@@ -34,3 +34,25 @@ l0_cpu_musespark:
   - unittest/disaggregated/test_rank_info.py
   - unittest/disaggregated/test_transfer_ownership_regressions.py
   - unittest/_torch/modules/dwdp/test_dwdp_mixed_layers.py
+  # The cpu_only tests of the pipeline-parallel and disaggregated context-server paths
+  # (stand-in PP ranks over the real scheduler, buffered PP P2P, the prompt_lens guard), listed
+  # by file so that this stage runs them (l0_cpu.yml reaches them only through directory entries).
+  - unittest/_torch/attention/test_prompt_lens_guard.py
+  - unittest/_torch/distributed/test_pp_buffered_p2p.py
+  - unittest/_torch/executor/test_pp_admission_backpressure.py
+  - unittest/_torch/executor/test_pp_admission_backpressure_loop.py
+  - unittest/_torch/executor/test_pp_compact_spec_relay.py
+  - unittest/_torch/executor/test_pp_adopt_admission_order.py
+  - unittest/_torch/executor/test_pp_ctx_diag.py
+  - unittest/_torch/executor/test_pp_ctx_diag_executor.py
+  - unittest/_torch/executor/test_pp_disagg_lagged_consensus.py
+  - unittest/_torch/executor/test_pp_follower_early_release.py
+  - unittest/_torch/executor/test_pp_follower_page_pressure.py
+  - unittest/_torch/executor/test_pp_follower_schedule.py
+  - unittest/_torch/executor/test_pp_longchain_protect.py
+  - unittest/_torch/executor/test_pp_relay_eager.py
+  - unittest/_torch/executor/test_pp_req_send_depth.py
+  - unittest/_torch/executor/test_pp_ring_depth.py
+  - unittest/_torch/executor/test_pp_stage_agree_lagged_loop.py
+  - unittest/_torch/executor/test_pp_stage_agreement.py
+  - unittest/_torch/executor/test_pp_subagent_idle_drop.py

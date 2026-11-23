@@ -21,6 +21,9 @@ class PPCommTag(IntEnum):
     SCHEDULE_RESULT = 20001
     EXECUTED_BATCH_NUM = 20002
     SAMPLE_STATE = 20003
+    # Follower -> first rank reuse reports of the PP stage agreement
+    # (pp_stage_agree.py).
+    STAGE_REUSE_REPORT = 20004
     # Reserved and never sent, so the MPI progress pump's MPI_Iprobe always
     # misses. Kept well apart from the tags above, which share its
     # communicator.

@@ -20,6 +20,7 @@
 #include "kv_cache_manager_v2/common.h"
 
 #include "tensorrt_llm/common/assert.h"
+#include <cstdint>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -50,30 +51,72 @@ struct GpuCacheTierConfig
     }
 };
 
+//! Size of one exported CU_MEM_HANDLE_TYPE_FABRIC handle (CUmemFabricHandle).
+inline constexpr size_t kFabricHandleBytes = 64;
+
+//! Host memory of another node, lent as fixed-size chunks over the NVLink fabric.
+//!
+//! Each handle is a CUmemFabricHandle exported by the lender for one chunk of chunkBytes. The level imports every
+//! handle when it is created, maps the chunks for the local device only (no CPU mapping) and never allocates or
+//! frees memory of its own. A chunk whose first 8 bytes do not read verifyNonce ^ chunkIndex is rejected.
+struct RemoteHostTierConfig
+{
+    std::vector<std::string> fabricHandles;
+    size_t chunkBytes = 0;
+    uint64_t verifyNonce = 0;
+
+    [[nodiscard]] size_t capacity() const noexcept
+    {
+        return fabricHandles.size() * chunkBytes;
+    }
+
+    void assertValid() const;
+};
+
 struct HostCacheTierConfig
 {
     size_t quota = 0; // bytes
+
+    //! Set for a remote host level (lent fabric memory); nullopt for local pinned host memory.
+    std::optional<RemoteHostTierConfig> remote;
 
     CacheTier tier() const noexcept
     {
         return CacheTier::HOST_MEM;
     }
 
-    void assertValid() const
+    [[nodiscard]] bool isRemote() const noexcept
     {
-        if (quota == 0)
-            throw std::invalid_argument("HostCacheTierConfig: quota must be > 0");
+        return remote.has_value();
     }
+
+    void assertValid() const;
+};
+
+//! A last cache level whose slots are objects of an external store, one object per cold page. KVCMv2 keeps the slot
+//! accounting and all policies; an IO table (storeLevelIo.h), attached after construction, moves the bytes.
+struct StoreTierConfig
+{
+    std::string label{"store"}; //!< Names the level in logs and stats.
+    size_t stagingBytes = 0;    //!< Page staging ring for G<->S; 0 = the default (64 MiB, at least 3 cold pages).
 };
 
 struct DiskCacheTierConfig
 {
     size_t quota = 0; // bytes
-    std::string path; // directory for temp files
+    std::string path; // directory for temp files; empty for a store level
+
+    //! Set for a store level (slots are external store objects); nullopt for a temp-file disk level.
+    std::optional<StoreTierConfig> store;
 
     CacheTier tier() const noexcept
     {
         return CacheTier::DISK;
+    }
+
+    [[nodiscard]] bool isStore() const noexcept
+    {
+        return store.has_value();
     }
 
     void assertValid() const;

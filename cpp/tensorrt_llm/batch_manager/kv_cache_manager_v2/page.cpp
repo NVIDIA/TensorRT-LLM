@@ -49,6 +49,10 @@ Page::~Page()
         {
             TLLM_CHECK_DEBUG_WITH_INFO(status() == PageStatus::DROPPABLE && !scheduledForEviction(),
                 "Page destroyed while still held or scheduled for eviction");
+            if (demoted)
+            {
+                manager->noteDemotedPageDestroyed();
+            }
             if (hasValidSlot())
             {
                 Slot s;
@@ -78,6 +82,12 @@ SharedPtr<PageHolder> Page::hold()
         return h;
 
     auto self = sharedFromThis();
+    // A new holder means a new user, so a demoted page goes back to its normal eviction key. Do it
+    // before the holder exists: undemote() re-queues the page only while it is still evictable.
+    if (TLLM_UNLIKELY(demoted))
+    {
+        manager->undemote(*this);
+    }
     h = makeShared<PageHolder>(self);
     holder = h;
 
@@ -237,6 +247,7 @@ SharedPtr<CommittedPage> UncommittedPage::convertToCommitted(
 PageHolder::PageHolder(SharedPtr<Page> p)
     : page(std::move(p))
 {
+    TLLM_CHECK_DEBUG_WITH_INFO(!page->demoted, "A held page must not be demoted");
 }
 
 PageHolder::~PageHolder()
@@ -614,7 +625,7 @@ std::vector<SharedPageLock> batchedLockPages(KvCache& kvCache, std::vector<Batch
         {
             storeMgr->promoteSparsePages(kvCache.cudaStream(), lockedHostPages, migrationRecorder, dropRecorder);
         }
-        storeMgr->batchedMigrate(level, pages, migrationRecorder);
+        storeMgr->batchedMigrate(level, pages, migrationRecorder, dropRecorder);
     }
 
     // Wait for all ready events on KvCache's stream (deduplicated).

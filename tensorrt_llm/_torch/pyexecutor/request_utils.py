@@ -3,7 +3,6 @@
 
 """Utility functions for request processing."""
 
-import os
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:
@@ -17,6 +16,7 @@ from tensorrt_llm.mapping import CpType
 from ..distributed import Distributed
 from .hang_detector import HangDetector
 from .llm_request import ExecutorRequest, LlmRequest, executor_request_to_llm_request
+from .pp_req_send_queue import PPRequestSendQueue, pp_req_send_async_enabled
 
 # Type alias for request queue items (to avoid circular import)
 # The actual RequestQueueItem class is defined in executor_request_queue.py
@@ -376,7 +376,9 @@ class RequestBroadcaster:
     def __init__(self, dist: Distributed, hang_detector: HangDetector):
         self.dist = dist
         self.hang_detector = hang_detector
-        self.send_requests_handler = None
+        # Request-payload sends to the next PP rank not yet waited on; at most
+        # one is in flight (DEFAULT_PP_REQ_SEND_DEPTH).
+        self.send_requests_queue = PPRequestSendQueue()
 
     def broadcast(self, new_requests: List) -> Tuple[List, Optional[Tuple]]:
         """Broadcast requests and Python objects across ranks."""
@@ -495,16 +497,31 @@ class RequestBroadcaster:
         # 2. rank2 will wait on mpi.recv(rank1) but never receive the new requests.
         # 3. rank1 will hang on nccl.send because rank2 will never reach nccl.recv(rank1).
         pp_send_func = (
-            self.dist.isend_object
-            if os.environ.get("TRTLLM_PP_REQ_SEND_ASYNC", "0") == "1"
-            else self.dist.send_object
+            self.dist.isend_object if pp_req_send_async_enabled() else self.dist.send_object
         )
 
         if not self.dist.is_last_pp_rank:
-            if self.send_requests_handler is not None:
+            # Wait on the oldest request send only while the queue is full
+            # (depth 1: the previous send, as without the knob). The payload
+            # is pickled when the send is posted (large out-of-band pickle
+            # buffers excepted, see pp_req_send_queue.py) and its buffers are
+            # owned by the handle, which the queue keeps until the wait.
+            while self.send_requests_queue.full():
                 with nvtx_range("wait_prev_send_requests_handler"):
-                    self.send_requests_handler.wait()
+                    self.send_requests_queue.wait_oldest()
             with nvtx_range("send_requests_to_next_pp"):
-                self.send_requests_handler = pp_send_func(payloads, self.dist.next_pp_rank, tag)
+                handle = pp_send_func(payloads, self.dist.next_pp_rank, tag)
+            self.send_requests_queue.push(handle)
 
         return payloads
+
+    def drain_pending_sends(self) -> int:
+        """Wait on every request send still in flight (a no-op at depth 1).
+
+        Called once the executor loop has ended: every rank received all
+        payloads up to the shutdown request, so each send has its receive.
+
+        Returns:
+            The number of sends waited on.
+        """
+        return self.send_requests_queue.drain()

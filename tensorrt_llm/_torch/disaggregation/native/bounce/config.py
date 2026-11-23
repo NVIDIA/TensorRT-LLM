@@ -53,6 +53,152 @@ def _env_int_gate(name: str, default: int) -> int:
     return value
 
 
+# Opt-in creation mode for the sender's gather stream (default 0 keeps the blocking stream).
+# A blocking stream implicitly waits on the legacy default stream, so a gather can queue behind a
+# whole forward step; a non-blocking stream does not. The gather's KV inputs are already complete
+# when a send starts (see VmmBounceTransport._new_stream), so no ordering is lost.
+# - 0 or unset: cudaStreamCreate (blocking, legacy behavior)
+# - 1: cudaStreamCreateWithFlags(cudaStreamNonBlocking)
+# - 2: cudaStreamCreateWithPriority(cudaStreamNonBlocking, greatest priority)
+_SEND_STREAM_NONBLOCKING_ENV = "TRTLLM_KV_BOUNCE_SEND_STREAM_NONBLOCKING"
+SEND_STREAM_BLOCKING = 0
+SEND_STREAM_NONBLOCKING = 1
+SEND_STREAM_NONBLOCKING_HIGH_PRIORITY = 2
+_SEND_STREAM_MODES = (
+    SEND_STREAM_BLOCKING,
+    SEND_STREAM_NONBLOCKING,
+    SEND_STREAM_NONBLOCKING_HIGH_PRIORITY,
+)
+
+
+def send_stream_mode_from_env() -> int:
+    """Read the send-stream creation mode from the env. Unset or empty is 0; any value other than
+    0, 1 or 2 raises ValueError, because silently keeping the blocking stream would hide a typo in
+    the setting."""
+    raw = os.environ.get(_SEND_STREAM_NONBLOCKING_ENV)
+    if raw is None or raw.strip() == "":
+        return SEND_STREAM_BLOCKING
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(
+            f"{_SEND_STREAM_NONBLOCKING_ENV}={raw!r} is not an integer; expected one of "
+            f"{_SEND_STREAM_MODES}"
+        ) from None
+    if value not in _SEND_STREAM_MODES:
+        raise ValueError(
+            f"{_SEND_STREAM_NONBLOCKING_ENV}={value} is not supported; expected one of "
+            f"{_SEND_STREAM_MODES}"
+        )
+    return value
+
+
+# Opt-in role scope for the bounce regions (default "both" keeps the two regions). A context
+# (prefill) worker only sends KV and a generation (decode) worker only receives it, so one of the two
+# regions is never used; scoping the transport to its role gives the used region the whole budget.
+# - "both" or unset: one send and one receive region (legacy)
+# - "recv": receive region only (generation workers)
+# - "send": send region only (context workers)
+_DIRECTION_ENV = "TRTLLM_KV_BOUNCE_DIRECTION"
+DIRECTION_BOTH = "both"
+DIRECTION_RECV = "recv"
+DIRECTION_SEND = "send"
+_DIRECTIONS = (DIRECTION_BOTH, DIRECTION_RECV, DIRECTION_SEND)
+
+
+def direction_from_env() -> str:
+    """Read the region scope from the env. Unset or empty is "both"; any other value than "both",
+    "recv" or "send" raises ValueError, so a typo cannot silently change the regions."""
+    raw = os.environ.get(_DIRECTION_ENV)
+    if raw is None or raw.strip() == "":
+        return DIRECTION_BOTH
+    value = raw.strip().lower()
+    if value not in _DIRECTIONS:
+        raise ValueError(
+            f"{_DIRECTION_ENV}={raw!r} is not supported; expected one of {_DIRECTIONS}"
+        )
+    return value
+
+
+# Opt-in just-in-time per-writer receive grant (default 0 keeps the dispatch-time reserve). Read on
+# the generation (receiver) side, which decides; the context side follows the flag in the request.
+# With it on, no receive region is reserved at dispatch: each context writer asks for a slot of its
+# own size right before it gathers, and its slot is released as soon as its own fragments are
+# scattered, so a slot is not held through the sender's queue or the sibling writers.
+_JIT_ENV = "TRTLLM_KV_BOUNCE_JIT"
+# Total time (ms) a context writer keeps asking while the receive region is full before it takes
+# the per-fragment path for that one flow. Read on the context (sender) side.
+_JIT_WAIT_MS_ENV = "TRTLLM_KV_BOUNCE_JIT_WAIT_MS"
+DEFAULT_JIT_WAIT_MS = 1000
+
+
+def bounce_jit_from_env() -> bool:
+    """Read the just-in-time grant switch. Unset or empty is off; any value other than 0 or 1
+    raises ValueError, so a typo cannot silently keep the dispatch-time reserve."""
+    raw = os.environ.get(_JIT_ENV)
+    if raw is None or raw.strip() == "":
+        return False
+    value = raw.strip()
+    if value not in ("0", "1"):
+        raise ValueError(f"{_JIT_ENV}={raw!r} is not supported; expected 0 or 1")
+    return value == "1"
+
+
+def bounce_jit_wait_ms_from_env() -> int:
+    """Read the sender's grant wait budget in ms. Unset or empty is the default; a value that is
+    not an integer of at least 0 raises ValueError."""
+    raw = os.environ.get(_JIT_WAIT_MS_ENV)
+    if raw is None or raw.strip() == "":
+        return DEFAULT_JIT_WAIT_MS
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(f"{_JIT_WAIT_MS_ENV}={raw!r} is not an integer") from None
+    if value < 0:
+        raise ValueError(f"{_JIT_WAIT_MS_ENV}={value} must be >= 0")
+    return value
+
+
+# Opt-in batched receive scatter (default 0 keeps one scatter and one stream sync per queued item).
+# Read on the generation (receiver) side. With it on, the scatter worker takes every item already
+# queued behind the one it woke for, scatters all of their fragments in one batched copy on the same
+# blocking scatter stream, syncs once, and then finishes the items in queue order. A queued writer
+# then waits for one sync instead of one per item ahead of it.
+_RECV_SCATTER_DRAIN_ENV = "TRTLLM_KV_BOUNCE_RECV_SCATTER_DRAIN"
+
+
+def recv_scatter_drain_from_env() -> bool:
+    """Read the batched receive scatter switch. Unset or empty is off; any value other than 0 or 1
+    raises ValueError, so a typo cannot silently keep the per-item scatter."""
+    raw = os.environ.get(_RECV_SCATTER_DRAIN_ENV)
+    if raw is None or raw.strip() == "":
+        return False
+    value = raw.strip()
+    if value not in ("0", "1"):
+        raise ValueError(f"{_RECV_SCATTER_DRAIN_ENV}={raw!r} is not supported; expected 0 or 1")
+    return value == "1"
+
+
+# Opt-in small-block receive scatter (default 0 keeps the batched copy's default block). Read on the
+# generation (receiver) side and applied to the receive scatter only; the send-side gather keeps the
+# default block. With it on, each program of the batched copy moves one 8 KiB slice of a fragment
+# instead of the default 64 KiB slice, so a fragment of a few KiB does not leave most of its
+# program's lanes masked. The copy, its stream, and the sync after it are unchanged.
+_RECV_SCATTER_TUNED_ENV = "TRTLLM_KV_BOUNCE_RECV_SCATTER_TUNED"
+
+
+def recv_scatter_tuned_from_env() -> bool:
+    """Read the small-block receive scatter switch. Unset or empty is off; any value other than 0
+    or 1 raises ValueError, so a typo cannot silently keep the default block."""
+    raw = os.environ.get(_RECV_SCATTER_TUNED_ENV)
+    if raw is None or raw.strip() == "":
+        return False
+    value = raw.strip()
+    if value not in ("0", "1"):
+        raise ValueError(f"{_RECV_SCATTER_TUNED_ENV}={raw!r} is not supported; expected 0 or 1")
+    return value == "1"
+
+
 def _round_up(a: int, b: int) -> int:
     return (a + b - 1) // b * b
 
@@ -91,6 +237,30 @@ class FixedSizing(Sizing):
 # bounce takes at most this fraction of the free memory left after the cache pool
 _HEADROOM_FRACTION = 0.5
 
+# Opt-in override of that fraction (default 0.5). Read where the transport is sized, so set it on the
+# worker that owns the regions. A larger share lets a fixed-size region fit when less memory is free
+# at setup, at the cost of less free memory for what is allocated after the regions.
+_MAX_FREE_FRACTION_ENV = "TRTLLM_KV_BOUNCE_MAX_FREE_FRACTION"
+_MAX_FREE_FRACTION_LIMIT = 0.9
+
+
+def max_free_fraction_from_env() -> float:
+    """Read the share of free memory the regions may take. Unset or empty is the default 0.5; a
+    value that is not a number in (0, 0.9] raises ValueError, so a typo cannot silently resize the
+    regions."""
+    raw = os.environ.get(_MAX_FREE_FRACTION_ENV)
+    if raw is None or raw.strip() == "":
+        return _HEADROOM_FRACTION
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ValueError(f"{_MAX_FREE_FRACTION_ENV}={raw!r} is not a number") from None
+    if not 0.0 < value <= _MAX_FREE_FRACTION_LIMIT:
+        raise ValueError(
+            f"{_MAX_FREE_FRACTION_ENV}={value} is outside (0, {_MAX_FREE_FRACTION_LIMIT}]"
+        )
+    return value
+
 
 def fit_within_free(
     capacity_bytes: int,
@@ -98,10 +268,13 @@ def fit_within_free(
     free_bytes: int,
     chunk_bytes: int,
     max_free_fraction: float = _HEADROOM_FRACTION,
+    num_regions: int = 2,
 ) -> Optional[int]:
-    """Clamp each region so the two together stay within the allowed fraction of free memory, rounded
-    to a chunk. Returns None if not even one chunk fits."""
-    budget_per_dir = (int(free_bytes * max_free_fraction) // 2 // chunk_bytes) * chunk_bytes
+    """Clamp each region so all ``num_regions`` together stay within the allowed fraction of free
+    memory, rounded down to a chunk. Returns None if not even one chunk fits."""
+    budget_per_dir = (
+        int(free_bytes * max_free_fraction) // num_regions // chunk_bytes
+    ) * chunk_bytes
     if budget_per_dir < chunk_bytes:
         return None
     capacity_bytes = min(capacity_bytes, budget_per_dir)

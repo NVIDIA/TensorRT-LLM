@@ -27,8 +27,10 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include <algorithm>
+#include <iterator>
 #include <set>
 #include <stdexcept>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -1060,7 +1062,9 @@ CommittedPage* KvCache::_copyPageToTreeBlock(
 
     auto& storageMgr = mManager->storage();
 
-    for (CacheLevel lvl = srcPage->cacheLevel; lvl < storageMgr.numCacheLevels(); ++lvl)
+    // Never into the store level: the copy runs on this cache's stream, which would then wait on the store.
+    CacheLevel const endLevel = storageMgr.storeLevel().value_or(storageMgr.numCacheLevels());
+    for (CacheLevel lvl = srcPage->cacheLevel; lvl < endLevel; ++lvl)
     {
         PoolGroupIndex const pgIdx = storageMgr.getPoolGroupIndex(lvl, lcIdx);
         Slot newSlot;
@@ -2000,6 +2004,21 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
         || (newBlock->tokens.size() >= tokenBlock.size()
             && std::equal(tokenBlock.begin(), tokenBlock.end(), newBlock->tokens.begin())));
 
+    if (!blockIsNew)
+    {
+        // This request now continues an existing block. A demoted page there would be evicted first, and the
+        // eviction would cascade into this request's continuation, so clear the mark. The rebase path below
+        // re-holds the pages anyway (Page::hold() un-demotes); the other paths do not.
+        for (LifeCycleId lc{0}; lc < newBlock->numLifeCycles(); ++lc)
+        {
+            CommittedPage* const page = newBlock->getPage(lc);
+            if (page != nullptr && TLLM_UNLIKELY(page->demoted))
+            {
+                mManager->storage().undemote(*page);
+            }
+        }
+    }
+
     auto ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
     bool didCommit = false;
 
@@ -2469,6 +2488,243 @@ int KvCache::_demoteSupersededAnchors(Priority priority)
 }
 
 // ---------------------------------------------------------------------------
+// ChainDemoteHandle
+// ---------------------------------------------------------------------------
+
+ChainDemoteHandle::ChainDemoteHandle(KvCacheManager& manager, std::vector<CommittedPage*> const& pages)
+    : mManager(manager.shared_from_this())
+{
+    // Exclusive: copies non-atomic refcounts of pages reachable from the radix tree.
+    auto const apiLock = mManager->lockExclusive();
+
+    std::unordered_set<CommittedPage*> seen;
+    std::vector<WeakPtr<CommittedPage>> refs;
+    refs.reserve(pages.size());
+    for (auto* page : pages)
+    {
+        if (!seen.insert(page).second)
+        {
+            continue;
+        }
+        auto ref = dynamicPointerCast<CommittedPage>(page->sharedFromThis());
+        TLLM_CHECK_WITH_INFO(ref, "Chain demote target is not a CommittedPage");
+        refs.emplace_back(ref);
+    }
+    mPageRefs = std::move(refs);
+}
+
+ChainDemoteHandle::~ChainDemoteHandle()
+{
+    if (mPageRefs.has_value())
+    {
+        KVCM2_POISON_ON_EXCEPT(
+            [this]()
+            {
+                // Runs from tp_dealloc/GC with the GIL held; release it before waiting for the API lock.
+                OptionalGilRelease const gilRelease;
+                auto const apiLock = mManager->lockExclusive();
+                mPageRefs.reset();
+            });
+    }
+}
+
+bool ChainDemoteHandle::valid() const noexcept
+{
+    return mPageRefs.has_value();
+}
+
+int ChainDemoteHandle::numRefs() const noexcept
+{
+    return mPageRefs.has_value() ? static_cast<int>(mPageRefs->size()) : 0;
+}
+
+void ChainDemoteHandle::absorb(ChainDemoteHandle& other)
+{
+    if (&other == this)
+    {
+        throw LogicError("ChainDemoteHandle cannot absorb itself");
+    }
+    if (other.mManager != mManager)
+    {
+        throw LogicError("ChainDemoteHandle can only absorb a handle of the same manager");
+    }
+    auto const apiLock = mManager->lockExclusive();
+    if (!mPageRefs.has_value() || !other.mPageRefs.has_value())
+    {
+        throw LogicError("ChainDemoteHandle is no longer valid");
+    }
+    // An expired reference still pins its page's allocation (in-place control block), so drop them here.
+    auto& refs = *mPageRefs;
+    refs.erase(std::remove_if(refs.begin(), refs.end(), [](auto const& ref) { return ref.expired(); }), refs.end());
+    auto& otherRefs = *other.mPageRefs;
+    refs.reserve(refs.size() + otherRefs.size());
+    std::move(otherRefs.begin(), otherRefs.end(), std::back_inserter(refs));
+    other.mPageRefs.reset();
+}
+
+void ChainDemoteHandle::release()
+{
+    auto const apiLock = mManager->lockExclusive();
+    if (!mPageRefs.has_value())
+    {
+        throw LogicError("ChainDemoteHandle is no longer valid");
+    }
+    mPageRefs.reset();
+}
+
+ChainDemoteResult ChainDemoteHandle::demote()
+{
+    KVCM2_REJECT_IF_POISONED();
+    auto const apiLock = mManager->lockExclusive();
+    if (!mPageRefs.has_value())
+    {
+        throw LogicError("ChainDemoteHandle is no longer valid");
+    }
+
+    // Declared after the lock so the strong references are released while it is still held.
+    std::vector<SharedPtr<CommittedPage>> pages;
+    pages.reserve(mPageRefs->size());
+    for (auto const& ref : *mPageRefs)
+    {
+        if (auto page = ref.lock())
+        {
+            pages.push_back(std::move(page));
+        }
+    }
+    mPageRefs.reset();
+
+    struct PlannedBlock
+    {
+        std::vector<CommittedPage*> pages;
+        bool good = false;
+    };
+
+    std::unordered_map<Block*, PlannedBlock> planned;
+    std::unordered_set<CommittedPage*> seen;
+    // Blocks in plan order, so the result does not depend on hash-map iteration order.
+    std::vector<Block*> order;
+    for (auto const& page : pages)
+    {
+        Block* const block = page->block;
+        if (block == nullptr || block->isOrphan() || !block->holdsPage(*page) || !seen.insert(page.get()).second)
+        {
+            continue;
+        }
+        auto const [it, inserted] = planned.try_emplace(block);
+        if (inserted)
+        {
+            order.push_back(block);
+        }
+        it->second.pages.push_back(page.get());
+    }
+
+    ChainDemoteResult result;
+    result.planBlocks = static_cast<int>(planned.size());
+
+    // Deepest first. A child's ordinal is its parent's plus one, so every child of a block is classified before
+    // the block itself. Iterative on purpose: chains reach tens of thousands of blocks.
+    std::stable_sort(
+        order.begin(), order.end(), [](Block const* lhs, Block const* rhs) { return lhs->ordinal() > rhs->ordinal(); });
+
+    // A block is good when nothing in it is held or locked and its whole subtree is good blocks of this chain:
+    // dropping it then cascades only into this chain's own idle blocks.
+    for (Block* block : order)
+    {
+        bool const held = std::any_of(block->storage.begin(), block->storage.end(),
+            [](CommittedPage const* page) { return page != nullptr && page->status() != PageStatus::DROPPABLE; });
+        if (held)
+        {
+            ++result.keptHeldBlocks;
+            continue;
+        }
+        bool const closed = std::all_of(block->next.begin(), block->next.end(),
+            [&planned](auto const& child)
+            {
+                auto const it = planned.find(child.second.get());
+                return it != planned.end() && it->second.good;
+            });
+        if (!closed)
+        {
+            ++result.keptSharedBlocks;
+            continue;
+        }
+        planned.at(block).good = true;
+    }
+
+    // Queue the tail first, so the deepest blocks are evicted first. Nothing is freed here: a demoted page is
+    // dropped only when the normal eviction at its level picks it.
+    StorageManager& storage = mManager->storage();
+    for (Block* block : order)
+    {
+        auto const& entry = planned.at(block);
+        if (!entry.good)
+        {
+            continue;
+        }
+        int numDemoted = 0;
+        for (CommittedPage* page : entry.pages)
+        {
+            CacheLevel const level = page->cacheLevel;
+            if (storage.demote(*page))
+            {
+                ++numDemoted;
+                if (level == kHotLevel)
+                {
+                    ++result.demotedPagesHot;
+                }
+            }
+        }
+        if (numDemoted > 0)
+        {
+            ++result.demotedBlocks;
+            result.demotedPages += numDemoted;
+        }
+    }
+    return result;
+}
+
+std::unique_ptr<ChainDemoteHandle> KvCache::planCommittedChainDemote(int fromBlock)
+{
+    KVCM2_REJECT_IF_POISONED();
+    auto const apiLock = mManager->lockExclusive();
+    if (mCommitState != CommitState::USER_STOP)
+        throw LogicError("plan_committed_chain_demote() requires stop_committing()");
+
+    std::vector<LifeCycleId> fullLifeCycles;
+    for (auto const item : mManager->lifeCycles())
+    {
+        auto const* attn = std::get_if<AttnLifeCycle>(&item.lc);
+        // SSM and sparse histories have their own drop rules; this plan does not cover them.
+        if (attn == nullptr || attn->isSparse)
+            return nullptr;
+        if (!attn->windowSize.has_value())
+            fullLifeCycles.push_back(item.id);
+    }
+    if (fullLifeCycles.empty() || numCommittedTokens() == 0)
+        return nullptr;
+
+    // Walk the tree blocks this cache committed. No match() and no hashing: the cost is O(new blocks).
+    std::vector<CommittedPage*> pages;
+    for (int ordinal = std::max(fromBlock, 0); ordinal < mNumCommittedBlocks; ++ordinal)
+    {
+        Block const* const block = mBlocks[BlockOrdinal{ordinal}].treeBlock.get();
+        if (block == nullptr || block->isOrphan())
+            break;
+        bool const complete = std::all_of(fullLifeCycles.begin(), fullLifeCycles.end(),
+            [block](LifeCycleId lc) { return block->getPage(lc) != nullptr; });
+        if (!complete)
+            break;
+        for (LifeCycleId lc : fullLifeCycles)
+        {
+            pages.push_back(block->getPage(lc));
+        }
+    }
+    if (pages.empty())
+        return nullptr;
+    return std::make_unique<ChainDemoteHandle>(*mManager, pages);
+}
+
+// ---------------------------------------------------------------------------
 // _onStopCommitting: release stale held uncommitted pages for SWA layers.
 // Mirrors Python's _on_stop_committing().
 // ---------------------------------------------------------------------------
@@ -2547,6 +2803,14 @@ void KvCache::_finalizeCachedTokensByLevel(
 
     TLLM_CHECK_DEBUG(countsByLevelTotal(mCachedTokensByLevel) == numTokens);
     TLLM_CHECK_DEBUG(mLastCachedTokenLevel.has_value());
+
+    // Remote host hits are counted at match time, independently of enableStats (stats-excluded caches, such as
+    // long-chain pins, are left out as everywhere else).
+    if (auto const remoteLevel = mManager->storage().remoteHostLevel();
+        remoteLevel.has_value() && !mManager->isStatsExcluded(id))
+    {
+        mManager->recordRemoteHostHitTokens(mCachedTokensByLevel.at(*remoteLevel));
+    }
 
     // Stage the attribution alongside the reuse counters derived from the same walk, so it is
     // committed (or discarded) with them instead of being pushed back in through a public setter.

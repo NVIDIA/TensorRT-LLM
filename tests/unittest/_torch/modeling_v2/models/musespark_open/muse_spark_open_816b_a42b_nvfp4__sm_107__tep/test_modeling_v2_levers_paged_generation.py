@@ -180,6 +180,7 @@ def test_the_paged_generation_server_is_wide(rejection_sampling):
     t = table("paged", rejection_sampling)
     assert LEVERS._wide_generation_refusal(t.deployment) is None
     assert LEVERS.row_cap(t.deployment) == LEVERS.WIDE_ROW_CAP
+    assert LEVERS.row_cap(t.deployment, t.default) == LEVERS.WIDE_ROW_CAP
     for name in WIDE_GENERATION:
         assert t.on(name), (name, t.decisions[name])
 
@@ -228,6 +229,6 @@ def test_the_wide_generation_refusals_name_what_they_miss(arena, max_batch_size,
     assert not t.on("multi_request_ffn_join")
 
 
-def test_the_baseline_keeps_the_row_cap_over_pages():
+def test_the_default_off_keeps_the_row_cap_over_pages():
     t = table("paged")
-    assert LEVERS.row_cap(t.deployment, LEVERS.BASELINE) == LEVERS.ROW_CAP
+    assert LEVERS.row_cap(t.deployment, LEVERS.OFF) == LEVERS.ROW_CAP

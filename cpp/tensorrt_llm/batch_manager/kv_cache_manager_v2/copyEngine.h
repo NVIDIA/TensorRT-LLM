@@ -49,8 +49,11 @@ public:
     CopyEngine& operator=(CopyEngine const&) = delete;
 
     // Transfer numBytes per task. Tasks must all share the same source and destination tiers.
-    void transfer(
-        CacheTier dstTier, CacheTier srcTier, size_t numBytes, std::vector<CopyTask> const& tasks, CUstream stream);
+    //
+    // remoteHost: a host-to-host transfer where either side is a remote host level. That memory is mapped for the
+    // GPU only, so the batch runs on the GPU copy kernel (the host-to-device path) instead of a host-function memcpy.
+    void transfer(CacheTier dstTier, CacheTier srcTier, size_t numBytes, std::vector<CopyTask> const& tasks,
+        CUstream stream, bool remoteHost = false);
 
 private:
     [[nodiscard]] StagingBufferManager& pageStagingManager() const;

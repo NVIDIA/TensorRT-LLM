@@ -1024,6 +1024,26 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::matchTokenPathMemo(
     return results;
 }
 
+namespace
+{
+//! The block's page coverage for `lcId`, or 0 when its page sits in a store slot the store tier's degrade fault mode
+//! holds unreadable (lost, unconfirmed or inside the breaker window): the match then stops before it, a miss.
+int readableCoverage(Block const& block, LifeCycleId lcId)
+{
+    int const coverage = block.pageCoverage(lcId);
+    if (coverage <= 0)
+    {
+        return coverage;
+    }
+    CommittedPage const* page = block.getPage(lcId);
+    if (page == nullptr || page->manager == nullptr)
+    {
+        return coverage;
+    }
+    return page->manager->storePageReadable(*page) ? coverage : 0;
+}
+} // namespace
+
 std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(
     std::vector<MatchResult> matched, std::optional<LifeCycleId> ssmLcId) const
 {
@@ -1050,7 +1070,7 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(
                 auto const& entry = matched[static_cast<size_t>(i)];
                 // An SSM page holds the recurrent state after exactly this many tokens,
                 // so reuse must stop there instead of anywhere inside the block.
-                int const snapshotLen = entry.block->pageCoverage(*ssmLcId);
+                int const snapshotLen = readableCoverage(*entry.block, *ssmLcId);
                 if (snapshotLen > 0 && entry.numMatchedTokens >= snapshotLen)
                 {
                     ssmTrunc = i + 1;
@@ -1086,7 +1106,7 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(
                     continue;
                 }
                 int const numMatched = matched[static_cast<size_t>(i)].numMatchedTokens;
-                int const coverage = matched[static_cast<size_t>(i)].block->pageCoverage(lcId);
+                int const coverage = readableCoverage(*matched[static_cast<size_t>(i)].block, lcId);
                 if (coverage >= numMatched)
                 {
                     continue;

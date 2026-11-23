@@ -200,7 +200,7 @@ def _pp_executor(monkeypatch, calls: list, *, rank: int) -> PyExecutor:
         executor.scheduler = Mock()
         executor.scheduler.can_schedule.return_value = True
         executor.scheduler.schedule_request.return_value = SimpleNamespace(
-            fitting_disagg_gen_init_requests=[]
+            context_requests=[], generation_requests=[], fitting_disagg_gen_init_requests=[]
         )
         executor.kv_cache_manager = Mock(spec=[])
     return executor

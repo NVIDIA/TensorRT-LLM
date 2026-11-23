@@ -1365,7 +1365,8 @@ def test_nonzero_pp_rank_reconciles_local_only_disagg_allocations(
     executor._pause_recompute_paused_requests = Mock()
     executor._revert_ctx_alloc = Mock()
     executor.inflight_req_ids = set()
-    executor.kv_cache_manager = Mock()
+    # No store tier attached: KVCacheManagerV2.store_level keeps its default None.
+    executor.kv_cache_manager = Mock(store_level=None)
     executor.scheduler = Mock()
 
     canonical = _make_disagg_transfer_request(1, 32)
@@ -1715,6 +1716,49 @@ class TestExecutorLoopCleanup:
 
         assert stub.is_shutdown is True
         assert "notify_all" in stub._events
+
+    @staticmethod
+    def _with_request_broadcaster(stub, depth, drain_error=None):
+        broadcaster = Mock()
+        broadcaster.send_requests_queue = types.SimpleNamespace(
+            depth=depth, summary=lambda: "summary"
+        )
+
+        def drain():
+            stub._events.append("drain_requests")
+            if drain_error is not None:
+                raise drain_error
+            return depth
+
+        broadcaster.drain_pending_sends.side_effect = drain
+        stub.request_broadcaster = broadcaster
+        return broadcaster
+
+    def test_request_sends_drained_after_pp_waits_above_default_depth(self):
+        """A request-send queue deeper than one: the queued sends are awaited last."""
+        stub = _CleanupStub()
+        broadcaster = self._with_request_broadcaster(stub, depth=4)
+        stub._executor_loop_cleanup()
+
+        broadcaster.drain_pending_sends.assert_called_once_with()
+        assert stub._events.index("wait_pp_0") < stub._events.index("drain_requests")
+
+    def test_request_sends_not_drained_at_default_depth(self):
+        """Depth 1 (the default) keeps the old teardown."""
+        stub = _CleanupStub()
+        broadcaster = self._with_request_broadcaster(stub, depth=1)
+        stub._executor_loop_cleanup()
+
+        broadcaster.drain_pending_sends.assert_not_called()
+        assert "drain_requests" not in stub._events
+
+    def test_request_send_drain_exception_does_not_propagate(self):
+        stub = _CleanupStub()
+        self._with_request_broadcaster(stub, depth=2, drain_error=RuntimeError("bad handle"))
+        stub._executor_loop_cleanup()
+
+        assert stub.is_shutdown is True
+        assert "drain_requests" in stub._events
 
 
 _STATE_GENERATION_IN_PROGRESS = LlmRequestState.GENERATION_IN_PROGRESS

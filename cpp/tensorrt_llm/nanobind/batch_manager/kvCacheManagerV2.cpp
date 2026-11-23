@@ -1583,16 +1583,58 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_prop_ro("tier", &kv::GpuCacheTierConfig::tier)
         .def("assert_valid", &kv::GpuCacheTierConfig::assertValid) DEF_COPY(kv::GpuCacheTierConfig);
 
+    nb::class_<kv::RemoteHostTierConfig>(m, "RemoteHostTierConfig")
+        .def(
+            "__init__",
+            [](kv::RemoteHostTierConfig* self, std::vector<nb::bytes> const& fabricHandles, size_t chunkBytes,
+                uint64_t verifyNonce)
+            {
+                std::vector<std::string> handles;
+                handles.reserve(fabricHandles.size());
+                for (auto const& handle : fabricHandles)
+                {
+                    handles.emplace_back(handle.c_str(), handle.size());
+                }
+                new (self) kv::RemoteHostTierConfig{std::move(handles), chunkBytes, verifyNonce};
+            },
+            nb::arg("fabric_handles"), nb::arg("chunk_bytes"), nb::arg("verify_nonce") = 0)
+        .def_prop_ro("fabric_handles",
+            [](kv::RemoteHostTierConfig const& self)
+            {
+                std::vector<nb::bytes> handles;
+                handles.reserve(self.fabricHandles.size());
+                for (auto const& handle : self.fabricHandles)
+                {
+                    handles.emplace_back(handle.data(), handle.size());
+                }
+                return handles;
+            })
+        .def_rw("chunk_bytes", &kv::RemoteHostTierConfig::chunkBytes)
+        .def_rw("verify_nonce", &kv::RemoteHostTierConfig::verifyNonce)
+        .def_prop_ro("capacity", &kv::RemoteHostTierConfig::capacity)
+        .def("assert_valid", &kv::RemoteHostTierConfig::assertValid) DEF_COPY(kv::RemoteHostTierConfig);
+
     nb::class_<kv::HostCacheTierConfig>(m, "HostCacheTierConfig")
-        .def(nb::init<size_t>(), nb::arg("quota"))
+        .def(nb::init<size_t, std::optional<kv::RemoteHostTierConfig>>(), nb::arg("quota"),
+            nb::arg("remote").none() = nb::none())
         .def_rw("quota", &kv::HostCacheTierConfig::quota)
+        .def_rw("remote", &kv::HostCacheTierConfig::remote)
+        .def_prop_ro("is_remote", &kv::HostCacheTierConfig::isRemote)
         .def_prop_ro("tier", &kv::HostCacheTierConfig::tier)
         .def("assert_valid", &kv::HostCacheTierConfig::assertValid) DEF_COPY(kv::HostCacheTierConfig);
 
+    nb::class_<kv::StoreTierConfig>(m, "StoreTierConfig")
+        .def(nb::init<std::string, size_t>(), nb::arg("label") = "store", nb::arg("staging_bytes") = 0)
+        .def_rw("label", &kv::StoreTierConfig::label)
+        .def_rw("staging_bytes", &kv::StoreTierConfig::stagingBytes) DEF_COPY(kv::StoreTierConfig);
+
     nb::class_<kv::DiskCacheTierConfig>(m, "DiskCacheTierConfig")
-        .def(nb::init<size_t, std::string>(), nb::arg("quota"), nb::arg("path"))
+        .def(nb::init<size_t, std::string, std::optional<kv::StoreTierConfig>>(), nb::arg("quota"),
+            nb::arg("path") = "", nb::arg("store").none() = nb::none())
         .def_rw("quota", &kv::DiskCacheTierConfig::quota)
         .def_rw("path", &kv::DiskCacheTierConfig::path)
+        .def_rw("store", &kv::DiskCacheTierConfig::store)
+        .def_prop_ro("is_store", &kv::DiskCacheTierConfig::isStore)
         .def_prop_ro("tier", &kv::DiskCacheTierConfig::tier)
         .def("assert_valid", &kv::DiskCacheTierConfig::assertValid) DEF_COPY(kv::DiskCacheTierConfig);
 
@@ -1764,6 +1806,27 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     // ---- PlannedDropHandle -------------------------------------------------
     nb::class_<kv::PlannedDropHandle>(m, "PlannedDropHandle")
         .def("drop", &kv::PlannedDropHandle::drop, nb::call_guard<nb::gil_scoped_release>());
+
+    // ---- ChainDemoteHandle -------------------------------------------------
+    nb::class_<kv::ChainDemoteHandle>(m, "ChainDemoteHandle")
+        .def("absorb", &kv::ChainDemoteHandle::absorb, nb::arg("other"), nb::call_guard<nb::gil_scoped_release>())
+        .def("release", &kv::ChainDemoteHandle::release, nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "demote",
+            [](kv::ChainDemoteHandle& self)
+            {
+                kv::ChainDemoteResult result;
+                {
+                    nb::gil_scoped_release release;
+                    result = self.demote();
+                }
+                return nb::make_tuple(result.planBlocks, result.demotedBlocks, result.demotedPages,
+                    result.demotedPagesHot, result.keptSharedBlocks, result.keptHeldBlocks);
+            },
+            "Demote the chain's subtree-closed, unheld blocks evict-first and invalidate the handle. Returns "
+            "(plan_blocks, demoted_blocks, demoted_pages, demoted_pages_gpu, kept_shared_blocks, kept_held_blocks).")
+        .def_prop_ro("valid", &kv::ChainDemoteHandle::valid)
+        .def_prop_ro("num_refs", &kv::ChainDemoteHandle::numRefs);
 
     nb::class_<kv::PageStorageSnapshot>(m, "PageStorageSnapshot")
         .def_prop_ro("version", &kv::PageStorageSnapshot::version)
@@ -2046,6 +2109,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def(
             "plan_committed_block_drop", [](kv::KvCache& self) { return self.planCommittedBlockDrop(); },
             nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "plan_committed_chain_demote",
+            [](kv::KvCache& self, int fromBlock) { return self.planCommittedChainDemote(fromBlock); },
+            nb::arg("from_block"), nb::call_guard<nb::gil_scoped_release>())
         .def(
             "get_aggregated_page_indices",
             [](kv::KvCache const& self, int layerGroupId, int beamIdx, bool validOnly) {
@@ -2708,6 +2775,98 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::call_guard<nb::gil_scoped_release>())
         .def("get_and_reset_iteration_suspend_resume_stats",
             &kv::KvCacheManager::getAndResetIterationSuspendResumeStats, nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "chain_demote_stats",
+            [](kv::KvCacheManager const& self)
+            {
+                auto const stats = self.demotionStats();
+                return std::make_pair(stats.destroyedDemotedPages, stats.undemotedPages);
+            },
+            // Takes the shared API lock, so it can block on a writer.
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("get_remote_host_tier_stats",
+            [](kv::KvCacheManager const& self)
+            {
+                auto const stats = self.remoteHostTierStats();
+                nb::dict result;
+                result["level"] = stats.storage.level;
+                result["lent_bytes"] = stats.storage.lentBytes;
+                result["num_chunks"] = stats.storage.numChunks;
+                result["demoted_pages"] = stats.storage.demotedPages;
+                result["demoted_bytes"] = stats.storage.demotedBytes;
+                result["promoted_pages"] = stats.storage.promotedPages;
+                result["promoted_bytes"] = stats.storage.promotedBytes;
+                result["gpu_kernel_host_copies"] = stats.storage.gpuKernelHostCopies;
+                result["host_function_host_copies"] = stats.storage.hostFunctionHostCopies;
+                result["hit_tokens"] = stats.hitTokens;
+                return result;
+            })
+        .def("get_remote_host_address_ranges", &kv::KvCacheManager::remoteHostAddressRanges,
+            nb::call_guard<nb::gil_scoped_release>())
+        // keep_alive<1, 3>: the manager calls the table, which `owner` (the Python object that holds it) keeps
+        // valid, until the manager itself is gone, whatever order the two are collected in.
+        .def(
+            "attach_store_level_io",
+            [](kv::KvCacheManager& self, uintptr_t table, nb::handle /*owner*/)
+            {
+                nb::gil_scoped_release release;
+                self.attachStoreLevelIo(table);
+            },
+            nb::arg("table"), nb::arg("owner"), nb::keep_alive<1, 3>())
+        .def("detach_store_level_io", &kv::KvCacheManager::detachStoreLevelIo, nb::arg("timeout_s") = 120.0,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "keep_free_bytes",
+            [](kv::KvCacheManager& self, int level, size_t bytes)
+            { return static_cast<int64_t>(self.keepFreeBytes(kv::CacheLevel{level}, bytes)); },
+            nb::arg("level"), nb::arg("bytes"), nb::call_guard<nb::gil_scoped_release>())
+        .def("get_store_level_stats",
+            [](kv::KvCacheManager const& self)
+            {
+                kv::StoreLevelStatsAll stats;
+                {
+                    // The IO table's stats may wait on its own lock; never with the GIL held.
+                    nb::gil_scoped_release release;
+                    stats = self.storeLevelStats();
+                }
+                nb::dict result;
+                result["level"] = stats.storage.level;
+                result["quota_bytes"] = stats.storage.quotaBytes;
+                result["num_slots"] = stats.storage.numSlots;
+                result["demoted_pages"] = stats.storage.demotedPages;
+                result["demoted_bytes"] = stats.storage.demotedBytes;
+                result["promoted_pages"] = stats.storage.promotedPages;
+                result["promoted_bytes"] = stats.storage.promotedBytes;
+                result["promoted_to_gpu_pages"] = stats.storage.promotedToGpuPages;
+                result["prefetched_pages"] = stats.storage.prefetchedPages;
+                result["ops_enqueued"] = stats.storage.opsEnqueued;
+                result["ops_submitted"] = stats.storage.opsSubmitted;
+                result["reserve_calls"] = stats.storage.reserveCalls;
+                result["reserve_evicted_slots"] = stats.storage.reserveEvictedSlots;
+                result["parked_streams"] = stats.storage.parkedStreams;
+                result["staging_fallbacks"] = stats.storage.stagingFallbacks;
+                result["reserve_failures"] = stats.storage.reserveFailures;
+                result["failed_put_ops"] = stats.storage.failedPutOps;
+                result["failed_get_ops"] = stats.storage.failedGetOps;
+                result["lost_slots"] = stats.storage.lostSlots;
+                result["unreadable_matches"] = stats.storage.unreadableMatches;
+                result["fault_degrade"] = static_cast<int>(stats.storage.faultDegrade);
+                result["io_attached"] = static_cast<int>(stats.ioAttached);
+                result["put_ops"] = stats.io.putOps;
+                result["put_rows"] = stats.io.putRows;
+                result["put_bytes"] = stats.io.putBytes;
+                result["get_ops"] = stats.io.getOps;
+                result["get_rows"] = stats.io.getRows;
+                result["get_bytes"] = stats.io.getBytes;
+                result["retries"] = stats.io.retries;
+                result["queued_ops"] = stats.io.queuedOps;
+                result["max_queued_ops"] = stats.io.maxQueuedOps;
+                result["put_p50_us"] = stats.io.putP50Us;
+                result["put_p99_us"] = stats.io.putP99Us;
+                result["get_p50_us"] = stats.io.getP50Us;
+                result["get_p99_us"] = stats.io.getP99Us;
+                return result;
+            })
         .def(
             "get_storage_statistics",
             [](kv::KvCacheManager const& self, int cacheLevel)

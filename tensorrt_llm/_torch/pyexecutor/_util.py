@@ -53,6 +53,8 @@ from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..speculative import (draft_prompt_lookahead, get_num_extra_kv_tokens,
                            get_num_spec_layers, get_spec_decoder,
                            should_use_separate_draft_kv_cache)
+from ..speculative.dflash_kv_storage import (FP8_DRAFT_KV_ENV,
+                                             fp8_draft_kv_requested)
 from ..speculative.spec_sampler_base import SpecSampler
 from ..utils import is_gdn_replay_enabled
 from . import config_utils
@@ -66,9 +68,13 @@ from .config_utils import (MambaKVCacheParams, _is_sliding_attention_layer,
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .guided_decoder import GuidedDecoder
-from .kv_cache.kv_cache_manager_v2 import (KVCacheLayerOwner, KVCacheLayerSpec,
+from .kv_cache import host_tier_memory
+from .kv_cache.kv_cache_manager_v2 import (FP8_DRAFT_COALESCING_GROUP,
+                                           KVCacheLayerOwner, KVCacheLayerSpec,
                                            KVCacheManagerV2, Role,
-                                           _resolve_v2_max_attention_window_vec)
+                                           _layer_buffer_coalescing_group,
+                                           _resolve_v2_max_attention_window_vec,
+                                           pp_dflash_context_enabled)
 from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
                                            CppMambaHybridCacheManager,
                                            MambaHybridCacheManagerV2,
@@ -702,15 +708,13 @@ def _get_num_storage_pool_groups(layer_specs: Sequence[KVCacheLayerSpec],
     sizes share one pool group. [agentx port] The agentx bindings have no
     per-layer reuse policy (main #19727), so it is not part of either key.
     """
-    scale_roles = (Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE)
-    nvfp4 = tensorrt_llm.bindings.DataType.NVFP4
     life_cycles: dict[tuple, dict[tuple[int, int], int]] = {}
     for layer in layer_specs:
         life_cycle = (layer.sliding_window_size,
                       ceil_div(layer.num_sink_tokens or 0, tokens_per_block))
         coalesced = life_cycles.setdefault(life_cycle, {})
         for role in layer.buffer_roles:
-            group = 1 + int(role in scale_roles) if layer.dtype == nvfp4 else 0
+            group = _layer_buffer_coalescing_group(layer, role)
             key = (group, layer.bytes_per_token(role) * tokens_per_block)
             coalesced[key] = coalesced.get(key, 0) + 1
     return len({
@@ -719,6 +723,118 @@ def _get_num_storage_pool_groups(layer_specs: Sequence[KVCacheLayerSpec],
                    reverse=True))
         for coalesced in life_cycles.values()
     })
+
+
+@dataclasses.dataclass(frozen=True)
+class StageKvBytesPerToken:
+    """KV bytes per token of one rank's explicit layer layout, split by kind.
+
+    ``full`` covers the full-attention layers, whose bytes grow with the
+    context. ``sliding_target`` and ``sliding_draft`` cover the
+    sliding-window layers, which retain at most a window of tokens and share
+    the window's life cycle (and so one ``pool_ratio`` entry) when their
+    windows are equal. ``sliding_growth`` is the factor by which the draft
+    layers grow the window's bytes per token on this rank: at a fixed byte
+    share of the pool, the window's token capacity shrinks by that factor.
+    """
+
+    full: int
+    sliding_target: int
+    sliding_draft: int
+    sliding_windows: tuple[int, ...]
+    draft_layer_ids: tuple[int, ...]
+
+    @property
+    def sliding_growth(self) -> float:
+        if self.sliding_target == 0:
+            return 1.0
+        return (self.sliding_target + self.sliding_draft) / self.sliding_target
+
+
+def stage_kv_bytes_per_token(layer_specs: Sequence[KVCacheLayerSpec],
+                             max_seq_len: int) -> StageKvBytesPerToken:
+    """Summarize a rank-local layer layout as ``StageKvBytesPerToken``.
+
+    A layer is sliding when its window is set and shorter than
+    ``max_seq_len``, as in the manager's cost model.
+    """
+    full = sliding_target = sliding_draft = 0
+    windows = set()
+    draft_layer_ids = []
+    for layer in layer_specs:
+        is_draft = layer.owner is KVCacheLayerOwner.DRAFT
+        if is_draft:
+            draft_layer_ids.append(layer.global_layer_id)
+        window = layer.sliding_window_size
+        if window is None or window >= max_seq_len:
+            full += layer.bytes_per_token()
+            continue
+        windows.add(int(window))
+        if is_draft:
+            sliding_draft += layer.bytes_per_token()
+        else:
+            sliding_target += layer.bytes_per_token()
+    return StageKvBytesPerToken(
+        full=full,
+        sliding_target=sliding_target,
+        sliding_draft=sliding_draft,
+        sliding_windows=tuple(sorted(windows)),
+        draft_layer_ids=tuple(draft_layer_ids),
+    )
+
+
+def draft_inclusive_pool_ratio(pool_ratio: Optional[Sequence[float]],
+                               layer_specs: Sequence[KVCacheLayerSpec],
+                               max_seq_len: int,
+                               tokens_per_block: int) -> Optional[List[float]]:
+    """Rescale ``pool_ratio`` for draft layers that share target life cycles.
+
+    ``pool_ratio`` gives each life cycle a byte share of every cache tier, in
+    the order the manager registers life cycles: by first appearance in
+    ``layer_specs``. A configured ratio describes the target layers. Draft
+    layers whose window and sink match a target life cycle add their bytes to
+    its page, which grows that life cycle's bytes per token by ``g = (target +
+    draft) / target`` and shrinks its token capacity by ``g`` at the same byte
+    share.
+
+    The result scales each share by its ``g`` and renormalizes. The life
+    cycles' token capacities then keep the proportions the configured shares
+    give the target layers alone, and each gives up the same fraction of its
+    tokens to hold the draft bytes.
+
+    Returns ``None`` when nothing is to be rescaled: no ``pool_ratio``, no
+    draft bytes, a ``pool_ratio`` without exactly one entry per life cycle,
+    or a life cycle that holds draft layers only.
+    """
+    if pool_ratio is None:
+        return None
+    target_bytes: Dict[tuple, int] = {}
+    draft_bytes: Dict[tuple, int] = {}
+    for layer in layer_specs:
+        window = layer.sliding_window_size
+        if window is not None and window >= max_seq_len:
+            window = None
+        life_cycle = (window,
+                      ceil_div(layer.num_sink_tokens or 0, tokens_per_block))
+        target_bytes.setdefault(life_cycle, 0)
+        draft_bytes.setdefault(life_cycle, 0)
+        if layer.owner is KVCacheLayerOwner.DRAFT:
+            draft_bytes[life_cycle] += layer.bytes_per_token()
+        else:
+            target_bytes[life_cycle] += layer.bytes_per_token()
+    if len(pool_ratio) != len(target_bytes):
+        return None
+    if any(target == 0 for target in target_bytes.values()):
+        return None
+    if not any(draft_bytes.values()):
+        return None
+    weights = [
+        float(share) * (target + draft) / target
+        for share, target, draft in zip(pool_ratio, target_bytes.values(),
+                                        draft_bytes.values())
+    ]
+    total = sum(weights)
+    return [weight / total for weight in weights]
 
 
 def _get_num_pool_groups_for_estimation(
@@ -1940,6 +2056,7 @@ class KvCacheCreator:
 
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
         self._check_shared_draft_kv_request()
+        self._check_fp8_draft_kv_request()
         unified_layer_specs = None
         if self._should_unify_dflash_kv_cache():
             unified_layer_specs = self._build_unified_dflash_layer_specs(
@@ -1949,6 +2066,10 @@ class KvCacheCreator:
                 "share one KV cache manager "
                 f"({len(unified_layer_specs)} layers, disagg={self._is_disagg})."
             )
+            if self._pp_dflash_context_placement():
+                self._log_pp_dflash_stage_layout(unified_layer_specs)
+                kv_cache_config = self._pp_dflash_stage_kv_cache_config(
+                    kv_cache_config, unified_layer_specs)
         kv_cache_manager = _create_kv_cache_manager(
             model_engine=model_engine,
             kv_cache_manager_cls=kv_cache_manager_cls,
@@ -1975,6 +2096,14 @@ class KvCacheCreator:
             joint_kv_cache_reuse=self._joint_kv_cache_reuse,
             layer_specs=unified_layer_specs,
         )
+        # The context server's drafter context store is on exactly under the last-stage
+        # placement; every stage keeps the same window (its plan of each context step's
+        # kept rows must match its neighbors'), and the manager guards reuse with it.
+        if (kv_cache_manager is not None and not estimating_kv_cache
+                and self._pp_dflash_context_placement()):
+            window = self._pp_dflash_draft_window(kv_cache_config)
+            if window is not None:
+                kv_cache_manager.enable_draft_context_window(window)
 
         if not self._skip_est:
             # KVCacheManager (Non-draft) modifies the max_seq_len field, update it to self
@@ -2130,6 +2259,155 @@ class KvCacheCreator:
                 "TRTLLM_DISAGG_SHARED_DRAFT_KV=1 requires the target and draft "
                 f"KV layers to share one KV cache manager, but {blocker}.")
 
+    def _check_fp8_draft_kv_request(self) -> None:
+        """Fail at startup when FP8 draft KV is asked for where it cannot apply.
+
+        ``TRTLLM_DFLASH_FP8_DRAFT_KV=1`` changes only draft layers that share
+        the target's KV cache manager. Anywhere else it would do nothing, so a
+        misconfigured worker would serve BF16 draft KV under the FP8 setting.
+        """
+        if not fp8_draft_kv_requested() or self._should_unify_dflash_kv_cache():
+            return
+        reason = self._dflash_unify_blocker() or (
+            "the disaggregated worker does not share the draft KV "
+            "(TRTLLM_DISAGG_SHARED_DRAFT_KV)")
+        raise ValueError(self._fp8_draft_kv_refusal(reason))
+
+    @staticmethod
+    def _fp8_draft_kv_refusal(reason: str) -> str:
+        return (f"{FP8_DRAFT_KV_ENV}=1 needs the DFlash draft KV layers in the "
+                "target's KV cache manager with an FP8 target KV, but "
+                f"{reason}. Unset it on this worker.")
+
+    def _unified_draft_kv_dtype(self, target_dtype, draft_dtype,
+                                draft_k_only: bool,
+                                draft_global_ids: Sequence[int]) -> object:
+        """The storage dtype of the draft layers in the shared KV cache manager.
+
+        The drafter's own dtype unless ``TRTLLM_DFLASH_FP8_DRAFT_KV=1`` asks for
+        FP8 E4M3 (``speculative/dflash_kv_storage.py``), which takes an FP8
+        target KV and a BF16 drafter that stores K and V. Draft-owned FP8
+        buffers then form their own coalescing group in the manager.
+
+        Raises:
+            ValueError: when FP8 draft KV is asked for and cannot apply.
+        """
+        if not fp8_draft_kv_requested():
+            return draft_dtype
+        data_type = tensorrt_llm.bindings.DataType
+        if target_dtype != data_type.FP8:
+            reason = f"the target KV dtype is {target_dtype}, not FP8"
+        elif draft_k_only:
+            reason = "the drafter stores one latent per token, not K and V"
+        elif draft_dtype != data_type.BF16:
+            reason = f"the drafter KV dtype is {draft_dtype}, not BF16"
+        else:
+            if draft_global_ids:
+                logger.info_once(
+                    f"{self._unified_drafter_name()} draft KV layers "
+                    f"{list(draft_global_ids)} stored as fp8 e4m3 (scale 1.0, "
+                    "saturating), coalescing group "
+                    f"{FP8_DRAFT_COALESCING_GROUP}.",
+                    key="dflash_fp8_draft_kv")
+            return data_type.FP8
+        raise ValueError(self._fp8_draft_kv_refusal(reason))
+
+    def _pp_dflash_context_placement(self) -> bool:
+        """Whether all DFlash draft KV layers go on the last pipeline stage.
+
+        Only on a stage of a pipeline-parallel DFlash context server, as the
+        model construction decided (``pp_dflash_context_enabled``): a
+        disaggregated worker at pipeline_parallel_size > 1 whose drafter is
+        DFlash on the TRTLLM attention backend. Only the last stage runs the
+        drafter, so it holds all draft layers (global ids ``num_hidden_layers
+        + i``) and the other stages hold none. Each stage's global layers then
+        stay one contiguous range, which the cache transceiver's per-stage
+        layer ranges rely on.
+        """
+        if not pp_dflash_context_enabled():
+            return False
+        spec_config = self._speculative_config
+        return (self._is_disagg and self._mapping.pp_size > 1
+                and spec_config is not None
+                and spec_config.spec_dec_mode.is_dflash()
+                and spec_config.attention_backend == "TRTLLM")
+
+    def _log_pp_dflash_stage_layout(
+            self, layer_specs: Sequence[KVCacheLayerSpec]) -> None:
+        """Log this stage's draft layers and KV bytes per token by kind.
+
+        Under the last-stage placement only the last stage carries the draft
+        bytes. They grow its sliding-window bytes per token by
+        ``sliding_growth``; ``_pp_dflash_stage_kv_cache_config`` rescales a
+        configured ``pool_ratio`` for it.
+        """
+        stage = stage_kv_bytes_per_token(layer_specs, self._max_seq_len)
+        logger.info(
+            f"{self._unified_drafter_name()} on pipeline stage "
+            f"{self._mapping.pp_rank} of {self._mapping.pp_size}: draft KV "
+            f"layers {list(stage.draft_layer_ids)}, "
+            f"{len(layer_specs)} KV layers; KV bytes per token: full "
+            f"{stage.full}, sliding target {stage.sliding_target}, sliding "
+            f"draft {stage.sliding_draft} (windows "
+            f"{list(stage.sliding_windows)}, sliding growth "
+            f"{stage.sliding_growth:.3f}).")
+
+    def _pp_dflash_stage_kv_cache_config(
+            self, kv_cache_config: KvCacheConfig,
+            layer_specs: Sequence[KVCacheLayerSpec]) -> KvCacheConfig:
+        """This stage's KV cache config under the last-stage draft placement.
+
+        A configured ``pool_ratio`` is one byte split for every stage. On the
+        stage that holds the draft layers it would leave the sliding-window
+        life cycle ``sliding_growth`` times fewer tokens than the same share
+        gives a stage without them, and a prefix is reusable only as deep as
+        every stage still holds its window. That stage gets the share
+        ``draft_inclusive_pool_ratio`` derives instead, on every cache tier.
+        Other stages, the estimation pass (no ``pool_ratio``) and every run
+        without the placement keep ``kv_cache_config`` as given.
+        """
+        if not self._pp_dflash_context_placement():
+            return kv_cache_config
+        pool_ratio = draft_inclusive_pool_ratio(kv_cache_config.pool_ratio,
+                                                layer_specs, self._max_seq_len,
+                                                self._tokens_per_block)
+        if pool_ratio is None:
+            return kv_cache_config
+        logger.info(
+            f"{self._unified_drafter_name()} on pipeline stage "
+            f"{self._mapping.pp_rank}: pool_ratio "
+            f"{list(kv_cache_config.pool_ratio)} -> "
+            f"{[round(share, 6) for share in pool_ratio]} so the draft KV "
+            "layers keep the configured token split.")
+        return kv_cache_config.model_copy(update={"pool_ratio": pool_ratio})
+
+    def _pp_dflash_draft_window(
+            self, kv_cache_config: KvCacheConfig) -> Optional[int]:
+        """The drafter's attention window under the last-stage placement, or None.
+
+        Under the last-stage placement the context server writes only the drafter context
+        a generation server can read: the rows of this window below each prompt's end, plus
+        the reuse rewind and one block (``KVCacheManagerV2.enable_draft_context_window``).
+        None when a draft layer attends the whole sequence: then every row is read and written.
+        The window comes from the drafter's config, so every stage derives the same one.
+        """
+        num_draft_layers = self._get_num_draft_layers()
+        windows = _resolve_v2_max_attention_window_vec(
+            self._get_draft_max_attention_window(self._unification_max_seq_len,
+                                                 kv_cache_config),
+            self._unification_max_seq_len, list(range(num_draft_layers)))
+        if not windows or any(window is None for window in windows):
+            return None
+        return int(max(windows))
+
+    def _dflash_draft_local_ids(self, num_draft_layers: int) -> List[int]:
+        """Drafter layer indices whose KV this rank holds in the shared manager."""
+        if self._pp_dflash_context_placement():
+            if self._mapping.is_last_pp_rank():
+                return list(range(num_draft_layers))
+            return []
+        return list(self._mapping.pp_layers(num_draft_layers))
+
     def _dflash_unify_blocker(self) -> Optional[str]:
         """The reason target and drafter layers cannot share one manager, or None."""
         spec_config = self._speculative_config
@@ -2146,7 +2424,8 @@ class KvCacheCreator:
             return "the drafter runs as a separate draft model engine"
         if self._draft_config is None:
             return "there is no draft model config"
-        if self._mapping.pp_size != 1:
+        if (self._mapping.pp_size != 1
+                and not self._pp_dflash_context_placement()):
             return f"pipeline_parallel_size is {self._mapping.pp_size}, not 1"
         if self._mapping.cp_size != 1:
             return f"context_parallel_size is {self._mapping.cp_size}, not 1"
@@ -2182,14 +2461,17 @@ class KvCacheCreator:
             return "the target or drafter has a per-layer KV-head count"
         # The drafter's shared context block table indexes all its layers
         # through one lifecycle; mixed windows need the separate manager.
+        num_draft_layers = int(
+            draft_model_config.pretrained_config.num_hidden_layers)
+        # With every draft layer on the last stage, the check covers all of
+        # them on every stage, so all stages reach the same decision.
+        draft_window_ids = (list(range(num_draft_layers))
+                            if self._pp_dflash_context_placement() else list(
+                                self._mapping.pp_layers(num_draft_layers)))
         draft_windows = _resolve_v2_max_attention_window_vec(
             self._get_draft_max_attention_window(self._unification_max_seq_len,
                                                  self._kv_cache_config),
-            self._unification_max_seq_len,
-            list(
-                self._mapping.pp_layers(
-                    int(draft_model_config.pretrained_config.num_hidden_layers))
-            ))
+            self._unification_max_seq_len, draft_window_ids)
         if len(set(draft_windows)) > 1:
             return "the draft layers use different attention windows"
         if self._is_disagg and not self._dflash_disagg_layouts_compatible(
@@ -2304,10 +2586,13 @@ class KvCacheCreator:
         draft_model_config = self._get_draft_kv_model_config()
         draft_config = draft_model_config.pretrained_config
         draft_layers = int(draft_config.num_hidden_layers)
-        draft_local_ids = list(self._mapping.pp_layers(draft_layers))
+        draft_local_ids = self._dflash_draft_local_ids(draft_layers)
         draft_heads, draft_head_dim, draft_dtype, draft_k_only = (
             self._dflash_kv_layout(draft_model_config,
                                    draft_config.torch_dtype))
+        draft_dtype = self._unified_draft_kv_dtype(
+            target_dtype, draft_dtype, draft_k_only,
+            [target_layers + layer_id for layer_id in draft_local_ids])
         draft_windows = _resolve_v2_max_attention_window_vec(
             self._get_draft_max_attention_window(self._max_seq_len,
                                                  kv_cache_config),
@@ -3175,21 +3460,21 @@ class KvCacheCreator:
 
     @classmethod
     def _drop_explicit_offload_tier_budgets(
-            cls, kv_cache_config: Optional[KvCacheConfig]
+        cls, kv_cache_config: Optional[KvCacheConfig], keep: Sequence[str] = ()
     ) -> Optional[KvCacheConfig]:
         """Return a copy of the config with explicit offload budgets unset.
 
         Host sizing then falls to the V2 auto host tier policy, which matches
         the tier to the manager's own device quota; V1 builds no secondary pool.
         The disk tier is V2 only and has no auto policy, so dropping its budget
-        leaves the tier out.
+        leaves the tier out. Budgets named in ``keep`` stay as configured.
         """
         if kv_cache_config is None:
             return kv_cache_config
         dropped = {
             attr: None
             for attr in cls._OFFLOAD_TIER_BUDGET_ATTRS
-            if getattr(kv_cache_config, attr)
+            if attr not in keep and getattr(kv_cache_config, attr)
         }
         if not dropped:
             return kv_cache_config
@@ -3226,11 +3511,23 @@ class KvCacheCreator:
         # requests, so an explicit offload tier would reserve capacity the probe
         # cannot fill. Encoder-decoder runs skip estimation, so dropping the
         # cross budgets is defensive.
+        # Opt-in (TRTLLM_KV_HOST_TIER_ESTIMATION_FINAL_SIZE=1): keep the
+        # configured host tier budget instead, so the estimation pass's
+        # page-locked host tier is no larger than the final one; off by default.
         if estimating_kv_cache:
+            keep_budgets = ()
+            if (host_tier_memory.estimation_final_size_enabled()
+                    and self_kv_cache_config.host_cache_size):
+                keep_budgets = ("host_cache_size", )
+                logger.info(
+                    f"{host_tier_memory.ESTIMATION_FINAL_SIZE_ENV}: the "
+                    "estimation pass keeps host_cache_size="
+                    f"{self_kv_cache_config.host_cache_size / (1 << 30):.2f}GiB"
+                )
             self_kv_cache_config = self._drop_explicit_offload_tier_budgets(
-                self_kv_cache_config)
+                self_kv_cache_config, keep=keep_budgets)
             cross_kv_cache_config = self._drop_explicit_offload_tier_budgets(
-                cross_kv_cache_config)
+                cross_kv_cache_config, keep=keep_budgets)
 
         # Split combined KV cache budgets before creating managers.
         has_draft = (

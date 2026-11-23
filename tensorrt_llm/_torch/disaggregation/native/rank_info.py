@@ -14,7 +14,7 @@
 # limitations under the License.
 
 from dataclasses import asdict, dataclass
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 import msgpack
 
@@ -24,6 +24,23 @@ from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_
 from tensorrt_llm._torch.disaggregation.resource.page import KVCachePageTable
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_size_in_bytes
+
+
+def unified_draft_layer_count(kv_cache_manager: KVCacheManager) -> int:
+    """Draft layers a unified KV cache manager holds on this rank.
+
+    Folded MTP/Eagle draft layers have no layer specs; they travel as ordinary
+    layers and are not counted.
+    """
+    if getattr(kv_cache_manager, "layer_specs", None) is None:
+        return 0
+    return len(kv_cache_manager.draft_layer_ids)
+
+
+def _draft_context_keep_tokens(kv_cache_manager: KVCacheManager) -> int:
+    """The draft rows a window-bounded drafter context keeps per prompt (0: every row)."""
+    keep = getattr(kv_cache_manager, "draft_context_keep_tokens", None)
+    return keep if isinstance(keep, int) and keep > 0 else 0
 
 
 @dataclass
@@ -51,6 +68,14 @@ class RankInfo:
     # Layers a unified KV cache manager owns for the drafter (layer specs with
     # a DRAFT owner). They ride the target's pages, so both peers must agree.
     num_draft_layers: int = 0
+    # The draft rows a context worker writes below each prompt's end when its
+    # drafter context is window-bounded (KVCacheManagerV2.draft_context_keep_tokens);
+    # 0 writes every row. Sent only when nonzero.
+    draft_context_keep_tokens: int = 0
+    # Whether this worker's KV cache reuses committed blocks. Local only: a
+    # generation worker checks it against a context peer's window, and it is
+    # never sent.
+    reuses_cached_blocks: bool = False
 
     @property
     def tp_size_per_dp_group(self) -> int:
@@ -60,6 +85,9 @@ class RankInfo:
 
     def to_bytes(self) -> bytes:
         data = asdict(self)
+        data.pop("reuses_cached_blocks")
+        if not data["draft_context_keep_tokens"]:
+            data.pop("draft_context_keep_tokens")
         data["attention"] = self.attention.to_dict() if self.attention is not None else None
         data["aux_meta"] = self.aux_meta.to_dict() if self.aux_meta is not None else None
         data["page_table"] = self.page_table.to_dict() if self.page_table is not None else None
@@ -115,10 +143,46 @@ class RankInfo:
             ),
             aux_meta=aux_buffer_meta,
             page_table=build_page_table_from_manager(kvm),
-            num_draft_layers=(
-                len(kvm.draft_layer_ids) if getattr(kvm, "layer_specs", None) is not None else 0
-            ),
+            num_draft_layers=unified_draft_layer_count(kvm),
+            draft_context_keep_tokens=_draft_context_keep_tokens(kvm),
+            reuses_cached_blocks=getattr(kvm, "enable_block_reuse", False) is True,
         )
+
+    def publish_instance_draft_layers(self, draft_layers_per_pp: Sequence[int]) -> None:
+        """Advertise the draft layers of the whole pipeline instead of this rank's.
+
+        A generation peer validates the draft-layer count against the first
+        context rank only, and every context rank compares its own count with
+        each generation rank's. With the draft layers on the last stage of a
+        pipeline-parallel context instance, both comparisons have to see the
+        instance-wide count on every context rank.
+
+        The draft layers' global ids follow the target's, so the per-stage
+        layer ranges built from ``layer_num_per_pp`` stay contiguous only when
+        all draft layers sit on the last stage; any other placement is
+        rejected.
+
+        Args:
+            draft_layers_per_pp: Draft layers held by each pipeline stage, in
+                stage order (one entry per stage, as gathered over the
+                pipeline group).
+        """
+        counts = [int(count) for count in draft_layers_per_pp]
+        if len(counts) != self.pp_size:
+            raise ValueError(
+                f"RankInfo: {len(counts)} per-stage draft layer counts for pp_size={self.pp_size}"
+            )
+        if counts[self.pp_rank] != self.num_draft_layers:
+            raise ValueError(
+                f"RankInfo: stage {self.pp_rank} reports {counts[self.pp_rank]} draft layers "
+                f"but holds {self.num_draft_layers}"
+            )
+        if any(counts[:-1]):
+            raise ValueError(
+                f"RankInfo: draft layers per pipeline stage are {counts}; the KV transfer needs "
+                "all draft layers on the last stage, after the target layers"
+            )
+        self.num_draft_layers = sum(counts)
 
     @classmethod
     def from_bytes(cls, data: bytes) -> "RankInfo":

@@ -42,6 +42,25 @@ target_include_directories(
   kvCacheManagerV2ColdPageTest
   PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager
           ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/sha256)
+add_gtest(kvCacheManagerV2ChainDemoteTest
+          "kvCacheManagerV2ChainDemoteTest.cpp;kvCacheManagerV2PoisonCheck.cpp")
+target_include_directories(
+  kvCacheManagerV2ChainDemoteTest
+  PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager
+          ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/sha256)
+add_gtest(
+  kvCacheManagerV2RemoteHostTierTest
+  "kvCacheManagerV2RemoteHostTierTest.cpp;kvCacheManagerV2PoisonCheck.cpp")
+target_include_directories(
+  kvCacheManagerV2RemoteHostTierTest
+  PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager
+          ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/sha256)
+add_gtest(kvCacheManagerV2StoreLevelTest
+          "kvCacheManagerV2StoreLevelTest.cpp;kvCacheManagerV2PoisonCheck.cpp")
+target_include_directories(
+  kvCacheManagerV2StoreLevelTest
+  PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager
+          ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/sha256)
 add_gtest(kvCacheManagerV2ColdPageCopyTest
           "kvCacheManagerV2ColdPageCopyTest.cu;kvCacheManagerV2PoisonCheck.cpp")
 target_include_directories(

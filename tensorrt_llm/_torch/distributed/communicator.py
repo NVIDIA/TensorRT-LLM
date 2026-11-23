@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 import math
 import pickle  # nosec B403
 from abc import ABC, abstractmethod
@@ -1344,10 +1346,37 @@ class PPCommTorch:
 
 _pp_comm = None
 
+# Whether _pp_comm is the buffered transport (pp_buffered.py), set by
+# init_pp_comm; the tensor-list ops and the capacity check use it.
+_pp_comm_buffered = False
 
-def init_pp_comm(mapping):
-    """Initialize PPComm once at startup"""
-    global _pp_comm
+
+def pp_comm_buffered() -> bool:
+    """Whether the PP communicator is the buffered transport (``pp_buffered.py``)."""
+    return _pp_comm_buffered
+
+
+def init_pp_comm(mapping, buffered: bool = False):
+    """Initialize PPComm once at startup.
+
+    Args:
+        mapping: the global mapping.
+        buffered: use the buffered transport (``pp_buffered.py``); the model
+            engine asks for it on a disaggregated server at
+            ``pipeline_parallel_size > 1``. Ignored without MPI.
+    """
+    global _pp_comm, _pp_comm_buffered
+    if buffered and mapping.pp_size > 1 and not mpi_disabled():
+        # Buffered transport: a copy-engine staging ring per same-node PP
+        # edge, NCCL for the rest; see pp_buffered.py. Otherwise the code
+        # below runs unchanged.
+        from .pp_buffered import init_buffered_pp_comm
+        _pp_comm = init_buffered_pp_comm(_pp_comm, mapping, PPCommNCCL,
+                                         PPCommNCCL)
+        _pp_comm_buffered = True
+        init_helix_cp_comm(mapping)
+        return
+    _pp_comm_buffered = False
     if mpi_disabled():
         _pp_comm = PPCommTorch(mapping)
     elif isinstance(_pp_comm, PPCommNCCL) and \
@@ -1388,11 +1417,27 @@ def pp_send(tensor):
     _pp_comm.send(tensor)
 
 
+def check_pp_comm_capacity(max_rows: int, hidden_size: int,
+                           activation_element_size: int) -> None:
+    """Check the PP transport against the largest stage boundary of the model.
+
+    Only the buffered transport (``pp_buffered.py``) has a size limit; with
+    any other transport this does nothing.
+    """
+    if _pp_comm_buffered:
+        _pp_comm.check_capacity(max_rows, hidden_size, activation_element_size)
+
+
 @torch.library.custom_op("trtllm::pp_recv_tensors", mutates_args=("tensors", ))
 def pp_recv_tensors(tensors: List[torch.Tensor]) -> None:
     """
     Receive tensors from previous pp rank.
     """
+    if _pp_comm_buffered:
+        # The buffered transport receives the list as one message, out of any
+        # breakable CUDA graph.
+        _pp_comm.recv_message(tensors)
+        return
     for tensor in tensors:
         pp_recv(tensor)
 
@@ -1400,5 +1445,10 @@ def pp_recv_tensors(tensors: List[torch.Tensor]) -> None:
 @torch.library.custom_op("trtllm::pp_send_tensors", mutates_args=("tensors", ))
 def pp_send_tensors(tensors: List[torch.Tensor]) -> None:
     """Send tensors to next pp rank."""
+    if _pp_comm_buffered:
+        # The buffered transport sends the list as one message, out of any
+        # breakable CUDA graph.
+        _pp_comm.send_message(tensors)
+        return
     for tensor in tensors:
         pp_send(tensor)

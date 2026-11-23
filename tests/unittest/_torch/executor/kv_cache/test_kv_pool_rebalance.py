@@ -925,6 +925,8 @@ def _make_pp_loop_executor(monkeypatch, *, num_micro_batches=2, agreement=(True,
 
     # Rebalance state uses the executor's global KV manager gate.
     exe._is_kv_manager_v2 = True
+    # No store tier attached: KVCacheManagerV2.store_level keeps its default None.
+    exe.kv_cache_manager = MagicMock(store_level=None)
     exe._pp_rebalance_drain_iters = None
     exe.pp_multi_stream_sample = False
     exe._can_pause_for_rebalance = MagicMock(return_value=True)

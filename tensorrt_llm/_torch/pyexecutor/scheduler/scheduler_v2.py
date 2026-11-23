@@ -22,12 +22,14 @@ from typing import Callable, Optional
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, ContextChunkingPolicy
 from tensorrt_llm.logger import logger
 
+from ..kv_cache.disagg_gen_fit_gate import DisaggGenFitGate
 from ..llm_request import (
     LlmRequest,
     LlmRequestState,
     get_draft_token_length,
     rewind_context_after_cache_drop,
 )
+from ..pp_stage_agree import reserved_depth
 from .scheduler import (
     RequestList,
     RequestScheduler,
@@ -889,6 +891,12 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Registered by PyExecutor; see set_async_transfer_manager.
         self._async_transfer_manager = None
 
+        # Opt-in (default off, TLLM_KV_DISAGG_GEN_FIT_GATE): the manager's
+        # size-aware generation-init fit gate. With it, generation-init
+        # admission keeps arrival order within a pass; see _schedule_loop.
+        fit_gate = getattr(kv_cache_manager, "disagg_gen_fit_gate", None)
+        self._disagg_gen_fit_gate = fit_gate if isinstance(fit_gate, DisaggGenFitGate) else None
+
         # Opt-out escape hatch for the blocked-pending-context fast path (see
         # _pending_ctx_certainly_blocked). On by default: the skip is decision-
         # neutral by construction; the env var exists to measure it or rule it
@@ -1145,6 +1153,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         ) = self._schedule_loop(active_requests, inflight_request_ids)
         if self._kvrg_track and self._kvrg_cnt:
             self._kvrg_maybe_log()
+        if self.record_context_admission_order:
+            # Allocation order; the sort below reorders the batch.
+            self.last_context_admission_order = [req.request_id for req in scheduled_ctx]
 
         # Sort by LoRA task ID
         scheduled_encoder.sort(key=_get_lora_task_id)
@@ -1219,6 +1230,12 @@ class KVCacheV2Scheduler(RequestScheduler):
             if req.state_value == self._gen_to_complete_state_value:
                 budget.pre_claim_peft(req)
 
+        fit_gate = self._disagg_gen_fit_gate
+        if fit_gate is not None:
+            # Residents without an active cache get their pages back before any
+            # generation-init of this pass takes them.
+            fit_gate.begin_pass(self._residents_without_active_cache(requests_list))
+
         # --- Phase 1: generation / disagg only ---
         while req_it < req_it_end:
             req = requests_list[req_it]
@@ -1250,10 +1267,20 @@ class KVCacheV2Scheduler(RequestScheduler):
                 if peft_pages is None:
                     break
 
+                # With the fit gate, a refused generation-init blocks every
+                # later one of this pass: a size-aware check that let shorter
+                # prompts past a refused one would favour short prompts.
+                if fit_gate is not None and fit_gate.pass_blocked:
+                    fit_gate.note_fifo_blocked()
+                    req_it += 1
+                    continue
+
                 action, tokens = self._try_schedule_disagg_gen_init(req, budget)
                 if action is ScheduleAction.STOP:
                     break
                 if action is ScheduleAction.SKIP:
+                    if fit_gate is not None:
+                        fit_gate.note_refused(req.py_request_id)
                     req_it += 1
                     continue
                 disagg_candidates.append(req)
@@ -1314,6 +1341,9 @@ class KVCacheV2Scheduler(RequestScheduler):
                 budget.commit(req, tokens, peft_pages)
 
             req_it += 1
+
+        if fit_gate is not None:
+            fit_gate.end_pass()
 
         # Requests whose pages were given up during this pass. A victim that is
         # itself a started context request still sits in pending_ctx, so
@@ -2102,6 +2132,21 @@ class KVCacheV2Scheduler(RequestScheduler):
         )
         return ScheduleAction.SCHEDULED, req_tokens
 
+    def _residents_without_active_cache(self, requests_list: RequestList) -> int:
+        """Started generation requests whose KV cache is not active (fit gate only).
+
+        Suspended (their pages evictable, so the fit gate counts them as free) or
+        given up; either way they need pages back before newer requests take them.
+        """
+        is_active = self.kv_cache_manager.is_request_active
+        return sum(
+            1
+            for req in requests_list
+            if req.is_generation_in_progress_state
+            and not req.is_generation_to_complete_state
+            and not is_active(req.py_request_id)
+        )
+
     def _try_schedule_disagg_gen_init(
         self, req: LlmRequest, budget: BudgetTracker
     ) -> tuple[ScheduleAction, int]:
@@ -2140,26 +2185,71 @@ class KVCacheV2Scheduler(RequestScheduler):
         A loading request remains outside the schedulable state range.
         """
         first_chunk = req.is_first_context_chunk
-        gate = self._kvrg_track and self.chunking_enabled and not self._kvrg_bypass
+        # A PP stage-agreement reservation (pp_stage_agree.py) records
+        # whether its own admission was refused pages; nothing else does.
+        stage_reserved = first_chunk and reserved_depth(req) is not None
+        # KVRG replays a stock outcome that never holds a stage reservation, so a
+        # reserved first chunk always takes the stock path.
+        gate = (
+            self._kvrg_track
+            and self.chunking_enabled
+            and not self._kvrg_bypass
+            and not stage_reserved
+        )
         if gate:
             # KVRG: replay a failed first chunk's stock outcome while nothing it needs changed.
             gated = self._kvrg_check(req, budget, preempt_for_pages)
             if gated is not None:
                 return gated, 0, False
             self._kvrg_fail_kind = None
+        if stage_reserved:
+            refused_before, self._ctx_page_refused = self._ctx_page_refused, False
         if self._admission_lookahead is None:
             result = self._try_schedule_context_once(req, budget, preempt_for_pages)
         else:
             result = self._try_schedule_context_after_lookahead(req, budget, preempt_for_pages)
 
         if first_chunk and result[0] is not ScheduleAction.SCHEDULED:
-            # Failed admission must not retain prefix-reuse holds. Suspension
-            # alone cannot release them when the last cache tier is full.
-            self.release_context_admission(req)
+            if stage_reserved:
+                # The reservation is a hold on purpose: every stage holds the
+                # agreed prefix until the chunk runs. Keep it, suspended, for a
+                # later pass; the stage agreement gives it back under pressure.
+                self._keep_stage_reservation(req, page_refused=self._ctx_page_refused)
+            else:
+                # Failed admission must not retain prefix-reuse holds. Suspension
+                # alone cannot release them when the last cache tier is full.
+                self.release_context_admission(req)
+        if stage_reserved:
+            self._ctx_page_refused = self._ctx_page_refused or refused_before
 
         if gate:
             self._kvrg_record(req, first_chunk, result[0])
         return result
+
+    def context_pages_refused_last_pass(self) -> bool:
+        """Whether the KV pool refused a context admission in the last pass."""
+        return self._ctx_page_refused
+
+    def _keep_stage_reservation(self, req: LlmRequest, page_refused: bool = False) -> None:
+        """Put back a first chunk that failed admission but holds a stage reservation.
+
+        PP stage agreement only. The caches stay (suspended: a resumed
+        reservation gives its onboarded pages back to the eviction lists of the
+        upper tiers but keeps holding them), and the cursor returns to the
+        start, so a later pass resumes the reservation at the agreed depth.
+        ``page_refused`` (the pool refused it pages, not the token budget) is
+        left on the request for the stage agreement (``py_pp_page_refused``).
+        """
+        req.py_pp_page_refused = page_refused
+        if self.ctx_diag is not None and req.py_request_id in self.kv_cache_manager.kv_cache_map:
+            # Counted whether or not the cache is still active here: a resize
+            # refused pages has already suspended a first chunk's cache.
+            self.ctx_diag.reservation_suspended(page_refused)
+        for manager in (self.kv_cache_manager, self.draft_kv_cache_manager):
+            if manager is not None and req.py_request_id in manager.kv_cache_map:
+                manager.suspend_request(req)
+        self._clear_request_runtime_state(req)
+        rewind_context_after_cache_drop(req, self.tokens_per_block)
 
     def _try_schedule_context_once(
         self,
@@ -2218,6 +2308,130 @@ class KVCacheV2Scheduler(RequestScheduler):
             if manager is not None and req.py_request_id in manager.kv_cache_map:
                 manager.free_resources(req)
         rewind_context_after_cache_drop(req, self.tokens_per_block)
+
+    def adopt_context_chunk(self, req: LlmRequest, chunk_size: int) -> bool:
+        """Size and allocate a context chunk another pipeline rank scheduled.
+
+        Pages are allocated here rather than in ``prepare_resources``, so a chunk
+        this rank's own pass refused (or sized differently) has no pages behind
+        it until this runs. Same steps as ``_try_schedule_context_chunked``
+        after its budget arithmetic: create or resume the cache, then grow it to
+        cover the chunk (plus draft tokens on the last chunk).
+        """
+        if not self._prepare_context_pair(req):
+            return False
+        req.context_chunk_size = chunk_size
+        num_tokens = chunk_size
+        if req.is_last_context_chunk:
+            num_tokens += get_draft_token_length(req)
+        return self._try_allocate_context(req, num_tokens)
+
+    def adopt_first_context_chunk(self, req: LlmRequest, position: int, chunk_size: int) -> bool:
+        """Admit a first context chunk at the reuse depth another pipeline rank chose.
+
+        PP stage agreement only (``pp_stage_agree.py``). The first rank
+        admitted the chunk from ``position``, the depth every stage confirmed;
+        this rank must resume the request at the same position or it would run
+        its layers at other token positions than the hidden states it receives.
+        The request normally holds this rank's reservation at exactly
+        ``position`` (``reserve_first_context_chunk``), which is resumed here.
+        Otherwise -- no reservation, or one at another depth -- the cache is
+        dropped and the prefix claimed afresh, capped at ``position``. Then the
+        chunk is sized and allocated as ``adopt_context_chunk`` does.
+
+        Returns False when the cache or the chunk cannot be allocated.
+
+        Raises:
+            RuntimeError: this rank can reuse less than ``position`` tokens of
+                the prompt, so it cannot run the chunk.
+        """
+        from ..pp_stage_agree import set_reserved_depth, set_reuse_cap
+
+        if self.ctx_diag is not None:
+            self.ctx_diag.first_chunk_adopted(reserved_depth(req), position)
+        set_reuse_cap(req, position)
+        if not self._prepare_context_pair(req):
+            return False
+        reached = req.context_current_position
+        if reached != position:
+            if self.ctx_diag is not None:
+                self.ctx_diag.first_chunk_reclaimed()
+            self.release_context_admission(req)
+            set_reserved_depth(req, None)
+            if not self._prepare_context_pair(req):
+                return False
+            reached = req.context_current_position
+        if reached != position:
+            self.release_context_admission(req)
+            raise RuntimeError(
+                f"PP stage agreement: this rank can resume context request "
+                f"{req.py_request_id} at position {reached} only, but the first PP "
+                f"rank admitted its first chunk at the {position}-token prefix "
+                "every stage confirmed. This rank held no reservation at that "
+                "depth; the chunk cannot run here."
+            )
+        set_reserved_depth(req, None)
+        req.context_chunk_size = chunk_size
+        num_tokens = chunk_size
+        if req.is_last_context_chunk:
+            num_tokens += get_draft_token_length(req)
+        return self._try_allocate_context(req, num_tokens)
+
+    def reserve_first_context_chunk(self, req: LlmRequest, cap: Optional[int]) -> Optional[int]:
+        """Claim and hold the reusable prefix of a waiting first chunk, capped at ``cap``.
+
+        PP stage agreement only (``pp_stage_agree.py``). Drops any cache
+        the request holds, then creates its caches (target, and draft when
+        paired) with the reuse match capped at ``cap`` (None: uncapped) but does
+        not resume them: a created cache holds its matched prefix pages
+        without onboarding them (a held page is never dropped, though it can
+        still move to a lower cache tier), so the depth it returns stays
+        claimable until the chunk is admitted, which resumes it. The request's
+        cursor is left at its start.
+
+        Returns:
+            The depth the claim reached -- after the core pruned it to an
+            endpoint every life cycle has pages for -- or None when no cache
+            could be created now.
+        """
+        from ..pp_stage_agree import set_reserved_depth, set_reuse_cap
+
+        set_reserved_depth(req, None)
+        self.release_context_admission(req)
+        set_reuse_cap(req, cap)
+        if not self._prepare_context_pair(req, resume=False):
+            self.release_context_admission(req)
+            return None
+        depth = self.kv_cache_manager.kv_cache_map[req.py_request_id].num_committed_tokens
+        set_reserved_depth(req, depth)
+        return depth
+
+    def reservation_leaves_chunk_room(self, req: LlmRequest) -> bool:
+        """Whether the pools could still allocate ``req``'s first chunk with every
+        held page where it is.
+
+        PP stage agreement only: a follower stage that already holds a
+        reservation asks this after reserving ``req``'s prefix, and declines the
+        reservation when it is False (``PPStageAgreement.answer_proposals``).
+        The chunk is the largest one the request can get: the rest of its
+        prompt after the reserved depth, at most ``max_num_tokens``.
+        """
+        depth = reserved_depth(req) or 0
+        num_tokens = max(req.prompt_len - depth, 0)
+        if self.max_num_tokens is not None:
+            num_tokens = min(num_tokens, self.max_num_tokens)
+        num_tokens += get_draft_token_length(req)
+        for manager in (self.kv_cache_manager, self._joint_draft_manager):
+            if manager is None:
+                continue
+            has_room = getattr(manager, "has_room_for_context_tokens", None)
+            if has_room is not None and not has_room(num_tokens):
+                return False
+        return True
+
+    def adopt_generation_step(self, req: LlmRequest) -> bool:
+        """Grow a generation request's cache for a step another pipeline rank scheduled."""
+        return self._try_allocate_generation(req)
 
     def _try_schedule_context_full(
         self,
@@ -2476,11 +2690,14 @@ class KVCacheV2Scheduler(RequestScheduler):
         draft_manager = self._joint_draft_manager
         if draft_manager is None:
             return None
+        # A cross-stage cap (PP stage agreement) bounds both pools' claim.
+        cap = getattr(req, "py_pp_reuse_cap", None)
         draft_match = draft_manager.probe_context_reuse(req)
         target_match = self.kv_cache_manager.probe_context_reuse(req)
         if draft_match is None or target_match is None:
-            return None
-        return min(draft_match, target_match)
+            return cap
+        common = min(draft_match, target_match)
+        return common if cap is None else min(common, cap)
 
     def _admit_unpaired_draft(self, req: LlmRequest) -> bool:
         """Create and resume an unpaired draft mirror as part of admitting *req*.
@@ -2555,12 +2772,25 @@ class KVCacheV2Scheduler(RequestScheduler):
             return False
         return draft_manager.mirror_admission_certainly_blocked(req)
 
-    def _prepare_context_pair(self, req: LlmRequest) -> bool:
-        """Prepare target/draft caches with one verified logical reuse depth."""
+    def _prepare_context_pair(self, req: LlmRequest, resume: bool = True) -> bool:
+        """Prepare target/draft caches with one verified logical reuse depth.
+
+        ``resume=False`` (``reserve_first_context_chunk``, first chunks only)
+        creates the caches without resuming them and leaves the cursor and the
+        unpaired draft mirror alone.
+        """
         from ..kv_cache.kv_cache_manager_v2 import _settle_context_cursor
 
+        if resume:
+            claim = lambda manager, limit: manager.prepare_context_cache(req, limit)  # noqa: E731
+        else:
+            claim = lambda manager, limit: manager.prepare_context_cache(  # noqa: E731
+                req, limit, resume=False
+            )
         draft_manager = self._joint_draft_manager
         if draft_manager is None:
+            if not resume:
+                return self.kv_cache_manager.prepare_context(req, resume=False)
             if not self.kv_cache_manager.prepare_context(req):
                 return False
             if self._admit_unpaired_draft(req):
@@ -2585,11 +2815,11 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Both pools claim the depth paired above, so they normally agree first
         # time; the target claim still caps to the draft's in case an eviction
         # landed between the probe and the claim.
-        draft_reuse = draft_manager.prepare_context_cache(req, self._reuse_claim_limit(req))
+        draft_reuse = claim(draft_manager, self._reuse_claim_limit(req))
         if draft_reuse is None:
             self._free_kv_caches(req)
             return False
-        common_reuse = self.kv_cache_manager.prepare_context_cache(req, draft_reuse)
+        common_reuse = claim(self.kv_cache_manager, draft_reuse)
         if common_reuse is None:
             self._free_kv_caches(req)
             return False
@@ -2598,11 +2828,11 @@ class KVCacheV2Scheduler(RequestScheduler):
             # The shorter re-claim can itself fall short, so drop straight to
             # no reuse rather than iterate against an eviction we do not own.
             draft_manager.free_resources(req)
-            draft_reuse = draft_manager.prepare_context_cache(req, common_reuse)
+            draft_reuse = claim(draft_manager, common_reuse)
             if draft_reuse != common_reuse:
                 self._free_kv_caches(req)
-                common_reuse = self.kv_cache_manager.prepare_context_cache(req, 0)
-                draft_reuse = draft_manager.prepare_context_cache(req, 0)
+                common_reuse = claim(self.kv_cache_manager, 0)
+                draft_reuse = claim(draft_manager, 0)
                 if common_reuse is None or draft_reuse is None:
                     self._free_kv_caches(req)
                     return False
@@ -2614,6 +2844,8 @@ class KVCacheV2Scheduler(RequestScheduler):
                         f"{req.py_request_id}: target={common_reuse}, draft={draft_reuse}"
                     )
 
+        if not resume:
+            return True
         # No enable_block_reuse guard: reaching here means a paired draft pool
         # exists, and KvCacheCreator only pairs when block reuse is on.
         _settle_context_cursor(req, common_reuse, self.kv_cache_manager.tokens_per_block)
@@ -3002,8 +3234,11 @@ class KVCacheV2Scheduler(RequestScheduler):
             req.is_context_init_state and not req.is_first_context_chunk
         ) or req.is_generation_in_progress_state
 
-    def _suspend_request(self, req: LlmRequest) -> None:
+    def _suspend_request(self, req: LlmRequest, evicted: bool = False) -> None:
         """Suspend a request's KV cache in both main and draft managers.
+
+        ``evicted`` marks a suspension that frees pages for a generation step;
+        only the opt-in context-path counters (``ctx_diag``) read it.
 
         TODO: Also release PEFT resources (mark_request_done) for the
         suspended request so the C++ PeftCacheManager can evict its
@@ -3011,6 +3246,12 @@ class KVCacheV2Scheduler(RequestScheduler):
         remains "active" on device, which could cause ensure_batch to
         fail if it needs to load a different adapter into a full cache.
         """
+        if (
+            self.ctx_diag is not None
+            and req.is_context_init_state
+            and self.kv_cache_manager.is_request_active(req.py_request_id)
+        ):
+            self.ctx_diag.context_suspended(not req.is_first_context_chunk, evicted)
         self._clear_request_runtime_state(req)
         self.kv_cache_manager.suspend_request(req)
         if self.draft_kv_cache_manager is not None:
@@ -3300,6 +3541,22 @@ class KVCacheV2Scheduler(RequestScheduler):
     # PEFT budget, IndexMapper slots) clear long before.
     _DEADLOCK_STALL_ITERS = 1000
 
+    # First chunks the PP stage agreement (pp_stage_agree.py) held out of
+    # this pass after a full sweep found none admissible alone; the deadlock
+    # check counts them as context candidates. Set by the first PP rank only.
+    stage_held_context_candidates = 0
+
+    # Per-stage counters of the context path (disaggregated PP server,
+    # pp_ctx_diag.py), set by the executor; None counts nothing.
+    ctx_diag = None
+
+    # With the PP stage agreement (pp_stage_agree.py): set on the first
+    # PP rank, which then records the ids of the context requests of each pass
+    # in the order their chunks were allocated (last_context_admission_order),
+    # before the batch is sorted, for the other ranks to adopt in that order.
+    record_context_admission_order = False
+    last_context_admission_order: list[int] | None = None
+
     # States in which an in-flight KV transfer still owns pages it is about to
     # release: a context-only request sending its cache after prefill, one
     # whose send landed and which the executor has yet to reap, and a
@@ -3311,6 +3568,27 @@ class KVCacheV2Scheduler(RequestScheduler):
             LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS.value,
         }
     )
+
+    def pages_return_pending(self, active_requests: RequestList) -> bool:
+        """Whether pages held now come back without a scheduling decision.
+
+        A KV transfer in flight, a connector load in flight or a preemption
+        awaiting the connector's saves: the cases in which ``_detect_deadlock``
+        does not count a pass that reclaimed nothing. The PP stage agreement
+        (``pp_stage_agree.py``) uses it the same way: such a pass is not
+        a stalled one.
+        """
+        return (
+            any(self._has_pending_connector_load(r) for r in active_requests)
+            or self.kv_cache_manager.has_pending_preemption()
+            or any(
+                req.state_value in self._TRANSFER_HOLDING_STATE_VALUES for req in active_requests
+            )
+            or (
+                self._async_transfer_manager is not None
+                and self._async_transfer_manager.has_any_inflight_requests()
+            )
+        )
 
     def _detect_deadlock(
         self,
@@ -3344,10 +3622,13 @@ class KVCacheV2Scheduler(RequestScheduler):
             and r.request_id not in inflight_request_ids
             and not self._has_pending_connector_load(r)
         )
-        num_ctx_candidates = sum(
-            1
-            for r in pending_ctx
-            if r.py_request_id not in preempted_ids and r.request_id not in inflight_request_ids
+        num_ctx_candidates = (
+            sum(
+                1
+                for r in pending_ctx
+                if r.py_request_id not in preempted_ids and r.request_id not in inflight_request_ids
+            )
+            + self.stage_held_context_candidates
         )
         if num_gen_candidates == 0 and num_ctx_candidates == 0:
             # Legitimately idle: nothing to schedule.
@@ -3547,6 +3828,8 @@ class KVCacheV2Scheduler(RequestScheduler):
                 "deferred until its connector saves retire"
             )
             return False
+        if self.ctx_diag is not None and req.is_context_init_state:
+            self.ctx_diag.context_preempted(not req.is_first_context_chunk)
         self._clear_request_runtime_state(req)
         if self.draft_kv_cache_manager is not None:
             self.draft_kv_cache_manager.free_resources(req)
@@ -3585,7 +3868,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                 f"[V2Scheduler] Evicting request {victim.py_request_id} "
                 f"(state={victim.state.name}) to free pages for request {req.py_request_id}"
             )
-            self._suspend_request(victim)
+            self._suspend_request(victim, evicted=True)
             evicted.append(victim)
             req_it_end = victim_idx
 

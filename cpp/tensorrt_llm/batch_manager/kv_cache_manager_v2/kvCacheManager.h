@@ -296,6 +296,47 @@ public:
     // the SUSPENDED state.
     std::pair<int64_t, int64_t> getAndResetIterationSuspendResumeStats();
 
+    //! Cumulative counters of pages demoted by ChainDemoteHandle::demote(): destroyed while demoted, and
+    //! rescued by a hold or a re-commit. Takes the shared API lock.
+    [[nodiscard]] StorageManager::DemotionStats demotionStats() const;
+
+    //! Counters of the remote host tier (level -1 when none is configured), plus the cumulative cached tokens
+    //! matched at that level. Lock-free, and safe to call after shutdown (see StorageManager::remoteHostStats()).
+    struct RemoteHostTierStats
+    {
+        StorageManager::RemoteHostStats storage;
+        uint64_t hitTokens = 0;
+    };
+
+    [[nodiscard]] RemoteHostTierStats remoteHostTierStats() const noexcept;
+
+    //! Adds cached tokens a reuse match found at the remote host level. Called when the match is made, whether or
+    //! not stats are enabled (so the remote hit count can be read with iteration stats off). Lock-free.
+    void recordRemoteHostHitTokens(int64_t numTokens) noexcept;
+
+    //! Reserved address ranges (base, bytes) of the remote host tier; empty without one.
+    [[nodiscard]] std::vector<std::pair<MemAddress, size_t>> remoteHostAddressRanges() const;
+
+    // ---- Store level ----------------------------------------------------------
+    //
+    // A store level (DiskCacheTierConfig::store) is the last level, directly below the local host level, whose slots
+    // are objects of an external store. It cannot move a page until its IO table (storeLevelIo.h) is attached.
+
+    //! Attach the IO table (storeLevelIo.h) of the store level: checks abiVersion/structBytes, self-tests the
+    //! completion ring, registers every host-level pool range and the page staging range (registerMemory), then calls
+    //! configure() with the store level's pool-group slot bytes and slot counts. Throws std::invalid_argument without a
+    //! store level or when one is attached; std::runtime_error("store level: <step> failed with <code>") on a non-zero
+    //! table answer (ranges registered so far are unregistered first).
+    void attachStoreLevelIo(std::uintptr_t table);
+    //! Waits until every enqueued op was submitted and the table drained (timeoutS), then unregisters every range.
+    //! Throws std::runtime_error if ops remain. Idempotent. Called by shutdown() after clearReusableBlocks().
+    void detachStoreLevelIo(double timeoutS = 120.0);
+    //! Keep at least `bytes` free in `level` (split by the level's current pool-group byte ratio), evicting its LRU
+    //! pages one level down; returns the slots evicted. Capped by the evictable pages (never throws OutOfPagesError).
+    SlotCount keepFreeBytes(CacheLevel level, size_t bytes);
+    //! Store level counters plus the IO table's stats (level -1 without a store level). Takes no API lock.
+    [[nodiscard]] StoreLevelStatsAll storeLevelStats() const noexcept;
+
     void markStatsDirty(std::optional<RequestIdType> kvCacheId);
     void clearStatsDirty(std::optional<RequestIdType> kvCacheId);
     std::unordered_set<RequestIdType> getDirtyStatsKvCacheIds() const;
@@ -464,6 +505,8 @@ private:
     int64_t mIterResumedRequests{0};
     int64_t mIterDiskPrefetchBlocks{0};
     CountsByLevel mIterCachedTokensByLevel;
+    // Cumulative cached tokens matched at the remote host level (see remoteHostTierStats()).
+    std::atomic<uint64_t> mRemoteHostHitTokens{0};
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

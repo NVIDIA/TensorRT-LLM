@@ -491,6 +491,13 @@ public:
         return result;
     }
 
+    // Hand the stream to the caller, after the scope ended: it returns to the pool when the caller drops it rather
+    // than when this object is destroyed. get() returns nullptr afterwards.
+    [[nodiscard]] CachedCudaStream takeStream() noexcept
+    {
+        return std::move(mStream);
+    }
+
 private:
     CachedCudaStream mStream;
     CachedCudaEvent mFinishEvent = CachedCudaEvent::makeNull();

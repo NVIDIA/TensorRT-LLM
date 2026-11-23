@@ -387,6 +387,10 @@ def make_ctx_request(
     req.encoder_output_len = encoder_output_len
     req.py_encoder_output_ready_event = None
     req.py_skip_cross_kv_projection = False
+    # The scheduler reads these with getattr defaults, so a bare Mock would answer
+    # with a truthy Mock: no pipeline stage reuse cap and no stage reservation.
+    req.py_pp_reuse_cap = None
+    req.py_pp_reserved_depth = None
     return req
 
 
@@ -2965,6 +2969,154 @@ class TestDisagg:
         # In production, this would crash IndexMapper (only 3 slots = 2+1 dummy).
         assert ids(out2.fitting_disagg_gen_init_requests) == [2, 3]
         assert prepare_count[0] == 4  # <-- proves the overflow
+
+
+class TestDisaggGenFitGate:
+    """Scheduler side of the opt-in generation-init fit gate (TLLM_KV_DISAGG_GEN_FIT_GATE).
+
+    The manager's ``prepare_disagg_gen_init`` runs the size-aware check; the scheduler keeps
+    generation-init admission in arrival order within a pass. The gate itself is covered in
+    ``test_disagg_gen_fit_gate.py``.
+    """
+
+    @staticmethod
+    def _pool_manager(gate, used, total, need_by_id):
+        """A manager whose prepare_disagg_gen_init checks the gate against a page pool."""
+        pool = {"used": list(used)}
+
+        def prepare(req):
+            need = need_by_id[req.request_id]
+            if gate is not None and not gate.check(
+                pool["used"], need, total, request_id=req.py_request_id
+            ):
+                return False
+            # The allocation itself fails when the pool cannot hold the request.
+            if any(u + n > t for u, n, t in zip(pool["used"], need, total)):
+                return False
+            pool["used"] = [u + n for u, n in zip(pool["used"], need)]
+            if gate is not None:
+                gate.note_admitted(req.py_request_id)
+            return True
+
+        mgr = make_kv_cache_manager(prepare_disagg_gen_init_fn=prepare)
+        mgr.disagg_gen_fit_gate = gate
+        return mgr, pool
+
+    @staticmethod
+    def _gate():
+        from tensorrt_llm._torch.pyexecutor.kv_cache.disagg_gen_fit_gate import DisaggGenFitGate
+
+        return DisaggGenFitGate(0.99, log_every_passes=0)
+
+    def test_off_skips_past_a_refused_gen_init(self):
+        """Gate off (default): a refused generation-init does not hold back later ones."""
+        mgr = make_kv_cache_manager(prepare_disagg_gen_init_fn=lambda req: req.request_id != 0)
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        # A Mock manager answers any attribute; only a real gate turns the FIFO on.
+        assert sched._disagg_gen_fit_gate is None
+        reqs = [make_disagg_request(i) for i in range(3)]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.fitting_disagg_gen_init_requests) == [1, 2]
+        assert mgr.prepare_disagg_gen_init.call_count == 3
+
+    def test_fifo_stops_later_gen_inits_in_the_pass(self):
+        gate = self._gate()
+        need = {0: [1, 40], 1: [1, 400], 2: [1, 10], 3: [1, 5]}
+        mgr, pool = self._pool_manager(gate, used=[0, 600], total=[100, 1_000], need_by_id=need)
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        assert sched._disagg_gen_fit_gate is gate
+        reqs = [make_disagg_request(i) for i in range(4)]
+        out = sched.schedule_request(reqs, set())
+        # Request 1 does not fit; 2 and 3 would, but must not overtake it.
+        assert ids(out.fitting_disagg_gen_init_requests) == [0]
+        assert [c.args[0].request_id for c in mgr.prepare_disagg_gen_init.call_args_list] == [
+            0,
+            1,
+        ]
+        assert pool["used"] == [1, 640]
+        assert gate.stats["fit_refused"] == 1
+        assert gate.stats["fifo_blocked"] == 2
+        assert gate.stats["fifo_blocked_passes"] == 1
+        assert not gate.pass_blocked
+
+    def test_generation_requests_are_not_blocked(self):
+        gate = self._gate()
+        need = {0: [1, 400], 1: [1, 10]}
+        mgr, _ = self._pool_manager(gate, used=[0, 600], total=[100, 1_000], need_by_id=need)
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        reqs = [
+            make_gen_request(10),
+            make_disagg_request(0),
+            make_gen_request(11),
+            make_disagg_request(1),
+            make_gen_request(12),
+        ]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.fitting_disagg_gen_init_requests) == []
+        assert ids(out.generation_requests) == [10, 11, 12]
+        assert gate.stats["fifo_blocked"] == 1
+
+    def test_next_pass_starts_unblocked(self):
+        gate = self._gate()
+        need = {1: [1, 300], 2: [1, 10]}
+        mgr, pool = self._pool_manager(gate, used=[0, 700], total=[100, 1_000], need_by_id=need)
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        reqs = [make_disagg_request(1), make_disagg_request(2)]
+        assert ids(sched.schedule_request(reqs, set()).fitting_disagg_gen_init_requests) == []
+        # Residents finished: the long prompt goes first, then the short one.
+        pool["used"] = [0, 400]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.fitting_disagg_gen_init_requests) == [1, 2]
+        assert gate.stats["passes"] == 2
+        assert gate.stats["fifo_blocked_passes"] == 1
+
+    def test_refusal_for_any_reason_blocks_the_pass(self):
+        """An index-slot, resume-gate or resize refusal keeps later gen-inits waiting too."""
+        gate = self._gate()
+        mgr = make_kv_cache_manager(prepare_disagg_gen_init_fn=lambda req: req.request_id != 0)
+        mgr.disagg_gen_fit_gate = gate
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        out = sched.schedule_request([make_disagg_request(i) for i in range(3)], set())
+        assert ids(out.fitting_disagg_gen_init_requests) == []
+        assert mgr.prepare_disagg_gen_init.call_count == 1
+        assert gate.stats["fifo_blocked"] == 2
+
+    def test_a_never_fitting_head_does_not_stall_later_gen_inits(self):
+        """A gen-init needing more pages than the pool has fails its allocation every pass;
+        it must not hold back every later gen-init forever."""
+        gate = self._gate()
+        need = {0: [1, 1_200], 1: [1, 10], 2: [1, 10]}
+        mgr, pool = self._pool_manager(gate, used=[0, 0], total=[100, 1_000], need_by_id=need)
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        reqs = [make_disagg_request(i) for i in range(3)]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.fitting_disagg_gen_init_requests) == [1, 2]
+        for _ in range(5):
+            out = sched.schedule_request([reqs[0]], set())
+            assert ids(out.fitting_disagg_gen_init_requests) == []
+        assert pool["used"] == [2, 20]
+        assert gate.stats["never_admissible"] == 6
+        assert gate.stats["fifo_blocked"] == 0
+
+    def test_suspended_resident_blocks_gen_inits_until_it_resumes(self):
+        """A started generation request whose cache is suspended gets its pages back before
+        any newer gen-init takes them."""
+        gate = self._gate()
+        need = {0: [1, 10], 1: [1, 10]}
+        mgr, pool = self._pool_manager(gate, used=[0, 100], total=[100, 1_000], need_by_id=need)
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        mgr.kv_cache_map[10].is_active = False
+        reqs = [make_disagg_request(0), make_gen_request(10), make_disagg_request(1)]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.fitting_disagg_gen_init_requests) == []
+        mgr.prepare_disagg_gen_init.assert_not_called()
+        assert gate.stats["resident_blocked"] == 2
+        assert gate.stats["resident_blocked_passes"] == 1
+        # Resumed: the next pass admits in arrival order.
+        mgr.kv_cache_map[10].is_active = True
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.fitting_disagg_gen_init_requests) == [0, 1]
+        assert pool["used"] == [2, 120]
 
 
 # ===========================================================================
@@ -5898,6 +6050,76 @@ class TestKVRetryGate:
         sched._stalled_schedules = sched._DEADLOCK_STALL_ITERS // 2
         sched.schedule_request([ctx], set())
         assert _resize_attempts(mgr) == [1, 1]
+
+
+# ===========================================================================
+# Started prefills and first chunks
+# ===========================================================================
+
+
+@pytest.fixture
+def started_prefill_env(monkeypatch):
+    for name in (
+        _INTERVAL_ENV,
+        _SPF_ENV,
+        _AGING_ENV,
+    ):
+        monkeypatch.delenv(name, raising=False)
+    return monkeypatch
+
+
+def _started(request_id, remaining, prompt_len=500_000, last=False):
+    return make_ctx_request(
+        request_id,
+        context_remaining_length=remaining,
+        prompt_len=prompt_len,
+        is_first_context_chunk=False,
+        is_last_context_chunk=last,
+    )
+
+
+def _crowded_long_prefill(sched, passes):
+    """Run *passes* passes of one long started prompt plus one new short arrival each.
+
+    Returns, per pass, the admitted request ids and the long prompt's chunk
+    size (0 when it got no tokens).
+    """
+    long_ctx = _started(1, remaining=4096)
+    history = []
+    for request_id in range(2, 2 + passes):
+        long_ctx.context_chunk_size = 0
+        out = sched.schedule_request([long_ctx, make_ctx_request(request_id, 128)], set())
+        admitted = ids(out.context_requests)
+        history.append((admitted, long_ctx.context_chunk_size if 1 in admitted else 0))
+        if 1 in admitted:
+            _admit_chunk(long_ctx)
+    return history
+
+
+class TestStartedPrefills:
+    def test_shortest_prefill_first_lets_short_arrivals_ahead(self, started_prefill_env):
+        """Shortest prefill first: every short arrival goes ahead and the long
+        started prompt only gets what is left of the budget."""
+        started_prefill_env.setenv(_SPF_ENV, "1")
+        sched = make_scheduler(
+            _reuse_settling_manager({}), max_num_tokens=192, ctx_chunk_config=(None, 64)
+        )
+        history = _crowded_long_prefill(sched, 8)
+        assert len(history) == 8
+        assert all(chunk == 64 for _, chunk in history)
+
+    def test_first_chunk_ahead_in_order_runs_before_a_started_prompt(self, started_prefill_env):
+        """At aging factor 0 shortest prefill first keeps arrival order, which here puts a
+        first chunk ahead of a started prompt."""
+        started_prefill_env.setenv(_SPF_ENV, "1")
+        started_prefill_env.setenv(_AGING_ENV, "0")
+        sched = make_scheduler(
+            _reuse_settling_manager({}), max_num_tokens=128, ctx_chunk_config=(None, 64)
+        )
+        fresh = make_ctx_request(2, 8192)
+        started = _started(1, remaining=640)
+        out = sched.schedule_request([fresh, started], set())
+        assert ids(out.context_requests) == [2]
 
 
 # ===========================================================================

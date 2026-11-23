@@ -123,8 +123,8 @@ static void twoHopTransfer(
     }
 }
 
-void CopyEngine::transfer(
-    CacheTier dstTier, CacheTier srcTier, size_t numBytes, std::vector<CopyTask> const& tasks, CUstream stream)
+void CopyEngine::transfer(CacheTier dstTier, CacheTier srcTier, size_t numBytes, std::vector<CopyTask> const& tasks,
+    CUstream stream, bool remoteHost)
 {
     // Nothing to copy. Also guards the two-hop path against a div-by-zero on
     // `buf.size() / numBytes` when numBytes == 0.
@@ -132,6 +132,8 @@ void CopyEngine::transfer(
     {
         return;
     }
+    TLLM_CHECK_WITH_INFO(!remoteHost || (dstTier == CacheTier::HOST_MEM && srcTier == CacheTier::HOST_MEM),
+        "CopyEngine: the remote host route is for host-to-host transfers only");
 
     constexpr auto G = CacheTier::GPU_MEM;
     constexpr auto H = CacheTier::HOST_MEM;
@@ -145,6 +147,11 @@ void CopyEngine::transfer(
         twoHopTransfer<G, H, D>(pageStagingManager(), numBytes, tasks, stream);
     else if (dstTier == H && srcTier == G)
         dispatchCopy<H, G>(tasks, numBytes, stream);
+    else if (dstTier == H && srcTier == H && remoteHost)
+    {
+        // Both sides are GPU-accessible host addresses; G<-H runs the same low-bandwidth kernel as H<-G.
+        dispatchCopy<G, H>(tasks, numBytes, stream);
+    }
     else if (dstTier == H && srcTier == H)
         dispatchCopy<H, H>(tasks, numBytes, stream);
     else if (dstTier == H && srcTier == D)

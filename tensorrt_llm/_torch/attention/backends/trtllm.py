@@ -51,6 +51,8 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
                         KVCacheParams, MLAParams, PositionalEmbeddingParams,
                         PredefinedAttentionMask, RopeParams,
                         merge_attention_forward_args)
+from .prompt_lens_guard import (PROMPT_LENS_GUARD_ENV, PROMPT_LENS_GUARD_MODE,
+                                PromptLensH2DGuard)
 from .sparse.hooks import prepare_sparse_runtime_params
 from .sparse.params import BlockSparseForwardInputs, SparseParams
 from .sparse.skip_softmax import SkipSoftmaxParams
@@ -95,6 +97,44 @@ def _resolve_uses_spcompress(sparse_params: Optional[SparseParams],
     return False
 
 
+_num_prompt_lens_guards = 0
+
+
+def _make_prompt_lens_guard(
+        metadata: "TrtllmAttentionMetadata") -> Optional[PromptLensH2DGuard]:
+    """The ``TLLM_ATTN_PROMPT_LENS_GUARD`` state of one metadata instance, or
+    None when the knob is off (see ``prompt_lens_guard``)."""
+    global _num_prompt_lens_guards
+    if PROMPT_LENS_GUARD_MODE is None:
+        return None
+    index = _num_prompt_lens_guards
+    _num_prompt_lens_guards += 1
+    pp_rank = getattr(metadata.mapping, "pp_rank", None)
+    kind = "CUDA-graph" if metadata.is_cuda_graph else "eager"
+    name = f"TrtllmAttentionMetadata #{index} (PP rank {pp_rank}, {kind})"
+    if index == 0:
+        if PROMPT_LENS_GUARD_MODE == "fresh":
+            action = (
+                "the prompt_lens host-to-device copy reads a fresh pinned "
+                "block per prepare(); open windows are counted, never "
+                "waited on")
+        elif PROMPT_LENS_GUARD_MODE == "fix":
+            action = ("prepare() waits for the previous prompt_lens copy "
+                      "before rewriting its pinned source when that copy has "
+                      "not run yet")
+        else:
+            action = ("prepare() counts and logs a rewrite of the pinned "
+                      "prompt_lens source while the previous copy has not run "
+                      "yet, without waiting")
+        logger.info(f"{PROMPT_LENS_GUARD_ENV}={PROMPT_LENS_GUARD_MODE} on PP "
+                    f"rank {pp_rank}: {action}.")
+    return PromptLensH2DGuard(PROMPT_LENS_GUARD_MODE,
+                              name,
+                              warn=logger.warning,
+                              info=logger.info,
+                              pin_memory=prefer_pinned())
+
+
 @functools.cache
 def generate_spec_decoding_position_offsets(max_num_requests: int,
                                             draft_len: int) -> torch.Tensor:
@@ -126,6 +166,8 @@ def generate_spec_decoding_packed_mask(max_num_requests: int,
 class TrtllmAttentionMetadata(AttentionMetadata):
     # A step-input stager while it records this metadata's writes, else None.
     step_input_stager: ClassVar[Optional["StepInputStager"]] = None
+    # Set per instance in _post_init_with_buffers (TLLM_ATTN_PROMPT_LENS_GUARD).
+    _prompt_lens_guard = None
     workspace: Optional[torch.Tensor] = None
     cuda_graph_workspace: Optional[torch.Tensor] = None
     workspace_reclaimable: bool = field(default=True, init=False)
@@ -412,6 +454,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             device='cpu',
             pin_memory=prefer_pinned(),
         )
+        # TLLM_ATTN_PROMPT_LENS_GUARD (None when off): guards the reuse of
+        # prompt_lens_cpu as the source of a non-blocking copy.
+        self._prompt_lens_guard = _make_prompt_lens_guard(self)
         self.kv_lens_cuda = self.get_empty_like(
             buffers,
             self.prompt_lens_cuda,
@@ -999,13 +1044,23 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             dtype=torch.int,
             device='cpu',
         )
+        guard = self._prompt_lens_guard
+        if guard is not None:
+            # Before the rewrite: the previous native copy may still read it.
+            guard.before_rewrite(prompt_lens)
         self.prompt_lens_cpu[:self.num_seqs].copy_(prompt_lens)
         stager = self.step_input_stager
         if stager is None or not stager.copy(
                 self.prompt_lens_cuda[:self.num_seqs],
                 self.prompt_lens_cpu[:self.num_seqs]):
-            self.prompt_lens_cuda[:self.num_seqs].copy_(
-                self.prompt_lens_cpu[:self.num_seqs], non_blocking=True)
+            if guard is None:
+                self.prompt_lens_cuda[:self.num_seqs].copy_(
+                    self.prompt_lens_cpu[:self.num_seqs], non_blocking=True)
+            else:
+                source = guard.copy_source(self.prompt_lens_cpu[:self.num_seqs])
+                self.prompt_lens_cuda[:self.num_seqs].copy_(source,
+                                                            non_blocking=True)
+                guard.after_native_copy(self.prompt_lens_cpu[:self.num_seqs])
 
         # number of tokens in the kv cache for each sequence in the batch
         cached_token_lens = torch.tensor(
@@ -1064,6 +1119,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.kv_lens_cuda[:self.num_seqs].copy_(maybe_pin_memory(
                 kv_lens[:self.num_seqs]),
                                                     non_blocking=True)
+        if guard is not None:
+            guard.note_kv_lens(kv_lens[:self.num_seqs])
         # total kv lens for context requests and generation requests, without extra tokens
         self.host_total_kv_lens[0] = kv_lens[:self.num_contexts].sum().item()
         self.host_total_kv_lens[1] = kv_lens[self.num_contexts:self.

@@ -14,7 +14,8 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from enum import IntEnum
 from queue import Queue
-from typing import (TYPE_CHECKING, Dict, Iterable, Iterator, List, Literal,
+from types import SimpleNamespace
+from typing import (TYPE_CHECKING, Any, Dict, Iterable, Iterator, List, Literal,
                     NoReturn, Optional, Tuple, Union)
 
 import torch
@@ -63,9 +64,13 @@ from ..disaggregation.orchestration.admission import \
 from ..disaggregation.orchestration.coordinator import (
     DisaggTransferCoordinator, NoopDisaggCoordinator, attach_ctx_usage,
     transfer_window_bypass_eligible)
-from ..disaggregation.orchestration.pp_termination import \
-    DisaggPPTerminationHandler
+from ..disaggregation.orchestration.pp_lagged_consensus import (
+    PPDisaggLaggedConsensus, create_pp_disagg_lagged_consensus,
+    pp_disagg_lagged_consensus_applies)
+from ..disaggregation.orchestration.pp_termination import (
+    DisaggPPTerminationHandler, LaggedDisaggPPTerminationHandler)
 from ..disaggregation.orchestration.transfer_manager import AsyncTransferManager
+from ..disaggregation.pp_dflash_context import pp_dflash_context_enabled
 from ..distributed import Distributed
 from ..distributed.communicator import ReduceOp
 from ..models.modeling_multimodal_mixin import \
@@ -96,8 +101,15 @@ from .hang_detector import (HangDetector, all_ranks_crashed,
                             start_rank_crash_kill_watchdog)
 from .hang_diagnostics import create_executor_hang_diagnostics
 from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from .kv_cache.longchain_protect import \
+    conversation_key as longchain_conversation_key
+from .kv_cache.longchain_protect import \
+    parse_config as parse_longchain_protect_config
 from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
                                            MixedMambaHybridCacheManager)
+from .kv_cache.subagent_idle_drop import chain_key as subagent_idle_chain_key
+from .kv_cache.subagent_idle_drop import \
+    parse_triggers as parse_subagent_idle_drop_triggers
 from .kv_cache_stats import append_kv_cache_iteration_stats
 from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID, ExecutorRequest,
                           LlmRequest, LlmRequestState, LlmResponse,
@@ -107,6 +119,22 @@ from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID, ExecutorRequest,
                           rewind_context_after_cache_drop)
 from .model_engine import ModelEngine
 from .perf_metrics_manager import PerfMetricsManager
+from .pp_admission import (ADMISSION_REPORT_KEY, Candidate, PPAdmissionLedger,
+                           ScheduledChunk, StageSnapshot)
+from .pp_ctx_diag import PPCtxDiag
+from .pp_ring import (executed_microbatch_offset, last_rank_due_relay_slot,
+                      relay_lag, resolve_num_micro_batches)
+from .pp_spec_relay import (encode_compact_spec_relay,
+                            expand_compact_spec_relay, is_compact_spec_relay,
+                            relay_payload_bytes)
+# yapf: disable
+from .pp_stage_agree import (DEFAULT_MAX_RESERVED, MAX_LOGGED_DISAGREEMENTS,
+                             MAX_LOGGED_PINS, RESERVED_DEPTH_ATTR,
+                             SPF_MAX_WAIT_ITERATIONS, PPStageAgreement,
+                             is_waiting_context, is_waiting_first_chunk,
+                             pp_stage_agree_layout, probe_lag,
+                             set_reserved_depth, spf_aged_slots)
+# yapf: enable
 from .pp_utils import (MpiProgressPump, PPCommTag, get_with_mpi_progress,
                        make_mpi_progress_exit_hook, make_mpi_progress_pump)
 from .profiling import PROFILE_START_STOP_ENV_VAR_NAME, PyExecutorProfileManager
@@ -430,6 +458,10 @@ class BatchState:
 @dataclasses.dataclass
 class BatchStatePP(BatchState):
     microbatch_id: int = -1
+    # PP stage agreement only: request id -> end of the context chunk this
+    # micro-batch ran, captured at launch (the live cursor moves on with the
+    # chunks launched after it).
+    context_chunk_ends: Optional[Dict[int, int]] = None
 
 
 @dataclasses.dataclass
@@ -471,6 +503,70 @@ class PyExecutor:
     # close (TRTLLM_KV_DEFER_CLOSE=1). Declared on the class so instances built
     # without running __init__ read it too.
     _kv_defer_close_armed = False
+    # Cross-stage reuse agreement (pp_stage_agree.py) and
+    # the first rank's request ids it holds out of the current scheduler pass.
+    # Declared on the class so instances built without __init__ read them too.
+    _pp_stage_agree: Optional[PPStageAgreement] = None
+    _pp_stage_agree_held: frozenset = frozenset()
+    _pp_stage_agree_exhausted_logged = False
+    # Admission back-pressure of a pipeline-parallel DFlash context server
+    # with the stage agreement (pp_admission.py):
+    # the first rank's ledger of the followers' KV room (None when off), the
+    # first chunks it holds out of the current scheduler pass for lack of room
+    # on a follower, and whether it held one back. Declared on the class so
+    # instances built without __init__ read them too.
+    _pp_admission: Optional[PPAdmissionLedger] = None
+    _pp_admission_held: frozenset = frozenset()
+    _pp_admission_blocked = False
+    # Follower: host time spent building its pool snapshots, and how many.
+    _pp_admission_snapshot_seconds = 0.0
+    _pp_admission_num_snapshots = 0
+    # Per-stage counters of the context path of a disaggregated PP server
+    # (pp_ctx_diag.py). Declared on the class so instances built without
+    # __init__ read it too.
+    _pp_ctx_diag: Optional[PPCtxDiag] = None
+    # Whether the last PP rank relays only the sampled rows of a SpecSampler
+    # host state (disaggregated PP server, pp_spec_relay.py). Declared on
+    # the class so instances built without __init__ read it too.
+    _pp_compact_spec_relay = False
+    # Whether this executor takes part in disaggregated serving (it was given a
+    # KV cache transceiver); with pipeline_parallel_size > 1 it runs the PP
+    # context-server paths. Declared on the class for the same reason.
+    _pp_disaggregated = False
+    # Whether this follower applies the released reservations of a schedule
+    # message before adopting its batch (stage agreement with block reuse,
+    # _pp_stage_agree_early_release), what it applied in the current
+    # iteration, and how many applications it logged. Declared on the class so
+    # instances built without __init__ read them too.
+    _pp_follower_early_release = False
+    _pp_early_released: Optional[Dict[int, tuple]] = None
+    _pp_early_release_logs = 0
+    _pp_early_release_in_batch_warned = False
+    # Idle child-chain demotion (TLLM_KV_SUBAGENT_IDLE_DROP_S,
+    # subagent_idle_drop.py): whether it runs on this rank, this rank's PP loop
+    # pass count, and the keys the first rank demoted at the current pass, to
+    # be stamped on its schedule message. Declared on the class so instances
+    # built without __init__ read them too.
+    _subagent_idle_drop_on = False
+    _subagent_idle_pass = 0
+    _subagent_idle_pending: Optional[List[str]] = None
+    # Long-chain protection (TLLM_KV_LONGCHAIN_PROTECT_ISL,
+    # longchain_protect.py): whether it runs on this rank, this rank's PP loop
+    # pass count, and the operations the first rank applied at the current
+    # pass, to be stamped on its schedule message. Declared on the class so
+    # instances built without __init__ read them too.
+    _longchain_protect_on = False
+    _longchain_pass = 0
+    _longchain_pending_ops: Optional[List[Tuple[str, str, int]]] = None
+    # Whether this rank, when it schedules, sends its context chunks so the
+    # other PP ranks run its batch (with the stage agreement;
+    # _pp_adopt_leader_schedule). Declared on the class
+    # so instances built without __init__ read it too.
+    _pp_adopt_leader_chunks = False
+    # PP disagg send / termination agreement without PP-group collectives
+    # (disaggregation/orchestration/pp_lagged_consensus.py). Declared on the
+    # class for the same reason.
+    _pp_disagg_lag: Optional[PPDisaggLaggedConsensus] = None
 
     def __init__(
             self,
@@ -896,16 +992,28 @@ class PyExecutor:
         # into a PP deadlock by GIL-holding native calls. "0": relay inline.
         self.pp_async_broadcast_sample_state = os.environ.get(
             "TLLM_PP_ASYNC_BROADCAST_SAMPLE_STATE", "0") == "1"
+        # Whether this executor takes part in disaggregated serving. The
+        # pipeline-parallel context-server paths below (pp_stage_agree.py,
+        # pp_admission.py, pp_ctx_diag.py, pp_ring.py, pp_spec_relay.py and the
+        # lagged send agreement) run only on such an executor at
+        # pipeline_parallel_size > 1; every other executor runs the stock PP
+        # loop.
+        self._pp_disaggregated = kv_cache_transceiver is not None
+        pp_disagg = self.dist.pp_size > 1 and self._pp_disaggregated
+        # Compact relay of SpecSampler host states (pp_spec_relay.py): only
+        # the sending (last) rank uses it; every rank decodes both forms.
+        self._pp_compact_spec_relay = pp_disagg
 
         # list of requests in each PP micro batch
         # The synchronous relay retires each microbatch within its own
-        # iteration, so pipeline-depth many slots suffice; the async relay
-        # thread needs a large window to absorb its delivery lag.
-        if self.pp_async_broadcast_sample_state:
-            self.num_micro_batches = max(self.dist.pp_size,
-                                         self.MIN_ASYNC_MICRO_BATCH_NUM)
-        else:
-            self.num_micro_batches = self.dist.pp_size
+        # iteration, so pipeline-depth many slots suffice (more on a
+        # disaggregated PP server, see pp_ring.py); the async relay thread
+        # needs a large window to absorb its delivery lag.
+        self.num_micro_batches = resolve_num_micro_batches(
+            self.dist.pp_size,
+            self.pp_async_broadcast_sample_state,
+            self.MIN_ASYNC_MICRO_BATCH_NUM,
+            disaggregated=self._pp_disaggregated)
         self.micro_batches: List[BatchStatePP
                                  | None] = [None] * self.num_micro_batches
         self.send_handles = [None] * self.num_micro_batches
@@ -915,6 +1023,48 @@ class PyExecutor:
         self.unhandled_batch_counter = 0
         self.pp_scheduler_max_retry_count = int(
             os.environ.get("TLLM_PP_SCHEDULER_MAX_RETRY_COUNT", 10))
+        # Cross-stage agreement on reused prefixes (pp_stage_agree.py), on a
+        # disaggregated PP server whose layout it covers; None elsewhere.
+        self._pp_stage_agree = self._create_pp_stage_agreement(
+            kv_connector_manager)
+        # Admission back-pressure of a PP DFlash context server
+        # (pp_admission.py): the first rank admits a new prompt only while
+        # every stage has KV room for it.
+        self._pp_admission = self._create_pp_admission()
+        # Log-only per-stage counters of the context path (pp_ctx_diag.py);
+        # after the agreement, which counts into them.
+        self._pp_ctx_diag = self._create_pp_ctx_diag()
+        # With the agreement, the first rank sends its context chunks with the
+        # schedule and the other ranks run exactly its batch
+        # (_pp_adopt_leader_schedule). Without it, the schedule's chunk fields
+        # are None and each follower keeps its own pass.
+        self._pp_adopt_leader_chunks = self._pp_stage_agree is not None
+        # With the agreement, the first rank also sends the order in which its
+        # pass allocated the chunks, and the other ranks adopt them in that
+        # order rather than in the batch order.
+        self._pp_adopt_in_admission_order = self._pp_stage_agree is not None
+        if self._pp_adopt_in_admission_order and hasattr(
+                self.scheduler, "record_context_admission_order"):
+            self.scheduler.record_context_admission_order = True
+        # With the agreement and block reuse, a follower applies the schedule
+        # message's dropped and lowered reservations before adopting its batch
+        # (_pp_stage_agree_early_release) rather than after the adoption only
+        # (_pp_stage_agree_answer).
+        self._pp_follower_early_release = (self._pp_stage_agree is not None and
+                                           self._pp_stage_agree.reuse_enabled)
+        if self._pp_follower_early_release and self.dist.pp_rank != 0:
+            logger.info(
+                f"PP stage {self.dist.pp_rank} applies the reservations the "
+                "first rank dropped or lowered before adopting its batch.")
+        # Opt-in (TLLM_KV_SUBAGENT_IDLE_DROP_S): the first rank demotes idle
+        # child chains and stamps their keys on its schedule message; the other
+        # stages demote the same keys at the same pass.
+        self._subagent_idle_drop_on = self._init_subagent_idle_drop()
+        # Opt-in (TLLM_KV_LONGCHAIN_PROTECT_ISL): every rank keeps long chains
+        # pending at their context end; the first rank pins and releases them
+        # and stamps the operations on its schedule message; the other stages
+        # apply the same operations at the same pass.
+        self._longchain_protect_on = self._init_longchain_protect()
         self.pp_multi_stream_sample = os.environ.get(
             "TRTLLM_PP_MULTI_STREAM_SAMPLE", "1") == "1"
         self.sample_stream = torch.cuda.Stream()
@@ -1169,10 +1319,7 @@ class PyExecutor:
         self._gpu_keepalive = GpuKeepalive.create_from_env(self.device_id)
 
         # Initialize disagg PP termination handler if needed
-        self._disagg_pp_termination_handler = None
-        if self.dist.pp_size > 1 and self.enable_kv_cache_reuse and self.kv_cache_transceiver:
-            self._disagg_pp_termination_handler = DisaggPPTerminationHandler(
-                self.dist, self._on_disagg_pp_termination)
+        self._init_disagg_pp_termination()
 
         if self.dist.pp_size > 1:
             self.event_loop = self._executor_loop_pp
@@ -3005,6 +3152,32 @@ class PyExecutor:
                     f"Error waiting on PP send handles during cleanup: "
                     f"{traceback.format_exc()}")
 
+        # A request-send queue deeper than 1 can leave several request-payload
+        # sends in flight; wait on them too (a no-op at the default depth of 1).
+        request_broadcaster = getattr(self, "request_broadcaster", None)
+        if (request_broadcaster is not None
+                and request_broadcaster.send_requests_queue.depth > 1):
+            try:
+                request_broadcaster.drain_pending_sends()
+                logger.info(request_broadcaster.send_requests_queue.summary())
+            except Exception:
+                logger.error(
+                    f"Error waiting on PP request sends during cleanup: "
+                    f"{traceback.format_exc()}")
+
+    def _pp_schedule_fields_on(self, agreement) -> bool:
+        """Whether this rank's schedule messages carry the pipeline-parallel fields.
+
+        True when the stage agreement (with the leader-batch adoption and its
+        admission order) runs here, or one of the knobs
+        TLLM_KV_SUBAGENT_IDLE_DROP_S, TLLM_KV_LONGCHAIN_PROTECT_ISL is on;
+        otherwise the message is sent without them.
+        """
+        return bool(self._pp_adopt_leader_chunks or agreement is not None
+                    or getattr(self, "_pp_adopt_in_admission_order", False)
+                    or self._subagent_idle_drop_on
+                    or self._longchain_protect_on)
+
     def _pp_schedule_and_propagate(self, microbatch_id: int):
         """The first PP rank schedules the requests and propagates the result to all other PP ranks."""
 
@@ -3018,11 +3191,27 @@ class PyExecutor:
                                    and is_dp_broadcast):
             scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
             )
+            agreement = getattr(self, "_pp_stage_agree", None)
+            if agreement is not None:
+                self._pp_stage_agree_check_admitted(scheduled_batch)
             fitting_disagg_gen_init_requests, wait_for_disagg_gen_transfer_progress = (
                 self.disagg.admit(fitting_disagg_gen_init_requests))
+            reuse_proposals = (agreement.take_proposals()
+                               if agreement is not None else None)
+            if self._pp_admission is not None:
+                self._pp_admission_record(scheduled_batch, reuse_proposals)
             serializable_schedule = SerializableSchedulerOutput.from_scheduler_result(
-                scheduled_batch, fitting_disagg_gen_init_requests,
-                num_fitting_reqs, wait_for_disagg_gen_transfer_progress)
+                scheduled_batch,
+                fitting_disagg_gen_init_requests,
+                num_fitting_reqs,
+                wait_for_disagg_gen_transfer_progress,
+                record_context_chunks=self._pp_adopt_leader_chunks,
+                record_first_chunks=agreement is not None,
+                reuse_proposals=reuse_proposals,
+                context_admission_order=self._pp_leader_admission_order(),
+                subagent_idle_drops=self._take_subagent_idle_pending(),
+                longchain_ops=self._take_longchain_pending_ops(),
+                attach_pp_fields=self._pp_schedule_fields_on(agreement))
 
         # Broadcast within first tp+cp group before send/recv chain to other tp+cp groups
         if self.dist.is_first_pp_rank:
@@ -3065,6 +3254,13 @@ class PyExecutor:
         1. Wait for cache transceiver to finish at least one cache transmission.
         2. Terminate requests that have finished context cache transmission.
         3. Check if current rank has enough KV cache resources to run the scheduled batch.
+
+        With the lagged send agreement (``pp_lagged_consensus.py``) step 1 is
+        rank-local and releases nothing: sends complete and free their KV only
+        in the lagged step at the top of the loop
+        (``PPDisaggLaggedConsensus.step``). Without block reuse the retries
+        then poll until ``TLLM_PP_SCHEDULER_MAX_RETRY_COUNT`` and raise; with
+        block reuse it raises at once, as with the stock collectives.
         """
         scheduled_batch_requests = scheduled_batch.all_requests()
         if self.scheduler.can_schedule(scheduled_batch_requests):
@@ -3094,12 +3290,1137 @@ class PyExecutor:
             )
 
             # Let cache transceiver finish at least one cache transmission and release requests' KV cache resources
+            # (rank-local under the lagged send agreement, where it releases nothing).
             self.disagg.reap_context_sends(1)
             self.disagg.check_transfer_timeouts()
         else:
             raise RuntimeError(
                 f"Reach maximum PP retry count ({self.pp_scheduler_max_retry_count}) but still cannot run first PP's schedule result. Please consider increasing the KV cache size by setting `free_gpu_memory_fraction` to a larger value. Or you can set `TLLM_PP_SCHEDULER_MAX_RETRY_COUNT` to a larger value to allow more retries."
             )
+
+    def _init_disagg_pp_termination(self) -> None:
+        """The disagg PP termination handler and, where it applies
+        (``pp_disagg_lagged_consensus_applies``), the lagged send agreement.
+        """
+        self._disagg_pp_termination_handler = None
+        pp_disagg_lag = pp_disagg_lagged_consensus_applies(
+            dist=self.dist,
+            transceiver=self.kv_cache_transceiver,
+            enable_attention_dp=self.enable_attention_dp)
+        if self.dist.pp_size > 1 and self.enable_kv_cache_reuse and self.kv_cache_transceiver:
+            if pp_disagg_lag:
+                self._disagg_pp_termination_handler = LaggedDisaggPPTerminationHandler(
+                    self._on_disagg_pp_termination)
+            else:
+                self._disagg_pp_termination_handler = DisaggPPTerminationHandler(
+                    self.dist, self._on_disagg_pp_termination)
+        if pp_disagg_lag:
+            self._pp_disagg_lag = create_pp_disagg_lagged_consensus(
+                dist=self.dist,
+                transceiver=self.kv_cache_transceiver,
+                lag=probe_lag(
+                    relay_lag(self.dist.pp_size, self.num_micro_batches,
+                              self.pp_async_broadcast_sample_state)),
+                enable_attention_dp=self.enable_attention_dp,
+                release_outcomes=lambda: self.disagg.reap_context_sends(0),
+                termination_handler=self._disagg_pp_termination_handler)
+
+    def _create_pp_stage_agreement(
+        self,
+        kv_connector_manager: Optional[KvCacheConnectorManager] = None
+    ) -> Optional[PPStageAgreement]:
+        """The cross-stage reuse agreement, or None.
+
+        Built on a disaggregated server at ``pipeline_parallel_size > 1`` whose
+        layout the agreement covers (``pp_stage_agree_layout``) with KV cache
+        manager V2, no KV cache connector and KV cache managers that stop their
+        context commit at the handled chunk. Every input is the same on every
+        rank, so every rank builds it or none does. Elsewhere the stock PP loop
+        runs (logged at INFO on a disaggregated PP server).
+
+        Args:
+            kv_connector_manager: the connector ``__init__`` was given; it is
+                created before ``self.kv_connector_manager`` is assigned, so the
+                argument is what tells this check about it.
+        """
+        if self.dist.pp_size <= 1 or not getattr(self, "_pp_disaggregated",
+                                                 False):
+            return None
+        missing = []
+        if not pp_stage_agree_layout(pp_size=self.dist.pp_size,
+                                     tp_size=self.dist.tp_size,
+                                     cp_size=self.dist.cp_size,
+                                     enable_attention_dp=bool(
+                                         self.enable_attention_dp),
+                                     disaggregated=True):
+            missing.append("tensor_parallel_size == context_parallel_size "
+                           "== 1 and no attention DP")
+        if not self._is_kv_manager_v2:
+            missing.append("KV cache manager V2")
+        if (kv_connector_manager is not None
+                or getattr(self, "kv_connector_manager", None) is not None):
+            # A connector-served prefix moves a first chunk's cursor past the
+            # agreed depth (_settle_context_cursor), which no other stage sees.
+            missing.append("no KV cache connector")
+        managers = [self.kv_cache_manager]
+        if getattr(self, "enable_joint_kv_cache_reuse", False):
+            managers.append(self.draft_kv_cache_manager)
+        for manager in managers:
+            # The commit must stop at the chunk each stage handled, not at the
+            # live cursor, which under PP is ahead of it (context_ends).
+            if isinstance(manager, BaseMambaCacheManager):
+                missing.append(
+                    "no mamba-hybrid KV cache manager (" +
+                    type(manager).__name__ +
+                    " cannot stop its context commit at the handled chunk)")
+            elif not getattr(manager, "_supports_pp_context_ends", False):
+                missing.append(
+                    "a KV cache manager whose update_context_resources takes "
+                    "context_ends (" + type(manager).__name__ + " does not)")
+        if missing:
+            logger.info(
+                f"PP stage {self.dist.pp_rank}: the pipeline stages run without "
+                "the cross-stage reuse agreement; it needs " +
+                ", ".join(missing) + ".")
+            return None
+        lag = probe_lag(
+            relay_lag(self.dist.pp_size, self.num_micro_batches,
+                      self.pp_async_broadcast_sample_state))
+        max_reserved = DEFAULT_MAX_RESERVED
+        spf_kwargs = {}
+        # Only the first rank makes reservations, and only with block reuse:
+        # it orders them shortest-uncached-first.
+        if self.enable_kv_cache_reuse and self.dist.rank == 0:
+            spf_kwargs = dict(
+                uncached_estimate=self._pp_stage_agree_uncached_estimate,
+                max_wait_iterations=SPF_MAX_WAIT_ITERATIONS,
+                aged_slots=spf_aged_slots(max_reserved))
+        agreement = PPStageAgreement(self.dist.pp_rank,
+                                     self.dist.pp_size,
+                                     lag,
+                                     bool(self.enable_kv_cache_reuse),
+                                     max_reserved=max_reserved,
+                                     **spf_kwargs)
+        spf = ""
+        if agreement.spf_order:
+            spf = (f", spf_order=on (max wait {agreement.max_wait_iterations} "
+                   f"iterations, {agreement.aged_slots} aged slot(s))")
+        logger.info(
+            "Pipeline stages agree on reused prefixes "
+            f"(stage {self.dist.pp_rank} of {self.dist.pp_size}, reports "
+            f"received {lag} iterations after they are sent, at most "
+            f"{agreement.max_reserved} reserved first chunks, block reuse "
+            f"{'on' if agreement.reuse_enabled else 'off'}{spf}).")
+        return agreement
+
+    def _pp_admission_managers(self) -> list:
+        """The KV cache managers whose pools a context chunk takes pages of."""
+        managers = [self.kv_cache_manager]
+        if getattr(self, "enable_joint_kv_cache_reuse", False):
+            managers.append(self.draft_kv_cache_manager)
+        return managers
+
+    def _create_pp_admission(self) -> Optional[PPAdmissionLedger]:
+        """The admission back-pressure of a pipeline-parallel DFlash context server, or None.
+
+        On a stage of a pipeline-parallel DFlash context server
+        (``pp_dflash_context_enabled``, decided by the model construction)
+        where the stage agreement runs: each follower's report then also
+        carries a snapshot of its KV pools, and the first rank admits a new
+        prompt only while every follower has room for it
+        (``pp_admission.py``). Every rank has the same inputs, so all ranks
+        agree on it. Only the first rank uses the ledger.
+        """
+        if self.dist.pp_size <= 1 or not pp_dflash_context_enabled():
+            return None
+        if self._pp_stage_agree is None:
+            logger.info(
+                "PP DFlash context server without the stage agreement: the "
+                "first PP rank admits context chunks against its own KV pools "
+                "only, with no back-pressure from the other stages.")
+            return None
+        unsupported = [
+            type(manager).__name__ for manager in self._pp_admission_managers()
+            if not hasattr(manager, "pp_admission_snapshot")
+        ]
+        if unsupported:
+            logger.info(
+                "PP DFlash context server: no admission back-pressure from the "
+                "other stages; it needs KV cache managers that report their "
+                "pools (" + ", ".join(unsupported) + " does not).")
+            return None
+        if (getattr(self, "draft_kv_cache_manager", None) is not None
+                and not getattr(self, "enable_joint_kv_cache_reuse", False)):
+            logger.warning(
+                "PP DFlash context server: the draft KV cache manager is "
+                "separate and not paired with the target's, so the admission "
+                "back-pressure does not see its pools; a stage can still fail "
+                "to allocate the drafter's KV cache for a chunk.")
+        max_chunk_tokens = getattr(self.scheduler, "max_num_tokens", None)
+        if max_chunk_tokens is None:
+            max_chunk_tokens = self.max_num_tokens
+        logger.info(
+            f"PP DFlash context server: PP stage {self.dist.pp_rank} " +
+            ("admits new prompts only while every stage has KV room for them"
+             if self.dist.rank ==
+             0 else "reports its KV pools to the first rank every iteration") +
+            f" (context chunks of at most {max_chunk_tokens} tokens).")
+        return PPAdmissionLedger(self.dist.pp_size, max_chunk_tokens)
+
+    def _pp_admission_snapshot(self) -> Dict[str, Any]:
+        """Follower: this stage's KV pools for its report (``pp_admission.py``)."""
+        start = time.perf_counter()
+        wire = StageSnapshot.merge([
+            manager.pp_admission_snapshot()
+            for manager in self._pp_admission_managers()
+        ]).to_wire()
+        self._pp_admission_snapshot_seconds += time.perf_counter() - start
+        self._pp_admission_num_snapshots += 1
+        return wire
+
+    def _pp_admission_hold(self) -> None:
+        """First rank: hold back the first chunks some stage has no KV room for.
+
+        Runs after the stage agreement's step, before the scheduler pass. The
+        candidates are the waiting first chunks the agreement lets through, in
+        arrival order, each admitted at the depth every stage confirmed.
+        """
+        agreement = self._pp_stage_agree
+        agreement_held = self._pp_stage_agree_held
+        live = []
+        waiting_first = []
+        candidates = []
+        for req in self.active_requests:
+            live.append(req.py_request_id)
+            if not is_waiting_first_chunk(req):
+                continue
+            waiting_first.append(req.py_request_id)
+            if req.py_request_id in agreement_held:
+                continue
+            depth = (agreement.confirmed_depth(req.py_request_id)
+                     if agreement.reuse_enabled else None)
+            if depth is None:
+                depth = req.context_current_position
+            candidates.append(
+                Candidate(req.py_request_id, depth,
+                          req.prompt_len + get_draft_token_length(req)))
+        held, line = self._pp_admission.hold(agreement.iteration, candidates,
+                                             live, waiting_first)
+        if line is not None:
+            logger.info(line)
+        for warning in self._pp_admission.take_warnings():
+            logger.warning(warning)
+        self._pp_admission_held = frozenset(held)
+        self._pp_admission_blocked = self._pp_admission.blocked
+        self._pp_ctx_diag_admission_holds(self._pp_admission_held)
+
+    def _pp_admission_record(
+            self, scheduled_batch,
+            reuse_proposals: Optional[Dict[int, Optional[int]]]) -> None:
+        """First rank: account the context chunks and the reuse proposals its
+        schedule message carries (``PPAdmissionLedger.record``)."""
+        chunks = []
+        for req in scheduled_batch.context_requests:
+            draft_tokens = get_draft_token_length(req)
+            num_tokens = req.context_chunk_size
+            if req.is_last_context_chunk:
+                num_tokens += draft_tokens
+            chunks.append(
+                ScheduledChunk(req.py_request_id, req.context_current_position,
+                               num_tokens, req.prompt_len + draft_tokens,
+                               bool(req.is_first_context_chunk)))
+        self._pp_admission.record(chunks, [
+            depth
+            for depth in (reuse_proposals or {}).values() if depth is not None
+        ])
+
+    def _pp_admission_failure_note(self) -> str:
+        """What a follower that cannot adopt a chunk adds about the admission
+        back-pressure (empty when it is off)."""
+        if self._pp_admission is None:
+            return ""
+        per_level = [
+            manager.available_pages_per_level()
+            for manager in self._pp_admission_managers()
+            if hasattr(manager, "available_pages_per_level")
+        ]
+        return (" (admission back-pressure: the first rank admitted the "
+                "prompt within the room this stage reported; this stage's KV "
+                f"pools now: {self._pp_admission_snapshot()}; free plus "
+                "evictable slots per manager, cache level (GPU first) and pool "
+                f"group: {per_level}.)")
+
+    def _create_pp_ctx_diag(self) -> Optional[PPCtxDiag]:
+        """The per-stage context-path counters of a disaggregated PP server, or None.
+
+        Hands them to the stage agreement, the scheduler and the KV cache
+        managers, which count into them only while they hold them; the PP loop
+        logs them (``_pp_ctx_diag_step``). Off without pipeline parallelism or
+        without disaggregated serving.
+        """
+        if self.dist.pp_size <= 1 or not getattr(self, "_pp_disaggregated",
+                                                 False):
+            return None
+        diag = PPCtxDiag(self.dist.pp_rank,
+                         self.dist.pp_size,
+                         guard_timing=True)
+        if self._pp_stage_agree is not None:
+            self._pp_stage_agree.diag = diag
+        for holder in (self.scheduler, self.kv_cache_manager,
+                       getattr(self, "draft_kv_cache_manager", None)):
+            if holder is not None and hasattr(type(holder), "ctx_diag"):
+                holder.ctx_diag = diag
+        logger.info(diag.config_line())
+        return diag
+
+    def _pp_ctx_diag_step(self, scheduled_batch) -> None:
+        """Count this iteration's context chunks (``pp_ctx_diag.py``) and
+        log the counters when a line is due.
+
+        Runs on every rank once the batch is final: after the first rank's
+        pass, or after a follower adopted it, before the forward.
+        """
+        diag = self._pp_ctx_diag
+        diag.record_context_chunks(scheduled_batch.context_requests
+                                   if scheduled_batch is not None else ())
+        if diag.due():
+            logger.info(diag.line("periodic", self._pp_ctx_diag_queue()))
+
+    def _pp_ctx_diag_queue(self) -> Dict[str, int]:
+        """This rank's waiting context requests now, for a counters line.
+
+        Also drops the counters' state of requests that are no longer active.
+        """
+        waiting_first = started = reserved = 0
+        live = []
+        for req in self.active_requests:
+            live.append(req.py_request_id)
+            if not is_waiting_context(req):
+                continue
+            if req.is_first_context_chunk:
+                waiting_first += 1
+                reserved += getattr(req, RESERVED_DEPTH_ATTR, None) is not None
+            else:
+                started += 1
+        self._pp_ctx_diag.forget_except(live)
+        return {
+            "waiting_first": waiting_first,
+            "started": started,
+            "reserved": reserved,
+            "agree_held": len(self._pp_stage_agree_held),
+        }
+
+    def _pp_ctx_diag_admission_holds(self, held: Iterable[int]) -> None:
+        """Count the first chunks an admission back-pressure holds out of this
+        iteration's scheduler pass (with the context-path counters; a no-op otherwise).
+
+        A first-rank back-pressure calls this once per iteration, after it
+        decided its holds, with the request ids it holds (empty when none).
+        """
+        if self._pp_ctx_diag is not None:
+            self._pp_ctx_diag.admission_holds(held)
+
+    def _pp_stage_agree_uncached_estimate(self, req) -> int:
+        """Uncached tokens of a waiting first chunk on this stage, at least 1
+        (shortest-uncached-first reservation order)."""
+        return max(req.prompt_len - (self._pp_stage_reuse_probe(req) or 0), 1)
+
+    def _pp_stage_reuse_probe(self, req) -> Optional[int]:
+        """Prefix of ``req`` this stage could reuse, ignoring a claim it holds."""
+        depth = self.kv_cache_manager.probe_context_reuse(req,
+                                                          include_claimed=True)
+        if depth is not None and self.enable_joint_kv_cache_reuse:
+            draft_depth = self.draft_kv_cache_manager.probe_context_reuse(
+                req, include_claimed=True)
+            depth = None if draft_depth is None else min(depth, draft_depth)
+        return depth
+
+    def _pp_stage_agree_exchange(self) -> None:
+        """First rank: one iteration of the cross-stage reuse agreement, before scheduling.
+
+        Receives the follower reports sent ``lag`` iterations ago -- the relay
+        already waited for every follower to get that far, so this does not
+        block in steady state -- finishes the proposal rounds every follower
+        answered, reserves and proposes new first chunks, and holds every
+        first chunk whose depth is not yet confirmed on all stages. A follower
+        does nothing here; it answers after adopting the schedule
+        (``_pp_stage_agree_answer``).
+        """
+        agreement = self._pp_stage_agree
+        if self.dist.rank != 0:
+            return
+        admission = self._pp_admission
+        if agreement.reuse_enabled or admission is not None:
+            due = agreement.reports_due()
+            if due is not None:
+                for stage in agreement.follower_stages:
+                    report = self.dist.recv_object(stage,
+                                                   PPCommTag.STAGE_REUSE_REPORT)
+                    if agreement.reuse_enabled:
+                        agreement.accept(stage, report, due)
+                    if admission is not None:
+                        if report["iteration"] != due:
+                            raise RuntimeError(
+                                f"PP stage {stage} sent its report of iteration "
+                                f"{report['iteration']}, but the first rank "
+                                f"expected iteration {due}; the pipeline ranks "
+                                "are out of step.")
+                        admission.accept(stage, due,
+                                         report.get(ADMISSION_REPORT_KEY))
+        if agreement.reuse_enabled:
+            kv_cache_map = self.kv_cache_manager.kv_cache_map
+            self._pp_stage_agree_held = frozenset(
+                agreement.step(
+                    [
+                        req for req in self.active_requests
+                        if is_waiting_first_chunk(req)
+                    ],
+                    self._pp_stage_agree_reserve,
+                    lambda req: req.py_request_id in kv_cache_map,
+                ))
+            # After a sweep in which every waiting first chunk was refused
+            # pages holding the only reservation, the V2 deadlock check counts
+            # the held ones, so a pool that admits nothing still fails loudly.
+            held_candidates = (len(self._pp_stage_agree_held)
+                               if agreement.exhausted else 0)
+            if held_candidates and not self._pp_stage_agree_exhausted_logged:
+                self._pp_stage_agree_exhausted_logged = True
+                logger.warning(
+                    f"PP stage agreement: each of the {held_candidates} waiting "
+                    "first chunk(s) was refused KV pages while holding the "
+                    "only reservation; the scheduler's deadlock check now "
+                    "counts them.")
+            self.scheduler.stage_held_context_candidates = held_candidates
+        if admission is not None:
+            self._pp_admission_hold()
+        agreement.advance()
+
+    def _pp_stage_agree_answer(self, scheduled_batch) -> None:
+        """Follower: claim the depths the first rank proposed, and report them.
+
+        Runs once per iteration after the follower adopted the schedule, so a
+        reservation never competes with this iteration's chunks. The report is
+        sent every iteration, empty or not, and the first rank receives it
+        ``lag`` iterations later.
+        """
+        agreement = self._pp_stage_agree
+        admission = self._pp_admission
+        if agreement.reuse_enabled or admission is not None:
+            if agreement.reuse_enabled:
+                proposals = scheduled_batch.leader_reuse_proposals
+                agreement.answer_proposals(
+                    proposals,
+                    {req.py_request_id: req
+                     for req in self.active_requests} if proposals else {},
+                    self._pp_stage_agree_reserve,
+                    self._pp_stage_agree_release,
+                    self._pp_stage_reuse_probe,
+                    self.scheduler.reservation_leaves_chunk_room,
+                )
+            report = agreement.build_report()
+            if admission is not None:
+                # After this iteration's adoption and claims: the first rank
+                # charges everything it scheduled after this iteration.
+                report[ADMISSION_REPORT_KEY] = self._pp_admission_snapshot()
+            # The first rank has received every report older than ``lag``
+            # iterations; waiting on those never blocks.
+            while len(agreement.pending_sends) > agreement.lag:
+                agreement.pending_sends.popleft().wait()
+            agreement.pending_sends.append(
+                self.dist.isend_object(report, 0, PPCommTag.STAGE_REUSE_REPORT))
+        agreement.advance()
+
+    def _init_subagent_idle_drop(self) -> bool:
+        """Whether this rank runs the idle child-chain demotion.
+
+        On only when the stage agreement is on, the pipeline has more than one
+        stage (the first rank's decision rides the PP schedule message), and
+        the KV cache manager of every stage built the tracker
+        (``TLLM_KV_SUBAGENT_IDLE_DROP_S``). A stage that refused would not
+        apply the first rank's decisions, and without a deciding first rank
+        the others would only hold references, so the stages agree with one
+        allgather here. It runs only when the knob is set, which it is on
+        every rank alike; unset, nothing is exchanged. A tracker built
+        without the agreement is disabled.
+        """
+        if parse_subagent_idle_drop_triggers()[0] == 0:
+            return False
+        manager = self.kv_cache_manager
+        local = bool(getattr(manager, "subagent_idle_drop_enabled", False))
+        if self._pp_stage_agree is None or self.dist.pp_size <= 1:
+            if local:
+                logger.warning(
+                    "[subagent_idle_drop] disabled on this executor: it needs "
+                    "the PP stage agreement and pipeline parallelism.")
+                manager.disable_subagent_idle_drop()
+            return False
+        stages = list(self.dist.pp_allgather(local))
+        if all(stages):
+            return True
+        refused = [stage for stage, on in enumerate(stages) if not on]
+        if local:
+            logger.warning(
+                "[subagent_idle_drop] disabled on this executor: the KV cache "
+                f"manager of PP stage(s) {refused} did not enable it.")
+            manager.disable_subagent_idle_drop()
+        return False
+
+    def _conversation_busy_keys(self, key_fn) -> List[str]:
+        """Keys of the active and queued requests under ``key_fn`` (first rank).
+
+        ``key_fn`` is a request key rule: the child-chain key (which needs a
+        parent-session id) or the plain conversation key.
+        """
+        keys = []
+        for req in self.active_requests:
+            key = key_fn(req)
+            if key is not None:
+                keys.append(key)
+        for item in self.waiting_queue:
+            # A queued item holds the executor request: read its scheduling
+            # parameters with the same key rules.
+            request = getattr(item, "request", None)
+            params = getattr(request, "py_scheduling_params", None)
+            key = key_fn(
+                SimpleNamespace(
+                    py_subagent_affinity_id=getattr(params,
+                                                    "subagent_affinity_id",
+                                                    None),
+                    py_conversation_params=getattr(request,
+                                                   "py_conversation_params",
+                                                   None)))
+            if key is not None:
+                keys.append(key)
+        return keys
+
+    def _subagent_idle_busy_keys(self) -> List[str]:
+        """Chain keys of the active and queued requests (first rank).
+
+        With the long-chain protection on, its pending and pinned chains count
+        as busy too: the idle drop stamps and skips them.
+        """
+        keys = self._conversation_busy_keys(subagent_idle_chain_key)
+        if self._longchain_protect_on:
+            keys.extend(self.kv_cache_manager.longchain_protected_keys())
+        return keys
+
+    def _subagent_parent_busy_ids(self) -> List[str]:
+        """Conversation ids of the active and queued requests (first rank).
+
+        The parent-resume trigger matches them against the children's
+        parent-session ids.
+        """
+        return self._conversation_busy_keys(longchain_conversation_key)
+
+    def _subagent_idle_decide(self) -> None:
+        """Count this PP loop pass; on the first rank, demote the idle chains.
+
+        Their keys are stamped on this pass's schedule message
+        (``_take_subagent_idle_pending``).
+        """
+        self._subagent_idle_pass += 1
+        if self.dist.rank != 0:
+            return
+        manager = self.kv_cache_manager
+        if getattr(manager, "subagent_parent_resume_enabled", False):
+            # Opt-in (TLLM_KV_SUBAGENT_PARENT_RESUME_DROP_S): also demote the
+            # idle children whose parent session sent its next request.
+            self._subagent_idle_pending = manager.subagent_idle_drop_decide(
+                self._subagent_idle_pass, self._subagent_idle_busy_keys,
+                self._subagent_parent_busy_ids)
+        else:
+            self._subagent_idle_pending = manager.subagent_idle_drop_decide(
+                self._subagent_idle_pass, self._subagent_idle_busy_keys)
+
+    def _take_subagent_idle_pending(self) -> Optional[List[str]]:
+        """First rank: the keys demoted at this pass, taken once."""
+        keys = self._subagent_idle_pending
+        self._subagent_idle_pending = None
+        return keys
+
+    def _subagent_idle_apply(self, scheduled_batch) -> None:
+        """Follower: demote the chains the first rank demoted at this pass."""
+        keys = scheduled_batch.leader_subagent_idle_drops
+        if keys:
+            self.kv_cache_manager.apply_subagent_idle_drops(
+                keys, self._subagent_idle_pass)
+
+    def _init_longchain_protect(self) -> bool:
+        """Whether this rank runs the long-chain protection.
+
+        On only when the stage agreement is on, the pipeline has more than one
+        stage (the first rank's operations ride the PP schedule message), and
+        the KV cache manager of every stage built the protector
+        (``TLLM_KV_LONGCHAIN_PROTECT_ISL``). A stage that refused would not
+        apply the first rank's operations, so the stages agree with one
+        allgather here. It runs only when the knob is set, which it is on
+        every rank alike; unset, nothing is exchanged. A protector built
+        without the agreement is disabled.
+        """
+        if parse_longchain_protect_config() is None:
+            return False
+        manager = self.kv_cache_manager
+        local = bool(getattr(manager, "longchain_protect_enabled", False))
+        if self._pp_stage_agree is None or self.dist.pp_size <= 1:
+            if local:
+                logger.warning(
+                    "[longchain_protect] disabled on this executor: it needs "
+                    "the PP stage agreement and pipeline parallelism.")
+                manager.disable_longchain_protect()
+            return False
+        stages = list(self.dist.pp_allgather(local))
+        if all(stages):
+            return True
+        refused = [stage for stage, on in enumerate(stages) if not on]
+        if local:
+            logger.warning(
+                "[longchain_protect] disabled on this executor: the KV cache "
+                f"manager of PP stage(s) {refused} did not enable it.")
+            manager.disable_longchain_protect()
+        return False
+
+    def _longchain_busy_keys(self) -> List[str]:
+        """Conversation keys of the active and queued requests (first rank)."""
+        return self._conversation_busy_keys(longchain_conversation_key)
+
+    def _longchain_protect_step(self) -> None:
+        """Count this PP loop pass; check the host floor; on the first rank,
+        pin and release chains.
+
+        The first rank's operations are stamped on this pass's schedule
+        message (``_take_longchain_pending_ops``).
+        """
+        self._longchain_pass += 1
+        manager = self.kv_cache_manager
+        manager.longchain_protect_floor()
+        if self.dist.rank != 0:
+            return
+        self._longchain_pending_ops = manager.longchain_protect_decide(
+            self._longchain_pass, self._longchain_busy_keys)
+
+    def _take_longchain_pending_ops(
+            self) -> Optional[List[Tuple[str, str, int]]]:
+        """First rank: the operations applied at this pass, taken once."""
+        ops = self._longchain_pending_ops
+        self._longchain_pending_ops = None
+        return ops
+
+    def _longchain_apply(self, scheduled_batch) -> None:
+        """Follower: apply the operations the first rank applied at this pass."""
+        ops = scheduled_batch.leader_longchain_ops
+        if ops:
+            self.kv_cache_manager.apply_longchain_protect_ops(
+                ops, self._longchain_pass)
+
+    def _pp_stage_agree_early_release(self, scheduled_batch) -> None:
+        """Follower: apply the dropped and lowered reservations of the schedule
+        message before adopting its batch (stage agreement with block reuse).
+
+        The first rank applied them before its scheduler pass
+        (``PPStageAgreement.step``, ``relieve``), so its pass admitted the batch
+        without the released pages; applying them here as well lets this rank's
+        own pass, its retry check and the adoption see the same released state
+        (``PPStageAgreement.pre_release``). ``_pp_stage_agree_answer`` answers
+        them afterwards without claiming again. Logs the first
+        ``MAX_LOGGED_PINS`` iterations that released anything, with the pages
+        freed and the pool's GPU utilization per pool group.
+        """
+        self._pp_early_released = None
+        agreement = self._pp_stage_agree
+        proposals = scheduled_batch.leader_reuse_proposals
+        if not proposals:
+            return
+        in_batch = {
+            req.py_request_id
+            for req in scheduled_batch.context_requests
+        }
+        in_batch |= set(scheduled_batch.leader_first_context_chunks or ())
+        pages = getattr(self.kv_cache_manager, "available_pages_per_level",
+                        None)
+        log = pages is not None and self._pp_early_release_logs < MAX_LOGGED_PINS
+        before = pages() if log else None
+        skipped = agreement.num_early_skipped_in_batch
+        applied = agreement.pre_release(
+            proposals, {req.py_request_id: req
+                        for req in self.active_requests}, in_batch,
+            self._pp_stage_agree_reserve, self._pp_stage_agree_release)
+        if (agreement.num_early_skipped_in_batch > skipped
+                and not self._pp_early_release_in_batch_warned):
+            self._pp_early_release_in_batch_warned = True
+            logger.warning(
+                f"PP stage agreement: rank {self.dist.pp_rank} got a dropped or "
+                "lowered reservation for a request in the same message's batch; "
+                "it is left to the answer after the adoption.")
+        if not applied:
+            return
+        self._pp_early_released = applied
+        if not log:
+            return
+        self._pp_early_release_logs += 1
+        after = pages()
+        freed = [[a - b for b, a in zip(level_before, level_after)]
+                 for level_before, level_after in zip(before, after)]
+        utilization = getattr(self.kv_cache_manager,
+                              "gpu_utilization_per_pool_group", None)
+        moved = {
+            request_id: f"{held}->{depth}"
+            for request_id, (held, depth) in applied.items()
+        }
+        logger.info(
+            f"PP stage agreement: rank {self.dist.pp_rank} released/lowered "
+            f"reservation(s) {moved} before adopting the first rank's batch; "
+            f"pages freed per cache level and pool group {freed}; GPU util per "
+            "pool group now "
+            f"{utilization() if utilization is not None else 'unknown'}.")
+
+    def _pp_stage_agree_reserve(self, req, cap: Optional[int]) -> Optional[int]:
+        """Reserve a first chunk's prefix on this rank (``reserve_first_context_chunk``).
+
+        For the first ``MAX_LOGGED_PINS`` reservations it logs the pages the
+        reservation took out of the free and evictable pages of every cache
+        level, per pool group: what one reserved prefix pins on this stage,
+        which differs between stages by their layer mix.
+        """
+        agreement = self._pp_stage_agree
+        diag = self._pp_ctx_diag
+        held = (getattr(req, RESERVED_DEPTH_ATTR, None)
+                if diag is not None else None)
+        pages = getattr(self.kv_cache_manager, "available_pages_per_level",
+                        None)
+        before = (pages() if pages is not None
+                  and agreement.num_pin_logs < MAX_LOGGED_PINS else None)
+        depth = self.scheduler.reserve_first_context_chunk(req, cap)
+        if diag is not None:
+            diag.reservation_claimed(held, depth)
+        if before is None or depth is None:
+            return depth
+        after = pages()
+        agreement.num_pin_logs += 1
+        pinned = [[b - a for b, a in zip(level_before, level_after)]
+                  for level_before, level_after in zip(before, after)]
+        num_held = sum(1 for other in self.active_requests
+                       if getattr(other, RESERVED_DEPTH_ATTR, None) is not None)
+        logger.info(
+            f"PP stage agreement: reservation pins {sum(pinned[-1])} last-tier "
+            f"page(s) on stage {self.dist.pp_rank} (request {req.py_request_id}, "
+            f"depth {depth}, prompt {req.prompt_len} tokens; pinned per cache "
+            f"level and pool group {pinned}; available after {after}; "
+            f"{num_held} reservation(s) held on this stage).")
+        return depth
+
+    def _pp_stage_agree_release(self, req) -> None:
+        """Drop the stage-agreement reservation a waiting first chunk holds here."""
+        if self._pp_ctx_diag is not None:
+            self._pp_ctx_diag.reservation_released(
+                getattr(req, RESERVED_DEPTH_ATTR, None))
+        self.scheduler.release_context_admission(req)
+        set_reserved_depth(req, None)
+
+    def _pp_stage_agree_check_admitted(self, scheduled_batch) -> None:
+        """First rank: keep only first chunks admitted at the depth every stage confirmed.
+
+        A first chunk whose claim landed elsewhere -- its reservation was
+        released by an earlier failed admission and the fresh claim found
+        another depth -- leaves the batch and is agreed again; the followers
+        still hold their reservations and re-claim on the next proposal. Logs
+        the first few admitted chunks on which the stages disagreed;
+        ``_pp_stage_agree_drain`` logs the totals.
+        """
+        agreement = self._pp_stage_agree
+        if not agreement.reuse_enabled:
+            return
+        self._pp_stage_agree_undo_off_depth(scheduled_batch)
+        self._pp_stage_agree_relieve(scheduled_batch)
+
+    def _pp_stage_agree_undo_off_depth(self, scheduled_batch) -> None:
+        """First rank: take first chunks admitted off the confirmed depth out of the batch."""
+        agreement = self._pp_stage_agree
+        undone = []
+        for req in scheduled_batch.context_requests:
+            if not is_waiting_first_chunk(req):
+                continue
+            keep, line = agreement.check_admitted(req.py_request_id,
+                                                  req.context_current_position)
+            if line is not None:
+                logger.info(line)
+            if keep:
+                set_reserved_depth(req, None)
+            else:
+                undone.append(req)
+        if not undone:
+            return
+        for req in undone:
+            logger.warning(
+                f"PP stage agreement: the first rank claimed request "
+                f"{req.py_request_id} at position {req.context_current_position}"
+                f", not at the depth every stage confirmed; it leaves this "
+                "batch and is agreed again.")
+            self.scheduler.release_context_admission(req)
+            set_reserved_depth(req, None)
+        scheduled_batch.reset_context_requests([
+            req for req in scheduled_batch.context_requests
+            if all(req is not other for other in undone)
+        ])
+
+    def _pp_stage_agree_relieve(self, scheduled_batch) -> None:
+        """First rank: give reservations back when its pass was under page pressure.
+
+        Pressure is a pass that scheduled nothing while the KV pool refused
+        pages, or one that preempted or paused a request
+        (``PPStageAgreement.relieve``). The reservations given back are released
+        here; the schedule message tells the followers to drop theirs.
+        """
+        agreement = self._pp_stage_agree
+        waiting = {}
+        refused = set()
+        others = False
+        for req in self.active_requests:
+            if is_waiting_first_chunk(req):
+                waiting[req.py_request_id] = req
+                if getattr(req, "py_pp_page_refused", False):
+                    req.py_pp_page_refused = False
+                    refused.add(req.py_request_id)
+            elif (is_waiting_context(req)
+                  or getattr(req, "is_generation_in_progress_state", False)):
+                others = True
+        progressed = bool(scheduled_batch.context_requests
+                          or scheduled_batch.generation_requests
+                          or getattr(scheduled_batch, "encoder_requests", None))
+        # A pass whose first chunks the admission back-pressure held back for
+        # lack of room on a follower counts as refused too: the reservations
+        # given back may be what fills that follower. Pages held by KV
+        # transfers, connector loads or a deferred preemption come back when
+        # those land, so such a pass is not stalled (as for the scheduler's
+        # deadlock check).
+        stalled = not progressed and bool(
+            refused or self.scheduler.context_pages_refused_last_pass()
+            or self._pp_admission_blocked
+        ) and not self.scheduler.pages_return_pending(self.active_requests)
+        preempted = bool(
+            getattr(scheduled_batch, "paused_requests", None)
+            or getattr(scheduled_batch, "recompute_paused_requests", None))
+        given_back = agreement.relieve(
+            stalled or preempted, stalled, refused, others, lambda request_id:
+            self._pp_stage_agree_release(waiting[request_id]))
+        if given_back and agreement.num_pressure_passes <= MAX_LOGGED_DISAGREEMENTS:
+            logger.info(
+                f"PP stage agreement: KV page pressure on the first rank "
+                f"({'stalled pass' if stalled else 'preemption'}); gave back "
+                f"the reservation(s) of request(s) {sorted(given_back)}, "
+                f"reservation bound now {agreement.budget}.")
+
+    def _pp_stage_agree_drain(self) -> None:
+        """Match the reports still in flight when the PP loop ends."""
+        agreement = self._pp_stage_agree
+        admission = self._pp_admission
+        if not agreement.reuse_enabled and admission is None:
+            return
+        if self.dist.rank == 0:
+            first = agreement.iteration - agreement.reports_in_flight()
+            for iteration in range(first, agreement.iteration):
+                for stage in agreement.follower_stages:
+                    report = self.dist.recv_object(stage,
+                                                   PPCommTag.STAGE_REUSE_REPORT)
+                    if agreement.reuse_enabled:
+                        agreement.accept(stage, report, iteration)
+            if agreement.reuse_enabled:
+                logger.info(agreement.summary())
+            if admission is not None:
+                logger.info(admission.summary())
+        else:
+            while agreement.pending_sends:
+                agreement.pending_sends.popleft().wait()
+            if self._pp_follower_early_release:
+                logger.info(agreement.follower_summary())
+            if admission is not None:
+                logger.info(
+                    f"PP admission back-pressure: PP stage {self.dist.pp_rank} "
+                    f"built {self._pp_admission_num_snapshots} KV pool "
+                    f"snapshot(s) in "
+                    f"{self._pp_admission_snapshot_seconds * 1e3:.1f} ms of host "
+                    "time.")
+
+    def _schedulable_active_requests(self):
+        """Active requests for the first rank's scheduler pass.
+
+        Leaves out the first chunks the PP stage agreement holds until every
+        stage has confirmed one reuse depth, those the admission back-pressure
+        holds; all requests otherwise.
+        """
+        held = self._pp_stage_agree_held
+        if self._pp_admission_held:
+            held = held | self._pp_admission_held
+        if not held:
+            return self.active_requests
+        return [
+            req for req in self.active_requests if req.py_request_id not in held
+        ]
+
+    def _pp_stage_agree_local_requests(self, scheduled_batch):
+        """Active requests for a follower's own scheduler pass (stage agreement).
+
+        Leaves out every waiting context request; the pass keeps the
+        generation, disagg generation-init and encoder requests. Every context
+        chunk the first rank scheduled is adopted at the first rank's position
+        and size (``_pp_adopt_leader_schedule``): a first chunk from this
+        stage's reservation (``adopt_first_context_chunk``), a later chunk by
+        ``adopt_context_chunk``. A local pass that saw them would size them
+        itself: it never sees the waiting first chunks (they must not be
+        admitted locally, and a failed local admission would drop a
+        reservation), so it can give a started prompt the token budget the
+        first rank split with a first chunk, and the adoption keeps that larger
+        allocation (a resize only grows), leaving the stage short of pages the
+        first rank had. Without them each context request's allocation on this
+        stage covers exactly the chunks the first rank scheduled.
+        """
+        del scheduled_batch  # every context chunk is adopted
+        return [
+            req for req in self.active_requests if not is_waiting_context(req)
+        ]
+
+    def _pp_no_retry_note(self, stage_agree: bool) -> str:
+        """What a follower that cannot allocate the first rank's chunk reports, and
+        why it does not wait.
+
+        With the stage agreement every stage runs the same chunks from the same
+        reused prefix, and the follower's own pass allocates no context chunk
+        (``_pp_stage_agree_local_requests``), so the shortfall is this stage's
+        room, not a different schedule: a smaller pool, more pages per token
+        for this stage's layer mix, or reserved prefixes that pin more pages
+        here than on the first rank. The note names the reservations this rank
+        holds.
+
+        Its pages free up only when finished context transfers are reaped. With
+        the stock transceiver, reaping (``reap_context_sends``) runs its
+        PP-group consensus, a collective the other ranks enter only from their
+        own executed-batch handling: one rank looping on it alone
+        desynchronizes the PP group (a middle stage deadlocks it). With the
+        lagged send agreement reaping is rank-local and releases
+        nothing (releases come from the lagged step), so waiting would not help
+        either.
+        """
+        if not stage_agree:
+            return ""
+        num_reserved = sum(
+            1 for req in self.active_requests
+            if getattr(req, RESERVED_DEPTH_ATTR, None) is not None)
+        return (
+            " (PP stage agreement: every stage runs the same chunks from "
+            "the same reused prefix, so this stage has less free room than the "
+            "first rank had: a smaller KV pool, a layer mix that needs more "
+            "pages per token, or reserved prefixes that pin more pages here; "
+            f"this rank holds {num_reserved} stage-agreement reservation(s). "
+            "This rank does not retry by reaping context transfers, which "
+            "would not free pages here in time.)")
+
+    def _pp_leader_admission_order(self) -> Optional[List[int]]:
+        """First rank: the order its last scheduler pass allocated context chunks in.
+
+        With the stage agreement only; None otherwise. Taken once:
+        the next pass records its own.
+        """
+        if not getattr(self, "_pp_adopt_in_admission_order", False):
+            return None
+        order = getattr(self.scheduler, "last_context_admission_order", None)
+        self.scheduler.last_context_admission_order = None
+        return order
+
+    def _pp_context_adoption_order(self, scheduled_batch: ScheduledRequests):
+        """The batch's context requests in the order this rank adopts their chunks.
+
+        The batch order, unless the first rank sent its allocation order
+        (with the stage agreement). The batch order lists non-last
+        chunks before last chunks, while the first rank's pass allocates them
+        in its admission order (shortest prefill first, say: a reserved first
+        chunk with a short remainder before the started prompt that takes the
+        rest of the token budget). Allocating in another order changes no
+        page count in total, but a KV cache resume is refused once the pool's
+        utilization is above ``max_util_for_resume``, not when the pages run
+        out: a follower that grows the started prompt first can be refused the
+        resume the first rank was granted.
+        """
+        context_requests = list(scheduled_batch.context_requests)
+        order = getattr(scheduled_batch, "leader_context_admission_order", None)
+        if order is None:
+            return context_requests
+        index = {request_id: i for i, request_id in enumerate(order)}
+        return sorted(context_requests,
+                      key=lambda req: index.get(req.request_id, len(index)))
+
+    def _pp_adopt_failure_detail(self, scheduled_batch: ScheduledRequests,
+                                 req) -> str:
+        """What a follower reports about its KV pool when it cannot adopt a chunk.
+
+        With the leader's admission order or the followers' early release only
+        (empty otherwise): the order
+        the chunks were adopted in and this rank's pool state
+        (``KVCacheManagerV2.admission_state``), which tells a refused resume
+        (utilization above ``max_util_for_resume``) from pages that ran out;
+        then the reservations this rank still holds deeper than the message
+        proposes for them (none once they were applied before the adoption),
+        and those it released or lowered before the adoption.
+        """
+        if not (getattr(self, "_pp_adopt_in_admission_order", False)
+                or getattr(self, "_pp_follower_early_release", False)):
+            return ""
+        order = getattr(scheduled_batch, "leader_context_admission_order", None)
+        state = getattr(self.kv_cache_manager, "admission_state", None)
+        detail = (" [adoption order: " +
+                  ("first rank's allocation order " +
+                   str(order) if order is not None else "batch order") + "]")
+        if state is not None:
+            detail += f" [{state(req)}]"
+        proposals = getattr(scheduled_batch, "leader_reuse_proposals",
+                            None) or {}
+        active_by_id = {
+            other.py_request_id: other
+            for other in self.active_requests
+        }
+        deeper = {}
+        for request_id, depth in proposals.items():
+            other = active_by_id.get(request_id)
+            held = (getattr(other, RESERVED_DEPTH_ATTR, None)
+                    if other is not None else None)
+            if held is not None and (depth is None or depth < held):
+                deeper[request_id] = (held, depth)
+        detail += (" [reservations held deeper than this message's proposal: "
+                   f"{deeper}; early-released this iteration: "
+                   f"{getattr(self, '_pp_early_released', None) or {}}]")
+        return detail
+
+    def _pp_adopt_leader_schedule(self, scheduled_batch: ScheduledRequests,
+                                  local_scheduler_output) -> None:
+        """Make a non-first PP rank run exactly the batch the first rank scheduled.
+
+        This rank forwards the batch received from the first rank, but its own
+        scheduler pass (``local_scheduler_output``) is what sizes each context
+        chunk and, with KV cache manager V2, allocates the KV pages. That pass
+        sees this rank's KV pool, which differs from the first rank's whenever
+        the stages hold different layers (sliding-window versus full
+        attention, uneven partitions), so it can refuse, defer or resize a
+        request the first rank scheduled, and admit one it did not. The
+        forward then ran the request with whatever chunk size the local pass
+        left -- a refused first chunk is rewound to the whole prompt -- and,
+        under V2, without its pages.
+
+        Every request on which the two passes agree is left untouched, so a
+        rank whose pass reproduces the first rank's batch changes no state here.
+
+        This does nothing unless the first rank sent its chunks, which it does
+        only where the stage agreement runs (``_pp_adopt_leader_chunks``).
+
+        With the stage agreement (``pp_stage_agree.py``) a chunk counts as
+        agreed only when its position matches too: a first chunk the first rank
+        admitted is adopted from this stage's reservation at the depth every
+        stage confirmed, and any other chunk at another position raises. Without it, a chunk of the same
+        size is not checked, so a stage that reused a different prefix runs the
+        chunk at its own position.
+        """
+        leader_chunks = scheduled_batch.leader_context_chunks
+        if leader_chunks is None:
+            return
+        stage_agree = self._pp_stage_agree is not None
+        leader_first_chunks = (scheduled_batch.leader_first_context_chunks
+                               or set())
+        local_context = {
+            req.request_id: req
+            for req in local_scheduler_output.context_requests
+        }
+        local_generation = {
+            req.request_id
+            for req in local_scheduler_output.generation_requests
+        }
+        if self._is_kv_manager_v2:
+            # Only the V2 scheduler allocates while scheduling (V1 sizes the
+            # cache from the batch in prepare_resources). Undo what the local
+            # pass allocated for requests outside the batch first, as the first
+            # rank never allocated it, so the batch's requests can use the pages.
+            leader_generation = {
+                req.request_id
+                for req in scheduled_batch.generation_requests
+            }
+            for req in local_scheduler_output.generation_requests:
+                if req.request_id not in leader_generation:
+                    self.kv_cache_manager.revert_allocate_generation(req)
+                    if self.enable_joint_kv_cache_reuse:
+                        self.draft_kv_cache_manager.revert_allocate_generation(
+                            req)
+            for req in local_context.values():
+                if req.request_id in leader_chunks:
+                    position, chunk_size = leader_chunks[req.request_id]
+                    if not req.is_first_context_chunk and not (
+                            req.context_chunk_size == chunk_size and
+                        (not stage_agree
+                         or req.context_current_position == position)):
+                        # The local pass sized this started prompt's chunk
+                        # differently, so the loop below adopts it. Its local
+                        # growth is undone first, before any chunk is adopted:
+                        # the adoption only grows the cache, and a larger local
+                        # chunk would keep pages the first rank gave to other
+                        # requests of the batch.
+                        self._revert_ctx_alloc([req])
+                    continue
+                if req.is_first_context_chunk:
+                    self.scheduler.release_context_admission(req)
+                else:
+                    self._revert_ctx_alloc([req])
+        for req in self._pp_context_adoption_order(scheduled_batch):
+            position, chunk_size = leader_chunks[req.request_id]
+            if (req.request_id in local_context
+                    and req.context_chunk_size == chunk_size and
+                (not stage_agree or req.context_current_position == position)):
+                continue
+            if stage_agree and req.request_id in leader_first_chunks:
+                # The first rank admitted this first chunk at the depth every
+                # stage confirmed: resume this stage's reservation there.
+                adopted = self.scheduler.adopt_first_context_chunk(
+                    req, position, chunk_size)
+            else:
+                if req.context_current_position != position:
+                    raise RuntimeError(
+                        f"PP rank {self.dist.pp_rank}: context request "
+                        f"{req.request_id} is at position "
+                        f"{req.context_current_position}, but the first PP rank "
+                        f"scheduled its chunk from position {position}.")
+                logger.debug(
+                    f"PP rank {self.dist.pp_rank}: adopting the first rank's "
+                    f"{chunk_size}-token context chunk of request "
+                    f"{req.request_id}; the local pass "
+                    f"{'sized it ' + str(req.context_chunk_size) if req.request_id in local_context else 'did not schedule it'}"
+                )
+                adopted = self.scheduler.adopt_context_chunk(req, chunk_size)
+            if not adopted:
+                raise RuntimeError(
+                    f"PP rank {self.dist.pp_rank}: cannot allocate KV cache "
+                    f"for the {chunk_size}-token context chunk of request "
+                    f"{req.request_id} that the first PP rank scheduled; "
+                    "increase this rank's KV cache size." +
+                    self._pp_no_retry_note(stage_agree) +
+                    self._pp_admission_failure_note() +
+                    self._pp_adopt_failure_detail(scheduled_batch, req))
+        if stage_agree:
+            for req in scheduled_batch.context_requests:
+                local_chunk = (req.context_current_position,
+                               req.context_chunk_size)
+                if local_chunk != tuple(leader_chunks[req.request_id]):
+                    raise RuntimeError(
+                        f"PP rank {self.dist.pp_rank}: context request "
+                        f"{req.request_id} would run tokens "
+                        f"[{local_chunk[0]}, {sum(local_chunk)}) but the first "
+                        "PP rank ran "
+                        f"[{leader_chunks[req.request_id][0]}, "
+                        f"{sum(leader_chunks[req.request_id])}).")
+        if not self._is_kv_manager_v2:
+            return
+        for req in scheduled_batch.generation_requests:
+            if req.request_id in local_generation:
+                continue
+            if not self.scheduler.adopt_generation_step(req):
+                raise RuntimeError(
+                    f"PP rank {self.dist.pp_rank}: cannot allocate KV cache "
+                    f"for the generation step of request {req.request_id} "
+                    "that the first PP rank scheduled; increase this rank's "
+                    "KV cache size.")
 
     def _executor_loop_pp(self):
         logger.debug(f"Starting executor loop for pp_rank {self.dist.pp_rank}")
@@ -3143,10 +4464,46 @@ class PyExecutor:
 
                 self._pad_attention_dp_dummy_request()
 
+                if self._pp_disagg_lag is not None:
+                    # Lagged agreement on KV sends and terminations in place of
+                    # the transceiver's PP-group collectives. Before the stage
+                    # agreement: this step promotes the generation-first
+                    # requests whose peers are ready, and the exchange must see
+                    # them to hold their first chunks until every stage agreed.
+                    self._pp_disagg_lag.step()
+
+                if self._subagent_idle_drop_on:
+                    # After the fetch, so new requests count as busy, and
+                    # before the exchange: the first rank demotes the idle
+                    # child chains, whose keys ride this pass's schedule.
+                    self._subagent_idle_decide()
+
+                if self._longchain_protect_on:
+                    # After the fetch, so new requests count as busy, and
+                    # before the exchange: every rank checks the host floor,
+                    # and the first rank pins and releases long idle chains,
+                    # whose operations ride this pass's schedule.
+                    self._longchain_protect_step()
+
+                if self._pp_stage_agree is not None:
+                    # The first rank reads the followers' answers so far and
+                    # holds every first chunk whose depth is not confirmed.
+                    self._pp_stage_agree_exchange()
+
                 # Stage 0: first PP rank schedules requests and propagates the result to all other PP ranks.
                 (scheduled_batch, fitting_disagg_gen_init_requests, _,
                  _) = self._pp_schedule_and_propagate(microbatch_id)
                 if self.dist.rank != 0:
+                    if self._subagent_idle_drop_on:
+                        # Demote what the first rank demoted at this pass.
+                        self._subagent_idle_apply(scheduled_batch)
+                    if self._longchain_protect_on:
+                        # Apply what the first rank applied at this pass.
+                        self._longchain_apply(scheduled_batch)
+                    if self._pp_follower_early_release:
+                        # Release what the first rank released before its
+                        # pass, so this rank's checks and adoption see it too.
+                        self._pp_stage_agree_early_release(scheduled_batch)
                     # Retry until current rank can run first PP's schedule result.
                     self._pp_retry_until_can_schedule(scheduled_batch)
                     # Run scheduler locally because scheduler may change llm requests' state.
@@ -3154,14 +4511,26 @@ class PyExecutor:
                                "prepare_expect_snapshot_points"):
                         self.kv_cache_manager.prepare_expect_snapshot_points(
                             self.active_requests)
+                    local_active_requests = self.active_requests
+                    if self._pp_stage_agree is not None:
+                        local_active_requests = self._pp_stage_agree_local_requests(
+                            scheduled_batch)
                     local_scheduler_output = self.scheduler.schedule_request(
-                        self.active_requests, self.inflight_req_ids)
+                        local_active_requests, self.inflight_req_ids)
                     local_disagg_candidates = getattr(
                         local_scheduler_output,
                         "fitting_disagg_gen_init_requests", [])
                     self.disagg.revert_deferred_gen_init(
                         local_disagg_candidates,
                         fitting_disagg_gen_init_requests)
+                    self._pp_adopt_leader_schedule(scheduled_batch,
+                                                   local_scheduler_output)
+                    if self._pp_stage_agree is not None:
+                        # Claim the proposed depths and report them.
+                        self._pp_stage_agree_answer(scheduled_batch)
+
+                if self._pp_ctx_diag is not None:
+                    self._pp_ctx_diag_step(scheduled_batch)
 
                 if (self._mm_encoder_item_scheduling_enabled
                         and scheduled_batch.scheduled_mm_encoder_items):
@@ -3215,7 +4584,13 @@ class PyExecutor:
                         # forward: rendezvous sends need this rank to keep
                         # entering MPI, and a forward blocked in a native call
                         # would starve the receiving rank.
+                        diag = self._pp_ctx_diag
+                        wait_start = (time.perf_counter()
+                                      if diag is not None else 0.0)
                         self._drain_relay_sends_before_forward(microbatch_id)
+                        if diag is not None:
+                            diag.relay_drain_waited(time.perf_counter() -
+                                                    wait_start)
 
                     self._add_inflight_ids(scheduled_batch)
 
@@ -3252,6 +4627,16 @@ class PyExecutor:
                         gpu_forward_start, gpu_forward_end = self.perf_manager.borrow_forward_timing_events(
                         )
                         gpu_forward_events_from_perf_pool = True
+
+                    # Chunk ends before the forward step advances the cursors.
+                    context_chunk_ends = None
+                    if self._pp_stage_agree is not None:
+                        context_chunk_ends = {
+                            req.py_request_id:
+                            req.context_current_position +
+                            req.context_chunk_size
+                            for req in scheduled_batch.context_requests
+                        }
 
                     # Stage 1.1: Async forward (all ranks) and decoding pass (last rank only)
                     # Per-iteration step[...] scope. Appears in Kineto traces
@@ -3342,6 +4727,7 @@ class PyExecutor:
                         gpu_forward_events_from_perf_pool=
                         gpu_forward_events_from_perf_pool,
                         microbatch_id=microbatch_id,
+                        context_chunk_ends=context_chunk_ends,
                     )
 
                     self.micro_batches[microbatch_id] = batch_state
@@ -3355,14 +4741,22 @@ class PyExecutor:
                     self.previous_batch = batch_state
                 if (self.dist.is_last_pp_rank
                         or can_queue) and previous_batch is not None:
+                    diag = self._pp_ctx_diag
+                    wait_start = time.perf_counter(
+                    ) if diag is not None else 0.0
                     with nvtx_range("sync_previous_sampler_event"):
                         previous_batch.sample_state.sampler_event.synchronize()
+                    if diag is not None:
+                        diag.sampler_sync_waited(time.perf_counter() -
+                                                 wait_start)
 
                 # Stage 2: Enqueue sample state for executed batch to ring broadcast it in background thread asynchronously.
                 # send/recv chain: (pp_size - 1) -> 0 -> 1 -> ... -> (pp_size - 2)
                 # intermediate ranks: send/recv sample state for next microbatch to allow overlap
-                offset = -1 if self.dist.is_last_pp_rank else (
-                    1 - self.dist.pp_size)
+                offset = executed_microbatch_offset(
+                    self.dist.is_last_pp_rank,
+                    relay_lag(self.dist.pp_size, self.num_micro_batches,
+                              self.pp_async_broadcast_sample_state))
                 executed_microbatch_id = (microbatch_id +
                                           offset) % self.num_micro_batches
                 executed_batch = self.micro_batches[executed_microbatch_id]
@@ -3462,6 +4856,14 @@ class PyExecutor:
                 # Stage 4: March forward in microbatch slots
                 microbatch_id = (microbatch_id + 1) % self.num_micro_batches
                 self.iter_counter += 1
+
+            if self._pp_stage_agree is not None:
+                self._pp_stage_agree_drain()
+            if self._pp_ctx_diag is not None:
+                logger.info(
+                    self._pp_ctx_diag.line("final", self._pp_ctx_diag_queue()))
+            if self._pp_disagg_lag is not None:
+                self._pp_disagg_lag.drain()
 
             # Stage 5: Handle remaining executed batches in the queue.
             # Note: _event_loop_completed was already set at the break above,
@@ -3794,14 +5196,25 @@ class PyExecutor:
         microbatch_id = executed_batch.microbatch_id
         sample_state = executed_batch.sample_state
         requests = sample_state.requests
+        diag = self._pp_ctx_diag
 
+        # What this rank relays: the received object, forwarded unchanged, or
+        # (last rank) its own host state, compacted when opted in.
+        wire = None
         if not self.dist.is_last_pp_rank:
             # Receive tokens from previous pp rank (w.r.t model forward direction)
+            wait_start = time.perf_counter() if diag is not None else 0.0
             with nvtx_range("recv_sample_state"):
-                sample_state.host, py_result_diffs = self.dist.recv_object(
+                wire, py_result_diffs = self.dist.recv_object(
                     src=self.dist.prev_pp_rank,
                     tag=tag,
                 )
+            if diag is not None:
+                diag.relay_recv_waited(time.perf_counter() - wait_start)
+            # A compact wire (pp_spec_relay.py) is decoded whatever this
+            # rank's own setting, so mixed settings across ranks are safe.
+            sample_state.host = (expand_compact_spec_relay(wire, requests)
+                                 if is_compact_spec_relay(wire) else wire)
 
             for request, py_result_diff in zip(requests, py_result_diffs):
                 request.py_result.apply_diff(py_result_diff)
@@ -3816,10 +5229,19 @@ class PyExecutor:
                 diff = request.py_result.get_diff()
                 py_result_diffs.append(diff)
                 request.py_result.reset_diff()
+            if self.dist.is_last_pp_rank:
+                wire = sample_state.host
+                if self._pp_compact_spec_relay:
+                    compact = encode_compact_spec_relay(wire, requests)
+                    if compact is not None:
+                        wire = compact
+            if diag is not None:
+                diag.relay_sent(is_compact_spec_relay(wire),
+                                relay_payload_bytes(wire))
             self.wait_on_pp_send_handles(self.send_handles, microbatch_id)
             with nvtx_range("send_sample_state"):
                 self.send_handles[microbatch_id] = self.dist.isend_object(
-                    (sample_state.host, py_result_diffs),
+                    (wire, py_result_diffs),
                     dest=self.dist.next_pp_rank,
                     tag=tag,
                 )
@@ -3850,7 +5272,9 @@ class PyExecutor:
                 if self._is_kv_manager_v2:
                     # Finalize V2 context KV before disagg transfer/response
                     # handling can terminate the request.
-                    self._update_v2_context_resources(scheduled_requests)
+                    self._update_v2_context_resources(
+                        scheduled_requests,
+                        getattr(executed_batch, "context_chunk_ends", None))
                 if self.kv_cache_transceiver:
                     finished_ctx_reqs = scheduled_requests.context_requests_last_chunk
                     self._send_kv_async(finished_ctx_reqs)
@@ -3911,8 +5335,10 @@ class PyExecutor:
         iteration and the full sweep only clears finished handles.
 
         The last rank originates the ring, and the first rank posts the
-        matching recv only ``pp_size - 2`` iterations later, when its
-        executed-microbatch cursor reaches that slot. Waiting on such a slot
+        matching recv only ``num_micro_batches - 2`` iterations later (the
+        synchronous relay lags by the ring depth, ``pp_size`` unless a
+        disaggregated server deepened it, see pp_ring.py), when its executed-microbatch cursor
+        reaches that slot. Waiting on such a slot
         earlier blocks this rank on a recv the peer issues after its next
         top-of-loop collectives (the disagg transfer consensus, for one),
         which cannot complete without this rank: with pp >= 4 and a
@@ -3926,8 +5352,10 @@ class PyExecutor:
             return
         # Same offset the non-last ranks apply to pick their executed
         # microbatch in stage 2 of this iteration.
-        due_microbatch_id = (microbatch_id + 1 -
-                             self.dist.pp_size) % self.num_micro_batches
+        due_microbatch_id = last_rank_due_relay_slot(
+            microbatch_id,
+            relay_lag(self.dist.pp_size, self.num_micro_batches, False),
+            self.num_micro_batches)
         self.wait_on_pp_send_handles(self.send_handles, due_microbatch_id)
 
     def _handle_dynamic_draft_len(self,
@@ -3998,12 +5426,26 @@ class PyExecutor:
                 if self.enable_joint_kv_cache_reuse:
                     self.draft_kv_cache_manager.revert_allocate_generation(req)
 
-    def _update_v2_context_resources(self, scheduled_batch) -> None:
-        """Commit one context frontier to target and draft caches."""
-        self.kv_cache_manager.update_context_resources(scheduled_batch)
+    def _update_v2_context_resources(self,
+                                     scheduled_batch,
+                                     context_ends=None) -> None:
+        """Commit one context frontier to target and draft caches.
+
+        ``context_ends`` (request id -> end of the chunk the batch ran) stops the
+        frontier at the handled chunks instead of the live cursors
+        (PP stage agreement); None keeps the cursors.
+        """
+        if context_ends is None:
+            self.kv_cache_manager.update_context_resources(scheduled_batch)
+            if self.enable_joint_kv_cache_reuse:
+                self.draft_kv_cache_manager.update_context_resources(
+                    scheduled_batch)
+            return
+        self.kv_cache_manager.update_context_resources(
+            scheduled_batch, context_ends=context_ends)
         if self.enable_joint_kv_cache_reuse:
             self.draft_kv_cache_manager.update_context_resources(
-                scheduled_batch)
+                scheduled_batch, context_ends=context_ends)
 
     def _finalize_adp_dummy_allocation(self, can_queue: bool) -> None:
         """Commit or roll back this iteration's tentative ADP dummy.
@@ -7501,7 +8943,7 @@ class PyExecutor:
                 self.active_requests)
 
         scheduler_output = self.scheduler.schedule_request(
-            self.active_requests, self.inflight_req_ids)
+            self._schedulable_active_requests(), self.inflight_req_ids)
 
         scheduled_encoder_requests = scheduler_output.encoder_requests
         should_batch_encoder_requests = (self.is_encoder_decoder

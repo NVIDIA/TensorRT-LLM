@@ -85,6 +85,8 @@ GpuCacheTierConfig = _cpp.GpuCacheTierConfig
 ExpandedBuffer = _cpp.ExpandedBuffer
 HalfOpenRange = _cpp.HalfOpenRange
 HostCacheTierConfig = _cpp.HostCacheTierConfig
+RemoteHostTierConfig = _cpp.RemoteHostTierConfig
+StoreTierConfig = _cpp.StoreTierConfig
 KVCacheDesc = _cpp.KVCacheDesc
 KVCacheCreatedData = _cpp.KVCacheCreatedData
 KVCacheEvent = _cpp.KVCacheEvent
@@ -147,6 +149,7 @@ PageStatus = _cpp.PageStatus
 PageStorageSnapshot = _cpp.PageStorageSnapshot
 Batch = _cpp.Batch
 BatchDeviceArray = _cpp.BatchDeviceArray
+ChainDemoteHandle = _cpp.ChainDemoteHandle
 PlannedDropHandle = _cpp.PlannedDropHandle
 PoolDesc = _cpp.PoolDesc
 PoolGroupDesc = _cpp.PoolGroupDesc
@@ -246,6 +249,7 @@ __all__ = [
     "NDEBUG",
     "OutOfPagesError",
     "PageIndexConverter",
+    "ChainDemoteHandle",
     "PlannedDropHandle",
     "PoolGroupPeakBlockStats",
     "PageIndexMode",
@@ -258,6 +262,8 @@ __all__ = [
     "PoolGroupIndex",
     "PoolIndex",
     "Priority",
+    "RemoteHostTierConfig",
+    "StoreTierConfig",
     "ReuseScope",
     "ScratchDesc",
     "KVCacheIterationStatsDelta",

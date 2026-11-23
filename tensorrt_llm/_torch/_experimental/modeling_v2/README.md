@@ -125,6 +125,12 @@ The targets, as `models/<family>/<target>`:
   `kernels/<path>/` and its op entries are under `ops/`. `TARGET_PATHS` in `modeling.py` names the
   paths each tensor-parallel size runs, `dispatch.py` selects them at construction and `layers.py`
   composes them into the built-in decoder layers.
+* `musespark_open/muse_spark_open_816b_a42b_nvfp4__sm_107__pp`: one pipeline stage of a
+  MuseSparkOpen 816B-A42B NVFP4 disaggregated context server at four stages of one rank on one
+  node (PP4, TP1) on Vera Rubin, on the built-in model's pipeline stages. It serves the
+  context-step paths only (`TARGET_PATHS` in `modeling.py`), and runs the sm107 TEP target's ops
+  at the stage's unsliced shapes through one seam (`_tep.py`), with that target's lever resolver
+  and knob grammar.
 * `qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__tp1`
 
 An entry, shared or owned, is one `OpWrapper` subclass: `__call__` is the op

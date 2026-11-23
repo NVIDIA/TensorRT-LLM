@@ -62,6 +62,7 @@ set(KV_CACHE_MANAGER_V2_SRCS
     kv_cache_manager_v2/streamingEventSink.cpp
     kv_cache_manager_v2/page.cpp
     kv_cache_manager_v2/storageManager.cpp
+    kv_cache_manager_v2/storeLevel.cpp
     kv_cache_manager_v2/introspection.cpp
     kv_cache_manager_v2/kvCache.cpp
     kv_cache_manager_v2/kvCacheManager.cpp

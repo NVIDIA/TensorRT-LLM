@@ -1063,7 +1063,7 @@ CTX_OVERLAP_OFF = {
 
 @pytest.mark.parametrize(
     "role, sizes",
-    [("agg", (1, 4, 16, 48)), ("gen", (1, 8, 64))],
+    [("agg", (1, 4, 16, 48)), ("gen", (1, 8))],
 )
 def test_the_context_sp_overlaps_are_on_by_default_and_off_by_their_knobs(role, sizes):
     # Bitwise, so on wherever they can run (the old bitwise default), whatever the role.
@@ -1600,7 +1600,8 @@ _CAPTURE_QKV = {"wide_capture_fold", "wide_qkv_prefetch"}
     "role, sizes, on",
     [
         ("gen", (1, 2, 3, 4, 5, 8), _CAPTURE),
-        ("gen", (None, 16, 48), _CAPTURE_QKV),
+        ("gen", (None,), _CAPTURE_QKV),
+        ("gen", (16, 48), {"wide_capture_fold", "swa_blocks_per_program"}),
         ("agg", (2, 3, 4, 5, 6, 7, 8), WIDE_STEPS),
         ("agg", (None, 1, 9, 16, 47, HC_MIN_BATCH, 64), _CAPTURE_QKV),
         ("ctx", (1, 4, 8, 64), _CAPTURE_QKV),
@@ -1984,8 +1985,11 @@ def test_the_context_step_levers_run_on_the_tep4_context_role(mbs):
     # They are bitwise and on wherever they can run: a generation server and an aggregated one of
     # any max_batch_size run them too. TEP8 does not serve them: off.
     assert all(LEVER_ROWS[name].kind is LEVERS.Kind.BITWISE for name in CTX_STEP_LEVERS)
+    # A generation server above the low-latency range keeps those of WIDE_GENERATION_OFF off.
     gen = table((107, 4), mbs, "gen", "windowed")
-    assert all(gen.on(name) for name in CTX_STEP_LEVERS), mbs
+    wide_gen = mbs > LEVERS.LL_MAX_BATCH
+    for name in CTX_STEP_LEVERS:
+        assert gen.on(name) is not (wide_gen and name in WIDE_GENERATION_OFF), (mbs, name)
     assert not any(table((107, 8), mbs, "ctx", "windowed").on(n) for n in CTX_STEP_LEVERS), mbs
     for agg_mbs in (LEVERS.HC_LEVERS_MIN_BATCH - 1, LEVERS.HC_LEVERS_MIN_BATCH, 64):
         agg = table((107, 4), agg_mbs, "agg", "windowed")
@@ -5690,7 +5694,10 @@ def test_the_disaggregated_role_defaults():
     tep4_gen = table((107, 4), 12, "gen", "windowed")
     assert tep4_gen.param("swa_prep_split", "MAX_BATCH") == 8
     assert not tep4_gen.on("swa_one_cluster_block")
-    assert tep4_gen.decisions["swa_one_cluster_block"].why == "max_batch_size 12 is above 8"
+    # (its steps go to the split programs: swa_prep_split stays off on a wide generation server)
+    assert tep4_gen.decisions["swa_one_cluster_block"].why == (
+        "yields to swa_blocks_per_program, which serves these steps where it is on"
+    )
     for key in ((107, 4), (107, 8)):
         for mbs in (8, 16):
             agg = table(key, mbs, "agg", "windowed")
@@ -9124,3 +9131,58 @@ def test_drafter_folds_is_on_by_default_only_at_max_batch_one(mbs):
     assert lever_table.decisions["drafter_folds"].source == "default"
     forced = table((107, 8), mbs, "gen", "paged", knobs(drafter_folds="on"))
     assert forced.on("drafter_folds")
+
+
+#: The levers a generation server above the low-latency range keeps off (the stock paths of its
+#: decode steps; the context-step levers it never runs).
+WIDE_GENERATION_OFF = (
+    "context_prep_rows_vec",
+    "context_sp_extra_parts",
+    "context_sp_moe_rs_overlap",
+    "context_sp_oproj_overlap",
+    "context_sp_router_input",
+    "context_sp_tail_pipeline",
+    "drafter_fc_inbox_wide",
+    "drafter_kv_fork_before_head",
+    "finalize_entry_trigger",
+    "full_attention_fold_multi",
+    "hop_cluster_split",
+    "hop_entry_trigger",
+    "incremental_block_offsets",
+    "next_qkv_prefetch_skip",
+    "prerouted_experts",
+    "split_kv_deep_rings",
+    "step_commit_v2",
+    "step_loop_on_execution_stream",
+    "swa_prep_split",
+    "weight_prefetch_after_join",
+    "wide_norm_gate_pdl",
+    "wide_qkv_prefetch",
+)
+
+
+@pytest.mark.parametrize("arena", ["windowed", "paged"])
+def test_a_wide_generation_server_keeps_the_low_latency_levers_off(arena):
+    for mbs in (9, 16, 64, 96):
+        gen = table((107, 4), mbs, "gen", arena)
+        for name in WIDE_GENERATION_OFF:
+            decision = gen.decisions[name]
+            assert not decision.on, (mbs, name)
+            assert decision.source in ("default", "dependency"), (mbs, name, decision.source)
+        # Their knobs still turn them on.
+        knobbed = table((107, 4), mbs, "gen", arena, knobs(step_commit_v2="on"))
+        assert knobbed.on("step_commit_v2"), mbs
+    # Inside the low-latency range, and on the other roles, they resolve as the levers' own rules.
+    for role, mbs in (("gen", 8), ("gen", 1), ("agg", 64), ("ctx", 64)):
+        lever_table = table((107, 4), mbs, role, arena)
+        for name in WIDE_GENERATION_OFF:
+            assert "above the low-latency range" not in lever_table.decisions[name].why, (
+                role,
+                mbs,
+                name,
+            )
+    # A TEP8 generation server's low-latency range is 16 requests.
+    tep8 = table((107, 8), 16, "gen", arena)
+    assert not any(
+        "above the low-latency range" in decision.why for decision in tep8.decisions.values()
+    )

@@ -1317,6 +1317,15 @@ class MuseSparkOpenOmniForConditionalGeneration(MultimodalModelMixin, PreTrained
         if hasattr(self, "llm"):
             return  # re-entry guard: post_config() can bring us back here
 
+        mapping = getattr(model_config, "mapping", None)
+        if mapping is not None and mapping.has_pp() and not model_config.disable_mm_encoder:
+            # The decoder's pipeline stages serve text only: the towers would
+            # run on every stage while only the first one consumes their rows,
+            # and the multimodal merge needs the embedding, which only the first
+            # stage keeps (MuseSparkOpenModel.__pp_init__).
+            raise ValueError(
+                "MuseSparkOpen pipeline parallelism serves text only; set disable_mm_encoder"
+            )
         self.mm_encoder = None
         if not model_config.disable_mm_encoder:
             self.mm_encoder = MuseSparkOpenVisionEncoder(model_config)

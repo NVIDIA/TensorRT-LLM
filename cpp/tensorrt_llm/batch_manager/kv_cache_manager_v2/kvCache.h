@@ -154,6 +154,60 @@ private:
     std::optional<std::vector<WeakPtr<CommittedPage>>> mPageRefs;
 };
 
+// ---------------------------------------------------------------------------
+// ChainDemoteHandle — weak references to the full-attention pages of one committed chain (for example one
+// conversation), collected turn by turn. demote() marks the pages of the chain's subtree-closed, unheld blocks
+// evict-first, so the next eviction at their level drops them before any other page (a lazy drop).
+//
+// Unlike PlannedDropHandle, destruction and release() never act on pages, and plannedDropCount is not touched.
+// Every method takes the manager's exclusive API lock: the refcounts in utils/sharedPtr.h are non-atomic, and a
+// weak reference keeps a destroyed page's allocation alive until it is released, so callers must bound the
+// number of references a handle holds.
+// ---------------------------------------------------------------------------
+struct ChainDemoteResult
+{
+    int planBlocks = 0;       // distinct live, linked blocks referenced by the handle
+    int demotedBlocks = 0;    // good blocks with at least one page newly demoted
+    int demotedPages = 0;     // pages newly demoted
+    int demotedPagesHot = 0;  // of which at kHotLevel (GPU) when demoted
+    int keptSharedBlocks = 0; // a child outside this chain's blocks, or above a kept block
+    int keptHeldBlocks = 0;   // some page of the block is HELD or LOCKED
+};
+
+class ChainDemoteHandle
+{
+public:
+    // Deduplicates `pages` by identity and stores weak references.
+    ChainDemoteHandle(KvCacheManager& manager, std::vector<CommittedPage*> const& pages);
+
+    // Releases the references under the API lock. Never demotes.
+    ~ChainDemoteHandle();
+
+    ChainDemoteHandle(ChainDemoteHandle const&) = delete;
+    ChainDemoteHandle& operator=(ChainDemoteHandle const&) = delete;
+
+    //! Move `other`'s references into this handle and invalidate `other`. Both must be valid, belong to the
+    //! same manager and be distinct, else LogicError. Expired references of this handle are dropped first.
+    void absorb(ChainDemoteHandle& other);
+
+    //! Demote the chain's subtree-closed, unheld blocks and invalidate the handle (LogicError if invalid).
+    //! Blocks are queued tail first, so the deepest blocks are evicted first. Frees nothing.
+    ChainDemoteResult demote();
+
+    //! Invalidate the handle without touching any page (LogicError if invalid).
+    void release();
+
+    [[nodiscard]] bool valid() const noexcept;
+
+    //! Number of stored references, live or expired; 0 when invalid.
+    [[nodiscard]] int numRefs() const noexcept;
+
+private:
+    std::shared_ptr<KvCacheManager> mManager;
+    // nullopt once demoted, released or absorbed.
+    std::optional<std::vector<WeakPtr<CommittedPage>>> mPageRefs;
+};
+
 // Independent host metadata for one request's layer group and beam. Events retain copy readiness,
 // not storage ownership: use the indices only while the request is active and its version matches.
 class PageStorageSnapshot
@@ -466,6 +520,13 @@ public:
     // Every returned handle must be dropped -- via drop() or destruction -- before the manager is
     // shut down: applying a plan takes the manager's API lock and mutates its state.
     std::unique_ptr<PlannedDropHandle> planCommittedBlockDrop();
+
+    // Plan an idle-chain demotion of this cache's committed blocks [fromBlock, numCommittedBlocks): collects the
+    // tree page of every full-attention (non-sparse, no window) life cycle, by walking the committed tree blocks
+    // (no match, no hashing). Stops at the first missing or orphan tree block, or the first block without a
+    // full-attention page. Must be called after stopCommitting(). Returns nullptr when the manager has a sparse or
+    // SSM life cycle or no full-attention life cycle, when nothing is committed, or when nothing was collected.
+    std::unique_ptr<ChainDemoteHandle> planCommittedChainDemote(int fromBlock);
 
     int historyLength() const noexcept
     {

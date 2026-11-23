@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 from abc import ABC, abstractmethod
 from threading import Event, Lock, Thread
 from typing import Callable, Optional
@@ -125,6 +127,10 @@ class ZMQMessenger(MessengerInterface):
 
     def receive(self) -> list[bytes]:
         return self._socket.recv_multipart()
+
+    def poll(self, timeout_ms: int) -> bool:
+        """Wait up to ``timeout_ms`` for an inbound message; True when one can be received."""
+        return self._socket.poll(int(timeout_ms), zmq.POLLIN) != 0
 
     def start_listener(
         self,

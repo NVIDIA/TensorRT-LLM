@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import itertools
 import math
 import os
 import queue
@@ -30,6 +31,7 @@ from typing import TYPE_CHECKING, Callable, Dict, Iterable, Iterator, List, Opti
 import msgpack
 import numpy as np
 import torch
+import zmq
 
 try:
     from cuda.bindings import runtime as cudart
@@ -122,23 +124,33 @@ class RecvReqInfo:
     aux_slot: Optional[int] = None
     slice_id: Optional[int] = None
     bounce_dst_base: Optional[int] = None
+    # Size of this writer's bounce sub-region under an exact fan-in layout; None otherwise.
+    bounce_dst_capacity: Optional[int] = None
+    # Just-in-time grant (TRTLLM_KV_BOUNCE_JIT on the receiver): each writer asks the receiver for
+    # its bounce slot (BOUNCE_GRANT_REQUEST) right before it gathers, instead of carrying a base here.
+    bounce_jit: bool = False
 
     def to_bytes(self) -> bytes:
-        return msgpack.packb(
-            {
-                "sender_req_id": self.sender_req_id,
-                "instance_name": self.instance_name,
-                "instance_rank": self.instance_rank,
-                "block_ids_per_layer_groups": [
-                    arr.tobytes() for arr in self.block_ids_per_layer_groups
-                ],
-                "unique_rid": self.unique_rid,
-                "dst_start_token": self.dst_start_token,
-                "aux_slot": self.aux_slot,
-                "slice_id": self.slice_id,
-                "bounce_dst_base": self.bounce_dst_base,
-            }
-        )
+        fields = {
+            "sender_req_id": self.sender_req_id,
+            "instance_name": self.instance_name,
+            "instance_rank": self.instance_rank,
+            "block_ids_per_layer_groups": [
+                arr.tobytes() for arr in self.block_ids_per_layer_groups
+            ],
+            "unique_rid": self.unique_rid,
+            "dst_start_token": self.dst_start_token,
+            "aux_slot": self.aux_slot,
+            "slice_id": self.slice_id,
+            "bounce_dst_base": self.bounce_dst_base,
+        }
+        # Only an exact fan-in layout carries a capacity, so the message is unchanged otherwise.
+        if self.bounce_dst_capacity is not None:
+            fields["bounce_dst_capacity"] = self.bounce_dst_capacity
+        # Only a just-in-time request carries the flag, so the message is unchanged otherwise.
+        if self.bounce_jit:
+            fields["bounce_jit"] = True
+        return msgpack.packb(fields)
 
     @classmethod
     def from_bytes(cls, data: bytes) -> "RecvReqInfo":
@@ -179,6 +191,9 @@ class WriteMeta:
     is_last_slice: bool = False
     meta_type: WriteMetaType = WriteMetaType.KV
     bounce_dst_base: Optional[int] = None
+    bounce_dst_capacity: Optional[int] = None
+    # The receiver grants this writer's bounce slot on request (see RecvReqInfo.bounce_jit).
+    bounce_jit: bool = False
 
 
 class MessageType:
@@ -190,6 +205,10 @@ class MessageType:
     AUX_AGENT_RESULT = b"AUX_AGENT_RESULT"
     CANCEL_SESSION = b"CANCEL_SESSION"
     SESSION_QUIESCED = b"SESSION_QUIESCED"
+    # Just-in-time bounce grant (TRTLLM_KV_BOUNCE_JIT): a context writer's request on its
+    # per-thread DEALER to the receiver ROUTER, and the receiver's in-line reply.
+    BOUNCE_GRANT_REQUEST = b"BOUNCE_GRANT_REQUEST"
+    BOUNCE_GRANT = b"BOUNCE_GRANT"
 
 
 class PeerIncompatibleError(ValueError):
@@ -599,6 +618,17 @@ _AGENT_RESULT_BY_CODE = {
 }
 
 
+# BOUNCE_GRANT_REQUEST: instance_rank, unique_rid, receiver_slice_id, nbytes, nonce. The signed
+# fields match _KV_RESULT_PREFIX.
+_GRANT_REQ = struct.Struct("<qqqqQ")
+# BOUNCE_GRANT: nonce, verdict (bounce.core.JitVerdict: NO=0, GRANT=1, RETRY=2), base, capacity.
+_GRANT_REPLY = struct.Struct("<QBqq")
+# One grant round trip; a reply that does not arrive in time sends that flow per-fragment.
+_JIT_REPLY_TIMEOUT_S = 0.1
+# Pause between grant requests while the receive region is full.
+_JIT_RETRY_SLEEP_S = 0.002
+
+
 def _make_kv_result_msg(
     instance_rank, unique_rid, slice_id, is_last_slice, agent_result, transfer_size=0, tail=None
 ):
@@ -950,6 +980,14 @@ class Sender(SenderBase):
         self._shutdown = False
         self._shutdown_requested = False
         self._instance_rank = self._registrar.self_rank_info.instance_rank
+        # Just-in-time bounce grant: how long one flow keeps asking while the receiver's region is
+        # full (TRTLLM_KV_BOUNCE_JIT_WAIT_MS), and the nonce that pairs each request with its reply.
+        self._bounce_jit_wait_s = 0.0
+        if getattr(bounce, "enabled", False):
+            from .bounce.config import bounce_jit_wait_ms_from_env
+
+            self._bounce_jit_wait_s = bounce_jit_wait_ms_from_env() / 1000.0
+        self._jit_nonce = itertools.count(1)
         # Guards concurrent add() from the listener thread.
         self._loaded_remote_agents: set[str] = set()
         self._loaded_remote_agents_lock = threading.Lock()
@@ -1143,6 +1181,83 @@ class Sender(SenderBase):
         if endpoint not in dealers:
             dealers[endpoint] = ZMQMessenger(mode="DEALER", endpoint=endpoint)
         return dealers[endpoint]
+
+    def _request_bounce_grant(self, write_meta: WriteMeta) -> bool:
+        """Ask the receiver for this writer's bounce slot (TRTLLM_KV_BOUNCE_JIT). On GRANT, set the
+        write's bounce base and capacity and return True. RETRY (region full) is asked again until
+        the wait budget runs out; NO, a missing reply or the budget leave no base, so the flow takes
+        the per-fragment path. The request goes on the per-thread DEALER that later carries this
+        flow's result, so the receiver always sees the request before the result."""
+        from .bounce.core import JitVerdict
+
+        nbytes = int(write_meta.sizes.sum())
+        nonce_source = getattr(self, "_jit_nonce", None)
+        if nonce_source is None:
+            nonce_source = self._jit_nonce = itertools.count(1)
+        deadline = time.monotonic() + getattr(self, "_bounce_jit_wait_s", 0.0)
+        try:
+            dealer = self._get_or_connect_thread_dealer(write_meta.peer_endpoint)
+            while True:
+                nonce = next(nonce_source)
+                dealer.send(
+                    [
+                        MessageType.BOUNCE_GRANT_REQUEST,
+                        _GRANT_REQ.pack(
+                            int(self._instance_rank),
+                            int(write_meta.unique_rid),
+                            int(write_meta.receiver_slice_id),
+                            nbytes,
+                            nonce,
+                        ),
+                    ]
+                )
+                reply = self._await_bounce_grant(dealer, nonce)
+                if reply is None:
+                    logger.warning_once(
+                        "[kv-bounce] jit: no grant reply within "
+                        f"{_JIT_REPLY_TIMEOUT_S}s; this flow takes the per-fragment path",
+                        key="kv-bounce-jit-reply-timeout",
+                    )
+                    return False
+                verdict, base, capacity = reply
+                if verdict == JitVerdict.GRANT:
+                    write_meta.bounce_dst_base = base
+                    write_meta.bounce_dst_capacity = capacity
+                    return True
+                if verdict != JitVerdict.RETRY:
+                    return False
+                if time.monotonic() + _JIT_RETRY_SLEEP_S >= deadline:
+                    logger.warning_once(
+                        "[kv-bounce] jit: receive region stayed full for the grant wait budget "
+                        "(TRTLLM_KV_BOUNCE_JIT_WAIT_MS); this flow takes the per-fragment path",
+                        key="kv-bounce-jit-wait-exhausted",
+                    )
+                    return False
+                time.sleep(_JIT_RETRY_SLEEP_S)
+        except (zmq.ZMQError, struct.error, ValueError) as e:
+            logger.warning(
+                f"[kv-bounce] jit: grant request failed for {write_meta.unique_rid} "
+                f"slice={write_meta.slice_id}: {e}; using the per-fragment path"
+            )
+            return False
+
+    @staticmethod
+    def _await_bounce_grant(dealer, nonce: int) -> Optional[tuple[int, int, int]]:
+        """Wait one reply timeout for the grant that answers ``nonce``. Replies to an earlier
+        request (a stale nonce) are dropped. Returns (verdict, base, capacity) or None."""
+        deadline = time.monotonic() + _JIT_REPLY_TIMEOUT_S
+        while True:
+            remaining_ms = int((deadline - time.monotonic()) * 1000)
+            if remaining_ms <= 0 or not dealer.poll(remaining_ms):
+                return None
+            message = dealer.receive()
+            if len(message) != 2 or message[0] != MessageType.BOUNCE_GRANT:
+                logger.warning(f"[kv-bounce] jit: dropping unexpected reply {message[:1]!r}")
+                continue
+            reply_nonce, verdict, base, capacity = _GRANT_REPLY.unpack(message[1])
+            if reply_nonce != nonce:
+                continue  # the late answer to an earlier attempt
+            return int(verdict), int(base), int(capacity)
 
     def _get_result_dealer(
         self, endpoint: Optional[str], *, legacy_shared: bool = False
@@ -1433,6 +1548,15 @@ class Sender(SenderBase):
             return
 
         from .bounce import build_send_request, encode_result_tail
+
+        # Just-in-time grant: ask the receiver for this writer's slot before any send-slot reserve
+        # or gather, so a waiting writer holds nothing. Without a grant the flow goes per-fragment.
+        if (
+            write_meta.bounce_jit
+            and write_meta.src_ptrs.size > 0
+            and getattr(self._bounce, "can_send", False)
+        ):
+            self._request_bounce_grant(write_meta)
 
         agent_result = AgentResult.SUCCESS
         send_slot_id = None
@@ -1833,6 +1957,8 @@ class Sender(SenderBase):
             receiver_slice_id=req_info.slice_id if req_info.slice_id is not None else 0,
             is_last_slice=task._chunk.is_last,
             bounce_dst_base=req_info.bounce_dst_base,
+            bounce_dst_capacity=req_info.bounce_dst_capacity,
+            bounce_jit=req_info.bounce_jit,
         )
 
     def _build_aux_write_meta(self, task: AuxSendTask, req_info: RecvReqInfo) -> WriteMeta:
@@ -2980,6 +3106,12 @@ class Receiver(ReceiverBase):
         self._registrar = peer_registrar
         self._agent = agent
         self._bounce = bounce
+        # Opt-in just-in-time per-writer grant (TRTLLM_KV_BOUNCE_JIT); the receiver decides it.
+        self._bounce_jit = False
+        if getattr(bounce, "enabled", False):
+            from .bounce.config import bounce_jit_from_env
+
+            self._bounce_jit = bounce_jit_from_env()
         # Internal component gate only. Production wiring is added after the
         # complete Phase 1 ownership path is available and qualified.
         self._enforce_physical_ownership = enforce_physical_ownership
@@ -2991,6 +3123,9 @@ class Receiver(ReceiverBase):
         # without re-validating. Executor-thread-only access, no lock (same
         # discipline as _sender_ep_instance_map).
         self._incompatible_peers: dict[str, str] = {}
+        # Exact PP fan-in layout per (peer instance, dp rank): each writer's bytes per block and
+        # layer group (uneven PP fan-in, see dispatch_task). None caches "cannot compute".
+        self._pp_fanin_writer_block_bytes_cache: dict[tuple, Optional[list[list[int]]]] = {}
 
         self._messenger = ZMQMessenger(mode="ROUTER")
         self._sessions = {}  # unique_rid -> RxSession
@@ -3135,6 +3270,7 @@ class Receiver(ReceiverBase):
         overlap: PeerOverlap,
         peer_ri: RankInfo,
         receiver_page_table: Optional[KVCachePageTable],
+        allow_uneven_pp: bool = False,
     ) -> bool:
         """Whether multi-writer bounce's equal total//num_writers split is valid for this overlap.
         The split assumes every writer contributes the same size, which holds when:
@@ -3148,7 +3284,8 @@ class Receiver(ReceiverBase):
         Otherwise fall back to the per-fragment path (correct, just not coalesced).
         Equal layer count means equal bytes only when the per-block sizes match; for PP fan-in
         (writers_split_layers) reserve() rejects the mismatched case, so this only needs the count
-        to split evenly."""
+        to split evenly. ``allow_uneven_pp`` skips only the even-split check, for a caller that
+        gives reserve() an exact per-writer layout instead."""
         # Any duplicated head, rank-wide or in a single view pair, leaves some
         # writers without a share (sender side) or doubles one (receiver side).
         rank_factors = (overlap.duplicate_head_factor, overlap.peer_duplicate_head_factor)
@@ -3157,7 +3294,7 @@ class Receiver(ReceiverBase):
             factor != 1 for pair in view_factors for factor in pair
         ):
             return False
-        if overlap.overlap_pp_size > 1:
+        if overlap.overlap_pp_size > 1 and not allow_uneven_pp:
             lpp = getattr(peer_ri, "layer_num_per_pp", None)
             if not lpp or len(lpp) < overlap.overlap_pp_size or len(set(lpp)) != 1:
                 return False
@@ -3175,6 +3312,48 @@ class Receiver(ReceiverBase):
                         if pool_view.mapper_kind == MapperKind.REPLICATED:
                             return False
         return True
+
+    @staticmethod
+    def _compute_pp_fanin_writer_block_bytes(
+        overlap: PeerOverlap,
+        peer_ri: RankInfo,
+        receiver_page_table: Optional[KVCachePageTable],
+    ) -> Optional[list[list[int]]]:
+        """Each PP fan-in writer's bytes per block for every receiver layer group, or None.
+
+        Only for a pure PP fan-in: every writer is a different context stage that sends the
+        receiver's whole head share of its own layers (no TP or CP split among the writers). The
+        bytes of a writer are the receiver's per-layer block bytes summed over the global layers
+        in that stage's range of ``peer_ri.layer_num_per_pp``."""
+        from .bounce.core import pp_fanin_writer_block_bytes
+        from .bounce.impl import layer_bytes_per_group
+
+        if receiver_page_table is None or overlap.overlap_pp_size <= 1:
+            return None
+        if overlap.overlap_tp_size > 1 or overlap.overlap_cp_size > 1:
+            return None
+        lpp = list(getattr(peer_ri, "layer_num_per_pp", None) or [])
+        if len(lpp) != peer_ri.pp_size:
+            return None
+        ranks_per_stage = peer_ri.tp_size * peer_ri.cp_size
+        writer_stages = [rank // ranks_per_stage for rank in overlap.ranks]
+        if len(set(writer_stages)) != len(writer_stages):
+            return None
+        return pp_fanin_writer_block_bytes(
+            layer_bytes_per_group(receiver_page_table), writer_stages, lpp
+        )
+
+    def _pp_fanin_writer_block_bytes(
+        self, overlap: PeerOverlap, peer_ri: RankInfo, sender_dp_rank: int
+    ) -> Optional[list[list[int]]]:
+        key = (peer_ri.instance_name, sender_dp_rank)
+        if key not in self._pp_fanin_writer_block_bytes_cache:
+            self._pp_fanin_writer_block_bytes_cache[key] = (
+                self._compute_pp_fanin_writer_block_bytes(
+                    overlap, peer_ri, self._registrar.self_extractor.page_table
+                )
+            )
+        return self._pp_fanin_writer_block_bytes_cache[key]
 
     def _get_mamba_slot(self, req_info: RecvReqInfo) -> Optional[int]:
         """Extract the mamba slot index from block_ids_per_layer_groups, or None."""
@@ -3258,13 +3437,46 @@ class Receiver(ReceiverBase):
         # sender, the rest empty), so the fan-in equal split would overflow
         # into neighboring reservations; use the per-fragment path.
         cp_involved = self._registrar.self_rank_info.cp_size > 1 or peer_infos.cp_size > 1
-        allow_bounce = task.expected_transfers == 1 or (
-            sender_dp_rank is not None
+        # Exact layout for a PP fan-in whose stages hold different layer counts (or layer groups
+        # with different slot sizes), where the equal split is refused: each writer gets its own
+        # exact sub-region instead of an equal share. Only the generation (receiver) side
+        # decides; the context side follows the request it gets. A fan-in the equal split
+        # accepts keeps it.
+        writer_block_bytes = None
+        if (
+            task.expected_transfers > 1
+            and sender_dp_rank is not None
             and not cp_involved
+            and topo_overlap.overlap_pp_size > 1
+            and not self._fanin_bounce_safe(
+                topo_overlap,
+                peer_infos,
+                self._registrar.self_extractor.page_table,
+            )
             and self._fanin_bounce_safe(
                 topo_overlap,
                 peer_infos,
                 self._registrar.self_extractor.page_table,
+                allow_uneven_pp=True,
+            )
+        ):
+            writer_block_bytes = self._pp_fanin_writer_block_bytes(
+                topo_overlap, peer_infos, sender_dp_rank
+            )
+            if writer_block_bytes is not None and len(writer_block_bytes) != len(
+                topo_overlap.ranks
+            ):
+                writer_block_bytes = None
+        allow_bounce = task.expected_transfers == 1 or (
+            sender_dp_rank is not None
+            and not cp_involved
+            and (
+                writer_block_bytes is not None
+                or self._fanin_bounce_safe(
+                    topo_overlap,
+                    peer_infos,
+                    self._registrar.self_extractor.page_table,
+                )
             )
         )
         # Recurrent (mamba/KDA) state rides the SAME coalesced write as the KV blocks,
@@ -3281,12 +3493,31 @@ class Receiver(ReceiverBase):
                     dst_slot=mamba_dst_slot,
                 )
         # Fan-in writers split layers only across PP stages; read the overlap only for a fan-in.
-        bounced = allow_bounce and self._bounce.reserve(
-            receiver_req,
-            task.expected_transfers,
-            extra_bytes=extra_bytes,
-            writers_split_layers=task.expected_transfers > 1 and topo_overlap.overlap_pp_size > 1,
-        )
+        reserve_kwargs = {}
+        if writer_block_bytes is not None:
+            reserve_kwargs["writer_block_bytes"] = writer_block_bytes
+        use_jit = allow_bounce and self._bounce_jit_eligible(sender_dp_rank, extra_bytes)
+        if use_jit:
+            # No region is reserved here: each writer is granted its own slot on request.
+            bounced = self._bounce.register_jit(
+                receiver_req,
+                writer_ranks=tuple(peer_overlap.ranks),
+                extra_bytes=extra_bytes,
+                writers_split_layers=task.expected_transfers > 1
+                and topo_overlap.overlap_pp_size > 1,
+                **reserve_kwargs,
+            )
+            if bounced:
+                receiver_req.bounce_jit = True
+        else:
+            bounced = allow_bounce and self._bounce.reserve(
+                receiver_req,
+                task.expected_transfers,
+                extra_bytes=extra_bytes,
+                writers_split_layers=task.expected_transfers > 1
+                and topo_overlap.overlap_pp_size > 1,
+                **reserve_kwargs,
+            )
         session = self._get_session(task._unique_rid)
         if session is None:
             raise RuntimeError(
@@ -3295,7 +3526,8 @@ class Receiver(ReceiverBase):
             )
         sender_endpoints = {peer_infos.sender_endpoints[rank] for rank in peer_overlap.ranks}
         # Fan-in: each sender gets its own sub-region base (writers must not overwrite); else serialize once.
-        fanin_bounce = bounced and task.expected_transfers > 1
+        # A just-in-time request carries no base, so every writer gets the same message.
+        fanin_bounce = bounced and task.expected_transfers > 1 and not use_jit
         key = (receiver_req.unique_rid, receiver_req.slice_id)
         receiver_req_bytes = None if fanin_bounce else receiver_req.to_bytes()
         if not self._enforce_physical_ownership:
@@ -3307,6 +3539,8 @@ class Receiver(ReceiverBase):
                     task._perf_timer.record_task_start(rank)
                 if fanin_bounce:
                     receiver_req.bounce_dst_base = self._bounce.writer_base(key, i)
+                    if writer_block_bytes is not None:
+                        receiver_req.bounce_dst_capacity = self._bounce.writer_capacity(key, i)
                     receiver_req_bytes = receiver_req.to_bytes()
                 self._request_sender_data(peer_infos.sender_endpoints[rank], receiver_req_bytes)
             return
@@ -3316,6 +3550,8 @@ class Receiver(ReceiverBase):
         for i, rank in enumerate(peer_ranks):
             if fanin_bounce:
                 receiver_req.bounce_dst_base = self._bounce.writer_base(key, i)
+                if writer_block_bytes is not None:
+                    receiver_req.bounce_dst_capacity = self._bounce.writer_capacity(key, i)
                 payload = receiver_req.to_bytes()
             else:
                 assert receiver_req_bytes is not None
@@ -3353,6 +3589,28 @@ class Receiver(ReceiverBase):
             self._bounce.release_idle_reservation(key)
             task.cancel_unpublished()
         return
+
+    def _bounce_jit_eligible(self, sender_dp_rank: Optional[int], extra_bytes: int) -> bool:
+        """Whether a bounce-eligible request takes the just-in-time grant. An ineligible request
+        under TRTLLM_KV_BOUNCE_JIT=1 keeps the dispatch-time reserve (logged once per reason)."""
+        if not getattr(self, "_bounce_jit", False):
+            return False
+        reason = None
+        if not getattr(self._bounce, "can_recv", False):
+            reason = "no-recv-region"
+        elif self._enforce_physical_ownership:
+            reason = "physical-ownership"
+        elif sender_dp_rank is None:
+            reason = "adp-broadcast"
+        elif extra_bytes:
+            reason = "recurrent-state"
+        if reason is None:
+            return True
+        logger.warning_once(
+            f"[kv-bounce] jit: not eligible ({reason}); using the dispatch-time reserve",
+            key=f"kv-bounce-jit-ineligible-{reason}",
+        )
+        return False
 
     @staticmethod
     def _extract_info_endpoint(params: DisaggregatedParams) -> str:
@@ -3411,6 +3669,9 @@ class Receiver(ReceiverBase):
                     sender_info.page_table,
                 )
                 PeerRegistrar.validate_draft_layers(self._registrar.self_rank_info, sender_info)
+                PeerRegistrar.validate_draft_context_window(
+                    self._registrar.self_rank_info, sender_info
+                )
             except ValueError as e:
                 msg = (
                     f"context peer at '{info_endpoint}' is incompatible: {e} "
@@ -3477,11 +3738,40 @@ class Receiver(ReceiverBase):
                         self._handle_cancel_session(msg)
                     except Exception as e:
                         logger.error(f"Receiver: error handling CANCEL_SESSION: {e}")
+                case MessageType.BOUNCE_GRANT_REQUEST if self._bounce_jit:
+                    # Only a receiver that opted in (TRTLLM_KV_BOUNCE_JIT) answers grants;
+                    # otherwise the request is an unknown message type, as without the knob.
+                    try:
+                        self._handle_bounce_grant(send_id, msg)
+                    except Exception as e:
+                        logger.error(f"Receiver: error handling BOUNCE_GRANT_REQUEST: {e}")
                 case _:
                     logger.error(f"Receiver received unknown message type: {msg[0]}")
             return True
 
         self._messenger.start_listener(handle_message)
+
+    def _handle_bounce_grant(self, send_id: bytes, message: list[bytes]) -> None:
+        """Answer a writer's just-in-time grant request in-line on the ROUTER (this runs on the
+        listener thread that owns the socket). Never blocks; anything unexpected answers NO."""
+        from .bounce.core import JitVerdict
+
+        nonce = 0
+        verdict, base, capacity = int(JitVerdict.NO), 0, 0
+        try:
+            peer_rank, unique_rid, receiver_slice_id, nbytes, nonce = _GRANT_REQ.unpack(message[1])
+            session = self._get_session(unique_rid)
+            if session is not None and 0 <= receiver_slice_id < len(session._kv_tasks):
+                # the same key the result path uses for this writer's report
+                key = (session.disagg_request_id, session._kv_tasks[receiver_slice_id].slice_id)
+                verdict, base, capacity = self._bounce.grant(key, peer_rank, nbytes)
+        except Exception as e:  # any fault answers NO: the writer then goes per-fragment
+            logger.error(f"Receiver: bounce grant failed: {e}")
+            verdict, base, capacity = int(JitVerdict.NO), 0, 0
+        self._messenger.send(
+            [MessageType.BOUNCE_GRANT, _GRANT_REPLY.pack(nonce, verdict, base, capacity)],
+            recipient=send_id,
+        )
 
     def _process_session_quiesced(self, message: list[bytes]) -> None:
         """Dispatch no-future-access proof only to the matching live request."""

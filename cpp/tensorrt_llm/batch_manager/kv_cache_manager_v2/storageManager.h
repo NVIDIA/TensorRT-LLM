@@ -25,14 +25,18 @@
 #include "kv_cache_manager_v2/lifeCycleRegistry.h"
 #include "kv_cache_manager_v2/storage/config.h"
 #include "kv_cache_manager_v2/storage/core.h"
+#include "kv_cache_manager_v2/storeLevel.h"
 #include "tensorrt_llm/common/assert.h"
 
+#include <atomic>
+#include <cstdint>
 #include <deque>
 #include <functional>
 #include <map>
 #include <memory>
 #include <optional>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -176,6 +180,110 @@ public:
     // Check if a page is evictable (optionally at a target level).
     bool isEvictable(Page const& page, std::optional<CacheLevel> level = std::nullopt) const noexcept;
 
+    // ---- Demotion (evict-first marks) ---------------------------------------
+    //
+    // A demoted page is scheduled under kPriorityDemoted instead of its own priority (see
+    // Page::evictionPriority()), so eviction at its level picks it before every other page. The mark
+    // follows the page when it falls to a lower level. All members require the exclusive API lock.
+
+    //! Mark a scheduled, DROPPABLE committed page evict-first and re-queue it at the back of the demoted
+    //! list (FIFO by demotion time). Returns false, changing nothing, for any other page or when the page
+    //! is already demoted.
+    bool demote(Page& page);
+
+    //! Clear the mark. A scheduled page is re-queued at the back of its own priority list; an unscheduled
+    //! page only loses the mark. No-op when the page is not demoted.
+    void undemote(Page& page);
+
+    //! Called by ~Page for a page destroyed while demoted.
+    void noteDemotedPageDestroyed() noexcept
+    {
+        ++mNumDestroyedDemotedPages;
+    }
+
+    struct DemotionStats
+    {
+        uint64_t destroyedDemotedPages = 0; // demoted pages destroyed (evicted, cascaded or cleared)
+        uint64_t undemotedPages = 0;        // demoted pages rescued by a hold or a re-commit
+    };
+
+    [[nodiscard]] DemotionStats demotionStats() const noexcept
+    {
+        return {mNumDestroyedDemotedPages, mNumUndemotedPages};
+    }
+
+    //! The remote host level, if one is configured (always the last level).
+    [[nodiscard]] std::optional<CacheLevel> remoteHostLevel() const noexcept
+    {
+        return mRemoteHostLevel;
+    }
+
+    [[nodiscard]] bool isRemoteHostLevel(CacheLevel level) const noexcept
+    {
+        return mRemoteHostLevel.has_value() && level == *mRemoteHostLevel;
+    }
+
+    //! Counters of the remote host level. All zero, with level -1, when none is configured; the host-to-host batch
+    //! counts are kept either way. Lock-free; safe after destroy().
+    struct RemoteHostStats
+    {
+        int level = -1;
+        uint64_t lentBytes = 0;              // imported capacity
+        uint64_t numChunks = 0;              // imported chunks
+        uint64_t demotedPages = 0;           // pages copied into the remote level
+        uint64_t demotedBytes = 0;           // bytes copied into the remote level
+        uint64_t promotedPages = 0;          // pages copied out of the remote level
+        uint64_t promotedBytes = 0;          // bytes copied out of the remote level
+        uint64_t gpuKernelHostCopies = 0;    // host-to-host batches on the GPU kernel (remote routes)
+        uint64_t hostFunctionHostCopies = 0; // host-to-host batches on cuLaunchHostFunc (local host only)
+    };
+
+    [[nodiscard]] RemoteHostStats remoteHostStats() const noexcept;
+
+    //! Reserved address ranges (base, bytes) of the remote host level's pools, as built; empty without one.
+    [[nodiscard]] std::vector<std::pair<MemAddress, size_t>> remoteHostAddressRanges() const;
+
+    // ---- Store level ---------------------------------------------------------
+
+    //! The store level, if one is configured (always the last level, below the local host level).
+    [[nodiscard]] std::optional<CacheLevel> storeLevel() const noexcept
+    {
+        return mStoreLevel;
+    }
+
+    [[nodiscard]] bool isStoreLevel(CacheLevel level) const noexcept
+    {
+        return mStoreLevel.has_value() && level == *mStoreLevel;
+    }
+
+    //! The IO ordering of the store level. Requires one (see storeLevel()).
+    [[nodiscard]] StoreLevel& storeIo() const
+    {
+        TLLM_CHECK_WITH_INFO(mStoreIo != nullptr, "no store level is configured");
+        return *mStoreIo;
+    }
+
+    //! Counters of the store level (level -1 when none is configured). Lock-free; safe after destroy().
+    [[nodiscard]] StoreLevelStats storeLevelStats() const noexcept;
+
+    //! Whether a page may be reused by a match: false only for a store page the degrade fault mode holds unreadable
+    //! (StoreLevel::slotReadable()), which is then counted. Requires the manager's lock (shared or exclusive).
+    [[nodiscard]] bool storePageReadable(Page const& page) const;
+
+    //! Degrade fault mode: folds the completed store ops in (StoreLevel::reapCompletedOps()). No-op otherwise.
+    //! Requires the exclusive API lock.
+    void reapStoreOps();
+
+    //! The pinned page staging buffer as (base, bytes); (0, 0) without one.
+    [[nodiscard]] std::pair<MemAddress, size_t> pageStagingRange() const noexcept;
+
+    //! Evict pages of `level` one level down until each pool group has at least its share of `bytes` free (shares
+    //! follow the level's current pool-group byte ratio). Capped by the evictable pages and, when the next level is
+    //! the last, by the room there (free plus droppable slots): never throws OutOfPagesError (a refusal still raised
+    //! below is counted as a reserve failure and evicts nothing). Returns the slots evicted. Requires the exclusive
+    //! API lock.
+    SlotCount keepFreeBytes(CacheLevel level, size_t bytes);
+
     // Ensure the requested free slots exist at this level (evicting pages as needed).
     void prepareFreeSlots(CacheLevel level, TypedVec<PoolGroupIndex, SlotCount> const& requirements,
         MigrationRecorder const& migrationRecorder = {}, DropRecorder const& dropRecorder = {});
@@ -194,9 +302,11 @@ public:
 
     // ---- Migration ---------------------------------------------------------
 
-    // Migrate pages excluded from eviction to one destination level. Locked pages cannot move.
-    void batchedMigrate(
-        CacheLevel dstLevel, std::vector<SharedPtr<Page>> const& pages, MigrationRecorder const& migrationRecorder);
+    // Migrate pages excluded from eviction to one destination level. Locked pages cannot move. With a store level,
+    // store pages bound for the GPU first move to the host level (stageStorePagesOnHost()); dropRecorder sees the
+    // pages that makes room for dropped.
+    void batchedMigrate(CacheLevel dstLevel, std::vector<SharedPtr<Page>> const& pages,
+        MigrationRecorder const& migrationRecorder, DropRecorder const& dropRecorder = {});
 
     //! Demote complete locked sparse pages on the requesting owner's stream, updating every live owner.
     //! Caller holds the manager's exclusive lock. Allocation/copy failure preserves GPU ownership.
@@ -405,6 +515,36 @@ private:
     bool submitColdPageCodec(PageIndexLocation location, PageIndexPair const* pageIndices, size_t numPages,
         CUstream stream, Submit&& submit);
 
+    //! Encode hot pages into cold pages at dstBasePtr (indices: dst = cold page ordinal, src = hot slot).
+    bool encodeColdBatch(LayerGroupId batchingLayerGroupId, void* dstBasePtr, PageIndexPair const* pageIndices,
+        size_t numPages, CUstream stream);
+    //! Decode cold pages at srcBasePtr into hot pages (indices: dst = hot slot, src = cold page ordinal).
+    bool decodeColdBatch(LayerGroupId batchingLayerGroupId, void const* srcBasePtr, PageIndexPair const* pageIndices,
+        size_t numPages, CUstream stream);
+
+    //! Moves `count` cold pages between the page staging buffer (page i at stagingBase + i * page bytes) and a cold
+    //! level that the GPU cannot reach: toCold writes pageIndices[i].dst from staging, otherwise pageIndices[i].src
+    //! is read into staging.
+    using ColdHop = std::function<void(
+        bool toCold, MemAddress stagingBase, PageIndexPair const* pageIndices, size_t count, CUstream stream)>;
+
+    //! GPU <-> a cold level the GPU cannot reach, through the page staging buffer: the codec runs between GPU and
+    //! staging, `hop` between staging and the cold level.
+    void submitStagedColdBatch(CacheLevel dstLevel, CacheLevel srcLevel, LayerGroupId batchingLayerGroupId,
+        PageIndexPair const* pageIndices, size_t numPages, CUstream stream, ColdHop const& hop);
+
+    //! Moves the pages of `pages` that are in the store level to the host level above it (freeing host slots first),
+    //! so that a following migration to the GPU is the plain host-to-GPU copy: the store writes straight into
+    //! registered host slots, many rows per op, instead of passing page by page through the staging ring. Returns
+    //! the pages moved: none when the host level cannot make room, and the store pages then take the direct route.
+    //! The caller keeps the pages out of eviction.
+    size_t stageStorePagesOnHost(std::vector<SharedPtr<Page>> const& pages, MigrationRecorder const& migrationRecorder,
+        DropRecorder const& dropRecorder);
+
+    //! Every route into or out of the store level, as store IO ops on `stream` (see StoreLevel).
+    void submitStoreBatch(CacheLevel dstLevel, CacheLevel srcLevel, LayerGroupId batchingLayerGroupId,
+        PageIndexPair const* pageIndices, size_t numPages, CUstream stream);
+
     PoolGroupBase& poolGroup(CacheLevel lvl, PoolGroupIndex pgIdx);
 
     LifeCyclePoolGroupMapping const& poolGroupMapping(CacheLevel level) const
@@ -436,6 +576,8 @@ private:
     // Whether SWA scratch reuse is enabled.
     std::optional<SwaScratchReuseConfig> mSwaScratchReuse;
 
+    // Whether the caller supplied a codec (declared before mColdPageCodec, which takes it).
+    bool mCustomColdPageCodec = false;
     // Owns the configured codec and outlives the storage and staging resources declared below.
     std::unique_ptr<IKvCacheColdPageCodec> mColdPageCodec;
 
@@ -470,6 +612,41 @@ private:
     static constexpr size_t kIndexStagingBytes = 256u << 10u;
     // Allocated only when a codec requests device indices; protected through codec completion.
     std::unique_ptr<StagingBufferManager> mIndexStagingManager;
+
+    // Demotion counters. Plain integers: mutated only under the exclusive API lock.
+    uint64_t mNumDestroyedDemotedPages = 0;
+    uint64_t mNumUndemotedPages = 0;
+
+    // Remote host level and its traffic counters (relaxed atomics; read by the stats line without the lock). The
+    // lent size, chunk count and address ranges are fixed when the level is built.
+    std::optional<CacheLevel> mRemoteHostLevel;
+    size_t mRemoteLentBytes = 0;
+    size_t mRemoteNumChunks = 0;
+    std::vector<std::pair<MemAddress, size_t>> mRemoteAddressRanges;
+    // Host-to-host copy batches by route: the GPU kernel (a remote level on either side) or cuLaunchHostFunc.
+    std::atomic<uint64_t> mGpuKernelHostCopies{0};
+    std::atomic<uint64_t> mHostFunctionHostCopies{0};
+    std::atomic<uint64_t> mRemoteDemotedPages{0};
+    std::atomic<uint64_t> mRemoteDemotedBytes{0};
+    std::atomic<uint64_t> mRemotePromotedPages{0};
+    std::atomic<uint64_t> mRemotePromotedBytes{0};
+
+    // Store level, its IO ordering (never reset, so the stats stay readable after destroy()) and its traffic
+    // counters (relaxed atomics, read by the stats line without the lock). Quota and slot count are fixed at build.
+    std::optional<CacheLevel> mStoreLevel;
+    std::shared_ptr<StoreLevel> mStoreIo;
+    uint64_t mStoreQuotaBytes = 0;
+    uint64_t mStoreNumSlots = 0;
+    std::atomic<uint64_t> mStoreDemotedPages{0};
+    std::atomic<uint64_t> mStoreDemotedBytes{0};
+    std::atomic<uint64_t> mStorePromotedPages{0};
+    std::atomic<uint64_t> mStorePromotedBytes{0};
+    std::atomic<uint64_t> mStorePromotedToGpuPages{0};
+    std::atomic<uint64_t> mStorePrefetchedPages{0};
+    std::atomic<uint64_t> mStoreReserveCalls{0};
+    std::atomic<uint64_t> mStoreReserveEvictedSlots{0};
+    std::atomic<uint64_t> mStoreStagingFallbacks{0};
+    std::atomic<uint64_t> mStoreReserveFailures{0};
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

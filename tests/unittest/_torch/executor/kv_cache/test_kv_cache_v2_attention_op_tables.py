@@ -15,9 +15,12 @@
 """Attention-op page tables of a KV cache whose life cycles mix page sizes.
 
 A unified target/draft cache (FP8 target, BF16 draft sharing a sliding window)
-cannot use one table per life cycle. The batch's rows of its tables must match
-the old full-capacity per-layer rebuild: bit for bit with per-layer tables, and
-page for page (same addresses, same BAD_PAGE_INDEX entries) with shared tables.
+cannot use one table per life cycle. Neither can one with FP8 draft layers
+(``TRTLLM_DFLASH_FP8_DRAFT_KV``): their pages are the target's size, but their
+coalescing group keeps them in a pool of their own, with another slot size.
+The batch's rows of its tables must match the old full-capacity per-layer
+rebuild: bit for bit with per-layer tables, and page for page (same addresses,
+same BAD_PAGE_INDEX entries) with shared tables.
 They must also be the host rows at enqueue time, however the host table changes
 before the asynchronous copy runs.
 """
@@ -54,9 +57,10 @@ UNSCHEDULED = (14, 24, 20, False)
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
 
-def _layer_specs():
-    # Muse Spark-like: FP8 target layers (windowed and full) plus BF16 draft
-    # layers with the target's window and twice its page size.
+def _layer_specs(draft_dtype=DataType.BF16):
+    # Muse Spark-like: FP8 target layers (windowed and full) plus draft layers
+    # with the target's window: BF16 at twice its page size, or FP8 at its page
+    # size in a pool of their own.
     target = KVCacheLayerSpec(
         global_layer_id=0,
         owner=KVCacheLayerOwner.TARGET,
@@ -70,12 +74,15 @@ def _layer_specs():
         replace(target, global_layer_id=i, sliding_window_size=None if i % 3 == 2 else WINDOW)
         for i in range(6)
     ]
-    draft = replace(target, owner=KVCacheLayerOwner.DRAFT, dtype=DataType.BF16)
+    draft = replace(target, owner=KVCacheLayerOwner.DRAFT, dtype=draft_dtype)
     return specs + [replace(draft, global_layer_id=6 + i) for i in range(2)]
 
 
-def _make_manager(monkeypatch, grouped: bool) -> KVCacheManagerV2:
+def _make_manager(monkeypatch, grouped: bool, draft_dtype=DataType.BF16) -> KVCacheManagerV2:
     torch.cuda.init()
+    if draft_dtype == DataType.FP8:
+        # FP8 draft layers keep a pool of their own only under the knob.
+        monkeypatch.setenv("TRTLLM_DFLASH_FP8_DRAFT_KV", "1")
     if not grouped:
         # raising=False: also runs against a tree without shared tables.
         monkeypatch.setattr(
@@ -97,7 +104,7 @@ def _make_manager(monkeypatch, grouped: bool) -> KVCacheManagerV2:
         max_batch_size=4,
         mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
         dtype=DataType.FP8,
-        layer_specs=_layer_specs(),
+        layer_specs=_layer_specs(draft_dtype),
     )
     for request_id, capacity, history, dummy in REQUESTS + (UNSCHEDULED,):
         cache = manager._create_kv_cache(request_id, None, None, is_dummy=dummy)
@@ -172,8 +179,14 @@ def eager_full_rebuild(monkeypatch):
     monkeypatch.setattr(torch_utils, "is_piecewise_running", lambda: True)
 
 
-def test_per_layer_tables_match_full_rebuild(monkeypatch) -> None:
-    manager = _make_manager(monkeypatch, grouped=False)
+_DRAFT_DTYPES = pytest.mark.parametrize(
+    "draft_dtype", [DataType.BF16, DataType.FP8], ids=["bf16-draft", "fp8-draft"]
+)
+
+
+@_DRAFT_DTYPES
+def test_per_layer_tables_match_full_rebuild(monkeypatch, draft_dtype) -> None:
+    manager = _make_manager(monkeypatch, grouped=False, draft_dtype=draft_dtype)
     try:
         assert manager._use_per_layer_page_tables
         assert manager.num_attention_op_pools == manager.num_local_layers
@@ -186,12 +199,16 @@ def test_per_layer_tables_match_full_rebuild(monkeypatch) -> None:
         manager.shutdown()
 
 
-def test_grouped_tables_address_the_full_rebuild_pages(monkeypatch) -> None:
-    manager = _make_manager(monkeypatch, grouped=True)
+@_DRAFT_DTYPES
+def test_grouped_tables_address_the_full_rebuild_pages(monkeypatch, draft_dtype) -> None:
+    manager = _make_manager(monkeypatch, grouped=True, draft_dtype=draft_dtype)
     try:
         assert not manager._use_per_layer_page_tables
-        # (window, FP8 pages), (window, BF16 pages), (full, FP8 pages).
+        # (window, target pages), (window, draft pages), (full, target pages).
         assert manager.num_attention_op_pools == 3
+        # The two draft layers share a table of their own.
+        op_pools = manager.kv_cache_pool_mapping[:, 0].tolist()
+        assert op_pools[6] == op_pools[7] not in op_pools[:6]
         tables, copy_idx = _copy_batch(manager)
         _check_windowed_out_pages(manager, copy_idx)
         reference = _full_rebuild(manager, copy_idx).cpu()

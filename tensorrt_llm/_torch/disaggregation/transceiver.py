@@ -46,12 +46,21 @@ from tensorrt_llm._torch.disaggregation.native.bounce import (
 from tensorrt_llm._torch.disaggregation.native.fetch import PeerFetch
 from tensorrt_llm._torch.disaggregation.native.perf_logger import perf_log_manager
 from tensorrt_llm._torch.disaggregation.native.publish import PeerPublish
+from tensorrt_llm._torch.disaggregation.native.rank_info import unified_draft_layer_count
 from tensorrt_llm._torch.disaggregation.native.retirement import QuiescenceFatalEvent
 from tensorrt_llm._torch.disaggregation.native.transfer import (
     RxSession,
     TransferWorker,
     TransferWorkerConfig,
 )
+from tensorrt_llm._torch.disaggregation.orchestration.pp_lagged_consensus import (
+    SEND_CANCELLED,
+    SEND_COMPLETED,
+    SEND_FAILED,
+    SEND_PENDING,
+    SendOutcome,
+)
+from tensorrt_llm._torch.disaggregation.pp_dflash_context import pp_dflash_context_enabled
 from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
     CacheReuseAdapter,
     create_cache_reuse_adapter,
@@ -278,6 +287,10 @@ def _validate_fp4_mla_bridge_profile(
 
 
 class KvCacheTransceiverV2(KvCacheTransceiver):
+    # Lagged PP consensus (orchestration/pp_lagged_consensus.py): the PP-group
+    # consensus on sends is decided by the first rank from lagged reports and
+    # applied by pp_lagged_apply; off, the stock collectives run.
+    _pp_lagged_consensus: bool = False
     # Pipelined status round state (TRTLLM_DISAGG_GEN_STATUS_PIPELINED); class-level defaults keep a transceiver built
     # without __init__ on the blocking path.
     _pipe_on: bool = False
@@ -471,6 +484,20 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._transfer_worker.populate_instance_and_rank_info(
             endpoints=endpoints, layer_num_per_pp=layer_num_per_pp
         )
+        if pp_dflash_context_enabled():
+            # The draft layers sit on the last stage only, but peers compare
+            # draft-layer counts per rank pair (a generation rank against the
+            # first context rank), so every rank publishes the instance-wide
+            # count. All ranks of an instance share the setting, so they all
+            # join this gather.
+            draft_layers_per_pp = cast(
+                list,
+                getattr(self._dist, "pp_allgather")(
+                    unified_draft_layer_count(self._kv_cache_manager)
+                ),
+            )
+            self._transfer_worker._rank_info.publish_instance_draft_layers(draft_layers_per_pp)
+            logger.info(f"draft_layers_per_pp: {draft_layers_per_pp}")
         logger.info(f"transfer worker ctx_server_endpoints: {endpoints}")
         logger.info(f"layer_num_per_pp: {layer_num_per_pp}")
         logger.info(f"self._context_info_endpoint: {self._context_info_endpoint}")
@@ -1286,6 +1313,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def check_context_transfer_status(
         self, at_least_request_num: Optional[int], mark_complete: bool = False
     ) -> CtxTransferStatus:
+        if self._pp_lagged_consensus:
+            return self._check_context_transfer_status_lagged(at_least_request_num, mark_complete)
         # A worker that never sends KV has nothing to reconcile here, so skip the consensus. Safe
         # because the flag flips together on every rank and never resets, so they all skip in step;
         # gating on the live session dict instead would not be, since a cancel clears it per-rank.
@@ -1370,6 +1399,134 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             # send failure that the executor must consume to release its
             # matching AsyncTransferManager claim.
             failed.extend(rid for rid in cancelled if rid not in failed)
+        return CtxTransferStatus(completed, failed)
+
+    # -- lagged PP consensus (orchestration/pp_lagged_consensus.py) --
+
+    def pp_lagged_consensus_refusal(self) -> List[str]:
+        """What this transceiver lacks for the lagged PP consensus (empty: nothing).
+
+        Pipelined transfer and the FP4 MLA bridge rely on the stock per-call
+        consensus. Every input is the same on every rank of one server.
+        """
+        missing = []
+        if self._mapping.pp_size <= 1:
+            missing.append("pipeline_parallel_size > 1")
+        if self._mapping.tp_size != 1 or self._mapping.cp_size != 1:
+            missing.append("tensor_parallel_size == context_parallel_size == 1")
+        if self._mapping.enable_attention_dp:
+            missing.append("no attention DP")
+        if self._enable_pipelined_transfer:
+            missing.append("enable_pipelined_transfer off")
+        if getattr(self, "_fp4_mla_bridge_enabled", False):
+            missing.append("the FP4 MLA ownership bridge off")
+        return missing
+
+    def enable_pp_lagged_consensus(self) -> None:
+        """Settle sends from the first rank's lagged decision instead of PP collectives.
+
+        Called once at executor construction by
+        ``create_pp_disagg_lagged_consensus``, only where
+        ``pp_lagged_consensus_refusal`` is empty.
+
+        Raises:
+            ValueError: ``pp_lagged_consensus_refusal`` names something.
+        """
+        missing = self.pp_lagged_consensus_refusal()
+        if missing:
+            raise ValueError("the lagged PP consensus requires " + ", ".join(missing) + ".")
+        self._pp_lagged_consensus = True
+        self._pp_lagged_released: List[tuple[int, Optional[LlmRequest]]] = []
+        self._pp_lagged_failed: List[int] = []
+
+    def pp_lagged_local_report(self) -> tuple[List[int], Dict[int, SendOutcome]]:
+        """This rank's view for the lagged agreement; rank-local, no collectives.
+
+        Returns:
+            ``(ready, sends)``: the waiting generation-first requests whose peer
+            info this rank has, and ``{rid: (outcome, quiesced)}`` for every send
+            that is finished here, classified as the stock outcome pass does
+            (a finished send whose final wait is still pending is reported as
+            pending, so a cancel or failure elsewhere can still settle it).
+        """
+        ready = [
+            rid
+            for rid in self._wait_reqs
+            if self._transfer_worker.has_all_peer_req_infos_for_send(rid)
+        ]
+        sends: Dict[int, SendOutcome] = {}
+        local_completed, local_failed = self._collect_done(self._send_sessions, self._send_reqs)
+        for rid in local_completed + local_failed:
+            session = self._send_sessions[rid]
+            result = session.wait_complete(blocking=False)
+            if session.status == SessionStatus.CANCELLED:
+                if getattr(session, "_enforce_physical_ownership", False) and (
+                    session.has_transferring_tasks()
+                ):
+                    continue
+                outcome = SEND_CANCELLED
+            elif result == WaitResult.COMPLETED:
+                outcome = SEND_COMPLETED
+            elif result is None or result == WaitResult.TIMEOUT:
+                outcome = SEND_PENDING
+            else:
+                outcome = SEND_FAILED
+            sends[rid] = (outcome, not session.has_transferring_tasks())
+        return ready, sends
+
+    def pp_lagged_apply(
+        self,
+        *,
+        ready: List[int],
+        cancelled: List[int],
+        failed: List[int],
+        completed: List[int],
+    ) -> None:
+        """Apply the first rank's decision; every PP rank calls this in the same iteration.
+
+        A request this rank no longer holds (a local transfer-timeout cancel
+        already retired its session, as in stock) is skipped. Completed and
+        failed sends are handed to the coordinator by the next
+        ``check_context_transfer_status``.
+        """
+        for rid in ready:
+            req = self._wait_reqs.pop(rid, None)
+            if req is not None:
+                req.state = LlmRequestState.CONTEXT_INIT
+        for rid in cancelled:
+            if rid in self._send_sessions:
+                self._retire_send_session(rid, outcome="cancelled")
+        for rid in completed:
+            if rid in self._send_sessions:
+                req = self._send_reqs.get(rid)
+                self._retire_send_session(rid, outcome="completed")
+                self._pp_lagged_released.append((rid, req))
+        failed_here = [rid for rid in failed if rid in self._send_sessions]
+        self._close_failed_sessions(
+            self._send_sessions, self._send_reqs, failed_here, mark_retired=True
+        )
+        self._pp_lagged_failed.extend(failed_here)
+
+    def _check_context_transfer_status_lagged(
+        self, at_least_request_num: Optional[int], mark_complete: bool
+    ) -> CtxTransferStatus:
+        """Lagged-mode status: local progress only, plus what the agreement settled."""
+        wait_num = at_least_request_num or 0
+        if wait_num > 0:
+            self._poll_sessions_for_interval(
+                self._send_sessions,
+                self._send_reqs,
+                wait_num,
+                self._sender_future_timeout_ms,
+            )
+        released, self._pp_lagged_released = self._pp_lagged_released, []
+        failed, self._pp_lagged_failed = self._pp_lagged_failed, []
+        completed = []
+        for rid, req in released:
+            if mark_complete and req is not None:
+                req.state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
+            completed.append(rid)
+        self._transfer_worker.sweep_stale_req_infos()
         return CtxTransferStatus(completed, failed)
 
     def check_gen_transfer_status(self, at_least_request_num: Optional[int]) -> GenTransferStatus:
@@ -1634,6 +1791,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self, at_least_request_num: Optional[int]
     ) -> GenTransferStatus:
         if not self._ever_had_recv_session and not self._gen_need_sync:
+            return GenTransferStatus([], [], [])
+        if self._pp_lagged_consensus and not self._ever_had_recv_session:
+            # Lagged mode is non-ADP with tp == cp == 1, so every PP rank opens
+            # its first receive in the same iteration (the propagated gen-init
+            # list) and the flag flips on every rank together: until then no
+            # rank has anything to agree on.
             return GenTransferStatus([], [], [])
         block_all = at_least_request_num is None
         wait_num = at_least_request_num if not block_all else 0
@@ -1901,6 +2064,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # Nothing waiting on any rank, so skip the consensus. The waiting set is the same on every
         # rank, so they all skip together.
         if not self._wait_reqs:
+            return
+        if self._pp_lagged_consensus:
+            # Promoted by pp_lagged_apply once every stage has reported peer info.
             return
 
         # Check which waiting requests have peer info locally, then allgather

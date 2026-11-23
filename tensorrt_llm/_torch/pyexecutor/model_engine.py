@@ -34,7 +34,8 @@ from ..attention.backends.interface import (AttentionMetadata,
 from ..attention.backends.utils import get_attention_backend
 from ..compilation.backend import Backend
 from ..distributed import Distributed
-from ..distributed.communicator import init_pp_comm
+from ..distributed.communicator import (check_pp_comm_capacity, init_pp_comm,
+                                        pp_comm_buffered)
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..models.modeling_utils import DecoderModelForCausalLM, timing_metric
@@ -261,8 +262,14 @@ class PyTorchModelEngine(ModelEngine):
             )
 
         self.mapping = mapping
+        from ._util import is_disagg_enabled
         if mapping.has_pp():
-            init_pp_comm(mapping)
+            # A disaggregated server runs the buffered PP transport
+            # (distributed/pp_buffered.py); every other deployment keeps NCCL.
+            init_pp_comm(mapping,
+                         buffered=is_disagg_enabled(
+                             getattr(llm_args, "cache_transceiver_config",
+                                     None)))
         from ._util import (compute_max_num_sequences, is_disagg_enabled,
                             resolved_kv_cache_manager_is_v2,
                             should_enable_adp_dummy_fixes,
@@ -343,6 +350,8 @@ class PyTorchModelEngine(ModelEngine):
                 self.moe_load_balancer = moe_load_balancer
         else:
             self.model = model
+        if mapping.has_pp() and pp_comm_buffered():
+            self._check_pp_comm_capacity()
         self._validate_breakable_cuda_graph_compatibility()
         # In-graph sampling needs the full vocabulary: top-k / top-p over a
         # tensor-parallel shard would rank against a slice of the logits and
@@ -1061,6 +1070,17 @@ class PyTorchModelEngine(ModelEngine):
     def is_multimodal(self) -> bool:
         """True iff this engine drives a multimodal model."""
         return is_multimodal(self.model, self.input_processor)
+
+    def _check_pp_comm_capacity(self) -> None:
+        """Size check of the buffered PP transport against this model's largest
+        stage boundary; called only with that transport."""
+        config = getattr(self.model, "config", None)
+        hidden_size = getattr(config, "hidden_size", None)
+        if hidden_size is None:
+            return
+        dtype = getattr(config, "torch_dtype", None)
+        element_size = dtype.itemsize if isinstance(dtype, torch.dtype) else 2
+        check_pp_comm_capacity(self.max_num_tokens, hidden_size, element_size)
 
     def _validate_breakable_cuda_graph_compatibility(self) -> None:
         if self.llm_args.prefill_cuda_graph_backend != PrefillCudaGraphBackend.BREAKABLE:

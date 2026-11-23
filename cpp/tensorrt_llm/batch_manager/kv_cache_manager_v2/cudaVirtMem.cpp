@@ -21,6 +21,9 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
 
+#include <algorithm>
+#include <cstring>
+
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 
@@ -54,9 +57,17 @@ PhysMemWrapper::PhysMemWrapper(size_t size, CUmemAllocationProp const& prop)
     cuCheck(cuMemCreate(&mHandle, size, &prop, 0));
 }
 
+PhysMemWrapper::PhysMemWrapper(CUmemGenericAllocationHandle adopted) noexcept
+    : mHandle(adopted)
+{
+}
+
 PhysMemWrapper::~PhysMemWrapper()
 {
-    cuMemRelease(mHandle);
+    if (mOwned)
+    {
+        cuMemRelease(mHandle);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -114,9 +125,121 @@ PooledPhysMemAllocator::PooledPhysMemAllocator(size_t physMemSize)
     }
 }
 
+PooledPhysMemAllocator::PooledPhysMemAllocator(ImportTag, size_t chunkBytes)
+    : mPhysMemSize(chunkBytes)
+    , mImported(true)
+    , mPool(
+          [this]() -> PhysMemWrapper*
+          {
+              // Runs under the pool's mutex, as does the destroy function below; nothing else touches the list.
+              if (mFreeImported.empty())
+              {
+                  throw OutOfMemoryError("Remote host tier: every lent chunk is in use");
+              }
+              auto* chunk = new PhysMemWrapper(mFreeImported.back());
+              mFreeImported.pop_back();
+              return chunk;
+          },
+          [this](PhysMemWrapper* chunk)
+          {
+              mFreeImported.push_back(chunk->release());
+              delete chunk;
+          })
+{
+    cuCheck(cuCtxGetDevice(&mDeviceId));
+}
+
+namespace
+{
+
+//! Reads the first 8 bytes of an imported chunk through a temporary device-only mapping.
+uint64_t readChunkHead(CUmemGenericAllocationHandle handle, size_t chunkBytes, int deviceId)
+{
+    CUdeviceptr va = 0;
+    // Aligned to the chunk, which is a multiple of the imported allocation's granularity (checked by the caller).
+    cuCheck(cuMemAddressReserve(&va, chunkBytes, chunkBytes, 0, 0));
+    bool mapped = false;
+    uint64_t head = 0;
+    try
+    {
+        cuCheck(cuMemMap(va, chunkBytes, 0, handle, 0));
+        mapped = true;
+        CUmemAccessDesc access{};
+        access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        access.location.id = deviceId;
+        access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        cuCheck(cuMemSetAccess(va, chunkBytes, &access, 1));
+        cuCheck(cuMemcpyDtoH(&head, va, sizeof(head)));
+    }
+    catch (...)
+    {
+        if (mapped)
+        {
+            cuMemUnmap(va, chunkBytes);
+        }
+        cuMemAddressFree(va, chunkBytes);
+        throw;
+    }
+    cuCheck(cuMemUnmap(va, chunkBytes));
+    cuCheck(cuMemAddressFree(va, chunkBytes));
+    return head;
+}
+
+} // namespace
+
+std::unique_ptr<PooledPhysMemAllocator> PooledPhysMemAllocator::importFabric(
+    size_t chunkBytes, std::vector<std::string> const& fabricHandles, uint64_t verifyNonce)
+{
+    TLLM_CHECK_WITH_INFO(chunkBytes > 0 && !fabricHandles.empty(), "Remote host tier: no chunks to import");
+    std::unique_ptr<PooledPhysMemAllocator> allocator(new PooledPhysMemAllocator(ImportTag{}, chunkBytes));
+    auto& imported = allocator->mFreeImported;
+    imported.reserve(fabricHandles.size());
+    for (size_t index = 0; index < fabricHandles.size(); ++index)
+    {
+        auto const& bytes = fabricHandles[index];
+        CUmemFabricHandle fabric{};
+        TLLM_CHECK_WITH_INFO(
+            bytes.size() == sizeof(fabric.data), "Remote host tier: bad fabric handle size %zu", bytes.size());
+        std::memcpy(fabric.data, bytes.data(), sizeof(fabric.data));
+        CUmemGenericAllocationHandle handle{};
+        cuCheck(cuMemImportFromShareableHandle(&handle, &fabric, CU_MEM_HANDLE_TYPE_FABRIC));
+        // From here the destructor releases it, also when a check below throws.
+        imported.push_back(handle);
+
+        CUmemAllocationProp prop{};
+        cuCheck(cuMemGetAllocationPropertiesFromHandle(&prop, handle));
+        // Only the location type is checked. An imported handle can report HOST_NUMA id 0 whatever node the lender
+        // allocated on, so the NUMA id is not validated.
+        TLLM_CHECK_WITH_INFO(
+            prop.location.type == CU_MEM_LOCATION_TYPE_HOST_NUMA || prop.location.type == CU_MEM_LOCATION_TYPE_HOST,
+            "Remote host tier: chunk %zu is not host memory (location type %d)", index,
+            static_cast<int>(prop.location.type));
+        size_t granularity = 0;
+        cuCheck(cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
+        TLLM_CHECK_WITH_INFO(granularity > 0 && chunkBytes % granularity == 0,
+            "Remote host tier: chunk size %zu is not a multiple of the granularity %zu", chunkBytes, granularity);
+        allocator->mImportGranularity = std::max(allocator->mImportGranularity, granularity);
+
+        uint64_t const head = readChunkHead(handle, chunkBytes, allocator->mDeviceId);
+        uint64_t const expected = verifyNonce ^ static_cast<uint64_t>(index);
+        TLLM_CHECK_WITH_INFO(head == expected,
+            "Remote host tier: chunk %zu reads 0x%016llx, expected 0x%016llx (stale or foreign handles)", index,
+            static_cast<unsigned long long>(head), static_cast<unsigned long long>(expected));
+    }
+    allocator->mNumImported = imported.size();
+    // acquire() pops from the back; reverse so the first chunks are handed out first.
+    std::reverse(imported.begin(), imported.end());
+    return allocator;
+}
+
 PooledPhysMemAllocator::~PooledPhysMemAllocator()
 {
     mPool.clear();
+    for (auto handle : mFreeImported)
+    {
+        cuMemRelease(handle);
+    }
+    mFreeImported.clear();
 }
 
 PooledPhysMemAllocator::PooledPhysMem PooledPhysMemAllocator::acquire()
@@ -134,7 +257,16 @@ VirtMem::VirtMem(size_t vmSize, PooledPhysMemAllocator& physMemAllocator, size_t
 {
     TLLM_CHECK_DEBUG(vmSize % physMemAllocator.physMemSize() == 0);
 
-    cuCheck(cuMemAddressReserve(&mAddr, vmSize, 0, 0, 0));
+    // Imported chunks are mapped at chunk offsets, so the range is aligned to the chunk size, a multiple of the
+    // imported allocation's granularity. Local allocators keep the driver's default alignment.
+    size_t const alignment = physMemAllocator.isImported() ? physMemAllocator.physMemSize() : 0;
+    cuCheck(cuMemAddressReserve(&mAddr, vmSize, alignment, 0, 0));
+    if (alignment != 0 && (mAddr % alignment != 0 || mAddr % physMemAllocator.importGranularity() != 0))
+    {
+        cuMemAddressFree(mAddr, vmSize);
+        TLLM_THROW("VirtMem: reserved address 0x%llx is not aligned to the imported chunk size %zu",
+            static_cast<unsigned long long>(mAddr), alignment);
+    }
 
     mAccessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
     mAccessDesc.location.id = physMemAllocator.deviceId();
@@ -166,7 +298,24 @@ void VirtMem::push(PooledPhysMemAllocator::PooledPhysMem handle)
     TLLM_CHECK_DEBUG(physSize * (mPhysHandles.size() + 1) <= mVmSize);
 
     cuCheck(cuMemMap(offset, physSize, 0, handle->handle(), 0));
-    cuCheck(cuMemSetAccess(offset, physSize, &mAccessDesc, 1));
+    if (!mPhysMemAllocator.isImported())
+    {
+        cuCheck(cuMemSetAccess(offset, physSize, &mAccessDesc, 1));
+    }
+    else
+    {
+        try
+        {
+            cuCheck(cuMemSetAccess(offset, physSize, &mAccessDesc, 1));
+        }
+        catch (...)
+        {
+            // An imported chunk goes back to the fixed set of lent chunks when `handle` is dropped, and a later
+            // push may map it again; it must not stay mapped here.
+            cuMemUnmap(offset, physSize);
+            throw;
+        }
+    }
     mPhysHandles.push_back(std::move(handle));
 }
 

@@ -1278,15 +1278,15 @@ ROW_CAP = 512
 WIDE_ROW_CAP = 768
 
 
-def row_cap(d: Deployment, default: str = AUTO) -> int:
+def row_cap(d: Deployment, default: str = ON) -> int:
     """The row cap of ``router_gemm`` and ``finalize_two_shot`` on ``d``.
 
     ``WIDE_ROW_CAP`` on a wide generation server (``_wide_generation_refusal``) under the
-    ``auto`` default, ``ROW_CAP`` everywhere else (and under ``baseline``). The rows above
+    ``on`` default, ``ROW_CAP`` everywhere else (and under ``__DEFAULT=off``). The rows above
     ``ROW_CAP`` leave the built-in FP32 router and the unfused expert combine for these
     paths, which is lossless-numeric against them.
     """
-    if default == AUTO and _wide_generation_refusal(d) is None:
+    if default == ON and _wide_generation_refusal(d) is None:
         return WIDE_ROW_CAP
     return ROW_CAP
 
@@ -1494,6 +1494,31 @@ _DRAFTER_KV_GLUE_RULE = in_band(
     Band.DEFAULT, _yielding(("drafter_kv_side_chain",), _at_most("MAX_BATCH")), stock=False
 )
 
+
+def _low_latency_generation(rule: RuleFn) -> RuleFn:
+    """``rule``, but off on a generation server of ``max_batch_size`` above the low-latency
+    range (``_ll_max_batch``: 8, or 16 on a TEP8 generation server).
+
+    For the levers of the low-latency selection and the context-step levers: a wide generation
+    server's decode steps keep the stock paths, as the levers stepping aside for these read them
+    (``_LL_DEFAULT_BAND``). Context, aggregated and low-latency generation servers are unchanged.
+    """
+
+    def wrapped(d: Deployment, t: Resolving, p: Mapping[str, object]) -> Tuple[bool, str]:
+        if d.role is Role.GEN and d.max_batch_size is not None:
+            most = _ll_max_batch(d)
+            if d.max_batch_size > most:
+                return False, (
+                    f"a generation server of max_batch_size {d.max_batch_size}, above the "
+                    f"low-latency range ({most})"
+                )
+        return rule(d, t, p)
+
+    return wrapped
+
+
+_LOW_LATENCY_GENERATION = _low_latency_generation(ALWAYS)
+
 LEVERS: Mapping[str, Lever] = types.MappingProxyType(
     {
         "packed_prep_append": Lever(
@@ -1555,12 +1580,12 @@ LEVERS: Mapping[str, Lever] = types.MappingProxyType(
         ),
         "step_loop_on_execution_stream": Lever(
             Kind.BITWISE,
-            ALWAYS,
+            _LOW_LATENCY_GENERATION,
             params=(Param("MAX_BATCH", 4, 1, 64),),
         ),
         "incremental_block_offsets": Lever(
             Kind.BITWISE,
-            ALWAYS,
+            _LOW_LATENCY_GENERATION,
             params=(
                 Param("MAX_BATCH", 8, 1, 64, default_for=_tep8_gen_wide_winner(16, 8)),
                 # Alias only (kept for the round-3 / E2E envs): upstream #21789 stages a manager
@@ -1864,12 +1889,12 @@ LEVERS: Mapping[str, Lever] = types.MappingProxyType(
         ),
         "weight_prefetch_after_join": Lever(
             Kind.BITWISE,
-            ALWAYS,
+            _LOW_LATENCY_GENERATION,
             params=_ll_params(),
         ),
         "next_qkv_prefetch_skip": Lever(
             Kind.BITWISE,
-            ALWAYS,
+            _LOW_LATENCY_GENERATION,
             params=_ll_params()
             + (
                 Param("MAX_ROWS", 8, 8, 64),
@@ -1910,7 +1935,9 @@ LEVERS: Mapping[str, Lever] = types.MappingProxyType(
         ),
         "swa_prep_split": Lever(
             Kind.BITWISE,
-            unless_rule({"swa_blocks_per_program": _SWA_BLOCKS_PER_PROGRAM}),
+            unless_rule(
+                {"swa_blocks_per_program": _SWA_BLOCKS_PER_PROGRAM}, _LOW_LATENCY_GENERATION
+            ),
             params=_ll_params(),
             conflicts=("swa_blocks_per_program",),
         ),
@@ -1926,13 +1953,13 @@ LEVERS: Mapping[str, Lever] = types.MappingProxyType(
         ),
         "full_attention_fold_multi": Lever(
             Kind.BITWISE,
-            ALWAYS,
+            _LOW_LATENCY_GENERATION,
             params=_ll_params(),
             after=("wide_full_attention",),
         ),
         "split_kv_deep_rings": Lever(
             Kind.BITWISE,
-            ALWAYS,
+            _LOW_LATENCY_GENERATION,
             params=_ll_params(),
         ),
         "bf16_half_window": Lever(
@@ -1943,7 +1970,7 @@ LEVERS: Mapping[str, Lever] = types.MappingProxyType(
         ),
         "prerouted_experts": Lever(
             Kind.BITWISE,
-            ALWAYS,
+            _LOW_LATENCY_GENERATION,
             # The most rows of a TP8 two-window call on the prerouted tables (16-token tiles
             # above 64 rows, the stock call's tile there).
             # (w256: to 256, 32-token tiles at 129..256 rows.)
@@ -2028,7 +2055,7 @@ LEVERS: Mapping[str, Lever] = types.MappingProxyType(
         ),
         "finalize_entry_trigger": Lever(
             Kind.BITWISE,
-            ALWAYS,
+            _LOW_LATENCY_GENERATION,
             params=_ll_params(),
         ),
         "tep8_finalize_transport_64": Lever(
@@ -2058,7 +2085,7 @@ LEVERS: Mapping[str, Lever] = types.MappingProxyType(
         ),
         "hop_entry_trigger": Lever(
             Kind.BITWISE,
-            ALWAYS,
+            _LOW_LATENCY_GENERATION,
             params=_ll_params()
             + (
                 # 1: the decode input boundary (model_boundary) also releases its dependent,
@@ -2131,7 +2158,7 @@ LEVERS: Mapping[str, Lever] = types.MappingProxyType(
         ),
         "step_commit_v2": Lever(
             Kind.BITWISE,
-            ALWAYS,
+            _LOW_LATENCY_GENERATION,
             params=_ll_params()
             + (
                 # The overlap scheduler's two input corrections of a captured decode graph as
@@ -2147,7 +2174,7 @@ LEVERS: Mapping[str, Lever] = types.MappingProxyType(
         ),
         "wide_norm_gate_pdl": Lever(
             Kind.BITWISE,
-            ALWAYS,
+            _LOW_LATENCY_GENERATION,
             params=_ll_params()
             + (
                 # (row, head) pairs per program of the PDL norm-gate on its 9..128-row steps (1: the
@@ -2174,7 +2201,7 @@ LEVERS: Mapping[str, Lever] = types.MappingProxyType(
         ),
         "drafter_kv_fork_before_head": Lever(
             Kind.BITWISE,
-            ALWAYS,
+            _LOW_LATENCY_GENERATION,
             # PAGED_COMMIT: alias only (kept for the round-3 / E2E envs) of upstream #21789's
             # paged_context_commit, the one-launch paged commit on the context-K/V fork; the value
             # engages nothing of its own (drafter.py logs the mapping).
@@ -2190,7 +2217,7 @@ LEVERS: Mapping[str, Lever] = types.MappingProxyType(
         ),
         "context_sp_extra_parts": Lever(
             Kind.BITWISE,
-            ALWAYS,
+            _LOW_LATENCY_GENERATION,
             params=(
                 Param("MAX_BATCH", LL_MAX_BATCH, 1, 64),
                 Param(
@@ -2288,7 +2315,7 @@ LEVERS: Mapping[str, Lever] = types.MappingProxyType(
         ),
         "hop_cluster_split": Lever(
             Kind.BITWISE,
-            ALWAYS,
+            _LOW_LATENCY_GENERATION,
             params=(
                 Param("CLUSTER", 2, 1, 2),
                 Param("ROWS", ((192, 208), (248, 264)), 9, 1024, ranges=True),
@@ -2296,7 +2323,7 @@ LEVERS: Mapping[str, Lever] = types.MappingProxyType(
         ),
         "drafter_fc_inbox_wide": Lever(
             Kind.BITWISE,
-            ALWAYS,
+            _LOW_LATENCY_GENERATION,
             params=(Param("MAX_ROWS", 384, 128, 512), Param("PROGRAMS", 128, 1, 256)),
         ),
         "l061_tile32_pin": Lever(
@@ -2387,7 +2414,7 @@ LEVERS: Mapping[str, Lever] = types.MappingProxyType(
         ),
         "context_prep_rows_vec": Lever(
             Kind.BITWISE,
-            ALWAYS,
+            _LOW_LATENCY_GENERATION,
         ),
         "context_embedding_replicated": Lever(
             Kind.BITWISE,
@@ -2395,7 +2422,7 @@ LEVERS: Mapping[str, Lever] = types.MappingProxyType(
         ),
         "context_sp_router_input": Lever(
             Kind.BITWISE,
-            ALWAYS,
+            _LOW_LATENCY_GENERATION,
         ),
         # The context-step reduce-scatter overlaps: bitwise where the chunked BF16 GEMMs are
         # row-split invariant and NCCL reduces a chunk as the whole buffer (both held on GB300;
@@ -2404,20 +2431,20 @@ LEVERS: Mapping[str, Lever] = types.MappingProxyType(
         # on sm107 TEP4 context servers; the experts' overlap is not measured yet.
         "context_sp_oproj_overlap": Lever(
             Kind.BITWISE,
-            ALWAYS,
+            _LOW_LATENCY_GENERATION,
             params=_ctx_overlap_params(),
             after=("context_fp8_dense",),
             excluded=_ctx_overlap_excluded("o_proj"),
         ),
         "context_sp_tail_pipeline": Lever(
             Kind.BITWISE,
-            ALWAYS,
+            _LOW_LATENCY_GENERATION,
             after=("context_fp8_dense", "context_sp_router_input", "context_sp_extra_parts"),
             excluded=_ctx_overlap_excluded("pool", needs_router_input=True),
         ),
         "context_sp_moe_rs_overlap": Lever(
             Kind.BITWISE,
-            ALWAYS,
+            _LOW_LATENCY_GENERATION,
             params=_ctx_overlap_params(),
             after=("context_fp8_dense",),
             excluded=_ctx_overlap_excluded("unpool"),
@@ -2441,14 +2468,16 @@ LEVERS: Mapping[str, Lever] = types.MappingProxyType(
         ),
         "wide_qkv_prefetch": Lever(
             Kind.BITWISE,
-            either(
-                _WIDE_QKV_PREFETCH,
-                unless_rule(
-                    {
-                        "weight_prefetch_after_join": _LL_DEFAULT_BAND,
-                        "splitk_frontier_tables": _LL_GATED,
-                    }
-                ),
+            _low_latency_generation(
+                either(
+                    _WIDE_QKV_PREFETCH,
+                    unless_rule(
+                        {
+                            "weight_prefetch_after_join": _LL_DEFAULT_BAND,
+                            "splitk_frontier_tables": _LL_GATED,
+                        }
+                    ),
+                )
             ),
         ),
         "wide_capture_fold": Lever(

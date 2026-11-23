@@ -187,6 +187,7 @@ class PeerRegistrar:
         AttentionPolicy.validate_peer_compatible(self_page_table, peer_ri.page_table)
         self._validate_view_head_geometry(peer_ri)
         self.validate_draft_layers(self._ri, peer_ri)
+        self.validate_draft_context_window(self._ri, peer_ri)
 
         self_layers = sum(self._ri.layer_num_per_pp)
         peer_layers = sum(peer_ri.layer_num_per_pp)
@@ -219,6 +220,29 @@ class PeerRegistrar:
                 "same TRTLLM_DISAGG_SHARED_DRAFT_KV setting. To draft on the generation "
                 "worker alone, keep its draft KV private with TRTLLM_DISAGG_SHARED_DRAFT_KV=0 "
                 "or attention_backend VANILLA."
+            )
+
+    @staticmethod
+    def validate_draft_context_window(self_ri: RankInfo, peer_ri: RankInfo) -> None:
+        """Reject a context peer that writes only a drafter context window when this worker
+        reuses cached blocks.
+
+        Such a context worker leaves the draft rows below the last
+        ``draft_context_keep_tokens`` prompt positions of each request unwritten. Its own
+        reuse is guarded; a generation worker that reused a received prefix for a later
+        request would read those rows as the drafter's context, which costs acceptance
+        length without any error.
+        """
+        if (
+            peer_ri.draft_context_keep_tokens > 0
+            and self_ri.draft_context_keep_tokens == 0
+            and self_ri.reuses_cached_blocks
+        ):
+            raise ValueError(
+                "PeerRegistrar: the context peer writes the drafter context of the last "
+                f"{peer_ri.draft_context_keep_tokens} prompt positions only, and this worker "
+                "reuses cached blocks, whose draft rows below that window were never written. "
+                "Serve the generation worker with kv_cache_config.enable_block_reuse=false."
             )
 
     def _validate_view_head_geometry(self, peer_ri: RankInfo) -> None:

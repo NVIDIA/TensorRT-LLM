@@ -119,6 +119,9 @@ class WeightAccounting:
         self.ignored_duplicate_vision: set = set()
         self.ignored_stale_fused_qkv: set = set()
         self.ignored_audio: set = set()
+        # Text keys another pipeline stage loads. Empty without pipeline
+        # parallelism, and then absent from the summary.
+        self.ignored_other_stage: set = set()
 
     @property
     def ignored_perception(self) -> set:
@@ -136,7 +139,7 @@ class WeightAccounting:
         )
 
     def summary(self) -> Dict[str, int]:
-        return {
+        summary = {
             "consumed": len(self.consumed),
             "ignored_out_of_range": len(self.ignored_out_of_range),
             "ignored_perception": len(self.ignored_perception),
@@ -146,6 +149,9 @@ class WeightAccounting:
             "ignored_stale_fused_qkv": len(self.ignored_stale_fused_qkv),
             "ignored_audio": len(self.ignored_audio),
         }
+        if self.ignored_other_stage:
+            summary["ignored_other_stage"] = len(self.ignored_other_stage)
+        return summary
 
 
 def _classify_perception_key(
@@ -856,6 +862,54 @@ def load_musespark_open_vision_weights(
     weights.mark_consumed_keys([projection_key])
 
 
+def _load_pipeline_stage(
+    model, weights, accounting: WeightAccounting, open_format: bool, stage: Tuple[int, int]
+) -> None:
+    """Load one pipeline stage's tensors; account the other stages' keys as theirs.
+
+    ``stage`` is ``(first, end)`` of the rank's decoder layers
+    (``MuseSparkOpenModel.__pp_init__``). The first stage loads the embedding,
+    the last one the final norm and the LM head, and every stage loads its own
+    layers -- so the BF16 experts of the checkpoint's quant-excluded first and
+    last layers are read, and quantized at load if asked, only on the stages
+    that run them. A non-last stage also loads the next stage's first
+    ``pre_qkv_proj_norm``: its last layer computes that norm in the fused
+    boundary. No payload of another stage's tensor is read.
+    """
+    first, end = stage
+    layers = model.model.layers
+    num_layers = len(layers)
+    keys_by_layer: Dict[int, List[str]] = {}
+    for key in weights.keys():
+        match = _LAYER_KEY.match(key)
+        if match is not None:
+            keys_by_layer.setdefault(int(match.group(1)), []).append(key)
+
+    if first == 0:
+        _load_linear(
+            model.model.embed_tokens,
+            _materialize(weights, "model.embed_tokens.weight", accounting),
+        )
+    else:
+        accounting.ignored_other_stage.add("model.embed_tokens.weight")
+    if end == num_layers:
+        _copy_param(model.model.norm.weight, _materialize(weights, "model.norm.weight", accounting))
+        _load_linear(model.lm_head, _materialize(weights, "lm_head.weight", accounting))
+    else:
+        accounting.ignored_other_stage.update(("model.norm.weight", "lm_head.weight"))
+
+    for layer_idx, layer in enumerate(layers):
+        if first <= layer_idx < end:
+            load_layer(model, layer, layer_idx, weights, accounting, open_format=open_format)
+            continue
+        keys = keys_by_layer.get(layer_idx, [])
+        if layer_idx == end:
+            norm_key = f"model.layers.{layer_idx}.self_attn.pre_qkv_proj_norm.weight"
+            _copy_param(layer.pre_qkv_proj_norm.weight, _materialize(weights, norm_key, accounting))
+            keys = [key for key in keys if key != norm_key]
+        accounting.ignored_other_stage.update(keys)
+
+
 def load_musespark_open_weights(
     model, weights, accounting=None, open_format: Optional[bool] = None
 ) -> Dict[str, int]:
@@ -877,14 +931,19 @@ def load_musespark_open_weights(
     if accounting is None:
         accounting = classify_keys(list(weights.keys()), config.num_hidden_layers)
 
-    _load_linear(
-        model.model.embed_tokens, _materialize(weights, "model.embed_tokens.weight", accounting)
-    )
-    _copy_param(model.model.norm.weight, _materialize(weights, "model.norm.weight", accounting))
-    _load_linear(model.lm_head, _materialize(weights, "lm_head.weight", accounting))
+    stage = getattr(model.model, "_pp_stage", None)
+    if stage is not None:
+        _load_pipeline_stage(model, weights, accounting, open_format, stage)
+    else:
+        _load_linear(
+            model.model.embed_tokens,
+            _materialize(weights, "model.embed_tokens.weight", accounting),
+        )
+        _copy_param(model.model.norm.weight, _materialize(weights, "model.norm.weight", accounting))
+        _load_linear(model.lm_head, _materialize(weights, "lm_head.weight", accounting))
 
-    for layer_idx, layer in enumerate(model.model.layers):
-        load_layer(model, layer, layer_idx, weights, accounting, open_format=open_format)
+        for layer_idx, layer in enumerate(model.model.layers):
+            load_layer(model, layer, layer_idx, weights, accounting, open_format=open_format)
 
     unexpected = _unaccounted_keys(weights, accounting)
     if unexpected:
@@ -1014,7 +1073,10 @@ def missing_vision_keys(keys: List[str], num_vision_layers: int) -> List[str]:
 
 def _unaccounted_keys(weights, accounting: WeightAccounting) -> set:
     ignored = (
-        accounting.ignored_out_of_range | accounting.ignored_perception | accounting.ignored_other
+        accounting.ignored_out_of_range
+        | accounting.ignored_perception
+        | accounting.ignored_other
+        | accounting.ignored_other_stage
     )
     return set(weights.keys()) - accounting.consumed - ignored
 

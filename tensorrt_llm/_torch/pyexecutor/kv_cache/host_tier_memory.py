@@ -29,8 +29,14 @@ environment variable is set to ``1``:
 * ``TRTLLM_KV_HOST_TIER_COLLAPSE``: after the KV cache manager v2 has created
   its host tier, collapse the new host-tier mappings into huge pages with
   ``madvise(MADV_COLLAPSE)``.
+* ``TRTLLM_KV_HOST_TIER_ESTIMATION_FINAL_SIZE``: the KV cache estimation pass
+  keeps the configured ``host_cache_size`` instead of falling back to the
+  automatic host tier, which is sized like the estimation's device quota and is
+  prefaulted and page-locked for the whole estimation. With an explicit,
+  smaller final host tier this removes a transient host-memory peak at startup;
+  the device estimate does not depend on the host tier.
 
-Neither needs privileges. Failures are logged and otherwise ignored.
+None needs privileges. Failures are logged and otherwise ignored.
 """
 
 import ctypes
@@ -42,6 +48,7 @@ from tensorrt_llm.logger import logger
 
 DROP_PAGE_CACHE_ENV = "TRTLLM_KV_HOST_TIER_DROP_PAGE_CACHE"
 COLLAPSE_ENV = "TRTLLM_KV_HOST_TIER_COLLAPSE"
+ESTIMATION_FINAL_SIZE_ENV = "TRTLLM_KV_HOST_TIER_ESTIMATION_FINAL_SIZE"
 
 # From <linux/mman.h>; Python's mmap module does not export it.
 _MADV_COLLAPSE = 25
@@ -56,6 +63,10 @@ def drop_page_cache_enabled() -> bool:
 
 def collapse_enabled() -> bool:
     return os.environ.get(COLLAPSE_ENV) == "1"
+
+
+def estimation_final_size_enabled() -> bool:
+    return os.environ.get(ESTIMATION_FINAL_SIZE_ENV) == "1"
 
 
 def _iter_files(roots: Iterable[Optional[str]]) -> Iterable[str]:
@@ -132,11 +143,21 @@ def _huge_page_bytes() -> int:
         return 0
 
 
-def collapse_new_mappings(before: List[AddressRange]) -> None:
-    """``MADV_COLLAPSE`` the anonymous mappings that are not in ``before``."""
+def collapse_new_mappings(
+    before: List[AddressRange], exclude: Iterable[Tuple[int, int]] = ()
+) -> None:
+    """``MADV_COLLAPSE`` the anonymous mappings that are not in ``before``.
+
+    ``exclude`` lists (base, bytes) ranges never to touch, such as GPU-only mappings of remote memory.
+    """
     huge = _huge_page_bytes()
     known = set(before)
-    targets = [r for r in anonymous_mappings() if r not in known]
+    excluded = [(base, base + size) for base, size in exclude]
+    targets = [
+        r
+        for r in anonymous_mappings()
+        if r not in known and not any(r[0] < end and begin < r[1] for begin, end in excluded)
+    ]
     if huge <= 0 or not targets:
         logger.info(
             f"{COLLAPSE_ENV}: nothing to collapse (huge page {huge} B, {len(targets)} new mappings)"

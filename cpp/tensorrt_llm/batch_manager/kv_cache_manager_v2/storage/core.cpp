@@ -29,6 +29,7 @@
 #include <numeric>
 #include <set>
 #include <stdexcept>
+#include <string>
 #include <unistd.h>
 #include <unordered_map>
 
@@ -489,6 +490,28 @@ Address DiskSlotPool::slotAddress(SlotId slot) const
 }
 
 // ---------------------------------------------------------------------------
+// StoreSlotPool
+// ---------------------------------------------------------------------------
+
+void StoreSlotPool::resize(SlotCount newNumSlots)
+{
+    if (newNumSlots != mNumSlots)
+    {
+        throw LogicError("StoreSlotPool: a store level cannot be resized (from " + std::to_string(mNumSlots) + " to "
+            + std::to_string(newNumSlots) + " slots)");
+    }
+}
+
+Address StoreSlotPool::slotAddress(SlotId slot) const
+{
+    TLLM_CHECK_WITH_INFO(isValidSlotId(slot), "StoreSlotPool::slotAddress: slot index out of bounds");
+    size_t const byteOffset = toSizeT(slot) * mSlotSize;
+    TLLM_CHECK_DEBUG_WITH_INFO(byteOffset <= static_cast<size_t>(std::numeric_limits<ssize_t>::max()),
+        "StoreSlotPool::slotAddress: byte offset out of range");
+    return DiskAddress{kStoreFd, static_cast<ssize_t>(byteOffset)};
+}
+
+// ---------------------------------------------------------------------------
 // PoolGroupBase
 // ---------------------------------------------------------------------------
 
@@ -615,6 +638,20 @@ GpuPoolGroup::GpuPoolGroup(
     }
 }
 
+GpuPoolGroup::GpuPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList,
+    PooledPhysMemAllocator& physMemAllocator, size_t vmSizePerPool)
+    : PoolGroupBase(numSlots)
+{
+    size_t const physMemSize = physMemAllocator.physMemSize();
+    TLLM_CHECK_WITH_INFO(!slotSizeList.empty(), "GpuPoolGroup: slotSizeList must not be empty");
+    for (size_t sz : slotSizeList)
+    {
+        size_t const vmSize
+            = std::max(roundUp(vmSizePerPool, physMemSize), roundUp(slotCountToSizeT(numSlots) * sz, physMemSize));
+        mPools.push_back(std::make_unique<GpuSlotPool>(sz, vmSize, physMemAllocator, numSlots));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // HostPoolGroup
 // ---------------------------------------------------------------------------
@@ -644,6 +681,19 @@ DiskPoolGroup::DiskPoolGroup(
     for (size_t sz : slotSizeList)
     {
         mPools.push_back(std::make_unique<DiskSlotPool>(directory, sz, numSlots));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// StorePoolGroup
+// ---------------------------------------------------------------------------
+
+StorePoolGroup::StorePoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList)
+    : PoolGroupBase(numSlots)
+{
+    for (size_t sz : slotSizeList)
+    {
+        mPools.push_back(std::make_unique<StoreSlotPool>(sz, numSlots));
     }
 }
 
@@ -708,6 +758,62 @@ HostCacheLevelStorage::HostCacheLevelStorage(
 // DiskCacheLevelStorage
 // ---------------------------------------------------------------------------
 
+RemoteHostCacheLevelStorage::RemoteHostCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
+    TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, RemoteHostTierConfig const& remote)
+    : mAllocator(PooledPhysMemAllocator::importFabric(remote.chunkBytes, remote.fabricHandles, remote.verifyNonce))
+{
+    TLLM_CHECK_WITH_INFO(slotCountList.size() == slotDescList.size(),
+        "RemoteHostCacheLevelStorage: slotCountList and slotDescList must have the same length");
+    // Every copy into or out of this level runs on the batched GPU copy kernel, which needs 16-byte aligned sizes
+    // and addresses. Checked here so a bad slot size fails at startup instead of in the middle of an eviction.
+    for (PoolGroupIndex pgIdx{0}; pgIdx < slotDescList.size(); ++pgIdx)
+    {
+        for (size_t const slotBytes : slotDescList[pgIdx].slotSizeList())
+        {
+            TLLM_CHECK_WITH_INFO(slotBytes % kRemoteCopyAlignment == 0,
+                "RemoteHostCacheLevelStorage: slot size %zu is not a multiple of %zu bytes", slotBytes,
+                kRemoteCopyAlignment);
+        }
+    }
+    try
+    {
+        for (PoolGroupIndex pgIdx{0}; pgIdx < slotDescList.size(); ++pgIdx)
+        {
+            mPoolGroups.push_back(std::make_unique<GpuPoolGroup>(
+                slotCountList[pgIdx], slotDescList[pgIdx].slotSizeList(), *mAllocator, lentBytes()));
+        }
+    }
+    catch (...)
+    {
+        // The pools hold chunks of mAllocator, which is destroyed before the base class's pool groups.
+        mPoolGroups.clear();
+        throw;
+    }
+    for (auto const& pg : mPoolGroups)
+    {
+        for (PoolIndex poolIdx{0}; poolIdx < pg->numPools(); ++poolIdx)
+        {
+            // Every pool reserves lentBytes() rounded to whole chunks (see GpuPoolGroup).
+            auto const base = std::get<MemAddress>(pg->slotAddress(SlotId{0}).at(poolIdx));
+            TLLM_CHECK_WITH_INFO(base % kRemoteCopyAlignment == 0,
+                "RemoteHostCacheLevelStorage: pool base 0x%llx is not %zu-byte aligned",
+                static_cast<unsigned long long>(base), kRemoteCopyAlignment);
+            mAddressRanges.emplace_back(base, lentBytes());
+        }
+    }
+}
+
+RemoteHostCacheLevelStorage::~RemoteHostCacheLevelStorage()
+{
+    // Unmap every pool while the allocator that owns their chunks is still alive.
+    mPoolGroups.clear();
+}
+
+std::vector<std::pair<MemAddress, size_t>> RemoteHostCacheLevelStorage::addressRanges() const
+{
+    return mAddressRanges;
+}
+
 DiskCacheLevelStorage::DiskCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
     TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, std::string directory)
     : mDirectory(std::move(directory))
@@ -718,6 +824,19 @@ DiskCacheLevelStorage::DiskCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> 
     {
         mPoolGroups.push_back(
             std::make_unique<DiskPoolGroup>(slotCountList[pgIdx], slotDescList[pgIdx].slotSizeList(), mDirectory));
+    }
+}
+
+StoreCacheLevelStorage::StoreCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
+    TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, std::string label)
+    : mLabel(std::move(label))
+{
+    TLLM_CHECK_WITH_INFO(slotCountList.size() == slotDescList.size(),
+        "StoreCacheLevelStorage: slotCountList and slotDescList must have the same length");
+    for (PoolGroupIndex pgIdx{0}; pgIdx < slotDescList.size(); ++pgIdx)
+    {
+        mPoolGroups.push_back(
+            std::make_unique<StorePoolGroup>(slotCountList[pgIdx], slotDescList[pgIdx].slotSizeList()));
     }
 }
 
@@ -740,10 +859,18 @@ std::unique_ptr<CacheLevelStorage> createCacheLevelStorage(CacheTierConfig const
             }
             else if constexpr (std::is_same_v<T, HostCacheTierConfig>)
             {
+                if (cfg.isRemote())
+                {
+                    return std::make_unique<RemoteHostCacheLevelStorage>(slotDescList, slotCountList, *cfg.remote);
+                }
                 return std::make_unique<HostCacheLevelStorage>(slotDescList, slotCountList);
             }
             else
             {
+                if (cfg.isStore())
+                {
+                    return std::make_unique<StoreCacheLevelStorage>(slotDescList, slotCountList, cfg.store->label);
+                }
                 return std::make_unique<DiskCacheLevelStorage>(slotDescList, slotCountList, cfg.path);
             }
         },

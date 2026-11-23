@@ -50,12 +50,18 @@ public:
     StorageManager* manager;
     LifeCycleId lifeCycle;
     CacheLevel cacheLevel;
-    // PrioritizedEvictionPolicy locates a scheduled page's sub-queue by this value, so changing it
-    // while the page is scheduled would erase from the wrong list. Change it only through
-    // StorageManager::setPriority(), which re-queues a scheduled page under the new value.
+    // PrioritizedEvictionPolicy keys a scheduled page's sub-queue by evictionPriority(), which equals
+    // this value unless the page is demoted. Changing it while the page is scheduled would erase from
+    // the wrong list, so change it only through StorageManager::setPriority(), which re-queues a
+    // scheduled page under the new value.
     Priority priority;
     WeakPtr<PageHolder> holder;     // empty → DROPPABLE
     std::optional<NodeRef> nodeRef; // present → scheduled for eviction
+    // Evict-first mark set by ChainDemoteHandle::demote(). Guarded by the exclusive API lock. It changes
+    // only while the page is unscheduled, or through StorageManager::demote()/undemote(), which remove the
+    // page from its eviction list, flip the flag and push it back; flipping it in place would erase the page
+    // from the wrong list. Implies the page is committed and was DROPPABLE when the mark was set.
+    bool demoted{false};
 
     Page(StorageManager* mgr, LifeCycleId lc, CacheLevel level, Priority prio);
 
@@ -68,6 +74,12 @@ public:
     bool scheduledForEviction() const noexcept
     {
         return nodeRef.has_value();
+    }
+
+    //! Key of the eviction list this page is scheduled in.
+    [[nodiscard]] Priority evictionPriority() const noexcept
+    {
+        return demoted ? kPriorityDemoted : priority;
     }
 
     // Prevent the page from being dropped (returns/creates a PageHolder).

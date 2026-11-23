@@ -99,6 +99,26 @@ def _check_collective_rpc_guard(
             "this shim only reaches rank-0.")
 
 
+# Opt-in (TLLM_EXECUTOR_PROXY_SKIP_CUDA_INIT=1): the proxy does not create a
+# CUDA stream before it starts the workers. Creating the stream creates a CUDA
+# context on the proxy's current device, which holds device memory next to that
+# device's worker for the life of the proxy; the proxy itself runs no device
+# work. Unset or any other value keeps the stream.
+_SKIP_CUDA_INIT_ENV = "TLLM_EXECUTOR_PROXY_SKIP_CUDA_INIT"
+
+
+def _skip_proxy_cuda_init() -> bool:
+    return os.environ.get(_SKIP_CUDA_INIT_ENV) == "1"
+
+
+def _init_leader_cuda_stream() -> None:
+    if _skip_proxy_cuda_init():
+        logger.info(f"{_SKIP_CUDA_INIT_ENV}=1: the executor proxy creates no "
+                    "CUDA stream")
+        return
+    torch.cuda.Stream()
+
+
 class GenerationExecutorProxy(GenerationExecutor):
     READY_SIGNAL = b"READY"
     WORKER_PROCESS_IDENTITIES_SIGNAL = b"WORKER_PROCESS_IDENTITIES"
@@ -896,7 +916,7 @@ class GenerationExecutorProxy(GenerationExecutor):
         # importing its module in every worker whether or not it is ever used.
         from tensorrt_llm._torch.models.modeling_utils import \
             export_external_model_modules
-        torch.cuda.Stream()
+        _init_leader_cuda_stream()
 
         # Strip the tokenizer from worker_kwargs to avoid MPI pickle failures.
         # Tokenizers using trust_remote_code=True reference classes in the

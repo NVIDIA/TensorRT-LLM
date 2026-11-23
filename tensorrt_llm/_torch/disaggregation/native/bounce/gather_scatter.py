@@ -48,6 +48,12 @@ _BLOCK = 4096
 _NUM_WARPS = 4
 _CHUNK_BYTES = _BLOCK * _ELEM_BYTES
 
+# opt-in receive scatter block (TRTLLM_KV_BOUNCE_RECV_SCATTER_TUNED): 512 elements = 8 KiB per
+# program on 2 warps, so a KV page fragment of a few KiB fills its program instead of masking most
+# of a 64 KiB one; the send-side gather keeps the default block
+_RECV_SCATTER_BLOCK = 512
+_RECV_SCATTER_NUM_WARPS = 2
+
 
 @dataclass
 class Plan:
@@ -134,10 +140,21 @@ def _get_meta_buffers(stream_handle: int, need: int, dev):
 
 
 def _launch_batched_copy(
-    dst_addrs: np.ndarray, src_addrs: np.ndarray, sizes: np.ndarray, stream
+    dst_addrs: np.ndarray,
+    src_addrs: np.ndarray,
+    sizes: np.ndarray,
+    stream,
+    *,
+    alloc_on_stream: bool = False,
+    block: int = _BLOCK,
+    num_warps: int = _NUM_WARPS,
 ) -> bool:
     """Run the single batched copy on the stream. Returns False when the caller must use the loop
-    fallback."""
+    fallback. ``alloc_on_stream`` allocates the metadata buffers with the stream current, so the
+    caching allocator ties the device block to that stream and not to the legacy default stream;
+    the non-blocking send stream needs this, the default keeps the legacy allocation site.
+    ``block`` (128-bit elements per program) and ``num_warps`` choose the kernel's launch shape;
+    every shape copies the same bytes to the same places."""
     if not _HAVE_TRITON or not torch.cuda.is_available():
         return False
 
@@ -153,13 +170,17 @@ def _launch_batched_copy(
     # pack all three address arrays into one pinned buffer and one async copy, so the kernel is
     # ordered after it
     stream_handle = int(stream)
-    pinned, devt = _get_meta_buffers(stream_handle, 3 * n, dev)
+    if alloc_on_stream:
+        with torch.cuda.stream(torch.cuda.ExternalStream(stream_handle)):
+            pinned, devt = _get_meta_buffers(stream_handle, 3 * n, dev)
+    else:
+        pinned, devt = _get_meta_buffers(stream_handle, 3 * n, dev)
     host = pinned.numpy()
     host[:n] = dst_addrs
     host[n : 2 * n] = src_addrs
     host[2 * n : 3 * n] = nvec
 
-    n_chunks = triton.cdiv(max_nvec, _BLOCK)
+    n_chunks = triton.cdiv(max_nvec, block)
     grid = (n, n_chunks)
 
     # buffer reuse is safe: every caller syncs the stream between calls, so the previous copy and
@@ -172,8 +193,8 @@ def _launch_batched_copy(
             devt[n : 2 * n],
             devt[2 * n : 3 * n],
             n,
-            BLOCK=_BLOCK,
-            num_warps=_NUM_WARPS,
+            BLOCK=block,
+            num_warps=num_warps,
         )
     return True
 
@@ -192,14 +213,16 @@ def gather_contiguous(
     offsets: np.ndarray,
     *,
     stream,
+    alloc_on_stream: bool = False,
 ) -> None:
     """Gather each source fragment into its place in the contiguous buffer, asynchronously. The
-    caller syncs before issuing the write."""
+    caller syncs before issuing the write. ``alloc_on_stream`` is forwarded to the batched copy
+    (see _launch_batched_copy)."""
     src_addrs = np.asarray(src_ptrs, dtype=np.int64)
     dst_addrs = np.int64(dst_base) + np.asarray(offsets, dtype=np.int64)
     sizes = np.asarray(sizes, dtype=np.int64)
 
-    if _launch_batched_copy(dst_addrs, src_addrs, sizes, stream):
+    if _launch_batched_copy(dst_addrs, src_addrs, sizes, stream, alloc_on_stream=alloc_on_stream):
         return
 
     _copy_frags(
@@ -216,14 +239,28 @@ def scatter_contiguous(
     offsets: np.ndarray,
     *,
     stream,
+    tuned: bool = False,
 ) -> None:
     """The inverse of gather: scatter each piece of the contiguous buffer back to its destination
-    fragment, asynchronously. The caller syncs before signaling completion."""
+    fragment, asynchronously. The caller syncs before signaling completion. ``tuned`` launches the
+    batched copy with the small receive-scatter block (TRTLLM_KV_BOUNCE_RECV_SCATTER_TUNED); the
+    bytes, the stream and the fallback are the same either way."""
     dst_addrs = np.asarray(dst_ptrs, dtype=np.int64)
     src_addrs = np.int64(src_base) + np.asarray(offsets, dtype=np.int64)
     sizes = np.asarray(sizes, dtype=np.int64)
 
-    if _launch_batched_copy(dst_addrs, src_addrs, sizes, stream):
+    if tuned:
+        launched = _launch_batched_copy(
+            dst_addrs,
+            src_addrs,
+            sizes,
+            stream,
+            block=_RECV_SCATTER_BLOCK,
+            num_warps=_RECV_SCATTER_NUM_WARPS,
+        )
+    else:
+        launched = _launch_batched_copy(dst_addrs, src_addrs, sizes, stream)
+    if launched:
         return
 
     _copy_frags(

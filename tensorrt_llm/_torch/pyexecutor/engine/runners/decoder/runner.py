@@ -3302,10 +3302,20 @@ class DecoderRunner(ScheduledModelRunner):
         context_prompt_lookahead = None
         if spec_metadata is not None and spec_metadata.context_prompt_lookahead_tokens is not None:
             context_prompt_lookahead = []
+        # A manager that keeps only a drafter context window names, per context
+        # request, the first prompt position whose drafter context is written.
+        draft_context_keep = (
+            getattr(kv_cache_manager, "draft_context_keep_tokens", None)
+            if spec_metadata is not None
+            else None
+        )
+        draft_context_keep_from = [] if draft_context_keep is not None else None
 
         for request in scheduled_requests.context_requests:
             request_ids.append(request.py_request_id)
             draft_lens.append(0)
+            if draft_context_keep_from is not None:
+                draft_context_keep_from.append(max(0, request.prompt_len - draft_context_keep))
             begin_compute = request.context_current_position
             end_compute = begin_compute + request.context_chunk_size
             if context_prompt_lookahead is not None:
@@ -4332,6 +4342,8 @@ class DecoderRunner(ScheduledModelRunner):
             ]
             if context_prompt_lookahead is not None:
                 spec_metadata.populate_context_prompt_lookahead(context_prompt_lookahead)
+            if draft_context_keep_from is not None:
+                spec_metadata.draft_context_keep_from = draft_context_keep_from
             # No-op for non 1-model
             spec_metadata.populate_sampling_params_for_one_model(scheduled_requests.all_requests())
             spec_metadata.prepare()

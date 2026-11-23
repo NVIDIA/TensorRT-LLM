@@ -13,6 +13,7 @@ from torch import nn
 from transformers import LlamaConfig, PretrainedConfig
 
 from tensorrt_llm.logger import logger
+from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -1768,10 +1769,13 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                             2 * spec_config.tokens_per_gen_step)
 
                 elif spec_config.spec_dec_mode.is_external_drafter():
+                    drafter_kwargs = external_drafter_config_kwargs(
+                        model_config, spec_config)
+                    drafter_kwargs["mapping"] = self.external_drafter_mapping(
+                        model_config)
                     self.draft_config = ModelConfig.from_pretrained(
                         model_config.spec_config.speculative_model,
-                        **external_drafter_config_kwargs(
-                            model_config, spec_config))
+                        **drafter_kwargs)
                     _set_draft_kv_cache_quant_algo(self.draft_config,
                                                    model_config)
                     self.draft_config.extra_attrs = model_config.extra_attrs
@@ -1807,6 +1811,14 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 self.spec_worker.set_draft_model(self.draft_model)
                 self.epilogue.append(self.spec_worker)
         self.layer_idx = -1
+
+    def external_drafter_mapping(self, model_config: ModelConfig) -> Mapping:
+        """The mapping a one-model external drafter is built with.
+
+        This is the target's mapping. A model whose pipeline stages hold the
+        drafter differently from its own layers overrides it.
+        """
+        return model_config.mapping
 
     def setup_aliases(self) -> None:
         if (self.draft_model is not None

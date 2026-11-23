@@ -12,6 +12,8 @@ from typing import (TYPE_CHECKING, Any, Dict, Hashable, List, Optional, Union,
 import torch
 
 import tensorrt_llm.bindings
+from tensorrt_llm._torch.pyexecutor.kv_cache.subagent_idle_drop import \
+    subagent_idle_drop_requested
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings import executor as tllm_executor
@@ -1573,8 +1575,18 @@ def executor_request_to_llm_request(
         mrope_config.setdefault("mrope_position_deltas", mrope_position_deltas)
 
     agent_hierarchy = None
+    # Opt-in (TLLM_KV_SUBAGENT_IDLE_DROP_S or TLLM_KV_SUBAGENT_PARENT_RESUME_DROP_S):
+    # the parent-session id (SchedulingParams.subagent_affinity_id) of a child
+    # request, which only the idle drop's chain key reads; off leaves the
+    # request without the attribute.
+    track_subagent_affinity = subagent_idle_drop_requested()
+    subagent_affinity_id = None
     if getattr(executor_request, "py_scheduling_params", None) is not None:
         agent_hierarchy = executor_request.py_scheduling_params.agent_hierarchy
+        if track_subagent_affinity:
+            subagent_affinity_id = getattr(
+                executor_request.py_scheduling_params, "subagent_affinity_id",
+                None)
 
     # Audio encoder-decoder models (e.g. Whisper) carry the encoder input as a
     # feature tensor, not encoder token ids. Route it into the request's native
@@ -1692,6 +1704,8 @@ def executor_request_to_llm_request(
                                                   None)
     llm_request.py_conversation_params = getattr(executor_request,
                                                  "py_conversation_params", None)
+    if track_subagent_affinity:
+        llm_request.py_subagent_affinity_id = subagent_affinity_id
     if child_req_ids:
         for child_id in child_req_ids:
             llm_request.create_child_request(child_id)

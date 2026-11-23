@@ -20,7 +20,10 @@
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/utils/cudaEvent.h"
 
+#include <cstdint>
 #include <cuda.h>
+#include <memory>
+#include <string>
 #include <vector>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -34,6 +37,8 @@ class PhysMemWrapper
 {
 public:
     PhysMemWrapper(size_t size, CUmemAllocationProp const& prop);
+    //! Takes ownership of a handle that already exists, for example one returned by cuMemImportFromShareableHandle.
+    explicit PhysMemWrapper(CUmemGenericAllocationHandle adopted) noexcept;
     ~PhysMemWrapper();
 
     PhysMemWrapper(PhysMemWrapper const&) = delete;
@@ -44,8 +49,16 @@ public:
         return mHandle;
     }
 
+    //! Gives up ownership without calling cuMemRelease and returns the handle.
+    [[nodiscard]] CUmemGenericAllocationHandle release() noexcept
+    {
+        mOwned = false;
+        return mHandle;
+    }
+
 private:
     CUmemGenericAllocationHandle mHandle;
+    bool mOwned = true;
 };
 
 // ---------------------------------------------------------------------------
@@ -60,6 +73,31 @@ public:
     // physMemSize: size of each physical chunk in bytes.
     explicit PooledPhysMemAllocator(size_t physMemSize);
     ~PooledPhysMemAllocator();
+
+    //! An allocator over a fixed set of chunks another process exported as CU_MEM_HANDLE_TYPE_FABRIC handles.
+    //!
+    //! Every handle is imported here, and each chunk's first 8 bytes must read verifyNonce ^ chunkIndex. acquire()
+    //! hands out imported chunks only and throws OutOfMemoryError once all are in use; clear() keeps them, so a
+    //! shrink followed by an expand reuses the same chunks. They are released when the allocator is destroyed.
+    [[nodiscard]] static std::unique_ptr<PooledPhysMemAllocator> importFabric(
+        size_t chunkBytes, std::vector<std::string> const& fabricHandles, uint64_t verifyNonce);
+
+    [[nodiscard]] bool isImported() const noexcept
+    {
+        return mImported;
+    }
+
+    //! Number of chunks this allocator can hand out (imported allocators only).
+    [[nodiscard]] size_t numImportedChunks() const noexcept
+    {
+        return mNumImported;
+    }
+
+    //! Largest minimum granularity reported for the imported chunks (imported allocators only; 1 otherwise).
+    [[nodiscard]] size_t importGranularity() const noexcept
+    {
+        return mImportGranularity;
+    }
 
     PooledPhysMemAllocator(PooledPhysMemAllocator const&) = delete;
     PooledPhysMemAllocator& operator=(PooledPhysMemAllocator const&) = delete;
@@ -86,9 +124,20 @@ public:
     }
 
 private:
+    struct ImportTag
+    {
+    };
+
+    PooledPhysMemAllocator(ImportTag, size_t chunkBytes);
+
     size_t mPhysMemSize{};
     int mDeviceId{};
     CUmemAllocationProp mProp{};
+    //! Imported allocators: chunks not lent to any VirtMem. Declared before mPool, which returns chunks here.
+    std::vector<CUmemGenericAllocationHandle> mFreeImported;
+    bool mImported = false;
+    size_t mNumImported = 0;
+    size_t mImportGranularity = 1;
     SimplePool<PhysMemWrapper> mPool;
 };
 

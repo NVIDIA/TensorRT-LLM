@@ -26,6 +26,7 @@ import socket
 import subprocess  # nosec B404
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from importlib.util import find_spec
@@ -525,6 +526,90 @@ def _provision_kv_cache_pool(llm_args: dict,
         yield
 
 
+# Every Nth periodic-GC tick logs at INFO; the others log at DEBUG.
+_SERVER_GC_INFO_EVERY_N_TICKS = 60
+
+
+def _start_periodic_gc_if_requested(
+        stop_event: Optional[threading.Event] = None
+) -> Optional[threading.Thread]:
+    """Start a periodic cyclic-GC thread when automatic GC is disabled.
+
+    ``TRTLLM_SERVER_DISABLE_GC=1`` turns off automatic cyclic GC so a
+    collection never pauses the event loop, but then reference cycles created
+    while serving (for example the Jinja render context of every chat template
+    render) are never freed. ``TRTLLM_SERVER_GC_COLLECT_INTERVAL_S`` (float
+    seconds; unset, empty or 0 means off) starts one daemon thread that runs
+    ``gc.collect(TRTLLM_SERVER_GC_COLLECT_GENERATION)`` (0..2, default 1) every
+    interval. It only acts when ``TRTLLM_SERVER_DISABLE_GC=1``; otherwise
+    automatic GC already reclaims cycles.
+
+    A tick frees the cycles in the collected generations that died before it.
+    Objects still alive at a tick are promoted to the next older generation;
+    with generation 1 that is the oldest one, which only a generation-2
+    collection revisits, so a cycle that dies after surviving a tick stays.
+
+    Args:
+        stop_event: Stops the thread when set. The server never sets it; the
+            thread is a daemon and ends with the process.
+
+    Returns:
+        The started thread, or None when the collector is off.
+
+    Raises:
+        ValueError: If either variable is set to an invalid value while
+            ``TRTLLM_SERVER_DISABLE_GC=1``; otherwise they are not read.
+    """
+    if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") != "1":
+        return None
+    interval_str = os.getenv("TRTLLM_SERVER_GC_COLLECT_INTERVAL_S", "").strip()
+    generation_str = os.getenv("TRTLLM_SERVER_GC_COLLECT_GENERATION",
+                               "").strip()
+    try:
+        interval_s = float(interval_str) if interval_str else 0.0
+    except ValueError:
+        interval_s = float("nan")
+    if not (0.0 <= interval_s < float("inf")):
+        raise ValueError(
+            "TRTLLM_SERVER_GC_COLLECT_INTERVAL_S must be a finite number of "
+            f"seconds >= 0 (0 = off), got {interval_str!r}")
+    if generation_str not in ("", "0", "1", "2"):
+        raise ValueError("TRTLLM_SERVER_GC_COLLECT_GENERATION must be 0, 1 or "
+                         f"2, got {generation_str!r}")
+    generation = int(generation_str) if generation_str else 1
+
+    if interval_s == 0.0:
+        return None
+    if stop_event is None:
+        stop_event = threading.Event()
+
+    def _collect_loop() -> None:
+        tick = 0
+        # Sleep first. GC is disabled only after the LLM and the server are
+        # built, so everything allocated before that went through automatic
+        # GC; the young generations fill only from what runs after it (the
+        # uvicorn start-up, then serving). An immediate collection would find
+        # almost nothing, and the first tick after one interval is as small as
+        # any later one.
+        while not stop_event.wait(interval_s):
+            start = time.perf_counter()
+            collected = gc.collect(generation)
+            elapsed_ms = (time.perf_counter() - start) * 1e3
+            tick += 1
+            is_info_tick = tick % _SERVER_GC_INFO_EVERY_N_TICKS == 0
+            log = logger.info if is_info_tick else logger.debug
+            log(f"Server GC: collected {collected} objects in "
+                f"{elapsed_ms:.1f} ms (gen {generation})")
+
+    thread = threading.Thread(target=_collect_loop,
+                              name="trtllm-serve-periodic-gc",
+                              daemon=True)
+    thread.start()
+    logger.info(f"Server GC: periodic collector enabled, every {interval_s} s, "
+                f"generation {generation} (automatic GC is disabled)")
+    return thread
+
+
 def launch_server(
         host: str,
         port: int,
@@ -646,6 +731,8 @@ def launch_server(
                 # Optionally disable GC (default: not disabled)
                 if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":
                     gc.disable()
+                # Opt-in, only acts with TRTLLM_SERVER_DISABLE_GC=1.
+                _start_periodic_gc_if_requested()
 
                 _signal_frontend_ready(multi_frontend)
                 uvloop.run(server(host, port, sockets=[s]))
@@ -2767,7 +2854,8 @@ main = DefaultGroup(
         "mm_embedding_serve": serve_encoder,
         "embeddings": serve_embedding,
         # The part of a Mooncake pool that outlives and is shared by every
-        # server, the memory a node with no connector lends it, and the report
+        # server, the memory a node with no connector lends it, the memory
+        # it lends servers that lend none (the store KV tier), and the report
         # of what they collectively contributed to it.
         "mooncake_master": mooncake_master,
         "mooncake_donor": mooncake_donor,

@@ -369,7 +369,7 @@ def _make_transport(
     monkeypatch, block_bytes_per_group, capacity=1 << 30, min_bytes=1, min_blocks=1
 ):
     monkeypatch.setattr(btr, "SlotAllocator", _FakeAlloc)
-    monkeypatch.setattr(btr.VmmBounceTransport, "_new_stream", lambda self: 0)
+    monkeypatch.setattr(btr.VmmBounceTransport, "_new_stream", lambda self, mode=0: 0)
     monkeypatch.setattr(
         btr.VmmBounceTransport,
         "_start_scatter_worker",
@@ -1222,3 +1222,404 @@ class TestNonBlockingStreams:
         )
         assert t._send_stream == 22 and t._scatter_stream == 22
         assert fake.calls == [("with_flags", 1), ("with_flags", 1)]
+
+
+# --------------------------------------------------------------------------- #
+# Exact per-writer layout for an uneven PP fan-in (the equal split refuses it)
+# --------------------------------------------------------------------------- #
+# A 62-layer model split 15/16/16/15 over 4 context PP stages, read by one generation rank. Each
+# stage holds 4 full-attention layers and 11/12/12/11 sliding-window layers, so the two layer
+# groups have different slot sizes (16 vs 46 layers per block) and different per-stage counts.
+_PP_LAYERS = [15, 16, 16, 15]
+_PP_FULL_LAYERS = [3, 7, 11, 14, 18, 22, 26, 30, 34, 38, 42, 46, 50, 54, 58, 61]
+_PP_SWA_LAYERS = [layer for layer in range(62) if layer not in _PP_FULL_LAYERS]
+
+
+def _pp_page_table(kv_bytes: int) -> KVCachePageTable:
+    """Receiver page table: a full-attention and a sliding-window group, one pool each.
+
+    Every layer holds a K and a V buffer of ``kv_bytes`` per block, at ascending offsets in the slot.
+    Local layer ids differ from the global ones, to exercise the mapping.
+    """
+
+    def group(pool_group_idx: int, global_layers: list[int]) -> AttentionLayerGroup:
+        entries = np.array(
+            [
+                (local, (2 * local + kv) * kv_bytes, kv_bytes)
+                for local in range(len(global_layers))
+                for kv in range(2)
+            ],
+            dtype=BUFFER_ENTRY_DTYPE,
+        )
+        return AttentionLayerGroup(
+            pool_group_idx=pool_group_idx,
+            local_layers=[
+                LocalLayer(local_layer_id=local, global_layer_id=g)
+                for local, g in enumerate(global_layers)
+            ],
+            # two views of the same physical pool must count its buffers once
+            pool_views=[
+                PoolView(pool_idx=0, buffer_entries=entries),
+                PoolView(pool_idx=0, buffer_entries=entries),
+            ],
+        )
+
+    def pool(n_layers: int, base: int) -> PhysicalPoolGroup:
+        return PhysicalPoolGroup(
+            pools=[PhysicalPool(base_address=base, slot_bytes=n_layers * 2 * kv_bytes, num_slots=8)]
+        )
+
+    return KVCachePageTable(
+        tokens_per_block=32,
+        layer_groups=[group(0, _PP_FULL_LAYERS), group(1, _PP_SWA_LAYERS)],
+        pool_groups=[pool(16, 0x200000), pool(46, 0x400000)],
+    )
+
+
+class TestPPFanInSizing:
+    """Per-writer byte computation (pure math plus the page-table walk)."""
+
+    def test_stage_layer_ranges(self):
+        assert bcore.stage_layer_ranges(_PP_LAYERS) == [(0, 15), (15, 31), (31, 47), (47, 62)]
+
+    @pytest.mark.skipif(not _HAVE_TRANSPORT, reason="bounce.transport import needs CUDA bindings")
+    def test_layer_bytes_per_group_full_and_swa(self):
+        # 8 KiB K + 8 KiB V per layer and block, as on a TP4 generation rank.
+        pt = _pp_page_table(8192)
+        per_group = btr.layer_bytes_per_group(pt)
+        assert per_group[0] == {g: 16384 for g in _PP_FULL_LAYERS}
+        assert per_group[1] == {g: 16384 for g in _PP_SWA_LAYERS}
+        # agrees with the slot sizes the transport sizes the region from
+        assert btr.block_bytes_per_group(pt) == [262144, 753664]
+        assert [sum(d.values()) for d in per_group] == btr.block_bytes_per_group(pt)
+
+    @pytest.mark.skipif(not _HAVE_TRANSPORT, reason="bounce.transport import needs CUDA bindings")
+    def test_writer_block_bytes_15_16_16_15(self):
+        pt = _pp_page_table(8192)
+        wbb = bcore.pp_fanin_writer_block_bytes(
+            btr.layer_bytes_per_group(pt), [0, 1, 2, 3], _PP_LAYERS
+        )
+        # 4 full layers per stage; 11/12/12/11 sliding-window layers
+        assert wbb == [
+            [4 * 16384, 11 * 16384],
+            [4 * 16384, 12 * 16384],
+            [4 * 16384, 12 * 16384],
+            [4 * 16384, 11 * 16384],
+        ]
+        # every receiver layer is written by exactly one writer
+        assert [sum(col) for col in zip(*wbb)] == btr.block_bytes_per_group(pt)
+
+    def test_writer_block_bytes_partial_overlap_and_bad_stage(self):
+        per_group = [{0: 10, 5: 10, 9: 10}, None, {1: 7, 8: 7}]
+        # a receiver that overlaps stages 1 and 2 only ([4, 8) and [8, 10))
+        assert bcore.pp_fanin_writer_block_bytes(per_group, [1, 2], [4, 4, 2]) == [
+            [10, 0, 0],
+            [10, 0, 7],
+        ]
+        assert bcore.pp_fanin_writer_block_bytes(per_group, [3], [4, 4, 2]) is None
+
+    def test_receiver_writer_block_bytes_only_for_pure_pp_fanin(self):
+        tfr = pytest.importorskip("tensorrt_llm._torch.disaggregation.native.transfer")
+        if not _HAVE_TRANSPORT:
+            pytest.skip("bounce.transport import needs CUDA bindings")
+        compute = tfr.Receiver._compute_pp_fanin_writer_block_bytes
+        pt = _pp_page_table(8192)
+
+        def ov(ranks, pp=4, tp=1, cp=1):
+            return SimpleNamespace(
+                ranks=list(ranks), overlap_pp_size=pp, overlap_tp_size=tp, overlap_cp_size=cp
+            )
+
+        def ri(lpp=_PP_LAYERS, pp=4, tp=1, cp=1):
+            return SimpleNamespace(layer_num_per_pp=list(lpp), pp_size=pp, tp_size=tp, cp_size=cp)
+
+        expect = [[65536, 180224], [65536, 196608], [65536, 196608], [65536, 180224]]
+        assert compute(ov([0, 1, 2, 3]), ri(), pt) == expect
+        # context TP2 per stage, receiver head share held by one rank of each stage
+        assert compute(ov([1, 3, 5, 7]), ri(tp=2), pt) == expect
+        assert compute(ov([0, 1, 2, 3], tp=2), ri(), pt) is None  # TP split among writers
+        assert compute(ov([0, 1, 2, 3], cp=2), ri(), pt) is None  # CP split among writers
+        assert (
+            compute(ov([0, 1, 2, 3]), ri(lpp=[31, 31], pp=4), pt) is None
+        )  # incomplete layer list
+        assert compute(ov([0, 1, 2, 3], pp=1), ri(), pt) is None  # not a PP fan-in
+        assert compute(ov([0, 1, 2, 3]), ri(), None) is None
+
+    def test_fanin_gate_allow_uneven_pp_keeps_other_guards(self):
+        tfr = pytest.importorskip("tensorrt_llm._torch.disaggregation.native.transfer")
+        safe = tfr.Receiver._fanin_bounce_safe
+
+        def ov(dup=1):
+            return SimpleNamespace(
+                duplicate_head_factor=dup,
+                peer_duplicate_head_factor=1,
+                overlap_pp_size=4,
+                ranks=[0, 1, 2, 3],
+            )
+
+        peer = SimpleNamespace(layer_num_per_pp=_PP_LAYERS, page_table=None)
+        assert safe(ov(), peer, None) is False  # default: uneven split refused (unchanged)
+        assert safe(ov(), peer, None, allow_uneven_pp=True) is True
+        assert safe(ov(dup=2), peer, None, allow_uneven_pp=True) is False
+
+    def test_recv_req_info_wire_unchanged_without_capacity(self):
+        tfr = pytest.importorskip("tensorrt_llm._torch.disaggregation.native.transfer")
+        import msgpack
+
+        blocks = [np.arange(3, dtype=np.int64), np.array([-1, 4], dtype=np.int64)]
+        info = tfr.RecvReqInfo(
+            sender_req_id=5,
+            instance_name="gen",
+            instance_rank=2,
+            block_ids_per_layer_groups=blocks,
+            unique_rid=77,
+            slice_id=0,
+            bounce_dst_base=0x1000,
+        )
+        legacy = msgpack.packb(
+            {
+                "sender_req_id": 5,
+                "instance_name": "gen",
+                "instance_rank": 2,
+                "block_ids_per_layer_groups": [b.tobytes() for b in blocks],
+                "unique_rid": 77,
+                "dst_start_token": None,
+                "aux_slot": None,
+                "slice_id": 0,
+                "bounce_dst_base": 0x1000,
+            }
+        )
+        assert info.to_bytes() == legacy  # off: byte-identical message
+        assert tfr.RecvReqInfo.from_bytes(legacy).bounce_dst_capacity is None
+        info.bounce_dst_capacity = 4096
+        assert tfr.RecvReqInfo.from_bytes(info.to_bytes()).bounce_dst_capacity == 4096
+
+
+@pytest.mark.skipif(not _HAVE_TRANSPORT, reason="bounce.transport import needs CUDA bindings")
+class TestPPFanInExactReserve:
+    def test_exact_layout_prefix_sum_and_capacity(self, monkeypatch):
+        t = _make_transport(monkeypatch, block_bytes_per_group=[262144, 753664])
+        wbb = [[65536, 180224], [65536, 196608], [65536, 196608], [65536, 180224]]
+        req = _recv_req([10, 4])  # full group 10 blocks, window group 4 blocks
+        # the equal split refuses this fan-in (heterogeneous slot bytes) ...
+        assert t.reserve(req, num_writers=4) is False
+        # ... the exact layout takes it
+        assert t.reserve(req, num_writers=4, writer_block_bytes=wbb) is True
+        sizes = [10 * a + 4 * b for a, b in wbb]
+        assert t._recv_alloc.reserved_sizes == [sum(sizes)]
+        rid_slice = (req.unique_rid, req.slice_id)
+        starts = [0, sizes[0], sizes[0] + sizes[1], sizes[0] + sizes[1] + sizes[2]]
+        for i in range(4):
+            assert t.writer_base(rid_slice, i) == 0x100000 + starts[i]
+            assert t.writer_capacity(rid_slice, i) == sizes[i]
+        # the equal-split path keeps no capacity
+        req2 = _recv_req([2], rid=2)
+        t2 = _make_transport(monkeypatch, block_bytes_per_group=[100])
+        assert t2.reserve(req2, num_writers=2) is True
+        assert t2.writer_capacity((2, 0), 0) is None
+
+    def test_exact_layout_aligns_writer_starts(self, monkeypatch):
+        t = _make_transport(monkeypatch, block_bytes_per_group=[300])
+        req = _recv_req([1])
+        assert t.reserve(req, num_writers=3, writer_block_bytes=[[100], [120], [80]]) is True
+        rid_slice = (req.unique_rid, req.slice_id)
+        assert [t.writer_base(rid_slice, i) - 0x100000 for i in range(3)] == [0, 256, 512]
+        assert [t.writer_capacity(rid_slice, i) for i in range(3)] == [100, 120, 80]
+        assert t._recv_alloc.reserved_sizes == [512 + 80]
+
+    def test_exact_layout_guards(self, monkeypatch):
+        t = _make_transport(monkeypatch, block_bytes_per_group=[300, None])
+        # wrong writer count
+        assert t.reserve(_recv_req([1]), num_writers=3, writer_block_bytes=[[100], [200]]) is False
+        # writers claim more than the slot holds
+        assert t.reserve(_recv_req([1]), num_writers=2, writer_block_bytes=[[200], [200]]) is False
+        # recurrent-state groups stay refused for a fan-in
+        assert (
+            t.reserve(_recv_req([1, 1]), num_writers=2, writer_block_bytes=[[100, 0], [200, 0]])
+            is False
+        )
+        # a layer group nobody writes (e.g. draft layers) is simply not reserved
+        assert t.reserve(_recv_req([2]), num_writers=2, writer_block_bytes=[[100], [0]]) is True
+        assert t._recv_alloc.reserved_sizes[-1] == 2 * 100
+
+    def test_sender_capacity_guard_falls_back_per_fragment(self, monkeypatch):
+        built = []
+        bounce = SimpleNamespace(build_request=lambda wm: built.append(wm) or ("bounced", 7))
+
+        def wm(capacity, sizes=(64, 64)):
+            return SimpleNamespace(
+                bounce_dst_base=0x1000,
+                bounce_dst_capacity=capacity,
+                sizes=np.array(sizes, dtype=np.int64),
+            )
+
+        assert btr.build_send_request(bounce, wm(None), lambda: "frag") == ("bounced", 7)
+        assert btr.build_send_request(bounce, wm(128), lambda: "frag") == ("bounced", 7)
+        assert len(built) == 2
+        assert btr.build_send_request(bounce, wm(127), lambda: "frag") == ("frag", None)
+        assert len(built) == 2  # no gather into the region when the write would not fit
+
+    def test_unequal_writer_fanin_assembles_on_cpu(self, monkeypatch):
+        """End-to-end layout agreement on CPU for an unequal-writer fan-in.
+
+        The receiver sizes the region from its page table, each context stage gathers its own
+        layers' fragments to its writer base (stage 1 instead falls back to writing in place), and
+        the scatter puts every byte where the receiver's page table says it belongs.
+        """
+        kv_bytes = 32
+        pt = _pp_page_table(kv_bytes)
+        tfr = pytest.importorskip("tensorrt_llm._torch.disaggregation.native.transfer")
+        overlap = SimpleNamespace(
+            ranks=[0, 1, 2, 3], overlap_pp_size=4, overlap_tp_size=1, overlap_cp_size=1
+        )
+        peer = SimpleNamespace(layer_num_per_pp=_PP_LAYERS, pp_size=4, tp_size=1, cp_size=1)
+        wbb = tfr.Receiver._compute_pp_fanin_writer_block_bytes(overlap, peer, pt)
+        t = _make_transport(monkeypatch, block_bytes_per_group=btr.block_bytes_per_group(pt))
+        # receiver slots per group: 3 full-attention blocks, 2 window blocks (+ a -1 hole each)
+        req = _recv_req([3, 2])
+        assert t.reserve(req, num_writers=4, writer_block_bytes=wbb) is True
+        rid_slice = (req.unique_rid, req.slice_id)
+
+        mem = np.zeros(0x500000, dtype=np.uint8)  # fake device memory
+        rng = np.random.default_rng(0)
+        expected = {}  # dst address -> bytes
+
+        def writer_fragments(stage):
+            """The sender's fragment table for one stage.
+
+            Receiver layers in its stage range, every valid block, K then V, in group order.
+            """
+            start, end = bcore.stage_layer_ranges(_PP_LAYERS)[stage]
+            dst, sizes = [], []
+            for g, lg in enumerate(pt.layer_groups):
+                pool = pt.pool_groups[lg.pool_group_idx].pools[0]
+                for block in req.block_ids_per_layer_groups[g]:
+                    if block < 0:
+                        continue
+                    for entry in lg.pool_views[0].buffer_entries:
+                        layer = lg.local_layers[int(entry["local_layer_id"])].global_layer_id
+                        if start <= layer < end:
+                            dst.append(
+                                pool.base_address
+                                + int(block) * pool.slot_bytes
+                                + int(entry["offset"])
+                            )
+                            sizes.append(int(entry["size"]))
+            return np.array(dst, dtype=np.int64), np.array(sizes, dtype=np.int64)
+
+        for stage in range(4):
+            dst, sizes = writer_fragments(stage)
+            payload = [rng.integers(0, 256, int(s), dtype=np.uint8) for s in sizes]
+            for d, p in zip(dst, payload):
+                expected[int(d)] = p
+            base = t.writer_base(rid_slice, stage)
+            capacity = t.writer_capacity(rid_slice, stage)
+            assert int(sizes.sum()) == capacity  # sender and receiver agree on the bytes
+            write_meta = SimpleNamespace(
+                bounce_dst_base=base, bounce_dst_capacity=capacity, dst_ptrs=dst, sizes=sizes
+            )
+            if stage == 1:
+                # fallback writer: per-fragment writes straight into the cache, no result tail
+                for d, p in zip(dst, payload):
+                    mem[d : d + p.size] = p
+                t.record_result(rid_slice, stage, None, None)
+                continue
+            # gather into the send slot, then one coalesced write at this writer's base
+            blob = np.concatenate(payload)
+            assert base + blob.size <= t.writer_base(rid_slice, 0) + t._recv_alloc.reserved_sizes[0]
+            mem[base : base + blob.size] = blob
+            msg = [b"KV_AGENT_RESULT", b"prefix"] + btr.encode_result_tail(write_meta)
+            d_ptrs, d_sizes, src_base = btr.decode_result_tail(msg)
+            t.record_result(rid_slice, stage, d_ptrs, d_sizes, src_base=src_base)
+
+        def fake_scatter(src_base, dst_ptrs, sizes, srcs, *, stream):
+            for d, s, n in zip(dst_ptrs, srcs, sizes):
+                mem[d : d + n] = mem[src_base + s : src_base + s + n]
+
+        monkeypatch.setattr(btr, "scatter_contiguous", fake_scatter)
+        monkeypatch.setattr(
+            btr,
+            "cudart",
+            SimpleNamespace(
+                cudaSetDevice=lambda dev: (0,), cudaStreamSynchronize=lambda stream: (0,)
+            ),
+        )
+        monkeypatch.setattr(btr, "CUASSERT", lambda ret: ret)
+        t._scatter_stream = 0
+        t._stop = SimpleNamespace(is_set=lambda: False)
+        t._scatter_q.put(None)
+        t._scatter_loop()
+
+        # 3 full blocks x 16 layers + 2 window blocks x 46 layers, K and V each
+        assert len(expected) == 2 * (3 * 16 + 2 * 46)
+        for d, p in expected.items():
+            assert np.array_equal(mem[d : d + p.size], p), hex(d)
+        assert t._recv_alloc.released  # settled after the scatter
+
+    def test_receiver_dispatch_publishes_exact_layout(self, monkeypatch):
+        """Receiver.dispatch_task with a 15/16/16/15 PP fan-in.
+
+        The equal split refuses it, so each stage gets its own base and capacity.
+        """
+        tfr = pytest.importorskip("tensorrt_llm._torch.disaggregation.native.transfer")
+        pt = _pp_page_table(8192)
+        t = _make_transport(monkeypatch, block_bytes_per_group=btr.block_bytes_per_group(pt))
+        overlap = SimpleNamespace(
+            ranks=[0, 1, 2, 3],
+            overlap_pp_size=4,
+            overlap_tp_size=1,
+            overlap_cp_size=1,
+            duplicate_head_factor=1,
+            peer_duplicate_head_factor=1,
+        )
+        peer = SimpleNamespace(
+            instance_name="ctx",
+            layer_num_per_pp=_PP_LAYERS,
+            pp_size=4,
+            tp_size=1,
+            cp_size=1,
+            page_table=None,
+            sender_endpoints=["ep0", "ep1", "ep2", "ep3"],
+        )
+        req = tfr.RecvReqInfo(
+            sender_req_id=9,
+            instance_name="gen",
+            instance_rank=0,
+            block_ids_per_layer_groups=[np.arange(5, dtype=np.int64), np.arange(2, dtype=np.int64)],
+            unique_rid=11,
+            slice_id=0,
+        )
+        rx = object.__new__(tfr.Receiver)
+        rx._bounce = t
+        rx._enforce_physical_ownership = False
+        rx._pp_fanin_writer_block_bytes_cache = {}
+        rx._registrar = SimpleNamespace(
+            get_peer_overlap=lambda peer_ri, dp: overlap,
+            self_rank_info=SimpleNamespace(cp_size=1),
+            self_extractor=SimpleNamespace(page_table=pt),
+        )
+        session = SimpleNamespace(mark_transferring=lambda slice_id: None, _sender_endpoints=set())
+        sent = []
+        monkeypatch.setattr(rx, "_build_recv_req_info", lambda task: req, raising=False)
+        monkeypatch.setattr(rx, "_get_sender_info", lambda params: peer, raising=False)
+        monkeypatch.setattr(rx, "_get_session", lambda rid: session, raising=False)
+        monkeypatch.setattr(
+            rx,
+            "_request_sender_data",
+            lambda ep, payload: sent.append((ep, payload)),
+            raising=False,
+        )
+        task = SimpleNamespace(
+            _params=SimpleNamespace(ctx_dp_rank=0),
+            _unique_rid=11,
+            slice_id=0,
+            expected_transfers=None,
+            _perf_timer=None,
+        )
+        rx.dispatch_task(task)
+        assert [ep for ep, _ in sent] == ["ep0", "ep1", "ep2", "ep3"]
+        infos = [tfr.RecvReqInfo.from_bytes(payload) for _, payload in sent]
+        sizes = [5 * 4 * 16384 + 2 * n * 16384 for n in (11, 12, 12, 11)]
+        assert [i.bounce_dst_capacity for i in infos] == sizes
+        assert [i.bounce_dst_base - 0x100000 for i in infos] == [sum(sizes[:k]) for k in range(4)]
+        assert t._recv_alloc.reserved_sizes == [sum(sizes)]

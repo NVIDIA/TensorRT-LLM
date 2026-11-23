@@ -321,6 +321,38 @@ private:
 };
 
 // ---------------------------------------------------------------------------
+// StoreSlotPool — the slots of a store level: objects of an external store, no local memory.
+// ---------------------------------------------------------------------------
+
+//! File descriptor of every store-level slot address. Never dereferenced: the store level moves its bytes through its
+//! IO table, and a stray pread/pwrite on it fails with EBADF.
+inline constexpr int kStoreFd = -2;
+
+class StoreSlotPool : public SlotPoolBase
+{
+public:
+    StoreSlotPool(size_t slotSize, SlotCount numSlots)
+        : SlotPoolBase(slotSize)
+        , mNumSlots(numSlots)
+    {
+    }
+
+    SlotCount numSlots() const noexcept override
+    {
+        return mNumSlots;
+    }
+
+    void destroy() override {}
+
+    //! The store objects are created once for the configured slot count, so the pool cannot change size.
+    void resize(SlotCount newNumSlots) override;
+    Address slotAddress(SlotId slot) const override;
+
+private:
+    SlotCount mNumSlots;
+};
+
+// ---------------------------------------------------------------------------
 // PoolGroupBase — manages multiple pools with mirrored slot allocation.
 // Mirrors _storage/_core.py::PoolGroupBase.
 // ---------------------------------------------------------------------------
@@ -399,6 +431,10 @@ class GpuPoolGroup : public PoolGroupBase
 public:
     GpuPoolGroup(
         SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, PooledPhysMemAllocator& physMemAllocator);
+
+    //! Reserves vmSizePerPool bytes of address space for every pool instead of sizing it from device memory.
+    GpuPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList,
+        PooledPhysMemAllocator& physMemAllocator, size_t vmSizePerPool);
 };
 
 class HostPoolGroup : public PoolGroupBase
@@ -415,6 +451,12 @@ public:
     DiskPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, std::string const& directory);
 };
 
+class StorePoolGroup : public PoolGroupBase
+{
+public:
+    StorePoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList);
+};
+
 // ---------------------------------------------------------------------------
 // CacheLevelStorage — manages all pool groups for one cache tier.
 // Mirrors _storage/_core.py::CacheLevelStorage.
@@ -425,6 +467,18 @@ public:
     virtual ~CacheLevelStorage() = default;
 
     virtual CacheTier cacheTier() const noexcept = 0;
+
+    //! True for a host level backed by another node's lent memory (see RemoteHostCacheLevelStorage).
+    [[nodiscard]] virtual bool isRemote() const noexcept
+    {
+        return false;
+    }
+
+    //! True for a level whose slots are objects of an external store (see StoreCacheLevelStorage).
+    [[nodiscard]] virtual bool isStore() const noexcept
+    {
+        return false;
+    }
 
     PoolGroupIndex numPoolGroups() const noexcept
     {
@@ -592,6 +646,56 @@ public:
     }
 };
 
+//! A HOST_MEM level over chunks of another node's host memory, imported as fabric handles.
+//!
+//! Each pool is a virtual address range the size of the whole lent capacity, so ratio adjustment can move chunks
+//! between pools by mapping and unmapping them. The chunks are mapped for the local device only: the CPU never reads
+//! or writes this level, and every copy into or out of it runs on the GPU. The level owns its allocator; the pools
+//! are torn down before it.
+class RemoteHostCacheLevelStorage : public CacheLevelStorage
+{
+public:
+    //! Size and address alignment the batched GPU copy kernel needs for every slot of this level.
+    static constexpr size_t kRemoteCopyAlignment = 16;
+
+    RemoteHostCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
+        TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, RemoteHostTierConfig const& remote);
+    ~RemoteHostCacheLevelStorage() override;
+
+    CacheTier cacheTier() const noexcept override
+    {
+        return CacheTier::HOST_MEM;
+    }
+
+    bool isRemote() const noexcept override
+    {
+        return true;
+    }
+
+    size_t poolSizeGranularity() const noexcept override
+    {
+        return mAllocator->physMemSize();
+    }
+
+    //! Bytes lent to this level (every imported chunk).
+    [[nodiscard]] size_t lentBytes() const noexcept
+    {
+        return mAllocator->numImportedChunks() * mAllocator->physMemSize();
+    }
+
+    [[nodiscard]] size_t numChunks() const noexcept
+    {
+        return mAllocator->numImportedChunks();
+    }
+
+    //! The reserved address range of every pool, as (base, bytes).
+    [[nodiscard]] std::vector<std::pair<MemAddress, size_t>> addressRanges() const;
+
+private:
+    std::unique_ptr<PooledPhysMemAllocator> mAllocator;
+    std::vector<std::pair<MemAddress, size_t>> mAddressRanges;
+};
+
 class DiskCacheLevelStorage : public CacheLevelStorage
 {
 public:
@@ -610,6 +714,40 @@ public:
 
 private:
     std::string mDirectory;
+};
+
+//! A DISK-tier level whose slots are objects of an external store, one object per cold page.
+//!
+//! The level owns no memory: its pools only number the slots, and every byte moves through the IO table the storage
+//! manager attaches to it (storeLevel.h). Slot counts are fixed when the level is built.
+class StoreCacheLevelStorage : public CacheLevelStorage
+{
+public:
+    StoreCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
+        TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, std::string label);
+
+    CacheTier cacheTier() const noexcept override
+    {
+        return CacheTier::DISK;
+    }
+
+    bool isStore() const noexcept override
+    {
+        return true;
+    }
+
+    size_t poolSizeGranularity() const noexcept override
+    {
+        return size_t{2} << 20;
+    }
+
+    [[nodiscard]] std::string const& label() const noexcept
+    {
+        return mLabel;
+    }
+
+private:
+    std::string mLabel;
 };
 
 // Factory: create appropriate CacheLevelStorage for a given tier config.

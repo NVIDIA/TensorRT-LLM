@@ -104,6 +104,26 @@ TokenIdExt = Union[TokenId, bytes]
 class PlannedDropHandle:
     def drop(self) -> None: ...
 
+class ChainDemoteHandle:
+    """Weak references to one committed chain's full-attention pages.
+
+    ``demote()`` marks the pages of the chain's subtree-closed, unheld blocks evict-first. Destruction and
+    ``release()`` never touch pages.
+    """
+
+    def absorb(self, other: ChainDemoteHandle) -> None: ...
+    def demote(self) -> tuple[int, int, int, int, int, int]:
+        """Demote the chain's eligible blocks and invalidate the handle.
+
+        Returns (plan_blocks, demoted_blocks, demoted_pages, demoted_pages_gpu, kept_shared_blocks,
+        kept_held_blocks).
+        """
+    def release(self) -> None: ...
+    @property
+    def valid(self) -> bool: ...
+    @property
+    def num_refs(self) -> int: ...
+
 class ReuseScope(NamedTuple):
     lora_id: int | None = None
     salt: int | None = None
@@ -203,17 +223,44 @@ class GpuCacheTierConfig:
     def tier(self) -> CacheTier: ...
     def assert_valid(self) -> None: ...
 
+class RemoteHostTierConfig:
+    """Host memory of another node, lent as fabric-handle chunks (see remote_host_tier.py)."""
+
+    def __init__(
+        self, fabric_handles: list[bytes], chunk_bytes: int, verify_nonce: int = 0
+    ) -> None: ...
+    @property
+    def fabric_handles(self) -> list[bytes]: ...
+    chunk_bytes: int
+    verify_nonce: int
+    @property
+    def capacity(self) -> int: ...
+    def assert_valid(self) -> None: ...
+
 @dataclass(slots=True)
 class HostCacheTierConfig:
     quota: int
+    remote: RemoteHostTierConfig | None = None
+    @property
+    def is_remote(self) -> bool: ...
     @property
     def tier(self) -> CacheTier: ...
     def assert_valid(self) -> None: ...
 
 @dataclass(slots=True)
+class StoreTierConfig:
+    """A last level whose slots are objects of an external store (an IO table attached at runtime)."""
+
+    label: str = "store"
+    staging_bytes: int = 0
+
+@dataclass(slots=True)
 class DiskCacheTierConfig:
     quota: int
-    path: str
+    path: str = ""
+    store: StoreTierConfig | None = None
+    @property
+    def is_store(self) -> bool: ...
     @property
     def tier(self) -> CacheTier: ...
     def assert_valid(self) -> None: ...
@@ -590,6 +637,7 @@ class _KVCache:
     @property
     def reuse_scope(self) -> ReuseScope: ...
     def plan_committed_block_drop(self) -> PlannedDropHandle | None: ...
+    def plan_committed_chain_demote(self, from_block: int) -> ChainDemoteHandle | None: ...
     def stop_committing(self) -> None: ...
     @property
     def superseded_anchor_priority(self) -> int | None: ...
@@ -792,6 +840,24 @@ class KVCacheManager:
     def resize(self, cache_level: CacheLevel, quota: int, best_efforts: bool = False) -> bool: ...
     def get_quota(self, cache_level: CacheLevel) -> int: ...
     def get_storage_statistics(self, cache_level: CacheLevel = ...) -> list[StorageStatistics]: ...
+    def get_remote_host_tier_stats(self) -> dict[str, int]:
+        """Remote host tier counters; level is -1 when no remote tier is configured."""
+    def get_remote_host_address_ranges(self) -> list[tuple[int, int]]: ...
+    def attach_store_level_io(self, table: int, owner: object) -> None:
+        """Attach the store level's IO table (address of a TllmKvStoreLevelIoV1, storeLevelIo.h).
+
+        ``owner`` is the object that keeps the table valid; the manager keeps it alive.
+
+        Registers the host-level pools and the page staging buffer, then configures the store
+        level's slot layout. Raises ValueError without a store level or when already attached;
+        RuntimeError when the table refuses a step.
+        """
+    def detach_store_level_io(self, timeout_s: float = 120.0) -> None:
+        """Drain the store IO and unregister every range; idempotent. Raises RuntimeError if ops remain."""
+    def keep_free_bytes(self, level: int, bytes: int) -> int:
+        """Evict LRU pages of `level` one level down until `bytes` are free; returns the slots evicted."""
+    def get_store_level_stats(self) -> dict[str, int]:
+        """Store level and IO table counters; level is -1 when no store level is configured."""
     def get_life_cycle_pool_group_indices(
         self, cache_level: CacheLevel = ...
     ) -> list[PoolGroupIndex]: ...
@@ -803,6 +869,8 @@ class KVCacheManager:
     def record_request_suspended(self) -> None: ...
     def record_request_resumed(self) -> None: ...
     def get_and_reset_iteration_suspend_resume_stats(self) -> tuple[int, int]: ...
+    def chain_demote_stats(self) -> tuple[int, int]:
+        """Cumulative (destroyed_demoted_pages, undemoted_pages)."""
     def get_and_reset_iteration_disk_prefetch_blocks(self) -> int: ...
     def get_and_reset_iteration_cached_tokens_by_level(self) -> list[int]: ...
     def get_and_reset_iteration_reused_blocks_by_level(

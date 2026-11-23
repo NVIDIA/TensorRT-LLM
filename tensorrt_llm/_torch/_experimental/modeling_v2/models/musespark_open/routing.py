@@ -4,9 +4,11 @@
 """Where a MuseSparkOpenOmniForCausalLM config lands. Read this file and you know.
 
 ``route`` is one forward-reading decision on three facts: the GPU, the model
-and the parallel layout (TEP). When they do not fit, ``route`` raises ``NoTarget``
-stating every fact it read. In ``auto`` the engine then uses the built-in
-MuseSparkOpen implementation; in ``require`` it raises that error.
+and the parallel layout. Two layouts have a target: TEP (``_tep``), and, on sm107,
+four pipeline stages of one rank each (``_pp_ctx``), which serves a context server.
+When the facts fit neither, ``route`` raises ``NoTarget`` stating every fact it
+read. In ``auto`` the engine then uses the built-in MuseSparkOpen implementation;
+in ``require`` it raises that error.
 
 The checkpoint publishes ``MuseSparkForConditionalGeneration`` with
 ``model_type: muse_spark``; the config loader translates that layout into the
@@ -25,7 +27,13 @@ speculative decoding: ``dispatch.drafterless_context``), and the built-in forwar
 through the target otherwise. So
 ``route`` decides on neither the speculative-decoding config nor the GPUs per node
 (launcher state: the visible devices, or the tensor-parallel size under Ray),
-and a deployment a target serves without fast paths still lands there.
+and a deployment a target serves without fast paths still lands there. The
+same holds for the pipeline target ``muse_spark_open_816b_a42b_nvfp4__sm_107__pp``:
+which server role it runs (it has fast paths for a context server, either without
+speculative decoding or with a DFlash drafter on the paged TRTLLM attention backend,
+whose prompt context the stages write and never draft from) and how the layers are
+split over the stages are its own construction-time decisions. It runs the sm107 TEP target's ops through one
+seam (its ``_tep.py``).
 
 When it returns the sm107 target, ``route`` applies that target's forced-acceptance
 policy to the speculative config (``rs_common.apply_forced_policy_to_spec_config``:
@@ -120,6 +128,25 @@ def apply_deployment_defaults(
     deployment_defaults.apply(compute_capability, mapping, facts)
 
 
+def _pp_ctx(m: Any) -> bool:
+    """Four pipeline stages of one rank each: every stage runs all attention heads and
+    all experts of its layers, with no tensor, expert, context or attention data
+    parallelism.
+
+    As with ``_tep``, the split decides which weights each rank loads and into which
+    shapes, so it selects a target. Four stages only: the stage target is written for
+    the four GPUs of one node.
+    """
+    return (
+        m.world_size == m.pp_size == 4
+        and m.tp_size == 1
+        and m.moe_ep_size == 1
+        and m.moe_tp_size == 1
+        and m.cp_size == 1
+        and not m.enable_attention_dp
+    )
+
+
 def route(
     pretrained_config: Any,
     mapping: Any,
@@ -135,16 +162,28 @@ def route(
     modeling code.
 
     Raises:
-        NoTarget: the deployment is neither target's.
+        NoTarget: the deployment is no target's.
     """
     # A config without one of these fields is another assembly: it reads as None
     # and the shape does not match.
     shape = tuple(getattr(pretrained_config, name, None) for name in _SHAPE_FIELDS)
 
+    capability = tuple(compute_capability)
+    model = capability in (_SM103, _SM107) and shape == _SHAPE
+
+    # Muse-Spark-Open-816B-A42B on sm107 as four pipeline stages of one rank.
+    if model and capability == _SM107 and _pp_ctx(mapping):
+        # One line, and at this depth, on purpose (see the TEP imports below).
+        # fmt: off
+        # isort: off
+        from .muse_spark_open_816b_a42b_nvfp4__sm_107__pp.modeling import ModelingV2MuseSparkOpen816bA42bNvfp4Sm107Pp
+        # isort: on
+        # fmt: on
+        return ModelingV2MuseSparkOpen816bA42bNvfp4Sm107Pp
+
     # Muse-Spark-Open-816B-A42B on sm103 or sm107, tensor-parallel attention and
     # expert-parallel MoE over the same ranks.
-    capability = tuple(compute_capability)
-    served = capability in (_SM103, _SM107) and shape == _SHAPE and _tep(mapping)
+    served = model and _tep(mapping)
     if not served:
         raise NoTarget(
             f"compute capability {compute_capability}, "
@@ -153,7 +192,9 @@ def route(
             f"moe_tp={mapping.moe_tp_size} attention_dp={mapping.enable_attention_dp}; the "
             "musespark_open targets are Muse-Spark-Open-816B-A42B on sm103 and on sm107, "
             "attention tensor-parallel and the experts expert-parallel over the same ranks at "
-            "any size (moe_tp 1, pp 1, cp 1, no attention DP)"
+            "any size (moe_tp 1, pp 1, cp 1, no attention DP), and on sm107 four pipeline "
+            "stages of one rank each (world 4 = pp 4, tp 1, moe_ep 1, moe_tp 1, cp 1, no "
+            "attention DP)"
         )
 
     # One line per target, and at this depth, on purpose: the claims suite reads the

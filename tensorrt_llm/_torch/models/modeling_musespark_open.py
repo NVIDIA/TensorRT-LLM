@@ -76,12 +76,25 @@ lever can be A/B'd on one image; see the ``_*_enabled`` helpers for rationale):
 
 Default-on switches read as disabled for the values ``0``/``false``/``no``/
 ``off``.
+
+Pipeline parallelism (``pipeline_parallel_size > 1``) runs each rank's
+contiguous slice of decoder layers (``Mapping.pp_layers``, so ``pp_partition``
+applies). The first stage owns the embedding, the last stage the final norm and
+the LM head. A stage boundary carries the FP32 residual stream and the next
+layer's fused pre-QKV norm output, so a pipelined forward computes the same
+function as a one-stage one. It serves text only and without speculative
+decoding; see :func:`pipeline_parallel_refusal`. The one exception: a modeling
+target that serves a pipeline stage of a disaggregated context server and builds
+this model inside :func:`pp_dflash_context_server` may carry a DFlash drafter
+with ``attention_backend`` TRTLLM. The drafter then lives on the last stage only
+(see :func:`pipeline_parallel_dflash_context`).
 """
 
 import contextlib
+import contextvars
 import copy
 import os
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Literal, Optional, Tuple
 
 import torch
 import triton
@@ -95,14 +108,16 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ...models.modeling_utils import QuantAlgo, QuantConfig
-from ..attention.backends import AttentionMetadata
+from ..attention.backends import AttentionBackend, AttentionMetadata
 from ..attention.backends.interface import (
     PositionalEmbeddingParams,
     PredefinedAttentionMask,
     RopeParams,
 )
 from ..attention.qk_norm_attention import QKNormRoPEAttention
+from ..disaggregation.pp_dflash_context import set_pp_dflash_context_server
 from ..distributed import AllReduce, AllReduceParams, allgather, reducescatter
+from ..distributed.communicator import pp_recv_tensors, pp_send_tensors
 from ..distributed.ops import MNNVLAllReduce, get_or_scale_allreduce_mnnvl_workspace
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
@@ -116,7 +131,7 @@ from ..moe.fused_moe import MiniMaxM2MoeRoutingMethod, create_moe
 from ..moe.fused_moe.moe_op_backend import TRTLLMOpBackend
 from ..utils import AuxStreamType, Fp4QuantizedTensor
 from .modeling_speculative import SpecDecOneEngineForCausalLM
-from .modeling_utils import DecoderModel
+from .modeling_utils import DecoderModel, remove_weights, skip_forward
 
 if TYPE_CHECKING:
     from .musespark_open_finalize_ar import FinalizeIpcWorkspace
@@ -3681,6 +3696,9 @@ class MuseSparkOpenModel(DecoderModel):
     #: The modeling_v2 target's context_prep op for context steps (MUSESPARK_OPEN_CTX_FUSIONS=1),
     #: or False; None until the first forward decides.
     _context_prep = None
+    #: ``(first, end)`` of this rank's decoder layers under pipeline
+    #: parallelism, set by ``__pp_init__``; None runs every layer.
+    _pp_stage: Optional[Tuple[int, int]] = None
 
     def __init__(self, model_config: ModelConfig[MuseSparkOpenConfig]):
         super().__init__(model_config)
@@ -3839,6 +3857,92 @@ class MuseSparkOpenModel(DecoderModel):
             object.__setattr__(layer.add_attn, "_router_input_moe", layer.feed_forward)
         return _vectorized_preattn_prep(_v2_prep.preattn_prep)
 
+    def __pp_init__(self) -> None:
+        """Keep only this pipeline stage's layers, embedding and final norm.
+
+        Replaces the generic hook, which assumes a layer returns
+        ``(hidden_states, residual)`` and keeps the next stage's
+        ``input_layernorm``. Here a layer returns the FP32 residual and, through
+        the fused boundary, the next layer's ``pre_qkv_proj_norm`` output. So a
+        non-last stage keeps the weight of the next stage's first
+        ``pre_qkv_proj_norm`` and sends both tensors (see
+        :meth:`_forward_pipeline_stage`).
+        """
+        mapping = self.model_config.mapping
+        if not mapping.has_pp():
+            return
+        num_layers = len(self.layers)
+        owned = mapping.pp_layers(num_layers)
+        if not owned or owned != list(range(owned[0], owned[-1] + 1)):
+            raise ValueError(
+                f"MuseSparkOpen pipeline stage {mapping.pp_rank} owns layers {owned}; every "
+                "stage needs a non-empty contiguous slice of the decoder layers"
+            )
+        first, end = owned[0], owned[-1] + 1
+        if not mapping.is_first_pp_rank():
+            skip_forward(self.embed_tokens)
+        if not mapping.is_last_pp_rank():
+            skip_forward(self.norm)
+        for layer_idx, layer in enumerate(self.layers):
+            if first <= layer_idx < end:
+                continue
+            keep = [layer.pre_qkv_proj_norm] if layer_idx == end else None
+            skip_forward(layer, ignore_modules=keep)
+        self._pp_stage = (first, end)
+
+    def _forward_pipeline_stage(
+        self,
+        attn_metadata: AttentionMetadata,
+        input_ids: Optional[torch.IntTensor],
+        position_ids: Optional[torch.IntTensor],
+        inputs_embeds: Optional[torch.FloatTensor],
+        **kwargs,
+    ) -> torch.Tensor:
+        """One pipeline stage of :meth:`forward`, with the same per-layer calls.
+
+        Stage boundary: the FP32 residual and the BF16 attention input of the
+        next stage's first layer, which the last layer here computes with the
+        fused ``next_layer_norm`` boundary exactly as an unpipelined forward
+        does. The prefill sequence-parallel path is refused under pipeline
+        parallelism at construction, so it is absent here.
+        """
+        mapping = self.model_config.mapping
+        first, end = self._pp_stage
+        if mapping.is_first_pp_rank():
+            if inputs_embeds is None:
+                inputs_embeds = self.embed_tokens(input_ids)
+            embeds = self.embed_norm(inputs_embeds.to(self.dtype))
+            if self.m_emb != 1.0:
+                embeds = embeds * self.m_emb
+            hidden_states = embeds.to(torch.float32)
+            precomputed_attn_input = None
+        else:
+            rows = input_ids if input_ids is not None else inputs_embeds
+            shape = (rows.shape[0], self.model_config.pretrained_config.hidden_size)
+            hidden_states = torch.empty(shape, dtype=torch.float32, device=rows.device)
+            precomputed_attn_input = torch.empty(shape, dtype=self.dtype, device=rows.device)
+            pp_recv_tensors([hidden_states, precomputed_attn_input])
+        for index in range(first, end):
+            next_norm = (
+                self.layers[index + 1].pre_qkv_proj_norm if index + 1 < len(self.layers) else None
+            )
+            result = self.layers[index](
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                attn_metadata=attn_metadata,
+                precomputed_attn_input=precomputed_attn_input,
+                next_layer_norm=next_norm,
+                **kwargs,
+            )
+            if next_norm is None:
+                hidden_states = result
+            else:
+                hidden_states, precomputed_attn_input = result
+        if not mapping.is_last_pp_rank():
+            pp_send_tensors([hidden_states, precomputed_attn_input])
+            return hidden_states
+        return self.norm(hidden_states.to(self.dtype))
+
     def _reserve_mnnvl_workspaces_once(self) -> None:
         """Reserve the MNNVL all-reduce workspaces before the first CUDA graph capture.
 
@@ -3866,6 +3970,10 @@ class MuseSparkOpenModel(DecoderModel):
             raise ValueError("Specify exactly one of input_ids and inputs_embeds")
         if self._mnnvl_reserve_tokens is not None:
             self._reserve_mnnvl_workspaces_once()
+        if self._pp_stage is not None:
+            return self._forward_pipeline_stage(
+                attn_metadata, input_ids, position_ids, inputs_embeds, **kwargs
+            )
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
         embeds = self.embed_norm(inputs_embeds.to(self.dtype))
@@ -3941,6 +4049,173 @@ def assert_supported_spec_config(spec_config: Any) -> None:
     )
 
 
+_PP_DFLASH_CONTEXT_SERVER = contextvars.ContextVar(
+    "musespark_open_pp_dflash_context_server", default=False
+)
+
+
+@contextlib.contextmanager
+def pp_dflash_context_server() -> Iterator[None]:
+    """Mark the model construction inside as a pipeline stage of a DFlash context server.
+
+    A modeling target that serves a pipeline stage of a disaggregated context
+    server wraps its call into the built-in constructor with this. By doing so
+    it guarantees what the built-in stage cannot: that no stage runs a draft
+    step, CUDA-graph warm-up included, and that the hidden states the drafter
+    reads reach the last stage. The constructor then admits a DFlash
+    ``speculative_config`` at ``pipeline_parallel_size > 1``
+    (:func:`pipeline_parallel_dflash_context`); without the marker it refuses
+    speculative decoding under pipeline parallelism.
+
+    The marker covers only the code inside the ``with`` block, on the calling
+    thread. Nested blocks are allowed; leaving one restores the enclosing state.
+    """
+    token = _PP_DFLASH_CONTEXT_SERVER.set(True)
+    try:
+        yield
+    finally:
+        _PP_DFLASH_CONTEXT_SERVER.reset(token)
+
+
+def in_pp_dflash_context_server() -> bool:
+    """Whether the caller runs inside :func:`pp_dflash_context_server`."""
+    return _PP_DFLASH_CONTEXT_SERVER.get()
+
+
+def _is_dflash_trtllm(spec_config: Any) -> bool:
+    mode = getattr(spec_config, "spec_dec_mode", None)
+    return (
+        mode is not None
+        and mode.is_dflash()
+        and getattr(spec_config, "attention_backend", None) == "TRTLLM"
+    )
+
+
+def pipeline_parallel_dflash_context(model_config: ModelConfig) -> bool:
+    """Whether this pipeline stage serves DFlash as part of a context server.
+
+    True only when all of these hold:
+
+    * ``pipeline_parallel_size > 1``;
+    * the construction runs inside :func:`pp_dflash_context_server`;
+    * the ``speculative_config`` is DFlash with ``attention_backend`` TRTLLM, whose
+      drafter context lives in the target's paged KV cache, so a context server
+      that writes it hands it to the generation server with the target KV.
+
+    Such a stage keeps the drafter on the last pipeline stage only: the other
+    stages drop its weights before they are materialized
+    (``MuseSparkOpenForCausalLM.__pp_init__``) and skip its checkpoint.
+    """
+    if model_config.mapping.pp_size == 1:
+        return False
+    if not in_pp_dflash_context_server():
+        return False
+    spec_config = getattr(model_config, "spec_config", None)
+    return spec_config is not None and _is_dflash_trtllm(spec_config)
+
+
+def _drop_pipeline_stage_drafter(drafter: nn.Module, rank: int, keep: List[nn.Module]) -> None:
+    """Free a drafter that this pipeline stage never runs.
+
+    ``remove_weights`` clears its parameters and buffers and marks every
+    submodule ``_weights_removed``, so the loader's post-load walks skip it.
+    Tensors that the drafter's modules, or the attention backends they hold,
+    keep as plain attributes (RoPE cos/sin tables, for one) are replaced by
+    meta tensors of the same shape and dtype: they stop holding memory, a read
+    of their shape still works, and any compute on them fails. The drafter's
+    forward raises. ``keep`` lists modules that are not the drafter's own: they
+    and their submodules stay untouched even if the drafter references them.
+    """
+    kept = {id(module) for root in keep for module in root.modules()}
+    shared = [module for module in drafter.modules() if id(module) in kept]
+    remove_weights(drafter, ignore_modules=shared)
+    owners = []
+    for module in drafter.modules():
+        if id(module) in kept:
+            continue
+        owners.append(module)
+        owners.extend(
+            value for value in vars(module).values() if isinstance(value, AttentionBackend)
+        )
+    for owner in owners:
+        for name, value in list(vars(owner).items()):
+            if isinstance(value, torch.Tensor) and value.device.type != "meta":
+                vars(owner)[name] = torch.empty_like(value, device="meta")
+
+    def removed_forward(*args, **kwargs):
+        raise RuntimeError(
+            f"MuseSparkOpen pipeline stage {rank} holds no drafter; it runs on the last stage"
+        )
+
+    drafter.forward = removed_forward
+
+
+def pipeline_free_drafter_mapping(mapping: Mapping) -> Mapping:
+    """The mapping the drafter of a DFlash context server stage is built with.
+
+    The drafter is a separate checkpoint of a few layers and runs whole on the
+    last stage (:meth:`MuseSparkOpenForCausalLM.__pp_init__` drops it on the
+    others). Built with the stage's pipeline mapping, its own generic stage hook
+    would split those few layers over the stages, and a ``pp_partition`` sized
+    for the target's layers cannot split them at all. So it is built without
+    pipeline stages, on the stage's one GPU (the only tensor-parallel size
+    :func:`pipeline_parallel_refusal` admits there).
+    """
+    return Mapping(world_size=1, rank=0, gpus_per_node=mapping.gpus_per_node)
+
+
+def pipeline_parallel_refusal(model_config: ModelConfig) -> Optional[str]:
+    """Why this deployment cannot run the decoder in pipeline stages, or None.
+
+    None for ``pp_size == 1``. Under pipeline parallelism the decoder runs one
+    contiguous slice of its layers per rank (``MuseSparkOpenModel.__pp_init__``)
+    and admits only what that stage-local forward covers:
+
+    * no speculative decoding: DFlash captures hidden states of layers on
+      several stages and drafts from them on the last one, and this stage-local
+      forward ships no captures across stages. The one-engine suffix automaton
+      and the external drafters are refused with it, because none of them was
+      run under pipeline parallelism with this model. The exception is a DFlash
+      context server built by a target that carries the captures and never
+      drafts (:func:`pipeline_parallel_dflash_context`);
+    * no context parallelism and no attention DP: the stage boundary carries
+      the rows of one replicated forward;
+    * at least one decoder layer per stage;
+    * a DFlash context server runs one GPU per stage: its drafter is built
+      without pipeline stages (:func:`pipeline_free_drafter_mapping`), whose
+      mapping cannot name the tensor-parallel group of a later stage.
+
+    The TP-only levers (prefill sequence parallelism, sharded projections) keep
+    their own construction-time refusals, which already name ``pp_size``.
+    """
+    mapping = model_config.mapping
+    if mapping.pp_size == 1:
+        return None
+    spec_config = getattr(model_config, "spec_config", None)
+    if spec_config is not None and not pipeline_parallel_dflash_context(model_config):
+        if in_pp_dflash_context_server():
+            return (
+                "a pipelined context server serves speculative decoding only with DFlash and "
+                "attention_backend TRTLLM"
+            )
+        return (
+            "speculative decoding is not supported; serve the stages without a speculative_config"
+        )
+    if mapping.cp_size != 1:
+        return f"context parallelism (cp_size={mapping.cp_size}) is not supported"
+    if mapping.enable_attention_dp:
+        return "attention data parallelism is not supported"
+    num_layers = model_config.pretrained_config.num_hidden_layers
+    if num_layers < mapping.pp_size:
+        return f"{num_layers} decoder layers cannot fill {mapping.pp_size} stages"
+    if spec_config is not None and mapping.tp_size != 1:
+        return (
+            "a pipelined DFlash context server runs one GPU per stage; "
+            f"tensor_parallel_size {mapping.tp_size} is not supported"
+        )
+    return None
+
+
 # No @register_auto_model here on purpose. The checkpoint's only architecture
 # string is "MuseSparkOpenOmniForCausalLM", and it now names
 # MuseSparkOpenOmniForConditionalGeneration in modeling_musespark_open_omni, which
@@ -3951,6 +4226,12 @@ def assert_supported_spec_config(spec_config: Any) -> None:
 class MuseSparkOpenForCausalLM(
     SpecDecOneEngineForCausalLM[MuseSparkOpenModel, MuseSparkOpenConfig]
 ):
+    #: Whether this stage serves DFlash as part of a pipelined context server
+    #: (:func:`pipeline_parallel_dflash_context`), decided at construction.
+    _pp_dflash_context: bool = False
+    #: Whether ``__pp_init__`` removed the drafter from this (non-last) stage.
+    _pp_stage_drafter_removed: bool = False
+
     def __init__(self, model_config: ModelConfig[MuseSparkOpenConfig]):
         quant_config = model_config.quant_config
         if quant_config is not None and quant_config.exclude_modules:
@@ -3972,9 +4253,13 @@ class MuseSparkOpenForCausalLM(
                 f"MuseSparkOpen: experts of layers {layers} run NVFP4, quantized from the "
                 f"BF16 checkpoint at load; exclude_modules is now {quant_config.exclude_modules}"
             )
-        assert model_config.mapping.pp_size == 1, (
-            "MuseSparkOpen does not support pipeline parallelism"
-        )
+        refusal = pipeline_parallel_refusal(model_config)
+        if refusal is not None:
+            raise ValueError(f"MuseSparkOpen pipeline parallelism: {refusal}")
+        pp_dflash_context = pipeline_parallel_dflash_context(model_config)
+        # The KV cache creator, the KV cache manager, the cache transceiver and the
+        # executor read this decision after the model is built.
+        set_pp_dflash_context_server(pp_dflash_context)
         assert_supported_spec_config(getattr(model_config, "spec_config", None))
         super().__init__(
             MuseSparkOpenModel(model_config),
@@ -3985,6 +4270,60 @@ class MuseSparkOpenForCausalLM(
         self.logits_processor = MuseSparkOpenLogitsProcessor(
             logit_multiplier=config.metap_multiplier, soft_cap=config.output_soft_cap_temp
         )
+        if pp_dflash_context:
+            self._pp_dflash_context = True
+            mapping = model_config.mapping
+            logger.info(
+                f"MuseSparkOpen pipeline stage {mapping.pp_rank}: DFlash context server "
+                f"(attention_backend TRTLLM); the drafter lives on stage {mapping.pp_size - 1}"
+            )
+
+    def external_drafter_mapping(self, model_config: ModelConfig) -> Mapping:
+        """The target's mapping, except on a stage of a DFlash context server.
+
+        There the drafter is built without pipeline stages
+        (:func:`pipeline_free_drafter_mapping`), so it is whole on every stage
+        until :meth:`__pp_init__` drops it from all but the last one.
+        """
+        if pipeline_parallel_dflash_context(model_config):
+            return pipeline_free_drafter_mapping(model_config.mapping)
+        return super().external_drafter_mapping(model_config)
+
+    def __pp_init__(self) -> None:
+        """The generic stage hook, plus the drafter placement of a DFlash context server.
+
+        Under :func:`pipeline_parallel_dflash_context` the drafter lives on the
+        last stage, which holds the speculative worker. Every other stage drops
+        it here, before any of its weights are materialized, and skips its
+        checkpoint (:meth:`load_draft_weights`). Without that, the generic hook
+        could only warn that the drafter has no ``skip_forward`` and keep all of
+        its weights on every stage.
+        """
+        if self._pp_dflash_context:
+            mapping = self.model_config.mapping
+            drafter = self.draft_model
+            if drafter is not None and mapping.has_pp() and not mapping.is_last_pp_rank():
+                self.epilogue = [module for module in self.epilogue if module is not drafter]
+                _drop_pipeline_stage_drafter(
+                    drafter, mapping.pp_rank, keep=[self.model, self.lm_head]
+                )
+                self._pp_stage_drafter_removed = True
+        super().__pp_init__()
+
+    def load_draft_weights(self, weights: Dict, weight_mapper: Optional[Any] = None) -> None:
+        """Load the drafter checkpoint, unless this stage dropped the drafter.
+
+        A stage that dropped it (:meth:`__pp_init__`) reads none of the tensors
+        and leaves the drafter as it is: its loader would otherwise rebuild the
+        projection, norm and DFlash 2 modules on the device.
+        """
+        if self._pp_stage_drafter_removed:
+            logger.info(
+                f"MuseSparkOpen pipeline stage {self.model_config.mapping.pp_rank}: skipping "
+                f"{len(weights)} drafter checkpoint tensors; the drafter lives on the last stage"
+            )
+            return
+        super().load_draft_weights(weights, weight_mapper)
 
     @classmethod
     def get_preferred_kv_cache_manager_version(cls, pretrained_config: Any = None) -> Literal["V2"]:

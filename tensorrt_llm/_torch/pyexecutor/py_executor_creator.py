@@ -1431,8 +1431,7 @@ def _create_py_executor(
 
     if store_host_donor is not None:
         with _startup_timer.phase("store_host_donor_late"):
-            _register_store_host_donor_late(py_executor, store_host_donor,
-                                            dist)
+            _register_store_host_donor_late(py_executor, store_host_donor, dist)
     with _startup_timer.phase("executor_start_worker",
                               metrics=creation_metrics,
                               metric_name="worker_start_seconds"):
@@ -1546,8 +1545,8 @@ def _register_store_host_donor_late(py_executor: PyExecutor,
         llm_args = getattr(py_executor, "llm_args", None)
         donor.wait_traffic = getattr(llm_args, "kv_connector_config",
                                      None) is not None
-        donor.traffic_probe = lambda: getattr(py_executor,
-                                              "num_fetch_requests", 0) > 0
+        donor.traffic_probe = lambda: getattr(py_executor, "num_fetch_requests",
+                                              0) > 0
     _fleet_vote(dist, donor.wait_startup)
     if donor.late_delay_seconds == 0:
         _fleet_vote(dist, donor.register_late)

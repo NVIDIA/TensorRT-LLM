@@ -160,6 +160,8 @@ void KvCacheManager::shutdown()
     _checkNoLivingKvCaches("shutdown()");
     clearReusableBlocks();
     TLLM_CHECK_DEBUG(mStorage);
+    // Store ops still in flight read or write host-tier slots and the staging buffer that destroy() frees.
+    detachStoreLevelIo();
 
     // Post-condition: after clearing all reusable blocks and with no active KvCaches,
     // no evictable pages should remain.
@@ -205,6 +207,8 @@ std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope, To
     std::optional<BlockRadixTree::ReuseMatch> reuseMatch;
     if (inputTokens.size() != 0)
     {
+        // Store tier degrade fault mode: the match must see the latest store op outcomes (no-op otherwise).
+        mStorage->reapStoreOps();
         reuseMatch = matchReuse(reuseScope, inputTokens, textOnly.value_or(this->textOnly()));
     }
 
@@ -458,6 +462,12 @@ bool KvCacheManager::resize(CacheLevel level, size_t quota, bool bestEfforts)
 {
     KVCM2_API_GUARD();
     auto const apiLock = lockExclusive();
+    if (auto const storeLevel = mStorage->storeLevel();
+        storeLevel.has_value() && (level == *storeLevel || level + 1 == *storeLevel))
+    {
+        throw std::invalid_argument(
+            "Cache level " + std::to_string(level.value()) + " is not resizable while the store level is attached");
+    }
     // Same precondition as adjust(): _adjustLevel may defragment, invalidating any page index an
     // ACTIVE cache holds.
     for (KvCache* kvc : mLivingKvCaches)
@@ -647,12 +657,112 @@ void KvCacheManager::commitCachedTokensByLevel(CountsByLevel const& counts)
     addCountsByLevel(mIterCachedTokensByLevel, counts);
 }
 
+void KvCacheManager::recordRemoteHostHitTokens(int64_t numTokens) noexcept
+{
+    if (numTokens > 0)
+    {
+        mRemoteHostHitTokens.fetch_add(static_cast<uint64_t>(numTokens), std::memory_order_relaxed);
+    }
+}
+
+KvCacheManager::RemoteHostTierStats KvCacheManager::remoteHostTierStats() const noexcept
+{
+    return {mStorage->remoteHostStats(), mRemoteHostHitTokens.load(std::memory_order_relaxed)};
+}
+
+std::vector<std::pair<MemAddress, size_t>> KvCacheManager::remoteHostAddressRanges() const
+{
+    return mStorage->remoteHostAddressRanges();
+}
+
+// ---- Store level -----------------------------------------------------------
+
+void KvCacheManager::attachStoreLevelIo(std::uintptr_t table)
+{
+    KVCM2_API_GUARD();
+    auto const apiLock = lockExclusive();
+    StorageManager& storage = *mStorage;
+    auto const storeLevel = storage.storeLevel();
+    if (!storeLevel.has_value())
+    {
+        throw std::invalid_argument("attach_store_level_io: no store level is configured");
+    }
+    if (storage.storeIo().attached())
+    {
+        throw std::invalid_argument("attach_store_level_io: the store level IO is already attached");
+    }
+
+    // Every range a store op reads or writes: the host level's pools (H<->S rows point into them) and the page
+    // staging buffer (G<->S rows point into it).
+    std::vector<std::pair<MemAddress, size_t>> ranges;
+    auto& hostStorage = *storage.mLevels.at(*storeLevel - 1).storage;
+    for (PoolGroupIndex pgIdx{0}; pgIdx < hostStorage.numPoolGroups(); ++pgIdx)
+    {
+        auto const* hostGroup = dynamic_cast<HostPoolGroup const*>(&hostStorage.poolGroup(pgIdx));
+        TLLM_CHECK_WITH_INFO(hostGroup != nullptr, "the level above the store level is not a local host level");
+        for (PoolIndex poolIdx{0}; poolIdx < hostGroup->numPools(); ++poolIdx)
+        {
+            HostMem const* memory = hostGroup->hostMem(poolIdx);
+            ranges.emplace_back(memory->address(), memory->size());
+        }
+    }
+    auto const staging = storage.pageStagingRange();
+    TLLM_CHECK_WITH_INFO(staging.second > 0, "the store level has no page staging buffer");
+    ranges.push_back(staging);
+
+    StoreLevelLayout layout;
+    auto& storeStorage = *storage.mLevels.at(*storeLevel).storage;
+    for (PoolGroupIndex pgIdx{0}; pgIdx < storeStorage.numPoolGroups(); ++pgIdx)
+    {
+        auto const sizes = storeStorage.slotSize(pgIdx);
+        layout.slotBytes.push_back(std::accumulate(sizes.begin(), sizes.end(), uint64_t{0}));
+        layout.numSlots.push_back(static_cast<uint64_t>(storeStorage.numSlots(pgIdx)));
+    }
+    storage.storeIo().attach(reinterpret_cast<TllmKvStoreLevelIoV1 const*>(table), ranges, layout);
+}
+
+void KvCacheManager::detachStoreLevelIo(double timeoutS)
+{
+    auto const apiLock = lockExclusive();
+    if (!mStorage->storeLevel().has_value())
+    {
+        return;
+    }
+    mStorage->storeIo().detach(timeoutS);
+}
+
+SlotCount KvCacheManager::keepFreeBytes(CacheLevel level, size_t bytes)
+{
+    KVCM2_API_GUARD();
+    auto const apiLock = lockExclusive();
+    return mStorage->keepFreeBytes(level, bytes);
+}
+
+StoreLevelStatsAll KvCacheManager::storeLevelStats() const noexcept
+{
+    StoreLevelStatsAll stats;
+    stats.storage = mStorage->storeLevelStats();
+    if (stats.storage.level >= 0)
+    {
+        auto const [attached, io] = mStorage->storeIo().ioStats();
+        stats.ioAttached = attached;
+        stats.io = io;
+    }
+    return stats;
+}
+
 CountsByLevel KvCacheManager::getAndResetIterationCachedTokensByLevel()
 {
     auto const apiLock = lockExclusive();
     CountsByLevel counts;
     std::swap(counts, mIterCachedTokensByLevel);
     return counts;
+}
+
+StorageManager::DemotionStats KvCacheManager::demotionStats() const
+{
+    auto const apiLock = lockShared();
+    return mStorage->demotionStats();
 }
 
 std::pair<int64_t, int64_t> KvCacheManager::getAndResetIterationSuspendResumeStats()
@@ -1030,6 +1140,12 @@ TypedVec<PoolGroupIndex, float> const& KvCacheManager::_getTargetRatioList(Cache
 
 bool KvCacheManager::_needAdjustment(CacheLevel level) const
 {
+    if (auto const storeLevel = mStorage->storeLevel();
+        storeLevel.has_value() && (level == *storeLevel || level + 1 == *storeLevel))
+    {
+        // Neither the store level nor the host level it is registered with can be resized.
+        return false;
+    }
     auto const& target = _getTargetRatioList(level);
     auto current = (level == kHotLevel) ? _currentHotRatio() : _currentColdRatios();
     constexpr float kThreshold = 1.25f;

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Callable
+from typing import Callable, List
 
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.pp_utils import PPCommTag
@@ -91,3 +91,39 @@ class DisaggPPTerminationHandler:
             if req:
                 self._terminator_func(req)
         self._terminating_iteration += 1
+
+
+class LaggedDisaggPPTerminationHandler:
+    """Termination agreement of the lagged PP disagg consensus (no vote ring).
+
+    Same contract as ``DisaggPPTerminationHandler``: a request is freed on every
+    PP rank in the same iteration, once every rank has queued it. The vote
+    rides on ``PPDisaggLaggedConsensus``: each rank reports ``pending_ids`` and
+    every rank frees what the first rank decided through ``apply``. The
+    per-executed-batch ``terminate_pending_requests`` is a no-op, so no rank
+    waits for the previous PP rank's executed batch.
+
+    Args:
+        terminator_func: frees one request (the executor's PP termination).
+    """
+
+    def __init__(self, terminator_func: Callable[[LlmRequest], None]):
+        self._terminator_func = terminator_func
+        self._pending_termination = {}
+
+    def terminate(self, request: LlmRequest):
+        self._pending_termination[request.py_request_id] = request
+
+    def terminate_pending_requests(self):
+        """No-op: terminations are decided once per iteration by the lagged agreement."""
+
+    def pending_ids(self) -> List[int]:
+        """Ids this rank has queued and not freed yet, oldest first."""
+        return list(self._pending_termination)
+
+    def apply(self, request_ids: List[int]) -> None:
+        """Free the requests every rank queued (the first rank's decision)."""
+        for request_id in request_ids:
+            request = self._pending_termination.pop(request_id, None)
+            if request is not None:
+                self._terminator_func(request)

@@ -119,6 +119,10 @@ using Priority = int;
 inline constexpr Priority kPriorityMin = 0;
 inline constexpr Priority kPriorityMax = 100;
 inline constexpr Priority kPriorityDefault = 35;
+// Eviction key of a page demoted by ChainDemoteHandle::demote(). Demoted pages share the lowest list and are
+// pushed to its back, so they are evicted FIFO by demotion time, after any priority-0 page already queued and
+// before every higher-priority page.
+inline constexpr Priority kPriorityDemoted = kPriorityMin;
 
 // Optional sliding window size (nullopt = no sliding window).
 using SlidingWindowSize = std::optional<int>;

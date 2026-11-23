@@ -218,6 +218,38 @@ class ScheduledRequests:
     """Maps a request id to the prompt-ordered indices of its multimodal items
     selected for encoder execution this iteration (only items whose encoder
     outputs are still missing). ``None`` when no items were scheduled."""
+    leader_context_chunks: dict[int, tuple[int, int]] | None = None
+    """On a pipeline-parallel rank that received this batch from a first rank
+    that runs the PP stage agreement (``pp_stage_agree.py``): request id ->
+    ``(context_current_position, context_chunk_size)`` of every context request,
+    as the first rank scheduled it. ``None`` otherwise, and on the rank that
+    scheduled the batch itself."""
+    leader_first_context_chunks: set[int] | None = None
+    """On a pipeline-parallel rank that received this batch from the first rank
+    with the PP stage agreement: ids of the context requests whose first chunk
+    the first rank admitted in this batch, i.e. whose position is the prefix it
+    reused. ``None`` otherwise."""
+    leader_reuse_proposals: dict[int, int | None] | None = None
+    """On a pipeline-parallel rank that received this batch from the first rank
+    with the PP stage agreement: request id -> reuse depth the first rank
+    proposes for a waiting first chunk (None: drop this rank's reservation of
+    it). ``None`` otherwise."""
+    leader_context_admission_order: list[int] | None = None
+    """On a pipeline-parallel rank that received this batch from a first rank
+    with the PP stage agreement: ids of the context requests in
+    the order the first rank's scheduler pass allocated their chunks, which
+    need not be the batch order. ``None`` otherwise."""
+    leader_subagent_idle_drops: list[str] | None = None
+    """On a pipeline-parallel rank that received this batch from a first rank
+    with ``TLLM_KV_SUBAGENT_IDLE_DROP_S`` on: keys of the idle child chains the
+    first rank demoted at this pass, which this rank demotes too
+    (``subagent_idle_drop.py``). ``None`` otherwise."""
+    leader_longchain_ops: list[tuple[str, str, int]] | None = None
+    """On a pipeline-parallel rank that received this batch from a first rank
+    with ``TLLM_KV_LONGCHAIN_PROTECT_ISL`` on: the (kind, key, generation)
+    pin, release and drop operations the first rank applied at this pass,
+    which this rank applies too (``longchain_protect.py``). ``None``
+    otherwise."""
 
     def __init__(self):
         self.encoder_requests: RequestList = []
@@ -228,6 +260,9 @@ class ScheduledRequests:
         self.recompute_paused_requests: RequestList = []
         self.added_inflight_req_ids: list[int] = []
         self.scheduled_mm_encoder_items: dict[int, list[int]] | None = None
+        # The leader_* attributes above stay class-level None unless a schedule
+        # message that carries the pipeline-parallel fields sets them
+        # (SerializableSchedulerOutput.to_scheduler_result).
 
     @property
     def is_generation_only(self) -> bool:
@@ -332,6 +367,30 @@ class RequestScheduler(ABC):
         to release; the default is a no-op.
         """
 
+    def adopt_context_chunk(self, request: LlmRequest, chunk_size: int) -> bool:
+        """Take a context chunk that another pipeline-parallel rank scheduled.
+
+        A non-first pipeline rank forwards the batch the first rank scheduled,
+        but runs its own scheduler pass, which can size or admit a context
+        request differently. This sets the chunk the first rank chose. Only
+        schedulers that allocate KV cache while scheduling must also allocate
+        it here; the default only sets the size, because the KV cache is then
+        sized from the batch in ``prepare_resources``.
+
+        Returns False when the chunk's KV cache cannot be allocated.
+        """
+        request.context_chunk_size = chunk_size
+        return True
+
+    def adopt_generation_step(self, request: LlmRequest) -> bool:
+        """Take a generation step that another pipeline-parallel rank scheduled.
+
+        The counterpart of ``adopt_context_chunk`` for a generation request this
+        rank's own pass did not schedule. Only schedulers that allocate KV cache
+        while scheduling have anything to do; the default succeeds.
+        """
+        return True
+
 
 @dataclass
 class SerializableSchedulerOutput:
@@ -358,6 +417,51 @@ class SerializableSchedulerOutput:
     recompute_paused_requests: list[int] = dataclasses.field(default_factory=list)
     """Request ids of recompute-paused requests."""
 
+    # The six pipeline-parallel fields below are class-level defaults, not
+    # dataclass fields: an instance carries them only when the first rank runs
+    # one of their features (from_scheduler_result), so without them the
+    # pickled message is the one without these fields.
+    context_chunks = None
+    """Request id -> ``(context_current_position, context_chunk_size)`` of every
+    scheduled context request. The request ids alone do not say how much of each
+    prompt the step runs; a receiving rank sizes the chunk with its own scheduler
+    pass, which need not reach the same result (``ScheduledRequests.leader_context_chunks``).
+    Recorded only with the PP stage agreement (``pp_stage_agree.py``); ``None``
+    otherwise, and the receiving ranks then size
+    every chunk with their own pass."""
+    context_first_chunks = None
+    """Ids of the scheduled context requests whose first chunk this step admits
+    (their position is the reused prefix). Recorded only with the PP stage
+    agreement (``pp_stage_agree.py``); ``None`` otherwise."""
+    reuse_proposals = None
+    """Request id -> reuse depth the first rank proposes for a waiting first
+    chunk, which every other rank claims and answers (None: drop the claim).
+    PP stage agreement only; ``None`` otherwise."""
+    context_admission_order = None
+    """Ids of the scheduled context requests in the order the scheduler pass
+    allocated their chunks (the batch lists them in another order). Recorded
+    only with the PP stage agreement (``pp_stage_agree.py``); ``None``
+    otherwise."""
+    subagent_idle_drops = None
+    """Keys of the idle child chains the first rank demoted at this pass, which
+    every other rank demotes at the same pass. ``TLLM_KV_SUBAGENT_IDLE_DROP_S``
+    only (``subagent_idle_drop.py``); ``None`` otherwise."""
+    longchain_ops = None
+    """The (kind, key, generation) long-chain operations the first rank applied
+    at this pass, which every other rank applies at the same pass.
+    ``TLLM_KV_LONGCHAIN_PROTECT_ISL`` only (``longchain_protect.py``); ``None``
+    otherwise."""
+
+    #: Names of the pipeline-parallel fields, in the order they are attached.
+    PP_FIELDS = (
+        "context_chunks",
+        "context_first_chunks",
+        "reuse_proposals",
+        "context_admission_order",
+        "subagent_idle_drops",
+        "longchain_ops",
+    )
+
     @classmethod
     def from_scheduler_result(
         cls,
@@ -365,8 +469,32 @@ class SerializableSchedulerOutput:
         fitting_disagg_gen_init_requests: RequestList,
         num_fitting_requests: int,
         wait_for_disagg_gen_transfer_progress: bool = False,
+        record_context_chunks: bool = False,
+        record_first_chunks: bool = False,
+        reuse_proposals: dict[int, int | None] | None = None,
+        context_admission_order: list[int] | None = None,
+        subagent_idle_drops: list[str] | None = None,
+        longchain_ops: list[tuple[str, str, int]] | None = None,
+        attach_pp_fields: bool = False,
     ) -> "SerializableSchedulerOutput":
-        return cls(
+        """The schedule message of a scheduler pass.
+
+        Args:
+            attach_pp_fields: the first rank sends the pipeline-parallel fields
+                (it runs the PP stage agreement, or ``TLLM_KV_SUBAGENT_IDLE_DROP_S``
+                or ``TLLM_KV_LONGCHAIN_PROTECT_ISL`` is on).
+                The message then carries all six of them, None where unused; a
+                field that is not None is attached in any case. Without either,
+                the message carries none of them.
+        """
+        if context_admission_order is not None:
+            # Requests the pass allocated but the batch no longer holds (taken
+            # back out after the pass) are left out.
+            scheduled_ids = {req.request_id for req in scheduled_requests.context_requests}
+            context_admission_order = [
+                request_id for request_id in context_admission_order if request_id in scheduled_ids
+            ]
+        output = cls(
             encoder_requests=[req.request_id for req in scheduled_requests.encoder_requests],
             context_requests_chunking=[
                 req.request_id for req in scheduled_requests.context_requests_chunking
@@ -386,6 +514,37 @@ class SerializableSchedulerOutput:
                 req.request_id for req in scheduled_requests.recompute_paused_requests
             ],
         )
+        pp_fields = (
+            (
+                {
+                    req.request_id: (req.context_current_position, req.context_chunk_size)
+                    for req in scheduled_requests.context_requests
+                }
+                if record_context_chunks or record_first_chunks
+                else None
+            ),
+            (
+                [
+                    req.request_id
+                    for req in scheduled_requests.context_requests
+                    if req.is_first_context_chunk
+                ]
+                if record_first_chunks
+                else None
+            ),
+            reuse_proposals,
+            context_admission_order,
+            subagent_idle_drops,
+            longchain_ops,
+        )
+        if attach_pp_fields or any(value is not None for value in pp_fields):
+            for name, value in zip(cls.PP_FIELDS, pp_fields):
+                setattr(output, name, value)
+        return output
+
+    def carries_pp_fields(self) -> bool:
+        """Whether the first rank attached the pipeline-parallel fields."""
+        return "context_chunks" in vars(self)
 
     def to_scheduler_result(
         self, active_requests: RequestList
@@ -411,6 +570,15 @@ class SerializableSchedulerOutput:
         scheduled_requests.recompute_paused_requests = [
             id_to_request[req_id] for req_id in self.recompute_paused_requests
         ]
+        if self.carries_pp_fields():
+            scheduled_requests.leader_context_chunks = self.context_chunks
+            scheduled_requests.leader_first_context_chunks = (
+                set(self.context_first_chunks) if self.context_first_chunks is not None else None
+            )
+            scheduled_requests.leader_reuse_proposals = self.reuse_proposals
+            scheduled_requests.leader_context_admission_order = self.context_admission_order
+            scheduled_requests.leader_subagent_idle_drops = self.subagent_idle_drops
+            scheduled_requests.leader_longchain_ops = self.longchain_ops
         fitting_disagg_gen_init_requests = [
             id_to_request[req_id] for req_id in self.fitting_disagg_gen_init_requests
         ]

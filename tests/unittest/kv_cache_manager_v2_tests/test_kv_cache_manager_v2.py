@@ -43,6 +43,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         BufferConfig,
         BufferId,
         CacheLevel,
+        ChainDemoteHandle,
         CorruptedError,
         CudaStream,
         DataRole,
@@ -96,6 +97,7 @@ else:
         BufferConfig,
         BufferId,
         CacheLevel,
+        ChainDemoteHandle,
         CorruptedError,
         CudaStream,
         DataRole,
@@ -1581,6 +1583,629 @@ class TestNoBatching(TestKVCacheManagerV2):
             profiler.disable()
             profiler.print_stats(sort="cumtime")
             profiler.dump_stats("profiler.prof")
+
+
+class TestChainDemote(TestKVCacheManagerV2):
+    """Evict-first demotion of idle committed chains (``ChainDemoteHandle``).
+
+    A handle collects weak references to a chain's full-attention pages turn by turn. ``demote()``
+    marks the pages of the chain's subtree-closed, unheld blocks evict-first; nothing is freed until
+    the normal eviction picks them. Destruction and ``release()`` never touch pages. The existing
+    ``test_planned_drop_handle`` and SSM planned-drop tests cover the unchanged planned-drop handle.
+    """
+
+    TPB = 4
+
+    def _make_manager(
+        self, gpu_quota: int = 4 << 20, host_quota: int = 0, swa_window: int | None = None
+    ) -> None:
+        tiers: list = [GpuCacheTierConfig(quota=gpu_quota)]
+        if host_quota:
+            tiers.append(HostCacheTierConfig(quota=host_quota))
+
+        def layer(layer_id: int, window: int | None) -> AttentionLayerConfig:
+            return AttentionLayerConfig(
+                layer_id=LayerId(layer_id),
+                buffers=[
+                    BufferConfig(role=Role.KEY, size=4096),
+                    BufferConfig(role=Role.VALUE, size=4096),
+                ],
+                sliding_window_size=window,
+            )
+
+        layers = [layer(0, None)]
+        if swa_window is not None:
+            layers.append(layer(1, swa_window))
+        self.cfg = KVCacheManagerConfig(tokens_per_block=self.TPB, cache_tiers=tiers, layers=layers)
+        self.manager = KVCacheManager(self.cfg)
+
+    @staticmethod
+    def _tokens(base: int, num_blocks: int) -> list[TokenIdExt]:
+        return [TokenId(base + i) for i in range(num_blocks * TestChainDemote.TPB)]
+
+    def _commit(
+        self, tokens: list[TokenIdExt], plan_from: int | None = None
+    ) -> ChainDemoteHandle | None:
+        """Commit ``tokens`` through a new cache, reusing the tree's prefix; optionally plan; close."""
+        kv_cache = self.manager.create_kv_cache(None, tokens)
+        handle = None
+        with TemporaryCudaStream([]) as stream_holder:
+            stream = cast(CudaStream, stream_holder.handle)
+            self.assertTrue(kv_cache.resume(stream))
+            self.assertTrue(kv_cache.resize(len(tokens)))
+            uncommitted = tokens[kv_cache.num_committed_tokens :]
+            if uncommitted:
+                kv_cache.commit(uncommitted)
+            kv_cache.stop_committing()
+            if plan_from is not None:
+                handle = kv_cache.plan_committed_chain_demote(plan_from)
+                self.assertIsInstance(handle, ChainDemoteHandle)
+        _ = stream_holder.take_finish_event()
+        kv_cache.close()
+        return handle
+
+    def _pressure(self, num_pages: int) -> None:
+        """Allocate every free GPU slot plus ``num_pages`` more, which evicts ``num_pages`` pages."""
+        stats = self.manager.get_storage_statistics(GPU_LEVEL)
+        self.assertEqual(len(stats), 1)
+        self.assertGreaterEqual(stats[0].evictable, num_pages)
+        num_blocks = stats[0].free + num_pages
+        kv_cache = self.manager.create_kv_cache()
+        with TemporaryCudaStream([]) as stream_holder:
+            self.assertTrue(kv_cache.resume(cast(CudaStream, stream_holder.handle)))
+            self.assertTrue(kv_cache.resize(num_blocks * self.TPB))
+        _ = stream_holder.take_finish_event()
+        kv_cache.close()
+
+    def test_demoted_child_is_evicted_before_parent(self) -> None:
+        self._make_manager()
+        parent = self._tokens(0, 4)
+        child = parent + self._tokens(1000, 4)
+        self._commit(parent)
+        handle = self._commit(child, plan_from=len(parent) // self.TPB)
+        assert handle is not None
+        self.assertTrue(handle.valid)
+        self.assertEqual(handle.num_refs, 4)
+
+        self.assertEqual(handle.demote(), (4, 4, 4, 4, 0, 0))
+        self.assertFalse(handle.valid)
+        self.assertEqual(handle.num_refs, 0)
+        # Demotion alone frees nothing.
+        self.assertEqual(self.manager.probe_reuse(None, child), len(child))
+
+        # Plain LRU would take the parent's older pages and cascade into the child.
+        self._pressure(4)
+        self.assertEqual(self.manager.probe_reuse(None, parent), len(parent))
+        self.assertEqual(self.manager.probe_reuse(None, child), len(parent))
+        self.assertEqual(self.manager.chain_demote_stats(), (4, 0))
+
+    def test_sibling_branch_keeps_shared_blocks(self) -> None:
+        self._make_manager()
+        parent = self._tokens(0, 4)
+        tail = self._tokens(1000, 4)
+        child = parent + tail
+        sibling = parent + tail[: self.TPB] + self._tokens(2000, 2)
+        self._commit(parent)
+        handle = self._commit(child, plan_from=len(parent) // self.TPB)
+        assert handle is not None
+        self._commit(sibling)
+
+        plan, blocks, pages, pages_gpu, kept_shared, kept_held = handle.demote()
+        self.assertEqual((plan, blocks, pages, pages_gpu), (4, 3, 3, 3))
+        self.assertGreater(kept_shared, 0)
+        self.assertEqual(kept_held, 0)
+
+        self._pressure(3)
+        self.assertEqual(self.manager.probe_reuse(None, sibling), len(sibling))
+        self.assertEqual(self.manager.probe_reuse(None, child), len(parent) + self.TPB)
+
+    def test_open_cache_holds_the_chain(self) -> None:
+        self._make_manager()
+        parent = self._tokens(0, 2)
+        child = parent + self._tokens(1000, 2)
+        self._commit(parent)
+        handle = self._commit(child, plan_from=len(parent) // self.TPB)
+        assert handle is not None
+
+        reader = self.manager.create_kv_cache(None, child)
+        with TemporaryCudaStream([]) as stream_holder:
+            self.assertTrue(reader.resume(cast(CudaStream, stream_holder.handle)))
+            self.assertEqual(reader.num_committed_tokens, len(child))
+            plan, blocks, pages, _, kept_shared, kept_held = handle.demote()
+        _ = stream_holder.take_finish_event()
+        reader.close()
+        self.assertEqual((plan, blocks, pages), (2, 0, 0))
+        self.assertGreater(kept_held, 0)
+        self.assertEqual(kept_held + kept_shared, 2)
+        self.assertEqual(self.manager.chain_demote_stats(), (0, 0))
+
+    def test_match_after_demotion_rescues_the_chain(self) -> None:
+        self._make_manager()
+        rescued = self._tokens(0, 4)
+        other = self._tokens(5000, 4)
+        handle = self._commit(rescued, plan_from=0)
+        assert handle is not None
+        self._commit(other)
+        self.assertEqual(handle.demote()[2], 4)
+
+        # A new request matching the chain holds its pages, which clears the marks; on release the
+        # pages go to the back of the LRU, behind the other chain.
+        reader = self.manager.create_kv_cache(None, rescued)
+        with TemporaryCudaStream([]) as stream_holder:
+            self.assertTrue(reader.resume(cast(CudaStream, stream_holder.handle)))
+        _ = stream_holder.take_finish_event()
+        reader.close()
+        self.assertEqual(self.manager.chain_demote_stats(), (0, 4))
+
+        self._pressure(4)
+        self.assertEqual(self.manager.probe_reuse(None, rescued), len(rescued))
+        self.assertEqual(self.manager.probe_reuse(None, other), 0)
+
+    def test_demoted_pages_are_evicted_first_at_host(self) -> None:
+        self._make_manager(gpu_quota=8 << 20, host_quota=4 << 20)
+        host_level = CacheLevel(1)
+        parent = self._tokens(0, 4)
+        child = parent + self._tokens(1000, 4)
+        self._commit(parent)
+        handle = self._commit(child, plan_from=len(parent) // self.TPB)
+        assert handle is not None
+
+        # Push all eight pages to the host, then demote the child's four there.
+        self._pressure(self.manager.get_storage_statistics(GPU_LEVEL)[0].evictable)
+        host = self.manager.get_storage_statistics(host_level)[0]
+        self.assertEqual(host.evictable, 8)
+        self.assertEqual(handle.demote(), (4, 4, 4, 0, 0, 0))
+
+        # A filler chain that overflows the host by four pages when it falls there.
+        filler = self._tokens(9000, host.free + 4)
+        self.assertLessEqual(
+            len(filler) // self.TPB, self.manager.get_storage_statistics(GPU_LEVEL)[0].free
+        )
+        self._commit(filler)
+        self._pressure(len(filler) // self.TPB)
+        self.assertEqual(self.manager.chain_demote_stats()[0], 4)
+        self.assertEqual(self.manager.probe_reuse(None, parent), len(parent))
+        self.assertEqual(self.manager.probe_reuse(None, child), len(parent))
+
+    def test_absorb_over_turns_with_rewritten_tail(self) -> None:
+        self._make_manager()
+        parent = self._tokens(0, 2)
+        first_tail = self._tokens(100, 2)
+        turn1 = parent + first_tail
+        turn2 = parent + first_tail[: self.TPB] + self._tokens(200, 2)
+        h1 = self._commit(turn1, plan_from=len(parent) // self.TPB)
+        h2 = self._commit(turn2, plan_from=len(parent) // self.TPB + 1)
+        assert h1 is not None and h2 is not None
+        self.assertEqual((h1.num_refs, h2.num_refs), (2, 2))
+
+        h1.absorb(h2)
+        self.assertFalse(h2.valid)
+        self.assertEqual(h1.num_refs, 4)
+        with self.assertRaises(LogicError):
+            h1.absorb(h1)
+        with self.assertRaises(LogicError):
+            h1.absorb(h2)
+        # The shared turn-1 block now has two children, both in the plan: both branches go.
+        self.assertEqual(h1.demote(), (4, 4, 4, 4, 0, 0))
+
+    def test_release_has_no_effect(self) -> None:
+        self._make_manager()
+        tokens = self._tokens(0, 4)
+        kv_cache = self.manager.create_kv_cache(None, tokens)
+        with TemporaryCudaStream([]) as stream_holder:
+            self.assertTrue(kv_cache.resume(cast(CudaStream, stream_holder.handle)))
+            self.assertTrue(kv_cache.resize(len(tokens)))
+            kv_cache.commit(tokens)
+            kv_cache.stop_committing()
+            released = kv_cache.plan_committed_chain_demote(0)
+            kept = kv_cache.plan_committed_chain_demote(0)
+        _ = stream_holder.take_finish_event()
+        kv_cache.close()
+        assert released is not None and kept is not None
+
+        released.release()
+        self.assertFalse(released.valid)
+        self.assertEqual(released.num_refs, 0)
+        with self.assertRaises(LogicError):
+            released.release()
+        with self.assertRaises(LogicError):
+            released.demote()
+        self.assertEqual(self.manager.chain_demote_stats(), (0, 0))
+        # Nothing was demoted by the release: a second plan still demotes every page.
+        self.assertEqual(kept.demote()[2], 4)
+
+    def test_collected_handle_has_no_effect(self) -> None:
+        self._make_manager()
+        tokens = self._tokens(0, 4)
+        kv_cache = self.manager.create_kv_cache(None, tokens)
+        with TemporaryCudaStream([]) as stream_holder:
+            self.assertTrue(kv_cache.resume(cast(CudaStream, stream_holder.handle)))
+            self.assertTrue(kv_cache.resize(len(tokens)))
+            kv_cache.commit(tokens)
+            kv_cache.stop_committing()
+            dropped = kv_cache.plan_committed_chain_demote(0)
+            kept = kv_cache.plan_committed_chain_demote(0)
+        _ = stream_holder.take_finish_event()
+        kv_cache.close()
+        assert dropped is not None and kept is not None
+
+        del dropped
+        gc.collect()
+        self.assertEqual(self.manager.chain_demote_stats(), (0, 0))
+        self.assertEqual(self.manager.probe_reuse(None, tokens), len(tokens))
+        self.assertEqual(kept.demote()[2], 4)
+
+    def test_coexists_with_planned_drop_handle(self) -> None:
+        self._make_manager(swa_window=2 * self.TPB)
+        tokens = self._tokens(0, 6)
+        kv_cache = self.manager.create_kv_cache(None, tokens)
+        with TemporaryCudaStream([]) as stream_holder:
+            self.assertTrue(kv_cache.resume(cast(CudaStream, stream_holder.handle)))
+            self.assertTrue(kv_cache.resize(len(tokens)))
+            kv_cache.commit(tokens)
+            kv_cache.stop_committing()
+            drop_handle = kv_cache.plan_committed_block_drop()
+            chain_handle = kv_cache.plan_committed_chain_demote(0)
+        _ = stream_holder.take_finish_event()
+        kv_cache.close()
+        assert drop_handle is not None and chain_handle is not None
+
+        plan, blocks, pages, _, kept_shared, kept_held = chain_handle.demote()
+        self.assertEqual((plan, blocks, pages, kept_shared, kept_held), (6, 6, 6, 0, 0))
+        drop_handle.drop()
+        self.assertEqual(self.manager.chain_demote_stats()[1], 0)
+
+    def test_planner_rejects_ssm_and_sparse(self) -> None:
+        ssm_layers = [
+            AttentionLayerConfig(
+                layer_id=LayerId(0),
+                buffers=[
+                    BufferConfig(role=Role.KEY, size=8192),
+                    BufferConfig(role=Role.VALUE, size=8192),
+                ],
+            ),
+            SsmLayerConfig(
+                layer_id=LayerId(1),
+                buffers=[BufferConfig(role=DataRole("ssm_state"), size=8192)],
+            ),
+        ]
+        sparse_layers = [
+            AttentionLayerConfig(LayerId(0), [BufferConfig("key", 4096, is_sparse=True)]),
+        ]
+        cases = [
+            (
+                "ssm",
+                KVCacheManagerConfig(
+                    tokens_per_block=32,
+                    cache_tiers=[GpuCacheTierConfig(quota=32 << 20)],
+                    layers=ssm_layers,
+                    commit_min_snapshot=True,
+                ),
+                64,
+            ),
+            (
+                "sparse",
+                KVCacheManagerConfig(
+                    tokens_per_block=4,
+                    cache_tiers=[GpuCacheTierConfig(4 << 20), HostCacheTierConfig(4 << 20)],
+                    layers=sparse_layers,
+                ),
+                8,
+            ),
+        ]
+        for name, cfg, num_tokens in cases:
+            with self.subTest(name):
+                self.manager = KVCacheManager(cfg)
+                tokens = [TokenId(i) for i in range(num_tokens)]
+                kv_cache = self.manager.create_kv_cache()
+                with TemporaryCudaStream([]) as stream_holder:
+                    self.assertTrue(kv_cache.resume(cast(CudaStream, stream_holder.handle)))
+                    # Two commits, one block-aligned chunk each, as the SSM planned-drop tests do.
+                    half = num_tokens // 2
+                    self.assertTrue(kv_cache.resize(half))
+                    kv_cache.commit(tokens[:half])
+                    self.assertTrue(kv_cache.resize(num_tokens))
+                    kv_cache.commit(tokens[half:])
+                    kv_cache.stop_committing()
+                    self.assertGreater(kv_cache.num_committed_tokens, 0)
+                    self.assertIsNone(kv_cache.plan_committed_chain_demote(0))
+                _ = stream_holder.take_finish_event()
+                kv_cache.close()
+                self.manager.shutdown()
+                del self.manager
+
+    def test_poisoned_manager_rejects_plan_and_demote(self) -> None:
+        if not hasattr(_introspection, "poison_for_testing"):
+            raise unittest.SkipTest("the poison latch is C++-backend only")
+        self._make_manager()
+        handle = self._commit(self._tokens(0, 2), plan_from=0)
+        assert handle is not None
+        kv_cache = self.manager.create_kv_cache()
+        _introspection.poison_for_testing("deliberate test poisoning")
+
+        with self.assertRaisesRegex(CorruptedError, "deliberate test poisoning"):
+            kv_cache.plan_committed_chain_demote(0)
+        with self.assertRaisesRegex(CorruptedError, "deliberate test poisoning"):
+            handle.demote()
+        # Disposal is not refused.
+        handle.release()
+        self.manager.shutdown()
+
+        del kv_cache, handle
+        del self.manager
+        gc.collect()
+        self.assertEqual(num_live_managers(), 0)
+        self.assertIn("deliberate test poisoning", take_poison())
+
+
+class TestLongChainPin(TestKVCacheManagerV2):
+    """Pins of the opt-in long-chain protection (``longchain_protect.py``).
+
+    A pin is a KV cache created on a committed chain's tokens and never resumed. Its reuse match
+    holds the chain's full-attention pages and the sliding-window pages at the matched endpoint. A
+    held page still moves from GPU to host, but the last tier never drops it. The protection
+    releases a pin by planning a chain demotion on it, closing it, then demoting.
+    """
+
+    TPB = 4
+    PIN = 1 << 63
+
+    def _make_manager(
+        self, gpu_quota: int = 4 << 20, host_quota: int = 4 << 20, swa_window: int | None = None
+    ) -> None:
+        tiers: list = [GpuCacheTierConfig(quota=gpu_quota)]
+        if host_quota:
+            tiers.append(HostCacheTierConfig(quota=host_quota))
+
+        def layer(layer_id: int, window: int | None) -> AttentionLayerConfig:
+            # Same buffer sizes for both layers: one pool group per level.
+            return AttentionLayerConfig(
+                layer_id=LayerId(layer_id),
+                buffers=[
+                    BufferConfig(role=Role.KEY, size=4096),
+                    BufferConfig(role=Role.VALUE, size=4096),
+                ],
+                sliding_window_size=window,
+            )
+
+        layers = [layer(0, None)]
+        if swa_window is not None:
+            layers.append(layer(1, swa_window))
+        self.cfg = KVCacheManagerConfig(tokens_per_block=self.TPB, cache_tiers=tiers, layers=layers)
+        self.manager = KVCacheManager(self.cfg)
+
+    @staticmethod
+    def _tokens(base: int, num_blocks: int) -> list[TokenIdExt]:
+        return [TokenId(base + i) for i in range(num_blocks * TestLongChainPin.TPB)]
+
+    def _stats(self, level: int):
+        stats = self.manager.get_storage_statistics(CacheLevel(level))
+        self.assertEqual(len(stats), 1)
+        return stats[0]
+
+    def _commit(self, tokens: list[TokenIdExt]) -> None:
+        """Commit ``tokens`` through a new cache, reusing the tree's prefix, then close it."""
+        kv_cache = self.manager.create_kv_cache(None, tokens)
+        with TemporaryCudaStream([]) as stream_holder:
+            self.assertTrue(kv_cache.resume(cast(CudaStream, stream_holder.handle)))
+            self.assertTrue(kv_cache.resize(len(tokens)))
+            uncommitted = tokens[kv_cache.num_committed_tokens :]
+            if uncommitted:
+                kv_cache.commit(uncommitted)
+            kv_cache.stop_committing()
+        _ = stream_holder.take_finish_event()
+        kv_cache.close()
+
+    def _pin(self, tokens: list[TokenIdExt], pin_id: int) -> _KVCache:
+        """What the protector does: exclude the id from the statistics, then match and stop."""
+        self.manager.mark_stats_excluded(pin_id)
+        pin = self.manager.create_kv_cache(None, tokens, id=pin_id)
+        pin.stop_committing()
+        self.assertEqual(pin.num_committed_tokens, len(tokens))
+        return pin
+
+    def _close(self, pin: _KVCache) -> None:
+        pin_id = pin.id
+        pin.close()
+        self.manager.clear_stats_excluded(pin_id)
+
+    def _release(self, pin: _KVCache) -> tuple[int, int, int, int, int, int]:
+        """What the protector's release does: plan on the pin, close it, then demote."""
+        handle = pin.plan_committed_chain_demote(0)
+        self.assertIsInstance(handle, ChainDemoteHandle)
+        self._close(pin)
+        return handle.demote()
+
+    def _flood(self, base: int) -> None:
+        """Commit fillers with more blocks than both tiers hold: every unheld older page goes."""
+        total = self._stats(0).total + (
+            self._stats(1).total if len(self.cfg.cache_tiers) > 1 else 0
+        )
+        chunk = 16
+        for i in range(total // chunk + 2):
+            self._commit(self._tokens(base + i * 1000, chunk))
+
+    def _push_gpu(self, extra: int) -> bool:
+        """Allocate every free GPU slot plus ``extra``, which moves ``extra`` pages down."""
+        num_blocks = self._stats(0).free + extra
+        kv_cache = self.manager.create_kv_cache()
+        with TemporaryCudaStream([]) as stream_holder:
+            self.assertTrue(kv_cache.resume(cast(CudaStream, stream_holder.handle)))
+            ok = kv_cache.resize(num_blocks * self.TPB)
+        _ = stream_holder.take_finish_event()
+        kv_cache.close()
+        return ok
+
+    def test_pin_holds_the_chain_and_its_window_under_host_pressure(self) -> None:
+        self._make_manager(swa_window=2 * self.TPB)
+        pinned = self._tokens(0, 12)
+        control = self._tokens(10000, 12)
+        self._commit(pinned)
+        self._commit(control)
+        pin = self._pin(pinned, self.PIN)
+
+        self._flood(100000)
+        self.assertEqual(self.manager.probe_reuse(None, pinned), len(pinned))
+        self.assertEqual(self.manager.probe_reuse(None, control), 0)
+
+        self._close(pin)
+        self._flood(200000)
+        self.assertLess(self.manager.probe_reuse(None, pinned), len(pinned))
+
+    def test_pinned_pages_move_from_gpu_to_host(self) -> None:
+        self._make_manager()
+        tokens = self._tokens(0, 8)
+        self._commit(tokens)
+        pin = self._pin(tokens, self.PIN)
+        # Held pages stay evictable on the GPU.
+        self.assertGreaterEqual(self._stats(0).evictable, 8)
+        host_total = self._stats(1).total
+        self.assertEqual(self._stats(1).available, host_total)
+
+        self.assertTrue(self._push_gpu(self._stats(0).evictable))
+        # On the last tier they are neither free nor evictable.
+        host = self._stats(1)
+        self.assertEqual(host.total - host.available, 8)
+        self.assertEqual(self._stats(0).available, self._stats(0).total)
+        self.assertEqual(self.manager.probe_reuse(None, tokens), len(tokens))
+
+        self._close(pin)
+        # Unheld: evictable at the host, still reusable until something needs the room.
+        self.assertEqual(self._stats(1).available, host_total)
+        self.assertEqual(self.manager.probe_reuse(None, tokens), len(tokens))
+
+    def test_two_pins_keep_the_window_of_a_backed_off_return(self) -> None:
+        window_blocks = 2
+        rewind_blocks = 2
+        self._make_manager(swa_window=window_blocks * self.TPB)
+        two = self._tokens(0, 12)
+        one = self._tokens(10000, 12)
+        self._commit(two)
+        self._commit(one)
+        n = len(two)
+        rewound = n - rewind_blocks * self.TPB
+        pins = [self._pin(two, self.PIN), self._pin(two[:rewound], self.PIN + 1)]
+        pins.append(self._pin(one, self.PIN + 2))
+
+        self._flood(100000)
+        # Both pins: their windows span [n - rewind - window, n), so a return that backs off by up
+        # to the rewind span still finds its window.
+        self.assertEqual(self.manager.probe_reuse(None, two), n)
+        self.assertEqual(self.manager.probe_reuse(None, two[: n - self.TPB]), n - self.TPB)
+        self.assertEqual(self.manager.probe_reuse(None, two[:rewound]), rewound)
+        # One pin: only the endpoint survives; a backed-off return loses its window.
+        self.assertEqual(self.manager.probe_reuse(None, one), n)
+        self.assertLess(self.manager.probe_reuse(None, one[:rewound]), rewound)
+        for pin in pins:
+            self._close(pin)
+
+    def test_pins_are_excluded_from_the_statistics(self) -> None:
+        self._make_manager()
+        tokens = self._tokens(0, 8)
+        self._commit(tokens)
+        self.manager.get_and_reset_iteration_reused_blocks_by_level()
+
+        reader = self.manager.create_kv_cache(None, tokens, id=1)
+        reader.commit_pending_stats()
+        self.assertNotEqual(self.manager.get_and_reset_iteration_reused_blocks_by_level(), {})
+        reader.close()
+
+        def committed() -> tuple[int, int, int, int]:
+            stats = self.manager.get_committed_stats()
+            return (
+                stats.alloc_total_blocks,
+                stats.alloc_new_blocks,
+                stats.reused_blocks,
+                stats.missed_blocks,
+            )
+
+        before = committed()
+        pin = self._pin(tokens, self.PIN)
+        self.assertTrue(self.manager.is_stats_excluded(self.PIN))
+        pin.commit_pending_stats()
+        self.assertEqual(self.manager.get_and_reset_iteration_reused_blocks_by_level(), {})
+        self.assertNotIn(self.PIN, self.manager.get_dirty_stats_kv_cache_ids())
+        self.assertEqual(committed(), before)
+        self._close(pin)
+        self.assertFalse(self.manager.is_stats_excluded(self.PIN))
+        self.assertEqual(self.manager.get_and_reset_iteration_reused_blocks_by_level(), {})
+
+    def test_release_demotes_the_tail_and_keeps_a_prefix_another_pin_holds(self) -> None:
+        self._make_manager(host_quota=0)
+        older = self._tokens(5000, 4)
+        prefix = self._tokens(0, 4)
+        released = prefix + self._tokens(1000, 4)
+        kept = prefix + self._tokens(2000, 4)
+        for tokens in (older, released, kept):
+            self._commit(tokens)
+        pin_released = self._pin(released, self.PIN)
+        pin_kept = self._pin(kept, self.PIN + 1)
+
+        plan, blocks, pages, _, kept_shared, kept_held = self._release(pin_released)
+        self.assertEqual((plan, blocks, pages), (8, 4, 4))
+        # The shared prefix is held by the other pin.
+        self.assertEqual((kept_shared, kept_held), (0, 4))
+
+        # Evict four pages: the demoted tail goes before the older, never-pinned chain.
+        stats = self._stats(0)
+        self.assertGreaterEqual(stats.evictable, 4)
+        self.assertTrue(self._push_gpu(4))
+        self.assertEqual(self.manager.probe_reuse(None, older), len(older))
+        self.assertEqual(self.manager.probe_reuse(None, released), len(prefix))
+        self.assertEqual(self.manager.probe_reuse(None, kept), len(kept))
+        self._close(pin_kept)
+
+    def test_held_pages_over_host_room_fail_until_the_floor_releases(self) -> None:
+        self._make_manager(gpu_quota=16 << 20, host_quota=4 << 20)
+        host_total = self._stats(1).total
+        size = host_total * 3 // 8
+        self.assertGreater(size, 0)
+        chains = [self._tokens(base, size) for base in (0, 100000, 200000)]
+        pins = []
+        for i, tokens in enumerate(chains[:2]):
+            self._commit(tokens)
+            pins.append(self._pin(tokens, self.PIN + i))
+        # Push both pinned chains to the host: three quarters of it is now held.
+        self.assertTrue(self._push_gpu(2 * size))
+        host = self._stats(1)
+        self.assertEqual(host.total - host.available, 2 * size)
+
+        self._commit(chains[2])
+        pins.append(self._pin(chains[2], self.PIN + 2))
+        # The third chain's held pages cannot fall: the host has less room than they need.
+        self.assertGreater(size, self._stats(1).available)
+        self.assertFalse(self._push_gpu(size))
+
+        # The floor: below the threshold, release the oldest pin (plan, close, demote).
+        floor = 0.30
+        released = 0
+        while True:
+            host = self._stats(1)
+            if host.available / host.total >= floor:
+                break
+            self._release(pins[released])
+            released += 1
+        self.assertEqual(released, 1)
+        self.assertTrue(self._push_gpu(size))
+        # The demoted chain made the room; the other two stay whole.
+        self.assertLess(self.manager.probe_reuse(None, chains[0]), len(chains[0]))
+        self.assertEqual(self.manager.probe_reuse(None, chains[1]), len(chains[1]))
+        self.assertEqual(self.manager.probe_reuse(None, chains[2]), len(chains[2]))
+        for pin in pins[released:]:
+            self._close(pin)
+
+    def test_pins_close_before_clear_reusable_blocks(self) -> None:
+        self._make_manager()
+        tokens = self._tokens(0, 4)
+        self._commit(tokens)
+        pin = self._pin(tokens, self.PIN)
+        # An open pin is an open KV cache: the reset refuses, so the protector clears first.
+        with self.assertRaises(RuntimeError):
+            self.manager.clear_reusable_blocks()
+        self.assertEqual(self.manager.probe_reuse(None, tokens), len(tokens))
+        self._close(pin)
+        self.manager.clear_reusable_blocks()
+        self.assertEqual(self.manager.probe_reuse(None, tokens), 0)
 
 
 class TestLivingKvCacheGuard(TestKVCacheManagerV2):
