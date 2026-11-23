@@ -556,10 +556,13 @@ class Flux3Attention(Attention):
         image_rotary_emb: Tuple[Tensor, Tensor],
         sample_bounds: Optional[Bounds] = None,
         timestep: Optional[Tensor] = None,
+        grouped_lengths: Optional[Tuple[int, ...]] = None,
     ) -> Tensor:
         """Attention before the output projection: [B, S, hidden] to [B, S, local heads * head_dim].
 
         ``image_rotary_emb`` (cos, sin) are [B, S, 1, head_dim]; ``sample_bounds`` limits attention.
+        ``grouped_lengths`` is each sample's count of image-side tokens. Those tokens lead the
+        joint sequence and VC-Attention groups only them.
         """
         b = hidden_states.shape[0]
         cos, sin = image_rotary_emb
@@ -571,7 +574,7 @@ class Flux3Attention(Attention):
                 sin.reshape(-1, self.head_dim).contiguous(),
             )
             q, k, v = qkv.split([self.local_q_dim, self.local_kv_dim, self.local_kv_dim], dim=-1)
-            return self._attend(q, k, v, sample_bounds, timestep)
+            return self._attend(q, k, v, sample_bounds, timestep, grouped_lengths)
 
         q, k, v = self.get_qkv(hidden_states)
         q = q.view(b, -1, self.local_num_attention_heads, self.head_dim)
@@ -580,7 +583,9 @@ class Flux3Attention(Attention):
         q, k = self.apply_qk_norm(q, k)
         q = apply_rotary_emb(q, cos, sin).to(v.dtype)
         k = apply_rotary_emb(k, cos, sin).to(v.dtype)
-        return self._attend(q.flatten(2), k.flatten(2), v.flatten(2), sample_bounds, timestep)
+        return self._attend(
+            q.flatten(2), k.flatten(2), v.flatten(2), sample_bounds, timestep, grouped_lengths
+        )
 
     def _attend(
         self,
@@ -589,9 +594,19 @@ class Flux3Attention(Attention):
         v: Tensor,
         sample_bounds: Optional[Bounds],
         timestep: Optional[Tensor] = None,
+        grouped_lengths: Optional[Tuple[int, ...]] = None,
     ) -> Tensor:
+        def grouped(sample: int, length: int) -> Optional[Tuple[int, int]]:
+            # The image-side tokens lead the sample. A sample without text
+            # groups the whole sequence.
+            if grouped_lengths is None or not 0 < grouped_lengths[sample] < length:
+                return None
+            return 0, grouped_lengths[sample]
+
         if sample_bounds is None:
-            return self._attn_impl(q, k, v, timestep=timestep)
+            return self._attn_impl(
+                q, k, v, timestep=timestep, grouped_tokens=grouped(0, q.shape[1])
+            )
         if q.shape[0] == 1 and len(sample_bounds) > 1:
             length = sample_bounds[0][1]
             if (
@@ -601,17 +616,19 @@ class Flux3Attention(Attention):
                     (start, end) == (i * length, (i + 1) * length)
                     for i, (start, end) in enumerate(sample_bounds)
                 )
+                and (grouped_lengths is None or len(set(grouped_lengths)) == 1)
             ):
                 # Equal packed segments are independent batch rows for every backend.
                 return self._attn_impl(
                     *(x.view(len(sample_bounds), length, x.shape[-1]) for x in (q, k, v)),
                     timestep=timestep,
+                    grouped_tokens=grouped(0, length),
                 ).reshape_as(q)
         # HND backends take strided [B, H, S, D] views; the others need contiguous slices.
         layout = getattr(self.attn, "preferred_layout", AttentionTensorLayout.NHD)
         copy_slices = layout != AttentionTensorLayout.HND
         output = torch.zeros_like(q)
-        for start, end in sample_bounds:
+        for sample, (start, end) in enumerate(sample_bounds):
             if end > start:
                 q_sample, k_sample, v_sample = q[:, start:end], k[:, start:end], v[:, start:end]
                 if copy_slices:
@@ -621,7 +638,11 @@ class Flux3Attention(Attention):
                         v_sample.contiguous(),
                     )
                 output[:, start:end] = self._attn_impl(
-                    q_sample, k_sample, v_sample, timestep=timestep
+                    q_sample,
+                    k_sample,
+                    v_sample,
+                    timestep=timestep,
+                    grouped_tokens=grouped(sample, end - start),
                 )
         return output
 
@@ -682,11 +703,16 @@ class _Flux3Block(nn.Module):
         mod: Tuple[Tensor, Tensor, Tensor],
         sample_bounds: Optional[Bounds],
         timestep: Optional[Tensor],
+        grouped_lengths: Optional[Tuple[int, ...]] = None,
     ) -> Tensor:
         shift, scale, gate = mod
         norm_hidden_states = (1 + scale) * self.norm(hidden_states) + shift
         attn = self.attn.attend(
-            norm_hidden_states, image_rotary_emb, sample_bounds=sample_bounds, timestep=timestep
+            norm_hidden_states,
+            image_rotary_emb,
+            sample_bounds=sample_bounds,
+            timestep=timestep,
+            grouped_lengths=grouped_lengths,
         )
         mlp_out = self.ff(norm_hidden_states.reshape(-1, norm_hidden_states.shape[-1])).reshape(
             *norm_hidden_states.shape[:-1], -1
@@ -715,7 +741,10 @@ class Flux3ModeTransformerBlock(_Flux3Block):
 
 
 class Flux3SingleTransformerBlock(_Flux3Block):
-    """Joint block: image, reference-image and text tokens of each sample attend together."""
+    """Joint block: image, reference-image and text tokens of each sample attend together.
+
+    ``grouped_lengths`` is each sample's count of image-side tokens, which VC-Attention groups.
+    """
 
     def forward(
         self,
@@ -724,8 +753,11 @@ class Flux3SingleTransformerBlock(_Flux3Block):
         mod: Tuple[Tensor, Tensor, Tensor],
         sample_bounds: Optional[Bounds] = None,
         timestep: Optional[Tensor] = None,
+        grouped_lengths: Optional[Tuple[int, ...]] = None,
     ) -> Tensor:
-        return self._update(hidden_states, image_rotary_emb, mod, sample_bounds, timestep)
+        return self._update(
+            hidden_states, image_rotary_emb, mod, sample_bounds, timestep, grouped_lengths
+        )
 
 
 # =============================================================================
@@ -1090,6 +1122,11 @@ class Flux3Transformer2DModel(BaseDiffusionModel):
             )
 
         chunks, sample_bounds = self._joint_chunks(local_layout)
+        # The image-side tokens lead each sample's joint sequence and the text
+        # tokens end it. VC-Attention groups only the image-side tokens.
+        grouped_lengths = tuple(
+            (end - start) - text for (start, end), text in zip(sample_bounds, local_lengths[TEXT])
+        )
 
         def joint(field: str) -> Tensor:
             return torch.cat(
@@ -1101,7 +1138,12 @@ class Flux3Transformer2DModel(BaseDiffusionModel):
         rotary_emb = prepared["_flux3_joint_cos"], prepared["_flux3_joint_sin"]
         for block in self.single_transformer_blocks:
             combined = block(
-                combined, rotary_emb, mod, sample_bounds=sample_bounds, timestep=timestep
+                combined,
+                rotary_emb,
+                mod,
+                sample_bounds=sample_bounds,
+                timestep=timestep,
+                grouped_lengths=grouped_lengths,
             )
 
         vec = streams[OUTPUT_MODALITY]["vec"]

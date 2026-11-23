@@ -408,10 +408,11 @@ def test_sol_packed_samples_match_single_samples(flow_map, shape):
 
 
 class VCPreparations:
-    """Counts VC-Attention operand preparations and Flux3Attention backend calls."""
+    """Counts VC-Attention operand preparations and Flux3Attention backend calls, and keeps
+    the grouped token ranges the attention calls carry."""
 
     def __init__(self, monkeypatch: pytest.MonkeyPatch):
-        self.prepared, self.attention_calls = 0, 0
+        self.prepared, self.attention_calls, self.grouped = 0, 0, set()
         prepare, attn_impl = visual_trtllm.prepare_vc_operands, Flux3Attention._attn_impl
 
         def counted_prepare(*args, **kwargs):
@@ -420,6 +421,7 @@ class VCPreparations:
 
         def counted_attn_impl(*args, **kwargs):
             self.attention_calls += 1
+            self.grouped.add(kwargs.get("grouped_tokens"))
             return attn_impl(*args, **kwargs)
 
         monkeypatch.setattr(visual_trtllm, "prepare_vc_operands", counted_prepare)
@@ -431,7 +433,9 @@ class VCPreparations:
 @pytest.mark.parametrize("flow_map", FLOW_MAP)
 @torch.inference_mode()
 def test_vc_attention_matches_diffusers_reference(monkeypatch, flow_map, qk_dtype, repair_budget):
-    """Every attention call runs VC-Attention, on the per-sample and batch-row paths alike."""
+    """Every attention call runs VC-Attention, on the per-sample and batch-row paths alike. The
+    joint blocks group each sample's image-side tokens, which lead the sequence (16 + 12 and
+    20 + 12 here). The per-mode blocks group everything."""
     monkeypatch.setenv("TLLM_FMHA_LIBS", "+prims_ts")
     model, reference, config = build(
         flow_map, head_dim=128, attention=vc_attention(qk_dtype, repair_budget)
@@ -443,6 +447,7 @@ def test_vc_attention_matches_diffusers_reference(monkeypatch, flow_map, qk_dtyp
     calls = VCPreparations(monkeypatch)
     actual = model(**kwargs, **targets)["x_image"]
     assert calls.prepared == calls.attention_calls > 0
+    assert calls.grouped == {None, (0, 28), (0, 32)}
     expected = reference_outputs(reference, samples, TIMESTEPS, TARGETS if flow_map else None)
     for (start, end), sample_expected in zip(bounds(SHAPES["i2i"][0]), expected):
         assert_parity(actual[start:end], sample_expected, relative_l2=2e-2, cosine=0.9999)
