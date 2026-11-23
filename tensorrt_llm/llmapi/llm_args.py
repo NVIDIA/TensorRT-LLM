@@ -2499,6 +2499,28 @@ class MoeAdaptiveLoadBalancerConfig(_MoeLoadBalancerConfigBase):
             raise ValueError(
                 f"`num_slots` ({self.num_slots}) must be at least `num_experts` "
                 f"({num_experts}) for adaptive EPLB.")
+        least = self.least_slots(num_experts)
+        if self.num_slots < least:
+            raise ValueError(
+                f"`num_slots` ({self.num_slots}) must be at least {least} for adaptive EPLB "
+                f"with {num_experts} experts at `ep_size` {self._ep_size}: a layout leaves "
+                "half of each rank's spare slots free, and with no free slot on a rank no "
+                "install can copy a new replica there, so the layout freezes at its first one."
+            )
+
+    def least_slots(self, num_experts: int) -> int:
+        """The fewest slots with which every planned layout leaves each rank a free slot.
+
+        An install copies new replicas into free slots: the slots ``policy.active_slots`` leaves
+        unfilled, searched one rank's worth of slots at a time.
+        """
+        from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb.policy import (
+            ExpertGeometry, active_slots)
+        slots = num_experts
+        while active_slots(ExpertGeometry(num_experts, slots,
+                                          self._ep_size)) >= slots:
+            slots += self._ep_size
+        return slots
 
 
 MoeLoadBalancerConfigType = Annotated[

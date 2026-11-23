@@ -23,8 +23,8 @@ from tensorrt_llm.llmapi.llm_args import MoeAdaptiveLoadBalancerConfig
 
 pytestmark = pytest.mark.cpu_only
 
-NUM_EXPERTS, NUM_SLOTS, EP_SIZE, TOP_K = 8, 12, 4, 2
-ASSIGNMENTS = [(2 * r + j) % 8 for r in range(4) for j in range(3)]  # rank r, slot j < 3
+NUM_EXPERTS, NUM_SLOTS, EP_SIZE, TOP_K = 8, 16, 4, 2  # two spare slots per rank: the fewest
+ASSIGNMENTS = [(2 * r + j) % 8 for r in range(4) for j in range(4)]  # rank r, slot j < 4
 
 
 @pytest.fixture(autouse=True)
@@ -153,7 +153,7 @@ def test_layer_route_stages_into_the_backend_and_records_the_statistics():
     # The slots fill the bucket's first rows and -1 / 0 the other rows, the columns after top_k
     # stay untouched, and the same launch adds the ids to the statistics.
     assert slots.data_ptr() == bucket.topk_idx.data_ptr()
-    assert slots.tolist() == [[10, 0], [0, 7]]
+    assert slots.tolist() == [[13, 0], [0, 9]]
     assert bucket.topk_idx[2:].tolist() == [[-1, -1], [-1, -1]]
     assert torch.equal(bucket.topk_weights[:2, :TOP_K], weights)
     assert (bucket.topk_weights[2:, :TOP_K] == 0).all()
@@ -165,10 +165,10 @@ def test_layer_route_stages_into_the_backend_and_records_the_statistics():
     # without the weights the backend is not asked.
     four = torch.tensor([[1, 2]] * 4, dtype=torch.int32)
     own = layer.route(four, token_final_scales=torch.ones(4, TOP_K))
-    assert own.data_ptr() != bucket.topk_idx.data_ptr() and own.tolist() == [[1, 3]] * 4
+    assert own.data_ptr() != bucket.topk_idx.data_ptr() and own.tolist() == [[1, 4]] * 4
     called = []
     plain = layer.route(experts, offset_by_ep_rank=True, overlap_fn=lambda: called.append(1))
-    assert called == [1] and plain.dtype == torch.int64 and plain.tolist() == [[10, 0], [0, 7]]
+    assert called == [1] and plain.dtype == torch.int64 and plain.tolist() == [[13, 0], [0, 9]]
     assert asked == [(2, TOP_K), (4, TOP_K)]
     # The statistics of ids other than the routed ones are added before the route.
     layer.update_local_statistic(four, True, True)
@@ -179,21 +179,21 @@ def test_layer_route_stages_into_the_backend_and_records_the_statistics():
     # and not counted, as the kernel drops it; a record outside a route counts every row.
     bucket.live_row_word = torch.tensor([(2 << 16) | 1], dtype=torch.int32)
     layer.update_statistic_with_local_ids(experts, False, True)
-    assert layer.route(experts, token_final_scales=weights).tolist() == [[10, 0], [-1, -1]]
+    assert layer.route(experts, token_final_scales=weights).tolist() == [[13, 0], [-1, -1]]
     padded = torch.tensor([[0.5, 0.25]] + [[0.0] * 2] * 3)
     assert torch.equal(bucket.topk_weights[:, :TOP_K], padded)
     layer.update_local_statistic(experts, False, True)
     layer.route(four)
     assert torch.equal(layer.statistics.rows, second + _counts(1, 0, 0, 0, 0, 0, 0, 1) + first)
     assert layer.statistics.forwards.item() == 2
-    # Installed tables route the forwards enqueued after them: a replica of expert 1 on slot 5
+    # Installed tables route the forwards enqueued after them: a replica of expert 1 on slot 6
     # takes all of its rows; an id outside the experts goes to slot num_slots.
     layout, shares = layer.home_layout(), [1.0] * NUM_SLOTS
-    layout[5], shares[1] = 1, 0.0
+    layout[6], shares[1] = 1, 0.0
     tables = build_route_tables(layout, shares, NUM_EXPERTS, NUM_SLOTS).packed()
     balancer.route_tables("cpu")[layer.layer_idx].copy_(torch.tensor(tables, dtype=torch.int32))
     ids = torch.tensor([[1, 1], [9, -1]], dtype=torch.int32)
-    assert layer.route(ids).tolist() == [[5, 5], [NUM_SLOTS, NUM_SLOTS]]
+    assert layer.route(ids).tolist() == [[6, 6], [NUM_SLOTS, NUM_SLOTS]]
 
 
 FIELDS = dict(zip(TimeModel.__dataclass_fields__, (1.0, 2.0, 3.0, 4.0, 0.9, 8)))
@@ -334,8 +334,8 @@ def test_adaptive_eplb_stays_off_on_every_rank_when_a_check_fails(
     assert not balancer.recording
     experts = torch.tensor([[1, 2], [7, 4]], dtype=torch.int32)
     layer.update_statistic_with_local_ids(experts, True, True)
-    # Expert e is home on slot e // 2 * 3 + e % 2 of the 3 slots per rank.
-    assert layer.route(experts).tolist() == [[1, 3], [10, 6]]
+    # Expert e is home on slot e // 2 * 4 + e % 2 of the 4 slots per rank.
+    assert layer.route(experts).tolist() == [[1, 4], [13, 8]]
     assert layer.statistics.forwards.item() == 0
     assert balancer.shutdown() is True
 
@@ -544,7 +544,7 @@ def test_a_moe_layer_runs_a_forward_through_the_load_balancer_hooks():
     state = dict(layer_load_balancer=layer, allreduce=None, _load_balancer_overlap_fn=None)
     module = type("Module", (MoEEplbWeightLayoutMixin,), {**hooks, **state})()
     assert isinstance(layer, base.MoeLayerLoadBalancer) and layer.get_load_expert_ids() == [0, 1]
-    assert layer.home_layout() == [0, 1, -1, 2, 3, -1, 4, 5, -1, 6, 7, -1]
+    assert layer.home_layout() == [0, 1, -1, -1, 2, 3, -1, -1, 4, 5, -1, -1, 6, 7, -1, -1]
     assert not layer.is_dynamic_routing() and layer.records_statistics()
     assert layer.stages_routes and not layer.produces_replica_plan
     # Construction, then a backend's weight load, then its post-load.
@@ -566,7 +566,7 @@ def test_a_moe_layer_runs_a_forward_through_the_load_balancer_hooks():
         slots = module._load_balancer_route(experts, True)
         module._load_balancer_start_set_cpu_stage(last)
         module._load_balancer_done_set_cpu_stage(last)
-    assert slots.tolist() == [[0, 7], [10, 10]]
+    assert slots.tolist() == [[0, 9], [13, 13]]
     assert torch.equal(layer.statistics.rows, _counts(2, 0, 0, 0, 0, 2, 0, 4))
     assert layer.statistics.forwards.item() == 1
 

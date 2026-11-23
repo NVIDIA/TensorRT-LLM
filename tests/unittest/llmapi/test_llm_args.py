@@ -766,6 +766,8 @@ class TestMoeConfigAdaptiveEplb:
             pytest.param(12, 6, "multiple of `ep_size`", id="experts-ep"),
             pytest.param(8, 12, "at least `num_experts`", id="few-slots"),
             pytest.param(10, 8, "divisible by `ep_size`", id="slots-ep"),
+            pytest.param(8, 8, "at least 16", id="no-spare-slot"),
+            pytest.param(12, 8, "at least 16", id="one-spare-slot"),
         ],
     )
     def test_validates_expert_capacity_after_setup(self, num_slots: int,
@@ -777,11 +779,43 @@ class TestMoeConfigAdaptiveEplb:
             config.validate_expert_capacity(num_experts)
 
     def test_expert_capacity_requires_setup(self) -> None:
-        config = MoeAdaptiveLoadBalancerConfig(num_slots=12)
+        config = MoeAdaptiveLoadBalancerConfig(num_slots=16)
         with pytest.raises(ValueError, match=r"Call setup\(\)"):
             config.validate_expert_capacity(num_experts=8)
         config.setup(ep_rank=0, ep_size=4)
         config.validate_expert_capacity(num_experts=8)
+
+    @pytest.mark.parametrize(
+        "ep_size, least",
+        [(32, 448), (64, 512), (128, 640), (96, 576)],
+    )
+    def test_least_slots_leave_every_rank_a_free_slot(self, ep_size: int,
+                                                      least: int) -> None:
+        """The least slot count gives every rank two spare slots.
+
+        384 experts: one spare slot per rank (512 slots at EP128) leaves a planned layout no free
+        slot to install into.
+        """
+        from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb.policy import (
+            ExpertGeometry, active_slots)
+        config = MoeAdaptiveLoadBalancerConfig(num_slots=least)
+        config.setup(ep_rank=0, ep_size=ep_size)
+        assert config.least_slots(384) == least
+        config.validate_expert_capacity(384)
+        geometry = ExpertGeometry(384, least, ep_size)
+        assert active_slots(geometry) == least - ep_size
+        with pytest.raises(ValueError, match=f"at least {least}"):
+            short = MoeAdaptiveLoadBalancerConfig(num_slots=least - ep_size)
+            short.setup(ep_rank=0, ep_size=ep_size)
+            short.validate_expert_capacity(384)
+
+    @pytest.mark.parametrize("ep_size", [72, 144])
+    def test_experts_not_divisible_by_ep_are_refused(self,
+                                                     ep_size: int) -> None:
+        config = MoeAdaptiveLoadBalancerConfig(num_slots=ep_size * 8)
+        config.setup(ep_rank=0, ep_size=ep_size)
+        with pytest.raises(ValueError, match="multiple of `ep_size`"):
+            config.validate_expert_capacity(384)
 
 
 @pytest.mark.cpu_only
