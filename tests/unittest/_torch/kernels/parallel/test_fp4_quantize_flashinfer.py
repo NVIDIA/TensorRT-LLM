@@ -20,8 +20,8 @@ from unittest.mock import patch
 import pytest
 import torch
 from parameterized import parameterized
-from utils.util import isSM100Family, skip_pre_blackwell_unittest, unittest_name_func
 from torch._subclasses.fake_tensor import FakeTensorMode
+from utils.util import isSM100Family, skip_pre_blackwell_unittest, unittest_name_func
 
 import tensorrt_llm
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
