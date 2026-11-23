@@ -15020,6 +15020,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             def tactic_space_key(self):
                 return _nvmmh_tactic_space_key()
 
+            def _exceeds_split_k_workspace(self, m: int, n: int,
+                                           split_k: int) -> bool:
+                return (self.split_k_fp32_partials and split_k > 1 and
+                        m * n * split_k * 4 > self.max_split_k_workspace_bytes)
+
             def _nvmmh_kernel_shapes(self, config, kernel_m: int, kernel_n: int,
                                      real_k: int, swap_ab: bool):
                 """Map an nvMMH config onto this kernel, or None if it cannot run it.
@@ -15035,6 +15040,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         or cluster_m not in (1, 2, 4)
                         or cluster_n not in (1, 2, 4)
                         or real_k % self.mma_tiler_k != 0
+                        or self._exceeds_split_k_workspace(
+                            kernel_m, kernel_n, config.split_k)
                         or config.split_k > real_k // self.mma_tiler_k
                         or -(-kernel_m // cta_m) < cluster_m):
                     return None
@@ -15048,7 +15055,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         self.a_dtype,
                         self.b_dtype,
                         self.sf_dtype,
-                        cutlass.BFloat16,
+                        cutlass.Float32 if self.split_k_fp32_partials
+                        and config.split_k > 1 else cutlass.BFloat16,
                         "k",
                         "k",
                         "m" if swap_ab else "n",
@@ -15136,6 +15144,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                swap_ab_candidates: List[bool],
                                max_tactics: int) -> List[Tuple]:
                 """Tactics of the top ``max_tactics`` nvMMH configs."""
+                backend = _SM107_BLOCKSCALED_NVMMH_BACKEND
+                if self.split_k_fp32_partials:
+                    backend = replace(
+                        backend,
+                        split_k_kind=cutedsl_nvmmh.SPLIT_K_OUT_OF_PLACE)
                 rankings = []
                 for swap_ab in swap_ab_candidates:
                     kernel_m, kernel_n = (n, m) if swap_ab else (m, n)
@@ -15149,7 +15162,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         lambda config: self._nvmmh_kernel_shapes(
                             config, kernel_m, kernel_n, real_k, swap_ab
                         ) is not None,
-                        backend=_SM107_BLOCKSCALED_NVMMH_BACKEND,
+                        backend=backend,
                         cache_key=(self.__class__.kernel_class.__name__,
                                    self.mma_tiler_k, swap_ab))
                     rankings.append([
@@ -15296,14 +15309,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         kernel_n = n
 
                     for split_k in self.split_k_candidates:
-                        if split_k > 1 and (real_k % mma_tiler_k != 0 or
-                                            (real_k // mma_tiler_k) % split_k
-                                            != 0):
+                        if self._exceeds_split_k_workspace(m, n, split_k):
                             continue
                         fp32_partials = self.split_k_fp32_partials and split_k > 1
-                        if (fp32_partials and m * n * split_k * 4
-                                > self.max_split_k_workspace_bytes):
-                            continue
                         if self.__class__.kernel_class.can_implement(
                             (kernel_m, kernel_n, real_k, batch_size),
                                 self.a_dtype,
@@ -15562,8 +15570,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
                 # A cached profile can cover larger M than its tuning sample.
                 # Keep the workspace bound valid for the actual invocation.
-                if (self.split_k_fp32_partials and split_k > 1 and
-                        m * n * split_k * 4 > self.max_split_k_workspace_bytes):
+                if self._exceeds_split_k_workspace(m, n, split_k):
                     split_k = 1
 
                 partition_id = kwargs.get("partition_id", -1)

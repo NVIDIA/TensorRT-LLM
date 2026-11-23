@@ -142,6 +142,9 @@ l0_gr100:
   # FC12 cases skip on B200/GB300 (the only lists that otherwise carry them).
   - unittest/_torch/kernels/parallel/test_fp8_block_scale_low_m_gemm.py
   - unittest/_torch/kernels/parallel/test_kimi_k3_router_logits.py
+  - unittest/_torch/kernels/parallel/test_kimi_k3_fp8_weight_read_linear.py::test_fine_grained_mxfp8_preserves_cancellation[8-512-1280]
+  - unittest/_torch/kernels/parallel/test_kimi_k3_fp8_weight_read_linear.py::test_fine_grained_mxfp8_tactics_match_reference[256]
+  - unittest/_torch/kernels/parallel/test_kimi_k3_fp8_weight_read_linear.py::test_fine_grained_mxfp8_bounds_cached_workspace
   - unittest/_torch/kernels/parallel/test_kimi_k3_fp8_weight_read_linear.py::test_forward_nvfp4_matches_gemm_then_fp4_quantize
   - unittest/_torch/moe/test_kimi_k3_route_sort.py
   - unittest/_torch/moe/test_moe_sorted_routing.py::test_backend_runs_on_sorted_routing[1-CUTEDSL_FC12]

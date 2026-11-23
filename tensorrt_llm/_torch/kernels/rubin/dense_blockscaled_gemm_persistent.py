@@ -3872,6 +3872,11 @@ def run_scaled_mm_with_emulated_dtype(
     :return: Execution time of the GEMM kernel
     :rtype: float
     """
+    if gemm_obj.split_k_partials and gemm_obj.split_k > 1:
+        raise ValueError(
+            "The benchmark requires a final output tensor and cannot store split-K partials"
+        )
+
     print(f"Running {gemm_obj.__class__.__name__} test (Emulated) with:")
     print(f"mnkl: {mnkl}")
     print(
