@@ -350,22 +350,6 @@ TORCH_LLM_DOCSTRING = TORCH_LLMARGS_EXPLICIT_DOCSTRING + """
 """
 
 
-def _default_guided_decoding_backend(
-        args: Any, model_type: Optional[str]) -> Optional[str]:
-    """The guided decoding backend to serve with when the arguments set none.
-
-    Mistral Large 4 serves structured outputs (``response_format``) by default,
-    with xgrammar. A speculative decoding config keeps the given value: how it
-    combines with guided decoding is settled when the arguments are validated.
-    A multimodal-encoder-only instance generates nothing and keeps it too.
-    """
-    if (args.guided_decoding_backend is None and model_type == "mistral_large_4"
-            and args.speculative_config is None
-            and not getattr(args, "mm_encoder_only", False)):
-        return "xgrammar"
-    return args.guided_decoding_backend
-
-
 @dataclass
 class PreprocessedInputs:
     """Light structure for holding preprocessed inputs.
@@ -2284,22 +2268,6 @@ class _TorchLLM(BaseLLM):
                     "using LLM(model=..., encode_only=True) with "
                     "llm.encode() for optimized batch-forward inference that "
                     "bypasses the decoder scheduler.", architectures[0])
-
-        model_type = getattr(self._hf_model_config, "model_type", None)
-        guided_decoding_backend = _default_guided_decoding_backend(
-            self.args, model_type)
-        if guided_decoding_backend != self.args.guided_decoding_backend:
-            logger.info(
-                f"Guided decoding backend {guided_decoding_backend} enabled "
-                "for structured outputs.")
-            self.args.guided_decoding_backend = guided_decoding_backend
-        elif (model_type == "mistral_large_4"
-              and guided_decoding_backend is None
-              and self.args.speculative_config is not None):
-            logger.info(
-                "Guided decoding stays off with speculative decoding; set "
-                "guided_decoding_backend to 'xgrammar' to serve structured "
-                "outputs.")
 
         # Create the standard executor for generate()/generate_async()
         # TODO: revisit gather_context_logits

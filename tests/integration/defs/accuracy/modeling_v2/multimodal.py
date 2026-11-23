@@ -564,7 +564,7 @@ def evaluate(llm, profile, out: Path):
                         failures,
                     )
 
-        # Structured outputs are on by default: guided decoding holds the answer to the schema.
+        # The gate serves with xgrammar: guided decoding holds the answer to the schema.
         if llm.args.guided_decoding_backend != "xgrammar":
             failures.append(
                 f"FAIL: guided decoding backend {llm.args.guided_decoding_backend!r}, not xgrammar"

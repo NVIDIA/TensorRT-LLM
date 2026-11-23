@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Guided decoding for mistral_large_4: xgrammar over the Tekken vocabulary, on by default.
+"""Guided decoding for mistral_large_4: xgrammar and llguidance over the Tekken vocabulary.
 
 xgrammar matches a grammar against each token's bytes. A Tekken token is raw bytes that
 need not be valid UTF-8, so the vocabulary keeps them as bytes. Control tokens are empty
@@ -27,7 +27,6 @@ from types import SimpleNamespace
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.py_executor_creator import get_guided_decoding_config
-from tensorrt_llm.llmapi.llm import _default_guided_decoding_backend
 from tensorrt_llm.llmapi.llm_args import GuidedDecodingConfig
 
 pytestmark = pytest.mark.cpu_only
@@ -131,31 +130,6 @@ def test_xgrammar_never_allows_control_tokens_inside_a_string(tokenizer):
     ]
     assert allowed, "a JSON string accepts ordinary text"
     assert min(allowed) >= tekken.num_special_tokens
-
-
-@pytest.mark.parametrize(
-    "fields,expected",
-    [
-        ({}, "xgrammar"),
-        ({"guided_decoding_backend": "llguidance"}, "llguidance"),
-        ({"speculative_config": object()}, None),
-        ({"mm_encoder_only": True}, None),
-        ({"model_type": None}, None),
-        ({"model_type": "mistral_large_3"}, None),
-    ],
-)
-def test_mistral_large_4_serves_structured_outputs_by_default(fields, expected):
-    fields = dict(fields)
-    model_type = fields.pop("model_type", "mistral_large_4")
-    args = SimpleNamespace(
-        **{
-            "guided_decoding_backend": None,
-            "speculative_config": None,
-            "mm_encoder_only": False,
-            **fields,
-        }
-    )
-    assert _default_guided_decoding_backend(args, model_type) == expected
 
 
 _WEATHER_TOOL = {

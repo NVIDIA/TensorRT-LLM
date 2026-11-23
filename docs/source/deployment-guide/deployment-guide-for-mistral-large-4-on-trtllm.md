@@ -285,7 +285,7 @@ These options are set in the YAML file passed to `trtllm-serve --config`. See th
 
 #### `guided_decoding_backend`
 
-* **Description:** The guided-decoding backend: `xgrammar` or `llguidance`. It constrains structured outputs (`response_format`), and with `llguidance` also `tool_choice: "required"` and named tool calls. Without speculative decoding, Mistral Large 4 defaults to `xgrammar`. **With speculative decoding, guided decoding stays off unless this key is set**, and requests with `response_format` are then not constrained. With `xgrammar`, a JSON response starts at the first generated token, so no reasoning is returned with it; with `llguidance`, the JSON may follow a reasoning section.
+* **Description:** The guided-decoding backend: `xgrammar` or `llguidance`. It constrains structured outputs (`response_format`), and with `llguidance` also `tool_choice: "required"` and named tool calls. **Guided decoding is off unless this key is set**, and requests with `response_format` are then not constrained. With `xgrammar`, a JSON response starts at the first generated token, so no reasoning is returned with it; with `llguidance`, the JSON may follow a reasoning section.
 
 ### Mistral Large 4 API Behavior
 
@@ -508,7 +508,7 @@ All 30 workloads passed with the existing accuracy references and tolerances unc
 * **`reasoning_effort`.** `low`, `medium` and `high` only; reasoning cannot be turned off.
 * **OpenAI `store` field.** The server keeps no completions: chat requests with `store: true` return HTTP 400. `store: false` is accepted.
 * **Log probabilities** are not available with speculative decoding.
-* **Speculative decoding.** Only DSpark with the draft in the NVFP4 checkpoint, with 3 draft tokens. Guided decoding must be enabled explicitly with it (see `guided_decoding_backend` in [Key YAML Options](#key-yaml-options)).
+* **Speculative decoding.** Only DSpark with the draft in the NVFP4 checkpoint, with 3 draft tokens.
 * **Image count.** The server does not limit the number of images per prompt.
 * **Long contexts.** A 1M-token request holds about 46 GiB of KV cache on each rank, so the 4-GPU deployments hold only one or two such requests at a time. TEP and TP keep a full copy of the KV cache on each rank; for many concurrent requests, use DEP.
 * **Disaggregated serving.** Validated on GB300 only for TEP4 to TEP4 at a 32K-token context without speculative decoding.
