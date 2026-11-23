@@ -866,3 +866,46 @@ def test_wan21_t2v_vae_matches_diffusers_encode_checkpoint():
     # fp32 parity; the residual gap is only channels_last vs contiguous conv
     # reduction order.
     _assert_close_metrics(wan_latents, reference_latents, max_abs=3e-3, relative_mean=1e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the fused kernel needs CUDA")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_fused_rms_norm_silu_matches_eager(dtype):
+    """WanRMSNorm + SiLU as one generated kernel, against the eager sequence."""
+    from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import WanRMSNorm, enable_fused_norm_silu
+
+    torch.manual_seed(0)
+    norm = WanRMSNorm(96, images=False).cuda().to(dtype)
+    with torch.no_grad():
+        norm.gamma.copy_(1.0 + 0.1 * torch.randn_like(norm.gamma))
+    x = torch.randn(1, 96, 5, 40, 64, device="cuda", dtype=dtype)
+    eager = torch.nn.functional.silu(norm(x))
+    assert torch.equal(norm.forward_silu(x), eager)  # off until enabled
+
+    holder = torch.nn.Sequential(norm)
+    assert enable_fused_norm_silu(holder) == 1 and norm.fuse_silu
+    fused = norm.forward_silu(x)
+    assert fused.dtype == dtype and fused.shape == eager.shape
+    # Same rounding points; the generated SiLU may differ from the eager one in the last bit.
+    torch.testing.assert_close(fused, eager, rtol=2**-7, atol=2**-7)
+    assert (fused == eager).float().mean() > 0.9
+
+
+def test_residual_block_norms_route_through_forward_silu():
+    """A WanResidualBlock runs norm1 / norm2 + SiLU through WanRMSNorm.forward_silu, the method
+    that takes the fused kernel once enable_fused_norm_silu sets the flag."""
+    from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import WanResidualBlock, WanRMSNorm
+
+    torch.manual_seed(0)
+    block = WanResidualBlock(8, 8).eval()
+    x = torch.randn(1, 8, 2, 4, 4)
+    calls = []
+    original = WanRMSNorm.forward_silu
+
+    def recording(self, inp):
+        calls.append(self)
+        return original(self, inp)
+
+    with torch.no_grad(), patch.object(WanRMSNorm, "forward_silu", recording):
+        block(x)
+    assert calls == [block.norm1, block.norm2]

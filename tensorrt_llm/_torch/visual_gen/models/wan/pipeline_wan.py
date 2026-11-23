@@ -48,6 +48,7 @@ from tensorrt_llm.logger import logger
 
 from .transformer_wan import WanTransformer3DModel
 from .vae_loader import load_wan_vae
+from .wan_vae import enable_fused_norm_silu
 
 # Supported Wan models:
 # - Wan2.1-T2V-14B: Single-stage text-to-video (14B parameters)
@@ -121,8 +122,12 @@ _WAN_TWO_TRANSFORMER_OFFLOAD_STAGES = (
         "nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4",
     ],
     # enable_fp8_block_fusions: static-FP8 checkpoints fuse each block's GEMM bias/GELU/FP8
-    # outputs and residual + norm + FP8 quantization (opt-in).
-    defaults={"enable_fp8_block_fusions": False},
+    # outputs and residual + norm + FP8 quantization, hand each FFN residual to the next block,
+    # run the cross-attention with a static-scale FP8 Q and FP8 output, and fuse the VAE
+    # RMSNorm + SiLU (opt-in). fp8_cross_attention_q_amax: optional JSON of calibrated
+    # cross-attention Q maxima (see load_cross_attention_q_amax); without it the Q scale comes
+    # from the RMSNorm bound.
+    defaults={"enable_fp8_block_fusions": False, "fp8_cross_attention_q_amax": ""},
     doc="Wan 2.1 & 2.2 text-to-video family.",
     supports_nvfp4_vae=True,
 )
@@ -403,6 +408,15 @@ class WanPipeline(BasePipeline):
         if self.transformer_2 is not None:
             if hasattr(self.transformer_2, "post_load_weights"):
                 self.transformer_2.post_load_weights()
+
+        # When a transformer runs the opted-in static-FP8 fusions, the VAE runs each RMSNorm +
+        # SiLU as one fused kernel too.
+        transformers = (self.transformer, self.transformer_2)
+        if getattr(self, "vae", None) is not None and any(
+            getattr(t, "fp8_block_fusions_planned", False) for t in transformers if t is not None
+        ):
+            flagged = enable_fused_norm_silu(self.vae)
+            logger.info(f"Wan VAE: fused RMSNorm + SiLU on {flagged} RMSNorm modules.")
 
         # Wan 2.2 TeaCache validation after both transformers' post_load_weights
         # (FP8 scales, etc.). Cache acceleration itself is enabled by the loader

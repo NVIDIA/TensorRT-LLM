@@ -24,7 +24,7 @@ import json
 from dataclasses import dataclass, fields
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any, Callable, TypedDict, Union
 
 import torch
 import torch.nn as nn
@@ -1081,6 +1081,29 @@ def swap_wan_convs_to_fp4(
     return replaced, static
 
 
+def _rms_norm_silu_eager(
+    x: torch.Tensor,
+    gamma: torch.Tensor,
+    bias: Union[torch.Tensor, float],
+    scale: float,
+    dim: int,
+) -> torch.Tensor:
+    """WanRMSNorm.forward for a bf16 / fp16 input, then SiLU."""
+    normalized = F.normalize(x.float(), dim=dim).to(x.dtype)
+    return F.silu(normalized * scale * gamma + bias)
+
+
+@lru_cache(maxsize=None)
+def _rms_norm_silu_fused() -> Callable[..., torch.Tensor]:
+    """WanRMSNorm + SiLU as one generated kernel. emulate_precision_casts keeps the eager rounding
+    points (the fp32 normalize, the cast back, each low-precision multiply); the fused SiLU still
+    differs from the eager op in the last bit for some elements, so the result is close to, not
+    bitwise equal to, the eager sequence."""
+    return torch.compile(
+        _rms_norm_silu_eager, dynamic=True, options={"emulate_precision_casts": True}
+    )
+
+
 class WanRMSNorm(nn.Module):
     def __init__(
         self,
@@ -1097,6 +1120,15 @@ class WanRMSNorm(nn.Module):
         self.scale = dim**0.5
         self.gamma = nn.Parameter(torch.ones(shape))
         self.bias = nn.Parameter(torch.zeros(shape)) if bias else 0.0
+        # Run forward_silu as one fused kernel (set at load, see enable_fused_norm_silu).
+        self.fuse_silu = False
+
+    def forward_silu(self, x: torch.Tensor) -> torch.Tensor:
+        """SiLU(forward(x)), as one fused kernel for CUDA bf16 / fp16 inputs when fuse_silu is set."""
+        if self.fuse_silu and x.is_cuda and x.dtype in (torch.float16, torch.bfloat16):
+            norm_dim = 1 if self.channel_first else -1
+            return _rms_norm_silu_fused()(x, self.gamma, self.bias, self.scale, norm_dim)
+        return F.silu(self(x))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         norm_dim = 1 if self.channel_first else -1
@@ -1211,6 +1243,15 @@ class WanResample(nn.Module):
         return x
 
 
+def _norm_activation(
+    norm: nn.Module, activation: Callable[[torch.Tensor], torch.Tensor], x: torch.Tensor
+) -> torch.Tensor:
+    """activation(norm(x)); WanRMSNorm.forward_silu (fused when enabled) when the activation is SiLU."""
+    if isinstance(norm, WanRMSNorm) and activation is F.silu:
+        return norm.forward_silu(x)
+    return activation(norm(x))
+
+
 class WanResidualBlock(nn.Module):
     _norm_cls = WanRMSNorm
     _conv_cls = WanCausalConv3d
@@ -1248,7 +1289,7 @@ class WanResidualBlock(nn.Module):
         elif getattr(self.conv1, "absorbs_silu", False):
             x = self.norm1(x)  # conv1 applies SiLU
         else:
-            x = self.nonlinearity(self.norm1(x))
+            x = _norm_activation(self.norm1, self.nonlinearity, x)
 
         if feat_cache is not None and feat_idx is not None:
             x = _causal_conv_with_cache(self.conv1, x, feat_cache, feat_idx)
@@ -1260,7 +1301,7 @@ class WanResidualBlock(nn.Module):
         elif getattr(self.conv2, "absorbs_silu", False):
             h = self.norm2(x)  # conv2 applies SiLU
         else:
-            h = self.nonlinearity(self.norm2(x))
+            h = _norm_activation(self.norm2, self.nonlinearity, x)
         x = self.dropout(h)
 
         # Only Conv2 feeds the block residual add. A parallel wrapper advertises
@@ -1469,7 +1510,7 @@ class WanEncoder3d(nn.Module):
                 x = layer(x)
 
         x = self.mid_block(x, feat_cache=feat_cache, feat_idx=feat_idx)
-        x = self.nonlinearity(self.norm_out(x))
+        x = _norm_activation(self.norm_out, self.nonlinearity, x)
         if feat_cache is not None and feat_idx is not None:
             x = _causal_conv_with_cache(self.conv_out, x, feat_cache, feat_idx)
         else:
@@ -1652,7 +1693,7 @@ class WanDecoder3d(nn.Module):
         for up_block in self.up_blocks:
             x = up_block(x, feat_cache=feat_cache, feat_idx=feat_idx, first_chunk=first_chunk)
 
-        x = self.nonlinearity(self.norm_out(x))
+        x = _norm_activation(self.norm_out, self.nonlinearity, x)
         if feat_cache is not None and feat_idx is not None:
             x = _causal_conv_with_cache(self.conv_out, x, feat_cache, feat_idx)
         else:
@@ -1890,3 +1931,13 @@ class WanVAE(nn.Module):
         posterior = self.encode(sample).latent_dist
         z = posterior.sample(generator=generator) if sample_posterior else posterior.mode()
         return self.decode(z, return_dict=return_dict)
+
+
+def enable_fused_norm_silu(vae: nn.Module) -> int:
+    """Let every WanRMSNorm of the VAE run its SiLU in one fused kernel (close to, not bitwise
+    equal to, the eager pair); returns how many norms got the flag. Norms used without SiLU, or
+    whose conv absorbs the norm or the SiLU, keep their eager path."""
+    norms = [m for m in vae.modules() if isinstance(m, WanRMSNorm)]
+    for norm in norms:
+        norm.fuse_silu = True
+    return len(norms)

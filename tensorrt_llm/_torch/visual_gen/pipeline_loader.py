@@ -199,14 +199,16 @@ class PipelineLoader:
                 f"Unknown pipeline_config keys for {class_name} ({checkpoint_dir}): "
                 f"{sorted(unknown)}. Valid keys: {sorted(entry.defaults)}"
             )
+        # bool and str keys take only their own type (a quoted "false" is not false).
         wrong_type = sorted(
-            key
+            f"{key} ({type(entry.defaults[key]).__name__})"
             for key, value in user_pipeline_config.items()
-            if isinstance(entry.defaults[key], bool) and not isinstance(value, bool)
+            if isinstance(entry.defaults[key], (bool, str))
+            and type(value) is not type(entry.defaults[key])
         )
         if wrong_type:
             raise ValueError(
-                f"pipeline_config keys for {class_name} must be true or false: {wrong_type}"
+                f"pipeline_config keys for {class_name} have the wrong type, expected: {wrong_type}"
             )
         return {**entry.defaults, **user_pipeline_config}
 

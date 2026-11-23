@@ -332,11 +332,22 @@ The key belongs to `WanPipeline` (Wan 2.1 / 2.2 T2V and Wan 2.2 TI2V-5B). The im
 
 The fusions apply only when every site supports them: static per-tensor FP8 on the cuBLAS path, a hidden size that is a multiple of 1024 up to 8192, and no tensor parallelism, VSA, per-token timestep embeddings (TI2V-5B) or async Ulysses. Blocks that do not qualify run unfused, and a warning lists the reasons with their block counts.
 
+With the fusions on, the key also enables:
+
+- **FFN residual handoff:** the FFN residual of one fused block runs in the next fused block's AdaLN row kernel instead of its own pass (bitwise the same result).
+- **Static-FP8 cross-attention:** when the cross-attention backend takes static FP8 input and output (cuDNN FP8, which the per-tensor FP8 recipe on SM107 uses for cross-attention), `norm_q` and the e4m3 quantization of Q run in one row kernel with a static scale, and the attention writes e4m3 for `to_out`. The scale comes from the RMSNorm bound, so Q never saturates, or from a calibrated maximum (below). A log line counts the blocks that run it.
+- **Deferred attention rescale:** the FP8 self-attention kernels skip the output rescale until the row maximum has grown by more than 2x. The kernels then quantize the softmax probabilities more coarsely, so this is lossy; it is part of the validated setup below.
+- **Fused VAE RMSNorm + SiLU:** when a transformer block runs the fusions, each VAE RMSNorm followed by SiLU runs as one generated kernel, close to (not bitwise equal to) the two eager ops.
+
+`fp8_cross_attention_q_amax` (default empty) is an optional JSON file of calibrated cross-attention Q maxima: `{"margin": m, "amax": {"transformer.blocks.0.attn2": a, "transformer_2.blocks.0.attn2": b, ...}}`, the maximum of `|norm_q(q)|` per layer over a calibration set and a headroom factor of at least 1. Layers missing from the file use the RMSNorm bound; a file whose names match no layer of a transformer logs a warning, and the key has no effect without `enable_fp8_block_fusions`.
+
 Accuracy was validated end to end on Rubin (SM107) with the Wan 2.2 T2V A14B static FP8 checkpoint and the per-tensor FP8 attention recipe on the `TRTLLM` backend. The fusions also run on other GPUs with FP8 GEMMs and with BF16 attention; there they are covered by unit tests against the unfused block only.
 
 ```yaml
 pipeline_config:
   enable_fp8_block_fusions: true
+  # Optional calibrated cross-attention Q maxima.
+  fp8_cross_attention_q_amax: /path/to/q_amax.json
 ```
 
 ### Quantized Attention
