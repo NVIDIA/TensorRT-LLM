@@ -75,6 +75,9 @@ def server(model_name: str, backend: str, extra_llm_api_options: bool,
     # context length (tens of thousands of tokens), which can exceed the
     # available KV cache on smaller GPUs.
     args.extend(["--max_seq_len", "2048"])
+    # Smaller batch size reduces chance of OOM, because test parametrization results
+    # in several concurrently live engines.
+    args.extend(["--max_batch_size", "128"])
     if extra_llm_api_options:
         args.extend(
             ["--extra_llm_api_options", temp_extra_llm_api_options_file])
