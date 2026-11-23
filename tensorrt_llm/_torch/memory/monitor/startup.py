@@ -118,6 +118,8 @@ class KvSizingBudget:
     attention: int
     penalty: int
     fraction: float
+    before_fraction: int
+    before_limits: int
     fraction_budget: int
     drafter: int
     indexer: int
@@ -129,22 +131,10 @@ class KvSizingBudget:
         return self.torch_peak + self.outside_torch
 
     @property
-    def before_fraction(self) -> int:
-        return (
-            self.device_total
-            - self.profiled_peak
-            + self.temporary_kv
-            - self.encoder
-            - self.attention
-            - self.penalty
-        )
-
-    @property
     def non_kv_peak(self) -> int:
         return self.device_total - self.before_fraction + self.indexer + self.context_mla
 
     def render(self) -> list[str]:
-        before_limits = self.fraction_budget - self.drafter - self.indexer - self.context_mla
         return [
             "  KV sizing budget (GiB):",
             f"    Device total {self.device_total / GIB:.3f}; profiled peak {self.profiled_peak / GIB:.3f} "
@@ -157,8 +147,8 @@ class KvSizingBudget:
             f"({(self.before_fraction - self.fraction_budget) / GIB:.3f} held back)",
             f"    Reserves after fraction: drafter headroom {self.drafter / GIB:.3f}, "
             f"indexer logits {self.indexer / GIB:.3f}, context MLA {self.context_mla / GIB:.3f}",
-            f"    Before user limits {before_limits / GIB:.3f}; user limits deducted "
-            f"{(before_limits - self.final_budget) / GIB:.3f}; final KV budget "
+            f"    Before user limits {self.before_limits / GIB:.3f}; user limits deducted "
+            f"{(self.before_limits - self.final_budget) / GIB:.3f}; final KV budget "
             f"{self.final_budget / GIB:.3f} ({self.final_budget} bytes)",
         ]
 

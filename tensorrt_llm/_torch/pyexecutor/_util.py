@@ -1751,7 +1751,7 @@ class KvCacheCreator:
         return None
 
     def _cal_max_memory(self, peak_memory, total_gpu_memory, fraction,
-                        allocated_bytes: int) -> int:
+                        allocated_bytes: int, before_fraction: int) -> int:
         """
         Calculate the max KV cache capacity.
 
@@ -1759,8 +1759,7 @@ class KvCacheCreator:
         """
         kv_size_per_token = self._get_kv_size_per_token()
 
-        available_kv_mem = (total_gpu_memory - peak_memory +
-                            allocated_bytes) * fraction
+        available_kv_mem = before_fraction * fraction
         logger.info(
             f"Peak memory during memory usage profiling (torch + non-torch): {peak_memory / (GB):.2f} GiB, "
             f"available KV cache memory when calculating max tokens: {available_kv_mem / (GB):.2f} GiB, "
@@ -2391,9 +2390,11 @@ class KvCacheCreator:
                 "the first penalized request.")
 
         # calculate max memory from peak memory and free gpu memory fraction
+        before_fraction = total_gpu_memory - peak_memory + allocated_bytes
         kv_cache_max_memory = self._cal_max_memory(peak_memory,
                                                    total_gpu_memory, fraction,
-                                                   allocated_bytes)
+                                                   allocated_bytes,
+                                                   before_fraction)
         fraction_budget = kv_cache_max_memory
         drafter_reserve = self._get_context_kv_only_drafter_reserve(fraction)
         if drafter_reserve > 0:
@@ -2565,6 +2566,8 @@ class KvCacheCreator:
                     f"{cap_at_floor} tokens and reserve "
                     f"{additional_reserve} additional bytes on this rank.")
 
+        before_limits = kv_cache_max_memory
+
         # NOTE:
         # For KVCacheManager, KvCacheCreator currently controls capacity using two parameters in KVCacheConfig:
         #   • max_tokens
@@ -2628,7 +2631,9 @@ class KvCacheCreator:
                 attention=fixed_workspace_reserve,
                 penalty=penalty_workspace_reserve,
                 fraction=fraction,
+                before_fraction=before_fraction,
                 fraction_budget=fraction_budget,
+                before_limits=before_limits,
                 drafter=drafter_reserve,
                 indexer=indexer_reserve,
                 context_mla=workspace_reserve,
