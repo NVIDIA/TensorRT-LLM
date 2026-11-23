@@ -611,11 +611,13 @@ def test_retention_duration_rejected_with_reuse_under_agg_helix(
             types.SimpleNamespace(pipeline_transfer_enabled=False) if has_transceiver else None
         ),
         _validate_token_id_range=Mock(),
+        _validate_embedding_bias=Mock(),
         sampler=Mock(),
         model_engine=None,
         _validate_request_budget=Mock(),
     )
     request = types.SimpleNamespace(
+        raise_if_validation_failed=Mock(),
         kv_cache_retention_config=retention,
         py_disaggregated_params=None,
         sampling_config=None,
