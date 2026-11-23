@@ -113,7 +113,6 @@ llm = LLM("/path/to/target_model", speculative_config=speculative_config, disabl
 MTP is supported by DeepSeek models and other architectures that ship native MTP modules, including Qwen3.8 MoE, Qwen3.5 MoE, and Step-3.x. MTP can be tuned with the following configuration options:
 
 * `max_draft_len`: Maximum draft candidate length.
-* `num_nextn_predict_layers`: Number of MTP modules to use. Currently must match `max_draft_len`.
 * `use_relaxed_acceptance_for_thinking`: If true, use relaxed decoding for reasoning models in the thinking phase. In this mode, speculation requirements are relaxed for the thinking phase - a draft token may be accepted if it appears in a candidate set constructed with `relaxed_topk` and `relaxed_delta`.
 * `relaxed_topk`: The top K tokens are sampled from the target model's logits to create the initial candidate set for relaxed decoding.
 * `relaxed_delta`: Used to further filter the top K candidate set for relaxed decoding. We remove tokens `t` for which `log(P(top 1 token)) - log(P(t)) > relaxed_delta`.
@@ -125,6 +124,14 @@ speculative_config = MTPDecodingConfig(max_draft_len=3)
 
 llm = LLM("/path/to/deepseek_model", speculative_config=speculative_config)
 ```
+
+The number of MTP layers is read from the checkpoint, rather than selected with
+`num_nextn_predict_layers`. That input name is deprecated: when supplied, it acts
+as an alias for `max_draft_len` unless `max_draft_len` is already set. Single-head
+MTP-Eagle can reuse its MTP layer for multiple draft steps. Vanilla MTP caps the
+requested `max_draft_len` at the number of available checkpoint heads. When
+`max_draft_len` is omitted, vanilla MTP uses all checkpoint heads and MTP-Eagle
+uses one draft step.
 
 MTP can be combined with the [Suffix Automaton enhancement](#suffix-automaton-sa-enhancement) for improved acceptance rates on repetitive content. See the SA section below for details.
 
