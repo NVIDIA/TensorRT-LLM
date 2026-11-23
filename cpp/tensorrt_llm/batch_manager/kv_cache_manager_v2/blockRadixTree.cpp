@@ -820,12 +820,78 @@ Block* findChildByTokens(
 
 } // namespace
 
-std::vector<BlockRadixTree::MatchResult> BlockRadixTree::matchTokenPath(
-    ReuseScope const& reuseScope, TokenSpan tokens, bool knownNoDigest, bool enablePartialMatch) const
+std::vector<BlockRadixTree::MatchResult> BlockRadixTree::matchTokenPath(ReuseScope const& reuseScope, TokenSpan tokens,
+    bool knownNoDigest, bool enablePartialMatch,
+    TypedVec<LifeCycleId, std::vector<HalfOpenRange<int>>>* optionalEndpointRanges) const
 {
     // Read-only: probeReuse() runs this under a shared lock, so probes may overlap. A root still
     // awaiting erasure is childless, so it yields no match.
     std::vector<MatchResult> results;
+
+    struct OptionalMatchState
+    {
+        LifeCycleId group;
+        AttnLifeCycle const* attention;
+        int lastMissing = -1;
+        bool missingSink = false;
+    };
+
+    std::vector<OptionalMatchState> optionalStates;
+    if (optionalEndpointRanges)
+    {
+        for (auto const& [group, attention] : mLifeCycles.attentionLifeCycles())
+        {
+            if (attention->reusePolicy == ReusePolicy::OPTIONAL && attention->windowSize)
+                optionalStates.push_back({group, attention});
+        }
+        if (!optionalStates.empty())
+            optionalEndpointRanges->resize(mLifeCycles.size());
+    }
+    auto appendRange = [](std::vector<HalfOpenRange<int>>& ranges, int beg, int end)
+    {
+        // The forward walk emits half-open ranges in increasing endpoint order.
+        if (!ranges.empty() && beg <= ranges.back().end)
+        {
+            ranges.back().end = std::max(ranges.back().end, end);
+        }
+        else
+        {
+            ranges.emplace_back(beg, end);
+        }
+    };
+    auto appendMatch = [&](Block* block, int count)
+    {
+        int const ordinal = static_cast<int>(results.size());
+        results.push_back({block, count});
+        int const start = ordinal * mTokensPerBlock;
+        for (auto& state : optionalStates)
+        {
+            int const coverage = block->pageCoverage(state.group);
+            // Every endpoint in [first, last] has the required preceding pages
+            // and a covered tail. Keep the range until REQUIRED pruning selects P.
+            int const first = std::max(start + 1,
+                state.lastMissing < 0 ? 1
+                                      : (state.lastMissing + 1) * mTokensPerBlock + *state.attention->windowSize - 1);
+            int const last = start + std::min(count, coverage);
+            auto& ranges = (*optionalEndpointRanges)[state.group];
+            if (!state.missingSink && first <= last)
+            {
+                appendRange(ranges, first, last + 1);
+            }
+            if (coverage < mTokensPerBlock)
+            {
+                state.lastMissing = ordinal;
+                state.missingSink = state.missingSink || ordinal < state.attention->numSinkBlocks;
+                // A window of one needs no historical tail at a block boundary.
+                int const end = start + count;
+                if (count == mTokensPerBlock && !state.missingSink
+                    && state.lastMissing < state.attention->getStaleRange(end, mTokensPerBlock).end.value())
+                {
+                    appendRange(ranges, end, end + 1);
+                }
+            }
+        }
+    };
 
     BlockKey const rootKey = RootBlock::makeKey(reuseScope);
     auto rootIt = mRoots.find(rootKey);
@@ -866,7 +932,7 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::matchTokenPath(
             missed = true;
             break;
         }
-        results.push_back({block, static_cast<int>(end - beg)});
+        appendMatch(block, static_cast<int>(end - beg));
         current = block;
     }
 
@@ -876,7 +942,7 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::matchTokenPath(
         auto [best, bestMatch]
             = findBestPartialMatchInNextNodes(current->next, tokens.begin() + missedRange.beg, missedRange.length());
         if (best)
-            results.push_back({best, bestMatch});
+            appendMatch(best, bestMatch);
     }
 
     return results;
@@ -1002,10 +1068,13 @@ void backOffMatch(std::vector<BlockRadixTree::MatchResult>& matched, int backoff
 }
 } // namespace
 
-BlockRadixTree::ReuseMatch BlockRadixTree::match(
-    ReuseScope const& reuseScope, TokenSpan tokens, bool knownNoDigest, bool enablePartialMatch, int backoff) const
+BlockRadixTree::ReuseMatch BlockRadixTree::match(ReuseScope const& reuseScope, TokenSpan tokens, bool knownNoDigest,
+    bool enablePartialMatch, int backoff, bool collectOptionalMatches) const
 {
-    auto rawMatched = matchTokenPath(reuseScope, tokens, knownNoDigest, enablePartialMatch);
+    ReuseMatch result{};
+    TypedVec<LifeCycleId, std::vector<HalfOpenRange<int>>> optionalEndpointRanges;
+    auto rawMatched = matchTokenPath(reuseScope, tokens, knownNoDigest, enablePartialMatch,
+        collectOptionalMatches ? &optionalEndpointRanges : nullptr);
     // Content-divergence depth is measured before page or recurrent-snapshot pruning.
     int const numReusableTokensBeforePruning = numMatchedTokens(rawMatched, mTokensPerBlock);
     auto const ssmLcId = mLifeCycles.requiredSsmLifeCycleId();
@@ -1024,11 +1093,22 @@ BlockRadixTree::ReuseMatch BlockRadixTree::match(
         numReusableTokensBeforeHybridPruning = numMatchedTokens(pruneMatch(rawMatched, std::nullopt), mTokensPerBlock);
     }
     auto matched = pruneMatch(std::move(rawMatched), ssmLcId);
-    ReuseMatch result{};
     result.numTokens = numMatchedTokens(matched, mTokensPerBlock);
     result.numLookupTokens = static_cast<int>(tokens.size());
     result.numReusableTokensBeforeHybridPruning = numReusableTokensBeforeHybridPruning.value_or(result.numTokens);
     result.numReusableTokensBeforePruning = numReusableTokensBeforePruning;
+    // REQUIRED coverage/backoff can shorten the path inside a page. Clip the
+    // already validated ranges without another page-coverage search.
+    result.optionalEndpointRanges.resize(optionalEndpointRanges.size());
+    for (LifeCycleId lc{0}; lc < optionalEndpointRanges.size(); ++lc)
+    {
+        for (auto const& range : optionalEndpointRanges[lc])
+        {
+            if (range.beg > result.numTokens)
+                break;
+            result.optionalEndpointRanges[lc].emplace_back(range.beg, std::min(range.end, result.numTokens + 1));
+        }
+    }
     result.blocks.reserve(BlockOrdinal{static_cast<int>(matched.size())});
     for (auto const& match : matched)
     {

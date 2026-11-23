@@ -520,7 +520,9 @@ def _check_exchange(
 _REPLAY_HIDDEN_SIZE = 128
 _REPLAY_SWA_WINDOW = 4
 _REPLAY_WINDOW = 5
-_REPLAY_MAX_TOKENS = 256
+_ENCODER_REPLAY_WINDOW = 128
+# Both ADP ranks can recover a full cache block plus their uncached suffixes.
+_REPLAY_MAX_TOKENS = 512
 
 
 def _replay_attention(layout: CSA2Layout, mapping: Mapping, layer_idx: int = 0) -> torch.nn.Module:
@@ -854,7 +856,7 @@ def _check_dp_encoder_replay_case(
         )
         requests = []
         try:
-            assert manager._decoder_replay_window == _REPLAY_WINDOW
+            assert manager._decoder_replay_window == _ENCODER_REPLAY_WINDOW
             assert manager._encoder_optional_groups
             metadata = CSA2TrtllmMetadata(
                 max_num_requests=1,
@@ -915,6 +917,7 @@ def _check_dp_encoder_replay_case(
     with pytest.MonkeyPatch.context() as settings, ExitStack() as stack:
         settings.setenv("TRTLLM_V41_DECODER_BOUNDED_REPLAY", "1")
         settings.setenv("TRTLLM_V41_ENCODER_REPLAY", "1")
+        settings.setenv("TRTLLM_V41_BOUNDED_REPLAY_TOKENS", str(_ENCODER_REPLAY_WINDOW))
         actual_case = stack.enter_context(cache(mapping))
         reference_case = stack.enter_context(cache(Mapping()))
         with torch.device("cuda"):
@@ -923,6 +926,7 @@ def _check_dp_encoder_replay_case(
             for actual, expected in zip(attention, reference_attention):
                 expected.load_state_dict(actual.state_dict())
             model = _replay_boundary(attention[1])
+            model.decoder_replay_window = _ENCODER_REPLAY_WINDOW
             model.layers[0].layer_idx = 1
             model.layers = [None, model.layers[0]]
             model.decoder_replay_split = 1
@@ -978,7 +982,7 @@ def _check_dp_encoder_replay_case(
             state = HCState.resolved(
                 encoder[:, None, :], pre_mix=torch.ones(length, 1, 1, device="cuda")
             )
-            kept = min(length, _REPLAY_WINDOW)
+            kept = min(length, _ENCODER_REPLAY_WINDOW)
             decoder_start = start + length - kept
             reference_attention[1].prepare_global_cache(norm(encoder), reference_metadata)
             reference_metadata.seq_lens = torch.tensor([kept], dtype=torch.int32, device="cpu")
@@ -994,7 +998,7 @@ def _check_dp_encoder_replay_case(
             new_positions, new_ids, replay_state = model._enter_bounded_replay(
                 plan, metadata, positions, ids, state
             )
-            expected_counts = [min(count, _REPLAY_WINDOW) for count in counts]
+            expected_counts = [min(count, _ENCODER_REPLAY_WINDOW) for count in counts]
             assert metadata.all_rank_num_tokens == expected_counts
             assert MPI.COMM_WORLD.allgather(replay_state.residual.shape[0]) == expected_counts
             torch.testing.assert_close(new_positions, positions[-kept:], rtol=0, atol=0)
@@ -1042,8 +1046,11 @@ def _check_dp_encoder_replay_case(
         requests = [admit(case, 1742, tokens) for case in (actual_case, reference_case)]
         for request in requests:
             assert request.context_current_position == prefix
-            assert encoder_replay_tokens(request) == (_REPLAY_WINDOW if prefix else 0)
-        expected_counts = [_REPLAY_WINDOW + 5, _REPLAY_WINDOW + 1 if reused_peer else 3]
+            assert encoder_replay_tokens(request) == (_ENCODER_REPLAY_WINDOW if prefix else 0)
+        expected_counts = [
+            _ENCODER_REPLAY_WINDOW + 5,
+            _ENCODER_REPLAY_WINDOW + 1 if reused_peer else 3,
+        ]
         assert (
             MPI.COMM_WORLD.allgather(
                 requests[0].context_chunk_size + encoder_replay_tokens(requests[0])
