@@ -444,7 +444,7 @@ disaggregated workers report the same digest.
 ## Serve with NVIDIA Dynamo
 
 The same recipes run behind the standard [NVIDIA Dynamo](https://github.com/ai-dynamo/dynamo)
-frontend and TensorRT LLM worker (`python3 -m dynamo.frontend` and `python3 -m dynamo.trtllm`),
+frontend and TensorRT LLM worker (`dynamo.frontend` and `dynamo.trtllm`),
 aggregated on one node or disaggregated with a prefill worker on one node and a decode worker on
 a second node. These steps were tested with the `ai-dynamo` and `ai-dynamo-runtime`
 `1.7.0.dev20261101` packages, unmodified; that release pins `tensorrt-llm==1.4.0rc2`, the version
@@ -498,10 +498,10 @@ export DYN_DISCOVERY_BACKEND=file DYN_FILE_KV=<SHARED_DISCOVERY_DIR> DYN_REQUEST
 On one node:
 
 ```bash
-python3 -m dynamo.frontend --http-host 0.0.0.0 --http-port 8000 \
+<DYNAMO_VENV>/bin/python3 -m dynamo.frontend --http-host 0.0.0.0 --http-port 8000 \
   --discovery-backend file --request-plane tcp --reasoning-field-name reasoning_content &
 
-python3 -m dynamo.trtllm --model-path <TARGET_CHECKPOINT> --served-model-name beam-nvfp4 \
+<DYNAMO_VENV>/bin/python3 -m dynamo.trtllm --model-path <TARGET_CHECKPOINT> --served-model-name beam-nvfp4 \
   --extra-engine-args beam-dynamo-aggregated.yaml --disaggregation-mode agg \
   --dyn-reasoning-parser beam --dyn-tool-call-parser beam \
   --custom-jinja-template <TARGET_CHECKPOINT>/chat_template.jinja
@@ -519,19 +519,19 @@ later need etcd discovery instead. Each worker must advertise an address the fro
 
 ```bash
 # first node: prefill worker
-DYN_TCP_RPC_HOST=<FIRST_NODE_ADDRESS> python3 -m dynamo.trtllm --model-path <TARGET_CHECKPOINT> \
+DYN_TCP_RPC_HOST=<FIRST_NODE_ADDRESS> <DYNAMO_VENV>/bin/python3 -m dynamo.trtllm --model-path <TARGET_CHECKPOINT> \
   --served-model-name beam-nvfp4 --extra-engine-args beam-dynamo-disagg-ctx.yaml \
   --disaggregation-mode prefill --dyn-reasoning-parser beam --dyn-tool-call-parser beam \
   --custom-jinja-template <TARGET_CHECKPOINT>/chat_template.jinja &
 
 # second node: decode worker
-DYN_TCP_RPC_HOST=<SECOND_NODE_ADDRESS> python3 -m dynamo.trtllm --model-path <TARGET_CHECKPOINT> \
+DYN_TCP_RPC_HOST=<SECOND_NODE_ADDRESS> <DYNAMO_VENV>/bin/python3 -m dynamo.trtllm --model-path <TARGET_CHECKPOINT> \
   --served-model-name beam-nvfp4 --extra-engine-args beam-dynamo-disagg-gen.yaml \
   --disaggregation-mode decode --dyn-reasoning-parser beam --dyn-tool-call-parser beam \
   --custom-jinja-template <TARGET_CHECKPOINT>/chat_template.jinja
 
 # first node, after both workers are ready: frontend
-DYN_TCP_RESPONSE_STREAM_HOST=<FIRST_NODE_ADDRESS> python3 -m dynamo.frontend \
+DYN_TCP_RESPONSE_STREAM_HOST=<FIRST_NODE_ADDRESS> <DYNAMO_VENV>/bin/python3 -m dynamo.frontend \
   --http-host 0.0.0.0 --http-port 8000 --discovery-backend file --request-plane tcp \
   --reasoning-field-name reasoning_content
 ```
