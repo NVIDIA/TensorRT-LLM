@@ -1641,6 +1641,11 @@ class NoopDisaggCoordinator(DisaggTransferCoordinator):
     def requires_gen_cancellation_consensus(self) -> bool:
         return False
 
+    def agree_pp_handoff_stops(
+        self, cancellations: Set[int], timeouts: Set[int], ready: Set[int]
+    ) -> Tuple[Set[int], Set[int], Set[int]]:
+        return cancellations, timeouts, ready
+
     def align_gen_cancellation(
         self, ready: List[LlmRequest], active: List[LlmRequest], cancel_ids: List[int]
     ) -> Tuple[List[LlmRequest], Set[int], Set[int]]:

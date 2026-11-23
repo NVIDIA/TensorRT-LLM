@@ -584,6 +584,7 @@ def test_executor_loop_pp_transcript_on_first_rank(monkeypatch) -> None:
             ("admit", []),
             ("receive_gen_init", []),
             ("poll_progress_when_idle",),
+            ("handle_timeouts_synced",),
             ("flush_pending_transfer_responses",),
             ("pace_idle",),
         ]
@@ -607,6 +608,7 @@ def test_executor_loop_pp_transcript_on_non_first_rank(monkeypatch) -> None:
             ("revert_deferred_gen_init", [], []),
             ("receive_gen_init", []),
             ("poll_progress_when_idle",),
+            ("handle_timeouts_synced",),
             ("flush_pending_transfer_responses",),
             ("pace_idle",),
         ]

@@ -142,6 +142,7 @@ def executor() -> PyExecutor:
 
 
 def _prepare_fetch(engine: PyExecutor) -> None:
+    engine.enable_iter_perf_stats = False
     engine.control_requests = []
     engine.request_accumulated = []
     engine.is_shutdown = False
