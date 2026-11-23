@@ -94,6 +94,7 @@ def check_llm_args(llm_args: "TorchLlmArgs") -> None:
     # The TLLM_MEM_MONITOR variables are folded into the configuration before this check.
     memory_monitor = llm_args.memory_monitor_config
     memory_monitor_mode = None if memory_monitor is None else memory_monitor.mode
+    rejection_method = getattr(spec_config, "rejection_sample_method", "standard")
     adp_routing = [
         name
         for name in (
@@ -259,6 +260,18 @@ def check_llm_args(llm_args: "TorchLlmArgs") -> None:
                 "no full memory monitor (memory_monitor_config.mode other than 'full', and no "
                 "TLLM_MEM_MONITOR=1), because full mode duplicates the MPI world's communicator to "
                 "gather every rank's report, while each rank is its own MPI world",
+            ),
+            (
+                not llm_args.enable_locality_domains,
+                "no locality domains (enable_locality_domains=False), because the KV cache then "
+                "keeps a pool per domain, while fault tolerance resizes the KV cache's GPU quota "
+                "as one pool",
+            ),
+            (
+                rejection_method == "standard",
+                "token-level rejection sampling (speculative_config.rejection_sample_method="
+                f"'standard', not {rejection_method!r}), because block verification is not tested "
+                "with fault tolerance",
             ),
         ]
     )

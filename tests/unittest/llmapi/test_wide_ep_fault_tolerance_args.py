@@ -33,6 +33,7 @@ from tensorrt_llm.llmapi import LLM, SamplingParams
 from tensorrt_llm.llmapi.llm_args import (
     AttentionDpConfig,
     AutoDecodingConfig,
+    BlockReuseConfig,
     CacheTransceiverConfig,
     ColdPageQuantizationCompressionConfig,
     DFlashDecodingConfig,
@@ -98,6 +99,14 @@ def _args(**fields) -> TorchLlmArgs:
         {"orchestrator_type": "ray"},
         # The default memory monitor reports out-of-memory errors on each rank on its own.
         {"memory_monitor_config": MemoryMonitorConfig(mode="oom")},
+        # A replacement rank starts with an empty reuse state, as after a conversation's drop.
+        {
+            "kv_cache_config": KvCacheConfig(
+                block_reuse_config=BlockReuseConfig(
+                    policy="per_conversation", drop_extended_turns=True
+                )
+            )
+        },
         # Without fault tolerance, nothing is checked.
         {
             "enable_wide_ep_fault_tolerance": False,
@@ -265,6 +274,21 @@ def test_supported_configuration_is_accepted(fields):
         (
             {"memory_monitor_config": MemoryMonitorConfig(mode="full")},
             "no full memory monitor (memory_monitor_config.mode other than 'full'",
+        ),
+        (
+            {"enable_locality_domains": True},
+            "no locality domains (enable_locality_domains=False), because the KV cache",
+        ),
+        (
+            {
+                "speculative_config": MTPDecodingConfig(
+                    max_draft_len=1,
+                    use_mtp_vanilla=True,
+                    use_rejection_sampling=True,
+                    rejection_sample_method="block",
+                )
+            },
+            "token-level rejection sampling (speculative_config.rejection_sample_method='standard'",
         ),
     ],
 )
