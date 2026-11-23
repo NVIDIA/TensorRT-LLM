@@ -16,8 +16,8 @@ In a 901-frame Cosmos3 generation run on one B200, decoding video latents into p
 - [Methodology](#methodology)
 - [Results](#results)
 - [Numerical accuracy of Winograd and Fourier convolution](#numerical-accuracy-of-winograd-and-fourier-convolution)
+- [Benchmark and measurement notes](#benchmark-and-measurement-notes)
 - [Conclusions](#conclusions)
-- [Availability and data](#availability-and-data)
 
 ## Motivation and decoder architecture
 
@@ -792,6 +792,12 @@ Figure 19 compares these decompositions on matched synthetic spatial 3 × 3 conv
 
 For the same 4 × 4 output, Fourier68 used 68 real products to direct convolution’s 144. Both had about 13.4% relative-L2 error. Spatial F4 used only 36 products, but even with optimized points its error was about 64%. A GPU implementation would also pay for the transforms, the additions in each complex product, and memory traffic. GPU latency and trained-VAE accuracy for Fourier68 remain open questions. The [measurement notes](../media/tech_blog31/measurement_notes.md#nvfp4-decomposition-comparison) specify the test dimensions and quantizer.
 
+## Benchmark and measurement notes
+
+TensorRT-LLM includes WinoVAE and the direct NVFP4 Wan VAE decoder. The [Wan VAE benchmark](https://github.com/NVIDIA/TensorRT-LLM/blob/6ef751b774349785036cecd4a8632d5effb9a39d/benchmarks/visual_gen/bench_wan_vae.py) landed with WinoVAE in [PR #21576](https://github.com/NVIDIA/TensorRT-LLM/pull/21576). The reported GPU timings and Cosmos3 accuracy measurements predate that merge. The NVFP4 Winograd and Fourier results come from single-convolution simulations.
+
+The [measurement notes](../media/tech_blog31/measurement_notes.md) give the hardware, weights, and timing procedure for each experiment, with the recorded values and instructions for regenerating the figures.
+
 ## Conclusions
 
 <a id="figure-20"></a>
@@ -809,9 +815,3 @@ On one B300, decode fell from 4.63 to 1.26 seconds even as convolution’s share
 FP16 storage and the selected spatial coefficients kept trained-model error near the BF16 baselines on the tested clip. Fusing the transforms where intermediate traffic dominates made Winograd practical at the final decoder level, and Fused GPUDirect P2P cut the cost of exchanging borders across GPUs. At four bits, reconstruction error remains the limit for the Winograd point sets we tested. Fourier filtering reached the direct NVFP4 error range in the single-convolution simulation.
 
 For 189-frame 720p video, WinoVAE sped up decode by **3.69× on GB200** and **2.93× on H200**, and encode by **2.65× on H200**. In the trained Sim-Bimanual workload on B300, with an already-fused baseline and eager VAE execution, generation time fell from **20.5 to 16.5 seconds (19.5%)**.
-
-## Availability and data
-
-TensorRT-LLM provides both WinoVAE and a direct NVFP4 Wan VAE decoder. WinoVAE and the [Wan VAE benchmark](https://github.com/NVIDIA/TensorRT-LLM/blob/6ef751b774349785036cecd4a8632d5effb9a39d/benchmarks/visual_gen/bench_wan_vae.py) merged into `main` in [PR #21576](https://github.com/NVIDIA/TensorRT-LLM/pull/21576). We measured WinoVAE latency and Cosmos3 accuracy before the merge. NVFP4 Winograd and Fourier filtering have only been evaluated in single-convolution simulations in this study.
-
-The [measurement notes](../media/tech_blog31/measurement_notes.md) record the separate experimental setups, numerical methods, and reproduction limits. [data.json](../media/tech_blog31/data.json) contains the recorded figure values. [plot.py](../media/tech_blog31/plot.py) and its [overview figure module](../media/tech_blog31/overview_plots.py) regenerate the figures with Matplotlib and NumPy. They do not rerun the experiments.

@@ -139,10 +139,10 @@ The direct [NVFP4 Wan VAE implementation](https://github.com/NVIDIA/TensorRT-LLM
 
 ## Reproducing the figures
 
-From the repository root, with Matplotlib and NumPy installed:
+The [plotting script](plot.py) reads the [recorded figure values](data.json) and imports the [workload and architecture plots](overview_plots.py). With Matplotlib and NumPy installed, run the script from the repository root.
 
 ```bash
 python docs/source/blogs/media/tech_blog31/plot.py
 ```
 
-This regenerates SVG and PNG figures from recorded data, including the workload and architecture figures implemented in `overview_plots.py`. It does not rerun GPU benchmarks or numerical searches. Numerical replay used NumPy 2.5.4 and SciPy 1.18.1. Fixed-candidate F4 and FP8/MXFP8 replays matched saved scalar results. This replay verification covers fixed candidates, excluding the continuous searches and the larger F6/F8 sweeps.
+This regenerates the SVG and PNG figures from the saved results. Numerical replay used NumPy 2.5.4 and SciPy 1.18.1. Fixed-candidate F4 and FP8/MXFP8 replays matched saved scalar results. This replay verification covers fixed candidates, excluding the continuous searches and the larger F6/F8 sweeps.
