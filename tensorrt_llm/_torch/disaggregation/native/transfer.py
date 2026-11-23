@@ -3661,11 +3661,9 @@ class Receiver(ReceiverBase):
                             "retry the request and verify matching internal_request_auth_key values"
                         )
             except TimeoutError as error:
-                # A context peer with a key drops a request that is unsigned or
-                # signed with another key, so a key mismatch also ends here.
                 raise RankInfoAuthenticationError(
-                    "RankInfo exchange timed out; retry the request and verify peer availability "
-                    "and that communicating peers use the same internal_request_auth_key"
+                    f"RankInfo exchange with context peer at '{info_endpoint}' timed out; "
+                    "retry the request and verify peer availability"
                 ) from error
             except FrameAuthenticationError as error:
                 raise RankInfoAuthenticationError(
@@ -4825,7 +4823,11 @@ class RankInfoServer:
                     logger.error(f"Instance info server received unknown message type: {msg[0]}")
             return True
 
-        self._messenger.start_listener(handle_message)
+        # A request that fails verification is answered with a challenge that
+        # carries no nonce, so its sender fails without waiting for a timeout.
+        self._messenger.start_listener(
+            handle_message, rejection_reply=[MessageType.AUTHENTICATION_CHALLENGE]
+        )
 
     def _handle_rank_info_request(self, send_id: bytes, message: list[bytes]):
         if self._rank_info_auth_key is None:

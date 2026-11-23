@@ -55,11 +55,11 @@ def test_frame_signer_only_when_key_configured() -> None:
         )
 
 
-def _make_receiver(master_key: Optional[bytes], timeout_s: float = 5.0) -> Receiver:
+def _make_receiver(master_key: Optional[bytes]) -> Receiver:
     receiver = Receiver.__new__(Receiver)
     receiver._sessions_lock = threading.Lock()
     receiver._shutdown = True
-    receiver._rank_info_timeout_s = timeout_s
+    receiver._rank_info_timeout_s = 5.0
     receiver._rank_info_auth_key = _make_rank_info_auth_key(master_key)
     receiver._frame_signer = _make_native_frame_signer(master_key)
     receiver._messenger = Mock(endpoint=_RECEIVER_ENDPOINT)
@@ -107,9 +107,10 @@ def test_rank_info_exchange_over_real_sockets(master_key: Optional[bytes]) -> No
 @pytest.mark.parametrize(
     "receiver_key, server_key, match, server_drops",
     [
-        # The signed server drops the frames; the receiver times out.
-        (_OTHER_MASTER_KEY, _MASTER_KEY, "RankInfo exchange timed out", 1),
-        (None, _MASTER_KEY, "RankInfo exchange timed out", 1),
+        # The signed server drops the request and answers with an unsigned
+        # challenge that carries no nonce.
+        (_OTHER_MASTER_KEY, _MASTER_KEY, "failed control-plane authentication", 1),
+        (None, _MASTER_KEY, "requires RankInfo authentication", 1),
         # The unsigned reply fails verification on the signed receiver.
         (_MASTER_KEY, None, "failed control-plane authentication", 0),
     ],
@@ -118,12 +119,12 @@ def test_rank_info_exchange_over_real_sockets(master_key: Optional[bytes]) -> No
 def test_rank_info_exchange_rejects_key_mismatch(
     receiver_key: Optional[bytes], server_key: Optional[bytes], match: str, server_drops: int
 ) -> None:
-    receiver = _make_receiver(receiver_key, timeout_s=0.5)
+    receiver = _make_receiver(receiver_key)
     with _rank_info_server(server_key) as server:
         receiver._extract_info_endpoint = Mock(return_value=server.endpoint)
         with pytest.raises(RankInfoAuthenticationError, match=match):
             receiver._get_sender_info(Mock())
-        assert _wait_for_auth_failures(server, server_drops) == server_drops
+        assert server._messenger.auth_failures == server_drops
     assert not receiver._incompatible_peers
 
 

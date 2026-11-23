@@ -504,7 +504,18 @@ class ZMQMessenger(MessengerInterface):
         self,
         on_message: Callable[[list[bytes]], Optional[bool]],
         on_error: Optional[Callable[[Exception], None]] = None,
+        rejection_reply: Optional[list[bytes]] = None,
     ) -> None:
+        """Start a listener thread to handle incoming messages.
+
+        Args:
+            on_message: Called with each received message; returning False
+                stops the listener.
+            on_error: Called with an exception that stops the listener.
+            rejection_reply: Frames a signed ROUTER sends, unsigned, to the
+                sender of a message that fails verification. None sends
+                nothing.
+        """
         assert self._mode in ["ROUTER", "REP"], (
             "Listener can only be started in ROUTER or REP modes"
         )
@@ -531,10 +542,14 @@ class ZMQMessenger(MessengerInterface):
                     if self._control_socket in events:
                         self._stop_event.set()
                     elif self._socket in events:
+                        frames = self._socket.recv_multipart()
                         try:
-                            messages = self.receive()
+                            messages = frames if self._signer is None else self._verify(frames)
                         except FrameAuthenticationError as e:
                             self._record_auth_failure(e)
+                            if rejection_reply is not None:
+                                with self._send_lock:
+                                    self._socket.send_multipart([frames[0], *rejection_reply])
                             continue
                         persist = on_message(messages)
                         if persist is False:
