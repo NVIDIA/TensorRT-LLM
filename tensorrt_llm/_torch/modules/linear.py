@@ -11,7 +11,8 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import ClassVar, Dict, List, Optional, Sequence, Tuple, Union
+from typing import (ClassVar, Dict, List, Literal, Optional, Sequence, Tuple,
+                    Union)
 
 import torch
 import torch.nn.functional as F
@@ -46,6 +47,7 @@ from ...models.modeling_utils import QuantConfig
 from ..autotuner import AutoTuner
 from ..cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
                               IS_CUTLASS_DSL_RUBIN_AVAILABLE)
+from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..kernels.fused_ops.fp8_static_quant import fp8_static_quant
 from ..locality_domain.layout import (make_bf16_linear_output_layout,
                                       make_nvfp4_linear_output_layout)
@@ -1304,12 +1306,14 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
 class W8A16FP8LinearMethod(FP8QDQLinearMethod):
     """W8A16 FP8 linear using on-the-fly weight dequantization.
 
-    Same weights, scales and loading as ``FP8QDQLinearMethod`` -- only the way
-    they are consumed differs, so everything but ``apply`` is inherited. The
-    activation is left in its 16-bit dtype and the weight is brought up to
-    meet it, which makes ``input_scale`` unused here.
+    Uses the weights and scales of ``FP8QDQLinearMethod`` and leaves the
+    activation in its 16-bit dtype.
 
-    Holds no state; one instance can serve every Linear in a model.
+    Args:
+        backend: ``"torch"`` dequantizes weights before the GEMM.
+            ``"flashinfer"`` selects the fused GEMM on supported CUDA devices
+            with contiguous operands. FlashInfer applies the FP32 weight
+            scale after accumulation, which changes rounding.
     """
 
     SUPPORTED_ACTIVATION_DTYPES: ClassVar[Tuple[torch.dtype,
@@ -1318,8 +1322,14 @@ class W8A16FP8LinearMethod(FP8QDQLinearMethod):
 
     requires_unquantized_activation: ClassVar[bool] = True
 
+    def __init__(self,
+                 backend: Literal["torch", "flashinfer"] = "torch") -> None:
+        if backend not in ("torch", "flashinfer"):
+            raise ValueError(f"Unknown W8A16 FP8 backend: {backend!r}")
+        self.backend = backend
+
     def apply(self, module: Linear, input: torch.Tensor,
-              bias: Optional[torch.Tensor]):
+              bias: Optional[torch.Tensor]) -> torch.Tensor:
         if module.weight.dtype != torch.float8_e4m3fn:
             raise RuntimeError(
                 f"W8A16FP8LinearMethod requires float8_e4m3fn weights, got "
@@ -1329,6 +1339,17 @@ class W8A16FP8LinearMethod(FP8QDQLinearMethod):
             raise RuntimeError(
                 f"W8A16FP8LinearMethod requires a 16-bit activation, got "
                 f"{input.dtype}.")
+
+        if (self.backend == "flashinfer" and IS_FLASHINFER_AVAILABLE
+                and IS_CUTLASS_DSL_AVAILABLE and input.is_cuda
+                and input.is_contiguous() and module.weight.is_contiguous()
+                and (bias is None or bias.is_contiguous())):
+            from flashinfer.gemm import mm_bf16_fp8
+
+            major, minor = torch.cuda.get_device_capability(input.device)
+            if mm_bf16_fp8.is_compute_capability_supported(major * 10 + minor):
+                return torch.ops.trtllm.flashinfer_w8a16_fp8_gemm(
+                    input, module.weight, module.weight_scale, bias)
 
         # In place: .to() always copies here (the checks above guarantee the
         # dtypes differ), so only one 16-bit copy of the weight is alive.

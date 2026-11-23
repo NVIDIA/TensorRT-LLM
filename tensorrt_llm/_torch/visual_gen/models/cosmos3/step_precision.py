@@ -164,9 +164,7 @@ class StepPrecisionController:
         self.first_steps = first_steps
         self.last_steps = last_steps
         self.high_precision = False
-        # One shared instance serves every Linear: these methods hold no
-        # state, weights live on the module and are passed to apply().
-        self._a16_method = W8A16FP8LinearMethod()
+        self._a16_method = W8A16FP8LinearMethod(backend="torch")
         # (module, its own FP8 method) for the projections this controller
         # steers. The FP8 instance is kept rather than rebuilt so restoring is
         # exact for anything that compares identity.
