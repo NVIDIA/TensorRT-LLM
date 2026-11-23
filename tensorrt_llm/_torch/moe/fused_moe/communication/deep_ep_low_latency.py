@@ -27,7 +27,7 @@ import torch
 
 from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
 from tensorrt_llm._torch.moe.fused_moe.deep_ep_utils import buffer_pool, deep_ep_installed
-from tensorrt_llm._utils import is_sm_120f
+from tensorrt_llm._utils import is_sm_120f, mpi_disabled
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -69,6 +69,11 @@ class DeepEPLowLatency(Communication):
         use_low_precision_combine: bool = False,
         moe_max_num_tokens: Optional[int] = None,
     ):
+        if mpi_disabled():
+            raise RuntimeError(
+                "DeepEPLowLatency requires MPI bootstrap and does not support the Ray orchestrator. "
+                "Use an MPI orchestrator or a different MoE communication strategy."
+            )
         super().__init__(mapping)
 
         # Validate hidden_size against kernel constraints

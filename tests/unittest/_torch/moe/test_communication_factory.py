@@ -25,6 +25,8 @@ from packaging.version import Version
 
 from tensorrt_llm._torch.moe.fused_moe import moe_comm_timeout_guard, nccl_ep_utils
 from tensorrt_llm._torch.moe.fused_moe.communication import communication_factory
+from tensorrt_llm._torch.moe.fused_moe.communication import deep_ep as deep_ep_module
+from tensorrt_llm._torch.moe.fused_moe.communication import deep_ep_low_latency as deep_ep_ll_module
 from tensorrt_llm._torch.moe.fused_moe.communication import nvlink_one_sided as one_sided_module
 from tensorrt_llm._torch.moe.fused_moe.communication import nvlink_two_sided as two_sided_module
 from tensorrt_llm._torch.moe.fused_moe.communication.allgather_reducescatter import (
@@ -65,6 +67,119 @@ def _make_model_config(
 
 def _strategy_unavailable(*args, **kwargs):
     raise RuntimeError("strategy unavailable")
+
+
+@pytest.fixture
+def deep_ep_buffers(monkeypatch: pytest.MonkeyPatch) -> tuple[Mock, Mock]:
+    """Isolate native allocation while retaining real strategy construction."""
+    monkeypatch.delenv("TRTLLM_FORCE_COMM_METHOD", raising=False)
+    monkeypatch.setenv("TRTLLM_CAN_USE_DEEP_EP", "1")
+    monkeypatch.setattr(deep_ep_module.DeepEP, "is_platform_supported", staticmethod(lambda: True))
+    monkeypatch.setattr(
+        deep_ep_ll_module.DeepEPLowLatency, "is_platform_supported", staticmethod(lambda: True)
+    )
+    monkeypatch.setattr(deep_ep_module, "local_mpi_size", lambda: 2)
+    normal = Mock(return_value=Mock())
+    low_latency = Mock(return_value=Mock())
+    monkeypatch.setattr(deep_ep_module.buffer_pool, "get_buffer", normal)
+    monkeypatch.setattr(deep_ep_ll_module.buffer_pool, "get_low_latency_buffer", low_latency)
+    # The low-latency constructor normally configures this process-wide setting.
+    monkeypatch.setenv("NVSHMEM_QP_DEPTH", "128")
+    return normal, low_latency
+
+
+@pytest.mark.parametrize("low_latency", [False, True])
+def test_deep_ep_rejects_ray_before_buffer_allocation(
+    monkeypatch: pytest.MonkeyPatch,
+    deep_ep_buffers: tuple[Mock, Mock],
+    low_latency: bool,
+) -> None:
+    monkeypatch.setenv("TLLM_DISABLE_MPI", "1")
+    monkeypatch.setattr(deep_ep_module, "local_mpi_size", lambda: 1)
+
+    with pytest.raises(RuntimeError, match="requires MPI.*Ray"):
+        if low_latency:
+            deep_ep_ll_module.DeepEPLowLatency(
+                _make_model_config().mapping,
+                num_slots=32,
+                hidden_size=4096,
+                weight_dtype=torch.bfloat16,
+                quant_config=None,
+                moe_max_num_tokens=1024,
+            )
+        else:
+            deep_ep_module.DeepEP(
+                _make_model_config().mapping,
+                num_slots=32,
+                hidden_size=4096,
+                weight_dtype=torch.bfloat16,
+                quant_config=None,
+            )
+
+    for allocate in deep_ep_buffers:
+        allocate.assert_not_called()
+
+
+@pytest.mark.parametrize("method", ["DEEPEP", "DEEPEPLOWLATENCY"])
+def test_forced_deep_ep_surfaces_ray_bootstrap_reason(
+    monkeypatch: pytest.MonkeyPatch, deep_ep_buffers: tuple[Mock, Mock], method: str
+) -> None:
+    monkeypatch.setenv("TLLM_DISABLE_MPI", "1")
+    monkeypatch.setenv("TRTLLM_FORCE_COMM_METHOD", method)
+    monkeypatch.setattr(deep_ep_module, "local_mpi_size", lambda: 1)
+
+    with pytest.raises(RuntimeError, match="requires MPI.*Ray"):
+        communication_factory.CommunicationFactory.create_strategy(
+            _make_model_config(),
+            num_experts=32,
+            num_slots=32,
+            top_k=8,
+            expert_size_per_partition=16,
+        )
+
+    for allocate in deep_ep_buffers:
+        allocate.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "mpi_enabled,normal_feasible", [(False, False), (True, True), (True, False)]
+)
+def test_deep_ep_auto_selection_respects_mpi_bootstrap(
+    monkeypatch: pytest.MonkeyPatch,
+    deep_ep_buffers: tuple[Mock, Mock],
+    mpi_enabled: bool,
+    normal_feasible: bool,
+) -> None:
+    monkeypatch.setenv("TLLM_DISABLE_MPI", "0" if mpi_enabled else "1")
+    monkeypatch.setattr(deep_ep_module, "local_mpi_size", lambda: 2 if normal_feasible else 1)
+    monkeypatch.setattr(communication_factory, "NVLinkOneSided", _strategy_unavailable)
+    monkeypatch.setattr(communication_factory, "NVLinkTwoSided", _strategy_unavailable)
+    monkeypatch.setattr(
+        communication_factory.CommunicationFactory,
+        "_get_nccl_ep_unavailable_reason",
+        lambda *args: "NCCL-EP unavailable",
+    )
+
+    strategy = communication_factory.CommunicationFactory.create_strategy(
+        _make_model_config(),
+        num_experts=32,
+        num_slots=32,
+        top_k=8,
+        expert_size_per_partition=16,
+    )
+
+    if not mpi_enabled:
+        assert isinstance(strategy, AllGatherReduceScatter)
+        for allocate in deep_ep_buffers:
+            allocate.assert_not_called()
+    elif normal_feasible:
+        assert isinstance(strategy, deep_ep_module.DeepEP)
+        deep_ep_buffers[0].assert_called_once()
+        deep_ep_buffers[1].assert_not_called()
+    else:
+        assert isinstance(strategy, deep_ep_ll_module.DeepEPLowLatency)
+        deep_ep_buffers[0].assert_not_called()
+        deep_ep_buffers[1].assert_called_once()
 
 
 def _mock_nccl_ep_v02(monkeypatch: pytest.MonkeyPatch) -> None:

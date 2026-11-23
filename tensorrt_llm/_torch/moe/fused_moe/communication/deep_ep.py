@@ -27,7 +27,7 @@ import torch
 
 from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
 from tensorrt_llm._torch.moe.fused_moe.deep_ep_utils import buffer_pool, deep_ep_installed
-from tensorrt_llm._utils import local_mpi_size
+from tensorrt_llm._utils import local_mpi_size, mpi_disabled
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -55,6 +55,11 @@ class DeepEP(Communication):
         expert_size_per_partition: int = 0,
         use_cuda_graph: bool = False,
     ):
+        if mpi_disabled():
+            raise RuntimeError(
+                "DeepEP requires MPI bootstrap and does not support the Ray orchestrator. "
+                "Use an MPI orchestrator or a different MoE communication strategy."
+            )
         super().__init__(mapping)
 
         # Check if DeepEP is feasible for the given number of ranks
