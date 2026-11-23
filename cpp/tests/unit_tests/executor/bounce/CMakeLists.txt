@@ -50,6 +50,16 @@ add_tllm_gtest(
   tllm::executor_bounce_core
   LABELS
   "unit;executor;bounce;host")
+add_tllm_gtest(
+  bounceFailedRequestTest
+  OWNER
+  executor
+  SOURCES
+  bounceFailedRequestTest.cpp
+  LINK_LIBRARIES
+  tllm::executor_bounce_core
+  LABELS
+  "unit;executor;bounce;host")
 # Header-only: knob resolution (agent_bounce_params dict > TRTLLM_NIXL_BOUNCE_*
 # env > default), byte-size suffixes, garbage fallback, derived-timeout
 # invariants.
@@ -141,6 +151,7 @@ if(NIXL_ROOT)
         ${BOUNCE_DIR}/BuddyAllocator.cpp
         ${BOUNCE_DIR}/CreditScheduler.cpp
         ${BOUNCE_DIR}/BounceMessage.cpp
+        ${BOUNCE_DIR}/BounceResult.cpp
         ${BOUNCE_DIR}/BounceArena.cpp
         ${BOUNCE_DIR}/ExecPool.cpp
         ${BOUNCE_DIR}/GatherScatterKernel.cu
@@ -150,11 +161,20 @@ if(NIXL_ROOT)
                          ${NIXL_BUILD_LIBRARY} PkgConfig::TLLM_BOUNCE_ZMQ)
 
     # One reactor test target: the bounce sources compiled in, plus the shared
-    # include/link sets.
+    # include/link sets. Each test case gets a 300 s ctest timeout (each takes
+    # seconds), so a test that hangs (e.g. on a closed stream gate) fails under
+    # its own name within minutes instead of at the stage's time limit.
     function(add_bounce_reactor_test name src)
       cmake_parse_arguments(ARG "INSTRUMENTED" "" "" ${ARGN})
-      add_tllm_gtest(${name} SOURCES ${src} FULL_STACK LABELS
-                     "unit;full-stack;gpu")
+      add_tllm_gtest(
+        ${name}
+        SOURCES
+        ${src}
+        FULL_STACK
+        TIMEOUT
+        300
+        LABELS
+        "unit;full-stack;gpu")
       if(ARG_INSTRUMENTED)
         target_sources(${name} PRIVATE ${BOUNCE_TSAN_SRCS})
       else()
