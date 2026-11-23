@@ -210,6 +210,17 @@ def _swa_cache_window(
     return swa_window
 
 
+def _draft_retention_window(
+    window: int | None, swa_window: int, replay_window: int, reserve: int
+) -> int | None:
+    """Let bounded draft pages share the decoder's PRIVATE lifecycle."""
+    if window is None or not replay_window:
+        return window
+    # Physical retention may exceed the drafter's attention window. Matching
+    # the decoder avoids a separate pool and independent page retirements.
+    return max(window, max(swa_window, replay_window + 1) + reserve)
+
+
 def _cache_size_layer_components(
     layout: CSA2Layout,
     layers: Sequence[int],
@@ -795,7 +806,15 @@ class CSA2CacheManager(KVCacheManagerV2):
         )
         specs = getattr(self, "_draft_layer_specs", ())
         sizes.extend(spec.bytes_per_token() for spec in specs)
-        windows.extend(spec.sliding_window_size for spec in specs)
+        windows.extend(
+            _draft_retention_window(
+                spec.sliding_window_size,
+                self.layout.window_size,
+                self._decoder_replay_window,
+                self.max_draft_len + self.reuse_match_backoff,
+            )
+            for spec in specs
+        )
         groups.extend(spec.reuse_policy.value for spec in specs)
         return sizes, windows, groups
 
@@ -970,7 +989,15 @@ class CSA2CacheManager(KVCacheManagerV2):
             for values, value in (
                 (self.num_kv_heads_per_layer, spec.num_kv_heads),
                 (self.head_dim_per_layer, spec.head_dim),
-                (self.max_attention_window_vec, spec.sliding_window_size),
+                (
+                    self.max_attention_window_vec,
+                    _draft_retention_window(
+                        spec.sliding_window_size,
+                        self.layout.window_size,
+                        self._decoder_replay_window,
+                        self.max_draft_len + self.reuse_match_backoff,
+                    ),
+                ),
             ):
                 values.extend([value] * (local_id + 1 - len(values)))
                 values[local_id] = value
@@ -2010,7 +2037,12 @@ class CSA2CacheManager(KVCacheManagerV2):
         )
         draft_specs = kwargs.get("layer_specs") or ()
         sizes.extend(spec.bytes_per_token() for spec in draft_specs)
-        windows.extend(spec.sliding_window_size for spec in draft_specs)
+        windows.extend(
+            _draft_retention_window(
+                spec.sliding_window_size, layout.window_size, replay_window, reserve
+            )
+            for spec in draft_specs
+        )
         scratch_groups.extend(
             (ReusePolicy.PRIVATE if replay_window else ReusePolicy.REQUIRED).value
             for _ in draft_specs

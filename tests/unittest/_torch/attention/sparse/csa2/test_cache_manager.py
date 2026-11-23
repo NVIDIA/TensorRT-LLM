@@ -340,8 +340,11 @@ def test_embedded_draft_layers_preserve_target_mapping_and_native_transfer(monke
         assert manager.pp_layers == [0, 1]
         assert manager.draft_layer_ids == (2, 3, 4)
         draft_pool = manager.layer_to_pool_mapping_dict[manager.layer_offsets[2]]
-        assert draft_pool not in manager._batch_page_params[:, 0]
-        assert all(base.shape[0] <= draft_pool for base in manager._device_base_rows)
+        decoder_layer = manager._cache_layer_id(1, CSA2CacheRole.SWA)
+        assert draft_pool == manager.layer_to_pool_mapping_dict[decoder_layer]
+        decoder_group = manager.impl.get_layer_group_id(decoder_layer)
+        _, windows = manager._get_runtime_cache_size_layer_components()
+        assert windows[-3:] == [manager._swa_retention(1)] * 3
         requests = manager.add_dummy_requests(
             [42], token_nums=[512], draft_kv_cache_manager=manager
         )
@@ -349,6 +352,8 @@ def test_embedded_draft_layers_preserve_target_mapping_and_native_transfer(monke
         cache = manager.kv_cache_map[42]
         for layer in manager.draft_layer_ids:
             assert manager.get_layer_cache_spec(layer).reuse_policy == ReusePolicy.PRIVATE
+            assert manager.get_layer_cache_spec(layer).sliding_window_size == 129
+            assert manager.impl.get_layer_group_id(manager.layer_offsets[layer]) == decoder_group
             buffer = manager.get_buffers(layer, kv_layout="HND")
             assert buffer.dtype == torch.bfloat16
             assert tuple(buffer.shape[1:]) == (1, 1, 128, 512)
