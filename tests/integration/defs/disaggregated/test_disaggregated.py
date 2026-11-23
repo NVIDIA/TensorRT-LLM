@@ -2604,11 +2604,13 @@ def enforce_aiperf_error_rate(artifact_dir,
     (HTTP 499 / RequestCancellationError) are excluded from both the numerator
     and the denominator — stress tests cancel a fraction of requests on purpose.
 
-    Record schema validated against aiperf==0.8.0 (the pin in
+    Record schema validated against aiperf 0.8.0 and 0.13.0 (the pin in
     requirements-dev.txt): each JSONL line is a MetricRecordInfo object
     ({"metadata", "metrics", "error"}), and both cancellation construction
     sites in aiperf's aiohttp client emit exactly error.code == 499 with
-    error.type == "RequestCancellationError". Reference gate output from the
+    error.type == "RequestCancellationError". The export also holds warmup
+    records (metadata.benchmark_phase == "warmup"); only profiling records
+    are counted. Reference gate output from the
     35000-request DeepSeek R1 FP4 validation run (cancellation_rate=10):
     [aiperf-gate] non-cancellation errors: 0/31561 (0.00%), cancelled: 3439.
 
@@ -2645,9 +2647,14 @@ def enforce_aiperf_error_rate(artifact_dir,
             if not isinstance(record, dict) or ("metrics" not in record
                                                 and "error" not in record):
                 # Non-request records would inflate the denominator and
-                # under-report the rate. The aiperf==0.8.0 record export is
+                # under-report the rate. The aiperf record export is
                 # request-only, but stay robust to future metadata additions.
                 non_request += 1
+                continue
+            # Warmup records are not part of the measured run and would
+            # dilute the rate on small runs.
+            phase = (record.get("metadata") or {}).get("benchmark_phase")
+            if phase is not None and phase != "profiling":
                 continue
             total += 1
             error = record.get("error")
@@ -2830,12 +2837,18 @@ def run_disaggregated_aiperf(config_file,
             str(warmup_request_count),
         ])
 
-        # Use request-count or num-dataset-entries
-        if request_count is not None:
-            aiperf_cmd.extend(['--request-count', str(request_count)])
-        else:
-            # Default: use num-dataset-entries for compatibility
-            aiperf_cmd.extend(['--num-dataset-entries', '64'])
+        # Pass both counts. Without --num-dataset-entries, aiperf builds one
+        # unique synthetic prompt per request before the first request is sent
+        # (up to 60k 8K-token prompts for the QA stress configs); without
+        # --request-count it sends only 10 requests. The default request count
+        # scales with concurrency, and the prompt pool stays small.
+        expected_records = (request_count if request_count is not None else max(
+            10, concurrency * 2))
+        aiperf_cmd.extend([
+            '--request-count',
+            str(expected_records), '--num-dataset-entries',
+            '100' if request_count is not None else '64'
+        ])
 
         if cancellation_rate is not None:
             aiperf_cmd.extend(
@@ -2875,13 +2888,6 @@ def run_disaggregated_aiperf(config_file,
         # of requests, so this is the only check that catches a mid-run error
         # storm on this path (the fatal-pattern scan above is hang/OOM only).
         if max_error_rate is not None:
-            # aiperf 0.8.0 derives the request count from concurrency when
-            # --request-count is not passed (max(10, concurrency * 2) for
-            # synthetic datasets; --num-dataset-entries only sizes the prompt
-            # pool). Mirror that so the completeness check also covers the
-            # default request mode instead of silently disabling.
-            expected_records = (request_count if request_count is not None else
-                                max(10, concurrency * 2))
             enforce_aiperf_error_rate(artifact_dir,
                                       max_error_rate,
                                       expected_records=expected_records)

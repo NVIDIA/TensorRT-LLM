@@ -940,6 +940,22 @@ def stress_test(config,
             os.unlink(extra_llm_options_path)
 
 
+def aiperf_export_concurrency(input_config):
+    """The profiling concurrency recorded in an aiperf profile_export_aiperf.json.
+
+    The concurrency lives on each phase in ``phases[]``; the warmup phase
+    (``exclude_from_results``) is skipped. Exports in the older v1 layout carry
+    it under ``loadgen``, and perf_analyzer's under ``perf_analyzer.stimulus``.
+    Returns 0 when none is present.
+    """
+    for phase in input_config.get("phases") or []:
+        if not phase.get("exclude_from_results") and phase.get("concurrency"):
+            return phase["concurrency"]
+    return ((input_config.get("loadgen") or {}).get("concurrency")
+            or ((input_config.get("perf_analyzer") or {}).get("stimulus")
+                or {}).get("concurrency") or 0)
+
+
 def create_aiperf_command(model_name,
                           model_path,
                           request_count,
@@ -1001,6 +1017,11 @@ def create_aiperf_command(model_name,
         str(output_len_std),
         "--request-count",
         str(request_count),
+        # Without it aiperf builds one unique synthetic prompt per request
+        # before the first request is sent; a fixed pool keeps a large stress
+        # run starting promptly.
+        "--num-dataset-entries",
+        "100",
         "--concurrency",
         str(concurrency),
         "--output-artifact-dir",
@@ -1482,13 +1503,8 @@ def extract_stress_test_metrics(artifacts_dir=None, current_model=None):
                                             {}).get("avg", 0)
                 tokThroughput = results.get("output_token_throughput",
                                             {}).get("avg", 0)
-                conCurrency = results.get("input_config",
-                                          {}).get("loadgen",
-                                                  {}).get("concurrency", 0)
-                if conCurrency == 0:
-                    conCurrency = results.get("input_config", {}).get(
-                        "perf_analyzer", {}).get("stimulus",
-                                                 {}).get("concurrency", 0)
+                conCurrency = aiperf_export_concurrency(
+                    results.get("input_config") or {})
 
                 # Try to determine model name from directory structure first
                 if first_dir in model_name_map:
