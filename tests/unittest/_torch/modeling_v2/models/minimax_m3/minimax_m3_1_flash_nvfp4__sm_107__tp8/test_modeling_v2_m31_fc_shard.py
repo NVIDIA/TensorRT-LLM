@@ -10,6 +10,7 @@ takes a shard only for the fc it was built from and the checked row counts. Defa
 TRTLLM_M31_DISABLE_FC_SHARD=1 turns it off."""
 
 import importlib
+import re
 from collections.abc import Iterator
 from types import SimpleNamespace
 
@@ -181,13 +182,21 @@ def test_the_factory_selects_only_a_compatible_configuration(
     shard = m31_fc_shard.FcShard.build(factory_fc, mapping)
     if supported_splits is None:
         assert shard is None
-        assert any("SPLITK_NUM=22" in notice and "SPLITK_NUM=9" in notice for notice in notices)
+        expected_reason = "the pinned shard GEMM differs from the full fc at 1 rows"
+        assert any(
+            all(f"SPLITK_NUM={split}: {expected_reason}" in notice for split in (22, 9))
+            for notice in notices
+        )
     else:
         assert shard is not None
         rows = m31_fc_shard.MAX_ROWS if supported_splits == 9 and not reject_first else 3
         inputs = torch.ones(rows, 32, dtype=torch.bfloat16, device="cuda")
         assert torch.equal(shard.partial(inputs), factory_fc(inputs)[:, :8])
-        assert any(f"configuration {last_configuration}" in notice for notice in notices)
+        assert any(
+            tuple(map(int, re.findall(r"-?\d+", notice.partition("configuration ")[2])))
+            == last_configuration
+            for notice in notices
+        )
 
 
 @pytest.mark.parametrize("failing_boundary", ["probe", "reference"])

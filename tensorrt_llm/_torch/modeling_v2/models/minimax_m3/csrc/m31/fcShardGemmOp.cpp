@@ -109,8 +109,9 @@ namespace torch_ext
 {
 
 //! x: bf16 [M, K] contiguous; w: bf16 [N, K] contiguous (a row slice of the full weight); cfg: the 9 config values
-//! above. Returns bf16 [M, N]. Unsupported algorithms raise NotImplementedError so callers can try another config.
-//! Other failures retain their existing exception types.
+//! above. Returns bf16 [M, N]. CUBLAS_STATUS_NOT_SUPPORTED and CUBLAS_STATUS_ARCH_MISMATCH from
+//! cublasLtMatmulAlgoCheck raise NotImplementedError so callers can try another config.
+//! Initialization and other failures retain their existing exception types.
 at::Tensor minimaxM31FcShardGemm(at::Tensor const& x, at::Tensor const& w, std::vector<int64_t> const& cfg)
 {
     TORCH_CHECK(x.is_cuda() && w.is_cuda() && x.get_device() == w.get_device(),

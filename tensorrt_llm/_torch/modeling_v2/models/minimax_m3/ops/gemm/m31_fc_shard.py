@@ -25,8 +25,9 @@ from tensorrt_llm.logger import logger
 
 # cuBLASLt candidates for the full fc (K = 30720 -> N = 6144, bf16 in / out, fp32 compute):
 # ALGO_ID, TILE_ID, SPLITK_NUM, REDUCTION_SCHEME, CTA_SWIZZLING, CUSTOM_OPTION, STAGES_ID, INNER_SHAPE_ID,
-# CLUSTER_SHAPE_ID. PINNED_CFG is tried first; the alternative covers full-fc backends using nine K splits.
-# Every candidate must pass the bitwise self-check before use.
+# CLUSTER_SHAPE_ID. PINNED_CFG retains the inherited 22-split compatibility choice, covered by simulation;
+# no physical 22-split setup has been verified. The nine-split alternative matched the measured full fc with
+# cuBLASLt raw version 130800. Every candidate must pass the bitwise self-check before use.
 PINNED_CFG = (66, 393, 22, 2, 0, 1, 35, 0, 3)
 _PINNED_CFGS = (PINNED_CFG, (66, 393, 9, 2, 0, 1, 35, 0, 3))
 MAX_ROWS = 8  # capacity: fixed: the verify rows of one request at draft length 7
