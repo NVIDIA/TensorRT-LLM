@@ -621,10 +621,7 @@ aggregated recipe on separate nodes scored 97/100 and 98/100 in approximately 25
 evaluation protocol; its score is not interchangeable with the full evaluation baseline.
 Neither this job nor full GSM8K runs in L0. Full GSM8K is excluded from all CI lists.
 
-The CI environment must stage the pinned dataset at `datasets/openai/gsm8k` below
-`LLM_MODELS_ROOT` and set `TRTLLM_TEST_TARGET_RELATIVE_PATH`,
-`TRTLLM_TEST_DRAFTER_RELATIVE_PATH` and `TRTLLM_TEST_KV_SCALES_RELATIVE_PATH` to the staged
-target checkpoint, drafter checkpoint and FP8 KV scale table, respectively. These paths
-are relative to `LLM_MODELS_ROOT`; private checkpoint locations are not stored in the repo.
-Selecting the test enables regression mode; missing inputs fail rather than silently skip.
-The CI service controls the LR/nightly cadence and provisions those inputs.
+See the [nightly staging layout and environment overrides](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/llm-api/gsm8k_eval/README.md#optimized-aggregated-recipe-test).
+On a designated nightly worker, set `TRTLLM_RUN_NVFP4_SERVING_GSM8K100=1` so missing
+assets fail the run. Unconfigured workers skip the optimized recipe; an explicit `0`
+always skips it.

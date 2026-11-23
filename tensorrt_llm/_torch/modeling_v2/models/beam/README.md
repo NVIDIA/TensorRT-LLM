@@ -218,8 +218,8 @@ The second command requires a compatible CUDA environment but no checkpoint.
 These unit tests do not reproduce the full 52-layer accuracy evaluation.
 The first-100 integration test is
 `tests/integration/defs/accuracy/test_nvfp4_serving_gsm8k.py`, listed with a
-45-minute timeout in `tests/integration/test_lists/qa/llm_function_core.txt`.
-It requires separately staged checkpoints, scales, dataset and criterion files;
+45-minute timeout in `tests/integration/test_lists/qa/functional/llm_function_core.txt`.
+It uses the checked-in criterion and separately staged checkpoints, scales and dataset;
 see the [evaluator README](../../../../../../examples/llm-api/gsm8k_eval/README.md).
 A test-list entry does not establish that a CI run selected or passed the test.
 

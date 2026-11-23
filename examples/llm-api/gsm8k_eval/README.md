@@ -228,12 +228,20 @@ Full 1,319-question GSM8K evaluation remains manual-only.
 
 The separate `tests/integration/defs/accuracy/test_nvfp4_serving_gsm8k.py` test uses
 `examples/configs/curated/beam-nvfp4-dflash2-fp8kv-aggregated.yaml` with DFlash2 and FP8 KV cache
-on four GB300 GPUs. Its selector is
-`tests/integration/test_lists/test-db/manual_gb300_nvfp4_serving_gsm8k_first100.yml`;
-it is manual-only, not the baseline QA gate above.
+on four GB300 GPUs. QA selects it separately in
+`tests/integration/test_lists/qa/functional/llm_function_core.txt`.
 
-This test stages the target, drafter, scale table and dataset below `LLM_MODELS_ROOT`, renders
-the recipe and runs the same evaluator with 100 questions and the recipe's `max_batch_size`
+For nightly evaluation, stage the authorized target and matching drafter in
+`LLM_MODELS_ROOT/beam/nvfp4-dflash2-fp8kv/{target,drafter}/` and the calibrated
+table at `beam/nvfp4-dflash2-fp8kv/kv_cache_scales.json` under the same models root.
+The public dataset belongs at `datasets/openai/gsm8k`. QA can override the three
+asset paths with `TRTLLM_TEST_TARGET_RELATIVE_PATH`, `TRTLLM_TEST_DRAFTER_RELATIVE_PATH`
+and `TRTLLM_TEST_KV_SCALES_RELATIVE_PATH`. Relative paths are resolved below the models root.
+The staging directory or a drafter/scale override enables the test. Set
+`TRTLLM_RUN_NVFP4_SERVING_GSM8K100=1` on a designated worker to fail if staging
+is missing, or `0` to skip. An unconfigured worker skips the optimized test.
+
+The test renders the recipe and runs the same evaluator with 100 questions and the recipe's `max_batch_size`
 as concurrency. The 45-minute timeout includes a cleanup reserve. Its criterion is at least
 95 correct answers, defined in `tests/integration/defs/accuracy/gsm8k_first100/criterion.json`
 and bound to the protocol manifest. Results go to

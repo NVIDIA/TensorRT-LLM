@@ -14,7 +14,8 @@
 # limitations under the License.
 """The CI deployment: explicit trigger, staged inputs, recipe, hardware and criterion.
 
-Inputs are staged by the runner below ``LLM_MODELS_ROOT`` and named by three relative paths:
+QA stages the optimized bundle under ``LLM_MODELS_ROOT/beam/nvfp4-dflash2-fp8kv``.
+Three optional relative paths override the defaults:
 the target checkpoint (``TRTLLM_TEST_TARGET_RELATIVE_PATH``), the DFlash2 drafter checkpoint
 (``TRTLLM_TEST_DRAFTER_RELATIVE_PATH``) and the FP8 KV-cache scale table
 (``TRTLLM_TEST_KV_SCALES_RELATIVE_PATH``). The dataset is read from
@@ -48,6 +49,12 @@ MODE_ENV = "TRTLLM_NVFP4_SERVING_GSM8K100_MODE"
 TARGET_ENV = "TRTLLM_TEST_TARGET_RELATIVE_PATH"
 DRAFTER_ENV = "TRTLLM_TEST_DRAFTER_RELATIVE_PATH"
 KV_SCALES_ENV = "TRTLLM_TEST_KV_SCALES_RELATIVE_PATH"
+STAGING_DIR = "beam/nvfp4-dflash2-fp8kv"
+STAGED_INPUTS = {
+    TARGET_ENV: f"{STAGING_DIR}/target",
+    DRAFTER_ENV: f"{STAGING_DIR}/drafter",
+    KV_SCALES_ENV: f"{STAGING_DIR}/kv_cache_scales.json",
+}
 DATASET_RELATIVE_DIR = "datasets/openai/gsm8k"
 
 RECIPE_RELATIVE_PATH = "examples/configs/curated/beam-nvfp4-dflash2-fp8kv-aggregated.yaml"
@@ -111,7 +118,7 @@ class Inputs:
 
 
 def _relative(environ: Mapping[str, str], name: str) -> str:
-    value = environ.get(name, "")
+    value = environ.get(name, STAGED_INPUTS[name])
     if not value:
         raise ValueError(f"{name} must name the input relative to LLM_MODELS_ROOT")
     path = Path(value)
