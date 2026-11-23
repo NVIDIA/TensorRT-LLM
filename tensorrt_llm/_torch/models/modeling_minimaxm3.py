@@ -102,6 +102,22 @@ def _moe_routed_output_is_global(experts: nn.Module) -> bool:
     return getattr(experts, "returns_global_routed_output", False)
 
 
+# A speculative decoding step computes RoPE for up to max_draft_len + 1 positions
+# past the current length (DSpark also for its draft block). Near max_seq_len,
+# which equals max_position_embeddings for MiniMax M3, those positions run past a
+# table sized to max_position_embeddings, and the fused QK-norm/RoPE kernels read
+# out of bounds. The extra rows are only read for draft positions that can never
+# be emitted; 256 rows of float32 cos/sin cost 64 KiB.
+_SPEC_DECODE_ROPE_HEADROOM = 256
+
+
+def _rope_params_with_spec_headroom(config, model_config) -> RopeParams:
+    rope = RopeParams.from_config(config)
+    if getattr(model_config, "spec_config", None) is not None:
+        rope.max_positions += _SPEC_DECODE_ROPE_HEADROOM
+    return rope
+
+
 class MiniMaxM3QKVIndexerLinear(Linear):
     """Five-way MiniMax-M3 projection with vLLM-compatible TP sharding.
 
@@ -1144,7 +1160,7 @@ class MiniMaxM3Attention(Attention):
             bias=False,
             pos_embd_params=PositionalEmbeddingParams(
                 type=PositionEmbeddingType.rope_gpt_neox,
-                rope=RopeParams.from_config(config),
+                rope=_rope_params_with_spec_headroom(config, model_config),
             ),
             rope_fusion=False,  # partial RoPE; rotate only rotary_dim of head_dim
             layer_idx=layer_idx,
