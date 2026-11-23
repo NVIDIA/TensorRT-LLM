@@ -285,14 +285,16 @@ def test_attached_embeddings_reuse_only_identical_embeddings() -> None:
     with open(_QWEN_3_VL_DIR / "config.json") as f:
         config = json.load(f)
     # Random rows stand in for encoder output: the prompt layout depends only
-    # on their shape, and the two images differ only in content.
+    # on their shape and grid, and the two images differ only in content.
     width = config["text_config"]["hidden_size"] * (
         1 + len(config["vision_config"]["deepstack_visual_indexes"]))
+    side = 16 * config["vision_config"]["spatial_merge_size"]
     generator = torch.Generator().manual_seed(0)
-    embeddings = [
-        torch.randn(256, width, generator=generator).to(torch.bfloat16).cuda()
-        for _ in range(2)
-    ]
+    embeddings = [{
+        "mm_embeddings":
+        torch.randn(256, width, generator=generator).to(torch.bfloat16).cuda(),
+        "image_grid_thw": [1, side, side],
+    } for _ in range(2)]
     kv_cache_config = KvCacheConfig(
         enable_block_reuse=True,
         free_gpu_memory_fraction=0.2,

@@ -137,6 +137,15 @@ def _attach(processor: BaseMultimodalInputProcessor, inputs: dict[str, Any],
                                                   SamplingParams())
 
 
+def _qwen_items(config: Any, *embeddings: torch.Tensor) -> list[dict[str, Any]]:
+    """Pass each embedding with the grid Qwen-VL needs: one merged row of patches."""
+    merge = config.vision_config.spatial_merge_size
+    return [{
+        "mm_embeddings": embedding,
+        "image_grid_thw": [1, merge, merge * embedding.shape[0]]
+    } for embedding in embeddings]
+
+
 def test_qwen3_vl_attached_embeddings_are_keyed_by_content() -> None:
     config = _make_qwen3_vl_config(hidden_size=4)
     num_levels = 1 + len(config.vision_config.deepstack_visual_indexes)
@@ -150,7 +159,8 @@ def test_qwen3_vl_attached_embeddings_are_keyed_by_content() -> None:
     first = torch.full((3, width), 0.5, dtype=torch.bfloat16)
     second = torch.full((2, width), -0.5, dtype=torch.bfloat16)
 
-    _, extra_processed_inputs = _attach(processor, inputs, [first, second])
+    _, extra_processed_inputs = _attach(processor, inputs,
+                                        _qwen_items(config, first, second))
     multimodal_input = extra_processed_inputs["multimodal_input"]
     hashes = multimodal_input.multimodal_hashes
 
@@ -164,11 +174,13 @@ def test_qwen3_vl_attached_embeddings_are_keyed_by_content() -> None:
         "multimodal_embed_mask_cumsum"]
     assert cumsum.tolist() == [0, 0, 1, 2, 3, 3, 3, 4, 5, 5, 5]
 
-    same = _attach(processor, inputs, [first.clone(), second.clone()])[1]
+    same = _attach(processor, inputs,
+                   _qwen_items(config, first.clone(), second.clone()))[1]
     assert same["multimodal_input"].multimodal_hashes == hashes
-    swapped = _attach(processor, inputs, [second, first])[1]
+    swapped = _attach(processor, inputs, _qwen_items(config, second, first))[1]
     assert swapped["multimodal_input"].multimodal_hashes == hashes[::-1]
-    changed = _attach(processor, inputs, [first, second + 1])[1]
+    changed = _attach(processor, inputs, _qwen_items(config, first,
+                                                     second + 1))[1]
     assert changed["multimodal_input"].multimodal_hashes[0] == hashes[0]
     assert changed["multimodal_input"].multimodal_hashes[1] != hashes[1]
 
@@ -191,27 +203,27 @@ def test_qwen3_vl_attached_embedding_uuid_joins_its_hash() -> None:
     uuids = {"image": ["user-a"]}
 
     plain = _attach(processor, {"prompt": "Describe."},
-                    [embedding])[1]["multimodal_input"]
+                    _qwen_items(config, embedding))[1]["multimodal_input"]
     with_uuid = _attach(processor, {
         "prompt": "Describe.",
         "multi_modal_uuids": uuids
-    }, [embedding])[1]["multimodal_input"]
+    }, _qwen_items(config, embedding))[1]["multimodal_input"]
     other_uuid = _attach(processor, {
         "prompt": "Describe.",
         "multi_modal_uuids": {
             "image": ["user-b"]
         }
-    }, [embedding])[1]["multimodal_input"]
+    }, _qwen_items(config, embedding))[1]["multimodal_input"]
     other_rows = _attach(processor, {
         "prompt": "Describe.",
         "multi_modal_uuids": uuids
-    }, [embedding + 1])[1]["multimodal_input"]
+    }, _qwen_items(config, embedding + 1))[1]["multimodal_input"]
     # Token IDs are decoded back to text before the hook runs.
     from_token_ids = _attach(
         processor, {
             "prompt_token_ids": [7, config.vision_start_token_id],
             "multi_modal_uuids": uuids
-        }, [embedding])[1]["multimodal_input"]
+        }, _qwen_items(config, embedding))[1]["multimodal_input"]
 
     assert plain.multimodal_uuids is None
     assert with_uuid.multimodal_uuids == ["user-a"]
@@ -355,9 +367,7 @@ def test_llama4_attached_embeddings_are_keyed_per_image() -> None:
 @pytest.mark.parametrize("with_grid", [False, True], ids=["tensor", "grid"])
 def test_llava_next_embeddings_keep_tensor_list(with_grid):
     """Models without mRoPE take a plain list of tensors and ignore a grid."""
-    processor = object.__new__(LlavaNextInputProcessor)
-    processor._config = SimpleNamespace(
-        image_token_index=9, text_config=SimpleNamespace(hidden_size=4))
+    processor = _make_llava_next_processor(hidden_size=4, image_token_index=9)
     embeddings = [torch.ones(3, 4), torch.zeros(2, 4)]
     items = embeddings
     if with_grid:
