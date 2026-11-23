@@ -112,11 +112,19 @@ def _dense_attention_model_config(model_config: DiffusionModelConfig) -> Diffusi
 
 
 def _padding_support(model_config: DiffusionModelConfig) -> tuple[bool, bool, bool]:
-    """What the dense attention backend of the config takes for the padding of a sequence:
-    whether a key padding mask, whether the length of the valid prefix, and whether the padding
-    must follow the tokens (a backend that takes only the length describes trailing padding
-    only). A backend that takes a mask gets the mask; one that takes only the length gets the
-    length; one that takes neither cannot attend a padded sequence."""
+    """Return what the dense attention backend of the config takes for padding.
+
+    A backend that takes a mask gets the mask; one that takes only the length gets the
+    length; one that takes neither cannot attend a padded sequence.
+
+    Returns:
+        A tuple ``(supports_mask, supports_length, requires_trailing)``:
+
+        * supports_mask: The backend takes ``key_padding_mask``.
+        * supports_length: The backend takes ``valid_seq_len``.
+        * requires_trailing: The padding must follow the tokens; also true for a backend
+          that takes only the length.
+    """
 
     attention = model_config.attention
     backend_cls = get_visual_gen_attention_backend(
@@ -777,10 +785,10 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
     def __init__(self, model_config: DiffusionModelConfig) -> None:
         super().__init__(model_config)
         self._attn_backend = getattr(model_config.attention, "backend", "VANILLA")
-        # A tensor handed to the attention backend, kept as (key, tensor) so that the layers
-        # and steps of a request pass one tensor object: backends key their caches on it.
-        # The key of the tags is a copy of the caller's tags and the pad; the key of the mask
-        # is the tags tensor it is built from and the batch size.
+        # Tensors handed to the attention backend, kept as (key, tensor): the layers and steps
+        # of a request pass one tensor object, which backends key their caches on.
+        #   tags key: (copy of the caller's tags, pad)
+        #   mask key: (padded tags tensor, batch size)
         self._cached_token_tags: tuple[tuple[torch.Tensor, int], torch.Tensor] | None = None
         self._cached_key_padding_mask: tuple[tuple[torch.Tensor, int], torch.Tensor] | None = None
         # Padding between packed modalities needs a backend that takes it anywhere.
@@ -1106,8 +1114,7 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
         rotary_emb = static_context.rotary_emb
         pad = _padding_to_multiple(sequence_length, self.sharder.size)
         has_existing_padding = bool((token_tags < 0).any())
-        # A backend that takes a mask gets the mask (below); one that takes only the length
-        # gets the length of the valid prefix.
+        # Only a backend without mask support gets the length of the valid prefix.
         valid_seq_len = None
         if (
             not self._supports_key_padding_mask
@@ -1117,9 +1124,8 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             valid_seq_len = sequence_length
             if has_existing_padding:
                 valid_seq_len = int((token_tags >= 0).sum().item())
-        # One tags tensor of the padded sequence per tags content. The caller owns its tags
-        # and may refill them in place, so the key holds a copy and its tags are compared by
-        # content (torch.equal); a key that holds no tensor is compared with !=.
+        # Reuse the padded tags while the caller's tags hold the same content: the caller may
+        # refill its tensor in place, so the key is a copy, compared by content.
         cached = self._cached_token_tags
         if cached is None or cached[0][1] != pad or not torch.equal(cached[0][0], token_tags):
             tags = token_tags.clone()
@@ -1150,9 +1156,8 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
                     "backend that takes interior padding, such as VANILLA."
                 )
             if self._supports_key_padding_mask:
-                # One mask per tags tensor and batch size: attention caches key on the mask
-                # tensor and use its version to detect changes. The key holds the tags
-                # tensor, compared by identity.
+                # Reuse the mask of the same padded tags tensor and batch size. Attention
+                # caches use the mask version to detect changes.
                 batch_size = packed_hidden_states.shape[0]
                 cached = self._cached_key_padding_mask
                 if (

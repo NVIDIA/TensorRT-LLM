@@ -640,8 +640,7 @@ class HunyuanVideo15Attention(Attention):
             key = torch.cat([key, encoder_key], dim=1)
             value = torch.cat([value, encoder_value], dim=1)
 
-        # The mask covers the joint sequence; the transformer builds it once per forward, a
-        # bool tensor that every layer hands to the backend.
+        # The transformer builds this bool mask of the joint sequence once per forward.
         hidden_states = self._attn_impl(
             query, key, value, key_padding_mask=attention_mask, token_tags=token_tags
         )
@@ -889,9 +888,9 @@ class HunyuanVideo15Transformer3DModel(BaseDiffusionModel):
             num_layers=num_refiner_layers,
             model_config=model_config,
         )
-        # A tensor handed to the attention backend, kept as (key, tensor) so that the layers
-        # and steps of a request pass one tensor object: backends key their caches on it.
-        # The key of the tags is the row counts of the joint sequence and the device.
+        # Tensor handed to the attention backend, kept as (key, tensor): the layers and steps
+        # of a request pass one tensor object, which backends key their caches on.
+        #   tags key: (video rows, image rows, context rows, device)
         self._cached_token_tags: Optional[
             Tuple[Tuple[int, int, int, torch.device], torch.Tensor]
         ] = None
@@ -1084,12 +1083,13 @@ class HunyuanVideo15Transformer3DModel(BaseDiffusionModel):
         encoder_hidden_states = torch.stack(new_encoder_hidden_states)
         encoder_attention_mask = torch.stack(new_encoder_attention_mask)
 
-        # The joint sequence of the blocks: video rows, then the context rows (image rows,
-        # text rows, the padding of every sample last). The blocks share one mask and one
-        # tags tensor of it; attention backends key their caches on these tensors.
+        # Joint sequence of the blocks: [video | image | text | padding]. The blocks share one
+        # mask and one tags tensor, which attention backends key their caches on.
         num_video, num_context = hidden_states.shape[1], encoder_hidden_states.shape[1]
         num_image = 0 if is_t2v else encoder_hidden_states_3.shape[1]
+        # The mask follows the prompt: one tensor per forward.
         joint_attention_mask = F.pad(encoder_attention_mask, (num_video, 0), value=True)
+        # The tags follow the row counts only: one tensor across forwards.
         tags_key = (num_video, num_image, num_context, hidden_states.device)
         cached = self._cached_token_tags
         if cached is None or cached[0] != tags_key:
