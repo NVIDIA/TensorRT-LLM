@@ -311,7 +311,9 @@ class BasePipeline(nn.Module):
         it did not cover runs without graphs instead of adding graphs and input buffers to
         every block for the rest of the process. Capture stays open while no block graph
         exists, e.g. after a first request that ran with graphs disabled (a FLUX.2 edit).
-        Every rank captures the same block graphs, so every rank decides alike.
+        Every rank captures the same block graphs, so every rank decides alike. Blocks that
+        are still without a graph when capture closes (a first request that failed partway
+        through capture) are logged.
         """
         runners = [
             runner
@@ -319,6 +321,13 @@ class BasePipeline(nn.Module):
             if isinstance(runner, BlockCUDAGraphRunner)
         ]
         if any(runner.graphs for runner in runners):
+            uncaptured = [r.name for r in runners if r.allow_capture and not r.graphs]
+            if uncaptured:
+                more = ", ..." if len(uncaptured) > 1 else ""
+                logger.warning(
+                    f"Block CUDA graph capture closed with {len(uncaptured)} of {len(runners)} "
+                    f"blocks uncaptured ({uncaptured[0]}{more}); they run without CUDA graphs."
+                )
             for runner in runners:
                 runner.allow_capture = False
 

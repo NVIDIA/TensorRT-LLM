@@ -392,7 +392,7 @@ class _StubPipeline:
         self._profiler = profiler
         self._is_warmup = is_warmup
         model = torch.nn.Module()
-        model.blocks = torch.nn.ModuleList([torch.nn.Identity()])
+        model.blocks = torch.nn.ModuleList([torch.nn.Identity(), torch.nn.Identity()])
         self._cuda_graph_runners = wrap_blocks_with_cuda_graphs(model, ["blocks"])
 
     def infer(self, req: object) -> object:
@@ -406,7 +406,7 @@ def test_run_inference_skips_profiling_during_warmup(
 ) -> None:
     profiler, events = _recording_profiler(monkeypatch, "all")
     pipeline = _StubPipeline(profiler, is_warmup=True)
-    (block_runner,) = pipeline._cuda_graph_runners.values()
+    block_runner, _ = pipeline._cuda_graph_runners.values()
 
     request = object()
     assert pipeline.run_inference(request) is request
@@ -417,12 +417,16 @@ def test_run_inference_skips_profiling_during_warmup(
     assert pipeline.run_inference(request) is request
     assert events == ["start", "stop"]
     # Block graph capture stays open until a block graph exists, then closes after a
-    # request even when that request fails.
+    # request even when that request fails, and logs the blocks left without a graph.
     assert block_runner.allow_capture
     block_runner.graphs["captured"] = None
-    with pytest.raises(RuntimeError):
+    with (
+        pytest.raises(RuntimeError),
+        patch("tensorrt_llm._torch.visual_gen.pipeline.logger.warning") as warning,
+    ):
         pipeline.run_inference(RuntimeError("decode failed"))
     assert not block_runner.allow_capture
+    assert "1 of 2 blocks uncaptured (transformer.blocks.1)" in warning.call_args.args[0]
 
 
 # ----------------------------------------------------------------------

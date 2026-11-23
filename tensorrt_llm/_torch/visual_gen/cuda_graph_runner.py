@@ -419,6 +419,11 @@ def _probe_copy(tensor: torch.Tensor) -> torch.Tensor:
     return probe
 
 
+# Request sizes choose the keys that run without a block graph, so a block runner logs
+# (and remembers) at most this many of them.
+_MAX_LOGGED_EAGER_KEYS = 64
+
+
 class BlockCUDAGraphRunner(CUDAGraphRunner):
     """CUDA graph runner for one transformer block, used with Cache-DiT.
 
@@ -450,8 +455,10 @@ class BlockCUDAGraphRunner(CUDAGraphRunner):
         # Output buffers of all block graphs of the model, by data pointer.
         self._block_outputs = block_outputs
         self._forward_context = forward_context
-        # Keys first seen after capture closed (after warmup), which run eagerly; logged once.
+        # Keys first seen after capture closed (after warmup), which run eagerly; each is
+        # logged once, up to _MAX_LOGGED_EAGER_KEYS of them.
         self._eager_keys: Set[KeyType] = set()
+        self._eager_keys_capped = False
 
     def _get_extra_key(self, *args, **kwargs) -> KeyType:
         call = self._forward_context.current()  # keys evaluated once per model.forward call
@@ -548,6 +555,12 @@ class BlockCUDAGraphRunner(CUDAGraphRunner):
         self.graphs[key].replay()
         return self.graph_outputs[key]
 
+    def clear(self):
+        """Releases the graphs and forgets the keys logged as run without one."""
+        super().clear()
+        self._eager_keys.clear()
+        self._eager_keys_capped = False
+
     def wrap(self, fn):
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
@@ -593,17 +606,26 @@ class BlockCUDAGraphRunner(CUDAGraphRunner):
                 if not self.allow_capture:
                     # Not during multi-rank warmup tuning, which runs before any capture.
                     if self.graphs and key not in self._eager_keys:
-                        self._eager_keys.add(key)
-                        shapes = {path: shape for path, shape, *_ in tensor_key}
-                        graph_keys = self._last_resolved_extra_keys
-                        logger.warning_once(
-                            f"{self.name} and every block with the same inputs run without "
-                            "CUDA graphs: block graphs are captured only during warmup, which "
-                            f"did not cover inputs {shapes}"
-                            + (f" with graph keys {graph_keys}" if graph_keys else "")
-                            + ".",
-                            key=("block CUDA graph not captured", key),
-                        )
+                        if len(self._eager_keys) < _MAX_LOGGED_EAGER_KEYS:
+                            self._eager_keys.add(key)
+                            shapes = {path: shape for path, shape, *_ in tensor_key}
+                            graph_keys = self._last_resolved_extra_keys
+                            logger.warning_once(
+                                f"{self.name} and every block with the same inputs run "
+                                "without CUDA graphs: block graphs are captured only during "
+                                f"warmup, which did not cover inputs {shapes}"
+                                + (f" with graph keys {graph_keys}" if graph_keys else "")
+                                + ".",
+                                key=("block CUDA graph not captured", key),
+                            )
+                        elif not self._eager_keys_capped:
+                            self._eager_keys_capped = True
+                            logger.warning_once(
+                                f"{self.name}: {_MAX_LOGGED_EAGER_KEYS} block inputs warmup "
+                                "did not cover were logged; further ones also run without "
+                                "CUDA graphs and are not logged.",
+                                key="block CUDA graph keys not logged",
+                            )
                     # Run as with graphs off, without publishing graph keys: attention derives
                     # its phases from the denoising step and the timestep its block receives.
                     return fn(*args, **kwargs)

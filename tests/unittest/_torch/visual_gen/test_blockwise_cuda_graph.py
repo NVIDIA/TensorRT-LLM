@@ -15,6 +15,7 @@ from torch import nn
 from torch.utils._pytree import tree_leaves
 
 from tensorrt_llm._torch.visual_gen.cuda_graph_runner import (
+    _MAX_LOGGED_EAGER_KEYS,
     SharedGraphPool,
     resolved_extra_key,
     resolved_extra_keys_scope,
@@ -226,6 +227,13 @@ def test_graph_keys():
     assert [len(runner.graphs) for runner in runners.values()] == [6, 2]
     assert warning_once.call_count == 2
     assert "(2, 32, 64)" in warning_once.call_args.args[0]
+
+    # Request sizes choose new keys, so a runner remembers a bounded number of them.
+    with patch.object(logger, "warning_once") as warning_once:
+        for scale in range(_MAX_LOGGED_EAGER_KEYS + 10):
+            model.blocks[0](**dict(call, scale=float(scale)))
+    assert len(runners["transformer.blocks.0"]._eager_keys) == _MAX_LOGGED_EAGER_KEYS
+    assert "not logged" in warning_once.call_args.args[0]
 
 
 @torch.inference_mode()
