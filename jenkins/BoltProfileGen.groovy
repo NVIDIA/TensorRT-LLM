@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@feature/TRTLLM-17472-aws-artifactory-migration']) _
 
 // =============================================================================
 // BoltProfileGen.groovy - helper job: BOLT profile generation.

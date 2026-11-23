@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-@Library(['trtllm-jenkins-shared-lib@main']) _
+@Library(['trtllm-jenkins-shared-lib@feature/TRTLLM-17472-aws-artifactory-migration']) _
 
 import java.lang.InterruptedException
 
