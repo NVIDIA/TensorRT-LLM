@@ -1,6 +1,6 @@
 # Adapt from
 # https://github.com/vllm-project/vllm/blob/2e33fe419186c65a18da6668972d61d7bbc31564/vllm/inputs/data.py
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional, Union
 
 from typing_extensions import NotRequired, TypedDict
 
@@ -17,7 +17,7 @@ class TextPrompt(TypedDict):
     if the model supports it.
     """
 
-    multi_modal_uuids: NotRequired[Dict[str, List[Any]]]
+    multi_modal_uuids: NotRequired[Dict[str, List[Optional[str]]]]
     """
     Optional user-provided UUIDs for multimodal items.
     Structure mirrors multi_modal_data: {"image": ["uuid1", None, "uuid3"]}.
@@ -55,7 +55,7 @@ class TokensPrompt(TypedDict):
     if the model supports it.
     """
 
-    multi_modal_uuids: NotRequired[Dict[str, List[Any]]]
+    multi_modal_uuids: NotRequired[Dict[str, List[Optional[str]]]]
     """
     Optional user-provided UUIDs for multimodal items.
     Structure mirrors multi_modal_data: {"image": ["uuid1", None, "uuid3"]}.

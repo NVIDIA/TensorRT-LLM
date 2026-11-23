@@ -335,6 +335,7 @@ class DisaggregatedParams(OpenAIBaseModel):
         description="Prompt-token offset of each multimodal item.")
     multimodal_lengths: Optional[List[PositiveInt]] = Field(
         default=None, description="Prompt-token count of each multimodal item.")
+    multimodal_cache_salt: Optional[str] = None
     # TODO(TRTLLM-12407): Multimodal E/PD over trtllm-serve needs these protocol fields too:
     # encoder embedding handles, multimodal hashes, and optional mRoPE handles.
     # Add them here and in to_disaggregated_params()/to_llm_disaggregated_params()
@@ -362,6 +363,14 @@ class DisaggregatedParams(OpenAIBaseModel):
                 "multimodal_positions and multimodal_lengths must have the same length"
             )
         return self
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_multimodal_handoff(self, handler: Any) -> Any:
+        # Older workers reject unknown fields, even when their value is null.
+        data = handler(self)
+        if isinstance(data, dict) and self.multimodal_cache_salt is None:
+            data.pop("multimodal_cache_salt", None)
+        return data
 
 
 class ConversationParams(OpenAIBaseModel):
@@ -2325,6 +2334,7 @@ def to_disaggregated_params(
         remote_tail_start=tllm_disagg_params.remote_tail_start,
         multimodal_positions=tllm_disagg_params.multimodal_positions,
         multimodal_lengths=tllm_disagg_params.multimodal_lengths,
+        multimodal_cache_salt=tllm_disagg_params.multimodal_cache_salt,
     )
 
 
@@ -2352,6 +2362,7 @@ def to_llm_disaggregated_params(
         remote_tail_start=disaggregated_params.remote_tail_start,
         multimodal_positions=disaggregated_params.multimodal_positions,
         multimodal_lengths=disaggregated_params.multimodal_lengths,
+        multimodal_cache_salt=disaggregated_params.multimodal_cache_salt,
         orig_elapsed_s=disaggregated_params.orig_elapsed_s,
     )
 

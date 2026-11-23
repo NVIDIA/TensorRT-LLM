@@ -151,9 +151,8 @@ def test_processor_preserves_interleaved_text_and_image_payload() -> None:
     )
     tokenizer = Mock(unk_token_id=None, all_special_tokens=[], all_special_ids=[])
     tokenizer.convert_tokens_to_ids.return_value = _IMAGE_ID
-    processor = create_input_processor_with_hash(
-        DeepseekV41InputProcessor("unused", config, tokenizer)
-    )
+    inner = DeepseekV41InputProcessor("unused", config, tokenizer)
+    processor = create_input_processor_with_hash(inner)
     pixels = np.arange(6 * 6 * 3, dtype=np.uint8).reshape(6, 6, 3)
     token_ids = [7, _IMAGE_ID, 8, _IMAGE_ID, 9]
     actual, extra = processor(
@@ -177,7 +176,9 @@ def test_processor_preserves_interleaved_text_and_image_payload() -> None:
     expected = ((expected - 0.5) / 0.5).to(torch.bfloat16)
     expected = expected.reshape(3, 3, 2, 3, 2).permute(1, 3, 0, 2, 4).reshape(9, 3, 2, 2)
     torch.testing.assert_close(image["pixel_values"][0], expected, rtol=0, atol=0)
-    assert extra["multimodal_input"] is not None
+    # Content hashes, not the random ones items get when hashing fails.
+    assert inner.multimodal_hashing_supported is True
+    assert extra["multimodal_input"].multimodal_positions == [1, 6]
     tokenizer.encode.assert_not_called()
     tokenizer.decode.assert_not_called()
 

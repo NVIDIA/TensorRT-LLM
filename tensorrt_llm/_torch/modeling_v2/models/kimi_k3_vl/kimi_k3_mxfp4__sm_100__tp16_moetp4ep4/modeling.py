@@ -983,6 +983,7 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4(
     one-engine speculative decoding (the functions of `spec_shell.py`). The checkpoint load is the family's manifest
     loader (`weights.py`)."""
 
+    accepts_multimodal_inputs = False
     # The engine builds the KDA layers' per-step metadata from this class (the hybrid cache manager's replay slots).
     mamba_metadata_cls = KimiK3MambaMetadata
     # The one-engine speculative fast paths (vocabulary-sharded sampling, hoisted positions): not taken.

@@ -183,7 +183,9 @@ def test_flash_routes_with_or_without_the_multimodal_encoder(
     """Routing does not read the encoder setting: the targets refuse image and video requests at admission."""
     config = _model_config(_flash_config(), spec_config=spec_config, **_TEP4)
     llm_args = _llm_args(mode, disable_mm_encoder=disable_mm_encoder)
-    assert _qualified(modeling_v2_resolve(config, llm_args)) == target
+    model = modeling_v2_resolve(config, llm_args)
+    assert _qualified(model) == target
+    assert model.accepts_multimodal_inputs is False
 
 
 @pytest.mark.parametrize(
@@ -612,8 +614,10 @@ def test_fp8_constructor_refuses_what_route_declines():
         ({}, None),
         ({"image": {"pixel_values": torch.zeros(1)}}, "image"),
         ({"video": {"pixel_values_videos": torch.zeros(1)}}, "video"),
+        ({"multimodal_embedding": torch.ones(2, 4)}, "multimodal_embedding"),
+        ({"image": {}, "multimodal_embedding": []}, None),
     ],
-    ids=["text", "empty-payload", "image", "video"],
+    ids=["text", "empty-payload", "image", "video", "embedding", "empty-fields"],
 )
 def test_fp8_target_refuses_media_on_admission(multimodal_data, refused):
     """The text-only target fails a media request on admission, as that request's own error."""
@@ -623,11 +627,12 @@ def test_fp8_target_refuses_media_on_admission(multimodal_data, refused):
         ModelingV2Glm53FlashFp8Sm10xTp4,
     )
 
+    assert ModelingV2Glm53FlashFp8Sm10xTp4.accepts_multimodal_inputs is False
     request = SimpleNamespace(py_multimodal_data=multimodal_data)
     if refused is None:
         ModelingV2Glm53FlashFp8Sm10xTp4.validate_request(None, request)
         return
-    with pytest.raises(ValueError, match=f"carries {refused} input"):
+    with pytest.raises(ValueError, match=refused):
         ModelingV2Glm53FlashFp8Sm10xTp4.validate_request(None, request)
 
 
@@ -653,6 +658,7 @@ def test_tp4_engine_routes_to_the_tp4_target(mode, sm, spec_config, layout, monk
     config = _model_config(_flash_config(), spec_config=spec_config, **layout)
     target = modeling_v2_resolve(config, _llm_args(mode, **_tp4_engine()))
     assert _qualified(target) == _TP4_TARGET
+    assert target.accepts_multimodal_inputs is False
 
 
 @pytest.mark.parametrize(

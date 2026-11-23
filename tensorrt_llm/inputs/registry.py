@@ -42,17 +42,20 @@ from .content_format import ContentFormat
 from .data import TextPrompt
 from .model_config import resolve_top_level_model_type
 # yapf: disable
-from .multimodal import (MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalInput,
+from .multimodal import (MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+                         MULTIMODAL_NO_CONTENT_HASHES_KEY, MultimodalInput,
                          MultimodalItemMetadata, _as_cpu_tensor,
                          _compute_mm_masks,
                          _find_mm_embedding_lengths_from_masks,
                          _find_mm_token_runs_from_mask,
-                         _find_mm_token_start_pos_from_masks, apply_mm_hashes,
-                         default_hasher, find_mm_token_lengths,
-                         get_multimodal_item_metadata, hexdigest_to_int32,
-                         validate_mm_inputs)
+                         _find_mm_token_start_pos_from_masks, _mm_items,
+                         apply_mm_hashes, default_hasher, find_mm_token_lengths,
+                         get_multimodal_item_metadata, has_mm_items,
+                         hexdigest_to_int32, isolate_mm_request,
+                         modalities_without_token_count, random_mm_hashes,
+                         validate_mm_inputs, validate_mm_uuids)
 # yapf: enable
-from .multimodal_data import MEDIA_MODALITIES, serialize_item
+from .multimodal_data import serialize_item
 from .prefix_token_cache import (OffsetTokenizer, PrefixTokenCache,
                                  create_prefix_token_cache)
 from .tokenization import tokenize_prompt
@@ -130,6 +133,8 @@ class InputProcessor(Protocol):
 
 class DefaultInputProcessor(InputProcessor):
     """Preprocess the inputs to the model."""
+
+    accepts_multimodal_inputs = False
 
     def __init__(self,
                  model_path,
@@ -410,6 +415,7 @@ class BaseMultimodalInputProcessor(ABC):
         return TextPrompt(
             prompt=prompt,
             multi_modal_data=inputs.get("multi_modal_data"),
+            multi_modal_uuids=inputs.get("multi_modal_uuids"),
             mm_processor_kwargs=inputs.get("mm_processor_kwargs") or {},
         )
 
@@ -687,7 +693,7 @@ class BaseMultimodalInputProcessor(ABC):
         if hasattr(self.processor, '_get_num_multimodal_tokens'):
             return self.processor._get_num_multimodal_tokens
         else:
-            raise NotImplementedError(
+            raise UnsupportedError(
                 f"get_num_multimodal_tokens not implemented for {self.__class__.__name__}. "
                 "Please override this method or ensure the processor has _get_num_multimodal_tokens method."
             )
@@ -1491,61 +1497,42 @@ def create_input_processor_with_hash(
             "get_mm_encoder_item_metadata() has been removed; implement "
             "get_mm_item_metadata() returning MultimodalItemMetadata instead.")
 
-    def multimodal_hashing_process(
+    def run_input_processor(
         inputs: TextPrompt, sampling_params: SamplingParams
-    ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
-        """
-        Process multimodal hashing for media tokens if possible.
+    ) -> tuple[list[int], ExtraProcessedInputs | None]:
+        try:
+            return input_processor(inputs, sampling_params)
+        except Exception as e:
+            logger.warning(f"Input processor failed: {e}.")
+            logger.debug(traceback.format_exc())
+            raise
 
-        Delegates the raw `(token_ids, extra_processed_inputs)` production to
-        the input processor's `__call__` (which itself dispatches between the
-        text-prompt and tokenized+MM fast paths), then computes hashes,
-        positions, and masks on top.
+    def add_multimodal_input(
+        inputs: TextPrompt,
+        prompt_token_ids: list[int],
+        extra_processed_inputs: ExtraProcessedInputs,
+        mm_hashes: dict[str, list[str]] | None,
+        mm_uuids_by_key: dict[str, list[str | None]] | None,
+    ) -> None:
+        """Find the prompt span of each item and add the `MultimodalInput`.
 
-        Supports optional user-provided UUIDs via 'multi_modal_uuids' in inputs.
-        When a UUID is provided for a multimodal item, it contributes to the
-        derived cache digest and is preserved as the external identity in KV
-        cache events.
+        `mm_hashes` maps modality -> content hash of each item. Without them,
+        each item gets a random hash. Raises ValueError when the spans cannot
+        be found, UnsupportedError when this processor cannot find them for
+        any request; `extra_processed_inputs` is then unchanged.
         """
-        assert 'multi_modal_data' in inputs, "multi_modal_data must be provided for hashing support."
+        vocab_size = input_processor.get_vocab_size()
+        mm_ids = input_processor.get_mm_token_ids()
+        mm_special_token_ids = input_processor.get_mm_special_token_ids()
+        if vocab_size is None and mm_ids is None:
+            raise UnsupportedError(
+                "Cannot locate vocab_size or mm_token_ids for multimodal token preprocessing"
+            )
         mm_data = inputs['multi_modal_data']
-
-        # Extract optional UUIDs (can be None, or dict with same structure as mm_data)
-        mm_uuids = inputs.get('multi_modal_uuids', None)
-
-        mm_hashes, mm_uuids_by_key = apply_mm_hashes(mm_data, mm_uuids,
-                                                     hash_lib)
-
-        prompt_token_ids, extra_processed_inputs = input_processor(
-            inputs, sampling_params)
-        if extra_processed_inputs is None:
-            extra_processed_inputs = {}
-        multimodal_data = extra_processed_inputs.setdefault(
-            "multimodal_data", {})
-        if not isinstance(multimodal_data, dict):
-            raise TypeError(
-                "extra_processed_inputs['multimodal_data'] must be a dict")
-        if encoder_cache_enabled:
-            multimodal_data[
-                "mm_processor_kwargs_hash"] = _hash_mm_processor_kwargs(
-                    inputs.get("mm_processor_kwargs") or {}, hash_lib)
-
+        multimodal_data = extra_processed_inputs["multimodal_data"]
         num_mm_tokens_by_key = find_mm_token_lengths(
-            mm_data,
-            input_processor,
-            multimodal_data=(extra_processed_inputs
-                             or {}).get("multimodal_data"),
-        )
-        # Raise (rather than returning ([], None)) so process_prompt_maybe_hash
-        # treats this as a failed hashing attempt: it falls back to the basic
-        # input processor and caches multimodal_hashing_supported=False instead
-        # of marking hashing as supported and forwarding an empty prompt
-        # downstream.
-        if not num_mm_tokens_by_key:
-            raise ValueError(
-                "multimodal hashing could not determine multimodal token "
-                "lengths for the provided input.")
-        # `mm_hashes_flat`, `start_positions`, and `num_mm_tokens` must all
+            mm_data, input_processor, multimodal_data=multimodal_data)
+        # The hashes, `start_positions`, and `num_mm_tokens` must all
         # index items at the same offsets — project into prompt order via the
         # manifest.
         mm_item_order = inputs.get("mm_item_order")
@@ -1580,18 +1567,12 @@ def create_input_processor_with_hash(
             raise ValueError("multimodal hashing produced an empty multimodal "
                              "token-length list.")
 
-        vocab_size = input_processor.get_vocab_size()
-        mm_ids = input_processor.get_mm_token_ids()
-        mm_special_token_ids = input_processor.get_mm_special_token_ids()
-        if vocab_size is None and mm_ids is None:
-            raise ValueError(
-                "Cannot locate vocab_size or mm_token_ids for multimodal token preprocessing"
-            )
         # Compute all three masks once here and reuse downstream. The embed
         # cumsum is stashed into extra_processed_inputs so the wrapper's
         # subsequent maybe_compute_mm_embed_cumsum call short-circuits via
         # its idempotency guard, avoiding a second full-sequence isin pass.
         input_ids_tensor = _as_cpu_tensor(prompt_token_ids)
+        embed_mask = None
         if input_ids_tensor.numel() == 0:
             start_positions, start_special_token_positions = [], []
             item_run_cu_offsets, run_positions, run_lengths = [0], [], []
@@ -1603,7 +1584,6 @@ def create_input_processor_with_hash(
                 mm_token_ids=mm_ids,
                 mm_special_token_ids=mm_special_token_ids,
             )
-            _cache_mm_embed_cumsum(multimodal_data, embed_mask)
             start_positions, start_special_token_positions = (
                 _find_mm_token_start_pos_from_masks(mm_mask, special_mask,
                                                     num_mm_tokens))
@@ -1612,83 +1592,121 @@ def create_input_processor_with_hash(
             multimodal_embedding_lengths = (
                 _find_mm_embedding_lengths_from_masks(mm_mask, embed_mask,
                                                       num_mm_tokens))
-        prepared_metadata = MultimodalItemMetadata(
-            item_refs, output_embedding_lengths=multimodal_embedding_lengths)
-        multimodal_data[
-            MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = _merge_mm_item_metadata(
-                prepared_metadata, metadata)
+        item_metadata = _merge_mm_item_metadata(
+            MultimodalItemMetadata(
+                item_refs,
+                output_embedding_lengths=multimodal_embedding_lengths),
+            metadata)
+        # Hashes, UUIDs and token spans use the same prompt-ordered item refs.
+        if mm_hashes is None:
+            mm_hashes_int32 = random_mm_hashes(len(item_refs))
+        else:
+            mm_hashes_int32 = [
+                hexdigest_to_int32(mm_hashes[m][i]) for m, i in item_refs
+            ]  # nested list w/ multiple int32 per hash
+        mm_uuid_list = (None if mm_uuids_by_key is None else [
+            mm_uuids_by_key[m][i] if m in mm_uuids_by_key else None
+            for m, i in item_refs
+        ])
+        validate_mm_inputs(prompt_token_ids, mm_hashes_int32, start_positions,
+                           num_mm_tokens)
+        multimodal_input = MultimodalInput.from_components(
+            mm_hashes_int32, start_positions, num_mm_tokens, mm_uuid_list,
+            item_run_cu_offsets, run_positions, run_lengths)
+
+        # All checks passed: only now change the request.
+        if embed_mask is not None:
+            _cache_mm_embed_cumsum(multimodal_data, embed_mask)
+        multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = item_metadata
         # Store special token offsets if available
         if len(start_special_token_positions
                ) > 0 and mm_special_token_ids is not None:
-            extra_processed_inputs["multimodal_data"][
+            multimodal_data[
                 "special_token_offsets"] = start_special_token_positions
-        # Hashes, UUIDs and token spans use the same prompt-ordered item refs.
-        mm_hashes_flat = [mm_hashes[m][i] for m, i in item_refs]
-        mm_uuid_list = (None if mm_uuids_by_key is None else
-                        [mm_uuids_by_key[m][i] for m, i in item_refs])
-        validate_mm_inputs(prompt_token_ids, mm_hashes_flat, start_positions,
-                           num_mm_tokens)
-        mm_hashes_int32 = [hexdigest_to_int32(h) for h in mm_hashes_flat
-                           ]  # nested list w/ multiple int32 per hash
-
-        extra_processed_inputs[
-            "multimodal_input"] = MultimodalInput.from_components(
-                mm_hashes_int32, start_positions, num_mm_tokens, mm_uuid_list,
-                item_run_cu_offsets, run_positions, run_lengths)
-        return prompt_token_ids, extra_processed_inputs
+        extra_processed_inputs["multimodal_input"] = multimodal_input
 
     def process_prompt_maybe_hash(
         inputs: TextPrompt, sampling_params: SamplingParams
-    ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
-        try_multimodal_hashing = False  # only used for first time
-        use_multimodal_hashing = False  # used for subsequent calls
-        # Any subset of the supported modalities is eligible for hashing.
-        # ``None`` payloads are skipped so an empty bucket doesn't gate off
-        # hashing for the modalities that are actually present.
-        modalities = [
-            m for m, d in inputs.get('multi_modal_data', {}).items()
-            if d is not None
-        ]
-        if modalities and all(m in MEDIA_MODALITIES for m in modalities):
-            if input_processor.multimodal_hashing_supported is not None:
-                use_multimodal_hashing = input_processor.multimodal_hashing_supported
-            else:
-                # First-time probe: attempt hashing and latch the result on
-                # the input processor.
-                try_multimodal_hashing = True
+    ) -> tuple[list[int], ExtraProcessedInputs | None]:
+        """Run the input processor once and key the multimodal items.
 
-        if try_multimodal_hashing or use_multimodal_hashing:
+        Content hashes come first, from the raw items; then the processor runs
+        and the prompt span of each item is found. An item without a content
+        hash (hashing off or failed) gets a random hash. A request whose item
+        spans cannot be found gets a cache salt of its own instead. Either way,
+        no other request reuses the KV cache blocks of items it cannot match
+        by content.
+        """
+        mm_data = inputs.get('multi_modal_data') or {}
+        # Bad UUIDs are an error in the request, whatever the processor can
+        # do with its items.
+        mm_uuids = inputs.get('multi_modal_uuids')
+        mm_uuids_by_key = validate_mm_uuids(mm_data, mm_uuids)
+        if mm_uuids is None:
+            mm_uuids_by_key = None
+        if not has_mm_items(mm_data):
+            return run_input_processor(inputs, sampling_params)
+
+        processor_name = type(input_processor).__name__
+        uncountable = modalities_without_token_count(mm_data, input_processor)
+        hashing_supported = input_processor.multimodal_hashing_supported
+        mm_hashes = None
+        if not uncountable and hashing_supported is not False:
             try:
-                prompt_token_ids, extra_processed_inputs = multimodal_hashing_process(
-                    inputs, sampling_params)
-                if try_multimodal_hashing:
-                    # if trying for first time, set the flag to True
-                    input_processor.multimodal_hashing_supported = True
-            except Exception as e:
-                logger.warning(f"Multimodal hashing failed: {e}.")
-                if try_multimodal_hashing:
-                    # if trying for first time, fall back to basic input processor
-                    # and set the flag to False so that we don't try again
-                    input_processor.multimodal_hashing_supported = False
-                    logger.warning("Falling back to basic input processor.")
-                    try:
-                        prompt_token_ids, extra_processed_inputs = input_processor(
-                            inputs, sampling_params)
-                    except Exception as e2:
-                        logger.warning(f"Basic input processor failed: {e}.")
-                        logger.debug(traceback.format_exc())
-                        raise e2
-                else:
-                    raise e
+                mm_hashes = apply_mm_hashes(mm_data, mm_uuids_by_key,
+                                            hash_lib).hashes
+            except (TypeError, ValueError) as e:
+                logger.warning_once(
+                    f"{processor_name}: multimodal content hashing failed "
+                    f"({e}). Such items get random hashes, so no other "
+                    "request reuses their KV cache.",
+                    key=f"mm-content-hash-failed:{processor_name}:"
+                    f"{type(e).__name__}")
+
+        prompt_token_ids, extra_processed_inputs = run_input_processor(
+            inputs, sampling_params)
+        if extra_processed_inputs is None:
+            extra_processed_inputs = {}
+        multimodal_data = extra_processed_inputs.setdefault(
+            "multimodal_data", {})
+        if not isinstance(multimodal_data, dict):
+            raise TypeError(
+                "extra_processed_inputs['multimodal_data'] must be a dict")
+
+        if uncountable:
+            reason = f"cannot count the tokens of {uncountable} items"
         else:
             try:
-                prompt_token_ids, extra_processed_inputs = input_processor(
-                    inputs, sampling_params)
-            except Exception as e:
-                logger.warning(f"Basic input processor failed: {e}.")
-                logger.debug(traceback.format_exc())
-                raise e
+                add_multimodal_input(inputs, prompt_token_ids,
+                                     extra_processed_inputs, mm_hashes,
+                                     mm_uuids_by_key)
+            except ValueError as e:
+                # UnsupportedError, a ValueError, means the processor cannot
+                # find item spans for any request: no HF
+                # _get_num_multimodal_tokens, or neither vocab_size nor
+                # mm_token_ids. Only then does a first request turn hashing
+                # off. Other errors come from this request.
+                if hashing_supported is None and isinstance(
+                        e, UnsupportedError):
+                    input_processor.multimodal_hashing_supported = False
+                reason = str(e)
+            else:
+                if mm_hashes is None:
+                    multimodal_data[MULTIMODAL_NO_CONTENT_HASHES_KEY] = True
+                else:
+                    input_processor.multimodal_hashing_supported = True
+                    if encoder_cache_enabled:
+                        # Encoder-cache keys need content hashes.
+                        multimodal_data[
+                            "mm_processor_kwargs_hash"] = _hash_mm_processor_kwargs(
+                                inputs.get("mm_processor_kwargs") or {},
+                                hash_lib)
+                return prompt_token_ids, extra_processed_inputs
 
+        # No item spans: only a cache salt of its own keeps the request apart.
+        modalities = sorted(m for m, items in _mm_items(mm_data).items()
+                            if items)
+        isolate_mm_request(multimodal_data, processor_name, modalities, reason)
         return prompt_token_ids, extra_processed_inputs
 
     def input_processor_wrapper(

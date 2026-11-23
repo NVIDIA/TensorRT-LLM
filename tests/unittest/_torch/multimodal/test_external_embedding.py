@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -141,6 +143,30 @@ def test_llava_next_embeddings_keep_tensor_list(with_grid):
     assert ids == [1, 9, 9, 9, 2, 9, 9, 3]
     torch.testing.assert_close(extra["multimodal_data"]["multimodal_embedding"],
                                torch.cat(embeddings))
+
+
+def test_llava_next_packed_embedding_uuids_follow_image_placeholders():
+    processor = object.__new__(LlavaNextInputProcessor)
+    processor._config = SimpleNamespace(
+        image_token_index=9, text_config=SimpleNamespace(hidden_size=4))
+    inputs = {
+        "prompt_token_ids": [1, 9, 2, 9, 3],
+        "multi_modal_uuids": {
+            "image": ["a", "b"]
+        }
+    }
+    # Four frames, two media items, two rows per frame.
+    packed = torch.zeros(4, 2, 4)
+    ids, _ = processor.attach_multimodal_embeddings(inputs, {"image": packed},
+                                                    SamplingParams())
+    assert ids == [1] + [9] * 4 + [2] + [9] * 4 + [3]
+    with pytest.raises(ValueError, match="UUID list length"):
+        processor.attach_multimodal_embeddings(
+            {
+                **inputs, "multi_modal_uuids": {
+                    "image": ["a"]
+                }
+            }, {"image": packed}, SamplingParams())
 
 
 if __name__ == "__main__":

@@ -740,6 +740,19 @@ def _make_text_only_native_processor() -> MistralNativeInputProcessor:
     return instance
 
 
+@pytest.mark.cpu_only
+def test_native_mistral_prompt_accepts_images_only_with_a_vision_encoder():
+    from tensorrt_llm.llmapi.llm import BaseLLM
+
+    inputs = {"prompt": "[IMG]", "multi_modal_data": {"image": [Image.new("RGB", (28, 28))]}}
+    llm = mock.Mock(spec=BaseLLM)
+    llm.input_processor = _make_text_only_native_processor()
+    with pytest.raises(ValueError, match="supports text only"):
+        BaseLLM._prepare_prompt_inputs(llm, inputs)
+    llm.input_processor = _make_dummy_processor(processor_cls=MistralNativeInputProcessor)
+    assert BaseLLM._prepare_prompt_inputs(llm, inputs) == inputs
+
+
 def test_dummy_mm_max_tokens_per_item_is_image_only():
     proc = _make_dummy_processor(patch_size=14, image_size=1540)
     demand = proc.get_mm_max_tokens_per_item()

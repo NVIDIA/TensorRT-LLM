@@ -32,7 +32,7 @@ from transformers import PreTrainedTokenizerBase
 
 from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.checkpoint_format import CheckpointFormat
-from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.multimodal_data import MEDIA_MODALITIES
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.kv_hints import KvHintsInput
 from tensorrt_llm.llmapi import tracing
@@ -44,7 +44,7 @@ from .._startup_errors import (classify_startup_error, log_startup_error,
 from .._utils import nvtx_range_debug
 from ..bindings import steady_clock_now
 from ..conversation_params import ConversationParams
-from ..disaggregated_params import DisaggregatedParams
+from ..disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
 from ..executor import (DetokenizedGenerationResultBase, GenerationExecutor,
                         GenerationResult, IterationResult, LoRARequest,
                         PostprocWorkerConfig, PromptAdapterRequest)
@@ -54,9 +54,15 @@ from ..executor.postprocessor_hook import (PostProcessorHook,
 from ..executor.request import DEFAULT_REQUEST_PRIORITY
 from ..executor.utils import (RequestError, create_mpi_comm_session,
                               get_spawn_proxy_process_env)
-from ..inputs import (PromptInputs, TokensPrompt, create_input_processor,
-                      create_input_processor_with_hash,
+from ..inputs import (PromptInputs, TextPrompt, TokensPrompt,
+                      create_input_processor, create_input_processor_with_hash,
                       maybe_compute_mm_embed_cumsum, prompt_inputs)
+from ..inputs.multimodal import (MULTIMODAL_CACHE_SALT_KEY,
+                                 MULTIMODAL_NO_CONTENT_HASHES_KEY,
+                                 MultimodalParams, _has_mm_payload_keys,
+                                 has_mm_items, isolate_mm_request,
+                                 request_cache_salt, validate_mm_uuids,
+                                 without_empty_mm_payloads)
 from ..logger import logger
 from ..sampling_params import LogitsProcessor, SamplingParams
 from ..scheduling_params import SchedulingParams
@@ -322,6 +328,23 @@ def _append_logits_processor(sampling_params: SamplingParams,
         existing.append(processor)
     else:
         sampling_params.logits_processor = [existing, processor]
+
+
+def _check_multimodal_processor(llm: "BaseLLM", data: dict) -> None:
+    input_processor = llm.input_processor
+    if (not getattr(input_processor, "accepts_multimodal_inputs", True)
+            or getattr(llm, "startup_metrics", {}).get(
+                "model_loader", {}).get("accepts_multimodal_inputs") is False):
+        raise ValueError(
+            "This model supports text only. Remove multi_modal_data "
+            "and multi_modal_embeddings from the prompt.")
+    supported = getattr(input_processor, "supported_modalities", None)
+    if isinstance(supported, frozenset) and supported:
+        unsupported = (data.keys() & MEDIA_MODALITIES) - supported
+        if unsupported:
+            raise ValueError(
+                f"This checkpoint does not support {sorted(unsupported)} inputs."
+            )
 
 
 def _multimodal_params_have_encoder_features(
@@ -685,6 +708,52 @@ class BaseLLM:
             return dict(inputs)
         return inputs
 
+    def _check_raw_media_encoder(self) -> None:
+        if (getattr(self.args, "disable_mm_encoder", False)
+                and self.startup_metrics.get("model_loader", {}).get(
+                    "mm_encoder_disabled", False)):
+            raise ValueError("Raw multimodal inputs require a local encoder. "
+                             "This deployment disabled its encoder.")
+
+    def _prepare_prompt_inputs(
+            self, inputs: PromptInputs) -> Union[TextPrompt, TokensPrompt]:
+        inputs = prompt_inputs(inputs)
+        if not ("multi_modal_data" in inputs or "multi_modal_embeddings"
+                in inputs or "multi_modal_uuids" in inputs):
+            return inputs
+        mm_data = inputs.get("multi_modal_data") or {}
+        empty = {
+            modality: None
+            for modality, value in mm_data.items()
+            if isinstance(value, dict) and not value
+        }
+        if empty:
+            mm_data = {**mm_data, **empty}
+            inputs = inputs.copy()
+            inputs["multi_modal_data"] = mm_data
+        embeddings = inputs.get("multi_modal_embeddings")
+        has_raw = has_mm_items(mm_data)
+        has_embeddings = has_mm_items(embeddings)
+        if has_raw and has_embeddings:
+            raise ValueError("Provide either multi_modal_data or "
+                             "multi_modal_embeddings.")
+        if has_raw or has_embeddings:
+            _check_multimodal_processor(
+                self,
+                without_empty_mm_payloads(
+                    mm_data if has_raw else embeddings or {}))
+        else:
+            validate_mm_uuids(mm_data or embeddings or {},
+                              inputs.get("multi_modal_uuids"))
+        if (not has_raw and "multi_modal_data" in inputs
+                or not has_embeddings and "multi_modal_embeddings" in inputs):
+            inputs = inputs.copy()
+            if not has_raw:
+                inputs.pop("multi_modal_data", None)
+            if not has_embeddings:
+                inputs.pop("multi_modal_embeddings", None)
+        return inputs
+
     @classmethod
     def _normalize_token_ids(cls, token_ids: Any, name: str) -> List[int]:
         if cls._is_token_id_list(token_ids):
@@ -889,6 +958,28 @@ class BaseLLM:
             prompt_token_ids = inputs.prompt_token_ids
             prompt = None
             multimodal_params = inputs.multimodal_params
+            if multimodal_params is not None:
+                data = multimodal_params.multimodal_data or {}
+                nonempty = without_empty_mm_payloads(data)
+                if _has_mm_payload_keys(nonempty):
+                    _check_multimodal_processor(self, nonempty)
+                    if not is_gen_only and any(m in nonempty
+                                               for m in MEDIA_MODALITIES):
+                        self._check_raw_media_encoder()
+                    # Encoders can require fields with empty tensors or None masks.
+                    nonempty = data
+                    if (multimodal_params.multimodal_input is None and
+                            nonempty.get(MULTIMODAL_CACHE_SALT_KEY) is None):
+                        nonempty = dict(nonempty)
+                        isolate_mm_request(nonempty,
+                                           type(self.input_processor).__name__,
+                                           ["prepared media"],
+                                           "no item identity")
+                if nonempty is not data:
+                    multimodal_params = replace(multimodal_params,
+                                                multimodal_data=nonempty)
+                    if not multimodal_params.has_content():
+                        multimodal_params = None
             preprocessed_encoder_input_token_ids = inputs.encoder_input_token_ids
             if preprocessed_encoder_input_token_ids is not None:
                 preprocessed_encoder_input_token_ids = self._normalize_token_ids(
@@ -922,6 +1013,47 @@ class BaseLLM:
                     disaggregated_params or
                     DisaggregatedParams(request_type="context_and_generation"),
                     multimodal_input_layout=encoder_layout)
+
+        gen_first = ((is_ctx_only or is_gen_only)
+                     and disaggregated_params.schedule_style
+                     == DisaggScheduleStyle.GENERATION_FIRST)
+        shared_salt = (disaggregated_params.multimodal_cache_salt
+                       if is_gen_only or gen_first else None)
+        if gen_first:
+            if multimodal_params is not None and multimodal_params.multimodal_input is not None:
+                # Both workers already have per-item cache keys.
+                shared_salt = None
+            elif shared_salt is None and request_cache_salt(
+                    None, multimodal_params) is not None:
+                raise ValueError(
+                    "Generation-first media without item spans requires the same "
+                    "multimodal_cache_salt on both workers. Use context-first "
+                    "scheduling or allocate the salt before dispatch.")
+        if shared_salt is not None:
+            # Preserve the private namespace across both workers, including decode from token IDs.
+            if multimodal_params is None:
+                multimodal_params = MultimodalParams()
+            data = dict(multimodal_params.multimodal_data or {})
+            data[MULTIMODAL_CACHE_SALT_KEY] = shared_salt.rsplit("/", 1)[-1]
+            data[MULTIMODAL_NO_CONTENT_HASHES_KEY] = True
+            multimodal_params = replace(multimodal_params,
+                                        multimodal_input=None,
+                                        multimodal_data=data)
+            if (cache_salt is not None
+                    and cache_salt != shared_salt and request_cache_salt(
+                        cache_salt, multimodal_params) != shared_salt):
+                raise ValueError(
+                    "cache_salt differs from the context request's cache salt")
+            cache_salt = shared_salt
+        else:
+            cache_salt = request_cache_salt(cache_salt, multimodal_params)
+            if is_ctx_only:
+                context_salt = cache_salt if request_cache_salt(
+                    None, multimodal_params) is not None else None
+                if disaggregated_params.multimodal_cache_salt != context_salt:
+                    disaggregated_params = replace(
+                        disaggregated_params,
+                        multimodal_cache_salt=context_salt)
 
         arrival_time = steady_clock_now(
         ) if self.args.return_perf_metrics else None
@@ -999,7 +1131,7 @@ class BaseLLM:
                 f"The inputs must be type str or list of int, but got {type(inputs)}"
             )
 
-        inputs = prompt_inputs(inputs)
+        inputs = self._prepare_prompt_inputs(inputs)
 
         if "multi_item_part_lens" in inputs:
             raise ValueError(
@@ -1100,6 +1232,8 @@ class BaseLLM:
                                     (("multi_modal_data" in inputs
                                       or "multi_modal_embeddings" in inputs))):
             if 'multi_modal_data' in inputs:
+                if not is_gen_only:
+                    self._check_raw_media_encoder()
                 # TODO: The current design uses a wrapper for existing input processor (input_processor_with_hash)
                 # to handle/add multimodal hashes, positions, and lengths. Now we only support image modality.
                 # In the future, we should refactor this to:
@@ -1124,6 +1258,15 @@ class BaseLLM:
                 maybe_compute_mm_embed_cumsum(
                     prompt_token_ids, extra_processed_inputs,
                     cast(BaseMultimodalInputProcessor, self.input_processor))
+                if (extra_processed_inputs is not None and
+                        extra_processed_inputs.get("multimodal_input") is None
+                        and _has_mm_payload_keys(
+                            extra_processed_inputs.get("multimodal_data"))):
+                    isolate_mm_request(
+                        extra_processed_inputs["multimodal_data"],
+                        type(self.input_processor).__name__,
+                        sorted(mm_embedding_info),
+                        "embeddings attached without item spans")
             else:
                 with nvtx_range_debug("input_processor"):
                     prompt_token_ids, extra_processed_inputs = self.input_processor(
@@ -1294,7 +1437,7 @@ class BaseLLM:
         sampling_params = SamplingParams(add_special_tokens=add_special_tokens)
         batch_multi_item_part_lens = []
         for inp in inputs:
-            inp = prompt_inputs(inp)
+            inp = self._prepare_prompt_inputs(inp)
             if "prompt_token_ids" in inp:
                 inp_tok = cast(TokensPrompt, inp)
                 multi_item_part_lens = inp_tok.get("multi_item_part_lens")

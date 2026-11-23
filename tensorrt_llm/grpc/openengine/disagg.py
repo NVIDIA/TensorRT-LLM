@@ -175,6 +175,11 @@ def disaggregated_params_from_request(
         opaque_state = attrs.get("opaque_state")
         if opaque_state:
             params.opaque_state = base64.b64decode(opaque_state, validate=True)
+        salt = attrs.get("multimodal_cache_salt")
+        if salt is not None:
+            if not isinstance(salt, str):
+                raise ValueError("kv.session multimodal_cache_salt must be a string")
+            params.multimodal_cache_salt = salt
         first_gen_tokens = attrs.get("first_gen_tokens")
         if first_gen_tokens:
             params.first_gen_tokens = [int(token) for token in first_gen_tokens]
@@ -251,6 +256,9 @@ def prefill_ready_response(
         dp_rank=disaggregated_params.ctx_dp_rank or 0,
     )
     attributes: dict[str, Any] = {}
+    salt = getattr(disaggregated_params, "multimodal_cache_salt", None)
+    if salt is not None:
+        attributes["multimodal_cache_salt"] = salt
     if decode_preparation is not None:
         attributes["trtllm_decode_preparation"] = decode_preparation
     endpoint = disaggregated_params.ctx_info_endpoint

@@ -33,7 +33,8 @@ from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalItemMetadata,
-    MultimodalItemPartition, MultimodalParams, split_multimodal_embedding_items)
+    MultimodalItemPartition, MultimodalParams, split_multimodal_embedding_items,
+    validate_mm_uuids)
 
 from ..._utils import async_tensor_h2d, nvtx_range
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
@@ -1149,14 +1150,20 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         for i in range(B):
             mask_i = attn_np[i] == 1
             seq = ids_np[i][mask_i]
-            vision_start_indices = np.flatnonzero(seq == vision_start_token_id)
-            vision_tokens = (seq[vision_start_indices +
-                                 1] if vision_start_indices.size else seq[:0])
-            image_nums = int((vision_tokens == image_token_id).sum())
-            video_nums = int((vision_tokens == video_token_id).sum())
             seq_list = seq.tolist()
             has_image = image_token_id in seq_list
             has_video = video_token_id in seq_list
+            if (B == 1 and len(seq) == S and has_image
+                    and image_grid_np is not None and video_grid_np is None):
+                # All image grids belong to this prompt, including attached
+                # images whose placeholders have no leading vision-start token.
+                image_nums, video_nums = len(image_grid_np), 0
+            else:
+                vision_start_indices = np.flatnonzero(
+                    seq == vision_start_token_id)
+                vision_tokens = seq[vision_start_indices + 1]
+                image_nums = int((vision_tokens == image_token_id).sum())
+                video_nums = int((vision_tokens == video_token_id).sum())
             llm_pos_ids_list = []
             st = 0
             remain_images, remain_videos = image_nums, video_nums
@@ -1327,6 +1334,8 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             multimodal_embedding["image"])
         if not image_embeddings:
             raise ValueError("At least one image embedding is required")
+        uuids = validate_mm_uuids({"image": image_embeddings},
+                                  inputs.get("multi_modal_uuids"))
         merge_size = self.config.vision_config.spatial_merge_size
         image_grid_thw = []
         for index, image_embedding in enumerate(image_embeddings):
@@ -1372,10 +1381,14 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             mrope_input_ids, torch.tensor(image_grid_thw, dtype=torch.long),
             None, attention_mask, None)
 
+        multimodal_params.multimodal_input.multimodal_uuids = uuids.get("image")
         multimodal_data = multimodal_params.multimodal_data
         multimodal_data["multimodal_embedding"] = image_embeddings
         multimodal_data["mrope_config"] = mrope_config
-        return prompt_token_ids, {"multimodal_data": multimodal_data}
+        return prompt_token_ids, {
+            "multimodal_data": multimodal_data,
+            "multimodal_input": multimodal_params.multimodal_input,
+        }
 
     @nvtx_range("Qwen2VLInputProcessorBase forward()")
     @torch.inference_mode()

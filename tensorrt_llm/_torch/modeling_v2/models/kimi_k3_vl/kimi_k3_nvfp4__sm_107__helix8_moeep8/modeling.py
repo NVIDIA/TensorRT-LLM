@@ -7703,6 +7703,7 @@ class KimiK3Sm107Helix8CacheManager(KimiK3Sm107CacheManager):
 class ModelingV2KimiK3Nvfp4Sm107Helix8Moeep8(KimiK3Sm107ForConditionalGeneration):
     """Kimi K3 NVFP4 on SM107, helix8_moeep8."""
 
+    accepts_multimodal_inputs = False
     K3_CONSTANTS: ClassVar[K3Sm107Constants] = CONSTANTS
 
     @property

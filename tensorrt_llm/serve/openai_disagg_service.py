@@ -21,6 +21,7 @@ from typing import Callable, Optional
 from fastapi import HTTPException
 
 from tensorrt_llm._utils import get_global_steady_clock_now_in_seconds
+from tensorrt_llm.inputs.multimodal import new_mm_cache_salt
 from tensorrt_llm.llmapi.disagg_utils import (
     ConditionalDisaggConfig,
     DisaggServerConfig,
@@ -32,6 +33,7 @@ from tensorrt_llm.serve.anthropic_protocol import (
     AnthropicCountTokensRequest,
     AnthropicCountTokensResponse,
 )
+from tensorrt_llm.serve.chat_utils import MM_PARSER_MAP
 from tensorrt_llm.serve.disagg_coordinator import CoordinatorClient, DisaggCoordinator
 from tensorrt_llm.serve.openai_client import OpenAIClient
 from tensorrt_llm.serve.openai_protocol import (
@@ -54,6 +56,7 @@ from tensorrt_llm.serve.output_length_predictor import RECORD_FLUSH_S, OutputLen
 from tensorrt_llm.serve.responses_utils import (
     ResponseHooks,
     UCompletionResponseOrGenerator,
+    chat_messages_from_responses_input,
     done_generator,
     responses_done_generator,
 )
@@ -73,6 +76,35 @@ def _ctx_handoff_slots(response: UCompletionResponse) -> list:
     if isinstance(response, ResponsesResponse):
         return [response]
     return list(response.choices)
+
+
+def _has_disagg_media(request: UCompletionRequest) -> bool:
+    if isinstance(request, ChatCompletionRequest):
+        messages = request.messages
+    elif isinstance(request, ResponsesRequest) and isinstance(request.input, list):
+        try:
+            messages = chat_messages_from_responses_input(request, [])
+        except ValueError:
+            # The worker reports invalid Responses content.
+            return False
+    else:
+        return False
+    found = False
+    for message in messages:
+        parts = message.get("content")
+        if parts is None or isinstance(parts, str):
+            continue
+        if not isinstance(parts, list):
+            # Pydantic can expose chat content as a single-use iterator.
+            parts = message["content"] = list(parts)
+        found = found or any(
+            isinstance(part, dict)
+            and part.get("type") != "text"
+            and (parse := MM_PARSER_MAP.get(part.get("type", ""))) is not None
+            and parse(part) is not None
+            for part in parts
+        )
+    return found
 
 
 def _ctx_usage_info(response: UCompletionResponse) -> Optional[UsageInfo]:
@@ -648,6 +680,7 @@ class OpenAIDisaggregatedService(OpenAIService):
             hooks.on_req_begin(request)
         # empty server means client decides which server to use
         need_ctx = not (await self._check_gen_only_disagg(request))
+        has_media = need_ctx and _has_disagg_media(request)
         ctx_server, gen_server = None, None
         ctx_server_info = None
         ctx_req, gen_req = None, None
@@ -670,6 +703,11 @@ class OpenAIDisaggregatedService(OpenAIService):
             disagg_request_id=disagg_request_id,
             ctx_server_info=ctx_server_info,
         )
+        if has_media:
+            # Workers use this private identity when preprocessing finds no item spans.
+            salt = new_mm_cache_salt(getattr(request, "cache_salt", None))
+            ctx_req.disaggregated_params.multimodal_cache_salt = salt
+            gen_req.disaggregated_params.multimodal_cache_salt = salt
         self._strip_gen_subagent_affinity(gen_req)
         # No orig_elapsed_s before the context phase: GEN admission keeps it FCFS.
 

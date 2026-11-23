@@ -982,6 +982,42 @@ def _make_qwen_vl_embedding_processor(model: str, prompt_ids: List[int]):
 
 
 @pytest.mark.cpu_only
+def test_qwen_attachment_admission_with_empty_raw_media():
+    from tensorrt_llm.inputs.multimodal import MultimodalParams
+    from tensorrt_llm.llmapi.llm import BaseLLM
+
+    processor, width = _make_qwen_vl_embedding_processor("qwen3", [7, 11, 12, 13, 8])
+    processor.processor.mm_special_token_ids = None
+    llm = object.__new__(BaseLLM)
+    llm.shutdown = MagicMock()
+    llm.input_processor = processor
+    llm.args = SimpleNamespace(multimodal_config=None)
+    llm._hf_model_config = processor.config
+    llm._prepare_sampling_params = MagicMock(return_value=SamplingParams())
+    tensor = torch.zeros(6, width)
+    prompt = {
+        "prompt": "image",
+        "multi_modal_embeddings": {
+            "image": [{"mm_embeddings": tensor, "image_grid_thw": [1, 4, 6]}]
+        },
+        "multi_modal_uuids": {"image": ["image-id"]},
+    }
+    with patch.object(MultimodalParams, "to_handle"):
+        regular = llm.preprocess(prompt)
+        empty_raw = llm.preprocess({**prompt, "multi_modal_data": {}})
+        empty_image = llm.preprocess({**prompt, "multi_modal_data": {"image": {}}})
+    for result in (regular, empty_raw, empty_image):
+        assert result.prompt_token_ids == [7, 11] + [12] * 6 + [13, 8]
+        assert result.multimodal_params.multimodal_data["multimodal_embedding"][0] is tensor
+        assert result.multimodal_params.multimodal_input.multimodal_uuids == ["image-id"]
+
+    with pytest.raises(ValueError, match="either multi_modal_data or multi_modal_embeddings"):
+        llm.preprocess({**prompt, "multi_modal_data": {"image": [Image.new("RGB", (2, 2))]}})
+    with pytest.raises(ValueError, match="UUID list length"):
+        llm.preprocess({**prompt, "multi_modal_uuids": {"image": ["a", "b"]}})
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("model", ["qwen2.5", "qwen3"])
 @pytest.mark.parametrize(
     "sizes",
@@ -1057,6 +1093,14 @@ def test_qwen_vl_embeddings_with_image_grid_match_processor_path(model, sizes):
     ids, extra = attach(grids)
 
     assert ids == ref_ids
+    mm_input = extra["multimodal_input"]
+    # Qwen3-VL keys the leading vision-start token together with the embedding rows.
+    leading_tokens = int(model == "qwen3")
+    starts = [i for i, token in enumerate(ids) if token == processor.config.vision_start_token_id]
+    assert mm_input.multimodal_positions == [i + 1 - leading_tokens for i in starts]
+    assert mm_input.multimodal_lengths == [count + leading_tokens for count in rows]
+    hashes = mm_input.multimodal_hashes
+    assert len(hashes) == len({tuple(item_hash) for item_hash in hashes}) == len(rows)
     ref_mrope = ref["multimodal_data"]["mrope_config"]
     mrope = extra["multimodal_data"]["mrope_config"]
     torch.testing.assert_close(mrope["mrope_position_ids"], ref_mrope["mrope_position_ids"])
@@ -1065,10 +1109,42 @@ def test_qwen_vl_embeddings_with_image_grid_match_processor_path(model, sizes):
         # Negative control: swapped grids also pass the row check, but give
         # other positions. So this test fails if an image gets the wrong grid.
         _, swapped = attach(grids.flip(0))
+        assert all(
+            item_hash not in hashes for item_hash in swapped["multimodal_input"].multimodal_hashes
+        )
         assert not torch.equal(
             swapped["multimodal_data"]["mrope_config"]["mrope_position_ids"],
             ref_mrope["mrope_position_ids"],
         )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("model", ["qwen2.5", "qwen3"])
+def test_qwen_vl_bare_image_placeholders_use_each_grid(model):
+    processor, width = _make_qwen_vl_embedding_processor(model, [7, 12, 12, 8])
+    items = [
+        {"mm_embeddings": torch.zeros(2, width), "image_grid_thw": [1, 2, 4]},
+        {"mm_embeddings": torch.zeros(4, width), "image_grid_thw": [1, 4, 4]},
+    ]
+    ids, extra = processor.attach_multimodal_embeddings(
+        {"prompt": "two images"}, {"image": items}, SamplingParams()
+    )
+    assert ids == [7] + [12] * 6 + [8]
+    mm_input = extra["multimodal_input"]
+    assert mm_input.multimodal_positions == [1, 3]
+    assert mm_input.multimodal_lengths == [2, 4]
+    assert mm_input.multimodal_hashes[0] != mm_input.multimodal_hashes[1]
+    positions = extra["multimodal_data"]["mrope_config"]["mrope_position_ids"]
+    torch.testing.assert_close(
+        positions[:, 0],
+        torch.tensor(
+            [
+                [0, 1, 1, 3, 3, 3, 3, 5],
+                [0, 1, 1, 3, 3, 4, 4, 5],
+                [0, 1, 2, 3, 4, 3, 4, 5],
+            ]
+        ),
+    )
 
 
 @pytest.mark.cpu_only

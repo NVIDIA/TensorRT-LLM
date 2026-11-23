@@ -812,6 +812,10 @@ class MistralNativeInputProcessor(MistralPixtralEncoderContract,
             f"tokenizer={type(self._tokenizer).__name__}")
 
     @property
+    def accepts_multimodal_inputs(self) -> bool:
+        return self._has_vision_encoder()
+
+    @property
     def config(self) -> PretrainedConfig:
         return self._config
 
@@ -1051,6 +1055,7 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
             self._multi_modal_projector = Mistral3MultiModalProjector(
                 model_config).eval()
         else:
+            self.mm_encoder_disabled = True
             logger.info(
                 f"{type(self).__name__}: multimodal encoder disabled "
                 "(disable_mm_encoder=True); serving text-only requests.")

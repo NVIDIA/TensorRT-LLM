@@ -9,6 +9,7 @@ current forward. `MultimodalInput` carries the executor boundary representation.
 Processor registration and encoder execution live outside this module.
 """
 
+import secrets
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from itertools import accumulate
@@ -20,6 +21,7 @@ import numpy as np
 import torch
 from blake3 import blake3
 
+from tensorrt_llm._errors import UnsupportedError
 from tensorrt_llm._utils import maybe_pin_memory
 from tensorrt_llm.inputs.multimodal_data import (MEDIA_MODALITIES,
                                                  BaseModalityData, VideoData,
@@ -30,6 +32,16 @@ from tensorrt_llm.logger import logger
 default_hasher = blake3
 _INT32_MAX = 2**31 - 1
 MULTIMODAL_ENCODER_ITEM_METADATA_KEY = "multimodal_encoder_item_metadata"
+# `multimodal_data` flag: the items of the request have no content hashes. They
+# have random hashes, or no hashes and a cache salt of their own, so no other
+# request reuses their KV cache blocks. Code that shares KV blocks by name
+# across requests or servers reads it to leave the request alone.
+MULTIMODAL_NO_CONTENT_HASHES_KEY = "multimodal_no_content_hashes"
+# `multimodal_data` entry: a cache salt drawn for a request whose items have no
+# content hashes and no prompt spans. The KV cache can key such items only by
+# their placeholder tokens, which are the same for every item, so the request
+# is submitted with this salt added to its own (see `request_cache_salt`).
+MULTIMODAL_CACHE_SALT_KEY = "multimodal_cache_salt"
 
 # Versioned tag prefixed to every content hash so the canonical, self-describing
 # serialization scheme can evolve without silently reusing stale cache keys.
@@ -597,7 +609,7 @@ def _validate_multimodal_runs(
 
 
 def strip_mm_data_for_generation(mm_data: Dict[str, Any]) -> None:
-    """Clear `mm_data` in place, retaining only `mrope_config.mrope_position_deltas`.
+    """Release encoder data, keeping generation positions and cache identity.
 
     Shared primitive behind `MultimodalParams.strip_for_generation` (which applies
     it to a detached copy, preserving its caller's dict) and the post-prefill
@@ -610,7 +622,13 @@ def strip_mm_data_for_generation(mm_data: Dict[str, Any]) -> None:
     mrope_deltas = None
     if isinstance(mrope_config, dict):
         mrope_deltas = mrope_config.get('mrope_position_deltas')
+    no_content_hashes = mm_data.get(MULTIMODAL_NO_CONTENT_HASHES_KEY)
+    cache_salt = mm_data.get(MULTIMODAL_CACHE_SALT_KEY)
     mm_data.clear()
+    if no_content_hashes:
+        mm_data[MULTIMODAL_NO_CONTENT_HASHES_KEY] = True
+    if cache_salt is not None:
+        mm_data[MULTIMODAL_CACHE_SALT_KEY] = cache_salt
     if mrope_deltas is not None:
         mm_data['mrope_config'] = {'mrope_position_deltas': mrope_deltas}
 
@@ -668,7 +686,8 @@ class MultimodalInput:
 
     Each element can be:
     - A string UUID: Used as the cache identifier (returned in events)
-    - None: Falls back to content-based hashing for that item
+    - None: No UUID; the item is keyed by its content hash, or by a random
+      hash when it has no content hash
 
     If the UUID string is longer than 32 bytes, it will be hashed internally
     for cache key computation, but the original UUID string is preserved and
@@ -998,9 +1017,10 @@ class MultimodalParams:
 
         Each entry is a tensor of shape ``[output_rows, feature_size]`` or its
         shared-tensor handle. Item output lengths describe those rows; prompt
-        lengths also count model-specific MM framing tokens. Hashes enable
-        the C++ KV-cache representation. Without hashes, only the processed
-        data is retained, as for external embeddings without KV-cache reuse.
+        lengths also count model-specific MM framing tokens. Hashes key the
+        KV cache blocks of the items. Without hashes, each item gets a random
+        one, so no other request reuses the KV cache of these items, and the
+        data is flagged with `MULTIMODAL_NO_CONTENT_HASHES_KEY`.
         """
         item_metadata.validate()
         embedding_lengths = item_metadata.output_embedding_lengths
@@ -1009,29 +1029,20 @@ class MultimodalParams:
             raise ValueError("Embeddings and item output lengths must align")
         if any(length <= 0 for length in embedding_lengths):
             raise ValueError("Attached embedding lengths must be positive")
-        multimodal_input = None
-        if multimodal_hashes is not None:
-            if len(multimodal_hashes) != len(embedding_lengths):
-                raise ValueError(
-                    "Multimodal hashes and item output lengths must align")
-            multimodal_input = MultimodalInput.from_components(
-                multimodal_hashes,
-                multimodal_positions,
-                multimodal_lengths,
-                mm_item_run_cu_offsets=multimodal_item_run_cu_offsets,
-                mm_run_positions=multimodal_run_positions,
-                mm_run_lengths=multimodal_run_lengths,
-            )
-        else:
-            _validate_multimodal_positions_and_lengths(
-                multimodal_positions, multimodal_lengths,
-                len(embedding_lengths), "output_embedding_lengths")
-            _validate_multimodal_runs(len(embedding_lengths),
-                                      multimodal_lengths,
-                                      multimodal_item_run_cu_offsets,
-                                      multimodal_run_positions,
-                                      multimodal_run_lengths,
-                                      "output_embedding_lengths")
+        content_hashed = multimodal_hashes is not None
+        if not content_hashed:
+            multimodal_hashes = random_mm_hashes(len(embedding_lengths))
+        if len(multimodal_hashes) != len(embedding_lengths):
+            raise ValueError(
+                "Multimodal hashes and item output lengths must align")
+        multimodal_input = MultimodalInput.from_components(
+            multimodal_hashes,
+            multimodal_positions,
+            multimodal_lengths,
+            mm_item_run_cu_offsets=multimodal_item_run_cu_offsets,
+            mm_run_positions=multimodal_run_positions,
+            mm_run_lengths=multimodal_run_lengths,
+        )
         data = {
             "multimodal_embedding": embeddings,
             MULTIMODAL_ENCODER_ITEM_METADATA_KEY: item_metadata,
@@ -1041,6 +1052,8 @@ class MultimodalParams:
             if any(offset < 0 for offset in special_token_offsets):
                 raise ValueError("special_token_offsets must be non-negative")
             data["special_token_offsets"] = special_token_offsets
+        if not content_hashed:
+            data[MULTIMODAL_NO_CONTENT_HASHES_KEY] = True
         return cls(multimodal_input=multimodal_input, multimodal_data=data)
 
     @property
@@ -1060,7 +1073,8 @@ class MultimodalParams:
             )
         return metadata.item_refs, metadata.output_embedding_lengths
 
-    def _is_shared_tensor_dict(self, obj: Any) -> bool:
+    @staticmethod
+    def _is_shared_tensor_dict(obj: Any) -> bool:
         """Check if an object is a shared tensor dictionary.
 
         Args:
@@ -1338,8 +1352,7 @@ class MultimodalParams:
     def strip_for_generation(self) -> None:
         """Strip multimodal data for generation processing.
 
-        Keeps only mrope_position_deltas and removes all other multimodal data
-        (embeddings, images, etc.) as they're not needed during generation.
+        Keep position deltas and cache identity while releasing encoder payloads.
         """
         if not self.multimodal_data:
             return
@@ -1381,6 +1394,144 @@ class MMHashResult(NamedTuple):
     """Modality -> list of original UUID strings. `None` entries mark
     items that fell back to content-only hashing. The whole dict is
     `None` when the caller supplied no UUIDs at all."""
+
+
+def _mm_items(mm_data: dict[str, Any]) -> dict[str, list[Any]]:
+    """Modality -> list of items. A modality set to None has no items."""
+    return {
+        modality: items if isinstance(items, list) else [items]
+        for modality, items in mm_data.items() if items is not None
+    }
+
+
+def has_mm_items(mm_data: dict[str, Any] | None) -> bool:
+    """Whether `mm_data` has at least one item of any modality."""
+    return any(_mm_items(mm_data or {}).values())
+
+
+def modalities_without_token_count(mm_data: dict[str, Any],
+                                   input_processor: Any) -> list[str]:
+    """Modalities of `mm_data` with items whose tokens cannot be counted.
+
+    Counting needs a media modality and a `get_num_tokens_per_<modality>`
+    method on `input_processor`. Without the counts, the prompt span of the
+    items cannot be found.
+    """
+    return [
+        modality for modality, items in _mm_items(mm_data).items()
+        if items and (modality not in MEDIA_MODALITIES or not hasattr(
+            input_processor, f"get_num_tokens_per_{modality}"))
+    ]
+
+
+def validate_mm_uuids(
+    mm_data: dict[str, Any],
+    mm_uuids: dict[str, Any] | None,
+) -> dict[str, list[str | None]]:
+    """Check a request's `multi_modal_uuids` against its `mm_data`.
+
+    Returns modality -> one UUID string or None per item, for each modality
+    with items and UUIDs. A modality set to None in `mm_uuids` has no UUIDs.
+    Raises ValueError for a malformed value or a modality that `mm_data` does
+    not have, which is an error in the request.
+    """
+    if mm_uuids is None:
+        return {}
+    if not isinstance(mm_uuids, dict):
+        raise ValueError(
+            "multi_modal_uuids must be a dict of modality to UUIDs, got "
+            f"{type(mm_uuids).__name__}")
+    items_by_modality = _mm_items(mm_data)
+    uuids_by_modality: dict[str, list[str | None]] = {}
+    for modality, uuids in mm_uuids.items():
+        if modality not in mm_data:
+            raise ValueError(
+                f"multi_modal_uuids has modality '{modality}', which "
+                "multi_modal_data does not have")
+        if uuids is None:
+            continue
+        if not isinstance(uuids, list):
+            uuids = [uuids]
+        items = items_by_modality.get(modality, [])
+        if len(uuids) != len(items):
+            raise ValueError(
+                f"UUID list length ({len(uuids)}) doesn't match "
+                f"data items length ({len(items)}) for modality '{modality}'")
+        for uuid in uuids:
+            if uuid is not None and not isinstance(uuid, str):
+                raise ValueError(
+                    f"multi_modal_uuids['{modality}'] items must be strings "
+                    f"or None, got {type(uuid).__name__}")
+        if items:
+            uuids_by_modality[modality] = uuids
+    return uuids_by_modality
+
+
+def new_mm_cache_salt(cache_salt: str | None = None) -> str:
+    """Create a private cache salt for one multimodal request."""
+    return _combine_mm_cache_salt(cache_salt,
+                                  f"mm-no-item-spans-{secrets.token_hex(16)}")
+
+
+def isolate_mm_request(multimodal_data: dict[str, Any], processor_name: str,
+                       modalities: list[str], reason: str) -> None:
+    """Give a request whose multimodal items have no prompt spans a cache salt.
+
+    Without item spans, the KV cache can key the items only by their
+    placeholder tokens, which are the same for every item. A cache salt of
+    the request's own (`MULTIMODAL_CACHE_SALT_KEY`, added to its salt by
+    `request_cache_salt`) keeps it from sharing those blocks.
+    """
+    multimodal_data[MULTIMODAL_NO_CONTENT_HASHES_KEY] = True
+    multimodal_data[MULTIMODAL_CACHE_SALT_KEY] = new_mm_cache_salt()
+    logger.warning_once(
+        f"{processor_name}: the prompt spans of {modalities} items were "
+        f"not found ({reason}). Such requests get a cache salt of their "
+        "own, so no other request reuses their KV cache.",
+        key=f"mm-no-item-spans:{processor_name}:{modalities}")
+    logger.debug(f"{processor_name}: no multimodal item spans: {reason}")
+
+
+def request_cache_salt(
+        cache_salt: str | None,
+        multimodal_params: "MultimodalParams | None") -> str | None:
+    """The cache salt to submit a request with.
+
+    `cache_salt`, with the request's own multimodal salt added when its
+    processed data has one (`MULTIMODAL_CACHE_SALT_KEY`), so no other request
+    reuses its KV cache blocks. Long caller salts use a digest so both
+    identities fit within the executor's byte limit. A
+    `cache_salt` that no request may have is returned as is, so the request
+    fails as any other would.
+    """
+    multimodal_data = (None if multimodal_params is None else
+                       multimodal_params.multimodal_data)
+    if not isinstance(multimodal_data, dict):
+        return cache_salt
+    multimodal_salt = multimodal_data.get(MULTIMODAL_CACHE_SALT_KEY)
+    if multimodal_salt is None:
+        return cache_salt
+    return _combine_mm_cache_salt(cache_salt, multimodal_salt)
+
+
+def _combine_mm_cache_salt(cache_salt: str | None, multimodal_salt: str) -> str:
+    if cache_salt is None:
+        return multimodal_salt
+    # The executor imports this module.
+    from tensorrt_llm.executor.request import GenerationRequest
+    max_bytes = GenerationRequest.MAX_CACHE_SALT_LEN
+    if not isinstance(cache_salt, str):
+        return cache_salt
+    caller_bytes = cache_salt.encode("utf-8")
+    if len(caller_bytes) > max_bytes:
+        return cache_salt
+    # Reserve the digest prefix so a literal caller salt cannot impersonate it.
+    if (len(caller_bytes) + 1 + len(multimodal_salt.encode("utf-8")) > max_bytes
+            or cache_salt.startswith("blake3:")):
+        digest = blake3(caller_bytes,
+                        derive_key_context="trtllm.mm.cache_salt.v1")
+        cache_salt = f"blake3:{digest.hexdigest()}"
+    return f"{cache_salt}/{multimodal_salt}"
 
 
 def apply_mm_hashes(mm_data: Dict[str, Any],
@@ -1429,25 +1580,14 @@ def apply_mm_hashes(mm_data: Dict[str, Any],
         hasher.update(b"</content>")
         return hasher.hexdigest()
 
-    mm_items = {
-        modality: items if isinstance(items, list) else [items]
-        for modality, items in mm_data.items()
-    }
+    mm_items = _mm_items(mm_data)
 
     mm_hashes: Dict[str, List[str]] = {}
     mm_uuids_by_key: Dict[str, List[Optional[str]]] = {}
+    uuids_by_modality = validate_mm_uuids(mm_data, mm_uuids)
 
     for modality, items in mm_items.items():
-        modality_uuids = None
-        if mm_uuids is not None and modality in mm_uuids:
-            modality_uuids = mm_uuids[modality]
-            if not isinstance(modality_uuids, list):
-                modality_uuids = [modality_uuids]
-            if len(modality_uuids) != len(items):
-                raise ValueError(
-                    f"UUID list length ({len(modality_uuids)}) doesn't match "
-                    f"data items length ({len(items)}) for modality '{modality}'"
-                )
+        modality_uuids = uuids_by_modality.get(modality)
 
         hashes: List[str] = []
         uuids: List[Optional[str]] = []
@@ -1484,6 +1624,15 @@ def hexdigest_to_int32(hex_digest: str) -> List[int]:
             value = value - 0x100000000  # Convert to signed by subtracting 2^32
         result.append(value)
     return result
+
+
+def random_mm_hashes(num_items: int) -> list[list[int]]:
+    """A random hash (8 int32 values) for each of `num_items` multimodal items.
+
+    For items without a content hash. KV block reuse keys the blocks of an item
+    by its hash, so with a random one no other request matches these blocks.
+    """
+    return [hexdigest_to_int32(secrets.token_hex(32)) for _ in range(num_items)]
 
 
 def int32_to_hexdigest(int32_values: List[int]) -> str:
@@ -1524,10 +1673,7 @@ def find_mm_token_lengths(
     to end, not just pure image/video/audio tokens.
 
     """
-    mm_items = {
-        modality: items if isinstance(items, list) else [items]
-        for modality, items in mm_data.items()
-    }
+    mm_items = _mm_items(mm_data)
     num_mm_tokens = {}
 
     mm_video_dict = (multimodal_data or {}).get("video") or {}
@@ -1540,11 +1686,18 @@ def find_mm_token_lengths(
         if video_grid_thw.ndim != 2 or video_grid_thw.shape[-1] != 3:
             raise ValueError("video_grid_thw must have shape [num_segments, 3]")
 
+    uncountable = modalities_without_token_count(mm_data, input_processor)
+    if uncountable:
+        raise UnsupportedError(
+            f"Input processor {type(input_processor).__name__} cannot count "
+            f"the tokens of {uncountable} items: it needs a "
+            "'get_num_tokens_per_<modality>' method for a media modality.")
+
     for modality, items in mm_items.items():
-        if not hasattr(input_processor, f"get_num_tokens_per_{modality}"):
-            raise AttributeError(
-                f"Input processor {type(input_processor).__name__} does not have 'get_num_tokens_per_{modality}' method required for multimodal hashing."
-            )
+        if not items:
+            # Nothing to count, so a missing hook does not matter.
+            num_mm_tokens[modality] = []
+            continue
 
         video_grid_thw_for_items = None
         if modality == "video" and video_grid_thw is not None:
@@ -1614,13 +1767,48 @@ def find_mm_token_lengths(
 # payload (e.g. mrope-only warmup on an mrope-enabled model) and the
 # check_mm_embed_cumsum_if_needed gate short-circuits.
 _MM_METADATA_ONLY_KEYS = frozenset({
+    MULTIMODAL_CACHE_SALT_KEY,
+    MULTIMODAL_NO_CONTENT_HASHES_KEY,
     "mrope_config",
+    "mm_bidirectional_blocks",
+    "mm_processor_kwargs_hash",
     "multimodal_embed_mask_cumsum",
     "multimodal_embedding_metadata",
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     "special_token_offsets",
     "layout_metadata",
 })
+
+
+def without_empty_mm_payloads(data: dict) -> dict:
+    """Drop absent payload fields while preserving request metadata and shared handles."""
+
+    def populated(value: Any) -> bool:
+        if isinstance(value, torch.Tensor):
+            return value.numel() > 0
+        if isinstance(value, np.ndarray):
+            return value.size > 0
+        if isinstance(value, (list, tuple, dict)):
+            return bool(value)
+        return value is not None
+
+    nonempty = {
+        key: value
+        for key, value in data.items()
+        if key in _MM_METADATA_ONLY_KEYS or populated(value)
+    }
+    return data if len(nonempty) == len(data) else nonempty
+
+
+def _has_embedding_rows(embeddings: Any) -> bool:
+    if isinstance(embeddings, list):
+        return any(_has_embedding_rows(item) for item in embeddings)
+    if isinstance(embeddings, (torch.Tensor, np.ndarray)):
+        return 0 not in embeddings.shape
+    if MultimodalParams._is_shared_tensor_dict(embeddings):
+        shape = embeddings["tensor_size"]
+        return not isinstance(shape, (list, tuple)) or 0 not in shape
+    return embeddings is not None
 
 
 def _has_mm_payload_keys(py_multimodal_data: Optional[dict]) -> bool:
@@ -1633,7 +1821,11 @@ def _has_mm_payload_keys(py_multimodal_data: Optional[dict]) -> bool:
     """
     if not py_multimodal_data:
         return False
-    return bool(set(py_multimodal_data.keys()) - _MM_METADATA_ONLY_KEYS)
+    payload_keys = py_multimodal_data.keys() - _MM_METADATA_ONLY_KEYS
+    if payload_keys == {"multimodal_embedding"}:
+        # Empty handles still travel to the worker so it can consume the IPC reference.
+        return _has_embedding_rows(py_multimodal_data["multimodal_embedding"])
+    return bool(payload_keys)
 
 
 # TODO(TRTLLM-11951): fold this gate into MultimodalRuntimeData.__post_init__
@@ -1760,6 +1952,20 @@ def _compute_mm_masks(
     return mm_mask, embed_mask, special_mask
 
 
+def _check_mm_token_count(mm_positions: torch.Tensor, lengths_t: torch.Tensor,
+                          num_mm_tokens: List[int]) -> None:
+    """Raise ValueError when the prompt has another number of multimodal tokens.
+
+    The per-item counts come from the processor's token-count methods, so a
+    request they get wrong (for example, other processor kwargs) fails here.
+    """
+    if mm_positions.numel() != lengths_t.sum().item():
+        raise ValueError(
+            f"Number of multimodal tokens ({mm_positions.numel()}) does not "
+            f"match sum of per-unit lengths ({lengths_t.sum().item()}): "
+            f"num_mm_tokens={num_mm_tokens}")
+
+
 def _find_mm_token_start_pos_from_masks(
     mm_mask: torch.Tensor,
     special_mask: Optional[torch.Tensor],
@@ -1792,10 +1998,7 @@ def _find_mm_token_start_pos_from_masks(
         start_special_token_positions = []
 
     lengths_t = torch.tensor(num_mm_tokens)
-    assert mm_positions.numel() == lengths_t.sum().item(), (
-        f"Number of multimodal tokens ({mm_positions.numel()}) does not match "
-        f"sum of per-unit lengths ({lengths_t.sum().item()}): "
-        f"num_mm_tokens={num_mm_tokens}")
+    _check_mm_token_count(mm_positions, lengths_t, num_mm_tokens)
 
     offsets = torch.zeros(len(num_mm_tokens), dtype=torch.long)
     if len(num_mm_tokens) > 1:
@@ -1817,10 +2020,7 @@ def _find_mm_token_runs_from_mask(
 
     mm_positions = torch.where(mm_mask)[0]
     lengths_t = torch.tensor(num_mm_tokens)
-    assert mm_positions.numel() == lengths_t.sum().item(), (
-        f"Number of multimodal tokens ({mm_positions.numel()}) does not match "
-        f"sum of per-unit lengths ({lengths_t.sum().item()}): "
-        f"num_mm_tokens={num_mm_tokens}")
+    _check_mm_token_count(mm_positions, lengths_t, num_mm_tokens)
 
     # Full-prompt start index for each emitted flat multimodal run.
     run_positions: List[int] = []
@@ -1865,10 +2065,7 @@ def _find_mm_embedding_lengths_from_masks(
 
     mm_positions = torch.where(mm_mask)[0]
     lengths_t = torch.tensor(num_mm_tokens)
-    assert mm_positions.numel() == lengths_t.sum().item(), (
-        f"Number of multimodal tokens ({mm_positions.numel()}) does not match "
-        f"sum of per-unit lengths ({lengths_t.sum().item()}): "
-        f"num_mm_tokens={num_mm_tokens}")
+    _check_mm_token_count(mm_positions, lengths_t, num_mm_tokens)
 
     embedding_lengths: List[int] = []
     offset = 0
@@ -1887,13 +2084,12 @@ def validate_mm_inputs(prompt_token_ids: Union[torch.Tensor, List[int],
     """Validates multimodal inputs for consistency and correctness."""
     # Validate number of hashes matches number of chunks
     if len(mm_hashes) != len(num_mm_tokens):
-        raise AssertionError(
-            f"Number of hashes ({len(mm_hashes)}) does not match "
-            f"number of multimodal chunks ({len(num_mm_tokens)})")
+        raise ValueError(f"Number of hashes ({len(mm_hashes)}) does not match "
+                         f"number of multimodal chunks ({len(num_mm_tokens)})")
 
     # Validate number of start positions matches number of chunks
     if len(start_positions) != len(num_mm_tokens):
-        raise AssertionError(
+        raise ValueError(
             f"Number of start positions ({len(start_positions)}) does not match "
             f"number of multimodal chunks ({len(num_mm_tokens)})")
     # Validate each chunk's position and length
@@ -1901,18 +2097,17 @@ def validate_mm_inputs(prompt_token_ids: Union[torch.Tensor, List[int],
     # Verify start_positions are sorted
     if not all(start_positions[i] < start_positions[i + 1]
                for i in range(len(start_positions) - 1)):
-        raise AssertionError(
-            "start_positions must be sorted in ascending order")
+        raise ValueError("start_positions must be sorted in ascending order")
     for chunk_idx, (start_pos,
                     chunk_len) in enumerate(zip(start_positions,
                                                 num_mm_tokens)):
         if start_pos < 0:
-            raise AssertionError(
+            raise ValueError(
                 f"Invalid negative start position {start_pos} for chunk {chunk_idx}"
             )
 
         if start_pos + chunk_len > prompt_len:
-            raise AssertionError(
+            raise ValueError(
                 f"Multimodal chunk {chunk_idx} at position {start_pos} with length {chunk_len} "
                 f"exceeds input sequence length {prompt_len}")
 
@@ -1920,7 +2115,7 @@ def validate_mm_inputs(prompt_token_ids: Union[torch.Tensor, List[int],
         if chunk_idx < len(start_positions) - 1:
             next_start = start_positions[chunk_idx + 1]
             if start_pos + chunk_len > next_start:
-                raise AssertionError(
+                raise ValueError(
                     f"Multimodal chunk {chunk_idx} at position {start_pos} with length {chunk_len} "
                     f"overlaps with chunk {chunk_idx + 1} at position {next_start}"
                 )

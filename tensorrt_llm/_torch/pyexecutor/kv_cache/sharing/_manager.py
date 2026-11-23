@@ -305,11 +305,16 @@ def stale_range(manager: KVCacheManagerV2, layer_group: int, history: int) -> tu
 
 def keyed_by_placeholders(request: LlmRequest) -> bool:
     """Whether the request carries multimodal data that the manager keys by its placeholder tokens
-    alone, as ``_augment_tokens_for_block_reuse`` does without a digest, position or length."""
-    return request.py_multimodal_data is not None and (
+    alone, as ``_augment_tokens_for_block_reuse`` does without a digest, position or length, or by
+    random digests, which the input processor flags as not naming the content."""
+    from tensorrt_llm.inputs.multimodal import MULTIMODAL_NO_CONTENT_HASHES_KEY
+
+    data = request.py_multimodal_data
+    return data is not None and (
         request.multimodal_hashes is None
         or request.multimodal_positions is None
         or request.multimodal_lengths is None
+        or (isinstance(data, dict) and bool(data.get(MULTIMODAL_NO_CONTENT_HASHES_KEY)))
     )
 
 

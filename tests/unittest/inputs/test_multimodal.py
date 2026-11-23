@@ -4,15 +4,18 @@
 
 from types import SimpleNamespace
 from typing import get_args
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pytest
 import torch
 
+from tensorrt_llm.inputs import registry
 from tensorrt_llm.inputs.media_io import MEDIA_IO_REGISTRY, MediaModality
 from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_CACHE_SALT_KEY,
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    MULTIMODAL_NO_CONTENT_HASHES_KEY,
     MultimodalInput,
     MultimodalItemMetadata,
     MultimodalItemPartition,
@@ -20,10 +23,14 @@ from tensorrt_llm.inputs.multimodal import (
     MultimodalRuntimeData,
     _find_mm_embedding_lengths_from_masks,
     find_mm_token_lengths,
+    modalities_without_token_count,
+    request_cache_salt,
     select_multimodal_fields,
 )
 from tensorrt_llm.inputs.multimodal_data import MEDIA_MODALITIES, AudioData, VideoData
 from tensorrt_llm.inputs.registry import (
+    BaseMultimodalInputProcessor,
+    DefaultInputProcessor,
     create_input_processor_with_hash,
     maybe_compute_mm_embed_cumsum,
 )
@@ -706,6 +713,749 @@ def test_mm_item_metadata_rejects_conflicting_prompt_order(hashing_enabled: bool
     assert processor.multimodal_hashing_supported is hashing_enabled
 
 
+class _ProbeFakeProcessor(_KwargsHashFakeProcessor):
+    multimodal_hashing_supported: bool | None = None
+
+    def __init__(
+        self,
+        call_error: Exception | None = None,
+        count_error: Exception | None = None,
+        vocab_size: int | None = 100,
+    ) -> None:
+        self.call_error = call_error
+        self.count_error = count_error
+        self.vocab_size = vocab_size
+        self.calls = 0
+
+    def __call__(self, inputs: dict, sampling_params: object) -> tuple[list[int], dict]:
+        self.calls += 1
+        if self.call_error is not None:
+            raise self.call_error
+        return super().__call__(inputs, sampling_params)
+
+    def get_num_tokens_per_image(self, *, image: np.ndarray) -> int:
+        if self.count_error is not None:
+            raise self.count_error
+        return super().get_num_tokens_per_image(image=image)
+
+    def get_vocab_size(self) -> int | None:
+        return self.vocab_size
+
+
+_PROBE_INPUTS = {"prompt": "unused", "multi_modal_data": {"image": [np.array([1], dtype=np.uint8)]}}
+_AUDIO_INPUTS = {"prompt": "unused", "multi_modal_data": {"audio": [np.zeros(2, dtype=np.float32)]}}
+
+
+def _assert_isolated(extra: dict) -> str:
+    """The request has no item spans and a cache salt of its own; returns that salt."""
+    data = extra["multimodal_data"]
+    assert "multimodal_input" not in extra
+    assert data[MULTIMODAL_NO_CONTENT_HASHES_KEY] is True
+    salt = request_cache_salt(None, MultimodalParams(multimodal_data=data))
+    assert salt is not None
+    assert request_cache_salt("user", MultimodalParams(multimodal_data=data)) == f"user/{salt}"
+    return salt
+
+
+@pytest.mark.parametrize(
+    "call_error",
+    [ValueError("bad image"), NotImplementedError("bad image")],
+    ids=["processor_error", "processor_unsupported_input"],
+)
+def test_processor_error_runs_the_processor_once_and_keeps_hashing_on(call_error) -> None:
+    """A request the processor rejects fails after one run and does not turn hashing off."""
+    processor = _ProbeFakeProcessor(call_error)
+    wrapped = create_input_processor_with_hash(processor)
+
+    with pytest.raises(type(call_error), match="bad image"):
+        wrapped(_PROBE_INPUTS, None)
+    assert processor.calls == 1
+    assert processor.multimodal_hashing_supported is None
+
+    processor.call_error = None
+    _, extra = wrapped(_PROBE_INPUTS, None)
+    assert processor.calls == 2
+    assert processor.multimodal_hashing_supported is True
+    assert extra["multimodal_input"].multimodal_hashes == [_CONTENT_HASH_SNAPSHOT["image"]]
+
+
+@pytest.mark.parametrize("hashing_supported", [None, True], ids=["probe", "hashing_on"])
+def test_token_count_error_isolates_the_request(hashing_supported) -> None:
+    """The token count fails for one request (other processor kwargs, say): no item spans.
+
+    The request is served after one processor run, with a cache salt of its own, so it shares
+    no KV cache blocks keyed by placeholder tokens. Hashing stays as it was.
+    """
+    processor = _ProbeFakeProcessor(count_error=ValueError("other max_pixels"))
+    processor.multimodal_hashing_supported = hashing_supported
+    wrapped = create_input_processor_with_hash(processor)
+
+    salts = {_assert_isolated(wrapped(_PROBE_INPUTS, None)[1]) for _ in range(2)}
+    assert len(salts) == 2
+    assert processor.calls == 2
+    assert processor.multimodal_hashing_supported is hashing_supported
+
+    processor.count_error = None
+    _, extra = wrapped(_PROBE_INPUTS, None)
+    assert processor.multimodal_hashing_supported is True
+    assert extra["multimodal_input"].multimodal_hashes == [_CONTENT_HASH_SNAPSHOT["image"]]
+    assert MULTIMODAL_CACHE_SALT_KEY not in extra["multimodal_data"]
+
+
+@pytest.mark.parametrize(
+    "count_error",
+    [NotImplementedError("bug"), AttributeError("bug"), TypeError("bug")],
+    ids=["not_implemented", "attribute_error", "type_error"],
+)
+def test_other_token_count_errors_fail_the_request(count_error) -> None:
+    """Only a ValueError from the token count means "no spans"; anything else is a bug to see."""
+    processor = _ProbeFakeProcessor(count_error=count_error)
+    wrapped = create_input_processor_with_hash(processor)
+
+    with pytest.raises(type(count_error), match="bug"):
+        wrapped(_PROBE_INPUTS, None)
+    assert processor.calls == 1
+    assert processor.multimodal_hashing_supported is None
+
+
+@pytest.mark.parametrize("no_items", [[], None], ids=["empty_list", "none"])
+def test_modality_without_items_keeps_hashing_on(no_items) -> None:
+    """An empty modality says nothing about whether the processor can hash.
+
+    An image request with ``"audio": []`` hashes its image and turns hashing on.
+    """
+    processor = _ProbeFakeProcessor()  # Counts image tokens only.
+    wrapped = create_input_processor_with_hash(processor)
+    image = _PROBE_INPUTS["multi_modal_data"]["image"]
+
+    _, extra = wrapped(
+        {"prompt": "unused", "multi_modal_data": {"image": image, "audio": no_items}}, None
+    )
+    assert processor.multimodal_hashing_supported is True
+    assert extra["multimodal_input"].multimodal_hashes == [_CONTENT_HASH_SNAPSHOT["image"]]
+
+
+@pytest.mark.parametrize(
+    "hashing_supported", [None, True, False], ids=["unknown", "hashing_on", "hashing_off"]
+)
+@pytest.mark.parametrize("inputs", [_PROBE_INPUTS, _AUDIO_INPUTS], ids=["image", "audio"])
+@pytest.mark.parametrize(
+    "uuids",
+    [{"image": [123]}, {"image": ["a", "b"]}, ["image-uuid"], {"images": ["a"]}],
+    ids=["int_uuid", "length_mismatch", "not_a_dict", "unknown_modality"],
+)
+def test_bad_multimodal_uuids_are_a_request_error(uuids, inputs, hashing_supported) -> None:
+    """Bad UUIDs fail the request before any processing and do not change the hashing flag.
+
+    Also for audio, whose tokens the processor cannot count, so it is never hashed.
+    """
+    modality = next(iter(inputs["multi_modal_data"]))
+    if isinstance(uuids, dict) and "image" in uuids:
+        uuids = {modality: uuids["image"]}
+    processor = _ProbeFakeProcessor()
+    processor.multimodal_hashing_supported = hashing_supported
+    wrapped = create_input_processor_with_hash(processor)
+
+    with pytest.raises(ValueError, match="(?i)uuid"):
+        wrapped({**inputs, "multi_modal_uuids": uuids}, None)
+    assert processor.calls == 0
+    assert processor.multimodal_hashing_supported is hashing_supported
+
+
+class _NoHfTokenCountProcessor(_ProbeFakeProcessor):
+    """Counts image tokens with the base processor, whose HF processor cannot."""
+
+    processor = object()
+    get_num_multimodal_tokens = BaseMultimodalInputProcessor.get_num_multimodal_tokens
+    get_num_tokens_per_image = BaseMultimodalInputProcessor.get_num_tokens_per_image
+
+
+@pytest.mark.parametrize(
+    "processor_cls,vocab_size",
+    [(_NoHfTokenCountProcessor, 100), (_ProbeFakeProcessor, None)],
+    ids=["no_hf_token_count", "no_vocab_or_mm_ids"],
+)
+def test_unsupported_hashing_turns_hashing_off(processor_cls, vocab_size) -> None:
+    """A processor that cannot find item spans turns hashing off; its requests are isolated."""
+    processor = processor_cls(vocab_size=vocab_size)
+    wrapped = create_input_processor_with_hash(processor)
+    inputs = {
+        "prompt": "unused",
+        "multi_modal_data": {"image": [np.zeros((2, 2, 3), dtype=np.uint8)]},
+    }
+
+    salts = set()
+    for _ in range(2):
+        salts.add(_assert_isolated(wrapped(inputs, None)[1]))
+        assert processor.multimodal_hashing_supported is False
+    assert len(salts) == 2
+    assert processor.calls == 2  # One processor run per request.
+
+
+def test_modality_without_token_count_hook_does_not_change_other_modalities() -> None:
+    """A bad image, a good image, then audio, which the processor cannot count (as Phi-4-MM).
+
+    The audio request is served after one processor run, with a cache salt of its own, and
+    image requests keep hashing.
+    """
+    processor = _ProbeFakeProcessor(count_error=ValueError("bad image"))  # Counts images only.
+    wrapped = create_input_processor_with_hash(processor)
+
+    _assert_isolated(wrapped(_PROBE_INPUTS, None)[1])
+    processor.count_error = None
+    _, extra = wrapped(_PROBE_INPUTS, None)
+    assert extra["multimodal_input"].multimodal_hashes == [_CONTENT_HASH_SNAPSHOT["image"]]
+
+    calls = processor.calls
+    _assert_isolated(wrapped(_AUDIO_INPUTS, None)[1])
+    assert processor.calls == calls + 1
+    assert processor.multimodal_hashing_supported is True
+
+    _, extra = wrapped(_PROBE_INPUTS, None)
+    assert extra["multimodal_input"].multimodal_hashes == [_CONTENT_HASH_SNAPSHOT["image"]]
+
+
+def test_phi4mm_has_no_audio_token_count() -> None:
+    """Phi-4-MM audio takes the no-span path above: it counts image tokens but not audio."""
+    from tensorrt_llm._torch.models.modeling_phi4mm import Phi4MMInputProcessor
+
+    image_and_audio = {"image": [np.zeros((2, 2, 3))], "audio": [np.zeros(2)]}
+    assert modalities_without_token_count(image_and_audio, Phi4MMInputProcessor) == ["audio"]
+
+
+class _PilOnlyKimiImageProcessor:
+    """Counts tokens as the Kimi K3 checkpoint does: PIL images only, else ValueError."""
+
+    media_proc_cfg = {"temporal_merge_kernel_size": 2}
+
+    def media_tokens_calculator(self, media: dict) -> int:
+        from PIL import Image
+
+        items = [media["image"]] if media["type"] == "image" else media["video_chunk"]
+        if not all(isinstance(item, Image.Image) for item in items):
+            raise ValueError(f"Unsupported data type: {type(items[0])}")
+        width, height = items[0].size
+        return (width // 28) * (height // 28)
+
+
+def test_kimi_counts_the_tokens_of_tensor_images_and_frames() -> None:
+    """trtllm-serve passes images and video frames as tensors (format="pt").
+
+    A count that rejects them leaves every such request without item spans, so it would reuse
+    no KV cache at all.
+    """
+    from tensorrt_llm._torch.models.modeling_kimi_k25 import KimiK25InputProcessor
+
+    processor = object.__new__(KimiK25InputProcessor)
+    processor._processor = SimpleNamespace(image_processor=_PilOnlyKimiImageProcessor())
+    frame = torch.zeros(3, 56, 84, dtype=torch.uint8)
+
+    assert processor.get_num_tokens_per_image(image=frame) == 6
+    assert processor.get_num_tokens_per_video(video=[frame] * 3) == 12
+
+
+@pytest.mark.parametrize("hashing_off", [True, False], ids=["hashing_off", "hashing_failed"])
+def test_request_without_content_hashes_gets_random_hashes(monkeypatch, hashing_off) -> None:
+    """Hashing off, or hashing failed for this request: the items get random hashes.
+
+    Two requests with the same image and prompt get the same spans and other hashes, which are
+    not the image's content hash, so their KV cache blocks get other keys. A supplied UUID is kept.
+    """
+    processor = _ProbeFakeProcessor()
+    if hashing_off:
+        processor.multimodal_hashing_supported = False
+    else:
+
+        def cannot_hash(*args: object, **kwargs: object) -> None:
+            raise ValueError("cannot hash this image")
+
+        monkeypatch.setattr(registry, "apply_mm_hashes", cannot_hash)
+    wrapped = create_input_processor_with_hash(processor)
+
+    inputs = [dict(_PROBE_INPUTS), dict(_PROBE_INPUTS)]
+    inputs[0]["multi_modal_uuids"] = {"image": ["image-0"]}
+    extras = [wrapped(request, None)[1] for request in inputs]
+    mm_inputs = [extra["multimodal_input"] for extra in extras]
+
+    assert processor.calls == 2
+    assert processor.multimodal_hashing_supported is (False if hashing_off else None)
+    for extra, mm_input in zip(extras, mm_inputs):
+        assert mm_input.multimodal_positions == [1]
+        assert mm_input.multimodal_lengths == [2]
+        assert mm_input.multimodal_hashes != [_CONTENT_HASH_SNAPSHOT["image"]]
+        assert extra["multimodal_data"][MULTIMODAL_NO_CONTENT_HASHES_KEY] is True
+        assert MULTIMODAL_CACHE_SALT_KEY not in extra["multimodal_data"]
+    assert mm_inputs[0].multimodal_hashes != mm_inputs[1].multimodal_hashes
+    assert [mm_input.multimodal_uuids for mm_input in mm_inputs] == [["image-0"], None]
+
+
+def test_random_hashes_keep_uuids_of_one_modality_in_prompt_order() -> None:
+    """Hashing off, an image and a video, a UUID for the video only."""
+
+    class Processor(_ProbeFakeProcessor):
+        def __call__(self, inputs: dict, sampling_params: object) -> tuple[list[int], dict]:
+            self.calls += 1
+            return [10, 101, 102, 20, 101, 102, 30], {"multimodal_data": {"image": {}, "video": {}}}
+
+        def get_num_tokens_per_video(self, *, video: list[np.ndarray], **kwargs: object) -> int:
+            return 2
+
+    processor = Processor()
+    processor.multimodal_hashing_supported = False
+    _, extra = create_input_processor_with_hash(processor)(
+        {
+            "prompt": "unused",
+            "multi_modal_data": {
+                "image": [np.array([1], dtype=np.uint8)],
+                "video": [[np.zeros((2, 2, 3), dtype=np.uint8)]],
+            },
+            "multi_modal_uuids": {"video": ["video-0"]},
+            "mm_item_order": [{"modality": "video", "index": 0}, {"modality": "image", "index": 0}],
+        },
+        None,
+    )
+
+    mm_input = extra["multimodal_input"]
+    assert mm_input.multimodal_positions == [1, 4]
+    assert mm_input.multimodal_uuids == ["video-0", None]
+    assert len({tuple(h) for h in mm_input.multimodal_hashes}) == 2
+
+
+@pytest.mark.parametrize("hashing_off", [False, True], ids=["hashing_on", "hashing_off"])
+def test_modality_set_to_none_is_like_no_modality(hashing_off) -> None:
+    """``"audio": None`` next to an image changes nothing: the image gets the same span and hash.
+
+    The processor counts image tokens only, so counting the None as an audio item would fail.
+    """
+    processor = _ProbeFakeProcessor()
+    processor.multimodal_hashing_supported = False if hashing_off else None
+    wrapped = create_input_processor_with_hash(processor)
+    image = _PROBE_INPUTS["multi_modal_data"]["image"]
+
+    mm_inputs = [
+        wrapped({"prompt": "unused", "multi_modal_data": data}, None)[1]["multimodal_input"]
+        for data in ({"image": image}, {"image": image, "audio": None})
+    ]
+
+    for mm_input in mm_inputs:
+        assert mm_input.multimodal_positions == [1]
+        assert mm_input.multimodal_lengths == [2]
+        assert len(mm_input.multimodal_hashes) == 1
+    if not hashing_off:
+        assert mm_inputs[1].multimodal_hashes == [_CONTENT_HASH_SNAPSHOT["image"]]
+        assert processor.multimodal_hashing_supported is True
+
+
+def _llm_with_mock_executor(input_processor: object = None) -> object:
+    """A BaseLLM whose generate_async submits to a mock executor."""
+    from tensorrt_llm.llmapi.llm import BaseLLM
+    from tensorrt_llm.sampling_params import SamplingParams
+
+    llm = object.__new__(BaseLLM)
+    llm.shutdown = Mock()
+    llm._encode_only = False
+    llm._startup_metrics = {}
+    llm.args = SimpleNamespace(mm_encoder_only=False, return_perf_metrics=False)
+    llm._executor = Mock()
+    llm._executor.is_shutdown.return_value = False
+    llm._prepare_sampling_params = Mock(return_value=SamplingParams(max_tokens=1))
+    llm._check_arguments = Mock()
+    llm._post_processor_hook = None
+    llm._tokenizer = None
+    llm._hf_model_config = None
+    llm.input_processor = input_processor
+    return llm
+
+
+def test_generate_async_submits_the_multimodal_cache_salt() -> None:
+    """LLM.generate_async adds the request's multimodal salt to the caller's salt."""
+    llm = _llm_with_mock_executor()
+    wrapped = create_input_processor_with_hash(_ProbeFakeProcessor(count_error=ValueError("x")))
+    submitted = []
+    for inputs in (_PROBE_INPUTS, {"prompt": "text only"}):
+        tokens, extra = wrapped(inputs, None) if "multi_modal_data" in inputs else ([1], None)
+        params = None if extra is None else MultimodalParams(**extra)
+        llm._preprocess = Mock(return_value=(tokens, None, params, None))
+        with patch("tensorrt_llm.llmapi.llm.RequestOutput._from_generation_result"):
+            llm.generate_async(inputs, cache_salt="user")
+        submitted.append(llm._executor.generate_async.call_args.kwargs["cache_salt"])
+
+    assert submitted[0].startswith("user/mm-no-item-spans-")
+    assert submitted[1] == "user"
+
+
+@pytest.mark.parametrize("route", ["raw", "preprocessed", "processor_tensors"])
+def test_phi4mm_single_audio_encoder_inputs(route: str) -> None:
+    from tensorrt_llm._torch.models.modeling_phi4mm import (
+        HFPhi4MultimodalEncoder,
+        Phi4MMInputProcessor,
+    )
+    from tensorrt_llm.llmapi.llm import PreprocessedInputs
+
+    config = SimpleNamespace(model_type="phi4mm", vocab_size=200064, torch_dtype=torch.float32)
+    hf_processor = Mock(
+        spec=["image_processor", "audio_processor", "_convert_images_audios_text_to_inputs"]
+    )
+    with patch("transformers.AutoProcessor.from_pretrained", return_value=hf_processor):
+        processor = Phi4MMInputProcessor("unused", config, Mock())
+    features = torch.tensor([[[2.0, 3.0]]])
+    audio = {"input_audio_embeds": features, "audio_embed_sizes": torch.tensor([1])}
+    hf_processor.audio_processor.return_value = audio
+    hf_processor._convert_images_audios_text_to_inputs.return_value = {
+        "input_ids": processor.get_mm_token_ids()[1:].reshape(1, 1).long(),
+        "input_image_embeds": torch.empty(0),
+        "image_sizes": torch.empty(0),
+        "image_attention_mask": torch.empty(0),
+        "audio_attention_mask": None,
+        **audio,
+    }
+    llm = _llm_with_mock_executor(processor)
+    llm.args.multimodal_config = None
+    inputs = {"prompt": "<|audio_1|>", "multi_modal_data": {"audio": [(np.zeros(320), 16000)]}}
+    if route == "preprocessed":
+        inputs = llm.preprocess(inputs)
+    elif route == "processor_tensors":
+        ids, extra = processor(inputs, None)
+        inputs = PreprocessedInputs(ids, MultimodalParams(**extra))
+    with patch("tensorrt_llm.llmapi.llm.RequestOutput._from_generation_result"):
+        llm.generate_async(inputs)
+    params = llm._executor.generate_async.call_args.kwargs["multimodal_params"]
+    params.to_tensor("multimodal_data")
+
+    encoder = HFPhi4MultimodalEncoder.__new__(HFPhi4MultimodalEncoder)
+    torch.nn.Module.__init__(encoder)
+    encoder.embed_tokens = torch.nn.Identity()
+    encoder.audio_embed = Mock(side_effect=lambda input_embeds, **kwargs: input_embeds)
+    (embedding,) = encoder._encoding_batch_request([params], processor.get_mm_token_ids())
+    torch.testing.assert_close(embedding, features[0])
+
+
+class _AttachWithoutSpansProcessor(_ProbeFakeProcessor):
+    """Attaches embeddings as LLaVA-NeXT and Llama 4 do: no hashes and no item spans."""
+
+    def attach_multimodal_embeddings(
+        self, inputs: dict, multimodal_embedding: dict, sampling_params: object
+    ) -> tuple[list[int], dict]:
+        return [10, 101, 102, 20], {
+            "multimodal_data": {"multimodal_embedding": multimodal_embedding["image"][0]}
+        }
+
+
+def test_attached_embeddings_without_item_spans_get_a_cache_salt() -> None:
+    """Two requests with the same prompt and other embeddings of the same size.
+
+    Their tokens are the same, so without item spans only a cache salt of their own keeps the
+    second from reusing the KV cache of the first.
+    """
+    llm = _llm_with_mock_executor(_AttachWithoutSpansProcessor())
+    submitted = []
+    for embedding in (torch.zeros(2, 4), torch.ones(2, 4)):
+        inputs = {"prompt": "unused", "multi_modal_embeddings": {"image": [embedding]}}
+        with (
+            patch.object(MultimodalParams, "to_handle"),
+            patch("tensorrt_llm.llmapi.llm.RequestOutput._from_generation_result"),
+        ):
+            llm.generate_async(inputs, cache_salt="user")
+        kwargs = llm._executor.generate_async.call_args.kwargs
+        submitted.append(kwargs["cache_salt"])
+        assert kwargs["multimodal_params"].multimodal_data[MULTIMODAL_NO_CONTENT_HASHES_KEY]
+
+    assert all(salt.startswith("user/mm-no-item-spans-") for salt in submitted)
+    assert submitted[0] != submitted[1]
+
+
+@pytest.mark.parametrize(
+    "method,inputs",
+    [
+        ("generate", {"prompt": "p", "multi_modal_data": {"image": [torch.zeros(3, 4, 4)]}}),
+        (
+            "preprocess",
+            {"prompt_token_ids": [1, 2], "multi_modal_data": {"image": [torch.zeros(3, 4, 4)]}},
+        ),
+        (
+            "generate_async",
+            {"prompt": "p", "multi_modal_embeddings": {"image": [torch.zeros(2, 4)]}},
+        ),
+        (
+            "encode",
+            {"prompt_token_ids": [1, 2], "multi_modal_data": {"image": [torch.zeros(3, 4, 4)]}},
+        ),
+    ],
+    ids=["generate", "preprocess", "generate_async", "encode"],
+)
+def test_text_only_model_rejects_multimodal_inputs(method: str, inputs: dict) -> None:
+    llm = _llm_with_mock_executor(DefaultInputProcessor("unused", None, Mock()))
+    llm.args.multimodal_config = None
+    if method == "encode":
+        llm._encode_only = True
+        llm._encoder_executor = Mock(max_batch_size=1, max_num_tokens=2, max_seq_len=2)
+        llm._encoder_executor.batch_forward.return_value = {"logits": torch.zeros(1)}
+    with pytest.raises(ValueError, match="supports text only"):
+        getattr(llm, method)(inputs)
+    llm._executor.generate_async.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "inputs",
+    [
+        {"prompt_token_ids": [1, 2], "multi_modal_data": {"image": [], "audio": None}},
+        {"prompt": "p", "multi_modal_embeddings": {}},
+        {"prompt": "p", "multi_modal_data": {"image": {}}, "multi_modal_uuids": {"image": []}},
+    ],
+    ids=["token_ids", "text", "empty_image_dict"],
+)
+def test_text_only_model_accepts_empty_multimodal_inputs(inputs: dict) -> None:
+    tokenizer = Mock()
+    tokenizer.encode.return_value = [1, 2]
+    llm = _llm_with_mock_executor(DefaultInputProcessor("unused", None, tokenizer))
+    llm.args.multimodal_config = None
+    result = llm.preprocess(inputs)
+    assert result.prompt_token_ids == [1, 2]
+    assert result.multimodal_params is None
+    assert "multi_modal_data" in inputs or "multi_modal_embeddings" in inputs
+
+
+@pytest.mark.parametrize(
+    "media, error",
+    [
+        ({}, "which multi_modal_data does not have"),
+        ({"multi_modal_data": {"image": []}}, "UUID list length"),
+        ({"multi_modal_data": {"image": {}}}, r"data items length \(0\)"),
+        ({"multi_modal_data": {"audio": {}}}, "which multi_modal_data does not have"),
+    ],
+    ids=["no_media_field", "empty_image_list", "empty_image_dict", "unknown_modality"],
+)
+def test_text_only_model_validates_uuids_for_empty_media(media, error) -> None:
+    llm = _llm_with_mock_executor(DefaultInputProcessor("unused", None, Mock()))
+    llm.args.multimodal_config = None
+    with pytest.raises(ValueError, match=error):
+        llm.preprocess(
+            {
+                "prompt_token_ids": [1, 2],
+                **media,
+                "multi_modal_uuids": {"image": ["unused"]},
+            }
+        )
+
+
+def test_text_only_admission_of_preprocessed_media_and_decode_metadata() -> None:
+    from tensorrt_llm.llmapi.llm import PreprocessedInputs
+
+    llm = _llm_with_mock_executor(DefaultInputProcessor("unused", None, Mock()))
+    for embedding in (torch.zeros(2, 4), {"method_key": -1, "tensor_size": [0, 4]}):
+        params = MultimodalParams(multimodal_data={"multimodal_embedding": embedding})
+        with pytest.raises(ValueError, match="supports text only"):
+            llm.generate_async(PreprocessedInputs([1, 2], params))
+    llm._executor.generate_async.assert_not_called()
+
+    extra = {"multimodal_data": {"mrope_config": {"mrope_position_deltas": [0]}}}
+    maybe_compute_mm_embed_cumsum([1, 2], extra, _ProbeFakeProcessor())
+    extra["multimodal_data"]["mm_processor_kwargs_hash"] = registry._hash_mm_processor_kwargs({})
+    params = MultimodalParams(**extra)
+    with patch("tensorrt_llm.llmapi.llm.RequestOutput._from_generation_result"):
+        llm.generate_async(PreprocessedInputs([1, 2], params))
+    submitted = llm._executor.generate_async.call_args.kwargs
+    assert submitted["multimodal_params"] is params
+    assert submitted["cache_salt"] is None
+
+    metadata = dict(params.multimodal_data)
+    params.multimodal_data["image"] = {}
+    params.multimodal_input = MultimodalInput([[1] * 8], [0], [1])
+    with patch("tensorrt_llm.llmapi.llm.RequestOutput._from_generation_result"):
+        llm.generate_async(PreprocessedInputs([1, 2], params), cache_salt="tenant")
+    submitted = llm._executor.generate_async.call_args.kwargs
+    assert submitted["cache_salt"] == "tenant"
+    assert submitted["multimodal_params"].multimodal_data == metadata
+    assert submitted["multimodal_params"].multimodal_input is params.multimodal_input
+    assert "image" in params.multimodal_data
+
+
+@pytest.mark.parametrize(
+    "data",
+    [{"image": None}, {"image": []}, {"image": {}}, {"multimodal_embedding": None}],
+)
+def test_text_only_admission_keeps_empty_prepared_media_unsalted(data) -> None:
+    from tensorrt_llm.llmapi.llm import PreprocessedInputs
+
+    llm = _llm_with_mock_executor(DefaultInputProcessor("unused", None, Mock()))
+    params = MultimodalParams(multimodal_data=data)
+    with patch("tensorrt_llm.llmapi.llm.RequestOutput._from_generation_result"):
+        llm.generate_async(PreprocessedInputs([1, 2], params))
+    submitted = llm._executor.generate_async.call_args.kwargs
+    assert submitted["cache_salt"] is None
+    assert submitted["multimodal_params"] is None
+    assert params.multimodal_data == data
+
+
+def test_prepared_media_admission_uses_checkpoint_modalities() -> None:
+    from transformers import Gemma4Config
+    from transformers.models.gemma4.configuration_gemma4 import Gemma4AudioConfig
+
+    from tensorrt_llm._torch.models.modeling_gemma4mm import Gemma4InputProcessor
+    from tensorrt_llm.llmapi.llm import PreprocessedInputs
+
+    processor = object.__new__(Gemma4InputProcessor)
+    processor._config = Gemma4Config()
+
+    processor._config.vision_config = processor._config.audio_config = None
+    llm = _llm_with_mock_executor(processor)
+    image = PreprocessedInputs(
+        [1, 2], MultimodalParams(multimodal_data={"image": {"pixels": torch.ones(2)}})
+    )
+    with pytest.raises(ValueError, match="supports text only"):
+        llm.generate_async(image)
+
+    processor._config.audio_config = Gemma4AudioConfig()
+    with pytest.raises(ValueError, match="image"):
+        llm.generate_async(image)
+    llm._executor.generate_async.assert_not_called()
+
+    audio = MultimodalParams(multimodal_data={"audio": {"input_features": torch.ones(2)}})
+    with patch("tensorrt_llm.llmapi.llm.RequestOutput._from_generation_result"):
+        llm.generate_async(PreprocessedInputs([1, 2], audio))
+    submitted = llm._executor.generate_async.call_args.kwargs["multimodal_params"]
+    assert submitted.multimodal_data["audio"] is audio.multimodal_data["audio"]
+
+
+@pytest.mark.parametrize(
+    "target_path, target_name",
+    [
+        ("kimi_k3_vl.kimi_k3_nvfp4__sm_107__tp1", "ModelingV2KimiK3Nvfp4Sm107Tp1"),
+        ("minimax_m3.minimax_m3_nvfp4__sm_103__tp4", "ModelingV2MiniMaxM3Nvfp4Sm103Tp4"),
+        ("minimax_m3.minimax_m3_nvfp4__sm_107__tp2", "ModelingV2MiniMaxM3Nvfp4Sm107Tp2"),
+    ],
+)
+def test_text_only_target_rejects_prepared_embeddings_before_submission(target_path, target_name):
+    from importlib import import_module
+
+    from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
+    from tensorrt_llm.llmapi.llm import PreprocessedInputs
+
+    target = getattr(
+        import_module(f"tensorrt_llm._torch.modeling_v2.models.{target_path}.modeling"), target_name
+    )
+    model = target.__new__(target)
+    torch.nn.Module.__init__(model)
+    llm = _llm_with_mock_executor(_ProbeFakeProcessor())
+    loader = ModelLoader(llm.args, SimpleNamespace(rank=0), None, None, 8, 8)
+    with patch.object(loader, "_timed_load", return_value=(model, None)):
+        loader.load("unused", None)
+    llm._startup_metrics = {"model_loader": loader.startup_metadata}
+    params = MultimodalParams(multimodal_data={"multimodal_embedding": torch.ones(2, 4)})
+    with (
+        patch("tensorrt_llm.llmapi.llm.RequestOutput._from_generation_result"),
+        pytest.raises(ValueError, match="supports text only"),
+    ):
+        llm.generate_async(PreprocessedInputs([1, 2], params))
+    llm._executor.generate_async.assert_not_called()
+
+
+def test_raw_media_admission_uses_the_loaded_encoder() -> None:
+    from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
+    from tensorrt_llm.disaggregated_params import DisaggregatedParams
+    from tensorrt_llm.llmapi.llm import PreprocessedInputs
+
+    llm = _llm_with_mock_executor(_ProbeFakeProcessor())
+    llm.args.disable_mm_encoder = True
+    llm.args.multimodal_config = None
+
+    def load_encoder(encoder, accepts_multimodal_inputs=True):
+        model = torch.nn.Module()
+        model.accepts_multimodal_inputs = accepts_multimodal_inputs
+        model.mm_encoder = encoder
+        loader = ModelLoader(llm.args, SimpleNamespace(rank=0), None, None, 8, 8)
+        with patch.object(loader, "_timed_load", return_value=(model, None)):
+            loader.load("unused", None)
+        llm._startup_metrics = {"model_loader": loader.startup_metadata}
+
+    load_encoder(None)
+    with pytest.raises(ValueError, match="require a local encoder"):
+        llm.preprocess(_PROBE_INPUTS)
+
+    media = MultimodalParams(multimodal_data={"image": {"pixel_values": torch.zeros(3, 2, 2)}})
+    with pytest.raises(ValueError, match="require a local encoder"):
+        llm.generate_async(PreprocessedInputs([1, 2], media))
+    llm._executor.generate_async.assert_not_called()
+
+    llm.input_processor.supported_modalities = frozenset()
+    key = "multimodal_embedding"
+    embedding = MultimodalParams(multimodal_data={key: torch.zeros(2, 4)})
+    with patch("tensorrt_llm.llmapi.llm.RequestOutput._from_generation_result"):
+        llm.generate_async(PreprocessedInputs([1, 2], embedding))
+        submitted = llm._executor.generate_async.call_args.kwargs["multimodal_params"]
+        assert submitted.multimodal_data[key] is embedding.multimodal_data[key]
+        embedding.to_handle("multimodal_data")
+        try:
+            llm.generate_async(PreprocessedInputs([1, 2], embedding))
+            submitted = llm._executor.generate_async.call_args.kwargs["multimodal_params"]
+            assert submitted.multimodal_data[key] is embedding.multimodal_data[key]
+        finally:
+            embedding.to_tensor("multimodal_data")
+
+    gen_only = DisaggregatedParams(request_type="generation_only")
+    with (
+        patch.object(MultimodalParams, "to_handle"),
+        patch("tensorrt_llm.llmapi.llm.RequestOutput._from_generation_result"),
+    ):
+        prepared = llm.preprocess(_PROBE_INPUTS, disaggregated_params=gen_only)
+        llm.generate_async(prepared, disaggregated_params=gen_only)
+    assert llm._executor.generate_async.call_args.kwargs["disaggregated_params"] is gen_only
+
+    load_encoder(torch.nn.Identity())
+    with patch.object(MultimodalParams, "to_handle"):
+        assert llm.preprocess(_PROBE_INPUTS).multimodal_params.multimodal_input is not None
+
+    llm._executor.generate_async.reset_mock()
+    llm.args.disable_mm_encoder = False
+    load_encoder(None, accepts_multimodal_inputs=False)
+    with pytest.raises(ValueError, match="supports text only"):
+        llm.generate_async(PreprocessedInputs([1, 2], embedding))
+    llm._executor.generate_async.assert_not_called()
+
+
+_MM_SALT = "mm-no-item-spans-" + "0" * 32
+
+
+@pytest.mark.parametrize(
+    "cache_salt",
+    ["a" * 206, "a" * 207, "a" * 256, "\u00e9" * 128],
+    ids=["fits", "one_byte_over", "at_limit", "multibyte_at_limit"],
+)
+def test_multimodal_cache_salt_fits_the_salt_limit(cache_salt: str) -> None:
+    """A caller salt any request may have stays valid with the multimodal salt added."""
+    from tensorrt_llm.executor.request import GenerationRequest
+    from tensorrt_llm.sampling_params import SamplingParams
+
+    params = MultimodalParams(multimodal_data={MULTIMODAL_CACHE_SALT_KEY: _MM_SALT})
+    salt = request_cache_salt(cache_salt, params)
+
+    assert len(salt.encode("utf-8")) <= GenerationRequest.MAX_CACHE_SALT_LEN
+    assert salt.endswith(_MM_SALT)
+    if len(cache_salt.encode("utf-8")) + 1 + len(_MM_SALT) <= GenerationRequest.MAX_CACHE_SALT_LEN:
+        assert salt == f"{cache_salt}/{_MM_SALT}"
+    else:
+        assert salt != request_cache_salt("b" * 256, params)
+        assert salt != request_cache_salt(salt.split("/", 1)[0], params)
+    GenerationRequest([1], SamplingParams(max_tokens=1), cache_salt=salt)
+
+
+@pytest.mark.parametrize(
+    "cache_salt,error",
+    [(123, TypeError), ("a" * 257, ValueError)],
+    ids=["not_a_string", "too_long"],
+)
+def test_bad_caller_cache_salt_still_fails_with_a_multimodal_salt(cache_salt, error) -> None:
+    """A caller salt no request may have fails as it does without a multimodal salt."""
+    from tensorrt_llm.executor.request import GenerationRequest
+    from tensorrt_llm.sampling_params import SamplingParams
+
+    params = MultimodalParams(multimodal_data={MULTIMODAL_CACHE_SALT_KEY: _MM_SALT})
+    with pytest.raises(error, match="cache_salt"):
+        GenerationRequest(
+            [1], SamplingParams(max_tokens=1), cache_salt=request_cache_salt(cache_salt, params)
+        )
+
+
 def _process_mm_contract(
     modalities: list[str],
     token_ids: list[int],
@@ -835,13 +1585,17 @@ def test_multimodal_input_contract_snapshot(
     assert data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] == MultimodalItemMetadata(
         item_refs, [4] * num_items, [2] * num_items
     )
-    if not hashing_enabled:
-        assert "multimodal_input" not in extra
-        return
-
     mm_input = extra["multimodal_input"]
-    hashes = _CONTENT_HASH_SNAPSHOT
-    assert mm_input.multimodal_hashes == [hashes[modality] for modality in modalities]
+    assert MULTIMODAL_CACHE_SALT_KEY not in data
+    if hashing_enabled:
+        hashes = _CONTENT_HASH_SNAPSHOT
+        assert mm_input.multimodal_hashes == [hashes[modality] for modality in modalities]
+        assert MULTIMODAL_NO_CONTENT_HASHES_KEY not in data
+    else:
+        # Without content hashes, each item gets a random hash and the same spans.
+        assert len(mm_input.multimodal_hashes) == num_items
+        assert not any(h in _CONTENT_HASH_SNAPSHOT.values() for h in mm_input.multimodal_hashes)
+        assert data[MULTIMODAL_NO_CONTENT_HASHES_KEY] is True
     assert mm_input.multimodal_uuids is None
     assert mm_input.multimodal_positions == [1 + 3 * index for index in range(num_items)]
     assert mm_input.multimodal_lengths == [2 + len(special_ids or [])] * num_items
@@ -1088,7 +1842,11 @@ def test_attached_embeddings_accept_tensors_without_cache_hashes(modality):
         multimodal_lengths=[3],
     )
 
-    assert params.multimodal_input is None
+    # Without content hashes, the item gets a random hash for its KV cache keys.
+    assert len(params.multimodal_input.multimodal_hashes) == 1
+    assert params.multimodal_input.multimodal_positions == [1]
+    assert params.multimodal_input.multimodal_lengths == [3]
+    assert params.multimodal_data[MULTIMODAL_NO_CONTENT_HASHES_KEY] is True
     assert params.item_metadata.item_refs == ((modality, 0),)
     assert params.multimodal_data["multimodal_embedding"][0] is embedding
     assert params.item_metadata.encoder_token_lengths is None

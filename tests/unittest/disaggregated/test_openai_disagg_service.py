@@ -350,6 +350,87 @@ def test_get_gen_request_uses_ctx_response_prompt_token_ids_for_chat():
     assert gen_request.conversation_params.conversation_id == "conv-chat"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api", ["chat", "responses"])
+async def test_generation_first_dispatches_one_private_media_salt(api):
+    from tensorrt_llm.serve.disagg_auth import (
+        build_internal_disagg_auth_headers,
+        validate_internal_disagg_request,
+    )
+
+    service = _make_service("generation_first")
+    service._ctx_client = AsyncMock()
+    service._gen_client = AsyncMock()
+    service._ctx_router.get_next_server.return_value = ("ctx", {})
+    content = [
+        {"type": "text", "text": "describe"},
+        {"type": "image_url", "image_url": {"url": "https://example.org/image"}},
+    ]
+    later = [{"type": "text", "text": "in one sentence"}]
+    image = {"type": "input_image", "image_url": "https://example.org/image", "detail": "auto"}
+    salts = []
+    for _ in range(2):
+        if api == "chat":
+            request = ChatCompletionRequest(
+                model="test",
+                messages=[
+                    {"role": "user", "content": content},
+                    {"role": "user", "content": later},
+                ],
+            )
+        else:
+            request = ResponsesRequest(model="test", input=[{"role": "user", "content": [image]}])
+        await service._send_disagg_request(request)
+        ctx = service._ctx_client.send_request.await_args.args[0]
+        gen = service._gen_client.send_request.await_args.args[0]
+        salt = ctx.disaggregated_params.multimodal_cache_salt
+        assert salt and salt == gen.disaggregated_params.multimodal_cache_salt
+        for worker in (ctx, gen):
+            assert (
+                worker.disaggregated_params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
+            )
+            headers = build_internal_disagg_auth_headers("key", worker)
+            validate_internal_disagg_request("key", worker, headers)
+            if api == "chat":
+                messages = worker.model_dump(mode="json")["messages"]
+                assert [message["content"] for message in messages] == [content, later]
+            else:
+                assert worker.model_dump(mode="json")["input"][0]["content"] == [image]
+        salts.append(salt)
+    assert salts[0] != salts[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "extra", [[], [{"type": "audio_url", "audio_url": {}}]], ids=["text", "skipped_audio"]
+)
+async def test_generation_first_keeps_text_content_for_both_workers(extra):
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import ReuseScope, sequence_to_blockchain_keys
+
+    service = _make_service("generation_first")
+    service._ctx_client = AsyncMock()
+    service._gen_client = AsyncMock()
+    service._ctx_router.get_next_server.return_value = ("ctx", {})
+    content = [{"type": "text", "text": "hello"}, *extra]
+    tokens = list(range(8))
+    request = ChatCompletionRequest(
+        model="test",
+        messages=[{"role": "system", "content": "be brief"}, {"role": "user", "content": content}],
+        prompt_token_ids=tokens,
+    )
+    await service._send_disagg_request(request)
+    expected = list(sequence_to_blockchain_keys(4, ReuseScope(), tokens))
+    for client in (service._ctx_client, service._gen_client):
+        worker = client.send_request.await_args.args[0]
+        salt = worker.disaggregated_params.multimodal_cache_salt
+        assert (
+            list(sequence_to_blockchain_keys(4, ReuseScope(salt=salt), worker.prompt_token_ids))
+            == expected
+        )
+        messages = worker.model_dump(mode="json")["messages"]
+        assert [message["content"] for message in messages] == ["be brief", content]
+
+
 def test_get_ctx_request_preserves_conversation_params_on_wire():
     service = _make_service("context_first")
     request = CompletionRequest(

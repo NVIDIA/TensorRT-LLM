@@ -49,8 +49,10 @@ from tensorrt_llm.bindings.executor import (DisServingRequestStats,
 from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
                                                           ReqIdsSet)
 from tensorrt_llm.executor.request import TruncateKVCacheRequest
-from tensorrt_llm.inputs.multimodal import (get_multimodal_item_metadata,
-                                            strip_mm_data_for_generation)
+from tensorrt_llm.inputs.multimodal import (_has_mm_payload_keys,
+                                            get_multimodal_item_metadata,
+                                            strip_mm_data_for_generation,
+                                            without_empty_mm_payloads)
 from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
                                           ExecutorMemoryType,
                                           GenPreemptionConfig, PeftCacheConfig,
@@ -9226,10 +9228,13 @@ class PyExecutor:
         # handled batch-wide.
         mm_data = getattr(request, 'py_multimodal_data', None)
         if mm_data:
-            validate_mm = getattr(self.model_engine.model,
-                                  'validate_multimodal_request_data', None)
+            validate_mm = getattr(model, 'validate_multimodal_request_data',
+                                  None)
             if validate_mm is not None:
                 validate_mm(mm_data)
+            if (getattr(model, "accepts_multimodal_inputs", True) is False and
+                    _has_mm_payload_keys(without_empty_mm_payloads(mm_data))):
+                raise ValueError("This model supports text only.")
 
     def _idle_kv_transfer_poll_timeout(self) -> Optional[datetime.timedelta]:
         """Idle request-queue wait bound while context KV transfers are tracked.

@@ -71,6 +71,8 @@ class DeepseekV41ForConditionalGeneration(MultimodalModelMixin, PreTrainedModel)
                 self.register_parameter(
                     name, nn.Parameter(torch.empty(self.embedding_dim, dtype=self.embedding_dtype))
                 )
+        else:
+            self.mm_encoder_disabled = True
 
     @property
     def language_model(self):

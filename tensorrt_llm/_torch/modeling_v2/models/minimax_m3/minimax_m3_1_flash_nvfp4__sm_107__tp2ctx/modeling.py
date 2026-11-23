@@ -5298,6 +5298,7 @@ class ModelingV2MiniMaxM31FlashNvfp4Sm107Tp2ctx(MiniMaxM3ForCausalLM):
     video data is refused.
     """
 
+    accepts_multimodal_inputs = False
     # The DSpark draft window ships with the context KV in disaggregated serving; the step loop is otherwise the
     # built-in model's. TP2CTX_PROXY_Q128: the prefill proxy (indexer max-score) plan uses 128-row query tiles with 4 KV
     # splits on steps whose longest query span exceeds 128 rows (MSA maxscore_qo_tile: the same score table bits; the

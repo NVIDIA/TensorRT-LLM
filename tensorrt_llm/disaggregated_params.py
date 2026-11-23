@@ -17,8 +17,6 @@ from dataclasses import dataclass
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-import numpy as np
-
 from tensorrt_llm.bindings import executor as tllme
 
 if TYPE_CHECKING:
@@ -57,6 +55,8 @@ class DisaggregatedParams:
         multimodal_hashes (List[List[int]]): The multimodal hashes of each multimodal item in the request.
         multimodal_positions (List[int]): Prompt-token offset of each multimodal item.
         multimodal_lengths (List[int]): Prompt-token count of each multimodal item.
+        multimodal_cache_salt (str): The context request's effective cache salt
+         when its multimodal items have no prompt spans.
         multimodal_input_layout (MultimodalInputLayout): Exact encoder-side
          prompt and multimodal layout to preserve during E/P handoff.
     """
@@ -78,6 +78,7 @@ class DisaggregatedParams:
     remote_tail_start: Optional[int] = None
     multimodal_positions: Optional[List[int]] = None
     multimodal_lengths: Optional[List[int]] = None
+    multimodal_cache_salt: Optional[str] = None
     orig_elapsed_s: Optional[float] = None
 
     # E-P Disaggregated Params
@@ -165,11 +166,12 @@ class DisaggregatedParams:
                     assert len(mm_hash) == 8, "mm_hash must be a list of 8 integers"
                     assert all(isinstance(x, int) for x in mm_hash), "mm_hash must contain integers"
             else:
-                # if user did not provide mm embedding handles, kvcache reuse will be disabled
+                # No hashes given: each item gets a random one, so no other request reuses its
+                # KV cache blocks.
                 assert len(self.multimodal_embedding_handles) > 0, (
                     "multimodal_embedding_handles must be provided"
                 )
-                vals = np.random.randint(
-                    np.iinfo(np.int32).min, np.iinfo(np.int32).max, size=8, dtype=np.int32
-                ).tolist()
-                self.multimodal_hashes = [vals] * len(self.multimodal_embedding_handles)
+                # Defer the import because inputs and executor import these parameters.
+                from tensorrt_llm.inputs.multimodal import random_mm_hashes
+
+                self.multimodal_hashes = random_mm_hashes(len(self.multimodal_embedding_handles))

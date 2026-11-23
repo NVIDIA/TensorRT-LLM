@@ -2471,6 +2471,8 @@ class ModelingV2Glm53FlashNvfp4Sm100DefaultMtpFused(Glm5NextForCausalLM):
     defaults, the V2 hybrid cache manager, the KDA metadata class) come with them.
     """
 
+    accepts_multimodal_inputs = False
+
     def __init__(self, model_config: ModelConfig[PretrainedConfig]) -> None:
         _check_construction(model_config)
         super().__init__(model_config)

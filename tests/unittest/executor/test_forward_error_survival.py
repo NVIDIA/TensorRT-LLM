@@ -210,6 +210,15 @@ def test_validate_request_accepts_models_without_the_hook():
     PyExecutor._validate_request(executor, _request(mm_data={"image": object()}))
 
 
+def test_validate_request_rejects_embeddings_on_a_text_only_target():
+    executor = _validating_executor(SimpleNamespace(accepts_multimodal_inputs=False))
+    with pytest.raises(ValueError, match="text only"):
+        PyExecutor._validate_request(executor, _request(mm_data={"multimodal_embedding": object()}))
+    PyExecutor._validate_request(
+        executor, _request(mm_data={"image": [], "special_token_offsets": []})
+    )
+
+
 # ---------------------------------------------------------------------------
 # Loop-level None handling
 # ---------------------------------------------------------------------------

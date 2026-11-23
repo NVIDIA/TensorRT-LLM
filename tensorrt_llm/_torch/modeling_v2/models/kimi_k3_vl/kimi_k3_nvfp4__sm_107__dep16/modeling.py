@@ -5507,6 +5507,7 @@ class ModelingV2KimiK3Nvfp4Sm107Dep16(KimiK3DefaultWeights, PreTrainedModel):
     ``KimiK3DefaultWeights`` mixin's (``weights.py``).
     """
 
+    accepts_multimodal_inputs = False
     # The optimizations this target's code is built for (a record: the code reads none of it).
     K3_CONSTANTS: ClassVar[K3Sm107Constants] = CONSTANTS
 

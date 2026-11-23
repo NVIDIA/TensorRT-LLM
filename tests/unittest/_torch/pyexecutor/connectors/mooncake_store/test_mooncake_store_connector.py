@@ -70,6 +70,7 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.scheduler import (
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.worker import (
     MooncakeStoreConnectorWorker,
 )
+from tensorrt_llm.inputs.multimodal import MULTIMODAL_NO_CONTENT_HASHES_KEY
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
 pytestmark = pytest.mark.cpu_only
@@ -349,6 +350,7 @@ def make_request(
     multimodal_hashes=None,
     multimodal_positions=None,
     multimodal_lengths=None,
+    py_multimodal_data=None,
 ):
     """A stand-in for the fields the leader reads off an `LlmRequest`.
 
@@ -368,6 +370,7 @@ def make_request(
         multimodal_hashes=multimodal_hashes,
         multimodal_positions=multimodal_positions,
         multimodal_lengths=multimodal_lengths,
+        py_multimodal_data=py_multimodal_data,
         get_tokens=lambda _beam=0, _tokens=tuple(tokens): list(_tokens),
     )
 
@@ -1531,15 +1534,27 @@ def test_scheduler_isolates_requests_by_multimodal_content(store_config):
     assert queries[3] == queries[0]
 
 
-def test_scheduler_bypasses_multimodal_requests_it_cannot_identify(store_config):
-    """Media without hashes gets neither a lookup nor a save.
+@pytest.mark.parametrize(
+    "multimodal",
+    [
+        dict(multimodal_positions=[4], multimodal_lengths=[4]),
+        dict(
+            multimodal_hashes=[IMAGE_A_HASH],
+            py_multimodal_data={MULTIMODAL_NO_CONTENT_HASHES_KEY: True},
+        ),
+    ],
+    ids=["no_hashes", "random_hashes"],
+)
+def test_scheduler_bypasses_multimodal_requests_it_cannot_identify(store_config, multimodal):
+    """Media without content hashes gets neither a lookup nor a save.
 
     The prompt's placeholder tokens say nothing about the content behind them,
-    so there is no key that names this request's pages and no one else's.
+    so there is no key that names this request's pages and no one else's. Random
+    hashes, which the input processor flags, name pages no one can look up.
     """
     scheduler = make_scheduler(store_config, hit_blocks=2)
     tokens = list(range(3 * TOKENS_PER_BLOCK))
-    request = make_request(1, tokens, multimodal_positions=[4], multimodal_lengths=[4])
+    request = make_request(1, tokens, **multimodal)
 
     assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
     assert scheduler._worker.queries == []

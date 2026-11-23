@@ -11,16 +11,20 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import ConversationManager
+from tensorrt_llm.inputs.multimodal import MULTIMODAL_CACHE_SALT_KEY
 from tensorrt_llm.runtime import kv_cache_manager_v2 as native
 
 
-def _request(request_id: int, salt: str | None = None) -> SimpleNamespace:
+def _request(
+    request_id: int, salt: str | None = None, multimodal_data: dict | None = None
+) -> SimpleNamespace:
     return SimpleNamespace(
         py_request_id=request_id,
         is_dummy_request=False,
         py_conversation_params=SimpleNamespace(conversation_id="shared"),
         cache_salt=salt,
         lora_task_id=None,
+        py_multimodal_data=multimodal_data,
     )
 
 
@@ -41,6 +45,30 @@ def test_overlapping_completion_after_owner_cleanup(completion: str) -> None:
         manager.clear()
     cache.reset_mock()
     manager.save_drop_plan(overlapping, cache)
+    cache.plan_committed_block_drop.assert_not_called()
+    assert not manager._conversation_states
+
+
+@pytest.mark.cpu_only
+def test_turns_with_a_multimodal_cache_salt_are_not_retained() -> None:
+    """A turn with a cache salt of its own (media without item spans) is never reused.
+
+    Each such turn has another salt, so retaining it would leave one state per turn that no
+    later turn reaches or drops.
+    """
+    manager = ConversationManager(max_num_turns=1)
+    cache = MagicMock(num_committed_tokens=4, tokens_per_block=4)
+    for request_id in range(5):
+        multimodal_salt = f"mm-no-item-spans-{request_id}"
+        request = _request(
+            request_id,
+            f"user/{multimodal_salt}",
+            {MULTIMODAL_CACHE_SALT_KEY: multimodal_salt},
+        )
+        manager.prepare_request(request)
+        manager.save_drop_plan(request, cache)
+        manager.finish_request(request)
+
     cache.plan_committed_block_drop.assert_not_called()
     assert not manager._conversation_states
 
