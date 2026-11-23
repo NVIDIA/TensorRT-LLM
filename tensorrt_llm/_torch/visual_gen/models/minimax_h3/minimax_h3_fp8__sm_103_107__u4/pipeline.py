@@ -11,8 +11,8 @@ from ..pipeline_minimax_h3 import MiniMaxH3Pipeline
 from ..transformer_minimax_h3 import (
     MiniMaxH3Attention,
     MiniMaxH3Transformer3DModel,
-    MiniMaxH3TransformerBlock,
 )
+from .block_ops import Fp8UlyssesMlpMixin, initialize_block_ops
 from .output_exchange import exchange_bf16_output, exchange_fp8_output, static_fp8_output_scale
 from .qkv_exchange import pack_qkv, qk_norm_rope_pack_qkv
 
@@ -191,7 +191,7 @@ class Fp8UlyssesAttention(MiniMaxH3Attention):
         return self._exchange_packed_output(send, descales, rows, **kwargs)
 
 
-class Fp8UlyssesBlock(MiniMaxH3TransformerBlock):
+class Fp8UlyssesBlock(Fp8UlyssesMlpMixin):
     attention_cls = Fp8UlyssesAttention
 
 
@@ -205,3 +205,7 @@ class MiniMaxH3Fp8U4Pipeline(MiniMaxH3Pipeline):
         self.transformer = Fp8UlyssesTransformer(
             self.pipeline_config.model_configs[PipelineComponent.TRANSFORMER]
         )
+
+    def post_load_weights(self) -> None:
+        super().post_load_weights()
+        initialize_block_ops(self.transformer)
