@@ -30,13 +30,12 @@ import copy
 import os
 from io import BytesIO
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import numpy as np
 import pytest
 from PIL import Image
 
-from tensorrt_llm.inputs import utils as inputs_utils
+from tensorrt_llm._torch.models.checkpoints.mistral.tokenizer import MistralTokenizer
 from tensorrt_llm.inputs.utils import apply_chat_template, async_apply_chat_template_with_mm
 from tensorrt_llm.serve.chat_utils import parse_chat_messages_coroutines
 from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
@@ -58,29 +57,32 @@ _WEATHER_TOOL = {
 }
 
 
-class _RecordingTokenizer:
-    """Stands in for the native tokenizer and records each chat mistral-common is asked to encode."""
+class _RecordingTokenizer(MistralTokenizer):
+    """Stands in for the native tokenizer and records each mistral-common request it encodes."""
 
     def __init__(self):
         self.calls = []
+        self._grid_only_mistral = SimpleNamespace(encode_chat_completion=self._encode)
 
-    def encode(self, tokenizer, messages, image_sizes, **kwargs):
-        assert tokenizer is self
-        self.calls.append((messages, kwargs))
-        return [1]
+    def _encode(self, request):
+        self.calls.append(request)
+        return SimpleNamespace(tokens=[1])
 
 
 def _render(tokenizer, messages, *, add_generation_prompt=True, **kwargs):
-    with patch.object(inputs_utils, "_encode_native_mistral_chat", tokenizer.encode):
-        return apply_chat_template(
-            model_type="mistral_large_4",
-            tokenizer=tokenizer,
-            processor=None,
-            conversation=messages,
-            add_generation_prompt=add_generation_prompt,
-            mm_placeholder_counts=[{} for _ in messages],
-            **kwargs,
-        )
+    return apply_chat_template(
+        model_type="mistral_large_4",
+        tokenizer=tokenizer,
+        processor=None,
+        conversation=messages,
+        add_generation_prompt=add_generation_prompt,
+        mm_placeholder_counts=[{} for _ in messages],
+        **kwargs,
+    )
+
+
+def _value(field):
+    return getattr(field, "value", field)
 
 
 def _request(**fields):
@@ -96,20 +98,18 @@ def test_only_encoder_kwargs_reach_the_renderer():
         chat_template_kwargs={"reasoning_effort": "high", "enable_thinking": False, "foo": 1},
         documents=[{"title": "t", "text": "x"}],
     )
-    ((_, kwargs),) = tokenizer.calls
-    assert kwargs == {
-        "tools": None,
-        "continue_final_message": False,
-        "reasoning_effort": "high",
-        "response_format": None,
-    }
+    (request,) = tokenizer.calls
+    assert request.tools is None
+    assert _value(request.reasoning_effort) == "high"
+    assert _value(request.response_format.type) == "text"
+    assert request.response_format.json_schema is None
 
 
 def test_unset_reasoning_effort_is_left_to_the_checkpoint():
     tokenizer = _RecordingTokenizer()
     _render(tokenizer, [{"role": "user", "content": "Hi."}])
-    ((_, kwargs),) = tokenizer.calls
-    assert kwargs["reasoning_effort"] is None
+    (request,) = tokenizer.calls
+    assert request.reasoning_effort is None
 
 
 def test_continue_final_message_needs_a_final_assistant_message():
@@ -121,7 +121,8 @@ def test_continue_final_message_needs_a_final_assistant_message():
         add_generation_prompt=False,
         chat_template_kwargs={"continue_final_message": True},
     )
-    assert tokenizer.calls[0][1]["continue_final_message"] is True
+    # mistral-common continues the final assistant message as a prefix.
+    assert tokenizer.calls[0].messages[-1].prefix is True
 
 
 def test_top_level_continue_final_message_reaches_native_renderer():
@@ -137,7 +138,8 @@ def test_top_level_continue_final_message_reaches_native_renderer():
         add_generation_prompt=request.add_generation_prompt,
         chat_template_kwargs=request.chat_template_kwargs,
     )
-    assert tokenizer.calls[0][1]["continue_final_message"] is True
+    # mistral-common continues the final assistant message as a prefix.
+    assert tokenizer.calls[0].messages[-1].prefix is True
 
 
 def test_top_level_continue_final_message_rejects_generation_prompt():
@@ -200,9 +202,10 @@ def test_null_strict_is_dropped_from_tools():
     original = copy.deepcopy(tools)
     tokenizer = _RecordingTokenizer()
     _render(tokenizer, [{"role": "user", "content": "Hi."}], tools=tools)
-    assert tokenizer.calls[0][1]["tools"] == [
-        {"type": "function", "function": {"name": "a", "description": None}},
-        {"type": "function", "function": {"name": "b", "strict": True}},
+    tools_seen = tokenizer.calls[0].tools
+    assert [(tool.function.name, tool.function.strict) for tool in tools_seen] == [
+        ("a", False),
+        ("b", True),
     ]
     assert tools == original
 

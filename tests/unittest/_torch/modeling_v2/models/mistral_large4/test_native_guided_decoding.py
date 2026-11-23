@@ -84,8 +84,9 @@ def test_mistral_large_4_llguidance_config_defers_to_the_tokenizer(tokenizer):
 
     config = get_guided_decoding_config("llguidance", tokenizer)
     assert config.backend == GuidedDecodingConfig.GuidedDecodingBackend.LLGUIDANCE
+    # The guided decoder gets the llguidance tokenizer itself, so the config carries none.
     assert config.tokenizer_str is None and config.encoded_vocab is None
-    assert config.stop_token_ids == [tokenizer.eos_token_id]
+    assert config.stop_token_ids is None
     n_words = tokenizer.tokenizer.n_words
     assert _llguidance_tokenizer(config, tokenizer, n_words) is not None
     xgrammar = get_guided_decoding_config("xgrammar", tokenizer)
