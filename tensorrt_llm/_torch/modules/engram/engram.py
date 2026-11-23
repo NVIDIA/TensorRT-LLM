@@ -66,11 +66,12 @@ from ._node_share import NodeShare
 from .functional import engram_history_scatter
 
 # Decode rows up to which one single-CTA launch scatters and hashes every layer (per-layer above).
-_DECODE_REFRESH_MAX_ROWS = 64
+DECODE_REFRESH_MAX_ROWS = 64
 
 # Default Engram embedding vocabulary size per n-gram level.
 # Derived from the DeepSeek-V3 tokenizer vocab size (129280) scaled by 5.
 _DEFAULT_ENGRAM_VOCAB_SIZE = 129280 * 5
+_HistorySeed = tuple[int, tuple[int, ...], tuple[bool, ...] | None]
 
 
 @dataclass(frozen=True)
@@ -93,6 +94,7 @@ class DecodeRefreshPlan:
     row_record: tuple
     shape_key: tuple
     cached: Dict[int, torch.Tensor]
+    pending_seeds: tuple[tuple[int, _HistorySeed], ...] = ()
 
 
 @dataclass
@@ -487,9 +489,7 @@ class EngramHashProvider:
         self._history: Optional[torch.Tensor] = None
         self._history_row_of: Dict[int, int] = {}
         self._history_free_rows: List[int] = []
-        self._pending_history_seeds: dict[
-            int, tuple[int, tuple[int, ...], tuple[bool, ...] | None]
-        ] = {}
+        self._pending_history_seeds: dict[int, _HistorySeed] = {}
         self._history_host_staging: dict = {}
         self._decode_row_map: tuple[tuple, torch.Tensor] | None = None
 
@@ -791,7 +791,7 @@ class EngramHashProvider:
             or not request_ids
             or len(set(request_ids)) != len(request_ids)
             or len(request_ids) == num_tokens
-            or num_tokens > _DECODE_REFRESH_MAX_ROWS
+            or num_tokens > DECODE_REFRESH_MAX_ROWS
             or type(max_seq_len) is not int
             or history.shape[1] < max_seq_len
             or self._pending_history_seeds.keys() & set(request_ids)
@@ -840,8 +840,10 @@ class EngramHashProvider:
         num_tokens: int,
         max_seq_len: int,
         max_seed_cells: int,
-    ) -> Optional[Tuple[DecodeRefreshPlan, List[int], Tuple[list, list, list, list]]]:
-        """Reserve the rows and take the pending seeds of requests that all join this forward:
+    ) -> Optional[
+        Tuple[DecodeRefreshPlan, List[int], Tuple[list[int], list[int], list[int], list[bool]]]
+    ]:
+        """Reserve rows and collect the pending seeds of requests that join this forward:
         (plan, history rows, seed cells as rows / positions / ids / text flags) for one launch."""
         request_ids = tuple(request_ids)
         history = self._history
@@ -850,7 +852,7 @@ class EngramHashProvider:
             history is None
             or multipliers is None
             or self._pad_id is None
-            or num_tokens > _DECODE_REFRESH_MAX_ROWS
+            or num_tokens > DECODE_REFRESH_MAX_ROWS
             or type(max_seq_len) is not int
             or history.shape[1] < max_seq_len
         ):
@@ -870,25 +872,26 @@ class EngramHashProvider:
             or sum(len(seed[1]) for seed in seeds if seed is not None) > max_seed_cells
         ):
             return None
+        if any(seed is not None and seed[0] + len(seed[1]) > history.shape[1] for seed in seeds):
+            raise ValueError("Engram history seed exceeds the configured sequence length")
         rows = self._reserve_history_rows(list(request_ids), max_seq_len, device)
         cells = ([], [], [], [])
+        pending_seeds = []
         top = self._lookup_table.shape[0] - 1
         for request_id, row, seed in zip(request_ids, rows, seeds):
             if seed is None:
                 continue
             start, token_ids, token_mask = seed
-            if start + len(token_ids) > self._history.shape[1]:
-                raise ValueError("Engram history seed exceeds the configured sequence length")
             cells[0].extend([row] * len(token_ids))
             cells[1].extend(range(start, start + len(token_ids)))
             cells[2].extend(max(0, min(token, top)) for token in token_ids)
             cells[3].extend(token_mask if token_mask is not None else [True] * len(token_ids))
-            del self._pending_history_seeds[request_id]
+            pending_seeds.append((request_id, seed))
         stream = torch._C._cuda_getCurrentRawStream(
             device.index if device.index is not None else torch.cuda.current_device()
         )
         row_map = torch.empty(num_tokens, dtype=torch.long, device=device)
-        self._decode_row_map = ((device, stream, tuple(rows), lengths), row_map)
+        row_record = ((device, stream, tuple(rows), lengths), row_map)
         plan = DecodeRefreshPlan(
             rows=row_map,
             lookup=self._lookup_table,
@@ -902,9 +905,10 @@ class EngramHashProvider:
             max_ngram=self.config.max_ngram_size,
             request_ids=request_ids,
             request_rows=tuple(rows),
-            row_record=self._decode_row_map,
+            row_record=row_record,
             shape_key=shape_key,
             cached=cached,
+            pending_seeds=tuple(pending_seeds),
         )
         return plan, rows, cells
 
@@ -935,7 +939,11 @@ class EngramHashProvider:
         )
 
     def adopt_decode_refresh(self, plan: DecodeRefreshPlan) -> None:
-        """Leave the provider as its own refresh of ``plan``'s batch would (the caller ran it)."""
+        """Publish the row map and consume the seeds after the caller queues the refresh."""
+        self._decode_row_map = plan.row_record
+        for request_id, seed in plan.pending_seeds:
+            if self._pending_history_seeds.get(request_id) is seed:
+                del self._pending_history_seeds[request_id]
         self._cached_hashes = plan.cached
 
     def _compute_decode_hashes(
@@ -1026,7 +1034,7 @@ class EngramHashProvider:
             is_blackwell_datacenter()
             and scatter_first
             and stack is not None
-            and num_output_tokens <= _DECODE_REFRESH_MAX_ROWS
+            and num_output_tokens <= DECODE_REFRESH_MAX_ROWS
         ):
             if self._multiplier_stack is None or self._multiplier_stack.device != input_ids.device:
                 self._multiplier_stack = torch.stack(

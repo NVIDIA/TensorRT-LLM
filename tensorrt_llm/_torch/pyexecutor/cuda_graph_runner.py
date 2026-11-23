@@ -1417,7 +1417,8 @@ class CUDAGraphRunner:
         copy_input_ids = (not prestaged and input_ids.data_ptr()
                           != static_input_ids.data_ptr())
         hooks_done = (prestaged and pre_replay_staged
-                      and position_id_offsets is not None)
+                      and position_id_offsets is not None
+                      and len(self._pre_replay_hooks) == 1)
 
         position_ids = current_inputs["position_ids"]
         # Hooks get their own corrected positions: the captured preprocessing

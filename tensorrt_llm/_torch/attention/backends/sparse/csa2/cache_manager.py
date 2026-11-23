@@ -1101,12 +1101,21 @@ class CSA2CacheManager(KVCacheManagerV2):
         may hold a page before or after the call, the rest stays BAD_PAGE_INDEX, and the
         call returns int64 ``[requests]``: the columns of each ``swa_out`` row that may hold
         a page. ``swa_live`` (int64 ``[requests]``) is that bound before the call.
+        When the bound is unknown, the destination is cleared on device first.
         ``page_versions`` are the requests' page-storage versions when the caller has
         already read them.
         """
         count = len(request_ids)
         self._batch_page_tables = self._device_batch_page_tables[:, :count]
         self._batch_scratch = None
+        stream = self._wait_for_page_table_conversion()
+        reset_swa = swa_out is not None and swa_live is None
+        if reset_swa:
+            # A new or overlapping view may hold another batch's pages. Clearing
+            # it on device keeps the base-row snapshot bounded by the live columns.
+            swa_out.fill_(BAD_PAGE_INDEX)
+            swa_live = np.zeros(count, dtype=np.int64)
+            self._batch_conversion_inputs = None
         if (
             self._unchanged_page_exit
             and count
@@ -1114,13 +1123,16 @@ class CSA2CacheManager(KVCacheManagerV2):
             and swa_out is not None
             and self._unchanged_page_storage(request_ids, swa_out, page_versions)
         ):
-            # The previous conversion recorded this event.
-            current_cuda_stream().wait_event(self._base_rows_read[self._base_rows_slot])
             self._num_page_table_reuses += 1
             return None
         self._batch_rows = np.empty(0, dtype=np.int32)
         self._batch_caches = None
         if not count:
+            self._batch_conversion_inputs = None
+            if swa_out is not None:
+                # copy_batch_block_offsets can still clear a destination with no live rows.
+                self._base_rows_read[self._base_rows_slot].record(stream)
+                self._page_tables_stream = stream
             return np.zeros(0, dtype=np.int64)
         rows = self.index_mapper.get_copy_index(list(request_ids), num_contexts, 1)
         self._batch_rows = rows.numpy().copy()
@@ -1135,8 +1147,6 @@ class CSA2CacheManager(KVCacheManagerV2):
         if not num_contexts:
             inputs = (self._batch_rows, caches, list(page_versions), scratch, swa_out)
             if _same_conversion_inputs(inputs, self._batch_conversion_inputs):
-                # The previous conversion recorded this event.
-                current_cuda_stream().wait_event(self._base_rows_read[self._base_rows_slot])
                 self._num_page_table_reuses += 1
                 return None
         changed = _changed_rows(inputs, self._batch_conversion_inputs)
@@ -1160,11 +1170,22 @@ class CSA2CacheManager(KVCacheManagerV2):
                     self._convert_all_rows(count, width, bound, scratch, swa_out, written)
                 self._page_table_full_build_s += time.perf_counter() - start
                 self._num_page_table_full_builds += 1
+        elif reset_swa:
+            self._base_rows_read[self._base_rows_slot].record(stream)
+        if width or reset_swa:
+            self._page_tables_stream = stream
         self._table_live[:count] = live
         if swa_out is None:
             self._swa_table_live[:count] = live
         self._batch_conversion_inputs = inputs
         return live
+
+    def _wait_for_page_table_conversion(self) -> torch.cuda.Stream:
+        """Return the current stream, ordered after any prior conversion on another stream."""
+        stream = current_cuda_stream()
+        if stream is not self._page_tables_stream:
+            stream.wait_event(self._base_rows_read[self._base_rows_slot])
+        return stream
 
     def take_page_table_stats(self) -> tuple[int, int, int, float]:
         stats = (
@@ -1324,7 +1345,7 @@ class CSA2CacheManager(KVCacheManagerV2):
             live = np.maximum(live, np.minimum(scratch[0][..., 1].max(axis=0), width))
         return live
 
-    def _scratch_descriptors(self, caches):
+    def _scratch_descriptors(self, caches) -> tuple[np.ndarray, np.ndarray] | None:
         """Host int32 ``[pools, requests, 2]`` scratch ranges and ``[pools, requests, n]``
         slot ids of the batch's ``caches``, or None when none holds SWA scratch slots."""
         if not self.enable_swa_scratch_reuse:
@@ -1572,6 +1593,8 @@ class CSA2CacheManager(KVCacheManagerV2):
         self._changed_rows_read = torch.cuda.Event()
         self._base_rows_slot = 0
         self._base_rows_read = [torch.cuda.Event(), torch.cuda.Event()]
+        self._base_rows_read[self._base_rows_slot].record(self._stream)
+        self._page_tables_stream = self._stream
         self._base_rows_stream = private_stream(device.index, "csa2_copy")
         self._device_scratch = {}
         self._batch_conversion_inputs = None
@@ -1650,15 +1673,16 @@ class CSA2CacheManager(KVCacheManagerV2):
         width = min(dst_tensor.shape[-1], self.max_blocks_per_seq)
         live = self._claim_block_offsets(dst_tensor)
         if live is None:
+            self._wait_for_page_table_conversion()
             dst_tensor[:, count:].fill_(BAD_PAGE_INDEX)
             dst_tensor[swa_layers:, :count].fill_(BAD_PAGE_INDEX)
             dst_tensor[:swa_layers, :count, 1:].fill_(BAD_PAGE_INDEX)
             dst_tensor[:swa_layers, :count, 0, width:].fill_(BAD_PAGE_INDEX)
-            live = np.full(count, width, dtype=np.int64)
         elif len(live) > count:
             # Only rows a larger earlier batch wrote hold pages past this batch.
             columns = int(live[count:].max())
             if columns:
+                self._wait_for_page_table_conversion()
                 dst_tensor[:swa_layers, count : len(live), 0, :columns].fill_(BAD_PAGE_INDEX)
             live = live[:count]
         elif len(live) < count:

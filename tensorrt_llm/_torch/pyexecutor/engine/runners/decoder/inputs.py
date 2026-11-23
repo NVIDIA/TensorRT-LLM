@@ -973,6 +973,9 @@ class DecoderInputPreparer:
             and not self._dspark_trims_submitted_tokens
         ):
             has_static_inputs = cuda_graph_runner is not None and cuda_graph_runner.enabled
+            stage_rng = False
+            if self.runtime_hooks.pack_spec_rng_uploads:
+                stage_rng = True
             self._steady_mtp = SteadyMtpPrepare(
                 max_batch_size=self._config.max_batch_size,
                 max_num_tokens=self._config.max_num_tokens,
@@ -987,7 +990,7 @@ class DecoderInputPreparer:
                     else None
                 ),
                 steady_decode_prepare=self._config.steady_decode_prepare,
-                stage_rng=self.runtime_hooks.pack_spec_rng_uploads,
+                stage_rng=stage_rng,
             )
 
     def _steady_mtp_fast_prepare_mode(
@@ -1221,6 +1224,7 @@ class DecoderInputPreparer:
             prepare_request_inputs(scheduled_requests, attn_metadata, promoted_context_request_ids)
 
         new_tokens_device, new_tokens_lens_device, next_draft_tokens_device = None, None, None
+        stores_ready = None
         if new_tensors_device is not None:
             # speculative decoding cases: [batch, 1 + draft_len], others: [batch]
             new_tokens_device = new_tensors_device.new_tokens
@@ -1228,6 +1232,7 @@ class DecoderInputPreparer:
             # would be SampleStateTensorsSpec.
             if isinstance(new_tensors_device, SampleStateTensorsSpec):
                 assert enable_spec_decode
+                stores_ready = new_tensors_device.stores_ready
                 new_tokens_lens_device = new_tensors_device.new_tokens_lens  # [batch]
                 next_draft_tokens_device = (
                     new_tensors_device.next_draft_tokens
@@ -1237,10 +1242,10 @@ class DecoderInputPreparer:
         if self.guided_decoder is not None:
             # Prefill CUDA graphs capture only the decoder body; guided decoding runs after it.
             # _skip_inactive raises if a capture ever records guided work while inactive.
-            stores_ready = getattr(new_tensors_device, "stores_ready", None)
             if stores_ready is not None:
                 # It copies the previous tokens out of the stores, which the sampler's side stream updates.
                 current_cuda_stream().wait_event(stores_ready)
+                stores_ready = None
             self.guided_decoder.add_batch(
                 scheduled_requests,
                 new_tokens=new_tokens_device,
@@ -1307,7 +1312,6 @@ class DecoderInputPreparer:
                 kv_cache_manager,
                 runtime_draft_len,
             )
-        stores_ready = getattr(new_tensors_device, "stores_ready", None)
         if stores_ready is not None:
             # A full pass gathers from the stores, which the sampler's side stream updates.
             current_cuda_stream().wait_event(stores_ready)

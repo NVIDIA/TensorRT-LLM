@@ -20,7 +20,12 @@ import torch
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.modules.multi_stream_utils import private_stream
-from tensorrt_llm._utils import get_sm_version, is_blackwell_datacenter, is_sm_100f
+from tensorrt_llm._utils import (
+    get_sm_version,
+    is_blackwell_datacenter,
+    is_sm_100f,
+    maybe_pin_memory,
+)
 from tensorrt_llm.math_utils import ceil_div
 
 from .block_select import PUBLISH_BLOCK, block_select_supported
@@ -2664,6 +2669,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         int64 arrays. The copy plan holds for every steady step that reads the
         same converted tables.
         """
+        from .....pyexecutor import device_copy
         from . import kernel
         from .cache_manager import CSA2CacheRole
 
@@ -2699,7 +2705,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         )
         plan = self._csa2_steady_refresh
         if plan is None or plan[0] != key:
-            targets, sources, published_copies, owner_copies = [], [], [], []
+            targets, sources, published_copies = [], [], []
 
             def refresh(target, spec, published=None):
                 source = (
@@ -2709,7 +2715,6 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
                     targets.append(target)
                     sources.append(source)
                     published_copies.append(published is not None)
-                    owner_copies.append(published is None and spec[1] != CSA2CacheRole.SWA)
 
             for owner, table in self.csa2_global_page_tables.items():
                 refresh(table, (owner, CSA2CacheRole.GLOBAL))
@@ -2737,24 +2742,36 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
                 max((target.shape[0] for target in targets), default=0),
                 any(published_copies),
                 None,
-                owner_copies,
             ]
-        _, targets, sources, descriptors, max_rows, copies_published, copied, owner_copies = plan
+        _, targets, sources, descriptors, max_rows, copies_published, copied = plan
+        # The manager's per-row bounds cover the owner tables and the SWA tables
+        # converted for the same batch, including a published SWA destination.
+        lives = [manager.batch_table_live()] * len(targets)
         if descriptors is not None:
-            # Converted tables hold BAD_PAGE_INDEX past their live columns, so only the columns
-            # either side may hold pages in are copied.
+            bounds = self._table_copy_bounds(targets, lives, max_rows)
+            columns = None
             live = manager.batch_live_columns()
+            copy_width = page_count if copied is None else min(page_count, max(live, copied))
+            if bounds is not None:
+                copy_width = min(page_count, int(bounds.max()))
+                columns = self._get_csa2_buffer(
+                    "steady_table_copy_columns", bounds.shape, torch.int32
+                )
+                site = device_copy.CopySite.CSA2_STEADY_TABLE_COLUMNS
+                device_copy.copy(site, columns, torch.from_numpy(bounds), snapshot=maybe_pin_memory)
+                if device_copy.CHECK_MODE:
+                    device_copy.expect_landed(site, columns)
             kernel.copy_tables_(
                 self._device_descriptors("page_table_refresh", descriptors),
                 max_rows,
-                page_count if copied is None else min(page_count, max(live, copied)),
+                copy_width,
+                row_columns=columns,
             )
             plan[6] = None if copies_published else live
         elif targets:
             torch._foreach_copy_(targets, sources)
         # Every target equals its source here, which holds BAD_PAGE_INDEX past its live columns.
-        table_live = manager.batch_table_live()
-        self._track_table_live(targets, [table_live if owner else None for owner in owner_copies])
+        self._track_table_live(targets, lives)
 
     def _finish_prepare_csa2(self, snapshot, *, defer_outputs: bool) -> None:
         manager = self.kv_cache_manager

@@ -39,6 +39,7 @@ import triton
 import triton.language as tl
 
 from tensorrt_llm._utils import current_cuda_stream, is_blackwell_datacenter, prefer_pinned
+from tensorrt_llm.logger import logger
 
 from ..attention.backends.interface import AttentionMetadata
 from ..attention.backends.trtllm import TrtllmAttentionMetadata
@@ -49,6 +50,7 @@ if TYPE_CHECKING:
     from ..modules.engram.engram import DecodeRefreshPlan, EngramHashProvider
     from ..speculative.interface import SpecMetadata
     from .cuda_graph_runner import CUDAGraphRunner
+    from .engine.runners.decoder.inputs import _SteadyStepInputs
     from .llm_request import LlmRequest
 
 __all__ = ["SteadyMtpPrepare", "SteadyMtpRecord", "stage_steady_inputs", "steady_glue_enabled"]
@@ -56,8 +58,12 @@ __all__ = ["SteadyMtpPrepare", "SteadyMtpRecord", "stage_steady_inputs", "steady
 # Depth of the host slab ring.
 _RING = 3
 
-# Tokens per step up to which the staging launch also does the Engram refresh (a single program).
-_GLUE_MAX_TOKENS = 64
+
+def _staging_words(num_rows: int, num_tokens: int) -> int:
+    """Worst-case slab words before seed cells: slots, KV and prompt lengths,
+    history rows, positions, and tokens for an admission."""
+    return 4 * num_rows + 2 * num_tokens
+
 
 # Integer args unspecialized, pointers not specialized on alignment, one BLOCK for every batch size: one variant
 # per engine, compiled during warmup instead of at each new batch size.
@@ -725,7 +731,10 @@ def stage_steady_inputs(
 
 @dataclass
 class SteadyMtpRecord:
-    """What the last qualifying full pass left, keyed by the batch it ran."""
+    """Prepared state keyed by the recorded or most recently admitted batch.
+
+    Request IDs and lengths include padding rows. Slots describe real requests only.
+    """
 
     request_ids: list[int]
     slots: list[int]
@@ -754,7 +763,7 @@ class SteadyMtpRecord:
     slots_array: np.ndarray | None = None
     seq_lens_kv_array: np.ndarray | None = None
     # The preparer's _SteadyStepInputs of the recorded batch.
-    step_inputs: Any = None
+    step_inputs: "_SteadyStepInputs | None" = None
     # The Engram refresh its steady steps do in the staging launch (None: unknown yet, False: none).
     glue_plan: "DecodeRefreshPlan | bool | None" = None
 
@@ -814,14 +823,24 @@ class SteadyMtpPrepare:
             ):
                 hooks = graph_runner.pre_replay_hooks
                 provider = getattr(hooks[0], "engram_provider", None) if len(hooks) == 1 else None
-                if provider is not None and self.block <= _GLUE_MAX_TOKENS:
-                    self.glue_runner, self.glue_provider = graph_runner, provider
-        # Slots, KV and prompt lengths, history rows (5 per request), positions and tokens, and
-        # the joining requests' history seed cells (4 words each).
+                if provider is not None:
+                    from ..modules.engram.engram import DECODE_REFRESH_MAX_ROWS
+
+                    # The block covers the engine's configured maximum batch and draft width.
+                    if self.block <= DECODE_REFRESH_MAX_ROWS:
+                        self.glue_runner, self.glue_provider = graph_runner, provider
+                    else:
+                        logger.info(
+                            "Engram refresh uses the replay hook: the engine's staging block %d "
+                            "exceeds the fused refresh limit %d",
+                            self.block,
+                            DECODE_REFRESH_MAX_ROWS,
+                        )
+        # The joining requests' seed cells carry four words each.
         seed_words = 0
         if self.glue_provider is not None:
             seed_words = 4 * max_requests * (self.glue_provider.config.max_ngram_size - 1)
-        self.slab_capacity = 5 * max_requests + 2 * int(max_num_tokens) + seed_words
+        self.slab_capacity = _staging_words(max_requests, int(max_num_tokens)) + seed_words
         # With pinned memory the kernel reads the host slab through its device mapping (no H2D copy); otherwise
         # the slab goes through a device copy.
         self.zero_copy = prefer_pinned()
@@ -978,7 +997,7 @@ class SteadyMtpPrepare:
         spec_metadata: "SpecMetadata",
         static_tensors: dict[str, torch.Tensor] | None,
         num_padding: int = 0,
-        step_inputs: Any = None,
+        step_inputs: "_SteadyStepInputs | None" = None,
     ) -> None:
         """Record a full pass that prepared ``requests``, all verifying their previous device drafts
         (or all without a previous step on the device) but the last ``num_padding`` padding rows.
@@ -988,7 +1007,7 @@ class SteadyMtpPrepare:
         b = len(requests)
         num_real = b - num_padding
         n_tokens = b * tokens_per_step
-        if 3 * b + n_tokens > self.slab_capacity:
+        if _staging_words(b, n_tokens) > self.slab_capacity:
             return
         attn_steady = (
             isinstance(attn_metadata, TrtllmAttentionMetadata)
@@ -1182,7 +1201,9 @@ class SteadyMtpPrepare:
             and rec.attn_metadata.num_tokens == num_tokens
         )
 
-    def _admission_plan(self, rec: SteadyMtpRecord, num_tokens: int, free_words: int):
+    def _admission_plan(
+        self, rec: SteadyMtpRecord, num_tokens: int, free_words: int
+    ) -> "tuple[DecodeRefreshPlan, list[int], tuple[list[int], list[int], list[int], list[bool]]] | None":
         """The Engram refresh of joining requests (with their history rows and seed cells) that the
         staging launch does in place of the replay's hook, or None."""
         if self.glue_provider is None or not self._glue_applies(rec, num_tokens):
@@ -1276,9 +1297,9 @@ class SteadyMtpPrepare:
                 for values in cells:
                     view[used : used + num_seeds] = values
                     used += num_seeds
-                rec.glue_plan = plan
         else:
             plan = self._glue_plan(rec, n)
+        assert used <= self.slab_capacity
         host_positions = positions.copy()
         if self.zero_copy:
             slab = self.host_slabs[k]
@@ -1333,6 +1354,7 @@ class SteadyMtpPrepare:
         )
         if plan is not None:
             self.glue_provider.adopt_decode_refresh(plan)
+            rec.glue_plan = plan
         # The host slots (and the Philox slot) may be rewritten once their reader (the copy, or the kernel
         # itself) has run.
         event = self.slab_events[k]

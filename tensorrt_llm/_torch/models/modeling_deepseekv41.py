@@ -3632,14 +3632,15 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
 
     model_cls = DeepseekV41Model
     weight_loader_cls = DeepseekV41WeightLoader
-    # Unchanged DSpark decode batches take the steady decode-step prepare (DecoderRunnerConfig).
-    steady_decode_prepare = True
 
     @property
     def runtime_hooks(self) -> RuntimeHooks:
-        """V4's hooks; its ranks step in lockstep (attention DP, TP), so they also merge their tuned
-        tactics."""
-        return replace(super().runtime_hooks, merge_tuned_tactics_across_ranks=True)
+        """Enable steady staging on SM100/SM103 and share tuned tactics across ranks."""
+        return replace(
+            super().runtime_hooks,
+            steady_decode_prepare=is_blackwell_datacenter(),
+            merge_tuned_tactics_across_ranks=True,
+        )
 
     def __pp_init__(self) -> None:
         super().__pp_init__()

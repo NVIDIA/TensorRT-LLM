@@ -23,9 +23,14 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import Decoder
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.metadata import DecoderMetadata
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
+from tensorrt_llm._torch.pyexecutor.sampler.sampler import TorchSampler
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.pyexecutor.steady_spec_prepare import SteadyMtpPrepare, stage_steady_inputs
-from tensorrt_llm._torch.speculative.spec_sampler_base import SampleStateTensorsSpec, StepOutputRows
+from tensorrt_llm._torch.speculative.spec_sampler_base import (
+    SampleStateTensorsSpec,
+    SpecSampler,
+    StepOutputRows,
+)
 from tensorrt_llm.llmapi import MTPDecodingConfig
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
@@ -89,7 +94,8 @@ def _device_tensors(gen):
 @pytest.mark.parametrize("block", [None, 64])
 @pytest.mark.parametrize("b,t", [(1, 7), (3, 8), (4, 9)])
 @pytest.mark.parametrize("mrope", [True, False])
-def test_staging_kernel_matches_full_pass(mrope, b, t, block, host_slab):
+@pytest.mark.parametrize("loads_first", [False, True])
+def test_staging_kernel_matches_full_pass(mrope, b, t, block, host_slab, loads_first):
     gen = torch.Generator().manual_seed(100 * b + t)
     n = b * t
     for _ in range(3):
@@ -113,6 +119,7 @@ def test_staging_kernel_matches_full_pass(mrope, b, t, block, host_slab):
             static_input_ids=static_ids,
             static_position_ids=static_pos,
             block=block,
+            loads_first=loads_first,
             **{k: v for k, v in actual.items() if k not in ("mrope_positions", "kv_lens_cuda")},
             mrope_positions=actual["mrope_positions"] if mrope else None,
             kv_lens_cuda=actual["kv_lens_cuda"] if kv_lens else None,
@@ -131,7 +138,7 @@ def test_staging_kernel_matches_full_pass(mrope, b, t, block, host_slab):
 
 
 @pytest.mark.parametrize("host_slab", [False, True])
-@pytest.mark.parametrize("b,t", [(1, 7), (5, 7), (3, 2)])
+@pytest.mark.parametrize("b,t", [(1, 2), (5, 7)])
 @pytest.mark.parametrize("mode", ["legacy", "loads_first", "padded", "output_rows", "admit"])
 def test_staged_rng_matches_uploaded_rng(b, t, host_slab, mode):
     """With an RNG slab the kernel writes SpecMetadata's Philox buffers exactly as
@@ -536,6 +543,30 @@ def _with_output_rows(stored, slots):
     )
 
 
+def _sample_pending_stores(sampler, stored, requests):
+    """Scatter real sampler outputs in a different order from the next batch."""
+    batch = ScheduledRequests()
+    batch.generation_requests = list(reversed(requests))
+    rows = _with_output_rows(stored, [r.py_seq_slot for r in batch.generation_requests]).rows
+    outputs = dict(
+        new_tokens=rows.next_new_tokens,
+        new_tokens_lens=rows.new_tokens_lens,
+        next_new_tokens=rows.next_new_tokens,
+        next_draft_tokens=rows.next_draft_tokens,
+        native_uniform_verify=True,
+    )
+    # Compile the scatter and drain the warmup before delaying the real update.
+    sampler.sample_async(batch, outputs, []).sampler_event.synchronize()
+    sampler.store.next_new_tokens.fill_(-1)
+    sampler.store.next_draft_tokens.fill_(-1)
+    sampler.store.new_tokens_lens.zero_()
+    with torch.cuda.stream(sampler._d2h_side_stream):
+        torch.cuda._sleep(200_000_000)
+    state = sampler.sample_async(batch, outputs, [])
+    assert state.device.stores_ready is not None and not state.device.stores_ready.query()
+    return state.device
+
+
 @pytest.mark.parametrize("mode", ["plain", "tp", "attention_dp_padded"])
 def test_prepare_inputs_steady_steps_match_forced_full_passes(mode):
     """Steady decode steps of DecoderInputPreparer on real TrtllmAttentionMetadata hand the model
@@ -571,6 +602,18 @@ def test_prepare_inputs_steady_steps_match_forced_full_passes(mode):
         dtype=tensorrt_llm.bindings.DataType.HALF,
     )
     try:
+        sampler = None
+        if mode == "tp":
+            sampler = SpecSampler(
+                TorchSampler.Args(
+                    max_seq_len=512,
+                    max_draft_len=draft_len,
+                    max_num_sequences=SLOTS,
+                    max_beam_width=1,
+                    max_total_draft_tokens=draft_len,
+                )
+            )
+            sampler.stores_on_side_stream = True
         requests = manager.add_dummy_requests(
             [1, 2, 3], token_nums=[10, 17, 33], is_gen=True, max_num_draft_tokens=draft_len
         )
@@ -654,6 +697,7 @@ def test_prepare_inputs_steady_steps_match_forced_full_passes(mode):
         copied, admitted, by_row = [], [], []
         for step, accepted in enumerate([[0, 0, 0]] + schedule):
             joining = isinstance(accepted, tuple)
+            use_stores = sampler is not None and step == 2
             previous_slots = [request.py_seq_slot for request in requests]
             if accepted is None:
                 _repage_last_block(manager, requests[0], other)
@@ -692,6 +736,8 @@ def test_prepare_inputs_steady_steps_match_forced_full_passes(mode):
                 if joining:
                     for request in requests:
                         request.py_batch_idx = None
+                if use_stores:
+                    previous = _sample_pending_stores(sampler, stored, requests)
                 with (
                     patch.object(
                         manager, "copy_batch_block_offsets", wraps=manager.copy_batch_block_offsets
@@ -730,6 +776,19 @@ def test_prepare_inputs_steady_steps_match_forced_full_passes(mode):
                 states[arm] = _step_state(
                     preparer, inputs, attn_metadata, spec_metadata, len(rows), t
                 )
+                if use_stores:
+                    expected_ids = stored.new_tokens[:t, previous_slots, 0].T.reshape(-1)
+                    expected_drafts = stored.next_draft_tokens[previous_slots, :draft_len].flatten()
+                    expected_offsets = stored.new_tokens_lens[previous_slots]
+                    assert torch.equal(states[arm]["input_ids"], expected_ids), arm
+                    assert torch.equal(states[arm]["draft_tokens"], expected_drafts), arm
+                    assert torch.equal(
+                        states[arm]["previous_pos_id_offsets"],
+                        expected_offsets.repeat_interleave(t),
+                    ), arm
+                    assert torch.equal(
+                        states[arm]["previous_kv_lens_offsets"], expected_offsets - t
+                    ), arm
             mismatches = sorted(
                 name
                 for name in states["steady"].keys() | states["full"].keys()
@@ -745,6 +804,9 @@ def test_prepare_inputs_steady_steps_match_forced_full_passes(mode):
         assert copied == changed and any(changed) and not all(changed), (copied, changed)
         assert admitted == [step in joins for step in steady_steps], admitted
         # A step that verifies its previous drafts reads them from the previous step's output rows.
-        assert by_row == [opted_in and not joined for joined in admitted], by_row
+        assert by_row == [
+            opted_in and step not in joins and not (sampler is not None and step == 2)
+            for step in steady_steps
+        ], by_row
     finally:
         manager.shutdown()

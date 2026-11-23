@@ -240,6 +240,13 @@ def test_steady_glue_matches_the_staging_launch_and_replay_hook(monkeypatch):
             tokens = torch.randint(-5, 300, (b, t), generator=gen, dtype=torch.int32).tolist()
             for side in (candidate, reference):
                 side.admit([3, 6], [3000, 700], [(2998, [11, 302]), (698, [4, 9])], tokens)
+            first, second = (request.py_request_id for request in candidate.requests)
+            first_seed = candidate.provider._pending_history_seeds[first]
+            candidate.provider.queue_history_seed(second, MAX_SEQ - 1, [4, 9])
+            with pytest.raises(ValueError, match="exceeds the configured sequence length"):
+                candidate.step(device_tensors, from_host=True)
+            assert candidate.provider._pending_history_seeds[first] == first_seed
+            candidate.provider.queue_history_seed(second, 698, [4, 9])
         results = [
             side.step(device_tensors, from_host=step == 6) for side in (candidate, reference)
         ]
@@ -247,6 +254,8 @@ def test_steady_glue_matches_the_staging_launch_and_replay_hook(monkeypatch):
         assert results[0][0] == (step < 4 or step >= 6) and not results[1][0], step
         assert torch.equal(results[0][1], results[1][1]), step
         assert torch.equal(candidate.provider._history, reference.provider._history), step
+        if step == 6:
+            assert not candidate.provider._pending_history_seeds
         assert torch.equal(
             candidate.runner._pre_replay_position_ids, reference.runner._pre_replay_position_ids
         ), step

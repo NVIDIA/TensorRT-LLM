@@ -13,7 +13,7 @@ from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
 from tensorrt_llm._torch.peft.lora.ownership import DecoderLoraOwner
 from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
-from tensorrt_llm._utils import is_blackwell_datacenter, release_gc
+from tensorrt_llm._utils import release_gc
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor, create_input_processor
 from tensorrt_llm.llmapi.llm_args import (
     DecodingBaseConfig,
@@ -71,6 +71,7 @@ from .guided_decoder import CapturableGuidedDecoder
 from .llm_request import LlmRequest
 from .model_loader import ModelLoader, release_localized_moe_weights
 from .resource_manager import ResourceManager, ResourceManagerType
+from .runtime_hooks import runtime_hooks_of
 from .sampler import SampleStateTensors
 from .scheduler import ScheduledRequests
 
@@ -98,18 +99,6 @@ def _spec_samples_sharded_temperature(model: torch.nn.Module) -> bool:
     target tokens on the LM head's vocab shard
     (``SpecDecOneEngineForCausalLM.spec_samples_sharded_temperature``)."""
     return _language_model_flag(model, "spec_samples_sharded_temperature")
-
-
-def _steady_decode_prepare(model: torch.nn.Module) -> bool:
-    """Whether the language model opts into ``steady_decode_prepare`` (SM100/SM103 only)."""
-    if not is_blackwell_datacenter():
-        return False
-    if isinstance(model, MultimodalModelMixin):
-        try:
-            model = model.language_model
-        except NotImplementedError:
-            return False
-    return bool(getattr(model, "steady_decode_prepare", False))
 
 
 # Refit only needs the compile wrapper removed before weights are loaded: the
@@ -603,7 +592,7 @@ class ModelEngine:
             guided_decoding_enabled=self.llm_args.guided_decoding_backend is not None,
             watermark_config=self.llm_args.watermark_config,
             is_disagg=is_disagg_enabled(self.llm_args.cache_transceiver_config),
-            steady_decode_prepare=_steady_decode_prepare(self.model),
+            steady_decode_prepare=runtime_hooks_of(self.model).steady_decode_prepare,
             **extra_fields,
         )
 

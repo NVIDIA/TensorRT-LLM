@@ -33,6 +33,7 @@ from ..._utils import current_cuda_stream, prefer_pinned
 from ...bindings.executor import FinishReason
 from ...sampling_params import SamplingParams
 from ..kernels.spec_step_copies import op as spec_step_copies
+from ..modules.multi_stream_utils import _record_stream
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from ..pyexecutor.resource_manager import BaseResourceManager
 from ..pyexecutor.runtime_hooks import SpecStepFold
@@ -805,7 +806,7 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         if scattered:
             for name in ("new_tokens", "next_new_tokens", "new_tokens_lens", "next_draft_tokens"):
                 # Keep the caching allocator from reusing the outputs before the side stream read them.
-                outputs[name].record_stream(side)
+                _record_stream(outputs[name], side)
         return scattered
 
     def sample_async(

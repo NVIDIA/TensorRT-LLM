@@ -509,7 +509,9 @@ PagePriorityCallback = Callable[[int, object], int]
 """Maps (block ordinal, life cycle) to the eviction priority of a page created by one cache."""
 
 
-def kept_generation_capacity(capacity: int, rewind: int, growth: int, tokens_per_block: int) -> int:
+def _kept_generation_capacity(
+    capacity: int, rewind: int, growth: int, tokens_per_block: int
+) -> int:
     """``capacity - rewind``, raised to the first slot of the last allocated block when that shrink
     would release the block and the next growth by ``growth`` slots would allocate it again."""
     new_capacity = capacity - rewind
@@ -6875,9 +6877,6 @@ class KVCacheManagerV2(BaseResourceManager):
             if not kv_cache.resume(self._stream.cuda_stream):
                 return False
             self._restore_page_index_bufs(req.py_request_id, kv_cache)
-            if self._keep_growth_block:
-                # A resumed cache gives no slack back; dropping it only leaves capacity higher.
-                self._kept_growth_slack.pop(req.py_request_id, None)
 
         if not self._ensure_generation_beam_width(req, kv_cache):
             return False
@@ -11116,7 +11115,7 @@ class KVCacheManagerV2(BaseResourceManager):
             self.try_commit_generation_blocks(req)
 
     def keep_growth_blocks(self) -> None:
-        """Keep a decoding request's growth block across a draft shrink (``kept_generation_capacity``),
+        """Keep a decoding request's growth block across a draft shrink (``_kept_generation_capacity``),
         except in a draft pool, under helix or under attention DP. Call before any request runs."""
         self._keep_growth_block = (
             not self.is_draft and not self._has_cp_helix and not self.mapping.enable_attention_dp
@@ -11126,11 +11125,11 @@ class KVCacheManagerV2(BaseResourceManager):
         self, request_id: int, capacity: int, rewind_len: int, draft_slots: int
     ) -> int:
         """The capacity a generation update shrinks to when it keeps its growth block (see
-        ``kept_generation_capacity``); records the slack it keeps, gives back the previous one."""
+        ``_kept_generation_capacity``); records the slack it keeps, gives back the previous one."""
         rewind = rewind_len + self._kept_growth_slack.pop(request_id, 0)
         # The next growth takes the width of the latest allocation.
         growth = 1 + self._allocated_draft_lens.get(request_id, draft_slots)
-        new_capacity = kept_generation_capacity(capacity, rewind, growth, self.tokens_per_block)
+        new_capacity = _kept_generation_capacity(capacity, rewind, growth, self.tokens_per_block)
         if new_capacity > capacity - rewind:
             self._kept_growth_slack[request_id] = new_capacity - (capacity - rewind)
         return new_capacity
