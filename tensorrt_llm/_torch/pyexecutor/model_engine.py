@@ -588,6 +588,7 @@ class ModelEngine:
             ),
             spec_decode_fast_paths=self.spec_decode_fast_paths,
             spec_samples_sharded_temperature=self.spec_samples_sharded_temperature,
+            guided_decoding_enabled=self.llm_args.guided_decoding_backend is not None,
             watermark_config=self.llm_args.watermark_config,
             is_disagg=is_disagg_enabled(self.llm_args.cache_transceiver_config),
             **extra_fields,

@@ -330,8 +330,10 @@ from each rank's vocab shard of the target logits instead of gathering them:
 
 `TLLM_SPEC_VOCAB_PARALLEL_ARGMAX=0` gathers the logits for greedy batches too.
 The models that take the speculative fast paths (`spec_decode_fast_paths`) read
-neither variable: their workers always select their greedy and temperature-only
-target tokens from the shards.
+neither variable. Their MTP-Eagle workers also gather logits when a sampled
+request has a positive temperature below 1e-4, so tied maxima retain their
+sampling probabilities. With only `["greedy", "temperature_only"]` captured,
+such batches run eagerly because they need the `advanced` variant.
 
 ## Beam search
 

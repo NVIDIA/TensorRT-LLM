@@ -347,8 +347,10 @@ def supports_temperature_only_graphs(config: DecoderRunnerConfig, mapping: Mappi
     return (
         config.cuda_graph_config is not None
         and config.watermark_config is None
-        and not getattr(spec_config, "use_rejection_sampling", False)
-        and not getattr(spec_config, "enable_penalty", False)
+        and not config.guided_decoding_enabled
+        and spec_config is not None
+        and not spec_config.use_rejection_sampling
+        and not spec_config.enable_penalty
         and (
             config.spec_samples_sharded_temperature
             or (

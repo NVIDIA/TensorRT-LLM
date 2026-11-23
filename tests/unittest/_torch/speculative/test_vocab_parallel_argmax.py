@@ -901,6 +901,7 @@ def test_model_reports_the_temperature_variant():
         # No batch selects the variant (_temperature_only), so no warmup pass captures it.
         (True, True, False, "use_rejection_sampling", None, False),
         (True, True, False, "enable_penalty", None, False),
+        (True, True, False, "guided", None, False),
         (True, True, False, None, ["greedy", "advanced"], False),
     ],
 )
@@ -918,6 +919,7 @@ def test_temperature_graph_variant_follows_the_worker(
         cuda_graph_config=SimpleNamespace(sampling_variants=listed) if cuda_graphs else None,
         spec_decode_fast_paths=fast_paths,
         spec_samples_sharded_temperature=worker,
+        guided_decoding_enabled=excluded_by == "guided",
         watermark_config=object() if excluded_by == "watermark" else None,
     )
     assert metadata.captures_temperature_only_graphs(config, None) is captured

@@ -109,12 +109,11 @@ def _temperature_only(spec_metadata, temperature_capable: bool) -> bool:
                 and not spec_metadata.enable_penalty)
 
 
-def _set_temperature_only(spec_metadata, temperature_capable: bool,
-                          all_temperature_only: bool) -> None:
+def _set_temperature_only(spec_metadata, all_temperature_only: bool) -> None:
     """Set both temperature-only graph key bits from a sampling scan's values;
     ``is_all_greedy_sample`` already holds the group-synchronized value."""
     spec_metadata.temperature_only = _temperature_only(spec_metadata,
-                                                       temperature_capable)
+                                                       all_temperature_only)
     all_temperature_only = (all_temperature_only
                             and spec_metadata.shard_temperature_only_graphs)
     spec_metadata.local_all_temperature_only = all_temperature_only
@@ -625,6 +624,9 @@ _UNSEEDED_RNG_WINDOW_KEY = "unseeded"
 # so each slot leaves them room before the next one starts.
 _RNG_SLOT_SPAN = 32
 
+# SamplingConfig and the CUDA kernels both represent temperatures in float32.
+_SHARD_TEMPERATURE_MIN = float(np.float32(GREEDY_TEMPERATURE_THRESHOLD))
+
 
 @dataclass(frozen=True, slots=True)
 class OneModelSamplingParams:
@@ -646,7 +648,8 @@ class OneModelSamplingParams:
     def is_shard_sampleable(self) -> bool:
         """Temperature-only and unseeded: a row the vocabulary-sharded samplers may draw. A seeded
         row stays on the stock sampler, so its tokens do not depend on the rest of the batch."""
-        return self.is_temperature_only and self.seed is None
+        return (self.is_temperature_only and self.seed is None
+                and self.temperature >= _SHARD_TEMPERATURE_MIN)
 
     @classmethod
     def of_request(cls, request: "LlmRequest") -> "OneModelSamplingParams":
@@ -1621,19 +1624,13 @@ class SpecMetadata:
             cached = self._sampling_scan_cache
             if cached is not None and cached[0] == scan_key:
                 (_, per_request_normalized, per_request_slot_ids,
-                 self.is_all_greedy_sample, temperature_capable,
-                 all_temperature_only) = cached
-                _set_temperature_only(self, temperature_capable,
-                                      all_temperature_only)
+                 self.is_all_greedy_sample, all_temperature_only) = cached
+                _set_temperature_only(self, all_temperature_only)
                 return per_request_normalized, per_request_slot_ids
 
         per_request_normalized: list[tuple[float, int, float, float, int]] = []
         has_non_greedy_requests = False
         all_temperature_only = True
-        # Whether every sampled row can be drawn on the sharded logits (see
-        # _temperature_only).
-        temperature_capable = True
-        temperature_graphs = self.temperature_only_graphs
         per_request_slot_ids: list[int] = []
         ragged_verify = self.is_ragged_verify
         default_generation_tokens = 1 + self.runtime_draft_len
@@ -1654,13 +1651,6 @@ class SpecMetadata:
 
             has_non_greedy_requests |= not params.is_greedy
             all_temperature_only &= params.is_greedy or params.is_shard_sampleable
-            # The key exchange draws rows below the greedy threshold by
-            # argmax (the lowest id of tied maxima), while the stock sampler
-            # still samples them (tied maxima evenly): such rows keep it.
-            if (temperature_graphs and not params.is_greedy
-                    and not (params.is_shard_sampleable and params.temperature
-                             >= GREEDY_TEMPERATURE_THRESHOLD)):
-                temperature_capable = False
 
             per_request_normalized.append(
                 (params.temperature, params.top_k, params.top_p, params.min_p,
@@ -1687,12 +1677,11 @@ class SpecMetadata:
         # value rather than resurrect the local value.
         if self.group_all_greedy_sample is not None:
             self.is_all_greedy_sample = self.group_all_greedy_sample
-        _set_temperature_only(self, temperature_capable, all_temperature_only)
+        _set_temperature_only(self, all_temperature_only)
         if scan_key is not None:
             self._sampling_scan_cache = (scan_key, per_request_normalized,
                                          per_request_slot_ids,
                                          self.is_all_greedy_sample,
-                                         temperature_capable,
                                          all_temperature_only)
         return per_request_normalized, per_request_slot_ids
 

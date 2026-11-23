@@ -63,6 +63,7 @@ class DecoderRunnerConfig(RunnerConfig):
     # (SpecDecOneEngineForCausalLM.spec_samples_sharded_temperature), so the
     # decode CUDA graphs capture the temperature-only variant.
     spec_samples_sharded_temperature: bool = field(default=False, kw_only=True)
+    guided_decoding_enabled: bool = field(default=False, kw_only=True)
     watermark_config: "WatermarkConfig | None" = field(default=None, kw_only=True)
     # The executor serves disaggregated (a cache transceiver is configured).
     is_disagg: bool = field(kw_only=True)
