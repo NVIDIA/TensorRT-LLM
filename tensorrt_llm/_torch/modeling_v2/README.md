@@ -421,11 +421,15 @@ the example.
    `local_slots`, and fill slot `j` from checkpoint expert `slot_experts[j]`.
    An expert in two slots is loaded twice, and a rank reads only the experts
    its slots hold.
-4. **Routing.** After the router's top-k, map the expert ids to slot ids
-   with `EplbLayer.route`, and call the expert kernels with `num_slots` as
-   the expert count and `[slot_offset, slot_offset + local_slots)` as this
-   rank's window. Every rank that routes the same tokens gets the same slots,
-   so a target that gathers its tokens before routing stays consistent.
+4. **Routing.** After the router's top-k, run each expert call inside
+   `eplb_call(eplb, topk_ids)`, which yields the slot ids and the call's
+   plan, and call the expert kernels inside it with `num_slots` as the expert
+   count and `[slot_offset, slot_offset + local_slots)` as this rank's
+   window. Pass `None` for `eplb` without EPLB, and the slot ids are the
+   expert ids. Every rank that routes the same tokens gets the same slots, so
+   a target that gathers its tokens before routing stays consistent. Static
+   EPLB's plan is None; the routing is a context so that a mode that places
+   replicas per call can keep its plan until the kernels are enqueued.
 
 Then list the mode in the target class, `EPLB_MODES = frozenset({"static"})`,
 and gate the layouts in `route` on `moe_eplb_mode(model_config)`.

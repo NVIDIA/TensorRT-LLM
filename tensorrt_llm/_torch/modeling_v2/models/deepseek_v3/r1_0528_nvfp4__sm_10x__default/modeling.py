@@ -79,7 +79,7 @@ from tensorrt_llm._torch.modeling_v2.catalog.comm.reducescatter import reducesca
 from tensorrt_llm._torch.modeling_v2.catalog.gemm.bmm_out import bmm_out
 from tensorrt_llm._torch.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
 from tensorrt_llm._torch.modeling_v2.catalog.gemm.nvfp4_gemm import nvfp4_gemm
-from tensorrt_llm._torch.modeling_v2.catalog.moe.eplb import EplbLayer
+from tensorrt_llm._torch.modeling_v2.catalog.moe.eplb import EplbLayer, eplb_call
 from tensorrt_llm._torch.modeling_v2.catalog.moe.fp4_block_scale_moe_runner import (  # noqa: E501
     fp4_block_scale_moe_runner,
 )
@@ -677,42 +677,41 @@ def _experts(core: DeepseekV3DefaultModelingV2, L: _LayerWeights, x: torch.Tenso
             cfg.num_experts_per_tok,
             float(cfg.routed_scaling_factor),
         )
-        if L.eplb is not None:
-            topk_ids = L.eplb.route(topk_ids)
-        xq, xsf = fp4_quantize(chunk, L.moe_gscale, _SF_VEC, False, _SF_LINEAR)
-        parts.append(
-            fp4_block_scale_moe_runner(
-                routing_logits=None,
-                routing_bias=None,
-                hidden_states=xq,
-                hidden_states_scale=xsf.view(torch.float8_e4m3fn),
-                gemm1_weights=L.fc1_w,
-                gemm1_weights_scale=L.fc1_s,
-                gemm1_bias=None,
-                gemm1_alpha=None,
-                gemm1_beta=None,
-                gemm1_clamp_limit=None,
-                gemm2_weights=L.fc2_w,
-                gemm2_weights_scale=L.fc2_s,
-                gemm2_bias=None,
-                output1_scale_scalar=L.out1_scale,
-                output1_scale_gate_scalar=L.out1_gate_scale,
-                output2_scale_scalar=L.out2_scale,
-                num_experts=d.num_slots,
-                top_k=cfg.num_experts_per_tok,
-                n_group=None,
-                topk_group=None,
-                intermediate_size=d.moe_inter,
-                local_expert_offset=d.slot_offset,
-                local_num_experts=d.local_slots,
-                routed_scaling_factor=None,
-                routing_method_type=_ROUTING_METHOD_INERT,
-                do_finalize=True,
-                act_type=_ACT_TYPE_SWIGLU,
-                topk_weights=topk_w,
-                topk_ids=topk_ids,
-            )[0]
-        )
+        with eplb_call(L.eplb, topk_ids) as (slot_ids, _):
+            xq, xsf = fp4_quantize(chunk, L.moe_gscale, _SF_VEC, False, _SF_LINEAR)
+            parts.append(
+                fp4_block_scale_moe_runner(
+                    routing_logits=None,
+                    routing_bias=None,
+                    hidden_states=xq,
+                    hidden_states_scale=xsf.view(torch.float8_e4m3fn),
+                    gemm1_weights=L.fc1_w,
+                    gemm1_weights_scale=L.fc1_s,
+                    gemm1_bias=None,
+                    gemm1_alpha=None,
+                    gemm1_beta=None,
+                    gemm1_clamp_limit=None,
+                    gemm2_weights=L.fc2_w,
+                    gemm2_weights_scale=L.fc2_s,
+                    gemm2_bias=None,
+                    output1_scale_scalar=L.out1_scale,
+                    output1_scale_gate_scalar=L.out1_gate_scale,
+                    output2_scale_scalar=L.out2_scale,
+                    num_experts=d.num_slots,
+                    top_k=cfg.num_experts_per_tok,
+                    n_group=None,
+                    topk_group=None,
+                    intermediate_size=d.moe_inter,
+                    local_expert_offset=d.slot_offset,
+                    local_num_experts=d.local_slots,
+                    routed_scaling_factor=None,
+                    routing_method_type=_ROUTING_METHOD_INERT,
+                    do_finalize=True,
+                    act_type=_ACT_TYPE_SWIGLU,
+                    topk_weights=topk_w,
+                    topk_ids=slot_ids,
+                )[0]
+            )
     return parts[0] if len(parts) == 1 else torch.cat(parts, 0)
 
 
@@ -817,26 +816,25 @@ def _mtp_experts(
             cfg.num_experts_per_tok,
             float(cfg.routed_scaling_factor),
         )
-        if M.eplb is not None:
-            topk_ids = M.eplb.route(topk_ids)
-        parts.append(
-            fused_moe(
-                input=chunk,
-                token_selected_experts=topk_ids,
-                token_final_scales=topk_w,
-                fc1_expert_weights=M.fc1,
-                fc1_expert_biases=None,
-                fc2_expert_weights=M.fc2,
-                fc2_expert_biases=None,
-                output_dtype=chunk.dtype,
-                quant_scales=[],
-                tp_size=d.moe_tp,
-                tp_rank=d.moe_tp_rank,
-                ep_size=d.moe_ep,
-                ep_rank=d.moe_ep_rank,
-                activation_type=_FUSED_MOE_ACT_SWIGLU,
-            )[0]
-        )
+        with eplb_call(M.eplb, topk_ids) as (slot_ids, _):
+            parts.append(
+                fused_moe(
+                    input=chunk,
+                    token_selected_experts=slot_ids,
+                    token_final_scales=topk_w,
+                    fc1_expert_weights=M.fc1,
+                    fc1_expert_biases=None,
+                    fc2_expert_weights=M.fc2,
+                    fc2_expert_biases=None,
+                    output_dtype=chunk.dtype,
+                    quant_scales=[],
+                    tp_size=d.moe_tp,
+                    tp_rank=d.moe_tp_rank,
+                    ep_size=d.moe_ep,
+                    ep_rank=d.moe_ep_rank,
+                    activation_type=_FUSED_MOE_ACT_SWIGLU,
+                )[0]
+            )
     return parts[0] if len(parts) == 1 else torch.cat(parts, 0)
 
 

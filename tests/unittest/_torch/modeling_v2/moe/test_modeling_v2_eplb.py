@@ -16,7 +16,8 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.modeling_v2.catalog._op import Cell
-from tensorrt_llm._torch.modeling_v2.catalog.moe.eplb import EplbLayer, EplbSlots
+from tensorrt_llm._torch.modeling_v2.catalog.moe import eplb as eplb_module
+from tensorrt_llm._torch.modeling_v2.catalog.moe.eplb import EplbLayer, EplbSlots, eplb_call
 from tensorrt_llm._torch.modeling_v2.catalog.moe.eplb import eplb_route as op
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
@@ -135,6 +136,48 @@ def test_registering_adds_the_layer_with_its_placement(mocked_runtime):
     finally:
         balancer.shutdown()
     assert get_moe_load_balancer() is None
+
+
+# --- the routing of one expert call (CPU) ---------------------------------------------------
+
+
+@pytest.mark.cpu_only
+def test_without_eplb_a_call_routes_to_the_expert_ids():
+    ids = torch.tensor([[3, 1], [0, 2]], dtype=torch.int32)
+    with eplb_call(None, ids) as (slot_ids, plan):
+        assert slot_ids is ids
+        assert plan is None
+
+
+@pytest.mark.cpu_only
+def test_a_registered_layer_routes_each_call_through_its_balancer(mocked_runtime, monkeypatch):
+    """Each call routes its own ids with the layer's balancer handle and the same slot on
+    every rank (`offset_by_ep_rank=False`), and static EPLB has no plan to hold."""
+    routed = []
+
+    def route(ids, balancer_layer, offset_by_ep_rank):
+        routed.append((ids, balancer_layer, offset_by_ep_rank))
+        return ids + 100
+
+    monkeypatch.setattr(eplb_module, "eplb_route", route)
+    slots = EplbSlots.from_config(MoeLoadBalancerConfig(num_slots=288), 3, 256, 4, 1)
+    balancer = MoeLoadBalancer(ep_rank=1, ep_size=4, layer_updates_per_iter=0)
+    try:
+        with balancer:
+            layer = EplbLayer.register(slots, top_k=8)
+        first = torch.tensor([[5, 6]], dtype=torch.int32)
+        second = torch.tensor([[7, 8], [9, 10]], dtype=torch.int32)
+        for ids in (first, second):
+            with eplb_call(layer, ids) as (slot_ids, plan):
+                assert torch.equal(slot_ids, ids + 100)
+                assert plan is None
+    finally:
+        balancer.shutdown()
+    assert len(routed) == 2
+    for (ids, handle, offset), want in zip(routed, (first, second)):
+        assert ids is want
+        assert handle is layer.balancer_layer
+        assert offset is False
 
 
 # --- the routing op (GPU) ---------------------------------------------------------------------

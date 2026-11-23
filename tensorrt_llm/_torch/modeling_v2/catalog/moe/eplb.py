@@ -14,9 +14,14 @@ and this module is what they share:
    way.
 2. `EplbLayer.register`: register the layer with the engine's balancer, at
    construction and in the order the layers run.
-3. `EplbLayer.route`: map the router's expert ids to slot ids before the expert
-   GEMMs, which then take `num_slots` as their expert count and this rank's
-   slot window as their local experts.
+3. `eplb_call`: around each expert call, map the router's expert ids to slot
+   ids for the expert GEMMs run inside it, which then take `num_slots` as their
+   expert count and this rank's slot window as their local experts.
+
+`eplb_call` is a context rather than a function so that a mode which places
+replicas per call can hold that call's plan until the expert kernels are
+enqueued. Static EPLB has no such plan: its slots are fixed at load, and the
+plan it yields is None.
 
 `eplb_mode` says whether the engine runs EPLB for a deployment and in which
 mode. A target lists the modes it implements in `EPLB_MODES`, and the resolver
@@ -25,8 +30,9 @@ declines EPLB deployments in any other mode (see the Modeling V2 README).
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
-from typing import Optional, Sequence
+from typing import Iterator, Optional, Sequence
 
 import torch
 
@@ -270,10 +276,33 @@ class EplbLayer:
         balancer_layer.set_initial_weight_assignments(list(slots.global_assignments))
         return cls(balancer_layer, slots)
 
-    def route(self, token_selected_experts: torch.Tensor) -> torch.Tensor:
-        """Global expert ids `[T, top_k]` int32 -> global slot ids `[T, top_k]` int32.
+    @contextlib.contextmanager
+    def call(self, token_selected_experts: torch.Tensor) -> Iterator[tuple[torch.Tensor, None]]:
+        """The routing of one expert call; see `eplb_call`, which a target calls instead.
 
-        Routes with `offset_by_ep_rank=False`, so every rank that routes the same
-        tokens gets the same slots.
+        Yields `(slot_ids, plan)`: global expert ids `[T, top_k]` int32 routed to global
+        slot ids `[T, top_k]` int32 under the layer's placement, with
+        `offset_by_ep_rank=False`, so every rank that routes the same tokens gets the
+        same slots. `plan` is None: the slots are fixed at load.
         """
-        return eplb_route(token_selected_experts, self.balancer_layer, False)
+        yield eplb_route(token_selected_experts, self.balancer_layer, False), None
+
+
+@contextlib.contextmanager
+def eplb_call(
+    eplb: Optional[EplbLayer], token_selected_experts: torch.Tensor
+) -> Iterator[tuple[torch.Tensor, None]]:
+    """The routing of one expert call, with or without EPLB.
+
+    A context that yields `(slot_ids, plan)` for the expert kernels run inside it:
+    `token_selected_experts`, the router's `[T, top_k]` int32 expert ids, routed to
+    the global slot ids `[T, top_k]` int32 the kernels take, and the call's plan.
+    Without EPLB (`eplb` None) every expert has one slot, so the slot ids are the
+    expert ids. The plan is None: static EPLB's slots are fixed at load. Enqueue the
+    call's expert kernels inside the context (see the module docstring).
+    """
+    if eplb is None:
+        yield token_selected_experts, None
+        return
+    with eplb.call(token_selected_experts) as routed:
+        yield routed

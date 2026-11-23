@@ -568,18 +568,19 @@ an EPLB deployment only if its class lists the mode in `EPLB_MODES`.
   `catalog/moe/eplb.py`: `eplb_slots` for each routed layer's slots,
   `EplbLayer.register` for each routed layer at construction in run order
   (a one-model draft layer with `repeat_count=max_draft_len`), expert weights
-  and per-expert scales sized and loaded by slot, and `EplbLayer.route` after
-  the router's top-k. The expert kernel then takes `num_slots` as its expert
-  count and this rank's slot window.
+  and per-expert scales sized and loaded by slot, and each expert call run
+  inside `eplb_call(eplb, topk_ids)`, which yields the slot ids (and the
+  call's plan, None for static) after the router's top-k. The expert kernel
+  then takes `num_slots` as its expert count and this rank's slot window.
 - `route` admits EPLB only at the layouts it was measured at
   (`moe_eplb_mode`). EPLB needs attention DP over ranks that hold whole
   experts (moe_tp 1), as the built-in MoE does.
 - A target that gathers tokens before routing routes on every rank and must
-  get the same slots on every rank: `EplbLayer.route` does
+  get the same slots on every rank: `eplb_call` does
   (`offset_by_ep_rank=False`).
 
 **Grep.** `EPLB_MODES`, `moe_eplb_mode`, `eplb_slots`, `EplbLayer`,
-`eplb_route`, `moe_load_balancer_mode`, `maybe_create_moe_load_balancer`,
+`eplb_call`, `eplb_route`, `moe_load_balancer_mode`, `maybe_create_moe_load_balancer`,
 `MoeLoadBalancerConfig`, `initial_global_assignments`, `num_slots`.
 
 **Tests to imitate.**
