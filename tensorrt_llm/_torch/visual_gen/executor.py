@@ -1294,14 +1294,23 @@ class DiffusionExecutor:
     def _handle_session_commands(
         self, commands: List[Any], session: SessionState, pool: SlotPool, pipeline_state: Any
     ) -> Optional[_SessionExit]:
-        """Handle commands in order until one ends the session; the rest are
-        answered as strays. Returns why the session ends, or ``None``."""
+        """Handle commands in order until one ends the session. Returns why the
+        session ends, or ``None``. What arrived behind the ending command is not
+        lost: the shutdown signal still ends the worker, a generation request or
+        another open gets the refusal it would have got a moment earlier, and
+        session commands are answered as strays."""
         for i, message in enumerate(commands):
             ending = self._handle_session_command(message, session, pool, pipeline_state)
-            if ending is not None:
-                for stray in commands[i + 1 :]:
-                    self._answer_stray_command(stray)
-                return ending
+            if ending is None:
+                continue
+            for late in commands[i + 1 :]:
+                if late is None:
+                    ending = _SessionExit.SHUTDOWN
+                elif isinstance(late, (DiffusionRequest, SessionOpen)):
+                    self._handle_session_command(late, session, pool, pipeline_state)
+                else:
+                    self._answer_stray_command(late)
+            return ending
         return None
 
     def _handle_session_command(

@@ -1945,6 +1945,39 @@ def test_second_open_is_refused_while_the_worker_is_inside_an_advance(harness):
         s.close()
 
 
+def _close_with_a_message_behind_it(h, pipe, behind):
+    """Park the worker in an advance, queue the session's CLOSE and ``behind`` on
+    the request socket, and let the worker find both in one drain. Returns why
+    the worker says the session ended."""
+    endings = []
+    serve = h.executor._serve_session
+    h.executor._serve_session = lambda req: (endings.append(serve(req)), endings[-1])[1]
+    s = h.open()
+    s.submit("controls", 1)  # the worker is now parked inside advance 0
+    h.executor.controls_ipc.put_nowait(SessionControl(s.request_id, ControlType.CLOSE))
+    h.executor.requests_ipc.put_nowait(behind)
+    pipe.advance_gate.set()
+    _wait_until(lambda: endings, what="the session to end")
+    return endings[0]
+
+
+def test_shutdown_signal_behind_a_close_still_stops_the_worker(harness):
+    pipe = CountingPipeline(initial=False)
+    pipe.advance_gate = threading.Event()
+    with harness(pipe) as h:
+        assert _close_with_a_message_behind_it(h, pipe, None) is _SessionExit.SHUTDOWN
+
+
+def test_generate_behind_a_close_is_refused_not_dropped(harness):
+    pipe = CountingPipeline(initial=False)
+    pipe.advance_gate = threading.Event()
+    with harness(pipe) as h:
+        assert _close_with_a_message_behind_it(h, pipe, _request(9)) is _SessionExit.CLOSE
+        _wait_until(lambda: any(r.request_id == 9 for r in h.responses), what="the refusal")
+        answer = next(r for r in h.responses if r.request_id == 9)
+        assert answer.error_type == "capacity" and "is open" in answer.error_msg
+
+
 def test_competing_opens_admit_exactly_one(harness):
     with harness(CountingPipeline(initial=False)) as h:
         outcomes = []
