@@ -2,18 +2,33 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from pathlib import Path
-from typing import Any, List, Literal, Optional, Sequence, Union
+from typing import Any, Dict, List, Literal, Optional, Sequence, Union, cast
 
 from tqdm import tqdm
+from typing_extensions import NotRequired, TypedDict
 
 from tensorrt_llm._utils import nvtx_range_debug
-from tensorrt_llm.inputs import create_input_processor, prompt_inputs
+from tensorrt_llm.disaggregated_params import DisaggregatedParams
+from tensorrt_llm.inputs import create_input_processor
 from tensorrt_llm.inputs.data import PromptInputs
 from tensorrt_llm.sampling_params import SamplingParams
 
-from .llm import BaseLLM, RequestOutput, _TorchLLM
+from .llm import BaseLLM, PreprocessedInputs, RequestOutput, _TorchLLM
 from .llm_args import TorchLlmArgs
 from .mpi_session import external_mpi_comm_available
+from .utils import set_api_status
+
+
+class MediaOnlyInput(TypedDict):
+    """Media to encode independently of a final prompt."""
+
+    multi_modal_data: Dict[str, Any]
+    multi_modal_uuids: NotRequired[Dict[str, List[Any]]]
+    mm_processor_kwargs: NotRequired[Dict[str, Any]]
+    mm_item_order: NotRequired[List[Dict[str, Any]]]
+
+
+EncoderInput = Union[PromptInputs, MediaOnlyInput]
 
 
 class MultimodalEncoder(_TorchLLM):
@@ -91,35 +106,21 @@ class MultimodalEncoder(_TorchLLM):
 
     def generate(
         self,
-        inputs: Union[PromptInputs, Sequence[PromptInputs]],
+        inputs: Union[EncoderInput, Sequence[EncoderInput]],
         use_tqdm: bool = True,
     ) -> Union[RequestOutput, List[RequestOutput]]:
         """Generate output for the given prompts in the synchronous mode.
         Synchronous generation accepts either single prompt or batched prompts.
 
         Args:
-            inputs (tensorrt_llm.inputs.data.PromptInputs, Sequence[tensorrt_llm.inputs.data.PromptInputs]): The prompt text or token ids.
-                It can be single prompt or batched prompts. See `generate_async` for inputs with no prompt.
+            inputs: One prompt or media-only request, or a sequence of requests.
         Returns:
             Union[tensorrt_llm.llmapi.RequestOutput, List[tensorrt_llm.llmapi.RequestOutput]]: The output data of the completion request to the LLM.
         """
-        unbatched = not isinstance(inputs, list)
-        if not unbatched:
-            if isinstance(inputs[0], int):
-                unbatched = True
-
-        if unbatched:
-            inputs = [inputs]
-
-        # A dict may hold only multi_modal_data (see generate_async).
-        inputs = [
-            i if isinstance(i, dict) else prompt_inputs(i) for i in inputs
-        ]
-
-        futures = []
-        for request_inputs in inputs:
-            future = self.generate_async(request_inputs)
-            futures.append(future)
+        unbatched = self._is_unbatched_inputs(inputs)
+        requests = ([cast(EncoderInput, inputs)] if unbatched else cast(
+            Sequence[EncoderInput], inputs))
+        futures = [self.generate_async(request) for request in requests]
 
         for future in tqdm(futures,
                            desc="Processed requests",
@@ -127,17 +128,26 @@ class MultimodalEncoder(_TorchLLM):
                            disable=not use_tqdm):
             future.result()
 
-        if unbatched:
-            futures = futures[0]
+        return futures[0] if unbatched else futures
 
-        return futures
+    @set_api_status("prototype")
+    def preprocess(
+        self,
+        inputs: EncoderInput,
+        sampling_params: Optional[SamplingParams] = None,
+        disaggregated_params: Optional[DisaggregatedParams] = None,
+    ) -> PreprocessedInputs:
+        """Prepare a prompted or media-only request for generate_async."""
+        # The shared implementation accepts media alone in encoder-only mode.
+        return super().preprocess(cast(PromptInputs, inputs), sampling_params,
+                                  disaggregated_params)
 
     @nvtx_range_debug("MM_encoder.generate_async",
                       color="green",
                       category="VisionEncoder")
     def generate_async(
         self,
-        inputs: PromptInputs,
+        inputs: Union[EncoderInput, PreprocessedInputs],
         sampling_params: Optional[SamplingParams] = None,
     ) -> RequestOutput:
         """Generate output for the given multimodal request in the asynchronous mode.
@@ -145,8 +155,9 @@ class MultimodalEncoder(_TorchLLM):
 
         For models whose input processor sets `supports_mm_item_handoff`, the
         request may hold only `multi_modal_data` (and optionally
-        `mm_processor_kwargs` and `mm_item_order`), with no prompt. Each item is
-        then encoded as in a full request. The result carries one embedding
+        `mm_processor_kwargs`, `multi_modal_uuids` and `mm_item_order`), with
+        no prompt. The processor checks the media and sampling settings for
+        independent encoding. The result carries one embedding
         handle per item, in placeholder order (`mm_item_order`, else the order
         of `multi_modal_data`), each with the item's metadata and hash, but no
         prompt layout or mRoPE positions. A prefill worker builds those from the
@@ -155,6 +166,6 @@ class MultimodalEncoder(_TorchLLM):
         Returns:
             Future that resolves to tensorrt_llm.llmapi.RequestOutput containing mm_embeddings
         """
-        result = super().generate_async(inputs, sampling_params)
-        # TODO: possible postprocess the result for disaggregated serving
-        return result
+        return super().generate_async(
+            cast(Union[PromptInputs, PreprocessedInputs], inputs),
+            sampling_params)
