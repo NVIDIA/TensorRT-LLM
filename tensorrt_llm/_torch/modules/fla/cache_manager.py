@@ -8,7 +8,7 @@ from __future__ import annotations
 import math
 import sys
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
@@ -31,6 +31,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2 import (
     MambaHybridCacheManagerV2,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import PageTableSpec
 from tensorrt_llm._torch.pyexecutor.kv_cache.regions import RegionProvider
 from tensorrt_llm._torch.utils import (
     is_gdn_flashinfer_replay_enabled,
@@ -1071,6 +1072,16 @@ class Qwen35HybridCacheManager(InforwardSnapshotHost, MambaHybridCacheManagerV2)
         if self._replay_region is not None:
             buffers += self._replay_region.shared_buffers(global_layer_id)
         return buffers
+
+    @override
+    def page_table_spec(self) -> PageTableSpec:
+        """The generation worker starts the replay history afresh."""
+        spec = super().page_table_spec()
+        if self._replay_region is None:
+            return spec
+        return replace(
+            spec, untransferred_roles=spec.untransferred_roles | self._replay_region.roles
+        )
 
     @override
     def get_disagg_ignored_roles(self) -> frozenset[DataRole]:

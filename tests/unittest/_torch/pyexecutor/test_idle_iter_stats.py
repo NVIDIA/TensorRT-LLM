@@ -726,7 +726,9 @@ def _fetch_stub(**overrides):
         dist=SimpleNamespace(rank=0, pp_size=1),
         disagg=SimpleNamespace(has_retiring_gen_receives=False),
         canceled_req_ids=set(),
+        kv_cache_transceiver=None,
         _has_pending_connector_transfers=lambda: False,
+        _has_pending_context_retirement=lambda: False,
         _idle_kv_transfer_poll_timeout=lambda: None,
         _stats_has_pending_work=False,
         _has_pending_iteration_stats_work=lambda: False,
@@ -781,7 +783,7 @@ def test_idle_fetch_requires_all_ranks_to_drain(
 
     queue = _WaitingQueue([object()] if waiting else [])
     stub = _fetch_stub(
-        control_requests=[object()] if control else [],
+        control_requests=[SimpleNamespace(control_requires_drain=True)] if control else [],
         disagg=SimpleNamespace(has_retiring_gen_receives=retiring),
         _has_pending_connector_transfers=lambda: pending,
         _stats_has_pending_work=stats_busy,
