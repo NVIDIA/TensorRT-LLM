@@ -15,6 +15,7 @@ from ..transformer_minimax_h3 import (
 from .block_ops import Fp8UlyssesMlpMixin, initialize_block_ops
 from .output_exchange import exchange_bf16_output, exchange_fp8_output, static_fp8_output_scale
 from .qkv_exchange import pack_qkv, qk_norm_rope_pack_qkv
+from .vae_opt import configure_u4_video_vae_post_load, configure_u4_video_vae_pre_load
 
 
 class Fp8UlyssesAttention(MiniMaxH3Attention):
@@ -207,5 +208,7 @@ class MiniMaxH3Fp8U4Pipeline(MiniMaxH3Pipeline):
         )
 
     def post_load_weights(self) -> None:
+        configure_u4_video_vae_pre_load(self.vae, self.device)
         super().post_load_weights()
         initialize_block_ops(self.transformer)
+        configure_u4_video_vae_post_load(self.vae, self.device, ulysses_size=4, enable_fp8=True)
