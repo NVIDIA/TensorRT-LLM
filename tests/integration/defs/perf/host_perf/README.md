@@ -51,6 +51,12 @@ pytest tests/integration/defs/perf/test_perf_sanity.py -v \
 Requires: GPU access (1 GPU), `LLM_MODELS_ROOT` set to model weights directory.
 
 ## Layer 2: Module Tests
+> **Post-merge only.** The Layer 2 module benchmarks run in the post-merge block of
+> `l0_b200.yml` (`DGX_B200-PyTorch-Post-Merge` stages), not on pre-merge. Their
+> medians are uploaded to OpenSearch for history tracking. `check_regression()`
+> compares each median against `baselines_b200.json` (2x factor); if it is exceeded,
+> it prints a `REGRESSION DETECTED` line and fails the test. Layer 1 (E2E,
+> `test_perf_sanity.py`) remains the pre-merge host-perf signal.
 
 ### Scheduler (`test_module_scheduler.py`)
 

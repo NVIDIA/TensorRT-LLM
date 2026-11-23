@@ -40,6 +40,8 @@ l0_h100:
   # this stage's "not cpu_only" selection runs the ones that need a real allocator and device.
   - unittest/_torch/memory
   # ------------- modules (non-MoE) ---------------
+  # Only the single-rank NCCL allreduce fallback tests run on Hopper; the rest of the file is SM100+.
+  - unittest/_torch/modules/test_fused_add_rms_norm_quant.py -k "test_nccl_residual_rms_norm_quant_fp8"
   - unittest/_torch/modules/test_rms_norm_fp8_per_token.py
   - unittest/_torch/kernels/fused_ops/test_add_rmsnorm_fp8_quant.py
   - unittest/_torch/modules/test_triton_linear.py

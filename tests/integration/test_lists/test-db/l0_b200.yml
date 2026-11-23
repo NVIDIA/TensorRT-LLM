@@ -590,6 +590,18 @@ l0_b200:
       stage: post_merge
       backend: pytorch
   tests:
+  # ------------- Host perf module regression tests (6 representative scenarios) ---------------
+  # These cases track performance in OpenSearch and perform comparison there:
+  # each median is uploaded at session end, and the upload pipeline checks it
+  # against OpenSearch history. They also compare each median with
+  # baselines_b200.json (2x factor); exceeding it prints a REGRESSION DETECTED
+  # line and fails the test.
+  - perf/host_perf/test_module_scheduler.py::test_scheduler_production[production_gen_only_bs8]
+  - perf/host_perf/test_module_scheduler.py::test_scheduler_production[production_mixed_32gen_4ctx]
+  - perf/host_perf/test_module_sampler.py::test_sampler_update_greedy[greedy_bs8]
+  - perf/host_perf/test_module_sampler.py::test_sampler_update_stop_words[stopwords_bs32]
+  - perf/host_perf/test_module_resource_manager.py::test_kv_cache_prepare_generation
+  - perf/host_perf/test_module_resource_manager.py::test_kv_cache_prepare_context
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_t2i_4step_example TIMEOUT (30)
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_i2v_4step_example TIMEOUT (45)
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_edge_i2v_example TIMEOUT (30)

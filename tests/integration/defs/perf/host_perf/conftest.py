@@ -24,9 +24,14 @@ import pytest
 
 @pytest.fixture(scope="session", autouse=True)
 def module_perf_db_finalizer():
-    """Upload accumulated module perf results to OpenSearch after all tests."""
+    """Upload accumulated module perf results to OpenSearch after all tests.
+
+    When uploading is enabled (``OPEN_SEARCH_DB_BASE_URL`` is set, i.e. CI), a
+    failed upload is re-raised so it shows up as a teardown error and the pytest
+    run exits non-zero. Without it (local runs) failures are only logged.
+    """
     yield
-    from .regression_helper import get_collected_results, post_module_perf_to_db
+    from .regression_helper import UPLOAD_TO_DB, get_collected_results, post_module_perf_to_db
 
     if get_collected_results():
         try:
@@ -35,3 +40,5 @@ def module_perf_db_finalizer():
             from defs.trt_test_alternative import print_info
 
             print_info(f"[module_perf_db] Failed to upload to OpenSearch: {e}")
+            if UPLOAD_TO_DB:
+                raise

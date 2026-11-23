@@ -12,14 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Soft regression detection and OpenSearch DB collection for module-level host perf tests.
+"""Regression detection and OpenSearch DB collection for module-level host perf tests.
 
 Loads baseline medians from baselines_b200.json and compares against
-current measurements. Prints a REGRESSION marker when the current median
-exceeds baseline * regression_factor, but does NOT fail the test.
-
-CI pipelines can grep for the REGRESSION marker to flag regressions
-without blocking the merge.
+current measurements. When the current median exceeds
+baseline * regression_factor, prints a ``REGRESSION DETECTED`` line and
+fails the test (AssertionError).
 
 Also provides ``collect_module_result()`` for accumulating per-scenario
 latency stats that are uploaded to OpenSearch at session end via
@@ -89,15 +87,16 @@ def _load_baselines():
 
 
 def check_regression(component: str, scenario_name: str, current_median_us: float):
-    """Check if the current median exceeds the baseline by more than the regression factor.
+    """Fail the test if the current median exceeds the baseline by more than the regression factor.
 
     Args:
         component: One of "scheduler", "sampler", "kv_cache".
         scenario_name: The scenario ID matching a key in baselines_b200.json.
         current_median_us: The measured median latency in microseconds.
 
-    Returns:
-        True if a regression was detected, False otherwise.
+    Raises:
+        AssertionError: If the median exceeds the threshold. The
+            ``REGRESSION DETECTED`` line is printed before raising.
     """
     baselines = _load_baselines()
     factor = baselines.get("_regression_factor", 2.0)
@@ -106,24 +105,24 @@ def check_regression(component: str, scenario_name: str, current_median_us: floa
 
     if baseline_us is None:
         print(f"  WARNING: No baseline for {component}/{scenario_name}, skipping regression check")
-        return False
+        return
 
     threshold_us = baseline_us * factor
     if current_median_us > threshold_us:
-        print(
-            f"  REGRESSION DETECTED: {component}/{scenario_name} "
+        msg = (
+            f"REGRESSION DETECTED: {component}/{scenario_name} "
             f"median={current_median_us:.1f} µs > "
             f"threshold={threshold_us:.1f} µs "
             f"(baseline={baseline_us:.1f} µs × {factor}x)"
         )
-        return True
-    else:
-        print(
-            f"  OK: median={current_median_us:.1f} µs "
-            f"<= threshold={threshold_us:.1f} µs "
-            f"(baseline={baseline_us:.1f} µs × {factor}x)"
-        )
-        return False
+        print(f"  {msg}")
+        raise AssertionError(msg)
+
+    print(
+        f"  OK: median={current_median_us:.1f} µs "
+        f"<= threshold={threshold_us:.1f} µs "
+        f"(baseline={baseline_us:.1f} µs × {factor}x)"
+    )
 
 
 def _compute_latency_stats(latencies_us):
