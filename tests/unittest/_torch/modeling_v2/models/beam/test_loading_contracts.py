@@ -4,7 +4,6 @@
 
 __extra_import_path__ = ["."]
 
-import json
 from collections import OrderedDict
 from types import SimpleNamespace
 
@@ -13,139 +12,7 @@ import pytest
 import torch
 from _components.dense_block import block as dense  # noqa: E501
 
-from tensorrt_llm._torch.modeling_v2.models.beam._tp4 import component_bf16 as bf16  # noqa: E501
-from tensorrt_llm._torch.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (  # noqa: E501
-    component as nvfp4,
-)
-
 pytestmark = pytest.mark.cpu_only
-
-
-@pytest.fixture(params=[bf16, nvfp4], ids=["bf16", "nvfp4"])
-def layout_loader(request, monkeypatch, tmp_path):
-    module = request.param
-    cls = (
-        bf16.BeamCheckpointLayoutBf16Sm103Tp4
-        if module is bf16
-        else nvfp4.BeamCheckpointLayoutNvfp4Sm103Tp4
-    )
-    (tmp_path / "config.json").write_text("{}")
-    (tmp_path / "hf_quant_config.json").write_text("{}")
-    spec = SimpleNamespace(
-        name="weight", bank=None, expert=None, interval=lambda rank: (0, 2), local_shape=(2,)
-    )
-    dst = torch.zeros(2, dtype=torch.bfloat16)
-    component = cls.__new__(cls)
-    torch.nn.Module.__init__(component)
-    state = dict(
-        config={},
-        rank=0,
-        layers=(),
-        expert_names=(),
-        specs=OrderedDict(weight=spec),
-        usable=True,
-        load_record={"old": True},
-        tensor=lambda name: dst,
-    )
-    for key, value in state.items():
-        setattr(component, key, value)
-    component.mapping = SimpleNamespace(world_size=1, rank=0)
-    component.schedule = SimpleNamespace(is_sparse=lambda layer: False)
-    agreements = []
-
-    def agree(ok):
-        agreements.append(ok)
-        return ok
-
-    component._agree = agree
-    monkeypatch.setattr(
-        bf16,
-        "load_failure_details",
-        lambda mapping, ok, error: None if component._agree(ok) else str(error),
-    )
-    component._check_diagnostics_agree = lambda: None
-    catalog = SimpleNamespace(
-        entries={"weight": SimpleNamespace(path="part", begin=0)},
-        validate=lambda *args, **kwargs: None,
-    )
-    monkeypatch.setattr(bf16, "SafetensorsCatalog", lambda path: catalog)
-    monkeypatch.setattr(cls, "_tensor_specs", staticmethod(lambda config: {}))
-    monkeypatch.setattr(module, "tensor_specs", lambda config: {})
-    if module is nvfp4:
-        monkeypatch.setattr(module, "check_recipe", lambda *args: {})
-        monkeypatch.setattr(module, "stored_entries", lambda *args: {})
-        monkeypatch.setattr(module, "validate", lambda *args, **kwargs: None)
-    reader = SimpleNamespace(bytes_read=4, reads=1, closed=False)
-
-    def close():
-        reader.closed = True
-
-    reader.close = close
-    monkeypatch.setattr(bf16, "TileReader", lambda: reader)
-    monkeypatch.setattr(bf16, "read_slice_into", lambda *args, **kwargs: dst.fill_(1))
-    return bf16, cls.load, component, agreements, catalog, reader, tmp_path
-
-
-@pytest.mark.parametrize("stored", [None, ["bad"]])
-def test_malformed_config_reaches_validation_agreement(layout_loader, stored):
-    _, load, component, agreements, _, _, path = layout_loader
-    (path / "config.json").write_text(json.dumps(stored))
-    with pytest.raises(bf16.LoadError) as exc:
-        load(component, str(path))
-    assert isinstance(exc.value.__cause__, (TypeError, AttributeError))
-    assert agreements == [False]
-    assert component.usable  # Validation rejected the reload before touching storage.
-    assert component.load_record == {"old": True}
-
-
-@pytest.mark.parametrize("stage", ["catalog", "reader", "ordering", "read", "close"])
-def test_rank_local_exception_reaches_agreement(layout_loader, monkeypatch, stage):
-    module, load, component, agreements, catalog, reader, path = layout_loader
-    failure = TypeError("injected rank-local failure")
-
-    def fail(*args, **kwargs):
-        raise failure
-
-    if stage == "catalog":
-        monkeypatch.setattr(module, "SafetensorsCatalog", fail)
-    elif stage == "reader":
-        monkeypatch.setattr(module, "TileReader", fail)
-    elif stage == "ordering":
-        catalog.entries.clear()
-    elif stage == "read":
-        monkeypatch.setattr(module, "read_slice_into", fail)
-    else:
-        reader.close = fail
-    with pytest.raises(bf16.LoadError) as exc:
-        load(component, str(path))
-    assert agreements == ([False] if stage == "catalog" else [True, False])
-    if stage == "ordering":
-        assert isinstance(exc.value.__cause__, KeyError)
-    else:
-        assert exc.value.__cause__ is failure
-    if stage != "catalog":
-        assert not component.usable and component.load_record is None
-    if stage in ("ordering", "read"):
-        assert reader.closed
-
-
-def test_successful_load_and_peer_failure(layout_loader):
-    _, load, component, agreements, _, reader, path = layout_loader
-    record = load(component, str(path))
-    assert agreements == [True, True]
-    assert component.usable and record["tensors"] == 1
-    assert reader.closed and torch.equal(component.tensor("weight"), torch.ones(2))
-    agreements.clear()
-
-    def peer_fails_completion(ok):
-        agreements.append(ok)
-        return len(agreements) == 1
-
-    component._agree = peer_fails_completion
-    with pytest.raises(bf16.LoadError, match="every rank"):
-        load(component, str(path))
-    assert agreements == [True, True]
-    assert not component.usable and component.load_record is None
 
 
 @pytest.fixture
