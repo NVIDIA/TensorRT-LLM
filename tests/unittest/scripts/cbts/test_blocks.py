@@ -351,18 +351,40 @@ def test_waives_rule_handles_dotted_file_and_negated_k_filters(tmp_path: Path) -
     res_kv = rule.apply(PRInputs(changed_files={WAIVES_FILE}, diffs={WAIVES_FILE: non_fp4_diff}))
     assert res_kv is not None and res_kv.affected_stages == {"DGX_B200-PyTorch-1"}
 
-    # Unparameterized function unwaive must retain parameter-level `-k "NVFP4"` batches.
+    # Unparameterized function unwaive must retain parameter-level `-k` (including `.py` param IDs)
+    # and must keep walking up when a file-level `-k` subset sits beside a parent directory batch.
+    kv_dir_batch = (
+        'unittest/kv_cache_manager_v2_tests -k "not RemoteInPlaceOfDisk and not '
+        'TestTeardownWithoutCudaContext"'
+    )
+    kv_file_subset = (
+        "unittest/kv_cache_manager_v2_tests/test_kv_cache_manager_v2.py -k "
+        '"TestTeardownWithoutCudaContext"'
+    )
     kv_fp4_only = 'unittest/disaggregated/test_deepseek_v4_kv_transfer.py -k "NVFP4"'
+    loader_py_param = 'unittest/test_loader.py -k "model.py"'
     (test_db / "l0_b200.yml").write_text(
         yaml.safe_dump(
-            {"version": "0.0.1", "l0_b200": [{"condition": pre_cond, "tests": [kv_fp4_only]}]},
+            {
+                "version": "0.0.1",
+                "l0_b200": [
+                    {
+                        "condition": pre_cond,
+                        "tests": [kv_dir_batch, kv_file_subset, kv_fp4_only, loader_py_param],
+                    }
+                ],
+            },
             sort_keys=False,
         )
     )
     rule_fp4 = WaivesRule(YAMLIndex.load(test_db), stages)
     unwaive_func_diff = (
-        "@@ -1,2 +1,1 @@\n"
-        "-unittest/disaggregated/test_deepseek_v4_kv_transfer.py::test_deepseek_v4_native_sparse_host_transfer SKIP (https://nvbugs/4)\n"
+        "@@ -1,4 +1,1 @@\n"
+        "-unittest/disaggregated/test_deepseek_v4_kv_transfer.py::"
+        "test_deepseek_v4_native_sparse_host_transfer SKIP (https://nvbugs/4)\n"
+        "-unittest/test_loader.py::test_load SKIP (https://nvbugs/5)\n"
+        "-unittest/kv_cache_manager_v2_tests/test_kv_cache_manager_v2.py::"
+        "TestSparseUnitCopy::test_a_contiguous_unit_lands_at_its_entry SKIP (https://nvbugs/6)\n"
     )
     res_unwaive = rule_fp4.apply(
         PRInputs(changed_files={WAIVES_FILE}, diffs={WAIVES_FILE: unwaive_func_diff})
@@ -371,7 +393,10 @@ def test_waives_rule_handles_dotted_file_and_negated_k_filters(tmp_path: Path) -
     filtered_fp4 = tmp_path / "filtered_fp4"
     write_filtered_test_db(test_db, filtered_fp4, res_unwaive.block_filters)
     assert yaml.safe_load((filtered_fp4 / "l0_b200.yml").read_text())["l0_b200"][0]["tests"] == [
-        kv_fp4_only
+        kv_dir_batch,
+        kv_file_subset,
+        kv_fp4_only,
+        loader_py_param,
     ]
 
 
@@ -434,9 +459,12 @@ def test_lookup_paths_preserves_walked_up_config_matches_alongside_direct_test(
         dir_batch
     ]
 
-    # SpecDecRule selects standalone `_mtp` entries without dragging in `--ignore=..._mtp...` batches.
+    # SpecDecRule selects double-quoted, single-quoted, and bare `-k` entries while ignoring `--ignore`/`--deselect`.
     mtp_file = "unittest/_torch/modules/kimi_kda/test_kda_mtp_decode_cute_parity.py"
-    kda_batch = f"{dir_batch} --ignore={mtp_file}"
+    k_double = 'unittest/test_generic_a.py -k "test_mtp"'
+    k_single = "unittest/test_generic_b.py -k 'test_mtp'"
+    k_bare = "unittest/test_generic_c.py -k test_mtp"
+    kda_batch = f"{dir_batch} --ignore={mtp_file} --deselect=unittest/foo.py::test_mtp"
     (test_db / "l0_b200.yml").write_text(
         yaml.safe_dump(
             {
@@ -444,7 +472,7 @@ def test_lookup_paths_preserves_walked_up_config_matches_alongside_direct_test(
                 "l0_b200": [
                     {
                         "condition": {"terms": {"stage": "pre_merge", "backend": "pytorch"}},
-                        "tests": [prefill, mtp_file, kda_batch],
+                        "tests": [prefill, mtp_file, k_double, k_single, k_bare, kda_batch],
                     }
                 ],
             },
@@ -462,7 +490,10 @@ def test_lookup_paths_preserves_walked_up_config_matches_alongside_direct_test(
     filtered_sd = tmp_path / "filtered_sd"
     write_filtered_test_db(test_db, filtered_sd, sd_res.block_filters)
     assert yaml.safe_load((filtered_sd / "l0_b200.yml").read_text())["l0_b200"][0]["tests"] == [
-        mtp_file
+        mtp_file,
+        k_double,
+        k_single,
+        k_bare,
     ]
 
 

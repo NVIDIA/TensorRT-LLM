@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import shlex
 import shutil
 from dataclasses import dataclass, field
 from fnmatch import fnmatch, fnmatchcase
@@ -143,9 +144,19 @@ _K_RESERVED_WORDS = {"and", "or", "not"}
 
 
 def _extract_k_keyword(entry: str) -> Optional[str]:
-    """Return the raw `-k "<value>"` keyword text, or None."""
-    m = _K_VALUE_RE.search(entry)
-    return m.group(1) if m else None
+    """Return the `-k` keyword expression (quoted or bare, matching `shlex.split`), or None."""
+    norm = normalize_test_id(entry)
+    try:
+        tokens = shlex.split(norm)
+    except ValueError:
+        m = _K_VALUE_RE.search(norm)
+        return m.group(1) if m else None
+    for idx, tok in enumerate(tokens[1:], start=1):
+        if tok == "-k" and idx + 1 < len(tokens):
+            return tokens[idx + 1]
+        if tok.startswith("-k="):
+            return tok[3:]
+    return None
 
 
 def _entry_excludes_waive(entry: str, waive_id: str) -> bool:
@@ -216,7 +227,9 @@ def _entry_applies_to_waive(entry: str, waive_id: str) -> bool:
         return True  # all-reserved expression → can't decide; over-include
     waive_file = waive_target.split("::", 1)[0]
     if "[" not in norm_waive and not (
-        waive_file.endswith(".py") and all(t.lower().endswith(".py") for t in real)
+        not entry_target.endswith(".py")
+        and waive_file.endswith(".py")
+        and all(t.lower().endswith(".py") for t in real)
     ):
         return True  # unparameterized waive may match `-k` via unseen `[params]`
     waive_lower = norm_waive.lower()
@@ -367,18 +380,24 @@ class YAMLIndex:
         if "[" in target:
             target = target.rsplit("[", 1)[0]
 
-        resolved: dict[tuple[str, int], tuple[Block, str]] = {}
+        resolved: list[tuple[Block, str]] = []
+        done_blocks: set[tuple[str, int]] = set()
         for level in [target, *_iter_parent_ids(target)]:
             for block in self._test_to_blocks.get(level, []):
                 key = (block.yaml_stem, block.block_index)
-                if key in resolved:
+                if key in done_blocks:
                     continue
-                if any(
-                    _entry_target(raw) == level and _entry_applies_to_waive(raw, waive_id)
+                hits = [
+                    raw
                     for raw in block.tests
-                ):
-                    resolved[key] = (block, level)
-        return list(resolved.values()) or None
+                    if _entry_target(raw) == level and _entry_applies_to_waive(raw, waive_id)
+                ]
+                if not hits:
+                    continue
+                resolved.append((block, level))
+                if any(_extract_k_keyword(raw) is None for raw in hits):
+                    done_blocks.add(key)
+        return resolved or None
 
     def git_path_to_yaml_key(self, git_path: str) -> Optional[str]:
         """Translate a repo-relative git path to its YAML namespace form.

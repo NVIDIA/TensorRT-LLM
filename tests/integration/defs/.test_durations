@@ -4057,9 +4057,9 @@
    "test_unittests.py::test_unittests_v2[unittest/_torch/visual_gen/sparse_attention]": 118.24,
    "test_unittests.py::test_unittests_v2[unittest/disaggregated/test_deepseek_v4_kv_transfer.py -k \"NVFP4\"]": 29.75,
    "test_unittests.py::test_unittests_v2[unittest/kv_cache_manager_v2_tests -k \"not RemoteInPlaceOfDisk and not TestTeardownWithoutCudaContext\"]": 447.22,
-   "test_unittests.py::test_unittests_v2[unittest/kv_cache_manager_v2_tests/test_kv_cache_manager_v2.py -k \"TestTeardownWithoutCudaContext\"]": 18.77,
    "test_unittests.py::test_unittests_v2[unittest/_torch/modules/dwdp]": 22.0,
    "examples/visual_gen/test_media_deps_install.py::test_visual_gen_deps_wheel_setup_restores_path_and_cleans_tempdir": 0.05,
    "examples/visual_gen/test_media_deps_install.py::test_visual_gen_deps_timeout_falls_back_to_apt_without_probing_wheel": 0.05,
-   "test_unittests.py::test_unittests_v2[unittest/_torch/modules/kimi_kda --ignore=unittest/_torch/modules/kimi_kda/test_kda_prefill_op.py --ignore=unittest/_torch/modules/kimi_kda/test_kda_mtp_decode_cute_parity.py]": 365.69
+   "test_unittests.py::test_unittests_v2[unittest/_torch/modules/kimi_kda --ignore=unittest/_torch/modules/kimi_kda/test_kda_prefill_op.py --ignore=unittest/_torch/modules/kimi_kda/test_kda_mtp_decode_cute_parity.py]": 365.69,
+   "test_unittests.py::test_unittests_v2[unittest/kv_cache_manager_v2_tests/test_kv_cache_manager_v2.py::TestTeardownWithoutCudaContext]": 18.77
 }
