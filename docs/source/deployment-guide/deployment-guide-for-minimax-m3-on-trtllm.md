@@ -80,6 +80,15 @@ example `trtllm-eval ... gsm8k --apply_chat_template --chat_template_kwargs
 '{"thinking_mode": "disabled"}'`; the raw eight-shot prompts of the `gsm8k`
 default bypass the template the model was trained with.
 
+### MiniMax-M3.1-Flash
+
+* [MiniMaxAI/MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash) — MiniMaxAI-published checkpoint in the mixed MXFP8/NVFP4 packaging, with its DSpark drafter bundled in the `dspark/` subdirectory. See [Serving MiniMax-M3.1-Flash](#serving-minimax-m31-flash).
+
+```bash
+git lfs install
+git clone https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash /models/MiniMax-M3.1-Flash
+```
+
 ## Feature Support Notes
 
 * **Block-sparse attention is required.** MiniMax-M3 runs on the block-sparse attention backend, which must be selected via `sparse_attention_config.algorithm: minimax_m3` in the YAML configuration. There is no dense fallback for the sparse layers.
@@ -95,6 +104,34 @@ default bypass the template the model was trained with.
 * **Size `max_seq_len` for the active attention paths.** On SM100/SM103, supported dense layers with unquantized KV cache in the Triton configuration use native paged attention and do not gather historical KV or expand GQA heads into temporary tensors. The SDPA dense fallback still allocates those buffers when TRTLLM-Gen is unavailable, disabled, ordered after the C++ fallback in `TLLM_FMHA_LIBS`, or the Triton configuration uses FP8/NVFP4 KV. FP8 KV retains SDPA to preserve its existing Q precision. The Triton sparse decode path separately has per-query FP32 temporary buffers that grow with the attended KV length. Keep `max_seq_len` bounded for paths with these allocations: checkpoint defaults (1M for MXFP8, 512K for BF16) can cause OOM or CUDA graph capture failures. The curated YAML sets `max_seq_len` just above ISL+OSL (`2068` for the 1k/1k benchmark); longer-context workloads may require a lower `max_batch_size`. MSA retains its own dense/sparse kernels and cache layout.
 * **Parallelism.** MoE experts run with expert parallelism. The attention layers support both Tensor-Expert Parallelism (TEP) and Data-Expert Parallelism (DEP, via `enable_attention_dp: true`). The overlap scheduler is enabled by default.
 * **Multimodal.** `MiniMaxM3SparseForConditionalGeneration` supports text, image, and video inputs. The text decoder is also usable standalone (text-only) via the `MiniMaxM3SparseForCausalLM` architecture.
+
+## Serving MiniMax-M3.1-Flash
+
+MiniMax-M3.1-Flash is served with the same `MiniMaxM3SparseForConditionalGeneration` architecture, CLI flags, and YAML options as MiniMax-M3. On SM107 (Rubin) it runs on the MiniMax-M3.1-Flash targets of the Modeling V2 `minimax_m3` family. All 60 of its attention layers are sparse (its `sparse_attention_freq` has no dense entries), so there are no dense target layers. The examples use a local copy of the checkpoint at `/models/MiniMax-M3.1-Flash`.
+
+### Checkpoint
+
+The checkpoint ships MXFP8 base layers with NVFP4 routed experts in the compressed-tensors packaging described in [Mixed MXFP8/NVFP4](#mixed-mxfp8nvfp4). The DSpark drafter is bundled in the `dspark/` subdirectory and is loaded only when `speculative_config` selects it.
+
+### MSA kernels
+
+These targets use their own copy of the MSA kernels, which compiles at run time on first use (it needs `nvcc` and the CUTLASS headers packaged with TensorRT LLM, or `CUTLASS_ROOT`).
+
+### Speculative decoding with the DSpark drafter
+
+DSpark is a target-dependent block drafter: it reads hidden states from several target layers and proposes a block of up to 7 draft tokens per step, which the target verifies in one forward. Select it with `decoding_type: DSpark` and point `speculative_model` at the bundled drafter, `MiniMaxAI/MiniMax-M3.1-Flash/dspark` (or the `dspark/` folder of a local checkpoint). The target attention backend must be `TRTLLM`. The drafter attends over a sliding window, so leave chunked prefill off unless a host KV cache is configured, and size `max_num_tokens` to the longest prompt. The TP targets need `moe_expert_parallel_size: 1`, and the DEP target needs `enable_attention_dp: true` with `moe_expert_parallel_size` equal to the world size. For example, the min-latency TP4 configuration (set `max_seq_len` to the longest prompt plus output you serve):
+
+```{literalinclude} ../../../examples/configs/curated/minimax-m3.1-flash-latency.yaml
+:language: yaml
+```
+
+For max throughput, [`minimax-m3.1-flash-throughput.yaml`](source:examples/configs/curated/minimax-m3.1-flash-throughput.yaml) runs the DEP8 target (attention data parallel, MegaMoE expert-parallel MoE) on 2 nodes of 4 GPUs with the same drafter. Launch it with one MPI rank per GPU, for example `srun --mpi=pmix -N 2 --ntasks-per-node 4 trtllm-llmapi-launch trtllm-serve MiniMaxAI/MiniMax-M3.1-Flash --config minimax-m3.1-flash-throughput.yaml`.
+
+`max_draft_len` is the number of draft tokens per step, up to the drafter's native block of 7. Launch the server with the same command as in [Launch the TensorRT LLM Server](#launch-the-tensorrt-llm-server), pointing `$MODEL` at `/models/MiniMax-M3.1-Flash` and `--extra_llm_api_options` at this file.
+
+### Thinking mode and reasoning parsing
+
+The MiniMax-M3.1-Flash chat template has no thinking-mode switch: it ends the prompt at the assistant header without prefilling `<mm:think>`, so the model decides per turn whether to emit a reasoning block. A `thinking_mode` key in `chat_template_kwargs` is ignored by this template; the key it reads is `reasoning_effort` (one of `low`, `medium`, `high`, `xhigh`, or `max`). With `--reasoning_parser minimax_m3` the reasoning block is returned in `reasoning_content` and the answer in `content`.
 
 ## Deployment Steps
 

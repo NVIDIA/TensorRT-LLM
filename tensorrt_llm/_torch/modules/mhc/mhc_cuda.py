@@ -150,6 +150,10 @@ def _get_mega_mhc():
 # Streams on which ``mega_mhc`` already allocated its split barriers, so a capture there may take it.
 _MEGA_MHC_CAPTURE_STREAMS: set[int] = set()
 
+# ``mega_mhc`` keeps a split task's X1 in tensor memory (up to 10 K blocks of 64), which every split choice
+# DeepGEMM makes meets up to this hidden size.
+_MEGA_MHC_MAX_HIDDEN = 5120
+
 
 def mhc_gemm_rms_dg_cuda(
     x: torch.Tensor,
@@ -273,6 +277,16 @@ _BIGFUSE_BLOCK_SIZE_OPTIONS = (128, 256, 512)
 # DeepGEMM leaves them free. Isolated profiling cannot see that and prefers
 # FMA.
 _PRE_MAPPING_DG_ONLY_MAX_M = 16
+# Its bigfuse width for lagged (V4.1) pre-mappings on SM100/SM103: widths tied in isolation do not
+# tie in the decode graph; 128 wins.
+_PRE_MAPPING_DG_ONLY_BIGFUSE_BS = 128
+
+
+def _dg_only_bigfuse_widths(lagged: bool) -> tuple[int, ...]:
+    if lagged and get_sm_version() in (100, 103):
+        return (_PRE_MAPPING_DG_ONLY_BIGFUSE_BS,)
+    return _BIGFUSE_BLOCK_SIZE_OPTIONS
+
 
 # Tactic is a tuple: (backend, tile_n, tile_m, bigfuse_bs)
 #   backend: "fma", "dg_splitk", "dg_nosplit"
@@ -350,7 +364,8 @@ class MhcPreMappingRunner(TunableRunner):
         valid_tile_n = tuple(tn for tn in _FMA_TILE_N_OPTIONS if N % tn == 0)
 
         if inputs[0].shape[0] <= _PRE_MAPPING_DG_ONLY_MAX_M and _get_dg_fn() is not None:
-            return [("dg_splitk", 0, 0, bs) for bs in _BIGFUSE_BLOCK_SIZE_OPTIONS]
+            widths = _dg_only_bigfuse_widths(kwargs.get("pre_mix_ext") is not None)
+            return [("dg_splitk", 0, 0, bs) for bs in widths]
 
         tactics = []
         for tn in valid_tile_n:
@@ -388,6 +403,10 @@ class MhcPreMappingRunner(TunableRunner):
             y_acc, r_acc, num_splits = mhc_gemm_rms_dg_cuda(
                 x, w_t, M, N, K, num_splits=_DG_NUM_SPLITS
             )
+            # A cached tactic may carry a width these calls do not tune.
+            widths = _dg_only_bigfuse_widths(kwargs.get("pre_mix_ext") is not None)
+            if M <= _PRE_MAPPING_DG_ONLY_MAX_M and bigfuse_bs not in widths:
+                bigfuse_bs = _PRE_MAPPING_DG_ONLY_BIGFUSE_BS
         elif backend == "dg_nosplit":
             y_acc, r_acc, num_splits = mhc_gemm_rms_dg_cuda(x, w_t, M, N, K, num_splits=1)
         else:
@@ -943,11 +962,18 @@ _FUSED_HC_FALLBACK_TACTIC_MMA = ("fused_half_mma", 0, 0, 0, 1)
 _FUSED_HC_FALLBACK_TACTIC_FMA = ("fused_half_fma", 2, 1, 256, 1)
 
 
-def _get_fused_hc_fallback_tactic(hidden_size: int | None = None):
+def _get_fused_hc_fallback_tactic(hidden_size: int | None = None, num_tokens: int = 0):
     mma_ok = _fused_hc_mma_supported()
     if hidden_size is not None:
         mma_ok = mma_ok and hidden_size in _FUSED_HC_MMA_SUPPORTED_HIDDEN_SIZES
-    return _FUSED_HC_FALLBACK_TACTIC_MMA if mma_ok else _FUSED_HC_FALLBACK_TACTIC_FMA
+    if mma_ok:
+        return _FUSED_HC_FALLBACK_TACTIC_MMA
+    # Token counts above the tuned buckets (prefill chunks past
+    # _MHC_FINE_GRAINED_TUNING_LIMIT) land here; the FMA GEMM is several times
+    # slower than DeepGEMM's TF32 GEMM there.
+    if num_tokens > 32 and _get_dg_fn() is not None:
+        return ("split_dg", 0, 1 if num_tokens >= 4096 else _DG_NUM_SPLITS, 256, 1)
+    return _FUSED_HC_FALLBACK_TACTIC_FMA
 
 
 class MhcFusedHcRunner(TunableRunner):
@@ -1074,6 +1100,13 @@ class MhcFusedHcRunner(TunableRunner):
             for tn, ks in _FUSED_HC_HALF_FMA_TN_KS:
                 if ks == 1:
                     add(("fused_half_fma", tn, ks, bs, 1))
+            # Without tcgen05, large M runs the boundary unfused: post_mapping,
+            # then the DeepGEMM TF32 GEMM + sqrsum (SM90 tensor cores) and
+            # big_fuse. num_k_splits carries the DeepGEMM split-K count.
+            if _get_dg_fn() is not None:
+                for splits in (1, _DG_NUM_SPLITS):
+                    for bs in _FUSED_HC_BIGFUSE_BS:
+                        add(("split_dg", 0, splits, bs, 1))
 
         return tactics
 
@@ -1098,9 +1131,8 @@ class MhcFusedHcRunner(TunableRunner):
 
         pre_mix_ext = kwargs.get("pre_mix_ext")
         if tactic == -1:
-            tactic = _get_fused_hc_fallback_tactic(self.hidden_size)
+            tactic = _get_fused_hc_fallback_tactic(self.hidden_size, residual_prev.shape[0])
         backend, tile_n, num_k_splits, bigfuse_bs, tile_m = tactic
-        backend_code = _FUSED_HC_BACKEND_CODE[backend]
 
         # Fused next-layer RMSNorm on layer_input. All four backends support
         # it (Path B/E inside mhcBigFuseKernel, Path D/F inside the all-in-one
@@ -1112,6 +1144,23 @@ class MhcFusedHcRunner(TunableRunner):
             norm_weight = norm_weight.to(torch.bfloat16)
         if norm_weight is not None and not norm_weight.is_contiguous():
             norm_weight = norm_weight.contiguous()
+
+        if backend == "split_dg":
+            return self._forward_split_dg(
+                x_prev,
+                residual_prev,
+                post_mix_prev,
+                comb_mix_prev,
+                w_t_cur,
+                hc_scale_cur,
+                hc_base_cur,
+                num_k_splits,
+                bigfuse_bs,
+                norm_weight,
+                norm_eps,
+                pre_mix_ext,
+            )
+        backend_code = _FUSED_HC_BACKEND_CODE[backend]
 
         B = residual_prev.shape[0]
         residual_cur = torch.empty_like(residual_prev)
@@ -1170,6 +1219,74 @@ class MhcFusedHcRunner(TunableRunner):
             pre_mix_ext=pre_mix_ext,
             pre_mix_out=pre_mix_out,
         )
+        if pre_mix_out is not None:
+            return residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur, pre_mix_out
+        return residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur
+
+    def _forward_split_dg(
+        self,
+        x_prev,
+        residual_prev,
+        post_mix_prev,
+        comb_mix_prev,
+        w_t_cur,
+        hc_scale_cur,
+        hc_base_cur,
+        num_splits,
+        bigfuse_bs,
+        norm_weight,
+        norm_eps,
+        pre_mix_ext,
+    ):
+        """post_mapping, then pre_mapping's DeepGEMM GEMM + sqrsum and big_fuse."""
+        n, hidden = self.n, self.hidden_size
+        B = residual_prev.shape[0]
+        pre_mix_out = None
+        if pre_mix_ext is not None:
+            if pre_mix_ext.numel() != B * n:
+                # Autotuner bucket profiling (see MhcPreMappingRunner.forward).
+                pre_mix_ext = torch.ones((B, n), dtype=torch.float32, device=x_prev.device)
+            pre_mix_ext = pre_mix_ext.reshape(B, n).to(torch.float32).contiguous()
+            pre_mix_out = torch.empty((B, n), dtype=torch.float32, device=x_prev.device)
+        K = n * hidden
+        residual_cur = mhc_post_mapping_cuda(
+            residual_prev.view(B, n, hidden),
+            x_prev,
+            post_mix_prev.view(B, n),
+            comb_mix_prev.view(B, n, n),
+            n,
+        )
+        y_acc, r_acc, num_splits = mhc_gemm_rms_dg_cuda(
+            residual_cur.view(B, K), w_t_cur, B, w_t_cur.shape[0], K, num_splits=num_splits
+        )
+        post_mix_cur = torch.empty((B, n), dtype=torch.float32, device=x_prev.device)
+        comb_mix_cur = torch.empty((B, n * n), dtype=torch.float32, device=x_prev.device)
+        layer_input_cur = torch.empty_like(x_prev)
+        mhc_big_fuse_cuda(
+            y_acc,
+            r_acc,
+            residual_cur,
+            hc_scale_cur,
+            hc_base_cur,
+            post_mix_cur,
+            comb_mix_cur,
+            layer_input_cur,
+            B,
+            K,
+            hidden,
+            self.rms_eps,
+            self.hc_pre_eps,
+            self.hc_sinkhorn_eps,
+            self.hc_post_mult_value,
+            self.sinkhorn_repeat,
+            num_splits=num_splits,
+            block_size=bigfuse_bs,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+            pre_mix_ext=pre_mix_ext,
+            pre_mix_out=pre_mix_out,
+        )
+        residual_cur = residual_cur.view(B, n, hidden)
         if pre_mix_out is not None:
             return residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur, pre_mix_out
         return residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur
@@ -1263,14 +1380,15 @@ def mhc_fused_hc(
     explores the full tactic space regardless of ``norm_weight``.
 
     V4.1 boundaries of at least 1024 tokens (of any size with ``deterministic``) with a folded
-    RMSNorm run DeepGEMM's ``mega_mhc`` on SM100/SM103 instead: one launch with the same math.
-    Its split-K count follows the token count (DeepGEMM fits the split tasks to whole waves of
-    SMs), so a token's result can change in the last bits with its batch size; a given size
-    repeats bitwise. It allocates per-stream split barriers on its first launch, which graph capture
-    forbids, so once ``torch.cuda.graph`` has created its default capture stream, the next eager
-    launch also runs once there. A capture on another stream takes it once an eager launch ran on
-    that stream (as a pass graph's warm runs do), else keeps the backends above. The barriers
-    carry the launch's grid id, so a captured launch re-initializes them on every replay.
+    RMSNorm and a hidden size of at most 5120 run DeepGEMM's ``mega_mhc`` on SM100, SM103 and SM107
+    instead: one launch with the same math. Its split-K count follows the token count (DeepGEMM fits
+    the split tasks to whole waves of SMs), so a token's result can change in the last bits with its
+    batch size; a given size repeats bitwise. It allocates per-stream split barriers on its first
+    launch, which graph capture forbids, so once ``torch.cuda.graph`` has created its default
+    capture stream, the next eager launch also runs once there. A capture on another stream takes it
+    once an eager launch ran on that stream (as a pass graph's warm runs do), else keeps the
+    backends above. The barriers carry the launch's grid id, so a captured launch re-initializes
+    them on every replay.
 
     With ``FORCE_DETERMINISTIC=1`` or ``FORCE_MHC_KERNEL_DETERMINISTIC=1`` every boundary runs one
     fixed FMA tactic instead, whose result for a token does not depend on its batch.
@@ -1294,8 +1412,9 @@ def mhc_fused_hc(
         and norm_weight is not None
         and n == 4
         and hidden_size % 1024 == 0
+        and hidden_size <= _MEGA_MHC_MAX_HIDDEN
         and (1 if deterministic else 1024) <= residual_prev.shape[0] <= 1 << 20
-        and get_sm_version() in (100, 103)
+        and get_sm_version() in (100, 103, 107)
         and not AutoTuner.get().is_tuning_mode
         and (
             not torch.cuda.is_current_stream_capturing()

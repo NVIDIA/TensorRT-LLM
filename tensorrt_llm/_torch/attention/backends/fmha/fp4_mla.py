@@ -254,6 +254,7 @@ class Fp4MlaFmha(PhasedFmha):
             scratch.cache_start_event,
             scratch.cache_done_event,
         )
+        forward_args.softmax_stats_is_lse = fp8_forward_args.softmax_stats_is_lse
 
     def forward_context_partition(
         self,
@@ -342,7 +343,9 @@ class Fp4MlaFmha(PhasedFmha):
             kv_scale_quant_orig=None,
             latent_cache=None,
         )
-        return fp8_attention.forward(q, k, v, fp8_metadata, fp8_forward_args)
+        output = fp8_attention.forward(q, k, v, fp8_metadata, fp8_forward_args)
+        forward_args.softmax_stats_is_lse = fp8_forward_args.softmax_stats_is_lse
+        return output
 
     def run_mla_generation(self, params: FmhaParams) -> None:
         attn = params.attn

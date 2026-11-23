@@ -95,11 +95,14 @@ def test_connector_retention_request_validation(
     executor._configure_csa2_remote_tail = Mock()
     executor._validate_token_id_range = Mock()
     executor._validate_request_budget = Mock()
+    executor._validate_token_id_range = Mock()
+    executor._validate_embedding_bias = Mock()
     executor.sampler = Mock()
     request = SimpleNamespace(
         kv_cache_retention_config=KvCacheRetentionConfig([]) if with_retention else None,
         py_disaggregated_params=None,
         sampling_config=None,
+        raise_if_validation_failed=Mock(),
     )
 
     if rejected:

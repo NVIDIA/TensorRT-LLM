@@ -137,8 +137,8 @@ def run_fp4_mla_splitkv(
     TRTLLM swizzle for the same rows. Output is [queries, 1-128, 512], FP16/BF16.
     KV lengths include the final query of each uniform linear-MTP request.
     Workspace is owned by metadata and must be warmed before graph capture.
-    The workspaces are process-wide and sized for the configured query
-    capacity, so every graph bucket and the eager path share one set.
+    The workspaces retain metadata ownership and reserve the configured query
+    capacity before capture.
     All input replication and partition planning execute on the current stream
     on every invocation; graph replay therefore consumes the current inputs.
     """
@@ -154,8 +154,7 @@ def run_fp4_mla_splitkv(
     if q_batch_capacity < queries:
         raise ValueError("Q capacity must cover the active query count")
     tasks = splits * queries
-    # One process-wide workspace set (layout._ensure_workspace_tensor) sized for the Q capacity serves every
-    # graph bucket and the eager path alike.
+    # Reserve per-forward scratch for the Q capacity before capture.
     workspace_queries = q_batch_capacity
     task_capacity = splits * workspace_queries
     if splits < 2 or tasks > 65535:
@@ -191,6 +190,7 @@ def run_fp4_mla_splitkv(
             (capacity,),
             dtype=dtype,
             device=output.device,
+            shared=True,
             capacity_numel=capacity,
         )[:count]
 

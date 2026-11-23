@@ -58,6 +58,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler.gen_admission_queue import (
 )
 from tensorrt_llm._torch.pyexecutor.scheduler.rank_state import (
     RankKvCacheStats,
+    RankSchedulingCounters,
     RankSpecDecodingStats,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler.waiting_queue import PriorityWaitingQueue
@@ -139,7 +140,7 @@ def _make_request_item(req_id, num_tokens=10, target_dp_rank=None, attention_dp_
 
 def append_to_waiting_queue(waiting_queue, rank, attention_dp_relax):
     req_id = len(waiting_queue)
-    waiting_queue.append(
+    waiting_queue.add_request(
         RequestQueueItem(
             req_id,
             create_mock_request_with_py_schedule_params(
@@ -345,6 +346,56 @@ class TestRankState:
 
         assert RankIterStatsPayload.deserialize(payload.serialize(include_kv_cache_load)) == payload
         assert RankState.deserialize(state.serialize(include_kv_cache_load)) == state
+
+    @pytest.mark.parametrize(
+        "include_kv_cache_load,with_snapshots,has_pending_work",
+        [(False, False, False), (True, False, True), (False, True, True), (True, True, False)],
+    )
+    def test_queued_stats_roundtrip_preserves_routing_tail(
+        self,
+        include_kv_cache_load: bool,
+        with_snapshots: bool,
+        has_pending_work: bool,
+    ) -> None:
+        payload = RankIterStatsPayload(
+            has_iter_stats=1,
+            iter_stats_iter=9,
+            num_queued_context_requests=2,
+            num_queued_ctx_tokens=300,
+            num_queued_gen_requests=1,
+            num_queued_gen_kv_tokens=400,
+            has_pending_work=has_pending_work,
+            kv_cache_stats=(
+                RankKvCacheStats(10, 8, 2, 16, 3, 2, 1, 1, 0.5) if with_snapshots else None
+            ),
+            # The queued fields follow every snapshot in the frame.
+            scheduling_counters=(
+                RankSchedulingCounters(1, 2, 3, 4, 5.5, 6, 7, 8, 9) if with_snapshots else None
+            ),
+        )
+        state = RankState(
+            rank=1,
+            iter_stats=payload,
+            num_connector_transfers=7,
+            connector_poll_failed=True,
+        )
+        wire = state.serialize(include_kv_cache_load)
+        assert wire[5] == -4  # Payload version follows the five-field rank prefix.
+        assert RankState.deserialize(wire) == state
+        with pytest.raises(ValueError, match="four trailing fields"):
+            RankState.deserialize(wire[:-1])
+
+    @pytest.mark.parametrize("include_kv_cache_load", [False, True])
+    def test_pending_work_roundtrip_without_sampled_stats(
+        self,
+        include_kv_cache_load: bool,
+    ) -> None:
+        payload = RankIterStatsPayload(has_pending_work=True)
+        state = RankState(rank=1, iter_stats=payload, num_connector_transfers=7)
+        wire = state.serialize(include_kv_cache_load)
+        assert wire[5] == -4  # Payload version follows the five-field rank prefix.
+        assert RankState.deserialize(wire) == state
+        assert not RankState.deserialize(wire).iter_stats.has_iter_stats
 
     def test_snapshot_wire_schema_is_stable(self) -> None:
         """Pin field order and the complete versioned frame independently of roundtrips."""
@@ -1309,7 +1360,7 @@ def test_achieve_max_num_active_requests(attention_dp_config):
 
     all_ranks_num_active_requests = [5, 6, 3, 7]
     waiting_queue = FCFSWaitingQueue()
-    waiting_queue.extend(req_list)
+    waiting_queue.add_requests(req_list)
     available = max_num_active_requests * 4 - sum(all_ranks_num_active_requests)
 
     result = get_from_waiting_queue(
@@ -2463,7 +2514,7 @@ class TestDefaultADPRouterKVBalance:
         queue = _gen_queue([8000, 300, 400])
         if case == "context_request":
             context_type = RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION
-            queue.append(_gen_item(3, 400, request_type=context_type))
+            queue.add_request(_gen_item(3, 400, request_type=context_type))
         states = _states([0], [7]) if single_rank else _states([20000, 21000], [8, 7])
         chosen, placement = router.pop_requests(
             queue, states, 1, 8, kv_balance=case != "kv_balance_off"
@@ -2597,7 +2648,7 @@ class TestDefaultADPRouterKVBalance:
         next_id = 0
         while next_id < num_ranks * slots or queue:
             for _ in range(min(rng.choice([1, 2]), num_ranks * slots - next_id)):
-                queue.append(_gen_item(next_id, int(rng.lognormvariate(9.5, 1.0))))
+                queue.add_request(_gen_item(next_id, int(rng.lognormvariate(9.5, 1.0))))
                 next_id += 1
             states = _states(tokens, counts)
             chosen, placement = router.pop_requests(queue, states, len(queue), slots)

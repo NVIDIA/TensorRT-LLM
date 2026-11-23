@@ -33,6 +33,7 @@ from .config import (
     _fp4_mla_q1_kv_blocks_per_program,
     _fp4_mla_q1_prefix_blocks_per_program,
     _HPUpdatePhase,
+    fp4_mla_generation_backend_supported,
 )
 from .fp4_mla_kernels import (
     _fp4_mla_context_cache_update_kernel,
@@ -51,7 +52,6 @@ from .layout import (
 )
 from .metadata import (
     _fp4_mla_generation_hp_page_ids,
-    _fp4_mla_generation_num_blocks_device,
     _fp4_mla_generation_page_ids,
     _fp4_mla_uniform_generation_lengths,
     _materialize_fp4_mla_device_page_table_for_forward,
@@ -60,9 +60,7 @@ from .packed_plan import _fp4_mla_helix_plan_bounds, _fp4_mla_packed_plan_geomet
 from .v_cache import (
     _get_cutedsl_persistent_v_packed_cache,
     _get_fp4_mla_v_packed_pool_base,
-    _maybe_update_triton_v_packed_cache,
     _repack_cutedsl_v_packed_cache,
-    _triton_prepack_v_enabled,
 )
 
 
@@ -103,9 +101,10 @@ def can_fuse_fp4_mla_q_quant(
 ) -> bool:
     """Return whether generation can quantize Q in the fused cache update."""
     num_gen = metadata.num_seqs - metadata.num_contexts
+    backend = _fp4_mla_attention_backend()
+    sm_version = get_sm_version()
     return bool(
-        _fp4_mla_attention_backend() in _FP4_MLA_K_RESIDUAL_BACKENDS
-        and get_sm_version() == 107
+        fp4_mla_generation_backend_supported(sm_version, backend)
         and num_gen > 0
         and getattr(metadata, "kv_cache_manager", None) is not None
         and q.shape[0] > 0
@@ -291,7 +290,6 @@ class _Fp4MlaContextScatterPlan:
     cutedsl_v_packed: bool
     v_packed_base: Optional[torch.Tensor]
     cutedsl_repack: Optional[tuple]
-    triton_v_pack: bool
     rope_table: Optional[torch.Tensor] = None
     rope_dim: int = 0
 
@@ -479,7 +477,6 @@ def _build_fp4_mla_context_scatter_plan(
         cutedsl_v_packed=cutedsl_v_packed,
         v_packed_base=v_packed_base,
         cutedsl_repack=cutedsl_repack,
-        triton_v_pack=has_decode_views and _triton_prepack_v_enabled(),
     )
 
 
@@ -752,19 +749,6 @@ def _scatter_fp4_mla_context(
             kv_lens=kv_lens,
             generation_lens=generation_lens,
             max_touched_pages=max_touched_pages,
-        )
-    if plan.triton_v_pack:
-        _maybe_update_triton_v_packed_cache(
-            metadata,
-            layer_idx,
-            kv_cache,
-            plan.paged_kv_indices,
-            num_queries=num_tokens,
-            v_head_dim=v_head_dim,
-            page_size=metadata.page_size,
-            local_layer=local_layer,
-            v_sf=v_sf[local_layer],
-            num_valid_pages=None,
         )
     return hp_pool_updated
 
@@ -1375,14 +1359,6 @@ def scatter_fp4_mla_kv_cache(
         helix_position_offsets=helix_position_offsets,
         helix_is_inactive_rank=helix_is_inactive_rank,
     )
-    v_pack_page_ids = _fp4_mla_generation_page_ids(
-        metadata, metadata.num_seqs - metadata.num_contexts
-    )
-    v_pack_num_valid = None
-    if getattr(metadata, "is_cuda_graph", False):
-        # Frozen launch grids cannot follow the per-replay page count;
-        # the repack kernels stride over this device-side count instead.
-        v_pack_num_valid = _fp4_mla_generation_num_blocks_device(metadata)
     cutedsl_repack_page_indptr = None
     cutedsl_repack_kv_lens = None
     cutedsl_repack_generation_lens = None
@@ -1400,7 +1376,9 @@ def scatter_fp4_mla_kv_cache(
                 metadata.page_size,
             )
         else:
-            cutedsl_v_pack_page_ids = v_pack_page_ids
+            cutedsl_v_pack_page_ids = _fp4_mla_generation_page_ids(
+                metadata, metadata.num_seqs - metadata.num_contexts
+            )
         _repack_cutedsl_v_packed_cache(
             persistent_v_packed,
             kv_cache,
@@ -1413,17 +1391,5 @@ def scatter_fp4_mla_kv_cache(
             generation_lens=cutedsl_repack_generation_lens,
             max_touched_pages=cutedsl_repack_max_touched_pages,
         )
-    _maybe_update_triton_v_packed_cache(
-        metadata,
-        layer_idx,
-        kv_cache,
-        v_pack_page_ids,
-        num_queries=num_tokens,
-        v_head_dim=v_head_dim,
-        page_size=metadata.page_size,
-        local_layer=local_layer,
-        v_sf=v_sf[local_layer],
-        num_valid_pages=v_pack_num_valid,
-    )
     metadata.fp4_mla_state.generation_cache_scattered = True
     return True

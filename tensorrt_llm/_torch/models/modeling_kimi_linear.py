@@ -146,6 +146,7 @@ from ..moe.fused_moe import ConfigurableMoE, SiTuActivation, TRTLLMGenFusedMoE, 
 from ..moe.fused_moe.interface import MoESchedulerKind
 from ..moe.fused_moe.routing import DeepSeekV3MoeRoutingMethod
 from ..nccl_window_tensor_scope import nccl_window_tensor_scoped_module
+from ..recurrent_state_spec import RecurrentStateSpec, recurrent_state_spec_from_mamba_params
 from ..utils import AuxStreamType, Fp4QuantizedTensor
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, register_auto_model, run_concurrently
@@ -3213,7 +3214,7 @@ class KimiLinearModel(DecoderModel):
         if runtime.gate.logits_kernel:
             compiled += kimi_k3_router_logits.precompile()
         if runtime.routed_experts.sort_routing_applies:
-            compiled += kimi_k3_routing.precompile(self.num_experts)
+            compiled += kimi_k3_routing.precompile(runtime.num_experts)
         return compiled
 
     def prewarm_decode_kernels(self, max_num_tokens: int, verify_batches: bool) -> int:
@@ -3724,6 +3725,19 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         routed to a path that cannot transfer the recurrent state.
         """
         return "PYTHON"
+
+    @classmethod
+    def get_recurrent_state_spec(
+        cls,
+        pretrained_config: Any,
+        *,
+        quant_config: Optional[QuantConfig] = None,
+    ) -> RecurrentStateSpec:
+        """Declare the KDA state of the linear-attention layers."""
+        from ..modules.kimi_kda.cache_manager import get_kimi_cache_params
+
+        params = get_kimi_cache_params(pretrained_config, quant_config=quant_config)
+        return recurrent_state_spec_from_mamba_params(params, conv_sections="q_k_v")
 
     # ------------------------------------------------------------------
     # Weight loading (streams the 1.5TB checkpoint; only the rank-local

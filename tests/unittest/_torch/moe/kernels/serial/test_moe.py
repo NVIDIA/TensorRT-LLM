@@ -14,18 +14,21 @@
 # limitations under the License.
 
 from enum import Enum
-from typing import Tuple
+from typing import Tuple, TypedDict
 
 import pytest
 import torch
 import torch.nn.functional as F
+from _torch.moe.moe_test_utils import MoeBackendType, replay_tactics_and_check
 from utils.util import getSMVersion
 
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.moe.fused_moe import RoutingMethodType
 from tensorrt_llm._torch.utils import next_positive_power_of_2
+from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.quantization.utils.fp4_utils import (
-    reorder_rows_for_gated_act_gemm, shuffle_matrix_a, shuffle_matrix_sf_a)
+    pad_up, reorder_rows_for_gated_act_gemm, shuffle_matrix_a,
+    shuffle_matrix_sf_a)
 
 # NOTE: Some tests in this file are deprecated and skipped. They are now covered by the
 # unified MoE test framework in tests/unittest/_torch/modules/moe/test_moe_backend.py
@@ -80,6 +83,18 @@ def test_situ_runner_has_valid_configs(num_tokens, get_tactics):
     """
     assert get_tactics(
         num_tokens), f"No valid SiTu tactic for num_tokens={num_tokens}"
+
+
+class _Mxfp4RoutingInfo(TypedDict):
+    """Routing parameters for the MXFP4 direct-op numerical reference."""
+
+    num_experts: int
+    top_k: int
+    n_groups: int | None
+    top_k_groups: int | None
+    routed_scaling: float | None
+    has_routing_bias: bool
+    routing_method_type: RoutingMethodType
 
 
 class moe_args:
@@ -2250,65 +2265,21 @@ def test_moe_fp8_per_tensor_scale(num_tokens, hidden_size, intermediate_size,
                    percent=0.925)
 
 
-@pytest.mark.skip(
-    reason=
-    "Deprecated: covered by tests/unittest/_torch/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
-)
-@pytest.mark.skipif(
-    getSMVersion() != 100,
-    reason="The kernel only supports Blackwell. Current SM is %d." %
-    getSMVersion(),
-)
-@pytest.mark.parametrize("num_tokens", [1, 256, 1024])
-@pytest.mark.parametrize("hidden_size", [512])
-@pytest.mark.parametrize("intermediate_size", [512])
-@pytest.mark.parametrize(
-    "routing_info",
-    [
-        pytest.param(
-            {
-                "num_experts": 16,
-                "top_k": 10,
-                "n_groups": None,
-                "top_k_groups": None,
-                "routed_scaling": None,
-                "has_routing_bias": False,
-                "routing_method_type": RoutingMethodType.Renormalize
-            },
-            id="RoutingRenormalize_qwen_next"),
-        pytest.param(
-            {
-                "num_experts": 16,
-                "top_k": 8,
-                "n_groups": None,
-                "top_k_groups": None,
-                "routed_scaling": None,
-                "has_routing_bias": False,
-                "routing_method_type": RoutingMethodType.Renormalize
-            },
-            id="RoutingRenormalize_topk_8"),
-        pytest.param(
-            {
-                "num_experts": 16,
-                "top_k": 4,
-                "n_groups": None,
-                "top_k_groups": None,
-                "routed_scaling": None,
-                "has_routing_bias": False,
-                "routing_method_type": RoutingMethodType.Renormalize
-            },
-            id="RoutingRenormalize_topk_4"),
-    ],
-)
-@pytest.mark.parametrize("dtype_activation", ["mxfp8", "bf16", "fp8"])
-@pytest.mark.parametrize("act_type_str", ["SwiGlu", "GatedSilu"])
-@pytest.mark.parametrize("use_autotune", [True, False],
-                         ids=["autotune", "no_autotune"])
-@pytest.mark.parametrize("use_topk_as_input", [False, True],
-                         ids=["use_score_as_input", "use_topk_as_input"])
-def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
-                            routing_info, dtype_activation, act_type_str,
-                            use_autotune, use_topk_as_input):
+def _run_moe_mxe2m1_weights(
+    num_tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    routing_info: _Mxfp4RoutingInfo,
+    dtype_activation: str,
+    act_type_str: str,
+    use_autotune: bool,
+    use_topk_as_input: bool,
+    valid_hidden_size: int | None = None,
+    valid_intermediate_size: int | None = None,
+    skip_dynamic_tuning_buckets: bool = False,
+    check_all_tactics: bool = False,
+) -> None:
+    """Run the MXFP4 direct op and its numerical reference on the same inputs."""
     torch.random.manual_seed(0)
 
     #
@@ -2429,6 +2400,22 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
         gemm2_bias = 50 * torch.randn(
             num_experts, hidden_size, device='cuda', dtype=torch.float)
 
+    if valid_hidden_size is not None:
+        hidden_states[:, valid_hidden_size:] = 0
+        gemm1_weights[:, :, valid_hidden_size:] = 0
+        gemm2_weights[:, valid_hidden_size:, :] = 0
+        if gemm2_bias is not None:
+            gemm2_bias[:, valid_hidden_size:] = 0
+    if valid_intermediate_size is not None:
+        # Gate and up projections are padded separately before interleaving.
+        for offset in (0, intermediate_size):
+            gemm1_weights[:, offset + valid_intermediate_size:offset +
+                          intermediate_size, :] = 0
+            if gemm1_bias is not None:
+                gemm1_bias[:, offset + valid_intermediate_size:offset +
+                           intermediate_size] = 0
+        gemm2_weights[:, :, valid_intermediate_size:] = 0
+
     hidden_states_mxe4m3 = None
     hidden_states_scale_linear_mxe4m3 = None
     hidden_states_scale_mxe4m3_bytes = None
@@ -2444,12 +2431,13 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
             torch.uint8)  # ue8m0 scaling factors
 
     sf_block_size = 32
-    # Quantize the weights for FC1. Produces scales for weights in 128x4 layout for ref impl.
-    gemm1_weights_mxe2m1_bytes, gemm1_scales_mxe2m1_bytes = quant_mxe2m1_batches(
-        gemm1_weights, num_experts, True)
-    # We do it twice to get the linear layout for scales for the FP4 kernels.
-    _, gemm1_scales_linear_mxe2m1_bytes = quant_mxe2m1_batches(
+    # Quantize FC1 once with linear scales; derive the reference's 128x4 layout.
+    gemm1_weights_mxe2m1_bytes, gemm1_scales_linear_mxe2m1_bytes = quant_mxe2m1_batches(
         gemm1_weights, num_experts, False)
+    gemm1_scales_mxe2m1_bytes = torch.ops.trtllm.block_scale_interleave(
+        gemm1_scales_linear_mxe2m1_bytes.view(torch.uint8).reshape(
+            num_experts, 2 * intermediate_size,
+            hidden_size // sf_block_size)).reshape(num_experts, -1)
 
     gemm1_weights_mxe2m1 = gemm1_weights_mxe2m1_bytes.view(torch.uint8).reshape(
         num_experts, 2 * intermediate_size, hidden_size // 2)  # packed fp8
@@ -2457,12 +2445,13 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
         torch.uint8).reshape(num_experts, 2 * intermediate_size, hidden_size //
                              sf_block_size)  # ue8m0 scaling factors
 
-    # Quantize the weights for FC2. Produces scales for weights in 128x4 layout for ref impl.
-    gemm2_weights_mxe2m1_bytes, gemm2_scales_mxe2m1_bytes = quant_mxe2m1_batches(
-        gemm2_weights, num_experts, True)
-    # We do it twice to get the linear layout for scales for the FP4 kernels.
-    _, gemm2_scales_linear_mxe2m1_bytes = quant_mxe2m1_batches(
+    # Quantize FC2 once with linear scales; derive the reference's 128x4 layout.
+    gemm2_weights_mxe2m1_bytes, gemm2_scales_linear_mxe2m1_bytes = quant_mxe2m1_batches(
         gemm2_weights, num_experts, False)
+    gemm2_scales_mxe2m1_bytes = torch.ops.trtllm.block_scale_interleave(
+        gemm2_scales_linear_mxe2m1_bytes.view(torch.uint8).reshape(
+            num_experts, hidden_size,
+            intermediate_size // sf_block_size)).reshape(num_experts, -1)
 
     gemm2_weights_mxe2m1 = gemm2_weights_mxe2m1_bytes.view(torch.uint8).reshape(
         num_experts, hidden_size, intermediate_size // 2)  # packed mxe2m1
@@ -2563,6 +2552,9 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
                                                  hidden_size // sf_block_size)
 
     # Shuffle weights and scaling factors for transposed mma output
+    # FC2 output rows use 128 alignment independently of the FC1 input padding.
+    output_hidden_size = (pad_up(valid_hidden_size, 128)
+                          if valid_hidden_size is not None else hidden_size)
     gemm1_weights_mxe2m1_shuffled = []
     gemm1_scales_mxe2m1_shuffled = []
     gemm2_weights_mxe2m1_shuffled = []
@@ -2584,16 +2576,19 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
                 shuffle_matrix_a(gemm1_bias_interleaved[i], epilogue_tile_m))
 
         gemm2_weights_mxe2m1_shuffled.append(
-            shuffle_matrix_a(gemm2_weights_mxe2m1[i].view(torch.uint8),
-                             epilogue_tile_m))
+            shuffle_matrix_a(
+                gemm2_weights_mxe2m1[i, :output_hidden_size].view(torch.uint8),
+                epilogue_tile_m))
         gemm2_scales_mxe2m1_shuffled.append(
-            shuffle_matrix_sf_a(gemm2_scales_linear_mxe2m1[i].view(torch.uint8),
-                                epilogue_tile_m))
+            shuffle_matrix_sf_a(
+                gemm2_scales_linear_mxe2m1[i, :output_hidden_size].view(
+                    torch.uint8), epilogue_tile_m))
 
         if gemm2_bias is not None:
             gemm2_bias_shuffled.append(
-                shuffle_matrix_a(gemm2_bias[i].clone().reshape(-1, 1),
-                                 epilogue_tile_m))
+                shuffle_matrix_a(
+                    gemm2_bias[i, :output_hidden_size].clone().reshape(-1, 1),
+                    epilogue_tile_m))
 
     # Stack weights for all experts
     gemm1_weights_mxe2m1_shuffled = torch.stack(gemm1_weights_mxe2m1_shuffled)
@@ -2604,7 +2599,7 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
     gemm2_weights_mxe2m1_shuffled = torch.stack(gemm2_weights_mxe2m1_shuffled)
     gemm2_scales_mxe2m1_shuffled = torch.stack(
         gemm2_scales_mxe2m1_shuffled).view(torch.uint8).reshape(
-            num_experts, hidden_size, intermediate_size // sf_block_size)
+            num_experts, output_hidden_size, intermediate_size // sf_block_size)
 
     gemm1_bias_shuffled = (torch.stack(gemm1_bias_shuffled).reshape(
         num_experts, -1) if gemm1_bias_shuffled else None)
@@ -2641,14 +2636,14 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
     #
     # Run the TRT-LLM kernel
     #
-    unpadded_hidden_size = hidden_size
+    unpadded_hidden_size = valid_hidden_size or hidden_size
     if test_invalid_topk_input:
         top_k = top_k + 1
-    AutoTuner.get().clear_cache()
-    with autotune(use_autotune):
+
+    def run_moe() -> torch.Tensor:
         if dtype_activation == "mxfp8":
             # Test fused unpadding by checking only half of the output.
-            output = torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner(
+            return torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner(
                 expert_logits, routing_bias,
                 hidden_states_mxe4m3.cuda().view(torch.float8_e4m3fn),
                 hidden_states_scale_linear_mxe4m3.cuda(),
@@ -2660,10 +2655,11 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
                 gemm2_scales_mxe2m1_shuffled.cuda(),
                 gemm2_bias_shuffled.cuda() if gemm2_bias_shuffled is not None
                 else None, num_experts, top_k, n_groups, top_k_groups,
-                intermediate_size, None, None, 0, num_experts, routed_scaling,
-                routing_method_type, act_type.value, topk_weights, topk_ids)
+                intermediate_size, valid_hidden_size, valid_intermediate_size,
+                0, num_experts, routed_scaling, routing_method_type,
+                act_type.value, topk_weights, topk_ids)
         elif dtype_activation == "bf16":
-            output = torch.ops.trtllm.bf16_mxe2m1_block_scale_moe_runner(
+            return torch.ops.trtllm.bf16_mxe2m1_block_scale_moe_runner(
                 expert_logits, routing_bias,
                 hidden_states.cuda().to(torch.bfloat16),
                 gemm1_weights_mxe2m1_shuffled.cuda(),
@@ -2674,10 +2670,11 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
                 gemm2_scales_mxe2m1_shuffled.cuda(),
                 gemm2_bias_shuffled.cuda() if gemm2_bias_shuffled is not None
                 else None, num_experts, top_k, n_groups, top_k_groups,
-                intermediate_size, None, None, 0, num_experts, routed_scaling,
-                routing_method_type, act_type.value, topk_weights, topk_ids)
+                intermediate_size, valid_hidden_size, valid_intermediate_size,
+                0, num_experts, routed_scaling, routing_method_type,
+                act_type.value, topk_weights, topk_ids)
         elif dtype_activation == "fp8":
-            output = torch.ops.trtllm.e4m3_mxe2m1_block_scale_moe_runner(
+            return torch.ops.trtllm.e4m3_mxe2m1_block_scale_moe_runner(
                 expert_logits, routing_bias,
                 input_hidden_states.cuda().to(torch.float8_e4m3fn),
                 gemm1_weights_mxe2m1_shuffled.cuda(),
@@ -2686,31 +2683,132 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
                 else None, gemm1_alpha, gemm1_beta, gemm1_clamp_limit,
                 gemm2_weights_mxe2m1_shuffled.cuda(),
                 gemm2_scales_mxe2m1_shuffled.cuda(),
-                gemm2_bias_shuffled.cuda() if gemm2_bias_shuffled is not None
-                else None, scale_c_fc1, scale_gate_fc1, scale_c_fc2,
-                num_experts, top_k, n_groups, top_k_groups, intermediate_size,
-                None, None, 0, num_experts, routed_scaling, routing_method_type,
-                act_type.value, topk_weights, topk_ids)
+                gemm2_bias_shuffled.cuda()
+                if gemm2_bias_shuffled is not None else None, scale_c_fc1,
+                scale_gate_fc1, scale_c_fc2, num_experts, top_k, n_groups,
+                top_k_groups, intermediate_size, valid_hidden_size,
+                valid_intermediate_size, 0, num_experts, routed_scaling,
+                routing_method_type, act_type.value, topk_weights, topk_ids)
         else:
             raise ValueError("Invalid dtype_activation")
+
+    AutoTuner.get().clear_cache()
+    with autotune(use_autotune,
+                  skip_dynamic_tuning_buckets=skip_dynamic_tuning_buckets):
+        output = run_moe()
     torch.cuda.synchronize()
-    output_dequant_actual = output.to(torch.float)
     output_dequant_reference = output_dequant_reference[:, :
                                                         unpadded_hidden_size].contiguous(
                                                         )
     if act_type == ActType.SiTu:
-        check_accuracy(output_dequant_reference,
-                       output_dequant_actual,
-                       atol=0.1,
-                       rtol=0.15,
-                       percent=0.95)
+        atol, rtol, percent = 0.1, 0.15, 0.95
     else:
+        atol, rtol = 0.0, 0.10
         percent = 0.8 if dtype_activation == "mxfp8" else 0.85
-        check_accuracy(output_dequant_reference,
-                       output_dequant_actual,
-                       atol=0.0,
-                       rtol=0.10,
-                       percent=percent)
+
+    def check_output(actual: torch.Tensor, reference: torch.Tensor) -> None:
+        actual = actual.to(torch.float)
+        assert torch.isfinite(
+            actual).all(), "MoE output contains non-finite values"
+        assert torch.isfinite(
+            reference).all(), "MoE reference contains non-finite values"
+        check_accuracy(reference, actual, atol=atol, rtol=rtol, percent=percent)
+        if valid_hidden_size is not None:
+            # A dropped final shuffle block must not hide in the global error budget.
+            check_accuracy(reference[:, -32:],
+                           actual[:, -32:],
+                           atol=atol,
+                           rtol=rtol,
+                           percent=percent)
+
+    check_output(output, output_dequant_reference)
+    if check_all_tactics:
+        with AutoTuner.get().capture() as all_tactics:
+            _ = run_moe()
+        tactics = list(all_tactics)
+        assert tactics and all(tactics), "Expected admitted MXFP4 MoE tactics"
+        replay_tactics_and_check(
+            all_tactics=tactics,
+            run_moe_fn=run_moe,
+            check_accuracy_fn=check_output,
+            ref_output=output_dequant_reference,
+            backend_type=MoeBackendType.TRTLLM,
+            quant_algo=QuantAlgo.W4A8_MXFP4_FP8,
+        )
+
+
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
+@pytest.mark.skipif(
+    getSMVersion() != 100,
+    reason="The kernel only supports Blackwell. Current SM is %d." %
+    getSMVersion(),
+)
+@pytest.mark.parametrize("num_tokens", [1, 256, 1024])
+@pytest.mark.parametrize("hidden_size", [512])
+@pytest.mark.parametrize("intermediate_size", [512])
+@pytest.mark.parametrize(
+    "routing_info",
+    [
+        pytest.param(
+            {
+                "num_experts": 16,
+                "top_k": 10,
+                "n_groups": None,
+                "top_k_groups": None,
+                "routed_scaling": None,
+                "has_routing_bias": False,
+                "routing_method_type": RoutingMethodType.Renormalize
+            },
+            id="RoutingRenormalize_qwen_next"),
+        pytest.param(
+            {
+                "num_experts": 16,
+                "top_k": 8,
+                "n_groups": None,
+                "top_k_groups": None,
+                "routed_scaling": None,
+                "has_routing_bias": False,
+                "routing_method_type": RoutingMethodType.Renormalize
+            },
+            id="RoutingRenormalize_topk_8"),
+        pytest.param(
+            {
+                "num_experts": 16,
+                "top_k": 4,
+                "n_groups": None,
+                "top_k_groups": None,
+                "routed_scaling": None,
+                "has_routing_bias": False,
+                "routing_method_type": RoutingMethodType.Renormalize
+            },
+            id="RoutingRenormalize_topk_4"),
+    ],
+)
+@pytest.mark.parametrize("dtype_activation", ["mxfp8", "bf16", "fp8"])
+@pytest.mark.parametrize("act_type_str", ["SwiGlu", "GatedSilu"])
+@pytest.mark.parametrize("use_autotune", [True, False],
+                         ids=["autotune", "no_autotune"])
+@pytest.mark.parametrize("use_topk_as_input", [False, True],
+                         ids=["use_score_as_input", "use_topk_as_input"])
+def test_moe_mxe2m1_weights(
+    num_tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    routing_info: _Mxfp4RoutingInfo,
+    dtype_activation: str,
+    act_type_str: str,
+    use_autotune: bool,
+    use_topk_as_input: bool,
+    valid_hidden_size: int | None = None,
+    valid_intermediate_size: int | None = None,
+) -> None:
+    _run_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
+                            routing_info, dtype_activation, act_type_str,
+                            use_autotune, use_topk_as_input, valid_hidden_size,
+                            valid_intermediate_size)
 
 
 @pytest.mark.skipif(

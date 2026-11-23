@@ -90,11 +90,15 @@ class MlaRopeGeneration(OpWrapper):
     )
 
     note = """
-    Only the fp8-e4m3 latent pool (`quant_mode=128`) is certified. The op also
-    has a bf16-pool path, where `quant_q_buffer` is unused and the roped q lands
-    in `fused_q`'s tail instead; nothing here drives it, so it is not certified
-    -- the prose contract this class replaced claimed it was, with fifteen tests
-    behind the claim and all fifteen on the fp8 path.
+    The cells are the fp8-e4m3 latent pool (`quant_mode=128`). The bf16-pool
+    path, where `quant_q_buffer` is unused and the roped q lands in `fused_q`'s
+    tail instead, is driven for Kimi K3 only: page 64, every scale and quant
+    buffer None, the identity rope table, at 6 / 12 / 24 / 96 heads with one
+    row per sequence, and at 6 heads with 8 rows per sequence (DSpark's token
+    and 7 drafts) handed `predicted_tokens_per_seq` 1 (what the K3 target and
+    the built-in MLA pass at every width) and 8. The Kimi K3 targets' cells
+    in the test file's `TARGET_CELLS` and its
+    `test_bf16_identity_rope_other_shapes` drive them.
 
     The schema annotation is wrong in both directions: it marks `fused_q` and
     `q_pe` mutable, but `q_pe` is never modified and on this path neither is
@@ -105,7 +109,7 @@ class MlaRopeGeneration(OpWrapper):
     Re-running a prepared step is idempotent rather than double-appending: the
     positions come from `sequence_length`, so the same slots are rewritten.
 
-    Not certified: `P` above 4, `block_ids_per_seq` (the flash-MLA layout),
+    Not certified: `P` above 4 on the fp8 pool, `block_ids_per_seq` (the flash-MLA layout),
     helix, `out_scale`, an `attention_window_size` below the KV length, and
     multi-layer pools.
     """

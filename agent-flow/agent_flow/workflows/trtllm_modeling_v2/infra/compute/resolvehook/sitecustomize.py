@@ -45,6 +45,9 @@ def _record(module, spec):
         "time": time.time(),
     }
     log = os.environ.get("MV2FLOW_RESOLVE_LOG")
+    if log and os.environ.get("MV2FLOW_RESOLVE_PER_HOST"):
+        # A rank of a step: one file a node (``steps.RESOLVE_PER_HOST``).
+        log = f"{log}.{os.environ.get('SLURMD_NODENAME') or entry['host']}"
     if log:
         try:
             with open(log, "a", encoding="utf-8") as handle:

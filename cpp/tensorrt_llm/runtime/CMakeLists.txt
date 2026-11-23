@@ -77,8 +77,8 @@ add_library(ipc_nvls_memory_src STATIC ipcNvlsMemory.cu ipcSocket.cpp
                                        mcastGroupComm.cpp)
 add_library(tllm::runtime_ipc_nvls ALIAS ipc_nvls_memory_src)
 target_link_libraries(
-  ipc_nvls_memory_src PUBLIC tllm::common_cuda tllm::runtime_distributed
-                             CUDA::cuda_driver)
+  ipc_nvls_memory_src PUBLIC tllm::common_cuda tllm::common_native_memory
+                             tllm::runtime_distributed CUDA::cuda_driver)
 target_compile_features(ipc_nvls_memory_src PUBLIC cxx_std_20)
 set_target_properties(
   ipc_nvls_memory_src
@@ -121,7 +121,8 @@ add_library(tllm::runtime_host_accessible_memory ALIAS
             tllm_runtime_host_accessible_memory)
 target_link_libraries(
   tllm_runtime_host_accessible_memory
-  PUBLIC tllm::runtime_gdr tllm::runtime_topology Threads::Threads
+  PUBLIC tllm::runtime_gdr tllm::runtime_topology tllm::common_native_memory
+         Threads::Threads
   PRIVATE tllm::common_environment)
 if(NOT WIN32)
   target_link_libraries(tllm_runtime_host_accessible_memory PUBLIC NUMA::NUMA)

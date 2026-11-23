@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Engram FP8 embedding gather with fused UE8M0 dequantization."""
+"""Engram MXFP8 or MXFP4 embedding gather with fused UE8M0 dequantization."""
 
 import functools
 
@@ -36,6 +36,30 @@ def _e4m3x2_to_f32(source, *, loc=None, ip=None):
     return (
         Float32(llvm.extractvalue(T.f32(), out, [0], loc=loc, ip=ip)),
         Float32(llvm.extractvalue(T.f32(), out, [1], loc=loc, ip=ip)),
+    )
+
+
+@dsl_user_op
+def _e2m1x4_to_e4m3x4(source, *, loc=None, ip=None):
+    """The four E2M1 nibbles in the low 16 bits, element 0 lowest, as four E4M3 bytes (exact)."""
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int32(source).ir_value(loc=loc, ip=ip)],
+            "{\n.reg .b32 lo, hi, sel, sign, bit, out;\n"
+            # E4M3 magnitudes of the E2M1 codes 0-7: 0, 0.5, 1, 1.5, 2, 3, 4, 6.
+            "mov.b32 lo, 0x3C383000;\nmov.b32 hi, 0x4C484440;\n"
+            "and.b32 sel, $1, 0x7777;\nprmt.b32 out, lo, hi, sel;\n"
+            "and.b32 sign, $1, 0x8;\nshl.b32 sign, sign, 4;\n"
+            "and.b32 bit, $1, 0x80;\nshl.b32 bit, bit, 8;\nor.b32 sign, sign, bit;\n"
+            "and.b32 bit, $1, 0x800;\nshl.b32 bit, bit, 12;\nor.b32 sign, sign, bit;\n"
+            "and.b32 bit, $1, 0x8000;\nshl.b32 bit, bit, 16;\nor.b32 sign, sign, bit;\n"
+            "or.b32 $0, out, sign;\n}",
+            "=r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
     )
 
 
@@ -77,13 +101,16 @@ class EngramLookupKernel:
     """Gather ``[T * local_heads, dim]`` rows of an E4M3 table and dequantize them.
 
     Row ``r`` reads hash ``ids[r // local_heads, head_start + r % local_heads]``
-    plus its head's bucket offset. Each thread owns one 16-byte column chunk of
+    plus its head's bucket offset. Each thread owns one 16-lane column chunk of
     ``rows_per_thread`` rows and issues all of their table loads before
     converting any, so a CTA keeps that many host-memory reads in flight. A
     grid-stride loop covers the rows with at most ``max_ctas`` CTAs. With ``masked``, rows
     outside ``[vocab_start, vocab_end)`` belong to another shard and are zero.
     With ``packed``, output row ``t`` holds token ``t``'s E4M3 bytes of all local
     heads, then their UE8M0 codes, padded to ``packed_row_bytes``.
+    With ``mxfp4``, the table holds E2M1 pairs, element ``2k`` in byte ``k``'s low nibble; a chunk
+    is 8 bytes, widened exactly to E4M3 once every row's load is issued, so both outputs are
+    those of the E4M3 table.
     """
 
     vector_bytes = 16
@@ -98,15 +125,18 @@ class EngramLookupKernel:
         block_size: int,
         masked: bool,
         packed: bool,
+        mxfp4: bool = False,
     ):
         check_lookup_geometry(dim, block_size)
         self.chunks = dim // self.vector_bytes
         self.head_start = head_start
         self.local_heads = local_heads
         self.dim = dim
+        self.row_bytes = dim // 2 if mxfp4 else dim
         self.block_size = block_size
         self.masked = masked
         self.packed = packed
+        self.mxfp4 = mxfp4
         self.rows_per_wave = self.num_threads // self.chunks
         self.rows_per_iteration = self.rows_per_wave * self.rows_per_thread
 
@@ -165,17 +195,25 @@ class EngramLookupKernel:
                     local[j] = self.table_row(ids, offsets, row, vocab_start, vocab_end)
 
             words = [cute.make_rmem_tensor((4,), Uint32) for _ in range(self.rows_per_thread)]
+            # An E2M1 chunk loads 2 words, widened after every row's load is in flight.
+            loaded = words
+            if cutlass.const_expr(self.mxfp4):
+                loaded = [cute.make_rmem_tensor((2,), Uint32) for _ in range(self.rows_per_thread)]
             codes = cute.make_rmem_tensor((self.rows_per_thread,), Int32)
             for j in cutlass.range_constexpr(self.rows_per_thread):
                 codes[j] = Int32(127)
-                for w in cutlass.range_constexpr(4):
-                    words[j][w] = Uint32(0)
+                for w in cutlass.range_constexpr(self.row_bytes // self.chunks // 4):
+                    loaded[j][w] = Uint32(0)
                 if local[j] >= 0:
-                    self.load_chunk(weight_base, scale, local[j], column, words[j], codes, j)
+                    self.load_chunk(weight_base, scale, local[j], column, loaded[j], codes, j)
 
             for j in cutlass.range_constexpr(self.rows_per_thread):
                 row = base + j * self.rows_per_wave + wave_row
                 if row < num_rows:
+                    if cutlass.const_expr(self.mxfp4):
+                        for w in cutlass.range_constexpr(2):
+                            words[j][2 * w] = _e2m1x4_to_e4m3x4(Int32(loaded[j][w] & 0xFFFF))
+                            words[j][2 * w + 1] = _e2m1x4_to_e4m3x4(Int32(loaded[j][w] >> 16))
                     if cutlass.const_expr(self.packed):
                         self.store_packed(output, row, column, words[j], codes[j])
                     else:
@@ -213,14 +251,23 @@ class EngramLookupKernel:
         codes: cute.Tensor,
         j: cutlass.Constexpr,
     ):
-        """Load one 16-byte E4M3 chunk and its scale code."""
-        source = cute.make_ptr(
-            Uint32,
-            weight_base + local * self.dim + column,
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        )
-        cute.autovec_copy(cute.make_tensor(source, cute.make_layout(4)), words)
+        """Load one 16-lane chunk (4 E4M3 words, or 2 E2M1 words) and its scale code."""
+        if cutlass.const_expr(self.mxfp4):
+            source = cute.make_ptr(
+                Uint32,
+                weight_base + local * self.row_bytes + column // 2,
+                cute.AddressSpace.gmem,
+                assumed_align=8,
+            )
+            cute.autovec_copy(cute.make_tensor(source, cute.make_layout(2)), words)
+        else:
+            source = cute.make_ptr(
+                Uint32,
+                weight_base + local * self.row_bytes + column,
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            cute.autovec_copy(cute.make_tensor(source, cute.make_layout(4)), words)
         codes[j] = Int32(scale[local, column // self.block_size]) & 255
 
     @cute.jit
@@ -300,13 +347,18 @@ def compile_engram_lookup(
     masked: bool,
     output_dtype: torch.dtype,
     packed: bool = False,
+    mxfp4: bool = False,
 ):
-    """Compile the lookup for one table geometry; tensors use TVM-FFI calling."""
+    """Compile the lookup for one table geometry; tensors use TVM-FFI calling. ``mxfp4`` tables hold
+    ``dim // 2`` bytes per row."""
     if output_dtype not in _OUTPUT_DTYPES:
         raise ValueError(f"Engram lookup does not support output dtype {output_dtype}")
     width = packed_row_bytes(local_heads, dim, block_size) if packed else dim
     weight = cute.runtime.make_fake_compact_tensor(
-        cutlass.Uint8, (cute.sym_int(), dim), stride_order=(1, 0), assumed_align=16
+        cutlass.Uint8,
+        (cute.sym_int(), dim // 2 if mxfp4 else dim),
+        stride_order=(1, 0),
+        assumed_align=16,
     )
     scale = cute.runtime.make_fake_compact_tensor(
         cutlass.Uint8, (cute.sym_int(), dim // block_size), stride_order=(1, 0)
@@ -318,7 +370,7 @@ def compile_engram_lookup(
     output = cute.runtime.make_fake_compact_tensor(
         _OUTPUT_DTYPES[output_dtype], (cute.sym_int(), width), stride_order=(1, 0), assumed_align=16
     )
-    kernel = EngramLookupKernel(head_start, local_heads, dim, block_size, masked, packed)
+    kernel = EngramLookupKernel(head_start, local_heads, dim, block_size, masked, packed, mxfp4)
     return cute.compile(
         kernel,
         weight,

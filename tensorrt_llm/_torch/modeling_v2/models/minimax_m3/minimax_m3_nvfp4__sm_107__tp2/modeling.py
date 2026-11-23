@@ -140,6 +140,7 @@ from tensorrt_llm._torch.modeling_v2.models.minimax_m3.config import (
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.config import (
     _validate_runtime as _validate_runtime,
 )
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.native import family_ops
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.activation.m3_silu_and_mul import (
     m3_silu_and_mul,
 )
@@ -561,7 +562,8 @@ KILL_MOE_ENGINE = False
 MOE_ENGINE_MAX_TOKENS = 0 if KILL_MOE_ENGINE else 8
 # The engine's push of its sum into the MoE boundary's multicast all-reduce (prepushed mode 2) on the rows the
 # engine serves, with the multicast boundary (DECODE_PLANS' moe_mc_ar): the boundary reads the pushed words instead
-# of loading and pushing the rows itself. Bit for bit the unpushed boundary (comm/_m3_moe_push_op_matrix.py).
+# of loading and pushing the rows itself. Bit for bit the unpushed boundary; see:
+# tests/unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/ops/comm/_m3_moe_push_op_matrix.py
 MOE_PUSH_MAX_TOKENS = MOE_ENGINE_MAX_TOKENS if MC_AR_TP2 else 0
 # When the engine pushes its sum into the boundary all-reduce, every CTA releases the PDL dependents right after its
 # grid dependency wait instead of after the push, so the all-reduce (which polls the pushed tagged words, not the grid)
@@ -752,8 +754,8 @@ MX_GEMV_TP2 = True
 # AutoTuner's per-start choice (whose L2-hot profiling left c2 bimodal at +-6%): FlashInfer's CuTe DSL quantize and
 # CuTe DSL GEMM. Stock's candidates per bucket are quantize {TRT-LLM, CuTe DSL} x GEMM {CUTLASS, CuTe DSL}; on SM107
 # every TP2 projection at 1..16 rows runs fastest on this pair, cold and L2-hot (graph us, cold: 4.7..10.3 against
-# 5.0..11.5 with the TRT-LLM quantize and 9.7..58 with CUTLASS), and all four candidates give the same bits (quantize
-# bytes and scales, GEMM outputs). A constant is rank-agreed and start-independent by construction.
+# 5.0..11.5 with the TRT-LLM quantize and 9.7..58 with CUTLASS). The quantizers match bitwise; GEMM outputs from
+# different tactics can differ. A constant is rank-agreed and start-independent by construction.
 # False returns these projections to the AutoTuner.
 MXFP8_DECODE_QUANT_TACTIC = 0  # MXFP8QuantizeRunner.CUTE_DSL
 MXFP8_DECODE_GEMM_TACTIC = 0  # FlashInferMXFP8GemmRunner.CUTE_DSL
@@ -1472,8 +1474,8 @@ def _linear(
     (``MXFP8_DECODE_QUANT_TACTIC`` / ``MXFP8_DECODE_GEMM_TACTIC``: FlashInfer's CuTe DSL quantize and CuTe DSL GEMM)
     instead of the AutoTuner's per-start choice (whose L2-hot profiling left c2 bimodal at +-6%). On SM107 every TP2
     projection at 1..16 rows runs fastest on this pair, cold and L2-hot (graph us, cold: 4.7..10.3 against 5.0..11.5
-    with the TRT-LLM quantize and 9.7..58 with CUTLASS), and all four candidates give the same bits (quantize bytes
-    and scales, GEMM outputs). A constant is rank-agreed and start-independent by construction.
+    with the TRT-LLM quantize and 9.7..58 with CUTLASS). The quantizers match bitwise; GEMM outputs from different
+    tactics can differ. A constant is rank-agreed and start-independent by construction.
 
     A kernel declining rows its path covers is a miss; the chain then continues down the list. ``push`` (an
     ``m3_mx_gemv`` ``ar`` tuple) is the boundary all-reduce exchange the GEMV writes its rows into. ``low_m_gemm``
@@ -5846,7 +5848,12 @@ class M3Eagle3Worker(Eagle3OneModelWorker):
         )
 
     def greedy_sample_draft_with_tp_gather(
-        self, logits: torch.Tensor, spec_metadata=None, mapping_lm_head_tp=None, tokens_out=None
+        self,
+        logits: torch.Tensor,
+        spec_metadata=None,
+        mapping_lm_head_tp=None,
+        tokens_out=None,
+        vocab_sharded=None,
     ) -> torch.Tensor:
         """W2b (``WIDE_SPEC_TAIL``): the in-tree draft loop's greedy top-1 over this rank's vocab shard of the drafter
         logits, from the fused shard argmax + cross-rank key exchange (ops/m3_shard_accept at draft length 0, at
@@ -5861,7 +5868,11 @@ class M3Eagle3Worker(Eagle3OneModelWorker):
             and logits.dim() == 2
             and logits.dtype == torch.bfloat16
             and logits.stride(-1) == 1
-            and self._draft_logits_are_sharded(logits, spec_metadata)
+            and (
+                self._draft_logits_are_sharded(logits, spec_metadata)
+                if vocab_sharded is None
+                else vocab_sharded
+            )
         ):
             m = logits.shape[0]
             empty = torch.empty((m, 0), dtype=torch.int32, device=logits.device)
@@ -5878,7 +5889,11 @@ class M3Eagle3Worker(Eagle3OneModelWorker):
                 _log_engaged("m3_draft_shard_top1", self.mapping)
         if tokens is None:
             return super().greedy_sample_draft_with_tp_gather(
-                logits, spec_metadata, mapping_lm_head_tp, tokens_out=tokens_out
+                logits,
+                spec_metadata,
+                mapping_lm_head_tp,
+                tokens_out=tokens_out,
+                vocab_sharded=vocab_sharded,
             )
         return self._tokens_into(tokens, tokens_out)
 
@@ -6088,6 +6103,9 @@ class ModelingV2MiniMaxM3Nvfp4Sm107Tp2(
             f"this target is built for sm_{_SM[0]}{_SM[1]}, the device is sm_"
             f"{''.join(map(str, torch.cuda.get_device_capability()))}"
         )
+        # The fused all-reduces and the long-context sparse decode (LC2) run the family library's fixed copies: an
+        # installation without the library refuses here (NoTarget), and modeling_v2='auto' keeps the built-in model.
+        family_ops()
         # Under modeling_v2='require' a covered decode shape that cannot take its fast path raises.
         set_require(resolved_mode(type(self)) is ModelingV2Mode.REQUIRE)
         model_config = _text_model_config(model_config)

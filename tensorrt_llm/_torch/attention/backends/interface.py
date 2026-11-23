@@ -198,6 +198,12 @@ class AttentionMetadata:
     # This buffer is currently only used for TrtllmAttentionMetadata.
     cache_indirection: Optional[torch.Tensor] = None
     cuda_graph_buffers: dict[str, list[torch.Tensor]] = None
+    forward_scratch_buffers: Optional[Buffers] = None
+    """Runner-local storage shared across graphs within one forward, not persistent state.
+
+    Warmup registers capacity; capture must not grow it. CUDAGraphRunner.clear()
+    releases the pool, unlike the potentially process-wide cuda_graph_buffers.
+    """
 
     _saved_tensors: Dict[str, torch.Tensor] = field(init=False,
                                                     default_factory=dict)
@@ -498,7 +504,8 @@ class AttentionMetadata:
 
         if self.mamba_metadata is None:
             if isinstance(self.kv_cache_manager, BaseMambaCacheManager):
-                metadata_cls = self.mamba_metadata_cls
+                metadata_cls = self.mamba_metadata_cls or getattr(
+                    self.kv_cache_manager, "mamba_metadata_cls", None)
                 if metadata_cls is None:
                     from ...modules.mamba.mamba2_metadata import Mamba2Metadata
                     metadata_cls = Mamba2Metadata
@@ -512,17 +519,25 @@ class AttentionMetadata:
 
         self.mamba_metadata.prepare(self)
 
-    def create_cuda_graph_metadata(self,
-                                   max_batch_size: int,
-                                   sub_cross_metadata: bool = False,
-                                   max_draft_tokens: int = 0,
-                                   buffers=None,
-                                   encode_only: bool = False) -> Self:
+    def create_cuda_graph_metadata(
+            self,
+            max_batch_size: int,
+            sub_cross_metadata: bool = False,
+            max_draft_tokens: int = 0,
+            buffers=None,
+            encode_only: bool = False,
+            *,
+            forward_scratch_buffers: Optional[Buffers] = None) -> Self:
         """
         Creates metadata for CUDA graph execution.
         CUDA graphs require to use pre-allocated buffers for all tensors in fields.
         Please do not re-allocate any tensors stored inside AttentionMetadata
         after the initial warmup run when you're using CUDA graphs.
+
+        forward_scratch_buffers belongs to the caller's runner and is shared by
+        its graphs within one forward. Warmup must register capacity before
+        capture; persistent state must not use this pool. The runner releases
+        it in clear(), independently of cuda_graph_buffers.
 
         When encode_only is True, initialize seq_lens as ones(max_batch_size)
         and leave num_contexts at the caller's discretion.
@@ -533,9 +548,15 @@ class AttentionMetadata:
         cuda_graph_metadata = copy.copy(self)
         cuda_graph_metadata.is_cuda_graph = True
         cuda_graph_metadata.cuda_graph_buffers = buffers
+        cuda_graph_metadata.forward_scratch_buffers = forward_scratch_buffers
         if self.has_cross_sub_metadata:
             cuda_graph_metadata.cross = cuda_graph_metadata.cross.create_cuda_graph_metadata(
-                max_batch_size, True, max_draft_tokens, buffers, encode_only)
+                max_batch_size,
+                True,
+                max_draft_tokens,
+                buffers,
+                encode_only,
+                forward_scratch_buffers=forward_scratch_buffers)
         if not sub_cross_metadata:
             # Set to None to force the cuda graph metadata to allocate a tensor
             # with the correct batch size. See seq_lens setter for how this works.
@@ -1106,11 +1127,16 @@ class AttentionForwardArgs:
     mrope_rotary_cos_sin: Optional[torch.Tensor] = None
     mrope_position_deltas: Optional[torch.Tensor] = cpp_field(dtype=torch.int32)
     softmax_stats_tensor: Optional[torch.Tensor] = None
+    # Output tag: a provider may write compact base-2 LSE into the first half
+    # of the caller's pair-capacity buffer. Other providers retain max/sum.
+    softmax_stats_is_lse: bool = False
     attention_sinks: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
     cu_q_seqlens: Optional[torch.Tensor] = cpp_field(dtype=torch.int32)
     cu_kv_seqlens: Optional[torch.Tensor] = cpp_field(dtype=torch.int32)
     fmha_scheduler_counter: Optional[torch.Tensor] = cpp_field(
         dtype=torch.uint32)
+    # Locality domain this call runs against; -1 means the whole batch.
+    locality_domain_id: int = -1
     mla_bmm1_scale: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
     mla_bmm2_scale: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
     quant_q_buffer: Optional[torch.Tensor] = None
@@ -1188,6 +1214,14 @@ class AttentionForwardArgs:
     sparse_backend_args: Optional[SparseBackendForwardArgs] = None
     sparse_runtime_params: SparseRuntimeParams = field(
         default_factory=SparseRuntimeParams)
+
+    @property
+    def softmax_stats(self) -> Optional[torch.Tensor]:
+        """Return the written normalizer view, with final width one for base-2 LSE."""
+        stats = self.softmax_stats_tensor
+        if stats is None or not self.softmax_stats_is_lse:
+            return stats
+        return stats.view(-1)[:stats.numel() // 2].view(*stats.shape[:-1], 1)
 
     @property
     def mask_type(self) -> int:
@@ -1268,6 +1302,11 @@ class AttentionBackend(Generic[TMetadata]):
         """
         self.quant_config = new_quant_config
 
+    def runs_without_host_plan(self, metadata: TMetadata) -> bool:
+        """Whether a forward over ``metadata`` reads all its inputs on the device, so a CUDA graph
+        can capture it without host-side preparation at replay."""
+        return False
+
     def forward(self,
                 q: torch.Tensor,
                 k: Optional[torch.Tensor],
@@ -1339,6 +1378,36 @@ class AttentionBackend(Generic[TMetadata]):
         that prefix.
         """
         return True
+
+    @classmethod
+    def runtime_workspace_min_tokens(
+        cls,
+        model_config: "ModelConfig",
+        mapping: Mapping,
+        *,
+        max_num_tokens: int,
+        runtime_features: AttentionRuntimeFeatures,
+    ) -> int:
+        """Minimum tokens priced at ``runtime_workspace_bytes_per_token``.
+
+        The estimator calls this only for a nonzero per-token workspace rate
+        with an admission cap. It subtracts staging actually covered by the
+        profiling peak before reserving additional memory. Backends whose
+        workspace is not chunk-bounded return zero, as does the default.
+        """
+        return 0
+
+    @classmethod
+    def runtime_workspace_profiled_tokens(
+        cls,
+        model_config: "ModelConfig",
+        *,
+        profiled_prompt_len: int,
+        max_num_tokens: int,
+        max_batch_size: int,
+    ) -> int:
+        """Workspace tokens actually staged by the fresh-prefill profiling path."""
+        return 0
 
     @classmethod
     def runtime_workspace_fixed_bytes(

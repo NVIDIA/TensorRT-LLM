@@ -65,7 +65,8 @@ class Qwen4ExpHcLowrankAct(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # spec: rows, inject (True), hc_count (4), rank (320), logits_width (384), dtype (bf16).
+    # spec: rows, inject (True), hc_count (4), rank (320), logits_width (384), dtype (bf16),
+    # capture (False: eager; True: replayed from a captured CUDA graph over two steps' logits).
     # The default target's HC mixers run this form on the fresh fp32 `cublas_mm` output
     # over the first `hc_first_cols` = ceil((320 + 4) / 32) * 32 = 352 columns of the
     # first projection: hence the 352-wide cells.
@@ -93,6 +94,21 @@ class Qwen4ExpHcLowrankAct(OpWrapper):
             why="default stack-final mixer (no inject): one decode token",
             spec=dict(rows=1, inject=False, logits_width=352),
         ),
+        # The FP8 unified target's HC mixers in its captured graphs at 641..3071 rows (e.g. the
+        # breakable prefill buckets): fewer rows run `qwen4_exp_hc_decode_tc_first`, more the
+        # rstd form.
+        Cell(
+            why="FP8 unified captured prefill HC mixer, 641 rows: 352-wide logits",
+            spec=dict(rows=641, logits_width=352, capture=True),
+        ),
+        Cell(
+            why="FP8 unified captured prefill HC mixer, 1024 rows: 352-wide logits",
+            spec=dict(rows=1024, logits_width=352, capture=True),
+        ),
+        Cell(
+            why="FP8 unified captured prefill HC mixer, 3071 rows (the largest): 352-wide",
+            spec=dict(rows=3071, logits_width=352, capture=True),
+        ),
     )
 
     note = """
@@ -107,20 +123,25 @@ class Qwen4ExpHcLowrankAct(OpWrapper):
     Preconditions: `logits` fp32, unit column stride, at least
     `rank (+ hc_count)` columns; `hc_count` a power of two. Graph-capturable.
 
+    CUDA-graph capture (the `capture` cells): the replay is bitwise the eager
+    call, and a second step's logits replay bitwise their own eager call.
+
     Source: a Triton kernel JIT-compiled at first call for the running device;
     the cells ran on sm_103. One program per row with an int64 row offset;
     2^31 elements is 6.1e6 rows of 352, far past the envelope.
 
     Certified: bf16 outputs from fp32 logits 352 wide (the call site) at 1, 32,
     1024 and 8192 rows with the injection and at 1 row without it, and 384 wide
-    at 128 and 8192 rows (without the injection at 8192); graph replay.
+    at 128 and 8192 rows (without the injection at 8192); graph replay, and
+    captured at 641, 1024 and 3071 rows 352 wide.
     Against the float64 reference: bitwise at 1, 32 and 128 rows; at 1024 and
     8192 rows at most 0.99 ulp on a few `low` elements, relative L2 <= 1.6e-5.
 
     Not certified: zero rows; rows past 8192; hc_count other than 4; rank
     other than 320; float16 outputs. The kernel has no row-count switch, so row
     counts between the cells take the same path, and the logits width enters
-    only as the row stride (128 rows is driven at 384 wide only).
+    only as the row stride. Not driven under capture: the form without the
+    injection, and the other captured batches.
     """
 
     def __call__(

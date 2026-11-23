@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -12,6 +15,10 @@ from tensorrt_llm.bench.dataclasses.general import (DatasetMetadata,
 from tensorrt_llm.bench.tuning import settings
 from tensorrt_llm.bench.tuning.dataclasses import (NemotronHybridConfig,
                                                    Qwen3HybridConfig)
+from tensorrt_llm.bench.tuning.settings import (get_benchmark_engine_settings,
+                                                get_model_config,
+                                                load_runtime_model_config)
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.version import __version__
@@ -22,6 +29,42 @@ _KV_CACHE_MAP = {
 }
 
 ALL_SUPPORTED_BACKENDS = ["pytorch"]
+
+
+def _tuning_model_configs(model: str, model_path: Union[Path, None],
+                          checkpoint_format: Union[str, None]):
+    """Read the model configurations the tuning heuristic needs.
+
+    A Mistral-native checkpoint is read the way the runtime loads it: params.json
+    and the consolidated safetensors files. When those cannot be read, its
+    config.json is read instead.
+
+    Returns:
+        The benchmark model configuration and the runtime model configuration.
+
+    Raises:
+        ValueError: When a local Mistral-native checkpoint can be read neither
+            from its native files nor from a config.json.
+    """
+    checkpoint = model_path or model
+    if checkpoint_format in (CheckpointFormat.MISTRAL,
+                             CheckpointFormat.MISTRAL_LARGE_3):
+        try:
+            return (get_model_config(model, model_path, checkpoint_format),
+                    load_runtime_model_config(checkpoint, checkpoint_format))
+        except (ValueError, RuntimeError) as e:
+            if (Path(checkpoint).is_dir()
+                    and not (Path(checkpoint) / "config.json").is_file()):
+                raise ValueError(
+                    f"checkpoint_format={checkpoint_format}: the tuning heuristic "
+                    f"cannot read {checkpoint} ({e}), and it has no config.json; "
+                    "pass --max_batch_size and --max_num_tokens") from e
+            logger.warning(
+                f"checkpoint_format={checkpoint_format}: the tuning heuristic "
+                f"cannot read the native files of {checkpoint} ({e}); reading "
+                "its config.json instead")
+    model_config = get_model_config(model, model_path)
+    return model_config, load_runtime_model_config(checkpoint)
 
 
 def get_settings(
@@ -45,6 +88,7 @@ def get_settings(
     extra_llm_api_options = params.get("extra_llm_api_options")
     enable_chunked_prefill = params.get("enable_chunked_prefill", False)
     enable_attention_dp = False
+    checkpoint_format = None
 
     kv_cache_dtype = "auto"
     mamba_ssm_cache_dtype = params.get("mamba_ssm_cache_dtype", "auto")
@@ -67,6 +111,7 @@ def get_settings(
         enable_chunked_prefill = llm_args_dict.get("enable_chunked_prefill",
                                                    enable_chunked_prefill)
         enable_attention_dp = llm_args_dict.get("enable_attention_dp", False)
+        checkpoint_format = llm_args_dict.get("checkpoint_format")
 
     mapping = {
         "pp_size": params.get("pp"),
@@ -86,17 +131,13 @@ def get_settings(
             f"Initial settings: max_batch_size={max_batch_size} (user-provided), "
             f"max_num_tokens={max_num_tokens} (user-provided).")
     else:
-        model_config = settings.get_model_config(model, model_path)
+        model_config, tllm_model_config = _tuning_model_configs(
+            model, model_path, checkpoint_format)
 
         if isinstance(model_config,
                       (NemotronHybridConfig, Qwen3HybridConfig
                        )) and mamba_ssm_cache_dtype not in (None, "auto"):
             model_config.set_mamba_ssm_cache_dtype(mamba_ssm_cache_dtype)
-
-        from tensorrt_llm._torch.model_config import ModelConfig
-        model = model_path or model
-        tllm_model_config = ModelConfig.from_pretrained(model,
-                                                        trust_remote_code=True)
 
         if (kv_cache_dtype is None
                 and tllm_model_config.quant_config.kv_cache_quant_algo is None):
@@ -105,10 +146,10 @@ def get_settings(
 
         tllm_model_config = settings.resolve_benchmark_kv_cache_quant(
             tllm_model_config,
-            model,
+            model_path or model,
             kv_cache_dtype,
             {
-                "model": model,
+                "model": model_path or model,
                 "trust_remote_code": True,
                 "skip_tokenizer_init": True,
                 "tensor_parallel_size": mapping["tp_size"],
@@ -124,7 +165,7 @@ def get_settings(
             explicit_cli_keys=explicit_cli_keys,
         )
 
-        max_batch_size, max_num_tokens = settings.get_benchmark_engine_settings(
+        max_batch_size, max_num_tokens = get_benchmark_engine_settings(
             model_config,
             tllm_model_config.quant_config,
             params.get("tp"),

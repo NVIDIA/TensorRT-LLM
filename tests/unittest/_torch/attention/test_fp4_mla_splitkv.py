@@ -105,6 +105,9 @@ def test_splitkv_reduce_strides_empty_splits_and_graph_replay(
 
 def test_splitkv_workspace_is_shared_across_graph_buckets() -> None:
     """Every graph bucket gets views of one capacity-sized workspace set (layout._ensure_workspace_tensor)."""
+    from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
+    from tensorrt_llm._torch.memory_buffer_utils import Buffers
+
     adapter = _module("fp4_mla_splitkv")
     heads, columns, splits, query_capacity = 128, 512, 4, 32
 
@@ -123,7 +126,10 @@ def test_splitkv_workspace_is_shared_across_graph_buckets() -> None:
         run_trtllm_fp4_mla_decode_page_native_from_raw=partial_launch,
     )
     base_metadata = SimpleNamespace(
-        is_cuda_graph=False, fp4_mla_state=SimpleNamespace(workspaces={})
+        is_cuda_graph=False,
+        fp4_mla_state=SimpleNamespace(workspaces={}),
+        forward_scratch_buffers=Buffers(),
+        get_empty=AttentionMetadata.get_empty,
     )
     buckets = []
     shared_pointers: dict[str, int] = {}
@@ -196,6 +202,12 @@ def test_splitkv_workspace_is_shared_across_graph_buckets() -> None:
             tensor = workspace[f"_fp4_mla_splitkv_{name}"]
             assert tensor.numel() == size
             assert shared_pointers.setdefault(name, tensor.data_ptr()) == tensor.data_ptr()
+            blocks = metadata.forward_scratch_buffers.buffers[
+                f"fp4_mla_decode_fp4_mla_splitkv_{name}"
+            ]
+            assert len(blocks) == 1
+            assert blocks[0].is_reserved
+            assert blocks[0].buffer.numel() == size * tensor.element_size()
         pointers = {key: value.data_ptr() for key, value in workspace.items()}
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):

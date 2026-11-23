@@ -40,6 +40,7 @@ from transformers import AutoProcessor
 
 from tensorrt_llm._startup import _StartupTimer
 from tensorrt_llm._torch.async_llm import AsyncLLM
+from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._utils import EnergyMonitor
 from tensorrt_llm.checkpoint_format import CheckpointFormat
 # yapf: disable
@@ -69,6 +70,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.media.encoding import image_to_bytes
 from tensorrt_llm.media.tensor_payload import is_tensor_format
 from tensorrt_llm.metrics.collector import MetricsCollector
+from tensorrt_llm.metrics.perf import PerfMetricsCollector
 from tensorrt_llm.metrics.perf_utils import (_record_input_processing,
                                              _start_input_processing,
                                              _time_input_processing)
@@ -120,7 +122,7 @@ from tensorrt_llm.serve.openai_protocol import (
     RerankUsageInfo, RerankV2Request, RerankV2Response, RerankV2Result,
     ResponseFormat, ResponsesRequest, ResponsesResponse,
     RuntimeMemoryUpdateRequest, StartProfileRequest, TokenizeRequest,
-    TokenizeResponse, UpdateWeightsRequest, UsageInfo,
+    TokenizeResponse, UpdateWeightsRequest, UsageInfo, VideoGenerationRequest,
     ensure_request_chat_template_allowed, to_llm_conversation_params,
     to_llm_disaggregated_params)
 from tensorrt_llm.serve.openai_video_routes import _VideoRoutesMixin
@@ -140,7 +142,7 @@ from tensorrt_llm.serve.render import (HarmonyConversionError, RenderResources,
                                        mount_render_endpoints,
                                        prepare_chat_request, render_chat,
                                        render_chat_for_length,
-                                       render_conversation)
+                                       render_conversation_with_media)
 from tensorrt_llm.serve.reranker import (Qwen3RerankInputBuilder,
                                          rerank_probability)
 from tensorrt_llm.serve.responses_utils import (ClosingStreamingResponse,
@@ -163,8 +165,10 @@ from tensorrt_llm.serve.tokenization_owners import (TokenizationOwners,
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
 from tensorrt_llm.serve.visual_gen_metrics import (
     build_visual_gen_server_timings, build_visual_gen_timing_headers)
-from tensorrt_llm.serve.visual_gen_utils import (local_media_path_is_disallowed,
-                                                 parse_visual_gen_params)
+from tensorrt_llm.serve.visual_gen_utils import (check_path_response_policy,
+                                                 parse_visual_gen_params,
+                                                 path_response_is_disabled,
+                                                 request_reads_files)
 from tensorrt_llm.usage import TerminalOutcome, record_termination_observation
 from tensorrt_llm.version import __version__ as VERSION
 
@@ -176,7 +180,7 @@ from .harmony_adapter import HarmonyAdapter, get_harmony_adapter
 from .kv_hints import KvHintsRequest, KvHintsRoute
 
 if TYPE_CHECKING:
-    from tensorrt_llm.visual_gen import VisualGen
+    from tensorrt_llm.visual_gen import VisualGen, VisualGenParams
 
 
 def _preprocess_in_conversation(
@@ -705,6 +709,9 @@ class OpenAIServer(_VideoRoutesMixin):
                     merged.setdefault(modality, {}).update(kw)
                 cfg.media_io_kwargs = merged
                 self.multimodal_server_config = cfg
+        if self._is_visual_gen:
+            check_path_response_policy()
+
         self.allow_request_chat_template = allow_request_chat_template
         self._internal_disagg_auth_key = internal_disagg_auth_key
         self._enable_rl_control_endpoints = enable_rl_control_endpoints
@@ -712,6 +719,8 @@ class OpenAIServer(_VideoRoutesMixin):
         self._enable_runtime_control_endpoints = enable_runtime_control_endpoints
         self._runtime_control_api_key = runtime_control_api_key
         self._runtime_control_replay_cache = RuntimeControlReplayCache()
+        # The gather in flight for GET /memory_report, shared by concurrent requests.
+        self._memory_report_task: Optional[asyncio.Future] = None
         self.server_role = server_role
         # Will be set in __call__
         self.binding_addr = None
@@ -919,6 +928,8 @@ class OpenAIServer(_VideoRoutesMixin):
             # down; the /metrics handler already treats that as no stats.
             self._metrics_stats_executor.shutdown(wait=False,
                                                   cancel_futures=True)
+            BaseMediaIO.clear_executor(self._media_load_executor)
+            self._media_load_executor.shutdown(wait=False, cancel_futures=True)
 
         self.app = FastAPI(lifespan=lifespan)
         self.app.state.trust_kv_hints = os.getenv("TRTLLM_TRUST_KV_HINTS",
@@ -1390,6 +1401,7 @@ class OpenAIServer(_VideoRoutesMixin):
                                methods=["POST"])
 
         self._register_runtime_control_routes()
+        self._register_memory_report_route()
         self._register_rl_control_routes()
         self.app.add_api_route("/server_info",
                                self.get_server_info,
@@ -1466,6 +1478,47 @@ class OpenAIServer(_VideoRoutesMixin):
                 status_code=HTTPStatus.UNAUTHORIZED,
                 detail=str(error),
             ) from error
+
+    def _register_memory_report_route(self) -> None:
+        """Serve ``GET /memory_report`` in the GPU memory monitor's full mode.
+
+        A report exposes process IDs, other processes' device usage and, in
+        stack mode, source paths, and each request makes every rank build a
+        report next to its executor loop. The route therefore takes the
+        runtime-control request signing, like ``/memory_status``, and exists
+        only when ``memory_monitor_config`` selects full mode (the
+        arguments fold ``TLLM_MEM_MONITOR`` into it) and a runtime-control
+        key is set. Sleep mode is not needed. The key is the
+        server's ``runtime_control_api_key`` or, failing that,
+        ``TRTLLM_RUNTIME_CONTROL_API_KEY``. With several frontends the route
+        is not served, since each frontend keeps its own replay cache. The
+        frontend is rank 0 and serves every rank's report, so
+        ``TLLM_MEM_MONITOR_RANKS`` does not decide whether it exists.
+        """
+        from tensorrt_llm._torch.memory.monitor.settings import full_mode_in
+
+        args = self.generator.args
+        if not full_mode_in(getattr(args, "memory_monitor_config", None)):
+            return
+        api_key = (self._runtime_control_api_key
+                   or os.getenv("TRTLLM_RUNTIME_CONTROL_API_KEY"))
+        if not api_key:
+            logger.info(
+                "GET /memory_report is not served: set "
+                "TRTLLM_RUNTIME_CONTROL_API_KEY to serve it with signed "
+                "requests. LLM.get_memory_report() returns the same reports.")
+            return
+        if args.num_serve_frontends > 1:
+            logger.info(
+                "GET /memory_report is not served with num_serve_frontends > "
+                "1: request signing keeps its replay cache per frontend.")
+            return
+        self._runtime_control_api_key = api_key
+        self.app.add_api_route(
+            "/memory_report",
+            self.memory_report,
+            methods=["GET"],
+            dependencies=[Depends(self._require_runtime_control_auth)])
 
     def _register_runtime_control_routes(self) -> None:
         if not self._enable_runtime_control_endpoints:
@@ -1594,16 +1647,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 token_ids_list.append(token_ids)
 
             try:
-                # Validate every input's length up front so an oversize item fails
-                # the whole request before any item is enqueued — otherwise gather()
-                # cancels the awaiters but their already-queued inputs still run
-                # encode() (wasted GPU work).
-                for token_ids in token_ids_list:
-                    self.encode_batcher.validate_input(token_ids)
-                results = await asyncio.gather(*[
-                    self.encode_batcher.submit(token_ids)
-                    for token_ids in token_ids_list
-                ])
+                results = await self.encode_batcher.submit_many(token_ids_list)
             except InputTooLongError as e:
                 return self.create_error_response(
                     str(e), status_code=HTTPStatus.BAD_REQUEST)
@@ -2101,7 +2145,11 @@ class OpenAIServer(_VideoRoutesMixin):
             if record is not None and raw_request is not None:
                 raw_request.state.perf_metrics_records.append(record)
         if self.metrics_collector:
-            if res.candidate_metrics:
+            records = getattr(res, "candidate_metric_records", None)
+            if records:
+                for record in records:
+                    self.metrics_collector.emit(record)
+            elif res.candidate_metrics:
                 for candidate_m in res.candidate_metrics:
                     self.metrics_collector.log_request_metrics_dict(candidate_m)
             elif res.metrics_dict:
@@ -2222,7 +2270,8 @@ class OpenAIServer(_VideoRoutesMixin):
             self, "_spec_decode_num_spec_tokens", None)
 
     def _record_iteration_stat(self, llm_stat: dict) -> None:
-        self.metrics_collector.log_iteration_stats(llm_stat)
+        self.metrics_collector.emit(
+            PerfMetricsCollector.collect_iteration(llm_stat))
         # Tee into the /metrics snapshot buffer so the HTTP handler can serve
         # without competing for the engine queue (nvbug 6102381).
         if self._iteration_stats_buffer is not None:
@@ -2552,24 +2601,34 @@ class OpenAIServer(_VideoRoutesMixin):
                 prompt = request.prompt_token_ids
             else:
                 # Render (and append the forced named-tool prefix, see
-                # ``_build_forced_tool_call_decoding``) while the media loads.
+                # ``_build_forced_tool_call_decoding``) while the media loads,
+                # or once it has loaded for a renderer that needs it.
                 # Tokenization stays with the engine's input processor.
-                render_task = render_conversation(
-                    render_resources,
-                    conversation=conversation,
-                    mm_placeholder_counts=mm_placeholder_counts,
-                    add_generation_prompt=request.add_generation_prompt,
-                    tools=tool_dicts,
-                    documents=request.documents,
-                    chat_template=request.chat_template,
-                    chat_template_kwargs=request.chat_template_kwargs,
-                    injected_chat_template_kwargs=request.
-                    injected_chat_template_kwargs,
-                    forced_prefix=forced_tool_begin_prefix,
-                )
-                rendered, (mm_data, mm_embeddings) = await asyncio.gather(
-                    render_task, mm_coroutines)
+                rendered, (
+                    mm_data,
+                    mm_embeddings) = await render_conversation_with_media(
+                        render_resources,
+                        mm_coroutines,
+                        conversation=conversation,
+                        mm_placeholder_counts=mm_placeholder_counts,
+                        add_generation_prompt=request.add_generation_prompt,
+                        tools=tool_dicts,
+                        documents=request.documents,
+                        chat_template=request.chat_template,
+                        chat_template_kwargs=request.chat_template_kwargs,
+                        injected_chat_template_kwargs=request.
+                        injected_chat_template_kwargs,
+                        forced_prefix=forced_tool_begin_prefix,
+                        truncate_prompt_tokens=request.truncate_prompt_tokens,
+                    )
                 if rendered.text is None:
+                    if forced_tool_begin_prefix is not None:
+                        # The prefix is text; appending it to rendered token
+                        # ids would need a re-encode that loses control tokens.
+                        raise ValueError(
+                            "tool_choice with a named function is not "
+                            "supported for this model, whose chat template "
+                            "renders token ids.")
                     prompt = rendered.token_ids
                 else:
                     prompt = rendered.text
@@ -3060,9 +3119,16 @@ class OpenAIServer(_VideoRoutesMixin):
         async def create_mm_embedding_response(promise: RequestOutput):
             await promise.aresult()
             # TODO: Replace mm_embedding_handles with a dedicated OpenAIBaseModel(JSON-safe), when enable multimodal disagg E2E
-            mm_embedding_handles = (
-                promise.disaggregated_params.multimodal_embedding_handles
-                if promise.disaggregated_params else None)
+            params = promise.disaggregated_params
+            mm_embedding_handles = (params.multimodal_embedding_handles
+                                    if params else None)
+            # The response returns only the embedding handles; release the
+            # exports no caller can open.
+            if params is not None:
+                for handle in (params.mrope_position_ids_handle,
+                               params.mrope_position_deltas_handle):
+                    if handle is not None:
+                        SharedTensorContainer.release_dict(handle)
             if not mm_embedding_handles:
                 return self.create_error_response(
                     message="Multimodal embedding handle missing in response",
@@ -3130,20 +3196,21 @@ class OpenAIServer(_VideoRoutesMixin):
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
             else:
-                render_task = render_conversation(
-                    render_resources,
-                    conversation=conversation,
-                    mm_placeholder_counts=mm_placeholder_counts,
-                    add_generation_prompt=request.add_generation_prompt,
-                    tools=tool_dicts,
-                    documents=request.documents,
-                    chat_template=request.chat_template,
-                    chat_template_kwargs=request.chat_template_kwargs,
-                    injected_chat_template_kwargs=request.
-                    injected_chat_template_kwargs,
-                )
-                rendered, (mm_data, mm_embeddings) = await asyncio.gather(
-                    render_task, mm_coroutines)
+                rendered, (
+                    mm_data,
+                    mm_embeddings) = await render_conversation_with_media(
+                        render_resources,
+                        mm_coroutines,
+                        conversation=conversation,
+                        mm_placeholder_counts=mm_placeholder_counts,
+                        add_generation_prompt=request.add_generation_prompt,
+                        tools=tool_dicts,
+                        documents=request.documents,
+                        chat_template=request.chat_template,
+                        chat_template_kwargs=request.chat_template_kwargs,
+                        injected_chat_template_kwargs=request.
+                        injected_chat_template_kwargs,
+                    )
                 prompt = (rendered.text
                           if rendered.text is not None else rendered.token_ids)
             prompt = prompt_inputs(prompt)
@@ -4007,12 +4074,12 @@ class OpenAIServer(_VideoRoutesMixin):
                                 "message": str(error)
                             }})
 
-    async def _call_runtime_memory_method(self, method: str,
-                                          tags: Optional[List[str]]) -> object:
+    async def _call_runtime_memory_method(self, method: str, *args:
+                                          object) -> object:
         operation = getattr(self.generator, method)
         if isinstance(self.generator, AsyncLLM):
-            return await operation(tags)
-        return await asyncio.to_thread(operation, tags)
+            return await operation(*args)
+        return await asyncio.to_thread(operation, *args)
 
     async def runtime_release_memory(
         self,
@@ -4042,17 +4109,35 @@ class OpenAIServer(_VideoRoutesMixin):
 
     async def runtime_memory_status(self) -> JSONResponse:
         try:
-            if isinstance(self.generator, AsyncLLM):
-                status = await self.generator.get_memory_status()
-            else:
-                status = await asyncio.to_thread(
-                    self.generator.get_memory_status)
+            status = await self._call_runtime_memory_method("get_memory_status")
         except Exception as error:
             return JSONResponse(status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                                 content={"error": {
                                     "message": str(error)
                                 }})
         return JSONResponse(content=status.model_dump(mode="json"))
+
+    async def memory_report(self) -> JSONResponse:
+        """Where each GPU worker's memory is going, as readable reports.
+
+        See ``LLM.get_memory_report``. Concurrent requests share one
+        in-flight gather rather than each asking every rank again.
+        """
+        task = self._memory_report_task
+        if task is None or task.done():
+            task = asyncio.ensure_future(
+                self._call_runtime_memory_method("get_memory_report"))
+            self._memory_report_task = task
+        try:
+            # Shielded: a client that disconnects must not cancel the
+            # gather other requests are waiting on.
+            reports = await asyncio.shield(task)
+        except Exception as error:
+            return JSONResponse(status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                                content={"error": {
+                                    "message": str(error)
+                                }})
+        return JSONResponse(content={"reports": reports})
 
     async def release_memory(self,
                              request: MemoryUpdateRequest) -> JSONResponse:
@@ -4171,7 +4256,7 @@ class OpenAIServer(_VideoRoutesMixin):
             # through to the outer ``except Exception`` → 500 so the
             # client doesn't get blamed for a server-internal failure.
             try:
-                params = parse_visual_gen_params(request, self.generator)
+                params = await self._parse_visual_gen_params(request)
                 logger.info(
                     f"Generating image: {image_id} with params: {params} and prompt: {request.prompt}"
                 )
@@ -4328,21 +4413,38 @@ class OpenAIServer(_VideoRoutesMixin):
             self, response_format: Optional[str]) -> Optional[Response]:
         """Return a 400 when ``response_format='path'`` but it is disabled.
 
-        Shares the switch with ``format='path'`` on the request side; see
-        :func:`local_media_path_is_disallowed`. Returns ``None`` when allowed.
+        See :func:`path_response_is_disabled`. Returns ``None`` when allowed.
         """
         if response_format != "path":
             return None
-        if local_media_path_is_disallowed():
+        if path_response_is_disabled():
             return self.create_error_response(
                 "response_format='path' is disabled on this server "
-                "(TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1); it returns "
+                "(TRTLLM_MEDIA_DISABLE_PATH_RESPONSE=1); it returns "
                 "server-side filesystem paths and is only meaningful for "
                 "co-located clients.",
                 err_type="BadRequestError",
                 status_code=HTTPStatus.BAD_REQUEST,
             )
         return None
+
+    async def _parse_visual_gen_params(
+        self, request: Union[ImageGenerationRequest, ImageEditRequest,
+                             VideoGenerationRequest]
+    ) -> "VisualGenParams":
+        """Translate a VisualGen request with `parse_visual_gen_params`.
+
+        A request that reads files (a ``format='path'`` reference or an
+        upload) is parsed on the media-load pool, which bounds how many
+        requests read at once; a read keeps its worker until it finishes,
+        even after its request is cancelled. Any other request is parsed
+        inline.
+        """
+        if not request_reads_files(request):
+            return parse_visual_gen_params(request, self.generator)
+        return await asyncio.get_running_loop().run_in_executor(
+            self._media_load_executor, parse_visual_gen_params, request,
+            self.generator)
 
     def _image_object(self, request: Union[ImageGenerationRequest,
                                            ImageEditRequest],
@@ -4429,7 +4531,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 path_error = self._reject_disabled_path(request.response_format)
                 if path_error is not None:
                     return path_error
-                params = parse_visual_gen_params(request, self.generator)
+                params = await self._parse_visual_gen_params(request)
                 logger.info(
                     f"Editing image: {image_id} with params: {params} and prompt: {request.prompt}"
                 )
