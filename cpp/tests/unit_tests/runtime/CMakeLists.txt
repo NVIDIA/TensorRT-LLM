@@ -119,6 +119,16 @@ add_tllm_gtest(
   LABELS
   "unit;runtime;gpu")
 add_tllm_gtest(
+  runtimeMpiUtilsTest
+  OWNER
+  runtime
+  SOURCES
+  mpiUtilsTest.cpp
+  LINK_LIBRARIES
+  tllm::runtime_distributed
+  LABELS
+  "unit;runtime;host")
+add_tllm_gtest(
   localizationTest
   OWNER
   runtime

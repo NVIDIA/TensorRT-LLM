@@ -64,7 +64,9 @@ def _warn_on_removed_fault_tolerance_envs() -> None:
             )
     if os.environ.get(_FAULT_TOLERANCE_MODE_ENV) == "1":
         logger.warning_once(
-            f"{_FAULT_TOLERANCE_MODE_ENV} is no longer read; set enable_wide_ep_fault_tolerance=True.",
+            f"{_FAULT_TOLERANCE_MODE_ENV}=1 no longer turns on Wide-EP fault tolerance for the "
+            "MoE layers; set enable_wide_ep_fault_tolerance=True. It only selects the MPI "
+            "signal-handler mode, which is deprecated and will be removed in a future release.",
             key=f"removed_env_{_FAULT_TOLERANCE_MODE_ENV}",
         )
 
