@@ -104,13 +104,7 @@ def _get_kv_cache_layer_specs(
 def _hyv4_flash_sparse_attention_config(
     pretrained_config: transformers.PretrainedConfig
 ) -> DeepSeekSparseAttentionConfig:
-    """HY4-Flash's sparse layers: DeepSeek-V3.2-style DSA over gated MLA.
-
-    The checkpoint's own indexer geometry (top-k, heads, head width) is the
-    engine's DSA geometry, so the stock DSA config covers it. Its indexer keys
-    rotate with the interleaved 3-D M-RoPE the sparse layers use, and the
-    checkpoint marks every indexed layer a full per-layer indexer.
-    """
+    """HY4-Flash's DSA geometry; its indexer keys rotate with interleaved M-RoPE."""
     text = unwrap_hyv4_flash_text_config(pretrained_config)
     return DeepSeekSparseAttentionConfig(
         index_n_heads=text.index_n_heads,
@@ -123,13 +117,7 @@ def _hyv4_flash_sparse_attention_config(
 def _resolve_hyv4_flash_dfly2(
         spec_config: Optional["SpeculativeConfig"],
         pretrained_config: transformers.PretrainedConfig) -> None:
-    """Fill the checkpoint-native DFly2 geometry on a DFlash speculative config.
-
-    HY4-Flash drafts from five layers inside its own checkpoint, so there is no
-    draft checkpoint for ``DFlashDecodingConfig.resolve_from_checkpoint`` to
-    read: the target layers, the mask token and the algorithm version come from
-    this checkpoint's ``dfly_*`` keys. A user-set field wins.
-    """
+    """Fill unset DFlash fields from the checkpoint's ``dfly_*`` keys."""
     if not isinstance(spec_config, DFlashDecodingConfig):
         return
     kv_layers = getattr(pretrained_config, "dfly_target_kv_layers", None)
@@ -670,11 +658,10 @@ class ModelConfig(Generic[TConfig]):
                 and getattr(self.pretrained_config, "model_type",
                             None) in ("deepseek_v41", "deepseek_v41_text")):
             self.sparse_attention_config = CSA2SparseAttentionConfig()
-        if (self.sparse_attention_config is None
-                and is_hyv4_flash(self.pretrained_config)):
-            self.sparse_attention_config = _hyv4_flash_sparse_attention_config(
-                self.pretrained_config)
         if is_hyv4_flash(self.pretrained_config):
+            if self.sparse_attention_config is None:
+                self.sparse_attention_config = (
+                    _hyv4_flash_sparse_attention_config(self.pretrained_config))
             _resolve_hyv4_flash_dfly2(self.spec_config, self.pretrained_config)
         if self.pretrained_config and self.sparse_attention_config:
             # Sparse geometry can come from the checkpoint. Resolve it once so

@@ -123,12 +123,7 @@ l0_cpu:
   - unittest/_torch/modeling_v2/models/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default
   # The qwen4_exp FP8 target's cpu_only tests, likewise.
   - unittest/_torch/modeling_v2/models/qwen4_exp/qwen3_8_flash_next_fp8__sm_103__unified
-  # The hyv4_flash family's cpu_only checks: the config
-  # shapes and the routing table (read with a monkeypatched compute capability and no
-  # device), the processor's inputs, and the Engram host tables' chunk geometry and
-  # shard reader. Every test under the family's target needs a GPU (l0_b300 runs them,
-  # and its 4-rank comm matrices on l0_dgx_b300), so the target directory is not listed
-  # here; test_engram_host.py is also on l0_b300, which runs its GPU checks.
+  # hyv4_flash family: cpu_only tests.
   - unittest/_torch/modeling_v2/models/hyv4_flash/test_modeling_v2_hyv4_flash_config.py
   - unittest/_torch/modeling_v2/models/hyv4_flash/test_routing.py
   - unittest/_torch/modeling_v2/models/hyv4_flash/test_processor.py

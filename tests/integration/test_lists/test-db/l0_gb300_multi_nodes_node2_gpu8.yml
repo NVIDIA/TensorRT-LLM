@@ -32,11 +32,5 @@ l0_gb300_multi_nodes_node2_gpu8:
   # GLM-5.2 NVFP4 modeling_v2 sm_103 tp8 target, GSM8K under modeling_v2="require".
   # Measured 34 min on 2x4 GB300 (batch 1).
   - accuracy/modeling_v2/glm_moe_dsa/glm_5_2_nvfp4__sm_103__tp8/test_accuracy.py::TestModelingV2Glm52Nvfp4Sm103Tp8::test_gsm8k_tp8 TIMEOUT (90)
-  # The hyv4-flash-FP8 modeling_v2 sm_103 unified target's tep8 layout: one engine
-  # across the two nodes, GSM8K under modeling_v2="require".
+  # hyv4_flash target: tep8, one engine across two nodes.
   - accuracy/modeling_v2/hyv4_flash/hy4_flash_fp8__sm_103__default/test_accuracy.py::TestModelingV2Hy4FlashFp8Sm103Default::test_gsm8k[tep8] TIMEOUT (120)
-  # The stated disaggregated deployment: two TP2/EP2 context servers and one TP4/EP4
-  # generation server with the checkpoint's five-draft DFly2 engine. The launcher binds
-  # every server on the pytest host, so the case skips unless eight devices are visible
-  # on it; the run's disagg gate proves the deployment independently.
-  - accuracy/modeling_v2/hyv4_flash/hy4_flash_fp8__sm_103__default/test_accuracy.py::TestModelingV2Hy4FlashFp8Sm103Default::test_disagg_gsm8k TIMEOUT (180)

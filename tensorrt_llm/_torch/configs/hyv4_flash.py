@@ -1,15 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""HY4-Flash configuration compatibility for Transformers versions before native support.
+"""HY4-Flash configs for Transformers versions without native support.
 
-The checkpoint declares a text decoder and a vision tower in one composite config
-(``model_type`` ``hy_v4_flash``); the decoder is gated MLA with two attention kinds
-(``deepseek_sparse_attention`` on the indexed layers, ``sliding_attention`` on the
-windowed ones), a latent MoE, the iHC residual streams and Engram hash tables, and
-the composite also carries the checkpoint-native DFly2 drafting geometry.
-
-Every value here is the checkpoint's own; the defaults only make a config built
-from a partial dict readable, and the checkpoint's ``config.json`` always wins.
+Defaults are the checkpoint's own values; its ``config.json`` always wins.
 """
 
 from transformers import PretrainedConfig
@@ -22,22 +15,17 @@ class HYV4FlashTextConfig(PretrainedConfig):
     base_config_key = "text_config"
     attribute_map = {"num_local_experts": "n_routed_experts"}
 
-    #: The checkpoint's name for a sparse-MLA layer that runs the DSA indexer.
-    #: Transformers' generic layer-type validator only knows ``full_attention``
-    #: (before it learns the native hy_v4_flash names), so construction maps it
-    #: to that and restores the checkpoint's name before returning.
+    #: Transformers' layer-type validator does not know the sparse-layer names, so
+    #: construction maps them to ``full_attention`` and restores them afterwards.
     SPARSE_LAYER_TYPE = "deepseek_sparse_attention"
     _GENERIC_LAYER_TYPE = {
         "deepseek_sparse_attention": "full_attention",
         "indexed_attention": "full_attention",
     }
 
-    #: The M-RoPE split and its interleaving, published per layer type inside
-    #: ``rope_parameters``; transformers' RoPE validator does not know them.
     ignore_keys_at_rope_validation = {"mrope_section", "mrope_interleaved"}
 
-    #: Base wavelength per layer type, keyed by the generic names construction
-    #: uses: the indexed layers rotate at 1e7 and the windowed ones at 1e4.
+    #: RoPE base per (generic) layer type.
     default_theta = {"full_attention": 10_000_000.0, "sliding_attention": 10_000.0}
 
     def __init__(self, **kwargs):
@@ -111,13 +99,10 @@ class HYV4FlashTextConfig(PretrainedConfig):
             "mrope_interleaved": True,
         }
         fields.update(kwargs)
-        # The published checkpoint labels the nested text config with the
-        # composite's own `model_type`; keep the class's own name instead.
+        # The checkpoint labels the nested text config with the composite's model_type.
         fields.pop("model_type", None)
 
-        # The checkpoint publishes one compressed-indexer block under its own
-        # ``compressed_indexer_*`` names; ``index_kpool`` is the canonical name
-        # for the group width it pools each head's keys to.
+        # ``index_kpool`` is the checkpoint's ``compressed_indexer_compress_ratio``.
         compress_ratio = fields.pop("compressed_indexer_compress_ratio", None)
         if compress_ratio is not None:
             fields["index_kpool"] = compress_ratio
@@ -130,8 +115,7 @@ class HYV4FlashTextConfig(PretrainedConfig):
         num_layers = fields["num_hidden_layers"]
         layer_types = fields.pop("layer_types", None)
         if layer_types is None:
-            # Two indexed layers first, then one indexed layer per three windowed
-            # ones: layers 0, 1, 5, 9, ... of the checkpoint's own pattern.
+            # Sparse layers 0, 1, 5, 9, ...
             layer_types = [
                 self.SPARSE_LAYER_TYPE
                 if layer_idx < 2 or (layer_idx - 1) % 4 == 0
@@ -146,10 +130,8 @@ class HYV4FlashTextConfig(PretrainedConfig):
                     f"{num_layers}"
                 )
 
-        # Transformers' layer-type validator rejects the checkpoint's sparse-layer
-        # name, and it only standardizes RoPE per layer type when the rope keys are
-        # in `layer_types`. Construct under the generic names, then publish the
-        # checkpoint's own names once construction (and its validation) is done.
+        # Construct under the generic names (RoPE is standardized per layer type only
+        # when its keys are in `layer_types`), then publish the checkpoint's names.
         generic_of = {name: self._GENERIC_LAYER_TYPE.get(name, name) for name in set(layer_types)}
         self.layer_types = [generic_of[name] for name in layer_types]
         published_of = {generic_of[name]: name for name in layer_types}
@@ -174,13 +156,11 @@ class HYV4FlashTextConfig(PretrainedConfig):
             published_of.get(name, name): params for name, params in self.rope_parameters.items()
         }
 
-        # MLA expands the latent to one key/value per query head, so keys are never
-        # grouped, and RoPE applies to the rope slice only.
         self.num_key_value_heads = self.num_attention_heads
         self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         self.head_dim = self.qk_rope_head_dim
 
-        # The windowed layers run their own head geometry, published as `swa_*`.
+        # The windowed layers run their own `swa_*` head geometry.
         sliding = {
             "num_attention_heads": self.swa_num_attention_heads,
             "num_key_value_heads": self.swa_num_attention_heads,
@@ -196,14 +176,9 @@ class HYV4FlashTextConfig(PretrainedConfig):
             if layer_type == "sliding_attention"
         }
 
-        # Engram's own ids are 1-based; the decoder's layers are 0-based.
-        engram_layer_ids = getattr(self, "engram_layer_ids", None) or []
-        self.engram_layer_ids = list(engram_layer_ids)
-        self.engram_layer_indices = [layer_id - 1 for layer_id in self.engram_layer_ids]
+        self.engram_layer_ids = list(getattr(self, "engram_layer_ids", None) or [])
 
-        # Which layers own a DSA indexer pool: every indexed layer runs one, and a
-        # windowed layer runs none. The engine reads this as `index_topk_pattern`
-        # ('F' a full per-layer indexer, 'S' no pool of its own).
+        # 'F': the layer owns a DSA indexer pool; 'S': it has none.
         self.index_topk_pattern = [
             "F" if layer_type == self.SPARSE_LAYER_TYPE else "S" for layer_type in layer_types
         ]
@@ -211,7 +186,7 @@ class HYV4FlashTextConfig(PretrainedConfig):
         self._validate()
 
     def _validate(self) -> None:
-        """Check the geometry whose mismatch would only surface as wrong math later."""
+        """Check geometry whose mismatch would otherwise only surface as wrong math."""
         for layer_type in set(self.layer_types):
             rope_head_dim = (
                 self.swa_qk_rope_head_dim
@@ -226,8 +201,7 @@ class HYV4FlashTextConfig(PretrainedConfig):
                     f"rotary width of {rope_head_dim}"
                 )
 
-        # The per-head sizes are hash moduli: a table of the wrong shape would hash
-        # against the wrong moduli instead of failing.
+        # The per-head sizes are hash moduli: a wrong shape would hash silently wrong.
         if self.engram_layer_ids and not self.engram_pad_id < self.engram_lookup_table_size:
             raise ValueError(
                 f"`engram_lookup_table_size` ({self.engram_lookup_table_size}) must cover "
@@ -252,13 +226,7 @@ class HYV4FlashTextConfig(PretrainedConfig):
                 )
 
     def convert_rope_params_to_dict(self, **kwargs):
-        """Complete the checkpoint's per-layer-type RoPE blocks.
-
-        The checkpoint nests one block per layer type, each carrying its own base
-        wavelength and the interleaved M-RoPE split, and publishes no top-level
-        ``rope_theta``. The base implementation fills a single global theta, which
-        would collapse the two bases, so each block is completed here instead.
-        """
+        """Complete the per-layer-type RoPE blocks (the base fills one global theta)."""
         rope_scaling = kwargs.pop("rope_scaling", None)
         if rope_scaling is not None:
             self.rope_parameters = rope_scaling
@@ -272,11 +240,10 @@ class HYV4FlashTextConfig(PretrainedConfig):
         mrope_interleaved = kwargs.get(
             "mrope_interleaved", getattr(self, "mrope_interleaved", None)
         )
-        default_theta = self.default_theta
         for layer_type in set(self.layer_types):
             params = rope_parameters.setdefault(layer_type, {})
             params.setdefault("rope_type", "default")
-            theta = default_theta[layer_type] if isinstance(default_theta, dict) else default_theta
+            theta = self.default_theta[layer_type]
             params.setdefault("rope_theta", rope_theta if rope_theta is not None else theta)
             if mrope_section is not None:
                 params.setdefault("mrope_section", list(mrope_section))
@@ -288,7 +255,7 @@ class HYV4FlashTextConfig(PretrainedConfig):
 
 
 class HYV4FlashVisionConfig(PretrainedConfig):
-    """The HY4-Flash SigLIP2-like vision tower and its projector (``vision_config``)."""
+    """The HY4-Flash vision tower and its projector (``vision_config``)."""
 
     model_type = "hy_v4_flash_vision"
     base_config_key = "vision_config"
@@ -338,8 +305,8 @@ class HYV4FlashVisionConfig(PretrainedConfig):
             "vision_full_attention": False,
         }
         fields.update(kwargs)
-        # The published checkpoint labels the nested tower with the composite's
-        # own `model_type`, which would recurse under `AutoConfig` resolution.
+        # The checkpoint labels the tower with the composite's model_type, which recurses
+        # under AutoConfig.
         fields.pop("model_type", None)
         super().__init__(**fields)
         self.head_dim = self.hidden_size // self.num_attention_heads
@@ -375,9 +342,8 @@ class HYV4FlashConfig(PretrainedConfig):
             "video_token_id": 120124,
             "spatial_merge_size": 2,
             "tie_word_embeddings": False,
-            # Checkpoint-native DFly2 drafting: five draft layers over the target's
-            # sparse layers 25, 29, 33, 37 and 41 (0-based), each reusing that
-            # layer's MLA KV and its top-`dfly_target_index_topk` index picks.
+            # Embedded DFly2 draft: each draft layer reuses its target layer's MLA KV and
+            # index picks.
             "dfly_num_hidden_layers": 5,
             "dfly_mask_token_id": 120009,
             "dfly_target_kv_layers": [25, 29, 33, 37, 41],

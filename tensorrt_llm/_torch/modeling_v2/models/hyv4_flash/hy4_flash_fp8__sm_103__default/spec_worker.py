@@ -2,44 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """The DFly2 drafter's worker: the block's inputs, its KV bookkeeping and its sampling walk.
 
-The engine's `DFlashWorker` drives a drafter that keeps a context of its own:
-it captures the target's prefill hidden states into a private arena, appends
-each step's block to that arena, and reads it back. This drafter keeps nothing
--- it appends its block to the *target* sparse layer's latent pool, at the rows
-its own block's positions name, and reads that layer's pick list back. The
-worker therefore replaces every step of the engine's preparation that talks
-about the private arena, and keeps the parts that are about the target:
-
-* `_lazy_init_ctx_buffers` builds only the state `_forward_impl` reads
-  unconditionally (`_ctx_len` and its snapshots), never the arena or its
-  buffers, and resolves the block width and the mask token from the drafter.
-  `_ctx_buf_inited` stays False, which keeps `DFlashSpecMetadata.prepare()`'s
-  slot bookkeeping inert: this drafter has no request slots.
-* `prepare_1st_drafter_inputs` builds the block itself -- `DflyBlockPrepare`
-  for the six rows' positions and pool slots, the family manager's
-  `draft_picks` state plus `DflyBlockIndices` for each draft layer's selection,
-  and the slot-0 fusion of the target's own hidden state.
-* `_sample_block_draft_tokens` walks the block: DFly2's draft positions
-  condition on the previous draft through the hidden correction, so the five
-  drafts of a step are drawn one after another, each from the corrected hidden
-  of its own block column.
-* `_prepare_kv_for_draft_forward` leaves `kv_lens_cuda` alone and only records
-  that a rewind is pending; this worker's own write sets it to the block's last
-  position, which is exactly the value the engine expects at the end of a step
-  (the target's own sequence length advanced by the accepted tokens), so the
-  deferred rewind resolves to nothing.
-
-The two halves of the KV bookkeeping are one convention: the native prologue
-ropes a generation row as `sequence_length[request] - predicted_tokens_per_seq
-+ t`, so a block whose rows sit at `[anchor, anchor + width)` needs
-`sequence_length = anchor + width` while it runs -- and that value, with
-`anchor = <the target's sequence length> - width + num_accepted_tokens`, is the
-value the engine's own step would have left for the next one.
+The drafter keeps no arena: its block is appended to the target sparse layers' pools, so every step of
+`DFlashWorker` that talks about the private arena is replaced. The native prologue ropes row `t` at
+`sequence_length - width + t`, so a block at `[anchor, anchor + width)` runs with
+`sequence_length = anchor + width`, which is also the length the engine expects after the step.
 """
 
 from __future__ import annotations
-
-from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -48,7 +17,6 @@ import torch.nn.functional as F
 from tensorrt_llm._torch.speculative.dflash import (
     DFlashSpecMetadata,
     DFlashWorker,
-    dflash_draft_slot_ids,
     dflash_noise_block_embedding,
 )
 from tensorrt_llm.logger import logger
@@ -58,40 +26,18 @@ from .ops.spec.dfly_block_prepare import dfly_block_indices, dfly_block_prepare
 
 
 class Hyv4FlashDFlashWorker(DFlashWorker):
-    """The DFly2 drafter's worker at one rank of one deployment.
-
-    Everything step-shaped comes from the engine; what this class owns is the
-    block: where its rows live in the target's pool and what they attend, how
-    its five drafts are sampled, and the sequence lengths that follow from it.
-    """
+    """The DFly2 drafter's worker at one rank of one deployment."""
 
     def __init__(self, spec_config, mapping, use_separate_draft_kv_cache: bool = False):
         super().__init__(spec_config, mapping, use_separate_draft_kv_cache)
-        # The base's `_ctx_buf_inited` guards its private-arena state; this
-        # worker's state is the four snapshotted tensors, allocated once.
         self._dfly_inited = False
 
-    # -- what the engine binds onto the worker ---------------------------------
-
     def bind_target_lm_head(self, lm_head: nn.Module, logits_processor: nn.Module) -> None:
-        """Keep the target logits gathered: this drafter's walk reads full vocab.
-
-        The engine's DFlash binds a vocabulary-shard selection over the target
-        head when the processor is the plain one, and `target_logits` then hands
-        back this rank's shard. DFly2's drafts are drawn from the drafter's own
-        full-vocabulary head (`Hyv4FlashDraft.block_logits`, over the corrected
-        hidden of each block column), and the acceptance reads the same rows, so
-        a second, shard-shaped source of truth is declined here: the worker
-        verifies through the gathered logits (`verifies_on_target_shard`), which
-        is also why `_vocab_parallel_draft_tokens` returns None.
-        """
+        """Keep the target logits gathered: the correction walk draws from the full vocabulary."""
         del lm_head, logits_processor
         self._vocab_parallel = None
 
-    # -- geometry the engine resolves off the drafter --------------------------
-
     def _resolve_mask_token_id(self, draft_model) -> int:
-        """The drafter's mask token, from the config, the drafter, or its model."""
         if self._resolved_mask_token_id is not None:
             return self._resolved_mask_token_id
         if getattr(self.spec_config, "mask_token_id", None) is not None:
@@ -110,16 +56,10 @@ class Hyv4FlashDFlashWorker(DFlashWorker):
     def _lazy_init_ctx_buffers(
         self, draft_model, spec_metadata, attn_metadata, draft_kv_cache_manager=None
     ):
-        """Build the state `_forward_impl` snapshots; the drafter keeps no arena.
+        """Allocate only the state `_forward_impl` snapshots every step; there is no arena.
 
-        The engine's version sizes a private context pool from the served
-        length and builds the drafter's fused KV buffers. This drafter writes
-        into the target's pool instead, so none of that exists -- but
-        `_forward_impl` reads and snapshots four tensors on every step
-        regardless of the drafter, so they are allocated here, once, at the
-        slot count the engine's spec metadata reports. The manager arguments
-        are unused: this worker addresses the target's pool through the
-        metadata, never a draft manager of its own.
+        `_ctx_buf_inited` stays False, which keeps `DFlashSpecMetadata.prepare()`'s slot
+        bookkeeping inert.
         """
         if self._dfly_inited:
             return
@@ -139,9 +79,6 @@ class Hyv4FlashDFlashWorker(DFlashWorker):
             )
         self._resolve_mask_token_id(draft_model)
 
-        # The block's positions are bounded by the served length, taken from
-        # the KV cache manager (as `DFlashWorker` does), with the model's own
-        # advertised length as the fallback.
         cache_manager = getattr(attn_metadata, "kv_cache_manager", None)
         runtime_max = getattr(cache_manager, "max_seq_len", None)
         if runtime_max is None:
@@ -151,16 +88,11 @@ class Hyv4FlashDFlashWorker(DFlashWorker):
         candidates = [c for c in (runtime_max, max_pos) if c is not None]
         self._max_ctx = min(candidates) if candidates else 8192
 
-        # The engine's `DFlashSpecMetadata.prepare()` guards its slot
-        # bookkeeping on `_ctx_buf_inited`, which stays False: a slot is
-        # private-arena state.
         num_req_slots = spec_metadata.num_seq_slots
         self._dummy_slot = num_req_slots
         num_slots = num_req_slots + 1
 
-        # CUDA-graph padding uses ids counting down from
-        # CUDA_GRAPH_DUMMY_REQUEST_ID; a floor of one draft block separates
-        # them from real ids. Imported lazily to avoid an import cycle.
+        # Imported lazily to avoid an import cycle.
         from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
 
         self._graph_dummy_id_floor = CUDA_GRAPH_DUMMY_REQUEST_ID - self.max_draft_len
@@ -185,19 +117,8 @@ class Hyv4FlashDFlashWorker(DFlashWorker):
         position_ids: torch.Tensor,
         total_target_tokens: int,
     ):
-        """Nothing: this drafter captures no prefill context.
-
-        The engine's drafter projects the target's prefill hidden states into
-        its own arena so a request's first blocks can attend the prompt. Here
-        the prompt is already in the target sparse layer's pool -- the same
-        pool the block is written into -- and the target's indexer publishes
-        each context request's last row in the picks state, so there is nothing
-        to capture; skipping it also skips the engine's request-slot
-        assignment, which is why `_ctx_buf_inited` stays False.
-        """
+        """Nothing: the prompt is already in the target's pool and its picks are published."""
         return None
-
-    # -- KV bookkeeping -------------------------------------------------------
 
     def _prepare_kv_for_draft_forward(
         self,
@@ -206,18 +127,7 @@ class Hyv4FlashDFlashWorker(DFlashWorker):
         num_contexts: int,
         batch_size: int,
     ):
-        """Record that this step's `kv_lens_cuda` is this worker's to set.
-
-        The engine's drafter raises the length by one before the draft forward
-        and rewinds it after, because its block sits one position past the
-        target's own. This block's rows sit at `anchor`, so
-        `prepare_1st_drafter_inputs` writes the length the block's own forward
-        needs -- which is also the value the engine expects at the end of the
-        step -- and the deferred rewind, whose only purpose is to keep a failed
-        forward from leaving a raised length, resolves to nothing. The accepted
-        counts are not needed here: the block is built from the target batch's
-        own positions.
-        """
+        """`prepare_1st_drafter_inputs` sets `kv_lens_cuda` to its final value, so the rewind is a no-op."""
         del num_accepted_tokens, num_contexts, batch_size
         self._kv_rewind_amount = None
         self._kv_rewind_pending = getattr(attn_metadata, "kv_lens_cuda", None) is not None
@@ -230,41 +140,23 @@ class Hyv4FlashDFlashWorker(DFlashWorker):
         anchors: torch.Tensor,
         width: int,
     ):
-        """Point each generation row at the block's last position.
+        """Point each generation row at the block's exclusive end, `anchors + width`.
 
-        `anchors + width` is the block's exclusive end: the native prologue
-        ropes row `t` of the block at `sequence_length - width + t`, and the
-        block's rows all sit at or before it. It is also exactly where the
-        engine's own step leaves the length -- the target's own
-        `sequence_length` advanced by the tokens this step accepted -- so
-        nothing has to be compensated after the draft forward.
-
-        It is *not* the count the sparse generation attention works to: that is
-        each row's own live prefix, the `lengths` this module writes beside
-        `packed`, which the block's forward hands the kernel as the request's
-        bound (`draft.Hyv4FlashDraft._block_attention`). The two part once a
-        request's picks fill its selection, and the buffer here keeps the
-        pool's end because the prologue is what reads it.
+        The sparse attention's per-row key count is `lengths`, not this; the prologue reads this.
         """
         new_lens = (anchors + width).to(torch.int32)
         kv_lens = getattr(attn_metadata, "kv_lens_cuda", None)
         if kv_lens is not None:
             kv_lens[num_contexts:batch_size] = new_lens
-        # The metadata's runtime aliases point at the same buffers the kernels
-        # read; a warmup clone splits them, so both are written when distinct.
-        # The clone carries the whole batch, context rows included.
+        # A warmup clone splits the runtime alias from `kv_lens_cuda`; write both when distinct.
         runtime = getattr(attn_metadata, "kv_lens_cuda_runtime", None)
         if runtime is not None and runtime is not kv_lens and runtime.shape[0] >= batch_size:
             runtime[num_contexts:batch_size] = new_lens
-        # The step's sequence lengths: the engine's drafter sets the window's
-        # token count the same way, and the blocks built from it follow.
         for name in ("_seq_lens", "_seq_lens_cuda"):
             seq_lens = getattr(attn_metadata, name, None)
             if seq_lens is None or seq_lens.shape[0] < batch_size:
                 continue
             seq_lens[num_contexts:batch_size] = width
-
-    # -- the block's inputs ---------------------------------------------------
 
     def prepare_1st_drafter_inputs(
         self,
@@ -278,16 +170,7 @@ class Hyv4FlashDFlashWorker(DFlashWorker):
         draft_model: nn.Module,
         total_target_tokens: int = 0,
     ):
-        """Everything the drafter's block forward reads, this step.
-
-        The block is `block_width` rows per generation request: the accepted
-        anchor's bonus token followed by mask tokens, all of them written into
-        the target sparse layer's pool at the positions they occupy in the
-        target's own sequence. `DflyBlockPrepare` gives those rows and their
-        slots, `DflyBlockIndices` gives each draft layer's selection over that
-        layer's picks, and the anchor's column is fused with the target's own
-        hidden state for that row.
-        """
+        """The block: the anchor's bonus token then mask tokens, at their target positions and pool slots."""
         del input_ids, total_target_tokens
         d = draft_model.dims
         num_contexts = attn_metadata.num_contexts
@@ -297,9 +180,7 @@ class Hyv4FlashDFlashWorker(DFlashWorker):
         device = hidden_states.device
 
         if num_gens == 0:
-            # A context-only step: the engine calls this preparation
-            # unconditionally and runs the drafter only when there are
-            # generation requests.
+            # Called unconditionally; the drafter runs only with generation requests.
             return {
                 "noise_embedding": hidden_states.new_empty(0, 0, d.hidden),
                 "query_positions": torch.empty(0, 0, dtype=torch.long, device=device),
@@ -317,17 +198,12 @@ class Hyv4FlashDFlashWorker(DFlashWorker):
         mask_token_id = int(self._resolve_mask_token_id(draft_model))
         accepted = num_accepted_tokens[num_contexts:batch_size].to(torch.int64)
         num_drafts = (accepted - 1).clamp_min(0)
-        # The anchor token: the last token the target accepted for this
-        # request, which the block's first column carries as its input.
         bonus = (
             accepted_tokens[num_contexts:batch_size]
             .gather(1, num_drafts.unsqueeze(1))
             .squeeze(1)
             .long()
         )
-        # The anchor is the first row after the accepted ones, so a block's
-        # rows start at `query_start_loc + num_accepted` -- one row past the
-        # target's last accepted row, whose hidden predicts the bonus.
         query_start_loc = torch.arange(
             num_gens + 1, dtype=torch.int64, device=device
         ) * width + int(attn_metadata.num_ctx_tokens)
@@ -340,11 +216,8 @@ class Hyv4FlashDFlashWorker(DFlashWorker):
 
         manager = attn_metadata.kv_cache_manager
         page_size = int(manager.tokens_per_block)
-        # One block per draft layer, because the sparse layers' pool rows
-        # differ: `scale`/`layer_offset` map a request's page to that layer's
-        # rows, and only the slots depend on the table. The rows themselves --
-        # positions, anchors and the block's source row -- are shared, so the
-        # first layer's block supplies them.
+        # One block per draft layer: the layers' pool rows differ, so only the slots depend on the
+        # layer; positions, anchors and source rows are the first layer's.
         block = None
         layer_slots = []
         for layer in range(d.num_layers):
@@ -371,8 +244,7 @@ class Hyv4FlashDFlashWorker(DFlashWorker):
             layer_slots.append(layer_block.slots.view(num_gens, width))
 
         self._write_block_kv_lens(attn_metadata, num_contexts, batch_size, block.anchors, width)
-        # The indexer's per-token map, the write slots and the scheduler
-        # buffers are rebuilt from the lengths just written.
+        # Rebuild the indexer map, write slots and scheduler buffers from the lengths just written.
         attn_metadata.update_for_spec_dec()
 
         picks = manager.draft_picks(d.target_kv_layers, d.index_topk, device=device)
@@ -380,8 +252,6 @@ class Hyv4FlashDFlashWorker(DFlashWorker):
         packed = torch.empty((d.num_layers, rows, d.index_width), dtype=torch.int32, device=device)
         lengths = torch.empty((d.num_layers, rows), dtype=torch.int32, device=device)
         for layer in range(d.num_layers):
-            # One layer at a time: the entry reads a per-layer pick pool and
-            # writes a per-layer slice, and the slices keep the state's strides.
             dfly_block_indices(
                 picks.history[layer : layer + 1],
                 block.source_rows,
@@ -391,8 +261,6 @@ class Hyv4FlashDFlashWorker(DFlashWorker):
                 lengths[layer : layer + 1],
             )
 
-        # The block's rows: the bonus token's embedding with the target's own
-        # hidden state fused into column 0, mask tokens elsewhere.
         embed_weight = draft_model.embed_tokens_weight
         trained_mask_embedding = (
             getattr(draft_model, "mask_token_embedding", None)
@@ -427,46 +295,14 @@ class Hyv4FlashDFlashWorker(DFlashWorker):
             "block_placement": DflyBlockSelection(
                 packed=packed,
                 lengths=lengths,
-                # Only the slots depend on the layer's table; the rest of the
-                # block is the same rows for all five.
                 slots=layer_slots[0],
                 positions=block.positions,
                 active=block.active,
                 attn_metadata=attn_metadata,
             ),
-            # The anchor token per generation request: the walk conditions its
-            # first position on it.
             "first_prev_tokens": bonus,
             "lilicorr_anchor": None,
         }
-
-    # -- the block's drafts ---------------------------------------------------
-
-    def _draft_slot_ids(
-        self, draft_model, num_gens: int, block_size: int, num_draft_tokens: int
-    ) -> torch.Tensor:
-        """The block's columns `1 .. K`: the hidden that predicts each column's own token.
-
-        DFly2's correction conditions column `s`'s hidden on the token of
-        column `s - 1`, so the corrected hidden of column `s` is the row whose
-        logits are column `s`'s own draft (see `_sample_block_draft_tokens`).
-        Column 0 is the anchor, whose token the target has already produced, so
-        it is never drafted from -- the engine's plain-DFlash convention, which
-        the base class already asks for.
-        """
-        del draft_model
-        return dflash_draft_slot_ids(num_gens, block_size, num_draft_tokens, False, device="cuda")
-
-    def _vocab_parallel_draft_tokens(self, draft_model) -> Optional[object]:
-        """None: the shard's fast path reads hidden the correction has not walked.
-
-        The engine's greedy draft path takes block logits straight from this
-        rank's vocabulary shard. DFly2's drafts condition on each other, so
-        that path would answer from uncorrected hidden states; declining it
-        keeps the correction walk the only route to a draft token.
-        """
-        del draft_model
-        return None
 
     def _sample_block_draft_tokens(
         self,
@@ -478,17 +314,9 @@ class Hyv4FlashDFlashWorker(DFlashWorker):
         num_contexts: int,
         batch_size: int,
     ) -> tuple[torch.Tensor, int]:
-        """Walk the block: `K` drafts, each conditioned on the ones before it.
+        """Draw the `K` drafts in order: column `s` is corrected with column `s - 1`'s token first.
 
-        The engine's DFlash draws every position independently from its block
-        logits. DFly2 corrects column `s`'s hidden with the embedding of the
-        token at column `s - 1` before that column's logits are taken, so
-        column `s`'s draft depends on column `s - 1`'s, which is only known
-        once it is drawn. The walk is therefore one step per column, in order,
-        from the anchor token: step `s` corrects the gathered row of column
-        `s + 1` with the token at column `s` and draws column `s + 1`'s token.
-        Each step's logits stand in for the precomputed block logits of that
-        column: `gen_logits` is dropped, not refined.
+        `gen_logits` only supplies shapes; each step's logits come from the corrected row.
         """
         num_gens, num_drafts = gen_logits.shape[:2]
         vocab_size = gen_logits.shape[-1]

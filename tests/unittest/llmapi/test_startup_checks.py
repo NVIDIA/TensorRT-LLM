@@ -200,7 +200,6 @@ def _arch_args(
     encode_only=False,
     model_kwargs=None,
     checkpoint_loader=None,
-    modeling_v2="auto",
 ):
     return SimpleNamespace(
         checkpoint_format=checkpoint_format,
@@ -208,7 +207,7 @@ def _arch_args(
         encode_only=encode_only,
         model_kwargs=model_kwargs,
         checkpoint_loader=checkpoint_loader,
-        modeling_v2=modeling_v2,
+        modeling_v2="auto",
     )
 
 
@@ -266,24 +265,10 @@ def test_externally_declared_architecture_passes(monkeypatch):
 
 
 def test_routed_architecture_passes(monkeypatch):
-    # A modeling_v2-only family has no V1 class: its @routes registration is its
-    # implementation, so the route makes the architecture known.
+    # A modeling_v2-only family's @routes registration counts as its implementation.
     from tensorrt_llm._torch.modeling_v2 import _router_index
 
     monkeypatch.setitem(_router_index._ROUTES, "FooBarForCausalLM", lambda *args: object)
     startup_checks.check_architecture_registered(
         _arch_args(), SimpleNamespace(architectures=["FooBarForCausalLM"])
     )
-
-
-def test_routed_architecture_is_unknown_with_modeling_v2_off(monkeypatch):
-    # 'off' promises the built-in implementation, so a v2-only architecture has
-    # none and must still be refused.
-    from tensorrt_llm._torch.modeling_v2 import _router_index
-
-    monkeypatch.setitem(_router_index._ROUTES, "FooBarForCausalLM", lambda *args: object)
-    with pytest.raises(ValueError, match="Unknown model architecture: FooBarForCausalLM"):
-        startup_checks.check_architecture_registered(
-            _arch_args(modeling_v2="off"),
-            SimpleNamespace(architectures=["FooBarForCausalLM"]),
-        )

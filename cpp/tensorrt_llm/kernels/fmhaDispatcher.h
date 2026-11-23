@@ -61,15 +61,12 @@ public:
     // Check if any fmha kernel meets the requirements.
     bool isSupported();
 
-    // Check whether a kernel exists for one call, whose mask depends on the call itself: a sliding
-    // window that covers the whole history selects the causal mask, one that does not selects a
-    // windowed mask no fixed probe can speak for.
+    // Check one call: its kv length and window decide the mask (e.g. windowed vs. causal).
     bool isSupported(tensorrt_llm::kernels::MHARunnerParams const& runnerParams);
 
-    // The same check for one call under a layout other than the fixed one.
+    // The same check under a layout other than the fixed one.
     bool isSupported(tensorrt_llm::kernels::MHARunnerParams const& runnerParams, kernels::AttentionInputLayout layout);
 
-    // Whether the kernels come from trtllm-gen rather than fmha v2.
     bool usesTrtllmGen() const
     {
         return mUseTllmGen;
@@ -88,13 +85,9 @@ public:
     void run(tensorrt_llm::kernels::MHARunnerParams runnerParams, kernels::AttentionInputLayout layout);
 
 private:
-    // The kernel-selection parameters for one call: its own sequence lengths, window and chunking
-    // decide the mask, so a verdict on one call does not stand for another.
+    // The kernel-selection parameters of one call.
     kernels::TllmGenFmhaRunnerParams makeTllmGenProbeParams(
         tensorrt_llm::kernels::MHARunnerParams const& runnerParams, kernels::AttentionInputLayout layout) const;
-
-    // Run the fmha kernel under the given layout.
-    void runImpl(tensorrt_llm::kernels::MHARunnerParams runnerParams, kernels::AttentionInputLayout layout);
 
     // The fixed fmha parameters.
     kernels::MHARunnerFixedParams mFixedParams;

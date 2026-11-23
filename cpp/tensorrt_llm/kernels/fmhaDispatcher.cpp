@@ -266,7 +266,7 @@ TllmGenFmhaRunnerParams FmhaDispatcher::makeTllmGenProbeParams(
     TllmGenFmhaRunnerParams probe;
     memset(&probe, 0, sizeof(probe));
 
-    // The fields that select a kernel, set exactly as run() sets them for this call.
+    // The kernel-selection fields, set as run() sets them for this call.
     probe.mQkvLayout = AttentionInputLayoutToQkvLayout(layout);
     probe.mKernelType = FmhaKernelType::Context;
     probe.mTileScheduler = TileScheduler::Persistent;
@@ -331,15 +331,10 @@ bool FmhaDispatcher::isSupported(MHARunnerParams const& runnerParams)
 
 void FmhaDispatcher::run(MHARunnerParams runnerParams)
 {
-    runImpl(runnerParams, mFixedParams.attentionInputLayout);
+    run(runnerParams, mFixedParams.attentionInputLayout);
 }
 
 void FmhaDispatcher::run(MHARunnerParams runnerParams, AttentionInputLayout const layout)
-{
-    runImpl(runnerParams, layout);
-}
-
-void FmhaDispatcher::runImpl(MHARunnerParams runnerParams, AttentionInputLayout const layout)
 {
     if (mUseTllmGen)
     {

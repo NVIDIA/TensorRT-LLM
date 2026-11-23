@@ -1,14 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Map a request-local KV position to its row in the primary latent pool.
-
-Adapted from the GLM-5.2 target's `ops/attention/convert_req_index_to_global.py`
-(same engine op, cells re-derived for this checkpoint). HY4-Flash hands the
-sparse MLA entry its selection built from `position_ids` -- request-local
-positions, ascending, `-1` past the document start -- while the trtllm-gen
-sparse kernel reads `kvPageIdxPtr` as rows of the pool base it is given. This
-entry is the conversion between the two.
-"""
+"""Map request-local KV positions to rows of the primary latent pool (viewed as `[-1, 576]`)."""
 
 from __future__ import annotations
 
@@ -17,37 +9,18 @@ import torch
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
-#: HY4-Flash's primary-pool geometry: pages of 32 tokens, 2048 selected keys on a
-#: sparse layer and 512 on a windowed one.
+#: Primary-pool pages of 32 tokens; 2048 selected keys on a sparse layer.
 _HY4 = dict(block_size=32, topk=2048)
 
 
 class ConvertReqIndexToGlobal(OpWrapper):
-    """Turn a layer's per-row key positions into rows of the primary KV pool.
+    """`block_table[req, p // block_size] * stride_factor + layer_id * block_size + p % block_size`, or -1.
 
-    Entry `token_indices[i, j]` is a KV position `p` counted from the start of
-    request `req_id[i]`'s own sequence. The op returns
-
-        block_table[req_id[i], p // block_size] * stride_factor
-            + layer_id * block_size + p % block_size
-
-    which is the row of the pool viewed as `[-1, 576]` that holds that token's
-    latent KV for this layer. A position that cannot be resolved comes back as
-    -1: `p < 0` (the selection's padding), `p // block_size` at or past
-    `block_table.size(1)`, or a negative block-table entry (an unused page).
-
-    Returns a fresh contiguous int32 tensor shaped like `token_indices`; no
-    argument is modified.
+    -1 when `p < 0`, `p // block_size >= block_table.size(1)`, or the block-table entry is negative.
     """
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # HY4-Flash calls it once per layer on the step's whole selection buffer: one
-    # row per query token, `topk` columns -- 2048 on a sparse layer, the 512-token
-    # window on a windowed one. `pool_layers` sets `stride_factor = pool_layers *
-    # block_size`, the page stride of a pool that interleaves every layer's pages;
-    # `layer_id` picks the layer inside a page. One primary pool holds all 42 text
-    # layers in decoder order.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="decode: one sequence, one token, a context longer than top-k",
@@ -90,20 +63,6 @@ class ConvertReqIndexToGlobal(OpWrapper):
         ),
     )
 
-    note = """
-    The kernel launches one block row per `req_id` entry and writes
-    `num_topk_tokens` columns at the output's row stride, which is
-    `token_indices.size(1)`. Both counts are taken on trust; see `is_valid`.
-
-    Arithmetic is int32 on the device: `block * stride_factor` past 2**31
-    wraps. This checkpoint's pool is far below that; `is_valid` states the
-    bound. The windowed layers' 512-column selection is the same call at a
-    narrower `num_topk_tokens`; both widths are cells above.
-
-    The grouped variant (`convert_req_index_to_global_grouped`, one launch for
-    several layers) is a different op and is not covered here.
-    """
-
     def __call__(
         self,
         req_id: torch.Tensor,
@@ -134,11 +93,7 @@ class ConvertReqIndexToGlobal(OpWrapper):
         stride_factor: int,
         layer_id: int,
     ) -> torch.Tensor:
-        """The kernel's integer map, in int64 so it cannot wrap.
-
-        `num_topk_tokens` is not read: the reference covers every column of
-        `token_indices`, which `is_valid` requires to be the same count.
-        """
+        """int64, so it cannot wrap; covers every column of `token_indices`."""
         tok = token_indices.long()
         max_blocks = block_table.shape[1]
         block = torch.div(tok, block_size, rounding_mode="floor")
@@ -160,17 +115,12 @@ class ConvertReqIndexToGlobal(OpWrapper):
         stride_factor: int,
         layer_id: int,
     ) -> None:
-        # The output's row stride is `token_indices.size(1)`, but the kernel
-        # walks `num_topk_tokens` columns. Wider spills each row's surplus into
-        # the next row and past the end of the output; narrower leaves the
-        # trailing columns uninitialized. Neither raises.
+        # The kernel walks `num_topk_tokens` columns at row stride `token_indices.size(1)`; a mismatch corrupts rows.
         assert num_topk_tokens == token_indices.shape[1], (
             f"num_topk_tokens must equal token_indices.size(1); got {num_topk_tokens} "
             f"against a {tuple(token_indices.shape)} operand"
         )
-        # The row count is `req_id.size(0)`, not `token_indices.size(0)`. A
-        # longer `req_id` reads past `token_indices` and writes past the output;
-        # a shorter one leaves the extra output rows uninitialized.
+        # The kernel's row count is `req_id.size(0)`.
         assert req_id.shape[0] == token_indices.shape[0], (
             f"req_id must hold exactly one entry per row of token_indices; got "
             f"{req_id.shape[0]} for {token_indices.shape[0]} rows"

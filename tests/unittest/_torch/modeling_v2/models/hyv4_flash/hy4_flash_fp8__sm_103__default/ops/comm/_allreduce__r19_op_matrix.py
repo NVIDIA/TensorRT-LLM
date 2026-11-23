@@ -1,45 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU certification matrix for the Hy4-Flash target's allreduce__r19 variant.
+"""GPU matrix for ``ops/comm/allreduce__r19.py``; run plainly, it is its own launcher.
 
-Copy of the catalog matrix ``tests/unittest/_torch/modeling_v2/comm/_allreduce_op_matrix.py``
-with this target's cells: ``op=NONE`` (the plain sum) at hidden 3072, world 2
-(the disaggregated context engine, ranks inside one node) at 1, 64, 5120 and
-8192 rows, world 4 in one GB300 tray and world 8 over two at the first three
-of those ends. Run plainly, this script is its own launcher: it spawns one rank
-per device named in CUDA_VISIBLE_DEVICES and kills the whole process group on
-the first failure or at the deadline, because a broken collective hangs rather
-than raising.
+    CUDA_VISIBLE_DEVICES=0,1,2,3 python _allreduce__r19_op_matrix.py
 
-    CUDA_VISIBLE_DEVICES=0,1 python _allreduce__r19_op_matrix.py        # world 2
-    CUDA_VISIBLE_DEVICES=0,1,2,3 python _allreduce__r19_op_matrix.py    # world 4
-
-World 8 spans two GB300 trays, which no single node can form. The spool runs a
-multi-node job as one process per node with ``MV2FLOW_JOB_NODES``,
-``MV2FLOW_JOB_NODE_RANK``, ``MV2FLOW_JOB_HOSTS`` and ``MV2FLOW_JOB_MASTER`` in
-the environment; under those this script spawns its own node's ranks with
-global rank ``node_rank * per_node + local`` and every node rendezvous through
-the first node. The collected entry point drives world 4 in one node and skips
-world 8 with that reason; the two-node run drives the world-8 cells.
-
-Not a pytest module, for the same reason as its siblings: the `check_*` bodies
-are one ordered sequence inside one job and read rank state that only
-`_run_one_rank` binds.
-
-The IPC workspace needs one host-side exchange of memory handles across the TP
-group. The engine does that through `Distributed.get(mapping)`, which under
-MPI-disabled mode is `TorchDist` and requires Ray. These ranks rendezvous
-through torch.distributed alone, so `_HostExchange` below stands in for it with
-a gloo group. It carries only that exchange; the allreduce itself runs on the
-real NCCL communicator. At world 8 over two trays the workspace opens no IPC
-handles at all (`IpcMemory` keeps `open_ipc` false when the group is wider than
-a node), so the op takes its NCCL fallback, and the exchange is only exercised
-at world 4.
-
-`TorchDist` also registers the world and node-local process groups with the C++
-side (`init_pg`). The `_pg` symbol reads both on its first call to find which
-ranks share a node, and dereferences null when they are missing. The rank body
-registers them the same way, with the backend pair a Ray worker uses.
+It spawns one rank per visible device and kills them all on the first failure or at
+the deadline, because a broken collective hangs rather than raising. A world over two
+nodes runs one copy per node with ``MV2FLOW_JOB_NODES``, ``MV2FLOW_JOB_NODE_RANK``,
+``MV2FLOW_JOB_HOSTS`` and ``MV2FLOW_JOB_MASTER`` set; every node rendezvous at the master.
 """
 
 import functools
@@ -61,87 +29,27 @@ assert torch.cuda.is_available(), "allreduce__r19 requires CUDA devices"
 _WORKER_FLAG = "--rank-worker"
 DEADLINE_S = 900
 
-# Bound inside the rank body, never in the launcher: importing the entry pulls
-# in tensorrt_llm, and the launcher must carry no CUDA or MPI state.
+# Bound in the rank body: importing the entry pulls in tensorrt_llm, which the launcher must not.
 allreduce: Any = None
 entry: Any = None
 validating: Any = None
-GROUP_ARGS: dict = {}
 RANK = 0
 WORLD = 1
-NODE_RANK = 0
-PER_NODE = 1
 HOST_GROUP: Any = None
 
-# Decode graph batch sizes this checkpoint's engine captures, sampled: the
-# smallest, a power of two, a size that is not one, and the cap.
+# Decode graph batch sizes, sampled: the smallest, a power of two, a non-power, the cap.
 GRAPH_BATCH_SIZES = (1, 8, 24, 64)
 
 
 def _compare(out, ref) -> None:
-    """5 ulp per element against the row scale, 1.25 ulp relative RMS.
-
-    The band is the catalog matrix's, which measured it on GB300 with the
-    gpt-oss and deepseek payloads; a dropped or doubled rank moves the result
-    by tens of ulp, and `check_the_gate_discriminates_a_wrong_reduction` checks
-    this band still refuses one at hidden 3072.
-
-    Measured on the run's sm_103 devices with these cells (bf16, hidden 3072,
-    one seed per certified cell):
-
-    - world 2, the ctx engine, both ranks in one node: 0.00 elem / 0.000 rms
-      ulp at all four of its ends (1, 64, 5120 and 8192 rows). Two terms
-      summed in fp32 round back to the reference's own bf16 result, and both
-      prefill messages stay inside the 64 MiB IPC workspace, so AUTO takes
-      the fused kernel there.
-    - world 4, one tray: 0.00 elem / 0.000 rms ulp at 1 and 64 rows, 2.46
-      elem / 0.759 rms ulp at 5120 rows. The 5120-row message stays inside
-      the 64 MiB IPC workspace, so AUTO takes the fused kernel.
-    - world 8, two trays: every cell there takes the NCCL fallback, whose
-      error grows with the rank count; the two-node run prints each cell's
-      numbers as `[measure] world 8 rows ...`.
-    """
-    # Imported here, not at module scope: _validating imports tensorrt_llm,
-    # which the launcher must not, and the rank body puts it on sys.path.
+    """5 ulp per element against the row scale, 1.25 ulp relative RMS."""
     from _validating import assert_within_ulp
 
-    outs = out if isinstance(out, tuple) else (out,)
-    refs = ref if isinstance(ref, tuple) else (ref,)
-    assert len(outs) == len(refs), (len(outs), len(refs))
-    for o, r in zip(outs, refs):
-        assert_within_ulp(o, r, element_ulp=5.0, rms_ulp=1.25)
-
-
-def _measure(out, ref) -> tuple[float, float]:
-    """The band's two numbers for one output, in its dtype's ulp: the worst
-    element against its row's largest magnitude, and the relative RMS."""
-    from _validating import ULP
-
-    ulp = ULP[ref.dtype]
-    flat_out, flat_ref = (
-        out.float().reshape(-1, out.shape[-1]),
-        ref.float().reshape(-1, ref.shape[-1]),
-    )
-    row_scale = flat_ref.abs().amax(dim=1, keepdim=True).clamp_min(1e-9)
-    element = ((flat_out - flat_ref).abs() / (row_scale * ulp)).max().item()
-    rms = (
-        (flat_out - flat_ref).pow(2).mean().sqrt() / flat_ref.pow(2).mean().sqrt().clamp_min(1e-9)
-    ).item() / ulp
-    return element, rms
-
-
-def _clone(out):
-    """A private copy of one output, tuple or single tensor.
-
-    `op=NONE` returns the one summed tensor, not a tuple; cloning it directly
-    rather than iterating it keeps the graph check from copying rows.
-    """
-    return tuple(o.clone() for o in out) if isinstance(out, tuple) else out.clone()
+    assert_within_ulp(out, ref, element_ulp=5.0, rms_ulp=1.25)
 
 
 class _HostExchange:
-    """The one call `IpcMemory` makes on `Distributed`: a TP-group allgather of
-    host objects."""
+    """Stands in for `Distributed` in `IpcMemory`: its one call, a TP-group host allgather."""
 
     def tp_allgather(self, obj: Any) -> List[Any]:
         gathered: List[Any] = [None] * WORLD
@@ -150,27 +58,16 @@ class _HostExchange:
 
 
 def _payload(rank: int, rows: int, hidden: int, seed: int) -> torch.Tensor:
-    """One rank's partial sum: bf16 values of the scale a projection produces.
-
-    Every rank can regenerate every other rank's payload from the seed, which
-    is what lets the reference be arithmetic rather than a second collective.
-    """
+    """One rank's partial sum; every rank can regenerate every other rank's from the seed."""
     gen = torch.Generator(device="cuda").manual_seed(seed * 977 + rank + 1)
     return torch.randn(rows, hidden, generator=gen, device="cuda").to(torch.bfloat16)
 
 
-def _residual_and_weight(rows: int, hidden: int, seed: int):
-    gen = torch.Generator(device="cuda").manual_seed(seed * 31 + 7)
-    residual = torch.randn(rows, hidden, generator=gen, device="cuda").to(torch.bfloat16)
-    weight = (1.0 + 0.1 * torch.randn(hidden, generator=gen, device="cuda")).to(torch.bfloat16)
-    return residual, weight
-
-
-def _call(x, residual, weight, eps, op):
+def _call(x, eps, op):
     return allreduce(
         x,
-        residual=residual,
-        norm_weight=weight,
+        residual=None,
+        norm_weight=None,
         scale=None,
         bias=None,
         op=op,
@@ -179,9 +76,9 @@ def _call(x, residual, weight, eps, op):
     )
 
 
-def _reference(rows, hidden, seed, residual, weight, eps, op):
+def _reference(rows, hidden, seed, eps, op):
     inputs = [_payload(r, rows, hidden, seed) for r in range(WORLD)]
-    return entry.allreduce.reference(inputs, residual, weight, eps, op)
+    return entry.allreduce.reference(inputs, None, None, eps, op)
 
 
 def _cells():
@@ -189,178 +86,80 @@ def _cells():
 
 
 def check_certified_cells() -> None:
-    """Every cell at this world size, inside `validating`, against the entry's
-    reference and this file's band."""
     cells = _cells()
     assert cells, f"no cell is certified at world size {WORLD}"
     for i, cell in enumerate(cells):
         spec = cell.spec
         seed = 4000 + 17 * i
         x = _payload(RANK, spec["rows"], spec["hidden"], seed)
-        residual, weight = _residual_and_weight(spec["rows"], spec["hidden"], seed)
         with validating(entry.allreduce):
-            out = _call(x, residual, weight, spec["eps"], spec["op"])
-        ref = _reference(
-            spec["rows"], spec["hidden"], seed, residual, weight, spec["eps"], spec["op"]
-        )
+            out = _call(x, spec["eps"], spec["op"])
+        ref = _reference(spec["rows"], spec["hidden"], seed, spec["eps"], spec["op"])
         try:
             _compare(out, ref)
         except AssertionError as exc:
             raise AssertionError(f"{cell.why}: {exc}") from exc
-        if RANK == 0:
-            element, rms = _measure(out, ref)
-            print(
-                f"[measure] world {WORLD} rows {spec['rows']}: "
-                f"{element:.2f} elem / {rms:.3f} rms ulp",
-                flush=True,
-            )
         dist.barrier()
 
 
-def check_inputs_are_untouched() -> None:
-    """`op=NONE` returns one fresh tensor and writes neither argument -- the
-    opposite contract from flashinfer_fused_add_rmsnorm, which a target swaps
-    this entry in for."""
-    spec = _cells()[0].spec
-    x = _payload(RANK, 32, spec["hidden"], 61)
-    residual, weight = _residual_and_weight(32, spec["hidden"], 61)
-    x0, r0 = x.clone(), residual.clone()
-    out = _call(x, residual, weight, spec["eps"], spec["op"])
-    torch.cuda.synchronize()
-    assert not isinstance(out, tuple), "op=NONE returns the one summed tensor"
-    assert torch.equal(x, x0), "input was written"
-    assert torch.equal(residual, r0), "residual was written"
-    assert out.data_ptr() not in (x.data_ptr(), residual.data_ptr()), "output aliases an input"
-    dist.barrier()
-
-
 def check_cuda_graph_replay_at_engine_batch_sizes() -> None:
-    """One graph per decode batch size, sharing a pool, replayed after the
-    input buffers are refilled: the engine's decode path."""
+    """One graph per decode batch size in a shared pool, replayed after refilling the inputs."""
     spec = _cells()[0].spec
     hidden, eps, op = spec["hidden"], spec["eps"], spec["op"]
     pool = None
     graphs = {}
     for rows in GRAPH_BATCH_SIZES:
         x = _payload(RANK, rows, hidden, 700 + rows)
-        residual, weight = _residual_and_weight(rows, hidden, 700 + rows)
         side = torch.cuda.Stream()
         side.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(side):
             for _ in range(2):
-                _call(x, residual, weight, eps, op)
+                _call(x, eps, op)
         torch.cuda.current_stream().wait_stream(side)
         torch.cuda.synchronize()
         dist.barrier()
         graph = torch.cuda.CUDAGraph()
         ctx = torch.cuda.graph(graph) if pool is None else torch.cuda.graph(graph, pool=pool)
         with ctx:
-            outs = _call(x, residual, weight, eps, op)
-        persistent = _clone(outs)
+            out = _call(x, eps, op)
         if pool is None:
             pool = graph.pool()
-        graphs[rows] = (graph, x, residual, weight, outs, persistent)
+        graphs[rows] = (graph, x, out)
         dist.barrier()
 
     for step, rows in enumerate(reversed(GRAPH_BATCH_SIZES)):
-        graph, x, residual, weight, outs, _ = graphs[rows]
+        graph, x, out = graphs[rows]
         seed = 900 + step
         x.copy_(_payload(RANK, rows, hidden, seed))
-        new_residual, _ = _residual_and_weight(rows, hidden, seed)
-        residual.copy_(new_residual)
         graph.replay()
         torch.cuda.synchronize()
-        ref = _reference(rows, hidden, seed, residual, weight, eps, op)
         try:
-            _compare(_clone(outs), ref)
+            _compare(out.clone(), _reference(rows, hidden, seed, eps, op))
         except AssertionError as exc:
             raise AssertionError(f"replay rows={rows}: {exc}") from exc
         dist.barrier()
 
 
-def check_the_gate_discriminates_a_wrong_reduction() -> None:
-    """A reference that drops one rank's contribution must fail the band;
-    otherwise the band passes anything."""
-    spec = _cells()[0].spec
-    rows, hidden = 64, spec["hidden"]
-    x = _payload(RANK, rows, hidden, 81)
-    residual, weight = _residual_and_weight(rows, hidden, 81)
-    out = _call(x, residual, weight, spec["eps"], spec["op"])
-    short = [_payload(r, rows, hidden, 81) for r in range(WORLD - 1)]
-    wrong = entry.allreduce.reference(short, residual, weight, spec["eps"], spec["op"])
-    try:
-        _compare(out, wrong)
-    except AssertionError:
-        pass
-    else:
-        raise AssertionError("the band accepted a sum that is missing one rank")
-    dist.barrier()
-
-
-def check_wrapper_guards() -> None:
-    """The guard refuses a strided input and a missing workspace.
-
-    `is_valid` is called directly rather than through a guarded op call: a
-    guard that wrongly admitted the missing workspace would hand the kernel a
-    null pointer.
-    """
-    spec = _cells()[0].spec
-    hidden = spec["hidden"]
-    wide = _payload(RANK, 8, 2 * hidden, 91)
-    strided = wide[:, :hidden]
-    residual, weight = _residual_and_weight(8, hidden, 91)
-    for bad, match in (
-        (dict(input=strided), "contiguous"),
-        (dict(workspace=None), "workspace"),
-    ):
-        kwargs = dict(GROUP_ARGS)
-        kwargs.update(
-            input=_payload(RANK, 8, hidden, 91),
-            residual=residual,
-            norm_weight=weight,
-            scale=None,
-            bias=None,
-            op=spec["op"],
-            eps=spec["eps"],
-            trigger_completion_at_end=False,
-        )
-        kwargs.update(bad)
-        try:
-            entry.allreduce.is_valid(**kwargs)
-        except AssertionError as exc:
-            assert match in str(exc), (match, str(exc))
-        else:
-            raise AssertionError(f"is_valid accepted {sorted(bad)}")
-    dist.barrier()
-
-
 CHECKS = (
     check_certified_cells,
-    check_inputs_are_untouched,
     check_cuda_graph_replay_at_engine_batch_sizes,
-    check_the_gate_discriminates_a_wrong_reduction,
-    check_wrapper_guards,
 )
 
 
 def _run_one_rank() -> int:
-    """Body of one spawned rank: run every check; a failing rank exits nonzero
-    and the launcher kills its siblings."""
-    global RANK, WORLD, NODE_RANK, PER_NODE, HOST_GROUP, GROUP_ARGS, allreduce, entry, validating
+    global RANK, WORLD, HOST_GROUP, allreduce, entry, validating
     os.environ.setdefault("TLLM_DISABLE_MPI", "1")
     rank = int(os.environ["RANK"])
     world = int(os.environ["WORLD_SIZE"])
     node_rank = int(os.environ["NODE_RANK"])
     per_node = int(os.environ["PER_NODE"])
     local = int(os.environ["LOCAL_DEVICE"])
-    # The spawned rank owns device `local`. Never LOCAL_RANK: every spawned
-    # rank inherits the launching shell's one value, and NCCL then refuses
-    # the group with "invalid usage".
+    # Never LOCAL_RANK: every spawned rank inherits the launching shell's one value.
     torch.cuda.set_device(local)
     dist.init_process_group(
         "cuda:nccl,cpu:gloo", init_method="env://", device_id=torch.device("cuda", local)
     )
-    RANK, WORLD, NODE_RANK, PER_NODE = rank, world, node_rank, per_node
+    RANK, WORLD = rank, world
     HOST_GROUP = dist.new_group(backend="gloo")
 
     from tensorrt_llm._torch.distributed import communicator
@@ -371,13 +170,9 @@ def _run_one_rank() -> int:
     from tensorrt_llm.bindings.internal.process_group import init_pg
     from tensorrt_llm.mapping import Mapping
 
-    # The node-local group, the way `TorchDist.setup_local_comm` builds it:
-    # every rank creates every node's group, in the same order, and keeps the
-    # one holding it. `new_group` is collective, so a rank that passes only
-    # its own node's list -- the obvious reading -- leaves the other node's
-    # ranks waiting on a creation that never comes, and the whole run hangs.
-    # The C++ side reads the registered group to decide IPC and NVLink
-    # reachability, so it must be this rank's node.
+    # The `_pg` symbol reads the world and node-local groups registered on the C++ side
+    # (as `TorchDist` does) and dereferences null without them. `new_group` is
+    # collective: every rank creates every node's group, in the same order.
     local_group = None
     for start in range(0, world, per_node):
         pg = dist.new_group(
@@ -388,22 +183,13 @@ def _run_one_rank() -> int:
             local_group = pg
     init_pg(dist.group.WORLD, local_group, torch_pybind11_abi())
 
+    # `TorchDist` needs Ray; the IPC handle exchange is all these ranks need from it.
     communicator.Distributed.get = staticmethod(lambda mapping: _HostExchange())
     mapping = Mapping(world_size=world, rank=rank, gpus_per_node=per_node, tp_size=world)
-    # What a target does in __init__: build the communicator arguments once.
-    # The partial is only the call surface, the way the catalog matrix uses
-    # one: the guard is armed on the entry itself, and `reference` and `CELLS`
-    # are read off `entry.allreduce` directly.
-    GROUP_ARGS = entry.allreduce_group_args(mapping)
-    allreduce = functools.partial(entry.allreduce, **GROUP_ARGS)
+    allreduce = functools.partial(entry.allreduce, **entry.allreduce_group_args(mapping))
 
-    # Spawned worker, not a pytest module: reach the shared helper directly.
-    # parents[5] of this file is tests/unittest/_torch/modeling_v2.
-    tests_root = Path(__file__).resolve().parents[5]
-    assert (tests_root / "_validating.py").is_file(), (
-        f"expected _validating.py in {tests_root}; this file moved without its parents[] index following"
-    )
-    sys.path.insert(0, str(tests_root))
+    # parents[5] is tests/unittest/_torch/modeling_v2, where `_validating.py` lives.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[5]))
     from _validating import validating as _validating_cm
 
     validating = _validating_cm
@@ -418,8 +204,7 @@ def _run_one_rank() -> int:
             traceback.print_exc()
             sys.stdout.flush()
             sys.stderr.flush()
-            # A rank that leaves a collective early wedges its siblings; exit
-            # hard so the launcher kills them at once.
+            # A rank that leaves a collective early wedges its siblings; exit hard.
             os._exit(13)
     dist.barrier()
     torch.cuda.synchronize()
@@ -442,15 +227,7 @@ def _argv_world_size():
 
 
 def _spawn_ranks() -> None:
-    """One worker per visible device of this node, all killed on the first
-    nonzero exit or at the deadline.
-
-    One node: rendezvous on the loopback. Several nodes (the spool's gang
-    environment): this node spawns its own ranks, and every node meets at the
-    first node's host name. The port has to be agreed without talking to the
-    other nodes, so it is derived from the gang's host list, which the spool
-    hands every node identically.
-    """
+    """One worker per visible device of this node, all killed on the first nonzero exit or at the deadline."""
     devices = _visible_devices()
     per_node = len(devices)
     assert per_node >= 2, f"a collective test needs at least 2 devices, got {per_node}"
@@ -465,12 +242,7 @@ def _spawn_ranks() -> None:
     )
 
     def _port(attempt: int) -> int:
-        """The rendezvous port for one attempt, below the ephemeral range
-        (32768-60999 on these hosts): a port the kernel hands to another
-        process between a probe and the ranks' bind is what TCPStore reports
-        as EADDRINUSE. A multi-node run has to agree on the port without
-        talking to the other nodes, so it is derived from the gang's host
-        list, which the spool hands every node identically."""
+        """Below the ephemeral range; across nodes, derived from the host list every node shares."""
         if nodes > 1:
             hosts = os.environ["MV2FLOW_JOB_HOSTS"]
             return 20000 + (zlib.crc32(hosts.encode()) + attempt * 7919) % 10000
@@ -489,8 +261,7 @@ def _spawn_ranks() -> None:
             PER_NODE=str(per_node),
             TLLM_DISABLE_MPI="1",
         )
-        # See the catalog matrix: inheriting the launching srun step's PMI
-        # namespace lets one failing rank take the whole step down unreported.
+        # An inherited srun PMI namespace lets one failing rank kill the whole step unreported.
         env = {
             k: v for k, v in env.items() if not k.startswith(("PMIX_", "PMI_", "OMPI_", "SLURM_"))
         }

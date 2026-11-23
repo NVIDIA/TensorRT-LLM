@@ -99,9 +99,7 @@ def _register_custom_configs_with_transformers() -> None:
         "glm5_next": Glm5NextConfig,
         "glm5_next_text": Glm5NextTextConfig,
         "glm5_next_vision": Glm5NextVisionConfig,
-        # HY4-Flash composite config ("hy_v4_flash") and its two sub-configs. The
-        # checkpoint labels its nested vision tower with the composite's own
-        # model_type, so the tower gets a distinct name of its own.
+        # The checkpoint labels its vision tower with the composite's model_type, so it gets its own.
         "hy_v4_flash": HYV4FlashConfig,
         "hy_v4_flash_text": HYV4FlashTextConfig,
         "hy_v4_flash_vision": HYV4FlashVisionConfig,

@@ -1881,30 +1881,26 @@ void invokeMLARopeContext(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, c
     }
 }
 
-// Launch the non-absorption FP8 quantize-copy for one set of context head widths. The kernel's
-// block covers whole heads, so the head widths are template parameters and the grid is derived
-// from the tokens one block covers.
+// Q-only FP8 quantize-copy (K/V already FP8). A block covers whole heads, so the head widths are template parameters.
 template <typename T, int QK_NOPE_HEAD_DIM, int QK_ROPE_HEAD_DIM, int V_HEAD_DIM>
-void launchMlaContextFp8QuantizeKernel(MlaParams<T> const& params, int grid_len, int q_len, int total_kv_len,
-    size_t src_v_token_stride, int num_heads_z, T const* k_buf, __nv_fp8_e4m3* quant_k_buf, T const* v_buf,
-    __nv_fp8_e4m3* quant_v_buf, cudaStream_t stream)
+void launchMlaContextFp8QuantizeQ(
+    MlaParams<T> const& params, int q_len, int num_heads_z, size_t src_v_token_stride, cudaStream_t stream)
 {
     constexpr int threads_per_block = 384;
-    constexpr int qk_head_dim = QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM;
-    constexpr int qk_tokens_per_block = threads_per_block / (qk_head_dim * static_cast<int>(sizeof(T)) / 16);
-    int const tokens_per_block = qk_tokens_per_block;
-    dim3 grid(std::max(1, int(tensorrt_llm::common::divUp(grid_len, tokens_per_block))), 1, num_heads_z);
+    constexpr int tokens_per_block
+        = threads_per_block / ((QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM) * static_cast<int>(sizeof(T)) / 16);
+    dim3 grid(std::max(1, int(tensorrt_llm::common::divUp(q_len, tokens_per_block))), 1, num_heads_z);
 
     TLLM_LOG_DEBUG(
-        "Launching quantizeCopyInputToFp8Kernel with grid_size: (%d, %d, %d), threads_per_block: %d, "
-        "total_kv_len: %d, acc_q_len: %d, absorption_mode: 0",
-        grid.x, grid.y, grid.z, threads_per_block, total_kv_len, params.acc_q_len);
+        "Launching quantizeCopyInputToFp8Kernel (FP8 K/V input) with grid_size: (%d, %d, %d), "
+        "threads_per_block: %d, acc_q_len: %d, fp8_q_input: %d",
+        grid.x, grid.y, grid.z, threads_per_block, params.acc_q_len, params.fp8_q_input);
 
     quantizeCopyInputToFp8Kernel<T, threads_per_block, QK_NOPE_HEAD_DIM, QK_ROPE_HEAD_DIM, V_HEAD_DIM, false>
-        <<<grid, threads_per_block, 0, stream>>>(params.q_buf, static_cast<__nv_fp8_e4m3*>(params.quant_q_buf), k_buf,
-            quant_k_buf, v_buf, quant_v_buf, q_len, total_kv_len, src_v_token_stride, params.quant_scale_qkv,
-            params.bmm1_scale, params.bmm2_scale, params.quant_scale_o, params.dequant_scale_q, params.dequant_scale_kv,
-            params.host_bmm1_scale);
+        <<<grid, threads_per_block, 0, stream>>>(params.q_buf, static_cast<__nv_fp8_e4m3*>(params.quant_q_buf),
+            /*k_buf=*/nullptr, /*quant_k_buf=*/nullptr, /*v_buf=*/nullptr, /*quant_v_buf=*/nullptr, q_len,
+            /*total_kv_len=*/0, src_v_token_stride, params.quant_scale_qkv, params.bmm1_scale, params.bmm2_scale,
+            params.quant_scale_o, params.dequant_scale_q, params.dequant_scale_kv, params.host_bmm1_scale);
 }
 
 template <typename T>
@@ -1985,28 +1981,22 @@ void invokeMLAContextFp8Quantize(MlaParams<T>& params, int total_kv_len, cudaStr
         {
             // K and V are FP8 already: quantize Q only, or nothing when it is FP8 too. Block 0 still
             // writes the BMM scales.
+            int const q_len = params.fp8_q_input ? 0 : params.acc_q_len;
+            int const num_heads_z = params.fp8_q_input ? 1 : params.head_num;
             int const qk_nope_head_dim = params.meta.qk_nope_head_dim;
             int const qk_rope_head_dim = params.meta.qk_rope_head_dim;
             int const v_head_dim = params.meta.v_head_dim;
-            int const q_len = params.fp8_q_input ? 0 : params.acc_q_len;
-            int const num_heads_z = params.fp8_q_input ? 1 : params.head_num;
             if (qk_nope_head_dim == 192 && qk_rope_head_dim == 64 && v_head_dim == 256)
             {
-                launchMlaContextFp8QuantizeKernel<T, 192, 64, 256>(params, q_len, q_len, /*total_kv_len=*/0,
-                    srcVTokenStride, num_heads_z, /*k_buf=*/nullptr, /*quant_k_buf=*/nullptr, /*v_buf=*/nullptr,
-                    /*quant_v_buf=*/nullptr, stream);
+                launchMlaContextFp8QuantizeQ<T, 192, 64, 256>(params, q_len, num_heads_z, srcVTokenStride, stream);
             }
             else if (qk_nope_head_dim == 128 && qk_rope_head_dim == 64 && v_head_dim == 128)
             {
-                launchMlaContextFp8QuantizeKernel<T, 128, 64, 128>(params, q_len, q_len, /*total_kv_len=*/0,
-                    srcVTokenStride, num_heads_z, /*k_buf=*/nullptr, /*quant_k_buf=*/nullptr, /*v_buf=*/nullptr,
-                    /*quant_v_buf=*/nullptr, stream);
+                launchMlaContextFp8QuantizeQ<T, 128, 64, 128>(params, q_len, num_heads_z, srcVTokenStride, stream);
             }
             else
             {
-                TLLM_CHECK_WITH_INFO(false,
-                    "MLA context FP8 quantize-copy has no kernel for qk_nope=%d qk_rope=%d v=%d; it is "
-                    "instantiated for (192, 64, 256) and (128, 64, 128).",
+                TLLM_THROW("MLA context FP8 Q quantize supports (192, 64, 256) or (128, 64, 128), got (%d, %d, %d).",
                     qk_nope_head_dim, qk_rope_head_dim, v_head_dim);
             }
         }
@@ -2062,17 +2052,14 @@ void invokeMLAContextFp8Quantize(MlaParams<T>& params, int total_kv_len, cudaStr
     }
 }
 
-// A windowed context call keeps, per sequence, the newest min(kvLen, window + qLen - 1) keys --
-// the oldest query of the call reaches back window - 1 keys from its own position -- and drops the
-// rest. The packed-QKV layout holds Q, K and V of one row, so the sequence's queries occupy the
-// last qLen rows of its block: row j then carries key (kvStart + j) and, for the tail rows, the
-// query whose own position is j, which is exactly what the kernel's causal position
-// qPosK = seqLenKv[b] - seqLenQ[b] + i expects when both lengths are the block length.
+// Per sequence, the packed block keeps the newest min(kvLen, window + qLen - 1) keys (the reach of
+// its oldest query) with the queries in its last qLen rows, so the kernel's causal position
+// seqLenKv - seqLenQ + i matches the true window when both lengths are the block length.
 __global__ void mlaWindowedPackedSeqLensKernel(int32_t const* __restrict__ cuQSeqLens,
     int32_t const* __restrict__ cuKvSeqLens, int32_t seqStart, int32_t seqEnd, int32_t windowSize,
     int32_t* __restrict__ packedCumKv, int32_t* __restrict__ packedKvLens)
 {
-    // The offsets are a prefix sum over the group, and a windowed group's sequence count is small.
+    // Serial prefix sum: a group holds few sequences.
     if (threadIdx.x != 0 || blockIdx.x != 0)
     {
         return;
@@ -2091,20 +2078,16 @@ __global__ void mlaWindowedPackedSeqLensKernel(int32_t const* __restrict__ cuQSe
     }
 }
 
-// Copy one segment (Q, K or V) of each row into its packed block. Every segment is a whole
-// number of heads, so the copy is a byte range and one kernel serves bf16 and fp8 operands.
+// Copies one [Q | K | V] segment of one row into its packed block. Segments are whole heads, so
+// the copy is a byte range serving bf16 and fp8 alike.
 __global__ void mlaWindowedPackedQkvPackKernel(void const* __restrict__ qSrc, void const* __restrict__ kSrc,
     void const* __restrict__ vSrc, int64_t qSrcRowBytes, int64_t kSrcRowBytes, int64_t vSrcRowBytes, int32_t qSegBytes,
     int32_t kSegBytes, int32_t vSegBytes, void* __restrict__ packed, int64_t packedRowBytes,
     int32_t const* __restrict__ packedCumKv, int32_t const* __restrict__ cuQSeqLens,
-    int32_t const* __restrict__ cuKvSeqLens, int32_t seqStart, int32_t seqEnd)
+    int32_t const* __restrict__ cuKvSeqLens, int32_t seqStart)
 {
     int32_t const b = blockIdx.y;
     int32_t const s = seqStart + b;
-    if (s >= seqEnd)
-    {
-        return;
-    }
     int32_t const packedLen = packedCumKv[b + 1] - packedCumKv[b];
     int32_t const j = blockIdx.x;
     if (j >= packedLen)
@@ -2114,7 +2097,6 @@ __global__ void mlaWindowedPackedQkvPackKernel(void const* __restrict__ qSrc, vo
     int32_t const qLen = cuQSeqLens[s + 1] - cuQSeqLens[s];
     int64_t const kvStart = static_cast<int64_t>(cuKvSeqLens[s + 1] - cuKvSeqLens[s]) - packedLen;
 
-    // The layout is [Q | K | V] within a row.
     void const* src = nullptr;
     int64_t srcRow = 0;
     int64_t srcRowBytes = 0;
@@ -2122,7 +2104,7 @@ __global__ void mlaWindowedPackedQkvPackKernel(void const* __restrict__ qSrc, vo
     int64_t segOffset = 0;
     if (blockIdx.z == 0)
     {
-        // The queries sit in the tail rows of the block; the rows before them carry no query.
+        // Only the tail qLen rows carry a query.
         if (j < packedLen - qLen)
         {
             return;
@@ -2131,11 +2113,9 @@ __global__ void mlaWindowedPackedQkvPackKernel(void const* __restrict__ qSrc, vo
         srcRow = static_cast<int64_t>(cuQSeqLens[s]) + (j - (packedLen - qLen));
         srcRowBytes = qSrcRowBytes;
         segBytes = qSegBytes;
-        segOffset = 0;
     }
     else if (blockIdx.z == 1)
     {
-        // The kept keys are the tail of the sequence's own K rows.
         src = kSrc;
         srcRow = static_cast<int64_t>(cuKvSeqLens[s]) + kvStart + j;
         srcRowBytes = kSrcRowBytes;
@@ -2150,10 +2130,6 @@ __global__ void mlaWindowedPackedQkvPackKernel(void const* __restrict__ qSrc, vo
         segBytes = vSegBytes;
         segOffset = static_cast<int64_t>(qSegBytes) + kSegBytes;
     }
-    if (segBytes <= 0)
-    {
-        return;
-    }
 
     char const* srcRowPtr = static_cast<char const*>(src) + srcRow * srcRowBytes;
     char* dstRowPtr
@@ -2167,17 +2143,13 @@ __global__ void mlaWindowedPackedQkvPackKernel(void const* __restrict__ qSrc, vo
     }
 }
 
-// Move each sequence's query rows from their packed positions to the compact output rows.
+// Moves each sequence's query rows from their packed positions to the compact output rows.
 __global__ void mlaWindowedPackedOutputCompactKernel(void const* __restrict__ packedO, void* __restrict__ out,
     int64_t outRowBytes, int32_t const* __restrict__ packedCumKv, int32_t const* __restrict__ cuQSeqLens,
-    int32_t seqStart, int32_t seqEnd)
+    int32_t seqStart)
 {
     int32_t const b = blockIdx.y;
     int32_t const s = seqStart + b;
-    if (s >= seqEnd)
-    {
-        return;
-    }
     int32_t const qLen = cuQSeqLens[s + 1] - cuQSeqLens[s];
     int32_t const i = blockIdx.x;
     if (i >= qLen)
@@ -2200,8 +2172,6 @@ __global__ void mlaWindowedPackedOutputCompactKernel(void const* __restrict__ pa
 void invokeMlaWindowedPackedSeqLens(int32_t const* cuQSeqLens, int32_t const* cuKvSeqLens, int32_t seqStart,
     int32_t seqEnd, int32_t windowSize, int32_t* packedCumKv, int32_t* packedKvLens, cudaStream_t stream)
 {
-    TLLM_CHECK_WITH_INFO(
-        seqEnd > seqStart && windowSize > 0, "Windowed packed MLA needs a non-empty group and a window.");
     mlaWindowedPackedSeqLensKernel<<<1, 32, 0, stream>>>(
         cuQSeqLens, cuKvSeqLens, seqStart, seqEnd, windowSize, packedCumKv, packedKvLens);
 }
@@ -2213,7 +2183,7 @@ void invokeMlaWindowedPackedQkvPack(void const* qSrc, void const* kSrc, void con
 {
     TLLM_CHECK_WITH_INFO(qSrc != nullptr && kSrc != nullptr && vSrc != nullptr && packed != nullptr,
         "Windowed packed MLA needs non-null Q, K, V and packed buffers.");
-    // The copies move whole 16-byte vectors, so every segment and row stride must hold them.
+    // The copies move whole 16-byte vectors.
     TLLM_CHECK_WITH_INFO((qSegBytes & 15) == 0 && (kSegBytes & 15) == 0 && (vSegBytes & 15) == 0
             && (qSrcRowBytes & 15) == 0 && (kSrcRowBytes & 15) == 0 && (vSrcRowBytes & 15) == 0
             && (packedRowBytes & 15) == 0,
@@ -2222,7 +2192,7 @@ void invokeMlaWindowedPackedQkvPack(void const* qSrc, void const* kSrc, void con
     dim3 const grid(maxRows, seqEnd - seqStart, 3);
     mlaWindowedPackedQkvPackKernel<<<grid, kThreads, 0, stream>>>(qSrc, kSrc, vSrc, qSrcRowBytes, kSrcRowBytes,
         vSrcRowBytes, qSegBytes, kSegBytes, vSegBytes, packed, packedRowBytes, packedCumKv, cuQSeqLens, cuKvSeqLens,
-        seqStart, seqEnd);
+        seqStart);
 }
 
 void invokeMlaWindowedPackedOutputCompact(void const* packedO, void* out, int64_t outRowBytes,
@@ -2234,7 +2204,7 @@ void invokeMlaWindowedPackedOutputCompact(void const* packedO, void* out, int64_
     constexpr int32_t kThreads = 256;
     dim3 const grid(maxQSeqLen, seqEnd - seqStart);
     mlaWindowedPackedOutputCompactKernel<<<grid, kThreads, 0, stream>>>(
-        packedO, out, outRowBytes, packedCumKv, cuQSeqLens, seqStart, seqEnd);
+        packedO, out, outRowBytes, packedCumKv, cuQSeqLens, seqStart);
 }
 
 template <typename T, typename KVCacheBuffer>

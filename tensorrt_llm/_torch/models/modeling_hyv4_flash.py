@@ -1,21 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""HY4-Flash (``hy_v4_flash``) processor support.
+"""HY4-Flash (``hy_v4_flash``) processor stack and multimodal placeholder metadata.
 
-The transformers build this engine ships has no ``hy_v4_flash`` model type, so
-``AutoProcessor.from_pretrained(<checkpoint>)`` degrades to a bare tokenizer and
-``AutoConfig`` does not recognize the architecture. This module ports the
-checkpoint's own processor stack so the engine reads the checkpoint's
-``processor_config.json`` unchanged:
-
-- ``HYV4VLImageProcessor`` -- dynamic-resolution image processor (patch 16,
-  2x2 merge, row-major patch order);
-- ``HYV4VLVideoProcessor`` -- per-frame budgeted video processor;
-- ``HYV4FlashProcessor`` -- the processor ``AutoProcessor`` resolves by the
-  checkpoint's ``processor_class``.
-
-It also registers the model type's multimodal placeholder metadata so
-``tensorrt_llm.inputs`` builds a text+media conversation for ``hy_v4_flash``.
+The bundled transformers has no ``hy_v4_flash`` model type, so this ports the checkpoint's processors.
 
 Ported from HuggingFace Transformers at commit
 ``b865850d05326cf20e306b31f14b0027de802da3`` (PR #50903):
@@ -191,11 +178,7 @@ class HYV4VLImageProcessor(TorchvisionBackend):
             size = SizeDict(**size_dict)
         return super()._standardize_kwargs(size=size, **kwargs)
 
-    # The reference decorates this override with `@auto_docstring`, which only
-    # generates documentation. Transformers resolves a method's owner class by
-    # source filename when the decorator is applied to a method
-    # (`image_processing_*.py` here), so it raises in a `modeling_*.py` module;
-    # the docstring it would build adds nothing the base class lacks.
+    # Not `@auto_docstring` as upstream: on a method it raises outside an `image_processing_*.py` module.
     def preprocess(
         self,
         images: ImageInput,
@@ -739,13 +722,7 @@ class HYV4FlashProcessor(ProcessorMixin):
         processor_dict=None,
         **kwargs,
     ):
-        """Build the sub-processors from the checkpoint directory.
-
-        ``AutoImageProcessor``/``AutoVideoProcessor`` cannot resolve
-        ``HYV4VLImageProcessor``/``HYV4VLVideoProcessor`` on transformers builds
-        without native ``hy_v4_vl`` support, so the ported classes read the
-        checkpoint's nested ``processor_config.json`` sections directly.
-        """
+        """Build the sub-processors from the checkpoint (no ``hy_v4_vl`` Auto* classes here)."""
         del processor_dict
         component_kwargs = dict(kwargs)
         component_kwargs.pop("trust_remote_code", None)
@@ -765,9 +742,7 @@ class HYV4FlashProcessor(ProcessorMixin):
         return [image_processor, tokenizer, video_processor]
 
     def replace_image_token(self, image_inputs: dict, image_idx: int, **kwargs) -> str:
-        # The grid arrives as a tensor row from `image_processor`'s output or as
-        # a plain list; the int() conversion serves both (string repetition
-        # needs a Python int).
+        # The grid row may be a tensor or a list; string repetition needs Python ints.
         _, grid_h, grid_w = image_inputs["image_grid_thw"][image_idx]
         merge_size = kwargs.get("merge_size") or self.image_processor.merge_size
         return self.image_token * self._num_frame_tokens(int(grid_h), int(grid_w), int(merge_size))
@@ -867,9 +842,7 @@ def register_hyv4_flash_processor() -> None:
 
 register_hyv4_flash_processor()
 
-# One placeholder per media item: the checkpoint's chat template renders a start,
-# one pad and an end token per image/video, and the model expands the pad run to
-# `grid_h // merge * (grid_w // merge + 1)` tokens from `image_grid_thw`.
+# One placeholder per media item; the model expands the pad run from the grid.
 PLACEHOLDER_METADATA = MultimodalPlaceholderMetadata(
     placeholder_map={
         "image": "<｜hy_image▁start:opensource｜><｜hy_image▁pad:opensource｜><｜hy_image▁end:opensource｜>",

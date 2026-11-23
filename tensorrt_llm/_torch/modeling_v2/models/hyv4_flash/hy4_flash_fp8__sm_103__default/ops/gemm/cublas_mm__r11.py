@@ -1,19 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""General matmul with optional fused bias via the trtllm cuBLASLt gemm op.
-
-This target's copy of `catalog/gemm/cublas_mm`, certified at the projections
-this checkpoint's engine calls: q_a 3072->1024, kv_a 3072->576, kv_b 512->14336
-and 512->7168, the router gate 3072->512, the layer-0 dense MLP 3072->13824 and
-13824->3072 and the shared-expert / latent down projection 1536->3072, at one
-decode row, a 64-row block and a 5120-token prefill chunk.
-
-`kv_b` is the one projection whose width follows attention TP: the
-disaggregated deployment's context engine runs at attn_tp 2, where a sparse
-layer's `heads_local` is 16 (`dims.py`), so the weight it passes is
-512 -> 16 x 448 = 7168. The 14336 cells cover the whole checkpoint tensor at
-attn_tp 1 and the windowed layer's 32 local heads at attn_tp 2.
-"""
+"""General matmul with optional fused bias via the trtllm cuBLASLt gemm op, at this checkpoint's projections."""
 
 from __future__ import annotations
 
@@ -24,22 +11,11 @@ from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper, t
 
 
 class CublasMm(OpWrapper):
-    """`mat_a @ mat_b (+ bias)`, fp32-accumulated, one cublas_mm call.
-
-    `mat_b` is read column-major, which is what a stored weight's `.t()` already
-    is -- the targets pass `weight.t()` and no transpose kernel runs.
-
-    `torch.ops.trtllm.cublas_mm` is a compiled-in C++ kernel
-    (`cpp/tensorrt_llm/thop/cublasScaledMM.cpp`, `TORCH_LIBRARY_FRAGMENT(trtllm)`),
-    so the path that runs is the wheel's binary, not a JIT compilation.
-    """
+    """`mat_a @ mat_b (+ bias)`, fp32-accumulated; `mat_b` is read column-major, as a stored weight's `.t()` is."""
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # The first cell is the shared entry's own. The rest are this checkpoint's
-    # call sites, re-derived from its geometry: rows span a decode step, a
-    # 64-row block (the two shapes the checkpoint runs at that width) and a
-    # 5120-token prefill chunk, the largest row count its engine passes.
+    # The first cell is the shared entry's own; the rest are this checkpoint's call sites.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="decode-shaped: one token, the shape every projection sees per step",
@@ -128,32 +104,8 @@ class CublasMm(OpWrapper):
     )
 
     note = """
-    `output_buffer_kind` and `group` are the op's multi-stream and collective
-    arguments. The covered targets leave them at their defaults, so neither is
-    a cell axis and neither is certified here.
-
-    Certified on sm_103, this target's only arch, with the cells above. The
-    engine's largest prefill chunk is 5120 rows; larger row counts and the
-    indexer's own small projections (n = 128, 2048, 16) are uncertified.
-    `torch.ops.trtllm.cublas_mm` is a compiled-in C++ kernel, not a JIT path.
-
-    The two 7168-wide cells are the disaggregated deployment's context engine:
-    at attn_tp 2 a sparse layer holds 16 of its 32 heads (`dims.py`), so the
-    `kv_b` weight it passes is 512 -> 7168. The 14336 cells cover the same
-    engine's windowed layers (32 local heads) and attn_tp 1's sparse width.
-
-    The lm_head cells are the engine's rank-local vocabulary at tp4, a shape
-    this op is not called with: the shell's `LMHead` is built with this
-    target's `lm_head_output_dtype` of float32, so `LMHead.apply_linear` takes
-    `_matmul_with_output_dtype` (`torch.mm`), and `Hyv4FlashCore` leaves
-    `use_custom_cublas_mm` unset (`_torch/models/modeling_utils.py` reads it
-    when it builds the head). They certify the width, not a call site.
-    Worst measured difference across the cells: 0.46 of the test's 4-ulp
-    element band, on the latent down over a 5120-token chunk, and 2.8e-4
-    relative RMS (3.6% of the 2-ulp band) on the layer-0 MLP down over the
-    same. Each cell prints its own two numbers, so the certifying run's log
-    carries them. A product over another weight lands at 146x the element
-    band.
+    `output_buffer_kind` and `group` are uncertified (callers leave the defaults). The lm_head cells certify the
+    width only: this target's float32 `LMHead` goes through `torch.mm`, not this op.
     """
 
     def __call__(
@@ -176,7 +128,7 @@ class CublasMm(OpWrapper):
         output_buffer_kind: int = 0,
         group: list[int] | None = None,
     ) -> torch.Tensor:
-        """fp32-accumulated, TF32 off -- see `true_fp32_matmul`."""
+        """fp32-accumulated, TF32 off."""
         with true_fp32_matmul():
             ref = mat_a.float() @ mat_b.float()
         if bias is not None:
@@ -192,17 +144,13 @@ class CublasMm(OpWrapper):
         output_buffer_kind: int = 0,
         group: list[int] | None = None,
     ) -> None:
-        # The kernel reads mat_a as dense row-major and mat_b as dense
-        # column-major; other layouts produce silently wrong results.
+        # Other layouts and a wrong bias are accepted by the op and give silently wrong results.
         assert mat_a.is_contiguous(), "mat_a must be dense row-major [M, K]"
         assert mat_b.stride(0) == 1 and mat_b.stride(1) == mat_b.shape[0], (
             "mat_b must be dense column-major [K, N] (e.g. weight.t())"
         )
         if bias is not None:
             out_dt = out_dtype if out_dtype is not None else mat_a.dtype
-            # A bias in the wrong dtype or shape is accepted by the op and
-            # produces silently wrong results; with fp32 inputs the bias is
-            # accepted but silently ignored.
             assert mat_a.dtype != torch.float32, "bias is silently ignored for fp32 inputs"
             assert bias.dtype == out_dt, "bias dtype must equal the output dtype"
             assert bias.shape == (mat_b.shape[1],) and bias.is_contiguous(), (

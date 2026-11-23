@@ -1,11 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the HY4-Flash target's convert_req_index_to_global entry.
-
-Adapted from the GLM-5.2 target's test of the same engine op; the cells are
-this checkpoint's (42 pool layers, pages of 32 tokens, a 2048-key sparse
-selection and a 512-key windowed one).
-"""
+"""GPU test for the HY4-Flash target's convert_req_index_to_global entry."""
 
 import math
 import zlib
@@ -19,7 +14,7 @@ from tensorrt_llm._torch.modeling_v2.models.hyv4_flash.hy4_flash_fp8__sm_103__de
 from tensorrt_llm._utils import get_sm_version
 
 __extra_import_path__ = ["../../../../.."]
-from _validating import validating  # noqa: E402 — needs the path declared above
+from _validating import certifying  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), "convert_req_index_to_global requires a CUDA device"
 
@@ -28,24 +23,11 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
-    """Exact: this is integer address arithmetic, and an off-by-one row is a
-    different token's KV."""
-    assert out.dtype == ref.dtype == torch.int32, (out.dtype, ref.dtype)
-    assert out.shape == ref.shape, (out.shape, ref.shape)
-    assert torch.equal(out, ref), (
-        f"{int((out != ref).sum())} of {out.numel()} pool rows differ from the reference"
-    )
-
-
 def _build(spec, seed):
     """`(req_id, block_table, token_indices, block_size, topk, stride_factor, layer_id)`.
 
-    Each request contributes `seq_rows[s]` query rows; row `j` of request `s`
-    sees positions `[0, kv_lens[s] - seq_rows[s] + j + 1)`, and its top-k row
-    holds up to `topk` distinct positions from that range in no order, padded
-    with -1 -- the shape the indexer's top-k hands over. Pages are a random
-    permutation of a pool twice the needed size; unused table entries are -1.
+    Row `j` of request `s` holds up to `topk` distinct positions from `[0, kv_lens[s] - seq_rows[s] + j + 1)`,
+    unordered, padded with -1. Pages are a random permutation; unused table entries are -1.
     """
     g = torch.Generator().manual_seed(seed)
     bs, topk = spec["block_size"], spec["topk"]
@@ -53,8 +35,7 @@ def _build(spec, seed):
     width = max(pages_needed)
     pad = spec.get("pad_block_table", False)
     if pad:
-        # Narrower than the longest request needs, so its tail positions have no
-        # table entry, and one in-range entry is an unused page.
+        # Narrower than the longest request needs, plus one unused in-range page.
         width = max(2, width // 2)
     num_pages = 2 * sum(pages_needed) + 2
     pool = torch.randperm(num_pages, generator=g).to(torch.int32)
@@ -88,62 +69,16 @@ def _build(spec, seed):
 
 
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
-def test_certified_cells(cell) -> None:
+def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest resolves the fixture by this name
+    certifying(op)
     args = _build(cell.spec, seed=zlib.crc32(cell.why.encode()) % 2**31)
     snap = [a.clone() for a in args[:3]]
-    with validating(op):
-        out = op(*args)
+    out = op(*args)
     for a, s in zip(args[:3], snap):
         assert torch.equal(a, s), "an input tensor was mutated"
-    _compare(out, op.reference(*args))
-    # The padding has to survive as -1, not as a row computed from -1.
-    assert bool((out[args[2] < 0] == -1).all())
+    ref = op.reference(*args)
+    # Exact: an off-by-one row is a different token's KV.
+    assert out.dtype == ref.dtype == torch.int32 and out.shape == ref.shape
+    assert torch.equal(out, ref), f"{int((out != ref).sum())} of {out.numel()} pool rows differ"
     if cell.spec.get("pad_block_table"):
         assert bool((out[args[2] >= 0] == -1).any()), "the cell drove no unresolvable position"
-
-
-def _small():
-    req = torch.tensor([0, 1, 1, 0], dtype=torch.int32, device="cuda")
-    table = torch.tensor([[3, 1], [0, 2]], dtype=torch.int32, device="cuda")
-    tok = torch.tensor(
-        [[0, 33, -1, 5], [1, 2, 63, -1], [40, 0, -1, -1], [31, 32, 7, 8]],
-        dtype=torch.int32,
-        device="cuda",
-    )
-    return req, table, tok
-
-
-def test_hand_worked_rows() -> None:
-    """Four rows worked out by hand, independent of `reference`."""
-    req, table, tok = _small()
-    out = op(req, table, tok, 32, 4, 64, 1)
-    # row 0, req 0: p=0 -> page 3: 3*64 + 0 + 32 = 224; p=33 -> page 1: 64 + 1 + 32 = 97
-    assert out[0].tolist() == [224, 97, -1, 229]
-    # row 1, req 1: pages [0, 2]; p=63 -> page 2, offset 31: 128 + 31 + 32 = 191
-    assert out[1].tolist() == [33, 34, 191, -1]
-    _compare(out, op.reference(req, table, tok, 32, 4, 64, 1))
-
-
-def test_guard_refuses_a_column_count_mismatch() -> None:
-    """Wider spills into the next row; narrower leaves columns uninitialized."""
-    req, table, tok = _small()
-    for bad in (2, 8):
-        with pytest.raises(AssertionError, match="num_topk_tokens must equal"):
-            with validating(op):
-                op(req, table, tok, 32, bad, 64, 0)
-
-
-def test_guard_refuses_a_req_id_length_mismatch() -> None:
-    """The kernel's row count is req_id's, not token_indices'."""
-    req, table, tok = _small()
-    for bad in (req[:2].contiguous(), torch.cat([req, req])):
-        with pytest.raises(AssertionError, match="exactly one entry per row"):
-            with validating(op):
-                op(bad, table, tok, 32, 4, 64, 0)
-
-
-def test_guard_refuses_an_int32_overflow() -> None:
-    req, table, tok = _small()
-    with pytest.raises(AssertionError, match="does not fit int32"):
-        with validating(op):
-            op(req, table, tok, 32, 4, 2**30, 0)

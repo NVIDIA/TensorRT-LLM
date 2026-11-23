@@ -1,53 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""DFly2 draft-block prepare: the six-row block and its per-layer selections, two launches.
+"""DFly2 draft-block prepare: the block's rows and pool slots, then each draft layer's selection.
 
-The DFly2 drafter drafts a block of ``block_width`` rows per request -- the accepted anchor's
-bonus token followed by ``block_width - 1`` mask-token rows -- and each of its draft layers
-attends over the target sparse layer's latent pool: that layer's top-``target_index_topk``
-picks for the anchor, compacted, followed by the block's own causal prefix. The drafter keeps
-no KV cache of its own (vocabulary row 29, ``own_kv_cache`` false): the block's rows are
-appended to the target layer's pool at slots this entry computes, and the target's next verify
-step reads them back.
-
-Two entries, because the two halves have different grids and different arguments:
-
-- ``DflyBlockPrepare`` (one program per request) builds the block: ``block_ids`` (bonus, then
-  mask tokens), ``positions``, the three mRoPE planes, ``seq_lens``, ``active``,
-  ``source_rows``/``anchors``, and the block rows' ``slots`` in the target layer's pool.
-- ``DflyBlockIndices`` (one program per request and draft layer) writes every block row's
-  selection into ``packed``/``lengths``: the compacted target picks followed by the block's
-  causal prefix, in the pool-row-id form ``SparseMlaDecode`` reads.
-
-Adapted from vLLM's checkpoint-native ``_prepare_dfly_inputs_kernel``,
-``_dfly_query_slots_kernel`` and ``_build_dfly_reuse_indices_kernel``
-(``vllm/models/hy_v4/nvidia/dfly_inputs.py``, Apache-2.0) and SGLang's
-``_build_draft_topk_kernel`` (``python/sglang/srt/speculative/dfly_utils.py``, Apache-2.0).
-SGLang's is the one that writes pool slots rather than positions, which is the form this
-target's sparse attention takes. The in-tree candidate,
-``models/kimi_k3_vl/ops/spec/k3_dflash_gen_prepare.py``, prepares a block over the drafter's
-*private* paged latent context; Hy4's block is prepared over the *target layer's* pool, so the
-pattern is re-derived here rather than copied. Values are this checkpoint's (``config.json``):
-mask token 120009, block width 6, ``dfly_target_index_topk`` 2048,
-``dfly_target_index_layer``/``dfly_target_kv_layers`` [25, 29, 33, 37, 41], and
-``dfly_context_local_window`` null -- so a selection is the picks plus the block and has no
-window columns.
-
-Re-derived for this engine, not copied:
-
-- vLLM reserves page 0 as its null block and pads every slot whose page is 0; TRT-LLM's KV
-  cache manager has no null page, so page 0 is a real page here and ``DflyBlockPrepare``
-  accepts it. A cell drives it.
-- vLLM's reuse lists hold *positions*; SGLang's and this entry's hold *pool rows* (the flat
-  ``page * block_size + offset`` slot), because ``SparseMlaDecode`` reads row ids. A history
-  entry is therefore only ever compared against ``-1``: with a zero local window every pick is
-  a past token, so there is no ``< anchor`` filter to apply.
-- ``lengths`` is written per layer, not once for layer 0 as SGLang writes it: each layer's pick
-  list is compacted by its own valid count, and only this checkpoint's uniform pick count makes
-  the two agree.
-- vLLM copies the anchor's target hidden into the block's row inside its prepare kernel; that
-  gather is the caller's here, because ``dfly_fusion`` takes the target hidden already
-  gathered and the vocabulary's step does not name it.
+The drafter keeps no KV cache: block rows are appended to the target sparse layer's latent pool,
+and each draft layer attends over that layer's compacted picks followed by the block's causal
+prefix. Selections hold pool rows (``page * block_size + offset``); page 0 is a real page.
 """
 
 from __future__ import annotations
@@ -60,27 +17,18 @@ import triton.language as tl
 
 from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
-#: The checkpoint's ``dfly_mask_token_id``: the token id the block's draft rows carry.
 MASK_TOKEN_ID = 120009
-#: The checkpoint's draft block width: five drafts plus the anchor (``--speculative-dfly-block-size 6``).
 BLOCK_WIDTH = 6
-#: The checkpoint's ``dfly_target_index_topk``: how many picks each target sparse layer keeps.
+#: `dfly_target_index_topk`.
 TARGET_TOPK = 2048
-#: The latent pool's page, the same 32 rows ``sparse_mla_decode`` pages the pool into.
 PAGE_ROWS = 32
-#: The interleaved mRoPE's position planes (config ``mrope_section`` [12, 10, 10]).
 MROPE_PLANES = 3
-#: A row no slot is assigned to. ``SparseMlaDecode`` reads ``-1`` as padding and refuses it
-#: inside a row's counted region, so it is the only value that may sit past ``lengths``.
+#: Padding: only valid past a row's `lengths`.
 PAD_SLOT_ID = -1
 
 
 class DraftBlock(NamedTuple):
-    """The block ``DflyBlockPrepare`` builds, one row per ``(request, block column)``.
-
-    Row ``g * block_width + j`` of the flat tensors belongs to request ``g`` and block column
-    ``j``; ``j == 0`` is the bonus token and ``j >= 1`` the mask-token rows.
-    """
+    """Row ``g * block_width + j`` is request ``g``, column ``j``; column 0 is the bonus token."""
 
     block_ids: torch.Tensor  # int64 [gens * width]: bonus at column 0, mask tokens after
     positions: torch.Tensor  # int64 [gens * width]: anchor + j for an active request
@@ -117,13 +65,9 @@ def _dfly_block_prepare_kernel(
     PLANES: tl.constexpr,
     PAD: tl.constexpr,
 ):
-    """One request per program: its block rows, and where they land in the target layer's pool.
-
-    The anchor is the position after the last accepted token -- ``source_rows[g] =
-    query_start_loc[g] + num_accepted[g]``, the row whose hidden predicts the bonus -- so a
-    request drafts only when it accepted at least one draft (``num_accepted > 0``) and the
-    whole block fits under ``max_model_len``. An inactive request gets mask-token rows at
-    positions ``0 .. W - 1`` and ``PAD`` slots; nothing may read them.
+    """One request per program. A request drafts only if it accepted a draft and the block fits
+    under ``max_model_len``; an inactive request gets mask rows at positions ``0 .. W - 1`` and
+    ``PAD`` slots.
     """
     g = tl.program_id(0)
     start = tl.load(QUERY_START_LOC + g)
@@ -148,7 +92,6 @@ def _dfly_block_prepare_kernel(
     for plane in tl.static_range(PLANES):
         tl.store(MROPE + plane * rows + row, positions, mask=in_block)
 
-    # The block row's slot: its page from the request's table, its offset inside the page.
     block_idx = positions // block_size
     valid = in_block & active & (positions < max_model_len) & (block_idx < num_blocks)
     page = tl.load(
@@ -163,27 +106,15 @@ def _dfly_block_prepare_kernel(
 class DflyBlockPrepare(OpWrapper):
     """``(bonus, num_accepted, query_start_loc, target_positions, block_table)`` -> ``DraftBlock``.
 
-    One launch, one program per request. ``query_start_loc`` is the target batch's exclusive
-    prefix offsets (``[G + 1]``, non-decreasing) and ``target_positions`` its absolute
-    positions, both over the *same* batch, so ``source_rows[g] = query_start_loc[g] +
-    num_accepted[g]`` is the last accepted token's row and ``anchors[g] = positions[source] +
-    1`` the block's first position. ``block_table`` is the request's page table into the
-    target layer's latent pool (``[G, NB]``), already mapped to that layer's slab the way the
-    manager's ``get_primary_pool_page_index_params`` gives it (``page * scale +
-    layer_offset``); ``block_size`` is that pool's page.
-
-    ``block_width`` 6 is this checkpoint's draft block; ``mask_token_id`` is its
-    ``dfly_mask_token_id`` (120009). Both are explicit because the call site knows them.
+    ``source_rows = query_start_loc[:G] + num_accepted`` and ``anchors = positions[source] + 1``,
+    so both must index the same batch. ``block_table`` is already mapped to the draft layer's slab
+    (``page * scale + layer_offset``) and ``block_size`` must be that pool's page.
     """
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # The checkpoint's decode envelope: up to 64 draft requests of 6 rows each (the engine
-    # materialises draft rows in multiples of 6), after a context prefix in the same batch.
-    # `accepted` is how many of the 5 drafts each request accepted this step; a request with
-    # none drafts nothing, and one whose block runs past `max_model_len` is inactive too.
-    # `page_scale`/`layer_offset` (1 and 0, raw page ids, unless a cell says otherwise) put the
-    # table in the caller's form: `page * scale + offset`, one draft layer's slab of the pool.
+    # `accepted` is how many of the 5 drafts each request accepted; `page_scale`/`layer_offset`
+    # (default 1/0) put the table in the caller's `page * scale + offset` form.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="one decode request: six block rows and their pool slots",
@@ -229,53 +160,6 @@ class DflyBlockPrepare(OpWrapper):
         ),
     )
 
-    note = """
-    Called by the target's drafter at `Hyv4FlashDraft.dflash_forward`, once per step, to build
-    the six rows it drafts into and the slots it appends them to in the target layer's pool.
-
-    The anchor is the row *after* the last accepted token (`query_start_loc[g] +
-    num_accepted[g]`, the last accepted token's own row whose hidden predicts the bonus), which
-    is vLLM's `query_end - num_rejected - 1` written in this engine's arguments. A request
-    drafts only when it accepted at least one draft and `anchor + block_width <= max_model_len`
-    -- the block's last position `anchor + block_width - 1` is then inside the model's length.
-
-    Page 0 is a real page: vLLM's allocator reserves it as a null block and its slot kernel
-    pads every slot whose page is 0, while TRT-LLM's KV cache manager has no null page. The
-    cell at `gens=1` puts the first request's block in page 0 and is checked against the
-    reference for exactly the slot arithmetic, so the difference from vLLM is measured, not
-    assumed.
-
-    Preconditions the callable cannot check (stated, not pinned by a test):
-      - `block_size` must be the target pool's page. This target's pool is 32 rows
-        (`PAGE_ROWS`, the page `sparse_mla_decode` reads), the default; any other value
-        computes correctly for a pool of that page, and a value that disagrees with the pool
-        writes plausible slots for the wrong rows.
-      - `query_start_loc` and `target_positions` must index the same batch. A start location
-        from a gen-only slice against a whole-batch positions tensor keeps every shape and
-        gives every request a plausible wrong anchor; `is_valid` bounds the start locations
-        by the positions' length, which catches the out-of-range form but not the in-range one.
-      - `num_accepted` counts accepted *drafts* (0 to `block_width - 1`); the block's column 0
-        is the bonus, which the caller has already resolved.
-      - `block_table` rows may be padded with any value: only the pages a block's positions
-        reach are read.
-
-    `is_valid` refuses what is measured to go silently wrong: a `num_accepted` past the
-    request's own block (the source row then belongs to the next request -- the anchor is a
-    real position, so nothing raises), a `query_start_loc` that decreases or runs past
-    `target_positions` (an out-of-range read; the probe is unsafe and is not run), and a
-    non-dense `block_table` row stride (the kernel walks the table at the row width it is
-    given). An empty batch returns empty tensors before launching.
-
-    Measured on sm_103 (GB300) against `reference`, every field of all six cells bitwise
-    equal: 6 rows at one request, 384 at 64, 12 across the page boundary, 24 at the
-    model-length edge (one inactive), 384 at the engine's largest batch (64 requests after a
-    512-token prefix, one of them taking none of its five drafts) over the caller's scaled and
-    shifted page table, and 6 rows at the request that took none, its whole block inactive. A
-    block built with the anchor one position early moves all 12 positions, a page table one
-    page along moves all 12 slots, and a block-table row stride wider than the table moves 6
-    of 12 slots.
-    """
-
     def __call__(
         self,
         bonus: torch.Tensor,
@@ -302,7 +186,7 @@ class DflyBlockPrepare(OpWrapper):
         if tuple(query_start_loc.shape) != (gens + 1,):
             raise ValueError(
                 f"dfly_block_prepare: query_start_loc {tuple(query_start_loc.shape)} must be "
-                f"({gens + 1},), one exclusive offset per request plus its end"
+                f"({gens + 1},)"
             )
         if block_table.dim() != 2 or block_table.shape[0] != gens:
             raise ValueError(
@@ -365,7 +249,7 @@ class DflyBlockPrepare(OpWrapper):
         block_width: int = BLOCK_WIDTH,
         block_size: int = PAGE_ROWS,
     ) -> DraftBlock:
-        """The same block in plain torch: integer arithmetic, so every field must be exact."""
+        """The same block in plain torch; integer arithmetic, so every field must be exact."""
         gens = bonus.shape[0]
         width = block_width
         device = bonus.device
@@ -377,7 +261,6 @@ class DflyBlockPrepare(OpWrapper):
         positions = torch.where(active[:, None], anchor[:, None] + j, j.expand(gens, width))
         block_ids = torch.full((gens, width), mask_token_id, dtype=torch.int64, device=device)
         block_ids[:, 0] = torch.where(active, bonus, torch.full_like(bonus, mask_token_id))
-        # The page gather is two-dimensional, so the block stays [gens, width] until then.
         block_idx = positions // block_size
         valid = (
             active[:, None].expand(gens, width)
@@ -423,30 +306,21 @@ class DflyBlockPrepare(OpWrapper):
         assert query_start_loc.dtype is torch.int64 and query_start_loc.is_contiguous()
         assert target_positions.dtype is torch.int64 and target_positions.is_contiguous()
         assert block_table.dtype is torch.int32 and block_table.dim() == 2
-        assert block_table.stride(0) == block_table.shape[1], (
-            f"block_table rows must be dense, stride {block_table.stride(0)} for a width of "
-            f"{block_table.shape[1]}: the kernel walks the table at that width"
-        )
+        # The kernel walks the table at its row width.
+        assert block_table.stride(0) == block_table.shape[1], "block_table rows must be dense"
         assert max_model_len >= block_width, (
             f"max_model_len {max_model_len} is shorter than the {block_width}-row block"
         )
         if gens == 0:
             return
-        # The source row is `start + num_accepted`: past `block_width - 1` it leaves the
-        # request's own block and reads the next request's first position -- a real position,
-        # so the anchor and every slot after it are plausible and wrong.
+        # Past `block_width - 1` the source row reads the next request's position: plausible, wrong.
         assert int(num_accepted.min()) >= 0 and int(num_accepted.max()) <= block_width - 1, (
-            f"num_accepted must be in [0, {block_width - 1}] (accepted drafts, not rows); got "
-            f"[{int(num_accepted.min())}, {int(num_accepted.max())}], which moves the source "
-            f"row out of the request's block"
+            f"num_accepted must be in [0, {block_width - 1}]"
         )
         starts = query_start_loc[: gens + 1]
-        assert bool((starts[1:] >= starts[:-1]).all()), (
-            "query_start_loc must be non-decreasing: a shorter request would read another's rows"
-        )
+        assert bool((starts[1:] >= starts[:-1]).all()), "query_start_loc must be non-decreasing"
         assert int(starts[-1]) <= target_positions.numel(), (
-            f"query_start_loc ends at {int(starts[-1])} past the {target_positions.numel()} "
-            f"positions of the batch it indexes"
+            "query_start_loc runs past target_positions"
         )
 
 
@@ -473,12 +347,10 @@ def _dfly_block_indices_kernel(
     BLOCK_BLOCK: tl.constexpr,
     PAD: tl.constexpr,
 ):
-    """One (request, draft layer) per program: compact the layer's picks, append the block.
+    """One (request, draft layer) per program: compact the layer's picks, append the causal block.
 
-    Row ``j`` of the block sees the request's valid picks in their own order, then the block's
-    slots ``0 .. j`` -- its own row last, so the block is causal inside itself. The three
-    writes to a row cover disjoint column ranges (``[0, n)``, ``[n, n + j + 1)`` and
-    ``[n + j + 1, OUT)``), which is what keeps them race-free without a fill pass.
+    The three stores to a row cover disjoint columns (``[0, n)``, ``[n, n + j + 1)``,
+    ``[n + j + 1, OUT)``), so no fill pass is needed.
     """
     g = tl.program_id(0)
     layer = tl.program_id(1)
@@ -515,27 +387,16 @@ def _dfly_block_indices_kernel(
 class DflyBlockIndices(OpWrapper):
     """``(history, state_rows, block_slots, active)`` -> ``packed``/``lengths``, written in place.
 
-    ``history`` int32 ``[layers, states, topk]`` holds each draft layer's target-layer picks --
-    pool rows, ``-1`` where there is no pick -- and ``state_rows`` int64 ``[gens]`` says which
-    of its ``states`` rows belongs to each request. ``block_slots`` int32 ``[gens, width]`` is
-    ``DflyBlockPrepare``'s ``slots``; ``active`` bool ``[gens]`` masks the padded requests.
-
-    ``packed`` int32 ``[layers, gens * width, out]`` and ``lengths`` int32 ``[layers, gens *
-    width]`` are the caller's buffers, written in place: row ``(layer, g * width + j)`` gets
-    the request's valid picks compacted to the front, then ``block_slots[g, :j + 1]``, then
-    ``-1``; ``lengths`` is that row's count, and 0 for an inactive request (whose whole row is
-    ``-1``). ``out`` must be at least ``topk + width`` wide; the buffer may be wider (vLLM
-    rounds it to 128), and the tail past each count is ``-1`` either way.
+    ``history`` int32 ``[layers, states, topk]`` holds pool-row picks (``-1`` = none);
+    ``state_rows`` picks each request's row. Row ``(layer, g * width + j)`` of ``packed`` gets the
+    valid picks compacted, then ``block_slots[g, :j + 1]``, then ``-1``; ``lengths`` is its count
+    (0 if inactive). ``packed`` must be at least ``topk + width`` wide.
     """
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # The drafter's selection at the checkpoint's values: five draft layers (target layers
-    # 25/29/33/37/41), up to 2048 picks each, the six-row block appended. `states` is the
-    # request-state array's row count -- a pool axis, not the batch: the small cells run a
-    # batch of one against eight state rows. The drafter calls this once per layer, on that
-    # layer's slice, so the last cell runs `layers=1` with `states` at the engine's per-step
-    # token budget and `out_width` at the buffer the caller allocates (`dims.index_width`).
+    # `states` is the picks-state row count, not the batch. The drafter calls this per layer, so
+    # the last cell is `layers=1` at the engine's per-step budget and the caller's packed width.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="one request, five draft layers: a batch of one against eight state rows",
@@ -573,49 +434,8 @@ class DflyBlockIndices(OpWrapper):
     )
 
     note = """
-    Called by the target's drafter once per step, before its five draft layers run: layer `i`
-    reads `packed[i]`/`lengths[i]` as `SparseMlaDecode`'s `packed`/`lengths`, so the block's
-    rows attend over the target sparse layer's own latent pool and the drafter keeps no KV
-    cache. `history` is the target layer's pick buffer for the anchor's source row, stacked
-    over the five draft layers (target layers 25, 29, 33, 37, 41 at checkpoint ids).
-
-    Pool rows, not positions: SGLang's `build_draft_topk` is the reference that writes slots
-    (`verify_slots`) rather than vLLM's positions, and this target's sparse attention indexes
-    the flat latent pool by row. A pick is therefore compacted when it is `>= 0` and there is
-    no `< anchor` filter -- the checkpoint's `dfly_context_local_window` is null, so the
-    selection is exactly the picks plus the block, and every pick is a past token.
-
-    `lengths` is per layer: each layer's list is compacted by its own count. SGLang writes one
-    count from layer 0, which holds only because this checkpoint's indexer keeps the same
-    number of picks per sparse layer (`min(kv_length, 2048)`); a layer whose picks came out
-    shorter would be read past its end there.
-
-    Preconditions the callable cannot check (stated, not pinned by a test):
-      - `history` values are rows of the same pool `block_slots` indexes. A picks buffer from
-        another layer or another request is in range and selects real, wrong rows.
-      - `state_rows` names the request's row in the *picks state*, which the target's indexer
-        writes each step for the anchor's source row; it is not the batch row.
-      - the block's slots must be distinct from the picks: a duplicate row is attended twice,
-        which changes the softmax weights without any visible inconsistency.
-
-    A `packed` narrower than `topk + width` is refused loudly (`ValueError`) before the launch:
-    the block store would run past each row's count and the sparse attention's `min(length, W)`
-    would silently drop the block. `is_valid` refuses what is measured to go silently wrong
-    instead: a `-1` block slot on an active request (a pad row inside the counted region, read
-    as a real latent row by a caller that only bounds the ids by the pool), a `history` whose
-    last dimension is strided (the kernel reads it dense, so a `[..., ::2]` view selects
-    adjacent columns), and `state_rows` outside the picks state (an out-of-range read; the
-    probe is unsafe and is not run). An empty batch returns after the buffers are left as they
-    are.
-
-    Measured on sm_103 (GB300): every element of `packed` and `lengths` bitwise equal to
-    `reference` in all six cells -- 5 x 6 rows at one request, 5 x 384 at 64 requests, the
-    37-pick compaction, the mixed-activity rows, the empty-pick rows (counts 1..6) and the
-    drafter's own per-layer slice: one layer, 64 requests, the state at the engine's 8192-row
-    per-step budget and the caller's 2176-wide packed. Of the
-    246480 `packed` entries the control cells write, a selection that appends all six block
-    slots to every row moves 300 (and every count), one that leaves the picks uncompacted
-    moves 840, and one read from a strided pick list moves 130860.
+    Unchecked: `history` must index the same pool as `block_slots`, and the block's slots must be
+    distinct from the picks (a duplicate row is attended twice).
     """
 
     def __call__(
@@ -640,7 +460,7 @@ class DflyBlockIndices(OpWrapper):
         if packed.shape[2] < topk + width:
             raise ValueError(
                 f"dfly_block_indices: packed is {packed.shape[2]} wide; a row needs "
-                f"topk + width = {topk + width} columns for the picks and the block"
+                f"topk + width = {topk + width} columns"
             )
         if state_rows.shape != (gens,) or active.shape != (gens,):
             raise ValueError(
@@ -689,14 +509,11 @@ class DflyBlockIndices(OpWrapper):
         valid = picks >= 0
         counts = valid.sum(-1)  # [L, G]
         order = valid.cumsum(-1) - 1
-        # Compact: the valid picks in their own order at the front, everything else -1. The
-        # invalid entries scatter into a spare column so they never land inside [0, n).
+        # Compact the valid picks to the front; invalid ones scatter into a spare column `topk`.
         tmp = torch.full(
             (layers, gens, width, topk + 1), PAD_SLOT_ID, dtype=torch.int32, device=device
         )
         dest = torch.where(valid, order, torch.full_like(order, topk))
-        # The index is `topk` wide against the `topk + 1` buffer: the spare column only ever
-        # receives the invalid picks, which scatter there instead of inside `[0, n)`.
         tmp.scatter_(
             -1,
             dest[..., None, :].expand(layers, gens, width, topk),
@@ -708,8 +525,7 @@ class DflyBlockIndices(OpWrapper):
         rows[..., :topk] = tmp[..., :topk]
         for j in range(width):
             for c in range(j + 1):
-                # `counts` of an inactive request may be anything; clamp so the scatter stays
-                # inside the row (the whole row is overwritten with -1 below anyway).
+                # Clamp: an inactive request's count is arbitrary and its row is masked below.
                 column = (counts + c).clamp(max=out_width - 1)
                 rows[:, :, j, :].scatter_(
                     -1, column[..., None], block_slots[None, :, c, None].expand(layers, gens, 1)
@@ -733,18 +549,16 @@ class DflyBlockIndices(OpWrapper):
     ) -> None:
         layers, states, topk = history.shape
         gens, width = block_slots.shape
+        # The kernel reads each row's picks at stride 1.
         assert history.dtype is torch.int32 and history.stride(-1) == 1, (
-            "history must be int32 with a dense last dimension: the kernel reads each row's "
-            "2048 columns at stride 1, so a strided view selects the wrong picks"
+            "history must be int32, dense last dim"
         )
         assert state_rows.dtype is torch.int64 and state_rows.shape == (gens,)
         assert block_slots.dtype is torch.int32 and block_slots.is_contiguous()
         assert active.dtype is torch.bool and active.shape == (gens,)
         assert packed.dtype is torch.int32 and packed.stride(-1) == 1
         assert lengths.dtype is torch.int32 and lengths.shape == (layers, gens * width)
-        assert lengths.stride(0) == gens * width, (
-            "lengths must be dense: the kernel writes each layer's counts at its layer stride"
-        )
+        assert lengths.stride(0) == gens * width, "lengths must be dense"
         if gens == 0:
             return
         live = active.nonzero().flatten()
@@ -752,14 +566,11 @@ class DflyBlockIndices(OpWrapper):
             return
         rows = state_rows[live]
         assert int(rows.min()) >= 0 and int(rows.max()) < states, (
-            f"state_rows must index the {states} rows of the picks state; got "
-            f"[{int(rows.min())}, {int(rows.max())}]"
+            f"state_rows must index the {states} state rows"
         )
         slots = block_slots[live]
-        assert int(slots.min()) >= 0, (
-            f"an active request has a block slot of {int(slots.min())}: a pad row inside the "
-            f"counted region is read as a real latent row"
-        )
+        # A pad row inside the counted region is read as a real latent row.
+        assert int(slots.min()) >= 0, "an active request has a -1 block slot"
 
 
 dfly_block_indices = DflyBlockIndices()

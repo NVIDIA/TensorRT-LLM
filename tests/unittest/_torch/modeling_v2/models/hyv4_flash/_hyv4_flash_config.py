@@ -1,16 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""HY4-Flash's checkpoint config, as ``config.json`` publishes it.
-
-The dicts below are this checkpoint's, key for key -- its 744-entry FP8
-exclusion list trimmed to representative entries -- so tests that must run
-without the weights still exercise the shape the engine reads.
-"""
+"""HY4-Flash's ``config.json``, key for key (its FP8 exclusion list trimmed), for weight-free tests."""
 
 import copy
 
-#: The 0-based decoder layers that run sparse MLA with the DSA indexer; the
-#: other 30 run windowed MLA.
 SPARSE_LAYERS = (0, 1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41)
 
 TEXT_CONFIG = {

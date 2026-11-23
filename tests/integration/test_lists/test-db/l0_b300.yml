@@ -198,14 +198,11 @@ l0_b300:
   - unittest/_torch/modeling_v2/models/qwen4_exp/qwen3_8_flash_next_fp8__sm_103__unified TIMEOUT (30)
   # qwen4_exp FP8 target at tp1, pre-merge: gsm8k without speculation.
   - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_fp8__sm_103__unified/test_accuracy.py::TestModelingV2Qwen38FlashNextFp8Sm103Unified::test_tp1_gsm8k TIMEOUT (60)
-  # The hyv4-flash-FP8 sm_103 unified target's single-GPU op checks, minus its 4-rank
-  # comm matrices, which l0_dgx_b300's pre-merge block runs.
+  # hyv4_flash target: single-GPU tests (comm matrices run on l0_dgx_b300).
   - unittest/_torch/modeling_v2/models/hyv4_flash/hy4_flash_fp8__sm_103__default --ignore-glob=unittest/_torch/modeling_v2/models/hyv4_flash/**/comm/* TIMEOUT (30)
-  # The family's device checks beside the target directory: the declared KV cache
-  # manager's pools at each member, and the Engram host tables' VMM mapping and gather.
-  # test_engram_host.py's cpu_only half runs on l0_cpu.
   - unittest/_torch/modeling_v2/models/hyv4_flash/test_cache_manager.py TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/hyv4_flash/test_engram_host.py TIMEOUT (30)
+  - unittest/_torch/attention/test_mla_hyv4_flash_geometry.py TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/minimax_m3/test_shared_kernel_contracts.py --import-mode=importlib TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4 --import-mode=importlib --ignore-glob=unittest/_torch/modeling_v2/models/minimax_m3/**/comm/* TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8 --import-mode=importlib --ignore-glob=unittest/_torch/modeling_v2/models/minimax_m3/**/comm/* TIMEOUT (30)

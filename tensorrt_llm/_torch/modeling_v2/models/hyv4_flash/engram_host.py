@@ -1,23 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Where an Engram hash table lives: pinned host memory the device reads through a VMM mapping.
+"""Engram hash tables in pinned host memory, read by the device through one VMM mapping.
 
-The four Engram tables are BF16 ``[164994380, 96]`` -- 31.7 GB each, 126.7 GB over the four
-layers -- so none fits on a device at any member of the deployment, and every unit (core
-included) reads them from host memory. This module is that path. It is ported from
-``models/qwen4_exp/ple_host_table.py`` and its ``chunk_broker`` (Apache-2.0, NVIDIA) and
-narrowed to what Engram needs: host residency is not an option here, so there is no
-device-resident or per-rank mode, and no fallback that silently keeps a second copy.
-
-Geometry. The rows are cut into `CHUNKS` chunks of `chunk_rows` rows; the ranks of one host
-split the chunks, rank ``r`` of ``world`` owning chunks
-``[r * CHUNKS / world, (r + 1) * CHUNKS / world)``. Every rank maps every chunk into one
-device VA range, so the gather reads the whole table at one pointer: it creates and fills the
-chunks it owns and attaches the others through the owner's file descriptor. One copy per
-host; the other host of a two-node deployment keeps its own. ``world`` must divide `CHUNKS`
-(the deployment's 4 and 8 do).
-
-The gather is ``torch.index_select`` over the mapped view -- a lookup, so no catalog entry.
+Each table (31.7 GB) is cut into `CHUNKS` chunks; the ranks of a host split them, create and fill
+their own, and attach the others through the owner's exported file descriptor, so a host keeps one
+copy and every rank maps the whole table at one pointer.
 """
 
 from __future__ import annotations
@@ -35,92 +22,62 @@ from typing import Callable, Optional
 
 import torch
 from cuda.bindings import driver as cuda_driver
-from cuda.bindings import runtime as cudart
 
 from tensorrt_llm._dlpack_utils import pack_strided_memory
-from tensorrt_llm._utils import CUASSERT
 from tensorrt_llm.logger import logger
 
-#: Fixed chunks of a table; every host size that divides it maps whole chunks.
 CHUNKS = 8
-#: Chunk byte sizes are multiples of this: the VMM host NUMA granularity, so the chunks map back
-#: to back as one table.
+#: Chunk byte sizes are multiples of the VMM host NUMA granularity, so chunks map back to back.
 CHUNK_ALIGN = 2 << 20
-#: How long a rank waits for another process of the host to publish a chunk.
 _ATTACH_TIMEOUT_S = 3600.0
-#: A chunk's sample: this many blocks of `_SAMPLE_ROWS` rows at an even stride.
+#: An attached chunk is checked at this many blocks of `_SAMPLE_ROWS` rows.
 _SAMPLE_BLOCKS = 256
 _SAMPLE_ROWS = 8
-#: ``cudaMemoryTypeHost``: what `cudaPointerGetAttributes` reports for the mapped table.
-_CUDA_MEMORY_TYPE_HOST = 1
 
 Copy = Callable[[torch.Tensor, int, int, int], None]
 Read = Callable[[int, int], torch.Tensor]
 
 
-# ------------------------------------------------------------------------ geometry --
-
-
-def chunk_rows(rows: int, cols: int, align: int = CHUNK_ALIGN) -> int:
-    """Rows of one chunk: an even split of `rows` over `CHUNKS`, rounded up so a chunk's bytes
-    are a multiple of `align` for any whole-byte element size. The element count is aligned,
-    so the row partition is independent of dtype."""
-    unit = align // math.gcd(align, cols)
+def chunk_rows(rows: int, cols: int) -> int:
+    """Rows of one chunk: `rows` / `CHUNKS`, rounded up so its element count is `CHUNK_ALIGN`-aligned."""
+    unit = CHUNK_ALIGN // math.gcd(CHUNK_ALIGN, cols)
     per = -(-rows // CHUNKS)
     return -(-per // unit) * unit
 
 
-def chunk_range(k: int, rows: int, cols: int, align: int = CHUNK_ALIGN) -> tuple[int, int]:
+def chunk_range(k: int, rows: int, cols: int) -> tuple[int, int]:
     """Global rows ``[lo, hi)`` of chunk `k` (empty past the table's end)."""
-    per = chunk_rows(rows, cols, align)
+    per = chunk_rows(rows, cols)
     return min(k * per, rows), min((k + 1) * per, rows)
 
 
 def owned_chunks(rank: int, world: int) -> range:
-    """The chunks rank `rank` of `world` is responsible for."""
+    """The chunks rank `rank` of `world` creates and fills."""
     assert world > 0 and CHUNKS % world == 0, (rank, world)
     per = CHUNKS // world
     return range(rank * per, (rank + 1) * per)
 
 
-def owned_rows(rank: int, world: int, rows: int, cols: int, align: int = CHUNK_ALIGN) -> tuple:
-    """Global rows ``[lo, hi)`` of rank `rank`'s chunks."""
-    chunks = owned_chunks(rank, world)
-    return (
-        chunk_range(chunks[0], rows, cols, align)[0],
-        chunk_range(chunks[-1], rows, cols, align)[1],
-    )
-
-
-def sample_blocks(k: int, rows: int, cols: int, align: int = CHUNK_ALIGN, phase: int = 0) -> list:
-    """Row blocks ``[lo, hi)`` of chunk `k` that an attaching rank compares: `_SAMPLE_BLOCKS`
-    blocks of `_SAMPLE_ROWS` rows at an even stride, `phase` 1 halfway between phase 0's; the
-    whole chunk when it is too short to stride."""
-    lo, hi = chunk_range(k, rows, cols, align)
+def sample_blocks(k: int, rows: int, cols: int) -> list:
+    """Row blocks ``[lo, hi)`` of chunk `k` compared on attach (the whole chunk if short)."""
+    lo, hi = chunk_range(k, rows, cols)
     if hi - lo <= 2 * _SAMPLE_BLOCKS * _SAMPLE_ROWS:
         return [(lo, hi)] if hi > lo else []
     stride = (hi - lo) // _SAMPLE_BLOCKS
-    first = lo + phase * (stride // 2)
+    first = lo + stride // 2
     return [
         (start, min(start + _SAMPLE_ROWS, hi))
         for start in range(first, hi, stride)[:_SAMPLE_BLOCKS]
     ]
 
 
-def _sample(read: Read, blocks) -> torch.Tensor:
-    """The checkpoint's rows at `blocks`, in order, as bytes on the CPU."""
-    return torch.cat([read(lo, hi).contiguous().view(torch.uint8).cpu() for lo, hi in blocks])
-
-
-# ------------------------------------------------------------------------ reading --
-
-
 def shard_rows(weights, keys, rows_per_shard: int, read_entry) -> tuple[Copy, Read]:
     """``(copy, read)`` over a table stored as equal contiguous row shards `keys`.
 
-    ``copy(dst, lo, hi, base)`` writes global rows ``[lo, hi)`` into `dst`, whose row 0 is
-    global row `base`, one shard at a time; ``read(lo, hi)`` returns those rows.
-    ``read_entry(entry, cut)`` reads rows `cut` of a checkpoint entry."""
+    ``copy(dst, lo, hi, base)`` writes global rows ``[lo, hi)`` into `dst`, whose row 0 is global
+    row `base`; ``read(lo, hi)`` returns those rows; ``read_entry(entry, cut)`` reads a checkpoint
+    entry's rows `cut`.
+    """
 
     def pieces(lo: int, hi: int):
         s = lo // rows_per_shard
@@ -139,9 +96,6 @@ def shard_rows(weights, keys, rows_per_shard: int, read_entry) -> tuple[Copy, Re
         return torch.cat([src for _, src in pieces(lo, hi)])
 
     return copy, read
-
-
-# ---------------------------------------------------------------------- host NUMA --
 
 
 def _parse_cpulist(text: str) -> set:
@@ -169,9 +123,6 @@ def device_numa_node(device) -> Optional[int]:
     return None
 
 
-# --------------------------------------------------------------------------- VMM --
-
-
 def _cu(result):
     err, *values = result
     if err != cuda_driver.CUresult.CUDA_SUCCESS:
@@ -180,8 +131,8 @@ def _cu(result):
 
 
 class _VmmChunks:
-    """`count` chunk allocations of `chunk_bytes` on host NUMA memory, mapped back to back for
-    one device, each created here or imported from a POSIX fd another process exported."""
+    """`count` host-NUMA chunk allocations mapped back to back for one device, each created here
+    or imported from a POSIX fd another process exported."""
 
     def __init__(self, device_index: int, chunk_bytes: int, count: int, node: int) -> None:
         self.device_index = device_index
@@ -222,7 +173,7 @@ class _VmmChunks:
         try:
             self._set_access(address, read_only)
         except BaseException:
-            # The caller releases `handle`; nothing stays mapped to it.
+            # The caller releases `handle`.
             cuda_driver.cuMemUnmap(address, self.chunk_bytes)
             raise
         self._handles[k] = handle
@@ -287,13 +238,6 @@ class _VmmChunks:
         flat = pack_strided_memory(self.va, nbytes, nbytes, 1, torch.uint8, index)
         return flat.view(dtype).view(rows, cols)
 
-    def resident_on_host(self) -> bool:
-        host = cuda_driver.CUmemLocationType.CU_MEM_LOCATION_TYPE_HOST_NUMA
-        return all(
-            _cu(cuda_driver.cuMemGetAllocationPropertiesFromHandle(h)).location.type == host
-            for h in self._handles.values()
-        )
-
     def close(self) -> None:
         D = cuda_driver
         for k, handle in self._handles.items():
@@ -305,30 +249,23 @@ class _VmmChunks:
             self.va = 0
 
 
-# ----------------------------------------------------------------------- handoff --
-#
-# One process creates and fills a chunk; every other process of the host attaches to the same
-# allocation through its file descriptor. A chunk is named by a key whose abstract Unix socket
-# (`\0trtllm-engram-<uid>-<key>`) the first process to bind owns; it serves the descriptor to
-# every same-uid peer (`SCM_RIGHTS`). Abstract names carry no permissions, so both sides check
-# the other's uid through `SO_PEERCRED`. Nothing is written to the filesystem, so a crash
-# leaves nothing behind, and a process that cannot bind connects and waits for the owner.
-# Ported from ``models/qwen4_exp/chunk_broker.py``.
+# A chunk's key names an abstract Unix socket (`\0trtllm-engram-<uid>-<key>`); the first process
+# to bind it owns the chunk and serves its fd to same-uid peers (`SCM_RIGHTS`, uid checked through
+# `SO_PEERCRED` on both sides). Nothing touches the filesystem, so a crash leaves nothing behind.
 
 OWNER = "owner"
 ATTACHED = "attached"
 
 _CRED = struct.Struct("iII")  # struct ucred: pid_t pid, uid_t uid, gid_t gid
 _POLL_SECONDS = 1.0
+_REPORT_SECONDS = 60.0
 
 
 def _socket_name(key: str) -> str:
-    """The abstract socket name of `key` (per uid)."""
     return f"\0trtllm-engram-{os.getuid()}-{key}"
 
 
 def _peer_uid(conn: socket.socket) -> int:
-    """The uid of the process at the other end of the connected Unix socket `conn`."""
     _, uid, _ = _CRED.unpack(conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, _CRED.size))
     return uid
 
@@ -364,7 +301,7 @@ class _OwnedSegment:
         except OSError:
             pass
         self._server.close()
-        # `_serve` alone starts answers: once it has returned, the list of answers is final.
+        # Only `_serve` starts answers: once it has returned, the list is final.
         self._thread.join(_POLL_SECONDS * 5)
         for thread in self._answers:
             thread.join(_POLL_SECONDS * 5)
@@ -374,9 +311,7 @@ class _OwnedSegment:
             try:
                 conn, _ = self._server.accept()
             except OSError:
-                # `close`, or `accept` failing (EMFILE, ENFILE, ENOMEM, ...). Either way the name
-                # is freed with the thread: connected peers already answered keep their answer,
-                # and every other peer sees its connection reset and owns the key itself.
+                # `close` or a failing `accept`: free the name; unanswered peers take the key over.
                 self._server.close()
                 return
             answer = threading.Thread(target=self._answer, args=(conn,), daemon=True)
@@ -412,16 +347,12 @@ def _try_own(key: str) -> Optional[_OwnedSegment]:
     return _OwnedSegment(server, key)
 
 
-def _acquire(
-    key: str, timeout_s: float, log: Callable[[str], None] = print, report_s: float = 60.0
-) -> tuple:
+def _acquire(key: str, timeout_s: float) -> tuple:
     """``(OWNER, segment)`` when no process owns `key`, else ``(ATTACHED, fd, meta)`` once the
-    owner publishes; an owner that exits, aborts or stops accepting first hands `key` to its
-    waiters. Raises `TimeoutError` when no owner has published within `timeout_s`, and
-    `PermissionError` when a process of another uid holds the name."""
+    owner publishes; an owner that exits first hands `key` to its waiters."""
     name = _socket_name(key)
     deadline = time.monotonic() + timeout_s
-    next_report = time.monotonic() + report_s
+    next_report = time.monotonic() + _REPORT_SECONDS
     while True:
         owned = _try_own(key)
         if owned is not None:
@@ -430,7 +361,7 @@ def _acquire(
         try:
             conn.connect(name)
         except (ConnectionRefusedError, FileNotFoundError):
-            # The owner just exited, or is between `bind` and `listen` (or never listens).
+            # The owner just exited, or is between `bind` and `listen`.
             conn.close()
             if time.monotonic() >= deadline:
                 raise TimeoutError(f"no owner of {key!r} listens within {timeout_s:.0f} s")
@@ -445,13 +376,15 @@ def _acquire(
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError(f"no allocation for {key!r} within {timeout_s:.0f} s")
-                conn.settimeout(min(remaining, report_s))
+                conn.settimeout(min(remaining, _REPORT_SECONDS))
                 try:
                     got = socket.recv_fds(conn, 4096, 1)
                 except socket.timeout:
                     if time.monotonic() >= next_report:
-                        log(f"engram host table: waiting for the owner of {key!r} to publish it")
-                        next_report = time.monotonic() + report_s
+                        logger.info(
+                            f"engram host table: waiting for the owner of {key!r} to publish it"
+                        )
+                        next_report = time.monotonic() + _REPORT_SECONDS
                 except ConnectionResetError:
                     # The owner closed its listener before accepting this connection.
                     got = (b"", [], 0, None)
@@ -460,21 +393,15 @@ def _acquire(
         msg, fds, _, _ = got
         if fds:
             return ATTACHED, fds[0], json.loads(msg.decode())
-        # The connection closed without a descriptor: the owner exited or aborted. Retry.
-
-
-# ------------------------------------------------------------------------- table --
+        # Closed without a descriptor: the owner exited or aborted. Retry.
 
 
 class EngramHostTable:
-    """One Engram table (``rows`` x ``cols`` elements of ``dtype``) in host memory, mapped for
-    ``device`` and read by the gather.
+    """One Engram table (``rows`` x ``cols`` of ``dtype``) in host memory, mapped for ``device``.
 
-    Construct it at declare time (it reserves this rank's chunks and the whole table's device
-    VA), then call `fill` once with the checkpoint's shards. ``rank`` / ``world`` are this
-    rank's place among the ranks of the host that share the table; ``name`` identifies the
-    table across those processes (the checkpoint's tensor name). ``table`` is the mapped view
-    after `fill` -- wrap it in an ``nn.Parameter`` without copying, as the caller does.
+    Construct at declare time (reserves this rank's chunks and the table's device VA), then
+    `fill` once. ``rank`` / ``world`` place this rank among the host's ranks sharing the table;
+    ``name`` (the checkpoint tensor name) identifies it across their processes.
     """
 
     def __init__(
@@ -487,9 +414,6 @@ class EngramHostTable:
         rank: int,
         world: int,
         name: str,
-        align: int = CHUNK_ALIGN,
-        identity: Optional[str] = None,
-        log: Callable[[str], None] = logger.info,
     ) -> None:
         if not 0 <= rank < world:
             raise ValueError(f"rank {rank} is not one of {world}")
@@ -499,22 +423,17 @@ class EngramHostTable:
         self.rows, self.cols, self.dtype, self.device = rows, cols, dtype, device
         self.rank, self.world = rank, world
         self.name = name
-        self.align = align
-        self.identity = (
-            identity or hashlib.sha256(f"{name}\0{rows}x{cols}\0{dtype}".encode()).hexdigest()[:32]
-        )
-        self._log = log
+        self.identity = hashlib.sha256(f"{name}\0{rows}x{cols}\0{dtype}".encode()).hexdigest()[:32]
         self.table: Optional[torch.Tensor] = None
         self._vmm: Optional[_VmmChunks] = None
-        #: The chunks this rank created (and will fill); `_segments` is the subset it serves.
+        #: The chunks this rank created (and fills); `_segments` is the subset it serves.
         self._created: set[int] = set()
         self._segments: dict[int, _OwnedSegment] = {}
         self._fds: list[int] = []
-        self._attached = 0
         if device.type != "cuda":
             self.table = torch.empty(rows, cols, dtype=dtype, device=device)
             return
-        self.chunk_bytes = chunk_rows(rows, cols, align) * cols * self.itemsize
+        self.chunk_bytes = chunk_rows(rows, cols) * cols * self.itemsize
         node = device_numa_node(device)
         index = device.index if device.index is not None else torch.cuda.current_device()
         self._vmm = _VmmChunks(index, self.chunk_bytes, CHUNKS, 0 if node is None else node)
@@ -524,33 +443,18 @@ class EngramHostTable:
                 if segment is None:
                     # Another process of this host holds the name: attach in `fill`.
                     continue
-                # Recorded first: if `create` fails, `close` releases the name, and the
-                # processes waiting on it take the chunk over.
+                # Recorded first so a failing `create` still releases the name in `close`.
                 self._segments[k] = segment
             self._vmm.create(k)
             self._created.add(k)
 
-    @property
-    def chunk_rows(self) -> int:
-        """Rows of one chunk."""
-        return chunk_rows(self.rows, self.cols, self.align)
-
-    @property
-    def owned_rows(self) -> tuple[int, int]:
-        """Global rows ``[lo, hi)`` this rank creates and fills."""
-        return owned_rows(self.rank, self.world, self.rows, self.cols, self.align)
-
     def _key(self, k: int) -> str:
         return f"{self.identity}-c{k}"
 
-    # ----------------------------------------------------------------------- fill --
-
     def fill(self, copy: Copy, read: Read) -> None:
-        """Fill this rank's chunks, publish them, attach the rest; ends with `table` mapped.
+        """Fill this rank's chunks, publish them, attach the rest; `copy`/`read` as `shard_rows`.
 
-        ``copy(dst, lo, hi, base)`` writes global rows ``[lo, hi)`` into `dst`, whose row 0 is
-        global row `base`; ``read(lo, hi)`` returns those rows from the checkpoint. Every rank
-        of the host calls it."""
+        Every rank of the host calls it."""
         if self.device.type != "cuda":
             copy(self.table, 0, self.rows, 0)
             return
@@ -561,7 +465,7 @@ class EngramHostTable:
         for k in range(CHUNKS):
             if k in self._created:
                 continue
-            got = _acquire(self._key(k), _ATTACH_TIMEOUT_S, self._log)
+            got = _acquire(self._key(k), _ATTACH_TIMEOUT_S)
             if got[0] == OWNER:
                 self._segments[k] = got[1]
                 self._vmm.create(k)
@@ -578,14 +482,13 @@ class EngramHostTable:
                 self._vmm.attach(k, fd)
             finally:
                 os.close(fd)
-            self._attached += 1
             self._check_chunk(k, read)
         if not self._vmm.complete():
             missing = sorted(set(range(CHUNKS)) - set(self._vmm._handles))
             raise RuntimeError(f"{self.name}: chunks {missing} are not mapped")
 
     def _fill_and_publish(self, k: int, copy: Copy) -> None:
-        lo, hi = chunk_range(k, self.rows, self.cols, self.align)
+        lo, hi = chunk_range(k, self.rows, self.cols)
         if hi > lo:
             copy(self.table, lo, hi, 0)
         torch.cuda.synchronize(self.device)
@@ -597,40 +500,21 @@ class EngramHostTable:
         self._segments[k].publish(fd, {"chunk": k, "chunk_bytes": self._vmm.chunk_bytes})
 
     def _check_chunk(self, k: int, read: Read) -> None:
-        """An attached chunk holds the checkpoint's bytes at its phase-1 sample, rows the key
-        does not hash; raises `RuntimeError` otherwise."""
-        blocks = sample_blocks(k, self.rows, self.cols, self.align, phase=1)
+        """Raise `RuntimeError` unless attached chunk `k` holds the checkpoint's sampled bytes."""
+        blocks = sample_blocks(k, self.rows, self.cols)
         if not blocks:
             return
         rows = torch.cat([torch.arange(lo, hi) for lo, hi in blocks])
         got = self.table.view(torch.uint8).index_select(0, rows.to(self.device)).cpu()
-        want = _sample(read, blocks)
+        want = torch.cat([read(lo, hi).contiguous().view(torch.uint8).cpu() for lo, hi in blocks])
         if not torch.equal(got, want):
             first = int(rows[(got != want).any(1)][0])
             raise RuntimeError(f"shared chunk {k} differs from the checkpoint at row {first}")
 
-    # ------------------------------------------------------------------- reading --
-
     def gather(self, ids: torch.Tensor) -> torch.Tensor:
-        """The table's rows `ids` names: ``[..., cols]``. A negative id reads row 0, which the
-        caller masks (the HF module's ``masked_fill`` for a position that owns no n-gram)."""
+        """The table's rows `ids`: ``[..., cols]``; a negative id reads row 0, which the caller masks."""
         flat = ids.clamp_min(0).reshape(-1).to(device=self.device, dtype=torch.int64)
         return self.table.index_select(0, flat).view(*ids.shape, self.cols)
-
-    def resident_on_host(self) -> bool:
-        """Whether the table's pages are host memory, from the driver."""
-        if self.device.type != "cuda":
-            return True
-        if self.table is None or self.table.numel() == 0:
-            return False
-        (attributes,) = CUASSERT(cudart.cudaPointerGetAttributes(self.table.data_ptr()))
-        return int(attributes.type) == _CUDA_MEMORY_TYPE_HOST
-
-    def describe(self) -> str:
-        return (
-            f"{self.name}: {CHUNKS} chunks of {self.chunk_rows} rows, rank {self.rank}/"
-            f"{self.world} created {sorted(self._created)} and attached {self._attached}"
-        )
 
     def close(self) -> None:
         for segment in self._segments.values():

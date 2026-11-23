@@ -1,37 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Compressed-indexer selection of the Hy4-Flash indexer: group scores to packed latent rows,
-one launch.
+"""Compressed-indexer selection: head-weighted relu group scores -> top-k groups -> packed latent rows.
 
-A query row ``r`` scores every complete group of its request's pool that closed before it,
-one weighted sum over the indexer's heads, keeps the best ``index_topk // ratio - 1`` of them
-plus the group it sits in, and expands the kept groups to the token slots they stand for::
-
-    scores[g] = relu(q_h . k_g)                                   # fp32, per head h
-    logits[g] = sum_h w_h * scores[g] * (H * D)**-0.5              # fp32
-    recall    = the min(group_topk - 1, visible) best logits, plus the row's own group
-    ids       = each recalled group g -> g * ratio + [0, ratio), then the own group's
-                slots up to the row's own position
-
-The ids leave ascending from column 0, ``-1`` past the row's length: the ``packed`` layout
-``sparse_mla_decode`` reads (its first ``lengths[r]`` columns are latent-pool rows, and it
-applies no causal mask of its own).
-
-``HYV4FlashCompressedIndexer.forward`` in the checkpoint's own implementation is
-``scores``/``logits`` above, the mask ``group_ids >= query_group_index``, ``complete_topk =
-min(group_topk - 1, num_groups)``, ``recalled_groups = cat(topk, query_group_index)``, the
-expansion ``recalled_groups * ratio + offsets`` clamped to ``kv_length - 1``, and
-``head_weights * (n_heads**-0.5 * head_dim**-0.5)``. It folds the recall into the causal
-attention mask; this entry returns the ids that survive that mask, and drops the clamp because
-every id it emits is at most the row's own position, which is inside the cache.
-
-The scoring is adapted from SGLang's ``_logits_kernel``
-(``python/sglang/kernels/ops/attention/dsa/hy4_flash_indexpool.py``, Apache-2.0): its
-``relu(q . k)`` per head, weighted by the head weight and summed over heads. The radix select,
-the barrier between the program's own write and read of scratch, and the expand-and-pad are
-adapted from glm5_next's target entry ``ops/attention/kpool_select.py`` (Apache-2.0). Both are
-one launch here: the scores go to a per-row scratch, the program selects from it, and it
-expands from its own selection.
+Ids leave ascending from column 0, ``-1`` past the row's length; the consumer applies no causal mask.
+Scoring adapted from SGLang's ``_logits_kernel`` (``hy4_flash_indexpool.py``, Apache-2.0); radix select
+and expand adapted from glm5_next's ``kpool_select.py`` (Apache-2.0).
 """
 
 from __future__ import annotations
@@ -44,8 +17,7 @@ from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper, t
 
 #: Groups scored per `tl.dot` step (the dot's N; at least 16, and the register tile stays small).
 BLOCK_G = 128
-#: Score columns one radix pass and one emit step stream; a row of the run's envelope (1280
-#: groups) is one step, a longer pool streams.
+#: Score columns one radix pass and one emit step stream.
 CHUNK = 2048
 #: Columns of -1 padding written per step.
 PAD_BLOCK = 512
@@ -77,13 +49,9 @@ def _radix_step(hist, remaining, thresh, shift):
 
 @triton.jit
 def _select(srow, sel_row, num_cand, SELECT_K: tl.constexpr, CHUNK: tl.constexpr):
-    """The ``SELECT_K`` largest of the row's ``num_cand`` scores, ascending, written to
-    ``sel_row``; returns their count, ``min(SELECT_K, num_cand)``.
+    """The ``SELECT_K`` largest of ``num_cand`` scores, ascending ids, into ``sel_row``; returns the count.
 
-    Four 8-bit radix passes find the threshold's exact FP32 key, then one emit pass streams the
-    row again and writes every score above it plus the ties it needs, in ascending id order, so
-    a tie at the threshold resolves to the lower group id. With ``num_cand <= SELECT_K`` every
-    candidate is selected (the threshold stays 0, below every real key) and no radix pass runs.
+    Four 8-bit radix passes find the threshold key; ties at it resolve to the lower group id.
     """
     lane = tl.arange(0, CHUNK)
     thresh = tl.zeros([], tl.uint32)
@@ -146,11 +114,7 @@ def _indexer_select_kernel(
     CHUNK: tl.constexpr,
     PAD_BLOCK: tl.constexpr,
 ):
-    """One program per row: score, select, expand.
-
-    ``pos < 0`` is a padded row of a captured batch: one dummy id, length 1, ``nonempty``
-    False, so the consumer has a row it may read and a flag that says it holds nothing.
-    """
+    """One program per row. ``pos < 0`` (padded row): one dummy id, length 1, ``nonempty`` False."""
     r = tl.program_id(0).to(tl.int64)
     pos = tl.load(POSITIONS + r).to(tl.int64)
     row = PACKED + r * OUT_W
@@ -217,11 +181,7 @@ def _reference_logits(
     ratio: int,
     scale: float,
 ) -> torch.Tensor:
-    """``[R, G]``: the head-weighted relu score of every group, ``-inf`` at and past the row's
-    own group (the checkpoint's ``masked_fill(group_ids >= query_group_index)``).
-
-    Computed in the operands' own dtype, so a caller may pass fp32 tensors (the reference's
-    precision) or fp64 ones (a recompute to measure the fp32 error against)."""
+    """``[R, G]`` head-weighted relu scores, ``-inf`` at and past the row's own group; in the operands' dtype."""
     rows = query.shape[0]
     batch, groups, _ = group_keys.shape
     logits = torch.full((rows, groups), float("-inf"), dtype=query.dtype, device=query.device)
@@ -244,24 +204,13 @@ def _reference_logits(
 
 
 class IndexerSelect(OpWrapper):
-    """``query`` BF16 ``[R, H, D]``, ``group_keys`` BF16 ``[B, G, D]``, ``head_weights`` FP32
-    ``[R, H]``, ``row_batch`` int32 ``[R]`` and ``positions`` int32 ``[R]`` ->
-    (``packed`` int32 ``[R, index_topk]``, ``lengths`` int32 ``[R]``, ``nonempty`` bool ``[R]``).
+    """-> (``packed`` int32 ``[R, index_topk]``, ``lengths`` int32 ``[R]``, ``nonempty`` bool ``[R]``).
 
-    ``query`` and ``group_keys`` arrive already rotated with the indexer's own interleaved
-    mRoPE (the query at its row's position, the group keys at their group's first position);
-    ``head_weights`` is ``head_weight_projection``'s output before the entry's
-    ``(H * D) ** -0.5`` scale. ``row_batch`` maps a row to the request whose pool it scores, so
-    a decode step is ``B`` rows over ``B`` pools and a prefill chunk is its rows over one.
+    ``query``/``group_keys`` arrive mRoPE-rotated; ``head_weights`` is unscaled; ``row_batch`` maps row -> pool.
     """
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # The checkpoint's indexer: 16 heads of 128, ratio 4, index_topk 2048, so 511 groups are
-    # recalled and a row's ids reach 2048 columns. The vocabulary's call sites are one row at
-    # the envelope's max length and 64 rows at max_batch_size; the envelope's largest row
-    # count (a 5120-token prefill chunk) and the shortest context the indexer runs on
-    # (2049 tokens -> 512 groups) bound the rest.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="one decode row at the envelope's max length: 5120 tokens -> 1280 groups",
@@ -284,64 +233,6 @@ class IndexerSelect(OpWrapper):
             spec=dict(rows=8, kv=5120, inactive=2),
         ),
     )
-
-    note = """
-    Called by the target's `Indexer.pool_and_select` in both phases: after `indexer_pool` and
-    the indexer's mRoPE produced the group keys, and after `query_projection` and the query's
-    mRoPE produced the query. Its `packed`/`lengths` are the `sparse_mla_decode` selection of
-    the same row, and its `nonempty` is what lets a caller skip a row with nothing visible.
-    The checkpoint skips the indexer entirely at `kv_length <= index_topk` (2048) and attends
-    densely; this entry is correct there too (it then recalls every visible group, i.e. the
-    dense causal prefix) but the target should not call it.
-
-    Sizes: a row's candidate count is its own complete-group count `pos // ratio` clamped to
-    the pool's `G`; `min(group_topk - 1, candidates)` groups are recalled, `group_topk =
-    index_topk // ratio` as the checkpoint derives it. The output is `index_topk` columns wide,
-    the consumer's width, and the longest row fills all of them (511 groups x 4 + the 4 slots
-    of the own group).
-
-    Preconditions:
-      - `query` and `group_keys` are read with `D` between heads or groups and 1 within a head
-        or key, while only the outer strides (`query.stride(0)`, `group_keys.stride(0)`) are
-        taken from the tensors. A last-dim slice of a wider buffer is accepted and scores its
-        neighbour's columns; a group-axis slice is not, its groups stay `D` apart and its
-        outer stride is read. `is_valid` refuses the first.
-      - `head_weights` is `[R, H]` dense. A transposed one has the same shape when `R == H`
-        and is accepted, computing a different weighted sum. `is_valid` refuses it.
-      - The pool must hold every complete group before a row's own group: a shorter pool is
-        silently missing groups from the recall (the kernel clamps its candidate count to the
-        pool). `is_valid` refuses it.
-    Loud (not pinned by a test): `D` a power of two of at least 16, `index_topk // ratio` at
-    least 2, `ratio` at least 1, and `row_batch`/`positions` shaped `[R]`; `__call__` raises
-    `ValueError` for the first three. A zero-row call returns empty tensors.
-
-    Precision: the interior is fp32, as the checkpoint computes it (`query.float()`,
-    `keys.float()`, the weighted sum in fp32), and the output is ids, so the only thing a
-    rounding can move is which group sits at the top-k threshold. The kernel's dot is an IEEE
-    fp32 dot (`input_precision="ieee"`) of bf16-representable operands, so its products are
-    exact and only the accumulation order differs from the reference's; the test derives its
-    threshold band from a float64 recompute and compares the selected ids exactly wherever the
-    k-th and (k+1)-th reference logits are farther apart than that band. Ties at the threshold
-    are the one place the two may legitimately differ (the kernel prefers the lower group id;
-    the reference takes torch's order), and the test compares the selected logits' multiset
-    there. Measured on the five cells: the fp32 reference sits at most 9.72e-07 from a float64
-    recompute of the same logits (8.74e-07 at 2049 tokens), the selected logits' multiset
-    differs from the reference's by 0.0 on every cell, and of the 5195 rows that select a
-    group, 5175 had a boundary gap past the test's 2e-05 band and selected the reference's
-    groups exactly; the other 20 sat inside a tie (one of them the eight-valued pool of the
-    tie test).
-
-    Plain `@triton.jit`, no autotune, JIT-compiled at first call; the cells drove that JIT path
-    on sm_103. `D`, `H`, `RATIO`, `SELECT_K` and the tiles are `tl.constexpr`, so each geometry
-    is its own specialization. Not captured here: CUDA graphs at a fixed shape (the scratch is
-    allocated per call, as the target's other select entry does, so a capture would have to
-    take the allocation into its pool).
-
-    Not certified: heads other than 16, `D` other than 128, `ratio` other than 4,
-    `index_topk` other than 2048, a pool with fewer groups than a row's complete groups (see
-    the guard), an fp32 or fp16 `query`/`group_keys`, an fp32 `head_weights` of a different
-    width, `positions` past 2**31 - 1, rows past the envelope's 5120, and batches past 64.
-    """
 
     def __call__(
         self,
@@ -417,14 +308,7 @@ class IndexerSelect(OpWrapper):
         ratio: int = 4,
         index_topk: int = 2048,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """The same selection in plain torch, fp32 throughout.
-
-        The top-k of ``_reference_logits`` (``-inf`` at and past the row's own group), with the
-        rows that see fewer than ``select_k`` groups keeping what they see; then the expansion,
-        the own group's tail up to the row's position, and ``-1`` after the row's length. A row
-        with nothing visible (a padded row) gets one dummy id 0 and ``nonempty`` False, as the
-        kernel writes.
-        """
+        """The same selection in plain torch, fp32 throughout."""
         rows, heads, dim = query.shape
         _, groups, _ = group_keys.shape
         dev = query.device
@@ -440,8 +324,7 @@ class IndexerSelect(OpWrapper):
         select_k = min(index_topk // ratio - 1, groups)
         if select_k > 0:
             top = torch.topk(logits, select_k, dim=1).indices
-            # Groups past a row's own are -inf and must not be recalled as -inf ids; the
-            # survivors go first, ascending, the rest -1 after them.
+            # Drop -inf (not visible) picks; survivors ascending, then -1.
             top = torch.where(torch.gather(logits, 1, top) > float("-inf"), top, -1)
             top = torch.where(top >= 0, top, torch.full_like(top, groups))
             top = top.sort(dim=1).values
@@ -486,7 +369,7 @@ class IndexerSelect(OpWrapper):
     ) -> None:
         rows, heads, dim = query.shape
         _, groups, _ = group_keys.shape
-        # Read with dense inner strides while only the row strides are taken from the tensors.
+        # Dense inner strides; only the row strides are taken from the tensors.
         assert tuple(query.stride()[1:]) == (dim, 1), (
             f"query must be dense within a row, [heads, head_dim]; got strides "
             f"{tuple(query.stride())} (a last-dim slice of a wider tensor reads its neighbour's "
@@ -506,8 +389,7 @@ class IndexerSelect(OpWrapper):
             f"transposed one is accepted when rows == heads and computes another weighted sum)"
         )
         assert row_batch.shape == (rows,) and positions.shape == (rows,)
-        # A pool shorter than a row's complete groups drops visible groups from the recall
-        # without a sign: the candidate count is clamped to the pool.
+        # The kernel clamps candidates to the pool, so a short pool would silently drop visible groups.
         active = positions >= 0
         if bool(active.any()):
             assert int(positions[active].max()) // ratio <= groups, (

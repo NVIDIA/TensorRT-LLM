@@ -305,32 +305,20 @@ def get_glm5_next_num_attention_layers(
     return sum(full_mask)
 
 
-#: The checkpoint's names for a layer that runs the DSA indexer (the engine
-#: keeps `deepseek_sparse_attention`; newer checkpoints spell it
-#: `indexed_attention`).
+#: DSA-indexer layer types (newer checkpoints spell it `indexed_attention`).
 _HYV4_FLASH_SPARSE_LAYER_TYPES = ("deepseek_sparse_attention",
                                   "indexed_attention")
 
 
 def is_hyv4_flash(config: transformers.PretrainedConfig) -> bool:
-    """True for HY4-Flash ("hy_v4_flash") text and composite configs.
-
-    Handles both the flattened text config (model_type "hy_v4_flash_text") and
-    the composite config (model_type "hy_v4_flash" with a nested text_config).
-    """
+    """True for HY4-Flash text and composite configs."""
     return getattr(config, "model_type",
                    None) in ("hy_v4_flash", "hy_v4_flash_text")
 
 
 def unwrap_hyv4_flash_text_config(
         config: transformers.PretrainedConfig) -> transformers.PretrainedConfig:
-    """Return the flattened HY4-Flash text config.
-
-    ``is_hyv4_flash`` accepts both the flattened text config and the composite
-    "hy_v4_flash" config with a nested ``text_config``; consumers read
-    text-level fields (``layer_types``, ``index_topk``, ``kv_lora_rank``, ...),
-    so they must unwrap the composite form first.
-    """
+    """Return the HY4-Flash text config, unwrapping the composite form."""
     if getattr(config, "model_type", None) == "hy_v4_flash":
         text_config = getattr(config, "text_config", None)
         if text_config is not None:
@@ -340,13 +328,7 @@ def unwrap_hyv4_flash_text_config(
 
 def get_hyv4_flash_layer_masks(
         config: transformers.PretrainedConfig) -> tuple[list[bool], list[bool]]:
-    """Return (sparse_layer_mask, sliding_layer_mask) for HY4-Flash.
-
-    The text config's literal ``layer_types`` list names every decoder layer as
-    exactly one of ``deepseek_sparse_attention`` (sparse MLA with the DSA
-    indexer) or ``sliding_attention`` (windowed MLA); 12 + 30 on the real
-    checkpoint.
-    """
+    """Return (sparse_layer_mask, sliding_layer_mask) from ``layer_types``."""
     config = unwrap_hyv4_flash_text_config(config)
     if (getattr(config, "layer_types", None) is None
             or len(config.layer_types) != config.num_hidden_layers):
@@ -889,14 +871,7 @@ def is_qwen4_exp_multimodal_config(config_dict: dict) -> bool:
 
 
 def is_hyv4_flash_multimodal_config(config_dict: dict) -> bool:
-    """Return whether a checkpoint contains the composite vision model.
-
-    HY4-Flash's checkpoint advertises ``model_type: hy_v4_flash`` with nested
-    ``text_config`` (the decoder) and ``vision_config`` (the SigLIP2-like tower
-    and its projector), and carries the multimodal token ids and the DFly2
-    drafting geometry at the top level. The text-only flatten path serves a
-    ``language_model_only: true`` config or a bare decoder.
-    """
+    """Return whether a checkpoint contains the composite vision model."""
     text_config = config_dict.get("text_config")
     vision_config = config_dict.get("vision_config")
     return (config_dict.get("model_type") == "hy_v4_flash"
@@ -1225,15 +1200,10 @@ def load_pretrained_config(model_name_or_path: str,
                                getattr(configs, config_name))
         model_config = config_class.from_dict(config_dict, **kwargs)
     elif is_hyv4_flash_multimodal_config(config_dict):
-        # HY4-Flash composite: keep the vision tower, the multimodal token ids
-        # and the checkpoint-native DFly2 geometry for the multimodal wrapper.
-        # transformers ships no hy_v4_flash config, so the in-tree classes
-        # build it.
         from tensorrt_llm._torch.configs import HYV4FlashConfig
         normalized_config = dict(config_dict)
         text_dict = dict(config_dict["text_config"])
-        # The checkpoint keeps the quantization block inside text_config; the
-        # engine reads it from the top level.
+        # The checkpoint keeps quantization_config inside text_config.
         quantization_config = text_dict.get("quantization_config")
         if quantization_config is not None:
             normalized_config["quantization_config"] = dict(quantization_config)
@@ -1244,7 +1214,7 @@ def load_pretrained_config(model_name_or_path: str,
         model_config.text_config.torch_dtype = resolved_dtype
         model_config.torch_dtype = resolved_dtype
     elif model_type in ("hy_v4_flash", "hy_v4_flash_text"):
-        # Text-only (or multimodal explicitly disabled): flatten to the decoder.
+        # Text-only or language_model_only: flatten to the decoder.
         from tensorrt_llm._torch.configs import HYV4FlashTextConfig
         text_dict = dict(config_dict.get("text_config") or config_dict)
         quantization_config = text_dict.get("quantization_config")
