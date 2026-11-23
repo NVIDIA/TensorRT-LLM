@@ -3,7 +3,7 @@
 
 from types import SimpleNamespace
 from typing import Callable
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -257,6 +257,7 @@ def test_fp8_block_scale_mlp_small_m_matches_deep_gemm(rows, backend):
     """A tuned shared-expert-sized FP8 MLP is at least as close to the exact product as its
     untuned forward."""
     from tensorrt_llm._torch.autotuner import AutoTuner, autotune
+    from tensorrt_llm._torch.custom_ops import torch_custom_ops
     from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -312,10 +313,61 @@ def test_fp8_block_scale_mlp_small_m_matches_deep_gemm(rows, backend):
     plain = mlp(x)
     with autotune():
         mlp(x)
-    tuned = mlp(x)
+    cache = AutoTuner.get().profiling_cache
+    with patch.object(cache, "search_cache", wraps=cache.search_cache) as cache_search:
+        tuned = mlp(x)
     # Whichever kernels win, the tuned forward is at least as close to the exact product.
     assert rms_error(tuned) <= 1.05 * rms_error(plain)
-    assert rms_error(tuned) <= 2e-2 * reference.square().mean().sqrt().item()
+
+    def activation_group_size(width: int, *, fused_swiglu: bool = False) -> int:
+        operation = (
+            torch_custom_ops._FP8_BLOCK_SCALE_SWIGLU_GEMM_AUTOTUNED_OP
+            if fused_swiglu
+            else torch_custom_ops._FP8_BLOCK_SCALE_GEMM_AUTOTUNED_OP
+        )
+        calls = [
+            call
+            for call in cache_search.call_args_list
+            if call.args[0] == operation and call.args[2][0][-1] == width
+        ]
+        if calls:
+            hit, _, tactic, _ = cache.search_cache(*calls[-1].args, **calls[-1].kwargs)
+            if hit:
+                return 0 if tactic == 0 else 128
+        if not fused_swiglu:
+            linear = mlp.gate_up_proj if width == hidden else mlp.down_proj
+            if linear.fp8_low_m_gemm.serves(x):
+                return 32
+        return 128
+
+    def quantized_activation(value: torch.Tensor, group_size: int) -> torch.Tensor:
+        blocks = value.float().reshape(rows, -1, group_size)
+        scale = torch.exp2(torch.ceil(torch.log2(blocks.abs().amax(-1).clamp_min(1e-4) / 448)))
+        quantized = (blocks / scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
+        return (quantized.double() * scale.double().unsqueeze(-1)).reshape_as(value)
+
+    gate_group_size = activation_group_size(hidden)
+    down_group_size = 0
+    if mlp._can_fuse_swiglu_fp8_quant():
+        down_group_size = activation_group_size(2 * intermediate, fused_swiglu=True)
+    if not down_group_size:
+        down_group_size = activation_group_size(intermediate)
+    precision_reference = reference
+    if gate_group_size or down_group_size:
+        gate_input = quantized_activation(x, gate_group_size) if gate_group_size else x.double()
+        gate_product = gate_input @ gate_ref.t()
+        up_product = gate_input @ up_ref.t()
+        if down_group_size:
+            gate_product = gate_product.to(torch.bfloat16).float()
+            up_product = up_product.to(torch.bfloat16).float()
+        activation_reference = F.silu(gate_product) * up_product
+        if down_group_size:
+            activation_reference = quantized_activation(
+                activation_reference.to(torch.bfloat16), down_group_size
+            )
+        precision_reference = activation_reference @ down_ref.t()
+    absolute_error = (tuned.double() - precision_reference).square().mean().sqrt().item()
+    assert absolute_error <= 2e-2 * precision_reference.square().mean().sqrt().item()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured = mlp(x)
