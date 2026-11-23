@@ -132,9 +132,13 @@ def test_early_generation_preparation_uses_execution_order_and_checks_manager():
 
 
 def test_unchanged_private_pages_skip_staging_events_and_scratch_resets(monkeypatch):
-    cache = SimpleNamespace(
-        history_length=140, page_storage_version=3, num_blocks=2, is_active=True
-    )
+    class StablePages(SimpleNamespace):
+        def __getattribute__(self, name):
+            if name in ("history_length", "num_blocks"):
+                pytest.fail("Unchanged native page versions must not re-read page geometry")
+            return super().__getattribute__(name)
+
+    cache = StablePages(history_length=140, page_storage_version=3, num_blocks=2, is_active=True)
     manager = SimpleNamespace(kv_cache_map={42: cache}, tokens_per_block=128)
     worker = SimpleNamespace(
         _draft_kv_manager=manager,
@@ -235,6 +239,19 @@ def test_private_page_updates_preserve_execution_order_without_redundant_gathers
     assert worker._batch_to_slot.tolist() == [1, 2, 2]
     assert worker._draft_capacities.tolist() == [384, 0, 0]
     assert gather.call_count == 3
+
+    # A narrower window can advance inside one native history block.
+    worker._draft_kv_manager.tokens_per_block = 256
+    caches[43].history_length = 383
+    caches[43].num_blocks = 2
+    tables[id(caches[43])] = (0, (9, 10))
+    DSv41DSparkWorker._prepare_page_tables(worker, [43], 0)
+    calls = worker._page_indices.call_count
+    caches[43].history_length = 384
+    tables[id(caches[43])] = (1, (10,))
+    DSv41DSparkWorker._prepare_page_tables(worker, [43], 0)
+    assert worker._page_indices.call_count == calls + 1
+    assert worker._draft_page_indices[1] == (1, (10,))
 
 
 @pytest.mark.parametrize(

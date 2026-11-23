@@ -148,6 +148,8 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
 
     def _prepare_page_tables(self, request_ids: list[int], num_contexts: int) -> None:
         manager = self._draft_kv_manager
+        private = self._draft_reuse_policy == ReusePolicy.PRIVATE
+        versioned_window = private and not num_contexts and manager.tokens_per_block == self._win
         real_rows = [
             row
             for row, rid in enumerate(request_ids)
@@ -157,27 +159,35 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
             and manager.kv_cache_map[rid].is_active
         ]
         real_ids = {request_ids[row] for row in real_rows}
-        for rid in list(self._req_to_slot):
-            if rid not in real_ids:
-                self._free_slots.append(self._req_to_slot.pop(rid))
-                self._managed_residency.pop(rid, None)
+        for rid in self._req_to_slot.keys() - real_ids:
+            self._free_slots.append(self._req_to_slot.pop(rid))
+            self._managed_residency.pop(rid, None)
         slots = [self._scratch_slot] * len(request_ids)
         updates = []
         capacities = [0] * self._draft_capacities.shape[0]
         for row in real_rows:
             rid = request_ids[row]
             cache = manager.kv_cache_map[rid]
-            slot = self._assign_slot(rid, reset=False)
+            slot = self._req_to_slot.get(rid)
+            if slot is None:
+                slot = self._assign_slot(rid, reset=False)
             slots[row] = slot
-            first = max(0, cache.history_length - self._win) // manager.tokens_per_block
-            version = (
-                cache,
-                cache.page_storage_version,
-                first,
-                cache.num_blocks,
-                row < num_contexts,
-            )
-            if self._draft_page_versions.get(slot) != version:
+            previous = self._draft_page_versions.get(slot)
+            page_version = cache.page_storage_version
+            # A page-sized window moves only at a history-block boundary, which
+            # the native storage version already tracks alongside page changes.
+            if (
+                versioned_window
+                and previous is not None
+                and previous[0] is cache
+                and previous[1] == page_version
+                and previous[-1] is False
+            ):
+                version = previous
+            else:
+                first = max(0, cache.history_length - self._win) // manager.tokens_per_block
+                version = (cache, page_version, first, cache.num_blocks, row < num_contexts)
+            if previous != version:
                 table = self._page_indices(cache, row < num_contexts)
                 if self._draft_page_indices.get(slot) != table:
                     updates.append((slot, row, *table))
@@ -196,7 +206,6 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
                 self._managed_residency[rid] = cache
         # Generation preparation resets scratch state inside the graph before
         # consuming it. Context seeding still needs the eager reset.
-        private = self._draft_reuse_policy == ReusePolicy.PRIVATE
         if num_contexts or not private:
             self._ctx_len[self._scratch_slot].zero_()
             self._valid_len[self._scratch_slot].zero_()
