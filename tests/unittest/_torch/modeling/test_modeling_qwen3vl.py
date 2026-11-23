@@ -1084,6 +1084,35 @@ def test_qwen_vl_embeddings_with_image_grid_match_processor_path(model, sizes):
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("model", ["qwen2.5", "qwen3"])
+def test_qwen_vl_bare_image_placeholders_use_each_grid(model):
+    processor, width = _make_qwen_vl_embedding_processor(model, [7, 12, 12, 8])
+    items = [
+        {"mm_embeddings": torch.zeros(2, width), "image_grid_thw": [1, 2, 4]},
+        {"mm_embeddings": torch.zeros(4, width), "image_grid_thw": [1, 4, 4]},
+    ]
+    ids, extra = processor.attach_multimodal_embeddings(
+        {"prompt": "two images"}, {"image": items}, SamplingParams()
+    )
+    assert ids == [7] + [12] * 6 + [8]
+    mm_input = extra["multimodal_input"]
+    assert mm_input.multimodal_positions == [1, 3]
+    assert mm_input.multimodal_lengths == [2, 4]
+    assert mm_input.multimodal_hashes[0] != mm_input.multimodal_hashes[1]
+    positions = extra["multimodal_data"]["mrope_config"]["mrope_position_ids"]
+    torch.testing.assert_close(
+        positions[:, 0],
+        torch.tensor(
+            [
+                [0, 1, 1, 3, 3, 3, 3, 5],
+                [0, 1, 1, 3, 3, 4, 4, 5],
+                [0, 1, 2, 3, 4, 3, 4, 5],
+            ]
+        ),
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("model", ["qwen2.5", "qwen3"])
 @pytest.mark.parametrize("as_dict", [False, True], ids=["tensor", "dict"])
 def test_qwen_vl_embeddings_without_image_grid_raise(model, as_dict):
     processor, width = _make_qwen_vl_embedding_processor(model, [7, 12, 8])

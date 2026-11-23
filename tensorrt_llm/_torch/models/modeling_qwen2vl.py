@@ -1149,14 +1149,20 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         for i in range(B):
             mask_i = attn_np[i] == 1
             seq = ids_np[i][mask_i]
-            vision_start_indices = np.flatnonzero(seq == vision_start_token_id)
-            vision_tokens = (seq[vision_start_indices +
-                                 1] if vision_start_indices.size else seq[:0])
-            image_nums = int((vision_tokens == image_token_id).sum())
-            video_nums = int((vision_tokens == video_token_id).sum())
             seq_list = seq.tolist()
             has_image = image_token_id in seq_list
             has_video = video_token_id in seq_list
+            if (B == 1 and len(seq) == S and has_image
+                    and image_grid_np is not None and video_grid_np is None):
+                # All image grids belong to this prompt, including attached
+                # images whose placeholders have no leading vision-start token.
+                image_nums, video_nums = len(image_grid_np), 0
+            else:
+                vision_start_indices = np.flatnonzero(
+                    seq == vision_start_token_id)
+                vision_tokens = seq[vision_start_indices + 1]
+                image_nums = int((vision_tokens == image_token_id).sum())
+                video_nums = int((vision_tokens == video_token_id).sum())
             llm_pos_ids_list = []
             st = 0
             remain_images, remain_videos = image_nums, video_nums
