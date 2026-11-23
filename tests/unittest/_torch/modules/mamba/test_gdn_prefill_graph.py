@@ -8,15 +8,15 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.modules.fla.flashinfer_chunk import invalidate_int32_cu_seqlens_cache
+from tensorrt_llm._torch.modules.fla.gdn_metadata import GDNMambaMetadata
+from tensorrt_llm._torch.modules.fla.inforward_snapshot import InforwardSnapshotEntry
 from tensorrt_llm._torch.modules.mamba import gdn_mixer
 from tensorrt_llm._torch.modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
-from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import (
     BreakableCUDAGraph,
     BreakableCUDAGraphCapture,
     enable_breakable_cuda_graph,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import InforwardSnapshotEntry
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or not gdn_mixer._use_flashinfer_gdn_prefill(),
@@ -69,7 +69,8 @@ class _Step:
             inforward_snapshot_max_tail=4,
             state_index=lambda rid: self.slots[rid],
         )
-        self.mamba = Mamba2Metadata(max_batch_size=4, chunk_size=128)
+        # The metadata the GDN models and managers name: the GDN core reads its state.
+        self.mamba = GDNMambaMetadata(max_batch_size=4, chunk_size=128)
         self.attn = SimpleNamespace(
             kv_cache_manager=self.manager,
             mamba_metadata=self.mamba,
@@ -96,7 +97,7 @@ class _Step:
         mamba.query_start_loc_long = mamba._cu_seqlens_long[: n + 1]
         mamba.state_indices[:n].copy_(torch.tensor([slot for slot, _, _, _ in requests]))
         mamba.has_initial_states[:n].copy_(torch.tensor([init for _, _, init, _ in requests]))
-        # What Mamba2Metadata.prepare resets for every iteration.
+        # What GDNMambaMetadata.prepare resets for every iteration.
         invalidate_int32_cu_seqlens_cache()
         mamba.prefill_needs_state_reset = True
         mamba.state_reset_done = False
@@ -254,7 +255,7 @@ def test_prefill_graph_does_not_replay_against_moved_metadata(harness):
     harness.run(_TWO_SPLIT_ONE, seed=1, capture=True)
     # The metadata is rebuilt: its buffers move, and the old ones hold another batch.
     old = harness.step.mamba
-    harness.step.mamba = harness.step.attn.mamba_metadata = Mamba2Metadata(4, 128)
+    harness.step.mamba = harness.step.attn.mamba_metadata = GDNMambaMetadata(4, 128)
     harness.step.set([(5, 64, True, 0), (2, 130, True, 2)])
     old.cu_seqlens.fill_(1)
     old.state_indices.fill_(0)

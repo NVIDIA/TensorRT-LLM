@@ -20,8 +20,8 @@ import tensorrt_llm._torch.modules.fla.flashinfer_chunk as fc
 import tensorrt_llm._torch.modules.fla.fused_sigmoid_gating_recurrent as fsg
 import tensorrt_llm._torch.modules.mamba.gdn_mixer as gm
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.modules.fla.gdn_metadata import GDNMambaMetadata
 from tensorrt_llm._torch.modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
-from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._utils import is_sm_100f
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
@@ -111,7 +111,7 @@ def test_forward_core_direct_launches_match_generic_entries(monkeypatch, ctx_len
         manager = _CacheManager(slots)
         manager.mamba_layer_cache = lambda layer_idx: layer_cache
         manager.is_speculative = lambda: False
-        md = Mamba2Metadata(max_batch_size=128, chunk_size=64)
+        md = GDNMambaMetadata(max_batch_size=128, chunk_size=64)
         attn = SimpleNamespace(
             seq_lens=seq_lens,
             seq_lens_cuda=seq_lens.cuda(),
@@ -233,7 +233,7 @@ def test_fused_prefill_conv_takes_the_direct_scan_launch(monkeypatch, ctx_lens):
         manager = _CacheManager(slots)
         manager.mamba_layer_cache = lambda layer_idx: layer_cache
         manager.is_speculative = lambda: False
-        md = Mamba2Metadata(max_batch_size=128, chunk_size=64)
+        md = GDNMambaMetadata(max_batch_size=128, chunk_size=64)
         attn = SimpleNamespace(
             seq_lens=seq_lens,
             seq_lens_cuda=seq_lens.cuda(),

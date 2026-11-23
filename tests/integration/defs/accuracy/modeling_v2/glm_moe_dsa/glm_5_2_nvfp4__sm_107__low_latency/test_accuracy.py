@@ -165,6 +165,9 @@ def _engine_kwargs(case: AccuracyCase = POINT01, *, modeling_v2: str = "require"
         cuda_graph_config=CudaGraphConfig(
             batch_sizes=list(range(1, case.batch_size + 1)), enable_padding=True
         ),
+        # Stays on the TRTLLM literal, which the MTP layers share: under a tactic
+        # they would resolve AUTO for their bf16 experts (CUTLASS here), and this
+        # target honors no draft tactic to pin them with (draft_moe_impls_honored).
         moe_config=MoeConfig(backend="TRTLLM", use_low_precision_moe_combine=True),
         sparse_attention_config=DeepSeekSparseAttentionConfig(
             enable_heuristic_topk=True,

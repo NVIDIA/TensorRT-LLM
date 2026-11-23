@@ -22,6 +22,7 @@
 #include <cooperative_groups.h>
 #include <cute/tensor.hpp>
 #include <mutex>
+#include <type_traits>
 
 namespace
 {
@@ -775,6 +776,39 @@ void invokeAttnResRmsNormFwd(AttnResFwdParams const& params, cudaStream_t stream
 void invokeAttnResAddRmsNormFwd(AttnResFwdParams const& params, cudaStream_t stream)
 {
     invokeAttnResDecodeRmsNorm<true>(params, stream);
+}
+
+bool invokeAttnResSingleTokenFwd(AttnResFwdParams const& params, cudaStream_t stream)
+{
+    using namespace sm100::fwd_prod_v2;
+
+    if (params.seqLen != 1)
+    {
+        return false;
+    }
+    // Unfused: no trailing norm or residual add, rsigma/probs/logits written, dependents released after the final
+    // store (S1Handoff's default).
+    auto const single_cta = [&](auto n_tok)
+    {
+        launch_s1_single_cta<decltype(n_tok)::value, false, false>(params.blockResidual, params.layerResidual, nullptr,
+            params.resWeight, params.rmsWeight, nullptr, nullptr, params.output, params.rsigma, params.probs,
+            params.logits, params.rmsEps, 0.f, params.seqLen, stream);
+    };
+    auto const splitk = [&](auto n_tok)
+    {
+        launch_s1_splitk<decltype(n_tok)::value, 8, false, false>(params.blockResidual, params.layerResidual, nullptr,
+            params.resWeight, params.rmsWeight, nullptr, nullptr, params.output, params.rsigma, params.probs,
+            params.logits, params.rmsEps, 0.f, params.seqLen, stream);
+    };
+    switch (params.numCandidates)
+    {
+    case 1: single_cta(std::integral_constant<int, 1>{}); return true;
+    case 2: single_cta(std::integral_constant<int, 2>{}); return true;
+    case 4: single_cta(std::integral_constant<int, 4>{}); return true;
+    case 8: splitk(std::integral_constant<int, 8>{}); return true;
+    case 12: splitk(std::integral_constant<int, 12>{}); return true;
+    default: return false;
+    }
 }
 
 }

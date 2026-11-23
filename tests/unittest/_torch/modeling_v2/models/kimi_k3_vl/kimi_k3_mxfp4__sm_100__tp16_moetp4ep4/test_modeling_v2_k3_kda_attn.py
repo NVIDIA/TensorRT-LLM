@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the ssm/k3_kda_attn catalog entry (and its sibling k3_kda_qkvg), on a real cache object and a
+"""GPU test for the ssm/k3_kda_attn op (and its sibling k3_kda_qkvg), on a real cache object and a
 caller-owned K3KdaBuffers.
 
 Kimi K3's fused KDA projection + speculative verify of one request's golden token and 7 drafts, at the TP16 rank

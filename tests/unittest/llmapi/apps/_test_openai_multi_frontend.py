@@ -90,6 +90,13 @@ def _success_total(server: RemoteOpenAIServer) -> float:
     )
 
 
+def _num_measured_records(server: RemoteOpenAIServer) -> int:
+    """Iteration records one poll of /metrics returns, without the heartbeats
+    an idle engine keeps reporting once a second."""
+    rows = requests.get(server.url_for("metrics"), timeout=30).json()
+    return sum(not row.get("isQueueSnapshot") for row in rows)
+
+
 def test_frontends_share_one_engine(server: RemoteOpenAIServer, model_path: str):
     with ThreadPoolExecutor(16) as pool:
         finish_reasons = list(
@@ -103,7 +110,7 @@ def test_frontends_share_one_engine(server: RemoteOpenAIServer, model_path: str)
     # Only the launcher drains the engine's stats (every second), so the first
     # poll gets all of them, whichever frontend answers.
     time.sleep(3)
-    polls = [len(requests.get(server.url_for("metrics"), timeout=30).json()) for _ in range(16)]
+    polls = [_num_measured_records(server) for _ in range(16)]
     assert polls[0] > 0 and not any(polls[1:]), polls
 
     # Every scrape counts the requests of all frontends.

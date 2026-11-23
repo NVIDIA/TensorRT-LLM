@@ -384,3 +384,24 @@ def test_sentinel_formats_share_a_live_workspace(monkeypatch: pytest.MonkeyPatch
     bf16, bf16_layout = layer("BF16")
     assert bf16.sentinel_max_tokens == 160 and bf16._sentinel_format == "BF16"
     assert not torch.equal(bf16_layout, nvfp4_layout)
+
+
+@pytest.mark.parametrize("phase", ["dispatch", "combine"])
+@pytest.mark.parametrize(
+    "rank_mask, message",
+    [
+        (False, "active_rank_mask requires committed EP group health"),
+        (True, "active_rank_mask is not an argument"),
+    ],
+    ids=["fault_tolerance_off", "fault_tolerance_on"],
+)
+def test_active_rank_mask_argument_refused(phase: str, rank_mask: bool, message: str) -> None:
+    """Refuse an active_rank_mask argument rather than run the all-to-all without it."""
+    comm = NVLinkOneSided.__new__(NVLinkOneSided)
+    comm._rank_mask_enabled = rank_mask
+    mask = torch.zeros(1, dtype=torch.uint64)
+    with pytest.raises(ValueError, match=message):
+        if phase == "dispatch":
+            comm.dispatch(None, None, None, None, [1], active_rank_mask=mask)
+        else:
+            comm.combine(None, active_rank_mask=mask)
