@@ -49,6 +49,7 @@ from tensorrt_llm.inputs.multimodal import (
 )
 from tensorrt_llm.logger import logger
 
+from ..hostfunc import hostfuncs_pending
 from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from ..pyexecutor.runtime_hooks import DEFAULT_RUNTIME_HOOKS, RuntimeHooks, runtime_hooks_of
 from .modeling_multimodal_utils import (
@@ -432,8 +433,15 @@ class MultimodalModelMixin:
     `BaseMultimodalInputProcessor.get_mm_item_metadata`. This is the executor-layer gate for
     item scheduling."""
 
+    # TODO: Move capability declarations into the planned single
+    # SupportsMultimodal Protocol; keep shared execution in this mixin
+    # and encoder attention-metadata setup in MultimodalEncoderMixin.
+    supported_encoder_attention_backends: ClassVar[dict[str, frozenset[str]]] = {}
+    """Public backends by logical encoder; an empty set marks fixed attention."""
+
     model_config: ModelConfig
     _multimodal_encoder_cache: Optional[TensorLRUCache] = None
+    _encoder_forward_context: Callable[[], contextlib.AbstractContextManager[None]] | None = None
 
     @classmethod
     def _cast_multimodal_encoder_dtype(
@@ -482,6 +490,16 @@ class MultimodalModelMixin:
         the bad one. Default: accept everything.
         """
         return None
+
+    def _run_multimodal_encoder(
+        self,
+        multimodal_params: Sequence[MultimodalParams],
+    ) -> torch.Tensor:
+        """Run encoder work with optional runtime instrumentation after H2D."""
+        if self._encoder_forward_context is None:
+            return self.encode_multimodal_inputs(multimodal_params)
+        with self._encoder_forward_context():
+            return self.encode_multimodal_inputs(multimodal_params)
 
     def prepare_multimodal_encoder_inputs(
         self,
@@ -600,7 +618,7 @@ class MultimodalModelMixin:
         def flush_group() -> None:
             if not group_params:
                 return
-            embeddings = self.encode_multimodal_inputs(group_params)
+            embeddings = self._run_multimodal_encoder(group_params)
             expected_length = sum(group_lengths)
             if embeddings.shape[0] != expected_length:
                 raise MultimodalEncoderContractError(
@@ -1140,7 +1158,7 @@ class MultimodalModelMixin:
             self._encode_with_partial_cache(partial_hits, encoder_cache)
 
         embeddings = get_multimodal_embeddings(
-            encoder_forward_fn=self.encode_multimodal_inputs,
+            encoder_forward_fn=self._run_multimodal_encoder,
             multimodal_params=list(multimodal_params),
         )
         if encoder_cache is not None:
@@ -1442,7 +1460,7 @@ class MultimodalModelMixin:
         )
         # Keep one call across requests and modalities so EncoderGroup can
         # batch modalities that share an encoder.
-        batched_output = self.encode_multimodal_inputs([param for param, _, _ in encoder_inputs])
+        batched_output = self._run_multimodal_encoder([param for param, _, _ in encoder_inputs])
         output_lengths = [length for _, lengths, _ in encoder_inputs for length in lengths]
         encoded_items = iter(torch.split(batched_output, output_lengths, dim=0))
 
@@ -1741,7 +1759,7 @@ def _dispatch_cross_iter_prefetch(
                 if partial_hits and encoder_cache is not None:
                     model._encode_with_partial_cache(partial_hits, encoder_cache)
                 if cache_misses:
-                    encoder_output = model.encode_multimodal_inputs(cache_misses).clone()
+                    encoder_output = model._run_multimodal_encoder(cache_misses).clone()
                     _store_chunked_prefill_embeddings(cache_misses, [encoder_output])
                     if encoder_cache is not None:
                         for param in cache_misses:
@@ -1815,6 +1833,10 @@ def maybe_prefetch_mm_encoder_for_next_iter(
     if max_prefetch_ahead is None:
         max_prefetch_ahead = 0
     if max_prefetch_ahead <= 0:
+        return 0
+    # The encoder can hold the GIL while it waits on the device. Until the host functions of a
+    # replayed graph have been drained, these requests are encoded when scheduled instead.
+    if hostfuncs_pending():
         return 0
 
     aux_stream = _get_mm_aux_stream(max_prefetch_ahead)

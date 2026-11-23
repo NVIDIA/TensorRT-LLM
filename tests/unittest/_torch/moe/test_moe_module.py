@@ -92,6 +92,7 @@ from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancerIterContext,
 )
 from tensorrt_llm._torch.moe.fused_moe.quantization import (
+    BF16TRTLLMGenFusedMoEMethod,
     DeepSeekFP8BlockScalesFusedMoEMethod,
     DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm,
     FP8QDQFusedMoEMethod,
@@ -115,7 +116,7 @@ from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm._utils import get_sm_version, mpi_comm, mpi_rank
 from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models.modeling_utils import QuantAlgo
+from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 G_LOGGER = logging.getLogger(__name__)
 
@@ -1627,6 +1628,30 @@ def test_configurable_moe_single_gpu(
     )
 
 
+@pytest.mark.parametrize(
+    "moe_tactic", ["cutlass", "cutlass.none", "trtllm.cutlass.grouped_gemm.none"]
+)
+def test_a_tactic_builds_the_implementation_it_names(moe_tactic: str):
+    """Model code builds MoE layers through create_moe; under a tactic the layer runs the
+    implementation the tactic names on the layer's format, here CUTLASS over BF16 weights."""
+    model_cfg = _create_model_config(
+        num_experts=8,
+        hidden_size=256,
+        intermediate_size=512,
+        dtype=torch.bfloat16,
+        mapping=Mapping(),
+        quant_config=QuantConfig(),
+        moe_backend="CUTLASS",
+    ).copy_with(moe_backend="CUTLASS", moe_tactic=moe_tactic)
+
+    with create_moe(
+        routing_method=RenormalizeMoeRoutingMethod(top_k=2),
+        reduce_results=True,
+        model_config=model_cfg,
+    ) as moe:
+        assert type(moe.backend).descriptor.impl_id == "trtllm.cutlass.grouped_gemm.none"
+
+
 # ============================================================================
 # FP32 Routing Bias Tests
 # ============================================================================
@@ -2199,10 +2224,13 @@ def _get_fused_moe_method_class(quant_algo, backend_type):
     backend_str = backend_type.value if hasattr(backend_type, "value") else str(backend_type)
 
     if quant_algo is None:
-        # Unquantized - only CUTLASS supports it
-        if backend_str == "CUTLASS":
-            return UnquantizedFusedMoEMethod
-        return None
+        # Unquantized: the CUTLASS method, or the TRTLLM-Gen BF16 method that
+        # keeps the experts in its shuffled BlockMajorK layout.
+        method_map = {
+            "CUTLASS": UnquantizedFusedMoEMethod,
+            "TRTLLM": BF16TRTLLMGenFusedMoEMethod,
+        }
+        return method_map.get(backend_str)
 
     # CUTLASS backend
     # What each CUTLASS leaf's _get_quant_method() returns, for the formats

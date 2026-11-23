@@ -8,10 +8,10 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.qwen4_exp_qk_norm_rope import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qwen4_exp_qk_norm_rope import (  # noqa: E501
     CKPT,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.qwen4_exp_qk_norm_rope import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qwen4_exp_qk_norm_rope import (  # noqa: E501
     qwen4_exp_qk_norm_rope as op,
 )
 

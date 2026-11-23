@@ -40,6 +40,10 @@ class MoEDep(str, Enum):
     #: The installed CuTe DSL exposes the Rubin helpers the SM107 CuteDSL
     #: kernels are written against.
     CUTEDSL_RUBIN = "cutedsl_rubin"
+    #: The installed CuTe DSL also ships the ``cutlass.memory`` /
+    #: ``cutlass.tensor_utils`` submodules the Rubin MXFP8 fused FC12 kernel
+    #: needs; older Rubin builds miscompile its MXFP8 path.
+    CUTEDSL_MXFP8_FUSED_FC12_RUBIN = "cutedsl_mxfp8_fused_fc12_rubin"
     #: Locality-domain execution is usable here: SM107, driver support, and
     #: ``DISABLE_LOCALITY_DOMAINS`` unset.
     LOCALITY_DOMAIN = "locality_domain"
@@ -53,6 +57,11 @@ class MoEEnvFlag(str, Enum):
     #: many expert slots the GEMM builds: two ranks disagreeing on it would
     #: otherwise share a fingerprint while building differently shaped layers.
     SHARED_EXPERT_FUSION = "TLLM_MOE_ENABLE_SHARED_EXPERT_FUSION"
+    #: Opt-in to the SM90 FP8 block-scale leaf that runs decode-sized batches
+    #: through Triton FP8-activation kernels
+    #: (``TrtllmTritonFp8ActGroupedGemmFp8BlockScalesImpl``). Collected for the
+    #: same reason: it decides which leaf every rank builds.
+    SM90_TRITON_FP8_DECODE = "TLLM_MOE_ENABLE_SM90_TRITON_FP8_DECODE"
 
 
 # Probe details are logged but excluded from the stable fingerprint.
@@ -92,6 +101,21 @@ def _probe_cutedsl_rubin() -> Tuple[bool, str]:
     return False, "installed CuTe DSL lacks Rubin helpers"
 
 
+def _probe_cutedsl_mxfp8_fused_fc12_rubin() -> Tuple[bool, str]:
+    # Import the op module first: it clears the flag if the vendored kernel
+    # fails to import with this CuTe DSL build.
+    from ...custom_ops import cute_dsl_custom_ops  # noqa: F401
+    from ...cute_dsl_utils import IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE
+
+    if IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE:
+        return True, ""
+    return (
+        False,
+        "installed CuTe DSL lacks cutlass.memory / cutlass.tensor_utils or another "
+        "module the Rubin MXFP8 fused FC12 kernel imports",
+    )
+
+
 def _probe_locality_domain() -> Tuple[bool, str]:
     from ...locality_domain_utils import is_locality_domain_enabled
 
@@ -115,12 +139,14 @@ _DEP_PROBES: Dict[MoEDep, DepProbe] = {
     MoEDep.MEGAMOE_CUTEDSL_RUNTIME: _probe_megamoe_cutedsl_runtime,
     MoEDep.MEGAMOE_CUTEDSL_OP: _probe_megamoe_cutedsl_op,
     MoEDep.CUTEDSL_RUBIN: _probe_cutedsl_rubin,
+    MoEDep.CUTEDSL_MXFP8_FUSED_FC12_RUBIN: _probe_cutedsl_mxfp8_fused_fc12_rubin,
     MoEDep.LOCALITY_DOMAIN: _probe_locality_domain,
 }
 
 # Preserve prior defaults when environment variables are unset.
 _ENV_FLAG_DEFAULTS: Dict[MoEEnvFlag, str] = {
     MoEEnvFlag.SHARED_EXPERT_FUSION: "0",
+    MoEEnvFlag.SM90_TRITON_FP8_DECODE: "0",
 }
 
 #: Removed in 1.4 (TRTLLM-17328); kept only to warn deployments that still

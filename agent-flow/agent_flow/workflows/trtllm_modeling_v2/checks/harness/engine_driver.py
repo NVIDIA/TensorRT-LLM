@@ -20,7 +20,6 @@ from typing import Any, Mapping
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import engine_facts  # noqa: E402
 import reuse_probe  # noqa: E402
 import workload_io as wio  # noqa: E402
 
@@ -46,8 +45,7 @@ def build_llm(spec: Mapping[str, Any]) -> tuple[Any, Any]:
 def sampling_for(base: Any, max_tokens: int, ignore_eos: bool, logprobs: int = 0) -> Any:
     """A copy of the declared sampling parameters with this request's budget.
 
-    ``logprobs`` asks for each generated token's top-k log-probs, as a request
-    whose tokens a gate compares up to a near-tie does.
+    ``logprobs`` asks for each generated token's top-k log-probs.
     """
     params = copy.deepcopy(base)
     params.max_tokens = int(max_tokens)
@@ -136,7 +134,6 @@ def record_of(index: int, request: Mapping[str, Any], output: Any, steps: int) -
     record = {
         "index": index,
         "id": request.get("id", str(index)),
-        "prompt_sha": wio.prompt_digest(str(request.get("prompt", request.get("token_ids", "")))),
         "prompt_tokens": len(prompt_ids) if prompt_ids is not None else None,
         "cached_tokens": reuse_probe.cached_tokens(output),
         **first,
@@ -150,10 +147,8 @@ def record_of(index: int, request: Mapping[str, Any], output: Any, steps: int) -
     return record
 
 
-def _run_requests(
-    llm: Any, base: Any, spec: Mapping[str, Any], *, phase: str = ""
-) -> dict[str, int]:
-    """Drain one phase before submitting the next, keeping the same engine and cache."""
+def _run_requests(llm: Any, base: Any, spec: Mapping[str, Any]) -> dict[str, int]:
+    """Send the requests, ``concurrency`` at a time, and count what the cache reused."""
     if spec.get("dataset"):
         raise ValueError("dataset was not normalized before engine launch")
     requests = spec.get("requests") or []
@@ -194,8 +189,6 @@ def _run_requests(
                 raise RuntimeError("the engine streamed no output for a request")
             index = start + offset
             record = record_of(index, request, output, steps)
-            if phase:
-                record["phase"] = phase
             wio.emit(wio.RECORD_MARKER, record)
             summary["requests"] += 1
             cached = record["cached_tokens"]
@@ -207,17 +200,8 @@ def _run_requests(
 
 
 def run_workload(llm: Any, base: Any, spec: Mapping[str, Any]) -> None:
-    """Run ordinary requests then optional boot phases, with one final cache probe."""
-    summary = _run_requests(llm, base, spec, phase="boot" if spec.get("phases") else "")
-    for phase in spec.get("phases") or ():
-        result = _run_requests(
-            llm,
-            base,
-            {**spec, **phase},
-            phase=phase["id"],
-        )
-        for key, value in result.items():
-            summary[key] += value
+    """Run the requests, then one final cache probe."""
+    summary = _run_requests(llm, base, spec)
     probe = (
         reuse_probe.probe(llm, sampling_for(base, 1, True), spec["llm"])
         if spec.get("reuse_probe")
@@ -236,7 +220,6 @@ def main(argv: list[str] | None = None) -> int:
     wio.emit(wio.DRIVER_MARKER, {"tensorrt_llm": str(tensorrt_llm.__file__), "api": "LLM"})
     llm, base = build_llm(spec)
     try:
-        engine_facts.emit(llm, requested=spec["llm"])
         run_workload(llm, base, spec)
     finally:
         llm.shutdown()

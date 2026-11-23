@@ -56,7 +56,7 @@ include = ["agent_flow*"]
     # imported.
     "infra/compute/resolvehook/*.py",
     # Not a package either: the engine gates put this directory first on
-    # PYTHONPATH so every rank's worker prints what its engine runs.
+    # PYTHONPATH so each rank records which modules of the tree it imported.
     "checks/harness/rankhook/*.py",
 ]
 

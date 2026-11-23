@@ -103,7 +103,11 @@ def test_splitkv_reduce_strides_empty_splits_and_graph_replay(
     check()
 
 
-def test_splitkv_workspace_is_sized_per_graph_bucket() -> None:
+def test_splitkv_workspace_is_shared_across_graph_buckets() -> None:
+    """Every graph bucket gets views of one capacity-sized workspace set (layout._ensure_workspace_tensor)."""
+    from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
+    from tensorrt_llm._torch.memory_buffer_utils import Buffers
+
     adapter = _module("fp4_mla_splitkv")
     heads, columns, splits, query_capacity = 128, 512, 4, 32
 
@@ -122,10 +126,13 @@ def test_splitkv_workspace_is_sized_per_graph_bucket() -> None:
         run_trtllm_fp4_mla_decode_page_native_from_raw=partial_launch,
     )
     base_metadata = SimpleNamespace(
-        is_cuda_graph=False, fp4_mla_state=SimpleNamespace(workspaces={})
+        is_cuda_graph=False,
+        fp4_mla_state=SimpleNamespace(workspaces={}),
+        forward_scratch_buffers=Buffers(),
+        get_empty=AttentionMetadata.get_empty,
     )
     buckets = []
-    storage_pointers = set()
+    shared_pointers: dict[str, int] = {}
     for queries in [1, 4, 8]:
         metadata = copy.copy(base_metadata)
         metadata.is_cuda_graph = True
@@ -179,7 +186,8 @@ def test_splitkv_workspace_is_sized_per_graph_bucket() -> None:
             for key, value in metadata.fp4_mla_state.workspaces.items()
             if key.startswith("_fp4_mla_splitkv_")
         }
-        tasks = splits * queries
+        # sized by the Q capacity, not this bucket's query count, and backed by the same storage in every bucket
+        tasks = splits * query_capacity
         expected_sizes = {
             "q": tasks * heads * 320,
             "q_sf": tasks * heads * 40,
@@ -193,8 +201,13 @@ def test_splitkv_workspace_is_sized_per_graph_bucket() -> None:
         for name, size in expected_sizes.items():
             tensor = workspace[f"_fp4_mla_splitkv_{name}"]
             assert tensor.numel() == size
-            assert tensor.data_ptr() not in storage_pointers
-            storage_pointers.add(tensor.data_ptr())
+            assert shared_pointers.setdefault(name, tensor.data_ptr()) == tensor.data_ptr()
+            blocks = metadata.forward_scratch_buffers.buffers[
+                f"fp4_mla_decode_fp4_mla_splitkv_{name}"
+            ]
+            assert len(blocks) == 1
+            assert blocks[0].is_reserved
+            assert blocks[0].buffer.numel() == size * tensor.element_size()
         pointers = {key: value.data_ptr() for key, value in workspace.items()}
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):

@@ -317,7 +317,12 @@ def generation_selection_cell(
     num_tokens = q.shape[0]
     if forward_args.attention_input_type == AttentionInputType.mixed:
         num_tokens -= metadata.num_ctx_tokens
-    q_len = num_tokens // num_generations
+    return generation_cell_bound(num_generations, num_tokens // num_generations)
+
+
+def generation_cell_bound(num_generations: int, q_len: int) -> tuple[int, int]:
+    """(generation requests, q_len) at the upper bound of their selection-cache cell (``generation_selection_cell``):
+    a decision made for the call's own sizes must evaluate a library's support here to agree with its selection."""
     return (
         max(
             num_generations,

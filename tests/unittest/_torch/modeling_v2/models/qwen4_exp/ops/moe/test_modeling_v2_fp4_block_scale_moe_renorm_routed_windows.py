@@ -19,14 +19,14 @@ from pathlib import Path
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.moe.fp4_block_scale_moe_renorm_routed import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.fp4_block_scale_moe_renorm_routed import (  # noqa: E501
     fp4_block_scale_moe_renorm_routed as op,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.moe.renorm_moe_routing_op import (
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.renorm_moe_routing_op import (
     renorm_moe_routing_op,
 )
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = ["../../../../moe", "~/tests/unittest/_torch/modeling_v2"]
 from _fp4_moe_test_utils import many_expert_layer  # noqa: E402,F401 — fixture by name
 from _precision import true_fp32_matmul  # noqa: E402
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
@@ -41,6 +41,7 @@ def _helpers():
     path = (
         Path(__file__).resolve().parents[4]
         / "moe"
+        / "ops"
         / "test_modeling_v2_fp4_block_scale_moe_runner.py"
     )
     spec = importlib.util.spec_from_file_location("_fp4_moe_runner_r4_test_helpers", path)

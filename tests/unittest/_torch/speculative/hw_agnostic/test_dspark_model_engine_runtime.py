@@ -491,7 +491,9 @@ def test_decoder_enables_ragged_metadata_during_construction(monkeypatch, enable
     decoder.mapping = kwargs["mapping"]
     decoder._attention_runtime_features = kwargs["attention_runtime_features"]
     decoder._buffers = SimpleNamespace(cache_indirection=None)
-    monkeypatch.setattr(decoder_metadata_module, "resolve_mamba_metadata_cls", lambda _model: None)
+    monkeypatch.setattr(
+        decoder_metadata_module, "resolve_mamba_metadata_cls", lambda _model, _manager=None: None
+    )
     kv = object()
 
     result = decoder.setup_attention(kv)
@@ -538,6 +540,7 @@ def test_current_main_warmup_keeps_serving_timeout_only_for_capture(monkeypatch,
     decoder = object.__new__(DecoderCudaGraphs)
     decoder.cuda_graph_runner = graph
     decoder.run_cuda_graph_warmup = warmup
+    decoder._warm_inforward_split = lambda resource_manager: None
     decoder.warmup_and_capture(object())
 
     assert calls == [(True, False, True), (False, True, False)]

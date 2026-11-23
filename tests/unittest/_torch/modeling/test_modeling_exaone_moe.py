@@ -22,6 +22,7 @@ from _torch.helpers import create_mock_cuda_graph_runner
 from parameterized import parameterized
 
 import tensorrt_llm
+from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
 from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -34,9 +35,11 @@ from tensorrt_llm._torch.models.modeling_exaone_moe import (
 from tensorrt_llm._torch.models.modeling_utils import MODEL_CLASS_MAPPING
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
 from utils.util import getSMVersion  # isort: skip
 
@@ -111,6 +114,152 @@ class Scenario:
 
 
 class TestExaoneMoe(unittest.TestCase):
+    @parameterized.expand([63, 65, 85, 94, 95, 100, 130])
+    @torch.no_grad()
+    def test_exaone_moe_prefix_reuse_logits(self, prefix_len: int) -> None:
+        """Full and partial prefix hits preserve logits across the sliding window."""
+        tokens_per_block = 32
+        window_size = 64
+        max_seq_len = 256
+        config_dict = deepcopy(EXAONE_MOE_CONFIG)
+        config_dict.update(
+            hidden_size=256,
+            intermediate_size=512,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            is_moe_layer=[False] * NUM_HIDDEN_LAYERS,
+            mlp_layer_types=["dense"] * NUM_HIDDEN_LAYERS,
+            vocab_size=256,
+            max_position_embeddings=max_seq_len,
+            sliding_window=window_size,
+        )
+        config = ExaoneMoeConfig.from_dict(config_dict)
+        model_config = ModelConfig(pretrained_config=config, attn_backend="TRTLLM")
+        with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+            torch.manual_seed(0)
+            reference = HFExaoneMoeForCausalLM(config).to(config.torch_dtype).cuda().eval()
+            model = ExaoneMoeForCausalLM(model_config).cuda().eval()
+            weight_mapper = ExaoneMoeWeightMapper()
+            weight_mapper.init_model_and_config(model, model_config)
+            model.load_weights(reference.state_dict(), weight_mapper)
+            model.post_load_weights()
+        del reference
+
+        prefix = [(i * 7 + 3) % config.vocab_size for i in range(prefix_len)]
+        # The prefix ends inside a block, and the suffix crosses the SWA boundary.
+        prompt = prefix + [(i * 11 + 5) % config.vocab_size for i in range(48)]
+        windows = [
+            window_size if layer_type == "sliding_attention" else max_seq_len
+            for layer_type in config.layer_types
+        ]
+        baseline = None
+        for block_reuse, partial_reuse, expected_reused in (
+            (False, False, 0),
+            (True, False, prefix_len // tokens_per_block * tokens_per_block),
+            (True, True, prefix_len),
+        ):
+            with self.subTest(block_reuse=block_reuse, partial_reuse=partial_reuse):
+                manager = KVCacheManagerV2(
+                    KvCacheConfig(
+                        enable_block_reuse=block_reuse,
+                        enable_partial_reuse=partial_reuse,
+                        enable_swa_scratch_reuse=False,
+                        max_attention_window=windows,
+                        max_gpu_total_bytes=32 << 20,
+                    ),
+                    tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+                    num_layers=config.num_hidden_layers,
+                    num_kv_heads=config.num_key_value_heads,
+                    head_dim=config.head_dim,
+                    tokens_per_block=tokens_per_block,
+                    max_seq_len=max_seq_len,
+                    max_batch_size=1,
+                    mapping=Mapping(world_size=1, tp_size=1, rank=0),
+                    dtype=tensorrt_llm.bindings.DataType.BF16,
+                )
+                try:
+                    self.assertEqual(
+                        manager.max_attention_window_vec,
+                        [None if window == max_seq_len else window for window in windows],
+                    )
+                    for request_id, tokens, expected_hit in (
+                        (1, prefix, 0),
+                        (2, prompt, expected_reused),
+                    ):
+                        request = LlmRequest(
+                            request_id=request_id,
+                            max_new_tokens=1,
+                            input_tokens=tokens,
+                            sampling_config=SamplingConfig(1),
+                            is_streaming=False,
+                        )
+                        request.state = LlmRequestState.CONTEXT_INIT
+                        try:
+                            self.assertTrue(manager.prepare_context(request))
+                            reused = manager.kv_cache_map[request_id].num_committed_tokens
+                            self.assertEqual(reused, expected_hit)
+                            self.assertEqual(request.context_current_position, expected_hit)
+                            self.assertEqual(request.prepopulated_prompt_len, expected_hit)
+                            if request_id == 2 and block_reuse:
+                                stale_blocks = max(
+                                    0, (reused + 1 - window_size) // tokens_per_block
+                                )
+                                sliding_pages = manager.get_batch_cache_indices(
+                                    [request_id], layer_idx=0
+                                )[0]
+                                full_pages = manager.get_batch_cache_indices(
+                                    [request_id], layer_idx=3
+                                )[0]
+                                self.assertEqual(
+                                    sliding_pages[:stale_blocks], [BAD_PAGE_INDEX] * stale_blocks
+                                )
+                                self.assertNotIn(BAD_PAGE_INDEX, sliding_pages[stale_blocks:])
+                                self.assertNotIn(BAD_PAGE_INDEX, full_pages)
+                            remaining = len(tokens) - reused
+                            self.assertTrue(manager.resize_context(request, remaining))
+                            metadata = get_attention_backend("TRTLLM").Metadata(
+                                seq_lens=torch.tensor([remaining], dtype=torch.int),
+                                num_contexts=1,
+                                kv_cache_params=KVCacheParams(
+                                    use_cache=True, num_cached_tokens_per_seq=[reused]
+                                ),
+                                kv_cache_manager=manager,
+                                request_ids=[request_id],
+                                prompt_lens=[remaining],
+                                max_num_requests=1,
+                                max_num_tokens=max_seq_len,
+                                runtime_features=AttentionRuntimeFeatures(cache_reuse=True),
+                            )
+                            metadata.prepare()
+                            logits = model.forward(
+                                input_ids=torch.tensor(
+                                    tokens[reused:], dtype=torch.int32, device="cuda"
+                                ),
+                                position_ids=torch.arange(
+                                    reused, len(tokens), device="cuda"
+                                ).unsqueeze(0),
+                                attn_metadata=metadata,
+                                return_context_logits=True,
+                            ).clone()
+                            self.assertEqual(logits.shape, (remaining, config.vocab_size))
+                            self.assertTrue(torch.isfinite(logits).all().item())
+                            if request_id == 2:
+                                if not block_reuse:
+                                    baseline = logits
+                                else:
+                                    self.assertIsNotNone(baseline)
+                                    # Cached prefix rows are omitted from context logits.
+                                    torch.testing.assert_close(
+                                        logits, baseline[reused:], atol=1e-2, rtol=1e-2
+                                    )
+                            request.context_current_position = len(tokens)
+                            manager.try_commit_blocks(request)
+                        finally:
+                            torch.cuda.synchronize()
+                            manager.free_resources(request)
+                finally:
+                    manager.shutdown()
+
     def test_config_defaults(self) -> None:
         config_dict = deepcopy(EXAONE_MOE_CONFIG)
         config = ExaoneMoeConfig.from_dict(config_dict)

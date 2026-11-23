@@ -29,7 +29,7 @@ Scope: this directory and its descendants. Supplements the repository-root
 
   ```text
   Reason: The affected H100 resource is temporarily unavailable.
-  H100_PCIe-PyTorch-1
+  DGX_H100-PyTorch-1
   ```
 
 - The following DGX B200 names and patterns are illustrative examples, not
@@ -64,6 +64,16 @@ Scope: this directory and its descendants. Supplements the repository-root
   tests pass on the latest PR head before merging the maintenance removal.
 
 ## Path-valued pytest options
+
+- Shard collection runs through `scripts/collect_pytest.py`: each attempt has a
+  30-minute deadline and only timed-out attempts get up to two retries. Ordinary
+  pytest failures and user cancellation must not retry. The enclosing Pipeline
+  deadline still applies. Keep attempt stdout/stderr under the stage result
+  directory so the normal result upload preserves them on failure. Only the
+  successful attempt's `output.txt` is parsed into the shard list.
+  The collection child disables mpi4py auto-initialization and TensorRT-LLM
+  library initialization. Keep these environment overrides local to that child;
+  normal test execution must retain its original runtime configuration.
 
 - For new or modified long pytest options that take a single file or directory
   path, use `--option=value` when supported. Keep the option and value in one

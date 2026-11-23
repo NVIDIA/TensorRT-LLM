@@ -182,12 +182,18 @@ def dump_inference_results(output_dir: str, results: List[dict],
     for task_id, result in enumerate(results):
         output_ids = result.outputs[0].token_ids
         output_text = result.outputs[0].text.strip()
-        input_text = result.prompt.strip()
-        # The ids the engine ran. Re-encoding the prompt text can give other
-        # ids, e.g. an extra BOS when the request set add_special_tokens=False.
-        input_ids = result.prompt_token_ids
-        if input_ids is None:
-            input_ids = tokenizer.encode(input_text)
+        if result.prompt is None:
+            # A token-id prompt has no text: dump the ids the engine received,
+            # which keep native chat control tokens that text cannot.
+            input_ids = result.prompt_token_ids
+            input_text = tokenizer.decode(input_ids).strip()
+        else:
+            input_text = result.prompt.strip()
+            # The ids the engine ran. Re-encoding the prompt text can give other
+            # ids, e.g. an extra BOS when the request set add_special_tokens=False.
+            input_ids = result.prompt_token_ids
+            if input_ids is None:
+                input_ids = tokenizer.encode(input_text)
         results_list.append({
             "task_id": task_id,
             "input_ids": input_ids,

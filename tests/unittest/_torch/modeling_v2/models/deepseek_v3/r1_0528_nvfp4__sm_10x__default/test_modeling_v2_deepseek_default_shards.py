@@ -42,8 +42,8 @@ import pytest
 import torch
 import torch.nn as nn
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.deepseek_v3 import routing
-from tensorrt_llm._torch._experimental.modeling_v2.models.deepseek_v3.r1_0528_nvfp4__sm_10x__default import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.deepseek_v3 import routing
+from tensorrt_llm._torch.modeling_v2.models.deepseek_v3.r1_0528_nvfp4__sm_10x__default import (  # noqa: E501
     weights as D,
 )
 from tensorrt_llm.mapping import Mapping

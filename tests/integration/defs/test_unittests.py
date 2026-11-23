@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import hashlib
 import os
 import re
 import shlex
@@ -65,6 +66,35 @@ def merge_report(base_file, extra_file, output_file, is_retry=False):
 
     os.remove(extra_file)
     base.write(output_file, encoding="UTF-8", xml_declaration=True)
+
+
+def _junit_all_tests_skipped(xml_path: str) -> bool:
+    """Whether every named testcase in a JUnit report was skipped.
+
+    The inner pytest exits 0 in that case, so ``test_unittests_v2`` would
+    otherwise be recorded as PASSED. A missing, empty, malformed, or mixed
+    report returns False.
+
+    Counts ``skipped`` elements on the testcases. pytest's ``LogXML`` records
+    a non-strict xfail as ``<skipped type="pytest.xfail">`` and includes it in
+    the suite ``skipped`` attribute, but those tests ran. ``PeriodicJUnitXML``
+    always writes the suite counts, so this does not read them.
+    """
+    import xml.etree.ElementTree as ElementTree
+    try:
+        root = ElementTree.parse(xml_path).getroot()
+    except (OSError, ElementTree.ParseError):
+        return False
+    cases = [case for case in root.iter("testcase") if case.get("name")]
+    skipped = 0
+    for case in cases:
+        if case.find("failure") is not None or case.find("error") is not None:
+            return False
+        skipped_node = case.find("skipped")
+        if (skipped_node is not None
+                and skipped_node.get("type") != "pytest.xfail"):
+            skipped += 1
+    return len(cases) > 0 and skipped == len(cases)
 
 
 def _junit_culprits(xml_path: str) -> list[str]:
@@ -178,6 +208,13 @@ def _parallel_config_key(case: str) -> str:
     return re.sub(r'\s+--ignore=\S+', '', case).strip()
 
 
+def _unittest_case_filename(case: str) -> str:
+    """Keep artifacts readable and distinguish full entries with a shared prefix."""
+    prefix = re.sub(r'[/\s"\']+', '-', case)[:63]
+    digest = hashlib.sha256(case.encode("utf-8")).hexdigest()[:16]
+    return f"{prefix}-{digest}"
+
+
 def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
     import pandas as pd
     import pynvml
@@ -254,9 +291,7 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
                 f"({case_markexpr}) and ({unittest_markexpr})")
         else:
             arg_list += ["-m", unittest_markexpr]
-    case_fn = re.sub(r'[/\s"\']+', '-', case)
-    if len(case_fn) > 80:
-        case_fn = case_fn[:80]
+    case_fn = _unittest_case_filename(case)
     # MoE entries expand to too many sub-tests, which introduces noise into
     # the overall TRT-LLM test quality metrics. Skip per-sub-test reporting
     # for MoE by prefixing with "moe-" (CI only collects files starting
@@ -465,6 +500,9 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
     if not passed:
         _fail_unittests("failure reported in unittests", output_xml, output_dir,
                         case, unfinished_test_path)
+    if _junit_all_tests_skipped(output_xml):
+        import pytest
+        pytest.skip(f"{case}: all unittests skipped")
 
 
 def test_csa2_tensor_parallel(llm_root, llm_venv, output_dir):

@@ -16,12 +16,16 @@
 
 Matches the CUDA arithmetic in ``torch.ops.trtllm.fp4_quantize(x, global_scale, 16, False, False)``: it follows
 ``cvt_warp_fp16_to_fp4`` step for step, including the ``rcp.approx.ftz`` reciprocals and the ``cvt.rn.satfinite``
-conversions.
+conversions. ``nvfp4_fp8_dual_quant`` also writes the per-tensor E4M3 copy of the same read, as
+``static_quantize_e4m3_per_tensor`` (``scaleMatrixPerTensorVec``: ``x * (1.0f / s)``, RN, saturating).
 """
+
+from typing import Optional
 
 import torch
 import triton
 import triton.language as tl
+import triton.language.extra.libdevice as tldevice
 
 from ..flashinfer_utils import get_env_enable_pdl
 
@@ -54,10 +58,13 @@ def _nvfp4_quant_kernel(
     global_scale_ptr: tl.tensor,
     q_ptr: tl.tensor,
     sf_ptr: tl.tensor,
+    fp8_scale_ptr,  # None unless write_fp8
+    fp8_ptr,  # None unless write_fp8
     num_tokens: tl.tensor,
     hidden: tl.constexpr,
     block_t: tl.constexpr,
     block_h: tl.constexpr,
+    write_fp8: tl.constexpr,
     launch_with_pdl: tl.constexpr,
 ) -> None:
     if launch_with_pdl:
@@ -93,6 +100,13 @@ def _nvfp4_quant_kernel(
         sf.to(tl.uint8, bitcast=True),
         mask=mask,
     )
+    if write_fp8:
+        fp8_factor = tldevice.rcp_rn(tl.load(fp8_scale_ptr))
+        tl.store(
+            fp8_ptr + rows[:, None] * hidden + cols[None, :],
+            (x * fp8_factor).to(tl.float8e4nv),
+            mask=mask,
+        )
 
     if launch_with_pdl:
         # Publish both outputs before any warp signals completion to a consumer.
@@ -134,6 +148,36 @@ def can_use_nvfp4_quant(x: torch.Tensor, global_scale: torch.Tensor) -> bool:
     )
 
 
+def _launch(
+    x: torch.Tensor,
+    global_scale: torch.Tensor,
+    fp8_scale: Optional[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    num_tokens, hidden = x.shape
+    q = torch.empty((num_tokens, hidden // 2), dtype=torch.uint8, device=x.device)
+    sf = torch.empty((num_tokens * (hidden // 16),), dtype=torch.uint8, device=x.device)
+    fp8 = None if fp8_scale is None else torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    launch_with_pdl = get_env_enable_pdl()
+    _nvfp4_quant_kernel[(triton.cdiv(num_tokens, 4), hidden // _BLOCK_H)](
+        x,
+        global_scale,
+        q,
+        sf,
+        fp8_scale,
+        fp8,
+        num_tokens,
+        hidden=hidden,
+        block_t=4,
+        block_h=_BLOCK_H,
+        write_fp8=fp8 is not None,
+        launch_with_pdl=launch_with_pdl,
+        launch_pdl=launch_with_pdl,
+        num_warps=2,
+        enable_fp_fusion=False,
+    )
+    return q, sf, fp8
+
+
 def nvfp4_quant(x: torch.Tensor, global_scale: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize BF16 ``[T, H]`` with a float32 CUDA scalar global scale.
 
@@ -141,22 +185,18 @@ def nvfp4_quant(x: torch.Tensor, global_scale: torch.Tensor) -> tuple[torch.Tens
     Returns packed FP4 ``[T, H/2]`` and linear E4M3 scales ``[T * H/16]``,
     both uint8, as ``fp4_quantize(x, global_scale, 16, False, False)``.
     """
-    num_tokens, hidden = x.shape
-    q = torch.empty((num_tokens, hidden // 2), dtype=torch.uint8, device=x.device)
-    sf = torch.empty((num_tokens * (hidden // 16),), dtype=torch.uint8, device=x.device)
-    launch_with_pdl = get_env_enable_pdl()
-    _nvfp4_quant_kernel[(triton.cdiv(num_tokens, 4), hidden // _BLOCK_H)](
-        x,
-        global_scale,
-        q,
-        sf,
-        num_tokens,
-        hidden=hidden,
-        block_t=4,
-        block_h=_BLOCK_H,
-        launch_with_pdl=launch_with_pdl,
-        launch_pdl=launch_with_pdl,
-        num_warps=2,
-        enable_fp_fusion=False,
-    )
+    q, sf, _ = _launch(x, global_scale, None)
     return q, sf
+
+
+def nvfp4_fp8_dual_quant(
+    x: torch.Tensor, global_scale: torch.Tensor, fp8_scale: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``nvfp4_quant`` plus the per-tensor E4M3 copy of the same input, in one read.
+
+    Requires ``can_use_nvfp4_quant(x, global_scale)`` and a one-element float32
+    ``fp8_scale`` on the same device. Returns ``(q, sf, fp8)``: ``q`` and ``sf``
+    as ``nvfp4_quant``, and ``fp8`` ``[T, H]`` equal to
+    ``static_quantize_e4m3_per_tensor(x, fp8_scale)``.
+    """
+    return _launch(x, global_scale, fp8_scale)

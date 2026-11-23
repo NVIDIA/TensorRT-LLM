@@ -227,6 +227,9 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         :type cluster_shape_mn: Tuple[int, int]
         :param raster_along_m: Boolean, True to use raster along M.
         :type raster_along_m: bool
+        :param weight_evict_first: Boolean, True to load B / SFB (the expert weights) with the L2 evict-first hint,
+            so that weights each tile reads once do not evict A and the output rows the epilogue adds into.
+        :type weight_evict_first: bool
         """
 
         self.sf_vec_size = sf_vec_size

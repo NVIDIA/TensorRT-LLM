@@ -314,6 +314,10 @@ methods:
         annotation: bool
         default: True
         status: prototype
+      autotuner_nvmmh_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.AutoTunerNvMMHConfig]
+        default: null
+        status: prototype
       use_fine_grained_sync:
         annotation: bool
         default: False
@@ -384,6 +388,10 @@ methods:
         status: prototype
       sleep_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.SleepConfig]
+        default: null
+        status: prototype
+      memory_monitor_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.MemoryMonitorConfig]
         default: null
         status: prototype
       reorder_policy_config:
@@ -559,6 +567,10 @@ methods:
   get_data_transceiver_state:
     parameters: {}
     return_annotation: bytes
+    status: prototype
+  get_memory_report:
+    parameters: {}
+    return_annotation: list[str]
     status: prototype
   get_memory_status:
     parameters: {}

@@ -34,12 +34,14 @@ import torch
 import triton
 import triton.language as tl
 
+from ..distributed.ll_exchange import TPKeyExchange, argmax_exchange_finish, fast_gumbel_key
+from ..modules.fla.op import gdc_wait_with_memory_clobber
+
 MAX_DRAFT_LEN = 31  # columns of the accept tile (k + 1 <= 32)
 
 
-# The counts change every step: keep them out of the cache key.
-@triton.jit(do_not_specialize=["num_contexts", "num_gens"])
-def _strict_accept_kernel(
+@triton.jit
+def _strict_accept_rows(
     target_ptr,  # [num_contexts + num_gens * (K + 1)] sampled target tokens (any int dtype)
     draft_ptr,  # [num_gens, K] draft tokens of the previous step
     accepted_ptr,  # [batch, accepted_stride] int32 out
@@ -60,6 +62,7 @@ def _strict_accept_kernel(
     BLOCK_B: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
+    """The acceptance of every request, in one program."""
     # ---- context requests: column 0 = their sampled token, one accepted token ----
     ctx = tl.arange(0, BLOCK_B)
     for c0 in range(0, num_contexts, BLOCK_B):
@@ -111,6 +114,285 @@ def _strict_accept_kernel(
         tl.store(counter_ptr, counter)
 
 
+# The counts change every step: keep them out of the cache key.
+@triton.jit(do_not_specialize=["num_contexts", "num_gens"])
+def _strict_accept_kernel(
+    target_ptr,
+    draft_ptr,
+    accepted_ptr,
+    num_accepted_ptr,
+    pool_ptr,
+    counter_ptr,
+    num_contexts,
+    num_gens,
+    accepted_stride,
+    frac,
+    K: tl.constexpr,
+    FORCE: tl.constexpr,
+    BASE_TOTAL: tl.constexpr,
+    MAX_TOTAL: tl.constexpr,
+    COUNTER_STRIDE: tl.constexpr,
+    SLOT_STRIDE: tl.constexpr,
+    POOL_MASK: tl.constexpr,
+    BLOCK_B: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    _strict_accept_rows(
+        target_ptr,
+        draft_ptr,
+        accepted_ptr,
+        num_accepted_ptr,
+        pool_ptr,
+        counter_ptr,
+        num_contexts,
+        num_gens,
+        accepted_stride,
+        frac,
+        K,
+        FORCE,
+        BASE_TOTAL,
+        MAX_TOTAL,
+        COUNTER_STRIDE,
+        SLOT_STRIDE,
+        POOL_MASK,
+        BLOCK_B,
+        BLOCK_K,
+    )
+
+
+@triton.jit(
+    do_not_specialize=[
+        "m",
+        "v_shard",
+        "stride_m",
+        "rank",
+        "vocab_offset",
+        "vocab_full",
+        "greedy_threshold",
+        "num_contexts",
+        "num_gens",
+        "accepted_stride",
+        "frac",
+        "split",
+    ]
+)
+def _sample_accept_kernel(
+    logits_ptr,
+    stride_m,
+    v_shard,
+    tok_out_ptr,
+    scratch_ptr,
+    ticket_ptr,
+    state_ptr,
+    peers_ptr,
+    temp_ptr,
+    seed_ptr,
+    m,
+    rank,
+    vocab_offset,
+    vocab_full,
+    greedy_threshold,
+    draft_ptr,
+    accepted_ptr,
+    num_accepted_ptr,
+    pool_ptr,
+    counter_ptr,
+    num_contexts,
+    num_gens,
+    accepted_stride,
+    frac,
+    split,
+    BLOCK_V: tl.constexpr,
+    NRANKS: tl.constexpr,
+    WORDS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    WAIT: tl.constexpr,
+    K: tl.constexpr,
+    FORCE: tl.constexpr,
+    BASE_TOTAL: tl.constexpr,
+    MAX_TOTAL: tl.constexpr,
+    COUNTER_STRIDE: tl.constexpr,
+    SLOT_STRIDE: tl.constexpr,
+    POOL_MASK: tl.constexpr,
+    BLOCK_B: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """The four-draws Gumbel sample of the TP key exchange (``argmax_logits``) drawn from seed + 1; the
+    program that takes the last ticket stores seed + 1 after the exchange and runs the strict acceptance on
+    the tokens it wrote. Every program reads the seed before it takes its ticket. ``split`` (programs per row,
+    ``ll_exchange._fast_gumbel_split``) follows the row count, so it is a runtime argument: one compiled kernel serves
+    every split."""
+    pv = tl.load(peers_ptr + tl.arange(0, NRANKS))  # host-written table: ahead of the wait
+    if WAIT:
+        gdc_wait_with_memory_clobber()
+    pid = tl.program_id(0)
+    row = pid // split
+    key = fast_gumbel_key(
+        logits_ptr,
+        stride_m,
+        v_shard,
+        temp_ptr,
+        seed_ptr,
+        row,
+        pid % split,
+        vocab_offset,
+        vocab_full,
+        greedy_threshold,
+        split,
+        BLOCK_V,
+        1,
+    )
+    last = argmax_exchange_finish(
+        key,
+        row,
+        m,
+        tok_out_ptr,
+        tok_out_ptr,
+        scratch_ptr,
+        ticket_ptr,
+        state_ptr,
+        pv,
+        rank,
+        split,
+        NRANKS,
+        WORDS,
+        BLOCK_M,
+        False,
+        True,
+    )
+    if last:
+        tl.store(seed_ptr, tl.load(seed_ptr) + 1)
+        tl.debug_barrier()  # the exchange's token stores are visible to every thread of this program
+        _strict_accept_rows(
+            tok_out_ptr,
+            draft_ptr,
+            accepted_ptr,
+            num_accepted_ptr,
+            pool_ptr,
+            counter_ptr,
+            num_contexts,
+            num_gens,
+            accepted_stride,
+            frac,
+            K,
+            FORCE,
+            BASE_TOTAL,
+            MAX_TOTAL,
+            COUNTER_STRIDE,
+            SLOT_STRIDE,
+            POOL_MASK,
+            BLOCK_B,
+            BLOCK_K,
+        )
+
+
+def _force_mode(force: Optional[tuple], k: int, num_accepted: torch.Tensor) -> tuple:
+    """(mode, base_total, max_total, frac, pool, counter, counter_stride, slot_stride, pool_mask) of
+    ``_strict_accept_rows`` for ``force`` (None: natural acceptance)."""
+    if force is None:
+        return 0, 1, k + 1, 0.0, num_accepted, num_accepted, 1, 1, 1
+    base_total, max_total, frac, pool, counter, c_stride, s_stride, pool_size = force
+    mode = 2 if (frac > 0.0 and base_total < max_total) else 1
+    if pool is None:
+        pool = counter = num_accepted  # unused in mode 1
+    return mode, base_total, max_total, frac, pool, counter, c_stride, s_stride, pool_size - 1
+
+
+def sample_and_strict_accept(
+    exchange: TPKeyExchange,
+    logits: torch.Tensor,
+    vocab_offset: int,
+    temperature: torch.Tensor,
+    seed: torch.Tensor,
+    greedy_threshold: float,
+    draft_tokens: torch.Tensor,
+    num_contexts: int,
+    batch_size: int,
+    force: Optional[tuple] = None,
+    channel: int = 1,
+) -> Optional[tuple]:
+    """``seed += 1``, ``exchange.argmax_logits(logits, ..., seed=seed)`` (four-draws Gumbel) and
+    ``fused_strict_accept`` of its tokens in one launch, with the same outputs: ``(accepted_tokens,
+    num_accepted_tokens)``, or None where the shapes do not fit (the caller keeps the three launches).
+    ``exchange``: a ``TPKeyExchange`` with ``fast_gumbel``; ``logits`` [M, V_shard] this rank's shard."""
+    k = draft_tokens.shape[-1]
+    num_gens = batch_size - num_contexts
+    m = logits.shape[0] if logits.dim() == 2 else 0
+    v_shard = logits.shape[-1]
+    if (
+        not exchange.fast_gumbel
+        or logits.dim() != 2
+        or logits.stride(-1) != 1
+        or v_shard % 4
+        or vocab_offset % 4
+        or not 1 <= m <= exchange.MAX_ROWS
+        or k + 1 > MAX_DRAFT_LEN + 1
+        or num_gens < 0
+        or m != num_contexts + num_gens * (k + 1)
+        or temperature.numel() != m
+        or seed.dtype != torch.int64
+        or seed.numel() != 1
+    ):
+        return None
+    (grid, split, block_v, scratch, ticket, state, peers, rank, nranks, words, block_m, pdl) = (
+        exchange.fast_gumbel_launch(m, v_shard, channel)
+    )
+    device = logits.device
+    tokens = torch.empty(m, dtype=torch.int32, device=device)
+    accepted = torch.empty((batch_size, k + 1), dtype=torch.int32, device=device)
+    num_accepted = torch.empty((batch_size,), dtype=torch.int32, device=device)
+    mode, base_total, max_total, frac, pool, counter, c_stride, s_stride, pool_mask = _force_mode(
+        force, k, num_accepted
+    )
+    _sample_accept_kernel[(grid,)](
+        logits,
+        logits.stride(0),
+        v_shard,
+        tokens,
+        scratch,
+        ticket,
+        state,
+        peers,
+        temperature.reshape(-1),
+        seed,
+        m,
+        rank,
+        vocab_offset,
+        v_shard * nranks,
+        float(greedy_threshold),
+        draft_tokens.contiguous() if num_gens > 0 else num_accepted,
+        accepted,
+        num_accepted,
+        pool,
+        counter,
+        num_contexts,
+        num_gens,
+        accepted.stride(0),
+        float(frac),
+        split=split,
+        BLOCK_V=block_v,
+        NRANKS=nranks,
+        WORDS=words,
+        BLOCK_M=block_m,
+        WAIT=pdl,
+        K=k,
+        FORCE=mode,
+        BASE_TOTAL=int(base_total),
+        MAX_TOTAL=int(max_total),
+        COUNTER_STRIDE=int(c_stride),
+        SLOT_STRIDE=int(s_stride),
+        POOL_MASK=int(pool_mask),
+        # The acceptance tile follows the batch (16 / 32 / 64 rows; it loops over row blocks above 64): one compile
+        # per tile size, the first time an eager step lands in it. Not one 64-row tile for every batch: the tile
+        # sizes this one-launch kernel's registers, so its captured decode steps keep their smaller variants.
+        BLOCK_B=max(16, min(64, triton.next_power_of_2(max(num_gens, num_contexts, 1)))),
+        BLOCK_K=max(8, triton.next_power_of_2(k + 1)),
+        num_warps=4,
+        launch_pdl=pdl,
+    )
+    return accepted, num_accepted
+
+
 def fused_strict_accept(
     target_tokens: torch.Tensor,
     draft_tokens: torch.Tensor,
@@ -129,16 +411,9 @@ def fused_strict_accept(
     device = target_tokens.device
     accepted = torch.empty((batch_size, k + 1), dtype=torch.int32, device=device)
     num_accepted = torch.empty((batch_size,), dtype=torch.int32, device=device)
-    if force is None:
-        mode, base_total, max_total, frac = 0, 1, k + 1, 0.0
-        pool = counter = num_accepted  # unused
-        c_stride = s_stride = pool_mask = 1
-    else:
-        base_total, max_total, frac, pool, counter, c_stride, s_stride, pool_size = force
-        mode = 2 if (frac > 0.0 and base_total < max_total) else 1
-        if pool is None:
-            pool = counter = num_accepted  # unused in mode 1
-        pool_mask = pool_size - 1
+    mode, base_total, max_total, frac, pool, counter, c_stride, s_stride, pool_mask = _force_mode(
+        force, k, num_accepted
+    )
     draft = draft_tokens.contiguous() if num_gens > 0 else num_accepted
     # One tile for every batch: the kernel loops over row blocks.
     block_b = 64
@@ -194,6 +469,7 @@ def _step0_epilogue_kernel(
     BLOCK_C: tl.constexpr,
     BLOCK_H: tl.constexpr,
     LAST: tl.constexpr,
+    COPY_HID: tl.constexpr,
 ):
     """One program per request ``i`` (every write is to row ``i`` only; ``seq_lens_ptr`` is never written)."""
     i = tl.program_id(0)
@@ -213,10 +489,11 @@ def _step0_epilogue_kernel(
     )
     dkv = tl.where(is_ctx, 1, acc - K)
     tl.store(ids_out_ptr + i, gid)
-    h = tl.arange(0, BLOCK_H)
-    hm = h < H
-    v = tl.load(hid_ptr + gid * hid_stride + h, mask=hm)
-    tl.store(hid_out_ptr + i.to(tl.int64) * H + h, v, mask=hm)
+    if COPY_HID:
+        h = tl.arange(0, BLOCK_H)
+        hm = h < H
+        v = tl.load(hid_ptr + gid * hid_stride + h, mask=hm)
+        tl.store(hid_out_ptr + i.to(tl.int64) * H + h, v, mask=hm)
     for r in tl.static_range(R):
         p = tl.load(pos_ptr + r * pos_row_stride + gid)
         for j in tl.static_range(1, K):
@@ -262,11 +539,13 @@ def step0_epilogue(
     num_ctx_tokens: int,
     accepted_tokens: Optional[torch.Tensor] = None,
     last_out: Optional[torch.Tensor] = None,
+    hidden_compact: bool = False,
 ) -> Optional[Step0Epilogue]:
     """``seq_lens`` must not alias ``seq_lens_out`` (read the pre-draft-loop copy). With ``accepted_tokens``
     ``[b, >= draft_len + 1]`` and ``last_out`` (contiguous ``[b]``), also ``last_out[i] =
-    accepted_tokens[i, num_accepted[i] - 1]``. Returns None when the shapes are not supported (caller keeps the
-    stock path)."""
+    accepted_tokens[i, num_accepted[i] - 1]``. ``hidden_compact``: ``hidden_states`` already holds each request's
+    row (the draft layer computed only those, speculative/kept_rows.py) and is the step's hidden rows as it is.
+    Returns None when the shapes are not supported (caller keeps the stock path)."""
     if (
         seq_lens.data_ptr() == seq_lens_out.data_ptr()
         or hidden_states.dim() != 2
@@ -275,6 +554,7 @@ def step0_epilogue(
         or batch_size < 1
         or batch_size > 1024
         or draft_len < 1
+        or (hidden_compact and hidden_states.shape[0] != batch_size)
     ):
         return None
     pos2 = position_ids.reshape(-1, position_ids.shape[-1])
@@ -284,7 +564,11 @@ def step0_epilogue(
     h = hidden_states.shape[1]
     dev = hidden_states.device
     ids = torch.empty((batch_size,), dtype=torch.int64, device=dev)
-    hid = torch.empty((batch_size, h), dtype=hidden_states.dtype, device=dev)
+    hid = (
+        hidden_states
+        if hidden_compact
+        else torch.empty((batch_size, h), dtype=hidden_states.dtype, device=dev)
+    )
     pos_all = torch.empty(
         (max(draft_len - 1, 1), rows, batch_size), dtype=position_ids.dtype, device=dev
     )
@@ -320,6 +604,7 @@ def step0_epilogue(
         BLOCK_C=64,
         BLOCK_H=triton.next_power_of_2(h),
         LAST=last,
+        COPY_HID=not hidden_compact,
         num_warps=4,
     )
     return Step0Epilogue(ids, hid, pos_all, tuple(position_ids.shape[:-1]))
@@ -328,6 +613,7 @@ def step0_epilogue(
 __all__ = [
     "MAX_DRAFT_LEN",
     "fused_strict_accept",
+    "sample_and_strict_accept",
     "step0_epilogue",
     "Step0Epilogue",
 ]

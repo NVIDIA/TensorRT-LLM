@@ -59,6 +59,81 @@ def test_packed_split_count_fills_one_cluster_wave(monkeypatch) -> None:
     assert select(4, 6, device, max_kv_len=999424, is_cuda_graph=True) == 3
 
 
+def test_packed_split_needed_mirrors_the_kernel_plan() -> None:
+    def needed(kv_lens, **kwargs) -> bool:
+        # DeepSeek-R1 q4 rows (4 m-tiles) on 212 SMs: 26 tasks per wave of 2-CTA clusters.
+        return fp4_mla_packed_plan.packed_split_needed(
+            kv_lens, query_len=4, m_tiles=4, sm_count=212, **kwargs
+        )
+
+    # An even batch that fills two thirds of a wave keeps every request whole at any KV length.
+    assert not needed([2048] * 32)
+    assert not needed([32768] * 32)
+    assert not needed([4096] * 128)
+    # A smaller even batch splits to fill the machine.
+    assert needed([4096] * 16)
+    # One long request among short ones splits, first or last.
+    assert needed([2048] * 31 + [32768])
+    assert needed([32768] + [2048] * 127)
+    # Lengths spread over a large batch stay whole.
+    assert not needed([1024 + 76 * i for i in range(256)])
+    # One slot per request never splits; neither does an empty step.
+    assert not needed([2048] * 31 + [32768], splits=1)
+    assert not needed([])
+
+
+def test_packed_split_variants_add_an_unsplit_graph_from_two_thirds_of_a_wave() -> None:
+    variants = fp4_mla_packed_plan.packed_split_variants
+    # q4: 26 tasks per wave, so 18 requests fill two thirds of it.
+    assert variants(17, m_tiles=4, sm_count=212) == (True,)
+    assert variants(18, m_tiles=4, sm_count=212) == (False, True)
+    assert variants(1024, m_tiles=4, sm_count=212) == (False, True)
+    # q1: 106 tasks per wave.
+    assert variants(70, m_tiles=1, sm_count=212) == (True,)
+    assert variants(71, m_tiles=1, sm_count=212) == (False, True)
+
+
+def test_on_demand_split_count_launches_the_budget_only_for_a_split(monkeypatch) -> None:
+    monkeypatch.delenv("TRTLLM_FP4_MLA_SPLIT_KV", raising=False)
+    monkeypatch.delenv("TRTLLM_FP4_MLA_SPLIT_ON_DEMAND", raising=False)
+    monkeypatch.setattr(fp4_mla_packed_plan, "_get_sm_count", lambda device: 212)
+    count = fp4_mla_packed_plan._on_demand_split_count
+
+    def metadata(kv_lens=None, *, packed_split=None, is_cuda_graph=False) -> SimpleNamespace:
+        return SimpleNamespace(
+            fp4_mla_state=SimpleNamespace(packed_split=packed_split),
+            is_cuda_graph=is_cuda_graph,
+            kv_lens_runtime=None if kv_lens is None else torch.tensor(kv_lens, dtype=torch.int32),
+        )
+
+    even, skewed = [4096] * 32, [2048] * 31 + [32768]
+    shape = dict(num_requests=32, m_tiles=4, query_len=4, device=torch.device("cuda"))
+    # Eager steps decide on their host KV lengths.
+    assert count(3, metadata(even), helix=False, **shape) == 1
+    assert count(3, metadata(skewed), helix=False, **shape) == 3
+    # The generation rows are the last kv_lens_runtime entries (context rows come first).
+    assert count(3, metadata([100000] + even), helix=False, **shape) == 1
+    # A keyed graph replays its decision; a graph without one keeps the budget.
+    assert (
+        count(3, metadata(skewed, packed_split=False, is_cuda_graph=True), helix=False, **shape)
+        == 1
+    )
+    assert (
+        count(3, metadata(even, packed_split=True, is_cuda_graph=True), helix=False, **shape) == 3
+    )
+    assert count(3, metadata(even, is_cuda_graph=True), helix=False, **shape) == 3
+    # Without host KV lengths, under Helix and with one slot the count stays.
+    assert count(3, metadata(), helix=False, **shape) == 3
+    assert count(3, metadata(even), helix=True, **shape) == 3
+    assert count(1, metadata(even), helix=False, **shape) == 1
+    # A fixed TRTLLM_FP4_MLA_SPLIT_KV and TRTLLM_FP4_MLA_SPLIT_ON_DEMAND=0 keep the budget.
+    monkeypatch.setenv("TRTLLM_FP4_MLA_SPLIT_KV", "3")
+    assert count(3, metadata(even), helix=False, **shape) == 3
+    monkeypatch.delenv("TRTLLM_FP4_MLA_SPLIT_KV")
+    monkeypatch.setenv("TRTLLM_FP4_MLA_SPLIT_ON_DEMAND", "0")
+    assert count(3, metadata(even), helix=False, **shape) == 3
+
+
 def _plan_mod():
     return importlib.import_module(
         "tensorrt_llm._torch.attention.backends.fp4_mla.fp4_mla_packed_reduce"
@@ -358,6 +433,7 @@ def test_uniform_generation_lengths_fuse_the_packed_plan(monkeypatch) -> None:
             generation_lengths_num_seqs=-1,
             generation_lengths_num_contexts=-1,
             generation_lengths_capture_recorded=False,
+            generation_lengths_serial=0,
             packed_plan_key=None,
         ),
     )

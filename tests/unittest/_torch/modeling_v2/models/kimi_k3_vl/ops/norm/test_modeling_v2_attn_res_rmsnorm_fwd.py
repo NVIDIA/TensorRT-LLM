@@ -1,11 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the attn_res_rmsnorm_fwd catalog entry.
+"""GPU test for the attn_res_rmsnorm_fwd op.
 
 A cell is (T, N): T tokens and N = K + 1 candidates, K snapshots plus the layer residual. Every cell
 checks the output's shape and dtype, bit-identical results from two identical calls, untouched inputs,
 and closeness to an fp32 torch evaluation of the contract's Semantics, with both bf16 rounding
-boundaries, under the metric of main's op test
+boundaries, under the metric of the built-in op test
 (tests/unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_rmsnorm_op.py).
 
 The kernel depends on N only: one CTA per token for N <= 4, one cluster of 8 CTAs per token for
@@ -17,8 +17,8 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2._native import load_family_ops
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.norm.attn_res_rmsnorm_fwd import (
+from tensorrt_llm._torch.modeling_v2._native import load_family_ops
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.norm.attn_res_rmsnorm_fwd import (
     attn_res_rmsnorm_fwd,
 )
 
@@ -26,7 +26,7 @@ __extra_import_path__ = ["../../../.."]
 from _validating import validating
 
 assert torch.cuda.is_available(), "attn_res_rmsnorm_fwd requires a CUDA device"
-# The receipts are sm_100 ones; CI's other architectures skip this file.
+# Runs on sm_100 and sm_103 (the architectures the op is certified on); other architectures skip this file.
 pytestmark = pytest.mark.skipif(
     torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
     reason="certified on sm_100 and sm_103",
@@ -34,17 +34,19 @@ pytestmark = pytest.mark.skipif(
 
 HIDDEN_SIZE = 7168
 RMS_EPS = 1e-6
-# The thresholds of main's op test.
+# The thresholds of the built-in op test.
 MIN_COSINE = 0.9999
 MAX_RELATIVE_L2 = 5e-3
 INPUT_NAMES = ("layer_residual", "block_residual", "res_weight", "rms_weight", "output_rms_weight")
 
 
-_FAMILY = "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl"
+_FAMILY = "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl"
 
 
-def _make_inputs(num_tokens: int, num_candidates: int, seed: int = 0) -> tuple[torch.Tensor, ...]:
-    """Inputs at the scales of main's op test, seeded by the cell."""
+def _make_inputs(
+    num_tokens: int, num_candidates: int, seed: int = 0
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Inputs at the scales of the built-in op test, seeded by the cell."""
     torch.manual_seed(seed)
     layer_residual = (
         torch.randn(num_tokens, 1, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda") * 0.05
@@ -67,7 +69,7 @@ def _bits(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def _similarity(actual: torch.Tensor, expected: torch.Tensor) -> tuple[float, float]:
-    """Cosine similarity and relative L2 error, the metric of main's op tests."""
+    """Cosine similarity and relative L2 error, the metric of the built-in op tests."""
     actual_float = actual.float().flatten()
     expected_float = expected.float().flatten()
     cosine = torch.nn.functional.cosine_similarity(actual_float, expected_float, dim=0).item()
@@ -160,7 +162,7 @@ def test_k3_fused_add_preserves_rounding_and_graph_inputs(
     addend = layer.roll(1, dims=-1) * 0.25
     args = (layer, addend, block, res_weight, rms_weight, output_weight, RMS_EPS, RMS_EPS)
     updated, normalized = load_family_ops(
-        "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl"
+        "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl"
     ).k3_attn_res_add_rmsnorm_fwd(*args, early_trigger=early_trigger)
     for replay in (False, True):
         if replay:
@@ -168,7 +170,7 @@ def test_k3_fused_add_preserves_rounding_and_graph_inputs(
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 updated, normalized = load_family_ops(
-                    "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl"
+                    "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl"
                 ).k3_attn_res_add_rmsnorm_fwd(*args, early_trigger=early_trigger)
             layer.copy_(layer.roll(3, dims=-1))
             addend.neg_()

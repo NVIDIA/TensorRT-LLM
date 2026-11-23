@@ -229,7 +229,7 @@ def _init_dspark_ctx_buffers(
     )
     worker._lazy_init_ctx_buffers(
         draft_model,
-        SimpleNamespace(max_num_requests=1),
+        SimpleNamespace(max_num_requests=1, num_seq_slots=1),
         SimpleNamespace(kv_cache_manager=manager, kv_cache_block_offsets=None),
         manager,
     )

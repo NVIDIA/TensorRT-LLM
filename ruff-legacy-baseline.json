@@ -1,8 +1,8 @@
 {
   "_meta": {
     "generated_by": "scripts/legacy_utils.py lint-update-violations",
-    "total_violations": 2060,
-    "total_files": 219
+    "total_violations": 2042,
+    "total_files": 218
   },
   ".github/scripts/label_community_user.py": {
     "D212": 1
@@ -808,17 +808,6 @@
     "D403": 3,
     "D415": 3,
     "E741": 3
-  },
-  "tests/integration/defs/triton_server/test_list_parser.py": {
-    "D202": 4,
-    "D205": 3,
-    "D208": 1,
-    "D209": 1,
-    "D212": 3,
-    "D214": 1,
-    "E731": 2,
-    "E741": 2,
-    "F811": 1
   },
   "tests/integration/defs/triton_server/trt_test_alternative.py": {
     "D200": 1,

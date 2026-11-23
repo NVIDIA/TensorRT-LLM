@@ -389,7 +389,7 @@ def test_rebalance_reserves_execution_row_before_resuming_real_requests(
 ) -> None:
     executor = _make_executor()
     executor._enable_remote_tail_adp = True
-    executor.resource_manager = SimpleNamespace(resource_managers={})
+    executor._read_kv_cache_capacity = Mock(return_value={})
     real = SimpleNamespace(py_request_id=1)
     dummy = SimpleNamespace(py_request_id=2)
     executor.active_requests = [real]
@@ -561,7 +561,7 @@ def test_constructor_initializes_remote_tail_adp_before_starting_worker(
     monkeypatch.setattr(torch.cuda, "Event", Mock())
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
     monkeypatch.setattr(torch.cuda, "stream", stream_scope)
-    monkeypatch.setattr(executor_module, "_distributed_warmup_guard", lambda *_: nullcontext())
+    monkeypatch.setattr(executor_module, "distributed_warmup_guard", lambda *_: nullcontext())
     monkeypatch.setattr(executor_module, "ExecutorRequestQueue", Mock())
     monkeypatch.setattr(executor_module, "mpi_disabled", lambda: True)
     monkeypatch.setattr(PyExecutor, "_set_global_steady_clock_offset", lambda _self: None)
@@ -619,6 +619,7 @@ def test_constructor_initializes_remote_tail_adp_before_starting_worker(
         enable_overlap_headroom=False,
         mm_encoder_item_scheduling_enabled=False,
         spec_decode_fast_paths=False,
+        uses_torch_compile=False,
         cuda_graph_runner=runner,
         model=SimpleNamespace(
             model=SimpleNamespace(
@@ -634,6 +635,7 @@ def test_constructor_initializes_remote_tail_adp_before_starting_worker(
             enable_iter_req_stats=False,
             iter_perf_stats_interval=1,
             stream_interval=1,
+            return_perf_metrics=False,
             attention_dp_config=None,
             kv_connector_config=None,
             batch_wait_timeout_ms=0,

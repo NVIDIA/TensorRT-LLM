@@ -1,6 +1,6 @@
 ---
 name: trtllm-modeling-v2-features
-description: Load when working on, testing or debugging a TensorRT-LLM engine feature around a ModelingV2 target -- KV-cache block (prefix) reuse, disaggregated serving, chunked prefill, KV-cache dtype (fp8/nvfp4 and their scales), CUDA graphs and the overlap scheduler, multimodal inputs, speculative decoding, or attention-DP/TP/EP where it changes one of those -- including a check that fails on a feature field, or a number that moves only with a feature on. Says which engine stage owns the feature and what the target must honour, where its code and tests are in the tree, and how to prove it from a CPU check up to the flow's accuracy, disagg or acceptance gate. Not needed to write or certify one catalog entry (trtllm-modeling-v2-entry) or to debug core accuracy with every feature at its default.
+description: Load when working on, testing or debugging a TensorRT-LLM engine feature around a ModelingV2 target -- KV-cache block (prefix) reuse, disaggregated serving, chunked prefill, KV-cache dtype (fp8/nvfp4 and their scales), CUDA graphs and the overlap scheduler, multimodal inputs, speculative decoding, or attention-DP/TP/EP where it changes one of those -- or a number that moves only with a feature on. Says which engine stage owns the feature and what the target must honour, where its code and tests are in the tree, and how to prove it from a CPU check up to the flow's accuracy, disagg or acceptance gate. Not needed to write or certify one catalog entry (trtllm-modeling-v2-entry) or to debug core accuracy with every feature at its default.
 ---
 
 <!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
@@ -10,12 +10,13 @@ description: Load when working on, testing or debugging a TensorRT-LLM engine fe
 
 ## When to load
 
-Load when a task names one of these features, when a verdict names a feature
-field (`block_reuse`, `chunked_prefill`, `kv_cache_dtype`, `cuda_graph`,
-`speculative`) or the disagg test, or when a result moves only with a feature on.
+Load when a task names one of these features, when the disagg test or the
+acceptance gate fails, or when a result moves only with a feature on. No
+verdict names a feature field: the table below says which check observes
+each feature.
 Open the feature's section in `references/features.md`, read the code it points
 to in the current tree, and imitate the tests it names. Read
-`tensorrt_llm/_torch/_experimental/modeling_v2/README.md` and
+`tensorrt_llm/_torch/modeling_v2/README.md` and
 `cpp/tensorrt_llm/modeling_v2/README.md` as the source of truth; follow the
 native guide before C++/CUDA edits, including its family build, namespace/
 registration macros, loaders, fakes and rebuild/install procedure. A default
@@ -44,7 +45,7 @@ scope that uses it; family sharing is allowed, sibling-target imports are not.
 | executor loop | admission, batching, context chunking, overlap loop, attention-DP router and dummy requests, cache-transceiver calls | `_torch/pyexecutor/py_executor.py`, `_torch/pyexecutor/scheduler/` |
 | resource managers | blocks: allocate, free, prefix reuse, snapshots, side buffers, and what disagg transfers | `_torch/pyexecutor/kv_cache/`, `resource_manager.py`, `get_kv_cache_manager_cls` in `_util.py` |
 | model engine | per-step attention/spec/multimodal metadata; CUDA-graph plan, capture, replay | `_torch/pyexecutor/model_engine.py` (`ModelEngine`), `_torch/pyexecutor/engine/` |
-| **the target** | model lifecycle; its forward reads metadata and writes into the pools it is handed | `_torch/_experimental/modeling_v2/` |
+| **the target** | model lifecycle; its forward reads metadata and writes into the pools it is handed | `_torch/modeling_v2/` |
 | sampler, speculative | tokens, draft verification, acceptance | `_torch/pyexecutor/sampler/`, `_torch/speculative/` |
 
 The target never schedules, allocates per-request storage, samples or
@@ -61,9 +62,8 @@ Climb only as far as the claim needs. Each rung says what it cannot see.
 1. **Source and CPU (seconds).** Grep the forward for what the feature forbids:
    host syncs or value-dependent Python branches under graphs, a context
    assumed to start at position 0, state in target-owned tensors. Run
-   `tests/unittest/_torch/modeling_v2/test_modeling_v2_routing.py` (no GPU)
-   and `trtllm-modeling-v2 intake lint` on the spec. *Blind to* numerics and to whether the engine turned the
-   feature on.
+   `tests/unittest/_torch/modeling_v2/test_modeling_v2_routing.py` (no GPU).
+   *Blind to* numerics and to whether the engine turned the feature on.
 2. **In-tree unit tests to imitate (minutes, one GPU).** Each section names the
    op-, cache- or transfer-level test that already exercises the feature. Copy
    its shape for the target's own case: an op cell with a cached prefix, a
@@ -72,28 +72,29 @@ Climb only as far as the claim needs. Each rung says what it cannot see.
 3. **One-member boot with the feature on.** `trtllm-modeling-v2 gate boot
    --task task.yaml --unit <unit or variant> --member <m>` runs it as the
    orchestrator does, with `modeling_v2="require"` for target evidence;
-   `--mode off` reruns the same command on the stock path as a control. Read the verdict's `[engine ...]` segment: every declared field is
-   read back from every rank's worker (`MV2FLOW_RANK_ENGINE`), with the reuse
-   probe and pool sizes. A field read as UNKNOWN, or only from the request, is
-   not evidence. *Blind to* accuracy: boot checks a few short continuations
-   for keywords.
+   `--mode off` reruns the same command on the stock path as a control. The
+   gate sends the unit's options and does not read back what the engine
+   resolved: whether a setting took effect is in the engine's own log.
+   *Blind to* accuracy: boot checks only that a few short continuations are
+   not empty.
 4. **Accuracy, disagg, acceptance.** `gate accuracy` runs the benchmark
-   with CUDA graphs (lint blocks an eager accuracy check) and re-attests each
-   rank's KV dtype and chunking; `gate disagg --unit disagg` runs the target's
-   disaggregated-serving test as CI does; `gate acceptance` judges
+   with CUDA graphs; `gate disagg --unit disagg` serves the
+   deployment `accuracy.disagg` states and scores it through its proxy, or
+   runs the target's disaggregated-serving test as CI does when it states a
+   `test`; `gate acceptance` judges
    speculators. *Blind spots* are per feature in the reference; they are why
    each feature carries a proof of its own.
 
 | feature | on in `task.yaml` by | proof that it ran | judged by |
 |---|---|---|---|
-| block reuse | a `reuse` variant (`kv_cache_config.enable_block_reuse: true`); off in core | reuse probe: a repeated prompt reports `cached_tokens` > 0 | variant accuracy |
-| chunked prefill | a `chunked` variant with a small `max_num_tokens`; off in core | a prompt longer than `max_num_tokens` past the cache, served | variant accuracy |
-| KV-cache dtype | a variant setting `llm_api_options.kv_cache_config.dtype` | each rank's resolved `kv_cache_quant_algo` | variant accuracy |
-| CUDA graphs | `runtime.cuda_graph` | each rank's graph settings and capture plan (not replays) | accuracy (graphs always on) |
+| block reuse | a `reuse` variant (`runtime: {kv_cache_reuse: true}`); off in core | reuse probe of a boot or an acceptance load: a repeated prompt reports `cached_tokens` > 0. A variant with `gates: [accuracy]` runs neither | variant accuracy |
+| chunked prefill | a `chunked` variant with a small `max_num_tokens`; off in core | benchmark prompts longer than `max_num_tokens`, served and scored; a boot of the variant, where it owes one, sends one such prompt | variant accuracy |
+| KV-cache dtype | a variant setting `llm_api_options.kv_cache_config.dtype` | the loader's KV-quantization log line, which no gate reads | variant accuracy |
+| CUDA graphs | `runtime.cuda_graph` (default on) | the options sent; no gate reads the captures | accuracy |
 | overlap scheduler | `runtime.overlap_scheduler` (default on, core) | the argument only | nothing of its own |
-| disaggregation | feature `disagg` + `accuracy.disagg.test` | a benchmark scored through `trtllm-serve disaggregated` | the tree's disaggregated-serving test |
+| disaggregation | feature `disagg` + `accuracy.disagg` (`config`/`context`/`generation`, or `test`) | a benchmark scored through `trtllm-serve disaggregated` | the flow's own serving of the stated deployment, or the tree's disaggregated-serving test |
 | multimodal | feature `multimodal` | an image prompt answered | boot image, image benchmark |
-| speculative | features `mtp`, `eagle3`, `dflash`, `dspark` | each rank's algorithm and depth; accepted tokens per iteration | acceptance gate |
+| speculative | features `mtp`, `eagle3`, `dflash`, `dspark` | accepted tokens per iteration | acceptance gate |
 
 ## Rules that save hours
 
@@ -113,7 +114,11 @@ Climb only as far as the claim needs. Each rung says what it cannot see.
   and chunked prefill are off there. Prove every other feature once, as one
   variant on core at the member the request validates fully (`spec/INTAKE.md`),
   never two at once.
-- **Write the disaggregated test the way the tree's own are written,** in
+- **Write a disaggregated test only when `accuracy.disagg` states a `test`.**
+  With `config`, `context` and `generation` there the flow serves the deployment itself:
+  a failing `gate disagg` is then about the target or its options, never about
+  a launcher to write. When it does state a test, write it the way the tree's
+  own are written, in
   `tests/integration/defs/accuracy/test_disaggregated_serving.py`: a
   `LlmapiAccuracyTestHarness` class with context and generation server configs,
   `launch_disaggregated_llm`, the benchmark task of `accuracy_core.py` (GSM8K
@@ -130,7 +135,7 @@ Climb only as far as the claim needs. Each rung says what it cannot see.
   keep model-specific logic at the narrowest target or family scope that uses
   it, and make a shared runtime change the smallest general one, never a
   branch on this model. Name each such file and
-  why in your report; the regression check follows it.
+  why in your report.
 - A stock-path control (`--mode off`, `modeling_v2: off`) splits a target bug
   from an engine bug. A new architecture has none; say so instead of guessing.
 - Report each feature as *verified* (its proof passed), *configured* (on, not
@@ -139,14 +144,14 @@ Climb only as far as the claim needs. Each rung says what it cannot see.
 ## Index
 
 `references/features.md`, one section each, every section in the same order
-(what; engine owns; target must honour; code and grep; tests to imitate; fast
-check; how the flow proves it; blind spots):
+(what; engine owns; target must honour; where in the code; tests to imitate,
+with a by-hand check; how the flow proves it; blind spots):
 
 0. Common machinery: enabling features in a spec, running one gate, reading
    engine evidence
 1. Block reuse (prefix KV-cache reuse), including side state and recurrent snapshots
 2. Chunked prefill
-3. Disaggregated serving: what crosses the hop, transceiver, one- and multi-node launch
+3. Disaggregated serving: what crosses the hop, transceiver, what not to build
 4. KV-cache dtype: fp8, nvfp4, mixed, and KV scales
 5. CUDA graphs and the overlap scheduler
 6. Multimodal inputs

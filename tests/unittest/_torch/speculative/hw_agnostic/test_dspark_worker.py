@@ -42,12 +42,13 @@ NCAP = 3
 HC_MULT = 4
 
 
-def _make_metadata(max_num_requests=8, max_num_tokens=64, layers=(58, 59, 60)):
+def _make_metadata(max_num_requests=8, max_num_tokens=64, layers=(58, 59, 60), num_seq_slots=0):
     return DSparkSpecMetadata(
         max_draft_len=5,
         max_total_draft_tokens=5,
         spec_dec_mode=SpeculativeDecodingMode.DSPARK,
         max_num_requests=max_num_requests,
+        num_seq_slots=num_seq_slots,
         layers_to_capture=list(layers),
         hidden_size=HIDDEN,
         max_num_tokens=max_num_tokens,
@@ -198,6 +199,39 @@ def test_worker_slot_exhaustion_preserves_live_request():
     assert torch.all(worker._kv_windows[slot] == 1.0)
 
 
+def test_metadata_keeps_the_seq_slot_pool_in_a_graph_copy():
+    metadata = _make_metadata(max_num_requests=5)
+
+    graph_metadata = metadata.create_cuda_graph_metadata(max_batch_size=2)
+
+    assert metadata.num_seq_slots == 5
+    assert graph_metadata.max_num_requests == 2
+    assert graph_metadata.num_seq_slots == 5
+
+
+@pytest.mark.parametrize("num_seq_slots", [4, 8], ids=["pool-eq-batch", "disagg-adp-2x-pool"])
+def test_worker_graph_bucket_uses_the_full_seq_slot_pool(num_seq_slots):
+    """A first _lazy_init on a small graph bucket must not shrink the slot pool."""
+    metadata = _make_metadata(max_num_requests=4, num_seq_slots=num_seq_slots)
+    graph_metadata = metadata.create_cuda_graph_metadata(max_batch_size=2)
+    worker = _make_worker()
+
+    worker._lazy_init(_fake_draft_model(), graph_metadata)
+
+    assert graph_metadata.max_num_requests == 2 < graph_metadata.num_seq_slots
+    assert worker._ctx_len.shape == (num_seq_slots + 1,)
+    assert worker._batch_to_slot.shape == (num_seq_slots,)
+    assert worker._scratch_slot == num_seq_slots
+    live_slots = {worker._assign_slot(100 + i, reset=False) for i in range(num_seq_slots)}
+    assert live_slots == set(range(num_seq_slots))
+    with pytest.raises(
+        RuntimeError,
+        match=f"all {num_seq_slots} slots of the executor's seq-slot pool are in use; "
+        "increase max_batch_size",
+    ):
+        worker._assign_slot(999, reset=False)
+
+
 def test_seed_context_windows_preserves_state_across_prefill_chunks():
     class DraftModel:
         num_stages = 1
@@ -221,6 +255,7 @@ def test_seed_context_windows_preserves_state_across_prefill_chunks():
     draft_model = DraftModel()
     metadata = types.SimpleNamespace(
         max_num_requests=1,
+        num_seq_slots=1,
         request_ids=[100],
         get_hidden_states=lambda _num_tokens: torch.zeros(
             3, HIDDEN * NCAP, device="cuda", dtype=torch.bfloat16
@@ -279,7 +314,7 @@ def test_seed_context_windows_reads_only_each_chunk_tail(chunks, window, final_w
         written.append(positions.tolist())
 
     draft.write_context_windows = write
-    meta = types.SimpleNamespace(max_num_requests=2, request_ids=[100, 101])
+    meta = types.SimpleNamespace(max_num_requests=2, num_seq_slots=2, request_ids=[100, 101])
     worker._lazy_init(draft, meta)
     expected = []
     total_kept = 0
@@ -620,6 +655,7 @@ def test_disagg_position_bootstrap_uses_actual_positions_and_target_width():
     draft_model = _RecordingDraftModel()
     metadata = types.SimpleNamespace(
         max_num_requests=2,
+        num_seq_slots=2,
         qo_indptr=None,
         verify_lens=None,
     )
@@ -722,6 +758,7 @@ def test_forward_mixed_batch_routes_through_base_entries(monkeypatch):
     batch_size = num_contexts + num_gens
 
     meta = _make_metadata(max_num_requests=8)
+    meta.runtime_draft_len = K
     meta.request_ids = [10, 11, 20, 21, 22]  # 2 context + 3 gen
     meta.prepare()
 
@@ -826,6 +863,7 @@ def test_forward_guided_batch_masks_and_advances_matcher_per_step(monkeypatch):
     FULL_VOCAB = 97  # post-TP-gather scatter width (wider than sharded `vocab`)
 
     meta = _make_metadata(max_num_requests=8)
+    meta.runtime_draft_len = K
     meta.request_ids = [10, 11, 20, 21, 22]  # 2 context + 3 gen
     meta.prepare()
 
@@ -958,9 +996,20 @@ def _routing_config(embedded):
         attention_backend="TRTLLM",
         confidence_threshold=0.5,
         enable_confidence_scheduling=False,
+        use_ancestral_draft_sampling=False,
         _use_shared_kv_cache=False,
         _allow_separate_draft_kv_cache=True,
     )
+
+
+def test_an_embedded_drafter_rejects_ancestral_draft_sampling():
+    from tensorrt_llm._torch.speculative.utils import get_spec_worker
+    from tensorrt_llm.mapping import Mapping
+
+    spec_config = _routing_config(True)
+    spec_config.use_ancestral_draft_sampling = True
+    with pytest.raises(ValueError, match="use_ancestral_draft_sampling"):
+        get_spec_worker(spec_config, None, Mapping())
 
 
 @pytest.mark.parametrize(
@@ -1160,6 +1209,7 @@ def test_ragged_draft_gathers_each_requests_hidden_state():
     draft_model = _RecordingDraftModel()
     metadata = types.SimpleNamespace(
         max_num_requests=2,
+        num_seq_slots=2,
         qo_indptr=torch.tensor([0, 4, 6], dtype=torch.int32, device="cuda"),
         verify_lens=torch.tensor([4, 2], dtype=torch.int32, device="cuda"),
     )

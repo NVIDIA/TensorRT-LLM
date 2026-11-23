@@ -1,6 +1,5 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-
 import copy
 import json
 from pathlib import Path
@@ -45,6 +44,9 @@ class Qwen3Attention(QKNormRoPEAttention):
         mapping_with_cp: Optional[Mapping] = None,
         use_gqa_decode_fmha: bool = False,
         cache_context_plan: bool = False,
+        fp8_output_gate: bool = False,
+        context_fmha_head_dim_per_stage_kv: int = 0,
+        context_last_rows_only: bool = False,
     ):
         config = model_config.pretrained_config
         self.pretrained_config = config
@@ -92,6 +94,10 @@ class Qwen3Attention(QKNormRoPEAttention):
             mapping_with_cp=mapping_with_cp,
             use_gqa_decode_fmha=use_gqa_decode_fmha,
             cache_context_plan=cache_context_plan,
+            fp8_output_gate=fp8_output_gate,
+            context_fmha_head_dim_per_stage_kv=
+            context_fmha_head_dim_per_stage_kv,
+            context_last_rows_only=context_last_rows_only,
         )
 
 

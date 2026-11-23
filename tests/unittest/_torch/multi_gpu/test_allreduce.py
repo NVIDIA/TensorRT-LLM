@@ -1255,6 +1255,35 @@ def run_mhc_allreduce_boundary_single_rank(tp_size: int, mnnvl: bool) -> bool:
         want = reference(parts.finalize(), *args)
         for g, w in zip(fused(parts, *args), want):
             torch.testing.assert_close(g, w, rtol=0, atol=0)
+
+        # Contiguous MoE views can have storage offsets that violate CuTe's alignment.
+        def offset_copy(value):
+            storage = torch.empty(value.numel() + 1,
+                                  dtype=value.dtype,
+                                  device=value.device)
+            view = storage[1:].view(value.shape)
+            view.copy_(value)
+            assert view.is_contiguous() and view.data_ptr() % 16
+            return view
+
+        parts = MoeUnfinalized(
+            **{
+                name: offset_copy(getattr(parts, name))
+                for name in ('shared', 'fc2', 'scales', 'perm')
+            })
+        want = reference(parts.finalize(), *args)
+        for g, w in zip(fused(parts, *args), want):
+            torch.testing.assert_close(g, w, rtol=0, atol=0)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = fused(parts, *args)
+        parts.shared.mul_(.875)
+        want = reference(parts.finalize(), *args)
+        for _ in range(32):
+            graph.replay()
+        torch.cuda.synchronize()
+        for g, w in zip(captured, want):
+            torch.testing.assert_close(g, w, rtol=0, atol=0)
     except Exception:
         traceback.print_exc()
         raise

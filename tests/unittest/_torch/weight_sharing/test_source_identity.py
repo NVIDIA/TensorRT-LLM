@@ -153,6 +153,39 @@ def test_moe_load_balancer_config_controls_backend_identity():
     assert per_layer_dynamic.matches(same_per_layer_dynamic).matched
 
 
+def test_moe_tactics_control_backend_identity():
+    """A tactic picks the implementation, and its weight layout, within one ``moe_backend``."""
+    base = identity_from(FakeModelConfig(moe_backend="TRTLLM"))
+    tactic = identity_from(FakeModelConfig(moe_backend="TRTLLM", moe_tactic="trtllm_gen.nvfp4"))
+    other_tactic = identity_from(
+        FakeModelConfig(moe_backend="TRTLLM", moe_tactic="trtllm_gen.w4a8_nvfp4_fp8")
+    )
+    draft_tactic = identity_from(
+        FakeModelConfig(moe_backend="TRTLLM", draft_moe_tactic="trtllm_gen.nvfp4")
+    )
+    same_tactic = identity_from(
+        FakeModelConfig(moe_backend="TRTLLM", moe_tactic="trtllm_gen.nvfp4")
+    )
+    # Segments find their fields by value, in any order and case.
+    reordered_tactic = identity_from(
+        FakeModelConfig(moe_backend="TRTLLM", moe_tactic="NVFP4.trtllm_gen")
+    )
+    draft_backend = identity_from(
+        FakeModelConfig(moe_backend="TRTLLM", draft_moe_backend="CUTLASS")
+    )
+
+    result = base.matches(tactic)
+    assert not result.matched
+    assert "backend_fingerprint" in result.mismatched_fields
+    assert "shard_fingerprint" not in result.mismatched_fields
+    assert not tactic.matches(other_tactic).matched
+    assert not base.matches(draft_tactic).matched
+    assert not tactic.matches(draft_tactic).matched
+    assert tactic.matches(same_tactic).matched
+    assert tactic.matches(reordered_tactic).matched
+    assert not base.matches(draft_backend).matched
+
+
 def test_model_layout_field_mismatch_flags_global_and_shard():
     a = identity_from(FakeModelConfig(pretrained_config=FakePretrainedConfig(hidden_size=4096)))
     b = identity_from(FakeModelConfig(pretrained_config=FakePretrainedConfig(hidden_size=8192)))

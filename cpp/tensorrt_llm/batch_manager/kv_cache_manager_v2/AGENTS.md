@@ -6,7 +6,7 @@ SPDX-License-Identifier: Apache-2.0
 # KVCacheManagerV2 C++ Guide
 
 This directory contains the C++ implementation of KVCacheManagerV2: allocation,
-prefix reuse, eviction, GPU/host/disk movement, page locking, and KV-cache event
+prefix reuse, eviction, GPU/host/disk/remote movement, page locking, and KV-cache event
 generation. Python accesses it through the nanobind bindings in
 `cpp/tensorrt_llm/nanobind/batch_manager/kvCacheManagerV2.cpp`.
 
@@ -64,7 +64,9 @@ them before changing `batch.*`, `sparseCache.*` or the index conversion.
   -- act on which class they caught; throw those directly:
   `OutOfMemoryError` and its `Host`/`Disk`/`Cu` forms, `LogicError`,
   `AssertionError`, `CuError`, `CorruptedError`, `ResourceBusyError`,
-  `OutOfPagesError`.
+  `OutOfPagesError`, and `RemoteMemError` (a failed remote cache level: the
+  V2 scheduler and the prefetch path catch it by class to re-match, recompute
+  or fail only the affected requests).
   Validation at the binding boundary that throws `std::invalid_argument` or
   `std::out_of_range` is legacy and should migrate to `TLLM_CHECK*` as it is
   touched, so that KVCM2 ends up on the same footing as the rest of the repo.
@@ -98,6 +100,7 @@ may have sliding-window and sink-token rules; SSM lifecycles represent a
 recurrent-state checkpoint. Both layer configs expose `reusePolicy`: `REQUIRED`
 constrains the prefix match, `OPTIONAL` offers state at the required endpoint for
 explicit selection on first resume, and `PRIVATE` never publishes reusable pages.
+Attention buffers with an effective `OPTIONAL` policy require a sliding window.
 A buffer may override its layer's default through `BufferConfig::reusePolicy`.
 This applies to attention and SSM buffers, so one model layer may span several
 lifecycle groups. Use `getBufferGroupId(layerId, role)` and `bufferGrouping()`
@@ -148,7 +151,7 @@ sizes match, which is what lets a sparse pool be backed by host memory while a
 dense pool of the same group and level is device memory; the group reports
 GPU_MEM either way. Compatible sparse buffers still coalesce. Sparse buffers place no requirement on the cold tiers.
 
-`StorageManager` coordinates GPU, host, and disk cache levels. It allocates
+`StorageManager` coordinates GPU, host, disk, and remote cache levels. It allocates
 slots, schedules pages for eviction, migrates pages between levels, and resizes
 pools. `CopyEngine` performs the actual batched transfers; C++ code calls it
 directly and must not round-trip through Python bindings.
@@ -208,6 +211,36 @@ live pages may be moved into the radix tree rather than copied.
 `stopCommitting()` is a distinct transition and must not call `commit()`:
 doing so would append the same tokens twice. It also releases stale held SWA
 pages and performs final commit-state bookkeeping.
+
+Cache creation records complete OPTIONAL endpoints, including partial pages, during the
+forward radix-tree walk. `optionalReuseMaxBacktrack` bounds selectable endpoints
+relative to the REQUIRED match `P`, defaulting to `P` only. Creation holds the
+union of pages needed by those endpoints. Callers
+select any endpoint in `reuse_status.endpoint_ranges` at first `resume()`. These
+half-open ranges permit different groups to share a partial recovery boundary. REQUIRED prefix reuse
+is unchanged; selected groups restore their lookback and receive private pages
+for the gap to that prefix. A partial recovery tail is copied into a private page
+at the selected group endpoint, even when GLOBAL matched farther ahead. A source
+page may cover more tokens than the selected match. Resume discards unused candidates before allocation
+and releases the selected candidate references after their page locks take over.
+Failed admission retains the selected state for retry.
+Declining an OPTIONAL group on retry releases its candidate holds and partial-copy
+retention borrows before allocation; REQUIRED and retained selections keep theirs.
+
+Selected OPTIONAL groups may start behind the REQUIRED history. Their initial
+histories survive capacity reservation, rollback, and suspend/resume. The normal
+post-forward history update advances them and reclaims stale pages using the
+same rules as REQUIRED groups. `resize(..., completeOptionalRecovery=true)`
+(Python `complete_optional_recovery=True`) explicitly completes recovery through
+the resulting history length, including at unchanged length, after all recovery
+KV accesses have been submitted on the cache stream. Capacity, history, and
+recovery state roll back together on page exhaustion. `commit()` also reports
+completed recovery. By default, `resize()` preserves recovery state even when
+updating the history marker before execution. The `history_length` setter is a
+convenience wrapper and rejects pending OPTIONAL recovery; use `resize()` to
+explicitly preserve or complete it. Complete recovery before entering decode.
+A failed model forward must close and re-create the cache before re-executing
+potentially modified state.
 
 ### Page status
 
@@ -428,6 +461,33 @@ physically duplicate the whole prompt; ownership splits at the prompt tail:
   when that is unavailable or fails. Pieces are served reads first, then
   required writes, then background writes, with aging so no queue starves.
 
+### Remote cache levels
+
+A remote level (`RemoteCacheTierConfig`, `CacheTier::REMOTE`) keeps its slots in
+host memory other processes donate (`tensorrt_llm/_torch/pyexecutor/kv_cache/remote_donor.py`).
+
+- `storage/remoteMem.*`: `RemoteMemClient`, one per rendezvous directory and
+  `StorageManager`: the donor table, the chunks claimed with O_EXCL claim files,
+  and the transfer backend. It opens and checks the directory once
+  (`openRendezvousDirectory`) and reads every donor file through that descriptor.
+  `RemoteRange` maps a pool's slots onto claimed chunks.
+- `storage/remoteTransfer.h`: the backend interface; `remoteTransferAgent.*`
+  (NIXL, one-sided RDMA concluded on the host) and `remoteTransferFabric.*`
+  (fabric memory mapped into this process, copied on the caller's stream).
+- Pages move through the pinned page staging ring. A host-concluded transfer
+  that misses its deadline fails the level, and its staging lease stays out of
+  use (`mUnquiescedRemoteTransfers`) until `quiesced()`; `destroy()` gives it one
+  more timeout, then leaks the lease, the claims and the backend
+  (`RemoteMemClient::abandon`).
+- A failed client fails its levels for good: they take no pages and give none
+  back. `dropPagesOfFailedRemoteLevels()` drops their evictable pages,
+  `KvCacheManager::_unlinkPagesOfFailedRemoteLevels()` unlinks the held ones from
+  the radix tree (from `createKvCache` with tokens, `prefetchReuse` and the
+  probes), and `prepareFreeSlots()` retries an eviction past a level whose WRITE
+  failed. Callers tell this failure apart by `RemoteMemError`.
+- A remote level cannot sit next to a file-backed disk level (rejected at
+  construction).
+
 ## Testing a change here
 
 The Python suite (`tests/unittest/kv_cache_manager_v2_tests/`) does **not** build this
@@ -470,6 +530,15 @@ done
 from it: the radix tree, the storage manager, and the living-`KvCache` set.
 Mutating APIs take it exclusively; read-only queries take it shared, so several
 `probeReuse()` lookups run concurrently while a writer is excluded.
+
+Remote levels add two exceptions. Each `RemoteMemClient` has its own `mMutex`
+for its donor table, claims and backend; it is taken inside the manager lock
+(the storage manager calls the client), never the other way round, and the
+client never calls back into the manager. Its failure flag `mFailed` is an
+atomic, read without any lock by `StorageManager::anyRemoteLevelFailed()` /
+`numFailedRemoteClients()`: the `any_remote_level_failed` binding and the
+probes' check for newly failed levels, which then take the lock exclusively to
+unlink their pages before matching.
 
 **What the lock does and does not cover.** It protects state *shared between*
 `KvCache`s, not the fields of an individual one, and it is a guarantee about the
@@ -525,7 +594,10 @@ Two exposed accessors look like they might leak shared state and do not:
   `get_life_cycle_pool_group_indices`,
   `get_page_stride`, `get_page_index_scale`, `get_page_index_converter`,
   `get_mem_pool_base_address`, `supports_index_mode`, `init_config`, and the
-  config flags. `get_page_index_upper_bound` resembles that group but reads a
+  config flags. `any_remote_level_failed` is lock-free too but reads runtime
+  state: each remote client's atomic `failed()` flag, walking `mRemoteClients`,
+  which `destroy()` clears; it is safe while no `shutdown()` runs concurrently.
+  `get_page_index_upper_bound` resembles that group but reads a
   pool's current `numSlots`, which `_adjustLevel()` changes, so it takes the
   shared lock. Anything added here that reads resize-mutable state must too.
 - `get_base_page_indices` returns a zero-copy numpy view, but into
