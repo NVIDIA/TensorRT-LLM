@@ -235,6 +235,33 @@ def test_qwen3_vl_attached_embedding_uuid_joins_its_hash() -> None:
     assert from_token_ids.multimodal_hashes == with_uuid.multimodal_hashes
 
 
+def test_qwen3_vl_attached_embedding_grid_joins_its_hash() -> None:
+    """The grid sets the item's mRoPE positions, so it is part of the key."""
+    hidden_size = 8
+    config = _make_qwen3_vl_config(hidden_size)
+    embedding_width = hidden_size * (
+        1 + len(config.vision_config.deepstack_visual_indexes))
+    processor = _make_qwen3_vl_processor(
+        config,
+        _make_tokenizer([
+            7,
+            config.vision_start_token_id,
+            config.image_token_id,
+            config.vision_end_token_id,
+        ]))
+    embedding = torch.zeros(4, embedding_width)
+    inputs = {"prompt": "Describe.", "multi_modal_uuids": {"image": ["user-a"]}}
+
+    def hashes(grid: list[int]) -> list[str]:
+        items = [{"mm_embeddings": embedding, "image_grid_thw": grid}]
+        return _attach(processor, inputs,
+                       items)[1]["multimodal_input"].multimodal_hashes
+
+    # Both grids hold the same four rows at a spatial merge size of 2.
+    assert hashes([1, 2, 8]) != hashes([1, 4, 4])
+    assert hashes([1, 2, 8]) == hashes([1, 2, 8])
+
+
 class _NoItemMetadataProcessor(Qwen3VLInputProcessorBase):
 
     def _attach_multimodal_embeddings_impl(

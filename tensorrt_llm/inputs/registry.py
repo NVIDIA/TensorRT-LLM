@@ -50,7 +50,8 @@ from .multimodal import (MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalInput,
                          _find_mm_token_start_pos_from_masks, apply_mm_hashes,
                          attached_embedding_hasher, default_hasher,
                          find_mm_token_lengths, get_multimodal_item_metadata,
-                         hexdigest_to_int32, validate_mm_inputs)
+                         hexdigest_to_int32, split_multimodal_embedding_items,
+                         validate_mm_inputs)
 # yapf: enable
 from .multimodal_data import MEDIA_MODALITIES, _to_host, serialize_item
 from .prefix_token_cache import (OffsetTokenizer, PrefixTokenCache,
@@ -364,8 +365,9 @@ class BaseMultimodalInputProcessor(ABC):
         override `_attach_multimodal_embeddings_impl` (not this wrapper).
 
         The returned `multimodal_input` keys each attached item by the content
-        of its embedding rows, as `apply_mm_hashes` keys media items, so KV-cache
-        reuse matches only identical embeddings.
+        of its embedding rows and of any metadata passed with them, as
+        `apply_mm_hashes` keys media items, so KV-cache reuse matches only
+        identical embeddings.
         """
         if (inputs.get("prompt_token_ids") is not None
                 and inputs.get("prompt") is None
@@ -381,6 +383,7 @@ class BaseMultimodalInputProcessor(ABC):
                     prompt_token_ids,
                     extra_processed_inputs["multimodal_data"],
                     inputs.get("multi_modal_uuids"),
+                    multimodal_embedding,
                 ))
         return prompt_token_ids, extra_processed_inputs
 
@@ -389,6 +392,7 @@ class BaseMultimodalInputProcessor(ABC):
         prompt_token_ids: list[int],
         multimodal_data: dict[str, Any],
         multimodal_uuids: dict[str, list[str | None]] | None,
+        attached_items: dict[str, Any],
     ) -> MultimodalInput:
         """Hash each attached item and locate it in the prompt.
 
@@ -397,6 +401,8 @@ class BaseMultimodalInputProcessor(ABC):
         Attached items are keyed on their embedding slots only: unlike media
         items, `multimodal_lengths` holds each item's row count, and positions
         and runs leave out framing tokens such as Llama 4's tile separators.
+        Metadata passed with an item, such as Qwen-VL's `image_grid_thw`, sets
+        the item's positions, so it is hashed together with the rows.
         The mask's prefix sum is also cached in `multimodal_data`.
 
         Args:
@@ -405,6 +411,8 @@ class BaseMultimodalInputProcessor(ABC):
                 `multimodal_embedding`: one `[rows, hidden]` tensor per item, or
                 all items concatenated along rows.
             multimodal_uuids: Optional user-provided UUIDs per modality.
+            attached_items: The caller's items per modality, as passed to
+                `attach_multimodal_embeddings`.
 
         Returns:
             Hashes, prompt positions, lengths and runs of the attached items.
@@ -422,14 +430,22 @@ class BaseMultimodalInputProcessor(ABC):
             # Copy packed rows to the host once rather than once per item.
             embeddings = torch.split(_to_host(embeddings), item_lengths)
 
+        item_extras = {
+            modality: split_multimodal_embedding_items(items)[1]
+            for modality, items in attached_items.items()
+        }
         # apply_mm_hashes takes each modality's items in modality-local order.
-        rows_by_modality: dict[str, list[torch.Tensor]] = {}
-        for (modality, _), rows in sorted(zip(item_refs,
-                                              embeddings,
-                                              strict=True),
-                                          key=lambda item: item[0]):
-            rows_by_modality.setdefault(modality, []).append(rows)
-        mm_hashes = apply_mm_hashes(rows_by_modality,
+        items_by_modality: dict[str, list[Any]] = {}
+        for (modality, index), rows in sorted(zip(item_refs,
+                                                  embeddings,
+                                                  strict=True),
+                                              key=lambda item: item[0]):
+            # A packed tensor holds several items and no metadata.
+            extras = item_extras.get(modality, [])
+            extra = extras[index] if index < len(extras) else {}
+            item = (rows, extra) if extra else rows
+            items_by_modality.setdefault(modality, []).append(item)
+        mm_hashes = apply_mm_hashes(items_by_modality,
                                     multimodal_uuids,
                                     hash_lib=attached_embedding_hasher)
         hashes = [mm_hashes.hashes[m][i] for m, i in item_refs]
