@@ -1281,6 +1281,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
             and draft_model.supports_greedy_token_reuse
         )
 
+    def _can_backfill_main_kv(self, draft_model) -> bool:
+        return False
+
     def _fork_backfill_projection(
         self, spec_metadata: "DSparkSpecMetadata", num_tokens: int
     ) -> None:
@@ -1317,7 +1320,10 @@ class DSv4DSparkWorker(SpecWorkerBase):
         side.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(side):
             rows = torch.arange(num_tokens, device=captured.device).view(num_gens, width)
-            main_x, kv = draft_model.project_backfill_rows(captured, rows)
+            if self._can_backfill_main_kv(draft_model):
+                main_x, kv = draft_model.project_backfill_rows(captured, rows, all_rows=True)
+            else:
+                main_x, kv = draft_model.project_backfill_rows(captured, rows)
             done = torch.cuda.Event()
             done.record(side)
         self._prep_fork = (spec_metadata, num_gens, width, main_x, kv, done)

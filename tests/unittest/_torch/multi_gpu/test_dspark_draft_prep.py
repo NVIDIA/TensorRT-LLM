@@ -108,13 +108,14 @@ def _check(rank: int, tp_size: int, strategy: str) -> None:
     rows = torch.arange(12, device="cuda").view(2, 6)
     same_kernel = shared.mnnvl_allreduce is not None
 
-    def inline():
+    def inline(all_rows=False):
         main_x = model.project_captured_rows(captured, rows)
-        kv = mxfp8_lowm_linear(main_x[:, :5].reshape(10, -1), *model._backfill_wkv_fp8)
-        return main_x, kv.view(2, 5, -1)
+        width = 6 if all_rows else 5
+        kv = mxfp8_lowm_linear(main_x[:, :width].reshape(2 * width, -1), *model._backfill_wkv_fp8)
+        return main_x, kv.view(2, width, -1)
 
-    def matches_inline(forked):
-        want = inline()
+    def matches_inline(forked, all_rows=False):
+        want = inline(all_rows)
         if same_kernel:
             return all(torch.equal(a, b) for a, b in zip(forked, want))
         return all(error(a, b) < 1e-2 for a, b in zip(forked, want))
@@ -123,7 +124,10 @@ def _check(rank: int, tp_size: int, strategy: str) -> None:
     # all-reduce on another stream; neither all-reduce disturbs the other. As in the CUDA-graph
     # runner, eager calls release their window outputs, which the owned capture then reuses.
     with discard_nccl_window_tensor_outputs(captured):
-        results = [matches_inline(model.project_backfill_rows(captured, rows))]
+        results = [
+            matches_inline(model.project_backfill_rows(captured, rows, all_rows=all_rows), all_rows)
+            for all_rows in (False, True)
+        ]
     side = torch.cuda.Stream()
     other = torch.randn(6, HIDDEN, generator=gen, device="cuda").bfloat16()
     params = AllReduceParams(
@@ -133,30 +137,31 @@ def _check(rank: int, tp_size: int, strategy: str) -> None:
         eps=1e-6,
     )
 
-    def concurrent():
+    def concurrent(all_rows=False):
         side.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(side):
-            forked = model.project_backfill_rows(captured, rows)
+            forked = model.project_backfill_rows(captured, rows, all_rows=all_rows)
         # Whole outputs: the residual may be an NCCL window tensor too.
         reduced = [shared(other, all_reduce_params=params) for _ in range(3)]
         torch.cuda.current_stream().wait_stream(side)
         return forked, reduced
 
-    with discard_nccl_window_tensor_outputs((captured, other)):
-        concurrent()
-    graph = torch.cuda.CUDAGraph()
-    with nccl_window_graph_capture(graph, torch.cuda.graph_pool_handle()):
-        forked, reduced = concurrent()
-    for _ in range(5):
-        captured.copy_(torch.randn(captured.shape, generator=gen, device="cuda").bfloat16())
-        other.copy_(torch.randn(other.shape, generator=gen, device="cuda").bfloat16())
-        graph.replay()
-        with discard_nccl_window_tensor_outputs((captured, other, forked, reduced)):
-            eager = model.project_backfill_rows(captured, rows)
-            results.append(all(torch.equal(a, b) for a, b in zip(forked, eager)))
-            results.append(matches_inline(forked))
-            want = shared(other, all_reduce_params=params)[0]
-            results.append(all(torch.equal(r[0], want) for r in reduced))
+    for all_rows in (False, True):
+        with discard_nccl_window_tensor_outputs((captured, other)):
+            concurrent(all_rows)
+        graph = torch.cuda.CUDAGraph()
+        with nccl_window_graph_capture(graph, torch.cuda.graph_pool_handle()):
+            forked, reduced = concurrent(all_rows)
+        for _ in range(5):
+            captured.copy_(torch.randn(captured.shape, generator=gen, device="cuda").bfloat16())
+            other.copy_(torch.randn(other.shape, generator=gen, device="cuda").bfloat16())
+            graph.replay()
+            with discard_nccl_window_tensor_outputs((captured, other, forked, reduced)):
+                eager = model.project_backfill_rows(captured, rows, all_rows=all_rows)
+                results.append(all(torch.equal(a, b) for a, b in zip(forked, eager)))
+                results.append(matches_inline(forked, all_rows))
+                want = shared(other, all_reduce_params=params)[0]
+                results.append(all(torch.equal(r[0], want) for r in reduced))
     torch.cuda.synchronize()
     assert all(results), results
 

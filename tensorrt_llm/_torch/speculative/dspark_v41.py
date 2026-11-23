@@ -4,9 +4,10 @@
 
 import torch
 
-from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm._utils import is_blackwell_datacenter, prefer_pinned
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX, ReusePolicy
 
+from ..modules.multi_stream_utils import private_stream
 from ..pyexecutor import device_copy
 from .dspark import DSparkSpecMetadata, DSv4DSparkWorker
 
@@ -40,6 +41,14 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
 
     def _allocate_context_storage(self, rows: int, stages: int, window: int, head_dim: int) -> None:
         return None
+
+    def _can_backfill_main_kv(self, draft_model) -> bool:
+        return (
+            is_blackwell_datacenter()
+            and bool(self._draft_kv_buffers)
+            and not self.mapping.enable_attention_dp
+            and draft_model.dspark_model._tp_attention_ready
+        )
 
     def prepare_draft_context(
         self, draft_model, spec_metadata, attn_metadata, resource_manager
@@ -439,10 +448,46 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
                 **projection,
             )
 
+        windows_ready = main_kv = None
         if fork is not None:
             main_x, kv = fork
-            write_backfill(kv=kv)
-            bonus_x = main_x.flatten(0, 1).index_select(0, main_rows)
+            if kv.shape[1] > K:
+                from .dspark_backfill_inputs import main_kv_backfill_inputs
+
+                main = torch.cuda.current_stream()
+                side = private_stream(kv.device.index, "dspark_prep_fork")
+                side.wait_stream(main)
+                with torch.cuda.stream(side):
+                    positions, valid, slots32, start32, bonus_x = main_kv_backfill_inputs(
+                        start_pos,
+                        num_accepted_tokens[num_contexts:batch_size],
+                        slots,
+                        main_rows,
+                        main_x.flatten(0, 1),
+                        kv.shape[1],
+                    )
+                    draft_model.write_context_pages(
+                        None, positions, valid, self._draft_kv_buffers, tables, capacities, kv=kv
+                    )
+                    main_kv = (slots32, start32)
+                    windows_ready = torch.cuda.Event()
+                    windows_ready.record(side)
+                for tensor in (
+                    num_accepted_tokens,
+                    start_pos,
+                    slots,
+                    kv,
+                    main_x,
+                    main_rows,
+                    tables,
+                    capacities,
+                ):
+                    tensor.record_stream(side)
+                for tensor in (bonus_x, *main_kv):
+                    tensor.record_stream(main)
+            else:
+                write_backfill(kv=kv)
+                bonus_x = main_x.flatten(0, 1).index_select(0, main_rows)
         else:
             row_index = torch.cat((interim_rows, main_rows.unsqueeze(1)), dim=1)
             projected = draft_model.project_captured_rows(captured, row_index)
@@ -463,6 +508,8 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
             return_logits=not return_tokens,
             all_rank_num_tokens=all_rank_num_tokens,
             main_x=bonus_x,
+            windows_ready=windows_ready,
+            main_kv=main_kv,
         )
         confidence = draft_output[1]
         if confidence is not None:
