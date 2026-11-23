@@ -398,7 +398,11 @@ approximate bounded replay over the same window. Set
 CED precompute, or when `max_num_tokens` does not exceed the replay window,
 Encoder state stays REQUIRED; an explicit `TRTLLM_V41_ENCODER_REPLAY=1` then
 fails model construction in the first case and is ignored with a warning in the
-second. Set these consistently for all workers. Replay eligibility and output
+second. When Encoder replay and prefix block reuse are enabled, its window must also be at least
+`kv_cache_config.tokens_per_block`; smaller combinations are rejected during
+cache initialization and sizing. With 256-token blocks, set
+`TRTLLM_V41_BOUNDED_REPLAY_TOKENS` to at least 256. Set these consistently for
+all workers. Replay eligibility and output
 requirements can retain full prefill, as described in the [CSA2 implementation guide](../../../tensorrt_llm/_torch/attention/backends/sparse/csa2/README.md).
 
 Validate task accuracy against full prefill on the intended checkpoint before

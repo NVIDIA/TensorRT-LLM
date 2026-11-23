@@ -52,9 +52,11 @@ from tensorrt_llm.quantization.mode import QuantMode
 from ...distributed import cp_allgather
 from ...kimi_k3_cache_policy import get_kimi_k3_fp8_kv_layer_ids, is_kimi_k3
 from ...locality_domain.runtime import LocalityDomainRuntime
-from ...pyexecutor import h2d_cache, step_inputs
+from ...pyexecutor import device_copy, h2d_cache, step_inputs
 from ...pyexecutor.config_utils import is_mla
+from ...pyexecutor.device_copy import CopySite
 from ...pyexecutor.h2d_cache import copy_h2d_pool_shared
+from ...pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
                       get_model_extra_attrs, helix_local_len_tensor)
 from ..kernels.sage_quant import SageQuantized, sage_quantize
@@ -88,6 +90,19 @@ def _has_fp8_context_mla_fmha(sm_version: int) -> bool:
     """Whether MLA context attention with an FP8 or NVFP4 KV cache runs the op's
     FP8 context MLA FMHA on this SM (``mFP8ContextMLA`` in thop/attentionOp.cpp)."""
     return sm_version == 90 or is_sm_100f(sm_version) or is_sm_120f(sm_version)
+
+
+def trtllm_supports_swa_scratch_reuse(sm_version: Optional[int] = None) -> bool:
+    """Whether TRTLLM attention can run with SWA scratch reuse on this GPU.
+
+    Scratch reuse needs per-layer page tables, which keep BAD_PAGE_INDEX for
+    blocks that left the window. The SM90 and SM100-family context kernels
+    load paged KV through TMA, which does not fault on those entries. The
+    fmha_v2 flash kernels used on other GPUs start the KV loop at a tile
+    boundary before the window and dereference every page in that tile.
+    """
+    sm = get_sm_version() if sm_version is None else sm_version
+    return sm == 90 or is_sm_100f(sm)
 
 
 def _resolve_skip_correction_threshold(threshold: float,
@@ -506,6 +521,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         return self.kv_cache_manager.kv_cache_pool_mapping if self.kv_cache_manager is not None else None
 
     def __post_init__(self) -> None:
+        if (isinstance(self.kv_cache_manager, KVCacheManagerV2)
+                and self.kv_cache_manager.enable_swa_scratch_reuse):
+            self._validate_swa_scratch_reuse()
         super().__post_init__()
         self.enable_helix = self.mapping.has_cp_helix(
         ) if self.mapping is not None else False
@@ -522,6 +540,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # Each copy records and restores its own draft swaps.
         self.draft_replay_swapped_attrs = {}
         self._post_init_with_buffers(self.cuda_graph_buffers)
+
+    def _validate_swa_scratch_reuse(self) -> None:
+        """Require context kernels that safely read per-layer scratch page tables."""
+        if not trtllm_supports_swa_scratch_reuse():
+            raise ValueError(
+                "TRTLLM attention supports SWA scratch reuse only on SM90 and "
+                "SM100-family GPUs. Set "
+                "kv_cache_config.enable_swa_scratch_reuse=False.")
 
     def _post_init_with_buffers(self, buffers) -> None:
 
@@ -1401,7 +1427,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             device='cpu',
         )
         self.prompt_lens_cpu[:self.num_seqs].copy_(prompt_lens)
-        if not self._upload_to_device(
+        if device_copy.current() is not None:
+            # The model declares a copy plan, which owns the engine's copies. Never
+            # skipped: CUDA graph metadata of every graph key takes this buffer from
+            # one pool, so no host record proves its device contents.
+            device_copy.copy(CopySite.ATTN_PROMPT_LENS,
+                             self.prompt_lens_cuda[:self.num_seqs],
+                             self.prompt_lens_cpu[:self.num_seqs])
+        elif not self._upload_to_device(
                 "prompt_lens", self.prompt_lens_cuda[:self.num_seqs],
                 self.prompt_lens_cpu[:self.num_seqs], h2d_cache.enabled()):
             copy_h2d_pool_shared(self.prompt_lens_cuda[:self.num_seqs],
@@ -1461,7 +1494,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # the sequence length including the cached tokens and the input tokens.
         self.kv_lens[:self.num_seqs].copy_(
             kv_lens + self.kv_cache_params.num_extra_kv_tokens)
-        if not self._upload_to_device(
+        if device_copy.current() is not None:
+            device_copy.copy(CopySite.ATTN_KV_LENS,
+                             self.kv_lens_cuda[:self.num_seqs],
+                             maybe_pin_memory(kv_lens[:self.num_seqs]))
+        elif not self._upload_to_device(
                 "kv_lens", self.kv_lens_cuda[:self.num_seqs],
                 kv_lens[:self.num_seqs], step_inputs.is_open()):
             step_inputs.copy_(self.kv_lens_cuda[:self.num_seqs],
@@ -1812,7 +1849,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             f"({self.kv_cache_manager.max_seq_len}).")
 
         num_seqs = self.num_seqs
-        copy_h2d_pool_shared(self.prompt_lens_cuda[:num_seqs], prompt_lens)
+        if device_copy.current() is not None:
+            device_copy.copy(CopySite.ATTN_PROMPT_LENS,
+                             self.prompt_lens_cuda[:num_seqs], prompt_lens)
+        else:
+            copy_h2d_pool_shared(self.prompt_lens_cuda[:num_seqs], prompt_lens)
         self.kv_lens_cuda[:num_seqs].copy_(kv_lens, non_blocking=True)
         self.host_total_kv_lens[0] = context_kv_tokens
         self.host_total_kv_lens[1] = generation_kv_tokens
