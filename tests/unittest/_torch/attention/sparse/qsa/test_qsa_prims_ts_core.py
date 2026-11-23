@@ -311,82 +311,23 @@ def test_repeat_runs_skip_wrapper_validation() -> None:
     _requires_prims_ts()
     import tensorrt_llm._torch.attention.backends.prims_ts.q_token_kv_block_sparse_metadata as fi_metadata
 
-    softmax_scale = HEAD_DIM**-0.5
     kwargs = dict(
-        page_size=PAGE_SIZE, max_seq_len_kv=CONTEXT, softmax_scale=softmax_scale, is_decode=False
+        page_size=PAGE_SIZE, max_seq_len_kv=CONTEXT, softmax_scale=HEAD_DIM**-0.5, is_decode=False
     )
     cases = [_make_case([36, 92], seed=60 + i) for i in range(2)]
     # 192 rows need a larger workspace, which drops every plan.
     larger = _make_case([40, 100], seed=70)
     # One K/V cache for every call, so the cases share a plan key.
-    k_cache, v_cache, block_table, metadata = cases[0][1], cases[0][2], cases[0][3], cases[0][8]
-
-    def run(case: tuple, positions_dtype: torch.dtype = torch.int32) -> torch.Tensor:
-        q, _, _, _, block_ids, request_indices, positions, _, _ = case
-        return prims_ts_sparse_gqa(
-            q,
-            k_cache,
-            v_cache,
-            block_table,
-            block_ids,
-            request_indices,
-            positions.to(positions_dtype),
-            **kwargs,
-        )
-
-    def reference(case: tuple) -> torch.Tensor:
-        q, _, _, _, _, request_indices, _, selected_tokens, _ = case
-        return qsa_sparse_gqa_reference(
-            q=q,
-            k_cache=k_cache,
-            v_cache=v_cache,
-            selected_tokens=selected_tokens,
-            request_indices=request_indices,
-            metadata=metadata,
-            softmax_scale=softmax_scale,
-        )
-
-    validated = []
-    wrapper_cls = fi_metadata.QTokenKvBlockSparsePagedTSWrapper
-    original = wrapper_cls.run
-
-    def recorded(self, *args, validate: bool = True, **kw) -> torch.Tensor:
-        validated.append(validate)
-        return original(self, *args, validate=validate, **kw)
-
-    wrapper_cls.run = recorded
-    try:
-        core = prims_ts_core._PrimsTSSparseCore()
-        with mock.patch.object(prims_ts_core, "_CORE", core):
-            outputs = [run(case).clone() for case in cases]
-            run(larger)
-            outputs.append(run(cases[0]).clone())
-            outputs.append(run(cases[1], torch.int64).clone())
-            outputs.append(run(cases[1], torch.int64).clone())
-    finally:
-        wrapper_cls.run = original
-    torch.cuda.synchronize()
-    # Same plan and ABI skips validation. A new plan key, a plan rebuilt after
-    # workspace growth and a changed ABI under one plan each validate again.
-    assert validated == [True, False, True, True, True, False]
-    for out, case in zip(outputs, (cases[0], cases[1], cases[0], cases[1], cases[1])):
-        torch.testing.assert_close(out.float(), reference(case).float(), atol=2e-2, rtol=2e-2)
-
-
-def test_warm_plan_revalidates_on_binding_and_failure() -> None:
-    _requires_prims_ts()
-    import tensorrt_llm._torch.attention.backends.prims_ts.q_token_kv_block_sparse_metadata as fi_metadata
-
-    kwargs = dict(
-        page_size=PAGE_SIZE, max_seq_len_kv=CONTEXT, softmax_scale=HEAD_DIM**-0.5, is_decode=False
-    )
-    q, k_cache, v_cache, block_table, block_ids, request_indices, positions, _, _ = _make_case(
-        [36, 92], seed=80
-    )
+    k_cache, v_cache, block_table = cases[0][1], cases[0][2], cases[0][3]
+    pages = k_cache.shape[0]
 
     def run(
-        k: torch.Tensor, v: torch.Tensor, positions_dtype: torch.dtype = torch.int32
+        case: tuple,
+        positions_dtype: torch.dtype = torch.int32,
+        k: torch.Tensor = k_cache,
+        v: torch.Tensor = v_cache,
     ) -> torch.Tensor:
+        q, _, _, _, block_ids, request_indices, positions, _, _ = case
         return prims_ts_sparse_gqa(
             q,
             k,
@@ -415,41 +356,31 @@ def test_warm_plan_revalidates_on_binding_and_failure() -> None:
     try:
         core = prims_ts_core._PrimsTSSparseCore()
         with mock.patch.object(prims_ts_core, "_CORE", core):
-            run(k_cache, v_cache)
-            run(k_cache, v_cache)
-            # Mixed metadata is rejected before the ABI comparison, without a launch.
-            with pytest.raises(ValueError, match="seq_lens"):
-                prims_ts_sparse_gqa(
-                    q,
-                    k_cache,
-                    v_cache,
-                    block_table,
-                    block_ids,
-                    request_indices,
-                    positions,
-                    seq_lens=torch.ones(2, dtype=torch.int32, device=q.device),
-                    **kwargs,
-                )
-            launches = len(validated)
-            # Same storage, different page geometry: the ABI changes and the wrapper rejects it.
-            pages = k_cache.shape[0]
+            run(cases[0])
+            run(cases[1])
+            run(larger)
+            run(cases[0])
+            run(cases[0], torch.int64)
+            run(cases[0], torch.int64)
+            # Same storage with a new page geometry changes the ABI and is rejected.
             with pytest.raises((ValueError, RuntimeError)):
                 run(
-                    k_cache.view(2 * pages, 1, PAGE_SIZE // 2, HEAD_DIM),
-                    v_cache.view(2 * pages, 1, PAGE_SIZE // 2, HEAD_DIM),
+                    cases[0],
+                    k=k_cache.view(2 * pages, 1, PAGE_SIZE // 2, HEAD_DIM),
+                    v=v_cache.view(2 * pages, 1, PAGE_SIZE // 2, HEAD_DIM),
                 )
-            assert validated[launches:] == [True]
-            # A failed launch after a validated ABI change drops the plan's ABI.
             fail_next.append(True)
             with pytest.raises(RuntimeError, match="injected"):
-                run(k_cache, v_cache, torch.int64)
-            launches = len(validated)
-            run(k_cache, v_cache)
-            run(k_cache, v_cache)
-            assert validated[launches:] == [True, False]
+                run(cases[0])
+            run(cases[0])
+            run(cases[0])
     finally:
         wrapper_cls.run = original
     torch.cuda.synchronize()
+    # Validate once per plan and ABI: a repeat skips, a new plan key, a plan
+    # rebuilt after workspace growth, a changed ABI, a rejected binding and a
+    # failed launch each validate again.
+    assert validated == [True, False, True, True, True, False, True, True, True, False]
 
 
 def test_auto_gates_small_decode_batches() -> None:
@@ -674,6 +605,18 @@ def test_decode_rows_derive_requests_from_seq_lens() -> None:
     with pytest.raises(ValueError, match="seq_lens"):
         prims_ts_sparse_gqa(
             q, k_cache, v_cache, block_table, block_ids, request_indices, positions, **kwargs
+        )
+    with pytest.raises(ValueError, match="seq_lens"):
+        prims_ts_sparse_gqa(
+            q,
+            k_cache,
+            v_cache,
+            block_table,
+            block_ids,
+            request_indices,
+            positions,
+            seq_lens=seq_lens,
+            **{**kwargs, "is_decode": False},
         )
 
 
