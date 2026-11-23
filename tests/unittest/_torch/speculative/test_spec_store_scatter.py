@@ -24,6 +24,7 @@ import pytest
 import torch
 from cuda.bindings import runtime as cudart
 
+from tensorrt_llm._torch.kernels.spec_step_copies.op import slot_scatter_supported
 from tensorrt_llm._torch.pyexecutor.sampler.sampler import TorchSampler
 from tensorrt_llm._torch.speculative import spec_sampler_base as sampler_ops
 from tensorrt_llm._torch.speculative.spec_sampler_base import SpecSampler
@@ -32,6 +33,9 @@ from tensorrt_llm._torch.utils import make_weak_ref
 from tensorrt_llm._utils import CUASSERT, TensorWrapper, convert_to_torch_tensor
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+requires_slot_scatter = pytest.mark.skipif(
+    not slot_scatter_supported(), reason="SlotScatter must be available on the current device"
+)
 
 WIDTH, SLOTS, DRAFT = 6, 8, 5
 
@@ -162,6 +166,7 @@ def test_sample_async_snapshots_the_store_on_the_side_stream(monkeypatch):
         _assert_step(state, scheduled, outputs)
 
 
+@requires_slot_scatter
 def test_side_stream_scatter_from_graph_output_views(monkeypatch):
     sampler = _sampler(monkeypatch)
     sampler.stores_on_side_stream = True
@@ -186,6 +191,7 @@ def test_side_stream_scatter_from_graph_output_views(monkeypatch):
         _assert_step(state, scheduled, eager)
 
 
+@requires_slot_scatter
 def test_graph_output_scatter_under_cuda_malloc_async():
     if torch.cuda.memory.get_allocator_backend() == "cudaMallocAsync":
         pytest.skip("already running under cudaMallocAsync")

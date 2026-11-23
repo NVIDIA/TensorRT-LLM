@@ -5,6 +5,7 @@ recorded batch / block-table key invalidate on any change, and consecutive stead
 the model what forced full passes hand it."""
 
 import types
+from contextlib import nullcontext
 from unittest.mock import Mock, patch
 
 import numpy as np
@@ -17,6 +18,7 @@ from _torch.pyexecutor.engine_test_utils import DummyModel
 import tensorrt_llm
 from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.kernels.spec_step_copies.op import slot_scatter_supported
 from tensorrt_llm._torch.pyexecutor import steady_spec_prepare
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import DecoderInputBuffers
@@ -543,7 +545,7 @@ def _with_output_rows(stored, slots):
     )
 
 
-def _sample_pending_stores(sampler, stored, requests):
+def _sample_stores(sampler, stored, requests):
     """Scatter real sampler outputs in a different order from the next batch."""
     batch = ScheduledRequests()
     batch.generation_requests = list(reversed(requests))
@@ -555,15 +557,11 @@ def _sample_pending_stores(sampler, stored, requests):
         next_draft_tokens=rows.next_draft_tokens,
         native_uniform_verify=True,
     )
-    # Compile the scatter and drain the warmup before delaying the real update.
-    sampler.sample_async(batch, outputs, []).sampler_event.synchronize()
     sampler.store.next_new_tokens.fill_(-1)
     sampler.store.next_draft_tokens.fill_(-1)
     sampler.store.new_tokens_lens.zero_()
-    with torch.cuda.stream(sampler._d2h_side_stream):
-        torch.cuda._sleep(200_000_000)
     state = sampler.sample_async(batch, outputs, [])
-    assert state.device.stores_ready is not None and not state.device.stores_ready.query()
+    assert state.device.stores_ready is not None
     return state.device
 
 
@@ -603,7 +601,7 @@ def test_prepare_inputs_steady_steps_match_forced_full_passes(mode):
     )
     try:
         sampler = None
-        if mode == "tp":
+        if mode == "tp" and slot_scatter_supported():
             sampler = SpecSampler(
                 TorchSampler.Args(
                     max_seq_len=512,
@@ -737,7 +735,17 @@ def test_prepare_inputs_steady_steps_match_forced_full_passes(mode):
                     for request in requests:
                         request.py_batch_idx = None
                 if use_stores:
-                    previous = _sample_pending_stores(sampler, stored, requests)
+                    previous = _sample_stores(sampler, stored, requests)
+                wait_patch = (
+                    patch.object(
+                        torch.cuda.Stream,
+                        "wait_event",
+                        autospec=True,
+                        side_effect=torch.cuda.Stream.wait_event,
+                    )
+                    if use_stores
+                    else nullcontext()
+                )
                 with (
                     patch.object(
                         manager, "copy_batch_block_offsets", wraps=manager.copy_batch_block_offsets
@@ -752,6 +760,7 @@ def test_prepare_inputs_steady_steps_match_forced_full_passes(mode):
                         "stage_steady_inputs",
                         wraps=steady_spec_prepare.stage_steady_inputs,
                     ) as stage,
+                    wait_patch as wait_event,
                 ):
                     prepared = preparer.prepare_inputs(
                         scheduled_requests=batch,
@@ -777,6 +786,7 @@ def test_prepare_inputs_steady_steps_match_forced_full_passes(mode):
                     preparer, inputs, attn_metadata, spec_metadata, len(rows), t
                 )
                 if use_stores:
+                    wait_event.assert_any_call(torch.cuda.current_stream(), previous.stores_ready)
                     expected_ids = stored.new_tokens[:t, previous_slots, 0].T.reshape(-1)
                     expected_drafts = stored.next_draft_tokens[previous_slots, :draft_len].flatten()
                     expected_offsets = stored.new_tokens_lens[previous_slots]

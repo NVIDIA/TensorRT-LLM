@@ -1403,9 +1403,9 @@ class DecoderRunner(ScheduledModelRunner):
 
     @property
     def steady_mtp_reads_output_rows(self) -> bool:
-        """Whether the steady MTP prepare reads the previous step's output rows (``steady_decode_prepare``)."""
+        """Whether steady MTP graph prepare can read the previous step's output rows."""
         steady_mtp = self._inputs._steady_mtp
-        return steady_mtp is not None and steady_mtp.steady_decode_prepare
+        return self._graphs.enabled and steady_mtp is not None and steady_mtp.steady_decode_prepare
 
     @property
     def previous_request_ids(self):

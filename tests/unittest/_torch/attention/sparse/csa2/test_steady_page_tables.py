@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention.backends.sparse.csa2 import kernel
+from tensorrt_llm._torch.attention.backends.sparse.csa2 import cache_manager, kernel
 from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import (
     BAD_PAGE_INDEX,
     CSA2CacheManager,
@@ -796,14 +796,35 @@ def test_full_conversions_order_shared_row_upload_across_streams(monkeypatch):
 
         monkeypatch.setattr(kernel, "convert_page_tables", take_snapshot)
         with torch.cuda.stream(first):
-            torch.cuda._sleep(200_000_000)
             manager.compute_batch_page_tables([1, 2], 0)
-        with torch.cuda.stream(second):
+        first_read_done = manager._base_rows_read[manager._base_rows_slot]
+        operations = Mock()
+        with (
+            torch.cuda.stream(second),
+            patch.object(
+                torch.cuda.Stream,
+                "wait_event",
+                autospec=True,
+                side_effect=torch.cuda.Stream.wait_event,
+            ) as wait_event,
+            patch.object(
+                cache_manager, "copy_host_to_device", wraps=cache_manager.copy_host_to_device
+            ) as upload,
+        ):
+            operations.attach_mock(wait_event, "wait_event")
+            operations.attach_mock(upload, "upload")
             manager.compute_batch_page_tables([2, 1], 0)
+        handoff = [
+            name
+            for name, args, _ in operations.mock_calls
+            if (name == "wait_event" and args == (second, first_read_done))
+            or (name == "upload" and args[1] == "batch_rows")
+        ]
         torch.cuda.current_stream().wait_stream(first)
         torch.cuda.current_stream().wait_stream(second)
         assert len(snapshots) == 1
         torch.testing.assert_close(snapshots[0], expected[..., : snapshots[0].shape[-1]])
+        assert handoff == ["wait_event", "upload"]
     finally:
         for request in active:
             manager.free_resources(request)
