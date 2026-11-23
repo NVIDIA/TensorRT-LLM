@@ -62,10 +62,14 @@ DEVICE = "cuda"
 LOSSLESS_REL_L2 = 0.01
 QUANT_LOSS_BUDGET = {"FP8": 0.05, "FP8_BLOCK_SCALES": 0.05, "NVFP4": 0.1}
 SAGE_LOSS_BUDGET = 0.05
+# Below the error of the same recipe without the compensation of Q and K.
+DECO_LOSS_BUDGET = 0.02
 # The SageAttention recipe the perf sweep uses: int8 Q/K, FP8 V, block sizes 1/16/1.
 SAGE_RECIPE = QuantAttentionConfig(
     qk_dtype="int8", v_dtype="fp8", q_block_size=1, k_block_size=16, v_block_size=1
 )
+# The DeCo-Attention recipe: compensated NVFP4 Q/K, FP8 V.
+DECO_RECIPE = QuantAttentionConfig(qk_dtype="nvfp4", v_dtype="fp8", deco_attention=True)
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -328,6 +332,8 @@ def _assert_attention_backend(model, backend_name: str, quant_attention_config=N
         "CUTEDSL": "CuTeDSLAttention",
         "FA4": "FlashAttn4Attention",
     }[backend_name]
+    if getattr(quant_attention_config, "deco_attention", False):
+        expected = "DeCoAttention"
     assert model.blocks, "No transformer blocks were built"
     for block in model.blocks:
         backend = block.attn1.attn
@@ -370,6 +376,26 @@ def test_sage_attention_loss_budget(checkpoint, dit_inputs):
     _assert_attention_backend(model, "TRTLLM", SAGE_RECIPE)
     scores = _score(lambda case: _run_trtllm(model, case), dit_inputs, reference)
     _assert_within(scores, SAGE_LOSS_BUDGET, f"{EXPERT} SageAttention vs BF16")
+
+
+def test_deco_attention_loss_budget(checkpoint, dit_inputs, require_deco_kernels):
+    """DeCo-Attention against dense BF16 attention on the same block and inputs."""
+    require_deco_kernels(DECO_RECIPE.v_dtype)
+    weights = _block_weights(checkpoint, EXPERT)
+    model = _trtllm_block(checkpoint, EXPERT, weights)
+    reference = {case["name"]: _run_trtllm(model, case) for case in dit_inputs}
+    del model
+    model = _trtllm_block(
+        checkpoint,
+        EXPERT,
+        weights,
+        attention_config=AttentionConfig(backend="CUTEDSL", quant_attention_config=DECO_RECIPE),
+    )
+    _assert_attention_backend(model, "CUTEDSL", DECO_RECIPE)
+    scores = _score(lambda case: _run_trtllm(model, case), dit_inputs, reference)
+    state = model.blocks[0].attn1.attn._metadata_state
+    assert state.get("deco_workspace") is not None, "The DeCo-Attention kernels did not run"
+    _assert_within(scores, DECO_LOSS_BUDGET, f"{EXPERT} DeCo-Attention vs BF16")
 
 
 def _attention_backend_supported(backend: str) -> bool:

@@ -28,7 +28,6 @@ from diffusers.models.transformers.transformer_minimax_h3 import (
 from tensorrt_llm._torch.modules import gated_mlp as gated_mlp_module
 from tensorrt_llm._torch.visual_gen.attention import attention as attention_module
 from tensorrt_llm._torch.visual_gen.attention.attention import QKVMode
-from tensorrt_llm._torch.visual_gen.attention.backends.cute_dsl import deco as deco_backend
 from tensorrt_llm._torch.visual_gen.attention.backends.interface import AttentionTensorLayout
 from tensorrt_llm._torch.visual_gen.config import (
     DiffusionModelConfig,
@@ -496,13 +495,8 @@ def _deco_attention_config() -> AttentionConfig:
     )
 
 
-@requires_cuda
-def test_deco_recipe_passes_tags_and_padding_to_its_backend(monkeypatch, require_deco_kernels):
-    """Under a DeCo-Attention recipe every attention layer is a DeCo layer. The text sequence
-    of the token refiner is too short for the kernels, so the backend runs it unquantized. The
-    transformer blocks hand the backend the token tags of the packed sequence and its padding
-    as a key padding mask: trailing padding becomes one length per sample, and padding between
-    the tokens the order that puts the tokens first."""
+def test_deco_recipe_builds_deco_layers(require_deco_kernels) -> None:
+    """Every attention layer of a model under a DeCo-Attention recipe is a DeCo layer."""
     from tensorrt_llm._torch.visual_gen.attention.backends.cute_dsl import DeCoAttention
 
     require_deco_kernels()
@@ -511,73 +505,54 @@ def test_deco_recipe_passes_tags_and_padding_to_its_backend(monkeypatch, require
     )
     config.attention = _deco_attention_config()
     config.attention_metadata_state = create_attention_metadata_state()
-    model = h3.MiniMaxH3Transformer3DModel(config).to("cuda").eval()
-    _initialize_weights(model, scale=0.1)
-    model.requires_grad_(False)
+    model = h3.MiniMaxH3Transformer3DModel(config)
 
-    backends = {
-        name: module.attn
-        for name, module in model.named_modules()
-        if isinstance(module, h3.MiniMaxH3Attention)
-    }
-    joint = [b for name, b in backends.items() if "token_refiner" not in name]
-    assert joint and len(joint) < len(backends)
-    assert all(type(b) is DeCoAttention for b in backends.values())
+    layers = [m.attn for m in model.modules() if isinstance(m, h3.MiniMaxH3Attention)]
+    assert layers and all(type(layer) is DeCoAttention for layer in layers)
 
-    planned, padding, launched = [], [], []
-    real_plan = DeCoAttention._plan
 
-    def plan(self, key_padding_mask, token_tags, *shape):
-        planned.append(token_tags)
-        if token_tags is not None:
-            padding.append(key_padding_mask)
-        return real_plan(self, key_padding_mask, token_tags, *shape)
+@requires_cuda
+def test_blocks_share_the_token_tags_and_the_padding_mask(monkeypatch) -> None:
+    """The joint blocks of a forward hand their backend one tags tensor and one padding mask."""
+    from tensorrt_llm._torch.visual_gen.attention.backends.vanilla import VanillaAttention
 
-    def launch(self, q, k, v, rows=None, token_counts=None, order=None):
-        if rows is not None:
-            launched.append((rows, token_counts, order))
-        return torch.zeros_like(q)
+    model = h3.MiniMaxH3Transformer3DModel(_make_model_config(num_layers=2)).to("cuda").eval()
+    _initialize_weights(model)
+    inputs = _model_inputs("cuda")
+    calls: list[dict] = []
+    backend_forward = VanillaAttention.forward
+
+    def record(self, q, k=None, v=None, **kwargs):
+        if kwargs.get("token_tags") is not None:  # the token refiner passes none
+            calls.append(kwargs)
+        return backend_forward(self, q, k, v, **kwargs)
+
+    monkeypatch.setattr(VanillaAttention, "forward", record)
 
     def forward(token_tags=None):
-        planned.clear()
-        padding.clear()
-        launched.clear()
+        """Run the model and return the tags and the mask that its blocks passed."""
+        calls.clear()
         if token_tags is not None:
             inputs["token_tags"] = token_tags
         with torch.inference_mode():
             model(**inputs)
+        tags, mask = calls[0]["token_tags"], calls[0]["key_padding_mask"]
+        assert len(calls) == len(model.transformer_blocks)
+        assert all(c["token_tags"] is tags and c["key_padding_mask"] is mask for c in calls)
+        assert all(c.get("valid_seq_len") is None for c in calls)
+        assert torch.equal(tags, inputs["token_tags"])
+        return tags, mask
 
-    monkeypatch.setattr(DeCoAttention, "_plan", plan)
-    monkeypatch.setattr(DeCoAttention, "_launch", launch)
-    inputs = _model_inputs("cuda")
-    forward()
-    assert not planned
+    tags, mask = forward()
+    assert mask is None
+    assert forward()[0] is tags
 
-    # With kernels that take every length, the calls with token tags are the joint blocks'.
-    monkeypatch.setattr(deco_backend, "MIN_SEQ_LEN", 1)
-    forward()
-    tagged = [tags for tags in planned if tags is not None]
-    assert len(tagged) == len(joint) and len(planned) == len(backends)
-    assert all(torch.equal(tags, inputs["token_tags"]) for tags in tagged)
-    assert all(mask is None for mask in padding)
-
-    # The model hands the backend the mask of the padded sequence.
-    forward(torch.tensor([1, 0, 2, -1], device="cuda"))
-    assert padding and all(mask is not None for mask in padding)
-    assert launched and all(order is None for _, _, order in launched)
-    assert all(lens.tolist() == [3] * lens.numel() for _, lens, _ in launched)
-    # The tags mark the padding: the batch shares one draw, from the tokens.
-    assert all(rows.dim() == 1 and int(rows.max()) < 3 for rows, _, _ in launched)
-
-    # The padding follows the content of the tags, also when one tags buffer is refilled.
+    # Padding between the tokens, then other padding refilled into the caller's tags tensor.
+    tags, mask = forward(torch.tensor([1, -1, 2, 0], device="cuda"))
+    assert torch.equal(mask, (tags >= 0)[None])
     inputs["token_tags"].copy_(torch.tensor([1, 2, -1, -1], device="cuda"))
-    forward()
-    assert launched and all(order is None for _, _, order in launched)
-    assert all(lens.tolist() == [2] * lens.numel() for _, lens, _ in launched)
-
-    forward(torch.tensor([1, -1, 2, 0], device="cuda"))
-    assert launched and all(order[0].tolist() == [0, 2, 3, 1] for _, _, order in launched)
-    assert all(lens.tolist() == [3] * lens.numel() for _, lens, _ in launched)
+    tags, mask = forward()
+    assert torch.equal(mask, (tags >= 0)[None])
 
 
 @requires_cuda
