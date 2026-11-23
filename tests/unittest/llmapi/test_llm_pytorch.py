@@ -7,7 +7,7 @@ import pathlib
 import random
 import time
 from contextlib import contextmanager, nullcontext
-from typing import Optional
+from typing import Generator, Optional
 
 import pytest
 
@@ -19,22 +19,21 @@ from tensorrt_llm.llmapi import CacheTransceiverConfig, KvCacheConfig
 from tensorrt_llm.llmapi.llm_args import (NGramDecodingConfig, SchedulerConfig,
                                           WaitingQueuePolicy)
 from tensorrt_llm.metrics import MetricNames
-from tensorrt_llm.sampling_params import SamplingParams
+from tensorrt_llm.sampling_params import EmbeddingBias, SamplingParams
 
 # isort: off
 from .lora_test_utils import (create_mock_nemo_lora_checkpoint,
                               compare_cuda_graph_lora_params_filler,
                               CUDAGraphLoRATestParams,
                               test_lora_with_and_without_cuda_graph)
-from .test_llm import (_test_llm_capture_request_error, get_model_path,
-                       global_kvcache_config, global_kvcache_config_no_reuse,
-                       llama_model_path, llm_get_stats_async_test_harness,
-                       llm_get_stats_test_harness,
-                       llm_return_logprobs_test_harness, llm_test_harness,
-                       prompts, run_llm_abort_request,
-                       sampling_params_for_aborting_request,
-                       run_llm_with_postprocess_parallel_and_result_handler,
-                       tinyllama_logits_processor_test_harness)
+from .test_llm import (
+    _test_llm_capture_request_error, get_model_path, global_kvcache_config,
+    global_kvcache_config_no_reuse, is_idle_heartbeat, llama_model_path,
+    llm_get_stats_async_test_harness, llm_get_stats_test_harness,
+    llm_return_logprobs_test_harness, llm_test_harness, prompts,
+    run_llm_abort_request, sampling_params_for_aborting_request,
+    run_llm_with_postprocess_parallel_and_result_handler,
+    tinyllama_logits_processor_test_harness)
 from utils.util import (force_ampere, similar, skip_gpu_memory_less_than_40gb,
                         skip_gpu_memory_less_than_138gb, skip_ray)
 from utils.llm_data import llm_models_root
@@ -141,11 +140,16 @@ def test_llm_get_stats_with_interval(use_overlap):
 
         records = []
         while True:
-            batch = llm.get_stats(timeout=2)
+            batch = [
+                json.loads(r) if isinstance(r, str) else r
+                for r in llm.get_stats(timeout=2)
+            ]
+            # The idle engine keeps reporting heartbeats; they are not
+            # sampled iterations.
+            batch = [r for r in batch if not is_idle_heartbeat(r)]
             if not batch:
                 break
-            records.extend(
-                json.loads(r) if isinstance(r, str) else r for r in batch)
+            records.extend(batch)
 
     iter_records = [r for r in records if "iter" in r]
     assert iter_records, "expected sampled iteration stats records"
@@ -189,41 +193,36 @@ def test_llm_abort_request(sampling_params):
     run_llm_abort_request(llm=llm, sampling_params=sampling_params)
 
 
-@contextmanager
-def _validate_invalid_token_error_scope():
-    with pytest.raises(RuntimeError) as exc_info:
-        yield
-    assert "Token ID out of range" in str(exc_info.value)
-
-
 @force_ampere
 @pytest.mark.part1
-def test_llm_invalid_input_token():
-    llm = LLM(model=llama_model_path, kv_cache_config=global_kvcache_config)
-    prompts = [
-        [-1],
-    ]
-    # NB: exc_info in _validate_invalid_token_error_scope creates a reference
-    #     to a traceback which outlives the scope of 'exc_info' and prevents
-    #     deletion of 'llm'. However, using the context manager protocol is
-    #     anyways more robust than delegating cleanup to __del__.
-    with llm:
-        with _validate_invalid_token_error_scope():
+class TestLlmInputValidation:
+
+    @pytest.fixture(scope="class")
+    def llm(self) -> Generator[LLM, None, None]:
+        with LLM(model=llama_model_path,
+                 kv_cache_config=global_kvcache_config) as llm:
+            yield llm
+
+    @staticmethod
+    @contextmanager
+    def _validate_invalid_token_error_scope():
+        with pytest.raises(RuntimeError) as exc_info:
+            yield
+        assert "Token ID out of range" in str(exc_info.value)
+
+    @pytest.mark.threadleak(enabled=False)
+    def test_llm_invalid_input_token(self, llm: LLM):
+        prompts = [
+            [-1],
+        ]
+        with self._validate_invalid_token_error_scope():
             llm.generate(
                 prompts,
                 sampling_params=SamplingParams(max_tokens=5),
             )
 
-
-@force_ampere
-@pytest.mark.part0
-def test_llm_invalid_input_token_async():
-    llm = LLM(model=llama_model_path, kv_cache_config=global_kvcache_config)
-    # NB: exc_info in _validate_invalid_token_error_scope creates a reference
-    #     to a traceback which outlives the scope of 'exc_info' and prevents
-    #     deletion of 'llm'. However, using the context manager protocol is
-    #     anyways more robust than delegating cleanup to __del__.
-    with llm:
+    @pytest.mark.threadleak(enabled=False)
+    def test_llm_invalid_input_token_async(self, llm: LLM):
         prompts = [
             [-1],
             [42],
@@ -239,13 +238,65 @@ def test_llm_invalid_input_token_async():
                     ) for submit_idx in submit_order
                 ]
                 for collect_idx in collect_order:
-                    with _validate_invalid_token_error_scope(
+                    with self._validate_invalid_token_error_scope(
                     ) if submit_order[collect_idx] in fail_idx else nullcontext(
                     ):
                         print(
                             f"collect order {collect_order}, collecting {collect_idx}"
                         )
                         futures[collect_idx].result()
+
+    @pytest.mark.threadleak(enabled=False)
+    @pytest.mark.parametrize(
+        "embedding_bias_in, error_regex",
+        [
+            (
+                torch.tensor([1] * 32001, dtype=torch.float32),
+                ".*Length of embedding bias tensor must match vocabulary size \\(151936\\).*",
+            ),
+            (
+                torch.tensor([[1] * 32001, [2] * 32001], dtype=torch.float32),
+                ".*bias\\.value\\(\\)\\.getShape\\(\\)\\.size\\(\\) == 1.*",
+            ),
+            (
+                [[1] * 32001, [2] * 32001],
+                ".*bias\\.value\\(\\)\\.getShape\\(\\)\\.size\\(\\) == 1.*",
+            ),
+            (
+                [1] * 32001,
+                ".*Length of embedding bias tensor must match vocabulary size \\(151936\\).*",
+            ),
+            (
+                ((42, -0.5), (-1, -2.5)),
+                ".*Embedding bias index must be in \\[0, 151935\\].*",
+            ),
+            (
+                ((42, -0.5), (999999, -2.5)),
+                ".*Embedding bias index must be in \\[0, 151935\\].*",
+            ),
+        ],
+    )
+    def test_llm_invalid_embedding_bias(
+        self,
+        embedding_bias_in: torch.Tensor | list[float] | EmbeddingBias,
+        error_regex: str,
+        llm: LLM,
+    ):
+        prompts = [
+            [0],
+        ]
+        with pytest.raises(
+                RuntimeError,
+                match=error_regex,
+        ):
+            llm.generate(
+                prompts,
+                sampling_params=SamplingParams(
+                    max_tokens=5, embedding_bias=embedding_bias_in),
+            )
+
+        # ensure engine remains responsive
+        llm.generate(prompts)
 
 
 @skip_ray
@@ -341,14 +392,19 @@ def test_llm_with_postprocess_parallel_and_result_handler(streaming):
                                                          tp_size=1)
 
 
+@pytest.mark.parametrize("sparse", [True, False])
 @pytest.mark.part0
-def test_embedding_bias_with_torch_sampler_strategies():
+def test_embedding_bias_with_torch_sampler_strategies(sparse: bool):
     """Test embedding bias application in TorchSampler."""
     tokenizer = AutoTokenizer.from_pretrained(llama_model_path)
     biased_word_id = tokenizer.encode("Z", add_special_tokens=False)[-1]
-    vocab_size_padded = AutoConfig.from_pretrained(llama_model_path).vocab_size
-    embedding_bias = torch.zeros(vocab_size_padded)
-    embedding_bias[biased_word_id] = torch.finfo(torch.float32).max
+    if sparse:
+        embedding_bias = ((biased_word_id, torch.finfo(torch.float32).max), )
+    else:
+        vocab_size_padded = AutoConfig.from_pretrained(
+            llama_model_path).vocab_size
+        embedding_bias = torch.zeros(vocab_size_padded)
+        embedding_bias[biased_word_id] = torch.finfo(torch.float32).max
 
     max_tokens = 6
     sampling_kwargs = {
@@ -1321,8 +1377,14 @@ def test_llm_context_only_timed_out_kv_cache_exhausted(sender_future_timeout_ms,
     for output in llm.generate(prompts0, sampling_params=sampling_params):
         print(output)
 
-    # Get number of allocated blocks
-    results = llm.get_stats(2)
+    # Get number of allocated blocks from the request's own iteration. Its
+    # record can trail the response; until then the engine reports idle
+    # heartbeats and zero-duration queue snapshots, which measure nothing.
+    results = []
+    for _ in range(max_retries):
+        results.extend(r for r in llm.get_stats(2) if r["iterLatencyMS"] > 0)
+        if any(r["numCompletedRequests"] for r in results):
+            break
     assert len(results) == 1
     final_used_num_blocks = results[0]["kvCacheStats"]["usedNumBlocks"]
 

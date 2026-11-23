@@ -35,6 +35,8 @@ dump*/
 *.pkl
 *.hdf5
 config.json
+# Eval fixtures of skills published to the NVIDIA skills catalog
+!skills/*/evals/files/**/config.json
 /*.svg
 cpp/cmake-build-*
 cpp/.ccache
@@ -82,7 +84,7 @@ ad-test-workspace/
 *.patch
 !cpp/tensorrt_llm/deep_ep/*.patch
 !3rdparty/patches/*.patch
-!3rdparty/vendor_patches/*.patch
+!**/3rdparty/vendor_patches/*.patch
 examples/disaggregated/slurm/benchmark/logs/
 scripts/attribution/data/checksum_to_paths.yml
 

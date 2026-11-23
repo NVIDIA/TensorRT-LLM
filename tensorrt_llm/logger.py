@@ -376,6 +376,11 @@ class Logger(metaclass=Singleton):
     def level(self) -> str:
         return self._min_severity
 
+    @property
+    def python_logger(self) -> logging.Logger:
+        """The standard-library logger every record goes through, e.g. to add a filter."""
+        return self._logger
+
     def set_level(self, min_severity):
         if self._set_from_env:
             self.warning(

@@ -21,7 +21,6 @@ from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import GroupedGemmInputs
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import PostInitCaller, remove_weights, skip_forward
-from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.modules.mhc.hyper_connection import HCState
 from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
@@ -43,6 +42,9 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
     is_qwen3_hybrid,
     load_pretrained_config,
     unwrap_kimi_text_config,
+)
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.metadata import (
+    resolve_mamba_metadata_cls,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MixedMambaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.model_loader import (
@@ -712,6 +714,8 @@ class Runner:
             if sparse_attention_config is not None
             else None
         )
+        # Resolved as the engine does: the model's class, then the cache manager's.
+        mamba_metadata_cls = resolve_mamba_metadata_cls(self.model, kv_cache_manager)
         attn_metadata = metadata_cls(
             seq_lens=torch.tensor([seq_len_q] * batch_size, dtype=torch.int),
             request_ids=list(range(request_id_begin, request_id_begin + batch_size)),
@@ -736,6 +740,7 @@ class Runner:
             workspace=attn_workspace,
             mapping=self.model_config.mapping,
             sparse_metadata_params=sparse_metadata_params,
+            mamba_metadata_cls=mamba_metadata_cls,
         )
         # One entry per attention-DP rank, not per world rank: the non-DP MoE path
         # asserts len(all_rank_num_tokens) == 1.
@@ -832,7 +837,7 @@ class Runner:
             )
 
         if is_nemotron_hybrid(pretrained_config) or is_qwen3_hybrid(pretrained_config):
-            mamba_metadata = Mamba2Metadata(
+            mamba_metadata = mamba_metadata_cls(
                 attn_metadata.max_num_requests,
                 chunk_size=128
                 if is_qwen3_hybrid(pretrained_config)

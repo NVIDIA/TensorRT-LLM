@@ -17,7 +17,7 @@ context_servers:
     free_gpu_memory_fraction: 0.8
     dtype: fp8
   moe_config:
-    backend: TRTLLM
+    tactic: trtllm_gen
     # Chunk the MoE forward at half of max_num_tokens: the TRTLLM-Gen FP4
     # MoE workspace for a full 16640-token chunk is a 7-8 GiB transient,
     # which exceeds the headroom left after weights (~107.5 GiB/GPU) and the
@@ -46,7 +46,7 @@ generation_servers:
     free_gpu_memory_fraction: 0.8
     dtype: fp8
   moe_config:
-    backend: TRTLLM
+    tactic: trtllm_gen
   cuda_graph_config:
     enable_padding: true
     batch_sizes:

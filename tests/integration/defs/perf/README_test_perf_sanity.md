@@ -222,6 +222,7 @@ There are two modes for perf sanity tests: aggregated (aggr) and disaggregated (
 **File Naming**: `xxx.yaml` where words are connected by `_` (underscore), not `-` (hyphen). The suffix indicates the GPU target:
 - B200 configs: `xxx_blackwell.yaml` (e.g., `deepseek_r1_fp4_v2_blackwell.yaml`)
 - GB200 configs: `xxx_grace_blackwell.yaml` (e.g., `deepseek_r1_fp4_v2_grace_blackwell.yaml`)
+- GR100 (Rubin) configs: `xxx_rubin.yaml` (e.g., `qwen3_8_flash_next_fp4_rubin.yaml`)
 - Multi-node: add `_2_nodes` before the GPU suffix (e.g., `deepseek_r1_fp4_v2_2_nodes_grace_blackwell.yaml`)
 
 **Server Config Rules**:

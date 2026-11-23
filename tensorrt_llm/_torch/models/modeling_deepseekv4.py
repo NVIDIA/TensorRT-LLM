@@ -48,7 +48,7 @@ from transformers import PretrainedConfig
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
-from tensorrt_llm._utils import get_sm_version, is_sm_100f, is_sm_120f
+from tensorrt_llm._utils import get_sm_version, is_blackwell_datacenter, is_sm_100f, is_sm_120f
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -1544,11 +1544,14 @@ class DeepseekV4Gate(nn.Module):
         apply_routing: bool = False,
         moe_backend: str = "CUTLASS",
         has_vl_bias: bool = False,
+        small_m_logit_partials: bool = False,
     ):
         super().__init__()
         self.weight = nn.Parameter(
             torch.empty((num_experts, hidden_size), dtype=dtype), requires_grad=False
         )
+        # The model opted into partials from ``router_logit_partials.SMALL_M_MIN_ROWS`` rows.
+        self.small_m_logit_partials = small_m_logit_partials
         self.moe_backend = moe_backend
         bias_dtype = torch.float32
 
@@ -1615,7 +1618,9 @@ class DeepseekV4Gate(nn.Module):
             # An empty attention-DP peer still joins expert communication, but
             # the router's cuBLAS fallback does not accept an empty GEMM.
             return hidden_states.new_empty((0, self.weight.shape[0]), dtype=torch.float32)
-        if partials and router_partials.applies(hidden_states, self.weight):
+        if partials and router_partials.applies(
+            hidden_states, self.weight, small_m=self.small_m_logit_partials
+        ):
             return router_partials.router_logit_partials(hidden_states, self.weight)
         return router_gemm_autotuned(hidden_states, self.weight)
 
@@ -1708,10 +1713,18 @@ def full_tp_shared_expert_forward(
     x: torch.Tensor, weights, swiglu_limit: Optional[float]
 ) -> torch.Tensor:
     """One rank's piece of the shared expert: its unscaled share of the TP all-reduce's sum."""
-    from ..modules.low_m_gemm import mxfp8_lowm_linear
+    from ..modules.low_m_gemm import mxfp8_lowm_linear, swiglu_out_supported
     from ..modules.swiglu import swiglu
 
     w13, s13, w2, s2 = weights
+    if is_blackwell_datacenter() and swiglu_out_supported(
+        x.shape[0], x.shape[1], w13, swiglu_limit
+    ):
+        # Releases the down GEMM only after x's producer completed (no SwiGLU launch in between).
+        hidden = mxfp8_lowm_linear(
+            x, w13, s13, swiglu_out_limit=swiglu_limit, release_after_wait=True
+        )
+        return mxfp8_lowm_linear(hidden, w2, s2)
     gate_up = mxfp8_lowm_linear(x, w13, s13)
     return mxfp8_lowm_linear(swiglu(gate_up, swiglu_limit=swiglu_limit), w2, s2)
 
@@ -1800,6 +1813,9 @@ class DeepseekV4MoE(nn.Module):
             apply_routing=False,
             moe_backend=model_config.moe_backend,
             has_vl_bias=bool(getattr(config, "use_vision_bias", False)),
+            small_m_logit_partials=bool(
+                model_config.extra_attrs.get("moe_router_partials_small_m", False)
+            ),
         )
         experts_quant_config = self._get_experts_quant_config(model_config, layer_idx)
         if override_quant_config is not None and experts_quant_config is model_config.quant_config:
@@ -3155,8 +3171,12 @@ class DeepseekV4Model(DecoderModel):
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
             )
 
+        prologue = None
         if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
+            prologue = self._fork_prologue(input_ids)
+            inputs_embeds = (
+                prologue.inputs_embeds if prologue is not None else self.embed_tokens(input_ids)
+            )
 
         # Engram and token-dependent routing still need IDs after embedding fusion.
         if input_ids is None:
@@ -3229,6 +3249,9 @@ class DeepseekV4Model(DecoderModel):
             requests=kwargs.get("context_requests"),
         )
         remote_tail_at = self._remote_tail_boundary(attn_metadata)
+        if prologue is not None and (replay_at is not None or remote_tail_at is not None):
+            # A row-changing boundary reads the embedding on this stream.
+            prologue.join(None)
 
         # The layers before the replay boundary may run as one unit (a CUDA graph).
         encoder = self._run_encoder_layers(
@@ -3257,6 +3280,8 @@ class DeepseekV4Model(DecoderModel):
                     dtype=inputs_embeds.dtype,
                     device=inputs_embeds.device,
                 )
+            elif prologue is not None:
+                hidden_states = prologue.join(engram_embeddings_cache)
             else:
                 hidden_states = torch.stack([inputs_embeds] * self.hc_mult, dim=1)
 
@@ -3270,7 +3295,7 @@ class DeepseekV4Model(DecoderModel):
             # a standalone hc_post; a resolved state feeds hc_head directly.
             hc_state = self._init_hc_state(hidden_states)
 
-        engram_kv_cache: dict[int, torch.Tensor] = {}
+        engram_kv_cache: dict[int, Any] = {}
         for idx in range(first_layer, self.num_hidden_layers):
             decoder_layer = self.layers[idx]
             if idx:
@@ -3302,10 +3327,7 @@ class DeepseekV4Model(DecoderModel):
             if engram_embeddings_cache is not None and (
                 spec_metadata is None or (replay_at is None and remote_tail_at is None)
             ):
-                projected = self._precompute_engram_kv(idx, engram_embeddings_cache)
-                if projected is not None:
-                    layer_id, kv = projected
-                    engram_kv_cache[layer_id] = kv
+                engram_kv_cache.update(self._precompute_engram_kv(idx, engram_embeddings_cache))
 
             engram_embeddings = None
             if engram_embeddings_cache is not None and idx in engram_embeddings_cache:
@@ -3388,9 +3410,9 @@ class DeepseekV4Model(DecoderModel):
 
     def _precompute_engram_kv(
         self, layer_idx: int, embeddings: dict[int, torch.Tensor]
-    ) -> tuple[int, torch.Tensor] | None:
-        """Optionally launch a later layer's Engram projection before this layer."""
-        return None
+    ) -> dict[int, Any]:
+        """Launch later layers' Engram projections before this layer, if any: ``{layer_id: kv}``."""
+        return {}
 
     # ------------------------------------------------------------------
     # Bounded-replay boundary hooks
@@ -3486,6 +3508,11 @@ class DeepseekV4Model(DecoderModel):
     # event waits, the PP-rank branch, the layer loop) is identical. Factoring
     # them out keeps V4.1 from having to copy ~90 lines that would then drift.
 
+    def _fork_prologue(self, input_ids: torch.Tensor) -> Any:
+        """None, or the embedding and the stacked residual launched on a side stream: ``inputs_embeds``
+        and ``join(engram_embeddings)``, which returns the residual joined to the current stream."""
+        return None
+
     def _init_hc_state(self, hidden_states: torch.Tensor):
         """Seed the inter-layer mHC state from the ``[N, mult, hidden]`` stream.
 
@@ -3519,6 +3546,8 @@ _DEEPSEEK_V4_SPEC_RUNTIME_HOOKS = RuntimeHooks(
     prioritize_decode_graphs=True,
     loop_on_execution_stream=True,
     prompts_to_owners=True,
+    skip_adp_count_gather=True,
+    skip_verify_row_gather=True,
 )
 
 
@@ -3608,10 +3637,12 @@ class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, Pretrai
             model=self.model_cls(model_config, mapping_with_cp=self.mapping_with_cp),
             model_config=model_config,
         )
-        # FP8 block-scale projections race the small-M kernel against the quantized GEMM.
+        # FP8 block-scale projections race the small-M kernel against the quantized GEMM; on SM107
+        # prefill-sized MXFP8 projections run on the CuTe DSL GEMM.
         for module in self.modules():
             if isinstance(module, Linear):
                 module.use_fp8_small_m_gemm = True
+                module.use_sm107_mxfp8_prefill_gemm = True
         self.logits_processor = self.logits_processor_cls(
             model_config, self.model.hc_head, self.model.norm
         )

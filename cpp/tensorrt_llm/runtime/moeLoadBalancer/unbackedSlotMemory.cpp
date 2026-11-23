@@ -22,9 +22,11 @@
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/nativeMemory.h"
 #include "tensorrt_llm/runtime/memoryCounters.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cuda_runtime_api.h>
 #include <exception>
 #include <utility>
@@ -44,6 +46,34 @@ CUmemAllocationProp slotMemoryProp(int device, bool hostAccessible = false)
     prop.allocFlags.gpuDirectRDMACapable = hostAccessible ? 1 : 0;
     return prop;
 }
+
+// Records the memory of a backed chunk in the native-memory ledger as EPLB device memory, as
+// HostAccessibleDeviceAllocator records the slots it allocates.
+struct SlotMemoryCreator : LocalCreator<>
+{
+    SlotMemoryCreator(int device, bool hostAccessible, size_t size)
+        : LocalCreator<>(slotMemoryProp(device, hostAccessible), size)
+        , mDevice(device)
+    {
+    }
+
+    CUmemGenericAllocationHandle create() override
+    {
+        CUmemGenericAllocationHandle const handle = LocalCreator<>::create();
+        tensorrt_llm::common::recordNativeAllocation(
+            tensorrt_llm::common::nativeMemoryLabels::kEplbDevice, mDevice, static_cast<std::int64_t>(mSize));
+        return handle;
+    }
+
+    void release(CUmemGenericAllocationHandle handle, bool destructing) override
+    {
+        LocalCreator<>::release(handle, destructing);
+        tensorrt_llm::common::recordNativeRelease(
+            tensorrt_llm::common::nativeMemoryLabels::kEplbDevice, mDevice, static_cast<std::int64_t>(mSize));
+    }
+
+    int mDevice;
+};
 
 // Registers the GDRCopy host mapping of a backed chunk with HostAccessibleDeviceAllocator, so EPLB's CPU copies reach
 // the chunk by its device address.
@@ -184,7 +214,7 @@ CUDAVirtualMemoryChunk UnbackedSlotMemory::mapChunk(
     CUDAVirtualMemoryChunk::Configurators configurators;
     if (backed)
     {
-        creator = std::make_unique<LocalCreator<>>(slotMemoryProp(mDevice, hostAccessible), size);
+        creator = std::make_unique<SlotMemoryCreator>(mDevice, hostAccessible, size);
         configurators.push_back(std::make_unique<UnicastConfigurator>(address, size, slotMemoryAccess(mDevice)));
         if (hostAccessible)
         {
