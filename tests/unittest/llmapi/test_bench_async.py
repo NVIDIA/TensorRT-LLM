@@ -467,11 +467,16 @@ async def test_llm_manager_idle_worker_waits_instead_of_polling() -> None:
     # So does a stop. asyncio.wait does not cancel on timeout, so a stop() that
     # no longer wakes the worker fails here.
     stop_task = asyncio.create_task(manager.stop())
-    done, _ = await asyncio.wait({stop_task}, timeout=10)
-    if stop_task not in done:
-        stop_task.cancel()
-    assert stop_task in done, "stop() did not wake the idle worker"
-    assert manager._backend_task.done()
+    try:
+        done, _ = await asyncio.wait({stop_task}, timeout=10)
+        assert stop_task in done, "stop() did not wake the idle worker"
+        stop_task.result()
+        assert manager._backend_task.done()
+    finally:
+        pending = [t for t in (stop_task, manager._backend_task) if not t.done()]
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
 
 
 @pytest.mark.asyncio
