@@ -63,8 +63,8 @@ for as long as that client is unreachable.
 
 A DeepGEMM key hashes the kernel source, the compiler arguments with the
 temporary directory left out, and the contents of the compiler and of
-DeepGEMM's headers. A CuTe DSL name hashes the cache's owner (the runner class,
-or the library cache's name), what names the key
+DeepGEMM's headers. A CuTe DSL name hashes the cache's owner (the runner class
+and a digest of its source file, or the library cache's name), what names the key
 (:meth:`SharedKernelCache._shared_text`: by default its ``repr``, and keys whose
 ``repr`` holds an object address are not shared), the TensorRT-LLM and CuTe DSL
 versions, and the GPU's compute capability.
@@ -82,6 +82,7 @@ interpreter. Modules that only some paths need are imported where they are
 used, to keep the compiler's start-up short.
 """
 
+import functools
 import hashlib
 import os
 import stat
@@ -467,12 +468,35 @@ def share_kernel_caches(runners: Iterable["TunableRunner"]) -> None:
             if cache is None:
                 continue
             if isinstance(cache, dict) and not isinstance(cache, SharedKernelCache):
-                setattr(
-                    cls,
-                    "kernel_cache",
-                    SharedKernelCache(f"{cls.__module__}.{cls.__qualname__}", cache),
-                )
+                owner = f"{cls.__module__}.{cls.__qualname__}|{source_digest(cls)}"
+                setattr(cls, "kernel_cache", SharedKernelCache(owner, cache))
             break
+
+
+def source_digest(obj: Any) -> str:
+    """A digest of the source file that defines ``obj``, for the names of the kernels it
+    compiles: a kernel compiled from another version of the file, which an editable install
+    does not tell by its version, gets another name. Empty when the file cannot be read."""
+    import inspect
+
+    try:
+        path = inspect.getsourcefile(obj)
+        if not path:
+            return ""
+        status = os.stat(path)
+    except (TypeError, OSError):
+        return ""
+    return _file_digest(path, status.st_mtime_ns, status.st_size)
+
+
+@functools.lru_cache(maxsize=None)
+def _file_digest(path: str, mtime_ns: int, size: int) -> str:
+    """The digest of ``path`` as it is at ``mtime_ns`` and ``size``."""
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()[:16]
+    except OSError:
+        return ""
 
 
 def _cute_identity() -> str:

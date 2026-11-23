@@ -310,7 +310,9 @@ During the memory-profiling warmup, ops that opt in build their JIT kernels ahea
 parallel, on worker processes of each rank (KernelBuilder). The workers start only while the
 rank's GPU keeps 8 GiB free, and stop when the warmup ends.
 `TLLM_KERNEL_BUILDER_WORKERS` caps the workers of a rank (default: its share of the CPUs, up
-to 8). `TLLM_KERNEL_BUILDER=0` starts no worker and turns the default sharing directory off:
+to 8). A worker that does not reply to a build within `TLLM_KERNEL_BUILDER_BUILD_TIMEOUT_S`
+seconds (default 900; `0` waits without a limit) is stopped, and that kernel builds where it is
+first used. `TLLM_KERNEL_BUILDER=0` starts no worker and turns the default sharing directory off:
 every kernel then builds where it is first used.
 
 Note that, when `TRTLLM_CACHE_DIR` is set, the FlashInfer workspace isolation

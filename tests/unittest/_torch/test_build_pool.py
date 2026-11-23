@@ -6,6 +6,8 @@ parallel, and the call returns once they have ended; this process then loads the
 The kernels are build_pool_targets.py's picklable stand-ins, so no GPU is needed.
 """
 
+import errno
+import importlib.util
 import os
 import threading
 import time
@@ -323,6 +325,100 @@ def test_new_workers_whose_contexts_do_not_fit_together_build_one_at_a_time(
     assert [result.status for result in results] == ["built", "built"]
 
 
+def test_a_later_batch_starts_the_workers_the_gpu_had_no_room_for(
+    pool: BuildPool, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """While the GPU has room for one worker, that worker builds a batch alone; once the GPU has
+    room, a later batch starts the workers its builds need, however many builds the first worker
+    made."""
+    room = {"workers": 1}
+    monkeypatch.setattr(
+        build_pool, "_gpu_has_room", lambda reserved=0: pool._workers_started < room["workers"]
+    )
+    with pool.pass_scope():
+        first = pool.build([_record(tmp_path / f"r{v}", v) for v in range(3)])
+        assert [result.status for result in first] == ["built"] * 3
+        assert pool._workers_started == 1
+        room["workers"] = 2
+        # Each build waits for the other to start: both end only if two workers run them.
+        a, b = str(tmp_path / "a"), str(tmp_path / "b")
+        second = pool.build([Build(_HOLD, (a, b, 60.0)), Build(_HOLD, (b, a, 60.0))])
+    assert [result.status for result in second] == ["built", "built"]
+    assert pool._workers_started == 2
+
+
+def test_a_worker_that_cannot_start_leaves_no_descriptor_open(
+    pool: BuildPool, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A worker whose start fails part way, here for want of a file for its stderr, closes the
+    pipes it opened, and the pass starts no other: its builds are left to the caller."""
+    starts = []
+
+    def no_file() -> None:
+        starts.append(1)
+        raise OSError(errno.EMFILE, "Too many open files")
+
+    monkeypatch.setattr(build_pool.tempfile, "TemporaryFile", no_file)
+    before = len(os.listdir("/proc/self/fd"))
+    with pool.pass_scope():
+        results = pool.build([_record(tmp_path / "a", 1)]) + pool.build(
+            [_record(tmp_path / "b", 2)]
+        )
+    assert [result.status for result in results] == ["refused", "refused"]
+    assert len(os.listdir("/proc/self/fd")) == before
+    assert len(starts) == 1 and pool._workers_started == 0
+
+
+def test_a_worker_that_stops_replying_is_stopped_and_its_build_fails(
+    pool: BuildPool, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A worker that does not reply within TLLM_KERNEL_BUILDER_BUILD_TIMEOUT_S seconds, stuck in
+    a build here, is stopped and its build fails, so the pass goes on; another worker takes the
+    next build."""
+    monkeypatch.setenv("TLLM_KERNEL_BUILDER_BUILD_TIMEOUT_S", "0")
+    assert build_pool._reply_timeout() is None
+    monkeypatch.setenv("TLLM_KERNEL_BUILDER_BUILD_TIMEOUT_S", "2.5")
+    assert build_pool._reply_timeout() == 2.5
+    monkeypatch.delenv("TLLM_KERNEL_BUILDER_BUILD_TIMEOUT_S")
+    with pool.pass_scope():
+        # A first build with the default limit, which leaves room for the worker's imports.
+        [first] = pool.build([_record(tmp_path / "a", 1)])
+        pool._pool._reply_timeout = 2.0
+        start = time.monotonic()
+        [stuck] = pool.build([Build(f"{targets.__name__}:stall", (600.0,))])
+        waited = time.monotonic() - start
+        # No limit for the next worker, whose first reply waits for its imports.
+        pool._pool._reply_timeout = None
+        [after] = pool.build([_record(tmp_path / "b", 2)])
+    assert first.status == "built"
+    assert stuck.status == "failed" and "did not reply within 2s" in stuck.error
+    assert waited < 60
+    assert after.status == "built" and pool._workers_started == 2
+
+
+def test_the_kernels_of_an_edited_compile_function_file_get_other_names(tmp_path: Path) -> None:
+    """A process_built function's kernels are also named by its file's contents: a kernel
+    compiled from another version of the file, which an editable install does not tell by its
+    version, is not loaded for this one."""
+
+    def store_name(module: str, source: str) -> str:
+        path = tmp_path / f"{module}.py"
+        path.write_text(source)
+        spec = importlib.util.spec_from_file_location(module, path)
+        loaded = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(loaded)
+        return loaded.compile_kernel._compiler.store_name
+
+    source = (
+        "from tensorrt_llm._torch.build_pool import process_built\n\n\n"
+        "@process_built('edited_file_test')\n"
+        "def compile_kernel(value):\n"
+        "    return value\n"
+    )
+    assert store_name("first", source) == store_name("first_again", source)
+    assert store_name("edited", source + "# edited\n") != store_name("first", source)
+
+
 def test_a_kernel_is_the_same_however_a_call_passes_its_arguments(pool: BuildPool) -> None:
     with pool.pass_scope():
         # Two spellings of one kernel: one build.
@@ -380,8 +476,9 @@ def test_ranks_sharing_a_store_build_each_kernel_once(share_dir, monkeypatch):
 
 def _claimed_elsewhere(rank, args):
     """Claim the kernel of ``args`` for another rank, which has not built it."""
-    # The store names a kernel by its call's arguments with the defaults filled in.
-    _, paths = rank._paths(targets.NAME, targets.compile_kernel._compiler.bind(args, {}))
+    compiler = targets.compile_kernel._compiler
+    # The store names a kernel by its function's file and its call's arguments, defaults filled in.
+    _, paths = rank._paths(compiler.store_name, compiler.bind(args, {}))
     os.makedirs(os.path.dirname(paths.claim), exist_ok=True)
     open(paths.claim, "w").close()
     return paths
