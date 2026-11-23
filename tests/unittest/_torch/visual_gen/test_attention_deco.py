@@ -274,11 +274,6 @@ def test_deco_delegates_unsupported_calls(
     assert out.dtype == torch.float16
     assert _relative_error(out, _sdpa(q, k, v)) < 2e-2
 
-    # A delegated call with a valid prefix attends the prefix alone; its padded rows are zero.
-    out = attn.forward(q.half(), k.half(), v.half(), valid_seq_len=200)
-    assert not out[:, 200:].any()
-    assert _relative_error(out[:, :200], _sdpa(q[:, :200], k[:, :200], v[:, :200])) < 2e-2
-
     # A delegated call with a key padding mask attends the tokens; its masked rows are zero.
     key_padding_mask = torch.ones(1, 256, dtype=torch.bool, device=device)
     key_padding_mask[:, 100:156] = False
@@ -286,20 +281,6 @@ def test_deco_delegates_unsupported_calls(
     ref = _sdpa(q, k, v, attn_mask=key_padding_mask[:, None, None, :])
     assert not out[~key_padding_mask].any()
     assert _relative_error(out[key_padding_mask], ref[key_padding_mask]) < 2e-2
-
-    # With both, the call keeps the prefix of the mask.
-    out = attn.forward(
-        q.half(), k.half(), v.half(), key_padding_mask=key_padding_mask, valid_seq_len=200
-    )
-    tokens = key_padding_mask[:, :200]
-    ref = _sdpa(q[:, :200], k[:, :200], v[:, :200], attn_mask=tokens[:, None, None, :])
-    assert not out[:, 200:].any() and not out[:, :200][~tokens].any()
-    assert _relative_error(out[:, :200][tokens], ref[tokens]) < 2e-2
-
-    # Cross-attention keeps all its keys: only the padded query rows are zero.
-    out = attn.forward(q, k[:, :128], v[:, :128], valid_seq_len=200)
-    assert not out[:, 200:].any()
-    assert _relative_error(out[:, :200], _sdpa(q[:, :200], k[:, :128], v[:, :128])) < 2e-2
 
     assert "deco_workspace" not in attn._state
     # The layer notes once, whatever its later calls are delegated for.
@@ -331,8 +312,8 @@ def test_deco_delegates_short_calls(require_deco_kernels, monkeypatch: pytest.Mo
 
 def test_deco_token_tags_draw_the_basis_rows_by_modality(require_deco_kernels) -> None:
     """With the token tags of a packed sequence the preparation takes half of its rows from the
-    text and audio tokens and none from the padding; the rows are drawn once per tags tensor
-    and ``valid_seq_len``. With a ``valid_seq_len`` they come from the tokens of the prefix."""
+    text and audio tokens and none from the padding; the rows are drawn once per tags tensor.
+    With a mask they come from the tokens of the mask."""
     device = require_deco_kernels()
     batch_size, seq_len, num_heads = 1, 4096, 2
     q, k, v = _random_qkv(batch_size, seq_len, num_heads, device, q_scale=4.0)
@@ -390,62 +371,55 @@ def test_deco_token_tags_draw_the_basis_rows_by_modality(require_deco_kernels) -
     beyond[0], last[0] = seq_len + 5, seq_len - 1
     assert torch.equal(_kernels(q, k, v, rows=beyond), _kernels(q, k, v, rows=last))
 
-    # With ``valid_seq_len`` and no mask the rows come from the tokens of the prefix, and
-    # another length gets its own draw.
+    # With a prefix mask the rows come from the tokens of the prefix, and another mask gets
+    # its own draw.
     num_plans = len(state["deco_plans"])
     text_last = torch.zeros(seq_len, dtype=torch.int32, device=device)
     text_last[3000:] = 1  # text at the end; the tags mark no padding
-    for valid_seq_len in (3500, 3100):
-        out = attn.forward(q, k, v, token_tags=text_last, valid_seq_len=valid_seq_len)
-        assert not out[:, valid_seq_len:].any()
+    positions = torch.arange(seq_len, device=device)[None]
+    for num_tokens in (3500, 3100):
+        key_padding_mask = positions < num_tokens
+        out = attn.forward(q, k, v, token_tags=text_last, key_padding_mask=key_padding_mask)
+        assert not out[:, num_tokens:].any()
         rows = state["deco_plans"][0].rows
-        assert rows.dim() == 1 and int(rows.max()) < valid_seq_len
-        assert int((rows >= 3000).sum()) == min(rows.numel() // 2, valid_seq_len - 3000)
+        assert rows.dim() == 1 and int(rows.max()) < num_tokens
+        assert int((rows >= 3000).sum()) == min(rows.numel() // 2, num_tokens - 3000)
     assert len(state["deco_plans"]) == num_plans + 2
 
 
 @pytest.mark.parametrize("v_dtype", V_DTYPES)
-def test_deco_valid_seq_len_attends_the_prefix(require_deco_kernels, v_dtype: str) -> None:
-    """With ``valid_seq_len`` the rows after the prefix are padding: the prefix attends its own
-    keys only, whatever the padding holds, and the padded rows come back zero. A mask whose
-    tokens are that prefix gives the same bits, a mask without padding those of the call
-    without a mask, and a mask with ``valid_seq_len`` those of the rows that both keep."""
+def test_deco_prefix_mask_attends_the_prefix(require_deco_kernels, v_dtype: str) -> None:
+    """With a mask whose tokens are a prefix the rows after it are padding: the prefix attends
+    its own keys only, whatever the padding holds, and the padded rows come back zero. A mask
+    without padding gives the bits of the call without a mask."""
     device = require_deco_kernels(v_dtype)
-    batch_size, seq_len, valid_seq_len, num_heads = 2, 1024, 700, 3
+    batch_size, seq_len, num_tokens, num_heads = 2, 1024, 700, 3
     q, k, v = _random_qkv(batch_size, seq_len, num_heads, device, q_scale=4.0)
     state: dict = {}
     attn = _backend(num_heads, v_dtype, state=state)
 
-    # A prefix that covers the sequence is the call without a length.
-    assert torch.equal(attn.forward(q, k, v, valid_seq_len=seq_len), attn.forward(q, k, v))
-
-    expected = attn.forward(q, k, v, valid_seq_len=valid_seq_len)
+    positions = torch.arange(seq_len, device=device).expand(batch_size, -1)
+    prefix_mask = positions < num_tokens
+    expected = attn.forward(q, k, v, key_padding_mask=prefix_mask)
 
     assert expected.shape == q.shape and expected.dtype == torch.bfloat16
-    assert not expected[:, valid_seq_len:].any()
-    prefix = expected[:, :valid_seq_len]
-    ref = _sdpa(q[:, :valid_seq_len], k[:, :valid_seq_len], v[:, :valid_seq_len])
-    uniform_weights = v[:, :valid_seq_len].float().mean(dim=1, keepdim=True).expand_as(ref)
+    assert not expected[:, num_tokens:].any()
+    prefix = expected[:, :num_tokens]
+    ref = _sdpa(q[:, :num_tokens], k[:, :num_tokens], v[:, :num_tokens])
+    uniform_weights = v[:, :num_tokens].float().mean(dim=1, keepdim=True).expand_as(ref)
     assert _relative_error(prefix, ref) < max(0.5 * _relative_error(uniform_weights, ref), 0.02)
 
-    positions = torch.arange(seq_len, device=device).expand(batch_size, -1)
-    prefix_mask = positions < valid_seq_len
-    assert torch.equal(attn.forward(q, k, v, key_padding_mask=prefix_mask), expected)
     full = torch.ones_like(prefix_mask)
     assert torch.equal(attn.forward(q, k, v, key_padding_mask=full), attn.forward(q, k, v))
-    assert torch.equal(
-        attn.forward(q, k, v, key_padding_mask=positions < 800, valid_seq_len=valid_seq_len),
-        expected,
-    )
-    # Newest first: a prefix mask with a valid_seq_len, a mask without padding, a prefix mask.
+    # Newest first: a mask without padding, a prefix mask.
     plans = state["deco_plans"]
-    assert [plan.token_counts is None for plan in plans] == [False, True, False]
+    assert [plan.token_counts is None for plan in plans] == [True, False]
     assert all(plan.order is None for plan in plans)
 
     # The mask is read once per tensor and content: an in-place change is seen.
-    full[:, valid_seq_len:] = False
+    full[:, num_tokens:] = False
     assert torch.equal(attn.forward(q, k, v, key_padding_mask=full), expected)
-    assert state["deco_plans"][0].token_counts.tolist() == [valid_seq_len] * batch_size
+    assert state["deco_plans"][0].token_counts.tolist() == [num_tokens] * batch_size
 
     # The compaction of a prefix is the prefix: a hole in sample 0 changes that sample only.
     holes = prefix_mask.clone()
@@ -455,20 +429,17 @@ def test_deco_valid_seq_len_attends_the_prefix(require_deco_kernels, v_dtype: st
 
     for padding in (0.0, 1e30, float("nan")):
         for tensor in (q, k, v):
-            tensor[:, valid_seq_len:] = padding
-        out = attn.forward(q, k, v, valid_seq_len=valid_seq_len)
-        assert torch.equal(out[:, :valid_seq_len], prefix)
-        assert not out[:, valid_seq_len:].any()
-
-    with pytest.raises(ValueError, match="valid_seq_len"):
-        attn.forward(q, k, v, valid_seq_len=seq_len + 1)
+            tensor[:, num_tokens:] = padding
+        out = attn.forward(q, k, v, key_padding_mask=prefix_mask)
+        assert torch.equal(out[:, :num_tokens], prefix)
+        assert not out[:, num_tokens:].any()
 
     # A batch element without valid tokens comes back zero, whatever its padding holds.
-    lens = torch.tensor([0, valid_seq_len], dtype=torch.int32, device=device)
+    lens = torch.tensor([0, num_tokens], dtype=torch.int32, device=device)
     out = _kernels(q, k, v, v_dtype, valid_seq_lens=lens)
     assert not out[0].any()
-    assert torch.equal(out[1, :valid_seq_len], prefix[1])
-    assert not out[1, valid_seq_len:].any()
+    assert torch.equal(out[1, :num_tokens], prefix[1])
+    assert not out[1, num_tokens:].any()
 
 
 @pytest.mark.parametrize("v_dtype", V_DTYPES)

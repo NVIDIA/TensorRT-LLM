@@ -226,10 +226,10 @@ def test_deco_joint_blocks_pass_one_mask_and_the_token_tags(monkeypatch, require
     plans, launches = [], []
     real_plan = DeCoAttention._plan
 
-    def plan(self, key_padding_mask, valid_seq_len, token_tags, *shape):
+    def plan(self, key_padding_mask, token_tags, *shape):
         if token_tags is not None:
             plans.append((key_padding_mask, token_tags))
-        return real_plan(self, key_padding_mask, valid_seq_len, token_tags, *shape)
+        return real_plan(self, key_padding_mask, token_tags, *shape)
 
     def launch(self, q, k, v, rows=None, token_counts=None, order=None):
         if rows is not None:

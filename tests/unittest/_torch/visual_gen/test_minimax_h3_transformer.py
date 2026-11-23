@@ -527,11 +527,11 @@ def test_deco_recipe_passes_tags_and_padding_to_its_backend(monkeypatch, require
     planned, padding, launched = [], [], []
     real_plan = DeCoAttention._plan
 
-    def plan(self, key_padding_mask, valid_seq_len, token_tags, *shape):
+    def plan(self, key_padding_mask, token_tags, *shape):
         planned.append(token_tags)
         if token_tags is not None:
-            padding.append((key_padding_mask, valid_seq_len))
-        return real_plan(self, key_padding_mask, valid_seq_len, token_tags, *shape)
+            padding.append(key_padding_mask)
+        return real_plan(self, key_padding_mask, token_tags, *shape)
 
     def launch(self, q, k, v, rows=None, token_counts=None, order=None):
         if rows is not None:
@@ -559,11 +559,11 @@ def test_deco_recipe_passes_tags_and_padding_to_its_backend(monkeypatch, require
     tagged = [tags for tags in planned if tags is not None]
     assert len(tagged) == len(joint) and len(planned) == len(backends)
     assert all(torch.equal(tags, inputs["token_tags"]) for tags in tagged)
-    assert all(mask is None and length is None for mask, length in padding)
+    assert all(mask is None for mask in padding)
 
-    # The backend takes a mask and a length: the model hands it the mask.
+    # The model hands the backend the mask of the padded sequence.
     forward(torch.tensor([1, 0, 2, -1], device="cuda"))
-    assert padding and all(mask is not None and length is None for mask, length in padding)
+    assert padding and all(mask is not None for mask in padding)
     assert launched and all(order is None for _, _, order in launched)
     assert all(lens.tolist() == [3] * lens.numel() for _, lens, _ in launched)
     # The tags mark the padding: the batch shares one draw, from the tokens.
@@ -1038,7 +1038,7 @@ def test_transformer_block_is_fullgraph_compile_safe(
         ("FLASHINFER", True, False, False),
         ("CUTEDSL", False, False, False),
         ("CUDNN", False, False, False),
-        ("DECO", True, True, False),
+        ("DECO", True, False, False),
     ],
 )
 def test_padding_support_tracks_the_capabilities_of_the_attention_backend(
