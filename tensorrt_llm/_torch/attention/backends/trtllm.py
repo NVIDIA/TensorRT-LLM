@@ -52,9 +52,11 @@ from tensorrt_llm.quantization.mode import QuantMode
 from ...distributed import cp_allgather
 from ...kimi_k3_cache_policy import get_kimi_k3_fp8_kv_layer_ids, is_kimi_k3
 from ...locality_domain.runtime import LocalityDomainRuntime
-from ...pyexecutor import h2d_cache, step_inputs
+from ...pyexecutor import device_copy, h2d_cache, step_inputs
 from ...pyexecutor.config_utils import is_mla
+from ...pyexecutor.device_copy import CopySite
 from ...pyexecutor.h2d_cache import copy_h2d_pool_shared
+from ...pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
                       get_model_extra_attrs, helix_local_len_tensor)
 from ..kernels.sage_quant import SageQuantized, sage_quantize
@@ -88,6 +90,19 @@ def _has_fp8_context_mla_fmha(sm_version: int) -> bool:
     """Whether MLA context attention with an FP8 or NVFP4 KV cache runs the op's
     FP8 context MLA FMHA on this SM (``mFP8ContextMLA`` in thop/attentionOp.cpp)."""
     return sm_version == 90 or is_sm_100f(sm_version) or is_sm_120f(sm_version)
+
+
+def trtllm_supports_swa_scratch_reuse(sm_version: Optional[int] = None) -> bool:
+    """Whether TRTLLM attention can run with SWA scratch reuse on this GPU.
+
+    Scratch reuse needs per-layer page tables, which keep BAD_PAGE_INDEX for
+    blocks that left the window. The SM90 and SM100-family context kernels
+    load paged KV through TMA, which does not fault on those entries. The
+    fmha_v2 flash kernels used on other GPUs start the KV loop at a tile
+    boundary before the window and dereference every page in that tile.
+    """
+    sm = get_sm_version() if sm_version is None else sm_version
+    return sm == 90 or is_sm_100f(sm)
 
 
 def _resolve_skip_correction_threshold(threshold: float,
@@ -310,6 +325,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     helix_position_offsets: Optional[torch.Tensor] = None
     helix_position_offsets_cpu: Optional[torch.Tensor] = None
 
+    # Generation-relative logical KV totals, including the current query group.
+    # Unlike kv_lens_cuda, these lengths are global rather than rank-local.
+    helix_global_kv_lens: Optional[torch.Tensor] = None
+    helix_global_kv_lens_cpu: Optional[torch.Tensor] = None
+
     # Whether the current rank is inactive for helix parallelism.
     # In helix parallelism, only the active rank appends KV cache for the query token
     # and attends to the previously cached tokens as well as the query token. Inactive
@@ -501,6 +521,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         return self.kv_cache_manager.kv_cache_pool_mapping if self.kv_cache_manager is not None else None
 
     def __post_init__(self) -> None:
+        if (isinstance(self.kv_cache_manager, KVCacheManagerV2)
+                and self.kv_cache_manager.enable_swa_scratch_reuse):
+            self._validate_swa_scratch_reuse()
         super().__post_init__()
         self.enable_helix = self.mapping.has_cp_helix(
         ) if self.mapping is not None else False
@@ -517,6 +540,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # Each copy records and restores its own draft swaps.
         self.draft_replay_swapped_attrs = {}
         self._post_init_with_buffers(self.cuda_graph_buffers)
+
+    def _validate_swa_scratch_reuse(self) -> None:
+        """Require context kernels that safely read per-layer scratch page tables."""
+        if not trtllm_supports_swa_scratch_reuse():
+            raise ValueError(
+                "TRTLLM attention supports SWA scratch reuse only on SM90 and "
+                "SM100-family GPUs. Set "
+                "kv_cache_config.enable_swa_scratch_reuse=False.")
 
     def _post_init_with_buffers(self, buffers) -> None:
 
@@ -753,6 +784,18 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             )
             self.helix_position_offsets_cpu = torch.empty_like(
                 self.helix_position_offsets,
+                device='cpu',
+                pin_memory=prefer_pinned(),
+            )
+            self.helix_global_kv_lens = self.get_empty(
+                buffers,
+                (self.max_num_sequences, ),
+                cache_name="helix_global_kv_lens",
+                dtype=torch.int,
+                capture_graph=capture_graph,
+            )
+            self.helix_global_kv_lens_cpu = torch.empty_like(
+                self.helix_global_kv_lens,
                 device='cpu',
                 pin_memory=prefer_pinned(),
             )
@@ -1018,6 +1061,20 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.helix_owned_new_tokens_cpu[:batch_size].copy_(
                 torch.tensor(helix_owned_new_tokens, dtype=torch.int))
             self._helix_spec_tokens_valid = True
+        elif (helix_position_offsets is not None
+              and helix_is_inactive_rank is not None
+              and len(helix_position_offsets) == len(helix_is_inactive_rank)
+              and self.helix_global_kv_lens is not None):
+            # Ordinary generation has one exact host-packed position per
+            # request. Speculative totals instead come from the corrected
+            # device positions in recompute_helix_spec_buffers().
+            num_generations = len(helix_position_offsets)
+            torch.add(self.helix_position_offsets_cpu[:num_generations],
+                      1,
+                      out=self.helix_global_kv_lens_cpu[:num_generations])
+            self.helix_global_kv_lens[:num_generations].copy_(
+                self.helix_global_kv_lens_cpu[:num_generations],
+                non_blocking=True)
 
     def _prepare_helix_context_slots(
             self, cached_token_lens: Optional[torch.Tensor]) -> None:
@@ -1081,6 +1138,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
           * helix_position_offsets / helix_local_slots / helix_kv_bounds are
             GENERATION-RELATIVE -- the packing loops only append for extend
             and generation rows, so token 0 is the first generation token.
+            helix_global_kv_lens is likewise generation-relative, one per
+            request rather than one per token.
           * kv_lens_cuda is BATCH-indexed, hence the num_contexts offset on
             the write below.
         """
@@ -1111,7 +1170,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             tokens_per_seq=tokens_per_gen_seq,
             tokens_per_block=self.kv_cache_manager.tokens_per_block,
             cp_size=self.mapping.cp_size,
-            cp_rank=self.mapping.cp_rank)
+            cp_rank=self.mapping.cp_rank,
+            global_kv_lens=(self.helix_global_kv_lens[:num_gen_seqs]
+                            if self.helix_global_kv_lens is not None else None))
 
     def build_locality_domain_block_offsets(
         self,
@@ -1366,7 +1427,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             device='cpu',
         )
         self.prompt_lens_cpu[:self.num_seqs].copy_(prompt_lens)
-        if not self._upload_to_device(
+        if device_copy.current() is not None:
+            # The model declares a copy plan, which owns the engine's copies. Never
+            # skipped: CUDA graph metadata of every graph key takes this buffer from
+            # one pool, so no host record proves its device contents.
+            device_copy.copy(CopySite.ATTN_PROMPT_LENS,
+                             self.prompt_lens_cuda[:self.num_seqs],
+                             self.prompt_lens_cpu[:self.num_seqs])
+        elif not self._upload_to_device(
                 "prompt_lens", self.prompt_lens_cuda[:self.num_seqs],
                 self.prompt_lens_cpu[:self.num_seqs], h2d_cache.enabled()):
             copy_h2d_pool_shared(self.prompt_lens_cuda[:self.num_seqs],
@@ -1426,7 +1494,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # the sequence length including the cached tokens and the input tokens.
         self.kv_lens[:self.num_seqs].copy_(
             kv_lens + self.kv_cache_params.num_extra_kv_tokens)
-        if not self._upload_to_device(
+        if device_copy.current() is not None:
+            device_copy.copy(CopySite.ATTN_KV_LENS,
+                             self.kv_lens_cuda[:self.num_seqs],
+                             maybe_pin_memory(kv_lens[:self.num_seqs]))
+        elif not self._upload_to_device(
                 "kv_lens", self.kv_lens_cuda[:self.num_seqs],
                 kv_lens[:self.num_seqs], step_inputs.is_open()):
             step_inputs.copy_(self.kv_lens_cuda[:self.num_seqs],
@@ -1777,7 +1849,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             f"({self.kv_cache_manager.max_seq_len}).")
 
         num_seqs = self.num_seqs
-        copy_h2d_pool_shared(self.prompt_lens_cuda[:num_seqs], prompt_lens)
+        if device_copy.current() is not None:
+            device_copy.copy(CopySite.ATTN_PROMPT_LENS,
+                             self.prompt_lens_cuda[:num_seqs], prompt_lens)
+        else:
+            copy_h2d_pool_shared(self.prompt_lens_cuda[:num_seqs], prompt_lens)
         self.kv_lens_cuda[:num_seqs].copy_(kv_lens, non_blocking=True)
         self.host_total_kv_lens[0] = context_kv_tokens
         self.host_total_kv_lens[1] = generation_kv_tokens
@@ -3886,6 +3962,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Execute the TRTLLM attention backend."""
         forward_args = merge_attention_forward_args(forward_args, kwargs)
+        forward_args.softmax_stats_is_lse = False
         has_variable_window_starts = (forward_args.variable_window_token_starts
                                       is not None)
         has_variable_window_ends = forward_args.variable_window_token_ends is not None
@@ -4909,10 +4986,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         temp_softmax_stats: torch.Tensor,
         merge_op: torch.Tensor,
         metadata: TrtllmAttentionMetadata,
+        is_lse: bool = False,
     ) -> None:
+        """Merge a partition using one fixed normalizer format for both inputs."""
         assert self.is_mla_enable and self.mla_params is not None
         assert metadata.kv_cache_manager is not None
-
         torch.ops.trtllm.merge_chunked_attention_for_mla(
             merged_attn,
             temp_attn,
@@ -4924,6 +5002,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             merge_op,
             self.num_heads,
             self.mla_params.v_head_dim,
+            is_lse=is_lse,
         )
 
     def sparse_kv_predict(

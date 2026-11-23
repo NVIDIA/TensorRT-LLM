@@ -65,34 +65,49 @@ async def logit_bias_effect_helper(client: Any,
             f'[WARNING] Using fallback token ids {paris_token_ids} for "Paris": {exc}'
         )
 
-    # Test with strong positive bias for 'Paris'
-    logit_bias = {str(token_id): 80 for token_id in paris_token_ids}
+    for include_colliding_keys in [False, True]:
+        # Test with strong positive bias for 'Paris'
+        if include_colliding_keys:
+            logit_bias = {
+                # NB: Space-padded token id precedes actual token id in sort-order, but should
+                #     win here, because it is last in dictionary order.
+                **{
+                    str(token_id): -80
+                    for token_id in paris_token_ids
+                },
+                **{
+                    " " + str(token_id): 80
+                    for token_id in paris_token_ids
+                },
+            }
+        else:
+            logit_bias = {str(token_id): 80 for token_id in paris_token_ids}
 
-    if api_type == 'completions':
-        response = await client.completions.create(
-            model=model_name,
-            prompt='The capital of France is',
-            max_tokens=5,
-            logit_bias=logit_bias,
-            temperature=0.0,
-        )
-        output = response.choices[0].text
-    elif api_type == 'chat':
-        response = await client.chat.completions.create(
-            model=model_name,
-            messages=[{
-                "role": "user",
-                "content": "The capital of France is"
-            }],
-            max_tokens=5,
-            logit_bias=logit_bias,
-            temperature=0.0,
-        )
-        output = response.choices[0].message.content
-    else:
-        raise ValueError(f"Unsupported api_type: {api_type}")
+        if api_type == 'completions':
+            response = await client.completions.create(
+                model=model_name,
+                prompt='The capital of France is',
+                max_tokens=5,
+                logit_bias=logit_bias,
+                temperature=0.0,
+            )
+            output = response.choices[0].text
+        elif api_type == 'chat':
+            response = await client.chat.completions.create(
+                model=model_name,
+                messages=[{
+                    "role": "user",
+                    "content": "The capital of France is"
+                }],
+                max_tokens=5,
+                logit_bias=logit_bias,
+                temperature=0.0,
+            )
+            output = response.choices[0].message.content
+        else:
+            raise ValueError(f"Unsupported api_type: {api_type}")
 
-    assert 'Paris' in output, f"Expected 'Paris' in output with positive logit bias, got: {output}"
+        assert 'Paris' in output, f"Expected 'Paris' in output with positive logit bias, got: {output}"
 
     # Test with strong negative bias for 'Paris'
     logit_bias = {str(token_id): -80 for token_id in paris_token_ids}

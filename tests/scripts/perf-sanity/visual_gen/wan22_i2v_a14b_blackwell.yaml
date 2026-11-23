@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 metadata:
   model_name: Wan2.2-I2V-A14B-Diffusers
   supported_gpus:
@@ -8,7 +11,7 @@ environment:
   server_env_var: TLLM_LOG_LEVEL=info
   client_env_var: ""
 server_configs:
-  - name: wan22_i2v_a14b_nvfp4_trtllm_cfg2_ulysses4
+  - name: wan22_i2v_a14b_nvfp4_sage_cfg2_ulysses4_cg_on
     model_path: Wan-AI/Wan2.2-I2V-A14B-Diffusers
     server_config:
       quant_config:
@@ -16,12 +19,25 @@ server_configs:
         dynamic: true
       attention_config:
         backend: TRTLLM
+        quant_attention_config:
+          qk_dtype: int8
+          v_dtype: fp8
+          q_block_size: 1
+          k_block_size: 16
+          v_block_size: 1
       parallel_config:
-        parallel_vae_size: 8
         cfg_size: 2
         ulysses_size: 4
+        async_ulysses: true
+        parallel_vae_size: 8
+      compilation_config:
+        resolutions:
+        - - 720
+          - 1280
+        num_frames:
+        - 81
       cuda_graph_config:
-        enable: false
+        enable: true
     client_configs:
       - name: 1280x720_81f_40s_con1_i2v
         prompt: A cat walks through a field of flowers
