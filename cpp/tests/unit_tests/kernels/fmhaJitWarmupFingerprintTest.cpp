@@ -158,4 +158,27 @@ TEST(TllmGenFmhaJitWarmupFingerprint, DistinguishesDsv4EpilogueFusion)
     EXPECT_EQ(kernel->jitWarmupFingerprint(fusedWithBuffers, 0), kernel->jitWarmupFingerprint(fused, 0));
 }
 
+TEST(TllmGenFmhaJitWarmupFingerprint, DistinguishesFp16Softmax)
+{
+    // mFp16Softmax selects a different kernel variant (copied to
+    // options.mEnablesFp16Softmax), so a sweep with and without it must not
+    // deduplicate to one.
+    auto const kernel = makeKernel();
+    auto const base = makeParams();
+    auto withFp16Softmax = base;
+    withFp16Softmax.mFp16Softmax = true;
+    EXPECT_NE(kernel->jitWarmupFingerprint(withFp16Softmax, 0), kernel->jitWarmupFingerprint(base, 0));
+}
+
+TEST(TllmGenFmhaJitWarmupFingerprint, DistinguishesHeadDimPerStageKv)
+{
+    // mHeadDimPerStageKv routes through applyCallerOptions and also decides
+    // usesNvrtc, so a sweep with and without it must not deduplicate to one.
+    auto const kernel = makeKernel();
+    auto const base = makeParams();
+    auto withStageKv = base;
+    withStageKv.mHeadDimPerStageKv = 128;
+    EXPECT_NE(kernel->jitWarmupFingerprint(withStageKv, 0), kernel->jitWarmupFingerprint(base, 0));
+}
+
 } // namespace

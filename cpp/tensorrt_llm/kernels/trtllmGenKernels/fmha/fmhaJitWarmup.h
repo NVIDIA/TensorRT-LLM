@@ -135,12 +135,16 @@ public:
         mDrainCv.wait(lock, [this]() { return mNumPendingTasks.load(std::memory_order_acquire) == 0; });
     }
 
-    // Runs every queued task to completion, then stops and joins the worker
-    // thread. Idempotent. Later enqueue() calls return false so callers fall
-    // back to inline execution.
+    // Discards every task still queued, lets the task in flight (if any) finish,
+    // then stops and joins the worker thread. Idempotent. Later enqueue() calls
+    // return false so callers fall back to inline execution. The queue is
+    // dropped rather than run down: at process exit nothing will use the
+    // kernels a queued sweep would compile, and running the rest of a grid
+    // would hold the exit for as long as the sweep itself takes.
     void shutdown()
     {
         std::thread thread;
+        size_t numDiscarded = 0;
         {
             std::unique_lock<std::mutex> lock(mMutex);
             if (mStopRequested)
@@ -148,9 +152,19 @@ public:
                 return;
             }
             mStopRequested = true;
+            numDiscarded = mQueue.size();
+            mQueue.clear();
+            // Each discarded task was counted at enqueue; settle the count so
+            // drain() returns once the in-flight task (if any) is done.
+            mNumPendingTasks.fetch_sub(static_cast<int>(numDiscarded), std::memory_order_acq_rel);
             thread = std::move(mThread);
         }
+        if (numDiscarded > 0)
+        {
+            TLLM_LOG_INFO("TRTLLM-Gen FMHA async JIT warmup: discarded %zu queued sweep(s) at shutdown.", numDiscarded);
+        }
         mQueueCv.notify_all();
+        mDrainCv.notify_all();
         if (thread.joinable())
         {
             thread.join();
@@ -241,17 +255,39 @@ public:
 
     // Registers a sweep. Returns true if an identical sweep is already
     // registered (scheduled, finished, or verified), in which case the caller
-    // must not run it again.
+    // must not run it again. Identity is the fingerprint alone, so the drop is
+    // logged: a fingerprint collision between two distinct sweeps would show
+    // up here as a duplicate, and the startup log is where to look for it.
     bool tryRegister(
         uint64_t fingerprint, TParams const& params, JITWarmupState initialState, int deviceId, TInstance* instance)
     {
         std::lock_guard<std::mutex> lock(mMutex);
         if (mEntries.find(fingerprint) != mEntries.end())
         {
+            TLLM_LOG_INFO("TRTLLM-Gen FMHA JIT warmup: sweep dropped as a duplicate (fingerprint=%llx, device=%d).",
+                static_cast<unsigned long long>(fingerprint), deviceId);
             return true;
         }
         mEntries.emplace(fingerprint, Entry{params, initialState, deviceId, instance});
         return false;
+    }
+
+    // Forgets a sweep whose inline run failed, so that a later request for the
+    // same sweep runs it again instead of being deduplicated against a sweep
+    // that compiled nothing.
+    void forget(uint64_t fingerprint)
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        auto it = mEntries.find(fingerprint);
+        if (it == mEntries.end())
+        {
+            return;
+        }
+        if (it->second.mState == JITWarmupState::kBackgroundDone)
+        {
+            mNumUnverified.fetch_sub(1, std::memory_order_acq_rel);
+        }
+        mEntries.erase(it);
     }
 
     // Moves a scheduled sweep to kBackgroundDone. Called when the background
@@ -377,9 +413,24 @@ JITWarmupScheduleResult scheduleJITWarmupSweep(TRegistry& registry, TllmGenFmhaA
     {
         return JITWarmupScheduleResult::kDuplicate;
     }
+    // An inline sweep that throws is forgotten, so the exception's handler can
+    // request the sweep again and have it run; the queued path keeps its entry
+    // and moves it to kBackgroundDone instead, where the verify pass re-runs it.
+    auto runInline = [&]()
+    {
+        try
+        {
+            runSweep(params, deviceId);
+        }
+        catch (...)
+        {
+            registry.forget(fingerprint);
+            throw;
+        }
+    };
     if (!async)
     {
-        runSweep(params, deviceId);
+        runInline();
         return JITWarmupScheduleResult::kRanInline;
     }
     bool const queued = worker->enqueue(
@@ -400,7 +451,7 @@ JITWarmupScheduleResult scheduleJITWarmupSweep(TRegistry& registry, TllmGenFmhaA
     {
         return JITWarmupScheduleResult::kQueued;
     }
-    runSweep(params, deviceId);
+    runInline();
     registry.markBackgroundDone(fingerprint);
     return JITWarmupScheduleResult::kRanInline;
 }

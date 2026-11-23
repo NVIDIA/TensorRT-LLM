@@ -619,8 +619,13 @@ private:
             // Serialize with the foreground run() path: the export library caches
             // compiled kernels in an unsynchronized global LRU cache. On the
             // background thread this lock is held for the whole compile; see run()
-            // for what that costs the foreground.
-            std::lock_guard<std::mutex> interfaceLock(getFmhaInterfaceMutex());
+            // for what that costs the foreground. With the flag off the sweep runs
+            // inline on the forward thread and skips the lock, as run() does.
+            std::unique_lock<std::mutex> interfaceLock(getFmhaInterfaceMutex(), std::defer_lock);
+            if (asyncJITWarmupEnabled())
+            {
+                interfaceLock.lock();
+            }
             FmhaConfig fmhaConfig = makeNvrtcConfig(options, ctaDim, grid);
             auto const compileStart = std::chrono::steady_clock::now();
             auto const cacheStatus = mFmhaInterface.generateAndCompileKernel(fmhaConfig);
@@ -679,7 +684,8 @@ public:
                 static_cast<uint64_t>(scaleQBits), static_cast<uint64_t>(params.mSparseAttention),
                 static_cast<uint64_t>(params.mSparseTopK), static_cast<uint64_t>(params.mIsSpecDecTree),
                 static_cast<uint64_t>(params.mSpecDecodingTargetMaxGenLen),
-                static_cast<uint64_t>(params.mDsv4EpilogueFusion.enabled)})
+                static_cast<uint64_t>(params.mDsv4EpilogueFusion.enabled), static_cast<uint64_t>(params.mFp16Softmax),
+                static_cast<uint64_t>(params.mHeadDimPerStageKv)})
         {
             fingerprint = combine(fingerprint, value);
         }
@@ -1096,8 +1102,13 @@ public:
             // std::mutex is not fair, so while a sweep is still compiling an
             // acquisition here can wait for one compile, and the background can take
             // the lock back between two of its compiles. The general warmup and
-            // autotuner forwards pay that per NVRTC-path layer per forward.
-            std::lock_guard<std::mutex> interfaceLock(getFmhaInterfaceMutex());
+            // autotuner forwards pay that per NVRTC-path layer per forward. With the
+            // flag off there is no background thread, so this path skips the lock.
+            std::unique_lock<std::mutex> interfaceLock(getFmhaInterfaceMutex(), std::defer_lock);
+            if (asyncJITWarmupEnabled())
+            {
+                interfaceLock.lock();
+            }
             FmhaConfig fmhaConfig = makeNvrtcConfig(options, ctaDim, grid);
             auto const compileStart = std::chrono::steady_clock::now();
             auto const cacheStatus = mFmhaInterface.generateAndCompileKernel(fmhaConfig);
@@ -1207,6 +1218,12 @@ private:
     std::tuple<int32_t, int32_t, int32_t> computeNumCtasSerialized(
         FmhaOptions& options, int32_t multiProcessorCount) const
     {
+        // Only the background warmup thread can race this; with the flag off every caller is
+        // the forward thread, so the per-layer, per-step path skips the lock.
+        if (!asyncJITWarmupEnabled())
+        {
+            return computeNumCtas(options, multiProcessorCount);
+        }
         std::lock_guard<std::mutex> selectionLock(getFmhaSelectionMutex());
         return computeNumCtas(options, multiProcessorCount);
     }
@@ -1321,8 +1338,14 @@ private:
         FmhaOptions options, FmhaOptionsFromArgs optionsFromArgs, int32_t multiProcessorCount) const
     {
         // Kernel selection mutates and then queries the autotuner's shared dummy kernel; the
-        // background JIT warmup thread runs this same path. See getFmhaSelectionMutex().
-        std::lock_guard<std::mutex> selectionLock(getFmhaSelectionMutex());
+        // background JIT warmup thread runs this same path. See getFmhaSelectionMutex(). With
+        // the flag off there is no background thread, so the per-layer, per-step path skips
+        // the lock.
+        std::unique_lock<std::mutex> selectionLock(getFmhaSelectionMutex(), std::defer_lock);
+        if (asyncJITWarmupEnabled())
+        {
+            selectionLock.lock();
+        }
         configurePaddedMlaTile(options, optionsFromArgs);
 
         // CGA SMEM reduction cluster limits are Rubin SM107-specific; clamping on SM100/SM103

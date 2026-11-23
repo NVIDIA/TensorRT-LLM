@@ -135,7 +135,7 @@ TEST(TllmGenFmhaAsyncWarmupWorker, FailingTaskDoesNotStrandTheQueue)
     EXPECT_TRUE(secondRan);
 }
 
-TEST(TllmGenFmhaAsyncWarmupWorker, ShutdownWithPendingWorkFinishesItThenRejectsNewWork)
+TEST(TllmGenFmhaAsyncWarmupWorker, ShutdownDiscardsQueuedWorkButFinishesInFlight)
 {
     TllmGenFmhaAsyncWarmupWorker worker;
     std::atomic<int> numRan{0};
@@ -149,14 +149,14 @@ TEST(TllmGenFmhaAsyncWarmupWorker, ShutdownWithPendingWorkFinishesItThenRejectsN
     ASSERT_TRUE(worker.enqueue([&]() { ++numRan; }));
     EXPECT_FALSE(worker.isShutDown());
 
-    // shutdown() must wait for the queued work rather than drop it.
+    // shutdown() lets the in-flight task finish but discards the queued one.
     std::thread shutdownThread([&]() { worker.shutdown(); });
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     EXPECT_EQ(numRan, 0);
     gate.open();
     shutdownThread.join();
 
-    EXPECT_EQ(numRan, 2);
+    EXPECT_EQ(numRan, 1);
     EXPECT_EQ(worker.numPendingTasks(), 0);
     EXPECT_TRUE(worker.isShutDown());
 
@@ -357,13 +357,17 @@ struct Scheduler
     std::atomic<int> mForegroundSweeps{0};
 
     JITWarmupScheduleResult schedule(uint64_t fingerprint, FakeParams const& params, FakeKernel* kernel,
-        bool failInBackground, bool async = true, int deviceId = 0)
+        bool failInBackground, bool async = true, int deviceId = 0, bool failInline = false)
     {
         return scheduleJITWarmupSweep(mRegistry, async ? &mWorker : nullptr, fingerprint, params, deviceId, kernel,
-            [this, failInBackground](FakeParams const&, int)
+            [this, failInBackground, failInline](FakeParams const&, int)
             {
                 if (std::this_thread::get_id() == mMainThread)
                 {
+                    if (failInline)
+                    {
+                        throw std::runtime_error("inline nvrtc failed");
+                    }
                     ++mForegroundSweeps;
                     return;
                 }
@@ -451,6 +455,23 @@ TEST(TllmGenFmhaJitWarmupProtocol, SyncModeRunsInlineAndStillDeduplicates)
     // Nothing for the barrier to verify.
     EXPECT_EQ(scheduler.drainAndVerifyAll(), 0);
     EXPECT_EQ(scheduler.mBackgroundSweeps, 0);
+}
+
+TEST(TllmGenFmhaJitWarmupProtocol, InlineFailureIsForgottenAndCanBeRetried)
+{
+    // An inline sweep that throws is forgotten, so a later request for the same
+    // sweep runs it again instead of being deduplicated against a sweep that
+    // compiled nothing.
+    Scheduler scheduler;
+    FakeKernel kernel{1};
+    EXPECT_THROW(scheduler.schedule(0xA, FakeParams{4, 1024}, &kernel, false, /*async=*/false, /*deviceId=*/0,
+                     /*failInline=*/true),
+        std::runtime_error);
+    EXPECT_FALSE(scheduler.mRegistry.state(0xA).has_value());
+    EXPECT_EQ(scheduler.schedule(0xA, FakeParams{4, 1024}, &kernel, false, /*async=*/false),
+        JITWarmupScheduleResult::kRanInline);
+    EXPECT_EQ(scheduler.mForegroundSweeps, 1);
+    EXPECT_EQ(scheduler.mRegistry.state(0xA), JITWarmupState::kVerified);
 }
 
 TEST(TllmGenFmhaJitWarmupProtocol, BackgroundSweepRunsOnItsOwnDevice)
