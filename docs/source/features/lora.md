@@ -101,20 +101,16 @@ outputs = llm.generate(
 
 ### LoRA with Quantization
 
+Load a pre-quantized FP8 base checkpoint compatible with the adapter. The model's
+quantization is read from the checkpoint; use `KvCacheConfig` to select the KV-cache
+dtype separately. See [Quantization](quantization.md) for preparing a checkpoint.
+
 ```python
-from tensorrt_llm.models.modeling_utils import QuantConfig
-from tensorrt_llm.quantization.mode import QuantAlgo
+from tensorrt_llm.llmapi import KvCacheConfig
 
-# Configure quantization
-quant_config = QuantConfig(
-    quant_algo=QuantAlgo.FP8,
-    kv_cache_quant_algo=QuantAlgo.FP8
-)
-
-# LoRA works with quantized models
 llm = LLM(
-    model="/path/to/model",
-    quant_config=quant_config,
+    model="/path/to/fp8/model",
+    kv_cache_config=KvCacheConfig(dtype="fp8"),
     lora_config=lora_config
 )
 ```
