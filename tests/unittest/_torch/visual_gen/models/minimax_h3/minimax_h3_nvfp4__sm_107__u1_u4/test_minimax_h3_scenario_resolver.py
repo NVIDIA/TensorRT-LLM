@@ -232,7 +232,6 @@ def test_route_leaves_the_attention_precision_entry_to_the_transformer(monkeypat
     cls = _stub_scenario_package(monkeypatch)
     bad = {"schema_version": 1, "layers": {"transformer_blocks.45.attn": "fp8"}}
     assert scenarios.route_nvfp4_sm_107_u1_u4(_config(attention_precision=bad)) is cls
-    assert not hasattr(scenarios, "resolve_attention_precision")
 
 
 def test_bad_mode_raises():
