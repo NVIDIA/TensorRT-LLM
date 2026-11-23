@@ -2755,11 +2755,12 @@ class KvCacheCreator:
 
     def _get_embedded_draft_layer_specs(self):
         """Describe the context KV read by the embedded CSA2 DSpark drafter."""
+        if getattr(getattr(self, "_sparse_attention_config", None), "algorithm",
+                   None) != "csa2":
+            return ()
         spec = self._speculative_config
         if (spec is None or not spec.spec_dec_mode.is_dspark()
-                or not spec.draft_is_embedded_in_target
-                or getattr(getattr(self, "_sparse_attention_config", None),
-                           "algorithm", None) != "csa2"):
+                or not spec.draft_is_embedded_in_target):
             return ()
         if not self._is_kv_cache_manager_v2:
             raise ValueError(
