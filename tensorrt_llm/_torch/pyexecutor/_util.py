@@ -2847,6 +2847,19 @@ class KvCacheCreator:
             if setting is None and not self._kv_cache_manager_hosts_draft_layers(
             ):
                 return "this cache manager requires opting in to shared draft KV"
+        elif (self._kv_cache_manager_cls is KVCacheManagerV2
+              and self._speculative_config.spec_dec_mode.is_dflash()):
+            setting = os.environ.get("TRTLLM_AGG_SHARED_DRAFT_KV")
+            if setting not in (None, "0", "1"):
+                raise ValueError(
+                    f"Invalid TRTLLM_AGG_SHARED_DRAFT_KV={setting!r}: "
+                    "expected '0', '1', or an unset variable.")
+            if setting == "0":
+                return "TRTLLM_AGG_SHARED_DRAFT_KV='0' selects a separate draft cache"
+            if setting is None and not getattr(self._model_engine.model,
+                                               "transfers_draft_kv_cache",
+                                               False):
+                return "the target has not opted in to shared draft KV"
         return None
 
     def _kv_cache_manager_hosts_draft_layers(self) -> bool:

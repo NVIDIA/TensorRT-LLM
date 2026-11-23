@@ -43,7 +43,8 @@ _SHARED_DRAFT_KV_ENV = "TRTLLM_DISAGG_SHARED_DRAFT_KV"
 
 @pytest.fixture(autouse=True)
 def _shared_draft_kv_allowed(monkeypatch):
-    # Tests of the layout rules assume a launcher that allows sharing.
+    # Exercise layout eligibility with sharing enabled in both serving modes.
+    monkeypatch.setenv("TRTLLM_AGG_SHARED_DRAFT_KV", "1")
     monkeypatch.setenv(_SHARED_DRAFT_KV_ENV, "1")
 
 
@@ -115,6 +116,49 @@ def _creator(*, is_disagg, target, draft, tp_size=1, draft_windows=None):
     creator._is_disagg = is_disagg
     creator._get_draft_kv_model_config = lambda: draft
     return creator
+
+
+@pytest.mark.parametrize("setting", [None, "0", "1"])
+@pytest.mark.parametrize("model_opt_in", [False, True])
+def test_aggregated_dflash_cache_policy(monkeypatch, setting, model_opt_in):
+    if setting is None:
+        monkeypatch.delenv("TRTLLM_AGG_SHARED_DRAFT_KV")
+    else:
+        monkeypatch.setenv("TRTLLM_AGG_SHARED_DRAFT_KV", setting)
+    # Cover the reviewer's mixed FP8/BF16 layout as well as Beam's matched FP8 caches.
+    target = _model_config(kv_heads=8, head_dim=128, kv_quant_algo=QuantAlgo.FP8)
+    draft = _model_config(
+        kv_heads=8, head_dim=128, kv_quant_algo=QuantAlgo.FP8 if model_opt_in else None
+    )
+    creator = _creator(is_disagg=False, target=target, draft=draft)
+    if model_opt_in:
+        creator._model_engine.model.transfers_draft_kv_cache = True
+        target.pretrained_config.num_hidden_layers = 52
+        draft.pretrained_config.num_hidden_layers = 5
+        creator._mapping.tp_size = 4
+        creator._max_seq_len = creator._unification_max_seq_len = 8192
+        draft.pretrained_config.layer_types = ["sliding_attention"] * 5
+        draft.pretrained_config.sliding_window = 4096
+        # Use the checkpoint's window through the production resolver.
+        del creator._get_draft_max_attention_window
+    shared = model_opt_in if setting is None else setting == "1"
+    creator._sparse_attention_config = None
+    creator._speculative_config._use_shared_kv_cache = False
+    creator._speculative_config.spec_dec_mode.use_one_engine = lambda: True
+    creator._speculative_config.spec_dec_mode.is_sa = lambda: False
+    assert creator._should_unify_dflash_kv_cache() is shared
+    assert creator._should_create_separate_draft_kv_cache() is (not shared)
+    specs = creator._build_unified_dflash_layer_specs(creator._kv_cache_config)
+    if shared:
+        n_target = target.pretrained_config.num_hidden_layers
+        n_draft = draft.pretrained_config.num_hidden_layers
+        assert [spec.global_layer_id for spec in specs] == list(range(n_target + n_draft))
+        if model_opt_in:
+            assert [spec.sliding_window_size for spec in specs[n_target:]] == [4096] * n_draft
+        draft_dtype = DataType.FP8 if model_opt_in else DataType.BF16
+        assert [spec.dtype for spec in specs] == [DataType.FP8] * n_target + [draft_dtype] * n_draft
+    else:
+        assert specs == ()
 
 
 @pytest.mark.parametrize("is_disagg", [False, True])
