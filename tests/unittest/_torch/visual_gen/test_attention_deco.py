@@ -346,7 +346,7 @@ def test_deco_token_tags_draw_the_basis_rows_by_modality(require_deco_kernels) -
     out = attn.forward(q, k, v, token_tags=token_tags)
 
     (plan,) = state["deco_plans"]
-    assert plan.tags is token_tags and not plan.captured
+    assert plan.token_tags is token_tags and not plan.captured
     rows = plan.rows
     drawn = token_tags[rows.long()]
     assert (drawn >= 0).all()
@@ -439,13 +439,13 @@ def test_deco_valid_seq_len_attends_the_prefix(require_deco_kernels, v_dtype: st
     )
     # Newest first: a prefix mask with a valid_seq_len, a mask without padding, a prefix mask.
     plans = state["deco_plans"]
-    assert [plan.valid_seq_lens is None for plan in plans] == [False, True, False]
+    assert [plan.token_counts is None for plan in plans] == [False, True, False]
     assert all(plan.order is None for plan in plans)
 
     # The mask is read once per tensor and content: an in-place change is seen.
     full[:, valid_seq_len:] = False
     assert torch.equal(attn.forward(q, k, v, key_padding_mask=full), expected)
-    assert state["deco_plans"][0].valid_seq_lens.tolist() == [valid_seq_len] * batch_size
+    assert state["deco_plans"][0].token_counts.tolist() == [valid_seq_len] * batch_size
 
     # The compaction of a prefix is the prefix: a hole in sample 0 changes that sample only.
     holes = prefix_mask.clone()
@@ -530,7 +530,7 @@ def test_deco_key_padding_mask_attends_the_tokens(require_deco_kernels, v_dtype:
         assert not out[0].any() and not out[1, 900:].any()
         assert torch.isfinite(out).all()
         assert _relative_error(out[1, :900], ref) < 0.2
-    (rows,) = [plan.rows for plan in state["deco_plans"] if plan.tags is token_tags]
+    (rows,) = [plan.rows for plan in state["deco_plans"] if plan.token_tags is token_tags]
     assert rows.shape[0] == batch_size and (rows[1] < 900).all()
     # The draw of sample 1 keeps its rows, half of them text, next to the empty sample.
     assert int((rows[1] >= 800).sum()) == rows.shape[1] // 2
@@ -584,7 +584,7 @@ def test_deco_token_tags_with_a_key_padding_mask(require_deco_kernels) -> None:
     out = attn.forward(q, k, v, token_tags=token_tags, key_padding_mask=key_padding_mask)
 
     plan = state["deco_plans"][0]
-    assert plan.tags is token_tags and plan.mask is key_padding_mask
+    assert plan.token_tags is token_tags and plan.key_padding_mask is key_padding_mask
     rows = plan.rows
     assert rows.shape[0] == batch_size
     assert (rows < lengths[:, None]).all()
@@ -600,7 +600,7 @@ def test_deco_token_tags_with_a_key_padding_mask(require_deco_kernels) -> None:
 
 @pytest.mark.parametrize("v_dtype", V_DTYPES)
 def test_deco_cuda_graph_with_a_key_padding_mask(require_deco_kernels, v_dtype: str) -> None:
-    """A captured forward with a mask computes the lengths and the order of the tokens inside
+    """A captured forward with a mask computes the counts and the order of the tokens inside
     the graph: a replay follows the content of the mask tensor of the capture. A capture takes
     the basis rows that an eager forward drew for the token tags, also when its mask tensor is
     another object than the mask of that forward."""

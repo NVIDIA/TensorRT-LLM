@@ -533,9 +533,9 @@ def test_deco_recipe_passes_tags_and_padding_to_its_backend(monkeypatch, require
             padding.append((key_padding_mask, valid_seq_len))
         return real_plan(self, key_padding_mask, valid_seq_len, token_tags, *shape)
 
-    def launch(self, q, k, v, rows=None, valid_seq_lens=None, order=None):
+    def launch(self, q, k, v, rows=None, token_counts=None, order=None):
         if rows is not None:
-            launched.append((rows, valid_seq_lens, order))
+            launched.append((rows, token_counts, order))
         return torch.zeros_like(q)
 
     def forward(token_tags=None):

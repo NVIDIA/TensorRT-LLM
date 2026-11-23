@@ -231,9 +231,9 @@ def test_deco_joint_blocks_pass_one_mask_and_the_token_tags(monkeypatch, require
             plans.append((key_padding_mask, token_tags))
         return real_plan(self, key_padding_mask, valid_seq_len, token_tags, *shape)
 
-    def launch(self, q, k, v, rows=None, valid_seq_lens=None, order=None):
+    def launch(self, q, k, v, rows=None, token_counts=None, order=None):
         if rows is not None:
-            launches.append((q.shape[1], rows, valid_seq_lens, order))
+            launches.append((q.shape[1], rows, token_counts, order))
         return torch.zeros_like(q)
 
     def forward(image_embeds):
@@ -258,14 +258,14 @@ def test_deco_joint_blocks_pass_one_mask_and_the_token_tags(monkeypatch, require
     assert len(launches) == len(model.transformer_blocks)
     mask, tags = plans[0]
     assert all(m is mask and t is tags for m, t in plans)
-    seq_len, rows, valid_seq_lens, order = launches[0]
+    seq_len, rows, token_counts, order = launches[0]
     num_video = seq_len - text.shape[1] - text_2.shape[1] - image_embeds.shape[1]
     assert order is None
-    assert valid_seq_lens.tolist() == [num_video + int(n) for n in num_text]
+    assert token_counts.tolist() == [num_video + int(n) for n in num_text]
     assert (tags[:num_video] == 0).all() and (tags[num_video:] > 0).all()
     # Every sample draws from its own tokens, video and text.
     assert rows.shape[0] == 2
-    assert (rows < valid_seq_lens[:, None]).all()
+    assert (rows < token_counts[:, None]).all()
     assert ((rows >= num_video).sum(dim=1) > 0).all()
     assert ((rows < num_video).sum(dim=1) > 0).all()
 
