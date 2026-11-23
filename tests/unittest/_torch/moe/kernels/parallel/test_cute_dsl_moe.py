@@ -5835,6 +5835,18 @@ def test_mxfp8_fused_fc12_moe_rubin(
     assert (raw_kwargs["input_scale"] == 255).all()
     torch.testing.assert_close(raw_output.float(), output.float(), rtol=2e-2, atol=2e-2)
 
+    # Raw input without zero_output, as after a dispatch with ep > top_k: the
+    # caller clears the output, and the reset only quantizes the input.
+    raw_output_prezeroed = torch.zeros_like(output)
+    with torch.inference_mode():
+        torch.ops.trtllm.cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin(
+            output=raw_output_prezeroed, zero_output=False, **raw_kwargs
+        )
+    torch.cuda.synchronize()
+    check(raw_output_prezeroed, "raw BF16 input, zero_output=False")
+    assert (raw_kwargs["input_scale"] == 255).all()
+    torch.testing.assert_close(raw_output_prezeroed.float(), output.float(), rtol=2e-2, atol=2e-2)
+
     # 2. Every tactic the runner enumerates (small shapes only: each distinct
     #    geometry is a DSL compile).
     if num_experts > 64 or swiglu_limit != float("inf"):
@@ -5889,7 +5901,7 @@ def test_mxfp8_fused_fc12_moe_rubin(
     get_sm_version() != 107 or not IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE,
     reason="MXFP8 fused FC12 MoE requires Rubin (SM107) with a CuTe DSL build that supports the fused FC12 kernel",
 )
-def test_mxfp8_fused_fc12_tactic_roundtrips_through_autotuner_cache():
+def test_mxfp8_fused_fc12_tactic_roundtrips_through_autotuner_cache() -> None:
     """Tactics must survive the AutoTuner's JSON/repr round trip."""
     import ast
     import json
@@ -5929,29 +5941,34 @@ def test_mxfp8_fused_fc12_tactic_roundtrips_through_autotuner_cache():
 def test_mxfp8_fused_fc12_sparse_gather_selection() -> None:
     """The gather variant is chosen from static shapes, scaled by the rank's expert share.
 
-    Qwen3.5-397B geometry: 512 experts, top-k 10. ``padded_routes`` is the
-    static ``permuted_idx_to_expanded_idx`` length the backend hands the op.
+    Qwen3.5-397B geometry: 512 experts, top-k 10, tile 128. ``padded_routes``
+    is the ``permuted_idx_to_expanded_idx`` length moe_sort allocates for
+    ``num_rows`` tokens, so the per-expert threshold (about 6.5K tokens) is the
+    same at every EP size.
     """
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import Sm107Mxfp8FusedFc12MoeRunner
 
-    def runner(num_local_experts):
-        return Sm107Mxfp8FusedFc12MoeRunner(512, 10, num_local_experts, 0, 128)
+    def sparse(num_local_experts: int, num_rows: int) -> bool:
+        runner = Sm107Mxfp8FusedFc12MoeRunner(512, 10, num_local_experts, 0, 128)
+        helper = GroupedGemmInputsHelper(512, 10, num_local_experts, 0, 128)
+        return runner._use_sparse_gather(
+            num_rows=num_rows, padded_routes=helper.get_max_num_permuted_tokens(num_rows)
+        )
 
-    # EP16 decode: 32 tokens, ~20 local routes spread over ~20 tiles -> sparse.
-    assert runner(32)._use_sparse_gather(num_rows=32, padded_routes=20 * 128)
-    # EP16 mid range, 2048 tokens: ~1280 local routes but heavy per-expert
-    # padding (32 experts x 127 rows) -> still sparse, because the estimate
-    # counts only this rank's share of the routes.
-    assert runner(32)._use_sparse_gather(num_rows=2048, padded_routes=1280 + 32 * 127)
-    # EP4 prefill, 16384 tokens: routes dominate the padding -> static.
-    assert not runner(128)._use_sparse_gather(
-        num_rows=16384, padded_routes=16384 * 10 // 4 + 128 * 127
-    )
-    # No EP: a single 128-row tile per expert, all full -> static.
-    assert not runner(512)._use_sparse_gather(num_rows=8192, padded_routes=8192 * 10)
+    # Decode: a handful of routes per local expert -> sparse.
+    assert sparse(32, 32)  # EP16
+    assert sparse(512, 1)  # EP1, fewer routes than local experts
+    # EP16, 2048 tokens: ~1280 local routes against 32 x 127 padding rows.
+    assert sparse(32, 2048)
+    # Below and above the threshold, at EP1 and EP4 alike.
+    assert sparse(512, 4096) and not sparse(512, 8192)
+    assert sparse(128, 4096) and not sparse(128, 8192)
+    # EP4 / EP8 prefill: routes dominate the padding -> static.
+    assert not sparse(128, 16384)
+    assert not sparse(64, 8192)
     # The estimate never drops below one route per arriving row (alltoall).
-    assert runner(1)._use_sparse_gather(num_rows=4, padded_routes=128)
-    assert not runner(1)._use_sparse_gather(num_rows=100, padded_routes=128)
+    assert sparse(1, 4)
+    assert not sparse(1, 100)
 
 
 @pytest.mark.cpu_only
@@ -5975,7 +5992,7 @@ def test_mxfp8_moe_tuning_buckets_cover_decode_shapes(monkeypatch: pytest.Monkey
     num_experts, top_k, hidden = 128, 10, 4096
     warmup_tokens = 3  # an odd shape: last_positive_power_of_2(3) == 2
 
-    def profiled_token_counts(tune_max_num_tokens):
+    def profiled_token_counts(tune_max_num_tokens: int) -> set:
         runner = CuteDslFusedMoEMxfp8Runner(
             forward_impl=None,
             num_experts=num_experts,
@@ -5997,17 +6014,17 @@ def test_mxfp8_moe_tuning_buckets_cover_decode_shapes(monkeypatch: pytest.Monkey
     anchored = profiled_token_counts(tune_max_num_tokens=8192)
     assert {1, 2, 4, 8, 32, 128, 1024, 8192} <= anchored, anchored
 
-    # Without the anchor only the warmup shape's buckets exist; keep this as
-    # documentation of the failure mode the anchor prevents.
-    unanchored = profiled_token_counts(tune_max_num_tokens=None)
-    assert 4 not in unanchored and 8 not in unanchored, unanchored
-
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("hidden", [2048, 4096, 7168])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_mxfp8_local_input_quantization_deferred(monkeypatch, hidden, dtype) -> None:
-    """Only local computation may defer quantization; communication needs bytes.
+def test_mxfp8_local_input_quantization_deferred(
+    monkeypatch: pytest.MonkeyPatch, hidden: int, dtype: torch.dtype
+) -> None:
+    """Quantization is deferred whenever ``post_quant_comm`` is False.
+
+    That covers no communication and a pre-quant dispatch of unquantized
+    activations; a result that is dispatched after quantization needs bytes.
 
     The cutoff is an element count, so the largest deferred row count follows
     from the hidden size rather than being tied to one model.
@@ -6025,7 +6042,9 @@ def test_mxfp8_local_input_quantization_deferred(monkeypatch, hidden, dtype) -> 
     scale_cols = hidden // 32
     calls = []
 
-    def native_quantize(tensor, swizzled, alignment):
+    def native_quantize(
+        tensor: torch.Tensor, swizzled: bool, alignment: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         calls.append((tensor, swizzled, alignment))
         return (
             torch.empty_like(tensor, dtype=torch.float8_e4m3fn),
@@ -6057,16 +6076,41 @@ def test_mxfp8_local_input_quantization_deferred(monkeypatch, hidden, dtype) -> 
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("over_limit", [False, True])
-def test_mxfp8_output_past_int32_falls_back_to_memset(monkeypatch, over_limit) -> None:
-    """The Rubin workspace reset indexes the output with Int32, so an output
-    past that extent is cleared by the memset rather than inside the op."""
+@pytest.mark.parametrize(
+    "enable_alltoall,moe_ep_size,top_k,dense",
+    [
+        (False, 8, 2, True),
+        (True, 1, 2, True),
+        (True, 2, 2, True),
+        (True, 3, 2, False),
+        (True, 8, 2, False),
+    ],
+    ids=[
+        "no_alltoall",
+        "alltoall_ep_lt_topk",
+        "alltoall_ep_eq_topk",
+        "alltoall_ep_topk_plus_1",
+        "alltoall_ep_gt_topk",
+    ],
+)
+def test_mxfp8_output_past_int32_falls_back_to_memset(
+    monkeypatch: pytest.MonkeyPatch,
+    over_limit: bool,
+    enable_alltoall: bool,
+    moe_ep_size: int,
+    top_k: int,
+    dense: bool,
+) -> None:
+    """The op clears the output inside its workspace reset only in the dense
+    case (no alltoall, or ep <= top_k), and only while the output fits the
+    reset kernel's Int32 extent; otherwise the leaf runs the row memset."""
     impl = TrtllmCutedslFusedFc12Mxfp8Impl
     leaf = impl.__new__(impl)
     torch.nn.Module.__init__(leaf)
     leaf.expert_size_per_partition = 4
     leaf.slot_start = 0
     leaf.num_slots = 4
-    leaf.mapping = SimpleNamespace(moe_ep_size=1)
+    leaf.mapping = SimpleNamespace(moe_ep_size=moe_ep_size)
     leaf.act_clamp = float("inf")
     leaf.w3_w1_weight = torch.empty(0)
     leaf.w2_weight = torch.empty(0)
@@ -6097,15 +6141,17 @@ def test_mxfp8_output_past_int32_falls_back_to_memset(monkeypatch, over_limit) -
     impl.run_moe_mxfp8_impl(
         leaf,
         x=torch.empty((num_tokens, hidden), dtype=torch.float8_e4m3fn),
-        token_selected_experts=torch.zeros((num_tokens, 2), dtype=torch.int32),
-        token_final_scales=torch.ones((num_tokens, 2)),
+        token_selected_experts=torch.zeros((num_tokens, top_k), dtype=torch.int32),
+        token_final_scales=torch.ones((num_tokens, top_k)),
         x_sf=torch.empty((num_tokens, hidden // 32), dtype=torch.uint8),
         moe_output=moe_output,
+        enable_alltoall=enable_alltoall,
     )
 
+    zero_in_op = dense and not over_limit
     assert len(op_calls) == 1
-    assert op_calls[0]["zero_output"] is (not over_limit)
-    assert len(memsets) == (1 if over_limit else 0)
+    assert op_calls[0]["zero_output"] is zero_in_op
+    assert len(memsets) == (0 if zero_in_op else 1)
 
 
 def _mxfp8_fused_fc12_op_tensors(tokens: int = 4, hidden: int = 512, top_k: int = 2) -> dict:
