@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""CPU contract tests for MiniMax-H3 FP8 U4 SM107 Video VAE configuration."""
+"""CPU contract tests for MiniMax-H3 FP8 U4 Video VAE configuration (SM103 & SM107)."""
 
 from __future__ import annotations
 
@@ -18,11 +18,20 @@ U4 = (
 def _load_vae_opt(capability: tuple[int, int]):
     tree = ast.parse((U4 / "vae_opt.py").read_text())
     keep = {
-        "_is_sm107_cuda",
+        "_SUPPORTED_VAE_CAPABILITIES",
+        "_is_supported_fp8_vae_cuda",
         "configure_u4_video_vae_pre_load",
         "configure_u4_video_vae_post_load",
     }
-    body = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in keep]
+    body = [
+        node
+        for node in tree.body
+        if (isinstance(node, ast.FunctionDef) and node.name in keep)
+        or (
+            isinstance(node, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id in keep for t in node.targets)
+        )
+    ]
     events = []
     ns = {
         "torch": SimpleNamespace(
@@ -45,8 +54,8 @@ def _load_vae_opt(capability: tuple[int, int]):
 
 
 class TestFp8U4VaeOptContracts(unittest.TestCase):
-    def test_sm103_and_cpu_are_strict_noops(self):
-        for cap, dev_type in (((10, 3), "cuda"), ((10, 7), "cpu")):
+    def test_unsupported_arch_and_cpu_are_strict_noops(self):
+        for cap, dev_type in (((9, 0), "cuda"), ((10, 7), "cpu")):
             ns = _load_vae_opt(cap)
             vae = SimpleNamespace(decoder="DEC", decoder_graph_max_shapes=0)
             dev = SimpleNamespace(type=dev_type)
@@ -55,15 +64,16 @@ class TestFp8U4VaeOptContracts(unittest.TestCase):
             self.assertEqual(vae.decoder_graph_max_shapes, 0)
             self.assertEqual(ns["_events"], [])
 
-    def test_sm107_configures_chunk_graph_and_fp8_decoder(self):
-        ns = _load_vae_opt((10, 7))
-        vae = SimpleNamespace(decoder="DEC", decoder_graph_max_shapes=0)
-        dev = SimpleNamespace(type="cuda")
-        self.assertTrue(ns["configure_u4_video_vae_pre_load"](vae, dev))
-        self.assertEqual(vae.decoder_graph_max_shapes, 2)
-        self.assertTrue(ns["configure_u4_video_vae_post_load"](vae, dev, ulysses_size=4))
-        self.assertIn(("set_tiles", (8, 512, 4), (16, 4, 4)), ns["_events"])
-        self.assertIn(("convert", "DEC"), ns["_events"])
+    def test_sm103_and_sm107_configure_chunk_graph_and_fp8_decoder(self):
+        for cap in ((10, 3), (10, 7)):
+            ns = _load_vae_opt(cap)
+            vae = SimpleNamespace(decoder="DEC", decoder_graph_max_shapes=0)
+            dev = SimpleNamespace(type="cuda")
+            self.assertTrue(ns["configure_u4_video_vae_pre_load"](vae, dev))
+            self.assertEqual(vae.decoder_graph_max_shapes, 2)
+            self.assertTrue(ns["configure_u4_video_vae_post_load"](vae, dev, ulysses_size=4))
+            self.assertIn(("set_tiles", (8, 512, 4), (16, 4, 4)), ns["_events"])
+            self.assertIn(("convert", "DEC"), ns["_events"])
 
 
 if __name__ == "__main__":

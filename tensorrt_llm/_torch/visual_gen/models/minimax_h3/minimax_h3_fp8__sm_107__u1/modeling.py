@@ -120,6 +120,62 @@ class Fp8Attention(ScenarioAttention):
         super().__init__(layer_idx=layer_idx, **kwargs)
         # Keep the index a CPU tensor so the compiled graph can be reused across blocks.
         self._fp8_block_id = torch.tensor(layer_idx, device="cpu", dtype=torch.int64)
+        self._hybrid_cudnn_backend = None
+        self._hybrid_step_state: dict[str, int] | None = None
+        self._hybrid_cudnn_steps: int = 8
+
+    @torch.compiler.disable
+    def _hybrid_attention_forward(self, qkv, rotary_emb, key_padding_mask, timestep):
+        cos, sin = rotary_emb
+        if self._hybrid_step_state["step"] < self._hybrid_cudnn_steps:
+            from ..fused_rope import apply_minimax_h3_qk_norm_rope_bf16
+
+            value = qkv.split([self.local_q_dim, self.local_kv_dim, self.local_kv_dim], dim=-1)[2]
+            query, key = apply_minimax_h3_qk_norm_rope_bf16(
+                qkv,
+                self.norm_q.weight,
+                self.norm_k.weight,
+                cos,
+                sin,
+                float(self.norm_q.variance_epsilon),
+                self.local_num_attention_heads,
+                self.head_dim,
+            )
+            orig = self.attn
+            self.attn = self._hybrid_cudnn_backend
+            try:
+                return self._attn_impl(
+                    query,
+                    key,
+                    value,
+                    key_padding_mask=key_padding_mask,
+                    discard_padded_queries=True,
+                    timestep=timestep,
+                )
+            finally:
+                self.attn = orig
+        from ..minimax_h3_fp8__sm_103_107__u4.qkv_exchange import qk_norm_rope_quant_u1_asym
+
+        rows = qkv.shape[1]
+        valid_rows = rows if key_padding_mask is None else int(key_padding_mask.sum().item())
+        query, key, value, descales = qk_norm_rope_quant_u1_asym(
+            qkv,
+            self.norm_q.weight,
+            self.norm_k.weight,
+            cos,
+            sin,
+            float(self.norm_q.variance_epsilon),
+            valid_rows,
+        )
+        return self._attn_impl(
+            query,
+            key,
+            value,
+            key_padding_mask=key_padding_mask,
+            discard_padded_queries=True,
+            timestep=timestep,
+            fp8_descales=descales,
+        )
 
     def forward(
         self,
@@ -137,6 +193,16 @@ class Fp8Attention(ScenarioAttention):
         if self.use_async_ulysses or getattr(self.attn, "world_size", 1) != 1:
             raise ValueError("The FP8 fused attention supports Ulysses=1 only")
         qkv = self.qkv_proj(hidden_states)
+        if (
+            self._hybrid_step_state is not None
+            and self._hybrid_cudnn_backend is not None
+            and qkv.ndim == 3
+            and qkv.shape[0] == 1
+            and self.local_num_attention_heads == 56
+            and self.head_dim == 128
+        ):
+            raw = self._hybrid_attention_forward(qkv, rotary_emb, key_padding_mask, timestep)
+            return self._out_proj(raw) if bf16_block and not return_raw else raw
         cos, sin = rotary_emb
         scales = fused_fp8_qk.qk_static_descale(self.head_dim, hidden_states.device)
         valid_len = None

@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""SM107 FP8 Video VAE and chunk CUDA-graph configuration for MiniMax-H3 FP8 U4."""
+"""FP8 Video VAE and chunk CUDA-graph configuration for MiniMax-H3 FP8 U4 (SM103 & SM107)."""
 
 from __future__ import annotations
 
@@ -19,14 +19,19 @@ __all__ = [
     "configure_u4_video_vae_post_load",
 ]
 
+_SUPPORTED_VAE_CAPABILITIES = frozenset(((10, 3), (10, 7)))
 
-def _is_sm107_cuda(device: torch.device) -> bool:
-    return device.type == "cuda" and torch.cuda.get_device_capability(device) == (10, 7)
+
+def _is_supported_fp8_vae_cuda(device: torch.device) -> bool:
+    return (
+        device.type == "cuda"
+        and torch.cuda.get_device_capability(device) in _SUPPORTED_VAE_CAPABILITIES
+    )
 
 
 def configure_u4_video_vae_pre_load(vae, device: torch.device, *, max_shapes: int | None = None) -> bool:
-    """Enable VAE decoder chunk CUDA graphs on SM107 before ``super().post_load_weights()``."""
-    if vae is None or not _is_sm107_cuda(device):
+    """Enable VAE decoder chunk CUDA graphs on SM103/SM107 before ``super().post_load_weights()``."""
+    if vae is None or not _is_supported_fp8_vae_cuda(device):
         return False
     shapes = int(SCENARIO.vae_graph_max_shapes if max_shapes is None else max_shapes)
     vae.decoder_graph_max_shapes = shapes
@@ -41,8 +46,8 @@ def configure_u4_video_vae_post_load(
     ulysses_size: int = 4,
     enable_fp8: bool = True,
 ) -> bool:
-    """Convert Video VAE decoder transformer Linears to tiled FP8 on SM107 after weights load."""
-    if not enable_fp8 or vae is None or not _is_sm107_cuda(device):
+    """Convert Video VAE decoder transformer Linears to tiled FP8 on SM103/SM107 after weights load."""
+    if not enable_fp8 or vae is None or not _is_supported_fp8_vae_cuda(device):
         return False
     if SCENARIO.vae_fp8_tiled:
         set_tiles(
