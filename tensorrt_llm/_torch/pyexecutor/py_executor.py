@@ -8928,12 +8928,14 @@ class PyExecutor:
             if not 0 <= retention.decode_retention_priority <= 100:
                 raise ValueError(
                     "Decode retention priority must be between 0 and 100")
-            if (self.kv_cache_manager.enable_block_reuse
+            has_retention_duration = (
+                retention.decode_duration_ms is not None
+                or any(r.duration_ms is not None
+                       for r in retention.token_range_retention_configs))
+            if (has_retention_duration
+                    and self.kv_cache_manager.enable_block_reuse
                     and self.dist.mapping.has_cp_helix()
-                    and self.kv_cache_transceiver is None and
-                (retention.decode_duration_ms is not None
-                 or any(r.duration_ms is not None
-                        for r in retention.token_range_retention_configs))):
+                    and self.kv_cache_transceiver is None):
                 raise ValueError(
                     "KV cache retention duration_ms is not supported with "
                     "block reuse under aggregated helix context parallelism: "

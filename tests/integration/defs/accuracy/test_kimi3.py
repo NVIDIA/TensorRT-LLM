@@ -408,7 +408,7 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
             kv_cache_config=KvCacheConfig(
                 dtype=kv_cache_dtype,
                 enable_block_reuse=True,
-                tokens_per_block=64,
+                tokens_per_block=HELIX_TOKENS_PER_BLOCK,
                 use_kv_cache_manager_v2=True,
                 **kv_cache_kwargs,
             ),

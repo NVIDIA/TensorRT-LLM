@@ -19,7 +19,7 @@ In Helix parallelism:
 
 Helix parallelism provides performance benefits when **all** of the following conditions apply:
 
-1. **Disaggregated serving**: Helix is designed for generation servers in a disaggregated (prefill/decode split) deployment architecture
+1. **Disaggregated serving**: Helix is designed for generation servers in a disaggregated (prefill/decode split) deployment architecture. Aggregated Helix, which runs prefill and decode on the same CP ranks, is now supported for dense MLA layers; see [Aggregated Helix](#aggregated-helix)
 2. **Long input sequences**: Performance gains typically appear with input sequence lengths **>64K tokens** or more
 3. **Low batch sizes**: Optimal for latency-sensitive workloads with high tokens/second/user requirements
 
@@ -30,6 +30,7 @@ On a typical latency vs. throughput Pareto curve, Helix targets operating points
 Helix parallelism currently supports models using **Multi-head Latent Attention (MLA)** on Blackwell GPU architecture:
 
 - DeepSeek-V3 / DeepSeek-V3-Lite
+- Kimi K3 (aggregated Helix)
 
 ## Configuration
 
@@ -58,6 +59,43 @@ Please set the following parameters for the generation servers in disaggregated 
     }
 }
 ```
+
+## Aggregated Helix
+
+Without a cache transceiver, Helix runs aggregated: one executor runs both the
+context and generation phases on the CP ranks. Aggregated Helix has these
+requirements:
+
+- Blackwell (SM100) or newer.
+- MLA models with dense MLA attention only. Every sparse attention algorithm is
+  rejected, including `skip_softmax`; Helix with sparse attention requires
+  disaggregated serving.
+- The TRTLLM attention backend.
+- Chunked prefill (`enable_chunked_prefill=True`).
+- KVCacheManagerV2 (`kv_cache_config.use_kv_cache_manager_v2=True`).
+
+The following are not supported with aggregated Helix:
+
+- An FP4 KV cache. Use a BF16 or FP8 KV cache.
+- A disk cache tier, a remote cache level, or a KV cache connector.
+- KV pool rebalance (`kv_cache_config.enable_kv_pool_rebalance`).
+- Attention DP with `pipeline_parallel_size > 1`.
+- A separate draft KV cache manager or draft-owned K/V layers for speculative decoding.
+- KV cache compression.
+
+### KV Cache Block Reuse
+
+Block reuse (`kv_cache_config.enable_block_reuse`) is supported with aggregated Helix
+and not with disaggregated Helix. Under aggregated Helix:
+
+- Reuse happens in whole ledger blocks of `tokens_per_block * context_parallel_size`
+  tokens, so every CP rank reuses the same prefix. Partial-block reuse is turned off.
+- Retention priorities are supported. A retention `duration_ms` (`decode_duration_ms` or a
+  token range's `duration_ms`) is rejected, because each CP rank would expire blocks on its
+  own clock.
+- For models with recurrent-state layers, such as Kimi K3, snapshot points are moved down
+  to ledger-block boundaries. Set `mamba_state_config.periodic_snapshot_interval` to a
+  multiple of the ledger block so that no snapshot is lost.
 
 ## Testing Helix with TensorRT-LLM
 

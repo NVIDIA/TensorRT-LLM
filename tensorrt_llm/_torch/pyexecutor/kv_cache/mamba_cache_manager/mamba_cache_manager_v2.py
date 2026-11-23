@@ -154,7 +154,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
     # Mixed-precision high layers are appended like any attention layer group.
     _supports_mixed_precision_kv = True
-    # Set per instance by KVCacheManagerV2 under helix context parallelism.
+    # KVCacheManagerV2.__init__ sets this per instance; the class default
+    # serves instances built without it.
     _has_cp_helix = False
     # Set per instance to the policy that lays out the attention layers when a
     # subclass selects one (see _configure_attention_cache_layout); the
@@ -1661,8 +1662,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         point may arrive after ``owner``'s history has passed its committed
         tokens; update_context_resources then advances history to each chunk
         end, so the commit at the point ends at history as commit_min_snapshot
-        requires. The point is moved down onto the same blocks as every other
-        snapshot point (see _align_snapshot_points).
+        requires. Under helix, the point is moved down onto a ledger block like
+        every other snapshot point (see _align_snapshot_points).
         """
         block = self._snapshot_alignment_block()
         if block is not None:
@@ -1692,14 +1693,19 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             return
         block = self._ledger_tokens_per_block
         points = request.expect_snapshot_points
-        aligned = sorted({point // block * block for point in points if point >= block})
-        if aligned != sorted(set(points)) and not self._helix_snapshot_realignment_logged:
+        # Points arrive sorted, so the floored points stay sorted.
+        aligned = []
+        for point in points:
+            floored = point - point % block
+            if floored and (not aligned or floored != aligned[-1]):
+                aligned.append(floored)
+        if not self._helix_snapshot_realignment_logged and aligned != points:
             self._helix_snapshot_realignment_logged = True
             logger.info(
                 f"Moving Mamba snapshot points down to {block}-token helix "
                 f"ledger blocks and dropping points below the first block "
                 f"(logged once; request {request.py_request_id}: "
-                f"{sorted(set(points))} -> {aligned})."
+                f"{points} -> {aligned})."
             )
         request.expect_snapshot_points = aligned
 
@@ -1796,8 +1802,12 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             if context_current_position is None
             else context_current_position
         )
-        if point is not None and point > current_position:
-            points.add(point)
+        if point is not None:
+            block = self._snapshot_alignment_block()
+            if block is not None:
+                point = point // block * block
+            if point > current_position:
+                points.add(point)
         request.expect_snapshot_points = sorted(points)
         self._align_snapshot_points(request)
 

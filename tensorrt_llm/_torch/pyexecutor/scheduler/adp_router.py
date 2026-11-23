@@ -333,8 +333,8 @@ class ADPRouter(ABC):
                 # KV cache, so the CP ranks of a DP group could route one request
                 # to different DP ranks, and that request would never pass
                 # DisaggTransferCoordinator.align_gen_admission_across_cp (see
-                # _use_max_load_across_cp). Only KV cache manager V1 gets here; V2
-                # rejects block reuse under helix CP.
+                # _use_max_load_across_cp). V2 rejects block reuse only under
+                # disaggregated helix CP, so both managers can get here.
                 logger.warning(
                     "attention_dp_config.enable_kv_cache_aware_routing is not "
                     "supported with helix context parallelism; falling back to "

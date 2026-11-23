@@ -1492,7 +1492,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
         Aggregated because no cache transceiver is configured: one executor
         runs both the context and generation phases on the CP ranks. Pure MLA
-        with no recurrent layers, so block reuse under Helix is not rejected.
+        with no recurrent layers, so no snapshot alignment is involved.
         Every CP rank must claim the same reuse depth in whole ledger blocks
         (tokens_per_block x cp_size = 128 tokens). max_num_tokens=512 chunks
         the few-shot prompts, so reused prefixes reach the cross-rank
@@ -1555,7 +1555,10 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 window for s in stats
                 for window in (s.get("kvCacheIterationStats") or {}).values()
             ]
-            reused_blocks = sum(w.get("iterReusedBlocks", 0) for w in windows)
+            # Missing counters must fail, not read as zero reuse.
+            assert windows, "no KV cache iteration stats were reported"
+            assert all("iterReusedBlocks" in w for w in windows)
+            reused_blocks = sum(w["iterReusedBlocks"] for w in windows)
             offloaded = sum(w.get("iterOffloadBlocks", 0) for w in windows)
             onboarded = sum(w.get("iterOnboardBlocks", 0) for w in windows)
             suspended = sum(s.get("iterSuspendedRequests", 0) for s in stats)

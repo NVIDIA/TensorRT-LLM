@@ -2787,10 +2787,11 @@ class KVCacheManagerV2(BaseResourceManager):
             type(self).__name__,
         )
         if kv_cache_config.enable_block_reuse and self.enable_partial_reuse and self._has_cp_helix:
-            logger.info(
-                "Helix context parallelism reuses whole ledger blocks only; "
-                "forcing enable_partial_reuse=False."
-            )
+            if "enable_partial_reuse" in getattr(kv_cache_config, "model_fields_set", ()):
+                logger.warning(
+                    "Helix context parallelism reuses whole ledger blocks only; "
+                    "forcing enable_partial_reuse=False."
+                )
             self.enable_partial_reuse = False
         # Mirror V1's KV reserve sizing (see V1 __init__ for rationale).
         self._kv_reserve_draft_tokens, self._generation_kv_capacity_headroom = (
@@ -10755,9 +10756,9 @@ class KVCacheManagerV2(BaseResourceManager):
             )
             history_length = (
                 None
-                # Reuse (history's consumer) is disabled under helix, and under
-                # disaggregated helix max_beam_num_tokens mixes rank-local and
-                # global counts.
+                # Under helix, reuse advances history itself through commit(),
+                # and under disaggregated helix max_beam_num_tokens mixes
+                # rank-local and global counts.
                 if self.kv_compression_manages_history or self._has_cp_helix
                 else req.max_beam_num_tokens - 1
             )

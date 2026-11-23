@@ -540,7 +540,9 @@ def test_context_model_capacity_profile_uses_real_dummy_requests(
     assert request.py_csa2_remote_tail_start is None
 
 
-def _retention(decode_duration_ms=None, range_duration_ms=None) -> KvCacheRetentionConfig:
+def _retention(
+    decode_duration_ms: int | None = None, range_duration_ms: int | None = None
+) -> KvCacheRetentionConfig:
     token_range = KvCacheRetentionConfig.TokenRangeRetentionConfig(
         0,
         None,
