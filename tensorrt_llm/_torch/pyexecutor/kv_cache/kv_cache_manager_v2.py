@@ -4573,11 +4573,26 @@ class KVCacheManagerV2(BaseResourceManager):
         return f"role={role!s}, pool_group_id=?, layer_group_id=?"
 
     def get_gpu_pool_bytes(self) -> list[int]:
-        """Return the bytes of each GPU pool group: slot count times bytes per slot, all roles."""
-        return [
-            int(stat.total) * int(sum(stat.slot_sizes))
-            for stat in self._get_storage_statistics(GPU_LEVEL)
-        ]
+        """Return the device-backed bytes of each GPU pool group: slot count times slot bytes.
+
+        With sparse KV cache offload a GPU-level pool group also holds pools of pinned host
+        memory mapped into the device. The storage statistics give a slot size for every pool
+        of the group, so the host-backed pools' slot bytes are left out.
+        """
+        host_slot_bytes = {
+            int(group.pool_group_index): sum(
+                int(pool.slot_bytes)
+                for pool in group.pools
+                if pool.storage_medium != CacheTier.GPU_MEM
+            )
+            for group in self.impl.pool_group_descs
+        }
+        pool_bytes = []
+        for pool_group_id, stat in enumerate(self._get_storage_statistics(GPU_LEVEL)):
+            slot_bytes = sum(int(size) for size in stat.slot_sizes)
+            slot_bytes -= host_slot_bytes.get(pool_group_id, 0)
+            pool_bytes.append(int(stat.total) * slot_bytes)
+        return pool_bytes
 
     def _log_kv_cache_pool_lifecycle_mapping(self) -> None:
         entries = OrderedDict()

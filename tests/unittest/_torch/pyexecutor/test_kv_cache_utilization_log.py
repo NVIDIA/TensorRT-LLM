@@ -6,8 +6,8 @@ from unittest.mock import Mock, call
 
 import pytest
 
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor import profiling
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.profiling import (
     KV_POOL_LOG_ENV_VAR_NAME,
     PyExecutorProfileManager,
@@ -33,9 +33,9 @@ def _capacity(total, free, evictable, slot_sizes=(GIB,)):
     )
 
 
-def _manager(tiers, snapshots):
+def _manager(tiers, snapshots, pool_group_descs=()):
     manager = object.__new__(KVCacheManagerV2)
-    manager.impl = SimpleNamespace(cache_tier_list=tiers)
+    manager.impl = SimpleNamespace(cache_tier_list=tiers, pool_group_descs=pool_group_descs)
     manager.get_iteration_stats = Mock(
         side_effect=AssertionError("must not collect iteration stats")
     )
@@ -134,9 +134,20 @@ def test_zero_capacity_and_missing_host(host_enabled):
     assert manager._get_storage_statistics.call_count == (2 if host_enabled else 1)
 
 
-def test_gpu_pool_bytes_count_every_role_of_a_slot():
+def _pool(slot_bytes, medium=CacheTier.GPU_MEM):
+    return SimpleNamespace(slot_bytes=slot_bytes, storage_medium=medium)
+
+
+def test_gpu_pool_bytes_count_every_device_backed_role_of_a_slot():
+    # Group 0 has two device-backed pools; group 1 adds a host-backed pool mapped into the device.
+    descs = [
+        SimpleNamespace(pool_group_index=0, pools=[_pool(100), _pool(28)]),
+        SimpleNamespace(pool_group_index=1, pools=[_pool(GIB), _pool(64, CacheTier.HOST_MEM)]),
+    ]
     manager = _manager(
-        [CacheTier.GPU_MEM], {0: [_capacity(10, 0, 0, (100, 28)), _capacity(4, 0, 0)]}
+        [CacheTier.GPU_MEM],
+        {0: [_capacity(10, 0, 0, (100, 28)), _capacity(4, 0, 0, (GIB, 64))]},
+        descs,
     )
     assert manager.get_gpu_pool_bytes() == [1280, 4 * GIB]
 
@@ -148,7 +159,6 @@ def test_format_kv_pool_fields():
         "kv_cache_gpu_pool_util = [0:0.900;1:N/A], "
         "kv_cache_host_pool_util = N/A, "
     )
-
 
 
 def test_pool_fields_follow_the_kv_cache_util_refresh(monkeypatch):
@@ -279,7 +289,7 @@ def test_load_kv_pool_log_enabled(monkeypatch, raw, expected):
     warning.assert_not_called()
 
 
-@pytest.mark.parametrize("raw", ["2", "50", "ture"])
+@pytest.mark.parametrize("raw", ["2", "50", "enabled"])
 def test_unrecognized_switch_stays_disabled_with_a_warning(monkeypatch, raw):
     monkeypatch.setenv(KV_POOL_LOG_ENV_VAR_NAME, raw)
     warning = Mock()
