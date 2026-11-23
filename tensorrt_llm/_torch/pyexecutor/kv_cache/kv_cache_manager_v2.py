@@ -66,6 +66,7 @@ from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils impo
     IndexMapper,
     copy_base_page_rows_to_device,
     copy_batch_block_offsets_to_device,
+    copy_per_layer_block_offsets_to_device,
     gather_base_page_rows,
 )
 from tensorrt_llm.llmapi.llm_args import (
@@ -158,6 +159,7 @@ from ..resource_manager import (
     scan_kv_buffer_for_invalid_values,
 )
 from ..scheduler import ScheduledRequests
+from .page_table import ByHead, PageTableSpec, Replicated, explicit_layer_specs, kv_dtype_name
 from .regions import RegionLayout, RegionProvider, lay_out_regions
 from .sparse_offload_memory import (
     HostHistoryReservations,
@@ -389,6 +391,12 @@ class Role:
     MLA_V_PACKED = DataRole("mla_v_packed")
     MLA_HP_TAIL = DataRole("mla_hp_tail")
     ALL = DataRole("all")
+
+
+# The roles the base manager splits by KV head (page_table_spec).
+_HEAD_SPLIT_ROLES = frozenset(
+    str(role) for role in (Role.KEY, Role.VALUE, Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE)
+)
 
 
 class BlockReusePolicy(StrEnum):
@@ -1843,9 +1851,26 @@ def _update_kv_cache_draft_token_location(
 
 
 @maybe_compile(options={"max-autotune": True})
-def _copy_swa_block_offsets_with_scratch_compiled(
+def _copy_per_layer_block_offsets_compiled(
     block_offsets: torch.Tensor,
     copy_idx: torch.Tensor,
+    pool_ids: torch.Tensor,
+    scales: torch.Tensor,
+    layer_offsets: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    base = block_offsets[pool_ids[:, :, None], copy_idx[None, None, :], 0, :]
+    converted = torch.where(
+        base == BAD_PAGE_INDEX,
+        BAD_PAGE_INDEX,
+        base * scales[:, :, None, None] + layer_offsets[:, :, None, None],
+    )
+    output.copy_(converted.permute(0, 2, 1, 3))
+
+
+@maybe_compile(options={"max-autotune": True})
+def _overlay_swa_scratch_pages_compiled(
+    tables: torch.Tensor,
     pool_ids: torch.Tensor,
     scales: torch.Tensor,
     layer_offsets: torch.Tensor,
@@ -1855,15 +1880,11 @@ def _copy_swa_block_offsets_with_scratch_compiled(
     scratch_ends: torch.Tensor,
     scratch_slots: torch.Tensor,
     num_contexts: torch.Tensor,
-    output: torch.Tensor,
 ) -> None:
-    base = block_offsets[pool_ids[:, :, None], copy_idx[None, None, :], 0, :]
-    converted = torch.where(
-        base == BAD_PAGE_INDEX,
-        BAD_PAGE_INDEX,
-        base * scales[:, :, None, None] + layer_offsets[:, :, None, None],
-    )
+    """Point each context row's scratch block range at its scratch slots.
 
+    ``tables`` already holds the converted per-layer pages for every row.
+    """
     context_positions = torch.arange(
         scratch_begs.shape[1],
         dtype=torch.int32,
@@ -1888,10 +1909,9 @@ def _copy_swa_block_offsets_with_scratch_compiled(
         slot_id * scales[:, :, None, None]
         + (offset + layer_offsets[:, :, None, None]) % scales[:, :, None, None]
     )
-    scratch_mask = scratch_mask_by_pool[pool_ids] & (base == BAD_PAGE_INDEX)
-    converted = torch.where(scratch_mask, scratch_index, converted)
-
-    output.copy_(converted.permute(0, 2, 1, 3))
+    converted = tables.permute(0, 2, 1, 3)
+    scratch_mask = scratch_mask_by_pool[pool_ids] & (converted == BAD_PAGE_INDEX)
+    tables.copy_(torch.where(scratch_mask, scratch_index, converted).permute(0, 2, 1, 3))
 
 
 def _rewind_context_cursor(req: LlmRequest, reuse: int) -> None:
@@ -4630,15 +4650,30 @@ class KVCacheManagerV2(BaseResourceManager):
             dtype=torch.int32,
             device=device,
         )
-        self._device_copy_idx_staging = torch.zeros(
-            staging_capacity,
-            dtype=torch.long,
-            device=device,
-        )
         self._device_num_contexts = torch.empty((), dtype=torch.int32, device=device)
         self._device_attention_op_pool_ids = pool_ids.to(device=device)
         self._device_attention_op_scales = scales.to(device=device)
         self._device_attention_op_layer_offsets = layer_offsets.to(device=device)
+        if self.enable_swa_scratch_reuse:
+            # Lane ``layer * 2 + role`` is relative to the full per-layer output.
+            lane_pools = pool_ids.reshape(-1)
+            pool_lanes = torch.argsort(lane_pools, stable=True).to(dtype=torch.int32)
+            pool_lane_offsets = torch.zeros(self.num_pools + 1, dtype=torch.int32)
+            pool_lane_offsets[1:] = torch.cumsum(
+                torch.bincount(lane_pools, minlength=self.num_pools), dim=0
+            )
+            self._device_copy_idx_int32_staging = torch.zeros(
+                staging_capacity, dtype=torch.int32, device=device
+            )
+            self._device_attention_op_converters = torch.stack(
+                (pool_ids.to(dtype=torch.int32), scales, layer_offsets), dim=-1
+            ).to(device=device)
+            self._device_attention_op_pool_lanes = pool_lanes.to(device=device)
+            self._device_attention_op_pool_lane_offsets = pool_lane_offsets.to(device=device)
+        else:
+            self._device_copy_idx_staging = torch.zeros(
+                staging_capacity, dtype=torch.long, device=device
+            )
         self._device_attention_op_scratch_pages = scratch_pages.to(device=device)
         self._device_block_positions = torch.arange(
             self.max_blocks_per_seq,
@@ -4693,10 +4728,6 @@ class KVCacheManagerV2(BaseResourceManager):
             device=device,
         )
 
-    def _copy_idx_to_device(self, copy_idx: torch.Tensor) -> torch.Tensor:
-        self._device_copy_idx_staging[: copy_idx.size(0)].copy_(copy_idx, non_blocking=True)
-        return self._device_copy_idx_staging
-
     def _copy_scratch_metadata_to_device(
         self,
         request_ids: List[int],
@@ -4743,6 +4774,40 @@ class KVCacheManagerV2(BaseResourceManager):
             self._device_scratch_slots_staging,
         )
 
+    def _copy_per_layer_block_offsets(
+        self,
+        dst_tensor: torch.Tensor,
+        copy_idx: torch.Tensor,
+        num_seqs: int,
+        num_blocks: int,
+        stream: torch.cuda.Stream,
+    ) -> None:
+        """Convert the batch's base-table rows into per-layer tables in ``dst_tensor``."""
+        if self._page_table_materializer.uses_device_staging:
+            # The kernel cannot read the host table here, so it reads a device copy.
+            with torch.cuda.stream(stream):
+                self._device_kv_cache_block_offsets_input.copy_(
+                    self.host_kv_cache_block_offsets,
+                    non_blocking=True,
+                )
+                rows = self._device_copy_idx_int32_staging[:num_seqs]
+                rows.copy_(copy_idx, non_blocking=True)
+            source = self._device_kv_cache_block_offsets_input
+        else:
+            # Both the table and IndexMapper's int32 row map are pinned host buffers.
+            source = self.host_kv_cache_block_offsets
+            rows = copy_idx
+        copy_per_layer_block_offsets_to_device(
+            source,
+            dst_tensor[: self.num_attention_op_pools],
+            rows,
+            self._device_attention_op_converters,
+            self._device_attention_op_pool_lane_offsets,
+            self._device_attention_op_pool_lanes,
+            num_blocks,
+            stream.cuda_stream,
+        )
+
     def _copy_batch_block_offsets_per_layer(
         self,
         dst_tensor: torch.Tensor,
@@ -4750,20 +4815,59 @@ class KVCacheManagerV2(BaseResourceManager):
         copy_idx: torch.Tensor,
         num_contexts: int,
         num_seqs: int,
+        max_blocks: Optional[int],
     ) -> None:
-        device_copy_idx = self._copy_idx_to_device(copy_idx)
-        self._device_kv_cache_block_offsets_input.copy_(
-            self.host_kv_cache_block_offsets,
-            non_blocking=True,
+        if not self.enable_swa_scratch_reuse:
+            self._device_kv_cache_block_offsets_input.copy_(
+                self.host_kv_cache_block_offsets, non_blocking=True
+            )
+            self._device_copy_idx_staging[:num_seqs].copy_(copy_idx, non_blocking=True)
+            # Conversion tensors and staging can contain only a subclass's output layers.
+            _copy_per_layer_block_offsets_compiled(
+                self._device_kv_cache_block_offsets_input,
+                self._device_copy_idx_staging,
+                self._device_attention_op_pool_ids,
+                self._device_attention_op_scales,
+                self._device_attention_op_layer_offsets,
+                self._device_attention_op_block_offsets_staging,
+            )
+            dst_tensor[: self.num_attention_op_pools, :num_seqs].copy_(
+                self._device_attention_op_block_offsets_staging[:, :num_seqs],
+                non_blocking=True,
+            )
+            return
+        has_scratch = num_contexts > 0 and any(
+            self.kv_cache_map[request_id].has_scratch_slots
+            for request_id in request_ids[:num_contexts]
+        )
+        uses_device_staging = self._page_table_materializer.uses_device_staging
+        if not has_scratch:
+            # A staged copy stays on the current stream, where the scratch path
+            # also refills the shared device input.
+            self._copy_per_layer_block_offsets(
+                dst_tensor,
+                copy_idx,
+                num_seqs,
+                self.max_blocks_per_seq if max_blocks is None else max_blocks,
+                torch.cuda.current_stream() if uses_device_staging else self._stream,
+            )
+            return
+        # The compiled overlay works on the full fixed-shape staging buffer, so
+        # convert every column there; both run on the current stream.
+        self._copy_per_layer_block_offsets(
+            self._device_attention_op_block_offsets_staging,
+            copy_idx,
+            num_seqs,
+            self.max_blocks_per_seq,
+            torch.cuda.current_stream(),
         )
         scratch_begs, scratch_ends, scratch_slots = self._copy_scratch_metadata_to_device(
             request_ids,
             num_contexts,
         )
         self._device_num_contexts.fill_(num_contexts)
-        _copy_swa_block_offsets_with_scratch_compiled(
-            self._device_kv_cache_block_offsets_input,
-            device_copy_idx,
+        _overlay_swa_scratch_pages_compiled(
+            self._device_attention_op_block_offsets_staging,
             self._device_attention_op_pool_ids,
             self._device_attention_op_scales,
             self._device_attention_op_layer_offsets,
@@ -4773,7 +4877,6 @@ class KVCacheManagerV2(BaseResourceManager):
             scratch_ends,
             scratch_slots,
             self._device_num_contexts,
-            self._device_attention_op_block_offsets_staging,
         )
         dst_tensor[: self.num_attention_op_pools, :num_seqs].copy_(
             self._device_attention_op_block_offsets_staging[
@@ -5828,6 +5931,23 @@ class KVCacheManagerV2(BaseResourceManager):
             own = {local: int(model_layer) for local, model_layer in enumerate(self.pp_layers)}
         return [high[layer_id] if layer_id in high else 2 * own[layer_id] for layer_id in layer_ids]
 
+    def _mixed_precision_model_layer_ids(self, layer_group_id: int) -> List[int]:
+        """Return the model layer of each layer of a layer group under mixed-precision KV, in the
+        order of ``_mixed_precision_global_layer_ids``; a high layer belongs to its layer's."""
+        high = {
+            int(high_layer): int(self.pp_layers[local])
+            for local, high_layer in self.mixed_precision_high_layers.items()
+        }
+        virtual = getattr(self, "_layer_attn_to_layer_id", None)
+        if virtual:
+            own = {}
+            for (model_layer, _), layer_id in virtual.items():
+                own.setdefault(int(layer_id), int(model_layer))
+        else:
+            own = {local: int(model_layer) for local, model_layer in enumerate(self.pp_layers)}
+        layer_ids = self._layer_ids_by_group[layer_group_id]
+        return [high[layer_id] if layer_id in high else own[layer_id] for layer_id in layer_ids]
+
     def _get_mixed_precision_buffers(
         self, layer_offset: int, kv_layout: str, mixed_precision_pool: str
     ) -> torch.Tensor:
@@ -5954,6 +6074,52 @@ class KVCacheManagerV2(BaseResourceManager):
         new roles do not require C++ changes.
         """
         return None
+
+    def page_table_spec(self) -> PageTableSpec:
+        """What this manager says of its pages that its runtime config and storage do not: how
+        each role's bytes spread over ranks, which roles never move, are derived or are rebuilt
+        per request, how its layers are named and how its KV data is quantized.
+
+        The base manager lays out the roles it registers itself: K/V and their block scales
+        split by KV head, head-major (HND), as the TRTLLM attention kernels write them, a K-only
+        (MLA) cache holding one latent head, which every tensor rank holds whole; and index-K,
+        which every tensor rank projects alike. A K-only cache given layers of K and V of their
+        own (``layer_specs``), as a drafter's beside an MLA target's latent, splits each layer by
+        its own KV heads instead, the latent one head (``page_table._kv_heads``). A manager
+        registering other roles or laying these out otherwise returns its own, usually this one
+        with some fields replaced (``dataclasses.replace``); a role that moves and that its spec
+        does not lay out makes ``get_page_table`` fail rather than guess. Under mixed-precision
+        KV it names the layers (``_mixed_precision_layer_ids``)."""
+        latent = self.kv_factor == 1 and all(
+            int(layer.kv_factor) == 1 for layer in explicit_layer_specs(self).values()
+        )
+        head_split = ByHead(total=1) if latent else ByHead()
+        return PageTableSpec(
+            role_layouts={
+                **{role: head_split for role in _HEAD_SPLIT_ROLES},
+                Role.INDEX_KEY: Replicated(),
+            },
+            layer_ids=self._mixed_precision_layer_ids(),
+            quant_mode={"FP8": "fp8", "NVFP4": "nvfp4"}.get(kv_dtype_name(self)),
+        )
+
+    def _mixed_precision_layer_ids(self) -> Optional[Dict[int, Tuple[int, int]]]:
+        """Internal layer id -> (global layer id, model layer) under mixed-precision KV, as
+        ``_mixed_precision_global_layer_ids`` and ``_mixed_precision_model_layer_ids`` name each
+        layer group's layers: model layer ``L``'s high layer ``2 * L + 1`` and every other layer
+        twice the id it has without, alike on every pipeline stage, whether it holds high layers
+        or not; None without mixed-precision KV."""
+        if getattr(self, "mixed_precision_low_dtype", None) is None:
+            return None
+        layer_ids: Dict[int, Tuple[int, int]] = {}
+        for layer_group_id, layers in enumerate(self._layer_ids_by_group):
+            names = zip(
+                self._mixed_precision_global_layer_ids(layer_group_id),
+                self._mixed_precision_model_layer_ids(layer_group_id),
+            )
+            for layer, (global_layer, model_layer) in zip(layers, names):
+                layer_ids[int(layer)] = (int(global_layer), int(model_layer))
+        return layer_ids
 
     def get_disagg_role_mapper_kinds(self) -> dict[DataRole, MapperKind]:
         """Map native cache roles to disaggregation mapper kinds.
@@ -8386,6 +8552,10 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _get_storage_statistics(self, cache_level: CacheLevel):
         return self.impl.get_storage_statistics(cache_level)
+
+    def get_storage_statistics(self, cache_level: CacheLevel) -> list:
+        """Per-pool-group storage statistics at ``cache_level``, as the storage reports them."""
+        return self._get_storage_statistics(cache_level)
 
     def _cold_pool_group_membership(self) -> tuple[tuple[int, frozenset[int]], ...]:
         """Cached ``(cold pool group id, life cycle ids)`` pairs shared by all cold levels.
@@ -10870,8 +11040,6 @@ class KVCacheManagerV2(BaseResourceManager):
         num_seqs: int,
         max_blocks: Optional[int] = None,
     ):
-        # max_blocks is accepted for signature parity with KVCacheManager; the
-        # device-side copy op here already scales with allocated blocks only.
         assert beam_width <= self.max_copy_beam_width
 
         # Cross KV is request-scoped: generation beams share the encoder K/V
@@ -10886,7 +11054,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
         if self._use_per_layer_page_tables:
             self._copy_batch_block_offsets_per_layer(
-                dst_tensor, request_ids, copy_idx, num_contexts, num_seqs
+                dst_tensor, request_ids, copy_idx, num_contexts, num_seqs, max_blocks
             )
             return
 

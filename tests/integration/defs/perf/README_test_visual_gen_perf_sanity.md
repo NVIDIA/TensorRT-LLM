@@ -85,15 +85,14 @@ The config folder can be overridden with:
 ### Current Naming Pattern
 
 VisualGen family YAMLs use model-based names. Hardware-specific recipes may
-include a hardware suffix. Recipes shared across GPU architectures use a
-platform-neutral name, such as `ltx2.yaml`; supported GPUs are listed in
+include a hardware suffix; supported GPUs are listed in
 `metadata.supported_gpus`.
 
 Examples:
 
 - `wan22_i2v_a14b_blackwell.yaml`
 - `flux2_blackwell.yaml`
-- `ltx2.yaml`
+- `ltx2_blackwell.yaml`
 
 ### YAML Structure
 
@@ -101,41 +100,27 @@ Each file can hold one or more named `server_configs`. This mirrors the LLM
 aggregated perf sanity layout and allows one family YAML to contain multiple
 stable server recipes.
 
+A minimal layout is shown below. See the [family YAMLs](../../../scripts/perf-sanity/visual_gen/)
+for complete recipes.
+
 ```yaml
 metadata:
   model_name: FLUX.2-dev
-  supported_gpus:
-    - B200
+  supported_gpus: [B200]
 hardware:
   gpus_per_node: 4
-environment:
-  server_env_var: TLLM_LOG_LEVEL=info
-  client_env_var: ""
 server_configs:
-  - name: flux2_fp8_cfg1_ulysses4_teacache_on
+  - name: t2i
     server_config:
-      quant_config:
-        quant_algo: FP8
-        dynamic: true
-      attention_config:
-        backend: VANILLA
       parallel_config:
         cfg_size: 1
         ulysses_size: 4
-      cache_config:
-        cache_backend: teacache
-      cuda_graph_config:
-        enable: false
     client_configs:
-      - name: 1024x1024_1f_50s_con1
+      - name: 1024x1024
         prompt: A cat holding a sign that says hello world
         backend: openai-images
         generation_mode: t2i
         size: 1024x1024
-        num_inference_steps: 50
-        seed: 42
-        max_concurrency: 1
-        num_prompts: 1
 ```
 
 ### Schema Notes
@@ -187,7 +172,7 @@ perf/test_visual_gen_perf_sanity.py::test_visual_gen_e2e[vg_upload-{config_base}
 Example:
 
 ```text
-perf/test_visual_gen_perf_sanity.py::test_visual_gen_e2e[vg_upload-flux2_blackwell-flux2_fp8_cfg1_ulysses4_teacache_on]
+perf/test_visual_gen_perf_sanity.py::test_visual_gen_e2e[vg_upload-flux2_blackwell-flux2_bf16_cfg1_ulysses4_teacache_cg_on]
 ```
 
 ## CI Integration
@@ -268,7 +253,7 @@ Important:
 
    The link pre-filters to `s_runtime: visual_gen`. To find a specific run,
    search for the server config name (e.g. `s_server_name:
-   flux2_fp8_cfg1_ulysses4_teacache_on`) or narrow the time range
+   flux2_bf16_cfg1_ulysses4_teacache_cg_on`) or narrow the time range
    to match the CI run timestamp.
 
 ## How to Add or Change a Match Key
@@ -300,10 +285,10 @@ extraction in `build_visual_gen_db_entry` and treat it as a baseline reset.
 
 ```bash
 # Run a single named recipe
-pytest perf/test_visual_gen_perf_sanity.py::test_visual_gen_e2e[vg_upload-flux2_blackwell-flux2_fp8_cfg1_ulysses4_teacache_on]
+pytest perf/test_visual_gen_perf_sanity.py::test_visual_gen_e2e[vg_upload-flux2_blackwell-flux2_bf16_cfg1_ulysses4_teacache_cg_on]
 
 # Run all server recipes from one family YAML without uploading
-pytest perf/test_visual_gen_perf_sanity.py::test_visual_gen_e2e[vg-ltx2]
+pytest perf/test_visual_gen_perf_sanity.py::test_visual_gen_e2e[vg-ltx2_blackwell]
 ```
 
 Set `LLM_MODELS_ROOT` to the shared model cache before running locally:

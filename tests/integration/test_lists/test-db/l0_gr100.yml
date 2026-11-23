@@ -117,6 +117,7 @@ l0_gr100:
   - unittest/_torch/modules/test_mxfp8_linear.py::test_sm107_mxfp8_prefill_linear_matches_reference
   - unittest/_torch/modules/test_mxfp8_linear.py::test_sm107_mxfp8_o_b_loaded_tactic_graph
   - unittest/_torch/attention/test_flashinfer_trtllm_gen_sm107_p128.py
+  - unittest/_torch/attention/sparse/qsa/test_qsa_prims_ts_core.py::test_auto_gates_small_decode_batches
   - unittest/_torch/kernels/parallel/test_nvfp4_quant.py
   - unittest/_torch/moe/kernels/parallel/test_triton_nvfp4_input_quant.py
   # CuteDSL MoE locality-domain split (NVFP4/BF16 grouped GEMM): module lifecycle and forward.

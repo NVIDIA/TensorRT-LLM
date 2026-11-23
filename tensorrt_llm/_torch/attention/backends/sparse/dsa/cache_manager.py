@@ -15,6 +15,7 @@ import torch
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import PageTableSpec
 from tensorrt_llm._torch.pyexecutor.kv_cache.sparse_offload_memory import sparse_cache_config
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import (
@@ -734,6 +735,11 @@ class DSACacheManagerV2(SparseOffloadCacheMixin, KVCacheManagerV2):
         if self.mla_kv_cache_layout == NVFP4_MLA_RECORD_LAYOUT:
             return None
         return super()._get_block_scale_role(role_a, layer_id)
+
+    def page_table_spec(self) -> PageTableSpec:
+        """Pages carrying their own scales are quantized as ``"fp8_ds_mla"``."""
+        spec = super().page_table_spec()
+        return replace(spec, quant_mode="fp8_ds_mla" if self.use_fp8_ds_mla else spec.quant_mode)
 
     def _extra_buffers_per_layer(self, *, tokens_per_block: int) -> dict[int, List[BufferConfig]]:
         return {

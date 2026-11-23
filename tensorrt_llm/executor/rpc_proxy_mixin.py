@@ -19,6 +19,7 @@ import os
 import threading
 from typing import Callable, List, Optional
 
+from .._torch.pyexecutor.llm_request import release_undelivered_response
 from .._utils import nvtx_range_debug
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import _SyncQueue
@@ -140,6 +141,7 @@ class RpcExecutorMixin:
 
                 if client_id not in self._results:
                     logger.warning(f"Received response for unknown client_id: {client_id}")
+                    release_undelivered_response(r)
                     continue
 
                 queue = self._results[client_id].queue

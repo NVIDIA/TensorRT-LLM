@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from tensorrt_llm._torch.attention.backends.fmha.prims_ts_mla_warmup import PrimsTSDenseMlaWarmup
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.distributed import Distributed
@@ -323,6 +324,7 @@ class DecoderWarmup:
         self._context_logits_heads = context_logits_heads
         # Token shape of the last autotuner warmup that ran a forward pass.
         self._completed_autotuner_warmup_num_tokens: int | None = None
+        self._prims_ts_dense_mla_warmup = PrimsTSDenseMlaWarmup()
 
     @property
     def guided_decoder(self) -> CapturableGuidedDecoder | None:
@@ -330,14 +332,21 @@ class DecoderWarmup:
 
     def run(self, resource_manager: ResourceManager) -> EagerWorkspaceReclaimer | None:
         """Warm up and capture graphs; return the eager workspace reclaimer to serve with."""
+        from tensorrt_llm._torch.modules.low_m_gemm import release_mma_staging_buffers
+
         kv_cache_manager = resource_manager.get_resource_manager(
             ResourceManagerType.KV_CACHE_MANAGER
         )
         # Warm here, not in AllReduce.__init__, to scope it to the LLM executor's graph capture.
         warmup_named_allreduce_topologies(self.model)
-        # Retain a partial summary when a phase raises.
-        with self._warmup_timer:
-            return self._warmup_scheduled(resource_manager, kv_cache_manager)
+        try:
+            # Retain a partial summary when a phase raises.
+            with self._warmup_timer:
+                return self._warmup_scheduled(resource_manager, kv_cache_manager)
+        finally:
+            # Serving runs on the executor's worker thread, whose padded low-M GEMM launches stage
+            # their rows in buffers of its own: free the ones the warmup forwards left on this thread.
+            release_mma_staging_buffers()
 
     def _get_max_shape_warmup_requests(
         self, resource_manager: ResourceManager
@@ -582,6 +591,8 @@ class DecoderWarmup:
             # NVSHMEM).
             gc.collect()
             torch.cuda.empty_cache()
+        with self._warmup_timer.phase("lowm_mma_row_buckets"):
+            self._prewarm_lowm_mma_row_buckets()
         with self._warmup_timer.phase("cuda_graph_capture"):
             # KV-cache estimation always uses both passes, so the KV-cache size ignores the switch.
             self._graphs.warmup_and_capture(
@@ -589,6 +600,14 @@ class DecoderWarmup:
                 allow_single_pass=not getattr(kv_cache_manager, "is_estimating_kv_cache", False),
             )
         log_mem_snapshot("warmup/after_cuda_graph_capture")
+        with self._warmup_timer.phase("prims_ts_dense_mla_prewarm"):
+            self._prims_ts_dense_mla_warmup.run(
+                self.model,
+                self._metadata.attn_metadata,
+                max_batch_size=self._config.max_batch_size,
+                max_num_tokens=self._config.max_num_tokens,
+                max_seq_len=self._config.max_seq_len,
+            )
         # Pre-compile DeepGEMM paged_mqa_logits_metadata for every 32-aligned
         # batch bucket the runtime can produce (max_batch_size scaled by the
         # MTP / DSL expansion factor when applicable). CUDA-graph warmup only
@@ -948,6 +967,47 @@ class DecoderWarmup:
                 self.dist.tp_allgather(1)
         if ready:
             logger.info(f"Throwaway Top-K prewarm complete ({time.perf_counter() - start:.1f} s)")
+
+    def _prewarm_lowm_mma_row_buckets(self) -> None:
+        """Compile the row buckets of the low-M MMA GEMMs the warmup forwards ran eagerly, then
+        barrier.
+
+        Eager forwards run these GEMMs on their row count rounded up to a bucket
+        (``low_m_gemm._MMA_ROW_BUCKETS``), and the warmup forwards reach only the buckets of their
+        own row counts. Runs before CUDA graph capture, so that a capture outside the decode graphs
+        finds its buckets compiled. Without a drafter that computes, no such GEMM has more rows than
+        a step's tokens, which attention DP gathers over the TP group, so the buckets stop at the one
+        that holds them; NGram drafts are prefix lookups. Any other drafter, a user-provided one
+        included, can run more rows than its target verifies, so with one every bucket compiles. The
+        TP group is held until its slowest rank has finished: the GEMMs a rank ran eagerly, and so
+        its compiles, can differ between ranks.
+        """
+        from tensorrt_llm._torch.modules.low_m_gemm import prewarm_mma_row_buckets
+
+        start = time.perf_counter()
+        compiled = gemms = 0
+        try:
+            spec_config = self._config.spec_config
+            max_rows = None
+            if spec_config is None or spec_config.spec_dec_mode.is_ngram():
+                max_rows = self._config.max_num_tokens
+                if self.mapping.enable_attention_dp:
+                    max_rows *= self.mapping.tp_size
+            compiled, gemms = prewarm_mma_row_buckets(max_rows)
+        except Exception as e:
+            # A prewarm miss only defers a compile to the first call that needs it, so it must not
+            # fail startup; the rank still meets its peers below.
+            logger.warning(f"Low-M MMA GEMM row-bucket prewarm stopped. {type(e).__name__}: {e}")
+        if self.dist is not None:
+            if self.mapping.cp_size > 1:
+                self.dist.tp_cp_allgather(1)
+            elif self.mapping.tp_size > 1:
+                self.dist.tp_allgather(1)
+        if compiled:
+            logger.info(
+                f"Low-M MMA GEMM row-bucket prewarm complete ({compiled} kernels for {gemms} GEMMs, "
+                f"{time.perf_counter() - start:.1f} s)"
+            )
 
     def _prewarm_model_decode_kernels(self, kv_cache_manager) -> None:
         """Call ``prewarm_decode_kernels`` on every module of the model that defines it, then

@@ -164,7 +164,7 @@ __global__ __launch_bounds__(WARP_SIZE* ROWS_PER_BLOCK) void fusedCatFp8Kernel(_
     packed.fp8[2] = quantize(v2);
     packed.fp8[3] = quantize(v3);
 
-    int base_out = row * HEAD_DIM + lane * ELEMS_PER_THREAD;
+    int64_t const base_out = static_cast<int64_t>(row) * HEAD_DIM + lane * ELEMS_PER_THREAD;
     *reinterpret_cast<uint32_t*>(fp8_out + base_out) = packed.u32;
 
     if (lane == 0)

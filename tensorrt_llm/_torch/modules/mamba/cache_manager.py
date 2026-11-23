@@ -9,7 +9,7 @@ import math
 import os
 import sys
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import NamedTuple
 
 import torch
@@ -32,6 +32,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2 import (
     MambaHybridCacheManagerV2,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import PageTableSpec
 from tensorrt_llm._torch.pyexecutor.kv_cache.regions import RegionProvider
 from tensorrt_llm._utils import get_sm_version, prefer_pinned
 from tensorrt_llm.logger import logger
@@ -660,6 +661,16 @@ class NemotronHybridCacheManager(MambaHybridCacheManagerV2):
             self.kv_cache_config.max_util_for_resume,
         )
         return (*providers, self._replay_region)
+
+    @override
+    def page_table_spec(self) -> PageTableSpec:
+        """The generation worker starts the replay history afresh."""
+        spec = super().page_table_spec()
+        if self._replay_region is None:
+            return spec
+        return replace(
+            spec, untransferred_roles=spec.untransferred_roles | self._replay_region.roles
+        )
 
     @override
     def get_disagg_ignored_roles(self) -> frozenset[DataRole]:

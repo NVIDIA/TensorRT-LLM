@@ -637,6 +637,21 @@ class PyResult:
         self.diff.mrope_position_ids = self._mrope_position_ids
         self.diff.mrope_position_deltas = self._mrope_position_deltas
 
+    def release_exports(self) -> None:
+        """Consume the handles this result exported; no response will deliver them."""
+        release_exported_handles(self)
+        self._mm_embeddings = None
+        self._mrope_position_ids = None
+        self._mrope_position_deltas = None
+        self.diff.mm_embeddings = None
+        self.diff.mrope_position_ids = None
+        self.diff.mrope_position_deltas = None
+
+    def drop_context_logits(self) -> None:
+        """Drop the stored context logits; no response will deliver them."""
+        self._context_logits = None
+        self.diff.context_logits_list = []
+
     def set_encoder_output(self, encoder_output: torch.Tensor):
         self._encoder_output = encoder_output
         self.diff.encoder_output = encoder_output
@@ -773,6 +788,33 @@ class PyResult:
     @property
     def encoder_output(self) -> torch.Tensor | None:
         return self._encoder_output
+
+
+def release_exported_handles(result: "PyResult | LlmResult") -> None:
+    """Consume a result's CUDA IPC handles that no consumer will open.
+
+    The producer cannot free an exported allocation until each of its handles is opened
+    and released, or consumed here.
+    """
+    handles = [
+        *(result.mm_embedding_handles or ()),
+        result.mrope_position_ids_handle,
+        result.mrope_position_deltas_handle,
+    ]
+    for handle in handles:
+        if handle is not None:
+            SharedTensorContainer.release_dict(handle)
+
+
+def release_undelivered_response(response: Any) -> None:
+    """Consume the exported handles of a response that no client will receive.
+
+    Takes the executor's responses, also when the worker has wrapped them; error
+    responses and other records carry no ``LlmResult`` and export nothing.
+    """
+    result = getattr(response, "result", None)
+    if isinstance(result, LlmResult):
+        release_exported_handles(result)
 
 
 class LlmResult:

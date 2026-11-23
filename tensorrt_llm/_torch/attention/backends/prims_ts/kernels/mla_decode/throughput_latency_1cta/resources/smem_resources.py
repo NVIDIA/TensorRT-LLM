@@ -770,6 +770,7 @@ class SmemPageOffsetsResource(MlaResource):
                 cta_idx_q,
                 self.cu_seqlens_q,
                 batch_idx,
+                cp_rank=self.cp_rank,
             )
             local_tile_idx = local_kv_tile_idx(
                 cfg,
@@ -912,6 +913,7 @@ class SmemPageOffsetsResource(MlaResource):
                     cta_idx_q,
                     self.cu_seqlens_q,
                     batch_idx,
+                    cp_rank=self.cp_rank,
                 )
                 local_tile_idx = local_kv_tile_idx(
                     cfg,
@@ -951,9 +953,19 @@ class SmemPageOffsetsResource(MlaResource):
                     3,
                     cutlass.Int32,
                 )
-                prims.cp_async_shared_global(
-                    smem_ptr, gmem_ptr, PAGE_OFFSET_BYTES, CP_ASYNC_CACHE_CA
-                )
+                if cutlass.const_expr(cfg.cp_world > 1):
+                    if seq_len_kv == Int32(0):
+                        # An empty rank need not own any valid physical pages.
+                        # A negative page selects TMA's out-of-bounds zero fill.
+                        self._smem_page_offsets.data_ptr(smem_offset).store(Int32(-1))
+                    else:
+                        prims.cp_async_shared_global(
+                            smem_ptr, gmem_ptr, PAGE_OFFSET_BYTES, CP_ASYNC_CACHE_CA
+                        )
+                else:
+                    prims.cp_async_shared_global(
+                        smem_ptr, gmem_ptr, PAGE_OFFSET_BYTES, CP_ASYNC_CACHE_CA
+                    )
 
     @producer_work
     @cute.jit
@@ -1690,6 +1702,7 @@ class SmemKvResource(MlaResource):
             cta_idx_q,
             self.cu_seqlens_q,
             batch_idx,
+            cp_rank=self.cp_rank,
         )
         tile_idx = global_kv_tile_idx(
             cfg,
@@ -1944,7 +1957,14 @@ class SmemKvResource(MlaResource):
                         tile_idx * Int32(pages_per_tile) + Int32(page_frag),
                         last_valid_page,
                     )
-                    page_id = Int32(self.page_offsets[logical_page_idx, batch_idx])
+                    if cutlass.const_expr(cfg.cp_world > 1):
+                        page_id = Int32(-1)
+                        if seq_len_kv > Int32(0):
+                            page_id = Int32(
+                                self.page_offsets[logical_page_idx, batch_idx]
+                            )
+                    else:
+                        page_id = Int32(self.page_offsets[logical_page_idx, batch_idx])
                 page_base = Int32(page_frag * first_page_elems)
                 smem_page_offset = page_base
                 if prims.elect_sync():
