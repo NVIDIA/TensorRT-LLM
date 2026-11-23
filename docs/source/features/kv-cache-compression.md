@@ -347,7 +347,6 @@ produce equal cold pages.
 
 ```yaml
 kv_cache_config:
-  use_kv_cache_manager_v2: true
   host_cache_size: 8589934592  # 8 GiB
 kv_cache_compression_config:
   algorithm: quantization_for_cold_page

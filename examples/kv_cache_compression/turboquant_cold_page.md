@@ -93,8 +93,11 @@ One-model MTP-EAGLE and EAGLE3 are supported: target and draft KVCMs encode
 their cold Pages independently, and draft cold Pages always quantize whole
 vectors. HELIX context parallelism is not currently supported.
 
-Set `kv_cache_config.use_kv_cache_manager_v2: true` explicitly. A nonzero Host
-or Disk cache is also required for Pages to cross a compression boundary.
+KVCacheManagerV2 is required and is the default
+(`kv_cache_config.use_kv_cache_manager_v2: true`), so there is nothing to set;
+`false`, or `auto` on a model without a V2 preference, selects V1, which cold
+Pages reject. A nonzero Host or Disk cache is also required for Pages to cross
+a compression boundary.
 
 ### Tested Models
 
@@ -124,7 +127,6 @@ with LLM(
     max_seq_len=4096,
     max_batch_size=4,
     kv_cache_config=KvCacheConfig(
-        use_kv_cache_manager_v2=True,
         dtype="auto",
         enable_block_reuse=False,
         host_cache_size=8 << 30,
@@ -147,7 +149,6 @@ The equivalent `trtllm-serve` configuration is:
 backend: pytorch
 
 kv_cache_config:
-  use_kv_cache_manager_v2: true
   dtype: auto
   enable_block_reuse: false
   host_cache_size: 8589934592  # 8 GiB
@@ -223,7 +224,6 @@ with LLM(
     max_batch_size=1,
     enable_iter_perf_stats=True,
     kv_cache_config=KvCacheConfig(
-        use_kv_cache_manager_v2=True,
         enable_block_reuse=True,
         max_tokens=8192,  # a GPU tier that the documents overflow
         host_cache_size=8 << 30,
@@ -288,7 +288,6 @@ cold Pages to Disk through pinned Host staging.
 
 ```yaml
 kv_cache_config:
-  use_kv_cache_manager_v2: true
   host_cache_size: 8589934592    # 8 GiB
   disk_cache_size: 68719476736   # 64 GiB
   disk_cache_path: /path/to/kv-cache-dir
@@ -432,8 +431,9 @@ decoding, two 6144-token prefixes, and 400 questions:
 
 1. Run the PyTorch backend on a GPU with compute capability 8.0 or newer, or
    8.9 or newer with an FP8 active KV cache.
-2. Select the native C++ KVCacheManagerV2 with
-   `use_kv_cache_manager_v2: true`.
+2. Keep the native C++ KVCacheManagerV2, the default: do not set
+   `use_kv_cache_manager_v2` to `false`, or to `auto` on a model without a V2
+   preference.
 3. Keep `kv_cache_config.dtype` at the model's intended runtime KV type:
    `auto`, FP16/BF16, or FP8. An active NVFP4 KV cache is rejected.
 4. Provision a nonzero Host cache and, optionally, a Disk cache. A positive
