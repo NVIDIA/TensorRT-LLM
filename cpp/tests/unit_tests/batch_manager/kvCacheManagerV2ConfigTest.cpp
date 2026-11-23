@@ -265,6 +265,7 @@ TEST(KvCacheManagerV2ConfigTest, SparseBuffersCoalesceBySize)
 TEST(KvCacheManagerV2ConfigTest, AttentionBufferPoliciesOverrideLayerDefault)
 {
     auto config = makeConfig();
+    std::get<AttentionLayerConfig>(config.layers.front()).slidingWindowSize = 8;
     auto& buffer = std::get<AttentionLayerConfig>(config.layers.front()).buffers.front();
     buffer.reusePolicy = ReusePolicy::REQUIRED;
     EXPECT_NO_THROW(config.validate());
@@ -278,6 +279,28 @@ TEST(KvCacheManagerV2ConfigTest, AttentionBufferPoliciesOverrideLayerDefault)
         auto const attr = storage.bufferAttributes().at(BufferId{0, buffer.role});
         EXPECT_EQ(std::get<AttnLifeCycle>(registry[attr.lifeCycleId]).reusePolicy, policy);
     }
+}
+
+TEST(KvCacheManagerV2ConfigTest, OptionalAttentionRequiresSlidingWindow)
+{
+    auto config = makeConfig();
+    auto& layer = std::get<AttentionLayerConfig>(config.layers.front());
+    layer.reusePolicy = ReusePolicy::OPTIONAL;
+    EXPECT_THROW(config.validate(), std::runtime_error);
+    layer.slidingWindowSize = 8;
+    EXPECT_NO_THROW(config.validate());
+
+    layer.slidingWindowSize.reset();
+    for (auto const policy : {ReusePolicy::REQUIRED, ReusePolicy::PRIVATE})
+    {
+        layer.buffers.front().reusePolicy = policy;
+        EXPECT_NO_THROW(config.validate());
+    }
+    layer.reusePolicy = ReusePolicy::REQUIRED;
+    layer.buffers.push_back(BufferConfig{.role = "value", .size = 4096, .reusePolicy = ReusePolicy::OPTIONAL});
+    EXPECT_THROW(config.validate(), std::runtime_error);
+    layer.slidingWindowSize = 8;
+    EXPECT_NO_THROW(config.validate());
 }
 
 TEST(KvCacheManagerV2ConfigTest, SsmBufferReusePoliciesSplitLayerLifecycles)

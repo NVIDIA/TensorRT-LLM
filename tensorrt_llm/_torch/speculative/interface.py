@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import copy
+import functools
 import os
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
@@ -35,8 +36,10 @@ from ..attention.backends.trtllm import (AttentionBackend, TrtllmAttention,
                                          TrtllmAttentionMetadata)
 from ..distributed import AllReduceStrategy
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
+from ..modules.bf16_draft_head import BF16DraftHead, build_bf16_draft_head
 from ..modules.logits_processor import LogitsProcessor
-from ..pyexecutor import step_inputs
+from ..pyexecutor import device_copy, step_inputs
+from ..pyexecutor.device_copy import CopySite
 from ..pyexecutor.resource_manager import ResourceManagerType
 
 if TYPE_CHECKING:
@@ -476,6 +479,8 @@ class SpeculativeDecodingMode(IntEnum):
     def is_mtp_vanilla(self):
         return self == SpeculativeDecodingMode.MTP
 
+    # Asked per request and per pass; the answer is fixed per mode.
+    @functools.cache
     def use_one_engine(self):
         return self.is_eagle3_one_model() or self.is_mtp_one_model(
         ) or self.is_external_drafter() or self.is_sa()
@@ -630,15 +635,10 @@ class OneModelSamplingParams:
     top_p: float
     min_p: float
     is_greedy: bool
+    # Sampled with a temperature alone: no top-k, top-p or min-p filter.
+    is_temperature_only: bool
     # The user's ``SamplingParams.seed``, None when unset.
     seed: Optional[int]
-
-    @property
-    def is_temperature_only(self) -> bool:
-        """Sampled with a temperature alone: no top-k, top-p or min-p filter."""
-        return (not self.is_greedy
-                and self.top_k == torch.iinfo(torch.int32).max
-                and self.top_p >= 1.0 and self.min_p <= 0.0)
 
     @property
     def is_shard_sampleable(self) -> bool:
@@ -670,13 +670,17 @@ class OneModelSamplingParams:
         # Greedy rows get a sentinel below the kernels' greedy threshold
         # (non-zero, one-hot under softmax); it must not reach a non-greedy row.
         disable_temperature = GREEDY_TEMPERATURE_THRESHOLD / 10
+        # Very large values disable top-k.
+        no_top_k = torch.iinfo(torch.int32).max
+        top_k = row.top_k if row.top_k > 0 else no_top_k
         return cls(
             temperature=disable_temperature if is_greedy else row.temperature,
-            # Very large values disable top-k.
-            top_k=row.top_k if row.top_k > 0 else torch.iinfo(torch.int32).max,
+            top_k=top_k,
             top_p=row.top_p,
             min_p=row.min_p,
             is_greedy=is_greedy,
+            is_temperature_only=(not is_greedy and top_k == no_top_k
+                                 and row.top_p >= 1.0 and row.min_p <= 0.0),
             seed=request_random_seed(request),
         )
 
@@ -696,11 +700,17 @@ def one_model_sampling_mode(requests, spec_metadata: "SpecMetadata") -> int:
 
 def _upload_host_values(dst: torch.Tensor,
                         values: np.ndarray,
-                        pack: bool = False) -> None:
-    """Copy ``values`` into the head of ``dst`` without blocking; ``pack`` lets the copy move to the open
-    step-input pack's flush (a plain copy when no pack is open)."""
+                        pack: bool = False,
+                        site: Optional[CopySite] = None) -> None:
+    """Copy ``values`` into the head of ``dst`` without blocking.
+
+    With ``site``, a model that declares a copy plan (an active copier) may merge the copy. Otherwise ``pack`` lets the
+    copy move to the open step-input pack's flush (a plain copy when no pack is open).
+    """
     src = maybe_pin_memory(torch.from_numpy(values))
-    if pack:
+    if site is not None and device_copy.current() is not None:
+        device_copy.copy(site, dst[:len(values)], src)
+    elif pack:
         step_inputs.copy_(dst[:len(values)], src)
     else:
         dst[:len(values)].copy_(src, non_blocking=True)
@@ -864,6 +874,9 @@ class SpecMetadata:
     # Stage the per-step Philox seed/offset uploads into the engine's step-input
     # pack (RuntimeHooks.pack_spec_rng_uploads) instead of copying each one.
     pack_rng_uploads: bool = False
+    # Verify a generation-only step's hidden states without the row gather
+    # (deploy-time; RuntimeHooks.skip_verify_row_gather).
+    skip_verify_row_gather: bool = False
     # Advanced-sampling specialization (deploy-time; from DecodingBaseConfig.advanced_sampling_mode).
     advanced_sampling_mode: AdvancedSamplingMode = AdvancedSamplingMode.FULL
     # Whether the occurrence penalties are enabled (deploy-time; from
@@ -1207,10 +1220,14 @@ class SpecMetadata:
 
         # The forward is the first reader of these buffers.
         pack = self.pack_rng_uploads
-        _upload_host_values(self.request_seeds, request_seeds, pack)
-        _upload_host_values(self.request_offsets, request_offsets, pack)
-        _upload_host_values(self.seeds, flat_seeds, pack)
-        _upload_host_values(self.offsets, flat_offsets, pack)
+        _upload_host_values(self.request_seeds, request_seeds, pack,
+                            CopySite.SPEC_RNG_REQUEST_SEEDS)
+        _upload_host_values(self.request_offsets, request_offsets, pack,
+                            CopySite.SPEC_RNG_REQUEST_OFFSETS)
+        _upload_host_values(self.seeds, flat_seeds, pack,
+                            CopySite.SPEC_RNG_SEEDS)
+        _upload_host_values(self.offsets, flat_offsets, pack,
+                            CopySite.SPEC_RNG_OFFSETS)
 
     def prepare_rejection_sampling_buffers(self):
         """
@@ -2088,6 +2105,9 @@ class SpecWorkerBase(nn.Module, ABC):
         self._gumbel_seed: Optional[torch.Tensor] = None
         self._auxiliary_state_handlers: list[
             AuxiliarySpeculativeStateHandler] = []
+        # Fused BF16 LM head + argmax + key exchange for greedy draft steps
+        # (see build_fused_draft_head); None keeps the GEMM path.
+        self.fused_draft_head: Optional[BF16DraftHead] = None
 
     def cache_derived_state(self) -> None:
         if self.key_exchange is not None and self._gumbel_seed is None:
@@ -2334,6 +2354,68 @@ class SpecWorkerBase(nn.Module, ABC):
                                      self.key_exchange,
                                      self._target_pair_exchange,
                                      channel=1)
+
+    def _fused_draft_lm_head(self, draft_model) -> Optional[nn.Module]:
+        """The vocab-sharded LM head whose greedy draft tokens the fused draft
+        head may produce in this worker's draft loop, or None. Workers whose
+        draft loop calls :meth:`_fused_draft_head_for` override this."""
+        del draft_model
+        return None
+
+    def build_fused_draft_head(self, draft_model) -> None:
+        """(Re)build :attr:`fused_draft_head` from the current weights of the
+        draft LM head (``trtllm::lm_head_argmax``: the shard GEMV, argmax and
+        key exchange in one launch, no draft logits), where the vocab-parallel
+        greedy argmax is enabled and the worker's draft head allows it.
+
+        Every TP rank reaches the same decision (configuration and device
+        type); the head reuses the key exchange's peer buffers.
+
+        A head built for the same LM head is kept: it reads the weights at
+        every call, and captured CUDA graphs hold its scratch (whose CTA
+        counter each launch leaves at zero), which must outlive a refit."""
+        lm_head = None
+        if self._vocab_parallel_argmax and draft_model is not None:
+            lm_head = self._fused_draft_lm_head(draft_model)
+        head = self.fused_draft_head
+        if head is not None and lm_head is not None and head.serves(lm_head):
+            return
+        self.fused_draft_head = None
+        if lm_head is not None and is_vocab_sharded_lm_head(lm_head):
+            self.fused_draft_head = build_bf16_draft_head(
+                lm_head, self.key_exchange)
+
+    def _fused_draft_head_for(self, rows: int,
+                              spec_metadata) -> Optional[BF16DraftHead]:
+        """The fused draft head when this draft step can take it: argmax
+        draft tokens (no advanced draft sampling), no guided decoding (it
+        masks the full draft logits) and at most the kernel's rows. Host-side
+        and identical on every TP rank."""
+        head = self.fused_draft_head
+        if (head is None or spec_metadata.wants_advanced_draft_sampling
+                or self.guided_decoder is not None or not head.supports(rows)):
+            return None
+        logger.info_once(
+            f"{type(self).__name__}: greedy draft tokens from the fused BF16 "
+            f"draft head (lm_head_argmax, up to {head.max_rows} rows)",
+            key=("spec_fused_draft_head", type(self).__name__))
+        return head
+
+    def _fused_draft_tokens(self,
+                            head: BF16DraftHead,
+                            hidden_states: torch.Tensor,
+                            out: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Greedy draft tokens (int32, target vocab) of ``hidden_states``
+        ``[rows, hidden]`` from the fused head, d2t applied; into ``out`` when
+        given."""
+        if self._d2t is None:
+            return head.sample(hidden_states, out=out)
+        tokens = head.sample(hidden_states)
+        tokens = (self._d2t[tokens] + tokens).to(torch.int32)
+        if out is None:
+            return tokens
+        out.copy_(tokens)
+        return out
 
     def _ensure_spec_dec_state_restored(self, attn_metadata, spec_metadata):
         """Restore attn-metadata spec-dec state if a failure skipped it.

@@ -92,6 +92,7 @@ Welcome to TensorRT LLM's Documentation!
    features/checkpoint-loading.md
    features/model-express.md
    features/sleep-wakeup.md
+   features/memory-monitor.md
    features/ray-orchestrator.md
    features/torch_compile_and_piecewise_cuda_graph.md
    features/helix.md
@@ -117,6 +118,7 @@ Welcome to TensorRT LLM's Documentation!
    developer-guide/kv-cache-cold-page-codec.md
    developer-guide/kv-cache-compression-development.md
    developer-guide/sparse-attention-development-guide.md
+   developer-guide/device-copy-plan.md
    developer-guide/telemetry.md
 
 

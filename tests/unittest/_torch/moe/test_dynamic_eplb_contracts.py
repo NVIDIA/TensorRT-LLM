@@ -878,10 +878,18 @@ def test_pyexecutor_shutdown_tail_failure_is_retryable():
     executor_cls = _extract_class(
         _TORCH_ROOT / "pyexecutor/py_executor.py",
         "PyExecutor",
-        {"shutdown", "_release_execution_resources", "_release_execution_pools"},
+        {
+            "shutdown",
+            "_release_execution_resources",
+            "_release_execution_pools",
+            "_shutdown_resource_managers",
+        },
         {
             "AsyncWorkerMixin": AsyncWorkerMixin,
             "torch": SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False)),
+            "monitor_providers": SimpleNamespace(
+                unregister_providers_of=lambda manager: events.append("monitor_unregister")
+            ),
         },
     )
     worker_cls = _extract_class(
@@ -912,6 +920,7 @@ def test_pyexecutor_shutdown_tail_failure_is_retryable():
     executor._kv_connector_failed = False
     executor.dist = SimpleNamespace(pp_size=1)
     executor._shutdown_sleep_wakeup_listeners = lambda: events.append("listener_shutdown")
+    executor._release_memory_monitor = lambda: events.append("monitor_release")
     executor.encoder_launch_executor = None
     executor.worker_started = True
     executor.resource_manager = SimpleNamespace(
@@ -953,8 +962,10 @@ def test_pyexecutor_shutdown_tail_failure_is_retryable():
         "profile_cleanup",
         "worker_join",
         "listener_shutdown",
+        "monitor_release",
         ("sampler_stop", 1),
         "release_graphs",
+        "monitor_unregister",
         "resource_shutdown",
         ("pool_delete", 1),
         ("terminal_cleanup", False),
