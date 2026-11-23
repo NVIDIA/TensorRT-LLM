@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""trtllm::fused_dit_qk_norm_rope_fp8 and trtllm::dit_v_amax against the bf16 fused op."""
+"""Wan FP8 kernels: trtllm::fused_dit_qk_norm_rope_fp8 and trtllm::dit_v_amax against the bf16
+fused op, and trtllm::fused_residual_norm_quant against a torch reference with the same rounding
+order."""
 
 import math
 
@@ -9,6 +11,7 @@ import torch
 from utils.util import skip_pre_hopper
 
 import tensorrt_llm  # noqa: F401  -- triggers libth_common.so load (registers trtllm ops)
+from tensorrt_llm._torch.visual_gen.models.wan.utils_wan import ResidualNormMode as RNM
 
 pytestmark = skip_pre_hopper
 
@@ -155,6 +158,7 @@ def test_fake_under_compile():
     qkv, q_w, k_w, cos, sin = _inputs(tokens, num_heads, tokens, seed=4)
 
     def fn(x):
+        """AdaLN mode with residual, gate and bias."""
         amax = torch.ops.trtllm.dit_v_amax(x, num_heads, HEAD_DIM)
         return _run(x, num_heads, q_w, k_w, cos, sin, False, amax)
 
@@ -162,3 +166,143 @@ def test_fake_under_compile():
     compiled = torch.compile(fn, fullgraph=True)(qkv)
     for a, b in zip(compiled, eager):
         torch.testing.assert_close(a.float(), b.float(), rtol=0, atol=0)
+
+
+# ---------------------------------------------------------------------------
+# trtllm::fused_residual_norm_quant: gated residual + LayerNorm / AdaLN + static FP8 quantization.
+# ---------------------------------------------------------------------------
+
+
+def _rnq_inputs(batch, seq, hidden, seed=0):
+    """Seeded inputs for every residual / norm mode."""
+    g = torch.Generator(device="cuda").manual_seed(seed)
+
+    def randn(*shape, scale=1.0):
+        """Seeded normal tensor on the GPU."""
+        return torch.randn(*shape, device="cuda", generator=g) * scale
+
+    return dict(
+        x=randn(batch, seq, hidden).bfloat16(),
+        y=randn(batch, seq, hidden, scale=0.5).bfloat16(),
+        y_bias=randn(hidden, scale=0.1).bfloat16(),
+        gate=randn(batch, hidden, scale=0.3),
+        ln_weight=1.0 + randn(hidden, scale=0.1),
+        ln_bias=randn(hidden, scale=0.1),
+        scale=randn(batch, hidden, scale=0.1),
+        shift=randn(batch, hidden, scale=0.1),
+    )
+
+
+def _rnq_reference(x, y, y_bias, gate, mode, weight, bias, inv_scale):
+    """Residual in fp32 with the product rounded before the add, then LayerNorm and FP8 quant."""
+    if y is not None:
+        y = y + y_bias if y_bias is not None else y  # bf16 add, as the kernel rounds y + y_bias
+        prod = y.float() * gate[:, None, :] if gate is not None else y.float()
+        x = (x.float() + prod).bfloat16()
+    if mode == RNM.RESIDUAL_ONLY:
+        return x, None
+    xf = x.float()
+    mean = xf.mean(-1, keepdim=True)
+    var = (xf * xf).mean(-1, keepdim=True) - mean * mean
+    xn = (xf - mean) * torch.rsqrt(var.clamp_min(0) + EPS)
+    if mode == RNM.LAYER_NORM:
+        out = xn * weight + bias
+    else:
+        out = xn * (1.0 + weight[:, None, :]) + bias[:, None, :]
+    normed = (out.bfloat16().float() * inv_scale).clamp(-E4M3_MAX, E4M3_MAX).to(E4M3)
+    return x, normed
+
+
+def _rnq_run(x, y, y_bias, gate, mode, weight, bias, inv_scale, seq):
+    """Run the op on [B, S, hidden] inputs and restore their shape."""
+    hidden = x.shape[-1]
+    x_out, normed = torch.ops.trtllm.fused_residual_norm_quant(
+        x.reshape(-1, hidden),
+        None if y is None else y.reshape(-1, hidden),
+        y_bias,
+        gate,
+        mode,
+        weight,
+        bias,
+        seq,
+        EPS,
+        inv_scale,
+    )
+    return (
+        x_out.view(x.shape) if y is not None else None,
+        normed.view(x.shape) if mode != RNM.RESIDUAL_ONLY else None,
+    )
+
+
+@pytest.mark.parametrize(
+    "hidden,batch,mode,has_y,has_gate,has_bias",
+    [
+        # Every mode with all inputs, across widths.
+        (3072, 1, RNM.RESIDUAL_ONLY, True, True, True),
+        (5120, 2, RNM.LAYER_NORM, True, True, True),
+        (4096, 2, RNM.ADA_LAYER_NORM, True, True, True),
+        # Optional inputs left out.
+        (3072, 1, RNM.LAYER_NORM, True, False, True),
+        (5120, 2, RNM.ADA_LAYER_NORM, True, True, False),
+        (5120, 2, RNM.ADA_LAYER_NORM, False, False, False),
+    ],
+)
+def test_residual_norm_quant_matches_reference(hidden, batch, mode, has_y, has_gate, has_bias):
+    """Each mode, with and without optional inputs, matches the reference."""
+    seq = 333
+    t = _rnq_inputs(batch, seq, hidden, seed=hidden + batch + mode)
+    y = t["y"] if has_y else None
+    y_bias = t["y_bias"] if has_bias and has_y else None
+    gate = t["gate"] if has_gate and has_y else None
+    weight, bias = {
+        RNM.RESIDUAL_ONLY: (None, None),
+        RNM.LAYER_NORM: (t["ln_weight"], t["ln_bias"]),
+        RNM.ADA_LAYER_NORM: (t["scale"], t["shift"]),
+    }[mode]
+    inv_scale = torch.tensor([E4M3_MAX / 6.0], device="cuda") if mode != RNM.RESIDUAL_ONLY else None
+
+    x_out, normed = _rnq_run(t["x"], y, y_bias, gate, mode, weight, bias, inv_scale, seq)
+    ref_x, ref_normed = _rnq_reference(
+        t["x"], y, y_bias, gate, mode, weight, bias, None if inv_scale is None else inv_scale.item()
+    )
+    if has_y:
+        assert torch.equal(x_out, ref_x)
+    else:
+        assert x_out is None
+    if mode != RNM.RESIDUAL_ONLY:
+        # Statistics accumulate in a different order; codes agree up to one e4m3 step.
+        torch.testing.assert_close(normed.float(), ref_normed.float(), rtol=0.125, atol=2**-6)
+        assert (normed.view(torch.uint8) == ref_normed.view(torch.uint8)).float().mean() > 0.995
+
+
+def test_residual_norm_quant_supported_hidden_sizes():
+    """Multiples of 1024 up to 8192 are supported; other widths are not."""
+    supported = torch.ops.trtllm.fused_residual_norm_quant_supported
+    assert all(supported(h) for h in (1024, 3072, 5120, 8192))
+    assert not any(supported(h) for h in (0, 1000, 3000, 9216))
+
+
+def test_residual_norm_quant_rejects_cpu_inv_out_scale():
+    """A host inv_out_scale is rejected."""
+    t = _rnq_inputs(1, 64, 3072)
+    inv_scale = torch.tensor([E4M3_MAX / 6.0])
+    with pytest.raises(RuntimeError, match="inv_out_scale must be a CUDA tensor"):
+        _rnq_run(
+            t["x"], None, None, None, RNM.LAYER_NORM, t["ln_weight"], t["ln_bias"], inv_scale, 64
+        )
+
+
+def test_residual_norm_quant_fake_under_compile():
+    """The fake op traces with fullgraph and compiled output equals eager."""
+    t = _rnq_inputs(1, 64, 3072, seed=7)
+    inv_scale = torch.tensor([E4M3_MAX / 6.0], device="cuda")
+
+    def fn(x, y):
+        return _rnq_run(
+            x, y, t["y_bias"], t["gate"], RNM.ADA_LAYER_NORM, t["scale"], t["shift"], inv_scale, 64
+        )
+
+    eager = fn(t["x"], t["y"])
+    compiled = torch.compile(fn, fullgraph=True)(t["x"], t["y"])
+    for a, b in zip(compiled, eager):
+        assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
