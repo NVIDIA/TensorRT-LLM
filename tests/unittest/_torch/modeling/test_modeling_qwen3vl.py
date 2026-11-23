@@ -3160,3 +3160,18 @@ def test_qwen_vl_prefill_from_items_rejects_bad_items(model):
     for form in ("embeddings", "handles"):
         with pytest.raises(ValueError, match="for every item or for none"):
             prefill([image, (video[0], video[1], no_hash)], form=form)
+
+
+@pytest.mark.cpu_only
+def test_qwen_vl_sm103_nvfp4_rejects_attached_video():
+    from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default.vision import (
+        validate_request,
+    )
+
+    processor, width = _make_qwen_vl_hf_processor("qwen3")
+    items = _encode_items(processor, ["video"])
+    prompt = _qwen_vl_request(["video"])["prompt"]
+    ids, params = _prefill_from_items(processor, prompt, items, width, "embeddings")
+    request = SimpleNamespace(py_multimodal_data=params.multimodal_data, prompt_len=len(ids))
+    with pytest.raises(ValueError, match="precomputed embeddings"):
+        validate_request(None, request)
