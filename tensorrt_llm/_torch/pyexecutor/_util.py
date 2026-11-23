@@ -19,6 +19,7 @@ from contextlib import ExitStack
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Union
 
 import torch
+from torch.utils._pytree import tree_flatten
 
 import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
@@ -59,7 +60,9 @@ from ..memory.monitor import startup as monitor_startup
 from ..memory.monitor.providers.kv_cache import \
     KvCacheProvider as MonitorKvCacheProvider
 from ..model_config import ModelConfig, _get_kv_cache_layer_specs
-from ..models.modeling_multimodal_mixin import MultimodalModelMixin
+from ..models.modeling_multimodal_mixin import (MultimodalModelMixin,
+                                                _active_encoder_layout,
+                                                _run_encoder_on_replica)
 from ..modules.dwdp.dense.manager import DenseDwdpManager
 from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from ..speculative import (draft_prompt_lookahead, get_draft_block_width,
@@ -1866,17 +1869,22 @@ class KvCacheCreator:
 
     def _create_dummy_encoder_inputs(self) -> List[MultimodalParams]:
         """Build one processed MM encoder batch at its scheduling limits."""
-        if not isinstance(self._model_engine.model, MultimodalModelMixin):
+        model = self._model_engine.model
+        mm_config = getattr(self._llm_args, "multimodal_config", None)
+        explicit = mm_config is not None and mm_config.encoder_data_parallel_size is not None
+        if explicit:
+            model = getattr(model, "_orig_mod", model)
+        if not isinstance(model, MultimodalModelMixin):
             return []
         if isinstance(
                 self._profiling_stage_data,
                 dict) and not self._profiling_stage_data.get("enable_mm_reqs"):
             return []
-        if self._llm_args.disable_mm_encoder:
-            return []
-        # MM E/P disaggregation may remove an otherwise exposed encoder.
-        if (hasattr(self._model_engine.model, "mm_encoder")
-                and self._model_engine.model.mm_encoder is None):
+        if explicit:
+            if _active_encoder_layout(model) is None:
+                return []
+        elif self._llm_args.disable_mm_encoder or (hasattr(
+                model, "mm_encoder") and model.mm_encoder is None):
             return []
 
         input_processor = self._model_engine.input_processor
@@ -1913,7 +1921,7 @@ class KvCacheCreator:
             mm_data = input_processor.get_dummy_mm_data(
                 max_num_encoder_tokens=encoder_max_num_tokens,
                 mm_counts={modality: num_items},
-                dtype=self._model_engine.model.dtype,
+                dtype=model.dtype,
             )
         except NotImplementedError:
             logger.info("Multimodal memory profiling skipped: "
@@ -1934,6 +1942,8 @@ class KvCacheCreator:
             return None
 
         encoder_inputs = self._dummy_encoder_inputs
+        model = self._model_engine.model
+        model = getattr(model, "_orig_mod", model)
         try:
             with torch.inference_mode():
                 for encoder_input in encoder_inputs:
@@ -1941,17 +1951,25 @@ class KvCacheCreator:
                         "multimodal_data",
                         "cuda",
                         pin_memory=prefer_pinned(),
-                        target_keywords=getattr(
-                            self._model_engine.model,
-                            "multimodal_data_device_paths",
-                            None,
-                        ),
+                        target_keywords=getattr(model,
+                                                "multimodal_data_device_paths",
+                                                None),
                     )
                 # The clone is retained only for memory accounting; no tensor
                 # data is consumed after this profiling forward returns.
                 with discard_nccl_window_tensor_outputs(encoder_inputs):
-                    output = self._model_engine.model.encode_multimodal_inputs(
-                        encoder_inputs)
+                    # A shared encoder TP pass holds the gathered inputs of a
+                    # group, up to one step, beside this rank's own inputs.
+                    # Hold a second copy during the forward to count it.
+                    gathered_inputs = [
+                        leaf.clone() for leaf in tree_flatten(
+                            [p.multimodal_data for p in encoder_inputs])[0]
+                        if isinstance(leaf, torch.Tensor) and leaf.is_cuda
+                    ] if getattr(self._model_engine,
+                                 "mm_encoder_collective_required",
+                                 False) else ()
+                    output = _run_encoder_on_replica(model, encoder_inputs)
+                    del gathered_inputs
                     # The runtime store owns detached copies rather than views
                     # of an encoder batch. Reproduce that allocation boundary.
                     return output.detach().clone()

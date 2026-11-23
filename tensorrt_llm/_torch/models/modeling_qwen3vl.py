@@ -67,6 +67,7 @@ from .modeling_multimodal_mixin import (
     MultimodalModelMixin,
     PreparedLlmInputs,
     encode_multimodal_by_groups,
+    make_multimodal_encoder_model_config,
 )
 from .modeling_qwen2vl import (
     Qwen2_5_VLVisionAttention,
@@ -1584,6 +1585,7 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
 
     supports_mm_encoder_item_scheduling = True
     supports_vision_gpu_normalize = True
+    supports_mm_encoder_data_parallel = True
 
     def get_multimodal_item_partitions(
         self,
@@ -1711,12 +1713,13 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
         # saves the encoder's GPU memory for the KV cache pool.
         if not (_is_mm_disagg() or model_config.disable_mm_encoder):
             vision_encoder_class = kwargs.get("vision_encoder_class")
+            encoder_model_config = make_multimodal_encoder_model_config(model_config)
             if vision_encoder_class is None:
                 self.mm_encoder = Qwen3VisionModelBase(
-                    copy.deepcopy(model_config), kwargs.get("vision_model_class", None)
+                    encoder_model_config, kwargs.get("vision_model_class", None)
                 ).eval()
             else:
-                self.mm_encoder = vision_encoder_class(copy.deepcopy(model_config)).eval()
+                self.mm_encoder = vision_encoder_class(encoder_model_config).eval()
             # Reuse the encoder's own group definition so the aggregated and
             # mm-encoder-only paths share a single source of truth.
             self.mm_encoder_groups = self.mm_encoder.mm_encoder_groups

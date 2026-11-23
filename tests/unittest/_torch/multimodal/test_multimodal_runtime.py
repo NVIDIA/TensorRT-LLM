@@ -1,5 +1,9 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+import weakref
 from typing import List
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -618,6 +622,82 @@ class TestGetMultimodalEmbeddings:
             assert (embedding.untyped_storage().data_ptr()
                     != encoder_output.untyped_storage().data_ptr())
         torch.testing.assert_close(torch.cat(cached, dim=0), encoder_output)
+
+    def test_encoder_output_is_freed_before_the_gather(self):
+        """Only the cached copy of the encoder output stays alive at the gather."""
+        encoder_output = None
+
+        def mock_encoder(params):
+            nonlocal encoder_output
+            output = torch.randn(13, _EMBED_DIM)
+            encoder_output = weakref.ref(output)
+            return output
+
+        alive_at_gather = []
+
+        def gather(params):
+            alive_at_gather.append(encoder_output() is not None)
+            return get_attached_multimodal_embeddings(params)
+
+        multimodal_params = [
+            _make_mm_params_with_data(has_cached_embedding=False,
+                                      total_mm_tokens=5),
+            _make_mm_params_with_data(has_cached_embedding=False,
+                                      total_mm_tokens=8)
+        ]
+        with patch(
+                f"{get_multimodal_embeddings.__module__}."
+                "get_attached_multimodal_embeddings",
+                side_effect=gather):
+            result = get_multimodal_embeddings(mock_encoder, multimodal_params)
+
+        assert alive_at_gather == [False]
+        assert result[0].shape == (13, _EMBED_DIM)
+
+    @pytest.mark.parametrize("current_chunk_only", [False, True],
+                             ids=["full-request", "active-chunk"])
+    def test_dense_encoder_output_with_cached_request(self, current_chunk_only):
+        first = _make_mm_params_with_data(total_mm_tokens=5)
+        second = _make_mm_params_with_data(total_mm_tokens=3)
+        cached_output = torch.full((2, _EMBED_DIM), -1.0)
+        cached = _make_mm_params_with_data(has_cached_embedding=True,
+                                           total_mm_tokens=2,
+                                           cached_embedding=cached_output)
+        cached.multimodal_data[
+            "multimodal_embedding_is_chunk"] = current_chunk_only
+        cached.multimodal_runtime = _make_runtime(0, 2, [2])
+        first.multimodal_runtime = _make_runtime(1, 3, [2, 3])
+        second.multimodal_runtime = _make_runtime(0, 3, [3])
+        gathered = torch.arange(8 * _EMBED_DIM,
+                                dtype=torch.float32).reshape(8, _EMBED_DIM)
+        items = gathered.split([2, 3, 3])
+        first_rows = (items[0][1:],
+                      items[1][:2]) if current_chunk_only else items[:2]
+        expected = torch.cat((*first_rows, cached_output, items[2]), dim=0)
+        encode = Mock(return_value=gathered)
+
+        with patch.object(torch, "cat", wraps=torch.cat) as concatenate:
+            output, = get_multimodal_embeddings(encode, [first, cached, second])
+
+        encode.assert_called_once_with([first, second])
+        concatenate.assert_called_once()
+        torch.testing.assert_close(output, expected)
+        torch.testing.assert_close(
+            first.multimodal_data["multimodal_embedding"], gathered[:5])
+        torch.testing.assert_close(
+            second.multimodal_data["multimodal_embedding"], gathered[5:])
+
+    def test_dense_single_request_is_reused_on_later_chunks(self):
+        param = _make_mm_params_with_data(total_mm_tokens=5)
+        encode = Mock(return_value=torch.ones((5, _EMBED_DIM)))
+
+        with patch.object(torch, "cat", wraps=torch.cat) as concatenate:
+            first, = get_multimodal_embeddings(encode, [param])
+            second, = get_multimodal_embeddings(encode, [param])
+
+        encode.assert_called_once_with([param])
+        concatenate.assert_not_called()
+        assert second is first
 
     def test_special_tokens_basic_caching(self):
         """Test caching behavior with special tokens present."""

@@ -68,6 +68,12 @@ class AutoModelForCausalLM(Generic[TModel, TConfig]):
                     f"Unknown architecture for AutoModelForMultimodalEncoder: {model_arch}"
                 )
             vision_encoder_cls, vlm_base_model = vision_encoder_info
+            mm_config = config.multimodal_config
+            if mm_config is not None and mm_config.encoder_data_parallel_size is not None:
+                from .modeling_multimodal_mixin import \
+                    make_multimodal_encoder_model_config
+
+                config = make_multimodal_encoder_model_config(config)
             return vision_encoder_cls(config, vlm_base_model)
         cls = AutoModelForCausalLM._resolve_class(config)
         if cls is None:

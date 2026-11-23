@@ -26,11 +26,15 @@ from tensorrt_llm._torch.models.modeling_mistral import (
     MistralHFInputProcessor,
     MistralNativeInputProcessor,
 )
+from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
+    make_multimodal_encoder_model_config,
+)
 from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
 from tensorrt_llm._torch.pyexecutor import resource_manager
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
 from tensorrt_llm.bindings import executor as executor_lib
 from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.llmapi.llm_args import MultimodalConfig
 from tensorrt_llm.models import modeling_utils
 
 _PATCH_SIZE = 14
@@ -188,12 +192,17 @@ def test_mistral_3_vlm_disable_mm_encoder_skips_vision_modules(mistral_small_3_1
     config_dict["vision_config"]["num_hidden_layers"] = 1
     model_config = model_config_lib.ModelConfig(
         pretrained_config=transformers.Mistral3Config.from_dict(config_dict),
-        disable_mm_encoder=True,
+        mapping=mapping_lib.Mapping(world_size=4, tp_size=4, enable_attention_dp=True),
+        multimodal_config=MultimodalConfig(encoder_data_parallel_size=2),
     )
+    make_multimodal_encoder_model_config(model_config)
+    assert model_config._mm_encoder_parallel_layout.collective
 
     with MetaInitMode():
-        model = modeling_mistral.Mistral3VLM(model_config)
+        model = modeling_mistral.Mistral3VLM(model_config.copy_with(disable_mm_encoder=True))
 
+    assert not model._encoder_parallel_layout.collective
+    assert not model._encoder_parallel_layout.distributes_items
     assert model._vision_tower is None
     assert model._multi_modal_projector is None
     assert not any(

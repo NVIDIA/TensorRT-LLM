@@ -375,15 +375,15 @@ def _normalize_encoder_embeddings(
     return encoder_embeddings
 
 
-def _join_embeddings(embeddings: List[torch.Tensor],
-                     *,
-                     start: int = 0,
-                     end: Optional[int] = None) -> torch.Tensor:
-    """Join per-item/per-request embeddings along dim 0 without a needless copy.
+def _concat_embeddings(embeddings: List[torch.Tensor],
+                       *,
+                       start: int = 0,
+                       end: Optional[int] = None) -> torch.Tensor:
+    """Concatenate per-item/per-request embeddings along dim 0 without a needless copy.
 
     ``torch.cat`` always allocates, so calling it on a one-element list
     duplicates the whole embedding. That matters here because the same rows
-    are joined several times on the way to the LLM input (per request, per
+    are concatenated several times on the way to the LLM input (per request, per
     batch, and again in ``fuse_input_embeds``), and each redundant copy is a
     full extra allocation live at the prefill peak. Multimodal embeddings are
     read-only downstream -- they are sliced and scattered into the input
@@ -510,7 +510,7 @@ def get_attached_multimodal_embeddings(
     Use this on E/P prefill workers and cached-only paths. The encoder already ran somewhere else.
     Normally `find_input_mm_embeds` selects active rows afterwards. If item
     scheduling attached current-chunk embeddings, select the same chunk from
-    any full-request embeddings before joining the batch. This keeps mixed
+    any full-request embeddings before concatenating the batch. This keeps mixed
     batches in one row layout without copying unrelated future chunks.
 
     Side-stream-prefetched requests must use `get_multimodal_embeddings`, which waits on
@@ -534,12 +534,12 @@ def get_attached_multimodal_embeddings(
             start = runtime.num_cached_mm_tokens
             end = start + runtime.num_mm_tokens_in_chunk
             if isinstance(embeds, list):
-                embeds = _join_embeddings(embeds, start=start, end=end)
+                embeds = _concat_embeddings(embeds, start=start, end=end)
             else:
                 embeds = embeds[start:end]
         elif isinstance(embeds, list):
             # Legacy paths can attach a list of full-request output pieces.
-            embeds = _join_embeddings(embeds)
+            embeds = _concat_embeddings(embeds)
             param.multimodal_data["multimodal_embedding"] = embeds
         if not isinstance(embeds, torch.Tensor):
             raise TypeError("multimodal_embedding must be a torch.Tensor")
@@ -548,7 +548,7 @@ def get_attached_multimodal_embeddings(
     if not attached_embeddings:
         return []
     # Match get_multimodal_embeddings output: one concatenated tensor.
-    return [_join_embeddings(attached_embeddings)]
+    return [_concat_embeddings(attached_embeddings)]
 
 
 def find_input_mm_embeds(
@@ -635,7 +635,7 @@ def find_input_mm_embeds(
 
     if len(mm_embeds) == 1:
         sliced = [mm_embeds[0][start:end] for start, end in slices]
-        return [_join_embeddings(sliced)]
+        return [_concat_embeddings(sliced)]
     return [mm_embeds[i][start:end] for i, (start, end) in enumerate(slices)]
 
 
@@ -744,7 +744,7 @@ def fuse_input_embeds(
             return input_ids, None, extra_embeds
         return input_ids, None
 
-    mm_embed = _join_embeddings(mm_embeds)
+    mm_embed = _concat_embeddings(mm_embeds)
 
     # TODO: support the case where only one index tensor is provided, the other is derived as the complement (try to avoid implicit host-device synchronization)
     if text_token_indices is None or mm_token_indices is None:

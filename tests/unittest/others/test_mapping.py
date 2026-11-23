@@ -225,6 +225,32 @@ def test_glm5_next_attention_mapping_is_unchanged(tp_size, pp_size, rank):
     assert _fields(glm5_next_attention_mapping(mapping)) == _fields(old)
 
 
+@pytest.mark.parametrize(("enable_attention_dp", "dp_size"), [(False, 2),
+                                                              (True, 1),
+                                                              (True, 2)])
+def test_encoder_mapping_is_unchanged(enable_attention_dp, dp_size):
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.models.multimodal_encoder_data_parallel import \
+        EncoderParallelLayout
+    from tensorrt_llm.llmapi.llm_args import MultimodalConfig
+    mapping = Mapping(world_size=4,
+                      rank=3,
+                      tp_size=4,
+                      enable_attention_dp=enable_attention_dp)
+    old = Mapping(world_size=4,
+                  rank=3,
+                  gpus_per_node=mapping.gpus_per_node,
+                  tp_size=4 // dp_size,
+                  pp_size=dp_size)
+    config = ModelConfig(
+        mapping=mapping,
+        multimodal_config=MultimodalConfig(encoder_data_parallel_size=dp_size))
+
+    new = EncoderParallelLayout.from_config(config).mapping
+
+    assert _fields(new) == _fields(old)
+
+
 class TestMapping(unittest.TestCase):
 
     def test_mapping(self):
