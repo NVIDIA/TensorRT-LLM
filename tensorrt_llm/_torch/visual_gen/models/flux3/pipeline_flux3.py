@@ -737,12 +737,18 @@ class Flux3Pipeline(BasePipeline):
             self._check_token_counts({"reference": references.num_tokens})
         samples, cfg_parallel = self._cfg_samples(guidance_scale)
         prompts = {_COND: prompt, _UNCOND: negative_prompt or ""}
-        tokens = [self._tokenize(prompts[sample]) for sample in samples]
+        # CFG ranks encode both prompts, as BasePipeline does, and keep only their own.
+        encoded = (_COND, _UNCOND) if cfg_parallel else samples
+        tokens = {sample: self._tokenize(prompts[sample]) for sample in encoded}
         self._check_token_counts(
-            {f"{sample} text": ids.shape[1] for sample, (ids, _) in zip(samples, tokens)}
+            {f"{sample} text": ids.shape[1] for sample, (ids, _) in tokens.items()}
         )
 
-        contexts = [self._encode_prompt(ids, mask)[0].to(self.dtype) for ids, mask in tokens]
+        contexts = []
+        for sample, (ids, mask) in tokens.items():
+            context = self._encode_prompt(ids, mask)[0].to(self.dtype)
+            if sample in samples:
+                contexts.append(context)
         conditioning = self._encode_references(references) if references is not None else None
         latents, latent_ids = self._prepare_latents(height, width, seed)
 

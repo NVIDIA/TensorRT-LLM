@@ -933,9 +933,13 @@ def test_cfg_parallel_ranks_split_the_samples_and_gather_conditional_first(
 
     monkeypatch.setattr(pipeline_flux3.dist, "all_gather", all_gather)
     kwargs = dict(height=64, width=64, num_inference_steps=2, seed=0)
-    pipeline.forward("a cat", negative_prompt="blurry", guidance_scale=3.5, **kwargs)
-    assert pipeline.text_encoder.tokenized == ["a cat" if conditional else "blurry"]
-    assert all(len(dict(call["layout"])["text"]) == 1 for call in pipeline.transformer.calls)
+    # Both ranks encode both prompts and keep their own: the long prompt pads to 160 tokens.
+    long_prompt = " ".join(["cat"] * 80)
+    pipeline.forward(long_prompt, negative_prompt="blurry", guidance_scale=3.5, **kwargs)
+    assert pipeline.text_encoder.tokenized == [long_prompt, "blurry"]
+    assert len(pipeline.text_encoder.encoded) == 2
+    text = (160,) if conditional else (80,)
+    assert all(dict(call["layout"])["text"] == text for call in pipeline.transformer.calls)
     # Each rank sends its own single-sample prediction, once per step.
     assert len(gathered) == 2 and all(torch.all(tensor == 1) for tensor in gathered)
     combined = pipeline._guide(torch.zeros(4, 2), 1, 3.5, cfg_parallel=True)
