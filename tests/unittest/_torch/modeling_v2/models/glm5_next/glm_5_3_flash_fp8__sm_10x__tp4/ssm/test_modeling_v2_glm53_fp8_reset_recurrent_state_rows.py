@@ -20,7 +20,9 @@ from tensorrt_llm._utils import get_sm_version
 __extra_import_path__ = ["../../../.."]
 from _validating import certifying, validating  # noqa: E402,F401 -- path above; fixture by name
 
-pytestmark = pytest.mark.skipif(get_sm_version() != 100, reason="certified on sm_100")
+pytestmark = pytest.mark.skipif(
+    get_sm_version() not in (100, 103), reason="certified on sm_100 and sm_103"
+)
 
 #: GLM-5.3-Flash's KDA at TP4: 64 heads over 4 ranks, K = V = 128.
 HEADS, HEAD_DIM = 16, 128

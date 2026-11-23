@@ -95,7 +95,7 @@ class LowMBf16Gemm(OpWrapper):
     (cuBLAS) for any shape or M the table does not cover, so it is safe on every call.
     """
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
     CELLS: tuple[Cell, ...] = (
         Cell(why="KDA [f_a | g_a | b], MTP-3 verify of one request", spec=dict(m=4, n=272, k=4096)),

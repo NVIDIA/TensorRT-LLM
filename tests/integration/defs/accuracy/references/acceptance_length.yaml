@@ -88,6 +88,9 @@ TestGPTOSS::test_eagle3_1gpu[cutlass-one_model]:
 TestGemma4_26B_A4B::test_nvfp4:
   ref_al: 3.379348
   min_al: 3.2103806
+TestGemma4_E4B::test_bf16_mtp:
+  ref_al: 3.269323
+  min_al: 3.1058569
 TestStep3p7SpeculativeDecoding::test_step3p7_mtp:
   ref_al: 3.143075
   min_al: 2.98592125
@@ -333,3 +336,14 @@ ModelingV2Qwen38FlashNextFp8Sm103Unified::mtp3_fp8_kv:
 ModelingV2Qwen38FlashNextFp8Sm103Unified::mtp3_long_context:
   ref_al: 4.000
   min_al: 3.800
+
+# Read by TestModelingV2Glm53FlashNvfp4Sm10xTp4::test_gsm8k_identity_vs_mtp3_and_acceptance at
+# both of its tp4 layouts. Keyed by target and variant for the same reason as the
+# ModelingV2DeepseekR10528Nvfp4Sm10xDefault::mtp3 entry above. max_draft_len is 3, so
+# acceptance length lives in [1.0, 4.0].
+ModelingV2Glm53FlashNvfp4Sm10xTp4::mtp3:
+  # Full gsm8k on B200 under the test's MTP3 config: stock (modeling_v2="off") 3.3897 at tp4
+  # and 3.3992 at tp4_ep4, modeling_v2 3.392 and 3.389. ref_al is the STOCK tp4 reading, so the
+  # gate is not self-referential; min_al is 95% of it.
+  ref_al: 3.3897
+  min_al: 3.2202

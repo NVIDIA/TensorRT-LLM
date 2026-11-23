@@ -71,7 +71,7 @@ class KdaMtpDecode(OpWrapper):
         A new contiguous bf16 ``[1, B * (1 + num_spec), H, 128]`` output.
     """
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     # GLM-5.3-Flash's KDA at TP4 (16 of 64 heads). The op's own edges here; the MTP-3 verify steps the shipped
     # target runs are in this entry's test. With 16 heads the packed fused-norm verify runs the cluster-pair
     # kernel while B * H <= 64, one CTA per (head, request) while B * H fits the SMs, the two-CTA-per-SM kernel

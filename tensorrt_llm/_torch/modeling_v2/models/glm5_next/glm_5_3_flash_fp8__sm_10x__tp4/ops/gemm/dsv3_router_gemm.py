@@ -38,7 +38,7 @@ class Dsv3RouterGemm(OpWrapper):
       step of more than 16 rows, and any call with a bias or a non-FP32 output.
     """
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
     # Only GLM-5.3-Flash calls this entry. Its own cells are the boundary between the two
     # kernels at GLM's router shape; the target's row counts are in the test.
@@ -73,7 +73,7 @@ class Dsv3RouterGemm(OpWrapper):
 
     Not certified: a bias (it goes to the same cuBLASLt call as `cublas_mm`, whose hazards
     `is_valid` repeats), outputs other than FP32, operand dtypes other than BF16, router
-    shapes other than GLM-5.3-Flash's, CUDA-graph capture, sm_103.
+    shapes other than GLM-5.3-Flash's, CUDA-graph capture.
     """
 
     def __call__(

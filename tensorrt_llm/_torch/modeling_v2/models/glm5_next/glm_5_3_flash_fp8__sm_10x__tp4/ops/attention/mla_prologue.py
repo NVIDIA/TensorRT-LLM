@@ -92,7 +92,7 @@ class MlaPrologue(OpWrapper):
     ``[slots, tokens_per_block, kv_lora]`` and the BF16 indexer pool ``[slots, tokens_per_block,
     >= 2 * head_dim]``. ``scale`` is the FP32 ``[1]`` quantization scale of the latent cache."""
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     # The target's generation rows: T = 1 (plain decode and the MTP draft steps) or 4 (MTP-3
     # verify) rows per request, read through the int64 GLM block tables.
     CELLS: tuple[Cell, ...] = (

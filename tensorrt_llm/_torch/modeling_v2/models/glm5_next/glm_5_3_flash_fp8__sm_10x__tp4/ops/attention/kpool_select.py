@@ -182,7 +182,7 @@ class KpoolSelect(OpWrapper):
     [R, blocks] -> (``packed`` int32 [R, W], ``lengths`` int32 [R], ``nonempty`` bool [R]) with
     ``W = cdiv(out_width, 64) * 64``, the layout ``compact_sparse_rows`` returns."""
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     CELLS: tuple[Cell, ...] = (
         Cell(why="MTP-3 verify of one 13K-token request", spec=dict(rows=4, kv=13312, pools=32800)),
         Cell(

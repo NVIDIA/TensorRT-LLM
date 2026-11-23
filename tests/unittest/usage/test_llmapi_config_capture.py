@@ -788,6 +788,8 @@ def test_collect_llm_api_config_captures_sparse_algorithm_for_every_arm():
             model="/customer/private/Llama",
             skip_tokenizer_init=True,
             sparse_attention_config=sparse_config,
+            # RocketKV rejects KV cache block reuse, which is enabled by default.
+            kv_cache_config=KvCacheConfig(enable_block_reuse=False),
         )
         captured, meta = _loads_payloads(args)
         assert captured["sparse_attention_config.algorithm"] == sparse_config.algorithm

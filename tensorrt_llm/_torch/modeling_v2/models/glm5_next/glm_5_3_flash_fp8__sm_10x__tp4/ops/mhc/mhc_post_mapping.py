@@ -44,7 +44,7 @@ class MhcPostMapping(OpWrapper):
         ``[M, 4, hidden]`` BF16, a new contiguous tensor of ``residual``'s shape.
     """
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
     _GLM = dict(mult=MULT, hidden=HIDDEN)
     CELLS: tuple[Cell, ...] = (
