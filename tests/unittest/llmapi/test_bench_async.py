@@ -446,7 +446,7 @@ async def test_llm_manager_idle_worker_waits_instead_of_polling() -> None:
     polls = 0
     get_nowait = manager._inbox.get_nowait
 
-    def counting_get_nowait():
+    def counting_get_nowait() -> tuple[InferenceRequest, SamplingParams, PostprocParams]:
         nonlocal polls
         polls += 1
         return get_nowait()
@@ -464,8 +464,13 @@ async def test_llm_manager_idle_worker_waits_instead_of_polling() -> None:
     await manager.enqueue(req, SamplingParams(), PostprocParams())
     await asyncio.wait_for(outbox.get(), timeout=10)
 
-    # So does a stop.
-    await asyncio.wait_for(manager.stop(), timeout=10)
+    # So does a stop. asyncio.wait does not cancel on timeout, so a stop() that
+    # no longer wakes the worker fails here.
+    stop_task = asyncio.create_task(manager.stop())
+    done, _ = await asyncio.wait({stop_task}, timeout=10)
+    if stop_task not in done:
+        stop_task.cancel()
+    assert stop_task in done, "stop() did not wake the idle worker"
     assert manager._backend_task.done()
 
 
