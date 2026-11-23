@@ -119,6 +119,7 @@ Encoder and LLM forward Params are execution views.
 | `tensorrt_llm/_torch/models/` | PyTorch backend model implementations (distinct from the top-level `models/` package) |
 | `tensorrt_llm/_torch/attention/ATTENTION_DEVELOPER_GUIDE.md` | Attention, MLA, backend families, sparse backends, metadata contracts, and KV-cache behavior - **read before modifying anything under `tensorrt_llm/_torch/attention/`** |
 | `tensorrt_llm/_torch/moe/fused_moe/MOE_DEVELOPER_GUIDE.md` | MoE architecture, backends, communication, development patterns — **read before modifying MoE code** |
+| `tensorrt_llm/_torch/pyexecutor/kv_cache/PAGE_TABLE_SPEC_GUIDE.md` | The page table spec each KV cache manager states for disaggregated transfer and KV cache sharing — **read before changing a KV cache manager's roles, layer naming or page table spec** |
 | `tensorrt_llm/_torch/pyexecutor/kv_cache/REGIONS_DEVELOPER_GUIDE.md` | KV cache regions: persistent state declared with a life cycle of its own and laid out as native regions — **read before adding model- or backend-specific state to the KV cache managers** |
 | `tensorrt_llm/_torch/pyexecutor/kv_cache/mamba_cache_manager/RECURRENT_STATE_DEVELOPER_GUIDE.md` | Recurrent state (Mamba2, GDN, KDA): the state a model declares, how shared runtime code finds the declaration, and what a family provides to its cache manager — **read before adding a recurrent family or a check on a recurrent model or cache manager** |
 | `CODING_GUIDELINES.md` | C++ and Python coding standards (referenced throughout, must read before contributing) |
@@ -133,6 +134,7 @@ Encoder and LLM forward Params are execution views.
 | **Attention backends** | `TorchLlmArgs.attn_backend` selects kernel: `TRTLLM` (default), `FlashInfer`, `FlashAttention` |
 | **Distributed execution** | Tensor/pipeline parallelism via `Mapping` class, multiple backends (MPI, Ray, RPC) |
 | **Auto-discovery** | Models self-register via `automodel.py`, resolved by HF config `architectures` field |
+| **Per-step device copies** | New per-step H2D/D2D copies in runtime code go through `_torch/pyexecutor/device_copy.py` with a named `CopySite`; a model opts in by declaring a `CopyPlan` (`copy_plan`). The step-input pack (`step_inputs.py`, `h2d_cache.py`, `tensorrt_llm/_device_copy.py`, `RuntimeHooks.pack_*` / `skip_unchanged_h2d`) is legacy: keep its users working, add no new ones. See [the copy plan guide](docs/source/developer-guide/device-copy-plan.md) |
 
 ## VisualGen
 
@@ -158,6 +160,7 @@ Key files:
 - **Copyright year** — update to current year when modifying existing files; add full header to new files.
 - **Avoid broad exception handling** — catch specific exceptions, not bare `except:` (see `CODING_GUIDELINES.md`).
 - **One concern per PR** — avoid scope creep. If a PR touches unrelated areas, split it.
+- **Replacing a shared runtime mechanism** — add the new one beside the old, opt-in and off by default, so code on the old one keeps its behavior and performance; move models in follow-up PRs and delete the old mechanism last. Do not delete or change the old API in the PR that introduces the new one.
 - **User-facing configuration classes** - when editing or defining any user-facing configuration classes (particularly `BaseLlmArgs` or any class used in its fields), you **MUST** follow the Pydantic guidelines in `CODING_GUIDELINES.md`.
 
 ## Development Workflow

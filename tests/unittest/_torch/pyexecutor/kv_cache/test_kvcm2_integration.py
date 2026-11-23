@@ -386,8 +386,8 @@ class _FakeKVCache:
         self.num_committed_tokens += len(tokens)
         self.history_length = max(self.history_length, self.num_committed_tokens)
 
-    def resize(self, capacity, history_length: int) -> bool:
-        del capacity
+    def resize(self, capacity, history_length: int, *, complete_optional_recovery=False) -> bool:
+        del capacity, complete_optional_recovery
         self.history_length = history_length
         return True
 

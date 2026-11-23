@@ -339,7 +339,8 @@ def throughput_command(
             "is submitted to the engine at once, so there is no point at which "
             "the deadline can be applied and the full dataset would run. Pass "
             "--concurrency N.")
-    tokenizer = initialize_tokenizer(options.checkpoint_path, custom_tokenizer)
+    tokenizer = initialize_tokenizer(options.checkpoint_path, custom_tokenizer,
+                                     options.checkpoint_format)
 
     # Extract throughput-specific options not handled by GeneralExecSettings
     max_batch_size = params.get("max_batch_size")

@@ -41,10 +41,12 @@ from .. import LLM as PyTorchLLM
 from ..inputs import (ConversationMessage, MultimodalDataTracker,
                       add_multimodal_placeholders, convert_image_mode)
 from ..inputs.content_format import ContentFormat
+from ..inputs.model_config import resolve_top_level_model_type
 from ..inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
 from ..inputs.utils import _resolve_content_format
 from ..inputs.utils import apply_chat_template as trtllm_apply_chat_template
-from ..inputs.utils import interleave_mm_placeholders, resolve_hf_chat_template
+from ..inputs.utils import (interleave_mm_placeholders,
+                            renders_from_loaded_media, resolve_hf_chat_template)
 from ..llmapi import RequestOutput
 from ..logger import logger
 from ..sampling_params import SamplingParams
@@ -613,7 +615,19 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
             self.model_type)
 
     def _get_model_type(self, llm: PyTorchLLM) -> str:
-        """Extract model type from the model configuration."""
+        """The model type of the loaded model.
+
+        Read from the configuration the input processor was loaded with, which
+        follows the checkpoint format: a Mistral-native checkpoint is
+        ``mistral_common`` whether or not it ships a Hugging Face config.json.
+        The checkpoint's config.json otherwise.
+        """
+        processor_config = getattr(getattr(llm, "input_processor", None),
+                                   "config", None)
+        if processor_config is not None:
+            model_type = resolve_top_level_model_type(processor_config)
+            if model_type:
+                return model_type
         config_path = os.path.join(llm._hf_model_dir, 'config.json')
 
         if not os.path.exists(config_path):
@@ -645,6 +659,15 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
 
         Adapted from: https://github.com/EleutherAI/lm-evaluation-harness/blob/7f04db12d2f8e7a99a0830d99eb78130e1ba2122/lm_eval/models/hf_vlms.py#L225
         """
+        if renders_from_loaded_media(self.model_type):
+            # lm-eval supplies image pixels only in generate_until, and
+            # mistral-common sizes each image's tokens from its pixels. Its
+            # cached context is a string, so keep the structured chat there
+            # and render it once the images are loaded.
+            return json.dumps({
+                "conversation": chat_history,
+                "add_generation_prompt": add_generation_prompt
+            })
         # Resolve content format once to decide whether to pre-insert
         # placeholders. OPENAI templates handle media natively, so we must
         # NOT pre-insert or the template will produce duplicates.
@@ -738,6 +761,64 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
                 }))
         return output
 
+    def _render_native_mistral_chat(self, prompt: str, images) -> List[int]:
+        """Render a deferred chat with mistral-common, its images where the text has them.
+
+        The image placeholders take the images in order, across the conversation;
+        placeholders past the last image (``is_force_single_image``) are dropped,
+        and images past the last placeholder follow the last user message's text.
+        """
+        deferred = json.loads(prompt)
+        conversation, counts = [], []
+        placed = 0
+        for message in deferred["conversation"]:
+            parts = message["content"].split(LM_EVAL_DEFAULT_IMAGE_PLACEHOLDER)
+            content_parts = []
+            for index, text in enumerate(parts):
+                if text:
+                    content_parts.append(text)
+                if index < len(parts) - 1 and placed < len(images):
+                    content_parts.append({
+                        "type": "image",
+                        "media_index": placed
+                    })
+                    placed += 1
+            conversation.append(
+                ConversationMessage(role=message.get("role", "user"),
+                                    content="".join(parts),
+                                    content_parts=content_parts))
+            counts.append(sum(isinstance(part, dict) for part in content_parts))
+        if conversation and placed < len(images):
+            # mistral-common takes images in user messages only, so they do
+            # not join an assistant generation prefix.
+            target = next((index for index in reversed(range(len(conversation)))
+                           if conversation[index]["role"] == "user"),
+                          len(conversation) - 1)
+            for index in range(placed, len(images)):
+                conversation[target]["content_parts"].append({
+                    "type":
+                    "image",
+                    "media_index":
+                    index
+                })
+            counts[target] += len(images) - placed
+        return trtllm_apply_chat_template(
+            model_type=self.model_type,
+            tokenizer=self.llm.tokenizer,
+            processor=None,
+            conversation=conversation,
+            add_generation_prompt=deferred["add_generation_prompt"],
+            mm_placeholder_counts=[{
+                "[IMG]": count
+            } if count else {} for count in counts],
+            mm_data={"image": images},
+            chat_template_kwargs={
+                **(self.chat_template_kwargs or {}),
+                # A gen_prefix ends the chat with the assistant turn to continue.
+                "continue_final_message":
+                not deferred["add_generation_prompt"],
+            })
+
     def generate_until(self, requests, disable_tqdm: bool = False) -> List[str]:
         """
         Generate text responses for multimodal requests.
@@ -764,7 +845,6 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
 
             # NOTE: For now, only this part is different from the original generate_until
             prompt, gen_kwargs, media_data = request.args
-            prompt = prompt_inputs(prompt)
 
             # NOTE: Convert RGBA format to RGB format
             if self.is_force_single_image:
@@ -775,6 +855,9 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
                     convert_image_mode(img, "RGB")
                     for img in media_data["visual"]
                 ]
+            if renders_from_loaded_media(self.model_type):
+                prompt = self._render_native_mistral_chat(prompt, images)
+            prompt = prompt_inputs(prompt)
             prompt["multi_modal_data"] = {"image": images}
 
             sampling_params = self._get_sampling_params(gen_kwargs)

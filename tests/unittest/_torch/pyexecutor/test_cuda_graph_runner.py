@@ -52,6 +52,7 @@ def _empty_runner() -> CUDAGraphRunner:
     runner.graph_outputs = {}
     runner.graph_metadata = {}
     runner._step_input_prologue_keys = {}
+    runner._prologue_copiers = {}
     runner._hostfunc_graph_keys = set()
     runner.forward_scratch_buffers = Buffers()
     return runner
@@ -729,6 +730,7 @@ def test_replay_defers_copies_only_to_its_captured_pack(monkeypatch, same_pack, 
     runner._check_strict_buffer_stability = lambda meta: None
     runner._get_num_tokens_for_key = lambda key: 1
     runner._step_input_prologue_keys = {key: captured}
+    runner._prologue_copiers = {}
     runner._pre_replay_hooks = []
     runner._hostfunc_graph_keys = set()
 
@@ -767,6 +769,7 @@ def test_forward_scratch_is_released_with_runner(monkeypatch: pytest.MonkeyPatch
     runner.graphs = {}
     runner.graph_outputs = {}
     runner._step_input_prologue_keys = {}
+    runner._prologue_copiers = {}
     runner._hostfunc_graph_keys = set()
     runner.forward_scratch_buffers = Buffers()
     scratch = torch.empty(16)

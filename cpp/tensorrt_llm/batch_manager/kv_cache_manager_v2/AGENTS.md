@@ -100,6 +100,7 @@ may have sliding-window and sink-token rules; SSM lifecycles represent a
 recurrent-state checkpoint. Both layer configs expose `reusePolicy`: `REQUIRED`
 constrains the prefix match, `OPTIONAL` offers state at the required endpoint for
 explicit selection on first resume, and `PRIVATE` never publishes reusable pages.
+Attention buffers with an effective `OPTIONAL` policy require a sliding window.
 A buffer may override its layer's default through `BufferConfig::reusePolicy`.
 This applies to attention and SSM buffers, so one model layer may span several
 lifecycle groups. Use `getBufferGroupId(layerId, role)` and `bufferGrouping()`
@@ -210,6 +211,36 @@ live pages may be moved into the radix tree rather than copied.
 `stopCommitting()` is a distinct transition and must not call `commit()`:
 doing so would append the same tokens twice. It also releases stale held SWA
 pages and performs final commit-state bookkeeping.
+
+Cache creation records complete OPTIONAL endpoints, including partial pages, during the
+forward radix-tree walk. `optionalReuseMaxBacktrack` bounds selectable endpoints
+relative to the REQUIRED match `P`, defaulting to `P` only. Creation holds the
+union of pages needed by those endpoints. Callers
+select any endpoint in `reuse_status.endpoint_ranges` at first `resume()`. These
+half-open ranges permit different groups to share a partial recovery boundary. REQUIRED prefix reuse
+is unchanged; selected groups restore their lookback and receive private pages
+for the gap to that prefix. A partial recovery tail is copied into a private page
+at the selected group endpoint, even when GLOBAL matched farther ahead. A source
+page may cover more tokens than the selected match. Resume discards unused candidates before allocation
+and releases the selected candidate references after their page locks take over.
+Failed admission retains the selected state for retry.
+Declining an OPTIONAL group on retry releases its candidate holds and partial-copy
+retention borrows before allocation; REQUIRED and retained selections keep theirs.
+
+Selected OPTIONAL groups may start behind the REQUIRED history. Their initial
+histories survive capacity reservation, rollback, and suspend/resume. The normal
+post-forward history update advances them and reclaims stale pages using the
+same rules as REQUIRED groups. `resize(..., completeOptionalRecovery=true)`
+(Python `complete_optional_recovery=True`) explicitly completes recovery through
+the resulting history length, including at unchanged length, after all recovery
+KV accesses have been submitted on the cache stream. Capacity, history, and
+recovery state roll back together on page exhaustion. `commit()` also reports
+completed recovery. By default, `resize()` preserves recovery state even when
+updating the history marker before execution. The `history_length` setter is a
+convenience wrapper and rejects pending OPTIONAL recovery; use `resize()` to
+explicitly preserve or complete it. Complete recovery before entering decode.
+A failed model forward must close and re-create the cache before re-executing
+potentially modified state.
 
 ### Page status
 

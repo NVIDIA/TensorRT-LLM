@@ -142,7 +142,7 @@ from tensorrt_llm.serve.render import (HarmonyConversionError, RenderResources,
                                        mount_render_endpoints,
                                        prepare_chat_request, render_chat,
                                        render_chat_for_length,
-                                       render_conversation)
+                                       render_conversation_with_media)
 from tensorrt_llm.serve.reranker import (Qwen3RerankInputBuilder,
                                          rerank_probability)
 from tensorrt_llm.serve.responses_utils import (ClosingStreamingResponse,
@@ -1647,16 +1647,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 token_ids_list.append(token_ids)
 
             try:
-                # Validate every input's length up front so an oversize item fails
-                # the whole request before any item is enqueued — otherwise gather()
-                # cancels the awaiters but their already-queued inputs still run
-                # encode() (wasted GPU work).
-                for token_ids in token_ids_list:
-                    self.encode_batcher.validate_input(token_ids)
-                results = await asyncio.gather(*[
-                    self.encode_batcher.submit(token_ids)
-                    for token_ids in token_ids_list
-                ])
+                results = await self.encode_batcher.submit_many(token_ids_list)
             except InputTooLongError as e:
                 return self.create_error_response(
                     str(e), status_code=HTTPStatus.BAD_REQUEST)
@@ -2610,24 +2601,34 @@ class OpenAIServer(_VideoRoutesMixin):
                 prompt = request.prompt_token_ids
             else:
                 # Render (and append the forced named-tool prefix, see
-                # ``_build_forced_tool_call_decoding``) while the media loads.
+                # ``_build_forced_tool_call_decoding``) while the media loads,
+                # or once it has loaded for a renderer that needs it.
                 # Tokenization stays with the engine's input processor.
-                render_task = render_conversation(
-                    render_resources,
-                    conversation=conversation,
-                    mm_placeholder_counts=mm_placeholder_counts,
-                    add_generation_prompt=request.add_generation_prompt,
-                    tools=tool_dicts,
-                    documents=request.documents,
-                    chat_template=request.chat_template,
-                    chat_template_kwargs=request.chat_template_kwargs,
-                    injected_chat_template_kwargs=request.
-                    injected_chat_template_kwargs,
-                    forced_prefix=forced_tool_begin_prefix,
-                )
-                rendered, (mm_data, mm_embeddings) = await asyncio.gather(
-                    render_task, mm_coroutines)
+                rendered, (
+                    mm_data,
+                    mm_embeddings) = await render_conversation_with_media(
+                        render_resources,
+                        mm_coroutines,
+                        conversation=conversation,
+                        mm_placeholder_counts=mm_placeholder_counts,
+                        add_generation_prompt=request.add_generation_prompt,
+                        tools=tool_dicts,
+                        documents=request.documents,
+                        chat_template=request.chat_template,
+                        chat_template_kwargs=request.chat_template_kwargs,
+                        injected_chat_template_kwargs=request.
+                        injected_chat_template_kwargs,
+                        forced_prefix=forced_tool_begin_prefix,
+                        truncate_prompt_tokens=request.truncate_prompt_tokens,
+                    )
                 if rendered.text is None:
+                    if forced_tool_begin_prefix is not None:
+                        # The prefix is text; appending it to rendered token
+                        # ids would need a re-encode that loses control tokens.
+                        raise ValueError(
+                            "tool_choice with a named function is not "
+                            "supported for this model, whose chat template "
+                            "renders token ids.")
                     prompt = rendered.token_ids
                 else:
                     prompt = rendered.text
@@ -3195,20 +3196,21 @@ class OpenAIServer(_VideoRoutesMixin):
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
             else:
-                render_task = render_conversation(
-                    render_resources,
-                    conversation=conversation,
-                    mm_placeholder_counts=mm_placeholder_counts,
-                    add_generation_prompt=request.add_generation_prompt,
-                    tools=tool_dicts,
-                    documents=request.documents,
-                    chat_template=request.chat_template,
-                    chat_template_kwargs=request.chat_template_kwargs,
-                    injected_chat_template_kwargs=request.
-                    injected_chat_template_kwargs,
-                )
-                rendered, (mm_data, mm_embeddings) = await asyncio.gather(
-                    render_task, mm_coroutines)
+                rendered, (
+                    mm_data,
+                    mm_embeddings) = await render_conversation_with_media(
+                        render_resources,
+                        mm_coroutines,
+                        conversation=conversation,
+                        mm_placeholder_counts=mm_placeholder_counts,
+                        add_generation_prompt=request.add_generation_prompt,
+                        tools=tool_dicts,
+                        documents=request.documents,
+                        chat_template=request.chat_template,
+                        chat_template_kwargs=request.chat_template_kwargs,
+                        injected_chat_template_kwargs=request.
+                        injected_chat_template_kwargs,
+                    )
                 prompt = (rendered.text
                           if rendered.text is not None else rendered.token_ids)
             prompt = prompt_inputs(prompt)
