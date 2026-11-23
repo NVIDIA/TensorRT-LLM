@@ -859,11 +859,12 @@ _SM107_GENPHASE_TACTICS: dict[int, Tuple] = {
         1,
         (4, 4),
     ),
+    # 384: re-tuned on the decode-only kernel, where this entry beats N256 / lead 45 by 1-2%.
     384: (
-        [256, 256, 256],
+        [256, 128, 256],
         [4, 1, 1],
         None,
-        ("decode", 45),
+        ("decode", 91),
         "atomic_counter",
         "epi_warps",
         True,
