@@ -117,8 +117,8 @@ def test_require_reports_all_engine_and_dflash_refusals(monkeypatch):
         assert reason in str(error.value)
 
 
-@pytest.mark.parametrize("bad_shape", [False, True])
-def test_rejected_hardware_or_shape_does_not_import_target(monkeypatch, bad_shape):
+@pytest.mark.parametrize("sm", [(9, 0), (10, 0), (10, 3)])
+def test_rejected_hardware_or_shape_does_not_import_target(monkeypatch, sm):
     original_import = builtins.__import__
 
     def guard(name, *args, **kwargs):
@@ -130,13 +130,15 @@ def test_rejected_hardware_or_shape_does_not_import_target(monkeypatch, bad_shap
 
     monkeypatch.setattr(builtins, "__import__", guard)
     config = _config()
-    if bad_shape:
+    for name in ("engine_refusal", "speculation_refusal"):
+        monkeypatch.setattr(routing, name, Mock(side_effect=AssertionError(name)))
+    if sm == (10, 3):
         config.pretrained_config.num_hidden_layers = 6
     with pytest.raises(_router_index.NoTarget):
         _route(
             config.pretrained_config,
             config.mapping,
-            (10, 3) if bad_shape else (9, 0),
+            sm,
             None,
             None,
             llm_args=NS(max_num_tokens=8192),

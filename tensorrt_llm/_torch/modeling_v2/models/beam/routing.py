@@ -186,10 +186,7 @@ def route(
     if quant_algo is None:
         algo = getattr(model_config.quant_config, "quant_algo", None)
         quant_algo = getattr(algo, "value", algo)
-    speculation = speculation_refusal(spec_config, llm_args)
-    engine = engine_refusal(llm_args, spec_config)
-    refusal = None
-    if (
+    matches_deployment = (
         compute_capability == SM
         and shape
         == tuple(
@@ -197,10 +194,14 @@ def route(
         )
         and layout == (WORLD_SIZE, WORLD_SIZE, 1, WORLD_SIZE, 1, False)
         and quant_algo == "NVFP4"
-        and speculation is None
-        and engine is None
         and kv_cache_quant_algo in (None, QuantAlgo.FP8)
-    ):
+    )
+    speculation = engine = refusal = None
+    if matches_deployment:
+        speculation = speculation_refusal(spec_config, llm_args)
+        engine = engine_refusal(llm_args, spec_config)
+
+    if matches_deployment and speculation is None and engine is None:
         from .full_model_nvfp4__sm_103__tp4.weights import BeamNvfp4CheckpointLoader
 
         loader = getattr(llm_args, "checkpoint_loader", None)
