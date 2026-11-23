@@ -209,15 +209,24 @@ def test_eagle3_watermark_with_rejection_sampling(watermark_kwargs):
 def test_dual_key_routing_diversifies_repeated_prompts():
     if torch.cuda.get_device_properties(0).total_memory / 1e9 < 35:
         pytest.skip("Not enough memory to load the target model")
-    # The same prompt twice: with the first key only the two requests repeat each other; routing
-    # tokens to the second key at random makes them diverge. Without deduplication, no repeated
-    # context falls back to ordinary sampling, so the divergence comes from the routing alone.
-    config = WatermarkConfig(
-        key=0x5EED5EED, algorithm="gumbel_dual_key", alpha=0.25, deduplicate_contexts="none"
-    )
+    # The same prompt twice: with the first key only (alpha=0) the two requests repeat each other,
+    # which also shows the watermark is applied; routing tokens to the second key at random makes
+    # them diverge. Without deduplication, no repeated context falls back to ordinary sampling.
+    params = SamplingParams(max_tokens=MAX_TOKENS, temperature=0.8, top_p=0.95, ignore_eos=True)
     prompts = PROMPTS * 2
-    params = dict(max_tokens=MAX_TOKENS, temperature=0.8, top_p=0.95, ignore_eos=True)
-    unseeded = _generate(config, False, False, SamplingParams(**params), prompts)
     count = len(PROMPTS)
-    differ = sum(unseeded[i][1] != unseeded[i + count][1] for i in range(count))
+
+    def run(alpha):
+        config = WatermarkConfig(
+            key=0x5EED5EED,
+            algorithm="gumbel_dual_key",
+            alpha=alpha,
+            deduplicate_contexts="none",
+        )
+        return _generate(config, False, False, params, prompts)
+
+    control = run(0.0)
+    assert all(control[i][1] == control[i + count][1] for i in range(count))
+    routed = run(0.25)
+    differ = sum(routed[i][1] != routed[i + count][1] for i in range(count))
     assert differ == count, f"only {differ}/{count} repeated prompts diverged"
