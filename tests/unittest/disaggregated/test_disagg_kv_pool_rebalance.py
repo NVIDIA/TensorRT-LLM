@@ -412,10 +412,12 @@ class _RecordingAgent:
 class _Manager:
     """Pool groups' slot counts, the plan for the next adjust(), and adjust()."""
 
-    def __init__(self, num_slots, with_plan=True, host_pool_groups=()):
+    def __init__(self, num_slots, with_plan=True, host_pool_groups=(), localized_pool_groups=()):
         self.num_slots = list(num_slots)
         # Pool groups whose pools live in host memory (registered as DRAM).
         self.host_pool_groups = set(host_pool_groups)
+        # Pool groups split across locality domains: their pools have unmapped holes.
+        self.localized_pool_groups = set(localized_pool_groups)
         self.impl = types.SimpleNamespace(pool_group_descs=[], planned_slot_counts=None)
         if not with_plan:
             del self.impl.planned_slot_counts
@@ -436,6 +438,7 @@ class _Manager:
                             slot_stride_bytes=stride,
                             num_slots=n,
                             memory_type="DRAM" if pg in self.host_pool_groups else "VRAM",
+                            mapped_ranges=self._mapped_ranges(pg, n * stride),
                         )
                         for base, stride in _POOLS[pg]
                     ]
@@ -443,6 +446,13 @@ class _Manager:
                 for pg, n in enumerate(self.num_slots)
             ],
         )
+
+    def _mapped_ranges(self, pg, length):
+        """Two domains' chunks with a hole between them, for a localized pool group."""
+        if pg not in self.localized_pool_groups:
+            return None
+        half = length // 2
+        return ((0, half), (half + _SEG, length + _SEG))
 
     def lengths(self, num_slots=None):
         num_slots = self.num_slots if num_slots is None else num_slots
@@ -597,6 +607,43 @@ def test_host_pools_fall_back_to_whole_pool_registration(monkeypatch):
         if adjust_ok:
             mgr.num_slots = list(new_slots)
             mgr._sync()
+        w.end_kv_pool_resize()
+        check()
+
+
+def test_localized_pools_fall_back_to_whole_pool_registration(monkeypatch):
+    """Locality domains leave holes in a pool, so its pools are never registered incrementally.
+
+    A resize can unmap a chunk in the middle of a localized pool, which segments
+    registered from its base would still cover. Every pool is registered whole
+    instead (get_unique_pool_memory_descs registers each mapped range), and a
+    resize drops and redoes the registration.
+    """
+    seen = []
+
+    def descs(page_table, device_id, memory_type=None):
+        seen.append([pool.mapped_ranges for pg in page_table.pool_groups for pool in pg.pools])
+        return _pool_memory_descs(page_table, device_id, memory_type)
+
+    monkeypatch.setattr(transfer, "get_unique_pool_memory_descs", descs)
+    mgr = _Manager((64, 48), localized_pool_groups={0})
+    assert transfer._paged_kv_pools(mgr.page_table()) is None
+    w = _worker(monkeypatch, mgr)
+
+    def check():
+        assert w._kv_segments is None
+        # The page table handed to the whole-pool path carries the holes.
+        assert seen[-1][0] == mgr._mapped_ranges(0, mgr.num_slots[0] * _POOLS[0][0][1])
+        assert {id(d) for d in w._kv_registered_mem} == set(w._agent.live)
+        assert w._agent.live
+
+    check()
+    for new_slots in [(90, 30), (40, 70)]:
+        mgr.impl.planned_slot_counts = list(new_slots)
+        w.begin_kv_pool_resize()
+        assert not w._agent.live and not w._kv_registered_mem and not w._registered_mem
+        mgr.num_slots = list(new_slots)
+        mgr._sync()
         w.end_kv_pool_resize()
         check()
 
