@@ -152,4 +152,15 @@ if(BUILD_XQA_TESTS)
   endif()
 
   add_test(NAME unitTests COMMAND unitTests)
+
+  # Exhaustive bit-exactness test of the 8-bit KV cache word converters in
+  # utils.cuh (no kernel / nvrtc dependencies). Built for SM80+ (not only the
+  # 89/90a pinned above) because the int8 -> bf16 path matters most on Ampere.
+  add_executable(convertKVCacheWordTest test/convertKVCacheWord.cu)
+  set_target_properties(
+    convertKVCacheWordTest PROPERTIES CUDA_ARCHITECTURES
+                                      "80-real;86-real;89-real;90a-real")
+  target_link_libraries(convertKVCacheWordTest PUBLIC GTest::gtest
+                                                      GTest::gtest_main)
+  add_test(NAME convertKVCacheWordTest COMMAND convertKVCacheWordTest)
 endif()
