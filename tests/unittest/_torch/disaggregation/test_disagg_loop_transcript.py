@@ -54,6 +54,7 @@ pytestmark = pytest.mark.cpu_only
 # hand as entry points move.
 _COLLECTIVE_COORDINATOR_CALLS = {
     "handle_errors_synced",  # dist.allreduce / tp_allgather under ADP
+    "agree_pp_handoff_stops",  # all PP owners vote before a handoff retires
     "prepare_context_schedulable",  # transceiver.prepare_context_requests consensus
     "poll_gen_transfers",  # gen transfer status consensus
     "poll_progress_when_idle",  # ctx transfer status consensus
@@ -98,6 +99,11 @@ def _recording_coordinator(calls: list) -> DisaggTransferCoordinator:
         calls.append(("align_gen_admission_across_cp", admitted))
         return admitted
 
+    def agree_pp_handoff_stops(cancel, timeout, ready):
+        calls.append(("agree_pp_handoff_stops", cancel, timeout, ready))
+        return cancel, timeout, ready
+
+    coordinator.agree_pp_handoff_stops = agree_pp_handoff_stops
     coordinator.admit = admit
     coordinator.align_gen_admission_across_cp = align_gen_admission_across_cp
     return coordinator
@@ -239,6 +245,12 @@ _SCHEDULE_HEAD = [
 ]
 # Non-PP loops flush at loop exit; the PP loop does not.
 _SHUTDOWN_PASS = [("handle_errors_synced",), ("flush_pending_transfer_responses",)]
+_PP_HANDOFF = [
+    ("check_transfer_timeouts",),
+    ("inflight_cancel_active",),
+    ("agree_pp_handoff_stops", set(), set(), set()),
+    ("fail_timed_out", []),
+]
 _PP_SHUTDOWN_PASS = [("handle_errors_synced",)]
 
 
@@ -556,8 +568,7 @@ def test_insufficient_kv_fail_fast_ends_the_loop_before_the_benchmark_gate(
 
 
 def test_executor_loop_pp_transcript_on_first_rank(monkeypatch) -> None:
-    """The PP loop admits inside schedule propagation and checks transfer
-    timeouts only on the retry and executed-batch paths. Responses are flushed
+    """The PP loop votes on stopped handoffs before schedule propagation. Responses are flushed
     from executed-batch handling or, when no batch executed, from the idle
     iteration, so buffered responses do not wait for the next executed batch."""
     calls = []
@@ -569,6 +580,7 @@ def test_executor_loop_pp_transcript_on_first_rank(monkeypatch) -> None:
             ("handle_errors_synced",),
             ("prepare_context_schedulable", []),
             ("poll_gen_transfers",),
+            *_PP_HANDOFF,
             ("admit", []),
             ("receive_gen_init", []),
             ("poll_progress_when_idle",),
@@ -591,6 +603,7 @@ def test_executor_loop_pp_transcript_on_non_first_rank(monkeypatch) -> None:
             ("handle_errors_synced",),
             ("prepare_context_schedulable", []),
             ("poll_gen_transfers",),
+            *_PP_HANDOFF,
             ("revert_deferred_gen_init", [], []),
             ("receive_gen_init", []),
             ("poll_progress_when_idle",),
