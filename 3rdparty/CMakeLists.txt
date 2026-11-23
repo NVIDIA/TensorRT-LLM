@@ -112,7 +112,7 @@ foreach(DEP_IDX RANGE ${DEP_COUNT_MINUS_ONE})
   elseif(DEP_NAME STREQUAL "msa")
     # MSA JIT-compiles against the CUTLASS headers staged by TRT-LLM. Force
     # revalidation when TRT-LLM changes its CUTLASS pin.
-    set(MSA_VALIDATED_CUTLASS_TAG "v4.4.2")
+    set(MSA_VALIDATED_CUTLASS_TAG "v4.8.0")
     if(NOT MSA_VALIDATED_CUTLASS_TAG STREQUAL TRTLLM_CUTLASS_TAG)
       message(
         FATAL_ERROR

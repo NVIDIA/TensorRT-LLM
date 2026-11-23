@@ -9504,7 +9504,7 @@ index fa63a02..8fd38fa 100644
 +# A run-time compile uses CUTLASS_ROOT when set, else the CUTLASS headers shipped in this package
 +# (fmha_sm100/cutlass). Either must be the CUTLASS release this package was validated with.
 +_CUTLASS_DIR = _PACKAGE_DIR / "cutlass"
-+_VALIDATED_CUTLASS_VERSION = (4, 4, 2)
++_VALIDATED_CUTLASS_VERSION = (4, 8, 0)
 +_cutlass_dir_cache = None
 +
 +
@@ -10392,3 +10392,27 @@ index 306b416..f6becc4 100644
          out.copy_(result)
          return out, None
      return result, None
+diff --git a/python/fmha_sm100/csrc/include/fmha_common.hpp b/python/fmha_sm100/csrc/include/fmha_common.hpp
+--- a/python/fmha_sm100/csrc/include/fmha_common.hpp
++++ b/python/fmha_sm100/csrc/include/fmha_common.hpp
+@@ -1,5 +1,5 @@
+ /***************************************************************************************************
+- * Copyright (c) 2024 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++ * Copyright (c) 2024 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  * SPDX-License-Identifier: BSD-3-Clause
+  *
+  * Redistribution and use in source and binary forms, with or without
+@@ -97,11 +97,8 @@
+ template <class a_type, class b_type, class c_type, int M, int N, UMMA::Major a_major,
+           UMMA::Major b_major, UMMA::ScaleIn a_neg, UMMA::ScaleIn b_neg, class... TAs, class... TMs>
+ CUTE_HOST_DEVICE constexpr auto to_tiled_mma_sm100_ts(
+-    TiledMMA<MMA_Atom<MMA_Traits<SM100_MMA_F8F6F4_SS, a_type, b_type, c_type, cute::C<M>,
+-                                 cute::C<N>, cute::integral_constant<UMMA::Major, a_major>,
+-                                 cute::integral_constant<UMMA::Major, b_major>,
+-                                 cute::integral_constant<UMMA::ScaleIn, a_neg>,
+-                                 cute::integral_constant<UMMA::ScaleIn, b_neg>>,
++    TiledMMA<MMA_Atom<SM100_MMA_F8F6F4_SS<a_type, b_type, c_type, M, N, a_major,
++                                            b_major, a_neg, b_neg>,
+                       TAs...>,
+              TMs...>) {
+   return TiledMMA<
