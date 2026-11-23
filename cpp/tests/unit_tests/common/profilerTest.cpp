@@ -132,6 +132,7 @@ void checkSelection(nlohmann::json const& selection)
 //! Check both language implementations against the same startup selector cases, including cached diagnostics.
 TEST(ProfilerStartupDeathTest, SharedSelectorCasesAreCached)
 {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
     std::ifstream fixture{TRTLLM_PROFILER_SELECTOR_CASES};
     ASSERT_TRUE(fixture.is_open());
     auto const cases = nlohmann::json::parse(fixture).at("cases");
@@ -146,6 +147,7 @@ TEST(ProfilerStartupDeathTest, SharedSelectorCasesAreCached)
 //! Check that repeated metadata failures warn once while the original operation exception survives.
 TEST(ProfilerStartupDeathTest, ObservationFailureWarnsOnceAndPreservesOperationException)
 {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
     EXPECT_EXIT(
         {
             unsetenv("TLLM_PROFILE_CUSTOM_REGIONS");
@@ -181,6 +183,7 @@ TEST(ProfilerStartupDeathTest, ObservationFailureWarnsOnceAndPreservesOperationE
 //! Verify uninitialized probes neither parse configuration nor evaluate their factories.
 TEST(ProfilerStartupDeathTest, ProbesBeforeStartupNeverParseInvalidConfiguration)
 {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
     EXPECT_EXIT(
         {
             setenv("TLLM_PROFILE_CUSTOM_REGIONS", "unknown", 1);
@@ -203,6 +206,7 @@ TEST(ProfilerStartupDeathTest, ProbesBeforeStartupNeverParseInvalidConfiguration
 //! Verify an explicit none selection suppresses callbacks and both factories.
 TEST(ProfilerStartupDeathTest, NoneSelectionNeverEvaluatesFactoriesOrEmitsScopes)
 {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
     EXPECT_EXIT(
         {
             setenv("TLLM_PROFILE_CUSTOM_REGIONS", "none", 1);
@@ -247,12 +251,20 @@ TEST(ProfilerMetadataTest, ByteLengthsAndControlCharactersAreJsonCompatible)
         std::move(metadata).take(), R"(TRTLLM1:6:区域{"control":"\u0000\u0001\r","ids":[-7,0,9223372036854775807]})");
 }
 
+//! Reject malformed UTF-8 instead of emitting an invalid metadata payload.
+TEST(ProfilerMetadataTest, InvalidUtf8ThrowsDuringEncoding)
+{
+    tc::ProfilerMetadata metadata{"workflow"};
+    metadata.add("invalid", std::string_view{"\xC3\x28", 2});
+    EXPECT_THROW(std::move(metadata).take(), nlohmann::json::type_error);
+}
+
 class ProfilerScopeTest : public ::testing::Test
 {
 protected:
     void SetUp() override
     {
-        // Death tests run before this fixture initializes the cached default selection.
+        // Startup death tests re-execute with fresh state instead of inheriting this cached selection.
 #if defined(_WIN32)
         ASSERT_EQ(_putenv_s("TLLM_PROFILE_CUSTOM_REGIONS", ""), 0);
 #else
@@ -347,4 +359,35 @@ TEST_F(ProfilerScopeTest, MetadataFailureDoesNotPreventBodyOrMaskItsException)
     }
     EXPECT_TRUE(bodyRan);
     EXPECT_EQ(observation().starts, 0);
+}
+
+//! Check that name failure bypasses metadata and callbacks while preserving the body's exception.
+TEST_F(ProfilerScopeTest, NameFailureDoesNotPreventBodyOrMaskItsException)
+{
+    CallbackGuard callback;
+    int nameCalls = 0;
+    int metadataCalls = 0;
+    bool bodyRan = false;
+    try
+    {
+        tc::RecordFunctionWithMetadata scope{tc::ProfilerRegion::kWorkflow};
+        scope.startWithLazyName(
+            [&]() -> std::string
+            {
+                ++nameCalls;
+                throw std::runtime_error("name failed");
+            },
+            [&](tc::ProfilerMetadata&) { ++metadataCalls; });
+        bodyRan = true;
+        throw std::logic_error("original body failure");
+    }
+    catch (std::logic_error const& error)
+    {
+        EXPECT_EQ(std::string{error.what()}, "original body failure");
+    }
+    EXPECT_TRUE(bodyRan);
+    EXPECT_EQ(nameCalls, 1);
+    EXPECT_EQ(metadataCalls, 0);
+    EXPECT_EQ(observation().starts, 0);
+    EXPECT_EQ(observation().ends, 0);
 }
