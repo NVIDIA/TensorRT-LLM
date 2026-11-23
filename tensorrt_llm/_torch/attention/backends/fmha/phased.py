@@ -338,24 +338,13 @@ class PhasedFmha(Fmha):
         phase_input = _leading_rows(q, num_ctx_tokens)
         params.qkv_input = phase_input if forward_args.is_fused_qkv else None
         params.query_input = None if forward_args.is_fused_qkv else phase_input
-<<<<<<< HEAD
-        # kv_row_total sums the context batch's KV lengths: a dense k / v spanning
-        # that many rows covers the requests' full KV and reaches _kv_rows whole.
-        kv_row_total = (
-            _host_sum(metadata.kv_lens_runtime, 0, num_seqs)
-            if metadata.kv_lens_runtime is not None
-            else None
-        )
-        params.key_input = _kv_rows(k, num_ctx_tokens, kv_row_total) if k is not None else None
-        params.value_input = _kv_rows(v, num_ctx_tokens, kv_row_total) if v is not None else None
-=======
         if self.attn.is_mla_enable:
             # An expanded MLA prefix or KV chunk can be longer than its Q span.
             params.key_input = k
             params.value_input = v
         else:
             kv_row_total = (
-                int(metadata.kv_lens_runtime[:num_seqs].sum())
+                _host_sum(metadata.kv_lens_runtime, 0, num_seqs)
                 if metadata.kv_lens_runtime is not None
                 else None
             )
@@ -363,7 +352,6 @@ class PhasedFmha(Fmha):
             params.value_input = (
                 _kv_rows(v, num_ctx_tokens, kv_row_total) if v is not None else None
             )
->>>>>>> origin/main
         params.output = out_tensor if fused_epilogue else _leading_rows(out_tensor, num_ctx_tokens)
         params.sequence_lengths = metadata.kv_lens_cuda_runtime
         params.context_lengths = metadata.prompt_lens_cuda_runtime
