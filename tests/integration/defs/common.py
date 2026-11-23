@@ -32,35 +32,27 @@ from .trt_test_alternative import (check_call, check_output, print_info,
                                    print_warning)
 
 
-def get_ucx_tls() -> str:
-    """Get UCX_TLS value based on GPU architecture.
+def single_host_ucx_env() -> dict[str, str]:
+    """Return UCX_TLS and UCX_NET_DEVICES for workers whose UCX peers are local.
 
-    Pre-Hopper GPUs need cuda_ipc excluded from UCX transports.
+    UCX_TLS selects the transports for this GPU. UCX_NET_DEVICES=lo keeps UCX
+    off the other host interfaces: UCX would probe each of them for every new
+    endpoint, and some refuse connections from this host. Apply the result
+    over the inherited environment, which may already set either variable.
     """
     from .conftest import get_sm_version
 
     sm = get_sm_version()
-    # Some GB300 ARM clusters need an explicit list: UCX auto-selection picks
-    # a misbehaving NIC transport there.
     if sm == 103 and "aarch" in platform.machine().lower():
-        return "cuda_copy,cuda_ipc,sm,self,tcp"
-    if sm < 90:
-        return "^cuda_ipc,ib,gdr_copy"
-    return "^ib,gdr_copy"
-
-
-def get_ucx_net_devices() -> str:
-    """Get UCX_NET_DEVICES for tests whose disagg workers all run on this host.
-
-    All UCX peers of such workers are on this host, so loopback is the only
-    network device they need ("lo" also turns off IB devices). With every
-    device enabled, UCX re-queried each TCP interface for every new endpoint,
-    which delayed cold NIXL peer setup on bonded NICs
-    (https://nvbugs/6836097), and on R100 QA nodes it used an interface that
-    refuses local TCP connections, which failed MPI worker spawn
-    (https://nvbugs/7088367).
-    """
-    return "lo"
+        # Some GB300 ARM clusters need an explicit list: UCX auto-selection
+        # picks a misbehaving NIC transport there.
+        transports = "cuda_copy,cuda_ipc,sm,self,tcp"
+    elif sm < 90:
+        # Pre-Hopper GPUs need cuda_ipc excluded.
+        transports = "^cuda_ipc,ib,gdr_copy"
+    else:
+        transports = "^ib,gdr_copy"
+    return {"UCX_TLS": transports, "UCX_NET_DEVICES": "lo"}
 
 
 def venv_check_call(venv, cmd, env=None, **kwargs):

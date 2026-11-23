@@ -19,7 +19,7 @@ import subprocess
 import time
 
 import requests
-from defs.common import get_ucx_net_devices, get_ucx_tls
+from defs.common import single_host_ucx_env
 from defs.conftest import llm_models_root
 
 from tensorrt_llm.logger import logger
@@ -71,8 +71,7 @@ def start_context_server(config,
 
     server_env = env.copy() if env else os.environ.copy()
     server_env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    server_env["UCX_TLS"] = get_ucx_tls()
-    server_env["UCX_NET_DEVICES"] = get_ucx_net_devices()
+    server_env.update(single_host_ucx_env())
 
     logger.info(f"Starting CONTEXT server on GPU {gpu_id} (port {port})...")
     process = subprocess.Popen(cmd,
@@ -98,8 +97,7 @@ def start_generation_server(config,
 
     server_env = env.copy() if env else os.environ.copy()
     server_env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    server_env["UCX_TLS"] = get_ucx_tls()
-    server_env["UCX_NET_DEVICES"] = get_ucx_net_devices()
+    server_env.update(single_host_ucx_env())
 
     logger.info(f"Starting GENERATION server on GPU {gpu_id} (port {port})...")
     process = subprocess.Popen(cmd,

@@ -25,7 +25,6 @@ import aiohttp
 import pytest
 import yaml
 from defs.common import get_free_port_in_ci as get_free_port
-from defs.common import get_ucx_net_devices, get_ucx_tls
 from defs.conftest import llm_models_root, skip_no_hopper
 from disagg_test_utils import (HEARTBEAT_INTERVAL, INACTIVE_TIMEOUT,
                                get_registered_worker_urls,
@@ -568,8 +567,6 @@ def background_workers(llm_venv, config_file: str):
     cwd = llm_venv.get_working_directory()
     os.chdir(cwd)
     env = llm_venv._new_env.copy()
-    env["UCX_TLS"] = get_ucx_tls()
-    env["UCX_NET_DEVICES"] = get_ucx_net_devices()
 
     with open(config_file, 'r') as f:
         config = yaml.safe_load(f)
