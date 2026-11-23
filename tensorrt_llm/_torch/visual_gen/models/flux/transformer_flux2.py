@@ -750,6 +750,10 @@ class Flux2Transformer2DModel(BaseDiffusionModel):
         hidden_states = self.x_embedder(hidden_states.contiguous())
         encoder_hidden_states = self.context_embedder(encoder_hidden_states)
 
+        # The blocks hand the timestep only to attention, which compares it with normalized
+        # sparse-attention cutoffs, so they get it unscaled.
+        attention_timestep = timestep
+
         # Scale timestep and guidance (FLUX convention)
         timestep = timestep.to(hidden_states.dtype) * 1000
         if guidance is not None:
@@ -789,7 +793,7 @@ class Flux2Transformer2DModel(BaseDiffusionModel):
                 image_rotary_emb=image_rotary_emb,
                 img_mod=img_mod,
                 txt_mod=txt_mod,
-                timestep=timestep,
+                timestep=attention_timestep,
             )
 
         # Concatenate for single-stream blocks
@@ -801,7 +805,7 @@ class Flux2Transformer2DModel(BaseDiffusionModel):
                 hidden_states=hidden_states,
                 image_rotary_emb=image_rotary_emb,
                 mod=single_mod[0],  # Single tuple of (shift, scale, gate)
-                timestep=timestep,
+                timestep=attention_timestep,
             )
 
         # Extract image features (discard text)

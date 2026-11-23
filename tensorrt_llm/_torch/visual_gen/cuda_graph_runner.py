@@ -604,8 +604,8 @@ class BlockCUDAGraphRunner(CUDAGraphRunner):
                             + ".",
                             key=("block CUDA graph not captured", key),
                         )
-                    # Run as with graphs off: no graph keys are published, so VC-Attention
-                    # keeps this shape's grouping apart from the ones captured graphs read.
+                    # Run as with graphs off, without publishing graph keys: attention derives
+                    # its phases from the denoising step and the timestep its block receives.
                     return fn(*args, **kwargs)
 
                 def call_with_tensors(*graph_tensors: torch.Tensor) -> Any:

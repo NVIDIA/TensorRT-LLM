@@ -381,9 +381,10 @@ def test_trtllm_skip_softmax_cutoff_is_capturable_with_a_device_timestep() -> No
 
 def test_vc_attention_eager_runs_keep_only_the_current_shape(monkeypatch) -> None:
     """Without the CUDA graph runner the layer drops the value grouping of a previous
-    K/V shape; under the runner every captured shape keeps its grouping, and eager calls
-    for new shapes (a block call warmup did not capture) leave those groupings unchanged.
-    The grouped token range of a call reaches the preprocessor."""
+    K/V shape; under the runner every captured shape keeps its grouping, which eager calls
+    at that shape share, and eager calls for new shapes (a block call warmup did not
+    capture) leave those groupings unchanged. The grouped token range of a call reaches the
+    preprocessor."""
     from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
     monkeypatch.setenv("TLLM_FMHA_LIBS", "+prims_ts")
@@ -412,6 +413,8 @@ def test_vc_attention_eager_runs_keep_only_the_current_shape(monkeypatch) -> Non
         operands(256)
     captured = dict(runner._groupings)
     assert list(captured) == [(1, 512, 2, None), (1, 256, 2, None)]
+    operands(256)
+    assert list(attention._vc_eager_preprocessor._groupings) == [(1, 384, 2, None)]
     operands(640)
     operands(768)
     assert attention._vc_preprocessor is runner
