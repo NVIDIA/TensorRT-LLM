@@ -245,8 +245,8 @@ def test_reciprocal_peer_refresh_keeps_unrelated_transfers_running(worker, task,
     monkeypatch.setattr(transfer.RankInfo, "from_bytes", Mock(return_value=new_info))
     original = SimpleNamespace(remote_name="decode11")
     unrelated = SimpleNamespace(remote_name="other0")
-    with sender._direct_peer_transfers((unrelated,)):
-        with sender._direct_peer_transfers((original,)):
+    with sender._peer_transfers((unrelated,)):
+        with sender._peer_transfers((original,)):
             sender._register_peer_rank(b"", [transfer.MessageType.REGISTER_RANK_INFO, b""])
             agent.invalidate_remote_agent.assert_not_called()
             with pytest.raises(transfer._TransferNotSubmittedError):
@@ -257,6 +257,36 @@ def test_reciprocal_peer_refresh_keeps_unrelated_transfers_running(worker, task,
         assert sender._agent_generation == 0
         assert not sender._agent_failed
     sender._recover_agent.assert_not_called()
+
+
+def test_fallback_sender_refreshes_peer_after_submitted_write_drains(worker, task, monkeypatch):
+    sender, agent = worker._sender, worker._agent
+    sender._recover_agent = None
+    sender._agent_failed = False
+    sender._peer_refresh_enabled = True
+    new_info = SimpleNamespace(
+        instance_name="decode", instance_rank=11, transfer_engine_info=b"new"
+    )
+    monkeypatch.setattr(transfer.RankInfo, "from_bytes", Mock(return_value=new_info))
+    connections = {"decode11": b"peer"}
+
+    def load(name, descriptor):
+        assert name not in connections
+        connections[name] = descriptor
+
+    def finish_write():
+        sender._register_peer_rank(b"", [transfer.MessageType.REGISTER_RANK_INFO, b""])
+        assert connections == {"decode11": b"peer"}
+        assert task._native_inflight == 1
+        return True
+
+    agent.load_remote_agent.side_effect = load
+    agent.invalidate_remote_agent.side_effect = connections.pop
+    agent.submit_transfer_requests.return_value.wait.side_effect = finish_write
+    assert submit(sender, task, 0) == (True, None)
+    assert connections == {"decode11": b"new"}
+    assert sender._agent_generation == 0
+    agent.shutdown.assert_not_called()
 
 
 def test_recovery_releases_terminal_outbound_handles_before_inbound_drain(worker, task):

@@ -741,12 +741,6 @@ class _SessionQuiescence:
     endpoint: Optional[str]
 
 
-@dataclass(frozen=True)
-class _RetiredSendSession:
-    retired_at: float
-    published_peer_ranks: frozenset[int]
-
-
 class Sender(SenderBase):
     # Time-to-live for orphaned RecvReqInfo entries (seconds).
     # In gen-first ADP broadcast, non-assigned DP ranks accumulate
@@ -793,7 +787,9 @@ class Sender(SenderBase):
         # timed out), oldest first. A REQUEST_DATA for one of them must be answered FAILED:
         # parking it as an early generation-first request would leave the peer's receive
         # unresolved for good. Protected by _sessions_lock.
-        self._retired_rids: dict[int, _RetiredSendSession] = {}
+        # An empty publication cohort needs only its timestamp. Dense small
+        # cohorts use one mask, while sparse ranks do not grow the mask.
+        self._retired_rids: dict[int, float | tuple[float, int | frozenset[int]]] = {}
         self._shutdown = False
         self._shutdown_requested = False
         self._instance_rank = self._registrar.self_rank_info.instance_rank
@@ -810,6 +806,12 @@ class Sender(SenderBase):
         self._remote_agent_descriptors: dict[str, bytes] = {}
         self._deferred_remote_agents: dict[str, tuple[bytes, float]] = {}
         self._peer_transfer_counts: dict[str, int] = {}
+        self._peer_refresh_enabled = (
+            not enforce_physical_ownership
+            and not context_first_ownership
+            and getattr(agent, "supports_handle_retirement", False) is True
+            and getattr(agent, "bounce_enabled", False) is not True
+        )
         self._unreleased_statuses: list[tuple[TransferStatus, SendTaskBase, threading.Event]] = []
         self._ownership_poisoned: Optional[Exception] = None
         self._ownership_poison_lock = (
@@ -919,7 +921,8 @@ class Sender(SenderBase):
             # Oldest first (see clear_session), so only expired entries are visited.
             expired = []
             for rid, retired in self._retired_rids.items():
-                if now - retired.retired_at <= self._RETIRED_SESSION_TTL_S:
+                retired_at = retired[0] if isinstance(retired, tuple) else retired
+                if now - retired_at <= self._RETIRED_SESSION_TTL_S:
                     break
                 expired.append(rid)
             pending_rids = (
@@ -1162,7 +1165,7 @@ class Sender(SenderBase):
         del self._deferred_remote_agents[name]
 
     @contextmanager
-    def _direct_peer_transfers(self, requests: tuple[TransferRequest, ...]):
+    def _peer_transfers(self, requests: tuple[TransferRequest, ...]):
         names = {request.remote_name for request in requests}
         with self._loaded_remote_agents_lock:
             for name in names:
@@ -1194,7 +1197,7 @@ class Sender(SenderBase):
         recover = self._recover_agent
         assert recover is not None
         retirement_event = None
-        with self._direct_peer_transfers(requests), self._agent_operation_gate.transfer():
+        with self._peer_transfers(requests), self._agent_operation_gate.transfer():
             generation = self._agent_generation
             if agent_generation is not None and agent_generation != generation:
                 return False, "transfer belongs to a retired NIXL agent generation"
@@ -1320,6 +1323,26 @@ class Sender(SenderBase):
             return self._submit_direct_transfer(
                 task, requests, on_submitted, agent_generation, session
             )
+        peer_lease = (
+            self._peer_transfers(requests)
+            if not owned and getattr(self, "_peer_refresh_enabled", False)
+            else nullcontext()
+        )
+        with peer_lease:
+            return self._submit_fallback_transfer(
+                task, peer_rank, request, requests, on_submitted, session, owned
+            )
+
+    def _submit_fallback_transfer(
+        self,
+        task: SendTaskBase,
+        peer_rank: int,
+        request: TransferRequest | _TransferRequestGroup,
+        requests: tuple[TransferRequest, ...],
+        on_submitted: Optional[Callable[[], None]],
+        session: Optional["TxSession"],
+        owned: bool,
+    ) -> tuple[bool, Optional[str]]:
         try:
             # This query cannot submit a transfer. Reject before acquiring backend ownership.
             for member in requests:
@@ -2315,13 +2338,16 @@ class Sender(SenderBase):
         agent_name = ri.instance_name + str(ri.instance_rank)
         logger.debug(f"Loading remote transfer agent descriptor for peer '{agent_name}'")
         # NIXL serializes descriptor load against submit internally. This lock
-        # closes the load-vs-shutdown window. Recovery-enabled senders also
-        # drain request handles before replacing metadata.
+        # closes the load-vs-shutdown window. Native direct senders also use
+        # peer leases to drain writes before replacing connection metadata.
         with self._loaded_remote_agents_lock:
             if self._shutdown_requested:
                 return
             self._registrar.register(ri.instance_name, ri.instance_rank, ri)
-            if getattr(self, "_recover_agent", None) is None:
+            if not (
+                getattr(self, "_peer_refresh_enabled", False)
+                or getattr(self, "_recover_agent", None) is not None
+            ):
                 self._agent.load_remote_agent(agent_name, ri.transfer_engine_info)
                 self._loaded_remote_agents.add(agent_name)
             else:
@@ -2479,13 +2505,9 @@ class Sender(SenderBase):
             )
             rejected_publication = False
             if fenced and info.wants_no_submission_result:
-                closed_session = self._retired_rids.get(info.unique_rid)
-                published = (
-                    closed_session.published_peer_ranks
-                    if closed_session is not None
-                    else self._get_req_info(info.unique_rid) or {}
+                rejected_publication = not self._has_peer_publication_locked(
+                    info.unique_rid, info.instance_rank
                 )
-                rejected_publication = info.instance_rank not in published
             refused = False
             retired = False
             if session is None and not fenced:
@@ -2745,10 +2767,29 @@ class Sender(SenderBase):
                 del self._sessions[unique_rid]
                 # Re-insert so the dict stays ordered by clear time.
                 self._retired_rids.pop(unique_rid, None)
-                self._retired_rids[unique_rid] = _RetiredSendSession(
-                    time.monotonic(), frozenset(self._get_req_info(unique_rid) or ())
-                )
+                retired_at = time.monotonic()
+                with self._peer_requests_lock:
+                    ranks = self._peer_requests.get(unique_rid)
+                    if not ranks:
+                        retired = retired_at
+                    elif all(0 <= rank < 64 for rank in ranks):
+                        retired = (retired_at, sum(1 << rank for rank in ranks))
+                    else:
+                        retired = (retired_at, frozenset(ranks))
+                self._retired_rids[unique_rid] = retired
         self._remove_req_info(unique_rid)
+
+    def _has_peer_publication_locked(self, unique_rid: int, rank: int) -> bool:
+        retired = self._retired_rids.get(unique_rid)
+        if retired is None:
+            with self._peer_requests_lock:
+                return rank in self._peer_requests.get(unique_rid, ())
+        if not isinstance(retired, tuple):
+            return False
+        ranks = retired[1]
+        if isinstance(ranks, int):
+            return 0 <= rank < 64 and bool(ranks & (1 << rank))
+        return rank in ranks
 
     def send_cancel_to_receivers(self, unique_rid: int, *, failure: bool = False) -> None:
         """Cancel peer receives, retaining their writers when failure precedes retirement."""

@@ -103,6 +103,7 @@ build_and_install_nixl() {
 
     git clone --depth 1 -b ${NIXL_VERSION} ${NIXL_REPO}
     cd nixl
+    git apply "${SCRIPT_DIR}/nixl-1.5.2-metadata-rollback.patch"
 
     CUDA_SO_PATH=$(find "/usr/local" -name "libcuda.so.1" 2>/dev/null | head -n1)
 

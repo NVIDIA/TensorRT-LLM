@@ -1,0 +1,39 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Backport of ai-dynamo/nixl#2560 to v1.5.2.
+
+--- a/src/core/agent_data.h
++++ b/src/core/agent_data.h
+@@ -90,6 +90,8 @@
+         nixl_status_t
+         invalidateRemoteMD(const std::string &remote_name) override;
+         nixl_status_t
++        invalidateRemoteMDLocked(const std::string &remote_name);
++        nixl_status_t
+         loadConnInfo(const std::string &remote_name,
+                      const nixl_backend_t &backend,
+                      const nixl_blob_t &conn_info);
+--- a/src/core/nixl_agent.cpp
++++ b/src/core/nixl_agent.cpp
+@@ -1720,7 +1720,11 @@
+     }
+
+     NIXL_LOCK_GUARD(lock);
+-
++    return invalidateRemoteMDLocked(remote_agent);
++}
++
++nixl_status_t
++nixlAgentData::invalidateRemoteMDLocked(const std::string &remote_agent) {
+     nixl_status_t ret = NIXL_ERR_NOT_FOUND;
+     if (remoteSections_.erase(remote_agent) > 0) {
+         ret = NIXL_SUCCESS;
+@@ -1799,7 +1803,6 @@
+     const nixl_status_t ret = it->second->loadRemoteData(&sd, backendEngines_);
+     // TODO: can be more graceful, if just the new MD blob was improper
+     if (ret != NIXL_SUCCESS) {
+-        remoteSections_.erase(it);
+-        remoteBackends_.erase(remote_name);
++        invalidateRemoteMDLocked(remote_name);
+         return ret;
+     }

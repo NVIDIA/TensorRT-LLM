@@ -163,6 +163,33 @@ TEST_P(TransferAgentTest, CheckRemoteDescriptorRanges)
     xferAgent0->invalidateRemoteAgent(agent1);
 }
 
+TEST_P(TransferAgentTest, ReloadAfterInvalidRemoteSection)
+{
+    if (backend != "nixl")
+    {
+        GTEST_SKIP() << "NIXL metadata validation";
+    }
+    std::string const senderName{"rollbackSender"}, peerName{"rollbackPeer"};
+    BaseAgentConfig senderConfig{senderName, true, false, true}, peerConfig{peerName, true, false, true};
+    auto sender = makeTransferAgent(senderConfig);
+    auto peer = makeTransferAgent(peerConfig);
+    std::vector<char> destination(64);
+    RegisteredHostMemory registered(MemoryDescs{MemoryType::kDRAM, {MemoryDesc{destination}}}, peer.get());
+    auto const valid = peer->getLocalAgentDesc();
+    auto invalid = valid.getBackendAgentDesc();
+    auto const sectionTag = invalid.find("nixlSecElms");
+    ASSERT_NE(sectionTag, std::string::npos);
+    invalid[sectionTag] = 'X';
+
+    for (int attempt = 0; attempt < 2; ++attempt)
+    {
+        EXPECT_ANY_THROW(sender->loadRemoteAgent(peerName, AgentDesc{invalid}));
+        EXPECT_FALSE(sender->checkRemoteDescs(peerName, registered.getDescs()));
+        ASSERT_NO_THROW(sender->loadRemoteAgent(peerName, valid));
+        EXPECT_TRUE(sender->checkRemoteDescs(peerName, registered.getDescs()));
+    }
+}
+
 TEST_P(TransferAgentTest, CheckRemoteDescriptorsAcrossVmmChunks)
 {
     if (backend != "nixl")

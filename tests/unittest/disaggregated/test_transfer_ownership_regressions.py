@@ -1695,9 +1695,7 @@ def test_legacy_routed_cancel_drains_admitted_writes_and_fences_late_writes(aux)
         sender._submit_transfer(task, 1, request, session=session)
     sender._agent.submit_transfer_requests.assert_called_once_with(request)
     assert session.close()
-    sender._retired_rids[rid] = transfer_mod._RetiredSendSession(
-        time.monotonic() - sender._RETIRED_SESSION_TTL_S - 1, frozenset()
-    )
+    sender._retired_rids[rid] = time.monotonic() - sender._RETIRED_SESSION_TTL_S - 1
     sender.sweep_stale_req_infos()
     assert rid not in sender._routed_cancels
     assert rid not in sender._pre_cancelled_rids
@@ -1711,9 +1709,7 @@ def test_routed_cancel_preserves_fence_during_ack_registration(retired) -> None:
     sender._enforce_physical_ownership = False
     sender._context_first_ownership = True
     if retired:
-        sender._retired_rids[rid] = transfer_mod._RetiredSendSession(
-            time.monotonic() - sender._RETIRED_SESSION_TTL_S - 1, frozenset()
-        )
+        sender._retired_rids[rid] = time.monotonic() - sender._RETIRED_SESSION_TTL_S - 1
 
     def get_peer_rank_info(_name, _rank):
         sender.sweep_stale_req_infos()
@@ -1754,6 +1750,26 @@ def test_failed_legacy_bounce_receive_keeps_waiting_after_session_ack() -> None:
     )
     Receiver.send_cancel_to_senders(listener, 112, {"sender"})
     dealer.send.assert_called_once_with([MessageType.CANCEL_SESSION, b"112"])
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("ranks", "evidence"),
+    [((), None), ((0, 2, 7), 133), ((0, 10**6), frozenset({0, 10**6}))],
+)
+def test_retired_sender_retains_compact_peer_publication_evidence(ranks, evidence):
+    rid = 117
+    sender = _make_owned_sender()
+    session = transfer_mod.TxSession(rid, DisaggregatedParams(disagg_request_id=rid), sender)
+    sender._peer_requests[rid] = dict.fromkeys(ranks)
+    assert session.close()
+    retired = sender._retired_rids[rid]
+    if evidence is None:
+        assert isinstance(retired, float)
+    else:
+        assert retired[1] == evidence
+    for rank in (0, 1, 2, 7, 64, 10**6):
+        assert sender._has_peer_publication_locked(rid, rank) is (rank in ranks)
 
 
 @pytest.mark.cpu_only
