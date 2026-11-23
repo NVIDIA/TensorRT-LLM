@@ -9,7 +9,7 @@ SPDX-License-Identifier: Apache-2.0
 
 This guide describes how to serve Mistral Large 4 with TensorRT LLM on NVIDIA GB300 GPUs. It covers obtaining the checkpoint and its format, the supported deployments, installing the software, launching `trtllm-serve` on one or two nodes, the model-specific API behavior, example requests, accuracy verification and the known limitations. The configurations below are validated on GB300, most of them by the accuracy tests in `tests/integration/defs/accuracy/modeling_v2/mistral_large4/`; configurations outside these tables are not validated.
 
-This source checkout also supports NVIDIA VR200 (`sm_107`) for all six parallel layouts, with DSpark enabled or disabled. See [VR200 Accuracy Validation](#vr200-accuracy-validation) for the verified scope. The installation and launch recipes below describe GB300; VR200 requires a source checkout containing the SM107 targets.
+TensorRT LLM also supports NVIDIA VR200 (`sm_107`) for all six parallel layouts, with DSpark enabled or disabled. See [VR200 Accuracy Validation](#vr200-accuracy-validation) for the verified scope. The installation and launch recipes below describe GB300.
 
 Mistral Large 4 is a Mixture-of-Experts model with about 1T parameters, 49B of them active per token (52B including the embedding and output layers). It takes text and image input, supports a context of up to 1,048,576 tokens, and uses latent attention with a sparse top-k indexer. Like Mistral Large 3, it is published on Hugging Face in the Mistral format: `params.json` for the configuration, `tekken.json` for the tokenizer and `consolidated-*.safetensors` for the weights. TensorRT LLM loads its text model as the architecture `MistralLarge4ForCausalLM`; the checkpoint itself names no architecture. The repository also ships Hugging Face tokenizer, chat-template, processor and generation-config files, but no Transformers `config.json`. TensorRT LLM reads the Mistral-format files only; see [Checkpoint Format](#checkpoint-format).
 
@@ -17,13 +17,13 @@ TensorRT LLM serves Mistral Large 4 through **modeling_v2** targets (`tensorrt_l
 
 ## Prerequisites
 
-* GPU for the deployment recipes below: NVIDIA GB300 (`sm_103`). VR200 (`sm_107`) is also supported by this source checkout, with the validation scope described below.
+* GPU for the deployment recipes below: NVIDIA GB300 (`sm_103`). VR200 (`sm_107`) is also supported, with the validation scope described below.
   * The 4-GPU deployments (TEP4, DEP4 and TP4) run on one node with 4 GPUs.
   * The 8-GPU deployments (TEP8, DEP8, TP8) run on two nodes with 4 GPUs each. Both nodes must be in the same multi-node NVLink domain.
 * Multi-node launcher: Slurm with the pyxis/enroot container plugin and PMIx (`srun --mpi=pmix`), or an equivalent MPI launcher, to start one rank per GPU.
-* A shared filesystem visible to all ranks for the checkpoint, the configuration file and, for a source build, the repository. The NVFP4 checkpoint, including its speculative-decoding draft, is about 610 GB.
-* Container runtime with NVIDIA GPU support, and TensorRT LLM with Mistral Large 4 support: the release container, the wheel or a source build. See [Install TensorRT LLM](#install-tensorrt-llm).
-* Python packages from `requirements.txt`, including `mistral-common[opencv]` 1.13.0 or later, `xgrammar` and `llguidance`. The release container includes them, and installing the wheel installs them. Install mistral-common from PyPI: the checkpoint's tokenizer declares reasoning efforts that earlier releases do not know. Image input needs OpenCV, which the `opencv` extra installs.
+* A shared filesystem visible to all ranks for the checkpoint, the configuration file and the repository. The NVFP4 checkpoint, including its speculative-decoding draft, is about 610 GB.
+* Container runtime with NVIDIA GPU support, and the TensorRT LLM development container. See [Install TensorRT LLM](#install-tensorrt-llm).
+* Python packages from `requirements.txt`, including `mistral-common[opencv]` 1.13.0 or later, `xgrammar` and `llguidance`; the source build installs them. mistral-common must be 1.13.0 or later: the checkpoint's tokenizer declares reasoning efforts that earlier releases do not know. Image input needs OpenCV, which the `opencv` extra installs.
 
 ## Models
 
@@ -95,55 +95,13 @@ Features of the NVFP4 deployments:
 
 ### Install TensorRT LLM
 
-Mistral Large 4 support is released from the `feat/mistral-large-4` branch as TensorRT LLM `1.4.0a0.dev202610310501`, both as a release container and as a wheel. Use one of them, or build the branch from source.
-
-#### Release Container
-
-The release container has TensorRT LLM and its dependencies installed:
-
-```text
-nvcr.io/nvidia/tensorrt-llm/release:feat-mistral-large-4-1.4.0a0.dev202610310501
-```
-
-The tag covers x86_64 and aarch64; GB300 nodes use the aarch64 image. With Slurm and pyxis/enroot, import it once into a squashfs file on the shared filesystem:
-
-```bash
-enroot import -o /path/to/tensorrt-llm-mistral-large-4.sqsh \
-    "docker://nvcr.io#nvidia/tensorrt-llm/release:feat-mistral-large-4-1.4.0a0.dev202610310501"
-```
-
-The launch commands below use this file as the container image. Other container runtimes can use the tag directly.
-
-#### Wheel
-
-The wheel is built for the NGC PyTorch container `nvcr.io/nvidia/pytorch:26.09-py3` and published to a preview package index. Inside that container:
-
-```bash
-pip3 install "tensorrt_llm==1.4.0a0.dev202610310501" \
-    --extra-index-url https://pypi.nvidia.com/trtllm_ngcpytorch_preview/
-```
-
-The launch commands start every rank in a fresh container, so save the container after the installation and use the saved image instead of the release container. With pyxis, on a GB300 node:
-
-```bash
-srun -N 1 --ntasks 1 \
-    --container-image=nvcr.io#nvidia/pytorch:26.09-py3 \
-    --container-save=/path/to/tensorrt-llm-mistral-large-4.sqsh \
-    pip3 install "tensorrt_llm==1.4.0a0.dev202610310501" \
-        --extra-index-url https://pypi.nvidia.com/trtllm_ngcpytorch_preview/
-```
-
-See [Install in an NGC PyTorch container](../installation/installation-guide.md#install-in-an-ngc-pytorch-container) for the general procedure.
-
-#### Build from Source
-
-Build in the TensorRT LLM development container built from `docker/Dockerfile.multi` (base `nvcr.io/nvidia/pytorch:26.09-py3`), using the SBSA (aarch64) variant on GB300. From the repository root:
+Build from source in the TensorRT LLM development container built from `docker/Dockerfile.multi`, using the SBSA (aarch64) variant on GB300. From the repository root:
 
 ```bash
 python3 scripts/build_wheel.py --use_ccache -a "103-real" --skip_building_wheel --install --yes
 ```
 
-`-a "103-real"` builds for GB300. `--install` installs TensorRT LLM in editable mode into the virtual environment that `build_wheel.py` creates at the repository root, named after the container's Python version: `.venv-3.12` for the current containers. The source-build launch commands below put its `bin` directory first on `PATH`, so build with the repository at the same path the servers use. With `--build_root`, the virtual environment is created under the build root instead. See [Building from Source](../installation/build-from-source.md) for the other options.
+`-a "103-real"` builds for GB300. `--install` installs TensorRT LLM in editable mode into the virtual environment that `build_wheel.py` creates at the repository root, named after the container's Python version: `.venv-3.12` for the current containers. The launch commands below put its `bin` directory first on `PATH`, so build with the repository at the same path the servers use. With `--build_root`, the virtual environment is created under the build root instead. See [Building from Source](../installation/build-from-source.md) for the other options.
 
 ### Configuration File
 
@@ -190,27 +148,11 @@ Always set `max_seq_len`. Without it the engine sizes the KV cache for the check
 
 ### Launch the TensorRT LLM Server
 
-Mistral Large 4 is launched through the `trtllm-llmapi-launch` wrapper, one rank per GPU. Rank 0 serves HTTP and the other ranks become workers. The example below starts the 4-GPU server with Slurm in the image from [Install TensorRT LLM](#install-tensorrt-llm):
+Mistral Large 4 is launched through the `trtllm-llmapi-launch` wrapper, one rank per GPU. Rank 0 serves HTTP and the other ranks become workers. The example below starts the 4-GPU server with Slurm in the development container, with its virtual environment first on `PATH`:
 
 ```bash
 MODEL=/path/to/mistral-large-4-nvfp4
-IMAGE=/path/to/tensorrt-llm-mistral-large-4.sqsh
-
-srun -N 1 --ntasks 4 --ntasks-per-node 4 \
-    --mpi=pmix --gpus-per-node=4 \
-    --container-image=${IMAGE} \
-    --container-mounts=${MODEL}:${MODEL},${EXTRA_LLM_API_FILE}:${EXTRA_LLM_API_FILE}:ro \
-    trtllm-llmapi-launch trtllm-serve ${MODEL} \
-        --config ${EXTRA_LLM_API_FILE} \
-        --host 0.0.0.0 --port 8000 \
-        --tool_parser mistral_large_4 \
-        --reasoning_parser mistral_large_4
-```
-
-For a source build, use the development container, mount the repository and put its virtual environment first on `PATH`:
-
-```bash
-REPO=/path/to/TensorRT-LLM   # the repository, built as in Build from Source
+REPO=/path/to/TensorRT-LLM   # the repository, built as in Install TensorRT LLM
 
 srun -N 1 --ntasks 4 --ntasks-per-node 4 \
     --mpi=pmix --gpus-per-node=4 \
@@ -226,7 +168,7 @@ srun -N 1 --ntasks 4 --ntasks-per-node 4 \
     "
 ```
 
-Outside Slurm, start the same command under MPI on one node, inside the container. For a source build, first run `export PATH="${REPO}/.venv-3.12/bin:$PATH"`.
+Outside Slurm, start the same command under MPI on one node, inside the development container, after `export PATH="${REPO}/.venv-3.12/bin:$PATH"`:
 
 ```bash
 mpirun -n 4 trtllm-llmapi-launch trtllm-serve ${MODEL} \
@@ -294,12 +236,13 @@ WORKDIR=/path/to/workdir   # the directory that holds quickstart.py
 
 srun -N 1 --ntasks 4 --ntasks-per-node 4 \
     --mpi=pmix --gpus-per-node=4 \
-    --container-image=${IMAGE} \
-    --container-mounts=${WORKDIR}:${WORKDIR},${MODEL}:${MODEL} \
-    trtllm-llmapi-launch python3 ${WORKDIR}/quickstart.py
+    --container-image=/path/to/tensorrt-llm-devel-container.sqsh \
+    --container-mounts=${REPO}:${REPO},${WORKDIR}:${WORKDIR},${MODEL}:${MODEL} \
+    bash -c "
+        export PATH=\"${REPO}/.venv-3.12/bin:\$PATH\"
+        exec trtllm-llmapi-launch python3 ${WORKDIR}/quickstart.py
+    "
 ```
-
-For a source build, make the same changes as for the server: the development container, the repository mount and the virtual environment on `PATH`.
 
 Outside Slurm, `python3 quickstart.py` on a node with 4 GPUs also works: the LLM API then starts its worker ranks itself through MPI. Inside a Slurm job step, MPI cannot start them, so use `trtllm-llmapi-launch`. For the 8-GPU deployments, start 8 ranks on two nodes, as for the server.
 
@@ -520,7 +463,7 @@ See [Disaggregated Serving](../features/disagg-serving.md) for the general setup
 
 ## Running Evaluations to Verify Accuracy (Optional)
 
-The accuracy tests in `tests/integration/defs/accuracy/modeling_v2/mistral_large4/` (one directory per target, the shared harness in `_common.py`) build the configurations above through the LLM API and compare the scores with the references in `tests/integration/defs/accuracy/references/` (`gsm8k.yaml`, `gpqa_diamond.yaml`, `mmmu.yaml` and `acceptance_length.yaml`). They read the checkpoint from `${LLM_MODELS_ROOT}/Mistral-Large-4-1T-A52B-NVFP4`, the [downloaded](#download-the-checkpoint) NVFP4 repository, and the datasets from `LLM_MODELS_ROOT`. The tests are not part of the release container or the wheel: run them from a checkout of this branch with its development requirements (`requirements-dev.txt`), as in the [source build](#build-from-source) environment. On a node with 4 GB300 GPUs:
+The accuracy tests in `tests/integration/defs/accuracy/modeling_v2/mistral_large4/` (one directory per target, the shared harness in `_common.py`) build the configurations above through the LLM API and compare the scores with the references in `tests/integration/defs/accuracy/references/` (`gsm8k.yaml`, `gpqa_diamond.yaml`, `mmmu.yaml` and `acceptance_length.yaml`). They read the checkpoint from `${LLM_MODELS_ROOT}/Mistral-Large-4-1T-A52B-NVFP4`, the [downloaded](#download-the-checkpoint) NVFP4 repository, and the datasets from `LLM_MODELS_ROOT`. Run them from the repository, built as in [Install TensorRT LLM](#install-tensorrt-llm), with its development requirements (`requirements-dev.txt`) installed. On a node with 4 GB300 GPUs:
 
 ```bash
 cd tests/integration/defs
@@ -588,4 +531,4 @@ All 30 workloads passed with the existing accuracy references and tolerances unc
 | Image requests fail with an error about OpenCV (`cv2`) | Install `mistral-common[opencv]`, or `opencv-python-headless`. |
 | Sampled outputs differ from another serving stack for the same request | The other stack may apply the checkpoint's `generation_config.json` (top_p 0.95); TensorRT LLM applies it only with `generation_config: auto`. Set that, or set `temperature` and `top_p` in the request. |
 | CUDA out-of-memory errors at startup | Keep `free_gpu_memory_fraction` at 0.85 or lower, and check `max_batch_size` and `max_seq_len`. |
-| The 8-GPU server does not start, or ranks cannot reach each other | Check that both nodes are in one multi-node NVLink domain and that the container image, the checkpoint, the configuration file and, for a source build, the checkout resolve to the same paths on both nodes. |
+| The 8-GPU server does not start, or ranks cannot reach each other | Check that both nodes are in one multi-node NVLink domain and that the container image, the checkpoint, the configuration file and the repository resolve to the same paths on both nodes. |
