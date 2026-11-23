@@ -881,7 +881,8 @@ class MistralNativeInputProcessor(MistralPixtralEncoderContract,
         """No caller-side check: this processor checks the images against the prompt.
 
         Text places the images at its ``[IMG]`` markers, or after itself without
-        markers; token ids carry a whole image grid per image.
+        markers; token ids carry a whole image grid per image, or one ``[IMG]``
+        per image that expands to its grid.
         """
         return False
 
@@ -905,11 +906,10 @@ class MistralNativeInputProcessor(MistralPixtralEncoderContract,
                 "Native tokenizer image grid count does not match images")
         delimiters = (self.processor.image_break_id,
                       self.processor.image_end_id)
-        if (getattr(self._config, "model_type", None) == "mistral_large_4"
-                and not any(token in delimiters for token in token_ids)):
-            # Mistral Large 4 takes one [IMG] per image, as a renderer that
-            # leaves the grids to the server writes it: each expands to its
-            # image's grid.
+        if not any(token in delimiters for token in token_ids):
+            # Every grid ends with [IMG_END], so ids without delimiters hold one
+            # [IMG] per image, as a renderer that leaves the grids to the server
+            # writes them: each expands to its image's grid.
             if token_ids.count(self.processor.image_token_id) != len(images):
                 raise ValueError(
                     "Image placeholder count does not match images")
