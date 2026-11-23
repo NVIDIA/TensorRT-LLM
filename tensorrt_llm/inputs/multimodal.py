@@ -1769,6 +1769,8 @@ _MM_METADATA_ONLY_KEYS = frozenset({
     MULTIMODAL_CACHE_SALT_KEY,
     MULTIMODAL_NO_CONTENT_HASHES_KEY,
     "mrope_config",
+    "mm_bidirectional_blocks",
+    "mm_processor_kwargs_hash",
     "multimodal_embed_mask_cumsum",
     "multimodal_embedding_metadata",
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,

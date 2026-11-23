@@ -267,6 +267,44 @@ def test_generation_reuses_context_block_keys_without_item_spans(handoff_llm, ca
         )
 
 
+@pytest.mark.parametrize("caller_salt", [None, "tenant"])
+def test_prepared_embeddings_without_identity_get_private_block_keys(handoff_llm, caller_salt):
+    from tensorrt_llm.inputs.multimodal import MultimodalParams
+    from tensorrt_llm.llmapi.llm import BaseLLM, PreprocessedInputs
+
+    tokens = [1, 2, 99, 99, 99, 99, 3, 4]
+    plain = BaseLLM.generate_async(handoff_llm, PreprocessedInputs(tokens), cache_salt=caller_salt)
+    keys = _block_keys(plain)
+    for value in (1, 7):
+        params = MultimodalParams(
+            multimodal_data={"multimodal_embedding": torch.full((4, 4), value)}
+        )
+        prepared = PreprocessedInputs(tokens, params)
+        for as_handle in (False, True):
+            if as_handle:
+                params.to_handle("multimodal_data")
+            try:
+                context = BaseLLM.generate_async(
+                    handoff_llm,
+                    prepared,
+                    disaggregated_params=DisaggregatedParams(request_type="context_only"),
+                    cache_salt=caller_salt,
+                )
+                handoff = context.disaggregated_params
+                handoff.request_type = "generation_only"
+                decode = BaseLLM.generate_async(
+                    handoff_llm, tokens, disaggregated_params=handoff, cache_salt=caller_salt
+                )
+                assert _block_keys(context) == _block_keys(decode)
+                keys.extend(_block_keys(context))
+                assert list(params.multimodal_data) == ["multimodal_embedding"]
+            finally:
+                if as_handle:
+                    params.release_handles()
+
+    assert len(set(keys)) == 10  # Two complete blocks for text and each of four attachments.
+
+
 def test_generation_first_requires_shared_identity_without_item_spans(handoff_llm):
     from dataclasses import replace
 
@@ -282,8 +320,9 @@ def test_generation_first_requires_shared_identity_without_item_spans(handoff_ll
     tokens = list(range(8))
     keys = []
     for request_id in (42, 43):
-        data = {}
-        isolate_mm_request(data, "processor", ["audio"], "no item spans")
+        data = {"multimodal_embedding": torch.ones(3, 4)}
+        if request_id == 42:
+            isolate_mm_request(data, "processor", ["image"], "no item spans")
         media = MultimodalParams(multimodal_data=data)
         prepared = PreprocessedInputs(prompt_token_ids=tokens, multimodal_params=media)
         context = DisaggregatedParams(
@@ -318,7 +357,8 @@ def test_generation_first_requires_shared_identity_without_item_spans(handoff_ll
         multimodal_hashes=[[1] * 8], multimodal_positions=[1], multimodal_lengths=[3]
     )
     prepared = PreprocessedInputs(
-        prompt_token_ids=tokens, multimodal_params=MultimodalParams(multimodal_input=identity)
+        prompt_token_ids=tokens,
+        multimodal_params=MultimodalParams(multimodal_input=identity, multimodal_data=data),
     )
     for params in (context, generation):
         result = BaseLLM.generate_async(

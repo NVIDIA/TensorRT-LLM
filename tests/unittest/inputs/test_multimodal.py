@@ -1201,10 +1201,15 @@ def test_text_only_admission_of_preprocessed_media_and_decode_metadata() -> None
         llm.generate_async(PreprocessedInputs([1, 2], params))
     llm._executor.generate_async.assert_not_called()
 
-    params = MultimodalParams(multimodal_data={"mrope_config": {"mrope_position_deltas": [0]}})
+    extra = {"multimodal_data": {"mrope_config": {"mrope_position_deltas": [0]}}}
+    maybe_compute_mm_embed_cumsum([1, 2], extra, _ProbeFakeProcessor())
+    extra["multimodal_data"]["mm_processor_kwargs_hash"] = registry._hash_mm_processor_kwargs({})
+    params = MultimodalParams(**extra)
     with patch("tensorrt_llm.llmapi.llm.RequestOutput._from_generation_result"):
         llm.generate_async(PreprocessedInputs([1, 2], params))
-    assert llm._executor.generate_async.call_args.kwargs["multimodal_params"] is params
+    submitted = llm._executor.generate_async.call_args.kwargs
+    assert submitted["multimodal_params"] is params
+    assert submitted["cache_salt"] is None
 
     metadata = dict(params.multimodal_data)
     params.multimodal_data["image"] = {}
@@ -1261,7 +1266,41 @@ def test_prepared_media_admission_uses_checkpoint_modalities() -> None:
     audio = MultimodalParams(multimodal_data={"audio": {"input_features": torch.ones(2)}})
     with patch("tensorrt_llm.llmapi.llm.RequestOutput._from_generation_result"):
         llm.generate_async(PreprocessedInputs([1, 2], audio))
-    assert llm._executor.generate_async.call_args.kwargs["multimodal_params"] is audio
+    submitted = llm._executor.generate_async.call_args.kwargs["multimodal_params"]
+    assert submitted.multimodal_data["audio"] is audio.multimodal_data["audio"]
+
+
+@pytest.mark.parametrize(
+    "target_path, target_name",
+    [
+        ("kimi_k3_vl.kimi_k3_nvfp4__sm_107__tp1", "ModelingV2KimiK3Nvfp4Sm107Tp1"),
+        ("minimax_m3.minimax_m3_nvfp4__sm_103__tp4", "ModelingV2MiniMaxM3Nvfp4Sm103Tp4"),
+        ("minimax_m3.minimax_m3_nvfp4__sm_107__tp2", "ModelingV2MiniMaxM3Nvfp4Sm107Tp2"),
+    ],
+)
+def test_text_only_target_rejects_prepared_embeddings_before_submission(target_path, target_name):
+    from importlib import import_module
+
+    from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
+    from tensorrt_llm.llmapi.llm import PreprocessedInputs
+
+    target = getattr(
+        import_module(f"tensorrt_llm._torch.modeling_v2.models.{target_path}.modeling"), target_name
+    )
+    model = target.__new__(target)
+    torch.nn.Module.__init__(model)
+    llm = _llm_with_mock_executor(_ProbeFakeProcessor())
+    loader = ModelLoader(llm.args, SimpleNamespace(rank=0), None, None, 8, 8)
+    with patch.object(loader, "_timed_load", return_value=(model, None)):
+        loader.load("unused", None)
+    llm._startup_metrics = {"model_loader": loader.startup_metadata}
+    params = MultimodalParams(multimodal_data={"multimodal_embedding": torch.ones(2, 4)})
+    with (
+        patch("tensorrt_llm.llmapi.llm.RequestOutput._from_generation_result"),
+        pytest.raises(ValueError, match="supports text only"),
+    ):
+        llm.generate_async(PreprocessedInputs([1, 2], params))
+    llm._executor.generate_async.assert_not_called()
 
 
 def test_raw_media_admission_uses_the_loaded_encoder() -> None:
@@ -1292,14 +1331,17 @@ def test_raw_media_admission_uses_the_loaded_encoder() -> None:
     llm._executor.generate_async.assert_not_called()
 
     llm.input_processor.supported_modalities = frozenset()
-    embedding = MultimodalParams(multimodal_data={"multimodal_embedding": torch.zeros(2, 4)})
+    key = "multimodal_embedding"
+    embedding = MultimodalParams(multimodal_data={key: torch.zeros(2, 4)})
     with patch("tensorrt_llm.llmapi.llm.RequestOutput._from_generation_result"):
         llm.generate_async(PreprocessedInputs([1, 2], embedding))
-        assert llm._executor.generate_async.call_args.kwargs["multimodal_params"] is embedding
+        submitted = llm._executor.generate_async.call_args.kwargs["multimodal_params"]
+        assert submitted.multimodal_data[key] is embedding.multimodal_data[key]
         embedding.to_handle("multimodal_data")
         try:
             llm.generate_async(PreprocessedInputs([1, 2], embedding))
-            assert llm._executor.generate_async.call_args.kwargs["multimodal_params"] is embedding
+            submitted = llm._executor.generate_async.call_args.kwargs["multimodal_params"]
+            assert submitted.multimodal_data[key] is embedding.multimodal_data[key]
         finally:
             embedding.to_tensor("multimodal_data")
 

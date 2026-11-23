@@ -4518,6 +4518,7 @@ class ModelingV2MiniMaxM3Nvfp4Sm103Tp4(
     ``load_draft_weights``) and the worker (``M3Eagle3Worker``) that verifies and drafts each step.
     """
 
+    accepts_multimodal_inputs = False
     # The drafter config loads through _draft_loader_moe_kwargs, so speculative_config.moe_tactic
     # selects the drafter as it does built-in. The trunk runs its own expert kernels, which no
     # moe_config.tactic names, so it declares no moe_impls_honored.

@@ -961,16 +961,23 @@ class BaseLLM:
             if multimodal_params is not None:
                 data = multimodal_params.multimodal_data or {}
                 nonempty = without_empty_mm_payloads(data)
-                if nonempty is not data:
-                    multimodal_params = replace(multimodal_params,
-                                                multimodal_data=nonempty)
-                    if not multimodal_params.has_content():
-                        multimodal_params = None
                 if _has_mm_payload_keys(nonempty):
                     _check_multimodal_processor(self, nonempty)
                     if not is_gen_only and any(m in nonempty
                                                for m in MEDIA_MODALITIES):
                         self._check_raw_media_encoder()
+                    if (multimodal_params.multimodal_input is None and
+                            nonempty.get(MULTIMODAL_CACHE_SALT_KEY) is None):
+                        nonempty = dict(nonempty)
+                        isolate_mm_request(nonempty,
+                                           type(self.input_processor).__name__,
+                                           ["prepared media"],
+                                           "no item identity")
+                if nonempty is not data:
+                    multimodal_params = replace(multimodal_params,
+                                                multimodal_data=nonempty)
+                    if not multimodal_params.has_content():
+                        multimodal_params = None
             preprocessed_encoder_input_token_ids = inputs.encoder_input_token_ids
             if preprocessed_encoder_input_token_ids is not None:
                 preprocessed_encoder_input_token_ids = self._normalize_token_ids(
