@@ -4970,8 +4970,16 @@ def _paged_kv_pools(page_table: KVCachePageTable) -> Optional[Dict[int, tuple]]:
     """Every KV pool as base -> (slot stride, pool group, num slots).
 
     None when a layer group is not paged attention (recurrent state shares
-    allocations between roles) or a pool lives in host memory (registered as
-    DRAM), where incremental registration does not apply.
+    allocations between roles), a pool lives in host memory (registered as
+    DRAM), or a pool is localized (locality domains), where incremental
+    registration does not apply.
+
+    A localized pool maps each locality domain's slot chunks at their own
+    offsets, with unmapped holes between them (``mapped_ranges``), and a
+    resize can unmap a chunk in the middle of the pool. Incremental
+    registration assumes a pool is backed from its base to its length and
+    only changes at its tail, so such a pool is registered whole, one entry
+    per mapped range, and re-registered on every resize.
     """
     if any(lg.kind == CacheKind.STATE for lg in page_table.layer_groups):
         return None
@@ -4980,6 +4988,8 @@ def _paged_kv_pools(page_table: KVCachePageTable) -> Optional[Dict[int, tuple]]:
     pools = {}
     for pg_idx, pg in enumerate(page_table.pool_groups):
         for pool in pg.pools:
+            if getattr(pool, "mapped_ranges", None) is not None:
+                return None
             pools.setdefault(
                 int(pool.base_address), (int(pool.slot_stride_bytes), pg_idx, int(pool.num_slots))
             )
