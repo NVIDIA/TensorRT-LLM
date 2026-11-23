@@ -409,6 +409,19 @@ class TestRankState:
         assert RankState.deserialize(wire) == state
         assert not RankState.deserialize(wire).iter_stats.has_iter_stats
 
+    def test_in_transfer_section_beside_queued_stats(self) -> None:
+        """The in-transfer tag and the queued stats' version are both -4, at different places."""
+        state = RankState(
+            rank=1,
+            iter_stats=RankIterStatsPayload(num_queued_context_requests=2, has_pending_work=True),
+            num_in_transfer_requests=3,
+            has_pending_context_retirement=True,
+        )
+        wire = state.serialize()
+        assert wire[5] == RankIterStatsPayload._QUEUED_WIRE_VERSION == RankState._IN_TRANSFER_TAG
+        assert wire[-3] == RankState._IN_TRANSFER_TAG
+        assert RankState.deserialize(wire) == state
+
     def test_snapshot_wire_schema_is_stable(self) -> None:
         """Pin field order and the complete versioned frame independently of roundtrips."""
         assert RankSpecDecodingStats._fields == (
