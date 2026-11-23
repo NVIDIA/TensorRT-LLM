@@ -56,8 +56,7 @@ def native_tool_guided_decoding(request, tokenizer):
 class MistralLarge4ServingExtension(MistralNativeServingExtension):
     """Mistral Large 4's hooks on top of the Mistral-native chat rules.
 
-    It adds the output-budget check, the forced tool-call grammar, and where
-    structured outputs start.
+    It adds the forced tool-call grammar and where structured outputs start.
     """
 
     # The ids mistral-common writes and checks when a client sends the calls back.
@@ -65,21 +64,6 @@ class MistralLarge4ServingExtension(MistralNativeServingExtension):
 
     # mistral-common renders the chats from tekken.json.
     ignores_server_chat_template = True
-
-    def validate_chat_request(
-        self, request: ChatCompletionRequest, *, max_seq_len: Optional[int]
-    ) -> None:
-        """Refuse an output budget that alone exceeds the engine's maximum sequence length."""
-        requested_tokens = request.max_completion_tokens
-        if (
-            max_seq_len is not None
-            and requested_tokens is not None
-            and requested_tokens > max_seq_len
-        ):
-            raise ValueError(
-                f"Requested {requested_tokens} output tokens exceeds the "
-                f"maximum context length of {max_seq_len} tokens."
-            )
 
     def required_tool_choice_mode(self) -> RequiredToolChoiceMode:
         """Required calls are forced by mistral-common's tool grammar."""

@@ -135,15 +135,6 @@ class ServingExtension:
         ``model_type`` this extension is registered for.
         """
 
-    def validate_chat_request(
-        self, request: "ChatCompletionRequest", *, max_seq_len: Optional[int]
-    ) -> None:
-        """Refuse a chat request the model cannot serve within the engine's limits.
-
-        Raises ``ValueError`` (a 400 on the routes). The default accepts every
-        request and leaves the limits to the engine.
-        """
-
     def required_tool_choice_mode(self) -> Optional[RequiredToolChoiceMode]:
         """Return the required-tool policy; boolean permission selects template enforcement."""
         return "template" if self.allows_required_tool_choice() else None

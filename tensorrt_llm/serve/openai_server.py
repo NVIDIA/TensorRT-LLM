@@ -2333,10 +2333,6 @@ class OpenAIServer(_VideoRoutesMixin):
             extension = render_resources.extension
             tool_dicts = prepare_chat_request(request,
                                               render_resources).tool_dicts
-            extension.validate_chat_request(request,
-                                            max_seq_len=getattr(
-                                                self.generator.args,
-                                                "max_seq_len", None))
             required_mode = extension.required_tool_choice_mode()
             required_tool_grammar = (request.tool_choice == "required"
                                      and required_mode == "grammar")

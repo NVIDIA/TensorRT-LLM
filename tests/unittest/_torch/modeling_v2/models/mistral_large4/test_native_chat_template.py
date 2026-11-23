@@ -147,28 +147,6 @@ def test_top_level_continue_final_message_rejects_generation_prompt():
         _request(continue_final_message=True)
 
 
-@pytest.mark.parametrize("stream", [False, True])
-@pytest.mark.parametrize("limit_field", ["max_tokens", "max_completion_tokens"])
-def test_chat_rejects_oversized_output_before_generation(tmp_path, stream, limit_field):
-    from test_common.serve.app_factory import AggConfig, isolated_serve_env
-
-    with isolated_serve_env(tmp_path) as env:
-        server = env.build_openai_server(AggConfig(model_name="m"))
-        server.model_config = SimpleNamespace(model_type="mistral_large_4")
-        server.generator.args.max_seq_len = 64
-        response = env.client(server.app).post(
-            "/v1/chat/completions",
-            json={
-                "model": "m",
-                "messages": [{"role": "user", "content": "Hi"}],
-                "stream": stream,
-                limit_field: 999999999,
-            },
-        )
-    assert response.status_code == 400, response.text
-    assert "exceeds the maximum context length of 64 tokens" in response.text
-
-
 @pytest.mark.parametrize(
     "last_role,add_generation_prompt,continue_final_message,match",
     [
