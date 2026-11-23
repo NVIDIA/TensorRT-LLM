@@ -81,6 +81,7 @@ def test_base_diffusion_model_rejects_non_native_order_unless_supported():
                 backend="CUTEDSL",
                 sparse_attention_config=SolAttentionConfig(tau=2.0, token_order=order),
             ),
+            quant_config_dict=None,
             component_name="transformer",
             pretrained_config=SimpleNamespace(),
         )
