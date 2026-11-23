@@ -1,18 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""CPU admission and routing contracts for the eager TP4 target; no model allocation."""
+"""CPU routing contracts for the Beam model family."""
 
 import builtins
 import json
 from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace as NS
-from unittest.mock import Mock
 
 import pytest
 
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.modeling_v2 import _router_index
 from tensorrt_llm._torch.modeling_v2._router_index import NoTarget
 from tensorrt_llm._torch.modeling_v2.models.beam import routing
 from tensorrt_llm._torch.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
@@ -25,41 +23,8 @@ from tensorrt_llm._torch.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4.m
 from tensorrt_llm._torch.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4.modeling import (
     ModelingV2BeamFullModelNvfp4Sm103Tp4 as Target,
 )
-from tensorrt_llm._torch.models.modeling_auto import AutoModelForCausalLM
 
 pytestmark = pytest.mark.cpu_only
-
-
-@pytest.mark.parametrize(
-    "ids,end_id,lora,valid",
-    [
-        ([0, 9], None, None, True),
-        ([9], -1, None, True),
-        ([0], 9, None, True),
-        ([-1], None, None, False),
-        ([10], None, None, False),
-        ([0], -2, None, False),
-        ([0], 10, None, False),
-        ([0], None, 0, False),
-    ],
-)
-def test_request_rejected_before_batch_execution(ids, end_id, lora, valid):
-    target = NS(model=NS(vocab_size=10))
-    request = NS(
-        py_end_id=end_id,
-        lora_task_id=lora,
-        check_token_id_range=lambda n: all(0 <= token < n for token in ids),
-    )
-    if valid:
-        Target.validate_request(target, request)
-    else:
-        with pytest.raises(ValueError):
-            Target.validate_request(target, request)
-
-
-def test_default_weight_loader_is_refused_explicitly():
-    with pytest.raises(ValueError, match="BeamNvfp4CheckpointLoader"):
-        Target.load_weights(NS(), {})
 
 
 @pytest.mark.parametrize(
@@ -249,29 +214,6 @@ def test_eager_route_accepts_disabled_prefill_graphs(route_setup, backend) -> No
     assert reads == [None]
 
 
-@pytest.mark.parametrize("builtin", [None, object])
-def test_auto_refusal_explains_missing_fallback(route_setup, monkeypatch, builtin) -> None:
-    config, args, reads = route_setup
-    config.pretrained_config.architectures = ["BeamForCausalLM"]
-    args.modeling_v2 = "auto"
-    args.cuda_graph_config = object()
-    args.disable_overlap_scheduler = False
-    monkeypatch.setattr(_router_index, "_device_compute_capability", lambda: (10, 3))
-    monkeypatch.setattr(AutoModelForCausalLM, "_resolve_class", lambda config: builtin)
-    log = Mock()
-    monkeypatch.setattr(_router_index, "logger", log)
-    assert _router_index.modeling_v2_resolve(config, args) is None
-    if builtin is None:
-        message = log.warning.call_args.args[0]
-        assert "no built-in implementation" in message
-        assert "CUDA graphs" in message and "overlap scheduler" in message
-        log.info.assert_not_called()
-    else:
-        log.warning.assert_not_called()
-        assert "using the built-in implementation" in log.info.call_args.args[0]
-    assert reads == []
-
-
 def test_wrong_hardware_refusal_does_not_import_target_model(route_setup, monkeypatch) -> None:
     config, args, reads = route_setup
     original_import = builtins.__import__
@@ -285,19 +227,6 @@ def test_wrong_hardware_refusal_does_not_import_target_model(route_setup, monkey
     with pytest.raises(NoTarget, match="compute capability"):
         routing.route(config, args, (9, 0))
     assert reads == []
-
-
-@pytest.mark.parametrize("diagnostics", [False, True])
-def test_checkpoint_digests_follow_diagnostic_mode(diagnostics, tmp_path) -> None:
-    checkpoint = str(tmp_path)
-    record = {"loaded": True}
-    load = Mock(return_value=record)
-    target = NS(
-        checkpoint_dir=checkpoint,
-        model=NS(diagnostics=diagnostics, load=load),
-    )
-    assert Target.load_checkpoint(target, checkpoint) is record
-    load.assert_called_once_with(checkpoint, record_digests=diagnostics)
 
 
 @pytest.mark.parametrize("page_size", [16, 32, 64])

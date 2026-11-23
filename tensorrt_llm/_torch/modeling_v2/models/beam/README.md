@@ -72,6 +72,7 @@ it does not make the TensorRT-LLM package independent of its native dependencies
 ```bash
 python -m pytest -m cpu_only \
   tests/unittest/_torch/modeling_v2/models/beam/test_component_contracts.py \
+  tests/unittest/_torch/modeling_v2/models/beam/full_model_nvfp4__sm_103__tp4/test_target_contracts.py \
   tests/unittest/_torch/modeling_v2/models/beam/test_diagnostic_mode.py \
   tests/unittest/_torch/modeling_v2/models/beam/full_model_nvfp4__sm_103__tp4/test_checkpoint_layout.py
 ```
