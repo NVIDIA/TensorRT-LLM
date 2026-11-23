@@ -1670,6 +1670,30 @@ def test_ulysses_forward_aligns_metadata_and_unpads_outputs(
         torch.testing.assert_close(actual.sample, expected.sample, rtol=0, atol=0)
         torch.testing.assert_close(actual.audio_sample, expected.audio_sample, rtol=0, atol=0)
 
+        if inference_mode and pad:
+            # An inference tags tensor has no version counter, so its padded tags are built on
+            # every forward: a refill in place reaches the blocks.
+            seen = []
+
+            class RecordBlock(nn.Module):
+                def forward(self, hidden_states, *args, token_tags=None, **kwargs):
+                    seen.append((args[3], token_tags))
+                    return hidden_states
+
+            model.transformer_blocks = nn.ModuleList([RecordBlock()])
+            with torch.inference_mode():
+                tags = inputs["token_tags"].clone()
+                refilled = dict(inputs, token_tags=tags)
+                model(**refilled)
+                tags[-1] = -1
+                model(**refilled)
+            key_padding_mask, token_tags = seen[-1]
+            torch.testing.assert_close(token_tags, F.pad(tags, (0, pad), value=-1))
+            if key_padding_mask is not None:
+                torch.testing.assert_close(
+                    key_padding_mask, F.pad(tags >= 0, (0, pad), value=False).unsqueeze(0)
+                )
+
 
 def test_refiner_rejects_padding_without_mask_support() -> None:
     refiner = h3.MiniMaxH3TokenRefiner.__new__(h3.MiniMaxH3TokenRefiner)

@@ -32,6 +32,7 @@ from tensorrt_llm._torch.visual_gen.attention.backends import (
 )
 from tensorrt_llm._torch.visual_gen.attention.backends.cute_dsl import DeCoAttention
 from tensorrt_llm._torch.visual_gen.attention.backends.cute_dsl import deco as deco_backend
+from tensorrt_llm._torch.visual_gen.attention.backends.utils import get_padding_support
 from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell import deco_attention
 from tensorrt_llm.visual_gen.args import AttentionConfig, QuantAttentionConfig
 
@@ -132,6 +133,21 @@ def test_deco_selection() -> None:
     assert DeCoAttention.support_key_padding_mask()
     assert not DeCoAttention.requires_trailing_padding()
     assert not DeCoAttention.support_valid_seq_len()
+
+    # (supports_mask, supports_length, requires_trailing): a quantized FLASHINFER recipe rejects
+    # a mask and a quantized TRTLLM recipe the valid prefix, which their classes alone do not say.
+    # The configs skip the recipe validator, which binds a recipe to the GPU generation.
+    def config(backend: str, quant_attention_config: QuantAttentionConfig | None = None):
+        return AttentionConfig.model_construct(
+            backend=backend, quant_attention_config=quant_attention_config
+        )
+
+    quantized = QuantAttentionConfig(qk_dtype="nvfp4", v_dtype="fp8")
+    assert get_padding_support(config("FLASHINFER")) == (True, False, False)
+    assert get_padding_support(config("FLASHINFER", quantized)) == (False, False, False)
+    assert get_padding_support(config("TRTLLM")) == (False, True, True)
+    assert get_padding_support(config("TRTLLM", quantized)) == (False, False, False)
+    assert get_padding_support(config("CUTEDSL", _quant_config())) == (True, False, False)
 
 
 def test_deco_cross_attention_layers_run_on_vanilla(require_deco_kernels) -> None:
