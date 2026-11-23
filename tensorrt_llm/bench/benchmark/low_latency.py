@@ -220,7 +220,8 @@ def latency_command(
 
     custom_tokenizer: str = params.get("custom_tokenizer", None)
     # Initialize the HF tokenizer for the specified model.
-    tokenizer = initialize_tokenizer(options.checkpoint_path, custom_tokenizer)
+    tokenizer = initialize_tokenizer(options.checkpoint_path, custom_tokenizer,
+                                     options.checkpoint_format)
 
     # Dataset Loading and Preparation
     with open(options.dataset_path, "r") as dataset:

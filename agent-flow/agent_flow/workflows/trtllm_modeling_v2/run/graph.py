@@ -538,7 +538,8 @@ def apply_revision(
     orchestrator's count. A task whose ``max_attempts``-th worker run
     failed is not retried, and the revision is refused; an attempt in
     ``not_started_attempts`` (its worktree could not be prepared, so no worker
-    ran) keeps its number but is not counted. Returns the adopted graph
+    ran, or the run's environment ended it) keeps its number but is not
+    counted. Returns the adopted graph
     (``current`` on refusal) and the reasons for refusal.
     """
     if not reason.strip():

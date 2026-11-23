@@ -88,6 +88,9 @@ TestGPTOSS::test_eagle3_1gpu[cutlass-one_model]:
 TestGemma4_26B_A4B::test_nvfp4:
   ref_al: 3.379348
   min_al: 3.2103806
+TestGemma4_E4B::test_bf16_mtp:
+  ref_al: 3.269323
+  min_al: 3.1058569
 TestStep3p7SpeculativeDecoding::test_step3p7_mtp:
   ref_al: 3.143075
   min_al: 2.98592125

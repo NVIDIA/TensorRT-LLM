@@ -118,6 +118,7 @@ Welcome to TensorRT LLM's Documentation!
    developer-guide/kv-cache-cold-page-codec.md
    developer-guide/kv-cache-compression-development.md
    developer-guide/sparse-attention-development-guide.md
+   developer-guide/device-copy-plan.md
    developer-guide/telemetry.md
 
 

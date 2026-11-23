@@ -1302,6 +1302,11 @@ class AttentionBackend(Generic[TMetadata]):
         """
         self.quant_config = new_quant_config
 
+    def runs_without_host_plan(self, metadata: TMetadata) -> bool:
+        """Whether a forward over ``metadata`` reads all its inputs on the device, so a CUDA graph
+        can capture it without host-side preparation at replay."""
+        return False
+
     def forward(self,
                 q: torch.Tensor,
                 k: Optional[torch.Tensor],
