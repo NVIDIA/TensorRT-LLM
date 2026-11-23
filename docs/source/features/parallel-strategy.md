@@ -85,6 +85,70 @@ enable_attention_dp: true
 
 Then set `--config parallel_config.yaml` in `trtllm-serve` or `trtllm-bench`.
 
+### Multimodal encoders
+
+`multimodal_config.encoder_data_parallel_size` (prototype) sets the number
+of encoder replicas inside the LLM tensor-parallel group. Omitting it or
+setting it to `null` preserves the model's existing encoder layout.
+
+A positive value `N` gives each replica `tensor_parallel_size / N` ranks.
+`N = 1` uses the full group for a single encoder, and
+`N = tensor_parallel_size` gives each rank a complete encoder. Layers that
+support tensor parallelism shard weights within the replica. Other towers,
+including Gemma4 audio, Hugging Face Qwen2-VL vision, and the Gemma4 Unified
+front ends, run the same weights on each rank of the replica.
+
+The model must support encoder DP, `N` must divide `tensor_parallel_size`,
+and both pipeline and context parallel sizes must equal 1. Ray accepts
+`N = 1` and `N = tensor_parallel_size`. A worker that skips its encoder
+has no encoder items to distribute or share. If the model still builds and
+runs its encoder with `disable_mm_encoder: true`, the encoder uses `N`.
+
+When replicas split a batch, each raw multimodal request needs item records
+with `output_embedding_lengths` for every input modality. The executor
+rejects a request that lacks these records before scheduling its forward.
+Requests with attached embeddings skip the encoder.
+
+| LLM attention | `enable_attention_dp` | `encoder_data_parallel_size` | Encoder |
+|---|---|---|---|
+| TP2 | `false` | `1` | TP2 |
+| TP2 | `false` | `2` | DP2 |
+| DP2 | `true` | `1` | TP2 |
+| DP2 | `true` | `2` | DP2 |
+
+```yaml
+tensor_parallel_size: 2
+enable_attention_dp: true
+multimodal_config:
+  encoder_data_parallel_size: 1  # Encoder TP2, with LLM attention DP2
+```
+
+This example was run with Qwen3-VL. The Qwen2.5-VL-7B checkpoint tests
+covered encoder TP and DP with LLM attention DP off. A small Qwen2.5-VL
+vision tower was also tested with LLM attention DP on.
+
+With LLM TP, encoder DP distributes cache-miss items by physical encoder token
+cost and gathers their embeddings in prompt order. With LLM attention DP and a
+fully replicated encoder, each rank encodes only its own requests. With LLM
+attention DP and encoder TP, all ranks participate in a common item-encoding
+step, including ranks with only cache hits or no multimodal work. The ranks'
+scheduled batches run together while they fit one encoder step
+(`encoder_max_num_tokens` and `encoder_max_batch_size`). With multiple
+replicas, the model receives all items assigned to its replica in one call
+and batches them by modality. Owners whose batches exceed the combined
+limit run in separate calls. CUDA payloads stay on the GPU, and only the owner
+keeps the returned embeddings in its cache.
+
+When encoder items are distributed or shared across ranks, startup rejects
+`mm_encoder_only`, encoder CUDA graphs, and side-stream prefetch. Sharing
+encoder TP across attention-DP ranks requires MM encoder item scheduling.
+With attention DP and one independent encoder per rank, each rank keeps its
+own items.
+
+See the [multimodal support matrix](../models/supported-models.md) for model
+coverage and the [model guide](../torch/adding_new_model.md#multimodal-encoder-parallelism)
+for the encoder DP contract.
+
 ### FFN Module
 
 #### Dense Models
