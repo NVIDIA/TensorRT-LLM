@@ -233,6 +233,9 @@ class ZMQMessenger(MessengerInterface):
     message gets ``[header, mac]`` appended, and every incoming message is
     verified and stripped before it reaches ``receive()`` callers or the
     listener callback, so handlers see the same frames as without a signer.
+    A ROUTER signs a reply for the DEALER socket whose message it verified
+    (the id of the DEALER's owner followed by the DEALER's stream id), so
+    the reply does not verify on another socket of the same owner.
 
     Message ordering. Each signed socket draws a random 16-byte stream id
     and numbers its messages from 1. The receiving socket remembers the last
@@ -411,13 +414,17 @@ class ZMQMessenger(MessengerInterface):
             )
             self._check_replay(header)
             with self._peer_ids_lock:
-                self._peer_ids[routing_id] = header.sender_id
+                # A reply is signed for the DEALER socket that sent the
+                # request: its owner's id followed by its stream id.
+                self._peer_ids[routing_id] = header.sender_id + header.stream_id
                 self._peer_ids.move_to_end(routing_id)
                 while len(self._peer_ids) > self._MAX_PEER_IDS:
                     self._peer_ids.popitem(last=False)
             return [routing_id, *payload]
         payload, header = self._signer.verify(
-            frames, recipient_id=self._identity, flow=FrameSigner.FLOW_TO_DEALER
+            frames,
+            recipient_id=self._identity + self._stream_id,
+            flow=FrameSigner.FLOW_TO_DEALER,
         )
         # A DEALER talks to exactly one ROUTER: the reply must come from it.
         if header.sender_id != self._endpoint.encode("utf-8"):

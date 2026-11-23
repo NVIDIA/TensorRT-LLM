@@ -309,7 +309,9 @@ holds 4096 and accepts a message from one more sending socket, it forgets the
 number of the socket it has least recently accepted a message from, and the next
 message from that socket is accepted with any number. A newly opened socket (each
 RankInfo exchange opens one) and a restarted worker start with none, so the first
-message they get from a sending socket is accepted with any number.
+message they get from a sending socket is accepted with any number. A reply is
+signed for the socket that sent the request, so another socket, such as the one a
+later RankInfo exchange opens, does not accept it.
 
 Upgrade communicating context and generation workers together before enabling
 native authentication. Existing deployments that already set

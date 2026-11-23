@@ -410,10 +410,11 @@ def test_signed_dealer_rejects_reply_for_other_recipient_or_from_other_peer(
     signed_pair: _MessengerPair,
 ) -> None:
     router, dealer = signed_pair
+    # Signed for another DEALER socket of the same owner.
     for_other = _signed(
         [b"reply"],
         sender_id=router.endpoint.encode(),
-        recipient_id=b"tcp://127.0.0.1:40003",
+        recipient_id=b"tcp://127.0.0.1:40001" + os.urandom(16),
         flow=FrameSigner.FLOW_TO_DEALER,
     )
     with pytest.raises(FrameAuthenticationError, match="MAC mismatch"):
@@ -421,7 +422,7 @@ def test_signed_dealer_rejects_reply_for_other_recipient_or_from_other_peer(
     from_other = _signed(
         [b"reply"],
         sender_id=b"tcp://10.0.0.9:1",
-        recipient_id=b"tcp://127.0.0.1:40001",
+        recipient_id=b"tcp://127.0.0.1:40001" + dealer._stream_id,
         flow=FrameSigner.FLOW_TO_DEALER,
     )
     with pytest.raises(FrameAuthenticationError, match="connected peer"):
@@ -433,7 +434,7 @@ def test_signed_dealer_rejects_repeated_reply(signed_pair: _MessengerPair) -> No
     reply = _signed(
         [b"reply"],
         sender_id=router.endpoint.encode(),
-        recipient_id=b"tcp://127.0.0.1:40001",
+        recipient_id=b"tcp://127.0.0.1:40001" + dealer._stream_id,
         flow=FrameSigner.FLOW_TO_DEALER,
         seq=1,
         stream_id=os.urandom(16),
