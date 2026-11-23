@@ -82,7 +82,9 @@ def test_registered_loader_delegates_without_importing_a_target(monkeypatch, tmp
 def test_missing_preload_interface_clears_previous_success(model):
     loader = BeamNvfp4CheckpointLoader()
     loader.load_weights("checkpoint", Mapping(), model=_model())
-    with pytest.raises(TypeError, match="callable load_checkpoint"):
+    with pytest.raises(
+        TypeError, match=rf"{type(model).__name__}.*callable load_checkpoint.*routing"
+    ):
         loader.load_weights("checkpoint", Mapping(), model=model)
     assert not loader.is_weights_preloaded()
 

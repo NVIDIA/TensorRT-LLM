@@ -196,8 +196,9 @@ class BeamNvfp4CheckpointLoader(HfCheckpointLoader):
         load_checkpoint = getattr(model, "load_checkpoint", None)
         if not callable(load_checkpoint):
             raise TypeError(
-                "BeamNvfp4CheckpointLoader requires modeling_v2='require' and a selected model with "
-                "a callable load_checkpoint(checkpoint_dir, kv_cache_scales=...)"
+                f"BeamNvfp4CheckpointLoader received {type(model).__name__}, which has no callable "
+                "load_checkpoint(checkpoint_dir, kv_cache_scales=...). Check the ModelingV2 "
+                "routing diagnostics for why the Beam NVFP4 target was not selected."
             )
         self._check_kv_cache_scales(model, mapping)
         load_checkpoint(checkpoint_dir, kv_cache_scales=self.kv_cache_scales)
