@@ -492,6 +492,18 @@ def test_queue_size_methods(executor_queue):
     assert executor_queue.get_request_queue_size() == 1
 
 
+def test_special_request_ids_are_distinct():
+    """Test that no two special queue items share an ID, so that each is told apart."""
+    from tensorrt_llm._torch.pyexecutor import executor_request_queue
+
+    ids = {
+        name: value
+        for name, value in vars(executor_request_queue).items()
+        if name.endswith("_REQUEST_ID")
+    }
+    assert len(set(ids.values())) == len(ids), ids
+
+
 def test_wake_returns_a_waiting_fetch(executor_queue):
     """Test that wake ends a waiting fetch without a request."""
     fetched = []
