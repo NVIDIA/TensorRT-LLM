@@ -370,5 +370,6 @@ class Qwen2ForRewardModel(DecoderModelForCausalLM[QwenModel, Qwen2Config]):
         logits = self.score(hidden_states)
 
         # get score of last token of each batch item
-        end_indices = torch.cumsum(attn_metadata.seq_lens, dim=0) - 1
+        end_indices = torch.cumsum(
+            attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
         return logits[end_indices]

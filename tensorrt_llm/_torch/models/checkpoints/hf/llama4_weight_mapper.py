@@ -1,9 +1,13 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import \
     HfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 
 
-@register_mapper("HF", "Llama4ForConditionalGeneration")
+@register_mapper(CheckpointFormat.HF, "Llama4ForConditionalGeneration")
 class Llama4HfWeightMapper(HfWeightMapper):
     """
     Weight mapper for Llama4ForConditionalGeneration that handles the

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Self-sampling GVR top-K decode kernels (CuTe DSL, Blackwell sm_100a).
+"""Self-sampling GVR top-K decode kernels (CuTe DSL, Hopper sm_90a and Blackwell sm_100a/sm_103a).
 
 Sample-calibrated threshold ladders for exact single-pass top-K: the kernel
 derives its selection threshold from an in-kernel sample of the row itself
@@ -66,11 +66,41 @@ from cutlass.cute import runtime as _crt
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.utils.smem_allocator import SmemAllocator
 
+from ....cute_dsl_file_cache import KernelCache
 from . import gvr_topk_decode_self_sampling_bf16 as _bf16
 from . import gvr_topk_decode_self_sampling_fp16 as _fp16
 
 # `C.` references throughout resolve against this module itself.
 C = sys.modules[__name__]
+
+
+@dsl_user_op
+def _pdl_wait(*, loc=None, ip=None):
+    """``griddepcontrol.wait`` as a memory barrier for the compiler (no load moves above it)."""
+    llvm.inline_asm(
+        None,
+        [],
+        "griddepcontrol.wait;",
+        "~{memory}",
+        has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _pdl_release(*, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [],
+        "griddepcontrol.launch_dependents;",
+        "~{memory}",
+        has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
 
 
 @cute.jit
@@ -572,14 +602,62 @@ def _ld_g_nc_v4_f32(gaddr, *, loc=None, ip=None):
     )
 
 
-def ld_g_f32x4(copy_atom, base_addr, v_idx, frag):
+@dsl_user_op
+def _l2_evict_first_policy(*, loc=None, ip=None):
+    """64-bit L2 cache policy (createpolicy, sm_80+) that makes a load's lines first to evict.
+
+    The fraction is 1.0, so the policy is a constant that ptxas folds into the uniform memory
+    descriptor of the `.L2::cache_hint` loads: it costs no general register."""
+    return cutlass.Int64(
+        mlir_llvm.inline_asm(
+            T.i64(),
+            [],
+            "createpolicy.fractional.L2::evict_first.b64 $0, 1.0;",
+            "=l",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=mlir_llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _ld_g_nc_v4_f32_hint(gaddr, pol, *, loc=None, ip=None):
+    """`_ld_g_nc_v4_f32` under the L2 cache policy ``pol`` (`ld.global.nc.L2::cache_hint`)."""
+    from cutlass._mlir import ir as _ir
+
+    st = _ir.Type.parse("!llvm.struct<(f32, f32, f32, f32)>")
+    r = mlir_llvm.inline_asm(
+        st,
+        [gaddr.ir_value(loc=loc, ip=ip), pol.ir_value(loc=loc, ip=ip)],
+        "ld.global.nc.L2::cache_hint.v4.f32 {$0, $1, $2, $3}, [$4], $5;",
+        "=f,=f,=f,=f,l,l",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=mlir_llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return tuple(
+        cutlass.Float32(mlir_llvm.extractvalue(T.f32(), r, [i], loc=loc, ip=ip)) for i in range(4)
+    )
+
+
+def ld_g_f32x4(copy_atom, base_addr, v_idx, frag, pol=None):
     """Load float4 #v_idx (16B units) from gmem byte base into frag[0..3].
 
     base_addr: Int64 byte address; frag: (4,) f32 fragment. Issue ALL batch
     members before consuming any. Pinned-asm form (see _ld_g_nc_v4_f32);
-    copy_atom kept for call-site compatibility.
+    copy_atom kept for call-site compatibility. pol: an L2 cache policy
+    (_l2_evict_first_policy) for the load, or None.
     """
-    v0, v1, v2, v3 = _ld_g_nc_v4_f32(base_addr + cutlass.Int64(v_idx) * cutlass.Int64(16))
+    gaddr = base_addr + cutlass.Int64(v_idx) * cutlass.Int64(16)
+    if pol is None:
+        v0, v1, v2, v3 = _ld_g_nc_v4_f32(gaddr)
+    else:
+        v0, v1, v2, v3 = _ld_g_nc_v4_f32_hint(gaddr, pol)
     frag[0] = v0
     frag[1] = v1
     frag[2] = v2
@@ -1944,6 +2022,23 @@ def _ld_g_nc_v4_b32(gaddr, *, loc=None, ip=None):
     return tuple(cutlass.Uint32(llvm.extractvalue(T.i32(), ret, [i])) for i in range(4))
 
 
+@dsl_user_op
+def _ld_g_nc_v4_b32_hint(gaddr, pol, *, loc=None, ip=None):
+    """`_ld_g_nc_v4_b32` under the L2 cache policy ``pol`` (`ld.global.nc.L2::cache_hint`)."""
+    ret = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+        [gaddr.ir_value(loc=loc, ip=ip), pol.ir_value(loc=loc, ip=ip)],
+        "ld.global.nc.L2::cache_hint.v4.b32 {$0, $1, $2, $3}, [$4], $5;",
+        "=r,=r,=r,=r,l,l",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return tuple(cutlass.Uint32(llvm.extractvalue(T.i32(), ret, [i])) for i in range(4))
+
+
 def ld_g_bf16x8(copy_atom, base_addr, v_idx, frag):
     """bf16 16-byte vector loader: bf16x8 vector #v_idx (16B units) widened
     into frag[0..7] (f32, exact). Halves the P3 load-instruction count vs the
@@ -1959,15 +2054,20 @@ def ld_g_bf16x8(copy_atom, base_addr, v_idx, frag):
     frag[7] = f32_of_u32(d & cutlass.Uint32(0xFFFF0000))
 
 
-def ld_g_b16x8_pk(copy_atom, base_addr, v_idx, pk):
+def ld_g_b16x8_pk(copy_atom, base_addr, v_idx, pk, pol=None):
     """Load 16-byte vector ``v_idx`` of 16-bit elements (either dtype) as raw packed pairs.
 
     ``base_addr`` is an Int64 global byte address, 16-byte aligned (the row base, or the col0 vector
     in prefill). One ld.global.nc.v4.b32 puts the eight elements in ``pk[0..3]`` as Uint32 pairs
     without widening, so a primed vector holds four registers instead of eight. ``copy_atom`` is
-    unused (call-site parity with ``ld_g_f32x4``).
+    unused (call-site parity with ``ld_g_f32x4``). ``pol`` is an L2 cache policy
+    (``_l2_evict_first_policy``) for the load, or None.
     """
-    a, b, c, d = _ld_g_nc_v4_b32(base_addr + cutlass.Int64(v_idx) * cutlass.Int64(16))
+    gaddr = base_addr + cutlass.Int64(v_idx) * cutlass.Int64(16)
+    if pol is None:
+        a, b, c, d = _ld_g_nc_v4_b32(gaddr)
+    else:
+        a, b, c, d = _ld_g_nc_v4_b32_hint(gaddr, pol)
     pk[0] = a
     pk[1] = b
     pk[2] = c
@@ -2901,10 +3001,13 @@ def _f16_env_samp(
 class GvrMainKernel:
     """gvr_main<BLK, U, MINB, NBS, KPT, SPLIT> — streaming self-sampling GVR.
 
-    The arguments below select the logits dtype and the 16-bit build options; an option is
-    dropped outside the builds it names.
+    The arguments below select the row stream's L2 policy, the logits dtype and the 16-bit
+    build options; an option is dropped outside the builds it names.
 
     Args:
+        l2ef: 16-byte-vector builds (not det or prefill): the P3 row-stream loads mark their
+            lines evict_first in L2, so the row streams of a batch evict their consumed lines
+            before the other rows' sampled lines.
         dtype: Float32, BFloat16 or Float16 logits. 16-bit builds must be hint-free; det
             builds are Float32 (get_compiled enforces it).
         vector_elems: elements per 16-byte load; 0 selects 4 (Float32) or 8 (16-bit).
@@ -2942,6 +3045,7 @@ class GvrMainKernel:
         fused_k: int = 0,
         warp_rank: bool = False,
         staged_k: int = 0,
+        l2ef: bool = False,
         dtype=cutlass.Float32,
         v16: bool = False,
         dense: bool = False,
@@ -2952,8 +3056,11 @@ class GvrMainKernel:
         samp_rounds: int = 0,
         env_first: bool = False,
         load_ahead: bool = False,
+        pdl: bool = False,
     ) -> None:
         self.det = bool(det)
+        # pdl: wait for the predecessor before any load, then release the dependents.
+        self.pdl = bool(pdl)
         self.fused_k = int(fused_k) if det else 0  # det: compile-time top-K
         self.regsel = bool(regsel) and dtype is cutlass.BFloat16
         self.envf = (
@@ -3144,6 +3251,12 @@ class GvrMainKernel:
             and not self.det
         )
 
+        self.l2ef = (
+            bool(l2ef)
+            and not self.det
+            and not self.prefill
+            and (dtype is cutlass.Float32 or self.vector_elems == 8)
+        )
         self.env_first = (
             bool(env_first)
             and dtype is cutlass.Float16
@@ -3376,6 +3489,9 @@ class GvrMainKernel:
         idv = cutlass.Int32(
             0
         )  # DET: typed predeclaration (det branch assigns it; the DSL hoists to None otherwise)
+        if cutlass.const_expr(self.pdl):
+            _pdl_wait()
+            _pdl_release()
         if cutlass.const_expr(self.staged_k > 0):
             k = cutlass.Int32(self.staged_k)
         BLK = self.blk
@@ -4106,6 +4222,10 @@ class GvrMainKernel:
 
         # ============ P1: sample prefetch (hint gather LAZY) =================
         atom128 = C.g2r_atom_f32(128, invariant=True)
+        # l2ef: the P3 row-stream loads below take an evict_first L2 policy (None: plain loads)
+        l2pol = None
+        if cutlass.const_expr(self.l2ef):
+            l2pol = C._l2_evict_first_policy()
         # samp_rounds (FP16): the first samp_rounds * BLK sample vectors stay packed in spk
         # for the min/max and histogram passes; the rest are loaded once per pass.  env_first
         # builds issued spk before the per-row prologue and reload it only when the row's
@@ -4316,12 +4436,18 @@ class GvrMainKernel:
             if fullsl != Int32(0):
                 if cutlass.const_expr(self.dtype == cutlass.Float32):
                     for uu in cutlass.range_constexpr(PFD):
-                        C.ld_g_f32x4(atom128, x_addr, c0 + tidx + cutlass.Int32(uu * BLK), pf[uu])
+                        C.ld_g_f32x4(
+                            atom128, x_addr, c0 + tidx + cutlass.Int32(uu * BLK), pf[uu], pol=l2pol
+                        )
                 else:
                     for uu in cutlass.range_constexpr(PFD):
                         if cutlass.const_expr(self.vector_elems == 8):
                             ld_g_b16x8_pk(
-                                atom128, x_addr, c0 + tidx + cutlass.Int32(uu * BLK), pf[uu]
+                                atom128,
+                                x_addr,
+                                c0 + tidx + cutlass.Int32(uu * BLK),
+                                pf[uu],
+                                pol=l2pol,
                             )
                         else:
                             ld_g_16x4(
@@ -4338,7 +4464,7 @@ class GvrMainKernel:
                         ic = i_
                         if ic >= c1:
                             ic = lim4
-                        C.ld_g_f32x4(atom128, x_addr, ic, pf[uu])
+                        C.ld_g_f32x4(atom128, x_addr, ic, pf[uu], pol=l2pol)
                 else:
                     for uu in cutlass.range_constexpr(PFD):
                         i_ = c0 + tidx + cutlass.Int32(uu * BLK)
@@ -4346,7 +4472,7 @@ class GvrMainKernel:
                         if ic >= c1:
                             ic = lim4
                         if cutlass.const_expr(self.vector_elems == 8):
-                            ld_g_b16x8_pk(atom128, x_addr, ic, pf[uu])
+                            ld_g_b16x8_pk(atom128, x_addr, ic, pf[uu], pol=l2pol)
                         else:
                             ld_g_16x4(self.dtype, atom128, x_addr, ic, pf[uu])
             # asm prefetch site #1: gate (c1-c0)>=2*BLK*U && SMP>=160
@@ -4610,7 +4736,11 @@ class GvrMainKernel:
                             if cutlass.const_expr(self.dtype == cutlass.Float32):
                                 for uu in cutlass.range_constexpr(PFD):
                                     C.ld_g_f32x4(
-                                        atom128, x_addr, c0 + tidx + cutlass.Int32(uu * BLK), pf[uu]
+                                        atom128,
+                                        x_addr,
+                                        c0 + tidx + cutlass.Int32(uu * BLK),
+                                        pf[uu],
+                                        pol=l2pol,
                                     )
                             else:
                                 for uu in cutlass.range_constexpr(PFD):
@@ -4620,6 +4750,7 @@ class GvrMainKernel:
                                             x_addr,
                                             c0 + tidx + cutlass.Int32(uu * BLK),
                                             pf[uu],
+                                            pol=l2pol,
                                         )
                                     else:
                                         ld_g_16x4(
@@ -4636,7 +4767,7 @@ class GvrMainKernel:
                                     ic = i_
                                     if ic >= c1:
                                         ic = lim4
-                                    C.ld_g_f32x4(atom128, x_addr, ic, pf[uu])
+                                    C.ld_g_f32x4(atom128, x_addr, ic, pf[uu], pol=l2pol)
                             else:
                                 for uu in cutlass.range_constexpr(PFD):
                                     i_ = c0 + tidx + cutlass.Int32(uu * BLK)
@@ -4644,7 +4775,7 @@ class GvrMainKernel:
                                     if ic >= c1:
                                         ic = lim4
                                     if cutlass.const_expr(self.vector_elems == 8):
-                                        ld_g_b16x8_pk(atom128, x_addr, ic, pf[uu])
+                                        ld_g_b16x8_pk(atom128, x_addr, ic, pf[uu], pol=l2pol)
                                     else:
                                         ld_g_16x4(self.dtype, atom128, x_addr, ic, pf[uu])
                     if cutlass.const_expr(NBD > BLK):
@@ -4770,7 +4901,11 @@ class GvrMainKernel:
                         if cutlass.const_expr(self.dtype == cutlass.Float32):
                             for uu in cutlass.range_constexpr(PFD, U):
                                 C.ld_g_f32x4(
-                                    atom128, x_addr, i0 + cutlass.Int32(uu * BLK), fr[uu - PFD]
+                                    atom128,
+                                    x_addr,
+                                    i0 + cutlass.Int32(uu * BLK),
+                                    fr[uu - PFD],
+                                    pol=l2pol,
                                 )
                         else:
                             for uu in cutlass.range_constexpr(PFD, U):
@@ -4792,7 +4927,11 @@ class GvrMainKernel:
                         for uu in cutlass.range_constexpr(PFD, U):
                             if cutlass.const_expr(self.vector_elems == 8):
                                 ld_g_b16x8_pk(
-                                    atom128, x_addr, i0 + cutlass.Int32(uu * BLK), fr[uu - PFD]
+                                    atom128,
+                                    x_addr,
+                                    i0 + cutlass.Int32(uu * BLK),
+                                    fr[uu - PFD],
+                                    pol=l2pol,
                                 )
                             else:
                                 ld_g_16x4(
@@ -4863,7 +5002,7 @@ class GvrMainKernel:
                                 ic = i_
                                 if ic >= c1:
                                     ic = lim4
-                                C.ld_g_f32x4(atom128, x_addr, ic, fr[uu - PFD])
+                                C.ld_g_f32x4(atom128, x_addr, ic, fr[uu - PFD], pol=l2pol)
                         else:
                             for uu in cutlass.range_constexpr(PFD, U):
                                 i_ = i0 + cutlass.Int32(uu * BLK)
@@ -4892,7 +5031,7 @@ class GvrMainKernel:
                             if ic >= c1:
                                 ic = lim4  # clamped address
                             if cutlass.const_expr(self.vector_elems == 8):
-                                ld_g_b16x8_pk(atom128, x_addr, ic, fr[uu - PFD])
+                                ld_g_b16x8_pk(atom128, x_addr, ic, fr[uu - PFD], pol=l2pol)
                             else:
                                 ld_g_16x4(self.dtype, atom128, x_addr, ic, fr[uu - PFD])
                         for uu in cutlass.range_constexpr(U):
@@ -4966,13 +5105,21 @@ class GvrMainKernel:
                             if cutlass.const_expr(self.dtype == cutlass.Float32):
                                 for uu in cutlass.range_constexpr(PFD):
                                     C.ld_g_f32x4(
-                                        atom128, x_addr, j0 + cutlass.Int32(uu * BLK), pf[uu]
+                                        atom128,
+                                        x_addr,
+                                        j0 + cutlass.Int32(uu * BLK),
+                                        pf[uu],
+                                        pol=l2pol,
                                     )
                             else:
                                 for uu in cutlass.range_constexpr(PFD):
                                     if cutlass.const_expr(self.vector_elems == 8):
                                         ld_g_b16x8_pk(
-                                            atom128, x_addr, j0 + cutlass.Int32(uu * BLK), pf[uu]
+                                            atom128,
+                                            x_addr,
+                                            j0 + cutlass.Int32(uu * BLK),
+                                            pf[uu],
+                                            pol=l2pol,
                                         )
                                     else:
                                         ld_g_16x4(
@@ -4989,7 +5136,7 @@ class GvrMainKernel:
                                     jc = j_
                                     if jc >= c1:
                                         jc = lim4
-                                    C.ld_g_f32x4(atom128, x_addr, jc, pf[uu])
+                                    C.ld_g_f32x4(atom128, x_addr, jc, pf[uu], pol=l2pol)
                             else:
                                 for uu in cutlass.range_constexpr(PFD):
                                     j_ = j0 + cutlass.Int32(uu * BLK)
@@ -4997,7 +5144,7 @@ class GvrMainKernel:
                                     if jc >= c1:
                                         jc = lim4
                                     if cutlass.const_expr(self.vector_elems == 8):
-                                        ld_g_b16x8_pk(atom128, x_addr, jc, pf[uu])
+                                        ld_g_b16x8_pk(atom128, x_addr, jc, pf[uu], pol=l2pol)
                                     else:
                                         ld_g_16x4(self.dtype, atom128, x_addr, jc, pf[uu])
                 # warp-aggregated reservation
@@ -8111,13 +8258,19 @@ class GvrMainKernel:
             amin,
             sd_en,
             tsh_en,
-        ).launch(grid=(R, b, 1), block=(self.blk, 1, 1), stream=stream, min_blocks_per_mp=self.minb)
+        ).launch(
+            grid=(R, b, 1),
+            block=(self.blk, 1, 1),
+            stream=stream,
+            min_blocks_per_mp=self.minb,
+            use_pdl=self.pdl,
+        )
 
 
 # ---------------------------------------------------------------------------
 # compile cache + torch-facing entry
 # ---------------------------------------------------------------------------
-_COMPILE_CACHE = {}
+_COMPILE_CACHE = KernelCache(f"{__name__}._COMPILE_CACHE", __file__)
 
 
 def get_compiled(
@@ -8129,6 +8282,7 @@ def get_compiled(
     fused_k: int = 0,
     warp_rank: bool = False,
     staged_k: int = 0,
+    l2ef: bool = False,
     dtype: str = "f32",
     v16: bool = False,
     dense: bool = False,
@@ -8139,6 +8293,7 @@ def get_compiled(
     samp_rounds: int = 0,
     env_first: bool = False,
     load_ahead: bool = False,
+    pdl: bool = False,
 ) -> Any:
     """Return the compiled gvr_main launcher for ``tpl``, cached per option set.
 
@@ -8194,7 +8349,10 @@ def get_compiled(
             )
             + (("regsel",) if regsel else ())
             + (("envf",) if envf else ())
+            + (("pdl",) if pdl else ())
         )
+        if l2ef:
+            key = key + (("l2ef", True),)
         if p2:
             key = key + (True,)
         if samp_rounds:
@@ -8246,6 +8404,7 @@ def get_compiled(
                 prefill=bool(prefill),
                 warp_rank=warp_rank,
                 staged_k=staged_k,
+                l2ef=bool(l2ef),
                 dtype=_dtype_of(dtype),
                 v16=bool(v16),
                 dense=bool(dense),
@@ -8256,6 +8415,7 @@ def get_compiled(
                 samp_rounds=int(samp_rounds),
                 env_first=bool(env_first),
                 load_ahead=bool(load_ahead),
+                pdl=pdl,
             )
         r0, c0 = cute.sym_int(), cute.sym_int()
         r1, c1 = cute.sym_int(), cute.sym_int()
@@ -9827,6 +9987,38 @@ def _bf16_window_emit_ballot(
         position_tied = position_tied + cutlass.Int32(popc(tie_masks[slot]))
 
 
+def _cr_row_l2_lines(blk: int, vpt: int) -> int:
+    """Upper bound on the 128-byte lines of one ``kern_cr`` row of 16-bit scores: the packed batch
+    (4 * blk * vpt scores), a scalar tail of at most blk scores and one line of misalignment."""
+    return (2 * (4 * blk * vpt + blk) + 127) // 128 + 1
+
+
+@cute.jit
+def _prefetch_row_l2(
+    logits: cute.Tensor,
+    row,
+    length,
+    tid,
+    elem_bytes: cutlass.Constexpr,
+    blk: cutlass.Constexpr,
+    max_lines: cutlass.Constexpr,
+):
+    """``prefetch.global.L2`` the 128-byte lines of ``logits[row, 0:length]`` if the row exists.
+
+    Thread ``tid`` of the ``blk``-thread CTA takes lines ``tid``, ``tid + blk``, ...; ``max_lines``
+    bounds the line count at trace time. ``kern_cr``'s successor-row lookahead (``succ_la``) calls
+    it for the row one wave ahead once the CTA's own row has landed.
+    """
+    if row < cutlass.Int32(logits.shape[0]):
+        row_addr = logits[row, None].iterator.toint()
+        head = cutlass.Int32(row_addr & cutlass.Int64(127))
+        lines = (head + length * cutlass.Int32(elem_bytes) + cutlass.Int32(127)) >> cutlass.Int32(7)
+        line_addr = row_addr - cutlass.Int64(head) + cutlass.Int64(tid) * cutlass.Int64(128)
+        for step in cutlass.range_constexpr((max_lines + blk - 1) // blk):
+            if tid + cutlass.Int32(step * blk) < lines:
+                _prefetch_l2(line_addr + cutlass.Int64(step * blk * 128))
+
+
 @cute.jit
 def _bf16_try_window_cr(
     hp,
@@ -9844,6 +10036,10 @@ def _bf16_try_window_cr(
     pk16: cutlass.Constexpr,
     stage_output: cutlass.Constexpr,
     packed_signcount_bf16: cutlass.Constexpr,
+    succ_la: cutlass.Constexpr = 0,
+    la_logits=None,
+    la_row=None,
+    la_length=None,
 ):
     """One-pass BF16 code window of ``kern_cr`` (static K): 1 if it emitted the row, else 0.
 
@@ -9853,7 +10049,9 @@ def _bf16_try_window_cr(
     end. The row is emitted only when every element was counted, the crossing bin lies strictly
     inside the window and the K-th code is finite; otherwise ``kern_cr`` runs its radix passes.
     Uses smem words 0-103, ``hist_bins`` words from ``STATIC_WORDS`` and, with ``stage_output``,
-    the staged output row of ``kern``.
+    the staged output row of ``kern``. With ``succ_la`` > 0 the CTA prefetches row ``la_row +
+    succ_la`` of ``la_logits`` (``la_length`` scores) into L2 after its first barrier, when its own
+    row has landed (``kern_cr``'s successor-row lookahead).
     """
     done = cutlass.Int32(0)
     target = cutlass.Int32(static_k)
@@ -9935,6 +10133,18 @@ def _bf16_try_window_cr(
         if cutlass.const_expr(_BF16_CR_BALLOT_EMIT or vpt == 8):
             s_cnt[0] = cutlass.Int32(0)
     cute.arch.barrier()
+    if cutlass.const_expr(succ_la > 0):
+        # successor-row lookahead: this row has landed (the sign count consumed it); the row one
+        # wave ahead streams into L2 while this row selects
+        _prefetch_row_l2(
+            la_logits,
+            la_row + cutlass.Int32(succ_la),
+            la_length,
+            tid,
+            2,
+            blk,
+            _cr_row_l2_lines(blk, vpt),
+        )
 
     part_pc = cutlass.Int32(0)
     part_positive = cutlass.Int32(-32768)
@@ -10128,7 +10338,9 @@ class GvrTopkRegKernel:
     bits-domain window, ``packed_prefetch`` keeps the kernel-head prefetch packed, ``parts``
     splits a row's emit over that many CTAs, ``static_env_bf16`` fixes the BF16 envelope
     (n, npad, k), and ``code_radix`` launches the code-radix kernels, which ``clus``,
-    ``candidate_list``, ``cr2``, ``lane_hash``, ``static_n`` and ``packed_signcount_bf16`` tune.
+    ``candidate_list``, ``cr2``, ``lane_hash``, ``static_n`` and ``packed_signcount_bf16`` tune;
+    ``succ_la`` > 0 makes ``kern_cr``'s BF16 window prefetch the row ``succ_la`` rows ahead into
+    L2.
     """
 
     def __init__(
@@ -10167,6 +10379,7 @@ class GvrTopkRegKernel:
         cr2: bool = False,
         lane_hash: bool = False,
         static_n: int | None = None,
+        succ_la: int = 0,
     ) -> None:
         self.det = bool(det)
         self.lane_hash = bool(lane_hash)
@@ -10322,6 +10535,11 @@ class GvrTopkRegKernel:
         self.static_env_bf16 = (
             static_env_bf16 if dtype is cutlass.BFloat16 and not self.code_radix else None
         )
+        # Successor-row lookahead of `kern_cr` (one CTA per row): once its row has landed, a CTA
+        # prefetches row + succ_la into L2 (0: off). The launcher passes one wave of co-resident
+        # CTAs (SMs * minb), so the next wave's row loads overlap this wave's select.
+        self.succ_la = int(succ_la) if self.code_radix and self.clus == 1 and not self.cr2 else 0
+        assert self.succ_la >= 0
 
     def _part_hist_offset(self, s: int) -> int:
         return ((s * self.parts) // self.S) * self.nbh * 4
@@ -14277,6 +14495,9 @@ class GvrTopkRegKernel:
         - BF16 with a static K (within vpt, nbh, K and stage_output limits): a window of
           single-code bins (``_bf16_try_window_cr``) runs first; when it finds the K-th code it
           emits the row and the two passes are skipped.
+        - ``succ_la`` > 0 (BF16 window builds): once its row has landed (after the window's first
+          barrier) the CTA prefetches the 128-byte lines of row ``row + succ_la`` into L2, so a
+          batch taller than one wave streams its next wave while this one selects.
 
         Padding lanes (vector index >= n4) hold key 0: bin 0 of pass 1, and of pass 2 when
         B1 == 0, starts at -(padded keys), and no emit selects them.  Shared memory: the 256-bin
@@ -14343,6 +14564,9 @@ class GvrTopkRegKernel:
                 x_addr + cutlass.Int64((env4 << cutlass.Int32(2)) + tid) * cutlass.Int64(2)
             )
 
+        # successor-row lookahead extent (succ_la): the envelope, which the head loads cover
+        n_envelope = n
+
         # ---- per-row varlen prologue (the `kern` contract: short rows emit identity + (-1) tail)
         short = cutlass.Int32(0)
         if cutlass.const_expr(self.varlen):
@@ -14369,7 +14593,7 @@ class GvrTopkRegKernel:
                         ov = i
                     out[row, i] = ov
                     i = i + cutlass.Int32(BLK)
-        if cutlass.const_expr(
+        window_cr = (
             self.dtype == cutlass.BFloat16
             and self.vpt <= 8
             and self.nbh >= 512
@@ -14382,7 +14606,17 @@ class GvrTopkRegKernel:
                     and (pre_idx.shape[1] % self.blk == 0 or not self.stage_output)
                 )
             )
-        ):
+        )
+        # succ_la: a window build prefetches the successor row after the window's first barrier
+        la_window = {}
+        if cutlass.const_expr(self.succ_la > 0 and window_cr):
+            la_window = {
+                "succ_la": self.succ_la,
+                "la_logits": logits,
+                "la_row": row,
+                "la_length": n_envelope,
+            }
+        if cutlass.const_expr(window_cr):
             if short == cutlass.Int32(0):
                 window_done = _bf16_try_window_cr(
                     hp,
@@ -14400,6 +14634,7 @@ class GvrTopkRegKernel:
                     pk16=self.pk16,
                     stage_output=self.stage_output,
                     packed_signcount_bf16=self.packed_signcount_bf16,
+                    **la_window,
                 )
                 if window_done != cutlass.Int32(0):
                     short = cutlass.Int32(1)
@@ -15835,7 +16070,7 @@ class GvrTopkRegKernel:
 # ---------------------------------------------------------------------------
 # host wrapper: compile cache + route()-driven entry
 # ---------------------------------------------------------------------------
-_COMPILE_CACHE__reg: dict = {}
+_COMPILE_CACHE__reg: dict = KernelCache(f"{__name__}._COMPILE_CACHE__reg", __file__)
 
 
 def get_compiled__reg(
@@ -15873,6 +16108,7 @@ def get_compiled__reg(
     cr2: bool = False,
     fp16_radix_impl: int = 0,
     static_n: int | None = None,
+    succ_la: int = 0,
 ) -> Any:
     """Compile (or fetch) the variant for constexpr tuple
     (BLK, VPT, MINB, KPT, CUR, DEG, IMG, NBH).
@@ -15899,7 +16135,9 @@ def get_compiled__reg(
     n is compiled in). pcw compiles the BF16 satellite's
     ``GvrPackedClampWindowKernel`` from blk, vpt, minb, next_n, cr_shift,
     varlen, parts (up to 8), stage_output, static_k, static_npad, pcw_bins and
-    pcw_cluster, and ignores the other kernel options.
+    pcw_cluster, and ignores the other kernel options. succ_la > 0 (``kern_cr`` builds
+    only: code_radix, clus == 1, not cr2, pcw or fp16_radix_impl=2) makes the BF16 window prefetch
+    the row succ_la rows ahead into L2 once a CTA's own row has landed.
     """
     if static_k is not None:
         assert static_k > 0
@@ -15952,6 +16190,17 @@ def get_compiled__reg(
         key += (("fp16_radix_impl", fp16_radix_impl),)
     if dtype == "f16" and static_n is not None:
         key += (("static_n", int(static_n)),)
+    if not (
+        code_radix
+        and dtype != "f32"
+        and clus == 1
+        and not cr2
+        and not pcw
+        and not (dtype == "f16" and fp16_radix_impl == 2)
+    ):
+        succ_la = 0  # only GvrTopkRegKernel.kern_cr takes the lookahead
+    if succ_la:
+        key += (("succ_la", int(succ_la)),)
     static_env_bf16 = (
         tuple(map(int, static_env_bf16))
         if dtype == "bf16" and not pcw and not code_radix and static_env_bf16 is not None
@@ -15964,7 +16213,8 @@ def get_compiled__reg(
         assert static_k is None or static_k == static_env_bf16[2]
         assert static_npad is None or static_npad == static_env_bf16[1]
         key += ("static_env_bf16",) + static_env_bf16
-    compiled = _COMPILE_CACHE__reg.get(key)
+    # A dump needs a compile, so it skips the stored kernels.
+    compiled = dict.get(_COMPILE_CACHE__reg, key) if dump_dir else _COMPILE_CACHE__reg.get(key)
     if compiled is None:
         from cutlass.cute import runtime as _crt
 
@@ -16025,6 +16275,7 @@ def get_compiled__reg(
                 lane_hash=lane_hash,
                 cr2=cr2,
                 static_n=static_n,
+                succ_la=succ_la,
             )
             if dtype == "f16" and fp16_radix_impl == 2:
                 kernel = _fp16.GvrCodeRadixCounterKernel(kernel)
@@ -16106,7 +16357,7 @@ def reg_topk(logits, pre_idx, n, out, rd=None):
 gvr_main.
 
 Ctor knobs (compile-time, mirror of the CUDA template params):
-    BLK = 1024, U ∈ {1,2,4,8}, MINB = 1, NBS = 256, CS ∈ {2,4,8}
+    BLK = 1024, U ∈ {1,2,4,8}, MINB = 1, NBS = 256, CS ∈ {2,3,4,8}
     (+ scap/cmp smem-extent knobs: every reachable route has 8192/2048 —
      SCAP/CMP stay LIVE runtime args for all value logic, ABI parity).
 Derived: HB=NBS, STEPC=BLK*U, PFD=min(U,4).
@@ -16148,6 +16399,7 @@ conditional retry clus.sync cannot deadlock.
 QUADC_CLUS__clus = C.QUADC_CLUS
 
 _NEG_INF__clus = float("-inf")
+_FIN_INT32_MAX = 2147483647  # finalize fold: the sort key of a dropped selection
 
 
 # ---------------------------------------------------------------------------
@@ -16270,10 +16522,10 @@ class GvrClusKernel:
 
     ``dtype`` is Float32, BFloat16 or Float16. 16-bit builds read 16-byte vectors of
     eight elements and require ``hint_free``; ``det`` is FP32-only (the host never
-    builds it for 16-bit logits). ``envf`` and the ``*_bf16`` knobs act only on
-    BFloat16 with ``det`` off:
+    builds it for 16-bit logits). ``sample_floor`` is the minimum sample count of the
+    varlen ladder of 16-bit and 3-CTA builds (other FP32 builds: 256). ``envf`` and the
+    ``*_bf16`` knobs act only on BFloat16 with ``det`` off:
 
-    - ``sample_floor_bf16``: minimum sample count of the varlen ladder (else 256).
     - ``envf`` (varlen only): SMP/TGT/SS2/TGT2 carry the ladder of the envelope
       length ``n``; its sample is loaded before the prologue, and rows of length
       ``n`` reuse both.
@@ -16304,17 +16556,22 @@ class GvrClusKernel:
         hint_free: bool = False,
         det: bool = False,
         dtype=cutlass.Float32,
-        sample_floor_bf16: int = 256,
+        sample_floor: int = 256,
         envf: bool = False,
         async_refine_bf16: bool = False,
         fused_merge_bf16: bool = False,
         push_merge_bf16: bool = False,
+        wave_sms: int = 148,
+        pdl: bool = False,
+        fin_k: int = 0,
+        fin_page: int = 64,
     ) -> None:
         self.det = bool(det)
+        self.wave_sms = int(wave_sms)  # route() wave budget of the big-occupancy flag
         self.push_merge_bf16 = (
             bool(push_merge_bf16) and dtype is cutlass.BFloat16 and not self.det and nbs == 256
         )
-        self.sample_floor_bf16 = int(sample_floor_bf16)
+        self.sample_floor = 256 if dtype is cutlass.Float32 and cs != 3 else int(sample_floor)
         self.envf = bool(envf) and dtype is cutlass.BFloat16 and bool(varlen) and not bool(det)
         self.async_refine_bf16 = (
             bool(async_refine_bf16) and dtype is cutlass.BFloat16 and not self.det
@@ -16322,6 +16579,30 @@ class GvrClusKernel:
         self.fused_merge_bf16 = (
             bool(fused_merge_bf16) and dtype is cutlass.BFloat16 and not self.det and nbs == 256
         )
+        # pdl: wait for the predecessor before any load, then release the dependents.
+        self.pdl = bool(pdl)
+        # fin_k > 0 (``call_fin``): each row's rank-0 CTA also runs the CSA2 paged decode finalize
+        # of its fin_k selections, as ``FinalizeShuffleSelectionKernel`` does.
+        self.fin = int(fin_k) > 0
+        self.fin_k = int(fin_k)
+        self.fin_page = int(fin_page)
+        if self.fin:
+            # The host folds FP32 rows only; BF16 rows may skip the exit cluster barrier it needs.
+            assert varlen and not det and dtype is cutlass.Float32, (
+                "the finalize fold serves the FP32 varlen decode engine"
+            )
+            assert fin_k % 2 == 0 and fin_k <= 1024, "fold: even k <= 1024 (two keys per thread)"
+            self.fin_padded = max(64, 1 << (fin_k - 1).bit_length())
+            self.fin_threads = self.fin_padded // 2
+            rounds = []
+            size = 2
+            while size <= self.fin_padded:
+                stride = size // 2
+                while stride >= 1:
+                    rounds.append((size, stride))
+                    stride //= 2
+                size *= 2
+            self.fin_rounds = tuple(rounds)
         assert blk == 1024, "gvr_clus is always BLK=1024"
         assert minb == 1, "gvr_clus is __launch_bounds__(BLK, 1)"
         # constexpr logits dtype: 16-bit builds (BFloat16 / Float16) share the
@@ -16333,7 +16614,7 @@ class GvrClusKernel:
         if dtype is not cutlass.Float32:
             assert bool(hint_free), "16-bit arm is hint-free"
         assert nbs == 256, "SNB must stay 256"
-        assert u in (1, 2, 4, 8) and cs in (2, 4, 8)
+        assert u in (1, 2, 4, 8) and cs in (2, 3, 4, 8)
         # per-row varlen mode (production heuristicTopKDecode contract, same
         # semantics as GvrMainKernel / GvrRegClusKernel): n and the sampling-
         # ladder scalars are re-derived PER ROW in-kernel from a device
@@ -16346,7 +16627,6 @@ class GvrClusKernel:
         if self.varlen:
             assert self.next_n >= 1 and self.cr_shift in (0, 2)
         self.hint_free = bool(hint_free)  # hint-free: gather_hint sites compiled out
-        self.lcs = cs.bit_length() - 1  # log2(CS) for the per-row Q shift
         self.blk = blk
         self.u = u
         self.minb = minb
@@ -16364,6 +16644,118 @@ class GvrClusKernel:
         self.ck_off = self.cbuf_bytes  # inside the blob
         self.dyn_bytes = nbs * 4 + self.cbuf_bytes + cmp_ * 8 + nbs * 4
         # == host smc = SNB*8 + (SCAP+4)*8 + CMP*8
+        if self.fin:
+            # the fold's exchange reuses rank 0's staging buffer, free once the row is written
+            assert 2 * self.fin_padded * 4 <= self.cbuf_bytes
+        # The fold assembles the row in rank 0's shared memory (the other ranks' P5 stores arrive
+        # over DSMEM): the row list (fin_padded slots) and its visible length follow ck64c.
+        self.fin_list_bytes = self.fin_padded * 4 + 16 if self.fin else 0
+
+    # ------------------------------------------------------------------
+    # finalize fold: rank 0 of each row, after every write of the row
+    # ------------------------------------------------------------------
+    @cute.jit
+    def _fin_tail(self, out, row, tidx, sbase, f_valid, f_width, f_vstride):
+        # Threads [0, fin_threads) hold two keys each; the network's shared-memory rounds sync only
+        # the key holders (named barrier 1; the body uses 0).
+        NT = self.fin_threads
+        PADDED = self.fin_padded
+        KF = self.fin_k
+        cute.arch.barrier()  # ---- barrier (rank 0's writes of the row) ----
+        if tidx < cutlass.Int32(NT):
+            exchange = cute.make_tensor(
+                cute.make_ptr(cutlass.Int32, sbase, cute.AddressSpace.smem, assumed_align=16),
+                cute.make_layout((2 * PADDED,)),
+            )
+            key0 = cutlass.Int32(_FIN_INT32_MAX)
+            key1 = cutlass.Int32(_FIN_INT32_MAX)
+            if tidx < cutlass.Int32(KF // 2):
+                s_list = cute.make_tensor(
+                    cute.make_ptr(
+                        cutlass.Int32,
+                        sbase + cutlass.Int32(self.ck_off + self.cmp * 8),
+                        cute.AddressSpace.smem,
+                        assumed_align=16,
+                    ),
+                    cute.make_layout((PADDED + 4,)),
+                )
+                o0 = s_list[2 * tidx]
+                o1 = s_list[2 * tidx + 1]
+                length = s_list[PADDED]
+                limit = f_width
+                if length < limit:
+                    limit = length
+                vbase = cutlass.Int64(row) * cutlass.Int64(f_vstride)
+                for r in cutlass.range_constexpr(2):
+                    offset = o0
+                    if cutlass.const_expr(r == 1):
+                        offset = o1
+                    key = cutlass.Int32(_FIN_INT32_MAX)
+                    if (offset >= cutlass.Int32(0)) & (offset < limit):
+                        page = vbase + cutlass.Int64(offset // cutlass.Int32(self.fin_page))
+                        if cutlass.Uint8(f_valid[page]) != cutlass.Uint8(0):
+                            key = offset
+                    if cutlass.const_expr(r == 0):
+                        key0 = key
+                    else:
+                        key1 = key
+            buffer = 0
+            for round_index in cutlass.range_constexpr(len(self.fin_rounds)):
+                size, stride = self.fin_rounds[round_index]
+                ascending = ((2 * tidx) & size) == 0
+                if cutlass.const_expr(stride == 1):
+                    lo = key0
+                    hi = key1
+                    if key1 < key0:
+                        lo = key1
+                        hi = key0
+                    if ascending:
+                        key0 = lo
+                        key1 = hi
+                    else:
+                        key0 = hi
+                        key1 = lo
+                else:
+                    half = stride // 2
+                    keep_min = ((tidx & half) == 0) == ascending
+                    if cutlass.const_expr(stride <= 32):
+                        other0 = cute.arch.shuffle_sync_bfly(key0, offset=half)
+                        other1 = cute.arch.shuffle_sync_bfly(key1, offset=half)
+                    else:
+                        base = buffer * PADDED
+                        exchange[base + 2 * tidx] = key0
+                        exchange[base + 2 * tidx + 1] = key1
+                        cute.arch.barrier(
+                            barrier_id=1, number_of_threads=NT
+                        )  # ---- fold exchange ----
+                        partner = tidx ^ half
+                        other0 = exchange[base + 2 * partner]
+                        other1 = exchange[base + 2 * partner + 1]
+                        buffer = 1 - buffer
+                    lo0 = key0
+                    hi0 = other0
+                    if other0 < key0:
+                        lo0 = other0
+                        hi0 = key0
+                    lo1 = key1
+                    hi1 = other1
+                    if other1 < key1:
+                        lo1 = other1
+                        hi1 = key1
+                    if keep_min:
+                        key0 = lo0
+                        key1 = lo1
+                    else:
+                        key0 = hi0
+                        key1 = hi1
+            if tidx < cutlass.Int32(KF // 2):
+                for r in cutlass.range_constexpr(2):
+                    key = key1
+                    if cutlass.const_expr(r == 0):
+                        key = key0
+                    if key == cutlass.Int32(_FIN_INT32_MAX):
+                        key = cutlass.Int32(-1)
+                    out[row, 2 * tidx + r] = key
 
     # ------------------------------------------------------------------
     # GVR_EMITK: classify+stage one survivor.
@@ -16425,7 +16817,13 @@ class GvrClusKernel:
         if bn >= B:
             p = C.atomic_add_cta(s_mrg.iterator + bn, cutlass.Int32(1))
             if p < lim1:
-                out_row[p] = idv
+                if cutlass.const_expr(self.fin):
+                    # into rank 0's row list, after its ck64c
+                    C._st_shared_cluster_i32(
+                        rk64 + cutlass.Int32(self.cmp * 8) + p * cutlass.Int32(4), idv
+                    )
+                else:
+                    out_row[p] = idv
             else:
                 if whole == cutlass.Int32(0):
                     q2 = p - above
@@ -16587,6 +16985,97 @@ class GvrClusKernel:
         TGT2: cutlass.Int32,
         bigf: cutlass.Int32,
     ):
+        # The selection only; the finalize arguments are unused stand-ins (``fin`` off).
+        self._body(
+            logits,
+            pre_idx,
+            kv_lens,
+            out,
+            n,
+            npad,
+            k,
+            SCAP,
+            CMP,
+            SMP,
+            TGT,
+            Q,
+            SS2,
+            TGT2,
+            bigf,
+            kv_lens,
+            kv_lens,
+            n,
+            n,
+        )
+
+    @cute.kernel
+    def kern_fin(
+        self,
+        logits: cute.Tensor,
+        pre_idx: cute.Tensor,
+        kv_lens: cute.Tensor,
+        out: cute.Tensor,
+        n: cutlass.Int32,
+        npad: cutlass.Int32,
+        k: cutlass.Int32,
+        SCAP: cutlass.Int32,
+        CMP: cutlass.Int32,
+        SMP: cutlass.Int32,
+        TGT: cutlass.Int32,
+        Q: cutlass.Int32,
+        SS2: cutlass.Int32,
+        TGT2: cutlass.Int32,
+        bigf: cutlass.Int32,
+        f_valid: cute.Tensor,
+        f_visible: cute.Tensor,
+        f_width: cutlass.Int32,
+        f_vstride: cutlass.Int32,
+    ):
+        self._body(
+            logits,
+            pre_idx,
+            kv_lens,
+            out,
+            n,
+            npad,
+            k,
+            SCAP,
+            CMP,
+            SMP,
+            TGT,
+            Q,
+            SS2,
+            TGT2,
+            bigf,
+            f_valid,
+            f_visible,
+            f_width,
+            f_vstride,
+        )
+
+    @cute.jit
+    def _body(
+        self,
+        logits: cute.Tensor,
+        pre_idx: cute.Tensor,
+        kv_lens: cute.Tensor,
+        out: cute.Tensor,
+        n: cutlass.Int32,
+        npad: cutlass.Int32,
+        k: cutlass.Int32,
+        SCAP: cutlass.Int32,
+        CMP: cutlass.Int32,
+        SMP: cutlass.Int32,
+        TGT: cutlass.Int32,
+        Q: cutlass.Int32,
+        SS2: cutlass.Int32,
+        TGT2: cutlass.Int32,
+        bigf: cutlass.Int32,
+        f_valid: cute.Tensor,
+        f_visible: cute.Tensor,
+        f_width: cutlass.Int32,
+        f_vstride: cutlass.Int32,
+    ):
         BLK = self.blk
         U = self.u
         NBS = self.nbs
@@ -16595,6 +17084,9 @@ class GvrClusKernel:
         STEPC = self.stepc
         NW = BLK // 32
 
+        if cutlass.const_expr(self.pdl):
+            _pdl_wait()
+            _pdl_release()
         tidx, _, _ = cute.arch.thread_idx()
         bx, by, _ = cute.arch.block_idx()  # (rank, row)
         rank = bx
@@ -16621,6 +17113,16 @@ class GvrClusKernel:
                 if tidx >= env_smp:
                     ep8 = (tidx - env_smp) * env_ss2 * cutlass.Int32(2) + cutlass.Int32(1)
                 ld_g_16x8_pair(self.dtype, None, env_x_addr, ep8, env_fsa, env_fsb)
+        # The fold: rank 0 loads the row's previous output (the slots the selection leaves keep it)
+        # and its visible length up front; they land in shared memory once it is allocated.
+        fin_old = cutlass.Int32(-1)
+        fin_vis = cutlass.Int32(0)
+        if cutlass.const_expr(self.fin):
+            if rank == cutlass.Int32(0):
+                if tidx < cutlass.Int32(self.fin_k):
+                    fin_old = cutlass.Int32(out[row, tidx])
+                if tidx == cutlass.Int32(0):
+                    fin_vis = cutlass.Int32(f_visible[row])
 
         # ============ per-row varlen prologue — shared contract lives in ======
         # GvrMainKernel's prologue (per-row n from kv_lens; ladder scalars are
@@ -16713,12 +17215,8 @@ class GvrClusKernel:
                     * cutlass.Float32(32.0 if self.cs == 2 else 16.0)
                     * cute.arch.rcp_approx(cutlass.Float32(aim))
                 )
-                if cutlass.const_expr(self.dtype == cutlass.BFloat16):
-                    if sel < cutlass.Int32(self.sample_floor_bf16):
-                        sel = cutlass.Int32(self.sample_floor_bf16)
-                else:
-                    if sel < cutlass.Int32(256):
-                        sel = cutlass.Int32(256)
+                if sel < cutlass.Int32(self.sample_floor):
+                    sel = cutlass.Int32(self.sample_floor)
                 nh = nv >> cutlass.Int32(1)
                 if sel > nh:
                     sel = nh
@@ -16780,9 +17278,11 @@ class GvrClusKernel:
         s_hist = smem.allocate_tensor(  # hist[NBS] @ blob start
             cutlass.Int32, cute.make_ordered_layout((self.hb,), order=(0,)), byte_alignment=128
         )
-        blob = smem.allocate_tensor(  # cbuf(int2) | ck64c
+        blob = smem.allocate_tensor(  # cbuf(int2) | ck64c [| fold row list]
             cutlass.Int8,
-            cute.make_ordered_layout((self.cbuf_bytes + self.cmp * 8,), order=(0,)),
+            cute.make_ordered_layout(
+                (self.cbuf_bytes + self.cmp * 8 + self.fin_list_bytes,), order=(0,)
+            ),
             byte_alignment=16,
         )
         s_mrg = smem.allocate_tensor(  # mrg[NBS]
@@ -16865,6 +17365,28 @@ class GvrClusKernel:
             cute.make_ptr(cutlass.Uint64, ck_addr, cute.AddressSpace.smem, assumed_align=16),
             cute.make_layout((self.cmp,)),
         )
+        if cutlass.const_expr(self.fin):
+            # The row list starts as the output before this launch's writes (a short row's
+            # identity), ahead of the first cluster barrier and every other rank's DSMEM store.
+            s_list = cute.make_tensor(
+                cute.make_ptr(
+                    cutlass.Int32,
+                    ck_addr + cutlass.Int32(self.cmp * 8),
+                    cute.AddressSpace.smem,
+                    assumed_align=16,
+                ),
+                cute.make_layout((self.fin_padded + 4,)),
+            )
+            if rank == cutlass.Int32(0):
+                if tidx < cutlass.Int32(self.fin_k):
+                    lv = fin_old
+                    if short != cutlass.Int32(0):
+                        lv = cutlass.Int32(-1)
+                        if tidx < nv:
+                            lv = tidx
+                    s_list[tidx] = lv
+                if tidx == cutlass.Int32(0):
+                    s_list[self.fin_padded] = fin_vis
 
         # ---- whole-body short-row guard (cluster-uniform: `short` is a pure
         # function of `row`, identical across all CS ranks and threads, so
@@ -16884,7 +17406,10 @@ class GvrClusKernel:
             p_addr = pre_idx.iterator.toint() + cutlass.Int64(prow) * cutlass.Int64(
                 k
             ) * cutlass.Int64(4)
-            out_row = out[row, None]
+            if cutlass.const_expr(self.fin):
+                out_row = s_list  # rank 0's own writes; the P5 stores reach it over DSMEM
+            else:
+                out_row = out[row, None]
 
             # ---- interleaved chunk ownership ----
             if cutlass.const_expr(self.dtype == cutlass.Float32):
@@ -18778,6 +19303,12 @@ class GvrClusKernel:
                             )
                             it = it + cutlass.Int32(1)
 
+        # The finalize fold runs after the row's last write: the other ranks' writes precede the
+        # exit cluster barrier, rank 0's own ones the CTA barrier in the tail.
+        if cutlass.const_expr(self.fin):
+            if rank == cutlass.Int32(0):
+                self._fin_tail(out, row, tidx, sbase, f_valid, f_width, f_vstride)
+
     # ------------------------------------------------------------------
     # host launcher: grid dim3(CS, b) + cluster (CS,1,1);
     # min_blocks_per_mp=1 == __launch_bounds__(1024, 1) 64-register wall.
@@ -18803,10 +19334,10 @@ class GvrClusKernel:
     ):
         # varlen grid rows = out.shape[0] (logits row count == out row count in
         # both modes); bigf = the route() `big` occupancy flag, a pure function
-        # of (rows, CS) so it is launch-computed, not an ABI scalar.
+        # of (rows, CS, wave budget) so it is launch-computed, not an ABI scalar.
         b = out.shape[0]
         bigf = cutlass.Int32(0)
-        if b * cutlass.Int32(self.cs) <= cutlass.Int32(148):
+        if b * cutlass.Int32(self.cs) <= cutlass.Int32(self.wave_sms):
             bigf = cutlass.Int32(1)
         self.kern(
             logits, pre_idx, kv_lens, out, n, npad, k, SCAP, CMP, SMP, TGT, Q, SS2, TGT2, bigf
@@ -18816,13 +19347,72 @@ class GvrClusKernel:
             cluster=(self.cs, 1, 1),
             stream=stream,
             min_blocks_per_mp=self.minb,
+            use_pdl=self.pdl,
+        )
+
+    @cute.jit
+    def call_fin(
+        self,
+        logits: cute.Tensor,
+        pre_idx: cute.Tensor,
+        kv_lens: cute.Tensor,
+        out: cute.Tensor,
+        n: cutlass.Int32,
+        npad: cutlass.Int32,
+        k: cutlass.Int32,
+        SCAP: cutlass.Int32,
+        CMP: cutlass.Int32,
+        SMP: cutlass.Int32,
+        TGT: cutlass.Int32,
+        Q: cutlass.Int32,
+        SS2: cutlass.Int32,
+        TGT2: cutlass.Int32,
+        f_valid: cute.Tensor,
+        f_visible: cute.Tensor,
+        f_width: cutlass.Int32,
+        f_vstride: cutlass.Int32,
+        stream,
+    ):
+        """``__call__`` with the finalize fold: ``f_valid`` uint8 page validity (row ``r`` at
+        ``r*f_vstride``), ``f_visible`` int32 per row, ``f_width`` the logits width."""
+        b = out.shape[0]
+        bigf = cutlass.Int32(0)
+        if b * cutlass.Int32(self.cs) <= cutlass.Int32(self.wave_sms):
+            bigf = cutlass.Int32(1)
+        self.kern_fin(
+            logits,
+            pre_idx,
+            kv_lens,
+            out,
+            n,
+            npad,
+            k,
+            SCAP,
+            CMP,
+            SMP,
+            TGT,
+            Q,
+            SS2,
+            TGT2,
+            bigf,
+            f_valid,
+            f_visible,
+            f_width,
+            f_vstride,
+        ).launch(
+            grid=(self.cs, b, 1),
+            block=(self.blk, 1, 1),
+            cluster=(self.cs, 1, 1),
+            stream=stream,
+            min_blocks_per_mp=self.minb,
+            use_pdl=self.pdl,
         )
 
 
 # ---------------------------------------------------------------------------
 # compile cache + torch-facing entry
 # ---------------------------------------------------------------------------
-_COMPILE_CACHE__clus = {}
+_COMPILE_CACHE__clus = KernelCache(f"{__name__}._COMPILE_CACHE__clus", __file__)
 
 
 def get_compiled__clus(
@@ -18836,19 +19426,26 @@ def get_compiled__clus(
     hint_free: bool = False,
     det: bool = False,
     dtype: str = "f32",
-    sample_floor_bf16: int = 256,
+    sample_floor: int = 256,
     async_refine_bf16: bool = False,
     fused_merge_bf16: bool = False,
     envf: bool = False,
     push_merge_bf16: bool = False,
+    wave_sms: int = 148,
+    pdl: bool = False,
+    fin_k: int = 0,
+    fin_page: int = 64,
+    cached_only: bool = False,
 ) -> Any:
     """Compile (or fetch) the gvr_clus variant for constexpr tuple
     tpl = (BLK, U, MINB, NBS, CS); scap/cmp are smem-extent keys (every
-    reachable route has 8192/2048 — asserted by run__clus()).
+    reachable route has 8192/2048 — asserted by run__clus()). ``wave_sms`` is the
+    host route's wave budget (``wave_sms()`` in the host module). ``fin_k`` > 0
+    compiles ``call_fin`` with CSA2's paged finalize; ``cached_only`` returns None on a miss.
 
     ``dtype`` is the logits tag ('f32', 'bf16' or 'f16'); 16-bit tags need
-    ``hint_free`` and ``det=False``. ``envf`` and the ``*_bf16`` options apply
-    to 'bf16' only; see GvrClusKernel.
+    ``hint_free`` and ``det=False``. ``sample_floor`` applies to the 16-bit tags and to
+    3-CTA clusters, ``envf`` and the ``*_bf16`` options to 'bf16' only; see GvrClusKernel.
     """
     if det:
         assert dtype == "f32", "deterministic mode is fp32-only"
@@ -18857,7 +19454,7 @@ def get_compiled__clus(
             tuple(tpl),
             scap,
             cmp_,
-            int(sample_floor_bf16) if dtype == "bf16" else 256,
+            int(sample_floor) if dtype != "f32" or tpl[4] == 3 else 256,
             bool(async_refine_bf16) if dtype == "bf16" else False,
             bool(fused_merge_bf16) if dtype == "bf16" else False,
             options_extra,
@@ -18870,9 +19467,12 @@ def get_compiled__clus(
         )
         + (("envf",) if envf else ())
         + (("push_merge_bf16",) if push_merge_bf16 and dtype == "bf16" else ())
+        + ((("wave_sms", int(wave_sms)),) if int(wave_sms) != 148 else ())
+        + (("pdl",) if pdl else ())
+        + (("fin", int(fin_k), int(fin_page)) if fin_k else ())
     )
     hit = _COMPILE_CACHE__clus.get(key)
-    if hit is not None:
+    if hit is not None or cached_only:
         return hit
     blk, u, minb, nbs, cs = tpl
     kern = GvrClusKernel(
@@ -18889,11 +19489,15 @@ def get_compiled__clus(
         hint_free=hint_free,
         det=det,
         dtype=_dtype_of(dtype),
-        sample_floor_bf16=sample_floor_bf16 if dtype == "bf16" else 256,
+        sample_floor=sample_floor,
         async_refine_bf16=bool(async_refine_bf16) if dtype == "bf16" else False,
         fused_merge_bf16=bool(fused_merge_bf16) if dtype == "bf16" else False,
         envf=bool(envf),
         push_merge_bf16=bool(push_merge_bf16) if dtype == "bf16" else False,
+        wave_sms=wave_sms,
+        pdl=pdl,
+        fin_k=fin_k,
+        fin_page=fin_page,
     )
     r0, c0 = cute.sym_int(), cute.sym_int()
     r1, c1 = cute.sym_int(), cute.sym_int()
@@ -18912,16 +19516,39 @@ def get_compiled__clus(
         cutlass.Int32, (v0,), stride_order=(0,), assumed_align=4
     )
     fake_stream = _crt.make_fake_stream(use_tvm_ffi_env_stream=True)
-    compiled = cute.compile(
-        kern,
-        logits_fake,
-        pre_fake,
-        kv_fake,
-        out_fake,
-        *([cutlass.Int32(0)] * 10),
-        stream=fake_stream,
-        options=("--enable-tvm-ffi " + options_extra).strip(),
-    )
+    if fin_k:
+        v1, v2 = cute.sym_int(), cute.sym_int()
+        valid_fake = _crt.make_fake_compact_tensor(
+            cutlass.Uint8, (v1,), stride_order=(0,), assumed_align=1
+        )
+        vis_fake = _crt.make_fake_compact_tensor(
+            cutlass.Int32, (v2,), stride_order=(0,), assumed_align=4
+        )
+        compiled = cute.compile(
+            kern.call_fin,
+            logits_fake,
+            pre_fake,
+            kv_fake,
+            out_fake,
+            *([cutlass.Int32(0)] * 10),
+            valid_fake,
+            vis_fake,
+            cutlass.Int32(0),
+            cutlass.Int32(0),
+            stream=fake_stream,
+            options=("--enable-tvm-ffi " + options_extra).strip(),
+        )
+    else:
+        compiled = cute.compile(
+            kern,
+            logits_fake,
+            pre_fake,
+            kv_fake,
+            out_fake,
+            *([cutlass.Int32(0)] * 10),
+            stream=fake_stream,
+            options=("--enable-tvm-ffi " + options_extra).strip(),
+        )
     _COMPILE_CACHE__clus[key] = compiled
     return compiled
 
@@ -23202,7 +23829,7 @@ class GvrRegClusKernel:
 # ---------------------------------------------------------------------------
 # host wrapper: compile cache + route()-driven entry
 # ---------------------------------------------------------------------------
-_COMPILE_CACHE__regclus: dict = {}
+_COMPILE_CACHE__regclus: dict = KernelCache(f"{__name__}._COMPILE_CACHE__regclus", __file__)
 
 
 def get_compiled__regclus(
@@ -23293,7 +23920,10 @@ def get_compiled__regclus(
         assert 0 < static_env_bf16[0] <= static_env_bf16[1]
         assert static_env_bf16[2] == tpl[3] == 1024
         key += ("static_env_bf16",) + static_env_bf16
-    compiled = _COMPILE_CACHE__regclus.get(key)
+    # A dump needs a compile, so it skips the stored kernels.
+    compiled = (
+        dict.get(_COMPILE_CACHE__regclus, key) if dump_dir else _COMPILE_CACHE__regclus.get(key)
+    )
     if compiled is None:
         from cutlass.cute import runtime as _crt
 
@@ -23884,7 +24514,9 @@ class ComplementKernel:
             )
 
 
-_COMPLEMENT_COMPILE_CACHE: dict[tuple[Any, ...], Any] = {}
+_COMPLEMENT_COMPILE_CACHE: dict[tuple[Any, ...], Any] = KernelCache(
+    f"{__name__}._COMPLEMENT_COMPILE_CACHE", __file__
+)
 
 
 def get_compiled_complement(

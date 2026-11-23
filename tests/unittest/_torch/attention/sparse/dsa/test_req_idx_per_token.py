@@ -15,12 +15,14 @@
 """
 Tests for the token->request map used by DSAtrtllmAttentionMetadata.
 
-1. build_req_idx_per_token must match the host repeat_interleave build for
-   every layout, so the device and host builders cannot drift.
+1. build_req_idx_per_token must match an independent Torch reference for
+   every layout.
 2. on_update_kv_lens() must rebuild the map after the MTP draft loop rewrites
    seq_lens, or every draft token is misattributed to request 0
    (https://nvbugs/6513132, https://nvbugs/6513093).
 3. on_update_kv_lens() must preserve the base metadata invalidation contract.
+4. prepare_for_indices_conversion() must write the pinned host map and copy
+   only its active prefix to the device.
 """
 
 from unittest.mock import Mock
@@ -35,7 +37,7 @@ from tensorrt_llm._torch.attention.backends.sparse.dsa import (
 
 
 def _host_reference(seq_lens: torch.Tensor) -> torch.Tensor:
-    """The host build from prepare_for_indices_conversion()."""
+    """Independent Torch reference for token-to-request indices."""
     return torch.repeat_interleave(
         torch.arange(len(seq_lens), dtype=torch.int32, device=seq_lens.device),
         seq_lens,
@@ -63,6 +65,26 @@ def test_matches_host_repeat_interleave(seq_lens, device):
     result = build_req_idx_per_token(seq_lens, num_tokens)
 
     assert result.to(torch.int32).tolist() == _host_reference(seq_lens).tolist()
+
+
+def test_prepare_for_indices_conversion_preserves_buffers() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    md = object.__new__(DSAtrtllmAttentionMetadata)
+    md._seq_lens = torch.tensor([2, 0, 1], dtype=torch.int32)
+    md._num_tokens = 3
+    md.host_req_idx_per_token = torch.full((5,), -1, dtype=torch.int32, pin_memory=True)
+    md.req_idx_per_token = torch.full((5,), -2, dtype=torch.int32, device="cuda")
+    host_ptr = md.host_req_idx_per_token.data_ptr()
+    expected = _host_reference(md._seq_lens).tolist()
+
+    md.prepare_for_indices_conversion()
+
+    assert md.host_req_idx_per_token.data_ptr() == host_ptr
+    assert md.host_req_idx_per_token.is_pinned()
+    assert md.host_req_idx_per_token.tolist() == expected + [-1, -1]
+    assert md.req_idx_per_token.cpu().tolist() == expected + [-2, -2]
 
 
 def test_on_update_kv_lens_invalidates_base_mla_state() -> None:

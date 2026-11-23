@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import math
 
 from tensorrt_llm._torch.models.checkpoints.base_config_loader import BaseConfigLoader
@@ -6,9 +9,10 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeight
 from tensorrt_llm._torch.models.checkpoints.hf.checkpoint_loader import HfCheckpointLoader
 from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import MistralConfigLoader
 from tensorrt_llm._torch.models.modeling_utils import register_checkpoint_loader
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 
 
-@register_checkpoint_loader("mistral")
+@register_checkpoint_loader(CheckpointFormat.MISTRAL)
 class MistralCheckpointLoader(HfCheckpointLoader):
     def __init__(
         self,
@@ -20,7 +24,7 @@ class MistralCheckpointLoader(HfCheckpointLoader):
         super().__init__(
             weight_loader=weight_loader, weight_mapper=weight_mapper, config_loader=config_loader
         )
-        self._checkpoint_format = "mistral"
+        self._checkpoint_format = CheckpointFormat.MISTRAL
         self.mm_module_mapping = {
             "vision_encoder": "vision_tower",
             "pre_mm_projector_norm": "multi_modal_projector.norm",
@@ -78,7 +82,7 @@ class MistralCheckpointLoader(HfCheckpointLoader):
         return MistralConfigLoader()
 
 
-@register_checkpoint_loader("mistral_large_3")
+@register_checkpoint_loader(CheckpointFormat.MISTRAL_LARGE_3)
 class MistralLarge3CheckpointLoader(MistralCheckpointLoader):
     def __init__(
         self,
@@ -90,4 +94,4 @@ class MistralLarge3CheckpointLoader(MistralCheckpointLoader):
         super().__init__(
             weight_loader=weight_loader, weight_mapper=weight_mapper, config_loader=config_loader
         )
-        self._checkpoint_format = "mistral_large_3"
+        self._checkpoint_format = CheckpointFormat.MISTRAL_LARGE_3

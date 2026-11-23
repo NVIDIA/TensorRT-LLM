@@ -34,6 +34,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import NamedTuple, Optional, Tuple
 
+import numpy as np
 import torch
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArgs
@@ -906,17 +907,9 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         """Whether kv_lens can change after prepare(): only with speculative decoding.
 
         max_total_draft_tokens is set by the engine's update_spec_dec_param; the
-        other checks mirror TrtllmAttentionMetadata's spec_active.
+        other checks mirror TrtllmAttentionMetadata's generation block-offset capacity predicate.
         """
-        params = self.kv_cache_params
-        runtime_features = self.runtime_features
-        return bool(
-            self.max_total_draft_tokens
-            or self.draft_kv_cache_manager is not None
-            or self.is_spec_decoding_enabled
-            or (params is not None and params.num_extra_kv_tokens)
-            or (runtime_features is not None and runtime_features.has_speculative_draft_tokens)
-        )
+        return bool(self.max_total_draft_tokens) or self._generation_block_offsets_need_capacity()
 
     def _fill_tail_in_forward(self) -> None:
         """TAIL_FILL_IN_FORWARD: -1 over msa_out_cache_loc past the live slots prepare() staged (see the prepare()
@@ -1377,20 +1370,24 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         # Inputs for on_update_kv_lens: each query token's (request row, offset
         # in request). Pinned and non-blocking so the copies do not synchronize
         # the stream. The slots themselves come from msa_block_table above.
-        qo_long = qo_lens_cpu.to(torch.long)
-        batch_row_cpu = torch.repeat_interleave(
-            torch.arange(batch_size, dtype=torch.int32), qo_long
-        )
-        starts = torch.cumsum(qo_long, 0) - qo_long
-        intra_cpu = (
-            torch.arange(total_new_tokens, dtype=torch.int64)
-            - torch.repeat_interleave(starts, qo_long)
-        ).to(torch.int32)
+        # Host arithmetic on a batch-sized vector runs in numpy: torch CPU ops
+        # (repeat_interleave above all) cost far more in dispatch and OpenMP
+        # fork/join than the arithmetic itself, and this runs every step.
+        qo_np = qo_lens_cpu.numpy().astype(np.int64, copy=False)
+        batch_row_np = np.repeat(np.arange(batch_size, dtype=np.int32), qo_np)
+        starts_np = np.cumsum(qo_np) - qo_np
+        intra_np = (
+            np.arange(total_new_tokens, dtype=np.int64) - np.repeat(starts_np, qo_np)
+        ).astype(np.int32)
         copy_h2d_pool_shared(
-            self.msa_q_batch_row[:total_new_tokens], maybe_pin_memory(batch_row_cpu), pack=True
+            self.msa_q_batch_row[:total_new_tokens],
+            maybe_pin_memory(torch.from_numpy(batch_row_np)),
+            pack=True,
         )
         copy_h2d_pool_shared(
-            self.msa_q_intra[:total_new_tokens], maybe_pin_memory(intra_cpu), pack=True
+            self.msa_q_intra[:total_new_tokens],
+            maybe_pin_memory(torch.from_numpy(intra_np)),
+            pack=True,
         )
         # The staged lens are the upper bound on_update_kv_lens clamps to: the
         # same attended lengths msa_seq_lens_cuda was just filled from, kept

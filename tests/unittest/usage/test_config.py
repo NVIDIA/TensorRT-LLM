@@ -77,6 +77,7 @@ class TestTelemetryConfigLocation:
         from tensorrt_llm.usage import config
 
         with pytest.raises(ValidationError):
+            # pyrefly: ignore [unexpected-keyword]
             config.TelemetryConfig(unknown_field=1)
 
 

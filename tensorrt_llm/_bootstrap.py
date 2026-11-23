@@ -19,7 +19,9 @@ Two phases, in this order, both driven from ``tensorrt_llm/__init__.py``:
 1. :func:`_prepare_environment` -- process environment and compiled-artifact
     cache defaults, DLL search path, Python-library preload and vendored
     ``triton_kernels`` precedence. It must run *before* ``torch`` and before
-    any TensorRT-LLM shared object is loaded.
+    any TensorRT-LLM shared object is loaded. ``__init__`` runs it and
+    ``import torch`` inside :func:`_mimalloc_arenas_off_thp`, which keeps
+    torch's CPU allocator off transparent huge pages.
 2. :func:`_init` -- custom-op library loading and MPI initialization.  It runs
    after the package's own imports have completed.
 
@@ -33,11 +35,15 @@ are already in ``sys.modules``, so this defers the *statement* and not the first
 import of any module.
 """
 
+import contextlib
+import functools
 import os
 import platform
 import sys
 import threading
 import time
+import warnings
+from collections.abc import Iterator
 from pathlib import Path
 
 # Disable UCC to WAR allgather issue before NGC PyTorch 25.12 upgrade.
@@ -46,6 +52,12 @@ os.environ["OMPI_MCA_coll_ucc_enable"] = "0"
 _inited = False
 
 _INDUCTOR_QUIESCE_POOL_ENV = "TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL"
+_MIMALLOC_ALLOW_THP_ENV = "MIMALLOC_ALLOW_THP"
+_PR_SET_THP_DISABLE = 41
+_PR_GET_THP_DISABLE = 42
+# PR_SET_THP_DISABLE flag (Linux 6.18+): THP stays allowed where MADV_HUGEPAGE
+# asks for it. PR_GET_THP_DISABLE then reads 1 | this.
+_PR_THP_DISABLE_EXCEPT_ADVISED = 1 << 1
 _UNIFIED_CACHE_ROOT_ENV = "TRTLLM_CACHE_DIR"
 _TRTLLM_DG_CACHE_ENV = "TRTLLM_DG_CACHE_DIR"
 _TRTLLM_DG_DUMP_CUBIN_ENV = "TRTLLM_DG_JIT_DUMP_CUBIN"
@@ -89,10 +101,124 @@ def _setup_unified_cache() -> None:
         os.environ.setdefault(_TRTLLM_DG_DUMP_CUBIN_ENV, "1")
 
 
+def _setup_jit_share() -> None:
+    """Share JIT kernel builds across processes (``TLLM_JIT_SHARE_DIR``).
+
+    Runs before :func:`_setup_unified_cache`, so that DeepGEMM's disk cache
+    defaults to the shared directory rather than to ``TRTLLM_CACHE_DIR``.
+    """
+    from . import _jit_share
+
+    _jit_share.install()
+
+
 def _set_numexpr_thread_default() -> None:
     # TRT-LLM uses NumExpr only for scalar checkpoint formulas. Avoid creating
     # its helper pool unless the embedding application explicitly opts in.
     os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
+
+@functools.lru_cache(maxsize=1)
+def _libc_prctl():
+    """libc's ``prctl`` with its argument types set, or None where it is unavailable."""
+    import ctypes
+
+    try:
+        prctl = ctypes.CDLL(None, use_errno=True).prctl
+    except (AttributeError, OSError):
+        return None
+    prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
+    prctl.restype = ctypes.c_int
+    return prctl
+
+
+def _thp_disable_flag() -> int | None:
+    """Return this process's PR_GET_THP_DISABLE value, or None where it cannot be read.
+
+    0 allows transparent huge pages, 1 disables them, and
+    1 | _PR_THP_DISABLE_EXCEPT_ADVISED disables them except for memory advised
+    MADV_HUGEPAGE.
+    """
+    prctl = _libc_prctl() if sys.platform == "linux" else None
+    if prctl is None:
+        return None
+    value = prctl(_PR_GET_THP_DISABLE, 0, 0, 0, 0)
+    return None if value < 0 else value
+
+
+def _set_thp_disable_flag(value: int) -> None:
+    """Set this process's THP-disable flag to a value `_thp_disable_flag` returned.
+
+    Warns if the kernel refuses, e.g. under a seccomp policy that lets the flag
+    be read but not set; the process then keeps the flag it has.
+    """
+    import ctypes
+
+    prctl = _libc_prctl()
+    flags = value & _PR_THP_DISABLE_EXCEPT_ADVISED
+    if prctl is not None and prctl(_PR_SET_THP_DISABLE, value & 1, flags, 0, 0) == 0:
+        return
+    reason = os.strerror(ctypes.get_errno()) if prctl is not None else "prctl is unavailable"
+    warnings.warn(
+        f"Could not set the transparent huge page disable flag of this process to {value}: "
+        f"{reason}",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+
+
+@contextlib.contextmanager
+def _mimalloc_arenas_off_thp() -> Iterator[None]:
+    """Keep torch's mimalloc arenas off transparent huge pages while torch loads.
+
+    ``tensorrt_llm/__init__.py`` runs phase 1 and ``import torch`` in this
+    context. On Linux it sets ``MIMALLOC_ALLOW_THP=0`` unless the caller set the
+    variable, and on exit, also when the body raises, withdraws it and puts the
+    process's THP-disable flag back if the import changed it.
+
+    PyTorch's CPU allocator on aarch64 is mimalloc, which by default advises its
+    1 GiB arenas MADV_HUGEPAGE. With 64 KiB base pages a transparent huge page is
+    512 MiB. Once a free inside the arena splits one, khugepaged later collapses
+    the range again, copying 512 MiB while it holds the process's mmap lock, so a
+    page fault in any thread of the process (the executor touching a fresh heap
+    page) waits tens of milliseconds, and its tensor-parallel peers wait with it.
+    mimalloc reads the option once, when torch loads it, so the variable only has
+    to be there for the import. It is set on every Linux platform but matters
+    only where torch's allocator is mimalloc.
+
+    The default only takes effect when tensorrt_llm is imported before torch. MPI
+    pool workers re-run the launching script's module-level imports, so they
+    follow its order. A value the caller sets wins and is left as it is: a
+    caller-set ``MIMALLOC_ALLOW_THP=0`` keeps transparent huge pages disabled for
+    the whole process and the processes it starts, including memory that asks
+    for them.
+
+    With the option off, mimalloc also disables transparent huge pages for the
+    whole process (PR_SET_THP_DISABLE) when it initializes. Only torch's arenas
+    need to stay off huge pages: memory that asks for them with MADV_HUGEPAGE
+    (the MoE load balancer's NUMA pool, the KVCacheManagerV2 host tier under
+    TLLM_KV_CACHE_MANAGER_V2_THP=1) must keep getting them. Withdrawing the
+    variable also keeps it from later libraries that bundle their own mimalloc
+    (pyarrow does) and from child processes that do not import TensorRT LLM.
+
+    Torch's arenas then stay off huge pages only under the ``madvise`` THP mode
+    (/sys/kernel/mm/transparent_hugepage/enabled), where memory that was not
+    advised gets none. Under ``always`` they are eligible again, as they are
+    without this default; the flag is put back there too, because keeping it
+    would also deny huge pages to the memory that asks for them.
+    """
+    if sys.platform != "linux" or _MIMALLOC_ALLOW_THP_ENV in os.environ:
+        yield
+        return
+    before = _thp_disable_flag()
+    os.environ[_MIMALLOC_ALLOW_THP_ENV] = "0"
+    try:
+        yield
+    finally:
+        os.environ.pop(_MIMALLOC_ALLOW_THP_ENV, None)
+        after = _thp_disable_flag()
+        if before is not None and after is not None and after != before:
+            _set_thp_disable_flag(before)
 
 
 def _keep_inductor_compile_pool_alive() -> None:
@@ -172,6 +298,7 @@ def _prepare_environment() -> None:
     """Phase 1: environment and library preparation, before the Torch import."""
     _set_numexpr_thread_default()
     _keep_inductor_compile_pool_alive()
+    _setup_jit_share()
     _setup_unified_cache()
     _add_trt_llm_dll_directory()
     _preload_python_lib()

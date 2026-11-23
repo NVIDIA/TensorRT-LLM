@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import KvCacheConfig
+from tensorrt_llm.llmapi import KvCacheConfig, MoeConfig
 
 # Eight prompts of distinct lengths (4-12 tokens). Every ID stays below 30000
 # so the same probe is valid for TinyLlama (32000-token vocabulary), Mistral,
@@ -90,6 +90,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         help="Image file for the image probe; repeat for more images",
     )
+    moe_group = parser.add_argument_group(
+        "moe", "MoE settings that every role of one row must share"
+    )
+    moe_group.add_argument("--moe-ep-size", type=int, default=1)
+    moe_group.add_argument("--moe-disable-finalize-fusion", action="store_true")
     eval_group = parser.add_argument_group(
         "eval", "Run an accuracy evaluator on the loaded model instead of the token probe"
     )
@@ -168,6 +173,17 @@ def _llm_kwargs(args: argparse.Namespace) -> dict[str, object]:
                 "kv_cache_config": KvCacheConfig(free_gpu_memory_fraction=args.eval_kv_fraction),
             }
         )
+    if args.moe_ep_size != 1:
+        kwargs["moe_expert_parallel_size"] = args.moe_ep_size
+    # Collect every `MoeConfig` field first and build the config once, so one
+    # MoE flag never replaces the config that another flag set.
+    moe_config_fields: dict[str, object] = {}
+    if args.moe_disable_finalize_fusion:
+        # The CUTLASS FC2+finalize fusion is not deterministic for top-k > 2;
+        # the roles of one row must generate identical greedy tokens.
+        moe_config_fields["disable_finalize_fusion"] = True
+    if moe_config_fields:
+        kwargs["moe_config"] = MoeConfig(**moe_config_fields)
     env_overrides = _rank_process_env_overrides(args)
     if env_overrides:
         kwargs["env_overrides"] = env_overrides

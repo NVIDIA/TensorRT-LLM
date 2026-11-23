@@ -113,6 +113,49 @@ class TestAsyncLoadImage:
 
 
 # ──────────────────────────────────────────────────────────────
+# load_image / async_load_image: local files
+# ──────────────────────────────────────────────────────────────
+
+
+class TestLoadImageLocalFile:
+    """`load_image` and `async_load_image` resolve local files the same way."""
+
+    @staticmethod
+    def _write_image(directory, name):
+        path = directory / name
+        Image.new("RGB", (6, 4), color=(10, 20, 30)).save(path)
+        return path
+
+    @staticmethod
+    def _reference(path):
+        return np.asarray(Image.open(path).convert("RGB"))
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "plain.png",
+            "with space.png",
+            "hash#mark.png",
+            "question?mark.png",
+            "semi;colon.png",
+            "100%.png",
+        ],
+    )
+    @pytest.mark.parametrize("as_uri", [False, True], ids=["bare_path", "file_uri"])
+    @pytest.mark.asyncio
+    async def test_sync_and_async_load_the_same_file(self, tmp_path, name, as_uri):
+        path = self._write_image(tmp_path, name)
+        source = path.as_uri() if as_uri else str(path)
+
+        expected = self._reference(path)
+        sync_image = utils_module.load_image(source, format="pil")
+        async_image = await async_load_image(source, format="pil")
+
+        assert np.array_equal(np.asarray(sync_image), expected)
+        assert np.array_equal(np.asarray(async_image), expected)
+
+
+# ──────────────────────────────────────────────────────────────
 # async_load_audio
 # ──────────────────────────────────────────────────────────────
 

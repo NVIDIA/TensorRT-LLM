@@ -945,6 +945,31 @@ TEST(KvCacheManagerV2ColdPageTest, ColdGroupingIsIndependentOfHotGrouping)
     }
 }
 
+TEST(KvCacheManagerV2ColdPageTest, SinkRequiredOnlyWindowSharesTheRequiredColdPoolGroup)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    // Three life cycles of one page shape. The cold tier groups them like the GPU tier: the
+    // SINK_REQUIRED_ONLY window shares the REQUIRED layer's pool group, and OPTIONAL keeps its own.
+    auto config = makeSplitColdGroupingConfig();
+    std::get<AttentionLayerConfig>(config.layers[0]).slidingWindowSize = std::nullopt;
+    auto& sinkOnly = std::get<AttentionLayerConfig>(config.layers[1]);
+    sinkOnly.slidingWindowSize = 128;
+    sinkOnly.numSinkTokens = 4;
+    sinkOnly.reusePolicy = ReusePolicy::SINK_REQUIRED_ONLY;
+    auto optionalWindow = sinkOnly;
+    optionalWindow.layerId = 2;
+    optionalWindow.reusePolicy = ReusePolicy::OPTIONAL;
+    config.layers.emplace_back(std::move(optionalWindow));
+    auto manager = std::make_shared<KvCacheManager>(std::move(config));
+
+    // Life cycles are registered in layer order.
+    auto const coldGroups = manager->getLifeCyclePoolGroupIndices(CacheLevel{1});
+    ASSERT_EQ(coldGroups.size(), LifeCycleId{3});
+    EXPECT_EQ(manager->storage().numPoolGroups(CacheLevel{1}), PoolGroupIndex{2});
+    EXPECT_EQ(coldGroups[LifeCycleId{0}], coldGroups[LifeCycleId{1}]);
+    EXPECT_NE(coldGroups[LifeCycleId{0}], coldGroups[LifeCycleId{2}]);
+}
+
 TEST(KvCacheManagerV2ColdPageTest, MigrationStatsUseColdPageBytes)
 {
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
@@ -1101,7 +1126,7 @@ TEST(KvCacheManagerV2ColdPageTest, MaxQuotaBelowTheStructuralMinimumIsRejected)
         config.cacheTiers[1] = HostCacheTierConfig{kOneUnit, maxQuota};
         return config;
     };
-    // Cold pool groups are keyed by (reuse policy, cold page bytes), so the split
+    // Cold pool groups are keyed by (effectivePoolReusePolicy, cold page bytes), so the split
     // comes from the codec reporting different page sizes, not from the config
     // alone. Without it both lifecycles share one group and one unit suffices.
     auto build = [&makeConfig](std::optional<size_t> maxQuota) {

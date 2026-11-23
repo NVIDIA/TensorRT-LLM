@@ -247,6 +247,7 @@ def test_kimi_k25_forward_with_attached_embeddings():
     with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
         torch.manual_seed(42)
         model = KimiK25ForConditionalGeneration(model_config)
+        # pyrefly: ignore [missing-argument]
         model = model.to(device="cuda", dtype=torch.bfloat16).eval()
         for name, parameter in model.named_parameters():
             if parameter.ndim > 1:

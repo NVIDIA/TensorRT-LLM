@@ -26,7 +26,7 @@ from .....helpers.utils import ceil_div, round_up, strides_equal_ignoring_single
 from .....quant_def import QuantKind
 from ....schedulers.base import SchedulerConsumer
 from ....schedulers.fc12_mapping import BlockPhase
-from ...custom_mix_cga_helpers import (
+from ....blackwell.custom_mix_cga_helpers import (
     PipelineTmaUmmaMixedCga,
     TmaAtomOrPair,
     bind_executable_tma_load_fields,

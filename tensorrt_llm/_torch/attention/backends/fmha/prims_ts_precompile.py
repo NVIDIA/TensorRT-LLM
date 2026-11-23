@@ -132,8 +132,8 @@ def strict() -> bool:
 def encode_payload(device_index: int, rows: int, heads: int, plan_kwargs: dict) -> dict[str, Any]:
     """JSON-safe description of one ``BatchSparseMLADecodePagedTSWrapper.plan`` call."""
     kwargs = dict(plan_kwargs)
-    dtype = kwargs.pop("q_data_type")
-    kwargs["q_data_type"] = str(dtype).removeprefix("torch.")
+    dtype = kwargs.pop("q_dtype")
+    kwargs["q_dtype"] = str(dtype).removeprefix("torch.")
     return {"device_index": device_index, "rows": rows, "heads": heads, "plan_kwargs": kwargs}
 
 
@@ -240,7 +240,7 @@ def _plan(mla_decode, payload: dict[str, Any], torch) -> None:
     device = torch.device("cuda", int(payload["device_index"]))
     torch.cuda.set_device(device)
     kwargs = dict(payload["plan_kwargs"])
-    kwargs["q_data_type"] = getattr(torch, kwargs["q_data_type"])
+    kwargs["q_dtype"] = getattr(torch, kwargs["q_dtype"])
     mla_decode.BatchSparseMLADecodePagedTSWrapper().plan(
         device, int(payload["rows"]), int(payload["heads"]), **kwargs
     )

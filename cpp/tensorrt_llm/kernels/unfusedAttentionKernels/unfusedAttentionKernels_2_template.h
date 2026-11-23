@@ -195,7 +195,12 @@ inline __device__ void zeroPagedVCacheTail(QKVPreprocessingParams<T, KVCacheBuff
 {
     // Context owns the last physical page exclusively. Clear unused V rows because paged FMHA loads full pages and
     // masked zero probabilities can still propagate NaNs through BMM2.
-    if constexpr (!GEN_PHASE && std::is_same_v<KVCacheBuffer, KVBlockArray> && std::is_same_v<T, TCache>)
+#ifdef ENABLE_FP8
+    constexpr bool kFp8Cache = std::is_same_v<TCache, __nv_fp8_e4m3>;
+#else
+    constexpr bool kFp8Cache = false;
+#endif
+    if constexpr (!GEN_PHASE && std::is_same_v<KVCacheBuffer, KVBlockArray> && (std::is_same_v<T, TCache> || kFp8Cache))
     {
         if (params.generation_phase || !isUniqueTokenWriter || cacheSeqLen <= 0 || tokenIdxInKvCache != cacheSeqLen - 1)
         {
@@ -210,12 +215,20 @@ inline __device__ void zeroPagedVCacheTail(QKVPreprocessingParams<T, KVCacheBuff
         }
 
         auto* vBlock = reinterpret_cast<TCache*>(params.kv_cache_buffer.getVBlockPtr(batchIdx, cacheSeqLen - 1));
-        auto* vBlockVec = reinterpret_cast<TVec*>(vBlock);
-        TVec const zero{};
         for (int tokenInBlock = validTokensInLastBlock; tokenInBlock < tokensPerBlock; ++tokenInBlock)
         {
             int const vIdx = kvHeadIdx * tokensPerBlock * vecsPerHead + tokenInBlock * vecsPerHead + channelIdx;
-            vBlockVec[vIdx] = zero;
+            if constexpr (std::is_same_v<T, TCache>)
+            {
+                reinterpret_cast<TVec*>(vBlock)[vIdx] = TVec{};
+            }
+            else
+            {
+                // Match the packed FP8 stores used for the valid V tokens.
+                using CacheVec = typename mmha::packed_type<TCache, mmha::num_elems<TVec>::value>::type;
+                static_assert(sizeof(CacheVec) == sizeof(TVec) / sizeof(T));
+                reinterpret_cast<CacheVec*>(vBlock)[vIdx] = CacheVec{};
+            }
         }
     }
 }

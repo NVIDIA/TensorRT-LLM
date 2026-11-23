@@ -317,7 +317,7 @@ def test_compact_workspace_matches_absolute_scores_and_bounded_phase():
                     launch(2, workspace)
             del invalid_workspaces, workspace
         else:
-            launch(2)
+            launch(2, None)
         reduce_per_head_scores(
             scratch,
             tri._decode_lengths_device,
