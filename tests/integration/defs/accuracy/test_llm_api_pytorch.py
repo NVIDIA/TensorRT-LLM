@@ -116,6 +116,16 @@ def _count_prims_ts_phase_calls(mocker):
     return calls
 
 
+def _disable_dense_prims_ts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run a multi-GPU MLA accuracy case without dense PrimTS attention.
+
+    Dense PrimTS MLA decode compiles its kernels the first time a
+    configuration runs, which adds minutes to every new case. The MPI workers
+    read TLLM_FMHA_LIBS from this process when the LLM starts them.
+    """
+    monkeypatch.setenv("TLLM_FMHA_LIBS", "-prims_ts")
+
+
 # MPI session reuse cannot safely reset Userbuffers between Engines. Tests
 # using this helper must keep ``torch_compile=True`` in their node id; tests
 # with unconditional compile configs must keep ``piecewise_cuda_graph`` in
@@ -646,9 +656,15 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(4, 1, 1), (4, 1, 4),
                                                          (2, 2, 1), (1, 4, 1)],
                              ids=["tp4", "ep4", "tp2pp2", "pp4"])
-    def test_bfloat16_4gpus(self, tp_size, pp_size, ep_size, mtp_nextn,
-                            attention_dp, cuda_graph, overlap_scheduler,
-                            torch_compile):
+    def test_bfloat16_4gpus(self, monkeypatch: pytest.MonkeyPatch, tp_size,
+                            pp_size, ep_size, mtp_nextn, attention_dp,
+                            cuda_graph, overlap_scheduler, torch_compile):
+        # The ep4 MTP case with attention DP, CUDA graphs and the overlap
+        # scheduler keeps the default FMHA libraries, so dense PrimTS MLA decode
+        # stays covered on four GPUs; the other cases run without it.
+        if not (ep_size == 4 and mtp_nextn == 2 and attention_dp and cuda_graph
+                and overlap_scheduler and not torch_compile):
+            _disable_dense_prims_ts(monkeypatch)
         if pp_size > 1 and mtp_nextn > 0:
             num_hidden_layers = 30
             pp_partition = [num_hidden_layers // pp_size + 1] * pp_size
@@ -1290,10 +1306,10 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("mtp_nextn", [0, 2])
     @parametrize_with_ids("moe_tactic",
                           ["cutlass", "trtllm_gen", "cutedsl.grouped_gemm"])
-    def test_nvfp4_4gpus(self, fp8kv, attention_dp, cuda_graph,
-                         overlap_scheduler, low_precision_combine, tp_size,
-                         pp_size, ep_size, torch_compile, mtp_nextn,
-                         moe_tactic):
+    def test_nvfp4_4gpus(self, monkeypatch: pytest.MonkeyPatch, fp8kv,
+                         attention_dp, cuda_graph, overlap_scheduler,
+                         low_precision_combine, tp_size, pp_size, ep_size,
+                         torch_compile, mtp_nextn, moe_tactic):
         # create_strategy passes use_low_precision_moe_combine to
         # NVLinkOneSided, NVLinkTwoSided, NcclEP, and DeepEPLowLatency. It
         # returns None or AllGatherReduceScatter, without the flag, when
@@ -1316,6 +1332,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 "dp_size > 1, moe_tp_size == 1, and the tactic allows all-to-all"
             )
         skip_unless_moe_tactic_runs_here(moe_tactic)
+        # test_bfloat16_4gpus covers dense PrimTS MLA decode on four GPUs.
+        _disable_dense_prims_ts(monkeypatch)
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
         # Picewise Cuda Graph cannot be enabled for nvfp4 attention dp.
