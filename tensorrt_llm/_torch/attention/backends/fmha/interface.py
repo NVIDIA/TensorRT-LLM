@@ -126,6 +126,11 @@ class Fmha(ABC):
         """
         return False
 
+    def defer_prequantized_rescale(self, enabled: bool) -> bool:
+        """Whether ``run_prequantized`` defers its output rescale (lossy), after asking for it
+        with ``enabled``; libraries without the deferral return False."""
+        return False
+
     def run_prequantized(
         self,
         q8: torch.Tensor,

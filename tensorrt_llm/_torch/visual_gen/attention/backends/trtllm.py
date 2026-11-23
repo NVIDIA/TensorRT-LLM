@@ -901,6 +901,11 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         lib = self._prequantized_fp8_lib
         return lib is not None and (not fp8_output or lib.supports_prequantized_fp8(fp8_output))
 
+    def defer_fp8_rescale(self, enabled: bool) -> bool:
+        """Defer the dense FP8 library's output rescale on the prequantized path."""
+        lib = self._prequantized_fp8_lib
+        return lib is not None and lib.defer_prequantized_rescale(enabled)
+
     def forward_fp8(
         self,
         q: torch.Tensor,

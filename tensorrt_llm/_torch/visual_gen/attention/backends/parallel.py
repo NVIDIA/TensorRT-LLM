@@ -905,6 +905,10 @@ class UlyssesAttention(AttentionBackend):
         """FP8 Q/K/V pass through when the inner backend takes them and no side stream is used."""
         return self._async_side_stream is None and self.inner_backend.accepts_fp8_qkv(fp8_output)
 
+    def defer_fp8_rescale(self, enabled: bool) -> bool:
+        """The inner backend runs the FP8 attention; it decides."""
+        return self.inner_backend.defer_fp8_rescale(enabled)
+
     def fp8_v_amax(self, qkv: torch.Tensor, num_heads: int, head_dim: int) -> torch.Tensor:
         """|V| maximum over the Ulysses group, so every rank quantizes V with one scale."""
         local_amax = torch.ops.trtllm.dit_v_amax(qkv, num_heads, head_dim)

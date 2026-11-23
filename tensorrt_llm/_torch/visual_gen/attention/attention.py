@@ -27,7 +27,9 @@ from ...attention.backends.fmha.trtllm_gen_dense_fp8 import LOG2E, is_per_tensor
 from ...modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from ...utils import Fp4QuantizedTensor
 from ..config import DiffusionModelConfig
+from ..modules.residual_norm_quant import ResidualNormMode, residual_norm_quant
 from ..modules.rms_norm import RMSNormTPAware
+from ..quantization.ops import FP8_E4M3_MAX
 from .backends.interface import AttentionBackend, AttentionTensorLayout
 from .backends.parallel import wrap_parallel_attention
 from .backends.utils import create_attention
@@ -385,6 +387,13 @@ class Attention(nn.Module):
         self._fp8_qk_mul = math.sqrt(LOG2E / math.sqrt(self.head_dim))
         # The FP8 attention output is quantized with to_out's static input scale; BF16 while False.
         self._fp8_output = False
+        # Static-FP8 cross-attention (enable_fp8_cross_attention): fp32 norm_q weight and the static
+        # dequant scale of the e4m3 Q; the output is e4m3 with to_out's input scale while
+        # _fp8_cross_output is set.
+        self._fp8_q_norm_weight: Optional[torch.Tensor] = None
+        self._fp8_q_descale: Optional[torch.Tensor] = None
+        self._fp8_q_inv_scale: Optional[torch.Tensor] = None
+        self._fp8_cross_output = False
 
     @staticmethod
     def _qualified_module_name(
@@ -674,6 +683,97 @@ class Attention(nn.Module):
             and to_out.quant_method.supports_cublas_epilogues(to_out)
         )
         return self._fp8_output
+
+    def defer_fp8_rescale(self, enabled: bool) -> bool:
+        """Defer the FP8 self-attention's output rescale (lossy: the kernels quantize the softmax
+        probabilities more coarsely). Returns whether it applies: FP8 Q/K/V producer on and a
+        backend with the deferral."""
+        return self._fp8_qkv_producer and self.attn.defer_fp8_rescale(enabled)
+
+    def enable_fp8_cross_attention(self, q_amax: Optional[float] = None) -> bool:
+        """Static-FP8 cross-attention: norm_q + e4m3 quantization of Q in one row kernel with a
+        static per-tensor scale, and an e4m3 output for a static-FP8 to_out. Call after weights
+        are loaded; returns whether it applies (a backend with static FP8 I/O, full-dim QK norm,
+        no TP and a row kernel for this width).
+
+        Without ``q_amax`` the Q scale needs no calibration: RMSNorm bounds every output element
+        by sqrt(width) * max|weight|, since each |x_i| is at most sqrt(width) times the row RMS,
+        and the scale maps that bound (plus the margin of the kernel's two bf16 roundings) to the
+        e4m3 maximum, so Q never saturates. ``q_amax`` is a calibrated maximum of |norm_q(q)|
+        (with its margin) that maps to the e4m3 maximum instead; it is capped at the bound, and
+        values above it saturate to the e4m3 maximum. The scale and the fp32 norm_q weight are
+        taken from the loaded weights: call again after the weights change.
+        """
+        self.disable_fp8_cross_attention()
+        norm_q = getattr(self, "norm_q", None)
+        width = self.local_q_dim
+        if not (
+            self.qkv_mode == QKVMode.SEPARATE_QKV
+            and self.qk_norm
+            and self.qk_norm_mode == "full"
+            and self.tp_size == 1
+            and isinstance(norm_q, RMSNormTPAware)
+            and not norm_q.use_gemma
+            and norm_q.weight is not None
+            and norm_q.weight.dtype == torch.bfloat16
+            and norm_q.weight.numel() == width
+            and self.attn.accepts_static_fp8_io()
+            and torch.ops.trtllm.fused_residual_norm_quant_supported(width)
+        ):
+            return False
+        weight = norm_q.weight.detach().float().contiguous()
+        bound = math.sqrt(width) * weight.abs().max() * (1.0 + 2.0**-8) ** 2
+        if q_amax is not None:
+            if not q_amax > 0:
+                raise ValueError(f"{self.module_name}: calibrated Q amax must be positive")
+            bound = torch.clamp(bound, max=float(q_amax))
+        self._fp8_q_norm_weight = weight
+        self._fp8_q_descale = (bound / FP8_E4M3_MAX).reshape(1)
+        self._fp8_q_inv_scale = self._fp8_q_descale.reciprocal()
+        to_out = self.to_out[0]
+        self._fp8_cross_output = bool(to_out.quant_method.supports_cublas_epilogues(to_out))
+        return True
+
+    @property
+    def static_fp8_cross_attention(self) -> bool:
+        """Whether enable_fp8_cross_attention() applies (fp8_cross_attention serves the layer)."""
+        return self._fp8_q_descale is not None
+
+    def disable_fp8_cross_attention(self) -> None:
+        """Back to the cross-attention without static FP8 Q or output."""
+        self._fp8_q_norm_weight = None
+        self._fp8_q_descale = None
+        self._fp8_q_inv_scale = None
+        self._fp8_cross_output = False
+
+    def fp8_cross_attention(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, **kwargs: Any
+    ) -> torch.Tensor:
+        """Cross-attention on the projections from ``get_qkv`` after ``enable_fp8_cross_attention``.
+
+        Returns [B, S, H*D], e4m3 for to_out when it is static FP8, else BF16. Calls with a key
+        padding mask or a K/V cache take the unquantized cross-attention, whose backends serve
+        them.
+        """
+        if kwargs.get("key_padding_mask") is not None or kwargs.get("kv") is not None:
+            q, k = self.apply_qk_norm(q, k)
+            return self._attn_impl(q, k, v, **kwargs)
+        _, q8 = residual_norm_quant(
+            q,
+            ResidualNormMode.RMS_NORM,
+            q.shape[1],
+            weight=self._fp8_q_norm_weight,
+            eps=float(self.norm_q.variance_epsilon),
+            inv_out_scale=self._fp8_q_inv_scale,
+        )
+        return self._attn_impl(
+            q8,
+            self.norm_k(k),
+            v,
+            q_descale=self._fp8_q_descale,
+            out_scale=self.to_out[0].input_scale if self._fp8_cross_output else None,
+            **kwargs,
+        )
 
     def apply_packed_qk_norm_rope_fp8(
         self,

@@ -780,13 +780,27 @@ class CuDNNAttention(AttentionBackend):
         v: torch.Tensor,
         is_causal: bool,
         with_lse: bool,
+        q_descale: Optional[torch.Tensor] = None,
+        out_scale: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         self._validate_inputs(q, k, v)
         b, s_q, h_q, d_qk = q.shape
         _, s_kv, h_kv, d_v = v.shape
         device = q.device
         out_dtype = self.dtype if self.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
-        q, k, v = q.to(out_dtype), k.to(out_dtype), v.to(out_dtype)
+        # Static FP8 inputs and outputs (FP8 attention only): q already e4m3 with q ~= q * q_descale,
+        # and an e4m3 output o / out_scale for a consumer whose input dequant scale is out_scale.
+        if (q_descale is not None or out_scale is not None) and not self.accepts_static_fp8_io():
+            raise ValueError(
+                "q_descale / out_scale need the cuDNN FP8 attention (quant_dtype='fp8')."
+            )
+        if q_descale is not None and q.dtype != torch.float8_e4m3fn:
+            raise ValueError(f"q_descale needs an e4m3 q; got {q.dtype}.")
+        if out_scale is not None and with_lse:
+            raise ValueError("out_scale does not support returning the LSE.")
+        if q_descale is None:
+            q = q.to(out_dtype)
+        k, v = k.to(out_dtype), v.to(out_dtype)
 
         # Q/K/V arrive as NHD [B, S, H, D]. cuDNN wants a [B, H, S, D] *logical* tensor,
         # but takes the strides explicitly, so `.transpose(1, 2)` stays a view and the
@@ -799,7 +813,11 @@ class CuDNNAttention(AttentionBackend):
                 v=v.contiguous().transpose(1, 2),
             )
         elif self.quant_dtype == "fp8":
-            if d_qk == d_v and is_fused_qkv(q, k, v):
+            if q_descale is not None:
+                q_q, descale_q = q.contiguous(), q_descale.float().reshape(1, 1, 1, 1)
+                k_q, descale_k = _quantize_fp8(k)
+                v_q, descale_v = _quantize_fp8(v)
+            elif d_qk == d_v and is_fused_qkv(q, k, v):
                 # One amax+cast over the packed buffer for fused-QKV, mirroring TransformerEngine's
                 # handling of same-layout buffers.
                 qkv_q, descale = _quantize_fp8(as_fused_qkv(q, k, v))
@@ -816,6 +834,8 @@ class CuDNNAttention(AttentionBackend):
                 k_q, descale_k = _quantize_fp8(k)
                 v_q, descale_v = _quantize_fp8(v)
             scale_s, descale_s, scale_o = self._softmax_scales(self.quant_dtype, device)
+            if out_scale is not None:
+                scale_o = out_scale.float().reciprocal().reshape(1, 1, 1, 1)
             buffers.update(
                 q=q_q.transpose(1, 2),
                 k=k_q.transpose(1, 2),
@@ -851,17 +871,25 @@ class CuDNNAttention(AttentionBackend):
             # O is written straight into an NHD buffer, likewise via strides.
             o_strides=(s_q * h_q * d_v, d_v, h_q * d_v, 1),
         )
+        o_dtype = out_dtype if out_scale is None else torch.float8_e4m3fn
         bundle = self._get_or_build_graph(
             self.quant_dtype,
             shape,
             is_causal=is_causal,
             sm_scale=self.scale,
-            out_dtype=out_dtype,
+            out_dtype=o_dtype,
             with_lse=with_lse,
             device=device,
         )
 
-        output = torch.empty(b, s_q, h_q, d_v, dtype=out_dtype, device=device)
+        output = torch.empty(
+            b,
+            s_q,
+            h_q,
+            d_v,
+            dtype=o_dtype,
+            device=device,
+        )
         tensor_map = {bundle.inputs[name]: tensor for name, tensor in buffers.items()}
         tensor_map[bundle.outputs["o"]] = output.transpose(1, 2)
 
@@ -891,6 +919,8 @@ class CuDNNAttention(AttentionBackend):
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
         key_padding_mask: Optional[torch.Tensor] = None,
         kv: Optional[ForwardPlan] = None,
+        q_descale: Optional[torch.Tensor] = None,
+        out_scale: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Run attention.
@@ -908,16 +938,34 @@ class CuDNNAttention(AttentionBackend):
                 blocks. The first ``kv.num_tokens`` rows are real; rows past them are
                 padding added so the sequence splits evenly across ranks, neither written
                 to the cache nor attended, and their output rows are zero.
+            q_descale: Only with ``accepts_static_fp8_io()``: ``q`` is e4m3 with this fp32
+                per-tensor dequant scale (for example a static calibrated scale), so only K/V
+                are quantized here.
+            out_scale: Only with ``accepts_static_fp8_io()``: return e4m3 ``o / out_scale``,
+                the input of a static-FP8 consumer whose dequant scale is ``out_scale``.
 
         Returns:
             Output tensor ``[B, S_q, H, D_v]``.
         """
         if kv is not None:
+            if q_descale is not None or out_scale is not None:
+                raise NotImplementedError("q_descale / out_scale do not support a K/V cache.")
             return self._run_paged(q, k, v, kv, attention_mask, key_padding_mask)
         output, _ = self._run(
-            q, k, v, is_causal=self._resolve_mask(attention_mask, key_padding_mask), with_lse=False
+            q,
+            k,
+            v,
+            is_causal=self._resolve_mask(attention_mask, key_padding_mask),
+            with_lse=False,
+            q_descale=q_descale,
+            out_scale=out_scale,
         )
         return output
+
+    def accepts_static_fp8_io(self) -> bool:
+        """Whether ``forward`` takes an e4m3 ``q`` with ``q_descale`` and writes e4m3 output with
+        ``out_scale`` (per-tensor FP8 attention)."""
+        return self.quant_dtype == "fp8"
 
     def forward_with_lse(
         self,

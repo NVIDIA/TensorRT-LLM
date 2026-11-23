@@ -52,12 +52,26 @@ def is_per_tensor_fp8(cfg: Optional["QuantAttentionConfig"]) -> bool:
     )
 
 
+# Deferred output rescale of the pre-quantized (FP16-softmax) path: the kernels skip the output
+# accumulator correction until the row max has grown by more than 2^1. With any positive
+# threshold the kernels quantize P with a scale of 1.75 instead of 448 (P stays below
+# 1.75 * 2^1 < 448), so small probabilities lose precision: the deferral is lossy and only
+# runs when a caller opts in (defer_prequantized_rescale).
+PREQUANTIZED_SKIP_CORRECTION_LOG2 = 1.0
+
+
 def dense_fp8_supported(
-    head_dim: int, num_heads: int, out_dtype: torch.dtype, fp16_softmax: bool
+    head_dim: int,
+    num_heads: int,
+    out_dtype: torch.dtype,
+    fp16_softmax: bool,
+    skip_correction_threshold: float = 0.0,
 ) -> bool:
     """Whether a trtllm-gen dense FP8 kernel serves this head layout on the current device."""
     return bool(
-        torch.ops.trtllm.fmha_dense_fp8_is_supported(head_dim, num_heads, out_dtype, fp16_softmax)
+        torch.ops.trtllm.fmha_dense_fp8_is_supported(
+            head_dim, num_heads, out_dtype, fp16_softmax, skip_correction_threshold
+        )
     )
 
 
@@ -86,6 +100,12 @@ class TrtllmGenDenseFp8Fmha(Fmha):
     # TRTLLM on the same SMs.
     SUPPORTED_SMS = frozenset({107})
 
+    def __init__(self, attn: "TrtllmAttention"):
+        super().__init__(attn)
+        # log2 threshold of the deferred output rescale on the pre-quantized path; 0 rescales the
+        # output on every row-max growth.
+        self._prequantized_skip_correction = 0.0
+
     @classmethod
     def _is_available(cls, attn: "TrtllmAttention") -> bool:
         """Whether the layer carries the per-tensor FP8 recipe and a kernel serves its heads."""
@@ -100,7 +120,9 @@ class TrtllmGenDenseFp8Fmha(Fmha):
         if attn.is_mla_enable or attn.num_heads != attn.num_kv_heads:
             logger.debug("TrtllmGenDenseFp8Fmha is unavailable: MHA without MLA is required.")
             return False
-        if not dense_fp8_supported(attn.head_dim, attn.num_heads, torch.bfloat16, False):
+        if not dense_fp8_supported(
+            attn.head_dim, attn.num_heads, torch.bfloat16, fp16_softmax=False
+        ):
             logger.debug(
                 "TrtllmGenDenseFp8Fmha is unavailable: no trtllm-gen dense FP8 kernel for "
                 f"head_dim={attn.head_dim}, num_heads={attn.num_heads} on this device."
@@ -227,7 +249,25 @@ class TrtllmGenDenseFp8Fmha(Fmha):
         with ``fp8_output`` writes an e4m3 output."""
         attn = self.attn
         out_dtype = torch.float8_e4m3fn if fp8_output else torch.bfloat16
-        return dense_fp8_supported(attn.head_dim, attn.num_heads, out_dtype, True)
+        return dense_fp8_supported(attn.head_dim, attn.num_heads, out_dtype, fp16_softmax=True)
+
+    def defer_prequantized_rescale(self, enabled: bool) -> bool:
+        """Defer the pre-quantized path's output rescale up to a 2^1 row-max growth (lossy, see
+        PREQUANTIZED_SKIP_CORRECTION_LOG2); returns whether it is deferred. Needs a kernel that
+        takes the threshold for both BF16 and e4m3 output."""
+        attn = self.attn
+        deferred = enabled and all(
+            dense_fp8_supported(
+                attn.head_dim,
+                attn.num_heads,
+                dtype,
+                fp16_softmax=True,
+                skip_correction_threshold=PREQUANTIZED_SKIP_CORRECTION_LOG2,
+            )
+            for dtype in (torch.bfloat16, torch.float8_e4m3fn)
+        )
+        self._prequantized_skip_correction = PREQUANTIZED_SKIP_CORRECTION_LOG2 if deferred else 0.0
+        return deferred
 
     def run_prequantized(
         self,
@@ -254,4 +294,5 @@ class TrtllmGenDenseFp8Fmha(Fmha):
             scale_out,
             True,
             out_dtype,
+            self._prequantized_skip_correction,
         )
