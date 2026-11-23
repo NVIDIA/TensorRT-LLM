@@ -26,13 +26,14 @@ from tensorrt_llm._torch.host_staging import HostUploader
 from tensorrt_llm._torch.kernels.spec_step_copies import op as spec_step_copies
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import _build_request_multimodal_input
-from tensorrt_llm._torch.pyexecutor import step_inputs
+from tensorrt_llm._torch.pyexecutor import device_copy, step_inputs
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import enable_breakable_cuda_graph
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import BreakableCUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     CUDAGraphRunner,
     get_mrope_dummy_seq_slot,
 )
+from tensorrt_llm._torch.pyexecutor.device_copy import CopySite
 from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import (
@@ -2500,9 +2501,11 @@ class DecoderInputPreparer:
         assert total_num_tokens <= self._config.max_num_tokens, (
             f"total_num_tokens ({total_num_tokens}) should be less than or equal to max_num_tokens ({self._config.max_num_tokens})"  # noqa: E501
         )
+        # An open copy-plan pack owns the step's copies: keep the per-buffer copies then.
         staged = (
             self._spec_overlap_staging
             and enable_spec_decode
+            and not device_copy.is_open()
             and next_draft_tokens_device is not None
             and previous_batch_len > 0
             and self._stage_spec_overlap_inputs(
@@ -2809,7 +2812,11 @@ class DecoderInputPreparer:
                     generation_positions.view(1, 1, -1).expand(3, 1, -1),
                 )
         else:
-            step_inputs.copy_(self._buffers.position_ids_cuda[:total_num_tokens], host_position_ids)
+            position_ids_cuda = self._buffers.position_ids_cuda[:total_num_tokens]
+            if device_copy.current() is not None:
+                device_copy.copy(CopySite.INPUT_POSITION_IDS, position_ids_cuda, host_position_ids)
+            else:
+                step_inputs.copy_(position_ids_cuda, host_position_ids)
 
         host.host_position_ids = host_position_ids
 

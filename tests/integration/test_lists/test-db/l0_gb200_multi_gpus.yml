@@ -37,6 +37,8 @@ l0_gb200_multi_gpus:
   # Synthetic weights cover Engram head/row shards and TP/EP shared-expert collectives.
   - unittest/_torch/multi_gpu/test_engram_sharding.py::test_engram_shard_roundtrip -k "world:4"
   - unittest/_torch/moe/test_deepseek_v41_shared_moe.py
+  # Dynamic expert parallelism at attention TP against the static expert split.
+  - unittest/_torch/moe/test_moe_ep_dynamic.py
   # Two-rank cases include uneven/empty attention-DP batches and bounded CSA2 replay.
   - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_engram[world2-row-sharded]
   - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_decoder_bounded_replay[world2]
