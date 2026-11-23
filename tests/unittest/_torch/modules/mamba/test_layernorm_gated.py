@@ -308,20 +308,35 @@ class TestRMSNormBasic:
 
         assert torch.equal(outputs[True], outputs[False])
 
+    @pytest.mark.parametrize("layout", ["dense", "aligned", "sliced"])
     @pytest.mark.parametrize("heads", [1, 12])
-    def test_multirow_kernel_reuses_the_compiled_variant_across_batches(self, heads: int) -> None:
-        """No row count compiles a new variant of the multi-row kernel.
+    def test_multirow_kernel_reuses_the_compiled_variant_across_batches(
+        self, heads: int, layout: str
+    ) -> None:
+        """No row count compiles a new variant of the multi-row kernel after warmup.
 
-        Warmup runs large batches and serving then sees every token count, so a
-        variant keyed on the rows (M on == 1 and % 16, or PDL chosen from the
-        grid) compiled mid-serving. heads=1 is the RMSNorm module path (SiLU
-        gate), heads=12 the Kimi K3 KDA output gate (token-major, sigmoid).
+        Serving sees row counts that warmup did not run, so a variant keyed on
+        the rows (M on == 1 and % 16, or PDL chosen from the grid) would
+        compile mid-serving. heads=1 is the RMSNorm module path (SiLU gate),
+        heads=12 the Kimi K3 KDA output gate (token-major, sigmoid).
+
+        ``layout`` gives the gate whole (dense) or as a column slice of a wider
+        projection whose row stride is a multiple of 16 (aligned) or not
+        (sliced). Sliced also makes x a column slice on the module path, so a
+        one-token batch, which PyTorch views with dense strides, keys other
+        variants.
         """
         from _torch.helpers import triton_num_compiled
 
         kernel = layernorm_gated._rms_norm_gated_fwd_multirow_kernel
         while isinstance(kernel, triton.runtime.Heuristics):
             kernel = kernel.fn  # the compiled variants live on the inner JITFunction
+        # Start from no compiled variants, as a server process does, so that
+        # those of earlier tests cannot stand in for the ones warmup compiles.
+        for cache in getattr(kernel, "device_caches", {}).values():
+            cache[0].clear()
+        layernorm_gated._multirow_variants_with_siblings.clear()
+
         device = "cuda"
         dtype = torch.bfloat16
         N = 128
@@ -331,10 +346,15 @@ class TestRMSNormBasic:
         norm = RMSNorm(N, eps=eps).to(device=device, dtype=dtype)
         norm.weight.data.copy_(weight)
 
+        pad = {"dense": 0, "aligned": 128, "sliced": 24}[layout]
+
         def check(num_tokens: int) -> None:
-            x = torch.randn(num_tokens * heads, N, device=device, dtype=dtype)
-            wide = torch.randn(num_tokens, heads * N + 128, device=device, dtype=dtype)
-            z = wide[:, 128:].view(num_tokens, heads, N)
+            if layout == "sliced" and heads == 1:
+                x = torch.randn(num_tokens, N + pad, device=device, dtype=dtype)[:, pad:]
+            else:
+                x = torch.randn(num_tokens * heads, N, device=device, dtype=dtype)
+            wide = torch.randn(num_tokens, heads * N + pad, device=device, dtype=dtype)
+            z = wide[:, pad:].view(num_tokens, heads, N)
             if heads == 1:
                 out = norm(x, z=z.reshape(num_tokens, N))
                 gate = F.silu(z.reshape(-1, N).float())
@@ -347,11 +367,12 @@ class TestRMSNormBasic:
             ref = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps) * weight.float() * gate
             torch.testing.assert_close(out, ref.to(dtype), rtol=1e-2, atol=1e-2)
 
-        # Warmup-sized first: the grid covers every SM. Then one row, multiples
-        # of 16 and neither, all below one wave of programs, and large again.
+        # Warmup-sized first: the grid covers every SM. Then one token, row
+        # counts that are multiples of 16 or not, and grids below and above one
+        # wave of programs.
         check(4096)
         compiled = triton_num_compiled(kernel)
-        for num_tokens in (1, 2, 3, 16, 17, 64, 100, 1000, 333):
+        for num_tokens in (1, 2, 3, 16, 17, 64, 100, 333, 1000, 4095):
             check(num_tokens)
         assert triton_num_compiled(kernel) == compiled
 

@@ -24,6 +24,8 @@ import triton
 import triton.language as tl
 import triton.language.extra.libdevice as tldevice
 
+from tensorrt_llm.logger import logger
+
 from ...._utils import get_sm_version
 from ...utils import Fp4QuantizedTensor
 
@@ -237,9 +239,23 @@ def _rms_norm_gated_fwd_multirow_kernel(
         tl.extra.cuda.gdc_launch_dependents()
 
 
-# Compiled variants of the multi-row kernel whose twin with the other PDL
-# setting has been compiled too.
-_multirow_variants_with_pdl_twin = set()
+# Compiled variants of the multi-row kernel whose siblings have been compiled
+# too (see _launch_multirow_kernel).
+_multirow_variants_with_siblings = set()
+
+
+def _compile_multirow_siblings(args, kwargs, device_index, launched=None):
+    """Compile the multi-row kernel for args and kwargs with every reachable
+    LAUNCH_WITH_PDL value but ``launched``."""
+    # PDL runs only below one wave of programs, which a one-program grid is.
+    for pdl in {False, _multirow_pdl(1, device_index)}:
+        if pdl != launched:
+            _multirow_variants_with_siblings.add(
+                _rms_norm_gated_fwd_multirow_kernel.warmup(*args,
+                                                           grid=(1, ),
+                                                           LAUNCH_WITH_PDL=pdl,
+                                                           launch_pdl=pdl,
+                                                           **kwargs))
 
 
 def _launch_multirow_kernel(grid_size: int, device_index: int, *args,
@@ -247,11 +263,18 @@ def _launch_multirow_kernel(grid_size: int, device_index: int, *args,
     """Launch the multi-row kernel, with PDL when its grid is below one wave.
 
     PDL is compiled into the kernel (LAUNCH_WITH_PDL and Triton's launch_pdl),
-    so the first launch of a variant also compiles its twin with the other PDL
-    setting. Otherwise a server warmed up on large batches would compile the
-    PDL variant the first time it serves a small batch, while every request in
-    flight waits. (Under torch.compile the launch is traced, not run, so there
-    is no variant to pair.)
+    and the grid size follows the row count. A server warmed up on some row
+    counts would compile a new variant the first time a serving batch flips
+    it, while every request in flight waits. So the first launch of a variant
+    also compiles its sibling, the same call with the other PDL setting.
+    (Under torch.compile the launch is traced, not run, so there is no variant
+    to pair.)
+
+    The row strides are compile keys too (== 1 and % 16), and a one-token
+    batch can change them: PyTorch gives a dimension of size 1 the dense
+    stride, so a gate viewed in a wider projection, or a column-sliced x,
+    arrives with other strides when it holds one token. Where those differ
+    from this launch's, the siblings include the one-token launches.
     """
     launch_with_pdl = _multirow_pdl(grid_size, device_index)
     with torch.cuda.device(device_index):
@@ -260,16 +283,27 @@ def _launch_multirow_kernel(grid_size: int, device_index: int, *args,
             LAUNCH_WITH_PDL=launch_with_pdl,
             launch_pdl=launch_with_pdl,
             **kwargs)
-        if (not torch.compiler.is_compiling()
-                and variant not in _multirow_variants_with_pdl_twin
-                and _pdl_device_policy(device_index)[0]):
-            _multirow_variants_with_pdl_twin.add(variant)
-            _rms_norm_gated_fwd_multirow_kernel.warmup(
-                *args,
-                grid=(grid_size, ),
-                LAUNCH_WITH_PDL=not launch_with_pdl,
-                launch_pdl=not launch_with_pdl,
-                **kwargs)
+        if (torch.compiler.is_compiling()
+                or variant in _multirow_variants_with_siblings):
+            return
+        N, heads = kwargs["N"], kwargs["HEADS_PER_TOK"]
+        strides = args[6:9]
+        logger.info(
+            f"Compiling the multi-row gated RMSNorm kernel's variants for "
+            f"N={N}, HEADS_PER_TOK={heads}, row strides {strides}")
+        _multirow_variants_with_siblings.add(variant)
+        _compile_multirow_siblings(args,
+                                   kwargs,
+                                   device_index,
+                                   launched=launch_with_pdl)
+        # One token: `heads` rows, dense x and y rows when that is one row,
+        # and a dense gate. Both of its variants are compiled, so that every
+        # variant in the set has its sibling.
+        one_token = (N if heads == 1 else strides[0],
+                     N if heads == 1 else strides[1], heads * N)
+        if one_token != strides:
+            _compile_multirow_siblings((*args[:6], *one_token, *args[9:]),
+                                       kwargs, device_index)
 
 
 def _multirow_gated_rmsnorm_eligible(N, ngroups, bias, z, norm_before_gate,
