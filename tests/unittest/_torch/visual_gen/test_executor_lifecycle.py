@@ -193,7 +193,7 @@ def _run_temporary_constructor_coordinator(
                 patch.object(
                     executor_module,
                     "find_free_port",
-                    side_effect=[29501, 29502],
+                    side_effect=[29501, 29502, 29503],
                 ),
                 patch.object(
                     executor_module.dist, "TCPStore", return_value=SimpleNamespace(port=29500)
@@ -950,7 +950,7 @@ def test_cleanup_is_registered_before_waiting_for_ready() -> None:
 
     with (
         patch.object(executor_module, "_detect_external_launch", return_value=None),
-        patch.object(executor_module, "find_free_port", side_effect=[29501, 29502]),
+        patch.object(executor_module, "find_free_port", side_effect=[29501, 29502, 29503]),
         patch.object(executor_module.dist, "TCPStore", return_value=SimpleNamespace(port=29500)),
         patch.object(executor_module, "get_ip_address", return_value="127.0.0.1"),
         patch.object(executor_module, "_get_mp_context", return_value=context),
