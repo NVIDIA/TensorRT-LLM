@@ -2229,11 +2229,13 @@ def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_gen_only(
 
     env = llm_venv._new_env.copy()
     env['TRTLLM_DISAGG_BENCHMARK_GEN_ONLY'] = '1'
+    server_start_timeout = (1200 if get_sm_version() in (100, 103) else None)
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_attention_dp_gen_only",
                            env=env,
                            model_path=deepseek_v3_model_root,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           server_start_timeout=server_start_timeout)
 
 
 @pytest.mark.skip_less_device(4)
