@@ -216,9 +216,9 @@
    ],
    "local_edits": [
     "class CuteDslMlaFmha removed (the FMHA library class: the engine's FMHA registry registers V1's own, nothing imports the family's), with the imports only it used (typing, attention.backends.interface, fmha.interface / fmha.phased, the TYPE_CHECKING trtllm import, cute_dsl_utils, _utils, bindings, logger); the split-KV plan kept unchanged",
-    "module docstring: the split-KV plan of the CuTe DSL MLA decode FMHA library"
+    "Reuse the K3 family split-KV kernel, CPU mirror and constants from kernels/k3_mla/split_kv_plan.py; keep the ULL batch-sized launch and piece cost argument."
    ],
-   "sha256": "5812c23b05d1ad620b86c788ed72c11b622b2f03524a338cc1e16e956df88a03",
+   "sha256": "672d66fb889a65039415482c2ba8bc51a610b057de5b84da9b51cefd8a3d3c76",
    "target_path": "kernels/mla/cute_dsl_mla.py"
   },
   "kernels/k3r_mla_decode/mla_decode_fp8.py": {
