@@ -365,6 +365,7 @@ def test_waives_rule_handles_dotted_file_and_negated_k_filters(tmp_path: Path) -
     loader_py_param = 'unittest/test_loader.py -k "model.py"'
     dir_py_param = 'unittest/loader_dir -k "model.py"'
     repeated_k = "unittest/test_rep.py -k slow -k=fast"
+    repeated_k_space = "unittest/test_rep2.py -k slow -k fast"
     (test_db / "l0_b200.yml").write_text(
         yaml.safe_dump(
             {
@@ -379,6 +380,7 @@ def test_waives_rule_handles_dotted_file_and_negated_k_filters(tmp_path: Path) -
                             loader_py_param,
                             dir_py_param,
                             repeated_k,
+                            repeated_k_space,
                         ],
                     }
                 ],
@@ -389,6 +391,8 @@ def test_waives_rule_handles_dotted_file_and_negated_k_filters(tmp_path: Path) -
     idx_multi = YAMLIndex.load(test_db)
     assert idx_multi.find_matches_for_waive("unittest/test_rep.py::test_slow[p]") is None
     assert idx_multi.find_matches_for_waive("unittest/test_rep.py::test_fast[p]") is not None
+    assert idx_multi.find_matches_for_waive("unittest/test_rep2.py::test_slow[p]") is None
+    assert idx_multi.find_matches_for_waive("unittest/test_rep2.py::test_fast[p]") is not None
 
     rule_fp4 = WaivesRule(idx_multi, stages)
     unwaive_func_diff = (
