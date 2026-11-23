@@ -90,6 +90,8 @@ def test_variable_window_probe_rejects_invalid_head_size():
         None,
         False,
         False,
+        True,
+        True,
     )
 
 

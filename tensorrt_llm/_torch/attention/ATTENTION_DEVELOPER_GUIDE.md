@@ -543,7 +543,8 @@ shares a selection cache key; beam search with KV history past the cyclic window
 is the exception, and the cache key records it. Whether XQA is expected to outrun MMHA weighs the
 call's batch against its KV history; `XqaFmha.has_perf_gain` asks
 `thop.xqa_has_perf_gain` once per batch, history block, speculative mode and output dtype,
-and `FmhaManager` keys selection on the answer once a selection reaches XQA. The native
+and `FmhaManager` keys selection on the answer once a selection reaches XQA. Without a gain,
+XQA yields to a later enabled library that serves the call, and keeps the call when none does. The native
 carrier behind the entry points is per host thread and never visible to
 Python. Generated nanobind readers
 (`scripts/generate_fmha_params.py`) copy the fields C++ reads from `attn`,

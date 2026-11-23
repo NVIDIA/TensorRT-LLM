@@ -162,24 +162,20 @@ def _legacy_forward_args(
     return AttentionForwardArgs(**values)
 
 
-def _xqa_is_supported(params: FmhaParams, is_gen: bool) -> bool:
-    return thop.xqa_is_supported(params, is_gen) and bool(thop.xqa_has_perf_gain(params))
-
-
 # The native op's library priorities. They agree phase by phase with the registry order,
 # which serves both variants: fmha_v2 serves no MHA generation and XQA no context phase.
 _NativeLibrary = tuple[type[PhasedFmha], Callable[[FmhaParams, bool], bool]]
 _MHA_LIBRARIES: tuple[_NativeLibrary, ...] = (
     (TrtllmGenFmha, thop.trtllm_gen_is_supported),
     (FmhaV2Fmha, thop.fmha_v2_is_supported),
-    (XqaFmha, _xqa_is_supported),
+    (XqaFmha, thop.xqa_is_supported),
     (MmhaFmha, thop.mmha_is_supported),
     (UnfusedFmha, thop.unfused_is_supported),
 )
 _MLA_LIBRARIES: tuple[_NativeLibrary, ...] = (
     (TrtllmGenFmha, thop.trtllm_gen_is_supported),
     (FlashMlaFmha, thop.flash_mla_is_supported),
-    (XqaFmha, _xqa_is_supported),
+    (XqaFmha, thop.xqa_is_supported),
     (FmhaV2Fmha, thop.fmha_v2_is_supported),
 )
 
@@ -221,12 +217,20 @@ class FallbackFmha(PhasedFmha):
         )
 
     def _first_library(self, params: FmhaParams, is_gen: bool) -> Optional[PhasedFmha]:
-        """The first native library that serves this phase call, or None."""
+        """The first native library that serves this phase call, or None.
+
+        XQA without an expected perf gain yields to a later library that serves the call.
+        """
+        xqa_without_gain = None
         for library, is_supported in self._libraries:
             serves_phase = library.SERVES_GENERATION if is_gen else library.SERVES_CONTEXT
-            if serves_phase and is_supported(params, is_gen):
-                return library
-        return None
+            if not (serves_phase and is_supported(params, is_gen)):
+                continue
+            if isinstance(library, XqaFmha) and not thop.xqa_has_perf_gain(params):
+                xqa_without_gain = library
+                continue
+            return library
+        return xqa_without_gain
 
     @classmethod
     def _is_available(cls, attn: "TrtllmAttention") -> bool:

@@ -72,23 +72,6 @@ int64_t exportOffset(tensorrt_llm::common::op::WorkspaceSlice const& slice)
 
 } // namespace
 
-KvCachePoolMapping readKvCachePoolMapping(at::Tensor const& hostKvCachePoolMapping, int64_t const layerIdx)
-{
-    TORCH_CHECK(hostKvCachePoolMapping.device().is_cpu(), "host_kv_cache_pool_mapping must be a CPU tensor.");
-    TORCH_CHECK(hostKvCachePoolMapping.dim() == 2, "host_kv_cache_pool_mapping must be a 2D tensor.");
-    TORCH_CHECK(hostKvCachePoolMapping.size(1) >= 2, "host_kv_cache_pool_mapping must have at least two columns.");
-    TORCH_CHECK(layerIdx >= 0 && layerIdx < hostKvCachePoolMapping.size(0),
-        "host_kv_cache_pool_mapping layer index is out of bounds.");
-
-    auto const* data = hostKvCachePoolMapping.data_ptr<int32_t>();
-    auto const rowOffset = layerIdx * hostKvCachePoolMapping.stride(0);
-    auto const colStride = hostKvCachePoolMapping.stride(1);
-    KvCachePoolMapping mapping;
-    mapping.poolIndex = data[rowOffset];
-    mapping.layerIdxInCachePool = data[rowOffset + colStride];
-    return mapping;
-}
-
 std::optional<at::Tensor> TrtllmAttentionWorkspaceManager::makeWorkspaceView(
     at::Tensor const& workspace, int64_t const offset, int64_t const sizeBytes, at::ScalarType const scalarType)
 {
@@ -1102,23 +1085,24 @@ bool MHA::isSeparateQAndKvInput() const
     return contextFixedParams().attentionInputLayout != AttentionInputLayout::PACKED_QKV;
 }
 
-bool MHA::supportsNvFp4Output()
+bool MHA::supportsNvFp4Output(bool useTrtllmGen, bool useFmhaV2, bool useXqa)
 {
     initPhase(/*isGen=*/false);
     initPhase(/*isGen=*/true);
-    bool const fusedContextKernel = (mTrtllmGen != nullptr && mTrtllmGen->hasKernels(/*isGen=*/false))
-        || (mFmhaV2 != nullptr && mFmhaV2->hasKernels(/*isGen=*/false));
-    bool const fp4GenerationKernel = (mTrtllmGen != nullptr && mTrtllmGen->hasKernels(/*isGen=*/true))
-        || (mXqa != nullptr && mXqa->hasKernels(/*isGen=*/true));
+    bool const trtllmGen = useTrtllmGen && mTrtllmGen != nullptr;
+    bool const fusedContextKernel = (trtllmGen && mTrtllmGen->hasKernels(/*isGen=*/false))
+        || (useFmhaV2 && mFmhaV2 != nullptr && mFmhaV2->hasKernels(/*isGen=*/false));
+    bool const fp4GenerationKernel = (trtllmGen && mTrtllmGen->hasKernels(/*isGen=*/true))
+        || (useXqa && mXqa != nullptr && mXqa->hasKernels(/*isGen=*/true));
     return fusedContextKernel && fp4GenerationKernel;
 }
 
-bool MHA::supportsVariableWindow()
+bool MHA::supportsVariableWindow(bool useTrtllmGen, bool useFmhaV2)
 {
     initPhase(/*isGen=*/false);
     return use_variable_window
-        && ((mTrtllmGen != nullptr && mTrtllmGen->hasKernels(/*isGen=*/false))
-            || (mFmhaV2 != nullptr && mFmhaV2->hasKernels(/*isGen=*/false)));
+        && ((useTrtllmGen && mTrtllmGen != nullptr && mTrtllmGen->hasKernels(/*isGen=*/false))
+            || (useFmhaV2 && mFmhaV2 != nullptr && mFmhaV2->hasKernels(/*isGen=*/false)));
 }
 
 void MHA::prepareInputs(FmhaParams& p, bool isGen)
@@ -2300,7 +2284,8 @@ std::string AttentionBase::toString() const
 
 bool attention_supports_nvfp4_output(int64_t const num_heads, int64_t const num_kv_heads, int64_t const head_size,
     std::optional<int64_t> const tokens_per_block, int64_t const mask_type, int64_t const quant_mode,
-    bool const use_paged_context_fmha, bool is_mla_enable)
+    bool const use_paged_context_fmha, bool is_mla_enable, bool const use_trtllm_gen, bool const use_fmha_v2,
+    bool const use_xqa)
 {
     // Only SM100 family supports NVFP4 output.
     if (!tensorrt_llm::common::isSM100Family())
@@ -2317,7 +2302,7 @@ bool attention_supports_nvfp4_output(int64_t const num_heads, int64_t const num_
     int device;
     check_cuda_error(cudaGetDevice(&device));
     auto const key = std::make_tuple(device, num_heads, num_kv_heads, head_size, tokens_per_block.value_or(0),
-        mask_type, quant_mode, use_paged_context_fmha);
+        mask_type, quant_mode, use_paged_context_fmha, use_trtllm_gen, use_fmha_v2, use_xqa);
     static thread_local std::map<std::decay_t<decltype(key)>, bool> cache;
     if (auto const it = cache.find(key); it != cache.end())
     {
@@ -2340,7 +2325,7 @@ bool attention_supports_nvfp4_output(int64_t const num_heads, int64_t const num_
     cfg.quant_mode = tensorrt_llm::common::QuantMode(uint32_t(quant_mode));
 
     MHA op{cfg};
-    bool const supported = op.supportsNvFp4Output();
+    bool const supported = op.supportsNvFp4Output(use_trtllm_gen, use_fmha_v2, use_xqa);
     cache.emplace(key, supported);
     return supported;
 }
@@ -2349,7 +2334,8 @@ bool attention_supports_variable_window(c10::ScalarType const dtype, c10::Scalar
     int64_t const num_heads, int64_t const num_kv_heads, int64_t const head_size,
     std::optional<int64_t> const tokens_per_block, int64_t const quant_mode, int64_t const /*max_num_requests*/,
     int64_t const /*max_context_length*/, int64_t const /*max_seq_len*/,
-    std::optional<int64_t> const /*attention_chunk_size*/, bool const use_kv_cache, bool const use_paged_context_fmha)
+    std::optional<int64_t> const /*attention_chunk_size*/, bool const use_kv_cache, bool const use_paged_context_fmha,
+    bool const use_trtllm_gen, bool const use_fmha_v2)
 {
     auto const sm = common::getSMVersion();
     if ((sm != 100 && sm != 103)
@@ -2370,23 +2356,25 @@ bool attention_supports_variable_window(c10::ScalarType const dtype, c10::Scalar
     cfg.quant_mode = common::QuantMode(static_cast<uint32_t>(quant_mode));
     cfg.paged_context_fmha = use_paged_context_fmha;
     cfg.use_variable_window = true;
-    // The phased runner's fixed configuration determines kernel availability.
-    static thread_local std::unordered_map<AttentionBase, bool> cache;
-    if (auto it = cache.find(cfg); it != cache.end())
+    // The phased runner's fixed configuration determines kernel availability, per library.
+    static thread_local std::unordered_map<AttentionBase, std::pair<bool, bool>> cache;
+    auto it = cache.find(cfg);
+    if (it == cache.end())
     {
-        return it->second;
+        std::pair<bool, bool> supported{false, false};
+        try
+        {
+            MHA op{cfg};
+            supported = {op.supportsVariableWindow(/*useTrtllmGen=*/true, /*useFmhaV2=*/false),
+                op.supportsVariableWindow(/*useTrtllmGen=*/false, /*useFmhaV2=*/true)};
+        }
+        catch (std::exception const& e)
+        {
+            TLLM_LOG_DEBUG("Variable-window FMHA probe rejected the configuration: %s", e.what());
+        }
+        it = cache.emplace(cfg, supported).first;
     }
-    bool supported = false;
-    try
-    {
-        MHA op{cfg};
-        supported = op.supportsVariableWindow();
-    }
-    catch (std::exception const& e)
-    {
-        TLLM_LOG_DEBUG("Variable-window FMHA probe rejected the configuration: %s", e.what());
-    }
-    return cache.emplace(cfg, supported).first->second;
+    return (use_trtllm_gen && it->second.first) || (use_fmha_v2 && it->second.second);
 }
 
 int64_t spec_dec_tree_custom_mask_capacity(

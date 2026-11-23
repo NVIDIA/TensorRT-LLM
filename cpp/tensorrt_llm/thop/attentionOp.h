@@ -148,7 +148,22 @@ struct KvCachePoolMapping
     int32_t layerIdxInCachePool{0};
 };
 
-KvCachePoolMapping readKvCachePoolMapping(at::Tensor const& hostKvCachePoolMapping, int64_t layerIdx);
+inline KvCachePoolMapping readKvCachePoolMapping(at::Tensor const& hostKvCachePoolMapping, int64_t const layerIdx)
+{
+    TORCH_CHECK(hostKvCachePoolMapping.device().is_cpu(), "host_kv_cache_pool_mapping must be a CPU tensor.");
+    TORCH_CHECK(hostKvCachePoolMapping.dim() == 2, "host_kv_cache_pool_mapping must be a 2D tensor.");
+    TORCH_CHECK(hostKvCachePoolMapping.size(1) >= 2, "host_kv_cache_pool_mapping must have at least two columns.");
+    TORCH_CHECK(layerIdx >= 0 && layerIdx < hostKvCachePoolMapping.size(0),
+        "host_kv_cache_pool_mapping layer index is out of bounds.");
+
+    auto const* data = hostKvCachePoolMapping.data_ptr<int32_t>();
+    auto const rowOffset = layerIdx * hostKvCachePoolMapping.stride(0);
+    auto const colStride = hostKvCachePoolMapping.stride(1);
+    KvCachePoolMapping mapping;
+    mapping.poolIndex = data[rowOffset];
+    mapping.layerIdxInCachePool = data[rowOffset + colStride];
+    return mapping;
+}
 
 namespace detail
 {
@@ -835,11 +850,13 @@ private:
     friend class SparseMlaFeature;
     friend bool attention_supports_nvfp4_output(std::int64_t num_heads, std::int64_t num_kv_heads,
         std::int64_t head_size, std::optional<std::int64_t> tokens_per_block, std::int64_t mask_type,
-        std::int64_t quant_mode, bool use_paged_context_fmha, bool is_mla_enable);
+        std::int64_t quant_mode, bool use_paged_context_fmha, bool is_mla_enable, bool use_trtllm_gen, bool use_fmha_v2,
+        bool use_xqa);
     friend bool attention_supports_variable_window(c10::ScalarType dtype, c10::ScalarType output_dtype,
         int64_t num_heads, int64_t num_kv_heads, int64_t head_size, std::optional<int64_t> tokens_per_block,
         int64_t quant_mode, int64_t max_num_requests, int64_t max_context_length, int64_t max_seq_len,
-        std::optional<int64_t> attention_chunk_size, bool use_kv_cache, bool use_paged_context_fmha);
+        std::optional<int64_t> attention_chunk_size, bool use_kv_cache, bool use_paged_context_fmha,
+        bool use_trtllm_gen, bool use_fmha_v2);
 };
 
 KvCachePoolPointers buildKvCachePoolPointers(at::Tensor const& hostKvCachePoolPointers, int32_t poolIndex,

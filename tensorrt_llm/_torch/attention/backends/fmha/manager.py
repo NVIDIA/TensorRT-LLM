@@ -591,31 +591,17 @@ class FmhaManager:
         context_fmha = None
         generation_fmha = None
         for fmha in self.fmha_libs:
-            if fmha.is_supported(q, k, v, metadata, forward_args):
+            if self._is_supported(fmha, q, k, v, metadata, forward_args):
                 return fmha
 
             if not isinstance(fmha, PhasedFmha):
                 continue
 
             if has_context and context_fmha is None:
-                if fmha.is_supported(
-                    q,
-                    k,
-                    v,
-                    metadata,
-                    forward_args,
-                    phase=FmhaPhase.CONTEXT,
-                ):
+                if self._is_supported(fmha, q, k, v, metadata, forward_args, FmhaPhase.CONTEXT):
                     context_fmha = fmha
             if has_generation and generation_fmha is None:
-                if fmha.is_supported(
-                    q,
-                    k,
-                    v,
-                    metadata,
-                    forward_args,
-                    phase=FmhaPhase.GENERATION,
-                ):
+                if self._is_supported(fmha, q, k, v, metadata, forward_args, FmhaPhase.GENERATION):
                     generation_fmha = fmha
 
             if has_context and context_fmha is None:
@@ -650,20 +636,38 @@ class FmhaManager:
             return None
 
         for fmha in self.fmha_libs:
-            if isinstance(fmha, PhasedFmha):
-                supported = fmha.is_supported(
-                    q,
-                    k,
-                    v,
-                    metadata,
-                    forward_args,
-                    phase=phase,
-                )
-            else:
-                supported = fmha.is_supported(q, k, v, metadata, forward_args)
-            if supported:
+            if self._is_supported(fmha, q, k, v, metadata, forward_args, phase):
                 return fmha
         return None
+
+    def _is_supported(
+        self,
+        fmha: Fmha,
+        q: torch.Tensor,
+        k: torch.Tensor | None,
+        v: torch.Tensor | None,
+        metadata: TrtllmAttentionMetadata,
+        forward_args: AttentionForwardArgs,
+        phase: FmhaPhase | None = None,
+    ) -> bool:
+        """Whether ``fmha`` serves the call, or its ``phase`` when it is phased.
+
+        XQA without an expected perf gain yields to a later library that serves the same call,
+        and keeps the call when none does.
+        """
+        if phase is not None and isinstance(fmha, PhasedFmha):
+            supported = fmha.is_supported(q, k, v, metadata, forward_args, phase=phase)
+        else:
+            supported = fmha.is_supported(q, k, v, metadata, forward_args)
+        if not supported or fmha is not self._xqa:
+            return supported
+        if self._xqa.has_perf_gain(q, k, v, metadata, forward_args):
+            return True
+        later_fmha_libs = self.fmha_libs[self.fmha_libs.index(fmha) + 1 :]
+        return not any(
+            self._is_supported(later, q, k, v, metadata, forward_args, phase)
+            for later in later_fmha_libs
+        )
 
 
 __all__ = ["FmhaManager", "generation_selection_cell"]

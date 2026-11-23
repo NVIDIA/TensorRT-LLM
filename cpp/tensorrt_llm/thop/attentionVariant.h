@@ -301,11 +301,11 @@ public:
     void enqueueContext(FmhaParams& p, PhasedFmha<MHA>& fmha);
     void enqueueGeneration(FmhaParams& p, PhasedFmha<MHA>& fmha);
 
-    /// Whether the fused context and generation kernels for this configuration exist;
-    /// builds the runners if they have not been built yet.
-    [[nodiscard]] bool supportsNvFp4Output();
-    /// Whether a variable-window context kernel exists for this configuration.
-    [[nodiscard]] bool supportsVariableWindow();
+    /// Whether the enabled libraries hold fused context and generation kernels for this
+    /// configuration; builds the runners if they have not been built yet.
+    [[nodiscard]] bool supportsNvFp4Output(bool useTrtllmGen, bool useFmhaV2, bool useXqa);
+    /// Whether an enabled library holds a variable-window context kernel for this configuration.
+    [[nodiscard]] bool supportsVariableWindow(bool useTrtllmGen, bool useFmhaV2);
 
     /// The op's own derived state, for debugging a dispatch decision.
     [[nodiscard]] std::string toString() const;

@@ -60,9 +60,13 @@ from ...pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
                       get_model_extra_attrs, helix_local_len_tensor)
 from ..kernels.sage_quant import SageQuantized, sage_quantize
+from .fmha.fallback import FallbackFmha
+from .fmha.fmha_v2 import FmhaV2Fmha
 from .fmha.fp4_mla import Fp4MlaFmha
 from .fmha.manager import FmhaManager
 from .fmha.registry import is_fmha_lib_enabled
+from .fmha.trtllm_gen import TrtllmGenFmha
+from .fmha.xqa import XqaFmha
 from .fp4_mla import (can_fuse_fp4_mla_q_quant, load_fp4_mla_chunked_kv_cache,
                       populate_helix_spec_buffers, scatter_fp4_mla_kv_cache)
 from .fp4_mla.state import Fp4MlaState
@@ -3838,6 +3842,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.rotary_inv_freq, self.rotary_cos_sin = (
                 self.rope_params.create_rope_const_params())
 
+    def _has_fmha_lib(self, fmha_cls: type) -> bool:
+        """Whether this layer enables ``fmha_cls``, alone or in the native fallback group."""
+        return any(
+            isinstance(fmha, (fmha_cls, FallbackFmha))
+            for fmha in self._fmha_manager.fmha_libs)
+
     def _is_nvfp4_output_kernel_available(
         self,
         *,
@@ -3863,6 +3873,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.quant_mode,
             use_paged_context_fmha,
             is_mla_enable,
+            self._has_fmha_lib(TrtllmGenFmha),
+            self._has_fmha_lib(FmhaV2Fmha),
+            self._has_fmha_lib(XqaFmha),
         )
 
     def out_head_size(self, is_gen_only: bool) -> int:
@@ -3901,6 +3914,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.attention_chunk_size,
             metadata.kv_cache_manager is not None,
             metadata.use_paged_context_fmha,
+            self._has_fmha_lib(TrtllmGenFmha),
+            self._has_fmha_lib(FmhaV2Fmha),
         )
 
     def create_output(self, q, *, is_quantize_output: bool,

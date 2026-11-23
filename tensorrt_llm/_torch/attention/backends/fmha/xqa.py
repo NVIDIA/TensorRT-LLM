@@ -94,7 +94,7 @@ class XqaFmha(PhasedFmha):
             serves_context=self.SERVES_CONTEXT,
             serves_generation=self.SERVES_GENERATION,
             is_supported=is_supported,
-        ) and self.has_perf_gain(q, k, v, metadata, forward_args)
+        )
 
     def has_perf_gain(
         self,
