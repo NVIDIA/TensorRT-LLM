@@ -256,7 +256,7 @@ index 4769d6b6a8c6009b22abf1850fb7f2df68216f8e..5ac63fcca05d8668e4367d0843c4c6d5
      q: torch.Tensor,
      paged_kv_cache: PagedKVCache,
 diff --git a/context.py b/context.py
-index 1c84d982574d7edf31e62eb4e8ebf8575b0b674d..9feef94adb43ba3e9f608952ddbd40ad570f906f 100644
+index 92904a9b22d119bd00aa6e8f95570fed02a7753b..3be474abc910f72c94786031367ef7a99afc6a48 100644
 --- a/context.py
 +++ b/context.py
 @@ -61,7 +61,7 @@ from .vc_attention import (
@@ -268,7 +268,7 @@ index 1c84d982574d7edf31e62eb4e8ebf8575b0b674d..9feef94adb43ba3e9f608952ddbd40ad
  from .decode import (
      _validate_native_hnd_tma_strides,
      prepare_lse,
-@@ -577,7 +577,7 @@ def _validate_device(device: torch.device) -> int:
+@@ -612,7 +612,7 @@ def _validate_device(device: torch.device) -> int:
      # Rubin runs through the sm_100f family target; a CuTe DSL older than 4.8
      # cannot emit for it unless CUTE_DSL_ARCH=sm_100f is set before import.
      if capability == (10, 7):
@@ -278,7 +278,7 @@ index 1c84d982574d7edf31e62eb4e8ebf8575b0b674d..9feef94adb43ba3e9f608952ddbd40ad
          require_cute_dsl_arch(device_index)
      return device_index
 diff --git a/decode.py b/decode.py
-index d8b009efc5a9224b4c81e3b7fd51bdb27ae1cc7c..1cdad28f48e3d54758735b3dc905335aa4b29886 100644
+index 1afff11570802991e7ffad85534341412fdb6d56..1ea64f1087440d6856be61bd430233b8db7aba15 100644
 --- a/decode.py
 +++ b/decode.py
 @@ -1,3 +1,4 @@
@@ -305,7 +305,7 @@ index d8b009efc5a9224b4c81e3b7fd51bdb27ae1cc7c..1cdad28f48e3d54758735b3dc905335a
  
  from . import _q_token_kv_block_sparse_policy as _sparse_policy
  from ._block_sparse.common import _num_sparse_pattern_heads
-@@ -805,7 +802,7 @@ def _validate_runtime_device(device: torch.device) -> None:
+@@ -809,7 +806,7 @@ def _validate_runtime_device(device: torch.device) -> None:
      # Rubin runs through the sm_100f family target; a CuTe DSL older than 4.8
      # cannot emit for it unless CUTE_DSL_ARCH=sm_100f is set before import.
      if capability == (10, 7):
@@ -314,7 +314,7 @@ index d8b009efc5a9224b4c81e3b7fd51bdb27ae1cc7c..1cdad28f48e3d54758735b3dc905335a
  
          require_cute_dsl_arch(device_index)
  
-@@ -4457,7 +4454,7 @@ class BatchDecodePagedTSWrapper:
+@@ -4480,7 +4477,7 @@ class BatchDecodePagedTSWrapper:
          # previous complete plan revision usable.
          self._plan_state = candidate
  
@@ -323,7 +323,7 @@ index d8b009efc5a9224b4c81e3b7fd51bdb27ae1cc7c..1cdad28f48e3d54758735b3dc905335a
      def run(
          self,
          q: torch.Tensor,
-@@ -4668,7 +4665,7 @@ class BatchDecodePagedTSWrapper:
+@@ -4691,7 +4688,7 @@ class BatchDecodePagedTSWrapper:
          return (result, lse) if return_lse else result
  
  
@@ -333,7 +333,7 @@ index d8b009efc5a9224b4c81e3b7fd51bdb27ae1cc7c..1cdad28f48e3d54758735b3dc905335a
      q: torch.Tensor,
      paged_kv_cache: PagedKVCache,
 diff --git a/kernels/fmha_context/fmha_resources.py b/kernels/fmha_context/fmha_resources.py
-index 17df005fcdb7bdd757e2dcd957b294d83b7cc41b..1b25383975ce5d5038748e57517819fd8317c22b 100644
+index c9811f30d5341adb16689ac4533147c36f75bbb9..ab6eb4052d28630329a0ec4a43577068543e0162 100644
 --- a/kernels/fmha_context/fmha_resources.py
 +++ b/kernels/fmha_context/fmha_resources.py
 @@ -1,3 +1,4 @@
@@ -341,7 +341,7 @@ index 17df005fcdb7bdd757e2dcd957b294d83b7cc41b..1b25383975ce5d5038748e57517819fd
  # Copyright (c) 2026 by FlashInfer team.
  #
  # Licensed under the Apache License, Version 2.0 (the "License");
-@@ -1454,8 +1455,6 @@ class GmemQKVResource(MemoryResource):
+@@ -1455,8 +1456,6 @@ class GmemQKVResource(MemoryResource):
                  if cutlass.const_expr(self.cfg.has_uniform_varlen):
                      seqlen_k = Int32(self.cfg.uniform_seq_len_k)
                  else:
@@ -350,7 +350,7 @@ index 17df005fcdb7bdd757e2dcd957b294d83b7cc41b..1b25383975ce5d5038748e57517819fd
                      seqlen_k = _load_runtime_seq_len_kv(
                          self.seqlens_kv, self.max_seq_len_kv, batch_coord
                      )
-@@ -1478,8 +1477,6 @@ class GmemQKVResource(MemoryResource):
+@@ -1479,8 +1478,6 @@ class GmemQKVResource(MemoryResource):
                      kv_request_begin = batch_coord * Int32(self.block_table_row_stride)
                      kv_page_idx_ub = Int32(self.cfg.max_num_pages_per_seq_kv - 1)
                  else:
@@ -359,7 +359,7 @@ index 17df005fcdb7bdd757e2dcd957b294d83b7cc41b..1b25383975ce5d5038748e57517819fd
                      kv_request_begin, kv_page_idx_ub = _load_block_table_row_bounds(
                          Int32(self.block_table_row_stride),
                          self.cfg,
-@@ -1566,13 +1563,9 @@ class GmemQKVResource(MemoryResource):
+@@ -1567,13 +1564,9 @@ class GmemQKVResource(MemoryResource):
              kv_request_begin = batch_coord * Int32(self.block_table_row_stride)
              kv_page_idx_ub = Int32(self.cfg.max_num_pages_per_seq_kv - 1)
          else:
@@ -373,7 +373,7 @@ index 17df005fcdb7bdd757e2dcd957b294d83b7cc41b..1b25383975ce5d5038748e57517819fd
              kv_request_begin, kv_page_idx_ub = _load_block_table_row_bounds(
                  Int32(self.block_table_row_stride),
                  self.cfg,
-@@ -7822,3 +7815,13 @@ class GmemOResource(MemoryResource):
+@@ -7855,3 +7848,13 @@ class GmemOResource(MemoryResource):
                  prims.cp_async_bulk_commit_group()
                  if cutlass.const_expr(self.cfg.gmem_o_store_wait_after_write):
                      prims.cp_async_bulk_wait_group(0, read=True)
@@ -388,7 +388,7 @@ index 17df005fcdb7bdd757e2dcd957b294d83b7cc41b..1b25383975ce5d5038748e57517819fd
 +    _load_runtime_seq_len_kv,
 +)
 diff --git a/kernels/fmha_decode/fmha_decode_resources/tmem_transformed_kv.py b/kernels/fmha_decode/fmha_decode_resources/tmem_transformed_kv.py
-index 6787e8ab5b566849ccc5ba228da220ed55898ea7..c11e9d211020c646a5a71cd309074d6bb70da119 100644
+index 2b3c72a304d0494a49fe633bc0ab0d46b31da891..b108140a12abfdd882b96f96fcf9aea15b1959f2 100644
 --- a/kernels/fmha_decode/fmha_decode_resources/tmem_transformed_kv.py
 +++ b/kernels/fmha_decode/fmha_decode_resources/tmem_transformed_kv.py
 @@ -1,3 +1,4 @@
@@ -396,17 +396,17 @@ index 6787e8ab5b566849ccc5ba228da220ed55898ea7..c11e9d211020c646a5a71cd309074d6b
  # Copyright (c) 2026 by FlashInfer team.
  #
  # Licensed under the Apache License, Version 2.0 (the "License");
-@@ -36,7 +37,7 @@ from cutlass.experimental.task_scheduling.resources import (
-     producer_work,
+@@ -37,7 +38,7 @@ from cutlass.experimental.task_scheduling.resources import (
  )
  
+ from ...task_compat import consumer_work_stage
 -from ......cute_dsl.availability import is_rubin_cute_dsl_available
 +from flashinfer.cute_dsl.availability import is_rubin_cute_dsl_available
  from ..fmha_decode_config import FmhaDecodeConfig
  from .helpers_common import (
      _TASK_CACHE_TMEM_BASE_OFFSET,
 diff --git a/kernels/mla_decode/helpers/nvfp4_kv.py b/kernels/mla_decode/helpers/nvfp4_kv.py
-index 8b2e8a43e5553ed33b67603273e0cc1fbd3585ae..fd3f735ede1f723f66d76f45a6490921ca77d3c3 100644
+index a6a4261ca8ad3aecf065f8a4c36fca327f307dbc..7b553b20c6d9c924a08db08235b0dbc531a389d6 100644
 --- a/kernels/mla_decode/helpers/nvfp4_kv.py
 +++ b/kernels/mla_decode/helpers/nvfp4_kv.py
 @@ -28,7 +28,7 @@ from cutlass.base_dsl.arch import Arch
@@ -419,7 +419,7 @@ index 8b2e8a43e5553ed33b67603273e0cc1fbd3585ae..fd3f735ede1f723f66d76f45a6490921
  from .gather import _address, gather4, select_gather_map
  from ...fmha_decode.fmha_decode_resources.tmem_transformed_kv import (
 diff --git a/kernels/mla_decode/throughput_latency_1cta/parallel_reduction.py b/kernels/mla_decode/throughput_latency_1cta/parallel_reduction.py
-index 0f953c00ed9a42f2eba63de8923bd3a21951245e..fd825a70072c597511d37230198964e2788a2af7 100644
+index 979ba5ad6f155e45c059e72f4f179f26b95d33a8..041ed4e908392b9cafe91ce5b18d5bd14aecb18b 100644
 --- a/kernels/mla_decode/throughput_latency_1cta/parallel_reduction.py
 +++ b/kernels/mla_decode/throughput_latency_1cta/parallel_reduction.py
 @@ -353,17 +353,17 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
@@ -444,11 +444,11 @@ index 0f953c00ed9a42f2eba63de8923bd3a21951245e..fd825a70072c597511d37230198964e2
  
      prims.barrier_cta_sync(
 diff --git a/mla_decode.py b/mla_decode.py
-index 94547ed86f7365df3638215daa0762ff1344741f..d0916ceffe0839ff9dd5c26fcf380a7bf4e50862 100644
+index 34fc8c46aae83960ea294d1a4b9cc46dfa2ba9a5..cdcfafc84ebf6eb58b9726bfe031ba46a4709706 100644
 --- a/mla_decode.py
 +++ b/mla_decode.py
 @@ -1,3 +1,4 @@
-+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
++# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  # Copyright (c) 2026 by FlashInfer team.
  #
  # Licensed under the Apache License, Version 2.0 (the "License");
@@ -466,7 +466,7 @@ index 94547ed86f7365df3638215daa0762ff1344741f..d0916ceffe0839ff9dd5c26fcf380a7b
  
  
  from .decode import (
-@@ -1196,8 +1193,34 @@ def _make_mla_decode_compile_spec(
+@@ -1260,8 +1257,34 @@ def _make_mla_decode_compile_spec(
  _cached_mla_decode_compile_spec = functools.cache(_make_mla_decode_compile_spec)
  
  
@@ -503,8 +503,8 @@ index 94547ed86f7365df3638215daa0762ff1344741f..d0916ceffe0839ff9dd5c26fcf380a7b
      compile_spec: _MLADecodeCompileSpec,
  ):
      """Compile and cache one batch-dynamic TS MLA topology."""
-@@ -1897,7 +1920,7 @@ class BatchMLADecodePagedTSWrapper:
-             softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
+@@ -2013,7 +2036,7 @@ class BatchMLADecodePagedTSWrapper:
+             zero_empty_rows=zero_empty_rows,
          )
  
 -    @flashinfer_experimental_api(trace=prims_ts_decode_mla_wrapper_trace_dispatch)
@@ -512,7 +512,7 @@ index 94547ed86f7365df3638215daa0762ff1344741f..d0916ceffe0839ff9dd5c26fcf380a7b
      def run(
          self,
          query: torch.Tensor,
-@@ -2013,7 +2036,7 @@ class BatchMLADecodePagedTSWrapper:
+@@ -2149,7 +2172,7 @@ class BatchMLADecodePagedTSWrapper:
          return (result, lse) if return_lse else result
  
  
@@ -521,7 +521,7 @@ index 94547ed86f7365df3638215daa0762ff1344741f..d0916ceffe0839ff9dd5c26fcf380a7b
  def batch_mla_decode_with_paged_kv_cache(
      query: torch.Tensor,
      kv_cache: torch.Tensor,
-@@ -2379,6 +2402,7 @@ def _prepare_sparse_output_quant(
+@@ -2542,6 +2565,7 @@ def _prepare_sparse_output_quant(
      )
  
  
@@ -529,7 +529,7 @@ index 94547ed86f7365df3638215daa0762ff1344741f..d0916ceffe0839ff9dd5c26fcf380a7b
  def _resolve_sparse_mla_plan(
      device,
      batch_size,
-@@ -2411,17 +2435,17 @@ def _resolve_sparse_mla_plan(
+@@ -2574,17 +2598,17 @@ def _resolve_sparse_mla_plan(
      affect geometry or workspace sizing.
      """
      import cutlass
@@ -551,7 +551,7 @@ index 94547ed86f7365df3638215daa0762ff1344741f..d0916ceffe0839ff9dd5c26fcf380a7b
          MlaDecodeTs,
      )
  
-@@ -2809,6 +2833,9 @@ def resolve_sparse_d576_reload_plan(
+@@ -2972,6 +2996,9 @@ def resolve_sparse_d576_reload_plan(
      return device, profile, spec, sections, byte_end, capacity, None
  
  
@@ -561,7 +561,7 @@ index 94547ed86f7365df3638215daa0762ff1344741f..d0916ceffe0839ff9dd5c26fcf380a7b
  class BatchSparseMLADecodePagedTSWrapper:
      """Plan native BF16/E4M3 attention, then bind one or two source index lists.
  
-@@ -2859,6 +2886,7 @@ class BatchSparseMLADecodePagedTSWrapper:
+@@ -3022,6 +3049,7 @@ class BatchSparseMLADecodePagedTSWrapper:
      def __init__(self, workspace_buffer=None):
          self._workspace_buffer = workspace_buffer
          self._state = None
@@ -569,7 +569,7 @@ index 94547ed86f7365df3638215daa0762ff1344741f..d0916ceffe0839ff9dd5c26fcf380a7b
          self.workspace_size_bytes = 0
  
      def plan(
-@@ -3041,6 +3069,7 @@ class BatchSparseMLADecodePagedTSWrapper:
+@@ -3204,6 +3232,7 @@ class BatchSparseMLADecodePagedTSWrapper:
                  kernel_signature=_mla_kernel_compile_signature(kernel),
              )
          compiled = _get_compiled_mla_decode(spec)
@@ -577,7 +577,7 @@ index 94547ed86f7365df3638215daa0762ff1344741f..d0916ceffe0839ff9dd5c26fcf380a7b
          self._state = dict(
              reload_d576=reload_d576,
              device=device,
-@@ -3276,6 +3305,49 @@ class BatchSparseMLADecodePagedTSWrapper:
+@@ -3439,6 +3468,49 @@ class BatchSparseMLADecodePagedTSWrapper:
          state = self._state
          if state is None:
              raise RuntimeError("plan() must be called before run()")
@@ -627,7 +627,7 @@ index 94547ed86f7365df3638215daa0762ff1344741f..d0916ceffe0839ff9dd5c26fcf380a7b
          _validate_query(
              query,
              packed_query=state["packed_query"],
-@@ -3344,15 +3416,6 @@ class BatchSparseMLADecodePagedTSWrapper:
+@@ -3507,15 +3579,6 @@ class BatchSparseMLADecodePagedTSWrapper:
              raise ValueError("attention_sinks must be contiguous CUDA FP32[H]")
          if validate and torch.isnan(attention_sinks).any().item():
              raise ValueError("attention_sinks must not contain NaN")
@@ -643,7 +643,7 @@ index 94547ed86f7365df3638215daa0762ff1344741f..d0916ceffe0839ff9dd5c26fcf380a7b
          if state["kv_cache_format"] != "fp8" and (
              isinstance(kv_cache_scale, torch.Tensor) or kv_cache_scale != 1.0
          ):
-@@ -3479,10 +3542,127 @@ class BatchSparseMLADecodePagedTSWrapper:
+@@ -3642,10 +3705,128 @@ class BatchSparseMLADecodePagedTSWrapper:
                  compiled=state["compiled"],
                  max_q_len=1,
              )
@@ -765,6 +765,7 @@ index 94547ed86f7365df3638215daa0762ff1344741f..d0916ceffe0839ff9dd5c26fcf380a7b
 +            bmm2,
 +            None,
 +            1,
++            0,
 +        )
 +        return out
 +
@@ -772,7 +773,7 @@ index 94547ed86f7365df3638215daa0762ff1344741f..d0916ceffe0839ff9dd5c26fcf380a7b
  def get_prims_ts_sparse_mla_decode_workspace_size(*plan_args, **plan_kwargs):
      """Return workspace bytes using the same arguments as wrapper.plan().
 diff --git a/q_token_kv_block_sparse_metadata.py b/q_token_kv_block_sparse_metadata.py
-index 8ca2ea99c7ccd323a1823df104b12a39de9bb25f..598d232c84cedae4bbb128f22d94c9421b654314 100644
+index 71a2c78067204c2eab2f3db0b7f4a7a62890c1a0..df026748317dba0c23fbb520285f1684b2c2d6a5 100644
 --- a/q_token_kv_block_sparse_metadata.py
 +++ b/q_token_kv_block_sparse_metadata.py
 @@ -1,3 +1,4 @@

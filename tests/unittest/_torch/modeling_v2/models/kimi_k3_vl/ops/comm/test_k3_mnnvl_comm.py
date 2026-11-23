@@ -15,7 +15,7 @@
 """The Kimi K3 decode collectives on the MNNVL all-reduce workspace, one process per GPU over the TP group of this
 run (4 on one GB200 tray), at every M in 1..8 and at 16, 32, 64 tokens:
   mv2_kimi_k3_vl::mnnvl_allreduce_attn_res (over the stock MNNVL all-reduce's workspace):
-    against the unfused path it replaces,
+    against the unfused path,
     the MNNVL all-reduce then trtllm::attn_res_add_rmsnorm_fwd (attn_res_rmsnorm_fwd without a prefix sum): the
     updated prefix sum bit for bit, the normed rows within 1e-2 (max |d| / max |ref|), both against an fp32 port of the
     attention-residual selection within 2e-2; 0, 1, 3, 8 and 11 snapshots, with and without the prefix; the reference

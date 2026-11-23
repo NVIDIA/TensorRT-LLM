@@ -49,6 +49,7 @@
       "patch_file": [
         "patches/deepgemm_configurable_barrier_timeout.patch",
         "patches/deepgemm_sm10x_family_target.patch",
+        "patches/deepgemm_paged_mqa_logits_page_mask.patch",
         "patches/deepgemm_mqa_logits_relu_fmax.patch",
         "patches/deepgemm_mega_mhc_tiled_sf.patch"
       ]
@@ -99,10 +100,15 @@
       "git_tag": "e2ebe7656649f619af0ad1d457b534283034655e",
       "git_submodules": "",
       "source_subdir": "dont-add-this-project-with-add-subdirectory",
-      "patch_file": [
-        "patches/msa_strided_paged_kv.patch",
-        "patches/msa_jit_device_arch.patch"
-      ]
+      "patch_file": "patches/msa_minimax_m3.patch"
+    },
+    {
+      "name": "msa_vllm",
+      "git_repository": "https://github.com/vllm-project/MSA.git",
+      "git_tag": "25c144700f727b638067e98066a60507081b63ad",
+      "git_submodules": "",
+      "source_subdir": "dont-add-this-project-with-add-subdirectory",
+      "patch_file": "patches/msa_vllm_minimax_m31.patch"
     },
     {
       "name": "nanobind",

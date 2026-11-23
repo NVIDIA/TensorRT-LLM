@@ -71,9 +71,16 @@
       "skip_when": {"sm": {"ne": 90}}
     },
     {
+      "decorator": "skip_no_sm100f",
+      "reason": "This test is for the SM100 family (SM100-SM109)",
+      "note": "Covers the cards below the family only: every operator must hold, so 'outside SM100-SM109' is no rule. A card past SM109 keeps the test and skips it at run time.",
+      "skip_when": {"sm": {"lt": 100}}
+    },
+    {
       "decorator": "skip_no_sm120",
       "reason": "This test is for SM120",
-      "skip_when": {"sm": {"ne": 120}}
+      "note": "Covers the cards below the SM120 family only: every operator must hold, so an upper-bound skip is left to runtime pytest.",
+      "skip_when": {"sm": {"lt": 120}}
     },
     {
       "decorator": "skip_device_contain_gb200",

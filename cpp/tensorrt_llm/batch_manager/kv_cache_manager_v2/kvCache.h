@@ -33,6 +33,7 @@
 #include "tensorrt_llm/executor/executor.h"
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <variant>
@@ -246,16 +247,15 @@ private:
     std::optional<std::vector<WeakPtr<CommittedPage>>> mPageRefs;
 };
 
-// Availability at the claimed prefix, indexed by LayerGroupId. OPTIONAL
-// candidates are held until the first successful resume or close.
-// Describes the initial prefix claim, not subsequent request progress.
+// Availability at a prefix claim or checkpoint, indexed by LayerGroupId.
+// Describes the initial selection, not subsequent request progress.
 struct ReuseGroupStatus
 {
     // Lifecycle group returned by getLayerGroupId(layerId), not a physical pool index.
     LayerGroupId groupId;
     // REQUIRED constrains the prefix match; OPTIONAL is selected at resume; PRIVATE is never reused.
     ReusePolicy policy;
-    // Exclusive token endpoint of the prefix claimed by REQUIRED groups, shared by all groups.
+    // Exclusive endpoint: latest available match, or the selected OPTIONAL match after resume.
     int endpoint;
     // All state needed by this group at endpoint is available; does not imply GPU residency or selection.
     // False for an empty prefix, PRIVATE groups, or missing/discarded OPTIONAL candidates.
@@ -263,6 +263,8 @@ struct ReuseGroupStatus
     // Retained token ranges [begin, end), including block-rounded SWA windows and sinks.
     // SSM uses (endpoint, endpoint) for its exact state; empty when complete is false.
     std::vector<std::pair<int, int>> coverage;
+    // Half-open ranges of selectable endpoints; REQUIRED has only [endpoint, endpoint + 1).
+    std::vector<HalfOpenRange<int>> endpointRanges;
 };
 
 // ---------------------------------------------------------------------------
@@ -288,10 +290,11 @@ public:
     // Priority callback: (blockOrdinal, lifeCycleId) → Priority.
     using PriorityCb = std::function<Priority(BlockOrdinal, LifeCycleId)>;
 
-    KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::optional<BlockRadixTree::ReuseMatch> reuseMatch,
-        std::optional<RequestIdType> id, PriorityCb priorityCb, std::optional<int> expectedPromptLength = std::nullopt,
-        std::optional<bool> textOnly = std::nullopt, bool enableRequestStats = false,
-        std::optional<executor::KvCacheRetentionConfig> retentionConfig = std::nullopt, bool isPrefetch = false);
+    KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::optional<LocalityDomainId> localityDomainId,
+        std::optional<BlockRadixTree::ReuseMatch> reuseMatch, std::optional<RequestIdType> id, PriorityCb priorityCb,
+        std::optional<int> expectedPromptLength = std::nullopt, std::optional<bool> textOnly = std::nullopt,
+        bool enableRequestStats = false, std::optional<executor::KvCacheRetentionConfig> retentionConfig = std::nullopt,
+        bool isPrefetch = false, int optionalReuseMaxBacktrack = 0);
 
     ~KvCache();
 
@@ -307,7 +310,8 @@ public:
     // Refused while the cache belongs to a Batch: locking pages writes through the bound
     // Span, which is the Batch's staged row, so a member is resumed before it joins.
     bool resume(std::optional<CUstream> stream = std::nullopt,
-        std::optional<std::vector<LifeCycleId>> optionalReuseGroups = std::nullopt);
+        std::optional<std::vector<LifeCycleId>> optionalReuseGroups = std::nullopt,
+        std::optional<std::map<LifeCycleId, int>> optionalReuseEndpoints = std::nullopt);
 
     // Suspend: detach from CUDA stream, unlock pages → PageHolder.
     //
@@ -339,9 +343,12 @@ public:
 
     // ---- Capacity / history ------------------------------------------------
 
-    // Resize capacity and/or history_length.
-    // Returns true on success, false when the resize ran out of pages and was rolled back.
-    bool resize(std::optional<int> capacity, std::optional<int> historyLength = std::nullopt);
+    //! Resize capacity and/or history length, preserving OPTIONAL recovery by default.
+    //! Set completeOptionalRecovery only after submitting all recovery KV accesses on the cache stream.
+    //! This reclaims stale recovery pages even at unchanged history length. Returns false on page
+    //! exhaustion, rolling back capacity, history, and recovery state together.
+    bool resize(std::optional<int> capacity, std::optional<int> historyLength = std::nullopt,
+        bool completeOptionalRecovery = false);
 
     // ---- Sparse history cache ----------------------------------------------
 
@@ -356,8 +363,9 @@ public:
     //! describes nothing. The smallest bound across sparse life cycles when several differ.
     [[nodiscard]] std::optional<int> maxInputLength() const;
 
-    // Convenience: set only capacity or history length.
+    // Convenience: set only capacity.
     void setCapacity(int capacity);
+    //! Convenience: set only history length. Pending OPTIONAL recovery requires an explicit resize().
     void setHistoryLength(int historyLength);
 
     // ---- Committing tokens -------------------------------------------------
@@ -533,6 +541,11 @@ public:
     ReuseScope const& reuseScope() const noexcept
     {
         return mReuseScope;
+    }
+
+    std::optional<LocalityDomainId> localityDomainId() const noexcept
+    {
+        return mLocalityDomainId;
     }
 
     // Plan dropping SWA blocks needed only by the next conversation turn.
@@ -760,7 +773,7 @@ private:
     };
 
     // Unlock stale SWA blocks. Returns backup holders for rollback.
-    std::vector<StaleBackup> _unlockStaleBlocks(int historyLength);
+    std::vector<StaleBackup> _unlockStaleBlocks(int historyLength, bool advanceGroupHistory = false);
 
     // Re-lock previously unlocked stale blocks (rollback on OOM).
     void _lockHeldBlocks(std::vector<StaleBackup> const& backup);
@@ -891,6 +904,7 @@ private:
 
     std::shared_ptr<KvCacheManager> mManager;
     ReuseScope mReuseScope;
+    std::optional<LocalityDomainId> mLocalityDomainId;
     PriorityCb mPriorityCb;
     std::optional<executor::KvCacheRetentionConfig> mRetentionConfig;
     std::vector<executor::RetentionPriorityAndDuration> mPromptRetentions;
@@ -919,6 +933,7 @@ private:
 
     TypedVec<BlockOrdinal, SeqBlock> mBlocks;
     std::vector<FuncGuard<std::function<void()>>> mPartialCopyRetentionHolds;
+    std::map<LifeCycleId, FuncGuard<std::function<void()>>> mOptionalPartialCopyRetentionHolds;
 
     std::vector<TokenIdExt> mCommittedTokens;
     // Initial current-residency provenance, observed before reused pages are held or promoted.
@@ -950,8 +965,13 @@ private:
     std::vector<ReuseGroupStatus> mReuseStatus;
     TypedVec<LifeCycleId, std::vector<std::pair<BlockOrdinal, SharedPtr<PageHolder>>>> mOptionalCandidates;
     std::vector<LifeCycleId> mSelectedOptionalGroups;
-    void _collectReuseCandidates();
-    void _selectOptionalGroups(std::vector<LifeCycleId> const& groups);
+    // Initial histories of selected OPTIONAL groups behind the REQUIRED prefix; -1 for other groups.
+    // Consumed by the ordinary post-forward history update, independently of the creation-time status.
+    TypedVec<LifeCycleId, int> mGroupHistoryLengths;
+    bool _recoversGroup(LifeCycleId lc) const;
+    void _collectReuseCandidates(
+        TypedVec<LifeCycleId, std::vector<HalfOpenRange<int>>> const& endpointRanges, int maxBacktrack);
+    void _selectOptionalGroups(std::map<LifeCycleId, int> const& endpoints);
     // PRIVATE and unselected OPTIONAL attention groups need fresh pages for the claimed prefix.
     bool _needsFreshPrefixPages(LifeCycleId lc) const;
 

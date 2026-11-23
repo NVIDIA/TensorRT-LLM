@@ -403,12 +403,30 @@ test directory, the layout is up to the target.
 | Tests | Location |
 |---|---|
 | Routing, loader and CI selection | `tests/unittest/_torch/modeling_v2/test_modeling_v2_*.py` |
-| Catalog operations | `tests/unittest/_torch/modeling_v2/<category>/` |
+| Catalog operations | `tests/unittest/_torch/modeling_v2/<category>/`; MoE op contracts in `moe/ops/` |
 | Family routing | `tests/unittest/_torch/modeling_v2/models/<family>/` |
 | Family-shared code | `tests/unittest/_torch/modeling_v2/models/<family>/<path of the code>/` |
 | Target code | `tests/unittest/_torch/modeling_v2/models/<family>/<target>/` |
 | Whole-model accuracy | `tests/integration/defs/accuracy/modeling_v2/<family>/<target>/` |
 | Accuracy references | `tests/integration/defs/accuracy/references/` |
+
+MoE-specific tests follow the modeling code's layout within their family or
+target. Tests that exercise a target configuration can stay with that target even
+when the op implementation is shared by the family. Shared MoE op contracts live
+in `moe/ops/`; shared MoE test helpers and their CPU guards live in `moe/`. These
+are test categories, rather than an extra `ops/` level in the production catalog.
+
+Target component layouts can currently mix `<category>/` and `ops/<category>/`:
+the MoE reorganization does not move unrelated component tests. Resolve existing
+tests by their collected entry file. New MoE op tests use the model's source-mirrored
+directory or shared `moe/ops/`, even when only a category-only test directory exists.
+Register a new test directory in CI with the required hardware, rank count and
+execution mode; path resolution alone does not register it. Other components can
+continue placing new entries in their existing component directories.
+Any later consolidation of a whole component must update its imports and CI lists
+together, preserving the existing hardware and rank requirements. Multi-rank
+collective tests belong with the target's communication tests so single-GPU MoE
+directory entries can collect all ordinary MoE tests.
 
 CI selects tests by the scope of the change:
 
@@ -419,6 +437,10 @@ CI selects tests by the scope of the change:
 * A change to a catalog operation runs its category's tests and the tests of
   every target that imports it. A change to code every model shares runs all
   Modeling V2 tests.
+
+Exact source-to-test associations retain additional named family and component
+checks outside these prefixes. See the [CBTS selection rules](../../../../jenkins/scripts/cbts/cbts/rules/README.md)
+for these associations and shared-helper selection.
 
 A target is a directory under `models/<family>/` whose class the family's
 `route` returns. Give each target a mirrored unit test directory and an

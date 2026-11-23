@@ -715,6 +715,11 @@ class WeightBuffer:
         """Number of remote prefetch slots."""
         return self._num_slots
 
+    @property
+    def page_pool(self) -> Optional[PagePool]:
+        """The prefetch page pool; None before it is created and after :meth:`release`."""
+        return self._page_pool
+
     def buffer_index_for_layer(self, layer_idx: int) -> int:
         """Prefetch slot of a MoE layer: its MoE order modulo ``num_slots``.
 

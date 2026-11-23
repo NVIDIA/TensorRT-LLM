@@ -1,6 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""ModelingV2 target: Qwen3.8-Flash-Next-NVFP4 (hf-fc694b5_orig) / sm_103 / default.
+"""ModelingV2 target: Qwen3.8-Flash-Next-NVFP4 / sm_103 / default.
+
+The loader retains FP8 or BF16 PLE storage and supports FP8 block-scaled or native
+NVFP4 draft experts. Native NVFP4 experts use their checkpoint scalars and local window.
 
 One target for the layouts `routing.py` admits in one node: one rank (tp1, every head and
 expert); at four ranks tp4 (attention TP4, routed experts split by intermediate), tep4
@@ -431,6 +434,7 @@ from tensorrt_llm.functional import AllReduceFusionOp
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
+from .. import ple_host_table as _ple_host
 from . import pool as _pool
 from . import vision as _vision
 from . import weights as _weights
@@ -652,7 +656,7 @@ _QSA_POSITION_AXES = _pool.QSA_POSITION_AXES
 _QSA_MROPE_SECTION = None
 # The draft experts' activation scales are fp32, not the UE8M0 power-of-two form.
 _MTP_MOE_USE_UE8M0 = False
-# Rows per draft FP8 runner call: its 128-expert windows are certified up to one 8192-row
+# Rows per draft expert runner call: the FP8 runner's windows are certified up to one 8192-row
 # chunk (`fp8_block_scale_moe_runner`). The rows an attention-DP group gathers (up to
 # its size times a rank's) run in chunks of it.
 _MTP_MOE_MAX_ROWS = 8192
@@ -837,19 +841,20 @@ _MTP_DENSE_FP8_MAX_ROWS = 16  # capacity: fixed: a dispatch threshold, at most f
 #: load the checkpoint's FP8 128x128 block-scaled experts are requantized (per-expert weight global
 #: scales, 16-element e4m3 block scales) into the trunk's layout and the FP8 copies are freed. The
 #: draft only proposes tokens, so this can change the acceptance length, not outputs. Certified at
-#: tp1; 0 (default): the FP8 block-scale runner.
+#: tp1; 0 (default) retains the checkpoint's FP8 or native NVFP4 format.
 _MTP_MOE_NVFP4_ENV = "TRTLLM_MODELING_V2_MTP_MOE_NVFP4"
 
 #: The NVFP4 draft MoE's two activation global scales are static, `448 * 6 / A` with `A` this factor
 #: times the largest calibrated amax of the trunk's routed experts (its `input_scale`s, FC1 input and
-#: FC2 input; the draft layer carries none). A global scale only has to keep the e4m3 block scales
+#: FC2 input; an FP8 draft carries none). Native NVFP4 uses its own checkpoint scales.
+#: A global scale only has to keep the e4m3 block scales
 #: inside their range, so the margin costs nothing until blocks are ~1e-3 of `A`.
 _MTP_MOE_NVFP4_FC1_MARGIN = 8.0
 _MTP_MOE_NVFP4_FC2_MARGIN = 4.0
 
 _PLE_HOST_OFFLOAD_ENV = "TRTLLM_MODELING_V2_PLE_HOST_OFFLOAD"
 
-#: The opt-in switches certified at tp1; every other layout runs the checkpoint's bf16 paths.
+#: The opt-in conversions certified at tp1; other layouts retain checkpoint formats.
 _ONE_RANK_SWITCHES = (
     _DENSE_FP8_ENV,
     _GDN_INPROJ_NVFP4_ENV,
@@ -905,12 +910,26 @@ def _moe_prefill_copy(one_rank: bool, trunk_moe_backend: str, max_num_tokens: in
     )
 
 
+def _ple_window(core):
+    """The n-gram gather's `row_window` for this rank's table (None: the whole table)."""
+    host = core._ple_table_host
+    return None if host is None else host.window
+
+
+def _ple_needs_sum(core) -> bool:
+    """Whether the gathered n-gram rows are this rank's share, summed over attention TP."""
+    host = core._ple_table_host
+    return host is not None and host.needs_sum
+
+
 def _ple_host_offload_enabled() -> bool:
     """Whether the n-gram table is declared in host memory (the default)."""
     return _switch(_PLE_HOST_OFFLOAD_ENV, default=True)
 
 
-def _moe_layer_scalars(w, i: int, start: int, count: int) -> dict[str, torch.Tensor]:
+def _moe_layer_scalars(
+    w, i: int, start: int, count: int, prefix: str = ""
+) -> dict[str, torch.Tensor]:
     """Layer `i`'s routed-expert scalars for the trtllm-gen runner over this rank's window
     `[start, start + count)`, built from the checkpoint's `input_scale` / `weight_scale_2`
     rows (declared over the whole routing space on every rank).
@@ -918,12 +937,13 @@ def _moe_layer_scalars(w, i: int, start: int, count: int) -> dict[str, torch.Ten
     The checkpoint stores modelopt reciprocals (`input_scale = 1 / g_act`, `weight_scale_2 =
     1 / g_w`), so a quantizer's global scale is `1 / input_scale` and the runner's scalars
     are products of the two."""
-    isc1, isc1_up = w[f"l{i}_e_isc1"], w[f"l{i}_e_isc1_up"]
+    parameter_prefix = f"l{i}_{prefix}"
+    isc1, isc1_up = w[f"{parameter_prefix}e_isc1"], w[f"{parameter_prefix}e_isc1_up"]
     assert torch.equal(isc1, isc1_up), (
         f"layer {i}: expert gate/up input_scale differ; the fused FC1 reads one activation "
         "quantization for both halves"
     )
-    assert torch.equal(w[f"l{i}_e_ws2_1"], w[f"l{i}_e_ws2_1_up"]), (
+    assert torch.equal(w[f"{parameter_prefix}e_ws2_1"], w[f"{parameter_prefix}e_ws2_1_up"]), (
         f"layer {i}: expert gate/up weight_scale_2 differ; the fused FC1 carries one alpha "
         "per expert for both halves"
     )
@@ -932,8 +952,8 @@ def _moe_layer_scalars(w, i: int, start: int, count: int) -> dict[str, torch.Ten
         f"layer {i}: the routed experts do not share one gate_proj.input_scale, so a single "
         "activation quantization cannot feed them all"
     )
-    e_isc2, ws2_2 = w[f"l{i}_e_isc2"], w[f"l{i}_e_ws2_2"]
-    gate1 = isc1 * w[f"l{i}_e_ws2_1"]
+    e_isc2, ws2_2 = w[f"{parameter_prefix}e_isc2"], w[f"{parameter_prefix}e_ws2_2"]
+    gate1 = isc1 * w[f"{parameter_prefix}e_ws2_1"]
     window = slice(start, start + count)
     return dict(
         # The routed FC1 activation global scale (one per layer).
@@ -1177,8 +1197,8 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         self.moe_prefill_copy = _moe_prefill_copy(
             self.one_rank, self.trunk_moe_backend, model_config.max_num_tokens
         )
-        # The draft experts' NVFP4 copy at one rank (`_mtp_moe_nvfp4`), built once: it frees
-        # the FP8 experts, and the shell's post-load walk reaches `post_load_weights` again.
+        # Cached native NVFP4 operands or the one-rank FP8 conversion, built once because
+        # the shell's post-load walk reaches `post_load_weights` again.
         self._mtp_moe_nvfp4 = None
         # The FP8 draft head at tp1, set by the shell's `post_load_weights` after this core's;
         # the post-load walk calls this core's `post_load_weights` again, which leaves it.
@@ -1192,8 +1212,14 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         self.ngram_vocab_divisor = cfg.make_ngram_vocab_size_divisible_by
         eos = cfg.eos_token_id
         self.eos_token_id = int(eos[0] if isinstance(eos, (list, tuple)) else eos)
-        self.ple_table_dtype = _weights.PLE_TABLE_DTYPE
         self.ple_host_offload = _ple_host_offload_enabled()
+        # How the host-resident table is stored (`ple_host_table`).
+        self.ple_host_mode = _ple_host.host_table_mode()
+        if self.ple_host_mode != _ple_host.RANK and not self.ple_host_offload:
+            logger.warning(
+                f"{_ple_host.PLE_HOST_TABLE_ENV}={self.ple_host_mode} applies to the host-resident "
+                f"n-gram table; {_PLE_HOST_OFFLOAD_ENV}=0 keeps one device copy per rank"
+            )
         _check_switches(self.one_rank)
         # CPU allocation behind the offloaded table; the `ple_table` parameter is a
         # device-address view that owns none of those pages.
@@ -1354,7 +1380,9 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         }
         # Reconcile the table height against the checkpoint's id-space tensors: an index past
         # the end is a device-side assert that poisons the process.
-        table_rows = w["ple_table"].shape[0]
+        # Rows of the whole table: under `server` storage `ple_table` holds only this rank's.
+        host = self._ple_table_host
+        table_rows = host.rows if host is not None else w["ple_table"].shape[0]
         used_rows = int(w["ple_offs"][-1]) + int(w["ple_vocab"][-1])
         assert used_rows <= table_rows, (
             f"the n-gram table has {table_rows} rows but its per-head offsets and vocabulary "
@@ -1379,6 +1407,12 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
                 else self._index_rope_table(self.mtp_theta, device)
             )
             self._mtp = _mtp_views(self)
+            if w[f"l{self.mtp_layer_idx}_mtp_fc1_w"].dtype == torch.uint8 or (
+                self.one_rank and device.type == "cuda" and _switch(_MTP_MOE_NVFP4_ENV)
+            ):
+                if self._mtp_moe_nvfp4 is None:
+                    self._mtp_moe_nvfp4 = _mtp_moe_nvfp4(self)
+                self._mtp = self._mtp._replace(**self._mtp_moe_nvfp4)
             self._build_draft_one_rank(device)
         if self.quant_mode in (QM_FP8_KV_CACHE, QM_NVFP4_KV_CACHE):
             # Built here, not at construction: that runs under meta init.
@@ -1418,8 +1452,8 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
 
     def _build_draft_one_rank(self, device) -> None:
         """At one rank the draft layer's operands for `DecodeTarget._mtp_layer`: the fused
-        `[q | k | v | gate | index | pad]` attention input (`weights._attn_in_w`), with
-        `_MTP_MOE_NVFP4_ENV` its routed experts in NVFP4, and with `_MTP_DENSE_FP8_ENV` the
+        `[q | k | v | gate | index | pad]` attention input (`weights._attn_in_w`), and with
+        `_MTP_DENSE_FP8_ENV` the
         packed FP8 copies of its dense projections; None / empty at every other layout."""
         self._mtp_attn_in = None
         self._mtp_gemv8 = {}
@@ -1433,10 +1467,6 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         self._mtp_attn_in = attn_in.t()
         if device.type != "cuda":
             return
-        if _switch(_MTP_MOE_NVFP4_ENV):
-            if self._mtp_moe_nvfp4 is None:
-                self._mtp_moe_nvfp4 = _mtp_moe_nvfp4(self)
-            self._mtp = self._mtp._replace(**self._mtp_moe_nvfp4)
         if _switch(_MTP_DENSE_FP8_ENV):
             self._mtp_gemv8 = {
                 "fc_e": pack_from_bf16(w[f"{p}fc_e"]),
@@ -1576,23 +1606,24 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         output-identical, so the pointer's memory kind read back from the driver is the
         signal that cannot be faked."""
         table = self.w["ple_table"]
-        kind = _weights.memory_kind(table.data_ptr())
-        expected = (
-            _weights.CUDA_MEMORY_TYPE_HOST
-            if self.ple_host_offload
-            else _weights.CUDA_MEMORY_TYPE_DEVICE
-        )
-        assert kind == expected, (
-            f"the n-gram table was declared with {_PLE_HOST_OFFLOAD_ENV}="
-            f"{'1' if self.ple_host_offload else '0'}, but the driver reports cudaMemoryType "
-            f"{kind} for the pointer the forward gathers from"
-        )
+        host = self._ple_table_host
+        if host is not None:
+            assert host.resident_on_host(), (
+                f"the n-gram table ({host.describe()}) was declared in host memory, but the "
+                "driver reports device memory for the pointer the forward gathers from"
+            )
+        else:
+            kind = _weights.memory_kind(table.data_ptr())
+            assert kind == _weights.CUDA_MEMORY_TYPE_DEVICE, (
+                f"the n-gram table was declared with {_PLE_HOST_OFFLOAD_ENV}=0, but the driver "
+                f"reports cudaMemoryType {kind} for the pointer the forward gathers from"
+            )
         mib = 1024.0 * 1024.0
         free, total = torch.cuda.mem_get_info()
         print(
             f"ple n-gram table: {tuple(table.shape)} {table.dtype}, "
             f"{table.numel() * table.element_size() / mib:.1f} MiB, "
-            f"{'HOST-resident (device-addressable)' if self.ple_host_offload else 'DEVICE-resident'}"
+            f"{f'HOST-resident ({host.describe()})' if host is not None else 'DEVICE-resident'}"
             f"; after load: allocated {torch.cuda.memory_allocated() / mib:.1f} MiB, "
             f"driver-used {(total - free) / mib:.1f} MiB of {total / mib:.1f} MiB",
             flush=True,
@@ -2220,8 +2251,8 @@ class _MtpWeights(NamedTuple):
     # The shared expert's gate|up rows and gate-logit row, row views of `sh_gug`.
     sh_gu: torch.Tensor
     sh_gate: torch.Tensor
-    # With `_MTP_MOE_NVFP4_ENV` (one rank), `fc1_w` .. `fc2_s` are the NVFP4 copy in the trunk's
-    # layout and these its activation global scale and the runner's three scalars.
+    # Native NVFP4 or the one-rank FP8 conversion: `fc1_w` .. `fc2_s` use the trunk's
+    # layout, with an activation global scale and the runner's three scalars.
     moe_gscale: torch.Tensor | None = None
     out1_scale: torch.Tensor | None = None
     out1_gate_scale: torch.Tensor | None = None
@@ -2607,10 +2638,10 @@ def _mtp_index_branch(core, M: _MtpWeights, mixed, draft: _DraftBound, qsa) -> t
 
 def _mtp_moe_block(core, M: _MtpWeights, x, pad_rows: int = 0, routed_only=False) -> torch.Tensor:
     """The draft layer's MoE: renormalized top-k over the whole routing space, the FP8
-    block-scale routed experts over this rank's window (1x128 activation scales, pre-routed),
+    block-scale or native NVFP4 routed experts over this rank's window,
     and the replicated bf16 shared expert in the trunk's form -- one GEMM forms gate|up and
     the per-token gate logit -- combined as `routed + sigmoid(gate logit) * shared`. The
-    activation scales come back transposed `[hidden / 128, tokens]` and go straight to the
+    FP8 activation scales come back transposed `[hidden / 128, tokens]` and go straight to the
     runner.
 
     The window's partial is completed as the trunk's is: under attention TP summed over the
@@ -2624,6 +2655,9 @@ def _mtp_moe_block(core, M: _MtpWeights, x, pad_rows: int = 0, routed_only=False
         parts = []
         for lo in range(0, rows.shape[0], _MTP_MOE_MAX_ROWS):
             chunk = rows[lo : lo + _MTP_MOE_MAX_ROWS]
+            if M.moe_gscale is not None:
+                parts.append(_mtp_routed_nvfp4(core, M, chunk))
+                continue
             logits = cublas_mm(chunk, M.router)
             topk_ids, topk_w = renorm_moe_routing_op(
                 logits, topk=core.topk, output_dtype=chunk.dtype
@@ -2657,10 +2691,7 @@ def _mtp_moe_block(core, M: _MtpWeights, x, pad_rows: int = 0, routed_only=False
             )
         return parts[0] if len(parts) == 1 else torch.cat(parts, 0)
 
-    if M.moe_gscale is not None:
-        # At one rank under `_MTP_MOE_NVFP4_ENV` the experts are their NVFP4 copy.
-        routed = _mtp_routed_nvfp4(core, M, x)
-    elif core.dp_size == 1:
+    if core.dp_size == 1:
         routed = core.tp_sum(run(x))
     else:
         routed = core.expert_sum(run, x, pad_rows)
@@ -2673,9 +2704,9 @@ def _mtp_moe_block(core, M: _MtpWeights, x, pad_rows: int = 0, routed_only=False
 
 
 def _mtp_routed_nvfp4(core, M: _MtpWeights, x) -> torch.Tensor:
-    """The draft layer's routed experts on their NVFP4 copy (`_mtp_moe_nvfp4`, one rank):
+    """The draft layer's local routed experts on NVFP4 operands (`_mtp_moe_nvfp4`):
     the activation quantized at the static FC1 input global scale, then the trunk's
-    logits-routed trtllm-gen runner over every expert, finalized."""
+    logits-routed trtllm-gen runner over this rank's expert window, finalized."""
     xq, xsf = fp4_quantize(x.contiguous(), M.moe_gscale, _SF_VEC, False, False)
     return fp4_block_scale_moe_renorm_routed(
         cublas_mm(x, M.router),
@@ -2691,12 +2722,15 @@ def _mtp_routed_nvfp4(core, M: _MtpWeights, x) -> torch.Tensor:
         core.num_experts,
         core.topk,
         core.moe_inter,
+        core.mtp_expert_offset,
+        core.mtp_local_experts,
     )
 
 
 def _mtp_moe_nvfp4(core) -> dict:
-    """The draft layer's routed experts requantized to NVFP4 (`_MTP_MOE_NVFP4_ENV`), as the
-    `_MtpWeights` fields `_mtp_routed_nvfp4` reads; frees the FP8 copies. The runner's scalars
+    """Native NVFP4 draft operands, or FP8 experts requantized to NVFP4, as the
+    `_MtpWeights` fields `_mtp_routed_nvfp4` reads. Only conversion frees the FP8 copies.
+    The native path uses checkpoint scalars. For conversion, the runner's scalars
     follow `_moe_layer_scalars` with `1 / g_in` and `1 / g_mid` standing for the checkpoint's
     `input_scale`s and `1 / g_w` for its `weight_scale_2`: `out1_gate = 1 / (g_in * g_w1[e])`,
     `out1 = out1_gate * g_mid`, `out2 = 1 / (g_mid * g_w2[e])`. The activation scales are static
@@ -2704,6 +2738,20 @@ def _mtp_moe_nvfp4(core) -> dict:
     w = core.w
     p = f"l{core.mtp_layer_idx}_mtp_"
     keys = [f"{p}{k}" for k in ("fc1_w", "fc1_s", "fc2_w", "fc2_s")]
+    if w[keys[0]].dtype == torch.uint8:
+        scalars = _moe_layer_scalars(
+            w, core.mtp_layer_idx, core.mtp_expert_offset, core.mtp_local_experts, prefix="mtp_"
+        )
+        return dict(
+            fc1_w=w[keys[0]],
+            fc1_s=w[keys[1]].view(torch.float8_e4m3fn),
+            fc2_w=w[keys[2]],
+            fc2_s=w[keys[3]].view(torch.float8_e4m3fn),
+            moe_gscale=scalars["global_scale"],
+            out1_scale=scalars["output1_scale_scalar"],
+            out1_gate_scale=scalars["output1_scale_gate_scalar"],
+            out2_scale=scalars["output2_scale_scalar"],
+        )
     fc1_w, fc1_s, fc2_w, fc2_s, g_w1, g_w2 = _weights.mtp_experts_to_nvfp4(*(w[k] for k in keys))
     for k in keys:
         w[k].data = w[k].data.new_empty(0)
@@ -4148,7 +4196,7 @@ class PrefillTarget:
 
         Per-request stateful: ids become one `ngram_size`-wide window per token
         (predecessors from the paged id history); each window hashes to one row per head;
-        rows gather fp8 vectors from one table (`ple_ngram_embed`); the key/value projections,
+        rows gather FP8 or BF16 vectors from one table (`ple_ngram_embed`); the key/value projections,
         the gate, a dilated depthwise short conv over a paged state, the residual add and the
         next site's grouped norm are `ple_gate_conv_inject_norm`. A sequence carrying nothing
         is seeded with `eos_token_id`.
@@ -4179,7 +4227,10 @@ class PrefillTarget:
             S.ple_offs,
             core.eos_token_id,
             num_tokens,
+            row_window=_ple_window(core),
         )
+        if _ple_needs_sum(core):
+            ngram = core.tp_sum(ngram)
         ple_gate_conv_inject_norm(
             hc[:num_tokens],
             cublas_mm(ngram, S.ple_key),
@@ -5564,8 +5615,8 @@ class DecodeTarget:
         return _draft_mm(out, M.o, core._mtp_gemv8.get("o"), gemm)
 
     def _mtp_moe(self, x) -> torch.Tensor:
-        """The draft layer's MoE at one rank: the FP8 block-scale routed experts (or with
-        `_MTP_MOE_NVFP4_ENV` the NVFP4 ones on the trunk's logits-routed runner) and the bf16
+        """The draft layer's MoE at one rank: FP8 block-scale or native NVFP4 routed experts
+        (FP8 can be converted with `_MTP_MOE_NVFP4_ENV`) and the bf16
         shared expert (its dense projections on `_draft_mm`), combined as `routed +
         sigmoid(gate logit) * shared`; the NVFP4 path runs the shared expert on the side
         stream."""
@@ -5863,7 +5914,10 @@ class DecodeTarget:
             S.ple_offs,
             core.eos_token_id,
             rows,
+            row_window=_ple_window(core),
         )
+        if _ple_needs_sum(core):
+            ngram = core.tp_sum(ngram)
         conv_input = torch.empty_like(hc) if stage else None
         out = ple_gate_conv_inject_norm(
             hc,
@@ -6828,6 +6882,8 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Default(
                 f"target implements { ({k: _TEXT_SETTINGS[k] for k in differs}) }"
             )
 
+        # Read here so a misspelled value fails before the build.
+        _ple_host.host_table_mode()
         mapping = model_config.mapping
         one_rank = mapping.world_size == 1
         spec = model_config.spec_config

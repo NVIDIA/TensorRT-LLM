@@ -194,6 +194,7 @@ def _run(tp_size: int) -> bool:
                 is_ragged_verify=False,
                 enable_penalty=False,
                 is_cuda_graph=False,
+                skip_verify_row_gather=False,
             )
             logits, vocab_sharded = SpecDecOneEngineForCausalLM._verify_logits(
                 model, hidden, attn_metadata, spec_metadata
