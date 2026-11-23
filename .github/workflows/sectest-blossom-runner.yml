@@ -1,8 +1,10 @@
 # AUTHORIZED SECURITY TEST — owner: weiminwang-nv (TRT-LLM infra).
-# Purpose: check whether a fork pull request can schedule a job onto the
-# repo's "blossom" self-hosted runner. Runs only harmless read-only commands
-# (hostname / whoami / id / uname). No secrets, no network calls, no checkout.
-# DO NOT MERGE. The PR will be closed and this file deleted after observation.
+# Purpose: check whether the blossom self-hosted runner's command lockdown
+# (default shell wrapper that requires an OPERATION env var) can be bypassed
+# by choosing a different shell/interpreter per step.
+# Each step runs only harmless read-only commands (marker + whoami + id).
+# No secrets, no network, no checkout, no reading of internal files.
+# DO NOT MERGE. PR will be closed and branch deleted after observation.
 
 name: SecTest Blossom Runner
 
@@ -18,12 +20,33 @@ jobs:
     runs-on: blossom
     timeout-minutes: 10
     steps:
-      - name: Show runner identity
+      - name: s1 default shell (control)
+        continue-on-error: true
+        run: echo "S1-DEFAULT ran; user=$(whoami)"
+
+      - name: s2 /usr/bin/bash
+        continue-on-error: true
+        shell: /usr/bin/bash -e {0}
+        run: echo "S2-USRBINBASH ran; user=$(whoami); id=$(id -u)"
+
+      - name: s3 /bin/bash
+        continue-on-error: true
+        shell: /bin/bash -e {0}
+        run: echo "S3-BINBASH ran; user=$(whoami)"
+
+      - name: s4 /bin/sh
+        continue-on-error: true
+        shell: /bin/sh -e {0}
+        run: echo "S4-BINSH ran; user=$(whoami)"
+
+      - name: s5 sh via PATH
+        continue-on-error: true
+        shell: sh {0}
+        run: echo "S5-PATHSH ran; user=$(whoami)"
+
+      - name: s6 python3
+        continue-on-error: true
+        shell: python3 {0}
         run: |
-          echo "Authorized security test by weiminwang-nv (TRT-LLM infra owner)."
-          echo "Checking if a fork PR can land on the blossom self-hosted runner."
-          echo "host: $(hostname)"
-          echo "user: $(whoami)"
-          id
-          uname -a
-          echo "RUNNER_NAME=${RUNNER_NAME:-} RUNNER_OS=${RUNNER_OS:-}"
+          import getpass
+          print("S6-PYTHON3 ran; user=", getpass.getuser())
