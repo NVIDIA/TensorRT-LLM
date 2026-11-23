@@ -60,7 +60,6 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     BufferConfig,
     DataRole,
     PageIndexMode,
-    PoolGroupDesc,
 )
 
 from .common import get_sparse_layer_ids
@@ -520,18 +519,37 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         num_total_slots = self._compute_num_total_slots()
         torch_dtype = self._torch_dtype_for_index_cache()
         device = torch.device("cuda")
+        # Resolve the zero-copy index-K views eagerly. The V2 pool geometry
+        # stays fixed for this manager's lifetime, but resolving it calls
+        # nanobind methods that Dynamo cannot trace from the fused FP8 indexer.
+        # Index-K has one head, so HND and NHD share the same physical
+        # token order even when the main K/V cache has multiple heads.
+        kv_layout = self._main_kv_view_layout
+        self._index_k_buffers: dict[int, Optional[torch.Tensor]] = {}
         self._index_v_buffers: dict[int, torch.Tensor] = {}
         for layer_idx in self.sparse_layer_ids:
-            if (
-                layer_idx in self.layer_offsets
-                and layer_idx not in self.disable_index_value_layer_ids
-            ):
+            if layer_idx not in self.layer_offsets:
+                continue
+            self._index_k_buffers[layer_idx] = super().get_index_k_buffer(
+                layer_idx,
+                num_heads=1,
+                head_dim=self.sparse_index_dim,
+                dtype=torch_dtype,
+                kv_layout=kv_layout,
+            )
+            if layer_idx not in self.disable_index_value_layer_ids:
                 self._index_v_buffers[layer_idx] = torch.zeros(
                     (num_total_slots, 1, self.sparse_index_dim),
                     dtype=torch_dtype,
                     device=device,
                 )
-        self._resolve_pool_views()
+        # Resolve the K/V and NVFP4 scale views once too: the forward fetches them every step.
+        for layer_idx in self.layer_offsets:
+            self._kv_buffers[layer_idx, kv_layout] = self.get_buffers(layer_idx, kv_layout)
+            if self.is_nvfp4_layer(layer_idx):
+                self._block_scale_buffers[layer_idx, kv_layout] = self.get_block_scale_buffers(
+                    layer_idx, kv_layout
+                )
         if _KV_POOL_ZERO_INIT:
             # The KV pools are written only at live slots, and readers that consume a whole block or page (the CSR
             # sparse prefill's V dequant, the full-context decode on a last page's tail) would turn uninitialized
@@ -545,39 +563,6 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             ):
                 if view is not None:
                     view.zero_()
-
-    def _resolve_pool_views(self) -> None:
-        """Resolve the zero-copy K/V, NVFP4 scale and index-K views for the current pool size.
-
-        The forward reads these cached views because resolving them calls nanobind methods that
-        Dynamo cannot trace from the fused FP8 indexer. Index-K has one head, so HND and NHD share
-        the same physical token order even when the main K/V cache has multiple heads.
-        """
-        kv_layout = self._main_kv_view_layout
-        self._index_k_buffers: dict[int, Optional[torch.Tensor]] = {}
-        for layer_idx in self.sparse_layer_ids:
-            if layer_idx in self.layer_offsets:
-                self._index_k_buffers[layer_idx] = super().get_index_k_buffer(
-                    layer_idx,
-                    num_heads=1,
-                    head_dim=self.sparse_index_dim,
-                    dtype=self._torch_dtype_for_index_cache(),
-                    kv_layout=kv_layout,
-                )
-        # get_buffers and get_block_scale_buffers return cached views, so drop them first.
-        self._kv_buffers.clear()
-        self._block_scale_buffers.clear()
-        for layer_idx in self.layer_offsets:
-            self._kv_buffers[layer_idx, kv_layout] = self.get_buffers(layer_idx, kv_layout)
-            if self.is_nvfp4_layer(layer_idx):
-                self._block_scale_buffers[layer_idx, kv_layout] = self.get_block_scale_buffers(
-                    layer_idx, kv_layout
-                )
-
-    def _on_gpu_pool_grown(self, grown: Sequence[Tuple[PoolGroupDesc, range]]) -> None:
-        """Zero the added slots and resolve the views for the larger pool."""
-        super()._on_gpu_pool_grown(grown)
-        self._resolve_pool_views()
 
     @staticmethod
     def main_kv_is_head_major(sparse_attention_config: Any, dtype: Optional[DataType]) -> bool:
