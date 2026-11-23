@@ -7,5 +7,5 @@ entries:
     benchmark: InferenceX
     model: nvidia/Qwen3.5-397B-A17B-NVFP4-V2
     hardware: GB300 NVL72
-    scenario: AgentX agentic coding, disaggregated serving
+    scenario: AgentX agentic coding, disaggregated serving with remote KV cache
     status: mainline
