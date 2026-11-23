@@ -40,7 +40,7 @@ _MISSING_AUTH_KEY_WARNING = (
 
 
 def get_internal_disagg_auth_fields() -> tuple[str, ...]:
-    return _INTERNAL_DISAGG_AUTH_FIELDS
+    return _INTERNAL_DISAGG_AUTH_FIELDS + ("multimodal_cache_salt",)
 
 
 def _warn_missing_auth_key() -> None:
@@ -67,9 +67,12 @@ def _auth_payload(request: UCompletionRequest) -> bytes:
         field_name: _canonical_ctx_info_endpoint(value)
         if field_name == "ctx_info_endpoint"
         else value
-        for field_name in get_internal_disagg_auth_fields()
+        for field_name in _INTERNAL_DISAGG_AUTH_FIELDS
         for value in [getattr(disaggregated_params, field_name)]
     }
+    # Preserve signatures from older routers when no salt was forwarded.
+    if disaggregated_params.multimodal_cache_salt is not None:
+        payload["multimodal_cache_salt"] = disaggregated_params.multimodal_cache_salt
     return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 

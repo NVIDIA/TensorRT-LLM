@@ -55,6 +55,8 @@ class DisaggregatedParams:
         multimodal_hashes (List[List[int]]): The multimodal hashes of each multimodal item in the request.
         multimodal_positions (List[int]): Prompt-token offset of each multimodal item.
         multimodal_lengths (List[int]): Prompt-token count of each multimodal item.
+        multimodal_cache_salt (str): The context request's effective cache salt
+         when its multimodal items have no prompt spans.
         multimodal_input_layout (MultimodalInputLayout): Exact encoder-side
          prompt and multimodal layout to preserve during E/P handoff.
     """
@@ -76,6 +78,7 @@ class DisaggregatedParams:
     remote_tail_start: Optional[int] = None
     multimodal_positions: Optional[List[int]] = None
     multimodal_lengths: Optional[List[int]] = None
+    multimodal_cache_salt: Optional[str] = None
     orig_elapsed_s: Optional[float] = None
 
     # E-P Disaggregated Params

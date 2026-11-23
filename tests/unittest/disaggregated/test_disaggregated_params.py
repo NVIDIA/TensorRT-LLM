@@ -112,6 +112,7 @@ def test_to_disaggregated_params():
     assert openai_params.ctx_dp_rank == 5
     assert openai_params.ctx_info_endpoint == "tcp://10.0.0.1:5000"
     assert openai_params.remote_tail_start == 128
+    assert "multimodal_cache_salt" not in openai_params.model_dump()
     assert openai_params.ctx_usage.prompt_tokens == 10
     assert openai_params.ctx_usage.prompt_tokens_details.cached_tokens == 4
 
@@ -178,6 +179,75 @@ def test_multimodal_spans_round_trip_through_openai_json():
     encoded = to_disaggregated_params(original).model_dump_json()
     restored = to_llm_disaggregated_params(OpenAIDisaggregatedParams.model_validate_json(encoded))
     assert restored == original
+
+
+@pytest.mark.parametrize("caller_salt", ["tenant/가", "가" * 80], ids=["caller", "long_caller"])
+def test_generation_reuses_context_block_keys_without_item_spans(caller_salt):
+    from tensorrt_llm.executor.request import GenerationRequest
+    from tensorrt_llm.executor.result import GenerationResult
+    from tensorrt_llm.inputs import prompt_inputs
+    from tensorrt_llm.inputs.multimodal import (
+        MULTIMODAL_CACHE_SALT_KEY,
+        MULTIMODAL_NO_CONTENT_HASHES_KEY,
+        MultimodalParams,
+        isolate_mm_request,
+    )
+    from tensorrt_llm.llmapi.llm import BaseLLM, PreprocessedInputs
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import ReuseScope, sequence_to_blockchain_keys
+    from tensorrt_llm.serve.openai_protocol import DisaggregatedParams as WireParams
+    from tensorrt_llm.serve.openai_protocol import (
+        to_disaggregated_params,
+        to_llm_disaggregated_params,
+    )
+
+    def submit(*args, **kwargs):
+        request = GenerationRequest(*args, **kwargs)
+        return GenerationResult(request, disaggregated_params=request.disaggregated_params)
+
+    llm = MagicMock()
+    llm._encode_only = llm.args.mm_encoder_only = llm.args.return_perf_metrics = False
+    llm._executor.is_shutdown.return_value = llm._is_encoder_decoder_model.return_value = False
+    llm._prepare_sampling_params.return_value = SamplingParams(max_tokens=4)
+    llm._prepare_prompt_inputs.side_effect = prompt_inputs
+    llm._preprocess.side_effect = lambda *args: BaseLLM._preprocess(llm, *args)
+    llm._executor.generate_async.side_effect = submit
+
+    data = {}
+    isolate_mm_request(data, "processor", ["audio"], "no item spans")
+    tokens = list(range(8))
+    context = BaseLLM.generate_async(
+        llm,
+        PreprocessedInputs(
+            prompt_token_ids=tokens, multimodal_params=MultimodalParams(multimodal_data=data)
+        ),
+        disaggregated_params=DisaggregatedParams(request_type="context_only"),
+        cache_salt=caller_salt,
+    )
+    encoded = to_disaggregated_params(context.disaggregated_params).model_dump_json()
+    handoff = to_llm_disaggregated_params(WireParams.model_validate_json(encoded))
+    handoff.request_type = "generation_only"
+
+    def block_keys(result):
+        request = result._generation_request
+        return [
+            key
+            for block, key in sequence_to_blockchain_keys(
+                4, ReuseScope(salt=request.cache_salt), request.prompt_token_ids
+            )
+            if block
+        ]
+
+    context_keys = block_keys(context)
+    assert len(context_keys) == 2
+    for overrides in ({}, {"cache_salt": caller_salt}):
+        generation = BaseLLM.generate_async(llm, tokens, disaggregated_params=handoff, **overrides)
+        assert block_keys(generation) == context_keys
+        gen_data = generation._generation_request.multimodal_params.multimodal_data
+        assert gen_data[MULTIMODAL_CACHE_SALT_KEY] == data[MULTIMODAL_CACHE_SALT_KEY]
+        assert gen_data[MULTIMODAL_NO_CONTENT_HASHES_KEY]
+    assert handoff.multimodal_cache_salt == context._generation_request.cache_salt
+    with pytest.raises(ValueError, match="cache_salt differs"):
+        BaseLLM.generate_async(llm, tokens, disaggregated_params=handoff, cache_salt="other")
 
 
 def test_embedding_handles_without_hashes_get_a_random_hash_each() -> None:
@@ -261,6 +331,7 @@ def test_context_only_response_carries_the_first_token_logprobs_and_logits():
         sampling_params=SamplingParams(max_tokens=4, logprobs=1, return_generation_logits=True),
     )
     result._disaggregated_params = DisaggregatedParams(
+        multimodal_cache_salt="context-salt",
         multimodal_embedding_handles=[{"tensor_size": [1, 16]}],
         multimodal_input_layout=MultimodalInputLayout(
             prompt_token_ids=[1, 2, 3],
@@ -307,6 +378,7 @@ def test_context_only_response_carries_the_first_token_logprobs_and_logits():
     assert params.request_type == "context_only"
     assert params.first_gen_tokens == [7]
     assert params.first_gen_log_probs == [first_token_logprob]
+    assert params.multimodal_cache_salt == "context-salt"
     assert params.multimodal_embedding_handles is None
     assert params.multimodal_input_layout is None
     assert params.mrope_position_ids_handle == {"tensor_size": [3, 1, 3]}

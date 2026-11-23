@@ -32,7 +32,9 @@ from transformers import PreTrainedTokenizerBase
 
 from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.checkpoint_format import CheckpointFormat
-from tensorrt_llm.inputs.multimodal import (MultimodalParams, has_mm_items,
+from tensorrt_llm.inputs.multimodal import (MULTIMODAL_CACHE_SALT_KEY,
+                                            MULTIMODAL_NO_CONTENT_HASHES_KEY,
+                                            MultimodalParams, has_mm_items,
                                             isolate_mm_request,
                                             request_cache_salt,
                                             validate_mm_uuids)
@@ -944,6 +946,34 @@ class BaseLLM:
                     DisaggregatedParams(request_type="context_and_generation"),
                     multimodal_input_layout=encoder_layout)
 
+        if is_gen_only and disaggregated_params.multimodal_cache_salt is not None:
+            context_salt = disaggregated_params.multimodal_cache_salt
+            # The random per-request suffix contains no slash. Restore the
+            # markers so retention and KV sharing also skip the generation leg.
+            if multimodal_params is None:
+                multimodal_params = MultimodalParams()
+            data = dict(multimodal_params.multimodal_data or {})
+            data[MULTIMODAL_CACHE_SALT_KEY] = context_salt.rsplit("/", 1)[-1]
+            data[MULTIMODAL_NO_CONTENT_HASHES_KEY] = True
+            multimodal_params = replace(multimodal_params,
+                                        multimodal_input=None,
+                                        multimodal_data=data)
+            if (cache_salt is not None
+                    and cache_salt != context_salt and request_cache_salt(
+                        cache_salt, multimodal_params) != context_salt):
+                raise ValueError(
+                    "cache_salt differs from the context request's cache salt")
+            cache_salt = context_salt
+        else:
+            cache_salt = request_cache_salt(cache_salt, multimodal_params)
+            if is_ctx_only:
+                context_salt = cache_salt if request_cache_salt(
+                    None, multimodal_params) is not None else None
+                if disaggregated_params.multimodal_cache_salt != context_salt:
+                    disaggregated_params = replace(
+                        disaggregated_params,
+                        multimodal_cache_salt=context_salt)
+
         arrival_time = steady_clock_now(
         ) if self.args.return_perf_metrics else None
 
@@ -966,7 +996,7 @@ class BaseLLM:
             multimodal_params=multimodal_params,
             scheduling_params=scheduling_params,
             conversation_params=conversation_params,
-            cache_salt=request_cache_salt(cache_salt, multimodal_params),
+            cache_salt=cache_salt,
             arrival_time=arrival_time,
             encoder_input_token_ids=encoder_input_token_ids,
             priority=priority,

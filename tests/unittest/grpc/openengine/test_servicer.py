@@ -395,6 +395,7 @@ def test_prefill_ready_round_trip_full_handoff() -> None:
         first_gen_tokens=[1],
         draft_tokens=[2, 3, 4],
         disagg_request_id=123456789012345,
+        multimodal_cache_salt="tenant/mm-no-item-spans-abc",
         schedule_style=DisaggScheduleStyle.GENERATION_FIRST,
         ctx_usage={"prompt_tokens": 5, "total_tokens": 6},
     )
@@ -406,6 +407,7 @@ def test_prefill_ready_round_trip_full_handoff() -> None:
 
     assert decoded.draft_tokens == [2, 3, 4]
     assert decoded.disagg_request_id == 123456789012345
+    assert decoded.multimodal_cache_salt == params.multimodal_cache_salt
     assert decoded.ctx_dp_rank == 0
     assert decoded.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
     assert decoded.ctx_usage == {"prompt_tokens": 5, "total_tokens": 6}

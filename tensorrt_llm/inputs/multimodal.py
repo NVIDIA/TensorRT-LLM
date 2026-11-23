@@ -1752,6 +1752,8 @@ def find_mm_token_lengths(
 # payload (e.g. mrope-only warmup on an mrope-enabled model) and the
 # check_mm_embed_cumsum_if_needed gate short-circuits.
 _MM_METADATA_ONLY_KEYS = frozenset({
+    MULTIMODAL_CACHE_SALT_KEY,
+    MULTIMODAL_NO_CONTENT_HASHES_KEY,
     "mrope_config",
     "multimodal_embed_mask_cumsum",
     "multimodal_embedding_metadata",

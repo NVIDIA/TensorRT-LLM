@@ -78,6 +78,7 @@ def test_protected_fields_come_from_protocol_metadata():
     assert set(get_internal_disagg_auth_fields()) == {
         "ctx_info_endpoint",
         "encoded_opaque_state",
+        "multimodal_cache_salt",
     }
 
 
@@ -167,6 +168,17 @@ def test_opaque_state_rejects_tampered_payload():
     headers = build_internal_disagg_auth_headers("secret", request)
     request.disaggregated_params.encoded_opaque_state = "dGFtcGVyZWQ="
 
+    with pytest.raises(ValueError, match="Invalid internal"):
+        validate_internal_disagg_request("secret", request, headers)
+
+
+def test_multimodal_cache_salt_is_authenticated():
+    request = _make_request()
+    request.disaggregated_params.multimodal_cache_salt = "first"
+    headers = build_internal_disagg_auth_headers("secret", request)
+    assert INTERNAL_DISAGG_AUTH_HEADER in headers
+    validate_internal_disagg_request("secret", request, headers)
+    request.disaggregated_params.multimodal_cache_salt = "second"
     with pytest.raises(ValueError, match="Invalid internal"):
         validate_internal_disagg_request("secret", request, headers)
 
