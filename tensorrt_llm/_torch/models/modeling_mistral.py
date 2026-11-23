@@ -749,6 +749,10 @@ class MistralNativeInputProcessor(MistralPixtralEncoderContract,
             f"tokenizer={type(self._tokenizer).__name__}")
 
     @property
+    def accepts_multimodal_inputs(self) -> bool:
+        return self._has_vision_encoder()
+
+    @property
     def config(self) -> PretrainedConfig:
         return self._config
 

@@ -30,6 +30,7 @@ from tensorrt_llm.inputs.multimodal import (
 from tensorrt_llm.inputs.multimodal_data import MEDIA_MODALITIES, AudioData, VideoData
 from tensorrt_llm.inputs.registry import (
     BaseMultimodalInputProcessor,
+    DefaultInputProcessor,
     create_input_processor_with_hash,
     maybe_compute_mm_embed_cumsum,
 )
@@ -1114,6 +1115,69 @@ def test_attached_embeddings_without_item_spans_get_a_cache_salt() -> None:
 
     assert all(salt.startswith("user/mm-no-item-spans-") for salt in submitted)
     assert submitted[0] != submitted[1]
+
+
+@pytest.mark.parametrize(
+    "method,inputs",
+    [
+        ("generate", {"prompt": "p", "multi_modal_data": {"image": [torch.zeros(3, 4, 4)]}}),
+        (
+            "preprocess",
+            {"prompt_token_ids": [1, 2], "multi_modal_data": {"image": [torch.zeros(3, 4, 4)]}},
+        ),
+        (
+            "generate_async",
+            {"prompt": "p", "multi_modal_embeddings": {"image": [torch.zeros(2, 4)]}},
+        ),
+        (
+            "encode",
+            {"prompt_token_ids": [1, 2], "multi_modal_data": {"image": [torch.zeros(3, 4, 4)]}},
+        ),
+    ],
+    ids=["generate", "preprocess", "generate_async", "encode"],
+)
+def test_text_only_model_rejects_multimodal_inputs(method: str, inputs: dict) -> None:
+    llm = _llm_with_mock_executor(DefaultInputProcessor("unused", None, Mock()))
+    llm.args.multimodal_config = None
+    if method == "encode":
+        llm._encode_only = True
+        llm._encoder_executor = Mock(max_batch_size=1, max_num_tokens=2, max_seq_len=2)
+        llm._encoder_executor.batch_forward.return_value = {"logits": torch.zeros(1)}
+    with pytest.raises(ValueError, match="supports text only"):
+        getattr(llm, method)(inputs)
+    llm._executor.generate_async.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "inputs",
+    [
+        {"prompt_token_ids": [1, 2], "multi_modal_data": {"image": [], "audio": None}},
+        {"prompt": "p", "multi_modal_embeddings": {}},
+    ],
+    ids=["token_ids", "text"],
+)
+def test_text_only_model_accepts_empty_multimodal_inputs(inputs: dict) -> None:
+    tokenizer = Mock()
+    tokenizer.encode.return_value = [1, 2]
+    llm = _llm_with_mock_executor(DefaultInputProcessor("unused", None, tokenizer))
+    llm.args.multimodal_config = None
+    result = llm.preprocess(inputs)
+    assert result.prompt_token_ids == [1, 2]
+    assert result.multimodal_params is None
+    assert "multi_modal_data" in inputs or "multi_modal_embeddings" in inputs
+
+
+def test_text_only_model_validates_uuids_for_empty_media() -> None:
+    llm = _llm_with_mock_executor(DefaultInputProcessor("unused", None, Mock()))
+    llm.args.multimodal_config = None
+    with pytest.raises(ValueError, match="UUID list length"):
+        llm.preprocess(
+            {
+                "prompt_token_ids": [1, 2],
+                "multi_modal_data": {"image": []},
+                "multi_modal_uuids": {"image": ["unused"]},
+            }
+        )
 
 
 _MM_SALT = "mm-no-item-spans-" + "0" * 32

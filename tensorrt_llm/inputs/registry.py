@@ -134,6 +134,8 @@ class InputProcessor(Protocol):
 class DefaultInputProcessor(InputProcessor):
     """Preprocess the inputs to the model."""
 
+    accepts_multimodal_inputs = False
+
     def __init__(self,
                  model_path,
                  config,

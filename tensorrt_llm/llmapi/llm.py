@@ -32,9 +32,10 @@ from transformers import PreTrainedTokenizerBase
 
 from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.checkpoint_format import CheckpointFormat
-from tensorrt_llm.inputs.multimodal import (MultimodalParams,
+from tensorrt_llm.inputs.multimodal import (MultimodalParams, has_mm_items,
                                             isolate_mm_request,
-                                            request_cache_salt)
+                                            request_cache_salt,
+                                            validate_mm_uuids)
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.kv_hints import KvHintsInput
 from tensorrt_llm.llmapi import tracing
@@ -56,8 +57,8 @@ from ..executor.postprocessor_hook import (PostProcessorHook,
 from ..executor.request import DEFAULT_REQUEST_PRIORITY
 from ..executor.utils import (RequestError, create_mpi_comm_session,
                               get_spawn_proxy_process_env)
-from ..inputs import (PromptInputs, TokensPrompt, create_input_processor,
-                      create_input_processor_with_hash,
+from ..inputs import (PromptInputs, TextPrompt, TokensPrompt,
+                      create_input_processor, create_input_processor_with_hash,
                       maybe_compute_mm_embed_cumsum, prompt_inputs)
 from ..logger import logger
 from ..sampling_params import LogitsProcessor, SamplingParams
@@ -687,6 +688,24 @@ class BaseLLM:
             return dict(inputs)
         return inputs
 
+    def _prepare_prompt_inputs(
+            self, inputs: PromptInputs) -> Union[TextPrompt, TokensPrompt]:
+        inputs = prompt_inputs(inputs)
+        if ("multi_modal_data" in inputs
+                or "multi_modal_embeddings" in inputs) and not getattr(
+                    self.input_processor, "accepts_multimodal_inputs", True):
+            mm_data = inputs.get("multi_modal_data") or {}
+            if has_mm_items(mm_data) or has_mm_items(
+                    inputs.get("multi_modal_embeddings")):
+                raise ValueError(
+                    "This model supports text only. Remove multi_modal_data "
+                    "and multi_modal_embeddings from the prompt.")
+            validate_mm_uuids(mm_data, inputs.get("multi_modal_uuids"))
+            inputs = inputs.copy()
+            inputs.pop("multi_modal_data", None)
+            inputs.pop("multi_modal_embeddings", None)
+        return inputs
+
     @classmethod
     def _normalize_token_ids(cls, token_ids: Any, name: str) -> List[int]:
         if cls._is_token_id_list(token_ids):
@@ -1001,7 +1020,7 @@ class BaseLLM:
                 f"The inputs must be type str or list of int, but got {type(inputs)}"
             )
 
-        inputs = prompt_inputs(inputs)
+        inputs = self._prepare_prompt_inputs(inputs)
 
         if "multi_item_part_lens" in inputs:
             raise ValueError(
@@ -1304,7 +1323,7 @@ class BaseLLM:
         sampling_params = SamplingParams(add_special_tokens=add_special_tokens)
         batch_multi_item_part_lens = []
         for inp in inputs:
-            inp = prompt_inputs(inp)
+            inp = self._prepare_prompt_inputs(inp)
             if "prompt_token_ids" in inp:
                 inp_tok = cast(TokensPrompt, inp)
                 multi_item_part_lens = inp_tok.get("multi_item_part_lens")
