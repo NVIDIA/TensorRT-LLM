@@ -34,12 +34,14 @@ from tensorrt_llm.bench.dataclasses.statistics import PercentileStats
 from tensorrt_llm.bench.tuning import heuristics
 from tensorrt_llm.bench.tuning import utils as tuning_utils
 from tensorrt_llm.bench.tuning.dataclasses import NemotronHybridConfig
+from tensorrt_llm.bench.tuning.settings import load_runtime_model_config
 from tensorrt_llm.bench.utils import VALID_QUANT_ALGOS
 from tensorrt_llm.bench.utils.data import (
     DatasetFormatError,
     create_dataset_from_stream,
     initialize_tokenizer,
 )
+from tensorrt_llm.executor.base_worker import BaseWorker
 from tensorrt_llm.llmapi import CudaGraphConfig
 from tensorrt_llm.llmapi.llm_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -254,6 +256,71 @@ def test_format_startup_metrics() -> None:
     assert "model_loader.checkpoint_loader_kind: HfCheckpointLoader\n" in output
     assert "model_loader.weight_loading.total_model_loading_seconds: 2.5000\n" in output
     assert ReportUtility._format_startup_metrics({}) == ""
+
+
+@pytest.mark.parametrize(
+    ("torch_dtype", "kv_algo", "quant_algo", "expected"),
+    [
+        (
+            torch.bfloat16,
+            QuantAlgo.NVFP4,
+            QuantAlgo.FP8_BLOCK_SCALES,
+            {
+                "dtype": "bfloat16",
+                "kv_cache_dtype": "NVFP4",
+                "quantization": "FP8_BLOCK_SCALES",
+            },
+        ),
+        (
+            torch.float16,
+            None,
+            None,
+            {"dtype": "float16", "kv_cache_dtype": None, "quantization": None},
+        ),
+    ],
+)
+def test_report_engine_config_from_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    torch_dtype: torch.dtype,
+    kv_algo: QuantAlgo | None,
+    quant_algo: QuantAlgo | None,
+    expected: dict[str, str | None],
+) -> None:
+    monkeypatch.setattr(ReportUtility, "_query_gpu_info", lambda _self: None)
+
+    worker = object.__new__(BaseWorker)
+    worker.doing_shutdown = True
+    worker.engine = SimpleNamespace(
+        model_engine=SimpleNamespace(
+            model=SimpleNamespace(
+                model_config=SimpleNamespace(
+                    torch_dtype=torch_dtype,
+                    quant_config=SimpleNamespace(
+                        kv_cache_quant_algo=kv_algo, quant_algo=quant_algo
+                    ),
+                )
+            )
+        )
+    )
+
+    keeper = StatsKeeper()
+    keeper.register_request_perf_item(_perf_item(0, num_out=4, decoding_iteration=3))
+    lengths = PercentileStats.from_iterable([8])
+    rt_cfg = _benchmark_runtime_config("pytorch")
+    rt_cfg.model = "nonexistent/checkpoint"
+    rt_cfg.mapping["world_size"] = 1
+    report = ReportUtility(
+        keeper,
+        DatasetMetadata(
+            isl_stats=lengths, osl_stats=lengths, seq_len_stats=lengths, num_requests=1
+        ),
+        rt_cfg,
+        mock.MagicMock(),
+        {},
+        engine_config=worker.get_engine_config(),
+    )
+    engine = report.get_statistics_dict()["engine"]
+    assert {k: engine[k] for k in expected} == expected
 
 
 def test_empty_stream_raises_dataset_format_error():
@@ -779,7 +846,16 @@ def _fp8_mistral_native_checkpoint(path, *, hf_config):
 
 
 def _engine_report(checkpoint, checkpoint_format):
-    """Return the engine section of the report of a one-request run on `checkpoint`."""
+    """Return the engine section of the report for a worker loaded from `checkpoint`."""
+    worker = object.__new__(BaseWorker)
+    worker.doing_shutdown = True
+    worker.engine = SimpleNamespace(
+        model_engine=SimpleNamespace(
+            model=SimpleNamespace(
+                model_config=load_runtime_model_config(checkpoint, checkpoint_format)
+            )
+        )
+    )
     keeper = StatsKeeper()
     keeper.register_request_perf_item(_perf_item(0, num_out=4, decoding_iteration=3))
     stats = PercentileStats.from_iterable([8])
@@ -794,7 +870,14 @@ def _engine_report(checkpoint, checkpoint_format):
         }
     )
     llm_args = {"kv_cache_config": {"dtype": "auto"}, "checkpoint_format": checkpoint_format}
-    report = ReportUtility(keeper, metadata, runtime_config, mock.Mock(), llm_args)
+    report = ReportUtility(
+        keeper,
+        metadata,
+        runtime_config,
+        mock.Mock(),
+        llm_args,
+        engine_config=worker.get_engine_config(),
+    )
     with mock.patch.object(ReportUtility, "_query_gpu_info", return_value=None):
         return report.get_statistics_dict()["engine"]
 
