@@ -2,15 +2,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """Scheduled encoder executor behaviour, driven through the members the worker calls.
 
-A fake runner answers each request with a row holding its request id. It writes into one
-reused output buffer, as a captured graph does, and can hold or fail a forward. The
-executor's queue, admission, batching, completion and delivery are real.
+A fake runner answers each request with a row holding its request id. As a pooling model it
+writes into one reused output buffer, as a captured graph does; as a multimodal encoder it
+returns one CPU embedding per request, which the completion exports through shared memory.
+It can hold or fail a forward. The executor's queue, admission, batching, completion and
+delivery are real.
 """
 
+import gc
 import re
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -20,12 +23,17 @@ import torch
 
 from tensorrt_llm._torch.pyexecutor import scheduled_encoder_executor
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
+from tensorrt_llm._torch.pyexecutor.llm_request import PyResult
 from tensorrt_llm._torch.pyexecutor.scheduled_encoder_executor import (
+    MultimodalEmbeddingCompletion,
+    PoolingCompletion,
     ScheduledEncoderExecutor,
     fit_batch,
 )
+from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm.bindings.executor import FinishReason, OutputConfig, Request, SamplingConfig
 from tensorrt_llm.executor.utils import is_context_length_exceeded_message
+from tensorrt_llm.llmapi.llm_args import SchedulerConfig, WaitingQueuePolicy
 from tensorrt_llm.mapping import Mapping
 
 WAIT = timedelta(seconds=30)
@@ -71,9 +79,11 @@ def test_fit_batch_charges_each_child_request_a_full_row():
 
 
 class _Runner:
-    """Answer each request with a row of its request id, through one reused output buffer."""
+    """Answer each request with a row of its request id."""
 
-    def __init__(self, max_batch_size: int):
+    def __init__(self, max_batch_size: int, multimodal: bool):
+        self.multimodal = multimodal
+        self.embedding_device = "cpu"
         self.output = torch.zeros(max_batch_size, WIDTH, device="cuda")
         self.batches: list[list[int]] = []
         self.errors: list[Exception] = []
@@ -114,6 +124,17 @@ class _Runner:
             self.staged.append(inputs.inputs_staged)
         if self.gpu_cycles:
             torch.cuda._sleep(self.gpu_cycles)
+        if self.multimodal:
+            return {
+                "mm_embeddings": [
+                    torch.full(
+                        (1, WIDTH), float(request.py_request_id), device=self.embedding_device
+                    )
+                    for request in requests
+                ],
+                "mm_embedding_request_indices": list(range(len(requests))),
+                "mm_embedding_lengths": [[1]] * len(requests),
+            }
         for row, request in enumerate(requests):
             self.output[row].fill_(request.py_request_id)
         return {"logits": self.output[: len(requests)]}
@@ -121,11 +142,22 @@ class _Runner:
 
 class _Harness:
     def __init__(
-        self, *, max_batch_size=4, max_num_tokens=64, max_seq_len=32, print_iter_log=False
+        self,
+        *,
+        completion="pooling",
+        max_batch_size=4,
+        max_num_tokens=64,
+        max_seq_len=32,
+        print_iter_log=False,
+        scheduler_config=None,
     ):
-        self.runner = _Runner(max_batch_size)
+        self.multimodal = multimodal = completion == "multimodal"
+        self.runner = _Runner(max_batch_size, multimodal)
         self.executor = ScheduledEncoderExecutor(
             self.runner,
+            completion=(
+                MultimodalEmbeddingCompletion(exports=True) if multimodal else PoolingCompletion()
+            ),
             model_loader=Mock(),
             llm_args=SimpleNamespace(
                 garbage_collection_gen0_threshold=20000,
@@ -133,6 +165,7 @@ class _Harness:
                 return_perf_metrics=False,
                 enable_iter_perf_stats=False,
                 print_iter_log=print_iter_log,
+                scheduler_config=scheduler_config or SchedulerConfig(),
             ),
             mapping=Mapping(),
             dist=SimpleNamespace(rank=0, world_size=1, has_pp=False, barrier=lambda: None),
@@ -146,7 +179,7 @@ class _Harness:
         self,
         num_tokens: int = 4,
         *,
-        context_logits: bool = True,
+        context_logits: bool | None = None,
         perf_metrics: bool = False,
         **attrs,
     ) -> int:
@@ -154,7 +187,9 @@ class _Harness:
             input_token_ids=list(range(1, num_tokens + 1)),
             max_tokens=1,
             output_config=OutputConfig(
-                return_context_logits=context_logits,
+                return_context_logits=(
+                    not self.multimodal if context_logits is None else context_logits
+                ),
                 exclude_input_from_output=True,
                 return_perf_metrics=perf_metrics,
             ),
@@ -176,6 +211,24 @@ class _Harness:
         assert response.result.is_final
         return response.result
 
+    def complete_after_the_loop_takes_the_cancellation(self, request_id: int) -> None:
+        """Hold each launched batch's completion until the loop has taken this cancellation."""
+        executor = self.executor
+        taken = threading.Event()
+        receive, cancel_launched = executor._receive, executor._cancel_launched
+
+        def receive_and_report():
+            receive()
+            if request_id in executor._cancelled_after_launch:
+                taken.set()
+
+        def cancel_once_taken(flight):
+            assert taken.wait(timeout=30)
+            return cancel_launched(flight)
+
+        executor._receive = receive_and_report
+        executor._cancel_launched = cancel_once_taken
+
     def shutdown(self) -> None:
         if not self.closed:
             self.closed = True
@@ -196,8 +249,13 @@ def _harness(**kwargs):
         h.shutdown()
 
 
-def test_batches_follow_the_budget_in_arrival_order():
-    with _harness(max_batch_size=2, max_num_tokens=64, max_seq_len=64) as h:
+@pytest.fixture(params=["pooling", "multimodal"])
+def completion(request):
+    return request.param
+
+
+def test_batches_follow_the_budget_in_arrival_order(completion):
+    with _harness(completion=completion, max_batch_size=2, max_num_tokens=64, max_seq_len=64) as h:
         ids = [h.submit(), h.submit(), h.submit(61), h.submit()]
         h.executor.start_worker()
 
@@ -219,6 +277,20 @@ def test_results_are_pooled_rows_with_no_tokens_and_reason_length():
         assert torch.equal(first.context_logits.cpu(), torch.full((1, WIDTH), float(pooled)))
         assert second.context_logits is None
         for result in (first, second):
+            assert result.output_token_ids == [[]]
+            assert result.finish_reasons == [FinishReason.LENGTH]
+
+
+def test_multimodal_results_are_exported_embeddings_with_no_tokens_and_reason_length():
+    with _harness(completion="multimodal", max_batch_size=2) as h:
+        ids = [h.submit(py_multimodal_data={"image": {}}) for _ in range(3)]
+        h.executor.start_worker()
+
+        for request_id in ids:
+            result = h.result(request_id)
+            (handle,) = result.mm_embedding_handles
+            embedding = SharedTensorContainer.from_dict(handle).get_local_view()
+            assert torch.equal(embedding, torch.full((1, WIDTH), float(request_id)))
             assert result.output_token_ids == [[]]
             assert result.finish_reasons == [FinishReason.LENGTH]
 
@@ -309,8 +381,73 @@ def test_inadmissible_requests_fail_alone():
         assert h.runner.batches == [[fitting]]
 
 
-def test_cancelling_a_queued_request_finishes_it_once_as_cancelled():
-    with _harness(max_batch_size=1) as h:
+@pytest.mark.parametrize(
+    ("max_seq_len", "max_num_tokens"), [(32, 64), (64, 32)], ids=["max_seq_len", "max_num_tokens"]
+)
+def test_a_multimodal_encoder_admits_multimodal_requests_and_fails_an_oversized_one_alone(
+    max_seq_len, max_num_tokens
+):
+    with _harness(
+        completion="multimodal", max_seq_len=max_seq_len, max_num_tokens=max_num_tokens
+    ) as h:
+        too_long = h.submit(33, py_multimodal_data={"image": {}})
+        fitting = h.submit(32, py_multimodal_data={"image": {}})
+        h.executor.start_worker()
+
+        (long_response,) = h.responses(too_long)
+        h.result(fitting)
+
+        assert is_context_length_exceeded_message(long_response.error_msg)
+        assert h.runner.batches == [[fitting]]
+
+
+@pytest.mark.parametrize("max_wait_s", [None, 60.0], ids=["priority", "aging"])
+def test_a_priority_queue_admits_the_higher_priority_request_first(max_wait_s):
+    with _harness(
+        max_batch_size=1,
+        scheduler_config=SchedulerConfig(
+            waiting_queue_policy=WaitingQueuePolicy.PRIORITY, waiting_queue_max_wait_s=max_wait_s
+        ),
+    ) as h:
+        h.runner.hold()
+        running = h.submit()
+        h.executor.start_worker()
+        assert h.runner.entered.wait(timeout=30)
+        low, high = h.submit(priority=0.1), h.submit(priority=0.9)
+        h.runner.release.set()
+
+        for request_id in (running, low, high):
+            h.result(request_id)
+        assert h.runner.batches == [[running], [high], [low]]
+
+
+def test_a_request_past_the_wait_cap_goes_ahead_of_a_higher_priority_one():
+    max_wait_s = 0.2
+    with _harness(
+        max_batch_size=1,
+        scheduler_config=SchedulerConfig(
+            waiting_queue_policy=WaitingQueuePolicy.PRIORITY, waiting_queue_max_wait_s=max_wait_s
+        ),
+    ) as h:
+        h.runner.hold()
+        running = h.submit()
+        h.executor.start_worker()
+        assert h.runner.entered.wait(timeout=30)
+        # Arrivals are stamped at enqueue, so the older request is past the cap when popped.
+        old = h.submit(priority=0.1)
+        time.sleep(2 * max_wait_s)
+        new = h.submit(priority=0.9)
+        h.runner.release.set()
+
+        for request_id in (running, old, new):
+            h.result(request_id)
+        assert h.runner.batches == [[running], [old], [new]]
+        # Admitted requests leave no bookkeeping behind in the queue.
+        assert not h.executor._waiting_queue._seq
+
+
+def test_cancelling_a_queued_request_finishes_it_once_as_cancelled(completion):
+    with _harness(completion=completion, max_batch_size=1) as h:
         h.runner.hold()
         running, queued = h.submit(), h.submit()
         h.executor.start_worker()
@@ -332,8 +469,185 @@ def test_cancelling_a_queued_request_finishes_it_once_as_cancelled():
         assert h.runner.batches == [[running], [later]]
 
 
-def test_a_survivable_forward_error_fails_only_its_batch():
-    with _harness(max_batch_size=1) as h:
+def test_cancelling_a_launched_request_finishes_it_once_as_cancelled(completion):
+    with _harness(completion=completion, max_batch_size=1) as h:
+        h.runner.hold()
+        launched, later = h.submit(), h.submit()
+        h.complete_after_the_loop_takes_the_cancellation(launched)
+        h.executor.start_worker()
+        assert h.runner.entered.wait(timeout=30)
+
+        h.executor.cancel_request(launched)
+        h.runner.release.set()
+
+        (cancelled,) = h.responses(launched)
+        assert cancelled.result.is_final
+        assert cancelled.result.finish_reasons == [FinishReason.CANCELLED]
+        assert cancelled.result.mm_embedding_handles is None
+        assert cancelled.result.context_logits is None
+        h.result(later)
+        assert h.responses(launched, NO_WAIT) == []
+        assert h.runner.batches == [[launched], [later]]
+
+
+def test_cancelling_a_launched_request_with_two_sequences_delivers_both_and_ends_with_the_last(
+    completion,
+):
+    with _harness(completion=completion) as h:
+        h.runner.hold()
+        launched = h.submit(sampling_config=SamplingConfig(num_return_sequences=2))
+        h.complete_after_the_loop_takes_the_cancellation(launched)
+        h.executor.start_worker()
+        assert h.runner.entered.wait(timeout=30)
+
+        h.executor.cancel_request(launched)
+        h.runner.release.set()
+
+        # The worker takes every response; a child's is stored under its own id.
+        responses = []
+        while len(responses) < 2 and (ready := h.executor.await_responses(timeout=WAIT)):
+            responses.extend(ready)
+        for response in responses:
+            response.result.deserialize()
+        assert [response.request_id for response in responses] == [launched, launched]
+        assert [response.result.sequence_index for response in responses] == [0, 1]
+        assert [response.result.is_final for response in responses] == [False, True]
+        for response in responses:
+            assert response.result.finish_reasons == [FinishReason.CANCELLED]
+
+
+def test_a_cancellation_sent_while_the_loop_waits_for_a_slot_still_cancels_a_launched_request(
+    completion,
+):
+    with _harness(completion=completion, max_batch_size=1) as h:
+        slots, waiting = h.executor._slots, threading.Event()
+
+        class Slots:
+            def acquire(self):
+                if not slots.acquire(blocking=False):
+                    waiting.set()
+                    slots.acquire()
+
+            def release(self):
+                slots.release()
+
+        h.executor._slots = Slots()
+        sent = threading.Event()
+        cancel_launched = h.executor._cancel_launched
+
+        def cancel_once_sent(flight):
+            assert sent.wait(timeout=30)
+            return cancel_launched(flight)
+
+        h.executor._cancel_launched = cancel_once_sent
+        first, second, third = h.submit(), h.submit(), h.submit()
+        h.executor.start_worker()
+        # Two batches are in flight, and the loop waits in the third launch, not in _receive.
+        assert waiting.wait(timeout=30)
+
+        h.executor.cancel_request(first)
+        sent.set()
+
+        (cancelled,) = h.responses(first)
+        assert cancelled.result.finish_reasons == [FinishReason.CANCELLED]
+        assert cancelled.result.mm_embedding_handles is None
+        assert cancelled.result.context_logits is None
+        h.result(second)
+        h.result(third)
+        assert h.runner.batches == [[first], [second], [third]]
+
+
+@pytest.mark.parametrize("rank, exports", [(0, True), (1, False)], ids=["rank_0", "tp_follower"])
+def test_only_rank_0_of_a_multimodal_encoder_exports(monkeypatch, rank, exports):
+    """A follower's responses reach no client, so its exports would pin each batch's memory."""
+    built = SimpleNamespace(
+        runner=_Runner(1, multimodal=True),
+        model_config=SimpleNamespace(is_generation=False),
+        model_loader=Mock(),
+        max_batch_size=1,
+        max_num_tokens=64,
+        max_seq_len=32,
+    )
+    monkeypatch.setattr(
+        scheduled_encoder_executor, "resolve_scheduled_encoder_args", lambda llm_args: llm_args
+    )
+    monkeypatch.setattr(
+        scheduled_encoder_executor,
+        "build_mm_encoder_runner",
+        lambda *args, **kwargs: nullcontext(built),
+    )
+    executor = ScheduledEncoderExecutor.create(
+        SimpleNamespace(
+            mm_encoder_only=True,
+            garbage_collection_gen0_threshold=20000,
+            batch_wait_timeout_ms=0,
+            return_perf_metrics=False,
+            enable_iter_perf_stats=False,
+            print_iter_log=False,
+            scheduler_config=SchedulerConfig(),
+        ),
+        model_path="",
+        checkpoint_loader=Mock(),
+        mapping=Mapping(world_size=2, rank=rank, tp_size=2),
+        dist=SimpleNamespace(rank=rank, world_size=2, has_pp=False, barrier=lambda: None),
+    )
+    request = SimpleNamespace(py_result=PyResult(prompt_len=1, max_new_tokens=1))
+
+    executor._completion.store(
+        [request],
+        {
+            "mm_embeddings": [torch.ones(1, WIDTH)],
+            "mm_embedding_request_indices": [0],
+            "mm_embedding_lengths": [[1]],
+        },
+    )
+
+    assert (request.py_result.mm_embedding_handles is not None) is exports
+    request.py_result.release_exports()
+
+
+def _cuda_memory_allocated() -> int:
+    gc.collect()
+    torch.cuda.synchronize()
+    torch.cuda.ipc_collect()
+    return torch.cuda.memory_allocated()
+
+
+@pytest.mark.parametrize("cause", ["cancelled", "failed"])
+def test_a_launched_request_whose_result_is_not_delivered_frees_its_exports(cause):
+    with _harness(completion="multimodal", max_batch_size=1) as h:
+        h.runner.embedding_device = "cuda"
+        if cause == "failed":
+
+            def fail_after_the_export(*args, **kwargs):
+                raise RuntimeError("bad step")
+
+            h.executor._perf_manager.append_step_metrics = fail_after_the_export
+        allocated = _cuda_memory_allocated()
+        h.runner.hold()
+        launched = h.submit(py_multimodal_data={"image": {}})
+        if cause == "cancelled":
+            h.complete_after_the_loop_takes_the_cancellation(launched)
+        h.executor.start_worker()
+        assert h.runner.entered.wait(timeout=30)
+        if cause == "cancelled":
+            h.executor.cancel_request(launched)
+        h.runner.release.set()
+
+        (response,) = h.responses(launched)
+        undelivered = (
+            response.result.finish_reasons == [FinishReason.CANCELLED]
+            if cause == "cancelled"
+            else response.error_msg == "bad step"
+        )
+        del response
+
+        assert _cuda_memory_allocated() == allocated
+        assert undelivered
+
+
+def test_a_survivable_forward_error_fails_only_its_batch(completion):
+    with _harness(completion=completion, max_batch_size=1) as h:
         h.runner.errors.append(RuntimeError("bad batch"))
         failed, later = h.submit(), h.submit()
         h.executor.start_worker()
@@ -354,8 +668,8 @@ def test_a_failed_forward_answers_a_request_with_children_once():
         assert (error.request_id, error.error_msg) == (failed, "bad batch")
 
 
-def test_a_fatal_forward_error_fails_everything_queued_and_shuts_down():
-    with _harness(max_batch_size=1) as h:
+def test_a_fatal_forward_error_fails_everything_queued_and_shuts_down(completion):
+    with _harness(completion=completion, max_batch_size=1) as h:
         h.runner.hold()
         h.runner.errors.append(RuntimeError("an illegal memory access was encountered"))
         running, waiting = h.submit(), h.submit()
@@ -411,8 +725,8 @@ def test_print_iter_log_logs_each_batch_with_its_size_and_tokens(monkeypatch):
     assert "host_step_time = " in line and "device_step_time = " in line
 
 
-def test_shutdown_runs_queued_requests_first():
-    with _harness(max_batch_size=1) as h:
+def test_shutdown_runs_queued_requests_first(completion):
+    with _harness(completion=completion, max_batch_size=1) as h:
         h.runner.hold()
         ids = [h.submit(), h.submit(), h.submit()]
         h.executor.start_worker()
