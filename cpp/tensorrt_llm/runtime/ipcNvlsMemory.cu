@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/nativeMemory.h"
 #include "tensorrt_llm/runtime/ipcNvlsMemory.h"
 #include "tensorrt_llm/runtime/ipcSocket.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
@@ -25,7 +26,9 @@
 #if ENABLE_MULTI_DEVICE
 #include "tensorrt_llm/common/nvmlWrapper.h"
 #endif
+#include <mutex>
 #include <unistd.h>
+#include <unordered_map>
 
 #define CUCHECK(cmd)                                                                                                   \
     do                                                                                                                 \
@@ -630,6 +633,54 @@ bool ipcNvlsFabricUsable()
 #endif
 }
 
+#if ENABLE_MULTI_DEVICE
+namespace
+{
+//! Native-memory records of NVLS allocations made inside a NativeMemoryLabelScope, by handle.
+struct NvlsNativeMemoryRecords
+{
+    std::mutex mutex;
+    std::unordered_map<IpcNvlsHandle const*, tensorrt_llm::common::NativeMemoryRecord> records;
+};
+
+//! Never destroyed: handles may be freed from static destructors.
+NvlsNativeMemoryRecords& nvlsNativeMemoryRecords()
+{
+    static auto* records = new NvlsNativeMemoryRecords();
+    return *records;
+}
+
+//! Record the local physical allocation behind `handle` (the unicast pages; the multicast object and peer mappings
+//! take none) under the caller's label, if one is in scope.
+void recordNvlsAllocation(IpcNvlsHandle const* handle)
+{
+    auto const* label = tensorrt_llm::common::currentNativeMemoryLabel();
+    int device = -1;
+    if (label == nullptr || handle == nullptr || cudaGetDevice(&device) != cudaSuccess)
+    {
+        return;
+    }
+    tensorrt_llm::common::NativeMemoryRecord const record{label, device, static_cast<std::int64_t>(handle->size)};
+    tensorrt_llm::common::recordNativeAllocation(record.label, record.device, record.bytes);
+    auto& state = nvlsNativeMemoryRecords();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    state.records[handle] = record;
+}
+
+void releaseNvlsAllocation(IpcNvlsHandle const* handle)
+{
+    auto& state = nvlsNativeMemoryRecords();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    auto const it = state.records.find(handle);
+    if (it != state.records.end())
+    {
+        tensorrt_llm::common::recordNativeRelease(it->second);
+        state.records.erase(it);
+    }
+}
+} // namespace
+#endif // ENABLE_MULTI_DEVICE
+
 IpcNvlsHandle* ipcNvlsAllocate(size_t size, std::set<int> group)
 {
     return ipcNvlsAllocate(size, std::move(group), nullptr);
@@ -692,6 +743,7 @@ IpcNvlsHandle* ipcNvlsAllocate(size_t size, std::set<int> group, std::shared_ptr
 
 #endif // ENABLE_NVSHMEM
 
+    recordNvlsAllocation(handle);
     return handle;
 #else
     TLLM_THROW("ipcNvlsAllocate needs to be compiled with ENABLE_MULTI_DEVICE");
@@ -705,6 +757,7 @@ void ipcNvlsFree(IpcNvlsHandle* handle)
     {
         return;
     }
+    releaseNvlsAllocation(handle);
 #if ENABLE_NVSHMEM
     nvshmem_free((void*) handle->uc_ptr);
 #else

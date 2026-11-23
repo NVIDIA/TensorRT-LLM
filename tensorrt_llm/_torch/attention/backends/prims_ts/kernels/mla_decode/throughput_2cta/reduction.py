@@ -19,6 +19,7 @@ import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64
 from cutlass.experimental import primitives as prims
 
+from ..helpers.context_parallel import local_kv_length
 from ..helpers.math import final_lse
 from .config import (
     REDUCTION_THREADS_PER_ROW,
@@ -57,6 +58,7 @@ def run_reduction_kernel(
     rows_per_cta: cutlass.Constexpr[int],
     split_divisor=None,
     runtime_seq_len_q=None,
+    cp_rank=0,
 ):
     """Combine consecutive logical split rows in one reference-reducer CTA.
 
@@ -141,7 +143,7 @@ def run_reduction_kernel(
     # Producer splits are sized from the group's largest K domain, while each
     # logical row consumes only the prefix containing its visible K tiles.
     tile_k = cache_seqs[batch_idx]
-    query_is_valid = query_is_valid & (tile_k > Int32(0))
+    query_is_valid = query_is_valid & (local_kv_length(cfg, tile_k, cp_rank) > Int32(0))
     tile_k = cute.math.max(tile_k, Int32(0))
     row_k = tile_k
     if cutlass.const_expr(
@@ -174,6 +176,8 @@ def run_reduction_kernel(
             logical_q_idx,
             logical_seq_len_q,
         )
+    tile_k = local_kv_length(cfg, tile_k, cp_rank)
+    row_k = local_kv_length(cfg, row_k, cp_rank)
     tile_k_tile_total = (tile_k + cfg.mma_qk_tiler[1] - 1) // cfg.mma_qk_tiler[1]
     row_k_tile_total = (row_k + cfg.mma_qk_tiler[1] - 1) // cfg.mma_qk_tiler[1]
     # A causal row consumes the prefix of configured-span ranges intersecting

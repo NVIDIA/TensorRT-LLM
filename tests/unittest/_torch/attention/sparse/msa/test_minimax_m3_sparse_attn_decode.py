@@ -1395,6 +1395,8 @@ def test_msa_jit_cache_tracks_sources_and_build_modes(
     monkeypatch.setattr(jit, "_FMHA_VARLEN_DIR", csrc)
     for name in ("GPU_TRACE", "SM_TIMING", "FMHA_GMEM_CHECK"):
         monkeypatch.delenv(name, raising=False)
+    # The OnlyScore proxy modes resolve from the device and name their own cache directories; pin the default ones.
+    monkeypatch.setattr(jit, "_proxy_modes_cache", (False, False))
     cache_root = tmp_path / "cache"
     monkeypatch.setenv("MINFER_FMHA_CACHE_DIR", str(cache_root))
     with caplog.at_level(logging.INFO, logger=jit.__name__):

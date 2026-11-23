@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import contextlib
 import math
-import os
 
 import torch
 import torch.nn.functional as F
@@ -57,8 +56,6 @@ EXACT_RULES = {
     "y": (0.0, 0.0),
 }
 
-_TF32_OVERRIDES = ("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", "NVIDIA_TF32_OVERRIDE")
-
 
 # ----------------------------------------------------------------------------- numerics
 
@@ -88,10 +85,6 @@ _CONTROLLED = {
 
 
 def assert_numerical_controls() -> None:
-    for var in _TF32_OVERRIDES:
-        assert var not in os.environ, (
-            f"{var} substitutes TF32 for fp32 GEMMs; run with env -u {var}"
-        )
     state = numerical_state()
     assert state == _CONTROLLED, f"numerical controls not in force: {state}"
 

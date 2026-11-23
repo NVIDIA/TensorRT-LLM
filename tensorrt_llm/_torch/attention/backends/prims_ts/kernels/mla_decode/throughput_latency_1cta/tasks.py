@@ -44,6 +44,7 @@ from ..helpers.schedule import (
     schedule_token_throttle_tail,
     work_tile_schedule_loop,
 )
+from ...task_compat import TaskCacheStageInfoMixin, runtime_domain_end
 from ..helpers.stage import MlaStage
 from ..helpers.tile import (
     runtime_split_count,
@@ -53,8 +54,14 @@ from ..helpers.tile import (
 )
 
 
-class MlaDecodeTask(Task):
+class MlaDecodeTask(TaskCacheStageInfoMixin, Task):
     """MLA decode task with cached thread state and Q-aware KV domain logic."""
+
+    # HEAD/TAIL work reads the K loop state from ``StageInfo``.
+    restore_loop_state_outside_loop = True
+    # ``_resolve_domain`` caches the KV length that ``make_task_cache`` reports,
+    # including for the short merged tasks whose loop bounds are static.
+    resolve_domain_every_tile = True
 
     def __init__(self, **kwargs):
         """Initialize MLA-specific task parameters and cached thread indices."""
@@ -62,6 +69,7 @@ class MlaDecodeTask(Task):
         self.runtime_split_kv = kwargs.pop("runtime_split_kv", None)
         self.seqlens_kv = kwargs.pop("seqlens_kv", None)
         self.cu_seqlens_q = kwargs.pop("cu_seqlens_q", None)
+        self.cp_rank = kwargs.pop("cp_rank", 0)
         self.domain_bias = kwargs.pop("domain_bias", 0)
         super().__init__(**kwargs)
         self._tmem_base_offset = Int32(0)
@@ -124,14 +132,18 @@ class MlaDecodeTask(Task):
             Int32(0),
         )
 
-    @cute.jit
     def get_domain(self, tile_coord):
         """Return the runtime loop domain for the current 1CTA work tile."""
+        return self._resolve_domain(tile_coord, self.domain)
+
+    @cute.jit
+    def _resolve_domain(self, tile_coord, static_domain):
+        """Resolve one tile's loop domain, falling back to the schedule's ``static_domain``."""
         if cutlass.const_expr(self.cfg is None):
-            return self.domain
+            return static_domain
         if cutlass.const_expr(self.seqlens_kv is None and self.cfg.seq_len_kv is None):
             # Padding and scheduler tasks have no K/V metadata or mainloop.
-            return self.domain
+            return static_domain
 
         # Persistent 1CTA coordinates combine batch and head tile in z;
         # non-persistent grids keep z as batch. cache_seqs remains batch-owned.
@@ -182,6 +194,7 @@ class MlaDecodeTask(Task):
             cta_idx_q,
             self.cu_seqlens_q,
             batch_idx,
+            cp_rank=self.cp_rank,
         )
         if cutlass.const_expr(self.cfg.fixed_sparse_kv_tiles > 0):
             return Int32(self.domain_bias)
@@ -268,7 +281,7 @@ def create_throughput_latency_softmax_task_impl(
                     local_sum_arr,
                     s_arr,
                 ) = work_tile_state
-            with domain_loop(0, domain, 1) as d:
+            with domain_loop(0, runtime_domain_end(domain), 1) as d:
                 tmem_s.wait()
                 (
                     old_max_arr,
@@ -642,7 +655,7 @@ def create_keeps_mma_ab_correction_task(
                     tail_o_stage_idx_1,
                 ) = work_tile_state
             local_state = load_initial_local_stats(local_state)
-            with domain_loop(0, domain, 1):
+            with domain_loop(0, runtime_domain_end(domain), 1):
                 (
                     local_state,
                     tail_o_stage_idx_0,
@@ -934,7 +947,7 @@ def create_throughput_latency_correction_task(
                     tmem_softmax_local1, local1_state
                 )
 
-            with domain_loop(0, domain, 1):
+            with domain_loop(0, runtime_domain_end(domain), 1):
                 (
                     local0_state,
                     tail_o_stage_idx_0,
@@ -1120,7 +1133,7 @@ def create_load_page_offsets_task(
                 page_offsets_produce(
                     smem_page_offsets, "load_k0", section=MlaStage.Head
                 )
-                with domain_loop(0, domain, 1):
+                with domain_loop(0, runtime_domain_end(domain), 1):
                     page_offsets_produce(
                         smem_page_offsets, "load_k0", section=MlaStage.Loop
                     )
@@ -1136,7 +1149,7 @@ def create_load_page_offsets_task(
                 page_offsets_produce(
                     smem_page_offsets, "load_k0", section=MlaStage.Head
                 )
-                with domain_loop(0, domain, 1):
+                with domain_loop(0, runtime_domain_end(domain), 1):
                     page_offsets_produce(
                         smem_page_offsets, "load_k1", section=MlaStage.Loop
                     )
@@ -1154,7 +1167,7 @@ def create_load_page_offsets_task(
                     smem_page_offsets, "load_k1", section=MlaStage.Head
                 )
 
-                with domain_loop(0, domain, 1):
+                with domain_loop(0, runtime_domain_end(domain), 1):
                     page_offsets_produce(
                         smem_page_offsets, "load_k0", section=MlaStage.Loop
                     )
@@ -1304,7 +1317,7 @@ def create_throughput_latency_load_task(
                     section=MlaStage.Head,
                     page_id_slot=0,
                 )
-                with domain_loop(0, domain, 1):
+                with domain_loop(0, runtime_domain_end(domain), 1):
                     load_kv(
                         head_dim_stages=cfg.qk_head_dim_stages,
                         producer_label="load_k1",
@@ -1338,7 +1351,7 @@ def create_throughput_latency_load_task(
                         page_id_slot=1,
                     )
 
-                with domain_loop(0, domain, 1):
+                with domain_loop(0, runtime_domain_end(domain), 1):
                     if cfg.single_kv_pipe:
                         load_kv(
                             head_dim_stages=cfg.qk_head_dim_stages,
@@ -1681,7 +1694,7 @@ def create_throughput_latency_mma_task(
                     consumer_label="k_desc_0",
                     release_k=False,
                 )
-                with domain_loop(0, domain, 1):
+                with domain_loop(0, runtime_domain_end(domain), 1):
                     staged_pv_mma(
                         smem_kv,
                         smem_p0,
@@ -1758,7 +1771,7 @@ def create_throughput_latency_mma_task(
                     consumer_label="k_desc_1",
                     release_k=not cfg.sparse_reuse_kv,
                 )
-                with domain_loop(0, domain, 1):
+                with domain_loop(0, runtime_domain_end(domain), 1):
                     tmem_s0.acquire()
                     staged_pv_mma(
                         smem_kv,
@@ -1936,7 +1949,7 @@ def create_single_kv_pipe_mma_task(
                 consumer_label="k_desc_0",
                 release_k=not cfg.sparse_reuse_kv,
             )
-            with domain_loop(0, domain, 1):
+            with domain_loop(0, runtime_domain_end(domain), 1):
                 if pv_before_qk:
                     pv_mma(
                         smem_kv,

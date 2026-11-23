@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Copyright (c) 2026 by FlashInfer team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -114,6 +114,9 @@ class _MLADecodeCompileSpec:
     write_final_lse: bool = True
     lse_mode: str = "none"
     scale_types: tuple[bool, bool, bool] = (False, False, False)
+    cp_world: int = 1
+    cp_interleave_size: int = 1
+    zero_empty_rows: bool = False
 
 
 @dataclass(frozen=True)
@@ -159,6 +162,9 @@ class _MLADecodePlanState:
     lse_mode: str = "none"
     softmax_scale: GlobalScale = 1.0
     output_scale: GlobalScale = 1.0
+    cp_world: int = 1
+    cp_interleave_size: int = 1
+    zero_empty_rows: bool = True
 
 
 @dataclass(frozen=True)
@@ -478,6 +484,9 @@ def _validate_mla_run_metadata(
     max_kv_len: int,
     page_size: int,
     mask_type: str,
+    cp_world: int = 1,
+    cp_interleave_size: int = 1,
+    cp_rank: int = 0,
 ) -> int:
     """Validate per-run request metadata against one static MLA plan.
 
@@ -533,15 +542,21 @@ def _validate_mla_run_metadata(
         q_lengths = (runtime_max_seq_len_q,) * batch_size
 
     seq_lens_host = tuple(int(value) for value in seq_lens_kv.tolist())
-    runtime_max_kv_len = max(seq_lens_host)
+    if cp_world > 1 and any(length < 0 for length in seq_lens_host):
+        raise ValueError("global runtime KV lengths must be nonnegative with CP")
+    local_lengths = tuple(
+        _mla_cp_local_length(length, cp_world, cp_interleave_size, cp_rank)
+        for length in seq_lens_host
+    )
+    runtime_max_kv_len = max(local_lengths)
     if runtime_max_kv_len > max_kv_len:
         raise ValueError(
-            "runtime KV metadata contains a request longer than "
+            "runtime KV metadata contains a local request longer than "
             f"max_kv_len ({max_kv_len}): got {runtime_max_kv_len}"
         )
     block_table_rows = block_tables.tolist()
     for request_idx, (row, seq_len) in enumerate(
-        zip(block_table_rows, seq_lens_host, strict=True)
+        zip(block_table_rows, local_lengths, strict=True)
     ):
         required_pages = _ceil_div(max(seq_len, 0), page_size)
         if any(
@@ -571,18 +586,19 @@ def _resolve_max_seq_len_q_alias(
     seq_len_q: Optional[int],
     max_q_len: Optional[int],
     default: Optional[int],
+    validate: bool = True,
 ) -> Optional[int]:
     """Resolve the legacy fixed-Q name and the explicit static-bound name."""
 
     legacy_bound = (
         _validate_positive_int(seq_len_q, "seq_len_q")
-        if seq_len_q is not None
-        else None
+        if validate and seq_len_q is not None
+        else seq_len_q
     )
     explicit_bound = (
         _validate_positive_int(max_q_len, "max_q_len")
-        if max_q_len is not None
-        else None
+        if validate and max_q_len is not None
+        else max_q_len
     )
     if (
         legacy_bound is not None
@@ -759,6 +775,39 @@ def _validate_out(
     _validate_16byte_alignment(out, "out")
 
 
+def _validate_mla_cp(cp_world: int, cp_interleave_size: int) -> None:
+    """Keep compile-time CP geometry safe even on the trusted launch path."""
+    for name, value in (
+        ("cp_world", cp_world),
+        ("cp_interleave_size", cp_interleave_size),
+    ):
+        if type(value) is not int:
+            raise TypeError(f"{name} must be an int")
+        if not 1 <= value <= _INT32_MAX:
+            raise ValueError(f"{name} must be in [1, {_INT32_MAX}]")
+    if cp_world * cp_interleave_size > _INT32_MAX:
+        raise ValueError("cp_world * cp_interleave_size must fit int32")
+
+
+def _validate_mla_cp_rank(cp_rank: int, cp_world: int) -> None:
+    if type(cp_rank) is not int:
+        raise TypeError("cp_rank must be an int")
+    if not 0 <= cp_rank < cp_world:
+        raise ValueError(f"cp_rank must be in [0, {cp_world})")
+
+
+def _mla_cp_local_length(
+    length: int, cp_world: int, cp_interleave_size: int, cp_rank: int
+) -> int:
+    """Map a global prefix to this rank's contiguous local KV prefix."""
+    if cp_world == 1:
+        return length
+    cycles, tail = divmod(max(length, 0), cp_world * cp_interleave_size)
+    return cycles * cp_interleave_size + min(
+        max(tail - cp_rank * cp_interleave_size, 0), cp_interleave_size
+    )
+
+
 def _check_softmax_rescale_threshold_log2_range(
     threshold: object, *, q_dtype: torch.dtype
 ) -> float:
@@ -833,6 +882,8 @@ def _resolve_mla_decode_launch_spec(
     mask_type: str,
     seq_len_q: int = 1,
     softmax_rescale_threshold_log2: float = 0.0,
+    cp_world: int = 1,
+    cp_interleave_size: int = 1,
 ):
     """Resolve and cache MLA policy/workspace without compiling."""
 
@@ -986,6 +1037,8 @@ def _resolve_mla_decode_launch_spec(
                 reduction_policy_splits=one_cta_split_kv,
                 explicit_persistent=None,
                 mask_type=mask_type,
+                cp_world=cp_world,
+                cp_interleave_size=cp_interleave_size,
                 softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
             )
             kernel.runtime_split_kv = True
@@ -1072,6 +1125,8 @@ def _resolve_mla_decode_launch_spec(
                 seq_len_q=seq_len_q,
                 batch_size=batch_size,
                 mask_type=mask_type,
+                cp_world=cp_world,
+                cp_interleave_size=cp_interleave_size,
                 softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
             )
             kernel._configure_parallel_reduction_topology(split_kv)
@@ -1160,12 +1215,18 @@ def _make_mla_decode_compile_spec(
     runtime_kv_lengths: bool = False,
     write_final_lse: bool = True,
     scale_types: tuple[bool, bool, bool] = (False, False, False),
+    cp_world: int = 1,
+    cp_interleave_size: int = 1,
+    zero_empty_rows: bool = True,
 ) -> _MLADecodeCompileSpec:
     """Keep policy resolution plan-specific and JIT identity batch-free."""
 
     kernel = copy.copy(launch_spec.kernel)
     kernel.lse_base_on_e = False
     kernel.runtime_kv_lengths = runtime_kv_lengths
+    kernel.cp_world = cp_world
+    kernel.cp_interleave_size = cp_interleave_size
+    kernel.zero_empty_rows = cp_world > 1 and zero_empty_rows
     return _MLADecodeCompileSpec(
         device_index=device_index,
         kernel_signature=_mla_kernel_compile_signature(kernel),
@@ -1185,6 +1246,9 @@ def _make_mla_decode_compile_spec(
         lse_mode=lse_mode,
         write_final_lse=write_final_lse,
         scale_types=scale_types,
+        cp_world=cp_world,
+        cp_interleave_size=cp_interleave_size,
+        zero_empty_rows=kernel.zero_empty_rows,
     )
 
 
@@ -1422,8 +1486,9 @@ def _compile_mla_decode(
                 fake_scale(compile_spec.scale_types[0]),
                 fake_scale(compile_spec.scale_types[1]),
                 stream_fake,
-                output_quant_args=output_quant_args,
-                max_q_len=cutlass.Int32(0),
+                output_quant_args,
+                cutlass.Int32(0),
+                cutlass.Int32(0),
                 options=_COMPILE_OPTIONS,
             )
 
@@ -1454,43 +1519,63 @@ def get_prims_ts_batch_mla_decode_workspace_size(
     out_dtype: torch.dtype = torch.bfloat16,
     mask_type: Literal["dense", "causal"] = "causal",
     device=None,
+    cp_world: int = 1,
+    cp_interleave_size: int = 1,
+    validate: bool = True,
 ) -> int:
     """Return caller-workspace bytes for one automatic MLA policy.
 
     The arguments define the static geometry used to resolve the same automatic
     policy and private scratch layout as
-    :func:`batch_mla_decode_with_paged_kv_cache`, without compiling a kernel.
+    :func:`batch_mla_decode_with_paged_kv_cache`, without compiling attention kernels.
     ``max_q_len`` is the static per-request Q bound for both fixed and
     packed-query launches;
     ``seq_len_q`` remains a backward-compatible fixed-Q alias. If neither is
     supplied, the bound is one. The returned byte count covers split-KV
     scratch. Optional final LSE uses a separate caller-owned output. Allocate
-    a contiguous ``torch.int8`` or ``torch.uint8`` CUDA buffer; MLA does not require its
-    contents to be initialized before first use.
+    with the same ``cp_world`` and ``cp_interleave_size`` as the plan. CP adds
+    no scratch. Use a contiguous ``torch.int8`` or ``torch.uint8`` CUDA buffer;
+    MLA does not require its contents to be initialized before first use.
+    ``max_kv_len`` is rank-local capacity, not the global request length.
+
+    ``validate=False`` skips repeated input/device validation. The caller must
+    ensure supported hardware, valid geometry and dtypes, and a static Q bound
+    covering every request. Alias and device resolution are retained, as is
+    the shared automatic-policy cache; a cold policy lookup may still query
+    device properties or compile a hardware occupancy probe. Warm up outside
+    CUDA graph capture.
     """
 
-    batch_size = _validate_positive_int(batch_size, "batch_size")
-    num_qo_heads = _validate_positive_int(num_qo_heads, "num_qo_heads")
-    _validate_mla_dims(kv_lora_rank, qk_rope_head_dim)
-    page_size = _validate_page_size(page_size)
-    max_kv_len = _validate_mla_max_kv_len(max_kv_len, "max_kv_len")
+    if not isinstance(validate, bool):
+        raise TypeError("validate must be a bool")
+    _validate_mla_cp(cp_world, cp_interleave_size)
+    if validate:
+        batch_size = _validate_positive_int(batch_size, "batch_size")
+        num_qo_heads = _validate_positive_int(num_qo_heads, "num_qo_heads")
+        _validate_mla_dims(kv_lora_rank, qk_rope_head_dim)
+        page_size = _validate_page_size(page_size)
+        max_kv_len = _validate_mla_max_kv_len(max_kv_len, "max_kv_len")
     max_q_len = _resolve_max_seq_len_q_alias(
         seq_len_q=seq_len_q,
         max_q_len=max_q_len,
         default=1,
+        validate=validate,
     )
     assert max_q_len is not None
-    _validate_mla_query_head_extent(
-        batch_size=batch_size,
-        num_qo_heads=num_qo_heads,
-        max_q_len=max_q_len,
-    )
-    _validate_mask(mask_type)
+    if validate:
+        _validate_mla_query_head_extent(
+            batch_size=batch_size,
+            num_qo_heads=num_qo_heads,
+            max_q_len=max_q_len,
+        )
+        _validate_mask(mask_type)
     if kv_dtype is None:
         kv_dtype = q_dtype
-    _validate_mla_dtype_pair(q_dtype, kv_dtype, out_dtype)
+    if validate:
+        _validate_mla_dtype_pair(q_dtype, kv_dtype, out_dtype)
     resolved_device, device_index = _resolve_cuda_device(device)
-    _validate_runtime_device(resolved_device)
+    if validate:
+        _validate_runtime_device(resolved_device)
 
     spec = _resolve_mla_decode_launch_spec(
         device_index,
@@ -1508,14 +1593,11 @@ def get_prims_ts_batch_mla_decode_workspace_size(
         # The skip-correction threshold does not change the workspace; pass the default
         # positionally so a default plan() hits the same cached spec.
         0.0,
+        cp_world,
+        cp_interleave_size,
     )
-    return _make_mla_workspace_layout(
-        spec.kernel_workspace_bytes,
-        batch_size,
-        num_qo_heads,
-        max_q_len,
-        include_lse=False,
-    ).total_bytes
+    # No final LSE section is needed; only the kernel scratch alignment remains.
+    return _align_up(spec.kernel_workspace_bytes)
 
 
 def _prepare_mla_runtime(
@@ -1625,6 +1707,7 @@ def _launch_mla_decode(
     compiled: Callable[..., object],
     lse: Optional[torch.Tensor] = None,
     max_q_len: int,
+    cp_rank: int = 0,
 ) -> torch.Tensor:
     """Form the dimension-first views and launch one compiled MLA kernel."""
 
@@ -1676,6 +1759,7 @@ def _launch_mla_decode(
         runtime.output_scale,
         runtime.output_quant_args,
         max_q_len,
+        cp_rank,
     )
     return runtime.out
 
@@ -1712,6 +1796,9 @@ class BatchMLADecodePagedTSWrapper:
         softmax_scale: GlobalScale = 1.0,
         output_scale: GlobalScale = 1.0,
         lse_mode: Literal["none", "base2"] = "none",
+        cp_world: int = 1,
+        cp_interleave_size: int = 1,
+        zero_empty_rows: bool = True,
         workspace_buffer: Optional[torch.Tensor] = None,
         validate: bool = True,
         tuning: Optional[MLAAttentionTuning] = None,
@@ -1760,16 +1847,33 @@ class BatchMLADecodePagedTSWrapper:
         num_qo_heads, kv_lora_rank, qk_rope_head_dim, page_size : int
             Static MLA head geometry and K/V page size.
         max_kv_len, max_q_len : int
-            Static per-request K/V and Q capacities.
+            Static per-request local K/V and Q capacities. K/V capacity is
+            rank-local even when runtime sequence lengths are global.
         packed_query : bool
             Select packed rather than fixed query storage.
         q_dtype, kv_dtype, out_dtype : torch.dtype
             Query, K/V, and output dtypes used to compile the plan.
         mask_type : {"dense", "causal"}
             Attention mask mode.
+        cp_world, cp_interleave_size : int
+            Compile-time context-parallel rank count and token interleave size,
+            both defaulting to one. Global token ``t`` belongs to rank
+            ``(t // cp_interleave_size) % cp_world``. Each local cache stores
+            its owned tokens in global order; page tables address that cache.
+            Every run supplies its rank and global logical request lengths.
+        zero_empty_rows : bool
+            Initialize rows with no locally visible KV to zero output and
+            negative-infinity LSE. Defaults to ``True``; ignored for cp_world=1.
+            ``False`` omits the initialization launch but keeps CP masking.
+            Empty-row results are then unspecified: sanitize them before
+            consumption or exclude them from merging.
+            This selects the compiled launch program, not workspace size.
         workspace_buffer : torch.Tensor, optional
             Caller-owned contiguous int8 or uint8 scratch on ``device``. It
             must be 32-byte aligned and large enough for the selected plan.
+            Size it with :func:`get_prims_ts_batch_mla_decode_workspace_size`
+            using matching geometry, dtypes, ``cp_world``, and
+            ``cp_interleave_size``, including when ``validate=False``.
             When omitted, planning allocates the buffer. The retained buffer
             is exclusive to one in-flight launch or graph replay.
         validate : bool
@@ -1804,6 +1908,9 @@ class BatchMLADecodePagedTSWrapper:
         lse_mode = validate_lse_mode(lse_mode)
         if not isinstance(validate, bool):
             raise TypeError("validate must be a bool")
+        _validate_mla_cp(cp_world, cp_interleave_size)
+        if not isinstance(zero_empty_rows, bool):
+            raise TypeError("zero_empty_rows must be a bool")
         if validate:
             if not isinstance(packed_query, bool):
                 raise TypeError("packed_query must be a bool")
@@ -1852,7 +1959,10 @@ class BatchMLADecodePagedTSWrapper:
             max_q_len,
         )
         spec = _resolve_mla_decode_launch_spec(
-            *spec_key, softmax_rescale_threshold_log2
+            *spec_key,
+            softmax_rescale_threshold_log2,
+            cp_world,
+            cp_interleave_size,
         )
         compile_spec = _cached_mla_decode_compile_spec(
             spec,
@@ -1869,6 +1979,9 @@ class BatchMLADecodePagedTSWrapper:
             runtime_kv_lengths=True,
             write_final_lse=lse_mode != "none",
             scale_types=(*scale_types(softmax_scale, output_scale), False),
+            cp_world=cp_world,
+            cp_interleave_size=cp_interleave_size,
+            zero_empty_rows=zero_empty_rows,
         )
         policy = spec.policy
         workspace_layout = _make_mla_workspace_layout(
@@ -1918,6 +2031,9 @@ class BatchMLADecodePagedTSWrapper:
             output_scale=output_scale,
             lse_mode=lse_mode,
             softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
+            cp_world=cp_world,
+            cp_interleave_size=cp_interleave_size,
+            zero_empty_rows=zero_empty_rows,
         )
 
     @flashinfer_experimental_api
@@ -1930,6 +2046,7 @@ class BatchMLADecodePagedTSWrapper:
         *,
         qo_indptr: Optional[torch.Tensor] = None,
         max_q_len: int | None = None,
+        cp_rank: int = 0,
         softmax_scale: GlobalScale | None = None,
         output_scale: GlobalScale | None = None,
         out: Optional[torch.Tensor] = None,
@@ -1940,7 +2057,7 @@ class BatchMLADecodePagedTSWrapper:
         """Launch MLA using live query/cache, page tables and KV lengths.
 
         Uses the policy and compiled kernels prepared by plan(). Batch and query
-        shape must match that plan; live K/V lengths stay within its capacity.
+        shape must match that plan; local K/V lengths stay within its capacity.
         Supply output/LSE buffers and validate=False during graph capture, and
         retain the wrapper and captured buffers for every replay.
 
@@ -1948,6 +2065,20 @@ class BatchMLADecodePagedTSWrapper:
         with the query shape minus its final dimension. return_lse controls tuple
         return only; an omitted enabled buffer is allocated. Output/LSE/workspace must
         be disjoint from inputs and live buffers. One wrapper serves one ordered lane.
+
+        seq_lens_kv contains GLOBAL logical request lengths, including the
+        current Q tokens, in a contiguous CUDA int32 vector. cp_rank is a host
+        integer in [0, cp_world), passed as a runtime scalar (captured by value
+        in a CUDA graph), not a compile key. With CP interleave I and world C,
+        a global prefix n maps to n//(I*C)*I + clamp(n%(I*C)-cp_rank*I, 0, I)
+        local tokens. Dense rows use n=seq_lens_kv[b]; causal row i uses
+        n=seq_lens_kv[b]-actual_Q+i+1, where packed actual_Q is the qo_indptr
+        delta, not max_q_len. Local cache/pages and max_kv_len stay rank-local.
+        For cp_world>1, zero local prefixes write zero O and negative-infinity
+        LSE unless zero_empty_rows=False was planned; that opt-out leaves empty
+        rows unspecified, not preserved. With cp_world=1, nonpositive request
+        lengths retain the inactive-request behavior. validate=False performs
+        no metadata readback; the caller must preserve all value constraints.
 
         Fixed queries use [B, Sq, H, 576]; packed queries use [total_q, H, 576] and
         qo_indptr with nonnegative per-request deltas. All-empty packed Q is a no-op.
@@ -1972,6 +2103,7 @@ class BatchMLADecodePagedTSWrapper:
         output_scale = resolve_scale(
             output_scale, state.output_scale, "output_scale", state.device
         )
+        _validate_mla_cp_rank(cp_rank, state.cp_world)
         runtime_qo_indptr = qo_indptr if state.packed_query else None
         runtime = _prepare_mla_runtime(
             query,
@@ -2005,6 +2137,9 @@ class BatchMLADecodePagedTSWrapper:
                 max_kv_len=state.max_kv_len,
                 page_size=state.page_size,
                 mask_type=state.mask_type,
+                cp_world=state.cp_world,
+                cp_interleave_size=state.cp_interleave_size,
+                cp_rank=cp_rank,
             )
             max_q_len = resolve_max_sequence_length(
                 max_q_len, actual_q, "max_q_len", state.max_q_len
@@ -2032,6 +2167,7 @@ class BatchMLADecodePagedTSWrapper:
             compiled=state.compiled,
             lse=lse,
             max_q_len=max_q_len,
+            cp_rank=cp_rank,
         )
         return (result, lse) if return_lse else result
 
@@ -2057,6 +2193,10 @@ def batch_mla_decode_with_paged_kv_cache(
     lse_mode: Literal["base2"] = "base2",
     out_dtype: torch.dtype = torch.bfloat16,
     workspace_buffer: Optional[torch.Tensor] = None,
+    cp_world: int = 1,
+    cp_interleave_size: int = 1,
+    cp_rank: int = 0,
+    zero_empty_rows: bool = True,
     validate: bool = True,
     tuning: Optional[MLAAttentionTuning] = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -2077,7 +2217,7 @@ def batch_mla_decode_with_paged_kv_cache(
         Dense physical-page table for each request. Rows must be inner
         contiguous and non-overlapping, but may have padding between them.
     seq_lens_kv : torch.Tensor
-        Live K/V sequence lengths.
+        Global logical K/V sequence lengths, including current Q tokens.
     qo_indptr : torch.Tensor, optional
         Cumulative query offsets selecting packed-query mode.
     max_q_len : int, optional
@@ -2091,7 +2231,16 @@ def batch_mla_decode_with_paged_kv_cache(
     mask_type : {"dense", "causal"}
         Attention mask mode.
     max_kv_len : int, optional
-        Static K/V length bound; defaults to the metadata maximum.
+        Static rank-local K/V length bound; defaults to the maximum local
+        length derived from global metadata for cp_rank. An all-empty CP rank
+        uses capacity one when this bound is omitted.
+    cp_world, cp_interleave_size, cp_rank : int
+        Context-parallel rank count, token interleave size, and runtime rank.
+        Defaults are 1, 1, and 0. See :meth:`BatchMLADecodePagedTSWrapper.run`.
+    zero_empty_rows : bool
+        Initialize CP empty rows to neutral output/LSE by default.
+        ``False`` omits this launch and leaves empty-row results unspecified.
+        Ignored for cp_world=1; does not change workspace size.
     softmax_scale, output_scale : float or torch.Tensor
         QK and value/output scaling factors.
     out : torch.Tensor, optional
@@ -2100,6 +2249,9 @@ def batch_mla_decode_with_paged_kv_cache(
         Output dtype.
     workspace_buffer : torch.Tensor, optional
         Caller-owned byte scratch, exclusive to one in-flight launch/graph.
+        Size it with :func:`get_prims_ts_batch_mla_decode_workspace_size`
+        using matching geometry, dtypes, ``cp_world``, and
+        ``cp_interleave_size``, including when ``validate=False``.
     validate : bool
         Validate tensors and metadata values (may synchronize), default True.
         False trusts the caller and requires workspace and explicit bounds;
@@ -2122,10 +2274,11 @@ def batch_mla_decode_with_paged_kv_cache(
     ``out``, and ``validate=False``; packed Q also needs an explicit
     ``max_q_len``.
     Warm this exact topology outside capture first. Retain stable tensor storage
-    and mutate metadata only between completed launches/replays. All live K/V
-    positive lengths must be within the static bound; nonpositive lengths mark
-    inactive requests whose output is untouched. Active page IDs must
-    index the cache, and causal per-request Q lengths must not exceed K/V lengths.
+    and mutate metadata only between completed launches/replays. Local lengths
+    derived for cp_rank must be within the static bound. With cp_world=1,
+    nonpositive lengths mark inactive requests whose output is untouched;
+    CP global lengths must be nonnegative. Active page IDs must index the
+    local cache, and causal Q lengths must not exceed positive global KV lengths.
     Packed offsets must start at zero, end at the query token count, and have
     nonnegative deltas within the Q bound. Scratch/output must not alias
     any inputs or each other. No metadata is copied to the host on the trusted
@@ -2148,6 +2301,8 @@ def batch_mla_decode_with_paged_kv_cache(
 
     if not isinstance(validate, bool):
         raise TypeError("validate must be a bool")
+    _validate_mla_cp(cp_world, cp_interleave_size)
+    _validate_mla_cp_rank(cp_rank, cp_world)
     if validate or workspace_buffer is None or out is None:
         if torch.cuda.is_initialized() and torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
@@ -2192,7 +2347,11 @@ def batch_mla_decode_with_paged_kv_cache(
     if not packed_query and max_q_len is None:
         max_q_len = int(query.shape[1])
     if max_kv_len is None:
-        max_kv_len = int(seq_lens_kv.max().item())
+        max_kv_len = _mla_cp_local_length(
+            int(seq_lens_kv.max().item()), cp_world, cp_interleave_size, cp_rank
+        )
+        if cp_world > 1:
+            max_kv_len = max(1, max_kv_len)
     assert max_q_len is not None
     if validate and out is not None:
         _validate_out(
@@ -2223,6 +2382,9 @@ def batch_mla_decode_with_paged_kv_cache(
         softmax_scale=softmax_scale,
         output_scale=output_scale,
         workspace_buffer=workspace_buffer,
+        cp_world=cp_world,
+        cp_interleave_size=cp_interleave_size,
+        zero_empty_rows=zero_empty_rows,
         validate=validate,
         tuning=tuning,
         lse_mode=validate_lse_mode(lse_mode)
@@ -2241,6 +2403,7 @@ def batch_mla_decode_with_paged_kv_cache(
         lse=lse,
         return_lse=return_lse,
         validate=validate,
+        cp_rank=cp_rank,
     )
 
 
@@ -3660,6 +3823,7 @@ class BatchSparseMLADecodePagedTSWrapper:
             bmm2,
             None,
             1,
+            0,
         )
         return out
 

@@ -942,6 +942,7 @@ def test_scheduler_retirement_probe_is_local_and_fresh_under_adp() -> None:
             can_share_inflight_prefix=False,
             tokens_per_block=16,
             _has_cp_helix=False,
+            max_beam_width=1,
             inforward_snapshot_rows=0,
             has_cache_tier_below_gpu=False,
             kv_connector_manager=None,

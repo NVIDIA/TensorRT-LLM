@@ -1175,7 +1175,8 @@ def test_mrope_storage_is_retained_for_generation_and_released_at_termination() 
     executor._free_request_resources = Mock()
     executor.gather_all_responses = False
     executor.dist = SimpleNamespace(rank=0)
-    executor.result_wait_queues = {request.py_request_id: object()}
+    executor._response_channel = ResponseChannel()
+    executor._response_channel.register([request.py_request_id], Mock())
     executor.previous_batch = SimpleNamespace(requests=[request])
 
     executor._release_multimodal_resources(request)
@@ -1195,7 +1196,7 @@ def test_mrope_storage_is_retained_for_generation_and_released_at_termination() 
     assert tensor_ref() is None
     assert storage_ref.expired()
     assert executor.previous_batch.requests == [request]
-    assert not executor.result_wait_queues
+    assert not executor._response_channel.result_wait_queues
 
     executor._do_terminate_request(request)
     assert storage_ref.expired()
@@ -1330,6 +1331,7 @@ def _make_v2_multimodal_scheduler(
     manager.enable_block_reuse = False
     manager.enable_joint_kv_cache_reuse = False
     manager._has_cp_helix = False
+    manager.max_beam_width = 1
     manager.kv_cache_map = {}
 
     def prepare_context(request):
