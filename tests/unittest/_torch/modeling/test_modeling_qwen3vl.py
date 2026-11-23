@@ -1057,6 +1057,14 @@ def test_qwen_vl_embeddings_with_image_grid_match_processor_path(model, sizes):
     ids, extra = attach(grids)
 
     assert ids == ref_ids
+    mm_input = extra["multimodal_input"]
+    # Qwen3-VL keys the leading vision-start token together with the embedding rows.
+    leading_tokens = int(model == "qwen3")
+    starts = [i for i, token in enumerate(ids) if token == processor.config.vision_start_token_id]
+    assert mm_input.multimodal_positions == [i + 1 - leading_tokens for i in starts]
+    assert mm_input.multimodal_lengths == [count + leading_tokens for count in rows]
+    hashes = mm_input.multimodal_hashes
+    assert len(hashes) == len({tuple(item_hash) for item_hash in hashes}) == len(rows)
     ref_mrope = ref["multimodal_data"]["mrope_config"]
     mrope = extra["multimodal_data"]["mrope_config"]
     torch.testing.assert_close(mrope["mrope_position_ids"], ref_mrope["mrope_position_ids"])
@@ -1065,6 +1073,9 @@ def test_qwen_vl_embeddings_with_image_grid_match_processor_path(model, sizes):
         # Negative control: swapped grids also pass the row check, but give
         # other positions. So this test fails if an image gets the wrong grid.
         _, swapped = attach(grids.flip(0))
+        assert all(
+            item_hash not in hashes for item_hash in swapped["multimodal_input"].multimodal_hashes
+        )
         assert not torch.equal(
             swapped["multimodal_data"]["mrope_config"]["mrope_position_ids"],
             ref_mrope["mrope_position_ids"],
