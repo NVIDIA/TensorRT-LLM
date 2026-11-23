@@ -22,8 +22,8 @@ attention DP16, and the ultra-low-latency (ULL) one over Helix CP16 with the
 routed experts split MoE TP16 (``helix16_moetp16ep1``: DSpark with 7 draft
 tokens, at most 4 requests per step, ``_check_sm107_ull``). ``_sm107_target``
 reads the layout from the mapping, the MoE backend and the context-parallel
-config; the layouts exclude each other, so the disaggregated role is not needed
-to choose. Their SM107 kernels launch with PDL as a
+config. ULL also requires a KV transceiver, declines an explicit non-generation
+role, and runs without a guided decoding backend. The SM107 kernels launch with PDL as a
 constant, so a deployment that turns PDL off (``TRTLLM_ENABLE_PDL`` other than ``1``, as the
 workers see it) gets ``NoTarget`` rather than launches that ignore the switch.
 """
@@ -365,6 +365,16 @@ def _check_sm107_ull(llm_args: TorchLlmArgs) -> None:
     The ULL target runs every KDA + MoE layer and every MoE of an MLA layer on fixed decode
     kernels compiled for 1 + 7 verified tokens per request and at most 32 rows per step.
     """
+    transceiver = llm_args.cache_transceiver_config
+    role = (_worker_env(llm_args, "TRTLLM_DISAGG_ROLE") or "").strip().lower()
+    if transceiver is None or transceiver.backend is None or (role and not role.startswith("gen")):
+        raise NoTarget(
+            "the sm107 Kimi K3 ULL target requires a disaggregated generation server "
+            f"with a KV cache transceiver, got role {role!r}"
+        )
+    if llm_args.guided_decoding_backend is not None:
+        raise NoTarget("the sm107 Kimi K3 ULL target does not support guided_decoding_backend")
+
     spec = llm_args.speculative_config
     draft_len = getattr(spec, "max_draft_len", None)
     if draft_len != _ULL_DRAFT_LEN:

@@ -102,10 +102,10 @@ from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
     # kda_context_only with it, so the estimate below and the manager agree by construction.
     _is_disagg_context_server,
 )
+from tensorrt_llm._torch.modules.kimi_kda.replay_region import ReplayLayout
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     MambaRole,
     MambaStateLayout,
-    ReplayLayout,
     _stack_state_views,
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp

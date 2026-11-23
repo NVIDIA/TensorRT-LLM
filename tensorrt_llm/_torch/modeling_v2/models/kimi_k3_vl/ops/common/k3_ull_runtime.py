@@ -7,7 +7,8 @@ gil_switch_us=200)``. Each piece maps onto one engine hook (``make_runtime_hooks
 
 * ``pin_executor`` and ``gil_switch_us``: :class:`StepShellEvents`. Before the overlap loop starts,
   the executor thread is pinned to one physical core of the process's CPU set, and the other threads
-  of the process are moved off that core and its SMT siblings. New threads are moved off it every
+  of the process are moved off that core and its SMT siblings when their affinity permits it.
+  New threads are checked every
   ``PIN_REFRESH_ITERS`` iterations (``on_iteration``). The interpreter's thread switch interval
   is set to ``GIL_SWITCH_US``.
 * ``step_prep``: :class:`InputCommitPack`, the engine's step-input pack
@@ -113,21 +114,17 @@ def pin_executor_cpu(available: Set[int], gpu_index: Optional[int] = None) -> Op
 
 
 class ExecutorThreadPin:
-    """Keeps the executor loop thread alone on one CPU.
+    """Reserves one CPU for the executor loop where other threads' affinity permits it.
 
-    The calling thread gets ``{cpu}``; every other thread of the process gets the process's CPU
-    set without ``cpu`` and its SMT siblings. Threads started later inherit the affinity of the
-    thread that starts them, so :meth:`maybe_refresh` moves new threads off the CPU every
-    ``refresh_iters`` iterations (a scan of ``/proc/self/task``).
+    The calling thread gets ``{cpu}``. Other threads keep their own affinity, minus the reserved
+    core's CPUs when that leaves an allowed CPU. Threads started later inherit their creator's
+    affinity, so :meth:`maybe_refresh` checks new threads every ``refresh_iters`` iterations.
     """
 
-    def __init__(self, cpu: int, available: Set[int], refresh_iters: int = PIN_REFRESH_ITERS):
+    def __init__(self, cpu: int, refresh_iters: int = PIN_REFRESH_ITERS):
         self.cpu = cpu
         self.tid = threading.get_native_id()
-        self.others = set(available) - smt_siblings(cpu)
-        if not self.others:
-            # A one-core set: nothing to move the other threads to.
-            self.others = set(available) - {cpu} or set(available)
+        self._reserved_cpus = smt_siblings(cpu)
         self.refresh_iters = max(1, refresh_iters)
         self._known: Set[int] = set()
 
@@ -139,16 +136,13 @@ class ExecutorThreadPin:
             cpu = pin_executor_cpu(available)
             if cpu is None:
                 return None
-            pin = cls(cpu, available)
+            pin = cls(cpu)
             os.sched_setaffinity(0, {cpu})
             pin.refresh()
         except (OSError, ValueError) as error:
             logger.warning(f"{_LOG}: executor thread not pinned ({error})")
             return None
-        logger.info(
-            f"{_LOG}: executor thread {pin.tid} pinned to CPU {cpu}; "
-            f"{len(pin.others)} CPUs left for the other threads"
-        )
+        logger.info(f"{_LOG}: executor thread {pin.tid} pinned to CPU {cpu}")
         return pin
 
     def refresh(self) -> int:
@@ -162,8 +156,11 @@ class ExecutorThreadPin:
             if tid == self.tid or tid in self._known:
                 continue
             try:
-                os.sched_setaffinity(tid, self.others)
-                moved += 1
+                current = os.sched_getaffinity(tid)
+                remaining = current - self._reserved_cpus
+                if remaining and remaining != current:
+                    os.sched_setaffinity(tid, remaining)
+                    moved += 1
             except OSError:
                 # The thread exited, or its affinity is not ours to change.
                 pass

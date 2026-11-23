@@ -163,10 +163,17 @@ def test_executor_pin_moves_the_other_threads(monkeypatch):
     monkeypatch.setattr(runtime, "smt_siblings", _topology(_TOPOLOGIES[0]))
     monkeypatch.setattr(runtime, "physical_gpu_index", lambda: 1)
     me = runtime.threading.get_native_id()
-    tasks = [str(me), "111", "222"]
+    affinities = {
+        0: set(range(8)),
+        111: set(range(8)),
+        222: {2, 3, 6},
+        333: {3},
+        444: {2, 6},
+    }
+    tasks = [str(me), "111", "222", "333", "444"]
     calls = []
     fake_os = types.SimpleNamespace(
-        sched_getaffinity=lambda pid: set(range(8)),
+        sched_getaffinity=affinities.__getitem__,
         sched_setaffinity=lambda pid, cpus: calls.append((pid, frozenset(cpus))),
         listdir=lambda path: list(tasks),
         environ={},
@@ -175,13 +182,14 @@ def test_executor_pin_moves_the_other_threads(monkeypatch):
     pin = runtime.ExecutorThreadPin.create()
     assert pin is not None and pin.cpu == 2
     others = frozenset(range(8)) - {2, 6}
-    assert calls == [(0, frozenset({2})), (111, others), (222, others)]
+    assert calls == [(0, frozenset({2})), (111, others), (222, frozenset({3}))]
     calls.clear()
-    tasks.append("333")
+    tasks.append("555")
+    affinities[555] = {4, 6}
     pin.maybe_refresh(runtime.PIN_REFRESH_ITERS - 1)
     assert calls == []
     pin.maybe_refresh(runtime.PIN_REFRESH_ITERS)
-    assert calls == [(333, others)]
+    assert calls == [(555, frozenset({4}))]
 
 
 def test_before_overlap_loop_sets_the_switch_interval(monkeypatch):

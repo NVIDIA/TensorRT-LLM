@@ -34,9 +34,8 @@ The MXFP4 checkpoint runs on sm_100 on two targets, TP16 with the experts split 
 
 The NVFP4 checkpoint runs on sm_107 only, on five specialized targets, each one layout of the
 recipe below. Routing admits exactly these layouts; anything else raises `NoTarget` with the facts
-it saw (`modeling_v2="require"` turns that into an error). The layouts exclude each other, so the
-target never needs the disaggregated role: no target behaves differently by role, and routing
-records none.
+it saw (`modeling_v2="require"` turns that into an error). The Helix16 ULL layout requires a KV cache
+transceiver and declines an explicit non-generation role or a guided decoding backend.
 
 The recipe:
 

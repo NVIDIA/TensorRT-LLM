@@ -112,6 +112,7 @@ def _mapping(worker: dict) -> Mapping:
 
 
 def _llm_args(worker: dict, **overrides):
+    transceiver = worker.get("cache_transceiver_config")
     fields = {
         "moe_config": SimpleNamespace(backend=worker["moe_config"]["backend"]),
         "dwdp_config": worker.get("dwdp_config"),
@@ -120,6 +121,8 @@ def _llm_args(worker: dict, **overrides):
             max_draft_len=worker["speculative_config"]["max_draft_len"]
         ),
         "max_batch_size": worker["max_batch_size"],
+        "cache_transceiver_config": SimpleNamespace(**transceiver) if transceiver else None,
+        "guided_decoding_backend": worker.get("guided_decoding_backend"),
     }
     fields.update(overrides)
     return SimpleNamespace(**fields)
@@ -134,7 +137,8 @@ def _route_name(model_config, llm_args) -> str:
 def test_each_recipe_role_routes_to_its_target(stem, role):
     worker = _worker(stem, role)
     expected = _RECIPE_TARGETS[stem][0 if role == "ctx" else 1]
-    assert _route_name(_model_config(_mapping(worker)), _llm_args(worker)) == expected
+    args = _llm_args(worker, env_overrides={"TRTLLM_DISAGG_ROLE": role})
+    assert _route_name(_model_config(_mapping(worker)), args) == expected
 
 
 def test_context_servers_of_a_dwdp12_recipe_route_to_tp1():
@@ -336,6 +340,9 @@ def _ull_args(**overrides):
         **vars(_FC12),
         "speculative_config": SimpleNamespace(max_draft_len=7),
         "max_batch_size": 4,
+        "cache_transceiver_config": SimpleNamespace(backend="NIXL"),
+        "guided_decoding_backend": None,
+        "env_overrides": {"TRTLLM_DISAGG_ROLE": "generation"},
     }
     fields.update(overrides)
     return SimpleNamespace(**fields)
@@ -357,11 +364,27 @@ def test_ull_generation_server_routes_to_the_ull_target(max_batch_size):
         (_ull_args(max_batch_size=None), "max_batch_size None"),
         (_ull_args(kv_cache_config=SimpleNamespace(dtype="fp8")), "NVFP4 KV cache"),
         (_ull_args(env_overrides={"TRTLLM_ENABLE_PDL": "0"}), "TRTLLM_ENABLE_PDL='0'"),
+        (_ull_args(cache_transceiver_config=None), "disaggregated generation server"),
+        (
+            _ull_args(cache_transceiver_config=SimpleNamespace(backend=None)),
+            "disaggregated generation server",
+        ),
+        (
+            _ull_args(env_overrides={"TRTLLM_DISAGG_ROLE": "context"}),
+            "disaggregated generation server",
+        ),
+        (_ull_args(guided_decoding_backend="xgrammar"), "guided_decoding_backend"),
     ],
 )
 def test_ull_declines_other_generation_steps(llm_args, match):
     with pytest.raises(NoTarget, match=match):
         _route_name(_model_config(_helix16_moetp16()), llm_args)
+
+
+def test_ull_accepts_a_transceiver_when_the_launcher_does_not_forward_the_role(monkeypatch):
+    monkeypatch.delenv("TRTLLM_DISAGG_ROLE", raising=False)
+    args = _ull_args(env_overrides={})
+    assert _route_name(_model_config(_helix16_moetp16()), args).endswith("__helix16_moetp16ep1")
 
 
 @pytest.mark.parametrize(

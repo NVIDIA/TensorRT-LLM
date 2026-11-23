@@ -42,6 +42,7 @@
     "Not ported: the DFlash draft-history snapshot kernel (served step_fold, k3_rubin/spec/history_snapshot.py). #21996's target decodes the draft table on the device and publishes no draft history; owned by the draft-cache area.",
     "fold_block_offsets_copy is provided, but its caller (the KV cache manager's copy_batch_block_offsets, cache.py) belongs to the KV area and is not wired yet; until it is, the block-offset copy stays #21996's copyBatchBlockOffsetsToDevice launch between the replays.",
     "physical_gpu_index reads CUDA_VISIBLE_DEVICES for device topology. It skips executor pinning when CUDA is unavailable or the visible device has no numeric GPU index.",
+    "ExecutorThreadPin narrows each other thread's existing affinity only when at least one CPU remains outside the reserved core.",
     "With spec_step_fold set, #21996's one-model sampler stores its outputs through _scatter_to_stores (4 index_copy_), which is served's path; without it, SM100/SM103 (GB300) would take #21996's one-launch SlotScatter, and SM107 (Rubin) the same 4 index_copy_ (spec_step_copies.is_supported excludes SM107)."
   ]
 }
