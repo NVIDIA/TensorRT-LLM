@@ -61,7 +61,7 @@ DEFAULT_WORKLOAD: dict[str, int] = {"isl": 4096, "osl": 1024, "max_batch_size": 
 #: Tokens between Mamba state snapshots on a hybrid checkpoint with block
 #: reuse: without a snapshot policy the engine turns reuse off.
 DEFAULT_SNAPSHOT_INTERVAL = 2048
-#: The boot gate's prompts when the site declares none: two short continuations.
+#: The boot prompts when the site declares none: two short continuations.
 DEFAULT_BOOT: dict[str, Any] = {
     "prompts": ["The capital of France is", "In one sentence, photosynthesis is"],
     "max_tokens": 32,
@@ -555,7 +555,7 @@ def derive_spec(
             "fallback, the checkpoint path's last two components, is no model's name)"
         )
     if (anchor.get("protocol") or {}).get("chat_template"):
-        accuracy["benchmark_args"] = ["--apply_chat_template"]
+        accuracy["evaluator_kwargs"] = {"apply_chat_template": True}
     if max_seq_len:
         accuracy["max_seq_len"] = max_seq_len
     if max_batch_size:

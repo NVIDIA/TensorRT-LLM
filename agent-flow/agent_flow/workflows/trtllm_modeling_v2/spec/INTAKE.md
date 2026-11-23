@@ -74,10 +74,10 @@ failed or when a landing's worker names it. Prove each requested feature **once*
 the request validates fully. One check of any kind covers a feature; the delivery report lists
 the checks behind each (`coverage.yaml`):
 
-- A storage or scheduling variant (a KV dtype, `chunked`, `reuse`) takes `gates: [accuracy]`.
-  That gate judges the variant's score against its unit's. No gate reads the dtype, the
-  chunking or the reuse the engine resolved, and such a variant owes no boot. A variant whose
-  gates include `boot` boots at the members of its unit where its benchmark does not run.
+- A storage or scheduling variant (a KV dtype, `chunked`, `reuse`) takes `gates: [accuracy]`:
+  its `e2e` test judges the variant's score against its unit's. No check reads the dtype, the
+  chunking or the reuse the engine resolved. A variant whose gates include `boot` boots at the
+  members of its unit where its benchmark does not run.
 - Members the request scopes to text-only or aggregate take core alone, not the variants.
 - A feature unit runs at one member (`members: {<feature>: [X]}`), and every variant stays on
   `unit: core`. Each feature then has a check that exercises it (disagg its test, multimodal
@@ -85,47 +85,102 @@ the checks behind each (`coverage.yaml`):
   combination, added only when the request names it. A variant of disagg owes nothing.
 - Leave the profile at `standard` unless the request asks.
 
-`--dry-run` journals the contract's checks per unit and variant; past ~30 deserves a second look.
+`--dry-run` journals the contract's checks per unit and variant, and who declared each (the
+flow, the flow changed by the spec, or the spec); past ~30 deserves a second look.
 
 **Disagg: the deployment or a test.** State the deployment whenever the request says how it is
 served: no agent then writes serving or test code, and the check is the same for every model.
-It needs an anchor row for the disagg unit and its benchmark's data where the gates run (`accuracy.dataset_path`
-or the offline caches).
+It needs an anchor row for the disagg unit and its benchmark's data where the gates run
+(`accuracy.dataset_path` or the offline caches); the benchmark runs under
+`accuracy.evaluator_kwargs`, which reach `trtllm-eval` as flags, and is held to its references
+row minus twice its standard error.
 
 A `test` is the other way: the run writes it; the flow deploys nothing of its own. Name the node
 id it will have, say in `notes` which task writes it, and give it what it reads in `accuracy.disagg.env`. A test that skips (too few
-devices, a missing model root) fails the gate: set `accuracy.disagg.devices` when it needs more
+devices, a missing model root) fails the check: set `accuracy.disagg.devices` when it needs more
 than two engines at its member's width.
 
 ## 4. Runtime
 
 `cuda_graph: true`, `overlap_scheduler: true`, `chunked_prefill: false`, `kv_cache_reuse: false`
-(the core configuration; chunking and reuse are variants), `--kv_cache_fraction` around 0.7. Every accuracy gate runs a full benchmark with CUDA graphs: eager
+(the core configuration; chunking and reuse are variants), `--kv_cache_fraction` around 0.7. Every e2e test runs a full benchmark with CUDA graphs: eager
 is 10-50x slower and scores a path the target does not serve.
 Run a unit or variant's accuracy eager only on purpose (a short subset, a capture still being
 built), and say so in `notes`; a benchmark you start by hand runs captured too.
 
-## 5. Accuracy and boot
+## 5. Tests, accuracy and boot
 
-- **Protocol.** Score the benchmark (GSM8K by default) as few-shot completion (no
-  `--apply_chat_template`) unless the model only works chat-formatted. A chat-template protocol on
-  a model that reasons first needs `--max_output_length` >= 1024 and its stop strings, or it scores
-  truncation.
-- **Benchmark and score.** Which benchmark, how much of it and how its score is read are the
-  user's to choose. A subset: `benchmark_args: ["--num_samples=200"]` (the floor's standard
-  error uses that count). Another benchmark: `benchmark`, with an anchor row for it. A benchmark
-  whose output is neither lm-eval's `accuracy:` line nor MMLU's weighted average needs
-  `score_pattern` (a regular expression whose first group is the score, on the anchor's scale)
-  and `samples`; without one, its gate quotes the lines that look like a score and fails.
-- **What fails a check.** Nothing generated, or a benchmark under its floor: the golden rule
-  is the benchmark score close to its reference. Kernel entries are judged by their output
-  distribution against their reference (`trtllm-modeling-v2-entry`).
+- **The run's tests.** The flow derives, per unit and variant, an `e2e` test: one engine per
+  member that answers the boot prompts (`generate`), scores the benchmark and, on a
+  speculator, measures its acceptance, run by the target's generated e2e test
+  (`tests/integration/defs/accuracy/modeling_v2/<family>/<target>/test_e2e.py`, from the spec,
+  written and committed by the flow before the first turn; CI runs the same file). Members its
+  benchmark skips get `boot`; the spec's serve gets `serve` (and `serve_one_rank` at delivery),
+  and `disagg` its test. `verification.<feature>.<name>` changes them, flat: an entry named
+  like one of them replaces what it gives (`datasets`, `members`, `stage`, `timeout`, `env`,
+  `serve`, `config`, `evaluator_kwargs`, `extra_checks`) and keeps the rest, `enabled: false`
+  turns it off, and `pytest` swaps in a test of the tree. Any other name is a test of the
+  spec's own and says its `purpose` and `datasets` or `pytest`.
+- **What `e2e` is for.** It is each feature's foundation test: the whole configuration, the
+  full benchmark against its reference, not cut down. It promises no particular path. A path
+  that runs only at some length, shape or switch is a test of its own: sparse attention, for
+  one, skips its indexer while every request is within its TopK budget, which GSM8K's are.
+  Such a test sets what it needs of the engine in `config` (LLM-API options laid over the
+  feature's at the member: `max_seq_len`, `enable_chunked_prefill`, `sparse_attention_config`;
+  not the parallelism or the speculator, which the member and the feature decide; a
+  configuration the run delivers is a variant), its protocol in `evaluator_kwargs` (laid over
+  `accuracy.evaluator_kwargs`: `num_fewshot`, `chat_template_kwargs`), and in `extra_checks`
+  what shows the path ran: the names of functions of the tree, run after its datasets on the
+  same engine. Their contract is `tests/integration/defs/accuracy/modeling_v2/_e2e.py`'s
+  "Extra checks": `f(result)`, the case's result and nothing else, from which a check derives
+  its bar (the engine's options, the checkpoint's config); it sends nothing, fails by
+  `AssertionError` and returns what it saw. A name is looked up in the target's own
+  `extra_checks.py`, beside its generated test, then in the shared `_extra_checks.py` beside
+  the runner (`sparse_topk_exceeded`: a request outgrew the sparse TopK budget); a name both
+  define is refused, and a function starting with `_` is a helper. A check a single target
+  needs goes in its own file, committed before the run. A changed protocol may need a
+  references row of its own.
+- **One measurement runs once.** A test of datasets that another test of the same feature,
+  member and settings measures (and more) takes that test's pass on the same tree. At a
+  landing that names a base's `e2e` with its speculator's `e2e` at the same member, the
+  speculator's runs alone; the base's runs once the work is done, unless what it reads is
+  unchanged since it passed.
+- **The catalog.** `generate` (the boot prompts), `acceptance` (a speculator's acceptance length),
+  and the `accuracy_core` benchmarks by their references file: `gsm8k`, `mmlu`,
+  `gpqa_diamond`, `mmmu`, `cnn_dailymail`, `json_mode_eval`, `longbench_v1`, `longbench_v2`,
+  `passkey_retrieval_64k`, `passkey_retrieval_128k`. One test's datasets run in order on one
+  load of the engine; another stage is another test. Another evaluation is a test of the tree,
+  named with `pytest`, written to the tree's own harness (`accuracy_core.py`, its references).
+- **Protocol.** Score the benchmark (GSM8K by default) under the protocol its references row was
+  measured under: few-shot completion, or for a model that only works chat-formatted
+  `accuracy.evaluator_kwargs` (accuracy_core's `extra_evaluator_kwargs`, as the tree's own test
+  of the model passes them: `{apply_chat_template: true, fewshot_as_multiturn: true,
+  chat_template_kwargs: {enable_thinking: false}}` for a thinking model scored without
+  thinking). The task's sizes are `accuracy_core.py`'s (for GSM8K, 1319 questions, 4096 input
+  and 256 output tokens, seed 0).
+- **What fails a check.** Nothing generated, a benchmark under `accuracy_core`'s hypothesis
+  test against its references row, or an acceptance at or below 1.0 or under its floor: the
+  golden rule is the benchmark score close to its reference. Kernel entries are judged by
+  their output distribution against their reference (`trtllm-modeling-v2-entry`).
+- **Tests of the tree.** `pytest` names repository-relative node ids (or a list). A whole-model
+  test says `members` (a member, a list, or `all`): it runs once per member and reads that
+  member's configuration from `MV2FLOW_LLM_OPTIONS` (a YAML of LLM-API options) and
+  `MV2FLOW_MODEL`, with `MV2FLOW_FEATURE` and `MV2FLOW_MEMBER`; `{member}` in the node id stands
+  for the member. A module test says `devices` (default 1) and runs once. `stage` is `landing`
+  (the default: when a landing names it) or `delivery` (once the work is done); `timeout` is per
+  member and node, default 3600 seconds; `env` adds variables. The test must be in the tree
+  before launch (preflight reads its file, class and function); it passes when every test it
+  selects passed, and a skip fails it.
 - **Drafting floors.** A unit's `accuracy.acceptance` entry holds its own drafter; a later
   unit that runs the same drafter (`features: [mtp, multimodal]`) is held to the entry of the
   speculator it builds on unless it has its own, then to `default`.
-- **Anchors.** Each unit's anchor is a row of `reference_yaml` under `accuracy.model_key`, which
-  the spec states (`org/model`; the checkpoint path's last two components are no model's name):
-  the user's score, else the reference implementation's (HuggingFace `transformers`, where it
+- **Anchors.** Each unit's anchor is a row of its benchmark's references file
+  (`tests/integration/defs/accuracy/references/<dataset>.yaml`, `reference_yaml`) under
+  `accuracy.model_key`, which the spec states (`org/model`; the checkpoint path's last two
+  components are no model's name), and `accuracy_core` picks the row the engine's
+  configuration names (dtype, quantization, KV-cache quantization, speculation); the spec's
+  `discriminators` say the same for preflight. Its score is
+  the user's, else the reference implementation's (HuggingFace `transformers`, where it
   runs the checkpoint natively), else an earlier run's. Without any, record a **low
   placeholder** (e.g. 10 on GSM8K, in percent): it lets a working target integrate and catches an
   engine that answers nothing. The first benchmark that passes on the placeholder at a member
@@ -133,21 +188,21 @@ built), and say so in `notes`; a benchmark you start by hand runs captured too.
   unit at that member is held to it, as a variant is to its unit's score. Commit the row to the
   run's branch: each check measures a snapshot of a commit and reads its anchor table there, and
   preflight refuses an uncommitted one.
-- **Datasets.** Staged from preflight on, beside the first turns: the spec's
+- **Staging.** A benchmark's dataset is staged from preflight on, beside the first turns: the spec's
   `accuracy.dataset_path`, else the copy under `$LLM_MODELS_ROOT/datasets/` (where the tree's
-  `accuracy_core.py` reads it), else a download into the workspace. A gate waits for one being
-  staged and runs as before without one that could not be; `datasets/status.json` says which.
-  The benchmark itself is the tree's (`trtllm-eval` runs the task `accuracy_core.py` defines: for
-  GSM8K, 1319 questions, 4096 input and 256 output tokens, seed 0).
+  `accuracy_core.py` reads it), else a download into the workspace. A check waits for one being
+  staged, and reads it through a models root that holds it; one that could not be staged runs
+  as before without it; `datasets/status.json` says which.
 - **Variant anchors.** A configuration variant that names no row of its own (`discriminators`,
   `reference_yaml`, `model_key`, `benchmark`) is judged against its unit's own score at the same
   member, on the same target (`anchor: relative`): a KV dtype against `auto`, the chunked variant
-  against the unchunked engine. Its floor allows for the error of both scores. A variant that
+  against the unchunked engine (its first benchmark; `accuracy_core`'s test allows for the
+  error of both scores). A variant that
   names a row of its own is judged against that row (its `discriminators` are layered over the
   unit's).
-- **Boot prompts.** Two or three short prompts. Boot and serve require an answer, not a
-  word in it: an answer cut at `max_tokens` passes, and whether it is right is the
-  benchmark's to judge.
+- **Boot prompts.** Two or three short prompts (`accuracy.boot`). The `generate` dataset and
+  serve require an answer, not a word in it: an answer cut at `max_tokens` passes, and whether
+  it is right is the benchmark's to judge.
 
 ## 6. Environment
 

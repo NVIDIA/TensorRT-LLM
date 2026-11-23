@@ -54,7 +54,6 @@ class GateResult:
     command: str = ""
     measured: float | None = None
     reference: float | None = None
-    tolerance: float | None = None
     duration_s: float = 0.0
     stdout_tail: str = ""
     #: The repository state this verdict was measured on —
@@ -79,12 +78,12 @@ class GateResult:
     reads: tuple[str, ...] = ()
     #: The per-prompt numbers behind ``measured``, where a gate has them.
     breakdown: str = ""
-    #: The accuracy floor the measurement was held to, and the binomial
-    #: standard error and sample count it was derived from.
+    #: The threshold a benchmark's score was held to, and the rule that set it; a
+    #: statistical floor's binomial standard error and the sample count behind it
+    #: (``checks/eval_score.py``).
     floor: float | None = None
     se: float | None = None
     samples: int | None = None
-    #: How ``floor`` was derived, verbatim (see :meth:`.accuracy_policy.Floor.describe`).
     floor_rule: str = ""
     #: Things the verdict wants a reader to see that do not change it -- a
     #: floor not backed by a measurement, a comparison that had no baseline.
@@ -115,11 +114,9 @@ class GateResult:
                 f"{self.duration_s:.0f}s{tree}"
             )
         if self.measured is not None and self.reference is not None:
-            margin = self.measured - (self.reference - (self.tolerance or 0.0))
             return (
-                f"[{verdict}] {label}: measured {self.measured:.4f} vs "
-                f"reference {self.reference:.4f} - tol {self.tolerance or 0.0:.2f} "
-                f"(margin {margin:+.4f}){why}{breakdown} in {self.duration_s:.0f}s{tree}"
+                f"[{verdict}] {label}: measured {self.measured:.4f} vs reference "
+                f"{self.reference:.4f}{why}{breakdown} in {self.duration_s:.0f}s{tree}"
             )
         return f"[{verdict}] {label}: {self.detail}{breakdown} ({self.duration_s:.0f}s){tree}"
 

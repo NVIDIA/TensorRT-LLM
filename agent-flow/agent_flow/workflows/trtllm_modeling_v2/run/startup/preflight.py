@@ -31,6 +31,7 @@ import yaml
 from ...checks import accuracy as accuracy_checks
 from ...checks import check_config
 from ...checks import disagg as disagg_checks
+from ...checks import e2e as e2e_checks
 from ...checks.check_config import resolve_llm_api_options, speculation_flags
 from ...infra.compute import environment as environment_mod
 from ...infra.compute.commands import CommandResult, CommandSpec, LocalCommandExecutor
@@ -38,6 +39,7 @@ from ...infra.compute.environment import RunEnvironment, resolve_environment, sc
 from ...infra.compute.sessions import GATE_ROLES, sessions_from_task
 from ...infra.git import git_output
 from ...operators.coverage import MODELING_V2_PACKAGE
+from ...spec import verification as verification_mod
 from ...spec.derive import hybrid_marker
 from ...spec.task_schema import (
     assembly_units,
@@ -380,8 +382,8 @@ def check_accuracy_anchors(
 ) -> list[str]:
     """Assert every unit's anchor ROW resolves, before any unit is built.
 
-    The lookup is :func:`~.accuracy.resolve_reference`, the accuracy gate's own,
-    so this check fails exactly when the gate would. Skipped rather than
+    The lookup is :func:`~.accuracy.resolve_reference`, by the spec's discriminators; the
+    e2e test's ``accuracy_core`` matches the row the engine's configuration names. Skipped rather than
     failed: a run with no ``accuracy`` block, a unit whose block names no
     reference file, and a reference file that is not in this checkout (a
     note records the weaker claim). Returns notes: every resolved anchor with
@@ -403,8 +405,12 @@ def check_accuracy_anchors(
         benchmark = str(resolve_per_unit(accuracy, "benchmark", unit) or "").strip()
         model_key = accuracy_checks.resolve_model_key(task_data, unit)
         # Resolved once and passed in, so the message and the lookup cannot
-        # disagree about which row was searched for.
-        wanted = accuracy_checks.resolve_discriminators(accuracy, unit)
+        # disagree about which row was searched for. A speculator's row is the one
+        # accuracy_core matches its engine's spec_dec_algo to.
+        try:
+            wanted = accuracy_checks.reference_discriminators(task_data, unit)
+        except ValueError as exc:
+            raise PreflightError(f"accuracy anchor for unit `{unit}`: {exc}") from exc
         try:
             score = accuracy_checks.resolve_reference(
                 task_data, model_key=model_key, discriminators=wanted, unit=unit
@@ -432,8 +438,16 @@ def check_accuracy_anchors(
                 f"to the reference file, citing the written source the number came from "
                 f"(an anchor is never invented), or fix `accuracy.model_key` / "
                 f"`accuracy.discriminators` for this unit. Left alone, this unit would "
-                f"assemble, boot on every member and die at its accuracy gate hours "
+                f"assemble, boot on every member and die at its benchmark hours "
                 f"from now, on this."
+                + (
+                    f"\n\nThe row needs spec_dec_algo: {wanted['spec_dec_algo']}: accuracy_core "
+                    "matches the engine's speculative decoding too. A drafter whose tokens the "
+                    "target verifies greedily does not change its answers, so its row may "
+                    "repeat the row without it, as the DFlash rows of references/gsm8k.yaml do."
+                    if wanted and wanted.get("spec_dec_algo")
+                    else ""
+                )
             ) from exc
         if score <= PLACEHOLDER_ANCHOR_MAX:
             raise PreflightError(
@@ -471,7 +485,7 @@ def _uncommitted(task_data: Mapping[str, Any], declared: str) -> str:
 
 
 def check_variant_anchors(task_data: Mapping[str, Any], world_size: int) -> list[str]:
-    """Every configuration variant with an accuracy gate has an anchor its gate can read.
+    """Every configuration variant with a benchmark has an anchor its e2e test can be judged by.
 
     A variant that names a row of its own looks it up under the variant's name,
     with its own ``accuracy`` overlay (``checks/check_config.variant_spec``). A
@@ -485,7 +499,7 @@ def check_variant_anchors(task_data: Mapping[str, Any], world_size: int) -> list
             continue
         if anchor_state(task_data, name) == ANCHOR_RELATIVE:
             contract = contract or contract_mod.compile_contract(task_data, world_size)
-            own = [c for c in contract.checks if c.unit == name and c.gate.startswith("accuracy[")]
+            own = [c for c in contract.checks if c.unit == name and c.scores]
             alone = [c.member for c in own if not c.after]
             if alone:
                 raise PreflightError(
@@ -503,6 +517,82 @@ def check_variant_anchors(task_data: Mapping[str, Any], world_size: int) -> list
             continue
         spec = check_config.variant_spec(task_data, name, world_size=world_size)
         notes.extend(check_accuracy_anchors(spec, [name]))
+    return notes
+
+
+def check_tests(
+    task_data: Mapping[str, Any], world_size: int, *, family: str = "", target_rel: str = ""
+) -> list[str]:
+    """Every test of the run can run on the tree before the run starts.
+
+    A pytest test is defined in the tree's sources (``spec.verification.defined``):
+    its file, class and function; nothing is imported, collected or run, a
+    parametrization is not looked at, and a node that selects nothing fails when it
+    runs. So is an extra check, ``f(result)`` in the target's own ``extra_checks.py``
+    or the shared ``_extra_checks.py`` and not both (``checks/e2e.resolve_extra_checks``),
+    once ``family`` and ``target_rel`` say where the target is. A test of datasets needs the
+    tree's runner (``checks/e2e.RUNNER_MODULE``), and each benchmark beyond its
+    feature's own (``accuracy.benchmark``, checked by :func:`check_accuracy_anchors`)
+    a references row for the model.
+    """
+    notes: list[str] = []
+    repo = str(task_data.get("trtllm_repo_path") or "")
+    missing: list[str] = []
+    tests = contract_mod.run_tests(task_data, world_size)
+    accuracy = task_data.get("accuracy") or {}
+    if (
+        any(t.runner == verification_mod.RUN_DATASETS for t in tests)
+        and not (Path(repo) / e2e_checks.RUNNER_MODULE).is_file()
+    ):
+        raise PreflightError(
+            f"{repo} holds no {e2e_checks.RUNNER_MODULE}, the runner of the e2e test every "
+            "test of datasets runs through: this tree predates it. Rebase the run's branch on "
+            "a main that has it."
+        )
+    for test in tests:
+        where = f"`{test.feature}.{test.name}`"
+        for node in test.nodes:
+            probe = node.replace(verification_mod.MEMBER_PLACEHOLDER, "").replace(
+                verification_mod.FEATURE_PLACEHOLDER, test.feature
+            )
+            there, said = verification_mod.defined(repo, probe)
+            if there is False:
+                missing.append(f"{where}: {said}")
+            elif there is None:
+                notes.append(f"test {where} ({test.stage}): unchecked, {said}")
+            else:
+                notes.append(f"test {where} ({test.stage}): {said}")
+        if test.extra_checks and family:
+            found, problems = e2e_checks.resolve_extra_checks(
+                repo, family, target_rel, test.extra_checks
+            )
+            missing += [f"{where}: extra check {said}" for said in problems]
+            notes += [f"test {where}: extra check {node}" for node in found.values()]
+        own = str(resolve_per_unit(accuracy, "benchmark", test.feature) or "gsm8k")
+        for dataset in test.benchmarks:
+            if dataset == own:
+                continue
+            path = Path(repo) / e2e_checks.REFERENCES_DIR / f"{dataset}.yaml"
+            try:
+                score = accuracy_checks.load_reference_score(
+                    path,
+                    accuracy_checks.resolve_model_key(task_data, test.feature),
+                    discriminators=accuracy_checks.reference_discriminators(
+                        task_data, test.feature
+                    ),
+                )
+            except (KeyError, OSError, TypeError, ValueError) as exc:
+                detail = str(exc.args[0]) if isinstance(exc, KeyError) and exc.args else str(exc)
+                missing.append(f"{where}: {dataset} has no references row ({detail})")
+                continue
+            notes.append(f"test {where}: {dataset} references row {score:g}")
+    if missing:
+        raise SpecInconsistencyError(
+            "tests the run declares cannot run on the tree: "
+            + "; ".join(missing)
+            + ". A test of the spec's own is in the tree, and a benchmark's references row "
+            "is committed, before the run starts."
+        )
     return notes
 
 
@@ -558,30 +648,21 @@ def check_gate_budgets(task_data: Mapping[str, Any]) -> list[str]:
     The spool admits a job only where it can finish before its allocation ends, so a
     gate whose limit is longer than a whole allocation is never admitted: it would wait
     for ever. The benchmark's limit is ``accuracy.timeout`` (default four hours), the
-    disaggregated test's ``accuracy.disagg.timeout``, and a boot's or the acceptance gate's
-    the longest ``timeout`` ``accuracy.boot`` or ``accuracy.acceptance`` declares.
+    disaggregated test's ``accuracy.disagg.timeout``, and a test the spec changes or
+    declares its ``timeout`` (per member, per pytest node).
     """
     sessions = [s for s in sessions_from_task(task_data) if s.role in GATE_ROLES and s.time_limit_s]
     if not sessions:
         return []
     budget = int(max(s.time_limit_s for s in sessions))
     accuracy = task_data.get("accuracy") or {}
-    limits = {
-        "accuracy.timeout": int(accuracy.get("timeout") or accuracy_checks.ACCURACY_TIMEOUT_S)
-    }
+    limits = {"accuracy.timeout": int(accuracy.get("timeout") or contract_mod.E2E_TIMEOUT_S)}
     disagg = disagg_checks.DisaggSpec.from_task(task_data)
     if disagg is not None:
         limits["accuracy.disagg.timeout"] = int(disagg.timeout)
-    for block in ("boot", "acceptance"):
-        level = accuracy.get(block)
-        levels = [level, *level.values()] if isinstance(level, Mapping) else []
-        declared = [
-            int(entry["timeout"])
-            for entry in levels
-            if isinstance(entry, Mapping) and entry.get("timeout") is not None
-        ]
-        if declared:
-            limits[f"accuracy.{block}.timeout"] = max(declared)
+    for (feature, name), entry in verification_mod.entries(task_data).items():
+        if entry.get("timeout") is not None:
+            limits[f"verification.{feature}.{name}.timeout"] = int(entry["timeout"])
     over = {key: limit for key, limit in limits.items() if limit > budget}
     if over:
         raise PreflightError(
@@ -670,7 +751,7 @@ def check_speculation_support(task_data: Mapping[str, Any]) -> list[str]:
     return [f"speculation: {', '.join(sorted(asked))} supported by public LLM configuration"]
 
 
-_LLM_API_GATE = "accuracy (trtllm-eval)"
+_LLM_API_GATE = "the e2e test"
 
 
 def check_capture_lists(task_data: Mapping[str, Any]) -> list[str]:
@@ -888,6 +969,8 @@ def run_preflight(
     notes.extend(check_variant_anchors(task_data, world_size))
     notes.extend(check_launch_settings(task_data))
     notes.extend(check_disagg_placement(task_data, world_size))
+    family, target_rel = resolve_target_identity(task_data, checkpoint_config)
+    notes.extend(check_tests(task_data, world_size, family=family, target_rel=target_rel))
     notes.extend(check_gate_budgets(task_data))
     notes.extend(check_speculation_support(task_data))
     notes.extend(check_capture_lists(task_data))
@@ -920,7 +1003,6 @@ def run_preflight(
         check_multirank_substrate(world_size, environment, runner)
 
     slug = derive_slug(task_data)
-    family, target_rel = resolve_target_identity(task_data, checkpoint_config)
     return PreflightResult(
         slug=slug,
         branch=f"trtllm-modeling-v2/{slug}",
@@ -1012,6 +1094,7 @@ __all__ = [
     "check_capture_lists",
     "check_disagg_placement",
     "check_gate_budgets",
+    "check_tests",
     "check_variant_anchors",
     "check_kv_cache_configs",
     "check_speculation_support",

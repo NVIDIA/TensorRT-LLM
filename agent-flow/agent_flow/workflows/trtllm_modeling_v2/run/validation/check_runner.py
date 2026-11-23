@@ -8,18 +8,17 @@ from __future__ import annotations
 import copy
 import threading
 from dataclasses import replace
-from typing import Any, Callable
+from pathlib import Path
+from typing import Any, Callable, Sequence
 
 from rich.markup import escape as escape_markup
 
 from agent_flow.console import print_message
 
-from ...checks import acceptance as acceptance_checks
 from ...checks import accuracy as accuracy_checks
 from ...checks import boot as boot_checks
-from ...checks import check_config, disagg, serve
+from ...checks import check_config, disagg, e2e, serve, user_tests
 from ...checks import verdict as check_result
-from ...checks.accuracy import resolve_model_key
 from ...infra.compute.environment import RunEnvironment
 from ...infra.compute.executor import (
     ACCURACY,
@@ -34,12 +33,14 @@ from ...infra.compute.executor import (
 from ...infra.compute.sessions import session_wait_from_task
 from ...infra.git import resolve_commit
 from ...spec import variants as variants_mod
+from ...spec import verification as verification_mod
 from ...spec.task_schema import (
     assembly_units,
     features_through,
     parse_parallel_segment,
     resolve_per_unit,
 )
+from ...spec.verification import DATASET_ACCEPTANCE
 from ..startup import datasets as datasets_mod
 from ..workspace import snapshots as snapshots_mod
 from . import anchors as anchors_mod
@@ -67,6 +68,7 @@ class CheckRunner:
         self._member_runners = {}
         self._session = threading.local()
         self.pin = None
+        self._tests: dict[tuple[str, str], verification_mod.Test] | None = None
 
     def _features_through(self, unit: str) -> list[str]:
         """Features implemented once ``unit`` is assembled, in order.
@@ -224,24 +226,21 @@ class CheckRunner:
 
         return run
 
-    def _reference_score(self, unit: str | None = None, spec: Any = None) -> float:
-        # `unit` is load-bearing: the accuracy references discriminate rows by
-        # `quant_algo` / `spec_dec_algo`, so core and the `mtp` increment
-        # anchor to DIFFERENT numbers.
-        spec = spec or self.task_data
-        return accuracy_checks.resolve_reference(
-            spec, model_key=resolve_model_key(spec, unit), unit=unit
-        )
-
     # ----------------------------------------------------------------- checks
     def _prioritized_check(self, check: contract_mod.Check, log) -> Any:
         """:meth:`_run_contract_check`, its jobs queued at the check's class (:func:`job_priority`).
 
-        The first unit's inner checks are on the way to its accuracy, and go
-        ahead of every other check in a session's spool.
+        The first unit's own landing checks of the flow's tests are on the way to
+        its accuracy, and go ahead of every other check in a session's spool. The
+        spec's own tests do not.
         """
         units = assembly_units(self.task_data)
-        first = bool(units) and check.unit == units[0] and check.tier == contract_mod.TIER_INNER
+        first = (
+            bool(units)
+            and check.unit == units[0]
+            and check.stage == contract_mod.STAGE_LANDING
+            and check.origin != verification_mod.ORIGIN_SPEC
+        )
         with job_priority(ACCURACY if first else FEATURE):
             return self._run_contract_check(check, log)
 
@@ -303,63 +302,73 @@ class CheckRunner:
         return view
 
     # ------------------------------------------------------------------ gates
+    def _run_tests(self) -> dict[tuple[str, str], verification_mod.Test]:
+        """The run's tests by ``(feature, name)`` (``contract.run_tests``), read once."""
+        if self._tests is None:
+            world = self.workflow._gate_env().world_size
+            self._tests = {
+                (t.feature, t.name): t for t in contract_mod.run_tests(self.task_data, world)
+            }
+        return self._tests
+
+    def _test_of(self, check: contract_mod.Check) -> verification_mod.Test:
+        test = self._run_tests().get((check.unit, check.gate))
+        if test is None:
+            raise ValueError(f"contract check {check.key} names no test of this run")
+        return test
+
     def _gate_call(self, check: contract_mod.Check) -> Callable[[Any], Any]:
-        """``check``'s gate, as a function of the runner it launches with."""
-        unit, member, gate = check.unit, check.member, check.gate
+        """``check``'s test, as a function of the runner it launches with.
+
+        Its result is named by the test, whatever the runner calls it.
+        """
+        call = self._test_call(check)
+        return lambda runner: _named(call(runner), check.gate)
+
+    def _test_call(self, check: contract_mod.Check) -> Callable[[Any], Any]:
+        unit, member = check.unit, check.member
+        test = self._test_of(check)
         spec, features = self._spec_for(unit)
         env = self._member_env(member)
         workdir = self.workspace / "gates" / unit
-
-        def common(runner: Any) -> dict[str, Any]:
-            return dict(task_data=spec, runner=runner, unit=unit, member=member)
-
-        if gate == "boot":
-            return lambda runner: boot_checks.run_boot_gate(
-                env, features=features, workdir=workdir,
-                spec=boot_checks.resolve_boot_spec(spec, unit, features),
-                **common(runner),
-            )  # fmt: skip
-        if gate.startswith("accuracy["):
-            if variants_mod.anchor_state(self.task_data, unit) == variants_mod.ANCHOR_RELATIVE:
-                return lambda runner: self._relative_accuracy(check, env, spec, workdir, runner)
-            return lambda runner: self._anchored_accuracy(check, env, spec, workdir, runner)
-        if gate == "acceptance":
-            return lambda runner: acceptance_checks.run_acceptance_gate(
-                env, features=features, workdir=workdir, **common(runner)
-            )
-        if gate == disagg.GATE_NAME:
+        if test.runner == verification_mod.RUN_DATASETS:
+            return lambda runner: self._datasets(check, test, env, spec, workdir, runner)
+        if test.runner == verification_mod.RUN_DISAGG:
             return lambda runner: disagg.run_disagg_gate(
-                env, workdir=workdir, task_data=self._with_dataset(spec, gate, unit),
+                env, workdir=workdir, task_data=self._with_dataset(spec, unit),
                 runner=runner, unit=unit, member=member,
             )  # fmt: skip
-        if gate == serve.GATE_NAME:
+        if test.runner == verification_mod.RUN_SERVE:
             return lambda runner: serve.run_serve_gate(
                 env, features=features, workdir=workdir,
                 boot=boot_checks.resolve_boot_spec(spec, unit, features),
-                **common(runner),
+                task_data=spec, runner=runner, unit=unit, member=member,
             )  # fmt: skip
-        raise ValueError(f"contract check {check.key} names no gate this workflow runs")
+        return lambda runner: user_tests.run_user_test(
+            env, task_data=spec, test=test, workdir=workdir, runner=runner,
+            member=member, features=features,
+        )  # fmt: skip
 
-    def _with_dataset(self, spec: Any, gate: str, unit: str | None = None) -> Any:
-        """``spec`` with the staged dataset its gate reads (``startup/datasets.py``), once ready.
+    def _with_dataset(self, spec: Any, unit: str | None = None) -> Any:
+        """``spec`` with the staged dataset the disaggregated gate reads (``startup/datasets.py``), once ready.
 
-        A benchmark (a stated disaggregated deployment's too) gets it as
-        ``accuracy.dataset_path`` (``trtllm-eval --dataset_path``); the disaggregated test, which
-        reads it under ``$LLM_MODELS_ROOT``, a models root that holds it. A dataset still
-        being staged is waited for; one that could not be is left out, and the gate runs as
-        it would without it.
+        A stated deployment's benchmark gets it as ``accuracy.dataset_path``
+        (``trtllm-eval --dataset_path``); the disaggregated test, which reads it under
+        ``$LLM_MODELS_ROOT``, a models root that holds it. A dataset still being staged is
+        waited for; one that could not be is left out, and the gate runs as it would
+        without it.
         """
         accuracy = dict(spec.get("accuracy") or {})
-        benchmark = gate[len("accuracy[") : -1] if gate.startswith("accuracy[") else "gsm8k"
-        if gate == disagg.GATE_NAME and not (accuracy.get("disagg") or {}).get("test"):
+        block = dict(accuracy.get("disagg") or {})
+        benchmark = "gsm8k"
+        if not block.get("test"):
             benchmark = str(resolve_per_unit(accuracy, "benchmark", unit) or benchmark)
         if benchmark not in datasets_mod.status(self.workspace):
             return spec
         path = datasets_mod.wait(self.workspace, benchmark)
         if not path:
             return spec
-        if gate == disagg.GATE_NAME and (accuracy.get("disagg") or {}).get("test"):
-            block = dict(accuracy.get("disagg") or {})
+        if block.get("test"):
             env = dict(block.get("env") or {})
             outer = (spec.get("environment") or {}).get("env") or {}
             root = env.get("LLM_MODELS_ROOT") or outer.get("LLM_MODELS_ROOT") or ""
@@ -373,75 +382,151 @@ class CheckRunner:
             return spec
         return {**spec, "accuracy": accuracy}
 
-    def _anchored_accuracy(
-        self, check: contract_mod.Check, env: RunEnvironment, spec: Any, workdir: Any, runner: Any
-    ) -> "check_result.GateResult":
-        """A unit's benchmark against its anchor: its reference row, or its own measured score.
+    def _models_root_env(self, spec: Any, datasets: Sequence[str]) -> dict[str, str]:
+        """``LLM_MODELS_ROOT`` for a test that reads ``datasets``: a root that holds them.
 
-        Its own score takes over where the row is a low placeholder and the unit has
-        measured a score at this member. The first pass on a placeholder keeps the score it measured as the unit's
-        anchor there (``validation/anchors.py``); every later benchmark of the unit at
-        that member is held to that score, as a variant is to its unit's.
+        Where the spec's models root lacks a staged dataset (``startup/datasets.py``),
+        a root of links to its entries with the staged copy beside them stands in for
+        it. Empty when the spec's root serves as it is.
         """
-        spec = self._with_dataset(spec, check.gate)
+        staged = datasets_mod.status(self.workspace)
+        outer = (spec.get("environment") or {}).get("env") or {}
+        root = str(outer.get(e2e.MODELS_ROOT_ENV) or "")
+        chosen = root
+        for name in datasets:
+            if name not in staged or name not in datasets_mod.KNOWN:
+                continue
+            path = datasets_mod.wait(self.workspace, name)
+            if path:
+                chosen = datasets_mod.models_root(self.workspace, chosen, name, path) or chosen
+        return {e2e.MODELS_ROOT_ENV: chosen} if chosen and chosen != root else {}
+
+    def _reference_row(self, unit: str, spec: Any, dataset: str) -> float | None:
+        """The score ``dataset``'s references row gives ``unit``, as the flow reads it; ``None`` if none.
+
+        The row ``accuracy_core`` matches: by the spec's discriminators and the
+        engine's speculative decoding (``checks/accuracy.reference_discriminators``).
+        """
+        path = Path(str(spec["trtllm_repo_path"])) / e2e.REFERENCES_DIR / f"{dataset}.yaml"
+        try:
+            return accuracy_checks.load_reference_score(
+                path,
+                accuracy_checks.resolve_model_key(spec, unit),
+                discriminators=accuracy_checks.reference_discriminators(spec, unit),
+            )
+        except (KeyError, OSError, TypeError, ValueError):
+            return None
+
+    def _datasets(
+        self,
+        check: contract_mod.Check,
+        test: verification_mod.Test,
+        env: RunEnvironment,
+        spec: Any,
+        workdir: Any,
+        runner: Any,
+    ) -> "check_result.GateResult":
+        """Run ``check``'s case of the target's generated e2e test, judged against its anchors.
+
+        A benchmark is judged against its references row, by the tree's runner,
+        but for two anchors the flow keeps (``validation/anchors.py``):
+
+        - a row that is a low placeholder (:data:`anchors.PLAUSIBLE_ANCHOR`): the
+          first score the feature measured on it at this member, once it has
+          one; the first pass keeps its score as that anchor;
+        - a configuration variant whose anchor is relative: its unit's score at
+          the same member on this target, for the benchmark its unit's ``e2e``
+          scores first, under the same protocol (``contract.relative_benchmark``).
+          The unit's verdict on this target gives it (the orchestrator runs that
+          check first: :attr:`~..contract.Check.after`); without one the unit's
+          check runs here first, on the same snapshot and devices.
+        """
         unit, member = check.unit, check.member
-        reference = self._reference_score(unit, spec)
-        benchmark = check.gate[len("accuracy[") : -1]
-        plausible = anchors_mod.PLAUSIBLE_ANCHOR.get(benchmark)
-        placeholder = plausible is not None and reference < plausible
-        own = (
-            anchors_mod.measured(self.workspace, unit, check.gate, member) if placeholder else None
+        references: dict[str, float] = {}
+        said: list[str] = []
+        placeholders: list[str] = []
+        relative = contract_mod.relative_benchmark(self.task_data, test, self._run_tests().values())
+        for dataset in test.benchmarks:
+            if relative and dataset == relative:
+                score, why = self._unit_score(check, runner)
+                if isinstance(score, check_result.GateResult):
+                    return score
+                if score is None:
+                    return check_result.GateResult(
+                        name=check.gate,
+                        member=member,
+                        passed=False,
+                        detail=f"{why}, so {unit}, whose {dataset} anchor is that score, has "
+                        "nothing to be judged against",
+                    )
+                references[dataset] = score
+                said.append(f"{dataset} judged against {why}")
+                continue
+            row = self._reference_row(unit, spec, dataset)
+            plausible = anchors_mod.PLAUSIBLE_ANCHOR.get(dataset)
+            if row is None or plausible is None or row >= plausible:
+                continue
+            own = anchors_mod.measured(self.workspace, unit, f"{check.gate}[{dataset}]", member)
+            if own is None:
+                placeholders.append(dataset)
+                continue
+            references[dataset] = own.score
+            said.append(
+                f"{dataset} anchored to {unit}'s own first measured score {own.score:.2f} "
+                f"(tree {own.tree}), which replaced the placeholder {row:g}"
+            )
+        preflight = self.workflow._preflight
+        node = e2e.node_id(preflight.family, preflight.target_rel, unit, check.gate, member)
+        reads = [
+            *test.benchmarks,
+            *([DATASET_ACCEPTANCE] if DATASET_ACCEPTANCE in test.datasets else []),
+        ]
+        result, lines = e2e.run_e2e(
+            env,
+            task_data=spec,
+            test=test,
+            member=member,
+            node=node,
+            workdir=workdir,
+            runner=runner,
+            references=references,
+            env=self._models_root_env(
+                spec, ["gsm8k" if d == DATASET_ACCEPTANCE else d for d in reads]
+            ),
         )
-        if own is not None:
-            result = accuracy_checks.run_accuracy_gate(
-                env, reference=own.score, workdir=workdir, task_data=spec, runner=runner,
-                unit=unit, member=member, relative=True,
-            )  # fmt: skip
-            return replace(
-                result,
-                detail=f"{result.detail}; anchored to {unit}'s own first measured score "
-                f"{own.score:.2f} (tree {own.tree}), which replaced the placeholder {reference:g}",
-                explained=True,
-            )
-        result = accuracy_checks.run_accuracy_gate(
-            env, reference=reference, workdir=workdir, task_data=spec, runner=runner,
-            unit=unit, member=member,
-        )  # fmt: skip
-        measured = getattr(result, "measured", None)
-        if (
-            placeholder
-            and getattr(result, "passed", False)
-            and measured is not None
-            and not getattr(result, "infrastructure", "")
-            and anchors_mod.record(
-                self.workspace,
-                unit,
-                check.gate,
-                member,
-                measured,
-                str(getattr(result, "tree_state", "") or ""),
-            )  # fmt: skip
-        ):
-            self.journal.event(
-                "anchor",
-                f"{check.key}: measured {measured:.2f} on the placeholder {reference:g}; "
-                f"that score anchors {unit}'s later {check.gate} at {member}",
-            )
+        for dataset in placeholders:
+            line = next((x for x in lines if x.get("dataset") == dataset), None)
+            score = line.get("score") if line else None
+            if (
+                line is not None
+                and line.get("passed")
+                and isinstance(score, (int, float))
+                and not result.infrastructure
+                and anchors_mod.record(
+                    self.workspace,
+                    unit,
+                    f"{check.gate}[{dataset}]",
+                    member,
+                    float(score),
+                    str(result.tree_state or ""),
+                )
+            ):
+                self.journal.event(
+                    "anchor",
+                    f"{check.key}: measured {dataset} {score:.2f} on a placeholder row; that "
+                    f"score anchors {unit}'s later {dataset} at {member}",
+                )
+        if said:
+            result = replace(result, detail=f"{result.detail}; " + "; ".join(said), explained=True)
         return result
 
-    def _relative_accuracy(
-        self, check: contract_mod.Check, env: RunEnvironment, spec: Any, workdir: Any, runner: Any
-    ) -> "check_result.GateResult":
-        """A variant's benchmark against its unit's own score at the same member, on this target.
+    def _unit_score(self, check: contract_mod.Check, runner: Any) -> tuple[Any, str]:
+        """A relative variant's anchor: its unit's benchmark score at the same member, on this target.
 
-        The unit's verdict on this target gives the score (the orchestrator runs
-        that check first: :attr:`~..contract.Check.after`). Without one -- a
-        change landed between the two -- the unit's benchmark runs here first,
-        on the same snapshot and devices.
+        The score and where it came from; a lost run's result in place of the score.
         """
-        spec = self._with_dataset(spec, check.gate)
         base = variants_mod.base_unit(self.task_data, check.unit)
-        key = f"{base}:{check.gate}@{check.member}"
+        key = check.after or f"{base}:{verification_mod.E2E}@{check.member}"
         marker = self.pin.marker if self.pin else self.workflow._target_marker()
         status = getattr(self.workflow, "_contract_status", None)
         holds = getattr(self.workflow, "_verdict_holds", None)
@@ -449,45 +534,36 @@ class CheckRunner:
         if verdict is not None:
             score, why = verdict.measured, verdict.detail
         else:
+            unit, _, rest = key.partition(":")
+            gate, _, member = rest.partition("@")
+            if (unit, gate) not in self._run_tests():
+                return None, f"{base} owes no benchmark at {check.member}"
             first = self._gate_call(
-                contract_mod.Check(base, check.gate, check.member, contract_mod.TIER_INNER)
+                contract_mod.Check(unit, gate, member, contract_mod.STAGE_LANDING, scores=True)
             )(runner)
             self.journal.event("gate", f"{first.summary()} (measured as {check.unit}'s anchor)")
             if first.infrastructure:
-                return first
+                return first, ""
             score, why = first.measured, first.detail
         if score is None:
-            return check_result.GateResult(
-                name=check.gate,
-                member=check.member,
-                passed=False,
-                detail=f"{key} measured no score on this target ({why}), so {check.unit}, whose "
-                "anchor is that score, has nothing to be judged against",
-            )
-        return accuracy_checks.run_accuracy_gate(
-            env,
-            reference=score,
-            workdir=workdir,
-            task_data=spec,
-            runner=runner,
-            unit=check.unit,
-            member=check.member,
-            relative=True,
-        )
+            return None, f"{key} measured no score on this target ({why})"
+        return score, f"{key}'s score {score:.2f} on this target"
 
     def _gate_gpus(self, check: contract_mod.Check) -> str | None:
         """The devices ``check``'s job asks for when it is not one member's worth."""
-        if check.gate != disagg.GATE_NAME:
+        if check.runner != verification_mod.RUN_DISAGG:
             return None
         spec = disagg.DisaggSpec.from_task(self._spec_for(check.unit)[0])
         count = spec.device_count(check.member) if spec else None
         return str(count) if count else None
 
     def _gate(self, check: contract_mod.Check, log) -> Any:
-        """Run ``check``'s gate on the target this workflow sees, journal it, and return its result."""
+        """Run ``check``'s test on the target this workflow sees, journal it, and return its result."""
         call = self._gate_call(check)
         nodes, lead = disagg.job_span(
-            self._spec_for(check.unit)[0], check.gate, self._member_env(check.member).nodes
+            self._spec_for(check.unit)[0],
+            disagg.GATE_NAME if check.runner == verification_mod.RUN_DISAGG else check.gate,
+            self._member_env(check.member).nodes,
         )
         runner = self._member_runner(check.member, self._gate_gpus(check), nodes=nodes, lead=lead)
         result = self._gate_until_verdict(lambda: call(runner), log)
@@ -495,9 +571,14 @@ class CheckRunner:
         self.journal.event("gate", result.summary())
         if not result.passed:
             print_message(f"[bold yellow]↻ {escape_markup(result.summary())}[/bold yellow]", log)
-            if check.gate == disagg.GATE_NAME and result.stdout_tail.strip():
+            if check.runner != verification_mod.RUN_SERVE and result.stdout_tail.strip():
                 self.journal.section(
                     f"`{check.key}` failed: the test's last lines",
                     f"```\n{result.stdout_tail.rstrip()}\n```",
                 )
         return result
+
+
+def _named(result: Any, name: str) -> Any:
+    """``result`` named ``name``: a check's verdict carries its test's name."""
+    return result if getattr(result, "name", name) == name else replace(result, name=name)

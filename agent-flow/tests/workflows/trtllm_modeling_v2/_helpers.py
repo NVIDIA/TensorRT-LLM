@@ -12,8 +12,7 @@ from pathlib import Path
 
 import yaml
 
-from agent_flow.workflows.trtllm_modeling_v2.checks import delivery
-from agent_flow.workflows.trtllm_modeling_v2.checks.harness import workload_io
+from agent_flow.workflows.trtllm_modeling_v2.checks import delivery, e2e
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import CommandResult
 from agent_flow.workflows.trtllm_modeling_v2.operators import coverage as catalog_paths
 from agent_flow.workflows.trtllm_modeling_v2.operators import coverage as vocab
@@ -140,13 +139,18 @@ def _build_repo(tmp_path: Path, *, modeling: str = _MODELING) -> Path:
     (refs / "gsm8k.yaml").write_text(
         yaml.safe_dump({"openai/gpt-oss-120b": [{"accuracy": 85.6}]}), encoding="utf-8"
     )
-    tests_dir = root / delivery.ACCURACY_TESTS_DIR
-    tests_dir.mkdir(parents=True, exist_ok=True)
-    (tests_dir / "test_modeling_v2_gpt_oss.py").write_text("def test(): ...\n", encoding="utf-8")
+    # The tree's runner of the generated e2e tests, and the target's generated test, listed.
+    runner = root / e2e.RUNNER_MODULE
+    runner.parent.mkdir(parents=True, exist_ok=True)
+    runner.write_text("def load_cases(path): ...\n\n\ndef run_case(case): ...\n", encoding="utf-8")
+    generated, _ = e2e.generated_paths("gpt_oss", TARGET_REL)
+    (root / generated).parent.mkdir(parents=True, exist_ok=True)
+    (root / generated).write_text(e2e.render_test(TARGET_REL), encoding="utf-8")
     db = root / delivery.TEST_DB_DIR
     db.mkdir(parents=True)
+    listed = generated.removeprefix("tests/integration/defs/")
     (db / "l0_gb300.yml").write_text(
-        "- condition: {}\n  tests:\n  - accuracy/test_modeling_v2_gpt_oss.py::T::t\n",
+        f"- condition: {{}}\n  tests:\n  - {listed}\n",
         encoding="utf-8",
     )
     return root
@@ -162,7 +166,7 @@ def _verify(root: Path) -> delivery.DeliveryReport:
         family="gpt_oss",
         reference_yaml=f"{delivery.ACCURACY_REFERENCES_DIR}/gsm8k.yaml",
         model_key="openai/gpt-oss-120b",
-        accuracy_test="test_modeling_v2_gpt_oss.py",
+        accuracy_test=delivery.accuracy_test_path(root, "gpt_oss", TARGET_REL),
     )
 
 
@@ -263,30 +267,67 @@ def healthy_smi(count: int = 1):
     return runner
 
 
-def driver_records(accepted: int = 320, iterations: int = 100, prompts: int = 32) -> str:
-    """What the engine driver prints for ``prompts`` prompts accepting alike."""
-    lines = []
-    for n in range(prompts):
-        record = {
-            "index": n,
-            "id": f"d{n}",
-            "tokens": accepted,
-            "iterations": iterations,
-            "token_ids": list(range(accepted)),
-            "text": "Paris is the capital of France",
-        }
-        lines.append(f"{workload_io.RECORD_MARKER} {json.dumps(record)}")
-    return "\n".join(lines) + "\n"
+_JUNIT = re.compile(r"--junitxml=('[^']*'|\S+)")
+_RESULTS = re.compile(r"MV2_E2E_RESULTS=('[^']*'|\S+)")
+_CASE = re.compile(r"test_e2e\[([^\]]+)\]")
+
+
+def _path_in(pattern: re.Pattern, command: str) -> Path | None:
+    match = pattern.search(command)
+    return Path(match.group(1).strip("'")) if match else None
+
+
+def e2e_answer(
+    command: str,
+    *,
+    score: float = 90.0,
+    accepted: int = 320,
+    iterations: int = 100,
+    passed: bool = True,
+) -> CommandResult:
+    """What one case of the generated e2e test leaves: a line per dataset, and its JUnit report."""
+    case = _CASE.search(command)
+    name = case.group(1) if case else "case"
+    lines = [
+        {"case": name, "dataset": "generate", "kind": "generate", "passed": True, "score": None},
+        {
+            "case": name,
+            "dataset": "gsm8k",
+            "kind": "benchmark",
+            "passed": passed,
+            "score": score,
+            "reference": 85.6,
+            "threshold": 81.7,
+            "detail": "" if passed else f"accuracy {score} below the threshold",
+        },
+        {
+            "case": name,
+            "dataset": "acceptance",
+            "kind": "acceptance",
+            "passed": True,
+            "score": accepted / iterations,
+        },
+    ]
+    results = _path_in(_RESULTS, command)
+    if results is not None:
+        results.parent.mkdir(parents=True, exist_ok=True)
+        results.write_text("".join(json.dumps(x) + "\n" for x in lines), encoding="utf-8")
+    report = _path_in(_JUNIT, command)
+    failure = "" if passed else '<failure message="a dataset failed"/>'
+    if report is not None:
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_text(
+            f'<testsuite><testcase classname="TestModelingV2" name="test_e2e[{name}]">'
+            f"{failure}</testcase></testsuite>",
+            encoding="utf-8",
+        )
+    return CommandResult(returncode=0 if passed else 1, stdout="1 passed\n" if passed else "")
 
 
 def passing_shell(score: float = 90.0, accepted: int = 320, iterations: int = 100):
     def runner(command, env=None, timeout=0):
-        if "trtllm-eval" in command:
-            return CommandResult(returncode=0, stdout=f"lm-eval gsm8k average accuracy: {score}\n")
-        # The gates that need per-request structure run the engine driver,
-        # which prints one record per prompt; the acceptance gate wants 32 of them.
-        if "engine_driver.py" in command:
-            return CommandResult(returncode=0, stdout=driver_records(accepted, iterations))
+        if "test_e2e" in command and "--junitxml" in command:
+            return e2e_answer(command, score=score, accepted=accepted, iterations=iterations)
         return CommandResult(
             returncode=0,
             stdout=(

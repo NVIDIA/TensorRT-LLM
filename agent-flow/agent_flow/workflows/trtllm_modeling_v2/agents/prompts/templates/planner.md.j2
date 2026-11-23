@@ -43,7 +43,7 @@ tasks:
       - {{ MODELING_V2_PACKAGE }}/models/<family>/<target>/weights.py
       - {{ MODELING_V2_PACKAGE }}/models/<family>/routing.py
     resources: {gpus: 1, est_minutes: 240}
-    satisfies: ["core:accuracy[gsm8k]@tep4"]   # the keys `contract.yaml` lists for the unit
+    satisfies: ["core:e2e@tep4"]   # the keys `contract.yaml` lists for the unit
     priority: required          # or nice_to_have, from the feature's status
     exclusive: false            # true only for work that needs the tree to itself
     ref: core                   # what it works on: the unit (assemble, feature),
@@ -248,7 +248,7 @@ attention tensor-parallel and the experts expert-parallel, on both.
 
 **Configuration variants** (`variants:` in `task.yaml`) are configurations a
 built unit must also serve: a KV-cache or SSM-state dtype, a speculation
-depth. Their checks are named by the variant (`kv_fp8:accuracy[gsm8k]@tep4`)
+depth. Their checks are named by the variant (`kv_fp8:e2e@tep4`)
 and run on the unit's target with the variant's overlay, so they are claimed
 first by a `check` task after the unit they configure. Add a `feature` task
 whose `ref` is the variant only when the target must change.
@@ -270,8 +270,11 @@ fix that lands later reaches it through integration.
 Once full support holds (every required check, the delivery files on disk, no
 local variant waiting), the orchestrator records that commit and the run is
 delivered at once. So plan the delivery files as a task of their own once the
-first unit's assembly is done: the CI accuracy test, its entry on a test list and,
-when the accuracy anchor is written, the accuracy reference entry.
+first unit's assembly is done: the entry on a test list for the target's e2e
+test (the flow writes and commits the test itself, `test_e2e.py` and
+`e2e_cases.yaml` in the target's accuracy directory, from the spec; no task
+edits them) and, when the accuracy anchor is written, the accuracy reference
+entry.
 
 When a check fails, read its evidence and the previous task's receipt before
 adding work. Keep ordinary build, import and launch repairs in the existing

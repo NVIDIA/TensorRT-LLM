@@ -48,13 +48,14 @@ from ..agents.roles import PACKAGED_SKILLS_DIR, resolve_role_agents
 from ..agents.slots import AgentGate, Priority, turn_priority
 from ..agents.turns import InProcessTurnExecutor, TurnRequest, TurnTimeout
 from ..checks import boot as boot_checks
-from ..checks import check_runtime
+from ..checks import check_runtime, e2e
 from ..checks import verdict as check_result
 from ..infra.compute.commands import CommandExecutor
 from ..infra.compute.environment import RunEnvironment
 from ..infra.compute.rebuild import LIBRARY_PATTERNS
 from ..infra.files import write_text_atomic
 from ..infra.git import CommitPolicy, git_output
+from ..spec import verification as verification_mod
 from ..spec.task_schema import load_and_validate_task_yaml
 from . import orchestrator as orchestrator_mod
 from .execution.handoff import current_decision
@@ -101,6 +102,8 @@ UNGATED_SUFFIXES: tuple[str, ...] = (".md",)
 NATIVE_LIBRARY_DIRS: tuple[str, ...] = ("tensorrt_llm", "tensorrt_llm/libs")
 #: The spec's blocks whose values may name a file a gate reads.
 GATE_INPUT_BLOCKS: tuple[str, ...] = ("accuracy", "runtime", "variants", "environment")
+#: The tree's accuracy harness, which a test of datasets judges benchmarks by.
+ACCURACY_CORE = "tests/integration/defs/accuracy/accuracy_core.py"
 
 
 def _same_tree(a: Path, b: Path) -> bool:
@@ -1070,21 +1073,34 @@ def gate_relevant(path: str, *, keep: Collection[str] = (), denied: Sequence[str
 
 
 def gate_inputs(task_data: Mapping[str, Any], repo: str | Path) -> frozenset[str]:
-    """The files a gate reads whole under the ungated paths, relative to the checkout.
+    """The files a check reads whole under the ungated paths, relative to the checkout.
 
-    The image a multimodal boot sends
-    when the spec names none, and every file inside the checkout that a
-    gate-facing block of the spec names (:data:`GATE_INPUT_BLOCKS`): an
-    options file, a prompts file, an image, a script in a command, and the
-    accuracy anchor tables.
+    The image a multimodal boot sends when the spec names none, and every file
+    inside the checkout that a gate-facing block of the spec names
+    (:data:`GATE_INPUT_BLOCKS`): an options file, a prompts file, an image, a
+    script in a command, and the accuracy anchor tables; the file of each pytest
+    test ``verification`` names; and what a test of datasets runs: the tree's
+    runner, ``accuracy_core``, the benchmarks' references and the targets'
+    generated e2e tests (``checks/e2e.py``).
     """
     root = Path(repo)
-    keep = {boot_checks.DEFAULT_BOOT_IMAGE}
+    keep = {boot_checks.DEFAULT_BOOT_IMAGE, e2e.RUNNER_MODULE, ACCURACY_CORE}
+    keep |= {f"{e2e.REFERENCES_DIR}/{name}.yaml" for name in verification_mod.BENCHMARKS}
     for block in GATE_INPUT_BLOCKS:
         for word in _path_words(task_data.get(block)):
             path = _in_checkout(word, root)
             if path is not None:
                 keep.add(path)
+    for entry in verification_mod.entries(task_data).values():
+        nodes = entry.get("pytest")
+        for node in [nodes] if isinstance(nodes, str) else nodes or ():
+            path = _in_checkout(str(node).partition("::")[0], root)
+            if path is not None:
+                keep.add(path)
+    for name in (e2e.TEST_FILENAME, e2e.CASES_FILENAME):
+        keep |= {
+            p.relative_to(root).as_posix() for p in root.glob(f"{e2e.ACCURACY_ROOT}/*/*/{name}")
+        }
     return frozenset(keep)
 
 

@@ -7,13 +7,11 @@ from __future__ import annotations
 
 import contextlib
 import json
-import math
 import os
 import re
 import shutil
 import subprocess
 import sys
-import textwrap
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -21,8 +19,6 @@ import pytest
 import yaml
 
 from agent_flow.workflows.trtllm_modeling_v2.checks import acceptance as acceptance_checks
-from agent_flow.workflows.trtllm_modeling_v2.checks import accuracy as accuracy_checks
-from agent_flow.workflows.trtllm_modeling_v2.checks import boot as boot_checks
 from agent_flow.workflows.trtllm_modeling_v2.checks import (
     check_config,
     delivery,
@@ -32,14 +28,9 @@ from agent_flow.workflows.trtllm_modeling_v2.checks import (
 )
 from agent_flow.workflows.trtllm_modeling_v2.checks import serve as sg
 from agent_flow.workflows.trtllm_modeling_v2.checks import test_results as tc
-from agent_flow.workflows.trtllm_modeling_v2.checks import verdict as check_result
 from agent_flow.workflows.trtllm_modeling_v2.checks.delivery import Check as DeliveryCheck
 from agent_flow.workflows.trtllm_modeling_v2.checks.delivery import DeliveryReport
-from agent_flow.workflows.trtllm_modeling_v2.checks.harness import (
-    reuse_probe,
-    serve_driver,
-    workload_io,
-)
+from agent_flow.workflows.trtllm_modeling_v2.checks.harness import serve_driver, workload_io
 from agent_flow.workflows.trtllm_modeling_v2.checks.harness import test_driver as drv
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import CommandResult
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import (
@@ -47,7 +38,6 @@ from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import (
     resolve_environment,
 )
 from agent_flow.workflows.trtllm_modeling_v2.operators import coverage as catalog_paths
-from agent_flow.workflows.trtllm_modeling_v2.run.validation import contract as contract_mod
 from agent_flow.workflows.trtllm_modeling_v2.run.validation import test_jobs
 from agent_flow.workflows.trtllm_modeling_v2.run.validation.check_runner import CheckRunner
 from agent_flow.workflows.trtllm_modeling_v2.run.validation.completion import (
@@ -56,7 +46,6 @@ from agent_flow.workflows.trtllm_modeling_v2.run.validation.completion import (
 from agent_flow.workflows.trtllm_modeling_v2.run.validation.completion import (
     tests_check as delivered_tests,
 )
-from agent_flow.workflows.trtllm_modeling_v2.spec import task_schema
 
 from ._helpers import _ENTRY, _REPO_ROOT, TARGET_REL, _build_repo, _verify, _write_entry
 
@@ -67,7 +56,6 @@ _gates_TASK = {
     "accuracy": {
         "benchmark": "gsm8k",
         "reference_yaml": "tests/integration/defs/accuracy/references/gsm8k.yaml",
-        "tolerance": 5.0,
     },
 }
 
@@ -157,37 +145,6 @@ def test_normalization_preserves_source_skip_template_order_and_image_requests(t
         workload_io.normalize_requests(spec)
 
 
-def test_repeat_probe_completes_before_resubmission_and_pins_attention_rank(monkeypatch):
-    events = []
-    monkeypatch.setitem(
-        sys.modules,
-        "tensorrt_llm.scheduling_params",
-        SimpleNamespace(SchedulingParams=lambda **kw: kw),
-    )
-
-    class LLM:
-        tokenizer = SimpleNamespace(encode=lambda *args, **kwargs: [1, 2, 3])
-
-        def get_kv_cache_capacity(self):
-            return {"tokensPerBlock": 4, "maxNumTokens": 128}
-
-        def generate_async(self, prompt, params, **kwargs):
-            events.append(("submit", kwargs))
-            return SimpleNamespace(
-                result=lambda: events.append(("complete", {})) or SimpleNamespace(cached_tokens=4)
-            )
-
-    result = reuse_probe.probe(LLM(), SimpleNamespace(), {"enable_attention_dp": True})
-    assert result["status"] == "OBSERVED" and result["reused"] == 4
-    assert [e[0] for e in events] == ["submit", "complete", "submit", "complete"]
-    assert events[0][1] == events[2][1]
-    assert events[0][1]["scheduling_params"] == {
-        "attention_dp_rank": 0,
-        "attention_dp_relax": False,
-    }
-    assert reuse_probe.probe(SimpleNamespace(), SimpleNamespace(), {})["status"] == "UNKNOWN"
-
-
 def test_the_gate_reads_the_driver_and_names_the_member(tmp_path):
     options = tmp_path / "core.llm_api.yaml"
     options.write_text("kv_cache_config: {free_gpu_memory_fraction: 0.6}\n", encoding="utf-8")
@@ -244,7 +201,7 @@ PASS = '<testsuite><testcase name="native_hop"/></testsuite>'
 def test_every_node_must_have_a_fresh_successful_report(tmp_path, second, code, expected):
     work = tmp_path / "gate"
     work.mkdir()
-    paths = [work / f"disagg.disagg.dep4.node{rank}.xml" for rank in range(2)]
+    paths = [work / f"disagg.disagg.dep4.run.node{rank}.xml" for rank in range(2)]
     for path in paths:
         path.write_text(PASS)
 
@@ -271,7 +228,7 @@ def test_every_node_must_have_a_fresh_successful_report(tmp_path, second, code, 
 
 def test_nonzero_single_node_exit_cannot_pass_from_a_successful_xml(tmp_path):
     def runner(command, env, timeout):
-        (tmp_path / "disagg.disagg.dep4.xml").write_text(PASS)
+        (tmp_path / "disagg.disagg.dep4.run.xml").write_text(PASS)
         return CommandResult(returncode=9)
 
     result = disagg.run_disagg_gate(
@@ -345,31 +302,6 @@ def shell(monkeypatch):
     return state
 
 
-def test_a_relative_variant_is_judged_against_its_units_score_measured_first(
-    tmp_path, shell, capsys
-):
-    path = _cli_task(tmp_path)
-    data = yaml.safe_load(path.read_text())
-    data["variants"] = {"switched": {"env": {"MY_SWITCH": "1"}, "gates": ["accuracy"]}}
-    path.write_text(yaml.safe_dump(data))
-    shell["output"] = [f"lm-eval gsm8k average accuracy: {score}\n" for score in (92, 85)]
-    argv = ["accuracy", "--task", str(path), "--unit", "switched", "--workdir", str(tmp_path / "w")]
-    assert gate_cli.main([*argv, "--member", "tep2"]) == 1
-    out = capsys.readouterr().out
-    assert out.startswith("[FAIL] accuracy[gsm8k]@tep2: measured 85.0000 vs floor 89.8872")
-    assert "the unit's own score 92.0000" in out and len(shell["seen"]) == 2
-    assert "MY_SWITCH=1" not in shell["seen"][0] and "MY_SWITCH=1" in shell["seen"][1]
-    # The benchmark prints its running score, a heartbeat for a long run.
-    assert "TLLM_EVAL_PARTIAL_SCORES_EVERY=50" in shell["seen"][0]
-    # A score in another form is quoted for whoever decides how it is read, then read by pattern.
-    printed = "Partial scores after 100/100 responses\nJSON Mode Eval accuracy: 91.50 (100)\n"
-    assert accuracy_checks.parse_eval_score(printed) is None
-    assert "  JSON Mode Eval accuracy: 91.50 (100)" in accuracy_checks.unparsed_score_detail(
-        printed, None
-    )
-    assert accuracy_checks.parse_eval_score(printed, r"Eval accuracy: ([0-9.]+)") == 91.5
-
-
 def test_an_uncommitted_target_fails_even_though_the_file_is_there(tmp_path):
     def git(*args):
         subprocess.run(["git", *args], cwd=tmp_path, check=True, capture_output=True)
@@ -392,35 +324,22 @@ def test_an_op_imported_from_another_target_is_refused_and_copying_it_is_the_fix
     assert "copy it into this target's ops/norm/" in check.detail
 
 
-def test_the_accuracy_test_path_follows_the_tree_layout(tmp_path):
-    """Each accuracy layout the trees have used maps to its own path, and test-db is read by path."""
-    package = tmp_path / delivery.ACCURACY_TESTS_DIR / "modeling_v2"
-    oldest = delivery.accuracy_test_path(tmp_path, "gpt_oss", "t")
-    assert oldest == "test_modeling_v2_gpt_oss.py"
+def test_the_ci_accuracy_test_is_the_generated_e2e_test_and_test_db_is_read_by_path(tmp_path):
+    accuracy_test = delivery.accuracy_test_path(tmp_path, "gpt_oss", "pkg/models/gpt_oss/t")
+    assert accuracy_test == "modeling_v2/gpt_oss/t/test_e2e.py"
+    package = tmp_path / delivery.ACCURACY_TESTS_DIR / "modeling_v2" / "gpt_oss" / "t"
     package.mkdir(parents=True)
-    (package / "__init__.py").write_text("", encoding="utf-8")
-    assert (
-        delivery.accuracy_test_path(tmp_path, "gpt_oss", "t")
-        == "modeling_v2/gpt_oss/t/test_accuracy.py"
-    )
-    (package / "test_gpt_oss.py").write_text("", encoding="utf-8")
-    assert delivery.accuracy_test_path(tmp_path, "gpt_oss", "t") == "modeling_v2/test_gpt_oss.py"
-
-    # Per target, every file is test_accuracy.py: registration must match the path, not the stem.
-    (package / "test_gpt_oss.py").unlink()
-    accuracy_test = "modeling_v2/gpt_oss/t/test_accuracy.py"
-    (package / "gpt_oss" / "t").mkdir(parents=True)
-    (package / accuracy_test.split("/", 1)[1]).write_text("", encoding="utf-8")
+    (package / "test_e2e.py").write_text("", encoding="utf-8")
     db = tmp_path / delivery.TEST_DB_DIR
     db.mkdir(parents=True)
     (db / "l0_x.yml").write_text(
-        "  - accuracy/modeling_v2/gpt_oss/other/test_accuracy.py::TestOther::test_gsm8k\n",
+        "  - accuracy/modeling_v2/gpt_oss/other/test_e2e.py::TestOther::test_e2e\n",
         encoding="utf-8",
     )
     checks = {c.name: c.passed for c in delivery.check_test_registration(tmp_path, accuracy_test)}
     assert checks == {"tests:accuracy-file": True, "tests:test-db": False}
     (db / "l0_x.yml").write_text(
-        f"  - accuracy/{accuracy_test}::TestT::test_gsm8k\n", encoding="utf-8"
+        f"  - accuracy/{accuracy_test}::TestT::test_e2e\n", encoding="utf-8"
     )
     checks = {c.name: c.passed for c in delivery.check_test_registration(tmp_path, accuracy_test)}
     assert checks == {"tests:accuracy-file": True, "tests:test-db": True}
@@ -607,104 +526,6 @@ def test_target_initializer_and_optional_weights_dependencies_are_checked(tmp_pa
     assert any("router" in check.detail for check in _verify(root).failures)
 
 
-_acceptance_gate_TASK = {
-    "checkpoint_path": "/ckpt/M",
-    "parallel": "tep4",
-    "trtllm_repo_path": "/repo",
-    "features": ["dspark"],
-    "accuracy": {"benchmark": "gsm8k", "reference_yaml": "r.yaml"},
-}
-
-
-def _acceptance_gate_env():
-    return resolve_environment(
-        {"environment": {"kind": "local", "python": "/py", "env": {}}}, devices=(0,), world_size=1
-    )
-
-
-def _acceptance_gate_driver_output(rates, *, iterations=100):
-    """What the engine driver prints for prompts accepting at ``rates``.
-
-    ``iterations`` is every prompt's, or a list with one per prompt.
-    """
-    lines = []
-    for n, rate in enumerate(rates):
-        steps = iterations[n] if isinstance(iterations, list) else iterations
-        tokens = int(round(rate * steps))
-        workload_io_line = {
-            "index": n,
-            "id": f"d{n}",
-            "tokens": tokens,
-            "iterations": steps,
-            "token_ids": [],
-            "text": "",
-        }
-        lines.append(f"{workload_io.RECORD_MARKER} {json.dumps(workload_io_line)}")
-    return "\n".join(lines) + "\n"
-
-
-def _acceptance_gate_task(**acceptance):
-    return {
-        **_acceptance_gate_TASK,
-        "accuracy": {**_acceptance_gate_TASK["accuracy"], "acceptance": acceptance},
-    }
-
-
-_BASE = [2.6 + 0.5 * math.sin(i) for i in range(32)]
-
-
-def _acceptance(tmp_path, monkeypatch, rates, *, iterations=100, **acceptance):
-    """The acceptance gate's verdict on a load whose prompts accept at ``rates``."""
-    monkeypatch.setattr(acceptance_checks, "inspect_tree", lambda task_data: "t")
-    seen = []
-
-    def run(command, env=None, timeout=0):
-        seen.append(command)
-        output = _acceptance_gate_driver_output(rates, iterations=iterations)
-        return CommandResult(returncode=0, stdout=output)
-
-    result = acceptance_checks.run_acceptance_gate(
-        _acceptance_gate_env(),
-        task_data=_acceptance_gate_task(**acceptance),
-        runner=run,
-        unit="dspark",
-        member="tep4",
-        workdir=tmp_path / "w",
-    )
-    return result, seen
-
-
-def test_acceptance_is_one_load_held_to_one_and_to_the_declared_floor(tmp_path, monkeypatch):
-    # With no floor declared the verdict stands on 1.0 alone, and says so.
-    result, seen = _acceptance(tmp_path, monkeypatch, _BASE)
-    assert result.passed, result.detail
-    assert len(seen) == 1 and "TRTLLM_MODELING_V2=require" in seen[0]
-    assert "held to 1.0 alone" in result.detail and "held to 1.0 alone" in result.warnings[0]
-    # Every draft rejected is the draft path computing the wrong thing.
-    result, _ = _acceptance(tmp_path, monkeypatch, [1.0] * 32)
-    assert not result.passed and "at or below 1.0" in result.detail
-    # A declared floor is met or not; one derived from a measured reference keeps 0.95 of it.
-    floor = {"min_absolute": 1.5, "floor_source": "a measured drafter"}
-    result, _ = _acceptance(tmp_path, monkeypatch, _BASE, dspark=floor)
-    assert result.passed and result.reference == 1.5
-    assert "vs declared floor 1.5000 (from a measured drafter): met" in result.detail
-    result, _ = _acceptance(tmp_path, monkeypatch, _BASE, dspark={"measured_reference": 3.32})
-    assert (
-        not result.passed
-        and "vs declared floor 3.1540 (0.95 x measured reference 3.32): NOT met" in result.detail
-    )
-
-
-def test_a_workload_too_short_to_measure_fails_as_the_workload_not_the_target(
-    tmp_path, monkeypatch
-):
-    # Each request's first iteration is its context step: 4 prompts x 2 leave 4 to count.
-    result, _ = _acceptance(tmp_path, monkeypatch, [2.5] * 4, iterations=2)
-    assert not result.passed
-    assert "workload too short to measure acceptance: 4 generation iteration(s)" in result.detail
-    assert "a property of the workload, not of the target" in result.detail
-
-
 _SNAPSHOTS = {
     "periodic_snapshot_interval": 2048,
     "additional_snapshot_offsets_from_start": [256, 512, 768],
@@ -754,211 +575,6 @@ def _reuse_task(tmp_path: Path, **extra) -> dict:
     return task
 
 
-def test_a_prompt_the_engine_refuses_fails_the_workload_and_the_load_waits_as_declared(tmp_path):
-    task = _reuse_task(tmp_path, features=["mtp"])
-    options = {**_OPTIONS, "speculative_config": {"decoding_type": "MTP", "max_draft_len": 3}}
-    Path(task["accuracy"]["llm_api_options"]["core"]).write_text(yaml.safe_dump(options))
-    task["accuracy"]["acceptance"] = {"timeout": 3600}
-    waited = []
-
-    def refused(command, env=None, timeout=0):
-        waited.append(timeout)
-        error = "RequestError: The prompt length (5000.0) should not exceed max_num_tokens (4096)"
-        return CommandResult(returncode=1, stdout=error)
-
-    result = acceptance_checks.run_acceptance_gate(
-        RunEnvironment(kind="local", python="/py", world_size=1, env={}),
-        task_data=task,
-        runner=refused,
-        unit="core",
-        member="tp1",
-        workdir=tmp_path,
-    )
-    assert "refused a prompt of 5000 tokens, longer than max_num_tokens 4096" in result.detail
-    assert "a property of the workload, not of the target" in result.detail and waited == [3600]
-
-
-_FAKE_LLM = """
-    import os
-    import types
-
-
-    class MambaStateConfig:
-        def __init__(self, periodic_snapshot_interval=0,
-                     additional_snapshot_offsets_from_start=(),
-                     additional_snapshot_offsets_from_end=()):
-            self.periodic_snapshot_interval = periodic_snapshot_interval
-            self.additional_snapshot_offsets_from_start = list(
-                additional_snapshot_offsets_from_start)
-            self.additional_snapshot_offsets_from_end = list(
-                additional_snapshot_offsets_from_end)
-
-
-    class KvCacheConfig:
-        def __init__(self, **fields):
-            self.enable_block_reuse = fields.get("enable_block_reuse", True)
-            state = fields.get("mamba_state_config") or {}
-            if isinstance(state, dict):
-                state = MambaStateConfig(**state)
-            self.mamba_state_config = state
-
-
-    class Tokenizer:
-        def encode(self, text, add_special_tokens=True):
-            return [ord(c) for c in text]
-
-
-    class RequestOutput:
-        # As the LLM API's: the handle `generate_async` returns is the output itself.
-
-        def __init__(self, ids, cached):
-            self.prompt_token_ids = ids
-            self.cached_tokens = cached
-            self.outputs = [types.SimpleNamespace(
-                token_ids=[11, 12], text=" Paris", finish_reason="length")]
-
-        def __iter__(self):
-            yield self
-
-        def result(self):
-            return self
-
-
-    class SamplingParams:
-        def __init__(self, **fields):
-            self.__dict__.update(fields)
-            self.ignore_eos = False
-
-
-    class LLM:
-        # Resumes a prompt where an earlier one left a recurrent-state snapshot, as a
-        # hybrid engine does; FAKE_REUSE=0 never resumes.
-
-        def __init__(self, model=None, **kw):
-            kv = kw.get("kv_cache_config") or KvCacheConfig()
-            if isinstance(kv, dict):
-                kv = KvCacheConfig(**kv)
-            self.args = types.SimpleNamespace(kv_cache_config=kv)
-            self.tokenizer = Tokenizer()
-            self.seen = []
-
-        def get_kv_cache_capacity(self):
-            return {"maxNumBlocks": 100, "tokensPerBlock": 32, "maxNumTokens": 3200}
-
-        def _resumed(self, ids):
-            kv = self.args.kv_cache_config
-            if os.environ.get("FAKE_REUSE", "1") != "1" or not kv.enable_block_reuse:
-                return 0
-            shared = 0
-            for earlier in self.seen:
-                n = 0
-                while n < min(len(ids), len(earlier)) and ids[n] == earlier[n]:
-                    n += 1
-                shared = max(shared, n)
-            limit = min(shared, len(ids) - 1)
-            state = kv.mamba_state_config
-            points = [o for o in state.additional_snapshot_offsets_from_start if o <= limit]
-            if state.periodic_snapshot_interval:
-                points += list(range(state.periodic_snapshot_interval, limit + 1,
-                                     state.periodic_snapshot_interval))
-            return max(points, default=0)
-
-        def generate_async(self, inputs, params=None, streaming=False, **kwargs):
-            if isinstance(inputs, dict):
-                ids = list(inputs["prompt_token_ids"])
-            else:
-                ids = self.tokenizer.encode(inputs)
-            cached = self._resumed(ids)
-            self.seen.append(ids)
-            return RequestOutput(ids, cached)
-
-        def shutdown(self):
-            pass
-"""
-
-
-def _fake_site(tmp_path: Path) -> tuple[Path, Path]:
-    """``(site, repo)``: a fake ``tensorrt_llm`` whose engine reuses, and a tree with its quickstart."""
-    site = tmp_path / "site"
-    path = site / "tensorrt_llm" / "__init__.py"
-    path.parent.mkdir(parents=True)
-    path.write_text(textwrap.dedent(_FAKE_LLM), encoding="utf-8")
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    return site, repo
-
-
-def _real_boot(tmp_path: Path, **env) -> check_result.GateResult:
-    site, repo = _fake_site(tmp_path)
-    environment = RunEnvironment(
-        kind="local", python=sys.executable, world_size=1, env={"PYTHONPATH": str(site), **env}
-    )
-    task = _reuse_task(tmp_path, trtllm_repo_path=str(repo))
-    return boot_checks.run_boot_gate(
-        environment, task_data=task, unit="core", member="tp1", workdir=tmp_path / "gates"
-    )
-
-
-def test_a_real_boot_fails_only_on_an_engine_that_reused_nothing(tmp_path):
-    reused = _real_boot(tmp_path / "reused")
-    assert reused.passed, reused.detail + reused.stdout_tail
-    result = _real_boot(tmp_path / "nothing", FAKE_REUSE="0")
-    assert not result.passed, result.stdout_tail
-    assert "the engine reused nothing: the reuse probe sent one 320-token prompt" in result.detail
-
-
-def _spec(tmp_path) -> dict:
-    checkpoint, repo = tmp_path / "ckpt", tmp_path / "repo"
-    checkpoint.mkdir(exist_ok=True)
-    repo.mkdir(exist_ok=True)
-    (tmp_path / "spool").mkdir(exist_ok=True)
-    (tmp_path / "mtp.yaml").write_text(
-        yaml.safe_dump({"speculative_config": {"decoding_type": "MTP", "max_draft_len": 3}})
-    )
-    spec = {
-        "checkpoint_path": str(checkpoint),
-        "arch": "sm_103",
-        "parallel": "unified",
-        "members": {"default": ["tp1", "tep2", "tep4"], "mtp": ["tep4"]},
-        "trtllm_repo_path": str(repo),
-        "features": ["mtp"],
-        "environment": {
-            "kind": "session_spool",
-            "spool": str(tmp_path / "spool"),
-            "python": "/usr/bin/python3",
-            "env": {"TMPDIR": "/scratch/tmp"},
-        },
-        "runtime": {"cuda_graph": True, "extra_flags": ["--max_seq_len=9216"]},
-        "accuracy": {
-            "benchmark": "gsm8k",
-            "reference_yaml": "x.yaml",
-            "llm_api_options": {"mtp": str(tmp_path / "mtp.yaml")},
-            "discriminators": {"default": {}, "mtp": {"spec_dec_algo": "MTP"}},
-        },
-        "variants": {
-            "kv_fp8": {
-                "members": ["tp1"],
-                "runtime": {"extra_flags": ["--kv_cache_dtype=fp8"]},
-                "llm_api_options": {"kv_cache_config": {"dtype": "fp8"}},
-                "accuracy": {"discriminators": {"kv_cache_quant_algo": "FP8"}},
-            },
-            "mtp7": {
-                "unit": "mtp",
-                "gates": ["boot", "accuracy", "acceptance"],
-                "llm_api_options": {"speculative_config": {"max_draft_len": 7}},
-                "env": {"X": "1"},
-            },
-        },
-    }
-    return spec
-
-
-def _load(tmp_path, spec) -> dict:
-    path = tmp_path / "task.yaml"
-    path.write_text(yaml.safe_dump(spec), encoding="utf-8")
-    return task_schema.load_and_validate_task_yaml(path)
-
-
 def test_each_member_is_launched_and_scheduled_at_its_own_width(tmp_path):
     from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import RunEnvironment
     from agent_flow.workflows.trtllm_modeling_v2.run.workflow import TrtllmModelingV2Workflow
@@ -985,41 +601,6 @@ def test_each_member_is_launched_and_scheduled_at_its_own_width(tmp_path):
         ("all", 0, 1),
         ("all", 0, 2),
     ]
-
-
-def test_a_unit_on_a_placeholder_is_anchored_to_its_first_measured_score(tmp_path, monkeypatch):
-    from types import SimpleNamespace
-
-    from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import RunEnvironment
-    from agent_flow.workflows.trtllm_modeling_v2.run.validation import anchors
-    from agent_flow.workflows.trtllm_modeling_v2.run.workflow import TrtllmModelingV2Workflow
-
-    data = _load(tmp_path, _spec(tmp_path))
-    contract = contract_mod.compile_contract(data, world_size=4)
-    check = next(c for c in contract.checks if c.key == "core:accuracy[gsm8k]@tp1")
-    workflow = TrtllmModelingV2Workflow(workspace=tmp_path / "ws")
-    workflow.environment = RunEnvironment(kind="local", python="python3", world_size=1)
-    workflow.task_data, workflow._contract = data, contract
-    runner = CheckRunner(workflow)
-    runner._reference_score = lambda unit, spec=None: 10.0  # a placeholder
-    calls = []
-
-    def gate(env, *, reference, unit, relative=False, **kwargs):
-        calls.append((reference, relative))
-        return SimpleNamespace(passed=True, measured=93.3, infrastructure="", detail="d",
-                               tree_state="abc", summary=str)  # fmt: skip
-
-    monkeypatch.setattr(accuracy_checks, "run_accuracy_gate", gate)
-    runner._gate_call(check)(None)
-    assert anchors.measured(workflow.workspace, "core", check.gate, "tp1").score == 93.3
-    # The next benchmark of core at tp1 is held to that score, not to the placeholder.
-    monkeypatch.setattr(
-        "agent_flow.workflows.trtllm_modeling_v2.run.validation.check_runner.replace",
-        lambda result, **changes: {**vars(result), **changes},
-    )
-    second = runner._gate_call(check)(None)
-    assert calls == [(10.0, False), (93.3, True)]
-    assert "replaced the placeholder 10" in second["detail"]
 
 
 def test_an_attention_dp_rank_serves_its_share_of_the_global_batch():

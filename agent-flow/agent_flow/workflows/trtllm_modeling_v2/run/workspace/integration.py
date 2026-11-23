@@ -582,11 +582,12 @@ def worktree_block(tree: Path, repo: Path, scratch: bool) -> str:
         f"commit there and nowhere else; do not touch `{repo}`. Read paths relative to your "
         "worktree where the prompt names the checkout. Commit with\n\n"
         f"    git -C {tree} add <path> [path...] && git -C {tree} commit -s -m <message>\n\n"
-        f"Run a gate on your work with `--tree {tree}`. When you finish, the orchestrator "
-        "checks your commits, rebases them onto the checkout and runs your task's checks "
-        "there; uncommitted changes are not integrated and fail the task."
-        + _sparse_note(tree)
-        + _behind_note(tree, repo, scratch=False)
+        "When you finish, the orchestrator checks your commits, rebases them onto the "
+        "checkout and runs your task's checks there; uncommitted changes are not integrated "
+        "and fail the task. You need not run those checks yourself first: run one on your "
+        f"work (`--tree {tree}`) to debug a failure, and only the datasets that show it "
+        "(`--datasets generate` answers the boot prompts on one load; a benchmark takes "
+        "longer)." + _sparse_note(tree) + _behind_note(tree, repo, scratch=False)
     )
 
 

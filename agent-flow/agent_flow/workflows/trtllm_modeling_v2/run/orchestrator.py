@@ -30,6 +30,7 @@ import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from ..agents import decisions as decision_table
@@ -267,8 +268,9 @@ class GraphOrchestrator:
     ) -> None:
         self.s = services
         self.contract = contract
-        #: The full benchmarks, which run again at milestones only (:meth:`_settle`).
-        self._accuracy_keys = {c.key for c in contract.checks if c.gate.startswith("accuracy[")}
+        #: The checks that score the engine (a benchmark), which run again at milestones
+        #: only (:meth:`_settle`).
+        self._accuracy_keys = {c.key for c in contract.checks if c.scores}
         #: State writes a full filesystem refused, by what they write: each is tried
         #: again as the loop goes round, and nothing new starts until all have landed.
         self._unwritten: dict[str, Callable[[], None]] = {}
@@ -501,7 +503,7 @@ class GraphOrchestrator:
         return next((c for c in self.contract.checks if c.key == key), None)
 
     def _delivery_keys(self) -> set[str]:
-        return {c.key for c in self.contract.by_tier(contract_mod.TIER_DELIVERY)}
+        return {c.key for c in self.contract.by_stage(contract_mod.STAGE_DELIVERY)}
 
     def _check_lock(self, key: str) -> threading.RLock:
         with self._check_locks_guard:
@@ -518,7 +520,10 @@ class GraphOrchestrator:
         task that claims it and has just landed, or the final tree. A check that
         needs another's verdict first (:attr:`Check.after`: a relative
         variant's benchmark, judged against its unit's) has it on this target
-        before it starts, the other run here if it has none.
+        before it starts, the other run here if it has none. A check another
+        answers (:attr:`Check.answered_by`) takes that one's pass on this
+        target, waiting for a run of it in flight, and runs itself only
+        without one.
         """
         try:
             first = self._check_by_key(check.after) if check.after else None
@@ -529,8 +534,12 @@ class GraphOrchestrator:
                         had = contract_mod.verdict_on(self.status, first.key, marker, self.s.holds)
                     if had is None:
                         self._run_check(first)
+            answer = self._check_by_key(check.answered_by) if check.answered_by else None
             with self._check_lock(check.key):
-                return self._run_check_once(check)
+                if answer is None:
+                    return self._run_check_once(check)
+                with self._check_lock(answer.key):
+                    return self._run_check_once(check, answer)
         except Exception:
             # No verdict (its session was lost): whoever asked, the check is owed
             # still, whatever an earlier pass of it says.
@@ -545,7 +554,9 @@ class GraphOrchestrator:
                 self._owed.add(key)
                 self._claims[key] = self._claims.get(key, 0) + 1
 
-    def _run_check_once(self, check: contract_mod.Check) -> bool:
+    def _run_check_once(
+        self, check: contract_mod.Check, answer: contract_mod.Check | None = None
+    ) -> bool:
         # The claims are read before the target: one that lands after this read is not
         # answered by a pass on the state read next, nor by the run that follows.
         with self._status_lock:
@@ -559,6 +570,8 @@ class GraphOrchestrator:
                 self._owed.discard(check.key)
         if here:
             return True
+        if answer is not None and self._answered(check, answer, marker, claims):
+            return True
         result = self.s.check(check)
         reads = self.s.narrow(result) if self.s.narrow is not None else ("", "")
         with self._status_lock:
@@ -566,6 +579,40 @@ class GraphOrchestrator:
             if self._claims.get(check.key, 0) == claims:
                 self._owed.discard(check.key)
         return bool(result.passed)
+
+    def _answered(
+        self, check: contract_mod.Check, answer: contract_mod.Check, marker: str, claims: int
+    ) -> bool:
+        """Record ``answer``'s pass on the target at ``marker`` as ``check``'s, if it has one.
+
+        The verdict is ``answer``'s, under its name: the same state of the target,
+        the same files read, the same score.
+        """
+        with self._status_lock:
+            verdict = contract_mod.verdict_on(self.status, answer.key, marker, self.s.holds)
+            if (
+                not marker
+                or verdict is None
+                or not verdict.passed
+                or (verdict.inputs and answer.inputs and verdict.inputs != answer.inputs)
+            ):
+                return False
+            said = SimpleNamespace(
+                name=check.gate,
+                member=check.member,
+                passed=True,
+                detail=f"answered by {answer.key}'s pass on this tree: {verdict.detail}",
+                tree_state=verdict.tree_state,
+                marker=verdict.marker,
+                imported=list(verdict.imported),
+                measured=verdict.measured if check.scores else None,
+            )
+            reads = (verdict.reads, verdict.reads_marker)
+            self.status.record(check.unit, said, marker=marker, inputs=check.inputs, reads=reads)
+            if self._claims.get(check.key, 0) == claims:
+                self._owed.discard(check.key)
+        self.s.log(f"[check] {check.key}: answered by {answer.key}'s pass on this tree")
+        return True
 
     def _submit_checks(
         self, pool: ThreadPoolExecutor, keys: Iterable[str]
@@ -595,9 +642,12 @@ class GraphOrchestrator:
     def _run_task(self, task: graph_mod.Task) -> tuple[str, list[str]]:
         """A task's worker, then, in the same thread, the checks it claims.
 
-        The delivery-tier checks it claims wait for the delivery tier. They are
+        The delivery-stage checks it claims wait for their stage. They are
         owed from here on: an earlier pass of one does not answer for the tree
-        this task left.
+        this task left. So is a base's ``e2e`` claimed with the speculator's
+        ``e2e`` that screens it (:attr:`Check.screened_by`): the speculator's
+        runs alone, and the base's runs once the work is done, unless its pass
+        still holds on what the work left.
         """
         try:
             with turn_priority(self._priority_of(task)):
@@ -607,10 +657,21 @@ class GraphOrchestrator:
         if decision.partition("\n")[0] not in FINISHED:
             return decision, []
         delivery = self._delivery_keys()
-        self._claim(k for k in task.satisfies if k in delivery)
+        screened = self._screened(task.satisfies)
+        self._claim(k for k in task.satisfies if k in delivery or k in screened)
+        if screened:
+            self.s.log(
+                f"[check] {task.id}: "
+                + "; ".join(
+                    f"{k} screened by {self._check_by_key(k).screened_by}" for k in screened
+                )
+                + ", owed once the work is done"
+            )
         self._agentless.add(task.id)
         try:
-            return decision, self._run_checks(k for k in task.satisfies if k not in delivery)
+            return decision, self._run_checks(
+                k for k in task.satisfies if k not in delivery and k not in screened
+            )
         except ChecksRaised as exc:
             # The work stands and has landed; only these checks' outcome is unknown.
             # They are owed still (:meth:`_run_check`).
@@ -618,6 +679,15 @@ class GraphOrchestrator:
             return decision, exc.failed
         finally:
             self._agentless.discard(task.id)
+
+    def _screened(self, keys: Sequence[str]) -> set[str]:
+        """The keys of ``keys`` whose screening check is among them too (:attr:`Check.screened_by`)."""
+        named = set(keys)
+        return {
+            key
+            for key in named
+            if (check := self._check_by_key(key)) is not None and check.screened_by in named
+        }
 
     def _priority_of(self, task: graph_mod.Task) -> Priority:
         """The priority ``task``'s turns take agent slots at (``slots.Priority``).
@@ -798,9 +868,9 @@ class GraphOrchestrator:
           ran it): every required check passes once, whoever claimed it.
           ``busy``, with foreground work running, these run once per landing;
           otherwise at once. A benchmark among them waits until no required
-          task is open, unless the bring-up still needs it;
+          task is open, unless the bring-up still needs it (it has never passed);
         - with no required task open and every other required check passed,
-          the delivery tier: its checks with no pass, and those a task that
+          the delivery stage: its checks with no pass, and those a task that
           landed since claims;
         - then, when no benchmark has scored the target as it is, the one check
           that confirms the final tree (:attr:`~.contract.Contract.confirm`).
@@ -822,8 +892,11 @@ class GraphOrchestrator:
         due = [c.key for c in evaluation.missing if c.key in claimed and c.key not in delivery]
         due += [c.key for c in self.contract.checks if c.key in owed - set(due)]
         if open_work:
+            # The bring-up still needs a benchmark of its that has never passed; one that has
+            # proved it, whether or not its milestone is written yet, waits like any other.
+            proved = {c.key for c in evaluation.passed}
             bringup = (
-                {c.key for c in contract_mod.bringup_checks(self.contract)}
+                {c.key for c in contract_mod.bringup_checks(self.contract)} - proved
                 if contract_mod.bringup_milestone(self.workspace) is None
                 else set()
             )
@@ -1341,8 +1414,8 @@ class GraphOrchestrator:
         No agent turn runs and no task slot is taken: its checks wait for
         devices on the check pool as every check does.
         The future holds what a worker's thread returns, :data:`CHECKED` and
-        the keys that failed, once every check is in. Its delivery-tier checks
-        wait for the delivery tier, as any task's do.
+        the keys that failed, once every check is in. Its delivery-stage checks
+        wait for their stage, as any task's do.
         """
         delivery = self._delivery_keys()
         self._claim(k for k in task.satisfies if k in delivery)
@@ -1618,7 +1691,7 @@ class GraphOrchestrator:
             )
             # What is due with no task to ask for it: a failed check once the target
             # has changed, a check whose run was lost, and, once no required task is
-            # open, the delivery tier and the check of the final tree.
+            # open, the delivery stage and the check of the final tree.
             if self._settling is None:
                 self._settle(busy=bool(running))
             spent = not running and self._settling is None and self._planner is None

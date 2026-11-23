@@ -28,9 +28,9 @@ from agent_flow.workflows.trtllm_modeling_v2.run.workspace.integration import Ta
 
 _orchestrator_CONTRACT = c.Contract(
     checks=(
-        c.Check("core", "boot", "tp1", c.TIER_INNER),
-        c.Check("core", "accuracy[gsm8k]", "tp1", c.TIER_INNER),
-        c.Check("core", "serve", "tp1", c.TIER_DELIVERY),
+        c.Check("core", "boot", "tp1", c.STAGE_LANDING),
+        c.Check("core", "e2e", "tp1", c.STAGE_LANDING, scores=True),
+        c.Check("core", "serve", "tp1", c.STAGE_DELIVERY),
     )
 )
 
@@ -113,23 +113,23 @@ def test_a_failed_check_wakes_the_planner_with_the_evidence(tmp_path):
             )
         return PlannerAnswer("CEILING", "no attention kernel")
 
-    services = _services(plan, failing={"core:accuracy[gsm8k]@tp1"})
+    services = _services(plan, failing={"core:e2e@tp1"})
     assert _orchestrator_orchestrator(tmp_path, services).run() == "ceiling"
-    assert any("checks failed: core:accuracy[gsm8k]@tp1" in e for e in turns[1].events)
-    assert "FAILED core:accuracy[gsm8k]@tp1" in turns[1].evaluation.render()
+    assert any("checks failed: core:e2e@tp1" in e for e in turns[1].events)
+    assert "FAILED core:e2e@tp1" in turns[1].evaluation.render()
 
 
 _STANDING = c.Contract(
     checks=(
-        c.Check("core", "boot", "tp1", c.TIER_INNER),
-        c.Check("core", "accuracy[gsm8k]", "tp1", c.TIER_INNER),
-        c.Check("mtp", "accuracy[gsm8k]", "tp1", c.TIER_INNER),
-        c.Check("mtp", "acceptance", "tp1", c.TIER_PROOF),
+        c.Check("core", "boot", "tp1", c.STAGE_LANDING),
+        c.Check("core", "e2e", "tp1", c.STAGE_LANDING, scores=True),
+        c.Check("mtp", "e2e", "tp1", c.STAGE_LANDING, scores=True),
+        c.Check("mtp", "acceptance", "tp1", c.STAGE_LANDING),
     ),
-    confirm="mtp:accuracy[gsm8k]@tp1",
+    confirm="mtp:e2e@tp1",
 )
-_CORE = ["core:boot@tp1", "core:accuracy[gsm8k]@tp1"]
-_MTP = ["mtp:accuracy[gsm8k]@tp1", "mtp:acceptance@tp1"]
+_CORE = ["core:boot@tp1", "core:e2e@tp1"]
+_MTP = ["mtp:e2e@tp1", "mtp:acceptance@tp1"]
 
 
 def _moving_target(plan, *, failing=lambda key, marker: False, lost=()):
@@ -186,14 +186,14 @@ def test_the_final_tree_is_confirmed_by_one_check_when_none_ran_on_it(tmp_path):
     services = _moving_target(plan)
     assert _standing_run(tmp_path, services) == "delivered"
     # `tidy` claims no check and changed the target last: one check runs on what it left.
-    assert services.ran[-1] == ("mtp:accuracy[gsm8k]@tp1", "m3")
+    assert services.ran[-1] == ("mtp:e2e@tp1", "m3")
     assert sorted(services.ran[:-1]) == sorted(
         [(k, "m1") for k in _CORE] + [(k, "m2") for k in _MTP]
     )
 
 
 def test_a_check_that_only_shows_the_engine_answering_does_not_confirm_the_final_tree(tmp_path):
-    serve = c.Check("core", "serve", "tp1", c.TIER_DELIVERY)
+    serve = c.Check("core", "serve", "tp1", c.STAGE_DELIVERY)
     contract = c.Contract(checks=(*_STANDING.checks[:2], serve), confirm=_CORE[1])
     plan = _plan_once(
         _task("core", "assemble", [*_CORE, serve.key]),
@@ -211,7 +211,7 @@ def test_a_check_that_only_shows_the_engine_answering_does_not_confirm_the_final
 def test_a_delivery_check_runs_again_only_when_a_task_that_claims_it_lands(
     tmp_path, claims, served_on
 ):
-    serve = c.Check("core", "serve", "tp1", c.TIER_DELIVERY)
+    serve = c.Check("core", "serve", "tp1", c.STAGE_DELIVERY)
     contract = c.Contract(checks=(_STANDING.checks[1], serve), confirm=_CORE[1])
     repaired = []
 
@@ -301,7 +301,7 @@ def test_the_worker_names_the_checks_its_landing_runs():
 
 
 def test_a_check_task_owes_the_delivery_checks_it_names(tmp_path):
-    serve = c.Check("core", "serve", "tp1", c.TIER_DELIVERY)
+    serve = c.Check("core", "serve", "tp1", c.STAGE_DELIVERY)
     contract = c.Contract(checks=(_STANDING.checks[1], serve), confirm=_CORE[1])
     status = c.ContractStatus.load(tmp_path)
     orchestrator = GraphOrchestrator(_moving_target(_plan_once()), contract, status, tmp_path)
@@ -312,7 +312,7 @@ def test_a_check_task_owes_the_delivery_checks_it_names(tmp_path):
 
 
 def test_a_claim_that_lands_while_its_check_runs_stays_owed(tmp_path):
-    serve = c.Check("core", "serve", "tp1", c.TIER_DELIVERY)
+    serve = c.Check("core", "serve", "tp1", c.STAGE_DELIVERY)
     state = {"tree": 1, "land": ""}  # land: where a task lands and claims the serve
     runs = []
 
@@ -510,10 +510,81 @@ def test_an_owed_check_that_passed_on_this_tree_is_owed_no_more(tmp_path):
     assert ran == [] and not orchestrator._owed
 
 
+_SCREENED = c.Contract(
+    checks=(
+        c.Check("core", "e2e", "tp1", c.STAGE_LANDING, scores=True, screened_by="mtp:e2e@tp1"),
+        c.Check("mtp", "e2e", "tp1", c.STAGE_LANDING, scores=True),
+    ),
+    confirm="mtp:e2e@tp1",
+)
+
+
+def _screened_plan():
+    return _plan_once(
+        _task("core", "assemble", ["core:e2e@tp1"]),
+        _task("mtp", "feature", ["mtp:e2e@tp1", "core:e2e@tp1"], deps=["core"]),
+        _task("tidy", "kernel", deps=["mtp"], touches=["catalog/k.py"]),
+    )
+
+
+def test_a_speculators_e2e_stands_in_for_its_bases_at_a_landing_that_names_both(tmp_path):
+    services = _moving_target(_screened_plan())
+    status = c.ContractStatus.load(tmp_path)
+    orchestrator = GraphOrchestrator(services, _SCREENED, status, tmp_path, poll_s=0)
+    assert orchestrator.run() == "delivered"
+    # mtp's landing ran mtp's e2e alone; the core's, owed from it, ran once on what the
+    # work left (m3, after tidy): its decode path without drafts is not one mtp's e2e reaches.
+    assert services.ran == [("core:e2e@tp1", "m1"), ("mtp:e2e@tp1", "m2"), ("core:e2e@tp1", "m3")]
+    assert not orchestrator._owed
+
+
+def test_a_screened_e2e_whose_pass_still_holds_does_not_run_again(tmp_path):
+    services = _moving_target(_screened_plan())
+    services.holds = lambda verdict: True  # what it reads is unchanged since it passed
+    status = c.ContractStatus.load(tmp_path)
+    orchestrator = GraphOrchestrator(services, _SCREENED, status, tmp_path, poll_s=0)
+    assert orchestrator.run() == "delivered"
+    assert services.ran == [("core:e2e@tp1", "m1"), ("mtp:e2e@tp1", "m2")]
+    assert not orchestrator._owed
+
+
+_ANSWERED = c.Contract(
+    checks=(
+        c.Check("mtp", "e2e", "tp1", c.STAGE_LANDING, scores=True),
+        c.Check("mtp", "gsm8k", "tp1", c.STAGE_DELIVERY, scores=True, answered_by="mtp:e2e@tp1"),
+    ),
+    confirm="mtp:e2e@tp1",
+)
+
+
+def test_a_check_another_answers_takes_its_pass_on_the_same_tree(tmp_path):
+    plan = _plan_once(_task("mtp", "feature", [c.key for c in _ANSWERED.checks]))
+    services = _moving_target(plan)
+    status = c.ContractStatus.load(tmp_path)
+    assert GraphOrchestrator(services, _ANSWERED, status, tmp_path, poll_s=0).run() == "delivered"
+    assert services.ran == [("mtp:e2e@tp1", "m1")]
+    answered = status.latest()["mtp:gsm8k@tp1"]
+    assert answered.passed and answered.marker == "m1"
+    assert answered.detail.startswith("answered by mtp:e2e@tp1's pass on this tree")
+
+
+def test_a_check_another_answers_runs_itself_where_that_one_has_not_passed(tmp_path):
+    plan = _plan_once(
+        _task("mtp", "feature", [c.key for c in _ANSWERED.checks]),
+        _task("tidy", "kernel", deps=["mtp"], touches=["catalog/k.py"]),
+    )
+    services = _moving_target(plan)
+    status = c.ContractStatus.load(tmp_path)
+    assert GraphOrchestrator(services, _ANSWERED, status, tmp_path, poll_s=0).run() == "delivered"
+    # mtp's e2e passed on m1; on m2, which tidy left, the delivery check runs itself, and
+    # its score confirms the final tree.
+    assert services.ran == [("mtp:e2e@tp1", "m1"), ("mtp:gsm8k@tp1", "m2")]
+
+
 def _three_benchmarks():
     """Three units' benchmarks at tp1, as a spec with one `accuracy` block for every unit owes."""
     checks = tuple(
-        c.Check(unit, "accuracy[gsm8k]", "tp1", c.TIER_INNER)
+        c.Check(unit, "e2e", "tp1", c.STAGE_LANDING, scores=True)
         for unit in ("core", "multimodal", "mtp")
     )
     return c.Contract(checks=checks, confirm=checks[-1].key)
@@ -583,7 +654,7 @@ def test_a_run_is_not_delivered_on_a_failure_it_measured(tmp_path):
     assert any("the contract does not hold" in e for turn in turns for e in turn.events)
 
 
-def test_a_boot_is_owed_only_where_no_stronger_check_loads_the_same_engine():
+def test_each_feature_owes_one_e2e_and_a_boot_only_where_it_scores_nothing():
     spec = {
         "checkpoint_path": "/ckpt/m",
         "parallel": "unified",
@@ -592,28 +663,43 @@ def test_a_boot_is_owed_only_where_no_stronger_check_loads_the_same_engine():
         "accuracy": {"benchmark": "gsm8k"},
     }
 
-    def boots(data):
-        return [x.key for x in c.compile_contract(data, world_size=4).checks if x.gate == "boot"]
+    def tests(data):
+        return {x.key: x for x in c.compile_contract(data, world_size=4).checks}
 
-    # The core's benchmark and the drafter's acceptance load every member's engine.
-    assert boots(spec) == []
-    assert c.compile_contract(spec, world_size=4).confirm == "mtp:accuracy[gsm8k]@tp1"
-    # The reuse probe is the boot's (and the acceptance gate's), not the benchmark's.
-    reuse = {**spec, "runtime": {"default": {"kv_cache_reuse": True}}}
-    assert boots(reuse) == ["core:boot@tp1", "core:boot@tp4"]
-    # A variant boots at the members its benchmark does not run at.
+    def datasets(data):
+        return {(t.feature, t.name): t.datasets for t in c.run_tests(data, world_size=4)}
+
+    # One engine per member: the boot prompts, the benchmark and, on a drafter, its acceptance.
+    owed = tests(spec)
+    assert list(owed) == ["core:e2e@tp1", "core:e2e@tp4", "mtp:e2e@tp1", "mtp:e2e@tp4"]
+    assert all(x.scores and x.runner == "datasets" for x in owed.values())
+    assert datasets(spec) == {
+        ("core", "e2e"): ("generate", "gsm8k"),
+        ("mtp", "e2e"): ("generate", "gsm8k", "acceptance"),
+    }
+    assert c.compile_contract(spec, world_size=4).confirm == "mtp:e2e@tp1"
+    # Where the benchmark runs at one member, the others boot (and accept the drafts there).
+    one = {**spec, "accuracy": {"benchmark": "gsm8k", "benchmark_members": "tp4"}}
+    assert list(tests(one)) == ["core:e2e@tp4", "core:boot@tp1", "mtp:e2e@tp4", "mtp:boot@tp1"]
+    assert datasets(one)[("mtp", "boot")] == ("generate", "acceptance")
+    assert not tests(one)["core:boot@tp1"].scores
+    # A variant scores at one member and boots at its others.
     fp8 = {"base": "core", "gates": ["boot", "accuracy"]}
     fp8["llm_api_options"] = {"kv_cache_config": {"dtype": "fp8"}}
-    assert boots({**spec, "features": [], "variants": {"kv_fp8": fp8}}) == ["kv_fp8:boot@tp1"]
+    variant_only = {**spec, "features": [], "variants": {"kv_fp8": fp8}}
+    assert [k for k in tests(variant_only) if k.startswith("kv_fp8")] == [
+        "kv_fp8:e2e@tp4",
+        "kv_fp8:boot@tp1",
+    ]
     # The smoke profile owes the boot alone, which then confirms the final tree.
     smoke = c.compile_contract({**spec, "features": [], "profile": "smoke"}, world_size=4)
     assert [x.gate for x in smoke.checks] == ["boot", "boot"] and smoke.confirm == "core:boot@tp1"
     # A later unit on the smoke profile does not take the confirmation from a benchmark.
     mixed = {**spec, "features": ["multimodal"], "profile": {"multimodal": "smoke"}}
-    assert c.compile_contract(mixed, world_size=4).confirm == "core:accuracy[gsm8k]@tp1"
+    assert c.compile_contract(mixed, world_size=4).confirm == "core:e2e@tp1"
     # Where no unit owes a benchmark, a variant's confirms it, not the core's boot.
     variant = {**spec, "features": [], "profile": {"core": "smoke"}, "variants": {"kv_fp8": fp8}}
-    assert c.compile_contract(variant, world_size=4).confirm == "kv_fp8:accuracy[gsm8k]@tp4"
+    assert c.compile_contract(variant, world_size=4).confirm == "kv_fp8:e2e@tp4"
 
 
 def test_a_failed_check_runs_again_with_its_repair_and_nothing_else_does(tmp_path):
@@ -637,7 +723,7 @@ def test_a_failed_check_runs_again_with_its_repair_and_nothing_else_does(tmp_pat
     # The repair claims the boot, which runs on what it left. The benchmark that passed
     # beside the failure stands; it runs once more, to score the final tree.
     assert services.ran[-2:] == [(_CORE[0], "m2"), (_CORE[1], "m2")]
-    assert sorted(services.ran[:-2]) == [(_CORE[1], "m1"), (_CORE[0], "m1")]
+    assert sorted(services.ran[:-2]) == sorted([(_CORE[1], "m1"), (_CORE[0], "m1")])
 
 
 @pytest.mark.parametrize(
@@ -798,8 +884,8 @@ def test_an_attempt_the_environment_ended_does_not_spend_a_worker_run(tmp_path, 
 
 _CONCURRENT_CONTRACT = c.Contract(
     checks=(
-        c.Check("core", "boot", "tp1", c.TIER_INNER),
-        c.Check("core", "accuracy[gsm8k]", "tp1", c.TIER_INNER),
+        c.Check("core", "boot", "tp1", c.STAGE_LANDING),
+        c.Check("core", "e2e", "tp1", c.STAGE_LANDING, scores=True),
     )
 )
 

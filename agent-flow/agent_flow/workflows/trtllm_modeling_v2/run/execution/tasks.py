@@ -22,6 +22,7 @@ import contextlib
 import json
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -33,7 +34,7 @@ from agent_flow.console import print_message, print_rule
 from ...agents.decisions import DECISION_REMINDER
 from ...agents.prompts.survey import capture_lists_block
 from ...agents.prompts.tags import tag_section, task_tags
-from ...checks import check_config, gate_cli
+from ...checks import check_config, e2e, gate_cli
 from ...infra.compute.scheduler import WATCHER_STALE_S, watcher_records
 from ...infra.git import CommitPolicy
 from ...operators import survey_review
@@ -326,6 +327,13 @@ class ExecutionStage:
             self.workflow.journal.event("integration", f"tasks share the checkout {repo}")
             return None
         policy = CommitPolicy.from_task(self.workflow.task_data, workspace=self.workflow.workspace)
+        preflight = getattr(self.workflow, "_preflight", None)
+        if preflight is not None and getattr(preflight, "target_rel", ""):
+            policy = replace(
+                policy,
+                generated_paths=e2e.generated_paths(preflight.family, preflight.target_rel),
+                protected_paths=e2e.extra_check_files(preflight.family, preflight.target_rel),
+            )
         env = {}
         if policy.identity is not None:
             # The rebase's committer; each commit keeps its author.
@@ -1016,7 +1024,7 @@ class ExecutionStage:
             evaluation,
             self.workflow._contract.required(),
             f"all {len(evaluation.passed)} required checks of the contract passed, the "
-            "delivery tier's included, and a check that passed on it confirms it",
+            "delivery stage's included, and a check that passed on it confirms it",
         )
 
     def _take_stage_notes(self) -> list[str]:

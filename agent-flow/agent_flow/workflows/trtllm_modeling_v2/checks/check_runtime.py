@@ -5,18 +5,16 @@
 
 from __future__ import annotations
 
-import json
 import os
 import shlex
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Mapping
 
 from ..infra.compute.commands import CommandResult, CommandSpec, LocalCommandExecutor
 from ..infra.compute.environment import RunEnvironment
-from .harness import workload_io
 
-# A boot gate that needs longer than this is an accuracy run with no anchor.
+# A served engine that needs longer than this to answer is not starting.
 BOOT_TIMEOUT_S = 1800
 
 
@@ -78,15 +76,6 @@ def with_mode(environment: RunEnvironment, mode: str) -> RunEnvironment:
     )
 
 
-# ------------------------------------------------------------ the engine driver
-#
-# The measured interpreter constructs public LLM/SamplingParams from one JSON
-# spec and emits MV2FLOW_RECORD results.
-
-#: The driver script, run as a file under the measured tree's interpreter.
-ENGINE_DRIVER = Path(__file__).resolve().parent / "harness" / "engine_driver.py"
-
-
 def gate_workdir(workdir: str | Path) -> Path:
     """``workdir``, made: where a gate writes the files its job reads.
 
@@ -118,62 +107,6 @@ def default_triton_cache(task_data: dict[str, Any], workspace: str | Path) -> No
     env.setdefault(TRITON_CACHE_DIR_ENV, str(Path(workspace).resolve() / RUN_TRITON_CACHE_DIRNAME))
 
 
-def write_driver_spec(
-    path: str | Path,
-    *,
-    config: Mapping[str, Any],
-    requests: Sequence[Mapping[str, Any]] = (),
-    dataset: Mapping[str, Any] | None = None,
-    max_tokens: int = 64,
-    concurrency: int = 1,
-    ignore_eos: bool = False,
-    reuse_probe: bool = False,
-) -> Path:
-    """Write public engine options and the workload to materialize before engine launch."""
-    spec = {
-        **config,
-        "requests": [dict(r) for r in requests],
-        "dataset": dict(dataset) if dataset else None,
-        "max_tokens": int(max_tokens),
-        "concurrency": int(concurrency),
-        "ignore_eos": bool(ignore_eos),
-        "reuse_probe": bool(reuse_probe),
-    }
-    if not dataset:
-        spec["requests"] = workload_io.normalize_requests(spec)
-        spec.pop("dataset")
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(spec, indent=1, ensure_ascii=False), encoding="utf-8")
-    return target
-
-
-def engine_driver_command(
-    environment: RunEnvironment, spec_path: str | Path, *, script: Path = ENGINE_DRIVER
-) -> str:
-    """Normalize offline data in one CPU process, then launch the public request entry."""
-    path = Path(spec_path)
-    spec = json.loads(path.read_text(encoding="utf-8"))
-    prefix = ""
-    if spec.get("dataset"):
-        normalized = path.with_suffix(".requests.json")
-        normalizer = ENGINE_DRIVER.with_name("workload_io.py")
-        prefix = (
-            environment.python_command(
-                [str(normalizer), str(path), str(normalized)], single_process=True
-            )
-            + " && "
-        )
-        path = normalized
-    return prefix + environment.python_command([str(script), "--spec", str(path)])
-
-
-def parse_driver_records(output: str) -> list[dict[str, Any]]:
-    """Every ``MV2FLOW_RECORD`` the engine driver printed, in request order."""
-    records = workload_io.parse_marked(output, workload_io.RECORD_MARKER)
-    return sorted(records, key=lambda r: int(r.get("index", 0)))
-
-
 def in_tree(runner: Callable[..., Any], tree: Path | None) -> Callable[..., Any]:
     """Run every command from inside ``tree``, with it first on ``PYTHONPATH``.
 
@@ -196,7 +129,6 @@ def in_tree(runner: Callable[..., Any], tree: Path | None) -> Callable[..., Any]
 __all__ = [
     "in_tree",
     "BOOT_TIMEOUT_S",
-    "ENGINE_DRIVER",
     "MODELING_V2_ENV",
     "MODE_OFF",
     "MODE_REQUIRE",
@@ -207,9 +139,6 @@ __all__ = [
     "TRITON_CACHE_DIR_ENV",
     "default_shell_runner",
     "default_triton_cache",
-    "engine_driver_command",
     "gate_workdir",
-    "parse_driver_records",
     "with_mode",
-    "write_driver_spec",
 ]

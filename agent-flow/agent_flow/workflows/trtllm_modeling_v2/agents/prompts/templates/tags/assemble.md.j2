@@ -39,7 +39,10 @@ unit and whole-model tests; naming conventions and scaffold helpers alone
 are not proof of correctness. A failing checkout check remains a failure to
 report or fix within scope, even when a guide describes a newer convention.
 
-Run a gate yourself to debug, with the command your dispatch names. **A
+Run a gate yourself to debug, with the command your dispatch names; the checks
+your task names run when it lands, so a gate run only to see them pass measures
+the same thing twice. Run the cheapest datasets that show what you debug
+(`--datasets generate` for a load or an answer, the benchmark for a score). **A
 shortfall is a debug signal, not a verdict**: back every re-gate with one
 explicit causal hypothesis, and after three hypothesis-backed fixes without
 improvement, stop and block with `accuracy_shortfall` and the trail. Turning

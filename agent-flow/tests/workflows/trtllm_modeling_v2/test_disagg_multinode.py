@@ -167,7 +167,7 @@ def test_the_specs_of_the_real_cases_load_and_size_their_checks_jobs(
     monkeypatch.setattr(datasets, "wait", lambda workspace, name: staged[name])
     runner.workspace = tmp_path
     own = {**task["accuracy"], "benchmark": {"default": "gsm8k", "disagg": "mmlu"}}
-    given = runner._with_dataset({**task, "accuracy": own}, "disagg", "disagg")
+    given = runner._with_dataset({**task, "accuracy": own}, "disagg")
     assert given["accuracy"]["dataset_path"] == "/staged/mmlu"
 
 
@@ -454,16 +454,22 @@ def test_a_deployment_on_one_node_is_served_and_scored_with_no_lead_and_no_step(
     config = yaml.safe_load((directory / "options.gen.yaml").read_text())
     assert config == dict(tensor_parallel_size=2, moe_expert_parallel_size=2, modeling_v2="require")
     assert "--servers ctx0,gen0 --timeout 120 gsm8k'" in client
-    # The unit's protocol reaches the evaluator, and its score pattern picks the row.
+    # The unit's protocol reaches the evaluator as trtllm-eval's flags; the score is the last
+    # lm-eval line, the average.
     turns = {
         **task["accuracy"],
-        "benchmark_args": ["--apply_chat_template", "--fewshot_as_multiturn"],
-        "score_pattern": r"lm-eval gsm8k flexible-extract accuracy:\s*([0-9.]+)",
+        "evaluator_kwargs": {
+            "apply_chat_template": True,
+            "fewshot_as_multiturn": True,
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
     }
     rows = "lm-eval gsm8k flexible-extract accuracy: 41.60\nlm-eval gsm8k average accuracy: 41.70\n"
     row = gate(UP + rows, task={**task, "accuracy": turns})
-    assert row.passed and row.measured == 41.60, row.detail
-    assert _lines(directory)[-1].endswith(" gsm8k --apply_chat_template --fewshot_as_multiturn'")
+    assert row.passed and row.measured == 41.70, row.detail
+    client = _lines(directory)[-1]
+    assert " gsm8k --apply_chat_template --fewshot_as_multiturn --chat_template_kwargs " in client
+    assert '{"enable_thinking": false}' in client
     # What the client says of servers that did not come up, or of a benchmark that failed, is the verdict.
     why = "ctx0 ended with 3 before every server was healthy; its log says: Failed to create NIXL backend"
     down = gate(

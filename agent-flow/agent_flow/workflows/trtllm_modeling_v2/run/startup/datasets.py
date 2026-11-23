@@ -2,10 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """The benchmark datasets, staged in the background from preflight on, never a blocker.
 
-Every accuracy gate runs offline (``HF_DATASETS_OFFLINE=1``), so the dataset must be on
-disk where the evaluator looks, before the first benchmark: ``trtllm-eval`` takes it as
-``--dataset_path``, and the tree's own accuracy tests (the disaggregated-serving one among
-them) read it under ``$LLM_MODELS_ROOT/datasets/...`` (``accuracy_core.py``). A run that
+Every benchmark runs offline (``HF_DATASETS_OFFLINE=1``), so the dataset must be on
+disk where the evaluator looks, before the first benchmark: the tree's own accuracy tests
+(the target's e2e test and the disaggregated-serving one) read it under
+``$LLM_MODELS_ROOT/datasets/...`` (``accuracy_core.py``). A run that
 found it missing there lost its benchmarks to it.
 
 :func:`start` runs beside the run's first turns: per benchmark, the spec's

@@ -22,12 +22,13 @@ import yaml
 from agent_flow.agent_runtime import AGENTS_FIELD, validate_agents
 
 from ..agents.roles import ROLES
-from ..checks import accuracy_policy
 from ..infra.compute.environment import EnvironmentError, check_tmpdir, gpus_per_node
 from ..infra.compute.sessions import validate_sessions
 from ..infra.git import COMMIT_POLICY_FIELD, validate_commit_policy_block
 from .schema_keys import reject_unknown_keys
 from .variants import ANCHOR_RECORDED, ANCHOR_RELATIVE, VARIANTS_FIELD, validate_variants
+from .verification import BENCHMARKS, VERIFICATION_FIELD
+from .verification import validate as validate_verification
 
 REQUIRED_PATH_FIELDS: tuple[str, ...] = (
     "checkpoint_path",
@@ -127,7 +128,7 @@ ACCEPTANCE_WORKLOAD_KEYS: tuple[str, ...] = (
     "max_tokens",
     "min_draft_iterations",
 )
-ACCEPTANCE_BLOCK_KEYS: tuple[str, ...] = (*ACCEPTANCE_WORKLOAD_KEYS, "timeout")
+ACCEPTANCE_BLOCK_KEYS: tuple[str, ...] = ACCEPTANCE_WORKLOAD_KEYS
 # What one unit's entry in `accuracy.acceptance` may carry:
 #   min_absolute        the absolute floor its acceptance is held to
 #   measured_reference  what a reference drafter measured on this workload; the
@@ -139,7 +140,6 @@ ACCEPTANCE_UNIT_KEYS: tuple[str, ...] = (
     "min_absolute",
     "measured_reference",
     "floor_source",
-    "timeout",
     *ACCEPTANCE_WORKLOAD_KEYS,
 )
 
@@ -184,6 +184,7 @@ TOP_LEVEL_KEYS: tuple[str, ...] = (
     COMMIT_POLICY_FIELD,
     VARIANTS_FIELD,
     "profile",
+    VERIFICATION_FIELD,
 )
 #: ``profile``: how much the contract owes, for the run or per unit (a mapping
 #: from unit or variant name, and ``default``, to a profile). ``smoke`` owes a
@@ -217,10 +218,12 @@ ACCURACY_KEYS: tuple[str, ...] = (
     # The `acceptance_length` floor a unit is held to, and the acceptance
     # gate's declared workload; see `ACCEPTANCE_WORKLOAD_KEYS`.
     "acceptance",
+    # The benchmark of the flow's e2e test: an accuracy_core dataset
+    # (`spec.verification.BENCHMARKS`), judged against its references row.
     "benchmark",
     "reference_yaml",
     "model_key",
-    "tolerance",
+    # Seconds one of the flow's tests may take at one member.
     "timeout",
     "dataset_path",
     "llm_api_options",
@@ -230,23 +233,27 @@ ACCURACY_KEYS: tuple[str, ...] = (
     "discriminators",
     # The disaggregated-serving test the `disagg` feature owes (checks/disagg.py).
     "disagg",
-    # `trtllm-eval` takes these two as its OWN flags rather than through the
-    # options YAML, so they have to be declarable here.
+    # The e2e test's engine limits, beside the options YAML.
     "max_seq_len",
     "max_batch_size",
-    "benchmark_args",
-    "floor",
+    # The benchmark's protocol, as accuracy_core's `extra_evaluator_kwargs` (an instruct
+    # model's `apply_chat_template`, `fewshot_as_multiturn`, `chat_template_kwargs`): the
+    # protocol its references row was measured under. Run-wide; a variant states its own.
+    "evaluator_kwargs",
     "boot",
     "serve",
-    # The benchmark's sample count, scalar or per unit, for the standard
-    # error behind the statistical floor.
-    "samples",
     "benchmark_members",
     "anchor",
-    # How the gate reads the score from the benchmark's output, scalar or per unit: a
-    # regular expression whose first group is the score, on the anchor's scale. Unset, the
-    # gate reads lm-eval's `accuracy:` line and MMLU's weighted average.
-    "score_pattern",
+)
+#: Keys a benchmark run by trtllm-eval read, and why none is read now.
+RETIRED_ACCURACY_KEYS: dict[str, str] = {
+    key: "the flow's e2e test judges a benchmark by accuracy_core's hypothesis test against "
+    "its references row (tests/integration/defs/accuracy/references/<dataset>.yaml)"
+    for key in ("tolerance", "floor", "samples", "score_pattern", "benchmark_args")
+}
+RETIRED_ACCURACY_KEYS["benchmark_args"] += (
+    "; the protocol is `evaluator_kwargs` (`{apply_chat_template: true}`, ...), which a stated "
+    "disaggregated deployment passes to trtllm-eval as flags too"
 )
 
 # `accuracy.anchor`: what a unit's or a variant's accuracy floor stands on.
@@ -268,18 +275,12 @@ BENCHMARK_MEMBERS: tuple[str, ...] = (BENCHMARK_MEMBERS_EVERY,)
 # Boot workloads allow run-wide keys and per-unit overlays. Absent multimodal images use
 # the repository asset.
 BOOT_KEYS: tuple[str, ...] = ("prompts", "prompts_file", "max_tokens")
-# How long one boot gate, or one acceptance gate, may run: `timeout` at either level of
-# `accuracy.boot` and `accuracy.acceptance` (default 1800 s). Not a workload key: it
-# changes no verdict, only how long a slow load is waited for.
-GATE_TIMEOUT_KEY = "timeout"
 BOOT_PROMPT_KEYS: tuple[str, ...] = ("prompt", "images", "render")
 BOOT_RENDERS: tuple[str, ...] = ("loader", "raw")
 
 # Serve defaults are derived from the declared sequence bound in derive_gate_defaults.
 SERVE_KEYS: tuple[str, ...] = ("enabled", "prompt", "max_tokens", "timeout")
 
-# The floor itself is computed in checks/accuracy_policy.py.
-FLOOR_KEYS: tuple[str, ...] = ("rule", "k")
 
 ENVIRONMENT_KEYS: tuple[str, ...] = (
     "kind",
@@ -305,10 +306,6 @@ ENVIRONMENT_KEYS: tuple[str, ...] = (
 
 ENVIRONMENT_KINDS: tuple[str, ...] = ("local", "session_spool")
 ENVIRONMENT_REQUIRED_FIELDS: tuple[str, ...] = ("kind", "python")
-
-# Accuracy tolerance, in benchmark points, under `accuracy.floor.rule:
-# tolerance` only.
-DEFAULT_ACCURACY_TOLERANCE = 5.0
 
 
 class TaskSchemaError(ValueError):
@@ -811,7 +808,7 @@ def _validate_acceptance_workload(entry: Mapping[str, Any], errors: list[str], w
     _validate_fields(
         entry,
         dict.fromkeys(
-            ("max_tokens", "min_draft_iterations", "num_prompts", GATE_TIMEOUT_KEY),
+            ("max_tokens", "min_draft_iterations", "num_prompts"),
             _POS_INT,
         ),
         errors,
@@ -835,7 +832,7 @@ def _validate_acceptance(block: Any, errors: list[str]) -> None:
         return
     _validate_acceptance_workload(block, errors, where)
     for unit, entry in block.items():
-        if unit in ACCEPTANCE_BLOCK_KEYS:
+        if unit in ACCEPTANCE_BLOCK_KEYS or unit == "timeout":
             continue
         unit_where = f"{where}.{unit}"
         if isinstance(entry, dict):
@@ -889,7 +886,7 @@ def _validate_boot_level(level: Mapping[str, Any], errors: list[str], where: str
     if prompts_file is not None:
         if not isinstance(prompts_file, str) or not Path(prompts_file).is_file():
             errors.append(f"'{where}.prompts_file' does not exist: {prompts_file}")
-    _validate_fields(level, {"max_tokens": _POS_INT, GATE_TIMEOUT_KEY: _POS_INT}, errors, where)
+    _validate_fields(level, {"max_tokens": _POS_INT}, errors, where)
 
 
 def _validate_boot(block: Any, errors: list[str]) -> None:
@@ -900,7 +897,7 @@ def _validate_boot(block: Any, errors: list[str]) -> None:
         return
     _validate_boot_level(block, errors, where)
     for unit, entry in block.items():
-        if unit in BOOT_KEYS or unit == GATE_TIMEOUT_KEY:
+        if unit in BOOT_KEYS or unit == "timeout":
             continue
         if not isinstance(entry, dict):
             errors.append(
@@ -908,17 +905,8 @@ def _validate_boot(block: Any, errors: list[str]) -> None:
                 f"mapping of them"
             )
             continue
-        reject_unknown_keys(entry, (*BOOT_KEYS, GATE_TIMEOUT_KEY), errors, where=f"{where}.{unit}")
+        reject_unknown_keys(entry, BOOT_KEYS, errors, where=f"{where}.{unit}")
         _validate_boot_level(entry, errors, f"{where}.{unit}")
-
-
-# The sample count a run actually scored, where the eval prints one: the MMLU
-# line carries it in parentheses, and lm-eval's partial-score line (printed
-# under `TLLM_EVAL_PARTIAL_SCORES_EVERY`) ends at `<total>/<total>`.
-_MMLU_SAMPLES = re.compile(r"MMLU weighted average accuracy:\s*[0-9.]+\s*\((\d+)\)")
-_PARTIAL_TOTAL = re.compile(r"Partial scores after\s+(\d+)/(\d+)\s+responses")
-# `--num_samples=N` or `--num_samples N` among the benchmark arguments.
-_NUM_SAMPLES_ARG = re.compile(r"^--num_samples(?:=(\d+))?$")
 
 
 def resolve_per_unit(accuracy: Mapping[str, Any], key: str, unit: str | None) -> Any:
@@ -934,117 +922,6 @@ def resolve_per_unit(accuracy: Mapping[str, Any], key: str, unit: str | None) ->
             chosen = value.get("default")
         return chosen
     return value
-
-
-def resolve_gate_timeout(accuracy: Mapping[str, Any], block: str, unit: str | None) -> int | None:
-    """``accuracy.<block>``'s ``timeout`` for ``unit``: its own entry's, else the block's; None unsaid."""
-    level = accuracy.get(block)
-    if not isinstance(level, Mapping):
-        return None
-    own = level.get(unit) if unit is not None else None
-    for source in (own, level):
-        if isinstance(source, Mapping) and source.get(GATE_TIMEOUT_KEY) is not None:
-            return int(source[GATE_TIMEOUT_KEY])
-    return None
-
-
-def resolve_samples(
-    accuracy: Mapping[str, Any],
-    unit: str | None,
-    benchmark: str,
-    output: str = "",
-) -> tuple[int | None, str]:
-    """How many samples the accuracy score was (or will be) measured on, and from where.
-
-    Most specific first: the count the eval itself printed (what was actually
-    scored), then ``--num_samples`` among the unit's benchmark arguments, then
-    ``accuracy.samples`` (scalar or per unit), then
-    :data:`.accuracy_policy.KNOWN_BENCHMARK_SAMPLES`. ``(None, reason)`` when none of
-    them answers.
-    """
-    if output:
-        mmlu = _MMLU_SAMPLES.findall(output)
-        if mmlu:
-            return int(mmlu[-1]), "the eval's own output"
-        partial = _PARTIAL_TOTAL.findall(output)
-        if partial:
-            return int(partial[-1][1]), "the eval's own output"
-    args = [str(a) for a in resolve_per_unit(accuracy, "benchmark_args", unit) or ()]
-    for i, arg in enumerate(args):
-        matched = _NUM_SAMPLES_ARG.match(arg)
-        if not matched:
-            continue
-        value = matched.group(1) or (args[i + 1] if i + 1 < len(args) else None)
-        try:
-            return int(str(value)), "--num_samples in benchmark_args"
-        except (TypeError, ValueError):
-            break
-    declared = resolve_per_unit(accuracy, "samples", unit)
-    if declared is not None:
-        try:
-            return int(declared), "accuracy.samples"
-        except (TypeError, ValueError):
-            pass
-    known = accuracy_policy.KNOWN_BENCHMARK_SAMPLES.get(benchmark)
-    if known is not None:
-        return known, f"the {benchmark} split size"
-    return None, f"no sample count for `{benchmark}`: declare `accuracy.samples`"
-
-
-def _validate_floor(block: Mapping[str, Any], errors: list[str]) -> None:
-    """Validate ``accuracy.floor`` and that its rule can be computed for every unit.
-
-    The statistical rule needs a sample count per benchmark.
-    """
-    where = f"{ACCURACY_FIELD}.floor"
-    floor = block.get("floor")
-    if floor is not None:
-        if not isinstance(floor, dict):
-            errors.append(f"'{where}' must be a mapping with keys {list(FLOOR_KEYS)}")
-            floor = {}
-        reject_unknown_keys(floor, FLOOR_KEYS, errors, where=where)
-        rule = floor.get("rule")
-        if rule is not None and rule not in accuracy_policy.FLOOR_RULES:
-            errors.append(
-                f"'{where}.rule' must be one of {accuracy_policy.FLOOR_RULES}, got {rule!r}"
-            )
-        k = floor.get("k")
-        if k is not None and (not _number(k) or k <= 0):
-            errors.append(f"'{where}.k' must be a number > 0, got {k!r}")
-    else:
-        floor = {}
-
-    samples = block.get("samples")
-    if samples is not None:
-        values = samples.values() if isinstance(samples, dict) else [samples]
-        if not all(_positive_int(v) for v in values):
-            errors.append(
-                f"'{ACCURACY_FIELD}.samples' must be an integer >= 1, or a mapping from unit "
-                f"to one; got {samples!r}"
-            )
-            return
-
-    if (
-        floor.get("rule") or accuracy_policy.FLOOR_STATISTICAL
-    ) != accuracy_policy.FLOOR_STATISTICAL:
-        return
-
-    benchmarks = block.get("benchmark")
-    pairs = (
-        list(benchmarks.items())
-        if isinstance(benchmarks, dict)
-        else [(None, benchmarks or "gsm8k")]
-    )
-    for unit, benchmark in pairs:
-        if not isinstance(benchmark, str):
-            continue
-        count, source = resolve_samples(block, None if unit == "default" else unit, benchmark)
-        if count is None:
-            errors.append(
-                f"'{ACCURACY_FIELD}' uses the statistical floor, and there is {source} "
-                f"(unit {unit or 'every unit'}); the floor is anchor - k * SE and the SE "
-                f"needs it"
-            )
 
 
 def _validate_serve(block: Any, errors: list[str]) -> None:
@@ -1112,36 +989,29 @@ def derive_gate_defaults(data: dict[str, Any], spec_dir: Path) -> None:
         accuracy["serve"] = {**(serve or {}), "enabled": _bounds_server_length(accuracy)}
 
 
-def _validate_score_pattern(value: Any, errors: list[str]) -> None:
-    """``accuracy.score_pattern``: a regular expression with a group, or a per-unit mapping of them."""
-    if value is None:
-        return
-    where = f"{ACCURACY_FIELD}.score_pattern"
-    if isinstance(value, dict):
-        if "default" not in value:
-            errors.append(f"'{where}' is a per-unit mapping, so it needs a 'default' key")
-        entries = [(f"{where}[{unit}]", entry) for unit, entry in value.items()]
-    else:
-        entries = [(where, value)]
-    for name, entry in entries:
-        if not isinstance(entry, str) or not entry.strip():
-            errors.append(f"'{name}' must be a non-empty regular expression")
-            continue
-        try:
-            groups = re.compile(entry).groups
-        except re.error as exc:
-            errors.append(f"'{name}' is not a regular expression: {exc}")
-            continue
-        if groups < 1:
-            errors.append(f"'{name}' needs a group around the score, e.g. `accuracy: ([0-9.]+)`")
-
-
 def _validate_accuracy(block: Any, errors: list[str]) -> None:
     """Validate the ``accuracy`` block in place, appending to ``errors``."""
     if not isinstance(block, dict):
         raise TaskSchemaError(f"'{ACCURACY_FIELD}' must be a mapping, got {type(block).__name__}")
 
-    reject_unknown_keys(block, ACCURACY_KEYS, errors, where=ACCURACY_FIELD)
+    for key, why in RETIRED_ACCURACY_KEYS.items():
+        if key in block:
+            errors.append(f"'{ACCURACY_FIELD}.{key}' is no longer read: {why}")
+    for name in ("boot", "acceptance"):
+        level = block.get(name)
+        levels = [level, *level.values()] if isinstance(level, dict) else []
+        if any(isinstance(entry, dict) and "timeout" in entry for entry in levels):
+            errors.append(
+                f"'{ACCURACY_FIELD}.{name}.timeout' is no longer read: the flow's e2e test runs "
+                f"the boot prompts, the benchmark and the acceptance on one engine, within "
+                f"`{ACCURACY_FIELD}.timeout`"
+            )
+    reject_unknown_keys(
+        {k: v for k, v in block.items() if k not in RETIRED_ACCURACY_KEYS},
+        ACCURACY_KEYS,
+        errors,
+        where=ACCURACY_FIELD,
+    )
 
     for name in ("benchmark", "reference_yaml"):
         value = block.get(name)
@@ -1165,21 +1035,26 @@ def _validate_accuracy(block: Any, errors: list[str]) -> None:
             f"from assembly unit to one"
         )
 
-    _validate_score_pattern(block.get("score_pattern"), errors)
+    benchmark = block.get("benchmark")
+    named = benchmark.values() if isinstance(benchmark, dict) else [benchmark]
+    for value in named:
+        if isinstance(value, str) and value.strip() and value not in BENCHMARKS:
+            errors.append(
+                f"'{ACCURACY_FIELD}.benchmark' names {value!r}, which is not an accuracy_core "
+                f"benchmark the e2e test runs ({sorted(BENCHMARKS)}); another evaluation is a "
+                f"test of the tree, named in `verification` with `pytest`"
+            )
+    kwargs = block.get("evaluator_kwargs")
+    if kwargs is not None and (
+        not isinstance(kwargs, dict) or not all(isinstance(k, str) for k in kwargs)
+    ):
+        errors.append(
+            f"'{ACCURACY_FIELD}.evaluator_kwargs' must be a mapping of keyword arguments for the "
+            "benchmark's evaluator (accuracy_core's extra_evaluator_kwargs)"
+        )
 
-    tolerance = block.get("tolerance")
-    if tolerance is None:
-        block["tolerance"] = DEFAULT_ACCURACY_TOLERANCE
-    elif not _number(tolerance):
-        errors.append(f"'{ACCURACY_FIELD}.tolerance' must be a number")
-    elif tolerance < 0:
-        errors.append(f"'{ACCURACY_FIELD}.tolerance' must be >= 0; got {tolerance}")
-
-    # ``dataset_path`` is optional but load-bearing for MMLU: trtllm-eval
-    # fetches that one dataset itself from a URL that now 404s, writes the
-    # error page to data.tar, and dies inside tarfile.open — so the failure
-    # reads as a corrupt archive rather than a dead link. Every other
-    # benchmark comes through lm-eval and is unaffected.
+    # Where the benchmark's dataset is on disk, for a run whose models root lacks it
+    # (``run/startup/datasets.py``).
     dataset_path = block.get("dataset_path")
     if dataset_path is not None and (not isinstance(dataset_path, str) or not dataset_path.strip()):
         errors.append(f"'{ACCURACY_FIELD}.dataset_path' must be a non-empty string when present")
@@ -1210,8 +1085,6 @@ def _validate_accuracy(block: Any, errors: list[str]) -> None:
 
     if block.get("acceptance") is not None:
         _validate_acceptance(block["acceptance"], errors)
-
-    _validate_floor(block, errors)
 
     if block.get("boot") is not None:
         _validate_boot(block["boot"], errors)
@@ -1262,33 +1135,6 @@ def _validate_accuracy(block: Any, errors: list[str]) -> None:
                             f"{type(value).__name__}"
                         )
 
-    # The evaluation *protocol* -- chat template, few-shot handling, seed --
-    # is expressed as options of the benchmark subcommand, so it cannot live
-    # in the llm_api_options YAML.
-    benchmark_args = block.get("benchmark_args")
-
-    def _is_arg_list(value: Any) -> bool:
-        return isinstance(value, list) and all(isinstance(a, str) for a in value)
-
-    if benchmark_args is None:
-        block["benchmark_args"] = []
-    elif isinstance(benchmark_args, dict):
-        if "default" not in benchmark_args:
-            errors.append(
-                f"'{ACCURACY_FIELD}.benchmark_args' is a per-unit mapping, so it needs "
-                f"a 'default' key"
-            )
-        for unit, value in benchmark_args.items():
-            if not _is_arg_list(value):
-                errors.append(
-                    f"'{ACCURACY_FIELD}.benchmark_args[{unit}]' must be a list of strings"
-                )
-    elif not _is_arg_list(benchmark_args):
-        errors.append(
-            f"'{ACCURACY_FIELD}.benchmark_args' must be a list of strings, or a "
-            f"mapping from assembly unit to one"
-        )
-
 
 def _unit_names(data: Mapping[str, Any]) -> set[str]:
     """The names a per-unit key may use: ``default``, ``core``, each feature and each variant."""
@@ -1298,6 +1144,17 @@ def _unit_names(data: Mapping[str, Any]) -> set[str]:
     if isinstance(data.get(VARIANTS_FIELD), Mapping):
         named.update(str(v) for v in data[VARIANTS_FIELD])
     return named
+
+
+def _member_error(member: str) -> str | None:
+    """What is wrong with ``member`` as a concrete member; ``None`` when nothing is."""
+    try:
+        kind, size = parse_parallel_segment(member)
+    except TaskSchemaError as exc:
+        return str(exc)
+    if size is None:
+        return f"name a concrete member (tp<N>, tep<N> or dep<N>), not {kind!r}"
+    return None
 
 
 def _require_named_units(data: Mapping[str, Any], errors: list[str]) -> None:
@@ -1312,8 +1169,9 @@ def _require_named_units(data: Mapping[str, Any], errors: list[str]) -> None:
     named = _unit_names(data)
     # `accuracy.acceptance` reads a `default` entry; `accuracy.boot` reads a unit's own only.
     for block, keys, units in (
-        ("acceptance", ACCEPTANCE_BLOCK_KEYS, named),
-        ("boot", (*BOOT_KEYS, GATE_TIMEOUT_KEY), named - {"default"}),
+        # A retired `timeout` is said by `_validate_accuracy`.
+        ("acceptance", (*ACCEPTANCE_BLOCK_KEYS, "timeout"), named),
+        ("boot", (*BOOT_KEYS, "timeout"), named - {"default"}),
     ):
         entries = accuracy.get(block)
         for unit in entries if isinstance(entries, Mapping) else ():
@@ -1562,6 +1420,9 @@ def load_and_validate_task_yaml(path: str | Path) -> dict[str, Any]:
 
     _validate_profile(data, errors)
     _require_named_units(data, errors)
+    validate_verification(
+        data, errors, features=_unit_names(data) - {"default"}, member_error=_member_error
+    )
 
     if ENVIRONMENT_FIELD not in data:
         errors.append(
@@ -1641,9 +1502,7 @@ __all__ = [
     "ANCHOR_RELATIVE",
     "ANCHOR_STATES",
     "gpus_per_node",
-    "resolve_gate_timeout",
     "resolve_per_unit",
-    "resolve_samples",
     "BENCHMARK_MEMBERS",
     "BENCHMARK_MEMBERS_EVERY",
     "derive_gate_defaults",
@@ -1655,7 +1514,6 @@ __all__ = [
     "ACCURACY_KEYS",
     "ARCH_FIELD",
     "ARCH_PATTERN",
-    "DEFAULT_ACCURACY_TOLERANCE",
     "DEFAULT_MEMBER_KINDS",
     "DEFAULT_PARALLEL",
     "DEFAULT_SCOPE",

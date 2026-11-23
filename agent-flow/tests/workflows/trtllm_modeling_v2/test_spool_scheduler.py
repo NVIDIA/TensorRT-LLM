@@ -1010,10 +1010,10 @@ class _Stage(CheckRunner):
 def test_the_first_units_inner_checks_go_ahead_of_every_other():
     stage = _Stage()
     for check in (
-        c.Check("core", "boot", "tp1", c.TIER_INNER),
-        c.Check("core", "serve", "tp1", c.TIER_DELIVERY),
-        c.Check("mtp", "boot", "tp1", c.TIER_INNER),
-        c.Check("mtp", "acceptance", "tp1", c.TIER_PROOF),
+        c.Check("core", "boot", "tp1", c.STAGE_LANDING),
+        c.Check("core", "serve", "tp1", c.STAGE_DELIVERY),
+        c.Check("mtp", "boot", "tp1", c.STAGE_LANDING),
+        c.Check("mtp", "acceptance", "tp1", c.STAGE_LANDING),
     ):
         stage._prioritized_check(check, None)
     assert stage.seen == [

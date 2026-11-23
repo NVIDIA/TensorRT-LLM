@@ -4,7 +4,7 @@
 """The serve gate: ``trtllm-serve`` starts the unit's target and answers over HTTP.
 
 The gate starts ``trtllm-serve <checkpoint>`` on the tree under test with the
-accuracy gate's LLM-API options, at the member's topology, waits for
+LLM-API options the e2e test builds its engine from, at the member's topology, waits for
 ``/health`` and sends one ``/v1/completions`` request, then the image prompts
 of the unit's boot workload as chats. It passes when the server became
 healthy and every answer is HTTP 200 with non-empty text. The job is
@@ -117,11 +117,10 @@ def write_serve_options(
     unit: str | None,
     member: str | None,
 ) -> Path:
-    """The unit's LLM-API options as the accuracy gate serves them, as one ``--config`` file.
+    """The unit's LLM-API options as the e2e test builds its engine, as one ``--config`` file.
 
-    What :func:`~.accuracy.eval_command` gives ``trtllm-eval``, written in the
-    gate's own directory so neither gate rewrites a file the other's job may
-    be reading.
+    Written in the serve check's own directory, so no other check rewrites a
+    file its job may be reading.
     """
     config = check_configuration(
         task_data, environment, unit=unit, features=None, max_tokens=64, member=member
