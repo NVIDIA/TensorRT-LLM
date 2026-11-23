@@ -61,6 +61,9 @@ l0_gb300_multi_gpus:
   # sampling, the breakable prefill graph, every opt-in projection) on one context and one
   # generation GPU.
   - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_tp1_disaggregated_mtp2 TIMEOUT (90)
+  # Inkling-2-Small modeling_v2 target on a GB300 tray (attention TP4, MoE EP4), eager: GSM8K
+  # (about 40 minutes).
+  - accuracy/modeling_v2/inkling2/inkling_2_small_nvfp4__sm_103__tep4/test_accuracy.py::TestModelingV2Inkling2SmallNvfp4Sm103Tep4::test_gsm8k TIMEOUT (90)
   # Covers the GPU cases of tests/unittest/_torch/attention/ on GB300, kernels/ and
   # multi_gpu/ included; its cpu_only cases run on CPU (l0_cpu). The GPU cases of
   # kernels/parallel_hw_agnostic/ run here too, although l0_b200 and l0_b300 ignore that
