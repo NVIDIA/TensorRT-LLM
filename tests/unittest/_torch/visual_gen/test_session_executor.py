@@ -1284,6 +1284,30 @@ def test_idle_timeout_keeps_an_existing_terminal_and_adds_none(harness):
             next(results)
 
 
+def test_refused_traffic_does_not_restart_the_idle_clock(harness):
+    """A generation request is refused and another session's keep-alive is dropped
+    while a session is open; neither is activity of the open session."""
+    idle = 0.6
+    with harness(
+        CountingPipeline(initial=False), SimpleNamespace(delivery_slots=2, idle_timeout=idle)
+    ) as h:
+        s = h.open()
+        opened = time.monotonic()
+        channel = h.client._sessions[s.request_id]
+        request_id = 100
+        while not _closed(channel):
+            assert time.monotonic() - opened < idle * 5, "refused traffic kept the session open"
+            request_id += 1
+            h.executor.requests_ipc.put_nowait(_request(request_id))
+            h.executor.requests_ipc.put_nowait(
+                SessionControl(s.request_id + 1, ControlType.KEEP_ALIVE)
+            )
+            time.sleep(idle / 10)
+        assert time.monotonic() - opened >= idle * 0.9
+        terminal = next(s.results())
+        assert terminal.done and "idle timeout" in terminal.error
+
+
 def test_first_result_request_restarts_the_idle_clock(harness):
     """A request that returns no slot still sends a keep-alive: the first request
     of a session, or one after the iterator was closed."""

@@ -1162,31 +1162,39 @@ class DiffusionExecutor:
         session publishes its terminal; the loop ends on the close command, on
         the shutdown signal, or on the idle timeout, and says which."""
         idle_timeout = self._session_idle_timeout()
+        # The idle wait counts from the later of the last advance and the last
+        # command of this session's own client. Traffic the worker refuses (a
+        # generation request, a second open, another session's commands) does
+        # not move it.
+        active_at = time.monotonic()
         while True:
             # Commands already waiting go first, so a value submitted during the
             # last advance is seen by the next dispatch.
-            ending = self._service_commands_now(session, pool, pipeline_state)
+            commands = self._waiting_commands()
+            if not commands and not session.can_advance(pool.free_count):
+                # Only the client can make progress now; wait for it.
+                deadline = None if idle_timeout is None else active_at + idle_timeout
+                commands = self._wait_for_commands(deadline)
+                if not commands:
+                    logger.warning(
+                        f"Worker {self.device_id}: session {session.session_id} idle for "
+                        f"{idle_timeout:.0f}s; closing it"
+                    )
+                    if not session.ended:
+                        self.response_queue.put(
+                            session.terminal_result(
+                                error=f"session idle timeout ({idle_timeout:.0f}s) expired"
+                            )
+                        )
+                    return _SessionExit.IDLE_TIMEOUT
+            if any(self._from_session(message, session) for message in commands):
+                active_at = time.monotonic()
+            ending = self._handle_session_commands(commands, session, pool, pipeline_state)
             if ending is not None:
                 return ending
             if session.can_advance(pool.free_count):
                 self._advance_session(session, pool, pipeline_state)
-                continue
-            # Only the client can make progress now; wait for it.
-            ending = self._wait_for_commands(session, pool, pipeline_state, timeout=idle_timeout)
-            if ending is _SessionExit.IDLE_TIMEOUT:
-                logger.warning(
-                    f"Worker {self.device_id}: session {session.session_id} idle for "
-                    f"{idle_timeout:.0f}s; closing it"
-                )
-                if not session.ended:
-                    self.response_queue.put(
-                        session.terminal_result(
-                            error=f"session idle timeout ({idle_timeout:.0f}s) expired"
-                        )
-                    )
-                return _SessionExit.IDLE_TIMEOUT
-            if ending is not None:
-                return ending
+                active_at = time.monotonic()
 
     def _end_session(self, session: SessionState, pipeline_state: Any, *, fatal: bool) -> None:
         """Tear the session down. ``fatal``: this rank is dying with peers possibly
@@ -1252,42 +1260,36 @@ class DiffusionExecutor:
             shapes[name] = (tuple(tensor.shape), tensor.dtype)
         return shapes
 
-    def _service_commands_now(
-        self, session: SessionState, pool: SlotPool, pipeline_state: Any
-    ) -> Optional[_SessionExit]:
-        """Handle every command already waiting on either socket, controls first,
-        without waiting for more. Returns why the session is to end if a close or
-        the shutdown signal was among them."""
-        commands = self._drain_controls() + self.requests_ipc.drain()
-        return self._handle_session_commands(commands, session, pool, pipeline_state)
+    def _waiting_commands(self) -> List[Any]:
+        """Every command already waiting on either socket, controls first, without
+        waiting for more."""
+        return self._drain_controls() + self.requests_ipc.drain()
 
-    def _wait_for_commands(
-        self,
-        session: SessionState,
-        pool: SlotPool,
-        pipeline_state: Any,
-        *,
-        timeout: Optional[float],
-    ) -> Optional[_SessionExit]:
-        """Wait up to ``timeout`` seconds (``None``: no limit) for a command on
-        either socket, then handle it and everything behind it, controls first.
-        Returns ``None`` when the session goes on, the reason when a command ended
-        it, and ``IDLE_TIMEOUT`` when nothing arrived in time. Both sockets are
-        watched in slices of ``POLL_TIMEOUT``, so a slot return or a close is seen
-        whatever sits unread on the request socket."""
-        deadline = None if timeout is None else time.monotonic() + timeout
+    def _wait_for_commands(self, deadline: Optional[float]) -> List[Any]:
+        """Wait until ``deadline`` on the monotonic clock (``None``: no limit) for
+        a command on either socket. Returns it with everything behind it, or an
+        empty list when nothing arrived in time. Both sockets are watched in
+        slices of ``POLL_TIMEOUT``, so a slot return or a close is seen whatever
+        sits unread on the request socket."""
         while True:
-            commands = self._drain_controls() + self.requests_ipc.drain()
+            commands = self._waiting_commands()
             if commands:
-                return self._handle_session_commands(commands, session, pool, pipeline_state)
+                return commands
             if deadline is not None and time.monotonic() >= deadline:
-                return _SessionExit.IDLE_TIMEOUT
+                return []
             try:
                 message = self.requests_ipc.get(timeout=POLL_TIMEOUT)
             except queue.Empty:
                 continue
-            commands = [message] + self._drain_controls() + self.requests_ipc.drain()
-            return self._handle_session_commands(commands, session, pool, pipeline_state)
+            return [message] + self._waiting_commands()
+
+    @staticmethod
+    def _from_session(message: Any, session: SessionState) -> bool:
+        """Whether ``message`` is a submit or a control of ``session``'s own client."""
+        return (
+            isinstance(message, (SessionSubmit, SessionControl))
+            and message.session_id == session.session_id
+        )
 
     def _handle_session_commands(
         self, commands: List[Any], session: SessionState, pool: SlotPool, pipeline_state: Any
@@ -1328,10 +1330,10 @@ class DiffusionExecutor:
             self.response_queue.put(reply)
             return None
         if isinstance(message, SessionControl):
-            if message.type is ControlType.KEEP_ALIVE:
-                return None  # its arrival already restarted the idle wait
             if message.session_id != session.session_id:
                 self._answer_stray_command(message)
+                return None
+            if message.type is ControlType.KEEP_ALIVE:
                 return None
             if message.type is ControlType.CLOSE:
                 return _SessionExit.CLOSE
