@@ -24,6 +24,7 @@
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/ControlChannel.h"
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/CreditScheduler.h"
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/ExecPool.h"
+#include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/HostWorkerPool.h"
 #include "tensorrt_llm/executor/transferAgent.h"
 
 #include <algorithm>
@@ -159,6 +160,11 @@ public:
     /// the sender's releaseLocal/reclaim can free arena bytes that re-grant a waiting remote flow).
     void sendGrants(std::vector<Grant> const& grants);
 
+    /// Pool for a bulk pass over `items`, or nullptr when the pass is too small to split or the pool
+    /// could not start; the caller then runs the pass itself. Started on first use and joined with this
+    /// context, after the transport's threads. Thread-safe.
+    [[nodiscard]] HostWorkerPool* poolForBulkPass(std::size_t items) noexcept;
+
     std::string selfName;
     BounceConfig cfg;
     int deviceId{};
@@ -168,6 +174,10 @@ public:
     ExecPool* exec{};          // gather/scatter exec contexts (streams/scratch), borrowed per kernel
     CreditScheduler scheduler; // shared region allocator; internally synchronized
     std::atomic<bool> stop{false};
+
+private:
+    std::once_flag mHostWorkerPoolStarted;
+    std::unique_ptr<HostWorkerPool> mHostWorkerPool;
 };
 
 /// Receiver role ([R]): WANT -> grant regions, DATA -> scatter into the caller's KV, then ACK. Owns
@@ -520,6 +530,12 @@ public:
         TransferDescs const& srcDescs, TransferDescs const& dstDescs, std::string const& peer)
     {
         return mSender.submit(srcDescs, dstDescs, peer);
+    }
+
+    /// See BounceContext::poolForBulkPass.
+    [[nodiscard]] HostWorkerPool* poolForBulkPass(std::size_t items) noexcept
+    {
+        return mCtx.poolForBulkPass(items);
     }
 
     /// This side's EFFECTIVE per-chunk cap: cfg.maxChunkSizeBytes AFTER the constructor's clamp to
