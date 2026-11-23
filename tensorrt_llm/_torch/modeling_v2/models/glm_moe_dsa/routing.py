@@ -16,7 +16,7 @@ import re
 from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig, PrefillCudaGraphBackend
-from tensorrt_llm.quantization.mode import QuantAlgo
+from tensorrt_llm.quantization.mode import QuantAlgo, QuantMode
 from tensorrt_llm.quantization.modelopt_config import (
     canonicalize_quant_algo,
     is_modelopt_quant_config,
@@ -142,6 +142,88 @@ def _nvfp4_with_bf16_mtp_layer(pretrained_config: Any) -> Tuple[bool, str]:
         return served, f"{layers} with the MTP layer unquantized"
     words = f"{quant_algo.name} with the MTP layer {'unquantized' if unquantized else 'quantized'}"
     return quant_algo == QuantAlgo.NVFP4 and unquantized, words
+
+
+def _unquantized_mlps(model_config: ModelConfig) -> tuple[bool, str]:
+    """Check dense/shared projections, including an active MTP shared expert.
+
+    A physical split declaration takes precedence over a fused exclusion or
+    entry; fused entries apply only to gate/up projections. Read weight-only
+    flags without caching quantization modes before the loader's KV override.
+    """
+    quant_config = model_config.quant_config
+    pretrained_config = model_config.pretrained_config
+    num_layers = pretrained_config.num_hidden_layers + (model_config.spec_config is not None)
+    for layer_idx in range(num_layers):
+        mlp_name = f"model.layers.{layer_idx}.mlp"
+        if layer_idx >= pretrained_config.first_k_dense_replace:
+            mlp_name += ".shared_experts"
+        for projection in ("gate_proj", "up_proj", "down_proj"):
+            projection_name = f"{mlp_name}.{projection}"
+            if quant_config.is_module_excluded_from_quantization(projection_name):
+                continue
+            projection_quant = None
+            if model_config.quant_config_dict is not None:
+                projection_quant = model_config.quant_config_dict.get(projection_name)
+            if projection_quant is None:
+                if projection != "down_proj" and quant_config.is_module_excluded_from_quantization(
+                    f"{mlp_name}.gate_up_proj"
+                ):
+                    continue
+                if model_config.quant_config_dict is None:
+                    projection_quant = quant_config
+                elif projection != "down_proj":
+                    projection_quant = model_config.quant_config_dict.get(
+                        f"{mlp_name}.gate_up_proj"
+                    )
+            if (
+                projection_quant is not None
+                and QuantMode.from_quant_algo(projection_quant.quant_algo).has_any_quant()
+            ):
+                return (
+                    False,
+                    f"quantized MLP projection {projection_name}: {projection_quant.quant_algo}",
+                )
+    return True, "unquantized dense and shared MLPs"
+
+
+def _tep4_checkpoint(model_config: ModelConfig) -> tuple[bool, str]:
+    """Check indexer ownership and unquantized dense/shared MLP declarations.
+
+    This does not establish the other loader requirements: NVFP4 trunk experts,
+    bf16 attention and remaining MTP weights, or exact tensor shapes and dtypes.
+    """
+    pretrained_config = model_config.pretrained_config
+    indexer_types = getattr(pretrained_config, "indexer_types", None)
+    if indexer_types is None:
+        return False, "indexer_types absent"
+    if not isinstance(indexer_types, (list, tuple)):
+        return False, f"indexer_types is {type(indexer_types).__name__}, not a list or tuple"
+    num_layers = pretrained_config.num_hidden_layers
+    if len(indexer_types) < num_layers:
+        return False, f"indexer_types covers {len(indexer_types)} of {num_layers} trunk layers"
+    if indexer_types[0] != "full":
+        return False, f"indexer_types[0]={indexer_types[0]!r} (layer 0 must own an indexer)"
+    sparse_config = model_config.sparse_attention_config
+    if sparse_config is None:
+        return False, "sparse_attention_config absent; no indexer K-cache ownership policy"
+    from tensorrt_llm._torch.attention.backends.sparse.dsa.cache_manager import (
+        derive_indexer_k_cache_layer_mask,
+    )
+
+    mtp_active = model_config.spec_config is not None
+    cache_owners = derive_indexer_k_cache_layer_mask(
+        sparse_config, pretrained_config, num_layers + mtp_active
+    )
+    for layer_idx, indexer_type in enumerate(indexer_types[: pretrained_config.num_hidden_layers]):
+        if indexer_type == "full" and not cache_owners[layer_idx]:
+            return False, (
+                f"indexer_types layer {layer_idx} has no indexer K-cache under sparse_attention_config "
+                "(index_topk_pattern / index_topk_freq / index_skip_topk_offset)"
+            )
+    if mtp_active and not cache_owners[num_layers]:
+        return False, f"active MTP indexer layer {num_layers} has no indexer K-cache"
+    return _unquantized_mlps(model_config)
 
 
 def _mtp_eagle_linear(spec_config: Optional[Any], draft_len: int) -> bool:
@@ -291,6 +373,7 @@ def route(
         and draft_len in (1, 3, 5)
         and draft_tokens == draft_len
     )
+    tep4_checkpoint = "not read"
     # GLM-5.2-NVFP4 on 4 B300s (sm103), tep4, MTP-Eagle with 1, 3 or 5 draft
     # tokens or no speculation. index_n_heads is checked because a
     # DeepSeek-V3.2-shaped DSA checkpoint would otherwise match the shape.
@@ -302,12 +385,11 @@ def route(
         and mtp_linear_or_none
         and kv_cache_quant_algo == QuantAlgo.FP8
     ):
-        # fmt: off
-        # isort: off
-        from .glm_5_2_nvfp4__sm_103__tep4.modeling import ModelingV2Glm52Nvfp4Sm103Tep4
-        # isort: on
-        # fmt: on
-        return ModelingV2Glm52Nvfp4Sm103Tep4
+        served, tep4_checkpoint = _tep4_checkpoint(model_config)
+        if served:
+            from .glm_5_2_nvfp4__sm_103__tep4.modeling import ModelingV2Glm52Nvfp4Sm103Tep4
+
+            return ModelingV2Glm52Nvfp4Sm103Tep4
 
     # tp8: the attention heads and the experts both tensor-parallel over eight ranks,
     # every expert on every rank, no attention DP. The low-latency decode fast paths
@@ -354,6 +436,7 @@ def route(
     raise NoTarget(
         f"compute capability {compute_capability}, config shape {shape}, "
         f"index_n_heads={index_n_heads}, layer pattern {pattern}, "
+        f"tep4 checkpoint {tep4_checkpoint}, "
         f"quantization {quantization}, "
         f"world_size={mapping.world_size} tp={mapping.tp_size} moe_ep={mapping.moe_ep_size} "
         f"moe_tp={mapping.moe_tp_size} attention_dp={mapping.enable_attention_dp} "
@@ -363,7 +446,8 @@ def route(
         "the glm_moe_dsa targets are GLM-5.2-NVFP4 on sm107, TP4/TP8/TP16 (4/8/16 ranks, "
         "tensor-parallel attention and experts, no attention DP), with one-model "
         "MTP-Eagle as a linear chain or no speculative decoding; GLM-5.2-NVFP4 "
-        "on sm103, tep4 (4 ranks, tensor-parallel attention, expert-parallel MoE), "
+        "on sm103, tep4 (4 ranks, tensor-parallel attention, expert-parallel MoE; "
+        "owning indexer schedule and unquantized dense/shared MLP projections), "
         "with one-model MTP-Eagle as a linear chain at max_draft_len 1, 3 or 5 (no dynamic "
         "tree) or no speculative decoding, both "
         "with an fp8 latent KV cache (not the packed fp8_ds_mla layout); and the "
