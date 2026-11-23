@@ -260,7 +260,7 @@ class BaseMultimodalInputProcessor(ABC):
             "This processor does not support prepared decode inputs")
 
     def get_preferred_media_io_kwargs(self) -> dict[str, dict[str, Any]]:
-        """Return per-modality decode defaults, below server and request overrides."""
+        """Return sampling defaults, below server and per-request overrides."""
         return {}
 
     def get_disagg_prefill_inputs(
@@ -853,12 +853,7 @@ class BaseMultimodalDummyInputsBuilder(ABC):
         return None
 
     def get_preferred_media_io_kwargs(self) -> Dict[str, Dict[str, Any]]:
-        """Per-modality media-IO decode defaults for this model.
-
-        Applied under the server's ``--media_io_kwargs`` and any per-request
-        override, so a model can opt into a decode format it was tuned for
-        (e.g. ``{"video": {"format": "np"}}``) without operator config.
-        """
+        """Return sampling defaults, below server and per-request overrides."""
         return {}
 
     def get_dummy_mm_data(

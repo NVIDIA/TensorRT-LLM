@@ -516,14 +516,6 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
             )
         return self.get_num_tokens_per_video(video=video, video_grid_thw=vgt)
 
-    def get_preferred_media_io_kwargs(self) -> Dict[str, Dict[str, Any]]:
-        # uint8 HWC arrays for both modalities so the HF processor rescales
-        # and normalizes uniformly in one pass. A single `do_rescale` kwarg
-        # controls both modalities; if they arrive in mismatched
-        # pre-rescale states (e.g. image=Tensor pre-rescaled, video=uint8
-        # np), the raw side is left at 0-255 and the ViT sees garbage.
-        return {"image": {"format": "np"}, "video": {"format": "np"}}
-
     def get_disagg_prefill_inputs(
         self, prompt_token_ids: List[int], multimodal_params: MultimodalParams
     ) -> Optional[MultimodalInputLayout]:
