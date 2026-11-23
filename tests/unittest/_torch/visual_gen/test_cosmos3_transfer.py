@@ -23,24 +23,23 @@ os.environ["TRTLLM_DISABLE_COSMOS3_GUARDRAILS"] = "1"
 import pytest
 import torch
 import torch.nn as nn
+from cosmos3_fixtures import bare_resolver
 
 from tensorrt_llm._torch.visual_gen.models.cosmos3 import pipeline_cosmos3 as pipeline_module
 from tensorrt_llm._torch.visual_gen.models.cosmos3 import transfer as transfer_module
 from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
-    COSMOS3_720P_PARAMS,
+    COSMOS3_DEFAULTS,
     COSMOS3_EXTRA_SPECS,
-    COSMOS3_GENERATION_DEFAULTS,
     VIDEO_RES_SIZE_INFO,
+    find_closest_target_size,
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniMoTPipeline
-from tensorrt_llm._torch.visual_gen.models.cosmos3.sampling import DISTILLED_GUIDANCE_SCALE
 from tensorrt_llm._torch.visual_gen.models.cosmos3.transfer import (
     BILATERAL_D,
     BILATERAL_SIGMA_COLOR,
     BILATERAL_SIGMA_SPACE,
     _scaled_bilateral_params,
     decode_media_to_uint8_cthw,
-    find_closest_target_size,
     load_or_compute_control_frames,
     pad_temporal_frames,
     resolve_transfer_config,
@@ -57,9 +56,11 @@ from tensorrt_llm.visual_gen.params import MediaRef, VisualGenParams
 
 pytestmark = pytest.mark.cosmos3
 
+QWEN3_VIDEO_DEFAULTS = COSMOS3_DEFAULTS["qwen3"]["video"]
+
 # What a plain Cosmos3 video request advertises, and so what the executor
 # merges into every request before infer() sees it.
-_ADVERTISED_VIDEO_DEFAULTS = COSMOS3_GENERATION_DEFAULTS[("qwen3", "video")]
+_ADVERTISED_VIDEO_DEFAULTS = QWEN3_VIDEO_DEFAULTS
 
 
 def _ids(value: int) -> torch.Tensor:
@@ -233,16 +234,6 @@ class StubSamplingPolicy:
         self.step_kwargs_calls += 1
         return {"generator": generator} if self.is_distilled else {}
 
-    def generation_default_overrides(self):
-        # Mirrors the real policy rather than returning {}, so a distilled stub
-        # still overrides the table the way the checkpoint would.
-        if not self.is_distilled:
-            return {}
-        return {
-            "num_inference_steps": len(self.fixed_sigmas),
-            "guidance_scale": DISTILLED_GUIDANCE_SCALE,
-        }
-
     def num_steps(self, default):
         return len(self.fixed_sigmas) if self.is_distilled else default
 
@@ -263,6 +254,7 @@ def _make_pipeline(sampling=None):
     # __new__ skips __init__, which is where the real pipeline resolves this
     # from the transformer config; the mode-defaults tables are keyed on it.
     pipeline.family = QWEN3_RECIPE.name
+    pipeline.resolver = bare_resolver(QWEN3_RECIPE.name)
     pipeline.scheduler = StubScheduler()
     pipeline.sampling = sampling or StubSamplingPolicy()
     pipeline.safety_checker = None
@@ -299,9 +291,27 @@ class TestTransferConfig:
         merged = resolve_transfer_config({"edge": True}, _merged_req(guidance_scale=7.0))
         assert merged.guidance_scale == 3.0
         assert cfg.control_guidance == 1.5
-        assert cfg.flow_shift == 10.0
+        # Only a caller's shift lands in the config; the row's default sits behind
+        # the checkpoint scheduler's shift and is applied by the pipeline.
+        assert cfg.flow_shift is None
+        assert resolve_transfer_config({"edge": True, "flow_shift": 4.0}, _req()).flow_shift == 4.0
         assert cfg.num_video_frames_per_chunk == 93
         assert cfg.share_vision_temporal_positions is True
+
+    @pytest.mark.parametrize("hints", [("edge", "blur"), ("seg", "wsm"), ("edge", "blur", "depth")])
+    def test_two_or_more_controls_use_the_mixed_row(self, hints):
+        """A mixed request does not combine the controls' rows and does not fall
+        back to the generic video values: it has its own row."""
+        mixed = COSMOS3_DEFAULTS["qwen3"]["transfer"]["mixed"]
+        extra = {key: {"control": b"clip"} for key in hints}
+        cfg = resolve_transfer_config(extra, _req())
+        assert cfg.guidance_scale == mixed["guidance_scale"]
+        assert cfg.control_guidance == mixed["control_guidance"]
+        assert transfer_module.transfer_defaults(cfg.hints) is mixed
+        explicit = resolve_transfer_config(
+            {**extra, "control_guidance": 2.5}, _req(guidance_scale=4.0)
+        )
+        assert (explicit.guidance_scale, explicit.control_guidance) == (4.0, 2.5)
 
     def test_control_directive_is_appended_by_default(self):
         """Reference parity: cosmos-framework names the active control modality
@@ -450,9 +460,9 @@ class TestSourceDerivedDefaults:
             _params
             if _params is not None
             else _merged_req(
-                num_frames=COSMOS3_720P_PARAMS["num_frames"],
-                frame_rate=COSMOS3_720P_PARAMS["frame_rate"],
-                max_sequence_length=COSMOS3_720P_PARAMS["max_sequence_length"],
+                num_frames=QWEN3_VIDEO_DEFAULTS["num_frames"],
+                frame_rate=QWEN3_VIDEO_DEFAULTS["frame_rate"],
+                max_sequence_length=QWEN3_VIDEO_DEFAULTS["max_sequence_length"],
                 seed=0,
             )
         )
@@ -507,17 +517,17 @@ class TestSourceDerivedDefaults:
         monkeypatch.setattr(pipeline_module, "video_stream_info", _stub_info(320, 192))
         req = self._infer_req(video=b"stand-in")
         req.params.width = 1280
-        assert self._size(req) == (1280, COSMOS3_720P_PARAMS["height"])
+        assert self._size(req) == (1280, QWEN3_VIDEO_DEFAULTS["height"])
 
     def test_no_reference_keeps_the_mode_defaults(self):
         req = self._infer_req()
-        assert self._size(req) == (COSMOS3_720P_PARAMS["width"], COSMOS3_720P_PARAMS["height"])
+        assert self._size(req) == (QWEN3_VIDEO_DEFAULTS["width"], QWEN3_VIDEO_DEFAULTS["height"])
 
     def test_unreadable_reference_falls_back_to_defaults(self):
         # A convenience probe must not fail the request; the real decode still
         # reports the problem properly.
         req = self._infer_req(video=b"not a video container")
-        assert self._size(req) == (COSMOS3_720P_PARAMS["width"], COSMOS3_720P_PARAMS["height"])
+        assert self._size(req) == (QWEN3_VIDEO_DEFAULTS["width"], QWEN3_VIDEO_DEFAULTS["height"])
 
     def test_transfer_fits_to_a_control_when_there_is_no_video(self, monkeypatch):
         # Transfer can run on precomputed controls alone.
@@ -545,11 +555,11 @@ class TestSourceDerivedDefaults:
     def test_default_stands_without_a_usable_source_rate(self, monkeypatch):
         monkeypatch.setattr(pipeline_module, "video_stream_info", _stub_info(192, 320, None))
         req = self._infer_req(video=b"stand-in")
-        assert self._captured(req)["frame_rate"] == COSMOS3_720P_PARAMS["frame_rate"]
+        assert self._captured(req)["frame_rate"] == QWEN3_VIDEO_DEFAULTS["frame_rate"]
 
     def test_default_stands_without_a_reference(self):
         assert (
-            self._captured(self._infer_req())["frame_rate"] == (COSMOS3_720P_PARAMS["frame_rate"])
+            self._captured(self._infer_req())["frame_rate"] == (QWEN3_VIDEO_DEFAULTS["frame_rate"])
         )
 
 
@@ -1092,7 +1102,7 @@ class TestTransferFrameRateResolution:
         pipeline._tokenize_prompt = lambda *a, **k: next(tokenized)
         pipeline._decode_latents_raw = lambda latents: torch.zeros(1, 3, 5, 16, 16)
 
-        params = _merged_req(frame_rate=COSMOS3_720P_PARAMS["frame_rate"], num_frames=5)
+        params = _merged_req(frame_rate=QWEN3_VIDEO_DEFAULTS["frame_rate"], num_frames=5)
         for key, value in caller.items():
             setattr(params, key, value)  # assignment marks it as caller intent
         cfg = resolve_transfer_config({**hints, "num_video_frames_per_chunk": 5}, params)
@@ -1142,9 +1152,9 @@ class TestTransferFrameRateResolution:
             monkeypatch,
             hints={"edge": {"control": b"clip"}},
             caller={"num_frames": 5},
-            infer_fps=COSMOS3_720P_PARAMS["frame_rate"],
+            infer_fps=QWEN3_VIDEO_DEFAULTS["frame_rate"],
         )
-        assert fps == COSMOS3_720P_PARAMS["frame_rate"]
+        assert fps == QWEN3_VIDEO_DEFAULTS["frame_rate"]
 
     def test_wsm_preset_outranks_the_source(self, monkeypatch):
         fps = self._emitted_fps(
@@ -1219,13 +1229,39 @@ class TestTransferSamplingAndSafety:
         baseline = pipeline.scheduler
         self._run(pipeline, monkeypatch)
         assert sampling.flow_shift_calls == [
-            transfer_module.TRANSFER_DEFAULTS["edge"]["flow_shift"]
+            COSMOS3_DEFAULTS["qwen3"]["transfer"]["edge"]["flow_shift"]
         ], "transfer did not program the hint's flow shift"
         # Installed, not merely built: a bare call that drops the returned
         # scheduler leaves the previous request's schedule in place.
         assert pipeline.scheduler is not baseline, (
             "transfer built a scheduler but never installed it"
         )
+
+    TWO_CONTROLS = {"blur": {"control": b"clip"}}
+
+    @pytest.mark.parametrize("extra", [None, TWO_CONTROLS], ids=["one-control", "two-controls"])
+    def test_flow_shift_is_request_then_override_then_checkpoint_then_default(
+        self, monkeypatch, extra
+    ):
+        """The same order for one control and for several: the caller's shift, else
+        the transfer override in place of a scheduler shift of 1.0, else the
+        checkpoint scheduler's, else the request's default row."""
+        row = "mixed" if extra else "edge"
+
+        def shift(*, checkpoint=None, request=None):
+            sampling = StubSamplingPolicy()
+            pipeline = _make_pipeline(sampling=sampling)
+            pipeline.resolver = bare_resolver(QWEN3_RECIPE.name, flow_shift=checkpoint)
+            cfg_extra = dict(extra or {})
+            if request is not None:
+                cfg_extra["flow_shift"] = request
+            self._run(pipeline, monkeypatch, cfg_extra=cfg_extra)
+            return sampling.flow_shift_calls
+
+        assert shift() == [COSMOS3_DEFAULTS["qwen3"]["transfer"][row]["flow_shift"]]
+        assert shift(checkpoint=1.0) == [10.0]
+        assert shift(checkpoint=7.0) == [7.0]
+        assert shift(checkpoint=1.0, request=4.0) == [4.0]
 
     def test_schedule_is_programmed_through_the_sampling_policy(self, monkeypatch):
         """A distilled checkpoint runs a fixed sigma list, not a step count."""
@@ -1318,5 +1354,5 @@ class TestFindClosestTargetSize:
         )
 
     def test_unknown_resolution_raises(self):
-        with pytest.raises(ValueError, match="Unknown Cosmos3 transfer resolution"):
+        with pytest.raises(ValueError, match="Unknown Cosmos3 resolution"):
             find_closest_target_size(720, 1280, 1080)
