@@ -20,6 +20,7 @@ from tensorrt_llm._torch.modules.mamba.replay_metadata import (
     REPLAY_WORK_ITEM_WIDTH,
     ReplaySlotIndices,
     build_replay_work_items,
+    snapshot_gdn_mtp_replay_work_items,
 )
 from tensorrt_llm._utils import prefer_pinned
 
@@ -211,6 +212,14 @@ class GDNMambaMetadata(Mamba2Metadata):
             return
         # FlashInfer ring replay folds in-kernel and never reads work items.
         if getattr(kv_cache_manager, "use_gdn_flashinfer_ring_replay", False):
+            return
+        if getattr(kv_cache_manager, "use_gdn_mtp_replay", False):
+            snapshot_gdn_mtp_replay_work_items(
+                self.state_indices[num_contexts:batch_size],
+                self.replay_state_indices[num_contexts:batch_size],
+                replay_metadata.prev_num_accepted_tokens,
+                self.replay_work_items,
+            )
             return
         use_gdn_all_layer_commit = getattr(
             kv_cache_manager, "use_gdn_cached_replay_all_layer_commit", False

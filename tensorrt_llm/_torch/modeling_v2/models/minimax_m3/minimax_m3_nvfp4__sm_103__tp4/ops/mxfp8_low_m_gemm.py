@@ -3,7 +3,7 @@
 """Fused MXFP8 activation quantization + low-M MXFP8 GEMM for decode (SM100+).
 
 ``out[M, N] = mxfp8(x)[M, K] @ mxfp8(W)[N, K]^T`` for ``1 <= M <= 8`` in one kernel
-(``torch.ops.trtllm.minimax_m3_mxfp8_low_m_gemm``, reached through the ``ops/gemm`` entry).
+(``family_ops().minimax_m3_mxfp8_low_m_gemm``, reached through the ``ops/gemm`` entry).
 
 * Each CTA owns ``16 * ROW_TILES`` weight rows and ``K / CLUSTER_K`` columns.
   Before ``griddepcontrol.wait`` it issues ``cp.async.bulk`` copies of its weight
@@ -30,7 +30,7 @@ from ..ops.gemm.mxfp8_low_m_gemm import mxfp8_low_m_gemm as _low_m_gemm_op
 
 # (N, K) -> (warps, cluster_k, max_m, row_tiles); measured on GB300 TP4 M3 shapes. The fused kernel beats native
 # quantize + GEMM only up to max_m rows; larger M, and every other shape, keeps the native path. These four
-# configurations are the ones built into ``torch.ops.trtllm.minimax_m3_mxfp8_low_m_gemm``.
+# configurations are the ones built into ``family_ops().minimax_m3_mxfp8_low_m_gemm``.
 _CONFIGS = {
     (2560, 6144): (4, 4, 8, 2),  # QKV (q, k, v, index q / k)
     (6144, 2048): (8, 2, 8, 4),  # o_proj

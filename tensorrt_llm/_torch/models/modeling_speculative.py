@@ -2294,7 +2294,14 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             spec_metadata: SpecMetadata) -> Tuple[torch.Tensor, bool]:
         """The target logits the worker verifies, and whether they are this rank's vocabulary
         columns, which the worker samples without the head's gather."""
-        rows = hidden_states[spec_metadata.gather_ids]
+        gather_ids = spec_metadata.gather_ids
+        if (spec_metadata.skip_verify_row_gather
+                and attn_metadata.num_contexts == 0
+                and gather_ids.shape[0] == hidden_states.shape[0]):
+            # A generation-only step gathers every row in order.
+            rows = hidden_states
+        else:
+            rows = hidden_states[gather_ids]
         worker = self.spec_worker
         vocab_sharded = worker.takes_vocab_sharded_target_logits(
             attn_metadata, spec_metadata)

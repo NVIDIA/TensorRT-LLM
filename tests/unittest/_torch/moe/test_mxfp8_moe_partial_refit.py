@@ -27,28 +27,43 @@ applies the swizzle exactly once in ``process_weights_after_loading``. These
 tests pin that contract by asserting bitwise equality against a single-shot
 load across every bucket order, including the case that regressed the BF16
 path (a w2-only bucket arriving after the w3/w1 bucket).
+
+``MXFP8CuteDslFusedMoEMethod`` (the CUTEDSL backend on Rubin/SM107) layers a
+second non-involutive transform on top -- the SwiGLU gate/up interleave of the
+FC1 weight and its scales for the fused FC12 kernel -- so the same matrix runs
+for both backends, plus a layout check that the CuTe DSL storage is exactly the
+interleave of the Cutlass storage (i.e. the interleave was applied once).
 """
 
-from typing import Dict, List
+from typing import Dict
 
 import pytest
 import torch
+from _torch.moe.moe_test_utils import finalize_moe_refit, refit_moe_in_buckets
 from transformers.configuration_utils import PretrainedConfig
 from utils.util import getSMVersion
 
+from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.moe.fused_moe import RenormalizeMoeRoutingMethod
 from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe
 from tensorrt_llm._torch.moe.fused_moe.interface import MoEWeightLoadingMode
-from tensorrt_llm._torch.moe.fused_moe.quantization import MXFP8CutlassFusedMoEMethod
+from tensorrt_llm._torch.moe.fused_moe.quantization import (
+    MXFP8CuteDslFusedMoEMethod,
+    MXFP8CutlassFusedMoEMethod,
+    interleave_linear_and_gate,
+)
+from tensorrt_llm._torch.utils import unswizzle_sf
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 NUM_EXPERTS = 4
 TOP_K = 2
 # create_weights asserts hidden_size and intermediate_size_per_partition are
-# multiples of BLOCK_SIZE * BLOCK_SCALES_VEC_SIZE (= 128) for the int32 SF packing.
-HIDDEN_SIZE = 256
+# multiples of BLOCK_SIZE * BLOCK_SCALES_VEC_SIZE (= 128) for the int32 SF packing;
+# the CuTe DSL fused FC12 method additionally needs hidden_size % 512 == 0.
+HIDDEN_SIZE = 512
 INTERMEDIATE_SIZE = 128
 BLOCK_SIZE = 32
 
@@ -60,7 +75,26 @@ requires_mxfp8_moe = pytest.mark.skipif(
 )
 
 
-def _make_module():
+BACKENDS = ["CUTLASS", "CUTEDSL"]
+
+
+def _skip_if_backend_unavailable(backend: str) -> None:
+    if backend == "CUTLASS" and get_sm_version() not in (100, 103, 107):
+        pytest.skip("CUTLASS MXFP8 MoE is limited to SM100/SM103/SM107 by can_implement")
+    if backend == "CUTEDSL" and not (
+        get_sm_version() == 107 and IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE
+    ):
+        pytest.skip(
+            "CUTEDSL MXFP8 MoE requires Rubin (SM107) with a CuTe DSL "
+            "build that supports the fused FC12 kernel"
+        )
+
+
+def _make_module(
+    backend: str = "CUTLASS",
+    weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.VANILLA,
+):
+    _skip_if_backend_unavailable(backend)
     pretrained_config = PretrainedConfig()
     pretrained_config.num_experts = NUM_EXPERTS
     pretrained_config.hidden_size = HIDDEN_SIZE
@@ -69,14 +103,14 @@ def _make_module():
     pretrained_config.torch_dtype = torch.bfloat16
     model_config = ModelConfig(
         pretrained_config=pretrained_config,
-        moe_backend="CUTLASS",
+        moe_backend=backend,
         quant_config=QuantConfig(quant_algo=QuantAlgo.MXFP8, group_size=BLOCK_SIZE),
     )
     module = create_moe(
         routing_method=RenormalizeMoeRoutingMethod(top_k=TOP_K),
         reduce_results=True,
         model_config=model_config,
-        weight_loading_mode=MoEWeightLoadingMode.VANILLA,
+        weight_loading_mode=weight_loading_mode,
     )
     module.cuda()
     return module
@@ -85,31 +119,6 @@ def _make_module():
 def _backend(module):
     # create_moe may return a ConfigurableMoE wrapper owning a backend module.
     return getattr(module, "backend", module)
-
-
-def _rlhf_finalize(module) -> None:
-    # Mirrors rlhf_utils.WorkerExtension.finalize_weight_update: the walk
-    # invokes BOTH process_weights_after_loading and post_load_weights on
-    # every eligible module.
-    for mod in module.modules():
-        if hasattr(mod, "process_weights_after_loading") and not getattr(
-            mod, "_weights_removed", False
-        ):
-            mod.process_weights_after_loading()
-        if hasattr(mod, "post_load_weights") and not getattr(mod, "_weights_removed", False):
-            mod.post_load_weights()
-
-
-def _refit(module, buckets: List[Dict[str, torch.Tensor]]) -> None:
-    # Mirrors rlhf_utils.WorkerExtension.update_weights: one pre_reload_weights
-    # walk, then one partial load per bucket, then a single finalize.
-    for mod in module.modules():
-        if hasattr(mod, "pre_reload_weights") and not getattr(mod, "_weights_removed", False):
-            mod.pre_reload_weights()
-    for bucket in buckets:
-        module.load_weights([dict(bucket)], allow_partial_loading=True)
-    _rlhf_finalize(module)
-    torch.cuda.synchronize()
 
 
 def _bits(t: torch.Tensor) -> torch.Tensor:
@@ -185,19 +194,46 @@ def _split(weights, leaves):
     return {k: v for k, v in weights.items() if k.split(".")[1] in leaves}
 
 
+def _fused(weights, leaves=("w1", "w3", "w2")):
+    """The same weights in the FUSED_GATE_UP_PROJ checkpoint format.
+
+    ``gate_up_proj`` is ``[E, H, 2I]`` with the gate (w1) first and
+    ``down_proj`` is ``[E, I, H]``; their scales drop H (resp. I) by the block.
+    """
+
+    def stack(*parts_of, suffix):
+        def expert(e):
+            parts = [weights[f"{e}.{name}.{suffix}"].view(torch.uint8) for name in parts_of]
+            return torch.cat(parts, dim=0).t()
+
+        return torch.stack([expert(e) for e in range(NUM_EXPERTS)]).contiguous()
+
+    fused = {}
+    if "w1" in leaves:
+        fused["gate_up_proj"] = stack("w1", "w3", suffix="weight").view(torch.float8_e4m3fn)
+        fused["gate_up_proj_weight_scale"] = stack("w1", "w3", suffix="weight_scale_inv")
+    if "w2" in leaves:
+        fused["down_proj"] = stack("w2", suffix="weight").view(torch.float8_e4m3fn)
+        fused["down_proj_weight_scale"] = stack("w2", suffix="weight_scale_inv")
+    return fused
+
+
 @requires_mxfp8_moe
-def test_mxfp8_moe_quant_method_is_selected():
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_mxfp8_moe_quant_method_is_selected(backend):
     """Guard the premise: this module must actually use the MXFP8 method."""
-    module = _make_module()
-    assert isinstance(_backend(module).quant_method, MXFP8CutlassFusedMoEMethod)
+    module = _make_module(backend)
+    expected = MXFP8CuteDslFusedMoEMethod if backend == "CUTEDSL" else MXFP8CutlassFusedMoEMethod
+    assert type(_backend(module).quant_method) is expected
 
 
 @requires_mxfp8_moe
+@pytest.mark.parametrize("backend", BACKENDS)
 @pytest.mark.parametrize(
     "bucket_order",
     ["w3w1_then_w2", "w2_then_w3w1", "single_bucket", "per_leaf"],
 )
-def test_mxfp8_bucketed_refit_matches_single_shot(bucket_order):
+def test_mxfp8_bucketed_refit_matches_single_shot(bucket_order, backend):
     """Every bucket order must land bitwise on the single-shot load result.
 
     ``w3w1_then_w2`` is the regression case: with an eagerly-applied swizzle the
@@ -207,7 +243,7 @@ def test_mxfp8_bucketed_refit_matches_single_shot(bucket_order):
     generator = torch.Generator(device="cuda").manual_seed(1234)
     weights = _mxfp8_expert_weights(generator)
 
-    expected = _fresh_load(_make_module(), weights)
+    expected = _fresh_load(_make_module(backend), weights)
 
     buckets = {
         "w3w1_then_w2": [_split(weights, {"w1", "w3"}), _split(weights, {"w2"})],
@@ -216,13 +252,14 @@ def test_mxfp8_bucketed_refit_matches_single_shot(bucket_order):
         "per_leaf": [_split(weights, {"w1"}), _split(weights, {"w3"}), _split(weights, {"w2"})],
     }[bucket_order]
 
-    module = _make_module()
-    _refit(module, buckets)
+    module = _make_module(backend)
+    refit_moe_in_buckets(module, buckets)
     _assert_matches(module, expected, bucket_order)
 
 
 @requires_mxfp8_moe
-def test_mxfp8_repeated_finalize_is_noop():
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_mxfp8_repeated_finalize_is_noop(backend):
     """The RLHF finalize walk calls process_weights_after_loading AND
     post_load_weights; draining the pending-slot sets must make the second
     application a no-op rather than a second swizzle."""
@@ -230,14 +267,14 @@ def test_mxfp8_repeated_finalize_is_noop():
     generator = torch.Generator(device="cuda").manual_seed(1234)
     weights = _mxfp8_expert_weights(generator)
 
-    expected = _fresh_load(_make_module(), weights)
+    expected = _fresh_load(_make_module(backend), weights)
 
-    module = _make_module()
-    _refit(module, [_split(weights, {"w1", "w3"}), _split(weights, {"w2"})])
+    module = _make_module(backend)
+    refit_moe_in_buckets(module, [_split(weights, {"w1", "w3"}), _split(weights, {"w2"})])
     _assert_matches(module, expected, "after first finalize")
 
     for _ in range(3):
-        _rlhf_finalize(module)
+        finalize_moe_refit(module)
         torch.cuda.synchronize()
     _assert_matches(module, expected, "after repeated finalize")
 
@@ -264,14 +301,15 @@ def test_mxfp8_pending_slots_drained_after_finalize():
     module.load_weights([_split(weights, {"w2"})], allow_partial_loading=True)
     assert backend._mxfp8_w2_sf_pending_slots
 
-    _rlhf_finalize(module)
+    finalize_moe_refit(module)
     torch.cuda.synchronize()
     assert not backend._mxfp8_w3_w1_sf_pending_slots
     assert not backend._mxfp8_w2_sf_pending_slots
 
 
 @requires_mxfp8_moe
-def test_mxfp8_two_sequential_refits_match_single_shot():
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_mxfp8_two_sequential_refits_match_single_shot(backend):
     """A second full update_weights cycle must land on the same bytes as a
     fresh load of the same tensors -- i.e. refits do not accumulate state."""
     torch.manual_seed(20260821)
@@ -280,28 +318,157 @@ def test_mxfp8_two_sequential_refits_match_single_shot():
     weights_a = _mxfp8_expert_weights(gen_a)
     weights_b = _mxfp8_expert_weights(gen_b)
 
-    expected_b = _fresh_load(_make_module(), weights_b)
+    expected_b = _fresh_load(_make_module(backend), weights_b)
 
-    module = _make_module()
-    _refit(module, [_split(weights_a, {"w1", "w3"}), _split(weights_a, {"w2"})])
-    _refit(module, [_split(weights_b, {"w1", "w3"}), _split(weights_b, {"w2"})])
+    module = _make_module(backend)
+    refit_moe_in_buckets(module, [_split(weights_a, {"w1", "w3"}), _split(weights_a, {"w2"})])
+    refit_moe_in_buckets(module, [_split(weights_b, {"w1", "w3"}), _split(weights_b, {"w2"})])
     _assert_matches(module, expected_b, "second refit")
 
 
 @requires_mxfp8_moe
+@pytest.mark.parametrize("backend", BACKENDS)
 @pytest.mark.parametrize("leaf", ["w1", "w3"])
-def test_mxfp8_single_projection_refit_after_finalize_matches_fresh_load(leaf):
+def test_mxfp8_single_projection_refit_after_finalize_matches_fresh_load(leaf, backend):
     """Refitting only w1 (or w3) of already-finalized slots must leave the
-    other projection's swizzled scales untouched and match a fresh full load."""
+    other projection's swizzled scales untouched and match a fresh full load.
+
+    On CUTEDSL the finalized FC1 slots are gate/up interleaved: the weight
+    half lands in its interleaved rows directly, while the scales are returned
+    to the plain layout before one half is written and interleaved again
+    after."""
     torch.manual_seed(20260821)
     weights_a = _mxfp8_expert_weights(torch.Generator(device="cuda").manual_seed(1))
     weights_b = _mxfp8_expert_weights(torch.Generator(device="cuda").manual_seed(2))
     merged = dict(weights_a)
     merged.update(_split(weights_b, {leaf}))
 
-    expected = _fresh_load(_make_module(), merged)
+    expected = _fresh_load(_make_module(backend), merged)
 
-    module = _make_module()
-    _refit(module, [weights_a])
-    _refit(module, [_split(weights_b, {leaf})])
+    module = _make_module(backend)
+    refit_moe_in_buckets(module, [weights_a])
+    refit_moe_in_buckets(module, [_split(weights_b, {leaf})])
     _assert_matches(module, expected, f"{leaf}-only refit after finalize")
+
+
+@requires_mxfp8_moe
+def test_mxfp8_cutedsl_whole_fc1_refit_skips_layout_round_trips(monkeypatch):
+    """When w1 and w3 arrive together they overwrite the whole slot, so the
+    scale interleave must ride on the raw bytes ahead of the single swizzle
+    rather than unswizzle and swizzle each slot again. The result still has to
+    match a fresh load."""
+    torch.manual_seed(20260821)
+    weights_a = _mxfp8_expert_weights(torch.Generator(device="cuda").manual_seed(1))
+    weights_b = _mxfp8_expert_weights(torch.Generator(device="cuda").manual_seed(2))
+    expected = _fresh_load(_make_module("CUTEDSL"), weights_b)
+
+    module = _make_module("CUTEDSL")
+    refit_moe_in_buckets(module, [weights_a])
+
+    quant_method = _backend(module).quant_method
+    assert isinstance(quant_method, MXFP8CuteDslFusedMoEMethod)
+    calls = []
+    # Bound on the instance, so the shadowing wrapper takes no self.
+    original = quant_method._permute_w3_w1_weight_scale_rows
+
+    def counted(*args, **kwargs):
+        calls.append(args)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(quant_method, "_permute_w3_w1_weight_scale_rows", counted)
+    refit_moe_in_buckets(module, [_split(weights_b, {"w1", "w3"}), _split(weights_b, {"w2"})])
+    assert not calls, f"whole-FC1 refit ran {len(calls)} scale layout round trips"
+    _assert_matches(module, expected, "whole-FC1 refit after finalize")
+
+
+@requires_mxfp8_moe
+def test_mxfp8_cutedsl_layout_is_single_interleave_of_cutlass_layout():
+    """The CuTe DSL storage must be exactly one gate/up interleave (granularity
+    64 along the expanded intermediate dim) of the Cutlass storage, for the
+    FC1 weight and its block scales alike; w2 is untouched. A double
+    interleave or a missing one would break the fused FC12 kernel silently."""
+    torch.manual_seed(20260907)
+    generator = torch.Generator(device="cuda").manual_seed(4321)
+    weights = _mxfp8_expert_weights(generator)
+
+    cutlass = _backend(_make_module("CUTLASS"))
+    cutedsl = _backend(_make_module("CUTEDSL"))
+    for module in (cutlass, cutedsl):
+        module.load_weights([dict(weights)])
+        module.post_load_weights()
+    torch.cuda.synchronize()
+
+    rows = cutedsl.expand_intermediate_size_per_partition
+    k = HIDDEN_SIZE
+    group = MXFP8CuteDslFusedMoEMethod.INTERLEAVE_GROUP_SIZE
+    for slot in range(cutedsl.w3_w1_weight.shape[0]):
+        ref_w = interleave_linear_and_gate(
+            cutlass.w3_w1_weight.data[slot].view(torch.uint8), group_size=group, dim=0
+        )
+        assert torch.equal(cutedsl.w3_w1_weight.data[slot].view(torch.uint8), ref_w), (
+            f"slot {slot}: CuTe DSL FC1 weight is not the interleave of the Cutlass layout"
+        )
+
+        ref_sf = interleave_linear_and_gate(
+            unswizzle_sf(
+                cutlass.w3_w1_weight_scale.data[slot].view(torch.uint8), rows, k, BLOCK_SIZE
+            ).view(rows, k // BLOCK_SIZE),
+            group_size=group,
+            dim=0,
+        )
+        got_sf = unswizzle_sf(
+            cutedsl.w3_w1_weight_scale.data[slot].view(torch.uint8), rows, k, BLOCK_SIZE
+        ).view(rows, k // BLOCK_SIZE)
+        assert torch.equal(got_sf, ref_sf), (
+            f"slot {slot}: CuTe DSL FC1 block scales are not the interleave of the Cutlass layout"
+        )
+
+    assert torch.equal(_bits(cutedsl.w2_weight.data), _bits(cutlass.w2_weight.data))
+    assert torch.equal(_bits(cutedsl.w2_weight_scale.data), _bits(cutlass.w2_weight_scale.data))
+
+
+@requires_mxfp8_moe
+def test_mxfp8_cutedsl_fc1_weight_is_in_kernel_layout_at_load():
+    """White-box: the CuTe DSL FC1 weight is written straight into the gate/up
+    interleaved rows while loading, so it already equals the interleave of the
+    Cutlass layout before any finalize, and neither a w2-only bucket nor the
+    finalize walk touches it again."""
+    torch.manual_seed(20260907)
+    weights = _mxfp8_expert_weights(torch.Generator(device="cuda").manual_seed(4321))
+
+    cutlass = _backend(_make_module("CUTLASS"))
+    cutlass.load_weights([dict(weights)])
+    group = MXFP8CuteDslFusedMoEMethod.INTERLEAVE_GROUP_SIZE
+    expected = interleave_linear_and_gate(_bits(cutlass.w3_w1_weight.data), group_size=group, dim=1)
+
+    module = _make_module("CUTEDSL")
+    backend = _backend(module)
+    module.load_weights([_split(weights, {"w1", "w3"})], allow_partial_loading=True)
+    torch.cuda.synchronize()
+    assert torch.equal(_bits(backend.w3_w1_weight.data), expected), (
+        "FC1 weight is not in the kernel layout right after loading"
+    )
+    module.load_weights([_split(weights, {"w2"})], allow_partial_loading=True)
+    finalize_moe_refit(module)
+    torch.cuda.synchronize()
+    assert torch.equal(_bits(backend.w3_w1_weight.data), expected), (
+        "a w2-only bucket or the finalize walk rewrote the FC1 weight"
+    )
+    assert not backend._mxfp8_w3_w1_sf_pending_slots
+
+
+@requires_mxfp8_moe
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_mxfp8_fused_gate_up_proj_refit_matches_vanilla_load(backend):
+    """FUSED_GATE_UP_PROJ hands the loader transposed views of the stacked
+    checkpoint tensors; a full load and a bucketed refit from that format must
+    match a VANILLA load of the same weights bit for bit."""
+    torch.manual_seed(20260821)
+    weights_a = _mxfp8_expert_weights(torch.Generator(device="cuda").manual_seed(1))
+    weights_b = _mxfp8_expert_weights(torch.Generator(device="cuda").manual_seed(2))
+    expected_b = _fresh_load(_make_module(backend), weights_b)
+
+    module = _make_module(backend, MoEWeightLoadingMode.FUSED_GATE_UP_PROJ)
+    refit_moe_in_buckets(module, [_fused(weights_a)])
+    refit_moe_in_buckets(module, [_fused(weights_b, {"w1", "w3"}), _fused(weights_b, {"w2"})])
+    _assert_matches(module, expected_b, "FUSED_GATE_UP_PROJ refit")

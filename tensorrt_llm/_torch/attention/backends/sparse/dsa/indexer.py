@@ -2012,12 +2012,17 @@ class Indexer(nn.Module):
         weights: torch.Tensor,
         q_scale: Optional[torch.Tensor] = None,
         is_generation: Optional[bool] = None,
+        decode_topk_start_event: Optional[torch.cuda.Event] = None,
     ) -> torch.Tensor:
         """Run the indexer TopK kernel for one phase or the full batch.
 
         When ``is_generation`` is ``None``, the inputs contain the full mixed
         batch. Otherwise they contain only the selected context or generation
         phase. ``q_scale`` is only consumed by the FP4 dispatch.
+
+        ``decode_topk_start_event`` is waited on the current stream immediately
+        before decode Top-K, after logits computation. It does not delay prefill
+        Top-K, and its producer must enqueue the record before this call.
 
         """
         # DSACacheManager / DeepseekV4CacheManager force quant_block_size to
@@ -2483,6 +2488,8 @@ class Indexer(nn.Module):
             )
             assert metadata.radix_aux_indices is not None
             assert metadata.radix_aux_logits is not None
+            if decode_topk_start_event is not None:
+                decode_topk_start_event.wait()
             self.top_k(
                 logits_decode,
                 topk_indices_buffer[token_offset : token_offset + num_gen_tokens, :],

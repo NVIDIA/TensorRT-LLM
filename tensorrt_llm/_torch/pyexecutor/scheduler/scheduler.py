@@ -126,11 +126,11 @@ class SchedulerOutput(
 
 def is_decoder_context_request_waiting_for_encoder_output(req: LlmRequest) -> bool:
     """Return whether decoder-context scheduling is blocked on encoder output."""
-    if not req.is_context_init_state:
-        return False
-
+    # The attribute is unset outside encoder-decoder models; read it before the state binding.
     ready_event = getattr(req, "py_encoder_output_ready_event", None)
-    return ready_event is not None and not ready_event.query()
+    if ready_event is None or not req.is_context_init_state:
+        return False
+    return not ready_event.query()
 
 
 def drop_decoder_context_requests_waiting_for_encoder_output(
@@ -444,6 +444,19 @@ class RequestScheduler(ABC):
         Args:
             probe: Whether cancelled receives still retain local resources.
         """
+
+    def set_async_transfer_manager(self, mgr) -> None:
+        """Register the executor's AsyncTransferManager, which owns the KV
+        pages of finished disaggregated sends until they land.
+
+        Only schedulers with transfer-aware deadlock detection use it; the
+        default is a no-op.
+        """
+
+    @property
+    def ctx_demote_uncached_tokens(self) -> int:
+        """Long-prefill demotion threshold in uncached tokens; 0 (the default) when off."""
+        return 0
 
     def take_decision_counters(self) -> tuple[int, int, int, int]:
         """Return and reset the holds since the last call: gen-init cap, gen-init transfer budget,
@@ -814,6 +827,13 @@ class MultimodalScheduler(RequestScheduler):
             probe: Whether cancelled receives still retain local resources.
         """
         self.scheduler.set_retiring_gen_receives_probe(probe)
+
+    def set_async_transfer_manager(self, mgr) -> None:
+        self.scheduler.set_async_transfer_manager(mgr)
+
+    @property
+    def ctx_demote_uncached_tokens(self) -> int:
+        return self.scheduler.ctx_demote_uncached_tokens
 
     def take_decision_counters(self) -> tuple[int, int, int, int]:
         return self.scheduler.take_decision_counters()

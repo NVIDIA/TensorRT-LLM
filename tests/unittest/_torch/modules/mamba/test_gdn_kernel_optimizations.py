@@ -754,6 +754,163 @@ def test_gdn_replay_verify_dispatches_by_history_layout(monkeypatch, ring_mode):
         assert kwargs["old_u"] == "old_x"
 
 
+def test_gdn_mtp_replay_verify_addresses_history_by_replay_slot(monkeypatch):
+    """GDN MTP replay reads the checkpoint and Conv state at the state slots, the
+    history at the replay slots, and hands the kernel per-request [T, C] raw rows."""
+    from tensorrt_llm._torch.modules.fla.cache_manager import ReplayStateUpdateMetadata
+    from tensorrt_llm._torch.modules.mamba import gdn_mixer
+
+    num_decodes, tokens, heads, channels = 3, 4, 2, 24
+    layer = gdn_mixer.Qwen3NextGatedDeltaNet.__new__(gdn_mixer.Qwen3NextGatedDeltaNet)
+    torch.nn.Module.__init__(layer)
+    layer.A_log = torch.zeros(heads)
+    layer.dt_bias = torch.zeros(heads)
+    layer.conv1d = SimpleNamespace(weight="conv_weight", bias=None)
+    layer.activation = "silu"
+    layer.conv_dim_per_tp = channels
+    layer.num_v_heads_per_tp = heads
+    layer.head_v_dim = 8
+    calls = {}
+    monkeypatch.setattr(gdn_mixer, "gdn_mtp_replay", lambda **kwargs: calls.update(kwargs))
+    history_len = torch.tensor([0, 3, 9, 13, 5, 7], dtype=torch.int32)
+    candidates = torch.zeros(8, tokens, channels)
+    layer_cache = SimpleNamespace(
+        prev_num_accepted_tokens=history_len,
+        old_x="history_u",
+        old_B="history_k",
+        old_dt="history_G",
+        intermediate_conv_window=candidates,
+    )
+    # Row-strided pre-conv q|k|v rows of the fused in_proj output.
+    projection = torch.arange(num_decodes * tokens * 40, dtype=torch.float32).view(-1, 40)
+    raw_x = projection[:, :channels]
+    is_dummy = torch.tensor([False, True, False])
+
+    output = layer._replay_verify(
+        raw_x=raw_x,
+        b="beta",
+        a="decay",
+        conv_states="conv",
+        ssm_states="pool",
+        state_indices=torch.tensor([3, 1, 5, 0], dtype=torch.int32),
+        replay_indices=torch.tensor([4, 2, 0, 1], dtype=torch.int32),
+        num_decodes=num_decodes,
+        draft_token_num=tokens,
+        replay_metadata=ReplayStateUpdateMetadata(history_len, None, tokens, 16),
+        layer_cache=layer_cache,
+        is_dummy=is_dummy,
+    )
+
+    assert calls["state_indices"].tolist() == [3, 1, 5]
+    assert calls["replay_indices"].tolist() == [4, 2, 0]
+    assert calls["history_u"] == "history_u" and calls["history_len"] is history_len
+    assert calls["is_dummy"] is is_dummy
+    assert (calls["b"], calls["a"]) == ("beta", "decay")
+    assert calls["candidate_x"].data_ptr() == candidates.data_ptr()
+    assert calls["candidate_x"].shape == (num_decodes, tokens, channels)
+    assert torch.equal(calls["raw_x"], raw_x.reshape(num_decodes, tokens, channels))
+    assert calls["raw_x"].stride() == (tokens * 40, 40, 1)
+    assert output.shape == (num_decodes, tokens, heads, 8)
+    with pytest.raises(AssertionError, match="dynamic draft length"):
+        layer._replay_verify(
+            raw_x=raw_x,
+            b="beta",
+            a="decay",
+            conv_states="conv",
+            ssm_states="pool",
+            state_indices=torch.tensor([3, 1, 5], dtype=torch.int32),
+            replay_indices=torch.tensor([4, 2, 0], dtype=torch.int32),
+            num_decodes=num_decodes,
+            draft_token_num=tokens - 1,
+            replay_metadata=ReplayStateUpdateMetadata(history_len, None, tokens, 16),
+            layer_cache=layer_cache,
+            is_dummy=is_dummy,
+        )
+
+
+def test_gdn_mtp_replay_in_mixed_step_takes_the_raw_decode_rows(monkeypatch):
+    """A mixed prefill + verify step hands GDN MTP replay the raw (pre-conv)
+    decode rows and their b / a gate rows, without the standalone conv1d update or the
+    q/k/v pack, and concatenates its output after the prefill rows."""
+    from tensorrt_llm._torch.modules.mamba import gdn_mixer
+
+    num_prefill_tokens, num_decodes, tokens, heads, head_dim, channels = 5, 2, 4, 2, 8, 24
+    layer = gdn_mixer.Qwen3NextGatedDeltaNet.__new__(gdn_mixer.Qwen3NextGatedDeltaNet)
+    torch.nn.Module.__init__(layer)
+    layer.A_log = torch.zeros(heads)
+    layer.dt_bias = torch.zeros(heads)
+    layer.num_v_heads, layer.attn_tp_size, layer.head_v_dim = heads, 1, head_dim
+    layer.num_v_heads_per_tp, layer.num_k_heads_per_tp, layer.head_k_dim = heads, 1, head_dim
+    layer._prefill_conv = lambda *args: "prefill_conv_out"
+    monkeypatch.setattr(gdn_mixer, "fused_gdn_post_conv", lambda *args, **kwargs: ("p",) * 5)
+    monkeypatch.setattr(
+        gdn_mixer,
+        "chunk_gated_delta_rule",
+        lambda **kwargs: (torch.ones(1, num_prefill_tokens, heads, head_dim), None),
+    )
+    for name in ("causal_conv1d_update_triton", "pack_gdn_decode_qkv"):
+        monkeypatch.setattr(
+            gdn_mixer, name, lambda *a, _name=name, **k: pytest.fail(f"{_name} called")
+        )
+    captured = {}
+
+    def fake_replay_verify(**kwargs):
+        captured.update(kwargs)
+        return torch.full((num_decodes, tokens, heads, head_dim), 2.0)
+
+    layer._replay_verify = fake_replay_verify
+    rows = num_prefill_tokens + num_decodes * tokens
+    mixed_qkv = torch.randn(rows, channels)
+    ba = torch.randn(rows, 2 * heads)
+    b = ba[:, :heads]
+    state_indices = torch.tensor([6, 2, 4], dtype=torch.int32)
+    replay_indices_d = torch.tensor([9, 1], dtype=torch.int32)
+    is_dummy = torch.tensor([False, True])
+
+    out = layer.forward_extend(
+        "conv_states",
+        "ssm_states",
+        spec_metadata=SimpleNamespace(runtime_draft_len=tokens - 1),
+        intermediate_conv_states="candidates",
+        is_target_verify=True,
+        mixed_qkv=mixed_qkv,
+        a=ba[:, heads:],
+        b=b,
+        batch_size=1 + num_decodes,
+        has_initial_states_bs=torch.ones(3, dtype=torch.bool),
+        has_initial_states_p=torch.ones(1, dtype=torch.bool),
+        cache_indices=state_indices,
+        query_start_loc=torch.tensor([0, num_prefill_tokens]),
+        query_start_loc_p=torch.tensor([0, num_prefill_tokens]),
+        query_start_loc_long=torch.tensor([0, num_prefill_tokens]),
+        num_prefill_tokens=num_prefill_tokens,
+        num_decode_tokens=num_decodes * tokens,
+        state_indices_p=state_indices[:1],
+        state_indices_d=state_indices[1:],
+        num_prefill=1,
+        num_decodes=num_decodes,
+        g_linear=False,
+        use_replay=True,
+        use_mtp_replay=True,
+        replay_state_indices_d=replay_indices_d,
+        replay_is_dummy=is_dummy,
+        replay_metadata="metadata",
+        layer_cache="layer_cache",
+    )
+
+    assert torch.equal(captured["raw_x"], mixed_qkv[num_prefill_tokens:])
+    assert torch.equal(captured["b"], b[num_prefill_tokens:])
+    assert torch.equal(captured["a"], ba[num_prefill_tokens:, heads:])
+    assert captured["state_indices"].tolist() == [2, 4]
+    assert captured["replay_indices"] is replay_indices_d
+    assert captured["is_dummy"] is is_dummy
+    assert captured["conv_states"] == "conv_states" and captured["ssm_states"] == "ssm_states"
+    assert (captured["num_decodes"], captured["draft_token_num"]) == (num_decodes, tokens)
+    assert out.shape == (1, rows, heads, head_dim)
+    assert torch.all(out[:, :num_prefill_tokens] == 1.0)
+    assert torch.all(out[:, num_prefill_tokens:] == 2.0)
+
+
 def test_verify_intermediate_state_indices_reuses_buffers():
     """The verify path's row-index vector is built once, not per GDN layer.
 
