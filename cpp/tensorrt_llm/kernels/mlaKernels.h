@@ -182,6 +182,33 @@ void invokeMLARopeContext(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, c
 template <typename T>
 void invokeMLAContextFp8Quantize(MlaParams<T>& params, int total_kv_len, cudaStream_t stream);
 
+// Windowed context MLA over a packed-QKV buffer. The trtllm-gen windowed context kernels exist
+// only for the packed-QKV layout, which carries Q, K and V of the same row, while a context call's
+// keys outnumber its queries. A windowed call therefore keeps, per sequence, the newest
+// min(kvLen, window + qLen - 1) keys and places that sequence's queries in the last qLen rows of
+// the block, so the kernel's own causal position matches the true window.
+
+// One call is packed in groups of sequences, so that a large prefill does not need a packed block
+// proportional to its whole batch. A group is the sequence range [seqStart, seqEnd) of the call.
+
+// The truncated block layout of one group: packedCumKv[s - seqStart] is the first row of sequence
+// s's block (seqEnd - seqStart + 1 entries) and packedKvLens[s - seqStart] its block length, which
+// is also its query length.
+void invokeMlaWindowedPackedSeqLens(int32_t const* cuQSeqLens, int32_t const* cuKvSeqLens, int32_t seqStart,
+    int32_t seqEnd, int32_t windowSize, int32_t* packedCumKv, int32_t* packedKvLens, cudaStream_t stream);
+
+// Copy each sequence's truncated keys, values and queries into its packed block. Sources are the
+// call's own Q/K/V buffers, addressed by byte strides so one kernel serves bf16 and fp8 operands.
+void invokeMlaWindowedPackedQkvPack(void const* qSrc, void const* kSrc, void const* vSrc, int64_t qSrcRowBytes,
+    int64_t kSrcRowBytes, int64_t vSrcRowBytes, int32_t qSegBytes, int32_t kSegBytes, int32_t vSegBytes, void* packed,
+    int64_t packedRowBytes, int32_t const* packedCumKv, int32_t const* cuQSeqLens, int32_t const* cuKvSeqLens,
+    int32_t seqStart, int32_t seqEnd, int32_t maxRows, cudaStream_t stream);
+
+// Copy each sequence's query rows from their packed positions back to the compact output rows.
+void invokeMlaWindowedPackedOutputCompact(void const* packedO, void* out, int64_t outRowBytes,
+    int32_t const* packedCumKv, int32_t const* cuQSeqLens, int32_t seqStart, int32_t seqEnd, int32_t maxQSeqLen,
+    cudaStream_t stream);
+
 template <typename T, typename KVCacheBuffer>
 void invokeMLARopeGeneration(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, cudaStream_t stream);
 

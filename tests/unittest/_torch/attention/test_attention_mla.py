@@ -384,6 +384,27 @@ scenarios = [
              kv_cache_tokens_per_block=tokens_per_block)
     for kv_cache_dtype in kv_cache_dtype_list for num_layers in [1, 2]
 ]
+# A V width that differs from qk_nope_head_dim, as the Hy4-Flash MLA layers have
+# (context head 192 + 64, V 256). Context FMHA takes its BMM2-N width from
+# v_head_dim, so a layer whose V is not qk_nope_head_dim must still build a
+# supported dispatcher. Both layer counts are kept: num_layers == 1 passes a
+# compact V and num_layers > 1 the joint-projection V view with stride
+# num_kv_heads * (qk_nope_head_dim + v_head_dim).
+scenarios += [
+    Scenario(kv_cache_dtype=torch.bfloat16,
+             num_layers=num_layers,
+             num_heads=64,
+             num_kv_heads=64,
+             q_lora_rank=1024,
+             kv_lora_rank=512,
+             qk_nope_head_dim=192,
+             qk_rope_head_dim=64,
+             v_head_dim=256,
+             hidden_size=3072,
+             max_position_embeddings=5120,
+             kv_cache_tokens_per_block=tokens_per_block)
+    for num_layers in [1, 2]
+]
 
 accuracy_dict = {
     torch.bfloat16: (3e-2, 3e-3),

@@ -39,6 +39,11 @@ from tensorrt_llm._torch.configs.glm5_next import (
     Glm5NextTextConfig,
     Glm5NextVisionConfig,
 )
+from tensorrt_llm._torch.configs.hyv4_flash import (
+    HYV4FlashConfig,
+    HYV4FlashTextConfig,
+    HYV4FlashVisionConfig,
+)
 from tensorrt_llm._torch.configs.k3_dspark import K3DsparkConfig
 from tensorrt_llm._torch.configs.kimi_k3 import KimiK3Config, KimiK3VisionConfig
 from tensorrt_llm._torch.configs.kimi_linear import KimiLinearConfig
@@ -94,6 +99,12 @@ def _register_custom_configs_with_transformers() -> None:
         "glm5_next": Glm5NextConfig,
         "glm5_next_text": Glm5NextTextConfig,
         "glm5_next_vision": Glm5NextVisionConfig,
+        # HY4-Flash composite config ("hy_v4_flash") and its two sub-configs. The
+        # checkpoint labels its nested vision tower with the composite's own
+        # model_type, so the tower gets a distinct name of its own.
+        "hy_v4_flash": HYV4FlashConfig,
+        "hy_v4_flash_text": HYV4FlashTextConfig,
+        "hy_v4_flash_vision": HYV4FlashVisionConfig,
         "gemma4_assistant": Gemma4AssistantConfig,
         # Kimi K3 composite multimodal config ("kimi_k3") and its text config
         # ("kimi_linear"). pyexecutor.config_utils.load_pretrained_config keeps
@@ -156,6 +167,9 @@ __all__ = [
     "Glm5NextConfig",
     "Glm5NextTextConfig",
     "Glm5NextVisionConfig",
+    "HYV4FlashConfig",
+    "HYV4FlashTextConfig",
+    "HYV4FlashVisionConfig",
     "Gemma4AssistantConfig",
     "Gemma4UnifiedAudioConfig",
     "Gemma4UnifiedConfig",

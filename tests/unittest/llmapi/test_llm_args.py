@@ -1175,6 +1175,112 @@ def test_dflash_spec_dec_variant_unknown_until_checkpoint_read():
     assert spec_cfg.spec_dec_variant is None
 
 
+# The keys HY4-Flash states its embedded DFly2 draft geometry with. The
+# checkpoint carries them beside its text_config/vision_config sub-configs:
+# five draft layers over the target's sparse layers 25, 29, 33, 37 and 41,
+# each reusing that layer's MLA KV and index picks.
+_HYV4_DFLY_CONFIG = {
+    "architectures": ["HYV4FlashForConditionalGeneration"],
+    "model_type": "hy_v4_flash",
+    "dfly_num_hidden_layers": 5,
+    "dfly_mask_token_id": 120009,
+    "dfly_target_kv_layers": [25, 29, 33, 37, 41],
+    "dfly_target_index_layer": [25, 29, 33, 37, 41],
+}
+
+
+@pytest.mark.cpu_only
+def test_dflash_embedded_drafter_resolves_to_the_target_checkpoint(
+        tmp_path: Path) -> None:
+    # An unset speculative_model means "the draft lives in the target
+    # checkpoint": the second, draft read is that checkpoint, narrowed to its
+    # ``model.dfly_layers.*`` namespace by the drafter's checkpoint_key_prefixes
+    # (checked at load time, not here).
+    checkpoint = tmp_path / "hy4-flash"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text(json.dumps(_HYV4_DFLY_CONFIG) +
+                                            "\n",
+                                            encoding="utf-8")
+
+    args = TorchLlmArgs(
+        model=str(checkpoint),
+        skip_tokenizer_init=True,
+        speculative_config=DFlashDecodingConfig(max_draft_len=5,
+                                                mask_token_id=120009),
+    )
+
+    spec = args.speculative_config
+    assert spec.speculative_model == str(checkpoint)
+    # The DFly2 geometry has no other source at this point: it comes from the
+    # same checkpoint's own keys.
+    assert spec.target_layer_ids == [25, 29, 33, 37, 41]
+    assert spec.mask_token_id == 120009
+    assert spec.spec_dec_variant == 2
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("scope", ["top_level", "text_config"])
+def test_dflash_embedded_drafter_reads_the_dfly_keys(tmp_path: Path,
+                                                     scope: str) -> None:
+    # Fields the user left unset resolve from the embedded draft's keys, in the
+    # language scope when the checkpoint wraps its text settings in one.
+    dfly = dict(_HYV4_DFLY_CONFIG)
+    config = {"architectures": ["HYV4FlashForConditionalGeneration"]}
+    if scope == "text_config":
+        config["text_config"] = dfly
+    else:
+        config.update(dfly)
+    checkpoint = tmp_path / "hy4-flash"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text(json.dumps(config),
+                                            encoding="utf-8")
+
+    args = TorchLlmArgs(
+        model=str(checkpoint),
+        skip_tokenizer_init=True,
+        speculative_config=DFlashDecodingConfig(max_draft_len=5),
+    )
+
+    spec = args.speculative_config
+    assert spec.speculative_model == str(checkpoint)
+    assert spec.target_layer_ids == [25, 29, 33, 37, 41]
+    assert spec.mask_token_id == 120009
+    assert spec.spec_dec_variant == 2
+
+
+@pytest.mark.cpu_only
+def test_dflash_user_set_drafter_is_left_alone(tmp_path: Path) -> None:
+    # A user-set standalone drafter keeps its own path and its own geometry:
+    # the target checkpoint's embedded-draft keys must not leak into it.
+    target = tmp_path / "hy4-flash"
+    target.mkdir()
+    (target / "config.json").write_text(json.dumps(_HYV4_DFLY_CONFIG),
+                                        encoding="utf-8")
+    drafter = tmp_path / "dflash-drafter"
+    drafter.mkdir()
+    (drafter / "config.json").write_text(json.dumps({
+        "architectures": ["DFlashDraftModel"],
+        "dflash_config": {
+            "target_layer_ids": [1, 2, 3],
+            "mask_token_id": 7,
+        },
+    }),
+                                         encoding="utf-8")
+
+    args = TorchLlmArgs(
+        model=str(target),
+        skip_tokenizer_init=True,
+        speculative_config=DFlashDecodingConfig(max_draft_len=3,
+                                                speculative_model=str(drafter)),
+    )
+
+    spec = args.speculative_config
+    assert spec.speculative_model == str(drafter)
+    assert spec.target_layer_ids == [1, 2, 3]
+    assert spec.mask_token_id == 7
+    assert spec.spec_dec_variant == 1
+
+
 @pytest.mark.cpu_only
 def test_dspark_target_layer_ids_resolved_from_checkpoint(tmp_path):
     # When the user leaves target_layer_ids unset, the checkpoint's ordered

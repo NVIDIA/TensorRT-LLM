@@ -690,3 +690,15 @@ zai-org/GLM-5.3-Flash:
     kv_cache_quant_algo: FP8
     spec_dec_algo: MTP
     accuracy: 92.87
+
+tencent/Hy4-flash-FP8:
+  # Full GSM8K, chat template with few-shot turns, no_think, greedy (temperature 0).
+  # 89.69 is core's tep4 flexible-extract score under that recipe, on GB300.
+  # About 95% of answers carry the right final number, and lm-eval's flexible-extract
+  # reads the 10.6% of them that end in `$$ \boxed{N} $$` as '$$'.
+  - quant_algo: FP8_BLOCK_SCALES
+    accuracy: 89.69
+  # DFly2 preserves the target distribution and uses the same reference.
+  - quant_algo: FP8_BLOCK_SCALES
+    spec_dec_algo: DFlash
+    accuracy: 89.69

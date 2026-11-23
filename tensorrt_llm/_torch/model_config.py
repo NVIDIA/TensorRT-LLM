@@ -34,9 +34,10 @@ from tensorrt_llm._errors import ModelLoadError
 from tensorrt_llm._torch.locality_domain.policy import LocalityDomainPolicy
 from tensorrt_llm._torch.pyexecutor.config_utils import (
     get_glm5_next_layer_masks, get_glm5_next_num_attention_layers,
-    get_kimi_linear_num_attention_layers, get_qwen3_hybrid_num_attention_layers,
-    is_glm5_next, is_kimi_linear, is_nemotron_hybrid, is_qwen3_hybrid,
-    is_qwen4_exp, load_pretrained_config)
+    get_hyv4_flash_num_attention_layers, get_kimi_linear_num_attention_layers,
+    get_qwen3_hybrid_num_attention_layers, is_glm5_next, is_hyv4_flash,
+    is_kimi_linear, is_nemotron_hybrid, is_qwen3_hybrid, is_qwen4_exp,
+    load_pretrained_config, unwrap_hyv4_flash_text_config)
 from tensorrt_llm._utils import (get_sm_version, is_sm_100f, is_sm_120f,
                                  torch_dtype_to_binding)
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
@@ -47,6 +48,7 @@ from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig  # noqa: F401
 from tensorrt_llm.llmapi.llm_args import (CSA2SparseAttentionConfig,
                                           DeepSeekSparseAttentionConfig,
                                           DeepSeekV4SparseAttentionConfig,
+                                          DFlashDecodingConfig,
                                           EncoderAttentionBackend,
                                           KvCacheConfig,
                                           MoeLoadBalancerConfigType,
@@ -97,6 +99,59 @@ def _get_kv_cache_layer_specs(
     if not isinstance(layer_specs, Sequence):
         return None
     return layer_specs
+
+
+def _hyv4_flash_sparse_attention_config(
+    pretrained_config: transformers.PretrainedConfig
+) -> DeepSeekSparseAttentionConfig:
+    """HY4-Flash's sparse layers: DeepSeek-V3.2-style DSA over gated MLA.
+
+    The checkpoint's own indexer geometry (top-k, heads, head width) is the
+    engine's DSA geometry, so the stock DSA config covers it. Its indexer keys
+    rotate with the interleaved 3-D M-RoPE the sparse layers use, and the
+    checkpoint marks every indexed layer a full per-layer indexer.
+    """
+    text = unwrap_hyv4_flash_text_config(pretrained_config)
+    return DeepSeekSparseAttentionConfig(
+        index_n_heads=text.index_n_heads,
+        index_head_dim=text.index_head_dim,
+        index_topk=text.index_topk,
+        indexer_rope_interleave=True,
+    )
+
+
+def _resolve_hyv4_flash_dfly2(
+        spec_config: Optional["SpeculativeConfig"],
+        pretrained_config: transformers.PretrainedConfig) -> None:
+    """Fill the checkpoint-native DFly2 geometry on a DFlash speculative config.
+
+    HY4-Flash drafts from five layers inside its own checkpoint, so there is no
+    draft checkpoint for ``DFlashDecodingConfig.resolve_from_checkpoint`` to
+    read: the target layers, the mask token and the algorithm version come from
+    this checkpoint's ``dfly_*`` keys. A user-set field wins.
+    """
+    if not isinstance(spec_config, DFlashDecodingConfig):
+        return
+    kv_layers = getattr(pretrained_config, "dfly_target_kv_layers", None)
+    index_layers = getattr(pretrained_config, "dfly_target_index_layer", None)
+    if (kv_layers is not None and index_layers is not None
+            and list(kv_layers) != list(index_layers)):
+        raise ValueError(
+            "HY4-Flash's DFly2 draft layers reuse their target layer's MLA KV "
+            f"and index picks, but dfly_target_kv_layers={kv_layers} and "
+            f"dfly_target_index_layer={index_layers} differ")
+    target_layer_ids = kv_layers if kv_layers is not None else index_layers
+    if spec_config.target_layer_ids is None:
+        if not target_layer_ids:
+            raise ValueError(
+                "HY4-Flash's DFly2 drafting needs the checkpoint's "
+                "dfly_target_kv_layers to capture its target hidden states")
+        spec_config.target_layer_ids = list(target_layer_ids)
+    if spec_config.mask_token_id is None:
+        spec_config.mask_token_id = getattr(pretrained_config,
+                                            "dfly_mask_token_id", None)
+    if spec_config.spec_dec_variant is None:
+        spec_config.spec_dec_variant = 2
 
 
 _DEEPSEEK_V4_ARCHITECTURES = {"DeepseekV4ForCausalLM"}
@@ -615,6 +670,12 @@ class ModelConfig(Generic[TConfig]):
                 and getattr(self.pretrained_config, "model_type",
                             None) in ("deepseek_v41", "deepseek_v41_text")):
             self.sparse_attention_config = CSA2SparseAttentionConfig()
+        if (self.sparse_attention_config is None
+                and is_hyv4_flash(self.pretrained_config)):
+            self.sparse_attention_config = _hyv4_flash_sparse_attention_config(
+                self.pretrained_config)
+        if is_hyv4_flash(self.pretrained_config):
+            _resolve_hyv4_flash_dfly2(self.spec_config, self.pretrained_config)
         if self.pretrained_config and self.sparse_attention_config:
             # Sparse geometry can come from the checkpoint. Resolve it once so
             # cache allocation, CUDA-graph routing, and model layers all read
@@ -2423,6 +2484,8 @@ class ModelConfig(Generic[TConfig]):
             return get_kimi_linear_num_attention_layers(cfg)
         if is_glm5_next(cfg):
             return get_glm5_next_num_attention_layers(cfg)
+        if is_hyv4_flash(cfg):
+            return get_hyv4_flash_num_attention_layers(cfg)
         return cfg.num_hidden_layers
 
     def get_num_mamba_layers(self) -> int:

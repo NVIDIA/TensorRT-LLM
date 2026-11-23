@@ -260,7 +260,86 @@ bool FmhaDispatcher::isSupported()
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+TllmGenFmhaRunnerParams FmhaDispatcher::makeTllmGenProbeParams(
+    MHARunnerParams const& runnerParams, AttentionInputLayout const layout) const
+{
+    TllmGenFmhaRunnerParams probe;
+    memset(&probe, 0, sizeof(probe));
+
+    // The fields that select a kernel, set exactly as run() sets them for this call.
+    probe.mQkvLayout = AttentionInputLayoutToQkvLayout(layout);
+    probe.mKernelType = FmhaKernelType::Context;
+    probe.mTileScheduler = TileScheduler::Persistent;
+    probe.mMultiCtasKvMode = false;
+    probe.mNumHeadsQ = mFixedParams.numQHeads;
+    probe.mNumHeadsKv = mFixedParams.numKvHeads;
+    probe.mNumHeadsQPerKv = probe.mNumHeadsQ / probe.mNumHeadsKv;
+    probe.mHeadDimQk = mFixedParams.headSize;
+    probe.mHeadDimV = mFixedParams.headSizeV;
+    probe.mHeadDimQkNope = mFixedParams.headSizeQkNope;
+    probe.mBatchSize = runnerParams.b;
+    probe.mMaxSeqLenQ = runnerParams.qSeqLen;
+    probe.mMaxSeqLenKv = runnerParams.kvSeqLen;
+    probe.mMaxSeqLenCacheKv = runnerParams.slidingWindowSize;
+    probe.mSumOfSeqLensQ = runnerParams.totalQSeqLen;
+    probe.mSumOfSeqLensKv = runnerParams.totalKvSeqLen;
+    probe.mNumTokensPerPage = (probe.mQkvLayout == QkvLayout::PagedKv) ? mFixedParams.numTokensPerBlock : 0;
+    probe.mMaxNumPagesPerSeqKv
+        = (probe.mQkvLayout == QkvLayout::PagedKv) ? runnerParams.pagedKvCache.mMaxBlocksPerSeq : 0;
+    probe.mNumPagesInMemPool = INT_MAX;
+    probe.mMultiProcessorCount = mMultiProcessorCount;
+    probe.mScaleQ = mFixedParams.qScaling;
+    probe.mUsesSpcompress = mFixedParams.useSpcompress;
+    applyTrtllmGenMaskSelection(probe,
+        detail::selectTrtllmGenMask(mFixedParams.attentionMaskType, runnerParams.slidingWindowSize,
+            runnerParams.chunkedAttentionSize, runnerParams.kvSeqLen));
+    // Sparse context attention uses a generation-style kernel with per-token sparse indices.
+    if (mFixedParams.useTllmGenSparseAttention)
+    {
+        probe.mSparseTopK = 4;
+        probe.mSparseAttention = (mFixedParams.useSparseMLA && mFixedParams.headSizeV == mFixedParams.headSize)
+            ? SparseType::DynamicTokenSparse
+            : SparseType::StaticTokenSparse;
+        probe.mDsv4EpilogueFusion.enabled = mFixedParams.fusesDsv4InvRopeFp8Quant;
+        probe.mKernelType = FmhaKernelType::Generation;
+        probe.mMaskType = TrtllmGenAttentionMaskType::Causal;
+        probe.mMultiCtasKvMode = true;
+    }
+    return probe;
+}
+
+bool FmhaDispatcher::isSupported(MHARunnerParams const& runnerParams, AttentionInputLayout const layout)
+{
+    if (!mUseTllmGen)
+    {
+        return mFMHARunner->isFmhaSupported();
+    }
+    if (mFixedParams.attentionMaskType == ContextAttentionMaskType::CUSTOM_MASK || mFixedParams.hasAlibi
+        || mFixedParams.isSPadded)
+    {
+        return false;
+    }
+    return mTllmGenFMHARunner->isSupported(makeTllmGenProbeParams(runnerParams, layout));
+}
+
+bool FmhaDispatcher::isSupported(MHARunnerParams const& runnerParams)
+{
+    return isSupported(runnerParams, mFixedParams.attentionInputLayout);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 void FmhaDispatcher::run(MHARunnerParams runnerParams)
+{
+    runImpl(runnerParams, mFixedParams.attentionInputLayout);
+}
+
+void FmhaDispatcher::run(MHARunnerParams runnerParams, AttentionInputLayout const layout)
+{
+    runImpl(runnerParams, layout);
+}
+
+void FmhaDispatcher::runImpl(MHARunnerParams runnerParams, AttentionInputLayout const layout)
 {
     if (mUseTllmGen)
     {
@@ -273,7 +352,7 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         auto qkvLayout = kernels::QkvLayout::PackedQkv;
         int32_t maxBlocksPerSeq = 0;
         int32_t numTokensPerBlock = 0;
-        if (mFixedParams.attentionInputLayout == AttentionInputLayout::Q_PAGED_KV)
+        if (layout == AttentionInputLayout::Q_PAGED_KV)
         {
             qkvLayout = kernels::QkvLayout::PagedKv;
             auto pagedKvCache = runnerParams.pagedKvCache.copyKVBlockArrayForContextFMHA();
@@ -283,7 +362,7 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
             maxBlocksPerSeq = pagedKvCache.mMaxBlocksPerSeq;
             numTokensPerBlock = pagedKvCache.mTokensPerBlock;
         }
-        else if (mFixedParams.attentionInputLayout == AttentionInputLayout::SEPARATE_Q_K_V)
+        else if (layout == AttentionInputLayout::SEPARATE_Q_K_V)
         {
             qkvLayout = kernels::QkvLayout::SeparateQkv;
         }
