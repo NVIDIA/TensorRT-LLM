@@ -4207,7 +4207,7 @@ class PyExecutor:
     def _executor_loop_cleanup(self):
         # Responses held for the next GPU wait go out first.
         self._stage_responses = False
-        self._flush_staged_responses()
+        self.flush_staged_responses()
         # Wake any waiters in await_responses BEFORE potentially-blocking
         # work below. If wait_on_pp_send_handles hangs (e.g. after a
         # crash leaves PP send handles in a bad state), the await loop
@@ -8527,7 +8527,7 @@ class PyExecutor:
 
                 # Staged responses go out now, so the response threads work
                 # while this thread waits on the sampler event below.
-                self._flush_staged_responses()
+                self.flush_staged_responses()
                 if (should_process_previous_batch
                         and self.rank_failure_recovery is not None):
                     self._accept_or_discard_previous_batch()
@@ -9286,7 +9286,7 @@ class PyExecutor:
             return
         if idle:
             # The fetch below may block until a request arrives.
-            self._flush_staged_responses()
+            self.flush_staged_responses()
             # In Ray path (TLLM_DISABLE_MPI=1), use a periodic heartbeat timeout so rank 0
             # reaches the broadcast path regularly to prevent trtllm-serve timeout when idle.
             timeout = datetime.timedelta(
@@ -13126,7 +13126,7 @@ class PyExecutor:
                     result_wait_queue.put_response.remote(resp.client_id, resp)
             self.response_cv.notify_all()
 
-    def _flush_staged_responses(self):
+    def flush_staged_responses(self):
         """Publish the staged responses in order, with one notify."""
         if self._staged_responses:
             staged, self._staged_responses = self._staged_responses, []
@@ -13141,7 +13141,7 @@ class PyExecutor:
         if self._staged_responses and (not self.active_requests
                                        or self._loop_iteration - self._staged_at
                                        > 1):
-            self._flush_staged_responses()
+            self.flush_staged_responses()
 
     def wait_for_intake_window(self) -> None:
         """Called on the request-intake thread between receiving a request and

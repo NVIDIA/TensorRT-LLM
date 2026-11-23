@@ -72,7 +72,7 @@ def _make_stub_executor(rank=0, queued_items=None):
     # FCFS waiting queue: no wait cap, so no rank-0 clock.
     stub._waiting_queue_needs_clock = False
     # No responses are staged for the idle path to flush.
-    stub._flush_staged_responses = lambda: None
+    stub.flush_staged_responses = lambda: None
     return stub
 
 

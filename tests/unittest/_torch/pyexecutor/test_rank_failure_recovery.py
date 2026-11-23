@@ -257,7 +257,7 @@ def _executor(rank=0):
     for step in (
         "_accept_or_discard_previous_batch",
         "_discard_previous_batch",
-        "_flush_staged_responses",
+        "flush_staged_responses",
         "_publish_responses",
         "resume_at_iteration",
         "known_request_ids",
@@ -532,7 +532,7 @@ def _loop_cleanup(recovery, fatal_error=None, completed=True):
         _event_loop_completed=completed,
         _fatal_error=fatal_error,
         _executor_events=Mock(),
-        _flush_staged_responses=Mock(),
+        flush_staged_responses=Mock(),
         _intake_window=threading.Event(),
     )
     PyExecutor._executor_loop_cleanup(executor)

@@ -296,8 +296,8 @@ def test_staged_context_cancellation_survives_retirement(executor: PyExecutor) -
     assert not executor.result_wait_queues
     executor._free_request_resources.assert_called_once_with(request)
 
-    executor._flush_staged_responses()
-    executor._flush_staged_responses()
+    executor.flush_staged_responses()
+    executor.flush_staged_responses()
     assert executor.responses == {request.py_request_id: [response]}
     result_queue.put_response.remote.assert_called_once_with(response.client_id, response)
     assert not executor._staged_responses

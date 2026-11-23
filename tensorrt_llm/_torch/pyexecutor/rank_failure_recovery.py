@@ -733,7 +733,7 @@ class RankFailureRecovery:
         # Publish the responses staged for the next GPU wait. The worker thread ends the requests
         # whose final response they hold later, so the read below may still list them; the commit
         # reads the outstanding requests again and does not count those requests as lost.
-        self._executor._flush_staged_responses()
+        self._executor.flush_staged_responses()
         recomputed = self._recompute_interrupted_requests()
         if record.joining_mask:
             if self._installed is record:

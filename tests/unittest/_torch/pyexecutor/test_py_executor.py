@@ -3315,7 +3315,7 @@ class _CleanupStub:
             raise RuntimeError("PP send handle in bad state")
 
     _executor_loop_cleanup = PyExecutor._executor_loop_cleanup
-    _flush_staged_responses = PyExecutor._flush_staged_responses
+    flush_staged_responses = PyExecutor.flush_staged_responses
 
 
 class TestExecutorLoopCleanup:
