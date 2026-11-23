@@ -16,11 +16,13 @@ from coordinator_harness import CoordinatorHarness as _Harness
 from coordinator_harness import TransferRequest as _Request
 from fake_dist import FakeDistGroup
 
+from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
 from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
     CtxTransferStatus,
     GenTransferStatus,
 )
 from tensorrt_llm._torch.disaggregation.orchestration import coordinator as coordinator_module
+from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
 from tensorrt_llm.bindings import LlmRequestState
@@ -780,6 +782,65 @@ def test_receive_outcome_preserves_backend_failure_after_abort(cause, expected) 
     h.coordinator.reap_gen_receives()
 
     assert h.coordinator.transfer_outcomes == expected
+
+
+@pytest.mark.parametrize(
+    ("local_status", "peer_status", "peer_timed_out", "expected"),
+    [
+        ("error", "completed", False, (0, 1, 0)),
+        ("error", "cancelled", False, (0, 1, 0)),
+        ("cancelled", "error", False, (0, 1, 0)),
+        ("cancelled", "cancelled", False, (0, 0, 0)),
+        ("cancelled", "error", True, (0, 0, 1)),
+    ],
+)
+def test_pp_receive_counts_backend_evidence_during_client_abort(
+    local_status, peer_status, peer_timed_out, expected
+) -> None:
+    h = _Harness(world_size=2, pp_size=2, supports_inflight_cancellation=True)
+    req = _receiving(h, 1, started_at=0.0)
+    req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+    h.coordinator._started_gen_receives[1] = req
+    h.registry.canceled = [1]
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._gen_need_sync = True
+    transceiver._init_gen_idle_poll(False)
+    transceiver._gen_idle_probe = False
+    transceiver._ever_had_recv_session = True
+    transceiver._pending_rank_info_admissions = None
+    transceiver._rank_info_start_failures = {}
+    transceiver._dist = h.dist
+    local_failed = local_status == "error"
+    session = SimpleNamespace(
+        status=SessionStatus.ERROR if local_failed else SessionStatus.CANCELLED,
+        wait_complete=Mock(return_value=WaitResult.FAILED if local_failed else None),
+        is_completed=lambda: False,
+        has_failed=lambda: local_failed,
+        close=Mock(return_value=True),
+    )
+    transceiver._recv_sessions = {1: session}
+    transceiver._recv_reqs = {1: req}
+    transceiver._poll_rank_info_admissions = lambda _: (list(transceiver._recv_sessions), [])
+    peer = [
+        [1] if peer_status == "cancelled" else [],
+        [1] if peer_status == "error" else [],
+        [1] if peer_status == "completed" else [],
+        [1],
+        [],
+        [1] if peer_timed_out else [],
+    ]
+    transceiver._gen_allgather = lambda local: [local, peer if local[3] else local]
+    h.transceiver.check_gen_transfer_status = transceiver.check_gen_transfer_status
+
+    h.coordinator.reap_gen_receives()
+    h.coordinator.reap_gen_receives()
+
+    assert h.coordinator.transfer_outcomes == expected
+    assert transceiver._recv_sessions == transceiver._recv_reqs == {}
+    session.close.assert_called_once_with()
+    if "cancelled" in (local_status, peer_status):
+        assert req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+        assert not h.effects.failed
 
 
 @pytest.mark.parametrize("polled_before_completion", [False, True])

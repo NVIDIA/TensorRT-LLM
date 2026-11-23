@@ -176,6 +176,13 @@ class DisaggTransferCoordinator:
         counts = self._transfer_outcomes
         return (counts[0], counts[1], counts[2]) if counts is not None else None
 
+    @staticmethod
+    def _has_observed_transfer_timeout(request: LlmRequest) -> bool:
+        return (
+            getattr(request, "py_kv_transfer_timed_out", False) is True
+            or getattr(request, "kv_cache_transfer_timed_out", False) is True
+        )
+
     def _record_transfer_outcome(
         self, request: LlmRequest, outcome: str, *, backend_failure: bool = False
     ) -> None:
@@ -196,10 +203,7 @@ class DisaggTransferCoordinator:
             if getattr(request, "is_child", False) is True
             else request.py_request_id
         )
-        if (
-            getattr(request, "py_kv_transfer_timed_out", False) is True
-            or getattr(request, "kv_cache_transfer_timed_out", False) is True
-        ):
+        if self._has_observed_transfer_timeout(request):
             outcome = "timeout"
         elif rid in canceled_ids and outcome == "error" and not backend_failure:
             return
@@ -1103,7 +1107,9 @@ class DisaggTransferCoordinator:
                     logger.warning(f"Request {request_id} not found in transfer manager")
                 continue
             request = requests_in_transfer[request_id]
-            if request_id in backend_failed_ids:
+            if self._has_observed_transfer_timeout(request):
+                self._record_transfer_outcome(request, "timeout")
+            elif request_id in backend_failed_ids:
                 self._record_transfer_outcome(request, "error", backend_failure=True)
             if request_id in cancelled_ids and not request.py_kv_transfer_timed_out:
                 # Preserve the terminal cancellation across the later error
@@ -1122,9 +1128,6 @@ class DisaggTransferCoordinator:
                 request.state = LlmRequestState.DISAGG_TRANS_ERROR
             elif request_id in succeeded_ids:
                 self._record_transfer_outcome(request, "success")
-            elif request_id in cancelled_ids:
-                if request.py_kv_transfer_timed_out:
-                    self._record_transfer_outcome(request, "timeout")
             self.release_transfer(request)
 
         # Releases above may have changed the set of requests in transfer.
@@ -1159,16 +1162,17 @@ class DisaggTransferCoordinator:
     def reap_gen_receives(self, at_least: int = 0) -> None:
         """Poll receive-side transfers; rank-synchronized inside the transceiver."""
         gen_status = self._transceiver.check_gen_transfer_status(at_least)
+        backend_failed_ids = set(getattr(gen_status, "backend_failed_request_ids", ()))
         if self._transfer_outcomes is not None and self._started_gen_receives:
             completed_ids = set(gen_status.completed_request_ids)
-            failed_ids = set(gen_status.error_request_ids)
+            failed_ids = set(gen_status.error_request_ids) | backend_failed_ids
             benchmark = is_gen_only_no_context_benchmark()
             # Native receives can settle through request state without returning an ID.
             for req in self._started_gen_receives.values():
                 rid = get_unique_rid(req)
                 if rid in self._settled_transfer_ids:
                     continue
-                if getattr(req, "kv_cache_transfer_timed_out", False) is True:
+                if self._has_observed_transfer_timeout(req):
                     self._record_transfer_outcome(req, "timeout")
                 elif rid in failed_ids or getattr(req, "kv_cache_transfer_failed", False) is True:
                     self._record_transfer_outcome(req, "error", backend_failure=True)
@@ -1179,6 +1183,10 @@ class DisaggTransferCoordinator:
         if gen_status.cancelled_requests:
             user_canceled_ids = set(self._registry.canceled_request_ids())
             for req in gen_status.cancelled_requests:
+                if self._has_observed_transfer_timeout(req):
+                    self._record_transfer_outcome(req, "timeout")
+                elif get_unique_rid(req) in backend_failed_ids:
+                    self._record_transfer_outcome(req, "error", backend_failure=True)
                 req_id = req.parent_request_id if req.is_child else req.py_request_id
                 if (
                     req_id not in user_canceled_ids

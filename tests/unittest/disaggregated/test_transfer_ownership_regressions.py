@@ -1063,7 +1063,7 @@ def test_gen_outcome_uses_peer_timeout_for_locally_completed_shard() -> None:
     tc._recv_reqs = {rid: req}
     tc._gen_allgather = lambda local: [local, [[], [rid], [], [rid], [], [rid]]]
 
-    assert tc._gen_consensus_outcome([rid], [], [], [rid], [rid]) == ([], [rid], [], set())
+    assert tc._gen_consensus_outcome([rid], [], [], [rid], [rid]) == ([], [rid], [], set(), {rid})
     assert req.py_kv_transfer_timed_out
 
 

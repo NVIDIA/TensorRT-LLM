@@ -263,7 +263,7 @@ class CtxTransferStatus(_CtxTransferStatusFields):
         return status
 
 
-class GenTransferStatus(NamedTuple):
+class _GenTransferStatusFields(NamedTuple):
     """Typed result of ``KvCacheTransceiver.check_gen_transfer_status``.
 
     Unpacks positionally as ``(completed_request_ids, error_request_ids,
@@ -283,6 +283,25 @@ class GenTransferStatus(NamedTuple):
     # closed; the caller decides the final request state, distinguishing
     # user cancellation from remote-initiated cancellation.
     cancelled_requests: List[LlmRequest]
+
+
+class GenTransferStatus(_GenTransferStatusFields):
+    """Settled generation transfers with independent backend failure evidence."""
+
+    backend_failed_request_ids: tuple[int, ...] = ()
+
+    def __new__(
+        cls,
+        completed_request_ids: List[int],
+        error_request_ids: List[int],
+        cancelled_requests: List[LlmRequest],
+        backend_failed_request_ids: tuple[int, ...] = (),
+    ) -> "GenTransferStatus":
+        status = super().__new__(cls, completed_request_ids, error_request_ids,
+                                 cancelled_requests)
+        if backend_failed_request_ids:
+            status.backend_failed_request_ids = backend_failed_request_ids
+        return status
 
 
 class KvCacheTransceiver(ABC):

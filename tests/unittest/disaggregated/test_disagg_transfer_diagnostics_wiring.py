@@ -1408,7 +1408,9 @@ def test_gen_settlement_continues_when_diagnostic_emission_fails(
     transceiver._collect_done = Mock(return_value=([request_id], []))
     transceiver._gen_consensus = Mock(side_effect=lambda request_ids: request_ids)
     transceiver._build_to_process = Mock(return_value=[request_id])
-    transceiver._gen_consensus_outcome = Mock(return_value=([], [], [request_id], [request_id]))
+    transceiver._gen_consensus_outcome = Mock(
+        return_value=([], [], [request_id], [request_id], set())
+    )
     transceiver._need_aux_transfer = Mock(return_value=False)
     transceiver._assert_disagg_history_declared = Mock()
     transceiver._close_session_or_raise = Mock()

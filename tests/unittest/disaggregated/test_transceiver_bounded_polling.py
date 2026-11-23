@@ -501,7 +501,7 @@ def test_gen_transfer_status_enters_consensus_when_sync_required() -> None:
     transceiver._recv_reqs = {}
     transceiver._gen_consensus = Mock(return_value=[])
     transceiver._build_to_process = Mock(return_value=[])
-    transceiver._gen_consensus_outcome = Mock(return_value=([], [], [], set()))
+    transceiver._gen_consensus_outcome = Mock(return_value=([], [], [], set(), set()))
     transceiver._close_failed_sessions = Mock()
 
     status = transceiver.check_gen_transfer_status(at_least_request_num=0)

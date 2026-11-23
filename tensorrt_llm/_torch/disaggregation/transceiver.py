@@ -1089,13 +1089,15 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 for rid in to_process
                 if getattr(self._recv_sessions.get(rid), "timed_out", False) is True
             ],
+            preserve_failures=True,
         )
         new_cancelled, new_failed, new_completed, globally_retirable, verified = outcome[:5]
         if idle_skip:
             # Every rank derives this from the same gathered payload.
             self._gen_idle_agreed = outcome[5]
         retirable = set(globally_retirable)
-        for rid in outcome[-1] & retirable:
+        timed_out, backend_failures = outcome[-2:]
+        for rid in timed_out & retirable:
             req = self._recv_reqs.get(rid)
             if req is not None:
                 req.py_kv_transfer_timed_out = True
@@ -1104,6 +1106,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             [rid for rid in new_failed if rid in retirable],
             new_completed,
             verified,
+            backend_failures & retirable,
         )
 
     def _ctx_consensus_outcome(self, to_process, cancelled, failed, completed, locally_quiesced):
@@ -1136,11 +1139,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 locally_timed_out=timed_out,
                 preserve_failures=True,
             )
-        for rid in timed_out.intersection(q, c + f):
+        for rid in timed_out.intersection(q, c + f + d):
             req = self._send_reqs.get(rid)
             if req is not None:
                 req.py_kv_transfer_timed_out = True
-        return c, f, d, q, failures.intersection(q, c)
+        return c, f, d, q, failures.intersection(q)
 
     def _sync_transfer_timing(self, reqs: list):
         """Return the rank-group timing envelope and bytes for the transfer CSV."""
@@ -1872,8 +1875,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         locally_quiesced = [
             rid for rid in to_process if not self._send_sessions[rid].has_transferring_tasks()
         ]
-        cancelled, failed, completed, quiesced_ids, cancelled_with_failures = (
-            self._ctx_consensus_outcome(to_process, cancelled, failed, completed, locally_quiesced)
+        cancelled, failed, completed, quiesced_ids, backend_failed = self._ctx_consensus_outcome(
+            to_process, cancelled, failed, completed, locally_quiesced
         )
         quiesced = set(quiesced_ids)
         cancelled = [rid for rid in cancelled if rid in quiesced]
@@ -1929,9 +1932,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._transfer_worker.sweep_stale_req_infos()
 
         failed.extend(owned_cancelled)
-        return CtxTransferStatus(
-            completed, failed, tuple(cancelled), tuple(sorted(cancelled_with_failures))
-        )
+        return CtxTransferStatus(completed, failed, tuple(cancelled), tuple(sorted(backend_failed)))
 
     def check_gen_transfer_status(self, at_least_request_num: Optional[int]) -> GenTransferStatus:
         if not self._ever_had_recv_session and not self._gen_need_sync:
@@ -2014,7 +2015,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         ]
 
         # All ranks must agree on per-rid outcome to avoid req.state divergence.
-        cancelled, failed, completed, verified = self._gen_consensus_outcome(
+        cancelled, failed, completed, verified, backend_failed = self._gen_consensus_outcome(
             to_process, cancelled, failed, completed, locally_verified
         )
         diagnostics_enabled = disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED
@@ -2084,7 +2085,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             if req is not None:
                 req.state = LlmRequestState.DISAGG_TRANS_ERROR
                 self._recv_reqs.pop(rid, None)
-        return GenTransferStatus(completed, failed + admission_failed, cancelled_reqs)
+        return GenTransferStatus(
+            completed, failed + admission_failed, cancelled_reqs, tuple(sorted(backend_failed))
+        )
 
     def _poll_gen_sessions_for_poll_interval(self, wait_num: int) -> None:
         self._poll_sessions_for_interval(

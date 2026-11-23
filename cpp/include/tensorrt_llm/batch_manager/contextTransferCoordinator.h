@@ -20,6 +20,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -28,6 +29,26 @@ namespace tensorrt_llm::batch_manager
 {
 
 class CacheTransceiverComm;
+
+enum class TransferConsensusState : std::uint64_t
+{
+    kCompleted = 1,
+    kFailed = 2,
+    kTimedOut = 3,
+    kCancelled = 4,
+};
+
+struct TransferConsensusOutcome
+{
+    std::unordered_set<std::uint64_t> completedRequestIds;
+    std::unordered_set<std::uint64_t> failedRequestIds;
+    std::unordered_set<std::uint64_t> timedOutRequestIds;
+    std::unordered_set<std::uint64_t> backendFailedRequestIds;
+};
+
+//! Reduce the gathered request/state pairs used by the collective protocol.
+[[nodiscard]] TransferConsensusOutcome reducePackedTransferStates(
+    std::span<std::uint64_t const> gatheredStates, int participantCount, bool timeoutIsFailure);
 
 enum class ContextTransferVote : std::uint64_t
 {
@@ -46,7 +67,7 @@ struct ContextTransferConsensusResult
 class ContextTransferVoteReducer
 {
 public:
-    explicit ContextTransferVoteReducer(int participantCount);
+    explicit ContextTransferVoteReducer(int participantCount, bool timeoutIsFailure = true);
 
     void recordVote(int participantRank, std::uint64_t requestId, ContextTransferVote vote);
 
@@ -73,17 +94,18 @@ private:
     };
 
     int mParticipantCount;
+    bool mTimeoutIsFailure;
     std::unordered_map<std::uint64_t, RequestVotes> mRequestVotes;
 };
 
 //! Coordinates asynchronous context-transfer outcomes across a rank group.
 //!
 //! Timeout and terminal events share one ordered stream toward the coordinator. Timeout updates and final commits
-//! share another ordered stream toward followers, so a request that times out can never commit success first.
+//! share another ordered stream toward followers, so timeout evidence arrives no later than terminal commit.
 class ContextTransferCoordinator
 {
 public:
-    explicit ContextTransferCoordinator(std::shared_ptr<CacheTransceiverComm> comm);
+    explicit ContextTransferCoordinator(std::shared_ptr<CacheTransceiverComm> comm, bool timeoutIsFailure = true);
     ~ContextTransferCoordinator();
 
     ContextTransferCoordinator(ContextTransferCoordinator const&) = delete;

@@ -51,6 +51,7 @@ def _harness(
     session: transfer_mod.TxSession | None,
     *,
     dist: FakeDistRank | None = None,
+    enable_transfer_metrics: bool = False,
 ) -> SimpleNamespace:
     """Run real coordinator/transfer-manager/reaper code with controlled engine effects."""
     transceiver = object.__new__(KvCacheTransceiverV2)
@@ -90,6 +91,7 @@ def _harness(
         effects=effects,
         registry=registry,
         enable_attention_dp=False,
+        enable_transfer_metrics=enable_transfer_metrics,
     )
     return SimpleNamespace(
         transceiver=transceiver,
@@ -192,7 +194,7 @@ def test_native_failure_cannot_independently_rewrite_request_cancellation() -> N
     request = _context_request()
     tx = worker.create_tx_session(request)
     tx.send(_sole_piece(tokens=16))
-    harness = _harness(worker, request, tx)
+    harness = _harness(worker, request, tx, enable_transfer_metrics=True)
     harness.transfers.start_transfer(request)
     handle = TaskHandle(tx, tx.kv_tasks[0], token_end=16)
     tx.set_exception("rank-local transfer failure")
@@ -204,8 +206,10 @@ def test_native_failure_cannot_independently_rewrite_request_cancellation() -> N
     # of this native task's earlier outcome.
     request.state = LlmRequestState.GENERATION_COMPLETE
     harness.coordinator.reap_context_sends()
+    harness.coordinator.reap_context_sends()
 
     assert request.state is LlmRequestState.GENERATION_COMPLETE
+    assert harness.coordinator.transfer_outcomes == (0, 1, 0)
     assert isinstance(handle.poll(), Failed)
     harness.manager.unpin_blocks_by_id.assert_called_once_with(91)
     harness.effects.terminate_request.assert_called_once_with(request)

@@ -139,5 +139,52 @@ TEST(ContextTransferVoteReducerTest, TimeoutAfterPartialTerminalVotesStillWins)
     EXPECT_TRUE(result.completedRequestIds.empty());
 }
 
+TEST(ContextTransferVoteReducerTest, ObserveOnlyPeerTimeoutSurvivesAnEarlyOrLatePoll)
+{
+    for (bool const pollBeforeCompletion : {false, true})
+    {
+        ContextTransferVoteReducer reducer(2, /*timeoutIsFailure=*/false);
+        constexpr std::uint64_t kRequestId = 61;
+        reducer.recordVote(0, kRequestId, ContextTransferVote::kCompleted);
+        reducer.recordTimeout(kRequestId);
+
+        bool observed = false;
+        if (pollBeforeCompletion)
+        {
+            auto const partial = reducer.takeReady();
+            observed = partial.timedOutRequestIds.count(kRequestId) != 0;
+            EXPECT_TRUE(observed);
+            EXPECT_TRUE(partial.completedRequestIds.empty());
+        }
+
+        reducer.recordVote(1, kRequestId, ContextTransferVote::kCompleted);
+        auto const terminal = reducer.takeReady();
+        EXPECT_TRUE(observed || terminal.timedOutRequestIds.count(kRequestId));
+        EXPECT_EQ(terminal.completedRequestIds, std::unordered_set<std::uint64_t>{kRequestId});
+        EXPECT_TRUE(terminal.failedRequestIds.empty());
+    }
+}
+
+TEST(TransferConsensusTest, PeerTimeoutEvidenceIsIndependentOfRetirementPolicy)
+{
+    constexpr std::uint64_t kLate = 67, kOnTime = 68, kMixed = 69;
+    constexpr auto kCompleted = static_cast<std::uint64_t>(TransferConsensusState::kCompleted);
+    constexpr auto kFailed = static_cast<std::uint64_t>(TransferConsensusState::kFailed);
+    constexpr auto kTimedOut = static_cast<std::uint64_t>(TransferConsensusState::kTimedOut);
+    constexpr auto kCancelled = static_cast<std::uint64_t>(TransferConsensusState::kCancelled);
+    std::vector<std::uint64_t> votes{kLate, kCompleted, kOnTime, kCompleted, kMixed, kFailed, kLate, kTimedOut, kLate,
+        kCompleted, kOnTime, kCompleted, kMixed, kCancelled};
+    for (bool const timeoutIsFailure : {false, true})
+    {
+        auto const result = reducePackedTransferStates(votes, 2, timeoutIsFailure);
+        EXPECT_EQ(result.timedOutRequestIds, std::unordered_set<std::uint64_t>{kLate});
+        EXPECT_EQ(result.backendFailedRequestIds, std::unordered_set<std::uint64_t>{kMixed});
+        EXPECT_TRUE(result.completedRequestIds.count(kOnTime));
+        EXPECT_TRUE(result.failedRequestIds.count(kMixed));
+        EXPECT_EQ(result.completedRequestIds.count(kLate), !timeoutIsFailure);
+        EXPECT_EQ(result.failedRequestIds.count(kLate), timeoutIsFailure);
+    }
+}
+
 } // namespace
 } // namespace tensorrt_llm::batch_manager

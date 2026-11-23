@@ -22,8 +22,67 @@
 namespace tensorrt_llm::batch_manager
 {
 
-ContextTransferVoteReducer::ContextTransferVoteReducer(int const participantCount)
+namespace
+{
+struct TransferStateCounts
+{
+    int completedCount{0};
+    int failedCount{0};
+    int timedOutCount{0};
+    int cancelledCount{0};
+};
+} // namespace
+
+TransferConsensusOutcome reducePackedTransferStates(
+    std::span<std::uint64_t const> gatheredStates, int const participantCount, bool const timeoutIsFailure)
+{
+    constexpr size_t kPackedStateFields = 2;
+    TLLM_CHECK_WITH_INFO(gatheredStates.size() % kPackedStateFields == 0,
+        "Packed transfer state consensus payload must contain request/state pairs.");
+
+    std::unordered_map<std::uint64_t, TransferStateCounts> stateCounts;
+    for (size_t idx = 0; idx < gatheredStates.size(); idx += kPackedStateFields)
+    {
+        auto const requestId = gatheredStates[idx];
+        auto const state = static_cast<TransferConsensusState>(gatheredStates[idx + 1]);
+        auto& counts = stateCounts[requestId];
+        switch (state)
+        {
+        case TransferConsensusState::kCompleted: counts.completedCount++; break;
+        case TransferConsensusState::kFailed: counts.failedCount++; break;
+        case TransferConsensusState::kTimedOut: counts.timedOutCount++; break;
+        case TransferConsensusState::kCancelled: counts.cancelledCount++; break;
+        }
+    }
+
+    TransferConsensusOutcome outcome;
+    for (auto const& [requestId, counts] : stateCounts)
+    {
+        auto const terminalCount = counts.completedCount + counts.failedCount + counts.cancelledCount;
+        if (counts.timedOutCount > 0)
+        {
+            outcome.timedOutRequestIds.insert(requestId);
+        }
+        if (terminalCount == participantCount
+            && (counts.failedCount > 0 || counts.cancelledCount > 0 || (timeoutIsFailure && counts.timedOutCount > 0)))
+        {
+            outcome.failedRequestIds.insert(requestId);
+            if (counts.failedCount > 0)
+            {
+                outcome.backendFailedRequestIds.insert(requestId);
+            }
+        }
+        else if (counts.completedCount == participantCount)
+        {
+            outcome.completedRequestIds.insert(requestId);
+        }
+    }
+    return outcome;
+}
+
+ContextTransferVoteReducer::ContextTransferVoteReducer(int const participantCount, bool const timeoutIsFailure)
     : mParticipantCount(participantCount)
+    , mTimeoutIsFailure(timeoutIsFailure)
 {
     TLLM_CHECK_WITH_INFO(participantCount > 0, "Context-transfer consensus requires at least one participant.");
 }
@@ -82,8 +141,9 @@ ContextTransferConsensusResult ContextTransferVoteReducer::takeReady()
             continue;
         }
 
-        auto& terminalRequestIds
-            = (requestVotes.failed || requestVotes.timedOut) ? result.failedRequestIds : result.completedRequestIds;
+        auto& terminalRequestIds = (requestVotes.failed || (mTimeoutIsFailure && requestVotes.timedOut))
+            ? result.failedRequestIds
+            : result.completedRequestIds;
         terminalRequestIds.insert(requestIt->first);
         requestIt = mRequestVotes.erase(requestIt);
     }
