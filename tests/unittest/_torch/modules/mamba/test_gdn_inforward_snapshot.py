@@ -19,6 +19,8 @@ import types
 import pytest
 import torch
 
+from tensorrt_llm._torch.modules.fla.gdn_metadata import GDNMambaMetadata
+from tensorrt_llm._torch.modules.fla.inforward_snapshot import InforwardSnapshotEntry
 from tensorrt_llm._torch.modules.mamba import gdn_inforward_split
 from tensorrt_llm._torch.modules.mamba.causal_conv1d import causal_conv1d_fn
 from tensorrt_llm._torch.modules.mamba.gdn_mixer import (
@@ -27,8 +29,6 @@ from tensorrt_llm._torch.modules.mamba.gdn_mixer import (
     _inforward_split_prefill_core,
     chunk_gated_delta_rule,
 )
-from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import InforwardSnapshotEntry
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
@@ -58,7 +58,7 @@ def _split():
         request_ids=[rid for rid, _, _, _ in _BATCH],
         seq_lens=torch.tensor([length for _, _, length, _ in _BATCH], dtype=torch.int32),
     )
-    metadata = Mamba2Metadata(max_batch_size=8, chunk_size=128)
+    metadata = GDNMambaMetadata(max_batch_size=8, chunk_size=128)
     metadata._prepare_inforward_split(attn, manager, plan, len(_BATCH), len(_BATCH))
     return metadata.inforward_split
 

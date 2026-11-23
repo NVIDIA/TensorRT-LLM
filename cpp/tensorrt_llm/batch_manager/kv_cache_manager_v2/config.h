@@ -40,6 +40,8 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 struct GpuCacheTierConfig
 {
     size_t quota = 0; // bytes
+    // Place KV pages in per-locality-domain physical memory when the device exposes locality domains.
+    bool enableLocalityDomains = false;
 
     [[nodiscard]] CacheTier tier() const noexcept
     {
@@ -204,6 +206,7 @@ enum class ReusePolicy
     //! Commit reusable pages without constraining the REQUIRED prefix match. The caller selects
     //! available groups at resume; missing or unselected groups use fresh pages for recomputation.
     //! These pages may be evicted independently without removing the REQUIRED prefix.
+    //! Attention buffers require a sliding window.
     OPTIONAL = 2,
     //! REQUIRED for sink blocks, OPTIONAL for the sliding window: sinks constrain the prefix match and are
     //! claimed with it; the window is selected at resume, and ReuseGroupStatus::complete describes it.

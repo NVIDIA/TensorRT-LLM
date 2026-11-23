@@ -23,6 +23,7 @@ resident must not be seen.
 
 import gc
 import weakref
+from contextlib import contextmanager
 from functools import partial
 from types import SimpleNamespace
 
@@ -33,6 +34,7 @@ from utils.block_causal_reference import reference_attention
 
 from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention as BaseTrtllmAttention
+from tensorrt_llm._torch.nccl_window_graph import nccl_window_graph_capture
 from tensorrt_llm._torch.visual_gen.attention.attention import Attention
 from tensorrt_llm._torch.visual_gen.attention.backends.cudnn import CuDNNAttention
 from tensorrt_llm._torch.visual_gen.attention.backends.trtllm import TrtllmAttention
@@ -113,6 +115,16 @@ def make_backend(name, layer_idx=0, dtype=DTYPE):
         max_seq_len=PROMPT_CAPACITY + WINDOW + CHUNK + 32,
         attention_metadata_state={},
     )
+
+
+@contextmanager
+def gc_safe_capture(graph):
+    """Capture the block into ``graph`` with Python's cyclic collector kept out of the
+    capture window: collect before, automatic collection off until capture ends. A graph
+    an earlier test left to the collector is then destroyed before, not during, this capture."""
+    gc.collect()
+    with nccl_window_graph_capture(graph, torch.cuda.graph_pool_handle()):
+        yield
 
 
 def run(attn, cache, q, k, v, causal_block_size=None):
@@ -533,7 +545,7 @@ def test_graph_replay_survives_commit(cache, backend):
             run(attn, cache, q, k, v)
     torch.cuda.current_stream().wait_stream(side)
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    with gc_safe_capture(graph):
         out = run(attn, cache, q, k, v)
 
     for step in range(3):  # the third commit rotates the table
@@ -619,7 +631,7 @@ def test_graph_survives_reopen_with_a_longer_prefix(backend):
                 run(attn, cache, q, k, v)
         torch.cuda.current_stream().wait_stream(side)
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
+        with gc_safe_capture(graph):
             out = run(attn, cache, q, k, v)
         cache.close()
 
@@ -670,7 +682,7 @@ def test_graph_captured_while_the_window_fills(backend, num_causal_blocks):
                 run(attn, cache, q, k, v, causal_block_size=size)
         torch.cuda.current_stream().wait_stream(side)
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
+        with gc_safe_capture(graph):
             out = run(attn, cache, q, k, v, causal_block_size=size)
 
         history_k, history_v = [], []

@@ -17,7 +17,7 @@ from agent_flow.console import print_message
 from ...checks import acceptance as acceptance_checks
 from ...checks import accuracy as accuracy_checks
 from ...checks import boot as boot_checks
-from ...checks import check_config, disagg, gate_records, serve
+from ...checks import check_config, disagg, serve
 from ...checks import verdict as check_result
 from ...checks.accuracy import resolve_model_key
 from ...infra.compute.environment import RunEnvironment
@@ -34,17 +34,11 @@ from ...infra.compute.executor import (
 from ...infra.compute.sessions import session_wait_from_task
 from ...infra.git import resolve_commit
 from ...spec import variants as variants_mod
-from ...spec.task_schema import (
-    assembly_units,
-    features_through,
-    members_for,
-    parse_parallel_segment,
-)
+from ...spec.task_schema import assembly_units, features_through, parse_parallel_segment
 from ..startup import datasets as datasets_mod
 from ..workspace import snapshots as snapshots_mod
 from . import anchors as anchors_mod
 from . import contract as contract_mod
-from . import runtime_facts
 
 #: How many times in a row one gate may be lost to its session and re-run.
 #: Each re-run waits for a heartbeat first, so this only binds on a session
@@ -66,14 +60,8 @@ class CheckRunner:
         self.journal = workflow.journal
         self.gate_log = workflow.gate_log
         self._member_runners = {}
-        self._accuracy_by_unit = {}
-        self._accuracy_lock = threading.Lock()
         self._session = threading.local()
-        self._accuracy_owed = {}
         self.pin = None
-        for check in workflow._contract.checks if workflow._contract else ():
-            if check.gate.startswith("accuracy["):
-                self._accuracy_owed.setdefault(check.unit, []).append(check.member)
 
     def _features_through(self, unit: str) -> list[str]:
         """Features implemented once ``unit`` is assembled, in order.
@@ -236,31 +224,6 @@ class CheckRunner:
             spec, model_key=resolve_model_key(spec, unit), unit=unit
         )
 
-    def _note_runtime_facts(self, check: contract_mod.Check, result: Any, marker: str) -> None:
-        """A passed gate's engines into ``runtime_facts.yaml``; a measured change is journaled.
-
-        ``marker`` is the target the gate measured, read as it started.
-        """
-        engines = tuple(getattr(result, "engine", ()) or ())
-        if not result.passed or not engines:
-            return
-        try:
-            changes = runtime_facts.record(
-                self.workspace,
-                unit=check.unit,
-                member=check.member,
-                gate=check.gate,
-                engines=engines,
-                tree=str(getattr(result, "tree_state", "") or ""),
-                marker=marker,
-                current=self.workflow._target_marker(),
-            )
-        except OSError as exc:
-            self.journal.event("runtime facts not written", f"{check.key}: {exc}")
-            return
-        if changes:
-            self.journal.event("runtime facts changed", "; ".join(changes))
-
     # ----------------------------------------------------------------- checks
     def _prioritized_check(self, check: contract_mod.Check, log) -> Any:
         """:meth:`_run_contract_check`, its jobs queued at the check's class (:func:`job_priority`).
@@ -277,30 +240,22 @@ class CheckRunner:
         """Run one contract check and return its gate result.
 
         On a git checkout the check measures a snapshot of the commit the
-        checkout is at as it starts (``_snapshots``). A check that passes adds
-        the engines it attested to the runtime facts.
+        checkout is at as it starts (``_snapshots``).
         """
         snapshots = getattr(self.workflow, "_snapshots", None)
         if snapshots is None:
-            marker = self.workflow._target_marker()
-            result = self._gate(check, log)
-        else:
-            result, marker = self._gate_on_snapshot(snapshots, check, log)
-        if check.gate.startswith("accuracy[") and result.passed:
-            with self._accuracy_lock:
-                self._note_shift(check.unit, check.member, result, self._spec_for(check.unit)[0])
-        self._note_runtime_facts(check, result, marker)
-        return result
+            return self._gate(check, log)
+        return self._gate_on_snapshot(snapshots, check, log)
 
     def _gate_on_snapshot(
         self, snapshots: snapshots_mod.Snapshots, check: contract_mod.Check, log
-    ) -> tuple[Any, str]:
-        """``check``'s result on a snapshot of the checkout's head, and the marker it measured."""
+    ) -> Any:
+        """``check``'s result on a snapshot of the checkout's head."""
         repo = str(self.task_data.get("trtllm_repo_path") or "")
         head = resolve_commit(repo)
         if head is None:
             why = f"git could not name the commit {repo} is at, so there was nothing to snapshot"
-            return snapshots_mod.void_result(check.gate, check.member, why), ""
+            return snapshots_mod.void_result(check.gate, check.member, why)
         pin = snapshots_mod.CheckTree(
             commit=head,
             tree=snapshots.tree(head),
@@ -310,11 +265,11 @@ class CheckRunner:
         )
         try:
             with snapshots.lease(head):
-                return self._on_snapshot(pin)._gate(check, log), pin.marker
+                return self._on_snapshot(pin)._gate(check, log)
         except snapshots_mod.SnapshotError as exc:
             result = snapshots_mod.void_result(check.gate, check.member, str(exc))
             self.journal.event("gate", result.summary())
-            return result, pin.marker
+            return result
 
     def _on_snapshot(self, pin: snapshots_mod.CheckTree) -> "CheckRunner":
         """The runner as one check sees it: the target is ``pin``'s snapshot.
@@ -361,9 +316,8 @@ class CheckRunner:
             return lambda runner: self._anchored_accuracy(check, env, spec, workdir, runner)
         if gate == "acceptance":
             return lambda runner: acceptance_checks.run_acceptance_gate(
-                env, features=features, workdir=workdir,
-                records=gate_records.records_for(self.workspace), **common(runner),
-            )  # fmt: skip
+                env, features=features, workdir=workdir, **common(runner)
+            )
         if gate == disagg.GATE_NAME:
             return lambda runner: disagg.run_disagg_gate(
                 env, workdir=workdir, task_data=self._with_dataset(spec, gate), runner=runner,
@@ -417,13 +371,11 @@ class CheckRunner:
         anchor there (``validation/anchors.py``); every later benchmark of the unit at
         that member is held to that score, as a variant is to its unit's.
         """
-        from ...spec.lint import PLAUSIBLE_ANCHOR
-
         spec = self._with_dataset(spec, check.gate)
         unit, member = check.unit, check.member
         reference = self._reference_score(unit, spec)
         benchmark = check.gate[len("accuracy[") : -1]
-        plausible = PLAUSIBLE_ANCHOR.get(benchmark)
+        plausible = anchors_mod.PLAUSIBLE_ANCHOR.get(benchmark)
         placeholder = plausible is not None and reference < plausible
         own = (
             anchors_mod.measured(self.workspace, unit, check.gate, member) if placeholder else None
@@ -541,27 +493,3 @@ class CheckRunner:
                     f"```\n{result.stdout_tail.rstrip()}\n```",
                 )
         return result
-
-    def _note_shift(self, unit: str, member: str, result: Any, spec: Any = None) -> None:
-        """Once every member `unit` owes an accuracy check has a verdict, check them together.
-
-        Each member can clear its own floor while all of them sit under the
-        anchor; that is recorded as a finding and refused at delivery. The
-        members are those the contract owes the benchmark at
-        (:func:`~..contract.benchmark_members`), else every member of the unit.
-        """
-        measured = self._accuracy_by_unit.setdefault(unit, {})
-        measured[member] = result
-        spec = spec or self.task_data
-        members = getattr(self, "_accuracy_owed", {}).get(unit) or members_for(
-            spec, unit, self.workflow._gate_env().world_size
-        )
-        if set(members) <= set(measured):
-            finding = accuracy_checks.note_systematic_shift(
-                gate_records.records_for(self.workspace),
-                [measured[m] for m in members],
-                spec.get("accuracy") or {},
-                unit,
-            )
-            if finding is not None:
-                self.journal.event("finding", finding.describe())

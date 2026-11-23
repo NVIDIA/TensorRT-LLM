@@ -861,6 +861,9 @@ def test_recompute_helix_spec_buffers_matches_elementwise_reference(
     )
     metadata.helix_local_slots = torch.full_like(metadata.helix_position_offsets, untouched)
     metadata.helix_kv_bounds = torch.full_like(metadata.helix_position_offsets, untouched)
+    metadata.helix_global_kv_lens = torch.full(
+        (num_seqs + 2,), untouched, dtype=torch.int32, device="cuda"
+    )
     metadata.kv_lens_cuda = torch.full((num_seqs + 3,), untouched, dtype=torch.int32, device="cuda")
 
     metadata.recompute_helix_spec_buffers(num_tokens, tokens_per_seq)
@@ -879,10 +882,15 @@ def test_recompute_helix_spec_buffers_matches_elementwise_reference(
         metadata.kv_lens_cuda[1 : 1 + num_seqs],
         expected_bounds.view(num_seqs, tokens_per_seq)[:, -1],
     )
+    torch.testing.assert_close(
+        metadata.helix_global_kv_lens[:num_seqs],
+        positions.view(num_seqs, tokens_per_seq)[:, -1] + 1,
+    )
     assert (metadata.helix_local_slots[num_tokens:] == untouched).all()
     assert (metadata.helix_kv_bounds[num_tokens:] == untouched).all()
     assert metadata.kv_lens_cuda[0].item() == untouched
     assert (metadata.kv_lens_cuda[1 + num_seqs :] == untouched).all()
+    assert (metadata.helix_global_kv_lens[num_seqs:] == untouched).all()
     # Any group of the sequence that this rank does not own writes no slot.
     assert ((metadata.helix_local_slots[gen] == -1) == (owner != cp_rank)).all()
 
@@ -891,8 +899,8 @@ def test_recompute_helix_spec_buffers_matches_elementwise_reference(
 def test_helix_spec_buffers_reuse_the_compiled_kernel_across_batches() -> None:
     kernel = fp4_mla_metadata._helix_spec_buffers_kernel
     tokens_per_seq = 4
-    positions, local_slots, kv_bounds, kv_lens = (
-        torch.zeros(64, dtype=torch.int32, device="cuda") for _ in range(4)
+    positions, local_slots, kv_bounds, kv_lens, global_kv_lens = (
+        torch.zeros(64, dtype=torch.int32, device="cuda") for _ in range(5)
     )
 
     def populate(num_contexts: int, num_seqs: int) -> None:
@@ -907,6 +915,7 @@ def test_helix_spec_buffers_reuse_the_compiled_kernel_across_batches() -> None:
             tokens_per_block=64,
             cp_size=8,
             cp_rank=3,
+            global_kv_lens=global_kv_lens[:num_seqs],
         )
 
     # Context counts 1-3 misalign the int32 kv_lens view.
@@ -1320,6 +1329,8 @@ def test_fp4_mla_chunked_prefill_attends_cached_partitions_then_current_chunk(
     monkeypatch.setattr(mla_module, "maybe_compiled_cat", torch.cat)
     tokens, cached, heads, nope, rope, rank, v_dim = 4, 6, 2, 8, 4, 16, 8
     calls = []
+    expected_is_lse = chunked_loop_num > 0
+    change_format = False
 
     def load_chunked_kv_cache_for_mla(**kwargs):
         calls.append(("load", kwargs["num_ctx_cached_tokens"]))
@@ -1332,10 +1343,16 @@ def test_fp4_mla_chunked_prefill_attends_cached_partitions_then_current_chunk(
         assert forward_args.latent_cache is None
         assert k.shape == (k.shape[0], heads * (nope + rope))
         assert v.shape == (k.shape[0], heads * v_dim)
+        forward_args.softmax_stats_is_lse = (
+            not expected_is_lse
+            if change_format and forward_args.attention_mask == PredefinedAttentionMask.CAUSAL
+            else expected_is_lse
+        )
         partition_keys.append(k)
         return forward_args.output
 
-    def merge(merged, temp, stats, temp_stats, merge_op, metadata):
+    def merge(merged, temp, stats, temp_stats, merge_op, metadata, *, is_lse=False):
+        assert is_lse == expected_is_lse
         calls.append(("merge", merge_op))
 
     partition_keys = []
@@ -1399,6 +1416,18 @@ def test_fp4_mla_chunked_prefill_attends_cached_partitions_then_current_chunk(
     current_k = partition_keys[-1].view(tokens, heads, nope + rope)
     for head in range(heads):
         torch.testing.assert_close(current_k[:, head, nope:], latent[:, 0, rank:])
+
+    if chunked_loop_num:
+        calls.clear()
+        change_format = True
+        with pytest.raises(RuntimeError, match="normalizer format changed between partitions"):
+            MLA.forward_context_with_chunked_prefill_fp4(
+                module, q, torch.zeros(tokens, rank), latent, metadata, output
+            )
+        # The causal partition must not reach merge after a format change.
+        assert [call for call in calls if call[0] == "merge"] == [
+            ("merge", f"op{i}") for i in range(chunked_loop_num)
+        ]
 
 
 def test_fp4_mla_v2_runtime_sizing_accounts_for_pipeline_slots() -> None:

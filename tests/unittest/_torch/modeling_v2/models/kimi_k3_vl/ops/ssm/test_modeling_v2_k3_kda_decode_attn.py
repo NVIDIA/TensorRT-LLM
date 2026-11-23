@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the ssm/k3_kda_decode_attn catalog entry, on a real cache object and a caller-owned K3KdaBuffers.
+"""GPU test for the ssm/k3_kda_decode_attn op, on a real cache object and a caller-owned K3KdaBuffers.
 
 Kimi K3's fused KDA projection + plain decode of R <= 8 requests of one token, at the TP16 rank slice, on the
 plain-decode pools of a real ``KimiK3HybridCacheManager`` (``_kda_cells.build_manager``: conv bf16
