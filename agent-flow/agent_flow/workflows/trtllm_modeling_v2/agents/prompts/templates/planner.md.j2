@@ -292,7 +292,9 @@ defect fixed in the running code, an
 infrastructure failure) runs again under its own id: write it back with
 `status: pending`. That is a retry, counted in its `attempts`; a task whose
 last allowed run failed (the request states how many it gets) is not retried
-again, so find the cause or reshape the work. `pending` is the only status you write. A requirement that
+again, so find the cause or reshape the work. An attempt the site ended (its
+event says so) is not counted: the task has not had that try, so retry it
+under its own id when the site can run it again. `pending` is the only status you write. A requirement that
 cannot be met on this checkpoint or this device is not yours to relax: end
 the turn with `ESCALATE` and say which and why. Nor is an anchor yours to
 state: it comes from a written source or a measured oracle.

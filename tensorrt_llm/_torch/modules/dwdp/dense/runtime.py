@@ -260,6 +260,12 @@ class DenseDWDP:
         return self._layers
 
     @property
+    def local_bytes_outside_torch(self) -> int:
+        """Device memory this rank's dense shards hold outside PyTorch; 0 once released."""
+        store = self._store
+        return store.local_bytes_outside_torch if store is not None else 0
+
+    @property
     def segments(self) -> tuple[SegmentKind, ...]:
         """Enabled segment kinds in canonical order."""
         return self._segments

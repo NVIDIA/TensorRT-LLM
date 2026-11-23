@@ -437,6 +437,9 @@ google/gemma-3n-E2B-it:
   - accuracy: 72.176
 google/gemma-4-E2B-it:
   - accuracy: 85.709
+google/gemma-4-E4B-it:
+  - spec_dec_algo: MTP
+    accuracy: 88.476
 swiss-ai/Apertus-8B-Instruct-2509:
   - accuracy: 57.56
 swiss-ai/Apertus-v1.5-8B:

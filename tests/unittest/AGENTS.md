@@ -21,32 +21,32 @@ Scope: this directory and its descendants. Supplements `../AGENTS.md`.
 
 ## Coverage and execution cost
 
-- For a new case or parameter value, identify the regression its assertions
-  detect and the gap in existing tests. Prefer strengthening an existing test
-  when that protects the behavior without another setup or process. Preserve
-  distinct boundary, error, backend and lifecycle coverage.
-- Compare executed inputs, assertions, fixtures, markers and the implementation
-  under test before deduplicating. Similar names or bodies can exercise different
-  implementations; different names can execute the same check.
-- Parameterize combinations that affect the exercised branch. A representative
-  value can cover an inactive dimension, while active dimensions retain their
-  meaningful values and boundaries. If a product change makes that dimension
-  relevant, expand the matrix with that change. State deliberately relinquished
-  coverage in the PR; a passing smaller suite alone is not equivalence evidence.
-- For pressure and concurrency tests, explain what the repetition count, payload
-  size and concurrency protect. Assert the required completeness, ordering and
-  error behavior; per-item assertions alone can pass on an empty stream. Keep
-  real communication and process behavior when those are the subject of the test.
-- Account for import/setup cost, subprocesses and shared state as well as test-body
-  time. Use readiness/completion signals for concurrent work, with a separate
-  protective timeout. Scope environment and event-loop changes and clean up owned
-  threads, processes and connections.
-- For test-time claims, compare the same selected work with representative CPU,
-  memory, architecture and runtime settings. Report cumulative execution work and
-  the slowest parallel shard separately; case-count reduction does not establish
-  wall-time or flake-rate improvement.
+Apply the shared [test value and CI placement rules](../AGENTS.md#test-value-and-ci-placement).
+When writing or pruning Python unit tests:
 
-Before changing registrations or process boundaries, follow the
-[test-list instructions](../integration/test_lists/AGENTS.md). An existing parent
-entry may already select a new test; confirm actual selection before adding an
-entry.
+- **Strengthen before adding**: extend an existing test when it covers the
+  regression without extra setup or processes. Keep distinct boundary, error,
+  backend, and lifecycle cases.
+- **Verify before deduplicating**: compare executed inputs, assertions,
+  fixtures, markers, and target implementations — similar names can hit
+  different code paths, and different names can test the same one.
+- **Keep matrices intentional**: parameterize dimensions that change the
+  exercised branch; use one representative value for inactive dimensions, and
+  expand them if product code later branches on them. Note any coverage you
+  deliberately drop in the PR (a smaller passing suite alone does not prove
+  equivalence).
+- **Keep tests reliable and assertions meaningful**: use readiness/completion
+  signals with a separate protective timeout instead of sleep-based timing;
+  scope env and event-loop changes and clean up owned threads, processes, and
+  connections. For stress/concurrency tests, assert completeness, ordering, and
+  error behavior so an empty stream cannot pass silently, and keep real
+  communication when communication is under test.
+- **When claiming runtime or cost improvements**: compare the same selected
+  tests under matching hardware and runtime settings, and report total execution
+  work and slowest shard separately (fewer cases alone does not prove faster
+  wall time or fewer flakes).
+
+Before changing CI registrations or process boundaries, see the
+[test-list guidance](../integration/test_lists/AGENTS.md#test-registration-and-batching).
+An existing parent entry may already select a new test; verify actual selection
+before adding an entry.

@@ -31,7 +31,7 @@ from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
 from tensorrt_llm._torch.moe.workspace import CutlassWorkspaceReclaimer
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
-from tensorrt_llm._torch.pyexecutor import h2d_cache, step_inputs
+from tensorrt_llm._torch.pyexecutor import device_copy, h2d_cache, step_inputs
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import BreakableCUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.context_logits_plan import ContextLogitsPlan
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
@@ -40,6 +40,7 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     DSparkCUDAGraphRunner,
     KeyType,
 )
+from tensorrt_llm._torch.pyexecutor.device_copy import CopyPlan, DeviceCopier, copy_plan_of
 from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
 from tensorrt_llm._torch.pyexecutor.h2d_cache import H2DSkipCache
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
@@ -157,6 +158,19 @@ class PrefillCompiledModel(torch.nn.Module):
             return getattr(super().__getattr__("eager_model"), name)
 
 
+def check_one_copy_path(model: object, plan: CopyPlan, hooks: RuntimeHooks) -> None:
+    """Refuse a model that declares a copy plan and also turns on the step-input pack or the skip cache.
+
+    The two paths coexist across models, not within one: a model moves its step's copies to the copy plan as a whole.
+    """
+    if plan and (hooks.pack_step_inputs or hooks.skip_unchanged_h2d):
+        raise ValueError(
+            f"{type(model).__name__} declares a copy plan and also turns on the step-input pack or the skip cache "
+            "(RuntimeHooks.pack_step_inputs / skip_unchanged_h2d); a model moves its step's copies to the copy plan "
+            "as a whole"
+        )
+
+
 class DecoderRunner(ScheduledModelRunner):
     """Run scheduled decoder generation with its own buffers, graphs and metadata."""
 
@@ -165,6 +179,10 @@ class DecoderRunner(ScheduledModelRunner):
     # This engine's skip cache and step-input pack (None: the hook is off), active only during its own forward.
     _h2d_cache: H2DSkipCache | None = None
     _step_pack: StepInputPack | None = None
+    # The copy plan the model declares (device_copy); empty by default, and then the engine has no copier.
+    copy_plan: CopyPlan = CopyPlan()
+    # This engine's copier (None: an empty plan), active only during its own forward.
+    _copier: DeviceCopier | None = None
     # Whether a batch may keep the greedy tokens a forward sampled in place of the logits. False when the executor
     # runs a guided decoder, which reads the logits of every batch.
     keep_greedy_only_outputs = True
@@ -250,6 +268,26 @@ class DecoderRunner(ScheduledModelRunner):
             )
         if self._h2d_cache is not None and self._h2d_cache.changed_span:
             logger.info("[M3 host] changed metadata uploads stage only each row's changed span")
+        self.copy_plan = copy_plan_of(model)
+        check_one_copy_path(model, self.copy_plan, self.runtime_hooks)
+        self._copier = (
+            DeviceCopier(self.copy_plan, torch.device("cuda", torch.cuda.current_device()))
+            if self.copy_plan
+            else None
+        )
+        if self._copier is not None:
+            final = self.copy_plan.final_flush
+            logger.info(
+                f"[device copy] {len(self.copy_plan.merge)} merged sites, "
+                f"{len(self.copy_plan.flush_after)} barriers, "
+                f"parallel scatter {self.copy_plan.parallel_scatter}, final flush "
+                + (
+                    "eager"
+                    if final is None
+                    else f"in graph (early copy {final.early_copy}, "
+                    f"one-launch prologue {final.prologue_op is not None}, step epoch {final.step_epoch})"
+                )
+            )
         # Heads that can project context logits eagerly; the model is fixed.
         self._context_logits_heads = context_logits_heads(
             model, mapping, is_spec_decode=config.is_spec_decode
@@ -430,7 +468,11 @@ class DecoderRunner(ScheduledModelRunner):
         resource_manager: ResourceManager,
         is_dummy: bool = False,
     ) -> Any:
-        with h2d_cache.active(self._h2d_cache), step_inputs.active(self._step_pack):
+        with (
+            h2d_cache.active(self._h2d_cache),
+            step_inputs.active(self._step_pack),
+            device_copy.active(self._copier),
+        ):
             try:
                 return self._forward_decoder(inputs, resource_manager, is_dummy=is_dummy)
             except BaseException:
@@ -438,6 +480,9 @@ class DecoderRunner(ScheduledModelRunner):
                 step_inputs.discard()
                 if self._h2d_cache is not None:
                     self._h2d_cache.clear()
+                # The copy plan's pack likewise: discarding it runs the staged copies' on_drop callbacks, so the
+                # buffer owners forget the records they made for them.
+                device_copy.discard()
                 raise
 
     def _initialize_moe_workspace_reclaimer(self) -> None:
@@ -819,6 +864,15 @@ class DecoderRunner(ScheduledModelRunner):
                 and not self.cuda_graph_runner.needs_capture(key)
             ):
                 step_inputs.begin()
+            # The copy plan's pack, under the same condition, for a model that declares a plan.
+            if (
+                self._copier is not None
+                and self._copier.merges
+                and can_run_graph
+                and not self.cuda_graph_runner.is_warmup_only
+                and not self.cuda_graph_runner.needs_capture(key)
+            ):
+                device_copy.begin()
             with self._cuda_graph_metadata_prepare_scope(
                 attn_metadata,
                 key,
@@ -910,6 +964,7 @@ class DecoderRunner(ScheduledModelRunner):
                 )
             # No-op unless a pack was opened above and the replay did not issue it.
             step_inputs.flush()
+            device_copy.flush()
             if context_plan is not None and context_plan.handled:
                 outputs = dict(outputs) if isinstance(outputs, dict) else {"logits": outputs}
                 outputs["context_logits_handled"] = True

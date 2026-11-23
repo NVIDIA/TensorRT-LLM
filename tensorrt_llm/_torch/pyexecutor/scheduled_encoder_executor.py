@@ -27,6 +27,7 @@ from tensorrt_llm.llmapi.utils import _reapply_current_thread_affinity_to_all_th
 from tensorrt_llm.logger import logger
 from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import host_profiler_context
 
+from ..memory.monitor import providers as monitor_providers
 from ..moe.fused_moe.moe_comm_timeout_guard import set_moe_comm_warmup
 from .engine.model_setup import build_encoder_runner, build_mm_encoder_runner
 from .engine.runners.encoder import resolve_scheduled_encoder_args
@@ -488,18 +489,31 @@ class ScheduledEncoderExecutor:
 
     def shutdown(self) -> None:
         """Let queued requests finish, stop the loop, then release the loader, the graphs and the model."""
-        if self._worker_thread is not None:
-            self._request_queue.enqueue_shutdown_request()
-            self.shutdown_event.wait()
-            if self._hang_detector.detected():
-                logger.error("Hang detected, shutting down immediately.")
-                return
-            self._worker_thread.join()
-        self._profiler.cleanup()
-        self._model_loader.cleanup()
-        self._runner.release_graphs()
-        del self._runner, self._model_loader
-        release_gc()
+        try:
+            if self._worker_thread is not None:
+                self._request_queue.enqueue_shutdown_request()
+                self.shutdown_event.wait()
+                if self._hang_detector.detected():
+                    logger.error("Hang detected, shutting down immediately.")
+                    return
+                self._worker_thread.join()
+            self._profiler.cleanup()
+            self._model_loader.cleanup()
+            self._runner.release_graphs()
+            del self._runner, self._model_loader
+            release_gc()
+        finally:
+            self._release_memory_monitor()
+
+    def _release_memory_monitor(self) -> None:
+        """Hand the memory monitor back, so the next executor in this process can be monitored.
+
+        ``create_py_executor`` sets the token after construction; releasing
+        it twice is harmless.
+        """
+        token = getattr(self, "_memory_monitor_token", None)
+        if token is not None:
+            monitor_providers.end_executor(token)
 
     # The loop.
 
