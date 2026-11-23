@@ -926,6 +926,7 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
             self._multi_modal_projector = Mistral3MultiModalProjector(
                 model_config).eval()
         else:
+            self.mm_encoder_disabled = True
             logger.info(
                 f"{type(self).__name__}: multimodal encoder disabled "
                 "(disable_mm_encoder=True); serving text-only requests.")

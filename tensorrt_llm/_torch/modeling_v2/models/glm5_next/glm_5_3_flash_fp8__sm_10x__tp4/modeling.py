@@ -688,6 +688,7 @@ class ModelingV2Glm53FlashFp8Sm10xTp4(
     #: The KDA layers reset a fresh request's recurrent state and conv window in their prefill
     #: only, so the engine must not run a one-token prompt as a decode row.
     resets_recurrent_state_in_context = True
+    mm_encoder_disabled = True
 
     def __init__(self, model_config: ModelConfig, *args: Any, **kwargs: Any) -> None:
         # ``route`` declines the same facts; this covers a direct construction.

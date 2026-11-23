@@ -33,7 +33,7 @@ from tensorrt_llm._torch.peft.lora.loaders import HfLoraLoader
 from tensorrt_llm._utils import get_sm_version, mpi_disabled
 from tensorrt_llm.bindings import ipc_nvls_supported
 from tensorrt_llm.functional import PositionEmbeddingType
-from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.multimodal import MultimodalParams, validate_mm_uuids
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.convert_utils import split_matrix_tp
 
@@ -1404,6 +1404,8 @@ class Llama4InputProcessor(BaseMultimodalInputProcessor,
             raise ValueError(
                 f"Missing required key in multimodal embedding: {e}")
 
+        validate_mm_uuids({"image": mm_embeddings},
+                          inputs.get("multi_modal_uuids"))
         # Validate embedding dimensions
         model_hidden_size = self.config.text_config.hidden_size
         for i, embedding in enumerate(mm_embeddings):

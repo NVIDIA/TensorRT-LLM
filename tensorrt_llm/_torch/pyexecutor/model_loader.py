@@ -809,8 +809,8 @@ def _reject_dense_dwdp_update(model: torch.nn.Module, action: str) -> None:
             "dwdp_config.enable_dense to update weights.")
 
 
-_CheckpointStartupMetadata = dict[str,
-                                  str | dict[str, str | bool | None] | None]
+_CheckpointStartupMetadata = dict[str, str | bool | dict[str, str | bool | None]
+                                  | None]
 
 
 def _checkpoint_startup_metadata(
@@ -1448,6 +1448,13 @@ class ModelLoader:
                 self._metrics):
             model, moe_load_balancer = self._timed_load(checkpoint_dir,
                                                         checkpoint_loader)
+
+        # Some models build their encoder in load_weights. Only the loaded
+        # model can report whether this deployment actually omitted it.
+        if getattr(self.llm_args, "disable_mm_encoder", False) and (
+                getattr(model, "mm_encoder_disabled", False) or
+            (hasattr(model, "mm_encoder") and model.mm_encoder is None)):
+            self._startup_metadata["mm_encoder_disabled"] = True
 
         release_seconds = _release_checkpoint_page_cache(
             self._checkpoint_dirs_read)

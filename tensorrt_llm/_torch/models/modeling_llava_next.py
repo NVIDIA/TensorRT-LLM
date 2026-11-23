@@ -20,7 +20,8 @@ from tensorrt_llm._torch.models.checkpoints.hf.llava_next_weight_mapper import \
 from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_mm_disagg
 from tensorrt_llm.inputs.multimodal import (MultimodalItemMetadata,
                                             MultimodalParams,
-                                            split_multimodal_embedding_items)
+                                            split_multimodal_embedding_items,
+                                            validate_mm_uuids)
 
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
                        BaseMultimodalInputProcessor, ContentFormat,
@@ -200,8 +201,10 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
         return expanded, None
 
     def _postprocess(
-        self, input_ids: torch.Tensor, mm_features: Union[torch.Tensor,
-                                                          List[torch.Tensor]]
+        self,
+        input_ids: torch.Tensor,
+        mm_features: Union[torch.Tensor, List[torch.Tensor]],
+        mm_uuids: Optional[Dict[str, Any]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Define model specific variables here before shared logic
         mm_tokens = torch.tensor([self.config.image_token_index
@@ -213,6 +216,8 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
         ## find mm token positions in input_ids
         mm_token_positions = torch.where(torch.isin(input_ids, mm_tokens))[0]
         num_medias = num_mm_tokens = len(mm_token_positions)
+        if mm_uuids is not None:
+            validate_mm_uuids({"image": [None] * num_medias}, mm_uuids)
         if num_medias > 1 and isinstance(mm_features, torch.Tensor):
             mm_features = list(
                 mm_features.split(mm_features.shape[0] // num_medias))
@@ -407,7 +412,8 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
             # image_grid_thw, which LLaVA-NeXT does not use. A bare tensor is
             # left as is: _postprocess splits it across the images.
             mm_features, _ = split_multimodal_embedding_items(mm_features)
-        fused_input_ids, mm_features = self._postprocess(input_ids, mm_features)
+        fused_input_ids, mm_features = self._postprocess(
+            input_ids, mm_features, inputs.get("multi_modal_uuids"))
         multimodal_data = {}
         multimodal_data["multimodal_embedding"] = mm_features
         return fused_input_ids.to(torch.int32).tolist(), {

@@ -32,12 +32,7 @@ from transformers import PreTrainedTokenizerBase
 
 from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.checkpoint_format import CheckpointFormat
-from tensorrt_llm.inputs.multimodal import (MULTIMODAL_CACHE_SALT_KEY,
-                                            MULTIMODAL_NO_CONTENT_HASHES_KEY,
-                                            MultimodalParams, has_mm_items,
-                                            isolate_mm_request,
-                                            request_cache_salt,
-                                            validate_mm_uuids)
+from tensorrt_llm.inputs.multimodal_data import MEDIA_MODALITIES
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.kv_hints import KvHintsInput
 from tensorrt_llm.llmapi import tracing
@@ -62,6 +57,11 @@ from ..executor.utils import (RequestError, create_mpi_comm_session,
 from ..inputs import (PromptInputs, TextPrompt, TokensPrompt,
                       create_input_processor, create_input_processor_with_hash,
                       maybe_compute_mm_embed_cumsum, prompt_inputs)
+from ..inputs.multimodal import (MULTIMODAL_CACHE_SALT_KEY,
+                                 MULTIMODAL_NO_CONTENT_HASHES_KEY,
+                                 MultimodalParams, _has_mm_payload_keys,
+                                 has_mm_items, isolate_mm_request,
+                                 request_cache_salt, validate_mm_uuids)
 from ..logger import logger
 from ..sampling_params import LogitsProcessor, SamplingParams
 from ..scheduling_params import SchedulingParams
@@ -327,6 +327,13 @@ def _append_logits_processor(sampling_params: SamplingParams,
         existing.append(processor)
     else:
         sampling_params.logits_processor = [existing, processor]
+
+
+def _check_multimodal_processor(input_processor: object) -> None:
+    if not getattr(input_processor, "accepts_multimodal_inputs", True):
+        raise ValueError(
+            "This model supports text only. Remove multi_modal_data "
+            "and multi_modal_embeddings from the prompt.")
 
 
 def _multimodal_params_have_encoder_features(
@@ -690,22 +697,38 @@ class BaseLLM:
             return dict(inputs)
         return inputs
 
+    def _check_raw_media_encoder(self) -> None:
+        if (getattr(self.args, "disable_mm_encoder", False)
+                and self.startup_metrics.get("model_loader", {}).get(
+                    "mm_encoder_disabled", False)):
+            raise ValueError("Raw multimodal inputs require a local encoder. "
+                             "This deployment disabled its encoder.")
+
     def _prepare_prompt_inputs(
             self, inputs: PromptInputs) -> Union[TextPrompt, TokensPrompt]:
         inputs = prompt_inputs(inputs)
-        if ("multi_modal_data" in inputs
-                or "multi_modal_embeddings" in inputs) and not getattr(
-                    self.input_processor, "accepts_multimodal_inputs", True):
-            mm_data = inputs.get("multi_modal_data") or {}
-            if has_mm_items(mm_data) or has_mm_items(
-                    inputs.get("multi_modal_embeddings")):
-                raise ValueError(
-                    "This model supports text only. Remove multi_modal_data "
-                    "and multi_modal_embeddings from the prompt.")
-            validate_mm_uuids(mm_data, inputs.get("multi_modal_uuids"))
+        if not ("multi_modal_data" in inputs or "multi_modal_embeddings"
+                in inputs or "multi_modal_uuids" in inputs):
+            return inputs
+        mm_data = inputs.get("multi_modal_data") or {}
+        embeddings = inputs.get("multi_modal_embeddings")
+        has_raw = has_mm_items(mm_data)
+        has_embeddings = has_mm_items(embeddings)
+        if has_raw and has_embeddings:
+            raise ValueError("Provide either multi_modal_data or "
+                             "multi_modal_embeddings.")
+        if has_raw or has_embeddings:
+            _check_multimodal_processor(self.input_processor)
+        else:
+            validate_mm_uuids(mm_data or embeddings or {},
+                              inputs.get("multi_modal_uuids"))
+        if (not has_raw and "multi_modal_data" in inputs
+                or not has_embeddings and "multi_modal_embeddings" in inputs):
             inputs = inputs.copy()
-            inputs.pop("multi_modal_data", None)
-            inputs.pop("multi_modal_embeddings", None)
+            if not has_raw:
+                inputs.pop("multi_modal_data", None)
+            if not has_embeddings:
+                inputs.pop("multi_modal_embeddings", None)
         return inputs
 
     @classmethod
@@ -912,6 +935,13 @@ class BaseLLM:
             prompt_token_ids = inputs.prompt_token_ids
             prompt = None
             multimodal_params = inputs.multimodal_params
+            if multimodal_params is not None:
+                data = multimodal_params.multimodal_data or {}
+                if _has_mm_payload_keys(data):
+                    _check_multimodal_processor(self.input_processor)
+                    if not is_gen_only and any(
+                            data.get(m) is not None for m in MEDIA_MODALITIES):
+                        self._check_raw_media_encoder()
             preprocessed_encoder_input_token_ids = inputs.encoder_input_token_ids
             if preprocessed_encoder_input_token_ids is not None:
                 preprocessed_encoder_input_token_ids = self._normalize_token_ids(
@@ -1151,6 +1181,8 @@ class BaseLLM:
                                     (("multi_modal_data" in inputs
                                       or "multi_modal_embeddings" in inputs))):
             if 'multi_modal_data' in inputs:
+                if not is_gen_only:
+                    self._check_raw_media_encoder()
                 # TODO: The current design uses a wrapper for existing input processor (input_processor_with_hash)
                 # to handle/add multimodal hashes, positions, and lengths. Now we only support image modality.
                 # In the future, we should refactor this to:

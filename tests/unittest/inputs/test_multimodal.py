@@ -1167,17 +1167,85 @@ def test_text_only_model_accepts_empty_multimodal_inputs(inputs: dict) -> None:
     assert "multi_modal_data" in inputs or "multi_modal_embeddings" in inputs
 
 
-def test_text_only_model_validates_uuids_for_empty_media() -> None:
+@pytest.mark.parametrize(
+    "media, error",
+    [
+        ({}, "which multi_modal_data does not have"),
+        ({"multi_modal_data": {"image": []}}, "UUID list length"),
+    ],
+    ids=["no_media_field", "empty_image_list"],
+)
+def test_text_only_model_validates_uuids_for_empty_media(media, error) -> None:
     llm = _llm_with_mock_executor(DefaultInputProcessor("unused", None, Mock()))
     llm.args.multimodal_config = None
-    with pytest.raises(ValueError, match="UUID list length"):
+    with pytest.raises(ValueError, match=error):
         llm.preprocess(
             {
                 "prompt_token_ids": [1, 2],
-                "multi_modal_data": {"image": []},
+                **media,
                 "multi_modal_uuids": {"image": ["unused"]},
             }
         )
+
+
+def test_text_only_admission_of_preprocessed_media_and_decode_metadata() -> None:
+    from tensorrt_llm.llmapi.llm import PreprocessedInputs
+
+    llm = _llm_with_mock_executor(DefaultInputProcessor("unused", None, Mock()))
+    params = MultimodalParams(multimodal_data={"multimodal_embedding": torch.zeros(2, 4)})
+    with pytest.raises(ValueError, match="supports text only"):
+        llm.generate_async(PreprocessedInputs([1, 2], params))
+    llm._executor.generate_async.assert_not_called()
+
+    params = MultimodalParams(multimodal_data={"mrope_config": {"mrope_position_deltas": [0]}})
+    with patch("tensorrt_llm.llmapi.llm.RequestOutput._from_generation_result"):
+        llm.generate_async(PreprocessedInputs([1, 2], params))
+    assert llm._executor.generate_async.call_args.kwargs["multimodal_params"] is params
+
+
+def test_raw_media_admission_uses_the_loaded_encoder() -> None:
+    from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
+    from tensorrt_llm.disaggregated_params import DisaggregatedParams
+    from tensorrt_llm.llmapi.llm import PreprocessedInputs
+
+    llm = _llm_with_mock_executor(_ProbeFakeProcessor())
+    llm.args.disable_mm_encoder = True
+    llm.args.multimodal_config = None
+
+    def load_encoder(encoder):
+        model = torch.nn.Module()
+        model.mm_encoder = encoder
+        loader = ModelLoader(llm.args, SimpleNamespace(rank=0), None, None, 8, 8)
+        with patch.object(loader, "_timed_load", return_value=(model, None)):
+            loader.load("unused", None)
+        llm._startup_metrics = {"model_loader": loader.startup_metadata}
+
+    load_encoder(None)
+    with pytest.raises(ValueError, match="require a local encoder"):
+        llm.preprocess(_PROBE_INPUTS)
+
+    media = MultimodalParams(multimodal_data={"image": {"pixel_values": torch.zeros(3, 2, 2)}})
+    with pytest.raises(ValueError, match="require a local encoder"):
+        llm.generate_async(PreprocessedInputs([1, 2], media))
+    llm._executor.generate_async.assert_not_called()
+
+    embedding = MultimodalParams(multimodal_data={"multimodal_embedding": torch.zeros(2, 4)})
+    with patch("tensorrt_llm.llmapi.llm.RequestOutput._from_generation_result"):
+        llm.generate_async(PreprocessedInputs([1, 2], embedding))
+    assert llm._executor.generate_async.call_args.kwargs["multimodal_params"] is embedding
+
+    gen_only = DisaggregatedParams(request_type="generation_only")
+    with (
+        patch.object(MultimodalParams, "to_handle"),
+        patch("tensorrt_llm.llmapi.llm.RequestOutput._from_generation_result"),
+    ):
+        prepared = llm.preprocess(_PROBE_INPUTS, disaggregated_params=gen_only)
+        llm.generate_async(prepared, disaggregated_params=gen_only)
+    assert llm._executor.generate_async.call_args.kwargs["disaggregated_params"] is gen_only
+
+    load_encoder(torch.nn.Identity())
+    with patch.object(MultimodalParams, "to_handle"):
+        assert llm.preprocess(_PROBE_INPUTS).multimodal_params.multimodal_input is not None
 
 
 _MM_SALT = "mm-no-item-spans-" + "0" * 32

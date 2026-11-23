@@ -415,6 +415,7 @@ class BaseMultimodalInputProcessor(ABC):
         return TextPrompt(
             prompt=prompt,
             multi_modal_data=inputs.get("multi_modal_data"),
+            multi_modal_uuids=inputs.get("multi_modal_uuids"),
             mm_processor_kwargs=inputs.get("mm_processor_kwargs") or {},
         )
 

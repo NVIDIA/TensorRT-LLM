@@ -982,6 +982,41 @@ def _make_qwen_vl_embedding_processor(model: str, prompt_ids: List[int]):
 
 
 @pytest.mark.cpu_only
+def test_qwen_attachment_admission_with_empty_raw_media():
+    from tensorrt_llm.inputs.multimodal import MultimodalParams
+    from tensorrt_llm.llmapi.llm import BaseLLM
+
+    processor, width = _make_qwen_vl_embedding_processor("qwen3", [7, 11, 12, 13, 8])
+    processor.processor.mm_special_token_ids = None
+    llm = object.__new__(BaseLLM)
+    llm.shutdown = MagicMock()
+    llm.input_processor = processor
+    llm.args = SimpleNamespace(multimodal_config=None)
+    llm._hf_model_config = processor.config
+    llm._prepare_sampling_params = MagicMock(return_value=SamplingParams())
+    tensor = torch.zeros(6, width)
+    prompt = {
+        "prompt": "image",
+        "multi_modal_embeddings": {
+            "image": [{"mm_embeddings": tensor, "image_grid_thw": [1, 4, 6]}]
+        },
+        "multi_modal_uuids": {"image": ["image-id"]},
+    }
+    with patch.object(MultimodalParams, "to_handle"):
+        regular = llm.preprocess(prompt)
+        empty_raw = llm.preprocess({**prompt, "multi_modal_data": {}})
+    assert regular.prompt_token_ids == empty_raw.prompt_token_ids == [7, 11] + [12] * 6 + [13, 8]
+    for result in (regular, empty_raw):
+        assert result.multimodal_params.multimodal_data["multimodal_embedding"][0] is tensor
+        assert result.multimodal_params.multimodal_input.multimodal_uuids == ["image-id"]
+
+    with pytest.raises(ValueError, match="either multi_modal_data or multi_modal_embeddings"):
+        llm.preprocess({**prompt, "multi_modal_data": {"image": [Image.new("RGB", (2, 2))]}})
+    with pytest.raises(ValueError, match="UUID list length"):
+        llm.preprocess({**prompt, "multi_modal_uuids": {"image": ["a", "b"]}})
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("model", ["qwen2.5", "qwen3"])
 @pytest.mark.parametrize(
     "sizes",

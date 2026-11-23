@@ -33,7 +33,8 @@ from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalItemMetadata,
-    MultimodalItemPartition, MultimodalParams, split_multimodal_embedding_items)
+    MultimodalItemPartition, MultimodalParams, split_multimodal_embedding_items,
+    validate_mm_uuids)
 
 from ..._utils import async_tensor_h2d, nvtx_range
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
@@ -1333,6 +1334,8 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             multimodal_embedding["image"])
         if not image_embeddings:
             raise ValueError("At least one image embedding is required")
+        uuids = validate_mm_uuids({"image": image_embeddings},
+                                  inputs.get("multi_modal_uuids"))
         merge_size = self.config.vision_config.spatial_merge_size
         image_grid_thw = []
         for index, image_embedding in enumerate(image_embeddings):
@@ -1378,6 +1381,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             mrope_input_ids, torch.tensor(image_grid_thw, dtype=torch.long),
             None, attention_mask, None)
 
+        multimodal_params.multimodal_input.multimodal_uuids = uuids.get("image")
         multimodal_data = multimodal_params.multimodal_data
         multimodal_data["multimodal_embedding"] = image_embeddings
         multimodal_data["mrope_config"] = mrope_config
