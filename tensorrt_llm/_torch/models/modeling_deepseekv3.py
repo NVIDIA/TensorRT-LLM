@@ -728,6 +728,11 @@ class DeepseekV3WeightLoader:
 
 
 class DeepseekV3MTPHead(nn.Module):
+    # forward(x, lm_head, attn_metadata, True) is just this rank's vocab shard
+    # of lm_head(x) outside attention DP, so a fused LM-head kernel may take x
+    # instead (bf16_draft_head.is_plain_mtp_shared_head). A subclass whose
+    # forward normalizes or transforms x sets it to False.
+    plain_lm_head_projection = True
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         super().__init__()

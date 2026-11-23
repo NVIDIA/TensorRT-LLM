@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the moe/k3_moe catalog entry: trtllm::k3_moe on its caller-owned state, both builds.
+"""GPU test for the moe/k3_moe op: trtllm::k3_moe on its caller-owned state, both builds.
 
 One GPU (sm_100), one rank of the Kimi K3 TP16 deployment's routed experts: experts TP4 x EP4, so 224 of the 896
 experts are local (global ids [224, 448)) with intermediate 768 per rank. The experts are random checkpoint-format

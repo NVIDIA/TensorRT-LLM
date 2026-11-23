@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Kimi K3's KDA prefill inputs and an fp64 token-by-token reference, for the ssm/ prefill entry tests.
 
-The two prefill paths of Kimi K3's KDA layer (``ssm/kda_prefill`` from four 64-token chunks up, ``ssm/chunk_kda``
-below) compute the same recurrence; both tests check against this one.
+``test_modeling_v2_kda_prefill.py`` uses the constants and comparison helpers; ``test_kda_prefill.py`` also uses
+``kimi_k3_inputs`` and ``recurrent_reference``.
 """
 
 import math
@@ -18,7 +18,7 @@ CHUNK = 64
 
 
 def kimi_k3_inputs(heads: int, tokens: int, gen: torch.Generator, batch_rows: int = 1) -> Dict:
-    """q / k / v / g / beta / A_log / dt_bias as Kimi K3's layer hands them to either prefill path."""
+    """q / k / v / g / beta / A_log / dt_bias as Kimi K3's layer hands them to the prefill entry."""
     shape = (batch_rows, tokens, heads, HEAD_DIM)
 
     def unit(t):  # q and k arrive L2-normalized per head (the layer's post-conv step)

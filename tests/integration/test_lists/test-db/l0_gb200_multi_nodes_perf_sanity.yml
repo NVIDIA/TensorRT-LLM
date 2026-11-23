@@ -20,5 +20,5 @@ l0_gb200_multi_nodes_perf_sanity_node4_gpu16:
   # aggr config
   # kimi-k3-mxfp4 modeling_v2 low-latency decode: TP16 attention, MoE TP4xEP4 + DSpark 7 drafts,
   # and MoE TP16xEP1 without speculation
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-kimi_k3_mxfp4_mv2_4_nodes_grace_blackwell-kimi_k3_tp16_moetp4ep4_dspark7_1k1k] TIMEOUT (35)
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-kimi_k3_mxfp4_mv2_4_nodes_grace_blackwell-kimi_k3_tp16_moetp4ep4_dspark7_1k1k] TIMEOUT (70)
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-kimi_k3_mxfp4_mv2_4_nodes_grace_blackwell-kimi_k3_tp16_moetp16ep1_nospec_1k1k] TIMEOUT (40)

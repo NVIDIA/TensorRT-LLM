@@ -247,6 +247,8 @@ torch::Tensor dtype_mxe2m1_block_scale_moe_runner(torch::optional<torch::Tensor>
     void* expert_weights_ptr = args.topk_weights ? args.topk_weights : expert_weights.data_ptr();
 
     int32_t const sf_block_size = 32;
+    TORCH_CHECK(args.valid_hidden_size.value_or(args.hidden_size) % sf_block_size == 0,
+        "valid_hidden_size must be a multiple of 32.");
     // allocate workspace for activation/gemm/finalize kernels
     auto const gemm1_output_type
         = dtype == btg::Dtype::Bfloat16 ? at::ScalarType::BFloat16 : at::ScalarType::Float8_e4m3fn;

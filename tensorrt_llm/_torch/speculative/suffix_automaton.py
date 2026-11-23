@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """
 Suffix Automaton Speculative Decoding Module
 
@@ -193,6 +195,7 @@ class SuffixAutomatonManager(BaseResourceManager):
         self._gpu_match_len: Optional[torch.Tensor] = None
         self._gpu_draft_tokens: Optional[torch.Tensor] = None
         self._gpu_batch_indices: Optional[torch.Tensor] = None
+        self._gpu_nondummy_mask: Optional[torch.Tensor] = None
 
         # Global pool buffers (allocated lazily in _ensure_workspace)
         self._gpu_active_slot_mask: Optional[torch.Tensor] = None
@@ -703,6 +706,9 @@ class SuffixAutomatonManager(BaseResourceManager):
         self._gpu_match_len = None
         self._gpu_draft_tokens = None
         self._gpu_batch_indices = None
+        self._gpu_nondummy_mask = None
+        self._cpu_batch_indices = None
+        self._cpu_nondummy_mask = None
         self._gpu_active_slot_mask = None
         self._gpu_match_slot = None
         self._pending_mask_updates.clear()
