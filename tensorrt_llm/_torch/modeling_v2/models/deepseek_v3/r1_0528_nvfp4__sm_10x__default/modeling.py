@@ -99,7 +99,13 @@ from tensorrt_llm._torch.modeling_v2.catalog.comm.reducescatter import reducesca
 from tensorrt_llm._torch.modeling_v2.catalog.gemm.bmm_out import bmm_out
 from tensorrt_llm._torch.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
 from tensorrt_llm._torch.modeling_v2.catalog.gemm.nvfp4_gemm import nvfp4_gemm
-from tensorrt_llm._torch.modeling_v2.catalog.moe.eplb import EplbLayer, Rows, rows_within
+from tensorrt_llm._torch.modeling_v2.catalog.moe.eplb import (
+    EplbLayer,
+    Rows,
+    TokenView,
+    eplb_call,
+    rows_within,
+)
 from tensorrt_llm._torch.modeling_v2.catalog.moe.fp4_block_scale_moe_runner import (  # noqa: E501
     fp4_block_scale_moe_runner,
 )
@@ -396,10 +402,11 @@ class DeepseekV3DefaultModelingV2(DecoderModel):
         )
         self.eplb_layers: dict[int, EplbLayer] = {}
         if self.dims.eplb is not None:
+            view = TokenView.ALLTOALL if self.moe_alltoall else TokenView.GATHERED
             for i, slots in self.dims.slots.items():
                 repeat = model_config.spec_config.max_draft_len if i == self.dims.num_layers else 1
                 self.eplb_layers[i] = EplbLayer.register(
-                    slots, cfg.num_experts_per_tok, repeat, alltoall=self.moe_alltoall
+                    slots, cfg.num_experts_per_tok, repeat, view=view
                 )
 
         self._rope: dict | None = None
@@ -807,12 +814,12 @@ def _experts(
             cfg.num_experts_per_tok,
             float(cfg.routed_scaling_factor),
         )
-        if L.eplb is not None:
-            start = k * _MOE_MAX_T
-            rows = rows_within(tokens, start, start + chunk.shape[0])
-            topk_ids = L.eplb.route(topk_ids, rows, last=k == len(chunks) - 1)
-        xq, xsf = fp4_quantize(chunk, L.moe_gscale, _SF_VEC, False, _SF_LINEAR)
-        parts.append(_trunk_runner(core, L, xq, xsf, topk_ids, topk_w))
+        start = k * _MOE_MAX_T
+        rows = rows_within(tokens, start, start + chunk.shape[0])
+        last = k == len(chunks) - 1
+        with eplb_call(L.eplb, topk_ids, rows=rows, last=last) as (slot_ids, _):
+            xq, xsf = fp4_quantize(chunk, L.moe_gscale, _SF_VEC, False, _SF_LINEAR)
+            parts.append(_trunk_runner(core, L, xq, xsf, slot_ids, topk_w))
     if L.eplb is not None:
         L.eplb.close()
     return parts[0] if len(parts) == 1 else torch.cat(parts, 0)
@@ -918,20 +925,20 @@ def _experts_alltoall(
             topk_w, topk_ids = _no_routes(chunk, cfg.num_experts_per_tok, chunk.dtype)
             xq = chunk.new_empty((0, chunk.shape[1] // 2), dtype=torch.uint8)
             xsf = chunk.new_empty((0, chunk.shape[1] // _SF_VEC), dtype=torch.uint8)
-        statistic = None
-        if L.eplb is not None:
-            topk_ids = L.eplb.route(topk_ids, last=r == len(rounds) - 1)
-            statistic = L.eplb.local_statistic()
-        rq, rsf, rids, rw = moe_alltoall_dispatch(a2a, xq, xsf, topk_ids, topk_w, sizes, statistic)
-        if statistic is not None:
-            L.eplb.gathered(moe_alltoall_gathered_statistic(a2a))
-        run = functools.partial(_trunk_runner, core, L)
-        rows = moe_alltoall_combine_rows(a2a, max(sizes), chunk.shape[1])
-        outs.append(
-            moe_alltoall_combine(
-                a2a, _received_in_runner_calls(run, _MOE_MAX_T, rows, rq, rsf, rids, rw)
+        with eplb_call(L.eplb, topk_ids, last=r == len(rounds) - 1) as (slot_ids, _):
+            statistic = L.eplb.local_statistic() if L.eplb is not None else None
+            rq, rsf, rids, rw = moe_alltoall_dispatch(
+                a2a, xq, xsf, slot_ids, topk_w, sizes, statistic
             )
-        )
+            if statistic is not None:
+                L.eplb.gathered(moe_alltoall_gathered_statistic(a2a))
+            run = functools.partial(_trunk_runner, core, L)
+            rows = moe_alltoall_combine_rows(a2a, max(sizes), chunk.shape[1])
+            outs.append(
+                moe_alltoall_combine(
+                    a2a, _received_in_runner_calls(run, _MOE_MAX_T, rows, rq, rsf, rids, rw)
+                )
+            )
     if L.eplb is not None:
         L.eplb.close()
     return outs[0] if len(outs) == 1 else torch.cat(outs, 0)
@@ -1051,10 +1058,10 @@ def _mtp_experts(
             cfg.num_experts_per_tok,
             float(cfg.routed_scaling_factor),
         )
-        if M.eplb is not None:
-            start = k * _MTP_MAX_T
-            topk_ids = M.eplb.route(topk_ids, rows_within(tokens, start, start + chunk.shape[0]))
-        parts.append(_mtp_runner(core, M, chunk, topk_ids, topk_w))
+        start = k * _MTP_MAX_T
+        rows = rows_within(tokens, start, start + chunk.shape[0])
+        with eplb_call(M.eplb, topk_ids, rows=rows) as (slot_ids, _):
+            parts.append(_mtp_runner(core, M, chunk, slot_ids, topk_w))
     return parts[0] if len(parts) == 1 else torch.cat(parts, 0)
 
 
@@ -1129,22 +1136,22 @@ def _mtp_experts_alltoall(
             )
         else:
             topk_w, topk_ids = _no_routes(chunk, cfg.num_experts_per_tok, torch.float32)
-        statistic = None
-        if M.eplb is not None:
-            topk_ids = M.eplb.route(topk_ids, last=r == len(rounds) - 1)
-            statistic = M.eplb.local_statistic()
-        rx, _, rids, rw = moe_alltoall_dispatch(
-            a2a, chunk, None, topk_ids, topk_w, sizes, statistic
-        )
-        if statistic is not None:
-            M.eplb.gathered(moe_alltoall_gathered_statistic(a2a))
-        run = functools.partial(_mtp_runner, core, M, alltoall=True, tuner_num_tokens=sum(sizes))
-        rows = moe_alltoall_combine_rows(a2a, max(sizes), chunk.shape[1])
-        outs.append(
-            moe_alltoall_combine(
-                a2a, _received_in_runner_calls(run, _MTP_MAX_T, rows, rx, rids, rw)
+        with eplb_call(M.eplb, topk_ids, last=r == len(rounds) - 1) as (slot_ids, _):
+            statistic = M.eplb.local_statistic() if M.eplb is not None else None
+            rx, _, rids, rw = moe_alltoall_dispatch(
+                a2a, chunk, None, slot_ids, topk_w, sizes, statistic
             )
-        )
+            if statistic is not None:
+                M.eplb.gathered(moe_alltoall_gathered_statistic(a2a))
+            run = functools.partial(
+                _mtp_runner, core, M, alltoall=True, tuner_num_tokens=sum(sizes)
+            )
+            rows = moe_alltoall_combine_rows(a2a, max(sizes), chunk.shape[1])
+            outs.append(
+                moe_alltoall_combine(
+                    a2a, _received_in_runner_calls(run, _MTP_MAX_T, rows, rx, rids, rw)
+                )
+            )
     return outs[0] if len(outs) == 1 else torch.cat(outs, 0)
 
 

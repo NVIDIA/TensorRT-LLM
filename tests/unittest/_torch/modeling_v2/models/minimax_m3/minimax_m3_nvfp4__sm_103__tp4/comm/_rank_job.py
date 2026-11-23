@@ -3,7 +3,7 @@
 """Run this target's collective rank job from pytest, and report what it did.
 
 The same contract as ``tests/unittest/_torch/modeling_v2/comm/_rank_job.py``: the
-launcher beside this file owns the per-device rank processes and the deadline
+launcher selected below owns the per-device rank processes and the deadline
 that kills a wedged collective; this only selects the devices, starts it in a
 fresh interpreter (by file path: this tree is not a package) and turns its exit
 code into an assertion.
@@ -48,9 +48,10 @@ def _load_launcher_constants(launcher: Path):
     return module
 
 
-def run(entry: str) -> str:
+def run(entry: str, directory: Path | None = None) -> str:
     """Run ``_<entry>_op_matrix``'s launcher over ``WORLD_SIZE`` devices; returns its stdout."""
-    launcher = Path(__file__).resolve().with_name(f"_{entry}_op_matrix.py")
+    base = Path(__file__).resolve().parent if directory is None else Path(directory).resolve()
+    launcher = base / f"_{entry}_op_matrix.py"
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=_devices())
 
     # Match the package resolved by pytest: an unbuilt checkout must not

@@ -808,6 +808,7 @@ select = [
     "I", # isort
     # "N",   # pep8 naming # no naming convention enforced for now the reduce the burden
     "PLE", # pylint errors
+    "TID251",
     "W",   # pycodestyle warnings
 ]
 extend-ignore = [
@@ -827,6 +828,10 @@ extend-ignore = [
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401", "F403"]
 "*/_[a-zA-Z]*" = ["D"]                       # Private packages (_abc/*.py) or modules (_xyz.py)
+
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"tests".msg = "Import test helpers through __extra_import_path__ (tests/test_common/magic_import.py)"
 
 
 [tool.ruff.lint.pycodestyle]

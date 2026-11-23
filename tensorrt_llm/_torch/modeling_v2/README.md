@@ -422,11 +422,15 @@ the example.
    `local_slots`, and fill slot `j` from checkpoint expert `slot_experts[j]`.
    An expert in two slots is loaded twice, and a rank reads only the experts
    its slots hold.
-4. **Routing.** After the router's top-k, map the expert ids to slot ids
-   with `EplbLayer.route`, and call the expert kernels with `num_slots` as
-   the expert count and `[slot_offset, slot_offset + local_slots)` as this
-   rank's window. Every rank that routes the same tokens gets the same slots,
-   so a target that gathers its tokens before routing stays consistent.
+4. **Routing.** After the router's top-k, run each expert call inside
+   `eplb_call(eplb, topk_ids)`, which yields the slot ids and the call's
+   plan, and call the expert kernels inside it with `num_slots` as the expert
+   count and `[slot_offset, slot_offset + local_slots)` as this rank's
+   window. Pass `None` for `eplb` without EPLB, and the slot ids are the
+   expert ids. Every rank that routes the same tokens gets the same slots, so
+   a target that gathers its tokens before routing stays consistent. Static
+   EPLB's plan is None; the routing is a context so that a mode that places
+   replicas per call can keep its plan until the kernels are enqueued.
 
 Then list the mode in the target class, `EPLB_MODES = frozenset({"static"})`,
 and gate the layouts in `route` on `moe_eplb_mode(model_config)`.
@@ -459,10 +463,12 @@ target does three more, and lists `"online"` in `EPLB_MODES`:
    computed while taking the views, keeps the old expert's value after a
    move. The balancer needs host-accessible device memory, which Grace
    systems have and x86 systems get from GDRCopy.
-7. **The forward.** `EplbLayer.route(ids, rows, last)` takes the layer from
-   the balancer on its first call of a forward and records the router's expert ids.
-   `rows` names the rows that are tokens when the rest are padding, such as
-   the rows an attention-DP gather pads. `EplbLayer.close()` hands the layer
+7. **The forward.** `eplb_call(eplb, ids, rows=..., last=...)` takes the layer
+   from the balancer on its first call of a forward and records the router's
+   expert ids; its plan stays None, since the slots change only between
+   forwards. `rows` names the rows that are tokens when the rest are padding,
+   such as the rows an attention-DP gather pads, and `last` marks the
+   forward's last call of the layer. `EplbLayer.close()` hands the layer
    back after its last expert kernel of the forward. The balancer takes the
    layers in their registration order every forward and waits for each to
    come back, so call `close` once per forward per layer, before the next
@@ -471,11 +477,12 @@ target does three more, and lists `"online"` in `EPLB_MODES`:
    draft step is closed after the last draft step.
 8. **Under an alltoall.** A target whose ranks route their own tokens and
    exchange them with an alltoall (`comm/moe_alltoall`) registers its layers
-   with `EplbLayer.register(..., alltoall=True)`. Each rank then counts only
-   its own tokens' experts, so the histogram the balancer places by is the
-   sum the forward's last dispatch gathers: pass `EplbLayer.local_statistic()`
-   to that dispatch, and the dispatch's gathered statistic to
-   `EplbLayer.gathered()`. Every rank routes every round, also with no tokens
+   with `EplbLayer.register(..., view=TokenView.ALLTOALL)` and runs the
+   dispatch, the expert kernels and the combine inside `eplb_call`. Each rank
+   then counts only its own tokens' experts, so the histogram the balancer
+   places by is the sum the forward's last dispatch gathers: pass
+   `EplbLayer.local_statistic()` to that dispatch, and the dispatch's gathered
+   statistic to `EplbLayer.gathered()`. Every rank routes every round, also with no tokens
    of its own, so every rank carries its histogram on the same dispatch. The
    replica choice is offset by the rank, which spreads the ranks' tokens over
    an expert's replicas; a target that gathers its tokens keeps it
@@ -539,12 +546,30 @@ test directory, the layout is up to the target.
 | Tests | Location |
 |---|---|
 | Routing, loader and CI selection | `tests/unittest/_torch/modeling_v2/test_modeling_v2_*.py` |
-| Catalog operations | `tests/unittest/_torch/modeling_v2/<category>/` |
+| Catalog operations | `tests/unittest/_torch/modeling_v2/<category>/`; MoE op contracts in `moe/ops/` |
 | Family routing | `tests/unittest/_torch/modeling_v2/models/<family>/` |
 | Family-shared code | `tests/unittest/_torch/modeling_v2/models/<family>/<path of the code>/` |
 | Target code | `tests/unittest/_torch/modeling_v2/models/<family>/<target>/` |
 | Whole-model accuracy | `tests/integration/defs/accuracy/modeling_v2/<family>/<target>/` |
 | Accuracy references | `tests/integration/defs/accuracy/references/` |
+
+MoE-specific tests follow the modeling code's layout within their family or
+target. Tests that exercise a target configuration can stay with that target even
+when the op implementation is shared by the family. Shared MoE op contracts live
+in `moe/ops/`; shared MoE test helpers and their CPU guards live in `moe/`. These
+are test categories, rather than an extra `ops/` level in the production catalog.
+
+Target component layouts can currently mix `<category>/` and `ops/<category>/`:
+the MoE reorganization does not move unrelated component tests. Resolve existing
+tests by their collected entry file. New MoE op tests use the model's source-mirrored
+directory or shared `moe/ops/`, even when only a category-only test directory exists.
+Register a new test directory in CI with the required hardware, rank count and
+execution mode; path resolution alone does not register it. Other components can
+continue placing new entries in their existing component directories.
+Any later consolidation of a whole component must update its imports and CI lists
+together, preserving the existing hardware and rank requirements. Multi-rank
+collective tests belong with the target's communication tests so single-GPU MoE
+directory entries can collect all ordinary MoE tests.
 
 CI selects tests by the scope of the change:
 
@@ -555,6 +580,10 @@ CI selects tests by the scope of the change:
 * A change to a catalog operation runs its category's tests and the tests of
   every target that imports it. A change to code every model shares runs all
   Modeling V2 tests.
+
+Exact source-to-test associations retain additional named family and component
+checks outside these prefixes. See the [CBTS selection rules](../../../../jenkins/scripts/cbts/cbts/rules/README.md)
+for these associations and shared-helper selection.
 
 A target is a directory under `models/<family>/` whose class the family's
 `route` returns. Give each target a mirrored unit test directory and an

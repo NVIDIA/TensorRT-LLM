@@ -60,13 +60,6 @@ CANCELLED = "the job was cancelled through the spool"
 ACCURACY = 2
 #: Every other check: the feature units, the variants, the proofs, delivery.
 FEATURE = 1
-#: The tune campaign's measurements and candidates: background work, below every job of the
-#: onboarding (a worker's own jobs queue at 0). A negative class never ages (``scheduler``), so a
-#: campaign's job, however long it waits, never ranks ahead of the onboarding's or holds one back.
-PERF = -1
-#: A tuner's own jobs (its tests, micro-benches, A/Bs): below the campaign's measurements, which
-#: run one at a time and hold back every candidate behind the one being measured.
-TUNER = -2
 
 _local = threading.local()
 
@@ -87,7 +80,7 @@ def job_priority(priority: int) -> Iterator[None]:
 
 
 def current_job_priority() -> int:
-    """The class this thread's jobs queue at; the scheduler's 0 by default (never :data:`PERF`)."""
+    """The class this thread's jobs queue at; the scheduler's 0 by default (a worker's own jobs)."""
     priority = getattr(_local, "priority", None)
     return 0 if priority is None else int(priority)
 
@@ -119,7 +112,7 @@ class SpoolCommandExecutor(CommandExecutor):
         if nodes < 1:
             raise ValueError("nodes must be positive")
         self.nodes = nodes
-        #: The class each job queues at (:data:`ACCURACY`, :data:`FEATURE`, :data:`PERF`).
+        #: The class each job queues at (:data:`ACCURACY`, :data:`FEATURE`, or 0).
         self.priority = priority
         #: The checkout a job runs against (its working directory and first ``PYTHONPATH``
         #: entry); the session refuses a result that imported the package from anywhere else.
@@ -340,10 +333,8 @@ __all__ = [
     "ACCURACY",
     "CANCELLED",
     "FEATURE",
-    "PERF",
     "SESSION_LOSS_REASONS",
     "SpoolCommandExecutor",
-    "TUNER",
     "current_job_priority",
     "job_priority",
     "select_command_executor",

@@ -1,0 +1,27 @@
+# arch: MODEL_CLASS_MAPPING key; required when model has get_model_defaults. Add when adding entries.
+- model: Qwen/Qwen3-30B-A3B
+  arch: Qwen3MoeForCausalLM
+  config_path: examples/configs/curated/qwen3.yaml
+  scenario: Max Throughput
+  gpu_compatibility: "Any"
+- model: Qwen/Qwen3-30B-A3B
+  arch: Qwen3MoeForCausalLM
+  config_path: examples/configs/curated/qwen3-disagg-prefill.yaml
+  scenario: Disaggregated Prefill
+  gpu_compatibility: "Any"
+  disagg: true
+- model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
+  config_path: examples/configs/curated/gpt-oss-120b-latency.yaml
+  scenario: Min Latency
+  gpu_compatibility: "Any"
+- model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
+  config_path: examples/configs/curated/gpt-oss-120b-throughput.yaml
+  scenario: Max Throughput
+  gpu_compatibility: "Any"
+- model: nvidia/Llama-3.3-70B-Instruct-FP8
+  arch: LlamaForCausalLM
+  config_path: examples/configs/curated/llama-3.3-70b.yaml
+  scenario: Max Throughput
+  gpu_compatibility: "Any"

@@ -34,7 +34,8 @@ class BeamDispatchCombine(OpWrapper):
     The provider is called once per selected expert, with at least one row; an expert no
     token selected is never called. Returns `output`. `expert_ids`, `mixing_weights` and
     `hidden_states` are read, never written; the weights are used as given, without
-    re-normalization or bias.
+    re-normalization or bias. Expert ids must be nonnegative and distinct within each
+    token; ``is_valid`` checks these preconditions when catalog validation is enabled.
     """
 
     ARCHS = frozenset({Arch.SM_103})
@@ -93,6 +94,21 @@ class BeamDispatchCombine(OpWrapper):
             route = (out.float() * flat_weights[assigned].unsqueeze(-1)).to(torch.bfloat16)
             acc.index_add_(0, expert_tokens, route.float())
         return (acc * routed_scaling_factor).to(torch.bfloat16)
+
+    def is_valid(
+        self,
+        hidden_states: torch.Tensor,
+        expert_ids: torch.Tensor,
+        mixing_weights: torch.Tensor,
+        expert_provider: Callable[[int, torch.Tensor], torch.Tensor],
+        routed_scaling_factor: float,
+    ) -> None:
+        """Check routing values only when catalog validation is enabled."""
+        assert torch.all(expert_ids >= 0), "expert_ids must be nonnegative"
+        ordered = expert_ids.sort(dim=-1).values
+        assert torch.all(ordered[:, 1:] != ordered[:, :-1]), (
+            "expert_ids must be distinct within each token"
+        )
 
     def reference(
         self,

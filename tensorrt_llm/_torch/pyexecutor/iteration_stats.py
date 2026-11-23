@@ -32,6 +32,9 @@ class IterationStatsRecord(NamedTuple):
     gpu_forward_time_ms: float | None = None
     mm_encoder_stats: dict[str, object] | None = None
     executor_loop: dict[str, object] | None = None
+    # The record was taken without a forward pass: it reports the queues, and
+    # its duration and per-loop timings are not measurements.
+    is_queue_snapshot: bool = False
 
     @classmethod
     def from_tuple(cls, stats: tuple) -> IterationStatsRecord:
@@ -86,4 +89,7 @@ class IterationStatsRecord(NamedTuple):
         for name, value in optional_fields:
             if value is not None:
                 stats[name] = value
+        # Measured records do not have the key.
+        if self.is_queue_snapshot:
+            stats["isQueueSnapshot"] = True
         return stats

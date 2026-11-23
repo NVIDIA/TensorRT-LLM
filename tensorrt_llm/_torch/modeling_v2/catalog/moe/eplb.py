@@ -15,9 +15,14 @@ and this module is what they share:
    way.
 2. `EplbLayer.register`: register the layer with the engine's balancer, at
    construction and in the order the layers run.
-3. `EplbLayer.route`: map the router's expert ids to slot ids before the expert
-   GEMMs, which then take `num_slots` as their expert count and this rank's
-   slot window as their local experts.
+3. `eplb_call`: around each expert call, map the router's expert ids to slot
+   ids for the expert GEMMs run inside it, which then take `num_slots` as their
+   expert count and this rank's slot window as their local experts.
+
+`eplb_call` is a context rather than a function so that a mode which places
+replicas per call can hold that call's plan until the expert kernels are
+enqueued. Static and online EPLB have no such plan: their slots change only
+between forwards, and the plan they yield is None.
 
 Online EPLB (`layer_updates_per_iter > 0`) moves experts between slots while the
 engine serves: between two forwards the balancer copies an expert's weights from
@@ -29,11 +34,11 @@ three more steps:
 5. `EplbLayer.bind_slots`, after loading and before any view of the slot weights
    is taken: move them to memory the balancer can write, and register each slot.
 6. `EplbLayer.close`, after the layer's last expert GEMM of a forward: hand the
-   layer back to the balancer. `route` takes it on the forward's first call and
-   records which experts the tokens chose, the statistic the balancer places by.
-   A target whose ranks each route their own tokens and exchange them with an
-   alltoall registers the layer with `alltoall=True`, and its forward's last
-   dispatch carries the statistic: `EplbLayer.local_statistic` goes into that
+   layer back to the balancer. `eplb_call` takes it on the forward's first call
+   and records which experts the tokens chose, the statistic the balancer places
+   by. A target whose ranks each route their own tokens and exchange them with an
+   alltoall registers the layer with `view=TokenView.ALLTOALL`, and its forward's
+   last dispatch carries the statistic: `EplbLayer.local_statistic` goes into that
    dispatch and `EplbLayer.gathered` takes every rank's back.
 
 `eplb_mode` says whether the engine runs EPLB for a deployment and in which
@@ -43,8 +48,10 @@ declines EPLB deployments in any other mode (see the Modeling V2 README).
 
 from __future__ import annotations
 
+import contextlib
+import enum
 from dataclasses import dataclass
-from typing import Callable, Mapping, Optional, Sequence
+from typing import Callable, Iterator, Mapping, Optional, Sequence
 
 import torch
 from torch import nn
@@ -246,7 +253,7 @@ class EplbRoute(OpWrapper):
 eplb_route = EplbRoute()
 
 
-#: Row ranges `(start, stop)` of a routed batch; see `EplbLayer.route`.
+#: Row ranges `(start, stop)` of a routed batch; see `EplbLayer.call`.
 Rows = Sequence[tuple[int, int]]
 
 
@@ -272,6 +279,17 @@ def _token_rows(ids: torch.Tensor, rows: Optional[Rows]) -> Optional[torch.Tenso
     return parts[0] if len(parts) == 1 else torch.cat(parts)
 
 
+class TokenView(enum.Enum):
+    """Which tokens each rank routes in a layer's MoE round trip (see `EplbLayer`)."""
+
+    #: Every rank routes the same rows, as under attention TP or attention DP over an
+    #: allgather.
+    GATHERED = "gathered"
+    #: Every rank routes its own tokens, and an alltoall carries them to the ranks that
+    #: hold their slots.
+    ALLTOALL = "alltoall"
+
+
 class EplbLayer:
     """A MoE layer registered with the engine's load balancer: its routing and, under
     online EPLB, its part in moving experts between slots.
@@ -283,21 +301,21 @@ class EplbLayer:
     Under online EPLB the balancer takes the layers in that order on every
     forward: it hands a layer to the GPU, waits for the GPU to hand it back, and
     may then rewrite the layer's slots before the next forward. The layer is
-    taken on its first `route` of a forward and handed back by `close`, so a
+    taken on its first `call` of a forward and handed back by `close`, so a
     target calls `close` once per forward per layer: after the layer's last
-    expert GEMM, before the next layer's first `route`, and also on a forward
+    expert GEMM, before the next layer's first `call`, and also on a forward
     that ran no tokens through the layer. A layer the forward leaves open stalls
     the balancer and, with it, the next forward.
 
     How the layer sees a forward's tokens follows the target's MoE round trip, chosen
     at `register`:
 
-    * Gathered (`alltoall=False`): every rank routes the same rows, as under attention
+    * Gathered (`TokenView.GATHERED`): every rank routes the same rows, as under attention
       TP or attention DP over an allgather. Every rank records the same expert ids,
       which is the statistic of the whole batch, and picks the same slot for each of a
       token's experts, so the replica choice ignores the rank: the ranks' slot windows
       then hold each token's experts exactly once between them.
-    * Alltoall (`alltoall=True`): every rank routes its own tokens and an alltoall
+    * Alltoall (`TokenView.ALLTOALL`): every rank routes its own tokens and an alltoall
       carries them to the ranks that hold their slots. Every rank counts its own
       tokens' experts; the forward's last dispatch carries this rank's histogram
       (`local_statistic`) and returns every rank's, which `gathered` hands the
@@ -311,7 +329,7 @@ class EplbLayer:
         slots: The layer's slots on this rank, as loaded; under online EPLB the
             balancer moves experts between them afterwards.
         online: Whether the balancer moves experts between slots while serving.
-        alltoall: Whether every rank routes its own tokens (see above).
+        view: Which tokens each rank routes (see above).
         repeat_count: How many times one forward runs the layer.
     """
 
@@ -322,18 +340,18 @@ class EplbLayer:
         *,
         top_k: int = 1,
         repeat_count: int = 1,
-        alltoall: bool = False,
+        view: TokenView = TokenView.GATHERED,
     ):
         self.balancer_layer = balancer_layer
         self.slots = slots
         self.online = balancer_layer.is_dynamic_routing()
-        self.alltoall = alltoall
+        self.view = view
         self.repeat_count = repeat_count
         self._top_k = top_k
         self._taken = False
         self._counted = False
         self._count_closed = False
-        # Alltoall: route calls of this forward that ended a pass over its tokens, and
+        # Alltoall: calls of this forward that ended a pass over its tokens, and
         # whether the balancer has this forward's gathered histogram.
         self._passes = 0
         self._gathered = False
@@ -347,7 +365,12 @@ class EplbLayer:
 
     @classmethod
     def register(
-        cls, slots: EplbSlots, top_k: int, repeat_count: int = 1, *, alltoall: bool = False
+        cls,
+        slots: EplbSlots,
+        top_k: int,
+        repeat_count: int = 1,
+        *,
+        view: TokenView = TokenView.GATHERED,
     ) -> "EplbLayer":
         """Add the layer to the engine's load balancer with its initial placement.
 
@@ -357,9 +380,9 @@ class EplbLayer:
             top_k: Experts each token selects.
             repeat_count: How many times one forward runs the layer, such as the
                 draft steps of a one-model MTP layer.
-            alltoall: Whether every rank routes its own tokens and an alltoall carries
-                them to the slots' ranks, rather than every rank routing the same rows
-                (see the class docstring).
+            view: Which tokens each rank routes: the same gathered rows on every rank,
+                or its own tokens that an alltoall carries to the slots' ranks (see
+                the class docstring).
 
         Raises:
             RuntimeError: If no load balancer is active, which means the layer is
@@ -375,16 +398,28 @@ class EplbLayer:
             balancer.set_repeated_for_next_layer(repeat_count)
         balancer_layer = balancer.add_layer(slots.num_experts, top_k, slots.local_slots)
         balancer_layer.set_initial_weight_assignments(list(slots.global_assignments))
-        return cls(balancer_layer, slots, top_k=top_k, repeat_count=repeat_count, alltoall=alltoall)
+        return cls(balancer_layer, slots, top_k=top_k, repeat_count=repeat_count, view=view)
 
-    def route(
-        self, token_selected_experts: torch.Tensor, rows: Optional[Rows] = None, last: bool = False
-    ) -> torch.Tensor:
-        """Global expert ids `[T, top_k]` int32 -> global slot ids `[T, top_k]` int32.
+    @property
+    def alltoall(self) -> bool:
+        """Whether every rank routes its own tokens (`TokenView.ALLTOALL`)."""
+        return self.view is TokenView.ALLTOALL
 
-        Gathered, every rank that routes the same tokens gets the same slots
-        (`offset_by_ep_rank=False`); alltoall, the replica choice is offset by the
-        rank (see the class docstring).
+    @contextlib.contextmanager
+    def call(
+        self,
+        token_selected_experts: torch.Tensor,
+        *,
+        rows: Optional[Rows] = None,
+        last: bool = False,
+    ) -> Iterator[tuple[torch.Tensor, None]]:
+        """The routing of one expert call; see `eplb_call`, which a target calls instead.
+
+        Yields `(slot_ids, plan)`: global expert ids `[T, top_k]` int32 routed to global
+        slot ids `[T, top_k]` int32 under the layer's placement, and no plan, since the
+        slots change only between forwards. Gathered, every rank that routes the same
+        tokens gets the same slots (`offset_by_ep_rank=False`); alltoall, the replica
+        choice is offset by the rank (see the class docstring).
 
         Under online EPLB the first call of a forward takes the layer from the
         balancer, and every call records the experts its tokens chose: the same ids
@@ -416,8 +451,9 @@ class EplbLayer:
                     self._sentinel(ids)
         if token_selected_experts.shape[0] == 0:
             # A rank with no tokens this round under an alltoall: nothing to route.
-            return token_selected_experts
-        return eplb_route(token_selected_experts, self.balancer_layer, self.alltoall)
+            yield token_selected_experts, None
+            return
+        yield eplb_route(token_selected_experts, self.balancer_layer, self.alltoall), None
 
     def _count_own(self, token_selected_experts: torch.Tensor, rows: Optional[Rows], last: bool):
         """Alltoall: add this rank's tokens' experts to its histogram. A call with no
@@ -434,7 +470,7 @@ class EplbLayer:
 
     def local_statistic(self) -> Optional[torch.Tensor]:
         """Alltoall, under online EPLB: this rank's histogram of the forward's experts,
-        `[num_experts]`, once the `route` call that completes it has counted. The
+        `[num_experts]`, once the `call` that completes it has counted. The
         dispatch that follows that call carries it to every rank, and `gathered` takes
         what it returns. None on every other call, and gathered or without online EPLB.
 
@@ -599,3 +635,29 @@ class EplbLayer:
             for local in range(self.slots.local_slots):
                 self.balancer_layer.register_weight_slot(local, name, data[local])
         self._bound = {name: w.data_ptr() for name, w in slot_weights.items()}
+
+
+@contextlib.contextmanager
+def eplb_call(
+    eplb: Optional[EplbLayer],
+    token_selected_experts: torch.Tensor,
+    *,
+    rows: Optional[Rows] = None,
+    last: bool = False,
+) -> Iterator[tuple[torch.Tensor, None]]:
+    """The routing of one expert call, with or without EPLB.
+
+    A context that yields `(slot_ids, plan)` for the expert kernels run inside it:
+    `token_selected_experts`, the router's `[T, top_k]` int32 expert ids, routed to
+    the global slot ids `[T, top_k]` int32 the kernels take, and the call's plan.
+    Without EPLB (`eplb` None) every expert has one slot, so the slot ids are the
+    expert ids. The plan is None: static and online EPLB change slots only between
+    forwards. Enqueue the call's expert kernels inside the context (see the module
+    docstring); under an alltoall that is the dispatch, the expert GEMMs and the
+    combine. `rows` and `last` feed online EPLB's statistic (`EplbLayer.call`).
+    """
+    if eplb is None:
+        yield token_selected_experts, None
+        return
+    with eplb.call(token_selected_experts, rows=rows, last=last) as routed:
+        yield routed

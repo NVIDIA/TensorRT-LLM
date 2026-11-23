@@ -345,6 +345,7 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
         self.intermediate_size_per_partition = intermediate_size // self.tp_size
 
         self.all_reduce = None
+        self.dummy_all_reduce = None
         # Debug function for eliminating imbalance during performance analysis.
         self.enable_dummy_allreduce = os.environ.get(
             "TRTLLM_ENABLE_DUMMY_ALLREDUCE", "0") == "1"
@@ -353,11 +354,15 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
                 mapping=self.mapping,
                 strategy=model_config.allreduce_strategy,
                 dtype=self.dtype)
-        elif self.enable_dummy_allreduce:
+        if self.enable_dummy_allreduce:
+            # Always NCCL: the model's strategy (e.g. TWOSHOT at TP 2/4)
+            # rejects the 4-element dummy tensor.
             from tensorrt_llm.functional import AllReduceStrategy
-            self.all_reduce = AllReduce(mapping=self.mapping,
-                                        strategy=AllReduceStrategy.NCCL,
-                                        dtype=self.dtype)
+            self.dummy_all_reduce = AllReduce(mapping=self.mapping,
+                                              strategy=AllReduceStrategy.NCCL,
+                                              dtype=self.dtype)
+            if self.all_reduce is None:
+                self.all_reduce = self.dummy_all_reduce
 
         # Initialize load balancer related attributes
         if init_load_balancer:
@@ -1052,12 +1057,12 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
         return outputs
 
     def dummy_allreduce(self):
-        assert self.enable_dummy_allreduce and self.all_reduce is not None, "Dummy allreduce is not enabled"
+        assert self.enable_dummy_allreduce and self.dummy_all_reduce is not None, "Dummy allreduce is not enabled"
         """
         Debug function for eliminating imbalance during performance analysis.
         Creates a small dummy tensor and performs allreduce to synchronize processes
         and eliminate timing imbalances for more accurate profiling measurements.
         """
         dummy_tensor = torch.zeros(4, dtype=torch.float32, device="cuda")
-        dummy_tensor = self.all_reduce(dummy_tensor)
+        dummy_tensor = self.dummy_all_reduce(dummy_tensor)
         return dummy_tensor

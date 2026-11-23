@@ -45,6 +45,8 @@ def _modules(monkeypatch):
         monkeypatch.setattr(module, "_fp4_mla_packed_rows_per_seq", _rows_per_seq)
     monkeypatch.setattr(decode, "_reduce_module", lambda: reduce)
     monkeypatch.setitem(sys.modules, _REDUCE, reduce)
+    # The workspace helper asks whether a CUDA graph is being captured; CPU nodes have no device.
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     return packed_plan, decode
 
 

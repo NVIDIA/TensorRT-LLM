@@ -34,7 +34,6 @@ import yaml
 from ..operators import tree_anchors
 from .schema_keys import reject_unknown_keys
 from .task_schema import (
-    DEFAULT_PERF_CONCURRENCY,
     DISAGG_FEATURE,
     DISAGG_KEYS,
     FEATURE_FAMILIES,
@@ -44,7 +43,6 @@ from .task_schema import (
     PROFILE_STANDARD,
     PROFILES,
     SPECULATORS,
-    parse_parallel_segment,
 )
 
 #: The derived spec and its report, in the workspace.
@@ -62,13 +60,9 @@ DEFAULT_WORKLOAD: dict[str, int] = {"isl": 4096, "osl": 1024, "max_batch_size": 
 #: Tokens between Mamba state snapshots on a hybrid checkpoint with block
 #: reuse: without a snapshot policy the engine turns reuse off.
 DEFAULT_SNAPSHOT_INTERVAL = 2048
-#: The boot gate's prompts when the site declares none: one whose answer any
-#: working target states, checked, and one open continuation.
+#: The boot gate's prompts when the site declares none: two short continuations.
 DEFAULT_BOOT: dict[str, Any] = {
-    "prompts": [
-        {"prompt": "The capital of France is", "keywords_any": ["Paris"]},
-        "In one sentence, photosynthesis is",
-    ],
+    "prompts": ["The capital of France is", "In one sentence, photosynthesis is"],
     "max_tokens": 32,
 }
 DEFAULT_BENCHMARK = "gsm8k"
@@ -110,14 +104,12 @@ SITE_KEYS = (
     "trtllm_repo_path",
     "environment",
     "agents",
-    "perf",
     "commit_policy",
     # The cluster's devices, and what a derived spec takes when its goal is silent.
     "device",
     "defaults",
 )
 SITE_DEVICE_KEYS = ("arch", "gpus_per_node", "nodes")
-SITE_PERF_KEYS = ("spools", "dev_spools", "env_script")
 SITE_DEFAULTS_KEYS = ("members", "workload", "accuracy", "boot", "disagg", "profile")
 #: ``reference`` (how the anchor was measured) is the operator's record; nothing reads it.
 SITE_ACCURACY_KEYS = ("benchmark", "protocol", "reference", "reference_yaml", "model_key")
@@ -171,7 +163,6 @@ class Goal:
     params: dict[str, Any] = field(default_factory=dict)
     accuracy: dict[str, str] = field(default_factory=dict)
     arch: str | None = None
-    tune: bool = False
 
 
 def parse_goal(text: str | None) -> Goal:
@@ -185,9 +176,6 @@ def parse_goal(text: str | None) -> Goal:
             _key_value(goal, word, errors)
             continue
         lowered = word.lower()
-        if lowered == "tune":
-            goal.tune = True
-            continue
         if PARALLEL_PATTERN.match(lowered):
             goal.members.append(lowered)
             continue
@@ -358,7 +346,7 @@ def validate_site(site: Any) -> list[str]:
     for key in ("trtllm_repo_path", "environment"):
         if not site.get(key):
             errors.append(f"site.yaml: '{key}' is required")
-    for key, keys in (("device", SITE_DEVICE_KEYS), ("perf", SITE_PERF_KEYS)):
+    for key, keys in (("device", SITE_DEVICE_KEYS),):
         block = site.get(key)
         if block is not None and not isinstance(block, Mapping):
             errors.append(f"site.yaml: '{key}' must be a mapping")
@@ -464,17 +452,13 @@ def derive_spec(
         if key not in goal.workload and key != "max_batch_size":
             note(f"workload.{key}", value, source)
     workload.update(goal.workload)
-    if goal.tune and not workload.get("concurrency"):
-        workload["concurrency"] = note(
-            "workload.concurrency", list(DEFAULT_PERF_CONCURRENCY), "default"
-        )
     concurrency = workload.get("concurrency") or []
     max_seq_len = workload.get("max_seq_len") or (
         workload["isl"] + workload["osl"] if "isl" in workload and "osl" in workload else None
     )
     max_batch_size = workload.get("max_batch_size") or (max(concurrency) if concurrency else None)
     if concurrency and "max_batch_size" not in goal.workload:
-        # A default batch below the goal's concurrency would queue the perf points it names.
+        # A default batch below the goal's concurrency would queue the requests it names.
         max_batch_size = max(int(max_batch_size or 0), max(concurrency))
     if max_batch_size and "max_batch_size" not in goal.workload:
         # The value the spec carries, not the default it was raised from.
@@ -635,30 +619,9 @@ def derive_spec(
     chosen = {u: p for u, p in goal.unit_profiles.items() if u in built}
     if chosen:
         spec["profile"] = {"default": spec.get("profile") or PROFILE_STANDARD, **chosen}
-    layout = spec["members"] if isinstance(spec.get("members"), dict) else {}
-    everywhere = list(dict.fromkeys(m for listed in layout.values() for m in listed))
-    left_out = [
-        f"{unit}@{member}"
-        for unit in ["core", *built]
-        for member in everywhere
-        if member not in layout.get(unit, layout.get("default", ()))
-    ]
-    if left_out:
-        # Where the goal gates a unit on fewer members, the rest is its choice, not a gap.
-        spec["coverage"] = {"accept": left_out}
     # The chunk size is the chunked variant's, not core's.
     params = {k: v for k, v in goal.params.items() if not (chunked and k == "chunk_tokens")}
     options = _llm_api_options(runtime, built, kv_dtype, params, snapshot, max_batch_size)
-    if goal.tune:
-        draft = options[built[-1]].get("speculative_config") if built else None
-        spec["perf"] = _perf(site, workload, members, draft)
-        adp = [c["name"] for c in spec["perf"]["configs"] if c["name"].startswith("dep")]
-        if adp:
-            note(
-                f"perf ({', '.join(adp)})",
-                "the high concurrency point, a global total across the attention-DP ranks",
-                "default",
-            )
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     derived = {
         "checkpoint": str(checkpoint),
@@ -771,11 +734,11 @@ def disagg_layout(
     """``(devices per node, nodes)`` the disaggregated-serving test needs; ``None`` unknown.
 
     One context and one generation engine, each on the fewest devices that hold
-    the checkpoint's weights (``lint.engine_width``): on one node when both fit,
+    the checkpoint's weights (``sizing.engine_width``): on one node when both fit,
     as the tree's own disaggregated accuracy tests run (context and generation
     sharing a node); else one engine per node, or as many nodes as an engine needs.
     """
-    from .lint import engine_width
+    from .sizing import engine_width
 
     width = engine_width(weight_bytes, gpu_memory_gib)
     if width is None or not isinstance(gpus_per_node, int) or gpus_per_node <= 0:
@@ -808,7 +771,7 @@ def _disagg(
     if block:
         note("accuracy.disagg", dict(block), "site")
     if "devices" not in block and "nodes" not in block and checkpoint is not None:
-        from .lint import checkpoint_weight_bytes
+        from .sizing import checkpoint_weight_bytes
 
         environment = site.get("environment") or {}
         per_node = environment.get("gpus_per_node") or (site.get("device") or {}).get(
@@ -840,51 +803,6 @@ def _disagg(
             "`trtllm-serve disaggregated`"
         )
     return block
-
-
-def member_options(member: str) -> dict[str, Any]:
-    """The LLM-API parallelism one member (``tp4``, ``tep4``, ``dep4``) serves at."""
-    match = PARALLEL_PATTERN.match(str(member))
-    if match is None:
-        return {}
-    kind, world = match.group(1), int(match.group(2))
-    options: dict[str, Any] = {"tensor_parallel_size": world}
-    if kind in ("tep", "dep"):
-        options["moe_expert_parallel_size"] = world
-    if kind == "dep":
-        options["enable_attention_dp"] = True
-    return options
-
-
-def _perf(
-    site: Mapping[str, Any],
-    workload: Mapping[str, Any],
-    members: list[str],
-    draft: Mapping[str, Any] | None,
-) -> dict[str, Any]:
-    """The tune stage's block: one config per member at the run's workload, with the speculator."""
-    shared = {
-        "isl": workload.get("isl", 1024),
-        "osl": workload.get("osl", 1024),
-        "concurrency": workload.get("concurrency") or list(DEFAULT_PERF_CONCURRENCY),
-    }
-    configs = []
-    for member in members:
-        options = member_options(member)
-        if draft:
-            options["speculative_config"] = dict(draft)
-        load = dict(shared)
-        kind, _ = parse_parallel_segment(member)
-        if kind == "dep":
-            # Attention DP serves throughput: only its high point. A concurrency (and a batch
-            # size) is always the global total; each rank serves its share of it.
-            load["concurrency"] = [max(shared["concurrency"])]
-        configs.append({"name": member, "workload": load, "llm_api_options": options})
-    return {
-        "enabled": True,
-        **dict(site.get("perf") or {}),
-        "configs": configs,
-    }
 
 
 def render_report(derivation: Derivation, spec_path: Path) -> str:
@@ -994,7 +912,6 @@ __all__ = [
     "derive_spec",
     "draft_layers",
     "inspect_checkpoint",
-    "member_options",
     "parse_goal",
     "read_config",
     "render_report",

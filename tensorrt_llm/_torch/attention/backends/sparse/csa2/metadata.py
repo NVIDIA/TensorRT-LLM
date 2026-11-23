@@ -18,11 +18,17 @@ import torch
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.modules.multi_stream_utils import private_stream
-from tensorrt_llm._utils import is_blackwell_datacenter, is_sm_100f
+from tensorrt_llm._utils import get_sm_version, is_blackwell_datacenter, is_sm_100f
 from tensorrt_llm.math_utils import ceil_div
 
 from .block_select import PUBLISH_BLOCK, block_select_supported
-from .params import CSA2BackendForwardArgs, CSA2Layer, CSA2MetadataParams, CSA2Mode
+from .params import (
+    CSA2BackendForwardArgs,
+    CSA2Layer,
+    CSA2MetadataParams,
+    CSA2Mode,
+    select_csa2_backend,
+)
 
 if TYPE_CHECKING:
     from .....pyexecutor.llm_request import LlmRequest
@@ -347,6 +353,10 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         # CSA2 never reads the generic MLA chunked-context tables.
         self.enable_context_mla_with_cached_kv = False
         super().__post_init__()
+
+    def _validate_swa_scratch_reuse(self) -> None:
+        """CSA2 resolves scratch pages before its hardware-selected attention helper."""
+        select_csa2_backend(get_sm_version())
 
     @property
     def tokens_per_block(self) -> int:
@@ -1352,7 +1362,11 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         self._csa2_source_batch = (list(seq_lengths), list(start_positions))
 
     def set_swa_bounded_replay(
-        self, cached_prefix_lengths: list[int | None], *, decoder: bool = False
+        self,
+        cached_prefix_lengths: list[int | None],
+        *,
+        decoder: bool = False,
+        query_starts: list[int | None] | None = None,
     ) -> None:
         """Prepare approximate reconstruction after an authoritative GLOBAL hit.
 
@@ -1371,6 +1385,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
                 "Bounded replay source selection cannot be combined with set_source_batch"
             )
         self._csa2_pending_replay = (tuple(cached_prefix_lengths), decoder)
+        self._csa2_pending_replay_query_starts = query_starts
 
     def prepare_context_replay(
         self, requests: list[LlmRequest], *, allow_final_window: bool = True
@@ -1384,6 +1399,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             tuple(request.prompt_len for request in requests) if allow_final_window else ()
         )
         prefixes = [None] * self.num_seqs
+        query_starts = [None] * self.num_seqs
         floors = [0] * self.num_seqs
         starts = self.kv_cache_params.num_cached_tokens_per_seq
         lengths = self.seq_lens.tolist()
@@ -1394,7 +1410,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
                 if cache is None or plan.cache_identity != id(cache) or not cache.is_active:
                     raise ValueError("Encoder recovery has lost its active Global claim")
             if isinstance(plan, EncoderReplay):
-                floors[row] = plan.start
+                floors[row] = plan.swa_read_floor if plan.restores_checkpoint else plan.start
                 if not plan.consumed:
                     if (
                         plan.request_id != request.py_request_id
@@ -1404,8 +1420,9 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
                     ):
                         raise ValueError("Encoder recovery input does not match its Global claim")
                     prefixes[row] = plan.global_end
+                    query_starts[row] = plan.start
         if any(prefix is not None for prefix in prefixes):
-            self.set_swa_bounded_replay(prefixes)
+            self.set_swa_bounded_replay(prefixes, query_starts=query_starts)
         self._csa2_pending_swa_floors = floors
 
     def set_decoder_query_boundary(self, first_layer: int) -> None:
@@ -1956,6 +1973,9 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         replay = getattr(self, "_csa2_pending_replay", None)
         if hasattr(self, "_csa2_pending_replay"):
             del self._csa2_pending_replay
+        query_starts = getattr(self, "_csa2_pending_replay_query_starts", None)
+        if hasattr(self, "_csa2_pending_replay_query_starts"):
+            del self._csa2_pending_replay_query_starts
         self.csa2_replay_mode = None
         self.csa2_replay_cached_lengths = ()
         replay_starts = [0] * len(lengths)
@@ -1973,6 +1993,13 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
                 else manager.get_swa_replay_ranges([prefix], decoder=decoder)[0][0]
                 for prefix in prefixes
             ]
+            if query_starts is not None:
+                if decoder or len(query_starts) != len(prefixes):
+                    raise ValueError("Explicit Encoder query starts must match the context batch")
+                replay_starts = [
+                    default if start is None else start
+                    for default, start in zip(replay_starts, query_starts)
+                ]
             for row, (prefix, start, length) in enumerate(zip(prefixes, starts, lengths)):
                 if prefix is None:
                     continue
@@ -1988,7 +2015,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             self.csa2_replay_cached_lengths = prefixes
         if hasattr(self, "_csa2_pending_swa_floors"):
             replay_starts = [
-                max(start, floor)
+                floor if query_starts is not None else max(start, floor)
                 for start, floor in zip(replay_starts, self._csa2_pending_swa_floors)
             ]
             del self._csa2_pending_swa_floors
@@ -3047,10 +3074,23 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("Warm up CSA2 paged indexer metadata before graph capture")
             page_capacity = required_pages
+            # Attention TP on SM100/SM103 (no mapping counts as TP, as in the workspace estimator):
+            # DeepGEMM's paged logits mask the unallocated pages.
+            from tensorrt_llm._utils import is_blackwell_datacenter
+
+            mapping = getattr(self, "mapping", None)
+            masked_pages = is_blackwell_datacenter() and not (
+                mapping is not None and mapping.enable_attention_dp
+            )
             scratch = {
                 "page_capacity": page_capacity,
                 "block_table": torch.empty(
                     (query_capacity, page_capacity), dtype=torch.int32, device=device
+                ),
+                "masked_block_table": torch.empty(
+                    (query_capacity, page_capacity) if masked_pages else (0, 0),
+                    dtype=torch.int32,
+                    device=device,
                 ),
                 "context_lengths": torch.empty(
                     (query_capacity, 1), dtype=torch.int32, device=device
@@ -3079,6 +3119,9 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             self._csa2_indexer_workspaces[key] = scratch
         page_capacity = scratch["page_capacity"]
         active_blocks = scratch["block_table"][:count]
+        active_masked = (
+            scratch["masked_block_table"][:count] if scratch["masked_block_table"].numel() else None
+        )
         active_context = scratch["context_lengths"][:count]
         active_visible = scratch["visible_lengths"][:count]
         active_valid = scratch["valid_pages"][:count]
@@ -3154,6 +3197,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
                 active_context,
                 active_visible,
                 active_valid[:, :owner_pages],
+                None if active_masked is None else active_masked[:, :owner_pages],
             )
             if split_heads:
                 # A request's last row sees its whole context.
@@ -3172,6 +3216,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             scratch["holder"] = (group, serial)
         self.csa2_indexer_k_cache = manager.get_index_pages(owner)
         self.csa2_indexer_block_table = active_blocks
+        self.csa2_indexer_masked_block_table = active_masked
         self.csa2_indexer_context_lengths = active_context
         self.csa2_indexer_scheduler_metadata = schedule
         self.csa2_indexer_next_n = next_n
@@ -3321,6 +3366,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         active_context,
         active_visible,
         active_valid,
+        active_masked=None,
     ):
         """Derive native block tables and page validity from the owner's page table.
 
@@ -3328,6 +3374,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         pages. The paged kernel scores the whole visible prefix, reading page
         zero for unallocated source pages; ``active_valid`` marks the native
         pages backed by an allocated page, and readers bound it by the visible length.
+        ``active_masked`` gets the table with admitted rows' unallocated pages flagged for DeepGEMM.
         """
         request_count, source_pages = table.shape
         page_capacity = active_blocks.shape[1]
@@ -3346,6 +3393,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
                     active_context,
                     active_visible,
                     active_valid,
+                    active_masked,
                 )
                 return
         if request_count == 0:
@@ -3353,6 +3401,8 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             active_visible.zero_()
             active_valid.fill_(False)
             active_context.fill_(1)
+            if active_masked is not None:
+                active_masked.zero_()
             return
         native = table.long()[:, :, None] * pages_per_source_page + torch.arange(
             pages_per_source_page, device=device
@@ -3376,6 +3426,13 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         active_valid.copy_(valid_pages[requests] & valid_requests[:, None])
         # A zero-length row keeps one defined column for the paged kernel.
         active_context.copy_(visible.clamp_min(1)[:, None])
+        if active_masked is not None:
+            from .kernel import DEEPGEMM_MASKED_PAGE
+
+            unbacked = valid_requests[:, None] & ~valid_pages[requests]
+            active_masked.copy_(
+                torch.where(unbacked, active_blocks | DEEPGEMM_MASKED_PAGE, active_blocks)
+            )
 
     @staticmethod
     def context_workspace_bytes_per_token(model_config) -> int:
@@ -3418,6 +3475,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         num_sms: int,
         *,
         num_owners: int = 1,
+        attention_dp: bool = False,
     ) -> int:
         """Exact retained bytes for one native index descriptor arena, including schedule.
 
@@ -3429,11 +3487,14 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         """
         if min(request_capacity, query_capacity, max_positions, topk, num_sms, num_owners) < 0:
             raise ValueError("CSA2 workspace capacities must be nonnegative")
+        from tensorrt_llm._utils import is_blackwell_datacenter
+
         pages_per_request = max(1, (max_positions + 63) // 64)
-        # Per query: int32 block table and one validity byte per page, context
-        # and visible lengths, the split-row request context, and the exact radix
-        # TopK scratch.
-        per_query = pages_per_request * (4 + 1) + 12 + 80 * topk
+        # Per query: int32 block table (and with attention TP on SM100/SM103 its masked-page copy
+        # for DeepGEMM) and one validity byte per page, context and visible lengths, the split-row
+        # request context, and the exact radix TopK scratch.
+        table_bytes = 8 if is_blackwell_datacenter() and not attention_dp else 4
+        per_query = pages_per_request * (table_bytes + 1) + 12 + 80 * topk
         return query_capacity * per_query + num_owners * (num_sms + 1) * 2 * 4
 
     @staticmethod
