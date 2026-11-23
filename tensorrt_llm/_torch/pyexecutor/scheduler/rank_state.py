@@ -317,7 +317,9 @@ class RankState:
     # section that serialize appends. Every rank of a fleet runs the same build,
     # so every message carries it; the tag only tells deserialize where the
     # section is, so that the shorter layouts it also parses stay readable. No
-    # field of those layouts is -4: each is a count or a -1 default.
+    # field that ends those layouts is -4: each is a count, a flag or a -1
+    # default. The iteration stats' version header can be -4, but it follows
+    # the five leading fields, never third from the end.
     _IN_TRANSFER_TAG: ClassVar[int] = -4
 
     def copy_iter_stats_from(self, iter_stats_payload: RankIterStatsPayload | None) -> None:
