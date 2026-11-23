@@ -9577,6 +9577,8 @@ class KVCacheManagerV2(BaseResourceManager):
             assert len(locality_domain_ids) == len(request_ids), (
                 "locality_domain_ids must have the same length as request_ids"
             )
+        if draft_kv_cache_manager is self:
+            draft_kv_cache_manager = None
         _kv_draft = (
             kv_reserve_draft_tokens if kv_reserve_draft_tokens is not None else max_num_draft_tokens
         )

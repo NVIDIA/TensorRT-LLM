@@ -27,12 +27,15 @@ import re
 from typing import TYPE_CHECKING
 
 import torch
+from torch import nn
 
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ...models.modeling_utils import QuantConfig
 from ..model_config import ModelConfig, MoESelection
+from ..modules.linear import Linear
+from ..modules.rms_norm import RMSNorm
 from ..utils import AuxStreamType
 from .modeling_deepseekv41 import (
     DeepseekV41DecoderLayer,
@@ -441,12 +444,104 @@ class DSv41DSparkDraftModel(DSv4DSparkDraftModel):
         return sparse_config.model_copy(update=updates)
 
 
+class _DSv41DSparkContextBlock(nn.Module):
+    """The capture projection owned by stage zero of a context-only drafter."""
+
+    def __init__(
+        self,
+        model_config,
+        layer_idx,
+        aux_stream_dict,
+        *,
+        stage_id,
+        num_stages,
+        num_capture_layers,
+        block_size=0,
+    ):
+        super().__init__()
+        self.self_attn = None
+        self.markov_head = None
+        self.confidence_head = None
+        if stage_id == 0:
+            config = model_config.pretrained_config
+            self.main_proj = Linear(
+                config.hidden_size * num_capture_layers,
+                config.hidden_size,
+                bias=False,
+                dtype=config.torch_dtype,
+                quant_config=DSv41DSparkBlock._capture_quant_config(model_config),
+                skip_create_weights_in_init=model_config.skip_create_weights_in_init,
+            )
+            self.main_norm = RMSNorm(
+                hidden_size=config.hidden_size, eps=config.rms_norm_eps, dtype=config.torch_dtype
+            )
+
+
+class _DSv41DSparkContextDraftModel(DSv41DSparkDraftModel):
+    """Captured-hidden projection and per-stage KV projection for a context worker."""
+
+    block_cls = _DSv41DSparkContextBlock
+    context_kv_only = True
+
+    def post_load_weights(self, weights=None) -> None:
+        self.mtp_layers[0].main_proj.transform_weights()
+        if weights is not None:
+            self._cache_attn_weights(weights)
+
+    def _cache_attn_weights(self, src: dict) -> None:
+        device = self.mtp_layers[0].main_norm.weight.device
+        for stage_id, stage in enumerate(self.mtp_layers):
+            prefix = f"mtp.{stage_id}.attn."
+            stage._dspark_attn = {
+                "wkv": self._block_dequant(
+                    src[prefix + "wkv.weight"].to(device),
+                    src[prefix + "wkv.scale"].to(device),
+                    block=self.checkpoint_fp8_block_size,
+                ),
+                "kv_norm_w": src[prefix + "kv_norm.weight"].to(device).to(torch.bfloat16),
+            }
+        self._pack_backfill_wkv_weights()
+        self._cache_fp8_prep_weights(src)
+
+    def _reject_generation(self, *args, **kwargs):
+        raise RuntimeError("A context-only DSpark drafter cannot generate draft tokens")
+
+    forward = _reject_generation
+    forward_batched = _reject_generation
+
+    def run_moe_lockstep_noop(self, all_rank_num_tokens, device):
+        """Context seeders have no MoE barriers to participate in."""
+        return None
+
+
 class DSv41DSparkForCausalLM(DSv4DSparkForCausalLM):
     """V4.1 wrapper using the existing embedded DSpark worker and verifier."""
 
     draft_model_cls = DSv41DSparkDraftModel
 
+    def reads_managed_ctx_pages(self, tokens_per_block: int) -> bool:
+        """Whether the V4.1 draft attention reads context from pages of this size."""
+        return tokens_per_block in (128, 256)
+
+    def __init__(self, draft_config, *args, context_kv_only=False, **kwargs):
+        if context_kv_only and getattr(draft_config, "moe_load_balancer", None) is None:
+            self.draft_model_cls = _DSv41DSparkContextDraftModel
+        super().__init__(draft_config, *args, **kwargs)
+
     def load_weights(self, weights: dict[str, torch.Tensor], weight_mapper=None, **kwargs) -> None:
+        context_kv_only = getattr(self.dspark_model, "context_kv_only", False)
+        if context_kv_only:
+            names = {"mtp.0.main_proj.weight", "mtp.0.main_proj.scale", "mtp.0.main_norm.weight"}
+            required = {"mtp.0.main_proj.weight", "mtp.0.main_norm.weight"}
+            for stage in range(self.num_stages):
+                for suffix in ("wkv.weight", "wkv.scale", "kv_norm.weight"):
+                    name = f"mtp.{stage}.attn.{suffix}"
+                    names.add(name)
+                    required.add(name)
+            missing = sorted(required.difference(weights.keys()))
+            if missing:
+                raise ValueError(f"V4.1 DSpark checkpoint is missing context KV weights: {missing}")
+            weights = {name: value for name, value in weights.items() if name in names}
         remapped = remap_dspark_v41_draft_keys(
             weights,
             self.num_stages,
@@ -459,8 +554,15 @@ class DSv41DSparkForCausalLM(DSv4DSparkForCausalLM):
         required = [
             "mtp_layers.0.main_proj.weight",
             "mtp_layers.0.main_norm.weight",
-            f"mtp_layers.{self.num_stages - 1}.norm.weight",
         ]
+        if context_kv_only:
+            remapped = {
+                name: value
+                for name, value in remapped.items()
+                if name.startswith("mtp_layers.0.main_")
+            }
+        else:
+            required.append(f"mtp_layers.{self.num_stages - 1}.norm.weight")
         if last.markov_head is not None:
             required.extend(
                 f"mtp_layers.{self.num_stages - 1}.markov_head.markov_w{i}.weight" for i in (1, 2)
@@ -477,6 +579,9 @@ class DSv41DSparkForCausalLM(DSv4DSparkForCausalLM):
                 f"unconsumed keys {unexpected[:8]}; unfed parameters {unfed[:8]}"
             )
         self.dspark_model.post_load_weights(weights)
+        if context_kv_only:
+            logger.info(f"[DSpark V4.1] loaded {self.num_stages} context-KV-only draft stages")
+            return
         logger.info(f"[DSpark V4.1] loaded {self.num_stages} lagged-pre draft stages")
 
 

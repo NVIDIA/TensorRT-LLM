@@ -291,7 +291,7 @@ def test_rank_info_from_bytes_defaults_missing_draft_layer_count() -> None:
         transfer_engine_info=b"",
     )
     payload = msgpack.unpackb(ri.to_bytes(), strict_map_key=False)
-    del payload["num_draft_layers"]
+    assert "num_draft_layers" not in payload
 
     assert RankInfo.from_bytes(msgpack.packb(payload)).num_draft_layers == 0
 

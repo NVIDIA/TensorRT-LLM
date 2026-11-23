@@ -22,6 +22,8 @@ from tensorrt_llm._torch.modules.multi_stream_utils import private_stream
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _RESERVED_REQUEST_IDS,
     GPU_LEVEL,
+    KVCacheLayerOwner,
+    KVCacheLayerSpec,
     KVCacheManagerV2,
     Role,
     _estimate_cache_size_components,
@@ -311,6 +313,12 @@ class CSA2CacheManager(KVCacheManagerV2):
     # GPU tier quota of the pools, set while the base configuration is built.
     _gpu_tier_quota: int | None = None
 
+    _draft_layer_specs: tuple[KVCacheLayerSpec, ...] = ()
+
+    @classmethod
+    def accepts_appended_draft_layers(cls) -> bool:
+        return True
+
     def __init__(
         self,
         kv_cache_config,
@@ -413,6 +421,22 @@ class CSA2CacheManager(KVCacheManagerV2):
         self._encoder_reuse_policy = (
             ReusePolicy.OPTIONAL if self._encoder_replay_enabled else ReusePolicy.REQUIRED
         )
+        draft_specs = tuple(kwargs.pop("layer_specs", None) or ())
+        if any(
+            spec.owner is not KVCacheLayerOwner.DRAFT or spec.global_layer_id < num_layers
+            for spec in draft_specs
+        ):
+            raise ValueError("CSA2 layer_specs must describe appended draft-owned layers")
+        self._draft_layer_specs = tuple(
+            replace(
+                spec,
+                reuse_policy=(
+                    ReusePolicy.PRIVATE if self._decoder_replay_window else ReusePolicy.REQUIRED
+                ),
+            )
+            for spec in draft_specs
+        )
+        self._appended_draft_layer_specs = {}
         self._encoder_optional_groups: tuple[int, ...] = ()
         self._global_buffers: dict[tuple[int, int, CSA2CacheRole], torch.Tensor] = {}
         self._pool_views = {}
@@ -760,7 +784,7 @@ class CSA2CacheManager(KVCacheManagerV2):
         return base + self.max_draft_len + self.reuse_match_backoff
 
     def _runtime_cache_size_layer_components(self) -> tuple[list[int], list[int | None], list[int]]:
-        return _cache_size_layer_components(
+        sizes, windows, groups = _cache_size_layer_components(
             self.layout,
             self.pp_layers,
             self._decoder_replay_window,
@@ -769,6 +793,27 @@ class CSA2CacheManager(KVCacheManagerV2):
             getattr(self, "context_swa_layer_limit", None),
             remote_tail=getattr(self, "bounded_replay_on_generation", False),
         )
+        specs = getattr(self, "_draft_layer_specs", ())
+        sizes.extend(spec.bytes_per_token() for spec in specs)
+        windows.extend(spec.sliding_window_size for spec in specs)
+        groups.extend(spec.reuse_policy.value for spec in specs)
+        return sizes, windows, groups
+
+    @property
+    def draft_layer_ids(self) -> tuple[int, ...]:
+        return tuple(spec.global_layer_id for spec in self._draft_layer_specs)
+
+    def get_disagg_global_layer_ids(self, layer_group_id: int) -> list[int]:
+        """Stable virtual IDs for target cache roles and appended draft layers."""
+        kinds = max(kind.value for kind in _CSA2LayerKind) + 1
+        inverse = {}
+        for (model_layer, kind), local_layer in self._layer_attn_to_layer_id.items():
+            inverse.setdefault(int(local_layer), model_layer * kinds + kind.value)
+        inverse.update(
+            (local_layer, spec.global_layer_id * kinds)
+            for local_layer, spec in self._appended_draft_layer_specs.items()
+        )
+        return [inverse[int(layer)] for layer in self.impl.layer_grouping[layer_group_id]]
 
     def _get_runtime_cache_size_layer_components(self):
         sizes, windows, _ = self._runtime_cache_size_layer_components()
@@ -812,8 +857,14 @@ class CSA2CacheManager(KVCacheManagerV2):
         return int(min(typical, max(fitting, self.tokens_per_block)))
 
     def get_layer_bytes_per_token(self, local_layer_idx, data_role):
+        if local_layer_idx in self._appended_draft_layer_specs:
+            return super().get_layer_bytes_per_token(local_layer_idx, data_role)
         # Replaced by the packed declarative layer configuration below.
         return 1
+
+    @classmethod
+    def _get_per_request_layer_tokens(cls, *args, layer_specs=None, **kwargs):
+        return super()._get_per_request_layer_tokens(*args, layer_specs=None, **kwargs)
 
     def _build_cache_config(self, config):
         layers = []
@@ -910,9 +961,32 @@ class CSA2CacheManager(KVCacheManagerV2):
         # configuration already preserves its disabled/default state.
         if scratch is not None:
             config.swa_scratch_reuse = scratch
+        for spec in self._draft_layer_specs:
+            local_id = len(config.layers)
+            if spec.global_layer_id in self.layer_offsets:
+                raise ValueError(f"Duplicate draft layer {spec.global_layer_id}")
+            self._appended_draft_layer_specs[local_id] = spec
+            self.layer_offsets[spec.global_layer_id] = local_id
+            for values, value in (
+                (self.num_kv_heads_per_layer, spec.num_kv_heads),
+                (self.head_dim_per_layer, spec.head_dim),
+                (self.max_attention_window_vec, spec.sliding_window_size),
+            ):
+                values.extend([value] * (local_id + 1 - len(values)))
+                values[local_id] = value
+            config.layers = [
+                *config.layers,
+                self._explicit_layer_config(local_id, spec, self.tokens_per_block),
+            ]
         return config
 
-    def get_buffers(self, layer_idx: int, role: CSA2CacheRole = CSA2CacheRole.SWA):
+    def get_buffers(
+        self, layer_idx: int, role: CSA2CacheRole = CSA2CacheRole.SWA, *, kv_layout: str = "HND"
+    ):
+        if any(
+            spec.global_layer_id == layer_idx for spec in getattr(self, "_draft_layer_specs", ())
+        ):
+            return super().get_buffers(layer_idx, kv_layout)
         layer_id = self._cache_layer_id(layer_idx, role)
         addr = self.impl.get_mem_pool_base_address(layer_id, role.role, role.index_mode)
         upper = self.impl.get_page_index_upper_bound(layer_id, role.role)
@@ -1253,7 +1327,9 @@ class CSA2CacheManager(KVCacheManagerV2):
         # The previous partial conversion may still read its buffers on another stream.
         stream.wait_event(self._changed_rows_read)
         host = self.host_kv_cache_block_offsets.numpy()
-        snapshot = np.ascontiguousarray(host[:, self._batch_rows[changed], 0, :width])
+        snapshot = np.ascontiguousarray(
+            host[: self._batch_page_pool_count, self._batch_rows[changed], 0, :width]
+        )
         buffer = self._device_changed_base
         if buffer is None or buffer.numel() < snapshot.size:
             buffer = self._device_changed_base = torch.empty(
@@ -1306,7 +1382,7 @@ class CSA2CacheManager(KVCacheManagerV2):
             device_base.data_ptr(), row_bytes, row_bytes, device_base.shape[1]
         )
         copy.extent = cudart.make_cudaExtent(
-            width * host.element_size(), int(self._batch_rows.max()) + 1, host.shape[0]
+            width * host.element_size(), int(self._batch_rows.max()) + 1, device_base.shape[0]
         )
         copy.kind = cudart.cudaMemcpyKind.cudaMemcpyHostToDevice
         CUASSERT(cudart.cudaMemcpy3DAsync(copy, self._base_rows_stream.cuda_stream))
@@ -1478,6 +1554,8 @@ class CSA2CacheManager(KVCacheManagerV2):
         return groups
 
     def get_layer_page_index_scale(self, layer_idx: int) -> int:
+        if self.layer_offsets.get(layer_idx) in self._appended_draft_layer_specs:
+            return super().get_layer_page_index_scale(layer_idx)
         return int(
             self.impl.get_page_index_scale(
                 self._cache_layer_id(layer_idx, CSA2CacheRole.SWA), CSA2CacheRole.SWA.role
@@ -1485,6 +1563,8 @@ class CSA2CacheManager(KVCacheManagerV2):
         )
 
     def get_batch_cache_indices(self, request_ids, layer_idx=None, num_blocks_per_seq=None):
+        if self.layer_offsets.get(layer_idx) in self._appended_draft_layer_specs:
+            return super().get_batch_cache_indices(request_ids, layer_idx, num_blocks_per_seq)
         layer_idx = self.pp_layers[0] if layer_idx is None else layer_idx
         result = []
         for i, request_id in enumerate(request_ids):
@@ -1571,6 +1651,8 @@ class CSA2CacheManager(KVCacheManagerV2):
             )
         params = np.asarray(params, dtype=np.int32).reshape(-1, 5)
         self._scratch_pools, params[:, 3] = np.unique(params[:, 0], return_inverse=True)
+        # Keep native pool indices, excluding unreferenced trailing draft pools.
+        self._batch_page_pool_count = int(params[:, 0].max(initial=-1)) + 1
         if -(-self.max_seq_len // self.tokens_per_block) > self.max_blocks_per_seq:
             raise ValueError("CSA2 page tables must cover max_seq_len")
         device = torch.device("cuda", torch.cuda.current_device())
@@ -1593,7 +1675,7 @@ class CSA2CacheManager(KVCacheManagerV2):
             # overwrites the rows the previous batch's conversion may still read.
             self._device_base_rows = [
                 torch.empty(
-                    (self.num_pools, capacity, self.max_blocks_per_seq),
+                    (self._batch_page_pool_count, capacity, self.max_blocks_per_seq),
                     dtype=torch.int32,
                     device=device,
                 )
@@ -1768,6 +1850,10 @@ class CSA2CacheManager(KVCacheManagerV2):
             **{role.role: MapperKind.REPLICATED for role in CSA2CacheRole},
         }
 
+    def get_disagg_ignored_roles(self):
+        # Remote-tail generation rebuilds draft KV from target hidden states.
+        return frozenset((Role.KEY,)) if self.bounded_replay_on_generation else frozenset()
+
     def get_disagg_pool_view_partition(self, layer_id: LayerId, role: DataRole):
         """Keep remote-tail SWA independently selectable in the transfer layout."""
         if not self.bounded_replay_on_generation or role != CSA2CacheRole.SWA.role:
@@ -1921,6 +2007,13 @@ class CSA2CacheManager(KVCacheManagerV2):
             remote_tail=bool(
                 getattr(model_config, "extra_attrs", {}).get("bounded_replay_on_generation", False)
             ),
+        )
+        draft_specs = kwargs.get("layer_specs") or ()
+        sizes.extend(spec.bytes_per_token() for spec in draft_specs)
+        windows.extend(spec.sliding_window_size for spec in draft_specs)
+        scratch_groups.extend(
+            (ReusePolicy.PRIVATE if replay_window else ReusePolicy.REQUIRED).value
+            for _ in draft_specs
         )
         _, headroom = _get_generation_kv_capacity(
             spec_config, is_draft=kwargs.get("is_draft", False)

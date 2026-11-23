@@ -182,6 +182,8 @@ class PeerRegistrar:
         receiver before it registers with a sender, so a mismatch fails the
         receiver's requests instead of leaving them waiting for KV.
         """
+        if self._ri.bounded_replay_on_generation:
+            return
         if self._ri.num_draft_layers != peer_ri.num_draft_layers:
             # The layer-count tolerance in _check_peer_compatible would transfer
             # only the target layers and leave the drafter's prompt KV unset on
@@ -227,6 +229,7 @@ class PeerRegistrar:
         # trusted on any other field. Raises ValueError naming both versions.
         validate_protocol_version(peer_ri)
         self.validate_bounded_replay_compatible(peer_ri)
+        self.validate_draft_layers_compatible(peer_ri)
         if not self._get_policy(CacheKind.PAGED).check_peer_compatible(peer_ri):
             return False
 

@@ -1533,6 +1533,9 @@ class KvCacheCreator:
             extra_kwargs.update(
                 shared_draft_block_width=self._unified_drafter_block_width())
         if not is_draft:
+            draft_specs = self._get_embedded_draft_layer_specs()
+            if draft_specs:
+                extra_kwargs.setdefault("layer_specs", draft_specs)
             derived_windows = _derive_v2_layer_type_attention_windows(
                 kv_cache_config, manager_cls, model_config, self._max_seq_len)
             if derived_windows is not None:
@@ -2091,6 +2094,8 @@ class KvCacheCreator:
                     # A hybrid manager's appended draft layers.
                     num_pool_groups += _get_num_storage_pool_groups(
                         unified_layer_specs, self._tokens_per_block)
+            if self._get_embedded_draft_layer_specs():
+                num_pool_groups += 1
         num_cache_blocks *= num_pool_groups
 
         # Dummy context requests use the configured maximum beam width. Scale
@@ -2674,7 +2679,8 @@ class KvCacheCreator:
         # only be in the separate draft KV cache manager.
         # We still pass spec_config so that num_extra_kv_tokens is calculated.
         spec_dec_layer_mask = None
-        if self._should_create_separate_draft_kv_cache():
+        draft_specs = self._get_embedded_draft_layer_specs()
+        if self._should_create_separate_draft_kv_cache() or draft_specs:
             num_target_layers = self._model_engine.model.model_config.pretrained_config.num_hidden_layers
             spec_dec_layer_mask = [True] * num_target_layers
 
@@ -2727,7 +2733,7 @@ class KvCacheCreator:
             self._llm_args.kv_cache_config.kv_events_config,
             cold_page_codec_provider=cold_page_codec_provider,
             joint_kv_cache_reuse=self._joint_kv_cache_reuse,
-            layer_specs=unified_layer_specs,
+            layer_specs=draft_specs or unified_layer_specs,
             shared_draft_block_width=shared_draft_block_width,
             remote_donor=remote_donor,
         )
@@ -2746,6 +2752,39 @@ class KvCacheCreator:
                 self._max_seq_len = kv_cache_manager.max_seq_len
 
         return kv_cache_manager
+
+    def _get_embedded_draft_layer_specs(self):
+        """Describe the context KV read by the embedded CSA2 DSpark drafter."""
+        spec = self._speculative_config
+        if (spec is None or not spec.spec_dec_mode.is_dspark()
+                or not spec.draft_is_embedded_in_target
+                or getattr(getattr(self, "_sparse_attention_config", None),
+                           "algorithm", None) != "csa2"):
+            return ()
+        if not self._is_kv_cache_manager_v2:
+            raise ValueError(
+                "Embedded CSA2 DSpark requires KV cache manager V2")
+        if not self._kv_cache_manager_cls.accepts_appended_draft_layers():
+            raise ValueError(
+                "The target KV cache manager cannot hold draft layers")
+        from .kv_cache.kv_cache_manager_v2 import (KVCacheLayerOwner,
+                                                   KVCacheLayerSpec, Role)
+
+        draft = self._model_engine.model.draft_model
+        if not draft.reads_managed_ctx_pages(self._tokens_per_block):
+            raise ValueError(
+                "The embedded drafter cannot read context pages of this size")
+        first_layer = self._model_engine.model.model_config.pretrained_config.num_hidden_layers
+        return tuple(
+            KVCacheLayerSpec(
+                global_layer_id=first_layer + stage,
+                owner=KVCacheLayerOwner.DRAFT,
+                dtype=tensorrt_llm.bindings.DataType.BF16,
+                num_kv_heads=1,
+                head_dim=int(draft._attn_params["head_dim"]),
+                buffer_roles=(Role.KEY, ),
+                sliding_window_size=int(draft._attn_params["window_size"]) + 1,
+            ) for stage in range(draft.num_stages))
 
     def _should_create_separate_draft_kv_cache(self) -> bool:
         """
@@ -4823,6 +4862,8 @@ def _create_kv_cache_manager(
             head_dim = getattr(config, "head_dim", None)
         if not isinstance(head_dim, int):
             head_dim = hidden_size // num_attention_heads
+    if layer_specs is None:
+        layer_specs = model_layer_specs
 
     # Derive per-layer max_attention_window for any model that publishes a
     # mixed sliding/full `layer_types` schedule (Gemma4 hybrid included) so V2

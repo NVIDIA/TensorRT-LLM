@@ -835,6 +835,12 @@ def get_spec_worker(spec_config,
                 raise ValueError(
                     "use_ancestral_draft_sampling=True is not supported with a "
                     "drafter embedded in the target checkpoint.")
+            if getattr(getattr(model_config, "sparse_attention_config", None),
+                       "algorithm", None) == "csa2":
+                from .dspark_v41 import DSv41DSparkWorker
+
+                return DSv41DSparkWorker(spec_config, mapping,
+                                         use_separate_draft_kv_cache)
             return DSv4DSparkWorker(spec_config, mapping,
                                     use_separate_draft_kv_cache)
         return DSparkWorker(spec_config, mapping, use_separate_draft_kv_cache)

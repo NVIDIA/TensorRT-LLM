@@ -1907,12 +1907,17 @@ def test_attention_replicated_validation_rejects_missing_index_key_view():
         AttentionPolicy.validate_peer_compatible(self_pt, peer_pt)
 
 
-@pytest.mark.parametrize(("local_draft", "peer_draft"), [(0, 0), (1, 1), (1, 0), (0, 1)])
+@pytest.mark.parametrize(
+    "local_draft,peer_draft,remote_tail",
+    [(0, 0, False), (1, 1, False), (1, 0, False), (0, 1, False), (1, 0, True)],
+    ids=["0-0", "1-1", "1-0", "0-1", "remote_tail_without_draft_kv"],
+)
 def test_peer_registrar_requires_matching_unified_draft_layers(
-    local_draft: int, peer_draft: int
+    local_draft: int, peer_draft: int, remote_tail: bool
 ) -> None:
     self_rankinfo = make_rankinfo(instance_name="local")
     self_rankinfo.num_draft_layers = local_draft
+    self_rankinfo.bounded_replay_on_generation = remote_tail
     reg = _make_peer_registrar(self_rankinfo)
     peer_ri = make_rankinfo(
         instance_name="peer",
@@ -1921,7 +1926,8 @@ def test_peer_registrar_requires_matching_unified_draft_layers(
         page_table=make_page_table(),
     )
     peer_ri.num_draft_layers = peer_draft
-    if local_draft != peer_draft:
+    peer_ri.bounded_replay_on_generation = remote_tail
+    if local_draft != peer_draft and not remote_tail:
         with pytest.raises(
             ValueError,
             match=f"draft KV layer count differs.*local={local_draft}, peer={peer_draft}",

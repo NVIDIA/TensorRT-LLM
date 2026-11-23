@@ -64,6 +64,8 @@ def build_attention_metadata(
     enable_ragged_verification: bool = False,
 ) -> AttentionMetadata:
     """Construct attention metadata and resolve model-derived inputs."""
+    if draft_kv_cache_manager is kv_cache_manager:
+        draft_kv_cache_manager = None
     pretrained_config = model_config.pretrained_config
     sparse_attention_config = model_config.sparse_attention_config
     sparse_mla = has_sparse_mla_hooks(getattr(sparse_attention_config, "algorithm", None))

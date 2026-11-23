@@ -13,10 +13,12 @@ from ..._utils import get_sm_version
 from ..attention.kernels.blackwell.dspark.rmsnorm_rope import (
     DSparkBackfillKernel,
     DSparkConcatFP8QuantKernel,
+    DSparkPagedBackfillKernel,
     DSparkRMSNormFP8QuantKernel,
     DSparkRMSNormRoPECacheWriteKernel,
     DSparkRMSNormRoPEDraftBlockKernel,
     DSparkRMSNormRoPEKernel,
+    DSparkRMSNormRoPEPageWriteKernel,
 )
 from ..utils import mxfp8_scale_infer_shape
 
@@ -396,6 +398,54 @@ def _compile_dspark_backfill(num_stages: int, eps: float):
         windows_fake,
         cutlass.Int32(1),
         stream_fake,
+        options="--opt-level 2 --enable-tvm-ffi",
+    )
+
+
+@functools.cache
+def _compile_dspark_paged_backfill(num_stages: int, page_size: int, eps: float):
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("DSpark paged backfill must be warmed up before CUDA graph capture")
+    tokens = cute.sym_int()
+    kv = cute.runtime.make_fake_compact_tensor(
+        cutlass.BFloat16, (cute.sym_int(), _DSV4_DSPARK_HEAD_DIM), stride_order=(1, 0)
+    )
+    weight = cute.runtime.make_fake_compact_tensor(
+        cutlass.BFloat16, (num_stages, _DSV4_DSPARK_HEAD_DIM), stride_order=(1, 0)
+    )
+    freqs = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32, (cute.sym_int(), _DSV4_DSPARK_ROPE_DIM // 2, 2), stride_order=(2, 1, 0)
+    )
+    mask = cute.runtime.make_fake_compact_tensor(cutlass.Uint8, (tokens,), stride_order=(0,))
+    positions = cute.runtime.make_fake_compact_tensor(cutlass.Int64, (tokens,), stride_order=(0,))
+    tables = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32, (cute.sym_int(), cute.sym_int()), stride_order=(1, 0)
+    )
+    capacities = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int64, (cute.sym_int(),), stride_order=(0,)
+    )
+    pools = tuple(
+        cute.runtime.make_fake_tensor(
+            cutlass.BFloat16,
+            (cute.sym_int(), page_size, _DSV4_DSPARK_HEAD_DIM),
+            stride=(cute.sym_int64(), _DSV4_DSPARK_HEAD_DIM, 1),
+        )
+        for _ in range(num_stages)
+    )
+    return cute.compile(
+        DSparkPagedBackfillKernel(
+            _DSV4_DSPARK_HEAD_DIM, _DSV4_DSPARK_ROPE_DIM, eps, page_size, num_stages
+        ),
+        kv,
+        weight,
+        freqs,
+        mask,
+        positions,
+        tables,
+        capacities,
+        pools,
+        cutlass.Int32(1),
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--opt-level 2 --enable-tvm-ffi",
     )
 
@@ -930,3 +980,172 @@ def _(
         first.new_empty((rows, hidden_dim), dtype=torch.float8_e4m3fn),
         first.new_empty((mxfp8_scale_infer_shape([[rows, hidden_dim]]),), dtype=torch.uint8),
     )
+
+
+@torch.library.custom_op(
+    "trtllm::cute_dsl_dspark_paged_backfill", mutates_args=("pools",), device_types="cuda"
+)
+def cute_dsl_dspark_paged_backfill(
+    kv: torch.Tensor,
+    weight: torch.Tensor,
+    freqs: torch.Tensor,
+    mask: torch.Tensor,
+    positions: torch.Tensor,
+    block_tables: torch.Tensor,
+    capacities: torch.Tensor,
+    pools: list[torch.Tensor],
+    eps: float,
+) -> None:
+    """Write valid [request, interim, stage] RMSNorm/RoPE rows through absolute page mappings."""
+    compiled = _compile_dspark_paged_backfill(weight.shape[0], pools[0].shape[1], eps)
+    compiled(
+        kv.view(-1, _DSV4_DSPARK_HEAD_DIM),
+        weight,
+        freqs,
+        mask.view(-1).view(torch.uint8),
+        positions.view(-1),
+        block_tables,
+        capacities,
+        tuple(pools),
+        mask.shape[1],
+    )
+
+
+@torch.library.register_fake("trtllm::cute_dsl_dspark_paged_backfill")
+def _(
+    kv: torch.Tensor,
+    weight: torch.Tensor,
+    freqs: torch.Tensor,
+    mask: torch.Tensor,
+    positions: torch.Tensor,
+    block_tables: torch.Tensor,
+    capacities: torch.Tensor,
+    pools: list[torch.Tensor],
+    eps: float,
+) -> None:
+    return None
+
+
+@functools.cache
+def _compile_dspark_rmsnorm_rope_page_write(page_size: int, eps: float, device: int):
+    # Device identity scopes compilation to the active CUDA target.
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "DSpark RMSNorm/RoPE page-write must be warmed up before CUDA graph capture"
+        )
+    rows = cute.sym_int()
+    pages = cute.sym_int()
+    x_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.BFloat16, (rows, _DSV4_DSPARK_HEAD_DIM), stride_order=(1, 0)
+    )
+    weight_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.BFloat16, (_DSV4_DSPARK_HEAD_DIM,), stride_order=(0,)
+    )
+    freqs_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32,
+        (rows, _DSV4_DSPARK_ROPE_DIM // 2, 2),
+        stride_order=(2, 1, 0),
+    )
+    cache_fake = cute.runtime.make_fake_tensor(
+        cutlass.BFloat16,
+        (pages, page_size, _DSV4_DSPARK_HEAD_DIM),
+        stride=(cute.sym_int64(), _DSV4_DSPARK_HEAD_DIM, 1),
+    )
+    tables_fake = cute.runtime.make_fake_tensor(
+        cutlass.Int32, (rows, cute.sym_int()), stride=(cute.sym_int64(), 1)
+    )
+    start_pos_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int64, (rows,), stride_order=(0,)
+    )
+    capacities_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int64, (rows,), stride_order=(0,)
+    )
+    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    kernel = DSparkRMSNormRoPEPageWriteKernel(
+        _DSV4_DSPARK_HEAD_DIM,
+        _DSV4_DSPARK_ROPE_DIM,
+        eps,
+        page_size,
+    )
+    return cute.compile(
+        kernel,
+        x_fake,
+        weight_fake,
+        freqs_fake,
+        cache_fake,
+        tables_fake,
+        start_pos_fake,
+        capacities_fake,
+        stream_fake,
+        options="--opt-level 2 --enable-tvm-ffi",
+    )
+
+
+@torch.library.custom_op(
+    "trtllm::cute_dsl_dspark_rmsnorm_rope_page_write",
+    mutates_args=("kv_cache",),
+    device_types="cuda",
+)
+def cute_dsl_dspark_rmsnorm_rope_page_write(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    freqs: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    start_pos: torch.Tensor,
+    capacities: torch.Tensor,
+    eps: float,
+) -> None:
+    """Normalize/rotate [batch, 1, 512] KV into pages; zero capacities mask dummy rows."""
+    _validate_dspark_preparation(x, weight, freqs)
+    batch = x.shape[0]
+    if (
+        x.shape[1] != 1
+        or kv_cache.ndim != 3
+        or kv_cache.shape[1] not in (16, 32, 64, 128, 256)
+        or kv_cache.shape[2] != _DSV4_DSPARK_HEAD_DIM
+        or kv_cache.dtype != x.dtype
+        or kv_cache.stride(1) != _DSV4_DSPARK_HEAD_DIM
+        or kv_cache.stride(2) != 1
+        or block_tables.ndim != 2
+        or block_tables.shape[0] != batch
+        or block_tables.dtype != torch.int32
+        or block_tables.stride(1) != 1
+        or not all(
+            t.is_cuda and t.device == x.device
+            for t in (kv_cache, block_tables, start_pos, capacities)
+        )
+        or not all(
+            t.shape == (batch,) and t.dtype == torch.int64 and t.is_contiguous()
+            for t in (start_pos, capacities)
+        )
+    ):
+        raise ValueError(
+            "DSpark page write requires BF16 pages with contiguous tokens, INT32 "
+            "page-table rows and contiguous INT64 positions/capacities on x's device"
+        )
+    with torch.cuda.device(x.device):
+        compiled = _compile_dspark_rmsnorm_rope_page_write(kv_cache.shape[1], eps, x.device.index)
+        compiled(
+            x.view(batch, _DSV4_DSPARK_HEAD_DIM),
+            weight,
+            freqs,
+            kv_cache,
+            block_tables,
+            start_pos,
+            capacities,
+        )
+
+
+@torch.library.register_fake("trtllm::cute_dsl_dspark_rmsnorm_rope_page_write")
+def _(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    freqs: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    start_pos: torch.Tensor,
+    capacities: torch.Tensor,
+    eps: float,
+) -> None:
+    return None

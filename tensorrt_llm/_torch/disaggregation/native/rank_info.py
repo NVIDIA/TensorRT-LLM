@@ -106,6 +106,8 @@ class RankInfo:
         if not self.draft_layers_reshard_across_tp:
             # Only a hosting manager's peers need the field.
             data.pop("draft_layers_reshard_across_tp")
+        if not self.num_draft_layers:
+            data.pop("num_draft_layers")
         data["attention"] = self.attention.to_dict() if self.attention is not None else None
         data["aux_meta"] = self.aux_meta.to_dict() if self.aux_meta is not None else None
         data["page_table"] = self.page_table.to_dict() if self.page_table is not None else None

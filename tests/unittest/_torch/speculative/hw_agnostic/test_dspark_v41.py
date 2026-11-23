@@ -352,6 +352,52 @@ def test_v41_draft_tactic_resolves_against_the_draft_stages_only(
             )
 
 
+@pytest.mark.cpu_only
+def test_v41_context_draft_constructs_without_moe(monkeypatch):
+    from tensorrt_llm._torch.models.modeling_dspark_v41 import _DSv41DSparkContextDraftModel
+
+    monkeypatch.setattr(
+        modeling_dspark.DSv4DSparkDraftModel,
+        "_derive_draft_model_config",
+        classmethod(lambda cls, config, *args, **kwargs: config),
+    )
+    config = SimpleNamespace(
+        n_routed_experts=2,
+        num_experts_per_tok=1,
+        dspark_n_routed_experts=2,
+        dspark_num_experts_per_tok=1,
+        dspark_target_layer_ids=[0],
+        sliding_window=128,
+        candidate_topk_blocks=1,
+        num_hidden_layers=1,
+        num_nextn_predict_layers=3,
+        vocab_size=16,
+        hidden_size=8,
+        hc_mult=2,
+        num_attention_heads=1,
+        kv_lora_rank=448,
+        qk_rope_head_dim=64,
+        o_groups=1,
+        o_lora_rank=512,
+        rms_norm_eps=1e-6,
+        torch_dtype=torch.bfloat16,
+    )
+    model = _DSv41DSparkContextDraftModel(
+        SimpleNamespace(
+            pretrained_config=config,
+            skip_create_weights_in_init=True,
+            max_seq_len=512,
+            mapping=SimpleNamespace(tp_size=1, enable_attention_dp=False),
+        ),
+        {},
+        num_stages=3,
+        block_size=5,
+    )
+    assert len(model.mtp_layers) == 3
+    assert all(not hasattr(stage, "mlp") for stage in model.mtp_layers)
+    assert model.run_moe_lockstep_noop([1], torch.device("cpu")) is None
+
+
 def test_v41_draft_uses_smaller_expert_bank_without_changing_target(monkeypatch):
     captured = {}
 
@@ -768,3 +814,45 @@ def test_v41_explicit_draft_backend_preserves_nvfp4_conversion(monkeypatch):
     assert experts.group_size == 16
     assert (draft_config.moe_backend, draft_config.moe_tactic) == ("MEGAMOE_CUTEDSL", None)
     assert model_config.quant_config_dict is None
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("role", [None, "context", "generation"])
+def test_v41_context_draft_uses_target_spec_when_draft_config_clears_it(monkeypatch, role):
+    from tensorrt_llm._torch.models import modeling_dspark_v41
+
+    if role is None:
+        monkeypatch.delenv("TRTLLM_DISAGG_ROLE", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_DISAGG_ROLE", role)
+    monkeypatch.setattr(modeling_dspark, "count_dspark_stages", Mock(return_value=3))
+    monkeypatch.setattr(modeling_dspark, "validate_dspark_eplb_layer_base", Mock())
+    monkeypatch.setattr(modeling_dspark, "_draft_moe_selection", Mock(return_value=None))
+
+    def init_draft(self, *args, **kwargs):
+        nn.Module.__init__(self)
+        self.dspark_model = SimpleNamespace()
+
+    monkeypatch.setattr(modeling_dspark.DSv4DSparkForCausalLM, "__init__", init_draft)
+    target = SimpleNamespace(
+        use_cuda_graph=False,
+        moe_load_balancer=None,
+        spec_config=SimpleNamespace(
+            spec_dec_mode=SpeculativeDecodingMode.DSPARK,
+            draft_is_embedded_in_target=True,
+            speculative_model="unused-checkpoint",
+            block_size=3,
+        ),
+    )
+    draft = SimpleNamespace(
+        pretrained_config=SimpleNamespace(model_type="deepseek_v41"),
+        spec_config=None,
+        moe_load_balancer=None,
+    )
+    model = modeling_dspark._build_dspark_draft(target, draft, None, SimpleNamespace())
+    expected = (
+        modeling_dspark_v41._DSv41DSparkContextDraftModel
+        if role == "context"
+        else DSv41DSparkDraftModel
+    )
+    assert model.draft_model_cls is expected

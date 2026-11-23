@@ -24,7 +24,7 @@ from tensorrt_llm.llmapi.llm_args import (
     "draft_len", [None, 0, 3, 1], ids=["general", "cuda_graph_0", "cuda_graph_3", "cuda_graph_1"]
 )
 def test_warmup_builders_resynchronize_stale_draft_buffers(
-    config_cls: type[DecodingBaseConfig], draft_len: int | None
+    config_cls: type[DecodingBaseConfig], draft_len: int | None, monkeypatch
 ) -> None:
     spec = config_cls(max_draft_len=3, speculative_model="dummy", draft_len_schedule={1: 3, 4: 2})
     config = decoder_config(spec_config=spec)
@@ -40,6 +40,7 @@ def test_warmup_builders_resynchronize_stale_draft_buffers(
         config=KvCacheConfig(max_tokens=258, use_kv_cache_manager_v2=True),
         max_num_tokens=258,
     ) as manager:
+        monkeypatch.setattr(manager, "get_draft_kv_cache_view", lambda: manager)
         resource_manager = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: manager})
         batch_size = 2
         if draft_len is None:
@@ -62,6 +63,8 @@ def test_warmup_builders_resynchronize_stale_draft_buffers(
                 len(request.py_draft_tokens) == expected_buffer_width
                 for request in batch.generation_requests
             )
+            assert len(manager.kv_cache_map) == batch_size
+        assert not manager.kv_cache_map
 
 
 def _warmup_request_split(num_locality_domains: int):

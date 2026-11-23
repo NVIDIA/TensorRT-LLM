@@ -286,7 +286,7 @@ class DSparkSpecMetadata(SpecMetadata):
         # captured gen forward can index the rolling windows by tensor. Mirrors
         # ``DFlashSpecMetadata.prepare`` (dflash.py:96-113).
         worker = self._dspark_worker
-        if worker is not None and worker._win_inited:
+        if worker is not None and worker._win_inited and worker._kv_windows is not None:
             req_to_slot = worker._req_to_slot
             # Unknown request IDs (synthetic warmup / CUDA-graph padding, ADP idle
             # requests, or disagg seed forwards without a real id) map to the
@@ -791,6 +791,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
         table_len = int(getattr(inner_model, "_runtime_position_ceiling", 0) or config_cap)
         self._position_cap = (table_len - 1 - block_size) if table_len else None
 
+    def _allocate_context_storage(self, rows, stages, window, head_dim):
+        return torch.zeros((rows, stages, window, head_dim), dtype=torch.bfloat16, device="cuda")
+
     def _lazy_init(self, draft_model, spec_metadata, attn_metadata=None) -> None:
         block_size = int(draft_model.block_size)
         if block_size != self.max_draft_len:
@@ -838,10 +841,8 @@ class DSv4DSparkWorker(SpecWorkerBase):
                 CUDA_GRAPH_DUMMY_REQUEST_ID - 2 * (self.max_draft_len + 1) + 1
             )
 
-            self._kv_windows = torch.zeros(
-                (num_rows, num_stages, self._win, head_dim),
-                dtype=torch.bfloat16,
-                device="cuda",
+            self._kv_windows = self._allocate_context_storage(
+                num_rows, num_stages, self._win, head_dim
             )
             self._ctx_len = torch.zeros(num_rows, dtype=torch.long, device="cuda")
             self._valid_len = torch.zeros(num_rows, dtype=torch.long, device="cuda")
@@ -874,11 +875,14 @@ class DSv4DSparkWorker(SpecWorkerBase):
                 self._build_verify_planner(draft_model, block_size)
             self._free_slots = deque(range(num_slots))
             self._req_to_slot = {}
-            logger.info(
-                f"DSpark: allocated rolling KV windows "
-                f"[{num_rows}, {num_stages}, {self._win}, {head_dim}] "
-                f"({num_slots} request slots + 1 scratch row)"
-            )
+            if self._kv_windows is not None:
+                logger.info(
+                    f"DSpark: allocated rolling KV windows "
+                    f"[{num_rows}, {num_stages}, {self._win}, {head_dim}] "
+                    f"({num_slots} request slots + 1 scratch row)"
+                )
+            else:
+                logger.info(f"DSpark: initialized {num_slots} managed-page request slots")
             # Buffer state is complete independently of CuTe DSL prewarming.
             # A failed prewarm must not cause the next forward to recreate the
             # windows or reset the live slot maps.
@@ -1010,7 +1014,8 @@ class DSv4DSparkWorker(SpecWorkerBase):
         self._ctx_len[slot].zero_()
         self._valid_len[slot].zero_()
         self._position_initialized[slot].zero_()
-        self._kv_windows[slot].zero_()
+        if self._kv_windows is not None:
+            self._kv_windows[slot].zero_()
 
     def _seed_context_windows(
         self,
@@ -1480,7 +1485,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
             self._ctx_len.clone(),
             self._valid_len.clone(),
             self._position_initialized.clone(),
-            self._kv_windows.clone(),
+            None if self._kv_windows is None else self._kv_windows.clone(),
             # The confidence buffer is persistent state too; warmup scores
             # must not reach the verification planner.
             None if self._confidence_logits is None else self._confidence_logits.clone(),
@@ -1492,7 +1497,8 @@ class DSv4DSparkWorker(SpecWorkerBase):
         self._ctx_len.copy_(ctx_len)
         self._valid_len.copy_(valid_len)
         self._position_initialized.copy_(position_initialized)
-        self._kv_windows.copy_(windows)
+        if windows is not None:
+            self._kv_windows.copy_(windows)
         if confidence is not None:
             self._confidence_logits.copy_(confidence)
         if stamp is not None:

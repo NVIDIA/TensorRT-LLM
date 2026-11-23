@@ -27,6 +27,11 @@ from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import (
     CSA2CacheRole,
 )
 from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Layout
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    KVCacheLayerOwner,
+    KVCacheLayerSpec,
+    Role,
+)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType, SamplingConfig
@@ -46,6 +51,7 @@ def _managers(
     *,
     reuse: bool = False,
     remote_tail: bool = False,
+    draft_stages: int = 0,
 ) -> list[CSA2CacheManager]:
     assert pp == 1  # CSA2 PP remains explicitly unsupported.
     return [
@@ -63,6 +69,19 @@ def _managers(
             layout=layout,
             is_disagg=True,
             bounded_replay_on_generation=remote_tail,
+            layer_specs=[
+                KVCacheLayerSpec(
+                    global_layer_id=len(layout.compress_ratios) + stage,
+                    owner=KVCacheLayerOwner.DRAFT,
+                    dtype=DataType.BF16,
+                    num_kv_heads=1,
+                    head_dim=512,
+                    buffer_roles=(Role.KEY,),
+                    sliding_window_size=129,
+                )
+                for stage in range(draft_stages)
+            ]
+            or None,
         )
         for rank in range(tp)
     ]
@@ -189,6 +208,46 @@ def test_csa2_shared_owner_kv_transfer(
         manager_factory=functools.partial(_managers, layout=layout),
         init_fn=_init_csa2_pool_data,
         verify_fn=_verify,
+    )
+
+
+@pytest.mark.parametrize("ctx_tp,gen_tp", [(1, 1), (1, 2), (2, 1)])
+def test_csa2_shared_draft_kv_handoff(monkeypatch, ctx_tp, gen_tp):
+    monkeypatch.setenv("TRTLLM_V41_DECODER_BOUNDED_REPLAY", "1")
+    layout = CSA2Layout((0, 2, 2, 1, 1, 1), (1, 3), (1, 3, 4), candidate_source_layer_id=3)
+
+    def verify(**kwargs):
+        _verify(**kwargs)
+        lengths = kwargs["request_lengths"]
+        ctx_managers, gen_managers = kwargs["ctx_managers"], kwargs["gen_managers"]
+        ctx_ids, gen_ids = kwargs["ctx_request_ids"], kwargs["gen_request_ids"]
+        for row, length in enumerate(lengths):
+            source = ctx_managers[0]
+            for target in gen_managers:
+                for layer in target.draft_layer_ids:
+                    src_pages = source.get_batch_cache_indices([ctx_ids[row]], layer)[0]
+                    dst_pages = target.get_batch_cache_indices([gen_ids[row]], layer)[0]
+                    src = source.get_buffers(layer, kv_layout="HND")
+                    dst = target.get_buffers(layer, kv_layout="HND")
+                    first = max(0, length + 1 - 129) // TOKENS_PER_BLOCK
+                    end = (length + TOKENS_PER_BLOCK - 1) // TOKENS_PER_BLOCK
+                    for logical in range(first, end):
+                        assert src_pages[logical] >= 0 and dst_pages[logical] >= 0
+                        torch.testing.assert_close(
+                            dst[dst_pages[logical]], src[src_pages[logical]], rtol=0, atol=0
+                        )
+
+    run_kv_transfer_test(
+        ctx_tp=ctx_tp,
+        ctx_pp=1,
+        gen_tp=gen_tp,
+        gen_pp=1,
+        ctx_enable_dp=False,
+        gen_enable_dp=False,
+        update_before_transfer=True,
+        manager_factory=functools.partial(_managers, layout=layout, draft_stages=3),
+        init_fn=_init_csa2_pool_data,
+        verify_fn=verify,
     )
 
 

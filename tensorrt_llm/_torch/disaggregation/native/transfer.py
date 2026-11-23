@@ -3623,6 +3623,7 @@ class Receiver(ReceiverBase):
                 sender_info = RankInfo.from_bytes(message[0])
                 validate_protocol_version(sender_info)
                 self._registrar.validate_bounded_replay_compatible(sender_info)
+                self._registrar.validate_draft_layers_compatible(sender_info)
                 MambaPolicy.validate_peer_compatible(
                     self._registrar.self_rank_info,
                     sender_info,
