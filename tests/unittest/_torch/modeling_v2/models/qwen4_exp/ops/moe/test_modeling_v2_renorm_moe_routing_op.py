@@ -69,6 +69,43 @@ def _check(logits, topk, output_dtype=None):
     return ids, weights
 
 
+def _capture(logits, topk, output_dtype):
+    """Capture one call over a private copy of the step's logits after a side-stream warmup:
+    `(graph, static logits, static outputs)`."""
+    static = logits.clone()
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        op(static, topk, output_dtype)
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = op(static, topk, output_dtype)
+    return graph, static, out
+
+
+def _same(a, b) -> bool:
+    """Ids and weights bitwise equal."""
+    return torch.equal(a[0], b[0]) and torch.equal(a[1], b[1])
+
+
+def _cell_logits(s, seed):
+    return _logits(
+        s["tokens"], s["num_experts"], s["logits_dtype"], s["dist"], s.get("magnitude", 1.0), seed
+    )
+
+
+def _check_sums(weights, s) -> None:
+    """Renormalized: every row sums to 1."""
+    assert weights.dtype == s["output_dtype"]
+    torch.testing.assert_close(
+        weights.float().sum(-1),
+        torch.ones(s["tokens"], device=DEV),
+        rtol=8e-3 if s["output_dtype"] is torch.bfloat16 else 1e-6,
+        atol=0.0,
+    )
+
+
 # ── the certified cells ───────────────────────────────────────────────────
 
 
@@ -76,23 +113,29 @@ def _check(logits, topk, output_dtype=None):
 def test_certified_cells(cell, certifying):  # noqa: F811 — pytest resolves the fixture by this name
     certifying(op)
     s = cell.spec
-    logits = _logits(
-        s["tokens"],
-        s["num_experts"],
-        s["logits_dtype"],
-        s["dist"],
-        s.get("magnitude", 1.0),
-        seed=zlib.crc32(cell.why.encode()),
-    )
+    seed = zlib.crc32(cell.why.encode())
+    logits = _cell_logits(s, seed)
     ids, weights = _check(logits, s["topk"], s["output_dtype"])
-    assert weights.dtype == s["output_dtype"]
-    # renormalized: every row sums to 1
-    torch.testing.assert_close(
-        weights.float().sum(-1),
-        torch.ones(s["tokens"], device=DEV),
-        rtol=8e-3 if s["output_dtype"] is torch.bfloat16 else 1e-6,
-        atol=0.0,
+    _check_sums(weights, s)
+    if not s.get("capture"):
+        return
+
+    # The replay is bitwise the eager call; a second step's logits replay bitwise their own.
+    graph, static, replayed = _capture(logits, s["topk"], s["output_dtype"])
+    graph.replay()
+    torch.cuda.synchronize()
+    assert _same(replayed, (ids, weights)), "the replay differs from the eager call it captured"
+    second = _cell_logits(s, seed + 1)
+    static.copy_(second)
+    graph.replay()
+    torch.cuda.synchronize()
+    step2 = (replayed[0].clone(), replayed[1].clone())
+    assert not torch.equal(step2[0], ids), "the second step reroutes"
+    assert _same(step2, op(second, s["topk"], s["output_dtype"])), (
+        "the second replay differs from its eager call"
     )
+    _compare(step2, op.reference(second, s["topk"], s["output_dtype"]))
+    _check_sums(step2[1], s)
 
 
 # ── what a cell cannot carry ──────────────────────────────────────────────

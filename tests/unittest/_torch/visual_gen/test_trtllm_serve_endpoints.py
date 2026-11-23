@@ -234,8 +234,11 @@ class MockVisualGen:
         self._req_counter = 0
         # Captured arguments of the most recent generate / generate_async call,
         # used by tests to assert forwarded VisualGenParams fields.
+        # ``last_params`` is the engine's snapshot; ``last_route_params`` is the
+        # object the route passed in, which the route may change afterwards.
         self.last_inputs = None
         self.last_params = None
+        self.last_route_params = None
         # Resolved reference bytes per slot, recorded at generation time.
         self.last_ref_bytes = {}
         # Stand-in for the coordinator-side executor proxy. The async video
@@ -294,6 +297,10 @@ class MockVisualGen:
 
     def generate_async(self, inputs=None, params=None) -> "MockVisualGenResult":
         self.last_inputs = inputs
+        self.last_route_params = params
+        # Mirror the engine: work on a snapshot, not the caller's object.
+        if params is not None:
+            params = params.model_copy(deep=True)
         self.last_params = params
         if self._validation_error is not None:
             raise self._validation_error
@@ -473,7 +480,7 @@ def _create_server(
     return client
 
 
-def _create_async_client(generator: MockVisualGen, model_name: str = "test-model"):
+def _create_async_client(generator: MockVisualGen, model_name: str = "test-model", **server_kwargs):
     """Build the VISUAL_GEN server and return an ``httpx.AsyncClient`` over its
     ASGI app.
 
@@ -495,6 +502,7 @@ def _create_async_client(generator: MockVisualGen, model_name: str = "test-model
             tool_parser=None,
             server_role=ServerRole.VISUAL_GEN,
             metadata_server_cfg=None,
+            **server_kwargs,
         )
     return httpx.AsyncClient(
         transport=httpx.ASGITransport(app=server.app), base_url="http://testserver"
@@ -659,9 +667,9 @@ def _mock_video_encoding():
     ],
 )
 def test_response_format_path_rejected_when_disabled(tmp_path, monkeypatch, endpoint, payload):
-    """With ``TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1``, ``response_format='path'``
+    """With ``TRTLLM_MEDIA_DISABLE_PATH_RESPONSE=1``, ``response_format='path'``
     is rejected with 400 on the image and video (sync + async) endpoints."""
-    monkeypatch.setenv("TRTLLM_DISALLOW_LOCAL_MEDIA_PATH", "1")
+    monkeypatch.setenv("TRTLLM_MEDIA_DISABLE_PATH_RESPONSE", "1")
     monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
     gen = MockVisualGen(
         image_output=_make_dummy_image_tensor(),
@@ -1295,11 +1303,11 @@ class TestImageEdit:
         assert os.path.exists(item["path"])
 
     def test_image_edit_response_format_path_rejected_when_disabled(self, tmp_path, monkeypatch):
-        """``TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1`` gates the edit route too,
+        """``TRTLLM_MEDIA_DISABLE_PATH_RESPONSE=1`` gates the edit route too,
         so the path transport cannot leak server-side paths on shared
         deployments."""
         client, _ = self._client(tmp_path, monkeypatch)
-        monkeypatch.setenv("TRTLLM_DISALLOW_LOCAL_MEDIA_PATH", "1")
+        monkeypatch.setenv("TRTLLM_MEDIA_DISABLE_PATH_RESPONSE", "1")
 
         resp = client.post(
             "/v1/images/edits",
@@ -3615,3 +3623,207 @@ async def test_video_omni_invalid_reference_part(value, status, repeat, omni_ref
         resp = await client.post("/v1/videos", data={"prompt": "Invalid reference"}, files=files)
     assert resp.status_code == status, resp.text
     assert generator.last_inputs is None
+
+
+async def _wait_for(condition, timeout: float = 10.0):
+    deadline = time.monotonic() + timeout
+    while not condition() and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+    assert condition()
+
+
+def _path_reference_video_body(path: Path) -> dict:
+    return {
+        "prompt": "cat",
+        "size": "64x64",
+        "seconds": 1.0,
+        "fps": 8,
+        "image_reference": {"content": str(path), "format": "path"},
+    }
+
+
+def _write_reference_png(directory: Path) -> Path:
+    path = directory / "ref.png"
+    Image.new("RGB", (4, 4), (64, 64, 64)).save(str(path))
+    return path
+
+
+class TestPathReferenceRoutes:
+    """``format='path'`` references on the video routes."""
+
+    @pytest.fixture
+    def client(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
+        return _create_server(MockVisualGen(video_output=_make_dummy_video_tensor()))
+
+    @pytest.mark.parametrize("route", ["/v1/videos", "/v1/videos/sync"])
+    def test_a_path_reference_is_refused_without_an_input_dir(
+        self, client, tmp_path, monkeypatch, route
+    ):
+        monkeypatch.delenv("TRTLLM_MEDIA_ALLOWED_INPUT_DIR", raising=False)
+
+        resp = client.post(route, json=_path_reference_video_body(_write_reference_png(tmp_path)))
+
+        assert resp.status_code == 400, resp.text
+        assert client.mock_gen.last_inputs is None
+
+    @pytest.mark.parametrize("route", ["/v1/videos", "/v1/videos/sync"])
+    def test_a_path_reference_reaches_the_engine_as_bytes(
+        self, client, tmp_path, monkeypatch, route
+    ):
+        """The route reads the file and hands the engine its bytes, then drops
+        its own copy once the engine holds a snapshot."""
+        monkeypatch.setenv("TRTLLM_MEDIA_ALLOWED_INPUT_DIR", str(tmp_path))
+        path = _write_reference_png(tmp_path)
+
+        resp = client.post(route, json=_path_reference_video_body(path))
+
+        assert resp.status_code in (200, 202), resp.text
+        assert client.mock_gen.last_params.image_reference[0].format == "bytes"
+        assert client.mock_gen.last_ref_bytes["image_reference"] == [path.read_bytes()]
+        assert client.mock_gen.last_route_params.image_reference is None
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_request_keeps_its_parse_worker_until_the_parse_ends(
+    tmp_path, monkeypatch
+):
+    """A request that reads files is parsed on the media-load pool: its size
+    bounds the parses in flight, and a parse whose request was cancelled holds
+    its worker until it returns."""
+    from tensorrt_llm.serve import openai_server
+
+    server_cls = openai_server.OpenAIServer
+    submit = server_cls._parse_visual_gen_params
+    parse = openai_server.parse_visual_gen_params
+    release = threading.Event()
+    submitted, started = [], []
+
+    async def counting_submit(self, request):
+        # Hands the parse to the pool before its first await.
+        submitted.append(request)
+        return await submit(self, request)
+
+    def blocking_parse(request, generator):
+        started.append(threading.current_thread().name)
+        if len(started) == 1:
+            release.wait(10)
+        return parse(request, generator)
+
+    monkeypatch.setattr(server_cls, "_parse_visual_gen_params", counting_submit)
+    monkeypatch.setattr(openai_server, "parse_visual_gen_params", blocking_parse)
+    monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
+    monkeypatch.setenv("TRTLLM_MEDIA_ALLOWED_INPUT_DIR", str(tmp_path))
+    body = _path_reference_video_body(_write_reference_png(tmp_path))
+    generator = MockVisualGen(video_output=_make_dummy_video_tensor())
+    try:
+        async with _create_async_client(generator, media_load_workers=1) as client:
+            first = asyncio.create_task(client.post("/v1/videos", json=body))
+            await _wait_for(lambda: started)
+            first.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await first
+
+            second = asyncio.create_task(client.post("/v1/videos", json=body))
+            await _wait_for(lambda: len(submitted) == 2)
+            release.set()
+            resp = await second
+    finally:
+        release.set()
+    assert resp.status_code == 202, resp.text
+    assert started == ["trtllm_media_load_0"] * 2
+
+
+@pytest.mark.asyncio
+async def test_a_request_that_reads_no_file_is_parsed_inline(tmp_path, monkeypatch):
+    """Only parses that read files take a media-load worker, so a request
+    without one does not wait behind slow reads."""
+    from tensorrt_llm.serve import openai_server
+
+    parse = openai_server.parse_visual_gen_params
+    started = []
+
+    def recording_parse(request, generator):
+        started.append(threading.current_thread().name)
+        return parse(request, generator)
+
+    monkeypatch.setattr(openai_server, "parse_visual_gen_params", recording_parse)
+    monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
+    generator = MockVisualGen(image_output=_make_dummy_image_tensor())
+    body = {"prompt": "cat", "response_format": "b64_json", "size": "64x64"}
+    async with _create_async_client(generator) as client:
+        resp = await client.post("/v1/images/generations", json=body)
+    assert resp.status_code == 200, resp.text
+    assert started == [threading.current_thread().name]
+
+
+def test_server_shutdown_stops_the_media_load_pool(tmp_path, monkeypatch):
+    from tensorrt_llm.inputs.media_io import BaseMediaIO
+    from tensorrt_llm.llmapi.disagg_utils import ServerRole
+    from tensorrt_llm.serve.openai_server import OpenAIServer
+
+    monkeypatch.setattr(BaseMediaIO, "_executor", None)
+    monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
+    with patch("tensorrt_llm.serve.openai_server._is_visual_gen_instance", return_value=True):
+        server = OpenAIServer(
+            generator=MockVisualGen(image_output=_make_dummy_image_tensor()),
+            model="test-model",
+            tool_parser=None,
+            server_role=ServerRole.VISUAL_GEN,
+            metadata_server_cfg=None,
+        )
+    with TestClient(server.app):
+        assert BaseMediaIO._executor is server._media_load_executor
+    with pytest.raises(RuntimeError):
+        server._media_load_executor.submit(int)
+    assert BaseMediaIO._executor is None
+
+
+class TestPathResponseStartupCheck:
+    """The path-response startup check runs on VisualGen servers only."""
+
+    _FORMER_ENV = "TRTLLM_DISALLOW_LOCAL_MEDIA_PATH"
+
+    def test_a_visual_gen_server_refuses_the_former_name_before_its_pools(self, monkeypatch):
+        from tensorrt_llm.inputs.media_io import BaseMediaIO
+        from tensorrt_llm.llmapi.disagg_utils import ServerRole
+        from tensorrt_llm.serve.openai_server import OpenAIServer
+
+        monkeypatch.setattr(BaseMediaIO, "_executor", None)
+        monkeypatch.setenv(self._FORMER_ENV, "1")
+        with patch("tensorrt_llm.serve.openai_server._is_visual_gen_instance", return_value=True):
+            with pytest.raises(ValueError, match="renamed"):
+                OpenAIServer(
+                    generator=MockVisualGen(image_output=_make_dummy_image_tensor()),
+                    model="test-model",
+                    tool_parser=None,
+                    server_role=ServerRole.VISUAL_GEN,
+                    metadata_server_cfg=None,
+                )
+        assert BaseMediaIO._executor is None
+
+    def test_other_servers_ignore_the_former_name(self, monkeypatch):
+        """The variable only ever applied to VisualGen, so an LLM server
+        reaches its own initialization with it set."""
+        from types import SimpleNamespace
+
+        from tensorrt_llm.inputs.media_io import BaseMediaIO
+        from tensorrt_llm.serve.openai_server import OpenAIServer
+
+        class _ReachedLlmInit(Exception):
+            pass
+
+        def _init_llm(self, chat_template=None):
+            raise _ReachedLlmInit
+
+        monkeypatch.setattr(BaseMediaIO, "_executor", None)
+        monkeypatch.setenv(self._FORMER_ENV, "1")
+        monkeypatch.setattr(OpenAIServer, "_init_llm", _init_llm)
+        with pytest.raises(_ReachedLlmInit):
+            OpenAIServer(
+                generator=SimpleNamespace(),
+                model="test-model",
+                tool_parser=None,
+                server_role=None,
+                metadata_server_cfg=None,
+            )

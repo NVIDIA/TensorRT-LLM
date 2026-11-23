@@ -45,6 +45,7 @@
 //
 
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/nativeMemory.h"
 #include "tensorrt_llm/kernels/ulyssesPermuteScatterKernel.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
@@ -289,6 +290,9 @@ private:
         return idx;
     }
 
+    // Neither buffer comes from the PyTorch caching allocator.
+    static constexpr char const* kSlotMemoryLabel = tensorrt_llm::common::nativeMemoryLabels::kUlyssesA2aSlots;
+
     // Lazy collective allocator. Cached when size is sufficient; reallocates
     // (releasing the old handle) on size-up. All ranks must reach this in the
     // same order (collective rendezvous).
@@ -351,7 +355,21 @@ private:
         if (slot.sendBuf != nullptr)
         {
             (void) cudaFree(slot.sendBuf);
+            // A slot holds a send buffer and a symmetric receive buffer, both slot.size bytes, recorded as one
+            // allocation. mCanonicalHandle keeps the receive buffer of the handle it was taken from mapped, so
+            // replacing that slot frees only the send buffer and the receive buffer stays a live allocation.
+            auto const slotBytes = static_cast<std::int64_t>(slot.size);
+            if (slot.handle.get() == mCanonicalHandle.get())
+            {
+                tensorrt_llm::common::adjustNativeAllocation(kSlotMemoryLabel, currentDev, -slotBytes);
+            }
+            else
+            {
+                tensorrt_llm::common::recordNativeRelease(kSlotMemoryLabel, currentDev, 2 * slotBytes);
+            }
         }
+        tensorrt_llm::common::recordNativeAllocation(
+            kSlotMemoryLabel, currentDev, 2 * static_cast<std::int64_t>(requiredSize));
         slot.symm_tensor = std::move(newSymmTensor);
         slot.handle = std::move(newHandle);
         slot.basePtr = slot.symm_tensor.data_ptr();

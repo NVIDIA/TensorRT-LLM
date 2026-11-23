@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The decode path's latent MoE on the catalog's Kimi K3 MoE entries.
+"""The decode path's latent MoE on the Kimi K3 MoE ops.
 
 **At most 8 tokens** (`MAX_TOKENS`), a MoE layer runs:
 
@@ -48,6 +48,7 @@ from typing import Optional, Union
 import torch
 from torch import nn
 
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.mnnvl_workspace import MnnvlWorkspace
 from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.comm.k3_latent_reduce import (
     K3LatentExchange,
     k3_latent_reduce,
@@ -55,8 +56,8 @@ from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.comm.k3_latent_reduce
 from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.comm.mnnvl_allgather_split import (
     mnnvl_allgather_split,
 )
-from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.comm.mnnvl_workspace import (
-    MnnvlWorkspace,
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.gemm.dsv3_router_gemm import (
+    dsv3_router_gemm,
 )
 from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.moe.k3_moe import (
     K3MoeHeadWorkspace,
@@ -73,8 +74,8 @@ from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.moe.k3_moe_front impo
     weight_supported,
 )
 from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.moe.k3_route_quant import k3_route_quant
-from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
 
+from ..norm import run_in_parallel
 from .decode_comm import K3DecodeComm, PendingTail, wide_all_reduce
 
 # The most tokens of the front and the small k3_moe build (one token tile), and of the wide build.
@@ -370,13 +371,12 @@ class K3DecodeMoeLayer:
                 _gemv(gemvs, "moe_shared_gate_up", x, shared.gate_up_proj.weight)
             )
 
-        routed, shared_act = maybe_execute_in_parallel(
+        routed, shared_act = run_in_parallel(
             _routed_partial,
             _shared_activation,
             moe.moe_main_event,
             moe.moe_shared_event,
             moe.shared_expert_stream,
-            disable_on_compile=True,
         )
         # The latent norm's weight is folded into the tail weight: normalize the whole latent row, keep this rank's
         # columns.
@@ -392,7 +392,7 @@ def _gemv(
     gemvs, site: str, x: torch.Tensor, weight: torch.Tensor, out_fp32: bool = False
 ) -> torch.Tensor:
     """``x @ weight.T`` on ``site``'s decode GEMV where it takes the call (``decode_gemv.K3DecodeGemvs.project``),
-    else on the stock GEMM: cuBLAS through ``trtllm::dsv3_router_gemm_op`` for an fp32 output, ``F.linear`` else."""
+    else on the stock GEMM: ``gemm/dsv3_router_gemm`` for an fp32 output, ``F.linear`` else."""
     y = None if gemvs is None else gemvs.project(site, x, weight)
     if y is not None:
         return y
@@ -402,7 +402,5 @@ def _gemv(
             raise ValueError(
                 f"the fp32 GEMM needs a contiguous weight, got strides {weight.stride()}"
             )
-        return torch.ops.trtllm.dsv3_router_gemm_op(
-            x.contiguous(), weight.t(), bias=None, out_dtype=torch.float32
-        )
+        return dsv3_router_gemm(x.contiguous(), weight)
     return torch.nn.functional.linear(x, weight)

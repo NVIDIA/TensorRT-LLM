@@ -195,11 +195,22 @@ class HcUpGateMeanKernel:
     """
 
     def __init__(
-        self, block_h: int, hc: int, hidden: int, rank: int, num_n_stage: int = 2, fp4: bool = False
+        self,
+        block_h: int,
+        hc: int,
+        hidden: int,
+        rank: int,
+        num_n_stage: int = 2,
+        fp4: bool = False,
+        wide: bool = False,
     ):
         assert block_h in (32, 64) and hidden % block_h == 0 and rank % 64 == 0
+        assert not (wide and fp4), "the NVFP4 epilogue stores 32-column rows"
         self.bh, self.hc, self.hidden, self.rank = block_h, hc, hidden, rank
         self.fp4 = fp4
+        # `wide`: eight epilogue warps; warps w and w + 4 read the same TMEM lane quarter and
+        # take the two 16-column halves of each stream's `block_h` columns.
+        self.wide = wide
         self.acc_dtype = cutlass.Float32
         self.io_dtype = cutlass.BFloat16
         self.mma_tiler = (128, hc * block_h, 1)
@@ -211,6 +222,12 @@ class HcUpGateMeanKernel:
         self.tma_warp_id = 5
         self.nrm_warp_id = 6
         self.threads_per_cta = 32 * 7
+        if wide:
+            assert block_h == 32
+            self.epi_cols = 16
+            self.epilogue_warp_id = tuple(range(8))
+            self.mma_warp_id, self.tma_warp_id, self.nrm_warp_id = 8, 9, 10
+            self.threads_per_cta = 32 * 11
         self.num_n_stage = num_n_stage
         self.epilog_sync_bar_id = 1
         self.tmem_alloc_sync_bar_id = 2
@@ -235,13 +252,15 @@ class HcUpGateMeanKernel:
         smem_capacity = utils.get_smem_capacity_in_bytes()
         # One normed stage is the 32-column slice of every stream for one tile half.
         self.n_box = (self.mma_tiler[0], self.epi_cols)
-        self.num_n_bytes = self.hc * self.n_box[0] * self.n_box[1] * 2
+        # A normed stage holds `n_slots` boxes: every stream, with `wide` both halves of each.
+        self.n_slots = self.hc * (self.bh // self.epi_cols if self.wide else 1)
+        self.num_n_bytes = self.n_slots * self.n_box[0] * self.n_box[1] * 2
         self.num_ab_stage = min(
             8, (smem_capacity - 2048 - self.num_n_stage * self.num_n_bytes) // ab_bytes
         )
         self.n_pre = min(self.num_ab_stage, self.rank // self.mma_tiler[2])
         self.n_smem_layout_staged = utils.sm100.make_smem_layout_epi(
-            self.io_dtype, utils.LayoutEnum.ROW_MAJOR, self.n_box, self.num_n_stage * self.hc
+            self.io_dtype, utils.LayoutEnum.ROW_MAJOR, self.n_box, self.num_n_stage * self.n_slots
         )
         self.a_smem_layout_staged = utils.sm100.make_smem_layout_a(
             tiled_mma, self.mma_tiler, self.io_dtype, self.num_ab_stage
@@ -573,15 +592,27 @@ class HcUpGateMeanKernel:
             col_blocks = self.hidden // self.epi_cols
             while work_tile.is_valid_tile:
                 crd = work_tile.tile_idx
-                for half in cutlass.range_constexpr(halves):
+                if cutlass.const_expr(self.wide):
+                    # One stage a tile: box (half, stream) in slot half * C + stream.
                     handle = n_producer.acquire_and_advance()
-                    for s in cutlass.range_constexpr(self.hc):
-                        cute.copy(
-                            tma_atom_n,
-                            tNgN[(None, crd[0], s * col_blocks + crd[1] * halves + half)],
-                            tNsN[(None, handle.index * self.hc + s)],
-                            tma_bar_ptr=handle.barrier,
-                        )
+                    for half in cutlass.range_constexpr(halves):
+                        for s in cutlass.range_constexpr(self.hc):
+                            cute.copy(
+                                tma_atom_n,
+                                tNgN[(None, crd[0], s * col_blocks + crd[1] * halves + half)],
+                                tNsN[(None, handle.index * self.n_slots + half * self.hc + s)],
+                                tma_bar_ptr=handle.barrier,
+                            )
+                else:
+                    for half in cutlass.range_constexpr(halves):
+                        handle = n_producer.acquire_and_advance()
+                        for s in cutlass.range_constexpr(self.hc):
+                            cute.copy(
+                                tma_atom_n,
+                                tNgN[(None, crd[0], s * col_blocks + crd[1] * halves + half)],
+                                tNsN[(None, handle.index * self.hc + s)],
+                                tma_bar_ptr=handle.barrier,
+                            )
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
             n_producer.tail()
@@ -634,7 +665,11 @@ class HcUpGateMeanKernel:
             )
             tAcc_epi = cute.flat_divide(tCtAcc_base[((None, None), 0, 0, None)], epi_tile)
             tiled_copy_t2r = tcgen05.make_tmem_copy(copy_atom_t2r, tAcc_epi[(None, None, 0, 0, 0)])
-            thr_copy_t2r = tiled_copy_t2r.get_slice(tidx)
+            # With `wide`, warp w + 4 reads warp w's TMEM lanes (rows); it takes the other half.
+            etid = tidx
+            if cutlass.const_expr(self.wide):
+                etid = tidx % 128
+            thr_copy_t2r = tiled_copy_t2r.get_slice(etid)
             tTR_tAcc_base = thr_copy_t2r.partition_S(tAcc_epi)
             tTR_sN = thr_copy_t2r.partition_D(sN)
             tTR_gX = thr_copy_t2r.partition_D(
@@ -676,7 +711,35 @@ class HcUpGateMeanKernel:
                 row_ok = cX_t[(0, 0, 0, 0)][0] < m
 
                 acc_pipeline.consumer_wait(acc_consumer_state)
-                for half in cutlass.range_constexpr(halves):
+                if cutlass.const_expr(self.wide):
+                    # This warp's half of every stream's columns, in the 4-warp form's arithmetic.
+                    g = warp_idx // 4
+                    n_handle = n_consumer.wait_and_advance()
+                    for s in cutlass.range_constexpr(self.hc):
+                        cute.autovec_copy(
+                            tTR_sN[
+                                (None, None, None, n_handle.index * self.n_slots + g * self.hc + s)
+                            ],
+                            rN,
+                        )
+                        cute.copy(
+                            tiled_copy_t2r,
+                            tTR_tAcc[(None, None, None, s * halves + g)],
+                            tTR_rAcc,
+                        )
+                        for i in cutlass.range_constexpr(nfrag):
+                            gate = _sigmoid(tTR_rAcc[i])
+                            if cutlass.const_expr(s == 0):
+                                tTR_rSum[i] = gate * rN[i].to(self.acc_dtype)
+                            else:
+                                tTR_rSum[i] = tTR_rSum[i] + gate * rN[i].to(self.acc_dtype)
+                    cute.arch.sync_warp()
+                    n_handle.release()
+                    for i in cutlass.range_constexpr(nfrag):
+                        tTR_rX[i] = (tTR_rSum[i] * inv_hc).to(self.io_dtype)
+                    if row_ok:
+                        cute.autovec_copy(tTR_rX, gX_t[(None, None, None, g)])
+                for half in cutlass.range_constexpr(0 if self.wide else halves):
                     n_handle = n_consumer.wait_and_advance()
                     for s in cutlass.range_constexpr(self.hc):
                         cute.autovec_copy(
@@ -736,14 +799,16 @@ class HcUpGateMeanKernel:
 _COMPILED: dict = {}
 
 
-def _launcher(block_h: int, hc: int, hidden: int, rank: int, ptrs, fp4: bool = False):
+def _launcher(
+    block_h: int, hc: int, hidden: int, rank: int, ptrs, fp4: bool = False, wide: bool = False
+):
     """Compile once per static configuration; later calls reuse the TVM-FFI entry,
     which launches on the caller's current stream (graph-capturable). `ptrs` is
     `(low, up, normed, mixed tensor, xq, sf, gs)`."""
-    key = (block_h, hc, hidden, rank, fp4)
+    key = (block_h, hc, hidden, rank, fp4, wide)
     fn = _COMPILED.get(key)
     if fn is None:
-        kern = HcUpGateMeanKernel(block_h, hc, hidden, rank, fp4=fp4)
+        kern = HcUpGateMeanKernel(block_h, hc, hidden, rank, fp4=fp4, wide=wide)
         cptrs = [
             make_ptr(cutlass.BFloat16, p, cute.AddressSpace.gmem, assumed_align=16)
             for p in ptrs[:3]
@@ -769,7 +834,12 @@ def _launcher(block_h: int, hc: int, hidden: int, rank: int, ptrs, fp4: bool = F
 
 
 def hc_up_gate_mean(
-    low: torch.Tensor, up: torch.Tensor, normed: torch.Tensor, hc_count: int, block_h: int
+    low: torch.Tensor,
+    up: torch.Tensor,
+    normed: torch.Tensor,
+    hc_count: int,
+    block_h: int,
+    wide: bool = False,
 ) -> torch.Tensor:
     """Launch the fused kernel; `up` is the `[R, C*H]` transposed view of the
     `[C*H, R]` up weight, as `cublas_mm(low, up)` takes it."""
@@ -780,7 +850,7 @@ def hc_up_gate_mean(
         ptrs = (low.data_ptr(), up.data_ptr(), normed.data_ptr())
         # The NVFP4 pointers are never read without `fp4`.
         unused = (mixed.data_ptr(),) * 3
-        _launcher(block_h, hc_count, hidden, rank, (*ptrs, mixed, *unused))(
+        _launcher(block_h, hc_count, hidden, rank, (*ptrs, mixed, *unused), wide=wide)(
             rows, *ptrs, mixed, *unused
         )
     return mixed
@@ -869,6 +939,9 @@ class Qwen4ExpHcUpGateMean(OpWrapper):
     turns it off): each CTA's first tile streams its up-weight stages before
     `griddepcontrol.wait` and reads `low` / `normed` after it.
 
+    `wide=True` runs the epilogue on eight warps instead of four, each element in the
+    four-warp form's arithmetic, so the bits are the same (bf16 output only).
+
     Certified: bf16 at the checkpoint's 4 x 2560, rank 320, at 1 and 32 rows
     (part of one tile), 128 (one full tile), 1024, 8192, 16384 and 16390 rows
     (a partial last tile); graph replay.
@@ -889,14 +962,24 @@ class Qwen4ExpHcUpGateMean(OpWrapper):
     """
 
     def __call__(
-        self, low: torch.Tensor, up: torch.Tensor, normed: torch.Tensor, hc_count: int
+        self,
+        low: torch.Tensor,
+        up: torch.Tensor,
+        normed: torch.Tensor,
+        hc_count: int,
+        wide: bool = False,
     ) -> torch.Tensor:
-        return hc_up_gate_mean(low, up, normed, hc_count, _BLOCK_H)
+        return hc_up_gate_mean(low, up, normed, hc_count, _BLOCK_H, wide)
 
     def reference(
-        self, low: torch.Tensor, up: torch.Tensor, normed: torch.Tensor, hc_count: int
+        self,
+        low: torch.Tensor,
+        up: torch.Tensor,
+        normed: torch.Tensor,
+        hc_count: int,
+        wide: bool = False,
     ) -> torch.Tensor:
-        """float64, one rounding."""
+        """float64, one rounding. `wide` does not change the result."""
         hidden = normed.shape[1] // hc_count
         gate = torch.sigmoid(F.linear(low.double(), up.double().t())).unflatten(
             -1, (hc_count, hidden)
@@ -905,8 +988,14 @@ class Qwen4ExpHcUpGateMean(OpWrapper):
         return (gate * x).mean(dim=-2).to(normed.dtype)
 
     def is_valid(
-        self, low: torch.Tensor, up: torch.Tensor, normed: torch.Tensor, hc_count: int
+        self,
+        low: torch.Tensor,
+        up: torch.Tensor,
+        normed: torch.Tensor,
+        hc_count: int,
+        wide: bool = False,
     ) -> None:
+        # `wide` needs 32-column blocks and bf16: always true of this entry.
         rows, rank = low.shape
         width = normed.shape[1]
         assert low.dtype == up.dtype == normed.dtype == torch.bfloat16, "bf16 operands"

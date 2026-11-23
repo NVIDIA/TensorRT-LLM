@@ -3,8 +3,9 @@
 
 """MXFP8 GEMM implementations with explicit, externally selected tactics.
 
-Every candidate accumulates each output over K in one sequential FP32 pass and rounds once, so all
-tactics return the same bits for the same inputs and an output row never depends on the other rows.
+Candidates accumulate over K in FP32 without split-K. The SM107 native backend can differ from
+the Blackwell backends at BF16 rounding boundaries; its accuracy contract is the MXFP8 operator
+tolerance against dequantized operands, rather than equality to another backend's output bytes.
 """
 
 from functools import lru_cache
@@ -23,16 +24,17 @@ MXFP8_DEFAULT_BACKENDS = (
     "cutedsl_swap_ab",
     "trtllm_cutlass",
 )
+_MXFP8_SUPPORTED_BACKENDS = (*MXFP8_DEFAULT_BACKENDS, "cutedsl_sm107")
 # Decode-graph GEMMs read their weights from HBM on every use: profile with a cold L2.
 _COLD_L2_FLUSH_BYTES = 256 << 20  # 256 MiB
 
 
 def validate_mxfp8_backends(backends: tuple[str, ...]) -> tuple[str, ...]:
     """Validate and canonicalize the ordered MXFP8 candidate list."""
-    if not backends or any(backend not in MXFP8_DEFAULT_BACKENDS for backend in backends):
+    if not backends or any(backend not in _MXFP8_SUPPORTED_BACKENDS for backend in backends):
         raise ValueError(
             f"Invalid MXFP8 allowed backends {backends!r}; "
-            f"expected a nonempty subset of {MXFP8_DEFAULT_BACKENDS!r}"
+            f"expected a nonempty subset of {_MXFP8_SUPPORTED_BACKENDS!r}"
         )
     return tuple(dict.fromkeys(backends))
 
@@ -160,8 +162,82 @@ class TrtllmMXFP8GemmRunner(TunableRunner):
         return self._native().forward([*inputs, alpha], tactic=tactic)
 
 
+class Sm107MXFP8GemmRunner(TunableRunner):
+    """Expose the native prefill tile for the SM107 CSA2 O-B projection."""
+
+    _ALPHA: ClassVar[dict] = {}
+
+    def __init__(self, output_dtype: torch.dtype):
+        self.output_dtype = output_dtype
+
+    def unique_id(self) -> tuple:
+        return (self.output_dtype,)
+
+    def _supports(self, inputs: list[torch.Tensor]) -> bool:
+        act, act_scale, weight, weight_scale = inputs
+        return (
+            self.output_dtype == torch.bfloat16
+            and act.is_cuda
+            and act.ndim == weight.ndim == 2
+            and 1024 <= act.shape[0] <= 2048
+            and tuple(weight.shape) == (5120, 8192)
+            and act.shape[1] == 8192
+            and act.dtype == weight.dtype == torch.float8_e4m3fn
+            and act_scale.dtype == weight_scale.dtype == torch.uint8
+            and act_scale.numel() == ((act.shape[0] + 127) // 128) * 128 * 256
+            and weight_scale.numel() == 5120 * 256
+            and all(t.device == act.device and t.is_contiguous() for t in inputs)
+            and torch.cuda.get_device_capability(act.device) == (10, 7)
+        )
+
+    def _prepare(self, inputs: list[torch.Tensor]):
+        from .cute_dsl_custom_ops import CuteDSLMXFP8RubinLinear
+
+        act, act_scale, weight, weight_scale = inputs
+        alpha = self._ALPHA.get(act.device.index)
+        if alpha is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("Run the SM107 MXFP8 GEMM before CUDA graph capture")
+            alpha = self._ALPHA[act.device.index] = torch.ones(
+                1, dtype=torch.float32, device=act.device
+            )
+        return CuteDSLMXFP8RubinLinear(self.output_dtype), [
+            act,
+            weight,
+            act_scale,
+            weight_scale,
+            alpha,
+        ]
+
+    def get_valid_tactics(
+        self, inputs: list[torch.Tensor], profile: OptimizationProfile | None, **kwargs
+    ) -> list:
+        if not self._supports(inputs):
+            return []
+        from . import cute_dsl_custom_ops
+
+        if not hasattr(cute_dsl_custom_ops, "CuteDSLMXFP8RubinLinear"):
+            return []
+        from .cute_dsl_custom_ops import _mxfp8_prefill_tactic_sm107
+
+        runner, prepared = self._prepare(inputs)
+        tactic = _mxfp8_prefill_tactic_sm107(runner, prepared)
+        return [tactic] if tactic is not None else []
+
+    def forward(self, inputs: list[torch.Tensor], tactic=-1) -> torch.Tensor:
+        if not self._supports(inputs):
+            raise ValueError("SM107 MXFP8 O-B GEMM does not support these inputs")
+        if tactic == -1:
+            tactics = self.get_valid_tactics(inputs, None)
+            if not tactics:
+                raise ValueError("SM107 MXFP8 O-B GEMM does not support these inputs")
+            tactic = tactics[0]
+        runner, prepared = self._prepare(inputs)
+        return runner(prepared, tactic=tactic)
+
+
 class MXFP8GemmUnifiedRunner(TunableRunner):
-    """Compare concrete FlashInfer, TensorRT-LLM CUTLASS and Swap-AB configurations in one tuner."""
+    """Compare explicit FlashInfer, CUTLASS, Swap-AB and SM107 tactics in one tuner."""
 
     # Graph warmup visits each capture shape; cache and profiling use that exact M.
     tuning_config = TuningConfig(cold_l2_flush_bytes=_COLD_L2_FLUSH_BYTES)
@@ -179,6 +255,8 @@ class MXFP8GemmUnifiedRunner(TunableRunner):
                 if backend == "cutedsl_swap_ab"
                 else TrtllmMXFP8GemmRunner(output_dtype)
                 if backend == "trtllm_cutlass"
+                else Sm107MXFP8GemmRunner(output_dtype)
+                if backend == "cutedsl_sm107"
                 else FlashInferMXFP8GemmRunner(output_dtype, backend)
             )
             for backend in self.allowed_backends
@@ -201,7 +279,7 @@ class MXFP8GemmUnifiedRunner(TunableRunner):
             for backend, runner in self.runners.items():
                 supported = (
                     bool(runner.get_valid_tactics(inputs, None))
-                    if backend in ("cutedsl_swap_ab", "trtllm_cutlass")
+                    if backend in ("cutedsl_swap_ab", "trtllm_cutlass", "cutedsl_sm107")
                     else runner._supports(inputs)
                 )
                 if supported:
