@@ -25,10 +25,9 @@ FP4_SCALE = 448.0 * 6.0 / 8.0
 op = m._ctxnormq_op()
 if op is None:
     # The op's kernel is built for SM103 and refuses SM107, so this target's boundary keeps the fused all-reduce.
-    pytest.skip(
+    pytestmark = pytest.mark.skip(
         "CTXNORMQ: this target's _ctxnormq_op() declines SM107 "
         "(mv2_minimax_m3::minimax_m31_ctx_residual_rmsnorm_mxfp8 runs on SM103 only)",
-        allow_module_level=True,
     )
 
 
