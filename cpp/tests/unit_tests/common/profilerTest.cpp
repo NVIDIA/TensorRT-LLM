@@ -26,6 +26,47 @@
 #include <string>
 #include <vector>
 
+#if defined(__linux__)
+namespace
+{
+thread_local bool failNextProfilerAllocation{false};
+}
+
+//! Inject one allocation failure from shared LibTorch in this test executable only.
+void* operator new(std::size_t size)
+{
+    if (failNextProfilerAllocation)
+    {
+        failNextProfilerAllocation = false;
+        throw std::bad_alloc{};
+    }
+    size = std::max(size, std::size_t{1});
+    while (true)
+    {
+        if (auto* memory = std::malloc(size))
+        {
+            return memory;
+        }
+        auto const handler = std::get_new_handler();
+        if (!handler)
+        {
+            throw std::bad_alloc{};
+        }
+        handler();
+    }
+}
+
+void operator delete(void* memory) noexcept
+{
+    std::free(memory);
+}
+
+void operator delete(void* memory, std::size_t) noexcept
+{
+    std::free(memory);
+}
+#endif
+
 namespace tc = tensorrt_llm::common;
 
 namespace
@@ -226,6 +267,53 @@ TEST(ProfilerStartupDeathTest, NoneSelectionNeverEvaluatesFactoriesOrEmitsScopes
         },
         ::testing::ExitedWithCode(0), "");
 }
+
+#if defined(__linux__)
+//! A failed global-callback snapshot must omit observation without aborting the operation.
+TEST(ProfilerStartupDeathTest, CallbackProbeAllocationFailurePreservesOperationException)
+{
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_EXIT(
+        {
+            unsetenv("TLLM_PROFILE_CUSTOM_REGIONS");
+            if (tc::initializeProfilerRegions())
+            {
+                std::exit(1);
+            }
+            auto const handle = at::addGlobalCallback(at::RecordFunctionCallback(observeStart, observeEnd)
+                                                          .needsInputs(false)
+                                                          .scopes({at::RecordScope::USER_SCOPE}));
+            std::logic_error const bodyError{"original body failure"};
+            bool bodyRan{false};
+            bool bodyExceptionPreserved{false};
+            failNextProfilerAllocation = true;
+            try
+            {
+                tc::RecordFunctionWithMetadata scope{tc::ProfilerRegion::kWorkflow};
+                scope.startWithLazyName(
+                    []() -> std::string { return "failed-probe"; }, [](tc::ProfilerMetadata&) { std::exit(1); });
+                bodyRan = true;
+                throw bodyError;
+            }
+            catch (std::logic_error const& error)
+            {
+                bodyExceptionPreserved = std::string{error.what()} == "original body failure";
+            }
+            if (failNextProfilerAllocation || !bodyRan || !bodyExceptionPreserved || observation().starts != 0
+                || observation().ends != 0)
+            {
+                std::exit(1);
+            }
+            {
+                tc::RecordFunctionWithMetadata scope{tc::ProfilerRegion::kWorkflow};
+                scope.startWithLazyName([]() -> std::string { return "recovered"; }, [](tc::ProfilerMetadata&) {});
+            }
+            at::removeCallback(handle);
+            std::exit(observation().starts == 1 && observation().ends == 1 ? 0 : 1);
+        },
+        ::testing::ExitedWithCode(0), "^TensorRT-LLM profiler warning: observation omitted: .+\n$");
+}
+#endif
 #endif
 
 //! Compare native encoding of Unicode, escaped strings, signed integers, and empty lists to a golden payload.

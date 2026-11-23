@@ -174,13 +174,17 @@ std::string ProfilerMetadata::take() &&
 //! Prepare a same-thread user scope only when the selected region has an active callback.
 RecordFunctionWithMetadata::RecordFunctionWithMetadata(ProfilerRegion region) noexcept
 {
-    if (!customRegionEnabled(region) || !at::hasCallbacks())
+    if (!customRegionEnabled(region))
     {
         return;
     }
-    mRegion = kRegionNames[static_cast<std::uint8_t>(region)].data();
     try
     {
+        if (!at::hasCallbacks())
+        {
+            return;
+        }
+        mRegion = kRegionNames[static_cast<std::uint8_t>(region)].data();
         mRecord.emplace(at::RecordScope::USER_SCOPE);
         if (!mRecord->isActive())
         {
