@@ -6643,7 +6643,9 @@ class K31DFlashWorker(
                 self._kv_rewind_pending = True
                 return None
         else:
-            kv_lens = rewind = num_accepted_tokens[:0]
+            # The kernel requires unit-stride placeholders. A one-request TP count can be a
+            # column of the agreement buffer, and slicing it to zero retains the column stride.
+            kv_lens = rewind = num_accepted_tokens.new_empty((0,))
         return k31_dflash2_draft_tail(
             kv_lens,
             rewind,

@@ -236,3 +236,26 @@ def test_the_dsa_manager_takes_the_fused_record(monkeypatch) -> None:
     )
     assert meta_f.saved_fields == meta_t.saved_fields
     assert meta_f.spec_dec_updates == meta_t.spec_dec_updates
+
+
+@_ACCEPT_RECORD_SM
+@_ACCEPT_RECORD_DSL
+def test_draft_tail_warmup_for_one_tp_request() -> None:
+    worker = modeling.K31DFlashWorker.__new__(modeling.K31DFlashWorker)
+    worker.guided_decoder = None
+    worker._kv_rewind_amount = torch.tensor([-1], dtype=torch.int32, device="cuda")
+    # TP agreement returns rank zero's accepted tokens and count from one packed row.
+    packed = torch.tensor([[11, 12, 13, 14, 15, 2]], dtype=torch.int32, device="cuda")
+    tokens, counts = packed[:, :-1].contiguous(), packed[:, -1].contiguous()
+    assert counts.stride() == (6,)
+    drafts = torch.tensor([[21, 22, 23, 24]], dtype=torch.int32, device="cuda")
+    kv_lens = torch.tensor([7], dtype=torch.int32, device="cuda")
+    metadata = types.SimpleNamespace(
+        is_cuda_graph=True, batch_indices_cuda=torch.tensor([0], device="cuda")
+    )
+
+    result = worker._k31_draft_tail(
+        types.SimpleNamespace(kv_lens_cuda=kv_lens), metadata, tokens, drafts, 1, counts
+    )
+    assert result.tolist() == [[12, 21, 22, 23, 24]]
+    assert kv_lens.tolist() == [7]
