@@ -114,7 +114,7 @@ def close_in_forked_child(resource: socket.socket | IO[bytes]) -> None:
     _closed_in_forked_child().add(resource)
 
 
-def _readable(watched: list, timeout_s: Optional[float]) -> list:
+def wait_readable(watched: list, timeout_s: Optional[float]) -> list:
     """Return the files of ``watched`` that are readable within ``timeout_s``, None to block.
 
     Unlike ``select.select``, this accepts descriptors numbered above ``FD_SETSIZE``.
@@ -391,14 +391,14 @@ class MembershipClient:
                     return
                 listed = member
             watched = [self._sock, self._wake_read]
-            readable = _readable(watched, max(0.0, tick_s - time.monotonic()))
+            readable = wait_readable(watched, max(0.0, tick_s - time.monotonic()))
             if (
                 self._sock not in readable
                 and time.monotonic() - heard_s > AUTHORITY_SILENCE_TIMEOUT_S
             ):
                 # This thread can wait long for a CPU or the GIL after its select returns, while the
                 # authority's lines arrive. Look again before taking the authority as silent.
-                readable = _readable(watched, 0.0)
+                readable = wait_readable(watched, 0.0)
                 if self._sock not in readable:
                     raise TimeoutError(
                         "the membership authority sent nothing for "

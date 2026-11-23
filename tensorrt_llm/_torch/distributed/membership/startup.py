@@ -56,7 +56,7 @@ from ...pyexecutor.hang_detector import RANK_CRASH_KILL_GRACE_ENV
 from ..communicator import Distributed
 from ..host_exchange import MnnvlDistFactory
 from ..startup_record import REPLACEMENT_CANNOT_START, ReplacementCannotStart, StartupRecord
-from .liveness import MembershipClient, _readable, close_in_forked_child, rendezvous_store
+from .liveness import MembershipClient, close_in_forked_child, rendezvous_store, wait_readable
 from .records import (
     MAX_RANKS,
     RENDEZVOUS_TIMEOUT_S,
@@ -561,7 +561,7 @@ def _start_authority(world_size: int, gpus_per_node: int, timeout_s: float) -> s
         finally:
             os.close(write_fd)
         close_in_forked_child(process.stdin)
-        ready = _readable([address_pipe], timeout_s)
+        ready = wait_readable([address_pipe], timeout_s)
         address = address_pipe.readline().strip() if ready else ""
     if not address:
         process.kill()

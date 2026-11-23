@@ -1460,16 +1460,19 @@ class DecoderWarmup:
         replacement = startup_record is not None and startup_record.replacement
         if tune_alone:
             Distributed.pause_startup_record()
-        ran_native_forward = run_autotuner_pass(
-            autotune(
-                cache_path=cache_path,
-                prime_all_runners=replacement,
-                report_progress=startup_record.report_progress if replacement else None,
-            ),
-            synchronize_trtllm_cache=True,
-        )
+        try:
+            ran_native_forward = run_autotuner_pass(
+                autotune(
+                    cache_path=cache_path,
+                    prime_all_runners=replacement,
+                    report_progress=startup_record.report_progress if replacement else None,
+                ),
+                synchronize_trtllm_cache=True,
+            )
+        finally:
+            if tune_alone:
+                Distributed.resume_startup_record()
         if tune_alone:
-            Distributed.resume_startup_record()
             AutoTuner.get().setup_distributed_state(self.mapping, self.dist)
         ran_flashinfer_forward = False
         if enable_flashinfer_mxfp8_autotuner:

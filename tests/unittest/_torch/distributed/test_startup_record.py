@@ -850,6 +850,16 @@ def test_replacement_tunes_a_missing_shape_alone():
     _record().close()
 
 
+def test_failed_replacement_warmup_resumes_the_record():
+    """Resume the startup record when the warmup that a replacement runs alone raises."""
+    _, published, tuned_tactics = _original_rank_0(16, 16)
+    replacement = _replacement_engine(published, tuned_tactics)
+    replacement._forward_warmup.side_effect = RuntimeError("warmup forward failed")
+    with pytest.raises(RuntimeError, match="warmup forward failed"):
+        replacement.autotuner_warmup(16)
+    assert _record().active
+
+
 def test_replacement_warmup_reports_startup_progress():
     """Check that each step of the warmup a replacement runs alone counts as startup progress.
 
