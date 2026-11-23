@@ -197,7 +197,8 @@ class VSATrtllmAttention(TrtllmAttention):
 
     @classmethod
     def support_valid_seq_len(cls) -> bool:
-        """The sparse path attends every row of the sequence."""
+        """The sparse forward does not read the caller's ``valid_seq_len``: the predictor fills
+        the key validity bits of the block-sparse kernel for its own layout."""
         return False
 
 
