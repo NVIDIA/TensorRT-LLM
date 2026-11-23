@@ -96,6 +96,7 @@ def _load_output_exchange_namespace():
         "static_fp8_output_scale",
         "unpack_u4_output",
         "exchange_fp8_output",
+        "exchange_bf16_output",
     }
     body = [
         node
@@ -132,10 +133,20 @@ def _load_pipeline_namespace(output_ns):
         return SimpleNamespace(all=lambda: math.isfinite(scale.value))
 
     exchanged = []
+    exchanged_bf16 = []
+    fused_qk = []
 
     def fake_exchange(raw_out, scale, group):
         exchanged.append((raw_out.shape, scale.value, group))
         return _FakeTensor((1, raw_out.shape[1] // 4, 56 * 128), dtype="fp8")
+
+    def fake_exchange_bf16(raw_out, group):
+        exchanged_bf16.append((raw_out.shape, group))
+        return _FakeTensor((1, raw_out.shape[1] // 4, 56 * 128), dtype="bf16")
+
+    def fake_qk_norm_rope_pack(qkv, wq, wk, cos, sin, eps, valid_rows, group):
+        fused_qk.append((qkv.shape, valid_rows, group))
+        return ("SEND_FUSED", "DESCALES_FUSED")
 
     ns = {
         "torch": SimpleNamespace(
@@ -150,11 +161,15 @@ def _load_pipeline_namespace(output_ns):
         "MiniMaxH3Attention": type("MiniMaxH3Attention", (), {"__init__": lambda self, *a, **k: None}),
         "static_fp8_output_scale": output_ns["static_fp8_output_scale"],
         "exchange_fp8_output": fake_exchange,
+        "exchange_bf16_output": fake_exchange_bf16,
         "pack_qkv": lambda q, k, v, valid_rows, group: ("SEND", "DESCALES"),
+        "qk_norm_rope_pack_qkv": fake_qk_norm_rope_pack,
     }
     exec(compile(ast.Module(body=[cls_node], type_ignores=[]), str(U4 / "pipeline.py"), "exec"), ns)
     ns["_finite_calls"] = finite_calls
     ns["_exchanged"] = exchanged
+    ns["_exchanged_bf16"] = exchanged_bf16
+    ns["_fused_qk"] = fused_qk
     return ns
 
 
@@ -273,21 +288,35 @@ class TestFp8U4OutputExchangeContracts(unittest.TestCase):
         self.assertEqual(attn._bf16_output_exchange_calls, 0)
         self.assertEqual(len(self.pipe_ns["_exchanged"]), 1)
 
-        # Protected BF16 block stays on BF16 output A2A.
+        # Protected BF16 block uses fast BF16 unpack on NHD.
         attn.to_out = [_make_linear(quant_method=_FakeUnquantMethod())]
         out_bf16 = attn._packed_forward(q, k, v)
         self.assertEqual(out_bf16.dtype, "bf16")
         self.assertEqual(out_bf16.shape, (1, 4, 56 * 128))
         self.assertEqual(attn._fp8_output_exchange_calls, 1)
         self.assertEqual(attn._bf16_output_exchange_calls, 1)
-        self.assertEqual(len(bf16_calls), 1)
+        self.assertEqual(len(self.pipe_ns["_exchanged_bf16"]), 1)
+        self.assertEqual(len(bf16_calls), 0)
 
-        # HND layout falls back cleanly to BF16 output A2A.
+        # HND layout falls back cleanly to stock BF16 output A2A.
         attn.attn.inner_backend.preferred_layout = "HND"
         attn.to_out = [_make_linear(scale=_FakeScale(0.25, ptr=8192))]
         out_hnd = attn._packed_forward(q, k, v)
         self.assertEqual(out_hnd.dtype, "bf16")
         self.assertEqual(attn._bf16_output_exchange_calls, 2)
+        self.assertEqual(len(bf16_calls), 1)
+
+        # Fused QK/RoPE + pack routes cleanly when enabled.
+        attn.attn.inner_backend.preferred_layout = "NHD"
+        attn.norm_q = SimpleNamespace(weight="WQ", variance_epsilon=1e-6)
+        attn.norm_k = SimpleNamespace(weight="WK", variance_epsilon=1e-6)
+        attn.to_out = [_make_linear(scale=_FakeScale(0.25, ptr=8192))]
+        qkv = _FakeTensor((1, 4, 3 * 56 * 128), dtype="bf16")
+        qkv.is_contiguous = lambda: True
+        out_fused = attn._fused_packed_forward(qkv, ("COS", "SIN"))
+        self.assertEqual(out_fused.dtype, "fp8")
+        self.assertEqual(attn._fused_qk_pack_calls, 1)
+        self.assertEqual(len(self.pipe_ns["_fused_qk"]), 1)
 
 
 if __name__ == "__main__":
