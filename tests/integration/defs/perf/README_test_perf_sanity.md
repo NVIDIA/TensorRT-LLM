@@ -78,6 +78,12 @@ The device value reported at iter `N` is the device step time of iter `N-1` (dev
 
 If the mean cannot be parsed for a `gen_only` run, `check_test_failure` raises `RuntimeError` and no data is uploaded. Other modes omit the five columns instead of failing: there the family is diagnostic and throughput still gates, so hard-failing would make every `e2e` case on every cluster red on log-scrape plumbing rather than on performance.
 
+#### `d_warmup_time`, `d_{ctx,gen}_<i>_warmup_time`
+
+Seconds from a server's launch until its `/health` first returns 200, so weight loading and the executor warmup are included; the client warmup requests are not. An aggregated row (also `ctx_only`) has one `d_warmup_time`; a disaggregated row has one field per worker (`d_ctx_0_warmup_time`, ..., `d_gen_0_warmup_time`, ...). They are uploaded only: not in `MINIMIZE_METRICS`, so they get no baseline and never gate.
+
+`test_e2e` uploads them for multi-node cases only (disaggregated, or a server with more GPUs than a node), which CI runs alone in their stage. A single-node stage runs several cases in one process, and each reuses the compile and tuning caches of the cases before it, so `test_warmup[<aggregated, ctx_only or gen_only_no_context id>]` measures single-node servers instead: it drops the checkpoint's page cache, starts the server with empty cache directories (`HOME`, `XDG_CACHE_HOME`, `TMPDIR` and every cache path the job sets, such as `TLLM_AUTOTUNER_CACHE_PATH`), records the same field and stops the server without running a client. Its rows are named `<server>-warmup` and carry `b_warmup_only`. CI runs it for the GB300 key models every 4th post-merge build (`l0_gb300_multi_gpus_perf_sanity_warmup`).
+
 ### Match Keys
 
 Match keys are the fields that identify a test case when looking up its history to
@@ -222,6 +228,7 @@ There are two modes for perf sanity tests: aggregated (aggr) and disaggregated (
 **File Naming**: `xxx.yaml` where words are connected by `_` (underscore), not `-` (hyphen). The suffix indicates the GPU target:
 - B200 configs: `xxx_blackwell.yaml` (e.g., `deepseek_r1_fp4_v2_blackwell.yaml`)
 - GB200 configs: `xxx_grace_blackwell.yaml` (e.g., `deepseek_r1_fp4_v2_grace_blackwell.yaml`)
+- GR100 (Rubin) configs: `xxx_rubin.yaml` (e.g., `qwen3_8_flash_next_fp4_rubin.yaml`)
 - Multi-node: add `_2_nodes` before the GPU suffix (e.g., `deepseek_r1_fp4_v2_2_nodes_grace_blackwell.yaml`)
 
 **Server Config Rules**:

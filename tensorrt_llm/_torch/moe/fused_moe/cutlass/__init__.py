@@ -25,6 +25,7 @@ from ..impl_environment import collect_moe_environment
 from .base import CutlassFusedMoEBase
 from .fp8 import TrtllmCutlassFp8Impl
 from .fp8_block_scales_hopper import DeepgemmCudaHopperFp8BlockScalesImpl
+from .fp8_block_scales_hopper_triton import TrtllmTritonFp8ActGroupedGemmFp8BlockScalesImpl
 from .fp8_block_scales_triton import TrtllmTritonFp8BlockScalesImpl
 from .lora import CutlassMoELoraMixin, raise_moe_lora_multichunk_unsupported
 from .mxfp8 import TrtllmCutlassMxfp8Impl
@@ -38,10 +39,13 @@ from .w4a16_nvfp4 import TrtllmCutlassW4a16Nvfp4Impl
 from .w8a16 import TrtllmCutlassW8a16Impl
 
 #: Every leaf in this family, in the order ``IMPL_PRIORITY`` ranks them and
-#: ``moe_resolution`` falls back to them. The order cannot change which leaf
-#: admits a problem: the ``quant`` segments are disjoint, except for the two
-#: ``fp8_block_scales`` leaves, whose SM sets are.
+#: ``moe_resolution`` falls back to them. The ``quant`` segments are disjoint
+#: except for the three ``fp8_block_scales`` leaves. The SM120/121 one has an SM
+#: set of its own. The two SM90 ones overlap, so the opt-in Triton
+#: FP8-activation leaf comes first: when opted in it wins, and otherwise it
+#: declines and the DeepGEMM leaf serves.
 CUTLASS_LEAVES: tuple[type[CutlassFusedMoEBase], ...] = (
+    TrtllmTritonFp8ActGroupedGemmFp8BlockScalesImpl,
     DeepgemmCudaHopperFp8BlockScalesImpl,
     TrtllmTritonFp8BlockScalesImpl,
     TrtllmCutlassNvfp4Impl,
@@ -62,7 +66,7 @@ def cutlass_leaves_in_resolution_order(
 ) -> tuple[type[CutlassFusedMoEBase], ...]:
     """Every leaf publishing ``quant_algo``, in ``CUTLASS_LEAVES`` order.
 
-    One entry for most formats and two for ``fp8_block_scales``, so a caller
+    One entry for most formats and three for ``fp8_block_scales``, so a caller
     asking "would a run serve this?" has to ask each, as resolution does.
     """
     quant = normalize_quant(canonical_quant(quant_algo))
@@ -75,9 +79,11 @@ def find_cutlass_leaf(
     """The leaf implementing ``quant_algo``, or ``None`` if none publishes it.
 
     A lookup, not an eligibility check, and resolution does not use it. ``sm``
-    only picks between the two ``fp8_block_scales`` leaves and defaults to the
-    SM resolution sees (``collect_moe_environment``, so an
-    ``override_moe_environment`` applies here too).
+    only picks among the ``fp8_block_scales`` leaves and defaults to the SM
+    resolution sees (``collect_moe_environment``, so an
+    ``override_moe_environment`` applies here too). A leaf with an
+    ``opt_in_flag`` is returned only when the collected environment sets that
+    flag to ``1``, as resolution would admit it.
 
     Args:
         quant_algo: The layer's quantization; ``None`` means unquantized.
@@ -90,9 +96,18 @@ def find_cutlass_leaf(
     leaves = cutlass_leaves_in_resolution_order(quant_algo)
     if len(leaves) <= 1:
         return leaves[0] if leaves else None
+    environment = collect_moe_environment()
     if sm is None:
-        sm = collect_moe_environment().sm
-    return next((leaf for leaf in leaves if leaf.sm_support.accepts(sm)), None)
+        sm = environment.sm
+    return next(
+        (
+            leaf
+            for leaf in leaves
+            if leaf.sm_support.accepts(sm)
+            and (leaf.opt_in_flag is None or environment.env_flag(leaf.opt_in_flag.value) == "1")
+        ),
+        None,
+    )
 
 
 def cutlass_leaf(
@@ -128,6 +143,7 @@ __all__ = [
     "TrtllmCutlassW4a16Mxfp4Impl",
     "TrtllmCutlassW4a16Nvfp4Impl",
     "TrtllmCutlassW8a16Impl",
+    "TrtllmTritonFp8ActGroupedGemmFp8BlockScalesImpl",
     "TrtllmTritonFp8BlockScalesImpl",
     "cutlass_leaf",
     "cutlass_leaves_in_resolution_order",

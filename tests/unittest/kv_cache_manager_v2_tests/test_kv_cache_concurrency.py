@@ -229,11 +229,10 @@ def test_optional_selection_and_resume_with_concurrent_priority_callbacks() -> N
         manager.shutdown()
 
 
-def test_capacity_and_history_length_setters_do_not_deadlock() -> None:
-    """The `capacity` / `history_length` property setters reach resize(), so they must free the GIL.
+def test_capacity_and_history_updates_do_not_deadlock() -> None:
+    """Capacity and history updates must release the GIL before taking the API lock.
 
-    Unlike `resize()` itself, these are `def_prop_rw` setters, which have no `call_guard` unless one
-    is written out by hand -- the case this guards against.
+    Property setters release it explicitly; resize uses a call guard.
     """
     manager = KVCacheManager(_make_config())
     try:
@@ -254,6 +253,7 @@ def test_capacity_and_history_length_setters_do_not_deadlock() -> None:
             cache.capacity = tokens_per_block * 4
             for history_length in range(tokens_per_block * 4):
                 cache.history_length = history_length
+                assert cache.resize(history_length=history_length, complete_optional_recovery=True)
             cache.suspend()
             cache.close()
         finally:

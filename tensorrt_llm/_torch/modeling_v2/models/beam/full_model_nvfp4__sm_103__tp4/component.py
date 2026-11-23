@@ -133,7 +133,9 @@ class BeamCheckpointLayoutNvfp4Sm103Tp4(BeamCheckpointLayoutBf16Sm103Tp4):
         """The rank-local storage of higher-precision tensor ``name``."""
         spec = self.specs[name]
         if isinstance(spec, QuantSpec):
-            raise ValueError(f"{name} is an NVFP4 expert projection; see expert_storage()")
+            raise ValueError(
+                f"{name} is an NVFP4 expert projection; use expert_bank() for packed weights and scales"
+            )
         return getattr(self, _attr(name))
 
     def bank(self, bank: str, field: str = "weight") -> torch.Tensor:
@@ -151,13 +153,6 @@ class BeamCheckpointLayoutNvfp4Sm103Tp4(BeamCheckpointLayoutBf16Sm103Tp4):
             kind: {f: self.bank(f"layers.{layer}.experts.{kind}", f) for f in BANK_FIELDS}
             for kind in _KINDS
         }
-
-    def expert_storage(self, layer: int, expert: int, proj: str) -> dict:
-        """Views of one expert projection's rank-local storage (``proj`` in ``PROJECTIONS``)."""
-        spec = self.specs.get(f"model.layers.{layer}.mlp.experts.{expert}.{proj}")
-        if not isinstance(spec, QuantSpec):
-            raise ValueError(f"layer {layer} expert {expert} {proj!r} is not held")
-        return {f: self.bank(spec.bank, f)[expert] for f in BANK_FIELDS}
 
     # ------------------------------------------------------------------ loading
 

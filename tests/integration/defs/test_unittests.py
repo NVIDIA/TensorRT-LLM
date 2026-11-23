@@ -68,6 +68,35 @@ def merge_report(base_file, extra_file, output_file, is_retry=False):
     base.write(output_file, encoding="UTF-8", xml_declaration=True)
 
 
+def _junit_all_tests_skipped(xml_path: str) -> bool:
+    """Whether every named testcase in a JUnit report was skipped.
+
+    The inner pytest exits 0 in that case, so ``test_unittests_v2`` would
+    otherwise be recorded as PASSED. A missing, empty, malformed, or mixed
+    report returns False.
+
+    Counts ``skipped`` elements on the testcases. pytest's ``LogXML`` records
+    a non-strict xfail as ``<skipped type="pytest.xfail">`` and includes it in
+    the suite ``skipped`` attribute, but those tests ran. ``PeriodicJUnitXML``
+    always writes the suite counts, so this does not read them.
+    """
+    import xml.etree.ElementTree as ElementTree
+    try:
+        root = ElementTree.parse(xml_path).getroot()
+    except (OSError, ElementTree.ParseError):
+        return False
+    cases = [case for case in root.iter("testcase") if case.get("name")]
+    skipped = 0
+    for case in cases:
+        if case.find("failure") is not None or case.find("error") is not None:
+            return False
+        skipped_node = case.find("skipped")
+        if (skipped_node is not None
+                and skipped_node.get("type") != "pytest.xfail"):
+            skipped += 1
+    return len(cases) > 0 and skipped == len(cases)
+
+
 def _junit_culprits(xml_path: str) -> list[str]:
     """Names of failed/errored tests in a JUnit report.
 
@@ -471,6 +500,9 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
     if not passed:
         _fail_unittests("failure reported in unittests", output_xml, output_dir,
                         case, unfinished_test_path)
+    if _junit_all_tests_skipped(output_xml):
+        import pytest
+        pytest.skip(f"{case}: all unittests skipped")
 
 
 def test_csa2_tensor_parallel(llm_root, llm_venv, output_dir):

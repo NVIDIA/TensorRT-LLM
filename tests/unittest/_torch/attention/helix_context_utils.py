@@ -19,8 +19,11 @@ Storage cases use Helix pages, check exact ownership and unchanged storage,
 and decode directly from prefill, including multiple context chunks.
 """
 
+import os
 import weakref
+from contextlib import ExitStack
 from dataclasses import dataclass
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
 import pytest
@@ -30,7 +33,10 @@ from _torch.modeling.kimi_k3_mla_reference import KimiMLAAttention
 from _torch.modeling.test_kimi_k3_checkpoint import load_mla_checkpoint
 from _torch.modeling.test_kimi_k3_mla import _assert_matches_reference, _checkpoint_weights
 from mpi4py import MPI
+from transformers import Qwen3Config
 
+from tensorrt_llm._torch.attention.backends.fmha.phased import FmhaParams
+from tensorrt_llm._torch.attention.backends.fmha.prims_ts import PrimsTSFmha
 from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures, KVCacheParams
 from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.configs.kimi_linear import KimiLinearConfig
@@ -39,6 +45,7 @@ from tensorrt_llm._torch.models.modeling_kimi_linear import KimiLinearForCausalL
 from tensorrt_llm._torch.pyexecutor.engine.metadata import build_attention_metadata
 from tensorrt_llm._torch.utils import model_extra_attrs
 from tensorrt_llm.functional import AllReduceStrategy
+from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig
 from tensorrt_llm.mapping import CpType, Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
@@ -54,10 +61,15 @@ class _Scenario:
     fp8_cache: bool = False
     compact_cache: bool = False
     chunked_history: bool = False
+    generation_query_width: int = 1
+    tokens_per_block: int = 64
+    strict_prims_ts: bool = False
 
 
 @torch.no_grad()
 def _check_context_heads(rank, world_size, scenario, use_nccl_for_alltoall, fifo_version):
+    if scenario.strict_prims_ts:
+        os.environ["TLLM_FMHA_LIBS"] = "prims_ts"
     torch.manual_seed(42)
     mapping = Mapping(
         world_size=world_size,
@@ -66,6 +78,7 @@ def _check_context_heads(rank, world_size, scenario, use_nccl_for_alltoall, fifo
         cp_size=scenario.cp_size,
         cp_config={
             "cp_type": CpType.HELIX,
+            "tokens_per_block": scenario.tokens_per_block,
             "use_nccl_for_alltoall": use_nccl_for_alltoall,
             "fifo_version": fifo_version,
         },
@@ -108,8 +121,40 @@ def _check_context_heads(rank, world_size, scenario, use_nccl_for_alltoall, fifo
         allreduce_strategy=AllReduceStrategy.NCCL,
         use_cute_dsl_blockscaling_mm=True,
         use_cute_dsl_blockscaling_bmm=True,
+        spec_config=DSparkDecodingConfig(
+            max_draft_len=scenario.generation_query_width - 1,
+            block_size=scenario.generation_query_width - 1,
+            mask_token_id=0,
+            target_layer_ids=[0],
+        )
+        if scenario.generation_query_width > 1
+        else None,
     )
-    with torch.device("cuda"):
+    with ExitStack() as setup, torch.device("cuda"):
+        if model_config.spec_config is not None:
+            # The target wrapper constructs its standalone drafter even though
+            # this attention test never executes it or loads draft weights.
+            draft_dir = setup.enter_context(TemporaryDirectory(prefix="helix-mla-draft-"))
+            Qwen3Config.from_dict(
+                {
+                    "architectures": ["Qwen3ForCausalLM"],
+                    "vocab_size": config.vocab_size,
+                    "hidden_size": config.hidden_size,
+                    "intermediate_size": config.intermediate_size,
+                    "num_hidden_layers": 1,
+                    "num_attention_heads": 4,
+                    "num_key_value_heads": 2,
+                    "head_dim": 64,
+                    "dtype": "bfloat16",
+                    "max_position_embeddings": config.max_position_embeddings,
+                    "dflash_config": {
+                        "mask_token_id": 0,
+                        "target_layer_ids": [0],
+                        "block_size": scenario.generation_query_width - 1,
+                    },
+                }
+            ).save_pretrained(draft_dir)
+            model_config.spec_config.speculative_model = draft_dir
         model = KimiLinearForCausalLM(model_config).eval()
     projections = {
         f"{name}.{suffix}": value
@@ -256,16 +301,19 @@ def _check_context_heads(rank, world_size, scenario, use_nccl_for_alltoall, fifo
 
 def _check_owner_only_kv(runtime, mixer, reference, model_config, mapping, scenario):
     config = model_config.pretrained_config
+    query_width = scenario.generation_query_width
     # Default cases overallocate so the old writer can fail safely. Compact
     # cases reserve only the ledger pages needed by the global maximum.
     lengths = [31, 64, 65, 127, 128, 129, 191, 193]
     if scenario.chunked_history:
         lengths = [31, 64, 65, 127, 128, 257, 383, 577]
+    if query_width > 1:
+        lengths = [31, 127, 255, 1023]
     if scenario.compact_cache:
         # Amortize the VMM slab even for one-byte FP8 cache elements.
         lengths *= 4
     batch = len(lengths)
-    max_length = max(lengths) + (5 if scenario.chunked_history else 4)
+    max_length = max(lengths) + (5 if scenario.chunked_history else 4) * query_width
     generator = torch.Generator(device="cuda").manual_seed(5678)
     hidden = torch.randn(
         batch,
@@ -286,7 +334,7 @@ def _check_owner_only_kv(runtime, mixer, reference, model_config, mapping, scena
         SimpleNamespace(
             ctx_len=cache_context * mapping.world_size,
             batch=batch,
-            kv_cache_tokens_per_block=64,
+            kv_cache_tokens_per_block=scenario.tokens_per_block,
             num_layers=1,
             kv_cache_dtype=torch.float8_e4m3fn if scenario.fp8_cache else torch.bfloat16,
         ),
@@ -314,6 +362,57 @@ def _check_owner_only_kv(runtime, mixer, reference, model_config, mapping, scena
     original_context = mixer.forward_context
     original_generation = mixer.mqa.mla_rope_generation
     prefill_lengths = list(lengths)
+    graph_checked = False
+    empty_rows_checked = False
+    if scenario.strict_prims_ts:
+        assert all(
+            len(backend._fmha_manager.fmha_libs) == 1
+            and isinstance(backend._fmha_manager.fmha_libs[0], PrimsTSFmha)
+            for backend in (mixer.mha, mixer.mqa)
+        )
+        fmha = mixer.mqa._fmha_manager.fmha_libs[0]
+        run_generation = fmha.run_mla_generation
+
+        def check_generation(params: FmhaParams) -> None:
+            nonlocal graph_checked, empty_rows_checked
+            assert params.input_seq_length == query_width
+            assert params.meta._helix_spec_tokens_valid
+            run_generation(params)
+            positions = params.meta.helix_position_offsets[: params.num_tokens]
+            torch.testing.assert_close(
+                params.meta.helix_global_kv_lens[: params.batch_size],
+                positions.view(-1, query_width)[:, -1] + 1,
+            )
+            empty = positions < mapping.cp_rank * page
+            active = ~empty
+            assert params.fwd.softmax_stats_is_lse
+            stats = params.fwd.softmax_stats
+            if not graph_checked:
+                assert params.seq_offset == 1
+                grouped_positions = positions.view(-1, query_width)
+                assert torch.any(
+                    grouped_positions[:, 0] // page != grouped_positions[:, -1] // page
+                )
+                eager = params.output[active].clone()
+                eager_stats = stats[active].clone()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    run_generation(params)
+                params.output.fill_(float("nan"))
+                stats.fill_(float("nan"))
+                graph.replay()
+                torch.cuda.synchronize()
+                torch.testing.assert_close(params.output[active], eager, atol=0, rtol=0)
+                torch.testing.assert_close(stats[active], eager_stats, atol=0, rtol=0)
+                graph_checked = True
+            if empty.any():
+                # Raw empty rows are unspecified; the full Helix path must
+                # neutralize them before the final output/reference comparison.
+                params.output[empty] = float("nan")
+                stats[empty] = float("nan")
+                empty_rows_checked = True
+
+        fmha.run_mla_generation = check_generation
 
     def remember_context(*args, **kwargs):
         latent_cache = kwargs["latent_cache"] if "latent_cache" in kwargs else args[6]
@@ -347,8 +446,9 @@ def _check_owner_only_kv(runtime, mixer, reference, model_config, mapping, scena
             attention_runtime_features=AttentionRuntimeFeatures(
                 cache_reuse=False,
                 chunked_prefill=scenario.chunked_history,
-                chunk_size=64,
+                chunk_size=scenario.tokens_per_block,
                 chunked_prefill_buffer_batch_size=2,
+                has_speculative_draft_tokens=query_width > 1,
             ),
             kv_cache_manager=manager,
             mapping=mapping,
@@ -363,9 +463,18 @@ def _check_owner_only_kv(runtime, mixer, reference, model_config, mapping, scena
         ]
         metadata.kv_cache_params = KVCacheParams(use_cache=True, num_cached_tokens_per_seq=cached)
         if global_positions is not None:
+            positions = [g + token for g in global_positions for token in range(query_width)]
+            owned_new = [
+                sum(
+                    (position // page) % mapping.cp_size == mapping.cp_rank
+                    for position in range(g, g + query_width)
+                )
+                for g in global_positions
+            ]
             metadata.update_helix_param(
-                global_positions,
+                positions,
                 [(g // page) % mapping.cp_size != mapping.cp_rank for g in global_positions],
+                owned_new if query_width > 1 else None,
             )
         else:
             # Initialize the legacy context-position view as well so the
@@ -374,6 +483,21 @@ def _check_owner_only_kv(runtime, mixer, reference, model_config, mapping, scena
                 [g for length in query_lengths for g in range(length)], [False] * batch
             )
         metadata.prepare()
+        if query_width > 1:
+            metadata.update_spec_dec_param(
+                batch_size=batch,
+                is_spec_decoding_enabled=True,
+                is_spec_dec_tree=False,
+                is_spec_dec_dynamic_tree=False,
+                max_draft_len=query_width - 1,
+                max_total_draft_tokens=query_width - 1,
+                num_contexts=num_contexts,
+            )
+            if global_positions is not None:
+                metadata.recompute_helix_spec_buffers(
+                    (batch - num_contexts) * query_width, query_width
+                )
+                metadata.on_update_kv_lens()
         attrs["attention_metadata"] = weakref.ref(metadata)
         return metadata
 
@@ -443,7 +567,7 @@ def _check_owner_only_kv(runtime, mixer, reference, model_config, mapping, scena
             # must retain global context lengths and local decode lengths.
             context_query = 3
             metadata = metadata_for(
-                [context_query] + [1] * (batch - 1),
+                [context_query] + [query_width] * (batch - 1),
                 [lengths[0]] + [len(owned_positions(g)) for g in lengths[1:]],
                 1,
                 lengths[1:],
@@ -452,7 +576,9 @@ def _check_owner_only_kv(runtime, mixer, reference, model_config, mapping, scena
             mixed = torch.cat(
                 (
                     hidden[0, context_start : context_start + context_query],
-                    torch.stack([hidden[i, g] for i, g in enumerate(lengths) if i > 0]),
+                    torch.cat(
+                        [hidden[i, g : g + query_width] for i, g in enumerate(lengths) if i > 0]
+                    ),
                 )
             )
             original_total = metadata.host_total_kv_lens.clone()
@@ -462,19 +588,23 @@ def _check_owner_only_kv(runtime, mixer, reference, model_config, mapping, scena
             target = torch.cat(
                 (
                     expected[0, context_start : context_start + context_query],
-                    torch.stack([expected[i, g] for i, g in enumerate(lengths) if i > 0]),
+                    torch.cat(
+                        [expected[i, g : g + query_width] for i, g in enumerate(lengths) if i > 0]
+                    ),
                 )
             )
             _assert_matches_reference(actual, target, scenario.fp8, scenario.fp8_cache)
             history[0] = torch.cat((history[0], captured[-1]))
             for req in range(1, batch):
-                history[req] = torch.cat((history[req], generated[-1][req - 1 : req]))
+                history[req] = torch.cat(
+                    (history[req], generated[-1][(req - 1) * query_width : req * query_width])
+                )
             check_cache(metadata, history)
-            lengths = [lengths[0] + context_query] + [g + 1 for g in lengths[1:]]
+            lengths = [lengths[0] + context_query] + [g + query_width for g in lengths[1:]]
 
         # No cache injection or repair: these are the pages written by prefill.
         metadata = metadata_for(
-            [lengths[0]] + [1] * (batch - 1),
+            [lengths[0]] + [query_width] * (batch - 1),
             [0] + [len(owned_positions(g)) for g in lengths[1:]],
             1,
             lengths[1:],
@@ -482,7 +612,7 @@ def _check_owner_only_kv(runtime, mixer, reference, model_config, mapping, scena
         mixed = torch.cat(
             (
                 hidden[0, : lengths[0]],
-                torch.stack([hidden[i, g] for i, g in enumerate(lengths) if i > 0]),
+                torch.cat([hidden[i, g : g + query_width] for i, g in enumerate(lengths) if i > 0]),
             )
         )
         with model_extra_attrs(attrs):
@@ -490,30 +620,37 @@ def _check_owner_only_kv(runtime, mixer, reference, model_config, mapping, scena
         target = torch.cat(
             (
                 expected[0, : lengths[0]],
-                torch.stack([expected[i, g] for i, g in enumerate(lengths) if i > 0]),
+                torch.cat(
+                    [expected[i, g : g + query_width] for i, g in enumerate(lengths) if i > 0]
+                ),
             )
         )
         _assert_matches_reference(actual, target, scenario.fp8, scenario.fp8_cache)
         history[0] = captured[-1]
         for req in range(1, batch):
-            history[req] = torch.cat((history[req], generated[-1][req - 1 : req]))
+            history[req] = torch.cat(
+                (history[req], generated[-1][(req - 1) * query_width : req * query_width])
+            )
         check_cache(metadata, history)
-        lengths = [lengths[0]] + [g + 1 for g in lengths[1:]]
+        lengths = [lengths[0]] + [g + query_width for g in lengths[1:]]
         for _ in range(3):
             metadata = metadata_for(
-                [1] * batch, [len(owned_positions(g)) for g in lengths], 0, lengths
+                [query_width] * batch, [len(owned_positions(g)) for g in lengths], 0, lengths
             )
-            inputs = torch.stack([hidden[i, g] for i, g in enumerate(lengths)])
+            inputs = torch.cat([hidden[i, g : g + query_width] for i, g in enumerate(lengths)])
             with model_extra_attrs(attrs):
                 actual = runtime(inputs, metadata)
-            target = torch.stack([expected[i, g] for i, g in enumerate(lengths)])
+            target = torch.cat([expected[i, g : g + query_width] for i, g in enumerate(lengths)])
             _assert_matches_reference(actual, target, scenario.fp8, scenario.fp8_cache)
             history = [
-                torch.cat((values, generated[-1][req : req + 1]))
+                torch.cat((values, generated[-1][req * query_width : (req + 1) * query_width]))
                 for req, values in enumerate(history)
             ]
             check_cache(metadata, history)
-            lengths = [g + 1 for g in lengths]
+            lengths = [g + query_width for g in lengths]
+        if scenario.strict_prims_ts:
+            assert graph_checked
+            assert any(MPI.COMM_WORLD.allgather(empty_rows_checked))
 
         # Exercise the context writer with nonzero global prefixes and real
         # RoPE, independently of historical-attention gathering.

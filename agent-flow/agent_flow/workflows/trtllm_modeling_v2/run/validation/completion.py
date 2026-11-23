@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Delivery: the gate findings, the checks on disk, the delivered tests, and the contract.
+"""Delivery: the checks on disk, the delivered tests, and the contract.
 
 The delivered tests run here, at the checkout's ``HEAD``, as one job with no
 agent turn. The contract's journal section also says where correctness stands
@@ -18,8 +18,7 @@ from rich.markup import escape as escape_markup
 
 from agent_flow.console import print_message, print_rule
 
-from ...checks import accuracy as accuracy_checks
-from ...checks import gate_records, test_results
+from ...checks import test_results
 from ...checks.accuracy import resolve_model_key
 from ...checks.delivery import Check as DeliveryCheck
 from ...checks.delivery import DeliveryReport, accuracy_test_path, verify_delivery
@@ -34,29 +33,34 @@ from ...spec.task_schema import (
 )
 from ..records.state import WorkflowState
 from . import contract as contract_mod
-from . import regression as regression_mod
 from . import requirements as requirements_mod
+from . import test_jobs
 
 
 @dataclass(frozen=True)
 class Completion:
-    """One assessment for milestones, campaign wrap-up, and final delivery."""
+    """One assessment for milestones and final delivery."""
 
     evaluation: contract_mod.Evaluation
     files: tuple[str, ...] = ()
-    unreviewed: tuple[str, ...] = ()
     required_open: bool = False
     unread_reports: bool = False
+    #: The check that confirms the final tree, while none of its kind has passed
+    #: on the target as it is (``contract.confirmed``); empty once one has.
+    unconfirmed: str = ""
 
     @property
     def gaps(self) -> list[str]:
         if not self.evaluation.holds:
             return ["the contract does not hold"]
         gaps = []
-        if self.unreviewed:
-            gaps.append(f"no regression check covers {', '.join(self.unreviewed)}")
         if self.files:
             gaps.append("delivery files: " + "; ".join(self.files))
+        if self.unconfirmed:
+            gaps.append(
+                f"the target as it is has not been measured: {self.unconfirmed} confirms it "
+                "once no required task is open"
+            )
         return gaps
 
     @property
@@ -72,7 +76,7 @@ class Completion:
         return (
             self.evaluation.holds
             and bool(self.files)
-            and not (self.unreviewed or self.required_open or self.unread_reports)
+            and not (self.required_open or self.unread_reports)
         )
 
 
@@ -80,11 +84,11 @@ def assess(
     evaluation: contract_mod.Evaluation,
     *,
     files: Sequence[str] = (),
-    unreviewed: Sequence[str] = (),
     required_open: bool = False,
     unread_reports: bool = False,
+    unconfirmed: str = "",
 ) -> Completion:
-    return Completion(evaluation, tuple(files), tuple(unreviewed), required_open, unread_reports)
+    return Completion(evaluation, tuple(files), required_open, unread_reports, unconfirmed)
 
 
 def run_deliver_phase(
@@ -94,15 +98,29 @@ def run_deliver_phase(
     print_rule("[bold magenta]deliver[/bold magenta]", log)
     report = delivery_report(workflow, run_tests=True)
     workflow.journal.section("delivery checks", f"```\n{report.render()}\n```")
-    matrix = requirements_mod.requirements_matrix(
-        workflow.task_data, workflow._contract, workflow._gate_env().world_size
+    coverage = requirements_mod.feature_checks(workflow.task_data, workflow._contract)
+    workflow.journal.section(
+        "coverage: the checks behind each feature", requirements_mod.render(coverage)
     )
-    workflow.journal.section("coverage: what is delivered, member by member", matrix.render())
     print_message(report.render(), log)
     result = assessment([f"{c.name}: {c.detail}" for c in report.failures])
     marker = workflow._target_marker()
     workflow.journal.section(
         "contract", contract_mod.standing(result.evaluation, workflow.workspace, marker)
+    )
+    repo = str(workflow.task_data.get("trtllm_repo_path") or "")
+    workflow.journal.section(
+        "where each check was measured",
+        contract_mod.measured_where(
+            result.evaluation,
+            workflow._contract_status(),
+            marker,
+            lambda tree: (
+                (workflow._git(repo, "rev-list", "--count", f"{tree}..HEAD") or "").strip()
+                if repo and tree
+                else ""
+            ),
+        ),
     )
     if result.ready:
         print_message(f"[bold green]✔ contract: {result.evaluation.render()}[/bold green]", log)
@@ -110,19 +128,13 @@ def run_deliver_phase(
     detail = "\n".join(result.gaps) or "required work or unread worker reports remain"
     workflow.journal.section("delivery blocked", detail)
     print_message(f"[bold red]✘ delivery blocked:\n{escape_markup(detail)}[/bold red]", log)
-    verdict = (
-        "delivery-failed:findings"
-        if any(c.name.startswith("finding:") for c in report.failures)
-        else "delivery-failed:contract"
-        if not result.evaluation.holds
-        else "delivery-failed"
-    )
+    verdict = "delivery-failed:contract" if not result.evaluation.holds else "delivery-failed"
     workflow._close_run(state, log, verdict=verdict)
     return False
 
 
 def delivery_failures(workflow) -> list[str]:
-    """What fails of the delivery checks on disk and the gate findings, one line each.
+    """What fails of the delivery checks on disk, one line each.
 
     As cheap as reading files: the execution stage reads it on every state of the
     target the contract holds on, so full support includes it.
@@ -157,16 +169,6 @@ def delivery_report(workflow, *, run_tests: bool = False) -> DeliveryReport:
     Cheap, and safe to repeat, unless ``run_tests`` has the delivered tests
     run first (:func:`tests_check`).
     """
-    findings = tuple(
-        DeliveryCheck(
-            f"finding:{finding.key}", False, str(finding.values.get("detail", finding.key))
-        )
-        for finding in accuracy_checks.blocking_findings(
-            gate_records.records_for(workflow.workspace), workflow.task_data.get("accuracy") or {}
-        )
-    )
-    if findings:
-        return DeliveryReport(checks=findings)
     report = verify_delivery(
         repo_root=workflow.task_data["trtllm_repo_path"],
         target_rel=workflow._preflight.target_rel,
@@ -237,7 +239,7 @@ def tests_check(workflow, report: DeliveryReport, *, run: bool = False) -> Deliv
     The target's own tests, and the catalog entries' tests it is delivered
     with (the report's ``test:`` checks), each by its result at ``HEAD``
     (``checks/test_results.py``). With ``run``, those with no result there run
-    first (``regression.record_at``), and the check holds only on none
+    first (``test_jobs.record_at``), and the check holds only on none
     failing, none left unrun and one at least passed. Without, it reads
     what is recorded and fails only on a test that fails there: a test
     that has not run at ``HEAD`` yet runs at delivery. ``None`` when there
@@ -258,12 +260,12 @@ def tests_check(workflow, report: DeliveryReport, *, run: bool = False) -> Deliv
     cache_dir = workflow.workspace / test_results.CACHE_DIRNAME
     ran = ""
     if run:
-        tree_at, run_job, python = regression_mod.job_runner(workflow, "delivery-tests")
-        results, jobs, code, tail = regression_mod.record_at(
+        tree_at, run_job, python = test_jobs.job_runner(workflow, "delivery-tests")
+        results, jobs, code, tail = test_jobs.record_at(
             head,
             files,
             cache_dir=cache_dir,
-            out=workflow.workspace / regression_mod.SELECTIONS_DIRNAME / "delivery",
+            out=workflow.workspace / test_jobs.SELECTIONS_DIRNAME / "delivery",
             tree_at=tree_at,
             run_job=run_job,
             python=python,

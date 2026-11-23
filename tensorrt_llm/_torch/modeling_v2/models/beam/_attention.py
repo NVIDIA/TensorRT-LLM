@@ -175,6 +175,7 @@ def check_step(
     head_dim: int,
     device: torch.device,
     max_tokens: int,
+    attention_window: int | None,
 ) -> None:
     """Raise ValueError on any call input a block would otherwise compute wrongly.
 
@@ -183,7 +184,8 @@ def check_step(
     ``arange(past, past + T)`` on that device; a prepared ``TrtllmAttentionMetadata``
     holding one step of one request on a BF16 ``KVCacheManagerV2`` that holds logical
     layer ``layer_idx`` with ``num_kv_heads`` kv heads of ``head_dim`` (``check_metadata``
-    states the steps and returns ``past``).
+    states the steps and returns ``past``). Cache retention must cover ``attention_window``
+    (or the full sequence for None), capped by the manager's maximum sequence length.
     """
     if not isinstance(hidden_states, torch.Tensor) or hidden_states.dtype != torch.bfloat16:
         raise ValueError("hidden_states must be a torch.bfloat16 tensor")
@@ -204,6 +206,22 @@ def check_step(
     past = check_metadata(
         md, num_tokens, layer_idx=layer_idx, num_kv_heads=num_kv_heads, head_dim=head_dim
     )
+    manager = md.kv_cache_manager
+    slot = manager.layer_offsets[layer_idx]
+    windows = manager.max_attention_window_vec
+    if slot >= len(windows):
+        raise ValueError(f"the KV cache manager has no retention window for layer {layer_idx}")
+    retained = windows[slot]
+    required = (
+        manager.max_seq_len
+        if attention_window is None
+        else min(attention_window, manager.max_seq_len)
+    )
+    if retained is not None and int(retained) < required:
+        raise ValueError(
+            f"layer {layer_idx} requires cache retention of at least {required} tokens; "
+            f"the cache keeps a window of {retained}"
+        )
     expected = torch.arange(
         past, past + num_tokens, dtype=position_ids.dtype, device=position_ids.device
     )
