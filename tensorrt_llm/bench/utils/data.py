@@ -21,6 +21,7 @@ from transformers import PreTrainedTokenizer
 from tensorrt_llm.bench.dataclasses.general import (DatasetMetadata,
                                                     InferenceRequest)
 from tensorrt_llm.bench.dataclasses.statistics import PercentileStats
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.inputs import default_multimodal_input_loader
 from tensorrt_llm.tokenizer.tokenizer import TransformersTokenizer
@@ -31,7 +32,8 @@ class DatasetFormatError(ValueError):
 
 
 def initialize_tokenizer(model_name: str,
-                         custom_tokenizer: str = None) -> PreTrainedTokenizer:
+                         custom_tokenizer: str = None,
+                         checkpoint_format: str = None) -> PreTrainedTokenizer:
     """Initialize a tokenizer.
 
     Args:
@@ -41,9 +43,15 @@ def initialize_tokenizer(model_name: str,
         'deepseek_v32') or a fully-qualified 'module.path.ClassName' for
         models whose HF tokenizer_config.json is incompatible with
         AutoTokenizer.
+        checkpoint_format (str, optional): The checkpoint format the LLM loads
+        the checkpoint in. A Mistral-native one (``mistral`` or
+        ``mistral_large_3``) gets the mistral-common tokenizer its input
+        processor uses, whatever Hugging Face tokenizer files the checkpoint
+        also ships.
 
     Returns:
-        PreTrainedTokenizer: An initialized HuggingFace tokenizer.
+        PreTrainedTokenizer: An initialized HuggingFace tokenizer, or the
+        Mistral-native checkpoint's ``MistralTokenizer``.
     """
     if custom_tokenizer:
         from tensorrt_llm.tokenizer import load_custom_tokenizer
@@ -52,6 +60,11 @@ def initialize_tokenizer(model_name: str,
                                           model_name,
                                           trust_remote_code=True,
                                           padding_side="left")
+    elif checkpoint_format in (CheckpointFormat.MISTRAL,
+                               CheckpointFormat.MISTRAL_LARGE_3):
+        from tensorrt_llm._torch.models.checkpoints.mistral.tokenizer import \
+            MistralTokenizer
+        tokenizer = MistralTokenizer.from_pretrained(str(model_name))
     else:
         # Route through TransformersTokenizer so trtllm-bench inherits its
         # post-load fixes -- in particular ``maybe_fix_byte_level_tokenizer``,

@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import io
+import json
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,8 +22,13 @@ from unittest import mock
 
 import pynvml
 import pytest
+import torch
+from safetensors.torch import save_file
 
+from tensorrt_llm.bench.benchmark import get_general_cli_options
+from tensorrt_llm.bench.benchmark.utils.general import get_settings
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
+from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment, DatasetMetadata
 from tensorrt_llm.bench.dataclasses.reporting import PerfItemTuple, ReportUtility, StatsKeeper
 from tensorrt_llm.bench.dataclasses.statistics import PercentileStats
 from tensorrt_llm.bench.tuning import heuristics
@@ -505,3 +511,310 @@ def test_calc_engine_setting_sizes_unset_ssm_cache_dtype_from_model_dtype(monkey
     for unset in (None, "auto"):
         assert engine_setting(unset, "bfloat16") == bf16_setting
         assert engine_setting(unset, "float32") == fp32_setting
+
+
+def _llm_api_options(tmp_path, **llm_args):
+    options = tmp_path / "extra_llm_api_options.yaml"
+    options.write_text("".join(f"{k}: {v}\n" for k, v in llm_args.items()))
+    return str(options)
+
+
+@pytest.mark.parametrize(
+    "checkpoint_format, model_path, downloads",
+    [("mistral", None, True), ("mistral", "local", False), ("HF", None, False)],
+)
+def test_cli_options_download_a_mistral_native_model_name_before_reading_it(
+    tmp_path, checkpoint_format, model_path, downloads
+):
+    """A model name in a Mistral-native format is read from its snapshot, as the LLM API reads it.
+
+    The checkpoint path is set before the model type, the tuning heuristic or the report read
+    the checkpoint; a local checkpoint and the Hugging Face format are not downloaded.
+    """
+    snapshot = tmp_path / "snapshot"
+    local = tmp_path / "local"
+    env = BenchmarkEnvironment(
+        model="org/model",
+        checkpoint_path=local if model_path else None,
+        workspace=tmp_path,
+        revision="rev",
+    )
+    params = {}
+    if checkpoint_format is not None:
+        params["extra_llm_api_options"] = _llm_api_options(
+            tmp_path, checkpoint_format=checkpoint_format
+        )
+    with mock.patch(
+        "tensorrt_llm.bench.benchmark.download_hf_model", return_value=snapshot
+    ) as download:
+        options = get_general_cli_options(params, env)
+    if downloads:
+        download.assert_called_once_with("org/model", "rev")
+        expected = snapshot
+    else:
+        download.assert_not_called()
+        expected = local if model_path else None
+    assert env.checkpoint_path == expected
+    assert options.model_path == expected
+    assert options.checkpoint_path == (expected or "org/model")
+
+
+# A small dense Mistral-native model: 2 layers, 4 query and 2 KV heads of 64.
+_MISTRAL_NATIVE_PARAMS = {
+    "dim": 256,
+    "n_layers": 2,
+    "head_dim": 64,
+    "hidden_dim": 512,
+    "n_heads": 4,
+    "n_kv_heads": 2,
+    "norm_eps": 1e-5,
+    "vocab_size": 1024,
+    "rope_theta": 1e6,
+}
+# The Hugging Face config.json of another model, to tell which of the two files was read.
+_HF_CONFIG = {
+    "model_type": "llama",
+    "architectures": ["LlamaForCausalLM"],
+    "hidden_size": 128,
+    "intermediate_size": 256,
+    "num_hidden_layers": 3,
+    "num_attention_heads": 2,
+    "num_key_value_heads": 1,
+    "vocab_size": 1024,
+    "torch_dtype": "bfloat16",
+}
+
+
+def _weights(*shapes):
+    return {f"w{i}": torch.zeros(shape, dtype=torch.bfloat16) for i, shape in enumerate(shapes)}
+
+
+def _mistral_native_checkpoint(path, *, weights="consolidated", hf_config=False):
+    """Write params.json and, by `weights`, its weights.
+
+    `weights` is "consolidated", "sharded" (consolidated shards and their index),
+    "unindexed_shards" or None.
+    """
+    path.mkdir()
+    (path / "params.json").write_text(json.dumps(_MISTRAL_NATIVE_PARAMS))
+    if weights == "consolidated":
+        save_file(_weights((1024, 256), (256,)), path / "consolidated.safetensors")
+    elif weights in ("sharded", "unindexed_shards"):
+        weight_map = {}
+        for shard, (name, tensor) in enumerate(_weights((1024, 256), (256,)).items(), 1):
+            file_name = f"consolidated-{shard:05d}-of-00002.safetensors"
+            save_file({name: tensor}, path / file_name)
+            weight_map[name] = file_name
+        if weights == "sharded":
+            (path / "consolidated.safetensors.index.json").write_text(
+                json.dumps({"weight_map": weight_map})
+            )
+    if hf_config:
+        (path / "config.json").write_text(json.dumps(_HF_CONFIG))
+        save_file(_weights((1024, 128)), path / "model.safetensors")
+    return path
+
+
+@pytest.mark.parametrize(
+    "checkpoint_format,model_type", [(None, "llama"), ("mistral_large_3", "mistral_common")]
+)
+def test_cli_options_read_the_model_type_of_the_checkpoint_format(
+    tmp_path, checkpoint_format, model_type
+):
+    """A Mistral-native checkpoint's model type comes from params.json, even beside a config.json.
+
+    The model type selects the multimodal prompt rendering.
+    """
+    checkpoint = _mistral_native_checkpoint(tmp_path / "checkpoint", hf_config=True)
+    env = BenchmarkEnvironment(model="m", checkpoint_path=checkpoint, workspace=tmp_path)
+    params = {}
+    if checkpoint_format is not None:
+        params["extra_llm_api_options"] = _llm_api_options(
+            tmp_path, checkpoint_format=checkpoint_format
+        )
+    options = get_general_cli_options(params, env)
+    assert options.checkpoint_format == checkpoint_format
+    assert options.model_type == model_type
+
+
+def _tune(tmp_path, checkpoint, checkpoint_format="mistral"):
+    """Run get_settings without explicit limits; return the engine-setting arguments."""
+    params = {
+        "tp": 1,
+        "pp": 1,
+        "ep": 1,
+        "extra_llm_api_options": _llm_api_options(
+            tmp_path, checkpoint_format=checkpoint_format, enable_chunked_prefill="false"
+        ),
+    }
+    metadata = SimpleNamespace(max_isl=4096, avg_isl=1024, avg_osl=256)
+    with mock.patch(
+        "tensorrt_llm.bench.benchmark.utils.general.get_benchmark_engine_settings",
+        return_value=(16, 32768),
+    ) as engine_settings:
+        settings = get_settings(params, metadata, "mistral-native", checkpoint)
+    assert settings["settings_config"]["max_batch_size"] == 16
+    assert settings["settings_config"]["max_num_tokens"] == 32768
+    model_config, quant_config = engine_settings.call_args.args[:2]
+    return model_config, quant_config
+
+
+@pytest.mark.parametrize(
+    "weights,hf_config,checkpoint_format",
+    [
+        ("consolidated", False, "mistral"),
+        ("sharded", False, "mistral"),
+        ("unindexed_shards", False, "mistral"),
+        # params.json wins over a config.json beside it.
+        ("consolidated", True, "mistral_large_3"),
+    ],
+)
+def test_tuning_reads_a_mistral_native_checkpoint_from_its_native_files(
+    tmp_path, weights, hf_config, checkpoint_format
+):
+    """The tuning heuristic reads params.json and the consolidated weights, as the runtime does."""
+    checkpoint = _mistral_native_checkpoint(
+        tmp_path / "checkpoint", weights=weights, hf_config=hf_config
+    )
+    model_config, quant_config = _tune(tmp_path, checkpoint, checkpoint_format)
+    assert model_config.model_type == "mistral_common"
+    assert model_config.num_hidden_layers == 2
+    assert model_config.num_attention_heads == 4
+    assert model_config.num_key_value_heads == 2
+    assert model_config.head_size == 64
+    assert model_config.dtype == "bfloat16"
+    assert not model_config.is_mla()
+    assert model_config.param_count == 1024 * 256 + 256
+    assert model_config.checkpoint_size_in_gb == (1024 * 256 + 256) * 2 / 1024**3
+    assert quant_config.quant_algo is None
+
+
+def test_an_image_dataset_of_a_mistral_native_checkpoint_renders_with_its_tekken_file(tmp_path):
+    """An image dataset renders with the Tekken file, without --custom_tokenizer.
+
+    trtllm-bench reads a Mistral-native checkpoint's tokenizer through mistral-common, as its
+    input processor does, though the directory ships a Hugging Face tokenizer too; each image
+    goes at its [IMG] marker.
+    """
+    import base64
+    import io
+    import shutil
+
+    from mistral_common.protocol.instruct.request import ChatCompletionRequest
+    from PIL import Image
+    from test_common.llm_data import llm_models_root
+    from test_common.mistral_tekken import TEKKEN_CHECKPOINT_FILES, write_hf_tokenizer
+
+    from tensorrt_llm._torch.models.checkpoints.mistral.tokenizer import MistralTokenizer
+
+    pytest.importorskip("cv2")  # mistral-common's image encoder resizes with OpenCV
+    root = llm_models_root()
+    tekken = None if root is None else root / TEKKEN_CHECKPOINT_FILES["v15"]
+    if tekken is None or not tekken.is_file():
+        pytest.skip("needs a Tekken file with an image encoder under LLM_MODELS_ROOT")
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    shutil.copy(tekken, checkpoint / "tekken.json")
+    write_hf_tokenizer(checkpoint)
+    (checkpoint / "config.json").write_text(json.dumps({"model_type": "mistral3"}))
+    image_path = tmp_path / "red.png"
+    Image.new("RGB", (64, 48), (200, 30, 30)).save(image_path)
+
+    assert not isinstance(initialize_tokenizer(str(checkpoint)), MistralTokenizer)
+    tokenizer = initialize_tokenizer(str(checkpoint), checkpoint_format="mistral")
+    assert isinstance(tokenizer, MistralTokenizer)
+    line = {
+        "task_id": 0,
+        "prompt": "Describe [IMG] briefly.",
+        "media_paths": [str(image_path)],
+        "output_tokens": 4,
+    }
+    _, requests = create_dataset_from_stream(
+        tokenizer,
+        io.StringIO(json.dumps(line) + "\n"),
+        model_dir=str(checkpoint),
+        model_type="mistral_common",
+        modality="image",
+    )
+    buffer = io.BytesIO()
+    Image.open(image_path).save(buffer, "PNG")
+    url = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+    content = [
+        {"type": "text", "text": "Describe "},
+        {"type": "image_url", "image_url": {"url": url}},
+        {"type": "text", "text": " briefly."},
+    ]
+    expected = tokenizer.mistral.encode_chat_completion(
+        ChatCompletionRequest.from_openai(messages=[{"role": "user", "content": content}])
+    ).tokens
+    assert requests[0].prompt["prompt_token_ids"] == expected
+
+
+def test_tuning_reads_config_json_when_the_native_files_cannot_be_read(tmp_path):
+    checkpoint = _mistral_native_checkpoint(tmp_path / "checkpoint", weights=None, hf_config=True)
+    model_config, quant_config = _tune(tmp_path, checkpoint)
+    assert model_config.model_type == "llama"
+    assert model_config.num_hidden_layers == 3
+    assert model_config.param_count == 1024 * 128
+    assert quant_config.quant_algo is None
+
+
+def test_tuning_of_an_unreadable_mistral_native_checkpoint_needs_explicit_limits(tmp_path):
+    """Neither the native files nor a config.json describe the checkpoint."""
+    checkpoint = _mistral_native_checkpoint(tmp_path / "checkpoint", weights=None)
+    with pytest.raises(ValueError, match="pass --max_batch_size and --max_num_tokens"):
+        _tune(tmp_path, checkpoint)
+
+
+def _fp8_mistral_native_checkpoint(path, *, hf_config):
+    """A Mistral-native checkpoint whose FP8 quantization only params.json declares.
+
+    The quantization a report shows tells whether it read params.json or config.json.
+    """
+    checkpoint = _mistral_native_checkpoint(path, hf_config=hf_config)
+    params = json.loads((checkpoint / "params.json").read_text())
+    params["quantization"] = {"qformat_weight": "fp8_e4m3", "qscheme_act": "TENSOR"}
+    (checkpoint / "params.json").write_text(json.dumps(params))
+    return checkpoint
+
+
+def _engine_report(checkpoint, checkpoint_format):
+    """Return the engine section of the report of a one-request run on `checkpoint`."""
+    keeper = StatsKeeper()
+    keeper.register_request_perf_item(_perf_item(0, num_out=4, decoding_iteration=3))
+    stats = PercentileStats.from_iterable([8])
+    metadata = DatasetMetadata(
+        isl_stats=stats, osl_stats=stats, seq_len_stats=stats, num_requests=1
+    )
+    runtime_config = _benchmark_runtime_config("pytorch").model_copy(
+        update={
+            "model": "mistral-native",
+            "model_path": checkpoint,
+            "mapping": {"pp_size": 1, "tp_size": 1, "moe_ep_size": 1, "world_size": 1},
+        }
+    )
+    llm_args = {"kv_cache_config": {"dtype": "auto"}, "checkpoint_format": checkpoint_format}
+    report = ReportUtility(keeper, metadata, runtime_config, mock.Mock(), llm_args)
+    with mock.patch.object(ReportUtility, "_query_gpu_info", return_value=None):
+        return report.get_statistics_dict()["engine"]
+
+
+@pytest.mark.parametrize(
+    "hf_config,checkpoint_format", [(False, "mistral"), (True, "mistral_large_3")]
+)
+def test_report_reads_a_mistral_native_checkpoint_from_its_native_files(
+    tmp_path, hf_config, checkpoint_format
+):
+    """The report reads the checkpoint in the format the LLM loaded, here params.json."""
+    checkpoint = _fp8_mistral_native_checkpoint(tmp_path / "checkpoint", hf_config=hf_config)
+    engine = _engine_report(checkpoint, checkpoint_format)
+    assert engine["dtype"] == "bfloat16"
+    assert engine["quantization"] == QuantAlgo.FP8_BLOCK_SCALES
+    assert engine["kv_cache_dtype"] is None
+
+
+def test_report_reads_config_json_in_the_hugging_face_format(tmp_path):
+    checkpoint = _fp8_mistral_native_checkpoint(tmp_path / "checkpoint", hf_config=True)
+    engine = _engine_report(checkpoint, None)
+    assert engine["dtype"] == "bfloat16"
+    assert engine["quantization"] is None
