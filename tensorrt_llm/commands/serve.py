@@ -31,8 +31,8 @@ import uuid
 from importlib.util import find_spec
 from pathlib import Path
 from types import FrameType
-from typing import (TYPE_CHECKING, Any, Dict, Iterator, Literal, NoReturn,
-                    Optional, Sequence, Set, Tuple)
+from typing import (TYPE_CHECKING, Any, Callable, Dict, Iterator, Literal,
+                    NoReturn, Optional, Sequence, Set, Tuple)
 
 import click
 import pydantic
@@ -75,9 +75,10 @@ from tensorrt_llm.logger import logger, severity_map
 from tensorrt_llm.mapping import CpType
 from tensorrt_llm.serve import OpenAIDisaggServer, OpenAIServer
 from tensorrt_llm.serve._frontend_processes import (
-    _frontend_affinity_sockets, _init_multi_frontend_mode,
-    _signal_frontend_ready, _spawn_attached_frontends,
-    _terminate_attached_frontends, _watch_attached_frontends)
+    _drain_attached_frontends, _frontend_affinity_sockets,
+    _init_multi_frontend_mode, _signal_frontend_ready,
+    _spawn_attached_frontends, _terminate_attached_frontends,
+    _watch_attached_frontends)
 from tensorrt_llm.serve.multi_frontend import (LAUNCHER_UDS_ENV,
                                                LAUNCHER_UDS_NAME,
                                                MultiFrontendServing)
@@ -914,6 +915,7 @@ def launch_server(
             # failure in between leaks the child processes.
             frontend_children = []
             stop_watching_frontends = None
+            stop_attached_frontends = None
             sockets = [s]
             if affinity_socket is not None:
                 sockets.append(affinity_socket)
@@ -932,6 +934,15 @@ def launch_server(
                         affinity_sockets=attached_affinity_sockets)
                     stop_watching_frontends = _watch_attached_frontends(
                         frontend_children)
+
+                    async def stop_attached_frontends(
+                            force_exit: Callable[[], bool]) -> None:
+                        stop_watching_frontends.set()
+                        await _drain_attached_frontends(
+                            frontend_children,
+                            llm.args.serve_graceful_shutdown_timeout_s,
+                            force_exit)
+
                     multi_frontend_serving = MultiFrontendServing(
                         launcher_uds=launcher_uds_path,
                         is_launcher=True,
@@ -956,7 +967,8 @@ def launch_server(
                     runtime_control_api_key=runtime_control_api_key,
                     multi_frontend_serving=multi_frontend_serving,
                     graceful_shutdown_timeout=llm.args.
-                    serve_graceful_shutdown_timeout_s)
+                    serve_graceful_shutdown_timeout_s,
+                    stop_attached_frontends=stop_attached_frontends)
                 _apply_fastapi_middlewares(server.app, middleware)
 
                 # Optionally disable GC (default: not disabled)

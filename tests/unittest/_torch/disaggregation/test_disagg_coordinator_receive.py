@@ -844,7 +844,7 @@ class _ClosingRequest(_GenRequest):
             py_use_chunked_generation_logits=False,
             return_perf_metrics=False,
             response=SimpleNamespace(result=SimpleNamespace()),
-            cached_tokens=5,
+            reported_cached_tokens=5,
             py_per_pos_drafted=None,
             py_per_pos_accepted=None,
             py_total_draft_tokens=0,

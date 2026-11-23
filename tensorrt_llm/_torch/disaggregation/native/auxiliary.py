@@ -319,7 +319,7 @@ class AuxBuffer(AuxBufferBase):
             cached_tokens = details.get("cached_tokens", 0)
         else:
             prompt_tokens = request.prompt_len
-            cached_tokens = request.cached_tokens
+            cached_tokens = request.reported_cached_tokens
         return int(prompt_tokens or 0), int(cached_tokens or 0)
 
     def get_slot_tokens(self, slot: int) -> tuple[list[int], list[int]]:
