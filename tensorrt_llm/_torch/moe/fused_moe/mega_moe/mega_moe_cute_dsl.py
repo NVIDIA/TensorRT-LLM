@@ -1278,6 +1278,10 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             self.create_weights()
         super().cache_derived_state()
 
+    # pre_reload_weights raises: the source weights are released after the
+    # initial packing.
+    supports_weight_reload = False
+
     def pre_reload_weights(self) -> None:
         raise NotImplementedError(
             "MegaMoE-CuteDSL does not support hot weight reloading; its "

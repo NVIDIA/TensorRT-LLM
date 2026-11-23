@@ -674,6 +674,17 @@ class MiniMaxM3Gate(nn.Module):
                 w["e_score_correction_bias"][:].to(self.e_score_correction_bias.dtype)
             )
 
+    def initialize_dummy_state(self, low: float, high: float, seed: int) -> None:
+        """Split the dummy ``weight`` as ``load_weights`` splits a checkpoint's.
+
+        A gate whose layer another pipeline rank runs has no weight
+        (``modeling_utils.remove_weights``), so there is nothing to split.
+        """
+        del low, high, seed  # The dummy weight is already in place.
+        if getattr(self, "_weights_removed", False):
+            return
+        self.split_weight = split_router_weight_bf16(self.weight)
+
     @property
     def routing_method(self) -> MiniMaxM3MoeRoutingMethod:
         # Pass a callable so routing always sees the latest parameter
@@ -3027,6 +3038,7 @@ class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, Pretraine
     # Preserve M3's hand-fused eager decode and above-ceiling prefill paths,
     # including MXFP8 decode-graph backend tuning, instead of the FX fallback.
     use_fx_for_pcg_fallback = False
+    rehearses_on_dummy_weights = True
 
     @classmethod
     def get_preferred_kv_cache_manager_version(cls, pretrained_config: Any = None) -> Literal["V2"]:

@@ -44,6 +44,7 @@ from tensorrt_llm._torch.autotuner import (AutoTuner, DistributedTuningStrategy,
                                            OptimizationProfile, StaticDim,
                                            TunableRunner, TuningConfig,
                                            autotune)
+from tensorrt_llm._torch.build_pool import BuildStrategy
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.utils import (deep_gemm_jit_warmup_buckets,
                                        get_power_of_2_num_tokens_buckets,
@@ -62,6 +63,16 @@ MPI.pickle.__init__(
 
 # needed since we reuse the mpi executor pool, first test running will leak a thread
 pytestmark = pytest.mark.threadleak(enabled=False)
+
+
+@pytest.fixture(autouse=True)
+def _build_pool_off(monkeypatch):
+    """The tests here build and time in this process, as with TLLM_KERNEL_BUILDER=0; the
+    tests that take ``tune_mode_workers`` build on worker processes."""
+    from tensorrt_llm._torch import build_pool
+
+    monkeypatch.setattr(build_pool.BuildPool, "_instance",
+                        build_pool.BuildPool(enabled=False))
 
 
 def test_multi_dynamic_dims():
@@ -2804,6 +2815,67 @@ def test_parallel_rank_dealt_no_pair_runs_the_merged_winner(
     assert warnings == [], warnings
 
 
+def test_parallel_deals_only_profiles_every_rank_profiles(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Under PARALLEL a rank times its share of a profile's (runner, tactic) pairs only when
+    every rank of the group profiles it. With attention DP the ranks profile their own row
+    counts: a profile another rank does not profile is timed in full here."""
+
+    class FourTacticRunner(TunableRunner):
+
+        def get_valid_tactics(self, inputs, profile, **kwargs) -> List[int]:
+            return [0, 1, 2, 3]
+
+        def forward(self, /, inputs, *, tactic: int = -1, **kwargs):
+            return inputs[0]
+
+    timed = []
+
+    def record_pair(self, runner, inputs, tactic, **kwargs):
+        timed.append(tactic)
+        return 1.0
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", record_pair)
+    op = "autotuner_test::parallel_deal_shared_profiles"
+    config = TuningConfig(
+        distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL)
+    tuner = autotuner.AutoTuner()
+
+    class PeerDist:
+        """Rank 1's all-gathers in a group of two whose rank 0 profiles ``peer_rows`` rows
+        and has nothing cached."""
+
+        peer_rows = 0
+
+        def tp_cp_allgather(self, obj):
+            # A tuple: the profiles each rank tunes and their cache hits.
+            if isinstance(obj, tuple):
+                keys = [
+                    p.get_opt_shapes() for p in tuner._optimization_profiles(
+                        config, [torch.zeros(self.peer_rows, 64)])
+                ]
+                return [(keys, [False] * len(keys)), obj]
+            return [obj, obj]
+
+    dist = PeerDist()
+    tuner.setup_distributed_state(Mapping(world_size=2, rank=1, tp_size=2),
+                                  dist=dist)
+    tuner.is_tuning_mode = True
+    for rows, peer_rows in ((8, 8), (16, 24)):
+        dist.peer_rows = peer_rows
+        timed.clear()
+        inputs = [torch.zeros(rows, 64)]
+        tuner.choose_one(op, [FourTacticRunner()], config, inputs)
+        profile = tuner._optimization_profiles(config, inputs)[0]
+        share = tuner._maybe_parallelize_tactics(
+            [0, 1, 2, 3],
+            DistributedTuningStrategy.PARALLEL,
+            offset=tuner._parallel_deal_start(
+                op, profile, DistributedTuningStrategy.PARALLEL))
+        expected = share if rows == peer_rows else [0, 1, 2, 3]
+        assert timed == expected and len(share) == 2, (rows, timed, share)
+
+
 def test_parallel_search_cache_picks_fastest_runner():
     """After a PARALLEL merge a shape can hold one entry per runner.
 
@@ -2854,7 +2926,7 @@ def test_parallel_deal_start_is_stable_and_spread():
     assert set(starts) == set(range(group_size)), sorted(set(starts))
 
 
-def test_share_jit_builds_sets_aside_profiles_built_elsewhere(
+def test_shared_builds_set_aside_profiles_built_elsewhere(
         monkeypatch, tmp_path):
     """With DeepGEMM's builds shared across ranks, a rank runs the profiles it
     claims first. One whose kernel another rank is building is set aside rather
@@ -2891,10 +2963,10 @@ def test_share_jit_builds_sets_aside_profiles_built_elsewhere(
     monkeypatch.setenv(jit_share.SHARE_DIR_ENV, str(tmp_path))
     tuner = AutoTuner.get()
     tuner.clear_cache()
-    op = "autotuner_test::share_jit_builds"
+    op = "autotuner_test::shared_builds"
     config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
         0, 0, (1, 2, 4, 8)), ),
-                          share_jit_builds=True)
+                          build_strategy=BuildStrategy.SHARED)
     real_claim = jit_share.SharedSweep.claim
     # Another rank holds the claim on the last profile (M = 8) and has run it.
     monkeypatch.setattr(jit_share.SharedSweep, "claim",
@@ -2911,7 +2983,7 @@ def test_share_jit_builds_sets_aside_profiles_built_elsewhere(
     assert jit_share._DEADLINE_ENV not in os.environ
 
 
-def test_share_jit_builds_sets_aside_a_timed_profile_whose_kernel_is_busy(
+def test_shared_builds_set_aside_a_timed_profile_whose_kernel_is_busy(
         monkeypatch, tmp_path):
     """The ranks split a sweep by profile when its first profile has one tactic.
     A later profile with several tactics is timed, and a tactic whose kernel
@@ -2950,10 +3022,10 @@ def test_share_jit_builds_sets_aside_a_timed_profile_whose_kernel_is_busy(
     monkeypatch.setenv(jit_share.SHARE_DIR_ENV, str(tmp_path))
     tuner = AutoTuner.get()
     tuner.clear_cache()
-    op = "autotuner_test::share_jit_builds_timed_busy"
+    op = "autotuner_test::shared_builds_timed_busy"
     config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
         0, 0, (1, 2, 4)), ),
-                          share_jit_builds=True)
+                          build_strategy=BuildStrategy.SHARED)
     runners = [MixedTacticsRunner()]
     with autotune():
         tuner.choose_one(op, runners, config,
@@ -3314,11 +3386,16 @@ def test_jit_share_builds_here_when_the_directory_fails(monkeypatch, tmp_path):
         assert (1, "tile") in cache and cache[(1, "tile")] == "kernel"
 
 
-def test_build_across_ranks_runs_only_claimed_items(monkeypatch, tmp_path):
+@pytest.mark.parametrize("workers_on", [False, True])
+def test_build_across_ranks_runs_only_claimed_items(monkeypatch, tmp_path,
+                                                    tune_mode_workers,
+                                                    workers_on):
     """With several tactics under INDEPENDENT tuning, a build pass runs each
     (profile, runner, tactic) this process claims once, before profiling, and
     leaves the items other processes claimed to them; profiling then times
-    every pair."""
+    every pair. A runner that cannot go to the worker processes (a local class)
+    takes the same pass with them on."""
+    tune_mode_workers.enabled = workers_on
     ran: List[tuple] = []
     timed: List[tuple] = []
 
@@ -3357,8 +3434,9 @@ def test_build_across_ranks_runs_only_claimed_items(monkeypatch, tmp_path):
     tuner.clear_cache()
     config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(0, 0,
                                                                   (2, 4)), ),
-                          share_jit_builds=True)
-    with autotune():
+                          build_strategy=BuildStrategy.SHARED,
+                          use_build_pool_in_warmup=workers_on)
+    with tune_mode_workers.pass_scope(), autotune():
         tuner.choose_one("autotuner_test::build_across_ranks",
                          [TwoTacticRunner()], config,
                          [torch.zeros(4, 64, device="cuda")])
@@ -3546,16 +3624,22 @@ def test_default_parallel_jit_warmup_threads(monkeypatch, host_cpus, affinity,
 
 
 @pytest.mark.parametrize("sharing", [False, True])
-def test_shared_jit_builds_replace_the_warmup_pool(monkeypatch, tmp_path,
-                                                   sharing):
-    """An op with both parallel_jit_warmup and share_jit_builds runs its sweep on
-    the warmup pool only when the processes do not share their JIT builds. When
-    they do, the claims split the builds and every profile runs on the calling
-    thread."""
+def test_the_warmup_pool_runs_the_profiles_this_process_claims(
+        monkeypatch, tmp_path, sharing):
+    """An op with both parallel_jit_warmup and the SHARED build strategy runs
+    its sweep on the warmup pool. When the processes share their JIT builds,
+    the pool runs only the profiles this process claims; the profiling then
+    runs every profile on the calling thread, a profile another process claimed
+    once that process ran it or the wait ran out."""
     monkeypatch.delenv("TLLM_AUTOTUNER_PARALLEL_JIT_WARMUP", raising=False)
     monkeypatch.setattr(jit_share, "enabled", lambda: sharing)
     monkeypatch.setattr(jit_share, "start_fraction", lambda: 0.0)
     monkeypatch.setenv(jit_share.SHARE_DIR_ENV, str(tmp_path))
+    # Another process holds the odd profiles, and never runs them.
+    monkeypatch.setenv("TLLM_JIT_SHARE_WAIT_S", "0.2")
+    real_claim = jit_share.SharedSweep.claim
+    monkeypatch.setattr(jit_share.SharedSweep, "claim",
+                        lambda self, i: i % 2 == 0 and real_claim(self, i))
     tuner = AutoTuner.get()
     tuner.clear_cache()
     ThreadRecordingRunner.calls.clear()
@@ -3563,16 +3647,416 @@ def test_shared_jit_builds_replace_the_warmup_pool(monkeypatch, tmp_path,
     config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
         0, 0, buckets), ),
                           parallel_jit_warmup=4,
-                          share_jit_builds=True)
+                          build_strategy=BuildStrategy.SHARED)
     x = torch.randn(128, 64, device="cuda")
     w = torch.randn(64, 128, device="cuda")
     caller = threading.get_ident()
     with autotune():
-        tuner.choose_one(f"autotuner_test::shared_builds_or_pool_{sharing}",
+        tuner.choose_one(f"autotuner_test::shared_builds_on_pool_{sharing}",
                          [ThreadRecordingRunner()], config, [x, w])
 
     on_caller = {m for m, t in ThreadRecordingRunner.calls if t == caller}
     on_pool = sorted(m for m, t in ThreadRecordingRunner.calls if t != caller)
     assert on_caller == set(buckets)
-    assert on_pool == ([] if sharing else sorted(buckets))
+    assert on_pool == sorted(buckets[0::2] if sharing else buckets)
     tuner.clear_cache()
+
+
+@pytest.fixture
+def tune_mode_workers(monkeypatch):
+    """A BuildPool whose worker processes import autotuner_worker_targets."""
+    from tensorrt_llm._torch import build_pool
+
+    original = build_pool._worker_env
+    here = os.path.dirname(os.path.abspath(__file__))
+
+    def worker_env():
+        env = original()
+        env["PYTHONPATH"] = os.pathsep.join(p for p in (here,
+                                                        env.get("PYTHONPATH"))
+                                            if p)
+        return env
+
+    monkeypatch.setattr(build_pool, "_worker_env", worker_env)
+    rank = build_pool.BuildPool(workers=2, enabled=True)
+    monkeypatch.setattr(build_pool.BuildPool, "_instance", rank)
+    yield rank
+    rank.stop()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize("workers_on, in_build_pass", [(True, True),
+                                                       (False, True),
+                                                       (True, False)],
+                         ids=["workers", "workers_off", "no_build_pass"])
+def test_tune_mode_builds_every_tactic_in_worker_processes_before_profiling(
+        tune_mode_workers, tmp_path, monkeypatch, workers_on, in_build_pass):
+    """In tune mode inside a build pass, an op that sets ``use_build_pool_in_warmup`` has the rank's
+    worker processes build every (profile, tactic) its profiling times, before it profiles;
+    with the workers off (``TLLM_KERNEL_BUILDER=0``), or outside a build pass, none builds
+    there."""
+    import autotuner_worker_targets as targets
+
+    tune_mode_workers.enabled = workers_on
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    runner = targets.RecordingRunner(str(tmp_path))
+    config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(0, 0, (1, 2, 4)), ),
+        use_build_pool_in_warmup=True,
+    )
+    x = torch.randn(4, 8, device="cuda")
+    # The builds there are when the first tactic is timed.
+    built_at_profiling = []
+    profile = AutoTuner._profile_single_kernel
+
+    def profile_after_builds(self, *args, **kwargs):
+        if not built_at_profiling:
+            built_at_profiling.append(sorted(os.listdir(tmp_path)))
+        return profile(self, *args, **kwargs)
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel",
+                        profile_after_builds)
+    build_pass = (tune_mode_workers.pass_scope()
+                  if in_build_pass else contextlib.nullcontext())
+    with build_pass, autotune():
+        best_runner, _ = tuner.choose_one("test::tune_mode_builds", [runner],
+                                          config, [x])
+    assert best_runner is runner
+    built = sorted(os.listdir(tmp_path))
+    if workers_on and in_build_pass:
+        assert built == sorted(f"m{m}-t{t}" for m in (1, 2, 4) for t in (0, 1))
+        assert built_at_profiling == [built]
+        assert all(
+            int((tmp_path / name).read_text()) != os.getpid() for name in built)
+        # The build pass stopped the workers.
+        assert tune_mode_workers._pool is None
+    else:
+        assert built == []
+    tuner.clear_cache()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_a_worker_frees_the_gpu_memory_of_a_build_once_it_ends(
+        tune_mode_workers, tmp_path):
+    """A build that runs a kernel to compile it allocates on the rank's GPU in the worker: the
+    worker frees that memory once the build ends, and the pool learns the most a build of the
+    kind allocated, to start the kind's builds only while the GPU has room for them."""
+    import autotuner_worker_targets as targets
+
+    from tensorrt_llm._torch.build_pool import Build
+
+    tune_mode_workers.max_workers = 1  # Both builds run in the same worker.
+    nbytes = 512 << 20
+    with tune_mode_workers.pass_scope():
+        [allocated] = tune_mode_workers.build(
+            [Build(f"{targets.__name__}:allocate", (nbytes, ), "allocate")])
+        [recorded] = tune_mode_workers.build([
+            Build(f"{targets.__name__}:record_reserved",
+                  (str(tmp_path / "reserved"), ), "record")
+        ])
+    assert (allocated.status, recorded.status) == ("built", "built")
+    assert allocated.peak_bytes >= nbytes
+    assert tune_mode_workers.peak_bytes("allocate") >= nbytes
+    assert int((tmp_path / "reserved").read_text()) < nbytes
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_small_inputs_of_any_dtype_reach_a_worker_with_their_values(
+        tune_mode_workers, tmp_path):
+    """A worker's small inputs keep their values whatever their dtype, as a prequantized FP8
+    GEMM's activation at a small profile: a pickled CPU tensor of a float8 or float4 dtype does
+    not load in another process."""
+    import autotuner_worker_targets as targets
+
+    from tensorrt_llm._torch.build_pool import Build
+
+    tensors = [
+        torch.arange(32 * dtype.itemsize, dtype=torch.uint8,
+                     device="cuda").view(dtype).reshape(4, 8)
+        for dtype in (torch.float8_e4m3fn, torch.float8_e8m0fnu,
+                      torch.float4_e2m1fn_x2, torch.bfloat16)
+    ]
+    path = tmp_path / "made"
+    with tune_mode_workers.pass_scope():
+        [result] = tune_mode_workers.build([
+            Build(f"{targets.__name__}:record_made",
+                  (str(path), [autotuner._TensorSpec.of(t) for t in tensors]),
+                  "made")
+        ])
+    assert result.status == "built", result.error
+    assert path.read_bytes() == b"".join(
+        t.view(torch.uint8).cpu().numpy().tobytes() for t in tensors)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_the_build_state_queues_every_tactic_on_the_workers_and_times_none(
+        tune_mode_workers, tmp_path, monkeypatch):
+    """In the build state (a rehearsal's, beside the checkpoint load), choose_one queues the
+    builds of every (profile, tactic) the op's tuning would time on the worker processes, times
+    none, and returns the tactic the op runs now; join_builds waits for the builds."""
+    import autotuner_worker_targets as targets
+
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    runner = targets.RecordingRunner(str(tmp_path))
+    config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(0, 0, (1, 2, 4)), ),
+        use_build_pool_in_rehearsal=True,
+    )
+    x = torch.randn(4, 8, device="cuda")
+    timed = []
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel",
+                        lambda self, *args, **kwargs: timed.append(args))
+    with (tune_mode_workers.pass_scope(overlapped=True),
+          autotuner.build_kernels()):
+        best_runner, tactic = tuner.choose_one("test::build_state", [runner],
+                                               config, [x])
+        assert (best_runner, tactic) == (runner, -1)
+        assert tuner.join_builds() == {"built": 6}
+    built = sorted(os.listdir(tmp_path))
+    assert built == sorted(f"m{m}-t{t}" for m in (1, 2, 4) for t in (0, 1))
+    assert all(
+        int((tmp_path / name).read_text()) != os.getpid() for name in built)
+    assert timed == []
+    tuner.clear_cache()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_in_the_build_state_a_thread_safe_op_builds_on_threads(
+        tune_mode_workers, tmp_path, monkeypatch):
+    """An op whose compiles run outside the GIL (``parallel_jit_warmup``, as DeepGEMM's) has
+    its builds made on the pass's threads, in this process, each admitted for twice its
+    inputs' bytes."""
+    import autotuner_worker_targets as targets
+
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    runner = targets.RecordingRunner(str(tmp_path))
+    config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(0, 0, (1, 2, 4)), ),
+        use_build_pool_in_rehearsal=True,
+        parallel_jit_warmup=-1,
+    )
+    x = torch.randn(4, 8, device="cuda")
+    needs = []
+    with tune_mode_workers.pass_scope(overlapped=True):
+        lane = tune_mode_workers.threads
+        submit = lane.submit
+
+        def record_need(function, family=None, need_bytes=0):
+            needs.append(need_bytes)
+            return submit(function, family, need_bytes)
+
+        monkeypatch.setattr(lane, "submit", record_need)
+        with autotuner.build_kernels():
+            tuner.choose_one("test::thread_builds", [runner], config, [x])
+        assert lane.join() == {"built": 6}
+        assert tuner.join_builds() == {}
+    built = sorted(os.listdir(tmp_path))
+    assert built == sorted(f"m{m}-t{t}" for m in (1, 2, 4) for t in (0, 1))
+    assert all(
+        int((tmp_path / name).read_text()) == os.getpid() for name in built)
+    # A build's input is m rows of 8 float32 values.
+    assert sorted(needs) == sorted(2 * m * 8 * 4 for m in (1, 2, 4)
+                                   for _ in range(2))
+    tuner.clear_cache()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_the_build_state_keeps_no_input_of_the_call_alive(
+        tune_mode_workers, tmp_path):
+    """The queued builds hold specs of the call's inputs, not the inputs: a dummy weight that
+    the checkpoint load replaces is freed while the builds go on."""
+    import gc
+    import weakref
+
+    import autotuner_worker_targets as targets
+
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    runner = targets.RecordingRunner(str(tmp_path), build_s=0.5)
+    config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(0, 0, (1, 2, 4)), ),
+        use_build_pool_in_rehearsal=True,
+    )
+    x = torch.randn(4, 8, device="cuda")
+    weight = torch.randn(1 << 21, device="cuda")
+    alive = weakref.ref(weight)
+    with (tune_mode_workers.pass_scope(overlapped=True),
+          autotuner.build_kernels()):
+        tuner.choose_one("test::no_inputs_kept", [runner], config, [x, weight])
+        del weight
+        gc.collect()
+        assert alive() is None
+        assert tuner.join_builds() == {"built": 6}
+    tuner.clear_cache()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_a_rehearsal_times_an_op_in_a_worker_and_the_warmup_finds_it_cached(
+        tune_mode_workers, tmp_path, monkeypatch):
+    """An op that sets ``tune_in_rehearsal`` has its profiles timed in a worker process once the
+    rehearsal's builds end; joining the RehearsalTuner caches the results, so that the warmup's
+    tuning times nothing."""
+    import autotuner_worker_targets as targets
+
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    runner = targets.RecordingRunner(str(tmp_path))
+    config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(0, 0, (1, 2, 4)), ),
+        use_build_pool_in_rehearsal=True,
+        tune_in_rehearsal=True,
+    )
+    x = torch.randn(4, 8, device="cuda")
+    rehearsal_tuner = autotuner.RehearsalTuner.get()
+    with tune_mode_workers.pass_scope(overlapped=True):
+        with autotuner.build_kernels():
+            tuner.choose_one("test::rehearsal_timing", [runner], config, [x])
+        rehearsal_tuner.start()
+        assert tuner.join_builds() == {"built": 6}
+        rehearsal_tuner.join()
+    for profile in tuner._optimization_profiles(config, [x]):
+        hit, *_ = tuner.profiling_cache.search_cache(
+            "test::rehearsal_timing", [runner],
+            profile.get_opt_shapes(),
+            config,
+            apply_map_to_tuning_buckets=False)
+        assert hit
+    timed = []
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel",
+                        lambda self, *args, **kwargs: timed.append(args))
+    with autotune():
+        tuner.choose_one("test::rehearsal_timing", [runner], config, [x])
+    assert timed == []
+    tuner.clear_cache()
+
+
+def test_rehearsal_tuner_merges_every_op_a_rank_of_the_group_timed(monkeypatch):
+    """Each merge is collective, so every rank merges the ops any rank timed in the rehearsal,
+    in one order."""
+
+    class _Dist:
+
+        def tp_cp_allgather(self, obj):
+            return [obj, [("other_op", DistributedTuningStrategy.PARALLEL)]]
+
+    tuner = autotuner.AutoTuner()
+    tuner.setup_distributed_state(Mapping(world_size=2, rank=0, tp_size=2),
+                                  dist=_Dist())
+    monkeypatch.setattr(autotuner.AutoTuner, "_instance", tuner)
+    synced = []
+    monkeypatch.setattr(tuner, "_maybe_sync_cache_data",
+                        lambda strategy, custom_op: synced.append(custom_op))
+    rehearsal_tuner = autotuner.RehearsalTuner()
+    rehearsal_tuner.submit(
+        autotuner._RehearsalTuningTask(
+            custom_op="own_op",
+            runners=[],
+            tuning_config=TuningConfig(
+                distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL),
+            profiles=[],
+            inputs=[],
+            kwargs={}))
+    rehearsal_tuner.join()
+    assert synced == ["other_op", "own_op"]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available()
+                    or torch.cuda.get_device_capability()[0] != 10,
+                    reason="DeepGEMM's FP8 block-scale GEMMs run on SM100f")
+def test_deep_gemm_fp8_gemm_returns_zeros_and_builds_on_threads_in_a_rehearsal(
+        monkeypatch):
+    """In the build state DeepGEMM's GEMM launches nothing and returns zeros of its output's
+    shape; in a pass beside the load, its builds, short and thread-safe, run on the pass's
+    threads, and no worker process starts."""
+    from _torch.helpers import per_block_cast_to_fp8_e8m0
+
+    import tensorrt_llm._torch.custom_ops.torch_custom_ops  # noqa: F401
+    from tensorrt_llm._torch.build_pool import BuildPool
+
+    pool = BuildPool(enabled=True)
+    monkeypatch.setattr(BuildPool, "_instance", pool)
+    tuner = AutoTuner()
+    monkeypatch.setattr(AutoTuner, "_instance", tuner)
+    m, n, k = 64, 1024, 1024
+    a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+    weight, weight_scale = per_block_cast_to_fp8_e8m0(
+        torch.randn((n, k), device="cuda", dtype=torch.bfloat16))
+    with pool.pass_scope(overlapped=True):
+        with autotuner.build_kernels():
+            output = torch.ops.trtllm.fp8_swap_ab_gemm(a, weight, weight_scale)
+        assert output.shape == (m, n) and output.dtype == torch.bfloat16
+        assert torch.count_nonzero(output) == 0
+        assert tuner.join_builds() == {}
+        counts = pool.join_threads()
+    assert counts.get("built", 0) > 0
+    assert counts.get("failed", 0) == counts.get("refused", 0) == 0
+    assert pool._workers_started == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_a_runner_that_builds_from_shapes_builds_on_meta_inputs_in_the_workers(
+        tune_mode_workers, tmp_path):
+    """A runner that ``builds_from_shapes`` builds every (profile, tactic) in the worker
+    processes on meta tensors of the profile's inputs."""
+    import autotuner_worker_targets as targets
+
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    runner = targets.FromShapesRunner(str(tmp_path))
+    config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(0, 0, (1, 2, 4)), ),
+        use_build_pool_in_warmup=True,
+    )
+    x = torch.randn(4, 8, device="cuda")
+    with tune_mode_workers.pass_scope(), autotune():
+        tuner.choose_one("test::builds_from_shapes", [runner], config, [x])
+    records = {
+        name: (tmp_path / name).read_text().split()
+        for name in os.listdir(tmp_path)
+    }
+    assert sorted(records) == sorted(f"m{m}-t{t}" for m in (1, 2, 4)
+                                     for t in (0, 1))
+    assert all(record[0] != str(os.getpid()) and record[1:] == ["meta", "8"]
+               for record in records.values())
+    tuner.clear_cache()
+
+
+def test_tensor_spec_remakes_the_storage_a_view_reads(monkeypatch):
+    """A worker's input has the tensor's storage, padding included, and its view of it, as a
+    TMA-aligned scale is a column-major view of a padded buffer, and a small tensor's values; a
+    small view of a large buffer keeps its own extent only."""
+    padded = torch.arange(8 * 16, dtype=torch.int32).reshape(8, 16)
+    scale = padded.t()[:12, :5]
+    remade = autotuner._TensorSpec.make(autotuner._TensorSpec.of(scale))
+    assert remade.shape == scale.shape and remade.stride() == scale.stride()
+    assert remade.storage_offset() == scale.storage_offset()
+    assert remade.untyped_storage().nbytes() == padded.untyped_storage().nbytes(
+    )
+    assert torch.equal(remade, scale)
+    # Without values, for a build from shapes: a meta tensor of the same view.
+    spec = autotuner._TensorSpec.of(scale, keep_values=False)
+    meta = autotuner._TensorSpec.make_meta(spec)
+    assert spec.values is None and meta.is_meta
+    assert (meta.shape, meta.stride(), meta.storage_offset(),
+            meta.dtype) == (scale.shape, scale.stride(), scale.storage_offset(),
+                            scale.dtype)
+    fp4 = torch.zeros(4, 8, dtype=torch.uint8).view(torch.float4_e2m1fn_x2)
+    assert autotuner._TensorSpec.make_meta(
+        autotuner._TensorSpec.of(
+            fp4, keep_values=False)).dtype == torch.float4_e2m1fn_x2
+
+    # A block scale keeps its values (powers of two, which a kernel decodes).
+    sf = torch.tensor([[0.5, 2.0], [4.0, 1.0]])
+    assert torch.equal(autotuner._TensorSpec.make(autotuner._TensorSpec.of(sf)),
+                       sf)
+
+    monkeypatch.setattr(autotuner, "_SPEC_STORAGE_SLACK_BYTES", 0)
+    buffer = torch.arange(100, dtype=torch.float16)
+    view = buffer[40:50]
+    remade = autotuner._TensorSpec.make(autotuner._TensorSpec.of(view))
+    assert torch.equal(remade, view)
+    assert remade.untyped_storage().nbytes(
+    ) == view.numel() * view.element_size()

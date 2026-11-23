@@ -29,6 +29,7 @@ from tensorrt_llm._torch.attention.attention import Attention
 from tensorrt_llm._torch.attention.backends.interface import RopeParams
 from tensorrt_llm._torch.model_config import ModelConfig, MoESelection
 from tensorrt_llm._torch.models.modeling_dflash import DFlashForCausalLM
+from tensorrt_llm._torch.models.modeling_dspark import MLADSparkForCausalLM
 from tensorrt_llm._torch.models.modeling_speculative import (
     Eagle3ForCausalLM,
     MTPForCausalLM,
@@ -52,6 +53,7 @@ from tensorrt_llm.llmapi.llm_args import (
     MoePerLayerDynamicLoadBalancerConfig,
     MTPDecodingConfig,
 )
+from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo, QuantMode
 
@@ -980,6 +982,77 @@ def test_dflash_workspace_sizes_the_largest_folded_chunk(
     ]
     counter_calls = wrapper._dflash_trtllm_gen_ops.get_multi_ctas_kv_counter_size.call_args_list
     assert [call.args for call in counter_calls] == [(heads * chunk, 3, 148)]
+
+
+def _fake_mla_dspark_wrapper(**draft_config: object) -> MLADSparkForCausalLM:
+    """An MLA DSpark drafter as created, before a load: the fields its projection and head
+    loaders read, and none of the modules they build."""
+    wrapper = MLADSparkForCausalLM.__new__(MLADSparkForCausalLM)
+    nn.Module.__init__(wrapper)
+    wrapper.config = SimpleNamespace(
+        hidden_size=64,
+        rms_norm_eps=1e-6,
+        torch_dtype=torch.bfloat16,
+        vocab_size=96,
+        **draft_config,
+    )
+    wrapper.target_layer_ids = getattr(wrapper.config, "dflash_config", {}).get("target_layer_ids")
+    wrapper.model_config = SimpleNamespace(mapping=Mapping())
+    wrapper._tp_split = False
+    wrapper._fc_input_slice = None
+    wrapper._dspark_markov_rank = 16
+    wrapper.markov_w1 = wrapper.markov_w2 = None
+    wrapper.confidence_proj_weight = wrapper.confidence_proj_bias = None
+    return wrapper
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the drafter builds its modules on CUDA")
+@pytest.mark.parametrize(
+    "draft_config, captured_width",
+    [
+        # Inferact/Kimi-K3-DSpark: the captured layers and the target's hidden size at the
+        # top level.
+        (dict(target_layer_ids=[2, 5, 9], num_target_layers=3, target_hidden_size=48), 3 * 48),
+        # z-lab/Qwen3-8B-DFlash-b16, RadixArk/Kimi-K3-DSpark: the layers in dflash_config,
+        # num_target_layers the target's depth, and no target_hidden_size.
+        (dict(dflash_config={"target_layer_ids": [2, 5, 9]}, num_target_layers=12), 3 * 64),
+    ],
+    ids=["top_level", "dflash_config"],
+)
+def test_dspark_dummy_state_builds_what_a_load_builds(
+    draft_config: dict, captured_width: int
+) -> None:
+    """Dummy weights give the drafter the fc, hidden_norm and Markov head a checkpoint
+    gives it, in the checkpoint's shapes and dtypes: fc takes the target hidden states
+    the worker captures."""
+    loaded = _fake_mla_dspark_wrapper(**draft_config)
+    dummy = _fake_mla_dspark_wrapper(**draft_config)
+    cfg = loaded.config
+
+    def tensor(*shape: int) -> torch.Tensor:
+        return torch.randn(shape, dtype=torch.bfloat16, device="cuda")
+
+    loaded._take_dspark_head_weights(
+        {
+            "markov_w1.weight": tensor(cfg.vocab_size, 16),
+            "markov_w2.weight": tensor(cfg.vocab_size, 16),
+        }
+    )
+    loaded._load_target_projection({"fc.weight": tensor(cfg.hidden_size, captured_width)})
+    loaded._load_hidden_norm(tensor(cfg.hidden_size))
+    dummy.initialize_dummy_state(low=-1e-3, high=1e-3, seed=0)
+
+    for expected, actual in (
+        (loaded.fc.weight, dummy.fc.weight),
+        (loaded.hidden_norm.weight, dummy.hidden_norm.weight),
+        (loaded.markov_w1, dummy.markov_w1),
+        (loaded.markov_w2, dummy.markov_w2),
+    ):
+        assert (actual.shape, actual.dtype, actual.device) == (
+            expected.shape,
+            expected.dtype,
+            expected.device,
+        )
 
 
 @pytest.mark.cpu_only

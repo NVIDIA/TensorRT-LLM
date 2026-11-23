@@ -35,9 +35,10 @@ from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.utils import fp8_quantize
 
-from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
-                         DynamicTensorSpec, OptimizationProfile, TunableRunner,
-                         TuningConfig, autotune)
+from ..autotuner import (AutoTuner, BuildStrategy, ConstraintSpec,
+                         DistributedTuningStrategy, DynamicTensorSpec,
+                         OptimizationProfile, TunableRunner, TuningConfig,
+                         autotune)
 from ..cublaslt_utils import IS_CUBLASLT_AVAILABLE
 from ..cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
                               IS_CUTLASS_DSL_RUBIN_AVAILABLE)
@@ -594,6 +595,9 @@ def _(
 _MXFP8_AUTOTUNED_OP = "trtllm::mxfp8_mxfp8_gemm_autotuned::gemm"
 _MXFP8_QUANTIZE_AUTOTUNED_OP = "trtllm::mxfp8_quantize_autotuned::quantize"
 _MXFP8_GEMM_AUTOTUNED_OP = "trtllm::mxfp8_gemm_autotuned::gemm_v3"
+# The autotuner's build state queues FlashInferMXFP8GemmRunner's builds under this
+# op; nothing tunes it.
+_FLASHINFER_MXFP8_GEMM_BUILD_OP = "trtllm::flashinfer_mxfp8_gemm::build"
 
 
 def _map_to_mxfp8_large_m_bucket(num_tokens: int) -> int:
@@ -829,11 +833,17 @@ class FlashInferMXFP8GemmRunner(TunableRunner):
     CUTLASS = -1  # -1 is the AutoTuner fallback tactic.
     CUTE_DSL = 0
 
+    # build() reads nothing of its inputs: a worker process gets meta tensors.
+    builds_from_shapes = True
+
+    # In a rehearsal, FlashInfer's CUTLASS MXFP8 module, which build() compiles,
+    # builds on the build pool (prebuild_flashinfer_mxfp8_gemm).
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(DynamicTensorSpec(
             0, 0, get_power_of_2_num_tokens_buckets,
             next_positive_power_of_2), ),
         constraint_specs=(ConstraintSpec(1, 0, _mxfp8_scale_infer_shape), ),
+        use_build_pool_in_rehearsal=True,
     )
 
     def __init__(self, output_dtype: torch.dtype) -> None:
@@ -845,6 +855,24 @@ class FlashInferMXFP8GemmRunner(TunableRunner):
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile, **kwargs) -> List[int]:
         return [self.CUTLASS, self.CUTE_DSL]
+
+    def build(self,
+              inputs: List[torch.Tensor],
+              *,
+              tactic: int = CUTLASS,
+              **kwargs) -> None:
+        """CUTLASS: build and load FlashInfer's CUTLASS MXFP8 GEMM module, without
+        running it.
+
+        CuTe DSL: nothing; its kernels compile when the tactic first runs.
+        """
+        if tactic == self.CUTLASS:
+            from flashinfer.gemm.gemm_base import get_cutlass_mxfp8_gemm_module
+            get_cutlass_mxfp8_gemm_module(torch.cuda.get_device_capability()[0])
+
+    def build_key(self, profile: OptimizationProfile, tactic: int) -> str:
+        # One module per tactic serves every shape.
+        return str(tactic)
 
     def forward(
         self,
@@ -945,6 +973,27 @@ def mxfp8_quantize_gemm_autotuned(
                       mxfp8_quantize_autotuned(input, tune))
     return mxfp8_gemm_autotuned(act, act_scale, weight, weight_scale,
                                 output_dtype, allowed_backends, tune)
+
+
+def prebuild_flashinfer_mxfp8_gemm(act: torch.Tensor, act_scale: torch.Tensor,
+                                   weight: torch.Tensor,
+                                   weight_scale: torch.Tensor,
+                                   output_dtype: torch.dtype) -> None:
+    """In the autotuner's build state, queue the builds of FlashInfer's MXFP8 GEMM
+    (``FlashInferMXFP8GemmRunner.build``), whose CUTLASS module the warmup's
+    FlashInfer MXFP8 tuning times, and of FlashInfer's ``trtllm_utils`` module,
+    whose delay kernel FlashInfer's tuning loads; outside it, nothing."""
+    tuner = AutoTuner.get()
+    if not tuner.is_build_mode:
+        return
+    from flashinfer.jit.tllm_utils import gen_trtllm_utils_module
+
+    from ..flashinfer_utils import queue_flashinfer_module_build
+    queue_flashinfer_module_build("trtllm_utils", gen_trtllm_utils_module)
+    runner = FlashInferMXFP8GemmRunner(output_dtype)
+    tuner.choose_one(_FLASHINFER_MXFP8_GEMM_BUILD_OP, [runner],
+                     runner.tuning_config,
+                     [act, act_scale, weight, weight_scale])
 
 
 def flashinfer_mxfp8_gemm_cute_dsl(
@@ -2305,15 +2354,17 @@ class fp8SwapABGemmRunner(TunableRunner):
     # and inference falls back to a slower uncompiled path.
     # `exclude_from_cache=True` keeps the in-process cache working but
     # ensures the tuning (and the JIT warmup it triggers) repeats on
-    # every process startup. `share_jit_builds=True` lets the ranks split
-    # those builds, instead of each running them on its thread pool, when
-    # they share JIT builds (TLLM_JIT_SHARE_DIR).
+    # every process startup. `build_strategy=BuildStrategy.SHARED` lets the
+    # ranks split those builds, instead of each running them on its thread
+    # pool, when they share JIT builds (TLLM_JIT_SHARE_DIR, or by default the
+    # launch's directory on each node).
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(DynamicTensorSpec(
             0, 0, deep_gemm_jit_warmup_buckets), ),
         exclude_from_cache=True,
         parallel_jit_warmup=_DEEP_GEMM_JIT_WARMUP_THREADS,
-        share_jit_builds=True,
+        build_strategy=BuildStrategy.SHARED,
+        use_build_pool_in_rehearsal=True,
     )
 
     def __init__(self, output_dtype: torch.dtype, disable_ue8m0_cast: bool,
@@ -2369,7 +2420,8 @@ class Fp8PrequantizedSwapABGemmRunner(TunableRunner):
             1, 0, lambda input_shapes: input_shapes[0][0]), ),
         exclude_from_cache=True,
         parallel_jit_warmup=_DEEP_GEMM_JIT_WARMUP_THREADS,
-        share_jit_builds=True,
+        build_strategy=BuildStrategy.SHARED,
+        use_build_pool_in_rehearsal=True,
     )
 
     def __init__(self, output_dtype: torch.dtype,
@@ -2433,12 +2485,17 @@ def fp8_prequantized_swap_ab_gemm(
     disable_ue8m0_cast: bool = False,
 ) -> torch.Tensor:
     runner = Fp8PrequantizedSwapABGemmRunner(output_dtype, disable_ue8m0_cast)
-    _, best_tactic = AutoTuner.get().choose_one(
+    tuner = AutoTuner.get()
+    _, best_tactic = tuner.choose_one(
         "trtllm::fp8_prequantized_swap_ab_gemm",
         [runner],
         Fp8PrequantizedSwapABGemmRunner.tuning_config,
         [activation, activation_scale, weight, weight_scale],
     )
+    if tuner.is_build_mode:
+        # The build state queued this GEMM's builds; nothing runs.
+        return activation.new_zeros((activation.size(0), weight.size(0)),
+                                    dtype=output_dtype)
     return runner(
         inputs=[activation, activation_scale, weight, weight_scale],
         tactic=best_tactic,
@@ -2492,6 +2549,10 @@ def fp8_swap_ab_gemm(
         fp8SwapABGemmRunner.tuning_config,
         [input, weight, weight_scale],
     )
+    if tuner.is_build_mode:
+        # The build state queued this GEMM's builds; nothing runs.
+        return input.new_zeros((input.size(0), weight.size(0)),
+                               dtype=output_dtype)
     return gemm_runner(
         inputs=[input, weight, weight_scale],
         tactic=best_tactic,

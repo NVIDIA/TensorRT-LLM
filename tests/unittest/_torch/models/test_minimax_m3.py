@@ -99,6 +99,7 @@ from tensorrt_llm._torch.models.modeling_utils import (
     apply_quant_config_exclude_modules,
     fused_checkpoint_names,
     get_registered_model_class,
+    remove_weights,
 )
 from tensorrt_llm._torch.modules.linear import _load_kv_cache_scales
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
@@ -107,6 +108,7 @@ from tensorrt_llm._torch.moe.fused_moe.routing import (
     MiniMaxM2MoeRoutingMethod,
     MiniMaxM3MoeRoutingMethod,
 )
+from tensorrt_llm._torch.pyexecutor.model_loader import initialize_dummy_weights
 from tensorrt_llm._torch.utils import AuxStreamType, EventType
 from tensorrt_llm.llmapi import MiniMaxM3SparseAttentionConfig, RocketSparseAttentionConfig
 from tensorrt_llm.mapping import Mapping
@@ -303,8 +305,10 @@ def test_nvfp4_cache_fused_layout_validation(layout: str, expected: bool | None)
         ),
     ],
 )
+# A warmup forward creates the scale buffer inside inference mode.
+@pytest.mark.parametrize("inference_mode", [False, True], ids=["eager", "inference_mode"])
 def test_nvfp4_reload_preserves_attention_scale_storage(
-    monkeypatch: pytest.MonkeyPatch, device: str
+    monkeypatch: pytest.MonkeyPatch, device: str, inference_mode: bool
 ) -> None:
     """The model reload hook updates eager and captured readers at stable addresses."""
     target = MiniMaxM3ForCausalLM.__new__(MiniMaxM3ForCausalLM)
@@ -327,7 +331,10 @@ def test_nvfp4_reload_preserves_attention_scale_storage(
 
     monkeypatch.setattr(SpecDecOneEngineForCausalLM, "load_weights", load_scales)
     monkeypatch.setenv("TRTLLM_LOAD_KV_SCALES", "1")
-    k_scale, v_scale = _aligned_nvfp4_dequant_scales(decoder.self_attn.attn, projection.kv_scales)
+    with torch.inference_mode(inference_mode):
+        k_scale, v_scale = _aligned_nvfp4_dequant_scales(
+            decoder.self_attn.attn, projection.kv_scales
+        )
     pointers = [
         x.data_ptr() for x in (projection.kv_scales, projection.inv_kv_scales, k_scale, v_scale)
     ]
@@ -2974,6 +2981,30 @@ def test_minimax_m3_fused_routing_cuda_graph_replay_tracks_inputs() -> None:
 
     torch.testing.assert_close(graph_idx, reference_idx, rtol=0, atol=0)
     torch.testing.assert_close(graph_weights, reference_weights, rtol=0, atol=0)
+
+
+@pytest.mark.cpu_only
+def test_minimax_m3_gate_dummy_state_splits_the_weight_as_a_load_does() -> None:
+    """Dummy weights give the router the BF16 split weight a checkpoint load gives it."""
+    loaded, dummy = (
+        modeling_minimaxm3.MiniMaxM3Gate(64, 8, top_k=2, routed_scaling_factor=1.0)
+        for _ in range(2)
+    )
+    weight = torch.randn(8, 64) * 0.02
+    loaded.load_weights([{"weight": weight}])
+    dummy.weight.data.copy_(weight)
+    dummy.initialize_dummy_state(low=-1e-3, high=1e-3, seed=0)
+    assert torch.equal(dummy.split_weight, loaded.split_weight)
+
+
+@pytest.mark.cpu_only
+def test_minimax_m3_gate_dummy_state_skips_a_stripped_gate() -> None:
+    """Dummy weights leave alone a gate whose layer another pipeline rank runs: its
+    weights are removed, so it has no weight to split."""
+    gate = modeling_minimaxm3.MiniMaxM3Gate(64, 8, top_k=2, routed_scaling_factor=1.0)
+    remove_weights(gate)
+    initialize_dummy_weights(gate)
+    assert not hasattr(gate, "split_weight")
 
 
 @pytest.mark.gpu
