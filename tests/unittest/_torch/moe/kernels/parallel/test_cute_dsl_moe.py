@@ -6080,6 +6080,7 @@ def test_mxfp8_fused_fc12_moe_rubin(
         num_experts,
         tile_size,
         swiglu_limit,
+        monkeypatch,
     )
 
 
@@ -6101,6 +6102,7 @@ def test_mxfp8_fused_fc12_moe_blackwell(
     num_experts: int,
     tile_size: int,
     swiglu_limit: float,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Blackwell (SM100/SM103) port of the fused MXFP8 FC1+FC2 MoE op against a float oracle.
 
@@ -6121,6 +6123,7 @@ def test_mxfp8_fused_fc12_moe_blackwell(
         num_experts,
         tile_size,
         swiglu_limit,
+        monkeypatch,
     )
 
 
@@ -6135,6 +6138,7 @@ def _run_mxfp8_fused_fc12_moe_case(
     num_experts: int,
     tile_size: int,
     swiglu_limit: float,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """End-to-end check of a fused MXFP8 FC1+FC2 MoE op against a float oracle.
 
@@ -6304,8 +6308,10 @@ def _run_mxfp8_fused_fc12_moe_case(
     assert (raw_kwargs["input_scale"] == 255).all()
     torch.testing.assert_close(raw_output_prezeroed.float(), output.float(), rtol=2e-2, atol=2e-2)
 
-    if num_experts == 16 and swiglu_limit == float("inf"):
-        op = torch.ops.trtllm.cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin
+    # The Blackwell tactic carries its gather variant; the Rubin runner picks
+    # it at the tuning bucket's shape.
+    is_rubin = runner_cls.__name__ == "Sm107Mxfp8FusedFc12MoeRunner"
+    if is_rubin and num_experts == 16 and swiglu_limit == float("inf"):
         # 1c. Each FC1 A gather variant. The bucket rule picks the sparse
         #     gather for every shape here, so force each variant once and check
         #     that it is the one compiled.
@@ -6318,12 +6324,12 @@ def _run_mxfp8_fused_fc12_moe_case(
 
             forced_output = torch.zeros_like(output)
             with monkeypatch.context() as m, torch.inference_mode():
-                m.setattr(Sm107Mxfp8FusedFc12MoeRunner, "_use_sparse_gather", use_sparse_gather)
+                m.setattr(runner_cls, "_use_sparse_gather", use_sparse_gather)
                 # Start from an empty cache, so the keys afterwards are the
                 # kernels this call compiled and ran.
-                m.setattr(Sm107Mxfp8FusedFc12MoeRunner, "kernel_cache", {})
-                op(output=forced_output, **common_kwargs)
-                compiled = list(Sm107Mxfp8FusedFc12MoeRunner.kernel_cache)
+                m.setattr(runner_cls, "kernel_cache", {})
+                fused_op(output=forced_output, **common_kwargs)
+                compiled = list(runner_cls.kernel_cache)
             torch.cuda.synchronize()
             label = f"forced sparse_gather={sparse_gather}"
             assert chosen == [sparse_gather], label
@@ -6341,10 +6347,10 @@ def _run_mxfp8_fused_fc12_moe_case(
         stream.wait_stream(torch.cuda.current_stream())
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.stream(stream), torch.inference_mode():
-            op(output=graph_output, zero_output=True, **raw_kwargs)
+            fused_op(output=graph_output, zero_output=True, **raw_kwargs)
             with torch.cuda.graph(graph, stream=stream):
                 for _ in range(2):
-                    op(output=graph_output, zero_output=True, **raw_kwargs)
+                    fused_op(output=graph_output, zero_output=True, **raw_kwargs)
         torch.cuda.current_stream().wait_stream(stream)
         graph_output.fill_(float("nan"))
         for _ in range(8):
@@ -6360,7 +6366,7 @@ def _run_mxfp8_fused_fc12_moe_case(
         #     also tunes the decode-sized lookups with raw BF16 input.
         tuner = AutoTuner.get()
         with torch.inference_mode(), autotune():
-            op(output=torch.zeros_like(output), zero_output=True, **common_kwargs)
+            fused_op(output=torch.zeros_like(output), zero_output=True, **common_kwargs)
         decode_sort = torch.ops.trtllm.moe_sort(
             token_selected_experts=token_selected_experts[:1],
             token_final_scales=token_final_scales[:1],
@@ -6387,7 +6393,7 @@ def _run_mxfp8_fused_fc12_moe_case(
             output[:1],
             token_final_scales[:1],
         ]
-        decode_runner = Sm107Mxfp8FusedFc12MoeRunner(
+        decode_runner = runner_cls(
             num_experts, top_k, num_local_experts, 0, tile_size, zero_output=True
         )
         hit, *_ = tuner.profiling_cache.search_cache(
@@ -7074,6 +7080,7 @@ def _mxfp8_leaf_stub(monkeypatch: pytest.MonkeyPatch) -> tuple:
         FUSED_INPUT_QUANT_MAX_ELEMENTS=impl.FUSED_INPUT_QUANT_MAX_ELEMENTS,
         _TUNER_KEY=impl._TUNER_KEY,
         _locality_domain_runtime=None,
+        _sm_version=107,
     )
     leaf._fuses_input_quant = impl._fuses_input_quant.__get__(leaf)
     impl_calls, tuned = [], []
