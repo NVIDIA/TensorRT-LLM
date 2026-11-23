@@ -2046,6 +2046,41 @@ class _TorchLLM(BaseLLM):
         return normalized
 
     @set_api_status("prototype")
+    def get_memory_report(self) -> list[str]:
+        """Explain where the GPU workers' memory is going, as readable reports.
+
+        Each report splits one worker process's GPU memory by purpose (KV
+        cache, weights, runtime buffers, CUDA graphs, communication buffers,
+        library overhead) so that the parts add up to what the process holds.
+        In the monitor's full mode (``memory_monitor_config.mode='full'`` or
+        ``TLLM_MEM_MONITOR=1``), reports also break down startup step by step
+        and compare against the state after warmup.
+
+        Every rank reports with the Ray executor. With the default MPI
+        executor, every rank reports in full mode; otherwise rank 0 reports
+        and every other rank is listed as not gathered.
+
+        Returns:
+            list[str]: One entry per rank, rank 0 first: its report, or one
+            line saying why there is none (not gathered, not answered in
+            time, or the report could not be built). With
+            ``encode_only=True`` the encoder runs in this process, and the one
+            entry is this process's report.
+        """
+        if self._encode_only:
+            from tensorrt_llm._torch.memory.monitor.triggers import report_now
+
+            report = report_now(tag="on_demand", force=True, save=False)
+            return [
+                report or
+                "rank 0: the report could not be built; see this process's log"
+            ]
+        replies = self._collective_rpc("get_memory_report")
+        return [
+            report for reply in replies if reply for report in reply if report
+        ]
+
+    @set_api_status("prototype")
     def get_memory_status(self) -> RuntimeMemoryStatus:
         """Return the authoritative runtime-memory checkpoint status.
 

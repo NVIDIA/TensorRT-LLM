@@ -48,6 +48,7 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
     from .msa_decode import MsaDecodeFmha
     from .msa_prefill import MsaPrefillFmha
     from .prims_ts_block_sparse import PrimsTSBlockSparseFmha
+    from .prims_ts_dsa_sparse_mla import PrimsTSDsaSparseMlaFmha
     from .prims_ts_sparse_mla import PrimsTSSparseMlaFmha
     from .trtllm_gen import TrtllmGenFmha
     from .unfused import UnfusedFmha
@@ -56,6 +57,7 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
     return {
         "fp4_mla": Fp4MlaFmha,
         "triton_custom_mask": TritonCustomMaskFmha,
+        "prims_ts": PrimsTSFmha,
         "cute_dsl_mla": CuteDslMlaFmha,
         # A pair, not a priority: msa_decode serves a MiniMax-M3 MSA layer's
         # generation phase and msa_prefill its context phase, and neither will
@@ -63,13 +65,16 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
         "msa_decode": MsaDecodeFmha,
         "msa_prefill": MsaPrefillFmha,
         "flashinfer_sparse_mla": FlashInferSparseMlaFmha,
-        "prims_ts": PrimsTSFmha,
         "prims_ts_block_sparse": PrimsTSBlockSparseFmha,
         # DeepSeek-V4 generation on the vendored PrimTS native sparse MLA
         # kernel. Enabled by default: it only reports itself available for
         # DeepSeek-V4 on SM100, so every other model and architecture never
         # sees it; everything else keeps the TRTLLM-Gen libraries below.
         "prims_ts_sparse_mla": PrimsTSSparseMlaFmha,
+        # DSA generation on the PrimTS D576 sparse MLA kernel over NVFP4 KV records. It only
+        # reports itself available for DSA layers whose cache uses the ``fp8rope`` NVFP4 layout,
+        # and DSATrtllmAttention then hands it the records instead of gathered FP8 rows.
+        "prims_ts_dsa_sparse_mla": PrimsTSDsaSparseMlaFmha,
         # GQA decode layers (GqaDecodeSetup) only: dedicated generation kernels in order of precedence, then
         # trtllm-gen with the module's KV append / deferred prologue.
         "gqa_kv_replica_fused": GqaKvReplicaFusedFmha,
@@ -93,10 +98,7 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
 
 
 FMHA_LIBS: dict[str, FmhaCls] = init_fmha_libs()
-# Libraries left out of the default set and enabled explicitly through
-# TLLM_FMHA_LIBS: dense PrimTS can add host overhead; beam_shared_prefix is a
-# narrow-scope beam-search path.
-_OPT_IN_FMHA_LIBS: frozenset[str] = frozenset({"prims_ts", "beam_shared_prefix"})
+_OPT_IN_FMHA_LIBS: frozenset[str] = frozenset({"beam_shared_prefix"})
 DEFAULT_FMHA_LIBS: tuple[str, ...] = tuple(
     name for name in FMHA_LIBS if name not in _OPT_IN_FMHA_LIBS
 )

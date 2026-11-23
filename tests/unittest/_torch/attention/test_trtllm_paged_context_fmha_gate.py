@@ -13,13 +13,34 @@ kernels outside the op read is declined by every native library, so selection
 continues to those kernels.
 """
 
+<<<<<<< HEAD
+=======
+from copy import copy
+from types import SimpleNamespace
+from unittest import mock
+
+>>>>>>> origin/main
 import pytest
 import torch
 from fmha_test_utils import native_batch, native_forward_args
 
 from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
+<<<<<<< HEAD
 from tensorrt_llm._torch.attention.backends.fmha.trtllm_gen import TrtllmGenFmha
 from tensorrt_llm._torch.attention.backends.fmha.unfused import UnfusedFmha
+=======
+from tensorrt_llm._torch.attention.backends.interface import (
+    AttentionRuntimeFeatures,
+    PredefinedAttentionMask,
+)
+from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import CSA2CacheManager
+from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.bindings import DataType
+from tensorrt_llm.bindings.internal import thop
+>>>>>>> origin/main
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
@@ -27,10 +48,77 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a G
 _UNFUSED_DTYPE = torch.float32
 
 
+<<<<<<< HEAD
 def _is_supported(fmha_cls, batch, **overrides) -> bool:
     attn, metadata, qkv = batch
     forward_args = native_forward_args(attn, metadata, qkv, **overrides)
     return fmha_cls(attn).is_supported(qkv, None, None, metadata, forward_args)
+=======
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("sm_version", [80, 86, 89, 90, 100, 103, 120, 121])
+@pytest.mark.parametrize("scratch", [False, True])
+def test_swa_scratch_architecture_gate(sm_version, scratch):
+    manager = object.__new__(KVCacheManagerV2)
+    manager.enable_swa_scratch_reuse = scratch
+    with (
+        mock.patch(
+            "tensorrt_llm._torch.attention.backends.trtllm.get_sm_version",
+            return_value=sm_version,
+        ),
+        mock.patch.object(TrtllmAttentionMetadata, "_post_init_with_buffers") as allocate,
+    ):
+        # SM120/121 run the fmha_v2 kernels that dereference stale per-layer pages.
+        if scratch and sm_version not in (90, 100, 103):
+            with pytest.raises(ValueError, match="only on SM90 and SM100-family"):
+                TrtllmAttentionMetadata(
+                    max_num_requests=1, max_num_tokens=32, kv_cache_manager=manager
+                )
+            allocate.assert_not_called()
+        else:
+            TrtllmAttentionMetadata(max_num_requests=1, max_num_tokens=32, kv_cache_manager=manager)
+            allocate.assert_called_once()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("sm_version", [80, 86, 89, 90, 100, 103, 120, 121])
+@pytest.mark.parametrize("scratch", [False, True])
+def test_csa2_swa_scratch_architecture_gate(sm_version: int, scratch: bool) -> None:
+    manager = object.__new__(CSA2CacheManager)
+    manager.enable_swa_scratch_reuse = scratch
+    with (
+        mock.patch(
+            "tensorrt_llm._torch.attention.backends.trtllm.get_sm_version",
+            return_value=sm_version,
+        ),
+        mock.patch(
+            "tensorrt_llm._torch.attention.backends.sparse.csa2.metadata.get_sm_version",
+            return_value=sm_version,
+        ),
+        mock.patch.object(TrtllmAttentionMetadata, "_post_init_with_buffers") as allocate,
+    ):
+        if scratch and sm_version not in (90, 100, 103, 120, 121):
+            with pytest.raises(
+                ValueError, match=f"CSA2 attention is unsupported on SM{sm_version}"
+            ):
+                CSA2TrtllmMetadata(max_num_requests=1, max_num_tokens=32, kv_cache_manager=manager)
+            allocate.assert_not_called()
+        else:
+            metadata = CSA2TrtllmMetadata(
+                max_num_requests=1, max_num_tokens=32, kv_cache_manager=manager
+            )
+            allocate.assert_called_once_with(None)
+            allocate.reset_mock()
+
+            clone = copy(metadata)
+            clone.is_cuda_graph = True
+            clone.__post_init__()
+            allocate.assert_called_once_with(None)
+            assert clone.kv_cache_manager is manager
+
+
+def _make_metadata(head_dim, features, kv_dtype=_ABSENT, tokens_per_block=32):
+    """Construct real metadata with no CUDA buffers.
+>>>>>>> origin/main
 
 
 def test_paged_context_without_fused_kernel_is_declined():

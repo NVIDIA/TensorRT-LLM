@@ -82,6 +82,7 @@ def test_small_context_fallback_preserves_mixed_batch_generation(
     fmha = FlashInferTrtllmGenFmha(attn)
     manager = object.__new__(KVCacheManagerV2)
     manager.dtype = None
+    manager._use_per_layer_page_tables = False
     manager.trtllm_gen_extra_tokens_per_block = frozenset({128})
     manager.impl = SimpleNamespace(get_page_index_upper_bound=lambda *args: 32)
     metadata = SimpleNamespace(

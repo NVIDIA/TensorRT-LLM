@@ -239,7 +239,6 @@ def test_prompt_logprobs_survive_batch_dependent_projection_switch(
             logits,
             1,
             [0, 1 if handled else end - start],
-            True,
             context_logits_handled=handled,
         )
     assert projected_rows == ([32, 22, 1] if legacy_first else [32, 5, 1])
@@ -358,6 +357,7 @@ def test_decoder_keeps_graph_replay_unless_bounded_projection_is_active(
         _model=model,
         _mapping=mapping,
         runtime_hooks=SimpleNamespace(pack_step_inputs=False),
+        _copier=None,
         _context_logits_heads=context_logits_heads(model, mapping, is_spec_decode=False),
         _config=SimpleNamespace(is_spec_decode=False, spec_config=None, use_mrope=False),
         _graphs=graphs,

@@ -17,12 +17,14 @@ Coalesces independent concurrent requests into a single batched `encode_fn` call
 mirroring NVIDIA Triton Inference Server's dynamic batcher: a configurable hold
 window (`max_queue_delay`) and a maximum batch size, with a token budget and queue
 backpressure. The actual model forward is injected as `encode_fn` so this module
-carries no TensorRT-LLM / torch dependencies and is unit-testable on CPU.
+is unit-testable on CPU.
 """
 
 import asyncio
 from dataclasses import dataclass
 from typing import Any, Callable, List, Optional
+
+from tensorrt_llm.executor.utils import check_prompt_capacity
 
 # encode_fn maps a batch (list of token-id lists) to a list of per-item results,
 # in the same order as the input.
@@ -76,6 +78,10 @@ class EncodeBatcher:
         self._max_queue_delay = max_queue_delay
         self._max_num_tokens = max_num_tokens
         self._max_seq_len = max_seq_len
+        # The longest single input; None when neither limit is set.
+        self._max_input_len = min(
+            (limit for limit in (max_seq_len, max_num_tokens) if limit is not None), default=None
+        )
         self._queue: "asyncio.Queue[_QueuedRequest]" = asyncio.Queue(maxsize=max_queue_size)
         self._worker: Optional[asyncio.Task] = None
 
@@ -100,14 +106,12 @@ class EncodeBatcher:
         `encode_fn` reject the formed batch. Callers may invoke this before
         submitting a group of inputs so an oversize item fails fast.
         """
-        if self._max_seq_len is not None and len(token_ids) > self._max_seq_len:
-            raise InputTooLongError(
-                f"Input length ({len(token_ids)}) exceeds max_seq_len ({self._max_seq_len})."
-            )
-        if self._max_num_tokens is not None and len(token_ids) > self._max_num_tokens:
-            raise InputTooLongError(
-                f"Input length ({len(token_ids)}) exceeds max_num_tokens ({self._max_num_tokens})."
-            )
+        if self._max_input_len is None:
+            return
+        try:
+            check_prompt_capacity(len(token_ids), self._max_input_len)
+        except ValueError as error:
+            raise InputTooLongError(str(error)) from error
 
     async def submit(self, token_ids: List[int]) -> Any:
         """Enqueue one input and await its encoded result.
@@ -124,6 +128,37 @@ class EncodeBatcher:
             raise QueueFullError("Request queue is full; retry later.")
         return await future
 
+    async def submit_many(self, token_ids_list: List[List[int]]) -> List[Any]:
+        """Enqueue a group of inputs (one request) and await their results in order.
+
+        The group is all or nothing: every input is validated and the queue must
+        have room for all of them before any is enqueued, so a request rejected
+        with InputTooLongError (HTTP 400) or QueueFullError (HTTP 429) leaves
+        nothing behind to encode. If one input fails, or the caller is
+        cancelled, the inputs still queued are cancelled and skipped by the
+        worker instead of being encoded for a request that already ended.
+        """
+        for token_ids in token_ids_list:
+            self.validate_input(token_ids)
+        max_queue_size = self._queue.maxsize
+        if max_queue_size > 0 and self._queue.qsize() + len(token_ids_list) > max_queue_size:
+            raise QueueFullError("Request queue is full; retry later.")
+        loop = asyncio.get_running_loop()
+        requests = [
+            _QueuedRequest(token_ids=token_ids, future=loop.create_future())
+            for token_ids in token_ids_list
+        ]
+        for request in requests:
+            # Cannot raise: the capacity check above and these puts run without
+            # yielding to the event loop.
+            self._queue.put_nowait(request)
+        try:
+            return await asyncio.gather(*(request.future for request in requests))
+        finally:
+            for request in requests:
+                if not request.future.done():
+                    request.future.cancel()
+
     async def _run(self) -> None:
         loop = asyncio.get_running_loop()
         # A request dequeued but held back because it would overflow the token
@@ -139,10 +174,13 @@ class EncodeBatcher:
         Returns the formed batch plus any request carried over to the next batch
         (an over-budget request that was dequeued but not added).
         """
-        if pending is not None:
-            batch = [pending]
-        else:
-            batch = [await self._queue.get()]
+        # A request whose future is already done was cancelled while queued; it
+        # is dropped here so it takes no batch slot, token budget, or encode work.
+        batch = [pending] if pending is not None and not pending.future.done() else []
+        while not batch:
+            request = await self._queue.get()
+            if not request.future.done():
+                batch = [request]
         num_tokens = len(batch[0].token_ids)
         deadline = loop.time() + self._max_queue_delay
         carry_over: Optional[_QueuedRequest] = None
@@ -154,6 +192,8 @@ class EncodeBatcher:
                 request = await asyncio.wait_for(self._queue.get(), timeout)
             except asyncio.TimeoutError:
                 break
+            if request.future.done():
+                continue
             if (
                 self._max_num_tokens is not None
                 and num_tokens + len(request.token_ids) > self._max_num_tokens
@@ -166,6 +206,10 @@ class EncodeBatcher:
 
     async def _dispatch(self, loop, batch: List[_QueuedRequest]) -> None:
         """Run encode_fn on the batch and resolve each request's future."""
+        # Drop requests cancelled during the hold window.
+        batch = [request for request in batch if not request.future.done()]
+        if not batch:
+            return
         token_ids_batch = [request.token_ids for request in batch]
         try:
             # encode_fn is synchronous and blocking (a GPU forward); run it in the

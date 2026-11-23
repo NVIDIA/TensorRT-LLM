@@ -441,6 +441,8 @@ class ModelConfig(Generic[TConfig]):
     replicate_embedding: bool = False
     # Batch sizes of the generation CUDA graphs (empty without them).
     cuda_graph_batch_sizes: Tuple[int, ...] = ()
+    # The executor's largest batch, in requests (None when unknown).
+    max_batch_size: Optional[int] = None
 
     # If true, enable min-latency mode. Currently only used for Llama4.
     enable_min_latency: bool = False

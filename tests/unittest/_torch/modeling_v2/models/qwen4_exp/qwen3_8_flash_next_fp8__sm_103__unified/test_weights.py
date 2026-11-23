@@ -6,9 +6,12 @@ index and safetensors headers: each rank's shard, each member's coverage and `lo
 from __future__ import annotations
 
 import collections
+import gc
 import json
 import re
 import struct
+from collections.abc import Callable
+from importlib import import_module
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -568,6 +571,119 @@ def _host_table_module():
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("dtype", (torch.float8_e4m3fn, torch.bfloat16))
+def test_host_table_preserves_stored_dtype(dtype: torch.dtype) -> None:
+    """The shared constructor accepts and fills the checkpoint's logical element dtype."""
+    host_table = _host_table_module()
+    expected = torch.arange(12, dtype=torch.float32).reshape(3, 4).to(dtype)
+
+    def copy_rows(destination: torch.Tensor, lo: int, hi: int, base: int) -> None:
+        destination[lo - base : hi - base].copy_(expected[lo:hi])
+
+    def read_rows(lo: int, hi: int) -> torch.Tensor:
+        return expected[lo:hi]
+
+    table = host_table.PleHostTable(
+        host_table.RANK,
+        3,
+        4,
+        dtype,
+        torch.device("cpu"),
+        rank=0,
+        world=1,
+        dp=1,
+        private=WT._host_resident_empty,
+    )
+    try:
+        table.fill(copy_rows, read_rows)
+        assert table.table.shape == expected.shape
+        assert table.table.dtype == dtype
+        assert torch.equal(table.table.view(torch.uint8), expected.view(torch.uint8))
+    finally:
+        table.close()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("dtype", (torch.float8_e4m3fn, torch.bfloat16))
+def test_host_table_node_allocates_dtype_bytes(dtype: torch.dtype, monkeypatch) -> None:
+    """Node allocations reserve every byte while retaining dtype-independent row chunks, and are
+    released when the table is collected."""
+    host_table = _host_table_module()
+    allocations = []
+    closed = []
+
+    class Chunks:
+        def __init__(self, device_index: int, chunk_bytes: int, count: int, node: int) -> None:
+            allocations.append((device_index, chunk_bytes, count, node))
+
+        def close(self) -> None:
+            closed.append(True)
+
+    monkeypatch.setattr(host_table, "_VmmChunks", Chunks)
+    monkeypatch.setattr(host_table, "device_numa_node", lambda device: 0)
+    monkeypatch.setattr(host_table._broker, "try_own", lambda key: None)
+    table = host_table.PleHostTable(
+        host_table.NODE,
+        23,
+        4,
+        dtype,
+        torch.device("cuda:0"),
+        rank=0,
+        world=1,
+        dp=1,
+        private=WT._host_resident_empty,
+        identity="element-width",
+        align=64,
+    )
+    try:
+        chunk_bytes = (
+            host_table.chunk_rows(23, 4, 64) * 4 * torch.empty(0, dtype=dtype).element_size()
+        )
+        assert allocations == [(0, chunk_bytes, host_table.CHUNKS, 0)]
+        assert table._node_error is None
+    finally:
+        del table
+        gc.collect()
+    assert closed == [True]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("dtype", (torch.float8_e4m3fn, torch.bfloat16))
+def test_host_table_vmm_view_uses_dtype_bytes(dtype: torch.dtype, monkeypatch) -> None:
+    """The VMM view packs byte lengths and restores the complete logical row width."""
+    host_table = _host_table_module()
+    expected = torch.arange(12, dtype=torch.float32).reshape(3, 4).to(dtype)
+    storage = expected.view(torch.uint8).flatten().clone()
+
+    def pack(
+        pointer: int,
+        segment_size: int,
+        segment_stride: int,
+        segments: int,
+        storage_dtype: torch.dtype,
+        device_index: int,
+    ) -> torch.Tensor:
+        assert pointer == 4096
+        assert segment_size == segment_stride == storage.numel()
+        assert segments == 1 and storage_dtype == torch.uint8 and device_index == 0
+        return storage
+
+    monkeypatch.setattr(host_table, "pack_strided_memory", pack)
+    driver = host_table.cuda_driver
+    success = driver.CUresult.CUDA_SUCCESS
+    monkeypatch.setattr(driver, "cuMemGetAllocationGranularity", lambda *args: (success, 1))
+    monkeypatch.setattr(driver, "cuMemAddressReserve", lambda *args: (success, 4096))
+    monkeypatch.setattr(driver, "cuMemAddressFree", lambda *args: (success,))
+    chunks = host_table._VmmChunks(0, storage.numel(), 1, 0)
+    try:
+        actual = chunks.view(3, 4, dtype, torch.device("cuda:0"))
+        assert actual.shape == expected.shape and actual.dtype == dtype
+        assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+    finally:
+        chunks.close()
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("rows, cols", [(320001536, 160), (1000, 160), (37, 4)])
 def test_host_table_chunks_cover_the_rows(rows, cols):
     """Chunks are whole multiples of the alignment, tile the rows in order, and every server size
@@ -755,18 +871,40 @@ def test_chunk_broker_reads_a_uid_above_2_31():
     assert broker._peer_uid(_Conn()) == uid
 
 
-def _fake_shards(rows_per_shard: int, shards: int, cols: int, seed: int) -> tuple:
+def _fake_shards(
+    rows_per_shard: int,
+    shards: int,
+    cols: int,
+    seed: int,
+    dtype: torch.dtype = WT.PLE_TABLE_DTYPE,
+) -> tuple:
     g = torch.Generator().manual_seed(seed)
-    data = torch.randint(0, 256, (shards * rows_per_shard, cols), generator=g, dtype=torch.uint8)
+    itemsize = torch.empty(0, dtype=dtype).element_size()
+    data = torch.randint(
+        0, 256, (shards * rows_per_shard, cols * itemsize), generator=g, dtype=torch.uint8
+    )
     keys = [f"s{i}" for i in range(shards)]
     weights = {
-        k: data[i * rows_per_shard : (i + 1) * rows_per_shard].view(WT.PLE_TABLE_DTYPE)
+        k: data[i * rows_per_shard : (i + 1) * rows_per_shard].view(dtype)
         for i, k in enumerate(keys)
     }
     return data, keys, weights
 
 
-def _host_tables(monkeypatch, mode, world, data, keys, weights, rows_per_shard, identity=None):
+def _host_tables(
+    monkeypatch,
+    mode,
+    world,
+    data,
+    keys,
+    weights,
+    rows_per_shard,
+    identity=None,
+    *,
+    private: Callable[
+        [int, int, torch.dtype, torch.device], tuple[torch.Tensor, object]
+    ] = WT._host_resident_empty,
+) -> list:
     """`world` ranks' tables in one process: threads, so `node` ranks wait on each other, and a
     barrier in place of the server's collective agreement. `weights` is every rank's checkpoint,
     or a list of one per rank."""
@@ -782,20 +920,21 @@ def _host_tables(monkeypatch, mode, world, data, keys, weights, rows_per_shard, 
         return all(votes)
 
     monkeypatch.setattr(PH, "_all_agree", agree)
-    rows, cols = data.shape
     checkpoints = weights if isinstance(weights, list) else [weights] * world
+    stored = next(iter(checkpoints[0].values()))
+    rows, cols = data.shape[0], stored.shape[1]
     sources = [PH.shard_rows(w, keys, rows_per_shard, WT._read) for w in checkpoints]
     tables = [
         PH.PleHostTable(
             mode,
             rows,
             cols,
-            WT.PLE_TABLE_DTYPE,
+            stored.dtype,
             torch.device("cuda"),
             rank=r,
             world=world,
             dp=1,
-            private=WT._host_resident_empty,
+            private=private,
             identity=identity,
         )  # fmt: skip
         for r in range(world)
@@ -819,24 +958,37 @@ def _vmm_host_numa() -> bool:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="host memory the GPU maps")
 @pytest.mark.parametrize("mode", ["rank", "server", "node", "node-fallback"])
-def test_host_table_modes(mode, monkeypatch):
+@pytest.mark.parametrize("dtype", (WT.PLE_TABLE_DTYPE, torch.bfloat16))
+def test_host_table_modes(mode: str, monkeypatch, dtype: torch.dtype) -> None:
     """`rank` holds every row, `server` this rank's rows with its window, `node` every row in
     chunks one rank creates and the other attaches to; `node` without a table identity runs
     `server`. Each holds exactly the checkpoint's bytes, in host memory."""
     import uuid
 
+    nvfp4_weights = import_module(
+        "tensorrt_llm._torch.modeling_v2.models.qwen4_exp."
+        "qwen3_8_flash_next_nvfp4__sm_103__default.weights"
+    )
+
     PH = _host_table_module()
     if mode == "node" and not _vmm_host_numa():
         pytest.skip("no CUDA VMM host NUMA allocation on this platform")
     rows_per_shard, shards, cols = 40960, 8, 160
-    data, keys, weights = _fake_shards(rows_per_shard, shards, cols, seed=5)
+    data, keys, weights = _fake_shards(rows_per_shard, shards, cols, seed=5, dtype=dtype)
     want = {"rank": PH.RANK, "server": PH.SERVER, "node": PH.NODE, "node-fallback": PH.SERVER}
     requested = PH.NODE if mode.startswith("node") else mode
     identity = uuid.uuid4().hex if mode == "node" else None
-    tables = _host_tables(monkeypatch, requested, 2, data, keys, weights, rows_per_shard, identity)
+    private = (
+        WT._host_resident_empty
+        if dtype == WT.PLE_TABLE_DTYPE
+        else nvfp4_weights._host_resident_empty
+    )
+    tables = _host_tables(
+        monkeypatch, requested, 2, data, keys, weights, rows_per_shard, identity, private=private
+    )
     _check_tables(tables, data, want[mode])
     if mode == "node":
-        created = sorted(len(t._segments) for t in tables)
+        created = sorted(len(t._node.segments) for t in tables)
         assert created == [PH.CHUNKS // 2, PH.CHUNKS // 2], [t.describe() for t in tables]
     for t in tables:
         t.close()
@@ -846,7 +998,7 @@ def _check_tables(tables, data, mode) -> None:
     """Every rank runs `mode` and holds exactly `data`'s bytes (its rows under `server`), in
     host memory."""
     PH = _host_table_module()
-    rows, cols = data.shape
+    rows, cols = data.shape[0], tables[0].cols
     expected = data.cuda()
     for rank, t in enumerate(tables):
         assert t.mode == mode, (rank, t.mode, t.describe())
@@ -855,10 +1007,12 @@ def _check_tables(tables, data, mode) -> None:
             lo, hi, base = t.window
             assert (lo, hi) == PH.owned_rows(rank, len(tables), rows, cols)
             got = t.table[lo - base : hi - base]
+            assert got.shape == (hi - lo, cols) and got.dtype == t.dtype
             assert torch.equal(got.view(torch.uint8), expected[lo:hi])
             assert t.needs_sum
         else:
             assert t.window is None and not t.needs_sum
+            assert t.table.shape == (rows, cols) and t.table.dtype == t.dtype
             assert torch.equal(t.table.view(torch.uint8), expected)
 
 

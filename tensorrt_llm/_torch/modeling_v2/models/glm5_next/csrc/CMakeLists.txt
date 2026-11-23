@@ -20,3 +20,14 @@ add_modeling_v2_target(
   ARCHS 100f
   SOURCES *.cu *.cpp
   REQUIRES MULTI_DEVICE)
+
+# The NVFP4 tp4 target's step program. Its kernels use tcgen05 and tensor
+# memory, so they build for the arch-specific SM100 and SM103 targets; the
+# sparse prefill instantiates FlashMLA's SM100 kernels; the BF16 GEMMs run on
+# cuBLASLt and the large collectives on NCCL.
+add_modeling_v2_target(
+  glm5_next glm_5_3_flash_nvfp4__sm_10x__tp4
+  ARCHS 100a 103a
+  SOURCES *.cpp kernels/*.cu
+  DEPS cublaslt flashmla nccl
+  REQUIRES MULTI_DEVICE)

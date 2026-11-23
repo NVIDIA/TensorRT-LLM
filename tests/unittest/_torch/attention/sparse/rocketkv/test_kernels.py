@@ -9,6 +9,7 @@ import torch
 from tensorrt_llm._torch.attention.backends.sparse.rocket.kernels import (
     triton_bmm,
     triton_rocket_paged_kt_cache_bmm,
+    triton_rocket_update_kt_cache_gen,
     triton_topk,
 )
 
@@ -377,6 +378,85 @@ def test_triton_rocket_paged_kt_cache_bmm(
     print(f"Max absolute difference: {max_diff:.6f}")
 
     assert max_diff < 0.05, f"Max difference {max_diff} exceeds threshold"
+
+
+def test_kt_kernels_address_pages_past_int32_element_offsets():
+    """KT kernels must address pages whose element offsets exceed int32.
+
+    KVCacheManagerV2 KT page indices are slot indices scaled by the number of
+    KT pages per slot, so large pools place KT pages past 2**31 elements.
+    """
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    num_kv_heads, num_heads_per_kv, head_dim = 2, 4, 64
+    kt_page_size, tokens_per_block = 4, 16
+    kv_lens = torch.tensor([37, 64], dtype=torch.int32, device=device)
+    num_gen_tokens = kv_lens.numel()
+    q = torch.randn(
+        (num_gen_tokens, num_kv_heads, num_heads_per_kv, head_dim), dtype=dtype, device=device
+    )
+    k = torch.randn((num_gen_tokens, num_kv_heads * head_dim), dtype=dtype, device=device)
+    compact, block_offsets, max_kt_blocks_per_seq = create_kt_cache_from_k(
+        k=k,
+        kv_lens=kv_lens,
+        kt_page_size=kt_page_size,
+        tokens_per_block=tokens_per_block,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+    )
+
+    # Place the same pages past element 2**31 of a larger pool.
+    first_page = 2**31 // compact[0].numel() + 1
+    pool = torch.empty(
+        (first_page + compact.shape[0], *compact.shape[1:]), dtype=dtype, device=device
+    )
+    pool[first_page:] = compact
+    pool_block_offsets = torch.where(block_offsets >= 0, block_offsets + first_page, block_offsets)
+
+    max_kt_tokens = math.ceil(kv_lens.max().item() / kt_page_size)
+    output_offsets = (
+        torch.arange(num_gen_tokens + 1, device=device, dtype=torch.int32) * max_kt_tokens
+    )
+
+    def kt_scores(kt_cache, kt_block_offsets):
+        return triton_rocket_paged_kt_cache_bmm(
+            q=q,
+            kt_cache_tensor=kt_cache,
+            kt_cache_block_offsets=kt_block_offsets,
+            kv_lens=kv_lens,
+            output_offsets=output_offsets,
+            kt_page_size=kt_page_size,
+            tokens_per_block=tokens_per_block,
+            max_kt_blocks_per_seq=max_kt_blocks_per_seq,
+            total_kt_tokens=num_gen_tokens * max_kt_tokens,
+        )
+
+    # The kernel writes only the scores of each request's own KT rows.
+    valid = torch.zeros(num_gen_tokens * max_kt_tokens, dtype=torch.bool, device=device)
+    for batch_idx, kv_len in enumerate(kv_lens.tolist()):
+        start = batch_idx * max_kt_tokens
+        valid[start : start + math.ceil(kv_len / kt_page_size)] = True
+    torch.testing.assert_close(
+        kt_scores(pool, pool_block_offsets)[..., valid],
+        kt_scores(compact, block_offsets)[..., valid],
+        rtol=0,
+        atol=0,
+    )
+
+    new_k = torch.randn_like(k)
+    for kt_cache, kt_block_offsets in ((compact, block_offsets), (pool, pool_block_offsets)):
+        triton_rocket_update_kt_cache_gen(
+            new_k,
+            kt_cache,
+            kt_block_offsets,
+            kv_lens,
+            kt_page_size,
+            tokens_per_block,
+            max_kt_blocks_per_seq,
+            num_kv_heads,
+            head_dim,
+        )
+    torch.testing.assert_close(pool[first_page:], compact, rtol=0, atol=0)
 
 
 # ==================== Triton TopK Tests ====================

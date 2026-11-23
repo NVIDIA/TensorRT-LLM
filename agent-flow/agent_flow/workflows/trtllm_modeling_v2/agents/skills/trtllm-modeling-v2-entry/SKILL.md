@@ -102,7 +102,7 @@ file is reported to the planner for ownership; it is not silently omitted.
   missing marker registration rather than editing `tests/unittest/pytest.ini`.
 - For index arguments, compute 2^31-element, 2^31/row-width and fp32 2^24+1
   boundaries. Probe those the runtime envelope reaches; record all limits,
-  guarding measured silent failures. Size from measured `runtime_facts.yaml`.
+  guarding measured silent failures. Size from the engine arguments the units run.
 - Iterate with `pytest -k`; certify once after the last edit to entry **and**
   test: run the whole test file and `test_modeling_v2_no_stale_claims.py` under
   `tests/unittest/_torch/modeling_v2`.

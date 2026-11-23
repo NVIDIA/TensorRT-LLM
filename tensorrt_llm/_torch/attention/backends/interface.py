@@ -504,7 +504,8 @@ class AttentionMetadata:
 
         if self.mamba_metadata is None:
             if isinstance(self.kv_cache_manager, BaseMambaCacheManager):
-                metadata_cls = self.mamba_metadata_cls
+                metadata_cls = self.mamba_metadata_cls or getattr(
+                    self.kv_cache_manager, "mamba_metadata_cls", None)
                 if metadata_cls is None:
                     from ...modules.mamba.mamba2_metadata import Mamba2Metadata
                     metadata_cls = Mamba2Metadata
@@ -1126,6 +1127,9 @@ class AttentionForwardArgs:
     mrope_rotary_cos_sin: Optional[torch.Tensor] = None
     mrope_position_deltas: Optional[torch.Tensor] = cpp_field(dtype=torch.int32)
     softmax_stats_tensor: Optional[torch.Tensor] = None
+    # Output tag: a provider may write compact base-2 LSE into the first half
+    # of the caller's pair-capacity buffer. Other providers retain max/sum.
+    softmax_stats_is_lse: bool = False
     attention_sinks: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
     cu_q_seqlens: Optional[torch.Tensor] = cpp_field(dtype=torch.int32)
     cu_kv_seqlens: Optional[torch.Tensor] = cpp_field(dtype=torch.int32)
@@ -1212,6 +1216,14 @@ class AttentionForwardArgs:
         default_factory=SparseRuntimeParams)
 
     @property
+    def softmax_stats(self) -> Optional[torch.Tensor]:
+        """Return the written normalizer view, with final width one for base-2 LSE."""
+        stats = self.softmax_stats_tensor
+        if stats is None or not self.softmax_stats_is_lse:
+            return stats
+        return stats.view(-1)[:stats.numel() // 2].view(*stats.shape[:-1], 1)
+
+    @property
     def mask_type(self) -> int:
         """Return the mask type this forward pass asks the native attention op for."""
         if self.attention_mask == PredefinedAttentionMask.CAUSAL:
@@ -1291,6 +1303,11 @@ class AttentionBackend(Generic[TMetadata]):
         after self.quant_config is reset.
         """
         self.quant_config = new_quant_config
+
+    def runs_without_host_plan(self, metadata: TMetadata) -> bool:
+        """Whether a forward over ``metadata`` reads all its inputs on the device, so a CUDA graph
+        can capture it without host-side preparation at replay."""
+        return False
 
     def forward(self,
                 q: torch.Tensor,
