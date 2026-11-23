@@ -23,6 +23,7 @@ import hashlib
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from multiprocessing import resource_tracker, shared_memory
 from typing import Optional
 
 import numpy as np
@@ -226,13 +227,28 @@ def spare_slot_bytes_to_back(layer: SingleLayerMoeLoadBalancer, slots: Sequence[
     )
 
 
+def _keep_after_exit(shm: shared_memory.SharedMemory) -> None:
+    """Keep ``shm`` after this process exits, until the node supervisor unlinks it."""
+    # The resource tracker registers POSIX shared memory under its name with the leading slash.
+    resource_tracker.unregister(f"/{shm.name}", "shared_memory")
+
+
 class DeploymentHostWeights(HostMoeTensorSharer):
-    """Host tensor sharer that keeps the host weights on this node, which restores load slots from."""
+    """Host tensor sharer that keeps the host weights on this node, which restores load slots from.
+
+    The host weights a rank creates or attaches outlive the rank: the resource tracker of a rank
+    that fails would otherwise unlink them, the other ranks' included. The node supervisor unlinks
+    them once the deployment ends.
+    """
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         # The host weights on this node by expert and weight name, which restores load slots from.
         self.node_host_weights: dict[tuple[int, str], torch.Tensor] = {}
+
+    def finalize_layer_weights(self) -> None:
+        super().finalize_layer_weights()
+        _keep_after_exit(self.own_shm)
 
     def finalize_host_tensor_sharing(self, add_host_weight_fn: Optional[Callable] = None) -> None:
         def keep(expert_id: int, name: str, weight: torch.Tensor) -> None:
@@ -241,12 +257,22 @@ class DeploymentHostWeights(HostMoeTensorSharer):
                 add_host_weight_fn(expert_id, name, weight)
 
         super().finalize_host_tensor_sharing(keep)
+        for shm in self.imported_shms:
+            _keep_after_exit(shm)
 
     def pre_shutdown_cleanup(self) -> None:
         # Drop the tensor views of the shared memory before closing it, so that no view points
         # to unmapped memory.
         self.node_host_weights.clear()
+        for shm in self.imported_shms:
+            shm.close()
+        self.imported_shms = []
         super().pre_shutdown_cleanup()
+
+    def post_shutdown_cleanup(self) -> None:
+        # The node supervisor unlinks the host weights.
+        self.own_shm = None
+        super().post_shutdown_cleanup()
 
 
 class EplbExpertRestore:

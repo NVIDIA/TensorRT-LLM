@@ -375,6 +375,32 @@ def pause_words():
             path.unlink()
 
 
+@pytest.fixture
+def host_weights():
+    """Return the host weights segments of ranks, which are unlinked after the test."""
+    paths = []
+
+    def segments(ranks, name=None):
+        paths.extend(
+            Path(
+                "/dev/shm",
+                f"{name or membership.host_weights_name(rank // GPUS)}_l0_lr{rank % GPUS}_all",
+            )
+            for rank in ranks
+        )
+        return paths[-len(ranks) :]
+
+    yield segments
+    for path in paths:
+        with contextlib.suppress(FileNotFoundError):
+            path.unlink()
+
+
+def _write(segments):
+    for segment in segments:
+        segment.write_bytes(b"host weights")
+
+
 def _read(tmp_path, rank, incarnation):
     path = tmp_path / f"rank-{rank}-{incarnation}.json"
     return json.loads(path.read_text()) if path.exists() else None
@@ -1173,6 +1199,29 @@ def test_pause_words_unlinked_at_end(tmp_path, deployment, supervisor_process, p
     assert supervisor.wait(30) == {"SIGTERM": 143, "ABORTED": 1, "SHUTDOWN": 0}[end]
     assert not any(word.exists() for word in words)
     assert all(word.exists() for word in node_0_words)
+
+
+@pytest.mark.parametrize("end", ["SIGTERM", "ABORTED", "SHUTDOWN"])
+def test_host_weights_unlinked_at_end(tmp_path, deployment, supervisor_process, host_weights, end):
+    """Unlink the node's host weights however the deployment ends.
+
+    Keep another deployment's host weights, and those of node 0, whose supervisor may run on the
+    same host.
+    """
+    authority, environ = deployment
+    segments = host_weights(RANKS)
+    (other,) = host_weights([2], name=f"moe_shared_{secrets.token_hex(8)}")
+    node_0 = host_weights(range(GPUS))
+    _write([*segments, other, *node_0])
+    supervisor = supervisor_process(environ, serving=True)
+    if end.startswith("SIG"):
+        supervisor.send_signal(getattr(signal, end))
+    else:
+        authority.push(_record(MembershipState[end]))
+    assert supervisor.wait(30) == {"SIGTERM": 143, "ABORTED": 1, "SHUTDOWN": 0}[end]
+    assert not any(segment.exists() for segment in segments)
+    assert other.exists()
+    assert all(segment.exists() for segment in node_0)
 
 
 def test_exit_skips_connect_in_flight(deployment, monkeypatch, supervisor_process):

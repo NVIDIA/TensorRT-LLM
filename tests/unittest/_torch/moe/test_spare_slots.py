@@ -15,7 +15,9 @@
 """Tests for the spare EPLB slots that hold a failed rank's experts on the active ranks."""
 
 import functools
+import os
 from contextlib import nullcontext
+from multiprocessing import resource_tracker
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -34,6 +36,7 @@ from tensorrt_llm._torch.moe.fused_moe.cutlass import (
     TrtllmCutlassW4a16Nvfp4Impl,
 )
 from tensorrt_llm._torch.moe.fused_moe.eplb_expert_restore import (
+    DeploymentHostWeights,
     EplbExpertRestore,
     FaultTolerantMoeLoadBalancer,
     create_spare_slot_storage,
@@ -519,3 +522,57 @@ def test_leaf_reason_wins_over_spare_slots(leaf, quant, sm, problem_fields, reas
     assert not leaf.capabilities.supports_spare_slots
     verdict = leaf.can_implement(problem, deployment)
     assert verdict.reject_reason is MoERejectReason[reason]
+
+
+@pytest.fixture
+def tracked(monkeypatch):
+    """Yield the shared memory names the resource tracker would unlink at exit, then unlink all."""
+    names = set()
+    monkeypatch.setattr(
+        resource_tracker, "register", lambda name, rtype: names.add(name.removeprefix("/"))
+    )
+    monkeypatch.setattr(
+        resource_tracker, "unregister", lambda name, rtype: names.discard(name.removeprefix("/"))
+    )
+    yield names
+    for name in _shm_names():
+        os.unlink(f"/dev/shm/{name}")
+
+
+def _shm_names():
+    return sorted(
+        name
+        for name in os.listdir("/dev/shm")
+        if name.startswith(f"test_host_weights_{os.getpid()}")
+    )
+
+
+def test_host_weights_outlive_a_failed_rank(tracked):
+    """Leave no host weights, created or attached, for a rank's resource tracker to unlink.
+
+    The resource tracker of a rank that fails unlinks the shared memory the rank registered, the
+    other ranks' host weights included. The node supervisor unlinks them once the deployment ends.
+    """
+    sharers = []
+    for rank in range(2):
+        sharer = DeploymentHostWeights(
+            0, 4, Mock(Get_rank=Mock(return_value=rank), Get_size=Mock(return_value=2))
+        )
+        sharer.set_shared_memory_base_name(f"test_host_weights_{os.getpid()}")
+        for expert_id in range(4):
+            if sharer.expert_start <= expert_id < sharer.expert_end:
+                sharer.share_host_tensor_with_shape(expert_id, "w", torch.full((4,), expert_id))
+            else:
+                sharer.pre_register_host_tensor_with_shape(expert_id, "w", torch.int64, (4,))
+        sharers.append(sharer)
+    for sharer in sharers:
+        sharer.finalize_layer_weights()
+    for sharer in sharers:
+        sharer.finalize_host_tensor_sharing()
+    assert sorted(sharer.node_host_weights) == [(e, "w") for e in range(4)]
+    assert not tracked
+    for sharer in sharers:
+        sharer.pre_shutdown_cleanup()
+        sharer.post_shutdown_cleanup()
+    assert not tracked
+    assert _shm_names() == sorted(sharer.get_shared_memory_name() for sharer in sharers)

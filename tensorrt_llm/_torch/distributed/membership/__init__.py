@@ -24,6 +24,7 @@ from tensorrt_llm._wide_ep_fault_tolerance import RENDEZVOUS_ENV, SHARED_SECRET_
 from ..startup_record import REPLACEMENT_CANNOT_START, ReplacementCannotStart
 from .authority import Authority
 from .authority_process import AuthorityProcess
+from .host_weights import host_weights_name, host_weights_prefix
 from .liveness import (
     MembershipClient,
     open_liveness_connection,
@@ -97,6 +98,8 @@ __all__ = [
     "UnsignedValueError",
     "all_ranks",
     "has_rank",
+    "host_weights_name",
+    "host_weights_prefix",
     "latest_epoch",
     "next_epoch",
     "open_liveness_connection",

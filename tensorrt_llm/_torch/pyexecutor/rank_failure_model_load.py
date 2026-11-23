@@ -35,7 +35,7 @@ from tensorrt_llm._wide_ep_fault_tolerance import (
 )
 
 from ..distributed import Distributed
-from ..distributed.membership import HANG_TIMEOUT_S
+from ..distributed.membership import HANG_TIMEOUT_S, host_weights_name
 from ..moe.fused_moe.communication.execution_state import MoeExecutionState
 from ..moe.fused_moe.communication.nvlink_one_sided import (
     SYNC_PROTOCOL_ENV,
@@ -199,9 +199,16 @@ def _no_nvlink_one_sided_cause(mapping: Mapping) -> str:
 def create_moe_load_balancer(
     model_config: ModelConfig, mapping: Mapping
 ) -> contextlib.AbstractContextManager[Optional[BaseMoeLoadBalancer]]:
-    """Create this rank's EPLB load balancer, which restores failed ranks' experts."""
+    """Create this rank's EPLB load balancer, which restores failed ranks' experts.
+
+    Its host weights are named for the deployment, so that the node supervisor unlinks them.
+    """
     return maybe_create_moe_load_balancer(
         model_config,
         mapping,
-        functools.partial(FaultTolerantMoeLoadBalancer, mapping=model_config.mapping),
+        functools.partial(
+            FaultTolerantMoeLoadBalancer,
+            mapping=model_config.mapping,
+            shared_memory_base_name=host_weights_name(model_config.mapping.node_rank),
+        ),
     )

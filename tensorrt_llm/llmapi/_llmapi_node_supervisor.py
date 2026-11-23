@@ -51,6 +51,7 @@ _MAX_FAILED_REPLACEMENTS = 3
 # A replacement that served this long before it ended counts as healthy. Its end is a new failure,
 # not a failed replacement, so its rank's failure count resets.
 _HEALTHY_SERVING_S = 600.0
+_SHM_DIR = "/dev/shm"  # nosec B108 - the POSIX shared-memory directory, not a temporary file
 # Run as ``_SCRIPT --exec-rank <supervisor PID> <command>``, this script execs a rank's command.
 _EXEC_RANK = "--exec-rank"
 _SCRIPT = os.path.abspath(__file__)
@@ -89,7 +90,8 @@ class NodeSupervisor:
     """Start, supervise and replace the ranks of one node.
 
     Every report interval, it reports to the authority which of its ranks are in a call that their
-    hang detector's pause covers. It unlinks its ranks' pause words once the deployment ends.
+    hang detector's pause covers. It unlinks the node's host weights and its ranks' pause words once
+    the deployment ends.
 
     Args:
         command: The command that starts each rank process. With ``rank_0_in_session``, it
@@ -162,6 +164,7 @@ class NodeSupervisor:
         # This process may have threads, so no Python code runs between a rank's fork and exec. A
         # new interpreter arms the rank's parent-death signal instead.
         self._exec_rank = [sys.executable, "-S", _SCRIPT, _EXEC_RANK, str(os.getpid())]
+        self._host_weights_prefix = f"{membership.host_weights_name(node)}_"
         self._pause_word_paths = {rank: membership.pause_word_path(rank) for rank in self._ranks}
         # When the next report to the authority is due, and the part of the last one not sent yet.
         self._report_due_s = 0.0
@@ -169,7 +172,7 @@ class NodeSupervisor:
         self._warned_unreadable_state = False
 
     def on_signal(self, signum: int, frame: FrameType | None = None) -> None:
-        """Unlink the ranks' pause words, then stop the supervisor and signal rank 0 the same.
+        """Unlink the node's shared memory, then stop the supervisor and signal rank 0 the same.
 
         The unlink runs here, before the loop wakes, since the launcher may kill this process soon
         after the signal.
@@ -356,9 +359,9 @@ class NodeSupervisor:
         stopped. Rank 0 is never stopped here, since its end is the deployment's end, which its
         launcher bounds. Each rank's end wakes the supervisor.
 
-        The ranks' pause words are unlinked at once, since the launcher may kill this process soon
-        after the ranks ended. The ranks still map them, so the unlink only removes the names.
-        Nothing opens them by name after SHUTDOWN.
+        The node's host weights and pause words are unlinked at once, since the launcher may kill
+        this process soon after the ranks ended. The ranks still map them, so the unlink only
+        removes the names. Nothing opens them by name after SHUTDOWN.
         """
         if not self._shutdown_handled:
             self._shutdown_handled = True
@@ -822,7 +825,7 @@ class NodeSupervisor:
                 process.left_out_reason = record.reason
 
     def _stop(self, status: int) -> int:
-        """Stop the node's ranks, and return ``status``. Unlink the ranks' pause words."""
+        """Stop the node's ranks, and return ``status``. Unlink the node's shared memory."""
         self._unlink_shared_memory()
         # A connect whose store client is still connecting then sends no hello.
         self._connecting = None
@@ -833,7 +836,7 @@ class NodeSupervisor:
         self._wait_for(ranks)
         for process in ranks:
             self._signal_group(process.child.pid, signal.SIGKILL)
-        # A rank stopped above may have created its pause word after the first pass.
+        # A rank stopped above may have created a segment after the first pass.
         self._unlink_shared_memory()
         return status
 
@@ -851,7 +854,7 @@ class NodeSupervisor:
                     running.unregister(key.fileobj)
 
     def _unlink_shared_memory(self) -> None:
-        """Unlink the pause words of the node's ranks.
+        """Unlink the node's host weights and the pause words of its ranks.
 
         Only a supervisor that the authority admitted, or that started a rank, owns them. One that
         the authority refuses, such as a second supervisor started for a node whose supervisor
@@ -859,7 +862,12 @@ class NodeSupervisor:
         """
         if self._view is None and not self._processes:
             return
-        for path in self._pause_word_paths.values():
+        host_weights = [
+            os.path.join(_SHM_DIR, name)
+            for name in os.listdir(_SHM_DIR)
+            if name.startswith(self._host_weights_prefix)
+        ]
+        for path in [*host_weights, *self._pause_word_paths.values()]:
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(path)
 
