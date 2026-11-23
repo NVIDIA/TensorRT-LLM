@@ -121,6 +121,44 @@ def test_pinned_core_choice_equals_served(topo, monkeypatch):
         assert ours == served.pin_executor_cpu(available, gpu_index=gpu)
 
 
+@pytest.mark.parametrize(
+    ("visible", "device", "expected_cpu"),
+    [
+        (None, 2, 3),
+        ("6,1", 1, 2),
+        ("3", 0, 4),
+        ("GPU-00000000-0000-0000-0000-000000000001", 0, None),
+        ("MIG-00000000-0000-0000-0000-000000000001", 0, None),
+        ("3", None, None),
+    ],
+)
+def test_executor_pin_requires_a_known_gpu_index(visible, device, expected_cpu, monkeypatch):
+    cuda = types.SimpleNamespace(
+        is_available=lambda: device is not None, current_device=lambda: device
+    )
+    monkeypatch.setattr(runtime, "torch", types.SimpleNamespace(cuda=cuda))
+    monkeypatch.setattr(runtime, "smt_siblings", lambda cpu: {cpu})
+    affinity_changes = []
+    monkeypatch.setattr(
+        runtime,
+        "os",
+        types.SimpleNamespace(
+            environ={} if visible is None else {"CUDA_VISIBLE_DEVICES": visible},
+            sched_getaffinity=lambda pid: set(range(1, 9)),
+            sched_setaffinity=lambda pid, cpus: affinity_changes.append((pid, cpus)),
+            listdir=lambda path: [],
+        ),
+    )
+
+    pin = runtime.ExecutorThreadPin.create()
+    if expected_cpu is None:
+        assert pin is None
+        assert affinity_changes == []
+    else:
+        assert pin is not None and pin.cpu == expected_cpu
+        assert affinity_changes == [(0, {expected_cpu})]
+
+
 def test_executor_pin_moves_the_other_threads(monkeypatch):
     monkeypatch.setattr(runtime, "smt_siblings", _topology(_TOPOLOGIES[0]))
     monkeypatch.setattr(runtime, "physical_gpu_index", lambda: 1)

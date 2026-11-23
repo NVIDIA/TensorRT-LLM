@@ -20,8 +20,8 @@ gil_switch_us=200)``. Each piece maps onto one engine hook (``make_runtime_hooks
   previous-step gathers into the same commit launch. :func:`fold_block_offsets_copy` does the same
   for the KV cache manager's block-offset copy; the manager calls it.
 
-The kernels are the served ones (``kernels/step/``, ``kernels/SOURCE.json``). Nothing here reads the
-environment.
+The kernels are the served ones (``kernels/step/``, ``kernels/SOURCE.json``). The executor pin
+reads ``CUDA_VISIBLE_DEVICES`` to identify the node-local GPU.
 """
 
 from __future__ import annotations
@@ -66,18 +66,24 @@ def smt_siblings(cpu: int) -> Set[int]:
     return siblings | {cpu}
 
 
-def physical_gpu_index() -> int:
-    """The node-local index of this process's GPU (0 without CUDA)."""
+def physical_gpu_index() -> Optional[int]:
+    """Return the node-local GPU index when it can be determined."""
     try:
         if not torch.cuda.is_available():
-            return 0
+            return None
         device = torch.cuda.current_device()
     except RuntimeError:
-        return 0
-    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
-    if device < len(visible) and visible[device].strip().isdigit():
-        return int(visible[device])
-    return device
+        return None
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible is None:
+        return device
+    devices = visible.split(",")
+    if device < len(devices):
+        identifier = devices[device].strip()
+        if identifier.isdecimal():
+            return int(identifier)
+    # A UUID mask may give each rank the same logical device ordinal.
+    return None
 
 
 def pin_executor_cpu(available: Set[int], gpu_index: Optional[int] = None) -> Optional[int]:
@@ -89,6 +95,10 @@ def pin_executor_cpu(available: Set[int], gpu_index: Optional[int] = None) -> Op
     cpus = sorted(available)
     if not cpus:
         return None
+    if gpu_index is None:
+        gpu_index = physical_gpu_index()
+        if gpu_index is None:
+            return None
     cores, seen = [], set()
     for cpu in cpus:
         if cpu in seen:
@@ -99,8 +109,6 @@ def pin_executor_cpu(available: Set[int], gpu_index: Optional[int] = None) -> Op
             cores.append(cpu)
     if not cores:
         return cpus[0]
-    if gpu_index is None:
-        gpu_index = physical_gpu_index()
     return cores[gpu_index % len(cores)]
 
 
