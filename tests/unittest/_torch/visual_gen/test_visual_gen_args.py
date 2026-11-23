@@ -325,6 +325,12 @@ class TestAttentionConfigQuantValidation:
         [
             ("TRTLLM", dict(qk_dtype="nvfp4"), None, "deco_attention is a CUTEDSL backend option"),
             ("CUTEDSL", dict(qk_dtype="mxfp8"), None, "Supported DeCo-Attention recipes"),
+            (
+                "CUTEDSL",
+                dict(qk_dtype="nvfp4", v_block_size=1),
+                None,
+                "Supported DeCo-Attention recipes",
+            ),
             ("CUTEDSL", dict(qk_dtype="nvfp4", smooth_v=True), None, "are SageAttention options"),
             (
                 "CUTEDSL",
@@ -333,7 +339,7 @@ class TestAttentionConfigQuantValidation:
                 "deco_attention does not compose with sparse_attention",
             ),
         ],
-        ids=["other_backend", "other_recipe", "sage_smoothing", "sparse_attention"],
+        ids=["other_backend", "other_recipe", "block_size", "sage_smoothing", "sparse_attention"],
     )
     def test_deco_attention_rejections(self, backend, quant, sparse, match):
         """DeCo-Attention is CUTEDSL only, takes nvfp4 Q/K with fp8 or nvfp4 V at block sizes 0,

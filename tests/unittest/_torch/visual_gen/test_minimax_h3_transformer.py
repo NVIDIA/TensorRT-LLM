@@ -1599,6 +1599,7 @@ def test_ulysses_forward_aligns_metadata_and_unpads_outputs(
     )
     full_timesteps = F.pad(inputs["timestep_indices"], (0, pad))
     full_mask = F.pad(inputs["token_tags"] >= 0, (0, pad), value=False).unsqueeze(0)
+    full_tags = F.pad(inputs["token_tags"], (0, pad), value=-1)
     cos, sin = model.rope(inputs["position_ids"])
     full_rope = (F.pad(cos, (0, 0, 0, pad), value=1), F.pad(sin, (0, 0, 0, pad), value=0))
 
@@ -1642,6 +1643,10 @@ def test_ulysses_forward_aligns_metadata_and_unpads_outputs(
                 torch.testing.assert_close(adaln_indices, full_indices.chunk(world_size)[rank])
                 for actual, expected_rope in zip(rotary_emb, full_rope):
                     torch.testing.assert_close(actual, expected_rope.chunk(world_size)[rank])
+                # The tags of the whole padded sequence, on every rank and for every backend,
+                # with a version counter: attention backends key their plans on it.
+                torch.testing.assert_close(token_tags, full_tags)
+                assert not token_tags.is_inference()
                 if backend == "TRTLLM":
                     assert valid_seq_len == (
                         int(full_mask.sum().item()) if pad or existing_padding else None
@@ -1676,8 +1681,8 @@ def test_ulysses_forward_aligns_metadata_and_unpads_outputs(
             seen = []
 
             class RecordBlock(nn.Module):
-                def forward(self, hidden_states, *args, token_tags=None, **kwargs):
-                    seen.append((args[3], token_tags))
+                def forward(self, hidden_states, *args, valid_seq_len=None, token_tags=None):
+                    seen.append((args[3], valid_seq_len, token_tags))
                     return hidden_states
 
             model.transformer_blocks = nn.ModuleList([RecordBlock()])
@@ -1685,11 +1690,15 @@ def test_ulysses_forward_aligns_metadata_and_unpads_outputs(
                 tags = inputs["token_tags"].clone()
                 refilled = dict(inputs, token_tags=tags)
                 model(**refilled)
-                tags[-1] = -1
+                tags[-2 if existing_padding else -1] = -1  # the last valid row becomes padding
                 model(**refilled)
-            key_padding_mask, token_tags = seen[-1]
+            key_padding_mask, valid_seq_len, token_tags = seen[-1]
             torch.testing.assert_close(token_tags, F.pad(tags, (0, pad), value=-1))
-            if key_padding_mask is not None:
+            if backend == "TRTLLM":
+                assert key_padding_mask is None
+                assert (seen[0][1], valid_seq_len) == (4, 3)
+            else:
+                assert valid_seq_len is None
                 torch.testing.assert_close(
                     key_padding_mask, F.pad(tags >= 0, (0, pad), value=False).unsqueeze(0)
                 )
