@@ -52,15 +52,6 @@
    "sha256": "beae703e838cdb3419e49f1edda723efa91ebf4f6a3c099345842f9785032d9b",
    "target_path": "kernels/k3_launch_attrs.py"
   },
-  "ops/attention/_k3_fp4_mla_cute_dsl_utils.py": {
-   "source": "tensorrt_llm/_torch/attention/backends/fp4_mla/cute_dsl_utils.py@6904cd9672",
-   "source_sha256": "d09923e8c8715b3daf21cf7b6cec49c9ecdc94a7e2970ab9965e9386089188be",
-   "import_edits": [],
-   "local_edits": [],
-   "sha256": "d09923e8c8715b3daf21cf7b6cec49c9ecdc94a7e2970ab9965e9386089188be",
-   "target_path": "kernels/fp4_mla_cute_dsl_utils.py",
-   "reused": "byte-identical to the family's file, which the target now imports"
-  },
   "kernels/k3r_fp4_mla/fp4_mla_kernels.py": {
    "source": "tensorrt_llm/_torch/attention/backends/fp4_mla/fp4_mla_kernels.py@6904cd9672",
    "source_sha256": "0e18d5d12f5a29ba96d98e6545ac6c95b9c7041d2bd0627618ba3d5fdf26149c",
@@ -130,6 +121,19 @@
    "sha256": "f055473c9925d2e61b2df30a1ed4dd56ebfbe27e96b9f218ea5700e77c8f66e2",
    "target_path": "kernels/k3_fp8w_lowm_gemm.py"
   },
+  "kernels/k3r_gemm/k3_fp8w_lowm_mxfp8.py": {
+   "source": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/kernels/k3_fp8w_lowm_mxfp8.py@6904cd9672",
+   "source_sha256": "15cb5f77bb02d22e5069935b1f6a011a28111499252309b185c934cadb79ce4e",
+   "import_edits": [
+    "Use family-relative imports for the shared low-M and Lamport all-reduce helpers."
+   ],
+   "local_edits": [
+    "Use the common low-M helpers and preserve the ULL compile-time sigmoid epilogue.",
+    "Share the existing family GEMM with the ULL implementation. The ordinary launcher retains its signature and uses the plain BF16 epilogue."
+   ],
+   "sha256": "4bee8a718bd4e77f6c51a0ad0f36c044b8fb5cc48643905f01a8f7ba7cc9a372",
+   "target_path": "kernels/k3_fp8w_lowm_mxfp8.py"
+  },
   "kernels/k3r_gemm/k3_fp8w_lowm_mxfp8_ull.py": {
    "source": "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/kernels/k3_fp8w_lowm_mxfp8.py@6904cd9672",
    "source_sha256": "15cb5f77bb02d22e5069935b1f6a011a28111499252309b185c934cadb79ce4e",
@@ -139,8 +143,10 @@
     "from .k3_fp8w_lowm_gemm import ( _EVICT_FIRST, _SF_TMEM_COLS, _TMEM_COLS, CTA_K, MMA_M, N_ALIGN, SF_VEC, SUPPORTED_MMA_N, _abs_max_bf16x32, _add_bf16x2, _asm, _bf16x2_inv_scale, _ceil_div, _f32_to_bf16_bits, _griddepcontrol_launch_dependents, _griddepcontrol_wait, _iv, _ldg_v4_b32, _lds_v4_b32, _lds_v4_f32, _mbarrier_arrive_remote, _quant_bf16x8_to_e4m3, _s2t_partition_sf, _st_async_v4_f32, _stg_v4_b32, _sts_u16, _sts_v4_b32, _ue8m0_of_amax, ) -> from .k3_fp8w_lowm_gemm_ull import ( _EVICT_FIRST, _SF_TMEM_COLS, _TMEM_COLS, CTA_K, MMA_M, N_ALIGN, SF_VEC, SUPPORTED_MMA_N, _abs_max_bf16x32, _add_bf16x2, _asm, _bf16x2_inv_scale, _ceil_div, _f32_to_bf16_bits, _griddepcontrol_launch_dependents, _griddepcontrol_wait, _iv, _ldg_v4_b32, _lds_v4_b32, _lds_v4_f32, _mbarrier_arrive_remote, _quant_bf16x8_to_e4m3, _s2t_partition_sf, _st_async_v4_f32, _stg_v4_b32, _sts_u16, _sts_v4_b32, _ue8m0_of_amax, )",
     "Bind the shared k3_fp8w_lowm_gemm helpers."
    ],
-   "local_edits": [],
-   "sha256": "66dab1518f4cce7afaed9cb070cc7802a59f2efe3a5ff0b2c39bf4a10da130eb",
+   "local_edits": [
+    "Re-export the shared GEMM and producer helpers. Keep the ULL launcher signature and sigmoid option."
+   ],
+   "sha256": "4094dce1042f9b575c6fc100170ff32cc91c162409b5b7684b2c7b430edc71ea",
    "target_path": "kernels/k3_fp8w_lowm_mxfp8.py"
   },
   "kernels/k3r_gemm/k3_latent_fp8_gemm_ull.py": {
@@ -429,6 +435,15 @@
    ],
    "sha256": "be77a039cd4be0afacfdb407f9d63b11c425ecef2f5422f23eb866f3625e54c7",
    "target_path": "kernels/step/step_upload_kernels.py"
+  },
+  "ops/attention/_k3_fp4_mla_cute_dsl_utils.py": {
+   "source": "tensorrt_llm/_torch/attention/backends/fp4_mla/cute_dsl_utils.py@6904cd9672",
+   "source_sha256": "d09923e8c8715b3daf21cf7b6cec49c9ecdc94a7e2970ab9965e9386089188be",
+   "import_edits": [],
+   "local_edits": [],
+   "sha256": "d09923e8c8715b3daf21cf7b6cec49c9ecdc94a7e2970ab9965e9386089188be",
+   "target_path": "kernels/fp4_mla_cute_dsl_utils.py",
+   "reused": "byte-identical to the family's file, which the target now imports"
   }
  },
  "vendor": {

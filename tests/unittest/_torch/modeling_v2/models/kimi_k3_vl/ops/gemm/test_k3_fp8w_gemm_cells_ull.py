@@ -119,3 +119,25 @@ def test_k3_fp8w_lowm_mxfp8_gemm_ull_cells(cell):
         op(xq, xs, w, w_scale, out, stage_weights=s["stage"])
     want = op.reference(xq, xs, w, w_scale, out, stage_weights=s["stage"])
     assert_within_ulp(out, want, ELEMENT_ULP, RMS_ULP)
+
+
+def test_k3_fp8w_lowm_mxfp8_sigmoid_tiles():
+    # MLA's folded projection places its gate after 17 plain BF16 tiles.
+    n, k, m = 2944, 7168, 8
+    sigmoid_tile0 = 17
+    gate_start = sigmoid_tile0 * 128
+    w, w_scale = _weight(n, k, 8)
+    xq, xs = mx.mxfp8_quantize_reference(_rows(m, k, 9))
+    plain = torch.empty((m, n), dtype=torch.bfloat16, device="cuda")
+    gated = torch.empty_like(plain)
+    tactic = mx.default_mx_tactic(m, n, k)
+    stock = importlib.import_module(f"{K3}.kernels.k3r_gemm.k3_fp8w_lowm_mxfp8")
+
+    # The same shape and tactic must select two compiled epilogues.
+    stock.run_k3_fp8w_lowm_gemm_mxfp8(xq, xs, w, w_scale, plain, tactic=tactic)
+    mx.run_k3_fp8w_lowm_gemm_mxfp8(
+        xq, xs, w, w_scale, gated, tactic=tactic, sigmoid_tile0=sigmoid_tile0
+    )
+
+    assert torch.equal(gated[:, :gate_start], plain[:, :gate_start])
+    assert torch.equal(gated[:, gate_start:], torch.sigmoid(plain[:, gate_start:]))
