@@ -113,8 +113,8 @@ def _context_request(record):
 def test_aux_slot_carries_the_record_through_the_transfer_layout():
     """The record written into a sender slot reads back from the receiver slot after a copy of
     exactly the items the auxiliary transfer layout names, as the NIXL write moves them."""
-    src = AuxBuffer(max_slot_num=4, beam_width=1, max_draft_len=7)
-    dst = AuxBuffer(max_slot_num=4, beam_width=1, max_draft_len=7)
+    src = AuxBuffer(max_slot_num=4, beam_width=1, max_draft_len=7, transfer_handoff_aux=True)
+    dst = AuxBuffer(max_slot_num=4, beam_width=1, max_draft_len=7, transfer_handoff_aux=True)
     assert len(src.meta.ptrs) == 5 and int(src.meta.item_sizes[4]) == 8 * HANDOFF_RECORD_WORDS
     layout = build_aux_transfer_layout(src.meta, dst.meta)
     src_slot, dst_slot = src.alloc_slot().id, dst.alloc_slot().id

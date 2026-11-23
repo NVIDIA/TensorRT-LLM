@@ -93,8 +93,11 @@ def test_zero_size_aux_buffer_is_skipped() -> None:
     assert [d[0] for d in _registered_descs(worker)] == [0x1000]
 
 
-def test_real_empty_draft_buffer_is_skipped_during_registration() -> None:
-    aux_buffer = AuxBuffer(max_slot_num=2, beam_width=1, max_draft_len=0, device="cpu")
+@pytest.mark.parametrize("handoff", [False, True])
+def test_real_empty_draft_buffer_is_skipped_during_registration(handoff: bool) -> None:
+    aux_buffer = AuxBuffer(
+        max_slot_num=2, beam_width=1, max_draft_len=0, transfer_handoff_aux=handoff
+    )
     worker = SimpleNamespace(_aux_buffer=aux_buffer, _agent=Mock(), _registered_mem=[])
 
     TransferWorker._register_aux_buffer(worker)
@@ -104,8 +107,7 @@ def test_real_empty_draft_buffer_is_skipped_during_registration() -> None:
         "aux_buffer_ptr_0",
         "aux_buffer_ptr_2",
         "aux_buffer_ptr_3",
-        "aux_buffer_ptr_4",
-    ]
+    ] + (["aux_buffer_ptr_4"] if handoff else [])
     assert all(int(d[0]) != 0 and int(d[1]) > 0 for d in descs)
     assert len(worker._registered_mem) == 1
 
@@ -137,7 +139,7 @@ def test_real_empty_draft_buffer_is_skipped_during_transfer() -> None:
 
     write_meta, registrar = _build_aux_write_meta(src_buffer, dst_buffer, src_slot=1, dst_slot=2)
 
-    expected_indices = np.array([0, 2, 3, 4])
+    expected_indices = np.array([0, 2, 3])
     np.testing.assert_array_equal(
         write_meta.src_ptrs,
         src_buffer.meta.ptrs[expected_indices] + src_buffer.meta.item_sizes[expected_indices],
@@ -147,7 +149,7 @@ def test_real_empty_draft_buffer_is_skipped_during_transfer() -> None:
         dst_buffer.meta.ptrs[expected_indices] + dst_buffer.meta.item_sizes[expected_indices] * 2,
     )
     np.testing.assert_array_equal(write_meta.sizes, src_buffer.meta.item_sizes[expected_indices])
-    assert write_meta.src_ptrs.size == 4
+    assert write_meta.src_ptrs.size == 3
     assert all(int(ptr) != 0 for ptr in write_meta.src_ptrs)
     assert all(int(ptr) != 0 for ptr in write_meta.dst_ptrs)
     registrar.cache_aux_transfer_layout.assert_called_once()

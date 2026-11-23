@@ -4970,7 +4970,11 @@ def _create_nixl_agent(
 
 
 def _make_aux_buffer(
-    kvm: KVCacheManagerV2, max_slots: int, max_draft_len: Optional[int] = None
+    kvm: KVCacheManagerV2,
+    max_slots: int,
+    max_draft_len: Optional[int] = None,
+    *,
+    transfer_handoff_aux: bool = False,
 ) -> Optional[AuxBuffer]:
     if max_slots <= 0:
         return None
@@ -4981,6 +4985,7 @@ def _make_aux_buffer(
         beam_width=max(1, int(getattr(kvm, "max_beam_width", 1))),
         max_draft_len=max_draft_len,
         device="cpu",
+        transfer_handoff_aux=transfer_handoff_aux,
     )
 
 
@@ -5030,7 +5035,10 @@ class TransferWorker:
         self._rank_info_auth_key = _validate_rank_info_auth_key(config.rank_info_auth_key)
         kvm = config.kv_cache_manager
         self._aux_buffer = _make_aux_buffer(
-            kvm, config.max_concurrent_sessions, config.max_draft_len
+            kvm,
+            config.max_concurrent_sessions,
+            config.max_draft_len,
+            transfer_handoff_aux=config.transfer_handoff_aux,
         )
         self._rank_info = RankInfo.from_kv_cache_manager(
             config.instance_name,

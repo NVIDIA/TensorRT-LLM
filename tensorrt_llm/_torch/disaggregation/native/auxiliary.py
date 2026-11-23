@@ -215,8 +215,15 @@ class AuxBufferBase(ABC):
 
 
 class AuxBuffer(AuxBufferBase):
-    def __init__(self, max_slot_num: int, beam_width: int, max_draft_len: int, device: str = "cpu"):
-        # public constructor args remain the same, internals are private
+    def __init__(
+        self,
+        max_slot_num: int,
+        beam_width: int,
+        max_draft_len: int,
+        device: str = "cpu",
+        *,
+        transfer_handoff_aux: bool = False,
+    ):
         self._max_slot_num = int(max_slot_num)
         self._beam_width = int(beam_width)
         self._max_draft_len = int(max_draft_len)
@@ -245,18 +252,18 @@ class AuxBuffer(AuxBufferBase):
         self._prompt_token_counts_buffer = torch.zeros(
             self._max_slot_num, 2, dtype=data_type, device=self._device
         )
-        # The model's context handoff record (encode_handoff_record), when it attaches one.
-        self._handoff_buffer = torch.zeros(
-            self._max_slot_num, HANDOFF_RECORD_WORDS, dtype=torch.int64, device=self._device
-        )
-
-        buffers = (
+        buffers = [
             self._first_tokens_buffer,
             self._draft_tokens_buffer,
             self._token_counts_buffer,
             self._prompt_token_counts_buffer,
-            self._handoff_buffer,
-        )
+        ]
+        self._handoff_buffer = None
+        if transfer_handoff_aux:
+            self._handoff_buffer = torch.zeros(
+                self._max_slot_num, HANDOFF_RECORD_WORDS, dtype=torch.int64, device=self._device
+            )
+            buffers.append(self._handoff_buffer)
         self._meta = AuxBufferMeta(
             ptrs=np.array([b.data_ptr() for b in buffers], dtype=np.int64),
             size=np.array([b.numel() * b.element_size() for b in buffers], dtype=np.int64),
@@ -336,13 +343,14 @@ class AuxBuffer(AuxBufferBase):
         self._prompt_token_counts_buffer[slot].copy_(
             torch.tensor([prompt_tokens, cached_tokens], dtype=torch.int32, device=self._device)
         )
-        self._handoff_buffer[slot].copy_(
-            torch.tensor(
-                encode_handoff_record(getattr(request, "py_disagg_handoff", None)),
-                dtype=torch.int64,
-                device=self._device,
+        if self._handoff_buffer is not None:
+            self._handoff_buffer[slot].copy_(
+                torch.tensor(
+                    encode_handoff_record(getattr(request, "py_disagg_handoff", None)),
+                    dtype=torch.int64,
+                    device=self._device,
+                )
             )
-        )
 
     @staticmethod
     def _resolve_prompt_token_counts(request: LlmRequest) -> tuple[int, int]:
@@ -378,4 +386,6 @@ class AuxBuffer(AuxBufferBase):
         """The context handoff record written into ``slot``, or None if it carries none."""
         if slot not in self._occupied_slots:
             raise ValueError(f"Cannot read slot {slot}: slot is not currently allocated.")
+        if self._handoff_buffer is None:
+            return None
         return decode_handoff_record(self._handoff_buffer[slot].tolist())

@@ -85,9 +85,10 @@ def test_aux_buffer_meta_property():
     buf = AuxBuffer(max_slot_num=4, beam_width=2, max_draft_len=8, device="cpu")
     meta = buf.meta
     assert isinstance(meta, AuxBufferMeta)
-    assert len(meta.ptrs) == 5
-    assert len(meta.size) == 5
-    assert len(meta.item_sizes) == 5
+    assert len(meta.ptrs) == 4
+    assert len(meta.size) == 4
+    assert len(meta.item_sizes) == 4
+    assert buf.get_slot_handoff(buf.alloc_slot().id) is None
     assert meta.device == "cpu"
     # Verify sizes are positive
     assert all(s > 0 for s in meta.size)
@@ -180,9 +181,9 @@ def test_aux_transfer_layout_ctx_no_spec_gen_sa():
     gen = AuxBuffer(max_slot_num=4, beam_width=1, max_draft_len=2, device="cpu")
     layout = build_aux_transfer_layout(ctx.meta, gen.meta)
 
-    # Buffer order: first tokens, draft tokens, token counts, prompt counts, handoff.
+    # Buffer order: first tokens, draft tokens, token counts, prompt counts.
     # the draft_tokens entry (index 1) is dropped.
-    expected_keep = [0, 2, 3, 4]
+    expected_keep = [0, 2, 3]
     np.testing.assert_array_equal(layout.src_item_sizes, ctx.meta.item_sizes[expected_keep])
     np.testing.assert_array_equal(layout.dst_item_sizes, gen.meta.item_sizes[expected_keep])
     np.testing.assert_array_equal(layout.src_base_ptrs, ctx.meta.ptrs[expected_keep])
