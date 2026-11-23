@@ -48,6 +48,7 @@ from tensorrt_llm.inputs.multimodal import (
     MultimodalParams,
 )
 from tensorrt_llm.llmapi.llm_args import MultimodalConfig, MultimodalEncoderCudaGraphConfig
+from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.sampling_params import SamplingParams
@@ -2655,6 +2656,30 @@ def test_normalization_transport_partial_encoder_cache() -> None:
     encoder.assert_not_called()
     assert torch.equal(attached[0], params.multimodal_data["multimodal_embedding"])
     assert params.multimodal_data["image"]["vision_normalization"] is spec
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(("tp_size", "pp_size", "rank"), [(4, 1, 3), (2, 2, 3)])
+def test_qwen3vl_merger_mapping_is_unchanged(tp_size, pp_size, rank, monkeypatch):
+    monkeypatch.setattr("tensorrt_llm.mapping.mpi_disabled", lambda: False)
+    world_size = tp_size * pp_size
+    mapping = Mapping(
+        world_size=world_size, rank=rank, tp_size=tp_size, pp_size=pp_size, enable_attention_dp=True
+    )
+    config = ModelConfig(
+        pretrained_config=SimpleNamespace(
+            vision_config=SimpleNamespace(hidden_size=8, spatial_merge_size=2, out_hidden_size=8),
+            text_config=SimpleNamespace(rms_norm_eps=1e-6, dtype=None),
+        ),
+        mapping=mapping,
+        skip_create_weights_in_init=True,
+    )
+
+    actual = modeling_qwen3vl.Qwen3VLVisionPatchMerger(config).linear_fc2.mapping
+    expected = Mapping(world_size=world_size, rank=rank, tp_size=1, pp_size=world_size)
+    assert actual.to_dict() == expected.to_dict()
+    assert actual.tp_group == expected.tp_group
+    assert actual.pp_group == expected.pp_group
 
 
 class _RecordingVisionEncoder(torch.nn.Module):
