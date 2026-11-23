@@ -61,7 +61,8 @@ from ..inputs.multimodal import (MULTIMODAL_CACHE_SALT_KEY,
                                  MULTIMODAL_NO_CONTENT_HASHES_KEY,
                                  MultimodalParams, _has_mm_payload_keys,
                                  has_mm_items, isolate_mm_request,
-                                 request_cache_salt, validate_mm_uuids)
+                                 request_cache_salt, validate_mm_uuids,
+                                 without_empty_mm_payloads)
 from ..logger import logger
 from ..sampling_params import LogitsProcessor, SamplingParams
 from ..scheduling_params import SchedulingParams
@@ -329,11 +330,21 @@ def _append_logits_processor(sampling_params: SamplingParams,
         sampling_params.logits_processor = [existing, processor]
 
 
-def _check_multimodal_processor(input_processor: object) -> None:
-    if not getattr(input_processor, "accepts_multimodal_inputs", True):
+def _check_multimodal_processor(llm: "BaseLLM", data: dict) -> None:
+    input_processor = llm.input_processor
+    if (not getattr(input_processor, "accepts_multimodal_inputs", True)
+            or getattr(llm, "startup_metrics", {}).get(
+                "model_loader", {}).get("accepts_multimodal_inputs") is False):
         raise ValueError(
             "This model supports text only. Remove multi_modal_data "
             "and multi_modal_embeddings from the prompt.")
+    supported = getattr(input_processor, "supported_modalities", None)
+    if isinstance(supported, frozenset) and supported:
+        unsupported = (data.keys() & MEDIA_MODALITIES) - supported
+        if unsupported:
+            raise ValueError(
+                f"This checkpoint does not support {sorted(unsupported)} inputs."
+            )
 
 
 def _multimodal_params_have_encoder_features(
@@ -711,6 +722,15 @@ class BaseLLM:
                 in inputs or "multi_modal_uuids" in inputs):
             return inputs
         mm_data = inputs.get("multi_modal_data") or {}
+        empty = {
+            modality: None
+            for modality, value in mm_data.items()
+            if isinstance(value, dict) and not value
+        }
+        if empty:
+            mm_data = {**mm_data, **empty}
+            inputs = inputs.copy()
+            inputs["multi_modal_data"] = mm_data
         embeddings = inputs.get("multi_modal_embeddings")
         has_raw = has_mm_items(mm_data)
         has_embeddings = has_mm_items(embeddings)
@@ -718,7 +738,10 @@ class BaseLLM:
             raise ValueError("Provide either multi_modal_data or "
                              "multi_modal_embeddings.")
         if has_raw or has_embeddings:
-            _check_multimodal_processor(self.input_processor)
+            _check_multimodal_processor(
+                self,
+                without_empty_mm_payloads(
+                    mm_data if has_raw else embeddings or {}))
         else:
             validate_mm_uuids(mm_data or embeddings or {},
                               inputs.get("multi_modal_uuids"))
@@ -937,10 +960,16 @@ class BaseLLM:
             multimodal_params = inputs.multimodal_params
             if multimodal_params is not None:
                 data = multimodal_params.multimodal_data or {}
-                if _has_mm_payload_keys(data):
-                    _check_multimodal_processor(self.input_processor)
-                    if not is_gen_only and any(
-                            data.get(m) is not None for m in MEDIA_MODALITIES):
+                nonempty = without_empty_mm_payloads(data)
+                if nonempty is not data:
+                    multimodal_params = replace(multimodal_params,
+                                                multimodal_data=nonempty)
+                    if not multimodal_params.has_content():
+                        multimodal_params = None
+                if _has_mm_payload_keys(nonempty):
+                    _check_multimodal_processor(self, nonempty)
+                    if not is_gen_only and any(m in nonempty
+                                               for m in MEDIA_MODALITIES):
                         self._check_raw_media_encoder()
             preprocessed_encoder_input_token_ids = inputs.encoder_input_token_ids
             if preprocessed_encoder_input_token_ids is not None:

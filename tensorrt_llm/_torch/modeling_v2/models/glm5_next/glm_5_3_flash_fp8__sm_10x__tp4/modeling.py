@@ -52,6 +52,7 @@ from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModel
 from tensorrt_llm._torch.speculative import get_spec_worker, should_use_separate_draft_kv_cache
 from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
+from tensorrt_llm.inputs.multimodal import _has_mm_payload_keys, without_empty_mm_payloads
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping as ParallelMapping
 
@@ -688,6 +689,7 @@ class ModelingV2Glm53FlashFp8Sm10xTp4(
     #: The KDA layers reset a fresh request's recurrent state and conv window in their prefill
     #: only, so the engine must not run a one-token prompt as a decode row.
     resets_recurrent_state_in_context = True
+    accepts_multimodal_inputs = False
     mm_encoder_disabled = True
 
     def __init__(self, model_config: ModelConfig, *args: Any, **kwargs: Any) -> None:
@@ -750,12 +752,11 @@ class ModelingV2Glm53FlashFp8Sm10xTp4(
     def validate_request(self, request: LlmRequest) -> None:
         """Reject media on admission, as that request's own error: the vision tower is not built,
         and the forward would assert on the whole step."""
-        data = request.py_multimodal_data or {}
-        media = [kind for kind in ("image", "video") if data.get(kind)]
-        if media:
+        data = without_empty_mm_payloads(request.py_multimodal_data or {})
+        if _has_mm_payload_keys(data):
             raise ValueError(
                 f"this GLM-5.3-Flash deployment serves text only (disable_mm_encoder); the "
-                f"request carries {' and '.join(media)} input"
+                f"request carries multimodal input fields {sorted(data)}"
             )
 
     def set_guided_decoder(self, guided_decoder: CapturableGuidedDecoder) -> bool:

@@ -2079,6 +2079,8 @@ class ModelingV2Glm53FlashNvfp4Sm100Default(Glm5NextForCausalLM):
     engine hooks (model defaults, the V2 hybrid cache manager, the KDA metadata class) come with the causal LM.
     """
 
+    accepts_multimodal_inputs = False
+
     def __init__(self, model_config: ModelConfig[PretrainedConfig]) -> None:
         _check_construction(model_config)
         super().__init__(model_config)

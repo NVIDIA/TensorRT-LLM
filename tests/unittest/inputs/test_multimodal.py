@@ -1054,6 +1054,7 @@ def _llm_with_mock_executor(input_processor: object = None) -> object:
     llm = object.__new__(BaseLLM)
     llm.shutdown = Mock()
     llm._encode_only = False
+    llm._startup_metrics = {}
     llm.args = SimpleNamespace(mm_encoder_only=False, return_perf_metrics=False)
     llm._executor = Mock()
     llm._executor.is_shutdown.return_value = False
@@ -1153,8 +1154,9 @@ def test_text_only_model_rejects_multimodal_inputs(method: str, inputs: dict) ->
     [
         {"prompt_token_ids": [1, 2], "multi_modal_data": {"image": [], "audio": None}},
         {"prompt": "p", "multi_modal_embeddings": {}},
+        {"prompt": "p", "multi_modal_data": {"image": {}}, "multi_modal_uuids": {"image": []}},
     ],
-    ids=["token_ids", "text"],
+    ids=["token_ids", "text", "empty_image_dict"],
 )
 def test_text_only_model_accepts_empty_multimodal_inputs(inputs: dict) -> None:
     tokenizer = Mock()
@@ -1172,8 +1174,10 @@ def test_text_only_model_accepts_empty_multimodal_inputs(inputs: dict) -> None:
     [
         ({}, "which multi_modal_data does not have"),
         ({"multi_modal_data": {"image": []}}, "UUID list length"),
+        ({"multi_modal_data": {"image": {}}}, r"data items length \(0\)"),
+        ({"multi_modal_data": {"audio": {}}}, "which multi_modal_data does not have"),
     ],
-    ids=["no_media_field", "empty_image_list"],
+    ids=["no_media_field", "empty_image_list", "empty_image_dict", "unknown_modality"],
 )
 def test_text_only_model_validates_uuids_for_empty_media(media, error) -> None:
     llm = _llm_with_mock_executor(DefaultInputProcessor("unused", None, Mock()))
@@ -1202,6 +1206,63 @@ def test_text_only_admission_of_preprocessed_media_and_decode_metadata() -> None
         llm.generate_async(PreprocessedInputs([1, 2], params))
     assert llm._executor.generate_async.call_args.kwargs["multimodal_params"] is params
 
+    metadata = dict(params.multimodal_data)
+    params.multimodal_data["image"] = {}
+    params.multimodal_input = MultimodalInput([[1] * 8], [0], [1])
+    with patch("tensorrt_llm.llmapi.llm.RequestOutput._from_generation_result"):
+        llm.generate_async(PreprocessedInputs([1, 2], params), cache_salt="tenant")
+    submitted = llm._executor.generate_async.call_args.kwargs
+    assert submitted["cache_salt"] == "tenant"
+    assert submitted["multimodal_params"].multimodal_data == metadata
+    assert submitted["multimodal_params"].multimodal_input is params.multimodal_input
+    assert "image" in params.multimodal_data
+
+
+@pytest.mark.parametrize(
+    "data",
+    [{"image": None}, {"image": []}, {"image": {}}, {"multimodal_embedding": None}],
+)
+def test_text_only_admission_keeps_empty_prepared_media_unsalted(data) -> None:
+    from tensorrt_llm.llmapi.llm import PreprocessedInputs
+
+    llm = _llm_with_mock_executor(DefaultInputProcessor("unused", None, Mock()))
+    params = MultimodalParams(multimodal_data=data)
+    with patch("tensorrt_llm.llmapi.llm.RequestOutput._from_generation_result"):
+        llm.generate_async(PreprocessedInputs([1, 2], params))
+    submitted = llm._executor.generate_async.call_args.kwargs
+    assert submitted["cache_salt"] is None
+    assert submitted["multimodal_params"] is None
+    assert params.multimodal_data == data
+
+
+def test_prepared_media_admission_uses_checkpoint_modalities() -> None:
+    from transformers import Gemma4Config
+    from transformers.models.gemma4.configuration_gemma4 import Gemma4AudioConfig
+
+    from tensorrt_llm._torch.models.modeling_gemma4mm import Gemma4InputProcessor
+    from tensorrt_llm.llmapi.llm import PreprocessedInputs
+
+    processor = object.__new__(Gemma4InputProcessor)
+    processor._config = Gemma4Config()
+
+    processor._config.vision_config = processor._config.audio_config = None
+    llm = _llm_with_mock_executor(processor)
+    image = PreprocessedInputs(
+        [1, 2], MultimodalParams(multimodal_data={"image": {"pixels": torch.ones(2)}})
+    )
+    with pytest.raises(ValueError, match="supports text only"):
+        llm.generate_async(image)
+
+    processor._config.audio_config = Gemma4AudioConfig()
+    with pytest.raises(ValueError, match="image"):
+        llm.generate_async(image)
+    llm._executor.generate_async.assert_not_called()
+
+    audio = MultimodalParams(multimodal_data={"audio": {"input_features": torch.ones(2)}})
+    with patch("tensorrt_llm.llmapi.llm.RequestOutput._from_generation_result"):
+        llm.generate_async(PreprocessedInputs([1, 2], audio))
+    assert llm._executor.generate_async.call_args.kwargs["multimodal_params"] is audio
+
 
 def test_raw_media_admission_uses_the_loaded_encoder() -> None:
     from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
@@ -1212,8 +1273,9 @@ def test_raw_media_admission_uses_the_loaded_encoder() -> None:
     llm.args.disable_mm_encoder = True
     llm.args.multimodal_config = None
 
-    def load_encoder(encoder):
+    def load_encoder(encoder, accepts_multimodal_inputs=True):
         model = torch.nn.Module()
+        model.accepts_multimodal_inputs = accepts_multimodal_inputs
         model.mm_encoder = encoder
         loader = ModelLoader(llm.args, SimpleNamespace(rank=0), None, None, 8, 8)
         with patch.object(loader, "_timed_load", return_value=(model, None)):
@@ -1229,10 +1291,17 @@ def test_raw_media_admission_uses_the_loaded_encoder() -> None:
         llm.generate_async(PreprocessedInputs([1, 2], media))
     llm._executor.generate_async.assert_not_called()
 
+    llm.input_processor.supported_modalities = frozenset()
     embedding = MultimodalParams(multimodal_data={"multimodal_embedding": torch.zeros(2, 4)})
     with patch("tensorrt_llm.llmapi.llm.RequestOutput._from_generation_result"):
         llm.generate_async(PreprocessedInputs([1, 2], embedding))
-    assert llm._executor.generate_async.call_args.kwargs["multimodal_params"] is embedding
+        assert llm._executor.generate_async.call_args.kwargs["multimodal_params"] is embedding
+        embedding.to_handle("multimodal_data")
+        try:
+            llm.generate_async(PreprocessedInputs([1, 2], embedding))
+            assert llm._executor.generate_async.call_args.kwargs["multimodal_params"] is embedding
+        finally:
+            embedding.to_tensor("multimodal_data")
 
     gen_only = DisaggregatedParams(request_type="generation_only")
     with (
@@ -1246,6 +1315,13 @@ def test_raw_media_admission_uses_the_loaded_encoder() -> None:
     load_encoder(torch.nn.Identity())
     with patch.object(MultimodalParams, "to_handle"):
         assert llm.preprocess(_PROBE_INPUTS).multimodal_params.multimodal_input is not None
+
+    llm._executor.generate_async.reset_mock()
+    llm.args.disable_mm_encoder = False
+    load_encoder(None, accepts_multimodal_inputs=False)
+    with pytest.raises(ValueError, match="supports text only"):
+        llm.generate_async(PreprocessedInputs([1, 2], embedding))
+    llm._executor.generate_async.assert_not_called()
 
 
 _MM_SALT = "mm-no-item-spans-" + "0" * 32

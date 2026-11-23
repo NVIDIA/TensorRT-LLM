@@ -1449,6 +1449,9 @@ class ModelLoader:
             model, moe_load_balancer = self._timed_load(checkpoint_dir,
                                                         checkpoint_loader)
 
+        if getattr(model, "accepts_multimodal_inputs", True) is False:
+            self._startup_metadata["accepts_multimodal_inputs"] = False
+
         # Some models build their encoder in load_weights. Only the loaded
         # model can report whether this deployment actually omitted it.
         if getattr(self.llm_args, "disable_mm_encoder", False) and (

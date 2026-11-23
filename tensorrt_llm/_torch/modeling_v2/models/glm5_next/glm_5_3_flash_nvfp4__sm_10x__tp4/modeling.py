@@ -1082,6 +1082,8 @@ class ModelingV2Glm53FlashNvfp4Sm10xTp4(
     # slot tables built from the page-index buffers
     mamba_metadata_cls = _SlotTablesMetadata
 
+    accepts_multimodal_inputs = False
+
     def __init__(self, model_config: ModelConfig):
         model_config = _runtime_model_config(model_config)
         cfg = unwrap_glm5_next_text_config(model_config.pretrained_config)

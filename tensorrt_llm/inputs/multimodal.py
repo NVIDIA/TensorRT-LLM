@@ -1777,6 +1777,26 @@ _MM_METADATA_ONLY_KEYS = frozenset({
 })
 
 
+def without_empty_mm_payloads(data: dict) -> dict:
+    """Drop absent payload fields while preserving request metadata and shared handles."""
+
+    def populated(value: Any) -> bool:
+        if isinstance(value, torch.Tensor):
+            return value.numel() > 0
+        if isinstance(value, np.ndarray):
+            return value.size > 0
+        if isinstance(value, (list, tuple, dict)):
+            return bool(value)
+        return value is not None
+
+    nonempty = {
+        key: value
+        for key, value in data.items()
+        if key in _MM_METADATA_ONLY_KEYS or populated(value)
+    }
+    return data if len(nonempty) == len(data) else nonempty
+
+
 def _has_mm_payload_keys(py_multimodal_data: Optional[dict]) -> bool:
     """True iff py_multimodal_data contains vision/video/audio content keys.
 

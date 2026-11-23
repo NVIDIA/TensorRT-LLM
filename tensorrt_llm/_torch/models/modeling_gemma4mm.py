@@ -274,6 +274,10 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
     mm_bidirectional_blocks = False
 
     @property
+    def accepts_multimodal_inputs(self) -> bool:
+        return bool(self.supported_modalities)
+
+    @property
     def supported_modalities(self) -> frozenset[str]:
         modalities = super().supported_modalities
         config = getattr(self, "config", None)

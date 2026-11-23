@@ -367,6 +367,7 @@ async def test_generation_first_dispatches_one_private_media_salt(api):
         {"type": "image_url", "image_url": {"url": "https://example.org/image"}},
     ]
     later = [{"type": "text", "text": "in one sentence"}]
+    image = {"type": "input_image", "image_url": "https://example.org/image", "detail": "auto"}
     salts = []
     for _ in range(2):
         if api == "chat":
@@ -378,11 +379,6 @@ async def test_generation_first_dispatches_one_private_media_salt(api):
                 ],
             )
         else:
-            image = {
-                "type": "input_image",
-                "image_url": "https://example.org/image",
-                "detail": "auto",
-            }
             request = ResponsesRequest(model="test", input=[{"role": "user", "content": [image]}])
         await service._send_disagg_request(request)
         ctx = service._ctx_client.send_request.await_args.args[0]
@@ -398,21 +394,40 @@ async def test_generation_first_dispatches_one_private_media_salt(api):
             if api == "chat":
                 messages = worker.model_dump(mode="json")["messages"]
                 assert [message["content"] for message in messages] == [content, later]
+            else:
+                assert worker.model_dump(mode="json")["input"][0]["content"] == [image]
         salts.append(salt)
     assert salts[0] != salts[1]
 
 
-def test_generation_first_keeps_text_content_for_both_workers():
-    from tensorrt_llm.serve.openai_disagg_service import _has_disagg_media
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "extra", [[], [{"type": "audio_url", "audio_url": {}}]], ids=["text", "skipped_audio"]
+)
+async def test_generation_first_keeps_text_content_for_both_workers(extra):
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import ReuseScope, sequence_to_blockchain_keys
 
-    content = [{"type": "text", "text": "hello"}]
+    service = _make_service("generation_first")
+    service._ctx_client = AsyncMock()
+    service._gen_client = AsyncMock()
+    service._ctx_router.get_next_server.return_value = ("ctx", {})
+    content = [{"type": "text", "text": "hello"}, *extra]
+    tokens = list(range(8))
     request = ChatCompletionRequest(
         model="test",
         messages=[{"role": "system", "content": "be brief"}, {"role": "user", "content": content}],
+        prompt_token_ids=tokens,
     )
-    assert not _has_disagg_media(request)
-    for _ in range(2):
-        messages = request.model_dump(mode="json")["messages"]
+    await service._send_disagg_request(request)
+    expected = list(sequence_to_blockchain_keys(4, ReuseScope(), tokens))
+    for client in (service._ctx_client, service._gen_client):
+        worker = client.send_request.await_args.args[0]
+        salt = worker.disaggregated_params.multimodal_cache_salt
+        assert (
+            list(sequence_to_blockchain_keys(4, ReuseScope(salt=salt), worker.prompt_token_ids))
+            == expected
+        )
+        messages = worker.model_dump(mode="json")["messages"]
         assert [message["content"] for message in messages] == ["be brief", content]
 
 

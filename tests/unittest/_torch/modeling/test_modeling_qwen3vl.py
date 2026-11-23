@@ -1005,8 +1005,9 @@ def test_qwen_attachment_admission_with_empty_raw_media():
     with patch.object(MultimodalParams, "to_handle"):
         regular = llm.preprocess(prompt)
         empty_raw = llm.preprocess({**prompt, "multi_modal_data": {}})
-    assert regular.prompt_token_ids == empty_raw.prompt_token_ids == [7, 11] + [12] * 6 + [13, 8]
-    for result in (regular, empty_raw):
+        empty_image = llm.preprocess({**prompt, "multi_modal_data": {"image": {}}})
+    for result in (regular, empty_raw, empty_image):
+        assert result.prompt_token_ids == [7, 11] + [12] * 6 + [13, 8]
         assert result.multimodal_params.multimodal_data["multimodal_embedding"][0] is tensor
         assert result.multimodal_params.multimodal_input.multimodal_uuids == ["image-id"]
 
