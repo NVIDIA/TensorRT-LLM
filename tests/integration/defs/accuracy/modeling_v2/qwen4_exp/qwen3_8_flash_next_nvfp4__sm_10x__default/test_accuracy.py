@@ -697,6 +697,9 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
                 assert core.quant_mode == target_modeling.QM_NVFP4_KV_CACHE, (
                     "the engine did not keep the NVFP4 KV pool the case asks for"
                 )
+            # Not held past the engine: `LLM.__exit__` frees the core, and with it the PLE host
+            # table's broker threads, only if nothing else references it.
+            del core
             if mocker is not None:
                 mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", self.GSM8K_MAX_OUTPUT_LEN)
                 GSM8K(self.MODEL_NAME).evaluate(
