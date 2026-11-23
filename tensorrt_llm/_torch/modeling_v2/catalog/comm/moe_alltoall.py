@@ -267,7 +267,24 @@ class MoeAlltoallCombine(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
-    CELLS: tuple[Cell, ...] = MoeAlltoallDispatch.CELLS
+    CELLS: tuple[Cell, ...] = (
+        Cell(
+            why="decode: one NVFP4 row a rank, every rank sending",
+            spec=dict(payload="NVFP4", rows=(1, 1, 1, 1), slots=256, top_k=8),
+        ),
+        Cell(
+            why="uneven rounds: ranks send different counts, one sends none",
+            spec=dict(payload="NVFP4", rows=(64, 3, 0, 17), slots=256, top_k=8),
+        ),
+        Cell(
+            why="288 slots: replicas of an expert on several ranks",
+            spec=dict(payload="NVFP4", rows=(32, 32, 32, 32), slots=288, top_k=8),
+        ),
+        Cell(
+            why="BF16 rows of the MTP layer",
+            spec=dict(payload="BF16", rows=(16, 0, 5, 16), slots=256, top_k=8),
+        ),
+    )
 
     note = """
     Its cells are the dispatch's: a combine sums the rows of the dispatch before it, whose
