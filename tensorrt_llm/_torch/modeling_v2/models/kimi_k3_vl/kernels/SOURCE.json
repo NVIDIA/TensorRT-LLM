@@ -443,8 +443,10 @@
    "source": "tensorrt_llm/_torch/attention/kernels/blackwell/mla/mla_decode_fp8.py",
    "source_sha256": "1696ff32c3c1a240e3086e0c652a2acb48d9de11bb91ed06f3d573406f76a243",
    "import_edits": [],
-   "local_edits": [],
-   "sha256": "92a536e6f885d15bec11d4db02ea6d3e28356761372491125123a4db7047d156",
+   "local_edits": [
+    "Fence the TMEM correction-factor load before releasing its pipeline stage."
+   ],
+   "sha256": "c9d9feea7b0fba01e4e6d31d49d8be414ca60d567b91fe24b5cbadf598961b23",
    "target_path": "kernels/mla/mla_decode_fp8.py"
   },
   "kernels/k3r_mla_decode/mla_helpers.py": {
