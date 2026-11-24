@@ -365,6 +365,58 @@
     },
     "ParallelConfig": {
       "additionalProperties": false,
+      "allOf": [
+        {
+          "else": {
+            "properties": {
+              "gather_mode": {
+                "const": "nccl"
+              },
+              "reduce_scatter_mode": {
+                "const": "nccl"
+              },
+              "row_align": {
+                "const": 1
+              }
+            }
+          },
+          "if": {
+            "properties": {
+              "tp_layout": {
+                "const": "token_sharded"
+              }
+            },
+            "required": [
+              "tp_layout"
+            ]
+          },
+          "then": {
+            "properties": {
+              "async_ulysses": {
+                "const": false
+              },
+              "attn2d_size": {
+                "const": [
+                  1,
+                  1
+                ]
+              },
+              "ring_size": {
+                "const": 1
+              },
+              "tp_size": {
+                "minimum": 2
+              },
+              "ulysses_size": {
+                "const": 1
+              }
+            },
+            "required": [
+              "tp_size"
+            ]
+          }
+        }
+      ],
       "description": "Configuration for distributed parallelism across DiT-shaped models.\n\nThe sequence axis can be sharded via Attention2D (a 2D mesh) or Ring\nAttention (a 1D mesh); these two are mutually exclusive. Either can be\ncombined with Ulysses head-sharding to form an outer \u00d7 inner sequence\nparallel mesh. See ``mapping.py`` for the underlying DeviceMesh layout.",
       "properties": {
         "async_ulysses": {
@@ -405,6 +457,17 @@
           "title": "Cfg Size",
           "type": "integer"
         },
+        "gather_mode": {
+          "default": "nccl",
+          "description": "Token-sharded TP input gather backend: 'nccl' or 'copy_engine'. The copy-engine path overlaps FP8 block-scale projection GEMMs with gathers and falls back to NCCL when unavailable. Non-default values require tp_layout='token_sharded'.",
+          "enum": [
+            "nccl",
+            "copy_engine"
+          ],
+          "status": "prototype",
+          "title": "Gather Mode",
+          "type": "string"
+        },
         "parallel_vae_size": {
           "default": 1,
           "description": "Number of ranks used for VAE parallelism. 1 disables parallel VAE.",
@@ -423,12 +486,31 @@
           "title": "Parallel Vae Split Dim",
           "type": "string"
         },
+        "reduce_scatter_mode": {
+          "default": "nccl",
+          "description": "Token-sharded TP output reduction backend: 'nccl' or 'copy_engine', independent of gather_mode. The copy-engine path overlaps eligible FP8 row GEMMs with transfers and falls back to NCCL when unavailable or below its crossover threshold. Non-default values require tp_layout='token_sharded'.",
+          "enum": [
+            "nccl",
+            "copy_engine"
+          ],
+          "status": "prototype",
+          "title": "Reduce Scatter Mode",
+          "type": "string"
+        },
         "ring_size": {
           "default": 1,
           "description": "Ring Attention sequence-parallel degree. The sequence is sharded across ring_size GPUs and K/V blocks stream around the ring. Mutually exclusive with attn2d_size > (1, 1); combinable with ulysses_size.",
           "minimum": 1,
           "status": "prototype",
           "title": "Ring Size",
+          "type": "integer"
+        },
+        "row_align": {
+          "default": 1,
+          "description": "Token-sharded TP row alignment: pad each sample so every rank's row count is a multiple of this positive integer. Larger values can increase padding and workspace use. Values other than 1 require tp_layout='token_sharded'.",
+          "minimum": 1,
+          "status": "prototype",
+          "title": "Row Align",
           "type": "integer"
         },
         "text_encoder_tp_size": {

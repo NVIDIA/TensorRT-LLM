@@ -494,6 +494,76 @@ def test_config_validation(
     assert (not errors) == valid, [error.message for error in errors]
 
 
+@pytest.mark.parametrize(
+    ("parallel_config", "valid"),
+    [
+        ({}, True),
+        ({"gather_mode": "nccl", "reduce_scatter_mode": "nccl", "row_align": 1}, True),
+        ({"tp_layout": "replicated", "row_align": 1}, True),
+        ({"tp_layout": "token_sharded", "tp_size": 2}, True),
+        *[
+            (
+                {
+                    "tp_layout": "token_sharded",
+                    "tp_size": 4,
+                    "gather_mode": gather,
+                    "reduce_scatter_mode": reduce_scatter,
+                    "row_align": 64,
+                },
+                True,
+            )
+            for gather in ("nccl", "copy_engine")
+            for reduce_scatter in ("nccl", "copy_engine")
+        ],
+        *[
+            ({**layout, field: value}, False)
+            for layout in ({}, {"tp_layout": None}, {"tp_layout": "replicated"})
+            for field, value in (
+                ("gather_mode", "copy_engine"),
+                ("reduce_scatter_mode", "copy_engine"),
+                ("row_align", 64),
+            )
+        ],
+        *[
+            ({"tp_layout": "token_sharded", "tp_size": 4, field: value}, False)
+            for field, value in (
+                ("gather_mode", "invalid"),
+                ("gather_mode", None),
+                ("reduce_scatter_mode", "invalid"),
+                ("reduce_scatter_mode", None),
+                ("row_align", 0),
+                ("row_align", -1),
+                ("row_align", True),
+                ("row_align", "64"),
+                ("row_align", 1.5),
+                ("row_align", None),
+                ("tp_size", 1),
+                ("ulysses_size", 2),
+                ("ring_size", 2),
+                ("attn2d_size", [2, 1]),
+                ("async_ulysses", True),
+            )
+        ],
+        ({"tp_layout": "token_sharded"}, False),
+    ],
+)
+def test_visual_gen_collective_controls_match_runtime(
+    schemas: dict[str, dict], parallel_config: dict, valid: bool
+) -> None:
+    from pydantic import ValidationError
+
+    from tensorrt_llm.visual_gen.args import VisualGenArgs
+
+    config = {"parallel_config": parallel_config}
+    errors = list(Draft202012Validator(schemas[generator.VISUAL_GEN_SCHEMA]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
+    if valid:
+        VisualGenArgs(**config)
+    else:
+        with pytest.raises(ValidationError):
+            VisualGenArgs(**config)
+
+
 def _tagged_unions(node: object):
     if isinstance(node, dict):
         if "discriminator" in node:

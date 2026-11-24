@@ -63,6 +63,70 @@ def test_diffusion_config_without_locality_domain_policy() -> None:
         assert projection._locality_domain_weight_shards is None
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("mode", ["fp8", "bf16", "nvfp4"])
+@pytest.mark.parametrize("batched", [False, True])
+def test_shared_gate_up_result_preserves_activation_dispatch(
+    monkeypatch: pytest.MonkeyPatch, mode: str, batched: bool
+) -> None:
+    mlp = GatedMLP(hidden_size=4, intermediate_size=4, bias=False)
+    projected = torch.arange(24, dtype=torch.float32).reshape(3, 8)
+    if batched:
+        projected = projected.unsqueeze(0)
+    activated = F.silu(projected[..., :4]) * projected[..., 4:]
+    quantized = (activated.reshape(3, 4), torch.ones(3, 1))
+    packed = torch.zeros(3, 2, dtype=torch.uint8)
+    scales = torch.ones(3, 1)
+    fp4_result = Mock()
+    down_proj = _make_down_proj()
+    down_proj.input_scale = torch.tensor(1.0)
+    down_proj.prefers_bf16_swiglu_input = Mock(return_value=mode == "bf16")
+    down_proj.forward = Mock(return_value=activated if mode == "bf16" else activated.reshape(3, 4))
+    mlp.down_proj = down_proj
+    monkeypatch.setattr(mlp, "_can_fuse_swiglu_fp8_quant", lambda: mode != "nvfp4")
+    monkeypatch.setattr(mlp, "_can_fuse_swiglu_nvfp4_quant", lambda: mode == "nvfp4")
+    activation = Mock(return_value=activated)
+    monkeypatch.setattr(mlp, "_apply_activation", activation)
+    monkeypatch.setattr(gated_mlp_module, "get_sm_version", lambda: 107)
+    fp8_quantize = Mock(return_value=quantized)
+    nvfp4_quantize = Mock(return_value=(packed, scales))
+    fp4_wrapper = Mock(return_value=fp4_result)
+    monkeypatch.setattr(
+        torch.ops.trtllm, "silu_and_mul_fp8_quantize_1x128_packed_ue8m0", fp8_quantize
+    )
+    monkeypatch.setattr(torch.ops.trtllm, "swiglu_nvfp4_quantize", nvfp4_quantize)
+    monkeypatch.setattr(gated_mlp_module, "Fp4QuantizedTensor", fp4_wrapper)
+
+    output = mlp._down_from_gate_up(projected)
+
+    torch.testing.assert_close(output, activated)
+    down_proj.forward.assert_called_once()
+    down_input = down_proj.forward.call_args.args[0]
+    if mode == "fp8":
+        assert down_input is quantized
+        fp8_quantize.assert_called_once()
+        torch.testing.assert_close(fp8_quantize.call_args.args[0], projected.reshape(3, 8))
+        assert fp8_quantize.call_args.args[1:] == (mlp.swiglu_limit, True)
+        activation.assert_not_called()
+        nvfp4_quantize.assert_not_called()
+    elif mode == "bf16":
+        assert down_input is activated
+        activation.assert_called_once_with(projected)
+        down_proj.prefers_bf16_swiglu_input.assert_called_once()
+        fp8_quantize.assert_not_called()
+        nvfp4_quantize.assert_not_called()
+    else:
+        assert down_input is fp4_result
+        nvfp4_quantize.assert_called_once()
+        torch.testing.assert_close(nvfp4_quantize.call_args.args[0], projected.reshape(3, 8))
+        assert nvfp4_quantize.call_args.args[1] is down_proj.input_scale
+        fp4_wrapper.assert_called_once()
+        assert fp4_wrapper.call_args.args[0].dtype == torch.uint8
+        assert fp4_wrapper.call_args.args[1] is scales
+        activation.assert_not_called()
+        fp8_quantize.assert_not_called()
+
+
 def test_gate_up_partition_falls_back_to_swiglu(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
