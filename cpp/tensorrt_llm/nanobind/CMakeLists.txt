@@ -92,11 +92,12 @@ if(ENABLE_NANOBIND_PROFILING)
   target_include_directories(
     ${TRTLLM_NB_PROFILING_RUNTIME} PRIVATE ${PROJECT_SOURCE_DIR}/include
                                            ${TORCH_INCLUDE_DIRS})
-  # Reuse the shared core's selector and scope implementation; do not embed a
-  # hidden second copy in the nanobind static library or Python module.
-  target_link_libraries(
-    ${TRTLLM_NB_PROFILING_RUNTIME} PRIVATE ${SHARED_TARGET} ${TORCH_LIBRARIES}
-                                           ${TORCH_PYTHON_LIB})
+  target_include_directories(${TRTLLM_NB_PROFILING_RUNTIME} SYSTEM
+                             PRIVATE "${json_SOURCE_DIR}/include")
+  # The final consumer supplies the profiler implementation. The bindings module
+  # links the shared core below, while profilerTest uses tllm::common_profiler.
+  target_link_libraries(${TRTLLM_NB_PROFILING_RUNTIME}
+                        PRIVATE ${TORCH_LIBRARIES} ${TORCH_PYTHON_LIB})
 endif()
 
 # SHA-256 symbols are provided by tensorrt_llm_batch_manager_static (via the

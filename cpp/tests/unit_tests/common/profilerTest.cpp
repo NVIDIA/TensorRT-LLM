@@ -18,6 +18,10 @@
 
 #include <gtest/gtest.h>
 
+#if defined(__linux__) && TRTLLM_ENABLE_NANOBIND_PROFILING
+#include <nanobind/nanobind.h>
+#endif
+
 #include <algorithm>
 #include <cstdlib>
 #include <fstream>
@@ -25,6 +29,13 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#if defined(__linux__) && TRTLLM_ENABLE_NANOBIND_PROFILING
+NB_MODULE(profiler_test_bindings, module)
+{
+    module.def("answer", [] { return 42; });
+}
+#endif
 
 #if defined(__linux__)
 namespace
@@ -313,6 +324,40 @@ TEST(ProfilerStartupDeathTest, CallbackProbeAllocationFailurePreservesOperationE
         },
         ::testing::ExitedWithCode(0), "^TensorRT-LLM profiler warning: observation omitted: .+\n$");
 }
+
+#if TRTLLM_ENABLE_NANOBIND_PROFILING
+//! A callback snapshot failure must leave the nanobind vectorcall result intact.
+TEST(ProfilerStartupDeathTest, CallbackProbeAllocationFailurePreservesBindingResult)
+{
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_EXIT(
+        {
+            setenv("TLLM_PROFILE_CUSTOM_REGIONS", "nanobind", 1);
+            ASSERT_FALSE(tc::initializeProfilerRegions().has_value());
+            ASSERT_EQ(PyImport_AppendInittab("profiler_test_bindings", PyInit_profiler_test_bindings), 0);
+            Py_Initialize();
+            nanobind::object answer = nanobind::module_::import_("profiler_test_bindings").attr("answer");
+            auto const handle = at::addGlobalCallback(at::RecordFunctionCallback(observeStart, observeEnd)
+                                                          .needsInputs(false)
+                                                          .scopes({at::RecordScope::USER_SCOPE}));
+
+            failNextProfilerAllocation = true;
+            auto result = nanobind::steal<nanobind::object>(PyObject_CallNoArgs(answer.ptr()));
+            ASSERT_FALSE(failNextProfilerAllocation);
+            ASSERT_TRUE(result.is_valid());
+            ASSERT_EQ(PyLong_AsLong(result.ptr()), 42);
+            ASSERT_EQ(observation().starts, 0);
+            ASSERT_EQ(observation().ends, 0);
+
+            result = nanobind::steal<nanobind::object>(PyObject_CallNoArgs(answer.ptr()));
+            ASSERT_TRUE(result.is_valid());
+            ASSERT_EQ(PyLong_AsLong(result.ptr()), 42);
+            at::removeCallback(handle);
+            std::exit(observation().starts == 1 && observation().ends == 1 ? 0 : 1);
+        },
+        ::testing::ExitedWithCode(0), "^TensorRT-LLM profiler warning: observation omitted: .+\n$");
+}
+#endif
 #endif
 #endif
 

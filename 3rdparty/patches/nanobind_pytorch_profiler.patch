@@ -188,7 +188,7 @@ diff --git a/src/nb_func.cpp b/src/nb_func.cpp
  
  #include "nb_internals.h"
  #include "buffer.h"
-@@ -28,6 +36,103 @@
+@@ -28,6 +36,102 @@
  
  // Forward/external declarations
  extern Buffer buf;
@@ -233,8 +233,7 @@ diff --git a/src/nb_func.cpp b/src/nb_func.cpp
 +    nb_func_record_scope(PyObject *self, PyObject *const *args,
 +                         size_t nargs, PyObject *kwnames) noexcept {
 +        if (!tensorrt_llm::common::customRegionEnabled(
-+                tensorrt_llm::common::ProfilerRegion::kNanobind) ||
-+            !at::hasCallbacks())
++                tensorrt_llm::common::ProfilerRegion::kNanobind))
 +            return;
 +        record.emplace(tensorrt_llm::common::ProfilerRegion::kNanobind);
 +        if (!record->isActive()) {
@@ -292,7 +291,7 @@ diff --git a/src/nb_func.cpp b/src/nb_func.cpp
  
  static PyObject *nb_func_vectorcall_simple_0(PyObject *, PyObject *const *,
                                               size_t, PyObject *) noexcept;
-@@ -610,6 +715,10 @@
+@@ -610,6 +714,10 @@
  
      func_data *fr = nb_func_data(self);
  
@@ -303,7 +302,7 @@ diff --git a/src/nb_func.cpp b/src/nb_func.cpp
      const bool is_method      = fr->flags & (uint32_t) func_flags::is_method,
                 is_constructor = fr->flags & (uint32_t) func_flags::is_constructor;
  
-@@ -888,6 +997,10 @@
+@@ -888,6 +996,10 @@
      const size_t count         = (size_t) Py_SIZE(self),
                   nargs_in      = (size_t) NB_VECTORCALL_NARGS(nargsf);
  
@@ -314,7 +313,7 @@ diff --git a/src/nb_func.cpp b/src/nb_func.cpp
      const bool is_method      = fr->flags & (uint32_t) func_flags::is_method,
                 is_constructor = fr->flags & (uint32_t) func_flags::is_constructor;
  
-@@ -977,6 +1090,10 @@
+@@ -977,6 +1089,10 @@
                                               PyObject *kwargs_in) noexcept {
      func_data *fr = nb_func_data(self);
      const size_t nargs_in = (size_t) NB_VECTORCALL_NARGS(nargsf);
@@ -325,7 +324,7 @@ diff --git a/src/nb_func.cpp b/src/nb_func.cpp
  
      // Handler routine that will be invoked in case of an error condition
      PyObject *(*error_handler)(PyObject *, PyObject *const *, size_t,
-@@ -1017,6 +1134,10 @@
+@@ -1017,6 +1133,10 @@
                                               PyObject *kwargs_in) noexcept {
      func_data *fr = nb_func_data(self);
      const size_t nargs_in = (size_t) NB_VECTORCALL_NARGS(nargsf);
@@ -336,7 +335,7 @@ diff --git a/src/nb_func.cpp b/src/nb_func.cpp
      bool is_constructor = fr->flags & (uint32_t) func_flags::is_constructor;
  
      // Handler routine that will be invoked in case of an error condition
-@@ -1362,6 +1483,9 @@
+@@ -1362,6 +1482,9 @@
          (f->flags & (uint32_t) func_flags::has_name)) {
          PyObject *scope_name = PyObject_GetAttrString(f->scope, "__qualname__");
          if (scope_name) {

@@ -1150,6 +1150,7 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
                         |    "ProfilerStartupDeathTest.ProbesBeforeStartupNeverParseInvalidConfiguration",
                         |    "ProfilerStartupDeathTest.NoneSelectionNeverEvaluatesFactoriesOrEmitsScopes",
                         |    "ProfilerStartupDeathTest.CallbackProbeAllocationFailurePreservesOperationException",
+                        |    "ProfilerStartupDeathTest.CallbackProbeAllocationFailurePreservesBindingResult",
                         |    "ProfilerMetadataTest.NativeGoldenIncludesUnicodeEscapingSignedIntegersAndEmptyLists",
                         |    "ProfilerMetadataTest.ByteLengthsAndControlCharactersAreJsonCompatible",
                         |    "ProfilerMetadataTest.InvalidUtf8ThrowsDuringEncoding",

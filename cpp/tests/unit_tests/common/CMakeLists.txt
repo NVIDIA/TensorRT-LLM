@@ -170,6 +170,12 @@ if(BUILD_PYT)
     tllm::common_profiler
     LABELS
     "unit;common;host")
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND ENABLE_NANOBIND_PROFILING)
+    set_property(TARGET profilerTest PROPERTY TRTLLM_NANOBIND_PROFILER_CONSUMER
+                                              ON)
+    target_link_libraries(profilerTest PRIVATE nanobind-trtllm-profiled-static
+                                               Python3::Python)
+  endif()
   target_compile_definitions(
     profilerTest
     PRIVATE
