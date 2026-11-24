@@ -114,8 +114,8 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
         # split: only the tail units after n_full, each split along KV into n_parts pieces merged in the epilogue
         self.split = split
         # pdl: the split launch follows a main launch, so it launches as its programmatic dependent; without a main
-        # launch it follows the kernels that wrote its scale and flags (the preparation) and must see their writes,
-        # so it launches normally
+        # launch it follows the kernels that wrote its scale and counters (the preparation) and must see their
+        # writes, so it launches normally
         self.pdl = pdl
         self.qk_acc_dtype = Float32
         self.pv_acc_dtype = Float32
@@ -228,6 +228,8 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
             # softmax -> epilogue exchange of the split launch (row, 2 values, stage, warpgroup): the final anchor
             # of a KV piece in value 0
             fields["sVec"] = Align[MemRange[Float32, 128 * 2 * 2 * 2], 16]
+            # per O tile: whether this piece arrived last at the tile's counter and merges it (epilogue.py)
+            fields["split_last"] = MemRange[Int32, 2]
         fields.update(
             sO=Align[
                 MemRange[self.o_dtype, cute.cosize(o_smem_layout_staged)], self.buffer_align_bytes
@@ -705,6 +707,8 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
 
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
+        if cutlass.const_expr(self.split):
+            split_scratch = (*split_scratch, Int32(storage.split_last.data_ptr().toint()))
         pipes = self._make_pipelines(storage, cluster_layout_vmnk)
         p_tail_ptr = storage.p_tail_mbar_ptr.data_ptr()
         # (computed here, outside the warp-role branches)
@@ -837,6 +841,7 @@ class PingPongAttention(LoadRole, MmaRole, SoftmaxRole, EpilogueRole):
                 sO,
                 pipes.epi_store_consumer,
                 self._role_work("store", tile_sched, work_tile),
+                split_scratch[3] if cutlass.const_expr(self.split) else None,
             )
         if warp_idx < self.epilogue_warp_ids[0]:
             cute.arch.setmaxregister_increase(self.num_regs_softmax)

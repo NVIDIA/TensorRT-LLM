@@ -24,22 +24,13 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.nvgpu import tcgen05
-from cutlass.cute.typing import Float32, Int32, Int64
+from cutlass.cute.typing import Float32, Int32, Int64, Uint32
 
-from ...common.mem import gptr, load_vector, store_vector
+from ...common.mem import gptr, load_vector, sptr, store_vector
 from ...common.state import State
 from ...constants import HEAD_DIM
 from ..valid_len import valid_len
-from .sched import NPARTS, PART
-
-
-def _merge_slot(slot_base, j, merger, stage):
-    """Merge slot of O tile `stage` of the j-th piece other than `merger`: piece j + (j >= merger) of the unit."""
-    return (slot_base + j + cutlass.select_(j >= merger, 1, 0)) * 2 + stage
-
-
-def _merger(stage, nparts):
-    return 0 if stage == 0 else stage % nparts
+from .sched import PART
 
 
 class EpilogueRole:
@@ -118,17 +109,19 @@ class EpilogueRole:
     ):
         """Split launch epilogue for both O tiles of a KV piece: all publishes, then the merges.
 
-        * O tile s is merged by piece s % nparts; every other piece publishes its unnormalized O rows, anchor and row
-          sum into its (unit, piece, tile) slot and then sets the slot's ready flag. All publishes come first, so
-          the two merges (on different SMs) run in parallel.
-        * The merger waits for the flags, brings every piece to the largest anchor and normalizes the sum. The flags
-          are zero on entry (the host zeroes them before the launches of a call) and on exit.
+        * Every piece publishes its unnormalized O rows, anchor and row sum of both tiles into its (unit, piece,
+          tile) slots, then counts itself on the (unit, tile) counter. The piece that arrives last at a counter
+          merges that tile: no CTA waits for another, so the launch needs no co-residency. All publishes come
+          first, so the two merges (on different SMs when different pieces arrive last) run in parallel.
+        * The merger reads the slots of all pieces in piece order, its own among them, brings them to the largest
+          anchor and normalizes the sum: the bits do not depend on which piece merges. The counters are zero on entry
+          (the host zeroes them before the launches of a call) and the merger zeroes its counter again. The smem
+          words at last_addr (one per tile) tell the store warp which tiles this piece merged.
         """
         tOtO0, tOtO1, vec0, vec1, sO = tensor_args
         s0_epi_consumer, s1_epi_consumer, mma_epi_consumer, epi_store_producer = pipeline_args
         part, nparts, slot_base = split_info
-        split_o_addr, split_ml_addr, split_flag_addr = split_args
-        split_ready = Int32(1)  # the flag of a published slot
+        split_o_addr, split_ml_addr, split_count_addr, last_addr = split_args
         eps = [
             self._epi_copy(thr_mma, tOtO0, sO[None, None, 0]),
             self._epi_copy(thr_mma, tOtO1, sO[None, None, 1]),
@@ -151,89 +144,70 @@ class EpilogueRole:
         rss = [self.load_row_sum(thr_mma, tOtO0), self.load_row_sum(thr_mma, tOtO1)]
         e0_handle = epi_store_producer.acquire_and_advance()
         e1_handle = epi_store_producer.acquire_and_advance()
-        mergers = [_merger(stage, nparts) for stage in range(2)]
-        # publish phase
+        # publish phase; the counter of (unit, tile) is the word of the unit's first slot of that tile
         for stage in cutlass.range_constexpr(2):
             ep = eps[stage]
-            if part != mergers[stage]:
-                slot = (slot_base + part) * 2 + stage
-                row_base = Int64(slot * 128 + thread_idx)
-                cute.arch.store(gptr(Float32, split_ml_addr + row_base * 8), rms[stage])
-                cute.arch.store(gptr(Float32, split_ml_addr + row_base * 8 + 4), rss[stage])
-                for i in cutlass.range_constexpr(ep.n_chunks):
-                    tTMrO, _, coords = self._load_chunk(ep, i, staged=False)
-                    for j in cutlass.range_constexpr(0, cute.size(tTMrO), 4):
-                        _, col = coords[j]
-                        # checked while tracing: the 16-byte store of four columns starts at a multiple of four
-                        assert col % 4 == 0
-                        dst = split_o_addr + (row_base * 128 + col) * 4
-                        vals = (tTMrO[j], tTMrO[j + 1], tTMrO[j + 2], tTMrO[j + 3])
-                        store_vector(gptr(Float32, dst, 16), vals)
+            slot = (slot_base + part) * 2 + stage
+            row_base = Int64(slot * 128 + thread_idx)
+            cute.arch.store(gptr(Float32, split_ml_addr + row_base * 8), rms[stage])
+            cute.arch.store(gptr(Float32, split_ml_addr + row_base * 8 + 4), rss[stage])
+            for i in cutlass.range_constexpr(ep.n_chunks):
+                tTMrO, _, coords = self._load_chunk(ep, i, staged=False)
+                for j in cutlass.range_constexpr(0, cute.size(tTMrO), 4):
+                    _, col = coords[j]
+                    # checked while tracing: the 16-byte store of four columns starts at a multiple of four
+                    assert col % 4 == 0
+                    slot_addr = split_o_addr + (row_base * 128 + col) * 4
+                    vals = (tTMrO[j], tTMrO[j + 1], tTMrO[j + 2], tTMrO[j + 3])
+                    store_vector(gptr(Float32, slot_addr, 16), vals)
+            cute.arch.fence_acq_rel_gpu()
+            self.split_barrier.arrive_and_wait()
+            if thread_idx == 0:
+                arrived = cute.arch.atomic_add(
+                    gptr(Uint32, split_count_addr + Int64(slot_base * 2 + stage) * 4),
+                    Uint32(1),
+                    sem="acq_rel",
+                    scope="gpu",
+                )
                 cute.arch.fence_acq_rel_gpu()
-                self.split_barrier.arrive_and_wait()
-                if thread_idx == 0:
-                    cute.arch.store(
-                        gptr(Int32, split_flag_addr + Int64(slot) * 4),
-                        split_ready,
-                        sem="release",
-                        scope="gpu",
-                    )
-        # merge phase: the other pieces are j = 0 .. nparts - 2 -> piece j + (j >= merger)
-        n_other = nparts - 1
+                cute.arch.store(
+                    sptr(Int32, last_addr + stage * 4), Int32(Int32(arrived) == nparts - 1)
+                )
+        self.split_barrier.arrive_and_wait()
+        # merge phase, by the last piece of each tile, over the slots of all pieces in piece order (its own among
+        # them), so that the result does not depend on which piece arrives last
         for stage in cutlass.range_constexpr(2):
             ep = eps[stage]
-            merger = mergers[stage]
-            if part == merger:
-                row_max = rms[stage]
-                m_fin = row_max
-                for j in cutlass.range(0, n_other, 1, unroll=1):
-                    slot_p = _merge_slot(slot_base, j, merger, stage)
-                    flag_ptr = gptr(Int32, split_flag_addr + Int64(slot_p) * 4)
-                    flag = cute.arch.load(flag_ptr, Int32, sem="acquire", scope="gpu")
-                    while flag != split_ready:
-                        flag = cute.arch.load(flag_ptr, Int32, sem="acquire", scope="gpu")
-                    m_p = cute.arch.load(
-                        gptr(Float32, split_ml_addr + Int64(slot_p * 128 + thread_idx) * 8),
-                        Float32,
-                        cop="cg",
-                    )
-                    m_fin = cute.arch.fmax(m_fin, m_p)
-                # every thread has seen the flags it polls: zero them for the next call (nothing in this launch reads
-                # them again; the next call's publishes follow this launch in stream order)
-                self.split_barrier.arrive_and_wait()
-                for j in cutlass.range(thread_idx, n_other, 128, unroll=1):
+            if cute.arch.load(sptr(Int32, last_addr + stage * 4), Int32) != 0:
+                if thread_idx == 0:
+                    # the counter is zero for the next call (nothing in this launch reads it again)
                     cute.arch.store(
-                        gptr(
-                            Int32,
-                            split_flag_addr + Int64(_merge_slot(slot_base, j, merger, stage)) * 4,
-                        ),
-                        Int32(0),
+                        gptr(Int32, split_count_addr + Int64(slot_base * 2 + stage) * 4), Int32(0)
                     )
-                s_own = cute.math.exp2(score_scale * (row_max - m_fin), fastmath=True)
-                l_fin = rss[stage] * s_own
-                for j in cutlass.range(0, n_other, 1, unroll=1):
-                    rb = Int64(_merge_slot(slot_base, j, merger, stage) * 128 + thread_idx)
+                m_fin = rms[stage]
+                for j in cutlass.range(0, nparts, 1, unroll=1):
+                    rb = Int64(((slot_base + j) * 2 + stage) * 128 + thread_idx)
+                    m_p = cute.arch.load(gptr(Float32, split_ml_addr + rb * 8), Float32, cop="cg")
+                    m_fin = cute.arch.fmax(m_fin, m_p)
+                l_fin = Float32(0.0)
+                for j in cutlass.range(0, nparts, 1, unroll=1):
+                    rb = Int64(((slot_base + j) * 2 + stage) * 128 + thread_idx)
                     m_p = cute.arch.load(gptr(Float32, split_ml_addr + rb * 8), Float32, cop="cg")
                     l_p = cute.arch.load(
                         gptr(Float32, split_ml_addr + rb * 8 + 4), Float32, cop="cg"
                     )
                     l_fin = l_fin + l_p * cute.math.exp2(score_scale * (m_p - m_fin), fastmath=True)
                 scale = scale_output / l_fin
-                scale_o = scale * s_own
                 for i in cutlass.range_constexpr(ep.n_chunks):
                     tTMrO, dst, coords = self._load_chunk(ep, i)
-                    for jj in cutlass.range_constexpr(0, cute.size(tTMrO), 2):
-                        tTMrO[jj], tTMrO[jj + 1] = cute.arch.mul_packed_f32x2(
-                            (tTMrO[jj], tTMrO[jj + 1]), (scale_o, scale_o)
-                        )
+                    for jj in cutlass.range_constexpr(cute.size(tTMrO)):
+                        tTMrO[jj] = Float32(0.0)
                     # two pieces per iteration: both loads are issued before either is used; an odd last pair
                     # re-reads its first piece with weight 0
-                    for j in cutlass.range(0, n_other, 2, unroll=1):
-                        has_b = j + 1 < n_other
-                        slot_a = _merge_slot(slot_base, j, merger, stage)
-                        slot_b = cutlass.select_(
-                            has_b, _merge_slot(slot_base, j + 1, merger, stage), slot_a
-                        )
+                    for j in cutlass.range(0, nparts, 2, unroll=1):
+                        has_b = j + 1 < nparts
+                        slot_a = (slot_base + j) * 2 + stage
+                        slot_b = cutlass.select_(has_b, slot_a + 2, slot_a)
                         rb_a = Int64(slot_a * 128 + thread_idx)
                         rb_b = Int64(slot_b * 128 + thread_idx)
                         m_a = cute.arch.load(
@@ -333,8 +307,9 @@ class EpilogueRole:
         return si_epi_consumer, mma_epi_consumer, epi_store_producer
 
     @cute.jit
-    def store_warp(self, mO_qdl, tma_atom_o, sO, epi_store_consumer, sched_args):
-        """Store warp: TMA stores of the staged O tiles of a work tile (split launch: the tiles its piece merges)."""
+    def store_warp(self, mO_qdl, tma_atom_o, sO, epi_store_consumer, sched_args, last_addr=None):
+        """Store warp: TMA stores of the staged O tiles of a work tile (split launch: the tiles its piece merged, the
+        smem words at last_addr that epilogue_split wrote before the epilogue barrier of the tile)."""
         tile_sched, work_tile = sched_args
         while work_tile.is_valid_tile:
             curr_block_coord = work_tile.tile_idx
@@ -356,7 +331,7 @@ class EpilogueRole:
                 )
                 handles.append(epi_store_consumer.wait_and_advance())
                 if cutlass.const_expr(self.split):
-                    if curr_block_coord[PART] == _merger(j, curr_block_coord[NPARTS]):
+                    if cute.arch.load(sptr(Int32, last_addr + j * 4), Int32) != 0:
                         cute.copy(tma_atom_o, tOsO[None, j], tOgO[None, o_coords[j]])
                 else:
                     cute.copy(tma_atom_o, tOsO[None, j], tOgO[None, o_coords[j]])

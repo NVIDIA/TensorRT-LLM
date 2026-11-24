@@ -190,9 +190,11 @@ def prepare(q, k, v, workspace, pv=None, rank=DEFAULT_RANK, rows=None, valid_seq
             or tuple(lens.shape) != shape[:1]
             or lens.device != device
             or not lens.is_contiguous()
+            or lens.data_ptr() % 16
         ):
             raise ValueError(
-                f"valid_seq_lens must be a contiguous int32 tensor [{shape[0]}] on {device}"
+                f"valid_seq_lens must be a contiguous int32 tensor [{shape[0]}] on {device} at a 16-byte aligned "
+                "address"
             )
     map_rows = rows is None and lens is not None
     if rows is None:
@@ -202,13 +204,14 @@ def prepare(q, k, v, workspace, pv=None, rank=DEFAULT_RANK, rows=None, valid_seq
         or rows.dtype != torch.int32
         or rows.device != device
         or not rows.is_contiguous()
+        or rows.data_ptr() % 16
         or not (
             rows.dim() == 1 or (lens is not None and rows.dim() == 2 and rows.shape[0] == shape[0])
         )
     ):
         raise ValueError(
-            f"rows must be a contiguous int32 tensor on {device}, one-dimensional or, with valid_seq_lens, "
-            f"[{shape[0]}, m]"
+            f"rows must be a contiguous int32 tensor on {device} at a 16-byte aligned address, one-dimensional "
+            f"or, with valid_seq_lens, [{shape[0]}, m]"
         )
     elif rows.numel() == 0:
         raise ValueError("rows must hold at least one token: the basis is estimated on them")

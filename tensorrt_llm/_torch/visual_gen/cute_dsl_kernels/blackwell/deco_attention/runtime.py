@@ -88,9 +88,16 @@ def pdl_enabled():
     return os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
 
 
-@functools.cache
 def num_sms(device):
-    return torch.cuda.get_device_properties(device).multi_processor_count
+    """Return the SM count of a device ("cuda": the current device), cached per device index."""
+    device = torch.device(device)
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return _num_sms(index)
+
+
+@functools.cache
+def _num_sms(index):
+    return torch.cuda.get_device_properties(index).multi_processor_count
 
 
 def compiled(cache, key, make, *args, **kwargs):

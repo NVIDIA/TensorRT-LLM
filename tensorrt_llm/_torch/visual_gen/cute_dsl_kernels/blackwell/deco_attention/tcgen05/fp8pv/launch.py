@@ -50,7 +50,8 @@ def scratch(b, s, h, sm_count):
     """Return the merge scratch of the split launch at this shape, name -> (dtype, shape); empty without one.
 
     A merge slot is a (tail unit, KV piece, O tile) triple. The pieces write its unnormalized O rows and (anchor, row
-    sum) pairs before they are read; its ready flag must be zero when the launch starts (the mergers zero it again).
+    sum) pairs before they are read. The word of a unit's first slot of a tile counts the pieces that published the
+    tile; it must be zero when the launch starts (the piece that merges zeroes it again).
     """
     n_units, n_full, n_parts = split_plan(s, h, b, sm_count)
     n_slots = (n_units - n_full) * n_parts * 2

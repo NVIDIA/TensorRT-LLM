@@ -59,8 +59,8 @@ def layout(b, s, h, rank, nsm):
 
 def prepare(q, k, v, rows, buffers, rank, lens=None, map_rows=False):
     """Run the preparation of this kernel on the buffers of a call (layout); rows, lens and map_rows as in prep.run."""
-    # every buffer may hold anything on entry; only the ready flags of a split launch must be zero when the attention
-    # starts: they are zeroed here
+    # every buffer may hold anything on entry; only the arrival counters of a split launch must be zero when the
+    # attention starts: they are zeroed here
     flags = buffers.get("split_flags")
     if flags is not None:
         flags.zero_()

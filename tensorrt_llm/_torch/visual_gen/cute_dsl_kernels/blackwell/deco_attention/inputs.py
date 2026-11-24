@@ -95,8 +95,11 @@ def hadamard(device):
     if indexed != device:
         return hadamard(indexed)
     _not_under_capture(device, "rotation matrix")
-    h = torch.ones(1, 1)
+    h = torch.ones(1, 1, device="cpu")
     while h.shape[0] < HEAD_DIM:
         h = torch.cat([torch.cat([h, h], 1), torch.cat([h, -h], 1)], 0)
-    signs = torch.randint(0, 2, (HEAD_DIM,), generator=torch.Generator().manual_seed(0)) * 2 - 1
+    signs = torch.randint(
+        0, 2, (HEAD_DIM,), generator=torch.Generator("cpu").manual_seed(0), device="cpu"
+    )
+    signs = signs * 2 - 1
     return (signs[:, None] * h).to(device=device, dtype=torch.bfloat16)
