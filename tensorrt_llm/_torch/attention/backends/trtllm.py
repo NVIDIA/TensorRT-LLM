@@ -1891,13 +1891,16 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     @property
     def supports_steady_decode_step(self) -> bool:
-        """Whether prepare_steady_decode_step may stand in for this metadata's prepare(): no host state of
-        prepare() beyond the KV lengths and block offsets (no FlashMLA, helix, cached-KV context MLA, FP4 MLA,
-        mixed-precision KV, full generation page table or FMHA library step plan) and prepare() is this
-        class's."""
+        """Whether prepare_steady_decode_step may stand in for this metadata's prepare()."""
         return (type(self).prepare is TrtllmAttentionMetadata.prepare
-                and self.kv_cache_manager is not None
-                and not self.enable_flash_mla and not self.enable_helix
+                and self._steady_decode_config_supported())
+
+    def _steady_decode_config_supported(self) -> bool:
+        """Whether the common prepare() needs no host state beyond the KV lengths and
+        block offsets (no FlashMLA, helix, cached-KV context MLA, FP4 MLA,
+        mixed-precision KV, full generation page table or FMHA step plan)."""
+        return (self.kv_cache_manager is not None and not self.enable_flash_mla
+                and not self.enable_helix
                 and not self.enable_context_mla_with_cached_kv
                 and self.fp4_mla_state is None
                 and not self._has_mixed_precision_staging()

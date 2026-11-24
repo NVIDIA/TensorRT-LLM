@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import time
-import weakref
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from copy import copy
@@ -59,6 +58,7 @@ from .....configs.deepseek_v41 import (
     decoder_bounded_replay_enabled,
     encoder_replay_enabled,
 )
+from .page_table_bounds import PageTableBounds
 from .params import CSA2Layout
 from .quantization import (
     INDEX_DATA_BYTES,
@@ -1607,38 +1607,9 @@ class CSA2CacheManager(KVCacheManagerV2):
         # tables every conversion writes, and of the SWA tables when they stay here.
         self._table_live = np.zeros(capacity, dtype=np.int64)
         self._swa_table_live = np.zeros(capacity, dtype=np.int64)
-        # Block-offset destinations this manager wrote: id -> (weak reference, address range,
-        # int64 [rows] columns); outside the first columns[r] of SWA slot 0's row r < rows they
-        # hold BAD_PAGE_INDEX.
-        self._block_offsets_live = {}
-
-    @staticmethod
-    def _address_range(tensor: torch.Tensor) -> tuple[int, int]:
-        extent = 1 + sum((size - 1) * stride for size, stride in zip(tensor.shape, tensor.stride()))
-        start = tensor.data_ptr()
-        return start, start + (extent if tensor.numel() else 0) * tensor.element_size()
-
-    def _claim_block_offsets(self, dst_tensor) -> np.ndarray | None:
-        """Per row of SWA slot 0, the columns past which ``dst_tensor`` holds BAD_PAGE_INDEX since
-        this manager last wrote it (rows past the array hold none), or None if unknown. Forgets
-        ``dst_tensor`` and every destination sharing its memory until ``_track_block_offsets``."""
-        tracked = self._block_offsets_live
-        address_range = self._address_range(dst_tensor)
-        live = None
-        entry = tracked.get(id(dst_tensor))
-        if entry is not None and entry[0]() is dst_tensor and entry[1] == address_range:
-            live = entry[2]
-        for key, (ref, (start, end), _) in list(tracked.items()):
-            if ref() is None or (start < address_range[1] and address_range[0] < end):
-                del tracked[key]
-        return live
-
-    def _track_block_offsets(self, dst_tensor, live: np.ndarray) -> None:
-        self._block_offsets_live[id(dst_tensor)] = (
-            weakref.ref(dst_tensor),
-            self._address_range(dst_tensor),
-            np.array(live, dtype=np.int64),
-        )
+        # SWA slot 0 holds BAD_PAGE_INDEX past each recorded row's live columns.
+        # Rows beyond the recorded array are entirely BAD_PAGE_INDEX.
+        self._block_offsets_live = PageTableBounds(track_overlaps=True)
 
     def batch_block_table_key(self, request_ids) -> None:
         """None: every steady decode step converts the tables again (copy_batch_block_offsets)."""
@@ -1671,7 +1642,7 @@ class CSA2CacheManager(KVCacheManagerV2):
         swa_layers = swa_layer_count[1]
         count = len(request_ids)
         width = min(dst_tensor.shape[-1], self.max_blocks_per_seq)
-        live = self._claim_block_offsets(dst_tensor)
+        live = self._block_offsets_live.claim(dst_tensor)
         if live is None:
             self._wait_for_page_table_conversion()
             dst_tensor[:, count:].fill_(BAD_PAGE_INDEX)
@@ -1693,7 +1664,7 @@ class CSA2CacheManager(KVCacheManagerV2):
             swa_out=dst_tensor[:swa_layers, :count, 0, :width],
             swa_live=live,
         )
-        self._track_block_offsets(
+        self._block_offsets_live.record(
             dst_tensor, live if written is None else np.minimum(written, width)
         )
         if self._swa_publication_token is not None:

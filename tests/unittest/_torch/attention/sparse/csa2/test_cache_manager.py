@@ -14,6 +14,7 @@ from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import (
     CSA2CacheRole,
 )
 from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+from tensorrt_llm._torch.attention.backends.sparse.csa2.page_table_bounds import PageTableBounds
 from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Layout
 from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import (
     read_index_rows,
@@ -551,7 +552,7 @@ def _metadata(manager, request, metadata=None):
 def test_swa_publication_is_scoped_transaction_with_exact_request_and_destination(monkeypatch):
     manager = CSA2CacheManager.__new__(CSA2CacheManager)
     manager._swa_publication_token = manager._swa_publication = None
-    manager._block_offsets_live = {}
+    manager._block_offsets_live = PageTableBounds(track_overlaps=True)
     manager.pp_layers = [0, 1]
     manager.max_blocks_per_seq = 4
     state = {"fail": False, "offset": 0}
@@ -893,7 +894,7 @@ def test_logical_page_tables_and_null_pointers(monkeypatch) -> None:
     manager.compute_batch_page_tables = compute
     destination = torch.full((40, 2, 2, 8), 99, dtype=torch.int32)
     manager._swa_publication_token = manager._swa_publication = None
-    manager._block_offsets_live = {}
+    manager._block_offsets_live = PageTableBounds(track_overlaps=True)
     manager.copy_batch_block_offsets(destination, [1], 1, 1, 1)
     assert destination[:20, 0, 0, 0].tolist() == list(range(1, 21))
     assert torch.all(destination[20:] == BAD_PAGE_INDEX)

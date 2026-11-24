@@ -460,10 +460,6 @@ def verify_skipped_device_copies(monkeypatch) -> None:
     module = sys.modules.get("tensorrt_llm._torch.pyexecutor.device_copy")
     if module is not None:
         monkeypatch.setattr(module, "CHECK_MODE", True)
-    csa2_metadata = sys.modules.get(
-        "tensorrt_llm._torch.attention.backends.sparse.csa2.metadata")
-    if csa2_metadata is not None:
-        monkeypatch.setattr(csa2_metadata, "_STEADY_PAGE_CHECKS", True)
 
 
 @pytest.fixture(scope="module")
