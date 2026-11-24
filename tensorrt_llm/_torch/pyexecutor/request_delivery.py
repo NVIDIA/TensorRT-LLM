@@ -23,6 +23,12 @@ class ResponseChannel:
         self.response_cv = threading.Condition(self.response_lock)
         self.responses: dict[int, list[LlmResponse]] = {}
         self.result_wait_queues: dict[int, ActorHandle | None] = {}
+        self._closed = False
+
+    def close(self) -> None:
+        """Reject future publications while keeping responses already stored for readers."""
+        with self.response_cv:
+            self._closed = True
 
     def register(self, request_ids: Iterable[int], result_wait_queue: ActorHandle) -> None:
         """Forward the requests' future responses to a Ray result wait queue.
@@ -79,6 +85,8 @@ class ResponseChannel:
             routed: Triples from ``route``, in delivery order.
         """
         with self.response_cv:
+            if self._closed:
+                return
             for req_id, resp, result_wait_queue in routed:
                 if req_id in self.responses.keys():
                     self.responses[req_id].append(resp)

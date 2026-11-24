@@ -72,6 +72,7 @@ _MULTIMODAL_INPUT_ERROR = "Requests to a pooling model cannot carry multimodal i
 
 # One forward runs while the next is launched; a third waits for the first to be published.
 _MAX_IN_FLIGHT = 2
+_CRASH_DRAIN_TIMEOUT_S = 1.0
 
 
 @dataclass(frozen=True)
@@ -232,6 +233,7 @@ class ScheduledEncoderExecutor:
         self.is_shutdown = False
         self.shutdown_event = threading.Event()
         self._event_loop_error: BaseException | None = None
+        self._fatal_error: BaseException | None = None
         self._event_loop_error_delivered = threading.Event()
         self._loop_completed = False
         self._worker_thread: threading.Thread | None = None
@@ -374,6 +376,13 @@ class ScheduledEncoderExecutor:
             propagate_hard_kill()
 
     # The members the worker drives.
+
+    @property
+    def execution_error(self) -> BaseException | None:
+        """Return the terminal error, which may be known before response publication ends."""
+        if self._event_loop_error is not None:
+            return self._event_loop_error
+        return self._completion_error if self._completion_error is not None else self._fatal_error
 
     def enqueue_request(
         self, request: ExecutorRequest, result_wait_queue: ActorHandle | None = None
@@ -543,6 +552,10 @@ class ScheduledEncoderExecutor:
                 else None
             )
             try:
+                completion_thread = self._completion_thread
+                if crashed and completion_thread is not None and completion_thread.is_alive():
+                    completion_thread.join(timeout=_CRASH_DRAIN_TIMEOUT_S)
+                self._response_channel.close()
                 with self._response_channel.response_cv:
                     self.is_shutdown = True
                     self._response_channel.response_cv.notify_all()
@@ -594,7 +607,7 @@ class ScheduledEncoderExecutor:
                         self._iter_counter += 1
         finally:
             self._in_flight.put(None)
-            # After a crash the thread may sit in a wedged device's wait, so it is not joined.
+            # Crash cleanup waits only after arming the watchdog.
             if self._loop_completed:
                 self._completion_thread.join()
 
@@ -886,6 +899,7 @@ class ScheduledEncoderExecutor:
         fatal = self._error_budget.consume(error_msg)
         if fatal:
             logger.error(f"Fatal error detected, initiating shutdown: {error_msg}")
+            self._fatal_error = error
             self.is_shutdown = True
             drained = [
                 item

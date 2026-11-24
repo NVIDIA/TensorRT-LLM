@@ -2,9 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 import asyncio
 import time
+from threading import Event
+
+import pytest
 
 from tensorrt_llm.executor.request import GenerationRequest
 from tensorrt_llm.executor.rpc_worker import RpcWorker
+from tensorrt_llm.executor.utils import ErrorResponse
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, TorchLlmArgs
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -82,3 +86,41 @@ class TestRpcWorkerTP1:
         # Fetch kv cache events
         events = asyncio.run(self.worker.fetch_kv_cache_events_async())
         assert isinstance(events, list)
+
+    def test_fetch_responses_after_event_loop_crash(
+            self, monkeypatch: pytest.MonkeyPatch) -> None:
+        engine = self.worker.engine
+        submitted = Event()
+        crash_message = "injected RPC executor event-loop crash"
+        sampling_params = SamplingParams(max_tokens=10, ignore_eos=True)
+        pending = GenerationRequest(prompt_token_ids=[3, 4, 5],
+                                    sampling_params=sampling_params).set_id(1)
+
+        def crash_with_pending_request() -> None:
+            if not submitted.wait(timeout=10):
+                raise RuntimeError("Timed out waiting for request registration")
+            raise RuntimeError(crash_message)
+
+        monkeypatch.setattr(engine, "_start_response_staging_iteration",
+                            crash_with_pending_request)
+        self.worker.submit(pending)
+        submitted.set()
+
+        assert engine.shutdown_event.wait(
+            timeout=10), "Timed out waiting for the engine to shut down"
+        assert self.worker.fetch_responses(timeout=0.1) == [
+            ErrorResponse(pending.id,
+                          f"Event loop terminated with error: {crash_message}",
+                          -1)
+        ]
+
+        late = GenerationRequest(prompt_token_ids=[3, 4, 5],
+                                 sampling_params=sampling_params).set_id(2)
+        self.worker.submit(late)
+
+        assert self.worker.fetch_responses(timeout=0.1) == [
+            ErrorResponse(late.id,
+                          f"Event loop terminated with error: {crash_message}",
+                          -1)
+        ]
+        assert not engine._event_loop_error_delivered.is_set()

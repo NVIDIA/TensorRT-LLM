@@ -24,6 +24,7 @@ from ..llmapi.utils import logger_debug
 from ..logger import logger
 from .request import GenerationRequest
 from .rpc import RPCServer
+from .utils import ErrorResponse, RequestError
 
 
 class RpcWorkerMixin:
@@ -41,6 +42,8 @@ class RpcWorkerMixin:
     # Default number of RPC server workers
     # This can be overridden by setting num_workers in the inheriting class
     NUM_WORKERS = 6
+    # Set by workers that stream responses to an RPC proxy.
+    _response_queue: Optional[Queue] = None
 
     def init_rpc_worker(self, rank: int, rpc_addr: Optional[str], hmac_key: bytes):
         if rpc_addr is None:
@@ -104,8 +107,6 @@ class RpcWorkerMixin:
         # which deadlocks inside a Ray actor (verified empirically).
         self._postproc_pool = ProcessPoolExecutor(max_workers=num)
 
-        from .utils import ErrorResponse
-
         def _make_on_postproc_worker_done(shard: int):
             def _on_postproc_worker_done(fut) -> None:
                 # ProcessPoolExecutor stores task exceptions on the Future and
@@ -124,17 +125,23 @@ class RpcWorkerMixin:
                 # produces no further responses for records already handed to
                 # the dead child, so fail this shard's pending requests
                 # explicitly instead of poisoning an unrelated next response.
-                errors = [
-                    ErrorResponse(client_id, f"PostprocWorker process died: {exc}", -1)
-                    for client_id in list(self._results.keys())
-                    if client_id % num == shard
-                ]
-                if errors:
-                    for err in errors:
-                        self._pop_result(err.client_id)
+                # Claim under the lock so final-response dispatch or the crash
+                # sweep cannot retire a request between the snapshot and the pop.
+                with self._results_lock:
+                    client_ids = [
+                        client_id
+                        for client_id in list(self._results)
+                        if client_id % num == shard and self._pop_result(client_id) is not None
+                    ]
+                if client_ids:
                     # fetch_responses drains _response_queue list-wise.
-                    self._response_queue.put(errors)
-                else:
+                    self._response_queue.put(
+                        [
+                            ErrorResponse(client_id, f"PostprocWorker process died: {exc}", -1)
+                            for client_id in client_ids
+                        ]
+                    )
+                elif self.engine is None or self.engine.execution_error is None:
                     # No in-flight request on this shard: park the failure on
                     # the background-error path so a later submission surfaces
                     # it instead of hanging on the dead child.
@@ -219,7 +226,18 @@ class RpcWorkerMixin:
         """Submits a request to the worker."""
         with nvtx_range_debug("RpcWorker.submit", color="blue", category="Worker"):
             logger_debug(f"[worker] Submitting request {request.id}", color="green")
-            result = super().submit(request)
+            try:
+                result = super().submit(request)
+            except RequestError as e:
+                if self._response_queue is None:
+                    raise
+                # The proxy sends submit without waiting for a reply, so the
+                # rejection reaches the client on the response stream instead.
+                logger.error(f"Failed to submit request {request.id}: {e}")
+                self._await_response_helper.temp_error_responses.put(
+                    ErrorResponse(request.id, str(e), request.id)
+                )
+                return None
             logger_debug(f"[worker] Submitted request {request.id}", color="green")
             return result
 
@@ -232,8 +250,15 @@ class RpcWorkerMixin:
             actual_timeout = (
                 timeout if timeout is not None else getattr(self, "_fetch_timeout", 0.1)
             )
+            # The engine sets shutdown_event only after publishing its last
+            # response, so reading it before the poll lets the poll drain them first.
+            loop_error = (
+                self.engine.execution_error if self.engine.shutdown_event.is_set() else None
+            )
             responses = super().await_responses(timeout=actual_timeout)
             responses = self._await_response_helper.process_and_handle_responses(responses)
+            if loop_error is not None:
+                self._fail_pending_requests(loop_error)
             logger_debug(f"[worker] Fetched {len(responses)} responses", color="green")
 
         qsize = self._response_queue.qsize()
@@ -244,6 +269,24 @@ class RpcWorkerMixin:
             # The queue contains batches of responses, so extend the list
             all_responses.extend(self._response_queue.get())
         return all_responses
+
+    def _fail_pending_requests(self, error: BaseException) -> None:
+        client_ids = [
+            client_id
+            for client_id in list(self._results)
+            if self._pop_result(client_id) is not None
+        ]
+        if not client_ids:
+            return
+        error_msg = f"Event loop terminated with error: {error}"
+        logger.error_once(
+            f"Failing RPC requests after executor error: {error}",
+            key=("rpc-executor-error", id(self.engine), error_msg),
+        )
+        # RPC cannot confirm receipt, so leave the rank-crash kill armed.
+        self._response_queue.put(
+            [ErrorResponse(client_id, error_msg, -1) for client_id in client_ids]
+        )
 
     async def fetch_responses_async(self, timeout: Optional[float] = None) -> list:
         """Async version of fetch_responses using asyncio.to_thread."""

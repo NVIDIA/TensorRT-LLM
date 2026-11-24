@@ -29,6 +29,7 @@ l0_a100:
     - unittest/executor/test_base_worker.py ISOLATION
     - unittest/executor/test_rpc_proxy.py
     - unittest/executor/test_rpc_worker.py
+    - unittest/_torch/pyexecutor/test_scheduled_encoder_executor.py::test_host_crash_finishes_response_publication_before_shutdown
     # llm.encode() accuracy
     - accuracy/test_llm_api_pytorch_encode.py::TestEncoderEncode::test_encoder_encode_matches_huggingface_classification[bert-yelp-eager]
     - accuracy/test_llm_api_pytorch_encode.py::TestEncoderEncode::test_encoder_encode_matches_huggingface_classification[bert-yelp-cuda_graph]
