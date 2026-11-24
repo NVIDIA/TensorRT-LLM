@@ -39,7 +39,11 @@ from tensorrt_llm._torch.models.modeling_qwen3vl import (
     _triton_pos_embed_interpolate,
 )
 from tensorrt_llm._torch.models.modeling_qwen3vl_moe import Qwen3MoeVLModel
+from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
+from tensorrt_llm._torch.models.multimodal import MultimodalFeature, supports_feature
+from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
+from tensorrt_llm._torch.pyexecutor.engine.model_setup import apply_torch_compile
 from tensorrt_llm._torch.pyexecutor.model_loader import _validate_encoder_attention_backend_support
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.inputs.multimodal import (
@@ -47,7 +51,13 @@ from tensorrt_llm.inputs.multimodal import (
     MultimodalItemMetadata,
     MultimodalParams,
 )
-from tensorrt_llm.llmapi.llm_args import MultimodalConfig, MultimodalEncoderCudaGraphConfig
+from tensorrt_llm.inputs.registry import BaseMultimodalDummyInputsBuilder
+from tensorrt_llm.llmapi.llm_args import (
+    MultimodalConfig,
+    MultimodalEncoderCudaGraphConfig,
+    PrefillCudaGraphBackend,
+)
+from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.sampling_params import SamplingParams
@@ -127,6 +137,110 @@ class TestQwen3VLScenario(MultimodalScenario):
         if self.kv_cache_reuse:
             features.append("kv_cache_reuse")
         return "-".join(features)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("native", [True, False], ids=["native", "wrapper"])
+def test_piecewise_graph_compiles_only_the_decoder(native: bool) -> None:
+    class Decoder(DecoderModelForCausalLM):
+        supports_multimodal = True
+
+    decoder = object.__new__(Decoder)
+    torch.nn.Module.__init__(decoder)
+    decoder.model = scope = torch.nn.Identity()
+    model = decoder
+    if not native:
+        model = object.__new__(Qwen3VLModel)
+        torch.nn.Module.__init__(model)
+        model.llm = decoder
+    model.mm_encoder = torch.nn.Identity()
+    args = SimpleNamespace(
+        prefill_cuda_graph_backend=PrefillCudaGraphBackend.PIECEWISE,
+        torch_compile_config=SimpleNamespace(compile_only_piecewise_graphs=False),
+    )
+    assert supports_feature(type(model), MultimodalFeature.LLM_PIECEWISE_CUDA_GRAPH)
+    with patch("torch.compile", return_value=torch.nn.Identity()) as compile_scope:
+        apply_torch_compile(model, "eager", llm_args=args, fullgraph=False)
+    compile_scope.assert_called_once_with(scope, backend="eager", fullgraph=False)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("needs_override", [False, True])
+def test_item_scheduling_window_geometry_capacity(needs_override: bool) -> None:
+    processor, _ = _make_qwen_vl_embedding_processor("qwen2.5", [])
+    cfg = processor.config.vision_config
+    cfg.patch_size = 1
+    cfg.window_size = 2 if needs_override else 8
+    processor.processor.image_processor.size = {"shortest_edge": 4, "longest_edge": 4}
+    processor.processor.video_processor.size = processor.processor.image_processor.size
+    tower = object.__new__(modeling_qwen2vl.Qwen2_5_VisionModel)
+    torch.nn.Module.__init__(tower)
+    tower.patch_size = cfg.patch_size
+    tower.window_size = cfg.window_size
+    tower.spatial_merge_size = cfg.spatial_merge_size
+    tower.spatial_merge_unit = cfg.spatial_merge_size**2
+
+    # Two temporal segments each contain one merged patch. A window side of one
+    # emits padding-only windows, which still consume attention metadata slots.
+    budget = 8
+    _, window_lengths = tower.get_window_index_by_thw(2, 2, 2)
+    fallback = tower.get_encoder_attention_metadata_capacity(budget)
+    assert (fallback["window_attention"] < len(window_lengths)) is needs_override
+    if needs_override:
+        capacity = processor.get_mm_encoder_attention_metadata_capacity(budget)
+    else:
+        capacity = BaseMultimodalDummyInputsBuilder.get_mm_encoder_attention_metadata_capacity(
+            processor, budget
+        )
+    capacities = capacity if capacity is not None else fallback
+    assert capacities["full_attention"] >= 2
+    assert capacities["window_attention"] >= len(window_lengths)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("replicated", [False, True])
+def test_encoder_tp_uses_loaded_vision_weights(replicated: bool) -> None:
+    config = Qwen3VLConfig(
+        vision_config={"hidden_size": 4, "out_hidden_size": 4, "spatial_merge_size": 1},
+        text_config={"dtype": "float32"},
+    )
+    weight = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+    feature = MultimodalFeature.ENCODER_TP
+    for rank in range(2):
+        mapping = Mapping(world_size=2, tp_size=2, rank=rank, enable_attention_dp=replicated)
+        model = object.__new__(Qwen3VLModel)
+        torch.nn.Module.__init__(model)
+        model.model_config = ModelConfig(pretrained_config=config, mapping=mapping)
+        assert not supports_feature(Qwen3VLModel, feature, model.model_config)
+        with patch("tensorrt_llm._torch.distributed.ops.get_allreduce_workspace"):
+            model.mm_encoder = modeling_qwen3vl.Qwen3VLVisionPatchMerger(model.model_config)
+        projection = model.mm_encoder.linear_fc1
+        projection.weight.data.copy_(projection.load_shard(weight))
+        expected = weight if replicated else weight.chunk(2)[rank]
+        torch.testing.assert_close(projection.weight, expected)
+        assert supports_feature(model, feature) is (not replicated)
+
+        # A user-supplied full span replicates this projection on every rank.
+        model.mm_encoders = torch.nn.ModuleDict(
+            {
+                "vision": Linear(
+                    4,
+                    4,
+                    bias=False,
+                    mapping=mapping,
+                    reduce_output=False,
+                    tensor_parallel_mode=TensorParallelMode.COLUMN,
+                    override_tp_sharding=(0, 4),
+                )
+            }
+        )
+        explicit = model.mm_encoders["vision"]
+        explicit.weight.data.copy_(explicit.load_shard(weight))
+        torch.testing.assert_close(explicit.weight, weight)
+        # A sharded decoder alone cannot establish encoder TP.
+        model.llm = model.mm_encoder
+        model.mm_encoder = None
+        assert not supports_feature(model, feature)
 
 
 class TestQwen3VL(TestModelingMultimodal):

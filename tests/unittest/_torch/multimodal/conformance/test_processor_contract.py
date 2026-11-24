@@ -37,9 +37,11 @@ def test_item_scheduling_processor(entry: ModelEntry | None) -> None:
             BaseMultimodalDummyInputsBuilder.get_mm_max_tokens_per_item,
             BaseMultimodalDummyInputsBuilder.get_dummy_mm_data,
             BaseMultimodalDummyInputsBuilder.get_max_mm_encoder_output_embeddings,
-            BaseMultimodalDummyInputsBuilder.get_mm_encoder_attention_metadata_capacity,
         ):
             hook = getattr(processor, default.__name__, None)
             assert callable(hook) and hook is not default, (
                 f"Item scheduling requires {processor.__name__} to implement {default.__name__}"
             )
+        # The engine calls this hook even when the tower supplies the capacity.
+        # Its default None selects the tower's geometry-aware or conservative bound.
+        assert callable(getattr(processor, "get_mm_encoder_attention_metadata_capacity", None))

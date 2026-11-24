@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Compare every multimodal registration and route to its reviewed gaps."""
 
-import ast
 import re
 import warnings
 
@@ -46,7 +45,6 @@ _SNAPSHOT_SIZES = {
     "KNOWN_OPT_OUTS": 225,
     "NOT_ON_BASE": 36,
     "MISSING_FIXTURE": 34,
-    "MISSING_ADMISSION_CHECK": 17,
 }
 
 
@@ -73,28 +71,17 @@ def _contract_problems(key: Key, entry: ModelEntry | None) -> list[str]:
         "KNOWN_OPT_OUTS": gaps.KNOWN_OPT_OUTS,
         "NOT_ON_BASE": gaps.NOT_ON_BASE,
         "MISSING_FIXTURE": gaps.MISSING_FIXTURE,
-        "MISSING_ADMISSION_CHECK": gaps.MISSING_ADMISSION_CHECK,
     }
     for name, snapshot in snapshots.items():
         if new and key in snapshot:
             problems.append(f"{where}: P0 contract: {name} cannot gain a key (see {_SKILL})")
 
     if not entry.media:
-        # A text-only target serves no media, so only its admission check applies.
+        # The executor owns V2 admission. Its behavior is exercised in test_admission.py.
         for name in ("KNOWN_OPT_OUTS", "NOT_ON_BASE", "MISSING_FIXTURE"):
             if key in snapshots[name]:
                 problems.append(f"{where}: text-only target in {name}: stale entry, delete it")
-        listed = key in gaps.MISSING_ADMISSION_CHECK or "text_only" in approved
-        if entry.refuses_media and listed:
-            problems.append(f"{where}: P0 text_only admission is present: stale entry, delete it")
-        elif not entry.refuses_media and not listed:
-            problems.append(
-                f"{where}: P0 text_only: run media through the multimodal runtime, or raise on "
-                f"media and rows in validate_multimodal_request_data (see {_SKILL})"
-            )
         return problems
-    if key in gaps.MISSING_ADMISSION_CHECK:
-        problems.append(f"{where}: takes media, not text-only: stale entry, delete it")
 
     if new and not entry.marked and "contract" not in approved:
         problems.append(f"{where}: P0 contract requires supports_multimodal = True (see {_SKILL})")
@@ -179,7 +166,6 @@ def _keys() -> list:
         | gaps.KNOWN_OPT_OUTS.keys()
         | gaps.NOT_ON_BASE.keys()
         | gaps.MISSING_FIXTURE
-        | gaps.MISSING_ADMISSION_CHECK
         | {key for key, _ in gaps.APPROVED_EXCEPTIONS}
     )
     return [pytest.param(key, id=_test_id(key, entries)) for key in sorted(keys, key=_label)]
@@ -200,7 +186,6 @@ def test_snapshot_only_shrinks() -> None:
         "KNOWN_OPT_OUTS": sum(map(len, gaps.KNOWN_OPT_OUTS.values())),
         "NOT_ON_BASE": len(gaps.NOT_ON_BASE),
         "MISSING_FIXTURE": len(gaps.MISSING_FIXTURE),
-        "MISSING_ADMISSION_CHECK": len(gaps.MISSING_ADMISSION_CHECK),
     }
     grown = {name: size for name, size in sizes.items() if size > _SNAPSHOT_SIZES[name]}
     assert not grown, f"known_gaps.py cannot grow {grown}. Follow the tier rules in {_SKILL}."
@@ -244,16 +229,12 @@ def test_route_returns_account_for_every_target(body: str, message: str) -> None
         _returns(f"@routes('Example')\ndef route():\n{body}", "example")
 
 
-class MultimodalForConditionalGeneration:
+class _Model:
     supports_multimodal = True
     supports_mm_encoder_item_scheduling = True
     supports_encoder_cache = True
     supports_vision_gpu_normalize = True
     supported_encoder_attention_backends = {"vision": frozenset()}
-
-
-class _Model(MultimodalForConditionalGeneration):
-    pass
 
 
 _KEY = ("ExampleVL", None)
@@ -338,46 +319,17 @@ def test_structural_features_require_approval_once_enforced(
         assert any(f"P0 feature '{feature}'" in p and "APPROVED_EXCEPTIONS" in p for p in problems)
 
 
-_TEXT_ONLY_TARGETS = """
-class Refuses:
-    def validate_multimodal_request_data(self, mm_data):
-        if mm_data:
-            raise ValueError("text only")
-
-
-class Silent:
-    def validate_multimodal_request_data(self, mm_data):
-        pass
-"""
-
-
-@pytest.mark.parametrize(("name", "refuses"), [("Refuses", True), ("Silent", False)])
-def test_new_text_only_target_needs_only_admission(
-    name: str, refuses: bool, monkeypatch: pytest.MonkeyPatch
+def test_text_only_target_has_no_media_feature_requirements(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    classes = {node.name: node for node in ast.parse(_TEXT_ONLY_TARGETS).body}
-    monkeypatch.setattr(models, "_source", lambda module: (classes, {}))
-    model_cls, media, admission = models._target("example.text_only.modeling", name)
-    assert (model_cls, media, admission) == (None, False, refuses)
     key = ("ExampleVL", "example/text_only")
-    entry = ModelEntry(model_cls, media=media, class_name=name, refuses_media=admission)
-    problems = _contract_problems(key, entry)
-    assert len(problems) == (0 if refuses else 1)
-    assert all("P0 text_only" in p and _SKILL in p for p in problems)
-
-
-def test_text_only_snapshot_entries(monkeypatch: pytest.MonkeyPatch) -> None:
-    key = ("ExampleVL", "example/text_only")
+    entry = ModelEntry(None, media=False)
+    assert _contract_problems(key, entry) == []
     monkeypatch.setattr(gaps, "SNAPSHOT_KEYS", gaps.SNAPSHOT_KEYS | {key})
-    monkeypatch.setattr(gaps, "MISSING_ADMISSION_CHECK", gaps.MISSING_ADMISSION_CHECK | {key})
     monkeypatch.setitem(gaps.NOT_ON_BASE, key, "Text only.")
-    entry = ModelEntry(None, media=False, refuses_media=True)
     assert _contract_problems(key, entry) == [
         "ExampleVL/example/text_only: text-only target in NOT_ON_BASE: stale entry, delete it",
-        "ExampleVL/example/text_only: P0 text_only admission is present: stale entry, delete it",
     ]
-    stale = "ExampleVL/example/text_only: takes media, not text-only: stale entry, delete it"
-    assert stale in _contract_problems(key, _entry())
 
 
 @pytest.mark.parametrize("reason", ["", "No layout.", "TRTLLM-1234"])
@@ -403,6 +355,7 @@ def test_new_key_requires_marker_base_and_fixture(monkeypatch: pytest.MonkeyPatc
 
 
 def test_snapshot_rejects_new_and_stale_entries(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(models, "_V2_BASE", _Model)
     monkeypatch.setitem(gaps.KNOWN_OPT_OUTS, _KEY, frozenset({Feature.ITEM_SCHEDULING}))
     monkeypatch.setitem(gaps.NOT_ON_BASE, _KEY, "Uses its own wrapper.")
     monkeypatch.setattr(gaps, "MISSING_FIXTURE", frozenset({_KEY}))

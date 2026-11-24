@@ -10,7 +10,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from functools import cache
 from importlib import import_module
-from importlib.util import resolve_name
+from importlib.util import find_spec, resolve_name
 from pathlib import Path
 
 from tensorrt_llm._torch.modeling_v2._router_index import NoTarget, registered_routes
@@ -26,7 +26,10 @@ from modeling_v2_source import route_returns  # noqa: E402
 
 Key = tuple[str, str | None]
 _ROOT = Path(__file__).resolve().parents[5]
-_BASES = {"MultimodalForConditionalGeneration", "ModelingV2ForConditionalGeneration"}
+# #22450 supplies this base. A V1 wrapper or a standalone V2 tower can also
+# inherit the mixin without using the V2 composite.
+_V2_MODULE = "tensorrt_llm._torch.modeling_v2.multimodal"
+_V2_BASE = import_module(_V2_MODULE).MultimodalModelForCausalLM if find_spec(_V2_MODULE) else None
 TINY_CONFIGS: dict[Key, str] = {}
 _MINIMAX_DEP = "minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__dep"
 _B300_TARGETS = {
@@ -42,13 +45,13 @@ class ModelEntry:
     fixture: str | None = None
     media: bool = True
     class_name: str = ""
-    # A text-only target defines validate_multimodal_request_data and raises in it.
-    refuses_media: bool = False
 
     @property
     def on_base(self) -> bool:
-        return self.model_cls is not None and any(
-            cls.__name__ in _BASES for cls in self.model_cls.__mro__
+        return (
+            self.model_cls is not None
+            and _V2_BASE is not None
+            and issubclass(self.model_cls, _V2_BASE)
         )
 
     @property
@@ -108,7 +111,7 @@ def _source(module: str) -> tuple[dict[str, ast.ClassDef], dict[str, tuple[str, 
 
 def _contract_in_source(module: str, name: str) -> bool:
     """Follow local and imported base classes to the marker, including mixin adapters."""
-    if name in _BASES or name == "MultimodalModelMixin":
+    if (module, name) == (MultimodalModelMixin.__module__, MultimodalModelMixin.__name__):
         return True
     if (
         not module.startswith("tensorrt_llm.")
@@ -143,11 +146,8 @@ def _contract_in_source(module: str, name: str) -> bool:
     return False
 
 
-def _target(
-    module: str, name: str, registered_cls: type | None = None
-) -> tuple[type | None, bool, bool]:
-    """The class when it declares the contract, whether it takes media, and whether it
-    refuses media at admission."""
+def _target(module: str, name: str, registered_cls: type | None = None) -> tuple[type | None, bool]:
+    """The class when it declares the contract, and whether the routed target serves media."""
     if _contract_in_source(module, name):
         try:
             cls = getattr(import_module(module), name)
@@ -155,16 +155,20 @@ def _target(
             raise AssertionError(
                 f"{module}.{name}: expose the feature contract to CPU tests"
             ) from exc
-        media = (
-            any(base.__name__ in _BASES for base in cls.__mro__)
-            or getattr(cls, "supports_multimodal", False) is True
-        )
-        return cls, media, False
+        return cls, issubclass(cls, MultimodalModelMixin) or getattr(
+            cls, "supports_multimodal", False
+        ) is True
     # Some targets run the tower and splice its embeddings in their own forward.
     classes, imports = _source(module)
     target = classes[name]
-    methods = {method.name: method for method in target.body if isinstance(method, ast.FunctionDef)}
-    forward = methods.get("forward")
+    forward = next(
+        (
+            node
+            for node in target.body
+            if isinstance(node, ast.FunctionDef) and node.name == "forward"
+        ),
+        None,
+    )
     calls = [node for node in ast.walk(forward or ast.Pass()) if isinstance(node, ast.Call)]
     media = any(getattr(call.func, "attr", None) == "multimodal_embeds" for call in calls)
     # This pre-marker MiniMax target passes its forward kwargs to the registered media model.
@@ -181,9 +185,7 @@ def _target(
                 for call in calls
             )
         )
-    hook = methods.get("validate_multimodal_request_data")
-    refuses = hook is not None and any(isinstance(node, ast.Raise) for node in ast.walk(hook))
-    return None, media, refuses
+    return None, media
 
 
 @cache
@@ -224,16 +226,12 @@ def inventory() -> dict[Key, ModelEntry]:
         for directory, name in _returns(inspect.getsource(route), route.__module__).items():
             target = f"{family}/{directory}"
             module = resolve_name(f".{directory}.modeling", route.__module__.rpartition(".")[0])
-            target_cls, media, refuses = _target(
-                module, name, cls if target == _MINIMAX_DEP else None
-            )
+            target_cls, media = _target(module, name, cls if target == _MINIMAX_DEP else None)
             fixture = TINY_CONFIGS.get((arch, target))
             job = f"unittest/_torch/modeling_v2/models/{target}"
             if target in _B300_TARGETS and job in listed:
                 fixture = f"l0_b300.yml: {job}"
-            entries[arch, target] = ModelEntry(
-                target_cls, processor, fixture, media, name, refuses_media=refuses
-            )
+            entries[arch, target] = ModelEntry(target_cls, processor, fixture, media, name)
     _source.cache_clear()
     return entries
 

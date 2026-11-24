@@ -388,31 +388,33 @@ extra host sync under overlap costs throughput only, which no gate sees.
 
 ## 6. Multimodal inputs
 
-Once the shared V2 composite lands, implement a media-serving target as `ModelingV2<Target>ForConditionalGeneration` on that base. A text-only target must reject both raw media and attached encoder rows at admission in `validate_multimodal_request_data`.
+In #22450 a media-serving V2 target inherits `MultimodalModelForCausalLM`. Set `llm_class` and declare each tower in `mm_encoders` with `MultimodalEncoderSpec(cls, weight_prefix, modalities)`. The mixin dispatches the towers and fuses embeddings in prompt order. With `llm_requires_input_ids`, it calls the decoder with the original IDs, `mm_embeds` and `mm_token_indices`.
+
+V2 admission requires a local encoder for raw media. Precomputed embeddings require a multimodal V2 target on a split encoder/prefill deployment. Position-only M-RoPE requests pass. V1 models keep their own validators. CI checks this behavior at admission when the V2 composite is available.
 
 V2 uses the same tiers, based on performance gain and implementation effort. P0 is required for every new model. Skipping a P0 feature needs an owner-approved entry in `APPROVED_EXCEPTIONS`. P1 is the next follow-up. Record a reason and tracking ID in `multimodal_opt_outs` for each P1 feature the model skips. P2 is optional. See the [multimodal onboarding tiers](../../../../../../../../.claude/skills/trtllm-model-onboard-multimodal/SKILL.md#multimodal-feature-tiers).
 
 <!-- BEGIN multimodal-feature-tiers -->
 | Feature | Tier | What the model must provide |
 | --- | --- | --- |
-| `contract` | P0 | Expose the language model and tower. Supply item order, row counts and input partitions. |
-| `text_only` | P0 | With `disable_mm_encoder`, omit the tower and refuse raw media and attached rows at admission. |
-| `uint8_media` | P0 | Accept the loader's default uint8 arrays or PIL images and honor processor normalization. |
-| `encoder_cache` | P0 | Return whole-item encoder rows with exact row counts and stable media hashes. |
-| `chunked_prefill_media` | P0 | Fuse only the media rows in the current prefill chunk. |
-| `kv_reuse_media` | P0 | Supply stable media hashes and token counts for prefix reuse. |
-| `llm_breakable_cuda_graph` | P0 | Keep encoder attention out of the decoder layer registry and prepare extra graph inputs. The check is structural until #21333 lands. |
-| `llm_piecewise_cuda_graph` | P0 | Scope piecewise prefill compilation to the decoder. The check is structural until #21333 lands. |
-| `encoder_dp` | P0 | Build the tower from the encoder config so replicas can encode whole items. The check is structural until #17330 lands. |
-| `item_scheduling` | P1 | Supply exact item costs, profiling inputs and encoder budgets. Moves to P0 when the runtime derives costs from item metadata. |
-| `supports_vision_gpu_normalize` | P1 | Provide processor statistics and a compatible tensor dtype and layout for normalization. |
-| `encoder_attention_backend` | P1 | Declare each tower's backends in the model class body. Let the engine size its attention metadata. |
-| `disagg_p_to_d` | P1 | Preserve media identity and export and restore mRoPE state across workers when used. |
-| `mm_encoder_groups` | P2 | Batch compatible items across requests. Moves to P1 when #21052 supplies the default builder. |
-| `encoder_cuda_graph` | P2 | Provide a graph capture adapter for the tower blocks. Moves to P1 when the default block adapter lands. |
-| `encoder_tp` | P2 | Shard tower weights under the encoder mapping. |
-| `disagg_e_to_p` | P2 | Accept attached rows with a complete item layout. |
-| `image_routing` | P2 | Qualify image KV events and routing before opting in. |
+| `contract` | P0 | Expose the decoder and local towers. Preserve prompt order and each item's embedding count. Supply partitions when the input builder needs them. |
+| `text_only` | P0 | With the encoder disabled, skip tower construction and loading. V2 admission in #22450 checks the local tower, split-worker mode and request content. |
+| `uint8_media` | P0 | Honor loader defaults and processor normalization. #22334 supplies RGB PIL images and RGB uint8 NumPy video frames. |
+| `encoder_cache` | P0 | Return complete item embeddings with exact counts and stable keys. Enable reuse with a positive cache budget and, in #22450, a local encoder. |
+| `chunked_prefill_media` | P0 | Count tokens per supported modality and fuse only the embeddings in the current chunk. Handle model-specific slicing when encoding changes lengths. |
+| `kv_reuse_media` | P0 | Supply token counts and placeholder geometry so the runtime can key media spans by content hash or UUID. |
+| `llm_breakable_cuda_graph` | P0 | Declare media replay on the wrapper. The engine checks the decoder, pipeline size and layer registry. Enforce after #21333. |
+| `llm_piecewise_cuda_graph` | P0 | Use native decoder compilation or compile only the wrapped decoder. Enforce after #21333. |
+| `encoder_dp` | P0 | Declare supports_mm_encoder_data_parallel and build replicas from the encoder config. Enforce after #17330. |
+| `item_scheduling` | P1 | Declare item scheduling and supply costs, profiling inputs and budgets. Override attention capacity when geometry requires it. Moves to P0 when costs can be derived. |
+| `supports_vision_gpu_normalize` | P1 | Skip CPU rescaling and normalization on the GPU path. Preserve the processor statistics, input dtype and layout. |
+| `encoder_attention_backend` | P1 | Declare selectable backends per tower, or an empty set for fixed attention. Size metadata at setup and refresh it on each forward. |
+| `disagg_p_to_d` | P1 | Transfer positions and deltas for mRoPE models. Preserve media identity and spans when reusing KV across workers. |
+| `mm_encoder_groups` | P2 | Batch compatible items across requests. Moves to P1 when #21052 supplies the default partition-based builder. |
+| `encoder_cuda_graph` | P2 | Capture tower blocks and check model accuracy. Moves to P1 when a default block adapter is available. |
+| `encoder_tp` | P2 | Shard tower weights across the ranks of the encoder mapping. |
+| `disagg_e_to_p` | P2 | Run the standalone encoder and restore its embeddings, item layout and required position metadata on the prefill worker. |
+| `image_routing` | P2 | Validate image KV events and routing for the advertised OpenEngine configuration. |
 <!-- END multimodal-feature-tiers -->
 
 **What.** An input processor prepares media, an encoder embeds it, and the

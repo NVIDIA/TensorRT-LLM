@@ -252,29 +252,6 @@ MISSING_FIXTURE: frozenset[Key] = frozenset(
     }
 )
 
-# Text-only targets that do not refuse media and rows at admission yet.
-MISSING_ADMISSION_CHECK: frozenset[Key] = frozenset(
-    {
-        (_GLM, "glm5_next/glm_5_3_flash_fp8__sm_10x__tp4"),
-        (_KIMI, "kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1"),
-        (_KIMI, "kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4"),
-        (_KIMI, "kimi_k3_vl/kimi_k3_nvfp4__sm_107__dep16"),
-        (_KIMI, "kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix8_moeep8"),
-        (_KIMI, "kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix8_moetp2ep4"),
-        (_KIMI, "kimi_k3_vl/kimi_k3_nvfp4__sm_107__tp1"),
-        (_MINIMAX, "minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__dep2ctx"),
-        (_MINIMAX, "minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp2"),
-        (_MINIMAX, "minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp2ctx"),
-        (_MINIMAX, "minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp4"),
-        (_MINIMAX, "minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp8"),
-        (_MINIMAX, "minimax_m3/minimax_m3_nvfp4__sm_103__tp4"),
-        (_MINIMAX, "minimax_m3/minimax_m3_nvfp4__sm_103__tp8"),
-        (_MINIMAX, "minimax_m3/minimax_m3_nvfp4__sm_107__tp2"),
-        (_MINIMAX, "minimax_m3/minimax_m3_nvfp4__sm_107__tp4"),
-        (_MINIMAX, "minimax_m3/minimax_m3_nvfp4__sm_107__tp8"),
-    }
-)
-
-# (Architecture and target, feature or "base", "fixture", "text_only") -> (reason, tracking ID,
+# (Architecture and target, feature or "base", "fixture") -> (reason, tracking ID,
 # approver).
 APPROVED_EXCEPTIONS: dict[tuple[Key, F | str], tuple[str, str, str]] = {}

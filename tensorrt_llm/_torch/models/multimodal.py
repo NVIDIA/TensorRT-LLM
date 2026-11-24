@@ -106,12 +106,12 @@ class SupportsMultimodal(Protocol):
 
     @property
     def embedding_dim(self) -> int:
-        """Width of one encoder output row, including model-specific extra features."""
+        """Width of an encoder embedding, including model-specific extra features."""
         ...
 
     @property
     def embedding_dtype(self) -> torch.dtype:
-        """Dtype of encoder output rows."""
+        """Dtype of encoder embeddings."""
         ...
 
     @property
@@ -196,23 +196,28 @@ _FEATURE_FLAGS = {
     MultimodalFeature.ITEM_SCHEDULING: "supports_mm_encoder_item_scheduling",
     MultimodalFeature.ENCODER_CACHE: "supports_encoder_cache",
     MultimodalFeature.DISAGG_E_TO_P: "support_mm_disagg",
+    MultimodalFeature.ENCODER_DP: "supports_mm_encoder_data_parallel",
 }
 
 
 def supports_feature(
-    model_cls: type,
+    model_cls: type | torch.nn.Module,
     feature: MultimodalFeature,
     model_config: ModelConfig[Any] | None = None,
     llm_args: TorchLlmArgs | None = None,
 ) -> bool:
-    """Return model-class eligibility, subject to any limits for this deployment.
+    """Read class declarations or inspect a built model under its deployment limits.
 
-    Breakable CUDA graphs follow the language model: its class declares
-    ``supports_multimodal_breakable_cuda_graph``, or the model passes the rows to the
-    language model (``language_model_takes_rows``). A model that builds its language
-    model at init has no class to read here; the engine checks the instance at setup.
-    A feature without its own flag is eligible unless the model opts out or limits it.
+    Encoder TP requires local tower weights sharded by their encoder mapping.
+    The breakable graph declaration is on the wrapper. At startup the engine also
+    validates the decoder instance and its layer registries before allowing replay.
     """
+    model = None
+    if not isinstance(model_cls, type):
+        model = model_cls
+        model_cls = type(model)
+        if model_config is None:
+            model_config = getattr(model, "model_config", None)
     if getattr(model_cls, "supports_multimodal", False) is not True:
         return False
     if feature in getattr(model_cls, "multimodal_opt_outs", {}):
@@ -222,21 +227,26 @@ def supports_feature(
         return False
 
     if feature in _FEATURE_FLAGS:
-        return bool(getattr(model_cls, _FEATURE_FLAGS[feature], False))
-    if feature in (MultimodalFeature.ENCODER_DP, MultimodalFeature.ENCODER_TP):
-        get_modes = getattr(model_cls, "get_supported_encoder_parallel_modes", None)
-        if model_config is not None and callable(get_modes):
-            modes = get_modes(model_config)
-        else:
-            modes = getattr(model_cls, "supported_encoder_parallel_modes", ())
-        return ("dp" if feature == MultimodalFeature.ENCODER_DP else "tp") in modes
+        flag = getattr(model_cls, _FEATURE_FLAGS[feature], False)
+        return flag is True if feature == MultimodalFeature.ENCODER_DP else bool(flag)
+    if feature == MultimodalFeature.ENCODER_TP:
+        from .modeling_multimodal_encoder import _has_sharded_encoder_weights
+
+        return model is not None and _has_sharded_encoder_weights(model)
     if feature == MultimodalFeature.LLM_BREAKABLE_CUDA_GRAPH:
-        language_model = getattr(model_cls, "language_model_class", None)
-        return getattr(model_cls, "language_model_takes_rows", False) is True or bool(
-            getattr(language_model, "supports_multimodal_breakable_cuda_graph", False)
+        from .modeling_multimodal_mixin import MultimodalModelMixin
+
+        return (
+            issubclass(model_cls, MultimodalModelMixin)
+            and getattr(model_cls, "supports_multimodal_breakable_cuda_graph", False) is True
+            and (model_config is None or model_config.mapping.pp_size == 1)
         )
     if feature == MultimodalFeature.LLM_PIECEWISE_CUDA_GRAPH:
-        return callable(getattr(model_cls, "apply_llm_torch_compile", None))
+        from .modeling_utils import DecoderModelForCausalLM
+
+        return issubclass(model_cls, DecoderModelForCausalLM) or callable(
+            getattr(model_cls, "apply_llm_torch_compile", None)
+        )
     return True
 
 
