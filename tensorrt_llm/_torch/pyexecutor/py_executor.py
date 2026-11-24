@@ -3331,7 +3331,7 @@ class PyExecutor:
         transfers = getattr(self, "async_transfer_manager", None)
         return (getattr(self, "kv_cache_transceiver", None) is not None
                 and transfers is not None
-                and self.disagg.supports_logical_context_cancellation() and any(
+                and self.disagg.logical_context_cancellation_enabled and any(
                     self.disagg.supports_logical_context_cancellation(req)
                     for req in transfers.requests_in_transfer().values()))
 
