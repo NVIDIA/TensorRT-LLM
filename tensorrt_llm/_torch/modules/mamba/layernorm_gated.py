@@ -139,9 +139,8 @@ def _layer_norm_fwd_1pass_kernel(
 # launch-limited; 4 rows with 4 warps reproduces the single-row kernel's
 # reduction order (bitwise-identical output) at ~2x the throughput. Shorter
 # rows take taller tiles, so every thread loads whole 16-byte vectors of x and
-# z; those may differ from the single-row kernel by rounding. The tile depends
-# only on the row length and dtype, never on the number of rows, so a row's
-# output does not depend on what else is in the batch.
+# z, and add each row in the 4-row tile's order (_row_sum_sq), so every tile
+# height gives the same output bits.
 _MULTIROW_ROWS = 4
 _MULTIROW_NUM_WARPS = 4
 _MULTIROW_MAX_N = 256
@@ -149,6 +148,8 @@ _MULTIROW_MAX_N = 256
 
 def _multirow_rows(N: int, element_size: int) -> int:
     """Rows per tile of the multi-row kernel for rows of N elements."""
+    if N < 32:
+        return _MULTIROW_ROWS
     num_threads = 32 * _MULTIROW_NUM_WARPS
     return max(_MULTIROW_ROWS, num_threads * (16 // element_size) // N)
 
@@ -202,16 +203,42 @@ def _gated_rows_load(X, Z, r0, M, stride_x_row, stride_z_tok, N: tl.constexpr,
 
 
 @triton.jit
+def _row_sum_sq(x, ROWS: tl.constexpr, SUM_LANES: tl.constexpr,
+                SUM_SPLIT: tl.constexpr, SUM_CHUNK: tl.constexpr):
+    """Sum of x * x per row, added in the order of a 4-row tile.
+
+    A 4-row tile gives each row one warp: every lane adds its SUM_CHUNK
+    elements, then lanes are combined at distances 16, 8, ..., 1. A taller tile
+    holds SUM_SPLIT of those chunks per thread and SUM_LANES threads per row, so
+    it adds each chunk on its own, combines the threads (distances 16 down to
+    SUM_SPLIT), then its own chunks (the smaller distances, largest first).
+    """
+    if SUM_SPLIT == 1:
+        total = tl.sum(x * x, axis=1)
+    else:
+        s = tl.sum(tl.reshape(x * x, (ROWS, SUM_LANES, SUM_SPLIT, SUM_CHUNK)),
+                   axis=3)
+        s = tl.sum(s, axis=1)
+        if SUM_SPLIT == 8:
+            s = tl.sum(tl.reshape(s, (ROWS, 2, 4)), axis=1)
+        if SUM_SPLIT >= 4:
+            s = tl.sum(tl.reshape(s, (ROWS, 2, 2)), axis=1)
+        total = tl.sum(s, axis=1)
+    return total
+
+
+@triton.jit
 def _gated_rows_store(X, Y, Rstd, FP8_SCALE, x, z, w, r0, M, eps, stride_y_row,
                       N: tl.constexpr, ROWS: tl.constexpr,
                       GATE_SIGMOID: tl.constexpr, SAVE_RSTD: tl.constexpr,
                       OUTPUT_FP8: tl.constexpr, CONTIG: tl.constexpr,
-                      EVEN: tl.constexpr):
+                      EVEN: tl.constexpr, SUM_LANES: tl.constexpr,
+                      SUM_SPLIT: tl.constexpr, SUM_CHUNK: tl.constexpr):
     """Gated RMSNorm of one loaded tile, stored to Y (and Rstd)."""
     rows = r0 + tl.arange(0, ROWS)
     cols = tl.arange(0, N)
     x = x.to(tl.float32)
-    var = tl.sum(x * x, axis=1) / N
+    var = _row_sum_sq(x, ROWS, SUM_LANES, SUM_SPLIT, SUM_CHUNK) / N
     rstd = 1.0 / tl.sqrt(var + eps)
     if SAVE_RSTD:
         if EVEN:
@@ -276,6 +303,10 @@ def _rms_norm_gated_fwd_multirow_kernel(
     CONTIG: tl.constexpr = False,  # X and Y rows dense (stride == N)
     EVEN: tl.constexpr = False,  # M % (ROWS * GROUPS) == 0: no row masks
     GROUPS: tl.constexpr = 1,
+    # Layout of a tile taller than 4 rows for _row_sum_sq (1: a 4-row tile).
+    SUM_LANES: tl.constexpr = 32,
+    SUM_SPLIT: tl.constexpr = 1,
+    SUM_CHUNK: tl.constexpr = 1,
 ):
     """Gated rmsnorm(x), several short rows per program.
 
@@ -317,7 +348,8 @@ def _rms_norm_gated_fwd_multirow_kernel(
                                               HEADS_PER_TOK, CONTIG, EVEN)
         _gated_rows_store(X, Y, Rstd, FP8_SCALE, x_cur, z_cur, w, r0, M, eps,
                           stride_y_row, N, ROWS, GATE_SIGMOID, SAVE_RSTD,
-                          OUTPUT_FP8, CONTIG, EVEN)
+                          OUTPUT_FP8, CONTIG, EVEN, SUM_LANES, SUM_SPLIT,
+                          SUM_CHUNK)
     if LAUNCH_WITH_PDL and not EARLY_TRIGGER:
         # Release only after both Rstd (when present) and Y have been stored.
         tl.extra.cuda.gdc_launch_dependents()
@@ -332,6 +364,26 @@ _MULTIROW_GROUPS_MIN_ROWS = 1 << 16
 # Compiled variants of the multi-row kernel whose siblings have been compiled
 # too (see _launch_multirow_kernel).
 _multirow_variants_with_siblings = set()
+
+
+def _multirow_tile(x, stride_x, contig):
+    """ROWS and _row_sum_sq's layout constants for x's rows.
+
+    A taller tile adds in the 4-row tile's order only when each thread holds
+    whole 16-byte vectors of x, which Triton emits only for 16-byte aligned
+    rows; other rows keep 4-row tiles.
+    """
+    N = x.shape[1]
+    rows = _multirow_rows(N, x.element_size())
+    if x.data_ptr() % 16 != 0 or not (contig or stride_x % 16 == 0):
+        rows = _MULTIROW_ROWS
+    split = 1
+    if rows > _MULTIROW_ROWS:
+        split = (16 // x.element_size()) // (N // 32)
+    return dict(ROWS=rows,
+                SUM_LANES=32 // split,
+                SUM_SPLIT=split,
+                SUM_CHUNK=max(N // 32, 1))
 
 
 def _compile_multirow_siblings(args, kwargs, device_index, launched=None):
@@ -392,7 +444,10 @@ def _launch_multirow_kernel(x,
     from this launch's, the siblings include the one-token launches.
     """
     M, N = x.shape
-    rows = _multirow_rows(N, x.element_size())
+    stride_x, stride_y = x.stride(0), y.stride(0)
+    contig = stride_x == N and stride_y == N
+    tile = _multirow_tile(x, stride_x, contig)
+    rows = tile["ROWS"]
     groups = (_MULTIROW_GROUPS if grouped and M >= _MULTIROW_GROUPS_MIN_ROWS
               and rows == _MULTIROW_ROWS else 1)
     rows_per_program = rows * groups
@@ -401,13 +456,12 @@ def _launch_multirow_kernel(x,
     launch_with_pdl = _multirow_pdl(grid[0], device_index)
     early_trigger = early_trigger and _pdl_device_policy(device_index)[0]
     even = M % rows_per_program == 0
-    stride_x, stride_y = x.stride(0), y.stride(0)
     args = (x, y, weight, z, rstd, fp8_scale, stride_x, stride_y, z.stride(0),
             M, eps)
     kwargs.update(N=N,
-                  ROWS=rows,
                   GROUPS=groups,
-                  CONTIG=(stride_x == N and stride_y == N),
+                  CONTIG=contig,
+                  **tile,
                   EARLY_TRIGGER=early_trigger,
                   num_warps=_MULTIROW_NUM_WARPS)
     with torch.cuda.device(device_index):
@@ -441,9 +495,12 @@ def _launch_multirow_kernel(x,
                      N if heads == 1 else stride_y, heads * N)
         if one_token != args[6:9]:
             contig = one_token[:2] == (N, N)
-            _compile_multirow_siblings((*args[:6], *one_token, *args[9:]),
-                                       dict(kwargs, GROUPS=1, CONTIG=contig),
-                                       device_index)
+            _compile_multirow_siblings(
+                (*args[:6], *one_token, *args[9:]),
+                dict(kwargs,
+                     GROUPS=1,
+                     CONTIG=contig,
+                     **_multirow_tile(x, one_token[0], contig)), device_index)
 
 
 def _multirow_gated_rmsnorm_eligible(N, ngroups, bias, z, norm_before_gate,

@@ -462,11 +462,75 @@ class TestRMSNormBasic:
             (256, torch.bfloat16, 4),
             (128, torch.float32, 4),
             (64, torch.float32, 8),
+            (32, torch.bfloat16, 32),
+            (16, torch.bfloat16, 4),
         ],
     )
     def test_multirow_rows_per_tile(self, N: int, dtype: torch.dtype, expected_rows: int) -> None:
         """Tiles are tall enough for whole 16-byte loads of x and z, and at least 4 rows."""
         assert layernorm_gated._multirow_rows(N, dtype.itemsize) == expected_rows
+
+    @pytest.mark.parametrize(
+        "N,dtype",
+        [
+            (32, torch.bfloat16),
+            (64, torch.bfloat16),
+            (128, torch.bfloat16),
+            (128, torch.float16),
+            (64, torch.float32),
+        ],
+    )
+    @pytest.mark.parametrize("x_pad", [0, 16, 8])
+    def test_taller_tiles_give_the_4_row_tile_bits(
+        self, N: int, dtype: torch.dtype, x_pad: int
+    ) -> None:
+        """Taller tiles add each row in the 4-row tile's order, so both entry points give its
+        output bits, for x rows that are 16-byte aligned (pad 0 and 16) or not (pad 8)."""
+        from tensorrt_llm._torch.modules.mamba.layernorm_gated import rms_norm_gated_token_major
+
+        device = "cuda"
+        heads, num_tokens = 4, 1031
+        num_rows = heads * num_tokens
+        assert layernorm_gated._multirow_rows(N, dtype.itemsize) > layernorm_gated._MULTIROW_ROWS
+        torch.manual_seed(17)
+        # Magnitudes over a wide range, so that another addition order changes the rounding.
+        shape = (num_rows, N + x_pad)
+        x = torch.randn(shape, device=device) * torch.exp(1.5 * torch.randn(shape, device=device))
+        x = x.to(dtype)[:, :N]
+        weight = (torch.rand(N, device=device) + 0.5).to(dtype)
+        wide = torch.randn(num_tokens, heads * N + 64, device=device, dtype=dtype)
+        z = wide[:, 64:].view(num_tokens, heads, N)
+
+        expected = torch.empty(num_rows, N, device=device, dtype=dtype)
+        layernorm_gated._rms_norm_gated_fwd_multirow_kernel[
+            (triton.cdiv(num_rows, layernorm_gated._MULTIROW_ROWS),)
+        ](
+            x,
+            expected,
+            weight,
+            z,
+            None,
+            None,
+            x.stride(0),
+            expected.stride(0),
+            z.stride(0),
+            num_rows,
+            1e-6,
+            N=N,
+            ROWS=layernorm_gated._MULTIROW_ROWS,
+            HEADS_PER_TOK=heads,
+            GATE_SIGMOID=False,
+            WEIGHT_IS_DELTA=False,
+            LAUNCH_WITH_PDL=False,
+            CONTIG=x.stride(0) == N,
+            num_warps=layernorm_gated._MULTIROW_NUM_WARPS,
+        )
+        actual = rms_norm_gated_token_major(x, z, weight, 1e-6)
+        assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+        dense, _, _ = layernorm_gated._layer_norm_fwd(
+            x, weight, None, 1e-6, z=z.reshape(-1, N), is_rms_norm=True
+        )
+        assert torch.equal(dense.view(torch.uint8), expected.view(torch.uint8))
 
     @pytest.mark.parametrize(
         "N,dtype",
