@@ -12,13 +12,14 @@ import os
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import build_pool_targets as targets
 import pytest
 
 from tensorrt_llm import _jit_share
 from tensorrt_llm._torch import build_pool
-from tensorrt_llm._torch.build_pool import Build, BuildPool, BuildResult
+from tensorrt_llm._torch.build_pool import Build, BuildPool, BuildResult, Claim
 
 pytestmark = pytest.mark.cpu_only
 
@@ -396,6 +397,28 @@ def test_a_worker_that_stops_replying_is_stopped_and_its_build_fails(
     assert after.status == "built" and pool._workers_started == 2
 
 
+def test_a_stopped_worker_marks_its_claim_failed_and_leaves_others_alone(
+    pool: BuildPool, tmp_path: Path
+) -> None:
+    """A worker stopped in a build it claimed leaves that claim failed, so that the ranks waiting
+    for the kernel build it at once rather than at the end of their wait; a claim another
+    process made stands."""
+    mine, theirs = (
+        Claim(*(str(tmp_path / f"{who}.{end}") for end in ("claim", "done", "failed")))
+        for who in ("mine", "theirs")
+    )
+    with pool.pass_scope():
+        [first] = pool.build([_record(tmp_path / "a", 1)])
+        pool._pool._reply_timeout = 2.0
+        [stuck] = pool.build([Build(f"{targets.__name__}:stall", (600.0,), None, mine)])
+    assert first.status == "built" and stuck.status == "failed"
+    assert os.path.exists(mine.claim) and os.path.exists(mine.failed)
+    with open(theirs.claim, "w") as f:
+        f.write(f"{os.uname().nodename} 1\n")
+    build_pool._abandon_claim(theirs, SimpleNamespace(pid=2), "stopped")
+    assert not os.path.exists(theirs.failed)
+
+
 def test_the_kernels_of_an_edited_compile_function_file_get_other_names(tmp_path: Path) -> None:
     """A process_built function's kernels are also named by its file's contents: a kernel
     compiled from another version of the file, which an editable install does not tell by its
@@ -541,7 +564,8 @@ def test_without_shared_builds_each_rank_keeps_a_store_of_its_own(
         [result] = ranks[0].build([_record(tmp_path / "r", 1)])
         assert result.status == "built"
         assert _jit_share._cute_store() == stores[0]
-    assert _jit_share._cute_store() == os.path.join("/nonexistent-share-dir", "cute")
+    # A directory this process does not share builds through is no store.
+    assert _jit_share._cute_store() is None
 
 
 def test_a_shared_store_that_cannot_be_made_leaves_the_rank_a_store_of_its_own(

@@ -312,12 +312,13 @@ def set_pool_store(path: str | None) -> None:
 def _cute_store() -> str | None:
     """Where shared kernel caches keep CuTe DSL kernels: inside a BuildPool build pass, the
     rank's store (in a worker process, the store of the rank it builds for); else
-    ``<TLLM_JIT_SHARE_DIR>/cute``, if set."""
+    ``<TLLM_JIT_SHARE_DIR>/cute`` when this process shares builds through it. A directory
+    :func:`install` refused is never one: its kernels would run unchecked."""
     store = _pool_store or os.environ.get(_POOL_STORE_ENV)
     if store:
         return store
     share_dir = os.environ.get(SHARE_DIR_ENV)
-    return os.path.join(share_dir, "cute") if share_dir else None
+    return os.path.join(share_dir, "cute") if share_dir and enabled() else None
 
 
 def _kernel_sharing_active() -> bool:

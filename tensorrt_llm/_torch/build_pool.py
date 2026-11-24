@@ -301,6 +301,8 @@ class _Task:
     batch: _Batch
     index: int
     settled: bool = False
+    # The build's claim among the ranks, which its worker takes before it builds.
+    claim: Optional[Claim] = None
 
 
 def _gpu_has_room(reserved: int = 0) -> bool:
@@ -460,7 +462,7 @@ class BuildPool:
                 pool = self._ensure_pool()
         for index, build in enumerate(builds):
             message = self._message(build) if pool is not None else None
-            task = _Task(message, build.family, batch, index)
+            task = _Task(message, build.family, batch, index, claim=build.claim)
             if message is None:
                 self._settle(task, BuildResult(REFUSED))
             else:
@@ -859,6 +861,7 @@ class _Pool:
                         else f"the worker process ended ({e!r}): {_tail(stderr)}"
                     )
                     self._owner._settle(task, BuildResult(FAILED, 0.0, error))
+                    _abandon_claim(task.claim, process, error)
                     self._release(task)
                     ended = True
                     self._ended()
@@ -883,10 +886,9 @@ class _Pool:
                     self._free += 1
             except Exception as e:  # noqa: BLE001 - a build left unsettled holds up its pass
                 # The worker ends with this thread: leaving closes its pipes.
-                self._owner._settle(
-                    task,
-                    BuildResult(FAILED, 0.0, f"serving the build raised {type(e).__name__}: {e}"),
-                )
+                error = f"serving the build raised {type(e).__name__}: {e}"
+                self._owner._settle(task, BuildResult(FAILED, 0.0, error))
+                _abandon_claim(task.claim, process, error)
                 self._release(task)
                 if not ended:
                     ended = True
@@ -957,6 +959,24 @@ def _reply_timeout() -> Optional[float]:
     except ValueError:
         seconds = _DEFAULT_REPLY_TIMEOUT_S
     return seconds if seconds > 0 else None
+
+
+def _abandon_claim(claim: Optional[Claim], process: subprocess.Popen, reason: str) -> None:
+    """Mark failed the claim of a build whose worker ended without settling it, so that the
+    ranks waiting for its kernel build it at once rather than at the end of their wait. Only a
+    claim this worker made counts: one another rank's worker made stands. The worker runs on
+    this node, so reading the claim it wrote cannot block on another client of the directory."""
+    if claim is None or os.path.exists(claim.done) or os.path.exists(claim.failed):
+        return
+    try:
+        with open(claim.claim) as f:
+            owner = f.read().split()
+    except OSError:
+        return  # Not claimed: the worker ended before it claimed the build.
+    if owner == [os.uname().nodename, str(process.pid)]:
+        from tensorrt_llm import _jit_share
+
+        _jit_share._mark_failed(claim.failed, reason)
 
 
 def _stop_worker(process: subprocess.Popen, timed_out: threading.Event) -> None:

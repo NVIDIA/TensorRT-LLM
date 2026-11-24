@@ -560,11 +560,9 @@ def autotune(tune_mode: bool = True,
     # it, or else, inside a build pass, through the store of this rank's worker
     # processes, which build kernels there (see tensorrt_llm._jit_share and
     # tensorrt_llm._torch.build_pool). A TLLM_JIT_SHARE_DIR that
-    # jit_share.install() refused is not used.
+    # jit_share.install() refused is never used (jit_share._cute_store).
     kernel_sharing = (jit_share.sharing_kernels() if tune_required and
-                      (jit_share.enabled() or
-                       (BuildPool.get().accepting()
-                        and not os.environ.get(jit_share.SHARE_DIR_ENV))) else
+                      (jit_share.enabled() or BuildPool.get().accepting()) else
                       contextlib.nullcontext())
     eager_forks_context = (no_eager_forks()
                            if tune_required else contextlib.nullcontext())

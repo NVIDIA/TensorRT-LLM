@@ -3234,6 +3234,7 @@ def test_shared_kernel_cache_exports_and_loads(monkeypatch, tmp_path):
                 f.write(name)
 
     monkeypatch.setenv(jit_share.SHARE_DIR_ENV, str(tmp_path))
+    monkeypatch.setattr(jit_share, "enabled", lambda: True)
     monkeypatch.setenv(jit_share._WAIT_ENV, "0.1")
     monkeypatch.setattr(jit_share, "_cute_identity", lambda: "test")
     monkeypatch.setattr(jit_share, "_export_kernel", export)
@@ -3274,6 +3275,7 @@ def test_shared_kernel_cache_marks_a_raised_compile_failed(
         return wait(obj, failed)
 
     monkeypatch.setenv(jit_share.SHARE_DIR_ENV, str(tmp_path))
+    monkeypatch.setattr(jit_share, "enabled", lambda: True)
     monkeypatch.setenv(jit_share._WAIT_ENV, "600")
     monkeypatch.setattr(jit_share, "_cute_identity", lambda: "test")
     monkeypatch.setattr(jit_share, "_wait", record_wait)
@@ -3292,6 +3294,7 @@ def test_jit_share_waits_end_at_the_deadline(monkeypatch, tmp_path):
     of an enclosing wait_until, however long the wait setting, so that a
     claimant that hangs delays the others by one wait at most."""
     monkeypatch.setenv(jit_share.SHARE_DIR_ENV, str(tmp_path))
+    monkeypatch.setattr(jit_share, "enabled", lambda: True)
     monkeypatch.setenv(jit_share._WAIT_ENV, "600")
     monkeypatch.setattr(jit_share, "_cute_identity", lambda: "test")
     sweep = jit_share.SharedSweep("sweep")
@@ -3316,6 +3319,7 @@ def test_jit_share_builds_here_when_the_directory_fails(monkeypatch, tmp_path):
     for name in ("slots", "sweeps", "cute"):
         (tmp_path / name).write_text("not a directory")
     monkeypatch.setenv(jit_share.SHARE_DIR_ENV, str(tmp_path))
+    monkeypatch.setattr(jit_share, "enabled", lambda: True)
     monkeypatch.setattr(jit_share, "_slot", None)
     monkeypatch.setattr(jit_share, "_cute_identity", lambda: "test")
     assert jit_share.start_fraction() == 0.0
@@ -3328,6 +3332,27 @@ def test_jit_share_builds_here_when_the_directory_fails(monkeypatch, tmp_path):
         assert (1, "tile") not in cache
         cache[(1, "tile")] = "kernel"  # its export fails
         assert (1, "tile") in cache and cache[(1, "tile")] == "kernel"
+
+
+def test_tuning_in_a_build_pass_shares_through_the_pool_store_not_a_refused_dir(
+        monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """With a TLLM_JIT_SHARE_DIR that install() refused, tuning inside a build pass still shares
+    the runners' CuTe DSL kernels through the store of the rank's workers, which build them
+    there, so the rank loads them; the refused directory is never a store."""
+    from tensorrt_llm._torch.build_pool import BuildPool
+
+    monkeypatch.setenv(jit_share.SHARE_DIR_ENV, str(tmp_path / "refused"))
+    monkeypatch.setattr(jit_share, "_installed", False)
+    monkeypatch.setattr(jit_share, "_pool_store", None)
+    monkeypatch.setattr(BuildPool, "accepting", lambda self: True)
+    with autotune():
+        # No store until a worker takes a build.
+        assert jit_share._cute_store() is None
+        assert not jit_share._kernel_sharing_active()
+        monkeypatch.setattr(jit_share, "_pool_store", str(tmp_path / "store"))
+        assert jit_share._kernel_sharing_active()
+        assert jit_share._cute_store() == str(tmp_path / "store")
+    assert not (tmp_path / "refused").exists()
 
 
 @pytest.mark.parametrize("workers_on", [False, True])
