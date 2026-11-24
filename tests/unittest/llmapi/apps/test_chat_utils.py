@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import asyncio
 import base64
 import json
 import os
@@ -791,13 +792,13 @@ class TestMakeMediaIo:
             ("audio", "decoded_memory_reserver"),
         ],
     )
-    def test_request_cannot_set_server_only_kwargs(self, modality, key):
+    def test_request_cannot_set_server_only_kwargs(self, modality: str, key: str) -> None:
         with pytest.raises(ValueError, match=key):
             _make_media_io(modality, None, {modality: {key: 1 << 40}})
 
 
 @pytest.fixture(scope="module")
-def video_data_uri(tmp_path_factory):
+def video_data_uri(tmp_path_factory: pytest.TempPathFactory) -> str:
     """A 40-frame 64x64 mp4 as a base64 data URI."""
     cv2 = pytest.importorskip("cv2")
 
@@ -812,35 +813,79 @@ def video_data_uri(tmp_path_factory):
 
 
 class TestRequestVideoDecodeBudget:
-    """All videos of one request share the server's decoded-frame limit."""
+    """All videos of one request share the server's decoded video limit."""
 
     # Counted peak bytes of ten 64x64 frames in the default uint8 format.
     TEN_FRAMES_PEAK_BYTES = 10 * 64 * 64 * 3 * 2
+    # The budget's error, which names the server setting.
+    LIMIT_ERROR = r"for this request would exceed \d+ bytes\..*`video\.max_decoded_frame_bytes`"
 
-    def test_only_failed_decodes_are_refunded(self):
+    def test_only_failed_decodes_are_refunded(self) -> None:
         budget = _chat_utils._DecodedVideoBudget(100)
         committed = budget.reserve(60, 30)
         committed.commit(30)
         committed.release()
         budget.reserve(40, 40).release()
         budget.reserve(40, 40)
-        with pytest.raises(ValueError, match="more than 100 bytes"):
+        with pytest.raises(ValueError, match="would exceed 100 bytes"):
             budget.reserve(1, 1)
+
+    def test_cancel_stops_new_and_running_decodes(self) -> None:
+        budget = _chat_utils._DecodedVideoBudget(100)
+        running = budget.reserve(10, 10)
+        running.check_cancelled()
+        budget.cancel()
+        with pytest.raises(ValueError, match="cancelled"):
+            running.check_cancelled()
+        with pytest.raises(ValueError, match="cancelled"):
+            budget.reserve(1, 1)
+
+    @pytest.mark.asyncio
+    async def test_a_failed_load_cancels_the_other_loads_and_the_budget(self) -> None:
+        budget = MagicMock()
+        tracker = MultimodalDataTracker(model_type=_MM_MODEL_TYPE, decoded_memory_budget=budget)
+        sibling_started = asyncio.Event()
+        sibling_cancelled = asyncio.Event()
+
+        async def sibling() -> None:
+            sibling_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                sibling_cancelled.set()
+                raise
+
+        async def failing() -> None:
+            await sibling_started.wait()
+            raise ValueError("decode failed")
+
+        tracker.add_data("video", sibling())
+        tracker.add_data("video", failing())
+        with pytest.raises(ValueError, match="decode failed"):
+            await tracker.retrieve_all_async()
+        budget.cancel.assert_called_once_with()
+        assert sibling_cancelled.is_set()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         ("server_video_kwargs", "num_frames", "num_videos", "error"),
         [
             ({}, 10, 1, None),
-            ({}, 40, 1, "exceeding the limit"),
-            ({"max_decoded_frame_bytes": 2 * TEN_FRAMES_PEAK_BYTES - 1}, 10, 2, "for this request"),
+            ({}, 40, 1, LIMIT_ERROR),
+            ({"max_decoded_frame_bytes": 2 * TEN_FRAMES_PEAK_BYTES - 1}, 10, 2, LIMIT_ERROR),
             ({"max_decoded_frame_bytes": None}, 40, 2, None),
         ],
         ids=["within_default_limit", "over_default_limit", "videos_share_limit", "limit_disabled"],
     )
     async def test_request_decode_is_bounded(
-        self, video_data_uri, monkeypatch, server_video_kwargs, num_frames, num_videos, error
-    ):
+        self,
+        video_data_uri: str,
+        monkeypatch: pytest.MonkeyPatch,
+        server_video_kwargs: dict,
+        num_frames: int,
+        num_videos: int,
+        error: str | None,
+    ) -> None:
         monkeypatch.setattr(
             _chat_utils, "_DEFAULT_MAX_DECODED_VIDEO_FRAME_BYTES", self.TEN_FRAMES_PEAK_BYTES
         )

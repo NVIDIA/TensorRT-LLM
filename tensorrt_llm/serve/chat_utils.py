@@ -23,6 +23,7 @@ from tensorrt_llm.inputs import (ContentFormat, ConversationMessage,
                                  MultimodalData, MultimodalDataTracker,
                                  load_base64_image_embeds)
 from tensorrt_llm.inputs.media_io import (MEDIA_IO_REGISTRY, BaseMediaIO,
+                                          DecodedMemoryBudget,
                                           is_local_media_url)
 from tensorrt_llm.inputs.model_config import resolve_top_level_model_type
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
@@ -105,14 +106,15 @@ _SERVER_ONLY_MEDIA_IO_KWARGS: Dict[str, frozenset] = {
     "audio": frozenset({"decoded_memory_reserver"}),
 }
 
-# Counted peak frame buffers (see `_load_video_by_cv2`) that the videos of one
-# request may allocate when the server sets no `video.max_decoded_frame_bytes`.
+# Counted decoded video data (the peak frame buffers of `_load_video_by_cv2`
+# and any audio extracted from the videos) that one request may allocate when
+# the server sets no `video.max_decoded_frame_bytes`.
 _DEFAULT_MAX_DECODED_VIDEO_FRAME_BYTES = 8 * 1024**3
 
 
 def _video_decode_limit(
         server_config: Optional[MultimodalServerConfig]) -> Optional[int]:
-    """Per-request decoded-frame budget for videos; `None` disables it."""
+    """Per-request decoded video budget in bytes; `None` disables it."""
     server_kwargs = (server_config.media_io_kwargs
                      if server_config else None) or {}
     video_kwargs = server_kwargs.get("video") or {}
@@ -129,7 +131,7 @@ class _DecodedVideoReservation:
         self._active = True
 
     def check_cancelled(self) -> None:
-        pass
+        self._budget.check_cancelled()
 
     def shrink(self, retained_bytes: int) -> None:
         pass
@@ -144,28 +146,37 @@ class _DecodedVideoReservation:
 
 
 class _DecodedVideoBudget:
-    """Caps the decoded-frame buffers of all videos in one request.
+    """Caps the decoded video data of all videos in one request.
 
     A reservation is charged its peak bytes and stays charged unless its decode
-    fails, so whether a request fits does not depend on decode order.
+    fails, so whether a request fits does not depend on decode order. After
+    `cancel`, new reservations and the checks of running decodes raise.
     """
 
     def __init__(self, limit_bytes: int) -> None:
         self._limit_bytes = limit_bytes
         self._charged_bytes = 0
+        self._cancelled = False
         self._lock = threading.Lock()
 
     def reserve(self, peak_bytes: int,
                 retained_bytes: int) -> _DecodedVideoReservation:
         with self._lock:
+            self.check_cancelled()
             if self._charged_bytes + peak_bytes > self._limit_bytes:
                 raise ValueError(
-                    "Decoded video frame buffers for this request require "
-                    f"more than {self._limit_bytes} bytes. The server sets "
-                    "this limit with `--media_io_kwargs` "
-                    "`video.max_decoded_frame_bytes`.")
+                    "Decoded video data for this request would exceed "
+                    f"{self._limit_bytes} bytes. The server sets this limit "
+                    "with `--media_io_kwargs` `video.max_decoded_frame_bytes`.")
             self._charged_bytes += peak_bytes
         return _DecodedVideoReservation(self, peak_bytes)
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def check_cancelled(self) -> None:
+        if self._cancelled:
+            raise ValueError("The request's media loading was cancelled.")
 
     def _refund(self, nbytes: int) -> None:
         with self._lock:
@@ -176,12 +187,13 @@ def _make_media_io(
     modality: str,
     server_config: Optional[MultimodalServerConfig],
     request_kwargs: Optional[Dict[str, Dict[str, Any]]],
-    decoded_memory_reserver: Optional[Callable[[int, int], Any]] = None,
+    decoded_memory_budget: Optional[DecodedMemoryBudget] = None,
 ) -> BaseMediaIO:
     """Construct a configured MediaIO instance for one modality on one request.
 
-    Videos get the server's decoded-frame limit (or the default) and the
-    request's shared `decoded_memory_reserver`; requests cannot override either.
+    Videos reserve their decoded data from the request's
+    `decoded_memory_budget`, which enforces the server's limit; without a
+    budget they are unbounded. Requests cannot set either.
     """
     server_kwargs = (server_config.media_io_kwargs
                      if server_config else None) or {}
@@ -199,11 +211,13 @@ def _make_media_io(
             "decoded-memory limits are configured by the server.")
     modality_server_kwargs = server_kwargs.get(modality)
     if modality == "video":
-        limit = _video_decode_limit(server_config)
+        reserver = (None if decoded_memory_budget is None else
+                    decoded_memory_budget.reserve)
+        # The budget applies the server's limit to the whole request.
         modality_server_kwargs = {
             **(modality_server_kwargs or {}),
-            "max_decoded_frame_bytes": limit,
-            "decoded_memory_reserver": decoded_memory_reserver,
+            "max_decoded_frame_bytes": None,
+            "decoded_memory_reserver": reserver,
         }
     return media_io_cls.create(modality_server_kwargs, modality_request_kwargs)
 
@@ -286,7 +300,7 @@ def parse_chat_message_content_part(
         video_io = _make_media_io("video",
                                   mm_data_tracker._multimodal_server_config,
                                   mm_data_tracker.request_media_io_kwargs,
-                                  mm_data_tracker.decoded_memory_reserver)
+                                  mm_data_tracker.decoded_memory_budget)
         return MultimodalData(modality="video",
                               data=_load_request_media(video_io, str_content),
                               is_embedding=False)
@@ -595,9 +609,13 @@ def parse_chat_messages_coroutines(
         model_config: HF `AutoConfig`; selects the model's placeholder
             strategy via `MULTIMODAL_PLACEHOLDER_REGISTRY`.
         multimodal_server_config: Server-level multimodal config
-            (e.g. `--media_io_kwargs`); defaults to empty.
+            (e.g. `--media_io_kwargs`); defaults to empty. Its
+            `video.max_decoded_frame_bytes` bounds the decoded video data of
+            the whole request (8 GiB when unset, unbounded when `None`).
         request_media_io_kwargs: Per-request override merged per
-            modality with the server default via `BaseMediaIO.create`.
+            modality with the server default via `BaseMediaIO.create`. It
+            cannot set the server-only `video.max_decoded_frame_bytes` or
+            `decoded_memory_reserver`.
         model_type_override: The model type to parse for, for a caller that
             has no `model_config` (the KV-aware router) but knows the type.
         resolve_media: When False the returned coroutine closes the
@@ -619,9 +637,8 @@ def parse_chat_messages_coroutines(
         model_type,
         multimodal_server_config,
         request_media_io_kwargs=request_media_io_kwargs,
-        decoded_memory_reserver=(
-            None if video_decode_limit is None else
-            _DecodedVideoBudget(video_decode_limit).reserve))
+        decoded_memory_budget=(None if video_decode_limit is None else
+                               _DecodedVideoBudget(video_decode_limit)))
 
     # Determine content format to decide placeholder strategy.
     #

@@ -511,22 +511,28 @@ class TestServingChatTemplateGather:
         from unittest.mock import Mock
 
         import tensorrt_llm.serve.resource_governor as rg
+        from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 
         governor = object.__new__(rg.ResourceGovernor)
         governor.model_config = Mock()
         governor.tokenizer = Mock()
         governor.processor = None
+        governor.multimodal_server_config = MultimodalServerConfig(
+            media_io_kwargs={"video": {"max_decoded_frame_bytes": 1 << 30}}
+        )
 
         async def fake_mm_coroutine():
             # parse_chat_messages_coroutines' coroutine yields
             # (mm_data, mm_embeddings).
             return ({"image": ["data"]}, None)
 
-        monkeypatch.setattr(
-            rg,
-            "parse_chat_messages_coroutines",
-            lambda messages, model_config, _: ([], fake_mm_coroutine(), [{}], None),
-        )
+        parse_calls = []
+
+        def fake_parse(messages, model_config, multimodal_server_config, **kwargs):
+            parse_calls.append((multimodal_server_config, kwargs))
+            return [], fake_mm_coroutine(), [{}], None
+
+        monkeypatch.setattr(rg, "parse_chat_messages_coroutines", fake_parse)
         # Must resolve the top-level model type, matching the serving call
         # sites (not the raw model_config.model_type).
         monkeypatch.setattr(rg, "resolve_top_level_model_type", lambda cfg: "resolved-model-type")
@@ -555,6 +561,9 @@ class TestServingChatTemplateGather:
         # Uses the top-level resolver and forwards the real placeholder counts.
         assert captured["model_type"] == "resolved-model-type"
         assert captured["mm_placeholder_counts"] == [{}]
+        # Parses with the server's media settings, and leaves the media undecoded
+        # for a renderer that does not read it.
+        assert parse_calls == [(governor.multimodal_server_config, {"resolve_media": False})]
 
     @staticmethod
     def _stub_responses_rendering(monkeypatch, conversation, mm_result, item_order=None):

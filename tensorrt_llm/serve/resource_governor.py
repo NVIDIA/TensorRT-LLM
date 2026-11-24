@@ -27,7 +27,8 @@ from fastapi import FastAPI
 from starlette.responses import JSONResponse, Response
 
 from tensorrt_llm.executor.request import TruncateKVCacheRequest
-from tensorrt_llm.inputs.utils import ConversationMessage
+from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
+from tensorrt_llm.inputs.utils import ConversationMessage, renders_from_loaded_media
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.chat_utils import (
     parse_chat_messages_coroutines,
@@ -81,6 +82,7 @@ class ResourceGovernor:
         allow_request_chat_template: bool = False,
         harmony_adapter_factory: Optional[Callable] = None,
         chat_template: Optional[str] = None,
+        multimodal_server_config: Optional[MultimodalServerConfig] = None,
     ):
         self.resource_governor_queue = resource_governor_queue
         self.tokenizer = tokenizer
@@ -90,6 +92,8 @@ class ResourceGovernor:
         # prompt the chat route executes, so it renders with the same template.
         self.chat_template = chat_template
         self.allow_request_chat_template = allow_request_chat_template
+        # The server's --media_io_kwargs, including its decoded-video limit.
+        self.multimodal_server_config = multimodal_server_config
         self._harmony_adapter_factory = harmony_adapter_factory
         self._harmony_adapter = None
 
@@ -163,11 +167,17 @@ class ResourceGovernor:
     ) -> List[int]:
         """Convert chat messages to token IDs via chat template + tokenization."""
         conversation: List[ConversationMessage] = []
+        resources = self._render_resources()
         conversation, mm_coroutines, mm_placeholder_counts, _ = parse_chat_messages_coroutines(
-            messages, self.model_config, None
+            messages,
+            self.model_config,
+            self.multimodal_server_config,
+            # Only the token ids are kept, so the media is decoded only for a
+            # renderer that reads it.
+            resolve_media=renders_from_loaded_media(resources.model_type),
         )
         rendered, _ = await render_conversation_with_media(
-            self._render_resources(),
+            resources,
             mm_coroutines,
             conversation=conversation,
             mm_placeholder_counts=mm_placeholder_counts,
