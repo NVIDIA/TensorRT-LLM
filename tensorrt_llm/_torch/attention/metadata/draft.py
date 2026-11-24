@@ -321,6 +321,50 @@ class StandaloneDSparkDraftMetadata(DraftMetadata):
         )
 
 
+class DFlashDraftMetadata(DraftMetadata):
+    """A DFlash drafter over a draft KV cache of its own.
+
+    The drafter runs once per target step, on the generation rows, with its
+    own attention over pages of the draft KV cache. It addresses those pages
+    through the block offsets held here, in the target step's row order, and
+    takes positions and lengths from the spec worker's own state.
+    """
+
+    def __init__(self, registry: _Registry, config: "BatchInputs") -> None:
+        super().__init__(registry, config)
+        draft_manager = config.draft_kv_cache_manager
+        num_pools = getattr(draft_manager, "num_attention_op_pools", draft_manager.num_pools)
+        # Block offsets of the step's rows in the draft KV cache,
+        # [num_pools, num_rows, 2, max_blocks_per_seq].
+        self.draft_kv_cache_block_offsets = self.get_buffer(
+            (num_pools, config.max_num_sequences, 2, draft_manager.max_blocks_per_seq),
+            torch.int32,
+            "draft_kv_cache_block_offsets",
+        )
+
+    def prepare(self, inputs: "BatchInputs") -> None:
+        if not inputs.stage_host:
+            return
+        self.config.draft_kv_cache_manager.copy_batch_block_offsets(
+            self.draft_kv_cache_block_offsets,
+            inputs.request_ids,
+            inputs.beam_width,
+            inputs.num_contexts,
+            inputs.num_seqs,
+        )
+
+
+class SharedKVCacheDFlashDraftMetadata(DraftMetadata):
+    """A DFlash drafter without a draft KV cache of its own.
+
+    The drafter runs once per target step, on the generation rows, with its
+    own attention. Its layers are extra layers of the target's KV cache, which
+    it addresses through the target's block offsets, or it keeps its context
+    in a buffer of the spec worker. Either way it reads nothing that the
+    target's metadata do not already hold, so this mode holds nothing.
+    """
+
+
 class SuffixAutomatonDraftMetadata(DraftMetadata):
     """Drafting from a suffix automaton over the tokens generated so far.
 

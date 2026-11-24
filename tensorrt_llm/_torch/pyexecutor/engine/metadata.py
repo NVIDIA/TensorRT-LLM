@@ -165,10 +165,12 @@ def build_feature_attention_metadata(
     )
     from tensorrt_llm._torch.attention.metadata.draft import (
         DenseLinearDraftMetadata,
+        DFlashDraftMetadata,
         EmbeddedDSparkDraftMetadata,
         LinearDraftLengthsMetadata,
         LinearDraftMetadata,
         SharedKVCacheDenseLinearDraftMetadata,
+        SharedKVCacheDFlashDraftMetadata,
         SharedKVCacheLinearDraftMetadata,
         SharedKVCacheStandaloneDSparkDraftMetadata,
         StandaloneDSparkDraftMetadata,
@@ -262,12 +264,18 @@ def build_feature_attention_metadata(
                 if has_separate_draft_cache
                 else SharedKVCacheStandaloneDSparkDraftMetadata
             )
+        elif spec_dec_mode.is_dflash():
+            metadata_types.append(
+                DFlashDraftMetadata
+                if has_separate_draft_cache
+                else SharedKVCacheDFlashDraftMetadata
+            )
         elif spec_dec_mode.is_sa():
             metadata_types.append(SuffixAutomatonDraftMetadata)
         else:
             raise UnsupportedMetadataConfiguration(
                 f"the speculative decoding mode {spec_dec_mode.name} (linear MTP-Eagle and "
-                "Eagle3 one-model, DSpark and the suffix automaton are covered)"
+                "Eagle3 one-model, DFlash, DSpark and the suffix automaton are covered)"
             )
         max_draft_tokens = spec_config.max_draft_len
 
