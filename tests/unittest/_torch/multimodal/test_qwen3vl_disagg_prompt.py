@@ -271,7 +271,8 @@ def test_external_embeddings_reuse_common_item_metadata(model):
         text_config=SimpleNamespace(hidden_size=16),
         vision_config=SimpleNamespace(deepstack_visual_indexes=[], spatial_merge_size=2),
     )
-    processor._tokenizer = _FakeTokenizer([11, _IMAGE_TOKEN_ID, 12, _IMAGE_TOKEN_ID, 13])
+    tokens = [11, *([_IMAGE_TOKEN_ID] * 4), 12, *([_IMAGE_TOKEN_ID] * 9), 13]
+    processor._tokenizer = Mock(return_value=SimpleNamespace(input_ids=torch.tensor([tokens])))
     mrope_config = {"mrope_position_deltas": torch.zeros(1, dtype=torch.int32)}
     processor.get_mrope_config = lambda *args: mrope_config
     embeddings = [torch.ones(4, 16), torch.ones(9, 16)]
@@ -280,12 +281,16 @@ def test_external_embeddings_reuse_common_item_metadata(model):
         {"mm_embeddings": embeddings[1], "image_grid_thw": [1, 6, 6]},
     ]
 
-    tokens, extra = processor.attach_multimodal_embeddings(
-        {"prompt": "video prompt"}, {"image": items}, SamplingParams()
+    result, extra = processor.attach_multimodal_embeddings(
+        {
+            "prompt": "<|vision_start|><|image_pad|><|vision_end|> and <|vision_start|><|image_pad|><|vision_end|>"
+        },
+        {"image": items},
+        SamplingParams(),
     )
     params = MultimodalParams(multimodal_data=extra["multimodal_data"])
 
-    assert tokens == [11, *([_IMAGE_TOKEN_ID] * 4), 12, *([_IMAGE_TOKEN_ID] * 9), 13]
+    assert result == tokens
     assert params.get_item_layout() == ((("image", 0), ("image", 1)), (4, 9))
     assert params.multimodal_data["multimodal_embedding"] == embeddings
     assert params.multimodal_data["mrope_config"] is mrope_config

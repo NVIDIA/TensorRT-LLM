@@ -60,7 +60,7 @@ def test_qwen3_vl_attach_multimodal_embeddings_builds_mrope_config():
     tokenizer = _make_tokenizer([
         7,
         config.vision_start_token_id,
-        config.image_token_id,
+        *([config.image_token_id] * 4),
         config.vision_end_token_id,
         8,
     ])
@@ -73,7 +73,10 @@ def test_qwen3_vl_attach_multimodal_embeddings_builds_mrope_config():
     ).reshape(num_image_tokens, expected_embedding_width)
 
     prompt_token_ids, extra_processed_inputs = processor.attach_multimodal_embeddings(
-        {"prompt": "Describe this image."},
+        {
+            "prompt":
+            "<|vision_start|><|image_pad|><|vision_end|>Describe this image."
+        },
         {
             "image": [{
                 "mm_embeddings": image_embedding,
@@ -96,7 +99,8 @@ def test_qwen3_vl_attach_multimodal_embeddings_builds_mrope_config():
         config.vision_end_token_id,
         8,
     ]
-    tokenizer.assert_called_once_with("Describe this image.",
+    tokenizer.assert_called_once_with("<|vision_start|>" + "<|image_pad|>" * 4 +
+                                      "<|vision_end|>Describe this image.",
                                       return_tensors="pt")
 
     multimodal_data = extra_processed_inputs["multimodal_data"]
