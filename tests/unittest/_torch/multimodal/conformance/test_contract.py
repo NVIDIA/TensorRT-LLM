@@ -42,7 +42,7 @@ _FIELDS = {"base", "fixture"} | {f for f, (tier, _) in FEATURE_TIERS.items() if 
 # entries lowers these; the snapshot never grows.
 _SNAPSHOT_SIZES = {
     "SNAPSHOT_KEYS": 56,
-    "KNOWN_OPT_OUTS": 225,
+    "KNOWN_OPT_OUTS": 224,
     "NOT_ON_BASE": 36,
     "MISSING_FIXTURE": 34,
 }
@@ -77,7 +77,7 @@ def _contract_problems(key: Key, entry: ModelEntry | None) -> list[str]:
             problems.append(f"{where}: P0 contract: {name} cannot gain a key (see {_SKILL})")
 
     if not entry.media:
-        # The executor owns V2 admission. Its behavior is exercised in test_admission.py.
+        # test_admission.py tracks payloads that reach forward until #22450.
         for name in ("KNOWN_OPT_OUTS", "NOT_ON_BASE", "MISSING_FIXTURE"):
             if key in snapshots[name]:
                 problems.append(f"{where}: text-only target in {name}: stale entry, delete it")
@@ -121,6 +121,7 @@ def _contract_problems(key: Key, entry: ModelEntry | None) -> list[str]:
         feature: entry.model_cls is not None and supports_feature(entry.model_cls, feature)
         for feature in Feature
         if FEATURE_TIERS[feature][0] != "P2"
+        and (new or feature not in NOT_DERIVABLE or feature in declared)
     }
     if new:
         # A tower can declare an empty set of selectable backends for fixed attention.
@@ -132,7 +133,7 @@ def _contract_problems(key: Key, entry: ModelEntry | None) -> list[str]:
         tier = FEATURE_TIERS[feature][0]
         label = f"{where}: {tier} feature '{feature}'"
         if supported:
-            if feature in approved or (feature in known and feature not in NOT_DERIVABLE):
+            if (feature in known or feature in approved) and feature not in NOT_DERIVABLE:
                 problems.append(f"{label} is supported: stale entry, delete it")
         elif feature in known or feature in approved:
             continue
@@ -229,6 +230,30 @@ def test_route_returns_account_for_every_target(body: str, message: str) -> None
         _returns(f"@routes('Example')\ndef route():\n{body}", "example")
 
 
+def test_delegated_media_forward_under_a_new_route(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Expose the same MiniMax implementation under a second deployment name.
+    dep = gaps._MINIMAX_DEP.split("/")[1]
+    alias = "additional_deployment"
+    resolve = models.resolve_name
+
+    def routed_targets(source, where):
+        targets = _returns(source, where)
+        if dep in targets:
+            targets[alias] = targets[dep]
+        return targets
+
+    monkeypatch.setattr(models, "_returns", routed_targets)
+    monkeypatch.setattr(
+        models, "resolve_name", lambda name, package: resolve(name.replace(alias, dep), package)
+    )
+    entries = inventory.__wrapped__()
+    arch = "MiniMaxM3SparseForConditionalGeneration"
+    key = (arch, f"minimax_m3/{alias}")
+    assert entries[key].media
+    assert any("requires supports_multimodal" in p for p in _contract_problems(key, entries[key]))
+    assert not entries[arch, f"minimax_m3/{dep}2ctx"].media
+
+
 class _Model:
     supports_multimodal = True
     supports_mm_encoder_item_scheduling = True
@@ -268,6 +293,19 @@ def test_new_model_requirements(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     with pytest.warns(UserWarning, match=r"ExampleVL: approved encoder_cache: .*TRTLLM-1234"):
         assert _contract_problems(_KEY, _entry()) == []
+
+
+def test_graph_declarations_do_not_clear_media_gaps(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLModel
+
+    key = ("Qwen3VLForConditionalGeneration", None)
+    features = {Feature.LLM_BREAKABLE_CUDA_GRAPH, Feature.LLM_PIECEWISE_CUDA_GRAPH}
+    monkeypatch.setattr(
+        Qwen3VLModel, "supports_multimodal_breakable_cuda_graph", True, raising=False
+    )
+    monkeypatch.setitem(gaps.KNOWN_OPT_OUTS, key, gaps.KNOWN_OPT_OUTS[key] | features)
+    assert all(supports_feature(Qwen3VLModel, feature) for feature in features)
+    assert _contract_problems(key, inventory()[key]) == []
 
 
 @pytest.mark.parametrize("hook", ["multimodal_opt_outs", "multimodal_feature_limits"])

@@ -275,7 +275,7 @@ Use expected performance gain and implementation effort to choose a feature's ti
 - **P1 is the next follow-up.** If a model skips a feature, record a reason and a TRTLLM issue or nvbug ID in `multimodal_opt_outs`.
 - **P2 is optional.** A model may omit these features.
 
-Engine settings select which eligible features run. CI checks class declarations, processor hooks and recorded exceptions. Shared V2 base and admission coverage follows #22450. Both decoder graph requirements take effect after #21333, and encoder DP after #17330. Tiny model fixtures are a separate follow-up. Explicit P0 opt-outs still need approval. Check media replay, chunk boundaries and KV reuse with model inputs on GPU.
+Engine settings select which eligible features run. CI checks class declarations, processor hooks and recorded exceptions. The shared V2 base and central admission rule follow #22450. CPU tests track text-only targets that currently admit unsupported payloads. Existing models can support decoder compilation or tower sharding before adopting the protocol marker. Both decoder graph requirements are deferred under #21333. Retire a media replay or piecewise gap when the target and backend pass the corresponding behavior check. Encoder DP follows #17330. Tiny model fixtures are a separate follow-up. Explicit P0 opt-outs still need approval. Check media replay, chunk boundaries and KV reuse with model inputs on GPU.
 
 <!-- BEGIN multimodal-feature-tiers -->
 | Feature | Tier | What the model must provide |
@@ -286,12 +286,12 @@ Engine settings select which eligible features run. CI checks class declarations
 | `encoder_cache` | P0 | Return complete item embeddings with exact counts and stable keys. Enable reuse with a positive cache budget and, in #22450, a local encoder. |
 | `chunked_prefill_media` | P0 | Count tokens per supported modality and fuse only the embeddings in the current chunk. Handle model-specific slicing when encoding changes lengths. |
 | `kv_reuse_media` | P0 | Supply token counts and placeholder geometry so the runtime can key media spans by content hash or UUID. |
-| `llm_breakable_cuda_graph` | P0 | Declare media replay on the wrapper. The engine checks the decoder, pipeline size and layer registry. Enforce after #21333. |
-| `llm_piecewise_cuda_graph` | P0 | Use native decoder compilation or compile only the wrapped decoder. Enforce after #21333. |
+| `llm_breakable_cuda_graph` | P0 | Declare graph support on the wrapper and stage media inputs for replay. The engine checks the decoder, pipeline size and layer registry. Enforce after #21333. |
+| `llm_piecewise_cuda_graph` | P0 | Accept piecewise prefill on the target route and compile only the decoder, native or wrapped. Enforce after #21333. |
 | `encoder_dp` | P0 | Declare supports_mm_encoder_data_parallel and build replicas from the encoder config. Enforce after #17330. |
 | `item_scheduling` | P1 | Declare item scheduling and supply costs, profiling inputs and budgets. Override attention capacity when geometry requires it. Moves to P0 when costs can be derived. |
-| `supports_vision_gpu_normalize` | P1 | Skip CPU rescaling and normalization on the GPU path. Preserve the processor statistics, input dtype and layout. |
-| `encoder_attention_backend` | P1 | Declare selectable backends per tower, or an empty set for fixed attention. Size metadata at setup and refresh it on each forward. |
+| `supports_vision_gpu_normalize` | P1 | Skip CPU rescaling and normalization on the GPU path. Preserve processor statistics, input dtype and layout through per-item selection. |
+| `encoder_attention_backend` | P1 | Declare selectable backends per tower, or an empty set for fixed attention. Size metadata at setup. Per-forward metadata refresh (C3) has an estimated P0 tier. |
 | `disagg_p_to_d` | P1 | Transfer positions and deltas for mRoPE models. Preserve media identity and spans when reusing KV across workers. |
 | `mm_encoder_groups` | P2 | Batch compatible items across requests. Moves to P1 when #21052 supplies the default partition-based builder. |
 | `encoder_cuda_graph` | P2 | Capture tower blocks and check model accuracy. Moves to P1 when a default block adapter is available. |

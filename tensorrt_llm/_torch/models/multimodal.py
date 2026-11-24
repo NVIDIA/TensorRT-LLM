@@ -209,8 +209,8 @@ def supports_feature(
     """Read class declarations or inspect a built model under its deployment limits.
 
     Encoder TP requires local tower weights sharded by their encoder mapping.
-    The breakable graph declaration is on the wrapper. At startup the engine also
-    validates the decoder instance and its layer registries before allowing replay.
+    Graph queries report the wrapper's breakable declaration or decoder compile scope.
+    Media replay also requires input staging, and the route must accept the chosen backend.
     """
     model = None
     if not isinstance(model_cls, type):

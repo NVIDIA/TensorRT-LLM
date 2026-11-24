@@ -390,7 +390,7 @@ extra host sync under overlap costs throughput only, which no gate sees.
 
 In #22450 a media-serving V2 target inherits `MultimodalModelForCausalLM`. Set `llm_class` and declare each tower in `mm_encoders` with `MultimodalEncoderSpec(cls, weight_prefix, modalities)`. The mixin dispatches the towers and fuses embeddings in prompt order. With `llm_requires_input_ids`, it calls the decoder with the original IDs, `mm_embeds` and `mm_token_indices`.
 
-V2 admission requires a local encoder for raw media. Precomputed embeddings require a multimodal V2 target on a split encoder/prefill deployment. Position-only M-RoPE requests pass. V1 models keep their own validators. CI checks this behavior at admission when the V2 composite is available.
+The central V2 rule in #22450 requires a local encoder for raw media. Precomputed embeddings require a multimodal V2 target on a split encoder/prefill deployment. Position-only M-RoPE requests pass. V1 models keep their own validators. CPU tests track text-only targets that admit unsupported payloads on the standalone head and check the central rule on #22450. Retire graph gaps when the selected route accepts the backend and the model stages media for breakable replay or compiles only the decoder for piecewise prefill.
 
 V2 uses the same tiers, based on performance gain and implementation effort. P0 is required for every new model. Skipping a P0 feature needs an owner-approved entry in `APPROVED_EXCEPTIONS`. P1 is the next follow-up. Record a reason and tracking ID in `multimodal_opt_outs` for each P1 feature the model skips. P2 is optional. See the [multimodal onboarding tiers](../../../../../../../../.claude/skills/trtllm-model-onboard-multimodal/SKILL.md#multimodal-feature-tiers).
 
@@ -403,12 +403,12 @@ V2 uses the same tiers, based on performance gain and implementation effort. P0 
 | `encoder_cache` | P0 | Return complete item embeddings with exact counts and stable keys. Enable reuse with a positive cache budget and, in #22450, a local encoder. |
 | `chunked_prefill_media` | P0 | Count tokens per supported modality and fuse only the embeddings in the current chunk. Handle model-specific slicing when encoding changes lengths. |
 | `kv_reuse_media` | P0 | Supply token counts and placeholder geometry so the runtime can key media spans by content hash or UUID. |
-| `llm_breakable_cuda_graph` | P0 | Declare media replay on the wrapper. The engine checks the decoder, pipeline size and layer registry. Enforce after #21333. |
-| `llm_piecewise_cuda_graph` | P0 | Use native decoder compilation or compile only the wrapped decoder. Enforce after #21333. |
+| `llm_breakable_cuda_graph` | P0 | Declare graph support on the wrapper and stage media inputs for replay. The engine checks the decoder, pipeline size and layer registry. Enforce after #21333. |
+| `llm_piecewise_cuda_graph` | P0 | Accept piecewise prefill on the target route and compile only the decoder, native or wrapped. Enforce after #21333. |
 | `encoder_dp` | P0 | Declare supports_mm_encoder_data_parallel and build replicas from the encoder config. Enforce after #17330. |
 | `item_scheduling` | P1 | Declare item scheduling and supply costs, profiling inputs and budgets. Override attention capacity when geometry requires it. Moves to P0 when costs can be derived. |
-| `supports_vision_gpu_normalize` | P1 | Skip CPU rescaling and normalization on the GPU path. Preserve the processor statistics, input dtype and layout. |
-| `encoder_attention_backend` | P1 | Declare selectable backends per tower, or an empty set for fixed attention. Size metadata at setup and refresh it on each forward. |
+| `supports_vision_gpu_normalize` | P1 | Skip CPU rescaling and normalization on the GPU path. Preserve processor statistics, input dtype and layout through per-item selection. |
+| `encoder_attention_backend` | P1 | Declare selectable backends per tower, or an empty set for fixed attention. Size metadata at setup. Per-forward metadata refresh (C3) has an estimated P0 tier. |
 | `disagg_p_to_d` | P1 | Transfer positions and deltas for mRoPE models. Preserve media identity and spans when reusing KV across workers. |
 | `mm_encoder_groups` | P2 | Batch compatible items across requests. Moves to P1 when #21052 supplies the default partition-based builder. |
 | `encoder_cuda_graph` | P2 | Capture tower blocks and check model accuracy. Moves to P1 when a default block adapter is available. |

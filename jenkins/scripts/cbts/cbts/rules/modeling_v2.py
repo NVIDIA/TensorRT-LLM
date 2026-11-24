@@ -87,9 +87,10 @@ is also kept for every modeling_v2 change.
 
 The multimodal conformance suite (`unittest/_torch/multimodal/conformance`)
 reads every route and the targets of vision-language architectures. A shared
-file, a `routing.py`, or a file of a target whose files import the multimodal
-contract (`tensorrt_llm._torch.models.multimodal` or the subtree's
-`multimodal.py`) also selects the CPU stage's entry that covers the suite.
+file, a route, or Python code in a family outside the known text-only families
+also selects the CPU entry that covers the suite. This includes base classes
+imported by a routed target. Files of targets that import the multimodal
+contract select it as well.
 
 A unit test prefix that no entry of a block sits at or under keeps the
 longest entry of that block that covers it instead, such as a directory
@@ -154,6 +155,8 @@ _IGNORE = re.compile(r"--ignore=(\S+)")
 
 _UNIT_ROOT = "unittest/_torch/modeling_v2"
 _MULTIMODAL_CONFORMANCE = "unittest/_torch/multimodal/conformance"
+# These routed architectures have no multimodal processor. Include new families by default.
+_TEXT_ONLY_FAMILIES = {"deepseek_v3", "glm_moe_dsa", "gpt_oss"}
 _MULTIMODAL_CONTRACT = ("tensorrt_llm._torch.models.multimodal", f"{PACKAGE}.multimodal")
 _ACCURACY_ROOT = "accuracy/modeling_v2"
 _PKG_MODULE = PACKAGE
@@ -499,8 +502,7 @@ class ModelingV2Rule(Rule):
     def _reaches_multimodal_contract(self, path: str) -> bool:
         """Whether a changed file can change what the multimodal conformance suite reads.
 
-        That is a shared file, a route, or a file of a target whose own files import
-        the multimodal contract (only the file itself for family code).
+        The inventory reads routed implementations even when they predate the protocol.
         """
         if not path.startswith(_MV2_SRC_PREFIXES[0]):
             return False
@@ -508,6 +510,8 @@ class ModelingV2Rule(Rule):
         if _is_shared(rel) or rel.name == "routing.py":
             return True
         parts = rel.parts
+        if parts[0] == "models" and rel.suffix == ".py" and parts[1] not in _TEXT_ONLY_FAMILIES:
+            return True
         if parts[0] == "models" and len(parts) > 3 and self._is_target(parts[1], parts[2]):
             unit = PurePosixPath(*parts[:3])
         elif rel.suffix == ".py":

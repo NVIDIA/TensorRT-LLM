@@ -37,12 +37,13 @@ FEATURE_TIERS = {
     ),
     F.LLM_BREAKABLE_CUDA_GRAPH: (
         "P0",
-        "Declare media replay on the wrapper. The engine checks the decoder, pipeline size and "
-        "layer registry. Enforce after #21333.",
+        "Declare graph support on the wrapper and stage media inputs for replay. The engine checks "
+        "the decoder, pipeline size and layer registry. Enforce after #21333.",
     ),
     F.LLM_PIECEWISE_CUDA_GRAPH: (
         "P0",
-        "Use native decoder compilation or compile only the wrapped decoder. Enforce after #21333.",
+        "Accept piecewise prefill on the target route and compile only the decoder, native or "
+        "wrapped. Enforce after #21333.",
     ),
     F.ENCODER_DP: (
         "P0",
@@ -56,13 +57,13 @@ FEATURE_TIERS = {
     ),
     "supports_vision_gpu_normalize": (
         "P1",
-        "Skip CPU rescaling and normalization on the GPU path. Preserve the processor "
-        "statistics, input dtype and layout.",
+        "Skip CPU rescaling and normalization on the GPU path. Preserve processor statistics, "
+        "input dtype and layout through per-item selection.",
     ),
     "encoder_attention_backend": (
         "P1",
         "Declare selectable backends per tower, or an empty set for fixed attention. Size "
-        "metadata at setup and refresh it on each forward.",
+        "metadata at setup. Per-forward metadata refresh (C3) has an estimated P0 tier.",
     ),
     F.DISAGG_P_TO_D: (
         "P1",
@@ -100,10 +101,11 @@ STRUCTURAL_ONLY = {
     "fixture": "Require per-target behavior fixtures when the tiny reference model is available.",
 }
 
-# No class flag shows these on main, so a class is eligible unless it opts out. Their
-# snapshot entries come from the reviewed support matrix and are never reported as stale;
-# the check named here deletes them when it lands.
+# Class declarations cannot settle these gaps. The snapshot records the reviewed
+# behavior until a test for the target and deployment verifies the feature.
 NOT_DERIVABLE = {
+    F.LLM_BREAKABLE_CUDA_GRAPH: "Replay a media request through the selected backend.",
+    F.LLM_PIECEWISE_CUDA_GRAPH: "Route the piecewise backend and compile only the decoder.",
     F.CHUNKED_PREFILL_MEDIA: "The one-GPU chunked prefill check.",
     F.KV_REUSE_MEDIA: "The one-GPU KV reuse check.",
     F.DISAGG_P_TO_D: "The decode state export and restore check.",

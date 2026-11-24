@@ -31,7 +31,6 @@ _ROOT = Path(__file__).resolve().parents[5]
 _V2_MODULE = "tensorrt_llm._torch.modeling_v2.multimodal"
 _V2_BASE = import_module(_V2_MODULE).MultimodalModelForCausalLM if find_spec(_V2_MODULE) else None
 TINY_CONFIGS: dict[Key, str] = {}
-_MINIMAX_DEP = "minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__dep"
 _B300_TARGETS = {
     "qwen4_exp/qwen3_8_flash_next_fp8__sm_10x__default",
     "qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default",
@@ -146,7 +145,7 @@ def _contract_in_source(module: str, name: str) -> bool:
     return False
 
 
-def _target(module: str, name: str, registered_cls: type | None = None) -> tuple[type | None, bool]:
+def _target(module: str, name: str, registered_cls: type) -> tuple[type | None, bool]:
     """The class when it declares the contract, and whether the routed target serves media."""
     if _contract_in_source(module, name):
         try:
@@ -171,8 +170,8 @@ def _target(module: str, name: str, registered_cls: type | None = None) -> tuple
     )
     calls = [node for node in ast.walk(forward or ast.Pass()) if isinstance(node, ast.Call)]
     media = any(getattr(call.func, "attr", None) == "multimodal_embeds" for call in calls)
-    # This pre-marker MiniMax target passes its forward kwargs to the registered media model.
-    if registered_cls is not None and forward and forward.args.kwarg:
+    # A routed subclass can pass the media through to its registered parent's forward.
+    if forward and forward.args.kwarg:
         media = media or (
             any(
                 isinstance(base, ast.Name)
@@ -226,7 +225,7 @@ def inventory() -> dict[Key, ModelEntry]:
         for directory, name in _returns(inspect.getsource(route), route.__module__).items():
             target = f"{family}/{directory}"
             module = resolve_name(f".{directory}.modeling", route.__module__.rpartition(".")[0])
-            target_cls, media = _target(module, name, cls if target == _MINIMAX_DEP else None)
+            target_cls, media = _target(module, name, cls)
             fixture = TINY_CONFIGS.get((arch, target))
             job = f"unittest/_torch/modeling_v2/models/{target}"
             if target in _B300_TARGETS and job in listed:

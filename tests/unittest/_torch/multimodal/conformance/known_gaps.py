@@ -5,13 +5,14 @@ The change that adds support deletes its entry, and test_contract.py holds the s
 The multimodal owners review changes to this file.
 """
 
-from _torch.multimodal.conformance.models import _MINIMAX_DEP, Key
+from _torch.multimodal.conformance.models import Key
 
 from tensorrt_llm._torch.models.multimodal import MultimodalFeature as F
 
 _GLM = "Glm5NextForConditionalGeneration"
 _KIMI = "KimiK3ForConditionalGeneration"
 _MINIMAX = "MiniMaxM3SparseForConditionalGeneration"
+_MINIMAX_DEP = "minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__dep"
 _QWEN = "Qwen4ExpForConditionalGeneration"
 _QWEN_FP8 = "qwen4_exp/qwen3_8_flash_next_fp8__sm_10x__default"
 _QWEN_NVFP4 = "qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default"
@@ -129,7 +130,7 @@ KNOWN_OPT_OUTS: dict[Key, frozenset[F]] = {
     ("HCXVisionForCausalLM", None): _UNMARKED,
     ("KimiK25ForConditionalGeneration", None): _UNMARKED,
     (_KIMI, None): _UNMARKED,
-    ("Llama4ForConditionalGeneration", None): _UNMARKED,
+    ("Llama4ForConditionalGeneration", None): _UNMARKED - {F.LLM_PIECEWISE_CUDA_GRAPH},
     ("LlavaLlamaModel", None): _UNMARKED,
     ("LlavaNextForConditionalGeneration", None): _UNMARKED,
     ("MiniCPMV4_6ForConditionalGeneration", None): _UNMARKED,

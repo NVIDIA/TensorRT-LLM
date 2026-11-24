@@ -60,15 +60,18 @@ from tensorrt_llm._torch.models.modeling_kimi_k25 import (
     KimiK25VisionModel,
     _frames_to_chunks,
 )
+from tensorrt_llm._torch.models.modeling_multimodal_encoder import _has_sharded_encoder_weights
 from tensorrt_llm._torch.models.modeling_utils import MetaInitMode, get_registered_model_class
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import torch_dtype_to_binding
+from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.inputs import create_input_processor
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.mapping import Mapping
 
 # ---------------------------------------------------------------------------
 # Model path — needed for tokenizer / processor loading
@@ -216,6 +219,40 @@ def _build_hf_config():
     config.text_config = text_config
     config.vision_config = vision_dict
     return config
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("replicated", [False, True])
+def test_encoder_tp_uses_loaded_vision_projection(replicated: bool) -> None:
+    cls = get_registered_model_class("KimiK25ForConditionalGeneration")
+    assert cls is KimiK25ForConditionalGeneration
+    config = PretrainedConfig(
+        dtype=torch.float32,
+        vision_config=dict(
+            hidden_size=8,
+            num_attention_heads=2,
+            num_hidden_layers=0,
+            text_hidden_size=8,
+            merge_kernel_size=(1, 1),
+        ),
+    )
+    weight = torch.arange(64, dtype=torch.float32).reshape(8, 8)
+    for rank in range(2):
+        model = object.__new__(cls)
+        torch.nn.Module.__init__(model)
+        model.model_config = ModelConfig(
+            pretrained_config=config,
+            allreduce_strategy=AllReduceStrategy.NCCL,
+            mapping=Mapping(world_size=2, tp_size=2, rank=rank, enable_attention_dp=replicated),
+        )
+        with mock.patch("tensorrt_llm._torch.distributed.ops.get_allreduce_workspace"):
+            model.mm_encoder = KimiK25VisionModel(model.model_config)
+        projection = model.mm_encoder.mm_projector.proj[0]
+        projection.weight.data.copy_(projection.load_shard(weight))
+        torch.testing.assert_close(
+            projection.weight, weight if replicated else weight.chunk(2)[rank]
+        )
+        assert _has_sharded_encoder_weights(model) is (not replicated)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

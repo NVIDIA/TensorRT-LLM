@@ -39,7 +39,10 @@ from tensorrt_llm._torch.models.modeling_qwen3vl import (
     _triton_pos_embed_interpolate,
 )
 from tensorrt_llm._torch.models.modeling_qwen3vl_moe import Qwen3MoeVLModel
-from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
+from tensorrt_llm._torch.models.modeling_utils import (
+    DecoderModelForCausalLM,
+    get_registered_model_class,
+)
 from tensorrt_llm._torch.models.multimodal import MultimodalFeature, supports_feature
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
@@ -140,34 +143,35 @@ class TestQwen3VLScenario(MultimodalScenario):
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("native", [True, False], ids=["native", "wrapper"])
-def test_piecewise_graph_compiles_only_the_decoder(native: bool) -> None:
-    class Decoder(DecoderModelForCausalLM):
-        supports_multimodal = True
-
-    decoder = object.__new__(Decoder)
-    torch.nn.Module.__init__(decoder)
-    decoder.model = scope = torch.nn.Identity()
-    model = decoder
-    if not native:
-        model = object.__new__(Qwen3VLModel)
-        torch.nn.Module.__init__(model)
+@pytest.mark.parametrize(
+    "arch", ["Llama4ForConditionalGeneration", "Qwen3VLForConditionalGeneration"]
+)
+def test_piecewise_graph_compiles_only_the_decoder(arch: str) -> None:
+    cls = get_registered_model_class(arch)
+    assert cls is not None
+    model = object.__new__(cls)
+    torch.nn.Module.__init__(model)
+    decoder = model
+    if not isinstance(model, DecoderModelForCausalLM):
+        decoder = object.__new__(DecoderModelForCausalLM)
+        torch.nn.Module.__init__(decoder)
         model.llm = decoder
+    decoder.model = scope = torch.nn.Identity()
     model.mm_encoder = torch.nn.Identity()
     args = SimpleNamespace(
         prefill_cuda_graph_backend=PrefillCudaGraphBackend.PIECEWISE,
         torch_compile_config=SimpleNamespace(compile_only_piecewise_graphs=False),
     )
-    assert supports_feature(type(model), MultimodalFeature.LLM_PIECEWISE_CUDA_GRAPH)
     with patch("torch.compile", return_value=torch.nn.Identity()) as compile_scope:
         apply_torch_compile(model, "eager", llm_args=args, fullgraph=False)
     compile_scope.assert_called_once_with(scope, backend="eager", fullgraph=False)
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("variant", ["qwen2.5", "exaone4_5"])
 @pytest.mark.parametrize("needs_override", [False, True])
-def test_item_scheduling_window_geometry_capacity(needs_override: bool) -> None:
-    processor, _ = _make_qwen_vl_embedding_processor("qwen2.5", [])
+def test_item_scheduling_window_geometry_capacity(variant: str, needs_override: bool) -> None:
+    processor, _ = _make_qwen_vl_embedding_processor(variant, [])
     cfg = processor.config.vision_config
     cfg.patch_size = 1
     cfg.window_size = 2 if needs_override else 8
