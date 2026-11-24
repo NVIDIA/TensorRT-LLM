@@ -1339,14 +1339,13 @@ class Sender(SenderBase):
             failures[name] = failures.get(name, 0) + 1
             rebuilt_for = self.__dict__.setdefault("_peer_rebuild_descriptors", {})
             recover = getattr(self, "_recover_agent", None)
-            receives_active = getattr(self, "_receives_active", None)
             if (
                 recover is None
                 or failures[name] < _PEER_LOAD_ATTEMPTS_BEFORE_RECOVERY
                 or rebuilt_for.get(name) == descriptor
                 # A rebuild waits for every receive to retire while all sends stay
                 # fenced; keep this failure peer-local until it can run promptly.
-                or (receives_active is not None and receives_active())
+                or not self._fence_agent_unless_receiving()
             ):
                 if failures[name] == 1:
                     logger.warning(f"Loading NIXL metadata for peer {name} failed: {error}")
@@ -1362,8 +1361,6 @@ class Sender(SenderBase):
             )
             rebuilt_for[name] = descriptor
             failures.clear()
-            with self._admission_lock:
-                self._agent_failed = True
             recover(self._agent_generation)
             return
         getattr(self, "_peer_load_failures", {}).pop(name, None)
@@ -1371,6 +1368,19 @@ class Sender(SenderBase):
         self._remote_agent_descriptors[name] = descriptor
         self._loaded_remote_agents.add(name)
         del self._deferred_remote_agents[name]
+
+    def _fence_agent_unless_receiving(self) -> bool:
+        """Close send and receive admission unless a receive may hold published destinations."""
+
+        def fence() -> None:
+            with self._admission_lock:
+                self._agent_failed = True
+
+        fence_unless_receiving = getattr(self, "_fence_unless_receiving", None)
+        if fence_unless_receiving is None:
+            fence()
+            return True
+        return fence_unless_receiving(fence)
 
     @contextmanager
     def _peer_transfers(self, requests: tuple[TransferRequest, ...]):
@@ -1585,12 +1595,12 @@ class Sender(SenderBase):
                             on_submitted()
                     if not status.wait():
                         detail = getattr(status, "last_status_str", lambda: None)()
+                        # The drain ACK may take a transfer timeout; the caller retains
+                        # the status for _poll_in_doubt_transfers instead of blocking here.
                         if (
                             member.op == TransferOp.WRITE
                             and getattr(self._agent, "bounce_enabled", False) is True
-                            and not status.wait_for_bounce_scatter_drain(
-                                max(1, int(self._retirement_timeout_s * 1000))
-                            )
+                            and not status.wait_for_bounce_scatter_drain(0)
                         ):
                             raise _DestinationDrainUnproven(detail, status)
                         return False, detail
@@ -4525,6 +4535,11 @@ class Receiver(ReceiverBase):
             raise ValueError("ctx_info_endpoint is required")
         return ep  # str (backward compat)
 
+    def _local_agent_generation(self) -> int:
+        sender_ref = getattr(self, "_recovery_sender", None)
+        sender = sender_ref() if sender_ref is not None else None
+        return 0 if sender is None else sender._agent_generation
+
     def _should_register_peer(self, params: DisaggregatedParams) -> bool:
         endpoint = self._extract_info_endpoint(params)
         return endpoint not in self._sender_ep_instance_map
@@ -4635,13 +4650,19 @@ class Receiver(ReceiverBase):
                 self._incompatible_peers[info_endpoint] = msg
                 raise PeerIncompatibleError(msg) from e
 
-            for endpoint in sender_info.sender_endpoints:
-                dealer = self._get_or_connect_dealer(endpoint)
-                rank_info = self._registrar.self_rank_info
-                dealer.send([MessageType.REGISTER_RANK_INFO, rank_info.to_bytes()])
-
-            self._sender_ep_instance_map[info_endpoint] = sender_info
-            return sender_info
+            while True:
+                # Agent recovery replaces the local descriptor and clears this cache under
+                # _sessions_lock; a registration that raced it is sent again.
+                with self._sessions_lock:
+                    generation = self._local_agent_generation()
+                    registration = self._registrar.self_rank_info.to_bytes()
+                for endpoint in sender_info.sender_endpoints:
+                    dealer = self._get_or_connect_dealer(endpoint)
+                    dealer.send([MessageType.REGISTER_RANK_INFO, registration])
+                with self._sessions_lock:
+                    if self._local_agent_generation() == generation:
+                        self._sender_ep_instance_map[info_endpoint] = sender_info
+                        return sender_info
 
         else:
             return self._sender_ep_instance_map[info_endpoint]
@@ -4666,13 +4687,23 @@ class Receiver(ReceiverBase):
                 logger.warning(f"send_cancel_to_senders: failed for rid={unique_rid}: {e}")
         return sent
 
-    def has_live_sessions(self) -> bool:
-        """Whether any receive session may still hold published destinations."""
+    def run_without_live_sessions(self, action: Callable[[], None]) -> bool:
+        """Run ``action`` unless a receive session may still hold published destinations.
+
+        ``action`` runs under the lock ``setup_session`` admits under, so no receive is
+        admitted between the check and ``action``.
+
+        Returns:
+            Whether ``action`` ran.
+        """
         with self._sessions_lock:
-            return any(
+            if any(
                 not isinstance(entry, weakref.ReferenceType) or entry() is not None
                 for entry in self._sessions.values()
-            )
+            ):
+                return False
+            action()
+            return True
 
     def _start_listener(self):
         def handle_message(messages: list[bytes]) -> bool:
@@ -4864,6 +4895,8 @@ class RxSession(RxSessionBase):
         # wait has run out (see failed_receive_awaits_writers).
         self._writer_wait_start: Optional[float] = None
         self._writer_wait_expired = False
+        # Set when the writer wait expires with an auxiliary writer still silent.
+        self._aux_slot_quarantined = False
         self.transfer_start_time = None
         self.transfer_end_time = None
         self.kv_cache_size_bytes: int = 0
@@ -5511,6 +5544,9 @@ class RxSession(RxSessionBase):
         if not self._enforce_physical_ownership:
             if self._bounce_writers_pending():
                 return False
+            if self._writer_wait_expired and not self._uses_legacy_bounce:
+                # failed_receive_awaits_writers presumed the silent writers gone.
+                return True
             if self._terminal_status == SessionStatus.CANCELLED:
                 return (
                     not any(
@@ -5569,7 +5605,9 @@ class RxSession(RxSessionBase):
         return self._logical_outcomes.failed
 
     def _terminal_aux_awaits_writers(self) -> bool:
-        if self._aux_expected_writers == 0:
+        if self._aux_expected_writers == 0 or (
+            self._writer_wait_expired and not self._uses_legacy_bounce
+        ):
             return False
         first_task = self._kv_tasks[0]
         if (
@@ -5694,11 +5732,13 @@ class RxSession(RxSessionBase):
             return self.has_failed()
         if self._enforce_physical_ownership or not self._logical_outcomes.failed:
             return False
-        if self._terminal_aux_awaits_writers():
+        aux_outstanding = self._terminal_aux_awaits_writers()
+        # A bounce AUX writer reports only after its scatter drained.
+        if aux_outstanding and self._uses_legacy_bounce:
             return True
         if self._writer_wait_expired:
             return False
-        if not any(
+        if not aux_outstanding and not any(
             self._legacy_outstanding_writers(task)
             if (self._legacy_quiesced_writers or task._unsubmitted_writers)
             and task._kv_result_report_tokens
@@ -5715,6 +5755,7 @@ class RxSession(RxSessionBase):
         if waited_s <= self._timeout_s * self._WRITER_WAIT_TIMEOUT_MULTIPLIER:
             return True
         self._writer_wait_expired = True
+        self._aux_slot_quarantined = aux_outstanding
         logger.warning(
             f"RxSession {self.disagg_request_id}: a writer has not reported {waited_s:.0f}s "
             "after the receive failed; retiring it without that writer's result"
@@ -5814,7 +5855,18 @@ class RxSession(RxSessionBase):
                     return False
                 self._closed = True
         if self._aux_buffer is not None and self.aux_slot is not None:
-            self._aux_buffer.free_slot(self.aux_slot)
+            if getattr(self, "_aux_slot_quarantined", False):
+                # The receive retires without a silent writer's auxiliary result, but
+                # that writer may still admit its write: an unaffected context session
+                # is not told this receive failed, and nothing here can revoke the
+                # registered slot it holds. The slot is never reused, so a late write
+                # cannot corrupt another request; it stays allocated until restart.
+                logger.warning(
+                    f"RxSession {self.disagg_request_id}: quarantining auxiliary slot "
+                    f"{self.aux_slot} that a silent writer may still write"
+                )
+            else:
+                self._aux_buffer.free_slot(self.aux_slot)
             self.aux_slot = None
         # Unregister from Receiver; keep fields alive for in-flight listener messages.
         if self._receiver is not None:
@@ -6264,11 +6316,14 @@ class TransferWorker:
                     self._sender._recover_agent = request_recovery
                     receiver_ref = weakref.ref(self._receiver)
 
-                    def receives_active() -> bool:
+                    def fence_unless_receiving(fence: Callable[[], None]) -> bool:
                         receiver = receiver_ref()
-                        return receiver is not None and receiver.has_live_sessions()
+                        if receiver is None:
+                            fence()
+                            return True
+                        return receiver.run_without_live_sessions(fence)
 
-                    self._sender._receives_active = receives_active
+                    self._sender._fence_unless_receiving = fence_unless_receiving
                     self._receiver._recovery_sender = weakref.ref(self._sender)
                 else:
                     logger.warning(
