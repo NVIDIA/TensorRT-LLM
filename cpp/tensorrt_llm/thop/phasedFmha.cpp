@@ -2534,36 +2534,7 @@ std::size_t UnfusedFmha::getWorkspaceSize(MHA const& op, FmhaParams const& p, bo
 
 AttentionContextWorkspaceLayout UnfusedFmha::contextWorkspaceLayout(MHA const& op, FmhaParams const& p) const
 {
-    auto const input_seq_length = static_cast<int32_t>(p.input_seq_length);
-    int32_t const cross_kv_length = op.feature<torch_ext::CrossAttentionFeature>().crossKvLength();
-
-    int const local_hidden_units_qo = op.mNumAttnHeads * op.getHeadSize();
-    int const local_hidden_units_kv = op.mNumAttnKVHeads * op.getHeadSize();
-
-    auto const size = tensorrt_llm::runtime::BufferDataType(p.getType()).getSize();
-
-    auto const batch_size = static_cast<size_t>(p.batch_size);
-    auto const kv_seq_length = (op.isCrossAttention(p) ? cross_kv_length : input_seq_length);
-
-    auto sizes = op.contextWorkspaceSizes(p);
-    // These buffers must upper-bound the carve in runContextImpl, which sizes them by
-    // batch_size * input_seq_length (not num_tokens): with padding removal the actual token count can be
-    // smaller than batch_size * max(context q length), so sizing by num_tokens underestimates.
-    sizes.attentionMask = size * batch_size * input_seq_length * kv_seq_length;
-    sizes.qBuf = size * batch_size * input_seq_length * local_hidden_units_qo;
-    sizes.kBuf = size * batch_size * kv_seq_length * local_hidden_units_kv;
-    sizes.vBuf = size * batch_size * kv_seq_length * local_hidden_units_kv;
-    sizes.qkBuf = size * batch_size * op.num_heads * input_seq_length * kv_seq_length;
-    sizes.qkvBuf = size * batch_size * input_seq_length * local_hidden_units_qo;
-    sizes.qkFloatBuf = sizeof(float) * batch_size * op.num_heads * input_seq_length * kv_seq_length;
-    sizes.fp8QkvBuf = 0;
-    sizes.fp8QBuf = 0;
-    sizes.fp8KBuf = 0;
-    sizes.fp8VBuf = 0;
-    sizes.paddingOffset = sizeof(int) * batch_size * input_seq_length;
-    sizes.encoderPaddingOffset = sizeof(int) * batch_size * cross_kv_length;
-    sizes.fmhaTileCounter = 0;
-    return AttentionWorkspaceManager::buildContextLayout(sizes);
+    return AttentionWorkspaceManager::buildContextLayout(op.contextWorkspaceSizes(p, false));
 }
 
 void UnfusedFmha::runContext(MHA const& op, FmhaParams const& p, cudaStream_t stream)

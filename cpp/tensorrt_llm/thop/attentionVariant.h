@@ -387,9 +387,9 @@ private:
     /// Whether the fused context kernels read Q apart from K/V.
     [[nodiscard]] bool isSeparateQAndKvInput() const;
 
-    /// The fused context workspace slices for this call: the one place they are sized.
+    /// Context workspace slices for the selected fused or unfused library.
     [[nodiscard]] tensorrt_llm::common::op::AttentionContextWorkspaceSizes contextWorkspaceSizes(
-        FmhaParams const& p) const;
+        FmhaParams const& p, bool fused = true) const;
     /// The fused context workspace layout for this call.
     [[nodiscard]] tensorrt_llm::common::op::AttentionContextWorkspaceLayout contextWorkspaceLayout(
         FmhaParams const& p) const;

@@ -102,6 +102,18 @@ if(ENABLE_CUBLASLT_FP4_GEMM)
   target_compile_definitions(tllm_common_cublas PUBLIC ENABLE_CUBLASLT_FP4_GEMM)
 endif()
 
+add_library(tllm_common_attention_workspace STATIC attentionWorkspace.cpp
+                                                   sageScaleGeometry.cpp)
+add_library(tllm::common_attention_workspace ALIAS
+            tllm_common_attention_workspace)
+target_link_libraries(tllm_common_attention_workspace
+                      PUBLIC tllm::common_headers)
+target_include_directories(tllm_common_attention_workspace SYSTEM
+                           PUBLIC ${CUDAToolkit_INCLUDE_DIRS})
+target_compile_features(tllm_common_attention_workspace PUBLIC cxx_std_20)
+set_target_properties(tllm_common_attention_workspace
+                      PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 add_library(
   common_src OBJECT
   cudaArchitectures.cpp
