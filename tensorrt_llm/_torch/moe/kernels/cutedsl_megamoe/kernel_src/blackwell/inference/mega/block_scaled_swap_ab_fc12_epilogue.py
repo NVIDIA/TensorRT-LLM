@@ -44,6 +44,8 @@ from .....helpers.ptx_helpers import (
     cvt_f32_to_fp8_to_f32,
     movmatrix_b16,
     red_add_relaxed_sys_v2_bf16x2,
+    sigmoid_pair_tanh_approx,
+    situ_pair_tanh_approx,
 )
 from .....helpers.smem_workspace import SmemRegion, SmemWorkspace
 from ....function_mapping import CoordinateSpace, FunctionMapping
@@ -987,6 +989,10 @@ class SwapABGatedActEpilogue(KernelComponent):
             # "swiglu" (default) or "quick_geglu": up * gate * sigmoid(1.702 * gate). Same core as
             # SwiGLU with the sigmoid argument scaled, so it costs nothing extra; exclusive with SiTU.
             "gate_activation": OptionalRequirement(str),
+            # sigmoid(gate) of the SwiGLU and SiTU cores as 0.5 * tanh(gate / 2) + 0.5 (one MUFU.TANH) instead
+            # of rcp(1 + exp2(-gate * log2e)) (MUFU.EX2 + MUFU.RCP); optional, absent means False. Not with
+            # quick_geglu or the SwiGLU alpha, which scale the sigmoid argument.
+            "use_tanh_sigmoid": OptionalRequirement(bool),
             # Whether run() will receive the per-token FC1 activation scale. Absent means False:
             # the SMEM scratch it needs is reserved only for descriptors that enable it.
             "fc1_activation_per_token_scale": OptionalRequirement(bool),
@@ -1016,6 +1022,7 @@ class SwapABGatedActEpilogue(KernelComponent):
             "relay_record_topk_marker": OptionalRequirement(int),
             # Publish fc2_done even without token-back (the internode rail peers gather relay rows after it).
             "publish_fc2_done": OptionalRequirement(bool),
+            "fc2_output_ring_blocks": OptionalRequirement(int),
         }
 
     @staticmethod
@@ -1065,6 +1072,8 @@ class SwapABGatedActEpilogue(KernelComponent):
         self.gate_up_clamp = problem_desc["gate_up_clamp"]
         self.situ_beta, self.situ_linear_beta = self._resolve_situ_betas(problem_desc)
         self.gate_activation = self._resolve_gate_activation(problem_desc)
+        # A codegen-time choice like the SiTU betas: the enclosing KernelClass folds it into its name().
+        self.use_tanh_sigmoid = problem_desc.get("use_tanh_sigmoid", False)
         # The scratch costs mainloop SMEM budget, so only a descriptor that enables the scale
         # reserves it; passing the tensor without the flag is rejected in run().
         self.act_scale_scratch_enabled = bool(problem_desc.get("fc1_activation_per_token_scale", False))
@@ -1079,6 +1088,9 @@ class SwapABGatedActEpilogue(KernelComponent):
                 raise ValueError("SiTU excludes SwiGLU alpha/beta constants.")
             if self.gate_activation != "swiglu":
                 raise ValueError("QuickGeGLU excludes SwiGLU alpha/beta constants.")
+        # The tanh sigmoid evaluates sigmoid(gate) itself; quick_geglu and the SwiGLU alpha scale its argument.
+        if self.use_tanh_sigmoid and (self.gate_activation != "swiglu" or self.swiglu_alpha is not None):
+            raise ValueError("use_tanh_sigmoid excludes quick_geglu and the SwiGLU alpha/beta constants.")
         self.mma_tiler_mnk = impl_desc["mma_tiler_mnk"]
         self.cluster_shape_mn = impl_desc["cluster_shape_mn"]
         self.use_2cta_instrs = impl_desc["use_2cta_instrs"]
@@ -1088,6 +1100,11 @@ class SwapABGatedActEpilogue(KernelComponent):
         self.communication_enabled = impl_desc["communication_enabled"]
         self.fc1_epi_flag_batch = impl_desc["fc1_epi_flag_batch"]
         self.fc2_epi_flag_batch = impl_desc["fc2_epi_flag_batch"]
+        # Ring of the local FC2 output (0: off). The local FC2 output, in which the rows wait for the kernel's
+        # combine warps, holds fc2_output_ring_blocks token blocks: an FC2 tile of pool token block b stores
+        # into slot b % fc2_output_ring_blocks (_fc2_output_row_start) and publishes its completion for the
+        # block, not for the expert (signal_fc2_done). Nothing waits here.
+        self.fc2_output_ring_blocks = impl_desc.get("fc2_output_ring_blocks", 0)
         # Release scope of the fc2_done publication: "gpu" for same-GPU consumers (the NVLink
         # token-back warps acquire at GPU scope), "sys" when another rank acquires the counter
         # (internode combine, design invariant I9).
@@ -1118,6 +1135,13 @@ class SwapABGatedActEpilogue(KernelComponent):
         self.fc2_output_is_local = not self.communication_enabled or self.token_back_push_data
         self.fc2_use_tma = self.fc2_use_bulk and self.fc2_output_is_local
         self.fc2_use_ublk = self.fc2_use_bulk and not self.fc2_output_is_local
+        if self.fc2_output_ring_blocks > 0 and not (self.token_back_push_data and self.fc2_use_tma):
+            # Only there is a row of the FC2 output a row of a ring slot: every other store addresses the pool
+            # row of its token, for the caller's output or for the metadata of the token it pushes.
+            raise ValueError(
+                "fc2_output_ring_blocks needs an epilogue that stores the FC2 output with TMA into the local FC2 "
+                "output for the kernel's combine warps (token_back_push_data with fc2_use_bulk)."
+            )
         if self.fc2_use_ublk and self.combine_format.act_dtype.width == 4:
             raise ValueError("FC2 UBLK does not support an FP4 combine payload.")
         if self.reduce_topk_in_kernel and self.combine_format.act_dtype is not cutlass.BFloat16:
@@ -1244,6 +1268,10 @@ class SwapABGatedActEpilogue(KernelComponent):
             "situ_beta": None,
             "situ_linear_beta": None,
         }
+
+    def _make_fc2_epilogue(self, *args) -> "SwapABFc2Epilogue":
+        """Device-side FC2 epilogue factory; variants substitute their own ``SwapABFc2Epilogue`` subclass."""
+        return SwapABFc2Epilogue(self, *args)
 
     @classmethod
     def epilogue_sync_barrier(cls) -> pipeline.NamedBarrier:
@@ -1492,8 +1520,7 @@ class SwapABGatedActEpilogue(KernelComponent):
             fc1_done_counter,
             optional_epi_args,
         )
-        fc2_epi = SwapABFc2Epilogue(
-            self,
+        fc2_epi = self._make_fc2_epilogue(
             tidx,
             fc2_smem_tensor,
             tma_atom_fc2_output,
@@ -2237,8 +2264,10 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         #        up   = clamp(up, -limit, +limit)   (symmetric)
         #   3. gated activation, either SwiGLU or SiTU (mutually exclusive; SiTU has no clamp):
         #        SwiGLU: out = up * gate * sigmoid(gate)
-        #        SiTU:   out = beta*tanh(gate/beta)*sigmoid(gate) * linear_beta*tanh(up/linear_beta)
-        #                sigmoid(x) = rcp(1 + exp2(-x * log2e))
+        #        SiTU:   out = beta*tanh(gate/beta)*sigmoid(gate) * linear_beta*tanh(up/linear_beta),
+        #                its two tanh on tanh.approx
+        #      sigmoid(x) = rcp(1 + exp2(-x * log2e)) (ex2.approx + rcp.approx), or with use_tanh_sigmoid
+        #      0.5*tanh(x/2) + 0.5 (one tanh.approx)
         #
         # The symmetric up-clamp is a single ``min.xorsign.abs.f32`` (magnitude
         # min(|up|, limit), sign = sign(up)^sign(limit) = sign(up) since limit>=0);
@@ -2344,15 +2373,14 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
                     )
                 )
 
-            # 3) gated activation on the dequanted (and clamped) real values.
-            #    sigmoid(x) = rcp(1 + exp2(-x * log2e)) -- shared by both cores.
-            def _sigmoid(p0, p1):
-                neg = cute.arch.mul_packed_f32x2((p0, p1), neg_log2e_pair)
+            # 3) gated activation on the dequanted (and clamped) real values; sigmoid(gate) is shared by both cores.
+            if cutlass.const_expr(self.use_tanh_sigmoid):
+                sigmoid_pair = sigmoid_pair_tanh_approx((g0, g1))
+            else:
+                neg = cute.arch.mul_packed_f32x2((g0, g1), neg_log2e_pair)
                 e = (cute.math.exp2(neg[0], fastmath=True), cute.math.exp2(neg[1], fastmath=True))
                 d = cute.arch.add_packed_f32x2(e, one_pair)
-                return (cute.arch.rcp_approx(d[0]), cute.arch.rcp_approx(d[1]))
-
-            sigmoid_pair = _sigmoid(g0, g1)
+                sigmoid_pair = (cute.arch.rcp_approx(d[0]), cute.arch.rcp_approx(d[1]))
 
             if cutlass.const_expr(self.situ_beta is None):
                 # Add beta after clamping; alpha scales only the sigmoid argument.
@@ -2361,38 +2389,11 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
                 ug = cute.arch.mul_packed_f32x2((u0, u1), (g0, g1))
                 out_pair = cute.arch.mul_packed_f32x2(ug, sigmoid_pair)
             else:
-                # SiTU (Kimi K3), matching HF ``modeling_kimi.py``:
-                #     situ_gate = beta        * tanh(gate / beta) * sigmoid(gate)
-                #     situ_up   = linear_beta * tanh(up   / linear_beta)
-                #     out       = situ_gate * situ_up
-                #
-                # ``tanh(z) = 2 * sigmoid(2z) - 1`` keeps the whole core on the packed f32x2 path --
-                # there is no packed tanh, so calling one would force this loop back to scalar.
-                #
-                # beta * tanh(x/beta) = beta * (2*sigmoid(2x/beta) - 1) = 2*beta*sigmoid(2x/beta) - beta
-                # so the reciprocals and the 2*beta factors fold at trace time.
-                inv_2beta = cutlass.Float32(2.0 / self.situ_beta)
-                two_beta = cutlass.Float32(2.0 * self.situ_beta)
-                neg_beta = cutlass.Float32(-self.situ_beta)
-
-                gs = _sigmoid(*cute.arch.mul_packed_f32x2((g0, g1), (inv_2beta, inv_2beta)))
-                tanh_g = cute.arch.add_packed_f32x2(
-                    cute.arch.mul_packed_f32x2(gs, (two_beta, two_beta)), (neg_beta, neg_beta)
+                # SiTU (Kimi K3), matching HF ``modeling_kimi.py``; its two tanh on MUFU.TANH. Without a linear
+                # beta the up branch stays unbounded.
+                out_pair = situ_pair_tanh_approx(
+                    (g0, g1), (u0, u1), self.situ_beta, self.situ_linear_beta, sigmoid_pair
                 )
-
-                if cutlass.const_expr(self.situ_linear_beta is not None):
-                    inv_2lbeta = cutlass.Float32(2.0 / self.situ_linear_beta)
-                    two_lbeta = cutlass.Float32(2.0 * self.situ_linear_beta)
-                    neg_lbeta = cutlass.Float32(-self.situ_linear_beta)
-                    us = _sigmoid(*cute.arch.mul_packed_f32x2((u0, u1), (inv_2lbeta, inv_2lbeta)))
-                    tanh_u = cute.arch.add_packed_f32x2(
-                        cute.arch.mul_packed_f32x2(us, (two_lbeta, two_lbeta)), (neg_lbeta, neg_lbeta)
-                    )
-                else:
-                    tanh_u = (u0, u1)
-
-                situ_gate = cute.arch.mul_packed_f32x2(tanh_g, sigmoid_pair)
-                out_pair = cute.arch.mul_packed_f32x2(situ_gate, tanh_u)
 
             out[i] = out_pair[0]
             out[i + 1] = out_pair[1]
@@ -2629,15 +2630,33 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
         publish: cutlass.Constexpr = self.publish_fc2_done
         flag_address = Int64(0)
         if cutlass.const_expr(publish):
-            flag_address = (self.fc2_done_counter.iterator + work_tile_info.expert_idx).toint()
+            if cutlass.const_expr(self.fc2_output_ring_blocks > 0):
+                # Local FC2 output in the ring: completion per pool token block. Every CTA tile of the block
+                # publishes once, the padded hidden tiles of the last cluster tile included.
+                block = work_tile_info.cumulative_token_block_count + work_tile_info.tile_n_idx
+                flag_address = (self.fc2_done_counter.iterator + block).toint()
+            else:
+                flag_address = (self.fc2_done_counter.iterator + work_tile_info.expert_idx).toint()
         no_fire: cutlass.Constexpr = not publish
         return flag_tracker.accumulate(next_work_tile_info.phase, self.fc2_epi_flag_batch, flag_address, no_fire)
 
     @cute.jit
-    def _make_output_router(self, work_tile_info: SwapAbFc12WorkTileInfo) -> "Fc2OutputRouter":
-        task_tile_data_row_start = (
-            work_tile_info.cumulative_data_physical_row + work_tile_info.tile_n_idx * cutlass.Int32(self.cta_tile_n)
+    def _fc2_output_row_start(self, work_tile_info: SwapAbFc12WorkTileInfo) -> cutlass.Int32:
+        """First row of this tile in the FC2 output: its pool rows, or the rows of its block's ring slot.
+
+        With the local FC2 output in the ring it holds fc2_output_ring_blocks token blocks and pool token block b
+        lives in slot b % fc2_output_ring_blocks.
+        """
+        if cutlass.const_expr(self.fc2_output_ring_blocks > 0):
+            block = work_tile_info.cumulative_token_block_count + work_tile_info.tile_n_idx
+            return (block % cutlass.Int32(self.fc2_output_ring_blocks)) * cutlass.Int32(self.cta_tile_n)
+        return work_tile_info.cumulative_data_physical_row + work_tile_info.tile_n_idx * cutlass.Int32(
+            self.cta_tile_n
         )
+
+    @cute.jit
+    def _make_output_router(self, work_tile_info: SwapAbFc12WorkTileInfo) -> "Fc2OutputRouter":
+        task_tile_data_row_start = self._fc2_output_row_start(work_tile_info)
         hidden_base_this_cta_tile = work_tile_info.tile_m_idx * cutlass.Int32(self.cta_tile_m)
         valid_hidden_this_cta_tile = cutlass.Int32(self.fc2_output.shape[2]) - hidden_base_this_cta_tile
         if valid_hidden_this_cta_tile < 0:
@@ -3398,9 +3417,7 @@ def fc2_tma_store_function(
     cute.copy(tiled_store, register_partition, smem_partition)
 
     token_tile_idx = (
-        work_tile_info.cumulative_data_physical_row
-        + work_tile_info.tile_n_idx * cutlass.Int32(epi.cta_tile_n)
-        + subtile_idx * cutlass.Int32(epi._EpilogueTokenTileSize)
+        epi._fc2_output_row_start(work_tile_info) + subtile_idx * cutlass.Int32(epi._EpilogueTokenTileSize)
     ) // cutlass.Int32(epi._EpilogueTokenTileSize)
     tiled_output = cute.flat_divide(epi.fc2_tma_output, (epi._EpilogueTokenTileSize, epi._EpilogueFc2HiddenTileSize))
     gmem_subtile = tiled_output[None, None, token_tile_idx, work_tile_info.tile_m_idx, 0]

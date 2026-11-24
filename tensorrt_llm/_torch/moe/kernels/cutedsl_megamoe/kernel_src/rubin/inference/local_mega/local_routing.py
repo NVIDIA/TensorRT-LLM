@@ -10,7 +10,7 @@ import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils
 from cutlass.cute.typing import AddressSpace
-from cutlass.cutlass_dsl import Int32, Int64
+from cutlass.cutlass_dsl import Boolean, Int32, Int64
 from cutlass.utils.blockscaled_layout import tile_atom_to_shape_SF
 
 from .....api import ImplDesc, KernelComponent, OptionalRequirement, ProblemDesc
@@ -21,7 +21,7 @@ from .....helpers.iket_compat import iket
 from .....helpers.ptx_helpers import cp_async_bulk_s2g, nanosleep, stg_b64, stg_f32, tma_load_1d
 from .....helpers.smem_workspace import SmemWorkspace
 from .....helpers.software_sync import SoftwareGridSync
-from .....helpers.utils import ceil_div, round_up
+from .....helpers.utils import ceil_div, round_up, worst_case_padded_rows
 from .....quant_def import QuantKind
 
 
@@ -254,13 +254,7 @@ class _MetadataPushRouter(KernelComponent):
             raise ValueError(f"topk must not exceed expert_count, got {self.topk} and {self.expert_count}.")
 
     def worst_case_padded_tokens(self, block: int) -> int:
-        source_token_capacity = self.max_tokens
-        routes_per_source_token = min(self.topk, self.expert_count)
-        route_capacity = source_token_capacity * routes_per_source_token
-        active_expert_capacity = min(self.expert_count, route_capacity)
-        route_budget_blocks = active_expert_capacity + (route_capacity - active_expert_capacity) // block
-        expert_bound_blocks = active_expert_capacity * int(ceil_div(source_token_capacity, block))
-        return min(route_budget_blocks, expert_bound_blocks) * block
+        return worst_case_padded_rows(self.max_tokens, self.expert_count, self.topk, block)
 
     @property
     def worst_case_token_count(self) -> int:
@@ -386,6 +380,7 @@ class _MetadataPushRouter(KernelComponent):
         shared_workspace: cute.Pointer,
         device_workspace: DeviceWorkspace,
         stream: cuda.CUstream,
+        tmp_buffer: Optional[cute.Pointer] = None,  # caller-owned tmp buffer; None: the data stays in local_workspace
     ) -> None:
         """Launch counting-sort DATA, prefix HELPER, and metadata placement roles."""
         if cutlass.const_expr(self.apply_topk_at_fc1 and topk_scores is None):
@@ -396,6 +391,7 @@ class _MetadataPushRouter(KernelComponent):
             local_workspace,
             shared_workspace,
             device_workspace,
+            tmp_buffer,
         ).launch(
             grid=[self.router_grid_cta_count, 1, 1],
             block=[self.router_warps_per_cta * 32, 1, 1],
@@ -411,6 +407,7 @@ class _MetadataPushRouter(KernelComponent):
         local_workspace: cute.Pointer,
         shared_workspace: cute.Pointer,
         device_workspace: DeviceWorkspace,
+        tmp_buffer: Optional[cute.Pointer],
     ) -> None:
         thread_idx, _, _ = cute.arch.thread_idx()
         linear_cta_idx, _, _ = cute.arch.block_idx()
@@ -425,7 +422,7 @@ class _MetadataPushRouter(KernelComponent):
         storage = smem_allocator.allocate(storage_type)
         smem_base = storage.buffer.data_ptr()
 
-        device_workspace.assign_device_members(local_workspace, shared_workspace)
+        device_workspace.assign_device_members(local_workspace, shared_workspace, tmp_buffer)
         self._device_workspace = device_workspace
         self._router_thread_idx = thread_idx
         self._router_linear_cta_idx = linear_cta_idx
@@ -1039,6 +1036,9 @@ class LocalRouting(KernelComponent):
             "token_in_flag_batch": int,
             "reduce_topk_in_kernel": bool,
             "router_smem_limit_bytes": OptionalRequirement(int),
+            "ring_token_blocks": OptionalRequirement(Optional[int]),
+            "ring_retire_region": OptionalRequirement(Optional[str]),
+            "ring_retire_threshold": OptionalRequirement(Optional[int]),
         }
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
@@ -1058,6 +1058,17 @@ class LocalRouting(KernelComponent):
         self.token_in_flag_batch = impl_desc["token_in_flag_batch"]
         self.reduce_topk_in_kernel = impl_desc["reduce_topk_in_kernel"]
         self.router_smem_limit_bytes = impl_desc.get("router_smem_limit_bytes", 227 * 1024)
+        # Ring workspace (0: off). The FC1 scale pool holds ring_token_blocks token blocks instead of the worst
+        # case: pool token block b lives in slot b % ring_token_blocks and keeps the slot until it is retired,
+        # that is until its last reader in any ringed pool is done (the slot lease). A "ready slot" of this
+        # router is a token block (``ready_slot_idx`` is a block number); a ring slot is
+        # ``block % ring_token_blocks``. token_in alone waits for the ring: it writes the scale row of a token of
+        # block b once block b - ring_token_blocks, the block that held the slot before, is retired
+        # (_previous_occupant_retired). The kernel names the counter that shows it, one per block
+        # (``ring_retire_region``), and the count of a retired block (``ring_retire_threshold``).
+        self.ring_token_blocks = impl_desc.get("ring_token_blocks") or 0
+        self.ring_retire_region = impl_desc.get("ring_retire_region")
+        self.ring_retire_threshold = impl_desc.get("ring_retire_threshold") or 0
 
         self._validate_configuration()
         self._router = _MetadataPushRouter(problem_desc, impl_desc)
@@ -1097,6 +1108,11 @@ class LocalRouting(KernelComponent):
             raise ValueError(f"{self.quant_kind} requires hidden_size divisible by {element_block}.")
         if self.sf_padding_block % 128 != 0:
             raise ValueError("sf_padding_block must be a multiple of 128.")
+        if type(self.ring_token_blocks) is not int or self.ring_token_blocks < 0:
+            raise ValueError(f"ring_token_blocks must be a non-negative int, got {self.ring_token_blocks!r}.")
+        if self.ring_enabled:
+            if self.ring_retire_region is None or self.ring_retire_threshold <= 0:
+                raise ValueError("A ring workspace needs the kernel's retire counter region and its threshold.")
 
     @property
     def activation_dtype(self) -> type:
@@ -1129,6 +1145,30 @@ class LocalRouting(KernelComponent):
         return self._router.worst_case_padded_tokens(self.tokens_per_fc1_ready_slot) // self.tokens_per_fc1_ready_slot
 
     @property
+    def ring_enabled(self) -> bool:
+        return self.ring_token_blocks > 0
+
+    @property
+    def ring_sf_rows_per_block(self) -> int:
+        """Scale rows of one ring slot: the token tile rounded up to whole 128-row scale atoms."""
+        return round_up(self.tokens_per_fc1_ready_slot, 128)
+
+    @property
+    def fc1_pool_token_count(self) -> int:
+        """Data rows of the pool token blocks, which size the kernel's FC1 output: the worst case, or
+        ring_token_blocks token tiles with a ring workspace. This component pools no token data itself."""
+        if self.ring_enabled:
+            return self.ring_token_blocks * self.tokens_per_fc1_ready_slot
+        return self.worst_case_token_count
+
+    @property
+    def fc1_pool_sf_token_count(self) -> int:
+        """Scale rows of the FC1 scale pool; with a ring workspace every slot owns whole 128-row scale atoms."""
+        if self.ring_enabled:
+            return self.ring_token_blocks * self.ring_sf_rows_per_block
+        return self.worst_case_sf_token_count
+
+    @property
     def token_src_metadata_region(self) -> str:
         return self._router.token_src_metadata_region
 
@@ -1146,6 +1186,7 @@ class LocalRouting(KernelComponent):
         shared_workspace: cute.Pointer,
         device_workspace: DeviceWorkspace,
         stream: cuda.CUstream,
+        tmp_buffer: Optional[cute.Pointer] = None,  # caller-owned tmp buffer; None: the data stays in local_workspace
     ) -> None:
         self._router.launch_router(
             topk_indices,
@@ -1154,6 +1195,7 @@ class LocalRouting(KernelComponent):
             shared_workspace,
             device_workspace,
             stream,
+            tmp_buffer=tmp_buffer,
         )
 
     @cute.jit
@@ -1209,7 +1251,8 @@ class LocalRouting(KernelComponent):
         """Register the fused kernel's FC1 scale pool and optional combine staging.
 
         FC1 scale pool: ``token_in`` only materializes activation scale factors in
-        expert-grouped POOL index space.  The activation payload is intentionally
+        expert-grouped POOL index space (with a ring workspace: in the ring slot of
+        each token block).  The activation payload is intentionally
         not duplicated; the Local MegaMoE FC1 mainloop gathers it directly from the caller
         tensor into B SMEM using ``token_src_metadata``.
 
@@ -1224,7 +1267,7 @@ class LocalRouting(KernelComponent):
             buffer_space="local",
             reset="tail_reset",
         )
-        activation_sf_element_count = self.worst_case_sf_token_count * self.activation_sf_hidden_padded
+        activation_sf_element_count = self.fc1_pool_sf_token_count * self.activation_sf_hidden_padded
         workspace.register(
             self.fc1_activation_sf_region,
             self.activation_sf_dtype,
@@ -1265,7 +1308,7 @@ class LocalRouting(KernelComponent):
     @cute.jit
     def fc1_activation_sf_tensor(self, device_workspace: DeviceWorkspace) -> cute.Tensor:
         layout = tile_atom_to_shape_SF(
-            (self.worst_case_sf_token_count, self.hidden_size, 1), self.activation_sf_vector_size
+            (self.fc1_pool_sf_token_count, self.hidden_size, 1), self.activation_sf_vector_size
         )
         return cute.make_tensor(device_workspace.ptr(self.fc1_activation_sf_region), cute.select(layout, mode=[0, 1]))
 
@@ -1275,6 +1318,26 @@ class LocalRouting(KernelComponent):
         if cutlass.const_expr(self.reduce_topk_in_kernel):
             return None
         return device_workspace.tensor(self.pre_reduced_activation_region)
+
+    @cute.jit
+    def _previous_occupant_retired(self, block: Int32) -> Boolean:
+        """Has the block that held this block's ring slot before it been retired? One look at the retire
+        counter. It does not wait: token_in decides what to do with the answer.
+
+        That earlier occupant, ``block - ring_token_blocks``, is retired when its counter in ``ring_retire_region``
+        shows ``ring_retire_threshold``: no reader of the slot is left then, in any ringed pool. Lane 0 reads the
+        counter and hands the value to every lane, so the warp takes one decision.
+        """
+        retired_count = Int32(0)
+        if self._lane_idx == Int32(0):
+            retired_count = cute.arch.load(
+                self._device_workspace.element_ptr(self.ring_retire_region, block - Int32(self.ring_token_blocks)),
+                Int32,
+                sem="acquire",
+                scope="gpu",
+            )
+        retired_count = Int32(cute.arch.shuffle_sync(retired_count, Int32(0)))
+        return retired_count >= Int32(self.ring_retire_threshold)
 
     @cute.jit
     def token_in(self, smem_workspace: SmemWorkspace, smem_base: cute.Pointer) -> None:
@@ -1379,6 +1442,29 @@ class LocalRouting(KernelComponent):
                 pool_token_idx = pool_expert_bases[local_expert] + token_in_expert
                 sf_token_idx = expert_sf_begin + token_in_expert
                 ready_slot_idx = expert_ready_slot_begin + token_in_expert // Int32(self.tokens_per_fc1_ready_slot)
+                if cutlass.const_expr(self.ring_enabled):
+                    # Scale row of this token in the ring: the slot of its token block, then its place in the
+                    # block. The metadata stays indexed by pool_token_idx.
+                    token_in_block = token_in_expert % Int32(self.tokens_per_fc1_ready_slot)
+                    ring_slot = ready_slot_idx % Int32(self.ring_token_blocks)
+                    sf_token_idx = ring_slot * Int32(self.ring_sf_rows_per_block) + token_in_block
+                    # Slot lease: the scale row may be written once the block that held the slot before its block
+                    # is retired. The first ring_token_blocks blocks are the first users of their slots and ask
+                    # nothing. The answer is the same in every lane, so the warp publishes, sleeps and asks again
+                    # as one.
+                    if ready_slot_idx >= Int32(self.ring_token_blocks):
+                        retired = self._previous_occupant_retired(ready_slot_idx)
+                        if not retired:
+                            if cutlass.const_expr(self.token_in_flag_batch > 1):
+                                # Publish the ready flags this warp still batches before it sleeps: the block it
+                                # waits for may be waiting for one of them.
+                                flag_tracker.fire()
+                                flag_tracker = flag_tracker.drained()
+                            iket.range_push("token_in.ring_wait")
+                            while not retired:
+                                nanosleep(500)
+                                retired = self._previous_occupant_retired(ready_slot_idx)
+                            iket.range_pop()
 
                 metadata = RoutingMetadata.load(
                     token_metadata_pointer.toint() + Int64(pool_token_idx) * Int64(RoutingMetadata.nbytes)

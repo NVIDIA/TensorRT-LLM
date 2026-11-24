@@ -12,6 +12,23 @@ from cutlass.cutlass_dsl import Boolean, Int32, Int64, extract_mlir_values, new_
 
 from ...helpers.ptx_helpers import mbarrier_arrive_expect_tx_on_peer, nanosleep, store_i32_to_peer_cluster_smem_async
 
+# Sentinel work ID broadcast when an atomic work-ID counter is exhausted
+WorkIdExhaustedSentinel = 0x3FFFFFFF
+
+
+@cute.jit
+def early_exit_max_work_id(cluster_idx: Int32, early_exit_cluster_start: int, early_exit_work_id_limit: int) -> Int32:
+    """Atomic-counter claim cutoff of one cluster under scheduler early exit.
+
+    Clusters from ``early_exit_cluster_start`` on stop claiming at
+    ``early_exit_work_id_limit``; the others get the exhausted sentinel, which
+    ``_claim_atomic_counter_work_id`` treats as no cutoff.
+    """
+    max_work_id = Int32(WorkIdExhaustedSentinel)
+    if cluster_idx >= Int32(early_exit_cluster_start):
+        max_work_id = Int32(early_exit_work_id_limit)
+    return max_work_id
+
 
 class GridStrideWorkIdState:
     """Register state for one monotonic grid-stride work-ID stream."""
@@ -53,6 +70,7 @@ class AtomicCounterWorkIdState:
         producer_state,
         consumer_state,
         cluster_size: int | Int32,
+        max_work_id: Int32 | None = None,
     ) -> None:
         if isinstance(counter_count, bool) or not isinstance(counter_count, int) or counter_count <= 0:
             raise ValueError("counter_count must be a positive Python int.")
@@ -64,6 +82,7 @@ class AtomicCounterWorkIdState:
         self.producer_state = producer_state
         self.consumer_state = consumer_state
         self.cluster_size = cluster_size
+        self.max_work_id = max_work_id
 
     def __extract_mlir_values__(self) -> List[ir.Value]:
         values: List[ir.Value] = []
@@ -77,6 +96,8 @@ class AtomicCounterWorkIdState:
             values.extend(extract_mlir_values(field))
         if isinstance(self.cluster_size, Int32):
             values.extend(extract_mlir_values(self.cluster_size))
+        if self.max_work_id is not None:
+            values.extend(extract_mlir_values(self.max_work_id))
         return values
 
     def __new_from_mlir_values__(self, values: List[ir.Value]) -> "AtomicCounterWorkIdState":
@@ -98,6 +119,7 @@ class AtomicCounterWorkIdState:
             producer_state=rebuild(self.producer_state),
             consumer_state=rebuild(self.consumer_state),
             cluster_size=rebuild(self.cluster_size) if isinstance(self.cluster_size, Int32) else self.cluster_size,
+            max_work_id=rebuild(self.max_work_id) if self.max_work_id is not None else None,
         )
         if value_index != len(values):
             raise ValueError(
@@ -133,8 +155,9 @@ class FixedGroupMixedCgaAtomicCounterWorkIdState:
             raise ValueError("fallback_cluster_count must be a positive Python int.")
         if fallback_cluster_count % split_factor != 0:
             raise ValueError("fallback_cluster_count must be divisible by split_factor.")
-        if atomic_counter_state.counter_count > 2:
-            raise ValueError("Fixed fallback groups support at most two work-ID streams.")
+        if atomic_counter_state.counter_count > 4:
+            # The group token carries the claimed stream in the top two bits of its 32-bit payload.
+            raise ValueError("Fixed fallback groups support at most four work-ID streams.")
         self.atomic_counter_state = atomic_counter_state
         self.registration_counter_pointer = registration_counter_pointer
         self.group_token_pointer = group_token_pointer
@@ -409,7 +432,19 @@ def _claim_atomic_counter_work_id(
         lane_idx = thread_idx % Int32(32)
         atomic_work_id = Int32(0)
         if lane_idx == Int32(0):
-            atomic_work_id = cute.arch.atomic_add(selected_counter_pointer, Int32(1))
+            if cutlass.const_expr(work_id_state.max_work_id is not None):
+                # Soft cutoff: a claim racing past the peek may land a few ids beyond
+                # max_work_id, which is still valid work for this cluster. Clusters with
+                # no cutoff (the sentinel) skip the peek.
+                atomic_work_id = Int32(WorkIdExhaustedSentinel)
+                if work_id_state.max_work_id < Int32(WorkIdExhaustedSentinel):
+                    peeked = cute.arch.load(selected_counter_pointer, Int32, sem="relaxed", scope="gpu")
+                    if peeked < work_id_state.max_work_id:
+                        atomic_work_id = cute.arch.atomic_add(selected_counter_pointer, Int32(1))
+                else:
+                    atomic_work_id = cute.arch.atomic_add(selected_counter_pointer, Int32(1))
+            else:
+                atomic_work_id = cute.arch.atomic_add(selected_counter_pointer, Int32(1))
         atomic_work_id = cute.arch.shuffle_sync(atomic_work_id, offset=0, mask=0xFFFFFFFF, mask_and_clamp=31)
         if lane_idx < Int32(work_id_state.cluster_size):
             store_i32_to_peer_cluster_smem_async(
@@ -676,7 +711,7 @@ def _claim_fixed_group_fallback_work_id(
             claimed_work_id = Int32(
                 cute.arch.shuffle_sync(claimed_work_id, offset=0, mask=0xFFFFFFFF, mask_and_clamp=31)
             )
-            claimed_payload = claimed_work_id | (Int32(atomic_counter_index) << Int32(31))
+            claimed_payload = claimed_work_id | (Int32(atomic_counter_index) << Int32(30))
             token = (Int64(work_id_state.next_generation) << Int64(32)) | (Int64(claimed_payload) & Int64(0xFFFFFFFF))
             if lane_idx == Int32(0):
                 cute.arch.store(group_token_pointer, token, sem="relaxed", scope="gpu")
@@ -714,8 +749,8 @@ def _claim_fixed_group_fallback_work_id(
     cluster_pipeline.sync_object_empty.arrive(atomic_counter_state.consumer_state.index, Int32(0))
     atomic_counter_state.consumer_state.advance()
     work_id_state.atomic_counter_state = atomic_counter_state
-    work_id_state.claimed_counter_index = (claimed_payload >> Int32(31)) & Int32(1)
-    linear_work_id = claimed_payload & Int32(0x7FFFFFFF)
+    work_id_state.claimed_counter_index = (claimed_payload >> Int32(30)) & Int32(3)
+    linear_work_id = claimed_payload & Int32(0x3FFFFFFF)
     return linear_work_id, work_id_state
 
 
@@ -871,8 +906,10 @@ __all__ = [
     "FixedGroupMixedCgaAtomicCounterWorkIdState",
     "GridStrideWorkIdState",
     "GridWorkId",
+    "WorkIdExhaustedSentinel",
     "broadcast_atomic_counter_ready",
     "broadcast_atomic_counter_ready_or_claim",
     "claim_work_id",
+    "early_exit_max_work_id",
     "initialize_fixed_group_mixed_cga_work_id_state",
 ]

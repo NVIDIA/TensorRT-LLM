@@ -26,13 +26,14 @@ from ...helpers.ptx_helpers import (
     cp_reduce_async_bulk_add_u32_s2g,
     nanosleep,
     read_clock64,
+    red_add_relaxed_gpu_s32,
     red_add_relaxed_sys_s32,
     stg_b64,
     stg_f32,
     tma_load_1d,
 )
 from ...helpers.smem_workspace import SmemWorkspace
-from ...helpers.utils import ceil_div, round_up
+from ...helpers.utils import ceil_div, round_up, worst_case_padded_rows
 from ...quant_def import CombineFormat, QuantKind
 from ..token_protocol import TokenSrcMetadata
 from .one_round_router import _OneRoundRouter, fence_proxy_async_global
@@ -250,13 +251,9 @@ class _MetadataPushRouter(KernelComponent):
         return self.expert_count // self.world_size
 
     def worst_case_padded_tokens(self, block: int) -> int:
-        source_token_capacity = self.world_size * self.max_tokens_per_rank
-        routes_per_source_token = min(self.topk, self.experts_per_rank)
-        route_capacity = source_token_capacity * routes_per_source_token
-        active_expert_capacity = min(self.experts_per_rank, route_capacity)
-        route_budget_blocks = active_expert_capacity + (route_capacity - active_expert_capacity) // block
-        expert_bound_blocks = active_expert_capacity * int(ceil_div(source_token_capacity, block))
-        return min(route_budget_blocks, expert_bound_blocks) * block
+        return worst_case_padded_rows(
+            self.world_size * self.max_tokens_per_rank, self.experts_per_rank, self.topk, block
+        )
 
     def _router_launch_configuration(self) -> Tuple[int, int]:
         def next_power_of_two(value: int) -> int:
@@ -448,6 +445,7 @@ class _MetadataPushRouter(KernelComponent):
         activation: Optional[cute.Tensor] = None,  # (tokens, hidden) FP4 rows, relay payload source
         activation_sf: Optional[cute.Tensor] = None,  # (tokens, hidden // sf_vector) scale factors
         activation_scales: Optional[cute.Tensor] = None,  # (max_tokens_per_rank,) fp32, local
+        tmp_buffer: Optional[cute.Pointer] = None,  # caller-owned tmp buffer; None: the data stays in local_workspace
     ) -> None:
         """Launch counting-sort DATA, size-exchange HELPER, and metadata PUSH roles."""
         if cutlass.const_expr(self.apply_topk_at_fc1 and topk_scores is None):
@@ -469,6 +467,7 @@ class _MetadataPushRouter(KernelComponent):
             gin_shared_window_offset,
             activation,
             activation_sf,
+            tmp_buffer,
         ).launch(
             grid=[self.router_grid_cta_count, 1, 1],
             block=[self.router_warps_per_cta * 32, 1, 1],
@@ -492,6 +491,7 @@ class _MetadataPushRouter(KernelComponent):
         gin_shared_window_offset,  # Optional[Int64]: None without GIN resources
         activation: Optional[cute.Tensor],
         activation_sf: Optional[cute.Tensor],
+        tmp_buffer: Optional[cute.Pointer],
     ) -> None:
         # First statement on purpose: a by-value NCCL DevComm argument must be materialized where it
         # dominates the whole kernel (see the fused kernel); the base router rejects the handles.
@@ -510,7 +510,7 @@ class _MetadataPushRouter(KernelComponent):
         storage = smem_allocator.allocate(storage_type)
         smem_base = storage.buffer.data_ptr()
 
-        device_workspace.assign_device_members(local_workspace, shared_workspace)
+        device_workspace.assign_device_members(local_workspace, shared_workspace, tmp_buffer)
         self._device_workspace = device_workspace
         self._peer_rank_ptr_mapper = peer_rank_ptr_mapper
         self._router_local_rank = local_rank
@@ -1384,6 +1384,9 @@ class TokenCommNonDeterministic(KernelComponent):
             "token_back_chunk_bytes": OptionalRequirement(int),
             "dispatch_sf_group": OptionalRequirement(int),
             "token_in_stage_split": OptionalRequirement(bool),
+            "ring_token_blocks": OptionalRequirement(Optional[int]),
+            "ring_retire_region": OptionalRequirement(Optional[str]),
+            "ring_retire_threshold": OptionalRequirement(Optional[int]),
         }
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
@@ -1394,6 +1397,18 @@ class TokenCommNonDeterministic(KernelComponent):
         self.topk = problem_desc["topk"]
         self.max_tokens_per_rank = problem_desc["max_tokens_per_rank"]
         self.hidden_size = problem_desc["hidden_size"]
+        # Ring workspace (0: off). The dispatch pool holds ring_token_blocks token blocks instead of the worst
+        # case: pool token block b lives in slot b % ring_token_blocks and keeps the slot until it is retired,
+        # that is until its last reader in any ringed pool is done (the slot lease). A "ready slot" of this
+        # router is a token block (``ready_slot_idx`` is a block number); a ring slot is
+        # ``block % ring_token_blocks``. token_in alone waits for the ring: it writes a token of block b once
+        # block b - ring_token_blocks, the block that held the slot before, is retired
+        # (_previous_occupant_retired). The kernel names the counter that shows it, one per block
+        # (``ring_retire_region``), and the count of a retired block (``ring_retire_threshold``). A kernel that
+        # only forwards its caller's descriptor names none, and the ring is refused.
+        self.ring_token_blocks = impl_desc.get("ring_token_blocks") or 0
+        self.ring_retire_region = impl_desc.get("ring_retire_region")
+        self.ring_retire_threshold = impl_desc.get("ring_retire_threshold") or 0
         self.quant_kind = "bf16" if problem_desc["quant_kind"] == "bf16" else QuantKind(problem_desc["quant_kind"])
         self.activation_quant_kind = None if self.quant_kind == "bf16" else self.quant_kind
         self.combine_format = problem_desc["combine_format"]
@@ -1528,6 +1543,27 @@ class TokenCommNonDeterministic(KernelComponent):
             )
         if self.token_back_ready_granularity not in ("expert", "token_tile"):
             raise ValueError(f"Unsupported token_back_ready_granularity {self.token_back_ready_granularity!r}.")
+        if type(self.ring_token_blocks) is not int or self.ring_token_blocks < 0:
+            raise ValueError(f"ring_token_blocks must be a non-negative int, got {self.ring_token_blocks!r}.")
+        if self.ring_enabled:
+            # Ahead of what is asked of every token-back path below, so the reason a caller reads is the ring's.
+            # A kernel that only forwards its caller's descriptor names no retire counter and gets no ring.
+            if self.ring_retire_region is None or self.ring_retire_threshold <= 0:
+                raise ValueError("A ring workspace needs the kernel's retire counter region and its threshold.")
+            self.validate_ring_paths(
+                dispatch_stage_depth=self.dispatch_stage_depth,
+                combine_stage_depth=self.combine_stage_depth,
+                token_back_schedule_mode=self.token_back_schedule_mode,
+                token_back_mode=self.token_back_mode,
+            )
+            if self.fc2_output_in_ring and self.token_back_ready_granularity != "token_tile":  # nosec B105
+                # token_back finds the ring rows of a token through its ready slot, the token block, which it
+                # has only where FC2 completion is counted per token tile. The kernel that owns the ring sets
+                # that granularity.
+                raise ValueError(
+                    "The ring workspace with the local FC2 output in it requires token_back_ready_granularity "
+                    "token_tile."
+                )
         if self.token_back_ready_granularity == "token_tile" and (  # nosec B105
             self.token_back_mode not in ("standalone_warps", "reuse_dispatch_warps")
             or self.token_back_schedule_mode != "atomic_counter"  # nosec B105
@@ -1572,6 +1608,39 @@ class TokenCommNonDeterministic(KernelComponent):
             self.cta_specialized or self.dispatch_stage_depth > 1 or self.token_in_stage_split
         ):
             raise NotImplementedError("One-round dispatch and tail parity require the fused single-stage token_in.")
+
+    @staticmethod
+    def validate_ring_paths(
+        *, dispatch_stage_depth: int, combine_stage_depth: int, token_back_schedule_mode: str, token_back_mode: str
+    ) -> None:
+        """Refuse a ring workspace that the token-in and token-back paths of this component cannot serve.
+
+        The one definition of these limits, applied twice. The component applies it to the ring it is configured
+        with. A kernel applies it to the ring its caller asked for, with the settings it hands the component:
+        where that ring would save nothing the kernel runs without it and the component never sees it, and a
+        requested ring is checked as a ring whatever the problem size.
+        """
+        if dispatch_stage_depth != 1:
+            # The staged token_in loop has no ring rows and no admission.
+            raise NotImplementedError("The ring workspace requires comm_stage_depths[0]=1.")
+        if token_back_mode == "standalone_warps":
+            # The local FC2 output of this mode is in the ring (fc2_output_in_ring).
+            if combine_stage_depth != 1:
+                # _token_back_multi_stage reads chunks ahead of the token it pushes and knows no ring rows.
+                raise NotImplementedError(
+                    "The ring workspace with the local FC2 output in it requires comm_stage_depths[1]=1."
+                )
+            if token_back_schedule_mode != "atomic_counter":
+                # This component's existing rule for FC2 completion per token tile (_validate_configuration:
+                # "token_tile return-ready requires ... atomic_counter"), applied under the ring's name because
+                # the ring asked for that count, not its caller. A static token-back schedule with the local FC2
+                # output in the ring is untested, not shown broken: the wait per token tile and the retire count
+                # are in the loop both schedules share.
+                raise ValueError(
+                    "The ring workspace with standalone_warps requires token_back_schedule_mode atomic_counter: "
+                    "the ring counts FC2 completion per token tile, which this token communication supports "
+                    "with the atomic_counter token-back schedule only."
+                )
 
     @property
     def experts_per_rank(self) -> int:
@@ -1648,6 +1717,52 @@ class TokenCommNonDeterministic(KernelComponent):
         return self._router.worst_case_padded_tokens(self.tokens_per_fc1_ready_slot) // self.tokens_per_fc1_ready_slot
 
     @property
+    def ring_enabled(self) -> bool:
+        return self.ring_token_blocks > 0
+
+    @property
+    def ring_sf_rows_per_block(self) -> int:
+        """Scale rows of one ring slot: the token tile rounded up to whole 128-row scale atoms."""
+        return round_up(self.tokens_per_fc1_ready_slot, 128)
+
+    @property
+    def fc1_pool_token_count(self) -> int:
+        """Rows of the dispatch pool: the worst case, or ring_token_blocks token tiles with a ring workspace."""
+        if self.ring_enabled:
+            return self.ring_token_blocks * self.tokens_per_fc1_ready_slot
+        return self.worst_case_token_count
+
+    @property
+    def fc1_pool_sf_token_count(self) -> int:
+        """Scale rows of the dispatch pool; with a ring workspace every slot owns whole 128-row scale atoms."""
+        if self.ring_enabled:
+            return self.ring_token_blocks * self.ring_sf_rows_per_block
+        return self.worst_case_sf_token_count
+
+    @property
+    def fc2_output_in_ring(self) -> bool:
+        """True when the local FC2 output is in the ring: with a ring workspace and token_back_mode
+        standalone_warps. Nothing to configure: the other pools are never in a ring without it.
+
+        With standalone_warps the FC2 rows wait in the local FC2 output (fc2_activation_region) until the combine
+        warps push them. In the ring that output holds the ring's token blocks instead of the worst case, block b
+        in slot b % ring_token_blocks, under the same lease as the dispatch pool. The push of its rows is the
+        last read of a block, so the combine warps add the rows they have pushed to the retire counter, and the
+        kernel names a whole token tile of rows as the count of a retired block. A block of fewer tokens reaches
+        that count too: the combine warp that takes an expert's last token also adds the rows the last block
+        lacks. epi_warps has no local FC2 output to ring (it pushes from the epilogue), and the kernels refuse a
+        ring with reuse_dispatch_warps.
+        """
+        return self.ring_enabled and self.token_back_mode == "standalone_warps"
+
+    @property
+    def fc2_output_token_count(self) -> int:
+        """Rows of the local FC2 output (data and scales): the worst case, or the token blocks of the ring."""
+        if self.fc2_output_in_ring:
+            return self.ring_token_blocks * self.tokens_per_fc1_ready_slot
+        return self.worst_case_token_count
+
+    @property
     def router_smem_workspace(self) -> SmemWorkspace:
         return self._router.router_smem_workspace
 
@@ -1709,6 +1824,7 @@ class TokenCommNonDeterministic(KernelComponent):
         activation: Optional[cute.Tensor] = None,
         activation_sf: Optional[cute.Tensor] = None,
         activation_scales: Optional[cute.Tensor] = None,
+        tmp_buffer: Optional[cute.Pointer] = None,  # caller-owned tmp buffer; None: the data stays in local_workspace
     ) -> None:
         if cutlass.const_expr(self.one_round_dispatch):
             self._router.launch_router(
@@ -1722,6 +1838,7 @@ class TokenCommNonDeterministic(KernelComponent):
                 peer_rank_ptr_mapper_host,
                 device_workspace,
                 stream,
+                tmp_buffer=tmp_buffer,
             )
         else:
             self._router.launch_router(
@@ -1739,6 +1856,7 @@ class TokenCommNonDeterministic(KernelComponent):
                 activation,
                 activation_sf,
                 activation_scales,
+                tmp_buffer=tmp_buffer,
             )
 
     # Pool-layout hooks. The NVLink-domain component consumes the router's tables directly; the
@@ -1749,6 +1867,15 @@ class TokenCommNonDeterministic(KernelComponent):
     def local_expert_sizes(self, device_workspace: DeviceWorkspace, local_rank: Int32) -> cute.Tensor:
         """This rank's expert token counts in pool order (scheduler tiles, token_in / token_back loops)."""
         return self._router.local_expert_sizes(device_workspace, local_rank)
+
+    @property
+    def sizes_ready_region(self) -> str:
+        """The counter ``wait_for_sizes_ready`` polls at system scope until it reaches ``sizes_ready_target``."""
+        return self._router.sizes_ready_region
+
+    @property
+    def sizes_ready_target(self) -> int:
+        return self._router.ranks_per_node
 
     @cute.jit
     def wait_for_sizes_ready(self, device_workspace: DeviceWorkspace, sleep_cycles: int = 1000) -> None:
@@ -1904,7 +2031,7 @@ class TokenCommNonDeterministic(KernelComponent):
     @property
     def name_token(self) -> str:
         """Compile-cache token of the communication component. Empty here: the NVLink-domain
-        component is the baseline and its kernel keeps main's compile-cache name."""
+        component is the baseline and its kernel name carries no component token."""
         return ""
 
     @property
@@ -1971,7 +2098,7 @@ class TokenCommNonDeterministic(KernelComponent):
             buffer_space="local",
             reset="tail_reset",
         )
-        activation_element_count = self.worst_case_token_count * self.hidden_size
+        activation_element_count = self.fc1_pool_token_count * self.hidden_size
         workspace.register(
             self.fc1_activation_region,
             self.activation_dtype,
@@ -1980,7 +2107,7 @@ class TokenCommNonDeterministic(KernelComponent):
             byte_alignment=128,
         )
         if self.activation_is_quantized:
-            activation_sf_element_count = self.worst_case_sf_token_count * self.activation_sf_hidden_padded
+            activation_sf_element_count = self.fc1_pool_sf_token_count * self.activation_sf_hidden_padded
             workspace.register(
                 self.fc1_activation_sf_region,
                 self.activation_sf_dtype,
@@ -2003,7 +2130,7 @@ class TokenCommNonDeterministic(KernelComponent):
                 reset="tail_reset",
             )
         if self.token_back_push_data:
-            fc2_element_count = self.worst_case_token_count * self.hidden_size
+            fc2_element_count = self.fc2_output_token_count * self.hidden_size
             workspace.register(
                 self.fc2_activation_region,
                 self.combine_format.act_dtype,
@@ -2012,7 +2139,7 @@ class TokenCommNonDeterministic(KernelComponent):
                 byte_alignment=128,
             )
         if self.token_back_push_sf:
-            fc2_sf_element_count = self.worst_case_token_count * self.combine_sf_hidden_padded
+            fc2_sf_element_count = self.fc2_output_token_count * self.combine_sf_hidden_padded
             workspace.register(
                 self.fc2_activation_sf_region,
                 self.combine_format.scale_dtype,
@@ -2170,7 +2297,7 @@ class TokenCommNonDeterministic(KernelComponent):
     def fc1_activation_tensor(self, device_workspace: DeviceWorkspace) -> cute.Tensor:
         return cute.make_tensor(
             device_workspace.ptr(self.fc1_activation_region),
-            cute.make_layout((self.worst_case_token_count, self.hidden_size), stride=(self.hidden_size, 1)),
+            cute.make_layout((self.fc1_pool_token_count, self.hidden_size), stride=(self.hidden_size, 1)),
         )
 
     @cute.jit
@@ -2178,7 +2305,7 @@ class TokenCommNonDeterministic(KernelComponent):
         if cutlass.const_expr(not self.activation_is_quantized):
             return None
         layout = tile_atom_to_shape_SF(
-            (self.worst_case_sf_token_count, self.hidden_size, 1), self.activation_sf_vector_size
+            (self.fc1_pool_sf_token_count, self.hidden_size, 1), self.activation_sf_vector_size
         )
         return cute.make_tensor(device_workspace.ptr(self.fc1_activation_sf_region), cute.select(layout, mode=[0, 1]))
 
@@ -2195,7 +2322,7 @@ class TokenCommNonDeterministic(KernelComponent):
         return cute.make_tensor(
             device_workspace.ptr(self.fc2_activation_region),
             cute.make_layout(
-                (self.worst_case_token_count, 1, self.hidden_size), stride=(self.hidden_size, self.hidden_size, 1)
+                (self.fc2_output_token_count, 1, self.hidden_size), stride=(self.hidden_size, self.hidden_size, 1)
             ),
         )
 
@@ -2207,7 +2334,7 @@ class TokenCommNonDeterministic(KernelComponent):
             device_workspace.ptr(self.fc2_activation_sf_region),
             cute.make_layout(
                 (
-                    self.worst_case_token_count,
+                    self.fc2_output_token_count,
                     1,
                     (self.combine_format.scale_block, self.hidden_size // self.combine_format.scale_block),
                 ),
@@ -2572,6 +2699,26 @@ class TokenCommNonDeterministic(KernelComponent):
         cute.arch.sync_warp()
 
     @cute.jit
+    def _previous_occupant_retired(self, block: Int32) -> Boolean:
+        """Has the block that held this block's ring slot before it been retired? One look at the retire
+        counter. It does not wait: token_in decides what to do with the answer.
+
+        That earlier occupant, ``block - ring_token_blocks``, is retired when its counter in ``ring_retire_region``
+        shows ``ring_retire_threshold``: no reader of the slot is left then, in any ringed pool. Lane 0 reads the
+        counter and hands the value to every lane, so the warp takes one decision.
+        """
+        retired_count = Int32(0)
+        if self._lane_idx == Int32(0):
+            retired_count = cute.arch.load(
+                self._device_workspace.element_ptr(self.ring_retire_region, block - Int32(self.ring_token_blocks)),
+                Int32,
+                sem="acquire",
+                scope="gpu",
+            )
+        retired_count = Int32(cute.arch.shuffle_sync(retired_count, Int32(0)))
+        return retired_count >= Int32(self.ring_retire_threshold)
+
+    @cute.jit
     def token_in(self, smem_workspace: SmemWorkspace, smem_base: cute.Pointer) -> None:
         """Wait for pushed metadata, then pull activation payloads into local pools."""
         transfer_warp_idx = self._dispatch_warp_idx
@@ -2705,6 +2852,35 @@ class TokenCommNonDeterministic(KernelComponent):
                 token_in_expert = dense_token_idx - expert_valid_begin
                 pool_token_idx = pool_expert_bases[local_expert] + token_in_expert
                 ready_slot_idx = expert_ready_slot_begin + token_in_expert // Int32(self.tokens_per_fc1_ready_slot)
+                # Row of this token in the dispatch pool (the metadata stays indexed by pool_token_idx).
+                pool_row_idx = pool_token_idx
+                # The loop carries what its body rebinds in source order. Naming pull_phase here keeps it ahead
+                # of the flag tracker, which the ring branch rebinds: the loop state has one order with and
+                # without a ring, and a build without one generates the code it would without this branch.
+                pull_phase = pull_phase
+                if cutlass.const_expr(self.ring_enabled):
+                    token_in_block = token_in_expert % Int32(self.tokens_per_fc1_ready_slot)
+                    ring_slot = ready_slot_idx % Int32(self.ring_token_blocks)
+                    pool_row_idx = ring_slot * Int32(self.tokens_per_fc1_ready_slot) + token_in_block
+                    if cutlass.const_expr(self.activation_is_quantized):
+                        ring_sf_token_idx = ring_slot * Int32(self.ring_sf_rows_per_block) + token_in_block
+                    # Slot lease: the token may be written once the block that held the slot before its block is
+                    # retired. The first ring_token_blocks blocks are the first users of their slots and ask
+                    # nothing. The answer is the same in every lane, so the warp publishes, sleeps and asks again
+                    # as one.
+                    if ready_slot_idx >= Int32(self.ring_token_blocks):
+                        retired = self._previous_occupant_retired(ready_slot_idx)
+                        if not retired:
+                            if cutlass.const_expr(self.token_in_flag_batch > 1):
+                                # Publish the ready flags this warp still batches before it sleeps: the block it
+                                # waits for may be waiting for one of them.
+                                flag_tracker.fire()
+                                flag_tracker = flag_tracker.drained()
+                            iket.range_push("token_in.ring_wait")
+                            while not retired:
+                                nanosleep(500)
+                                retired = self._previous_occupant_retired(ready_slot_idx)
+                            iket.range_pop()
 
                 self.wait_for_pool_record(local_expert, token_in_expert)
                 metadata = TokenSrcMetadata.load(
@@ -2746,7 +2922,7 @@ class TokenCommNonDeterministic(KernelComponent):
                         chunk_destination = cute.make_ptr(
                             self.activation_dtype,
                             fc1_activation_pointer.toint()
-                            + Int64(pool_token_idx) * Int64(self.bytes_per_token)
+                            + Int64(pool_row_idx) * Int64(self.bytes_per_token)
                             + chunk_offset,
                             AddressSpace.gmem,
                             assumed_align=16,
@@ -2778,7 +2954,7 @@ class TokenCommNonDeterministic(KernelComponent):
 
                     destination_activation = cute.make_ptr(
                         self.activation_dtype,
-                        fc1_activation_pointer.toint() + Int64(pool_token_idx) * Int64(self.bytes_per_token),
+                        fc1_activation_pointer.toint() + Int64(pool_row_idx) * Int64(self.bytes_per_token),
                         AddressSpace.gmem,
                         assumed_align=16,
                     )
@@ -2789,6 +2965,9 @@ class TokenCommNonDeterministic(KernelComponent):
 
                 if cutlass.const_expr(self.activation_is_quantized):
                     sf_token_idx = expert_sf_begin + token_in_expert
+                    if cutlass.const_expr(self.ring_enabled):
+                        # The scale row of the token's ring slot, resolved with its data row above.
+                        sf_token_idx = ring_sf_token_idx
                     destination_sf_row = fc1_activation_sf[Int64(sf_token_idx), ((None, None), None)]
                     destination_sf_values = cute.slice_(destination_sf_row, (0, None, None))
                     destination_sf_values = cute.group_modes(destination_sf_values, 0, 2)
@@ -3170,6 +3349,8 @@ class TokenCommNonDeterministic(KernelComponent):
         pool_expert_bases = self.pool_expert_base_tensor(self._device_workspace)
         token_metadata_pointer = self.token_src_metadata_pointer(self._device_workspace)
         fc2_done = self._device_workspace.ptr(self.fc2_done_region)
+        if cutlass.const_expr(self.fc2_output_in_ring):
+            ring_retire_count = self._device_workspace.ptr(self.ring_retire_region)
         if cutlass.const_expr(self.token_back_push_data):
             fc2_activation_pointer = self._device_workspace.ptr(self.fc2_activation_region)
             output_token_bytes = self.hidden_size * int(self.combine_format.act_dtype.width) // 8
@@ -3233,6 +3414,13 @@ class TokenCommNonDeterministic(KernelComponent):
                         iket.range_pop()
                         last_ready_slot = ready_slot
                 pool_token_idx = pool_expert_bases[local_expert] + token_in_expert
+                # Row of this token in the local FC2 output: its pool row, or with that output in the ring the
+                # row of its block's slot.
+                fc2_output_token_idx = pool_token_idx
+                if cutlass.const_expr(self.fc2_output_in_ring):
+                    fc2_output_token_idx = (ready_slot % Int32(self.ring_token_blocks)) * Int32(
+                        self.tokens_per_fc1_ready_slot
+                    ) + token_in_expert % Int32(self.tokens_per_fc1_ready_slot)
                 metadata = TokenSrcMetadata.load(
                     token_metadata_pointer.toint() + Int64(pool_token_idx) * Int64(TokenSrcMetadata.nbytes),
                     wide_topk=self.wide_topk_records,
@@ -3248,9 +3436,9 @@ class TokenCommNonDeterministic(KernelComponent):
                 if pushes_token:
                     if cutlass.const_expr(self.token_back_push_data):
                         iket.range_push("token_back.push_data")
-                        local_activation_address = fc2_activation_pointer.toint() + Int64(pool_token_idx) * Int64(
-                            output_token_bytes
-                        )
+                        local_activation_address = fc2_activation_pointer.toint() + Int64(
+                            fc2_output_token_idx
+                        ) * Int64(output_token_bytes)
                         remote_activation = cute.make_tensor(
                             cute.make_ptr(
                                 self._token_comm_args.pre_reduced_activation.dtype,
@@ -3321,7 +3509,7 @@ class TokenCommNonDeterministic(KernelComponent):
 
                     if cutlass.const_expr(self.token_back_push_sf):
                         iket.range_push("token_back.push_sf")
-                        local_sf_address = fc2_sf_pointer.toint() + Int64(pool_token_idx) * Int64(output_sf_bytes)
+                        local_sf_address = fc2_sf_pointer.toint() + Int64(fc2_output_token_idx) * Int64(output_sf_bytes)
                         remote_sf = cute.make_tensor(
                             cute.make_ptr(
                                 self._token_comm_args.pre_reduced_activation_sf.dtype,
@@ -3381,6 +3569,21 @@ class TokenCommNonDeterministic(KernelComponent):
                                     self._stateless_pace(Int32(current_window_unit), current_window)
                         iket.range_pop()
 
+                if cutlass.const_expr(self.fc2_output_in_ring):
+                    # The local FC2 output in the ring: this token's rows are out of it, every local read of them
+                    # has completed above, so add the token to the retire counter of its block. The worker that
+                    # takes an expert's last token also adds the rows its last block lacks: every block then
+                    # reaches a whole token tile, the count at which the block is retired and token_in admits
+                    # the next block of its slot. The add is relaxed: it makes no write of this thread visible.
+                    retired_rows = Int32(1)
+                    if token_in_expert == expert_token_count - Int32(1):
+                        retired_rows = retired_rows + (
+                            Int32(self.tokens_per_fc1_ready_slot)
+                            - expert_token_count % Int32(self.tokens_per_fc1_ready_slot)
+                        ) % Int32(self.tokens_per_fc1_ready_slot)
+                    if lane_idx == Int32(0):
+                        red_add_relaxed_gpu_s32(ring_retire_count + ready_slot, retired_rows)
+
                 cute.arch.sync_warp()
                 next_dense_token = self.next_token(next_dense_token)
 
@@ -3415,16 +3618,33 @@ class TokenCommNonDeterministic(KernelComponent):
         transfer_warp_idx = self._transfer_warp_idx
         lane_idx = self._lane_idx
         transfer_thread_idx = transfer_warp_idx * Int32(32) + lane_idx
-        iket.range_push("tail.nvlink_drain")
-        self._nvlink_barrier.arrive_and_wait(
-            self.transfer_thread_count,
-            Int32(self.promised_launchable_sm_count),
-            self._linear_cta_idx,
-            transfer_thread_idx,
-            prologue_grid_sync=True,
-            epilogue_grid_sync=False,
-        )
-        iket.range_pop()
+        if cutlass.const_expr(self.tail_parity):
+            # Tail parity keeps the cross-rank drain: its zeroing of the next call's shared copy in token_in is
+            # ordered by this rank's drain arrival (fence.acq_rel.sys + release).
+            iket.range_push("tail.nvlink_drain")
+            self._nvlink_barrier.arrive_and_wait(
+                self.transfer_thread_count,
+                Int32(self.promised_launchable_sm_count),
+                self._linear_cta_idx,
+                transfer_thread_idx,
+                prologue_grid_sync=True,
+                epilogue_grid_sync=False,
+            )
+            iket.range_pop()
+        else:
+            # Only a local drain before the reset. Peers write this rank's shared tail counters (sizes,
+            # sizes_ready, metadata_ready) solely from their routers, each push ending in a system-fenced
+            # increment of an exact-count ready flag; token_in acquired both flags at their targets, so no
+            # write of this call is still in flight, and the grid sync carries that to the resetting CTA.
+            # Only the publish below has to cross ranks: the next call's routers add into the reset counters.
+            iket.range_push("tail.nvlink_drain")
+            self._nvlink_barrier.sync(
+                self.transfer_thread_count,
+                Int32(self.promised_launchable_sm_count),
+                self._linear_cta_idx,
+                transfer_thread_idx,
+            )
+            iket.range_pop()
         total_reset_threads = self.promised_launchable_sm_count * self.transfer_thread_count
         global_reset_thread = self._linear_cta_idx * Int32(self.transfer_thread_count) + transfer_thread_idx
         if cutlass.const_expr(self.tail_parity):
@@ -3455,7 +3675,7 @@ class TokenCommNonDeterministic(KernelComponent):
         if cutlass.const_expr(os.environ.get("MEGA_USE_NCU", "0") == "1"):
             iket.range_push("tail.ncu_finalize")
             self._nvlink_barrier.finalize(
-                1 if self.tail_parity else 2,
+                1,
                 self.transfer_thread_count,
                 Int32(self.promised_launchable_sm_count),
                 self._linear_cta_idx,

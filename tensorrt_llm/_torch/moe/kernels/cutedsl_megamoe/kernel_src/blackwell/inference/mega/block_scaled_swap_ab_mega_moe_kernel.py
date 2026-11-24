@@ -1,6 +1,7 @@
 """Fused pull-dispatch MegaMoE kernel composition for Blackwell."""
 
 import hashlib
+import os
 
 from typing import ClassVar, Optional, Tuple
 
@@ -17,15 +18,19 @@ from cutlass.cutlass_dsl import Boolean, Int32, Int64
 from .....api import ImplDesc, KernelClass, OptionalRequirement, ProblemDesc, StaticOrRuntimeIntegerType
 from .....communication.nvlink_domain.one_round_router import _OneRoundRouter
 from .....communication.nvlink_domain.token_comm import TokenCommArgs, TokenCommNonDeterministic
+from .....communication.nvlink_domain.token_comm_dedup import TokenCommDedup
+from .....communication.token_protocol import TokenSrcMetadata
 from .....helpers.cute_py_helpers import Tcgen05MmaInstruction, make_tcgen05_tmem_plan, tcgen05_block_scaled_acc_dtype
 from .....helpers.device_workspace import DeviceWorkspace
 from .....helpers.dlb_expert_count import resolve_dlb_expert_counts
+from .....helpers.fc2_ready_geometry import derive_fc2_ready_geometry
 from .....helpers.iket_compat import iket
 from .....helpers.megamoe_aot import make_megamoe_aot_callable
 from .....helpers.route_reset import ClearInvalidRoutes
 from .....helpers.smem_workspace import SmemWorkspace
-from .....helpers.topk_reduce import TopkReduce
-from .....helpers.utils import ceil_div, round_up
+from .....helpers.topk_reduce import REDUCE_OPERAND_ALIGN_BYTES, TopkReduce, check_reduce_operand_alignment
+from .....helpers.topk_reduce_dedup import TopkReduceDedup
+from .....helpers.utils import ceil_div, ring_token_blocks_in_effect, round_up
 from .....helpers.helper_weight_ready_gate import (
     derive_helper_weight_ready_topology,
     make_helper_weight_ready_generation_gate,
@@ -37,11 +42,13 @@ from ....schedulers.fc12_scheduler import (
     BlackwellFusedFc12Scheduler,
     PhaseInterleavedFc12Scheduler,
     minimum_phase_interleave_hint,
+    minimum_phase_interleave_ring_token_blocks,
 )
 from ....schedulers.non_clc_mixed_cga import NonClcMixedCgaConfig
 from ....schedulers.shared_fc12_scheduler import SharedExpertTileSchedule
 from ...custom_mix_cga_helpers import TmaAtomOrPair, pipeline_init_arrive_mixed_cga, pipeline_init_wait_mixed_cga
 from .block_scaled_swap_ab_fc12_epilogue import GatedActEpilogueArgs, SwapABGatedActEpilogue
+from .block_scaled_swap_ab_fc12_epilogue_dedup import GatedActEpilogueArgsDedup, SwapABGatedActEpilogueDedup
 from .block_scaled_swap_ab_fc12_extension import BlockScaledSwapAbFc12Extension
 from .block_scaled_swap_ab_fc12_mainloop import BlockScaledSwapAbFc12Mainloop
 
@@ -70,6 +77,10 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
     fc1_output_region: ClassVar[str] = "blackwell.mega_moe.fc1_output"
     fc1_output_sf_region: ClassVar[str] = "blackwell.mega_moe.fc1_output_sf"
     fc1_done_counter_region: ClassVar[str] = "blackwell.mega_moe.fc1_done_counter"
+    # Ring workspace only: the region of the retire counter, one element per pool token block. The last reader of
+    # a block adds to it: the MMA warp for every FC2 MMA tile, or the combine warps for every row they pushed out
+    # of the local FC2 output.
+    ring_retire_region: ClassVar[str] = "blackwell.mega_moe.ring_retire_count"
     topk_reduce_counter_region: ClassVar[str] = "blackwell.mega_moe.topk_reduce_counters"
     shared_fc1_output_region: ClassVar[str] = "blackwell.mega_moe.shared_fc1_output"
     shared_fc1_output_sf_region: ClassVar[str] = "blackwell.mega_moe.shared_fc1_output_sf"
@@ -104,6 +115,8 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             "gate_activation": OptionalRequirement(str),
             "swiglu_alpha": OptionalRequirement(Optional[float]),
             "swiglu_beta": OptionalRequirement(Optional[float]),
+            # sigmoid on tanh.approx for the SwiGLU and SiTU cores; validated by the epilogue, keyed in name().
+            "use_tanh_sigmoid": OptionalRequirement(bool),
             "world_size": int,
             "topk": int,
             "topk_index_dtype": type,
@@ -151,6 +164,15 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             "relay_warp_count": OptionalRequirement(int),
             "fc2_done_release_scope": OptionalRequirement(str),
             "topk_reduce_persistent": OptionalRequirement(bool),
+            # Combine-side token dedup (port of the Rubin path): one pushed row per (token, destination rank).
+            "combine_dedup": OptionalRequirement(bool),
+            # Combine dedup: epilogue warps join the combine after their last tile (default on under atomic_counter).
+            "dedup_epilogue_tail_combine": OptionalRequirement(bool),
+            # Combine dedup: copies per combine fill (default 1 for reuse_dispatch / hybrid, 2 for standalone).
+            "dedup_copies_per_fill": OptionalRequirement(int),
+            # Combine dedup: fc2_done poll backoff cap in ns (default 1000; MEGA_DEDUP_WAIT_SLEEP_MAX_NS overrides).
+            "dedup_poll_max_sleep_ns": OptionalRequirement(int),
+            "ring_token_blocks": OptionalRequirement(Optional[int]),
         }
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
@@ -158,7 +180,8 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         problem_desc, impl_desc = resolve_dlb_expert_counts(
             problem_desc, impl_desc, world_size=problem_desc["world_size"]
         )
-        # The Blackwell epilogue publishes expert counters, not token-tile counters.
+        # The Blackwell epilogue publishes expert counters; it counts per token tile only with the local FC2
+        # output in the ring workspace, where the kernel asks for that itself.
         if impl_desc.get("token_back_ready_granularity", "expert") != "expert":
             raise ValueError("Blackwell requires token_back_ready_granularity='expert'.")
 
@@ -221,14 +244,46 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         self.token_in_flag_batch = impl_desc["token_in_flag_batch"]
         self.token_back_mode = impl_desc["token_back_mode"]
         self.reduce_topk_in_kernel = impl_desc["reduce_topk_in_kernel"]
+        # Ring workspace: the ring_token_blocks the caller asked for (None or 0: none). The ring in effect is
+        # self.ring_token_blocks, resolved below once the geometry is validated.
+        self.requested_ring_token_blocks = impl_desc.get("ring_token_blocks")
+        # Read by the router, which takes it from the caller's descriptor. Kept here for the check of a requested
+        # ring, which applies the router's limits with the settings the router gets.
+        self.comm_stage_depths = tuple(impl_desc.get("comm_stage_depths", (1, 1)))
         self.skip_topk_reduce = impl_desc.get("skip_topk_reduce", False)
         self.helper_expert_count = impl_desc.get("helper_expert_count", 0)
         if type(self.helper_expert_count) is not int or self.helper_expert_count < 0:
             raise ValueError("helper_expert_count must be a non-negative exact int")
         # Opt-in persistent scheduler for the separate top-k reduce.
-        self.topk_reduce_persistent = bool(impl_desc.get("topk_reduce_persistent"))
-        if self.topk_reduce_persistent and self.reduce_topk_in_kernel:
-            raise ValueError("topk_reduce_persistent applies to the separate top-k reduce; reduce_topk_in_kernel has none.")
+        self.topk_reduce_persistent = bool(
+            impl_desc.get("topk_reduce_persistent") and not self.reduce_topk_in_kernel
+        )
+        self.combine_dedup = bool(impl_desc.get("combine_dedup", False))
+        requested_tail = impl_desc.get("dedup_epilogue_tail_combine")
+        self.dedup_epilogue_tail_combine = self.combine_dedup and (
+            impl_desc["work_id_mode"] == "atomic_counter" if requested_tail is None else bool(requested_tail)
+        )
+        requested_copies_per_fill = impl_desc.get("dedup_copies_per_fill")
+        self.dedup_copies_per_fill = (
+            int(requested_copies_per_fill)
+            if requested_copies_per_fill is not None
+            else 1 if self.token_back_mode in ("reuse_dispatch_warps", "hybrid_warps") else 2
+        )
+        requested_poll_cap = impl_desc.get("dedup_poll_max_sleep_ns")
+        self.dedup_poll_max_sleep_ns = int(
+            requested_poll_cap
+            if requested_poll_cap is not None
+            else os.environ.get("MEGA_DEDUP_WAIT_SLEEP_MAX_NS", self.default_dedup_poll_max_sleep_ns)
+        )
+        # Diagnostic only (MEGA_DIAG_SKIP_TOKEN_BACK=1): the combine warps do nothing and the output is wrong.
+        self._diag_skip_token_back = os.environ.get("MEGA_DIAG_SKIP_TOKEN_BACK", "0") == "1"
+        if self.combine_dedup:
+            # The one-round router and tail parity are TRT-LLM-local and exist only in the NVLink token comm, not in
+            # the dedup one; the fused shared expert is not wired into the dedup epilogue.
+            self.one_round_dispatch = False
+            if self.fuse_shared:
+                raise ValueError("The fused shared expert does not support combine_dedup.")
+        self.tail_parity = not self.combine_dedup
 
         self.occupancy = 1
         self.architecture = "sm_100"
@@ -246,7 +301,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             self.home_expert_count = self.local_expert_count
         # Master switch of every internode (multi-node) code path. False (the default) is the
         # NVLink-domain kernel of main: the nvlink component, one logical node, no GIN handles, no
-        # relay warps, main's compile-cache name; the internode keys must be absent. True selects
+        # relay warps, no component token in the compile-cache name; the internode keys must be absent. True selects
         # the internode_gin component (communication/internode/).
         self.internode = bool(impl_desc.get("internode", False))
         self.token_comm_kind = impl_desc.get("token_comm_kind", "internode_gin" if self.internode else "nvlink")
@@ -292,7 +347,41 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             )
 
         self._validate_geometry()
+        # Ring workspace (0: off). The per-launch pools on the way of a routed token are sized for
+        # ring_token_blocks token blocks instead of the worst-case routed tokens: the dispatched-token pool, the
+        # FC1 output and, where the kernel keeps the FC2 result in a local FC2 output for combine warps of its
+        # own, that output (ring_covers_fc2_output). Pool token block b lives in slot b % ring_token_blocks of
+        # each and keeps it until the block is retired, that is until its last reader is done (the slot lease).
+        # token_in alone waits for the ring: it writes a block once the block that held its slot before is
+        # retired. A requested ring that would not be smaller than the worst case is not in effect: the kernel
+        # is then the kernel without the key, in everything it sizes, generates and names.
+        self.ring_token_blocks = ring_token_blocks_in_effect(
+            self.requested_ring_token_blocks,
+            tokens_per_block=self.tokens_per_token_block,
+            source_tokens=self.world_size * self.max_tokens_per_rank,
+            local_experts=self.local_expert_count,
+            topk=self.topk,
+            token_padding_block=self.token_padding_block,
+            sf_padding_block=self.sf_padding_block,
+        )
+        # A requested ring is checked as a ring, in effect or not: what is supported does not depend on the
+        # problem size.
+        self._validate_ring_workspace()
+        # The key never makes an invalid configuration valid: the caller's hint is validated against the
+        # caller's FC1 flag batch, as without the key, before the ring takes that batch over.
         self._resolve_schedule_hint()
+        # The ring in effect takes two tuning values over, and name() shows what is in effect. Everything else
+        # that conflicts with a ring is refused (_validate_ring_workspace).
+        if self.ring_token_blocks:
+            # A held FC1 completion flag could be the very one a ring slot waits for: publish each tile at once.
+            # The prologue of a caller who left the hint to the kernel is then the smallest safe one, not that
+            # one rounded up to the caller's batch; a hint the caller gave stays the caller's.
+            self.epi_flag_batches = (1, self.epi_flag_batches[1])
+            self.hint = self._ring_schedule()["hint"]
+        if self.ring_covers_fc2_output:
+            # Likewise for FC2: a held completion could be the one the combine warps need to push, and with
+            # that retire, the block a ring slot waits for.
+            self.epi_flag_batches = (self.epi_flag_batches[0], 1)
         mma_cta_count = 2 if self.use_2cta_instrs else 1
         mma_instruction = Tcgen05MmaInstruction(
             a_type=self.a_dtype,
@@ -305,13 +394,24 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             sf_vec_size=self.sf_vec_size,
         )
         tmem_plan = make_tcgen05_tmem_plan(mma_instruction, self.architecture, self.mma_tiler_mnk)
-        tokens_per_fc1_ready_slot = self.mma_tiler_mnk[1] * self.cluster_shape_mn[1]
+        tokens_per_fc1_ready_slot = self.tokens_per_token_block
         hidden_per_fc2_cluster_tile = self.mma_tiler_mnk[0] // mma_cta_count * self.cluster_shape_mn[0]
         fc2_done_signals_per_token_tile = (
             ceil_div(self.hidden_size, hidden_per_fc2_cluster_tile)
             * self.cluster_shape_mn[0]
             * self.cluster_shape_mn[1]
         )
+        if self.ring_covers_fc2_output:
+            # A local FC2 output in the ring workspace is read out block by block, so FC2 completion is counted
+            # per token tile: every CTA tile of a block publishes once. The helper checks that a ready slot is
+            # one token tile (hidden-only clusters, complete MMA CTA groups).
+            tokens_per_fc1_ready_slot, fc2_done_signals_per_token_tile = derive_fc2_ready_geometry(
+                hidden_size=self.hidden_size,
+                mma_tiler_mnk=self.mma_tiler_mnk,
+                cluster_shape_mn=self.cluster_shape_mn,
+                use_2cta_instrs=self.use_2cta_instrs,
+                fallback_cluster_shape_mn=self.fallback_cluster_shape_mn,
+            )
         token_comm_impl_desc = ImplDesc(
             {
                 **impl_desc,
@@ -321,16 +421,32 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 "tokens_per_fc1_ready_slot": tokens_per_fc1_ready_slot,
                 "fc2_done_signals_per_token_tile": fc2_done_signals_per_token_tile,
                 "promised_launchable_sm_count": self.mixed_cga_config.total_cta_cnt,
-                "token_back_schedule_mode": ("atomic_counter" if self.work_id_mode == "atomic_counter" else "static"),
-                "tail_parity": True,
+                "token_back_schedule_mode": self.token_back_schedule_mode,
+                "tail_parity": self.tail_parity,
                 "one_round_dispatch": self.one_round_dispatch,
                 "one_round_cta_count": self.one_round_cta_count,
+                # sm_100 / sm_103 have no fma.f32x2.bf16x2: the dedup combine reduce widens bf16 first.
+                **(
+                    {
+                        "dedup_mixed_precision_fma": False,
+                        "dedup_epilogue_tail_combine": self.dedup_epilogue_tail_combine,
+                        "dedup_copies_per_fill": self.dedup_copies_per_fill,
+                        "dedup_poll_max_sleep_ns": self.dedup_poll_max_sleep_ns,
+                    }
+                    if self.combine_dedup
+                    else {}
+                ),
+                "token_back_ready_granularity": "token_tile" if self.ring_covers_fc2_output else "expert",
+                **self._ring_lease_impl_fields(tokens_per_fc1_ready_slot),
             }
         )
         # One assignment on purpose: tests/test_dlb_contracts.py executes the constructor's
         # self.token_comm binding in isolation, so the class choice cannot live in a local.
+        # combine_dedup with internode is rejected by _validate_geometry.
         self.token_comm = (
-            _internode_component() if self.internode else TokenCommNonDeterministic
+            TokenCommDedup
+            if self.combine_dedup
+            else _internode_component() if self.internode else TokenCommNonDeterministic
         )(problem_desc, token_comm_impl_desc)
         # CTA layout: 12 warps, or 16 when warps 12-15 host standalone token-back or the
         # component's relay group. Both wide layouts use the standalone register budget
@@ -338,8 +454,8 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         self.relay_warp_count = self.token_comm.relay_warp_count
         if self.relay_warp_count not in (0, 4):
             raise ValueError(f"relay_warp_count must be 0 or 4, got {self.relay_warp_count}.")
-        if self.relay_warp_count > 0 and self.token_back_mode == "standalone_warps":  # nosec B105
-            raise ValueError("token_back_mode='standalone_warps' and a relay warp group both need warps 12-15.")
+        if self.relay_warp_count > 0 and self.token_back_mode in ("standalone_warps", "hybrid_warps"):  # nosec B105
+            raise ValueError(f"token_back_mode={self.token_back_mode!r} and a relay warp group both need warps 12-15.")
         if self.relay_warp_count > 0:
             # The internode combine gather also runs on the epilogue warps after their last tile.
             epilogue_workers = getattr(self.token_comm, "combine_epilogue_worker_warps", None)
@@ -348,7 +464,8 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                     "The component's combine_epilogue_worker_warps must equal the kernel's epilogue warp "
                     f"count ({len(self.epilogue_warp_ids)})."
                 )
-        wide_layout = self.token_back_mode == "standalone_warps" or self.relay_warp_count > 0  # nosec B105
+        # hybrid_warps (dedup only): the standalone combine warps 12-15 plus the dispatch warps after token_in.
+        wide_layout = self.token_back_mode in ("standalone_warps", "hybrid_warps") or self.relay_warp_count > 0  # nosec B105
         self.threads_per_cta = 16 * 32 if wide_layout else 12 * 32
         self.other_warp_register_count = 64 if wide_layout else 72
         self.max_tokens = self.token_comm.worst_case_token_count
@@ -371,6 +488,9 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 "fc1_epi_flag_batch": self.epi_flag_batches[0],
                 "epi_async_release": impl_desc.get("epi_async_release", True),
                 "fc2_epi_flag_batch": self.epi_flag_batches[1],
+                # With the local FC2 output in the ring workspace an FC2 tile stores into the ring slot of its
+                # block and publishes its completion per block.
+                "fc2_output_ring_blocks": self.ring_token_blocks if self.ring_covers_fc2_output else 0,
                 "fc2_done_release_scope": self.token_comm.fc2_done_release_scope,
                 # Optional int: absent when the component has no relay records (validation rejects None).
                 **(
@@ -379,15 +499,31 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                     else {}
                 ),
                 "publish_fc2_done": self.token_comm.publishes_fc2_done,
+                # Combine dedup: the FC2 epilogue scatters rows into TokenCommDedup's order buffer.
+                **(
+                    {
+                        "dedup_world_size": self.world_size,
+                        "dedup_topk": self.topk,
+                        "dedup_chunk_bytes": self.token_comm.order_chunk_bytes,
+                        "dedup_chunks_per_row": self.token_comm.order_chunks_per_row,
+                    }
+                    if self.combine_dedup
+                    else {}
+                ),
             }
         )
         scheduler_type = (
             BlackwellFusedFc12Scheduler if self.schedule_mode == "grouped" else PhaseInterleavedFc12Scheduler
         )
         self.scheduler = scheduler_type(fc12_problem_desc, resolved_impl_desc)
-        self.epilogue = SwapABGatedActEpilogue(fc12_problem_desc, resolved_impl_desc)
+        if self.combine_dedup:
+            self.epilogue = SwapABGatedActEpilogueDedup(fc12_problem_desc, resolved_impl_desc)
+        else:
+            self.epilogue = SwapABGatedActEpilogue(fc12_problem_desc, resolved_impl_desc)
         if self.fuse_shared:
             self._init_shared_expert()
+        if self.ring_covers_fc2_output:
+            self._validate_token_tile_ready_contract()
         if self.epilogue.fc1_output_dtype is not self.b_dtype:
             raise ValueError("Epilogue FC1 output dtype must match the Mainloop B dtype.")
         if self.epilogue.fc1_output_sf_dtype is not self.sf_dtype:
@@ -396,6 +532,8 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             raise ValueError("Epilogue and Mainloop scale vector sizes must match.")
         self._device_workspace = self._build_device_workspace()
         self._mainloop, self._smem_workspace = self._build_mainloop_and_smem(fc12_problem_desc, resolved_impl_desc)
+        if self.dedup_epilogue_tail_combine:
+            self._check_epilogue_tail_ring()
         self.masks_invalid_combine_slots = not self.reduce_topk_in_kernel and not self.internode
         # With relay tokens the reduce adds one returned BF16 node partial per remote node (I11).
         internode_reduce = (
@@ -406,6 +544,9 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         self._topk_reduce = (
             None
             if self.reduce_topk_in_kernel or self.skip_topk_reduce
+            # Dedup: weights are folded at FC1; sum the rank slots named by the valid-rank mask.
+            else TopkReduceDedup(self.hidden_size, self.world_size, self.combine_format)
+            if self.combine_dedup
             else TopkReduce(
                 self.hidden_size,
                 self.topk,
@@ -507,6 +648,38 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             raise ValueError(f"topk_index_dtype must be Int32 or Int64, got {self.topk_index_dtype}.")
         if self.reduce_topk_in_kernel and not self.apply_topk_at_fc1:
             raise ValueError("In-kernel top-k reduction requires apply_topk_at_fc1=True.")
+        if self.token_back_mode == "hybrid_warps" and not self.combine_dedup:
+            raise ValueError("token_back_mode='hybrid_warps' exists only in the combine-dedup token_back.")
+        if self.combine_dedup:
+            if self.topk > TokenSrcMetadata.MAX_TOPK or self.world_size > TokenSrcMetadata.MAX_RANKS:
+                raise ValueError(
+                    f"TokenSrcMetadata keeps topk and rank in {TokenSrcMetadata.FIELD_BITS} bits each; "
+                    f"topk must be <= {TokenSrcMetadata.MAX_TOPK} and world_size <= {TokenSrcMetadata.MAX_RANKS}."
+                )
+            if self.max_tokens_per_rank > TokenSrcMetadata.MAX_TOKENS:
+                raise ValueError(
+                    f"TokenSrcMetadata keeps the token index in {TokenSrcMetadata.TOKEN_BITS} bits; "
+                    f"max_tokens_per_rank must be <= {TokenSrcMetadata.MAX_TOKENS}."
+                )
+            if not self.apply_topk_at_fc1:
+                raise ValueError("combine_dedup applies top-k scores at FC1 only (pre_fc1_quant).")
+            if self.combine_format.is_quantized or self.combine_format.act_dtype is not cutlass.BFloat16:
+                raise ValueError("combine_dedup supports the BF16 combine format only.")
+            if self.world_size > 32:
+                raise ValueError("combine_dedup keeps the destination-rank mask in an Int32; world_size must be <= 32.")
+            if self.token_back_mode == "epi_warps":
+                raise ValueError(
+                    "combine_dedup pushes the reduced rank-major rows from the combine warps; use "
+                    "reuse_dispatch_warps, standalone_warps or hybrid_warps."
+                )
+            if not self.fc2_use_bulk:
+                raise ValueError("combine_dedup stages FC2 subtiles in SMEM for per-token bulk stores; fc2_use_bulk must be on.")
+            if self.internode:
+                raise ValueError("combine_dedup is an NVLink-domain path; internode must be off.")
+            if self.skip_topk_reduce or self.topk_reduce_persistent:
+                raise ValueError("combine_dedup has its own rank-slot reduce; skip_topk_reduce / topk_reduce_persistent must be off.")
+            if self.fc1_activation_per_token_scale:
+                raise ValueError("combine_dedup's router does not carry per-token FC1 activation scales.")
         if self.intermediate_gateup_size % 2 != 0:
             raise ValueError("The SwiGLU intermediate dimension must be even.")
         if self.max_tokens_per_rank <= 0:
@@ -598,18 +771,203 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 f"minimum legal hint is {minimum_safe_hint}."
             )
 
+    def minimum_ring_token_blocks(self) -> int:
+        """Smallest ring_token_blocks a kernel of this configuration accepts (phase_interleave only).
+
+        It is the minimum a ring kernel enforces, also when this kernel was built without a ring.
+        """
+        if self.schedule_mode != "phase_interleave":
+            raise ValueError("The ring workspace requires schedule_policy phase_interleave.")
+        return minimum_phase_interleave_ring_token_blocks(**self._ring_schedule())
+
+    def _ring_schedule(self) -> dict:
+        """The phase_interleave schedule of a ring kernel of this configuration: the FC1 and FC2 cluster tiles of
+        a token block, the clusters that claim them and the FC1 prologue (hint).
+
+        A ring publishes every FC1 completion at once, so where the caller leaves the hint to the kernel the
+        prologue of a ring kernel is the smallest safe one, not that one rounded up to the caller's FC1 flag
+        batch. It is the same whether a ring is in effect or not.
+        """
+        mma_cta_count = 2 if self.use_2cta_instrs else 1
+        cluster_feature_tile = self.mma_tiler_mnk[0] // mma_cta_count * self.cluster_shape_mn[0]
+        blocks_fc1 = ceil_div(self.intermediate_gateup_size, cluster_feature_tile)
+        blocks_fc2 = ceil_div(self.hidden_size, cluster_feature_tile)
+        clusters = self.mixed_cga_config.launch_cluster_cnt_merge_as_preferred
+        schedule = dict(blocks_fc1=blocks_fc1, blocks_fc2=blocks_fc2, launch_cluster_cnt_merge_as_preferred=clusters)
+        hint = self.schedule_policy[1]
+        if hint is None:
+            hint = minimum_phase_interleave_hint(**schedule)
+        return dict(schedule, hint=hint)
+
+    def _validate_ring_workspace(self) -> None:
+        """A requested ring is checked as a ring, whatever the problem size.
+
+        Everything the ring cannot work with is refused for the ring the caller asked for, also where that ring
+        would save nothing and the kernel runs without it (ring_token_blocks is 0 then): whether a configuration
+        is supported does not depend on max_tokens_per_rank. The value itself was checked when the ring in effect
+        was resolved. What the ring takes over instead of refusing is in the constructor.
+        """
+        ring_token_blocks = self.requested_ring_token_blocks
+        if not ring_token_blocks:
+            return
+        if self.tail_parity or self.one_round_dispatch or self.fuse_shared:
+            # TRT-LLM local features: their workspace epochs and extra tiles were never checked with a ring.
+            raise NotImplementedError(
+                "The ring workspace does not support tail parity, the one-round router or the fused shared expert."
+            )
+        if self.schedule_mode != "phase_interleave":
+            # grouped runs the FC1 tiles of a whole expert group before its FC2 tiles: every block of the
+            # group is live at once, and a single expert can hold every routed token.
+            raise ValueError("The ring workspace requires schedule_policy phase_interleave.")
+        if self.internode:
+            raise NotImplementedError("The ring workspace does not support the internode component.")
+        if self.token_back_mode == "reuse_dispatch_warps":
+            # Not supported, with combine_dedup or without. Without it the local FC2 output of this mode, the
+            # largest pool, could never join the ring.
+            raise NotImplementedError(
+                "The ring workspace does not support token_back_mode reuse_dispatch_warps: its dispatch warps "
+                "start pushing only after they have received every token, while the one wait of the ring is in "
+                "token_in."
+            )
+        if self.ring_would_cover_fc2_output:
+            # The ring has the local FC2 output in it: FC2 TMA stores put a tile into the slot of its block, and
+            # the combine warps read the slots block by block.
+            if not self.fc2_use_bulk:
+                raise NotImplementedError(
+                    "The ring workspace with standalone_warps requires fc2_use_bulk (FC2 TMA stores into the "
+                    "local FC2 output)."
+                )
+            if self._diag_skip_token_back:
+                raise ValueError(
+                    "The ring workspace with standalone_warps cannot run under MEGA_DIAG_SKIP_TOKEN_BACK: its "
+                    "combine warps would retire no block."
+                )
+        if not self.combine_dedup:
+            # The limits of the router's own paths, in the router's one definition and words (the staged
+            # token_in, and with the local FC2 output in the ring the multi-stage token-back and the static
+            # token-back schedule). The combine_dedup router has no such path.
+            TokenCommNonDeterministic.validate_ring_paths(
+                dispatch_stage_depth=self.comm_stage_depths[0],
+                combine_stage_depth=self.comm_stage_depths[1],
+                token_back_schedule_mode=self.token_back_schedule_mode,
+                token_back_mode=self.token_back_mode,
+            )
+        token_tile = self.tokens_per_token_block
+        if round_up(token_tile, 128) % token_tile != 0:
+            # A ring slot is one token tile of data rows and that tile rounded up to whole 128-row scale atoms;
+            # the kernel extension derives the data row of a slot from its scale row (get_gmem_tensor).
+            raise ValueError(
+                f"The ring workspace needs a token tile that divides the scale rows of its slot, got {token_tile}."
+            )
+        # combine_dedup needs no check of its own: its router has the same single-stage token_in, with the ring
+        # rows and the admission, and what it adds (the order buffer, the rank mask) is addressed by source
+        # token and rank, never by a pool row. Nor do DLB helper experts: a helper slot is a physical expert
+        # of the rank, numbered in the pool like every other, and the scheduler warp's wait for its weights
+        # holds a claimed tile back without changing the claim order.
+        minimum = self.minimum_ring_token_blocks()
+        if ring_token_blocks < minimum:
+            raise ValueError(
+                f"ring_token_blocks {ring_token_blocks} cannot hold the FC1 lead of this schedule "
+                f"(hint {self._ring_schedule()['hint']}, "
+                f"{self.mixed_cga_config.launch_cluster_cnt_merge_as_preferred} clusters); the minimum is {minimum}."
+            )
+
+    def _validate_token_tile_ready_contract(self) -> None:
+        """Check the FC2 completion count per token tile against the built components.
+
+        With the local FC2 output in the ring the combine warps read a block once its counter shows
+        fc2_done_signals_per_token_tile, so the scheduler's logical CTA geometry, the epilogue's tiles and that
+        target have to agree.
+        """
+        mapping_tile = self.scheduler.mapping_cta_tile_shape_mnk
+        mapping_cluster = self.scheduler.mapping_cluster_shape_mn
+        if (
+            mapping_cluster != (1, self.cluster_shape_mn[0])
+            or mapping_tile[:2] != (self.epilogue.cta_tile_n, self.epilogue.cta_tile_m)
+        ):
+            raise ValueError(
+                "The ring workspace with standalone_warps needs the scheduler and the epilogue to share the logical "
+                "CTA geometry."
+            )
+        expected_signals = ceil_div(self.hidden_size, mapping_tile[1] * mapping_cluster[1]) * mapping_cluster[1]
+        if (
+            self.token_comm.tokens_per_fc1_ready_slot != mapping_tile[0]
+            or self.token_comm.fc2_done_signals_per_token_tile != expected_signals
+        ):
+            raise ValueError(
+                "The ring workspace with standalone_warps needs the combine warps and the FC2 epilogue to share "
+                "ready slots and completion counts."
+            )
+
+    @property
+    def token_back_schedule_mode(self) -> str:
+        """The token-back schedule this kernel hands its router: it follows the work-id mode."""
+        return "atomic_counter" if self.work_id_mode == "atomic_counter" else "static"
+
+    @property
+    def ring_would_cover_fc2_output(self) -> bool:
+        """True when a ring of this kernel, of whatever size, has the local FC2 output in it: a property of the
+        caller's configuration, with a ring in effect or without. The checks of a requested ring read this one.
+
+        With token_back_mode standalone_warps and no combine_dedup the kernel keeps the FC2 result in a local
+        FC2 output for combine warps of its own: that output is on the way of a block, and the last reader of
+        the block is the combine. In every other mode a ring goes with, the last reader is the FC2 operand load.
+        """
+        return self.token_back_mode == "standalone_warps" and not self.combine_dedup
+
+    @property
+    def ring_covers_fc2_output(self) -> bool:
+        """True when the local FC2 output is in the ring in effect: a ring of the same token blocks as the other
+        pools. Everything that sizes a pool or generates code reads this one."""
+        return bool(self.ring_token_blocks) and self.ring_would_cover_fc2_output
+
+    def _ring_lease_impl_fields(self, tokens_per_block: int) -> dict:
+        """token_comm's ring keys: the ring size, whether its local FC2 output is in the ring, the retire counter
+        and the count at which a block is retired.
+
+        The last reader of a block adds to the retire counter. Without the local FC2 output in the ring that is
+        the FC2 operand load: the MMA warp adds one for every in-bound FC2 MMA tile of the block (the mainloop's
+        run_mma). With it, it is the combine: the combine warps add the rows they have pushed out of that
+        output, a whole token block of rows per block, and the MMA warp adds nothing.
+        """
+        retire_region, retire_threshold = None, None
+        if self.ring_token_blocks:
+            retire_region = self.ring_retire_region
+            retire_threshold = ceil_div(self.hidden_size, self.mma_tiler_mnk[0])
+            if self.ring_covers_fc2_output:
+                retire_threshold = tokens_per_block
+        return {
+            "ring_token_blocks": self.ring_token_blocks,
+            "ring_retire_region": retire_region,
+            "ring_retire_threshold": retire_threshold,
+        }
+
+    @property
+    def tokens_per_token_block(self) -> int:
+        """Routed tokens of one token block: one token tile of one expert, the ready slot of the router."""
+        return self.mma_tiler_mnk[1] * self.cluster_shape_mn[1]
+
+    @property
+    def separate_tmp_buffer(self) -> bool:
+        """True: the per-launch data lives in the caller-owned tmp buffer (third pointer operand)."""
+        # The internode component keeps main's single local buffer: its router data regions were
+        # never validated on a recycled buffer.
+        return not self.internode
+
     def _build_device_workspace(self) -> DeviceWorkspace:
         intermediate_downproj = self.intermediate_gateup_size // 2
         sf_column_count = round_up(ceil_div(intermediate_downproj, self.sf_vec_size), 4)
-        max_sf_rows = self.token_comm.worst_case_sf_token_count
+        # The FC1 output has the rows of the router's dispatch pool: the worst case, or the ring.
+        max_sf_rows = self.token_comm.fc1_pool_sf_token_count
         counter_slot_count = self.token_comm.max_fc1_ready_slot_count
 
-        device_workspace = DeviceWorkspace()
-        device_workspace.enable_tail_parity()
+        device_workspace = DeviceWorkspace(separate_tmp=self.separate_tmp_buffer)
+        if self.tail_parity:
+            device_workspace.enable_tail_parity()
         device_workspace.register(
             self.fc1_output_region,
             self.epilogue.fc1_output_dtype,
-            (self.max_tokens, intermediate_downproj),
+            (self.token_comm.fc1_pool_token_count, intermediate_downproj),
             buffer_space="local",
             mem_order=(1, 0),
             byte_alignment=128,
@@ -630,6 +988,16 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             byte_alignment=16,
             reset="tail_reset",
         )
+        if self.ring_token_blocks:
+            # One counter per pool token block, like the FC1 done counter: the ring reuses rows, not counters.
+            device_workspace.register(
+                self.ring_retire_region,
+                cutlass.Int32,
+                (counter_slot_count,),
+                buffer_space="local",
+                byte_alignment=16,
+                reset="tail_reset",
+            )
         if self.topk_reduce_persistent:
             # Work cursor of the persistent top-k reduce: tail-reset like the
             # other per-launch counters, so it is zero before every reduce.
@@ -677,8 +1045,12 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         return device_workspace
 
     def get_workspace_sizes(self) -> Tuple[int, int]:
-        """Return required local and shared workspace bytes."""
+        """Return required local and shared workspace bytes. The tmp buffer is sized by get_tmp_buffer_bytes()."""
         return self._device_workspace.local_and_shared_bytes
+
+    def get_tmp_buffer_bytes(self) -> int:
+        """Return the size of the caller-owned tmp buffer (0: the per-launch data stays in the local workspace)."""
+        return self._device_workspace.tmp_bytes
 
     @property
     def require_zero_workspace_leading_bytes(self) -> Tuple[int, int]:
@@ -755,19 +1127,43 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             f"{'_weightevictfirst' if self._mainloop.weight_evict_first else ''}"
             f"{self._shared_name_suffix()}"
             f"{f'_oneround{self.one_round_cta_count}' if self.one_round_dispatch else ''}"
-            f"{'_tailpar' if self.token_comm.tail_parity else ''}"
-            # Empty for the NVLink-domain component: the internode=False kernel keeps main's name.
+            f"{'_tailpar' if self.tail_parity else ''}"
+            # Empty for the NVLink-domain component: the internode=False kernel carries no component token.
             + (f"_{self.token_comm.name_token}" if self.token_comm.name_token else "")
             + "_dlb_v1"
             # Off / SwiGLU keep the historical name so existing compiled-kernel caches stay valid.
             + ("_fc1actscale" if self.fc1_activation_per_token_scale else "")
             + (f"_act{self.gate_activation}" if self.gate_activation != "swiglu" else "")
+            # Every build takes the tmp_buffer operand (None with the internode component): an ABI change, so it
+            # keys the compiled kernel and its AOT symbol.
+            + "_tmpbuf_v1"
+            + ("_tanhsigmoid" if self.epilogue.use_tanh_sigmoid else "")
+            + ("_dedup" if self.combine_dedup else "")
+            + (f"_c{self.token_comm.order_chunk_bytes}" if self.combine_dedup else "")
+            + ("_epitail" if self.dedup_epilogue_tail_combine else "")
+            + (f"_cpf{self.token_comm.token_back_copies_per_fill}" if self.combine_dedup else "")
+            + (f"_poll{self.token_comm.fc2_done_wait_sleep_max_ns}" if self.combine_dedup else "")
+            + ("_diagskiptb" if self._diag_skip_token_back else "")
+            # The ring size is baked into the pool layouts and the slot arithmetic.
+            + (f"_ring{self.ring_token_blocks}_v1" if self.ring_token_blocks else "")
         )
 
     def _shared_name_suffix(self) -> str:
         if not self.fuse_shared:
             return ""
         return f"_sharedfp8i{self.shared_intermediate_size}clamp{self.shared_gate_up_clamp}"
+
+    default_dedup_poll_max_sleep_ns: ClassVar[int] = 1000
+
+    def _check_epilogue_tail_ring(self) -> None:
+        """The epilogue-tail ring reuses the FC2 staging SMEM: check that it fits."""
+        needed = self.token_comm.epilogue_tail_ring_bytes
+        staging = 0 if self.epilogue.fc2_staging_spec is None else self.epilogue.fc2_staging_spec.nbytes
+        if staging < needed:
+            raise ValueError(
+                f"The combine-dedup epilogue tail needs {needed} B of FC2 staging SMEM, the staging region has "
+                f"{staging} B."
+            )
 
     def aot_compile(self, out_path: Optional[str] = None, **_compile_kwargs):
         """Compile against fake (metadata-only) inputs; ``out_path=None`` returns the in-memory callable.
@@ -821,7 +1217,10 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             fc1_weight_sf=fake_tensor(self.sf_dtype, (experts, fc1_weight_sf_columns), (1, 0), {0}, 16),
             fc2_weight=fake_tensor(self.a_dtype, (experts, intermediate_downproj, hidden), (2, 0, 1), {0, 2}, 16),
             fc2_weight_sf=fake_tensor(self.sf_dtype, (experts, fc2_weight_sf_columns), (1, 0), {0}, 16),
-            output_activation=fake_tensor(output_dtype, (tokens, hidden), (1, 0), {0}, 16),
+            # 32 B under combine dedup: TopkReduceDedup stores 256-bit rows.
+            output_activation=fake_tensor(
+                output_dtype, (tokens, hidden), (1, 0), {0}, REDUCE_OPERAND_ALIGN_BYTES if self.combine_dedup else 16
+            ),
             # Opaque byte workspaces: a bare base pointer, like to_cute_ptr. The 128-byte promise matches the
             # alignment the registered regions assume, so the caller must hand over 128-byte-aligned bases.
             local_workspace=make_ptr(cutlass.Uint8, 0, AddressSpace.gmem, assumed_align=128),
@@ -834,6 +1233,13 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 max_ranks=self.world_size,
             ),
             stream=make_fake_stream(),
+        )
+        # Caller-owned tmp buffer: a bare base pointer with the same 128-byte promise as the workspaces.
+        # The internode component has none: its per-launch data stays in local_workspace.
+        fake_arguments.update(
+            tmp_buffer=make_ptr(cutlass.Uint8, 0, AddressSpace.gmem, assumed_align=128)
+            if self.separate_tmp_buffer
+            else None
         )
         if self.helper_expert_count > 0:
             fake_arguments.update(
@@ -941,8 +1347,12 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         fc2_weight: cute.Tensor,  # (local_experts, intermediate_downproj, hidden)
         fc2_weight_sf: cute.Tensor,  # (local_experts, packed_fc2_scale_factors)
         output_activation: cute.Tensor,  # (tokens, hidden)
-        local_workspace: cute.Pointer,  # local GMEM byte workspace
+        local_workspace: cute.Pointer,  # local GMEM byte workspace: kernel state, persistent
         shared_workspace: cute.Pointer,  # symmetric GMEM byte workspace
+        # Caller-owned per-launch buffer of get_tmp_buffer_bytes() bytes, 128-byte aligned: any content
+        # at launch, nothing in it survives the launch, may be a different buffer on every launch.
+        # None iff the internode component is selected (its per-launch data stays in local_workspace).
+        tmp_buffer: Optional[cute.Pointer],
         peer_rank_ptr_mapper_host,
         stream: cuda.CUstream,
         fc1_alpha: Optional[cute.Tensor] = None,  # (local_experts,)
@@ -969,6 +1379,9 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         num_valid_tokens: Optional[cute.Tensor] = None,
     ) -> None:
         """Launch router, fused MegaMoE compute, and optional TopK reduce."""
+        if cutlass.const_expr(self.combine_dedup):
+            # TopkReduceDedup stores 256-bit rows: the caller declares 32 B (as on Rubin).
+            check_reduce_operand_alignment(output_activation=output_activation)
         # One constexpr bool: the DSL preprocessor only treats a plain ``const_expr(...)`` test as
         # static, so a ``raise`` under ``const_expr(a) or const_expr(b)`` is rejected as an early exit.
         gin_argument_mismatch: cutlass.Constexpr = ((gin_dev_comm is None) != (gin_window is None)) or (
@@ -993,6 +1406,11 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         def rewrite_tensor_shape(tensor: cute.Tensor, shape: Tuple) -> cute.Tensor:
             return cute.make_tensor(tensor.iterator, cute.make_layout(shape, stride=tensor.stride))
 
+        if cutlass.const_expr(self.separate_tmp_buffer != (tmp_buffer is not None)):
+            raise ValueError(
+                "tmp_buffer must be a pointer iff the kernel keeps its per-launch data in the tmp buffer "
+                f"(separate_tmp_buffer={self.separate_tmp_buffer})."
+            )
         if cutlass.const_expr(self.fc1_activation_per_token_scale != (fc1_activation_per_token_scale is not None)):
             raise ValueError(
                 "fc1_activation_per_token_scale must be passed iff the descriptor enables it "
@@ -1083,11 +1501,12 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             router_activation,
             router_activation_sf,
             fc1_activation_per_token_scale,
+            tmp_buffer=tmp_buffer,
         )
 
         peer_rank_ptr_mapper = peer_rank_ptr_mapper_host.make_device_object()
         self._device_workspace.assign_device_members(
-            local_workspace, shared_workspace, read_epoch=False
+            local_workspace, shared_workspace, tmp_buffer, read_epoch=False
         )
         # Only external partial-output consumers need invalid rows cleared.
         if cutlass.const_expr(not self.reduce_topk_in_kernel and self.skip_topk_reduce):
@@ -1116,7 +1535,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         fc2_weight = rewrite_tensor_shape(fc2_weight, (experts, intermediate_downproj, hidden))
 
         singleton = cutlass.Int32(1)
-        token_rows = self.max_tokens
+        token_rows = self.token_comm.fc1_pool_token_count
 
         fc1_a = cute.make_tensor(
             fc1_weight.iterator,
@@ -1141,7 +1560,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         )
 
         sf_vec_size = self.sf_vec_size
-        padded_token_rows = self.token_comm.worst_case_sf_token_count
+        padded_token_rows = self.token_comm.fc1_pool_sf_token_count
         padded_hidden = hidden
         fc1_sfb = cute.make_tensor(
             activation_sf_pool.iterator,
@@ -1206,6 +1625,9 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         else:
             pre_reduced_activation = self.token_comm.pre_reduced_activation_tensor(self._device_workspace)
             pre_reduced_activation_sf = self.token_comm.pre_reduced_activation_sf_tensor(self._device_workspace)
+        dedup_valid_rank_mask = None
+        if cutlass.const_expr(self.combine_dedup):
+            dedup_valid_rank_mask = self.token_comm.valid_rank_mask_tensor(self._device_workspace)
         # Internode combine inputs of TopkReduce, resolved while the workspace members are bound.
         combine_landing = self.token_comm.combine_landing_tensor(self._device_workspace)
         combine_message_index = self.token_comm.message_index_tensor(self._device_workspace)
@@ -1222,6 +1644,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             )
 
         if cutlass.const_expr(self.token_comm.token_back_push_data):
+            # Local FC2 output: the expert-major pool, or the (T*R*K, 1, H) order buffer under dedup.
             fc2_output = self.token_comm.fc2_activation_tensor(self._device_workspace)
         else:
             fc2_output = rewrite_tensor_shape(
@@ -1313,6 +1736,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             local_rank,
             local_workspace,
             shared_workspace,
+            tmp_buffer,
             fc1_alpha,
             fc2_alpha,
             fc1_norm_const,
@@ -1344,14 +1768,17 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             )
         if cutlass.const_expr(self.topk_reduce_persistent != (num_valid_tokens is not None)):
             raise ValueError("num_valid_tokens is required exactly when topk_reduce_persistent=True.")
-        if cutlass.const_expr(not self.reduce_topk_in_kernel and not self.skip_topk_reduce):
+        if cutlass.const_expr(not self.reduce_topk_in_kernel and self.combine_dedup):
+            # Weights are already folded at FC1; sum the rank slots named by the valid-rank mask.
+            self._topk_reduce(pre_reduced_activation, dedup_valid_rank_mask, output_activation, stream)
+        elif cutlass.const_expr(not self.reduce_topk_in_kernel and not self.skip_topk_reduce):
             reduce_scores = None if cutlass.const_expr(self.apply_topk_at_fc1) else topk_scores
-            extra_term = None
+            shared_term = None
             if cutlass.const_expr(self.fuse_shared):
                 self._device_workspace.assign_device_members(
-                    local_workspace, shared_workspace, read_epoch=False
+                    local_workspace, shared_workspace, tmp_buffer, read_epoch=False
                 )
-                extra_term = self._device_workspace.tensor(self.shared_output_region)
+                shared_term = self._device_workspace.tensor(self.shared_output_region)
                 self._device_workspace.remove_device_members()
             if cutlass.const_expr(self.topk_reduce_persistent):
                 # Fixed grid; the token count is read from device memory
@@ -1365,7 +1792,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                     counters=topk_reduce_counters,
                     num_tokens_dev=num_valid_tokens,
                     topk_indices=topk_indices,
-                    extra_term=extra_term,
+                    shared_term=shared_term,
                 )
             else:
                 self._topk_reduce(
@@ -1378,7 +1805,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                     message_index=combine_message_index,
                     topk_indices=topk_indices,
                     local_rank=local_rank,
-                    extra_term=extra_term,
+                    shared_term=shared_term,
                 )
 
     @cute.jit
@@ -1459,6 +1886,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         local_rank: cutlass.Int32,
         local_workspace: cute.Pointer,
         shared_workspace: cute.Pointer,
+        tmp_buffer: Optional[cute.Pointer],
         fc1_alpha: Optional[cute.Tensor],
         fc2_alpha: Optional[cute.Tensor],
         fc1_norm_const: Optional[cute.Tensor],
@@ -1478,7 +1906,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         smem_allocator = utils.SmemAllocator()
         storage = smem_allocator.allocate(storage_type)
         smem_base = storage.buffer.data_ptr()
-        self._device_workspace.assign_device_members(local_workspace, shared_workspace)
+        self._device_workspace.assign_device_members(local_workspace, shared_workspace, tmp_buffer)
         fc1_done_counter = self._device_workspace.tensor(self.fc1_done_counter_region)
         fc1_output_sf_storage = self._device_workspace.tensor(self.fc1_output_sf_region)
         if cutlass.const_expr(isinstance(self.hidden_size, int)):
@@ -1615,14 +2043,28 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             fc1_done_counter_pointer=fc1_done_counter.iterator,
             fc2_spin_threshold=fc2_spin_threshold,
             fc1_ready_counter_pointer=self.token_comm.fc1_ready_counter_pointer(self._device_workspace),
+            ring_token_blocks=self.ring_token_blocks,
+            ring_data_rows_per_block=self.token_comm.tokens_per_fc1_ready_slot if self.ring_token_blocks else 0,
+            ring_sf_rows_per_block=self.token_comm.ring_sf_rows_per_block if self.ring_token_blocks else 0,
         )
-        optional_epilogue_args = GatedActEpilogueArgs(
-            fc1_alpha=fc1_alpha,
-            fc2_alpha=fc2_alpha,
-            fc1_norm_const=fc1_norm_const,
-            topk_scores=pool_topk_scores,
-            fc1_activation_per_token_scale=pool_activation_scales,
-        )
+        if cutlass.const_expr(self.combine_dedup):
+            optional_epilogue_args = GatedActEpilogueArgsDedup(
+                fc1_alpha=fc1_alpha,
+                fc2_alpha=fc2_alpha,
+                fc1_norm_const=fc1_norm_const,
+                topk_scores=pool_topk_scores,
+                fc1_activation_per_token_scale=pool_activation_scales,
+                fc2_remote_output=pre_reduced_activation,
+                local_rank=local_rank,
+            )
+        else:
+            optional_epilogue_args = GatedActEpilogueArgs(
+                fc1_alpha=fc1_alpha,
+                fc2_alpha=fc2_alpha,
+                fc1_norm_const=fc1_norm_const,
+                topk_scores=pool_topk_scores,
+                fc1_activation_per_token_scale=pool_activation_scales,
+            )
 
         pipeline_init_arrive_mixed_cga(
             self.cluster_shape_mn, self.resolved_fallback_cluster_shape_mn, is_fallback_cluster, is_relaxed=True
@@ -1630,7 +2072,9 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         pipeline_init_wait_mixed_cga(
             self.cluster_shape_mn, self.resolved_fallback_cluster_shape_mn, is_fallback_cluster
         )
-        finalize_barrier_thread_count = 12 * 32 if self.token_back_mode == "standalone_warps" else 8 * 32  # nosec B105
+        finalize_barrier_thread_count = (
+            12 * 32 if self.token_back_mode in ("standalone_warps", "hybrid_warps") else 8 * 32  # nosec B105
+        )
         finalize_barrier = pipeline.NamedBarrier(barrier_id=13, num_threads=finalize_barrier_thread_count)
 
         if warp_idx == self.scheduler_warp_id:
@@ -1756,6 +2200,13 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 ab_pipeline_state=mma_pipeline_state,
                 acc_pipeline=acc_pipeline,
                 sched_consumer=sched_consumer,
+                ring_device_workspace=self._device_workspace,
+                # The MMA warp retires the blocks unless the combine does.
+                ring_retire_region=(
+                    self.ring_retire_region
+                    if self.ring_token_blocks and not self.ring_covers_fc2_output
+                    else None
+                ),
             )
             iket.range_pop()
 
@@ -1793,8 +2244,15 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             tmem_allocator.relinquish_alloc_permit()
             tmem_allocator.free(tmem_allocator.retrieve_ptr(self.acc_dtype), self._mainloop.num_tmem_alloc_cols)
             iket.range_pop()
-            # Internode combine: the epilogue warps join the relay warps' gather after their last tile.
-            self.token_comm.epilogue_tail_body(self._smem_workspace, smem_base, warp_idx)
+            if cutlass.const_expr(self.dedup_epilogue_tail_combine and not self._diag_skip_token_back):
+                # Combine dedup: the epilogue warps reduce leftover blocks in their finished FC2 staging SMEM.
+                tail_ring = self._smem_workspace.ptr(self.epilogue.fc2_staging_region, smem_base)
+                iket.range_push("mega.token_back_epilogue_tail")
+                self.token_comm.token_back_epilogue_tail(self._smem_workspace, smem_base, warp_idx, tail_ring)
+                iket.range_pop()
+            else:
+                # Internode combine: the epilogue warps join the relay warps' gather after their last tile.
+                self.token_comm.epilogue_tail_body(self._smem_workspace, smem_base, warp_idx)
             finalize_barrier.arrive_unaligned()
 
         if warp_idx >= Int32(self.transfer_warp_idx_start):
@@ -1804,8 +2262,11 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 self.token_comm.token_in(self._smem_workspace, smem_base)
                 iket.range_pop()
                 if cutlass.const_expr(
-                    self.token_comm.token_back_enabled and self.token_back_mode != "standalone_warps"  # nosec B105
+                    self.token_comm.token_back_enabled
+                    and self.token_back_mode not in ("standalone_warps",)  # nosec B105
+                    and not self._diag_skip_token_back
                 ):
+                    # reuse_dispatch_warps, epi_warps (quantized scale push) and hybrid_warps (after token_in).
                     iket.range_push("mega.token_back")
                     self.token_comm.token_back(self._smem_workspace, smem_base)
                     iket.range_pop()
@@ -1813,9 +2274,10 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 iket.range_push("mega.tail_reset")
                 self.token_comm.reset_tail()
                 iket.range_pop()
-            elif cutlass.const_expr(self.token_back_mode == "standalone_warps"):  # nosec B105
+            elif cutlass.const_expr(self.token_back_mode in ("standalone_warps", "hybrid_warps")):  # nosec B105
                 iket.range_push("mega.token_back_standalone")
-                self.token_comm.token_back(self._smem_workspace, smem_base)
+                if cutlass.const_expr(not self._diag_skip_token_back):
+                    self.token_comm.token_back(self._smem_workspace, smem_base)
                 iket.range_pop()
                 finalize_barrier.arrive_unaligned()
             elif cutlass.const_expr(self.relay_warp_count > 0):

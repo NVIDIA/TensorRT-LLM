@@ -33,6 +33,11 @@ class GpuReleaseFlagBatchTracker:
             red_add_release_gpu_s32(pointer, Int32(1))
 
     @cute.jit
+    def drained(self) -> "GpuReleaseFlagBatchTracker":
+        """The tracker after an explicit ``fire()``: nothing held, so a later flush cannot publish it again."""
+        return self._make(flag_address=Int64(0), accumulated_flags=Int32(0), phase=self.phase)
+
+    @cute.jit
     def accumulate(
         self, next_phase: Any, flush_threshold: int, flag_address: Int64, no_fire: bool = False
     ) -> "GpuReleaseFlagBatchTracker":
@@ -96,6 +101,11 @@ class GpuAsyncReleaseFlagBatchTracker:
             pointer = cute.make_ptr(cutlass.Int32, self.flag_address, AddressSpace.gmem, assumed_align=4)
             with cute.arch.elect_one():
                 red_async_add_release_gpu_s32(pointer, Int32(1))
+
+    @cute.jit
+    def drained(self) -> "GpuAsyncReleaseFlagBatchTracker":
+        """The tracker after an explicit ``fire()``: nothing held, so a later flush cannot publish it again."""
+        return self._make(flag_address=Int64(0), accumulated_flags=Int32(0), phase=self.phase)
 
     @cute.jit
     def accumulate(

@@ -1346,6 +1346,14 @@ def _construct_megamoe_kernel(
     return construct(kernel_cls), rejection
 
 
+def _megamoe_tmp_buffer_span(kernel) -> Tuple[int, int]:
+    """Return (offset, bytes) of the kernel's tmp buffer behind its local workspace state."""
+    if not hasattr(kernel, "get_tmp_buffer_bytes"):
+        return 0, 0
+    local_bytes, _ = kernel.get_workspace_sizes()
+    return pad_up(int(local_bytes), 128), int(kernel.get_tmp_buffer_bytes())
+
+
 def _megamoe_barrier_reset_slices(kernel) -> Tuple[int, int, int, int, str]:
     local_bytes, shared_bytes = kernel.require_zero_workspace_leading_bytes
     return 0, int(local_bytes), 0, int(shared_bytes), f"export-{type(kernel).__name__}"
@@ -2048,12 +2056,20 @@ if IS_MEGAMOE_OP_AVAILABLE:
         if _MEGAMOE_TUNING_WORKSPACE_KEYS:
             _evict_latched_tuning_workspaces()
         local_bytes, _ = kernel.get_workspace_sizes()
+        # The kernel's caller-owned tmp buffer (per-launch data, never zeroed)
+        # is the 128-byte-aligned tail of the same allocation, so it shares the
+        # local workspace's lifetime, cache eviction and captured address.
+        tmp_offset, tmp_bytes = _megamoe_tmp_buffer_span(kernel)
         # Only the atomic counters need zeroing (a stray negative byte hangs
         # spin_wait at 100% SM); the multi-GiB bulk is overwritten every launch
         # (full ``torch.zeros`` = huge wasted memset). Zero the leading counter
         # prefix plus the persisted ``nvlink_barrier_counter``, deliberately
         # OUTSIDE that prefix so the device tail-reset never touches it.
-        local_workspace = torch.empty(local_bytes, dtype=torch.uint8, device=device)
+        local_workspace = torch.empty(
+            tmp_offset + tmp_bytes if tmp_bytes else local_bytes, dtype=torch.uint8, device=device
+        )
+        if local_workspace.data_ptr() % 128 != 0:
+            raise RuntimeError("MegaMoE-CuteDSL: the local workspace must be 128-byte aligned.")
         _lead = int(kernel.require_zero_workspace_leading_bytes[0])
         local_workspace[:_lead].zero_()
         _bc_off, _bc_n, _, _, _ = _megamoe_barrier_reset_slices(kernel)
@@ -3411,18 +3427,23 @@ if IS_MEGAMOE_OP_AVAILABLE:
             # present K stride-1 via a transpose VIEW (DLPack carries the
             # strides); do NOT ``.contiguous()``.
             output_activation = combine_output.reshape(combine_output.shape[0], self.hidden_size)
+            # The top-k reduce stores 256-bit rows: the kernel requires the
+            # output declared 32 B aligned (from_dlpack checks the pointer).
+            output_align = 32
             if buffer_cache is None:
                 cute_activation = _to_cute(activation)
                 cute_activation_sf = _to_cute(activation_sf)
                 cute_topk_weights = _to_cute(topk_weights)
-                cute_output = _to_cute(output_activation)
+                cute_output = _to_cute(output_activation, output_align)
                 cute_topk_idx = _to_cute(topk_idx)
             else:
                 cute_activation = _to_cute_cached(buffer_cache, activation)
                 cute_activation_sf = _to_cute_cached(buffer_cache, activation_sf)
                 cute_topk_weights = _to_cute_cached(buffer_cache, topk_weights)
                 # Its live rows change per iteration, not between the layers of one.
-                cute_output = _to_cute_slot(buffer_cache, "output_activation", output_activation)
+                cute_output = _to_cute_slot(
+                    buffer_cache, "output_activation", output_activation, output_align
+                )
                 # topk_idx is the calling module's own staging buffer.
                 cute_topk_idx = _to_cute_w(topk_idx)
             runtime_kwargs = dict(
@@ -3458,6 +3479,12 @@ if IS_MEGAMOE_OP_AVAILABLE:
                     shared_activation_sf=_to_cute_w(shared_activation_sf),
                     # A runtime scalar, never a compile-time constant.
                     shared_num_tokens=cutlass.Int32(int(shared_num_tokens)),
+                )
+            # The gen-phase entry has no tmp_buffer operand; the others require it.
+            if hasattr(kernel, "get_tmp_buffer_bytes"):
+                tmp_offset, tmp_bytes = _megamoe_tmp_buffer_span(kernel)
+                runtime_kwargs["tmp_buffer"] = (
+                    _to_cute_ptr_cached(local_workspace[tmp_offset:]) if tmp_bytes else None
                 )
             runtime_kwargs.update(
                 topk_indices=cute_topk_idx,

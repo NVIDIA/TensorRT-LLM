@@ -13,7 +13,7 @@ import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils
 from cutlass.cute.typing import AddressSpace
-from cutlass.cutlass_dsl import Int32, Int64
+from cutlass.cutlass_dsl import Boolean, Int32, Int64
 from cutlass.utils.blockscaled_layout import tile_atom_to_shape_SF
 
 from ...api import ImplDesc, KernelComponent, OptionalRequirement, ProblemDesc
@@ -31,12 +31,13 @@ from ...helpers.ptx_helpers import (
     cvt_rn_bf16x2_f32x2,
     f32x2_pack,
     fma_rn_f32x2_bf16x2,
+    fma_rn_f32x2_bf16x2_unpacked,
     stg_b64,
     stg_f32,
     tma_load_1d,
 )
 from ...helpers.smem_workspace import SmemWorkspace
-from ...helpers.utils import ceil_div, round_up
+from ...helpers.utils import ceil_div, round_up, worst_case_padded_rows
 from ...quant_def import CombineFormat, QuantKind
 from ..token_protocol import TokenSrcMetadata
 from .symmetric_buffer import SymmetricBufferDevice
@@ -287,13 +288,9 @@ class _DedupMetadataPushRouter(KernelComponent):
         return self.expert_count // self.world_size
 
     def worst_case_padded_tokens(self, block: int) -> int:
-        source_token_capacity = self.world_size * self.max_tokens_per_rank
-        routes_per_source_token = min(self.topk, self.experts_per_rank)
-        route_capacity = source_token_capacity * routes_per_source_token
-        active_expert_capacity = min(self.experts_per_rank, route_capacity)
-        route_budget_blocks = active_expert_capacity + (route_capacity - active_expert_capacity) // block
-        expert_bound_blocks = active_expert_capacity * int(ceil_div(source_token_capacity, block))
-        return min(route_budget_blocks, expert_bound_blocks) * block
+        return worst_case_padded_rows(
+            self.world_size * self.max_tokens_per_rank, self.experts_per_rank, self.topk, block
+        )
 
     @property
     def router_max_routes_per_cta(self) -> int:
@@ -487,6 +484,7 @@ class _DedupMetadataPushRouter(KernelComponent):
         peer_rank_ptr_mapper_host,
         device_workspace: DeviceWorkspace,
         stream: cuda.CUstream,
+        tmp_buffer: Optional[cute.Pointer] = None,  # caller-owned tmp buffer; None: the data stays in local_workspace
     ) -> None:
         """Launch counting-sort DATA, size-exchange HELPER, and metadata PUSH roles."""
         if cutlass.const_expr(self.carry_topk_scores and topk_scores is None):
@@ -500,6 +498,7 @@ class _DedupMetadataPushRouter(KernelComponent):
             shared_workspace,
             peer_rank_ptr_mapper,
             device_workspace,
+            tmp_buffer,
         ).launch(
             grid=[self.router_grid_cta_count, 1, 1],
             block=[self.router_warps_per_cta * 32, 1, 1],
@@ -517,6 +516,7 @@ class _DedupMetadataPushRouter(KernelComponent):
         shared_workspace: cute.Pointer,
         peer_rank_ptr_mapper: SymmetricBufferDevice,
         device_workspace: DeviceWorkspace,
+        tmp_buffer: Optional[cute.Pointer],
     ) -> None:
         thread_idx, _, _ = cute.arch.thread_idx()
         linear_cta_idx, _, _ = cute.arch.block_idx()
@@ -529,7 +529,7 @@ class _DedupMetadataPushRouter(KernelComponent):
         storage = smem_allocator.allocate(storage_type)
         smem_base = storage.buffer.data_ptr()
 
-        device_workspace.assign_device_members(local_workspace, shared_workspace)
+        device_workspace.assign_device_members(local_workspace, shared_workspace, tmp_buffer)
         self._device_workspace = device_workspace
         self._peer_rank_ptr_mapper = peer_rank_ptr_mapper
         self._router_local_rank = local_rank
@@ -1371,6 +1371,9 @@ class TokenCommDedup(KernelComponent):
     # Last-copy reduce: two copies per 1-D TMA through two buffers, so per-warp SMEM is 2 x 2 x chunk.
     token_back_copies_per_fill: ClassVar[int] = 2
     token_back_fill_buffers: ClassVar[int] = 2
+    # Epilogue-tail ring (in the kernel's FC2 staging SMEM): two fill buffers of one copy.
+    epilogue_tail_fill_buffers: ClassVar[int] = 2
+    epilogue_tail_copies_per_fill: ClassVar[int] = 1
     # Combine-warp fc2_done prefix-wait spin cadence (ns). Diagnostic override: MEGA_DEDUP_WAIT_SLEEP_NS.
     fc2_done_wait_sleep_ns: ClassVar[int] = int(os.environ.get("MEGA_DEDUP_WAIT_SLEEP_NS", "500"))
     # Backoff cap (ns) of that spin; polling every 0.5 us slows the MMA/epilogue warps (DSV4 T8192: -12 us).
@@ -1401,6 +1404,9 @@ class TokenCommDedup(KernelComponent):
     token_back_activation_smem_region = "nvlink.token_comm_dedup.main_smem.token_back_activation"  # nosec B105
     # hybrid_warps: second set of rings for the dispatch warps, overlaid on their token_in stage.
     token_back_reuse_activation_smem_region = "nvlink.token_comm_dedup.main_smem.token_back_reuse_activation"  # nosec B105
+    # dedup_epilogue_tail_combine: mbarriers of the four epilogue-warp workers.
+    token_back_tail_mbarrier_region = "nvlink.token_comm_dedup.main_smem.token_back_tail_mbarriers"  # nosec B105
+    epilogue_tail_worker_warps: ClassVar[int] = 4
     token_back_sf_smem_region = "nvlink.token_comm_dedup.main_smem.token_back_sf"  # nosec B105
 
     @classmethod
@@ -1429,6 +1435,17 @@ class TokenCommDedup(KernelComponent):
             "token_back_schedule_mode": str,
             "reduce_topk_in_kernel": bool,
             "router_smem_limit_bytes": OptionalRequirement(int),
+            "ring_token_blocks": OptionalRequirement(Optional[int]),
+            "ring_retire_region": OptionalRequirement(Optional[str]),
+            "ring_retire_threshold": OptionalRequirement(Optional[int]),
+            # Set by the kernel: False on sm_100/sm_103, which lack fma.f32x2.bf16x2 (widen + fma.f32x2 instead).
+            "dedup_mixed_precision_fma": OptionalRequirement(bool),
+            # The epilogue warps join the combine after their last tile (atomic-counter schedule only).
+            "dedup_epilogue_tail_combine": OptionalRequirement(bool),
+            # Copies per combine fill (one 1-D TMA).
+            "dedup_copies_per_fill": OptionalRequirement(int),
+            # Cap (ns) of the fc2_done poll backoff.
+            "dedup_poll_max_sleep_ns": OptionalRequirement(int),
         }
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
@@ -1439,6 +1456,17 @@ class TokenCommDedup(KernelComponent):
         self.topk = problem_desc["topk"]
         self.max_tokens_per_rank = problem_desc["max_tokens_per_rank"]
         self.hidden_size = problem_desc["hidden_size"]
+        # Ring workspace (0: off). The dispatch pool holds ring_token_blocks token blocks instead of the worst
+        # case: pool token block b lives in slot b % ring_token_blocks and keeps the slot until it is retired,
+        # that is until its last reader in any ringed pool is done (the slot lease). A "ready slot" of this
+        # router is a token block (``ready_slot_idx`` is a block number); a ring slot is
+        # ``block % ring_token_blocks``. token_in alone waits for the ring: it writes a token of block b once
+        # block b - ring_token_blocks, the block that held the slot before, is retired
+        # (_previous_occupant_retired). The kernel names the counter that shows it, one per block
+        # (``ring_retire_region``), and the count of a retired block (``ring_retire_threshold``).
+        self.ring_token_blocks = impl_desc.get("ring_token_blocks") or 0
+        self.ring_retire_region = impl_desc.get("ring_retire_region")
+        self.ring_retire_threshold = impl_desc.get("ring_retire_threshold") or 0
         self.quant_kind = QuantKind(problem_desc["quant_kind"])
         self.combine_format = problem_desc["combine_format"]
         self.apply_topk_at_fc1 = problem_desc["apply_topk_at_fc1"]
@@ -1454,6 +1482,22 @@ class TokenCommDedup(KernelComponent):
         self.token_back_schedule_mode: TokenBackScheduleMode = impl_desc["token_back_schedule_mode"]
         self.reduce_topk_in_kernel = impl_desc["reduce_topk_in_kernel"]
         self.router_smem_limit_bytes = impl_desc.get("router_smem_limit_bytes", 227 * 1024)
+        self.mixed_precision_fma = bool(impl_desc.get("dedup_mixed_precision_fma", True))
+        self.epilogue_tail_combine = bool(impl_desc.get("dedup_epilogue_tail_combine", False))
+        copies_per_fill = impl_desc.get("dedup_copies_per_fill")
+        if copies_per_fill is not None:
+            if not 1 <= copies_per_fill <= 4:
+                raise ValueError(f"dedup_copies_per_fill must be in [1, 4], got {copies_per_fill}.")
+            self.token_back_copies_per_fill = int(copies_per_fill)
+        poll_max_sleep_ns = impl_desc.get("dedup_poll_max_sleep_ns")
+        if poll_max_sleep_ns is not None:
+            if poll_max_sleep_ns < self.fc2_done_wait_sleep_ns:
+                raise ValueError(
+                    f"dedup_poll_max_sleep_ns must be >= {self.fc2_done_wait_sleep_ns}, got {poll_max_sleep_ns}."
+                )
+            self.fc2_done_wait_sleep_max_ns = int(poll_max_sleep_ns)
+        if self.epilogue_tail_combine and self.token_back_schedule_mode != "atomic_counter":
+            raise ValueError("dedup_epilogue_tail_combine needs the atomic-counter token_back schedule (late joiners claim).")
         self._validate_configuration()
         self._router = _DedupMetadataPushRouter(problem_desc, impl_desc)
         self._nvlink_barrier = NvlinkBarrier(world_size=self.world_size, barrier_id=self.grid_sync_barrier_id)
@@ -1514,6 +1558,12 @@ class TokenCommDedup(KernelComponent):
             raise ValueError(f"{self.quant_kind} requires hidden_size divisible by {element_block}.")
         if self.sf_padding_block % 128 != 0:
             raise ValueError("sf_padding_block must be a multiple of 128.")
+
+        if type(self.ring_token_blocks) is not int or self.ring_token_blocks < 0:
+            raise ValueError(f"ring_token_blocks must be a non-negative int, got {self.ring_token_blocks!r}.")
+        if self.ring_enabled:
+            if self.ring_retire_region is None or self.ring_retire_threshold <= 0:
+                raise ValueError("A ring workspace needs the kernel's retire counter region and its threshold.")
 
     @property
     def experts_per_rank(self) -> int:
@@ -1609,6 +1659,15 @@ class TokenCommDedup(KernelComponent):
         return self.token_back_chunk_bytes(self._token_back_available_bytes_per_warp())
 
     @property
+    def epilogue_tail_ring_bytes(self) -> int:
+        """SMEM ring of the epilogue-tail workers (the kernel's FC2 staging SMEM must hold it)."""
+        return self.epilogue_tail_worker_warps * self.epilogue_tail_warp_ring_bytes
+
+    @property
+    def epilogue_tail_warp_ring_bytes(self) -> int:
+        return self.epilogue_tail_fill_buffers * self.epilogue_tail_copies_per_fill * self.order_chunk_bytes
+
+    @property
     def order_chunks_per_row(self) -> int:
         return ceil_div(self.output_token_bytes, self.order_chunk_bytes)
 
@@ -1636,6 +1695,29 @@ class TokenCommDedup(KernelComponent):
     @property
     def max_fc1_ready_slot_count(self) -> int:
         return self._router.worst_case_padded_tokens(self.tokens_per_fc1_ready_slot) // self.tokens_per_fc1_ready_slot
+
+    @property
+    def ring_enabled(self) -> bool:
+        return self.ring_token_blocks > 0
+
+    @property
+    def ring_sf_rows_per_block(self) -> int:
+        """Scale rows of one ring slot: the token tile rounded up to whole 128-row scale atoms."""
+        return round_up(self.tokens_per_fc1_ready_slot, 128)
+
+    @property
+    def fc1_pool_token_count(self) -> int:
+        """Rows of the dispatch pool: the worst case, or ring_token_blocks token tiles with a ring workspace."""
+        if self.ring_enabled:
+            return self.ring_token_blocks * self.tokens_per_fc1_ready_slot
+        return self.worst_case_token_count
+
+    @property
+    def fc1_pool_sf_token_count(self) -> int:
+        """Scale rows of the dispatch pool; with a ring workspace every slot owns whole 128-row scale atoms."""
+        if self.ring_enabled:
+            return self.ring_token_blocks * self.ring_sf_rows_per_block
+        return self.worst_case_sf_token_count
 
     @property
     def router_smem_workspace(self) -> SmemWorkspace:
@@ -1693,7 +1775,24 @@ class TokenCommDedup(KernelComponent):
         peer_rank_ptr_mapper_host,
         device_workspace: DeviceWorkspace,
         stream: cuda.CUstream,
+        # Blackwell call shape; unsupported, must be None.
+        gin_dev_comm=None,
+        gin_window=None,
+        shared_window_offset=None,
+        router_activation=None,
+        router_activation_sf=None,
+        fc1_activation_per_token_scale=None,
+        tmp_buffer: Optional[cute.Pointer] = None,  # caller-owned tmp buffer; None: the data stays in local_workspace
     ) -> None:
+        if cutlass.const_expr(
+            gin_dev_comm is not None
+            or gin_window is not None
+            or shared_window_offset is not None
+            or router_activation is not None
+            or router_activation_sf is not None
+            or fc1_activation_per_token_scale is not None
+        ):
+            raise ValueError("TokenCommDedup's router takes no GIN resources, relay payload or per-token scales.")
         self._router.launch_router(
             topk_indices,
             topk_scores,
@@ -1703,11 +1802,21 @@ class TokenCommDedup(KernelComponent):
             peer_rank_ptr_mapper_host,
             device_workspace,
             stream,
+            tmp_buffer=tmp_buffer,
         )
 
     @cute.jit
     def local_expert_sizes(self, device_workspace: DeviceWorkspace, local_rank: Int32) -> cute.Tensor:
         return self._router.local_expert_sizes(device_workspace, local_rank)
+
+    @property
+    def sizes_ready_region(self) -> str:
+        """The counter ``wait_for_sizes_ready`` polls at system scope until it reaches ``sizes_ready_target``."""
+        return self._router.sizes_ready_region
+
+    @property
+    def sizes_ready_target(self) -> int:
+        return self._router.world_size
 
     @cute.jit
     def wait_for_sizes_ready(self, device_workspace: DeviceWorkspace, sleep_cycles: int = 1000) -> None:
@@ -1773,7 +1882,10 @@ class TokenCommDedup(KernelComponent):
             buffer_space="local",
             reset="tail_reset",
         )
-        activation_element_count = self.worst_case_token_count * self.hidden_size
+        # Only the dispatch pool and its scale plane follow a ring workspace (fc1_pool_* row counts). The ready
+        # counters above stay one per pool token block, and the order buffer below is addressed by source token
+        # and rank, not by pool row.
+        activation_element_count = self.fc1_pool_token_count * self.hidden_size
         workspace.register(
             self.fc1_activation_region,
             self.activation_dtype,
@@ -1781,7 +1893,7 @@ class TokenCommDedup(KernelComponent):
             buffer_space="local",
             byte_alignment=128,
         )
-        activation_sf_element_count = self.worst_case_sf_token_count * self.activation_sf_hidden_padded
+        activation_sf_element_count = self.fc1_pool_sf_token_count * self.activation_sf_hidden_padded
         workspace.register(
             self.fc1_activation_sf_region,
             self.activation_sf_dtype,
@@ -1825,6 +1937,10 @@ class TokenCommDedup(KernelComponent):
                 self.token_back_mbarrier_region,
                 self.transfer_warp_count * self.token_back_worker_groups * self.token_back_fill_buffers,
             )
+            if self.epilogue_tail_combine:
+                workspace.register_mbarrier(
+                    self.token_back_tail_mbarrier_region, self.epilogue_tail_worker_warps * self.epilogue_tail_fill_buffers
+                )
         workspace.register_tensor(
             self.expert_sizes_smem_region, cutlass.Int32, (self.experts_per_rank,), byte_alignment=16
         )
@@ -1891,13 +2007,13 @@ class TokenCommDedup(KernelComponent):
     def fc1_activation_tensor(self, device_workspace: DeviceWorkspace) -> cute.Tensor:
         return cute.make_tensor(
             device_workspace.ptr(self.fc1_activation_region),
-            cute.make_layout((self.worst_case_token_count, self.hidden_size), stride=(self.hidden_size, 1)),
+            cute.make_layout((self.fc1_pool_token_count, self.hidden_size), stride=(self.hidden_size, 1)),
         )
 
     @cute.jit
     def fc1_activation_sf_tensor(self, device_workspace: DeviceWorkspace) -> cute.Tensor:
         layout = tile_atom_to_shape_SF(
-            (self.worst_case_sf_token_count, self.hidden_size, 1), self.activation_sf_vector_size
+            (self.fc1_pool_sf_token_count, self.hidden_size, 1), self.activation_sf_vector_size
         )
         return cute.make_tensor(device_workspace.ptr(self.fc1_activation_sf_region), cute.select(layout, mode=[0, 1]))
 
@@ -1934,6 +2050,83 @@ class TokenCommDedup(KernelComponent):
     @cute.jit
     def pre_reduced_activation_sf_tensor(self, device_workspace: DeviceWorkspace) -> Optional[cute.Tensor]:
         return None
+
+    # NVLink-domain defaults of the internode hooks the Blackwell kernel calls.
+    relay_warp_count: ClassVar[int] = 0
+
+    @property
+    def ranks_per_node(self) -> int:
+        return self.world_size
+
+    @property
+    def publishes_fc2_done(self) -> bool:
+        return self.token_back_enabled
+
+    @property
+    def fc2_done_release_scope(self) -> str:
+        return "gpu"
+
+    @property
+    def relay_record_topk_marker(self) -> Optional[int]:
+        return None
+
+    @property
+    def relay_slot_count(self) -> int:
+        return 0
+
+    @property
+    def name_token(self) -> str:
+        return ""
+
+    @property
+    def requires_gin_resources(self) -> bool:
+        return False
+
+    def prepare_device_resources(self, gin_dev_comm, gin_window, gin_shared_window_offset=None) -> None:
+        if gin_dev_comm is not None or gin_window is not None:
+            raise ValueError("TokenCommDedup takes no NCCL GIN resources.")
+
+    @cute.jit
+    def relay_landing_tensor(self, device_workspace: DeviceWorkspace) -> Optional[cute.Tensor]:
+        return None
+
+    def fc2_done_fanout(self, device_workspace: DeviceWorkspace, peer_rank_ptr_mapper):
+        return None
+
+    def epilogue_tail_body(self, smem_workspace: SmemWorkspace, smem_base: cute.Pointer, epilogue_warp: Int32) -> None:
+        pass
+
+    @cute.jit
+    def combine_landing_tensor(self, device_workspace: DeviceWorkspace) -> Optional[cute.Tensor]:
+        return None
+
+    @cute.jit
+    def message_index_tensor(self, device_workspace: DeviceWorkspace) -> Optional[cute.Tensor]:
+        return None
+
+    def fc1_activation_per_token_scales_tensor(self, device_workspace: DeviceWorkspace) -> Optional[cute.Tensor]:
+        return None
+
+    @cute.jit
+    def _previous_occupant_retired(self, block: Int32) -> Boolean:
+        """Has the block that held this block's ring slot before it been retired? One look at the retire
+        counter. It does not wait: token_in decides what to do with the answer.
+
+        That earlier occupant, ``block - ring_token_blocks``, is retired when its counter in ``ring_retire_region``
+        shows ``ring_retire_threshold``: no reader of the slot is left then, in any ringed pool. Lane 0 reads the
+        counter and hands the value to every lane, so the warp takes one decision.
+        """
+        retired_count = Int32(0)
+        if self._lane_idx == Int32(0):
+            retired_count = cute.arch.load(
+                self._device_workspace.element_ptr(self.ring_retire_region, block - Int32(self.ring_token_blocks)),
+                Int32,
+                sem="acquire",
+                scope="gpu",
+            )
+        retired_count = Int32(cute.arch.shuffle_sync(retired_count, Int32(0)))
+        return retired_count >= Int32(self.ring_retire_threshold)
+
     @cute.jit
     def token_in(self, smem_workspace: SmemWorkspace, smem_base: cute.Pointer) -> None:
         """Wait for pushed metadata, then pull activation payloads into local pools (same as the non-dedup dispatch:
@@ -2047,6 +2240,30 @@ class TokenCommDedup(KernelComponent):
                 pool_token_idx = pool_expert_bases[local_expert] + token_in_expert
                 sf_token_idx = expert_sf_begin + token_in_expert
                 ready_slot_idx = expert_ready_slot_begin + token_in_expert // Int32(self.tokens_per_fc1_ready_slot)
+                # Row of this token in the dispatch pool (the metadata stays indexed by pool_token_idx).
+                pool_row_idx = pool_token_idx
+                if cutlass.const_expr(self.ring_enabled):
+                    token_in_block = token_in_expert % Int32(self.tokens_per_fc1_ready_slot)
+                    ring_slot = ready_slot_idx % Int32(self.ring_token_blocks)
+                    pool_row_idx = ring_slot * Int32(self.tokens_per_fc1_ready_slot) + token_in_block
+                    sf_token_idx = ring_slot * Int32(self.ring_sf_rows_per_block) + token_in_block
+                    # Slot lease: the token may be written once the block that held the slot before its block is
+                    # retired. The first ring_token_blocks blocks are the first users of their slots and ask
+                    # nothing. The answer is the same in every lane, so the warp publishes, sleeps and asks again
+                    # as one.
+                    if ready_slot_idx >= Int32(self.ring_token_blocks):
+                        retired = self._previous_occupant_retired(ready_slot_idx)
+                        if not retired:
+                            if cutlass.const_expr(self.token_in_flag_batch > 1):
+                                # Publish the ready flags this warp still batches before it sleeps: the block it
+                                # waits for may be waiting for one of them.
+                                flag_tracker.fire()
+                                flag_tracker = flag_tracker.drained()
+                            iket.range_push("token_in.ring_wait")
+                            while not retired:
+                                nanosleep(500)
+                                retired = self._previous_occupant_retired(ready_slot_idx)
+                            iket.range_pop()
 
                 metadata = TokenSrcMetadata.load(
                     token_metadata_pointer.toint() + Int64(pool_token_idx) * Int64(TokenSrcMetadata.nbytes)
@@ -2086,7 +2303,7 @@ class TokenCommDedup(KernelComponent):
 
                 destination_activation = cute.make_ptr(
                     self.activation_dtype,
-                    fc1_activation_pointer.toint() + Int64(pool_token_idx) * Int64(self.bytes_per_token),
+                    fc1_activation_pointer.toint() + Int64(pool_row_idx) * Int64(self.bytes_per_token),
                     AddressSpace.gmem,
                     assumed_align=16,
                 )
@@ -2180,11 +2397,70 @@ class TokenCommDedup(KernelComponent):
                 )
                 sizes_ready_barrier.arrive_and_wait()
 
+        self._token_back_loop(
+            owned_sizes,
+            global_worker_idx,
+            global_worker_count,
+            worker_mbarriers,
+            worker_stages.iterator.toint(),
+            chunk_bytes,
+            self.token_back_copies_per_fill,
+            self.token_back_fill_buffers,
+        )
+
+    @cute.jit
+    def token_back_epilogue_tail(
+        self, smem_workspace: SmemWorkspace, smem_base: cute.Pointer, epilogue_warp: Int32, ring: cute.Pointer
+    ) -> None:
+        """The epilogue warps, after their last tile, claim and reduce the remaining blocks in ``ring``."""
+        if cutlass.const_expr(not self.epilogue_tail_combine):
+            return
+        lane_idx = self._lane_idx
+        chunk_bytes = self.order_chunk_bytes
+        warp_mbarriers = smem_workspace.ptr(self.token_back_tail_mbarrier_region, smem_base) + epilogue_warp * Int32(
+            self.epilogue_tail_fill_buffers
+        )
+        stage_base = ring.toint() + epilogue_warp * Int32(self.epilogue_tail_warp_ring_bytes)
+        if lane_idx == Int32(0):
+            for buffer_idx in cutlass.range_constexpr(self.epilogue_tail_fill_buffers):
+                cute.arch.mbarrier_init(warp_mbarriers + buffer_idx, 1)
+        cute.arch.sync_warp()
+        # A CTA without a work tile gets here right after sizes_ready, before the routers push the metadata the
+        # claims read.
+        self._router.wait_for_metadata_ready(self._device_workspace)
+        sizes = self._router.sizes_tensor(self._device_workspace)
+        owned_sizes = cute.make_tensor(
+            sizes.iterator + self._local_rank * Int32(self.experts_per_rank), cute.make_layout((self.experts_per_rank,))
+        )
+        self._token_back_loop(
+            owned_sizes,
+            Int32(0),
+            Int32(1),
+            warp_mbarriers,
+            stage_base,
+            chunk_bytes,
+            self.epilogue_tail_copies_per_fill,
+            self.epilogue_tail_fill_buffers,
+        )
+
+    @cute.jit
+    def _token_back_loop(
+        self,
+        owned_sizes: cute.Tensor,
+        global_worker_idx: Int32,
+        global_worker_count: Int32,
+        worker_mbarriers: cute.Pointer,
+        stage_base,
+        chunk_bytes: int,
+        copies_per_fill: int,
+        fill_buffers: int,
+    ) -> None:
+        """Claim pool tokens in expert order and reduce + push every multi-copy block whose last copy they hold."""
+        lane_idx = self._lane_idx
         pool_expert_bases = self._router.pool_expert_base_tensor(self._device_workspace)
         token_metadata_pointer = self._router.token_src_metadata_pointer(self._device_workspace)
         fc2_done = self._device_workspace.ptr(self.fc2_done_region)
         order_pointer = self._device_workspace.ptr(self.fc2_order_output_region)
-        output_token_bytes = self.output_token_bytes
         # Fills issued by this worker so far: fill s uses buffer s % 2 and phase (s // 2) & 1 of its mbarrier.
         fill_sequence = Int32(0)
 
@@ -2236,9 +2512,11 @@ class TokenCommDedup(KernelComponent):
                         metadata.src_rank,
                         metadata.src_token,
                         worker_mbarriers,
-                        worker_stages,
+                        stage_base,
                         fill_sequence,
                         chunk_bytes,
+                        copies_per_fill,
+                        fill_buffers,
                     )
                 next_dense_token = self.next_token(next_dense_token)
 
@@ -2257,17 +2535,18 @@ class TokenCommDedup(KernelComponent):
         stage_base,
         block_address: Int64,
         chunk_bytes: int,
+        copies_per_fill: int,
+        fill_buffers: int,
     ) -> None:
-        """Elected lane: one 1-D TMA of the two copies of fill ``fill_idx`` (chunk-major, copies ascending) into
-        buffer ``sequence % 2``, arming that buffer's mbarrier with the byte count."""
+        """Elected lane: one 1-D TMA of fill ``fill_idx`` into buffer ``sequence % fill_buffers``."""
         chunk_idx = fill_idx // fills_per_chunk
-        first_copy = (fill_idx - chunk_idx * fills_per_chunk) * Int32(self.token_back_copies_per_fill)
-        copies = cutlass.min(Int32(self.token_back_copies_per_fill), copy_count - first_copy)
-        buffer_idx = sequence % Int32(self.token_back_fill_buffers)
+        first_copy = (fill_idx - chunk_idx * fills_per_chunk) * Int32(copies_per_fill)
+        copies = cutlass.min(Int32(copies_per_fill), copy_count - first_copy)
+        buffer_idx = sequence % Int32(fill_buffers)
         mbarrier = worker_mbarriers + buffer_idx
         destination = cute.make_ptr(
             cutlass.Uint8,
-            stage_base + buffer_idx * Int32(self.token_back_copies_per_fill * chunk_bytes),
+            stage_base + buffer_idx * Int32(copies_per_fill * chunk_bytes),
             AddressSpace.smem,
             assumed_align=16,
         )
@@ -2283,15 +2562,14 @@ class TokenCommDedup(KernelComponent):
         src_rank: Int32,
         src_token: Int32,
         worker_mbarriers: cute.Pointer,
-        worker_stages: cute.Tensor,
+        stage_base,
         fill_sequence: Int32,
         chunk_bytes: int,
+        copies_per_fill: int,
+        fill_buffers: int,
     ) -> Int32:
-        """Reduce the ``copy_count`` copies of the order block at ``block_address`` chunk by chunk (two copies per
-        TMA through two buffers, fp32 accumulation in order 0..cnt-1, one bf16 rounding) and push each chunk.
-        Returns the advanced fill sequence."""
+        """Reduce the copies of one order block chunk by chunk, push each chunk, return the fill sequence."""
         lane_idx = self._lane_idx
-        copies_per_fill = self.token_back_copies_per_fill
         output_token_bytes = self.output_token_bytes
         chunk_count = ceil_div(output_token_bytes, chunk_bytes)
         round_group = min(self.reduction_round_group, ceil_div(chunk_bytes // 16, 32))
@@ -2311,14 +2589,19 @@ class TokenCommDedup(KernelComponent):
         destination_row = remote_activation[Int64(src_token), destination_slot, None]
         word_atom = _copy_atom(cutlass.Int32, 128)
         vector_layout = cute.make_layout((4,))
-        stage_base = worker_stages.iterator.toint()
         one2 = f32x2_pack(cutlass.Float32(1.0), cutlass.Float32(1.0))  # {1.0, 1.0} weight for the FFMA2 adds
         fills_per_chunk = (copy_count + Int32(copies_per_fill - 1)) // Int32(copies_per_fill)
         fill_count = fills_per_chunk * Int32(chunk_count)
 
+        prefetch = fill_buffers - 1
         iket.range_push("token_back.push_data")
-        with cute.arch.elect_one():
-            self._issue_fill(fill_sequence, Int32(0), fills_per_chunk, copy_count, worker_mbarriers, stage_base, block_address, chunk_bytes)
+        # Prologue: the first fill_buffers - 1 fills.
+        for ahead in cutlass.range_constexpr(prefetch):
+            if Int32(ahead) < fill_count:
+                with cute.arch.elect_one():
+                    self._issue_fill(fill_sequence + Int32(ahead), Int32(ahead), fills_per_chunk, copy_count,
+                                     worker_mbarriers, stage_base, block_address, chunk_bytes, copies_per_fill,
+                                     fill_buffers)
         # Whole-chunk fp32 accumulators (round_group x 32 lanes x 16 B covers the chunk, checked at construction).
         words = cute.make_rmem_tensor((4,), cutlass.Int32)
         acc = cute.make_rmem_tensor((4, round_group), cutlass.Int64)
@@ -2328,21 +2611,22 @@ class TokenCommDedup(KernelComponent):
             fill_in_chunk = fill_idx - chunk_idx * fills_per_chunk
             first_copy = fill_in_chunk * Int32(copies_per_fill)
             sequence = fill_sequence + fill_idx
-            buffer_base = stage_base + (sequence % Int32(self.token_back_fill_buffers)) * Int32(copies_per_fill * chunk_bytes)
+            buffer_base = stage_base + (sequence % Int32(fill_buffers)) * Int32(copies_per_fill * chunk_bytes)
             current_vectors = cutlass.min(Int32(chunk_bytes), Int32(output_token_bytes) - chunk_idx * Int32(chunk_bytes)) // Int32(16)
-            # Prefetch fill i+1 into the other buffer. If that buffer just fed a bulk copy, wait for its READ only.
-            if fill_idx + Int32(1) < fill_count:
+            # Prefetch into the buffer fill i - 1 used; wait only for the read of its bulk copy.
+            if fill_idx + Int32(prefetch) < fill_count:
                 cute.arch.cp_async_bulk_wait_group(0, read=True)
                 with cute.arch.elect_one():
-                    self._issue_fill(sequence + Int32(1), fill_idx + Int32(1), fills_per_chunk, copy_count,
-                                     worker_mbarriers, stage_base, block_address, chunk_bytes)
+                    self._issue_fill(sequence + Int32(prefetch), fill_idx + Int32(prefetch), fills_per_chunk,
+                                     copy_count, worker_mbarriers, stage_base, block_address, chunk_bytes,
+                                     copies_per_fill, fill_buffers)
             if fill_in_chunk == Int32(0):
                 for group in cutlass.range_constexpr(round_group):
                     for word in cutlass.range_constexpr(4):
                         acc[word, group] = Int64(0)
             cute.arch.mbarrier_wait(
-                worker_mbarriers + sequence % Int32(self.token_back_fill_buffers),
-                (sequence // Int32(self.token_back_fill_buffers)) & Int32(1),
+                worker_mbarriers + sequence % Int32(fill_buffers),
+                (sequence // Int32(fill_buffers)) & Int32(1),
             )
             iket.range_push("token_back.reduce")
             # Copies accumulate in 0..cnt-1 order; groups are 512 B apart so adjacent lanes keep contiguous 16 B.
@@ -2358,7 +2642,12 @@ class TokenCommDedup(KernelComponent):
                             )
                             cute.copy(word_atom, slot_vector, words)
                             for word in cutlass.range_constexpr(4):
-                                acc[word, group] = fma_rn_f32x2_bf16x2(words[word], one2, acc[word, group])
+                                if cutlass.const_expr(self.mixed_precision_fma):
+                                    acc[word, group] = fma_rn_f32x2_bf16x2(words[word], one2, acc[word, group])
+                                else:
+                                    acc[word, group] = fma_rn_f32x2_bf16x2_unpacked(
+                                        words[word], one2, acc[word, group]
+                                    )
             iket.range_pop()
             if fill_in_chunk == fills_per_chunk - Int32(1):
                 # Round once to bf16 into slot 0 of this buffer and push the chunk from there.
@@ -2416,14 +2705,17 @@ class TokenCommDedup(KernelComponent):
         transfer_warp_idx = self._transfer_warp_idx
         lane_idx = self._lane_idx
         transfer_thread_idx = transfer_warp_idx * Int32(32) + lane_idx
+        # Only a local drain before the reset. Peers write this rank's shared tail counters (sizes,
+        # sizes_ready, metadata_ready) solely from their routers, each push ending in a system-fenced
+        # increment of an exact-count ready flag; token_in acquired both flags at their targets, so no
+        # write of this call is still in flight, and the grid sync carries that to the resetting CTA.
+        # Only the publish below has to cross ranks: the next call's routers add into the reset counters.
         iket.range_push("tail.nvlink_drain")
-        self._nvlink_barrier.arrive_and_wait(
+        self._nvlink_barrier.sync(
             self.transfer_thread_count,
             Int32(self.promised_launchable_sm_count),
             self._linear_cta_idx,
             transfer_thread_idx,
-            prologue_grid_sync=True,
-            epilogue_grid_sync=False,
         )
         iket.range_pop()
         total_reset_threads = self.promised_launchable_sm_count * self.transfer_thread_count
@@ -2445,7 +2737,7 @@ class TokenCommDedup(KernelComponent):
         if cutlass.const_expr(os.environ.get("MEGA_USE_NCU", "0") == "1"):
             iket.range_push("tail.ncu_finalize")
             self._nvlink_barrier.finalize(
-                2,
+                1,
                 self.transfer_thread_count,
                 Int32(self.promised_launchable_sm_count),
                 self._linear_cta_idx,
