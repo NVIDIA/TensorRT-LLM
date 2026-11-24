@@ -155,7 +155,7 @@ srun -l \
     bash -c "
         set -ex
         $PROLOGUE
-        export PATH=$PATH:~/.local/bin
+        export PATH=\$PATH:~/.local/bin
 
         bindpcie trtllm-llmapi-launch \
          trtllm-serve $LOCAL_MODEL \
