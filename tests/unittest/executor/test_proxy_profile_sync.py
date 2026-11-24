@@ -255,31 +255,37 @@ def test_profile_control_during_pre_shutdown_raises_runtime_error(bare_proxy, ki
     proxy.profile_ack_queue.get.assert_not_called()
 
 
-def test_stop_profile_timeout_warns_does_not_hang(bare_proxy):
-    """Timeout produces a warning rather than wedging the event loop.
+def test_stop_profile_timeout_warns_does_not_hang(
+    bare_proxy: GenerationExecutorProxy, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Read the ACK queue and warn on timeout without blocking indefinitely."""
+    from tensorrt_llm.executor import proxy as proxy_module
 
-    If the worker is stuck (no ack within the timeout), the proxy
-    must not hang the HTTP event loop forever. It logs a warning and
-    returns so the handler can produce a 5xx response.
-
-    ``queue.Queue.get(timeout=...)`` raises ``queue.Empty`` on timeout
-    (not ``TimeoutError``), so the mock must mirror that to exercise the
-    real ``except Empty`` branch in ``_wait_profile_ack``.
-    """
     proxy = bare_proxy
+    now = [0.0]
+    warning = MagicMock()
+    # Advance only the proxy clock when an ACK read times out; scheduling
+    # delays must not let the deadline expire before the first read.
+    monkeypatch.setattr(proxy_module, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    monkeypatch.setattr(proxy_module.logger, "warning", warning)
 
-    def never_ack(timeout=None):
+    def never_ack(timeout: float) -> None:
+        assert 0 < timeout <= 0.05
+        now[0] += timeout
         raise queue.Empty()
 
     proxy.profile_ack_queue.get.side_effect = never_ack
-    proxy._STOP_PROFILE_ACK_TIMEOUT_S = 0.01
+    proxy._STOP_PROFILE_ACK_TIMEOUT_S = 0.5
 
-    # Should not raise; should not hang.
     t0 = time.monotonic()
     proxy.stop_profile()
     elapsed = time.monotonic() - t0
-    # The TimeoutError path returns promptly.
     assert elapsed < 1.0
+    proxy.profile_ack_queue.get.assert_called()
+    warning.assert_called_once_with(
+        "stop_profile: timed out waiting for worker ack after 0.5s. "
+        "The chrome trace may not be on disk yet."
+    )
 
 
 def test_profile_control_pinned_to_single_owner_thread(bare_proxy, tmp_path):
