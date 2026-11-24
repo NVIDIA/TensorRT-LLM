@@ -664,6 +664,31 @@ TEST(VmmDescSplitterTest, SplitDescsUnalignedBase)
     EXPECT_EQ(out[2].getLen(), chunkSize / 2);
 }
 
+TEST(VmmDescSplitterTest, SplitDescsAcrossRuns)
+{
+    // A pool mapped from chunks of two sizes is two adjacent regions: 2 x 2MB, then 3 x 512KB.
+    VramRegionMap regionMap;
+    regionMap[0x000000] = {0x400000, 0x200000};
+    regionMap[0x400000] = {0x180000, 0x80000};
+
+    // From inside the first chunk into the second run.
+    std::vector<MemoryDesc> descs{{0x100000, 0x400000, 0}};
+    MemoryDescs input{MemoryType::kVRAM, descs};
+
+    auto result = VmmDescSplitter::splitDescsWithRegionMap(input, regionMap);
+    auto const& out = result.getDescs();
+
+    ASSERT_EQ(out.size(), 4);
+    EXPECT_EQ(out[0].getAddr(), 0x100000);
+    EXPECT_EQ(out[0].getLen(), 0x100000);
+    EXPECT_EQ(out[1].getAddr(), 0x200000);
+    EXPECT_EQ(out[1].getLen(), 0x200000);
+    EXPECT_EQ(out[2].getAddr(), 0x400000);
+    EXPECT_EQ(out[2].getLen(), 0x80000);
+    EXPECT_EQ(out[3].getAddr(), 0x480000);
+    EXPECT_EQ(out[3].getLen(), 0x80000);
+}
+
 TEST(VmmDescSplitterTest, SplitDescsNonVmm)
 {
     VramRegionMap regionMap;
@@ -743,6 +768,33 @@ TEST(VmmDescSplitterTest, SplitTransferDescsUnalignedBothSides)
     ASSERT_EQ(splitDst.getDescs().size(), 2);
     EXPECT_EQ(splitSrc.getDescs()[0].getLen(), 0x200000);
     EXPECT_EQ(splitSrc.getDescs()[1].getLen(), 0x200000);
+}
+
+TEST(VmmDescSplitterTest, SplitTransferDescsAcrossDstRuns)
+{
+    // dst pool: one 4MB chunk, then 1MB chunks (two regions); src: one 8MB chunk.
+    VramRegionMap localMap, remoteMap;
+    localMap[0x1000000] = {0x800000, 0x800000};
+    remoteMap[0x2000000] = {0x400000, 0x400000};
+    remoteMap[0x2400000] = {0x200000, 0x100000};
+
+    std::vector<MemoryDesc> srcDescs{{0x1000000, 0x600000, 0}};
+    std::vector<MemoryDesc> dstDescs{{0x2000000, 0x600000, 0}};
+    MemoryDescs srcInput{MemoryType::kVRAM, srcDescs};
+    MemoryDescs dstInput{MemoryType::kVRAM, dstDescs};
+
+    auto [splitSrc, splitDst] = VmmDescSplitter::splitAndCoalesceTransferDescs(srcInput, dstInput, localMap, remoteMap);
+
+    // Every piece stays inside one dst chunk: 4MB, then 1MB + 1MB from the second region.
+    ASSERT_EQ(splitDst.getDescs().size(), 3);
+    EXPECT_EQ(splitDst.getDescs()[0].getAddr(), 0x2000000);
+    EXPECT_EQ(splitDst.getDescs()[0].getLen(), 0x400000);
+    EXPECT_EQ(splitDst.getDescs()[1].getAddr(), 0x2400000);
+    EXPECT_EQ(splitDst.getDescs()[1].getLen(), 0x100000);
+    EXPECT_EQ(splitDst.getDescs()[2].getAddr(), 0x2500000);
+    EXPECT_EQ(splitDst.getDescs()[2].getLen(), 0x100000);
+    ASSERT_EQ(splitSrc.getDescs().size(), 3);
+    EXPECT_EQ(splitSrc.getDescs()[2].getAddr(), 0x1500000);
 }
 
 TEST(VmmDescSplitterTest, SplitTransferDescsNoDstRegion)

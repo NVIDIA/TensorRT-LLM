@@ -18,21 +18,68 @@
 #include "kv_cache_manager_v2/storage/core.h"
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/logger.h"
 #include <algorithm>
 #include <cerrno>
 #include <climits>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <limits>
 #include <numeric>
 #include <set>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 #include <unistd.h>
 #include <unordered_map>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
+
+namespace
+{
+
+//! Bytes kGpuChunkSizeEnvVar asks for, or 0 when it is unset or empty.
+size_t requestedGpuChunkBytes()
+{
+    char const* const value = std::getenv(kGpuChunkSizeEnvVar);
+    if (value == nullptr || *value == '\0')
+    {
+        return 0;
+    }
+    std::string_view const text(value);
+    bool const digitsOnly = std::all_of(text.begin(), text.end(), [](char c) { return c >= '0' && c <= '9'; });
+    errno = 0;
+    unsigned long long const mib = digitsOnly ? std::strtoull(value, nullptr, 10) : 0;
+    constexpr unsigned long long kMaxMib = std::numeric_limits<size_t>::max() >> 20;
+    if (!digitsOnly || errno == ERANGE || mib > kMaxMib)
+    {
+        throw std::invalid_argument(
+            std::string(kGpuChunkSizeEnvVar) + " must be a non-negative integer number of MiB, got '" + value + "'");
+    }
+    return static_cast<size_t>(mib) << 20;
+}
+
+} // namespace
+
+size_t gpuMaxChunkSize(size_t unit)
+{
+    size_t const requested = requestedGpuChunkBytes();
+    if (requested <= unit)
+    {
+        return unit;
+    }
+    // Largest unit << k not above requested. unit is a power of two (createCacheLevelStorage), so this is
+    // std::bit_floor(requested); spelled out to stay within the language level this file already uses.
+    size_t chunk = unit;
+    while (chunk <= requested / 2)
+    {
+        chunk <<= 1;
+    }
+    return chunk;
+}
 
 // ---------------------------------------------------------------------------
 // SlotAllocator
@@ -312,7 +359,7 @@ SlotCount GpuSlotPool::computeNumSlots(size_t slotSize, size_t numPhysMem, size_
 
 SlotCount GpuSlotPool::numSlots() const noexcept
 {
-    return computeNumSlots(mSlotSize, mVirtMem.numPhysMem(), mVirtMem.physMemSize());
+    return slotCountValueFromSize(mVirtMem.usableBytes() / mSlotSize);
 }
 
 void GpuSlotPool::destroy()
@@ -627,7 +674,13 @@ GpuCacheLevelStorage::GpuCacheLevelStorage(
 {
     TLLM_CHECK_DEBUG_WITH_INFO(slotCountList.size() == storageCfg.slotDescList.size(),
         "GpuCacheLevelStorage: slotCountList and slotDescList must have the same length");
-    mPhysMemAllocator = std::make_unique<PooledPhysMemAllocator>(physMemSize);
+    mPhysMemAllocator = std::make_unique<PooledPhysMemAllocator>(physMemSize, gpuMaxChunkSize(physMemSize));
+    if (mPhysMemAllocator->maxChunkSize() > physMemSize)
+    {
+        TLLM_LOG_INFO(
+            "GPU KV pools map chunks up to %zu MiB (%s) on a %zu MiB allocation unit; pool sizes are unchanged.",
+            mPhysMemAllocator->maxChunkSize() >> 20, kGpuChunkSizeEnvVar, physMemSize >> 20);
+    }
 
     for (PoolGroupIndex pgIdx{0}; pgIdx < storageCfg.slotDescList.size(); ++pgIdx)
     {

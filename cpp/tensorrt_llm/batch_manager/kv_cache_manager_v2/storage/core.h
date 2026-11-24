@@ -153,6 +153,24 @@ private:
     DynamicBitset mOccupiedMask;
 };
 
+//! Largest physical chunk, in MiB, the GPU pools map (rounded down to a power-of-two
+//! multiple of the tier's unit). Unset, empty, 0, or a value at or below the unit keeps
+//! one chunk per unit.
+//!
+//! Only the mapping changes: pools are still sized and resized in units of the GPU
+//! tier's physMemSize (chosen from the quota in createCacheLevelStorage), and are
+//! mapped from the largest chunks their offsets allow
+//! (PooledPhysMemAllocator::chunkSizeAt), so pool sizes and slot counts are the
+//! same as without it. Every chunk is one cuMemCreate allocation, which a transfer
+//! agent registers -- and every peer writing into it imports and maps -- separately
+//! (NIXL/UCX cuda_ipc). Disaggregated serving with many peers per pool can raise it
+//! to cut that count.
+inline constexpr char const* kGpuChunkSizeEnvVar = "TLLM_KV_CACHE_MANAGER_V2_GPU_CHUNK_MB";
+
+//! The largest chunk kGpuChunkSizeEnvVar asks for a GPU tier with allocation unit
+//! `unit`: `unit` when it is unset or at most `unit`. Throws on a malformed value.
+[[nodiscard]] size_t gpuMaxChunkSize(size_t unit);
+
 // ---------------------------------------------------------------------------
 // SlotPoolBase — abstract base for a single memory pool.
 // Mirrors _storage/_core.py::SlotPoolBase.
