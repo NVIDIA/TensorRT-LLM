@@ -77,6 +77,7 @@ In our submissions, the global batch is `512` trajectories per training step, an
 | **Concurrency** | Varies with load; bigger batches raise throughput | Set by the training recipe, not by traffic: only a few steps' worth of rollouts can be in flight |
 | **Requests** | Independent requests | Closed-loop multi-turn: about `30` calls each, context grows from roughly `8k` to `30k` tokens, only about `1.4k` new tokens per turn (`~96%` prefix cache hit) |
 | **Weights** | Fixed | In-flight weight update (refit) after every training step, taking only `~4%` of the step time |
+| **Outputs** | Generated tokens | Must also return the logprob of every sampled token, which can add overhead to the inference engine. |
 | **Environment** | Dedicated machines | Cluster shared with the trainer and sandboxes; host CPUs contended by Gym and the sandboxes |
 
 ### Decode Latency Dominates Rollout Time
@@ -96,7 +97,7 @@ To decide a suitable recipe, which includes how many rollouts may be in flight, 
 
 ### Step 1: Derive the Latency Budget from the Trainer
 
-We start by measuring the trainer's step time and how long a rollout takes. From these we derive the latency budget, the longest a rollout may take while still keeping the trainer fed. The budget depends on the step time and on the max concurrency, the number of rollouts allowed to run at the same time: with more rollouts running at once, each can take longer and still keep up. The budget then guides the rest of the recipe, including the max concurrency itself. If the model calls cannot fit in the budget however many GPUs we add, the max concurrency has to go up.
+We start by measuring the trainer's step time and how long a rollout takes. From these we derive the latency budget, the longest a rollout may take while still keeping the trainer fed. The budget depends on the step time and on the max concurrency, the number of rollouts allowed to run at the same time: with more rollouts running at once, each can take longer and still keep up. Max concurrency is also capped: in our recipes, rollout can run at most `4` training steps ahead of the trainer (the staleness age), so at most `4` × `512` trajectories can be in flight or waiting. The budget then guides the rest of the recipe, including the max concurrency itself. If the model calls cannot fit in the budget however many GPUs we add, the max concurrency has to go up, within that cap. Raising the cap means a larger batch or more off-policy data.
 
 For example, our Megatron trainer consumes `512` trajectories every `108` seconds and a rollout takes about `140` seconds, so about `670` rollouts run at once. A max concurrency of `512` gives a budget of only `76` seconds, which no number of GPUs can meet, so our larger recipes raise it to `1,024`, which gives `151` seconds.
 
