@@ -78,6 +78,31 @@
       "title": "AttentionConfig",
       "type": "object"
     },
+    "BatchingConfig": {
+      "additionalProperties": false,
+      "description": "Request-level dynamic batching of compatible text-to-image requests.",
+      "properties": {
+        "max_batch_size": {
+          "default": 1,
+          "description": "Maximum generated images in a dynamic batch; 1 disables request merging. A larger single request still runs independently.",
+          "minimum": 1,
+          "status": "prototype",
+          "title": "Max Batch Size",
+          "type": "integer"
+        },
+        "max_queue_delay_ms": {
+          "default": 0.0,
+          "description": "Maximum milliseconds spent collecting compatible requests when a worker is ready; 0 merges only requests already queued.",
+          "maximum": 2147483647,
+          "minimum": 0,
+          "status": "prototype",
+          "title": "Max Queue Delay Ms",
+          "type": "number"
+        }
+      },
+      "title": "BatchingConfig",
+      "type": "object"
+    },
     "CacheDiTConfig": {
       "additionalProperties": false,
       "description": "Configuration for Cache-DiT (DBCache, TaylorSeer, SCM).\n\nRequires the cache-dit package.",
@@ -1071,13 +1096,18 @@
       "type": "object"
     }
   },
-  "$id": "https://nvidia.github.io/TensorRT-LLM/1.4.0rc4/_static/schemas/trtllm-serve-visual-gen-config.schema.json",
+  "$id": "https://nvidia.github.io/TensorRT-LLM/1.4.0rc5/_static/schemas/trtllm-serve-visual-gen-config.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "description": "Static YAML checks only; runtime validation remains authoritative.",
   "properties": {
     "attention_config": {
       "$ref": "#/$defs/AttentionConfig",
+      "status": "prototype"
+    },
+    "batching_config": {
+      "$ref": "#/$defs/BatchingConfig",
+      "description": "Request batching limits shared by offline generation and serving.",
       "status": "prototype"
     },
     "cache_config": {
@@ -1208,6 +1238,6 @@
       "status": "prototype"
     }
   },
-  "title": "TensorRT-LLM 1.4.0rc4 trtllm-serve --visual_gen_args",
+  "title": "TensorRT-LLM 1.4.0rc5 trtllm-serve --visual_gen_args",
   "type": "object"
 }

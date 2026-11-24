@@ -113,7 +113,7 @@ class TestGreedyTokensUsable:
 def test_handle_logits_takes_greedy_only_outputs() -> None:
     """The executor hands HandleLogits the outputs' logits before sampling; a greedy-only batch (no request asks for
     logits) has none, and HandleLogits must return without reading them."""
-    HandleLogits()([], [_request()], None, 1, [0], True)
+    HandleLogits()([], [_request()], None, 1, [0])
 
 
 class TestStableGreedyFromGreedyTokens:

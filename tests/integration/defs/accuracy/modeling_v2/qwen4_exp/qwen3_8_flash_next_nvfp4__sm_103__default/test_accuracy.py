@@ -35,8 +35,8 @@ from PIL import Image, ImageDraw
 from transformers import AutoProcessor, AutoTokenizer
 
 from tensorrt_llm import LLM
-from tensorrt_llm._torch._experimental.modeling_v2 import MODELING_V2_VALIDATE_ENV
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2 import MODELING_V2_VALIDATE_ENV
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default import (  # noqa: E501
     modeling as target_modeling,
 )
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import BreakableCUDAGraphRunner

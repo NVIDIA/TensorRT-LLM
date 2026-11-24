@@ -202,11 +202,12 @@ class MoECommTimeoutGuard:
         with self._lock:
             self._proxies.discard(proxy)
 
-    def set_warmup(self, in_warmup: bool) -> None:
+    def set_warmup(self, in_warmup: bool, *, quiet: bool = False) -> None:
         """Apply the warmup or serving timeout to every registered proxy.
 
         Args:
             in_warmup: Whether the engine enters warmup.
+            quiet: Log the switch at DEBUG instead of INFO.
 
         Raises:
             RuntimeError: If the current CUDA stream is capturing a graph. Proxies may issue
@@ -230,21 +231,23 @@ class MoECommTimeoutGuard:
         applied = "native defaults" if seconds is None else f"{seconds} s"
         names = ", ".join(proxy.name for proxy in proxies)
         stage = "warmup" if in_warmup else "serving"
-        logger.info(f"MoE communication timeouts for {stage}: {applied} ({names})")
+        log = logger.debug if quiet else logger.info
+        log(f"MoE communication timeouts for {stage}: {applied} ({names})")
 
     @contextlib.contextmanager
-    def serving_timeouts(self) -> Iterator[None]:
+    def serving_timeouts(self, *, quiet: bool = False) -> Iterator[None]:
         """Apply the serving timeout in the enclosed block, then restore the previous timeout.
 
         A captured CUDA graph keeps the timeouts that were current at capture, and serving
-        replays it, so the pass that captures uses the serving timeout even during warmup.
+        replays it, so every capture uses the serving timeout even during warmup. ``quiet`` logs
+        both switches at DEBUG.
         """
         previous = self._in_warmup
-        self.set_warmup(False)
+        self.set_warmup(False, quiet=quiet)
         try:
             yield
         finally:
-            self.set_warmup(previous)
+            self.set_warmup(previous, quiet=quiet)
 
     def _resolve_budgets(self) -> MoECommTimeoutBudgets:
         if self._budgets is None:
@@ -335,10 +338,10 @@ def set_moe_comm_warmup(in_warmup: bool) -> None:
 
 
 @contextlib.contextmanager
-def moe_comm_serving_timeouts() -> Iterator[None]:
+def moe_comm_serving_timeouts(*, quiet: bool = False) -> Iterator[None]:
     """Apply the serving timeouts in the enclosed block.
 
     See ``MoECommTimeoutGuard.serving_timeouts``.
     """
-    with _DEFAULT_GUARD.serving_timeouts():
+    with _DEFAULT_GUARD.serving_timeouts(quiet=quiet):
         yield

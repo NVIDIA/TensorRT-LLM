@@ -52,16 +52,33 @@ _TIMEOUT_EVIDENCE_PLUGIN_NAME = "trtllm_pytest_timeout_evidence"
 
 
 def _emit_timeout_record(marker, payload, config) -> None:
-    """Emit a record with both global and fixture output capture disabled."""
+    """Emit a record with both global and fixture output capture disabled.
+
+    The record is also appended to TIMEOUT_EVIDENCE_FILE when CI provides one.
+    """
     try:
         record = json.dumps(payload, separators=(",", ":"))
+        line = f"{marker}{record}\n".encode("utf-8")
+    except (TypeError, UnicodeError, ValueError):
+        return
+    try:
         capman = config.pluginmanager.getplugin("capturemanager")
         capture_disabled = (capman.global_and_fixture_disabled()
                             if capman else nullcontext())
         with capture_disabled:
-            os.write(2, f"\n{marker}{record}\n".encode("utf-8"))
+            os.write(2, b"\n" + line)
     except (OSError, TypeError, UnicodeError, ValueError):
         # Timeout handling must proceed even if diagnostic output is unavailable.
+        pass
+    try:
+        # No O_CREAT: CI creates the file; appending keeps its owner and mode.
+        path = os.environ["TIMEOUT_EVIDENCE_FILE"]
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND)
+        try:
+            os.write(fd, line)
+        finally:
+            os.close(fd)
+    except (KeyError, OSError):
         pass
 
 

@@ -129,4 +129,4 @@ add a new config:
 4. (If applicable) generate canary references for the new model and
    add the reference JSON next to this directory.
 5. Register the new test ID in
-   `tests/integration/test_lists/qa/llm_function_stress.txt`.
+   `tests/integration/test_lists/qa/functional/llm_function_stress.txt`.

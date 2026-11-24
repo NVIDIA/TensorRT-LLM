@@ -592,9 +592,9 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
 
 #if TLLM_MOE_A2A_COMPILE_SM90
             // .acquire and .release qualifiers for fence instruction require sm_90 or higher.
-            asm volatile("fence.release.sys;");
+            asm volatile("fence.release.sys;" ::: "memory");
 #else
-            asm volatile("fence.acq_rel.sys;");
+            asm volatile("fence.acq_rel.sys;" ::: "memory");
 #endif
             // Signal completion to all active peers; skip dead ranks (their symmetric memory
             // is unreachable).
@@ -1132,9 +1132,9 @@ __global__ void moeA2ACombineKernel(const CombineKernelPointers ptrs, int max_to
         }
 #if TLLM_MOE_A2A_COMPILE_SM90
         // .acquire and .release qualifiers for fence instruction require sm_90 or higher.
-        asm volatile("fence.acquire.sys;");
+        asm volatile("fence.acquire.sys;" ::: "memory");
 #else
-        asm volatile("fence.acq_rel.sys;");
+        asm volatile("fence.acq_rel.sys;" ::: "memory");
 #endif
     }
     __syncthreads();

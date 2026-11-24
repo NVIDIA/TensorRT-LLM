@@ -15,12 +15,13 @@
 
 import re
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Dict, List, Literal
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional
 
 import torch
 from transformers import PretrainedConfig
 
 if TYPE_CHECKING:
+    from tensorrt_llm._torch.recurrent_state_spec import RecurrentStateSpec
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 from tensorrt_llm._utils import get_sm_version, is_sm_100f, is_sm_120f
@@ -768,9 +769,13 @@ class _Qwen3_5VLModel(Qwen3VLModelBase):
     decorators (outer arch string + input-processor `model_type`).
     """
 
+    supported_encoder_attention_backends = Qwen3VLModelBase.supported_encoder_attention_backends
+
     supports_encoder_cache = True
     # The inner Qwen3.5 decoder implements them (see Qwen3NextForCausalLM).
     model_specific_llm_args = Qwen3NextForCausalLM.model_specific_llm_args
+    # The inner decoder's GDN layers read it.
+    mamba_metadata_cls = Qwen3NextForCausalLM.mamba_metadata_cls
 
     @classmethod
     def get_model_defaults(cls, llm_args):
@@ -791,6 +796,17 @@ class _Qwen3_5VLModel(Qwen3VLModelBase):
     ) -> Literal["PYTHON"]:
         """Match the hybrid text decoder's Python disaggregated route."""
         return "PYTHON"
+
+    @classmethod
+    def get_recurrent_state_spec(
+        cls,
+        pretrained_config: Any,
+        *,
+        quant_config: Optional[QuantConfig] = None,
+    ) -> "RecurrentStateSpec":
+        """Return the hybrid text decoder's declaration, read from ``text_config``."""
+        text_config = getattr(pretrained_config, "text_config", None) or pretrained_config
+        return Qwen3NextForCausalLM.get_recurrent_state_spec(text_config, quant_config=quant_config)
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
         kwargs["vision_model_class"] = Qwen3VisionModel
@@ -864,6 +880,8 @@ class _Qwen3_5VLModel(Qwen3VLModelBase):
 class Qwen3_5MoeVLModel(_Qwen3_5VLModel):
     """VLM wrapper composing Qwen3 vision encoder with Qwen3.5 MoE text decoder."""
 
+    supported_encoder_attention_backends = _Qwen3_5VLModel.supported_encoder_attention_backends
+
     @classmethod
     def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
         return _get_qwen35_moe_model_defaults(llm_args)
@@ -886,3 +904,5 @@ class Qwen3_5VLModel(_Qwen3_5VLModel):
     instead of `SparseMoeBlock` (the dense text config has a native `intermediate_size`
     and no `num_experts`).
     """
+
+    supported_encoder_attention_backends = _Qwen3_5VLModel.supported_encoder_attention_backends

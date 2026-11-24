@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the ssm/k3_kda_verify catalog entry, on a real cache object.
+"""GPU test for the ssm/k3_kda_verify op, on a real cache object.
 
 Kimi K3's KDA speculative verify of R requests of 1 + num_spec tokens, at the TP16 rank slice (6 heads, K = V = 128,
 conv width 4), on the verify pools of a real ``KimiK3HybridCacheManager`` built with MTP-style speculation, the KDA
@@ -28,7 +28,7 @@ import _kda_cells as kc
 from _validating import validating
 
 k3_kda_verify = importlib.import_module(
-    "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl."
+    "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl."
     "kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.ops.ssm.k3_kda_verify"
 ).k3_kda_verify
 

@@ -109,21 +109,22 @@ def test_snapshot_policy_follows_reuse_and_encoder_recovery(
             assert manager.probe_context_reuse(request(1, 257)) is None
 
 
-@pytest.mark.parametrize("prefix", [129, 255])
-def test_partial_global_hit_copies_tail_and_replays_encoder(cache_config, monkeypatch, prefix):
-    from tensorrt_llm._torch.pyexecutor.ced_replay import EncoderReplay
-
+@pytest.mark.parametrize("prefix,source_end", [(129, 384), (254, 384), (255, 384), (253, 255)])
+def test_partial_global_hit_copies_tail_and_replays_encoder(
+    cache_config, monkeypatch, prefix, source_end
+):
     config, sparse, dtype = cache_config
     monkeypatch.setenv("TRTLLM_V41_DECODER_BOUNDED_REPLAY", "1")
     monkeypatch.setenv("TRTLLM_V41_ENCODER_REPLAY", "1")
     with cache_case(config, sparse, dtype, [384], [0], 1, reuse=True) as case:
         manager = case[0].kv_cache_manager
         source = manager.kv_cache_map[0]
-        source.commit(list(range(384)))
+        source.commit(list(range(source_end)))
+        source.stop_committing()
         reader = LlmRequest(
             request_id=1,
             max_new_tokens=2,
-            input_tokens=list(range(prefix)) + [0] * 128,
+            input_tokens=list(range(prefix)) + [0] * 140,
             sampling_config=SamplingConfig(),
             is_streaming=False,
         )
@@ -132,11 +133,16 @@ def test_partial_global_hit_copies_tail_and_replays_encoder(cache_config, monkey
             assert reader.context_current_position == prefix
             cache = manager.kv_cache_map[1]
             assert cache.num_committed_tokens == prefix
-            assert isinstance(reader.py_ced_replay, EncoderReplay)
-            assert reader.py_ced_replay.start == max(0, prefix - 140)
-            assert not any(
-                cache.reuse_status[group].complete for group in manager._encoder_optional_groups
-            )
+            # An odd prefix restores the Encoder one row earlier and replays that row.
+            restored = prefix - prefix % 2
+            plan = reader.py_ced_replay
+            if restored == prefix:
+                assert isinstance(plan, EncoderCheckpoint)
+            else:
+                assert plan.restores_checkpoint and plan.start == restored
+            for group in manager._encoder_optional_groups:
+                status = cache.reuse_status[group]
+                assert status.complete and status.endpoint == restored
             for layer in manager.layout.kv_source_layer_ids:
                 for role in (CSA2CacheRole.GLOBAL, CSA2CacheRole.INDEX):
                     source_pages = manager.get_cache_indices(0, layer, role)
@@ -265,17 +271,21 @@ def test_dummy_context_uses_base_lifecycle_without_publishing(cache_config, monk
 
 @pytest.mark.parametrize("chunked", [False, True])
 @pytest.mark.parametrize("encoder_replay", [False, True])
+@pytest.mark.parametrize("prefix,snapshot_end", [(256, 256), (255, 255), (253, 255)])
 def test_encoder_snapshot_resumes_without_replay(
-    model_and_config, monkeypatch, chunked, encoder_replay
+    model_and_config, monkeypatch, chunked, encoder_replay, prefix, snapshot_end
 ):
     model, config, sparse, dtype = model_and_config
     enable_ced(model)
     model.model.encoder_replay_enabled = encoder_replay
     monkeypatch.setenv("TRTLLM_V41_DECODER_BOUNDED_REPLAY", "1")
     monkeypatch.setenv("TRTLLM_V41_ENCODER_REPLAY", str(int(encoder_replay)))
+    if encoder_replay:
+        # An odd prefix would restore one row earlier and replay it; keep an exact restore.
+        prefix -= prefix % 2
     window = model.model.decoder_replay_window
     chunks = [1, window - 2, 1] if chunked else [window]
-    total = 256 + window
+    total = prefix + window
     ids = torch.arange(total, device="cuda", dtype=torch.int32)
     with (
         torch.inference_mode(),
@@ -289,16 +299,17 @@ def test_encoder_snapshot_resumes_without_replay(
         # Match GEMM partitions on the no-reuse reference so the comparison
         # isolates checkpoint restore from BF16 shape-dependent rounding.
         start = 0
-        for length in [256, *chunks]:
+        for length in [prefix, *chunks]:
             end = start + length
-            if start == 256:
+            if start == prefix:
                 # Match the empty private Decoder history of a new cache hit.
-                warm.py_ced_replay = EncoderCheckpoint(0, id(manager.kv_cache_map[0]), 256)
+                warm.py_ced_replay = EncoderCheckpoint(0, id(manager.kv_cache_map[0]), prefix)
             reference = run(model, metadata, [warm], ids[start:end], [start], [length], 1)
             start = end
         expected = reference.clone()
-        manager.kv_cache_map[0].commit(list(range(256)))
-        frozen = global_bytes(metadata, 0, 256)
+        manager.kv_cache_map[0].commit(list(range(snapshot_end)))
+        manager.kv_cache_map[0].stop_committing()
+        frozen = global_bytes(metadata, 0, prefix)
         saved = []
         for layer, _, role in manager._encoder_roles:
             slot = manager.get_cache_indices(0, layer, role)[1]
@@ -310,12 +321,13 @@ def test_encoder_snapshot_resumes_without_replay(
         if not encoder_replay:
             assert manager.probe_context_reuse(short) <= max(0, 257 - window)
         fresh = request(1, total)
-        assert manager.probe_context_reuse(fresh) == 256
+        assert manager.probe_context_reuse(fresh) == (snapshot_end if encoder_replay else prefix)
+        assert manager.prepare_context_cache(fresh, reuse_limit=prefix) == prefix
         assert manager.prepare_context(fresh)
-        assert fresh.context_current_position == 256
+        assert fresh.context_current_position == prefix
         assert isinstance(fresh.py_ced_replay, EncoderCheckpoint)
         for layer, role, slot, _ in saved:
-            assert manager.get_cache_indices(1, layer, role)[1] == slot
+            assert (manager.get_cache_indices(1, layer, role)[1] == slot) == (prefix % 128 == 0)
         if encoder_replay and chunked:
             from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 
@@ -334,7 +346,7 @@ def test_encoder_snapshot_resumes_without_replay(
             assert fresh.py_ced_replay is plan
             assert manager.context_replay_tokens(fresh) == 0
         output = None
-        start = 256
+        start = prefix
         for i, length in enumerate(chunks):
             final = i == len(chunks) - 1
             fresh.context_current_position = start
@@ -358,7 +370,7 @@ def test_encoder_snapshot_resumes_without_replay(
                 rtol=0,
                 atol=0,
             )
-        for name, value in global_bytes(metadata, 0, 256).items():
+        for name, value in global_bytes(metadata, 0, prefix).items():
             torch.testing.assert_close(value, frozen[name], rtol=0, atol=0)
         manager.free_resources(fresh)
 
@@ -386,7 +398,10 @@ def test_encoder_window_spans_two_blocks(cache_config, monkeypatch, missing_page
         assert manager.prepare_context(fresh)
         assert manager.kv_cache_map[1].is_active
         assert fresh.context_current_position == 512
-        assert manager.context_replay_tokens(fresh) == (268 if missing_page else 0)
+        assert manager.context_replay_tokens(fresh) == (256 if missing_page else 0)
+        if missing_page:
+            assert fresh.py_ced_replay.restores_checkpoint
+            assert fresh.py_ced_replay.start == 256
         fresh.context_chunk_size = 268
         assert manager.resize_context(fresh, 268)
         if not missing_page:
@@ -415,18 +430,21 @@ def test_context_prepare_resumes_before_budgeting_and_retries(
         if policy != "cold":
             manager.kv_cache_map[0].commit(list(range(256)))
             if policy == "evicted":
+                _introspection.drop_optional_pages(manager.kv_cache_map[0], 128)
                 _introspection.drop_optional_pages(manager.kv_cache_map[0], 256)
         manager.free_resources(request(0, 384))
         req = request(1, 257 if policy == "short-suffix" else 396)
         resume = manager._resume_and_restore
         selections = []
 
-        def try_resume(req_id, cache, groups=None):
-            selections.append(groups)
+        def try_resume(req_id, cache, groups=None, *, optional_reuse_endpoints=None):
+            selections.append(
+                optional_reuse_endpoints if optional_reuse_endpoints is not None else groups
+            )
             if len(selections) == 1:
                 assert not cache.is_active
                 return False
-            return resume(req_id, cache, groups)
+            return resume(req_id, cache, groups, optional_reuse_endpoints=optional_reuse_endpoints)
 
         monkeypatch.setattr(manager, "_resume_and_restore", try_resume)
         assert not manager.prepare_context(req)
@@ -441,13 +459,17 @@ def test_context_prepare_resumes_before_budgeting_and_retries(
         plan = req.py_ced_replay
         if policy == "hit":
             assert isinstance(plan, EncoderCheckpoint)
-            assert selections[-1] == manager._encoder_optional_groups
+            assert selections[-1] == {group: 256 for group in manager._encoder_optional_groups}
+        elif policy == "short-suffix":
+            assert isinstance(plan, EncoderReplay) and plan.restores_checkpoint
+            assert plan.start == 117
+            assert selections[-1] == {group: 117 for group in manager._encoder_optional_groups}
         elif policy != "cold":
             assert isinstance(plan, EncoderReplay)
-            assert selections[-1] == ()
+            assert selections[-1] == {}
         else:
             assert plan is None
-        expected_tokens = None if policy == "cold" else 0 if policy == "hit" else 140
+        expected_tokens = {"cold": None, "hit": 0, "short-suffix": 139, "evicted": 140}[policy]
         assert manager.context_replay_tokens(req) == expected_tokens
 
         # A budget rejection or allocation failure can suspend the admitted

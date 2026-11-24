@@ -24,11 +24,11 @@ from unittest import mock
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default import (  # noqa: E501
-    modeling as M,
-)
 from tensorrt_llm._torch.configs import Qwen4ExpTextConfig, Qwen4ExpVisionConfig
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default import (  # noqa: E501
+    modeling as M,
+)
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.llmapi import QSASparseAttentionConfig
 from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
@@ -771,7 +771,8 @@ def test_every_rank_completes_its_draft_rows_through_the_round_trip(counts, monk
             state["partial"], _expert_out(gathered, ids, wts, 128 * rank, 128)
         )
         assert tuple(out.shape) == (counts[rank], HIDDEN)
-        torch.testing.assert_close(out, _expert_out(xs[rank], *route(xs[rank]), 0, NUM_EXPERTS))
+        call_ids, call_wts = route(xs[rank])
+        torch.testing.assert_close(out, _expert_out(xs[rank], call_ids, call_wts, 0, NUM_EXPERTS))
         per_rank.append(state["collectives"])
     assert all(c == per_rank[0] for c in per_rank), per_rank
     assert per_rank[0] == [

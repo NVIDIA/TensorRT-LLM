@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import replace
 from typing import Dict, List, Optional, Set
 
 from tensorrt_llm.bindings.executor import (
@@ -38,6 +39,24 @@ _ITERATION_STATS_SCALAR_FIELDS = (
 
 _ITERATION_STATS_OPTIONAL_FIELDS = ("static_batching_stats",)
 
+# Payload counters that are all zero on a rank with nothing scheduled.
+_SCHEDULED_WORK_FIELDS = (
+    "num_context_requests",
+    "num_ctx_tokens",
+    "num_ctx_kv_tokens",
+    "num_gen_requests",
+    "num_gen_kv_tokens",
+    "num_paused_requests",
+    "num_paused_kv_tokens",
+)
+# The scheduled counts that give a rank a row of its own in a queue snapshot.
+_ROW_WORK_FIELDS = (
+    "num_context_requests",
+    "num_ctx_tokens",
+    "num_gen_requests",
+    "num_gen_kv_tokens",
+)
+
 
 # The /metrics JSON key of each InflightBatchingStats field taken from a rank's payload; the other
 # fields of a rank's row come from rank 0's stats.
@@ -49,6 +68,10 @@ _PAYLOAD_IFB_KEYS = {
     "num_gen_kv_tokens": "numGenKvTokens",
     "num_paused_requests": "numPausedRequests",
     "num_paused_kv_tokens": "numPausedKvTokens",
+    "num_queued_context_requests": "numQueuedContextRequests",
+    "num_queued_ctx_tokens": "numQueuedCtxTokens",
+    "num_queued_gen_requests": "numQueuedGenRequests",
+    "num_queued_gen_kv_tokens": "numQueuedGenKvTokens",
 }
 # The /metrics JSON key of each scheduling counter a rank's payload carries.
 _SCHEDULING_COUNTER_KEYS = {
@@ -97,21 +120,25 @@ _SPECDEC_STATS_FORMAT = (
     "{" + ", ".join(f'"{key}": %r' for key in _SPECDEC_STATS_KEYS.values()) + "}"
 )
 # Marks for the parts of a rank row that differ between ranks other than 0, and their row text.
-_IFB_MARK, _KV_MARK, _SPECDEC_MARK, _RANK_MARK = (
+_IFB_MARK, _KV_MARK, _SPECDEC_MARK, _RANK_MARK, _QUEUED_MARK = (
     "@adp-row-inflight-batching-stats@",
     "@adp-row-kv-cache-stats@",
     "@adp-row-specdec-stats@",
     "@adp-row-attention-dp-rank@",
+    "@adp-row-num-queued-requests@",
 )
-_IFB_TEXT, _KV_TEXT, _SPECDEC_TEXT, _RANK_TEXT = (
+_IFB_TEXT, _KV_TEXT, _SPECDEC_TEXT, _RANK_TEXT, _QUEUED_TEXT = (
     json.dumps(_IFB_MARK),
     json.dumps(_KV_MARK),
     json.dumps(_SPECDEC_MARK),
     json.dumps(_RANK_MARK),
+    json.dumps(_QUEUED_MARK),
 )
 _MARK_TEXTS = re.compile(
     "("
-    + "|".join(re.escape(text) for text in (_IFB_TEXT, _KV_TEXT, _SPECDEC_TEXT, _RANK_TEXT))
+    + "|".join(
+        re.escape(text) for text in (_IFB_TEXT, _KV_TEXT, _SPECDEC_TEXT, _RANK_TEXT, _QUEUED_TEXT)
+    )
     + ")"
 )
 
@@ -223,6 +250,22 @@ class ADPIterStatsBuffer:
         self._synthetic_iters: Set[int] = set()
         # Rank 0 only: full IterationStats objects waiting for ADP fanout.
         self._rank0_iter_stats: Dict[int, IterationStats] = {}
+        # Rank 0 only: whether the pending record is a queue snapshot (see queue()).
+        self._rank0_is_queue_snapshot: Dict[int, bool] = {}
+        # All ranks: pending iterations queued as an all-rank idle heartbeat.
+        self._idle_heartbeat_iters: Set[int] = set()
+        # What the latest finalize() call did, for the executor on rank 0:
+        # whether it settled an iteration at all, the rank states if that
+        # iteration was an idle heartbeat (see make_idle_heartbeat_rows),
+        # whether it was the queue snapshot of a busy engine with nothing
+        # scheduled on any rank, every rank's queued counters in rank order
+        # (RankIterStatsPayload._QUEUED_FIELDS), and whether rank 0's row is
+        # among the rows (then it is the first).
+        self.last_finalize_settled = False
+        self.last_idle_rank_states: Optional[List[RankState]] = None
+        self.last_fanout_is_busy_queue_snapshot = False
+        self.last_fanout_queued_counters: tuple = ()
+        self.last_fanout_has_rank0_row = False
         # Rank 0 only: per-request stats preserved for compatibility.
         # RequestStats remain rank-0-owned under Attention-DP.
         self._rank0_req_stats: Dict[int, Optional[List[RequestStats]]] = {}
@@ -250,6 +293,10 @@ class ADPIterStatsBuffer:
             num_gen_kv_tokens=ifb.num_gen_kv_tokens,
             num_paused_requests=ifb.num_paused_requests,
             num_paused_kv_tokens=ifb.num_paused_kv_tokens,
+            num_queued_context_requests=ifb.num_queued_context_requests,
+            num_queued_ctx_tokens=ifb.num_queued_ctx_tokens,
+            num_queued_gen_requests=ifb.num_queued_gen_requests,
+            num_queued_gen_kv_tokens=ifb.num_queued_gen_kv_tokens,
             kv_cache_stats=_snapshot_kv_cache_stats(stats.kv_cache_stats),
             cross_kv_cache_stats=_snapshot_kv_cache_stats(stats.cross_kv_cache_stats),
             specdec_stats=_snapshot_specdec_stats(stats.specdec_stats),
@@ -268,10 +315,29 @@ class ADPIterStatsBuffer:
         host_step_time_ms: Optional[float] = None,
         prev_device_step_time_ms: Optional[float] = None,
         gpu_forward_time_ms: Optional[float] = None,
+        is_queue_snapshot: bool = False,
+        idle_heartbeat: bool = False,
     ) -> None:
-        """Queue local stats; rank 0 also keeps objects needed for fanout."""
+        """Queue local stats; rank 0 also keeps objects needed for fanout.
+
+        ``is_queue_snapshot`` marks a record taken without a forward pass: it
+        reports the queues and has no measured duration.
+
+        ``idle_heartbeat`` marks the queue snapshot taken while every rank is
+        idle (the caller's all-rank decision). It supersedes an idle
+        heartbeat that is still pending: an idle engine has nothing new to
+        say about an earlier moment, and a second pending snapshot would keep
+        the buffer from ever draining. Every rank queues it in the same
+        iteration, so the pending sets stay aligned.
+        """
+        # An idle heartbeat is always a queue snapshot.
+        is_queue_snapshot = is_queue_snapshot or idle_heartbeat
         payload = self.make_payload(stats)
         iter_id = payload.iter_stats_iter
+        if idle_heartbeat:
+            for pending_iter in list(self._idle_heartbeat_iters):
+                if pending_iter != iter_id:
+                    self._discard(pending_iter)
 
         if iter_id in self._payloads and iter_id not in self._synthetic_iters:
             logger.warning(
@@ -281,9 +347,14 @@ class ADPIterStatsBuffer:
         self._payloads[iter_id] = payload
         self._synthetic_iters.discard(iter_id)
         self._note_payload_insert(iter_id)
+        if idle_heartbeat:
+            self._idle_heartbeat_iters.add(iter_id)
+        else:
+            self._idle_heartbeat_iters.discard(iter_id)
 
         if is_rank0:
             self._rank0_iter_stats[iter_id] = stats
+            self._rank0_is_queue_snapshot[iter_id] = is_queue_snapshot
             self._rank0_req_stats[iter_id] = req_stats
             self._rank0_kv_iter_stats[iter_id] = kv_iter_stats
             self._rank0_host_step_time_ms[iter_id] = host_step_time_ms
@@ -295,6 +366,23 @@ class ADPIterStatsBuffer:
         if self._oldest_iter is None:
             return None
         return self._payloads[self._oldest_iter]
+
+    @staticmethod
+    def rank0_sent_payload(all_rank_states: List[RankState]) -> bool:
+        """Whether rank 0 piggybacked a payload on the exchange behind these states.
+
+        Rank 0 may then hold more pending iterations, and the one it sent may
+        still wait for a peer's payload. Rank 0 is the TP group's first rank,
+        and every rank of the group gets the same answer; under helix CP
+        another TP group may get a different one.
+
+        Args:
+            all_rank_states: Rank states gathered by one TP-group exchange.
+
+        Returns:
+            True if another exchange can make progress on rank 0's stats.
+        """
+        return any(s.rank == 0 and s.iter_stats.has_iter_stats for s in all_rank_states)
 
     def _note_payload_insert(self, iter_id: int) -> None:
         if self._oldest_iter is None or iter_id < self._oldest_iter:
@@ -321,6 +409,8 @@ class ADPIterStatsBuffer:
         self._payloads.pop(iter_id, None)
         self._synthetic_iters.discard(iter_id)
         self._rank0_iter_stats.pop(iter_id, None)
+        self._rank0_is_queue_snapshot.pop(iter_id, None)
+        self._idle_heartbeat_iters.discard(iter_id)
         self._rank0_req_stats.pop(iter_id, None)
         self._rank0_kv_iter_stats.pop(iter_id, None)
         self._rank0_host_step_time_ms.pop(iter_id, None)
@@ -358,8 +448,10 @@ class ADPIterStatsBuffer:
 
         Attention-DP emits one stats row per rank so downstream FPM consumers
         can see scheduling distribution and diagnose load imbalance. Scheduled
-        fields are rank-local. Queued fields remain rank-0/global because the
-        executor request queue lives on rank 0.
+        and queued fields are rank-local: a rank's queued fields count the
+        requests it admitted and has not scheduled yet, and rank 0's also
+        count the pre-admission queues, which no rank owns yet. The queued
+        load of the engine is the sum over the ranks' rows.
         """
         rank = rank_state.rank
         payload = rank_state.iter_stats
@@ -395,6 +487,11 @@ class ADPIterStatsBuffer:
         ifb.num_paused_requests = payload.num_paused_requests
         ifb.num_paused_kv_tokens = payload.num_paused_kv_tokens
         ifb.num_scheduled_requests = ifb.num_context_requests + ifb.num_gen_requests
+        ifb.num_queued_context_requests = payload.num_queued_context_requests
+        ifb.num_queued_ctx_tokens = payload.num_queued_ctx_tokens
+        ifb.num_queued_gen_requests = payload.num_queued_gen_requests
+        ifb.num_queued_gen_kv_tokens = payload.num_queued_gen_kv_tokens
+        stats.num_queued_requests = ifb.num_queued_context_requests + ifb.num_queued_gen_requests
         counters = payload.scheduling_counters or _NO_SCHEDULING_COUNTERS
         for name, value in zip(RankSchedulingCounters._fields, counters):
             setattr(ifb, name, value)
@@ -402,14 +499,8 @@ class ADPIterStatsBuffer:
         if source_ifb is not None:
             ifb.micro_batch_id = source_ifb.micro_batch_id
             ifb.avg_num_decoded_tokens_per_iter = source_ifb.avg_num_decoded_tokens_per_iter
-            if rank == 0:
-                ifb.num_queued_context_requests = source_ifb.num_queued_context_requests
-                ifb.num_queued_ctx_tokens = source_ifb.num_queued_ctx_tokens
-                ifb.num_queued_gen_requests = source_ifb.num_queued_gen_requests
-                ifb.num_queued_gen_kv_tokens = source_ifb.num_queued_gen_kv_tokens
 
         if rank != 0:
-            stats.num_queued_requests = 0
             stats.num_completed_requests = 0
             stats.num_new_active_requests = 0
             stats.new_active_requests_queue_latency_ms = 0.0
@@ -426,6 +517,11 @@ class ADPIterStatsBuffer:
     ) -> List[str]:
         """Align payloads; once every rank is ready, rank 0 returns each rank's ``/metrics`` JSON
         row (``iteration_stats_row`` of that rank's stats) in rank order."""
+        self.last_finalize_settled = False
+        self.last_idle_rank_states = None
+        self.last_fanout_is_busy_queue_snapshot = False
+        self.last_fanout_queued_counters = ()
+        self.last_fanout_has_rank0_row = False
         pending_states = [s for s in all_rank_states if s.iter_stats.has_iter_stats]
         if not pending_states:
             return []
@@ -467,10 +563,41 @@ class ADPIterStatsBuffer:
                     f"iter {iter_stats_iter}"
                 )
                 self._clear_through(iter_stats_iter)
+                self.last_finalize_settled = True
                 return []
+            states = sorted(matching_states, key=lambda s: s.rank)
+            queued_counters = tuple(
+                tuple(getattr(s.iter_stats, name) for name in RankIterStatsPayload._QUEUED_FIELDS)
+                for s in states
+            )
+            any_queued = any(any(counters) for counters in queued_counters)
+            no_scheduled_work = not any(
+                getattr(s.iter_stats, name) for s in states for name in _SCHEDULED_WORK_FIELDS
+            )
+            is_queue_snapshot = self._rank0_is_queue_snapshot.get(iter_stats_iter, False)
+            is_idle_heartbeat = iter_stats_iter in self._idle_heartbeat_iters
+            # A peer's measured record can share the iteration with rank 0's
+            # snapshot; such a fanout is exported like any measured one.
+            self.last_fanout_is_busy_queue_snapshot = (
+                is_queue_snapshot and not is_idle_heartbeat and no_scheduled_work
+            )
+            self.last_fanout_queued_counters = queued_counters
+            idle_with_empty_queues = is_idle_heartbeat and not any_queued
+            exported_states = states
+            if is_queue_snapshot and not idle_with_empty_queues:
+                # An idle heartbeat with empty queues reports every rank. Any other queue
+                # snapshot has a row only for the ranks with work to report: scheduled or
+                # queued on that rank.
+                exported_states = [
+                    s
+                    for s, counters in zip(states, queued_counters)
+                    if any(getattr(s.iter_stats, name) for name in _ROW_WORK_FIELDS)
+                    or any(counters)
+                ]
+            self.last_fanout_has_rank0_row = any(s.rank == 0 for s in exported_states)
             rows = self._rank_rows(
                 rank0_stats,
-                sorted(matching_states, key=lambda s: s.rank),
+                exported_states,
                 self._rank0_req_stats.get(iter_stats_iter),
                 self._rank0_kv_iter_stats.get(iter_stats_iter),
                 # Per-loop timings exist on rank 0 only; every rank's row carries them (ADP ranks
@@ -483,10 +610,52 @@ class ADPIterStatsBuffer:
                     scheduler_mode=scheduler_mode,
                     gpu_forward_time_ms=self._rank0_gpu_forward_time_ms.get(iter_stats_iter),
                 ),
+                is_queue_snapshot=is_queue_snapshot,
             )
+            if idle_with_empty_queues and no_scheduled_work:
+                self.last_idle_rank_states = states
 
         self._clear_through(iter_stats_iter)
+        self.last_finalize_settled = True
         return rows
+
+    def make_idle_heartbeat_rows(
+        self, rank0_stats: IterationStats, scheduler_mode: Optional[str] = None
+    ) -> List[str]:
+        """Repeat the last idle-heartbeat fanout with a fresh rank-0 snapshot.
+
+        While every rank stays idle the peers are parked in the request
+        broadcast, so their rows cannot change. Rank 0 can therefore publish
+        the next heartbeat locally, one row per rank as in finalize(), without
+        waking them for another exchange. Peer rows reuse the payloads of the
+        last exchanged heartbeat; rank 0's row and the shared scalars come
+        from ``rank0_stats``.
+
+        Args:
+            rank0_stats: Rank 0's current queue snapshot.
+            scheduler_mode: The rows' ``schedulerMode``, as in finalize().
+
+        Returns:
+            One ``/metrics`` JSON row per rank, or an empty list when the
+            latest finalize() call did not fan out an idle heartbeat.
+        """
+        rank_states = self.last_idle_rank_states
+        if rank_states is None:
+            return []
+        rank0_payload = self.make_payload(rank0_stats)
+        return self._rank_rows(
+            rank0_stats,
+            [replace(s, iter_stats=rank0_payload) if s.rank == 0 else s for s in rank_states],
+            None,
+            None,
+            timings=dict(
+                host_step_time_ms=0.0,
+                prev_device_step_time_ms=0.0,
+                scheduler_mode=scheduler_mode,
+                gpu_forward_time_ms=0.0,
+            ),
+            is_queue_snapshot=True,
+        )
 
     def _rank_rows(
         self,
@@ -495,26 +664,41 @@ class ADPIterStatsBuffer:
         req_stats: Optional[List[RequestStats]],
         kv_iter_stats: Optional[Dict[int, object]],
         timings: Dict[str, object],
+        is_queue_snapshot: bool,
     ) -> List[str]:
-        """Rows of ranks other than 0 differ only in their payload counts, KV cache stats,
-        speculative-decoding stats and rank: the first is built in full and the others are
-        spliced into its text."""
+        """Rows of ranks other than 0 differ only in their payload counts (with the
+        ``numQueuedRequests`` those give), KV cache stats, speculative-decoding stats and rank:
+        the first is built in full and the others are spliced into its text.
+        ``is_queue_snapshot`` marks every row (see queue())."""
         rows: List[str] = []
         template = None
         for state in states:
             if state.rank == 0:
                 stats = self._make_rank_iter_stats(rank0_stats, state)
-                row = iteration_stats_row(stats, req_stats, kv_iter_stats, 0, **timings)
+                row = iteration_stats_row(
+                    stats,
+                    req_stats,
+                    kv_iter_stats,
+                    0,
+                    **timings,
+                    is_queue_snapshot=is_queue_snapshot,
+                )
                 rows.append(json.dumps(row))
                 continue
             if template is None:
                 stats = self._make_rank_iter_stats(rank0_stats, state)
-                row = iteration_stats_row(stats, attention_dp_rank=state.rank, **timings)
+                row = iteration_stats_row(
+                    stats,
+                    attention_dp_rank=state.rank,
+                    **timings,
+                    is_queue_snapshot=is_queue_snapshot,
+                )
                 ifb = row["inflightBatchingStats"]
                 row["inflightBatchingStats"] = _IFB_MARK
                 row["kvCacheStats"] = _KV_MARK
                 row["specDecodingStats"] = _SPECDEC_MARK
                 row["attentionDpRank"] = _RANK_MARK
+                row["numQueuedRequests"] = _QUEUED_MARK
                 template = (_MARK_TEXTS.split(json.dumps(row)), ifb)
             pieces, ifb = template
             payload = state.iter_stats
@@ -531,6 +715,9 @@ class ADPIterStatsBuffer:
                     payload.specdec_stats, rank0_stats.specdec_stats
                 ),
                 _RANK_TEXT: str(state.rank),
+                _QUEUED_TEXT: str(
+                    payload.num_queued_context_requests + payload.num_queued_gen_requests
+                ),
             }
             rows.append("".join(fills.get(piece, piece) for piece in pieces))
         return rows

@@ -130,6 +130,9 @@ void AttentionLayerConfig::validate() const
     for (auto const& buf : buffers)
     {
         buf.validate();
+        TLLM_CHECK_WITH_INFO(
+            buf.effectiveReusePolicy(reusePolicy) != ReusePolicy::OPTIONAL || slidingWindowSize.has_value(),
+            "AttentionLayerConfig: OPTIONAL reuse requires a sliding window");
         // Sinks required, sliding window optional: the policy needs both a sliding window and sink tokens.
         if (buf.effectiveReusePolicy(reusePolicy) == ReusePolicy::SINK_REQUIRED_ONLY
             && (!slidingWindowSize.has_value() || numSinkTokens.value_or(0) == 0))
@@ -321,6 +324,12 @@ void KVCacheManagerConfig::validate() const
     if (typicalStep.has_value())
     {
         typicalStep->validate();
+    }
+    if (coldTypicalStep.has_value())
+    {
+        coldTypicalStep->validate();
+        TLLM_CHECK_WITH_INFO(
+            !coldTypicalStep->kvCaches.empty(), "cold_typical_step must describe at least one KV cache");
     }
 
     poolRebalance.validate();

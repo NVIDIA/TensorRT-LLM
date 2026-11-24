@@ -60,6 +60,7 @@ def _penalty_mapping_meta(
         verify_lens=None,
         qo_indptr=None,
         total_verify_tokens=None,
+        rejection_sample_method="standard",
     )
     if verify_lens is not None:
         lens = torch.tensor(verify_lens, dtype=torch.int32)
@@ -303,6 +304,8 @@ def test_sampling_parameter_rows_follow_metadata_not_stale_request_windows(ragge
         samples_from_vocab_shards=False,
         _sampling_scan_cache=None,
         temperature_only_graphs=False,
+        greedy_graphs=True,
+        shard_temperature_only_graphs=True,
         use_rejection_sampling=False,
         enable_penalty=False,
     )

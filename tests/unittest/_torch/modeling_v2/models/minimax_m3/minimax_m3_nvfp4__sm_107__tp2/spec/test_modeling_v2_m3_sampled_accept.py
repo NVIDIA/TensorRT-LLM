@@ -6,10 +6,10 @@ and its workspace size."""
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.spec.m3_sampled_accept import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.spec.m3_sampled_accept import (  # noqa: E501
     m3_sampled_accept as op,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.spec.m3_sampled_accept_ws_words import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.spec.m3_sampled_accept_ws_words import (  # noqa: E501
     m3_sampled_accept_ws_words as ws_words,
 )
 

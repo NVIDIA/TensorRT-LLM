@@ -5,10 +5,10 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops.spec.m3_sampled_accept import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops.spec.m3_sampled_accept import (  # noqa: E501
     m3_sampled_accept as op,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops.spec.m3_sampled_accept_ws_words import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops.spec.m3_sampled_accept_ws_words import (  # noqa: E501
     m3_sampled_accept_ws_words as ws_words,
 )
 
@@ -175,7 +175,7 @@ def test_guard_refuses_fp64_temperatures() -> None:
 
 def test_the_verify_calls_this_targets_op_pair() -> None:
     """The verify calls this target's op pair (the sm_107 tp4 kernel), whose workspace sizes as the shared one."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops import (  # noqa: E501
         m3_sampled_accept as kernels,
     )
 

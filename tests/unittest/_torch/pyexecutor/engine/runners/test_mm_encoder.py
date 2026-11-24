@@ -7,12 +7,14 @@ from unittest.mock import Mock, patch
 
 import pytest
 import torch
+from torch import nn
 
+from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
 from tensorrt_llm._torch.pyexecutor.engine.runners import mm_encoder as mm_encoder_module
 from tensorrt_llm._torch.pyexecutor.engine.runners.interface import ScheduledInputs
 from tensorrt_llm._torch.pyexecutor.engine.runners.mm_encoder import MultimodalEncoderRunner
 from tensorrt_llm._torch.pyexecutor.llm_request import PyResult
-from tensorrt_llm._torch.pyexecutor.sampler import EarlyStopWithMMResult
+from tensorrt_llm._torch.pyexecutor.scheduled_encoder_executor import MultimodalEmbeddingCompletion
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._torch.utils import get_model_extra_attrs
@@ -95,13 +97,13 @@ def test_mm_encoder_runner_forward_skips_metadata_only_and_missing_length_reques
     to_device.assert_called_once_with(params[0], "multimodal_data", "cuda", pin_memory=True)
     for request in requests:
         request.get_tokens.assert_not_called()
-    assert result["logits"] is None
     assert result["mm_embedding_request_indices"] == [3]
     assert result["mm_embedding_lengths"] == [[2]]
     torch.testing.assert_close(result["mm_embeddings"][0], torch.arange(4).reshape(2, 2))
 
 
 def test_mm_encoder_runner_splits_embeddings_and_returns_mrope_metadata() -> None:
+    """The runner also marks its inputs staged once the towers have run."""
     requests = [
         SimpleNamespace(
             py_multimodal_data={
@@ -131,21 +133,24 @@ def test_mm_encoder_runner_splits_embeddings_and_returns_mrope_metadata() -> Non
         ),
     ]
     embeddings = torch.arange(6).reshape(3, 2)
-    model = SimpleNamespace(extra_attrs={}, forward=Mock(return_value=[embeddings]))
+    calls = Mock()
+    calls.forward.return_value = [embeddings]
+    model = SimpleNamespace(extra_attrs={}, forward=calls.forward)
     runner = MultimodalEncoderRunner(model, encoder_cache_enabled=False, moe_load_balancer=None)
 
     for index, request in enumerate(requests):
         request.py_multimodal_params = MultimodalParams(multimodal_data=request.py_multimodal_data)
         request.get_num_tokens = Mock(return_value=index + 1)
     result = runner.forward(
-        ScheduledInputs(batch=SimpleNamespace(context_requests=requests)),
+        ScheduledInputs(
+            batch=SimpleNamespace(context_requests=requests), inputs_staged=calls.inputs_staged
+        ),
         resource_manager=SimpleNamespace(get_resource_manager=Mock(return_value=None)),
     )
 
-    model.forward.assert_called_once()
+    assert [name for name, _, _ in calls.mock_calls] == ["forward", "inputs_staged.record"]
     params = model.forward.call_args.args[0]
     assert [param.input_ids_start_offset for param in params] == [0, 1]
-    assert result["logits"] is None
     assert result["mm_embedding_request_indices"] == [0, 1]
     assert result["mm_embedding_lengths"] == [[1], [2]]
     torch.testing.assert_close(result["mm_embeddings"][0], embeddings[:1])
@@ -178,7 +183,6 @@ def test_mm_encoder_handoff_preserves_per_item_metadata_in_sparse_batch() -> Non
     ]
     for request in requests:
         request.py_result = PyResult(prompt_len=1, max_new_tokens=1)
-        request.set_finished_reason = Mock()
         request.py_multimodal_params = MultimodalParams(multimodal_data=request.py_multimodal_data)
         request.get_num_tokens = Mock(return_value=1)
     scheduled_requests = SimpleNamespace(
@@ -202,9 +206,7 @@ def test_mm_encoder_handoff_preserves_per_item_metadata_in_sparse_batch() -> Non
         resource_manager=SimpleNamespace(get_resource_manager=Mock(return_value=None)),
     )
     assert get_model_extra_attrs() is None
-    sampler = EarlyStopWithMMResult()
-    state = sampler.sample_async(scheduled_requests, result, [])
-    sampler.update_requests(state)
+    MultimodalEmbeddingCompletion(exports=True).store(requests, result)
 
     assert requests[1].py_result.mm_embedding_handles is None
     image_handles = json.loads(json.dumps(requests[0].py_result.mm_embedding_handles))
@@ -225,20 +227,21 @@ def test_mm_encoder_handoff_preserves_per_item_metadata_in_sparse_batch() -> Non
     torch.testing.assert_close(torch.cat(restored), embeddings[1:])
 
 
-def test_mm_encoder_runner_rejects_kv_manager_before_preparation() -> None:
+class _Tower(MultimodalEncoderMixin, nn.Module):
+    pass
+
+
+def test_mm_encoder_runner_releases_every_tower_graph() -> None:
+    towers = [_Tower(), _Tower()]
+    graphs = [Mock(), Mock()]
+    for tower, graph in zip(towers, graphs):
+        tower._blocks_graph_runner = graph
     runner = MultimodalEncoderRunner(
-        SimpleNamespace(extra_attrs={}), encoder_cache_enabled=False, moe_load_balancer=None
+        nn.Sequential(*towers), encoder_cache_enabled=False, moe_load_balancer=None
     )
-    runner._prepare_inputs = Mock()
-    resource_manager = Mock()
-    resource_manager.get_resource_manager.return_value = object()
 
-    with pytest.raises(
-        AssertionError,
-        match="no-KV-cache runner was initialized, but a KV cache manager was allocated",
-    ):
-        runner.forward(
-            ScheduledInputs(batch=ScheduledRequests()), resource_manager=resource_manager
-        )
+    runner.release_graphs(release_nccl_window_owners=False)
 
-    runner._prepare_inputs.assert_not_called()
+    for tower, graph in zip(towers, graphs):
+        graph.clear.assert_called_once_with(release_nccl_window_owners=False)
+        assert tower._blocks_graph_runner is None

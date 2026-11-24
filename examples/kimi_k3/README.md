@@ -207,7 +207,7 @@ decoding is incompatible with KV-cache block reuse.
 ## Suffix-automaton speculative decoding
 
 Suffix-automaton (SA) speculation is supported for aggregated serving: set
-`speculative_config: {decoding_type: SA}` in the extra LLM API options. For
+`speculative_config: {decoding_type: SA, max_draft_len: 2}` in the extra LLM API options. For
 GSM8K evaluation, pass `--sa` to the eval job (see "Run the model" above),
 which selects `eval_extra_llm_options_sa.yaml`.
 
@@ -245,6 +245,8 @@ limitations" below.
   aggregated configuration (`eval_extra_llm_options_sa.yaml`) runs with the
   overlap scheduler off, chunked prefill off, and `max_batch_size` 8 with a
   matching CUDA-graph `max_batch_size`. Under disaggregated serving, SA runs
-  eagerly (no CUDA graphs, no overlap scheduler) and requires
-  `max_batch_size` ≤ 8 on the generation server
-  (`examples/kimi_k3/disagg/gen_config.yaml`).
+  without the overlap scheduler and requires `max_batch_size` ≤ 8 on the
+  generation server (`examples/kimi_k3/disagg/gen_config.yaml`). That
+  example configuration also disables CUDA graphs; SA with CUDA graphs is
+  functional, but its disaggregated performance points have not been
+  re-measured yet.

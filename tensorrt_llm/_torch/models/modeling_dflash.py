@@ -23,7 +23,11 @@ except ImportError:
     _flashinfer_rope = None
 from ..distributed import AllReduce
 from ..modules.logits_processor import scale_and_soft_cap_logits
-from ..pyexecutor.config_utils import _is_sliding_attention_layer, get_layer_attention_window
+from ..pyexecutor.config_utils import (
+    _is_sliding_attention_layer,
+    dspark_layer_window_size,
+    get_layer_attention_window,
+)
 from ..speculative.dflash_attention import (
     DFLASH_FOLDED_DECODE_LOWERING,
     DFlashTrtllmGenOps,
@@ -42,48 +46,6 @@ from .modeling_utils import FUSED_MODULE_COMPONENTS, get_model_architecture, reg
 # (modeling_dspark) multiply by this to get the natural-log LSE flashinfer's
 # merge expects. One constant, so a flashinfer convention change is fixed once.
 TRTLLM_GEN_LSE_LN2 = math.log(2.0)
-
-
-def dspark_layer_window_size(
-    use_swa: bool, swa_window: int, layer_types, layer_idx: int
-) -> tuple[int, int]:
-    """flash-attn ``window_size`` for one draft layer of the block decode.
-
-    Sliding-window block decode was introduced by the DSpark drafters
-    (deepseek-ai/DeepSpec) -- hence the name -- but it is an attention
-    configuration, not part of the DSpark head set, so it stays in the DFlash
-    base: the block decode below indexes the resolved windows directly and must
-    not depend on a subclass-only attribute.
-
-    Those drafters run the draft block through HF attention with
-    ``sliding_window`` set on 'sliding_attention' layers and is_causal=False.
-    HF's flash path (transformers/modeling_flash_attention_utils.py) translates
-    that to ``window_size = (sliding_window - 1, sliding_window - 1)``, i.e.
-    each query attends keys within ``swa_window - 1`` KV-index distance on both
-    sides. In the DFlash pool layout KV index == token position, so this limits
-    draft queries to the most recent ``swa_window`` context tokens plus the
-    (nearby) draft block. Full-attention layers and drafters that do not enable
-    the window keep flash-attn's default ``(-1, -1)`` (no window).
-
-    A drafter that sets `use_swa` but declares no sliding layer is windowed on
-    every layer: some DFlash 2 drafters are exported with all `full_attention`
-    layer types and the window only in `dflash_config`, and other serving
-    stacks window every layer of such a drafter. The per-layer filter applies
-    only when the layer types tell sliding layers from full ones, and it reads
-    them with `_is_sliding_attention_layer`, as the attention mask does.
-    """
-    if not use_swa:
-        return (-1, -1)
-    any_sliding = layer_types is not None and any(
-        _is_sliding_attention_layer(layer_type) for layer_type in layer_types
-    )
-    if (
-        any_sliding
-        and layer_idx < len(layer_types)
-        and not _is_sliding_attention_layer(layer_types[layer_idx])
-    ):
-        return (-1, -1)
-    return (swa_window - 1, swa_window - 1)
 
 
 def dflash_merge_future_block_attention(

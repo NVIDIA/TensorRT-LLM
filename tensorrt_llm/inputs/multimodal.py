@@ -303,6 +303,30 @@ def get_multimodal_item_metadata(
     return metadata
 
 
+def split_multimodal_embedding_items(
+        items: Any) -> Tuple[List[torch.Tensor], List[Dict[str, Any]]]:
+    """Split one modality's external embedding items into tensors and metadata.
+
+    An item is an embedding tensor, or a dict that holds the tensor under
+    ``"mm_embeddings"`` and per-item metadata by field name, for example
+    ``{"mm_embeddings": tensor, "image_grid_thw": [1, 34, 46]}``. A bare
+    tensor has no metadata. A single item may be passed without a list.
+    """
+    if isinstance(items, (torch.Tensor, dict)):
+        items = [items]
+    tensors, metadata = [], []
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            item = {"mm_embeddings": item}
+        elif "mm_embeddings" not in item:
+            raise ValueError(f"Embedding item {index} must hold its tensor "
+                             "under 'mm_embeddings'")
+        item = dict(item)
+        tensors.append(item.pop("mm_embeddings"))
+        metadata.append(item)
+    return tensors, metadata
+
+
 class MultimodalEncoderProgress(Enum):
     """Python-only progress derived from request-local MM item outputs.
 
@@ -1592,6 +1616,7 @@ def find_mm_token_lengths(
 _MM_METADATA_ONLY_KEYS = frozenset({
     "mrope_config",
     "multimodal_embed_mask_cumsum",
+    "multimodal_embedding_metadata",
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     "special_token_offsets",
     "layout_metadata",

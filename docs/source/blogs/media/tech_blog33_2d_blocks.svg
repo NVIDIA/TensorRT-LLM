@@ -62,7 +62,7 @@
 <line x1="377" y1="181" x2="647" y2="181" stroke="#bfc0c0" stroke-width="0.5"/>
 <path d="M383,128.5 L641,128.5" fill="none" stroke="#76B900" stroke-width="1.5" marker-end="url(#ahg)"/>
 <text x="512" y="68" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#4f5d75" text-anchor="middle">NoPE + RoPE</text>
-<text x="377" y="236" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#2d3142" text-anchor="start">scores S = Q·Kᵀ</text>
+<text x="377" y="236" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#2d3142" text-anchor="start">logits S = Q·Kᵀ</text>
 <text x="690" y="34" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="13" font-weight="600" fill="#2d3142" text-anchor="start">(c) BMM2 (PV): token reduction</text>
 <rect x="712" y="76" width="240" height="120" fill="#ffffff" stroke="#bfc0c0" stroke-width="0.8"/>
 <line x1="742" y1="76" x2="742" y2="196" stroke="#bfc0c0" stroke-width="0.5"/>
@@ -179,6 +179,6 @@
 <text x="800" y="460" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#76B900" text-anchor="start">Scale overhead:</text>
 <text x="800" y="478" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#76B900" text-anchor="start">0.03 bits per value</text>
 <text x="520" y="552" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="13" font-weight="600" fill="#76B900" text-anchor="start">Same FP4 values and scales for both BMMs</text>
-<text x="520" y="572" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">No requantization; the kernels repeat each block scale</text>
-<text x="520" y="588" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">in the layout that each Tensor Core instruction expects</text>
+<text x="520" y="572" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">No requantization pass and no high-precision</text>
+<text x="520" y="588" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">intermediate tensor between the two BMMs</text>
 </svg>

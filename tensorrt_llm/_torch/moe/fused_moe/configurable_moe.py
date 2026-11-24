@@ -62,6 +62,8 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from .activation import install_activation_params
 from .communication import AllGatherReduceScatter, Communication, CommunicationFactory
+from .communication.nccl_ep import NcclEP
+from .impl_environment import collect_moe_environment
 from .moe_scheduler import MoEScheduler, create_moe_scheduler
 
 # Attributes that ConfigurableMoE owns (computed in MoE.__init__ from real
@@ -81,7 +83,12 @@ _BACKEND_SYNC_ATTRS = (
     "slot_start",
     "slot_end",
     "expert_size_per_partition",
+    # A dynamic-EP layer's static partition, else None (``_maybe_dynamic_expert_parallel_layout``).
+    "dynamic_ep",
 )
+
+# 4: a dynamic-EP rank holds twice its static routed weights, at most a quarter of the bank.
+_DYNAMIC_EP_MIN_MOE_TP = 4
 
 
 def _dwdp_ineligibility(moe: "ConfigurableMoE") -> Optional[str]:
@@ -224,6 +231,7 @@ class ConfigurableMoE(MoE):
             layer_idx=layer_idx,  # ConfigurableMoE needs correct layer_idx for EPLB initialization
             **kwargs,
         )
+        self.comm = None
         self._override_quant_config = override_quant_config
         if override_quant_config is not None:
             self.quant_config = override_quant_config
@@ -432,6 +440,7 @@ class ConfigurableMoE(MoE):
         # this rank's experts, so it is sized here, before the sync below
         # mirrors the layout onto the backend and before its weights exist.
         self._decide_dwdp()
+        self._maybe_dynamic_expert_parallel_layout(model_config)
 
         # Mirror wrapper-owned EPLB / layer-id state onto the backend so any
         # backend code path that reads e.g. ``self.layer_load_balancer`` or
@@ -453,6 +462,44 @@ class ConfigurableMoE(MoE):
         if not backend_model_config.skip_create_weights_in_init and not has_post_init_quant_config:
             self.create_weights()
         return backend_model_config
+
+    def _dynamic_expert_parallelism_applies(self, model_config: ModelConfig) -> bool:
+        """Whether each call splits its experts over the two EP ranks (attention TP, SM100/SM103):
+        an opted-in model (``moe_dynamic_ep``), batch-1 steps within ``dynamic_ep_max_rows``."""
+        if not model_config.extra_attrs.get("moe_dynamic_ep", False):
+            return False
+        spec = model_config.spec_config
+        return (
+            self.backend is not None
+            and model_config.max_batch_size == 1
+            and (spec.tokens_per_gen_step if spec is not None else 1)
+            <= getattr(type(self.backend), "dynamic_ep_max_rows", 0)
+            and not self.use_dp
+            and self.ep_size == 2
+            and self.tp_size >= _DYNAMIC_EP_MIN_MOE_TP
+            and self.layer_load_balancer is None
+            and self.num_slots == self.num_experts
+            and self.num_experts % self.ep_size == 0
+            and get_global_dwdp_manager() is None
+            and getattr(self.routing_method, "sqrt_softplus_bias_selection", False)
+            and collect_moe_environment().sm in (100, 103)
+        )
+
+    def _maybe_dynamic_expert_parallel_layout(self, model_config: ModelConfig) -> None:
+        """Dynamic expert parallelism: every EP rank holds its TP shard of all experts, and
+        ``dynamic_ep`` is the static partition ``(slot_start, count, ep_rank, ep_size)``."""
+        self.dynamic_ep = None
+        if not self._dynamic_expert_parallelism_applies(model_config):
+            return
+        self.dynamic_ep = (
+            self.slot_start,
+            self.expert_size_per_partition,
+            self.ep_rank,
+            self.ep_size,
+        )
+        self.expert_size_per_partition = self.num_experts
+        self.slot_start, self.slot_end = 0, self.num_experts
+        self.initial_local_expert_ids = list(self.initial_global_assignments)
 
     def _reject_non_divisible_ep_backend(self) -> None:
         """Enforce the non-divisible-EP contract on the resolved backend.
@@ -782,8 +829,12 @@ class ConfigurableMoE(MoE):
             return None
         if _runs_under_dwdp(self):
             return None
+        # Communication must use the same quantization contract as this layer's
+        # backend, including unquantized MTP overrides in quantized models.
+        comm_model_config = copy.copy(self.model_config)
+        comm_model_config.quant_config = self.backend.quant_config
         return CommunicationFactory.create_strategy(
-            model_config=self.model_config,
+            model_config=comm_model_config,
             num_experts=self.num_experts,
             num_slots=self.num_slots,
             top_k=self.routing_method.experts_per_token,
@@ -972,11 +1023,14 @@ class ConfigurableMoE(MoE):
         # An explicit override is authoritative. Otherwise use the wrapper's
         # final value, after model __post_init__ has applied layerwise and
         # exclusion-based quantization settings.
-        self.backend.quant_config = (
+        quant_config = (
             self._override_quant_config
             if self._override_quant_config is not None
             else self.quant_config
         )
+        if isinstance(self.comm, NcclEP):
+            self.comm.set_quant_config(quant_config)
+        self.backend.quant_config = quant_config
         # The quant config just changed and a backend may resolve its activation
         # ABI from it: TRTLLMGenFusedMoE narrows the clamp to a uniform scalar on
         # the FP8 block-scale path, whose kernel takes one ``double`` by value.

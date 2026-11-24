@@ -117,6 +117,7 @@ add_th_common_family(
   weightOnlyQuantGemm.cpp
   weightOnlyQuantOp.cpp
   finegrained_mixed_dtype_gemm_thop.cpp
+  lmHeadArgmaxOp.cpp
   tinygemm2.cpp)
 
 # TODO: th_common_moe does not compile with USING_OSS_CUTLASS_MOE_GEMM=OFF
@@ -139,6 +140,7 @@ add_th_common_family(
   ulyssesPermuteScatterOp.cpp
   helixPostProcessOp.cpp
   ncclCommunicatorOp.cpp
+  nativeMemoryOp.cpp
   allocateOutput.cpp
   reducescatterOp.cpp
   localityDomainAllocator.cpp
@@ -224,9 +226,6 @@ if(USING_OSS_CUTLASS_MOE_GEMM)
 endif()
 
 if(ENABLE_CUBLASLT_FP4_GEMM)
-  target_compile_definitions(th_common_gemm_quant
-                             PRIVATE ENABLE_CUBLASLT_FP4_GEMM)
-  target_compile_definitions(th_common PUBLIC ENABLE_CUBLASLT_FP4_GEMM)
   target_link_libraries(th_common PRIVATE ${CUBLASLT_LIB})
 endif()
 
