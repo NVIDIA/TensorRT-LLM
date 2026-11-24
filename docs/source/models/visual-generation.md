@@ -39,6 +39,7 @@ TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion mode
 | `Lightricks/LTX-2` | Text-to-Video (with Audio), Image-to-Video (with Audio) |
 | `Lightricks/LTX-2.3` | Text-to-Video (with Audio), Video-to-Video (with Audio) |
 | `FastVideo/FastVideo-FastH3-8-Step-V2` | Text-to-Video (with Audio, 8-step distilled) |
+| `MiniMaxAI/MiniMax-H3-Image` | Text-to-Image (six-step distilled) |
 | `Qwen/Qwen-Image` | Text-to-Image |
 | `Qwen/Qwen-Image-2512` | Text-to-Image |
 | `Qwen/Qwen-Image-Layered` | Image-to-Image |
@@ -169,6 +170,21 @@ params.image_reference = [
 FLUX.2 and Qwen-Image-Edit accept a list of reference images on `image_reference`.
 
 The same fields carry references over `trtllm-serve`; see [`examples/visual_gen/serve/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/serve) for request examples.
+
+## MiniMax-H3-Image
+
+Use the [image example](../../../examples/visual_gen/models/minimax_h3_image.py)
+with the [single-GPU config](../../../examples/visual_gen/configs/minimax-h3-image-bf16-1gpu.yaml)
+and a local [MiniMax-H3-Image checkpoint](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image)
+that you are authorized to use. The checkpoint must include its tokenizer, text
+encoder and converted `transformer_diffusers/` and `vae_diffusers/` directories.
+The MiniMax-H3 video checkpoint is not interchangeable.
+
+The validated configuration generates one 2048 × 2048 image from one prompt
+on one SM100 GPU. It uses six learned denoising steps and guidance scale 1.
+Do not supply a negative prompt, reference media or a custom step count.
+Use eager execution without step caching or CUDA graphs. Allow room for the
+model and decoder: warm inference reserved about 127 GiB on the tested GPU.
 
 ## MiniMax-H3 Notes
 

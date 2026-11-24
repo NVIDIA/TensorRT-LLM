@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Single-request BF16 profile validated on one SM100 GPU. The distilled
+# checkpoint supplies the PDD schedule; do not enable step caching or graphs.
+attention_config:
+  backend: TRTLLM
+cuda_graph_config:
+  enable: false
+torch_compile_config:
+  enable: false
+compilation_config:
+  skip_warmup: true
