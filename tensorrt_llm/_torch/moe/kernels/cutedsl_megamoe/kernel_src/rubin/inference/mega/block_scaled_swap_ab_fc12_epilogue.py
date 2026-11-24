@@ -1010,6 +1010,9 @@ class SwapABGatedActEpilogue(KernelComponent):
         self.situ_beta, self.situ_linear_beta = self._resolve_situ_betas(problem_desc)
         # A codegen-time choice like the SiTU betas: the enclosing KernelClass folds it into its name().
         self.use_tanh_sigmoid = problem_desc.get("use_tanh_sigmoid", False)
+        # The tanh sigmoid evaluates sigmoid(gate) itself and does not apply the SwiGLU alpha to its argument.
+        if self.use_tanh_sigmoid and self.swiglu_alpha is not None:
+            raise ValueError("use_tanh_sigmoid excludes the SwiGLU alpha/beta constants.")
         # The Blackwell epilogue accepts gate_activation="quick_geglu"; this one has not been
         # ported yet. Refuse rather than silently computing SwiGLU for a quick_geglu descriptor.
         if problem_desc.get("gate_activation") not in (None, "swiglu"):
