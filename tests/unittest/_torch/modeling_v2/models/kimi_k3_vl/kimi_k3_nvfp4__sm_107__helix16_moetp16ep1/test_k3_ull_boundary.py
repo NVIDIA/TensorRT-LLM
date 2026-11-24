@@ -2,12 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """The ULL target's GEN-step boundary (step prep, layer 0, the chain entry mix, the MLA layers'
 mixes, the decoder loop), host-side: the measured run's settings as constants, no environment
-reads, self-containment and the provenance manifest ``FLAT_BOUNDARY_SOURCE.json`` (no GPU)."""
+reads and self-containment (no GPU)."""
 
 import ast
-import json
 import pathlib
-import re
 from datetime import timedelta
 from types import SimpleNamespace
 
@@ -27,7 +25,6 @@ _REPO = pathlib.Path(__file__).resolve().parents[7]
 _T_DIR = (
     _REPO / "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl" / pathlib.Path(__file__).parent.name
 )
-_MANIFEST = _T_DIR.parent / "FLAT_BOUNDARY_SOURCE.json"
 
 #: The boundary's files: no environment reads, no imports of the shared Kimi K3 VL code.
 BOUNDARY_FILES = (
@@ -143,50 +140,6 @@ def test_no_shared_kimi_imports(rel):
                 node.lineno,
                 module,
             )
-
-
-def _qualified(tree, name):
-    """Whether ``name`` (``f``, ``C``, ``C.m`` or a module constant) is defined in ``tree``."""
-    head, _, attr = name.partition(".")
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name == head:
-            if not attr:
-                return True
-            return isinstance(node, ast.ClassDef) and any(
-                isinstance(f, ast.FunctionDef) and f.name == attr for f in node.body
-            )
-        if isinstance(node, (ast.Assign, ast.AnnAssign)) and not attr:
-            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            if any(isinstance(t, ast.Name) and t.id == head for t in targets):
-                return True
-    return False
-
-
-def test_manifest_names_existing_target_functions():
-    """Keys name files relative to the family directory, where the manifest is."""
-    data = json.loads(_MANIFEST.read_text())
-    assert data["functions"]
-    missing = []
-    for key in data["functions"]:
-        rel, _, name = key.partition(":")
-        name = name.split(" (")[0]
-        if not _qualified(ast.parse((_MANIFEST.parent / rel).read_text()), name):
-            missing.append(key)
-    assert not missing
-
-
-def test_manifest_source_references_have_digests():
-    """Every reference records a source symbol, line number and file digest."""
-    data = json.loads(_MANIFEST.read_text())
-    for path, digest in data["source_sha256"].items():
-        assert re.fullmatch(r"[0-9a-f]{64}", digest), path
-    for key, refs in data["functions"].items():
-        assert refs, key
-        for ref in refs:
-            path, line = ref["source"].rsplit(":", 1)
-            assert path in data["source_sha256"], key
-            assert line.isdecimal() and int(line) > 0, key
-            assert ref["symbol"].strip(), key
 
 
 def test_rendezvous_broadcasts_a_listening_store(monkeypatch):

@@ -8,7 +8,6 @@ deployment: 16 ranks, every step generation-only, each request verifying ``1 + 7
 model ``KimiK3Helix16UllForCausalLM`` (no vision tower: the context server encodes media).
 
 This module expresses the Kimi K3 ULL reference generation step as plain calls.
-``FLAT_BOUNDARY_SOURCE.json`` maps target functions to their source symbols.
 
 The text model has 93 decoder layers: 69 KDA (Kimi Delta Attention) layers, 24 MLA layers
 (3, 7, ..., 87, 91, 92), layer 0 with a dense MLP, layers 1..92 with the latent MoE. Most of the

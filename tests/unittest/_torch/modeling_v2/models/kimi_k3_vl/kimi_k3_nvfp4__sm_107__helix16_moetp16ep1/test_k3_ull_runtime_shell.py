@@ -3,9 +3,8 @@
 """The ULL target's GEN-step shell (``ops/common/k3_ull_runtime.py``), host-side.
 
 Covered without a GPU: ``make_runtime_hooks`` declares the served shell; the executor selects the
-expected core on synthetic topologies; the pin and the GIL switch interval are applied; the
-provenance manifest names functions in the target. The engine hook points are tested in
-``tests/unittest/_torch/pyexecutor/``
+expected core on synthetic topologies, and the pin and the GIL switch interval are applied.
+The engine hook points are tested in ``tests/unittest/_torch/pyexecutor/``
 (``test_runtime_hooks.py``, ``test_step_inputs.py``)."""
 
 import ast
@@ -28,7 +27,6 @@ pytestmark = pytest.mark.cpu_only
 _REPO = pathlib.Path(__file__).resolve().parents[7]
 _FAM_DIR = _REPO / "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl"
 _RUNTIME_SOURCE = _FAM_DIR / "ops/common/k3_ull_runtime.py"
-_MANIFEST = _FAM_DIR / "FLAT_RUNTIME_SOURCE.json"
 
 
 def test_make_runtime_hooks_declares_the_served_shell():
@@ -217,28 +215,3 @@ def test_ull_step_kernels_match_the_source_manifest():
         assert entry["local_edits"]
     text = (_FAM_DIR / "kernels/k3r_step/step_upload_kernels.py").read_text()
     assert "os.environ" not in text.split("def _cdiv")[0]
-
-
-def _defined(tree):
-    names = set()
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
-            names.add(node.name)
-            if isinstance(node, ast.ClassDef):
-                names |= {
-                    f"{node.name}.{item.name}"
-                    for item in node.body
-                    if isinstance(item, ast.FunctionDef)
-                }
-        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
-            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            names |= {t.id for t in targets if isinstance(t, ast.Name)}
-    return names
-
-
-def test_manifest_names_exist():
-    manifest = json.loads(_MANIFEST.read_text())
-    ours = _defined(ast.parse(_RUNTIME_SOURCE.read_text()))
-    assert manifest["functions"]
-    for name in manifest["functions"]:
-        assert name.startswith("k3_ull_runtime.") and name[len("k3_ull_runtime.") :] in ours, name
