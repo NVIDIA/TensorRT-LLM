@@ -27,7 +27,9 @@ separate processes, so every op's builds run there.
   :class:`Claim`, and share the store.
 
 ``TLLM_KERNEL_BUILDER=0`` starts no worker. ``TLLM_KERNEL_BUILDER_WORKERS`` caps the workers of a
-rank (default: its share of the CPUs, up to 8).
+rank (default: its share of the CPUs, up to 8). A worker that does not reply to a build within
+``TLLM_KERNEL_BUILDER_BUILD_TIMEOUT_S`` seconds (default 900; 0 waits without a limit) is stopped,
+and the build fails.
 """
 
 from __future__ import annotations
@@ -41,6 +43,8 @@ import faulthandler
 import functools
 import hashlib
 import importlib
+import inspect
+import math
 import os
 import pickle  # nosec B403 - messages between this process and its own workers
 import queue
@@ -81,6 +85,10 @@ _LAUNCHER_ENV_PREFIXES = ("OMPI_", "PMIX_", "PMI_", "SLURM_", "MPI_", "I_MPI_", 
 _STDERR_TAIL = 2000
 # Seconds a stop waits for idle workers to exit before it kills them.
 _STOP_TIMEOUT_S = 60.0
+# Seconds a worker may take to reply to a build (its first includes its imports) before it is
+# stopped; 0 waits without a limit.
+_REPLY_TIMEOUT_ENV = "TLLM_KERNEL_BUILDER_BUILD_TIMEOUT_S"
+_DEFAULT_REPLY_TIMEOUT_S = 900.0
 # A build whose pickled request is larger (a runner that holds weights) is built here.
 _MAX_MESSAGE_BYTES = 64 << 20
 # Ends a failed build's report when the build cost the worker its CUDA context: the worker ends.
@@ -91,6 +99,9 @@ _MIN_FREE_GPU_BYTES = 8 << 30
 # In an overlapped pass, a build that does not fit with no other build running looks at the
 # GPU's free memory again after this many seconds, until the pass ends.
 _PATIENT_POLL_S = 1.0
+# What a worker's CUDA context takes: a worker's first build makes it, and reserves this much
+# beside its own need, so that workers starting together do not overcommit the GPU.
+_WORKER_CONTEXT_BYTES = 1 << 30
 
 # How a build ended (BuildResult.status): a worker built it; it was built before; another rank's
 # worker claimed it, and makes it; it failed; no worker took it.
@@ -152,14 +163,17 @@ class BuildResult(NamedTuple):
 
 class _Compiler(NamedTuple):
     """A ``process_built`` function's name for its kernels, its ``"module:qualname"``, whether
-    KernelBuilder's build mode and its rehearsal build its kernels on the workers, and its kernels
-    compiled so far, by arguments."""
+    KernelBuilder's build mode and its rehearsal build its kernels on the workers, its kernels
+    compiled so far, by arguments, what makes a call's ``(args, kwargs)`` those arguments, and the
+    name of its kernels in the store."""
 
     name: str
     where: str
     use_build_pool_in_warmup: bool
     use_build_pool_in_rehearsal: bool
     memo: Dict[tuple, Any]
+    bind: Callable[[tuple, Dict[str, Any]], tuple]
+    store_name: str
 
 
 def process_built(
@@ -168,15 +182,18 @@ def process_built(
     """Memoize a CuTe DSL kernel compile function whose kernels worker processes can build.
 
     Use it in place of ``functools.cache`` on a function that compiles one kernel from hashable,
-    picklable positional arguments and returns the compiled kernel (what ``cute.compile``
-    returns). The function keeps ``cache_info()`` and ``cache_clear()``;
+    picklable arguments and returns the compiled kernel (what ``cute.compile`` returns). Its
+    parameters must be positional ones; a call may pass them by keyword or leave defaults out,
+    and gets the kernel of the same arguments either way. The function keeps ``cache_info()`` and
+    ``cache_clear()``;
     ``KernelBuilder.build_kernels`` compiles several of its kernels at a time. A call loads the
     kernel from the store when a worker built it, and compiles it here otherwise. In a worker, a
     call compiles the kernel and exports it to the store, so that its rank loads it. ``raw`` is
     the undecorated function.
 
     Args:
-        name: Names the function's kernels in the store; unique per compile function.
+        name: Names the function's kernels in the store, with a digest of the file that
+            defines the function; unique per compile function.
         use_build_pool_in_warmup: In build mode, ``KernelBuilder.build_kernels`` builds the
             function's kernels on the workers. For compiles long enough to repay a worker.
         use_build_pool_in_rehearsal: In a rehearsal, ``KernelBuilder.build_kernels`` queues the
@@ -187,9 +204,36 @@ def process_built(
         memo: Dict[tuple, Any] = {}
         lock = threading.Lock()
         counts = {"hits": 0, "misses": 0}
+        signature = inspect.signature(raw)
+        positional = (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        if any(p.kind not in positional for p in signature.parameters.values()):
+            raise TypeError(f"process_built: {raw.__qualname__} must take positional parameters")
+        num_params = len(signature.parameters)
+        from tensorrt_llm import _jit_share
+
+        # A kernel compiled from another version of the function's file has another name.
+        store_name = f"{name}|{_jit_share.source_digest(raw)}"
+        # The arguments of the calls that leave defaults out, by the arguments they pass.
+        completed: Dict[tuple, tuple] = {}
+
+        def bind(args: tuple, kwargs: Dict[str, Any]) -> tuple:
+            """A call's arguments as positional ones with the defaults filled in: one key per
+            kernel, however the call passes them."""
+            if not kwargs:
+                if len(args) == num_params:
+                    return args
+                full = completed.get(args)
+                if full is not None:
+                    return full
+            bound = signature.bind(*args, **kwargs)
+            bound.apply_defaults()
+            if not kwargs:
+                completed[args] = bound.args
+            return bound.args
 
         @functools.wraps(raw)
-        def compiled(*args):
+        def compiled(*args, **kwargs):
+            args = bind(args, kwargs)
             kernel = memo.get(args)
             if kernel is None:
                 with lock:
@@ -197,10 +241,10 @@ def process_built(
                     if kernel is None:
                         counts["misses"] += 1
                         pool = BuildPool.get()
-                        kernel = pool.load(name, args)
+                        kernel = pool.load(store_name, args)
                         if kernel is None:
                             kernel = raw(*args)
-                            pool.store(name, args, kernel)
+                            pool.store(store_name, args, kernel)
                         memo[args] = kernel
                         return kernel
             counts["hits"] += 1
@@ -223,6 +267,8 @@ def process_built(
             use_build_pool_in_warmup,
             use_build_pool_in_rehearsal,
             memo,
+            bind,
+            store_name,
         )
         return compiled
 
@@ -287,16 +333,19 @@ class _Task:
     settled: bool = False
     # Counted in BuildPool._outstanding until it settles.
     outstanding: bool = False
+    # The build's claim among the ranks, which its worker takes before it builds.
+    claim: Optional[Claim] = None
 
 
-def _gpu_has_room() -> bool:
-    """Whether the rank's GPU has room for one more worker (``_MIN_FREE_GPU_BYTES`` free)."""
+def _gpu_has_room(reserved: int = 0) -> bool:
+    """Whether the rank's GPU has room for one more worker: ``_MIN_FREE_GPU_BYTES`` free beside
+    ``reserved`` bytes that are not taken yet."""
     import torch
 
     if not torch.cuda.is_available() or not torch.cuda.is_initialized():
         return True
     free, _ = torch.cuda.mem_get_info()
-    return free >= _MIN_FREE_GPU_BYTES
+    return free - reserved >= _MIN_FREE_GPU_BYTES
 
 
 def _current_device() -> Optional[int]:
@@ -350,10 +399,13 @@ class _Admission:
         family: Optional[str],
         need: Optional[int] = None,
         in_process: bool = False,
+        cold: bool = False,
     ) -> bool:
         """Wait until the GPU has room for the build ``key`` (``need`` bytes, or its family's
         measured peak), and count it running; False when it cannot start. ``in_process``: the
-        build allocates from this process's allocator, whose cached memory it reuses."""
+        build allocates from this process's allocator, whose cached memory it reuses. ``cold``:
+        the first build of a worker, which also makes the worker's CUDA context and reserves room
+        for it."""
         with self._memory:
             while not self._stopping:
                 free = _free_gpu_bytes(self.device)
@@ -373,10 +425,11 @@ class _Admission:
                 ):
                     fits = False  # A kind of build not measured yet builds one at a time.
                 else:
+                    reserve = (need or 0) + (_WORKER_CONTEXT_BYTES if cold else 0)
                     taken = sum(nbytes for _, nbytes in self._running.values())
-                    fits = free - taken - (need or 0) >= _MIN_FREE_GPU_BYTES
+                    fits = free - taken - reserve >= _MIN_FREE_GPU_BYTES
                 if fits:
-                    self._running[key] = (family, need or 0)
+                    self._running[key] = (family, reserve)
                     return True
                 patient = self._owner.overlapping()
                 if not self._running and not patient:
@@ -390,6 +443,11 @@ class _Admission:
         with self._memory:
             self._running.pop(key, None)
             self._memory.notify_all()
+
+    def reserved_bytes(self) -> int:
+        """The memory the builds running reserved, which the GPU's free memory may not show yet."""
+        with self._memory:
+            return sum(nbytes for _, nbytes in self._running.values())
 
     def stop(self) -> None:
         """Refuse the builds waiting for memory, and every build asked for later."""
@@ -567,7 +625,7 @@ class BuildPool:
                 pool = self._ensure_pool()
         for index, build in builds:
             message = self._message(build) if pool is not None else None
-            task = _Task(message, build.family, batch, index)
+            task = _Task(message, build.family, batch, index, claim=build.claim)
             if message is None:
                 self._settle(task, BuildResult(REFUSED))
             else:
@@ -603,8 +661,11 @@ class BuildPool:
         kernel's, in order: ``"present"`` for a kernel in the store already. With a shared store,
         the ranks split them. The calls ``function(*args)`` then load them."""
         names = [fn._compiler.name for fn, _ in kernels]
+        # The pairs whose arguments name the kernel of an earlier pair, by that pair's index: they
+        # end with it.
+        twins: Dict[int, List[int]] = {}
 
-        def warn(index: int, result: BuildResult) -> None:
+        def done(index: int, result: BuildResult) -> None:
             if result.status == FAILED:
                 error = result.error.splitlines()[0] if result.error else ""
                 logger.warning_once(
@@ -612,8 +673,10 @@ class BuildPool:
                     f"here ({error})",
                     key=("build_pool", names[index], error),
                 )
+            for twin in twins.pop(index, ()):
+                batch.settle(twin, BuildResult(PRESENT) if result.status == BUILT else result)
 
-        batch = BuildBatch(len(kernels), warn)
+        batch = BuildBatch(len(kernels), done)
         if not kernels:
             return batch
         if not self.accepting() or self._usable_store() is None:
@@ -621,12 +684,19 @@ class BuildPool:
                 batch.settle(index, BuildResult(REFUSED))
             return batch
         builds = []
+        # The pair that builds each kernel, by the kernel's path in the store.
+        first_build: Dict[str, int] = {}
         for index, (fn, args) in enumerate(kernels):
             compiler = fn._compiler
-            _, paths = self._paths(compiler.name, args)
+            args = compiler.bind(tuple(args), {})
+            _, paths = self._paths(compiler.store_name, args)
             if os.path.exists(paths.obj):
                 batch.settle(index, BuildResult(PRESENT))
                 continue
+            if paths.obj in first_build:
+                twins.setdefault(first_build[paths.obj], []).append(index)
+                continue
+            first_build[paths.obj] = index
             claim = Claim(paths.claim, paths.obj, paths.failed) if self._shared else None
             builds.append(
                 (
@@ -795,13 +865,21 @@ class BuildPool:
                 from tensorrt_llm import _jit_share
 
                 store, shared = self._store, self._shared
+                if store is None and _jit_share.enabled():
+                    shared_store = os.path.join(os.environ[_jit_share.SHARE_DIR_ENV], "cute")
+                    try:
+                        os.makedirs(shared_store, exist_ok=True)
+                        store, shared = shared_store, True
+                    except OSError as e:
+                        # The workers still build into a store of this rank's own.
+                        logger.warning_once(
+                            f"[BuildPool] the shared store {shared_store} cannot be made "
+                            f"({type(e).__name__}: {e}): this rank's kernels are not shared",
+                            key=("build_pool", "shared_store"),
+                        )
                 if store is None:
-                    if _jit_share.enabled():
-                        store = os.path.join(os.environ[_jit_share.SHARE_DIR_ENV], "cute")
-                        shared = True
-                    else:
-                        store = tempfile.mkdtemp(prefix="tllm-build-pool-")
-                        atexit.register(shutil.rmtree, store, True)
+                    store = tempfile.mkdtemp(prefix="tllm-build-pool-")
+                    atexit.register(shutil.rmtree, store, True)
                 os.makedirs(store, exist_ok=True)
                 self._store, self._shared, self._store_ready = store, shared, True
             return self._store
@@ -835,8 +913,12 @@ class _Pool:
         self._cwd = cwd
         self._env = {**_worker_env(), **extra_env}
         self._lock = threading.Lock()
-        self._idle = 0
+        # The workers free for a build, less the builds queued for them: below one, a new build
+        # waits for a worker unless one starts.
+        self._free = 0
         self._live = 0
+        # A worker that does not reply to a build within this many seconds is stopped.
+        self._reply_timeout = _reply_timeout()
         self._stopping = False
         self._processes: List[subprocess.Popen] = []
         self._threads: List[threading.Thread] = []
@@ -844,17 +926,27 @@ class _Pool:
         self._admission = admission
 
     def put(self, task: _Task) -> None:
-        """Queue ``task``, starting a worker when none is idle and the cap and the GPU's free
+        """Queue ``task``, starting a worker when none is free and the cap and the GPU's free
         memory allow; with no worker able to take it, refuse it at once."""
         with self._lock:
             if not self._stopping:
-                if self._idle == 0 and len(self._processes) < self._max and _gpu_has_room():
+                if (
+                    self._free <= 0
+                    and len(self._processes) < self._max
+                    and _gpu_has_room(self._reserved_bytes())
+                ):
                     try:
                         self._start_worker()
                     except OSError as e:
-                        logger.warning(f"[BuildPool] a worker process did not start: {e}")
+                        # The next builds would fail the same way: they wait for the workers
+                        # that run.
+                        self._max = len(self._processes)
+                        logger.warning(
+                            f"[BuildPool] a worker process did not start, and no other starts "
+                            f"in this pass: {e}"
+                        )
                 if self._live:
-                    self._idle = max(0, self._idle - 1)
+                    self._free -= 1
                     self.queue.put(task)
                     return
         self._owner._settle(task, BuildResult(REFUSED, 0.0, "no worker process is running"))
@@ -878,10 +970,14 @@ class _Pool:
     def _start_worker(self) -> None:
         """Start one worker and the thread that serves it; called holding ``self._lock``."""
         index = len(self._processes)
-        task_read, task_write = os.pipe()
-        result_read, result_write = os.pipe()
-        stderr = tempfile.TemporaryFile()
+        fds: List[int] = []
+        stderr = None
         try:
+            task_read, task_write = os.pipe()
+            fds += (task_read, task_write)
+            result_read, result_write = os.pipe()
+            fds += (result_read, result_write)
+            stderr = tempfile.TemporaryFile()
             process = subprocess.Popen(
                 [
                     sys.executable,
@@ -897,68 +993,126 @@ class _Pool:
                 stderr=stderr,
             )
         except OSError:
-            for fd in (task_read, task_write, result_read, result_write):
+            for fd in fds:
                 os.close(fd)
-            stderr.close()
+            if stderr is not None:
+                stderr.close()
             raise
         os.close(task_read)
         os.close(result_write)
         thread = threading.Thread(
             target=self._serve,
-            args=(task_write, result_read, stderr),
+            args=(process, task_write, result_read, stderr),
             name=f"tllm-build-pool-{index}",
             daemon=True,
         )
         self._processes.append(process)
         self._threads.append(thread)
         self._live += 1
-        self._idle += 1
+        self._free += 1
         self._owner._worker_started()
         thread.start()
 
-    def _serve(self, task_write: int, result_read: int, stderr: IO[bytes]) -> None:
-        with (
-            stderr,
-            os.fdopen(task_write, "wb") as to_worker,
-            os.fdopen(result_read, "rb") as from_worker,
-        ):
-            while True:
-                task = self.queue.get()
-                if task is None:
-                    try:
-                        _write(to_worker, pickle.dumps(None))
-                    except OSError:
-                        pass
-                    return
-                if not self._admission.admit(id(task), task.family):
+    def _serve(
+        self, process: subprocess.Popen, task_write: int, result_read: int, stderr: IO[bytes]
+    ) -> None:
+        to_worker = os.fdopen(task_write, "wb")
+        from_worker = os.fdopen(result_read, "rb")
+        try:
+            self._serve_tasks(process, to_worker, from_worker, stderr)
+        finally:
+            for stream in (to_worker, from_worker, stderr):
+                try:
+                    stream.close()
+                except OSError:
+                    pass  # A request the worker never read stays buffered; its pipe is broken.
+
+    def _serve_tasks(
+        self,
+        process: subprocess.Popen,
+        to_worker: IO[bytes],
+        from_worker: IO[bytes],
+        stderr: IO[bytes],
+    ) -> None:
+        # The worker makes its CUDA context in its first build, which reserves room for it
+        # (see _Admission.admit); once that build ends, the context is in the GPU's free memory.
+        cold = True
+        ended = False
+        while True:
+            task = self.queue.get()
+            if task is None:
+                try:
+                    _write(to_worker, pickle.dumps(None))
+                except OSError:
+                    pass
+                break
+            try:
+                if not self._admission.admit(id(task), task.family, cold=cold):
                     self._owner._settle(
                         task, BuildResult(REFUSED, 0.0, "the GPU has no room for the build")
                     )
                     with self._lock:
-                        self._idle += 1
+                        self._free += 1
                     continue
+                # A worker that stalls (in its imports or a build) keeps its pipes open, so
+                # no error or end of file would tell this thread: the watchdog stops it, and
+                # the exchange then fails.
+                timed_out = threading.Event()
+                watchdog = None
+                if self._reply_timeout is not None:
+                    watchdog = threading.Timer(
+                        self._reply_timeout, _stop_worker, (process, timed_out)
+                    )
+                    watchdog.daemon = True
+                    watchdog.start()
                 try:
                     _write(to_worker, task.message)
-                    result = BuildResult(*_recv(from_worker))
+                    reply = _recv(from_worker)
                 except (OSError, EOFError, pickle.UnpicklingError) as e:
-                    self._owner._settle(
-                        task,
-                        BuildResult(
-                            FAILED, 0.0, f"the worker process ended ({e!r}): {_tail(stderr)}"
-                        ),
+                    error = (
+                        f"the worker process did not reply within {self._reply_timeout:g}s "
+                        f"({_REPLY_TIMEOUT_ENV}) and was stopped"
+                        if timed_out.is_set()
+                        else f"the worker process ended ({e!r}): {_tail(stderr)}"
                     )
+                    self._owner._settle(task, BuildResult(FAILED, 0.0, error))
+                    _abandon_claim(task.claim, process, error)
                     self._admission.release(id(task))
+                    ended = True
                     self._ended()
-                    return
-                # The result records the memory the build took, before the builds waiting for
-                # room look again.
+                    break
+                finally:
+                    if watchdog is not None:
+                        watchdog.cancel()
+                cold = False
+                result = BuildResult(*reply)
+                # The result records the memory the build took, before the builds waiting
+                # for room look again.
                 self._owner._settle(task, result)
                 self._admission.release(id(task))
-                if result.status == FAILED and result.error.endswith(_WORKER_ENDS):
+                # A worker the watchdog stopped as it replied takes no other build.
+                if timed_out.is_set() or (
+                    result.status == FAILED and result.error.endswith(_WORKER_ENDS)
+                ):
+                    ended = True
                     self._ended()
-                    return
+                    break
                 with self._lock:
-                    self._idle += 1
+                    self._free += 1
+            except Exception as e:  # noqa: BLE001 - a build left unsettled holds up its pass
+                # The worker ends with this thread: leaving closes its pipes.
+                error = f"serving the build raised {type(e).__name__}: {e}"
+                self._owner._settle(task, BuildResult(FAILED, 0.0, error))
+                _abandon_claim(task.claim, process, error)
+                self._admission.release(id(task))
+                if not ended:
+                    ended = True
+                    self._ended()
+                break
+
+    def _reserved_bytes(self) -> int:
+        """The memory the builds running reserved, which the GPU's free memory may not show yet."""
+        return self._admission.reserved_bytes()
 
     def _ended(self) -> None:
         """A worker ended: with none left, refuse the builds still queued."""
@@ -974,6 +1128,7 @@ class _Pool:
                     break
                 if task is not None:
                     stranded.append(task)
+            self._free += len(stranded)
         for task in stranded:
             self._owner._settle(task, BuildResult(REFUSED, 0.0, "no worker process is left"))
 
@@ -1133,6 +1288,55 @@ class _ThreadLane:
             return FAILED
         _end_claim(item.claim)
         return BUILT
+
+
+def _reply_timeout() -> Optional[float]:
+    """``TLLM_KERNEL_BUILDER_BUILD_TIMEOUT_S`` in seconds, or None for exactly 0, which waits
+    without a limit. Any other value that is not a positive, finite number of seconds keeps the
+    default, with a warning: a stalled worker would otherwise hold up the warmup for good."""
+    value = os.environ.get(_REPLY_TIMEOUT_ENV)
+    if value is None:
+        return _DEFAULT_REPLY_TIMEOUT_S
+    try:
+        seconds = float(value)
+    except ValueError:
+        seconds = math.nan
+    if seconds == 0:
+        return None
+    if not (math.isfinite(seconds) and seconds > 0):
+        logger.warning_once(
+            f"[BuildPool] {_REPLY_TIMEOUT_ENV}={value!r} is neither 0 (no limit) nor a positive "
+            f"number of seconds: a worker that does not reply to a build is stopped after "
+            f"{_DEFAULT_REPLY_TIMEOUT_S:g}s",
+            key=("build_pool", "reply_timeout", value),
+        )
+        return _DEFAULT_REPLY_TIMEOUT_S
+    # A timer thread cannot wait longer.
+    return min(seconds, threading.TIMEOUT_MAX)
+
+
+def _abandon_claim(claim: Optional[Claim], process: subprocess.Popen, reason: str) -> None:
+    """Mark failed the claim of a build whose worker ended without settling it, so that the
+    ranks waiting for its kernel build it at once rather than at the end of their wait. Only a
+    claim this worker made counts: one another rank's worker made stands. The worker runs on
+    this node, so reading the claim it wrote cannot block on another client of the directory."""
+    if claim is None or os.path.exists(claim.done) or os.path.exists(claim.failed):
+        return
+    try:
+        with open(claim.claim) as f:
+            owner = f.read().split()
+    except OSError:
+        return  # Not claimed: the worker ended before it claimed the build.
+    if owner == [os.uname().nodename, str(process.pid)]:
+        from tensorrt_llm import _jit_share
+
+        _jit_share._mark_failed(claim.failed, reason)
+
+
+def _stop_worker(process: subprocess.Popen, timed_out: threading.Event) -> None:
+    """Kill a worker that did not reply in time; its pipes then fail the exchange."""
+    timed_out.set()
+    process.kill()
 
 
 def _tail(stream: IO[bytes]) -> str:

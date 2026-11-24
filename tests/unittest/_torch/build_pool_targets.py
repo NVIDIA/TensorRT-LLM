@@ -95,6 +95,11 @@ def unpicklable() -> object:
     return lambda: None
 
 
+def stall(seconds: float) -> None:
+    """A build that stops replying for ``seconds``, as one stuck in I/O does."""
+    time.sleep(seconds)
+
+
 def hold(started: str, release: str, timeout: float = 120.0) -> None:
     """A build that creates the file ``started`` and runs until the file ``release`` exists,
     for at most ``timeout`` seconds."""

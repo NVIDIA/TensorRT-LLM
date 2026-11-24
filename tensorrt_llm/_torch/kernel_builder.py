@@ -51,8 +51,6 @@ from typing import (
     Union,
 )
 
-import torch
-
 from tensorrt_llm import _jit_share
 from tensorrt_llm.logger import logger
 
@@ -468,7 +466,7 @@ class KernelBuilder:
             to_workers = []
             for fn, args in kernels:
                 compiler = getattr(fn, "_compiler", None)
-                if compiler is None or args in compiler.memo:
+                if compiler is None or compiler.bind(tuple(args), {}) in compiler.memo:
                     continue
                 if pool.accepting() and self._uses_pool(compiler):
                     to_workers.append((fn, args))
@@ -584,11 +582,13 @@ class KernelBuilder:
         return self._stats.setdefault(op, _OpStats())
 
     def _rotated(self, builds: List[tuple]) -> List[tuple]:
-        """Start each GPU's list at a different place: ranks sharing a compiler cache then
-        build different kernels first instead of waiting on each other's locks."""
-        if not builds or not torch.cuda.is_available():
+        """Start each rank's list at a different place, its slot among the processes that share
+        JIT builds (``_jit_share.start_fraction``): ranks sharing a compiler cache then build
+        different kernels first instead of waiting on each other's locks. A rank's device index
+        cannot tell them apart where each rank sees its GPU alone (``CUDA_VISIBLE_DEVICES``)."""
+        if not builds:
             return builds
-        offset = torch.cuda.current_device() % len(builds)
+        offset = int(_jit_share.start_fraction() * len(builds))
         return builds[offset:] + builds[:offset]
 
 

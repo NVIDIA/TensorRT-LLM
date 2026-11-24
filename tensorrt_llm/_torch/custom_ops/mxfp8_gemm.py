@@ -47,27 +47,55 @@ def validate_mxfp8_backends(backends: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(backends))
 
 
+def _max_active_clusters(kernel_key: object) -> int | None:
+    """The persistent grid FlashInfer compiles a CuTe DSL MXFP8 GEMM kernel for: the max active
+    clusters of its launch cluster (``cluster_shape_mn`` times split-K) on this process's GPU,
+    which the SMs that ``cute_dsl_utils.sm_reserve()`` keeps out lower. None for a key of
+    another layout than FlashInfer 0.7's ``(sf_vec_size, mma_tiler_mn, cluster_shape_mn,
+    swap_ab, use_prefetch, enable_pdl, out_dtype, split_k_slices)``."""
+    if not (isinstance(kernel_key, tuple) and len(kernel_key) == 8):
+        return None
+    cluster_shape_mn, split_k = kernel_key[2], kernel_key[-1]
+    if not (
+        isinstance(cluster_shape_mn, tuple)
+        and len(cluster_shape_mn) == 2
+        and all(isinstance(v, int) for v in (*cluster_shape_mn, split_k))
+    ):
+        return None
+    from flashinfer.cute_dsl.utils import get_max_active_clusters
+
+    return get_max_active_clusters(cluster_shape_mn[0] * cluster_shape_mn[1] * split_k)
+
+
 class _FlashInferKernelCache(jit_share.SharedKernelCache):
     """FlashInfer's CuTe DSL MXFP8 GEMM kernels, shared like a runner's ``kernel_cache``.
 
     Keys are ``(device index, kernel key)`` and values ``(kernel, max active clusters)``. A kernel
-    is named by its device's SM count rather than the device's index, since it is compiled for
-    that many clusters, and its cluster count is kept beside it.
+    is compiled for the max active clusters of its launch cluster on its device
+    (:func:`_max_active_clusters`), which depend on the device's SMs and on the SMs a process
+    reserves: it is named by that count rather than by the device's index, and one exported for
+    another count is neither exported nor loaded.
     """
 
-    def _shared_text(self, key) -> str | None:
+    def _shared_text(self, key: object) -> str | None:
         if not (isinstance(key, tuple) and len(key) == 2 and isinstance(key[0], int)):
             return None
-        device_index, kernel_key = key
-        sms = torch.cuda.get_device_properties(device_index).multi_processor_count
-        return super()._shared_text((sms, kernel_key))
+        clusters = _max_active_clusters(key[1])
+        if clusters is None:
+            return None
+        return super()._shared_text((clusters, key[1]))
 
-    def _export(self, value, obj: str, name: str, meta: str) -> None:
+    def _export(self, key: tuple, value: tuple, obj: str, name: str, meta: str) -> None:
         kernel, clusters = value
+        if clusters != _max_active_clusters(key[1]):
+            raise ValueError(f"compiled for {clusters} active clusters, not this name's")
         jit_share._export_kernel(kernel, obj, name, meta, extra=clusters)
 
-    def _load(self, obj: str, name: str, meta: str):
-        return jit_share._load_kernel(obj, name, meta), jit_share._exported_extra(meta)
+    def _load(self, key: tuple, obj: str, name: str, meta: str) -> tuple:
+        clusters = jit_share._exported_extra(meta)
+        if clusters != _max_active_clusters(key[1]):
+            raise ValueError(f"exported for {clusters} active clusters")
+        return jit_share._load_kernel(obj, name, meta), clusters
 
 
 @lru_cache
@@ -272,14 +300,15 @@ class MXFP8GemmUnifiedRunner(TunableRunner):
 
     # Graph warmup visits each capture shape; cache and profiling use that exact M. The ranks of
     # the tuning group time a share of the tactics each, and compile each FlashInfer CuTe DSL kernel
-    # once when they share JIT builds (share_kernel_caches).
+    # once when they share JIT builds (share_library_kernel_caches). The swap-AB CuTe DSL tiles
+    # stay in mxfp8_swapab's cache: every rank that runs one compiles it.
     tuning_config = TuningConfig(
         cold_l2_flush_bytes=_COLD_L2_FLUSH_BYTES,
         distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL,
         build_strategy=BuildStrategy.SHARED,
     )
-    # Expose JIT participation so loaded winners are primed before graph capture.
-    kernel_cache: ClassVar[dict] = MXFP8SwapABGemmRunner.kernel_cache
+    # Its tactics compile on their first run: loaded winners are primed before graph capture.
+    primes_cached_tactics: ClassVar[bool] = True
 
     def __init__(
         self, output_dtype: torch.dtype, allowed_backends: tuple[str, ...] = MXFP8_DEFAULT_BACKENDS
@@ -303,7 +332,7 @@ class MXFP8GemmUnifiedRunner(TunableRunner):
         return (self.output_dtype, self.allowed_backends)
 
     @classmethod
-    def share_kernel_caches(cls) -> None:
+    def share_library_kernel_caches(cls) -> None:
         """Share FlashInfer's cache of CuTe DSL MXFP8 kernels across the processes that share JIT
         builds (``jit_share.share_kernel_caches``)."""
         try:
@@ -343,7 +372,11 @@ class MXFP8GemmUnifiedRunner(TunableRunner):
 
 def agree_mxfp8_tactics(custom_op: str) -> None:
     """Make the tuner's tensor-parallel ranks hold the tactics most of them chose for ``custom_op``
-    and the MXFP8 quantizer tuned with it, since a step waits for its slowest rank. Collective."""
+    and the MXFP8 quantizer tuned with it, since a step waits for its slowest rank. Collective.
+
+    The GEMM's PARALLEL tuning already left every rank of the group the fastest entry of each
+    profile that all of them tuned; the vote settles the quantizer, which each rank tunes on its
+    own, and any GEMM profile only some ranks tuned."""
     from .torch_custom_ops import _MXFP8_QUANTIZE_AUTOTUNED_OP
 
     changed = AutoTuner.get().post_tune_merge_tactics(
