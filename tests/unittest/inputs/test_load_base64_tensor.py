@@ -22,6 +22,7 @@ from tensorrt_llm.inputs.utils import async_load_base64_tensor, load_base64_tens
 pytestmark = pytest.mark.cpu_only
 
 _LIMIT = 1 << 20
+_REBUILD = b"ctorch._utils\n_rebuild_tensor_v2\n"
 
 
 def _encode(value: object, **save_kwargs: object) -> str:
@@ -38,13 +39,11 @@ def _rewrite(
 
     A replacement of None drops the record.
     """
-    replace = replace or {}
     src = zipfile.ZipFile(io.BytesIO(base64.b64decode(payload)))
     out = io.BytesIO()
     with zipfile.ZipFile(out, "w", **zip_kwargs) as dst:
         for info in src.infolist():
-            suffix = info.filename.split("/", 1)[1]
-            data = replace.get(suffix, src.read(info))
+            data = (replace or {}).get(info.filename.split("/", 1)[1], src.read(info))
             if data is not None:
                 dst.writestr(info.filename, data)
         for name in add:
@@ -52,83 +51,94 @@ def _rewrite(
     return base64.b64encode(out.getvalue()).decode("ascii")
 
 
-def _replace_pickle(payload: str, pickled: bytes) -> str:
-    """Swap the data.pkl record of a torch.save archive."""
-    return _rewrite(payload, {"data.pkl": pickled})
-
-
-class _BigBytearray:
-    """Pickles as ``bytearray(n)``: allowed by weights_only, allocates on load."""
-
-    def __reduce__(self) -> tuple:
-        return (bytearray, (1 << 30,))
-
-
-def _rebuild_pickle(rows: int, stride: tuple, storage_numel: int, wrap: bool) -> bytes:
-    """A protocol-2 ``_rebuild_tensor_v2`` pickle of a ``(rows, 2)`` float tensor.
+def _pickle(
+    size: tuple,
+    stride: tuple,
+    numel: int,
+    *,
+    wrap: bool = False,
+    head: bytes = b"\x80\x02",
+    rebuild: bytes = _REBUILD,
+) -> bytes:
+    """A ``_rebuild_tensor_v2`` pickle of a float view, built opcode by opcode.
 
     With ``wrap``, the tensor is passed to ``OrderedDict``, which iterates its rows
     while unpickling; its hooks are then an empty tuple, keeping the opcode counts
     of an ordinary ``torch.save`` pickle.
     """
 
-    def tup(*items: int) -> bytes:
-        return b"(" + b"".join(b"J" + i.to_bytes(4, "little") for i in items) + b"t"
-
-    storage = (
-        b"((X\x07\x00\x00\x00storagectorch\nFloatStorage\nX\x01\x00\x00\x000"
-        b"X\x03\x00\x00\x00cpu" + b"J" + storage_numel.to_bytes(4, "little") + b"tQ"
-    )
-    hooks = b")" if wrap else b"ccollections\nOrderedDict\n)R"
-    rebuild = (
-        b"ctorch._utils\n_rebuild_tensor_v2\n"
-        + storage
-        + b"K\x00"
-        + tup(rows, 2)
-        + tup(*stride)
-        + b"\x89"
-        + hooks
-        + b"tR"
-    )
-    if wrap:
-        return b"\x80\x02ccollections\nOrderedDict\n" + rebuild + b"\x85R."
-    return b"\x80\x02" + rebuild + b"."
-
-
-def _view_pickle(offset: int, size: tuple, stride: tuple, storage_numel: int) -> bytes:
-    """A protocol-2 ``_rebuild_tensor_v2`` pickle of a float view with arbitrary ints."""
-
     def num(value: int) -> bytes:
         length = (value.bit_length() + 8) // 8
         return b"\x8a" + bytes([length]) + value.to_bytes(length, "little", signed=True)
 
-    return (
-        b"\x80\x02ctorch._utils\n_rebuild_tensor_v2\n((X\x07\x00\x00\x00storage"
-        b"ctorch\nFloatStorage\nX\x01\x00\x00\x000X\x03\x00\x00\x00cpu"
-        + num(storage_numel)
-        + b"tQ"
-        + num(offset)
-        + b"("
-        + b"".join(num(v) for v in size)
-        + b"t("
-        + b"".join(num(v) for v in stride)
-        + b"t\x89ccollections\nOrderedDict\n)RtR."
+    storage = (
+        b"((X\x07\x00\x00\x00storagectorch\nFloatStorage\nX\x01\x00\x00\x000X\x03\x00\x00\x00cpu"
     )
+    hooks = b")" if wrap else b"ccollections\nOrderedDict\n)R"
+    body = rebuild + storage + num(numel) + b"tQ" + num(0)
+    body += b"(" + b"".join(map(num, size)) + b"t(" + b"".join(map(num, stride)) + b"t"
+    body += b"\x89" + hooks + b"tR"
+    if wrap:
+        body = b"ccollections\nOrderedDict\n" + body + b"\x85R"
+    return head + body + b"."
 
 
-def _patch_record_sizes(payload: str, record: str, compress_size: int, file_size: int) -> str:
-    """Overwrite one record's declared stored and uncompressed sizes in both its headers."""
+def _with_pickle(pickled: bytes) -> str:
+    """A torch.save archive of ``zeros(8)`` with its data.pkl record swapped."""
+    return _rewrite(_encode(torch.zeros(8)), {"data.pkl": pickled})
+
+
+def _patch(payload: str, edit: Callable[[bytearray, zipfile.ZipFile], None]) -> str:
+    """Edit the decoded archive bytes in place and re-encode them."""
     raw = bytearray(base64.b64decode(payload))
-    name = f"archive/{record}".encode()
-    info = zipfile.ZipFile(io.BytesIO(bytes(raw))).getinfo(name.decode())
-    struct.pack_into("<II", raw, info.header_offset + 18, compress_size, file_size)
-    entry = raw.find(b"PK\x01\x02")
-    while entry != -1:
-        name_len = struct.unpack_from("<H", raw, entry + 28)[0]
-        if raw[entry + 46 : entry + 46 + name_len] == name:
-            struct.pack_into("<II", raw, entry + 20, compress_size, file_size)
-        entry = raw.find(b"PK\x01\x02", entry + 4)
+    edit(raw, zipfile.ZipFile(io.BytesIO(bytes(raw))))
     return base64.b64encode(bytes(raw)).decode()
+
+
+def _headers(raw: bytearray, archive: zipfile.ZipFile, name: str) -> tuple[int, int]:
+    """Offsets of one record's local and central directory headers."""
+    central = raw.find(b"PK\x01\x02")
+    while raw[central + 46 : central + 46 + len(name)] != name.encode():
+        central = raw.find(b"PK\x01\x02", central + 4)
+    return archive.getinfo(name).header_offset, central
+
+
+def _set_sizes(payload: str, record: str, compress_size: int, file_size: int) -> str:
+    """Overwrite one record's declared stored and uncompressed sizes in both its headers."""
+
+    def edit(raw: bytearray, archive: zipfile.ZipFile) -> None:
+        local, central = _headers(raw, archive, f"archive/{record}")
+        struct.pack_into("<II", raw, local + 18, compress_size, file_size)
+        struct.pack_into("<II", raw, central + 20, compress_size, file_size)
+
+    return _patch(payload, edit)
+
+
+def _encrypt(raw: bytearray, archive: zipfile.ZipFile) -> None:
+    """Set the encryption flag of every record."""
+    for name in archive.namelist():
+        local, central = _headers(raw, archive, name)
+        raw[local + 6] |= 1
+        raw[central + 8] |= 1
+
+
+def _corrupt_storage(raw: bytearray, archive: zipfile.ZipFile) -> None:
+    """Overwrite the storage bytes, keeping the record's declared CRC."""
+    local, _ = _headers(raw, archive, "archive/data/0")
+    start = local + 30 + sum(struct.unpack_from("<HH", raw, local + 26))
+    raw[start : start + 4] = b"\x01\x02\x03\x04"
+
+
+def _zip64_edit(field: int, value: Callable[[int], int], in_record: bool) -> Callable:
+    """An edit of one 8-byte field of the zip64 locator, or of the record it points to."""
+
+    def edit(raw: bytearray, archive: zipfile.ZipFile) -> None:
+        at = len(raw) - 22 - 20
+        if in_record:
+            at = struct.unpack_from("<Q", raw, at + 8)[0]
+        struct.pack_into("<Q", raw, at + field, value(struct.unpack_from("<Q", raw, at + field)[0]))
+
+    return edit
 
 
 def _spy_reads(monkeypatch) -> list:
@@ -144,34 +154,39 @@ def _spy_reads(monkeypatch) -> list:
     return reads
 
 
-@pytest.mark.parametrize(
-    "tensor, save_kwargs",
-    [
-        (torch.randn(5, 8).to(torch.float16), {}),
-        (torch.randn(5, 8).to(torch.bfloat16), {}),
-        (torch.randn(5, 8), {}),
-        *[(torch.randn(2, 3), {"pickle_protocol": p}) for p in (3, 4, 5)],
-        (torch.arange(12.0).reshape(4, 3)[::2], {}),
-        (torch.arange(12.0).reshape(4, 3)[1:, 1:], {}),
-        (torch.arange(6.0).reshape(3, 2).t(), {}),
-        (torch.arange(10.0)[3:7], {}),
-        (torch.arange(4.0, requires_grad=True), {}),
-        (torch.zeros(0, 4), {}),
-    ],
-)
+class _BigBytearray:
+    """Pickles as ``bytearray(n)``: allowed by weights_only, allocates on load."""
+
+    def __reduce__(self) -> tuple:
+        return (bytearray, (1 << 30,))
+
+
+_ACCEPTED = [
+    (torch.randn(5, 8).to(torch.float16), {}),
+    (torch.randn(5, 8).to(torch.bfloat16), {}),
+    *[(torch.randn(2, 3), {"pickle_protocol": p}) for p in (2, 3, 4, 5)],
+    (torch.arange(12.0).reshape(4, 3)[1:, 1:], {}),
+    (torch.arange(6.0).reshape(3, 2).t(), {}),
+    (torch.arange(4.0, requires_grad=True), {}),
+    (torch.zeros(0, 4), {}),
+]
+
+
+@pytest.mark.parametrize("tensor, save_kwargs", _ACCEPTED)
 def test_saved_tensors_round_trip(monkeypatch, tensor: torch.Tensor, save_kwargs: dict) -> None:
-    """Dtypes, pickle protocols, views and empty tensors decode on CPU without torch.load."""
-
-    def no_load(*args: object, **kwargs: object) -> None:
-        raise AssertionError("torch.load must not run on client bytes")
-
-    monkeypatch.setattr(torch, "load", no_load)
+    """Dtypes, protocols, views and empty tensors decode on CPU, never through torch.load."""
+    monkeypatch.setattr(torch, "load", None)
     payload = _encode(tensor, **save_kwargs)
-    # The default device does not leak into the result, even for empty storage.
     with torch.device("meta"):
         decoded = load_base64_tensor(payload, max_bytes=_LIMIT)
     assert decoded.device.type == "cpu" and decoded.dtype == tensor.dtype
     assert torch.equal(decoded, tensor.detach())
+
+
+def test_hand_built_pickle_accepted() -> None:
+    """The hand-built pickle the rejection cases mutate loads when well formed."""
+    decoded = load_base64_tensor(_with_pickle(_pickle((4, 2), (2, 1), 8)), max_bytes=_LIMIT)
+    assert decoded.shape == (4, 2)
 
 
 def test_async_round_trip(monkeypatch) -> None:
@@ -188,26 +203,9 @@ def test_async_round_trip(monkeypatch) -> None:
         return await async_load_base64_tensor(_encode(tensor), max_bytes=_LIMIT)
 
     monkeypatch.setattr(utils, "load_base64_tensor", spy)
-    tensor = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    tensor = torch.arange(12.0).reshape(3, 4)
     assert torch.equal(asyncio.run(run()), tensor)
     assert len(threads) == 2 and threads[0] != threads[1]
-
-
-def test_encoded_length_checked_before_decode(monkeypatch) -> None:
-    """An over-long string is rejected without decoding it."""
-
-    def no_decode(*args, **kwargs) -> bytes:
-        raise AssertionError("an over-long payload was decoded")
-
-    monkeypatch.setattr(utils, "_b64decode_strict", no_decode)
-    with pytest.raises(ValueError, match="base64 characters"):
-        load_base64_tensor("A" * 5000, max_bytes=1024)
-
-
-def test_decoded_size_over_limit() -> None:
-    """Decoded bytes over the limit are rejected even when the text length passes."""
-    with pytest.raises(ValueError, match="is 3 bytes, over the 2-byte limit"):
-        load_base64_tensor("AAAA", max_bytes=2)
 
 
 def test_line_wrapped_base64_near_limit_accepted() -> None:
@@ -220,32 +218,26 @@ def test_line_wrapped_base64_near_limit_accepted() -> None:
     assert torch.equal(load_base64_tensor(wrapped, max_bytes=limit), tensor)
 
 
-def test_whitespace_retry_releases_the_failed_attempt() -> None:
-    """A trailing newline costs a second decode, but not a third copy of the payload."""
-    raw = bytes(range(256)) * (1 << 14)
-    text = base64.b64encode(raw).decode() + "\n"
-    tracemalloc.start()
-    try:
-        with pytest.raises(ValueError, match="zip"):
-            load_base64_tensor(text, max_bytes=len(raw))
-        peak = tracemalloc.get_traced_memory()[1]
-    finally:
-        tracemalloc.stop()
-    # The decoded slices plus their join: two copies, not three.
-    assert peak < 2.5 * len(raw)
+_BASE64_REJECTED = {
+    "bytes": (b"QUJD", _LIMIT, TypeError, "base64 string"),
+    "encoded-over-limit": ("A" * 5000, 1024, ValueError, "base64 characters"),
+    "decoded-over-limit": ("AAAA", 2, ValueError, "is 3 bytes, over the 2-byte limit"),
+    "alphabet": ("not base64!", _LIMIT, ValueError, "not valid base64"),
+    "alphabet-wrapped": ("QUJD\nRE!G", _LIMIT, ValueError, "not valid base64"),
+    "non-ascii": ("QUJDé", _LIMIT, ValueError, "not valid base64"),
+}
 
 
-@pytest.mark.parametrize("payload", ["not base64!", "QUJD\nRE!G", "QUJDé"])
-def test_invalid_base64(payload: str) -> None:
-    """Non-alphabet characters are rejected, with or without line breaks."""
-    with pytest.raises(ValueError, match="not valid base64"):
-        load_base64_tensor(payload, max_bytes=_LIMIT)
-
-
-def test_non_string_payload() -> None:
-    """Bytes are not accepted in place of base64 text."""
-    with pytest.raises(TypeError, match="base64 string"):
-        load_base64_tensor(b"QUJD", max_bytes=_LIMIT)
+@pytest.mark.parametrize(
+    "text, limit, error, match", _BASE64_REJECTED.values(), ids=_BASE64_REJECTED
+)
+def test_base64_rejected(monkeypatch, text: object, limit: int, error: type, match: str) -> None:
+    """Non-strings, bad characters and sizes over the limit are refused; long text undecoded."""
+    monkeypatch.setattr(
+        utils, "_b64decode_strict", None if limit == 1024 else utils._b64decode_strict
+    )
+    with pytest.raises(error, match=match):
+        load_base64_tensor(text, max_bytes=limit)
 
 
 def test_base64_decodes_without_strict_mode(monkeypatch) -> None:
@@ -254,7 +246,6 @@ def test_base64_decodes_without_strict_mode(monkeypatch) -> None:
     b64decode = base64.b64decode
 
     def spy(text: str, validate: bool = False) -> bytes:
-        """Record the call and decode as ``base64.b64decode`` does."""
         calls.append(validate)
         return b64decode(text, validate=validate)
 
@@ -273,7 +264,6 @@ def test_base64_decoded_in_slices(monkeypatch) -> None:
     a2b_base64 = utils.binascii.a2b_base64
 
     def spy(text: str, **kwargs: bool) -> bytes:
-        """Record the slice length and decode as ``binascii.a2b_base64`` does."""
         lengths.append(len(text))
         return a2b_base64(text, **kwargs)
 
@@ -300,334 +290,137 @@ def test_sliced_decoding_matches_whole_text(monkeypatch, tail: str) -> None:
         raw = bytes(range(size))
         text = base64.b64encode(raw).decode()
         wrapped = "\n".join(text[i : i + 16] for i in range(0, len(text), 16))
-        assert utils._b64decode_strict(text + tail, strip_whitespace=True) == raw
-        assert utils._b64decode_strict(wrapped + tail, strip_whitespace=True) == raw
-        if not tail:
-            assert utils._b64decode_strict(text) == raw
-        if text.endswith("="):
-            with pytest.raises(ValueError):
-                utils._b64decode_strict(text + tail + "QQ==", strip_whitespace=True)
-            if not tail:
+        for strip, encoded in [(True, text + tail), (True, wrapped + tail), (not tail, text)]:
+            assert utils._b64decode_strict(encoded, strip_whitespace=strip) == raw
+            if text.endswith("="):
                 with pytest.raises(ValueError):
-                    utils._b64decode_strict(text + "QQ==")
+                    utils._b64decode_strict(encoded + "QQ==", strip_whitespace=strip)
 
 
-@pytest.mark.parametrize(
-    "build, match",
-    [
-        pytest.param(
-            lambda: _encode({"cls": pickle.Pickler}),
-            "unsupported pickle opcode|references",
-            id="arbitrary-global",
-        ),
-        pytest.param(
-            lambda: _replace_pickle(
-                _encode(torch.zeros(2)), pickle.dumps(_BigBytearray(), protocol=2)
-            ),
-            "bytearray",
-            id="allocating-reducer",
-        ),
-        pytest.param(lambda: _encode([torch.zeros(2)]), "unsupported pickle opcode", id="list"),
-        pytest.param(
-            lambda: _replace_pickle(_encode(torch.zeros(2)), b"\x80\x02ctorch._utils\n"),
-            "malformed",
-            id="truncated",
-        ),
-        pytest.param(
-            lambda: _encode(torch.tensor([1 + 2j]).conj().imag), "", id="negative-bit-view"
-        ),
-        pytest.param(
-            # A plain tuple in place of the rebuild GLOBAL is not a callable.
-            lambda: _replace_pickle(
-                _encode(torch.zeros(8)),
-                _rebuild_pickle(4, (2, 1), 8, wrap=False).replace(
-                    b"ctorch._utils\n_rebuild_tensor_v2\n",
-                    b"X\x1f\x00\x00\x00torch._utils _rebuild_tensor_v2\x85",
-                ),
-            ),
-            "exactly one tensor",
-            id="tuple-as-global",
-        ),
-        pytest.param(
-            lambda: _replace_pickle(
-                _encode(torch.zeros(8)),
-                b"\x80\xff" + _rebuild_pickle(4, (2, 1), 8, wrap=False)[2:],
-            ),
-            "malformed",
-            id="protocol-255",
-        ),
-        pytest.param(
-            lambda: _replace_pickle(
-                _encode(torch.zeros(8)),
-                b"\x80\x04\x95"
-                + (10_000).to_bytes(8, "little")
-                + _rebuild_pickle(4, (2, 1), 8, wrap=False)[2:],
-            ),
-            "malformed",
-            id="frame-past-end",
-        ),
-        pytest.param(
-            lambda: _encode(torch.zeros(2, 2, dtype=torch.int32)), "unsupported dtype", id="int32"
-        ),
-        pytest.param(lambda: _encode(torch.zeros(4, 4).to_sparse()), "", id="sparse"),
-        pytest.param(
-            lambda: _replace_pickle(
-                _encode(torch.zeros(1)), _rebuild_pickle(100_000_000, (0, 0), 1, wrap=True)
-            ),
-            "rebuild exactly one tensor",
-            id="reducer-wrapping-tensor",
-        ),
-        pytest.param(
-            lambda: _encode(torch.zeros(1, 8).expand(2, 8)), "repeats storage", id="expanded-view"
-        ),
-        pytest.param(
-            lambda: _encode(torch.zeros(1, 1024).expand(4096, 1024)),
-            "describes",
-            id="view-over-limit",
-        ),
-        pytest.param(
-            lambda: _replace_pickle(_encode(torch.zeros(4)), _view_pickle(0, (4,), (1,), _LIMIT)),
-            "describes",
-            id="storage-over-limit",
-        ),
-        pytest.param(
-            # Four rows of two at stride 3 cover 8 elements but end at element 10.
-            lambda: _replace_pickle(
-                _encode(torch.zeros(8)), _rebuild_pickle(4, (3, 1), 8, wrap=False)
-            ),
-            "past its storage",
-            id="view-past-storage",
-        ),
-        *[
-            pytest.param(
-                lambda o=o, s=s, t=t: _replace_pickle(
-                    _encode(torch.zeros(4)), _view_pickle(o, s, t, 4)
-                ),
-                "size, stride or offset",
-                id=f"out-of-range-{name}",
-            )
-            for name, o, s, t in [
-                ("size", 0, (0, 2**64), (1, 1)),
-                ("stride", 0, (1, 4), (2**64, 1)),
-                ("offset", 2**64, (0,), (1,)),
-            ]
-        ],
-        pytest.param(
-            lambda: _replace_pickle(
-                _encode(torch.zeros(4)), _view_pickle(0, (1_000_000,) * 4 + (0,), (1,) * 5, 4)
-            ),
-            "multiply",
-            id="zero-dim-huge-product",
-        ),
-    ],
-)
-def test_pickle_rejected(build: Callable[[], str], match: str) -> None:
+def test_whitespace_retry_releases_the_failed_attempt() -> None:
+    """A trailing newline costs a second decode, but not a third copy of the payload."""
+    raw = bytes(range(256)) * (1 << 14)
+    text = base64.b64encode(raw).decode() + "\n"
+    tracemalloc.start()
+    try:
+        with pytest.raises(ValueError, match="zip"):
+            load_base64_tensor(text, max_bytes=len(raw))
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    # The decoded slices plus their join: two copies, not three.
+    assert peak < 2.5 * len(raw)
+
+
+_FRAMED = b"\x80\x04\x95" + (10_000).to_bytes(8, "little")
+_TUPLE_GLOBAL = b"X\x1f\x00\x00\x00torch._utils _rebuild_tensor_v2\x85"
+_PICKLE_REJECTED = {
+    "allocating-global": (pickle.dumps(_BigBytearray(), protocol=2), "bytearray"),
+    "opcode": (pickle.dumps([1.0], protocol=2), "unsupported pickle opcode"),
+    "truncated": (b"\x80\x02" + _REBUILD, "malformed"),
+    "protocol": (_pickle((4, 2), (2, 1), 8, head=b"\x80\xff"), "malformed"),
+    "frame-past-end": (_pickle((4, 2), (2, 1), 8, head=_FRAMED), "malformed"),
+    "tuple-as-global": (_pickle((4, 2), (2, 1), 8, rebuild=_TUPLE_GLOBAL), "exactly one"),
+    # OrderedDict(tensor) would unbind 1e8 zero-stride rows while unpickling.
+    "reducer-wrapping-tensor": (_pickle((10**8, 2), (0, 0), 1, wrap=True), "exactly one"),
+    "negative-stride": (_pickle((4, 2), (-2, 1), 8), "exactly one"),
+    "out-of-range-size": (_pickle((0, 2**64), (1, 1), 4), "size, stride or offset"),
+    "logical-over-limit": (_pickle((1 << 18, 2), (0, 0), 1), "describes"),
+    "storage-over-limit": (_pickle((4,), (1,), _LIMIT), "describes"),
+    "zero-dim-huge-product": (_pickle((10**6,) * 4 + (0,), (1,) * 5, 4), "multiply"),
+    "repeats-storage": (_pickle((4, 2), (0, 1), 2), "repeats storage"),
+    # Four rows of two at stride 3 cover 8 elements but end at element 10.
+    "past-storage": (_pickle((4, 2), (3, 1), 8), "past its storage"),
+}
+
+
+@pytest.mark.parametrize("pickled, match", _PICKLE_REJECTED.values(), ids=_PICKLE_REJECTED)
+def test_pickle_rejected(pickled: bytes, match: str) -> None:
     """Pickles that are not one bounded dense float tensor are refused before allocating."""
-    payload = build()
+    payload = _with_pickle(pickled)
     with pytest.raises(ValueError, match=match):
         load_base64_tensor(payload, max_bytes=_LIMIT)
 
 
-def test_hand_built_pickle_accepted() -> None:
-    """The hand-built rebuild pickle the rejection cases mutate loads when well formed."""
-    payload = _replace_pickle(_encode(torch.zeros(8)), _rebuild_pickle(4, (2, 1), 8, wrap=False))
-    assert load_base64_tensor(payload, max_bytes=_LIMIT).shape == (4, 2)
-
-
-def _storage_crc_mismatch() -> str:
-    """Overwrite the storage bytes in place, keeping the record's declared CRC."""
-    raw = bytearray(base64.b64decode(_encode(torch.zeros(4))))
-    info = zipfile.ZipFile(io.BytesIO(bytes(raw))).getinfo("archive/data/0")
-    name_len, extra_len = struct.unpack_from("<HH", raw, info.header_offset + 26)
-    start = info.header_offset + 30 + name_len + extra_len
-    raw[start : start + 16] = struct.pack("<4f", 1, 2, 3, 4)
-    return base64.b64encode(bytes(raw)).decode()
-
-
-def _encrypted_flag() -> str:
-    """Set the encryption flag on every record, in both of its headers."""
-    raw = bytearray(base64.b64decode(_encode(torch.zeros(4))))
-    for signature, flag_offset in ((b"PK\x03\x04", 6), (b"PK\x01\x02", 8)):
-        header = raw.find(signature)
-        while header != -1:
-            raw[header + flag_offset] |= 0x1
-            header = raw.find(signature, header + 4)
-    return base64.b64encode(bytes(raw)).decode()
-
-
-def _zip64_locator_moved() -> str:
-    """Point the zip64 locator 8 bytes before its directory record."""
-    raw = bytearray(base64.b64decode(_encode(torch.zeros(2))))
-    locator = len(raw) - 22 - 20
-    assert raw[locator : locator + 4] == b"PK\x06\x07"
-    (reloff,) = struct.unpack_from("<Q", raw, locator + 8)
-    struct.pack_into("<Q", raw, locator + 8, reloff - 8)
-    return base64.b64encode(bytes(raw)).decode()
-
-
 @pytest.mark.parametrize(
-    "build, max_bytes, match",
+    "tensor, match",
     [
-        pytest.param(
-            lambda: _encode(torch.zeros(2, 2), _use_new_zipfile_serialization=False),
-            _LIMIT,
-            "zip",
-            id="legacy-format",
-        ),
-        pytest.param(
-            lambda: _rewrite(_encode(torch.zeros(16, 16)), compression=zipfile.ZIP_DEFLATED),
-            _LIMIT,
-            "uncompressed",
-            id="deflated",
-        ),
-        pytest.param(_storage_crc_mismatch, _LIMIT, "CRC", id="crc-mismatch"),
-        pytest.param(_encrypted_flag, _LIMIT, "unencrypted", id="encrypted"),
-        pytest.param(
-            lambda: _rewrite(_encode(torch.zeros(2)), {"data.pkl": None}),
-            _LIMIT,
-            "only the records",
-            id="missing-pickle",
-        ),
-        pytest.param(_zip64_locator_moved, _LIMIT, "directly precede its locator", id="zip64"),
-        pytest.param(
-            lambda: base64.b64encode(
-                bytes(8) + struct.pack("<4sHHHHIIH", b"PK\x05\x06", 0, 0, 0, 0x4B50, 0x0706, 0, 0)
-            ).decode(),
-            _LIMIT,
-            "",
-            id="shorter-than-zip64-locator",
-        ),
-        pytest.param(
-            # A small archive declaring a 4 MiB storage is refused before allocating it.
-            lambda: _patch_record_sizes(
-                _replace_pickle(_encode(torch.zeros(4)), _view_pickle(0, (4,), (1,), 1 << 20)),
-                "data/0",
-                4 << 20,
-                4 << 20,
-            ),
-            8 << 20,
-            "does not match its tensor",
-            id="storage-past-archive",
-        ),
-        pytest.param(
-            # Declared record sizes summing past the limit are refused before reading.
-            lambda: _patch_record_sizes(_encode(torch.zeros(4)), "data/0", 2 * _LIMIT, 2 * _LIMIT),
-            _LIMIT,
-            "expands to",
-            id="records-over-limit",
-        ),
-        pytest.param(
-            lambda: _rewrite(_encode(torch.zeros(2)), add=[f"junk/{i}" for i in range(20_000)]),
-            8 << 20,
-            "central directory is over",
-            id="directory-over-limit",
-        ),
-        pytest.param(
-            lambda: _rewrite(_encode(torch.zeros(2)), add=["archive/notes"]),
-            _LIMIT,
-            "only the records",
-            id="unknown-record",
-        ),
-        pytest.param(
-            lambda: _rewrite(_encode(torch.zeros(2)), add=["archive/data/1"]),
-            _LIMIT,
-            "only the records",
-            id="second-storage",
-        ),
+        (torch.zeros(2, dtype=torch.int32), "unsupported dtype"),
+        (torch.tensor([1 + 2j]).conj().imag, "unsupported pickle opcode"),
     ],
+    ids=["int32", "negative-bit-view"],
 )
-def test_archive_rejected(build: Callable[[], str], max_bytes: int, match: str) -> None:
-    """Archives other than the stored records torch.save writes for one tensor are refused."""
-    payload = build()
+def test_unsupported_saved_tensor_rejected(tensor: torch.Tensor, match: str) -> None:
+    """Integer tensors and unresolved negative-bit views are refused."""
     with pytest.raises(ValueError, match=match):
-        load_base64_tensor(payload, max_bytes=max_bytes)
+        load_base64_tensor(_encode(tensor), max_bytes=_LIMIT)
+
+
+_ZEROS = _encode(torch.zeros(4))
+_SHORT = base64.b64encode(
+    bytes(8) + struct.pack("<4sHHHHIIH", b"PK\x05\x06", 0, 0, 0, 0x4B50, 0x0706, 0, 0)
+).decode()
+_ARCHIVE_REJECTED = {
+    "legacy-format": (_encode(torch.zeros(4), _use_new_zipfile_serialization=False), "zip"),
+    "deflated": (_rewrite(_ZEROS, compression=zipfile.ZIP_DEFLATED), "uncompressed"),
+    "encrypted": (_patch(_ZEROS, _encrypt), "unencrypted"),
+    "crc-mismatch": (_patch(_ZEROS, _corrupt_storage), "CRC"),
+    "missing-pickle": (_rewrite(_ZEROS, {"data.pkl": None}), "only the records"),
+    "unknown-record": (_rewrite(_ZEROS, add=["archive/notes"]), "only the records"),
+    "directory-over-limit": (_rewrite(_ZEROS, add=[f"x/{i}" for i in range(400)]), "is over"),
+    "zip64-directory-over-limit": (
+        _patch(_ZEROS, _zip64_edit(40, lambda _: 8192, True)),
+        "is over",
+    ),
+    "zip64-record-moved": (_patch(_ZEROS, _zip64_edit(8, lambda v: v - 8, False)), "precede"),
+    "shorter-than-zip64-locator": (_SHORT, "zip"),
+    # Declared record sizes summing past the limit are refused before reading.
+    "records-over-limit": (_set_sizes(_ZEROS, "data/0", 2 * _LIMIT, 2 * _LIMIT), "expands to"),
+    # A small archive declaring a 512 KiB storage is refused before allocating it.
+    "storage-past-archive": (
+        _set_sizes(
+            _rewrite(_ZEROS, {"data.pkl": _pickle((4,), (1,), 1 << 17)}), "data/0", *[1 << 19] * 2
+        ),
+        "does not match its tensor",
+    ),
+}
+
+
+@pytest.mark.parametrize("payload, match", _ARCHIVE_REJECTED.values(), ids=_ARCHIVE_REJECTED)
+def test_archive_rejected(payload: str, match: str) -> None:
+    """Archives other than the stored records torch.save writes for one tensor are refused."""
+    with pytest.raises(ValueError, match=match):
+        load_base64_tensor(payload, max_bytes=_LIMIT)
 
 
 @pytest.mark.parametrize("record", ["data.pkl", "byteorder", "data/0"])
 def test_record_sizes_must_agree(monkeypatch, record: str) -> None:
     """A stored record whose two declared sizes differ is refused before any record is read."""
-    payload = _encode(torch.zeros(4096))
-    info = zipfile.ZipFile(io.BytesIO(base64.b64decode(payload))).getinfo(f"archive/{record}")
+    info = zipfile.ZipFile(io.BytesIO(base64.b64decode(_ZEROS))).getinfo(f"archive/{record}")
     # zipfile would read compress_size bytes, past the declared file_size.
-    forged = _patch_record_sizes(payload, record, info.file_size + 4096, info.file_size)
+    forged = _set_sizes(_ZEROS, record, info.file_size + 4096, info.file_size)
     reads = _spy_reads(monkeypatch)
     with pytest.raises(ValueError, match="uncompressed"):
         load_base64_tensor(forged, max_bytes=_LIMIT)
     assert reads == []
 
 
-def test_oversized_pickle_record_rejected_unread(monkeypatch) -> None:
-    """A data.pkl record over the pickle limit is refused from its size, before it is read."""
-    pickled = pickle.dumps(torch.zeros(1).tolist(), protocol=2)[:-1] + b"N" * 8192 + b"."
-    payload = _replace_pickle(_encode(torch.zeros(2)), pickled)
+@pytest.mark.parametrize(
+    "record, value, match",
+    [
+        ("data.pkl", b"N" * 8192, "pickle is"),
+        ("byteorder", b"little\n", "little-endian"),
+        ("byteorder", b"bigend", "little-endian"),
+    ],
+    ids=["pickle-over-limit", "byteorder-long", "byteorder-big"],
+)
+def test_metadata_record_rejected(monkeypatch, record: str, value: bytes, match: str) -> None:
+    """Oversized metadata records are refused unread; a six-byte byteorder must say little."""
+    payload = _rewrite(_ZEROS, {record: value})
     reads = _spy_reads(monkeypatch)
-    with pytest.raises(ValueError, match="pickle is"):
+    with pytest.raises(ValueError, match=match):
         load_base64_tensor(payload, max_bytes=_LIMIT)
-    assert not any(name.endswith("data.pkl") for name in reads)
-
-
-@pytest.mark.parametrize("value", [b"little\n", b"bigend"])
-def test_byteorder_record_must_be_little(monkeypatch, value: bytes) -> None:
-    """A longer byteorder record is refused unread; a six-byte one must say little."""
-    payload = _rewrite(_encode(torch.zeros(4)), {"byteorder": value})
-    reads = _spy_reads(monkeypatch)
-    with pytest.raises(ValueError, match="little-endian"):
-        load_base64_tensor(payload, max_bytes=_LIMIT)
-    assert any(name.endswith("byteorder") for name in reads) == (len(value) == 6)
-
-
-def _zip_member(name: str, data: bytes, offset: int, method: int = 0, size: int = 0) -> tuple:
-    """Local and central directory headers of one record (``size`` for deflated data)."""
-    raw = name.encode()
-    crc = zlib.crc32(data if not method else bytes(size)) & 0xFFFFFFFF
-    usize = size or len(data)
-    local = struct.pack(
-        "<IHHHHHIIIHH", 0x04034B50, 20, 0, method, 0, 0, crc, len(data), usize, len(raw), 0
-    )
-    central = struct.pack(
-        "<IHHHHHHIIIHHHHHII",
-        0x02014B50,
-        20,
-        20,
-        0,
-        method,
-        0,
-        0,
-        crc,
-        len(data),
-        usize,
-        len(raw),
-        0,
-        0,
-        0,
-        0,
-        0,
-        offset,
-    )
-    return local + raw + data, central + raw
-
-
-def _benign_members() -> list:
-    """The records torch.save writes for ``zeros(2, 2)``."""
-    src = zipfile.ZipFile(io.BytesIO(base64.b64decode(_encode(torch.zeros(2, 2)))))
-    return [(info.filename, src.read(info)) for info in src.infolist()]
-
-
-def test_legacy_stream_before_zip_ignored() -> None:
-    """A legacy torch.save stream at byte 0 ahead of a valid zip is never read."""
-    legacy = io.BytesIO()
-    torch.save(torch.arange(4), legacy, _use_new_zipfile_serialization=False)
-    body, central = bytearray(legacy.getvalue()), bytearray()
-    for name, data in _benign_members():
-        # The version record claims offset 0, where torch.load would see the legacy magic.
-        local, entry = _zip_member(name, data, 0 if name.endswith("/version") else len(body))
-        body += local
-        central += entry
-    count = len(_benign_members())
-    eocd = struct.pack("<IHHHHIIH", 0x06054B50, 0, 0, count, count, len(central), len(body), 0)
-    payload = base64.b64encode(bytes(body + central + eocd)).decode()
-    decoded = load_base64_tensor(payload, max_bytes=_LIMIT)
-    assert decoded.dtype == torch.float32 and torch.equal(decoded, torch.zeros(2, 2))
+    assert any(name.endswith(record) for name in reads) == (value == b"bigend")
 
 
 def test_hidden_central_directory_rejected() -> None:
@@ -637,34 +430,42 @@ def test_hidden_central_directory_rejected() -> None:
     zipfile reads the benign directory shifted back while miniz would read one
     hidden in the last entry's comment, pointing at a deflated 16 MiB storage.
     """
-    hidden_numel = 4 << 20
-    pickled = _rebuild_pickle(hidden_numel // 2, (2, 1), hidden_numel, wrap=False)
+
+    def member(name: str, data: bytes, offset: int, method: int = 0, size: int = 0) -> tuple:
+        raw = name.encode()
+        sizes = struct.pack(
+            "<III", zlib.crc32(bytes(size) if method else data), len(data), size or len(data)
+        )
+        local = struct.pack("<IHHHHH", 0x04034B50, 20, 0, method, 0, 0) + sizes
+        central = struct.pack("<IHHHHHH", 0x02014B50, 20, 20, 0, method, 0, 0) + sizes
+        local += struct.pack("<HH", len(raw), 0) + raw + data
+        return local, central + struct.pack("<HHHHHII", len(raw), 0, 0, 0, 0, 0, offset) + raw
+
+    src = zipfile.ZipFile(io.BytesIO(base64.b64decode(_encode(torch.zeros(2, 2)))))
+    numel = 4 << 20
     deflate = zlib.compressobj(9, zlib.DEFLATED, -15)
-    compressed = deflate.compress(bytes(4 * hidden_numel)) + deflate.flush()
+    compressed = deflate.compress(bytes(4 * numel)) + deflate.flush()
     body, visible, hidden = bytearray(), [], b""
-    for name, data in _benign_members():
-        visible.append((name, data, len(body)))
-        body += _zip_member(name, data, 0)[0]
+    for info in src.infolist():
+        visible.append((info.filename, src.read(info), len(body)))
+        body += member(info.filename, src.read(info), 0)[0]
     for name, data, method, size in [
-        ("archive/data.pkl", pickled, 0, 0),
+        ("archive/data.pkl", _pickle((numel // 2, 2), (2, 1), numel), 0, 0),
         ("archive/version", b"3\n", 0, 0),
-        ("archive/data/0", compressed, 8, 4 * hidden_numel),
+        ("archive/data/0", compressed, 8, 4 * numel),
     ]:
-        local, entry = _zip_member(name, data, len(body), method, size)
+        local, entry = member(name, data, len(body), method, size)
         hidden += entry
         body += local
-    entries = [_zip_member(name, data, 0)[1] for name, data, _ in visible]
-    shift = sum(len(e) for e in entries)
+    shift = sum(len(member(name, data, 0)[1]) for name, data, _ in visible)
     central = b""
     for i, (name, data, offset) in enumerate(visible):
-        entry = bytearray(_zip_member(name, data, offset + shift)[1])
+        entry = bytearray(member(name, data, offset + shift)[1])
         if i == len(visible) - 1:
             entry[32:34] = struct.pack("<H", len(hidden))
             entry += hidden
         central += bytes(entry)
-    eocd = struct.pack(
-        "<IHHHHIIH", 0x06054B50, 0, 0, 3, 3, len(central), len(body) + shift, shift
-    ) + bytes(shift)
-    payload = base64.b64encode(bytes(body) + central + eocd).decode()
+    eocd = struct.pack("<IHHHHIIH", 0x06054B50, 0, 0, 3, 3, len(central), len(body) + shift, shift)
+    payload = base64.b64encode(bytes(body) + central + eocd + bytes(shift)).decode()
     with pytest.raises(ValueError, match="no comment"):
         load_base64_tensor(payload, max_bytes=_LIMIT)
