@@ -244,7 +244,7 @@ def test_joint_blocks_share_the_token_tags_and_the_padding_mask(monkeypatch):
 
     monkeypatch.setattr(VanillaAttention, "forward", record)
 
-    def forward(image_embeds):
+    def forward(embeds):
         """Run the model and return the tags and the mask that its blocks passed."""
         calls.clear()
         with torch.no_grad():
@@ -254,14 +254,16 @@ def test_joint_blocks_share_the_token_tags_and_the_padding_mask(monkeypatch):
                 timestep=timestep,
                 encoder_attention_mask=text_mask,
                 encoder_hidden_states_2=text_2,
-                image_embeds=image_embeds,
+                image_embeds=embeds,
                 encoder_attention_mask_2=text_mask_2,
             )
-        tags, mask = calls[0]["token_tags"], calls[0]["key_padding_mask"]
+        passed_tags, passed_mask = calls[0]["token_tags"], calls[0]["key_padding_mask"]
         assert len(calls) == len(model.transformer_blocks)
-        assert all(c["token_tags"] is tags and c["key_padding_mask"] is mask for c in calls)
+        assert all(
+            c["token_tags"] is passed_tags and c["key_padding_mask"] is passed_mask for c in calls
+        )
         assert all(c.get("valid_seq_len") is None for c in calls)
-        return tags, mask
+        return passed_tags, passed_mask
 
     # Text to video: tag 0 on the video rows, 1 after them; the image rows hold no token.
     tags, mask = forward(torch.zeros_like(image_embeds))

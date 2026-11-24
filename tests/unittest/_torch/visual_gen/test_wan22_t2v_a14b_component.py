@@ -378,9 +378,11 @@ def test_sage_attention_loss_budget(checkpoint, dit_inputs):
     _assert_within(scores, SAGE_LOSS_BUDGET, f"{EXPERT} SageAttention vs BF16")
 
 
-def test_deco_attention_loss_budget(checkpoint, dit_inputs, require_deco_kernels):
+def test_deco_attention_loss_budget(checkpoint, dit_inputs, require_deco_kernels, monkeypatch):
     """DeCo-Attention against dense BF16 attention on the same block and inputs."""
     require_deco_kernels(DECO_RECIPE.v_dtype)
+    from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell import deco_attention
+
     weights = _block_weights(checkpoint, EXPERT)
     model = _trtllm_block(checkpoint, EXPERT, weights)
     reference = {case["name"]: _run_trtllm(model, case) for case in dit_inputs}
@@ -392,9 +394,18 @@ def test_deco_attention_loss_budget(checkpoint, dit_inputs, require_deco_kernels
         attention_config=AttentionConfig(backend="CUTEDSL", quant_attention_config=DECO_RECIPE),
     )
     _assert_attention_backend(model, "CUTEDSL", DECO_RECIPE)
+    prepare, calls = deco_attention.prepare, []
+
+    def recording(q, *args, **kwargs):
+        calls.append(tuple(q.shape))
+        return prepare(q, *args, **kwargs)
+
+    monkeypatch.setattr(deco_attention, "prepare", recording)
     scores = _score(lambda case: _run_trtllm(model, case), dit_inputs, reference)
-    state = model.blocks[0].attn1.attn._metadata_state
-    assert state.get("deco_workspace") is not None, "The DeCo-Attention kernels did not run"
+    # The self-attention of every block reaches the DeCo kernels once per case.
+    assert len(calls) == len(dit_inputs) * len(model.blocks), (
+        f"Expected one DeCo-Attention kernel call per case and block, found {calls}"
+    )
     _assert_within(scores, DECO_LOSS_BUDGET, f"{EXPERT} DeCo-Attention vs BF16")
 
 

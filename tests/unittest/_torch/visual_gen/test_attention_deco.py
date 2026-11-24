@@ -18,6 +18,7 @@
 and fails it when the kernel package does not import.
 """
 
+import importlib
 import itertools
 import multiprocessing
 
@@ -35,6 +36,7 @@ from tensorrt_llm._torch.visual_gen.attention.backends.cute_dsl import DeCoAtten
 from tensorrt_llm._torch.visual_gen.attention.backends.cute_dsl import deco as deco_backend
 from tensorrt_llm._torch.visual_gen.attention.backends.utils import get_padding_support
 from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell import deco_attention
+from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell.deco_attention.runtime import num_sms
 from tensorrt_llm.visual_gen.args import AttentionConfig, QuantAttentionConfig
 
 HEAD_DIM = 128
@@ -143,6 +145,41 @@ def _assert_follows_the_scores(
     ref = _sdpa(q, k, v)
     uniform_weights = v.float().mean(dim=1, keepdim=True).expand_as(ref)
     assert _relative_error(out, ref) < max(0.5 * _relative_error(uniform_weights, ref), 0.02)
+
+
+def _split_plan(kernel: str):
+    """Return ``split_plan`` of a kernel package of the GPU's family, such as ``tcgen05.fp8pv``."""
+    return importlib.import_module(f"{deco_attention.__name__}.{kernel}.launch").split_plan
+
+
+def _multi_launch_call(device: torch.device, v_dtype: str = "fp8") -> tuple[int, int, int, int]:
+    """Return (batch, rows, heads, valid rows) of a call sized from the SM count of the device.
+
+    Its plan, asserted from ``split_plan`` of the kernels:
+
+    * tcgen05: two waves of whole units in the main launch and a tail in the split launch. The
+      valid rows end in the first tail unit, so the tail has units without a valid query and
+      pieces without a valid key.
+    * SM120: whole units and a split tail in the attention launch, and more (batch, head) pairs
+      than a quarter of the SMs, so the V pass of the preparation is a launch of its own. The
+      valid rows end in the first key half of the sequence.
+    """
+    sms = num_sms(device)
+    if deco_attention.target.kernel_family() == "tcgen05":
+        seq_len, num_heads = 256 * (sms // 4 + 1), 8
+        plan = _split_plan("tcgen05.fp8pv")(seq_len, num_heads, 1, sms)
+        units, main_units, pieces = plan
+        assert main_units >= 2 * sms and units > main_units and pieces > 1, (plan, sms)
+        return 1, seq_len, num_heads, seq_len - 256 * (units - main_units) + 100
+    seq_len, num_heads = 3072, sms // 4 + 1
+    tiles = seq_len // 128
+    if v_dtype == "fp8":
+        plan = _split_plan("sm120.fp8pv")(tiles * num_heads, tiles, sms)
+    else:
+        plan = _split_plan("sm120.nvfp4pv")(1, seq_len, num_heads, sms)
+    whole_units, split_units, _ = plan
+    assert whole_units > 0 and split_units > 0 and 4 * num_heads > sms, (plan, sms)
+    return 1, seq_len, num_heads, seq_len // 2 - 156
 
 
 def test_deco_selection() -> None:
@@ -295,6 +332,30 @@ def test_deco_forward_matches_sdpa(
     assert torch.equal(attn.forward(q, k, v), out)
 
 
+@pytest.mark.parametrize("v_dtype", V_DTYPES)
+@pytest.mark.parametrize("with_lengths", [False, True], ids=["full", "lengths"])
+def test_deco_whole_units_and_split_tail_follow_the_scores(
+    require_deco_kernels, v_dtype: str, with_lengths: bool
+) -> None:
+    """A call whose plan has whole units and a split tail (``_multi_launch_call``) follows the
+    scores, with and without valid lengths, and a second call returns the same bits."""
+    device = require_deco_kernels(v_dtype)
+    batch_size, seq_len, num_heads, valid_seq_len = _multi_launch_call(device, v_dtype)
+    q, k, v = _random_qkv(batch_size, seq_len, num_heads, device, q_scale=4.0)
+    lens = None
+    if with_lengths:
+        lens = torch.tensor([valid_seq_len], dtype=torch.int32, device=device)
+    else:
+        valid_seq_len = seq_len
+
+    out = _kernels(q, k, v, v_dtype, valid_seq_lens=lens)
+
+    assert not out[:, valid_seq_len:].any()
+    tokens = slice(valid_seq_len)
+    _assert_follows_the_scores(out[:, tokens], q[:, tokens], k[:, tokens], v[:, tokens])
+    assert torch.equal(_kernels(q, k, v, v_dtype, valid_seq_lens=lens), out)
+
+
 def test_deco_rank_64_follows_the_scores(require_deco_kernels) -> None:
     """Rank 64 doubles the compensation channels and runs its own QK kernel where the GPU
     offers it."""
@@ -322,29 +383,39 @@ def test_deco_large_caller_draw_follows_the_scores(require_deco_kernels) -> None
     assert not torch.equal(out, out_other)
 
 
+def _run_on_two_streams(device: torch.device, shape: tuple[int, int, int]) -> None:
+    """Run two calls of a shape on two streams, four rounds, and compare with the calls alone."""
+    calls = [_random_qkv(*shape, device, seed=seed) for seed in (0, 1)]
+    expected = [_kernels(q, k, v) for q, k, v in calls]
+    num_bytes = deco_attention.workspace_size(*shape, device, "fp8")
+    workspaces = [torch.empty(num_bytes, dtype=torch.uint8, device=device) for _ in calls]
+    rounds = 4
+    outs = [[torch.full_like(q, float("nan")) for q, _, _ in calls] for _ in range(rounds)]
+    streams = [torch.cuda.Stream(device=device) for _ in calls]
+    # The inputs and the NaN fills are on the current stream: both streams wait for them.
+    for stream in streams:
+        stream.wait_stream(torch.cuda.current_stream(device))
+    for round_outs in outs:
+        for stream, (q, k, v), workspace, out in zip(streams, calls, workspaces, round_outs):
+            with torch.cuda.stream(stream):
+                deco_attention.attention(deco_attention.prepare(q, k, v, workspace, "fp8"), out)
+    torch.cuda.synchronize(device)
+    for round_outs in outs:
+        for out, want in zip(round_outs, expected):
+            assert torch.equal(out, want), f"{shape}: the output differs from the call alone"
+
+
 def _two_stream_rounds(device_index: int, result) -> None:
-    """Run two preparations on two streams, four rounds, and send True or the failure text."""
+    """Run the two-stream rounds of every shape and send True or the failure text."""
     try:
         device = torch.device("cuda", device_index)
         torch.cuda.set_device(device)
-        calls = [_random_qkv(1, 16384, 4, device, seed=seed) for seed in (0, 1)]
-        expected = [_kernels(q, k, v) for q, k, v in calls]
-        num_bytes = deco_attention.workspace_size(1, 16384, 4, device, "fp8")
-        workspaces = [torch.empty(num_bytes, dtype=torch.uint8, device=device) for _ in calls]
-        rounds = 4
-        outs = [[torch.full_like(q, float("nan")) for q, _, _ in calls] for _ in range(rounds)]
-        streams = [torch.cuda.Stream(device=device) for _ in calls]
-        # The inputs and the NaN fills are on the current stream: both streams wait for them.
-        for stream in streams:
-            stream.wait_stream(torch.cuda.current_stream(device))
-        for round_outs in outs:
-            for stream, (q, k, v), workspace, out in zip(streams, calls, workspaces, round_outs):
-                with torch.cuda.stream(stream):
-                    deco_attention.attention(deco_attention.prepare(q, k, v, workspace, "fp8"), out)
-        torch.cuda.synchronize(device)
-        for round_outs in outs:
-            for out, want in zip(round_outs, expected):
-                assert torch.equal(out, want)
+        shapes = [(1, 16384, 4)]
+        if deco_attention.target.kernel_family() == "tcgen05":
+            # The tail of this shape runs in the split launch, whose pieces merge.
+            shapes.append(_multi_launch_call(device)[:3])
+        for shape in shapes:
+            _run_on_two_streams(device, shape)
         result.send(True)
     except Exception as error:  # noqa: BLE001 - the child reports to the test process
         result.send(f"{type(error).__name__}: {error}")
@@ -353,8 +424,10 @@ def _two_stream_rounds(device_index: int, result) -> None:
 def test_deco_preparations_on_two_streams_finish(require_deco_kernels) -> None:
     """Two calls with workspaces of their own run their preparations side by side on two
     streams and come back as alone: no CTA of a launch waits for another CTA of its grid, so
-    the launches need not be resident together. The rounds run in a child process that a hang
-    cannot leave stuck on the device: the test kills it on the timeout."""
+    the launches need not be resident together. On the tcgen05 kernels a second shape adds the
+    split launch, whose pieces merge next to the launches of the other stream. The rounds run
+    in a child process that a hang cannot leave stuck on the device: the test kills it on the
+    timeout."""
     device = require_deco_kernels()
     context = multiprocessing.get_context("spawn")
     result, child_end = context.Pipe(duplex=False)
@@ -792,15 +865,9 @@ def test_deco_sm120_nvfp4_split_units_merge_a_padded_half(require_deco_kernels) 
     they do not fill the SMs; with a valid length in the second half the merged output of the
     valid rows follows FP32 SDPA, the padded rows are zero, and a second call on the same
     workspace returns the same bits."""
-    from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell.deco_attention.runtime import (
-        num_sms,
-    )
-    from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell.deco_attention.sm120.nvfp4pv.launch import (  # noqa: E501
-        split_plan,
-    )
-
     device = require_deco_kernels("nvfp4")
     seq_len, valid_seq_len, num_heads = 3200, 2049, 1
+    split_plan = _split_plan("sm120.nvfp4pv")
     full_units, split_units, split_tile = split_plan(1, seq_len, num_heads, num_sms(device))
     # The split units are the last query tiles: the first of them starts below the valid length, and the valid
     # keys reach past the split point, so the merge of a valid query tile has two non-empty halves.

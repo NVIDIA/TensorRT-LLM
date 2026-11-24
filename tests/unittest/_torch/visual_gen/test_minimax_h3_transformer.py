@@ -536,12 +536,14 @@ def test_blocks_share_the_token_tags_and_the_padding_mask(monkeypatch) -> None:
             inputs["token_tags"] = token_tags
         with torch.inference_mode():
             model(**inputs)
-        tags, mask = calls[0]["token_tags"], calls[0]["key_padding_mask"]
+        passed_tags, passed_mask = calls[0]["token_tags"], calls[0]["key_padding_mask"]
         assert len(calls) == len(model.transformer_blocks)
-        assert all(c["token_tags"] is tags and c["key_padding_mask"] is mask for c in calls)
+        assert all(
+            c["token_tags"] is passed_tags and c["key_padding_mask"] is passed_mask for c in calls
+        )
         assert all(c.get("valid_seq_len") is None for c in calls)
-        assert torch.equal(tags, inputs["token_tags"])
-        return tags, mask
+        assert torch.equal(passed_tags, inputs["token_tags"])
+        return passed_tags, passed_mask
 
     tags, mask = forward()
     assert mask is None
@@ -1668,6 +1670,7 @@ def test_ulysses_forward_aligns_metadata_and_unpads_outputs(
         model._attn_backend = backend
         model._supports_key_padding_mask = backend != "TRTLLM"
         model._supports_valid_seq_len = backend == "TRTLLM"
+        model._requires_trailing_padding = backend == "TRTLLM"
         model.sharder = RankSharder()
         model.transformer_blocks = nn.ModuleList([CaptureBlock()])
         handle = model.norm_out.register_forward_pre_hook(check_norm_indices)
