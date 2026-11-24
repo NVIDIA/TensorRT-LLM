@@ -51,6 +51,22 @@ def test_blocks_match_tgv_on_the_packed_weight(m, tactic, rows):
         off += r
 
 
+def test_odd_tile_count_2cta():
+    """A 2-CTA launch rounds an odd tile count up by one CTA, whose tile lands in the scratch block; that CTA
+    joins its pair's teardown, so the launches complete."""
+    k = 7168
+    rows = (896, 3520)  # 14 + 55 tiles of 64 weight rows
+    torch.manual_seed(sum(rows))
+    weight = (torch.randn(sum(rows), k, device="cuda") * 0.02).to(torch.bfloat16)
+    x = torch.randn(8, k, device="cuda").to(torch.bfloat16)
+    for _ in range(16):
+        outs = mo.multi_out_linear(x, weight, rows, (torch.float32, torch.bfloat16), 21, True)
+    torch.cuda.synchronize()
+    ref = x.float() @ weight.float().t()
+    torch.testing.assert_close(outs[0], ref[:, :896], rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(outs[1].float(), ref[:, 896:], rtol=2e-2, atol=2e-2)
+
+
 def test_unserved_operands():
     k = 7168
     w = torch.zeros(896 + 3584, k, device="cuda", dtype=torch.bfloat16)

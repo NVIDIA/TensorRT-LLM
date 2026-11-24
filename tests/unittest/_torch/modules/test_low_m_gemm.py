@@ -140,16 +140,16 @@ def _fake_kernels(monkeypatch):
     )
 
     def tgv_module():
+        # kernels/blackwell/tgv_gemm: the pair-synchronized TGV kernel the "tgv" rows run on.
         module = MagicMock()
-        module.run_tgv_cute_ext = lambda a, b, bias, out, pdl, tactic: (
-            calls.append(("tgv", tactic)) or out
-        )
+        module.tactic_config = lambda tactic: ("tgv", tactic)
+        module.run_tgv = lambda a, w_t, out, pdl, cfg: calls.append(cfg) or out
         return module
 
     monkeypatch.setitem(
         sys.modules, "flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk", splitk_module()
     )
-    monkeypatch.setitem(sys.modules, "flashinfer.gemm.kernels.tgv_gemm_cute_ext", tgv_module())
+    monkeypatch.setitem(sys.modules, "tensorrt_llm._torch.kernels.blackwell.tgv_gemm", tgv_module())
     monkeypatch.setattr(_mod, "_current_sm", lambda device: 103)
     return calls
 
