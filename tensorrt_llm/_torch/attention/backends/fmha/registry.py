@@ -98,12 +98,12 @@ def get_enabled_fmha_lib_classes(
     use_fmha_libs_env: bool = True,
     prepended_fmha_lib_classes: Sequence[FmhaCls] = (),
 ) -> list[FmhaCls]:
-    """Resolve ordered candidates and apply environment overrides.
+    """Resolve ordered candidates and apply environment overrides to the base list.
 
     Args:
         fmha_libs: Registered names and classes. None selects the default list.
         use_fmha_libs_env: Apply deltas or an exact list from TLLM_FMHA_LIBS.
-        prepended_fmha_lib_classes: Model classes to place before the base candidates.
+        prepended_fmha_lib_classes: Legacy model classes to try before the resolved base list.
     """
     entries = _parse_fmha_libs_env() if use_fmha_libs_env else ()
     return _resolve_fmha_lib_classes(fmha_libs, entries, prepended_fmha_lib_classes)
@@ -120,22 +120,23 @@ def _resolve_fmha_lib_classes(
             raise ValueError(f"Unknown FMHA library {name!r} in TLLM_FMHA_LIBS.")
         entries.append((sign, FMHA_LIBS[name]))
     if entries and not entries[0][0]:
-        return list(dict.fromkeys(cls for _, cls in entries))
+        resolved = [cls for _, cls in entries]
+    else:
+        candidates = DEFAULT_FMHA_LIBS if fmha_libs is None else fmha_libs
+        classes = [_get_fmha_lib_class(lib) if isinstance(lib, str) else lib for lib in candidates]
+        additions: dict[FmhaCls, None] = {}
+        excluded: set[FmhaCls] = set()
+        for sign, cls in entries:
+            if sign == "+":
+                excluded.discard(cls)
+                additions[cls] = None
+            else:
+                additions.pop(cls, None)
+                excluded.add(cls)
 
-    candidates = DEFAULT_FMHA_LIBS if fmha_libs is None else fmha_libs
-    classes = [_get_fmha_lib_class(lib) if isinstance(lib, str) else lib for lib in candidates]
-    additions: dict[FmhaCls, None] = {}
-    excluded: set[FmhaCls] = set()
-    for sign, cls in entries:
-        if sign == "+":
-            excluded.discard(cls)
-            additions[cls] = None
-        else:
-            additions.pop(cls, None)
-            excluded.add(cls)
+        resolved = [cls for cls in (*additions, *classes) if cls not in excluded]
 
-    ordered = dict.fromkeys((*additions, *prepended_fmha_lib_classes, *classes))
-    return [cls for cls in ordered if cls not in excluded]
+    return list(dict.fromkeys((*prepended_fmha_lib_classes, *resolved)))
 
 
 @functools.lru_cache(maxsize=8)

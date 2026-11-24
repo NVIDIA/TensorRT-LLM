@@ -547,12 +547,17 @@ environment variable is parsed. The name is visible process-wide after
 import. Keep its availability and support checks aligned with the model's
 requirements.
 
+Use `fmha_libs` for new Modeling V2 targets that customize FMHA selection.
+`prepended_fmha_lib_classes` remains available to existing targets during
+migration. The legacy hook will be removed after those targets move to
+`fmha_libs`.
+
 Pass `fmha_libs` to `create_attention()` or `TrtllmAttention` to supply the
 layer's complete ordered base list. Its entries are names registered with
 `@fmha_lib("name")` or FMHA classes that accept the owning attention in their
 constructor. `None` selects the defaults, while `[]` selects an empty base
-list. The resolver places any model classes in
-`prepended_fmha_lib_classes` before the base list.
+list. The resolver places legacy `prepended_fmha_lib_classes` before the
+resolved base candidates and keeps the first occurrence of each class.
 For dense FP4 MLA, an explicit list must include a library that can serve the
 FP8 context path. The temporary FP8 attention view uses the same list and
 checks availability for its own KV cache type.
@@ -594,16 +599,15 @@ with the native `AttentionOp` input requirements.
 ##### 3.2.2.1 Selection order (`TLLM_FMHA_LIBS`)
 
 `TLLM_FMHA_LIBS` accepts an exact list of registered names in selection order
-or a list of `+name` and `-name` entries. An exact list replaces the layer's
-entire candidate list, including any anonymous classes. In a signed list,
-`+name` moves or adds the corresponding class to the front in the order
-written, and `-name` removes it. The last operation for a name determines
-whether it is included. The environment variable addresses only registered
-names. The resolver applies these overrides to the combined model prepend
-and base list, then deduplicates by class. A signed list therefore orders
-environment additions first, then model prepends, then the remaining base
-candidates. Set `use_fmha_libs_env=False` to skip these candidate-list
-overrides for a layer. Shared metadata still reads the global setting.
+or a list of `+name` and `-name` entries. An exact list replaces the base
+candidates, including any anonymous classes supplied through `fmha_libs`.
+In a signed list, `+name` moves or adds the class to the front of the base
+candidates in the order written, and `-name` removes it from those candidates.
+The last operation for a name determines whether it is included.
+These overrides apply only to the base candidates. Legacy
+`prepended_fmha_lib_classes` remain first in either mode.
+Set `use_fmha_libs_env=False` to skip the candidate-list overrides for a layer.
+Shared metadata still reads the global setting.
 
 The default candidate list places dense PrimTS ahead of CuTe DSL MLA. Its
 default performance policy considers only supported MLA generation on SM107.

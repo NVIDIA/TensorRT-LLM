@@ -1229,9 +1229,13 @@ def test_manager_without_prepended_libraries_builds_the_registry_list(declared: 
     ("fmha_libs", "env", "use_env", "expected"),
     [
         pytest.param(None, "", True, ["model", "first", "second"], id="prepend-before-defaults"),
-        pytest.param(None, "+second", True, ["second", "model", "first"], id="env-before-prepend"),
-        pytest.param(None, "-model", True, ["first", "second"], id="env-removes-prepend"),
-        pytest.param(None, "first", True, ["first"], id="exact-env-replaces-prepend"),
+        pytest.param(
+            None, "+second", True, ["model", "second", "first"], id="prepend-before-env-addition"
+        ),
+        pytest.param(
+            ["model", "second"], "-model", True, ["model", "second"], id="env-removal-keeps-prepend"
+        ),
+        pytest.param(None, "first", True, ["model", "first"], id="exact-env-keeps-prepend"),
         pytest.param(["second", "model"], "", True, ["model", "second"], id="explicit-dedup"),
         pytest.param([], "", True, ["model"], id="empty-base"),
         pytest.param(None, "first", False, ["model", "first", "second"], id="env-disabled"),
@@ -1262,7 +1266,7 @@ def test_manager_resolves_prepended_library_priority(
     ("env", "expected"),
     [
         pytest.param("-first", ["anonymous", "second"], id="signed-keeps-anonymous-prepend"),
-        pytest.param("second", ["second"], id="exact-replaces-anonymous-prepend"),
+        pytest.param("second", ["anonymous", "second"], id="exact-keeps-anonymous-prepend"),
     ],
 )
 def test_manager_env_override_with_anonymous_prepend(
