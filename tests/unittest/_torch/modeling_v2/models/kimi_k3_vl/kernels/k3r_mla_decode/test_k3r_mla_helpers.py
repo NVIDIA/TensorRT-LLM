@@ -41,7 +41,5 @@ def test_copy_is_recorded_in_source_json():
     entry = json.loads((_FAMILY / "kernels/SOURCE.json").read_text())["files"][
         "kernels/k3r_mla_decode/mla_helpers.py"
     ]
-    assert entry["source"].startswith(
-        "tensorrt_llm/_torch/attention/kernels/blackwell/mla/mla_helpers.py@"
-    )
+    assert entry["source"] == "tensorrt_llm/_torch/attention/kernels/blackwell/mla/mla_helpers.py"
     assert entry["import_edits"] == [] and entry["local_edits"] == []

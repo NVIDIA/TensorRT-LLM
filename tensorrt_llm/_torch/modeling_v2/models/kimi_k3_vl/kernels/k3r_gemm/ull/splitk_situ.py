@@ -1,5 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # TensorRT-LLM local change: update imports for the Kimi K3 family layout.
 """Shared-expert gate/up split-K GEMM with SiTU in its epilogue (one kernel instead of
 gate/up -> SiTU, so the down GEMM depends on the GEMM directly).

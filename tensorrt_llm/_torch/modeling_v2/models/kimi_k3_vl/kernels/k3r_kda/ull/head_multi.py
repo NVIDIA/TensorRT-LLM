@@ -1,5 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # TensorRT-LLM local change: update imports for the Kimi K3 family layout.
 """KDA input projection and spec verify recurrence in one kernel for ``requests`` x
 ``tokens`` verify rows (Rubin TP16; M16 = 2 requests x 8, M8 = 2 requests x 4):

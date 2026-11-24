@@ -127,6 +127,13 @@ Copyright 2022 Hugging Face
 Licensed under the Apache License 2.0
 
 --------------------------------------------------------------------------------
+tokenspeed-mla
+--------------------------------------------------------------------------------
+Original Source: https://github.com/lightseekorg/tokenspeed/tree/75db6170844e04351ab4ff6228e6f2dd411d67f3/tokenspeed-mla
+Copyright (c) 2026 LightSeek Foundation <contact@lightseek.org>
+Licensed under the MIT License
+
+--------------------------------------------------------------------------------
 Transformers
 --------------------------------------------------------------------------------
 Original Source: https://github.com/huggingface/transformers

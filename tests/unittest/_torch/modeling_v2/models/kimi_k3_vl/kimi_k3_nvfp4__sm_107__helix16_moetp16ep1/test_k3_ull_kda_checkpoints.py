@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""KDA checkpoint layout, MR8 flat views, seed / commit and slot indices on CPU tensors."""
+"""KDA checkpoint layout, ULL decode flat views, seed / commit and slot indices on CPU tensors."""
 
 import importlib.util
 import sys

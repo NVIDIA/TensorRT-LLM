@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Stand-in for ``vllm.envs``: the switches the vendored MR8 decode code reads, at their defaults."""
+"""Stand-in for ``vllm.envs``: the switches the specialized Kimi K3 decode code reads, at their defaults."""
 
 VLLM_KIMI_K3_AUX_ATTN_RES_STREAM = False
 VLLM_KIMI_K3_DS_LPC = False

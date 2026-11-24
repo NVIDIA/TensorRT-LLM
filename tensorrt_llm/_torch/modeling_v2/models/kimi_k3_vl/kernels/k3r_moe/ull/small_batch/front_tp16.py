@@ -1,5 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # TensorRT-LLM local change: update imports for the Kimi K3 family layout.
 """TP16 SM placement probe for the MoE front."""
 

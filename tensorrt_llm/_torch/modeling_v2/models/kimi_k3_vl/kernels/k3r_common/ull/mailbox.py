@@ -1,5 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Lamport mailboxes: BF16 rows published in 16-byte fragments; a reader polls until no
 fragment holds the -0.0 sentinel, then re-arms."""
 

@@ -1,5 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # TensorRT-LLM local change: update imports for the Kimi K3 family layout.
 """O-projection all-reduce consumer (``groups`` 128-thread groups poll disjoint
 rank slots, group 0 sums in rank order into the AttnRes) and TP16 fused producer +

@@ -4,7 +4,7 @@
 
 :class:`K3UllCacheManager` is the runtime's ``KimiK3HybridCacheManager`` (FP4 MLA latent
 cache composed into the KV cache manager V2, a standalone drafter's layers appended to it) with
-the KDA states kept in checkpoint mode for the MR8 KDA kernels: one ``kda_ckpt`` buffer per
+the KDA states kept in checkpoint mode for the ULL decode KDA kernels: one ``kda_ckpt`` buffer per
 layer and state slot holding a recurrent state for every verify position and an extended conv
 page (layout: :mod:`._kda_checkpoints`), read at the slot's accepted-draft count of the last
 verify. The live SSM / conv pools stay the persistent and transferred state:
@@ -42,11 +42,11 @@ local KDA layer, as for ``mamba_layer_cache``):
     True once the checkpoint pools are bound.
 ``manager.kda_checkpoint_views(layer_idx) -> K3UllKdaKernelViews(state_flat, conv_flat,
 unit_bytes)``
-    The layer's MR8 flat views: ``state_flat`` [rows, H, V, K] in the SSM state dtype,
+    The layer's ULL decode flat views: ``state_flat`` [rows, H, V, K] in the SSM state dtype,
     ``conv_flat`` [conv_rows, 3 * H * K, W - 1 + num_spec] BF16, both with a row stride of
     ``unit_bytes`` bytes. Fixed addresses for the manager's lifetime.
 ``manager.kda_kernel_caches(layer_idx) -> list[Tensor]``
-    ``[conv_flat, state_flat]``, the order the MR8 KDA providers take as ``kv_cache``.
+    ``[conv_flat, state_flat]``, the order the ULL decode KDA providers take as ``kv_cache``.
 ``manager.checkpoint_indices(state_indices, out_slots=None, out_accepted=None) ->
 (slots, accepted)``
     For the requests whose manager slots are ``state_indices`` [n] (``mamba_metadata``'s
@@ -239,7 +239,7 @@ class K3UllKdaLayerCache(KDAReplayLayerCache):
     kda_ckpt: torch.Tensor | None = None
     # [slots, conv_dim, W - 1 + num_spec] BF16 raw convolution inputs, dimension-first.
     kda_vconv: torch.Tensor | None = None
-    # ``[conv_flat, state_flat]``: the MR8 kernel views of the same storage.
+    # ``[conv_flat, state_flat]``: the ULL decode kernel views of the same storage.
     kda_ckpt_kernel_caches: tuple[torch.Tensor, torch.Tensor] | None = None
 
     @property
@@ -515,7 +515,7 @@ class K3UllKdaCheckpointState(KDAReplayState):
 
 
 class K3UllKdaKernelViews(NamedTuple):
-    """One KDA layer's MR8 flat views (see :meth:`K3UllCacheManager.kda_checkpoint_views`)."""
+    """One KDA layer's ULL decode flat views (see :meth:`K3UllCacheManager.kda_checkpoint_views`)."""
 
     state_flat: torch.Tensor
     conv_flat: torch.Tensor
@@ -666,7 +666,7 @@ class K3UllCacheManager(KimiK3HybridCacheManager):
         return replay
 
     def kda_checkpoint_views(self, layer_idx: int) -> K3UllKdaKernelViews:
-        """The MR8 flat views of KDA layer ``layer_idx`` (global id)."""
+        """The ULL decode flat views of KDA layer ``layer_idx`` (global id)."""
         replay = self._checkpoint_state()
         views = replay.checkpoint_views[self.mamba_layer_offsets[layer_idx]]
         return K3UllKdaKernelViews(views.state_flat, views.conv_flat, views.unit_bytes)
@@ -697,7 +697,7 @@ class K3UllCacheManager(KimiK3HybridCacheManager):
 
 
 class K3UllKdaState:
-    """The MR8 chain's KDA state in a :class:`K3UllCacheManager`.
+    """The ULL decode chain's KDA state in a :class:`K3UllCacheManager`.
 
     ``caches(layer)``: ``[conv_flat, state_flat]`` of the layer (fixed addresses, bound before
     capture). ``indices(state_indices, slots, accepted)``: the step's ``spec_state_indices_tensor``

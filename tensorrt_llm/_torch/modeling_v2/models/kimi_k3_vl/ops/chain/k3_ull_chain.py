@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The Helix16 ULL MR8 chain and its rank-local checkpoint views."""
+"""The Helix16 ULL decode chain and its rank-local checkpoint views."""
 
 from __future__ import annotations
 
@@ -991,7 +991,7 @@ class NvScratch:
     """The MoE layers' shared experts workspace, route mailbox and plan buffer (one device)."""
 
     def __init__(self, device):
-        from ...kernels.k3r_moe.ull import experts as mr8_experts
+        from ...kernels.k3r_moe.ull import experts as mxfp4_experts
 
         rt = _runtime()
         self.device = torch.device(device)
@@ -999,9 +999,9 @@ class NvScratch:
         buffers = rt.scratch(self.device, self.slots)
         self.workspace = buffers["workspace"]
         self.routes = rt.route_mailbox(self.workspace, self.slots)
-        # SharedFront compiles its routing for MR8's plan size; the NVFP4 image / plan are smaller
+        # SharedFront compiles its routing for the MXFP4 experts' plan size; the NVFP4 image / plan are smaller
         # and start at the same base.
-        size = max(mr8_experts.PLAN_BYTES, rt.nv.PLAN_BYTES)
+        size = max(mxfp4_experts.PLAN_BYTES, rt.nv.PLAN_BYTES)
         self.plan = torch.zeros(size, dtype=torch.uint8, device=device)
         self.image = self.plan[: rt.nv.IMAGE_BYTES]
         self.rows = self.plan[: rt.nv.PLAN_BYTES]
@@ -1243,12 +1243,12 @@ def plan_chain(layers: Sequence[Tuple[int, int]]) -> ChainPlan:
 
 
 # ---------------------------------------------------------------------------------------------
-# Attribute views of the containers (what MR8's Prepared* classes read; no tensor copied)
+# Attribute views of the containers (what the specialized decode chain's Prepared* classes read; no tensor copied)
 # ---------------------------------------------------------------------------------------------
 
 
 def _attention_view(w: KdaWeights, config: ChainConfig):
-    """``KimiK3DeltaAttention``'s attributes MR8's KDA providers read, over ``w``."""
+    """``KimiK3DeltaAttention``'s attributes the specialized decode chain's KDA providers read, over ``w``."""
     heads = HEADS // w.tp
     name = f"model.layers.{w.layer}.self_attn"
     return NS(
@@ -1270,7 +1270,7 @@ def _attention_view(w: KdaWeights, config: ChainConfig):
 
 
 def _moe_view(w: MoeWeights, config: ChainConfig):
-    """``KimiMoE``'s attributes MR8's MoE providers read, over ``w``."""
+    """``KimiMoE``'s attributes the specialized decode chain's MoE providers read, over ``w``."""
     eps = config.rms_norm_eps
     return NS(
         prefix=f"model.layers.{w.layer}.mlp",
@@ -1286,7 +1286,7 @@ def _moe_view(w: MoeWeights, config: ChainConfig):
 
 
 def _decoder_view(layer: ChainLayerWeights, attention, mlp):
-    """A decoder layer as MR8's providers read it: its AttnRes sites, attention and MoE."""
+    """A decoder layer as the specialized decode chain's providers read it: its AttnRes sites, attention and MoE."""
     a = layer.attn_res
     return NS(
         layer_idx=layer.layer,
@@ -1307,7 +1307,7 @@ def _decoder_view(layer: ChainLayerWeights, attention, mlp):
 
 
 class _Kernels:
-    """The MR8 modules the chain builds from (imported on first use: they need CUTLASS)."""
+    """The ULL decode modules the chain builds from (imported on first use: they need CUTLASS)."""
 
     def __init__(self):
         # isort: off
@@ -1350,7 +1350,7 @@ class _DecodeState:
             raise ValueError(
                 f"chain rows {tuple(rows)}: whole q{q} requests up to {p.PREPARED_MAX}"
             )
-        # MR8's tuned providers serve every batch up to 8 and 16 / 32 / 64, plus the verify rows.
+        # Tuned providers cover batches up to 8, plus 16 / 32 / 64 and the verify rows.
         self.tuned = tuple(sorted({*p.BATCHES, *verify}))
         self.q = q
         self.batches = self.tuned
@@ -1365,7 +1365,7 @@ class _DecodeState:
 
 
 class SoloKda:
-    """MR8's KDA in-projection + core of one KDA layer outside the chain, without its
+    """KDA in-projection and core for one layer outside the decode chain, without its
     o-projection: ``run`` returns the core rows (``[rows, 768]`` BF16, after the gated norm) for
     the model's o-projection. The kernels a chained layer runs at the verify shapes ``rows``
     (``q`` tokens per request): on Rubin TP16 with a BF16 state the ``HEAD_BATCHES`` /
@@ -1441,8 +1441,9 @@ class K3UllChain:
     ``_chain_weights.load_chain_weights``'s, this rank's (it must hold every layer of ``layers``
     on the chain, the next layer's AttnRes vectors of each and the solo layers' KDA weights).
     ``rows``: the step rows (requests x ``q``) served; ``solo``: KDA layers off the chain whose
-    in-projection + core also run on MR8's kernels (:meth:`run_solo`); ``tap_mix``: the DSpark taps
-    store the pre-norm AttnRes mixture (else the updated prefix); ``kda_state``: the cache
+    in-projection + core also run on the specialized decode chain's kernels (:meth:`run_solo`);
+    ``tap_mix``: the DSpark taps store the pre-norm AttnRes mixture (else the updated prefix);
+    ``kda_state``: the cache
     manager's checkpoints (:class:`KdaCheckpointState`, bound here); ``nv_force``: run the NVFP4
     routed experts' Rubin engines on another device (GB300)."""
 
@@ -1842,7 +1843,7 @@ class K3UllChain:
         )
 
     def effect_ok(self) -> Tuple[bool, str]:
-        """Rubin (10.7): MR8's TP16 B8 q8 deployment path (KdaHeadVerify, fused o-projection,
+        """Rubin (10.7): the specialized decode chain's TP16 B8 q8 deployment path (KdaHeadVerify, fused o-projection,
         NVFP4 image8 experts) at 8 rows, the solo layers' KdaHeadVerify too; elsewhere always true
         (GB300 runs its own tables)."""
         if torch.cuda.get_device_capability(self.device) != (10, 7):

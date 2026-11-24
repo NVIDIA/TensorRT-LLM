@@ -1,5 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # TensorRT-LLM local change: update imports for the Kimi K3 family layout.
 """Clustered MoE tail (TP8 B1..4, TP16 B1..8): routed finalization/publication,
 all-reduce, RMS tree, K-split up projection, shared reduce-scatter and output multicast.

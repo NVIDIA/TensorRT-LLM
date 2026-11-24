@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Stand-ins for the ``vllm`` names the vendored MR8 decode code imports.
+"""Stand-ins for the ``vllm`` names the specialized Kimi K3 decode code imports.
 
 One section per ``vllm`` module the code imports (``_compat_envs`` and ``_compat_custom_ops``
 stand in for ``vllm.envs`` and ``vllm._custom_ops``, which the code imports as modules):

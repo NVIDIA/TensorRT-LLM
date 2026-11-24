@@ -1,6 +1,6 @@
 {
   "area": "boundary",
-  "scope": "GEN step outside the MR8 chain: step prep, layer 0 (MR8 solo KDA, KDA o_proj push + Lamport finish, Dense0), the chain entry mix, the MLA layers' input hand-off / post-attention mix / prefetch forks, the final join, the decoder loop.",
+  "scope": "GEN step outside the ULL decode chain: step prep, layer 0 (standalone KDA, KDA o_proj push + Lamport finish, Dense0), the chain entry mix, the MLA layers' input hand-off / post-attention mix / prefetch forks, the final join, the decoder loop.",
   "source_commit": "6904cd9672",
   "source_tree": "user/xguan/k3-rubin-ull-chain-mlamoe-gsm (~/dev/tekit_k3r_mlamoe_gsm)",
   "measured_run": "1007804",

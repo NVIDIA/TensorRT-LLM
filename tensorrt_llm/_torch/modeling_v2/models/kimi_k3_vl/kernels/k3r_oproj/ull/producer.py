@@ -1,5 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # TensorRT-LLM local change: update imports for the Kimi K3 family layout.
 """O-projection producer for the split and fused AttnRes paths: 112 CTAs of 64 output
 rows. Each warp keeps ``rows`` 16-row weight tiles of one of ``4 * rows`` K parts in

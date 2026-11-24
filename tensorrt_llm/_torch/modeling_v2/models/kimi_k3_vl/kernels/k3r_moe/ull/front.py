@@ -1,5 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # TensorRT-LLM local change: update imports for the Kimi K3 family layout.
 """MoE front: the weight-stationary [router shard; down shard] GEMM publishes logits
 and the latent shard into a multicast mailbox row; the routing kernel polls all 896
@@ -97,7 +97,7 @@ class RouteSitu:
         # and plan writers of the NVFP4 Rubin experts, ``ull/nv_experts.image_chunk_nv`` /
         # ``plan_chunk_nv``): the copy role writes the latent as NVFP4 under the layer's
         # activation global scale (a runtime FP32 argument after ``plan`` / ``signal``)
-        # instead of MXFP8 (``image_chunk`` / ``plan_chunk``). None: vLLM MR8 unchanged.
+        # instead of MXFP8 (``image_chunk`` / ``plan_chunk``). None: the original vLLM Rubin decode path unchanged.
         self.nv = nv
         assert nv is None or (plan and batch <= 64)
 
@@ -736,7 +736,7 @@ class SharedFront:
         place of ``experts_runtime.rubin`` / ``polled``), the routing kernel writes the
         NVFP4 image / plan (``RouteSitu`` ``nv``: ``nv.writers``) under ``nv.gsf``, and
         ``nv.wide_routing`` takes the routing options from the *_WIDE tables on other
-        devices too (GB300 forced onto the Rubin experts path). None: vLLM MR8 unchanged."""
+        devices too (GB300 forced onto the Rubin experts path). None: the original vLLM Rubin decode path unchanged."""
         experts = moe.shared_experts
         gate_up, down = experts.gate_up_proj.weight, experts.down_proj.weight
         self.shared = shared = gate_up.shape[0] // 2

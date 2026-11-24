@@ -1,5 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # TensorRT-LLM local change: update imports for the Kimi K3 family layout.
 """Rubin (cc 10.7) routed experts for TP16 verify steps of 64 tokens: the grouped
 ``ExpertsKernel`` engine (units of <= 8 tokens per expert, per-slot gathered MXFP8

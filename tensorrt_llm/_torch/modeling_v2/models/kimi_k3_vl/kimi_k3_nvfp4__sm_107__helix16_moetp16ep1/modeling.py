@@ -14,7 +14,7 @@ served source.
 
 The text model has 93 decoder layers: 69 KDA (Kimi Delta Attention) layers, 24 MLA layers
 (3, 7, ..., 87, 91, 92), layer 0 with a dense MLP, layers 1..92 with the latent MoE. Most of the
-step runs on the MR8 kernel chain (``chain.K3UllChain``, its own weights from
+step runs on the ULL decode kernel chain (``chain.K3UllChain``, its own weights from
 ``_chain_weights``): every KDA + MoE layer whole, the MoE of every MLA layer, and the
 attention-residual mixes and norms that consume each MoE tail. This file runs the rest, in model
 order (:meth:`KimiK3Helix16UllModelingV2.forward`):
@@ -63,8 +63,9 @@ Merged into this module, in this order (``MOVE.json`` in the family directory):
   private containers.
 * ``_chain_nv.py``: The NVFP4 routed experts of the chain's MoE layers
   (``moe.prepared.PreparedMoE``).
-* ``chain.py``: The KDA + MoE kernel chain of one rank (vLLM MR8's TP16 decode kernels,
-  ``kernels/k3r_*/ull/``).
+* ``chain.py``: The KDA + MoE kernel chain of one rank. The TP16 decode kernels
+  were developed by NVIDIA for the vLLM Kimi K3 Rubin backend and are located in
+  ``kernels/k3r_*/ull/``.
 * ``dflash.py``: The target head and the DSpark worker of the Kimi K3 SM107 Helix16 ULL target.
 * ``drafter.py``: The DSpark drafter of the Kimi K3 SM107 Helix16 ULL target
   (Inferact/Kimi-K3-DSpark, 5 MLA layers) and its installation on the target.
@@ -219,7 +220,7 @@ from ..ops.attention.k3_mla_state import K3MlaAttnState
 from ..ops.attention.k3_ull_helix_tail_workspace import K3HelixTail, ull2_tail_enabled
 from ..ops.cache.k3_ull_cache_manager import K3UllCacheManager, K3UllKdaCheckpointState
 from ..ops.chain.k3_ull_chain import K3UllChain
-from ..ops.chain.mr8_chain import mr8_chain_moe, mr8_chained_layer, mr8_solo_kda
+from ..ops.chain.k3_ull_decode_chain import ull_chain_moe, ull_chained_layer, ull_solo_kda
 from ..ops.comm.k3_attn_res_lamport_ull import k3_attn_res_lamport
 from ..ops.common.k3_ull_features import PROFILE, K3Features
 from ..ops.common.k3_ull_features import active as _features
@@ -9681,7 +9682,7 @@ class KimiK3Helix16UllModelingV2(DecoderModel):
         # (served ``ChainKda``)
         slots = md.mamba_metadata.generation_state_indices
         chain.bind_slots(md.mamba_metadata.state_indices if slots is None else slots, rows)
-        core = mr8_solo_kda(chain, 0, attn_in)
+        core = ull_solo_kda(chain, 0, attn_in)
         # (served ``Oproj``: the KDA mixer's ``_project_output(core, allow_ar_push=True)``)
         attn_out = l0.linear_attn(core)
         # (served ``ull/dense0.py`` ``Dense0._issue``)
@@ -9703,12 +9704,12 @@ class KimiK3Helix16UllModelingV2(DecoderModel):
             aux = torch.empty_like(x) if tap else None
             if layer.kind == CHAINED:
                 # (served ``ChainLayer``)
-                x = mr8_chained_layer(chain, i, x, prefix, blocks, aux, i in chain.last)
+                x = ull_chained_layer(chain, i, x, prefix, blocks, aux, i in chain.last)
             else:
                 moe_in, prefix = self._mla_layer(layer, x, prefix, bank[:num_snapshots], md)
                 # (served ``ChainMoe``)
                 nxt = chain.next_of[i]
-                x = mr8_chain_moe(
+                x = ull_chain_moe(
                     chain, i, moe_in, prefix, blocks, aux, nxt is not None and nxt in chain.sites
                 )
             if tap:

@@ -9,6 +9,7 @@ engine hook points the shell uses are tested in ``tests/unittest/_torch/pyexecut
 (``test_runtime_hooks.py``, ``test_step_inputs.py``)."""
 
 import ast
+import hashlib
 import json
 import pathlib
 import subprocess
@@ -218,11 +219,12 @@ def test_the_only_environment_read_is_the_gpu_index():
     assert '"CUDA_VISIBLE_DEVICES"' in pathlib.Path(runtime.__file__).read_text()
 
 
-def test_served_step_kernels_are_byte_copies():
+def test_ull_step_kernels_match_the_source_manifest():
     files = json.loads((_FAM_DIR / "kernels" / "SOURCE.json").read_text())["files"]
     for name in ("kernels/k3r_step/input_commit.py", "kernels/k3r_step/step_upload_kernels.py"):
         entry = files[name]
-        assert entry["source"].endswith(f"@{SERVED_COMMIT}")
+        assert entry["source"] == f"tensorrt_llm/_torch/pyexecutor/{pathlib.Path(name).name}"
+        assert hashlib.sha256((_FAM_DIR / name).read_bytes()).hexdigest() == entry["sha256"]
         assert entry["local_edits"]
     text = (_FAM_DIR / "kernels/k3r_step/step_upload_kernels.py").read_text()
     assert "os.environ" not in text.split("def _cdiv")[0]

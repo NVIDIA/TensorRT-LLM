@@ -1,6 +1,5 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from FlashInfer v0.7.0.post1 (Apache-2.0):
 # flashinfer/gemm/kernels/dense_bf16_gemm_sm100_splitk.py
 """FlashInfer 0.7.0.post1 ``SplitKDenseGemmKernel`` (``dense_bf16_gemm_sm100_splitk``)

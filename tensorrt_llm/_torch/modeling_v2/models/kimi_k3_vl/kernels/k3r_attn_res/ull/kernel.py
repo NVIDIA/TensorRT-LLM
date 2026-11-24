@@ -1,5 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # TensorRT-LLM local change: update imports for the Kimi K3 family layout.
 """Seven-CTA cluster AttnRes: one cluster per token, 1024 hidden columns per CTA.
 
@@ -112,14 +112,14 @@ class ClusterAttnRes:
         # TensorRT-LLM local change (K3 chain -> the MLA layer after a run): ``mx_out``: the
         # normalized output row is also stored in MXFP8 (E4M3 ``xq [M, 7168]`` and one UE8M0
         # exponent per 1x32 group, ``xs [M, 224]``; two trailing Int64 addresses), the operands
-        # of the MLA layer's low-M FP8 projection. Off: the vLLM MR8 kernel unchanged.
+        # of the MLA layer's low-M FP8 projection. Off: the original vLLM Rubin decode kernel unchanged.
         if mx_out and out_mc:
             raise ValueError("mx_out with out_mc")
         self.mx_out = mx_out
         # TensorRT-LLM local change (K3 chain, DSpark taps): ``aux_mix``: the aux stream
         # gets the pre-norm mixture (the normalized output before its RMSNorm) instead
         # of the updated prefix row, the tap value of TensorRT-LLM's default
-        # KIMI_K3_AUX_ATTN_RES_STREAM=1. Off: the vLLM MR8 kernel unchanged.
+        # KIMI_K3_AUX_ATTN_RES_STREAM=1. Off: the original vLLM Rubin decode kernel unchanged.
         self.aux_mix = aux_mix
         # ``out_mc`` (row-sharded AttnRes, M >= 256, ``attn_res.sharded``): the output
         # row (and the aux rows) go to every rank's Lamport all-gather row row0 + token

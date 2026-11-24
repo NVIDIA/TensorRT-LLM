@@ -1,5 +1,7 @@
-# SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Modified by NVIDIA for TensorRT-LLM.
 
 """Shared CuTe DSL primitives; this module does not define a CUDA kernel."""
 

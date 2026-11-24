@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Per-position KDA checkpoints: byte layout, MR8 flat views, seed / commit and slot indices.
+"""Per-position KDA checkpoints: byte layout, ULL decode flat views, seed / commit and slot indices.
 
 This module depends on PyTorch only. :mod:`.cache` binds it to the KV cache manager's pools.
 
@@ -14,7 +14,7 @@ One KDA layer keeps, per recurrent-state slot, one buffer of role ``kda_ckpt``::
   ``conv_window + num_spec``. Columns ``[a, a + conv_window)`` are the committed window after
   ``a`` accepted drafts.
 
-The MR8 KDA kernels index one state tensor and one conv tensor with int32
+The ULL decode KDA kernels index one state tensor and one conv tensor with int32
 ``slots[b, t]`` (the conv page at ``slots[b, 0]``) and treat ``slot <= 0`` as padding. Both flat
 views here (:func:`kda_checkpoint_views`) have a row stride of ``U`` bytes, the largest power of
 two from 16 to 256 that divides the slot stride ``P``, the buffer address and the state size, so
@@ -123,7 +123,7 @@ class KDACheckpointViews:
 
     ``ckpt`` [slots, num_checkpoints, H, V, K] and ``vconv`` [slots, conv_dim, conv_width] are the
     typed per-slot views; ``state_flat`` [rows, H, V, K] and ``conv_flat`` [conv_rows, conv_dim,
-    conv_width] are the MR8 kernel views with a row stride of ``unit_bytes``. All four share the
+    conv_width] are the ULL decode kernel views with a row stride of ``unit_bytes``. All four share the
     buffer's storage.
     """
 
@@ -147,7 +147,7 @@ def checkpoint_unit(slot_bytes: int, address: int, state_bytes: int) -> int:
 
 
 def kda_checkpoint_views(raw: torch.Tensor, layout: KDACheckpointLayout) -> KDACheckpointViews:
-    """The typed per-slot views and the MR8 flat views of a ``kda_ckpt`` buffer.
+    """The typed per-slot views and the ULL decode flat views of a ``kda_ckpt`` buffer.
 
     ``raw`` is the pool's ``[slots, payload_bytes]`` uint8 view; its slot stride may exceed the
     payload (other buffers of the slot). Raises ValueError when the buffer is too small or
@@ -313,7 +313,7 @@ def checkpoint_indices(
     out_slots: torch.Tensor | None = None,
     out_accepted: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """The MR8 ``(spec_state_indices [n, num_checkpoints], num_accepted_tokens [n])`` int32 of
+    """The ULL decode ``(spec_state_indices [n, num_checkpoints], num_accepted_tokens [n])`` int32 of
     the requests whose manager slots are ``state_indices`` [n].
 
     ``accepted_drafts`` is the per-slot count of drafts accepted by the last verify (it excludes

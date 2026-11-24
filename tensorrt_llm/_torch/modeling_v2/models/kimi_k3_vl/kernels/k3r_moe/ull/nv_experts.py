@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""NVFP4 routed experts for MoE TP16 at 8 token rows on the vLLM MR8 Rubin engine.
+"""NVFP4 routed experts for MoE TP16 at 8 token rows for the Kimi K3 Rubin decode backend.
 
-``RubinNvExpertsKernel`` is vLLM MR8's ``RubinExpertsKernel`` (``experts_rubin.py``, vendored under
-``kimi_k3_vl/k3_vllm/vllm_mr8``) with the checkpoint's NVFP4 experts in place of MXFP4 x
+``RubinNvExpertsKernel`` is adapted from the NVIDIA vLLM Kimi K3 Rubin backend's
+``RubinExpertsKernel`` (``experts_rubin.py``) with the checkpoint's NVFP4 experts in place of MXFP4 x
 MXFP8. What stays: the static byte partition over the grid (FC1(A) / FC1(B) stages split by K with
 the peer-slot exchange of FP32 partial sums, FC2 jobs split evenly with the FC2(B) dynamic pool),
 the warp roles, the polled route mailbox, the call-parity hidden images and their re-arm, the
@@ -960,8 +960,10 @@ class RubinNvExpertsKernel(RubinExpertsKernel):
 
 
 class RubinNvGroupedExpertsKernel(RubinGroupedExpertsKernel):
-    """vLLM MR8's ``RubinGroupedExpertsKernel`` (``experts_rubin64.py``: TP16, 9-64 token rows) on
-    the NVFP4 weights and activations of ``RubinNvExpertsKernel``. What stays: the grouping (each
+    """Variant of the NVIDIA vLLM Rubin backend's ``RubinGroupedExpertsKernel`` (``experts_rubin64.py``).
+
+    Handles TP16 and 9-64 token rows with the NVFP4 weights and activations of
+    ``RubinNvExpertsKernel``. What stays: the grouping (each
     expert's tokens in units of <= 8 rows, units in expert order), the static FC1(A) / FC1(B) K-split
     partition with partial sums through the workspace, FC2 jobs split evenly with the claimed FC2(B)
     tail pool, the per-slot activation slices gathered from the plan by warp 3, the hidden images in

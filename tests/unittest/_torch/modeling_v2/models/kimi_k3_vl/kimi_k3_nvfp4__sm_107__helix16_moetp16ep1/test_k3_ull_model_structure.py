@@ -321,7 +321,7 @@ def test_imports_no_sibling_target():
 
 
 def test_modeling_v2_imports_resolve_in_this_tree():
-    """Every absolute modeling_v2 import of the target, the MR8 copy
+    """Every absolute modeling_v2 import of the target, the ULL decode kernels
     and its function-level imports included, names a module of this tree."""
     import tensorrt_llm
 

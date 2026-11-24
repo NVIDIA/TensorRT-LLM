@@ -1,5 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # TensorRT-LLM local change: update imports for the Kimi K3 family layout.
 """The DSpark drafter's dense gate/up of 33-64 rows (B5-B8) with vLLM's silu_and_mul in
 its epilogue, on ``SplitKTmemGemm64`` (weights on chip before x lands).
