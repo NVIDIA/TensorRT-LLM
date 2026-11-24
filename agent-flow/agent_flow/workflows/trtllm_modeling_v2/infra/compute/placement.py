@@ -43,11 +43,14 @@ class JobNeeds:
     #: The ``wall`` header in seconds; ``None`` takes the session's default (0 is none).
     wall_s: float | None
     holds_gpus: bool
+    #: The nodes it spans, and whether a session's lead runs it.
+    nodes: int = 1
+    lead: bool = False
 
     @classmethod
     def from_script(cls, name: str, script: str) -> "JobNeeds":
         spec = _sched.job_spec_from_script(name, script)
-        return cls(gpus=spec.gpus, wall_s=spec.wall_s, holds_gpus=spec.holds_gpus)
+        return cls(spec.gpus, spec.wall_s, spec.holds_gpus, nodes=spec.nodes, lead=spec.lead)
 
     def wall_on(self, default_wall_s: float) -> float:
         """The wall limit this job runs under on a session whose default is ``default_wall_s``."""
@@ -149,8 +152,20 @@ def rank(view: SpoolView) -> tuple:
 def assess(spool: str | Path, job: JobNeeds, *, stale_s: float, now: float) -> SpoolView:
     """What ``spool`` can do for ``job`` now: through its best live watcher, or why not."""
     root = Path(spool)
-    records = _sched.watcher_records(root)
+    # A lead holds no devices: `_judge` would find it free (0 of 0) whatever its nodes do.
+    every = _sched.watcher_records(root)
+    records = [record for record in every if not record.get("lead")]
     live = [record for record in records if now - float(record["alive_epoch"]) <= stale_s]
+    if live and (job.nodes > 1 or job.lead):  # one allocation runs it: its nodes, its lead
+        nodes = [record.get("slurm_job") for record in live]
+        led = {
+            r.get("slurm_job")
+            for r in every
+            if r.get("lead") and now - float(r["alive_epoch"]) <= stale_s
+        }
+        if not any(nodes.count(a) >= job.nodes and (a in led or not job.lead) for a in nodes):
+            asked = f"the job spans {job.nodes} nodes" + (" under a lead" if job.lead else "")
+            return SpoolView(path=root, reasons=[f"{asked}: no allocation here has them"])
     if not live:
         if not records:
             return SpoolView(path=root, reasons=["no watcher has ever heart-beat there"])

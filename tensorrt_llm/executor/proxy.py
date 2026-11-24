@@ -1577,6 +1577,17 @@ class GenerationExecutorProxy(GenerationExecutor):
             logger.warning(f"Error fetching startup metrics via RPC: {e}")
             return None
 
+    def get_engine_config(self) -> dict:
+        """Get rank-0 resolved engine config metadata via RPC."""
+        if self.rpc_client is None:
+            return {}
+        try:
+            config = self.rpc_client.get_engine_config().remote()
+            return config if isinstance(config, dict) else {}
+        except RPCError as e:
+            logger.debug(f"Error fetching engine config via RPC: {e}")
+            return {}
+
     def aget_stats(self, timeout: float) -> IterationResult:
         """Get iteration statistics from the runtime via RPC (async).
 

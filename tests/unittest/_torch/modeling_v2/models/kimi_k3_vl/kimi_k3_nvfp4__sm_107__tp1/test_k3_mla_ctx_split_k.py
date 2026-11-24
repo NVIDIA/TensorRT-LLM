@@ -293,7 +293,9 @@ def _build_prefix_case(prefix, new, chunk_size, buffer_batch, seed=0, global_sca
             kv_global_scale=torch.full((1,), global_scale, dtype=torch.float32, device="cuda"),
         ),
         page_size=PAGE,
-        kv_cache_manager=SimpleNamespace(get_fp4_mla_cache_buffers=lambda _layer: (kv, sf)),
+        kv_cache_manager=SimpleNamespace(
+            fp4_mla_layout=SimpleNamespace(get_fp4_mla_cache_buffers=lambda _layer: (kv, sf))
+        ),
     )
     q = torch.randn(T, H * (NOPE + ROPE), generator=g, device="cuda").to(torch.bfloat16)
     latent = (torch.randn(T, LORA + ROPE, generator=g, device="cuda") * 0.5).to(torch.bfloat16)
@@ -673,7 +675,7 @@ def test_fp4_mla_gather_mxfp8_cells(cell):
         global_scale=FP4_MLA_KV_GLOBAL_SCALE,
     )
     meta = case.meta
-    kv, sf = meta.kv_cache_manager.get_fp4_mla_cache_buffers(0)
+    kv, sf = meta.kv_cache_manager.fp4_mla_layout.get_fp4_mla_cache_buffers(0)
     state = meta.fp4_mla_state
     for loop_idx in range(case.loops):
         tokens = int(meta.host_cu_chunked_seq_len[loop_idx, meta.num_contexts])

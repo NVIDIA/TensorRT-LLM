@@ -202,9 +202,10 @@ def run_gate(args: argparse.Namespace) -> check_result.GateResult:
         devices = ()
     else:
         devices = tuple(range(gpus))
-    environment = resolve_environment(task_data, devices=devices, world_size=world)
+    environment = resolve_environment(task_data, devices=devices).at_width(world)
     # The unit's own, without a variant's overlay: what a relative variant is judged against.
-    unit_environment = resolve_environment(declared, devices=devices, world_size=world)
+    unit_environment = resolve_environment(declared, devices=devices).at_width(world)
+    nodes, lead = disagg.job_span(task_data, args.name, environment.nodes)
     if args.python:
         environment = replace(environment, python=args.python)
         unit_environment = replace(unit_environment, python=args.python)
@@ -219,7 +220,7 @@ def run_gate(args: argparse.Namespace) -> check_result.GateResult:
         # A worker's own gate run queues with the run's other checks.
         executor = select_command_executor(
             environment, name_prefix=f"gate-{args.name}", gpus=str(gpus), tree=tree,
-            priority=FEATURE, nodes=spec.nodes if spec else 1,
+            priority=FEATURE, nodes=nodes, lead=lead,
         )  # fmt: skip
         runner = shell_runner_for(executor)
         runner = pin.runner(runner) if pin is not None else check_runtime.in_tree(runner, tree)

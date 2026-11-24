@@ -892,7 +892,11 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             gen_indexer_kv_lens.view(-1, 1), _DG_SCHEDULE_BLOCK_KV, self.num_sms
         )
         self.scheduler_metadata_buffer.copy_(scheduler_metadata_buffer, non_blocking=True)
-        if self.max_draft_tokens > 0 and not self.use_expanded_buffers_for_mtp:
+        if (
+            self.max_draft_tokens > 0
+            and not self.use_expanded_buffers_for_mtp
+            and not self.use_cute_dsl_paged_mqa_logits
+        ):
             scheduler_metadata_buffer_full_next_n = get_paged_mqa_logits_metadata(
                 scheduler_context_lens.contiguous(),
                 _DG_SCHEDULE_BLOCK_KV,

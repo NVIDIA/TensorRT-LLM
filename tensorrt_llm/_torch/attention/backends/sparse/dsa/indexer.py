@@ -1503,7 +1503,7 @@ class Indexer(nn.Module):
                 gen_seq_lens.view(-1, 1), _DG_SCHEDULE_BLOCK_KV, metadata.num_sms
             )
             metadata.scheduler_metadata_buffer.copy_(scheduler_metadata_buffer, non_blocking=True)
-            if metadata.max_draft_tokens > 0:
+            if metadata.max_draft_tokens > 0 and not metadata.use_cute_dsl_paged_mqa_logits:
                 scheduler_metadata_buffer_full_next_n = get_paged_mqa_logits_metadata(
                     scheduler_context_lens.contiguous(),
                     _DG_SCHEDULE_BLOCK_KV,
