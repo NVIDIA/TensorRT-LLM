@@ -2830,6 +2830,144 @@ def test_held_transfer_failure_keeps_other_lora_requests_schedulable(pp_size):
     assert set(executor.inflight_req_ids) == {9}
 
 
+def test_failed_partial_pipelined_prefill_retires_its_send_session(monkeypatch):
+    """A forward failure after an earlier pipelined chunk retires that send locally.
+
+    The failure is parked, so no later chunk runs and the send never gets its
+    last slice, and the generation side never cancels. The send is cancelled
+    when the failure is parked; the reaper retires it only once its submitted
+    write drains, and the original error is then reported exactly once.
+    """
+    from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
+    from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+
+    class PartialSendSession:
+        disagg_request_id = 5
+
+        def __init__(self):
+            self.status = SessionStatus.READY
+            self.write_in_flight = True
+            self.cancel_calls = 0
+            self.closed = False
+
+        def cancel(self):
+            self.cancel_calls += 1
+            self.status = SessionStatus.CANCELLED
+
+        def has_failed(self):
+            return self.status == SessionStatus.CANCELLED
+
+        def is_completed(self):
+            return False
+
+        def has_transferring_tasks(self):
+            return self.write_in_flight
+
+        def wait_complete(self, blocking=True):
+            return WaitResult.FAILED if self.has_failed() else None
+
+        def close(self):
+            self.closed = True
+            return True
+
+    request = types.SimpleNamespace(
+        py_request_id=5,
+        request_id=5,
+        py_client_id=105,
+        py_disaggregated_params=None,
+        is_context_only_request=True,
+        state=LlmRequestState.CONTEXT_INIT,
+        context_remaining_length=4,
+        context_current_position=4,
+        py_kv_send_session_retired=False,
+    )
+    session = PartialSendSession()
+
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._send_sessions = {5: session}
+    transceiver._send_reqs = {5: request}
+    transceiver._recv_sessions = {}
+    transceiver._wait_reqs = {}
+    transceiver._rank_info_start_failures = None
+    transceiver._pending_rank_info_admissions = None
+    transceiver._ever_had_send_session = True
+    transceiver._ctx_need_tp_sync = False
+    transceiver._ctx_need_pp_sync = False
+    transceiver._transfer_worker = Mock()
+    transceiver._ctx_consensus = list
+    transceiver._ctx_consensus_outcome = lambda _rids, cancelled, failed, completed, quiesced: (
+        cancelled,
+        failed,
+        completed,
+        quiesced,
+    )
+
+    coordinator = object.__new__(DisaggTransferCoordinator)
+    coordinator._transceiver = transceiver
+    coordinator._unpublished_gen_receives = {}
+    # The partial send is not in the transfer manager; the idle poll must reap it.
+    coordinator._dist = Mock(world_size=1)
+    coordinator._transfers = Mock()
+    coordinator._transfers.has_any_inflight_requests.return_value = False
+    coordinator._transfers.requests_in_transfer.return_value = {}
+    coordinator._context_cancellation_drains = set()
+    coordinator._pending_ctx_transfer_failures = set()
+    coordinator._timed_out_ctx_cancelled_ids = set()
+    coordinator._check_transfer_errors = Mock()
+
+    executor = object.__new__(PyExecutor)
+    executor._error_budget = Mock()
+    executor._fatal_error = None
+    executor.enable_attention_dp = False
+    executor.dist = Mock(world_size=1)
+    executor._pending_transfer_responses = []
+    executor._pending_response_terminations = []
+    executor.kv_cache_transceiver = transceiver
+    executor._disagg_coordinator = coordinator
+    executor.async_transfer_manager = Mock()
+    executor.async_transfer_manager.requests_in_transfer.return_value = {}
+    responses = []
+    executor._enqueue_responses = Mock(side_effect=responses.extend)
+    executor._terminate_request = Mock()
+    executor._wait_for_model_engine_input_copy = Mock()
+    executor.active_requests = [request]
+
+    executor._handle_errors("forward failed", requests=[request], charge_budget=False)
+    # A later error while the write is in flight keeps the original outcome.
+    executor._handle_errors("transfer failed", requests=[request], charge_budget=False)
+
+    # Cancelled locally (which notifies the generation side), but the submitted
+    # write still reads the pages: nothing is released or reported yet.
+    assert session.status == SessionStatus.CANCELLED
+    assert session.cancel_calls == 2
+    for _ in range(2):
+        assert transceiver.check_context_transfer_status(0) == ([], [])
+        executor._sweep_transfer_held_failures()
+    assert transceiver._send_sessions == {5: session}
+    assert not session.closed
+    assert executor._held_transfer_failures() == {id(request): (request, "forward failed")}
+    assert executor.active_requests == [request]
+    executor._terminate_request.assert_not_called()
+    assert responses == []
+
+    session.write_in_flight = False
+    monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
+    coordinator.poll_progress_when_idle()
+    assert session.closed
+    assert transceiver._send_sessions == {}
+    assert request.py_kv_send_session_retired
+
+    executor._sweep_transfer_held_failures()
+    executor._sweep_transfer_held_failures()
+
+    assert executor._held_transfer_failures() == {}
+    assert executor.active_requests == []
+    executor._terminate_request.assert_called_once_with(request)
+    assert [(req_id, response.error_msg) for req_id, response in responses] == [
+        (5, "forward failed")
+    ]
+
+
 class TestComputeScheduledTokens:
     """Tests for PyExecutor._compute_scheduled_tokens.
 

@@ -892,7 +892,11 @@ class DisaggTransferCoordinator:
         should_poll_synchronous_context_status = (
             uses_synchronous_gen_transfer
             and self._dist.world_size == 1
-            and self._transfers.has_any_inflight_requests()
+            and (
+                self._transfers.has_any_inflight_requests()
+                # A cancelled partial send is retired only by this reap.
+                or getattr(self._transceiver, "has_open_send_sessions", lambda: False)()
+            )
         )
         if uses_synchronous_gen_transfer and not should_poll_synchronous_context_status:
             return

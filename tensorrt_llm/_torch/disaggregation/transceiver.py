@@ -1575,6 +1575,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         """Whether pipelined prefill-transfer is enabled."""
         return self._enable_pipelined_transfer
 
+    def has_open_send_sessions(self) -> bool:
+        """Whether any send session, including a partial one, awaits retirement."""
+        return bool(self._send_sessions)
+
     def has_inflight_transfer(self, req: LlmRequest) -> bool:
         """Whether a transfer session or cancelled admission fence retains resources."""
         rid = get_unique_rid(req)

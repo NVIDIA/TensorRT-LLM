@@ -11039,8 +11039,13 @@ class PyExecutor:
             made_progress = self._scheduler_progress_since_vote
         else:
             pending = self._pending_scheduler_failures
-            pending.difference_update(req.py_request_id
-                                      for req in scheduled_batch.all_requests())
+            # Withdraw proposals for every row kind the vote would remove.
+            pending.difference_update(
+                req.py_request_id
+                for rows in (scheduled_batch.encoder_requests,
+                             scheduled_batch.all_requests(),
+                             scheduled_batch.recompute_paused_requests)
+                for req in rows)
             pending.update(local_ids)
             self._scheduler_failure_sync_tick += 1
             scheduled_batch.failed_requests = []
@@ -12920,6 +12925,19 @@ class PyExecutor:
                 request for request in failed_requests
                 if self._transfer_owns_request_blocks(request)
             ]
+            # A held context request is part-way through a pipelined send.
+            # Its remaining chunks will not run, so the send never gets its
+            # last slice and nothing else would retire it. Cancel it: the
+            # send reaper retires the session once its submitted writes
+            # drain, and a session retired here already no longer holds the
+            # request.
+            for request in held_requests:
+                if getattr(request, "is_context_only_request", False) is True:
+                    self.disagg.request_cancellation(request)
+            held_requests = [
+                request for request in held_requests
+                if self._transfer_owns_request_blocks(request)
+            ]
             if held_requests:
                 held_ids = {id(request) for request in held_requests}
                 failed_requests = [
@@ -12928,7 +12946,7 @@ class PyExecutor:
                 ]
                 parked = self._held_transfer_failures()
                 for request in held_requests:
-                    parked[id(request)] = (request, error_msg)
+                    parked.setdefault(id(request), (request, error_msg))
                 logger.warning(
                     f"Deferring failure of {len(held_requests)} request(s) "
                     "whose KV blocks a transfer still owns")
@@ -12945,9 +12963,13 @@ class PyExecutor:
             if (getattr(request, "context_remaining_length", 0) > 0 and getattr(
                     request, "context_current_position", None) == 0):
                 request.py_kv_reuse_poisoned = True
+            # A failure parked earlier is the request's outcome; a later error
+            # (such as the retirement of the transfer it waited on) does not
+            # replace it.
+            held = self._held_transfer_failures().pop(id(request), None)
             error_responses[req_id] = LlmResponse(
                 request_id=req_id,
-                error_msg=error_msg,
+                error_msg=error_msg if held is None else held[1],
                 client_id=request.py_client_id)
         if requests is None:
             parked = self._held_transfer_failures()

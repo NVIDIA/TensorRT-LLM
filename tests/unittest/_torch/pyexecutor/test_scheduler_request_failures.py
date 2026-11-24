@@ -347,10 +347,10 @@ def test_rejected_rows_never_reset_stall_rounds_without_execution(parallelism):
     assert all(ex._handle_errors.call_count == 2 for ex in executors)
 
 
-@pytest.mark.parametrize("rescheduled_at", [None, 10])
+@pytest.mark.parametrize("rescheduled_as", [None, "generation", "encoder"])
 @pytest.mark.parametrize("parallelism", ["tp", "cp", "pp"])
 def test_local_rejection_from_tick_zero_never_starts_a_request_on_one_rank(
-    parallelism, rescheduled_at
+    parallelism, rescheduled_as
 ):
     """A local rejection only proposes a failure; batches change only by vote.
 
@@ -375,6 +375,8 @@ def test_local_rejection_from_tick_zero_never_starts_a_request_on_one_rank(
 
     request = SimpleNamespace(py_request_id=7)
 
+    rescheduled_at = None if rescheduled_as is None else 10
+
     def scheduled(pass_id):
         # The scheduler fails a request only in a pass without progress.
         if rescheduled_at is not None and pass_id >= rescheduled_at:
@@ -385,11 +387,12 @@ def test_local_rejection_from_tick_zero_never_starts_a_request_on_one_rank(
         executed = []
         for pass_id[0] in range(num_passes):
             batch = ScheduledRequests()
-            batch.generation_requests = scheduled(pass_id[0])
+            setattr(batch, f"{rescheduled_as or 'generation'}_requests", scheduled(pass_id[0]))
             batch.failed_requests = [request] if rank == 1 and pass_id[0] == 0 else []
             executor._fail_scheduler_requests(batch)
             assert batch.failed_requests == []
-            executed.append([req.py_request_id for req in batch.all_requests()])
+            rows = batch.encoder_requests + batch.all_requests()
+            executed.append([req.py_request_id for req in rows])
             if pass_id[0] < num_passes - 1:
                 executor._handle_errors.assert_not_called()
         return executed
