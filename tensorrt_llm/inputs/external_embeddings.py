@@ -187,6 +187,9 @@ def parse_external_embeddings(
     Args:
         multimodal_embedding: Mapping of modality to a tensor, a dict entry, or
             a list of them, in the order of that modality's prompt placeholders.
+            Each embedding is a dense ``[rows, hidden]`` float16, bfloat16,
+            float32 or float64 tensor; the model checks ``hidden`` and the
+            ``rows`` implied by ``<modality>_grid_thw``.
         supported_modalities: Modalities the caller accepts.
         temporal_patch_size: Video frames per temporal patch, bounding ``frames_indices``.
 
