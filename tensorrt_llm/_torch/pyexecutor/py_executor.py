@@ -143,9 +143,9 @@ from .request_utils import (RequestBroadcaster,
                             derive_attention_dp_per_rank_request_cap,
                             drain_queued_items, get_from_waiting_queue,
                             get_num_child_requests, merge_requests)
-from .resource_manager import (NoFreeSlotsError, ResourceManager,
-                               ResourceManagerType, is_context_only_kv_cache,
-                               request_context)
+from .resource_manager import (NoFreeSlotsError, PeftCacheManager,
+                               ResourceManager, ResourceManagerType,
+                               is_context_only_kv_cache, request_context)
 from .response_utils import prepare_response, publish_execution_metadata
 from .runtime_hooks import ExecutorEvents, RuntimeHooks, runtime_hooks_of
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
@@ -1438,6 +1438,7 @@ class PyExecutor:
         # these requests until their prior execution state is safe to reuse.
         self.inflight_req_ids = ReqIdsSet()
         self._pending_recompute_pause_ids: set[int] = set()
+        self._pending_peft_pause_requests: list[LlmRequest] = []
 
         # Encoder-decoder models execute the encoder and decoder in separate
         # iterations in both executor loops. PP usage is very rare for these
@@ -4602,6 +4603,9 @@ class PyExecutor:
                 if self._is_kv_manager_v2:
                     self._terminate_recompute_paused_requests(scheduled_batch)
                     self._pause_recompute_paused_requests(scheduled_batch)
+                    if scheduled_batch.paused_requests:
+                        self._pending_peft_pause_requests.extend(
+                            scheduled_batch.paused_requests)
 
                 # For requests that are fitting disagg gen init, also prepare resources for KV cache manager
                 self.disagg.receive_gen_init(fitting_disagg_gen_init_requests)
@@ -4792,6 +4796,10 @@ class PyExecutor:
                         or can_queue) and previous_batch is not None:
                     with nvtx_range("sync_previous_sampler_event"):
                         previous_batch.sample_state.sampler_event.synchronize()
+                if self._is_kv_manager_v2 and (previous_batch is None
+                                               or self.dist.is_last_pp_rank
+                                               or can_queue):
+                    self._flush_pending_peft_pauses()
 
                 # Stage 2: Enqueue sample state for executed batch to ring broadcast it in background thread asynchronously.
                 # send/recv chain: (pp_size - 1) -> 0 -> 1 -> ... -> (pp_size - 2)
@@ -7292,6 +7300,8 @@ class PyExecutor:
                         self._terminate_recompute_paused_requests(
                             scheduled_batch)
                         self._pause_recompute_paused_requests(scheduled_batch)
+                        self._pause_peft_for_suspended_requests(
+                            scheduled_batch.paused_requests)
                     self._finalize_adp_dummy_allocation(False)
                     # _check_benchmark_disagg_gate() makes this retry decision
                     # with a model-parallel all-gather. Flush before retrying so
@@ -7307,6 +7317,8 @@ class PyExecutor:
                 if self._is_kv_manager_v2:
                     self._terminate_recompute_paused_requests(scheduled_batch)
                     self._pause_recompute_paused_requests(scheduled_batch)
+                    self._pause_peft_for_suspended_requests(
+                        scheduled_batch.paused_requests)
                 else:
                     self._terminate_requests(scheduled_batch.paused_requests)
                     self._pause_requests(scheduled_batch.paused_requests)
@@ -8389,6 +8401,8 @@ class PyExecutor:
 
                 if self._is_kv_manager_v2 and self._can_pause_for_rebalance():
                     self._maybe_rebalance_kv_pools()
+                    if self.previous_batch is None:
+                        self._flush_pending_peft_pauses()
 
                 loop_head = None
                 flush_transfer_errors = False
@@ -8439,6 +8453,11 @@ class PyExecutor:
                         self._terminate_recompute_paused_requests(
                             scheduled_batch)
                         self._pause_recompute_paused_requests(scheduled_batch)
+                        if scheduled_batch.paused_requests:
+                            self._pending_peft_pause_requests.extend(
+                                scheduled_batch.paused_requests)
+                        if self.previous_batch is None:
+                            self._flush_pending_peft_pauses()
                     self._finalize_adp_dummy_allocation(False)
                     self._flush_pending_transfer_responses()
                     if defer_kv_close:
@@ -8452,6 +8471,9 @@ class PyExecutor:
 
                 if self._is_kv_manager_v2:
                     self._terminate_recompute_paused_requests(scheduled_batch)
+                    if scheduled_batch.paused_requests:
+                        self._pending_peft_pause_requests.extend(
+                            scheduled_batch.paused_requests)
                 else:
                     self._terminate_requests(scheduled_batch.paused_requests)
 
@@ -8707,6 +8729,11 @@ class PyExecutor:
                         self.previous_batch.scheduled_requests.all_requests())
                 else:
                     self._enqueue_responses([])
+
+                if self._is_kv_manager_v2 and (
+                        self.previous_batch is None
+                        or should_process_previous_batch):
+                    self._flush_pending_peft_pauses()
 
                 if defer_kv_close and not self.active_requests:
                     # Idle: no next forward to overlap with, so close now and
@@ -13928,6 +13955,47 @@ class PyExecutor:
                 and not req.is_finished)
             if should_recompute:
                 self._pause_recompute_request(req)
+
+    def _get_peft_cache_manager(self) -> Optional[PeftCacheManager]:
+        if self.resource_manager is None:
+            return None
+        return self.resource_manager.get_resource_manager(
+            ResourceManagerType.PEFT_CACHE_MANAGER)
+
+    def _pause_peft_for_suspended_requests(
+            self, requests: Iterable[LlmRequest]) -> None:
+        """Pause PEFT device ownership for KV-suspended started LoRA requests.
+
+        Skips requests that finished, left ``active_requests``, were reset for
+        recompute, or resumed KV before this point so we neither register a
+        phantom paused entry nor release an adapter still in use.
+        """
+        peft_cache_manager = self._get_peft_cache_manager()
+        if peft_cache_manager is None:
+            return
+        for req in requests:
+            if (req.lora_task_id is None or req.is_finished
+                    or req.state == LlmRequestState.GENERATION_TO_COMPLETE):
+                continue
+            is_started = (
+                (req.is_context_init_state and not req.is_first_context_chunk)
+                or (req.is_generation_in_progress_state and not (
+                    req.is_generation_only_request
+                    and req.py_decoding_iter == 0)))
+            if not is_started:
+                continue
+            if not any(active is req for active in self.active_requests):
+                continue
+            if self.kv_cache_manager.is_request_active(req.py_request_id):
+                continue
+            peft_cache_manager.pause_request(req)
+
+    def _flush_pending_peft_pauses(self) -> None:
+        pending = self._pending_peft_pause_requests
+        if not pending:
+            return
+        self._pending_peft_pause_requests = []
+        self._pause_peft_for_suspended_requests(pending)
 
     def _check_helix_schedule_consistency(
             self, scheduled_batch: ScheduledRequests) -> None:

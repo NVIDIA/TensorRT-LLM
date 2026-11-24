@@ -146,8 +146,10 @@ class BudgetTracker:
         if self._peft_cache_manager is None:
             return 0
         lora_task_id = getattr(req, "lora_task_id", None)
-        if lora_task_id is None or lora_task_id in self._seen_peft_task_ids:
+        if lora_task_id is None:
             return 0
+        if lora_task_id in self._seen_peft_task_ids:
+            return None if self._claimed_peft_pages > self._max_peft_pages else 0
         required = self._peft_cache_manager.determine_num_pages(req)
         if self._claimed_peft_pages + required > self._max_peft_pages:
             return None
@@ -783,24 +785,23 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Index of each pending context request in requests_list.
         pending_ctx_index: dict[int, int] = {}
 
-        # Pre-claim PEFT pages for terminal requests and, with GEN preemption,
-        # every live decode, including requests omitted from this batch.
-        # In the overlap executor these requests are no longer scheduled
-        # (state outside schedulable range) but their adapters haven't
-        # been released yet (mark_request_done runs after prepare_resources
-        # in the next iteration).  Without this, the budget would appear
-        # empty and context requests with a different adapter could be
-        # admitted, causing ensure_batch to crash when it can't evict the
-        # still-active adapter.
+        # Pre-claim PEFT pages for every request that currently holds an active
+        # device adapter: terminal requests awaiting release in the overlap
+        # executor, and started requests (decodes and started context chunks)
+        # whose PEFT ownership has not been paused. Pre-claiming up front keeps
+        # their adapters accounted for even when they are omitted from this
+        # batch (GEN preemption, phase 2 context chunks checked after phase 1
+        # resumes, KV-suspended requests awaiting post-batch PEFT pause, or
+        # rebalance-suspended requests that still own PEFT).
         if self.peft_cache_manager is not None:
             for req in active_requests:
-                if req.state_value == self._gen_to_complete_state_value or (
-                    self._gen_preemption_enabled
-                    and req.state_value == LlmRequestState.GENERATION_IN_PROGRESS.value
-                    and self.kv_cache_manager.is_request_active(req.py_request_id)
-                ):
-                    # Resident paused and displaced decode requests still hold their adapters;
-                    # KV-suspended requests already paused PEFT ownership in _suspend_request.
+                if (
+                    req.state_value == self._gen_to_complete_state_value
+                    or (
+                        self._is_started_request(req)
+                        and not (req.is_generation_only_request and req.py_decoding_iter == 0)
+                    )
+                ) and not self.peft_cache_manager.is_paused(req):
                     budget.pre_claim_peft(req)
 
         # --- Phase 1: generation / disagg only ---
@@ -908,6 +909,11 @@ class KVCacheV2Scheduler(RequestScheduler):
                     continue
                 peft_pages = budget.peft_pages_needed(req)
                 if peft_pages is None:
+                    if self.peft_cache_manager is not None and self.peft_cache_manager.is_paused(
+                        req
+                    ):
+                        req_it += 1
+                        continue
                     break
                 action, tokens, scheduled_beam_width, req_it_end = self._try_schedule_generation(
                     req,
@@ -2459,17 +2465,6 @@ class KVCacheV2Scheduler(RequestScheduler):
         elif scheduled_beam_width != beam_width:
             return ScheduleAction.SKIP, 0, scheduled_beam_width, req_it_end
 
-        peft_cache_manager = getattr(self, "peft_cache_manager", None)
-        # Capture suspended state before _try_allocate_generation() can activate
-        # the KV cache (including a partial resume whose resize fails before an
-        # eviction retry succeeds).
-        was_suspended_peft = (
-            peft_cache_manager is not None
-            and self._is_started_request(req)
-            and getattr(req, "lora_task_id", None) is not None
-            and not self.kv_cache_manager.is_request_active(req.py_request_id)
-        )
-
         self._lost_kv_error = None
         success = self._try_allocate_generation(req)
         if self._lost_kv_error is not None:
@@ -2530,8 +2525,6 @@ class KVCacheV2Scheduler(RequestScheduler):
             return lost, 0, scheduled_beam_width, req_it_end
 
         if success:
-            if was_suspended_peft:
-                peft_cache_manager.add_request_peft(req, True)
             return ScheduleAction.SCHEDULED, req_tokens, scheduled_beam_width, req_it_end
 
         # Self-eviction: suspend this gen request to free its
@@ -2553,12 +2546,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                 f"[V2Scheduler] Self-evicting request {req.py_request_id} "
                 f"(state={req.state.name}) to free GPU pages"
             )
-            # If the request entered suspended and only became KV-active during a
-            # partial resume whose resize failed, PEFT ownership is already paused.
-            if was_suspended_peft:
-                self._suspend_kv_caches(req)
-            else:
-                self._suspend_request(req)
+            self._suspend_request(req)
             evicted.append(req)
 
         return ScheduleAction.STOP, 0, scheduled_beam_width, req_it_end
@@ -2666,33 +2654,18 @@ class KVCacheV2Scheduler(RequestScheduler):
             req.is_context_init_state and not req.is_first_context_chunk
         ) or req.is_generation_in_progress_state
 
-    def _suspend_kv_caches(self, req: LlmRequest) -> bool:
-        """Suspend *req*'s KV caches (main and draft) and return whether main KV was active."""
-        was_kv_active = self.kv_cache_manager.is_request_active(req.py_request_id)
+    def _suspend_request(self, req: LlmRequest) -> None:
+        """Suspend a request's KV cache in both main and draft managers.
+
+        PEFT device ownership for evicted requests is paused by the executor
+        once any in-flight forward that may still read the adapter has
+        completed, and re-acquired in ``PeftCacheManager.prepare_resources``
+        when the request resumes.
+        """
         self._clear_request_runtime_state(req)
         self.kv_cache_manager.suspend_request(req)
         if self.draft_kv_cache_manager is not None:
             self.draft_kv_cache_manager.suspend_request(req)
-        return was_kv_active
-
-    def _suspend_request(self, req: LlmRequest) -> None:
-        """Suspend a request's KV cache (main and draft) and pause its PEFT ownership.
-
-        Started LoRA requests transitioning from active KV state are marked done
-        with ``pause=True`` so the C++ ``PeftCacheManager`` releases active
-        device-cache ownership (allowing eviction for other adapters) while
-        keeping the adapter pinned in host cache until resume. Never-started
-        requests and requests whose KV cache was already suspended are skipped.
-        """
-        was_kv_active = self._suspend_kv_caches(req)
-        peft_cache_manager = getattr(self, "peft_cache_manager", None)
-        if (
-            was_kv_active
-            and peft_cache_manager is not None
-            and self._is_started_request(req)
-            and getattr(req, "lora_task_id", None) is not None
-        ):
-            peft_cache_manager.mark_request_done(req, pause=True)
 
     def _clear_request_runtime_state(self, req: LlmRequest) -> None:
         req.py_batch_idx = None

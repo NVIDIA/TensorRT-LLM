@@ -5784,8 +5784,7 @@ def create_py_executor_resources(
             kv_cache_manager=kv_cache_manager,
             scheduler_policy=scheduler_policy,
             ctx_chunk_config=ctx_chunk_config,
-            peft_cache_manager=peft_cache_manager.impl
-            if peft_cache_manager is not None else None,
+            peft_cache_manager=peft_cache_manager,
             scheduler_capacity=v2_scheduler_capacity,
             draft_kv_cache_manager=draft_kv_cache_manager,
             cross_kv_cache_manager=cross_kv_cache_manager,
