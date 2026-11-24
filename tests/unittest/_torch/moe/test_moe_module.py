@@ -37,6 +37,7 @@ from collections.abc import Sequence
 from contextlib import nullcontext
 from itertools import product
 from typing import List, NamedTuple, Optional
+from unittest.mock import patch
 
 import cloudpickle
 import pytest
@@ -443,7 +444,6 @@ def _create_routing_method(routing_method_cls, top_k, num_experts, dtype, model_
             model_config = MoeModelConfig(num_experts, top_k, hidden_size=0, intermediate_size=0)
         n_group, topk_group = resolve_deepseek_group_config(model_config)
         routed_scaling_factor = 1.0
-        # Create e_score_correction_bias as a zero tensor (no bias correction in test)
         e_score_correction_bias = torch.zeros(num_experts, dtype=dtype, device="cuda")
         return routing_method_cls(
             top_k=top_k,
@@ -774,6 +774,29 @@ def _test_moe_worker_impl(
                         )
                 torch.cuda.synchronize()
                 return output
+
+            if (
+                bias_dtype == torch.float32
+                and impl_id == "deepgemm.cuda.hopper_grouped_gemm.fp8_block_scales"
+                and routing_method_cls is DeepSeekV3MoeRoutingMethod
+            ):
+                # Without bias, the first top_k experts win. A +1 bias on the
+                # last top_k beats the first group's sigmoid(1) score.
+                router_logits.zero_()
+                router_logits[:, :top_k] = 1
+                routing_method.e_score_correction_bias[-top_k:] = 1
+                with patch.object(
+                    fused_moe.backend, "run_moe", wraps=fused_moe.backend.run_moe
+                ) as dispatch:
+                    run_forward()
+                dispatch.assert_called_once()
+                expert_ids = dispatch.call_args.args[0].token_selected_experts
+                expected_ids = torch.arange(
+                    num_experts - top_k, num_experts, dtype=expert_ids.dtype
+                )
+                torch.testing.assert_close(
+                    expert_ids.sort(dim=-1).values, expected_ids.expand(seq_len, -1)
+                )
 
             # Get reference output
             with torch.inference_mode():
@@ -1721,7 +1744,12 @@ def _create_routing_method_with_bias(routing_method_cls, top_k, num_experts, bia
             }.get(get_sm_version(), "trtllm.trtllm_gen.fused_moe.fp8_block_scales"),
             QuantAlgo.FP8_BLOCK_SCALES,
         ),
-        ("trtllm.trtllm_gen.fused_moe.w4a8_mxfp4_mxfp8", QuantAlgo.W4A8_MXFP4_MXFP8),
+        (
+            "trtllm.cutlass.grouped_gemm.w4a8_mxfp4_mxfp8"
+            if get_sm_version() in (120, 121)
+            else "trtllm.trtllm_gen.fused_moe.w4a8_mxfp4_mxfp8",
+            QuantAlgo.W4A8_MXFP4_MXFP8,
+        ),
         ("trtllm.cutlass.grouped_gemm.fp8", QuantAlgo.FP8),
     ],
 )
@@ -1733,13 +1761,13 @@ def test_moe_fp32_routing_bias(routing_method_cls, moe_model_config, impl_id, qu
     MiniMax-M2/M3 and DeepSeek models emit fp32 routing_bias from
     trust_remote_code model definitions. TRTLLM-Gen cases verify that the bias
     reaches the thop boundary, Runner::run() and routing kernels without
-    being read as bf16. FP8 and SM120/121 NVFP4 cases cover CUTLASS. MiniMax-M3
-    also verifies its routed scaling factor through the unified ConfigurableMoE
-    output reference.
+    being read as bf16. FP8 uses CUTLASS, as do NVFP4 and MXFP4/MXFP8 on SM120/121.
+    MiniMax-M3 also verifies its routed scaling factor through the unified
+    ConfigurableMoE output reference.
 
     Compare the selected implementation's output against the PyTorch reference.
     """
-    # This focused matrix uses the TRTLLM test input and skip policy.
+    # Keep the TRTLLM shape and CI filters for this focused matrix.
     backend_type = MoeTestFamily.TRTLLM
 
     ci_skip = should_skip_to_accelerate_ci(
@@ -1755,6 +1783,12 @@ def test_moe_fp32_routing_bias(routing_method_cls, moe_model_config, impl_id, qu
     skip_reason = should_skip_trtllm(
         backend_type, quant_algo, moe_model_config, routing_method_cls=routing_method_cls
     )
+    fixture_family = backend_type
+    if not skip_reason and quant_algo == QuantAlgo.W4A8_MXFP4_MXFP8:
+        fixture_family = impl_test_family(impl_id)
+        skip_reason = get_quick_skip_reason(
+            impl_id, quant_algo, dtype, moe_model_config, routing_method_cls
+        )
     if skip_reason:
         pytest.skip(skip_reason)
 
@@ -1782,7 +1816,7 @@ def test_moe_fp32_routing_bias(routing_method_cls, moe_model_config, impl_id, qu
         routing_method_cls=routing_method_cls,
         dtype_routing_logits=dtype_routing_logits,
         bias_dtype=torch.float32,
-        quant_test_family=backend_type,
+        quant_test_family=fixture_family,
     )
 
 
