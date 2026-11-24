@@ -702,6 +702,7 @@ def _make_admission_executor(model, requests):
 def _make_admission_request(request_id: int) -> types.SimpleNamespace:
     return types.SimpleNamespace(
         request_id=request_id,
+        child_requests=[],
         py_disaggregated_params=None,
         sampling_config=None,
         kv_cache_retention_config=None,
@@ -788,6 +789,25 @@ def test_model_validation_fails_only_the_request_it_rejects() -> None:
     assert [call.args[0] for call in model.validate_request.call_args_list] == requests
     # The checks after the model's still run for the requests it admitted.
     assert executor._validate_request_budget.call_count == 2
+
+
+def test_failed_parent_fails_its_child_sequences() -> None:
+    parent, child, other = (_make_admission_request(i) for i in (1, 10, 2))
+    parent.child_requests = [child]
+
+    def validate_request(request) -> None:
+        if request.request_id == 1:
+            raise ValueError("over budget")
+
+    model = types.SimpleNamespace(validate_request=Mock(side_effect=validate_request))
+    executor = _make_admission_executor(model, [parent, child, other])
+
+    admitted = PyExecutor._fetch_and_activate_new_requests(executor)
+
+    assert admitted == [other]
+    executor._handle_errors.assert_called_once_with(
+        "over budget", requests=[parent, child], charge_budget=False
+    )
 
 
 def test_encoder_input_above_max_num_tokens_fails_only_that_request() -> None:

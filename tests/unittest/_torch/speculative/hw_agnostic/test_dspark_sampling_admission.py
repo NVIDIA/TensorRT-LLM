@@ -122,6 +122,7 @@ def test_invalid_confidence_request_is_excluded_before_activation(processors):
     request = SimpleNamespace(
         sampling_config=SimpleNamespace(temperature=1.0, top_k=None, top_p=None, min_p=None),
         py_logits_post_processors=[object()] if processors else None,
+        child_requests=[],
     )
     already_active = object()
     executor.waiting_queue = object()

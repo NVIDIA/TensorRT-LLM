@@ -9906,16 +9906,15 @@ class PyExecutor:
         # Attached precomputed embeddings skip the encoder but sit on the
         # device whole until prefill strips them; their sum shares the
         # encoder-output byte budget.
-        attached_budget_bytes = getattr(self.model_engine,
-                                        "mm_encoder_output_budget_bytes", None)
-        bytes_per_embedding = getattr(
-            self.model_engine, "bytes_per_mm_encoder_embedding", None) or 0
+        attached_budget_bytes = self.model_engine.mm_encoder_output_budget_bytes
+        bytes_per_embedding = (self.model_engine.bytes_per_mm_encoder_embedding
+                               or 0)
         remaining_attached_bytes = None
         if attached_budget_bytes is not None:
             remaining_attached_bytes = attached_budget_bytes - sum(
-                get_attached_mm_bytes(
-                    getattr(request, "py_multimodal_data", None),
-                    bytes_per_embedding) for request in self.active_requests)
+                get_attached_mm_bytes(request.py_multimodal_data,
+                                      bytes_per_embedding)
+                for request in self.active_requests)
 
         admitted = []
         deferred = []
@@ -9951,8 +9950,8 @@ class PyExecutor:
                      if item_metadata is not None else None)
             if attached_bytes is not None:
                 if attached_bytes > attached_budget_bytes:
-                    # Deferring could never admit it. Request validation
-                    # rejects a single sequence over the budget with guidance.
+                    # Request validation rejects the sequence group with
+                    # guidance.
                     admitted.append(queue_item)
                     continue
                 if attached_bytes > remaining_attached_bytes:
@@ -10429,13 +10428,17 @@ class PyExecutor:
         return self.should_exclude_last_generation_logits
 
     def _fetch_and_activate_new_requests(self) -> List[LlmRequest]:
+        # Children of failed parents, by identity; they follow their parent.
+        failed_children = set()
 
         def _respond_if_invalid(request: LlmRequest) -> bool:
             """Immediately fail invalid request.
 
             Return True if invalid request was encountered and
-            handled.
+            handled. A failed parent fails its child sequences with it.
             """
+            if id(request) in failed_children:
+                return True
             try:
                 self._validate_request(request)
                 if self._mm_encoder_item_scheduling_enabled:
@@ -10450,8 +10453,9 @@ class PyExecutor:
                             self.scheduler, "context_chunk_unit_size", None))
                 return False
             except Exception as e:
+                failed_children.update(map(id, request.child_requests))
                 self._handle_errors(str(e),
-                                    requests=[request],
+                                    requests=[request, *request.child_requests],
                                     charge_budget=False)
                 return True
 

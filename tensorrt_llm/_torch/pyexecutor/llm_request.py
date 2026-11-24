@@ -1681,8 +1681,8 @@ def initialize_multimodal_encoder_request(
     effective encoder token budget, the items' embedding rows do not match
     the prompt's embedding slots, or — when the encoder-output budget is
     supplied — the outputs that must be resident at once could never fit
-    (see `get_mm_max_resident_embeddings`), or the request's attached
-    precomputed embeddings alone exceed it.
+    (see `get_mm_max_resident_embeddings`), or the attached precomputed
+    embeddings of the request and its child sequences alone exceed it.
     """
     mm_data = request.py_multimodal_data
     has_raw_payload = isinstance(mm_data, dict) and any(
@@ -1709,8 +1709,15 @@ def initialize_multimodal_encoder_request(
                 f"the effective startup maximum {max_num_tokens}")
 
     if has_full_embedding and max_output_bytes is not None:
-        attached_bytes = get_attached_mm_bytes(mm_data,
-                                               bytes_per_encoder_embedding)
+        # Admission passes malformed metadata through uncharged; reject it here.
+        item_metadata = get_multimodal_item_metadata(mm_data)
+        if item_metadata is not None:
+            item_metadata.validate()
+        # Each child sequence holds its own copy of the parent's multimodal
+        # data, so the parent is charged for the whole sequence group.
+        num_sequences = 1 + len(request.child_requests)
+        attached_bytes = num_sequences * get_attached_mm_bytes(
+            mm_data, bytes_per_encoder_embedding)
         if attached_bytes > max_output_bytes:
             raise ValueError(
                 format_attached_mm_embedding_budget_error(
