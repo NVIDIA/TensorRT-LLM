@@ -21,6 +21,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+import torch
 
 pytestmark = pytest.mark.cpu_only
 
@@ -68,7 +69,9 @@ def request_factory():
 @pytest.fixture
 def schedule():
     mode = SimpleNamespace(is_pard=lambda: False, support_dynamic_draft_len=lambda: True)
-    config = SimpleNamespace(spec_dec_mode=mode, draft_len_schedule=None, use_rejection_sampling=True)
+    config = SimpleNamespace(
+        spec_dec_mode=mode, draft_len_schedule=None, use_rejection_sampling=True
+    )
 
     def prepare(requests, max_seq_len):
         step_limit = budget.batch_draft_budget(requests, 7, max_seq_len, 1, is_pard=False)
@@ -109,18 +112,11 @@ def test_verify_prefix_and_finish_at_context_limit(request_factory, schedule, ac
     assert tokens[-1] == 99
 
 
-def test_output_budget_limits_the_whole_verify_batch(request_factory, schedule):
+def test_short_output_preserves_full_width_for_other_requests(request_factory, schedule):
     short = request_factory(prompt_len=8, generated=2, max_tokens=3)
     long = request_factory(prompt_len=8, generated=2, max_tokens=24)
-    assert schedule([short, long], 64) == 0
-    assert short.py_draft_tokens == long.py_draft_tokens == []
-    # Static decoding preserves empty proposals when bounded:
-    assert schedule([long], 64) == 7
-    assert long.py_draft_tokens == []
-    # Fresh proposals get the full draft budget:
-    long.py_draft_tokens = list(range(1, 8))
-    assert schedule([long], 64) == 7
-    assert long.py_draft_tokens == list(range(1, 8))
+    assert schedule([short, long], 64) == 7
+    assert short.py_draft_tokens == long.py_draft_tokens == list(range(1, 8))
 
 
 @pytest.mark.parametrize("requested, expected", [(65536, 158), (158, 158), (1, 1)])
@@ -141,7 +137,9 @@ def test_static_step_preserves_empty_proposals_when_bounded(request_factory):
     # Static decoding preserves proposals: a request intentionally entering
     # with no draft tokens must remain empty even when a draft_budget is set.
     mode = SimpleNamespace(is_pard=lambda: False, support_dynamic_draft_len=lambda: False)
-    config = SimpleNamespace(spec_dec_mode=mode, draft_len_schedule=None, use_rejection_sampling=True)
+    config = SimpleNamespace(
+        spec_dec_mode=mode, draft_len_schedule=None, use_rejection_sampling=True
+    )
     req_with_draft = request_factory(prompt_len=8, generated=2, max_tokens=24)
     req_without_draft = request_factory(prompt_len=8, generated=2, max_tokens=24)
     req_without_draft.py_draft_tokens = []
@@ -155,36 +153,67 @@ def test_static_step_preserves_empty_proposals_when_bounded(request_factory):
     assert req_without_draft.py_draft_tokens == []
 
 
-def test_helix_child_requests_share_total_input_len_cp_capacity():
-    # Helix ranks slice prompts across CP ranks. Both the parent request
-    # and all child requests receive total_input_len_cp and must clamp to
-    # the exact same capacity.
-    parent = SimpleNamespace(
-        is_dummy=False,
-        total_input_len_cp=100,
-        max_new_tokens=200,
-        py_max_new_tokens=200,
+@pytest.mark.parametrize(
+    "linear, dynamic_tree, fixed_target, shared, overlap, reserve",
+    [
+        (True, False, False, False, True, 0),
+        (True, False, True, False, False, 7),
+        (True, False, False, True, True, 15),
+        (True, True, False, False, False, 7),
+        (False, False, False, False, True, 21),
+    ],
+)
+def test_fixed_verify_layout_fits_at_admission(
+    request_factory, linear, dynamic_tree, fixed_target, shared, overlap, reserve
+):
+    physical_width = 7 if linear else 13
+    cfg = SimpleNamespace(
+        max_draft_len=7,
+        tokens_per_gen_step=physical_width + 1,
+        is_linear_tree=linear,
+        use_dynamic_tree=dynamic_tree,
     )
-    child = SimpleNamespace(
-        is_dummy=False,
-        total_input_len_cp=100,
-        max_new_tokens=200,
-        py_max_new_tokens=200,
+    assert (
+        budget.fixed_draft_reserve(
+            cfg,
+            SimpleNamespace(modeling_v2_target=object if fixed_target else None),
+            SimpleNamespace(pp_size=1, tp_size=2, enable_attention_dp=shared),
+            disaggregated=False,
+            overlap=overlap,
+        )
+        == reserve
     )
-    admission.clamp_generation_request(parent, max_seq_len=120, cp_size=2)
-    admission.clamp_generation_request(child, max_seq_len=120, cp_size=2)
-    assert parent.max_new_tokens == parent.py_max_new_tokens == 70
-    assert child.max_new_tokens == child.py_max_new_tokens == 70
+    req = request_factory(32, 0, 100)
+    admission.clamp_generation_request(req, 64, 1, draft_reserve=reserve)
+    assert req.py_max_new_tokens == req.max_new_tokens == 32 - reserve
+    if reserve:
+        with pytest.raises(
+            ValueError, match=rf"maximum context length is 64 tokens.*reserves {reserve}"
+        ):
+            admission.clamp_generation_request(
+                request_factory(64 - reserve, 0, 1), 64, 1, draft_reserve=reserve
+            )
 
 
-def test_remaining_output_tokens_detects_speculative_tail(request_factory):
-    max_seq_len = 64
-    max_total_draft_tokens = 7
-    threshold = 2 * (max_total_draft_tokens + 1)
+def test_pard_requires_room_for_mask_rows(request_factory):
+    req = request_factory(prompt_len=24, generated=3, max_tokens=100)
+    assert budget.request_draft_budget(req, 7, 32, 1, is_pard=True) == 2
 
-    near_limit = request_factory(prompt_len=40, generated=10, max_tokens=50)
-    assert budget.remaining_output_tokens(near_limit, max_seq_len, cp_size=1) < threshold
 
-    far_from_limit = request_factory(prompt_len=20, generated=10, max_tokens=50)
-    assert budget.remaining_output_tokens(far_from_limit, max_seq_len, cp_size=1) >= threshold
-
+@pytest.mark.parametrize("mapped_ids", [[3, 1], [3, 0], [0, 3]])
+def test_reduced_vocab_padding_uses_target_zero_and_clears_reused_rows(mapped_ids):
+    expand = _load_host_module("_torch/speculative/ragged_helpers.py").expand_mapped_draft_probs
+    indices = torch.tensor(mapped_ids)
+    out = torch.zeros(1, 2, 4)
+    proposals = torch.tensor([[[1.0, 0.0], [1.0, 0.0]]])
+    # First row is synthetic target zero. The second really sampled draft ID zero.
+    expand(out, proposals, indices, torch.tensor([[0, mapped_ids[0]]]))
+    assert out[0, 0].tolist() == [1.0, 0.0, 0.0, 0.0]
+    assert out[0, 1, mapped_ids[0]] == 1
+    # A narrower step reuses the first scratch row, then a wider step reuses both.
+    real_probs = torch.tensor([[[0.25, 0.75], [0.25, 0.75]]])
+    real_tokens = torch.full((1, 2), mapped_ids[1])
+    for width in (1, 2):
+        expand(out[:, :width], real_probs[:, :width], indices, real_tokens[:, :width])
+        torch.testing.assert_close(out[:, :width, indices], real_probs[:, :width])
+        torch.testing.assert_close(out[:, :width].sum(-1), torch.ones(1, width))

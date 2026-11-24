@@ -1256,6 +1256,24 @@ def test_merge_helix_requests_without_padding():
             assert llm_request.get_tokens(0) == [5, 6, 7, 8]
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("cp_rank", [0, 1])
+def test_merge_helix_children_retain_global_prompt(cp_rank):
+    prompt = list(range(12))
+    request = trtllm.Request(
+        input_token_ids=prompt,
+        max_tokens=10,
+        sampling_config=trtllm.SamplingConfig(num_return_sequences=3),
+    )
+    item = RequestQueueItem(id=42, request=request, child_req_ids=[43, 44])
+    requests = merge_helix_requests(
+        [item], cp_rank=cp_rank, cp_size=2, tokens_per_block=4, exclude_last_generation_logits=False
+    )
+    assert [req.request_id for req in requests] == [42, 43, 44]
+    assert all(req.total_input_len_cp == len(prompt) for req in requests)
+    assert all(req.prompt_len < len(prompt) for req in requests)
+
+
 def test_merge_helix_requests_empty_ranks():
     """When num_total_blocks < cp_size, the highest CP ranks own no blocks.
 

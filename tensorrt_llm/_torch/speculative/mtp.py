@@ -38,6 +38,31 @@ def _select_mtp_position_ids(position_ids: torch.Tensor,
     return position_ids[..., token_indices]
 
 
+class _MTPRequestSlots(SlotManager):
+    """Map padding request IDs to one scratch slot outside the real request pool."""
+
+    def __init__(self, num_real_slots: int):
+        super().__init__(num_real_slots)
+        self._dummy_ids: set[int] = set()
+
+    def add_dummy(self, request_id: int):
+        if self.get_slot(request_id) is None:
+            self._dummy_ids.add(request_id)
+
+    def get_slot(self, request_id: int):
+        if request_id in self._dummy_ids:
+            return self.max_num_requests
+        return super().get_slot(request_id)
+
+    def remove_slot(self, request_id: int):
+        self._dummy_ids.discard(request_id)
+        super().remove_slot(request_id)
+
+    def shutdown(self):
+        self._dummy_ids.clear()
+        super().shutdown()
+
+
 class MTPHiddenStatesManager(BaseResourceManager):
 
     def __init__(self,
@@ -55,7 +80,7 @@ class MTPHiddenStatesManager(BaseResourceManager):
         # Reserve one extra slot for the CUDA graph padding dummy request,
         # which is kept alive permanently and must not consume a real slot.
         slot_pool_size = (num_seq_slots or max_num_requests) + 1
-        self.slot_manager = SlotManager(slot_pool_size)
+        self.slot_manager = _MTPRequestSlots(slot_pool_size - 1)
         # Optional SA manager for MTP+SA mode
         self.sa_manager = sa_manager
 
@@ -99,7 +124,7 @@ class MTPHiddenStatesManager(BaseResourceManager):
 
     def free_resources(self, request: LlmRequest):
         free_slot_id = self.slot_manager.get_slot(request.request_id)
-        if self.use_relaxed_acceptance_for_thinking:
+        if self.use_relaxed_acceptance_for_thinking and free_slot_id is not None:
             self.mtp_relaxed_delta_pool[free_slot_id].copy_(0,
                                                             non_blocking=True)
         self.slot_manager.remove_slot(request.request_id)
@@ -108,13 +133,7 @@ class MTPHiddenStatesManager(BaseResourceManager):
 
     def add_dummy_requests(self, request_ids: List[int]):
         for rid in request_ids:
-            # The target and draft engines share this resource manager and
-            # each registers its padding dummy under the same
-            # draft-length-derived request ID. Reserve the slot once and share
-            # it between them; dummy outputs are discarded, so the slot
-            # contents never matter (mirrors SuffixAutomatonManager).
-            if self.slot_manager.get_slot(rid) is None:
-                self.slot_manager.add_slot(rid)
+            self.slot_manager.add_dummy(rid)
         if self.sa_manager is not None:
             self.sa_manager.add_dummy_requests(request_ids)
 

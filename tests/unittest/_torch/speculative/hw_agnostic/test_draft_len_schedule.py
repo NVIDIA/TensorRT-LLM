@@ -136,7 +136,7 @@ def test_correctness_across_batch_sizes(
                 top_k=1,
                 top_p=1.0,
             )
-            for max_tokens in [4] * 4 + [8] * 3 + [24]
+            for max_tokens in [4] * 4 + [8] * 3 + [12]
         ]
 
     # With dynamic draft_len_schedule
@@ -151,13 +151,15 @@ def test_correctness_across_batch_sizes(
             original_handle_dynamic_draft_len(scheduled_batch)
             remaining = min(
                 (
-                    min(executor.max_seq_len - req.get_num_tokens(0),
-                        req.py_max_new_tokens - (req.get_num_tokens(0) - req.py_orig_prompt_len))
-                    for req in scheduled_batch.all_requests() if not req.is_dummy
+                    executor.max_seq_len - req.get_num_tokens(0)
+                    for req in scheduled_batch.generation_requests
+                    if not req.is_dummy
                 ),
                 default=max_draft_len + 1,
             )
-            runtime_schedule.append((scheduled_batch.batch_size, executor.runtime_draft_len, remaining))
+            runtime_schedule.append(
+                (scheduled_batch.batch_size, executor.runtime_draft_len, remaining)
+            )
 
         monkeypatch.setattr(
             executor, "_handle_dynamic_draft_len", instrumented_handle_dynamic_draft_len
@@ -168,6 +170,9 @@ def test_correctness_across_batch_sizes(
     llm_with_schedule.shutdown()
 
     if drafter_type == "model_drafter":
+        assert [len(r.outputs[0].token_ids) for r in results_with_schedule] == [
+            params.max_tokens for params in sampling_params_list
+        ]
         for batch_size, runtime_draft_len, remaining in runtime_schedule:
             scheduled_len = get_draft_len_for_batch_size(schedule, batch_size, max_draft_len)
             expected_draft_len = max(0, min(scheduled_len, remaining - 1))

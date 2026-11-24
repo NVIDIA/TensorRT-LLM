@@ -73,6 +73,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler import (
     SerializableSchedulerOutput,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
+    SchedulerOutput,
     split_encoder_from_decoder_context_requests,
 )
 from tensorrt_llm.bindings.executor import RequestType
@@ -4830,6 +4831,111 @@ class TestOneModelMTPDraftTokenScheduling:
         assert ex.runtime_draft_len == self.MAX_TOTAL_DRAFT_TOKENS
         assert gen.py_needs_onehot_draft_probs
         assert gen.py_draft_tokens == [0] * self.MAX_TOTAL_DRAFT_TOKENS
+
+    def test_boundary_reservation_matches_verifier_and_preserves_prefill(self):
+        gen = self._make_llm_request(1, LlmRequestState.GENERATION_IN_PROGRESS)
+        ctx = self._make_llm_request(2, LlmRequestState.CONTEXT_INIT)
+        ctx.max_new_tokens = ctx.py_max_new_tokens = 1
+        ex = self._make_one_model_mtp_executor([ctx, gen])
+        ex.model_engine.spec_config = MTPDecodingConfig(max_draft_len=7)
+        ex.model_engine.max_draft_len = ex.max_total_draft_tokens = 7
+        ex.max_seq_len = gen.get_num_tokens(0) + 3
+        ex.dist = types.SimpleNamespace(cp_size=1)
+        batch = ScheduledRequests()
+        batch.context_requests_last_chunk = [ctx]
+        batch.generation_requests = [gen]
+        gen.py_draft_tokens = list(range(1, 8))
+
+        ex._reserve_one_model_draft_tokens()
+        ex._handle_dynamic_draft_len(batch)
+        assert ex.runtime_draft_len == gen.num_draft_tokens == 2
+        assert gen.py_draft_tokens == [1, 2]
+
+        gen.add_new_token(1, 0)
+        gen.add_new_token(2, 0)
+        batch.context_requests_last_chunk = []
+        ex._reserve_one_model_draft_tokens()
+        ex._handle_dynamic_draft_len(batch)
+        assert ex.runtime_draft_len == gen.num_draft_tokens == 0
+        assert gen.py_draft_tokens == []
+
+    def test_terminal_forward_defers_prefill_and_retains_live_drafter_state(self):
+        terminal = self._make_llm_request(1, LlmRequestState.GENERATION_IN_PROGRESS)
+        continuing = self._make_llm_request(2, LlmRequestState.GENERATION_IN_PROGRESS)
+        ctx = self._make_llm_request(3, LlmRequestState.CONTEXT_INIT)
+        terminal.add_new_token(9, 0)
+        ex = self._make_one_model_mtp_executor([terminal, continuing, ctx])
+        ex.max_seq_len = terminal.get_num_tokens(0) + 1
+        ex.max_draft_len = 7
+        ex.dist = types.SimpleNamespace(cp_size=1)
+        ex.ctx_decoder_batcher = None
+        ex.is_encoder_decoder = ex.enable_batch_waiting = False
+        ex.inflight_req_ids = set()
+        ex.kv_cache_manager = Mock()
+        ex.scheduler = Mock()
+        ex.scheduler.take_lost_kv_requests.return_value = []
+        ex.scheduler.schedule_request.return_value = SchedulerOutput(
+            [], [ctx], [terminal, continuing], [], [], 3
+        )
+        ex._get_ctx_mla_kv_len_cap = Mock(return_value=None)
+        ex._revert_context_chunks = Mock()
+        ex._revert_unexecuted_alloc = Mock()
+
+        scheduled, _, _ = PyExecutor._schedule(ex)
+        assert scheduled.generation_requests == [terminal]
+        assert scheduled.context_requests == []
+        assert scheduled.paused_in_place_ids == {continuing.request_id}
+        ex._revert_context_chunks.assert_called_once_with([ctx])
+        assert ex._revert_unexecuted_alloc.call_args.args[0].generation_requests == [continuing]
+
+    def test_overlap_waits_only_when_pending_burst_can_exhaust_context(self):
+        gen = self._make_llm_request(1, LlmRequestState.GENERATION_IN_PROGRESS)
+        gen.max_new_tokens = gen.py_max_new_tokens = 1
+        ex = self._make_one_model_mtp_executor([gen])
+        ex.max_draft_len = 3
+        ex.dist = types.SimpleNamespace(cp_size=1)
+        ex.inflight_req_ids = set()
+        state = types.SimpleNamespace(requests=[gen], runtime_draft_len=3)
+        ex.previous_batch = types.SimpleNamespace(sample_state=state)
+        ex.max_seq_len = gen.get_num_tokens(0) + 8
+        assert not ex._pending_speculative_tail_ids()
+        ex.max_seq_len -= 1
+        assert ex._pending_speculative_tail_ids() == {gen.request_id}
+        ex.speculation_permanently_disabled = True
+        state.runtime_draft_len = 0
+        assert not ex._pending_speculative_tail_ids()
+
+    def test_separate_drafter_reserves_reenabled_batch_width(self):
+        gen = self._make_llm_request(1, LlmRequestState.GENERATION_IN_PROGRESS)
+        ex = self._make_one_model_mtp_executor([gen])
+        ex.max_seq_len = 64
+        ex.dist = types.SimpleNamespace(cp_size=1)
+        gen.py_disable_speculative_decoding = True
+        ex.use_spec_decode = False
+        ex._prepare_draft_requests()
+        assert gen.num_draft_tokens == 0
+        ex.use_spec_decode = True
+        ex._prepare_draft_requests()
+        assert gen.num_draft_tokens == gen.py_draft_pages_allocated == ex.max_total_draft_tokens
+        assert len(gen.py_draft_tokens) == gen.num_draft_tokens
+
+    def test_acceptance_gate_observes_verified_width_before_metrics_clear_it(self):
+        gen = self._make_llm_request(1, LlmRequestState.GENERATION_IN_PROGRESS)
+        ex = self._make_one_model_mtp_executor([gen])
+        ex.dist = types.SimpleNamespace(has_pp=False)
+        ex.max_draft_len = 7
+        ex.iter_counter = 1
+        ex.sampler = Mock()
+        ex.speculation_gate = Mock()
+        ex.speculation_gate.record_acceptance_rate.return_value = False, 1.0
+        gen.draft_tokens = [0] * 7
+        gen.py_num_accepted_draft_tokens = gen.py_num_draft_tokens_verified = 2
+        state = types.SimpleNamespace(requests=[gen])
+        ex._update_requests(state)
+        ex.speculation_gate.record_acceptance_rate.assert_called_once_with(1.0, sample_id=1)
+        assert gen.py_num_draft_tokens_verified == 0
+        ex._update_requests(state)
+        assert ex.speculation_gate.record_acceptance_rate.call_count == 1
 
     def test_one_model_mtp_preserves_sampler_draft_tokens(self) -> None:
         sampler_drafts = [7, 8]

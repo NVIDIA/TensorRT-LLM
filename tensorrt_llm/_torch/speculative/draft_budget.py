@@ -23,51 +23,83 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import DecodingBaseConfig
+    from ...mapping import Mapping
+    from ..model_config import ModelConfig
     from ..pyexecutor.llm_request import LlmRequest
     from ..pyexecutor.scheduler import ScheduledRequests
 
 
-def uses_fixed_tree(config: DecodingBaseConfig) -> bool:
-    return not config.is_linear_tree or (
-        getattr(config, "use_dynamic_tree", False) and config.dynamic_tree_max_topK > 1
+def fixed_draft_reserve(
+    config: DecodingBaseConfig | None,
+    model_config: ModelConfig,
+    mapping: Mapping,
+    *,
+    disaggregated: bool,
+    overlap: bool,
+) -> int:
+    """Return admission headroom for targets or execution groups with a fixed verify layout.
+
+    An overlapped forward can precede retirement of a full previous burst.
+    """
+    if config is None or not config.max_draft_len:
+        return 0
+    shared_width = (
+        disaggregated
+        or mapping.pp_size > 1
+        or (mapping.enable_attention_dp and mapping.tp_size > 1)
     )
+    if not (
+        model_config.modeling_v2_target is not None
+        or shared_width
+        or not config.is_linear_tree
+        or getattr(config, "use_dynamic_tree", False)
+    ):
+        return 0
+    return config.tokens_per_gen_step - 1 + (config.max_draft_len + 1 if overlap else 0)
 
 
-def _token_room(request: LlmRequest, max_seq_len: int, cp_size: int) -> tuple[int, int]:
+def remaining_sequence_tokens(request: LlmRequest, max_seq_len: int, cp_size: int = 1) -> int:
+    """Count free sequence positions using the unsliced prompt for Helix CP."""
     current = request.get_num_tokens(0)
-    generated = current - request.py_orig_prompt_len
     if cp_size > 1:
-        # Disaggregated Helix ranks have different local prompt slices.
+        generated = current - request.py_orig_prompt_len
         current = request.total_input_len_cp // cp_size + generated
-    return max_seq_len - current, request.py_max_new_tokens - generated
-
-
-def remaining_output_tokens(request: LlmRequest, max_seq_len: int, cp_size: int = 1) -> int:
-    return min(_token_room(request, max_seq_len, cp_size))
+    return max_seq_len - current
 
 
 def request_draft_budget(
     request: LlmRequest, max_draft_len: int, max_seq_len: int, cp_size: int, *, is_pard: bool
 ) -> int:
+    """Cap the proposals so their physical target verification fits the request's context."""
     if request.is_dummy:
         return max_draft_len
-    seq_room, gen_room = _token_room(request, max_seq_len, cp_size)
+    seq_room = remaining_sequence_tokens(request, max_seq_len, cp_size)
     # PARD submits K proposals and K-1 mask rows along with the target token.
     seq_limit = seq_room // 2 if is_pard else seq_room - 1
-    return max(0, min(max_draft_len, seq_limit, gen_room - 1))
+    return max(0, min(max_draft_len, seq_limit))
 
 
 def batch_draft_budget(
-    requests: Iterable[LlmRequest], max_draft_len: int, max_seq_len: int, cp_size: int, *, is_pard: bool
+    requests: Iterable[LlmRequest],
+    max_draft_len: int,
+    max_seq_len: int,
+    cp_size: int,
+    *,
+    is_pard: bool,
 ) -> int:
     """A uniform verify width that fits every real request in the batch."""
     return min(
-        (request_draft_budget(r, max_draft_len, max_seq_len, cp_size, is_pard=is_pard) for r in requests),
+        (
+            request_draft_budget(r, max_draft_len, max_seq_len, cp_size, is_pard=is_pard)
+            for r in requests
+        ),
         default=max_draft_len,
     )
 
 
-def resize_draft_tokens(request: LlmRequest, draft_len: int, *, is_pard: bool, rejection_on: bool) -> None:
+def resize_draft_tokens(
+    request: LlmRequest, draft_len: int, *, is_pard: bool, rejection_on: bool
+) -> None:
     """Keep the proposal prefix and pad unused input positions with token zero."""
     proposals = request.py_draft_tokens or []
     width = max(0, 2 * draft_len - 1) if is_pard else draft_len
@@ -76,7 +108,7 @@ def resize_draft_tokens(request: LlmRequest, draft_len: int, *, is_pard: bool, r
     if len(proposals) == width:
         return
     if is_pard:
-        proposals = proposals[:min((len(proposals) + 1) // 2, draft_len)]
+        proposals = proposals[: min((len(proposals) + 1) // 2, draft_len)]
     request.py_draft_tokens = proposals[:width] + [0] * max(0, width - len(proposals))
 
 
@@ -91,14 +123,16 @@ def get_draft_len_for_batch_size(
     return draft_len_schedule[thresholds[index]] if index < len(thresholds) else 0
 
 
-def resolve_draft_len(spec_config: DecodingBaseConfig | None,
-                      scheduled_batch: ScheduledRequests,
-                      *,
-                      max_draft_len: int,
-                      static_draft_len: int,
-                      draft_len: int | None = None,
-                      draft_budget: int | None = None,
-                      speculation_permanently_disabled: bool = False) -> int:
+def resolve_draft_len(
+    spec_config: DecodingBaseConfig | None,
+    scheduled_batch: ScheduledRequests,
+    *,
+    max_draft_len: int,
+    static_draft_len: int,
+    draft_len: int | None = None,
+    draft_budget: int | None = None,
+    speculation_permanently_disabled: bool = False,
+) -> int:
     """Synchronize this batch's draft buffers and return its draft length.
 
     Dynamic and explicit lengths pad or truncate generation-request buffers to
@@ -112,12 +146,14 @@ def resolve_draft_len(spec_config: DecodingBaseConfig | None,
 
     is_static = False
     if draft_len is None:
-        if (spec_config is not None
-                and spec_config.draft_len_schedule is not None
-                and spec_config.spec_dec_mode.support_dynamic_draft_len()):
+        if (
+            spec_config is not None
+            and spec_config.draft_len_schedule is not None
+            and spec_config.spec_dec_mode.support_dynamic_draft_len()
+        ):
             draft_len = get_draft_len_for_batch_size(
-                spec_config.draft_len_schedule, scheduled_batch.batch_size,
-                max_draft_len)
+                spec_config.draft_len_schedule, scheduled_batch.batch_size, max_draft_len
+            )
         elif draft_budget is None:
             # Static decoding preserves the proposals produced by the drafter,
             # including requests intentionally entering with no draft tokens.

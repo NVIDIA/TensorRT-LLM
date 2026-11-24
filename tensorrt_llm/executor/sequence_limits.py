@@ -23,8 +23,7 @@ if TYPE_CHECKING:
     from .._torch.pyexecutor.llm_request import LlmRequest
 
 
-def context_length_exceeded_message(max_context_length: int,
-                                    num_prompt_tokens: int) -> str:
+def context_length_exceeded_message(max_context_length: int, num_prompt_tokens: int) -> str:
     """Client-facing message for a prompt that exceeds the model context.
 
     Mirrors OpenAI's wording so agent frameworks that pattern-match it (to
@@ -34,11 +33,12 @@ def context_length_exceeded_message(max_context_length: int,
     return (
         f"This model's maximum context length is {max_context_length} tokens. "
         f"However, your messages resulted in {num_prompt_tokens} tokens. "
-        "Please reduce the length of the messages.")
+        "Please reduce the length of the messages."
+    )
 
 
 def generation_capacity(prompt_len: int, max_seq_len: int, cp_size: int = 1) -> int:
-    """Available output tokens under the worker's per-CP-rank context limit."""
+    """Return output capacity under the per-CP-rank limit, raising when no output fits."""
     capacity = max_seq_len - prompt_len // cp_size
     if capacity <= 0:
         raise ValueError(context_length_exceeded_message(max_seq_len * cp_size, prompt_len))
@@ -50,8 +50,13 @@ def clamp_generation_request(
 ) -> None:
     """Apply the same limit to the native scheduler and the Python sampler."""
     prompt_len = request.total_input_len_cp
-    capacity = generation_capacity(prompt_len, max(0, max_seq_len - draft_reserve), cp_size)
+    capacity = generation_capacity(prompt_len, max_seq_len, cp_size) - draft_reserve
+    if capacity <= 0:
+        message = context_length_exceeded_message(max_seq_len * cp_size, prompt_len)
+        raise ValueError(
+            f"{message} Speculative verification reserves {draft_reserve} "
+            "additional positions per context-parallel rank."
+        )
     if request.max_new_tokens > capacity:
         request.max_new_tokens = capacity
         request.py_max_new_tokens = capacity
-

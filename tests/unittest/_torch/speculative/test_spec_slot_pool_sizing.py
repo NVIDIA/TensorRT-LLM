@@ -144,7 +144,7 @@ def test_mtp_hidden_states_pool_spans_the_slot_pool(num_seq_slots, expected_pool
         _mtp_config(), torch.float16, hidden_size=8, max_num_requests=R, num_seq_slots=num_seq_slots
     )
 
-    assert mgr.slot_manager.max_num_requests == expected_pool
+    assert mgr.slot_manager.max_num_requests == expected_pool - 1
     assert mgr.mtp_past_hidden_states_pool.shape[0] == expected_pool
     assert mgr.mtp_past_tokens_pool.shape[0] == expected_pool
     assert mgr.mtp_relaxed_delta_pool.shape[0] == expected_pool
@@ -162,6 +162,11 @@ def test_mtp_slot_pool_survives_a_full_overlap_turnover():
         _mtp_config(), torch.float16, hidden_size=8, max_num_requests=R, num_seq_slots=POOL
     )
 
+    dummy_ids = [1000, 1001, 1002]
+    mgr.add_dummy_requests(dummy_ids)
+    assert {mgr.slot_manager.get_slot(rid) for rid in dummy_ids} == {POOL}
+    mgr.free_resources(types.SimpleNamespace(request_id=dummy_ids[0]))
+    assert mgr.slot_manager.get_slot(dummy_ids[1]) == POOL
     retiring = [mgr.slot_manager.add_slot(rid) for rid in range(R)]
     # Replacements are admitted before the deferred teardown frees the slots.
     incoming = [mgr.slot_manager.add_slot(rid) for rid in range(R, 2 * R)]
@@ -371,7 +376,7 @@ def test_eagle3_slot_manager_spans_the_slot_pool(num_seq_slots, expected_pool):
         num_seq_slots=num_seq_slots,
     )
 
-    assert mgr.slot_manager.max_num_requests == expected_pool
+    assert mgr.slot_manager.max_num_requests == expected_pool - 1
     assert mgr.relaxed_delta_pool.shape[0] == expected_pool
     assert len(mgr.seq_lens) == expected_pool
     assert len(mgr.start_indices) == expected_pool

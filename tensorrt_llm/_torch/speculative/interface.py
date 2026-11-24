@@ -3647,8 +3647,9 @@ class SpecWorkerBase(nn.Module, ABC):
                         target_indices = (source_indices +
                                           d2t.to(device=device)) % vocab_size
                         spec_metadata.d2t_target_indices = target_indices
-                    full_draft_probs[:, :runtime_draft_len,
-                                     target_indices] = draft_probs
+                    from .ragged_helpers import expand_mapped_draft_probs
+                    expand_mapped_draft_probs(full_draft_probs, draft_probs,
+                                              target_indices, draft_tokens)
                 else:
                     assert draft_vocab_size < vocab_size
                     full_draft_probs[:, :runtime_draft_len, :

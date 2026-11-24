@@ -67,6 +67,7 @@ from ..speculative import (draft_prompt_lookahead, get_draft_block_width,
                            get_spec_decoder, should_use_separate_draft_kv_cache)
 from ..speculative.dflash_attention import (DFLASH_FOLDED_DECODE_LOWERING,
                                             dflash_trtllm_supports_page_size)
+from ..speculative.draft_budget import fixed_draft_reserve
 from ..speculative.spec_sampler_base import SpecSampler
 from . import config_utils
 from .config_utils import (MambaKVCacheParams, _is_sliding_attention_layer,
@@ -1289,7 +1290,12 @@ class KvCacheCreator:
         self._unification_max_seq_len = max_seq_len
         self._max_batch_size = max_batch_size
         self._gen_preemption_headroom = gen_preemption_headroom
+        # The estimation requests go through the same admission policy as serving requests.
         self._net_max_seq_len = net_max_seq_len
+        if speculative_config is not None:
+            self._net_max_seq_len -= fixed_draft_reserve(
+                speculative_config, model_engine.model.model_config, mapping,
+                disaggregated=is_disagg, overlap=not llm_args.disable_overlap_scheduler)
         self._dummy_reqs = None
         self._mla_chunked_profile_length: int | None = None
         # Prompt length of the fresh-prefill dummies the profiling forward runs.
