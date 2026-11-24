@@ -7,6 +7,8 @@ import base64
 import io
 import pickle
 import struct
+import threading
+import tracemalloc
 import zipfile
 import zlib
 from typing import Callable, Optional
@@ -167,11 +169,23 @@ def test_saved_tensors_round_trip(monkeypatch, tensor: torch.Tensor, save_kwargs
     assert torch.equal(decoded, tensor.detach())
 
 
-def test_async_round_trip() -> None:
-    """The async wrapper returns the same tensor."""
+def test_async_round_trip(monkeypatch) -> None:
+    """The async wrapper decodes in a worker thread, off the event loop."""
+    threads = []
+    load = utils.load_base64_tensor
+
+    def spy(data: str, *, max_bytes: int) -> torch.Tensor:
+        threads.append(threading.get_ident())
+        return load(data, max_bytes=max_bytes)
+
+    async def run() -> torch.Tensor:
+        threads.append(threading.get_ident())
+        return await async_load_base64_tensor(_encode(tensor), max_bytes=_LIMIT)
+
+    monkeypatch.setattr(utils, "load_base64_tensor", spy)
     tensor = torch.arange(12, dtype=torch.float32).reshape(3, 4)
-    decoded = asyncio.run(async_load_base64_tensor(_encode(tensor), max_bytes=_LIMIT))
-    assert torch.equal(decoded, tensor)
+    assert torch.equal(asyncio.run(run()), tensor)
+    assert len(threads) == 2 and threads[0] != threads[1]
 
 
 def test_encoded_length_checked_before_decode(monkeypatch) -> None:
@@ -199,6 +213,21 @@ def test_line_wrapped_base64_near_limit_accepted() -> None:
     limit = len(base64.b64decode(payload))
     assert len(wrapped) > 4 * ((limit + 2) // 3)
     assert torch.equal(load_base64_tensor(wrapped, max_bytes=limit), tensor)
+
+
+def test_whitespace_retry_releases_the_failed_attempt() -> None:
+    """A trailing newline costs a second decode, but not a third copy of the payload."""
+    raw = bytes(range(256)) * (1 << 14)
+    text = base64.b64encode(raw).decode() + "\n"
+    tracemalloc.start()
+    try:
+        with pytest.raises(ValueError, match="zip"):
+            load_base64_tensor(text, max_bytes=len(raw))
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    # The decoded slices plus their join: two copies, not three.
+    assert peak < 2.5 * len(raw)
 
 
 @pytest.mark.parametrize("payload", ["not base64!", "QUJD\nRE!G", "QUJDé"])
@@ -295,6 +324,14 @@ def test_sliced_decoding_matches_whole_text(monkeypatch, tail: str) -> None:
         ),
         pytest.param(lambda: _encode([torch.zeros(2)]), "unsupported pickle opcode", id="list"),
         pytest.param(
+            lambda: _replace_pickle(_encode(torch.zeros(2)), b"\x80\x02ctorch._utils\n"),
+            "malformed",
+            id="truncated",
+        ),
+        pytest.param(
+            lambda: _encode(torch.tensor([1 + 2j]).conj().imag), "", id="negative-bit-view"
+        ),
+        pytest.param(
             lambda: _encode(torch.zeros(2, 2, dtype=torch.int32)), "unsupported dtype", id="int32"
         ),
         pytest.param(lambda: _encode(torch.zeros(4, 4).to_sparse()), "", id="sparse"),
@@ -312,6 +349,11 @@ def test_sliced_decoding_matches_whole_text(monkeypatch, tail: str) -> None:
             lambda: _encode(torch.zeros(1, 1024).expand(4096, 1024)),
             "describes",
             id="view-over-limit",
+        ),
+        pytest.param(
+            lambda: _replace_pickle(_encode(torch.zeros(4)), _view_pickle(0, (4,), (1,), _LIMIT)),
+            "describes",
+            id="storage-over-limit",
         ),
         pytest.param(
             # Four rows of two at stride 3 cover 8 elements but end at element 10.
@@ -412,6 +454,13 @@ def _zip64_locator_moved() -> str:
             8 << 20,
             "does not match its tensor",
             id="storage-past-archive",
+        ),
+        pytest.param(
+            # Declared record sizes summing past the limit are refused before reading.
+            lambda: _patch_record_sizes(_encode(torch.zeros(4)), "data/0", 2 * _LIMIT, 2 * _LIMIT),
+            _LIMIT,
+            "expands to",
+            id="records-over-limit",
         ),
         pytest.param(
             lambda: _rewrite(_encode(torch.zeros(2)), add=[f"junk/{i}" for i in range(20_000)]),

@@ -332,9 +332,10 @@ def _read_tensor_archive(content: bytes,
                 # zipfile reads compress_size bytes even for a stored member,
                 # so the two sizes must agree for file_size to bound reads.
                 if (member.compress_type != zipfile.ZIP_STORED
-                        or member.compress_size != member.file_size):
-                    raise ValueError(
-                        "Tensor payload members must be uncompressed.")
+                        or member.compress_size != member.file_size
+                        or member.flag_bits & 0x1):
+                    raise ValueError("Tensor payload members must be stored "
+                                     "uncompressed and unencrypted.")
                 total += member.file_size
             if total > max_bytes:
                 raise ValueError(
@@ -376,11 +377,9 @@ def _read_tensor_archive(content: bytes,
                     filled += len(chunk)
             if filled != storage_bytes:
                 raise ValueError("Tensor payload storage record is truncated.")
-    except (ValueError, MemoryError):
-        raise
-    except Exception as e:
-        # zipfile raises many types (BadZipFile, NotImplementedError,
-        # RuntimeError, EOFError, ...) on malformed archives.
+    except (zipfile.BadZipFile, zipfile.LargeZipFile, EOFError, OSError,
+            NotImplementedError, KeyError, struct.error) as e:
+        # zipfile raises these on malformed archives.
         raise ValueError(
             f"Tensor payload must be a torch.save zip archive: {e}") from e
     return spec, storage
@@ -432,7 +431,8 @@ def load_base64_tensor(data: str, *, max_bytes: int) -> torch.Tensor:
     tensor is built from the checked fields. The tensor's logical size is at
     most ``max_bytes``, and peak allocation here is about twice the decoded
     payload (the payload plus the tensor's storage). Only little-endian
-    float16, bfloat16 and float32 tensors load. Callers check shape.
+    float16, bfloat16 and float32 tensors load, without conjugate or negative
+    bits (save ``tensor.resolve_conj().resolve_neg()``). Callers check shape.
 
     Args:
         data: Standard base64 text of a ``torch.save`` file; ASCII whitespace
@@ -454,14 +454,20 @@ def load_base64_tensor(data: str, *, max_bytes: int) -> torch.Tensor:
     # Base64 is ASCII; checked first because translate() is slow on other text.
     if not data.isascii():
         raise ValueError("Tensor payload is not valid base64: non-ASCII text.")
+    content, error = None, ""
     try:
         content = _b64decode_strict(data)
     except ValueError as e:
+        error = str(e)
+    if content is None:
         # Line-wrapped base64 is accepted; only then is whitespace stripped.
+        # This runs outside the handler, whose traceback would keep the
+        # failed attempt's decoded slices alive.
         try:
             content = _b64decode_strict(data, strip_whitespace=True)
         except ValueError:
-            raise ValueError(f"Tensor payload is not valid base64: {e}") from e
+            raise ValueError(
+                f"Tensor payload is not valid base64: {error}") from None
     if len(content) > max_bytes:
         raise ValueError(f"Tensor payload is {len(content)} bytes, over the "
                          f"{max_bytes}-byte limit.")
