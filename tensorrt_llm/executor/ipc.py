@@ -20,7 +20,7 @@ import pickle  # nosec B403
 import threading
 import time
 import traceback
-from queue import Queue
+from queue import Empty, Queue
 from typing import Any, Callable, Optional
 
 import zmq
@@ -55,7 +55,8 @@ class ZeroMqQueue:
                  is_server: bool,
                  is_async: bool = False,
                  name: Optional[str] = None,
-                 use_hmac_encryption: bool = True):
+                 use_hmac_encryption: bool = True,
+                 recv_timeout: Optional[float] = None):
         '''
         Parameters:
             address (tuple[str, Optional[bytes]], optional): The address (tcp-ip_port, hmac_auth_key) for the IPC. Defaults to None. If hmac_auth_key is None and use_hmac_encryption is False, the queue will not use HMAC encryption.
@@ -64,6 +65,8 @@ class ZeroMqQueue:
             is_async (bool): Whether to use asyncio for the socket. Defaults to False.
             name (str, optional): The name of the queue. Defaults to None.
             use_hmac_encryption (bool): Whether to use HMAC encryption for pickled data. Defaults to True.
+            recv_timeout (float, optional): Default receive timeout in seconds.
+                Configured once on the socket, without polling before each receive.
         '''
 
         if not use_hmac_encryption:
@@ -83,6 +86,10 @@ class ZeroMqQueue:
         self.name = name
         self.socket = self.context.socket(socket_type)
         self.socket.set_hwm(0)
+        if recv_timeout is not None:
+            if recv_timeout < 0:
+                raise ValueError("recv_timeout must be non-negative")
+            self.socket.setsockopt(zmq.RCVTIMEO, int(recv_timeout * 1000))
 
         # For ROUTER sockets, track the last identity to enable replies. For now we assume there is only one client in our case.
         self._last_identity = None
@@ -216,6 +223,30 @@ class ZeroMqQueue:
                 # Standard socket without encryption - use pyobj directly
                 self.socket.send_pyobj(obj)
 
+    def put_interruptible(self, obj: Any, should_stop: Callable[[],
+                                                                bool]) -> None:
+        """Send on a proxy-owned socket until delivery or local cancellation.
+
+        Other queues retain their blocking send behavior. A finite socket send
+        timeout adds no poll to successful sends and lets the owning thread
+        observe cancellation without another thread closing its socket.
+        """
+        self.setup_lazily()
+        self._check_thread_safety()
+        if not getattr(self, "_interruptible_send_configured", False):
+            self.socket.setsockopt(zmq.SNDTIMEO, 50)
+            self._interruptible_send_configured = True
+        data = self._prepare_data(obj)
+        with nvtx_range_debug("send", color="blue", category="IPC"):
+            while not should_stop():
+                try:
+                    self._send_data(data)
+                    return
+                except zmq.Again:
+                    continue
+        raise RuntimeError(
+            "Executor proxy request send cancelled during shutdown.")
+
     def put_nowait(self, obj: Any, routing_id: Optional[bytes] = None):
         """Send an object without waiting for a writable peer.
 
@@ -302,9 +333,10 @@ class ZeroMqQueue:
         """Receive an object from the queue.
 
         Args:
-            timeout: If ``None`` (default), block until a message arrives.
-                If a non-negative float, wait up to that many seconds and
-                raise ``queue.Empty`` if nothing arrives in time.
+            timeout: If ``None`` (default), receive using the socket's
+                configured timeout (blocking indefinitely by default).
+                If a non-negative float, poll for up to that many seconds.
+                Raise ``queue.Empty`` if no message arrives in time.
         """
         self.setup_lazily()
         self._check_thread_safety()
@@ -313,9 +345,11 @@ class ZeroMqQueue:
             # from seconds. ``poll`` returns 0 when the timeout fires
             # without any event on the socket.
             if not self.socket.poll(timeout=int(timeout * 1000)):
-                from queue import Empty
                 raise Empty()
-        return self._recv_data()
+        try:
+            return self._recv_data()
+        except zmq.Again:
+            raise Empty() from None
 
     def drain(self) -> list[Any]:
         """Non-blocking drain: return all currently available messages without waiting."""

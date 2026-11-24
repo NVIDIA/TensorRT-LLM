@@ -16,6 +16,7 @@
 
 import asyncio
 import queue as _queue
+import threading
 import time as _time
 from concurrent.futures import Future as _Future
 from unittest.mock import Mock
@@ -58,6 +59,8 @@ class _FakeResult:
 
 def _bare_proxy():
     proxy = GenerationExecutorProxy.__new__(GenerationExecutorProxy)
+    proxy._init_lifecycle()
+    proxy._error_queue = _queue.Queue()
     proxy._engine_dead = False
     proxy._results = {}
     # Set so the __del__ -> shutdown() path is a clean no-op at GC time.
@@ -589,7 +592,8 @@ def test_proxy_check_remote_worker_death_marks_engine_dead():
 def _teardown_proxy(engine_dead):
     proxy = _bare_proxy()
     proxy.workers_started = True
-    proxy.doing_shutdown = True  # skip pre_shutdown(); teardown path only
+    proxy.doing_shutdown = True
+    proxy._pre_shutdown_complete = True  # teardown path only
     proxy._engine_dead = engine_dead
     proxy._fatal_error = RuntimeError("worker died") if engine_dead else None
     proxy.dispatch_result_thread = None
@@ -614,9 +618,7 @@ def test_shutdown_does_not_block_on_dead_engine():
     done.set_exception(RuntimeError("captured by mpi_done_callback already"))
     proxy.mpi_futures = [pending, done]
 
-    dispatcher = _Mock()
-    dispatcher.is_alive.return_value = True
-    proxy.dispatch_result_thread = dispatcher
+    proxy._stop_dispatch_thread = _Mock()
 
     start = _time.monotonic()
     proxy.shutdown()
@@ -625,9 +627,7 @@ def test_shutdown_does_not_block_on_dead_engine():
     # One collective 5 s grace, not an unbounded f.result() per future.
     assert elapsed < 30
     assert not pending.done()
-    # The dispatcher join is bounded (daemon thread is leaked, not awaited).
-    dispatcher.stop.assert_called_once()
-    dispatcher.join.assert_called_once_with(timeout=5.0)
+    proxy._stop_dispatch_thread.assert_called_once_with(drain=False)
     # The dead pool is not joined; the session is abandoned instead.
     proxy.mpi_session.abandon.assert_called_once_with()
     proxy.mpi_session.shutdown.assert_not_called()
@@ -641,13 +641,11 @@ def test_shutdown_keeps_blocking_semantics_when_engine_alive():
     done.set_result(None)
     proxy.mpi_futures = [done]
 
-    dispatcher = _Mock()
-    dispatcher.is_alive.return_value = True
-    proxy.dispatch_result_thread = dispatcher
+    proxy._stop_dispatch_thread = _Mock()
 
     proxy.shutdown()
 
-    dispatcher.join.assert_called_once_with(timeout=None)
+    proxy._stop_dispatch_thread.assert_called_once_with(drain=True)
     proxy.mpi_session.shutdown.assert_called_once_with()
     proxy.mpi_session.abandon.assert_not_called()
     assert proxy.workers_started is False
@@ -668,9 +666,7 @@ def test_shutdown_bounds_wait_on_worker_that_never_finishes(monkeypatch):
     stuck = [_Future() for _ in range(4)]  # never complete
     proxy.mpi_futures = [done, *stuck]
 
-    dispatcher = _Mock()
-    dispatcher.is_alive.return_value = True
-    proxy.dispatch_result_thread = dispatcher
+    proxy._stop_dispatch_thread = _Mock()
 
     start = _time.monotonic()
     proxy.shutdown()
@@ -682,10 +678,133 @@ def test_shutdown_bounds_wait_on_worker_that_never_finishes(monkeypatch):
     item = r.queue.get_nowait()
     assert isinstance(item, EngineDeadError)
     assert isinstance(item.root_cause, TimeoutError)
-    dispatcher.join.assert_called_once_with(timeout=5.0)
+    proxy._stop_dispatch_thread.assert_called_once_with(drain=False)
     proxy.mpi_session.abandon.assert_called_once_with()
     proxy.mpi_session.shutdown.assert_not_called()
     assert proxy.workers_started is False
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("engine_dead,send_tail", [(True, False), (False, True), (False, False)])
+def test_shutdown_joins_real_dispatcher_before_socket_close(
+    tmp_path, monkeypatch, engine_dead, send_tail
+) -> None:
+    """A quiet result lane cannot outlive shutdown or lose a healthy final batch."""
+    from tensorrt_llm.executor.ipc import FusedIpcQueue
+    from tensorrt_llm.executor.utils import ErrorResponse
+
+    proxy = _teardown_proxy(engine_dead)
+    proxy.mpi_futures = []
+    proxy.garbage_collection_gen0_threshold = None
+    proxy.doing_shutdown = False
+    received = threading.Event()
+    closing_dispatcher = threading.Event()
+    proxy.result_queue = FusedIpcQueue(
+        (f"ipc://{tmp_path / 'result.sock'}", b"private-test-key"),
+        is_server=True,
+        recv_timeout=0.02,
+    )
+    worker_lane = FusedIpcQueue(proxy.result_queue.address, is_server=False)
+    pending = _FakeResult()
+    proxy._results = {7: pending}
+    real_recv = proxy.result_queue.queue._recv_data
+    real_close = proxy.result_queue.close
+    real_stop = proxy._stop_dispatch_thread
+    closed = []
+
+    def recv() -> object:
+        received.set()
+        return real_recv()
+
+    def close() -> None:
+        assert not proxy.dispatch_result_thread.is_alive()
+        closed.append(True)
+        real_close()
+
+    def stop(*, drain: bool) -> None:
+        closing_dispatcher.set()
+        real_stop(drain=drain)
+
+    monkeypatch.setattr(proxy.result_queue.queue, "_recv_data", recv)
+    monkeypatch.setattr(proxy.result_queue, "close", close)
+    monkeypatch.setattr(proxy, "_stop_dispatch_thread", stop)
+    monkeypatch.setattr(proxy, "_DISPATCH_DRAIN_TIMEOUT_S", 0.1)
+    # Neither timed idle receive nor healthy responses should call poll().
+    monkeypatch.setattr(proxy.result_queue.queue.socket, "poll", _Mock(side_effect=AssertionError))
+
+    def send_final_batch() -> None:
+        assert closing_dispatcher.wait(10)
+        worker_lane.put([ErrorResponse(7, "final worker response", 7), None])
+
+    writer = threading.Thread(target=send_final_batch) if send_tail else None
+    try:
+        proxy._start_dispatch_threads()
+        assert received.wait(5)
+        if writer is not None:
+            writer.start()
+        proxy.doing_shutdown = True
+        proxy.shutdown()
+        # No sleep or extra join before the at-return lifetime assertion.
+        assert not proxy.dispatch_result_thread.is_alive()
+        assert closed == [True]
+        assert proxy._error_queue.empty()
+        if send_tail:
+            assert pending.queue.get_nowait().error_msg == "final worker response"
+            assert not proxy.dispatch_result_thread.stop_event.is_set()
+    finally:
+        if writer is not None and writer.ident is not None:
+            closing_dispatcher.set()
+            writer.join(timeout=5)
+        if proxy.dispatch_result_thread is not None and proxy.dispatch_result_thread.is_alive():
+            # Failure cleanup only: a baseline reader cannot be closed while blocked.
+            proxy.dispatch_result_thread.stop()
+            if writer is None:
+                worker_lane.put(None)
+            proxy.dispatch_result_thread.join(timeout=5)
+        worker_lane.close()
+        if proxy.dispatch_result_thread is None or not proxy.dispatch_result_thread.is_alive():
+            real_close()
+        proxy.workers_started = False
+
+
+@pytest.mark.cpu_only
+def test_dispatch_final_batch_notifies_async_waiter_before_sentinel(tmp_path) -> None:
+    """A sentinel in a fused batch must not skip the preceding async notification."""
+    from tensorrt_llm.executor.ipc import FusedIpcQueue
+    from tensorrt_llm.executor.utils import ErrorResponse
+    from tensorrt_llm.llmapi.utils import AsyncQueue
+
+    async def run() -> None:
+        proxy = _bare_proxy()
+        proxy.result_queue = FusedIpcQueue(
+            (f"ipc://{tmp_path / 'final.sock'}", b"private-test-key"), is_server=True
+        )
+        worker_lane = FusedIpcQueue(proxy.result_queue.address, is_server=False)
+        pending = _FakeResult()
+        aqueue = AsyncQueue()
+        pending.queue = aqueue.sync_q
+        proxy._results = {7: pending}
+        ready = asyncio.Event()
+
+        async def wait_response() -> object:
+            ready.set()
+            return await aqueue.get()
+
+        waiter = asyncio.create_task(wait_response())
+        try:
+            await ready.wait()
+            worker_lane.put([ErrorResponse(7, "final response", 7), None])
+            assert not await asyncio.to_thread(proxy.dispatch_result_task)
+            response = await asyncio.wait_for(waiter, 2)
+            assert response.error_msg == "final response"
+            assert not proxy._results
+        finally:
+            waiter.cancel()
+            await asyncio.gather(waiter, return_exceptions=True)
+            worker_lane.close()
+            proxy.result_queue.close()
+
+    asyncio.run(run())
 
 
 def test_shutdown_does_not_shut_down_external_session():

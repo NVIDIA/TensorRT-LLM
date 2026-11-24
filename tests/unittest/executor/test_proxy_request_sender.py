@@ -10,10 +10,12 @@ each payload.
 import pickle
 import queue
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
 
+from tensorrt_llm.executor.ipc import IpcQueue
 from tensorrt_llm.executor.proxy import (
     GenerationExecutorProxy,
     _create_request_sender,
@@ -52,7 +54,12 @@ class _RecordingQueue:
             self.release_first_put.wait(timeout=10)
         self.messages.append(msg)
 
-    def put_noblock(self, msg, *, retry=1, wait_time=0.001):
+    def put_interruptible(self, msg, should_stop):
+        if should_stop():
+            raise RuntimeError("request send cancelled")
+        self.put(msg)
+
+    def put_nowait(self, msg):
         self._check_writer()
         self.messages.append(msg)
 
@@ -63,7 +70,11 @@ def _payloads(*items):
 
 def _bare_proxy():
     proxy = GenerationExecutorProxy.__new__(GenerationExecutorProxy)
-    # Keeps the __del__ -> shutdown() path a no-op at GC time.
+    proxy._init_lifecycle()
+    proxy._engine_dead = False
+    # These tests close their transports explicitly, without running a full
+    # executor lifecycle on the request-only stand-ins.
+    proxy._shutdown_complete = True
     proxy.workers_started = False
     return proxy
 
@@ -108,7 +119,7 @@ def test_burst_is_sent_as_one_list_in_order():
     assert request_queue.messages == [_payloads(0), _payloads(1, 2, 3, 4, 5)]
 
 
-def test_close_flushes_queued_requests_and_drops_later_ones():
+def test_close_flushes_queued_requests_and_rejects_later_ones():
     request_queue = _RecordingQueue(block_first_put=True)
     sender = _RequestSender(request_queue, queue.Queue())
     sender.send(pickle.dumps("first"))
@@ -120,7 +131,8 @@ def test_close_flushes_queued_requests_and_drops_later_ones():
     closer.join(timeout=10)
     assert not closer.is_alive()
     assert request_queue.messages == [_payloads("first"), _payloads("queued")]
-    sender.send(pickle.dumps("late"))
+    with pytest.raises(RuntimeError, match="closed"):
+        sender.send(pickle.dumps("late"))
     assert request_queue.messages == [_payloads("first"), _payloads("queued")]
 
 
@@ -218,7 +230,7 @@ def test_pre_shutdown_sends_the_sentinel_itself_if_nothing_else_wrote(batching):
 
 def test_transport_error_reaches_error_queue():
     class _FailingQueue:
-        def put(self, msg):
+        def put_interruptible(self, msg, should_stop):
             raise RuntimeError("socket closed")
 
     error_queue = queue.Queue()
@@ -265,3 +277,137 @@ def test_worker_unpacks_batched_requests_in_order():
 
     request_queue = _ListQueue(["a", _payloads("b", "c"), "d", None, "after sentinel"])
     assert list(_incoming_requests(request_queue)) == ["a", "b", "c", "d"]
+
+
+def test_sender_preserves_fifo_and_bare_quit_with_private_peer():
+    request_queue = IpcQueue(is_server=True)
+    peer = IpcQueue(request_queue.address, is_server=False)
+    sender = _RequestSender(request_queue, queue.Queue())
+    try:
+        peer.setup_lazily()
+        sender.send(pickle.dumps("generate"))
+        sender.send(pickle.dumps("cancel"))
+        thread = sender._thread
+        sender.close(timeout=2.0, send_sentinel=True)
+        assert not thread.is_alive()
+        messages = []
+        while (message := peer.get(timeout=2.0)) is not None:
+            messages.extend(pickle.loads(payload) for payload in message)
+        assert messages == ["generate", "cancel"]
+    finally:
+        sender.close(timeout=2.0)
+        peer.close()
+        request_queue.close()
+
+
+@pytest.mark.parametrize("batching", [False, True])
+@pytest.mark.parametrize("engine_dead", [False, True])
+def test_absent_peer_send_is_interrupted_before_transport_close(monkeypatch, batching, engine_dead):
+    proxy = _bare_proxy()
+    proxy.request_queue = IpcQueue(is_server=True)
+    proxy._REQUEST_SHUTDOWN_TIMEOUT_S = 0.05
+    errors = queue.Queue()
+    entered = threading.Event()
+    original_send = proxy.request_queue._send_data
+
+    def record_send(*args, **kwargs):
+        entered.set()
+        return original_send(*args, **kwargs)
+
+    monkeypatch.setattr(proxy.request_queue, "_send_data", record_send)
+    proxy._request_sender = (
+        _RequestSender(proxy.request_queue, errors, proxy._request_send_stopped)
+        if batching
+        else None
+    )
+    outcome = []
+
+    def send():
+        try:
+            proxy._send_request("generate")
+        except RuntimeError as exc:
+            outcome.append(exc)
+
+    caller = threading.Thread(target=send)
+    caller.start()
+    assert entered.wait(timeout=2.0)
+    sender_thread = proxy._request_sender._thread if batching else None
+    try:
+        proxy._engine_dead = engine_dead
+        started = time.monotonic()
+        proxy._close_request_sender(send_sentinel=True)
+        assert time.monotonic() - started < 1.0
+        if sender_thread is not None:
+            assert not sender_thread.is_alive()
+        # Acquiring the send lock in close proves a direct writer has stopped
+        # touching the socket; the caller can still be returning its exception.
+        assert proxy._request_transport_closed
+        caller.join(timeout=2.0)
+        assert not caller.is_alive()
+        assert not errors.empty() if batching else outcome
+    finally:
+        caller.join(timeout=2.0)
+        proxy._close_request_sender()
+        proxy.request_queue.close()
+
+
+def test_close_reports_a_noncooperative_sender_instead_of_success():
+    request_queue = _RecordingQueue(block_first_put=True)
+    sender = _RequestSender(request_queue, queue.Queue())
+    sender.send(pickle.dumps("generate"))
+    assert request_queue.first_put_started.wait(timeout=2.0)
+    try:
+        with pytest.raises(TimeoutError, match="still closing"):
+            sender.close(timeout=0.0)
+        assert sender._thread.is_alive()
+    finally:
+        request_queue.release_first_put.set()
+        sender.close(timeout=2.0)
+
+
+@pytest.mark.parametrize("batching", [False, True])
+def test_generation_send_waiting_at_admission_is_rejected_after_close(monkeypatch, batching):
+    proxy = _bare_proxy()
+    proxy.request_queue = _RecordingQueue()
+    proxy._request_sender = _RequestSender(proxy.request_queue, queue.Queue()) if batching else None
+    entered = threading.Event()
+    release_pickle = threading.Event()
+    errors = []
+    original_pickle = pickle.dumps
+
+    def blocked_pickle(request):
+        entered.set()
+        assert release_pickle.wait(timeout=2.0)
+        return original_pickle(request)
+
+    if batching:
+        monkeypatch.setattr(pickle, "dumps", blocked_pickle)
+
+    def submit():
+        if not batching:
+            entered.set()
+        try:
+            proxy._send_generation_request("generate")
+        except RuntimeError as exc:
+            errors.append(exc)
+
+    with proxy._request_send_lock:
+        caller = threading.Thread(target=submit)
+        caller.start()
+        assert entered.wait(timeout=2.0)
+        with proxy._admission_lock:
+            proxy.doing_shutdown = True
+        release_pickle.set()
+    caller.join(timeout=2.0)
+    assert not caller.is_alive()
+    assert len(errors) == 1
+    proxy._close_request_sender()
+    assert proxy.request_queue.messages == []
+
+
+def test_dead_engine_abort_does_not_attempt_transport():
+    proxy = _bare_proxy()
+    proxy._engine_dead = True
+    proxy.request_queue = _RecordingQueue(block_first_put=True)
+    proxy.abort_request(1)
+    assert not proxy.request_queue.first_put_started.is_set()

@@ -4,8 +4,10 @@
 """Response delivery and cleanup while a regular RPC send is in flight."""
 
 import asyncio
+import concurrent.futures
 import gc
 import threading
+import time
 from types import SimpleNamespace
 from typing import NoReturn
 from unittest.mock import AsyncMock
@@ -31,6 +33,8 @@ pytestmark = pytest.mark.cpu_only
 def client() -> RPCClient:
     rpc_client = RPCClient.__new__(RPCClient)
     rpc_client._closed = False
+    rpc_client._closing = False
+    rpc_client._loop = None
     rpc_client._server_stopped = False
     rpc_client._timeout = None
     rpc_client._call_lock = threading.Lock()
@@ -268,11 +272,258 @@ async def test_close_drains_blocked_send(
         assert not rpc_client._pending_futures
         assert not rpc_client._sending_tasks
         assert not rpc_client._loop.is_running()
+        assert rpc_client._loop.is_closed()
+        assert not rpc_client._loop_thread.is_alive()
+        assert not asyncio.all_tasks(rpc_client._loop)
         with pytest.raises(RPCCancelled, match="RPC client closed"):
             await asyncio.wait_for(asyncio.wrap_future(result), timeout=1)
     finally:
         rpc_client.close()
         server.shutdown()
+
+
+def test_close_releases_only_owned_resources(monkeypatch: pytest.MonkeyPatch) -> None:
+    rpc_client = RPCClient(get_unique_ipc_addr(), hmac_key=b"test-key")
+    socket_threads: list[threading.Thread] = []
+    close_socket = rpc_client._client_socket.close
+
+    def record_close() -> None:
+        socket_threads.append(threading.current_thread())
+        close_socket()
+
+    monkeypatch.setattr(rpc_client._client_socket, "close", record_close)
+    try:
+        assert not rpc_client._executor._threads
+        rpc_client.close()
+        assert rpc_client._closed
+        assert not rpc_client._loop_thread.is_alive()
+        assert rpc_client._loop.is_closed()
+        assert not asyncio.all_tasks(rpc_client._loop)
+        assert socket_threads == [rpc_client._loop_thread]
+        assert not rpc_client._executor._threads
+        rpc_client.close()
+        assert len(socket_threads) == 1
+    finally:
+        rpc_client.close()
+
+
+@pytest.mark.parametrize("failure_site", ["socket", "reader"])
+def test_initialization_failure_cleans_started_loop(
+    monkeypatch: pytest.MonkeyPatch, failure_site: str
+) -> None:
+    error = RuntimeError("startup failed")
+    captured: list[RPCClient] = []
+    ensure_loop = RPCClient._ensure_event_loop
+    start_reader = RPCClient._start_response_reader_eagerly
+
+    def fail() -> NoReturn:
+        raise error
+
+    def start_and_inject(rpc_client: RPCClient) -> None:
+        ensure_loop(rpc_client)
+        captured.append(rpc_client)
+        if failure_site == "socket":
+            monkeypatch.setattr(rpc_client._client_socket, "setup_lazily", fail)
+        else:
+
+            def start_then_fail() -> NoReturn:
+                start_reader(rpc_client)
+                raise error
+
+            monkeypatch.setattr(rpc_client, "_start_response_reader_eagerly", start_then_fail)
+
+    monkeypatch.setattr(RPCClient, "_ensure_event_loop", start_and_inject)
+    try:
+        with pytest.raises(RuntimeError) as raised:
+            RPCClient(get_unique_ipc_addr(), hmac_key=b"test-key")
+        assert raised.value is error
+        assert len(captured) == 1
+        assert captured[0]._closed
+        assert captured[0]._loop.is_closed()
+        assert not captured[0]._loop_thread.is_alive()
+        assert not captured[0]._executor._threads
+    finally:
+        for rpc_client in captured:
+            rpc_client.close()
+
+
+def test_cleanup_error_surfaces_and_can_be_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    rpc_client = RPCClient(get_unique_ipc_addr(), hmac_key=b"test-key")
+    close_socket = rpc_client._client_socket.close
+    attempts: list[threading.Thread] = []
+    error = ConnectionError("socket close failed")
+
+    def fail_once() -> None:
+        attempts.append(threading.current_thread())
+        if len(attempts) == 1:
+            raise error
+        close_socket()
+
+    monkeypatch.setattr(rpc_client._client_socket, "close", fail_once)
+    try:
+        with pytest.raises(ConnectionError) as raised:
+            rpc_client.close()
+        assert raised.value is error
+        assert not rpc_client._closed
+        assert rpc_client._closing
+        rpc_client.close()
+        assert rpc_client._closed
+        assert rpc_client._loop.is_closed()
+        assert not rpc_client._loop_thread.is_alive()
+        assert attempts == [rpc_client._loop_thread, rpc_client._loop_thread]
+    finally:
+        rpc_client.close()
+
+
+def test_concurrent_close_confirms_one_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:
+    rpc_client = RPCClient(get_unique_ipc_addr(), hmac_key=b"test-key")
+    start = threading.Barrier(3)
+    close_socket = rpc_client._client_socket.close
+    socket_threads: list[threading.Thread] = []
+
+    def record_close() -> None:
+        socket_threads.append(threading.current_thread())
+        close_socket()
+
+    def close_client() -> None:
+        start.wait(timeout=3)
+        rpc_client.close()
+        assert not rpc_client._loop_thread.is_alive()
+        assert rpc_client._loop.is_closed()
+
+    monkeypatch.setattr(rpc_client._client_socket, "close", record_close)
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as callers:
+            closing = [callers.submit(close_client) for _ in range(2)]
+            start.wait(timeout=3)
+            for future in closing:
+                future.result(timeout=3)
+        assert rpc_client._closed
+        assert socket_threads == [rpc_client._loop_thread]
+    finally:
+        rpc_client.close()
+
+
+@pytest.mark.parametrize("blocked_owner", ["loop", "pool"])
+def test_close_timeout_is_bounded_and_retriable(
+    monkeypatch: pytest.MonkeyPatch, blocked_owner: str
+) -> None:
+    monkeypatch.setattr(RPCClient, "_CLOSE_TIMEOUT_SECONDS", 0.05, raising=False)
+    rpc_client = RPCClient(get_unique_ipc_addr(), hmac_key=b"test-key", num_workers=1)
+    entered, release = threading.Event(), threading.Event()
+
+    def block_owner() -> None:
+        entered.set()
+        assert release.wait(10)
+
+    if blocked_owner == "loop":
+        rpc_client._loop.call_soon_threadsafe(block_owner)
+    else:
+        rpc_client._executor.submit(block_owner)
+    try:
+        assert entered.wait(2)
+        started = time.monotonic()
+        with pytest.raises(TimeoutError, match="still closing"):
+            rpc_client.close()
+        assert time.monotonic() - started < 1
+        assert not rpc_client._closed
+        assert rpc_client._closing
+        with pytest.raises(RPCCancelled, match="RPC client closed"):
+            rpc_client.method().remote()
+        with pytest.raises(RPCCancelled, match="RPC client closed"):
+            rpc_client.method().remote_future()
+        with pytest.raises(TimeoutError, match="still closing"):
+            rpc_client.close()
+        assert not rpc_client._closed
+    finally:
+        release.set()
+        monkeypatch.setattr(RPCClient, "_CLOSE_TIMEOUT_SECONDS", 3.0)
+        rpc_client.close()
+    assert rpc_client._closed
+    assert rpc_client._loop.is_closed()
+    assert not rpc_client._loop_thread.is_alive()
+    assert all(not worker.is_alive() for worker in rpc_client._executor._threads)
+
+
+@pytest.mark.parametrize("callback_owner", ["loop", "pool"])
+def test_close_from_owned_callback_requires_external_confirmation(callback_owner: str) -> None:
+    rpc_client = RPCClient(get_unique_ipc_addr(), hmac_key=b"test-key")
+    completed = threading.Event()
+    errors: list[Exception] = []
+
+    def close_in_callback() -> None:
+        try:
+            rpc_client.close()
+        except RuntimeError as error:
+            errors.append(error)
+        finally:
+            completed.set()
+
+    try:
+        if callback_owner == "loop":
+            rpc_client._loop.call_soon_threadsafe(close_in_callback)
+        else:
+            rpc_client._executor.submit(close_in_callback)
+        assert completed.wait(2)
+        assert len(errors) == 1
+        assert "external thread" in str(errors[0])
+        assert not rpc_client._closed
+        rpc_client.close()
+        assert rpc_client._closed
+        assert rpc_client._loop.is_closed()
+        assert not rpc_client._loop_thread.is_alive()
+        assert all(not worker.is_alive() for worker in rpc_client._executor._threads)
+    finally:
+        rpc_client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_external_loop_call_and_inline_close(
+    monkeypatch: pytest.MonkeyPatch, streaming: bool
+) -> None:
+    rpc_client = RPCClient(get_unique_ipc_addr(), hmac_key=b"test-key")
+    caller_loop = asyncio.get_running_loop()
+    errors: list[dict[str, object]] = []
+    previous_handler = caller_loop.get_exception_handler()
+    caller_loop.set_exception_handler(lambda loop, context: errors.append(context))
+    sending, cleaned = threading.Event(), threading.Event()
+    transport_loops: list[asyncio.AbstractEventLoop] = []
+
+    async def blocked_send(request: RPCRequest) -> None:
+        transport_loops.append(asyncio.get_running_loop())
+        sending.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleaned.set()
+
+    monkeypatch.setattr(rpc_client._client_socket, "put_async", blocked_send)
+    stream = rpc_client.method().remote_streaming() if streaming else None
+    call = stream.__anext__() if stream is not None else rpc_client.method().remote_async()
+    result = asyncio.create_task(call)
+    try:
+        assert await asyncio.to_thread(sending.wait, 2)
+        # close must not wait for callbacks on the caller's currently occupied loop.
+        rpc_client.close()
+        assert cleaned.is_set()
+        assert transport_loops == [rpc_client._loop]
+        assert not rpc_client._loop_thread.is_alive()
+        assert rpc_client._loop.is_closed()
+        assert caller_loop.is_running()
+        assert not caller_loop.is_closed()
+        with pytest.raises(RPCCancelled, match="RPC client closed"):
+            await asyncio.wait_for(result, 1)
+        assert not rpc_client._streaming_queues
+        gc.collect()
+        await asyncio.sleep(0)
+        assert not errors
+    finally:
+        rpc_client.close()
+        if not result.done():
+            result.cancel()
+            await asyncio.gather(result, return_exceptions=True)
+        caller_loop.set_exception_handler(previous_handler)
 
 
 @pytest.mark.asyncio

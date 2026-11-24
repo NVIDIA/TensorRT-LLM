@@ -20,8 +20,7 @@ attached-frontend proxy lifecycle over real ipc:// sockets.
 """
 
 import os
-import tempfile
-import time
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -193,41 +192,25 @@ class TestClassicFrontendProxyEndToEnd:
         )
         return proxy, worker_ingress, hmac_key, result_addrs
 
-    @staticmethod
-    def _stop_dispatch_thread(proxy, result_addrs, hmac_key):
-        """End the dispatch thread the way the worker does at engine teardown.
-
-        The worker fans a per-lane None sentinel to every frontend (see
-        notify_proxy_threads_to_quit). Frontend shutdown deliberately leaves
-        the thread to process teardown, which the threadleak checker would
-        report as a leak.
-        """
-        import zmq
-
-        from tensorrt_llm.executor.ipc import FusedIpcQueue
-
-        worker_lane = FusedIpcQueue(
-            (result_addrs[proxy._frontend_id], hmac_key),
-            is_server=False,
-            fuse_message=False,
-            socket_type=zmq.PUSH,
-            name="fake_worker_shutdown_lane",
-        )
-        worker_lane.put(None)
-        proxy.dispatch_result_thread.join(timeout=10)
-        assert not proxy.dispatch_result_thread.is_alive()
-
-    def test_submit_namespaces_and_shutdown_never_sends_sentinel(self):
+    def test_submit_namespaces_and_shutdown_never_sends_sentinel(
+        self, tmp_path, monkeypatch
+    ) -> None:
         from tensorrt_llm.executor.request import CancellingRequest, GenerationRequest
+        from tensorrt_llm.executor.utils import RequestError
         from tensorrt_llm.sampling_params import SamplingParams
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            proxy, worker_ingress, hmac_key, result_addrs = self._make_proxy_and_fake_worker(tmpdir)
+        proxy, worker_ingress, _, _ = self._make_proxy_and_fake_worker(tmp_path)
+        receiving = threading.Event()
+        real_recv = proxy.result_queue.queue._recv_data
 
-            # Attributes read by OpenAIServer at init must exist (a missing
-            # _resource_governor_queue crashed all siblings in the first e2e).
+        def recv() -> object:
+            receiving.set()
+            return real_recv()
+
+        monkeypatch.setattr(proxy.result_queue.queue, "_recv_data", recv)
+        try:
+            # OpenAIServer reads this property when it initializes a frontend.
             assert proxy.resource_governor_queue is None
-
             result = proxy.submit(GenerationRequest([1, 2, 3], SamplingParams()))
             assert get_frontend_id(result.request_id) == 1
             assert worker_ingress.poll(5)
@@ -235,66 +218,81 @@ class TestClassicFrontendProxyEndToEnd:
             assert isinstance(received, GenerationRequest)
             assert received.id == result.request_id
 
-            # Frontend shutdown aborts its in-flight requests (cancel) but
-            # must NOT emit the None engine-shutdown sentinel.
+            # No worker result or sentinel is sent to this lane on detach.
+            assert receiving.wait(5)
             proxy.shutdown()
+            assert not proxy.dispatch_result_thread.is_alive()
+            assert proxy.result_queue.queue.socket is None
+            assert proxy.request_queue.socket is None
+            assert not proxy._results
+            with pytest.raises(RequestError, match="shut down"):
+                result.result(timeout=1)
+            assert not proxy._engine_dead
             assert worker_ingress.poll(5)
             cancel = worker_ingress.get()
             assert isinstance(cancel, CancellingRequest)
             assert cancel.id == result.request_id
-            assert not worker_ingress.poll(1), (
+            proxy.shutdown()  # Idempotent; no duplicate cancel or global quit.
+            assert not worker_ingress.poll(0.1), (
                 "an attached frontend must never send the engine-shutdown sentinel"
             )
-            self._stop_dispatch_thread(proxy, result_addrs, hmac_key)
+            with pytest.raises(RuntimeError, match="shutting down|shut down"):
+                proxy.submit(GenerationRequest([4], SamplingParams()))
+        finally:
+            proxy.shutdown()
+            worker_ingress.close()
 
-    def test_check_health_and_submit_reflect_fatal_error(self):
+    def test_check_health_and_submit_reflect_fatal_error(self, tmp_path) -> None:
         from tensorrt_llm.executor.request import GenerationRequest
         from tensorrt_llm.executor.utils import EngineDeadError
         from tensorrt_llm.sampling_params import SamplingParams
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            proxy, _, _, _ = self._make_proxy_and_fake_worker(tmpdir)
-
-            # Regression: this state lives in GenerationExecutorProxy.__init__,
-            # which an attached frontend deliberately skips, so it must be
-            # initialized explicitly (a missing _engine_dead broke the first
-            # submit(); a missing _worker_process_monitor broke /health).
+        proxy, worker_ingress, _, _ = self._make_proxy_and_fake_worker(tmp_path)
+        try:
             assert proxy.check_health()
             assert proxy.model_world_size == 1
-
+            assert proxy.dispatch_result_thread is None
             proxy._set_fatal_error(RuntimeError("rank0 worker died"))
             assert not proxy.check_health()
             with pytest.raises(EngineDeadError):
                 proxy.submit(GenerationRequest([1], SamplingParams()))
+            proxy.shutdown()
+            assert proxy.dispatch_result_thread is None
+            assert not worker_ingress.poll(0.1)
+        finally:
+            proxy.shutdown()
+            worker_ingress.close()
 
-    def test_dispatch_routes_own_lane_responses(self):
+    def test_dispatch_routes_own_lane_responses(self, tmp_path) -> None:
         import zmq
 
         from tensorrt_llm.executor.ipc import FusedIpcQueue
         from tensorrt_llm.executor.request import GenerationRequest
-        from tensorrt_llm.executor.utils import ErrorResponse
+        from tensorrt_llm.executor.utils import ErrorResponse, RequestError
         from tensorrt_llm.sampling_params import SamplingParams
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            proxy, _, hmac_key, result_addrs = self._make_proxy_and_fake_worker(tmpdir)
+        proxy, worker_ingress, hmac_key, result_addrs = self._make_proxy_and_fake_worker(tmp_path)
+        worker_lane = FusedIpcQueue(
+            (result_addrs[1], hmac_key),
+            is_server=False,
+            fuse_message=False,
+            socket_type=zmq.PUSH,
+            name="fake_worker_result_lane",
+        )
+        try:
             result = proxy.submit(GenerationRequest([1, 2, 3], SamplingParams()))
             client_id = result.request_id
             assert client_id in proxy._results
-
-            # The fake worker pushes an ErrorResponse down this frontend's
-            # result lane; the dispatcher must deliver it and retire the
-            # request.
-            worker_lane = FusedIpcQueue(
-                (result_addrs[1], hmac_key),
-                is_server=False,
-                fuse_message=False,
-                socket_type=zmq.PUSH,
-                name="fake_worker_result_lane",
-            )
+            assert worker_ingress.poll(5)
+            worker_ingress.get()
             worker_lane.put(ErrorResponse(client_id, "boom", 1))
-            deadline = time.time() + 5
-            while client_id in proxy._results and time.time() < deadline:
-                time.sleep(0.01)
-            assert client_id not in proxy._results
-
-            self._stop_dispatch_thread(proxy, result_addrs, hmac_key)
+            with pytest.raises(RequestError, match="boom"):
+                result.result(timeout=5)
+            proxy.shutdown()
+            assert not proxy.dispatch_result_thread.is_alive()
+            assert not proxy._results
+            assert not worker_ingress.poll(0.1)
+        finally:
+            proxy.shutdown()
+            worker_lane.close()
+            worker_ingress.close()
