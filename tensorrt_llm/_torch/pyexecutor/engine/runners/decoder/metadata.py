@@ -121,6 +121,7 @@ class DecoderMetadata:
             else None,
             kv_cache_manager=kv_cache_manager,
             draft_kv_cache_manager=draft_kv_cache_manager,
+            max_total_draft_tokens=self._config.max_total_draft_tokens,
             enable_ragged_verification=self._ragged_verification_enabled,
         )
         if isinstance(kv_cache_manager, BaseMambaCacheManager):
