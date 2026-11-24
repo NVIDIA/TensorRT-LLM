@@ -4696,6 +4696,53 @@ class TestPoolsideV1ToolParser(BaseToolParserTestClass):
         assert result.normal_text == ""
         assert len(result.calls) == 0
 
+    @pytest.mark.parametrize("chunk_size", [1, 7, 10000])
+    @pytest.mark.parametrize("text", [
+        "ordinary answer <tool_",
+        "prefix <tool_call>get_weather<arg_key>location</arg_key>"
+        "<arg_value>Paris",
+        "prefix <tool_call>get_weather<arg_key>location</arg_key>"
+        "<arg_value>literal </tool_call> marker",
+    ])
+    def test_finish_releases_incomplete_buffer_as_text(self, sample_tools,
+                                                       chunk_size, text):
+        """Unfinished markup is released as text, as in the whole parser."""
+        parser = PoolsideV1ToolParser()
+        results = [
+            parser.parse_streaming_increment(text[i:i + chunk_size],
+                                             sample_tools)
+            for i in range(0, len(text), chunk_size)
+        ]
+        results.append(parser.finish(sample_tools))
+        assert "".join(result.normal_text for result in results) == text
+        assert all(not result.calls for result in results)
+        assert parser.detect_and_parse(text, sample_tools).normal_text == text
+        again = parser.finish(sample_tools)
+        assert again.normal_text == ""
+        assert again.calls == []
+
+    @pytest.mark.parametrize("chunk_size", [1, 7, 10000])
+    def test_finish_releases_prefix_after_complete_call(self, sample_tools,
+                                                        chunk_size):
+        """A partial opener after a valid call is emitted without repeats."""
+        parser = PoolsideV1ToolParser()
+        text = ('<tool_call>get_weather<arg_key>location</arg_key>'
+                '<arg_value>Paris</arg_value></tool_call> answer <tool')
+        results = [
+            parser.parse_streaming_increment(text[i:i + chunk_size],
+                                             sample_tools)
+            for i in range(0, len(text), chunk_size)
+        ]
+        results.append(parser.finish(sample_tools))
+        calls = [call for result in results for call in result.calls]
+        assert "".join(result.normal_text
+                       for result in results) == " answer <tool"
+        assert [call.name for call in calls if call.name] == ["get_weather"]
+        assert json.loads("".join(call.parameters for call in calls)) == {
+            "location": "Paris"
+        }
+        assert parser.finish(sample_tools).normal_text == ""
+
     def test_parse_streaming_increment_allows_end_tag_text_in_string_arg(
             self, sample_tools, parser):
         result = parser.parse_streaming_increment(
