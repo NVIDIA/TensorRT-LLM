@@ -649,7 +649,7 @@ if _TILED:
             )
             return out.reshape(*x.shape[:-1], self.down.out_features)
 
-    def _make_tiled_processor():
+    def _tiled_processor_type():
         from diffusers.models.attention_dispatch import dispatch_attention_fn
         from diffusers.models.autoencoders.autoencoder_kl_minimax_h3 import (
             MiniMaxH3VideoAttnProcessor,
@@ -690,7 +690,7 @@ if _TILED:
                 )
                 return attn.to_out[0](hidden_states)
 
-        return TiledAttnProcessor()
+        return TiledAttnProcessor
 
     class PaddedRope(nn.Module):
         """Wraps the decoder's rotary embedding: cos / sin padded from the 48 rotary lanes to the 64 head
@@ -718,7 +718,7 @@ if _TILED:
             rot_mask = lanes < rotary_dim
             return cos, sin, perm, sign, rot_mask
 
-    def _make_fused_processor():
+    def _fused_processor_type():
         from diffusers.models.attention_dispatch import dispatch_attention_fn
         from diffusers.models.autoencoders.autoencoder_kl_minimax_h3 import (
             MiniMaxH3VideoAttnProcessor,
@@ -755,17 +755,15 @@ if _TILED:
                 )
                 return attn.to_out[0](hidden_states)
 
-        return FusedAttnProcessor()
+        return FusedAttnProcessor
 
-    def _tile_block(block: nn.Module) -> None:
+    def _tile_block(block: nn.Module, processor_type: type) -> None:
         swiglu, down = block.ff.net[0], block.ff.net[2]
         block.ff.net = nn.ModuleList([Fp8SwiGLUDown(swiglu.proj, down)])
         block.attn.to_out[0] = Fp8LinearTiled(block.attn.to_out[0])
         if _FUSED:
             block.attn.qkv_shared = Fp8QKVShared(block.attn.to_q, block.attn.to_k, block.attn.to_v)
-            block.attn.set_processor(_make_fused_processor())
-        else:
-            block.attn.set_processor(_make_tiled_processor())
+        block.attn.set_processor(processor_type())
 
 
 def convert_decoder_linears_fp8(decoder: nn.Module) -> int:
@@ -776,6 +774,10 @@ def convert_decoder_linears_fp8(decoder: nn.Module) -> int:
     With ``vae_fp8_tiled=1`` the SwiGLU-output and attention-output quantizes of every
     block then move to the tiled kernels (bit-identical codes).
     """
+    processor_type = None
+    if _TILED:
+        # Create separate instances of one type so Dynamo can reuse guards across layers.
+        processor_type = _fused_processor_type() if _FUSED else _tiled_processor_type()
     replaced = 0
     for block in decoder.transformer_blocks:
         for parent in list(block.modules()):
@@ -783,8 +785,8 @@ def convert_decoder_linears_fp8(decoder: nn.Module) -> int:
                 if isinstance(child, nn.Linear):
                     setattr(parent, name, Fp8Linear(child))
                     replaced += 1
-        if _TILED:
-            _tile_block(block)
+        if processor_type is not None:
+            _tile_block(block, processor_type)
     if _FUSED:
         decoder.rope = PaddedRope(decoder.rope, head_dim=_HEAD_DIM)
     logger.info(

@@ -778,7 +778,6 @@ class MiniMaxH3TransformerBlock(nn.Module):
         timestep: Optional[torch.Tensor],
         valid_seq_len: Optional[int],
     ) -> torch.Tensor:
-        hidden_size = hidden_states.shape[-1]
         mod = self.adaln_proj.table(temb)
         norm_hidden_states = h3_norm_mod(
             hidden_states, self.norm1.weight, mod, adaln_indices, self.norm1.variance_epsilon, 1, 0
@@ -797,6 +796,12 @@ class MiniMaxH3TransformerBlock(nn.Module):
             4,
             3,
         )
+        return self._forward_mlp_residual(hidden_states, norm_hidden_states, mod, adaln_indices)
+
+    def _forward_mlp_residual(
+        self, hidden_states, norm_hidden_states, mod, adaln_indices
+    ) -> torch.Tensor:
+        hidden_size = hidden_states.shape[-1]
         ff_output = self.ff(
             norm_hidden_states.reshape(-1, norm_hidden_states.shape[-1])
         ).reshape_as(norm_hidden_states)
@@ -814,6 +819,7 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
 
     # The transformer-block class; a scenario (``models/minimax_h3/<scenario>/``) substitutes its own.
     block_cls = MiniMaxH3TransformerBlock
+    replicate_token_refiner = False
     _supports_per_layer_quant = True
 
     def __init__(self, model_config: DiffusionModelConfig) -> None:
@@ -988,6 +994,11 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
                 )
             )
 
+        refiner_config = model_config
+        if self.replicate_token_refiner:
+            # Every rank already has the conditioning input and the Refiner weights.
+            # Keep the unsharded sequence length so its GEMMs use the single-rank geometry.
+            refiner_config = model_config.model_copy(update={"visual_gen_mapping": None})
         self.token_refiner = MiniMaxH3TokenRefiner(
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
@@ -997,7 +1008,7 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             norm_eps=norm_eps,
             qk_norm_eps=qk_norm_eps,
             final_norm_eps=final_norm_eps,
-            model_config=model_config,
+            model_config=refiner_config,
             fuse_bf16_gate_up_swiglu=fuse_bf16_gate_up_swiglu,
             unquantized_attention=unquantized_attention,
         )

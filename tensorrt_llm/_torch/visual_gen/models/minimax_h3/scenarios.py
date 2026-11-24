@@ -267,10 +267,66 @@ def route_fp8_sm_107_u1(config: "DiffusionPipelineConfig") -> Type["BasePipeline
     return MiniMaxH3Fp8Sm107U1Pipeline
 
 
+def route_fp8_u4(config: "DiffusionPipelineConfig") -> Type["BasePipeline"]:
+    """Static FP8 with synchronous four-rank Ulysses and dense cuDNN FP8 attention."""
+    capability = _device_capability()
+    if capability not in ((10, 3), (10, 7)):
+        raise NoScenario("packed FP8 Ulysses needs SM103 or SM107")
+    vgm = config.visual_gen_mapping
+    if (
+        vgm is None
+        or vgm.world_size != 4
+        or vgm.ulysses_size != 4
+        or vgm.cp_size != 1
+        or config.mapping.tp_size != 1
+        or config.parallel.async_ulysses
+    ):
+        raise NoScenario("packed FP8 Ulysses needs four synchronous Ulysses ranks and TP=CP=1")
+    if (
+        _transformer_quant_algo(config) != QuantAlgo.FP8
+        or _transformer_layer_quant(config) is not None
+        or config.dynamic_weight_quant
+        or config.force_dynamic_quantization
+    ):
+        raise NoScenario("packed FP8 Ulysses needs a statically quantized FP8 checkpoint")
+    model = config.model_configs["transformer"]
+    pretrained = model.pretrained_config
+    if (
+        model.torch_dtype != torch.bfloat16
+        or (pretrained.num_attention_heads, pretrained.attention_head_dim) != (56, 128)
+        or resolve_attention_precision(pretrained, model.extra_attrs)
+    ):
+        raise NoScenario("packed FP8 Ulysses needs 56 heads of width 128 and BF16 activations")
+    attention = config.attention
+    qac = attention.quant_attention_config
+    if (
+        attention.backend.upper() != "CUDNN"
+        or attention.sparse_attention_config is not None
+        or qac is None
+        or qac.qk_dtype != "fp8"
+        or qac.v_dtype != "fp8"
+    ):
+        raise NoScenario("packed FP8 Ulysses needs dense CUDNN with FP8 Q, K and V")
+    if (
+        config.cuda_graph.enable
+        or config.cpu_offload_config.enable
+        or config.runtime_lora is not None
+        or config.cache is not None
+        or config.extra_attrs.get("minimax_h3_scenario")
+    ):
+        raise NoScenario(
+            "packed FP8 Ulysses needs immutable resident components and eager collectives"
+        )
+    from .minimax_h3_fp8__sm_103_107__u4.pipeline import MiniMaxH3Fp8U4Pipeline
+
+    return MiniMaxH3Fp8U4Pipeline
+
+
 # Scenario routes in the order they are tried; the first that does not raise wins.
 ROUTES: tuple[Callable[["DiffusionPipelineConfig"], Type["BasePipeline"]], ...] = (
     route_nvfp4_sm_107_u1_u4,
     route_fp8_sm_107_u1,
+    route_fp8_u4,
 )
 
 

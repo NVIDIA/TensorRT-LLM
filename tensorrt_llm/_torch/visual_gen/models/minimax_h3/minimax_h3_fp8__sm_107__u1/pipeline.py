@@ -28,6 +28,13 @@ class MiniMaxH3Fp8Sm107U1Pipeline(MiniMaxH3Nvfp4Sm107U1U4Pipeline):
         super().post_load_weights()
         kernel_cache = Path(get_default_build_root()) / "minimax_h3_fp8"
         self.transformer.initialize_fp8(kernel_cache)
+        audio_vae = getattr(self, "audio_vae", None)
+        if audio_vae is not None:
+            from tensorrt_llm._torch.visual_gen.models.minimax_h3.minimax_h3_fp8__sm_103_107__u4.vae_opt import (
+                install_audio_vae_cuda_graph,
+            )
+
+            install_audio_vae_cuda_graph(audio_vae, self.device)
         if self.vae is not None:
             self.vae.enable_tiling(
                 tile_sample_min_height=288,
