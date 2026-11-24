@@ -19,6 +19,8 @@ import pytest
 from tensorrt_llm.executor.result import Logprob
 from tensorrt_llm.serve.postprocess_handlers import create_completion_logprobs
 
+pytestmark = pytest.mark.cpu_only
+
 # Tokens of unequal length, so an offset built from the wrong token's length
 # lands somewhere else.
 PIECES = ["A", " wonderful", " world", "!"]
