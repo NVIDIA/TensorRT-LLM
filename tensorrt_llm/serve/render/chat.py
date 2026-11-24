@@ -39,6 +39,7 @@ from pydantic import ValidationError
 
 from tensorrt_llm.inputs.tokenization import tokenize_prompt
 from tensorrt_llm.inputs.utils import (
+    _gather_or_cancel,
     _has_python_chat_template,
     apply_chat_template,
     async_apply_chat_template,
@@ -300,7 +301,8 @@ async def render_conversation_with_media(
     those of :func:`render_conversation`.
     """
     if not renders_from_loaded_media(res.model_type):
-        rendered, media = await asyncio.gather(
+        # A render failure cancels the media loads still running.
+        rendered, media = await _gather_or_cancel(
             render_conversation(res, **render_kwargs), mm_coroutines
         )
         return rendered, media

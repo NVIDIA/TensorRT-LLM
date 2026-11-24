@@ -84,6 +84,21 @@ def _image_embeds_part() -> dict:
     return {"type": "image_embeds", "image_embeds": {"data": encoded}}
 
 
+def _video_embeds_part() -> dict:
+    """One precomputed video embedding with its grid and frame timestamps."""
+    with io.BytesIO() as buf:
+        torch.save(torch.zeros(4, 8), buf)
+        encoded = base64.b64encode(buf.getvalue()).decode("ascii")
+    return {
+        "type": "video_embeds",
+        "video_embeds": {
+            "data": encoded,
+            "video_grid_thw": [1, 4, 4],
+            "timestamps": [0.0],
+        },
+    }
+
+
 def _unreadable_image_part() -> dict:
     """An image reference that raises if anything tries to load it."""
     return {
@@ -95,6 +110,7 @@ def _unreadable_image_part() -> dict:
 MEDIA_PARTS = {
     "image_url": (_image_url_part, "multi_modal_data"),
     "image_embeds": (_image_embeds_part, "multi_modal_embeddings"),
+    "video_embeds": (_video_embeds_part, "multi_modal_embeddings"),
 }
 
 
