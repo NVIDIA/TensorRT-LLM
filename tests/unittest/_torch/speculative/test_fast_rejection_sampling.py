@@ -559,8 +559,12 @@ def test_worker_paths_fast():
             md.draft_tokens = drafts.reshape(-1)
             acc, num = _worker(fused)._accept_draft_tokens(logits, drafts, nctx, bsz, md)
             out[method, fused] = (acc.clone(), num.clone())
-    # Block verification accepts by its own rule, which the fused kernels do not implement.
-    assert all(torch.equal(x, y) for x, y in zip(out["block", False], out["block", True]))
+    # Block verification accepts by its own rule, which the fused kernels do not implement. A row
+    # writes only its first `num` tokens (a context row writes one), so compare those.
+    (b0, m0), (b1, m1) = out["block", False], out["block", True]
+    assert torch.equal(m0, m1)
+    written = torch.arange(K + 1, device=DEV) < m0.unsqueeze(1)
+    assert torch.equal(b0[written], b1[written])
     (a0, n0), (a1, n1) = out["standard", False], out["standard", True]
     assert torch.equal(a0[:nctx, 0], a1[:nctx, 0])  # context rows: the same target sampler
     p = _softmax64(logits[nctx:], torch.ones(ngen * (K + 1), device=DEV)).reshape(ngen, K + 1, V)
