@@ -329,9 +329,8 @@ class DSv41DSparkDraftModel(DSv4DSparkDraftModel):
             raise ValueError("V4.1 DSpark top-k exceeds its draft expert count")
         if not config.dspark_target_layer_ids:
             raise ValueError("V4.1 DSpark requires checkpoint dspark_target_layer_ids")
-        # The draft is SWA-only, with no encoder/decoder KV or index sharing.
-        # Its attention module is instantiated to load weights; runtime attention
-        # uses worker-owned windows, independently of the target cache manager.
+        # Draft layers use independent SWA records in the shared cache manager;
+        # they do not share the target's encoder/decoder KV or index sources.
         config.engram_layer_ids = []
         config.engram_config = None
         config.window_size = config.sliding_window
