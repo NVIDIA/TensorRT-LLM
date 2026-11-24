@@ -172,6 +172,13 @@ class TestStandaloneApp:
         assert response.status_code == 400
         assert "Multimodal" in response.json()["message"]
 
+    def test_completion_render_refuses_prompt_embeds(self, client) -> None:
+        body = {"model": "m", "prompt": "hello world"}
+        assert client.post("/v1/completions/render", json=body).status_code == 200
+        response = client.post("/v1/completions/render", json={**body, "prompt_embeds": "AAAA"})
+        assert response.status_code == 400
+        assert "prompt_embeds" in response.text
+
     def test_a_named_tool_choice_stays_in_the_echoed_request(self, client) -> None:
         body = {
             **CHAT_BODY,
