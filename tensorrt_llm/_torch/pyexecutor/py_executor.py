@@ -3138,8 +3138,9 @@ class PyExecutor:
     def _has_pending_context_retirement(self) -> bool:
         """Keep qualified source retirement live after the logical result leaves.
 
-        Always False under attention DP, which the context-first ownership
-        profile does not support yet.
+        Scans the in-flight transfers only when the coordinator supports
+        logical context cancellation. Under attention DP it never does: the
+        context-first ownership profile does not support attention DP yet.
 
         Returns:
             Whether a source claim still awaits TP-agreed retirement. All
@@ -3147,7 +3148,8 @@ class PyExecutor:
         """
         transfers = getattr(self, "async_transfer_manager", None)
         return (getattr(self, "kv_cache_transceiver", None) is not None
-                and transfers is not None and any(
+                and transfers is not None
+                and self.disagg.supports_logical_context_cancellation() and any(
                     self.disagg.supports_logical_context_cancellation(req)
                     for req in transfers.requests_in_transfer().values()))
 

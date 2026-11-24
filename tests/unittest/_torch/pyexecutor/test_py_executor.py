@@ -2268,6 +2268,30 @@ def test_adp_ranks_wait_for_peer_context_retirement(
     assert _stop_decisions(ranks) == [True, True]
 
 
+def test_context_retirement_check_skips_transfers_without_logical_cancellation() -> None:
+    """Without logical context cancellation no transfer can await retirement, so none is read."""
+    executor = PyExecutor.__new__(PyExecutor)
+    executor.kv_cache_transceiver = types.SimpleNamespace(
+        supports_logical_context_cancellation=lambda request=None: False
+    )
+    executor.async_transfer_manager = Mock()
+    executor.async_transfer_manager.requests_in_transfer.return_value = {
+        7: types.SimpleNamespace(py_request_id=7)
+    }
+    executor._disagg_coordinator = DisaggTransferCoordinator(
+        transceiver=executor.kv_cache_transceiver,
+        transfer_manager=executor.async_transfer_manager,
+        kv_cache_manager=None,
+        dist=types.SimpleNamespace(world_size=2),
+        effects=Mock(),
+        registry=Mock(active_requests=Mock(return_value=[])),
+        enable_attention_dp=True,
+    )
+
+    assert not executor._has_pending_context_retirement()
+    executor.async_transfer_manager.requests_in_transfer.assert_not_called()
+
+
 def _classify_termination(
     request, enable_partial_reuse_for_disagg, is_vswa, is_kv_manager_v2, pp_size=1
 ):
