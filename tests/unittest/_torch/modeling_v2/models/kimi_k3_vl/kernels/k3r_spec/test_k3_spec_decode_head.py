@@ -34,6 +34,7 @@ from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.spec.k3_spec_decode_h
     k3_spec_decode_head,
 )
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import DecoderInputPreparer
+from tensorrt_llm.mapping import CpType, Mapping
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU")
 
@@ -42,7 +43,7 @@ def _helix_metadata(kv_lens, helix_pos, tokens_per_block, cp_size, cp_rank, max_
     def buffer(dtype, fill):
         return torch.full((max_tokens,), fill, dtype=dtype, device="cuda")
 
-    return SimpleNamespace(
+    metadata = SimpleNamespace(
         num_contexts=0,
         num_generations=num_gen,
         kv_lens_cuda=kv_lens,
@@ -52,6 +53,10 @@ def _helix_metadata(kv_lens, helix_pos, tokens_per_block, cp_size, cp_rank, max_
         kv_cache_manager=SimpleNamespace(tokens_per_block=tokens_per_block),
         mapping=SimpleNamespace(cp_size=cp_size, cp_rank=cp_rank),
     )
+    metadata.kv_cache_manager.mapping = Mapping(
+        world_size=cp_size, rank=cp_rank, cp_size=cp_size, cp_config={"cp_type": CpType.HELIX}
+    )
+    return metadata
 
 
 @requires_cuda
@@ -183,6 +188,9 @@ def _step_metadata(num_ctx, num_ctx_tokens, num_gen, num_chunked, helix, gen_pos
     md.kv_lens_cuda = md.kv_lens_cuda.to(torch.int32)
     md.kv_cache_manager = SimpleNamespace(tokens_per_block=32)
     md.mapping = SimpleNamespace(cp_size=4, cp_rank=1)
+    md.kv_cache_manager.mapping = Mapping(
+        world_size=4, rank=1, cp_size=4, cp_config={"cp_type": CpType.HELIX}
+    )
     md._helix_spec_tokens_valid = helix
     md.helix_position_offsets = torch.zeros(max_tokens, dtype=torch.int32, device="cuda")
     md.helix_position_offsets[: gen_positions.numel()] = gen_positions

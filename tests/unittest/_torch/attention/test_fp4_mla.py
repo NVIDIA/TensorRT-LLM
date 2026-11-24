@@ -68,7 +68,7 @@ from tensorrt_llm.llmapi.llm_args import (
     MTPDecodingConfig,
 )
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig as LlmKvCacheConfig
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.mapping import CpType, Mapping
 
 _DataType = tensorrt_llm.bindings.DataType
 _CacheType = tensorrt_llm.bindings.internal.batch_manager.CacheType
@@ -522,7 +522,12 @@ def test_recompute_helix_spec_buffers_matches_elementwise_reference(
     base[1, 0] = 7 * tokens_per_block - max(1, tokens_per_seq // 2)
     positions = (base + torch.arange(tokens_per_seq)).reshape(-1).to(torch.int32).cuda()
     metadata = object.__new__(trtllm_backend.TrtllmAttentionMetadata)
-    metadata.kv_cache_manager = SimpleNamespace(tokens_per_block=tokens_per_block)
+    metadata.kv_cache_manager = SimpleNamespace(
+        tokens_per_block=tokens_per_block,
+        mapping=Mapping(
+            world_size=cp_size, rank=cp_rank, cp_size=cp_size, cp_config={"cp_type": CpType.HELIX}
+        ),
+    )
     metadata.mapping = SimpleNamespace(cp_size=cp_size, cp_rank=cp_rank)
     metadata._num_contexts = 1
     metadata._num_generations = num_seqs

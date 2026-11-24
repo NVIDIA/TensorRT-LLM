@@ -258,6 +258,8 @@ class SpecDecodeHead:
         kv_start, num_kv = spec_decode_kv_range(md)
         helix_kwargs = {}
         if helix:
+            cache_mapping = md.kv_cache_manager.mapping
+            sharded_cache = cache_mapping.has_cp_helix()
             tokens_per_seq = preparer.get_runtime_tokens_per_gen_step(runtime_draft_len)
             assert gen_tokens % tokens_per_seq == 0 and (
                 gen_tokens // tokens_per_seq == md.num_generations
@@ -272,8 +274,8 @@ class SpecDecodeHead:
                 helix_zero_kv=self._zero_kv_scratch(md.helix_kv_bounds),
                 num_helix=gen_tokens,
                 tokens_per_block=md.kv_cache_manager.tokens_per_block,
-                cp_size=md.mapping.cp_size,
-                cp_rank=md.mapping.cp_rank,
+                cp_size=cache_mapping.cp_size if sharded_cache else 1,
+                cp_rank=cache_mapping.cp_rank if sharded_cache else 0,
                 kv_bound_start=num_ctx_requests,
                 tokens_per_seq=tokens_per_seq,
             )

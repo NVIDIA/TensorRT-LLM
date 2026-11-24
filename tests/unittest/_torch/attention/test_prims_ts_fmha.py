@@ -45,7 +45,7 @@ from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings import DataType
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.mapping import CpType, Mapping
 from tensorrt_llm.quantization.mode import QuantMode
 
 
@@ -2166,7 +2166,7 @@ def test_workspace_allocation_change_invalidates_only_workspace_bound_wrappers()
     fmha._update_workspace_allocation(first_workspace)
     fmha._context_wrappers[1] = Mock()
     fmha._decode_wrappers[1] = Mock()
-    fmha._mla_decode_wrappers[(1, 1)] = Mock()
+    fmha._mla_decode_wrappers[(1, 1, 1, 1, 32)] = Mock()
 
     second_workspace = torch.empty(64, dtype=torch.uint8)
     fmha._update_workspace_allocation(second_workspace)
@@ -2204,6 +2204,134 @@ def _get_test_mla_wrapper(
         cp_world=cp_world,
         cp_interleave_size=32 if cp_world > 1 else 1,
     )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("initial_layout", ["replica", "sharded", "ulysses"])
+def test_mla_decode_preserves_live_cache_ownership(
+    monkeypatch: pytest.MonkeyPatch, initial_layout: str
+) -> None:
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        prims_ts_module, "get_multi_processor_count_for_device", lambda _device_index: 1
+    )
+    monkeypatch.setattr(
+        prims_ts_package, "get_prims_ts_batch_mla_decode_workspace_size", Mock(return_value=64)
+    )
+    observed: list[tuple[int, int, int]] = []
+
+    class DecodeKernel:
+        def __init__(self) -> None:
+            self.cp_world = 0
+            self.cp_interleave_size = 0
+            self.page_size = 0
+
+        def plan(
+            self, *, cp_world: int, cp_interleave_size: int, page_size: int, **_kwargs: object
+        ) -> None:
+            self.cp_world = cp_world
+            self.cp_interleave_size = cp_interleave_size
+            self.page_size = page_size
+
+        def run(
+            self,
+            _query: torch.Tensor,
+            kv_cache: torch.Tensor,
+            *,
+            seq_lens_kv: torch.Tensor,
+            cp_rank: int,
+            **_kwargs: object,
+        ) -> None:
+            assert self.page_size == kv_cache.shape[2]
+            prims_mla_module._validate_mla_cp_rank(cp_rank, self.cp_world)
+            visible = prims_mla_module._mla_cp_local_length(
+                int(seq_lens_kv[0]), self.cp_world, self.cp_interleave_size, cp_rank
+            )
+            observed.append((self.cp_world, cp_rank, visible))
+
+    monkeypatch.setattr(prims_mla_module, "BatchMLADecodePagedTSWrapper", DecodeKernel)
+    page_size = 64
+    cache = torch.empty((6, 1, page_size, 576), dtype=torch.bfloat16)
+    block_tables = torch.tensor([[[0, 1, 2], [3, 4, 5]]], dtype=torch.int32)
+    build_metadata = Mock(return_value=(cache, block_tables, None))
+    monkeypatch.setattr(prims_ts_module.thop, "build_trtllm_gen_kv_cache_metadata", build_metadata)
+    mappings = {
+        "replica": Mapping(),
+        "sharded": Mapping(world_size=2, rank=1, cp_size=2, cp_config={"cp_type": CpType.HELIX}),
+        "ulysses": Mapping(world_size=2, rank=1, cp_size=2, cp_config={"cp_type": CpType.ULYSSES}),
+    }
+    attn = _Attention(head_dim=576, is_mla=True, num_heads=4)
+    fmha = PrimsTSFmha(attn)
+    query = torch.empty((1, attn.num_heads * 576), dtype=torch.bfloat16)
+    output = torch.empty((1, attn.num_heads * 512), dtype=torch.bfloat16)
+    sequence_lengths = torch.tensor([129], dtype=torch.int32)
+    metadata = SimpleNamespace(
+        is_cuda_graph=False,
+        helix_position_offsets=torch.tensor([128], dtype=torch.int32),
+        helix_global_kv_lens=torch.tensor([129], dtype=torch.int32),
+        mapping=mappings["sharded"],
+        kv_cache_manager=SimpleNamespace(mapping=mappings[initial_layout]),
+        tokens_per_block=page_size,
+        beam_width=1,
+        kv_cache_block_offsets=block_tables,
+        host_kv_cache_pool_pointers=torch.tensor([1234], dtype=torch.int64),
+        host_kv_cache_pool_mapping=torch.tensor([[0, 0]], dtype=torch.int32),
+        max_num_requests=1,
+        max_num_tokens=1,
+        num_contexts=0,
+        num_generations=1,
+        num_ctx_tokens=0,
+    )
+    forward_args = AttentionForwardArgs(
+        output=output,
+        attention_input_type=AttentionInputType.generation_only,
+        attention_window_size=192,
+    )
+    workspace = torch.empty(64, dtype=torch.uint8)
+    params = FmhaParams(
+        attn=attn,
+        meta=metadata,
+        fwd=forward_args,
+        workspace=workspace,
+        query_input=query,
+        output=output,
+        sequence_lengths=sequence_lengths,
+        input_seq_length=1,
+        max_past_kv_length=192,
+        max_attention_window_size=192,
+        cyclic_attention_window_size=192,
+        num_tokens=1,
+        seq_offset=0,
+        tokens_per_block=page_size,
+        kv_factor=1,
+        total_num_blocks=6,
+        batch_size=1,
+        num_requests=1,
+    )
+    layouts = (
+        ("ulysses",)
+        if initial_layout == "ulysses"
+        else (
+            initial_layout,
+            "sharded" if initial_layout == "replica" else "replica",
+            initial_layout,
+        )
+    )
+    for layout in layouts:
+        metadata.kv_cache_manager = SimpleNamespace(mapping=mappings[layout])
+        sequence_lengths.fill_(64 if layout == "sharded" else 129)
+        for page_size in (64, 32, 64):
+            num_pages = 192 // page_size
+            cache = torch.empty((2 * num_pages, 1, page_size, 576), dtype=torch.bfloat16)
+            block_tables = torch.arange(2 * num_pages, dtype=torch.int32).reshape(1, 2, num_pages)
+            build_metadata.return_value = (cache, block_tables, None)
+            metadata.tokens_per_block = page_size
+            metadata.kv_cache_block_offsets = block_tables
+            params.tokens_per_block = page_size
+            params.total_num_blocks = 2 * num_pages
+            fmha.prepare_workspace(query, None, None, metadata, forward_args, workspace)
+            fmha.run_mla_generation(params)
+            assert observed[-1] == ((2, 1, 64) if layout == "sharded" else (1, 0, 129))
 
 
 @pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])
@@ -2273,6 +2401,9 @@ def test_mla_eager_wrapper_plans_once_and_reads_live_fixed_metadata(
         helix_kv_bounds=None,
         helix_global_kv_lens=global_lengths,
         mapping=SimpleNamespace(cp_size=2, cp_rank=1),
+        kv_cache_manager=SimpleNamespace(
+            mapping=Mapping(world_size=2, rank=1, cp_size=2, cp_config={"cp_type": CpType.HELIX})
+        ),
         tokens_per_block=page_size,
         beam_width=1,
         kv_cache_block_offsets=torch.empty((2, 2, 3), dtype=torch.int32),
@@ -2399,7 +2530,12 @@ def test_mla_eager_wrapper_plans_once_and_reads_live_fixed_metadata(
     )
     assert run_kwargs["seq_lens_kv"].data_ptr() == expected_lengths.data_ptr()
     torch.testing.assert_close(run_kwargs["seq_lens_kv"], expected_lengths)
-    assert fmha._mla_decode_wrappers[(2, query_width)] is wrapper
+    assert (
+        fmha._mla_decode_wrappers[
+            (2, query_width, 2 if helix else 1, page_size if helix else 1, page_size)
+        ]
+        is wrapper
+    )
     assert len(fmha._mla_decode_plan_profiles) == 1
     assert asdict(next(iter(fmha._mla_decode_plan_profiles))) == {
         key: value
@@ -2532,8 +2668,8 @@ def test_mla_wrapper_cache_plans_each_batch_once_and_reuses_a_b_a(
     for wrapper in wrappers:
         wrapper.plan.assert_called_once()
         assert wrapper.plan.call_args.kwargs["workspace_buffer"] is workspace
-    assert fmha._mla_decode_wrappers[(2, 1)] is wrappers[0]
-    assert fmha._mla_decode_wrappers[(1, 1)] is wrappers[1]
+    assert fmha._mla_decode_wrappers[(2, 1, 1, 1, 32)] is wrappers[0]
+    assert fmha._mla_decode_wrappers[(1, 1, 1, 1, 32)] is wrappers[1]
     profiles = fmha._mla_decode_plan_profiles.copy()
     assert {profile.batch_size for profile in profiles} == {1, 2}
     fmha._update_workspace_allocation(workspace)
@@ -2778,6 +2914,9 @@ def test_mla_prepare_workspace_sizes_caller_owned_workspace(
         is_cuda_graph=is_cuda_graph,
         helix_position_offsets=torch.empty(2 * query_width, dtype=torch.int32) if helix else None,
         mapping=SimpleNamespace(cp_size=2, cp_rank=1),
+        kv_cache_manager=SimpleNamespace(
+            mapping=Mapping(world_size=2, rank=1, cp_size=2, cp_config={"cp_type": CpType.HELIX})
+        ),
         kv_cache_block_offsets=torch.empty((2, 2, 3), dtype=torch.int32),
         max_num_requests=2,
         num_contexts=0,
@@ -2837,7 +2976,7 @@ def test_mla_prepare_workspace_preserves_cached_wrappers_with_stable_allocation(
     workspace = torch.empty(48, dtype=torch.uint8)
     fmha._update_workspace_allocation(workspace)
     wrapper = Mock()
-    fmha._mla_decode_wrappers[(2, 1)] = wrapper
+    fmha._mla_decode_wrappers[(2, 1, 1, 1, 32)] = wrapper
     q = torch.empty((2, attn.num_heads * 576), dtype=torch.bfloat16)
     metadata = SimpleNamespace(
         is_cuda_graph=True,
@@ -2860,7 +2999,7 @@ def test_mla_prepare_workspace_preserves_cached_wrappers_with_stable_allocation(
     fmha.prepare_workspace(q.clone(), None, None, metadata, forward_args, workspace)
 
     stream.synchronize.assert_not_called()
-    assert fmha._mla_decode_wrappers[(2, 1)] is wrapper
+    assert fmha._mla_decode_wrappers[(2, 1, 1, 1, 32)] is wrapper
     assert workspace.numel() == 48
     workspace_size.assert_called_once()
 
@@ -2969,7 +3108,7 @@ def test_mla_workspace_size_cache_tracks_request_geometry(
     # already fits, so pointer stability does not conceal a changed plan bound.
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     previous_pointer = workspace.data_ptr()
-    fmha._mla_decode_wrappers[(2, 1)] = Mock()
+    fmha._mla_decode_wrappers[(2, 1, 1, 1, 32)] = Mock()
     fmha._mla_decode_plan_profiles.add(object())
     metadata.kv_cache_block_offsets = torch.empty((4, 2, 6), dtype=torch.int32)
     fmha.prepare_workspace(q, None, None, metadata, forward_args, workspace)
@@ -3013,7 +3152,7 @@ def test_mla_workspace_size_cache_preserves_allocation_checks(
     )
     first_workspace = torch.empty(0, dtype=torch.uint8)
     fmha.prepare_workspace(q, None, None, metadata, forward_args, first_workspace)
-    fmha._mla_decode_wrappers[(2, 6)] = Mock()
+    fmha._mla_decode_wrappers[(2, 6, 1, 1, 32)] = Mock()
     context_wrapper = Mock()
     fmha._context_wrappers[2] = context_wrapper
 

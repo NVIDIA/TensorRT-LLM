@@ -278,7 +278,9 @@ class PrimsTSFmha(PhasedFmha):
         self._contiguous_context_wrappers: dict[tuple[Any, ...], "BatchPrefillTSWrapper"] = {}
         # VC-Attention-QK16 K/V preparation with its token permutation, one per layer.
         self._decode_wrappers: dict[int, "BatchDecodePagedTSWrapper"] = {}
-        self._mla_decode_wrappers: dict[tuple[int, int], "BatchMLADecodePagedTSWrapper"] = {}
+        self._mla_decode_wrappers: dict[
+            tuple[int, int, int, int, int], "BatchMLADecodePagedTSWrapper"
+        ] = {}
         self._mla_decode_plan_capacity: int | None = None
         self._mla_context_wrappers: dict[
             tuple[int, int, int, str, bool], "BatchPrefillTSWrapper"
@@ -1049,9 +1051,7 @@ class PrimsTSFmha(PhasedFmha):
     ) -> "BatchMLADecodePagedTSWrapper":
         if batch_size <= 0:
             raise RuntimeError("PrimTS MLA decode requires a positive batch size.")
-        # Within a prepared KV capacity, dense MLA instances fix the mask,
-        # dtypes, Helix geometry and LSE mode. Only batch and verify width vary.
-        key = (batch_size, max_q_len)
+        key = (batch_size, max_q_len, cp_world, cp_interleave_size, page_size)
         wrapper = self._mla_decode_wrappers.get(key)
         if wrapper is not None:
             return wrapper
@@ -1088,10 +1088,12 @@ class PrimsTSFmha(PhasedFmha):
 
     @staticmethod
     def _mla_cp_geometry(metadata: "TrtllmAttentionMetadata") -> tuple[int, int]:
-        """Return model-invariant CP geometry while keeping page capacity local."""
+        """Return KV-cache ownership geometry while keeping page capacity local."""
         if metadata.helix_position_offsets is None:
             return 1, 1
-        return int(metadata.mapping.cp_size), int(metadata.tokens_per_block)
+        cache_mapping = metadata.kv_cache_manager.mapping
+        cp_size = int(cache_mapping.cp_size) if cache_mapping.has_cp_helix() else 1
+        return cp_size, int(metadata.tokens_per_block) if cp_size > 1 else 1
 
     def forward(
         self,
@@ -1995,7 +1997,6 @@ class PrimsTSFmha(PhasedFmha):
         max_seq_len = int(block_tables.shape[-1]) * params.tokens_per_block
         mask_type = self._get_prims_mask_type(params.fwd)
         sequence_lengths = params.sequence_lengths
-        cp_rank = 0
         if meta.helix_position_offsets is not None:
             if seq_len_q != 1 and not meta._helix_spec_tokens_valid:
                 raise RuntimeError(
@@ -2007,9 +2008,9 @@ class PrimsTSFmha(PhasedFmha):
             sequence_lengths = meta.helix_global_kv_lens
             if sequence_lengths is None:
                 raise RuntimeError("Helix MLA requires global KV lengths.")
-            cp_rank = int(meta.mapping.cp_rank)
         seq_lens = self._get_sequence_lengths(sequence_lengths, batch_size)
         cp_world, cp_interleave_size = self._mla_cp_geometry(meta)
+        cp_rank = int(meta.kv_cache_manager.mapping.cp_rank) if cp_world > 1 else 0
         stats = params.fwd.softmax_stats_tensor
         params.fwd.softmax_stats_is_lse = stats is not None
         if stats is not None:

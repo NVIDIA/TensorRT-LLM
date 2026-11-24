@@ -64,6 +64,7 @@ class _Scenario:
     generation_query_width: int = 1
     tokens_per_block: int = 64
     strict_prims_ts: bool = False
+    ulysses_cache: bool = False
 
 
 @torch.no_grad()
@@ -180,35 +181,61 @@ def _check_context_heads(rank, world_size, scenario, use_nccl_for_alltoall, fifo
     if scenario.check_kv_ownership:
         return _check_owner_only_kv(runtime, mixer, reference, model_config, mapping, scenario)
     batch, context_length = 2, 128
+    query_width = scenario.generation_query_width
+    total_length = context_length + query_width
     generator = torch.Generator(device="cuda").manual_seed(1234)
     hidden = torch.randn(
         batch,
-        context_length + 1,
+        total_length,
         config.hidden_size,
         dtype=torch.bfloat16,
         device="cuda",
         generator=generator,
     )
-    mask = torch.full((context_length + 1, context_length + 1), float("-inf"), device="cuda").triu(
-        1
-    )[None, None]
+    mask = torch.full((total_length, total_length), float("-inf"), device="cuda").triu(1)[
+        None, None
+    ]
     expected = reference(hidden, attention_mask=mask)
+    # Complete local caches isolate head-layout checks from distributed KV
+    # ownership and gathering.
+    cache_mapping = (
+        Mapping(
+            world_size=world_size,
+            rank=rank,
+            tp_size=scenario.tp_size,
+            cp_size=scenario.cp_size,
+            cp_config={"cp_type": CpType.ULYSSES},
+        )
+        if scenario.ulysses_cache
+        else Mapping(world_size=1, rank=0, tp_size=1)
+    )
     cache_scenario = SimpleNamespace(
-        ctx_len=context_length,
+        ctx_len=(total_length - 1) * cache_mapping.world_size,
         batch=batch,
         kv_cache_tokens_per_block=64,
         num_layers=1,
         kv_cache_dtype=torch.bfloat16,
     )
-    # Complete local caches isolate head-layout checks from distributed KV
-    # ownership and gathering.
     manager, metadata = setup_kv_and_metadata(
         cache_scenario,
-        Mapping(world_size=1, rank=0, tp_size=1),
+        cache_mapping,
         cache_type=CACHE_TYPE_SELFKONLY,
         num_kv_heads=1,
         head_dim=config.kv_lora_rank + config.qk_rope_head_dim,
     )
+    if query_width > 1:
+        metadata = get_attention_backend("TRTLLM").Metadata(
+            seq_lens=torch.tensor([context_length] * batch, dtype=torch.int),
+            request_ids=list(range(batch)),
+            max_num_requests=batch,
+            num_contexts=batch,
+            prompt_lens=[context_length] * batch,
+            max_num_tokens=context_length * batch,
+            kv_cache_manager=manager,
+            kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[0] * batch),
+            mapping=cache_mapping,
+        )
+        metadata.prepare()
     full_q_projection_rows = []
     handle = mixer.q_b_proj.register_forward_hook(
         lambda module, inputs, output: full_q_projection_rows.append(output.shape[0])
@@ -262,35 +289,69 @@ def _check_context_heads(rank, world_size, scenario, use_nccl_for_alltoall, fifo
         if scenario.cp_size > 1:
             assert full_q_projection_rows == [], "cached prefill must retain the CP head split"
 
+        generation_start = context_length if query_width == 1 else context_length - 1
+        num_contexts = 1 if query_width == 1 else 0
+        request_ids = [0, 1] if num_contexts else [1]
+        query_lengths = [context_length] * num_contexts + [query_width]
         metadata = get_attention_backend("TRTLLM").Metadata(
-            seq_lens=torch.tensor([context_length, 1], dtype=torch.int),
-            request_ids=[0, 1],
+            seq_lens=torch.tensor(query_lengths, dtype=torch.int),
+            request_ids=request_ids,
             max_num_requests=batch,
-            num_contexts=1,
-            prompt_lens=[context_length, context_length],
-            max_num_tokens=context_length + 1,
+            num_contexts=num_contexts,
+            prompt_lens=[context_length] * num_contexts + [generation_start],
+            max_num_tokens=sum(query_lengths),
             kv_cache_manager=manager,
             kv_cache_params=KVCacheParams(
-                use_cache=True, num_cached_tokens_per_seq=[0, context_length]
+                use_cache=True, num_cached_tokens_per_seq=[0] * num_contexts + [generation_start]
             ),
             mapping=mapping,
             enable_context_mla_with_cached_kv=True,
+            runtime_features=AttentionRuntimeFeatures(has_speculative_draft_tokens=query_width > 1),
         )
         # The generation kernel emits CP softmax statistics only when its
         # Helix fields are present. Every rank appends to its full replica in
         # this fixture; owner-only writes are checked separately.
-        metadata.update_helix_param([context_length], [False])
+        positions = list(range(generation_start, generation_start + query_width))
+        metadata.update_helix_param(positions, [False], [query_width] if query_width > 1 else None)
         metadata.prepare()
+        if query_width > 1:
+            metadata.update_spec_dec_param(
+                batch_size=len(request_ids),
+                is_spec_decoding_enabled=True,
+                is_spec_dec_tree=False,
+                is_spec_dec_dynamic_tree=False,
+                max_draft_len=query_width - 1,
+                max_total_draft_tokens=query_width - 1,
+                num_contexts=num_contexts,
+            )
+            metadata.recompute_helix_spec_buffers(query_width, query_width)
+            metadata.on_update_kv_lens()
         extra_attrs["attention_metadata"] = weakref.ref(metadata)
-        mixed = torch.cat((hidden[0, :context_length], hidden[1, -1:]), dim=0)
+        step_hidden = hidden[1, generation_start : generation_start + query_width].contiguous()
+        if num_contexts:
+            step_hidden = torch.cat((hidden[0, :context_length], step_hidden), dim=0)
         with model_extra_attrs(extra_attrs):
-            actual = runtime(mixed, metadata)
+            actual = runtime(step_hidden, metadata)
+        if num_contexts:
+            _assert_matches_reference(
+                actual[:context_length], expected[0, :context_length], scenario.fp8
+            )
         _assert_matches_reference(
-            actual[:context_length], expected[0, :context_length], scenario.fp8
+            actual[-query_width:],
+            expected[1, generation_start : generation_start + query_width],
+            scenario.fp8,
         )
-        _assert_matches_reference(actual[-1], expected[1, -1], scenario.fp8)
+        if query_width > 1:
+            expected_positions = torch.tensor(positions, dtype=torch.int32, device="cuda")
+            torch.testing.assert_close(
+                metadata.helix_local_slots[:query_width],
+                expected_positions,
+            )
+            torch.testing.assert_close(
+                metadata.helix_kv_bounds[:query_width], expected_positions + 1
+            )
         if scenario.cp_size > 1:
-            assert full_q_projection_rows == [1], (
+            assert full_q_projection_rows == [query_width], (
                 "only decode tokens use the full TP-local Q projection"
             )
         return 0.0

@@ -1149,6 +1149,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # replaces a chain of elementwise ops on the step's critical path.
         # Static shapes and allocation-free, so it is safe under CUDA graph
         # capture.
+        cache_mapping = self.kv_cache_manager.mapping
+        sharded_cache = cache_mapping.has_cp_helix()
         populate_helix_spec_buffers(
             self.helix_position_offsets[:num_gen_tokens],
             self.helix_local_slots[:num_gen_tokens],
@@ -1158,8 +1160,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             num_tokens=num_gen_tokens,
             tokens_per_seq=tokens_per_gen_seq,
             tokens_per_block=self.kv_cache_manager.tokens_per_block,
-            cp_size=self.mapping.cp_size,
-            cp_rank=self.mapping.cp_rank,
+            cp_size=cache_mapping.cp_size if sharded_cache else 1,
+            cp_rank=cache_mapping.cp_rank if sharded_cache else 0,
             global_kv_lens=(self.helix_global_kv_lens[:num_gen_seqs]
                             if self.helix_global_kv_lens is not None else None))
 
