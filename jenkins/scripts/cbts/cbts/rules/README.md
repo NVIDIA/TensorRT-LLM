@@ -15,7 +15,7 @@ for the overall CBTS architecture.
 | `waives.py` | `WaivesRule` | `waiveonly` | `tests/integration/test_lists/waives.txt` |
 | `tests_def.py` | `TestsDefRule` | `testdefonly` | `tests/**/*` (any file under tests/) |
 | `test_list.py` | `TestListRule` | `testlistonly` | `tests/integration/test_lists/test-db/*.yml` |
-| `visual_gen.py` | `VisualGenRule` | `visualgenonly` | `examples/visual_gen/**`, `scripts/visualgen_eval/**`, `tensorrt_llm/_torch/visual_gen/**`, `tensorrt_llm/media/**`, `tensorrt_llm/visual_gen/**` (each excl. docs), and the exact VisualGen serve schema |
+| `visual_gen.py` | `VisualGenRule` | `visualgenonly` | `examples/visual_gen/**`, `scripts/visualgen_eval/**`, `tensorrt_llm/_torch/visual_gen/**`, `tensorrt_llm/media/**`, `tensorrt_llm/visual_gen/**` (each excl. docs), the exact VisualGen serve schema, `cpp/cmake/modules/modeling_v2.cmake` and `cpp/tensorrt_llm/modeling_v2/common/familyLibrary.version` |
 | `spec_dec.py` | `SpecDecRule` | `specdeconly` | `tensorrt_llm/_torch/speculative/**`, `tensorrt_llm/models/{eagle,medusa,redrafter}/**`, `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/**`, `examples/llm-api/llm_speculative_decoding.py` (each excl. docs) |
 | `modeling_v2.py` | `ModelingV2Rule` | `modelingv2only` | `tensorrt_llm/_torch/modeling_v2/**`, `cpp/tensorrt_llm/modeling_v2/**`, `cpp/cmake/modules/modeling_v2.cmake` (excl. docs); per target or family for changes under `models/` and `catalog/<category>/`, from paths and imports |
 | `agent_flow.py` | `AgentFlowRule` | `agentflowonly` | `agent-flow/**` (excl. docs and out-of-scope metadata) → the single `CPU-AgentFlow-UnitTest` stage; not test-db-driven |
@@ -276,7 +276,7 @@ Outcomes:
 
 ## VisualGenRule
 
-Path-only rule. Claims source files under `examples/visual_gen/`,
+Claims source files under `examples/visual_gen/`,
 `scripts/visualgen_eval/`, `tensorrt_llm/_torch/visual_gen/`,
 `tensorrt_llm/media/`, and `tensorrt_llm/visual_gen/` (excluding documentation,
 which `DocsRule` handles). It also claims the exact generated schema
@@ -290,7 +290,12 @@ used as test fixtures (e.g. `examples/visual_gen/cat_piano.png` and
 loaded by `tests/unittest/_torch/visual_gen/`), so edits to them must
 still force VG stages.
 
-Block selection — entry-pattern based only:
+A family in `_torch/visual_gen/modeling_v2/models/<family>/` with a `pipeline_registry.py` selects its routed suites under `visual_gen/modeling_v2/<family>/` and its mirrored unit tests. A family router or native family change runs the family. Changes under the Modeling V2 catalog also select the VisualGen targets that transitively import the entry.
+
+VisualGen native libraries build with `cpp/cmake/modules/modeling_v2.cmake` and link `cpp/tensorrt_llm/modeling_v2/common/familyLibrary.version`. A change to either selects the native CMake test and the consumers of every VisualGen native source, together with `ModelingV2Rule`'s selection under `testsonly`. A VisualGen V2 native source in a family without `pipeline_registry.py` selects every VG entry.
+
+Changes under `_torch/visual_gen/modeling_v2/catalog/` select the mirrored operation tests, the routed targets that import the operation directly or through helpers, and the CPU operation-contract checks. Changes to a routed family or target’s `ops/` also run the CPU contract checks. Changes to the shared `OpWrapper` base select every routed VisualGen family and its catalog consumers.
+
 VisualGen has no `condition.terms.backend` of its own; VG entries
 live in `backend: pytorch` and `backend: tensorrt` blocks. A block
 "belongs to VG" iff any of its `tests:` entries lives under a dedicated
@@ -322,7 +327,7 @@ test set than internal VG changes without requiring all unrelated GPU tests.
 
 Outcomes:
 
-- No VG source files in the diff → rule returns `None`.
+- No VG source, imported catalog or shared native build changes → rule returns `None`.
 - VG source touched, all internal (`examples/visual_gen/**`,
   `scripts/visualgen_eval/**`, or `tensorrt_llm/_torch/visual_gen/**`)
   → `scope=visualgenonly`;

@@ -378,6 +378,8 @@
 /tests/unittest/_torch/modules/test_top_k.py @NVIDIA/trt-llm-topk-devs
 
 # ===== VisualGen / AIGV =====
+/tests/unittest/scripts/test_build_wheel_visual_gen.py @NVIDIA/trt-llm-visualgen-devs
+/cpp/tensorrt_llm/visual_gen/ @NVIDIA/trt-llm-visualgen-devs
 /cpp/tensorrt_llm/thop/fusedDiT* @NVIDIA/trt-llm-visualgen-devs
 /examples/visual_gen @NVIDIA/trt-llm-visualgen-devs
 /scripts/visualgen_eval @NVIDIA/trt-llm-visualgen-devs
@@ -392,6 +394,8 @@
 /tests/scripts/perf-sanity/visual_gen @NVIDIA/trt-llm-visualgen-devs
 /tests/unittest/_torch/visual_gen @NVIDIA/trt-llm-visualgen-devs
 /tests/unittest/visual_gen @NVIDIA/trt-llm-visualgen-devs
+/tests/test_common/visual_gen @NVIDIA/trt-llm-visualgen-devs
+/jenkins/scripts/cbts/cbts/rules/visual_gen.py @NVIDIA/trt-llm-devs @NVIDIA/trt-llm-visualgen-devs
 
 # ===== SCAFFOLDING =====
 /tensorrt_llm/scaffolding @WeiHaocheng @dc3671
@@ -459,6 +463,7 @@
 /constraints.txt @NVIDIA/trt-llm-oss-compliance
 /cpp/CMakeLists.txt @NVIDIA/trt-llm-oss-compliance
 /cpp/cmake/** @NVIDIA/trt-llm-oss-compliance
+/cpp/cmake/modules/visual_gen.cmake @NVIDIA/trt-llm-visualgen-devs @NVIDIA/trt-llm-oss-compliance
 /docker/common/** @NVIDIA/trt-llm-infra-devs @NVIDIA/trt-llm-oss-compliance
 /jenkins/license_cpp.json @NVIDIA/trt-llm-infra-devs @NVIDIA/trt-llm-oss-compliance
 /scripts/check_cpp_licenses.py @NVIDIA/trt-llm-infra-devs @NVIDIA/trt-llm-oss-compliance
