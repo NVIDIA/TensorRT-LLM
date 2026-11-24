@@ -48,6 +48,8 @@ Not captured:
 
 TeaCache wraps on top of the CUDA graph wrapper. When TeaCache decides a step must compute, it calls the graphed transformer forward. When TeaCache skips a step, no transformer graph replay is needed for that step.
 
+With Cache-DiT, FLUX.1 and FLUX.2 capture each transformer block as its own graph instead of `transformer.forward`, so Cache-DiT decides which blocks run between replays. Other pipelines keep the whole-forward graph, which freezes one cache decision: Cache-DiT then caches nothing, and a warning is logged.
+
 ## Graph Keys
 
 Each captured graph is stored under a graph key. The default key contains tensor shapes from the wrapped `model.forward` arguments and keyword arguments.
@@ -58,7 +60,7 @@ This separation matters because tensor shapes alone are not always enough. If tw
 
 ## Extra Keys
 
-Models add non-shape graph-key contributors through `BaseDiffusionModel.register_cuda_graph_extra_key_fns()`. The hook receives the model's `CUDAGraphRunner`; implementations call `runner.register_extra_key_fn(name, fn)` to register a named callback.
+Models add non-shape graph-key contributors through `BaseDiffusionModel.register_cuda_graph_extra_key_fns()`. The hook receives the model's `CUDAGraphRunner`, or a `ModelForwardContext` with per-block graphs; implementations call its `register_extra_key_fn(name, fn)` to register a named callback.
 
 During key construction, the runner calls each registered callback with the same `*args` and `**kwargs` passed to the wrapped `model.forward`. If the callback returns a non-`None` hashable value, the runner appends `(name, value)` to the graph key. If it returns `None`, that key part is omitted for the current call.
 
@@ -68,13 +70,15 @@ Subclasses can override `register_cuda_graph_extra_key_fns()` to add model-speci
 
 ## Capture and Replay
 
-Capture is lazy:
+Whole-forward capture is lazy:
 
 1. On the first call with a new graph key, VisualGen runs a short warmup, captures a CUDA graph, and stores static input buffers for that key.
 2. On later calls with the same key, VisualGen copies new tensor values into the static buffers in place and replays the captured graph.
 3. On a call with a different key, VisualGen captures a separate graph.
 
 This means the first denoising step for a new shape or phase pays capture cost. Later matching steps replay the graph.
+
+Per-block graphs are captured only during warmup, or during the first request when warmup is disabled. A request whose block inputs warmup did not produce, such as another resolution, `n > 1`, a non-default `max_sequence_length` or a FLUX.2 edit, runs those blocks without graphs and logs a warning.
 
 When a pipeline has multiple transformer components that do not execute concurrently, VisualGen can share a CUDA graph memory pool across their runners so graph memory can be reused between components.
 
