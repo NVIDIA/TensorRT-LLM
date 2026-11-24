@@ -456,11 +456,17 @@ def test_vc_attention_eager_runs_keep_only_the_current_shape(monkeypatch) -> Non
             monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
             with pytest.raises(_StopAtFmhaDispatch):
                 attention.forward(x, x, x, batch_size=1, seq_len=256)
+    # An eager call at a captured shape passes the mode of its step's phase and no step.
+    attention.metadata._metadata_state["denoise_step"] = (4, 50)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    with pytest.raises(_StopAtFmhaDispatch):
+        attention.forward(x, x, x, batch_size=1, seq_len=256)
     assert seen == [
         (None, None, None),
         ((0, 128), None, None),
         (None, None, "cold"),
         (None, None, "keep"),
+        (None, None, "warm"),
         (None, None, "warm"),
     ]
 

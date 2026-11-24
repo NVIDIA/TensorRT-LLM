@@ -506,8 +506,9 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         metadata state, so the V-Smooth window is a fraction of the schedule's
         steps on any scheduler. Under the CUDA graph runner the host resolved
         phase names the preprocessor path. Capture must not record the step.
-        Eager calls at a K/V shape the runner never prepared keep their grouping
-        in a separate preprocessor.
+        Eager calls at a K/V shape the runner prepared name the path by their
+        step's phase too. Eager calls at other shapes keep their grouping in a
+        separate preprocessor.
         """
         del timestep
         quant_cfg = self.quant_attention_config
@@ -529,8 +530,14 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 denoise_step = self.metadata._metadata_state.get("denoise_step")
                 # Eager calls at a shape the runner prepared share its grouping, which the
                 # captured regrouping steps refresh, so they see the grouping graphs off
-                # would. Other shapes keep one eager grouping, apart from the runner's.
-                if shape not in self._vc_graph_shapes:
+                # would. They pass the mode of their step's phase, as the graphs do (a warm
+                # step refreshes, as these are the real calls), so the runner's preprocessor
+                # never sees a step, which would start an extra regroup per request. Other
+                # shapes keep one eager grouping, apart from the runner's.
+                if shape in self._vc_graph_shapes:
+                    mode = VC_PHASE_MODES.get(vc_smooth_phase(denoise_step))
+                    denoise_step = None
+                else:
                     if self._vc_shape is not None and shape != self._vc_shape:
                         from ....attention.backends.prims_ts.vc_attention.quantization import (
                             VCAttentionPreprocessor,
