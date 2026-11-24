@@ -32,6 +32,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._torch.utils import helix_page_owner
 from tensorrt_llm._utils import get_sm_version, torch_dtype_to_binding
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
@@ -1051,6 +1052,8 @@ class PrimsTSFmha(PhasedFmha):
     ) -> "BatchMLADecodePagedTSWrapper":
         if batch_size <= 0:
             raise RuntimeError("PrimTS MLA decode requires a positive batch size.")
+        # A dense MLA instance fixes heads, dtypes, mask and LSE mode for one layer.
+        # Workspace-allocation and page-table-capacity changes clear the cache.
         key = (batch_size, max_q_len, cp_world, cp_interleave_size, page_size)
         wrapper = self._mla_decode_wrappers.get(key)
         if wrapper is not None:
@@ -1087,13 +1090,13 @@ class PrimsTSFmha(PhasedFmha):
         return wrapper
 
     @staticmethod
-    def _mla_cp_geometry(metadata: "TrtllmAttentionMetadata") -> tuple[int, int]:
-        """Return KV-cache ownership geometry while keeping page capacity local."""
+    def _mla_cp_geometry(metadata: "TrtllmAttentionMetadata") -> tuple[int, int, int]:
+        """Return (world, rank, interleave), or (1, 0, 1) without Helix pages."""
         if metadata.helix_position_offsets is None:
-            return 1, 1
-        cache_mapping = metadata.kv_cache_manager.mapping
-        cp_size = int(cache_mapping.cp_size) if cache_mapping.has_cp_helix() else 1
-        return cp_size, int(metadata.tokens_per_block) if cp_size > 1 else 1
+            return 1, 0, 1
+        cp_world, cp_rank = helix_page_owner(metadata.kv_cache_manager.mapping)
+        cp_interleave_size = int(metadata.tokens_per_block) if cp_world > 1 else 1
+        return cp_world, cp_rank, cp_interleave_size
 
     def forward(
         self,
@@ -1327,7 +1330,7 @@ class PrimsTSFmha(PhasedFmha):
                     self._mla_decode_plan_profiles.clear()
                 self._mla_decode_plan_capacity = max_seq_len
 
-            cp_world, cp_interleave_size = self._mla_cp_geometry(metadata)
+            cp_world, _, cp_interleave_size = self._mla_cp_geometry(metadata)
             required_bytes = get_prims_ts_batch_mla_decode_workspace_size(
                 batch_size,
                 self.attn.num_heads,
@@ -2009,8 +2012,7 @@ class PrimsTSFmha(PhasedFmha):
             if sequence_lengths is None:
                 raise RuntimeError("Helix MLA requires global KV lengths.")
         seq_lens = self._get_sequence_lengths(sequence_lengths, batch_size)
-        cp_world, cp_interleave_size = self._mla_cp_geometry(meta)
-        cp_rank = int(meta.kv_cache_manager.mapping.cp_rank) if cp_world > 1 else 0
+        cp_world, cp_rank, cp_interleave_size = self._mla_cp_geometry(meta)
         stats = params.fwd.softmax_stats_tensor
         params.fwd.softmax_stats_is_lse = stats is not None
         if stats is not None:

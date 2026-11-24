@@ -33,6 +33,7 @@ import triton
 import triton.language as tl
 
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.utils import helix_page_owner
 
 # The module, not the instance: the entry imports this module for its launcher.
 from ...ops.spec import k3_spec_decode_head as _entry
@@ -258,8 +259,7 @@ class SpecDecodeHead:
         kv_start, num_kv = spec_decode_kv_range(md)
         helix_kwargs = {}
         if helix:
-            cache_mapping = md.kv_cache_manager.mapping
-            sharded_cache = cache_mapping.has_cp_helix()
+            cp_world, cp_rank = helix_page_owner(md.kv_cache_manager.mapping)
             tokens_per_seq = preparer.get_runtime_tokens_per_gen_step(runtime_draft_len)
             assert gen_tokens % tokens_per_seq == 0 and (
                 gen_tokens // tokens_per_seq == md.num_generations
@@ -274,8 +274,8 @@ class SpecDecodeHead:
                 helix_zero_kv=self._zero_kv_scratch(md.helix_kv_bounds),
                 num_helix=gen_tokens,
                 tokens_per_block=md.kv_cache_manager.tokens_per_block,
-                cp_size=cache_mapping.cp_size if sharded_cache else 1,
-                cp_rank=cache_mapping.cp_rank if sharded_cache else 0,
+                cp_size=cp_world,
+                cp_rank=cp_rank,
                 kv_bound_start=num_ctx_requests,
                 tokens_per_seq=tokens_per_seq,
             )

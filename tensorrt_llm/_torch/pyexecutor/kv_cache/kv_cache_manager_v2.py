@@ -47,7 +47,7 @@ from tensorrt_llm._torch.disaggregation.resource.page import MapperKind, RoleLay
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
 from tensorrt_llm._torch.locality_domain_utils import is_locality_domain_enabled
 from tensorrt_llm._torch.model_config import _get_kv_cache_layer_specs
-from tensorrt_llm._torch.utils import helix_local_len, maybe_compile
+from tensorrt_llm._torch.utils import helix_local_len, helix_page_owner, maybe_compile
 from tensorrt_llm._utils import (
     TensorWrapper,
     binding_to_torch_dtype,
@@ -2769,8 +2769,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # ledger block = cp_size physical pages (one per rank), while
         # self.tokens_per_block stays the PHYSICAL kernel page size.
         self._has_cp_helix = mapping.has_cp_helix()
-        self._helix_cp_rank = mapping.cp_rank if self._has_cp_helix else 0
-        self._helix_cp_size = mapping.cp_size if self._has_cp_helix else 1
+        self._helix_cp_size, self._helix_cp_rank = helix_page_owner(mapping)
         self._ledger_tokens_per_block = tokens_per_block * self._helix_cp_size
         if self._has_cp_helix:
             if kv_cache_config.enable_block_reuse:

@@ -2251,9 +2251,7 @@ def test_mla_decode_preserves_live_cache_ownership(
 
     monkeypatch.setattr(prims_mla_module, "BatchMLADecodePagedTSWrapper", DecodeKernel)
     page_size = 64
-    cache = torch.empty((6, 1, page_size, 576), dtype=torch.bfloat16)
-    block_tables = torch.tensor([[[0, 1, 2], [3, 4, 5]]], dtype=torch.int32)
-    build_metadata = Mock(return_value=(cache, block_tables, None))
+    build_metadata = Mock()
     monkeypatch.setattr(prims_ts_module.thop, "build_trtllm_gen_kv_cache_metadata", build_metadata)
     mappings = {
         "replica": Mapping(),
@@ -2273,7 +2271,7 @@ def test_mla_decode_preserves_live_cache_ownership(
         kv_cache_manager=SimpleNamespace(mapping=mappings[initial_layout]),
         tokens_per_block=page_size,
         beam_width=1,
-        kv_cache_block_offsets=block_tables,
+        kv_cache_block_offsets=None,
         host_kv_cache_pool_pointers=torch.tensor([1234], dtype=torch.int64),
         host_kv_cache_pool_mapping=torch.tensor([[0, 0]], dtype=torch.int32),
         max_num_requests=1,
@@ -2319,7 +2317,6 @@ def test_mla_decode_preserves_live_cache_ownership(
     )
     for layout in layouts:
         metadata.kv_cache_manager = SimpleNamespace(mapping=mappings[layout])
-        sequence_lengths.fill_(64 if layout == "sharded" else 129)
         for page_size in (64, 32, 64):
             num_pages = 192 // page_size
             cache = torch.empty((2 * num_pages, 1, page_size, 576), dtype=torch.bfloat16)

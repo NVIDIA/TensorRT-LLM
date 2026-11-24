@@ -507,11 +507,18 @@ def test_fp4_mla_cuda_graph_generation_lengths_records_capture_once(monkeypatch)
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA tensors")
 @pytest.mark.parametrize(
-    "tokens_per_block,cp_size,cp_rank,tokens_per_seq",
-    [(64, 16, 0, 8), (64, 16, 15, 8), (32, 4, 1, 1), (128, 2, 1, 6)],
+    "tokens_per_block,cp_size,cp_rank,tokens_per_seq,cache_layout",
+    [
+        (64, 16, 0, 8, "helix"),
+        (64, 16, 15, 8, "helix"),
+        (32, 4, 1, 1, "helix"),
+        (128, 2, 1, 6, "helix"),
+        (64, 2, 1, 8, "replica"),
+        (64, 2, 1, 8, "ulysses"),
+    ],
 )
 def test_recompute_helix_spec_buffers_matches_elementwise_reference(
-    tokens_per_block: int, cp_size: int, cp_rank: int, tokens_per_seq: int
+    tokens_per_block: int, cp_size: int, cp_rank: int, tokens_per_seq: int, cache_layout: str
 ) -> None:
     generator = torch.Generator().manual_seed(7)
     num_seqs = 5
@@ -524,8 +531,17 @@ def test_recompute_helix_spec_buffers_matches_elementwise_reference(
     metadata = object.__new__(trtllm_backend.TrtllmAttentionMetadata)
     metadata.kv_cache_manager = SimpleNamespace(
         tokens_per_block=tokens_per_block,
-        mapping=Mapping(
-            world_size=cp_size, rank=cp_rank, cp_size=cp_size, cp_config={"cp_type": CpType.HELIX}
+        mapping=(
+            Mapping()
+            if cache_layout == "replica"
+            else Mapping(
+                world_size=cp_size,
+                rank=cp_rank,
+                cp_size=cp_size,
+                cp_config={
+                    "cp_type": CpType.ULYSSES if cache_layout == "ulysses" else CpType.HELIX
+                },
+            )
         ),
     )
     metadata.mapping = SimpleNamespace(cp_size=cp_size, cp_rank=cp_rank)
@@ -546,12 +562,19 @@ def test_recompute_helix_spec_buffers_matches_elementwise_reference(
     metadata.recompute_helix_spec_buffers(num_tokens, tokens_per_seq)
     torch.cuda.synchronize()
 
-    # Reference: the per-op formulation (helix_local_len_vec mirrors the cache manager).
-    owner = torch.div(positions, tokens_per_block, rounding_mode="floor") % cp_size
-    expected_slots = torch.where(
-        owner == cp_rank, metadata.helix_local_len_vec(positions), torch.full_like(positions, -1)
-    )
-    expected_bounds = metadata.helix_local_len_vec(positions + 1)
+    # Replicated caches use global positions, independently of the attention mapping.
+    if cache_layout == "helix":
+        owner = torch.div(positions, tokens_per_block, rounding_mode="floor") % cp_size
+        expected_slots = torch.where(
+            owner == cp_rank,
+            metadata.helix_local_len_vec(positions),
+            torch.full_like(positions, -1),
+        )
+        expected_bounds = metadata.helix_local_len_vec(positions + 1)
+    else:
+        owner = torch.full_like(positions, cp_rank)
+        expected_slots = positions
+        expected_bounds = positions + 1
     gen = slice(0, num_tokens)
     torch.testing.assert_close(metadata.helix_local_slots[gen], expected_slots)
     torch.testing.assert_close(metadata.helix_kv_bounds[gen], expected_bounds)
