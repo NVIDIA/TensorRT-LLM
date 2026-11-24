@@ -1514,6 +1514,14 @@ class CSA2CacheManager(KVCacheManagerV2):
         batch = self._batch_caches
         return batch is not None and batch[0] == tuple(request_ids)
 
+    def draft_page_table_state(self) -> object | None:
+        """Opaque generation snapshot, retained while all conversion inputs match.
+
+        A new snapshot invalidates consumers' row metadata after page changes,
+        cache replacement or request reordering. Context batches return None.
+        """
+        return self._batch_conversion_inputs
+
     def batch_page_table(self, spec, width: int) -> torch.Tensor:
         """Converted int32 ``[requests, width]`` table of ``spec`` for the last computed batch."""
         return self._batch_page_tables[self._batch_page_index[spec], :, :width]

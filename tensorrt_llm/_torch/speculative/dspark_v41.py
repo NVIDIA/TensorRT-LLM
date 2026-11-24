@@ -35,6 +35,7 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
         self._draft_page_versions = {}
         self._draft_page_indices = {}
         self._draft_page_capacities = {}
+        self._draft_prepared_batch = None
         self._managed_residency = {}
         self._draft_metadata_host_buffers = []
         self._uploaded_slots = None
@@ -101,6 +102,7 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
             self._draft_page_versions.clear()
             self._draft_page_indices.clear()
             self._draft_page_capacities.clear()
+            self._draft_prepared_batch = None
             self._managed_residency.clear()
             self._uploaded_slots = None
             self._uploaded_capacities = None
@@ -150,6 +152,17 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
         if self._draft_block_tables is not table:
             self._draft_block_tables = table
             self._table_slots = None
+        batch_state = manager.draft_page_table_state() if managed else None
+        previous_batch = self._draft_prepared_batch
+        if (
+            batch_state is not None
+            and previous_batch is not None
+            and previous_batch[0] is batch_state
+            and previous_batch[1] == tuple(request_ids)
+        ):
+            return
+        batch_snapshot = None if batch_state is None else (batch_state, tuple(request_ids))
+        self._draft_prepared_batch = None
         versioned_window = private and not num_contexts and manager.tokens_per_block == self._win
         real_rows = [
             row
@@ -230,6 +243,7 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
             self._table_slots = None
         gather_table = not managed and self._table_slots != slot_values
         if not updates and not slots_changed and not capacities_changed and not gather_table:
+            self._draft_prepared_batch = batch_snapshot
             return
         direct = private and not native and self._table_slots == slot_values
         count = sum(len(indices) for _, _, _, indices in updates) * (2 if direct else 1)
@@ -294,6 +308,7 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
             )
             self._table_slots = slot_values
         host["event"].record()
+        self._draft_prepared_batch = batch_snapshot
 
     def _seed_context_windows(
         self,

@@ -39,6 +39,7 @@ def test_context_worker_rebinds_managed_pages_without_draft_decode():
         _batch_to_slot=torch.empty(2),
         _ctx_len=torch.empty(3),
         _draft_page_versions={0: object()},
+        _draft_prepared_batch=object(),
         _draft_page_indices={0: (0, (1,))},
         _draft_page_capacities={0: 128},
         _managed_residency={42: object()},
@@ -63,6 +64,7 @@ def test_context_worker_rebinds_managed_pages_without_draft_decode():
     )
     assert worker._draft_kv_manager is manager
     assert not worker._draft_page_versions
+    assert worker._draft_prepared_batch is None
     assert not worker._draft_page_indices
     assert not worker._managed_residency
     assert manager.get_buffers.call_count == 3
@@ -131,6 +133,7 @@ def test_unchanged_private_pages_skip_staging_events_and_scratch_resets(monkeypa
         _win=128,
         _draft_capacities=torch.tensor([256]),
         _draft_page_versions={0: (cache, 3, 0, 2, False)},
+        _draft_prepared_batch=None,
         _draft_page_indices={0: (0, (7, 8))},
         _uploaded_slots=(0,),
         _uploaded_capacities=(256,),
@@ -182,6 +185,9 @@ def test_private_fallback_pages_preserve_execution_order_and_managed_pages_skip_
         _win=128,
         _ctx_len=torch.tensor([140, 268, 0]),
         _valid_len=torch.tensor([128, 128, 0]),
+        _position_initialized=torch.ones(3, dtype=torch.bool),
+        _kv_windows=None,
+        _confidence_logits=None,
         _draft_capacities=torch.zeros(3, dtype=torch.long),
         _batch_to_slot=torch.full((3,), 2, dtype=torch.long),
         _draft_table_storage=storage,
@@ -190,6 +196,7 @@ def test_private_fallback_pages_preserve_execution_order_and_managed_pages_skip_
         _draft_managed_block_tables=storage[3:],
         _draft_fallback_block_tables=storage[3:],
         _draft_page_versions={},
+        _draft_prepared_batch=None,
         _draft_page_indices={},
         _draft_page_capacities={},
         _draft_metadata_host_buffers=[],
@@ -205,6 +212,7 @@ def test_private_fallback_pages_preserve_execution_order_and_managed_pages_skip_
         torch.cuda, "Event", lambda: SimpleNamespace(query=lambda: True, record=lambda: None)
     )
     monkeypatch.setattr("tensorrt_llm._torch.speculative.dspark_v41.prefer_pinned", lambda: False)
+    worker._clear_slot = DSv41DSparkWorker._clear_slot.__get__(worker)
     gather = Mock(wraps=torch.index_select)
     monkeypatch.setattr(torch, "index_select", gather)
     DSv41DSparkWorker._prepare_page_tables(worker, [42, 43], 0)
@@ -246,14 +254,30 @@ def test_private_fallback_pages_preserve_execution_order_and_managed_pages_skip_
     # Once target preparation published this execution order, draft generation
     # only updates its row state and capacities, including a native page change.
     worker._draft_kv_manager.draft_page_table_prepared = lambda _: True
+    snapshot = [None]
+    worker._draft_kv_manager.draft_page_table_state = lambda: snapshot[0]
     calls, gathers = worker._page_indices.call_count, gather.call_count
     for blocks in (2, 3, 3):
         caches[43].num_blocks = blocks
         caches[43].page_storage_version += 1
+        snapshot[0] = object()
         DSv41DSparkWorker._prepare_page_tables(worker, [43], 0)
+        assert worker._draft_capacities.tolist() == [blocks * 256, 0, 0]
+        # The target's unchanged snapshot also covers the slot and capacity
+        # metadata. Reading native properties again would duplicate its work.
+        with monkeypatch.context() as patch:
+            patch.setattr(worker._draft_kv_manager, "kv_cache_map", {})
+            DSv41DSparkWorker._prepare_page_tables(worker, [43], 0)
+        assert worker._batch_to_slot.tolist() == [1, 2, 2]
         assert worker._draft_capacities.tolist() == [blocks * 256, 0, 0]
     assert worker._page_indices.call_count == calls
     assert gather.call_count == gathers
+    # A different request still needs its own slot even if it aliases the
+    # same cache and the target's physical page conversion can be reused.
+    caches[44] = caches[43]
+    DSv41DSparkWorker._prepare_page_tables(worker, [44], 0)
+    assert 43 not in worker._req_to_slot
+    assert 44 in worker._req_to_slot
 
 
 @pytest.mark.parametrize(

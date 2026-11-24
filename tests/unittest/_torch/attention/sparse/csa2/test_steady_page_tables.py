@@ -527,8 +527,12 @@ def test_steady_decode_reuses_converted_tables(
                     starts.append(0)
             use_graph = rng.random() < 0.75
             before = len(conversions)
+            previous_state = manager.draft_page_table_state()
             tables, observed = reusing.step(batch, starts, use_graph)
             converted = len(conversions) > before
+            state = manager.draft_page_table_state()
+            assert state is not None
+            assert (state is previous_state) == (not converted)
             stats["partial"] += any(conversions[before:])
             with _always_convert(manager):
                 expected_tables, expected = converting.step(batch, starts, use_graph)
