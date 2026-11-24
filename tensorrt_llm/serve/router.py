@@ -1056,9 +1056,20 @@ class Router(ABC):
         try:
 
             def read_records() -> list[tuple[str, object]]:
-                return [(key, metadata_server.get(key))
-                        for key in metadata_server.keys()
-                        if key.startswith("trtllm/")]
+                records = []
+                for key in metadata_server.keys():
+                    if not key.startswith("trtllm/"):
+                        continue
+                    try:
+                        record = metadata_server.get(key)
+                    except (ValueError, RecursionError):
+                        if not matching_role_only:
+                            raise
+                        logger.warning(
+                            f"Ignoring unreadable CTX registry record {key!r}")
+                        continue
+                    records.append((key, record))
+                return records
 
             records = await asyncio.to_thread(
                 read_records) if matching_role_only else read_records()
@@ -1066,6 +1077,14 @@ class Router(ABC):
                 if isinstance(server_metadata,
                               dict) and 'url' in server_metadata:
                     url = server_metadata['url']
+                    if matching_role_only:
+                        if not isinstance(url, str) or not url:
+                            continue
+                        role = (server_metadata.get('server_type')
+                                or server_metadata.get('server_role'))
+                        if not isinstance(role, str):
+                            other_roles.add(url)
+                            continue
                     if matching_role_only and not self._is_matching_role(
                             self._get_server_type(server_metadata)):
                         other_roles.add(url)
@@ -3064,8 +3083,9 @@ class CoordinatorDelegatingRouter(Router):
         if context_admissions is None:
             await self._local.mirror_servers(servers)
         else:
-            await self._local._mirror_context_servers(servers, context_admissions,
-                                                     self._request_timeout_s)
+            await self._local._mirror_context_servers(servers,
+                                                      context_admissions,
+                                                      self._request_timeout_s)
 
     def set_unpredicted_priority(self, priority: float) -> None:
         # The local router computes the routing key's priority.
@@ -3120,10 +3140,13 @@ class CoordinatorDelegatingRouter(Router):
                 "(disagg_request_id/ctx_request_id) on the request")
         return rid
 
-    async def get_next_server(self,
-                              request: OpenAIRequest,
-                              exclude_server: Optional[str] = None,
-                              req_id: Optional[int] = None) -> tuple[str, dict]:
+    async def get_next_server(
+            self,
+            request: OpenAIRequest,
+            exclude_server: Optional[str] = None,
+            req_id: Optional[int] = None,
+            *,
+            on_cancel: Optional[Callable[[], None]] = None) -> tuple[str, dict]:
         # routing_key() tokenizes + block-hashes the prompt (CPU-bound for
         # kv_cache_aware); run it in a thread so it doesn't block the fleet worker
         # event loop driving the concurrent streams.
@@ -3153,6 +3176,9 @@ class CoordinatorDelegatingRouter(Router):
                 body = await asyncio.shield(selection)
                 info = body.get("info") or {}
         except asyncio.CancelledError:
+            if on_cancel is not None:
+                # Notify the request owner before waiting for a remote placement.
+                on_cancel()
             if self.pooled:
                 # A pooled select may wait long for a seat. This finish fails
                 # its coordinator-side wait at once; the one below releases a

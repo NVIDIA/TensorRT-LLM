@@ -288,6 +288,11 @@ class _ContextCancellation:
             "the transfer timeout and physical-quiescence grace/fail-close policy remain active"
         )
 
+    def start_delivery(self) -> None:
+        """Start one bounded CTX cancellation without waiting for its receipt."""
+        if self._token is not None and self._delivery is None:
+            self._delivery = asyncio.create_task(self._deliver_cancellation())
+
     async def cancel(self) -> None:
         """Share bounded cancellation delivery without resetting its budget.
 
@@ -295,10 +300,9 @@ class _ContextCancellation:
         cancellation cannot cancel delivery, reopen admission, or extend the
         worker's transfer or quiescence deadlines.
         """
-        if self._token is None:
-            return
+        self.start_delivery()
         if self._delivery is None:
-            self._delivery = asyncio.create_task(self._deliver_cancellation())
+            return
         settled = asyncio.gather(self._delivery, return_exceptions=True)
         interrupted = False
         with anyio.CancelScope(shield=True):
@@ -626,9 +630,19 @@ class OpenAIDisaggregatedService(OpenAIService):
                         # bounds its wait by the context servers' KV transfer timeout, which
                         # runs from here. Stamped again below to include this wait.
                         self._stamp_orig_elapsed(gen_req, arrival_time)
-                    gen_server, gen_route_info = await self._gen_router.get_next_server(
-                        gen_req, exclude_server=ctx_server, req_id=disagg_request_id
-                    )
+                    if cancellation is not None and isinstance(
+                        self._gen_router, CoordinatorDelegatingRouter
+                    ):
+                        gen_server, gen_route_info = await self._gen_router.get_next_server(
+                            gen_req,
+                            exclude_server=ctx_server,
+                            req_id=disagg_request_id,
+                            on_cancel=cancellation.start_delivery,
+                        )
+                    else:
+                        gen_server, gen_route_info = await self._gen_router.get_next_server(
+                            gen_req, exclude_server=ctx_server, req_id=disagg_request_id
+                        )
                     gen_reservation_id = disagg_request_id
                     if length_ticket is not None:
                         self._output_length_priority.placed(length_ticket, gen_req, gen_route_info)

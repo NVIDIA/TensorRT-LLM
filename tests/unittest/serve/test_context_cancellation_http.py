@@ -51,7 +51,7 @@ from tensorrt_llm.serve.openai_protocol import (
 from tensorrt_llm.serve.openai_server import OpenAIServer
 from tensorrt_llm.serve.output_length_predictor import OutputLengthPriority
 from tensorrt_llm.serve.responses_utils import ClosingStreamingResponse
-from tensorrt_llm.serve.router import Router, ServerPreparationPending
+from tensorrt_llm.serve.router import CoordinatorDelegatingRouter, Router, ServerPreparationPending
 
 pytestmark = pytest.mark.cpu_only
 
@@ -329,6 +329,55 @@ async def test_cancel_before_gen_dispatch_cancels_ctx_even_after_http_result(
         "ctx:8000", "worker-token"
     )
     service._gen_client.send_request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ctx_cancel_does_not_wait_for_delegated_gen_placement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slow GEN select still gets its finish, but cannot delay the CTX signal."""
+    service = _service(monkeypatch)
+    local = Mock(spec=Router)
+    local.pooled = False
+    local.routing_key = Mock(return_value={})
+    router = CoordinatorDelegatingRouter("http://coordinator", local, "generation")
+    service._gen_router = router
+    selecting, release, cancelled = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def select(payload: dict) -> dict:
+        selecting.set()
+        await release.wait()
+        return {"server": "gen:8001", "info": {}}
+
+    async def cancel_ctx(server: str, token: str) -> str:
+        cancelled.set()
+        return "queued"
+
+    monkeypatch.setattr(router, "_post_select", select)
+    finish = AsyncMock()
+    monkeypatch.setattr(router, "finish_request", finish)
+    service._ctx_client.cancel_context_cancellation.side_effect = cancel_ctx
+    task = asyncio.create_task(
+        service._send_disagg_request_ctx_first(CompletionRequest(model="model", prompt="hello"))
+    )
+    try:
+        await asyncio.wait_for(selecting.wait(), 2)
+        task.cancel()
+        await asyncio.wait_for(cancelled.wait(), 2)
+        assert not task.done()
+        finish.assert_not_awaited()
+    finally:
+        release.set()
+        if not selecting.is_set():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert task.cancelled()
+    finish.assert_awaited_once()
+    assert finish.await_args.kwargs == {"success": False, "req_id": 42}
+    service._gen_client.send_request.assert_not_awaited()
+    service._ctx_client.cancel_context_cancellation.assert_awaited_once_with(
+        "ctx:8000", "worker-token"
+    )
 
 
 @pytest.mark.asyncio

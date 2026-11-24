@@ -76,6 +76,7 @@ from tensorrt_llm.serve.disagg_coordinator import (
     DisaggCoordinatorService,
     coordinator_reservation_timeout,
 )
+from tensorrt_llm.serve.metadata_server import JsonDictionary
 from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
 from tensorrt_llm.serve.openai_disagg_service import OpenAIDisaggregatedService
 from tensorrt_llm.serve.openai_protocol import (
@@ -1352,6 +1353,42 @@ async def test_protected_metadata_can_recover_after_empty_discovery() -> None:
         await router.refresh_protected_context_servers()
         assert router.servers == ["ctx:8000"]
         assert router.server_registration_id("ctx:8000") == "trtllm/v2"
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
+async def test_protected_metadata_rechecks_repaired_registration() -> None:
+    """An unreadable registration loses only its own grant until it passes a fresh probe."""
+    records = {
+        f"trtllm/{name}": json.dumps({"server_role": "context", "url": name}).encode()
+        for name in ("healthy", "repaired")
+    }
+    store = Mock()
+    store.keys.side_effect = records.keys
+    store.get.side_effect = lambda key: (records[key], None)
+    router = RoundRobinRouter(
+        ServerRole.CONTEXT, metadata_server=JsonDictionary(store), require_context_cancellation=True
+    )
+    router._check_server_health = AsyncMock(return_value=True)
+    router._fetch_server_info = AsyncMock(
+        return_value={"supports_logical_context_cancellation": True}
+    )
+    try:
+        await router.refresh_protected_context_servers()
+        first = router.context_admissions()
+        assert set(first) == {"healthy", "repaired"}
+        original = records["trtllm/repaired"]
+        records["trtllm/repaired"] = b"{"
+        await router.refresh_protected_context_servers()
+        assert router.context_admissions() == {"healthy": first["healthy"]}
+        router._fetch_server_info.reset_mock()
+        records["trtllm/repaired"] = original
+        await router.refresh_protected_context_servers()
+        after = router.context_admissions()
+        assert after["healthy"] == first["healthy"]
+        assert after["repaired"] != first["repaired"]
+        router._fetch_server_info.assert_awaited_once()
     finally:
         await router.close()
 
