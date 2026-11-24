@@ -113,6 +113,9 @@ l0_cpu:
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/test_modeling_v2_mtp_draft_moe.py
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/spec/test_modeling_v2_small_batch_mtp.py
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/test_routing.py
+  # The GLM TP8 routed-MoE kernel's synchronization source checks: AST reads of the
+  # kernel source against the DSL's primitives, no device.
+  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_103__tp8/moe/test_modeling_v2_cute_dsl_routed_moe_xc_sync.py
   # The GLM-5.3-Flash target's admission check and guided-decoding refusal, on fake requests,
   # and its step metadata's hooks (cpu_only, so the GPU stage's entry for the target's
   # directory deselects them).
@@ -232,6 +235,7 @@ l0_cpu:
   # what runs it.
   - unittest/_torch/misc/test_xgrammar_structural_tag.py
   - unittest/_torch/misc/test_grammar_matcher.py
+  - unittest/_torch/misc/test_tekken_guided_decoding.py
   - unittest/_torch/models/checkpoints
   - unittest/_torch/modules
   - unittest/_torch/moe
@@ -305,6 +309,7 @@ l0_cpu:
   - unittest/_torch/visual_gen/test_runtime_lora.py
   - unittest/_torch/visual_gen/test_seacache.py
   - unittest/_torch/visual_gen/test_sleep.py
+  - unittest/_torch/visual_gen/test_symm_mem_pool.py
   - unittest/_torch/visual_gen/test_teacache.py
   - unittest/_torch/visual_gen/test_tensor_payload.py
   - unittest/_torch/visual_gen/test_token_sharded_tp.py
@@ -377,6 +382,7 @@ l0_cpu:
   - unittest/llmapi/test_deepseek_v4_tokenizer.py
   - unittest/llmapi/test_deepseek_v41_tokenizer.py
   - unittest/llmapi/test_disagg_worker_role.py
+  - unittest/llmapi/test_tokenizer_factory_mistral.py
   - unittest/llmapi/test_session_reuse.py
   - unittest/llmapi/apps/test_anthropic_adapter.py
   - unittest/llmapi/apps/test_anthropic_batches.py
