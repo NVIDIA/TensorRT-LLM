@@ -504,7 +504,6 @@ def test_deco_recipe_builds_deco_layers(require_deco_kernels) -> None:
         num_layers=1, num_refiner_layers=1, attention_head_dim=128, rope_freq_dim=16
     )
     config.attention = _deco_attention_config()
-    config.attention_metadata_state = create_attention_metadata_state()
     model = h3.MiniMaxH3Transformer3DModel(config)
 
     layers = [m.attn for m in model.modules() if isinstance(m, h3.MiniMaxH3Attention)]
@@ -513,7 +512,7 @@ def test_deco_recipe_builds_deco_layers(require_deco_kernels) -> None:
 
 @requires_cuda
 def test_blocks_share_the_token_tags_and_the_padding_mask(monkeypatch) -> None:
-    """The joint blocks of a forward hand their backend one tags tensor and one padding mask."""
+    """The blocks of a forward hand their backend one tags tensor and one padding mask."""
     from tensorrt_llm._torch.visual_gen.attention.backends.vanilla import VanillaAttention
 
     model = h3.MiniMaxH3Transformer3DModel(_make_model_config(num_layers=2)).to("cuda").eval()
@@ -547,13 +546,10 @@ def test_blocks_share_the_token_tags_and_the_padding_mask(monkeypatch) -> None:
 
     tags, mask = forward()
     assert mask is None
-    assert forward()[0] is tags
 
     # Padding between the tokens, then other padding refilled into the caller's tags tensor.
     tags, mask = forward(torch.tensor([1, -1, 2, 0], device="cuda"))
     assert torch.equal(mask, (tags >= 0)[None])
-    # An unchanged input reuses both tensors on the next forward (attention backends key their plans on them).
-    assert forward() == (tags, mask)
     inputs["token_tags"].copy_(torch.tensor([1, 2, -1, -1], device="cuda"))
     tags, mask = forward()
     assert torch.equal(mask, (tags >= 0)[None])
@@ -1017,7 +1013,7 @@ def test_transformer_block_is_fullgraph_compile_safe(
         ("FLASHINFER", True, False, False),
         ("CUTEDSL", False, False, False),
         ("CUDNN", False, False, False),
-        ("DECO", True, False, False),
+        ("DECO", True, False, True),
     ],
 )
 def test_padding_support_tracks_the_capabilities_of_the_attention_backend(
@@ -1030,7 +1026,6 @@ def test_padding_support_tracks_the_capabilities_of_the_attention_backend(
     if backend == "DECO":
         require_deco_kernels()
         config.attention = _deco_attention_config()
-        config.attention_metadata_state = create_attention_metadata_state()
     else:
         config.attention = AttentionConfig(backend=backend)
     model = h3.MiniMaxH3Transformer3DModel(config)
@@ -1647,10 +1642,8 @@ def test_ulysses_forward_aligns_metadata_and_unpads_outputs(
                 torch.testing.assert_close(adaln_indices, full_indices.chunk(world_size)[rank])
                 for actual, expected_rope in zip(rotary_emb, full_rope):
                     torch.testing.assert_close(actual, expected_rope.chunk(world_size)[rank])
-                # The tags of the whole padded sequence, on every rank and for every backend,
-                # with a version counter: attention backends key their plans on it.
+                # The tags of the whole padded sequence, on every rank and for every backend.
                 torch.testing.assert_close(token_tags, full_tags)
-                assert not token_tags.is_inference()
                 if backend == "TRTLLM":
                     assert valid_seq_len == (
                         int(full_mask.sum().item()) if pad or existing_padding else None
@@ -1681,8 +1674,8 @@ def test_ulysses_forward_aligns_metadata_and_unpads_outputs(
         torch.testing.assert_close(actual.audio_sample, expected.audio_sample, rtol=0, atol=0)
 
         if inference_mode and pad:
-            # An inference tags tensor has no version counter, so its padded tags are built on
-            # every forward: a refill in place reaches the blocks.
+            # The padded tags and the mask are built on every forward: a refill of the caller's
+            # tags in place reaches the blocks.
             seen = []
 
             class RecordBlock(nn.Module):
@@ -1697,15 +1690,15 @@ def test_ulysses_forward_aligns_metadata_and_unpads_outputs(
                 model(**refilled)
                 tags[-2 if existing_padding else -1] = -1  # the last valid row becomes padding
                 model(**refilled)
-            key_padding_mask, valid_seq_len, token_tags = seen[-1]
-            torch.testing.assert_close(token_tags, F.pad(tags, (0, pad), value=-1))
+            passed_mask, passed_length, passed_tags = seen[-1]
+            torch.testing.assert_close(passed_tags, F.pad(tags, (0, pad), value=-1))
             if backend == "TRTLLM":
-                assert key_padding_mask is None
-                assert (seen[0][1], valid_seq_len) == (4, 3)
+                assert passed_mask is None
+                assert (seen[0][1], passed_length) == (4, 3)
             else:
-                assert valid_seq_len is None
+                assert passed_length is None
                 torch.testing.assert_close(
-                    key_padding_mask, F.pad(tags >= 0, (0, pad), value=False).unsqueeze(0)
+                    passed_mask, F.pad(tags >= 0, (0, pad), value=False).unsqueeze(0)
                 )
 
 

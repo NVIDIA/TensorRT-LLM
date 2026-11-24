@@ -247,8 +247,7 @@ class MiniMaxH3Pipeline(BasePipeline):
                 )
             if vgm.ulysses_size > 1:
                 # Ulysses pads the packed sequence to a multiple of its size.
-                supports_mask, supports_length, _ = get_padding_support(pipeline_config.attention)
-                if not (supports_mask or supports_length):
+                if not get_padding_support(pipeline_config.attention).supports_padding:
                     raise NotImplementedError(
                         "MiniMax-H3 Ulysses requires an attention backend that takes "
                         "key_padding_mask or valid_seq_len for the padded packed rows, such "
@@ -1307,10 +1306,7 @@ class MiniMaxH3Pipeline(BasePipeline):
                 generator,
             )
         position_ids = layout.position_ids.to(self.device)
-        # The transformer and the attention backends key their memos on this tensor and its
-        # version counter, which an inference tensor has not.
-        with torch.inference_mode(False):
-            token_tags = layout.token_tags.to(self.device)
+        token_tags = layout.token_tags.to(self.device)
         video_indices = layout.video_indices.to(self.device)
         audio_indices = layout.audio_indices.to(self.device)
         text_indices = layout.text_indices.to(self.device)

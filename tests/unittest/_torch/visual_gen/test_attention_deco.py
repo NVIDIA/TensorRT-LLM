@@ -60,6 +60,21 @@ def kernel_calls(monkeypatch: pytest.MonkeyPatch) -> list:
     return calls
 
 
+@pytest.fixture
+def kernel_inputs(monkeypatch: pytest.MonkeyPatch) -> list:
+    """The ``(rows, valid_seq_lens)`` of the calls of the kernels' ``prepare`` during the test,
+    newest last."""
+    calls: list = []
+    prepare = deco_backend.deco_attention.prepare
+
+    def recording(*args, **kwargs):
+        calls.append((kwargs.get("rows"), kwargs.get("valid_seq_lens")))
+        return prepare(*args, **kwargs)
+
+    monkeypatch.setattr(deco_backend.deco_attention, "prepare", recording)
+    return calls
+
+
 @pytest.fixture(autouse=True)
 def _kernels_serve_short_calls(monkeypatch: pytest.MonkeyPatch) -> None:
     """The tests run the kernels on short sequences; ``test_deco_delegates_short_calls`` puts
@@ -71,8 +86,8 @@ def _quant_config(v_dtype: str = "fp8") -> QuantAttentionConfig:
     return QuantAttentionConfig(qk_dtype="nvfp4", v_dtype=v_dtype, deco_attention=True)
 
 
-def _backend(num_heads: int, v_dtype: str = "fp8", state: dict | None = None) -> DeCoAttention:
-    """A DeCo layer from the factory, on the attention state of its model component."""
+def _backend(num_heads: int, v_dtype: str = "fp8") -> DeCoAttention:
+    """A DeCo layer from the factory."""
     attn = create_attention(
         backend="CUTEDSL",
         layer_idx=0,
@@ -81,7 +96,6 @@ def _backend(num_heads: int, v_dtype: str = "fp8", state: dict | None = None) ->
         attention_config=AttentionConfig(
             backend="CUTEDSL", quant_attention_config=_quant_config(v_dtype)
         ),
-        attention_metadata_state={} if state is None else state,
     )
     assert isinstance(attn, DeCoAttention)
     return attn
@@ -184,7 +198,8 @@ def _multi_launch_call(device: torch.device, v_dtype: str = "fp8") -> tuple[int,
 
 def test_deco_selection() -> None:
     """CUTEDSL keeps its dense backend unless the quantization recipe asks for DeCo-Attention,
-    which takes the padding of a call as a key padding mask."""
+    which takes the padding of a call as a key padding mask with the padding of every sample
+    behind its tokens."""
     assert not QuantAttentionConfig().deco_attention
     plain = QuantAttentionConfig(qk_dtype="nvfp4")
     assert get_visual_gen_attention_backend("CUTEDSL") is CuTeDSLAttention
@@ -197,7 +212,7 @@ def test_deco_selection() -> None:
         is DeCoAttention
     )
     assert DeCoAttention.support_key_padding_mask()
-    assert not DeCoAttention.requires_trailing_padding()
+    assert DeCoAttention.requires_trailing_padding()
     assert not DeCoAttention.support_valid_seq_len()
 
     # (supports_mask, supports_length, requires_trailing): a quantized FLASHINFER recipe rejects
@@ -213,7 +228,7 @@ def test_deco_selection() -> None:
     assert get_padding_support(config("FLASHINFER", quantized)) == (False, False, False)
     assert get_padding_support(config("TRTLLM")) == (False, True, True)
     assert get_padding_support(config("TRTLLM", quantized)) == (False, False, False)
-    assert get_padding_support(config("CUTEDSL", _quant_config())) == (True, False, False)
+    assert get_padding_support(config("CUTEDSL", _quant_config())) == (True, False, True)
 
 
 def test_deco_cross_attention_layers_run_on_vanilla(require_deco_kernels) -> None:
@@ -225,10 +240,7 @@ def test_deco_cross_attention_layers_run_on_vanilla(require_deco_kernels) -> Non
 
     from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMode
     from tensorrt_llm._torch.visual_gen.attention.backends import VanillaAttention
-    from tensorrt_llm._torch.visual_gen.config import (
-        DiffusionModelConfig,
-        create_attention_metadata_state,
-    )
+    from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 
     require_deco_kernels()
     num_heads, hidden_size = 2, 2 * HEAD_DIM
@@ -239,7 +251,6 @@ def test_deco_cross_attention_layers_run_on_vanilla(require_deco_kernels) -> Non
         attention=AttentionConfig(backend="CUTEDSL", quant_attention_config=_quant_config()),
         skip_create_weights_in_init=True,
     )
-    config.attention_metadata_state = create_attention_metadata_state()
 
     for cross in (
         Attention(hidden_size, num_heads, qkv_mode=QKVMode.SEPARATE_QKV, config=config),
@@ -267,28 +278,17 @@ def test_deco_cross_attention_layers_run_on_vanilla(require_deco_kernels) -> Non
 
 
 def test_deco_layer_construction(require_deco_kernels, kernel_calls: list) -> None:
-    """A layer needs a recipe with a kernel on this GPU (NVFP4 PV: SM120 only) and the attention
-    state of the model component. A layer whose head dimension or K/V head count the kernels
-    do not take is built and runs all its calls on VANILLA."""
+    """A layer needs a recipe with a kernel on this GPU (NVFP4 PV: SM120 only). A layer whose
+    head dimension or K/V head count the kernels do not take is built and runs all its calls on
+    VANILLA."""
     device = require_deco_kernels()
     args = dict(num_heads=4, head_dim=HEAD_DIM, quant_attention_config=_quant_config())
     if "nvfp4" not in deco_backend.supported_v_dtypes():
         with pytest.raises(ValueError, match="no kernel for qk_dtype='nvfp4', v_dtype='nvfp4'"):
             DeCoAttention(**{**args, "quant_attention_config": _quant_config("nvfp4")})
-    with pytest.raises(ValueError, match="attention_metadata_state"):
-        create_attention(
-            backend="CUTEDSL",
-            layer_idx=0,
-            num_heads=4,
-            head_dim=HEAD_DIM,
-            attention_config=AttentionConfig(
-                backend="CUTEDSL", quant_attention_config=_quant_config()
-            ),
-        )
 
     for geometry in ({"head_dim": 64}, {"num_kv_heads": 2}):
-        state: dict = {}
-        attn = DeCoAttention(**{**args, **geometry}, attention_metadata_state=state)
+        attn = DeCoAttention(**{**args, **geometry})
         head_dim, num_kv_heads = attn.head_dim, attn.num_kv_heads
 
         gen = torch.Generator(device=device).manual_seed(0)
@@ -320,8 +320,7 @@ def test_deco_forward_matches_sdpa(
     an attention that ignores Q and K (uniform weights) on rows that a few keys dominate."""
     device = require_deco_kernels(v_dtype)
     q, k, v = _random_qkv(batch_size, seq_len, num_heads, device, q_scale=4.0)
-    state: dict = {}
-    attn = _backend(num_heads, v_dtype, state=state)
+    attn = _backend(num_heads, v_dtype)
 
     out = attn.forward(q, k, v)
 
@@ -354,6 +353,36 @@ def test_deco_whole_units_and_split_tail_follow_the_scores(
     tokens = slice(valid_seq_len)
     _assert_follows_the_scores(out[:, tokens], q[:, tokens], k[:, tokens], v[:, tokens])
     assert torch.equal(_kernels(q, k, v, v_dtype, valid_seq_lens=lens), out)
+
+
+@pytest.mark.parametrize("v_dtype", V_DTYPES)
+def test_deco_compensation_follows_the_shared_directions(
+    require_deco_kernels, v_dtype: str
+) -> None:
+    """Q and K whose energy sits in 32 directions that every token shares put the quantization
+    error of the scores on those directions. The compensation channels, estimated on the sampled
+    tokens, remove most of it; a basis estimated on one token cannot, and its error is larger.
+    NVFP4 PV adds an error of its own to both outputs, so its two bounds are wider."""
+    device = require_deco_kernels(v_dtype)
+    num_directions = 32
+    q, k, v = _random_qkv(1, 4096, 2, device)
+    gen = torch.Generator(device=device).manual_seed(2)
+    directions = torch.randn((num_directions, HEAD_DIM), generator=gen, device=device)
+    directions = directions / directions.norm(dim=1, keepdim=True)
+    shared = []
+    for x in (q, k):
+        weights = torch.randn((*x.shape[:3], num_directions), generator=gen, device=device)
+        shared.append((0.1 * x.float() + 3.0 * weights @ directions).bfloat16())
+    q, k = shared
+    ref = _sdpa(q, k, v)
+
+    error = _relative_error(_kernels(q, k, v, v_dtype), ref)
+    one_token = torch.zeros(64, dtype=torch.int32, device=device)
+    error_one_token = _relative_error(_kernels(q, k, v, v_dtype, rows=one_token), ref)
+
+    max_error, max_share = {"fp8": (0.04, 0.5), "nvfp4": (0.07, 0.85)}[v_dtype]
+    assert error < max_error
+    assert error < max_share * error_one_token
 
 
 def test_deco_rank_64_follows_the_scores(require_deco_kernels) -> None:
@@ -529,8 +558,7 @@ def test_deco_reads_the_slices_of_a_fused_projection(require_deco_kernels, v_dty
             q.contiguous(), k.contiguous(), v.contiguous(), v_dtype, valid_seq_lens=valid_seq_lens
         )
         assert torch.equal(_kernels(q, k, v, v_dtype, valid_seq_lens=valid_seq_lens), expected)
-    state: dict = {}
-    attn = _backend(num_heads, v_dtype, state=state)
+    attn = _backend(num_heads, v_dtype)
     contiguous_out = attn.forward(q.contiguous(), k.contiguous(), v.contiguous())
     assert torch.equal(attn.forward(q, k, v), contiguous_out)
     num_bytes = deco_attention.workspace_size(batch_size, seq_len, num_heads, device, v_dtype)
@@ -562,8 +590,7 @@ def test_deco_call_leaves_no_workspace_behind(require_deco_kernels) -> None:
     device = require_deco_kernels()
     batch_size, seq_len, num_heads = 1, 512, 4
     q, k, v = _random_qkv(batch_size, seq_len, num_heads, device)
-    state: dict = {}
-    first, second = _backend(num_heads, state=state), _backend(num_heads, state=state)
+    first, second = _backend(num_heads), _backend(num_heads)
     out = first.forward(q, k, v)
     others = [_random_qkv(batch_size, n, num_heads, device, seed=1) for n in (200, 1024)]
     # The first call of a sequence length draws its basis rows, which the kernel package keeps.
@@ -577,6 +604,41 @@ def test_deco_call_leaves_no_workspace_behind(require_deco_kernels) -> None:
     assert torch.equal(first.forward(q, k, v), out)
     torch.cuda.synchronize(device)
     assert torch.cuda.memory_allocated(device) == allocated
+
+
+def test_deco_forward_keeps_its_caller_compiled(require_deco_kernels) -> None:
+    """A torch.compile'd caller keeps its own operations compiled around the backend. The one
+    graph break is the call that launches the kernels: a tensor address read in traced code
+    would make the compiler give up the whole frame of the caller."""
+    import torch._dynamo
+
+    device = require_deco_kernels()
+    seq_len, num_heads = 512, 2
+    attn = _backend(num_heads)
+
+    class Caller(torch.nn.Module):
+        def forward(self, x, key_padding_mask, token_tags):
+            q, k, v = x * 0.5, x * 0.25, x + 1.0
+            out = attn.forward(q, k, v, key_padding_mask=key_padding_mask, token_tags=token_tags)
+            return out * 2.0
+
+    x = _random_qkv(1, seq_len, num_heads, device)[0]
+    key_padding_mask = torch.arange(seq_len, device=device)[None] < 400
+    token_tags = torch.zeros(seq_len, dtype=torch.int32, device=device)
+    token_tags[300:] = 1
+    caller = Caller()
+    expected = caller(x, key_padding_mask, token_tags)
+
+    torch._dynamo.reset()
+    try:
+        explanation = torch._dynamo.explain(caller)(x, key_padding_mask, token_tags)
+        assert (explanation.graph_count, explanation.graph_break_count) == (2, 1), (
+            explanation.break_reasons
+        )
+        compiled = torch.compile(caller, backend="eager")
+        assert torch.equal(compiled(x, key_padding_mask, token_tags), expected)
+    finally:
+        torch._dynamo.reset()
 
 
 def test_deco_delegates_unsupported_calls(
@@ -656,10 +718,13 @@ def test_deco_delegates_short_calls(
     assert kernel_calls == [(1, MIN_SEQ_LEN, num_heads, 128)]
 
 
-def test_deco_token_tags_draw_the_basis_rows_by_modality(require_deco_kernels) -> None:
+def test_deco_token_tags_draw_the_basis_rows_by_modality(
+    require_deco_kernels, kernel_inputs: list
+) -> None:
     """With the token tags of a packed sequence the preparation takes half of its rows from the
-    text and audio tokens and none from the padding; the rows are drawn once per tags tensor.
-    With a mask they come from the tokens of the mask."""
+    text and audio tokens and none from the padding. The rows are drawn on the device, the same
+    for the same tags, and kept while the tags tensor stays as it is; with a mask they come from
+    the tokens of the mask."""
     device = require_deco_kernels()
     batch_size, seq_len, num_heads = 1, 4096, 2
     q, k, v = _random_qkv(batch_size, seq_len, num_heads, device, q_scale=4.0)
@@ -667,57 +732,54 @@ def test_deco_token_tags_draw_the_basis_rows_by_modality(require_deco_kernels) -
     token_tags[:100] = 1  # text
     token_tags[100:160] = 2  # audio
     token_tags[-8:] = -1  # padding
-    state: dict = {}
-    attn = _backend(num_heads, state=state)
+    num_rows = deco_attention.inputs.sample_count(seq_len)
+    attn = _backend(num_heads)
 
     out = attn.forward(q, k, v, token_tags=token_tags)
 
-    (plan,) = state["deco_plans"]
-    assert plan.token_tags is token_tags and not plan.captured
-    rows = plan.rows
+    rows, valid_seq_lens = kernel_inputs[-1]
+    assert valid_seq_lens is None and rows.shape == (num_rows,)
     drawn = token_tags[rows.long()]
-    assert (drawn >= 0).all()
-    assert int((drawn > 0).sum()) == rows.numel() // 2
+    assert (drawn >= 0).all() and rows.unique().numel() == num_rows
+    assert int((drawn > 0).sum()) == num_rows // 2
 
     # The kernels give the same output for these rows, and another one for their own draw.
     assert torch.equal(out, _kernels(q, k, v, rows=rows))
     assert not torch.equal(out, attn.forward(q, k, v))
 
-    assert torch.equal(attn.forward(q, k, v, token_tags=token_tags), out)
-    assert len(state["deco_plans"]) == 1
-    # An inference tags tensor has no version counter: it is drawn from once and kept by identity.
+    # The same tags in another tensor give the same rows, in inference mode as well.
     with torch.inference_mode():
-        inference_tags = token_tags.clone()
-        for _ in range(2):
-            assert torch.equal(attn.forward(q, k, v, token_tags=inference_tags), out)
-    assert len(state["deco_plans"]) == 2 and state["deco_plans"][0].token_tags is inference_tags
+        assert torch.equal(attn.forward(q, k, v, token_tags=token_tags.clone()), out)
+    assert torch.equal(kernel_inputs[-1][0], rows)
     with pytest.raises(ValueError, match="token tags"):
         attn.forward(q, k, v, token_tags=token_tags[:-1])
 
-    # A refill of the tags tensor in place advances its version counter: a capture before the
-    # next eager call finds no draw, the next call draws from the new text range, and the call
-    # after it reuses that draw.
+    # The draw of the last tags tensor is kept until the tensor is written in place: the next
+    # call then draws from the new text.
+    attn.forward(q, k, v, token_tags=token_tags)
+    kept = kernel_inputs[-1][0]
+    attn.forward(q, k, v, token_tags=token_tags)
+    assert kernel_inputs[-1][0] is kept
     token_tags[:1000] = 1
-    with pytest.raises(RuntimeError, match="eagerly once before capturing"):
-        with torch.cuda.graph(torch.cuda.CUDAGraph()):
-            attn.forward(q, k, v, token_tags=token_tags)
     attn.forward(q, k, v, token_tags=token_tags)
-    plan = state["deco_plans"][0]
-    assert len(state["deco_plans"]) == 3
-    assert int((plan.rows < 1000).sum()) == plan.rows.numel() // 2
-    attn.forward(q, k, v, token_tags=token_tags)
-    assert len(state["deco_plans"]) == 3 and state["deco_plans"][0] is plan
+    assert int((kernel_inputs[-1][0] < 1000).sum()) == num_rows // 2
 
-    # A group short of its half gives all its tokens and the other group fills the draw, so a
-    # mostly-text sequence still draws the full count; a sequence of padding draws nothing. The
-    # preparation takes a draw of fewer rows than twice its rank and rejects an empty one.
+    # A group short of its half gives all its tokens and the other group fills the draw; tags
+    # with fewer tokens than the draw repeat them; a sequence of padding draws row 0.
     mostly_text = torch.ones(seq_len, dtype=torch.int32, device=device)
     mostly_text[:5] = 0
-    rows = deco_attention.sample_rows(seq_len, device, mostly_text)
-    assert rows.numel() == deco_attention.inputs.sample_count(seq_len)
-    assert int((mostly_text[rows.long()] == 0).sum()) == 5
+    draw = deco_attention.sample_rows(seq_len, device, mostly_text)
+    assert draw.unique().numel() == num_rows
+    assert int((mostly_text[draw.long()] == 0).sum()) == 5
+    few_tokens = torch.full((seq_len,), -1, dtype=torch.int32, device=device)
+    few_tokens[:50] = 1
+    assert torch.isfinite(attn.forward(q, k, v, token_tags=few_tokens)).all()
+    assert kernel_inputs[-1][0].unique().tolist() == list(range(50))
     padding = torch.full((seq_len,), -1, dtype=torch.int32, device=device)
-    assert deco_attention.sample_rows(seq_len, device, padding).numel() == 0
+    draw = deco_attention.sample_rows(seq_len, device, padding)
+    assert draw.numel() == num_rows and not draw.any()
+
+    # The preparation takes a draw of fewer rows than twice its rank and rejects an empty one.
     lens = torch.tensor([seq_len], dtype=torch.int32, device=device)
     for short, valid_seq_lens in ((rows[:16], None), (rows[:16][None], lens)):
         out_short = _kernels(q, k, v, rows=short, valid_seq_lens=valid_seq_lens)
@@ -725,21 +787,12 @@ def test_deco_token_tags_draw_the_basis_rows_by_modality(require_deco_kernels) -
     with pytest.raises(ValueError, match="at least one token"):
         _kernels(q, k, v, rows=rows[:0])
 
-    # Tags with fewer tokens than the draw takes give them all.
-    few_tokens = torch.full((seq_len,), -1, dtype=torch.int32, device=device)
-    few_tokens[:50] = 1
-    assert torch.isfinite(attn.forward(q, k, v, token_tags=few_tokens)).all()
-    rows = state["deco_plans"][0].rows
-    assert sorted(rows.tolist()) == list(range(50))
-
     # A row outside the sequence stands for its nearest token.
-    beyond, last = plan.rows.clone(), plan.rows.clone()
+    beyond, last = rows.clone(), rows.clone()
     beyond[0], last[0] = seq_len + 5, seq_len - 1
     assert torch.equal(_kernels(q, k, v, rows=beyond), _kernels(q, k, v, rows=last))
 
-    # With a prefix mask the rows come from the tokens of the prefix, and another mask gets
-    # its own draw.
-    num_plans = len(state["deco_plans"])
+    # With a mask the rows come from the tokens of the mask.
     text_last = torch.zeros(seq_len, dtype=torch.int32, device=device)
     text_last[3000:] = 1  # text at the end; the tags mark no padding
     positions = torch.arange(seq_len, device=device)[None]
@@ -747,22 +800,23 @@ def test_deco_token_tags_draw_the_basis_rows_by_modality(require_deco_kernels) -
         key_padding_mask = positions < num_tokens
         out = attn.forward(q, k, v, token_tags=text_last, key_padding_mask=key_padding_mask)
         assert not out[:, num_tokens:].any()
-        rows = state["deco_plans"][0].rows
-        assert rows.dim() == 1 and int(rows.max()) < num_tokens
-        assert int((rows >= 3000).sum()) == min(rows.numel() // 2, num_tokens - 3000)
-    assert len(state["deco_plans"]) == min(num_plans + 2, deco_backend._PLANS_KEPT)
+        rows, valid_seq_lens = kernel_inputs[-1]
+        assert valid_seq_lens.tolist() == [num_tokens]
+        assert rows.shape == (batch_size, num_rows) and int(rows.max()) < num_tokens
+        assert int((rows >= 3000).sum()) == num_rows // 2
 
 
 @pytest.mark.parametrize("v_dtype", V_DTYPES)
-def test_deco_prefix_mask_attends_the_prefix(require_deco_kernels, v_dtype: str) -> None:
-    """With a mask whose tokens are a prefix the rows after it are padding: the prefix attends
-    its own keys only, whatever the padding holds, and the padded rows come back zero. A mask
-    without padding gives the bits of the call without a mask."""
+def test_deco_prefix_mask_attends_the_prefix(
+    require_deco_kernels, kernel_inputs: list, v_dtype: str
+) -> None:
+    """The tokens of a sample are its first rows and the rows after them padding: the tokens
+    attend their own keys only, whatever the padding holds, and the padded rows come back zero.
+    A mask without padding gives the bits of the call without a mask."""
     device = require_deco_kernels(v_dtype)
     batch_size, seq_len, num_tokens, num_heads = 2, 1024, 700, 3
     q, k, v = _random_qkv(batch_size, seq_len, num_heads, device, q_scale=4.0)
-    state: dict = {}
-    attn = _backend(num_heads, v_dtype, state=state)
+    attn = _backend(num_heads, v_dtype)
 
     positions = torch.arange(seq_len, device=device).expand(batch_size, -1)
     prefix_mask = positions < num_tokens
@@ -777,21 +831,18 @@ def test_deco_prefix_mask_attends_the_prefix(require_deco_kernels, v_dtype: str)
 
     full = torch.ones_like(prefix_mask)
     assert torch.equal(attn.forward(q, k, v, key_padding_mask=full), attn.forward(q, k, v))
-    # Newest first: a mask without padding, a prefix mask.
-    plans = state["deco_plans"]
-    assert [plan.token_counts is None for plan in plans] == [True, False]
-    assert all(plan.order is None for plan in plans)
 
-    # The mask is read once per tensor and content: an in-place change is seen.
+    # The token counts follow the content of the mask: a write into the tensor is seen.
     full[:, num_tokens:] = False
     assert torch.equal(attn.forward(q, k, v, key_padding_mask=full), expected)
-    assert state["deco_plans"][0].token_counts.tolist() == [num_tokens] * batch_size
+    assert kernel_inputs[-1][1].tolist() == [num_tokens] * batch_size
 
-    # The compaction of a prefix is the prefix: a hole in sample 0 changes that sample only.
-    holes = prefix_mask.clone()
-    holes[0, 100:200] = False
-    out = attn.forward(q, k, v, key_padding_mask=holes)
-    assert torch.equal(out[1], expected[1]) and not torch.equal(out[0], expected[0])
+    # Every sample has its own tokens: a shorter sample 0 changes that sample only.
+    shorter = prefix_mask.clone()
+    shorter[0, 500:] = False
+    out = attn.forward(q, k, v, key_padding_mask=shorter)
+    assert torch.equal(out[1], expected[1]) and not out[0, 500:].any()
+    assert not torch.equal(out[0, :500], expected[0, :500])
 
     for padding in (0.0, 1e30, float("nan")):
         for tensor in (q, k, v):
@@ -892,27 +943,26 @@ def test_deco_sm120_nvfp4_split_units_merge_a_padded_half(require_deco_kernels) 
 
 
 @pytest.mark.parametrize("v_dtype", V_DTYPES)
-def test_deco_key_padding_mask_attends_the_tokens(require_deco_kernels, v_dtype: str) -> None:
-    """With a ``key_padding_mask`` every sample attends its own tokens only, wherever they sit
-    and whatever the masked rows hold, and the masked rows come back zero. A sample whose mask
-    excludes every row comes back zero, on the kernels and on a delegated call, with and
-    without token tags, next to a sample that is served."""
+def test_deco_key_padding_mask_attends_the_tokens(
+    require_deco_kernels, kernel_inputs: list, v_dtype: str
+) -> None:
+    """With a ``key_padding_mask`` every sample attends its own tokens only and the masked rows
+    come back zero. A sample whose mask excludes every row comes back zero, on the kernels and
+    on a delegated call, with and without token tags, next to a sample that is served."""
     device = require_deco_kernels(v_dtype)
     batch_size, seq_len, num_heads = 2, 1024, 3
     q, k, v = _random_qkv(batch_size, seq_len, num_heads, device, q_scale=4.0)
-    state: dict = {}
-    attn = _backend(num_heads, v_dtype, state=state)
+    attn = _backend(num_heads, v_dtype)
 
-    # Sample 0 has holes between its tokens; sample 1 has another token count, as a prefix.
-    gen = torch.Generator(device=device).manual_seed(1)
-    key_padding_mask = torch.rand((batch_size, seq_len), generator=gen, device=device) < 0.7
-    key_padding_mask[1] = torch.arange(seq_len, device=device) < 600
+    # The samples hold different numbers of tokens, each followed by its padding.
+    lengths = torch.tensor([717, 600], device=device)
+    key_padding_mask = torch.arange(seq_len, device=device) < lengths[:, None]
 
     out = attn.forward(q, k, v, key_padding_mask=key_padding_mask)
 
     assert out.shape == q.shape and out.dtype == torch.bfloat16
     assert not out[~key_padding_mask].any()
-    tokens = out[key_padding_mask].clone()
+    assert kernel_inputs[-1][1].tolist() == lengths.tolist()
     ref = _sdpa(q, k, v, attn_mask=key_padding_mask[:, None, None, :])
     for sample in range(batch_size):
         valid = key_padding_mask[sample]
@@ -922,22 +972,11 @@ def test_deco_key_padding_mask_attends_the_tokens(require_deco_kernels, v_dtype:
         )
         error = _relative_error(out[sample, valid], ref[sample, valid])
         assert error < max(0.5 * uniform_error, 0.02)
-    (plan,) = state["deco_plans"]
-    assert plan.order is not None
-
-    for padding in (0.0, 1e30, float("nan")):
-        for tensor in (q, k, v):
-            tensor[~key_padding_mask] = padding
-        out = attn.forward(q, k, v, key_padding_mask=key_padding_mask)
-        assert torch.equal(out[key_padding_mask], tokens)
-        assert not out[~key_padding_mask].any()
-    assert len(state["deco_plans"]) == 1
 
     with pytest.raises(ValueError, match="key_padding_mask"):
         attn.forward(q, k, v, key_padding_mask=key_padding_mask[:, :-1])
 
-    # Sample 0 without tokens, sample 1 with a prefix of 900.
-    q, k, v = _random_qkv(batch_size, seq_len, num_heads, device, q_scale=4.0)
+    # Sample 0 without tokens, sample 1 with 900.
     empty_sample = torch.ones((batch_size, seq_len), dtype=torch.bool, device=device)
     empty_sample[0] = False
     empty_sample[1, 900:] = False
@@ -950,7 +989,7 @@ def test_deco_key_padding_mask_attends_the_tokens(require_deco_kernels, v_dtype:
         assert not out[0].any() and not out[1, 900:].any()
         assert torch.isfinite(out).all()
         assert _relative_error(out[1, :900], ref) < 0.2
-    (rows,) = [plan.rows for plan in state["deco_plans"] if plan.token_tags is token_tags]
+    rows = kernel_inputs[-1][0]
     assert rows.shape[0] == batch_size and (rows[1] < 900).all()
     # The draw of sample 1 keeps its rows, half of them text, next to the empty sample.
     assert int((rows[1] >= 800).sum()) == rows.shape[1] // 2
@@ -959,68 +998,23 @@ def test_deco_key_padding_mask_attends_the_tokens(require_deco_kernels, v_dtype:
     assert not out[0].any() and not out[1, 900:].any()
     assert _relative_error(out[1, :900], ref) < 2e-2
 
-    # An inference mask has no version counter: it is read on the device on every call, so a
-    # write into it between two calls is followed and no plan holds it. With token tags the
-    # basis rows are those of the tags, kept for the tags, and a capture finds them.
-    plans_before = len(state["deco_plans"])
+    # The mask is read on the device on every call, in inference mode as well: a write into it
+    # between two calls is followed.
     with torch.inference_mode():
         inference_mask = torch.ones((batch_size, seq_len), dtype=torch.bool, device=device)
         attn.forward(q, k, v, key_padding_mask=inference_mask)
         inference_mask[:, 700:] = False
         out = attn.forward(q, k, v, key_padding_mask=inference_mask)
     assert torch.equal(out, attn.forward(q, k, v, key_padding_mask=inference_mask.clone()))
-    assert len(state["deco_plans"]) == plans_before + 1
-    fresh_state: dict = {}
-    fresh = _backend(num_heads, v_dtype, state=fresh_state)
-    with torch.inference_mode():
-        warm = fresh.forward(q, k, v, key_padding_mask=inference_mask, token_tags=token_tags)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            captured = fresh.forward(
-                q, k, v, key_padding_mask=inference_mask, token_tags=token_tags
-            )
-        graph.replay()
-    torch.cuda.synchronize()
-    assert torch.equal(captured, warm)
-    (plan,) = fresh_state["deco_plans"]
-    assert plan.key_padding_mask is None and plan.captured
 
 
-def test_deco_token_tags_with_a_key_padding_mask(require_deco_kernels) -> None:
-    """With token tags and a mask whose tokens are not a prefix, the basis rows are the
-    positions of the drawn tokens after the compaction. When the samples of a batch have
-    padding on positions with a modality, such as text of two lengths, every sample gets the
-    draw of its own tokens, half of it from its text, once per tags tensor and mask."""
+def test_deco_token_tags_with_a_key_padding_mask(require_deco_kernels, kernel_inputs: list) -> None:
+    """With token tags and a mask every sample gets the draw of its own tokens, half of it from
+    its text: the samples of a batch may hold text of different lengths."""
     device = require_deco_kernels()
     batch_size, seq_len, num_heads = 2, 4096, 2
     q, k, v = _random_qkv(batch_size, seq_len, num_heads, device, q_scale=4.0)
-    state: dict = {}
-    attn = _backend(num_heads, state=state)
-
-    token_tags = torch.zeros(seq_len, dtype=torch.int32, device=device)
-    token_tags[:100] = 1  # text
-    token_tags[100:160] = 2  # audio
-    token_tags[-8:] = -1  # padding
-    key_padding_mask = (token_tags >= 0).expand(batch_size, -1).clone()
-    key_padding_mask[0, 40:100] = False  # the text of sample 0 is shorter
-
-    out = attn.forward(q, k, v, token_tags=token_tags, key_padding_mask=key_padding_mask)
-
-    assert not out[~key_padding_mask].any()
-    rows = state["deco_plans"][0].rows
-    # Every sample's draw stays on its own tokens.
-    assert key_padding_mask.gather(1, rows.long()).all()
-    order = torch.argsort(~key_padding_mask, dim=1, stable=True)
-    index = order[:, :, None, None].expand_as(q)
-    position = torch.argsort(order, dim=1)
-    compacted = _kernels(
-        q.gather(1, index),
-        k.gather(1, index),
-        v.gather(1, index),
-        rows=position.gather(1, rows.long()).to(torch.int32).contiguous(),
-        valid_seq_lens=key_padding_mask.sum(dim=1, dtype=torch.int32),
-    )
-    assert torch.equal(out, torch.empty_like(q).scatter_(1, index, compacted))
+    attn = _backend(num_heads)
 
     # Video, then text with the padding of every sample last: the tags mark no padding.
     num_video = 3600
@@ -1031,129 +1025,71 @@ def test_deco_token_tags_with_a_key_padding_mask(require_deco_kernels) -> None:
 
     out = attn.forward(q, k, v, token_tags=token_tags, key_padding_mask=key_padding_mask)
 
-    plan = state["deco_plans"][0]
-    assert plan.token_tags is token_tags and plan.key_padding_mask is key_padding_mask
-    rows = plan.rows
-    assert rows.shape[0] == batch_size
-    assert (rows < lengths[:, None]).all()
+    rows, valid_seq_lens = kernel_inputs[-1]
+    assert valid_seq_lens.tolist() == lengths.tolist()
+    assert rows.shape[0] == batch_size and (rows < lengths[:, None]).all()
     text_rows = (rows >= num_video).sum(dim=1)
     assert text_rows.tolist() == [rows.shape[1] // 2, 20]
+    assert not out[~key_padding_mask].any()
     assert torch.equal(out, _kernels(q, k, v, rows=rows, valid_seq_lens=lengths.to(torch.int32)))
 
+    # The layers of a forward pass the same two tensors: the draw is kept for them.
     assert torch.equal(
         attn.forward(q, k, v, token_tags=token_tags, key_padding_mask=key_padding_mask), out
     )
-    assert len(state["deco_plans"]) == 2
+    assert kernel_inputs[-1][0] is rows
 
 
 @pytest.mark.parametrize("v_dtype", V_DTYPES)
 def test_deco_cuda_graph_with_a_key_padding_mask(require_deco_kernels, v_dtype: str) -> None:
-    """A captured forward with a mask computes the counts and the order of the tokens inside
-    the graph: a replay follows the content of the mask tensor of the capture. A capture takes
-    the basis rows that an eager forward drew for the token tags, also when its mask tensor is
-    another object than the mask of that forward."""
+    """A captured forward with a mask and token tags computes its token counts and basis rows
+    inside the graph: a replay follows the content of the mask and tags tensors of the capture,
+    which the eager forward before it has not seen."""
     device = require_deco_kernels(v_dtype)
-    batch_size, seq_len, num_heads = 2, 512, 2
-    state: dict = {}
-    attn = _backend(num_heads, v_dtype, state=state)
+    batch_size, seq_len, num_heads = 2, 2048, 2
+    attn = _backend(num_heads, v_dtype)
     q, k, v = _random_qkv(batch_size, seq_len, num_heads, device)
-    gen = torch.Generator(device=device).manual_seed(1)
-    key_padding_mask = torch.rand((batch_size, seq_len), generator=gen, device=device) < 0.7
+    token_tags = torch.zeros(seq_len, dtype=torch.int32, device=device)
+    token_tags[1800:] = 1
+    lengths = torch.tensor([[2000], [1850]], device=device)
+    positions = torch.arange(seq_len, device=device)
+    key_padding_mask = positions < lengths
 
-    attn.forward(q, k, v, key_padding_mask=key_padding_mask)
+    attn.forward(q, k, v, token_tags=token_tags.clone(), key_padding_mask=key_padding_mask.clone())
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        graph_out = attn.forward(q, k, v, key_padding_mask=key_padding_mask)
+        graph_out = attn.forward(q, k, v, token_tags=token_tags, key_padding_mask=key_padding_mask)
 
     new_q, new_k, new_v = _random_qkv(batch_size, seq_len, num_heads, device, seed=1)
-    positions = torch.arange(seq_len, device=device).expand(batch_size, -1)
-    for new_mask in (
-        torch.rand((batch_size, seq_len), generator=gen, device=device) < 0.5,
-        positions < 300,
-        torch.ones_like(key_padding_mask),
+    audio_first = torch.zeros_like(token_tags)
+    audio_first[:300] = 2
+    for new_mask, new_tags in (
+        (key_padding_mask.clone(), token_tags.clone()),
+        (positions < lengths - 700, token_tags.clone()),
+        (torch.ones_like(key_padding_mask), audio_first),
     ):
-        expected = attn.forward(new_q, new_k, new_v, key_padding_mask=new_mask).clone()
+        expected = attn.forward(
+            new_q, new_k, new_v, token_tags=new_tags, key_padding_mask=new_mask
+        ).clone()
         q.copy_(new_q)
         k.copy_(new_k)
         v.copy_(new_v)
         key_padding_mask.copy_(new_mask)
+        token_tags.copy_(new_tags)
         graph_out.fill_(float("nan"))
         graph.replay()
         torch.cuda.synchronize()
         assert torch.equal(graph_out, expected)
 
-    seq_len = 2048
-    q, k, v = _random_qkv(batch_size, seq_len, num_heads, device)
-    token_tags = torch.zeros(seq_len, dtype=torch.int32, device=device)
-    token_tags[1800:] = 1
-    lengths = torch.tensor([[2000], [1850]], device=device)
-    warm_mask = torch.arange(seq_len, device=device) < lengths
-    # A batch of one first: its plan holds one draw, the plan of the batch of two one per sample.
-    expected_one = attn.forward(
-        q[:1], k[:1], v[:1], token_tags=token_tags, key_padding_mask=warm_mask[:1]
-    ).clone()
-    expected = attn.forward(q, k, v, token_tags=token_tags, key_padding_mask=warm_mask).clone()
-
-    # A second warm-up of the batch size with another mask draws other rows; the capture with
-    # the first mask takes the rows of its own warm-up, and a capture with a clone of that mask
-    # the newest rows that fit the batch.
-    other_mask = torch.arange(seq_len, device=device) < lengths - 100
-    attn.forward(q, k, v, token_tags=token_tags, key_padding_mask=other_mask)
-    for capture_mask, want in ((warm_mask, expected), (warm_mask.clone(), None)):
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            graph_out = attn.forward(q, k, v, token_tags=token_tags, key_padding_mask=capture_mask)
-        graph_out.fill_(float("nan"))
-        graph.replay()
-        torch.cuda.synchronize()
-        if want is None:
-            rows = state["deco_plans"][0].rows
-            assert state["deco_plans"][0].key_padding_mask is other_mask
-            lens = lengths.reshape(-1).int()
-            want = _kernels(q, k, v, v_dtype, rows=rows, valid_seq_lens=lens)
-            want[~warm_mask] = 0
-        assert torch.equal(graph_out, want)
-
-    # The capture of the batch of one takes the rows drawn for one sample, not the newer rows
-    # drawn per sample of the batch of two.
-    graph_one = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph_one):
-        graph_out_one = attn.forward(
-            q[:1], k[:1], v[:1], token_tags=token_tags, key_padding_mask=capture_mask[:1]
-        )
-    graph_out_one.fill_(float("nan"))
-    graph_one.replay()
-    torch.cuda.synchronize()
-    assert torch.equal(graph_out_one, expected_one)
-
-    # A capture without a mask after the masked warm-ups takes the newest rows drawn per sample
-    # with the full length of every sample.
-    rows = state["deco_plans"][0].rows
-    assert rows.dim() == 2
-    graph_full = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph_full):
-        graph_out_full = attn.forward(q, k, v, token_tags=token_tags)
-    graph_out_full.fill_(float("nan"))
-    graph_full.replay()
-    torch.cuda.synchronize()
-    full = torch.full((batch_size,), seq_len, dtype=torch.int32, device=device)
-    assert torch.equal(graph_out_full, _kernels(q, k, v, v_dtype, rows=rows, valid_seq_lens=full))
-
-    with pytest.raises(RuntimeError, match="eagerly once before capturing"):
-        with torch.cuda.graph(torch.cuda.CUDAGraph()):
-            attn.forward(q, k, v, token_tags=token_tags.clone(), key_padding_mask=capture_mask)
-
 
 @pytest.mark.parametrize("v_dtype", V_DTYPES)
 def test_deco_cuda_graph(require_deco_kernels, v_dtype: str) -> None:
     """A forward is captured after an eager forward of its shape and replays onto new inputs,
-    also after eager forwards of other shapes reused and regrew the component's workspace and
-    other requests' token tags passed through the state, which keeps the captured rows. A
-    sequence length or token tags first met under capture are rejected with a clear error."""
+    also after eager forwards of other shapes and other token tags. A sequence length first met
+    under capture is rejected with a clear error."""
     device = require_deco_kernels(v_dtype)
     batch_size, seq_len, num_heads = 1, 384, 2
-    state: dict = {}
-    attn = _backend(num_heads, v_dtype, state=state)
+    attn = _backend(num_heads, v_dtype)
     q, k, v = _random_qkv(batch_size, seq_len, num_heads, device)
     token_tags = torch.zeros(seq_len, dtype=torch.int32, device=device)
     token_tags[:64] = 1
@@ -1162,14 +1098,11 @@ def test_deco_cuda_graph(require_deco_kernels, v_dtype: str) -> None:
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         graph_out = attn.forward(q, k, v, token_tags=token_tags)
-    (plan,) = state["deco_plans"]
-    assert plan.captured
 
     for other_len in (128, 1024, 256, 512, 640, 768):
         other_tags = torch.zeros(other_len, dtype=torch.int32, device=device)
         other_tags[:64] = 1
         attn.forward(*_random_qkv(batch_size, other_len, num_heads, device), token_tags=other_tags)
-    assert plan in state["deco_plans"] and len(state["deco_plans"]) == 5
     new_q, new_k, new_v = _random_qkv(batch_size, seq_len, num_heads, device, seed=1)
     expected = attn.forward(new_q, new_k, new_v, token_tags=token_tags).clone()
     q.copy_(new_q)
@@ -1188,7 +1121,3 @@ def test_deco_cuda_graph(require_deco_kernels, v_dtype: str) -> None:
     with pytest.raises(RuntimeError, match="eagerly once before capturing"):
         with torch.cuda.graph(torch.cuda.CUDAGraph()):
             deco_attention.prepare(*unseen, workspace, v_dtype)
-    # So does the backend for the draw of token tags it has not seen.
-    with pytest.raises(RuntimeError, match="eagerly once before capturing"):
-        with torch.cuda.graph(torch.cuda.CUDAGraph()):
-            attn.forward(q, k, v, token_tags=token_tags.clone())

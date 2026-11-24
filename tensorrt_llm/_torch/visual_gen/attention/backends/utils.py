@@ -20,7 +20,7 @@ Uses diffusion-specific wrappers (TrtllmAttention, VanillaAttention)
 that handle metadata preparation internally for simplified usage.
 """
 
-from typing import Optional, Type
+from typing import NamedTuple, Optional, Type
 
 import torch
 
@@ -118,19 +118,31 @@ def get_visual_gen_attention_backend(
         return VanillaAttention
 
 
-def get_padding_support(attention_config: AttentionConfig) -> tuple[bool, bool, bool]:
+class PaddingSupport(NamedTuple):
+    """What the dense attention backend of a config takes for the padding of a sequence.
+
+    Attributes:
+        supports_mask: The backend takes ``key_padding_mask``.
+        supports_length: The backend takes ``valid_seq_len``.
+        requires_trailing: The padding must follow the tokens; also true for a backend that
+            takes only the length.
+    """
+
+    supports_mask: bool
+    supports_length: bool
+    requires_trailing: bool
+
+    @property
+    def supports_padding(self) -> bool:
+        """Whether the backend can attend a padded sequence at all."""
+        return self.supports_mask or self.supports_length
+
+
+def get_padding_support(attention_config: AttentionConfig) -> PaddingSupport:
     """Return what the dense attention backend of a config takes for the padding of a sequence.
 
     A model hands a backend that takes a mask the mask, and one that takes only the length the
     length; a backend that takes neither cannot attend a padded sequence.
-
-    Returns:
-        A tuple ``(supports_mask, supports_length, requires_trailing)``:
-
-        * supports_mask: The backend takes ``key_padding_mask``.
-        * supports_length: The backend takes ``valid_seq_len``.
-        * requires_trailing: The padding must follow the tokens; also true for a backend
-          that takes only the length.
     """
     # A config object without the field carries no quantization recipe.
     quant_attention_config = getattr(attention_config, "quant_attention_config", None)
@@ -148,7 +160,7 @@ def get_padding_support(attention_config: AttentionConfig) -> tuple[bool, bool, 
     requires_trailing = backend_cls.requires_trailing_padding() or (
         supports_length and not supports_mask
     )
-    return supports_mask, supports_length, requires_trailing
+    return PaddingSupport(supports_mask, supports_length, requires_trailing)
 
 
 def create_attention(
@@ -187,7 +199,7 @@ def create_attention(
             forward its quantization or sparsity configuration.
         attention_metadata_state: Optional per-component VisualGen attention state.
             It keeps shape-stable attention metadata alive across layers and
-            CUDA Graph captures. Required for TRTLLM, FlashInfer and DeCo-Attention.
+            CUDA Graph captures. Required for TRTLLM and shared by FlashInfer layers.
         **kwargs: Additional backend-specific arguments
 
     Returns:
@@ -205,11 +217,6 @@ def create_attention(
     )
 
     backend_name = backend.upper()
-    is_deco = (
-        backend_name == "CUTEDSL"
-        and quant_attention_config is not None
-        and quant_attention_config.deco_attention
-    )
     attn_cls = get_visual_gen_attention_backend(
         backend_name, sparse_algorithm, quant_attention_config
     )
@@ -239,13 +246,6 @@ def create_attention(
             raise ValueError(
                 "FLASHINFER backend requires `attention_metadata_state` from "
                 "DiffusionModelConfig for shared workspace allocation."
-            )
-        kwargs["attention_metadata_state"] = attention_metadata_state
-    elif is_deco:
-        if attention_metadata_state is None:
-            raise ValueError(
-                "DeCo-Attention requires `attention_metadata_state` from "
-                "DiffusionModelConfig for the plans its layers share."
             )
         kwargs["attention_metadata_state"] = attention_metadata_state
     return attn_cls(

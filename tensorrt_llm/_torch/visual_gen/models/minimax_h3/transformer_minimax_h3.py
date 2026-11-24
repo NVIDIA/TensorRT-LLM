@@ -369,18 +369,6 @@ def _norm_2d(norm: RMSNorm, hidden_states: torch.Tensor) -> torch.Tensor:
     return norm(hidden_states.reshape(-1, shape[-1])).view(shape)
 
 
-def _padded_tags_and_mask(
-    token_tags: torch.Tensor, pad: int, batch_size: int, with_mask: bool
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Return the token tags padded by ``pad`` rows of -1 and, with ``with_mask``, the key
-    padding mask over them for ``batch_size`` samples (None without a mask), both built outside
-    inference mode so that they carry version counters."""
-    with torch.inference_mode(False):
-        padded = _pad_tensor_dim(token_tags, 0, pad, -1) if pad else token_tags
-        mask = (padded >= 0).unsqueeze(0).expand(batch_size, -1) if with_mask else None
-    return padded, mask
-
-
 def _pad_tensor_dim(
     tensor: torch.Tensor,
     dim: int,
@@ -554,10 +542,9 @@ class MiniMaxH3TokenRefiner(nn.Module):
     ) -> None:
         super().__init__()
         self._attn_backend = model_config.attention.backend.upper()
-        self._supports_key_padding_mask, supports_valid_seq_len, _ = get_padding_support(
-            model_config.attention
-        )
-        self._supports_padding = self._supports_key_padding_mask or supports_valid_seq_len
+        padding_support = get_padding_support(model_config.attention)
+        self._supports_key_padding_mask = padding_support.supports_mask
+        self._supports_padding = padding_support.supports_padding
         self.sharder = SequenceSharder.from_vgm(
             model_config.visual_gen_mapping,
             num_attention_heads=num_attention_heads,
@@ -771,19 +758,12 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
     def __init__(self, model_config: DiffusionModelConfig) -> None:
         super().__init__(model_config)
         self._attn_backend = getattr(model_config.attention, "backend", "VANILLA")
-        # Tags handed to the attention backend, kept as (key, tensor): the layers and steps of
-        # a request pass one tensor object, which backends key their caches on.
-        #   key: (the caller's tags, their version counter, pad, batch size, with a mask)
-        #   value: (the padded tags, the key padding mask over them or None)
-        self._cached_token_tags: tuple[tuple, tuple[torch.Tensor, torch.Tensor | None]] | None
-        self._cached_token_tags = None
-        # Padding between packed modalities needs a backend that takes it anywhere.
-        (
-            self._supports_key_padding_mask,
-            self._supports_valid_seq_len,
-            self._requires_trailing_padding,
-        ) = get_padding_support(model_config.attention)
-        self._supports_padding = self._supports_key_padding_mask or self._supports_valid_seq_len
+        # What the attention backend takes for padded rows, and whether they must follow the tokens.
+        padding_support = get_padding_support(model_config.attention)
+        self._supports_key_padding_mask = padding_support.supports_mask
+        self._supports_valid_seq_len = padding_support.supports_length
+        self._requires_trailing_padding = padding_support.requires_trailing
+        self._supports_padding = padding_support.supports_padding
         quant_algo = model_config.quant_config.quant_algo
         # TODO: Support calibrated checkpoints in load_weights before enabling static quantization.
         if quant_algo is not None and not (
@@ -1110,30 +1090,15 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             valid_seq_len = sequence_length
             if has_existing_padding:
                 valid_seq_len = int((token_tags >= 0).sum().item())
-        # The padded tags and the mask over them are reused while the caller passes the same
-        # tensor with the same version counter, which an in-place refill advances; the tensor
-        # is held, so its address is not given to another. Attention backends key their plans
-        # on these tensors and their counters. An inference tensor has no counter: its padded
-        # tags and mask are built on every forward (the pipeline hands a tensor with a counter).
-        batch_size = packed_hidden_states.shape[0]
-        with_mask = self._supports_key_padding_mask and bool(pad or has_existing_padding)
-        if token_tags.is_inference():
-            padded_token_tags, key_padding_mask = _padded_tags_and_mask(
-                token_tags, pad, batch_size, with_mask
-            )
-        else:
-            key = (token_tags, token_tags._version, pad, batch_size, with_mask)
-            cached = self._cached_token_tags
-            if cached is None or cached[0][0] is not token_tags or cached[0][1:] != key[1:]:
-                cached = (key, _padded_tags_and_mask(token_tags, pad, batch_size, with_mask))
-                self._cached_token_tags = cached
-            padded_token_tags, key_padding_mask = cached[1]
+        token_tags_for_mask = token_tags
         if pad:
             packed_hidden_states = _pad_tensor_dim(packed_hidden_states, 1, pad)
             adaln_indices = _pad_tensor_dim(adaln_indices, 0, pad)
             timestep_indices_for_norm = _pad_tensor_dim(timestep_indices, 0, pad)
+            token_tags_for_mask = _pad_tensor_dim(token_tags, 0, pad, -1)
             rotary_emb = _pad_rotary_emb(rotary_emb, pad)
 
+        key_padding_mask = None
         if pad or has_existing_padding:
             if not self._supports_padding:
                 raise NotImplementedError(
@@ -1144,12 +1109,20 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             # A backend that reads the padding as one valid prefix requires trailing
             # padding. Ulysses appends padding in this layout.
             if self._requires_trailing_padding and bool(
-                ((padded_token_tags[:-1] < 0) & (padded_token_tags[1:] >= 0)).any()
+                ((token_tags_for_mask[:-1] < 0) & (token_tags_for_mask[1:] >= 0)).any()
             ):
                 raise NotImplementedError(
                     f"{self._attn_backend} requires trailing packed-row padding; use a "
                     "backend that takes interior padding, such as VANILLA."
                 )
+            if self._supports_key_padding_mask:
+                # Attention caches use the mask version to detect changes.
+                with torch.inference_mode(False):
+                    key_padding_mask = (
+                        (token_tags_for_mask >= 0)
+                        .unsqueeze(0)
+                        .expand(packed_hidden_states.shape[0], -1)
+                    )
 
         padded_sequence_length = packed_hidden_states.shape[1]
         packed_hidden_states = self.sharder.shard(packed_hidden_states, dim=1)
@@ -1172,7 +1145,7 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
                 valid_seq_len=valid_seq_len,
                 # Each attention call sees the whole packed sequence, whose rows these tags
                 # describe.
-                token_tags=padded_token_tags,
+                token_tags=token_tags_for_mask,
             )
 
         packed_hidden_states = self.norm_out(

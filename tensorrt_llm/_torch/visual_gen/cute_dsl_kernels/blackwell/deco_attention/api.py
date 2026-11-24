@@ -161,7 +161,7 @@ def prepare(q, k, v, workspace, pv=None, rank=DEFAULT_RANK, rows=None, valid_seq
         workspace: uint8 [>= workspace_size(B, S, H, device, pv, rank)] on that device, 256-byte aligned, any content.
         rows: int32 [m] on that device, not empty: the tokens the compensation basis is estimated on.
             * None is the default draw, sample_rows(seq_len, device, rank=rank); a packed multimodal sequence passes
-              sample_rows(seq_len, device, token_tags, rank), which holds fewer when fewer tokens are not padding.
+              sample_rows(seq_len, device, token_tags, rank), drawn on the device.
             * A caller's draw should hold at least 2 * rank tokens where the sequence has that many, the floor of the
               default draw; the kernels clamp a row outside [0, S) to the sequence.
         valid_seq_lens: None (every batch element is full), or int32 [B] on that device.

@@ -60,7 +60,9 @@ attention(operands, out)                   # BF16 [B, S, H, 128] out
   one-dimensional tensor on the device of `q`. The default, `sample_rows(seq_len, rank=rank)`, holds 1/256 of the
   tokens and at least 2 x rank of them. A packed multimodal sequence passes
   `rows=sample_rows(seq_len, token_tags=tags, rank=rank)`, which takes half of the rows from the text and audio
-  tokens. A draw may hold fewer rows than 2 x rank; an empty one is rejected.
+  tokens; it runs on the device and reads nothing back, and with `tokens` (bool `[B, seq_len]`, true for a token)
+  every batch element gets the draw of its own tokens. The last tagged draw is kept for the calls that pass the same
+  tensors. A draw may hold fewer rows than 2 x rank; an empty one is rejected.
 - **Rank.** `rank=64` doubles the compensation channels where `ranks()` lists it.
 - **Compilation.** Kernels compile on first use and are cached per device and rank. The `tcgen05` attention takes the
   shape at run time; the `sm120` attention compiles once per shape.

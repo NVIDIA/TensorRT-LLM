@@ -888,12 +888,6 @@ class HunyuanVideo15Transformer3DModel(BaseDiffusionModel):
             num_layers=num_refiner_layers,
             model_config=model_config,
         )
-        # Tags handed to the attention backend, kept as (key, tensor): the layers and steps of
-        # a request pass one tensor object, which backends key their caches on.
-        #   key: (video rows, image rows, context rows, device)
-        self._cached_token_tags: Optional[
-            Tuple[Tuple[int, int, int, torch.device], torch.Tensor]
-        ] = None
         self.context_embedder_2 = HunyuanVideo15ByT5TextProjection(
             text_embed_2_dim, 2048, inner_dim, model_config=model_config
         )
@@ -1085,28 +1079,15 @@ class HunyuanVideo15Transformer3DModel(BaseDiffusionModel):
         encoder_hidden_states = torch.stack(new_encoder_hidden_states)
         encoder_attention_mask = torch.stack(new_encoder_attention_mask)
 
-        # Joint sequence of the blocks: [video | image | text | padding]. The blocks share one
-        # mask and one tags tensor, which attention backends key their caches on.
+        # Joint sequence of the blocks: [video | image | text | padding]. The blocks share one mask
+        # and one tags tensor per forward, so that an attention backend derives from them once.
         num_video, num_context = hidden_states.shape[1], encoder_hidden_states.shape[1]
-        # One mask tensor per forward, shared by the blocks. Attention backends keep what they
-        # derive from a mask while its version counter stands, which an inference tensor lacks.
-        with torch.inference_mode(False):
-            joint_attention_mask = F.pad(encoder_attention_mask, (num_video, 0), value=True)
-        # One tags tensor across forwards: it depends on the row counts only.
-        tags_key = (num_video, num_image, num_context, hidden_states.device)
-        cached = self._cached_token_tags
-        if cached is None or cached[0] != tags_key:
-            # 0 video or image, positive text; the mask says which rows are padding. Built
-            # outside inference mode, the tensor carries the version counter that attention
-            # backends key their plans on.
-            with torch.inference_mode(False):
-                token_tags = torch.ones(
-                    num_video + num_context, dtype=torch.int32, device=hidden_states.device
-                )
-                token_tags[: num_video + num_image] = 0
-            cached = (tags_key, token_tags)
-            self._cached_token_tags = cached
-        token_tags = cached[1]
+        joint_attention_mask = F.pad(encoder_attention_mask, (num_video, 0), value=True)
+        # 0 video or image, positive text; the mask says which rows are padding.
+        token_tags = torch.ones(
+            num_video + num_context, dtype=torch.int32, device=hidden_states.device
+        )
+        token_tags[: num_video + num_image] = 0
 
         # 4. Transformer blocks
         if torch.is_grad_enabled() and self.gradient_checkpointing:

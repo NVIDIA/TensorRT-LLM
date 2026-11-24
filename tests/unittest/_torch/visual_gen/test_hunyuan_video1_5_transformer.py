@@ -193,7 +193,6 @@ class TestHunyuanVideo15Transformer(unittest.TestCase):
 def test_deco_recipe_builds_deco_layers(require_deco_kernels):
     """Every attention layer of a model under a DeCo-Attention recipe is a DeCo layer."""
     from tensorrt_llm._torch.visual_gen.attention.backends.cute_dsl import DeCoAttention
-    from tensorrt_llm._torch.visual_gen.config import create_attention_metadata_state
     from tensorrt_llm._torch.visual_gen.models.hunyuan_video1_5 import (
         transformer_hunyuan_video1_5 as hunyuan,
     )
@@ -207,7 +206,6 @@ def test_deco_recipe_builds_deco_layers(require_deco_kernels):
             qk_dtype="nvfp4", v_dtype="fp8", deco_attention=True
         ),
     )
-    model_config.attention_metadata_state = create_attention_metadata_state()
     model = hunyuan.HunyuanVideo15Transformer3DModel(model_config)
 
     layers = [m.attn for m in model.modules() if isinstance(m, hunyuan.Attention)]
@@ -271,7 +269,6 @@ def test_joint_blocks_share_the_token_tags_and_the_padding_mask(monkeypatch):
     positions = torch.arange(tags.numel(), device="cuda")
     assert torch.equal(tags, (positions >= num_video).to(tags.dtype))
     assert torch.equal(mask, positions < (num_video + num_text)[:, None])
-    assert forward(torch.zeros_like(image_embeds))[0] is tags
 
     # With image embeddings the image rows follow the video rows and share their tag.
     tags, mask = forward(image_embeds)
