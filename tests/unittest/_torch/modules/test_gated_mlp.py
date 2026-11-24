@@ -319,7 +319,7 @@ def test_fp8_block_scale_mlp_small_m_matches_deep_gemm(rows, backend):
     # Whichever kernels win, the tuned forward is at least as close to the exact product.
     assert rms_error(tuned) <= 1.05 * rms_error(plain)
 
-    def activation_group_size(width: int, *, fused_swiglu: bool = False) -> int:
+    def activation_group_size(width: int, cache_calls, *, fused_swiglu: bool = False) -> int:
         operation = (
             torch_custom_ops._FP8_BLOCK_SCALE_SWIGLU_GEMM_AUTOTUNED_OP
             if fused_swiglu
@@ -327,7 +327,7 @@ def test_fp8_block_scale_mlp_small_m_matches_deep_gemm(rows, backend):
         )
         calls = [
             call
-            for call in cache_search.call_args_list
+            for call in cache_calls
             if call.args[0] == operation and call.args[2][0][-1] == width
         ]
         if calls:
@@ -346,28 +346,79 @@ def test_fp8_block_scale_mlp_small_m_matches_deep_gemm(rows, backend):
         quantized = (blocks / scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
         return (quantized.double() * scale.double().unsqueeze(-1)).reshape_as(value)
 
-    gate_group_size = activation_group_size(hidden)
-    down_group_size = 0
-    if mlp._can_fuse_swiglu_fp8_quant():
-        down_group_size = activation_group_size(2 * intermediate, fused_swiglu=True)
-    if not down_group_size:
-        down_group_size = activation_group_size(intermediate)
-    precision_reference = reference
-    if gate_group_size or down_group_size:
-        gate_input = quantized_activation(x, gate_group_size) if gate_group_size else x.double()
-        gate_product = gate_input @ gate_ref.t()
-        up_product = gate_input @ up_ref.t()
-        if down_group_size:
-            gate_product = gate_product.to(torch.bfloat16).float()
-            up_product = up_product.to(torch.bfloat16).float()
-        activation_reference = F.silu(gate_product) * up_product
-        if down_group_size:
-            activation_reference = quantized_activation(
-                activation_reference.to(torch.bfloat16), down_group_size
+    def check_precision(output, cache_calls):
+        gate_group_size = activation_group_size(hidden, cache_calls)
+        down_group_size = 0
+        if mlp._can_fuse_swiglu_fp8_quant():
+            down_group_size = activation_group_size(
+                2 * intermediate, cache_calls, fused_swiglu=True
             )
-        precision_reference = activation_reference @ down_ref.t()
-    absolute_error = (tuned.double() - precision_reference).square().mean().sqrt().item()
-    assert absolute_error <= 2e-2 * precision_reference.square().mean().sqrt().item()
+        if not down_group_size:
+            down_group_size = activation_group_size(intermediate, cache_calls)
+        precision_reference = reference
+        if gate_group_size or down_group_size:
+            gate_input = quantized_activation(x, gate_group_size) if gate_group_size else x.double()
+            gate_product = gate_input @ gate_ref.t()
+            up_product = gate_input @ up_ref.t()
+            if down_group_size:
+                gate_product = gate_product.to(torch.bfloat16).float()
+                up_product = up_product.to(torch.bfloat16).float()
+            activation_reference = F.silu(gate_product) * up_product
+            if down_group_size:
+                activation_reference = quantized_activation(
+                    activation_reference.to(torch.bfloat16), down_group_size
+                )
+            precision_reference = activation_reference @ down_ref.t()
+        absolute_error = (output.double() - precision_reference).square().mean().sqrt().item()
+        limit = 2e-2 * precision_reference.square().mean().sqrt().item()
+        assert absolute_error <= limit, (
+            f"gate/down activation groups {gate_group_size}/{down_group_size}: "
+            f"RMS error {absolute_error:.3e} > {limit:.3e}"
+        )
+        return gate_group_size, down_group_size
+
+    check_precision(tuned, cache_search.call_args_list)
+
+    tuned_operations = (
+        torch_custom_ops._FP8_BLOCK_SCALE_GEMM_AUTOTUNED_OP,
+        torch_custom_ops._FP8_BLOCK_SCALE_SWIGLU_GEMM_AUTOTUNED_OP,
+    )
+
+    def checked_forward(*, expect_cache_miss=False):
+        with patch.object(cache, "search_cache", wraps=cache.search_cache) as controlled_search:
+            output = mlp(x)
+        if expect_cache_miss:
+            for call in controlled_search.call_args_list:
+                if call.args[0] in tuned_operations:
+                    hit, _, _, _ = cache.search_cache(*call.args, **call.kwargs)
+                    assert not hit, f"cache-miss control hit a tuned entry for {call.args[0]}"
+        return check_precision(output, controlled_search.call_args_list)
+
+    cache_keys = set()
+    tactic_overrides = {}
+    has_gate_tactic = False
+    for call in cache_search.call_args_list:
+        operation, runners, shapes, tuning_config = call.args[:4]
+        if operation not in tuned_operations:
+            continue
+        for runner in runners:
+            cache_keys.add(cache.get_cache_key(operation, runner, shapes, tuning_config))
+        hit, runner_id, _, _ = cache.search_cache(*call.args, **call.kwargs)
+        if not hit:
+            continue
+        cache_key = cache.get_cache_key(operation, runners[runner_id], shapes, tuning_config)
+        gate_lookup = shapes[0][-1] == hidden
+        has_gate_tactic = has_gate_tactic or gate_lookup
+        tactic_overrides[cache_key] = (runner_id, 0 if gate_lookup else -1, 0.0)
+    if has_gate_tactic:
+        with patch.dict(cache.cache, tactic_overrides):
+            assert checked_forward() == (0, 128)
+    if cache_keys:
+        with patch.dict(cache.cache):
+            for cache_key in cache_keys:
+                cache.cache.pop(cache_key, None)
+            fallback_groups = checked_forward(expect_cache_miss=True)
+            assert all(fallback_groups), f"cache-miss activation groups {fallback_groups}"
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured = mlp(x)
