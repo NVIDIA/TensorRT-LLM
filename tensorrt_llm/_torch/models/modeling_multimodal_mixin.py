@@ -34,6 +34,7 @@ from typing import (
 )
 
 import torch
+from torch.utils._pytree import tree_flatten
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
@@ -87,25 +88,12 @@ def _assemble_multimodal_encoder_embeddings(
 
 @dataclass(frozen=True)
 class EncoderGroup:
-    """Modalities that share a single encoder call.
+    """Modalities served by one tower.
 
-    Batching all items in a group into one encoder invocation amortizes
-    fixed costs (kernel launches, dispatch) across items. The framework
-    splits the output back per-modality and reorders it into prompt order
-    via each request's `MultimodalItemMetadata.item_refs` manifest.
-
-    Contract between `build_batched_input` and `encoder_fn`:
-
-    * `build_batched_input` must concatenate items across requests in
-      `modalities` order (all items for the first modality across requests,
-      then all items for the second modality, etc.).
-    * Within a modality, items must appear in the same per-request iteration
-      order that `_lengths_by_modality` uses (i.e. the order of
-      `multimodal_params` passed in).
-    * `encoder_fn` must return one tensor whose rows correspond 1:1 to the
-      input layout produced by `build_batched_input`, so the framework can
-      split the output by `_lengths_by_modality` and reorder into prompt
-      order via each request's item manifest.
+    The default builder calls the tower separately for each modality and
+    compatible input shape. A custom builder controls its group's input
+    layout: it batches in modality order and, within a modality, in request
+    order and then payload-local item order.
     """
 
     modalities: Tuple[str, ...]
@@ -122,10 +110,178 @@ class EncoderGroup:
     graph's static output buffer); clone such outputs before returning
     them."""
 
-    build_batched_input: Callable[[List[MultimodalParams]], Dict[str, Any]]
+    build_batched_input: Optional[Callable[[List[MultimodalParams]], Dict[str, Any]]] = None
     """Builds the kwargs dict passed to `encoder_fn`. Responsible for
     concatenating raw per-item tensors from `multimodal_data` across
-    requests in the order described in the class docstring."""
+    requests in the order described above. By default, the runtime batches
+    the fields declared in the modality's input partitions."""
+
+
+def _encoder_fields(
+    data: dict[str, Any], partitions: dict[str, MultimodalItemPartition]
+) -> dict[str, tuple[int | None, Any]]:
+    fields = {}
+    for key, (axis, lengths) in partitions.items():
+        value = data.get(key)
+        if value is None:
+            continue
+        if axis is not None:
+            if isinstance(value, torch.Tensor):
+                if not -value.ndim <= axis < value.ndim:
+                    raise MultimodalEncoderContractError(f"Invalid item axis {axis} for {key}")
+                axis %= value.ndim
+                size = value.shape[axis]
+            elif isinstance(value, (list, tuple)) and axis == 0:
+                size = len(value)
+            else:
+                raise MultimodalEncoderContractError(f"Invalid item axis {axis} for {key}")
+            if lengths is not None and sum(lengths) != size:
+                raise MultimodalEncoderContractError(
+                    "Packed field size does not match its item lengths"
+                )
+        fields[key] = (axis, value)
+    return fields
+
+
+def _same_shared_value(left: Any, right: Any) -> bool:
+    if left is right:
+        return True
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, torch.Tensor):
+        # Comparing distinct CUDA tensors by value would synchronize the host.
+        return (
+            left.device.type == right.device.type == "cpu"
+            and left.dtype == right.dtype
+            and torch.equal(left, right)
+        )
+    if isinstance(left, (list, tuple)):
+        return len(left) == len(right) and all(
+            _same_shared_value(a, b) for a, b in zip(left, right)
+        )
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(
+            _same_shared_value(left[k], right[k]) for k in left
+        )
+    return isinstance(left, (int, float, str, bytes)) and left == right
+
+
+def _tensor_list_layout(value: Sequence[Any]) -> set[tuple[Any, ...]]:
+    layouts = set()
+    for item in value:
+        if isinstance(item, torch.Tensor):
+            layouts.add((item.dtype, item.device, item.shape))
+        elif isinstance(item, (list, tuple, dict)):
+            leaves, structure = tree_flatten(item)
+            tensors = tuple(
+                (v.dtype, v.device, v.shape) for v in leaves if isinstance(v, torch.Tensor)
+            )
+            if tensors:
+                layouts.add((structure, tensors))
+    return layouts
+
+
+def _compatible_field(first: tuple[int | None, Any], second: tuple[int | None, Any]) -> bool:
+    axis, left = first
+    other_axis, right = second
+    if axis != other_axis or type(left) is not type(right):
+        return False
+    if axis is None:
+        return _same_shared_value(left, right)
+    if isinstance(left, torch.Tensor):
+        return (
+            left.dtype == right.dtype
+            and left.device == right.device
+            and left.shape[:axis] == right.shape[:axis]
+            and left.shape[axis + 1 :] == right.shape[axis + 1 :]
+        )
+    return _tensor_list_layout(left) == _tensor_list_layout(right)
+
+
+def _build_batched_input(fields: list[dict[str, tuple[int | None, Any]]]) -> dict[str, Any]:
+    """Combine already placed fields, preserving singleton storage."""
+    inputs = {}
+    for key, (axis, first) in fields[0].items():
+        if axis is None or len(fields) == 1:
+            inputs[key] = first
+        elif isinstance(first, torch.Tensor):
+            inputs[key] = torch.cat([payload[key][1] for payload in fields], dim=axis)
+        else:
+            inputs[key] = type(first)(item for payload in fields for item in payload[key][1])
+    return inputs
+
+
+def _encode_modality(
+    group: EncoderGroup,
+    modality: str,
+    params: list[MultimodalParams],
+    layouts: Sequence[tuple[Sequence[tuple[str, int]], Sequence[int]]],
+) -> torch.Tensor:
+    """Batch compatible payloads and return their embeddings in request and local item order."""
+    fields = []
+    output_lengths = []
+    owner = getattr(group.encoder_fn, "__self__", None)
+    derive_partitions = getattr(owner, "get_multimodal_item_partitions", None)
+    for param, (refs, lengths) in zip(params, layouts, strict=True):
+        data = param.multimodal_data.get(modality)
+        if data is None:
+            continue
+        item_lengths = [(i, n) for (m, i), n in zip(refs, lengths, strict=True) if m == modality]
+        if not item_lengths:
+            continue
+        metadata = param.item_metadata
+        partitions = metadata.input_partitions.get(modality) if metadata is not None else None
+        if derive_partitions is not None and data.keys() - (partitions or {}).keys():
+            defaults = derive_partitions(param, modality)
+            if defaults is not None:
+                partitions = {**defaults, **(partitions or {})}
+        if partitions is None:
+            raise MultimodalEncoderContractError(
+                f"The {modality} payload declares no input partitions"
+            )
+        payload = _encoder_fields(data, partitions)
+        # A single request may carry a list of items with different shapes.
+        if any(
+            axis == 0 and isinstance(value, (list, tuple)) and len(_tensor_list_layout(value)) > 1
+            for axis, value in payload.values()
+        ):
+            for index, length in sorted(item_lengths):
+                fields.append(
+                    {
+                        key: (axis, partitions[key].select(value, [index]))
+                        for key, (axis, value) in payload.items()
+                    }
+                )
+                output_lengths.append(length)
+        else:
+            fields.append(payload)
+            output_lengths.append(sum(length for _, length in item_lengths))
+
+    batches: list[list[int]] = []
+    for index, candidate in enumerate(fields):
+        for batch in batches:
+            first = fields[batch[0]]
+            if first.keys() == candidate.keys() and all(
+                _compatible_field(first[key], value) for key, value in candidate.items()
+            ):
+                batch.append(index)
+                break
+        else:
+            batches.append([index])
+
+    pieces = {}
+    for batch in batches:
+        out = group.encoder_fn(**_build_batched_input([fields[i] for i in batch]))
+        lengths = [output_lengths[i] for i in batch]
+        expected = sum(lengths)
+        if out.shape[0] != expected:
+            raise MultimodalEncoderContractError(
+                f"MM encoder returned {out.shape[0]} embeddings, item metadata expects {expected}"
+            )
+        if len(batches) == 1:
+            return out
+        pieces.update(zip(batch, out.split(lengths), strict=True))
+    return torch.cat([pieces[i] for i in range(len(output_lengths))])
 
 
 def _lengths_by_modality(
@@ -239,11 +395,9 @@ def encode_multimodal_by_groups(
     """Run each group's encoder over its batched items and reorder into
     per-request prompt order.
 
-    For each group present in the batch, one encoder call is issued over all
-    items across all requests belonging to that group's modalities
-    (arithmetic-intensity win). The output is split back per-modality using
-    the prompt-ordered output lengths in `MultimodalItemMetadata`,
-    then reordered by the same metadata's `item_refs`.
+    With the default builder, each call receives compatible items of one
+    modality. Custom builders keep their group layout. The framework restores
+    prompt order using the output lengths and item references in the request.
 
     Shared entry point for both the aggregated (`MultimodalModelMixin`) and
     mm-encoder-only (`Qwen3VisionModelBase.forward`) paths so the ordering
@@ -265,14 +419,21 @@ def encode_multimodal_by_groups(
                 group_layouts.append(layout)
         if not group_params:
             continue
-        out = group.encoder_fn(**group.build_batched_input(group_params))
         lengths = _lengths_by_modality(group_layouts, group.modalities)
+        per_modality_lengths.update(lengths)
+        if group.build_batched_input is None:
+            for modality in group.modalities:
+                if lengths[modality]:
+                    per_modality_embeds[modality] = _encode_modality(
+                        group, modality, group_params, group_layouts
+                    )
+            continue
+        out = group.encoder_fn(**group.build_batched_input(group_params))
         cursor = 0
         for m in group.modalities:
             total = sum(lengths[m])
             per_modality_embeds[m] = out[cursor : cursor + total]
             cursor += total
-        per_modality_lengths.update(lengths)
     return _reorder_embeds_by_manifest(item_layouts, per_modality_embeds, per_modality_lengths)
 
 

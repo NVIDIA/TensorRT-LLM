@@ -83,9 +83,15 @@ producer/admission boundaries, avoiding repeated validation per forward.
 Partitions describe how to select processed fields: shared fields have no item
 axis, batched fields have an item axis, and packed fields also provide host-side
 per-item lengths. Contiguous tensor selections can share storage; reordered
-selections may copy. Treat shared input storage as read-only. Model hooks and
-`EncoderGroup` still own compatible batching, padding, masks, encoder arguments,
-and output fusion.
+selections may copy. Treat shared input storage as read-only.
+
+An `EncoderGroup` with `build_batched_input=None` passes the declared fields
+to the tower as keyword arguments. Each call batches compatible items of one
+modality across requests. It concatenates tensors along the declared item axis
+on their existing device and passes a single tensor through directly. Different
+non-item dimensions, dtypes, devices, or shared values require separate calls.
+A tower that needs a different layout can keep its custom builder. The runtime
+restores the embeddings to each request's prompt order.
 
 ## Processor Hooks
 

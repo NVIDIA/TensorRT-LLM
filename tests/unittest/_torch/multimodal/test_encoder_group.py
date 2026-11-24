@@ -15,12 +15,15 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
+    EncoderGroup,
     _lengths_by_modality,
     _reorder_embeds_by_manifest,
+    encode_multimodal_by_groups,
 )
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalItemMetadata,
+    MultimodalItemPartition,
     MultimodalParams,
 )
 
@@ -265,3 +268,63 @@ class TestReorderEmbedsByManifest:
         mp = _mp(buckets={})
         out = _reorder_embeds_by_manifest([(mp.item_metadata.item_refs, ())], {}, {})
         assert out.numel() == 0
+
+
+def _group_request(refs, lengths, buckets):
+    metadata = MultimodalItemMetadata(
+        refs,
+        output_embedding_lengths=lengths,
+        input_partitions={modality: {"pixels": MultimodalItemPartition()} for modality in buckets},
+    )
+    return MultimodalParams(
+        multimodal_data={**buckets, MULTIMODAL_ENCODER_ITEM_METADATA_KEY: metadata}
+    )
+
+
+def test_default_builder_batches_compatible_shapes_within_each_modality():
+    calls = []
+
+    def encode(pixels):
+        calls.append(pixels)
+        return pixels[:, :1]
+
+    image = torch.tensor([[1, 1], [2, 2]])
+    video = torch.tensor([[3, 3]])
+    wide = torch.tensor([[4, 4, 4]])
+    requests = [
+        _group_request(
+            [("image", 1), ("video", 0), ("image", 0)],
+            [1, 1, 1],
+            {"image": {"pixels": image}, "video": {"pixels": video}},
+        ),
+        _group_request([("image", 0)], [1], {"image": {"pixels": wide}}),
+        _group_request([("image", 0)], [1], {"image": {"pixels": torch.tensor([[5, 5]])}}),
+    ]
+    # An optional empty bucket has no items or partition declaration.
+    requests[1].multimodal_data["video"] = {}
+    out = encode_multimodal_by_groups([EncoderGroup(("image", "video"), encode)], requests)
+    assert out.flatten().tolist() == [2, 3, 1, 4, 5]
+    assert [tensor.shape for tensor in calls] == [(3, 2), (1, 3), (1, 2)]
+    assert calls[1] is wide and calls[2] is video
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_default_builder_splits_list_items_within_a_request(nested):
+    calls = []
+
+    def encode(pixels):
+        if nested:
+            pixels = [frames[0] for frames in pixels]
+        calls.append([value.shape for value in pixels])
+        return torch.stack([value.sum() for value in pixels])
+
+    small, wide = torch.tensor([1]), torch.tensor([2, 3])
+    if nested:
+        small, wide = [small], [wide]
+    requests = [
+        _group_request([("image", 1), ("image", 0)], [1, 1], {"image": {"pixels": [small, wide]}}),
+        _group_request([("image", 0)], [1], {"image": {"pixels": [small]}}),
+    ]
+    out = encode_multimodal_by_groups([EncoderGroup(("image",), encode)], requests)
+    assert calls == [[(1,), (1,)], [(2,)]]
+    assert out.tolist() == [5, 1, 1]
