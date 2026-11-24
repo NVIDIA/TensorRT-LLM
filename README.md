@@ -22,6 +22,9 @@ TensorRT LLM
 
 <!-- Use github markdown link to link for the latest blog since the doc build has not happened yet. When the doc build is updated, it should be updated to the webpage link. -->
 
+* [11/24] Modeling V2: Exploring a Refactor of Modeling Code for the Agent Era
+✨ [➡️ link](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog34_Modeling_V2_Exploring_a_Refactor_of_Modeling_Code_for_the_Agent_Era.md)
+
 * [11/24] TensorRT LLM for Reinforcement Learning: Powering the Fastest MLPerf Training v6.1 Qwen3.5 397B GRPO Result on NVIDIA Vera Rubin
 ✨ [➡️ link](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog36_TensorRT-LLM_for_Reinforcement_Learning_Fastest_MLPerf_Qwen3_5_397B_GRPO_on_Vera_Rubin.md)
 
