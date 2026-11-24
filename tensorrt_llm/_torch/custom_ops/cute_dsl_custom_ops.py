@@ -7,7 +7,7 @@ import itertools
 import math
 import os
 from dataclasses import replace
-from typing import ClassVar, Dict, List, Optional, Tuple, Type
+from typing import ClassVar, Dict, List, Optional, Sequence, Tuple, Type
 
 import torch
 
@@ -25,7 +25,6 @@ from ..cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
                               IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE,
                               IS_CUTLASS_DSL_RUBIN_AVAILABLE,
                               MXFP8_FUSED_FC12_RESET_MAX_ELEMENTS,
-                              mxfp8_fused_fc12_tuner_key_suffix,
                               reserved_max_active_clusters, sm_reserve)
 from ..locality_domain.autotune import tune_locality_domain_concurrent
 from ..locality_domain.runtime import LocalityDomainRuntime
@@ -84,8 +83,6 @@ def _dense_gemm_scheduler_modes(default: Tuple[str, ...]) -> Tuple[str, ...]:
 # Torch schema parsing rejects ``inf`` as a default value.
 SWIGLU_LIMIT_SCALAR_DISABLED = -1.0
 _CUDA_MAX_GRID_DIM_Z = 65_535
-# Largest extent a kernel taking an Int32 element count can address.
-_INT32_MAX = 2**31 - 1
 _CUTEDSL_FC2_N_TILE_SIZE_ENV = "TRTLLM_CUTEDSL_FC2_N_TILE_SIZE"
 _CUTEDSL_FC2_N_TILE_SIZES = (128, 256)
 
@@ -19606,16 +19603,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                   MMA tile M (no B-reuse in the fused kernel).
 
                 Tactic: ``(mma_tiler, mma_inst_shape, cluster_shape_mn,
-                scheduler, stream_weights, fc2_stream_weights)`` with
-                ``mma_tiler_m == mma_inst_m == tile_size``, ``mma_n in {128,
-                256}``, ``mma_tiler_k in {128, 256}`` (``UMMA_K = 64`` for
-                FP8), ``cluster_shape_mn == (cta_group, 1)``, ``scheduler in
-                {"l2_atomic", "static"}``, ``stream_weights`` selecting L2
-                evict-first weight loads and ``fc2_stream_weights`` the same
-                policy for the FC2 weight loads alone. Shorter tactics from
-                caches normalize: four elements mean ``stream_weights=False``,
-                five mean the FC2 loads follow ``stream_weights``. The tactic
-                space ties the FC2 policy to ``stream_weights``.
+                scheduler, stream_weights)`` with ``mma_tiler_m == mma_inst_m
+                == tile_size``, ``mma_n in {128, 256}``, ``mma_tiler_k in {128,
+                256}`` (``UMMA_K = 64`` for FP8), ``cluster_shape_mn ==
+                (cta_group, 1)``, ``scheduler in {"l2_atomic", "static"}`` and
+                ``stream_weights`` selecting L2 evict-first loads of the FC1
+                and FC2 weights.
                 """
                 kernel_class = Sm107Mxfp8BlockScaledContiguousGroupedGemmFusedFc12Kernel
                 kernel_cache = dict()
@@ -19628,13 +19621,22 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 mma_tiler_k_candidates = (128, 256)
                 mma_n_candidates = (128, 256)
                 scheduler_candidates = ("l2_atomic", "static")
-                # L2 evict-first weight loads pay off once most M tiles read
-                # their expert's weights exactly once (decode with many active
-                # experts per rank) and lose when weights are reused across M
-                # tiles, so the autotuner picks it per token bucket.
+                # L2 evict-first weight loads keep the routed activations and
+                # the FC1 intermediate in L2. With L2 flushed before each run,
+                # as serving finds it after the other layers, they win by a
+                # few percent at most token counts and lose by as much at
+                # some, under either gather, so the autotuner picks per
+                # bucket.
                 stream_weights_candidates = (False, True)
+                # Every profiled run first reads this many bytes, so the
+                # weights come from HBM as in serving, where a layer's experts
+                # leave L2 before the layer runs again.
+                cold_l2_flush_bytes = 256 << 20
                 # The FC1 SFA gather fetches 16-byte chunks of scales per row.
                 fc1_k_alignment = 16 * MXFP8_FUSED_FC12_SF_VEC_SIZE
+                # Int32 slots per 128-byte line: the work-ID counters each
+                # take a line of their own in the per-launch workspace.
+                int32_per_line = 128 // 4
 
                 def __init__(self,
                              num_experts: int,
@@ -19669,6 +19671,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             f"{self.__class__.kernel_class.__name__} supports "
                             f"tile_size 128 and 256 only, but got {self.tile_size}"
                         )
+                    # Maps padded routes to the tuning bucket's token count.
+                    self._bucket_helper = GroupedGemmInputsHelper(
+                        num_experts, top_k, num_local_experts,
+                        local_expert_offset, tile_size)
 
                 def unique_id(self) -> Tuple:
                     return (
@@ -19712,6 +19718,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     padding_bound = padded_routes - num_rows * self.top_k
                     return local_routes < padding_bound
 
+                def _sparse_gather_for_bucket(self, padded_routes: int) -> bool:
+                    """Gather variant of the tuning bucket ``padded_routes`` maps to.
+
+                    Tactics are tuned, cached and primed per power-of-two token
+                    bucket, so the variant is decided at the bucket's shape:
+                    every row count in one bucket compiles and runs the kernel
+                    that tuning and priming built for it.
+                    """
+                    helper = self._bucket_helper
+                    num_rows = last_positive_power_of_2(
+                        helper.infer_num_tokens(padded_routes))
+                    return self._use_sparse_gather(
+                        num_rows, helper.get_max_num_permuted_tokens(num_rows))
+
                 def _default_tactic(self) -> Tuple:
                     return (
                         (self.tile_size, 128, 128),
@@ -19719,24 +19739,22 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         (self.cta_group, 1),
                         "l2_atomic",
                         False,
-                        False,
                     )
 
                 @staticmethod
-                def _normalize_tactic(tactic: Tuple) -> Tuple:
-                    # Shorter tactics come from caches or precomputed strings
-                    # predating a policy element: four elements keep the
-                    # default policy, five let the FC2 loads follow
-                    # ``stream_weights``.
+                def _normalize_tactic(tactic: Sequence) -> Tuple:
+                    """Tuple form of a tactic read back from JSON or a string."""
+                    if len(tactic) != 5:
+                        raise ValueError(
+                            "MXFP8 fused FC12 tactic needs 5 elements (mma_tiler, "
+                            "mma_inst_shape, cluster_shape_mn, scheduler, "
+                            f"stream_weights), got {tactic!r}")
                     (mma_tiler, mma_inst_shape, cluster_shape_mn, scheduler,
-                     *rest) = tactic
-                    stream_weights = bool(rest[0]) if rest else False
-                    fc2_stream_weights = (bool(rest[1])
-                                          if len(rest) > 1 else stream_weights)
+                     stream_weights) = tactic
                     return (tuple(int(v) for v in mma_tiler),
                             tuple(int(v) for v in mma_inst_shape),
                             tuple(int(v) for v in cluster_shape_mn),
-                            str(scheduler), stream_weights, fc2_stream_weights)
+                            str(scheduler), bool(stream_weights))
 
                 def _is_tactic_feasible(self, mma_tiler: Tuple[int, int, int],
                                         mma_inst_shape: Tuple[int, int, int],
@@ -19820,7 +19838,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             continue
                         valid_tactics.append(
                             (mma_tiler, mma_inst_shape, cluster_shape_mn,
-                             scheduler, stream_weights, stream_weights))
+                             scheduler, stream_weights))
 
                     logger.debug(
                         f"CuteDSL Rubin MXFP8 FusedFC12: Found {len(valid_tactics)} "
@@ -19855,6 +19873,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                                helper.infer_shape_num_tokens),
                             ),
                             inputs_pre_hook=helper.inputs_pre_hook,
+                            cold_l2_flush_bytes=self.cold_l2_flush_bytes,
                         )
                     return self.__class__.tuning_config_cache[key]
 
@@ -19947,15 +19966,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     assert output.size(1) == fc2_n
                     assert token_final_scales.size() == (num_tokens, self.top_k)
 
-                    if isinstance(tactic,
-                                  (tuple, list)) and len(tactic) in (4, 5, 6):
-                        (mma_tiler, mma_inst_shape, cluster_shape_mn, scheduler,
-                         stream_weights,
-                         fc2_stream_weights) = self._normalize_tactic(tactic)
-                    else:
-                        (mma_tiler, mma_inst_shape, cluster_shape_mn, scheduler,
-                         stream_weights,
-                         fc2_stream_weights) = self._default_tactic()
+                    # The fallback tactic is -1 (or None).
+                    (mma_tiler, mma_inst_shape, cluster_shape_mn, scheduler,
+                     stream_weights) = (self._normalize_tactic(tactic)
+                                        if isinstance(tactic, (tuple, list))
+                                        else self._default_tactic())
                     assert mma_tiler[0] == self.tile_size, (
                         f"Tactic ({tactic}) is incompatible with tile size "
                         f"({self.tile_size})")
@@ -19992,23 +20007,26 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                           device=fc1_sfa.device)
                     # Per-launch zeroed workspace: FC1->FC2 readiness counters
                     # (one per 128-row M tile is an upper bound for every tile
-                    # geometry) and the two L2-atomic work-ID counters on their
-                    # own 128 B lines. One uninitialized allocation per call,
-                    # cleared by the reset launch below (no fill kernels). The
-                    # caching allocator is stream-ordered, so calls in flight
-                    # on different streams (chunk overlap) get distinct
-                    # buffers, and CUDA graphs capture fixed addresses from
-                    # their private pool.
+                    # geometry), padded to whole 128-byte lines, then the two
+                    # L2-atomic work-ID counters, each on a line of its own.
+                    # One uninitialized allocation per call, cleared by the
+                    # reset launch below (no fill kernels). The caching
+                    # allocator is stream-ordered, so calls in flight on
+                    # different streams (chunk overlap) get distinct buffers,
+                    # and CUDA graphs capture fixed addresses from their
+                    # private pool.
+                    line = self.int32_per_line
                     num_ready = m // 128
-                    ready_words = (num_ready + 31) // 32 * 32
-                    workspace = torch.empty(ready_words + 64,
+                    fc1_counter_at = pad_up(num_ready, line)
+                    fc2_counter_at = fc1_counter_at + line
+                    workspace = torch.empty(fc2_counter_at + line,
                                             dtype=torch.int32,
                                             device=fc1_a.device)
                     fc1_ready = workspace[:num_ready]
-                    fc1_scheduler_counter = workspace[ready_words:ready_words +
-                                                      1]
-                    fc2_scheduler_counter = workspace[ready_words +
-                                                      32:ready_words + 33]
+                    fc1_scheduler_counter = workspace[
+                        fc1_counter_at:fc1_counter_at + 1]
+                    fc2_scheduler_counter = workspace[
+                        fc2_counter_at:fc2_counter_at + 1]
 
                     def _e4m3_ptr(t: torch.Tensor) -> cute.Pointer:
                         return make_ptr(cutlass.Float8E4M3FN,
@@ -20060,15 +20078,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     max_active_clusters = get_max_activate_clusters(
                         cluster_shape_mn[0] * cluster_shape_mn[1])
 
-                    # Static-shape choice (see _use_sparse_gather), so it is
-                    # fixed per CUDA-graph bucket.
-                    sparse_gather = self._use_sparse_gather(orig_m, m)
+                    # Decided per tuning bucket, like the tactic.
+                    sparse_gather = self._sparse_gather_for_bucket(m)
 
                     cache_key = (self.tile_size, self.top_k, mma_tiler,
                                  mma_inst_shape, cluster_shape_mn, scheduler,
                                  self.swiglu_limit, max_active_clusters,
-                                 sparse_gather, stream_weights,
-                                 fc2_stream_weights)
+                                 sparse_gather, stream_weights)
                     if cache_key not in self.__class__.kernel_cache:
                         gemm = self.__class__.kernel_class(
                             self.sf_vec_size,
@@ -20082,7 +20098,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             scheduler=scheduler,
                             sparse_gather=sparse_gather,
                             stream_weights=stream_weights,
-                            fc2_stream_weights=fc2_stream_weights,
+                            fc2_stream_weights=stream_weights,
                         )
                         sf_vec_cx = self.sf_vec_size
                         tile_size_cx = self.tile_size
@@ -20279,10 +20295,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     input_dtype = None
                     if input_unquantized is not None:
                         input_dtype = input_unquantized.dtype
-                        raw_dtype = (cutlass.BFloat16 if input_dtype
-                                     == torch.bfloat16 else cutlass.Float16)
                         quant_args = dict(input_raw_ptr=make_ptr(
-                            raw_dtype,
+                            _TORCH_TO_CUTLASS_DTYPE[input_dtype],
                             input_unquantized.data_ptr(),
                             cute.AddressSpace.gmem,
                             assumed_align=16),
@@ -20297,7 +20311,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         compiled_reset = cute.compile(
                             reset_fc12_sync_workspace,
                             fc1_ready_ptr,
-                            cutlass.Int32(m // 128),
+                            cutlass.Int32(num_ready),
                             fc1_scheduler_counter_ptr,
                             fc2_scheduler_counter_ptr,
                             output_ptr,
@@ -20311,7 +20325,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             reset_key] = compiled_reset
                     compiled_reset(
                         fc1_ready_ptr,
-                        cutlass.Int32(m // 128),
+                        cutlass.Int32(num_ready),
                         fc1_scheduler_counter_ptr,
                         fc2_scheduler_counter_ptr,
                         output_ptr,
@@ -20425,7 +20439,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     fc1_norm_const, fc2_weight, fc2_weight_scale, fc2_alpha,
                     output, token_final_scales
                 ]
-                tuner_key += mxfp8_fused_fc12_tuner_key_suffix(input.dtype)
                 if precomputed_tactic is None:
                     _, best_tactic = tuner.choose_one(
                         tuner_key,

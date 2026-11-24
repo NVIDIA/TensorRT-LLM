@@ -27,10 +27,7 @@ FC12 kernel the NVFP4 leaf runs, so the two share no code here.
 import torch
 
 from .....autotuner import AutoTuner
-from .....cute_dsl_utils import (
-    MXFP8_FUSED_FC12_RESET_MAX_ELEMENTS,
-    mxfp8_fused_fc12_tuner_key_suffix,
-)
+from .....cute_dsl_utils import MXFP8_FUSED_FC12_RESET_MAX_ELEMENTS
 from .....model_config import ModelConfig
 from .....utils import ActivationType, AuxStreamType
 from ...activation import (
@@ -117,6 +114,12 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
     # instead of a separate ``mxfp8_quantize`` launch; larger, prefill-sized
     # inputs keep the native launch.
     FUSED_INPUT_QUANT_MAX_ELEMENTS = 1 << 24
+
+    # One tuner key for raw and prequantized input: the input quantization in
+    # the workspace reset costs the same for every tile size and kernel
+    # tactic, so timings taken with either input rank them the same, and a
+    # warmup that only sees one input dtype tunes the lookups of the other.
+    _TUNER_KEY = "CuteDslFusedMoE::run_moe_mxfp8"
 
     # The workspace reset indexes the output with Int32, so larger outputs
     # are cleared by the memset instead.
@@ -428,17 +431,12 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
         inputs = [x, token_selected_experts, token_final_scales, x_sf, moe_output]
         tuning_config = runner.get_tuning_config()
         _, best_tactic = tuner.choose_one(
-            self._tuner_key(x.dtype),
+            self._TUNER_KEY,
             [runner],
             tuning_config,
             inputs,
         )
         return runner(inputs, tactic=best_tactic)
-
-    @staticmethod
-    def _tuner_key(dtype: torch.dtype) -> str:
-        """Separate quantize/reset timing from the prequantized op cache."""
-        return "CuteDslFusedMoE::run_moe_mxfp8" + mxfp8_fused_fc12_tuner_key_suffix(dtype)
 
     def _memset_moe_output(
         self,

@@ -640,8 +640,12 @@ finalize (scatter-add) into one persistent kernel, driven through
   `FUSED_INPUT_QUANT_MAX_ELEMENTS` are passed through unquantized, with
   `x_sf=None`, and quantized inside the op's workspace-reset launch
   (`fused_fc12_mxfp8_workspace.py` / `mxfp8_input_quant.py`, bit-compatible
-  with `mxfp8_quantize` for finite inputs), saving the separate quantize
-  launch.
+  with `mxfp8_quantize` for finite inputs; a 32-element block holding a NaN
+  gets scale 0xFF and its finite values quantize to zero), saving the
+  separate quantize launch. Raw and prequantized inputs share one tuner key at
+  both levels (the leaf's tile choice and the op's kernel tactic): the
+  quantization costs the same for every candidate, so a warmup that sees only
+  one input dtype tunes the lookups of the other.
 - Weights: e4m3 `[E, 2I, H]` / `[E, H, I]` with block scales in the 128x4
   swizzled layout produced by `block_scale_interleave` (int32-packed storage,
   viewed as bytes). FC1 weight and scales are gate/up interleaved at
@@ -664,13 +668,16 @@ finalize (scatter-add) into one persistent kernel, driven through
   so calls in flight on different streams, such as overlapped chunks, never
   share them.
 - Tactic = `(mma_tiler, mma_inst_shape, cluster_shape_mn, scheduler,
-  stream_weights, fc2_stream_weights)` with
+  stream_weights)` with
   `mma_tiler_m == routing tile_size in {128, 256}`, `mma_n in {128, 256}`,
   `mma_tiler_k in {128, 256}`, cluster `(cta_group, 1)`, scheduler
   `l2_atomic` / `static`, and L2 evict-first weight loads for both GEMMs
-  (`stream_weights`); `fc2_stream_weights` sets the FC2 loads alone and the
-  tactic space ties it to `stream_weights`. Shorter tactics from older
-  caches normalize.
+  (`stream_weights`); a tactic of any other length raises. The op profiles
+  with a 256 MiB L2 flush before every run (`cold_l2_flush_bytes`), so the
+  weights come from HBM as in serving. The FC1 A gather variant (sparse for
+  mostly padded tiles, static otherwise) is decided at the shape of the
+  tuning bucket, so every row count in a bucket runs the kernel that tuning
+  and priming compiled for it.
   The outer `CuteDslFusedMoEMxfp8Runner` tunes the routing tile with its
   power-of-two buckets anchored to `moe_tune_max_num_tokens` (so a small
   warmup still profiles the larger buckets, up to that cap), and the comb
