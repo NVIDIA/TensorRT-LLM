@@ -18,7 +18,9 @@ import weakref
 from collections.abc import Callable
 from dataclasses import dataclass
 from types import TracebackType
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
+
+import torch
 
 from tensorrt_llm import _profiler
 from tensorrt_llm._torch.disaggregation.base.transfer import get_wire_request_id
@@ -32,9 +34,6 @@ from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm.bindings import LlmRequestState
-
-if TYPE_CHECKING:
-    import torch
 
 _Direction = Literal["send", "recv"]
 _OBSERVATION_ERRORS = (AttributeError, LookupError, TypeError, ValueError, RuntimeError, OSError)
@@ -349,9 +348,17 @@ class _ProfiledKvCacheTransceiver(KvCacheTransceiver):
         return result
 
     def respond_and_send_async(self, req: LlmRequest) -> None:
+        if not self._records and (
+            torch.compiler.is_compiling() or not torch.autograd._profiler_enabled()
+        ):
+            return self._transceiver.respond_and_send_async(req)
         return self._submit(req, "send", self._transceiver.respond_and_send_async)
 
     def request_and_receive_async(self, req: LlmRequest) -> None:
+        if not self._records and (
+            torch.compiler.is_compiling() or not torch.autograd._profiler_enabled()
+        ):
+            return self._transceiver.request_and_receive_async(req)
         return self._submit(req, "recv", self._transceiver.request_and_receive_async)
 
     def request_and_receive_sync(self, req: LlmRequest) -> None:
