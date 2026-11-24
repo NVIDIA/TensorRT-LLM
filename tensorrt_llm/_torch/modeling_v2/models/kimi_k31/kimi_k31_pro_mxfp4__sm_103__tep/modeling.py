@@ -115,7 +115,6 @@ from types import SimpleNamespace
 from typing import (
     TYPE_CHECKING,
     Any,
-    Callable,
     Dict,
     Iterator,
     List,
@@ -205,6 +204,9 @@ from tensorrt_llm._torch.modeling_v2.models.kimi_k31.ops.comm.allreduce_module i
     allreduce_module,
     tp_allreduce,
     uses_mnnvl,
+)
+from tensorrt_llm._torch.modeling_v2.models.kimi_k31.ops.common.host_datastack import (
+    run_on_large_datastack_chunk,
 )
 from tensorrt_llm._torch.modeling_v2.models.kimi_k31.ops.common.multi_stream import (
     do_multi_stream,
@@ -8911,55 +8913,6 @@ class DecodeTarget:
         )
 
 
-# ---------------------------------------------------------------------------
-# Host data stack: one interpreter data-stack chunk per forward.
-# ---------------------------------------------------------------------------
-#
-# Run a forward on one large chunk of the interpreter's data stack.
-#
-# CPython (3.11 and later) keeps the frames of Python calls on a per-thread data stack made of chunks (16 KiB unless a
-# frame needs more). A call whose frame does not fit in the current chunk maps a new chunk with ``mmap``, and that chunk
-# is unmapped again as soon as the call returns. An eager forward of this target reaches the end of a chunk inside its
-# CuTe DSL launch paths, so every launch maps and unmaps a chunk. In a disaggregated server UCX (loaded by the KV cache
-# transceiver) hooks ``munmap`` and records each unmapped range in its registration caches; before the first transfer
-# nothing drains those records, so every unmap gets slower and the CUDA-graph warmup's eager forwards spend most of
-# their host time in that hook.
-#
-# ``run_on_large_datastack_chunk`` calls the forward from a trampoline frame with ``DATASTACK_KIB`` KiB of locals. That
-# frame does not fit in the current chunk, so the interpreter maps one chunk of twice its size for it, and every frame
-# of the forward below it lands in the same chunk: one map and one unmap per forward instead of one per launch.
-# Host-side only; no kernel, launch or tensor changes.
-
-
-#: KiB of locals of the trampoline frame (half of the chunk it maps).
-DATASTACK_KIB = 512
-
-
-def _make_trampoline(num_locals: int) -> Callable[..., Any]:
-    """A function ``trampoline(fn, *args, **kwargs) -> fn(*args, **kwargs)`` whose frame holds ``num_locals`` locals
-    (assigned only in a branch that never runs, so they cost the frame's size and nothing else)."""
-    targets = " = ".join(f"_slot{i}" for i in range(num_locals))
-    source = (
-        "def run_on_large_datastack_chunk(fn, /, *args, **kwargs):\n"
-        "    if _NEVER:\n"
-        f"        {targets} = None\n"
-        "    return fn(*args, **kwargs)\n"
-    )
-    namespace = {"_NEVER": False}
-    exec(compile(source, "<kimi_k31 host_datastack>", "exec"), namespace)
-    return namespace["run_on_large_datastack_chunk"]
-
-
-_TRAMPOLINE = _make_trampoline(DATASTACK_KIB * 1024 // 8)
-
-
-def run_on_large_datastack_chunk(fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
-    """``fn(*args, **kwargs)``, with every Python frame below it on one data-stack chunk (see the module docstring)."""
-    if torch.compiler.is_compiling():
-        return fn(*args, **kwargs)
-    return _TRAMPOLINE(fn, *args, **kwargs)
-
-
 class ModelingV2KimiK31ProMxfp4Sm103Tep(KimiK31ForConditionalGeneration):
     """Kimi K3.1 Pro MXFP4, sm_103, attention TP perf layouts (TEP8, TEP16 MoE TP4 x EP4, TEP32 MoE TP4 x EP8)."""
 
@@ -8981,7 +8934,6 @@ class ModelingV2KimiK31ProMxfp4Sm103Tep(KimiK31ForConditionalGeneration):
         multimodal_params: Optional[List[MultimodalParams]] = None,
         **kwargs,
     ) -> torch.Tensor:
-        # One interpreter data-stack chunk for the whole forward (no chunk map / unmap per launch; see above).
         target = self._prefill if attn_metadata.num_contexts > 0 else self._decode
         return run_on_large_datastack_chunk(
             target.forward,

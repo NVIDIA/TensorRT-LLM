@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The engine hooks the Kimi K3.1 targets declare (``runtime.py``) and the count-first attention-DP admission."""
+"""Kimi K3.1 runtime hooks, forward execution and count-first attention-DP admission."""
 
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -17,6 +18,9 @@ from tensorrt_llm._torch.attention.backends.sparse.dsa.cache_manager import (
 )
 from tensorrt_llm._torch.modeling_v2.models.kimi_k31.ops.attention.dsa_cache import (
     is_dsa_cache_manager as is_k31_dsa_cache_manager,
+)
+from tensorrt_llm._torch.modeling_v2.models.kimi_k31.ops.common.host_datastack import (
+    run_on_large_datastack_chunk,
 )
 from tensorrt_llm._torch.modeling_v2.models.kimi_k31.ops.ssm.kda_dsa_cache_manager import (
     KimiK3DSAHybridCacheManager,
@@ -35,6 +39,20 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
+
+
+@pytest.mark.parametrize("compiling", [False, True])
+def test_forward_data_stack_reservation(compiling: bool, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: compiling)
+
+    def forward(token: object, *, position: int) -> tuple[object, int, int]:
+        return token, position, sys.getsizeof(sys._getframe(1))
+
+    token = object()
+    result, position, caller_frame_bytes = run_on_large_datastack_chunk(forward, token, position=7)
+    assert result is token
+    assert position == 7
+    assert (caller_frame_bytes >= 512 * 1024) == (not compiling)
 
 
 def _kimi_dsa_model_config():
