@@ -347,6 +347,16 @@ class FmhaManager:
         fmha_libs: Sequence[str | type[Fmha]] | None = None,
         use_fmha_libs_env: bool = True,
     ) -> None:
+        """Resolve and construct the available libraries for one layer.
+
+        Args:
+            attn: The owning attention layer.
+            fmha_libs: Ordered base FMHA names or classes. None selects the
+                defaults, and [] selects an empty base list. The layer's
+                legacy prepends are tried first.
+            use_fmha_libs_env: Apply TLLM_FMHA_LIBS to the base candidates.
+                Shared metadata uses the process-wide setting.
+        """
         self._cache: dict[_FmhaCacheKey, Fmha] = {}
         self._cache_inputs: dict[_FmhaCacheKey, _FmhaCacheInputs] = {}
         # Environment configuration is fixed for the manager lifetime so
