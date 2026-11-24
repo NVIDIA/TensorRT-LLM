@@ -151,6 +151,7 @@ Key files:
 - `tensorrt_llm/_torch/visual_gen/ENGINEERING_CRITERIA.md`: **Engineering criteria for any change under `tensorrt_llm/visual_gen/` or `tensorrt_llm/_torch/visual_gen/`** — API discipline, feature/test/lossy-vs-lossless requirements, examples & docs rules. Read before modifying anything in those trees.
 - `tensorrt_llm/visual_gen/`: VisualGen public Python API. **User-facing surface — before modifying anything here, pause and confirm with the user that a public API change is actually intended; do not infer it from the surrounding task.**
 - `tensorrt_llm/_torch/visual_gen/`: VisualGen internal implementation. All non-user-facing code belongs here.
+- Develop new MiniMax-H3 features in V2. See the [H3 Modeling V2 guide](tensorrt_llm/_torch/visual_gen/modeling_v2/models/minimax_h3/README.md) for target ownership, dependencies and validation.
 
 ## Anti-Patterns / Gotchas
 

@@ -5,44 +5,21 @@
 
 **Write new H3 features and kernels in `visual_gen/modeling_v2/models/minimax_h3/`.** A *target* is the pipeline for a particular checkpoint or deployment. Base H3 and FastH3 are targets in the same family. During rollout, [V1](../../../models/minimax_h3/) remains the default and is available for fixes and comparisons. V1 and V2 use the same VisualGen API, CLI and checkpoint names. [LLM Modeling V2 guide](../../../../modeling_v2/README.md)
 
-## Run a target
-
-**Set `TLLM_VISUALGEN_MODELING2_H3=1` on every worker before startup.** Set `H3_CHECKPOINT` to your checkpoint directory and run from the repository root.
-
-```bash
-TLLM_VISUALGEN_MODELING2_H3=1 python examples/visual_gen/models/minimax_h3.py \
-    --model "$H3_CHECKPOINT" \
-    --visual_gen_args examples/visual_gen/configs/minimax-h3-bf16-1gpu.yaml
-```
-
-The [router](pipeline_registry.py) selects a target before building the transformer. Each worker logs its choice in `AutoPipeline: Creating`.
-
-| Checkpoint | Target | Denoising steps |
-| --- | --- | --- |
-| Base H3 | [default_pipeline/](default_pipeline/) handles BF16, FP8, block-scaled FP8 and NVFP4 | The default is 50 sigma points including zero, giving 49 updates. |
-| FastH3 (`schema_version` starts with `fasth3-` in `fastvideo_inference.json`) | [fasth3/](fasth3/) | The checkpoint supplies the schedule. FastH3 8-Step V2 uses nine points and eight updates. |
-
-Block-scaled FP8 MLPs on SM100 and SM103 require the `catalog/activation` native extension from the matching wheel.
-
-For routed TRTLLM attention, use block-scaled Sage to quantize Q/K/V. The block-sparse runner executes per-tensor FP8 recipes in the input dtype. For VC repair, use KV lengths divisible by 128. With a partial final tile, PrimTS includes padded keys in the softmax denominator.
-
-## When to split a target
-
-**Split a target when a checkpoint or deployment needs a substantially different implementation.** It might need a different loading or execution mechanism, or enough conditional branches that two separate paths are easier to maintain. This can happen within a single stage.
-
-For example, an existing loader can unpack FP8 weights and convert their scales. If a checkpoint needs different modules, different allocations and a different order for loading shards, its own target can handle loading and still reuse the H3 forward pass. [FastH3](fasth3/pipeline.py) has its own target because it selects gated attention and uses the checkpoint’s trained denoising schedule.
-
-Use a checkpoint name for a target that supports several deployments, such as `fasth3/`. Name a deployment-specific target `<checkpoint-and-quantization>__<sm>__<parallel>/`. In [`route(config, checkpoint_dir)`](pipeline_registry.py), check precision, hardware, parallel layout and required features. Return the target class directly so CI can find it. If the deployment does not match, **return the default target for that checkpoint**. The selected pipeline makes decisions that depend on the request or denoising step.
-
-## Where to put code
-
-### Code layout
+## Code layout
 
 | Location | What belongs here |
 | --- | --- |
 | `visual_gen/modeling_v2/models/<family>/<target>/` | Code **specific to one checkpoint or deployment**. |
 | `visual_gen/modeling_v2/models/<family>/` | The router and **H3 code used by multiple targets**. Each target imports shared components from the family. |
 | `visual_gen/modeling_v2/catalog/` | **Model-agnostic operations only.** Another family must be able to pass its own tensors to the same op without adding model-specific branches. H3 can be the first caller. The catalog defines the inputs and expected results, provides a reference, and tests each implementation against it. |
+
+### When to split a target
+
+**Split a target when a checkpoint or deployment needs a substantially different implementation.** It might need a different loading or execution mechanism, or enough conditional branches that two separate paths are easier to maintain. This can happen within a single stage.
+
+For example, an existing loader can unpack FP8 weights and convert their scales. If a checkpoint needs different modules, different allocations and a different order for loading shards, its own target can handle loading and still reuse the H3 forward pass. [FastH3](fasth3/pipeline.py) has its own target because it selects gated attention and uses the checkpoint’s trained denoising schedule.
+
+Use a checkpoint name for a target that supports several deployments, such as `fasth3/`. Name a deployment-specific target `<checkpoint-and-quantization>__<sm>__<parallel>/`. In [`route(config, checkpoint_dir)`](pipeline_registry.py), check precision, hardware, parallel layout and required features. Return the target class directly so CI can find it. If the deployment does not match, **return the default target for that checkpoint**. The selected pipeline makes decisions that depend on the request or denoising step.
 
 ### Implementation layers
 
@@ -74,7 +51,7 @@ TP       project local heads -> attention -> output projection and sum across ra
 Ulysses  local tokens -> exchange Q/K/V -> compute attention for local heads over the full sequence -> return exchange
 ```
 
-### Allowed dependencies
+## Allowed dependencies
 
 **Keep model implementations self-contained in V2, from op to kernel.** First look for an op in the LLM or VisualGen V2 catalog. If none fits, implement the op and any kernel it needs in V2. Put model-specific code in the H3 family or target, and model-agnostic ops that other families can use unchanged in the VisualGen V2 catalog.
 
@@ -85,6 +62,27 @@ H3 can also use public third-party APIs such as PyTorch and FlashInfer, and Visu
 **List every V1 backend dependency in the PR description.** For a migration, check model construction, weight loading and execution. Follow catalog calls, runtime adapters, fallbacks and registered `torch.ops` or `torch.classes` names to their implementations. For each exception, name the V2 caller, the repository path and symbol it reaches, and the specific capability that justifies reuse. Reviewers check that each entry point and its fallbacks keep model decisions in V2. If the audit finds no exceptions, say so.
 
 For example, the [V2 SOL predictor](../../catalog/attention/sol_predictor.py) calls [`visual_gen_sol_predictor`](../../../attention/backends/sparse/sol/kernels.py) to compute block predictions from Q/K/V. H3 decides which layers and denoising steps use those predictions. Other shared implementations include [CuTe sparse kernels](../../../cute_dsl_kernels/blackwell/video_sparse_attention/), [PrimTS runners](../../../../attention/backends/prims_ts/) and the [block-scaled FP8 GEMM](ops/quantized_gemm.py) that uses the shared Blackwell low-M kernel.
+
+## Run a target
+
+**Set `TLLM_VISUALGEN_MODELING2_H3=1` on every worker before startup.** Set `H3_CHECKPOINT` to your checkpoint directory and run from the repository root.
+
+```bash
+TLLM_VISUALGEN_MODELING2_H3=1 python examples/visual_gen/models/minimax_h3.py \
+    --model "$H3_CHECKPOINT" \
+    --visual_gen_args examples/visual_gen/configs/minimax-h3-bf16-1gpu.yaml
+```
+
+The [router](pipeline_registry.py) selects a target before building the transformer. Each worker logs its choice in `AutoPipeline: Creating`.
+
+| Checkpoint | Target | Denoising steps |
+| --- | --- | --- |
+| Base H3 | [default_pipeline/](default_pipeline/) handles BF16, FP8, block-scaled FP8 and NVFP4 | The default is 50 sigma points including zero, giving 49 updates. |
+| FastH3 (`schema_version` starts with `fasth3-` in `fastvideo_inference.json`) | [fasth3/](fasth3/) | The checkpoint supplies the schedule. FastH3 8-Step V2 uses nine points and eight updates. |
+
+Block-scaled FP8 MLPs on SM100 and SM103 require the `catalog/activation` native extension from the matching wheel.
+
+For routed TRTLLM attention, use block-scaled Sage to quantize Q/K/V. The block-sparse runner executes per-tensor FP8 recipes in the input dtype. For VC repair, use KV lengths divisible by 128. With a partial final tile, PrimTS includes padded keys in the softmax denominator.
 
 ## Test a change
 
