@@ -648,7 +648,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             raise ValueError(f"topk_index_dtype must be Int32 or Int64, got {self.topk_index_dtype}.")
         if self.reduce_topk_in_kernel and not self.apply_topk_at_fc1:
             raise ValueError("In-kernel top-k reduction requires apply_topk_at_fc1=True.")
-        if self.token_back_mode == "hybrid_warps" and not self.combine_dedup:
+        if self.token_back_mode == "hybrid_warps" and not self.combine_dedup:  # nosec B105 -- mode name, not a credential
             raise ValueError("token_back_mode='hybrid_warps' exists only in the combine-dedup token_back.")
         if self.combine_dedup:
             if self.topk > TokenSrcMetadata.MAX_TOPK or self.world_size > TokenSrcMetadata.MAX_RANKS:
@@ -667,7 +667,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 raise ValueError("combine_dedup supports the BF16 combine format only.")
             if self.world_size > 32:
                 raise ValueError("combine_dedup keeps the destination-rank mask in an Int32; world_size must be <= 32.")
-            if self.token_back_mode == "epi_warps":
+            if self.token_back_mode == "epi_warps":  # nosec B105 -- mode name, not a credential
                 raise ValueError(
                     "combine_dedup pushes the reduced rank-major rows from the combine warps; use "
                     "reuse_dispatch_warps, standalone_warps or hybrid_warps."
@@ -821,7 +821,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             raise ValueError("The ring workspace requires schedule_policy phase_interleave.")
         if self.internode:
             raise NotImplementedError("The ring workspace does not support the internode component.")
-        if self.token_back_mode == "reuse_dispatch_warps":
+        if self.token_back_mode == "reuse_dispatch_warps":  # nosec B105 -- mode name, not a credential
             # Not supported, with combine_dedup or without. Without it the local FC2 output of this mode, the
             # largest pool, could never join the ring.
             raise NotImplementedError(
@@ -913,7 +913,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         FC2 output for combine warps of its own: that output is on the way of a block, and the last reader of
         the block is the combine. In every other mode a ring goes with, the last reader is the FC2 operand load.
         """
-        return self.token_back_mode == "standalone_warps" and not self.combine_dedup
+        return self.token_back_mode == "standalone_warps" and not self.combine_dedup  # nosec B105 -- mode name, not a credential
 
     @property
     def ring_covers_fc2_output(self) -> bool:

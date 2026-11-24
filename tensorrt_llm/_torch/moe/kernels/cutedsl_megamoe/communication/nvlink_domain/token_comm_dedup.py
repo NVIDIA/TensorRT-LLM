@@ -1496,7 +1496,7 @@ class TokenCommDedup(KernelComponent):
                     f"dedup_poll_max_sleep_ns must be >= {self.fc2_done_wait_sleep_ns}, got {poll_max_sleep_ns}."
                 )
             self.fc2_done_wait_sleep_max_ns = int(poll_max_sleep_ns)
-        if self.epilogue_tail_combine and self.token_back_schedule_mode != "atomic_counter":
+        if self.epilogue_tail_combine and self.token_back_schedule_mode != "atomic_counter":  # nosec B105 -- mode name, not a credential
             raise ValueError("dedup_epilogue_tail_combine needs the atomic-counter token_back schedule (late joiners claim).")
         self._validate_configuration()
         self._router = _DedupMetadataPushRouter(problem_desc, impl_desc)

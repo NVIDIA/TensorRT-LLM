@@ -1623,14 +1623,14 @@ class TokenCommNonDeterministic(KernelComponent):
         if dispatch_stage_depth != 1:
             # The staged token_in loop has no ring rows and no admission.
             raise NotImplementedError("The ring workspace requires comm_stage_depths[0]=1.")
-        if token_back_mode == "standalone_warps":
+        if token_back_mode == "standalone_warps":  # nosec B105 -- mode name, not a credential
             # The local FC2 output of this mode is in the ring (fc2_output_in_ring).
             if combine_stage_depth != 1:
                 # _token_back_multi_stage reads chunks ahead of the token it pushes and knows no ring rows.
                 raise NotImplementedError(
                     "The ring workspace with the local FC2 output in it requires comm_stage_depths[1]=1."
                 )
-            if token_back_schedule_mode != "atomic_counter":
+            if token_back_schedule_mode != "atomic_counter":  # nosec B105 -- mode name, not a credential
                 # This component's existing rule for FC2 completion per token tile (_validate_configuration:
                 # "token_tile return-ready requires ... atomic_counter"), applied under the ring's name because
                 # the ring asked for that count, not its caller. A static token-back schedule with the local FC2
@@ -1753,7 +1753,7 @@ class TokenCommNonDeterministic(KernelComponent):
         lacks. epi_warps has no local FC2 output to ring (it pushes from the epilogue), and the kernels refuse a
         ring with reuse_dispatch_warps.
         """
-        return self.ring_enabled and self.token_back_mode == "standalone_warps"
+        return self.ring_enabled and self.token_back_mode == "standalone_warps"  # nosec B105 -- mode name, not a credential
 
     @property
     def fc2_output_token_count(self) -> int:

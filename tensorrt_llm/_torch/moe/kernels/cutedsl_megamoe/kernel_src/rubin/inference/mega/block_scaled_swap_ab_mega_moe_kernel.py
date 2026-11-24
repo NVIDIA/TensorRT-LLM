@@ -262,7 +262,7 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
             raise ValueError(f"epilogue_warpgroups must be 1 or 2, got {self.epilogue_warpgroups!r}.")
         self.two_epilogue_warpgroups = self.epilogue_warpgroups == 2
         if self.two_epilogue_warpgroups and (
-            self.token_back_mode != "epi_warps" or self.combine_dedup or self.comm_clusters > 0
+            self.token_back_mode != "epi_warps" or self.combine_dedup or self.comm_clusters > 0  # nosec B105 -- mode name, not a credential
         ):
             raise ValueError(
                 "epilogue_warpgroups=2 requires token_back_mode epi_warps, no combine dedup and no communication "
@@ -848,7 +848,7 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
             raise ValueError("The ring workspace requires schedule_policy phase_interleave.")
         if self.comm_clusters > 0:
             raise NotImplementedError("The ring workspace does not support the communication CTA split.")
-        if self.token_back_mode == "reuse_dispatch_warps":
+        if self.token_back_mode == "reuse_dispatch_warps":  # nosec B105 -- mode name, not a credential
             # Not supported, with combine_dedup or without. Without it the local FC2 output of this mode, the
             # largest pool, could never join the ring.
             raise NotImplementedError(
@@ -908,7 +908,7 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
         FC2 output for combine warps of its own: that output is on the way of a block, and the last reader of
         the block is the combine. In every other mode a ring goes with, the last reader is the FC2 operand load.
         """
-        return self.token_back_mode == "standalone_warps" and not self.combine_dedup
+        return self.token_back_mode == "standalone_warps" and not self.combine_dedup  # nosec B105 -- mode name, not a credential
 
     @property
     def ring_covers_fc2_output(self) -> bool:
@@ -1651,7 +1651,7 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
         if (
             self.shared_expert
             and request in (None, "auto")
-            and self.token_back_mode == "epi_warps"
+            and self.token_back_mode == "epi_warps"  # nosec B105 -- mode name, not a credential
             and self.max_tokens_per_rank >= 8192
         ):
             return "early"
