@@ -26,7 +26,8 @@ The kernel is FlashInfer's TGV GEMM (``flashinfer.gemm.kernels.tgv_gemm_cute_ext
 CTA per (cta_m weight rows, cta_n tokens) tile over the full K, weights loaded before ``griddepcontrol.wait``)
 with one change: the epilogue of a tile stores into the output of the row block the tile belongs to (row
 blocks are multiples of cta_m rows). The FP32 accumulation is the TGV kernel's, so a BF16 block is bitwise
-TGV's output for the packed weight, and an FP32 block is that accumulator before the cast.
+TGV's output for the packed weight, and an FP32 block is that accumulator before the cast. The kernel class
+subclasses ``tgv_gemm.TgvGemmKernel``, so 2-CTA tactics get its pair-synchronized teardown.
 """
 
 from __future__ import annotations
@@ -44,15 +45,12 @@ try:
     import cutlass.utils.blackwell_helpers as sm100_utils
     from cutlass.cute import experimental as cute_ext
     from cutlass.cute.runtime import from_dlpack, make_fake_stream
-    from flashinfer.gemm.kernels.tgv_gemm_cute_ext import (
-        TgvGemmCuteExtKernel,
-        WorkTileInfo,
-        _resolve_tactic,
-    )
+
+    from .tgv_gemm import TgvGemmKernel, WorkTileInfo, tactic_config
 
     IS_AVAILABLE = True
 except ImportError:  # pragma: no cover - FlashInfer / CuTe DSL without the TGV CuTe kernel
-    TgvGemmCuteExtKernel = object
+    TgvGemmKernel = object
     IS_AVAILABLE = False
 
 #: Largest number of row blocks one launch stores.
@@ -63,7 +61,7 @@ if IS_AVAILABLE:
     _TORCH_TO_CUTLASS = {torch.bfloat16: cutlass.BFloat16, torch.float32: cutlass.Float32}
 
 
-class _TgvMultiOutKernel(TgvGemmCuteExtKernel):
+class _TgvMultiOutKernel(TgvGemmKernel):
     """TGV with the epilogue store routed to one of up to three output tensors by the tile's weight-row block."""
 
     def __init__(self, block_tiles: tuple, grid_tiles: int, **tgv_kwargs):
@@ -104,7 +102,7 @@ class _TgvMultiOutKernel(TgvGemmCuteExtKernel):
     def kernel(
         self, mA: cute.Tensor, mB: cute.Tensor, mC0: cute.Tensor, mC1: cute.Tensor, mC2: cute.Tensor
     ):
-        """TgvGemmCuteExtKernel.kernel (no bias) with the per-block output selection in the epilogue warps."""
+        """``TgvGemmKernel.kernel`` (no bias) with the per-block output selection in the epilogue warps."""
         DMA_Stage = self.num_ab_stage
         a_major = utils.LayoutEnum.from_tensor(mA).mma_major_mode()
         b_major = utils.LayoutEnum.from_tensor(mB).mma_major_mode()
@@ -237,6 +235,9 @@ class _TgvMultiOutKernel(TgvGemmCuteExtKernel):
                 gD = cute.local_tile(mC2, c_tiler_mn, (work.M_idx - e1, work.N_idx, work.L_idx))
                 self._store_block(mC2, gD, *barriers, acc_layout, epi_tid)
 
+        # 2-CTA: both CTAs of the pair meet before the TMEM dealloc and again before exit (see tgv_gemm).
+        self.pair_teardown(warp_idx, tmem_base_ptr)
+
     @cute.experimental.jit
     def _store_block(
         self,
@@ -295,7 +296,7 @@ def _cute(t: torch.Tensor, leading_dim: int):
 
 @functools.cache
 def _compiled(tactic: int, use_pdl: bool, block_tiles: tuple, grid_tiles: int, out_dtypes: tuple):
-    cta_m, cta_n, stages, use_2cta = _resolve_tactic(tactic)
+    cta_m, cta_n, stages, use_2cta = tactic_config(tactic)
     gemm = _TgvMultiOutKernel(
         block_tiles,
         grid_tiles,
@@ -319,7 +320,7 @@ def _compiled(tactic: int, use_pdl: bool, block_tiles: tuple, grid_tiles: int, o
 
 def tactic_cta_m(tactic: int) -> int:
     """Weight rows per CTA tile of a TGV tactic (each output block must be a multiple of it)."""
-    return _resolve_tactic(tactic)[0]
+    return tactic_config(tactic)[0]
 
 
 def can_use(

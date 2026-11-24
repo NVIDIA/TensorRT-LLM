@@ -692,10 +692,13 @@ def planned_low_m_linear(
         tactic = DirectTactic(choice[1], choice[2], m)
         return run_direct_dense(input_tensor, weight.t(), out, get_env_enable_pdl(), tactic)
     if choice[0] == "tgv":
-        from flashinfer.gemm.kernels.tgv_gemm_cute_ext import run_tgv_cute_ext
+        # FlashInfer 0.6.18's TGV kernel with its 2-CTA teardown synchronized
+        # across the CTA pair (kernels/blackwell/tgv_gemm): the stock kernel
+        # can fault with "cluster target block not present" (Xid 13).
+        from ..kernels.blackwell.tgv_gemm import run_tgv, tactic_config
 
-        return run_tgv_cute_ext(
-            input_tensor, weight.t(), None, out, get_env_enable_pdl(), choice[1]
+        return run_tgv(
+            input_tensor, weight.t(), out, get_env_enable_pdl(), tactic_config(choice[1])
         )
     from flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk import SplitKTactic, run_splitk_dense
 
