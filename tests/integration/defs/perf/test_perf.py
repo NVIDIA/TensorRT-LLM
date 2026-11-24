@@ -1527,6 +1527,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             return [
                 "env",
                 "AGENTX_DURATION=3600",
+                # Cover warmup, benchmark grace, and dataset preparation.
+                "AGENTX_TIMEOUT_GRACE=2400",
                 "AGENTX_MAX_CTX=1048576",
                 "AGENTX_WARMUP_PER_LANE=10",
                 "AGENTX_EXTRA_ARGS=--benchmark-grace-period 30 "
