@@ -1140,7 +1140,38 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
                     // Release Torch's RecordFunction ABI requires NDEBUG; retain symbols with RelWithDebInfo.
                     buildWheelInContainer(pipeline, [], X86_64_TRIPLE, false, false, "-a '90' -b RelWithDebInfo --micro_benchmarks -D ENABLE_NANOBIND_PROFILING=ON -D ENABLE_NCCL_PROFILING=ON --extra-make-targets profilerTest", true, tarName)
                     sh "cd ${LLM_ROOT} && ./cpp/build_RelWithDebInfo/tests/unit_tests/common/profilerTest --gtest_output=xml:profiler-test-results.xml"
-                    sh """python3 -c 'import xml.etree.ElementTree as ET; cases = ET.parse("${LLM_ROOT}/profiler-test-results.xml").findall(".//testcase"); assert len(cases) == 13, "profiling build must run all 13 native cases"; assert all(case.get("status") == "run" and all(case.find(kind) is None for kind in ("skipped", "failure", "error")) for case in cases), "native profiler cases must pass without skips"'"""
+                    sh """python3 - "${LLM_ROOT}/profiler-test-results.xml" <<'PYTHON'
+                        |import sys
+                        |import xml.etree.ElementTree as ET
+                        |
+                        |required = {
+                        |    "ProfilerStartupDeathTest.SharedSelectorCasesAreCached",
+                        |    "ProfilerStartupDeathTest.ObservationFailureWarnsOnceAndPreservesOperationException",
+                        |    "ProfilerStartupDeathTest.ProbesBeforeStartupNeverParseInvalidConfiguration",
+                        |    "ProfilerStartupDeathTest.NoneSelectionNeverEvaluatesFactoriesOrEmitsScopes",
+                        |    "ProfilerStartupDeathTest.CallbackProbeAllocationFailurePreservesOperationException",
+                        |    "ProfilerMetadataTest.NativeGoldenIncludesUnicodeEscapingSignedIntegersAndEmptyLists",
+                        |    "ProfilerMetadataTest.ByteLengthsAndControlCharactersAreJsonCompatible",
+                        |    "ProfilerMetadataTest.InvalidUtf8ThrowsDuringEncoding",
+                        |    "ProfilerScopeTest.ActiveCallbackReceivesOwnedMetadataAndEndsOnce",
+                        |    "ProfilerScopeTest.CallbackWithoutInputsDoesNotInspectMetadata",
+                        |    "ProfilerScopeTest.InactiveAndUnselectedScopesDoNotEvaluateFactories",
+                        |    "ProfilerScopeTest.MetadataFailureDoesNotPreventBodyOrMaskItsException",
+                        |    "ProfilerScopeTest.NameFailureDoesNotPreventBodyOrMaskItsException",
+                        |    "ProfilerScopeTest.NcclMetadataExtractionIsLazy",
+                        |    "ProfilerScopeTest.NcclInactiveScopeNeverConstructsItsOwningName",
+                        |    "ProfilerScopeTest.NcclThrowingNameDoesNotPreventBodyOrMaskItsException",
+                        |}
+                        |seen = set()
+                        |for case in ET.parse(sys.argv[1]).iter("testcase"):
+                        |    name = f"{case.attrib['classname']}.{case.attrib['name']}"
+                        |    if case.get("status") != "run" or any(case.find(k) is not None for k in ("skipped", "failure", "error")):
+                        |        sys.exit(f"Native profiler case failed or skipped: {name}")
+                        |    seen.add(name)
+                        |missing = sorted(required - seen)
+                        |if missing:
+                        |    sys.exit(f"Missing native profiler cases: {', '.join(missing)}")
+                        |PYTHON""".stripMargin()
                 })
             }
         }]

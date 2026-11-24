@@ -1294,6 +1294,7 @@ def test_modeling_v2_association_paths_and_ci_registration(
     ("changed_file", "profiling_expected"),
     [
         ("tests/unittest/_torch/distributed/test_nccl_profiler.py", True),
+        ("tests/unittest/bindings/test_nanobind_profiler.py", True),
         ("tests/unittest/scripts/cbts/test_blocks.py", False),
     ],
 )
