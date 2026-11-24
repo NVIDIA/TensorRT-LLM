@@ -132,6 +132,7 @@ class KvSizingBudget:
 
     @property
     def non_kv_peak(self) -> int:
+        # Drafter tensors are already in the profiled peak; their reserve protects PyTorch headroom.
         return self.device_total - self.before_fraction + self.indexer + self.context_mla
 
     def render(self) -> list[str]:

@@ -372,7 +372,7 @@ def test_memory_plan_leaves_out_the_temporary_sizing_pool():
     from types import SimpleNamespace
     from unittest.mock import Mock, patch
 
-    from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
+    from tensorrt_llm._torch.pyexecutor._util import CacheCost, KvCacheCreator
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm.llmapi.llm_args import KvCacheConfig
     from tensorrt_llm.mapping import Mapping
@@ -396,7 +396,9 @@ def test_memory_plan_leaves_out_the_temporary_sizing_pool():
                 tokens_per_block=128,
                 max_seq_len=4096,
                 max_batch_size=8,
-                kv_cache_config=KvCacheConfig(max_tokens=1024),
+                kv_cache_config=KvCacheConfig(
+                    free_gpu_memory_fraction=0.75, max_gpu_total_bytes=100
+                ),
                 llm_args=Mock(cache_transceiver_config=None, enable_chunked_prefill=False),
                 speculative_config=None,
                 sparse_attention_config=None,
@@ -415,7 +417,7 @@ def test_memory_plan_leaves_out_the_temporary_sizing_pool():
         py_executor.resource_manager.resource_managers.get.side_effect = [kv_manager, None]
         util = "tensorrt_llm._torch.pyexecutor._util"
         with (
-            patch.object(creator, "_cal_max_memory", return_value=budget) as cal,
+            patch.object(creator, "_get_kv_size_per_token", return_value=CacheCost(slope=1)),
             patch.object(torch.cuda, "mem_get_info", return_value=(400, 1024)),
             patch.object(
                 torch.cuda,
@@ -432,35 +434,36 @@ def test_memory_plan_leaves_out_the_temporary_sizing_pool():
             # The DeepSeek-V4 indexer workspace is taken out of the KV budget.
             patch(f"{util}.get_indexer_mqa_logits_workspace_bytes", return_value=indexer),
             patch(f"{util}.get_indexer_mqa_logits_workspace_reserve", return_value=indexer),
-            patch(f"{util}.is_decode_only", return_value=True),
-            patch(f"{util}.get_mla_context_workspace_kv_len_cap", return_value=None),
+            patch(f"{util}.is_decode_only", return_value=False),
+            patch(f"{util}.get_attention_workspace_bytes_per_token", return_value=1),
+            patch(f"{util}.get_attention_workspace_is_chunked_prefill_bounded", return_value=True),
+            patch(f"{util}.get_mla_context_workspace_kv_len_cap", return_value=9),
+            patch(f"{util}.get_attention_workspace_min_tokens", return_value=0),
+            patch(f"{util}.get_attention_workspace_profiled_tokens", return_value=0),
         ):
             creator.configure_kv_cache_capacity(py_executor)
-        assert creator._kv_cache_config.max_gpu_total_bytes == budget - indexer - 13
-        return cal.call_args
+        assert creator._kv_cache_config.max_gpu_total_bytes == 100
 
-    sizing_pool, budget, indexer = 300, 200, 50
+    sizing_pool, indexer = 300, 50
     startup.clear()
-    call = size(skip_est=False)
-    peak, allocated = call.args[0], call.args[3]
-    assert allocated == sizing_pool
-    assert startup.memory_plan().non_kv_peak == peak - sizing_pool + indexer, (
-        "the indexer reserve is outside the KV cache, so it is part of the non-KV peak"
-    )
-
+    size(skip_est=False)
     detail = startup.memory_plan().budget
     assert detail.profiled_peak == 500 + (1024 - 400 - 128)
     assert detail.temporary_kv == sizing_pool
     assert (detail.encoder, detail.attention, detail.penalty) == (7, 17, 11)
-    assert (detail.drafter, detail.indexer, detail.context_mla) == (13, indexer, 0)
+    assert (detail.drafter, detail.indexer, detail.context_mla) == (13, indexer, 9)
     assert detail.before_fraction == 1024 - detail.profiled_peak + sizing_pool - 35
-    assert detail.final_budget == budget - indexer - 13
-    assert any(f"({detail.final_budget} bytes)" in line for line in detail.render())
+    assert detail.fraction_budget == int(detail.before_fraction * 0.75)
+    assert detail.before_limits == detail.fraction_budget - 13 - indexer - 9
+    assert detail.before_limits - detail.final_budget == 47
+    assert startup.memory_plan().non_kv_peak == 1024 - detail.before_fraction + indexer + 9
+    report = "\n".join(startup.render_plan_lines(device_used=624, kv_capacity=100))
+    assert "KV sizing budget" in report and "(100 bytes)" in report
 
     # Without a profiled forward pass the "peak" is only current usage: no plan.
     startup.clear()
     size(skip_est=True)
-    assert startup.memory_plan() is None
+    assert startup.render_plan_lines(device_used=624, kv_capacity=100) == []
 
 
 @pytest.mark.cpu_only

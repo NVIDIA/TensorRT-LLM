@@ -1751,14 +1751,15 @@ class KvCacheCreator:
         return None
 
     def _cal_max_memory(self, peak_memory, total_gpu_memory, fraction,
-                        allocated_bytes: int, before_fraction: int) -> int:
+                        allocated_bytes: int) -> tuple[int, int]:
         """
-        Calculate the max KV cache capacity.
+        Return available bytes before the fraction and the resulting KV budget.
 
         NOTE: `allocated_bytes` is the total KV-cache memory that must be pre-allocated during the estimation phase (for both the main and draft models) so the estimation run can complete successfully. When computing `available_kv_mem`, add this amount back in.
         """
         kv_size_per_token = self._get_kv_size_per_token()
 
+        before_fraction = total_gpu_memory - peak_memory + allocated_bytes
         available_kv_mem = before_fraction * fraction
         logger.info(
             f"Peak memory during memory usage profiling (torch + non-torch): {peak_memory / (GB):.2f} GiB, "
@@ -1766,7 +1767,7 @@ class KvCacheCreator:
             f"fraction is set {fraction}, kv size per token is {kv_size_per_token}. device total memory {total_gpu_memory / (GB):.2f} GiB, "
             f"temporary kv cache memory during profiling {allocated_bytes / (GB):.2f} GiB"
         )
-        return int(available_kv_mem)
+        return before_fraction, int(available_kv_mem)
 
     def _get_mla_chunked_profile_length(self, input_seq_len: int) -> int | None:
         """Length needed to profile two full cached-KV chunks with a full query."""
@@ -2390,12 +2391,9 @@ class KvCacheCreator:
                 "the first penalized request.")
 
         # calculate max memory from peak memory and free gpu memory fraction
-        before_fraction = total_gpu_memory - peak_memory + allocated_bytes
-        kv_cache_max_memory = self._cal_max_memory(peak_memory,
-                                                   total_gpu_memory, fraction,
-                                                   allocated_bytes,
-                                                   before_fraction)
-        fraction_budget = kv_cache_max_memory
+        before_fraction, fraction_budget = self._cal_max_memory(
+            peak_memory, total_gpu_memory, fraction, allocated_bytes)
+        kv_cache_max_memory = fraction_budget
         drafter_reserve = self._get_context_kv_only_drafter_reserve(fraction)
         if drafter_reserve > 0:
             budget_before = kv_cache_max_memory
