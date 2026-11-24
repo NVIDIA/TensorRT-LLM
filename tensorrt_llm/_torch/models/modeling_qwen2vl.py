@@ -31,9 +31,11 @@ from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_mm_disagg
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.inputs.external_embeddings import (ExternalEmbeddingItem,
+                                                     parse_external_embeddings)
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalItemMetadata,
-    MultimodalItemPartition, MultimodalParams, split_multimodal_embedding_items)
+    MultimodalItemPartition, MultimodalParams)
 
 from ..._utils import async_tensor_h2d, nvtx_range
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
@@ -1286,6 +1288,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         mrope_position_ids, mrope_position_deltas = type(self).get_rope_index(
             self.config, input_ids, image_grid_thw, video_grid_thw,
             attention_mask, second_per_grid_ts)
+        self._check_mrope_positions(mrope_position_ids)
 
         mrope_config = {}
         mrope_config['mrope_position_ids'] = mrope_position_ids.to(
@@ -1294,87 +1297,228 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             'cpu').to(torch.int32).clone()
         return mrope_config
 
+    def _check_mrope_positions(self, position_ids: torch.Tensor) -> None:
+        """Reject prompts whose positions fall outside the rotary table.
+
+        A video time scale moves positions independently of the token count.
+        Admission caps decoding to the table (cap_mrope_decode_tokens).
+        """
+        text_config = getattr(self.config, "text_config", self.config)
+        max_positions = getattr(text_config, "max_position_embeddings", None)
+        if type(max_positions) is not int:
+            return
+        if position_ids.numel() and (int(position_ids.min()) < 0 or int(
+                position_ids.max()) >= max_positions):
+            raise ValueError(
+                f"Qwen mRoPE positions exceed the model's {max_positions} "
+                "positions; check the video time scale")
+
+    # Qwen-VL prompt placeholders for one image or video item. A video is
+    # framed by vision start / end; Qwen3-VL also accepts it bare.
+    _EXTERNAL_PLACEHOLDER_RE = re.compile(
+        r"(?P<framed_video><\|vision_start\|><\|video_pad\|><\|vision_end\|>)"
+        r"|(?P<video><\|video_pad\|>)|(?P<image><\|image_pad\|>)")
+    _IMAGE_PAD = "<|image_pad|>"
+    _VIDEO_PAD = "<|video_pad|>"
+    _VISION_START = "<|vision_start|>"
+    _VISION_END = "<|vision_end|>"
+
+    def _external_embedding_width(self) -> int:
+        """Row width of an attached embedding: the text hidden size."""
+        return self.config.text_config.hidden_size
+
+    def _resolve_external_video_metadata(
+            self, item: ExternalEmbeddingItem) -> Dict[str, Any]:
+        """Validate video timing and return what prompt and MRoPE need.
+
+        Qwen2-VL / Qwen2.5-VL scale the MRoPE time axis by the seconds per
+        temporal patch, which HF derives as ``temporal_patch_size / fps`` from
+        the sampled frame rate. Rows and grid do not determine it, so one of
+        the two is required.
+        """
+        if item.timestamps is not None or item.frames_indices is not None:
+            raise ValueError(
+                f"{type(self).__name__} takes 'second_per_grid_ts' or 'fps' for "
+                "video embeddings, not 'timestamps' / 'frames_indices'")
+        if (item.second_per_grid_ts is None) == (item.fps is None):
+            raise ValueError(
+                f"video embedding of grid {item.grid_thw}: pass exactly one of "
+                "'second_per_grid_ts' or 'fps' (the sampled frame rate)")
+        if item.second_per_grid_ts is not None:
+            second_per_grid_t = item.second_per_grid_ts
+        else:
+            temporal_patch_size = self.config.vision_config.temporal_patch_size
+            second_per_grid_t = temporal_patch_size / item.fps
+        # MRoPE takes the time scale as float32.
+        if second_per_grid_t > torch.finfo(torch.float32).max:
+            raise ValueError(
+                f"video embedding of grid {item.grid_thw}: time scale "
+                f"{second_per_grid_t} seconds per grid overflows float32")
+        return {"second_per_grid_t": second_per_grid_t}
+
+    def _expand_external_video_placeholder(self, item: ExternalEmbeddingItem,
+                                           video_metadata: Dict[str, Any],
+                                           framed: bool) -> str:
+        """Prompt text for one video, as the HF processor expands it.
+
+        MRoPE gives video positions only to pads that follow vision start, so
+        a bare placeholder is rejected rather than given text positions.
+        """
+        if not framed:
+            raise ValueError(
+                f"{type(self).__name__} needs video placeholders framed as "
+                "<|vision_start|><|video_pad|><|vision_end|>")
+        return (self._VISION_START + self._VIDEO_PAD * item.num_rows +
+                self._VISION_END)
+
+    def _validate_external_embedding_grid(
+        self,
+        item: ExternalEmbeddingItem,
+        index: int,
+    ) -> Tuple[int, int, int]:
+        """Check the item's grid against its rows."""
+        merge = self.config.vision_config.spatial_merge_size
+        name = f"{item.modality} embedding {index}"
+        grid = item.grid_thw
+        if grid is None:
+            # MRoPE positions depend on the grid, which the rows alone do not
+            # give; take it from the model's image or video processor.
+            raise ValueError(
+                f"{name} requires '{item.modality}_grid_thw' for mRoPE "
+                "positions")
+        t, h, w = grid
+        if item.modality == "image" and t != 1:
+            raise ValueError(
+                f"{name}: image_grid_thw must have t == 1, got {t}")
+        if h % merge or w % merge:
+            raise ValueError(
+                f"{name}: grid height and width must be multiples of the "
+                f"spatial merge size {merge}, got {grid}")
+        expected_rows = t * (h // merge) * (w // merge)
+        if expected_rows != item.num_rows:
+            raise ValueError(
+                f"{name} has {item.num_rows} rows but its grid {grid} gives "
+                f"{expected_rows}")
+        return grid
+
     def _attach_multimodal_embeddings_impl(
         self,
         inputs: TextPrompt,
-        multimodal_embedding: Dict[str, List[Any]],
+        multimodal_embedding: Dict[str, Any],
         sampling_params: SamplingParams,
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
-        """Attach external image embeddings.
+        """Build a request from precomputed image / video embeddings.
 
-        mRoPE positions depend on each image's grid, which the row count alone
-        does not give. So each image must be passed as
-        ``{"mm_embeddings": tensor, "image_grid_thw": [t, h, w]}``, with the
-        grid from the model's image processor.
+        The prompt is expanded exactly as the HF processor expands it for the
+        equivalent raw media (including Qwen3 frame timestamps). The request
+        carries MRoPE positions; the wrapper keys each item by its rows and the
+        metadata passed with them.
         """
-        # Check support first, so models without it (such as Qwen2-VL) raise
-        # this error instead of asking for a grid.
         build_disagg_prefill_multimodal_inputs = getattr(
             self, "build_disagg_prefill_multimodal_inputs", None)
         if not callable(build_disagg_prefill_multimodal_inputs):
             raise NotImplementedError(
                 f"{type(self).__name__} does not support external multimodal embeddings"
             )
+        items_by_modality = parse_external_embeddings(
+            multimodal_embedding,
+            temporal_patch_size=getattr(self.config.vision_config,
+                                        "temporal_patch_size", 1))
+        text_prompt = inputs.get("prompt")
+        if not text_prompt:
+            raise ValueError("Text prompt is required but not provided")
 
-        if not isinstance(multimodal_embedding, dict):
-            raise ValueError("multimodal_embedding must be a dictionary")
-        if set(multimodal_embedding) != {"image"}:
+        width = self._external_embedding_width()
+        grids: Dict[str, List[Tuple[int, int, int]]] = {}
+        video_metadata: List[Dict[str, Any]] = []
+        for modality, items in items_by_modality.items():
+            for index, item in enumerate(items):
+                if item.embedding.shape[1] != width:
+                    raise ValueError(
+                        f"{modality} embedding {index} has width "
+                        f"{item.embedding.shape[1]}, expected {width}")
+                grids.setdefault(modality, []).append(
+                    self._validate_external_embedding_grid(item, index))
+                if modality == "video":
+                    video_metadata.append(
+                        self._resolve_external_video_metadata(item))
+
+        # Expand each placeholder in prompt order; items of one modality are
+        # consumed in the order given. HF replaces framed video placeholders
+        # before bare ones, so a mix of both forms would reorder videos.
+        matches = list(self._EXTERNAL_PLACEHOLDER_RE.finditer(text_prompt))
+        if {"video", "framed_video"} <= {m.lastgroup for m in matches}:
             raise ValueError(
-                "Only image modality is supported for external multimodal embedding"
-            )
-
-        image_embeddings, item_metadata = split_multimodal_embedding_items(
-            multimodal_embedding["image"])
-        if not image_embeddings:
-            raise ValueError("At least one image embedding is required")
-        merge_size = self.config.vision_config.spatial_merge_size
-        image_grid_thw = []
-        for index, image_embedding in enumerate(image_embeddings):
-            if image_embedding.dim() != 2:
+                "Prompt mixes bare <|video_pad|> and framed "
+                "<|vision_start|><|video_pad|><|vision_end|> placeholders; "
+                "use one form for all videos")
+        ordered_items: List[ExternalEmbeddingItem] = []
+        item_refs: List[Tuple[str, int]] = []
+        consumed = {"image": 0, "video": 0}
+        pieces: List[str] = []
+        last_end = 0
+        for match in matches:
+            modality = "image" if match.lastgroup == "image" else "video"
+            items = items_by_modality.get(modality, [])
+            index = consumed[modality]
+            if index >= len(items):
                 raise ValueError(
-                    f"Image embedding {index} must be rank 2, got shape {tuple(image_embedding.shape)}"
+                    f"Prompt has more {modality} placeholders than {modality} embeddings ({len(items)})"
                 )
-            grid = item_metadata[index].get("image_grid_thw")
-            if grid is None:
+            consumed[modality] += 1
+            item = items[index]
+            ordered_items.append(item)
+            item_refs.append((modality, index))
+            pieces.append(text_prompt[last_end:match.start()])
+            if modality == "image":
+                # MRoPE gives image positions only to pads that follow vision
+                # start, so an unframed image would get text positions.
+                if not (text_prompt.endswith(self._VISION_START, 0,
+                                             match.start()) and
+                        text_prompt.startswith(self._VISION_END, match.end())):
+                    raise ValueError(
+                        f"{type(self).__name__} needs image placeholders "
+                        "framed as <|vision_start|><|image_pad|><|vision_end|>")
+                pieces.append(self._IMAGE_PAD * item.num_rows)
+            else:
+                pieces.append(
+                    self._expand_external_video_placeholder(
+                        item, video_metadata[index],
+                        match.lastgroup == "framed_video"))
+            last_end = match.end()
+        pieces.append(text_prompt[last_end:])
+        for modality, items in items_by_modality.items():
+            if consumed[modality] != len(items):
                 raise ValueError(
-                    f"Image embedding {index} has no image_grid_thw, which "
-                    f"{type(self).__name__} needs for mRoPE positions. Pass "
-                    "each image as {'mm_embeddings': tensor, "
-                    "'image_grid_thw': [t, h, w]}, with the grid from the "
-                    "model's image processor.")
-            grid = torch.as_tensor(grid).flatten().tolist()
-            rows = image_embedding.shape[0]
-            # An image has t == 1. Floats are rejected, not truncated.
-            if (len(grid) != 3 or any(type(size) is not int for size in grid)
-                    or grid[0] != 1 or min(grid) <= 0 or grid[1] % merge_size
-                    or grid[2] % merge_size
-                    or math.prod(grid) != rows * merge_size**2):
-                raise ValueError(
-                    f"image_grid_thw {grid} does not match image embedding "
-                    f"{index}: it must be 3 integers [1, h, w] (t is 1 for "
-                    f"an image), h and w must be multiples of {merge_size}, "
-                    f"and h * w / {merge_size}**2 must equal its {rows} rows.")
-            image_grid_thw.append(grid)
+                    f"Prompt has {consumed[modality]} {modality} placeholders "
+                    f"but {len(items)} {modality} embeddings were given")
+        expanded_prompt = "".join(pieces)
+        prompt_token_ids = self.tokenizer(
+            expanded_prompt, return_tensors="pt").input_ids[0].tolist()
 
-        mm_handles = [{
-            "tensor_size": tuple(image_embedding.shape)
-        } for image_embedding in image_embeddings]
-        prompt_token_ids, multimodal_params = build_disagg_prefill_multimodal_inputs(
-            inputs, mm_handles)
+        rows = [item.num_rows for item in ordered_items]
 
-        # ``build_disagg_prefill_multimodal_inputs`` already emits the in-vocab
-        # ``image_token_id`` at mm positions (no legacy OOV remap), so
-        # ``mrope_input_ids`` is fed to ``get_mrope_config`` as-is.
+        image_grid_thw = (torch.tensor(grids["image"], dtype=torch.long)
+                          if grids.get("image") else None)
+        video_grid_thw = (torch.tensor(grids["video"], dtype=torch.long)
+                          if grids.get("video") else None)
+        second_per_grid_ts = None
+        if video_metadata and "second_per_grid_t" in video_metadata[0]:
+            second_per_grid_ts = torch.tensor(
+                [meta["second_per_grid_t"] for meta in video_metadata],
+                dtype=torch.float32)
         mrope_input_ids = torch.tensor(prompt_token_ids,
                                        dtype=torch.long).unsqueeze(0)
-        attention_mask = torch.ones_like(mrope_input_ids)
-        mrope_config = self.get_mrope_config(
-            mrope_input_ids, torch.tensor(image_grid_thw, dtype=torch.long),
-            None, attention_mask, None)
-
-        multimodal_data = multimodal_params.multimodal_data
-        multimodal_data["multimodal_embedding"] = image_embeddings
-        multimodal_data["mrope_config"] = mrope_config
+        multimodal_data = {
+            "multimodal_embedding": [item.embedding for item in ordered_items],
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY:
+            MultimodalItemMetadata(item_refs, output_embedding_lengths=rows),
+            "mrope_config":
+            self.get_mrope_config(mrope_input_ids, image_grid_thw,
+                                  video_grid_thw,
+                                  torch.ones_like(mrope_input_ids),
+                                  second_per_grid_ts),
+        }
         return prompt_token_ids, {"multimodal_data": multimodal_data}
 
     @nvtx_range("Qwen2VLInputProcessorBase forward()")
@@ -2344,6 +2488,41 @@ def _qwen_vision_input_partitions(
     }
 
 
+def cap_mrope_decode_tokens(request: Any,
+                            text_config: Any,
+                            lookahead: int = 0) -> None:
+    """Cap a request's new tokens so its decode positions fit the rotary table.
+
+    A positive mRoPE delta puts decode positions ahead of the token count,
+    which max_seq_len bounds, so a request may run past the
+    max_position_embeddings rotary table. The executor runs this at
+    admission, after max_new_tokens is clamped to max_seq_len. Every new
+    token but the last is forwarded, the first at ``prompt_len + delta``.
+    ``lookahead`` reserves the draft tokens a speculative step forwards past
+    the last accepted token.
+    """
+    max_positions = getattr(text_config, "max_position_embeddings", None)
+    mrope_config = (request.py_multimodal_data or {}).get("mrope_config") or {}
+    deltas = mrope_config.get("mrope_position_deltas")
+    if (type(max_positions) is not int or not isinstance(deltas, torch.Tensor)
+            or not deltas.numel()):
+        return
+    delta = int(deltas.max())
+    if delta <= 0:
+        return
+    budget = max_positions - request.orig_prompt_len - delta + 1 - lookahead
+    if budget <= 0:
+        raise ValueError(
+            f"Qwen mRoPE decode positions start past the model's "
+            f"{max_positions} positions; check the video time scale")
+    if request.py_max_new_tokens > budget:
+        logger.warning(
+            f"max_new_tokens ({request.py_max_new_tokens}) would take mRoPE "
+            f"positions past the model's {max_positions}; using {budget}.")
+        request.max_new_tokens = budget
+        request.py_max_new_tokens = budget
+
+
 class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
     supported_encoder_attention_backends = {
         "vision": frozenset({"VANILLA", "TRTLLM", "FLASHINFER"})
@@ -2357,6 +2536,15 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
         modality: str,
     ) -> dict[str, MultimodalItemPartition] | None:
         return _qwen_vision_item_partitions(param, modality)
+
+    def validate_request(self, request: Any) -> None:
+        """Cap decoding so mRoPE positions stay in the rotary table."""
+        spec_config = getattr(self.model_config, "spec_config", None)
+        cap_mrope_decode_tokens(
+            request,
+            getattr(self.model_config.pretrained_config, "text_config",
+                    self.model_config.pretrained_config),
+            lookahead=getattr(spec_config, "max_total_draft_tokens", None) or 0)
 
     def __init__(
         self,
