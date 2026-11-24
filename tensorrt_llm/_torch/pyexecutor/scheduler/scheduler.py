@@ -442,6 +442,19 @@ class RequestScheduler(ABC):
             probe: Whether cancelled receives still retain local resources.
         """
 
+    def set_async_transfer_manager(self, mgr) -> None:
+        """Register the executor's AsyncTransferManager, which owns the KV
+        pages of finished disaggregated sends until they land.
+
+        Only schedulers with transfer-aware deadlock detection use it; the
+        default is a no-op.
+        """
+
+    @property
+    def ctx_demote_uncached_tokens(self) -> int:
+        """Long-prefill demotion threshold in uncached tokens; 0 (the default) when off."""
+        return 0
+
     def take_decision_counters(self) -> tuple[int, int, int, int]:
         """Return and reset the holds since the last call: gen-init cap, gen-init transfer budget,
         decoder-tail hold passes, and requests whose final window was held."""
@@ -811,6 +824,13 @@ class MultimodalScheduler(RequestScheduler):
             probe: Whether cancelled receives still retain local resources.
         """
         self.scheduler.set_retiring_gen_receives_probe(probe)
+
+    def set_async_transfer_manager(self, mgr) -> None:
+        self.scheduler.set_async_transfer_manager(mgr)
+
+    @property
+    def ctx_demote_uncached_tokens(self) -> int:
+        return self.scheduler.ctx_demote_uncached_tokens
 
     def take_decision_counters(self) -> tuple[int, int, int, int]:
         return self.scheduler.take_decision_counters()

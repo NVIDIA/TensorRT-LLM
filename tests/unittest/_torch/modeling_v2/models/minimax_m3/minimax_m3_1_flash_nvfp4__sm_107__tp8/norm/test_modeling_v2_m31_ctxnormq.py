@@ -4,8 +4,8 @@
 activation and the routed experts' NVFP4 input (mv2_minimax_m3::minimax_m31_ctx_residual_rmsnorm_mxfp8).
 
 The quantized outputs must equal mxfp8_quantize / fp4_quantize of the op's own norm bit for bit; the norm and the
-updated residual are checked against an fp32 reference. Skipped while the target's ``_ctxnormq_op()`` declines the
-device.
+updated residual are checked against an fp32 reference. Skipped while the target's ``_ctxnormq_op()`` returns
+``None``.
 """
 
 import pytest
@@ -24,11 +24,9 @@ FP4_SCALE = 448.0 * 6.0 / 8.0
 
 op = m._ctxnormq_op()
 if op is None:
-    # The op's kernel is built for SM103 and refuses SM107, so this target's boundary keeps the fused all-reduce.
-    pytest.skip(
-        "CTXNORMQ: this target's _ctxnormq_op() declines SM107 "
-        "(mv2_minimax_m3::minimax_m31_ctx_residual_rmsnorm_mxfp8 runs on SM103 only)",
-        allow_module_level=True,
+    # This TP8 target does not engage CTXNORMQ; its boundary keeps the fused all-reduce.
+    pytestmark = pytest.mark.skip(
+        "CTXNORMQ: the sm_107 TP8 target does not engage CTXNORMQ (_ctxnormq_op() returns None)",
     )
 
 
