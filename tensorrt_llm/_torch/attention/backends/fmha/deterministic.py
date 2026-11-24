@@ -6,10 +6,10 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
 from tensorrt_llm._torch.attention.kernels.deterministic_attention import deterministic_attention
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings import DataType
-from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 
 from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha, deterministic_attention_requested
@@ -75,8 +75,9 @@ class DeterministicFmha(FlashInferTrtllmGenFmha):
             return "speculative decoding"
         if forward_args.attention_sinks is not None:
             return "attention sinks"
-        if AttentionMaskType(forward_args.mask_type) != AttentionMaskType.causal:
-            return f"mask type {AttentionMaskType(forward_args.mask_type).name}"
+        # Not mask_type: that property raises for a custom mask.
+        if forward_args.attention_mask != PredefinedAttentionMask.CAUSAL:
+            return f"attention mask {forward_args.attention_mask!r}"
         if self.attn.attention_chunk_size:
             return "chunked attention"
         if (

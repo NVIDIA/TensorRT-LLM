@@ -14,6 +14,8 @@ from tensorrt_llm._torch.attention.backends.fmha.interface import FmhaPhase
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
+    CustomAttentionMask,
+    PredefinedAttentionMask,
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm._torch.metadata import KVCacheParams
@@ -21,7 +23,6 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
-from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
@@ -93,7 +94,9 @@ def _assert_same_bits(actual: torch.Tensor, expected: torch.Tensor) -> None:
         ({"num_heads": 66}, "query heads per KV head"),
         ({"use_spec_decoding": True}, "speculative decoding"),
         ({"attention_sinks": torch.zeros(8)}, "attention sinks"),
-        ({"mask_type": AttentionMaskType.padding}, "mask type"),
+        ({"attention_mask": PredefinedAttentionMask.FULL}, "attention mask"),
+        # A custom mask has no native mask type; the library must decline, not raise.
+        ({"attention_mask": CustomAttentionMask.CUSTOM}, "attention mask"),
         ({"attention_chunk_size": 16}, "chunked attention"),
         ({"attention_window_size": 64}, "sliding attention window"),
         ({"attention_window_size": None}, "sliding attention window"),
@@ -109,7 +112,7 @@ def test_requests_the_kernel_cannot_serve_are_left_to_the_fallback(change, reaso
         num_heads=8,
         use_spec_decoding=False,
         attention_sinks=None,
-        mask_type=AttentionMaskType.causal,
+        attention_mask=PredefinedAttentionMask.CAUSAL,
         attention_chunk_size=0,
         attention_window_size=128,
     )
@@ -129,9 +132,9 @@ def test_requests_the_kernel_cannot_serve_are_left_to_the_fallback(change, reaso
         use_spec_decoding=setup["use_spec_decoding"],
         max_seq_len=128,
     )
-    forward_args = SimpleNamespace(
+    forward_args = AttentionForwardArgs(
         attention_sinks=setup["attention_sinks"],
-        mask_type=setup["mask_type"],
+        attention_mask=setup["attention_mask"],
         attention_window_size=setup["attention_window_size"],
     )
     query = torch.empty(1, 8 * 64, dtype=setup["query_dtype"])
