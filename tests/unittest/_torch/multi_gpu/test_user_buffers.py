@@ -313,7 +313,8 @@ def run_single_rank_ledger(tensor_parallel_size, ub_size):
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
                     reason='needs 2 GPUs to run this test')
 @pytest.mark.parametrize("tensor_parallel_size", [2])
-def test_user_buffers_are_in_the_native_memory_ledger(tensor_parallel_size):
+def test_user_buffers_are_in_the_native_memory_ledger(
+        tensor_parallel_size: int) -> None:
     # The registration deltas require a fresh allocator on every rank.
     with MPIPoolExecutor(tensor_parallel_size) as executor:
         results = executor.map(run_single_rank_ledger,
