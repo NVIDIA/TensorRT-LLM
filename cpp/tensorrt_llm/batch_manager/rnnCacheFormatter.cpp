@@ -414,6 +414,8 @@ void RnnCacheFormatter::unformat(TransferSession& session)
                 totalBytesRecv += recvBuffers[t]->getSizeInBytes();
                 session.recv(connIdx, recvBuffers[t]->data(), recvBuffers[t]->getSizeInBytes());
             }
+
+            // Account for the transferred recurrent state, mirroring CacheFormatter::unformat().
             llmRequest.updateKvCacheSize(totalBytesRecv);
 
             // Split each recvBuffer into SSM and conv portions for concat kernels.
