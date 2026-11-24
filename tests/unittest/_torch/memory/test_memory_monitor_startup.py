@@ -417,7 +417,8 @@ def test_memory_plan_leaves_out_the_temporary_sizing_pool():
         py_executor.resource_manager.resource_managers.get.side_effect = [kv_manager, None]
         util = "tensorrt_llm._torch.pyexecutor._util"
         with (
-            patch.object(creator, "_get_kv_size_per_token", return_value=CacheCost(slope=1)),
+            # The MLA split is fractional; sizing deducts nine whole bytes.
+            patch.object(creator, "_get_kv_size_per_token", return_value=CacheCost(slope=17)),
             patch.object(torch.cuda, "mem_get_info", return_value=(400, 1024)),
             patch.object(
                 torch.cuda,

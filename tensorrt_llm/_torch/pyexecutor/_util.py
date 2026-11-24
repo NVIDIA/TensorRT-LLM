@@ -2634,7 +2634,7 @@ class KvCacheCreator:
                 before_limits=before_limits,
                 drafter=drafter_reserve,
                 indexer=indexer_reserve,
-                context_mla=workspace_reserve,
+                context_mla=budget_before - before_limits,
                 final_budget=kv_cache_max_memory,
             )
             monitor_startup.record_memory_plan(budget.non_kv_peak,
