@@ -51,6 +51,9 @@ from .utils import (
     silu_f32,
 )
 
+# L2 cache hint of a TMA load: evict first (CUTLASS ``CacheHintSm90::EVICT_FIRST``).
+_TMA_EVICT_FIRST = 0x12F0000000000000
+
 SUPPORTED_ACTIVATION_TYPES = (
     ActivationType.Swiglu,
     ActivationType.Relu2,
@@ -285,6 +288,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         swiglu_limit: cutlass.Float32 = float("inf"),
         situ_beta: Optional[float] = None,
         situ_linear_beta: Optional[float] = None,
+        early_launch_dependents: bool = False,
+        weight_evict_first: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel with
         gather operation and fused activation.
@@ -335,8 +340,18 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :param situ_linear_beta: Linear-side (up) SiTU constant. Required for --
             and only valid with -- ``ActivationType.SiTu``.
         :type situ_linear_beta: Optional[float]
+        :param early_launch_dependents: Let the dependent kernel (FC2) launch right after this kernel's own
+            dependency wait instead of at its end, so its CTAs start on SMs this kernel has released and
+            load their weights while the tail of this kernel still runs (see the FC2 kernel's
+            ``pdl_preload_weights``). Value-neutral.
+        :type early_launch_dependents: bool
+        :param weight_evict_first: Mark the TMA loads of the expert weights (B) and block scales (SFB)
+            L2 evict-first. Value-neutral.
+        :type weight_evict_first: bool
         """
 
+        self.early_launch_dependents = bool(early_launch_dependents)
+        self.weight_evict_first = bool(weight_evict_first)
         self.sf_vec_size = sf_vec_size
         self.topk = topk
         self.activation_type = validate_activation_type(activation_type)
@@ -1355,6 +1370,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             self.cta_sync_barrier.arrive_and_wait()
 
         griddepcontrol_wait()
+        if cutlass.const_expr(self.early_launch_dependents):
+            griddepcontrol_launch_dependents()
 
         #
         # Specialized Schedule Warp
@@ -1806,6 +1823,12 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 pipeline.PipelineUserType.Consumer, self.num_tile_stage
             )
 
+            b_cache_kw = (
+                {"cache_policy": cutlass.Int64(_TMA_EVICT_FIRST)}
+                if cutlass.const_expr(self.weight_evict_first)
+                else {}
+            )
+
             # Get the first tile info
             tile_info = cute.make_rmem_tensor((5,), cutlass.Int32)
             tile_info_pipeline.consumer_wait(tile_info_consumer_state)
@@ -1856,6 +1879,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         tBsB_pipe,
                         tma_bar_ptr=tma_bar,
                         mcast_mask=b_full_mcast_mask,
+                        **b_cache_kw,
                     )
                     cute.copy(
                         tma_atoms_sfb[0],
@@ -1863,6 +1887,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         tBsSFB_pipe,
                         tma_bar_ptr=tma_bar,
                         mcast_mask=sfb_full_mcast_mask,
+                        **b_cache_kw,
                     )
 
                     b_producer_state.advance()

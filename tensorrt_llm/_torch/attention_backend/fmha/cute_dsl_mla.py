@@ -15,6 +15,7 @@
 """CuTe DSL MLA decode FMHA library."""
 
 import math
+import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -53,8 +54,13 @@ _SPLIT_PLAN_KV_TILE = 128
 _SPLIT_PLAN_MIN_TILES = 4
 # Fixed cost of one piece (cluster launch, Q load, pipeline fill, partial store
 # and its reduction) in KV tiles, fitted on forced-split sweeps: with it the
-# wave-quantized makespan picks a near-optimal split.
+# wave-quantized makespan picks a near-optimal split. Callers whose decode
+# geometry was fitted separately pass their own ``piece_cost``.
 _SPLIT_PLAN_PIECE_COST_TILES = 60
+# TLLM_CUTE_DSL_MLA_COMPACT_PLAN=1 (read at import, default off): the step's plan
+# kernel is launched sized to the call (``launch_mla_split_kv_plan(compact=True)``).
+# The plan it writes is the same.
+_COMPACT_PLAN = os.environ.get("TLLM_CUTE_DSL_MLA_COMPACT_PLAN", "0") == "1"
 
 
 @triton.jit(
@@ -145,10 +151,35 @@ def launch_mla_split_kv_plan(
     rows_per_request: int,
     wave_clusters: int,
     max_split: int = _SPLIT_PLAN_MAX_SPLIT,
+    piece_cost: int = _SPLIT_PLAN_PIECE_COST_TILES,
+    compact: bool = False,
+    candidates: int = _SPLIT_PLAN_MAX_SPLIT,
 ) -> None:
-    """Write the per-request split counts for ``cache_seqs`` into ``plan`` (one launch)."""
+    """Write the per-request split counts for ``cache_seqs`` into ``plan`` (one launch).
+
+    The same plan as ``plan_mla_split_kv`` with the same arguments, when ``candidates`` (the
+    number of piece counts the kernel tries) equals ``max_split``: both default to 32. The
+    host mirror always tries ``max_split`` piece counts.
+
+    ``compact`` sizes the kernel's request lanes to the call instead of the
+    ``_SPLIT_PLAN_MAX_REQUESTS`` maximum: the next power of two of ``num_requests``, at least
+    16. The lanes beyond the request count are masked out of every reduction, so the plan
+    is bitwise the same. The lane count is a Triton constexpr, so
+    each (lanes, ``candidates``) pair compiles its own kernel variant: with ``compact`` the
+    variants are lanes 16 (1..16 requests), 32, 64, ... 1024 at 32 candidates, and nothing
+    else unless a caller passes another ``candidates``: the fill switch's plan (at most two
+    requests, ``CuteDSLNVMlaDecodeBlackwellRunner.get_plan_fill_split``) adds 16 lanes at 64
+    candidates. Without ``compact`` there is the single 1024-lane variant. Whether the
+    engine's graph warm-up visits every batch size of a serving run, and so compiles these
+    variants before the first request, is not checked here: the 1..16 request batches share
+    one variant.
+    """
     if not 0 < num_requests <= _SPLIT_PLAN_MAX_REQUESTS:
         raise ValueError(f"split plan supports 1..{_SPLIT_PLAN_MAX_REQUESTS} requests")
+    if piece_cost < 0:
+        raise ValueError(f"split plan piece cost must be >= 0, got {piece_cost}")
+    if candidates < 1:
+        raise ValueError(f"split plan needs at least one piece candidate, got {candidates}")
     for name, tensor in (("cache_seqs", cache_seqs), ("plan", plan)):
         if (
             tensor.dtype != torch.int32
@@ -167,9 +198,11 @@ def launch_mla_split_kv_plan(
         max(max_split, 1),
         KV_TILE=_SPLIT_PLAN_KV_TILE,
         MIN_TILES=_SPLIT_PLAN_MIN_TILES,
-        PIECE_COST=_SPLIT_PLAN_PIECE_COST_TILES,
-        MAX_PIECES=_SPLIT_PLAN_MAX_SPLIT,
-        BLOCK=_SPLIT_PLAN_MAX_REQUESTS,
+        PIECE_COST=int(piece_cost),
+        MAX_PIECES=candidates,
+        BLOCK=max(16, 1 << (num_requests - 1).bit_length())
+        if compact
+        else _SPLIT_PLAN_MAX_REQUESTS,
         num_warps=4,
     )
 
@@ -693,6 +726,20 @@ class CuteDslMlaFmha(PhasedFmha):
         block_split_kvs = self._split_kv_plan(
             meta, cache_seqs_base, batch_size, seq_len_q, num_heads
         )
+        # The split cap of that plan when it is wider than the tuned grid (see
+        # ``CuteDSLNVMlaDecodeBlackwellRunner.get_plan_fill_split``), else nothing.
+        plan_cap = {}
+        if block_split_kvs is not None:
+            from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
+                CuteDSLNVMlaDecodeBlackwellRunner,
+            )
+
+            fill_split = CuteDSLNVMlaDecodeBlackwellRunner.get_plan_fill_split(
+                batch_size,
+                CuteDSLNVMlaDecodeBlackwellRunner.get_folded_seq_len_q(num_heads, seq_len_q),
+            )
+            if fill_split:
+                plan_cap = {"plan_max_split": fill_split}
         output_view = output.view(batch_size, seq_len_q, num_heads, d_latent)
 
         q_latent = q_view[..., :d_latent].permute(2, 3, 1, 0)
@@ -729,6 +776,7 @@ class CuteDslMlaFmha(PhasedFmha):
                 else None
             ),
             block_split_kvs,
+            **plan_cap,
         )
 
     @staticmethod
@@ -759,17 +807,27 @@ class CuteDslMlaFmha(PhasedFmha):
                 return None
             plan = torch.empty(capacity, dtype=torch.int32, device=cache_seqs.device)
             meta._cute_dsl_mla_split_plan = plan
-        runner = CuteDSLNVMlaDecodeBlackwellRunner
-        rows_per_request = runner.get_folded_seq_len_q(num_heads, seq_len_q)
-        wave_clusters = max(runner._get_max_active_blocks() // runner._CLUSTER_SHAPE_MNK[0], 1)
+        rows_per_request, wave_clusters = CuteDSLNVMlaDecodeBlackwellRunner.get_split_plan_geometry(
+            num_heads, seq_len_q
+        )
         key = (batch_size, rows_per_request, wave_clusters, cache_seqs.data_ptr(), plan.data_ptr())
         if getattr(meta, "_cute_dsl_mla_split_plan_key", None) != key:
+            launch = {"compact": True} if _COMPACT_PLAN else {}
+            fill_split = CuteDSLNVMlaDecodeBlackwellRunner.get_plan_fill_split(
+                batch_size, rows_per_request
+            )
+            if fill_split:
+                # Up to ``fill_split`` splits per request, that many piece candidates, and
+                # the compact launch (at the 1024-request lane count a 64-candidate plan
+                # kernel runs several times longer than the 32-candidate one).
+                launch = dict(max_split=fill_split, candidates=fill_split, compact=True)
             launch_mla_split_kv_plan(
                 cache_seqs,
                 plan,
                 num_requests=batch_size,
                 rows_per_request=rows_per_request,
                 wave_clusters=wave_clusters,
+                **launch,
             )
             meta._cute_dsl_mla_split_plan_key = key
         return plan[:batch_size]

@@ -28,6 +28,7 @@ from tensorrt_llm._torch.disaggregation.native.auxiliary import (
     build_aux_transfer_layout,
 )
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import (
+    AttentionPolicy,
     HNDHeadMismatchMapper,
     IntactMapper,
     NHDHeadMismatchMapper,
@@ -111,6 +112,49 @@ def make_page_table(pool_ptrs=None, block_bytes=None, global_layer_ids=None, mam
         tokens_per_block=16,
         layer_groups=[attn_lg, mamba_lg],
         pool_groups=pool_groups,
+    )
+
+
+def make_draft_page_table(
+    bytes_per_token,
+    tokens_per_block,
+    global_layer_ids=(61, 62),
+    kv_heads_per_rank=1,
+    total_kv_heads=None,
+):
+    """A KVCachePageTable of standalone drafter layers.
+
+    The drafter's context is full-sequence KV on every rank (``cp_as_tp``): one
+    plane per layer whose page holds ``kv_heads_per_rank`` heads of
+    ``bytes_per_token`` bytes per token each (a single latent for an MLA drafter).
+    """
+    bytes_per_layer = bytes_per_token * kv_heads_per_rank * tokens_per_block
+    local_layers = [
+        LocalLayer(local_layer_id=i, global_layer_id=gid) for i, gid in enumerate(global_layer_ids)
+    ]
+    entries = [(i, i * bytes_per_layer, bytes_per_layer) for i in range(len(global_layer_ids))]
+    view = PoolView(
+        pool_idx=0,
+        buffer_entries=np.array(entries, dtype=BUFFER_ENTRY_DTYPE),
+        pool_role=frozenset({"key"}),
+        mapper_kind=MapperKind.INDEXED,
+        bytes_per_layer=bytes_per_layer,
+    )
+    group = AttentionLayerGroup(
+        pool_group_idx=0,
+        kv_head_num_per_rank=kv_heads_per_rank,
+        local_layers=local_layers,
+        pool_views=[view],
+        cp_as_tp=True,
+        total_kv_head_num=total_kv_heads or kv_heads_per_rank,
+    )
+    pool = PhysicalPool(
+        base_address=0x1000, slot_bytes=bytes_per_layer * len(global_layer_ids), num_slots=8
+    )
+    return KVCachePageTable(
+        tokens_per_block=tokens_per_block,
+        layer_groups=[group],
+        pool_groups=[PhysicalPoolGroup(pools=[pool])],
     )
 
 
@@ -495,6 +539,112 @@ def test_peer_registrar_incompatible_peer_raises():
     )
     with pytest.raises(ValueError):
         reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+
+
+def test_standalone_draft_peers_must_store_the_same_bytes_per_token():
+    """Draft pages are copied as bytes, so a peer that stores another dtype is rejected."""
+    bf16 = make_draft_page_table(bytes_per_token=1152, tokens_per_block=64)
+    fp8 = make_draft_page_table(bytes_per_token=576, tokens_per_block=64)
+    fp8_big_pages = make_draft_page_table(bytes_per_token=576, tokens_per_block=128)
+
+    AttentionPolicy.validate_peer_compatible(bf16, bf16, 64, 64)
+    AttentionPolicy.validate_peer_compatible(fp8, fp8, 64, 64)
+    # The pages differ in size, the bytes per token do not.
+    AttentionPolicy.validate_peer_compatible(fp8, fp8_big_pages, 64, 128)
+    with pytest.raises(ValueError, match="context_kv_dtype"):
+        AttentionPolicy.validate_peer_compatible(fp8, bf16, 64, 64)
+    with pytest.raises(ValueError, match="context_kv_dtype"):
+        AttentionPolicy.validate_peer_compatible(bf16, fp8, 64, 64)
+    with pytest.raises(ValueError, match="context_kv_dtype"):
+        AttentionPolicy.validate_peer_compatible(fp8_big_pages, bf16, 128, 64)
+    # Without the pages' token counts only the layouts are compared, as before.
+    AttentionPolicy.validate_peer_compatible(fp8, bf16)
+
+
+def test_standalone_draft_peers_may_hold_different_numbers_of_heads_per_rank():
+    """A GQA drafter's pages hold the rank's heads: TP and attention-DP ranks differ in size, not format."""
+    tp4 = make_draft_page_table(256, 64, kv_heads_per_rank=1, total_kv_heads=4)
+    tp2 = make_draft_page_table(256, 64, kv_heads_per_rank=2, total_kv_heads=4)
+    dp = make_draft_page_table(256, 64, kv_heads_per_rank=4, total_kv_heads=4)
+
+    for local, peer in ((tp2, dp), (dp, tp2), (tp4, tp2), (tp4, dp)):
+        AttentionPolicy.validate_peer_compatible(local, peer, 64, 64)
+    # Another tokens-per-block changes the page size as well, not the format.
+    AttentionPolicy.validate_peer_compatible(
+        tp2, make_draft_page_table(256, 128, kv_heads_per_rank=4, total_kv_heads=4), 64, 128
+    )
+    # A different storage format is still rejected, whatever the heads per rank.
+    fp8_dp = make_draft_page_table(128, 64, kv_heads_per_rank=4, total_kv_heads=4)
+    with pytest.raises(ValueError, match="context_kv_dtype"):
+        AttentionPolicy.validate_peer_compatible(tp2, fp8_dp, 64, 64)
+    with pytest.raises(ValueError, match="context_kv_dtype"):
+        AttentionPolicy.validate_peer_compatible(fp8_dp, tp2, 64, 64)
+    # So is a different number of heads in total.
+    eight_heads = make_draft_page_table(256, 64, kv_heads_per_rank=2, total_kv_heads=8)
+    with pytest.raises(ValueError, match="global KV head counts"):
+        AttentionPolicy.validate_peer_compatible(tp2, eight_heads, 64, 64)
+
+
+def test_standalone_draft_bytes_per_token_ignores_ordinary_attention_layers():
+    """Target layers pair by page layout; only the drafter's full-sequence groups are compared."""
+    AttentionPolicy.validate_peer_compatible(
+        make_page_table(block_bytes=[1024]), make_page_table(block_bytes=[2048]), 16, 16
+    )
+
+
+def test_peer_registrar_rejects_draft_peers_that_store_different_dtypes():
+    """The registrar hands both sides' page sizes to the draft storage check."""
+    local = make_rankinfo(
+        instance_name="local",
+        tp_size=1,
+        kv_heads_per_rank=1,
+        tokens_per_block=64,
+        is_mla=True,
+        layer_num_per_pp=[2],
+        page_table=make_draft_page_table(bytes_per_token=1152, tokens_per_block=64),
+    )
+    reg = _make_peer_registrar(local)
+    peer = make_rankinfo(
+        instance_name="peer",
+        instance_rank=1,
+        tp_size=1,
+        kv_heads_per_rank=1,
+        tokens_per_block=64,
+        is_mla=True,
+        layer_num_per_pp=[2],
+        page_table=make_draft_page_table(bytes_per_token=576, tokens_per_block=64),
+    )
+    with pytest.raises(ValueError, match="context_kv_dtype"):
+        reg.register(peer.instance_name, peer.instance_rank, peer)
+
+
+def test_peer_registrar_accepts_draft_peers_with_different_heads_per_rank():
+    """Context TP ranks hold part of the drafter's heads, attention-DP generation ranks all of them."""
+    local = make_rankinfo(
+        instance_name="local",
+        tp_size=2,
+        kv_heads_per_rank=1,
+        tokens_per_block=64,
+        is_mla=True,
+        layer_num_per_pp=[2],
+        page_table=make_draft_page_table(256, 64, kv_heads_per_rank=2, total_kv_heads=4),
+    )
+    reg = _make_peer_registrar(local)
+    peer = make_rankinfo(
+        instance_name="peer",
+        instance_rank=1,
+        tp_size=1,
+        kv_heads_per_rank=1,
+        tokens_per_block=64,
+        is_mla=True,
+        enable_attention_dp=True,
+        layer_num_per_pp=[2],
+        page_table=make_draft_page_table(256, 64, kv_heads_per_rank=4, total_kv_heads=4),
+    )
+
+    reg.register(peer.instance_name, peer.instance_rank, peer)
+
+    assert reg.get_peer_rank_info("peer", 1) is peer
 
 
 def test_peer_registrar_self_rank_info_property():

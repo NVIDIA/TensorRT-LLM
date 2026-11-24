@@ -4910,3 +4910,305 @@ def test_moe_module_weight_evict_first_is_bitwise_neutral_rubin(
     assert len(decided_off) >= 2 and not any(decided_off), decided_off
     assert torch.isfinite(out_on).all() and out_on.abs().max() > 0
     assert torch.equal(out_on, out_off)
+
+
+COMPACT_EPILOGUE_ENV = "TRTLLM_CUTEDSL_MOE_COMPACT_EPILOGUE"
+FC2_PDL_ENV = "TRTLLM_CUTEDSL_MOE_FC2_PDL"
+
+
+def test_moe_compact_epilogue_switch(monkeypatch):
+    from tensorrt_llm._torch.cute_dsl_kernels import moe_compact_epilogue
+
+    monkeypatch.delenv(COMPACT_EPILOGUE_ENV, raising=False)
+    assert moe_compact_epilogue() == 0
+    for value in ("0", "1", "2", "3"):
+        monkeypatch.setenv(COMPACT_EPILOGUE_ENV, value)
+        assert moe_compact_epilogue() == int(value)
+    for value in ("4", "yes", "-1"):
+        monkeypatch.setenv(COMPACT_EPILOGUE_ENV, value)
+        with pytest.raises(ValueError, match=COMPACT_EPILOGUE_ENV):
+            moe_compact_epilogue()
+
+
+def test_moe_fc2_pdl_switch(monkeypatch):
+    from tensorrt_llm._torch.cute_dsl_kernels import moe_fc2_pdl
+
+    monkeypatch.delenv(FC2_PDL_ENV, raising=False)
+    assert moe_fc2_pdl() is False
+    monkeypatch.setenv(FC2_PDL_ENV, "1")
+    assert moe_fc2_pdl() is True
+    monkeypatch.setenv(FC2_PDL_ENV, "0")
+    assert moe_fc2_pdl() is False
+    for value in ("2", "yes", "-1"):
+        monkeypatch.setenv(FC2_PDL_ENV, value)
+        with pytest.raises(ValueError, match=FC2_PDL_ENV):
+            moe_fc2_pdl()
+
+
+@pytest.mark.skipif(not IS_CUTLASS_DSL_RUBIN_AVAILABLE, reason="needs the CuTe DSL Rubin kernels")
+def test_moe_switches_reject_unsupported_configurations():
+    from tensorrt_llm._torch.cute_dsl_kernels.rubin.moe import (
+        rubin_contiguous_gather_grouped_blockscaled_gemm_act_fusion as fc1_module,
+    )
+    from tensorrt_llm._torch.cute_dsl_kernels.rubin.moe import (
+        rubin_contiguous_grouped_blockscaled_gemm_finalize_fusion as fc2_module,
+    )
+
+    Fc1Kernel = fc1_module.Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel
+    Fc2Kernel = fc2_module.Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel
+
+    def fc1(**kwargs):
+        args = dict(
+            sf_vec_size=16,
+            mma_inst_shape=(128, 128, 128),
+            mma_tiler=(128, 128, 256),
+            cluster_shape_mn=(1, 1),
+            vectorized_f32=True,
+            topk=8,
+            activation_type=ActivationType.SiTu,
+            situ_beta=4.0,
+            situ_linear_beta=25.0,
+            compact_epilogue=True,
+        )
+        args.update(kwargs)
+        return Fc1Kernel(**args)
+
+    def fc2(**kwargs):
+        args = dict(
+            sf_vec_size=16,
+            mma_inst_shape=(128, 256, 128),
+            mma_tiler=(128, 256, 256),
+            cluster_shape_mn=(1, 1),
+            topK=8,
+            compact_epilogue=True,
+        )
+        args.update(kwargs)
+        return Fc2Kernel(**args)
+
+    assert fc1().compact_epilogue and fc2().compact_epilogue
+    assert not fc1(compact_epilogue=False).compact_epilogue
+    with pytest.raises(ValueError, match="compact_epilogue"):
+        fc1(mma_inst_shape=(256, 128, 128), mma_tiler=(256, 128, 256), cluster_shape_mn=(2, 1))
+    with pytest.raises(ValueError, match="compact_epilogue"):
+        fc1(activation_type=ActivationType.Relu2, situ_beta=None, situ_linear_beta=None)
+    with pytest.raises(ValueError, match="compact_epilogue"):
+        fc1(
+            ugpu_half_gemm=True,
+            activation_type=ActivationType.Swiglu,
+            situ_beta=None,
+            situ_linear_beta=None,
+        )
+    with pytest.raises(ValueError, match="compact_epilogue"):
+        fc2(mma_inst_shape=(256, 256, 128), mma_tiler=(256, 256, 256), cluster_shape_mn=(2, 1))
+
+    # The FC2 programmatic launch with preloaded weights, and the early trigger of FC1 it relies on.
+    assert fc2(compact_epilogue=False, pdl_preload_weights=True).pdl_preload_weights
+    assert not fc2().pdl_preload_weights
+    assert fc1(early_launch_dependents=True).early_launch_dependents
+    assert not fc1().early_launch_dependents
+    with pytest.raises(ValueError, match="pdl_preload_weights"):
+        fc2(compact_epilogue=False, pdl_preload_weights=True, die_local=True)
+    with pytest.raises(ValueError, match="pdl_preload_weights"):
+        fc2(
+            compact_epilogue=False,
+            pdl_preload_weights=True,
+            mma_inst_shape=(256, 256, 128),
+            mma_tiler=(256, 256, 256),
+            cluster_shape_mn=(2, 1),
+        )
+
+
+@pytest.mark.skipif(not IS_CUTLASS_DSL_RUBIN_AVAILABLE, reason="needs the CuTe DSL Rubin kernels")
+def test_moe_fc2_pdl_tuning_hook_waits_for_its_sort(monkeypatch):
+    """The FC2 kernel built with TRTLLM_CUTEDSL_MOE_FC2_PDL reads its tile tables before its dependency wait. When the
+    FC2 runner is tuned, the sort of its input hook is the last kernel before the first profiled run, so the hook waits
+    for it, with the switch (and PDL) on only."""
+    runner = _make_sm107_nvfp4_finalize_runner(monkeypatch)
+    hook = runner.get_tuning_config().inputs_pre_hook
+    monkeypatch.setattr(
+        cute_dsl_custom_ops.GroupedGemmInputsHelper,
+        "inputs_pre_hook_finalize_fusion",
+        lambda self, inputs: inputs,
+    )
+    synced = []
+
+    class _Stream:
+        def synchronize(self):
+            synced.append(True)
+
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda *args, **kwargs: _Stream())
+    inputs = _make_sm107_nvfp4_finalize_inputs()
+    for enable_pdl, fc2_pdl, waits in (("1", "0", False), ("1", "1", True), ("0", "1", False)):
+        monkeypatch.setenv("TRTLLM_ENABLE_PDL", enable_pdl)
+        monkeypatch.setenv(FC2_PDL_ENV, fc2_pdl)
+        synced.clear()
+        assert hook(inputs) is inputs
+        assert synced == ([True] if waits else []), (enable_pdl, fc2_pdl)
+
+
+def _rubin_situ_moe_switch_runner(num_tokens: int, routing: str, monkeypatch):
+    """A CuTe DSL NVFP4 SiTU MoE on Rubin and a function that runs it under environment switches.
+
+    top_k = 2: every output row sums at most two bf16 contributions, so the FC2 finalize reduction is order independent
+    and a switch that changes no arithmetic must leave the output bitwise unchanged. "skewed" sends half of the tokens
+    to one expert, so one call mixes tiles with few valid rows and tiles with many. ``run(env)`` sets the given
+    switches (the others of this file off), runs the MoE and returns its output and, for the FC1 and FC2 runners, the
+    kernel cache keys the call looked up, which prove which kernels it built.
+    """
+    from _torch.modules.moe.quantize_utils import get_test_quant_params
+    from transformers.configuration_utils import PretrainedConfig
+
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.modules.fused_moe import RenormalizeMoeRoutingMethod
+    from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe_backend
+    from tensorrt_llm._torch.modules.fused_moe.impl_contract import MoECommPlan, MoERunContext
+    from tensorrt_llm._torch.modules.fused_moe.interface import MoESchedulerKind
+    from tensorrt_llm.mapping import Mapping
+    from tensorrt_llm.models.modeling_utils import QuantAlgo
+
+    monkeypatch.delenv("TRTLLM_K3_DIE_LOCAL_EXPERTS", raising=False)
+    monkeypatch.setenv("TRTLLM_ENABLE_PDL", "1")
+
+    hidden_size, intermediate_size, num_experts, top_k = 2048, 1536, 256, 2
+    dtype = torch.bfloat16
+    torch.manual_seed(0)
+    routing_method = RenormalizeMoeRoutingMethod(top_k=top_k)
+    x = torch.randn((num_tokens, hidden_size), dtype=dtype, device="cuda")
+    router_logits = torch.randn((num_tokens, num_experts), dtype=dtype, device="cuda")
+    if routing == "skewed":
+        router_logits[: num_tokens // 2, 3] += 100.0
+    quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+        QuantAlgo.NVFP4, x, "CUTEDSL"
+    )
+    weights = quantize_util_cls(
+        num_experts=num_experts,
+        dtype=dtype,
+        intermediate_size=intermediate_size,
+        hidden_size=hidden_size,
+        quant_config=quant_config,
+        bias=False,
+        swiglu_gptoss_style=False,
+    ).create_weights(**quant_kwargs)
+    pretrained_config = PretrainedConfig()
+    pretrained_config.num_experts = num_experts
+    pretrained_config.hidden_size = hidden_size
+    pretrained_config.intermediate_size = intermediate_size
+    pretrained_config.torch_dtype = dtype
+    backend = create_moe_backend(
+        moe_cls=CuteDslFusedMoE,
+        routing_method=routing_method,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        dtype=dtype,
+        reduce_results=True,
+        model_config=ModelConfig(
+            pretrained_config=pretrained_config,
+            quant_config=quant_config,
+            mapping=Mapping(),
+            moe_backend="CUTEDSL",
+        ),
+        init_load_balancer=False,
+        activation="situ",
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+    )
+    backend.load_weights([weights])
+    backend.post_load_weights()
+    backend.cuda()
+
+    selected, scales = routing_method.apply(router_logits)
+    x_q, x_sf = backend.quantize_input(x, post_quant_comm=False)
+    args = dict(
+        x=x_q,
+        token_selected_experts=selected.to(torch.int32),
+        token_final_scales=scales.to(torch.float32),
+        x_sf=x_sf,
+    )
+    if backend.scheduler_kind == MoESchedulerKind.EXTERNAL_COMM:
+        args["comm_plan"] = MoECommPlan(
+            input_sf_swizzled=True,
+            enable_alltoall=False,
+            moe_output=None,
+            payload_in_workspace=False,
+        )
+
+    class _KeyLog(dict):
+        """The runner's kernel cache, logging every key a lookup asks for."""
+
+        def __init__(self, base):
+            super().__init__(base)
+            self.used = []
+
+        def __contains__(self, key):
+            self.used.append(key)
+            return super().__contains__(key)
+
+    logs = []
+    for name in (
+        "Sm107BlockScaledContiguousGatherGroupedGemmActFusionRunner",
+        "Sm107BlockScaledContiguousGroupedGemmFinalizeFusionRunner",
+    ):
+        runner = getattr(cute_dsl_custom_ops, name)
+        monkeypatch.setattr(runner, "kernel_cache", _KeyLog(runner.kernel_cache))
+        logs.append(runner.kernel_cache)
+
+    def run(env):
+        for name in (COMPACT_EPILOGUE_ENV, FC2_PDL_ENV):
+            monkeypatch.setenv(name, env.get(name, "0"))
+        for log in logs:
+            log.used.clear()
+        with torch.inference_mode():
+            out = backend.run_moe(MoERunContext(**args)).clone()
+        torch.cuda.synchronize()
+        return out, [list(log.used) for log in logs]
+
+    return run
+
+
+@pytest.mark.skipif(
+    get_sm_version() != 107,
+    reason="This test is only supported on Rubin (SM 107) GPUs",
+)
+@pytest.mark.parametrize("routing", ["random", "skewed"])
+@pytest.mark.parametrize("num_tokens", [6, 48])
+def test_moe_module_compact_epilogue_is_bitwise_neutral_rubin(
+    num_tokens: int, routing: str, monkeypatch
+):
+    """The compact epilogues change no arithmetic: the MoE output is bitwise the same with each of them on and off.
+
+    With "skewed" routing one call mixes compact tiles with tiles past the compact limit (default epilogue).
+    """
+    run = _rubin_situ_moe_switch_runner(num_tokens, routing, monkeypatch)
+    out_off, used_off = run({})
+    assert torch.isfinite(out_off).all() and out_off.abs().max() > 0
+    for value in ("1", "2", "3"):
+        out_on, used_on = run({COMPACT_EPILOGUE_ENV: value})
+        assert torch.equal(out_on, out_off), value
+        # FC1 (bit 1) and FC2 (bit 2) looked up the compact kernel exactly when their bit is set.
+        for bit, used, used_default in zip((1, 2), used_on, used_off):
+            assert used and used_default, (value, bit)
+            assert all("compact_epilogue" in key for key in used) == bool(int(value) & bit)
+            assert not any("compact_epilogue" in key for key in used_default)
+
+
+@pytest.mark.skipif(
+    get_sm_version() != 107,
+    reason="This test is only supported on Rubin (SM 107) GPUs",
+)
+@pytest.mark.parametrize("routing", ["random", "skewed"])
+@pytest.mark.parametrize("num_tokens", [6, 48])
+def test_moe_module_fc2_pdl_is_bitwise_neutral_rubin(num_tokens: int, routing: str, monkeypatch):
+    """The FC2 programmatic launch changes no arithmetic: the MoE output is bitwise the same with it on and off,
+    alone and with the compact epilogues, and the switch-on runs built the early-trigger FC1 and the PDL FC2 kernels.
+    """
+    run = _rubin_situ_moe_switch_runner(num_tokens, routing, monkeypatch)
+    out_off, used_off = run({})
+    assert torch.isfinite(out_off).all() and out_off.abs().max() > 0
+    for env in ({FC2_PDL_ENV: "1"}, {FC2_PDL_ENV: "1", COMPACT_EPILOGUE_ENV: "3"}):
+        out_on, (fc1_used, fc2_used) = run(env)
+        assert torch.equal(out_on, out_off), env
+        assert fc1_used and all("early_launch_dependents" in key for key in fc1_used), env
+        assert fc2_used and all("pdl_preload_weights" in key for key in fc2_used), env
+    for fc_used, flag in zip(used_off, ("early_launch_dependents", "pdl_preload_weights")):
+        assert fc_used and not any(flag in key for key in fc_used)

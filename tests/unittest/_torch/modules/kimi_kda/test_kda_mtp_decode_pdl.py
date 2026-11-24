@@ -12,7 +12,8 @@ committed state, the conv windows and the replay caches must be BITWISE identica
 launch, over two chained verify rounds with mixed per-slot accepted counts, for every ``num_spec``
 0..7.
 
-Device tests (SM107 with the CuTe DSL Rubin kernels; the switch is ignored elsewhere):
+Device tests (SM107 with the CuTe DSL Rubin kernels, or SM103 (GB300) where the gate's
+``PORTABLE_ON_SM103`` allowlist honours the switch; it is ignored elsewhere):
 
 * parity: the PDL launch against the default launch on every layout the K3 packed path can select
   (a cluster pair per tile, one CTA per tile in one wave and in several waves, the compact layout
@@ -64,8 +65,14 @@ def _device_skip_reason():
         return f"deps: {_KERNEL_ERR or _POLICY_ERR}"
     if not torch.cuda.is_available():
         return "needs a GPU"
-    if torch.cuda.get_device_capability(0) != (10, 7):
-        return "the MK1 PDL variant is validated on SM107 only"
+    cap = torch.cuda.get_device_capability(0)
+    if cap == (10, 3):
+        # GB300: the switch is in the gate's SM103 allowlist (no SM107 content in the kernel).
+        if PDL_ENV not in mk1_gate.PORTABLE_ON_SM103 or not mk1_gate._sm103_portable_platform():
+            return "needs the CuTe DSL on SM103 and the switch in PORTABLE_ON_SM103"
+        return None
+    if cap != (10, 7):
+        return "the MK1 PDL variant is validated on SM103 and SM107 only"
     if not mk1_gate.mk1_platform_supported():
         return "needs the CuTe DSL Rubin helpers (rubin_helpers)"
     return None
@@ -282,6 +289,7 @@ def test_switch_off_by_default(monkeypatch):
 @requires_kernel_module
 def test_switch_ignored_off_sm107(monkeypatch):
     monkeypatch.setattr(mk1_gate, "mk1_platform_supported", lambda: False)
+    monkeypatch.setattr(mk1_gate, "_sm103_portable_platform", lambda: False)
     _set_pdl(monkeypatch, True)
     assert kda_ops._verify_pdl_enabled() is False
 

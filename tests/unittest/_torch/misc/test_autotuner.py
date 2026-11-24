@@ -6,10 +6,13 @@ import itertools
 import json
 import math
 import os
+import pathlib
 import pickle
 import statistics
 import sys
 import tempfile
+import threading
+import time
 from typing import Any, List
 
 import cloudpickle
@@ -584,6 +587,70 @@ def test_load_cache_skips_non_literal_tactic():
     # ... and the non-literal entry was skipped, not silently mis-decoded.
     bad = ("op_bad", "R", "0", ((2, 128), ))
     assert bad not in cache.cache
+
+
+def _write_cache_file(cache_path):
+    """Write a cache file the way the ranks do: a tmp file, then a rename."""
+    cache = AutoTuner.get().profiling_cache
+    doc = {
+        "metadata": cache._serialize_metadata(),
+        "shared": {},
+        "rank_0": {
+            "('op_wait', 'R', '0', ((1, 128),))": {
+                "runner_id": 0,
+                "tactic": "3",
+                "min_time": 0.001
+            },
+        },
+    }
+    tmp_path = cache_path + ".tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(doc, f)
+    os.rename(tmp_path, cache_path)
+
+
+@pytest.mark.parametrize("name_reported_present", [False, True])
+def test_load_cache_waits_for_a_file_that_appears(monkeypatch, tmp_path,
+                                                  name_reported_present):
+    """A rank on another node of a shared file system can find the cache file
+    missing while another rank replaces it; load_cache must wait for it instead
+    of raising (the other ranks would wait for that rank for ever)."""
+    monkeypatch.setattr(autotuner, "_CACHE_FILE_WAIT_SECONDS", 30.0)
+    monkeypatch.setattr(autotuner, "_CACHE_FILE_POLL_SECONDS", 0.01)
+    cache_path = str(tmp_path / "late_cache.json")
+    if name_reported_present:
+        # the existence test passes, the open then fails: the other order of
+        # the same race
+        real_exists = pathlib.Path.exists
+
+        def exists(self, *args, **kwargs):
+            if str(self) == cache_path:
+                return True
+            return real_exists(self, *args, **kwargs)
+
+        monkeypatch.setattr(pathlib.Path, "exists", exists)
+    cache = AutoTuner.get().profiling_cache
+    cache.clear()
+    writer = threading.Timer(0.2, _write_cache_file, args=(cache_path, ))
+    writer.start()
+    try:
+        cache.load_cache(cache_path, rank=0)
+    finally:
+        writer.join()
+    assert ("op_wait", "R", "0", ((1, 128), )) in cache.cache
+
+
+def test_load_cache_raises_when_the_file_never_appears(monkeypatch, tmp_path):
+    monkeypatch.setattr(autotuner, "_CACHE_FILE_WAIT_SECONDS", 0.2)
+    monkeypatch.setattr(autotuner, "_CACHE_FILE_POLL_SECONDS", 0.01)
+    cache_path = str(tmp_path / "missing_cache.json")
+    cache = AutoTuner.get().profiling_cache
+    start = time.monotonic()
+    with pytest.raises(FileNotFoundError, match="Cache file not found"):
+        cache.load_cache(cache_path, rank=0)
+    assert time.monotonic() - start >= 0.2
+    # waiting for a missing file must not create its lock file
+    assert not os.path.exists(cache_path + ".lock")
 
 
 def test_kernel_testing_single_context():

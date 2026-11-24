@@ -34,7 +34,7 @@ from ...flashinfer_utils import get_env_enable_pdl
 _BLOCK_M = 16
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["M", "M_PAD4"])
 def _gate_mul_fp8_kernel(
     a_ptr,
     g_ptr,
@@ -46,6 +46,8 @@ def _gate_mul_fp8_kernel(
     K: tl.constexpr,
     BLOCK_M: tl.constexpr,
     LAUNCH_WITH_PDL: tl.constexpr,
+    DEEPGEMM: tl.constexpr = False,
+    M_PAD4=0,
 ):
     pid_m = tl.program_id(0)
     kb = tl.program_id(1)
@@ -84,9 +86,16 @@ def _gate_mul_fp8_kernel(
     tl.store(q_ptr + rows64[:, None] * K + cols[None, :], codes, mask=mask)
     # One 32-bit word per (row, 128-column block): the scale byte for each of its four K32 groups,
     # at byte (row // 128) * (K // 128) * 512 + kb * 512 + (row % 32) * 16 + (row % 128) // 32 * 4.
-    word = tl.where(in_rows, e8 * 0x01010101, 0)
-    w_off = (rows // 128) * (K // 128) * 128 + kb * 128 + (rows % 32) * 4 + (rows % 128) // 32
-    tl.store(sf_ptr + w_off, word)
+    if DEEPGEMM:
+        # DeepGEMM's packed MN-major layout: int32 [M, K / 512] with strides (1, ceil4(M)); the
+        # scale of 128-column block kb is byte kb % 4 of word (kb // 4) * ceil4(M) + row, and the
+        # padding rows (M <= row < ceil4(M)) are zeroed.
+        b_off = ((kb // 4) * M_PAD4 + rows) * 4 + kb % 4
+        tl.store(sf_ptr + b_off, tl.where(in_rows, e8, 0).to(tl.uint8), mask=rows < M_PAD4)
+    else:
+        word = tl.where(in_rows, e8 * 0x01010101, 0)
+        w_off = (rows // 128) * (K // 128) * 128 + kb * 128 + (rows % 32) * 4 + (rows % 128) // 32
+        tl.store(sf_ptr + w_off, word)
     if LAUNCH_WITH_PDL:
         tl.extra.cuda.gdc_launch_dependents()
 
@@ -128,4 +137,48 @@ def gate_mul_fp8_r128c4(
     return codes, scales
 
 
-__all__ = ["gate_mul_fp8_r128c4"]
+def gate_mul_fp8_deepgemm(
+    attn_out: torch.Tensor, gate: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """E4M3 ``[M, K]`` codes and DeepGEMM-packed UE8M0 scales of ``attn_out * gate.sigmoid()``.
+
+    The SM100/103 twin of :func:`gate_mul_fp8_r128c4`: byte for byte what
+    ``torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(attn_out * gate.sigmoid(), False)``
+    returns (the scale: int32 ``[M, K / 512]`` with strides ``(1, ceil4(M))``, the operand of
+    ``fp8_prequantized_swap_ab_gemm``), in one kernel instead of the sigmoid, the multiply and the
+    quantization. The scale rows beyond ``M`` (up to ``ceil4(M)``) are zero. ``K % 512 == 0``.
+    """
+    if attn_out.dim() != 2 or gate.shape != attn_out.shape:
+        raise ValueError("attn_out and gate must be [M, K] tensors of the same shape")
+    if attn_out.dtype != torch.bfloat16 or gate.dtype != torch.bfloat16:
+        raise ValueError("attn_out and gate must be BF16")
+    m, k = attn_out.shape
+    if k % 512 or attn_out.stride(1) != 1 or gate.stride(1) != 1:
+        raise ValueError("K must be a multiple of 512 and the columns contiguous")
+    m_pad4 = (m + 3) // 4 * 4
+    codes = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=attn_out.device)
+    words = torch.empty((m_pad4 * (k // 512),), dtype=torch.int32, device=attn_out.device)
+    scales = words.as_strided((m, k // 512), (1, m_pad4))
+    if m == 0:
+        return codes, scales
+    launch_with_pdl = get_env_enable_pdl() and get_sm_version() >= 90
+    _gate_mul_fp8_kernel[((m_pad4 + _BLOCK_M - 1) // _BLOCK_M, k // 128)](
+        attn_out,
+        gate,
+        codes,
+        words.view(torch.uint8),
+        m,
+        attn_out.stride(0),
+        gate.stride(0),
+        K=k,
+        BLOCK_M=_BLOCK_M,
+        LAUNCH_WITH_PDL=launch_with_pdl,
+        DEEPGEMM=True,
+        M_PAD4=m_pad4,
+        num_warps=4,
+        launch_pdl=launch_with_pdl,
+    )
+    return codes, scales
+
+
+__all__ = ["gate_mul_fp8_r128c4", "gate_mul_fp8_deepgemm"]

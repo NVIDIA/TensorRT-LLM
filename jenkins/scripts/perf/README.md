@@ -297,11 +297,11 @@ When modifying disaggregated SLURM scripts, keep these invariants:
 When adding or re-enabling perf sanity tests, two files must be updated:
 
 1. **Test-db YAML** in `tests/integration/test_lists/test-db/` — add or uncomment the test case line
-2. **`jenkins/L0_Test.groovy`** — update or add the CI stage in `launchTestJobs()`
+2. **`jenkins/L0_Test.groovy`** — update or add the CI stage in `getX86SlurmTestConfigs()`, `getSBSASlurmTestConfigs()` or `getMultiNodesSBSAConfigs()`
 
 ### Where to Find CI Stage Definitions
 
-In `jenkins/L0_Test.groovy`, search for `launchTestJobs`. Perf sanity stages are grouped by test type:
+In `jenkins/L0_Test.groovy`, search for those functions. Perf sanity stages are grouped by test type:
 
 | Config Variable | Test Type | Platform |
 |-----------------|-----------|----------|

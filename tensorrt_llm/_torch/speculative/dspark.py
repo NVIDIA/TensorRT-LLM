@@ -19,6 +19,7 @@
 # produces the whole block (and its confidence-truncated length) inside a single
 # ``DSv4DSparkDraftModel.forward`` rather than via mask-token cross-attention.
 
+import math
 import os
 from collections import deque
 from dataclasses import dataclass
@@ -50,6 +51,27 @@ MARKOV_SAMPLED_FEEDBACK_ENV_VAR = "TLLM_DSPARK_MARKOV_SAMPLED_FEEDBACK"
 def markov_sampled_feedback_enabled() -> bool:
     """Whether ``TLLM_DSPARK_MARKOV_SAMPLED_FEEDBACK=1`` is set."""
     return os.environ.get(MARKOV_SAMPLED_FEEDBACK_ENV_VAR, "0") == "1"
+
+
+# Proposal temperature of the sampled-feedback draft chain relative to the request temperature
+# (read at import, default 1.0). Position i is drawn from softmax(logits_i / (T * scale)) and
+# that same proposal is stored for the rejection test, so verification stays exact in
+# distribution for any scale > 0; only the acceptance rate changes.
+DRAFT_TEMP_SCALE_ENV_VAR = "TLLM_DSPARK_DRAFT_TEMP_SCALE"
+
+
+def _draft_temp_scale() -> float:
+    scale = float(os.environ.get(DRAFT_TEMP_SCALE_ENV_VAR, "1.0"))
+    # Finite and bounded: inf gives a uniform proposal and tiny values overflow logits / (T * scale)
+    # to a NaN proposal row, which would break the exactness of the rejection test.
+    if not (math.isfinite(scale) and 1e-3 <= scale <= 1e3):
+        raise ValueError(
+            f"{DRAFT_TEMP_SCALE_ENV_VAR} must be finite and in [1e-3, 1e3], got {scale}"
+        )
+    return scale
+
+
+_DRAFT_TEMP_SCALE = _draft_temp_scale()
 
 
 if TYPE_CHECKING:
@@ -973,13 +995,16 @@ class DSparkWorker(DFlashWorker):
             if applies:
                 logger.info(
                     "TLLM_DSPARK_MARKOV_SAMPLED_FEEDBACK=1: the Markov chain advances on "
-                    "the sampled draft tokens."
+                    f"the sampled draft tokens; proposal temperature = {_DRAFT_TEMP_SCALE:g} x "
+                    f"request temperature ({DRAFT_TEMP_SCALE_ENV_VAR}), verification at the "
+                    "request temperature."
                 )
             else:
                 logger.warning(
                     "TLLM_DSPARK_MARKOV_SAMPLED_FEEDBACK=1 needs TLLM_SPEC_FAST_RS=1, "
                     "advanced_sampling_mode=no_topk or no_topk_no_topp and full-vocab draft "
-                    "logits; keeping the greedy Markov chain for the rejection proposal."
+                    "logits; keeping the greedy Markov chain for the rejection proposal "
+                    f"({DRAFT_TEMP_SCALE_ENV_VAR}={_DRAFT_TEMP_SCALE:g} is inert on that chain)."
                 )
         return applies
 
@@ -1001,12 +1026,16 @@ class DSparkWorker(DFlashWorker):
             return super()._draft_tokens_from_block_logits(
                 draft_model, gen_logits, inputs, spec_metadata, batch_size, num_contexts
             )
+        temperatures = spec_metadata.request_temperatures[num_contexts:batch_size]
+        if _DRAFT_TEMP_SCALE != 1.0:
+            # Same tensor drives sampling and the stored proposal (see _DRAFT_TEMP_SCALE).
+            temperatures = temperatures * _DRAFT_TEMP_SCALE
         chain_args = (
             gen_logits,
             inputs["first_prev_tokens"],
             draft_model.markov_w1,
             draft_model.markov_w2,
-            spec_metadata.request_temperatures[num_contexts:batch_size],
+            temperatures,
         )
         req_args = (
             spec_metadata.batch_slot_ids[num_contexts:batch_size],

@@ -25,6 +25,8 @@ l0_vr200:
   # K3 CTX fusion, shared BF16 MXFP8 GEMM, and dispatch regressions.
   - unittest/_torch/thop/test_k3_ctx_fp8_output.py
   - unittest/_torch/thop/test_k3_kvb_stationary.py
+  # K3 MLA decode fused FP8 query / KV-row kernel (TRTLLM_K3_MLA_FUSED_QKV, SM107 only): bit-exact against the stock chain.
+  - unittest/_torch/modules/test_k3_mla_fused_qkv.py
   # K3 DEP16 generated moe_sort (TRTLLM_K3_MOE_SORT_KF, SM107 only): layout contract, gate, PDL wait.
   - unittest/_torch/thop/parallel/test_k3_moe_sort_kf.py TIMEOUT (10)
   - unittest/_torch/thop/parallel/test_cute_dsl_moe.py::test_nvfp4_gather_grouped_gemm_situ_rubin

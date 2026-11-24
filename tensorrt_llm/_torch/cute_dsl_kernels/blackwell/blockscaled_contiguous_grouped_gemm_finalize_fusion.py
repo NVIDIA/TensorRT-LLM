@@ -47,6 +47,9 @@ from .utils import (
     is_power_of_2,
 )
 
+# L2 cache hint of a TMA load: evict first (CUTLASS ``CacheHintSm90::EVICT_FIRST``).
+_TMA_EVICT_FIRST = 0x12F0000000000000
+
 """
 High-performance persistent blockscaled contiguous grouped dense GEMM (C = alpha * (SFA * A) * (SFB * B)) example for
 the NVIDIA Blackwell architecture using CUTE DSL.
@@ -204,6 +207,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
         raster_along_m: bool = False,
+        pdl_preload_weights: bool = False,
+        weight_evict_first: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel.
 
@@ -226,6 +231,19 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         self.sf_vec_size = sf_vec_size
         self.acc_dtype = cutlass.Float32
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
+        # Programmatic dependent launch with the weights of the first tile loaded before the
+        # dependency wait (port of the Rubin FC2 kernel's ``pdl_preload_weights``). The FC1 GEMM
+        # before this kernel lets its dependents launch right after its own wait on the sort, so the
+        # tile tables are complete when this kernel starts: a CTA on an SM released by FC1 sets up,
+        # its TMA warp loads B and SFB of the first tile's first stages, and waits for FC1 only
+        # before its first load of A / SFA, the only inputs FC1 writes. Epilogue reads (routing maps,
+        # scales, atomic add into the output) happen after the first accumulator, i.e. after the
+        # wait. No value changes. 1-CTA MMA tactics only.
+        self.pdl_preload_weights = bool(pdl_preload_weights)
+        if self.pdl_preload_weights and self.use_2cta_instrs:
+            raise ValueError("pdl_preload_weights needs a 1-CTA MMA tactic (mma tiler M 128)")
+        # L2 evict-first hint on the TMA loads of the expert weights (B) and their block scales (SFB).
+        self.weight_evict_first = bool(weight_evict_first)
         self.cluster_shape_mn = cluster_shape_mn
         self.raster_along_m = raster_along_m
         # K dimension is deferred in _setup_attributes
@@ -1173,7 +1191,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         else:
             self.cta_sync_barrier.arrive_and_wait()
 
-        griddepcontrol_wait()
+        if cutlass.const_expr(not self.pdl_preload_weights):
+            griddepcontrol_wait()
 
         #
         # Specialized Schedule warp
@@ -1277,6 +1296,11 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         # Specialized TMA load warp
         #
         if warp_idx == self.tma_warp_id:
+            b_cache_kw = (
+                {"cache_policy": cutlass.Int64(_TMA_EVICT_FIRST)}
+                if cutlass.const_expr(self.weight_evict_first)
+                else {}
+            )
             ab_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_ab_stage
             )
@@ -1299,6 +1323,44 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             )
             tile_info_pipeline.consumer_release(tile_info_consumer_state)
             tile_info_consumer_state.advance()
+
+            # Programmatic launch: B and SFB of the first tile's first stages before the dependency
+            # wait; their A and SFA loads follow the wait in the tile loop below.
+            preloaded = cutlass.Int32(0)
+            if cutlass.const_expr(self.pdl_preload_weights):
+                if is_valid_tile:
+                    pre_n = tile_info[1]
+                    pre_l = tile_info[2]
+                    pre_sfb_n = pre_n
+                    if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 64):
+                        pre_sfb_n = pre_n // 2
+                    pre_gB = tBgB_0[(None, pre_n, None, pre_l)]
+                    pre_gSFB = tBgSFB_0[(None, pre_sfb_n, None, pre_l)]
+                    preloaded = cutlass.min(k_tile_cnt, cutlass.Int32(self.num_ab_stage))
+                    pre_state = pipeline.make_pipeline_state(
+                        pipeline.PipelineUserType.Producer, self.num_ab_stage
+                    )
+                    for k_pre in cutlass.range(0, preloaded, 1, unroll=1):
+                        ab_pipeline.producer_acquire(pre_state)
+                        pre_bar = ab_pipeline.producer_get_barrier(pre_state)
+                        cute.copy(
+                            tma_atoms_b[0],
+                            pre_gB[(None, k_pre)],
+                            tBsB_0[(None, pre_state.index)],
+                            tma_bar_ptr=pre_bar,
+                            mcast_mask=b_full_mcast_mask,
+                            **b_cache_kw,
+                        )
+                        cute.copy(
+                            tma_atoms_sfb[0],
+                            pre_gSFB[(None, k_pre)],
+                            tBsSFB_0[(None, pre_state.index)],
+                            tma_bar_ptr=pre_bar,
+                            mcast_mask=sfb_full_mcast_mask,
+                            **b_cache_kw,
+                        )
+                        pre_state.advance()
+                griddepcontrol_wait()
 
             while is_valid_tile:
                 mma_tile_coord_mnl = (
@@ -1338,8 +1400,13 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
 
                     tma_bar = ab_pipeline.producer_get_barrier(ab_producer_state)
 
-                    # Conditionally wait for AB buffer empty
-                    ab_pipeline.producer_acquire(ab_producer_state, peek_ab_empty_status)
+                    # Conditionally wait for AB buffer empty (stages below `preloaded` were
+                    # acquired and given their B / SFB loads before the dependency wait)
+                    if cutlass.const_expr(self.pdl_preload_weights):
+                        if k_tile >= preloaded:
+                            ab_pipeline.producer_acquire(ab_producer_state, peek_ab_empty_status)
+                    else:
+                        ab_pipeline.producer_acquire(ab_producer_state, peek_ab_empty_status)
 
                     # TMA load A/B
                     cute.copy(
@@ -1358,26 +1425,50 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                     )
                     tBgB_slice = tBgB_0[(None, mma_tile_coord_mnl[1], None, expert_idx)]
                     tBgSFB_slice = tBgSFB_0[(None, slice_n, None, expert_idx)]
-                    cute.copy(
-                        tma_atoms_b[0],
-                        tBgB_slice[(None, ab_producer_state.count)],
-                        tBsB_pipe,
-                        tma_bar_ptr=tma_bar,
-                        mcast_mask=b_full_mcast_mask,
-                    )
-                    cute.copy(
-                        tma_atoms_sfb[0],
-                        tBgSFB_slice[(None, ab_producer_state.count)],
-                        tBsSFB_pipe,
-                        tma_bar_ptr=tma_bar,
-                        mcast_mask=sfb_full_mcast_mask,
-                    )
+                    if cutlass.const_expr(self.pdl_preload_weights):
+                        if k_tile >= preloaded:
+                            cute.copy(
+                                tma_atoms_b[0],
+                                tBgB_slice[(None, ab_producer_state.count)],
+                                tBsB_pipe,
+                                tma_bar_ptr=tma_bar,
+                                mcast_mask=b_full_mcast_mask,
+                                **b_cache_kw,
+                            )
+                            cute.copy(
+                                tma_atoms_sfb[0],
+                                tBgSFB_slice[(None, ab_producer_state.count)],
+                                tBsSFB_pipe,
+                                tma_bar_ptr=tma_bar,
+                                mcast_mask=sfb_full_mcast_mask,
+                                **b_cache_kw,
+                            )
+                    else:
+                        cute.copy(
+                            tma_atoms_b[0],
+                            tBgB_slice[(None, ab_producer_state.count)],
+                            tBsB_pipe,
+                            tma_bar_ptr=tma_bar,
+                            mcast_mask=b_full_mcast_mask,
+                            **b_cache_kw,
+                        )
+                        cute.copy(
+                            tma_atoms_sfb[0],
+                            tBgSFB_slice[(None, ab_producer_state.count)],
+                            tBsSFB_pipe,
+                            tma_bar_ptr=tma_bar,
+                            mcast_mask=sfb_full_mcast_mask,
+                            **b_cache_kw,
+                        )
 
                     # Peek (try_wait) AB buffer empty for k_tile = prefetch_k_tile_cnt + k_tile + 1
                     ab_producer_state.advance()
                     peek_ab_empty_status = cutlass.Boolean(1)
                     if ab_producer_state.count < k_tile_cnt:
                         peek_ab_empty_status = ab_pipeline.producer_try_acquire(ab_producer_state)
+
+                if cutlass.const_expr(self.pdl_preload_weights):
+                    preloaded = cutlass.Int32(0)
 
                 #
                 # Advance to next tile

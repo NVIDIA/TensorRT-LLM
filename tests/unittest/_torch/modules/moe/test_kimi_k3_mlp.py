@@ -206,6 +206,7 @@ def test_gated_mlp_supports_fused_situ(situ_beta, situ_linear_beta):
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("defer_knob", [False, True], ids=["knob_off", "knob_on"])
 @pytest.mark.parametrize(
     "attention_dp,tp_size,rank,expected_shared_tp,expected_shared_rank,moe_backend,scheduler_kind",
     [
@@ -218,6 +219,7 @@ def test_gated_mlp_supports_fused_situ(situ_beta, situ_linear_beta):
 )
 def test_kimi_k3_shared_expert_parallel_construction(
     monkeypatch,
+    defer_knob,
     attention_dp,
     tp_size,
     rank,
@@ -258,6 +260,8 @@ def test_kimi_k3_shared_expert_parallel_construction(
     create_moe_kwargs = {}
 
     monkeypatch.setenv("KIMI_K3_ROUTER_BF16", "0")
+    monkeypatch.setattr(modeling_kimi_linear, "_K3_DEFER_SHARED_AR", defer_knob)
+    monkeypatch.setattr(modeling_kimi_linear, "_K3_DEFER_SHARED_AR_MIN_TOKENS", 128)
     monkeypatch.setattr(
         modeling_kimi_linear,
         "create_moe",
@@ -291,12 +295,21 @@ def test_kimi_k3_shared_expert_parallel_construction(
     # TP recipes (no attention DP, no MoE all-to-all) keep the PDL launch.
     assert isinstance(shared.activation, SituAndMul)
     assert shared.activation.overlaps_moe_dispatch is attention_dp
-    assert runtime._defer_shared_allreduce is (
+    always_deferred = (
         not attention_dp
         and tp_size > 1
         and moe_backend == "MEGAMOE_CUTEDSL"
         and scheduler_kind == "FUSED_COMM"
     )
+    if defer_knob:
+        # TRTLLM_K3_DEFER_SHARED_AR extends the deferral to the other backends, still only
+        # with a tensor-parallel shared expert.
+        assert runtime._defer_shared_allreduce is (not attention_dp and tp_size > 1)
+    else:
+        assert runtime._defer_shared_allreduce is always_deferred
+    if runtime._defer_shared_allreduce:
+        # The fused-communication backend defers at every token count, the knob above its threshold.
+        assert runtime._defer_shared_ar_min_tokens == (None if always_deferred else 128)
     assert (runtime.moe_routed_event is not None) is runtime._defer_shared_allreduce
     if runtime._defer_shared_allreduce:
         assert runtime.moe_routed_event is not runtime.moe_main_event
@@ -357,31 +370,114 @@ def test_kimi_k3_router_gemm_dtype_env_rejects_unknown_values(monkeypatch, value
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "defer,multi_stream,is_compiling,has_aux_stream",
+    "defer,min_tokens,compiling,expected_by_tokens",
     [
-        (False, True, False, True),
-        (True, True, False, True),
-        (True, False, False, True),
+        (False, None, False, {1: False, 500: False}),
+        (False, 128, False, {1: False, 500: False}),
+        (True, "unset", False, {0: True, 1: True, 500: True}),
+        (True, None, False, {0: True, 1: True, 500: True}),
+        (True, 0, False, {0: False, 1: True, 500: True}),
+        (True, 128, False, {1: False, 127: False, 128: False, 129: True, 500: True}),
+        # A compiled graph never compares against the threshold; the rule without one stays.
+        (True, 128, True, {1: False, 129: False, 500: False}),
+        (True, None, True, {0: True, 1: True, 500: True}),
     ],
-    ids=["ordinary_shared", "parallel", "serial"],
+    ids=[
+        "off",
+        "off_threshold",
+        "unset_threshold",
+        "no_threshold",
+        "threshold_zero",
+        "threshold",
+        "threshold_compiling",
+        "no_threshold_compiling",
+    ],
+)
+def test_kimi_k3_shared_allreduce_defer_threshold(
+    monkeypatch, defer, min_tokens, compiling, expected_by_tokens
+):
+    """The shared all-reduce is deferred only above the token threshold of the runtime."""
+    from tensorrt_llm._torch.models import modeling_kimi_linear
+
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: compiling)
+    runtime = modeling_kimi_linear.KimiK3MoERuntime.__new__(modeling_kimi_linear.KimiK3MoERuntime)
+    nn.Module.__init__(runtime)
+    runtime._defer_shared_allreduce = defer
+    if min_tokens != "unset":
+        # A runtime that never sets the threshold (the class default) defers at every token count.
+        runtime._defer_shared_ar_min_tokens = min_tokens
+    for num_tokens, expected in expected_by_tokens.items():
+        assert runtime._defer_shared_ar_for(num_tokens) is expected, num_tokens
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "defer_flag,min_tokens,num_tokens,reduce_routed,streams,merged,fp8_down,expect_defer",
+    [
+        # The shared expert reduces its own output.
+        pytest.param(False, None, 2, False, "parallel", False, False, False, id="ordinary_shared"),
+        # Fused-communication MegaMoE: deferred at every token count, the routed result is complete.
+        pytest.param(True, None, 2, False, "parallel", False, False, True, id="parallel"),
+        pytest.param(True, None, 2, False, "serial", False, False, True, id="serial"),
+        pytest.param(True, None, 2, False, "compiling", False, False, True, id="compiling"),
+        pytest.param(True, None, 2, False, "no_aux_stream", False, False, True, id="no_aux_stream"),
+        # TRTLLM_K3_DEFER_SHARED_AR on an external-communication backend: the routed partial is
+        # reduced after the join, the shared all-reduce is deferred above the token threshold.
+        pytest.param(True, 0, 1, True, "parallel", False, False, True, id="knob_default_threshold"),
+        pytest.param(
+            True, 128, 129, True, "parallel", False, False, True, id="knob_above_threshold"
+        ),
+        pytest.param(True, 128, 128, True, "parallel", False, False, False, id="knob_at_threshold"),
+        pytest.param(
+            True, 128, 2, True, "parallel", False, False, False, id="knob_below_threshold"
+        ),
+        pytest.param(True, 128, 129, True, "serial", False, False, True, id="knob_above_serial"),
+        pytest.param(True, 128, 129, True, "serial", False, True, True, id="knob_serial_fp8_down"),
+        pytest.param(True, 128, 129, True, "parallel", False, True, True, id="knob_above_fp8_down"),
+        pytest.param(True, 128, 2, True, "parallel", False, True, False, id="knob_below_fp8_down"),
+        # A compiled graph keeps the default launch; without an auxiliary stream the deferred
+        # all-reduce runs serially after the join.
+        pytest.param(True, 128, 129, True, "compiling", False, False, False, id="knob_compiling"),
+        pytest.param(True, 128, 129, True, "no_aux_stream", False, False, True, id="knob_no_aux"),
+        pytest.param(False, 128, 129, True, "parallel", False, False, False, id="knob_off"),
+        # Below the merged all-reduce's token cap the shared partial rides that collective and no
+        # separate shared all-reduce is deferred; above the cap the knob applies.
+        pytest.param(True, 0, 2, True, "parallel", True, False, False, id="merged_below_cap"),
+        pytest.param(True, 0, 129, True, "parallel", True, False, True, id="merged_above_cap"),
+    ],
 )
 def test_kimi_k3_shared_allreduce_ordering(
     monkeypatch: pytest.MonkeyPatch,
-    defer: bool,
-    multi_stream: bool,
-    is_compiling: bool,
-    has_aux_stream: bool,
+    defer_flag: bool,
+    min_tokens: int | None,
+    num_tokens: int,
+    reduce_routed: bool,
+    streams: str,
+    merged: bool,
+    fp8_down: bool,
+    expect_defer: bool,
 ) -> None:
-    """Check shared-allreduce dependencies and result propagation without CUDA work."""
-    from tensorrt_llm._torch.distributed import AllReduceParams
+    """Check shared-allreduce dependencies and result propagation without CUDA work.
+
+    ``streams`` selects the stream setup: ``parallel`` (multi-stream, auxiliary stream), ``serial``
+    (multi-stream off), ``no_aux_stream`` (multi-stream on, no auxiliary stream) or ``compiling``
+    (multi-stream on, under torch.compile tracing).
+    """
+    from tensorrt_llm._torch.distributed import AllReduceFusionOp, AllReduceParams
     from tensorrt_llm._torch.models import modeling_kimi_linear
     from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 
+    multi_stream = streams != "serial"
+    has_aux_stream = streams != "no_aux_stream"
+    is_compiling = streams == "compiling"
+    merged_cap = 128
+    merged_active = merged and num_tokens <= merged_cap
     calls = []
     current_stream = "main"
     aux_stream = object() if has_aux_stream else None
     parallel = multi_stream and has_aux_stream and not is_compiling
-    overlap = defer and parallel
+    overlap = expect_defer and parallel
+    shared_ar_name = "shared_fp8_allreduce" if fp8_down else "shared_allreduce"
 
     class _Event:
         def __init__(self, name: str, enabled: bool) -> None:
@@ -416,17 +512,33 @@ def test_kimi_k3_shared_allreduce_ordering(
         def __init__(self, name: str) -> None:
             super().__init__()
             self.name = name
+            self.weight = torch.ones(4, dtype=torch.bfloat16)
+            self.variance_epsilon = 1e-5
 
         def forward(self, value: torch.Tensor) -> torch.Tensor:
             calls.append((self.name, current_stream))
             return value
 
-    def routed_experts(value: torch.Tensor, logits: torch.Tensor, **kwargs) -> torch.Tensor:
-        calls.append(("routed_moe", current_stream))
-        return value * 2
+    class _RoutedExperts:
+        routing_method = None
+
+        def __call__(self, value: torch.Tensor, logits: torch.Tensor, **kwargs) -> torch.Tensor:
+            calls.append(("routed_moe", current_stream))
+            return value * 2
+
+        def all_reduce(self, value: torch.Tensor, all_reduce_params: AllReduceParams):
+            calls.append(("latent_allreduce", current_stream))
+            if all_reduce_params.fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM:
+                # Merged: (normalized rows, plain sum of the rows).
+                return value, value + 5
+            return value
 
     def shared_allreduce(value: torch.Tensor) -> torch.Tensor:
         calls.append(("shared_allreduce", current_stream))
+        return value + 5
+
+    def shared_fp8_allreduce(value: torch.Tensor) -> torch.Tensor:
+        calls.append(("shared_fp8_allreduce", current_stream))
         return value + 5
 
     class _Shared(nn.Module):
@@ -439,33 +551,50 @@ def test_kimi_k3_shared_allreduce_ordering(
         ) -> torch.Tensor:
             calls.append(("shared_local", current_stream))
             partial = value * 3
-            if defer:
+            if expect_defer or merged_active:
                 assert final_all_reduce_params.enable_allreduce is False
                 return partial
             assert final_all_reduce_params is None
+            if fp8_down:
+                # The FP8 down projection leaves the reduction to ``shared_down_all_reduce``.
+                return partial
             return self.down_proj.all_reduce(partial)
 
     runtime = modeling_kimi_linear.KimiK3MoERuntime.__new__(modeling_kimi_linear.KimiK3MoERuntime)
     nn.Module.__init__(runtime)
     runtime.gate = SimpleNamespace(compute_logits=lambda value: value)
-    runtime.routed_experts = routed_experts
+    runtime.routed_experts = _RoutedExperts()
     runtime.routed_expert_down_proj = _Projection("routed_down")
     runtime.routed_expert_norm = _Projection("routed_norm")
     runtime.routed_expert_up_proj = _Projection("routed_up")
     runtime.shared_experts = _Shared()
-    runtime._reduce_routed_output = False
-    runtime._defer_shared_allreduce = defer
+    runtime.shared_down_all_reduce = shared_fp8_allreduce if fp8_down else None
+    runtime.moe_hidden_size = 4
+    runtime.hidden_size = 4
+    runtime._reduce_routed_output = reduce_routed
+    runtime._merge_moe_allreduce = merged
+    runtime._defer_shared_allreduce = defer_flag
+    runtime._defer_shared_ar_min_tokens = min_tokens
     runtime.shared_expert_stream = aux_stream
     runtime.moe_main_event = _Event("fork", parallel)
     runtime.moe_shared_event = _Event("shared_done", parallel)
-    midpoint_event = _Event("midpoint", overlap) if defer else None
+    midpoint_event = _Event("midpoint", overlap) if defer_flag else None
     runtime.moe_routed_event = midpoint_event
     runtime.latent_down_stream = None
     runtime.moe_latent_fork_event = None
     runtime.moe_latent_ready_event = None
 
+    monkeypatch.setattr(modeling_kimi_linear, "_K3_ROUTE_TAIL", False)
+    monkeypatch.setattr(modeling_kimi_linear, "_K3_LATENT_AR_QUANT", False)
+    monkeypatch.setattr(modeling_kimi_linear, "_K3_MERGED_MOE_AR_MAX_TOKENS", merged_cap)
+    monkeypatch.setattr(
+        modeling_kimi_linear,
+        "_k3_zero_residual",
+        lambda numel, device: torch.zeros(numel, dtype=torch.bfloat16),
+    )
     monkeypatch.setattr(torch.cuda, "stream", use_stream)
     monkeypatch.setattr(torch.cuda, "Event", lambda: pytest.fail("Events must be initialized once"))
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: is_compiling)
 
     shared_stream = "aux" if parallel else "main"
@@ -474,24 +603,41 @@ def test_kimi_k3_shared_allreduce_ordering(
     for _ in range(2):
         calls.clear()
         with with_multi_stream(multi_stream):
-            output = runtime(torch.ones(2, 4))
+            output = runtime(torch.ones(num_tokens, 4, dtype=torch.bfloat16))
         assert runtime.moe_routed_event is midpoint_event
-        assert sum(name == "shared_allreduce" for name, _ in calls) == 1
-        allreduce = calls.index(("shared_allreduce", shared_stream))
-        assert calls.index(("shared_local", shared_stream)) < allreduce
+        # The shared all-reduce runs once, in its own implementation and stream, unless the merged
+        # all-reduce carries the shared partial.
+        shared_reductions = [
+            call for call in calls if call[0] in ("shared_allreduce", "shared_fp8_allreduce")
+        ]
+        assert shared_reductions == ([] if merged_active else [(shared_ar_name, shared_stream)])
+        assert [call for call in calls if call[0] == "latent_allreduce"] == (
+            [("latent_allreduce", "main")] if reduce_routed else []
+        )
+        allreduce = None if merged_active else calls.index((shared_ar_name, shared_stream))
+        if not merged_active:
+            assert calls.index(("shared_local", shared_stream)) < allreduce
         if overlap:
             # Fence all routed chunks, but leave the norm/up tail free to overlap.
             recorded = calls.index(("midpoint_record", "main"))
             assert calls.index(("routed_moe", "main")) < recorded
-            assert recorded < calls.index(("routed_norm", "main"))
+            if not reduce_routed:
+                assert recorded < calls.index(("routed_norm", "main"))
             assert recorded < calls.index(("midpoint_wait", "aux")) < allreduce
         if parallel:
             # The final join must cover the shared all-reduce.
             completed = calls.index(("shared_done_record", "aux"))
-            assert allreduce < completed < calls.index(("shared_done_wait", "main"))
-        elif defer:
+            joined = calls.index(("shared_done_wait", "main"))
+            assert completed < joined
+            if allreduce is not None:
+                assert allreduce < completed
+            if reduce_routed:
+                assert joined < calls.index(("latent_allreduce", "main"))
+        elif expect_defer:
             assert calls.index(("routed_moe", "main")) < allreduce
-        torch.testing.assert_close(output, torch.full((2, 4), 10.0))
+            if reduce_routed:
+                assert allreduce < calls.index(("latent_allreduce", "main"))
+        torch.testing.assert_close(output, torch.full((num_tokens, 4), 10.0, dtype=torch.bfloat16))
 
 
 @pytest.mark.cpu_only
