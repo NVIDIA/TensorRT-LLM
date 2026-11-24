@@ -4788,7 +4788,8 @@ class PyExecutor:
                 # Stage 1.2: Sync sampler for previous microbatch to start new sample state comm chain.
                 # For last PP rank, we must synchronize the previous batch
                 # since we need to broadcast its sample state soon afterwards in the same iteration.
-                # For other PP ranks, we can delay the synchronization if the current batch cannot be queued.
+                # For other PP ranks, we can delay the synchronization if the current batch cannot be queued,
+                # unless pending V2 PEFT pauses must flush rank-uniformly before the next schedule pass.
                 previous_batch = self.previous_batch
                 if can_queue:
                     self.previous_batch = batch_state
@@ -4796,9 +4797,12 @@ class PyExecutor:
                         or can_queue) and previous_batch is not None:
                     with nvtx_range("sync_previous_sampler_event"):
                         previous_batch.sample_state.sampler_event.synchronize()
-                if self._is_kv_manager_v2 and (previous_batch is None
-                                               or self.dist.is_last_pp_rank
-                                               or can_queue):
+                if self._is_kv_manager_v2 and self._pending_peft_pause_requests:
+                    if (previous_batch is not None
+                            and not (self.dist.is_last_pp_rank or can_queue)
+                            and self._get_peft_cache_manager() is not None):
+                        with nvtx_range("sync_previous_sampler_event"):
+                            previous_batch.sample_state.sampler_event.synchronize()
                     self._flush_pending_peft_pauses()
 
                 # Stage 2: Enqueue sample state for executed batch to ring broadcast it in background thread asynchronously.

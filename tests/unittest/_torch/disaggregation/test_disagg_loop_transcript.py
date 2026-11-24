@@ -137,6 +137,7 @@ def _idle_executor(monkeypatch, calls: list) -> PyExecutor:
     executor.iter_counter = 0
     executor._resource_governor_enabled = False
     executor._is_kv_manager_v2 = False
+    executor._pending_peft_pause_requests = []
     executor._mm_encoder_item_scheduling_enabled = False
     executor.enable_early_first_token_response = False
     executor.drafter = None

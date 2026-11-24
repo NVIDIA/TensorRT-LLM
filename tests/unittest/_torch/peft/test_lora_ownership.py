@@ -150,6 +150,7 @@ def _make_runtime(
     cache._lora_manager = manager
     cache._lora_model_config = model_config
     cache._lora_config = config
+    cache._paused_request_ids = set()
     worker = object.__new__(BaseWorker)
     worker.doing_shutdown = True
     worker._runtime_model_config = None
@@ -229,6 +230,7 @@ def _load(runtime: _Runtime, entrypoint: str, path: Path) -> None:
         )
     else:
         runtime.request = SimpleNamespace(
+            py_request_id=7,
             lora_task_id="7",
             py_lora_path=str(path),
             lora_weights=None,
