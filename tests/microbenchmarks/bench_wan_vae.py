@@ -6,9 +6,9 @@ Decode and encode at the Cosmos3 shapes, with random weights (seeded) or a check
 inputs or a real clip. CUDA-graph replay timed with CUPTI kernel timestamps, L2 flushed between
 replays; accuracy against the native model run in fp32. Writes one JSON per run.
 
-    python benchmarks/visual_gen/bench_wan_vae.py --label wino --out-dir /tmp/wan_vae
+    python tests/microbenchmarks/bench_wan_vae.py --label wino --out-dir /tmp/wan_vae
         --shapes t2v_720p_189f --winovae-opts encoder_chunk_frames=24
-    python benchmarks/visual_gen/bench_wan_vae.py ... --world-size 2 --split-dim width
+    python tests/microbenchmarks/bench_wan_vae.py ... --world-size 2 --split-dim width
 """
 
 from __future__ import annotations
