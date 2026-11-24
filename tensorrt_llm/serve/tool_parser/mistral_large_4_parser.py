@@ -43,17 +43,6 @@ _CONTENT, _NAME, _ARGUMENTS, _END = "content", "name", "arguments", "end"
 _DECODER = json.JSONDecoder()
 
 
-def _partial_marker_length(text: str, markers) -> int:
-    """Length of the longest suffix of ``text`` that is a proper prefix of a marker."""
-    best = 0
-    for marker in markers:
-        for length in range(min(len(text), len(marker) - 1), best, -1):
-            if marker.startswith(text[-length:]):
-                best = length
-                break
-    return best
-
-
 class _Arguments:
     """The arguments of one call: raw text up to the end of the first JSON value."""
 
@@ -188,7 +177,14 @@ class MistralLarge4ToolParser(BaseToolParser):
         if self._state == _CONTENT:
             index = buffer.find(TOOL_CALLS)
             if index == -1:
-                keep = 0 if final else _partial_marker_length(buffer, (TOOL_CALLS, EOS))
+                keep = (
+                    0
+                    if final
+                    else max(
+                        self._ends_with_partial_token(buffer, TOOL_CALLS),
+                        self._ends_with_partial_token(buffer, EOS),
+                    )
+                )
                 self._content(buffer[: len(buffer) - keep], content)
                 self._buffer = buffer[len(buffer) - keep :]
                 if final:
@@ -228,7 +224,14 @@ class MistralLarge4ToolParser(BaseToolParser):
         found = [(buffer.find(marker), marker) for marker in (TOOL_CALLS, EOS)]
         found = [(index, marker) for index, marker in found if index != -1]
         if not found:
-            keep = 0 if final else _partial_marker_length(buffer, (TOOL_CALLS, EOS))
+            keep = (
+                0
+                if final
+                else max(
+                    self._ends_with_partial_token(buffer, TOOL_CALLS),
+                    self._ends_with_partial_token(buffer, EOS),
+                )
+            )
             self._arguments.feed(buffer[: len(buffer) - keep])
             self._buffer = buffer[len(buffer) - keep :]
             if final:
