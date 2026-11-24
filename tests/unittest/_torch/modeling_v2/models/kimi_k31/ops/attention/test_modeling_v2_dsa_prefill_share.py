@@ -13,6 +13,7 @@ from tensorrt_llm._torch.modeling_v2.models.kimi_k31.ops.attention import dsa_pr
 
 __extra_import_path__ = ["../../../..", "."]
 import _k31_dsa_inputs as inputs  # noqa: E402
+from _k31_utils import on_sm
 
 
 @pytest.fixture(autouse=True)
@@ -23,9 +24,13 @@ def _aggregated_server(monkeypatch):
 
 @inputs.on_sm103
 @pytest.mark.parametrize(
-    "world,tile,piece_rows", [(16, 300, 128)], ids=["tier2-tiles-128-row-pieces"]
+    "force_oom",
+    [
+        pytest.param(False, id="tier2-tiles-128-row-pieces"),
+        pytest.param(True, marks=on_sm(103), id="logits-oom"),
+    ],
 )
-def test_shared_rows_match_the_owner(monkeypatch, world, tile, piece_rows):
+def test_shared_rows_match_the_owner(monkeypatch, force_oom):
     """Every piece of a long-prefix chunk, scored alone with its owner tile's Top-K plan, equals the owner's own
     rows bit for bit (FP8 index keys, the perf targets' GVR prefill Top-K)."""
     from tensorrt_llm._torch.modeling_v2.models.kimi_k31.ops.attention import dsa_indexer
@@ -33,6 +38,7 @@ def test_shared_rows_match_the_owner(monkeypatch, world, tile, piece_rows):
         K31DSAParams,
     )
 
+    world, tile, piece_rows = 16, 300, 128
     params = K31DSAParams(
         index_n_heads=32, index_head_dim=128, index_topk=2048, indexer_k_dtype="fp8"
     )
@@ -58,6 +64,48 @@ def test_shared_rows_match_the_owner(monkeypatch, world, tile, piece_rows):
         indexer.forward_prepared(
             q[c0:c1], k, k_scale, weights[c0:c1], ks[c0:c1], ke[c0:c1], owner[c0:c1]
         )
+    if force_oom:
+        score = dsa_indexer.fp8_mqa_logits
+        limit = 0
+        attempted = []
+
+        def limited(query, *args):
+            attempted.append(query.shape[0])
+            if query.shape[0] > limit:
+                raise RuntimeError(
+                    f"CUDA out of memory. Tried to allocate logits for {query.shape[0]} rows"
+                )
+            return score(query, *args)
+
+        def score_prefix(count):
+            return indexer.forward_prepared(
+                q[:count],
+                k,
+                k_scale,
+                weights[:count],
+                ks[:count],
+                ke[:count],
+                torch.empty_like(owner[:count]),
+                tier_rows=tile,
+            )
+
+        monkeypatch.setattr(dsa_indexer, "fp8_mqa_logits", limited)
+        for perf, expected in [(False, [17]), (True, [17, 9, 5, 3])]:
+            indexer._k31_perf = perf
+            attempted.clear()
+            with pytest.raises(RuntimeError, match="logits for 17 rows"):
+                score_prefix(17)
+            assert attempted == expected
+        limit = 4
+        attempted.clear()
+        with pytest.raises(RuntimeError, match="logits for 32 rows"):
+            score_prefix(32)
+        assert attempted == [32, 16, 8] + [4] * 7
+        attempted.clear()
+        assert torch.equal(score_prefix(28), owner[:28])
+        assert attempted == [28, 14, 7] + [4] * 7
+        limit = 32
+
     # Every piece on its own (as some rank scores it), written back at its rows.
     shared = torch.full((rows, 2048), -7, dtype=torch.int32, device="cuda")
     for lo, hi, tier in share.chunk_pieces(rows, num_keys, piece_rows):

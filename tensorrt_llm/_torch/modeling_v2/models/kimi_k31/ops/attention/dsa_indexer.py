@@ -20,6 +20,9 @@ from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
 from tensorrt_llm._torch.modeling_v2.models.kimi_k31.kernels.attention.dsa_topk_order_remap import (
     supports as dsa_topk_order_remap_supports,
 )
+from tensorrt_llm._torch.modeling_v2.models.kimi_k31.kernels.attention.gvr_topk_decode_host import (
+    _PREFILL_ROW_SLAB,
+)
 from tensorrt_llm._torch.modeling_v2.models.kimi_k31.ops.attention import dsa_prefill_share
 from tensorrt_llm._torch.modeling_v2.models.kimi_k31.ops.attention.convert_req_index_to_global import (
     convert_req_index_to_global,
@@ -106,6 +109,17 @@ if TYPE_CHECKING:
 #: The compute capability the deterministic GVR Top-K is certified on (its op ARCHS); on any other
 #: architecture the indexer keeps the CUDA radix Top-K.
 _GVR_TOPK_CAPABILITY = (10, 3)
+
+
+# Count the original full-tile call and every subsequent call on its remaining rows.
+_MAX_PREFILL_MQA_ATTEMPTS = 10
+
+
+def _is_mqa_allocation_oom(error: RuntimeError) -> bool:
+    # DeepGEMM's pybind can expose the torch::empty CUDA OOM as a plain RuntimeError.
+    return isinstance(error, torch.cuda.OutOfMemoryError) or str(error).startswith(
+        "CUDA out of memory. Tried to allocate "
+    )
 
 
 @functools.lru_cache(maxsize=None)
@@ -765,10 +779,58 @@ class K31Indexer(nn.Module):
         """
         if output_indices.shape != (q_data.shape[0], self.index_topk):
             raise ValueError("Prepared output must match query rows and configured Top-K")
-        if q_data.shape[0] == 0 or k_data.shape[0] == 0:
+        rows = q_data.shape[0]
+        if rows == 0 or k_data.shape[0] == 0:
             return output_indices.fill_(-1)
-        logits = self._call_mqa_logits(q_data, k_data, k_scale, weights, row_starts, row_ends)
-        # The deterministic GVR on every tile wider than the Top-K (SM 10.3), else the CUDA radix.
+
+        try:
+            logits = self._call_mqa_logits(q_data, k_data, k_scale, weights, row_starts, row_ends)
+        except RuntimeError as error:
+            if (
+                not self._k31_perf
+                or not _is_mqa_allocation_oom(error)
+                or torch.cuda.is_current_stream_capturing()
+            ):
+                raise
+            # DeepGEMM pads its FP32 output to whole query blocks.
+            block_rows = 128 // q_data.shape[1]
+            if rows <= block_rows:
+                raise
+            begin, tile_rows = 0, (rows + 1) // 2
+            for _ in range(1, _MAX_PREFILL_MQA_ATTEMPTS):
+                # Keep the original GVR slab's per-row index order for every Q slice.
+                slab_start = begin - begin % _PREFILL_ROW_SLAB
+                slab_end = min(slab_start + _PREFILL_ROW_SLAB, rows)
+                owner_rows = slab_end - slab_start if tier_rows is None else tier_rows
+                end = min(begin + tile_rows, slab_end)
+                span = slice(begin, end)
+                starts, ends = row_starts[span], row_ends[span]
+                try:
+                    tile_logits = self._call_mqa_logits(
+                        q_data[span], k_data, k_scale, weights[span], starts, ends
+                    )
+                except RuntimeError as retry_error:
+                    if not _is_mqa_allocation_oom(retry_error):
+                        raise
+                    if end - begin <= block_rows:
+                        break
+                    tile_rows = (end - begin + 1) // 2
+                    continue
+                indexer_topk_prefill_gvr(
+                    tile_logits,
+                    starts,
+                    ends,
+                    output_indices[span],
+                    self.index_topk,
+                    tier_rows=owner_rows,
+                )
+                del tile_logits
+                begin = end
+                if begin == rows:
+                    return output_indices
+            # An unfinished tile reports its original allocation error.
+            raise
+
         if self.gvr_topk(logits.device):
             indexer_topk_prefill_gvr(
                 logits, row_starts, row_ends, output_indices, self.index_topk, tier_rows=tier_rows
