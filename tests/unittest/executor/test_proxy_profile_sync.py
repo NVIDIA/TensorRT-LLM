@@ -23,13 +23,14 @@ import concurrent.futures
 import queue
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
 from tensorrt_llm.executor.ipc import IpcQueue
 from tensorrt_llm.executor.proxy import GenerationExecutorProxy, _RequestSender
-from tensorrt_llm.executor.request import StartProfileRequest, StopProfileRequest
+from tensorrt_llm.executor.request import CancellingRequest, StartProfileRequest, StopProfileRequest
 from tensorrt_llm.executor.worker import _incoming_requests
 
 # These tests deliberately keep a real single-thread
@@ -646,7 +647,7 @@ def test_profile_close_settles_running_and_queued_calls_with_private_peer(
             owner = proxy._profile_control_thread
             with proxy._admission_lock:
                 proxy.doing_shutdown = True
-                proxy._shutdown_deadline = time.monotonic() + (2.0 if acknowledge else 0.05)
+                proxy._PROFILE_SHUTDOWN_TIMEOUT_S = 2.0 if acknowledge else 0.05
             allow_ack.set()
             proxy._close_profile_control()
             # No post-close sleep or join may hide a surviving owned worker.
@@ -674,10 +675,52 @@ def test_profile_close_settles_running_and_queued_calls_with_private_peer(
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("profile_error", [False, True], ids=["missing_ack", "failed_drain"])
+def test_profile_shutdown_still_delivers_cancel_and_quit(bare_proxy, monkeypatch, profile_error):
+    proxy = bare_proxy
+    proxy.workers_started = True
+    proxy.mpi_futures = [concurrent.futures.Future()]
+    proxy._results = {7: SimpleNamespace(abort=lambda: proxy.abort_request(7))}
+    proxy._REQUEST_SHUTDOWN_TIMEOUT_S = 0.1
+    proxy._PROFILE_SHUTDOWN_TIMEOUT_S = 0.1
+    proxy._START_PROFILE_ACK_TIMEOUT_S = 2.0
+    proxy.request_queue = IpcQueue(is_server=True)
+    proxy.profile_ack_queue = None
+    peer = IpcQueue(proxy.request_queue.address, is_server=False)
+    try:
+        peer.put("ready")
+        assert proxy.request_queue.get(timeout=2) == "ready"
+        if profile_error:
+            error = TimeoutError("profile worker still busy")
+            with monkeypatch.context() as patch:
+                patch.setattr(proxy, "_close_profile_control", MagicMock(side_effect=error))
+                with pytest.raises(TimeoutError) as raised:
+                    proxy.pre_shutdown()
+                assert raised.value is error
+                assert not proxy._pre_shutdown_complete
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as caller:
+                profile = caller.submit(proxy.start_profile)
+                assert isinstance(peer.get(timeout=2), StartProfileRequest)
+                proxy.pre_shutdown()  # No ACK, so profiling consumes its whole grace period.
+                with pytest.raises(RuntimeError, match="shutting down"):
+                    profile.result(timeout=2)
+        cancel = peer.get(timeout=1)
+        assert isinstance(cancel, CancellingRequest) and cancel.id == 7
+        assert peer.get(timeout=1) is None
+        proxy.pre_shutdown()  # Retrying an incomplete profile drain must not send quit twice.
+        assert not peer.poll(0.05)
+    finally:
+        peer.close()
+        if proxy.profile_ack_queue is not None:
+            proxy.profile_ack_queue.close()
+        proxy.request_queue.close()
+
+
+@pytest.mark.cpu_only
 def test_profile_close_does_not_start_an_unused_worker(bare_proxy):
     proxy = bare_proxy
     proxy.doing_shutdown = True
-    proxy._shutdown_deadline = time.monotonic() + 0.05
     proxy._close_profile_control()
     assert proxy._profile_control_thread is None
     assert proxy._profile_control_executor is None

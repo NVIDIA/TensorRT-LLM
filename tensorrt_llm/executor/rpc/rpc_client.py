@@ -4,6 +4,7 @@
 import asyncio
 import concurrent.futures
 import os
+import sys
 import threading
 import time
 import traceback
@@ -104,6 +105,7 @@ class RPCClient:
         '''
         self._address = address
         self._timeout = timeout
+        self._is_finalizing = sys.is_finalizing
 
         # Check if PAIR mode is enabled via environment variable
         use_pair_mode = os.environ.get('TLLM_LLMAPI_ZMQ_PAIR', '0') != '0'
@@ -183,11 +185,18 @@ class RPCClient:
                 work remains rejected; a later close can wait for completion.
             RuntimeError: Called on an owned loop or pool thread, which cannot
                 join itself. Cleanup starts, but an external thread must close
-                again to confirm completion.
+                again to confirm completion. Also raised during interpreter
+                finalization, when cleanup can no longer be safely scheduled.
 
         Caller-owned event loops are never stopped or closed. Their pending
         calls receive RPCCancelled when their event loops next run.
         """
+        if self._closed:
+            return
+        if self._is_finalizing():
+            raise RuntimeError(
+                "RPC client cleanup cannot complete during interpreter finalization"
+            )
         deadline = time.monotonic() + self._CLOSE_TIMEOUT_SECONDS
         with self._call_lock:
             if self._closed:
@@ -619,7 +628,8 @@ class RPCClient:
             except concurrent.futures.TimeoutError:
                 if future.done():
                     return future.result()
-                if self._closed and not self._loop.is_running():
+                if (self._closing
+                        or self._closed) and not self._loop.is_running():
                     future.cancel()
                     raise RPCCancelled("RPC client closed")
 

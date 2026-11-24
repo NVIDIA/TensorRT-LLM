@@ -15,6 +15,7 @@
 import asyncio
 import hashlib
 import hmac
+import math
 import os
 import pickle  # nosec B403
 import threading
@@ -65,8 +66,9 @@ class ZeroMqQueue:
             is_async (bool): Whether to use asyncio for the socket. Defaults to False.
             name (str, optional): The name of the queue. Defaults to None.
             use_hmac_encryption (bool): Whether to use HMAC encryption for pickled data. Defaults to True.
-            recv_timeout (float, optional): Default receive timeout in seconds.
-                Configured once on the socket, without polling before each receive.
+            recv_timeout (float, optional): Non-negative receive timeout in seconds,
+                rounded up to milliseconds. Zero is nonblocking. Configured once
+                on the socket, without polling before each receive.
         '''
 
         if not use_hmac_encryption:
@@ -89,7 +91,7 @@ class ZeroMqQueue:
         if recv_timeout is not None:
             if recv_timeout < 0:
                 raise ValueError("recv_timeout must be non-negative")
-            self.socket.setsockopt(zmq.RCVTIMEO, int(recv_timeout * 1000))
+            self.socket.setsockopt(zmq.RCVTIMEO, math.ceil(recv_timeout * 1000))
 
         # For ROUTER sockets, track the last identity to enable replies. For now we assume there is only one client in our case.
         self._last_identity = None
@@ -231,6 +233,9 @@ class ZeroMqQueue:
         timeout adds no poll to successful sends and lets the owning thread
         observe cancellation without another thread closing its socket.
         """
+        cancelled = "Executor proxy request send cancelled during shutdown."
+        if should_stop():
+            raise RuntimeError(cancelled)
         self.setup_lazily()
         self._check_thread_safety()
         if not getattr(self, "_interruptible_send_configured", False):
@@ -238,14 +243,14 @@ class ZeroMqQueue:
             self._interruptible_send_configured = True
         data = self._prepare_data(obj)
         with nvtx_range_debug("send", color="blue", category="IPC"):
+            # Serialization can outlast the shutdown deadline.
             while not should_stop():
                 try:
                     self._send_data(data)
                     return
                 except zmq.Again:
                     continue
-        raise RuntimeError(
-            "Executor proxy request send cancelled during shutdown.")
+        raise RuntimeError(cancelled)
 
     def put_nowait(self, obj: Any, routing_id: Optional[bytes] = None):
         """Send an object without waiting for a writable peer.

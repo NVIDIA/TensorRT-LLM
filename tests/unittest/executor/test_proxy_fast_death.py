@@ -63,7 +63,8 @@ def _bare_proxy():
     proxy._error_queue = _queue.Queue()
     proxy._engine_dead = False
     proxy._results = {}
-    # Set so the __del__ -> shutdown() path is a clean no-op at GC time.
+    proxy._request_sender = None
+    # No workers to reap on the __del__ -> shutdown() path at GC time.
     proxy.workers_started = False
     proxy._multi_frontend_ipc_dir = None
     # Borrowed-session default; ownership-sensitive tests override it.
@@ -969,11 +970,11 @@ def _proxy_awaiting_worker_init(
     proxy._fatal_error = None
     proxy._owns_mpi_session = owns_session
     proxy.worker_cls = object
-    # The loop sets workers_started, so the __del__ -> shutdown() path at GC
-    # time is live: keep it out of pre_shutdown(), whose attributes (the
-    # worker-process monitor teardown, the request queue) this fixture does
-    # not seed.
+    # This init-wait fake owns no runtime resources. Suppress only its shutdown
+    # phases, including finalizer waits on deliberately pending futures;
+    # lifecycle tests using _bare_proxy() still exercise real teardown.
     proxy.doing_shutdown = True
+    proxy._shutdown_complete = True
 
     worker_future = _Future()
     if ready_status is None:
@@ -1021,6 +1022,8 @@ def test_worker_death_during_init_aborts_the_wedged_world():
     proxy.mpi_session.release_exit_joins.assert_called_once_with()
     # Pending work fails fast rather than waiting on a gone producer.
     assert isinstance(r.queue.get_nowait(), EngineDeadError)
+    proxy.__del__()  # The init-only fake must also be safe to finalize.
+    proxy.mpi_session.abandon.assert_not_called()
 
 
 def test_worker_death_during_init_does_not_abort_borrowed_session():
@@ -1161,6 +1164,10 @@ def test_non_ready_status_during_init_aborts_then_marks_dead():
     assert called.index("shutdown_abort") < called.index("release_exit_joins")
     # Pending work fails fast on this path too.
     assert isinstance(r.queue.get_nowait(), EngineDeadError)
+    assert not proxy.mpi_futures[0].done()
+    proxy.__del__()  # Finalization must not wait on this deliberately pending future.
+    assert not proxy.mpi_futures[0].done()
+    proxy.mpi_session.abandon.assert_not_called()
 
 
 def test_non_ready_status_reports_worker_rank_stage_and_root_cause():

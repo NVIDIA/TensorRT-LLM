@@ -8,9 +8,10 @@ import concurrent.futures
 import gc
 import threading
 import time
+from collections.abc import Coroutine
 from types import SimpleNamespace
 from typing import NoReturn
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock, Mock
 
 import pytest
 
@@ -524,6 +525,70 @@ async def test_external_loop_call_and_inline_close(
             result.cancel()
             await asyncio.gather(result, return_exceptions=True)
         caller_loop.set_exception_handler(previous_handler)
+
+
+@pytest.mark.parametrize("already_closing", [False, True])
+def test_close_during_finalization_does_not_queue_or_wait(
+    monkeypatch: pytest.MonkeyPatch, already_closing: bool
+) -> None:
+    rpc_client = RPCClient(get_unique_ipc_addr(), hmac_key=b"test-key")
+    close_future = Mock()
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(rpc_client, "_is_finalizing", lambda: True)
+            schedule = Mock(side_effect=AssertionError("must not queue cleanup"))
+            patch.setattr(asyncio, "run_coroutine_threadsafe", schedule)
+            patch.setattr(rpc_client, "_call_lock", MagicMock())
+            patch.setattr(rpc_client, "_closing", already_closing)
+            patch.setattr(rpc_client, "_close_future", close_future if already_closing else None)
+            with pytest.raises(RuntimeError, match="interpreter finalization"):
+                rpc_client.close()
+            assert not rpc_client._closed
+            schedule.assert_not_called()
+            close_future.result.assert_not_called()
+            assert not rpc_client._call_lock.mock_calls
+    finally:
+        rpc_client.close()
+    assert rpc_client._closed
+    assert not rpc_client._loop_thread.is_alive()
+
+
+def test_already_closed_client_succeeds_during_finalization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rpc_client = RPCClient(get_unique_ipc_addr(), hmac_key=b"test-key")
+    rpc_client.close()
+    monkeypatch.setattr(rpc_client, "_is_finalizing", lambda: True)
+    rpc_client.close()
+    assert rpc_client._closed
+    assert not rpc_client._loop_thread.is_alive()
+
+
+@pytest.mark.parametrize("close_state", ["_closing", "_closed"])
+def test_sync_call_cancels_when_cleanup_stops_loop_before_completion(
+    client: RPCClient, monkeypatch: pytest.MonkeyPatch, close_state: str
+) -> None:
+    stopped = SimpleNamespace(is_running=lambda: False)
+    result = Mock()
+
+    def timeout(*, timeout: float) -> NoReturn:
+        # The first wait straddles the transition to closing and a stopped loop.
+        setattr(client, close_state, True)
+        raise concurrent.futures.TimeoutError
+
+    result.result.side_effect = timeout
+    result.done.side_effect = [False, AssertionError("must not poll stopped loop again")]
+
+    def schedule(coroutine: Coroutine, loop: asyncio.AbstractEventLoop) -> Mock:
+        coroutine.close()
+        return result
+
+    client._loop = stopped
+    monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", schedule)
+    with pytest.raises(RPCCancelled, match="RPC client closed"):
+        client._call_sync("method")
+    result.cancel.assert_called_once()
+    result.result.assert_called_once()
 
 
 @pytest.mark.asyncio

@@ -193,6 +193,18 @@ def test_close_during_interpreter_finalization_does_not_join():
     assert request_queue.messages == [_payloads("first"), _payloads("queued")]
 
 
+def test_proxy_finalizer_does_not_start_shutdown_during_late_finalization(monkeypatch):
+    proxy = _bare_proxy()
+    calls = []
+    monkeypatch.setattr(proxy, "shutdown", lambda: calls.append("shutdown"))
+    with monkeypatch.context() as patch:
+        patch.setattr(proxy, "_is_finalizing", lambda: True, raising=False)
+        proxy.__del__()
+    assert not calls
+    proxy.__del__()
+    assert calls == ["shutdown"]
+
+
 def test_pre_shutdown_flushes_batched_requests_before_the_sentinel():
     request_queue = _RecordingQueue(block_first_put=True)
     proxy = _bare_proxy()
@@ -240,6 +252,28 @@ def test_transport_error_reaches_error_queue():
     error = error_queue.get_nowait()
     assert isinstance(error, RuntimeError)
     assert str(error) == "socket closed"
+
+
+def test_batched_quit_failure_is_best_effort(monkeypatch):
+    from tensorrt_llm.executor import proxy as proxy_module
+
+    warnings = []
+    monkeypatch.setattr(proxy_module.logger, "warning", warnings.append)
+
+    class GoneAfterBatch(_RecordingQueue):
+        def put(self, msg):
+            if msg is None:
+                raise RuntimeError("peer closed")
+            super().put(msg)
+
+    request_queue = GoneAfterBatch()
+    errors = queue.Queue()
+    sender = _RequestSender(request_queue, errors)
+    sender.send(pickle.dumps("request"))
+    assert not sender.close(timeout=2, send_sentinel=True)
+    assert request_queue.messages == [_payloads("request")]
+    assert errors.empty()
+    assert len(warnings) == 1 and "peer closed" in warnings[0]
 
 
 def test_batched_request_is_captured_when_sent():

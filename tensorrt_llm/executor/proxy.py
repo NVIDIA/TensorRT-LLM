@@ -113,18 +113,20 @@ def _check_collective_rpc_guard(
             "this shim only reaches rank-0.")
 
 
-def _put_proxy_request(request_queue: IpcQueue, request,
-                       should_stop: Callable[[], bool]) -> None:
-    """Keep data sends cancellable and make one last nonblocking quit attempt."""
-    if request is None and should_stop():
-        request_queue.put_nowait(None)
-        return
+def _send_quit(request_queue: IpcQueue, should_stop: Callable[[],
+                                                              bool]) -> None:
+    """Best-effort quit from the socket's writer, even when the peer is gone."""
     try:
-        request_queue.put_interruptible(request, should_stop)
-    except RuntimeError:
-        if request is not None or not should_stop():
-            raise
+        if not should_stop():
+            try:
+                request_queue.put_interruptible(None, should_stop)
+                return
+            except RuntimeError:
+                if not should_stop():
+                    raise
         request_queue.put_nowait(None)
+    except (RuntimeError, zmq.ZMQError) as exc:
+        logger.warning(f"Executor proxy quit could not be delivered: {exc}")
 
 
 class _RequestSender:
@@ -232,9 +234,6 @@ class _RequestSender:
                  and time.monotonic() >= self._deadline)
                 or (self._should_stop is not None and self._should_stop()))
 
-    def _put(self, message) -> None:
-        _put_proxy_request(self._request_queue, message, self._send_stopped)
-
     def _run(self) -> None:
         while True:
             with self._cond:
@@ -249,7 +248,7 @@ class _RequestSender:
                     for _ in range(min(len(self._pending), self.MAX_BATCH_SIZE))
                 ]
             try:
-                self._put(batch)
+                self._request_queue.put_interruptible(batch, self._send_stopped)
             except Exception as e:
                 # Pickling already completed in the caller. Do not continue
                 # after a transport failure and silently lose an earlier batch.
@@ -263,7 +262,7 @@ class _RequestSender:
         if send_sentinel:
             # A bare None, not a batch: the worker stops at a top-level None.
             try:
-                self._put(None)
+                _send_quit(self._request_queue, self._send_stopped)
             except Exception as e:
                 self._error_queue.put_nowait(e)
 
@@ -298,10 +297,11 @@ class GenerationExecutorProxy(GenerationExecutor):
         self._admission_lock = threading.RLock()
         self._request_send_lock = threading.RLock()
         self._pre_shutdown_lock = threading.RLock()
+        self._is_finalizing = sys.is_finalizing
         self._shutdown_lock = threading.RLock()
         self._pre_shutdown_complete = False
         self._shutdown_complete = False
-        self._shutdown_deadline: Optional[float] = None
+        self._request_shutdown_deadline: Optional[float] = None
         self._request_transport_closed = False
         self._profile_control_futures: set[concurrent.futures.Future] = set()
         self._profile_control_thread: Optional[threading.Thread] = None
@@ -882,11 +882,14 @@ class GenerationExecutorProxy(GenerationExecutor):
         self._profile_control_thread = threading.current_thread()
         self._check_profile_control_open(kind)
         request.ack_addr = self._ensure_profile_ack_queue()
-        self._send_request(request)
+        self._send_request(request, should_stop=self._profile_send_stopped)
         self._wait_profile_ack(kind, timeout)
 
+    def _profile_send_stopped(self) -> bool:
+        return self._profile_control_cancelled or self._request_send_stopped()
+
     def _check_profile_control_open(self, kind: str) -> None:
-        if (self._profile_control_cancelled or self._request_send_stopped()):
+        if self._profile_send_stopped():
             raise RuntimeError(
                 f"{kind}_profile: executor proxy is shutting down or worker is dead."
             )
@@ -901,15 +904,12 @@ class GenerationExecutorProxy(GenerationExecutor):
         with self._admission_lock:
             futures = tuple(self._profile_control_futures)
         executor.shutdown(wait=False)
-        deadline = self._shutdown_deadline or time.monotonic()
         if self._engine_dead:
             self._profile_control_cancelled = True
         pending = [future for future in futures if not future.done()]
-        if pending:
-            concurrent.futures.wait(
-                pending,
-                timeout=max(0.0, deadline -
-                            time.monotonic()) if not self._engine_dead else 0.0)
+        if pending and not self._profile_control_cancelled:
+            concurrent.futures.wait(pending,
+                                    timeout=self._PROFILE_SHUTDOWN_TIMEOUT_S)
         if any(not future.done() for future in futures):
             self._profile_control_cancelled = True
             executor.shutdown(wait=False, cancel_futures=True)
@@ -1338,14 +1338,29 @@ class GenerationExecutorProxy(GenerationExecutor):
                 if not self._request_send_stopped():
                     raise
 
+    _PROFILE_SHUTDOWN_TIMEOUT_S = 5.0
     _REQUEST_SHUTDOWN_TIMEOUT_S = 5.0
+
+    def _drain_control_and_requests(self, *, cancel_requests: bool,
+                                    send_sentinel: bool) -> None:
+        try:
+            self._close_profile_control()
+        finally:
+            # The worker notification has its own budget even if profiling
+            # timed out. A retry must not send more traffic after the quit.
+            if not self._request_transport_closed:
+                if self._request_shutdown_deadline is None:
+                    self._request_shutdown_deadline = time.monotonic(
+                    ) + self._REQUEST_SHUTDOWN_TIMEOUT_S
+                try:
+                    if cancel_requests and not self._engine_dead:
+                        self._abort_all_requests()
+                finally:
+                    self._close_request_sender(send_sentinel=send_sentinel)
 
     def _pre_shutdown(self) -> None:
         with self._admission_lock:
             self.doing_shutdown = True
-            if self._shutdown_deadline is None:
-                self._shutdown_deadline = (time.monotonic() +
-                                           self._REQUEST_SHUTDOWN_TIMEOUT_S)
         logger_debug('Proxy.pre_shutdown...\n', "yellow")
 
         self._worker_process_monitor.close()
@@ -1354,32 +1369,18 @@ class GenerationExecutorProxy(GenerationExecutor):
         if hasattr(self, '_shutdown_event'):
             self._shutdown_event.set()
 
-        self._close_profile_control()
-        if self.workers_started and not self._engine_dead:
-            self._abort_all_requests()
-
-        # Notify surviving workers to quit.  Send the sentinel when:
-        #   (a) ``mpi_futures`` is empty -- the
-        #       ``RemoteMpiCommSessionClient`` case where workers run in a
-        #       separate ``mgmn_leader_node`` process (used by
-        #       ``trtllm-llmapi-launch``) and ``submit()`` returns ``[]``.
-        #       Without this branch the sentinel would be silently dropped
-        #       and the ``dispatch_result_thread`` would block forever on
-        #       ``result_queue.get()``.
-        #   (b) at least one tracked worker future is still alive (covers
-        #       the in-process ``MpiPoolSession`` / ``MpiCommSession`` cases
-        #       and the partial-crash scenario where some workers exited
-        #       early).
-        # The original ``all(not f.done() ...)`` was vacuously True for an
-        # empty list and therefore covered case (a) by accident.  Switching
-        # to bare ``any(...)`` to better handle partial crashes regressed
-        # case (a); keep both behaviours explicit.
+        # A remote session has no local futures; for a local session notify
+        # surviving workers even if some ranks have already exited.
         send_sentinel = (self.workers_started
                          and (not self.mpi_futures
                               or any(not f.done() for f in self.mpi_futures)))
-        self._close_request_sender(send_sentinel=send_sentinel)
+        self._drain_control_and_requests(cancel_requests=self.workers_started,
+                                         send_sentinel=send_sentinel)
 
-    def _send_request(self, request) -> None:
+    def _send_request(self,
+                      request,
+                      *,
+                      should_stop: Optional[Callable[[], bool]] = None) -> None:
         """Send a request to the rank-0 worker.
 
         With TRTLLM_PROXY_BATCH_REQUESTS=1 the request is pickled here, on the
@@ -1389,9 +1390,19 @@ class GenerationExecutorProxy(GenerationExecutor):
         here.
         """
         if self._request_sender is None:
-            with self._request_send_lock:
-                self.request_queue.put_interruptible(request,
-                                                     self._request_send_stopped)
+            # The active writer can be a profiling call. A cancellation send
+            # during teardown must not wait indefinitely for that writer.
+            deadline = self._request_shutdown_deadline
+            timeout = -1 if deadline is None else max(
+                0.0, deadline - time.monotonic())
+            if not self._request_send_lock.acquire(timeout=timeout):
+                raise RuntimeError(
+                    "Executor proxy request send cancelled during shutdown.")
+            try:
+                self.request_queue.put_interruptible(
+                    request, should_stop or self._request_send_stopped)
+            finally:
+                self._request_send_lock.release()
         else:
             self._request_sender.send(pickle.dumps(request))
 
@@ -1413,12 +1424,8 @@ class GenerationExecutorProxy(GenerationExecutor):
 
     def _request_send_stopped(self) -> bool:
         return (self._engine_dead or self._request_transport_closed
-                or (self._shutdown_deadline is not None
-                    and time.monotonic() >= self._shutdown_deadline))
-
-    def _put_request(self, request) -> None:
-        _put_proxy_request(self.request_queue, request,
-                           self._request_send_stopped)
+                or (self._request_shutdown_deadline is not None
+                    and time.monotonic() >= self._request_shutdown_deadline))
 
     def _close_request_sender(self, send_sentinel: bool = False) -> None:
         """Stop the request sender, if any, then send the shutdown sentinel if asked.
@@ -1427,10 +1434,10 @@ class GenerationExecutorProxy(GenerationExecutor):
         that has been writing ``request_queue``: the sender thread once it has
         started, the caller otherwise.
         """
-        deadline = getattr(self, "_shutdown_deadline", None)
+        deadline = getattr(self, "_request_shutdown_deadline", None)
         if deadline is None:
             deadline = time.monotonic() + self._REQUEST_SHUTDOWN_TIMEOUT_S
-            self._shutdown_deadline = deadline
+            self._request_shutdown_deadline = deadline
         if self._request_sender is not None:
             send_sentinel = self._request_sender.close(
                 timeout=max(0.0, deadline - time.monotonic()),
@@ -1444,11 +1451,7 @@ class GenerationExecutorProxy(GenerationExecutor):
         try:
             if send_sentinel and not getattr(self, "_request_transport_closed",
                                              False):
-                try:
-                    self._put_request(None)
-                except (RuntimeError, zmq.ZMQError) as exc:
-                    logger.warning(
-                        f"Executor proxy quit could not be delivered: {exc}")
+                _send_quit(self.request_queue, self._request_send_stopped)
             self._request_transport_closed = True
         finally:
             self._request_send_lock.release()
@@ -1904,7 +1907,9 @@ class GenerationExecutorProxy(GenerationExecutor):
         return self._iter_kv_events_result
 
     def __del__(self):
-        if hasattr(self, '_shutdown_lock'):
+        # Daemon threads can no longer service close requests during late
+        # interpreter finalization. Explicit shutdown has a stronger contract.
+        if hasattr(self, '_shutdown_lock') and not self._is_finalizing():
             self.shutdown()
 
     def __enter__(self):
@@ -2024,14 +2029,9 @@ class GenerationExecutorFrontendProxy(GenerationExecutorProxy):
     def _pre_shutdown(self) -> None:
         with self._admission_lock:
             self.doing_shutdown = True
-            if self._shutdown_deadline is None:
-                self._shutdown_deadline = (time.monotonic() +
-                                           self._REQUEST_SHUTDOWN_TIMEOUT_S)
-        self._close_profile_control()
         # Cancel only this frontend's requests; the launcher owns engine quit.
-        if not self._engine_dead:
-            self._abort_all_requests()
-        self._close_request_sender()
+        self._drain_control_and_requests(cancel_requests=True,
+                                         send_sentinel=False)
 
     def _shutdown(self) -> None:
         self.pre_shutdown()
