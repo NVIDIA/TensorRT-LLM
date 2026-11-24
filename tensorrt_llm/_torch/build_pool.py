@@ -8,8 +8,7 @@ separate processes, so every op's builds run there.
 
 * A build (:class:`Build`) is a module-level function and picklable arguments. Its kernel reaches
   the rank through its compiler's disk cache or, for a CuTe DSL kernel, through the pool's store
-  (:func:`process_built` functions and the runners' shared ``kernel_cache`` dicts load it). Its
-  function may return a value, which its result carries.
+  (:func:`process_built` functions and the runners' shared ``kernel_cache`` dicts load it).
 * The workers live only inside a pass (:meth:`BuildPool.pass_scope`: the memory-profiling warmup,
   or a rehearsal) and exit when it ends, before the KV cache is sized.
 * KernelBuilder sends an op's builds to the pool when the op sets
@@ -152,13 +151,12 @@ class BuildResult(NamedTuple):
     """How a build ended: ``status`` ``"built"``, ``"present"`` (built before), ``"claimed"``
     (another rank's worker makes it), ``"failed"``, or ``"refused"`` (no worker took it: its
     caller builds it); the seconds the worker took; the error of a failed build; the most GPU
-    memory the build allocated at once, in bytes; what the build's function returned."""
+    memory the build allocated at once, in bytes."""
 
     status: str
     seconds: float = 0.0
     error: str = ""
     peak_bytes: int = 0
-    value: Any = None
 
 
 class _Compiler(NamedTuple):
@@ -331,8 +329,6 @@ class _Task:
     batch: BuildBatch
     index: int
     settled: bool = False
-    # Counted in BuildPool._outstanding until it settles.
-    outstanding: bool = False
     # The build's claim among the ranks, which its worker takes before it builds.
     claim: Optional[Claim] = None
 
@@ -503,9 +499,6 @@ class BuildPool:
         self._counts: collections.Counter = collections.Counter()
         self._build_s = 0.0
         self._workers_started = 0
-        # Builds queued on the workers that have not ended (wait_idle).
-        self._outstanding = 0
-        self._idle = threading.Condition(self._lock)
         # family -> the most GPU memory a build of it allocated at once in a worker
         self._peak_bytes: Dict[str, int] = {}
 
@@ -629,9 +622,6 @@ class BuildPool:
             if message is None:
                 self._settle(task, BuildResult(REFUSED))
             else:
-                with self._lock:
-                    self._outstanding += 1
-                    task.outstanding = True
                 pool.put(task)
 
     def _message(self, build: Build) -> Optional[bytes]:
@@ -770,13 +760,6 @@ class BuildPool:
             lane = self._lane
         return lane.join() if lane is not None else {}
 
-    def wait_idle(self) -> None:
-        """Wait until every build queued so far on the workers and the threads has ended."""
-        with self._idle:
-            while self._outstanding:
-                self._idle.wait()
-        self.join_threads()
-
     def counts(self) -> Dict[str, int]:
         """How many builds ended each way (:class:`BuildResult`'s statuses)."""
         with self._lock:
@@ -797,10 +780,6 @@ class BuildPool:
             if task.settled:
                 return
             task.settled = True
-            if task.outstanding:
-                self._outstanding -= 1
-                if not self._outstanding:
-                    self._idle.notify_all()
             self._counts[result.status] += 1
             if result.status == BUILT:
                 self._build_s += result.seconds
@@ -1404,12 +1383,7 @@ def _worker_main(task_read: int, result_write: int) -> None:
             if ends:
                 result = (result[0], result[1], result[2] + _WORKER_ENDS, *result[3:])
             try:
-                data = pickle.dumps(result, protocol=pickle.HIGHEST_PROTOCOL)
-            except (pickle.PicklingError, TypeError, AttributeError) as e:
-                error = f"the build's value does not pickle: {type(e).__name__}: {e}"
-                data = pickle.dumps((FAILED, result[1], error), protocol=pickle.HIGHEST_PROTOCOL)
-            try:
-                _write(results, data)
+                _write(results, pickle.dumps(result, protocol=pickle.HIGHEST_PROTOCOL))
             except BrokenPipeError:
                 return
             if ends:
@@ -1483,7 +1457,7 @@ def _run(function: str, args: tuple, claim: Optional[Claim]) -> tuple:
         return (elsewhere, 0.0, "")
     t0 = time.perf_counter()
     try:
-        value = _resolve(function)(*args)
+        _resolve(function)(*args)
     except Exception as e:  # noqa: BLE001 - reported to the rank, which builds it itself
         _end_claim(claim, e)
         detail = traceback.format_exc()[-_STDERR_TAIL:]
@@ -1492,7 +1466,7 @@ def _run(function: str, args: tuple, claim: Optional[Claim]) -> tuple:
     seconds = time.perf_counter() - t0
     peak = _release_gpu_memory()
     _end_claim(claim)
-    return (BUILT, seconds, "", peak, value)
+    return (BUILT, seconds, "", peak)
 
 
 def _release_gpu_memory() -> int:

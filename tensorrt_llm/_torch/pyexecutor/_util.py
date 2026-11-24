@@ -2131,25 +2131,20 @@ class KvCacheCreator:
         if remainder:
             ctx_blocks += ceil_div(remainder + extra_kv_tokens,
                                    tokens_per_block)
-        # The generation-only batch: each request holds its token (two under
-        # Helix), the extra KV tokens and the draft loop's tokens, for each
-        # beam.
-        helix = self._mapping.has_cp_helix()
+        # The generation-only batch: each request holds its token, the extra KV
+        # tokens and the draft loop's tokens, for each beam.
         num_gen_requests = max(
             1,
             min(engine.batch_size,
                 engine.max_num_tokens // (1 + engine.max_total_draft_tokens)))
         gen_blocks = num_gen_requests * engine.max_beam_width * ceil_div(
-            (2 if helix else 1) + extra_kv_tokens +
-            engine.max_draft_loop_tokens, tokens_per_block)
+            1 + extra_kv_tokens + engine.max_draft_loop_tokens,
+            tokens_per_block)
         # get_num_available_tokens also holds back the extra KV and draft
         # tokens of a request.
         num_blocks = max(ctx_blocks, gen_blocks) + ceil_div(
             extra_kv_tokens + engine.max_total_draft_tokens, tokens_per_block)
         num_blocks *= self._num_kv_pool_groups()
-        if helix:
-            # Helix capacities count the tokens of all the CP ranks.
-            num_blocks *= self._mapping.cp_size
         return num_blocks * tokens_per_block
 
     def _size_throwaway_kv_cache(self, get_tokens: Callable[[], int]) -> None:
@@ -2176,15 +2171,14 @@ class KvCacheCreator:
             self._kv_cache_config.max_gpu_total_bytes = max_gpu_total_bytes
         self._kv_cache_config.max_tokens = max_tokens
 
-    def prepare_rehearsal(self, *, scale: int = 1) -> None:
+    def prepare_rehearsal(self) -> None:
         """Size the KV cache config for the KernelBuilder rehearsal's throwaway
-        managers for ``scale`` times the tokens of the rehearsal's own forwards,
-        whether or not the capacity estimation runs."""
+        managers from the rehearsal's own forwards, whether or not the capacity
+        estimation runs."""
         # build_managers then builds from this config instead of sizing for
         # serving (configure_kv_cache_capacity).
         self._skip_est = False
-        self._size_throwaway_kv_cache(
-            lambda: self._get_token_num_for_rehearsal() * scale)
+        self._size_throwaway_kv_cache(self._get_token_num_for_rehearsal)
 
     def try_prepare_estimation(self) -> bool:
         """Prepare for possible KV cache capacity estimation.

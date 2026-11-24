@@ -6,7 +6,7 @@
 import contextlib
 import inspect
 import os
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Any
 
@@ -457,17 +457,11 @@ class DecoderRunner(ScheduledModelRunner):
         self._eager_workspace_reclaimer = None
         self._eager_workspace_reclaimer = self._warmup.run(resource_manager)
 
-    def rehearse(
-        self,
-        resource_manager: ResourceManager,
-        shapes: Sequence[tuple[int, int]] | None = None,
-    ) -> list[tuple[int, int]]:
-        """The warmup's rehearsal forwards (``DecoderWarmup.rehearse``), returning the
-        shapes every rank skipped for lack of KV cache space. The state they bind to
-        ``resource_manager`` (attention and speculative metadata, cached input copies)
-        goes with it."""
+    def rehearse(self, resource_manager: ResourceManager) -> None:
+        """The warmup's rehearsal forwards. The state they bind to ``resource_manager``
+        (attention and speculative metadata, cached input copies) goes with it."""
         try:
-            return self._warmup.rehearse(resource_manager, shapes)
+            self._warmup.rehearse(resource_manager)
         finally:
             self.attn_metadata = None
             self.spec_metadata = None

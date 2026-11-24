@@ -232,25 +232,22 @@ engine skip the warmup-only pass:
 ### Kernel Builds Beside the Checkpoint Load
 
 For a model whose dummy weights give it the modules and tensors a checkpoint load gives it
-(`rehearses_on_dummy_weights`: MiniMax-M3, Kimi-K3 and Kimi-K3-VL), the engine is first built on
-dummy weights and runs a rehearsal: the autotuner warmup's forwards (a context batch at the maximum
-token count and one generation request, or a batch of generation requests where the warmup runs
-only those, as with Helix context parallelism) on a temporary KV cache of their own. In the
-rehearsal an op queues the kernel builds its calls need instead of compiling them, and an
-autotuned op queues the builds of every shape, runner and tactic its tuning times. The checkpoint
-then loads while the builds run on each rank's worker processes and, for short compiles that run
-outside the GIL such as DeepGEMM's, on build threads of the rank's process, which start a build
-only while the GPU has room for it. An op that tunes in the rehearsal
-(`TuningConfig.tune_in_rehearsal`: the low-M BF16 GEMM race) is timed meanwhile in a worker
-process, with CUDA graphs, and the autotuner warmup finds it tuned. The workers and threads stop,
-and the GPU memory they held is freed, before the KV cache is sized. The startup log shows these
-as the `rehearsal`, `checkpoint` and `gpu_builds` phases.
+(`rehearses_on_dummy_weights`: MiniMax-M3), the engine is first built on dummy weights and runs a
+rehearsal: the autotuner warmup's forwards (a context batch at the maximum token count and one
+generation request, or a batch of generation requests where the warmup runs only those) on a
+temporary KV cache of their own. In the rehearsal an op queues the kernel builds its calls need
+instead of compiling them, and an autotuned op queues the builds of every shape, runner and tactic
+its tuning times. The checkpoint then loads while the builds run on each rank's worker processes,
+which start a build only while the GPU has room for it, and, for an op whose builds are
+thread-safe, on build threads of the rank's process. The workers and threads stop, and the GPU
+memory they held is freed, before the KV cache is sized; the warmup then finds the kernels built.
+The startup log shows these as the `rehearsal`, `checkpoint` and `gpu_builds` phases.
 
 The checkpoint loads first, without a rehearsal, with load formats other than AUTO, MX
 checkpoints, host-resident weights, a failed meta-device init, sleep mode, the MoE load balancer,
 MegaMoE-CuteDSL MoE (it cannot reload its weights), DWDP, the multimodal encoders' CUDA graphs,
 Modeling V2 targets, encoder-only, pooling, multimodal-encoder and encoder-decoder models, and
-context parallelism other than Helix.
+context parallelism.
 
 | Environment variable | Default | Effect |
 |----------------------|---------|--------|

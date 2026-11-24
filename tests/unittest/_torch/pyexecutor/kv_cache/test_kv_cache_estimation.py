@@ -25,7 +25,6 @@ import tensorrt_llm.bindings.internal.batch_manager as batch_manager
 from tensorrt_llm._errors import ResourceError
 from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
-from tensorrt_llm._torch.autotuner import RehearsalTuner
 from tensorrt_llm._torch.distributed.communicator import ReduceOp
 from tensorrt_llm._torch.model_config import KVCacheLayerSpec as ModelKVCacheLayerSpec
 from tensorrt_llm._torch.model_config import ModelConfig, _get_kv_cache_layer_specs
@@ -59,7 +58,6 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheLayerSpec as KVCacheStorageLayerSpec,
 )
 from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
-from tensorrt_llm._torch.pyexecutor.rehearsal import Rehearsal
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     KVCacheManager,
     ResourceManager,
@@ -543,7 +541,6 @@ def _make_rehearsal_creator(
     max_beam_width=1,
     max_total_draft_tokens=0,
     max_draft_loop_tokens=0,
-    helix_cp_size=1,
 ):
     """Build a minimal V1 KvCacheCreator (bypasses __init__) wired up for
     prepare_rehearsal, with the capacity estimation off."""
@@ -554,7 +551,6 @@ def _make_rehearsal_creator(
     c._skip_est = True
     c._is_kv_cache_manager_v2 = False
     c._kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
-    c._mapping = Mock(cp_size=helix_cp_size, **{"has_cp_helix.return_value": helix_cp_size > 1})
     c._model_engine = SimpleNamespace(
         batch_size=batch_size,
         max_num_tokens=max_num_tokens,
@@ -597,36 +593,12 @@ def _make_rehearsal_creator(
             ),
             AutotunerWarmupMode.GENERATION_ONLY,
         ),
-        (
-            dict(
-                batch_size=64,
-                max_num_tokens=1024,
-                max_seq_len=8192,
-                max_total_draft_tokens=3,
-                max_draft_loop_tokens=3,
-                helix_cp_size=4,
-            ),
-            AutotunerWarmupMode.GENERATION_ONLY,
-        ),
-        (
-            dict(
-                batch_size=64,
-                max_num_tokens=1024,
-                max_seq_len=8192,
-                max_total_draft_tokens=3,
-                max_draft_loop_tokens=3,
-                helix_cp_size=4,
-            ),
-            AutotunerWarmupMode.CONTEXT_AND_FULL_GENERATION,
-        ),
     ],
     ids=[
         "multi_sequence_context",
         "beam_search",
         "draft_loop",
         "generation_only",
-        "disagg_helix",
-        "aggregated_helix",
     ],
 )
 @pytest.mark.parametrize("extra_kv_tokens", [0, 3])
@@ -693,80 +665,6 @@ def test_rehearsal_kv_cache_holds_the_warmup_batches(engine, mode, extra_kv_toke
     for num_tokens, num_gen_requests in warmup_configs:
         batch = requests.create_warmup_request(resource_manager, num_tokens, num_gen_requests)
         assert batch is not None
-
-
-@pytest.mark.parametrize("configured_max_tokens", [None, 4096])
-def test_rehearsal_cache_scales_its_tokens_within_a_configured_max_tokens(configured_max_tokens):
-    """A retry's cache holds ``scale`` times the rehearsal's tokens, within the configured
-    max_tokens."""
-    creator = _make_rehearsal_creator(
-        batch_size=16, max_num_tokens=96, max_seq_len=8192, helix_cp_size=8
-    )
-    creator._kv_cache_config = KvCacheConfig(
-        free_gpu_memory_fraction=0.9, max_tokens=configured_max_tokens
-    )
-    with patch(
-        "tensorrt_llm._torch.pyexecutor._util.get_num_extra_kv_tokens",
-        return_value=0,
-    ):
-        tokens = creator._get_token_num_for_rehearsal()
-        creator.prepare_rehearsal(scale=64)
-    expected = 64 * tokens
-    if configured_max_tokens is not None:
-        expected = min(expected, configured_max_tokens)
-    assert creator._skip_est is False
-    assert creator._kv_cache_config.max_tokens == expected
-
-
-@pytest.mark.parametrize(
-    "skips",
-    [
-        [[]],
-        [[(96, 16)], []],
-        [[(96, 16)], [(96, 16)], []],
-        [[(96, 16)], [(96, 16)], [(96, 16)]],
-    ],
-    ids=["fits", "fits_on_the_first_retry", "fits_on_the_second_retry", "skipped_throughout"],
-)
-def test_rehearsal_reruns_skipped_shapes_on_larger_caches(skips):
-    """The shapes every rank skipped for lack of KV cache space run again, and only they, on
-    throwaway managers sized for more tokens, until they fit; each round's managers are torn
-    down."""
-    sizings, rehearsed, torn_down = [], [], []
-    rounds = iter(skips)
-
-    class _Creator:
-        _kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
-
-        def prepare_rehearsal(self, *, scale):
-            sizings.append(scale)
-
-        def build_managers(self, resources, estimating_kv_cache):
-            assert estimating_kv_cache
-            resources[ResourceManagerType.KV_CACHE_MANAGER] = Mock()
-
-        def teardown_managers(self, resources):
-            torn_down.append(resources[ResourceManagerType.KV_CACHE_MANAGER])
-
-    class _Engine:
-        def rehearse(self, resource_manager, shapes=None):
-            rehearsed.append(shapes)
-            return list(next(rounds))
-
-    with (
-        patch(
-            "tensorrt_llm._torch.pyexecutor.rehearsal.get_spec_resource_manager",
-            return_value=None,
-        ),
-        patch.object(RehearsalTuner, "get") as rehearsal_tuner,
-    ):
-        Rehearsal().rehearse(_Engine(), _Creator())
-
-    num_rounds = len(skips)
-    assert sizings == [1, *Rehearsal.RETRY_TOKEN_SCALES][:num_rounds]
-    assert rehearsed == [None, *skips[: num_rounds - 1]]
-    assert len(set(map(id, torn_down))) == num_rounds
-    rehearsal_tuner.return_value.start.assert_called_once()
 
 
 @pytest.mark.parametrize("tp_size", [2, 4, 8])

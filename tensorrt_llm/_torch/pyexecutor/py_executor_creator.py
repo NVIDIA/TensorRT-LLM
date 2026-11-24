@@ -1054,11 +1054,9 @@ def _create_py_executor(
         # The model is built on dummy weights for a KernelBuilder rehearsal; its
         # checkpoint loads after the rehearsal below. Not with what takes the
         # weights over as they load (DWDP) or captures graphs on them (the
-        # multimodal encoders' CUDA graphs), nor with a context parallelism
-        # other than Helix, whose forwards the rehearsal does not run
-        # (DecoderWarmup.rehearse).
+        # multimodal encoders' CUDA graphs), nor with context parallelism, whose
+        # forwards the rehearsal does not run (DecoderWarmup.rehearse).
         mm_config = llm_args.multimodal_config
-        rehearsal_off = mapping.cp_size > 1 and not mapping.has_cp_helix()
         model_engine = ModelEngine(
             model_path=checkpoint_dir,
             llm_args=llm_args,
@@ -1073,7 +1071,7 @@ def _create_py_executor(
                               and dense_dwdp_manager is None
                               and (mm_config is None
                                    or not mm_config.encoder_cuda_graph)
-                              and not rehearsal_off),
+                              and mapping.cp_size == 1),
         )
 
     # Model loading can disable reuse after runtime features were created.

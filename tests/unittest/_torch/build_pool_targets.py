@@ -85,16 +85,6 @@ def fail() -> None:
     raise ValueError("a build that fails")
 
 
-def double(value: int) -> int:
-    """A build whose function returns a value: twice ``value``."""
-    return 2 * value
-
-
-def unpicklable() -> object:
-    """A build whose function returns a value that does not pickle."""
-    return lambda: None
-
-
 def stall(seconds: float) -> None:
     """A build that stops replying for ``seconds``, as one stuck in I/O does."""
     time.sleep(seconds)
