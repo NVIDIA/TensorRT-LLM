@@ -500,6 +500,38 @@ class ParallelConfig(StrictBaseModel):
         ),
     )
 
+    gather_mode: Literal["nccl", "copy_engine"] = Field(
+        "nccl",
+        status="prototype",
+        description=(
+            "Token-sharded TP input gather backend: 'nccl' or 'copy_engine'. "
+            "The copy-engine path overlaps FP8 block-scale projection GEMMs with gathers "
+            "and falls back to NCCL when unavailable. Non-default values require "
+            "tp_layout='token_sharded'."
+        ),
+    )
+    reduce_scatter_mode: Literal["nccl", "copy_engine"] = Field(
+        "nccl",
+        status="prototype",
+        description=(
+            "Token-sharded TP output reduction backend: 'nccl' or 'copy_engine', "
+            "independent of gather_mode. The copy-engine path overlaps eligible FP8 "
+            "row GEMMs with transfers and falls back to NCCL when unavailable or below "
+            "its crossover threshold. Non-default values require tp_layout='token_sharded'."
+        ),
+    )
+    row_align: int = Field(
+        1,
+        ge=1,
+        strict=True,
+        status="prototype",
+        description=(
+            "Token-sharded TP row alignment: pad each sample so every rank's row count "
+            "is a multiple of this positive integer. Larger values can increase padding and "
+            "workspace use. Values other than 1 require tp_layout='token_sharded'."
+        ),
+    )
+
     @property
     def token_sharded_tp(self) -> bool:
         """True iff ``tp_layout`` is ``'token_sharded'`` (test this, not the field's truthiness)."""
@@ -564,6 +596,13 @@ class ParallelConfig(StrictBaseModel):
     @model_validator(mode="after")
     def _validate_tp_layout(self) -> "ParallelConfig":
         # async_ulysses is excluded transitively (it requires ulysses_size > 1).
+        if not self.token_sharded_tp and (
+            self.gather_mode != "nccl" or self.reduce_scatter_mode != "nccl" or self.row_align != 1
+        ):
+            raise ValueError(
+                "parallel_config.gather_mode/reduce_scatter_mode='copy_engine' and "
+                "row_align != 1 require tp_layout='token_sharded'."
+            )
         if self.token_sharded_tp:
             if self.tp_size == 1:
                 raise ValueError(

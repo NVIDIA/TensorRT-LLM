@@ -639,3 +639,104 @@ def test_minimax_h3_tp2_example_lpips(tmp_path):
     assert audio_score < MINIMAX_H3_AUDIO_LOG_STFT_THRESHOLD, (
         f"H3 TP2 changed audio: log-STFT={audio_score:.6f} >= {MINIMAX_H3_AUDIO_LOG_STFT_THRESHOLD}"
     )
+
+
+def _wan22_fp8_ce_quality_worker(rank, world_size, model_path, output_dir):
+    """Compare NCCL and CE row reductions on the same loaded FP8 model and seed."""
+    import json
+    from pathlib import Path
+
+    from defs.examples.visual_gen.visual_gen_test_utils import _lpips_deterministic_algorithms
+
+    from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
+    from tensorrt_llm.visual_gen.args import VisualGenArgs
+
+    args = VisualGenArgs(
+        model=model_path,
+        quant_config={"quant_algo": "FP8_BLOCK_SCALES", "dynamic": True},
+        parallel_config={
+            "tp_size": world_size,
+            "tp_layout": "token_sharded",
+            "gather_mode": "copy_engine",
+            "reduce_scatter_mode": "copy_engine",
+            "row_align": 64,
+        },
+        attention_config={"backend": "VANILLA"},
+        torch_compile_config={"enable": False},
+        cuda_graph_config={"enable": False},
+    )
+    with _lpips_deterministic_algorithms(fully_eager=True), torch.no_grad():
+        pipeline = PipelineLoader(args, device=f"cuda:{rank}").load(skip_warmup=True)
+        helpers = [getattr(pipeline, name).sharder._tp for name in ("transformer", "transformer_2")]
+        calls = [0]
+        for helper in helpers:
+            assert helper.gather_mode == helper.reduce_scatter_mode == "copy_engine"
+            original = helper.ce_gemm_reduce_scatter
+
+            def counted(*a, _original=original, **kwargs):
+                calls[0] += 1
+                return _original(*a, **kwargs)
+
+            helper.ce_gemm_reduce_scatter = counted
+        counts = {}
+        try:
+            for mode in ("nccl", "copy_engine"):
+                for helper in helpers:
+                    helper.reduce_scatter_mode = mode
+                calls[0] = 0
+                result = pipeline.forward(
+                    prompt=WAN22_LPIPS_PROMPT,
+                    negative_prompt=WAN22_LPIPS_NEGATIVE_PROMPT,
+                    height=512,
+                    width=512,
+                    num_frames=61,
+                    num_inference_steps=WAN22_LPIPS_NUM_INFERENCE_STEPS,
+                    guidance_scale=WAN22_LPIPS_GUIDANCE_SCALE,
+                    seed=WAN22_LPIPS_SEED,
+                )
+                # This geometry reaches 8192 rows/destination at TP4 with batched CFG.
+                # A small golden geometry would silently test NCCL fallback in both arms.
+                assert (calls[0] > 0) == (mode == "copy_engine"), (mode, calls[0])
+                assert all(helper.plan.local_rows >= 8192 for helper in helpers)
+                assert all(helper.effective_gather_mode == "copy_engine" for helper in helpers)
+                counts[mode] = calls[0]
+                if rank == 0:
+                    assert result.video is not None and result.video.float().std().item() > 0
+                    _save_lpips_video_mp4(
+                        result.video.detach().cpu(),
+                        Path(output_dir) / f"wan22_fp8_{mode}.mp4",
+                        WAN22_LPIPS_FRAME_RATE,
+                    )
+            if rank == 0:
+                (Path(output_dir) / "collective_calls.json").write_text(json.dumps(counts) + "\n")
+        finally:
+            for helper in helpers:
+                helper.close()
+
+
+def test_wan22_fp8_ce_reduce_scatter_quality(_visual_gen_deps, tmp_path):
+    """A full-model reorder-quality gate that verifies production CE dispatch actually ran."""
+    _skip_if_insufficient_gpus_for_parallel({"tp_size": 4})
+    from tensorrt_llm._utils import is_sm_100f
+
+    if not is_sm_100f():
+        pytest.skip("Copy-engine block-scale FP8 requires an SM100-family GPU")
+    run_test_in_distributed(
+        world_size=4,
+        test_fn=_wan22_fp8_ce_quality_worker,
+        model_path=get_checkpoint("Wan2.2-T2V-A14B-Diffusers"),
+        output_dir=str(tmp_path),
+    )
+    score = _run_lpips_eval(
+        tmp_path,
+        "wan22_fp8_ce_reduce_scatter",
+        "video",
+        WAN22_LPIPS_PROMPT,
+        tmp_path / "wan22_fp8_nccl.mp4",
+        tmp_path / "wan22_fp8_copy_engine.mp4",
+    )
+    _assert_lpips_below_threshold(
+        score,
+        WAN_MULTI_GPU_REORDERED_WITHIN_BUILD_LPIPS_THRESHOLD,
+        label="FP8 copy-engine reduce-scatter vs same-build NCCL",
+    )

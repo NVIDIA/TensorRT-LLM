@@ -989,6 +989,11 @@ class BasePipeline(nn.Module):
 
         self._is_warmup = True
         try:
+            if post_tune_merge_dist is None and self._needs_eager_warmup_pass():
+                # Every shape eagerly before any capture (the multi-rank autotune branch
+                # below already runs such a pass).
+                with self.disallow_cuda_graph_capture():
+                    self._run_warmup_pass(shapes, steps)
             if not enable_autotune:
                 self._run_warmup_pass(shapes, steps)
             elif post_tune_merge_dist is None:
@@ -1018,6 +1023,22 @@ class BasePipeline(nn.Module):
         )
         elapsed = time.time() - warmup_start
         logger.info(f"Warmup completed in {elapsed:.2f}s")
+
+    def _needs_eager_warmup_pass(self) -> bool:
+        """Whether every warm-up shape must run eagerly before any CUDA graph is captured.
+
+        A token-sharded TP with the copy-engine gather or reduce-scatter sizes its grow-only
+        symmetric pools from the forwards, and a pool that grows after a capture would leave
+        that graph with stale buffers (``TokenShardedSequenceSharder.needs_eager_warmup``).
+        """
+        if not self.pipeline_config.cuda_graph.enable:
+            return False
+        return any(
+            getattr(
+                getattr(getattr(self, name, None), "sharder", None), "needs_eager_warmup", False
+            )
+            for name in self.transformer_components
+        )
 
     def _run_warmup_pass(self, shapes, steps) -> None:
         """Run one warmup pass over all shapes (denoise loop with dummy inputs)."""
@@ -1611,3 +1632,10 @@ class BasePipeline(nn.Module):
             runner.clear()
         for graph_pool in graph_pools:
             release_nccl_window_graph_owner(graph_pool)
+        # Token-sharded TP: release the group's copy-engine gather state (after the graphs
+        # that captured its buffers) through the model's sharder.
+        for name in self.transformer_components:
+            sharder = getattr(getattr(self, name, None), "sharder", None)
+            close = getattr(sharder, "close", None)
+            if close is not None:
+                close()

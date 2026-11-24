@@ -863,7 +863,38 @@ class TestTokenShardedTPConfig:
         assert pc.token_sharded_tp is True
         assert pc.n_workers == 4
 
-    def test_yaml_roundtrip(self, tmp_path):
+    def test_collective_defaults(self):
+        pc = ParallelConfig()
+        assert pc.gather_mode == pc.reduce_scatter_mode == "nccl"
+        assert pc.row_align == 1
+
+    @pytest.mark.parametrize("field", ["gather_mode", "reduce_scatter_mode"])
+    @pytest.mark.parametrize("value", ["rdma", None])
+    def test_rejects_invalid_collective_modes(self, field, value):
+        with pytest.raises(ValidationError, match=field):
+            ParallelConfig(tp_size=2, tp_layout="token_sharded", **{field: value})
+
+    @pytest.mark.parametrize("row_align", [0, -1, 1.5, True, "128", None])
+    def test_rejects_invalid_row_alignment(self, row_align):
+        with pytest.raises(ValidationError, match="row_align"):
+            ParallelConfig(tp_size=2, tp_layout="token_sharded", row_align=row_align)
+
+    @pytest.mark.parametrize("layout", [None, "replicated"])
+    @pytest.mark.parametrize(
+        "controls",
+        [
+            {"gather_mode": "copy_engine"},
+            {"reduce_scatter_mode": "copy_engine"},
+            {"row_align": 128},
+        ],
+    )
+    def test_collective_controls_require_token_sharded_layout(self, layout, controls):
+        with pytest.raises(ValidationError, match="require tp_layout='token_sharded'"):
+            ParallelConfig(tp_size=2, tp_layout=layout, **controls)
+
+    @pytest.mark.parametrize("gather_mode", ["nccl", "copy_engine"])
+    @pytest.mark.parametrize("reduce_scatter_mode", ["nccl", "copy_engine"])
+    def test_yaml_roundtrip(self, tmp_path, gather_mode, reduce_scatter_mode):
         yaml_path = tmp_path / "config.yml"
         yaml_path.write_text(
             "model: /tmp/model\n"
@@ -871,12 +902,24 @@ class TestTokenShardedTPConfig:
             "  cfg_size: 2\n"
             "  tp_size: 2\n"
             "  tp_layout: token_sharded\n"
+            f"  gather_mode: {gather_mode}\n"
+            f"  reduce_scatter_mode: {reduce_scatter_mode}\n"
+            "  row_align: 128\n"
         )
         args = VisualGenArgs.from_yaml(yaml_path)
         assert args.parallel_config.token_sharded_tp is True
         dumped = args.model_dump()
-        assert dumped["parallel_config"]["tp_layout"] == "token_sharded"
+        pc = dumped["parallel_config"]
+        assert pc["tp_layout"] == "token_sharded"
+        assert pc["gather_mode"] == gather_mode
+        assert pc["reduce_scatter_mode"] == reduce_scatter_mode
+        assert pc["row_align"] == 128
         assert VisualGenArgs(**dumped).parallel_config == args.parallel_config
+        assert (
+            VisualGenArgs.model_validate_json(args.model_dump_json()).parallel_config
+            == args.parallel_config
+        )
+        assert pickle.loads(pickle.dumps(args)).parallel_config == args.parallel_config
 
 
 class TestVisualGenArgsPickle:
