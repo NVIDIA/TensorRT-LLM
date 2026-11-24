@@ -28,7 +28,9 @@ Three groups of checks:
 """
 
 import ast
+import inspect
 import os
+import pydoc
 import textwrap
 from pathlib import Path
 
@@ -459,8 +461,14 @@ def test_required_internal_variable_raises_key_error(monkeypatch):
         envs.TRTLLM_DISAGG_CONFIG_FILE
 
 
-def test_dir_lists_the_declared_variables():
-    assert set(envs.environment_variables) <= set(dir(envs))
+def test_introspection_does_not_read_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in envs.environment_variables:
+        monkeypatch.delenv(name, raising=False)
+
+    members = dict(inspect.getmembers(envs))
+    assert members["environment_variables"] is envs.environment_variables
+    assert not set(envs.environment_variables).intersection(members)
+    assert "environment_variables" in pydoc.render_doc(envs, renderer=pydoc.plaintext)
 
 
 # ---------------------------------------------------------------------------

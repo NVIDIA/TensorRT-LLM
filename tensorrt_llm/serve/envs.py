@@ -30,9 +30,11 @@ fleet-worker variables) and code reads them later. Each reader reproduces the
 parsing of the call site that read the variable before it was declared here
 (``tests/unittest/serve/test_envs.py`` pins it); changing a reader or a default
 is a behavior change. Where unset and empty differ today, they still differ.
-A required variable raises ``KeyError`` when it is unset, also through
-``hasattr(envs, NAME)`` and ``inspect.getmembers(envs)``; code that enumerates
-the variables uses ``environment_variables`` instead of attribute access.
+A required variable raises ``KeyError`` when it is unset, including an explicit
+``hasattr(envs, NAME)`` probe. Dynamic settings are not advertised by ``dir()``,
+so introspection does not evaluate them. Enumerate declarations through
+``environment_variables``. Tests change the environment with ``monkeypatch.setenv``
+or ``monkeypatch.delenv``; assigning a module attribute shadows its dynamic reader.
 
 Three blocks, in this order: deployment switches (set by whoever runs the
 server), launcher-internal variables (written by a launcher for a process it
@@ -723,7 +725,8 @@ def __getattr__(name: str) -> Any:
 
 
 def __dir__() -> list[str]:
-    return sorted([*globals(), *environment_variables])
+    """Expose concrete attributes without evaluating dynamic environment settings."""
+    return sorted(globals())
 
 
 def consume(name: str) -> Optional[str]:
