@@ -21,7 +21,8 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
 from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 #: This checkpoint's GDN `[q|k|v]` width; the conv is width 4 over a 3-column pool.
 CKPT_DIM = 10240
@@ -388,7 +389,7 @@ class CausalConv1dUpdate(OpWrapper):
     writes through it). `conv_state` is advanced in place and not returned.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # spec keys: dim, x_row_stride (default 16480), batch, pool_slots, slots
     # ("random" | tuple), pool_layers (the pool the last layer's view of a buffer

@@ -14,15 +14,15 @@ vendors:
     digest: sha256-tree-v1:b5e8540bfd32251213a13d0aec255124a75606eb78cd1a9de5256a0062c9a9a9
   flashinfer-prims-ts:
     url: https://github.com/bastianhagedorn/flashinfer.git
-    branch: trtllm-prims-ts-mla-decode-corr-load-wait-20261124
-    commit: 83c578dc1bb1914aecd24931d4b5d4995844de14
+    branch: kernels/mla_decode/throughput_2cta/resources.py
+    commit: 8485300b24d5b636fa7d247f535c29e2066bc686
     source: flashinfer/attention/prims_ts
     destination: tensorrt_llm/_torch/attention/backends/prims_ts
     include:
     - '**/*.py'
     patch: 3rdparty/vendor_patches/flashinfer-prims-ts.patch
-    patch_digest: sha256:791858b6b86402fed18cb151e5f0d8620820da70fcf81a9e2b731e8686f539b2
-    digest: sha256-tree-v1:cec597ddced7acf9377c29a8f2f05b266632b5178c61e1135da4ad6f67267f99
+    patch_digest: sha256:18c46484646256b4a77339187d2db1b43a836c622e6148e31275165b2c165eb2
+    digest: sha256-tree-v1:9b280792babd6bfd7009512fb03cedb425c34bf28d34e8438ec7df1d44bd214f
   openengine-proto:
     url: https://github.com/ai-dynamo/openengine.git
     tag: v0.1.0

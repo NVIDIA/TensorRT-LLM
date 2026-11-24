@@ -60,6 +60,7 @@ def build_attention_metadata(
     draft_kv_cache_manager: KVCacheManager | KVCacheManagerV2 | None = None,
     enable_context_mla_with_cached_kv: bool | None = None,
     max_num_heads_per_kv: int | None = None,
+    max_total_draft_tokens: int | None = None,
     enable_ragged_verification: bool = False,
 ) -> AttentionMetadata:
     """Construct attention metadata and resolve model-derived inputs."""
@@ -92,6 +93,11 @@ def build_attention_metadata(
         else None
     )
     metadata_kwargs = {}
+    if max_total_draft_tokens is not None:
+        from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+
+        if issubclass(attention_backend.Metadata, TrtllmAttentionMetadata):
+            metadata_kwargs["max_total_draft_tokens"] = max_total_draft_tokens
     if enable_ragged_verification:
         from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import (
             DSAtrtllmAttentionMetadata,
