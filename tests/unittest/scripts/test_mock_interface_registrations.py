@@ -322,6 +322,10 @@ def test_replacements_preserve_descriptor_binding(
             id="decorator-calls-closure",
         ),
         pytest.param(
+            "def invoke(fn):\n    fn()\n    return fn\n@invoke\ndef drop():\n    del fixture.x",
+            id="decorator-calls-decorated-function",
+        ),
+        pytest.param(
             "def drop():\n    del fixture.x\nhooks = SimpleNamespace(drop=drop)\nhooks.drop()",
             id="namespace-calls-closure",
         ),
@@ -343,6 +347,29 @@ def test_indirect_mutation_invalidates_instance_evidence(tmp_path: Path, mutatio
     before, after = results
     assert before["status"] == "matched"
     assert after["status"] == "unverified"
+
+
+def test_descriptor_preserves_captured_instance_evidence(tmp_path: Path) -> None:
+    results = _check(
+        tmp_path,
+        "class Real:\n    x = 1\n",
+        """
+        from types import SimpleNamespace
+        from test_common.interface_checks import verify_instance
+
+        def test_fixture():
+            fixture = SimpleNamespace(x=1)
+
+            @staticmethod
+            def drop():
+                del fixture.x
+
+            verify_instance(fixture, "production:Real", members=("x",))
+            drop()
+            verify_instance(fixture, "production:Real", members=("x",))
+        """,
+    )
+    assert [result["status"] for result in results] == ["matched", "unverified"]
 
 
 def test_namespace_reads_preserve_instance_evidence(tmp_path: Path) -> None:

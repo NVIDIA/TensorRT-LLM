@@ -1310,9 +1310,13 @@ class Analyzer:
         captures = loaded_names(node).difference(self.source.bindings(node))
         return Value(captures=frozenset(captures))
 
-    def referenced_origins(self, node: ast.AST, env: dict[str, Value]) -> frozenset[int]:
-        """Find tracked objects reachable from the referenced values."""
-        roots = (env[name] for name in loaded_names(node) if name in env)
+    def referenced_origins(
+        self, node: ast.AST, env: dict[str, Value], *, argument: Value | None = None
+    ) -> frozenset[int]:
+        """Find tracked objects reachable from references and an implicit argument."""
+        roots = [env[name] for name in loaded_names(node) if name in env]
+        if argument is not None:
+            roots.append(argument)
         return frozenset(
             origin for value in reachable_values(roots, env) for origin in value.origins
         )
@@ -1517,7 +1521,7 @@ class Analyzer:
             )
 
     def uses_rebound_names(
-        self, call: ast.Call, references: list[ast.expr], *, allowed: ast.AST | None = None
+        self, node: ast.AST, references: list[ast.expr], *, allowed: ast.AST | None = None
     ) -> bool:
         names = set()
         for ref in references:
@@ -1528,7 +1532,7 @@ class Analyzer:
             names.add(ref.id)
 
         scopes = [self.source.tree]
-        parent = self.parents.get(call)
+        parent = self.parents.get(node)
         while parent is not None:
             if isinstance(parent, DEFINITIONS + (ast.Lambda,)):
                 scopes.append(parent)
@@ -1934,8 +1938,20 @@ class Analyzer:
                     self.block(statement.body, {})
                     value = self.deferred_function(statement)
                 for decorator in reversed(statement.decorator_list):
+                    if isinstance(decorator, ast.Call):
+                        reference = decorator.func
+                        only_wraps = self.source.qualified(reference) == MARKERS + ".mock_target"
+                    else:
+                        reference = decorator
+                        only_wraps = self.source.qualified(reference).removeprefix("builtins.") in {
+                            "staticmethod",
+                            "classmethod",
+                            "property",
+                        }
+                    if only_wraps and not self.uses_rebound_names(statement, [reference]):
+                        continue
                     self.invalidate_origins(
-                        self.referenced_origins(decorator, env),
+                        self.referenced_origins(decorator, env, argument=value),
                         env,
                         f"Unresolved decorator effects at line {decorator.lineno}",
                     )
