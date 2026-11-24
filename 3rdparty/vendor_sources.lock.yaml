@@ -13,8 +13,8 @@ vendors:
     patch_digest: sha256:77729d1f7c3d29682d232e6128be8b1bfcb548cdcf54dd16995685d620a6eeea
     digest: sha256-tree-v1:b5e8540bfd32251213a13d0aec255124a75606eb78cd1a9de5256a0062c9a9a9
   flashinfer-prims-ts:
-    url: https://github.com/harrisonzhy/flashinfer.git
-    branch: harrisonzhy/trtllm-prims-ts-dev-20261107_vc-attn-fixes-d76f94bb
+    url: https://github.com/yuxianq/flashinfer.git
+    branch: trtllm-prims-ts-dev-20261107
     commit: 69527ce04c4ca765f9f46ff0aa55b50ac776ba29
     source: flashinfer/attention/prims_ts
     destination: tensorrt_llm/_torch/attention/backends/prims_ts
