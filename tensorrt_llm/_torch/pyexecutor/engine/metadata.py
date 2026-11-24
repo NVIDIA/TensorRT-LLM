@@ -164,9 +164,11 @@ def build_feature_attention_metadata(
         DeepseekV4Metadata,
     )
     from tensorrt_llm._torch.attention.metadata.draft import (
+        DenseLinearDraftMetadata,
         EmbeddedDSparkDraftMetadata,
         LinearDraftLengthsMetadata,
         LinearDraftMetadata,
+        SharedKVCacheDenseLinearDraftMetadata,
         SharedKVCacheLinearDraftMetadata,
         SharedKVCacheStandaloneDSparkDraftMetadata,
         StandaloneDSparkDraftMetadata,
@@ -214,7 +216,7 @@ def build_feature_attention_metadata(
         metadata_types.append(MlaContextMetadata)
         if attention_runtime_features.chunked_prefill:
             metadata_types.append(ChunkedPrefillMetadata)
-    # The metadata of a sparse algorithm stands in for the dense one or requires it.
+    # The metadata of a sparse algorithm requires the dense one.
     if is_deepseek_v4:
         metadata_types.append(DeepseekV4Metadata)
     elif is_csa2:
@@ -244,6 +246,14 @@ def build_feature_attention_metadata(
                 metadata_types.append(DeepseekV4DraftMetadata)
             elif is_csa2:
                 metadata_types.append(CSA2DraftMetadata)
+        elif spec_dec_mode.is_eagle3_one_model() and spec_config.is_linear_tree:
+            # The Eagle3 drafter is a dense model of its own.
+            metadata_types.append(
+                DenseLinearDraftMetadata
+                if has_separate_draft_cache
+                else SharedKVCacheDenseLinearDraftMetadata
+            )
+            metadata_types.append(LinearDraftLengthsMetadata)
         elif spec_dec_mode.is_dspark() and spec_config.draft_is_embedded_in_target:
             metadata_types.append(EmbeddedDSparkDraftMetadata)
         elif spec_dec_mode.is_dspark():
@@ -256,8 +266,8 @@ def build_feature_attention_metadata(
             metadata_types.append(SuffixAutomatonDraftMetadata)
         else:
             raise UnsupportedMetadataConfiguration(
-                f"the speculative decoding mode {spec_dec_mode.name} (linear MTP-Eagle "
-                "one-model, DSpark and the suffix automaton are covered)"
+                f"the speculative decoding mode {spec_dec_mode.name} (linear MTP-Eagle and "
+                "Eagle3 one-model, DSpark and the suffix automaton are covered)"
             )
         max_draft_tokens = spec_config.max_draft_len
 

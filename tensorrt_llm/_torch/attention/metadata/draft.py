@@ -23,6 +23,8 @@ import torch
 
 from .base import Metadata, UnsupportedMetadataConfiguration, _Registry, build_metadata
 from .core import TrtllmCoreMetadata
+from .sparse import SparseMetadata
+from .spec_decoding import SpecDecodingMetadata
 
 if TYPE_CHECKING:
     from .batch_inputs import BatchInputs
@@ -94,7 +96,7 @@ def _build_draft_set(metadata: DraftMetadata, config: "BatchInputs") -> TrtllmCo
 
 
 class LinearDraftMetadata(DraftMetadata):
-    """The metadata of a linear draft chain over a separate draft KV cache (Eagle3 / MTP-Eagle).
+    """The metadata of a linear draft chain of the target's own layers over a separate draft KV cache (MTP-Eagle).
 
     The draft layers run the attention backend on a second set of metadata,
     draft: the target's types, built over the draft KV cache. The engine
@@ -123,7 +125,7 @@ class LinearDraftMetadata(DraftMetadata):
 
 
 class SharedKVCacheLinearDraftMetadata(DraftMetadata):
-    """The metadata of a linear draft chain over the target's KV cache (Eagle3 / MTP-Eagle).
+    """The metadata of a linear draft chain of the target's own layers over the target's KV cache (MTP-Eagle).
 
     The draft layers are extra layers of the target's KV cache. They run the
     attention backend on a second set of metadata, draft: the target's types,
@@ -145,6 +147,65 @@ class SharedKVCacheLinearDraftMetadata(DraftMetadata):
         self.draft = _build_draft_set(
             self,
             dataclasses.replace(config, draft_kv_cache_manager=None, buffer_name_prefix="draft_"),
+        )
+
+
+class DenseLinearDraftMetadata(DraftMetadata):
+    """The metadata of a linear draft chain of a dense draft model over a separate draft KV cache (Eagle3).
+
+    The draft layers are dense attention layers, whatever the target
+    attaches. They run the attention backend on a second set of metadata,
+    draft: the dense types, built over the draft KV cache. The engine
+    prepares it with each target step that drafts; the other draft metadata
+    update it in place for each draft step.
+    """
+
+    def __init__(self, registry: _Registry, config: "BatchInputs") -> None:
+        super().__init__(registry, config)
+        draft_manager = config.draft_kv_cache_manager
+        if draft_manager is None or draft_manager is config.kv_cache_manager:
+            raise ValueError("DenseLinearDraftMetadata requires a separate draft KV cache")
+        # The core of the metadata the draft layers receive as attn_metadata.
+        self.draft = build_metadata(
+            [TrtllmCoreMetadata, SpecDecodingMetadata, SparseMetadata],
+            dataclasses.replace(
+                config,
+                kv_cache_manager=draft_manager,
+                draft_kv_cache_manager=None,
+                sparse_metadata_params=None,
+                buffer_name_prefix="draft_",
+            ),
+        )
+
+
+class SharedKVCacheDenseLinearDraftMetadata(DraftMetadata):
+    """The metadata of a linear draft chain of a dense draft model over the target's KV cache (Eagle3).
+
+    The draft layers are dense attention layers, whatever the target
+    attaches, and extra layers of the target's KV cache. They run the
+    attention backend on a second set of metadata, draft: the dense types,
+    built over that same cache with lengths of their own, so the draft steps
+    leave the target's metadata untouched. The engine prepares it with each
+    target step that drafts; the other draft metadata update it in place for
+    each draft step.
+    """
+
+    def __init__(self, registry: _Registry, config: "BatchInputs") -> None:
+        super().__init__(registry, config)
+        draft_manager = config.draft_kv_cache_manager
+        if draft_manager is not None and draft_manager is not config.kv_cache_manager:
+            raise ValueError(
+                "SharedKVCacheDenseLinearDraftMetadata requires a shared draft KV cache"
+            )
+        # The core of the metadata the draft layers receive as attn_metadata.
+        self.draft = build_metadata(
+            [TrtllmCoreMetadata, SpecDecodingMetadata, SparseMetadata],
+            dataclasses.replace(
+                config,
+                draft_kv_cache_manager=None,
+                sparse_metadata_params=None,
+                buffer_name_prefix="draft_",
+            ),
         )
 
 
