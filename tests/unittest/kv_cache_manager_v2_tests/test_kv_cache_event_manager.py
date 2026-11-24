@@ -843,6 +843,7 @@ def test_event_data_pickle_round_trip_preserves_value_semantics():
         diff,
         KVCacheUpdatedData("block", diff, None),
         KVCacheEvent(4, stored, 128, "same-hash-label", 1, 2),
+        KVCacheEvent(5, stored, 128, "same-hash-label", 1, 3, "ring"),
     ]
 
     for value in values:
@@ -856,6 +857,7 @@ def test_event_manager_public_methods_drain_queue():
         window_size_by_layer_group=None,
     )
     manager.set_layer_group_window_sizes({0: 64, 1: 96})
+    manager.set_layer_group_regions({1: "ring"})
 
     manager.add_created_event([2, 3], layer_group_ids=[0, 1])
     manager.add_stored_event(
@@ -876,7 +878,13 @@ def test_event_manager_public_methods_drain_queue():
         layer_group_id=1,
     )
 
-    assert _flush_serialized_events(manager)
+    events = _flush_serialized_events(manager)
+    # Only the events of a region's group carry its name.
+    assert any(event.get("layer_group_id") == 1 for event in events)
+    assert all(
+        event.get("region") == ("ring" if event.get("layer_group_id") == 1 else None)
+        for event in events
+    )
     assert manager.get_latest_events(0) == []
     assert manager.get_latest_events(-1) == []
 

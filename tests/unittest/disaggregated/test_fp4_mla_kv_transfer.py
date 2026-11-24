@@ -37,9 +37,12 @@ from tensorrt_llm._torch.attention.backends.fp4_mla import (
     _cutedsl_backend_available,
 )
 from tensorrt_llm._torch.attention.backends.fp4_mla.cache_manager import Fp4MlaKVCacheManagerV2
+from tensorrt_llm._torch.kimi_k3_cache_policy import KIMI_K3_FP8_KV_LAYERS_ENV
+from tensorrt_llm._torch.modules.kimi_kda.cache_manager import KimiK3HybridCacheManager
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MTPDecodingConfig
+from tensorrt_llm.runtime.kv_cache_manager_v2 import LayerId
 
 NUM_LAYERS = 4
 HEAD_DIM = 576
@@ -92,6 +95,63 @@ def _create_managers(
             spec_config=MTPDecodingConfig(max_draft_len=max_draft_len) if speculative else None,
             max_num_tokens=MAX_TOKENS,
             pretrained_config=SimpleNamespace(kv_lora_rank=KV_LORA_RANK),
+            is_disagg=True,
+        )
+        for rank in range(tp * pp)
+    ]
+
+
+# Kimi K3 layer pattern: KDA layers 0 and 2, MLA layers 1 and 3. Kimi K3 keeps its last MLA layer in
+# the FP8 fallback, so layer 1 is NVFP4 and layer 3 FP8.
+K3_MAMBA_LAYER_MASK = [True, False, True, False]
+
+
+def _create_k3_managers(
+    tp: int, pp: int, enable_dp: bool, *, speculative: bool = True
+) -> list[KimiK3HybridCacheManager]:
+    """Kimi K3 hybrid managers, which store the MLA state in the FP4 MLA layout's regions."""
+    return [
+        KimiK3HybridCacheManager(
+            mamba_d_state=32,
+            mamba_d_conv=4,
+            mamba_num_heads=4,
+            mamba_n_groups=4,
+            mamba_head_dim=32,
+            mamba_num_layers=sum(K3_MAMBA_LAYER_MASK),
+            mamba_layer_mask=K3_MAMBA_LAYER_MASK,
+            mamba_cache_dtype=torch.bfloat16,
+            mamba_ssm_cache_dtype=torch.float32,
+            kv_cache_config=KvCacheConfig(
+                max_tokens=MAX_TOKENS,
+                dtype="nvfp4",
+                enable_block_reuse=False,
+                host_cache_size=0,
+            ),
+            kv_cache_type=CacheTypeCpp.SELFKONLY,
+            num_layers=len(K3_MAMBA_LAYER_MASK) - sum(K3_MAMBA_LAYER_MASK),
+            layer_mask=[not is_mamba for is_mamba in K3_MAMBA_LAYER_MASK],
+            num_kv_heads=1,
+            head_dim=HEAD_DIM,
+            tokens_per_block=TOKENS_PER_BLOCK,
+            max_seq_len=transfer_harness.MAX_SEQ_LEN,
+            max_batch_size=transfer_harness.MAX_BATCH_SIZE,
+            mapping=Mapping(
+                world_size=tp * pp,
+                rank=rank,
+                tp_size=tp,
+                pp_size=pp,
+                enable_attention_dp=enable_dp,
+            ),
+            dtype=DataType.NVFP4,
+            spec_config=MTPDecodingConfig(max_draft_len=MAX_DRAFT_LEN) if speculative else None,
+            max_num_tokens=MAX_TOKENS,
+            pretrained_config=SimpleNamespace(
+                model_type="kimi_linear",
+                num_hidden_layers=len(K3_MAMBA_LAYER_MASK),
+                kv_lora_rank=KV_LORA_RANK,
+                qk_rope_head_dim=HEAD_DIM - KV_LORA_RANK,
+                linear_attn_config={"full_attn_layers": [2, 4], "kda_layers": [1, 3]},
+            ),
             is_disagg=True,
         )
         for rank in range(tp * pp)
@@ -185,6 +245,22 @@ def _v_packed_pages(
     return pool.view(-1, manager.fp4_mla_layout.mla_v_head_dim, TOKENS_PER_BLOCK // 2)[pages]
 
 
+def _fp4_layers(manager) -> set[int]:
+    """Global ids of the manager's NVFP4 MLA layers."""
+    return {
+        manager.pp_layers[local_layer]
+        for local_layer in manager.fp4_mla_layout._fp4_mla_compact_to_local
+    }
+
+
+def _fp8_layers(manager) -> set[int]:
+    """Global ids of the manager's FP8 fallback MLA layers."""
+    return {
+        manager.pp_layers[int(layer_id)]
+        for layer_id in manager.fp4_mla_layout._fp8_mla_manager_layer_ids
+    }
+
+
 def _handles_request(manager, tp: int, enable_dp: bool, req_idx: int) -> bool:
     return not enable_dp or req_idx % tp == manager.mapping.tp_rank
 
@@ -225,15 +301,37 @@ def _verify_cache(
     # context worker without speculation neither holds nor sends.
     ctx_layers = {layer_idx for manager in ctx_managers for layer_idx in manager.pp_layers}
 
+    # FP8 fallback layers arrive byte-exact too.
+    for req_idx, prompt_len in enumerate(request_lengths):
+        for gen_manager in gen_managers:
+            if not _handles_request(gen_manager, gen_tp, gen_enable_dp, req_idx):
+                continue
+            for layer_idx in _fp8_layers(gen_manager) & ctx_layers:
+                ctx_manager = _find_ctx_manager(
+                    ctx_managers,
+                    ctx_tp=ctx_tp,
+                    ctx_enable_dp=ctx_enable_dp,
+                    req_idx=req_idx,
+                    layer_idx=layer_idx,
+                )
+                gen_pages = _prompt_pages(
+                    gen_manager, gen_request_ids[req_idx], layer_idx, prompt_len
+                )
+                ctx_pages = _prompt_pages(
+                    ctx_manager, ctx_request_ids[req_idx], layer_idx, prompt_len
+                )
+                assert torch.equal(
+                    gen_manager.get_buffers(layer_idx)[gen_pages],
+                    ctx_manager.get_buffers(layer_idx)[ctx_pages],
+                )
+
     # Transferred roles arrive byte-exact; derived sidecars stay local.
     for req_idx, prompt_len in enumerate(request_lengths):
         for gen_manager in gen_managers:
             if not _handles_request(gen_manager, gen_tp, gen_enable_dp, req_idx):
                 continue
             gen_hp_pages = _hp_pages(gen_manager, gen_request_ids[req_idx], prompt_len)
-            for layer_idx in gen_manager.pp_layers:
-                if layer_idx not in ctx_layers:
-                    continue
+            for layer_idx in sorted(_fp4_layers(gen_manager) & ctx_layers):
                 ctx_manager = _find_ctx_manager(
                     ctx_managers,
                     ctx_tp=ctx_tp,
@@ -313,9 +411,7 @@ def _verify_cache(
         for gen_manager in gen_managers:
             if not _handles_request(gen_manager, gen_tp, gen_enable_dp, req_idx):
                 continue
-            for layer_idx in gen_manager.pp_layers:
-                if layer_idx not in ctx_layers:
-                    continue
+            for layer_idx in sorted(_fp4_layers(gen_manager) & ctx_layers):
                 ctx_manager = _find_ctx_manager(
                     ctx_managers,
                     ctx_tp=ctx_tp,
@@ -484,3 +580,44 @@ def test_fp4_mla_kv_transfer_from_context_only_cache(
         verify_fn=_verify_cache,
     )
     assert created_sides == [True, False]
+
+
+@pytest.mark.timeout(300)
+@pytest.mark.parametrize(
+    "ctx_speculative", [False, True], ids=["ctx_without_spec", "ctx_with_spec"]
+)
+def test_k3_mla_regions_kv_transfer(monkeypatch, ctx_speculative: bool) -> None:
+    """Kimi K3 keeps its MLA state in token-block regions, the HP ring on the FP4 layer itself.
+
+    The FP4 and FP8 latents and the HP positions of prompts ending inside a 16-token tile (65,
+    129 and 383 tokens) reach a generation worker with speculation, whose ring is as large as or
+    larger than the context worker's, as the context worker wrote them.
+    """
+    _requires_fp4_mla_backend("triton")
+    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
+    monkeypatch.delenv(KIMI_K3_FP8_KV_LAYERS_ENV, raising=False)
+    calls = []
+
+    def factory(tp: int, pp: int, enable_dp: bool) -> list[KimiK3HybridCacheManager]:
+        calls.append((tp, pp, enable_dp))
+        managers = _create_k3_managers(
+            tp, pp, enable_dp, speculative=ctx_speculative or len(calls) > 1
+        )
+        for manager in managers:
+            assert manager.fp4_mla_layout._hp_manager_layer_ids == [LayerId(1)]
+            assert _fp8_layers(manager) == {3}
+        return managers
+
+    transfer_harness.run_kv_transfer_test(
+        ctx_tp=1,
+        ctx_pp=1,
+        gen_tp=1,
+        gen_pp=1,
+        ctx_enable_dp=False,
+        gen_enable_dp=False,
+        update_before_transfer=True,
+        manager_factory=factory,
+        init_fn=_initialize_cache,
+        verify_fn=_verify_cache,
+        prepare_resources=True,
+    )

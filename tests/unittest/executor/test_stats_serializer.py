@@ -511,6 +511,7 @@ class TestStatsSerializer:
                     full_reused_blocks_by_level=[1, 1, 0],
                     partial_reused_blocks_by_level=[0, 1, 0],
                     connector_reused_blocks=2,
+                    region="fp4_mla_latent",
                 ),
                 4: KVCacheV2SsmLifeCycleIterationStats(
                     life_cycle_id=4,
@@ -583,6 +584,8 @@ class TestStatsSerializer:
         assert life_cycle["poolGroupId"] == 7
         assert life_cycle["windowSize"] == 16
         assert life_cycle["kind"] == "attention"
+        # A region's life cycle is labelled with the region; a layer config's carries no label.
+        assert life_cycle["region"] == "fp4_mla_latent"
         assert life_cycle["iterReusedBlocks"] == 5
         assert life_cycle["iterMissedBlocks"] == 3
         assert "iterGenAllocBlocks" not in life_cycle

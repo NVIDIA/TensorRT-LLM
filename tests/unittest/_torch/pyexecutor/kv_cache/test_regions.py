@@ -48,6 +48,7 @@ COUNT = DataRole("count")
 
 PRIVATE_SLOT = RegionLifeCycle(AllocationUnit.REQUEST, HandOff.NEVER)
 SNAPSHOTTED_SLOT = RegionLifeCycle(AllocationUnit.REQUEST, HandOff.DECLARED_POINTS)
+RING = RegionLifeCycle(AllocationUnit.TOKEN_BLOCK, HandOff.BLOCK_BOUNDARIES, window=19)
 
 
 def _layers():
@@ -104,27 +105,56 @@ def test_request_region_lays_out_as_a_native_region():
     assert layout.region("replay").bytes_per_slot() == 512 + 16 + 512
 
 
-def test_lowered_regions_validate_in_the_native_config():
-    """The native config accepts the lowered region beside the layers, and rejects it on an attention layer."""
-    configs, _ = lay_out_regions([_replay()], _layers())
-    config = KVCacheManagerConfig(
+def _ring(layers=(0,)):
+    return Region(
+        "ring", RING, tuple(RegionLayer(layer, (Plane(HISTORY, 2048),)) for layer in layers)
+    )
+
+
+def test_token_block_region_lays_out_as_a_native_region():
+    """A token-block region handed off at block boundaries lowers to a REQUIRED token-block region with its
+    window, which an attention layer with no buffers of its own hosts."""
+    layers = [AttentionLayerConfig(layer_id=LayerId(0), buffers=[]), *_layers()[1:]]
+    configs, layout = lay_out_regions([_ring(), _replay()], layers)
+    ring, replay = configs
+    assert ring.allocation_unit == RegionAllocationUnit.TOKEN_BLOCK
+    assert ring.reuse_policy == ReusePolicy.REQUIRED
+    assert ring.window_size == 19
+    assert ring.fixed_slot_count is None
+    assert [(int(b.layer_id), str(b.buffer.role), b.buffer.size) for b in ring.buffers] == [
+        (0, "history", 2048)
+    ]
+    assert replay.window_size is None
+    assert layout.owner(0, HISTORY).name == "ring"
+    assert layout.layer_ids("ring") == (LayerId(0),)
+
+
+def _native_config(layers, regions):
+    return KVCacheManagerConfig(
         tokens_per_block=32,
         cache_tiers=[GpuCacheTierConfig(quota=1 << 24)],
-        layers=_layers(),
+        layers=layers,
         commit_min_snapshot=True,
-        regions=configs,
+        regions=regions,
     )
-    assert [region.name for region in config.regions] == ["replay"]
 
-    on_attention, _ = lay_out_regions([_replay(layers=(0,))], _layers())
+
+def test_native_config_places_each_region_kind_on_its_layer_kind():
+    """A request region sits on SSM layers and a token-block region on attention layers; the native
+    config rejects either on the other kind."""
+    layers = [AttentionLayerConfig(layer_id=LayerId(0), buffers=[]), *_layers()[1:]]
+    configs, _ = lay_out_regions([_ring(), _replay()], layers)
+    assert [region.name for region in _native_config(layers, configs).regions] == [
+        "ring",
+        "replay",
+    ]
+
+    request_on_attention, _ = lay_out_regions([_replay(layers=(0,))], _layers())
     with pytest.raises(ValueError, match="SsmLayerConfig"):
-        KVCacheManagerConfig(
-            tokens_per_block=32,
-            cache_tiers=[GpuCacheTierConfig(quota=1 << 24)],
-            layers=_layers(),
-            commit_min_snapshot=True,
-            regions=on_attention,
-        )
+        _native_config(_layers(), request_on_attention)
+    token_block_on_ssm, _ = lay_out_regions([_ring(layers=(1,))], _layers())
+    with pytest.raises(ValueError, match="AttentionLayerConfig"):
+        _native_config(_layers(), token_block_on_ssm)
 
 
 def _recurrent(layers=(1, 2)):
@@ -194,13 +224,13 @@ def test_lay_out_rejects_what_it_cannot_store():
         lay_out_regions([_replay(), _replay(name="other")], _layers())
     with pytest.raises(ValueError, match="already stores"):
         lay_out_regions([_recurrent()], _layers())
-    per_block = Region(
-        "per_block",
-        RegionLifeCycle(AllocationUnit.TOKEN_BLOCK, HandOff.BLOCK_BOUNDARIES),
-        (RegionLayer(1, (Plane(HISTORY, 64),)),),
+    private_blocks = Region(
+        "private_blocks",
+        RegionLifeCycle(AllocationUnit.TOKEN_BLOCK, HandOff.NEVER),
+        (RegionLayer(0, (Plane(HISTORY, 64),)),),
     )
-    with pytest.raises(ValueError, match="only request regions"):
-        lay_out_regions([per_block], _layers())
+    with pytest.raises(ValueError, match="block-boundary"):
+        lay_out_regions([private_blocks], _layers())
 
 
 def test_region_declarations_are_checked():
@@ -219,8 +249,16 @@ def test_region_declarations_are_checked():
     for count in (0, -1):
         with pytest.raises(ValueError, match="fixed_slot_count"):
             _replay(fixed_slot_count=count)
+    with pytest.raises(ValueError, match="fixed_slot_count"):
+        Region("ring", RING, (RegionLayer(0, (Plane(HISTORY, 8),)),), fixed_slot_count=4)
+    with pytest.raises(ValueError, match="has no window"):
+        RegionLifeCycle(AllocationUnit.REQUEST, HandOff.NEVER, window=8)
+    for window in (0, -1):
+        with pytest.raises(ValueError, match="positive"):
+            RegionLifeCycle(AllocationUnit.TOKEN_BLOCK, HandOff.BLOCK_BOUNDARIES, window=window)
     assert PRIVATE_SLOT.reuse_policy == ReusePolicy.PRIVATE
     assert SNAPSHOTTED_SLOT.reuse_policy == ReusePolicy.REQUIRED
+    assert RING.reuse_policy == ReusePolicy.REQUIRED
 
 
 def test_renumbered_follows_the_compacted_layers():
