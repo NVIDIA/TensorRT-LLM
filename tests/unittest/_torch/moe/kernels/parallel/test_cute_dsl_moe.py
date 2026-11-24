@@ -5869,12 +5869,16 @@ def test_mxfp8_fused_fc12_moe_rubin(
             forced_output = torch.zeros_like(output)
             with monkeypatch.context() as m, torch.inference_mode():
                 m.setattr(Sm107Mxfp8FusedFc12MoeRunner, "_use_sparse_gather", use_sparse_gather)
+                # Start from an empty cache, so the keys afterwards are the
+                # kernels this call compiled and ran.
+                m.setattr(Sm107Mxfp8FusedFc12MoeRunner, "kernel_cache", {})
                 op(output=forced_output, **common_kwargs)
+                compiled = list(Sm107Mxfp8FusedFc12MoeRunner.kernel_cache)
             torch.cuda.synchronize()
             label = f"forced sparse_gather={sparse_gather}"
             assert chosen == [sparse_gather], label
             # The compile key's ninth element is the gather variant.
-            assert any(key[8] is sparse_gather for key in Sm107Mxfp8FusedFc12MoeRunner.kernel_cache)
+            assert len(compiled) == 1 and compiled[0][8] is sparse_gather, (label, compiled)
             check(forced_output, label)
             torch.testing.assert_close(forced_output.float(), output.float(), rtol=2e-2, atol=2e-2)
 
@@ -5993,17 +5997,24 @@ def test_mxfp8_fused_fc12_moe_rubin(
     )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.skipif(
-    get_sm_version() != 107 or not IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE,
-    reason="MXFP8 fused FC12 MoE requires Rubin (SM107) with a CuTe DSL build that supports the fused FC12 kernel",
+    not IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE,
+    reason="Needs a CuTe DSL build that supports the Rubin MXFP8 fused FC12 kernel",
 )
-def test_mxfp8_fused_fc12_tactic_roundtrips_through_autotuner_cache() -> None:
-    """Tactics must survive the AutoTuner's JSON/repr round trip."""
+def test_mxfp8_fused_fc12_tactic_roundtrips_through_autotuner_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tactics must survive the AutoTuner's JSON/repr round trip.
+
+    Host-only: the runner checks the SM version only at construction.
+    """
     import ast
     import json
 
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import Sm107Mxfp8FusedFc12MoeRunner
 
+    monkeypatch.setattr(cute_dsl_custom_ops, "get_sm_version", lambda: 107)
     runner = Sm107Mxfp8FusedFc12MoeRunner(64, 8, 8, 0, 128)
     tactic = runner._default_tactic()
     assert tactic == ((128, 128, 128), (128, 128, 64), (1, 1), "l2_atomic", False)
@@ -6025,20 +6036,23 @@ def test_mxfp8_fused_fc12_tactic_roundtrips_through_autotuner_cache() -> None:
             runner._normalize_tactic(ast.literal_eval(repr(wrong)))
 
 
+@pytest.mark.cpu_only
 @pytest.mark.skipif(
-    get_sm_version() != 107 or not IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE,
-    reason="Sm107Mxfp8FusedFc12MoeRunner constructs on Rubin (SM107) only, with a CuTe DSL build "
-    "that supports the fused FC12 kernel",
+    not IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE,
+    reason="Needs a CuTe DSL build that supports the Rubin MXFP8 fused FC12 kernel",
 )
-def test_mxfp8_fused_fc12_sparse_gather_selection() -> None:
+def test_mxfp8_fused_fc12_sparse_gather_selection(monkeypatch: pytest.MonkeyPatch) -> None:
     """The gather variant follows the tuning bucket, scaled by the rank's expert share.
 
     Qwen3.5-397B geometry: 512 experts, top-k 10, tile 128. ``padded_routes``
     is the ``permuted_idx_to_expanded_idx`` length moe_sort allocates for
     ``num_rows`` tokens, so the per-expert threshold (about 6.5K tokens) is the
-    same at every EP size.
+    same at every EP size. Host-only: the runner checks the SM version only at
+    construction.
     """
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import Sm107Mxfp8FusedFc12MoeRunner
+
+    monkeypatch.setattr(cute_dsl_custom_ops, "get_sm_version", lambda: 107)
 
     def sparse(num_local_experts: int, num_rows: int) -> bool:
         runner = Sm107Mxfp8FusedFc12MoeRunner(512, 10, num_local_experts, 0, 128)

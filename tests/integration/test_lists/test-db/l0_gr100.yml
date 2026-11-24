@@ -129,6 +129,7 @@ l0_gr100:
   - unittest/_torch/moe/kernels/parallel/test_mxfp8_input_quant.py
   - unittest/_torch/moe/kernels/parallel/test_cute_dsl_moe.py::test_mxfp8_fused_fc12_moe_rubin
   - unittest/_torch/moe/kernels/parallel/test_cute_dsl_moe.py::test_moe_module_mxfp8_chunked_forward_with_aux_stream
+  # The two host-only runner tests are cpu_only and also run pre-merge in l0_cpu.
   - unittest/_torch/moe/kernels/parallel/test_cute_dsl_moe.py::test_mxfp8_fused_fc12_tactic_roundtrips_through_autotuner_cache
   - unittest/_torch/moe/kernels/parallel/test_cute_dsl_moe.py::test_mxfp8_fused_fc12_sparse_gather_selection
   - unittest/_torch/moe/test_moe_backend.py::test_cutedsl_mxfp8_fused_fc12_accuracy_ab

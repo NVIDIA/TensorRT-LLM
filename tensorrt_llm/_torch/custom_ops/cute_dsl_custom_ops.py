@@ -19505,7 +19505,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # every CuTe DSL op; the MoEDep probe reads the cleared flag.
             try:
                 from ..moe.kernels.rubin.fused_fc12_mxfp8_workspace import \
-                    reset_fc12_sync_workspace
+                    prepare_fc12_launch
                 from ..moe.kernels.rubin.rubin_contiguous_grouped_blockscaled_gemm_fused_fc12_mxfp8 import \
                     Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel as \
                     Sm107Mxfp8BlockScaledContiguousGroupedGemmFusedFc12Kernel
@@ -20309,7 +20309,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         reset_key)
                     if compiled_reset is None:
                         compiled_reset = cute.compile(
-                            reset_fc12_sync_workspace,
+                            prepare_fc12_launch,
                             fc1_ready_ptr,
                             cutlass.Int32(num_ready),
                             fc1_scheduler_counter_ptr,

@@ -29,9 +29,7 @@ def test_fc12_quantize_reset(
     from cuda.bindings import driver as cuda
     from cutlass.cute.runtime import make_ptr
 
-    from tensorrt_llm._torch.moe.kernels.rubin.fused_fc12_mxfp8_workspace import (
-        reset_fc12_sync_workspace,
-    )
+    from tensorrt_llm._torch.moe.kernels.rubin.fused_fc12_mxfp8_workspace import prepare_fc12_launch
 
     torch.manual_seed(87)
     x = torch.randn((num_tokens, hidden), dtype=dtype, device="cuda")
@@ -66,7 +64,7 @@ def test_fc12_quantize_reset(
         input_numel=cutlass.Int32(x.numel()),
     )
     compiled = cute.compile(
-        reset_fc12_sync_workspace, *args, use_pdl=use_pdl, zero_output=zero_output, **quant_args
+        prepare_fc12_launch, *args, use_pdl=use_pdl, zero_output=zero_output, **quant_args
     )
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -116,9 +114,7 @@ def test_fc12_reset_only_replay(
     from cuda.bindings import driver as cuda
     from cutlass.cute.runtime import make_ptr
 
-    from tensorrt_llm._torch.moe.kernels.rubin.fused_fc12_mxfp8_workspace import (
-        reset_fc12_sync_workspace,
-    )
+    from tensorrt_llm._torch.moe.kernels.rubin.fused_fc12_mxfp8_workspace import prepare_fc12_launch
 
     def ptr(tensor: torch.Tensor, element_type: type) -> "cute.Pointer":
         return make_ptr(element_type, tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
@@ -138,9 +134,7 @@ def test_fc12_reset_only_replay(
         cutlass.Int32(num_output),
         cuda.CUstream(stream.cuda_stream),
     ]
-    compiled = cute.compile(
-        reset_fc12_sync_workspace, *args, use_pdl=use_pdl, zero_output=zero_output
-    )
+    compiled = cute.compile(prepare_fc12_launch, *args, use_pdl=use_pdl, zero_output=zero_output)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
         compiled(*args)
