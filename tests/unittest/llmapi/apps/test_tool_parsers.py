@@ -16,6 +16,7 @@
 import abc
 import functools
 import json
+import re
 import time
 from contextlib import AbstractContextManager
 from typing import Callable, Iterator, NamedTuple
@@ -423,6 +424,146 @@ class TestBaseToolParser:
     def test_extracts_forced_tool_calls_default_false(self):
         """Forced tool_choice extraction is opt-in per parser."""
         assert ConcreteToolParser.extracts_forced_tool_calls is False
+
+
+def _streamed_text(parser, increments, tools):
+    """The content a client assembles from the increments and finish()."""
+    text = "".join(
+        parser.parse_streaming_increment(piece, tools).normal_text
+        for piece in increments)
+    return text + parser.finish(tools).normal_text
+
+
+def _token_increments(text, size):
+    """Increments of `size` characters that keep each special token whole.
+
+    The detokenizer emits a special token such as ``<｜tool▁sep｜>`` in one piece.
+    """
+    increments = []
+    for piece in re.split(r"(<｜[^｜]*｜>)", text):
+        if piece.startswith("<｜"):
+            increments.append(piece)
+        else:
+            increments += [
+                piece[i:i + size] for i in range(0, len(piece), size)
+            ]
+    return increments
+
+
+# Parsers whose streaming ends through BaseToolParser.finish.
+_BASE_FINISH_PARSERS = [
+    Qwen3ToolParser,
+    DeepSeekV3Parser,
+    DeepSeekV31Parser,
+    MiniMaxM2ToolParser,
+    PoolsideV1ToolParser,
+]
+
+
+class TestFinishReleasesHeldTail:
+    """A stream that ends while holding text back releases what detect_and_parse keeps."""
+
+    @pytest.mark.parametrize("parser_cls", _BASE_FINISH_PARSERS)
+    @pytest.mark.parametrize("increments", [
+        ["The answer is", " a <"],
+        ["Compare x", " < y and see <"],
+        ["Hi"],
+    ])
+    def test_a_tail_that_could_start_a_call(self, parser_cls, increments,
+                                            sample_tools):
+        """The last increment ends in a prefix of the start token."""
+        text = "".join(increments) + parser_cls().bot_token[:4]
+
+        expected = parser_cls().detect_and_parse(text, sample_tools)
+        streamed = _streamed_text(parser_cls(),
+                                  increments + [parser_cls().bot_token[:4]],
+                                  sample_tools)
+
+        assert expected.calls == []
+        assert streamed == expected.normal_text == text
+
+    @pytest.mark.parametrize("parser_cls", _BASE_FINISH_PARSERS)
+    def test_a_complete_call_keeps_its_content(self, parser_cls, sample_tools):
+        """Nothing is released twice, and no end token leaks into content."""
+        parser = parser_cls()
+        text = {
+            Qwen3ToolParser:
+            '<tool_call>\n{"name": "get_weather", "arguments": '
+            '{"location": "Paris"}}\n</tool_call>',
+            DeepSeekV3Parser:
+            '<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>'
+            'get_weather\n```json\n{"location": "Paris"}\n```'
+            '<｜tool▁call▁end｜><｜tool▁calls▁end｜>',
+            DeepSeekV31Parser:
+            '<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>'
+            '{"location": "Paris"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>',
+            MiniMaxM2ToolParser:
+            '<minimax:tool_call><invoke name="get_weather">'
+            '<parameter name="location">Paris</parameter></invoke>'
+            '</minimax:tool_call>',
+            PoolsideV1ToolParser:
+            '<tool_call>get_weather\n<arg_key>location</arg_key>\n'
+            '<arg_value>Paris</arg_value>\n</tool_call>',
+        }[parser_cls]
+        increments = _token_increments(text, 3)
+
+        assert _streamed_calls(parser, increments,
+                               sample_tools) == [("get_weather", {
+                                   "location": "Paris"
+                               })]
+        assert _streamed_text(parser_cls(), increments, sample_tools) == ""
+
+    def test_poolside_unterminated_call_is_content(self, sample_tools):
+        """A call cut off by the end of the stream is content, as in detect_and_parse."""
+        text = ("Listing.<tool_call>get_weather\n<arg_key>location</arg_key>\n"
+                "<arg_value>Par")
+        increments = [text[i:i + 5] for i in range(0, len(text), 5)]
+
+        expected = PoolsideV1ToolParser().detect_and_parse(text, sample_tools)
+        parser = PoolsideV1ToolParser()
+
+        assert _streamed_text(parser, increments,
+                              sample_tools) == expected.normal_text == text
+        assert expected.calls == []
+        assert parser._buffer == ""
+
+    def test_poolside_unterminated_call_after_a_call(self, sample_tools):
+        call = ("<tool_call>get_weather\n<arg_key>location</arg_key>\n"
+                "<arg_value>Paris</arg_value>\n</tool_call>")
+        cut = "<tool_call>search_web\n<arg_key>query</arg_key>\n<arg_val"
+        increments = [call, " then ", cut]
+
+        parser = PoolsideV1ToolParser()
+        results = [
+            parser.parse_streaming_increment(piece, sample_tools)
+            for piece in increments
+        ]
+        results.append(parser.finish(sample_tools))
+
+        assert "".join(r.normal_text for r in results) == " then " + cut
+        assert [c.name for r in results for c in r.calls
+                if c.name] == ["get_weather"]
+
+    def test_qwen3_text_after_a_call_stays_dropped(self, sample_tools):
+        """Qwen3 detect_and_parse drops the text after a call; so does the stream."""
+        call = ('<tool_call>\n{"name": "get_weather", "arguments": '
+                '{"location": "Paris"}}\n</tool_call>\nDone <')
+        text = "Checking.\n" + call
+        increments = ["Checking.\n"
+                      ] + [call[i:i + 4] for i in range(0, len(call), 4)]
+
+        expected = Qwen3ToolParser().detect_and_parse(text, sample_tools)
+        streamed = _streamed_text(Qwen3ToolParser(), increments, sample_tools)
+
+        assert expected.normal_text == "Checking."
+        assert streamed.strip() == "Checking."
+
+    def test_a_held_tail_of_a_streamed_call_stays(self, sample_tools):
+        """A call whose name went out keeps its unfinished arguments out of content."""
+        parser = Qwen3ToolParser()
+        text = '<tool_call>\n{"name": "get_weather", "arguments": {"loca'
+
+        assert _streamed_text(parser, [text], sample_tools) == ""
 
 
 # ============================================================================
