@@ -254,19 +254,20 @@ class Fp4MlaV2CacheLayoutPolicy(Fp4MlaLayoutHooks):
     # Attention-layout operations of a lifecycle manager that composes this
     # policy (MambaHybridCacheManagerV2), which calls them with itself.
 
-    def virtual_layer_pool_roles(
-        self, layer_id: int
-    ) -> Optional[tuple[DataRole, Optional[DataRole]]]:
-        """Pool roles of a virtual layer this layout appended (an HP ring), else ``None``."""
-        return self.fp4_mla_layout.virtual_layer_pool_roles(layer_id)
+    @staticmethod
+    def auxiliary_pool_roles(role: DataRole) -> Optional[tuple[DataRole, Optional[DataRole]]]:
+        """The HP tail has a page-table lane of its own on its virtual or real layer."""
+        return (role, None) if role == Role.MLA_HP_TAIL else None
 
-    def disagg_global_layer_id(self, internal_layer: int) -> Optional[int]:
+    def disagg_global_layer_id(
+        self, internal_layer: int, role: DataRole | None = None
+    ) -> Optional[int]:
         """Transfer ID of an MLA cache or HP-ring layer.
 
         Model layer ``L`` takes ``2 * L`` and ``2 * L + 1``, so a lifecycle
         manager gives its other layers ``2 * L`` to keep the IDs collision-free.
         """
-        return self.fp4_mla_layout._fp4_mla_disagg_global_layer_id(internal_layer)
+        return self.fp4_mla_layout._fp4_mla_disagg_global_layer_id(internal_layer, role)
 
     def disagg_role_layouts(self) -> dict[DataRole, RoleLayout]:
         """Transfer geometry of the HP ring."""
@@ -315,13 +316,9 @@ class Fp4MlaV2CacheLayoutPolicy(Fp4MlaLayoutHooks):
         whole. The high-precision tail is a ring of BF16 latent tokens alike on every rank,
         sized by this worker's speculative rewind, so a context and a generation worker may size
         it differently. V scales and packed V derive from K and K scales; the generation worker
-        rebuilds them locally in rebuild_disagg_imported_cache. A model layer's cache and its
-        high-precision tail are two internal layers, global layers ``2 * m`` and ``2 * m + 1``
-        of model layer ``m``; an appended draft layer and a layer ``recurrent`` names take
-        ``2 * m``, so every name stays distinct and alike under any pipeline split. The tail's
-        window keeps the rewind beyond the tokens attention reads, and the lifecycles of the FP8
-        fallback and appended draft layers a window past ``max_seq_len``
-        (``retention_margins``)."""
+        rebuilds them locally in rebuild_disagg_imported_cache. Model layer L uses transfer ids
+        2L for latent and recurrent state
+        and 2L + 1 for its HP tail. The role distinguishes a tail on the same layer as its latent."""
         layout = self.fp4_mla_layout
         layer_ids = {}
         for layers in layer_groups(self):
@@ -333,6 +330,14 @@ class Fp4MlaV2CacheLayoutPolicy(Fp4MlaLayoutHooks):
                     if global_layer is None:
                         raise ValueError(f"Unknown FP4 MLA V2 internal layer {internal}.")
                 layer_ids[internal] = (global_layer, global_layer // 2)
+        buffer_layer_ids = {}
+        for cache_layer, hp_layer in zip(
+            layout._cache_manager_layer_ids, layout._hp_manager_layer_ids, strict=True
+        ):
+            if cache_layer == hp_layer:
+                tail_id = layout._fp4_mla_disagg_global_layer_id(int(hp_layer), Role.MLA_HP_TAIL)
+                assert tail_id is not None
+                buffer_layer_ids[(int(hp_layer), str(Role.MLA_HP_TAIL))] = (tail_id, tail_id // 2)
         return replace(
             spec,
             role_layouts={
@@ -344,6 +349,7 @@ class Fp4MlaV2CacheLayoutPolicy(Fp4MlaLayoutHooks):
             derived_roles=spec.derived_roles | {Role.MLA_V_SCALE, Role.MLA_V_PACKED},
             retention_margins=True,
             layer_ids=layer_ids,
+            buffer_layer_ids=buffer_layer_ids,
         )
 
     extend_page_table_spec = _fp4_mla_page_table_spec
@@ -362,8 +368,9 @@ class Fp4MlaV2CacheLayoutPolicy(Fp4MlaLayoutHooks):
 
     def get_disagg_global_layer_ids(self, layer_group_id: int) -> list[int]:
         result = []
-        for layer_id in self.impl.layer_grouping[layer_group_id]:
-            global_layer_id = self.fp4_mla_layout._fp4_mla_disagg_global_layer_id(int(layer_id))
+        roles = {int(buf.layer_id): buf.role for buf in self.impl.buffer_grouping[layer_group_id]}
+        for layer_id, role in roles.items():
+            global_layer_id = self.fp4_mla_layout._fp4_mla_disagg_global_layer_id(layer_id, role)
             if global_layer_id is None:
                 raise ValueError(f"Unknown FP4 MLA V2 internal layer {int(layer_id)}.")
             result.append(global_layer_id)

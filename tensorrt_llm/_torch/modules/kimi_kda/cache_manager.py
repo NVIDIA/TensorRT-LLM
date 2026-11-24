@@ -23,10 +23,12 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.fp4_mla_layout_hooks import Fp4MlaL
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheLayerOwner,
     KVCacheLayerSpec,
+    Role,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     MambaAcceptanceBatch,
     MambaLayerCache,
+    MambaRole,
     MambaStateLayout,
     _get_local_mamba_cache_layout,
     _host_slots_to_device,
@@ -50,6 +52,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     BufferConfig,
     DataRole,
     KVCacheManagerConfig,
+    RegionAllocationUnit,
     RegionConfig,
     SsmLayerConfig,
     _introspection,
@@ -1388,6 +1391,8 @@ class KimiK3HybridCacheManager(Fp4MlaLayoutHooks, MambaHybridCacheManagerV2):
         first keeps its group id the same with and without replay state.
         """
         providers = super()._region_providers()
+        if self.fp4_mla_layout is not None:
+            providers = (*providers, self.fp4_mla_layout)
         if not self.mamba_pp_layers:
             return providers
         if not self._replay_shares_state_slot:
@@ -1522,15 +1527,23 @@ class KimiK3HybridCacheManager(Fp4MlaLayoutHooks, MambaHybridCacheManagerV2):
         full_history = set()
         draft_keys = set()
         target_keys = set()
-        recurrent_position = None
+        # The configured order follows model layers, then the HP tail and replay pools.
+        # Native group ids enumerate layer-backed buffers first and regions last.
+        primary_regions = {
+            entry.layer_id: region.name
+            for region in config.regions
+            for entry in region.buffers
+            if entry.buffer.role in (Role.KEY, MambaRole.SSM_STATE)
+        }
+        configured_keys: dict[tuple | str, None] = {}
         draft_layer_ids = {
             self.layer_offsets[spec.global_layer_id]
             for spec in self._draft_layer_specs
             if spec.global_layer_id in self.layer_offsets
         }
         for layer in config.layers:
-            if isinstance(layer, SsmLayerConfig) and recurrent_position is None:
-                recurrent_position = len(block_bytes)
+            if layer.layer_id in primary_regions:
+                configured_keys[primary_regions[layer.layer_id]] = None
             for buffer in layer.buffers:
                 policy = (
                     buffer.reuse_policy if buffer.reuse_policy is not None else layer.reuse_policy
@@ -1547,23 +1560,20 @@ class KimiK3HybridCacheManager(Fp4MlaLayoutHooks, MambaHybridCacheManagerV2):
                     key = (life_cycle.window_size, life_cycle.num_sink_blocks, policy)
                     if life_cycle.window_size is None or life_cycle.window_size >= self.max_seq_len:
                         full_history.add(key)
+                configured_keys[key] = None
                 block_bytes[key] = block_bytes.get(key, 0) + buffer.size
                 (draft_keys if layer.layer_id in draft_layer_ids else target_keys).add(key)
         for region in config.regions:
             block_bytes[region.name] = sum(entry.buffer.size for entry in region.buffers)
 
-        # Kimi's pool_ratio counts recurrent state at the first local KDA layer.
-        # Native group IDs place regions after layer buffers. When MLA and the HP
-        # ring move to regions, have the Kimi layout map each configured weight
-        # to its native group on this rank. Draft sizing also needs the page
-        # sizes of both full-history MLA groups (FP4 and FP8 when present).
-        # The windowed HP ring keeps its weight but contributes no draft pages.
-        configured_order = list(block_bytes)
-        if RECURRENT_STATE_REGION in configured_order:
-            assert recurrent_position is not None
-            configured_order.remove(RECURRENT_STATE_REGION)
-            configured_order.insert(recurrent_position, RECURRENT_STATE_REGION)
+            configured_keys[region.name] = None
+            if (
+                region.allocation_unit == RegionAllocationUnit.TOKEN_BLOCK
+                and region.window_size is None
+            ):
+                full_history.add(region.name)
 
+        configured_order = list(configured_keys)
         if len(ratio) == len(configured_order) and configured_order == list(block_bytes):
             return config
 

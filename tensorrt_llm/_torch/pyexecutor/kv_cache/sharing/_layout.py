@@ -336,12 +336,15 @@ class ManagerLayout:
         return tuple(sorted(self.device_pools))
 
 
-def global_layer_ids(manager: KVCacheManagerV2, internal_ids: Sequence[int]) -> list[int]:
+def global_layer_ids(
+    manager: KVCacheManagerV2, internal_ids: Sequence[int], *, layer_group: int | None = None
+) -> list[int]:
     """The global id of each internal layer id, the same under any pipeline split: the declared id;
     else for virtual layers ``model_layer * number_of_attention_types + attention_type``; else the
     model layer."""
     # One declared id per internal layer of each layer group, in order (FP4 MLA's tail layers).
-    declared = _manager.declared_global_layer_ids(manager)
+    group = (layer_group, internal_ids) if layer_group is not None else None
+    declared = _manager.declared_global_layer_ids(manager, group)
     if declared is not None:
         return [declared[int(lid)] for lid in internal_ids]
     virtual = _manager.virtual_layers(manager)
@@ -465,8 +468,10 @@ def derive_layout(manager: KVCacheManagerV2) -> ManagerLayout:
     pg_of_lg = _manager.layer_group_pool_indices(manager)
     if len(pg_of_lg) != len(grouping):
         raise ValueError(f"{len(grouping)} layer groups but {len(pg_of_lg)} pool-group indices")
-    internal = sorted({lid for group in grouping for lid in group})
-    global_of = dict(zip(internal, global_layer_ids(manager, internal)))
+    global_of = [
+        dict(zip(layer_ids, global_layer_ids(manager, layer_ids, layer_group=lg), strict=True))
+        for lg, layer_ids in enumerate(grouping)
+    ]
 
     state_groups = set()
     for lg, layer_ids in enumerate(grouping):
@@ -513,7 +518,7 @@ def derive_layout(manager: KVCacheManagerV2) -> ManagerLayout:
                     transfer = role not in ignored
                     buffers.append(
                         BufferDesc(
-                            layer=global_of.get(lid, lid),
+                            layer=global_of[lg][lid],
                             role=role,
                             pool=(g, pool_index),
                             offset=j * size,
@@ -532,14 +537,10 @@ def derive_layout(manager: KVCacheManagerV2) -> ManagerLayout:
 
     layer_groups: list[LayerGroupDesc] = []
     for lg, layer_ids in enumerate(grouping):
-        first = layer_cfg[layer_ids[0]]
         is_state = lg in state_groups
-        window = None
-        sink_tokens = 0
-        if not is_state:
-            window = getattr(first, "window_size", None)
-            window = None if window is None else int(window)
-            sink_tokens = int(getattr(first, "num_sink_tokens", None) or 0)
+        window, sink_blocks = (
+            (None, 0) if is_state else _manager.attention_group_window(manager, lg)
+        )
         # Layer groups with equal slot sizes may share a pool group, each drawing its own slots.
         g = pg_of_lg[lg]
         if g not in device_pools:
@@ -548,9 +549,9 @@ def derive_layout(manager: KVCacheManagerV2) -> ManagerLayout:
             LayerGroupDesc(
                 kind="state" if is_state else "attention",
                 window=window,
-                sink_blocks=-(-sink_tokens // tokens_per_block),
+                sink_blocks=sink_blocks,
                 pool_group=g,
-                layers=tuple(sorted(global_of[lid] for lid in layer_ids)),
+                layers=tuple(sorted(global_of[lg].values())),
                 shard=_group_shard(shards[lg], ShardDesc(heads.tp_size, heads.tp_rank)),
             )
         )

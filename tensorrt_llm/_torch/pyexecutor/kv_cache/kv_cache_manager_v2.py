@@ -3539,6 +3539,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     attention_only=isinstance(self.event_manager, StreamingKVCacheEventManager)
                 )
             )
+            self.event_manager.set_layer_group_regions(self._get_event_regions_by_layer_group())
             self.event_manager.add_created_event(
                 self._get_event_num_blocks_per_cache_level(config.cache_tiers, tokens_per_block),
                 self._get_event_layer_group_ids(),
@@ -3639,9 +3640,7 @@ class KVCacheManagerV2(BaseResourceManager):
         self._commit_branch_snapshots = (
             block_reuse_config.enable_branch_snapshot and self.enable_block_reuse
         )
-        has_swa_layers = self._commit_branch_snapshots and any(
-            getattr(layer, "sliding_window_size", None) for layer in self.impl.init_config.layers
-        )
+        has_swa_layers = self._commit_branch_snapshots and self._has_windowed_layer_group()
         # A paired draft pool caps the target lookup at the common reuse depth,
         # which hides the fork, so joint reuse records no SWA branch points.
         if has_swa_layers and self.enable_joint_kv_cache_reuse and not self.is_draft:
@@ -4542,33 +4541,48 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"{self._describe_page_indices(kv_cache, layer_group_id)}"
             )
 
+    def _group_window_size(self, layer_group_id: int) -> Optional[int]:
+        """Sliding window of an attention layer group; None without one and for a state group."""
+        life_cycle = self.impl.get_group_life_cycle(layer_group_id)
+        return life_cycle.window_size if isinstance(life_cycle, AttnLifeCycle) else None
+
+    def _has_windowed_layer_group(self) -> bool:
+        """Whether any attention layer group, a layer config's or a region's, has a window."""
+        return any(
+            self._group_window_size(layer_group_id) is not None
+            for layer_group_id in range(len(self._layer_ids_by_group))
+        )
+
     def _get_event_window_sizes_by_layer_group(
         self, attention_only: bool = False
     ) -> Dict[int, int]:
-        # Assumes every layer listed in a group shares the same sliding_window_size,
-        # which is part of the lifecycle identity. Only the
-        # first layer's window is read; if the grouping policy ever permits
-        # mixed windows in one group, this needs to fan out per-layer. A layer
-        # can belong to several groups through buffer policy overrides.
+        # A group's window is part of its life cycle, so the native life cycle
+        # reports it for layer-config and region groups alike. A group without a
+        # window reports max_seq_len.
         #
         # `attention_only` is set for the streaming event manager, which tracks
         # attention prefix reuse only: excluding SSM and other non-attention life cycles
         # prevents a state life cycle (which reports max_seq_len as its window) from
         # tying with the attention life cycle and being selected as the event target.
         # The buffered manager keeps every layer group, so its windows are unchanged.
-
-        def get_event_window_size(layer_config: object) -> int:
-            window_size = getattr(layer_config, "sliding_window_size", None)
-            return self.max_seq_len if window_size is None else int(window_size)
-
         window_sizes: Dict[int, int] = {}
-        for layer_group_id, layer_ids in enumerate(self._layer_ids_by_group):
-            # Native bindings expose grouping, not the private Python lifecycle registry.
-            layer_config = self.kv_cache_manager_py_config.layers[int(layer_ids[0])]
-            if attention_only and not isinstance(layer_config, AttentionLayerConfig):
+        for layer_group_id in range(len(self._layer_ids_by_group)):
+            life_cycle = self.impl.get_group_life_cycle(layer_group_id)
+            if attention_only and not isinstance(life_cycle, AttnLifeCycle):
                 continue
-            window_sizes[int(layer_group_id)] = get_event_window_size(layer_config)
+            window_size = life_cycle.window_size if isinstance(life_cycle, AttnLifeCycle) else None
+            window_sizes[layer_group_id] = (
+                self.max_seq_len if window_size is None else int(window_size)
+            )
         return window_sizes
+
+    def _get_event_regions_by_layer_group(self) -> Dict[int, str]:
+        """Region name of each layer group that is a declared region's life cycle."""
+        return {
+            group_id: region.name
+            for region in self.region_layout.regions
+            for group_id in self.get_region_group_ids(region.name)
+        }
 
     def _format_kv_cache_pool_lifecycle_entry(self, layer_id: LayerId, role: DataRole) -> str:
         for pool_group in self.impl.pool_group_descs:
@@ -4609,11 +4623,17 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _log_kv_cache_pool_lifecycle_mapping(self) -> None:
         entries = OrderedDict()
-        for layer in self.kv_cache_manager_py_config.layers:
-            for buffer in layer.buffers:
-                entries.setdefault(
-                    self._format_kv_cache_pool_lifecycle_entry(layer.layer_id, buffer.role), None
-                )
+        config = self.kv_cache_manager_py_config
+        buffers = [
+            *((layer.layer_id, buffer.role) for layer in config.layers for buffer in layer.buffers),
+            *(
+                (region_buffer.layer_id, region_buffer.buffer.role)
+                for region in config.regions
+                for region_buffer in region.buffers
+            ),
+        ]
+        for layer_id, role in buffers:
+            entries.setdefault(self._format_kv_cache_pool_lifecycle_entry(layer_id, role), None)
 
         if not entries:
             return
@@ -5619,7 +5639,9 @@ class KVCacheManagerV2(BaseResourceManager):
             return config
 
         # Inspect the final buffers: a layer with no attention KV heads can
-        # still own recurrent-state or other buffers added by a subclass.
+        # still own recurrent-state or other buffers added by a subclass. A
+        # layer that a declared region covers stays, with no buffers of its own
+        # when the region holds all its state: it places the region's buffers.
         layers: list[AttentionLayerConfig | SsmLayerConfig] = []
         retained_layer_ids = []
         for layer in config.layers:
@@ -7195,13 +7217,7 @@ class KVCacheManagerV2(BaseResourceManager):
             self.enable_swa_scratch_reuse
             or self.block_reuse_policy != BlockReusePolicy.ALL_REUSABLE
         )
-        return not (
-            swa_window_only_at_chunk_end
-            and any(
-                getattr(layer, "sliding_window_size", None)
-                for layer in self.impl.init_config.layers
-            )
-        )
+        return not (swa_window_only_at_chunk_end and self._has_windowed_layer_group())
 
     def request_prefix_snapshot(self, owner: LlmRequest, num_tokens: int) -> bool:
         """Make the first ``num_tokens`` of ``owner``'s prompt reusable once computed.
@@ -7879,21 +7895,20 @@ class KVCacheManagerV2(BaseResourceManager):
     def _life_cycle_by_layer_group(self) -> List[AttnLifeCycle]:
         """Attention life cycle per layer group.
 
-        The layers listed in a group share its window and sinks, which is how
-        the lifecycle identity groups buffers, so the first layer describes the
-        group, including when buffer policies split a layer. A group
-        with no window -- full attention, or a group whose layers carry no
-        window at all -- yields an empty stale range.
+        An attention group, a layer config's or a region's, is described by its
+        native life cycle, which carries its window and sinks. A group with no
+        window, and a state group, yields an empty stale range.
         """
         if self._layer_group_life_cycles is None:
-            layers = self.kv_cache_manager_py_config.layers
+            life_cycles = [
+                self.impl.get_group_life_cycle(layer_group_id)
+                for layer_group_id in range(len(self.impl.buffer_grouping))
+            ]
             self._layer_group_life_cycles = [
-                AttnLifeCycle.make(
-                    getattr(layer, "window_size", None),
-                    getattr(layer, "num_sink_tokens", None),
-                    self.tokens_per_block,
-                )
-                for layer in (layers[int(layer_ids[0])] for layer_ids in self._layer_ids_by_group)
+                life_cycle
+                if isinstance(life_cycle, AttnLifeCycle)
+                else AttnLifeCycle.make(None, None, self.tokens_per_block)
+                for life_cycle in life_cycles
             ]
         return self._layer_group_life_cycles
 
@@ -8630,7 +8645,14 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         return [_CACHE_TIER_NAMES.get(tier, str(tier)) for tier in self.impl.cache_tier_list]
 
-    def _stats_life_cycle_metadata(self) -> dict[int, tuple[int, Optional[int], str]]:
+    def _stats_life_cycle_metadata(
+        self,
+    ) -> dict[int, tuple[int, Optional[int], str, Optional[str]]]:
+        """Pool group, window, kind and region name of every life cycle (layer group).
+
+        The kind is ``attention`` or ``ssm``; the region is the name of the
+        declared region whose life cycle it is, or None for a layer config's.
+        """
         # life cycle (== layer group) -> pool group is static structure exposed by
         # the public pool_group_descs API; no introspection needed.
         pool_groups_by_life_cycle = {
@@ -8638,24 +8660,25 @@ class KVCacheManagerV2(BaseResourceManager):
             for pool_group in self.impl.pool_group_descs
             for variant in pool_group.slot_desc.variants
         }
+        regions = self._get_event_regions_by_layer_group()
 
-        metadata: dict[int, tuple[int, Optional[int], str]] = {}
+        metadata: dict[int, tuple[int, Optional[int], str, Optional[str]]] = {}
         for life_cycle_id, layer_ids in enumerate(self._layer_ids_by_group):
             if not layer_ids:
                 continue
-            # Buffer policies can split a layer without changing its kind or window.
-            layer = self.kv_cache_manager_py_config.layers[int(layer_ids[0])]
-            is_attention = isinstance(layer, AttentionLayerConfig)
+            life_cycle = self.impl.get_group_life_cycle(life_cycle_id)
+            is_attention = isinstance(life_cycle, AttnLifeCycle)
             metadata[life_cycle_id] = (
                 int(pool_groups_by_life_cycle[life_cycle_id]),
-                self._stats_window_size(layer.sliding_window_size) if is_attention else None,
+                self._stats_life_cycle_window_size(life_cycle),
                 "attention" if is_attention else "ssm",
+                regions.get(life_cycle_id),
             )
         return metadata
 
     def _storage_pool_groups_by_window(self) -> dict[int, set[int]]:
         pool_groups_by_window: dict[int, set[int]] = defaultdict(set)
-        for pool_group_id, window_size, _ in self._stats_life_cycle_metadata().values():
+        for pool_group_id, window_size, _, _ in self._stats_life_cycle_metadata().values():
             if window_size is not None:
                 pool_groups_by_window[window_size].add(pool_group_id)
         return pool_groups_by_window
@@ -8824,7 +8847,7 @@ class KVCacheManagerV2(BaseResourceManager):
         pool_group_deltas: dict[int, KVCacheIterationStatsDelta] = {}
 
         for life_cycle_id, delta in raw_iteration_stats.items():
-            pool_group_id, window_size, _ = life_cycle_metadata[int(life_cycle_id)]
+            pool_group_id, window_size, _, _ = life_cycle_metadata[int(life_cycle_id)]
 
             pool_group_delta = self._filter_iteration_stats_delta(
                 delta, KV_CACHE_ITERATION_STATS_POOL_GROUP_FIELDS
@@ -8974,13 +8997,14 @@ class KVCacheManagerV2(BaseResourceManager):
         reused_blocks_by_level=None,
         connector_reused_blocks: int = 0,
     ) -> KVCacheV2LifeCycleIterationStats:
-        pool_group_id, window_size, kind = life_cycle_metadata[life_cycle_id]
+        pool_group_id, window_size, kind, region = life_cycle_metadata[life_cycle_id]
         assert kind == "attention"
         return KVCacheV2LifeCycleIterationStats(
             life_cycle_id=life_cycle_id,
             pool_group_id=pool_group_id,
             window_size=window_size,
             kind=kind,
+            region=region,
             stats=self._build_iteration_stats(
                 (),
                 (),
@@ -9006,12 +9030,13 @@ class KVCacheManagerV2(BaseResourceManager):
         life_cycle_metadata,
         snapshot_delta,
     ) -> KVCacheV2SsmLifeCycleIterationStats:
-        pool_group_id, window_size, kind = life_cycle_metadata[life_cycle_id]
+        pool_group_id, window_size, kind, region = life_cycle_metadata[life_cycle_id]
         assert kind == "ssm"
         assert window_size is None
         return KVCacheV2SsmLifeCycleIterationStats(
             life_cycle_id=life_cycle_id,
             pool_group_id=pool_group_id,
+            region=region,
             snapshot_stats=KVCacheV2SsmSnapshotIterationStats(
                 iter_snapshot_lookups=snapshot_delta.iter_snapshot_lookups,
                 iter_snapshot_hits=snapshot_delta.iter_snapshot_hits,

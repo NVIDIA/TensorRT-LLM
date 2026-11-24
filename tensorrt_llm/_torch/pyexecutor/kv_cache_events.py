@@ -709,6 +709,10 @@ class StreamingKVCacheEventManager:
             f"window_size={self._max_window_size}"
         )
 
+    def set_layer_group_regions(self, regions: dict[int, str]) -> None:
+        """Accept the common manager notification; streamed events carry no region."""
+        return
+
     def add_created_event(
         self,
         num_blocks_per_cache_level: Any,

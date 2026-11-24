@@ -19,6 +19,14 @@ import torch
 
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind, RoleLayout
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
+from tensorrt_llm._torch.pyexecutor.kv_cache.regions import (
+    AllocationUnit,
+    HandOff,
+    Plane,
+    Region,
+    RegionLayer,
+    RegionLifeCycle,
+)
 from tensorrt_llm._torch.pyexecutor.resource_manager import DataType
 from tensorrt_llm._utils import (
     TensorWrapper,
@@ -43,6 +51,11 @@ from .layout import get_fp4_mla_v_scale_pool_size
 if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+
+
+FP4_MLA_LATENT_REGION = "fp4_mla_latent"
+FP8_MLA_LATENT_REGION = "fp8_mla_latent"
+MLA_HP_RING_REGION = "mla_hp_ring"
 
 
 def _persistent_cache_view_mode() -> torch.inference_mode:
@@ -347,14 +360,59 @@ class Fp4MlaCacheLayout:
             result[local_layer] = buffers
         return result
 
+    def declare_regions(self) -> tuple[Region, ...]:
+        """Full-history latents and the windowed BF16 tail of the local target MLA layers."""
+        manager = self._manager
+        block = manager.tokens_per_block
+        fp4_layers = self._fp4_mla_local_layer_indices()
+        fp8_layers = self._fp8_mla_local_layer_indices()
+        sidecars = self.extra_buffers_per_layer()
+        latent = RegionLifeCycle(AllocationUnit.TOKEN_BLOCK, HandOff.BLOCK_BOUNDARIES)
+        fp4 = []
+        for layer in fp4_layers:
+            planes = [
+                Plane(role, manager.get_layer_bytes_per_token(layer, role) * block)
+                for role in manager._get_buffer_roles_for_layer(layer)
+            ]
+            planes.extend(Plane(buf.role, buf.size) for buf in sidecars[layer] if buf.size)
+            fp4.append(RegionLayer(layer, tuple(planes)))
+        if not fp4:
+            raise ValueError("FP4 MLA V2 layout requires at least one local FP4 attention layer.")
+        regions = [Region(FP4_MLA_LATENT_REGION, latent, tuple(fp4))]
+        if fp8_layers:
+            regions.append(
+                Region(
+                    FP8_MLA_LATENT_REGION,
+                    latent,
+                    tuple(
+                        RegionLayer(
+                            layer, (Plane(Role.KEY, self._fp8_mla_bytes_per_token(layer) * block),)
+                        )
+                        for layer in fp8_layers
+                    ),
+                )
+            )
+        regions.append(
+            Region(
+                MLA_HP_RING_REGION,
+                RegionLifeCycle(
+                    AllocationUnit.TOKEN_BLOCK, HandOff.BLOCK_BOUNDARIES, self._fp4_mla_hp_pool_size
+                ),
+                tuple(
+                    RegionLayer(layer, (Plane(Role.MLA_HP_TAIL, self._hp_bytes_per_page(layer)),))
+                    for layer in fp4_layers
+                ),
+            )
+        )
+        return tuple(regions)
+
     def apply_cache_config(
         self, config: KVCacheManagerConfig, *, hp_reuse_policy: ReusePolicy
     ) -> KVCacheManagerConfig:
         """Lay out the FP4 MLA layers of ``config`` and record their manager layer IDs.
 
-        FP8 fallback and drafter layers get a lifecycle of their own, and every
-        FP4 MLA layer gets a virtual layer for its HP ring, reused under
-        ``hp_reuse_policy``.
+        A region-backed layout places HP tails on the real FP4 layers. With
+        layer-backed storage each tail has a virtual layer of its own.
         """
         cache_layers = list(config.layers)
         fp8_local_layers = self._fp8_mla_local_layer_indices()
@@ -362,7 +420,18 @@ class Fp4MlaCacheLayout:
         if not fp4_local_layers:
             raise ValueError("FP4 MLA V2 layout requires at least one local attention layer.")
         self._fp8_mla_manager_layer_ids = [LayerId(local_layer) for local_layer in fp8_local_layers]
-        if fp8_local_layers:
+        region_storage = FP4_MLA_LATENT_REGION in self._manager.region_layout
+        if region_storage:
+            if any(
+                self._manager.max_attention_window_vec[layer] is not None
+                for layer in fp4_local_layers
+            ):
+                raise ValueError(
+                    "FP4 MLA latent regions require full history. max_attention_window is below max_seq_len."
+                )
+            for layer in (*fp4_local_layers, *fp8_local_layers):
+                cache_layers[layer] = AttentionLayerConfig(layer_id=LayerId(layer), buffers=[])
+        elif fp8_local_layers:
             fp8_lifecycle_window = (
                 self._manager.max_seq_len
                 + self._manager.num_extra_kv_tokens
@@ -410,6 +479,10 @@ class Fp4MlaCacheLayout:
         }
         self._fp4_mla_compact_to_local = fp4_local_layers
         self._cache_manager_layer_ids = [LayerId(i) for i in fp4_local_layers]
+        if region_storage:
+            self._hp_manager_layer_ids = list(self._cache_manager_layer_ids)
+            return replace(config, layers=cache_layers)
+
         self._hp_manager_layer_ids = []
         for local_layer in fp4_local_layers:
             layer_id = LayerId(len(cache_layers))
@@ -433,20 +506,20 @@ class Fp4MlaCacheLayout:
     def prepare_page_table_tensor(self, index_mapper_capacity: int) -> None:
         cache_layer = self._cache_manager_layer_ids[0]
         hp_layer = self._hp_manager_layer_ids[0]
-        cache_pool_id = int(self._manager.impl.get_layer_group_id(cache_layer))
-        hp_pool_id = int(self._manager.impl.get_layer_group_id(hp_layer))
+        cache_pool_id = int(self._manager.impl.get_buffer_group_id(cache_layer, Role.KEY))
+        hp_pool_id = int(self._manager.impl.get_buffer_group_id(hp_layer, Role.MLA_HP_TAIL))
         if cache_pool_id == hp_pool_id:
             raise RuntimeError("FP4 MLA full-history and HP state must use distinct lifecycles.")
         fp8_pool_id = None
         if self._fp8_mla_manager_layer_ids:
             fp8_layer = self._fp8_mla_manager_layer_ids[0]
-            fp8_pool_id = int(self._manager.impl.get_layer_group_id(fp8_layer))
+            fp8_pool_id = int(self._manager.impl.get_buffer_group_id(fp8_layer, Role.KEY))
             if fp8_pool_id in (cache_pool_id, hp_pool_id):
                 raise RuntimeError("FP4 MLA, FP8 MLA, and HP state must use distinct lifecycles.")
         draft_pool_id = None
         if self._draft_manager_layer_ids:
             draft_pool_id = int(
-                self._manager.impl.get_layer_group_id(self._draft_manager_layer_ids[0])
+                self._manager.impl.get_buffer_group_id(self._draft_manager_layer_ids[0], Role.KEY)
             )
 
         # The hybrid manager can split a recurrent layer across groups by buffer reuse policy.
@@ -549,14 +622,6 @@ class Fp4MlaCacheLayout:
                 v_scale_pool.zero_()
             stream.synchronize()
 
-    def virtual_layer_pool_roles(
-        self, layer_id: int
-    ) -> Optional[tuple[DataRole, Optional[DataRole]]]:
-        """Pool roles of a virtual layer this layout appended (an HP ring), else ``None``."""
-        if LayerId(layer_id) in self._hp_manager_layer_ids:
-            return Role.MLA_HP_TAIL, None
-        return None
-
     def align_snapshot_points(self, request: "LlmRequest") -> None:
         """Move a hybrid manager's recurrent-state snapshots onto full cache blocks.
 
@@ -582,11 +647,11 @@ class Fp4MlaCacheLayout:
 
     def _validate_fp4_mla_layer_groups(self) -> None:
         cache_groups = {
-            int(self._manager.impl.get_layer_group_id(layer_id))
+            int(self._manager.impl.get_buffer_group_id(layer_id, Role.KEY))
             for layer_id in self._cache_manager_layer_ids
         }
         hp_groups = {
-            int(self._manager.impl.get_layer_group_id(layer_id))
+            int(self._manager.impl.get_buffer_group_id(layer_id, Role.MLA_HP_TAIL))
             for layer_id in self._hp_manager_layer_ids
         }
         if len(cache_groups) != 1 or len(hp_groups) != 1 or cache_groups == hp_groups:
@@ -595,7 +660,7 @@ class Fp4MlaCacheLayout:
                 f"got cache={sorted(cache_groups)}, hp={sorted(hp_groups)}."
             )
         fp8_groups = {
-            int(self._manager.impl.get_layer_group_id(layer_id))
+            int(self._manager.impl.get_buffer_group_id(layer_id, Role.KEY))
             for layer_id in self._fp8_mla_manager_layer_ids
         }
         if self._fp8_mla_manager_layer_ids and (
@@ -606,7 +671,7 @@ class Fp4MlaCacheLayout:
                 f"FP4 and HP; got fp8={sorted(fp8_groups)}."
             )
         draft_groups = {
-            int(self._manager.impl.get_layer_group_id(layer_id))
+            int(self._manager.impl.get_buffer_group_id(layer_id, Role.KEY))
             for layer_id in self._draft_manager_layer_ids
         }
         if self._draft_manager_layer_ids and (
@@ -664,10 +729,10 @@ class Fp4MlaCacheLayout:
         cache_layer = self._cache_manager_layer_ids[compact_layer]
         hp_layer = self._hp_manager_layer_ids[compact_layer]
         return Fp4MlaPageTableSpec(
-            cache_pool_id=int(self._manager.impl.get_layer_group_id(cache_layer)),
+            cache_pool_id=int(self._manager.impl.get_buffer_group_id(cache_layer, Role.KEY)),
             # copy_batch_block_offsets already applies the V2 converter scale.
             cache_page_index_scale=1,
-            hp_pool_id=int(self._manager.impl.get_layer_group_id(hp_layer)),
+            hp_pool_id=int(self._manager.impl.get_buffer_group_id(hp_layer, Role.MLA_HP_TAIL)),
             hp_page_index_scale=1,
         )
 
@@ -1054,27 +1119,21 @@ class Fp4MlaCacheLayout:
             [request.prompt_len for request in requests],
         )
 
-    def _fp4_mla_disagg_global_layer_id(self, internal_layer: int) -> Optional[int]:
-        """Collision-free transfer ID of an MLA cache or HP-ring layer.
-
-        A model layer's latent cache (FP4 or FP8 fallback) maps to ``2 * L``
-        and its HP-ring virtual layer to ``2 * L + 1``, where ``L`` is the
-        global model layer; an appended draft layer ``D`` maps to ``2 * D``.
-        Returns ``None`` for any other internal layer.
-        """
-        internal_layer = int(internal_layer)
-        if internal_layer in self._manager._appended_draft_layer_specs:
+    def _fp4_mla_disagg_global_layer_id(
+        self, internal_layer: int, role: DataRole | None = None
+    ) -> Optional[int]:
+        """Latent and draft buffers use 2L; the HP tail of model layer L uses 2L + 1."""
+        if internal_layer in self._hp_manager_layer_ids and (
+            role == Role.MLA_HP_TAIL or internal_layer not in self._cache_manager_layer_ids
+        ):
+            compact = self._hp_manager_layer_ids.index(internal_layer)
+            return 2 * int(self._manager.pp_layers[self._fp4_mla_compact_to_local[compact]]) + 1
+        if (
+            internal_layer in self._cache_manager_layer_ids
+            or internal_layer in self._fp8_mla_manager_layer_ids
+            or internal_layer in self._manager._appended_draft_layer_specs
+        ):
             return 2 * int(self._manager.pp_layers[internal_layer])
-        for compact_layer, layer_id in enumerate(self._cache_manager_layer_ids):
-            if int(layer_id) == internal_layer:
-                local_layer = self._fp4_mla_compact_to_local[compact_layer]
-                return 2 * int(self._manager.pp_layers[local_layer])
-        if any(int(layer_id) == internal_layer for layer_id in self._fp8_mla_manager_layer_ids):
-            return 2 * int(self._manager.pp_layers[internal_layer])
-        for compact_layer, layer_id in enumerate(self._hp_manager_layer_ids):
-            if int(layer_id) == internal_layer:
-                local_layer = self._fp4_mla_compact_to_local[compact_layer]
-                return 2 * int(self._manager.pp_layers[local_layer]) + 1
         return None
 
     def runtime_cache_size_layer_components(self) -> tuple[list[int], list[Optional[int]]]:

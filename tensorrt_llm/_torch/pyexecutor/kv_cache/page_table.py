@@ -146,6 +146,8 @@ class PageTableSpec:
             of its (model layer, attention type) map (``_layer_attn_to_layer_id``). Stated under
             mixed-precision KV, whose high layers take global layers ``2 * L + 1`` and every other
             layer twice the id it has without; the high layers hold the high type.
+        buffer_layer_ids: Transfer and model layer ids for individual (internal layer, role)
+            pairs that have their own transfer id within a model layer.
         quant_mode: How the manager's own KV data is quantized, as configured: None unquantized,
             else one of ``QUANT_MODES``: ``"fp8"``, ``"nvfp4"``, ``"fp8_ds_mla"`` (FP8 pages
             carrying their own scales) or ``"csa2_packed"`` (CSA2's fixed packed FP8/FP4 records,
@@ -181,7 +183,14 @@ class PageTableSpec:
     mixed_precision: tuple[str, str] | None = None
     retention_margins: bool = False
 
+    buffer_layer_ids: Mapping[tuple[int, str], tuple[int, int]] = field(default_factory=dict)
+
     def __post_init__(self) -> None:
+        buffer_ids = {
+            (int(layer), str(role)): (int(global_layer), int(model_layer))
+            for (layer, role), (global_layer, model_layer) in self.buffer_layer_ids.items()
+        }
+        object.__setattr__(self, "buffer_layer_ids", types.MappingProxyType(buffer_ids))
         layouts = {str(role): layout for role, layout in dict(self.role_layouts).items()}
         for layout in (*layouts.values(), self.default_layout):
             if layout is not None and not isinstance(layout, RoleLayoutV2):
@@ -240,19 +249,27 @@ def state_split(manager: object) -> tuple[str, ...]:
     return ("tp",)
 
 
-def layer_ids_of(manager: object, spec: PageTableSpec | None = None) -> dict[int, tuple[int, int]]:
+def layer_ids_of(
+    manager: object, spec: PageTableSpec | None = None, *, role: str | None = None
+) -> dict[int, tuple[int, int]]:
     """Internal layer id -> (global layer id, model layer) of each layer of ``manager``'s layer
-    groups, as its page table names them: the ``layer_ids`` of its spec (``spec``, else its
+    groups, including any transfer id specific to ``role``. Uses the ``layer_ids`` of its spec (``spec``, else its
     ``page_table_spec()``) or, without them, its model layers (``_layer_ids``).
 
     Raises:
         ValueError: If its model layers name no global layer for some layer.
     """
     spec = manager.page_table_spec() if spec is None else spec
-    if spec.layer_ids is not None:
-        return dict(spec.layer_ids)
-    internal = sorted({lid for group in layer_groups(manager) for lid in group})
-    return _layer_ids(manager, internal)
+    if spec.layer_ids is None:
+        internal = sorted({lid for group in layer_groups(manager) for lid in group})
+        ids = _layer_ids(manager, internal)
+    else:
+        ids = dict(spec.layer_ids)
+    if role is not None:
+        ids.update(
+            (lid, value) for (lid, name), value in spec.buffer_layer_ids.items() if name == role
+        )
+    return ids
 
 
 def _layer_ids(manager: object, internal: list[int]) -> dict[int, tuple[int, int]]:

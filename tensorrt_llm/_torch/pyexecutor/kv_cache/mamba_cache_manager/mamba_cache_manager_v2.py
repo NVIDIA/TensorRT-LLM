@@ -656,17 +656,19 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         """
         layout_policy = self._attention_cache_layout_policy
         result = []
-        # A recurrent layer split by buffer reuse policies is listed once per group.
-        layer_ids = dict.fromkeys(
-            int(buffer.layer_id) for buffer in self.impl.buffer_grouping[layer_group_id]
-        )
-        for internal_layer in layer_ids:
+        # A layer split across groups is listed once per group. Its buffers in
+        # one group are all latent, all HP ring or all recurrent state, so its
+        # first buffer here names its transfer ID.
+        roles_by_layer: Dict[int, DataRole] = {}
+        for buffer in self.impl.buffer_grouping[layer_group_id]:
+            roles_by_layer.setdefault(int(buffer.layer_id), buffer.role)
+        for internal_layer, role in roles_by_layer.items():
             if layout_policy is None:
                 global_layer_id = int(self.pp_layers[internal_layer])
             elif self._is_local_mamba_layer(internal_layer):
                 global_layer_id = 2 * int(self.pp_layers[internal_layer])
             else:
-                global_layer_id = layout_policy.disagg_global_layer_id(self, internal_layer)
+                global_layer_id = layout_policy.disagg_global_layer_id(self, internal_layer, role)
                 if global_layer_id is None:
                     raise ValueError(f"Unknown hybrid attention layout layer {internal_layer}.")
             result.append(global_layer_id)
@@ -742,12 +744,12 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     def _get_pool_roles(self, pool_id: int) -> Tuple[DataRole, Optional[DataRole]]:
         buffers = self.impl.buffer_grouping[pool_id]
         layer_id = int(buffers[0].layer_id)
+        layout_policy = self._attention_cache_layout_policy
+        if layout_policy is not None:
+            roles = layout_policy.auxiliary_pool_roles(buffers[0].role)
+            if roles is not None:
+                return roles
         if layer_id >= self.num_local_layers:
-            layout_policy = self._attention_cache_layout_policy
-            if layout_policy is not None:
-                roles = layout_policy.virtual_layer_pool_roles(self, layer_id)
-                if roles is not None:
-                    return roles
             if layer_id in self.mixed_precision_high_layers.values():
                 return super()._get_pool_roles(pool_id)
             raise ValueError(f"Unknown hybrid V2 virtual layer {layer_id}.")
@@ -995,9 +997,12 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                     layer_id=layer_id,
                     buffers=buffers,
                 )
-        # The declared regions' buffers are bound the same way.
+        # The declared regions' buffers on recurrent layers are bound the same
+        # way. Regions on attention layers keep the attention layout's views.
         for region in self.region_layout.regions:
             for region_layer in region.layers:
+                if not self._is_local_mamba_layer(region_layer.model_layer):
+                    continue
                 for plane in region_layer.planes:
                     self._recurrent_buffers[region_layer.model_layer, plane.role] = None
 
@@ -1841,20 +1846,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         if report is None:
             return None
 
-        region_groups = {
-            group
-            for region in self.region_layout.regions
-            for group in self.get_region_group_ids(region.name)
-        }
         pool_group_ids = sorted(
             {
                 pool_group_id
-                for life_cycle_id, (
-                    pool_group_id,
-                    _,
-                    kind,
-                ) in self._stats_life_cycle_metadata().items()
-                if kind == "ssm" and life_cycle_id not in region_groups
+                for pool_group_id, _, kind, region in self._stats_life_cycle_metadata().values()
+                if kind == "ssm" and region is None
             }
         )
         if not pool_group_ids:

@@ -88,6 +88,8 @@ class KVCacheV2LifeCycleIterationStats:
     # rather than matching on device. Those blocks sit on no cache level, so they are the part of
     # the full reuse count that `full_reused_blocks_by_level` does not cover.
     connector_reused_blocks: int = 0
+    # Name of the region whose life cycle this is; None for a layer config's life cycle.
+    region: str | None = None
 
 
 @dataclass(slots=True)
@@ -112,6 +114,8 @@ class KVCacheV2SsmLifeCycleIterationStats:
     life_cycle_id: int
     pool_group_id: int
     snapshot_stats: KVCacheV2SsmSnapshotIterationStats
+    # Name of the region whose life cycle this is; None for a layer config's life cycle.
+    region: str | None = None
     window_size: None = field(default=None, init=False)
     kind: Literal["ssm"] = field(default="ssm", init=False)
 
@@ -280,6 +284,8 @@ def append_kv_cache_iteration_stats(stats_dict: dict, kv_iter_stats) -> None:
             "windowSize": stats.window_size,
             "kind": stats.kind,
         }
+        if stats.region is not None:
+            serialized["region"] = stats.region
         if isinstance(stats, KVCacheV2SsmLifeCycleIterationStats):
             serialized["snapshotStats"] = serialize_ssm_snapshot_iteration_stats(
                 stats.snapshot_stats
