@@ -324,7 +324,7 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 | **LTX-2** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No |
 | **LTX-2.3** | Yes | Yes | No | No | Yes | Yes | Yes | Yes | Yes | No | No | No | No |
 | **MiniMax-H3** | Yes | Yes | No | No | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes |
-| **MiniMax-H3-Image** | No | No | No | No | No | No | No | Not validated | Yes | No | No | No | No |
+| **MiniMax-H3-Image** | Yes | Yes | No | No | No | No | No | Yes | Yes | No | No | No | No |
 | **FastH3** | Yes | Yes | No | No | No | No | No | Yes | Yes | No | No | No | No |
 | **Qwen-Image** | Yes | Yes | Yes | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No |
 | **Qwen-Image-Layered** | Yes | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No |

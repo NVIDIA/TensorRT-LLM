@@ -11,7 +11,8 @@ from PIL import Image
 from test_common.llm_data import llm_models_root
 
 
-def test_minimax_h3_image_example(llm_root, llm_venv, tmp_path, monkeypatch):
+@pytest.mark.parametrize("precision", ["bf16", "fp8-blockwise", "nvfp4"])
+def test_minimax_h3_image_example(llm_root, llm_venv, tmp_path, monkeypatch, precision):
     root = llm_models_root()
     if root is None or not (root / "MiniMax-H3-Image").exists():
         pytest.skip("Stage an approved MiniMax-H3-Image checkpoint under LLM_MODELS_ROOT")
@@ -37,7 +38,7 @@ def test_minimax_h3_image_example(llm_root, llm_venv, tmp_path, monkeypatch):
             "--model",
             str(model),
             "--visual_gen_args",
-            str(example_dir / "configs/minimax-h3-image-bf16-1gpu.yaml"),
+            str(example_dir / f"configs/minimax-h3-image-{precision}-1gpu.yaml"),
             "--output_path",
             str(output),
         ],

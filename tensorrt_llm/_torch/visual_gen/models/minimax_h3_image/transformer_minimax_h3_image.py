@@ -8,6 +8,8 @@ import math
 import torch
 from torch import nn
 
+from tensorrt_llm.quantization.mode import QuantAlgo
+
 from ...config import DiffusionModelConfig
 from ..minimax_h3.transformer_minimax_h3 import (
     MiniMaxH3AdaLayerNormOut,
@@ -37,8 +39,22 @@ class MiniMaxH3ImageTransformer2DModel(MiniMaxH3Transformer3DModel):
             raise ValueError("Expected the six-head MiniMax-H3 image checkpoint with 1x2x2 patches")
         if model_config.mapping.world_size != 1 or model_config.attention.sparse_attention_config:
             raise ValueError("MiniMax-H3-Image currently requires dense, single-device attention")
-        if model_config.quant_config.quant_algo is not None:
-            raise ValueError("MiniMax-H3-Image currently supports the mixed BF16/FP32 weights only")
+        quant_algo = model_config.quant_config.quant_algo
+        if quant_algo is not None and not (
+            quant_algo in (QuantAlgo.FP8, QuantAlgo.FP8_BLOCK_SCALES, QuantAlgo.NVFP4)
+            and model_config.dynamic_weight_quant
+        ):
+            raise ValueError(
+                "MiniMax-H3-Image supports mixed BF16/FP32 weights or dynamically quantized "
+                "FP8 / FP8_BLOCK_SCALES / NVFP4 weights only"
+            )
+        if quant_algo == QuantAlgo.NVFP4 and not model_config.force_dynamic_quantization:
+            raise ValueError(
+                "MiniMax-H3-Image NVFP4 requires force_dynamic_quantization=True; "
+                "the dynamic weight loader does not calibrate activation scales"
+            )
+        # Quantize the shared H3 blocks, keeping image projections and timestep
+        # embedding in their checkpoint precision (ordinary torch.nn.Linear).
         self.proj_in = nn.Linear(cfg.in_channels * 4, cfg.hidden_size, dtype=torch.float32)
         self.context_embedder = nn.Linear(
             cfg.text_dim, cfg.hidden_size, dtype=model_config.torch_dtype
@@ -76,6 +92,7 @@ class MiniMaxH3ImageTransformer2DModel(MiniMaxH3Transformer3DModel):
             nn.Linear(cfg.hidden_size, cfg.in_channels * 4, dtype=torch.float32)
             for _ in range(NUM_PDD_STEPS)
         )
+        self.apply_quant_config_exclude_modules()
 
     def post_load_weights(self) -> None:
         from tensorrt_llm._torch.modules.linear import Linear

@@ -71,7 +71,7 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 | **LTX-2** | Yes | Yes | Yes | Yes | No | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes |
 | **LTX-2.3** | Yes | Yes | No | No | No | No | No | Yes | Yes | Yes | Yes | Yes | No | No | No | No | No |
 | **MiniMax-H3** | Yes | Yes | No | No | No | Yes | No | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | No |
-| **MiniMax-H3-Image** | No | No | No | No | No | No | No | No | No | No | Not validated | Yes | No | No | No | No | No |
+| **MiniMax-H3-Image** | Yes | Yes | No | No | No | No | No | No | No | No | Yes | Yes | No | No | No | No | No |
 | **FastH3** | Yes | Yes | No | No | No | No | No | No | No | No | Yes | Yes | No | No | No | No | No |
 | **Qwen-Image** | Yes | Yes | Yes | Yes | No | No | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No | No |
 | **Qwen-Image-Layered** | Yes | No | No | Yes | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No | No |
@@ -178,10 +178,21 @@ The validated single-GPU eager profile uses the `TRTLLM` attention backend for
 the DiT and PyTorch SDPA for the text encoder. `trtllm-serve` image generation
 was verified on a GB100 GPU at 2048x2048 with six steps and seed 42; its output
 was pixel-identical to eager generation through the Python API. `torch.compile`
-with the default `enable_fullgraph: false` completed generation, but output
-equivalence is not validated: the measured AlexNet LPIPS against eager was
-0.1038 for the validation prompt. Compilation therefore remains unvalidated
-in the feature matrix.
+with the default `enable_fullgraph: false` is also supported. It is not
+pixel-equivalent to eager: the measured AlexNet LPIPS against eager was
+0.1038 for the validation prompt.
+
+Dynamic load-time quantization of the shared transformer attention/MLP and
+conditioning layers is supported with the
+[FP8 blockwise config](../../../examples/visual_gen/configs/minimax-h3-image-fp8-blockwise-1gpu.yaml)
+or [NVFP4 config](../../../examples/visual_gen/configs/minimax-h3-image-nvfp4-1gpu.yaml).
+Both use `quant_config.dynamic: true` with the original checkpoint; NVFP4 also
+enables dynamic activation scaling automatically. The image input/output and
+timestep projections, text encoder, and image decoder retain their existing
+precision. Static quantized checkpoints are not supported. Both recipes
+completed the same single-GPU generation check, with AlexNet LPIPS of 0.4331
+(FP8 blockwise) and 0.5134 (NVFP4) against eager BF16. These are functional
+checks, not output-equivalence guarantees.
 
 Use the [image example](../../../examples/visual_gen/models/minimax_h3_image.py)
 with the [single-GPU config](../../../examples/visual_gen/configs/minimax-h3-image-bf16-1gpu.yaml)

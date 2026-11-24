@@ -19,6 +19,8 @@ from tensorrt_llm._torch.visual_gen.models.minimax_h3_image.transformer_minimax_
     MiniMaxH3ImageTransformer2DModel,
 )
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PIPELINE_REGISTRY, AutoPipeline
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.visual_gen.args import AttentionConfig
 from tensorrt_llm.visual_gen.params import VisualGenParams
 
@@ -138,6 +140,55 @@ def _image_config(**overrides):
 def test_image_transformer_rejects_incompatible_checkpoint(override):
     with pytest.raises(ValueError, match="six-head.*1x2x2"):
         MiniMaxH3ImageTransformer2DModel(_image_config(**override))
+
+
+@pytest.mark.parametrize("algo", [QuantAlgo.FP8, QuantAlgo.FP8_BLOCK_SCALES, QuantAlgo.NVFP4])
+def test_image_transformer_dynamic_quantization(algo):
+    config = _image_config(
+        hidden_size=128,
+        ffn_dim=256,
+        time_embed_dim=128,
+        num_attention_heads=1,
+        attention_head_dim=128,
+    ).model_copy(
+        update=dict(
+            quant_config=QuantConfig(
+                quant_algo=algo,
+                group_size=16 if algo == QuantAlgo.NVFP4 else 128,
+                exclude_modules=["norm_out.linear"],
+            ),
+            dynamic_weight_quant=True,
+            force_dynamic_quantization=algo == QuantAlgo.NVFP4,
+        )
+    )
+    model = MiniMaxH3ImageTransformer2DModel(config)
+    qkv = model.transformer_blocks[0].attn.qkv_proj
+    assert qkv.quant_config.quant_algo == algo
+    assert qkv.weight.dtype == (torch.uint8 if algo == QuantAlgo.NVFP4 else torch.float8_e4m3fn)
+    assert not model.norm_out.linear.has_any_quant
+    assert model.norm_out.linear.weight.dtype == config.torch_dtype
+    assert model.proj_in.weight.dtype == torch.float32
+    assert all(head.weight.dtype == torch.float32 for head in model.pdd_proj_out)
+    assert model.time_embedder.linear_1.weight.dtype == torch.float32
+    assert model.context_embedder.weight.dtype == config.torch_dtype
+
+
+@pytest.mark.parametrize("algo", [QuantAlgo.FP8, QuantAlgo.FP8_BLOCK_SCALES, QuantAlgo.NVFP4])
+def test_image_transformer_rejects_static_quantization(algo):
+    config = _image_config().model_copy(update=dict(quant_config=QuantConfig(quant_algo=algo)))
+    with pytest.raises(ValueError, match="dynamically quantized"):
+        MiniMaxH3ImageTransformer2DModel(config)
+
+
+def test_image_transformer_nvfp4_requires_dynamic_activation_scales():
+    config = _image_config().model_copy(
+        update=dict(
+            quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4),
+            dynamic_weight_quant=True,
+        )
+    )
+    with pytest.raises(ValueError, match="force_dynamic_quantization=True"):
+        MiniMaxH3ImageTransformer2DModel(config)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="TRTLLM RMSNorm requires CUDA")
