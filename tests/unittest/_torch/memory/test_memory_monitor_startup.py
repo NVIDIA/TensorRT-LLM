@@ -19,6 +19,7 @@ report has to show *their* numbers and *their* advice, not a second opinion
 that could drift from them.
 """
 
+import sys
 import types
 
 import pytest
@@ -55,7 +56,7 @@ def _frame(free=150 * GIB, kv=16 * GIB):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the executor monitor reads the device")
 def test_executor_memory_monitor_feeds_the_report(monkeypatch):
     from tensorrt_llm._torch.memory.monitor import tagging, triggers
-    from tensorrt_llm._torch.memory.monitor.capture import _advice
+    from tensorrt_llm._torch.memory.monitor.capture import _advice, capture, structured_report
     from tensorrt_llm._torch.memory.monitor.summary import Group
     from tensorrt_llm._torch.pyexecutor.py_executor_creator import _ExecutorMemoryMonitor
     from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
@@ -78,6 +79,24 @@ def test_executor_memory_monitor_feeds_the_report(monkeypatch):
         assert steps[0].name == monitor.memory_type_friendly_names[ExecutorMemoryType.SAMPLER]
     finally:
         del held
+
+    # The same capture still describes its executor after the next startup resets the monitor.
+    monkeypatch.setattr(sys.modules[capture.__module__], "read_device", lambda _: _frame().device)
+    monkeypatch.setattr(startup, "_first", startup.Reading(process=GIB, torch=0, known=0))
+    monkeypatch.setattr(tagging, "_frozen", tagging.TagSnapshot(supported=True))
+    startup.record_memory_plan(7 * GIB, GIB)
+    snapshot = capture(tag="startup_complete", startup_steps=True)
+    before = structured_report(snapshot)
+    assert before["startup_plan"]["non_kv_peak"] == 7 * GIB
+    assert before["startup_steps"][0]["stage"] == "sampler"
+    assert before["startup_tagging_supported"]
+    assert before["group_members_bytes"]["overhead"]
+    startup.clear()
+    tagging.set_frozen_map(tagging.TagSnapshot(supported=False))
+    assert structured_report(snapshot) == before
+    startup.record_memory_plan(3 * GIB, None)
+    startup.record_stage("replacement", GIB, 0)
+    assert structured_report(snapshot) == before
 
     # A failed step is recorded.
     startup.clear()

@@ -36,7 +36,7 @@ from .pools import pool_usage, released_tags_pinned
 from .providers import collect_all
 from .report import render
 from .schema import Basis, Category, Entry, Group, Placement, Source
-from .summary import group_totals
+from .summary import GroupTotals, group_totals
 from .tagging import get_frozen_map, live_attribution
 
 __all__ = ["MonitorCapture", "capture", "read_device", "read_torch", "render_capture"]
@@ -53,6 +53,9 @@ class MonitorCapture:
     rank: int | None
     device_index: int
     timestamp_ns: int
+    totals: GroupTotals
+    startup_tagging_supported: bool
+    startup_plan: startup.MemoryPlan | None = None
     failed_stage: startup.StageSample | None = None
     checks: tuple[CheckResult, ...] = ()
     #: One line saying what happened, shown above the summary (e.g. the
@@ -65,8 +68,8 @@ class MonitorCapture:
     #: Whether the summary may give tuning advice; off for a failure that
     #: is not about memory.
     advise: bool = True
-    #: Whether to list memory taken by each startup step.
-    startup_steps: bool = False
+    #: None when the report did not request startup steps.
+    startup_steps: tuple[startup.StageSample, ...] | None = None
     #: Untagged PyTorch memory by allocating code; empty unless stack
     #: recording (``TLLM_MEM_MONITOR_STACKS=1``) is on.
     unattributed_sites: dict[str, int] | None = None
@@ -256,15 +259,17 @@ def capture(
         torch_reading = read_torch(device_index, segments)
         # One tag reading feeds the entries, check B and the stack breakdown;
         # reading twice would let the allocator move between them.
-        by_tag, sites = live_attribution(get_frozen_map(), segments)
+        tag_map = get_frozen_map()
+        by_tag, sites = live_attribution(tag_map, segments)
         pool_rows: dict[str, list[dict]] = {}
         entries = collect_all(pool_rows=pool_rows) + _tag_entries(by_tag)
     checks = _run_checks(by_tag, torch_reading.live, pool_rows)
 
     frame = build_frame(read_device(device_index), torch_reading, entries)
+    totals = group_totals(frame)
     baseline = None if record_baseline else startup.baseline()
     if record_baseline:
-        startup.record_baseline(group_totals(frame).sizes)
+        startup.record_baseline(totals.sizes)
 
     return MonitorCapture(
         frame=frame,
@@ -276,13 +281,16 @@ def capture(
         rank=rank,
         device_index=device_index,
         timestamp_ns=timestamp_ns,
+        totals=totals,
+        startup_tagging_supported=tag_map.supported,
+        startup_plan=startup.memory_plan(),
         failed_stage=startup.failed_stage() if tag == "startup_failed" else None,
         checks=checks,
         headline=headline,
         baseline=baseline,
         suggestion=suggestion,
         advise=advise,
-        startup_steps=startup_steps,
+        startup_steps=startup.stages() if startup_steps else None,
         unattributed_sites=sites or None,
     )
 
@@ -290,9 +298,9 @@ def capture(
 def structured_report(snapshot: MonitorCapture) -> dict:
     """One rank's JSON-compatible report. All memory quantities are bytes."""
     frame = snapshot.frame
-    totals = group_totals(frame)
+    totals = snapshot.totals
     device = frame.device
-    plan = startup.memory_plan()
+    plan = snapshot.startup_plan
     released = any(e.released for e in frame.entries) or any(
         pool.released for pool in frame.torch.pools or ()
     )
@@ -329,13 +337,11 @@ def structured_report(snapshot: MonitorCapture) -> dict:
             group.name.lower(): dict(members) for group, members in totals.members.items()
         },
         "unmeasured": list(totals.unmeasured),
-        "startup_tagging_supported": get_frozen_map().supported,
+        "startup_tagging_supported": snapshot.startup_tagging_supported,
         "checks": [asdict(check) for check in snapshot.checks],
         "capability": asdict(snapshot.capability),
         "startup_plan": asdict(plan) if plan is not None and not released else None,
-        "startup_steps": [asdict(stage) for stage in startup.stages()]
-        if snapshot.startup_steps
-        else [],
+        "startup_steps": [asdict(stage) for stage in snapshot.startup_steps or ()],
         "failed_stage": asdict(snapshot.failed_stage)
         if snapshot.failed_stage is not None
         else None,
@@ -359,7 +365,8 @@ def render_capture(snapshot: MonitorCapture) -> str:
         baseline=snapshot.baseline,
         advice=_advice() if snapshot.advise else {},
         suggestion=snapshot.suggestion,
-        startup_steps=snapshot.startup_steps,
+        startup_steps=snapshot.startup_steps is not None,
+        totals=snapshot.totals,
         unattributed_sites=snapshot.unattributed_sites,
     )
 
