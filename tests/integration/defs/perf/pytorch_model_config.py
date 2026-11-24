@@ -1133,7 +1133,7 @@ def get_model_yaml_config(model_label: str,
                 },
             }
         },
-        # Nemotron-3-Ultra-550B-NVFP4 throughput variant, aligned with curated yaml (served from HF).
+        # Nemotron-3-Ultra-550B-NVFP4 throughput variant, aligned with curated yaml (synced HF submodule).
         {
             'patterns': ['nemotron_3_ultra_550b_nvfp4-serve-pytorch-'],
             'config': {
