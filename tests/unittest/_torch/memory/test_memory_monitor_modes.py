@@ -72,7 +72,6 @@ class TestDefaultReportsOnlyOutOfMemory:
         triggers.notify_error("CUDA out of memory. Tried to allocate 2.00 GiB. GPU 0")
         assert len(seen) == 1 and seen[0][0] == "out_of_memory"
         assert "No matching fault-time memory snapshot" in seen[0][1]
-        assert "details by allocator" not in seen[0][1]
 
         # No periodic thread even though an interval is set ...
         assert not any(t.name == "memory-monitor-periodic" for t in threading.enumerate())

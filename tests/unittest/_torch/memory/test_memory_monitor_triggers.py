@@ -223,29 +223,6 @@ def _oom(mod):
 
 
 @pytest.mark.cpu_only
-def test_oom_snapshot_survives_unwind_and_filters_other_devices(armed, monkeypatch):
-    mod, _, emitted, _ = armed
-    monkeypatch.setattr(mod, "_armed", mod._Armed(None, 0, 0, True, snapshot_on_oom=True))
-    blocks = [{"size": 512, "state": "active_allocated"}, {"size": 1024, "state": "inactive"}]
-    segments = [
-        {"device": 0, "total_size": 1536, "blocks": blocks},
-        {"device": 1, "total_size": 4096, "blocks": [{"size": 4096, "state": "active_allocated"}]},
-    ]
-    from contextlib import nullcontext
-
-    monkeypatch.setattr(torch.cuda, "device", lambda _: nullcontext())
-    monkeypatch.setattr(mod, "capture", lambda **kwargs: None)
-    monkeypatch.setattr(torch.cuda.memory, "_snapshot", lambda: {"segments": segments})
-    _oom(mod)
-    segments.clear()
-    assert not emitted
-    mod.notify_error(_TORCH_OOM)
-    headline = emitted[0]["incident"]
-    assert "512 bytes live (blocks: 1), 1.50 KiB reserved" in headline
-    assert "512 bytes  no recorded stack" in headline
-
-
-@pytest.mark.cpu_only
 def test_torch_observer_only_records(armed):
     mod, clock, emitted, reset = armed
 

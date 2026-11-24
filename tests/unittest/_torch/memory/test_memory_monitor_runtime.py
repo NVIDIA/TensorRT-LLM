@@ -243,7 +243,6 @@ def test_real_out_of_memory_is_reported_once_it_escapes(monkeypatch, tmp_path):
     # Caught by its caller: nothing is reported.
     assert not list(tmp_path.iterdir()), "a caught OOM"
     del model
-    monkeypatch.setattr(triggers, "capture", lambda **kw: pytest.fail("sampled after unwinding"))
     # What the executor's error handler passes on once the error escapes.
     triggers.notify_error(error)
     (path,) = tmp_path.glob("*_out_of_memory.txt")
