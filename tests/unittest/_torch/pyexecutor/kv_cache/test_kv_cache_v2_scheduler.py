@@ -4028,6 +4028,432 @@ class TestPeftSuspendResume:
         peft_kv.prepare_resources(out_kv)
         assert impl_kv.device_cached == {2}
 
+        # One-slot failed KV resume: when A reserves the only slot + PEFT page in
+        # Phase 1 but fails KV resume in Phase 2a without preempting a victim,
+        # its reservation is released and the blocked following decode B is
+        # reconsidered in the same pass ahead of C.
+        mgr_retry = make_kv_cache_manager(
+            can_evict=False,
+            prepare_context_fn=lambda req: req.py_request_id != 40,
+        )
+        peft_retry, impl_retry = _make_peft_wrapper(
+            max_device_pages=1, initial_active={1: {40}, 2: {41}}
+        )
+        sched_retry = make_scheduler(mgr_retry, max_batch_size=1, peft_cache_manager=peft_retry)
+        ctx_fail = _init_lora_req(
+            make_ctx_request(40, 64, is_first_context_chunk=False, lora_task_id=1)
+        )
+        mgr_retry.kv_cache_map[40].is_active = False
+        peft_retry.pause_request(ctx_fail)
+        gen_follow = _init_lora_req(make_gen_request(41, lora_task_id=2))
+        mgr_retry.kv_cache_map[41].is_active = False
+        peft_retry.pause_request(gen_follow)
+        impl_retry.device_cached.clear()
+        base_follow = make_gen_request(42)
+
+        out_retry = sched_retry.schedule_request([ctx_fail, gen_follow, base_follow], set())
+        assert out_retry.context_requests == []
+        assert ids(out_retry.generation_requests) == [41]
+        peft_retry.prepare_resources(out_retry)
+        assert not peft_retry.is_paused(gen_follow)
+        assert peft_retry.is_paused(ctx_fail)
+        assert impl_retry.device_cached == {2}
+
+        # Two-slot failed KV resume: A reserves slot 1 + adapter 1, B (adapter 2)
+        # is PEFT-blocked during Phase 1, C (base decode) takes slot 2, then A
+        # fails KV in Phase 2a -> Phase 1b retries B into the freed slot + page.
+        mgr_retry2 = make_kv_cache_manager(
+            can_evict=True,
+            prepare_context_fn=lambda req: req.py_request_id != 50,
+        )
+        peft_retry2, impl_retry2 = _make_peft_wrapper(
+            max_device_pages=1, initial_active={1: {50}, 2: {51}}
+        )
+        sched_retry2 = make_scheduler(mgr_retry2, max_batch_size=2, peft_cache_manager=peft_retry2)
+        ctx_fail2 = _init_lora_req(
+            make_ctx_request(50, 64, is_first_context_chunk=False, lora_task_id=1)
+        )
+        mgr_retry2.kv_cache_map[50].is_active = False
+        peft_retry2.pause_request(ctx_fail2)
+        gen_blocked = _init_lora_req(make_gen_request(51, lora_task_id=2))
+        mgr_retry2.kv_cache_map[51].is_active = False
+        peft_retry2.pause_request(gen_blocked)
+        impl_retry2.device_cached.clear()
+        base_gen = make_gen_request(52)
+
+        out_retry2 = sched_retry2.schedule_request([ctx_fail2, gen_blocked, base_gen], set())
+        assert out_retry2.context_requests == []
+        assert sorted(ids(out_retry2.generation_requests)) == [51, 52]
+        peft_retry2.prepare_resources(out_retry2)
+        assert not peft_retry2.is_paused(gen_blocked)
+        assert impl_retry2.device_cached == {2}
+
+        # Token-budget STOP retry: A holds all 64 tokens so base decode 62 hits
+        # ScheduleAction.STOP in _try_schedule_generation before 61 is visited;
+        # when A fails KV in Phase 2a, Phase 1b must retry both 62 and 61.
+        mgr_tok_retry = make_kv_cache_manager(
+            can_evict=False,
+            prepare_context_fn=lambda req: req.py_request_id != 60,
+        )
+        peft_tok_retry, impl_tok_retry = _make_peft_wrapper(
+            max_device_pages=2, initial_active={1: {60}, 2: {61}}
+        )
+        sched_tok_retry = make_scheduler(
+            mgr_tok_retry,
+            max_batch_size=4,
+            max_num_tokens=64,
+            peft_cache_manager=peft_tok_retry,
+        )
+        ctx_tok_fail = _init_lora_req(
+            make_ctx_request(60, 64, is_first_context_chunk=False, lora_task_id=1)
+        )
+        mgr_tok_retry.kv_cache_map[60].is_active = False
+        peft_tok_retry.pause_request(ctx_tok_fail)
+        base_tok_follow = make_gen_request(62)
+        gen_tok_follow = _init_lora_req(make_gen_request(61, lora_task_id=2))
+        mgr_tok_retry.kv_cache_map[61].is_active = False
+        peft_tok_retry.pause_request(gen_tok_follow)
+        impl_tok_retry.device_cached.clear()
+
+        out_tok_retry = sched_tok_retry.schedule_request(
+            [ctx_tok_fail, base_tok_follow, gen_tok_follow], set()
+        )
+        assert out_tok_retry.context_requests == []
+        assert ids(out_tok_retry.generation_requests) == [62, 61]
+
+        # Phase 1b eviction safety: when B (index 1) is retried after C (index 2)
+        # was already admitted in Phase 1 and B's KV allocation fails, B must not
+        # evict or recompute-pause already-scheduled C.
+        mgr_evict = make_kv_cache_manager(
+            can_evict=True,
+            prepare_context_fn=lambda req: req.py_request_id != 70,
+            try_allocate_generation_fn=lambda req: req.py_request_id != 71,
+        )
+        peft_evict, impl_evict = _make_peft_wrapper(
+            max_device_pages=1, initial_active={1: {70}, 2: {71}}
+        )
+        sched_evict = make_scheduler(mgr_evict, max_batch_size=2, peft_cache_manager=peft_evict)
+        ctx_evict_fail = _init_lora_req(
+            make_ctx_request(70, 64, is_first_context_chunk=False, lora_task_id=1)
+        )
+        mgr_evict.kv_cache_map[70].is_active = False
+        peft_evict.pause_request(ctx_evict_fail)
+        gen_evict_fail = _init_lora_req(make_gen_request(71, lora_task_id=2))
+        mgr_evict.kv_cache_map[71].is_active = False
+        peft_evict.pause_request(gen_evict_fail)
+        impl_evict.device_cached.clear()
+        already_scheduled_c = make_gen_request(72)
+
+        out_evict = sched_evict.schedule_request(
+            [ctx_evict_fail, gen_evict_fail, already_scheduled_c], set()
+        )
+        assert ids(out_evict.generation_requests) == [72]
+        assert 72 not in ids(out_evict.paused_requests)
+        assert 72 not in ids(out_evict.recompute_paused_requests)
+
+        # Phase 1b FCFS paused-context ordering: [A (paused ctx, adapter 1,
+        # KV resume fails), B (paused ctx, adapter 2, runnable), C (paused
+        # decode, adapter 3)] with 1 PEFT page -> after A fails, B reserves
+        # adapter 2 and runs ahead of younger decode C.
+        mgr_fcfs = make_kv_cache_manager(
+            can_evict=False,
+            prepare_context_fn=lambda req: req.py_request_id != 80,
+        )
+        peft_fcfs, impl_fcfs = _make_peft_wrapper(
+            max_device_pages=1, initial_active={1: {80}, 2: {81}, 3: {82}}
+        )
+        sched_fcfs = make_scheduler(mgr_fcfs, max_batch_size=4, peft_cache_manager=peft_fcfs)
+        ctx_a = _init_lora_req(
+            make_ctx_request(80, 64, is_first_context_chunk=False, lora_task_id=1)
+        )
+        mgr_fcfs.kv_cache_map[80].is_active = False
+        peft_fcfs.pause_request(ctx_a)
+        ctx_b = _init_lora_req(
+            make_ctx_request(81, 64, is_first_context_chunk=False, lora_task_id=2)
+        )
+        mgr_fcfs.kv_cache_map[81].is_active = False
+        peft_fcfs.pause_request(ctx_b)
+        gen_c = _init_lora_req(make_gen_request(82, lora_task_id=3))
+        mgr_fcfs.kv_cache_map[82].is_active = False
+        peft_fcfs.pause_request(gen_c)
+        impl_fcfs.device_cached.clear()
+
+        out_fcfs = sched_fcfs.schedule_request([ctx_a, ctx_b, gen_c], set())
+        assert ids(out_fcfs.context_requests) == [81]
+        assert out_fcfs.generation_requests == []
+        peft_fcfs.prepare_resources(out_fcfs)
+        assert not peft_fcfs.is_paused(ctx_b)
+        assert peft_fcfs.is_paused(gen_c)
+        assert impl_fcfs.device_cached == {2}
+
+        # Two-page / two-slot FCFS ordering after STOP without preemption:
+        # [A (adapter 1, 1p, KV fails STOP), B (adapter 2, 1p, runnable),
+        #  C (paused decode, adapter 3, 2p)] -> A and B both reserve in Phase 1;
+        # A's STOP skips B in round 1, but B must NOT be marked failed and must
+        # be reconsidered and admitted ahead of younger decode C.
+        mgr_fcfs2 = make_kv_cache_manager(
+            can_evict=False,
+            prepare_context_fn=lambda req: req.py_request_id != 90,
+        )
+        peft_fcfs2, impl_fcfs2 = _make_peft_wrapper(
+            max_device_pages=2,
+            pages_per_task={1: 1, 2: 1, 3: 2},
+            initial_active={1: {90}, 2: {91}, 3: {92}},
+        )
+        sched_fcfs2 = make_scheduler(mgr_fcfs2, max_batch_size=2, peft_cache_manager=peft_fcfs2)
+        ctx_a2 = _init_lora_req(
+            make_ctx_request(90, 64, is_first_context_chunk=False, lora_task_id=1)
+        )
+        mgr_fcfs2.kv_cache_map[90].is_active = False
+        peft_fcfs2.pause_request(ctx_a2)
+        ctx_b2 = _init_lora_req(
+            make_ctx_request(91, 64, is_first_context_chunk=False, lora_task_id=2)
+        )
+        mgr_fcfs2.kv_cache_map[91].is_active = False
+        peft_fcfs2.pause_request(ctx_b2)
+        gen_c2 = _init_lora_req(make_gen_request(92, lora_task_id=3))
+        mgr_fcfs2.kv_cache_map[92].is_active = False
+        peft_fcfs2.pause_request(gen_c2)
+        impl_fcfs2.device_cached.clear()
+
+        out_fcfs2 = sched_fcfs2.schedule_request([ctx_a2, ctx_b2, gen_c2], set())
+        assert ids(out_fcfs2.context_requests) == [91]
+        assert out_fcfs2.generation_requests == []
+        peft_fcfs2.prepare_resources(out_fcfs2)
+        assert not peft_fcfs2.is_paused(ctx_b2)
+        assert peft_fcfs2.is_paused(gen_c2)
+        assert impl_fcfs2.device_cached == {2}
+
+        # Shared-adapter 2-page / 3-slot case: [A (adapter 1, KV fails STOP),
+        # B (adapter 2, runnable), C (paused decode sharing adapter 2)].
+        # A's STOP without preemption must not skip B even though C already
+        # shares B's adapter; both B and C run in the same pass.
+        mgr_shared = make_kv_cache_manager(
+            can_evict=False,
+            prepare_context_fn=lambda req: req.py_request_id != 100,
+        )
+        peft_shared, impl_shared = _make_peft_wrapper(
+            max_device_pages=2,
+            initial_active={1: {100}, 2: {101, 102}},
+        )
+        sched_shared = make_scheduler(mgr_shared, max_batch_size=3, peft_cache_manager=peft_shared)
+        ctx_a3 = _init_lora_req(
+            make_ctx_request(100, 64, is_first_context_chunk=False, lora_task_id=1)
+        )
+        mgr_shared.kv_cache_map[100].is_active = False
+        peft_shared.pause_request(ctx_a3)
+        ctx_b3 = _init_lora_req(
+            make_ctx_request(101, 64, is_first_context_chunk=False, lora_task_id=2)
+        )
+        mgr_shared.kv_cache_map[101].is_active = False
+        peft_shared.pause_request(ctx_b3)
+        gen_c3 = _init_lora_req(make_gen_request(102, lora_task_id=2))
+        mgr_shared.kv_cache_map[102].is_active = False
+        peft_shared.pause_request(gen_c3)
+        impl_shared.device_cached.clear()
+
+        out_shared = sched_shared.schedule_request([ctx_a3, ctx_b3, gen_c3], set())
+        assert ids(out_shared.context_requests) == [101]
+        assert ids(out_shared.generation_requests) == [102]
+        peft_shared.prepare_resources(out_shared)
+        assert not peft_shared.is_paused(ctx_b3)
+        assert not peft_shared.is_paused(gen_c3)
+        assert impl_shared.device_cached == {2}
+
+    def test_failed_reserved_paused_context_trips_deadlock_detector(self) -> None:
+        """A lone PEFT-paused started context whose KV resume always fails or
+        whose token requirement exceeds max_num_tokens must still count as a
+        context candidate in _detect_deadlock."""
+        mgr = make_kv_cache_manager(
+            can_evict=True,
+            prepare_context_fn=lambda _req: False,
+            has_cache_tier_below_gpu=False,
+        )
+        peft, impl = _make_peft_wrapper(max_device_pages=1, initial_active={1: {0}})
+        sched = make_scheduler(mgr, max_batch_size=2, peft_cache_manager=peft)
+        sched._DEADLOCK_STALL_ITERS = 3
+
+        paused_ctx = _init_lora_req(
+            make_ctx_request(0, 64, is_first_context_chunk=False, lora_task_id=1)
+        )
+        mgr.kv_cache_map[0].is_active = False
+        peft.pause_request(paused_ctx)
+        impl.device_cached.clear()
+
+        for _ in range(2):
+            out = sched.schedule_request([paused_ctx], set())
+            assert out.context_requests == []
+            assert out.generation_requests == []
+        with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
+            sched.schedule_request([paused_ctx], set())
+
+        # Pre-reservation token-budget stall (rejected before reserving PEFT).
+        mgr_small = make_kv_cache_manager(can_evict=False, has_cache_tier_below_gpu=False)
+        peft_small, impl_small = _make_peft_wrapper(max_device_pages=1, initial_active={1: {1}})
+        sched_small = make_scheduler(
+            mgr_small, max_batch_size=2, max_num_tokens=32, peft_cache_manager=peft_small
+        )
+        sched_small._DEADLOCK_STALL_ITERS = 3
+        oversized_ctx = _init_lora_req(
+            make_ctx_request(1, 64, is_first_context_chunk=False, lora_task_id=1)
+        )
+        mgr_small.kv_cache_map[1].is_active = False
+        peft_small.pause_request(oversized_ctx)
+        impl_small.device_cached.clear()
+
+        for _ in range(2):
+            out = sched_small.schedule_request([oversized_ctx], set())
+            assert out.context_requests == []
+        with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
+            sched_small.schedule_request([oversized_ctx], set())
+
+    def test_reserved_paused_context_and_phase2b_share_inforward_snapshot_budget(self) -> None:
+        """Snapshot rows consumed by a reserved paused context in Phase 2a must
+        not be reset before Phase 2b schedules ordinary context requests."""
+        prompt = 4000
+        mgr = make_kv_cache_manager(tokens_per_block=32, can_evict=True)
+        mgr.inforward_snapshot_rows = 1
+        mgr.inforward_snapshot_max_tail = 16
+        mgr.inforward_snapshot_min_main = 3
+        peft, impl = _make_peft_wrapper(max_device_pages=2, initial_active={1: {0}})
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=3 * prompt,
+            peft_cache_manager=peft,
+            ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 256),
+        )
+
+        reserved_ctx = _init_lora_req(
+            make_ctx_request(0, prompt, is_first_context_chunk=False, lora_task_id=1)
+        )
+        reserved_ctx.context_current_position = 0
+        reserved_ctx.prompt_len = prompt
+        reserved_ctx.expect_snapshot_points = [prompt - 2]
+        reserved_ctx.py_multimodal_data = None
+        reserved_ctx.py_mamba_inforward_snapshot_point = None
+        mgr.kv_cache_map[0].is_active = False
+        peft.pause_request(reserved_ctx)
+        impl.device_cached.clear()
+
+        ordinary_ctx = make_ctx_request(1, prompt, is_first_context_chunk=True)
+        ordinary_ctx.context_current_position = 0
+        ordinary_ctx.prompt_len = prompt
+        ordinary_ctx.expect_snapshot_points = [prompt - 2]
+        ordinary_ctx.py_multimodal_data = None
+        ordinary_ctx.py_mamba_inforward_snapshot_point = None
+
+        out = sched.schedule_request([reserved_ctx, ordinary_ctx], set())
+        assert sorted(ids(out.context_requests)) == [0, 1]
+        # Only 1 staging row exists: Phase 2a takes it for req 0, so Phase 2b
+        # must leave req 1 split at the snapshot boundary.
+        assert reserved_ctx.py_mamba_inforward_snapshot_point == prompt - 2
+        assert ordinary_ctx.py_mamba_inforward_snapshot_point is None
+
+    def test_prioritize_first_token_retries_blocked_disagg_init_after_failed_ctx_reserve(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Under TLLM_DISAGG_GEN_PRIORITIZE_FIRST_TOKEN, if an older paused
+        started context holds paused_peft_barrier in Phase 1 and then fails KV
+        in Phase 2a, the blocked DISAGG_GENERATION_INIT behind it is retried
+        in Phase 1b with the failed context excluded from the barrier."""
+        monkeypatch.setenv("TLLM_DISAGG_GEN_PRIORITIZE_FIRST_TOKEN", "1")
+        mgr = make_kv_cache_manager(
+            can_evict=False,
+            prepare_context_fn=lambda req: req.py_request_id != 0,
+        )
+        peft, impl = _make_peft_wrapper(max_device_pages=1, initial_active={1: {0}})
+        impl.host_cached.add(2)
+        sched = make_scheduler(mgr, max_batch_size=2, peft_cache_manager=peft)
+
+        paused_ctx = _init_lora_req(
+            make_ctx_request(0, 64, is_first_context_chunk=False, lora_task_id=1)
+        )
+        mgr.kv_cache_map[0].is_active = False
+        peft.pause_request(paused_ctx)
+        impl.device_cached.clear()
+
+        disagg_init = _init_lora_req(make_disagg_request(1, lora_task_id=2))
+        disagg_init.is_generation_only_request = True
+        disagg_init.py_decoding_iter = 0
+
+        out = sched.schedule_request([paused_ctx, disagg_init], set())
+        assert out.context_requests == []
+        assert ids(out.fitting_disagg_gen_init_requests) == [1]
+
+    def test_force_chunk_paused_context_reserves_minimum_legal_chunk(self) -> None:
+        """Under FORCE_CHUNK with a 16-token budget, an older paused context
+        needing a 16-token chunk must hold 16 tokens so a younger paused context
+        with a 1-token tail cannot steal 1 token and round the older chunk to 0.
+        When the next legal boundary is 1 token away, reserving 1 token still
+        allows both contexts to run within budget."""
+        mgr = make_kv_cache_manager(tokens_per_block=16, can_evict=True)
+        peft, impl = _make_peft_wrapper(max_device_pages=2, initial_active={1: {0}, 2: {1}})
+        sched = make_scheduler(
+            mgr,
+            max_batch_size=4,
+            max_num_tokens=16,
+            peft_cache_manager=peft,
+            ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 16),
+        )
+
+        older = _init_lora_req(
+            make_ctx_request(0, 32, is_first_context_chunk=False, lora_task_id=1)
+        )
+        older.context_current_position = 16
+        older.prompt_len = 48
+        older.expect_snapshot_points = []
+        mgr.kv_cache_map[0].is_active = False
+        peft.pause_request(older)
+
+        younger = _init_lora_req(
+            make_ctx_request(1, 1, is_first_context_chunk=False, lora_task_id=2)
+        )
+        younger.context_current_position = 31
+        younger.prompt_len = 32
+        younger.expect_snapshot_points = []
+        mgr.kv_cache_map[1].is_active = False
+        peft.pause_request(younger)
+        impl.device_cached.clear()
+
+        out = sched.schedule_request([older, younger], set())
+        assert ids(out.context_requests) == [0]
+        assert older.context_chunk_size == 16
+
+        # If the older context's next legal snapshot boundary is 1 token away,
+        # it reserves only 1 token, leaving room for a 1-token younger tail.
+        mgr2 = make_kv_cache_manager(tokens_per_block=16, can_evict=True)
+        peft2, impl2 = _make_peft_wrapper(max_device_pages=2, initial_active={1: {10}, 2: {11}})
+        sched2 = make_scheduler(
+            mgr2,
+            max_batch_size=4,
+            max_num_tokens=2,
+            peft_cache_manager=peft2,
+            ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 16),
+        )
+        snap_older = _init_lora_req(
+            make_ctx_request(10, 32, is_first_context_chunk=False, lora_task_id=1)
+        )
+        snap_older.context_current_position = 15
+        snap_older.prompt_len = 47
+        snap_older.expect_snapshot_points = [16]
+        mgr2.kv_cache_map[10].is_active = False
+        peft2.pause_request(snap_older)
+
+        tail_younger = _init_lora_req(
+            make_ctx_request(11, 1, is_first_context_chunk=False, lora_task_id=2)
+        )
+        tail_younger.context_current_position = 31
+        tail_younger.prompt_len = 32
+        tail_younger.expect_snapshot_points = []
+        mgr2.kv_cache_map[11].is_active = False
+        peft2.pause_request(tail_younger)
+        impl2.device_cached.clear()
+
+        out2 = sched2.schedule_request([snap_older, tail_younger], set())
+        assert ids(out2.context_requests) == [10, 11]
+        assert snap_older.context_chunk_size == 1
+        assert tail_younger.context_chunk_size == 1
+
     @pytest.mark.parametrize("newer_kind", ["gen", "started_ctx"])
     def test_newer_peft_paused_request_cannot_jump_older_multi_page_peft_waiter(
         self, newer_kind: str
