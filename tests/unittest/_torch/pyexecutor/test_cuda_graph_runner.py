@@ -349,6 +349,7 @@ def test_adp_graph_agreement_skips_inactive_ranks() -> None:
     runner.kv_regime_resolver = runner.packed_split_resolver = None
     runner.config = SimpleNamespace(
         enable_attention_dp=True,
+        skip_adp_count_gather=False,
         mapping=SimpleNamespace(tp_size=4),
         dist=SimpleNamespace(
             tp_allgather_int64=lambda row, active_only: np.array(

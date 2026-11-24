@@ -2166,7 +2166,13 @@ def _make_adp_ranks_at_shutdown(
 
     ranks = []
     for rank in range(2):
-        executor = _make_executor_with_kv_cache_manager(None)
+        # The ranks have no KV cache manager and no model: no KV cache capacity and no
+        # token-id range to check.
+        executor = PyExecutor.__new__(PyExecutor)
+        executor._kv_connector_deadlines = {}
+        executor._fetch_hint_enabled = False
+        executor._kv_cache_capacity = {}
+        executor._num_embeddings = None
         executor.enable_attention_dp = True
         executor.enable_iter_perf_stats = False
         executor._kv_load_tracker = KvLoadTracker(None, rank=rank, enabled=False)
@@ -5251,7 +5257,7 @@ def _prepared_gen_request(rid: int, py_result: PyResult, **disagg_params) -> typ
         py_decoding_iter=1,
         py_batch_idx=None,
         py_result=py_result,
-        cached_tokens=0,
+        reported_cached_tokens=0,
         py_draft_tokens=[],
         py_per_pos_drafted=[],
         py_per_pos_accepted=[],
