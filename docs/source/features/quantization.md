@@ -96,9 +96,21 @@ generation attention expands the selected tokens to FP8 rows. `fp8rope` requests
 records, which are expanded to FP8 rows where they cannot be read in place, and
 fails with a cache that does not support them.
 Servers that exchange KV caches, such as the context and generation servers of a
-disaggregated deployment, must use the same layout. `auto` follows the GPU, the
-installed CuTe DSL and `TLLM_FMHA_LIBS` of each server, so select `residual` or
-`fp8rope` explicitly when these differ between the servers.
+disaggregated deployment, must use the same layout. `auto` follows each server's
+cache configuration (including sparse KV cache offload, mixed-precision KV
+caches and the cache-manager version), GPU, installed CuTe DSL, Helix parallelism,
+and `TLLM_FMHA_LIBS`. If those automatic choices differ, explicitly select a
+layout supported by every exchanging server. For disaggregated NVFP4 DSA serving
+with generation-side sparse KV cache offload, setting
+`TRTLLM_NVFP4_MLA_KV_CACHE_LAYOUT=residual` on all context and generation servers
+resolves the `auto` layout mismatch, even on otherwise identical nodes.
+Exchanging servers must also use matching
+`TRTLLM_NVFP4_MLA_RESIDUAL_QUANTIZATION` settings (for example, leave the default
+`1` on every server), because this setting changes the residual cache's data and
+scale byte counts.
+Offloaded caches do not support `fp8rope`, so a resident worker that selects
+`fp8rope` under `auto` would otherwise use a different representation. If `auto`
+already selects `residual` on every worker, no explicit override is needed.
 
 #### MLA Latent Scale for Quantized KV Caches
 
