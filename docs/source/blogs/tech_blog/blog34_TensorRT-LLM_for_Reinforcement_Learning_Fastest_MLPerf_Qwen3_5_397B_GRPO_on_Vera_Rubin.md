@@ -24,6 +24,7 @@ By NVIDIA TensorRT LLM team
   - [Faster GDN Decode and Prefill (for 1,024 GPUs)](#faster-gdn-decode-and-prefill-for-1024-gpus)
   - [Shard-to-Shard Weight Refit in NeMo RL (for All Scales)](#shard-to-shard-weight-refit-in-nemo-rl-for-all-scales)
 - [How to Reproduce](#how-to-reproduce)
+- [Future Work](#future-work)
 - [Acknowledgements](#acknowledgements)
 - [References](#references)
 
@@ -42,9 +43,7 @@ In large-scale RL training, rollout is often the bottleneck: the throughput of t
   <img src="../media/tech_blog34_mlperf_56gpu_time_to_train.png" alt="Bar chart of Qwen3.5 397B GRPO time to train at 56 accelerators in MLPerf Training v6.1, with a legend: the NVIDIA Vera Rubin result with NeMo RL and TensorRT LLM, in green, ranks first at 28.47 min, ahead of four slower results from other submissions, in gray, between about 40 and 43 min. Each bar is labeled with its hardware (NVIDIA Rubin, GB300 or GB200) and its MLCommons submission ID" width="1000">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 1: Time to train at the same scale of 56 accelerators in the Qwen3.5 397B GRPO benchmark. NVIDIA Vera Rubin with NeMo RL and TensorRT LLM (in green) ranks first at 28.47 minutes. Source: <a href="https://results.mlcommons.org/training#benchmark=qwen35_397b_grpo&amp;round=v6.1">MLCommons MLPerf Training v6.1 results</a> (<a href="https://results.mlcommons.org/training#view=submission&amp;benchmark=qwen35_397b_grpo&amp;rid=6.1-0119%3Aqwen35_397b_grpo">submission details</a>).</em></sub></p>
-
-<p align="center"><sub>MLPerf Training v6.1 Closed division results retrieved from www.mlcommons.org on Nov 23, 2026, from the following entries: 6.1-0119, 6.1-0018, 6.1-0032, 6.1-0051 and 6.1-0017. The MLPerf name and logo are trademarks of MLCommons Association in the United States and other countries. All rights reserved. Unauthorized use is strictly prohibited. See <a href="https://www.mlcommons.org">www.mlcommons.org</a> for more information.</sub></p>
+<p align="center"><sub><em>Figure 1: Time to train at the same scale of 56 accelerators in the Qwen3.5 397B GRPO benchmark. NVIDIA Vera Rubin with NeMo RL and TensorRT LLM (in green) ranks first at 28.47 minutes. Source: <a href="https://results.mlcommons.org/training#benchmark=qwen35_397b_grpo&amp;round=v6.1">MLCommons MLPerf Training v6.1 results</a> (<a href="https://results.mlcommons.org/training#view=submission&amp;benchmark=qwen35_397b_grpo&amp;rid=6.1-0119%3Aqwen35_397b_grpo">submission details</a>).<sup>1</sup></em></sub></p>
 
 On NVIDIA Vera Rubin, **submissions that use TensorRT LLM as the rollout engine rank first at 56, 64 and 1,024 GPUs**. For example, a Nebius submission ([6.1-0135](https://results.mlcommons.org/training#view=submission&benchmark=qwen35_397b_grpo&rid=6.1-0135%3Aqwen35_397b_grpo)) using NeMo RL and TensorRT LLM reached 24.82 minutes at 64 GPUs (Figure 2).
 
@@ -54,9 +53,7 @@ On NVIDIA Vera Rubin, **submissions that use TensorRT LLM as the rollout engine 
 </figure>
 </div>
 
-<p align="center"><sub><em>Figure 2: Time to train on NVIDIA Vera Rubin GPUs with different rollout engines in the Qwen3.5 397B GRPO benchmark, grouped by accelerator count (56, 64 and 1,024 GPUs), showing the fastest result for each rollout engine. Gray bars are other NVIDIA submissions that also use NeMo RL with a different rollout engine. See all submission results for the GRPO track in the <a href="https://results.mlcommons.org/training#benchmark=qwen35_397b_grpo&amp;round=v6.1">MLPerf Training v6.1 results</a>.</em></sub></p>
-
-<p align="center"><sub>MLPerf Training v6.1 Closed division results retrieved from www.mlcommons.org on Nov 23, 2026, from the following entries: 6.1-0119, 6.1-0135, 6.1-0122, 6.1-0117 and 6.1-0118. The MLPerf name and logo are trademarks of MLCommons Association in the United States and other countries. All rights reserved. Unauthorized use is strictly prohibited. See <a href="https://www.mlcommons.org">www.mlcommons.org</a> for more information.</sub></p>
+<p align="center"><sub><em>Figure 2: Time to train on NVIDIA Vera Rubin GPUs with different rollout engines in the Qwen3.5 397B GRPO benchmark, grouped by accelerator count (56, 64 and 1,024 GPUs), showing the fastest result for each rollout engine. Gray bars are other NVIDIA submissions that also use NeMo RL with a different rollout engine. See all submission results for the GRPO track in the <a href="https://results.mlcommons.org/training#benchmark=qwen35_397b_grpo&amp;round=v6.1">MLPerf Training v6.1 results</a>.<sup>1</sup></em></sub></p>
 
 The other performance numbers in this post, such as the percentage gains, timings and rollout breakdowns, are NVIDIA internal measurements. They are not MLPerf results and have not been verified by MLCommons.
 
@@ -187,6 +184,10 @@ The configs and instructions for all three Rubin recipes are in our [MLPerf Trai
 | [6.1-0121](https://results.mlcommons.org/training#view=submission&benchmark=qwen35_397b_grpo&rid=6.1-0121%3Aqwen35_397b_grpo) | 64 GPUs | [`hecate_ngpu64_nemo_rl_trtllm`](https://github.com/mlcommons/training_results_v6.1/tree/main/NVIDIA/benchmarks/qwen35_397b_grpo/implementations/hecate_ngpu64_nemo_rl_trtllm) | `config_VR_16x4_t8g8_tp4pp2ep16_2p8d16_mxfp8.sh` |
 | [6.1-0117](https://results.mlcommons.org/training#view=submission&benchmark=qwen35_397b_grpo&rid=6.1-0117%3Aqwen35_397b_grpo) | 1,024 GPUs | [`hecate_ngpu1024_nemo_rl_trtllm`](https://github.com/mlcommons/training_results_v6.1/tree/main/NVIDIA/benchmarks/qwen35_397b_grpo/implementations/hecate_ngpu1024_nemo_rl_trtllm) | `config_VR_256x4_t64g192_tp4pp2ep32gtp8_mxfp8.sh` |
 
+## Future Work
+
+Looking ahead, we plan to extend TensorRT LLM's role in RL training. In the near term, our priorities are end-to-end NVFP4 support for RL and working toward zero logprob mismatch between training and rollout, with minimal performance penalty. We also plan to support more RL algorithms. If you are building RL on TensorRT LLM and have requirements we should know about, tell us by [opening an issue on GitHub](https://github.com/NVIDIA/TensorRT-LLM/issues).
+
 ## Acknowledgements
 
 This is a joint effort across NVIDIA, spanning the TensorRT LLM, NeMo RL and MLPerf teams. We also thank the MLCommons MLPerf Training committees. We thank everyone for their contributions.
@@ -200,3 +201,5 @@ This is a joint effort across NVIDIA, spanning the TensorRT LLM, NeMo RL and MLP
 - [TensorRT LLM Ray orchestrator](https://nvidia.github.io/TensorRT-LLM/features/ray-orchestrator.html)
 - [NVIDIA NeMo RL](https://github.com/NVIDIA-NeMo/RL)
 - [NVIDIA NeMo Gym](https://github.com/NVIDIA-NeMo/gym)
+
+<sup>1</sup> MLPerf Training v6.1 Closed division results retrieved from www.mlcommons.org on Nov 23, 2026, from the following entries: 6.1-0017, 6.1-0018, 6.1-0032, 6.1-0051, 6.1-0117, 6.1-0118, 6.1-0119, 6.1-0121, 6.1-0122 and 6.1-0135. The MLPerf name and logo are trademarks of MLCommons Association in the United States and other countries. All rights reserved. Unauthorized use is strictly prohibited. See [www.mlcommons.org](https://www.mlcommons.org) for more information.
