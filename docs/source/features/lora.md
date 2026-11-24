@@ -12,6 +12,7 @@ LoRA (Low-Rank Adaptation) is a parameter-efficient fine-tuning technique that e
    - [NeMo LoRA Format](#nemo-lora-format)
    - [Routed-Expert MoE LoRA](#routed-expert-moe-lora)
    - [Cache Management](#cache-management)
+   - [CUDA Graph Adapter Capacity](#cuda-graph-adapter-capacity)
    - [Options for Performance Tuning](#options-for-performance-tuning)
 4. [TRTLLM serve with LoRA](#trtllm-serve-with-lora)
    - [YAML Configuration](#yaml-configuration)
@@ -268,6 +269,13 @@ llm = LLM(
 )
 ```
 
+### CUDA Graph Adapter Capacity
+
+When deploying LoRA with CUDA graphs, set `LoraConfig.max_loras` to at least the maximum number of distinct
+adapters that requests may use concurrently (requests sharing the same LoRA task ID count as one adapter).
+When unset, the graph has 8 adapter slots. If a decode batch uses more distinct adapters than available
+slots, all requests in that batch fail.
+
 ### Options for Performance Tuning
 
 `LoraConfig` exposes several options for performance tuning depending on the user's workload. The first is `overlap_lora_and_base`:
@@ -301,7 +309,9 @@ Create a `config.yaml` file:
 lora_config:
   lora_target_modules: ['attn_q', 'attn_k', 'attn_v']
   max_lora_rank: 8
+  max_loras: 16  # Provision for up to 16 distinct adapters used concurrently.
 ```
+
 ### Starting the Server
 ```bash
 python -m tensorrt_llm.commands.serve
