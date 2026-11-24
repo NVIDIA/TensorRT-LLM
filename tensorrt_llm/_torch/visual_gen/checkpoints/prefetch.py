@@ -42,19 +42,22 @@ def _local_prefetch_context() -> tuple[int, int, int]:
 
     Host page-cache sharing follows host membership, not the number of visible
     GPUs or global ranks. Gathering host identities also supports interleaved
-    ranks and launchers that do not export LOCAL_WORLD_SIZE.
+    ranks and launchers that do not export LOCAL_WORLD_SIZE. GROUP_RANK (torchrun)
+    or SLURM_NODEID distinguishes nodes with identical container hostnames.
+    Without a launcher node ID, distinct nodes must report distinct hostnames.
     """
     available_memory = int(psutil.virtual_memory().available)
     if not _dist_initialized() or dist.get_world_size() == 1:
         return 0, 1, available_memory
 
     hostname = socket.gethostname()
-    gathered: list[tuple[str, int] | None] = [None] * dist.get_world_size()
-    dist.all_gather_object(gathered, (hostname, available_memory))
+    node = (os.environ.get("GROUP_RANK", os.environ.get("SLURM_NODEID")), hostname)
+    gathered: list[tuple[tuple[str | None, str], int] | None] = [None] * dist.get_world_size()
+    dist.all_gather_object(gathered, (node, available_memory))
     local_ranks = [
-        rank for rank, entry in enumerate(gathered) if entry is not None and entry[0] == hostname
+        rank for rank, entry in enumerate(gathered) if entry is not None and entry[0] == node
     ]
-    local_memory = [entry[1] for entry in gathered if entry is not None and entry[0] == hostname]
+    local_memory = [entry[1] for entry in gathered if entry is not None and entry[0] == node]
     return local_ranks.index(dist.get_rank()), len(local_ranks), min(local_memory)
 
 

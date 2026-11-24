@@ -13,7 +13,19 @@ from tensorrt_llm._torch.visual_gen.checkpoints import prefetch
 pytestmark = pytest.mark.cpu_only
 
 
-def _distributed(monkeypatch, rank, hosts, memory):
+def _distributed(
+    monkeypatch: pytest.MonkeyPatch,
+    rank: int,
+    hosts: list[str],
+    memory: list[int],
+    node_ids: list[str] | None = None,
+    node_env: str = "GROUP_RANK",
+) -> list[str]:
+    monkeypatch.delenv("GROUP_RANK", raising=False)
+    monkeypatch.delenv("SLURM_NODEID", raising=False)
+    if node_ids is not None:
+        monkeypatch.setenv(node_env, node_ids[rank])
+    nodes = list(zip(node_ids or [None] * len(hosts), hosts))
     calls = []
     monkeypatch.setattr(prefetch.dist, "is_available", lambda: True)
     monkeypatch.setattr(prefetch.dist, "is_initialized", lambda: True)
@@ -24,10 +36,13 @@ def _distributed(monkeypatch, rank, hosts, memory):
         prefetch.psutil, "virtual_memory", lambda: SimpleNamespace(available=memory[rank])
     )
 
-    def gather(output, value):
-        assert value == (hosts[rank], memory[rank])
+    def gather(
+        output: list[tuple[tuple[str | None, str], int] | None],
+        value: tuple[tuple[str | None, str], int],
+    ) -> None:
+        assert value == (nodes[rank], memory[rank])
         calls.append("gather")
-        output[:] = list(zip(hosts, memory))
+        output[:] = list(zip(nodes, memory))
 
     monkeypatch.setattr(prefetch.dist, "all_gather_object", gather)
     monkeypatch.setattr(prefetch.dist, "barrier", lambda: calls.append("barrier"))
@@ -35,7 +50,7 @@ def _distributed(monkeypatch, rank, hosts, memory):
 
 
 @pytest.fixture
-def shards(tmp_path):
+def shards(tmp_path: Path) -> list[str]:
     paths = []
     for i in range(8):
         path = tmp_path / f"shard-{i}"
@@ -45,7 +60,9 @@ def shards(tmp_path):
 
 
 @pytest.mark.parametrize("interleaved", [False, True])
-def test_prefetch_covers_every_shard_on_every_host(monkeypatch, shards, interleaved):
+def test_prefetch_covers_every_shard_on_every_host(
+    monkeypatch: pytest.MonkeyPatch, shards: list[str], interleaved: bool
+) -> None:
     hosts = [f"node-{i // 4}" for i in range(72)]
     if interleaved:
         hosts = [f"node-{i % 18}" for i in range(72)]
@@ -63,7 +80,9 @@ def test_prefetch_covers_every_shard_on_every_host(monkeypatch, shards, interlea
         assert sorted(paths) == sorted(shards)
 
 
-def test_memory_limit_uses_only_actual_node_peers(monkeypatch, shards):
+def test_memory_limit_uses_only_actual_node_peers(
+    monkeypatch: pytest.MonkeyPatch, shards: list[str]
+) -> None:
     hosts = ["a", "b", "a", "b"]
     memory = [10000, 1, 9000, 1]
     for rank in range(4):
@@ -78,7 +97,9 @@ def test_memory_limit_uses_only_actual_node_peers(monkeypatch, shards):
 
 @pytest.mark.parametrize("cached", [False, True])
 @pytest.mark.parametrize("empty", [False, True])
-def test_cache_hits_and_empty_inputs_keep_collective_sequence(monkeypatch, shards, cached, empty):
+def test_cache_hits_and_empty_inputs_keep_collective_sequence(
+    monkeypatch: pytest.MonkeyPatch, shards: list[str], cached: bool, empty: bool
+) -> None:
     calls = _distributed(monkeypatch, 0, ["a", "b"], [10000, 10000])
     cache = set(shards) if cached else set()
     reads = []
@@ -90,7 +111,9 @@ def test_cache_hits_and_empty_inputs_keep_collective_sequence(monkeypatch, shard
     assert calls == ["gather", "barrier"]
 
 
-def test_cache_filter_does_not_change_shard_ownership(monkeypatch, shards):
+def test_cache_filter_does_not_change_shard_ownership(
+    monkeypatch: pytest.MonkeyPatch, shards: list[str]
+) -> None:
     reads = []
     for rank, cache in enumerate([{shards[0]}, {shards[2]}]):
         _distributed(monkeypatch, rank, ["a", "a"], [10000, 10000])
@@ -109,11 +132,13 @@ def test_cache_filter_does_not_change_shard_ownership(monkeypatch, shards):
 
 
 @pytest.mark.parametrize("ignore_errors", [False, True])
-def test_read_failure_does_not_cache_unread_shards(monkeypatch, shards, ignore_errors):
+def test_read_failure_does_not_cache_unread_shards(
+    monkeypatch: pytest.MonkeyPatch, shards: list[str], ignore_errors: bool
+) -> None:
     calls = _distributed(monkeypatch, 0, ["a", "b"], [10000, 10000])
     cache = set()
 
-    def fail(path, description):
+    def fail(path: str, description: str) -> None:
         raise OSError("injected read failure")
 
     monkeypatch.setattr(prefetch, "_prefetch_file", fail)
@@ -130,7 +155,9 @@ def test_read_failure_does_not_cache_unread_shards(monkeypatch, shards, ignore_e
     assert calls == ["gather", "barrier"]
 
 
-def test_single_process_prefetch_reads_files(monkeypatch, shards):
+def test_single_process_prefetch_reads_files(
+    monkeypatch: pytest.MonkeyPatch, shards: list[str]
+) -> None:
     monkeypatch.setattr(prefetch.dist, "is_initialized", lambda: False)
     monkeypatch.setattr(prefetch.psutil, "virtual_memory", lambda: SimpleNamespace(available=10000))
     cache = set()
@@ -143,7 +170,9 @@ def test_single_process_prefetch_reads_files(monkeypatch, shards):
     assert prefetch.prefetch_files_to_host_cache(shards, description="test", prefetched_paths=cache)
 
 
-def test_uneven_host_membership_ignores_stale_launcher_size(monkeypatch):
+def test_uneven_host_membership_ignores_stale_launcher_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     hosts = ["a", "b", "a", "c", "a", "b"]
     memory = [1000, 400, 900, 1, 800, 500]
     expected = [(0, 3, 800), (0, 2, 400), (1, 3, 800), (0, 1, 1), (2, 3, 800), (1, 2, 400)]
@@ -151,3 +180,24 @@ def test_uneven_host_membership_ignores_stale_launcher_size(monkeypatch):
     for rank, context in enumerate(expected):
         _distributed(monkeypatch, rank, hosts, memory)
         assert prefetch._local_prefetch_context() == context
+
+
+@pytest.mark.parametrize("node_env", ["GROUP_RANK", "SLURM_NODEID"])
+def test_shared_hostnames_keep_launcher_nodes_separate(
+    monkeypatch: pytest.MonkeyPatch, shards: list[str], node_env: str
+) -> None:
+    hosts = ["shared-container"] * 8
+    node_ids = [str(rank // 4) for rank in range(8)]
+    memory = [10000] * 4 + [9000] * 4
+    covered: dict[str, list[str]] = {"0": [], "1": []}
+    for rank, node_id in enumerate(node_ids):
+        calls = _distributed(monkeypatch, rank, hosts, memory, node_ids, node_env)
+        assert prefetch._local_prefetch_context() == (rank % 4, 4, memory[rank])
+        calls.clear()
+        monkeypatch.setattr(
+            prefetch, "_prefetch_file", lambda path, _: covered[node_id].append(path)
+        )
+        assert prefetch.prefetch_files_to_host_cache(shards, description="shared hostname")
+        assert calls == ["gather", "barrier"]
+    for paths in covered.values():
+        assert sorted(paths) == sorted(shards)
