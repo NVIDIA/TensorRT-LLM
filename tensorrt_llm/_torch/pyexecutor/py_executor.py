@@ -4649,6 +4649,14 @@ class PyExecutor:
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
         CUASSERT(cudart.cudaSetDevice(self.device_id))
+        # Ranks receiving a schedule run their scheduler outside the traced _schedule.
+        schedule_local = traced_schedule = None
+        if not self._pp_rank_schedules():
+            schedule_local = self.scheduler.schedule_request
+            if custom_region_enabled("workflow"):
+                traced_schedule = record_workflow_scope("trtllm::schedule")(
+                    schedule_local)
+        profiler_enabled = torch.autograd._profiler_enabled
         microbatch_id = 0
         with self._profiler() as profile_step, self.hang_detector:
             iter_start_time = time.time()
@@ -4692,15 +4700,18 @@ class PyExecutor:
                 # Stage 0: first PP rank schedules requests and propagates the result to all other PP ranks.
                 (scheduled_batch, fitting_disagg_gen_init_requests, _,
                  _) = self._pp_schedule_and_propagate(microbatch_id)
-                if not self._pp_rank_schedules():
+                if schedule_local is not None:
                     # Retry until current rank can run first PP's schedule result.
                     self._pp_retry_until_can_schedule(scheduled_batch)
                     # Run scheduler locally because scheduler may change llm requests' state.
                     if self.kv_cache_manager is not None:
                         self.kv_cache_manager.prepare_expect_snapshot_points(
                             self.active_requests)
-                    local_scheduler_output = self.scheduler.schedule_request(
-                        self.active_requests, self.inflight_req_ids)
+                    schedule = schedule_local
+                    if traced_schedule is not None and profiler_enabled():
+                        schedule = traced_schedule
+                    local_scheduler_output = schedule(self.active_requests,
+                                                      self.inflight_req_ids)
                     local_disagg_candidates = getattr(
                         local_scheduler_output,
                         "fitting_disagg_gen_init_requests", [])
@@ -8664,7 +8675,7 @@ class PyExecutor:
                     with self.perf_manager.record_perf_events(
                             gpu_forward_start, gpu_forward_end) as fwd_timing:
                         self._stage_mark('pre_forward')
-                        with self._step_scope(scheduled_batch):
+                        with self._step_scope(scheduled_batch) as forward_scope:
                             batch_outputs = self._forward_step(
                                 scheduled_batch, previous_tensors_device)
 
@@ -8775,7 +8786,11 @@ class PyExecutor:
                             sample_stream
                     ), self.perf_manager.record_perf_events(
                             None, gpu_sample_end) as sample_timing:
-                        with self._step_scope(scheduled_batch, phase="sample"):
+                        # Forward can consume the batch's replay rows. Keep its original label.
+                        sample_scope = (nullcontext() if forward_scope is None
+                                        else torch.profiler.record_function(
+                                            f"{forward_scope.name} sample"))
+                        with sample_scope:
                             if self.guided_decoder is not None:
                                 # add_batch must be called again to have updated new tokens.
                                 self.guided_decoder.add_batch(scheduled_batch)

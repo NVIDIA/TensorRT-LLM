@@ -866,6 +866,36 @@ def test_pp_loop_call_propagates_actual_slot(
     assert fields["workflow.executor.iteration"] == 6
 
 
+@pytest.mark.parametrize("rank", [0, 1])
+def test_pp_loop_profiles_local_schedule_once(monkeypatch: pytest.MonkeyPatch, rank: int) -> None:
+    """Each pipeline rank records exactly one scope around its scheduler call."""
+    owner = _pp_executor(monkeypatch, [], rank=rank)
+    del owner._schedule  # Restore the production scheduling path on the leading rank.
+    owner.ctx_decoder_batcher = None
+    owner.kv_cache_manager = Mock(spec=[])
+    owner.scheduler = Mock()
+    owner.scheduler.can_schedule.return_value = True
+
+    def schedule_request(*args: object) -> None:
+        with torch.profiler.record_function("test::local_scheduler"):
+            raise RuntimeError("stop at local scheduler")
+
+    owner.scheduler.schedule_request.side_effect = schedule_request
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as trace:
+        with pytest.raises(RuntimeError, match="stop at local scheduler"):
+            owner._executor_loop_pp()
+
+    owner.scheduler.schedule_request.assert_called_once_with(
+        owner.active_requests, owner.inflight_req_ids
+    )
+    events = trace.events()
+    scopes = [event for event in events if event.name == "trtllm::schedule"]
+    assert len(scopes) == int(profiler.custom_region_enabled("workflow"))
+    if scopes:
+        local = next(event for event in events if event.name == "test::local_scheduler")
+        assert local.cpu_parent is scopes[0]
+
+
 @pytest.mark.parametrize("last_pp_rank", [False, True])
 def test_executor_pp_loop_passes_consecutive_slots(
     monkeypatch: pytest.MonkeyPatch, last_pp_rank: bool
@@ -1122,6 +1152,39 @@ def test_encoder_replay_rows_agree_in_metadata_phase_and_step_label() -> None:
     fields = py_executor._forward_workflow_metadata(owner, batch)
     assert fields["workflow.batch.scheduled_context_tokens"] == 5
     assert fields["workflow.batch.live_context_tokens"] == 3
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_overlap_sampling_uses_forward_replay_label(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool
+) -> None:
+    """Keep the pre-forward recovery count in both active overlap annotations."""
+    from _torch.misc.test_guided_decoder_errors import _loop_executor
+
+    from tensorrt_llm._torch.pyexecutor.ced_replay import EncoderReplay
+
+    replay = EncoderReplay(request_id=1, cache_identity=7, global_end=9, start=0)
+    batch = py_executor.ScheduledRequests()
+    batch.context_requests_chunking = [_request(context_chunk_size=3, py_ced_replay=replay)]
+    batch.batch_no = 1
+    owner = _loop_executor(monkeypatch, None, [batch], [])
+    del owner._step_scope, owner._build_step_scope_label  # Use the real profiling hooks.
+    owner._profile_controller = SimpleNamespace(enabled=enabled)
+    build_label = Mock(wraps=owner._build_step_scope_label)
+    owner._build_step_scope_label = build_label
+
+    def forward(*args: object) -> dict:
+        replay.consumed = True
+        return {}
+
+    owner._forward_step = forward
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as trace:
+        owner._executor_loop_overlap()
+    labels = [event.name for event in trace.events() if event.name.startswith("step[")]
+    assert labels == (
+        ["step[EXTEND bs=1 toks=12]", "step[EXTEND bs=1 toks=12] sample"] if enabled else []
+    )
+    assert build_label.call_count == int(enabled)
 
 
 def test_live_workflow_counts_use_request_dummy_contract() -> None:
