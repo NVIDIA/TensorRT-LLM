@@ -1039,6 +1039,10 @@ class MPIDist(Distributed):
             return mpi_recv(buf, src, tag)
 
     def send_object(self, obj: object, dest: int, tag: int = 0) -> None:
+        if (not custom_region_enabled("mpi")
+                or not torch.autograd._profiler_enabled()):
+            mpi_send_object(obj, dest, tag)
+            return
         with self._record_mpi("send_object",
                               direction="send",
                               payload=obj,
@@ -1050,6 +1054,9 @@ class MPIDist(Distributed):
                      obj: object,
                      dest: int,
                      tag: int = 0) -> MPI.Request | None:
+        if (not custom_region_enabled("mpi")
+                or not torch.autograd._profiler_enabled()):
+            return mpi_isend_object(obj, dest, tag)
         with self._record_mpi("isend_object",
                               direction="send",
                               payload=obj,
@@ -1058,6 +1065,9 @@ class MPIDist(Distributed):
             return mpi_isend_object(obj, dest, tag)
 
     def recv_object(self, src: int, tag: int = 0) -> object:
+        if (not custom_region_enabled("mpi")
+                or not torch.autograd._profiler_enabled()):
+            return mpi_recv_object(src, tag)
         with self._record_mpi("recv_object",
                               direction="recv",
                               peer=src,
