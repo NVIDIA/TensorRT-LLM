@@ -138,6 +138,61 @@ def save_triage_records(
         print(f"Failed to save some triage records for {scan_type}", file=sys.stderr)
 
 
+def get_reported(scan_type: str, branch: str) -> set:
+    """Return {(package_name, package_version)} of risks (vulnerability or license) already reported.
+
+    Reads the "reported" records written by save_reported.
+    """
+    filters = [
+        {"term": {"s_type": "reported"}},
+        {"term": {"s_scan_type": scan_type}},
+        {"term": {"s_branch": branch}},
+    ]
+    try:
+        resp = ES_CLIENT.search(
+            index=ES_INDEX_BASE + "-*",
+            body={
+                "size": 10000,
+                "query": {"bool": {"filter": filters}},
+                "_source": ["s_package_name", "s_package_version"],
+            },
+        )
+    except Exception as exc:
+        print(f"Failed to query reported risks for {scan_type}: {exc}", file=sys.stderr)
+        return set()
+    return {
+        (hit["_source"].get("s_package_name"), hit["_source"].get("s_package_version"))
+        for hit in resp["hits"]["hits"]
+    }
+
+
+def save_reported(
+    post_url: str, scan_type: str, branch: str, ts_created: int, risk_docs: list
+) -> None:
+    """Mark risks as reported, keyed by package name and version."""
+    keys = {
+        (doc.get("s_package_name"), doc.get("s_package_version"))
+        for doc in risk_docs
+        if doc.get("s_package_name")
+    }
+    docs = [
+        {
+            "s_type": "reported",
+            "s_scan_type": scan_type,
+            "s_branch": branch,
+            "ts_created": ts_created,
+            "s_package_name": name,
+            "s_package_version": version,
+        }
+        for name, version in sorted(keys, key=str)
+    ]
+    if not docs:
+        return
+    _, errors = es_post(post_url, docs)
+    if errors:
+        print(f"Failed to save some reported risks for {scan_type}", file=sys.stderr)
+
+
 def post_preapproved_deps(risk_docs: list[dict], fallback_package_type: str | None = None) -> bool:
     """POST each risk doc as an individual preapproved record to the preapproved index.
 

@@ -4,6 +4,7 @@ import os
 from datetime import datetime, timezone
 
 from submit_report import (
+    mark_reported,
     submit_container_licenses,
     submit_container_vulns,
     submit_source_code_licenses,
@@ -127,11 +128,25 @@ def _vuln_docs_to_entries(docs, scan_type):
     ]
 
 
+def _vuln_summary(label, entries, limit=10):
+    """One-line description naming the new vulnerable packages, for the Slack report."""
+    names = sorted({f"{e['package_name']}=={e['package_version']} ({e['cve']})" for e in entries})
+    shown = ", ".join(names[:limit])
+    more = f", +{len(names) - limit} more" if len(names) > limit else ""
+    return f"{len(entries)} new {label}: {shown}{more}"
+
+
 def process_result():
     RISKY_DEPENDENCIES = []
     detected_licenses = []
     detected_vulnerabilities = []
     preapproved_candidates = []
+    source_vulns = []
+    amd64_container_vulns = []
+    arm64_container_vulns = []
+    source_licenses = []
+    amd64_container_licenses = []
+    arm64_container_licenses = []
 
     if not args.skip_source_code:
         source_vulns = submit_source_code_vulns(
@@ -140,7 +155,9 @@ def process_result():
         )
         detected_vulnerabilities.extend(_vuln_docs_to_entries(source_vulns, "source_code"))
         if args.scan_mode != "release" and len(source_vulns) > 0:
-            RISKY_DEPENDENCIES.append(f"{len(source_vulns)} new source code vulnerability")
+            RISKY_DEPENDENCIES.append(
+                _vuln_summary("source code vulnerability", detected_vulnerabilities)
+            )
 
         source_result = submit_source_code_licenses(
             os.path.join(args.report_directory, "source_code/sbom.json"),
@@ -188,7 +205,13 @@ def process_result():
         )
         count_container_vulns = len(amd64_container_vulns) + len(arm64_container_vulns)
         if args.scan_mode != "release" and count_container_vulns > 0:
-            RISKY_DEPENDENCIES.append(f"{count_container_vulns} new container vulnerability")
+            RISKY_DEPENDENCIES.append(
+                _vuln_summary(
+                    "container vulnerability",
+                    _vuln_docs_to_entries(amd64_container_vulns, "container")
+                    + _vuln_docs_to_entries(arm64_container_vulns, "container"),
+                )
+            )
 
         amd64_container_licenses, amd64_license_info = submit_container_licenses(
             os.path.join(args.report_directory, "release_amd64/licenses.json"),
@@ -227,6 +250,26 @@ def process_result():
         status = "unstable"
         if args.scan_mode == "monitor":
             post_slack_msg(args.build_number, args.ref, detail, args.build_url)
+            ts = int(SUBMIT_KWARG["start_datetime"].timestamp() * 1000)
+            # Mark only after the report went out, so a failed post is retried next run.
+            mark_reported(
+                "source_code_vulnerability", SUBMIT_KWARG["build_metadata"], ts, source_vulns
+            )
+            mark_reported(
+                "container_vulnerability",
+                SUBMIT_KWARG["build_metadata"],
+                ts,
+                amd64_container_vulns + arm64_container_vulns,
+            )
+            mark_reported(
+                "source_code_license", SUBMIT_KWARG["build_metadata"], ts, source_licenses
+            )
+            mark_reported(
+                "container_license",
+                SUBMIT_KWARG["build_metadata"],
+                ts,
+                amd64_container_licenses + arm64_container_licenses,
+            )
 
         result = {
             "status": status,
