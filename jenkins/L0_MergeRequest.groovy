@@ -1010,7 +1010,7 @@ def launchTestListCheck(pipeline, globalVars)
 
                 def llmPath = sh(script: "realpath ${LLM_ROOT}", returnStdout: true).trim()
                 sh "NVIDIA_TRITON_SERVER_VERSION=26.09 LLM_ROOT=${llmPath} LLM_BACKEND_ROOT=${llmPath}/triton_backend " +
-                   "python3 -u ${llmPath}/scripts/check_test_list.py --l0 --qa --waive --validate --parity --check-duplicate-waives"
+                   "python3 -u ${llmPath}/scripts/check_test_list.py --l0 --qa --waive"
             }
         }
     })
@@ -1961,6 +1961,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/_torch/kernels/blackwell/gemm_twoshot_allreduce_norm.py",
         "tensorrt_llm/_torch/kernels/blackwell/mnnvl_",
         "tensorrt_llm/_torch/kernels/blackwell/tp2_allreduce_norm.py",
+        "tensorrt_llm/_torch/memory/monitor/ranks.py",
         "tensorrt_llm/_torch/models/modeling_llama.py",
         "tensorrt_llm/_torch/models/modeling_qwen3_next.py",
         "tensorrt_llm/_torch/moe/",

@@ -1665,7 +1665,8 @@ def _register_fake():
           workspace,
           cp_rank,
           cp_size,
-          zero_kv_mask=None):
+          zero_kv_mask=None,
+          is_lse=False):
         # Returns outputs with same shapes as inputs
         return partial_o.new_empty(partial_o.shape), softmax_stats.new_empty(
             softmax_stats.shape)
@@ -1698,11 +1699,11 @@ def _register_fake():
         return (_mk(), _mk(), _mk())
 
     @torch.library.register_fake("trtllm::helix_post_process")
-    def _(gathered_o, gathered_stats, scale):
+    def _(gathered_o, gathered_stats, scale, is_lse=False):
         return gathered_o.new_empty(*gathered_o.shape[1:])
 
     @torch.library.register_fake("trtllm::helix_post_process_native")
-    def _(gathered_o, gathered_stats, scale, cp_dim):
+    def _(gathered_o, gathered_stats, scale, cp_dim, is_lse=False):
         # Remove the dimension at cp_dim (context parallelism dimension)
         out_shape = list(gathered_o.shape)
         del out_shape[cp_dim]

@@ -16,6 +16,8 @@ from cutlass.utils.smem_allocator import SmemAllocator
 
 from tensorrt_llm._torch.kernels.blackwell.utils import TRTLLM_ENABLE_PDL, griddepcontrol_wait
 
+from . import dsv4_route_one as route_one
+
 try:
     from cuda.bindings import driver as cuda
 except ImportError:
@@ -197,9 +199,11 @@ class DSv4RouteNvfp4QuantKernel:
     a flag, a live-row bound, with ``count_mask`` a row mask, and rows with all-zero logits
     skipped). ``mxfp8`` also writes each token as MXFP8. Without ``quant`` the launch only routes
     (an input the producer already quantized). With ``num_local`` the tables cover the experts
-    ``[local_start, local_start + num_local)`` of an expert-parallel rank, numbered from 0. ``pdl``
-    launches it as a programmatic dependent of the previous kernel. With ``splits`` > 1 the logits
-    are K-chunk partials ``[splits, tokens, experts]``, summed s = 0 .. splits-1 as they load.
+    ``[local_start, local_start + num_local)`` of an expert-parallel rank, numbered from 0; with
+    ``dynamic_ep`` = (rank, 2) both ranks hold all experts and the tables cover this rank's share of
+    the used ones (``home_first_owner``). ``pdl`` launches it as a programmatic dependent of the
+    previous kernel. With ``splits`` > 1 the logits are K-chunk partials ``[splits, tokens,
+    experts]``, summed s = 0 .. splits-1 as they load.
     """
 
     group_size = 16
@@ -222,6 +226,7 @@ class DSv4RouteNvfp4QuantKernel:
         pdl: bool = False,
         cta_scoring: bool = True,
         splits: int = 1,
+        dynamic_ep: tuple[int, int] = (0, 0),
     ):
         warp = cute.arch.WARP_SIZE
         num_local = num_experts if num_local is None else num_local
@@ -250,6 +255,7 @@ class DSv4RouteNvfp4QuantKernel:
         self.num_local = num_local
         self.pdl = pdl
         self.splits = splits
+        self.dynamic_ep_rank, self.dynamic_ep_size = dynamic_ep
         # The experts a thread scores for one token, and a lane holds when picking.
         self.experts_per_thread = (num_experts + self.num_threads - 1) // self.num_threads
         self.experts_per_lane = num_experts // warp
@@ -383,6 +389,10 @@ class DSv4RouteNvfp4QuantKernel:
                         (len(self.routing_tiles), self.num_threads // cute.arch.WARP_SIZE)
                     ),
                 )
+                # Dynamic EP: the used experts below each expert, then whether this rank runs it.
+                assigned_s = experts_s
+                if cutlass.const_expr(self.dynamic_ep_size > 1):
+                    assigned_s = smem.allocate_tensor(Int32, cute.make_layout(self.num_local))
             nonzero_s = smem.allocate_tensor(
                 Int32, cute.make_layout(self.num_threads // cute.arch.WARP_SIZE)
             )
@@ -400,6 +410,8 @@ class DSv4RouteNvfp4QuantKernel:
                         scores_s,
                         experts_s,
                         warp_ctas_s,
+                        assigned_s,
+                        nonzero_s,
                         tidx,
                     )
             elif row < self.num_rows(logits):
@@ -803,6 +815,23 @@ class DSv4RouteNvfp4QuantKernel:
         return counted
 
     @cute.jit
+    def home_first_owner(
+        self, below_s: cute.Tensor, total: Int32, below: Int32, expert: Int32
+    ) -> Int32:
+        """The EP rank of the two that runs used ``expert``: each keeps up to ceil(used / 2) of its
+        half's used experts, lowest first, and gives the rest to the other."""
+        half = self.num_experts // 2
+        home = Int32(0)
+        kept = below
+        if expert >= Int32(half):
+            home = Int32(1)
+            kept = below - below_s[half]
+        owner = home
+        if kept >= (total + Int32(1)) // Int32(2):
+            owner = Int32(1) - home
+        return owner
+
+    @cute.jit
     def route_with_tables(
         self,
         logits: cute.Tensor,
@@ -815,13 +844,16 @@ class DSv4RouteNvfp4QuantKernel:
         scores_s: cute.Tensor,
         experts: cute.Tensor,
         warp_ctas: cute.Tensor,
+        assigned: cute.Tensor,
+        warp_used: cute.Tensor,
         tidx: Int32,
     ):
         """Route every token (thread ``e`` scores expert ``e`` of every token, then warp ``t``
         picks token ``t``), then write ``tables[t]`` for tile ``t``: expanded-to-permuted,
         permuted-to-token, CTA experts, CTA limits, (CTAs, padded rows). Experts are numbered
         from ``local_start``; a pick of another rank's expert maps to -1. ``experts`` holds the
-        local expert histogram, then one tile's first CTAs."""
+        local expert histogram, then one tile's first CTAs; with ``dynamic_ep`` ``assigned`` holds
+        the used experts below each expert, then whether this rank runs it."""
         warp_size = cute.arch.WARP_SIZE
         num_warps = self.num_threads // warp_size
         warp = tidx // warp_size
@@ -869,6 +901,42 @@ class DSv4RouteNvfp4QuantKernel:
         count = Int32(0)
         if tidx < self.num_local:
             count = experts[tidx]
+        if cutlass.const_expr(self.dynamic_ep_size > 1):
+            used = Int32(0)
+            if count > Int32(0):
+                used = Int32(1)
+            below = used
+            for offset in (1, 2, 4, 8, 16):
+                lower = cute.arch.shuffle_sync_up(below, offset)
+                if lane >= offset:
+                    below = below + lower
+            if lane == warp_size - 1:
+                warp_used[warp] = below
+            cute.arch.barrier()
+            below = below - used
+            total = Int32(0)
+            for w in cutlass.range_constexpr(num_warps):
+                if w < warp:
+                    below = below + warp_used[w]
+                total = total + warp_used[w]
+            if tidx < self.num_local:
+                assigned[tidx] = below
+            cute.arch.barrier()
+            mine = Int32(0)
+            if used != Int32(0):
+                if self.home_first_owner(assigned, total, below, tidx) == Int32(
+                    self.dynamic_ep_rank
+                ):
+                    mine = Int32(1)
+            cute.arch.barrier()
+            if mine == Int32(0):
+                count = Int32(0)
+            if tidx < self.num_local:
+                assigned[tidx] = mine
+            cute.arch.barrier()
+            if pick_rank >= Int32(0):
+                if assigned[pick_expert] == Int32(0):
+                    pick_rank = Int32(-1)
         # All tiles at once: each expert's CTA count, scanned within the warp, then over warps.
         owned = [(count + tile - 1) // tile for tile in self.routing_tiles]
         scanned = list(owned)
@@ -1009,6 +1077,7 @@ def _compile(
     pdl: bool = False,
     cta_scoring: bool = True,
     splits: int = 1,
+    dynamic_ep: tuple[int, int] = (0, 0),
 ):
     tokens = cute.sym_int()
     # A launch bucket has its own row count, at least the tokens'.
@@ -1074,6 +1143,7 @@ def _compile(
             pdl=pdl,
             cta_scoring=cta_scoring,
             splits=splits,
+            dynamic_ep=dynamic_ep,
         ),
         logits,
         cute.runtime.make_fake_compact_tensor(Float32, (num_experts,), stride_order=(0,)),
@@ -1123,6 +1193,29 @@ def _max_ctas(num_tokens: int, top_k: int, num_experts: int, tile: int) -> int:
     return filled + (expanded - filled) // tile
 
 
+def routing_table_max_ctas(num_tokens: int, top_k: int, num_experts: int, dynamic_ep) -> int:
+    """The most CTAs a rank's tables of the two-rank dynamic split assign: half of the used experts,
+    rounded up, as a table's rows fit one CTA per expert; 0 without it, the kernels' worst case."""
+    if dynamic_ep is None:
+        return 0
+    return (min(num_tokens * top_k, num_experts) + 1) // 2
+
+
+def _check_dynamic_ep(
+    dynamic_ep: Optional[tuple[int, int]],
+    local_experts: Optional[tuple[int, int]],
+    with_routing_tables: bool,
+) -> None:
+    if dynamic_ep is not None and (
+        tuple(dynamic_ep) not in ((0, 2), (1, 2))
+        or local_experts is not None
+        or not with_routing_tables
+    ):
+        raise ValueError(
+            f"dynamic expert parallelism {dynamic_ep} needs 2 ranks and tables over every expert"
+        )
+
+
 def _local_range(local_experts: Optional[tuple[int, int]], num_experts: int) -> tuple[int, int]:
     first, count = (0, num_experts) if local_experts is None else local_experts
     if not (0 <= first and 0 < count and first + count <= num_experts):
@@ -1166,11 +1259,15 @@ def dsv4_route_nvfp4_quant(
     replicas: bool = False,
     local_experts: Optional[tuple[int, int]] = None,
     routing_tiles: tuple[int, ...] = ROUTING_TABLE_TILES,
+    dynamic_ep: Optional[tuple[int, int]] = None,
+    one_cluster: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """DeepSeek-V4 routing and NVFP4 input quantization in one launch, bitwise ``routing.apply``
     then ``fp4_quantize``; ``with_routing_tables`` also returns ``run_moe``'s routing tables for
     ``routing_tiles``, over the experts ``local_experts`` = (first, count) of an expert-parallel
-    rank if given.
+    rank if given, or with ``dynamic_ep`` = (rank, 2) over this rank's share of the experts in use
+    (every rank holding every expert). ``one_cluster``: a table launch of a shape
+    ``dsv4_route_one.applies`` takes routes in one cluster.
 
     ``staged`` = a launch bucket's (ids, weights, NVFP4 rows, scale rows) with at least as many rows
     as tokens: the launch also writes the ids there and writes the rest there instead, returning
@@ -1239,12 +1336,38 @@ def dsv4_route_nvfp4_quant(
             raise ValueError(f"MXFP8 buffers are too small for {num_tokens} rows of {hidden_size}")
         x_fp8 = x_fp8.view(torch.int32)
     local_start, num_local = _local_range(local_experts, num_experts)
+    _check_dynamic_ep(dynamic_ep, local_experts, with_routing_tables)
     tables = (
         _routing_tables(num_tokens, num_local, top_k, device, num_experts, routing_tiles)
         if with_routing_tables
         else None
     )
     routing_tiles = routing_tiles if with_routing_tables else ()
+    if (
+        one_cluster
+        and tables is not None
+        and splits == 1
+        and mxfp8 is None
+        and route_one.applies(num_tokens, num_experts, top_k, routing_tiles)
+        and route_one.route_one(
+            logits,
+            selection_bias,
+            routed_scaling_factor,
+            ids,
+            weights,
+            tables,
+            routing_tiles,
+            local_start,
+            num_local,
+            pdl=False,
+            dynamic_ep=dynamic_ep,
+            x=x,
+            global_scale=global_scale.view(1),
+            x_fp4=x_fp4,
+            x_sf=x_sf,
+        )
+    ):
+        return ids, weights, x_fp4.view(torch.uint8), x_sf, tables
     if num_tokens > 0:
         _compile(
             num_experts,
@@ -1262,6 +1385,7 @@ def dsv4_route_nvfp4_quant(
             num_local=num_local,
             cta_scoring=_cta_scoring(num_tokens, num_experts),
             splits=splits,
+            dynamic_ep=tuple(dynamic_ep) if dynamic_ep else (0, 0),
         )(
             logits,
             selection_bias,
@@ -1299,11 +1423,13 @@ def dsv4_route(
     with_routing_tables: bool = False,
     local_experts: Optional[tuple[int, int]] = None,
     routing_tiles: tuple[int, ...] = ROUTING_TABLE_TILES,
+    dynamic_ep: Optional[tuple[int, int]] = None,
+    one_cluster: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """DeepSeek-V4 routing in one launch, bitwise ``routing.apply`` with the weights in
     ``weights_dtype``, for an input already quantized; ``with_routing_tables`` also returns
-    ``run_moe``'s routing tables for ``routing_tiles`` (as ``dsv4_route_nvfp4_quant``). It launches
-    as a programmatic dependent of the router GEMM."""
+    ``run_moe``'s routing tables for ``routing_tiles`` (as ``dsv4_route_nvfp4_quant``, also for
+    ``one_cluster``). It launches as a programmatic dependent of the router GEMM."""
     if not isinstance(router_logits, torch.Tensor):
         raise TypeError("dsv4_route takes [tokens, experts] router logits")
     num_tokens, num_experts = router_logits.shape
@@ -1311,12 +1437,32 @@ def dsv4_route(
     ids = torch.empty((num_tokens, top_k), dtype=torch.int32, device=device)
     weights = torch.empty((num_tokens, top_k), dtype=weights_dtype, device=device)
     local_start, num_local = _local_range(local_experts, num_experts)
+    _check_dynamic_ep(dynamic_ep, local_experts, with_routing_tables)
     tables = (
         _routing_tables(num_tokens, num_local, top_k, device, num_experts, routing_tiles)
         if with_routing_tables
         else None
     )
     routing_tiles = routing_tiles if with_routing_tables else ()
+    if (
+        one_cluster
+        and tables is not None
+        and route_one.applies(num_tokens, num_experts, top_k, routing_tiles)
+        and route_one.route_one(
+            router_logits,
+            selection_bias,
+            routed_scaling_factor,
+            ids,
+            weights,
+            tables,
+            routing_tiles,
+            local_start,
+            num_local,
+            pdl=TRTLLM_ENABLE_PDL,
+            dynamic_ep=dynamic_ep,
+        )
+    ):
+        return ids, weights, tables
     if num_tokens > 0:
         _compile(
             num_experts,
@@ -1329,6 +1475,7 @@ def dsv4_route(
             num_local=num_local,
             pdl=TRTLLM_ENABLE_PDL,
             cta_scoring=_cta_scoring(num_tokens, num_experts),
+            dynamic_ep=tuple(dynamic_ep) if dynamic_ep else (0, 0),
         )(
             router_logits,
             selection_bias,

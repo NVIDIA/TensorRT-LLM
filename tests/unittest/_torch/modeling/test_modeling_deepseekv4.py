@@ -1144,6 +1144,7 @@ def test_deepseek_v4_moe_allreduce_is_mnnvl_eligible(monkeypatch: pytest.MonkeyP
         moe_backend="TRTLLM",
         quant_config=QuantConfig(),
         use_cute_dsl_blockscaling_mm=False,
+        extra_attrs={},
     )
     moe = v4.DeepseekV4MoE(
         num_experts=4,

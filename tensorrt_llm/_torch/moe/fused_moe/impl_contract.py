@@ -84,6 +84,12 @@ class MoEDecodeOptions:
     fc2_weights_evict_first_rows: int = 0
     # TRTLLM-Gen BF16: logits-routed un-finalized SwiGLU runs of up to 32 rows take the BF16 decode MoE engine.
     bf16_decode_engine: bool = False
+    # TRTLLM-Gen NVFP4 op without ``tuning``: un-finalized attention-TP calls of up to this many rows run FC2 on the
+    # CuTe DSL kernel where it reproduces the tactic's cubin (trtllm_gen.decode_moe.cute_fc2_opt_in; 0: none).
+    cute_fc2_rows: int = 0
+    # TRTLLM-Gen NVFP4 on the DS-V4 route kernel's tables: launches of the shapes dsv4_route_one.applies takes route
+    # in one cluster.
+    one_cluster_route: bool = False
 
     @classmethod
     def of(cls, extra_attrs: Dict) -> "MoEDecodeOptions":
@@ -113,6 +119,11 @@ class MoEInputRequirement:
     # output before the next chunk runs. ``FusedCommMoEScheduler`` copies no
     # chunk output, so it refuses a backend that declares this.
     run_moe_reuses_buffers: bool = False
+    # ``run_moe`` launches a persistent grid that needs all its CTAs resident
+    # at once and waits on its own progress counters. Two calls in flight on
+    # different streams can each hold part of the GPU and wait forever, so a
+    # multi-chunk forward runs every chunk on one stream.
+    run_moe_requires_coresident_grid: bool = False
 
     # No sentinel for invalid_token_expert_id: every Communication uses -1.
 
@@ -729,10 +740,11 @@ class MoECommPlan:
 @dataclass(frozen=True)
 class MoERoutingTables:
     """Routing tables in the kernel's layout, one entry per tile of ``tiles``; a tactic with
-    another tile routes itself."""
+    another tile routes itself. ``max_ctas`` > 0 bounds the CTAs any of them assigns."""
 
     tables: torch.Tensor
     tiles: Tuple[int, ...]
+    max_ctas: int = 0
 
 
 @dataclass(frozen=True)
