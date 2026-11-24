@@ -445,6 +445,52 @@ def test_helix_dummy_min_tokens_applies_to_generation_only() -> None:
         manager.shutdown()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="allocates real KV cache pools")
+@pytest.mark.parametrize("rank", [0, 1])
+def test_helix_generation_dummy_fields_match_allocated_cache(rank: int) -> None:
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+    from tensorrt_llm.mapping import CpType, Mapping
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
+
+    mapping = Mapping(world_size=2, rank=rank, cp_size=2, cp_config={"cp_type": CpType.HELIX})
+    manager = KVCacheManagerV2(
+        KvCacheConfig(max_tokens=512, enable_block_reuse=False, host_cache_size=0),
+        CacheType.SELF,
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=64,
+        tokens_per_block=32,
+        max_seq_len=256,
+        max_batch_size=3,
+        mapping=mapping,
+    )
+    requests = []
+    try:
+        token_counts = [2, 63, 65]
+        request_ids = [2, 0, 1]
+        allocated_requests = manager.add_dummy_requests(request_ids, token_counts, is_gen=True)
+        assert allocated_requests is not None
+        requests = allocated_requests
+        assert len(requests) == len(token_counts)
+        pages_per_request = manager.get_batch_cache_indices(request_ids)
+        for request, token_count, pages in zip(
+            requests, token_counts, pages_per_request, strict=True
+        ):
+            position = token_count - 1
+            owns_token = (position // 32) % 2 == rank
+            local_after = _brute_local_len(token_count, rank, 2, 32)
+            assert request.total_input_len_cp + request.py_decoding_iter - 1 == position
+            assert request.py_helix_is_inactive_rank == (not owns_token)
+            assert request.seqlen_this_rank_cp == local_after
+            needed_pages = math.ceil(local_after / 32)
+            assert len(pages) >= needed_pages
+            assert BAD_PAGE_INDEX not in pages[:needed_pages]
+    finally:
+        for request in requests:
+            manager.free_resources(request)
+        manager.shutdown()
+
+
 def test_estimation_prepare_promotes_skip_est_for_v2() -> None:
     """Disaggregated helix disables estimation; with a V2 manager it must also
     promote _skip_est so build_managers() calls configure_kv_cache_capacity().

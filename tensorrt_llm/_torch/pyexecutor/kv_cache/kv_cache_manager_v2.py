@@ -9647,19 +9647,9 @@ class KVCacheManagerV2(BaseResourceManager):
                 req.py_prompt_len = req.prompt_len
                 req.py_draft_tokens = [1] * max_num_draft_tokens
                 if self._has_cp_helix:
-                    # Frozen fields (V1 parity): dummies never pass the
-                    # per-step derivation — last CP rank active, shared
-                    # synthetic global length.
-                    if self._helix_cp_rank == self._helix_cp_size - 1:
-                        req.py_helix_is_inactive_rank = False
-                        req.prompt_len = token_num - 1
-                    else:
-                        req.py_helix_is_inactive_rank = True
-                        req.prompt_len = token_num
-                    req.py_prompt_len = req.prompt_len
-                    req.seqlen_this_rank_cp = req.prompt_len
-                    req.total_input_len_cp = token_num * self._helix_cp_size - 1
+                    req.total_input_len_cp = req.prompt_len
                     req.py_decoding_iter = 1
+                    self._set_helix_rank_fields(req)
                 if not self._ensure_generation_beam_width(req, kv_cache):
                     release_resources(req, free_draft_resources=draft_kv_cache is not None)
                     return None

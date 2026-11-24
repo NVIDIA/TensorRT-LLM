@@ -121,6 +121,7 @@ def create_helix_gen_metadata(
     position_ids_gen,
     *,
     enable_context_mla_with_cached_kv=False,
+    attn_backend: str = "TRTLLM",
 ):
     """Create generation-phase attention metadata with Helix fields.
 
@@ -130,7 +131,9 @@ def create_helix_gen_metadata(
     kwargs = {}
     if enable_context_mla_with_cached_kv:
         kwargs["enable_context_mla_with_cached_kv"] = True
-    attn_metadata = get_attention_backend("TRTLLM").Metadata(
+    if attn_backend == "FLASHINFER":
+        kwargs["mapping"] = kv_cache_manager.mapping
+    attn_metadata = get_attention_backend(attn_backend).Metadata(
         seq_lens=torch.tensor([1] * batch, dtype=torch.int),
         request_ids=list(range(batch)),
         max_num_requests=batch,
@@ -144,6 +147,10 @@ def create_helix_gen_metadata(
         ),
         **kwargs,
     )
+    if attn_backend == "FLASHINFER":
+        attn_metadata.update_helix_param(position_ids_gen.tolist(), helix_is_inactive_rank)
+        attn_metadata.prepare()
+        return attn_metadata
     attn_metadata.enable_helix = True
     attn_metadata.helix_is_inactive_rank = torch.tensor(
         helix_is_inactive_rank, dtype=torch.bool, device="cuda"
@@ -173,6 +180,7 @@ def setup_kv_and_metadata(
     cache_type,
     num_kv_heads: int,
     head_dim: int,
+    attn_backend: str = "TRTLLM",
 ):
     """Create a :class:`KVCacheManagerV2` and context-phase attention metadata.
 
@@ -222,13 +230,13 @@ def setup_kv_and_metadata(
         req.state = LlmRequestState.GENERATION_IN_PROGRESS
         req.prompt_len = ctx_len_per_gpu
         req.py_prompt_len = req.prompt_len
-    attn_metadata = get_attention_backend("TRTLLM").Metadata(
+    attn_metadata = get_attention_backend(attn_backend).Metadata(
         seq_lens=torch.tensor([ctx_len_per_gpu] * scenario.batch, dtype=torch.int),
         request_ids=list(range(scenario.batch)),
         max_num_requests=scenario.batch,
         num_contexts=scenario.batch,
         prompt_lens=[ctx_len_per_gpu] * scenario.batch,
-        max_num_tokens=ctx_len_per_gpu,
+        max_num_tokens=ctx_len_per_gpu * scenario.batch,
         kv_cache_manager=kv_cache_manager,
         kv_cache_params=KVCacheParams(
             use_cache=True,

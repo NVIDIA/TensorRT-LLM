@@ -1017,6 +1017,11 @@ class Attention(nn.Module):
 
     def create_output(self, q: torch.Tensor, attn_metadata: AttentionMetadata,
                       mask_type: str):
+        if self.mapping.has_cp_helix() and attn_metadata.num_contexts == 0:
+            return [
+                q.new_empty((q.shape[0], self.num_heads_tp_cp * self.head_dim),
+                            dtype=self.o_proj.dtype)
+            ]
         # Attention is treated as mixed request by default.
         return self.attn.create_output(
             q,
@@ -1079,9 +1084,6 @@ class Attention(nn.Module):
         # so it produces BF16 output. After combining, the downstream o_proj
         # linear layer handles quantization (FP8/NVFP4) in its apply() method.
         if self.mapping.has_cp_helix() and attn_metadata.num_contexts == 0:
-            assert output is None, (
-                "Helix produces BF16 partial outputs which may not match a pre-allocated FP8/NVFP4 buffer for torch.compile inplace output."
-            )
             softmax_stats = torch.empty((num_tokens, self.num_heads, 2),
                                         device=q.device,
                                         dtype=torch.float32)
@@ -1110,6 +1112,9 @@ class Attention(nn.Module):
                                                    attn_metadata)
             if output_gate is not None:
                 attn_output = self.apply_output_gate(attn_output, output_gate)
+            if output is not None:
+                output[:num_tokens].copy_(attn_output)
+                attn_output = output
             return attn_output, None
 
         # Don't set out_scale if o_proj has pre_quant_scale — this prevents

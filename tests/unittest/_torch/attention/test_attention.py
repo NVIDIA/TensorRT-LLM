@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import weakref
 from dataclasses import dataclass
 from typing import Callable, Optional, Sequence
 
@@ -11,17 +12,21 @@ import torch
 from utils.util import getSMVersion
 
 import tensorrt_llm
+from tensorrt_llm._torch.attention import attention as attention_module
+from tensorrt_llm._torch.attention.attention import Attention
 from tensorrt_llm._torch.attention.backends import (AttentionBackend,
                                                     FlashInferAttention,
                                                     VanillaAttention)
-from tensorrt_llm._torch.attention.backends.interface import \
-    PredefinedAttentionMask
+from tensorrt_llm._torch.attention.backends.interface import (
+    AttentionForwardArgs, AttentionMetadata, PredefinedAttentionMask)
 from tensorrt_llm._torch.metadata import KVCacheParams
+from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
     KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._torch.utils import model_extra_attrs, torch_compiling
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.mapping import CpType, Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -44,6 +49,86 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 atol = 1e-2
 rtol = 1e-3
 fp8_atol = 5e-2
+
+
+@pytest.mark.parametrize("compile_graph", [False, True],
+                         ids=["inplace", "compiled"])
+@torch.inference_mode()
+def test_helix_compiled_attention_output(monkeypatch: pytest.MonkeyPatch,
+                                         compile_graph: bool) -> None:
+    mapping = Mapping(world_size=2,
+                      cp_size=2,
+                      rank=0,
+                      cp_config={"cp_type": CpType.HELIX})
+    config = ModelConfig(mapping=mapping, attn_backend="TRTLLM")
+    attention = Attention(hidden_size=512,
+                          num_attention_heads=4,
+                          num_key_value_heads=2,
+                          max_position_embeddings=64,
+                          bias=False,
+                          layer_idx=0,
+                          dtype=torch.bfloat16,
+                          config=config,
+                          reduce_output=False).cuda()
+    attention.qkv_proj.weight.fill_(0.125)
+    attention.o_proj.weight.fill_(0.25)
+    metadata = attention.attn.Metadata(seq_lens=torch.tensor([1],
+                                                             dtype=torch.int),
+                                       num_contexts=0,
+                                       max_num_requests=1,
+                                       max_num_tokens=1)
+    config.extra_attrs["attention_metadata"] = weakref.ref(metadata)
+    combined = torch.arange(256, device="cuda", dtype=torch.bfloat16).view(
+        1, -1) / 256
+
+    def run_kernel(query: torch.Tensor, key: Optional[torch.Tensor],
+                   value: Optional[torch.Tensor],
+                   attn_metadata: AttentionMetadata,
+                   forward_args: AttentionForwardArgs) -> torch.Tensor:
+        assert forward_args.softmax_stats_tensor is not None
+        forward_args.softmax_stats_tensor.fill_(1)
+        return query.new_zeros((attn_metadata.num_tokens, 512))
+
+    def exchange_partials(
+        partial_output: torch.Tensor,
+        softmax_stats: torch.Tensor,
+        mapping: Mapping,
+        num_heads_tp_cp: int,
+        head_dim: int,
+        *,
+        zero_kv_mask: Optional[torch.Tensor],
+        is_cuda_graph: bool,
+    ) -> torch.Tensor:
+        return combined
+
+    captured_graphs: list[torch.fx.GraphModule] = []
+
+    def capture_graph(
+        graph_module: torch.fx.GraphModule,
+        example_inputs: Sequence[torch.Tensor],
+    ) -> Callable[..., torch.Tensor]:
+        captured_graphs.append(graph_module)
+        return graph_module.forward
+
+    monkeypatch.setattr(attention.attn, "forward", run_kernel)
+    monkeypatch.setattr(attention_module, "_helix_post_process",
+                        exchange_partials)
+    hidden_states = torch.ones((1, 512), device="cuda", dtype=torch.bfloat16)
+    compiled_attention = (torch.compile(
+        attention, backend=capture_graph, fullgraph=True)
+                          if compile_graph else attention)
+    with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU]) as profiler:
+        with model_extra_attrs(config.extra_attrs), torch_compiling(True):
+            output = compiled_attention(None, hidden_states, metadata)
+    expected = attention.o_proj(combined)
+    torch.testing.assert_close(output, expected)
+    assert any(event.key == "trtllm::attn_custom_op_inplace"
+               for event in profiler.key_averages())
+    if compile_graph:
+        assert any(
+            node.target == torch.ops.trtllm.attn_custom_op_inplace.default
+            for graph in captured_graphs for node in graph.graph.nodes)
 
 
 @dataclass(kw_only=True, frozen=True)
