@@ -470,6 +470,55 @@ def _validate_speculative_connector(spec_config: Optional[SpeculativeConfig],
         raise
 
 
+def _validate_connector_kv_cache_manager(
+        connector: KvCacheConnectorManager, *, enable_attention_dp: bool,
+        speculative_prefill_only: bool, max_beam_width: int, enable_sleep: bool,
+        capacity_scheduler_policy: CapacitySchedulerPolicy,
+        use_kv_cache_manager_v2: bool | str) -> None:
+    """Validate the KV cache manager a KV-moving connector needs, or shut it down and re-raise.
+
+    As in `_validate_speculative_connector`, the connector's worker and scheduler
+    already exist, so a refusal releases them before the error leaves the creator.
+    A capacity-only connector moves no KV and is not checked.
+
+    Args:
+        connector: The constructed connector manager.
+        enable_attention_dp: Whether attention DP is enabled.
+        speculative_prefill_only: Whether the connector runs in that mode.
+        max_beam_width: The configured beam width.
+        enable_sleep: Whether sleep mode is enabled.
+        capacity_scheduler_policy: The configured capacity scheduler policy.
+        use_kv_cache_manager_v2: The tri-state
+            `kv_cache_config.use_kv_cache_manager_v2` (True, False or "auto").
+
+    Raises:
+        ValueError: Attention DP or speculative prefill would fall back to V1.
+        NotImplementedError: V1 with a policy other than GUARANTEED_NO_EVICT.
+    """
+    if connector.capacity_only:
+        return
+    try:
+        if enable_attention_dp or speculative_prefill_only:
+            incompatible = kv_cache_manager_v2_incompatible_features(
+                max_beam_width, enable_sleep=enable_sleep)
+            if incompatible:
+                raise ValueError(
+                    "KV connector attention-DP/speculative-prefill mode requires KVCacheManagerV2; "
+                    f"disable {', '.join(incompatible)} to prevent fallback to V1."
+                )
+        if (capacity_scheduler_policy
+                != CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
+                and use_kv_cache_manager_v2 is False):
+            raise NotImplementedError(
+                "KV connector in this configuration is only supported with the "
+                "GUARANTEED_NO_EVICT capacity scheduler policy. Set "
+                "kv_cache_config.use_kv_cache_manager_v2=True to use another policy."
+            )
+    except (NotImplementedError, ValueError):
+        connector.shutdown()
+        raise
+
+
 def _validate_speculative_connector_role(
         connector: KvCacheConnectorManager) -> None:
     """Reject a speculative KV-moving connector on a known generation server."""
@@ -1543,25 +1592,15 @@ def _create_py_executor(
                                         speculative_prefill_only,
                                         kv_connector_manager)
 
-        if not kv_connector_manager.capacity_only and (
-                mapping.enable_attention_dp or speculative_prefill_only):
-            incompatible = kv_cache_manager_v2_incompatible_features(
-                llm_args.max_beam_width, enable_sleep=enable_sleep)
-            if incompatible:
-                raise ValueError(
-                    "KV connector attention-DP/speculative-prefill mode requires KVCacheManagerV2; "
-                    f"disable {', '.join(incompatible)} to prevent fallback to V1."
-                )
-
-        if not kv_connector_manager.capacity_only:
-            if (scheduler_config.capacity_scheduler_policy
-                    != CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
-                    and v2_selection is False):
-                raise NotImplementedError(
-                    "KV connector in this configuration is only supported with the "
-                    "GUARANTEED_NO_EVICT capacity scheduler policy. Set "
-                    "kv_cache_config.use_kv_cache_manager_v2=True to use another policy."
-                )
+        _validate_connector_kv_cache_manager(
+            kv_connector_manager,
+            enable_attention_dp=mapping.enable_attention_dp,
+            speculative_prefill_only=speculative_prefill_only,
+            max_beam_width=llm_args.max_beam_width,
+            enable_sleep=enable_sleep,
+            capacity_scheduler_policy=scheduler_config.
+            capacity_scheduler_policy,
+            use_kv_cache_manager_v2=v2_selection)
 
         if uses_connector(kv_connector_config, "mooncake-store"):
             # Imported here because `registry.py` leaves a connector package to

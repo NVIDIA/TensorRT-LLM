@@ -7853,7 +7853,15 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _disagg_generation_limit(self, req: LlmRequest, prompt_len: int) -> int:
         """Completion bound of a disaggregated decode request, in ledger blocks."""
-        return self._disagg_completion_limit(min(self.max_seq_len, prompt_len + req.max_new_tokens))
+        return self._disagg_completion_limit(self._generation_completion_end(req, prompt_len))
+
+    def _generation_completion_end(self, req: LlmRequest, prompt_len: int) -> int:
+        """Tokens a decode request reaches: capped at `max_seq_len`, but never below its prompt.
+
+        A `max_seq_len` lowered below the prompt still leaves the prompt to allocate, so a
+        bound short of it would admit a request whose generation-init resize can never fit.
+        """
+        return max(prompt_len, min(self.max_seq_len, prompt_len + req.max_new_tokens))
 
     def completion_capacity(self) -> int | None:
         """Idle ledger capacity excluding live padding allocations.
@@ -7895,7 +7903,7 @@ class KVCacheManagerV2(BaseResourceManager):
         end = (
             self._context_only_completion_end(prompt_len)
             if req.is_context_only_request
-            else min(self.max_seq_len, prompt_len + req.max_new_tokens)
+            else self._generation_completion_end(req, prompt_len)
         )
         return ceil_div(end, self._ledger_tokens_per_block)
 
@@ -7982,7 +7990,7 @@ class KVCacheManagerV2(BaseResourceManager):
         limit = kv_cache.num_blocks
         if is_gen:
             step_capacity = kv_cache.capacity + 1 + self._generation_draft_slots(req)
-            limit = max(limit, ceil_div(step_capacity, self.tokens_per_block))
+            limit = max(limit, ceil_div(step_capacity, self._ledger_tokens_per_block))
         self._completion_dummy_limits[req.py_request_id] = limit
         return self._completion_blocks_fit(self._unallocated_completion_blocks())
 

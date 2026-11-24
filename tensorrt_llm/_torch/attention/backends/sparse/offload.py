@@ -680,12 +680,21 @@ class SparseOffloadCacheMixin:
         cache again would exceed the sparse cache's one-token bound between
         capacity and history. No growth is recorded, so a skipped step reverts
         nothing.
+
+        A step a KV-moving connector kept (`keep_generation_allocation`) also leaves
+        capacity beyond history, but its retained entry must be consumed here, so the
+        base manager reuses that allocation without growing it.
         """
         if self._enable_kv_cache_offload:
             if self._sparse_batch is not None:
                 self._sparse_batch.wait_published()
             cache = self.kv_cache_map.get(req.py_request_id)
-            if cache is not None and cache.is_active and cache.capacity > cache.history_length:
+            if (
+                cache is not None
+                and cache.is_active
+                and cache.capacity > cache.history_length
+                and req.py_request_id not in self._retained_generation_allocations
+            ):
                 return True
         return super().try_allocate_generation(req)
 

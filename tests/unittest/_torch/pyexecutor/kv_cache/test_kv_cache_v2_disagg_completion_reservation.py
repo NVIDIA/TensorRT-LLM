@@ -246,6 +246,38 @@ def test_helix_context_reservation_sizes_off_the_full_prompt(
 
 
 @pytest.mark.cpu_only
+def test_completion_bound_covers_a_prompt_longer_than_max_seq_len() -> None:
+    """A lowered max_seq_len caps the output, never the prompt the cache must still hold."""
+    manager = _context_reservation_manager(available=100)
+    manager.max_seq_len = 32
+    request = _first_chunk(prompt_len=40, max_new_tokens=8, is_context_only_request=False)
+
+    # 40 prompt tokens in 4-token ledger blocks; capping at max_seq_len would count only 8.
+    assert manager._completion_blocks_required(request) == 10
+    # Arrival validation and the generation-init bound size off the same end.
+    assert manager._disagg_generation_limit(request, 40) == manager._disagg_completion_limit(40)
+
+
+@pytest.mark.cpu_only
+def test_helix_padding_step_is_sized_in_ledger_blocks() -> None:
+    """Under helix CP a generation dummy's step is counted in CP-scaled ledger blocks."""
+    manager = _context_reservation_manager(available=1)
+    manager._has_cp_helix = True
+    manager.tokens_per_block = 4
+    manager._ledger_tokens_per_block = 8  # 4 tokens per block on each of 2 CP ranks
+    manager._generation_draft_slots = lambda req: 0
+    kv_cache = Mock(num_blocks=0, capacity=5)
+    manager.kv_cache_map[99] = kv_cache
+
+    # The step reaches 6 ledger tokens: one 8-token ledger block, which fits beside the
+    # single free block; counting 4-token physical blocks would reserve two and refuse it.
+    assert manager._reserve_padding_forward(
+        SimpleNamespace(py_request_id=99), kv_cache, is_gen=True
+    )
+    assert manager._completion_dummy_limits == {99: 1}
+
+
+@pytest.mark.cpu_only
 def test_context_reservation_defers_without_recording() -> None:
     manager = _context_reservation_manager(available=4)
 

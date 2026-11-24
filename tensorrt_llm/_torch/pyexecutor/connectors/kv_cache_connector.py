@@ -1008,6 +1008,10 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self._bound_scheduler_output: Optional[SchedulerOutput] = None
         self._bound_prefix_load_ids: Set[int] = set()
         self._dispatched_prefix_load_ids: Set[int] = set()
+        # Decoder layers whose forward hooks wait for loads, and whether this
+        # pass started loads that no forward has waited for yet.
+        self._load_layer_indices: tuple[int, ...] = ()
+        self._loads_await_forward = False
         self._local_finished_prefix_load_ids: Set[int] = set()
         self._prefix_completion_tracker: PrefixLoadCompletionTracker | None = None
         self._deferred_load_terminations: Dict[int, LlmRequest] = {}
@@ -2039,6 +2043,37 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             loads.update({load.reservation_id: load for load in scheduler_output.prefix_loads})
             scheduler_output.prefix_loads = list(loads.values())
         self._scheduler_output = scheduler_output
+
+    def register_load_layers(self, layer_indices: List[int]) -> None:
+        """Record the decoder layers whose pre-hooks wait for this connector's loads."""
+        self._load_layer_indices = tuple(layer_indices)
+
+    def mark_loads_started(self) -> None:
+        """Record that the worker started this pass's loads; the next forward waits for them."""
+        self._loads_await_forward = True
+
+    def mark_loads_waited(self) -> None:
+        """Record that a forward ran, and its layer hooks waited for every started load."""
+        self._loads_await_forward = False
+
+    def finish_loads_of_skipped_forward(self, stream: torch.cuda.Stream) -> None:
+        """Complete loads started for a forward that will not run.
+
+        A synchronous load is only waited for by the forward's layer hooks. When
+        attention-DP peers skip the forward after this owner started its loads,
+        nothing else tracks them, and the pages they write can be freed (by a
+        later SKIP) while the worker still writes them. Wait for every layer, as
+        the forward would have, and for the stream, before any page is released.
+
+        Args:
+            stream: The stream the loads were started on.
+        """
+        if not self._loads_await_forward:
+            return
+        for layer_idx in self._load_layer_indices:
+            self.worker.wait_for_layer_load(layer_idx, stream)
+        stream.synchronize()
+        self._loads_await_forward = False
 
     def layer_pre_hook(self, module, *args):
         self.worker.wait_for_layer_load(module.layer_idx, torch.cuda.current_stream())

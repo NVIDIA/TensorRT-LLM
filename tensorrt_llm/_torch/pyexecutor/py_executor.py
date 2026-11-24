@@ -2104,12 +2104,15 @@ class PyExecutor:
             # A capacity-only connector has no per-layer work, so it is spared
             # a hook on every layer of every forward pass.
             if not capacity_only:
+                load_layers = []
                 for _name, module in self.model_engine.model.named_modules():
                     if isinstance(module, DecoderLayer):
                         module.register_forward_pre_hook(
                             self.kv_connector_manager.layer_pre_hook)
                         module.register_forward_hook(
                             self.kv_connector_manager.layer_post_hook)
+                        load_layers.append(module.layer_idx)
+                self.kv_connector_manager.register_load_layers(load_layers)
 
             self.kv_connector_manager.wait_for_initialization()
 
@@ -5964,6 +5967,11 @@ class PyExecutor:
         can_queue check. V1 allocates in prepare_resources() after the
         can_queue check, so no revert is needed.
         """
+        if self._kv_connector_moves_kv:
+            # Loads this owner started for the skipped forward must land before
+            # any of their pages can be released.
+            self.kv_connector_manager.finish_loads_of_skipped_forward(
+                torch.cuda.current_stream())
         if not self._is_kv_manager_v2:
             return
         managers = [self.kv_cache_manager]
@@ -6639,6 +6647,7 @@ class PyExecutor:
         self.kv_connector_manager.mark_prefix_loads_dispatched()
         self.kv_connector_manager.worker.start_load_kv(
             torch.cuda.current_stream())
+        self.kv_connector_manager.mark_loads_started()
         if self._kv_connector_reports_failed_loads:
             failed = self.kv_connector_manager.take_failed_load_requests()
             if failed:
@@ -6922,6 +6931,8 @@ class PyExecutor:
         if self._kv_connector_moves_kv:
             self.kv_connector_manager.worker.wait_for_save(
                 torch.cuda.current_stream())
+            # The forward just run waited for every load this pass started.
+            self.kv_connector_manager.mark_loads_waited()
 
     def _is_benchmark_disagg_fill_complete(
             self,

@@ -35,11 +35,13 @@ from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
 from tensorrt_llm._torch.pyexecutor.py_executor_creator import (
     _connector_runs_speculative_prefill_only,
     _refuse_speculation_next_to_connector,
+    _validate_connector_kv_cache_manager,
     _validate_speculative_connector,
     _validate_speculative_connector_role,
 )
 from tensorrt_llm.llmapi.llm_args import (
     CacheTransceiverConfig,
+    CapacitySchedulerPolicy,
     Eagle3DecodingConfig,
     MTPDecodingConfig,
     NGramDecodingConfig,
@@ -253,3 +255,44 @@ def test_a_rejected_connector_is_shut_down_before_the_error_leaves(
         _validate_speculative_connector(spec_config, True, speculative_prefill_only, connector)
 
     assert connector.shutdown.call_count == (0 if failure == "accepted" else 1)
+
+
+@pytest.mark.parametrize("case", ["adp_falls_back_to_v1", "v1_policy", "accepted", "capacity_only"])
+def test_a_connector_refused_for_its_kv_cache_manager_is_shut_down(
+    monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    import tensorrt_llm._torch.pyexecutor.py_executor_creator as creator
+
+    incompatible = ["beam search"] if case in ("adp_falls_back_to_v1", "capacity_only") else []
+    monkeypatch.setattr(
+        creator, "kv_cache_manager_v2_incompatible_features", lambda *a, **k: incompatible
+    )
+    connector = Mock(capacity_only=case == "capacity_only")
+    policy = (
+        CapacitySchedulerPolicy.MAX_UTILIZATION
+        if case == "v1_policy"
+        else CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
+    )
+
+    def validate() -> None:
+        _validate_connector_kv_cache_manager(
+            connector,
+            enable_attention_dp=True,
+            speculative_prefill_only=False,
+            max_beam_width=1,
+            enable_sleep=False,
+            capacity_scheduler_policy=policy,
+            use_kv_cache_manager_v2=False,
+        )
+
+    if case == "adp_falls_back_to_v1":
+        with pytest.raises(ValueError, match="requires KVCacheManagerV2"):
+            validate()
+    elif case == "v1_policy":
+        with pytest.raises(NotImplementedError, match="GUARANTEED_NO_EVICT"):
+            validate()
+    else:
+        validate()
+
+    refused = case in ("adp_falls_back_to_v1", "v1_policy")
+    assert connector.shutdown.call_count == (1 if refused else 0)
