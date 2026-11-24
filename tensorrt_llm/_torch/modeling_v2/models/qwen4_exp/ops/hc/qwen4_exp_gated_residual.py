@@ -9,7 +9,7 @@ computes a different hyper-connection (a per-stream scalar gate, a weighted sum,
 the raw stream gated) and does not instantiate hidden 2560. The semantics follow
 the HuggingFace ``Qwen4ExpTextGatedResidual`` minus its norm.
 
-No target calls it: the qwen4_exp target (`qwen3_8_flash_next_nvfp4__sm_103__default`)
+No target calls it: the qwen4_exp target (`qwen3_8_flash_next_nvfp4__sm_10x__default`)
 runs every mixer, the MTP layer's included, on the fused hyper-connection entries. This
 entry is their unfused form: `gate_ratio` is the band their tests gate `low`, `inject` and
 `mixed` in, and the target's MTP draft hyper-connection test takes `reference` as the
@@ -23,7 +23,8 @@ from typing import Optional, Tuple
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 #: This checkpoint's geometry: 4 streams of 2560, rank-320 mixer bottleneck.
 CKPT_HC_COUNT = 4
@@ -67,7 +68,7 @@ class Qwen4ExpGatedResidual(OpWrapper):
     as stored (`nn.Linear` layout), nothing is cached.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     # spec: leading (token dims), inject (True). Every cell is this
     # checkpoint's 4x2560 bf16 geometry with synthetic weights of its measured

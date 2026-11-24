@@ -78,6 +78,8 @@ from tensorrt_llm.runtime.kv_cache_hash import \
     get_effective_kv_cache_event_hash_algo
 from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
 from tensorrt_llm.serve._perf_metrics_config import resolve_perf_metrics_config
+from tensorrt_llm.serve._visual_gen_errors import \
+    render_visual_gen_validation_error
 from tensorrt_llm.serve.anthropic_adapter import (
     AnthropicRequestError, AnthropicResponseError, anthropic_error_response,
     convert_anthropic_count_tokens_request, convert_anthropic_request,
@@ -142,7 +144,7 @@ from tensorrt_llm.serve.render import (HarmonyConversionError, RenderResources,
                                        mount_render_endpoints,
                                        prepare_chat_request, render_chat,
                                        render_chat_for_length,
-                                       render_conversation)
+                                       render_conversation_with_media)
 from tensorrt_llm.serve.reranker import (Qwen3RerankInputBuilder,
                                          rerank_probability)
 from tensorrt_llm.serve.responses_utils import (ClosingStreamingResponse,
@@ -946,7 +948,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 return anthropic_error_response(str(exc),
                                                 "invalid_request_error", 400)
             if self.server_role is ServerRole.VISUAL_GEN:
-                return self._create_visual_gen_validation_error_response(exc)
+                return render_visual_gen_validation_error(
+                    exc, self.create_error_response)
             # Non-visual-gen roles keep the shared 400 + ``{"error": ...}``
             # response shape that integration tests (e.g.
             # ``test_malformed_json_request``) and existing clients
@@ -1241,36 +1244,6 @@ class OpenAIServer(_VideoRoutesMixin):
             err_type="NotImplementedError",
             message=message,
             status_code=HTTPStatus.NOT_IMPLEMENTED,
-        )
-
-    def _create_visual_gen_validation_error_response(
-            self, exc: RequestValidationError) -> Response:
-        """Render a ``RequestValidationError`` as the visual-gen 422 envelope.
-
-        The body has the LLM-style ``{message, type, code}`` shape with
-        HTTP 422. The ``message`` field names the offending field(s) for
-        each error in ``exc.errors()`` so clients can fix the request
-        without parsing the full Pydantic payload.
-        """
-        parts: List[str] = []
-        for err in exc.errors():
-            loc = ".".join(
-                str(seg) for seg in err.get("loc", ()) if seg != "body")
-            etype = err.get("type", "")
-            msg = err.get("msg", "")
-            if etype == "extra_forbidden":
-                parts.append(
-                    f"Unknown request field {loc!r}. Pass model-specific "
-                    "parameters via 'extra_params' instead.")
-            elif loc:
-                parts.append(f"{loc}: {msg}")
-            else:
-                parts.append(msg)
-        message = "; ".join(parts) if parts else str(exc)
-        return self.create_error_response(
-            message=message,
-            err_type="BadRequestError",
-            status_code=HTTPStatus.UNPROCESSABLE_ENTITY,
         )
 
     def _check_health(self) -> bool:
@@ -1647,16 +1620,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 token_ids_list.append(token_ids)
 
             try:
-                # Validate every input's length up front so an oversize item fails
-                # the whole request before any item is enqueued — otherwise gather()
-                # cancels the awaiters but their already-queued inputs still run
-                # encode() (wasted GPU work).
-                for token_ids in token_ids_list:
-                    self.encode_batcher.validate_input(token_ids)
-                results = await asyncio.gather(*[
-                    self.encode_batcher.submit(token_ids)
-                    for token_ids in token_ids_list
-                ])
+                results = await self.encode_batcher.submit_many(token_ids_list)
             except InputTooLongError as e:
                 return self.create_error_response(
                     str(e), status_code=HTTPStatus.BAD_REQUEST)
@@ -2610,24 +2574,34 @@ class OpenAIServer(_VideoRoutesMixin):
                 prompt = request.prompt_token_ids
             else:
                 # Render (and append the forced named-tool prefix, see
-                # ``_build_forced_tool_call_decoding``) while the media loads.
+                # ``_build_forced_tool_call_decoding``) while the media loads,
+                # or once it has loaded for a renderer that needs it.
                 # Tokenization stays with the engine's input processor.
-                render_task = render_conversation(
-                    render_resources,
-                    conversation=conversation,
-                    mm_placeholder_counts=mm_placeholder_counts,
-                    add_generation_prompt=request.add_generation_prompt,
-                    tools=tool_dicts,
-                    documents=request.documents,
-                    chat_template=request.chat_template,
-                    chat_template_kwargs=request.chat_template_kwargs,
-                    injected_chat_template_kwargs=request.
-                    injected_chat_template_kwargs,
-                    forced_prefix=forced_tool_begin_prefix,
-                )
-                rendered, (mm_data, mm_embeddings) = await asyncio.gather(
-                    render_task, mm_coroutines)
+                rendered, (
+                    mm_data,
+                    mm_embeddings) = await render_conversation_with_media(
+                        render_resources,
+                        mm_coroutines,
+                        conversation=conversation,
+                        mm_placeholder_counts=mm_placeholder_counts,
+                        add_generation_prompt=request.add_generation_prompt,
+                        tools=tool_dicts,
+                        documents=request.documents,
+                        chat_template=request.chat_template,
+                        chat_template_kwargs=request.chat_template_kwargs,
+                        injected_chat_template_kwargs=request.
+                        injected_chat_template_kwargs,
+                        forced_prefix=forced_tool_begin_prefix,
+                        truncate_prompt_tokens=request.truncate_prompt_tokens,
+                    )
                 if rendered.text is None:
+                    if forced_tool_begin_prefix is not None:
+                        # The prefix is text; appending it to rendered token
+                        # ids would need a re-encode that loses control tokens.
+                        raise ValueError(
+                            "tool_choice with a named function is not "
+                            "supported for this model, whose chat template "
+                            "renders token ids.")
                     prompt = rendered.token_ids
                 else:
                     prompt = rendered.text
@@ -3195,20 +3169,21 @@ class OpenAIServer(_VideoRoutesMixin):
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
             else:
-                render_task = render_conversation(
-                    render_resources,
-                    conversation=conversation,
-                    mm_placeholder_counts=mm_placeholder_counts,
-                    add_generation_prompt=request.add_generation_prompt,
-                    tools=tool_dicts,
-                    documents=request.documents,
-                    chat_template=request.chat_template,
-                    chat_template_kwargs=request.chat_template_kwargs,
-                    injected_chat_template_kwargs=request.
-                    injected_chat_template_kwargs,
-                )
-                rendered, (mm_data, mm_embeddings) = await asyncio.gather(
-                    render_task, mm_coroutines)
+                rendered, (
+                    mm_data,
+                    mm_embeddings) = await render_conversation_with_media(
+                        render_resources,
+                        mm_coroutines,
+                        conversation=conversation,
+                        mm_placeholder_counts=mm_placeholder_counts,
+                        add_generation_prompt=request.add_generation_prompt,
+                        tools=tool_dicts,
+                        documents=request.documents,
+                        chat_template=request.chat_template,
+                        chat_template_kwargs=request.chat_template_kwargs,
+                        injected_chat_template_kwargs=request.
+                        injected_chat_template_kwargs,
+                    )
                 prompt = (rendered.text
                           if rendered.text is not None else rendered.token_ids)
             prompt = prompt_inputs(prompt)
@@ -4537,7 +4512,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 output = self.generator.generate(inputs=request.prompt,
                                                  params=params)
             except ValidationError as exc:
-                return self._render_pydantic_validation_error(exc)
+                return render_visual_gen_validation_error(
+                    exc, self.create_error_response)
             except ValueError as exc:
                 logger.error(f"Image edit request error: {exc}")
                 return self.create_error_response(
@@ -4599,7 +4575,8 @@ class OpenAIServer(_VideoRoutesMixin):
             return JSONResponse(content=response.model_dump(), headers=headers)
 
         except ValidationError as exc:
-            return self._render_pydantic_validation_error(exc)
+            return render_visual_gen_validation_error(
+                exc, self.create_error_response)
         except Exception as e:
             logger.error(traceback.format_exc())
             return self.create_error_response(

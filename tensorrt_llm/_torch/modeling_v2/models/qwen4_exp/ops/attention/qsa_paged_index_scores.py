@@ -15,7 +15,8 @@ from tensorrt_llm._torch.attention.backends.sparse.qsa import kernels as _qsa_ke
 from tensorrt_llm._torch.attention.backends.sparse.qsa.kernels import (
     triton_qsa_paged_index_scores as _triton_qsa_paged_index_scores,
 )
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.jit_variants import warm_variants
 from tensorrt_llm._torch.modules.fla.op import gdc_wait_with_memory_clobber
 
@@ -817,7 +818,7 @@ class QsaPagedIndexScores(OpWrapper):
     Returns a fresh fp32 `[rows, columns]`; nothing is written in place.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     CELLS: tuple[Cell, ...] = (
         Cell(
@@ -1111,7 +1112,7 @@ class QsaPagedIndexScores(OpWrapper):
     (`_qsa_paged_index_scores_kernel`, `_qsa_paged_index_scores_qtile_kernel`,
     `_qsa_paged_index_scores_group_kernel`),
     JIT-compiled for the running device on first call; the cells ran that JIT
-    path on sm_103.
+    path on sm_103 and sm_107.
 
     Visible-split kernel (decode-sized visible-only calls). Its grid is
     `(row tiles, request slots, split)`: a row tile is `min(rows, 16 // heads)`
