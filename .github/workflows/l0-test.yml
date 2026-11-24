@@ -67,8 +67,8 @@ jobs:
               !parsed.port &&
               !parsed.username &&
               !parsed.password &&
-              !parsed.search &&
-              !parsed.hash &&
+              !rawUrl.includes('?') &&
+              !rawUrl.includes('#') &&
               /^\/artifactory\/sw-tensorrt-llm-generic-local\/redacted\/llm-artifacts\/[A-Za-z0-9._/-]+\/test-results\.tar\.gz$/.test(parsed.pathname) &&
               !pathSegments.includes('') &&
               !pathSegments.includes('.') &&
