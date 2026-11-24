@@ -25,7 +25,7 @@ from cutlass import Int32, Int64
 
 from ...constants import DEFAULT_RANK, HEAD_DIM, QK_CHANNELS
 from ...inputs import hadamard
-from ...runtime import current_stream, num_sms
+from ...runtime import current_stream, num_sms, token_pitches
 from .encode import ENCODE_THREADS
 
 
@@ -84,6 +84,8 @@ def run(
 ):
     """Run the launches of a chain on the current stream: raw BF16 q, k, v [B, S, H, 128] into the buffers of the call.
 
+    * q, k, v: contiguous, or views of a fused projection; the kernels read their tokens at the pitch of each tensor.
+
     * host, cache, host_buffers: the host function of the kernel package, its compile cache and the buffers whose
       addresses it takes after q, k, v, the rows and the rotation, in its order.
     * min_score_log2: log2 of the score-scale floor; rows: the sampled tokens of the Q/K basis (inputs.sample_rows).
@@ -112,6 +114,7 @@ def run(
         B,
         S,
         H,
+        *token_pitches(q, k, v),
         rows.shape[-1],
         T,
         min_score_log2,

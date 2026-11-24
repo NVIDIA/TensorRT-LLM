@@ -48,8 +48,10 @@ attention(operands, out)                   # BF16 [B, S, H, 128] out
 
 `workspace_size` and `prepare` raise `ValueError` for a PV format or rank that the GPU does not offer.
 
-- **Tensors.** `q`, `k`, `v` and `out` are contiguous BF16 tensors of one shape on one device, at 256-byte aligned
-  addresses: every allocation is, and a view into one at an offset of a multiple of 128 elements.
+- **Tensors.** `q`, `k`, `v` and `out` are BF16 tensors of one shape on one device, at 256-byte aligned addresses:
+  every allocation is, and a view into one at an offset of a multiple of 128 elements. `out` is contiguous; `q`, `k`
+  and `v` are contiguous or the slices of a fused projection `[B, S, Hq + 2 Hkv, 128]`, which the preparation reads
+  in place at the projection's pitch.
 - **Workspace.** The caller owns it: a one-dimensional `uint8` tensor on the device of `q`, of at least
   `workspace_size(...)` bytes, at an address that is a multiple of 256. Its content does not matter. The functions
   keep nothing between calls and a call writes every byte it reads, so one buffer serves calls of any shape that

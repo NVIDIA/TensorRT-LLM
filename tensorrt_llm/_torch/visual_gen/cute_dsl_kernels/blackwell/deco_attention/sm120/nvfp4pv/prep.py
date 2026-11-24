@@ -62,6 +62,9 @@ def _host(
     B: Int32,
     S: Int32,
     H: Int32,
+    QP: Int32,
+    KP: Int32,
+    VP: Int32,
     NQK: Int32,
     T: Int32,
     msl: Int32,
@@ -97,6 +100,9 @@ def _host(
         B,
         S,
         H,
+        QP,
+        KP,
+        VP,
         T,
         NQK,
         BH,
@@ -107,10 +113,26 @@ def _host(
     ).launch(grid=(BH + nspare, 1, 1), block=(EIG_THREADS, 1, 1), stream=stream)
     if cutlass.const_expr(not FUSED):
         v_kernel(
-            v_p, vmax_p, v4_p, v4sf_p, vmean_p, v4s_p, S, H, T, nspare, nv_items, nv_cta, lens_p
+            v_p, vmax_p, v4_p, v4sf_p, vmean_p, v4s_p, S, H, VP, T, nspare, nv_items, nv_cta, lens_p
         ).launch(grid=(nv_cta, 1, 1), block=(V_THREADS, 1, 1), stream=stream)
     qk_kernel(
-        q_p, k_p, had_p, ut_p, q4_p, k4_p, prov_p, gmax_p, B, S, H, T, nqk_items, nqk_cta, lens_p
+        q_p,
+        k_p,
+        had_p,
+        ut_p,
+        q4_p,
+        k4_p,
+        prov_p,
+        gmax_p,
+        B,
+        S,
+        H,
+        QP,
+        KP,
+        T,
+        nqk_items,
+        nqk_cta,
+        lens_p,
     ).launch(grid=(nqk_cta, 1, 1), block=(QK_THREADS, 1, 1), stream=stream)
     encode_kernel(
         prov_p, gmax_p, qsf_p, ksf_p, score_scale_p, B, H, T, nqk_cta, msl, nenc_cta

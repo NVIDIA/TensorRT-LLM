@@ -385,6 +385,39 @@ def test_deco_kernel_api_takes_aligned_tensors_only(require_deco_kernels) -> Non
 
 
 @pytest.mark.parametrize("v_dtype", V_DTYPES)
+def test_deco_reads_the_slices_of_a_fused_projection(require_deco_kernels, v_dtype: str) -> None:
+    """The preparation reads q, k and v in place from a fused QKV projection, whose slices are
+    strided over the heads: the bits of contiguous copies, with and without valid lengths, and
+    the backend hands such slices to the kernels without a copy. A slice of another layout is
+    rejected by the kernel API, and the output must be contiguous."""
+    device = require_deco_kernels(v_dtype)
+    batch_size, seq_len, num_heads = 2, 1024, 3
+    gen = torch.Generator(device=device).manual_seed(0)
+    fused = torch.randn(
+        (batch_size, seq_len, 3 * num_heads, 128), generator=gen, device=device
+    ).bfloat16()
+    q, k, v = (fused[:, :, i * num_heads : (i + 1) * num_heads] for i in range(3))
+    assert not q.is_contiguous() and deco_attention.token_rows(q)
+    lens = torch.tensor([1024, 700], dtype=torch.int32, device=device)
+    for valid_seq_lens in (None, lens):
+        expected = _kernels(
+            q.contiguous(), k.contiguous(), v.contiguous(), v_dtype, valid_seq_lens=valid_seq_lens
+        )
+        assert torch.equal(_kernels(q, k, v, v_dtype, valid_seq_lens=valid_seq_lens), expected)
+    state: dict = {}
+    attn = _backend(num_heads, v_dtype, state=state)
+    contiguous_out = attn.forward(q.contiguous(), k.contiguous(), v.contiguous())
+    assert torch.equal(attn.forward(q, k, v), contiguous_out)
+    num_bytes = deco_attention.workspace_size(batch_size, seq_len, num_heads, device, v_dtype)
+    workspace = torch.empty(num_bytes, dtype=torch.uint8, device=device)
+    channels_outer = torch.empty((batch_size, 128, num_heads, seq_len), device=device).bfloat16()
+    with pytest.raises(ValueError, match="fused projection"):
+        deco_attention.prepare(q, k, channels_outer.permute(0, 3, 2, 1), workspace, v_dtype)
+    with pytest.raises(ValueError, match="contiguous"):
+        deco_attention.attention(deco_attention.prepare(q, k, v, workspace, v_dtype), q)
+
+
+@pytest.mark.parametrize("v_dtype", V_DTYPES)
 def test_deco_constant_v_comes_back_as_the_constant(require_deco_kernels, v_dtype: str) -> None:
     """A V of one large value in every row has block means of that value and deviations of
     zero; the smoothed V keeps its scaled means finite, and the output is the constant."""

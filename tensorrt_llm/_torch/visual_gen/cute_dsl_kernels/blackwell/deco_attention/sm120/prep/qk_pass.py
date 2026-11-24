@@ -43,7 +43,7 @@ from ..ptx.shared import (
     st_global_b32_v2_hint,
 )
 from ..valid_len import valid_len
-from .basis import row_addr
+from .basis import tok_addr
 
 QK_THREADS = 256
 
@@ -135,8 +135,14 @@ def _item_coords(item, T, BH, H):
     return bhs, tile, side, bh, bb, bh - bb * H
 
 
-def _rows_base(qk, side, bb, hh, rg, S, H, t):
-    return row_addr(Int64(cutlass.select_(side != 0, qk[1], qk[0])), bb, rg, hh, S, H, 256) + t * 8
+def _side_pitch(pitches, side):
+    """The token pitch (bytes) of the side's tensor: pitches = (that of q, that of k)."""
+    return Int64(cutlass.select_(side != 0, pitches[1], pitches[0]))
+
+
+def _rows_base(qk, pitches, side, bb, hh, rg, S, t):
+    base = Int64(cutlass.select_(side != 0, qk[1], qk[0]))
+    return tok_addr(base, bb, rg, hh, S, _side_pitch(pitches, side)) + t * 8
 
 
 def _load_rows(afn, base, rstride, rg, nv, live=None):
@@ -167,12 +173,15 @@ def qk_kernel(
     B: Int32,
     S: Int32,
     H: Int32,
+    QP: Int32,
+    KP: Int32,
     T: Int32,
     nitems: Int32,
     ncta: Int32,
     lens_p,
 ):
-    """The Q'/K' pass of the CTA's share of the nitems items (side, batch, head, tile). lens_p: None, or the global
+    """The Q'/K' pass of the CTA's share of the nitems items (side, batch, head, tile). QP, KP: the bytes between
+    consecutive tokens of q and of k. lens_p: None, or the global
     address of the valid prefix lengths: the tokens from the length of their batch element on are then read as zeros
     (zero codes and block scales, outside the group maxima), and a tile without a valid token is left as it is."""
     tid, _, _ = cute.arch.thread_idx()
@@ -236,7 +245,7 @@ def qk_kernel(
     item_lo = (cta * nitems) // ncta
     item_hi = ((cta + 1) * nitems) // ncta
     cur = Int32(-1)
-    rstride = Int64(H) * 256
+    pitches = (QP, KP)
     BH = B * H
     af = cute.make_rmem_tensor((32,), Uint32)
     afn = cute.make_rmem_tensor((32,), Uint32)
@@ -245,7 +254,13 @@ def qk_kernel(
         _, tile0, side0, _, bb0, hh0 = _item_coords(item_lo, T, BH, H)
         rg0 = tile0 * 128 + warp * 16 + g
         nv0 = valid_len(lens_p, bb0, S)
-        _load_rows(afn, _rows_base((q_p, k_p), side0, bb0, hh0, rg0, S, H, t), rstride, rg0, nv0)
+        _load_rows(
+            afn,
+            _rows_base((q_p, k_p), pitches, side0, bb0, hh0, rg0, S, t),
+            _side_pitch(pitches, side0),
+            rg0,
+            nv0,
+        )
     for item in cutlass.range(item_lo, item_hi, unroll=1):
         for i in cutlass.range_constexpr(32):
             af[i] = afn[i]
@@ -257,7 +272,12 @@ def qk_kernel(
         nok = Int32(nitem < item_hi)
         nvn = valid_len(lens_p, cutlass.min(nbb, B - 1), S)
         _load_rows(
-            afn, _rows_base((q_p, k_p), nside, nbb, nhh, nrg, S, H, t), rstride, nrg, nvn, nok
+            afn,
+            _rows_base((q_p, k_p), pitches, nside, nbb, nhh, nrg, S, t),
+            _side_pitch(pitches, nside),
+            nrg,
+            nvn,
+            nok,
         )
         live = cutlass.const_expr(lens_p is None) or tile * 128 < valid_len(lens_p, bb, S)
         if live:

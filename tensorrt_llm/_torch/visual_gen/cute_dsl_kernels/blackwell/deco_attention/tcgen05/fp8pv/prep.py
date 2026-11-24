@@ -39,7 +39,7 @@ from cutlass.cute.runtime import from_dlpack
 
 from ...constants import HEAD_DIM, qk_scale_atoms
 from ...inputs import hadamard
-from ...runtime import num_sms, pdl_enabled
+from ...runtime import num_sms, pdl_enabled, token_pitches
 from ..prep.basis import EIG_THREADS, GMAX_WORDS, clear_kernel, eig_kernel, eig_kernel_lens
 from ..prep.encode import encode_kernel, encode_threads
 from ..prep.qk_pass import QK_THREADS, X_STAGES, qk_kernel, qk_kernel_lens
@@ -68,20 +68,20 @@ def _launch_chain(inputs, operands, scratch, sizes, grids, stream, rank, lens, p
     q, k, v, rows, hadamard = inputs
     q4, k4, q_sf, k_sf, score_scale, v8, v_mean, v8_scale = operands
     gmax, uT, q_sfv, k_sfv = scratch
-    S, H, NQK, NCQ, BH, NB = sizes
+    S, H, QP, KP, VP, NQK, NCQ, BH, NB = sizes
     v_units, v_grid, ntiles, qgrid, egrid = grids
     min_prod = HEAD_DIM * 2.0**MIN_SCORE_LOG2
     clear_kernel(gmax).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
     if lens is None:
-        eig = eig_kernel(q, k, rows, hadamard, uT, S, H, NQK, NCQ, rank)
-        vs = v_scan_kernel(v, v_mean, gmax, S, H, NB, v_units)
-        ve = v_encode_kernel(v, v8, v_mean, gmax, S, H, NB, v_units)
+        eig = eig_kernel(q, k, rows, hadamard, uT, S, H, QP, KP, NQK, NCQ, rank)
+        vs = v_scan_kernel(v, v_mean, gmax, S, H, VP, NB, v_units)
+        ve = v_encode_kernel(v, v8, v_mean, gmax, S, H, VP, NB, v_units)
     else:
         eig = eig_kernel_lens(
-            q, k, rows, hadamard, uT, lens[0], S, H, NQK, NCQ, rank, lens[1], lens[2]
+            q, k, rows, hadamard, uT, lens[0], S, H, QP, KP, NQK, NCQ, rank, lens[1], lens[2]
         )
-        vs = v_scan_kernel_lens(v, v_mean, gmax, lens[0], S, H, NB, v_units)
-        ve = v_encode_kernel_lens(v, v8, v_mean, gmax, lens[0], S, H, NB, v_units)
+        vs = v_scan_kernel_lens(v, v_mean, gmax, lens[0], S, H, VP, NB, v_units)
+        ve = v_encode_kernel_lens(v, v8, v_mean, gmax, lens[0], S, H, VP, NB, v_units)
     eig.launch(grid=(BH, 1, 1), block=(EIG_THREADS, 1, 1), use_pdl=pdl, stream=stream)
     vs.launch(
         grid=(v_grid, 1, 1),
@@ -132,6 +132,8 @@ def _make_host(rank, rows_per_sample=None, map_rows=False, pdl=True):
       valid prefix lengths [B] after the buffers, with rows [B, NQK] (True) or [NQK] (False). map_rows: the
       eigensolver maps the rows into each valid prefix (the default draw).
     * pdl: the launches of the chain follow each other as programmatic dependents.
+    * QP, KP, VP: the bytes between consecutive tokens of q, k and v, which the eigensolver and the V scan and encode
+      read in place (the Q/K pass reads them through TMA descriptors built on the tensors' layouts).
     """
     if rows_per_sample is None:
 
@@ -156,6 +158,9 @@ def _make_host(rank, rows_per_sample=None, map_rows=False, pdl=True):
             k_sfv: cute.Tensor,
             S: Int32,
             H: Int32,
+            QP: Int32,
+            KP: Int32,
+            VP: Int32,
             NQK: Int32,
             NCQ: Int32,
             BH: Int32,
@@ -171,7 +176,7 @@ def _make_host(rank, rows_per_sample=None, map_rows=False, pdl=True):
                 (q, k, v, rows, hadamard),
                 (q4, k4, q_sf, k_sf, score_scale, v8, v_mean, v8_scale),
                 (gmax, uT, q_sfv, k_sfv),
-                (S, H, NQK, NCQ, BH, NB),
+                (S, H, QP, KP, VP, NQK, NCQ, BH, NB),
                 (v_units, v_grid, ntiles, qgrid, egrid),
                 stream,
                 rank,
@@ -203,6 +208,9 @@ def _make_host(rank, rows_per_sample=None, map_rows=False, pdl=True):
         lens: cute.Tensor,
         S: Int32,
         H: Int32,
+        QP: Int32,
+        KP: Int32,
+        VP: Int32,
         NQK: Int32,
         NCQ: Int32,
         BH: Int32,
@@ -218,7 +226,7 @@ def _make_host(rank, rows_per_sample=None, map_rows=False, pdl=True):
             (q, k, v, rows, hadamard),
             (q4, k4, q_sf, k_sf, score_scale, v8, v_mean, v8_scale),
             (gmax, uT, q_sfv, k_sfv),
-            (S, H, NQK, NCQ, BH, NB),
+            (S, H, QP, KP, VP, NQK, NCQ, BH, NB),
             (v_units, v_grid, ntiles, qgrid, egrid),
             stream,
             rank,
@@ -302,7 +310,8 @@ def run(q, k, v, rows, buffers, rank, lens=None, map_rows=False):
     tensors = (q, k, v, rows, hadamard(dev), *(buffers[n] for n in _HOST_BUFFERS))
     if lens is not None:
         tensors += (lens,)
-    sizes = (S, H, NQK, (NQK + 255) // 256, BH, NB, v_units, v_grid, ntiles, qgrid, egrid)
+    sizes = (S, H, *token_pitches(q, k, v), NQK, (NQK + 255) // 256, BH, NB)
+    sizes += (v_units, v_grid, ntiles, qgrid, egrid)
     map_rows = lens is not None and map_rows
     pdl = pdl_enabled()
     key = (dev.index, rank, rows_per_sample, map_rows, pdl)

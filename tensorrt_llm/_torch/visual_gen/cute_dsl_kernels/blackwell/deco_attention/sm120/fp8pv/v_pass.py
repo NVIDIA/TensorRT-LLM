@@ -50,6 +50,7 @@ from ..prep.basis import (
     scan_max_word,
     stage_rows,
     store_slot,
+    tok_addr,
 )
 from ..ptx.fp8pv import st_global_cs_b32_pred, st_global_cs_b32_v2_pred
 from ..ptx.shared import ld_global_nc_b32_hint_pred
@@ -103,6 +104,7 @@ def _vscan(
     done_p: Int64,
     S: Int32,
     H: Int32,
+    VP: Int32,
     T: Int32,
     ntiles: Int32,
     tid: Int32,
@@ -116,7 +118,7 @@ def _vscan(
     grp = u & 7
     cc = u >> 3
     sub4 = tid >> 7
-    rstride = Int64(H) * 256
+    rstride = Int64(VP)
     mx = Float32(0.0)
     scanned = Int32(0)
     t4 = next_scan_tiles(sb, done_p, tid)
@@ -131,7 +133,7 @@ def _vscan(
         k0 = tt * 128 + 16 * grp
         nk = valid_len(lens_p, bb, S)
         cnt = key_count(k0, nk) * tv
-        base = row_addr(v_p, bb, cutlass.min(k0, S - 1), hh, S, H, 256) + Int64(cc * 16)
+        base = tok_addr(v_p, bb, cutlass.min(k0, S - 1), hh, S, VP) + Int64(cc * 16)
         # with lengths: a tile without a valid key is skipped
         live = cutlass.const_expr(lens_p is None) or tt * 128 < nk
         if live:
@@ -149,6 +151,7 @@ def _vscan_gs(
     B: Int32,
     S: Int32,
     H: Int32,
+    VP: Int32,
     cta: Int32,
     ncta: Int32,
     tid: Int32,
@@ -172,11 +175,11 @@ def _vscan_gs(
         k0 = tt * 128 + 16 * grp
         nk = valid_len(lens_p, bb, S)
         cnt = key_count(k0, nk)
-        base = row_addr(v_p, bb, cutlass.min(k0, S - 1), hh, S, H, 256) + Int64(cc * 16)
+        base = tok_addr(v_p, bb, cutlass.min(k0, S - 1), hh, S, VP) + Int64(cc * 16)
         # with lengths: a tile without a valid key is skipped
         live = cutlass.const_expr(lens_p is None) or tt * 128 < nk
         if live:
-            sums, vmx, vmn = group16(base, Int64(H) * 256, cnt)
+            sums, vmx, vmn = group16(base, Int64(VP), cnt)
             mx = _tile_fold(sums, vmx, vmn, cnt, mx)
     store_slot(mx, tid, sb, vmax_p, cta)
 
@@ -190,6 +193,7 @@ def _vpass(
     done_p: Int64,
     S: Int32,
     H: Int32,
+    VP: Int32,
     T: Int32,
     ntiles: Int32,
     pid: Int32,
@@ -221,7 +225,7 @@ def _vpass(
     # tile t: issue its 128 x 256 B rows into vin (zero past S)
     tix = next_tile(word, ctr, tid_h, half)
     if tix < ntiles:
-        stage_rows(v_p, vin, tid_h, ntiles - 1 - tix, S, H, T, lens_p)
+        stage_rows(v_p, vin, tid_h, ntiles - 1 - tix, S, H, VP, T, lens_p)
     cute.arch.cp_async_commit_group()
     cute.arch.barrier(barrier_id=1 + half, number_of_threads=256)
     nix = next_tile(word, ctr, tid_h, half)
@@ -254,7 +258,7 @@ def _vpass(
         cute.arch.barrier(barrier_id=1 + half, number_of_threads=256)
         # prefetch the next tile while this one is processed
         if nix < ntiles:
-            stage_rows(v_p, vin, tid_h, ntiles - 1 - nix, S, H, T, lens_p)
+            stage_rows(v_p, vin, tid_h, ntiles - 1 - nix, S, H, VP, T, lens_p)
         cute.arch.cp_async_commit_group()
         # with lengths: a tile without a valid key is skipped
         live = cutlass.const_expr(lens_p is None) or tt * 128 < nk
@@ -303,6 +307,9 @@ def basis_kernel(
     B: Int32,
     S: Int32,
     H: Int32,
+    QP: Int32,
+    KP: Int32,
+    VP: Int32,
     T: Int32,
     NQK: Int32,
     BH: Int32,
@@ -321,15 +328,17 @@ def basis_kernel(
         done_p,
         S,
         H,
+        QP,
+        KP,
         T,
         NQK,
         BH,
         nspare,
         FUSED,
-        lambda cta, tid, sb: _vscan_gs(v_p, vmax_p, B, S, H, cta, nspare, tid, sb, lens_p),
-        lambda ntiles, tid, sb: _vscan(v_p, done_p, S, H, T, ntiles, tid, sb, lens_p),
+        lambda cta, tid, sb: _vscan_gs(v_p, vmax_p, B, S, H, VP, cta, nspare, tid, sb, lens_p),
+        lambda ntiles, tid, sb: _vscan(v_p, done_p, S, H, VP, T, ntiles, tid, sb, lens_p),
         lambda ntiles, pid, tid, sb: _vpass(
-            v_p, v8_p, vmean_p, v8s_p, done_p, S, H, T, ntiles, pid, tid, sb, lens_p
+            v_p, v8_p, vmean_p, v8s_p, done_p, S, H, VP, T, ntiles, pid, tid, sb, lens_p
         ),
         lens_p,
         rows_mode,
@@ -345,6 +354,7 @@ def v_kernel(
     v8s_p: Int64,
     S: Int32,
     H: Int32,
+    VP: Int32,
     T: Int32,
     nspare: Int32,
     nitems: Int32,
@@ -368,7 +378,7 @@ def v_kernel(
     grp = lane & 7
     cc = (lane >> 3) + 4 * warp
     SP16 = T * 8
-    rstride = Int64(H) * 256
+    rstride = Int64(VP)
     item_lo = (cta * nitems) // ncta
     item_hi = ((cta + 1) * nitems) // ncta
     for item in cutlass.range(item_lo, item_hi, unroll=1):
@@ -381,7 +391,7 @@ def v_kernel(
         nk = valid_len(lens_p, bb, S)
         cnt = cnt_s if cutlass.const_expr(lens_p is None) else key_count(k0, nk)
         kb = cutlass.min(k0, S - 1)
-        base = row_addr(v_p, bb, kb, hh, S, H, 256) + Int64(cc * 16)
+        base = tok_addr(v_p, bb, kb, hh, S, VP) + Int64(cc * 16)
         # with lengths: a tile without a valid key is skipped
         live = cutlass.const_expr(lens_p is None) or tile * 128 < nk
         if live:

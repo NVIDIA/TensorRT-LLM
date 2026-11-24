@@ -133,8 +133,8 @@ def chunk_src(st, mat, tok, chk):
     """Global address of 16-byte chunk chk of the row of token tok of q (mat 0) or k (mat 1) of this (batch, head)."""
     return (
         Int64(cutlass.select_(mat != 0, st.k_p, st.q_p))
-        + ((st.rowoff + Int64(tok)) * Int64(st.H) + Int64(st.h)) * 256
-        + Int64(chk * 16)
+        + (st.rowoff + Int64(tok)) * Int64(cutlass.select_(mat != 0, st.KP, st.QP))
+        + Int64(st.h * 256 + chk * 16)
     )
 
 
@@ -697,6 +697,8 @@ def _eig(
     bh: Int32,
     S: Int32,
     H: Int32,
+    QP: Int32,
+    KP: Int32,
     NQK: Int32,
     tid: Int32,
     sb: Int32,
@@ -713,10 +715,13 @@ def _eig(
     * st gets the coordinates, the region addresses and the typed views of a phase where the phase begins. A view
       (s...) covers a regular array of one scalar type, for the scalar loads and stores that index it; the 16-byte
       vector loads and stores, the asynchronous copies, ldmatrix and the predicated loads take the region addresses.
+    * QP, KP: the bytes between consecutive tokens of q and of k.
     * lens_p, rows_mode: None, or the global address of the valid prefix lengths and the rows mode of sampled_token:
       the sampled tokens then lie in the valid prefix of the batch element.
     """
-    st = State(tid=tid, sb=sb, NQK=NQK, H=H, q_p=q_p, k_p=k_p, rows_p=rows_p, lens_p=lens_p)
+    st = State(
+        tid=tid, sb=sb, NQK=NQK, H=H, QP=QP, KP=KP, q_p=q_p, k_p=k_p, rows_p=rows_p, lens_p=lens_p
+    )
     st.rows_mode = rows_mode
     st.lane = tid & 31
     st.warp = tid >> 5
@@ -975,6 +980,12 @@ def key_count(k0, n):
     return cutlass.max(cutlass.min(n - k0, 16), 0)
 
 
+def tok_addr(p, bb, row, hh, S, pitch):
+    """Global address of the row of token `row` of (batch bb, head hh) of a raw [B, S, H, 128] BF16 tensor at p whose
+    tokens are `pitch` bytes apart (256 H for a contiguous tensor, the row of the fused projection for a view)."""
+    return p + (Int64(bb) * Int64(S) + Int64(row)) * Int64(pitch) + Int64(hh) * 256
+
+
 def row_addr(p, bb, row, hh, S, H, pitch):
     """Global address of row `row` of (batch bb, head hh) of a [B, S, H] tensor of `pitch` bytes per row at p."""
     return p + ((Int64(bb) * Int64(S) + Int64(row)) * Int64(H) + Int64(hh)) * pitch
@@ -1014,11 +1025,12 @@ def group16(base, rstride, cnt):
     return sums, vmx, vmn
 
 
-def stage_rows(v_p, vin, tid_h, tl, S, H, T, lens_p=None):
+def stage_rows(v_p, vin, tid_h, tl, S, H, VP, T, lens_p=None):
     """cp.async of the 128 x 256 B rows of V tile tl (flat over (batch, head, tile)) into the shared-memory buffer
     vin by the 256 threads of a V-pass half, thread tid_h eight of the 16-byte parts: row `key` at key * 256, its part p
     at (p ^ (key >> 4)) % 16 (zeros for the keys past S; lens_p: the global address of the valid prefix lengths, the
-    keys from the length of the batch element on are then zeros too)."""
+    keys from the length of the batch element on are then zeros too). VP: the bytes between consecutive tokens of
+    V."""
     bh = tl // T
     tt = tl - bh * T
     bb = bh // H
@@ -1029,11 +1041,7 @@ def stage_rows(v_p, vin, tid_h, tl, S, H, T, lens_p=None):
         key = c >> 4
         part = c & 15
         kg = tt * 128 + key
-        src = (
-            v_p
-            + ((Int64(bb) * Int64(S) + Int64(cutlass.min(kg, S - 1))) * Int64(H) + Int64(hh)) * 256
-            + Int64(part * 16)
-        )
+        src = tok_addr(v_p, bb, cutlass.min(kg, S - 1), hh, S, VP) + Int64(part * 16)
         cp_async16(
             vin + key * 256 + ((part ^ (key >> 4)) & 15) * 16,
             src,
@@ -1052,6 +1060,8 @@ def basis_cta(
     done_p: Int64,
     S: Int32,
     H: Int32,
+    QP: Int32,
+    KP: Int32,
     T: Int32,
     NQK: Int32,
     BH: Int32,
@@ -1066,7 +1076,8 @@ def basis_cta(
     """The CTA of a basis launch (grid BH + nspare, EIG_THREADS threads): the CTAs below BH solve one eigenproblem
     each, the nspare others scan V with the scan of the kernel's PV format (FUSED: vscan(ntiles, tid, sb) over the
     tiles a counter hands out, then its V pass vpass(ntiles, pid, tid, sb); otherwise vscan_gs(cta, tid, sb),
-    grid-stride over all of V). sb: the CTA's shared memory. lens_p, rows_mode: the lengths arguments of _eig."""
+    grid-stride over all of V). QP, KP: the token pitches of q and k (_eig). sb: the CTA's shared memory. lens_p,
+    rows_mode: the lengths arguments of _eig."""
     tid, _, _ = cute.arch.thread_idx()
     pid, _, _ = cute.arch.block_idx()
     smem = SmemAllocator()
@@ -1075,7 +1086,7 @@ def basis_cta(
     ntiles = BH * T
     # eigenproblems, and the V maxima in the other CTAs
     if pid < BH:
-        _eig(q_p, k_p, rows_p, had_p, ut_p, pid, S, H, NQK, tid, sb, lens_p, rows_mode)
+        _eig(q_p, k_p, rows_p, had_p, ut_p, pid, S, H, QP, KP, NQK, tid, sb, lens_p, rows_mode)
     elif cutlass.const_expr(not FUSED):
         vscan_gs(pid - BH, tid, sb)
     else:

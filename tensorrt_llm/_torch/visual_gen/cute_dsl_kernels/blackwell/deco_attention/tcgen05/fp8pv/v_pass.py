@@ -60,11 +60,12 @@ def _grid_max(x: Float32, maxima: Int32, gb: Int64, tidx: Int32, lane: Int32, wa
 
 
 @cute.jit
-def _v_scan_body(v, v_mean, gmax, S, H, NB, nunits, lens):
+def _v_scan_body(v, v_mean, gmax, S, H, VP, NB, nunits, lens):
     """The scan: per chunk (8 channels of a head) of every block the sum, minimum and maximum over the block's valid
     keys, the BF16 mean mu into v_mean (row = block) and max(max - mu, mu - min) into the grid's maximum (_grid_max).
-    lens: None, or the global address of the valid prefix lengths: the valid keys of a block are then those below the
-    length of its batch element, and a block without valid keys gets a zero mean."""
+    VP: the bytes between consecutive tokens of v. lens: None, or the global address of the valid prefix lengths: the
+    valid keys of a block are then those below the length of its batch element, and a block without valid keys gets
+    a zero mean."""
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
     gdim, _, _ = cute.arch.grid_dim()
@@ -78,7 +79,7 @@ def _v_scan_body(v, v_mean, gmax, S, H, NB, nunits, lens):
     gb = Int64(gmax.iterator.toint())
     nblk = (S + Int32(V_BLOCK - 1)) // Int32(V_BLOCK)
     nchunk = H * Int32(16)
-    row_bytes = Int64(H) * Int64(256)
+    row_bytes = Int64(VP)
     acc = Float32(0.0)
 
     u = bidx
@@ -142,7 +143,7 @@ def _v_scan_body(v, v_mean, gmax, S, H, NB, nunits, lens):
 
 
 @cute.jit
-def _v_encode_body(v, v8, v_mean, gmax, S, H, NB, nunits, lens):
+def _v_encode_body(v, v8, v_mean, gmax, S, H, VP, NB, nunits, lens):
     """The encode: v8 = E4M3((V - mu) / s), s the power-of-two scale of the maximum of the scan (the encode launch's
     v8_scale), and v_mean = mu / s (exact). lens: as for _v_scan_body; the keys from the length on get zero codes."""
     tidx, _, _ = cute.arch.thread_idx()
@@ -154,7 +155,7 @@ def _v_encode_body(v, v8, v_mean, gmax, S, H, NB, nunits, lens):
     gb = Int64(gmax.iterator.toint())
     nblk = (S + Int32(V_BLOCK - 1)) // Int32(V_BLOCK)
     nchunk = H * Int32(16)
-    row_bytes = Int64(H) * Int64(256)
+    row_bytes = Int64(VP)
     inv8 = Float32(1.0) / pow2_ceil_448(load_invariant(Float32, gb + Int64(4 * GMAX_V)))
 
     u = bidx
@@ -216,11 +217,12 @@ def v_scan_kernel(
     gmax: cute.Tensor,
     S: Int32,
     H: Int32,
+    VP: Int32,
     NB: Int32,
     nunits: Int32,
 ):
     """The scan (_v_scan_body) of a call whose batch elements are all full."""
-    _v_scan_body(v, v_mean, gmax, S, H, NB, nunits, None)
+    _v_scan_body(v, v_mean, gmax, S, H, VP, NB, nunits, None)
 
 
 @cute.kernel
@@ -231,11 +233,12 @@ def v_scan_kernel_lens(
     lens: cute.Tensor,
     S: Int32,
     H: Int32,
+    VP: Int32,
     NB: Int32,
     nunits: Int32,
 ):
     """The scan (_v_scan_body) of a call with valid prefix lengths lens [B] (int32)."""
-    _v_scan_body(v, v_mean, gmax, S, H, NB, nunits, Int64(lens.iterator.toint()))
+    _v_scan_body(v, v_mean, gmax, S, H, VP, NB, nunits, Int64(lens.iterator.toint()))
 
 
 @cute.kernel
@@ -246,11 +249,12 @@ def v_encode_kernel(
     gmax: cute.Tensor,
     S: Int32,
     H: Int32,
+    VP: Int32,
     NB: Int32,
     nunits: Int32,
 ):
     """The encode (_v_encode_body) of a call whose batch elements are all full."""
-    _v_encode_body(v, v8, v_mean, gmax, S, H, NB, nunits, None)
+    _v_encode_body(v, v8, v_mean, gmax, S, H, VP, NB, nunits, None)
 
 
 @cute.kernel
@@ -262,8 +266,9 @@ def v_encode_kernel_lens(
     lens: cute.Tensor,
     S: Int32,
     H: Int32,
+    VP: Int32,
     NB: Int32,
     nunits: Int32,
 ):
     """The encode (_v_encode_body) of a call with valid prefix lengths lens [B] (int32)."""
-    _v_encode_body(v, v8, v_mean, gmax, S, H, NB, nunits, Int64(lens.iterator.toint()))
+    _v_encode_body(v, v8, v_mean, gmax, S, H, VP, NB, nunits, Int64(lens.iterator.toint()))

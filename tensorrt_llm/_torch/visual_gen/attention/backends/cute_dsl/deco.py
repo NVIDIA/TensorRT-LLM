@@ -230,16 +230,13 @@ class DeCoAttention(AttentionBackend):
             out = out.masked_fill(padded, 0)
         return out
 
-    @torch.compile
-    def _contiguous_qkv(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return q, k and v as contiguous tensors, which the kernels read.
-
-        Slices of a fused QKV projection are strided; the compiled copy stays on a vectorized
-        kernel, and contiguous inputs pass through without a copy.
-        """
-        return q.contiguous(), k.contiguous(), v.contiguous()
+    @staticmethod
+    def _kernel_input(x: torch.Tensor) -> bool:
+        """Whether the kernels read x in place: contiguous or a view of a fused projection, at an
+        aligned address."""
+        return (
+            x.is_contiguous() or deco_attention.token_rows(x)
+        ) and x.data_ptr() % deco_attention.TENSOR_ALIGNMENT == 0
 
     def _workspace(self, num_bytes: int, device: torch.device) -> torch.Tensor:
         """Return the workspace of a call: the buffer of the component, grown to its largest call.
@@ -531,11 +528,11 @@ class DeCoAttention(AttentionBackend):
             key_padding_mask, kwargs.get("token_tags"), q.shape[0], q.shape[1], q.device
         )
         if order is None:
-            # The kernels read contiguous tensors at aligned addresses; a contiguous view into
-            # an allocation at an odd offset is copied.
+            # The kernels read the slices of a fused projection in place; a tensor of another
+            # layout, or at an address that is not aligned, is copied.
             q, k, v = (
-                x if x.data_ptr() % deco_attention.TENSOR_ALIGNMENT == 0 else x.clone()
-                for x in self._contiguous_qkv(q, k, v)
+                x if self._kernel_input(x) else x.clone(memory_format=torch.contiguous_format)
+                for x in (q, k, v)
             )
         return self._launch(q, k, v, rows, token_counts, order)
 

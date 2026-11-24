@@ -76,6 +76,12 @@ def current_stream(device):
     return cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
 
 
+def token_pitches(q, k, v):
+    """Return the bytes between consecutive tokens of q, k and v: 256 H for a contiguous tensor, the row of the fused
+    projection for a view into one."""
+    return tuple(t.stride(1) * t.element_size() for t in (q, k, v))
+
+
 def pdl_enabled():
     """Return whether the launches use programmatic dependent launch: TRTLLM_ENABLE_PDL, on unless set to 0, read
     at every call as the kernels of TensorRT-LLM read it."""

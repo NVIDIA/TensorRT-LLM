@@ -98,22 +98,36 @@ def _kernel(pv, rank):
 TENSOR_ALIGNMENT = 256
 
 
-def _check(shape, device, **tensors):
-    """Check that the caller's tensors (name=tensor) are contiguous BF16 tensors of one shape [B, S, H, HEAD_DIM]
-    (shape, or that of the first tensor for None) without an empty dimension, on one device (device, or that of the
-    first tensor), at 256-byte aligned addresses; return both."""
+def token_rows(x):
+    """Whether the tokens of x [B, S, H, HEAD_DIM] are rows of HEAD_DIM H contiguous elements at one pitch, a multiple
+    of the alignment, over the batch: a contiguous tensor, or a view of the fused projection [B, S, Hq + 2 Hkv, D]."""
+    return (
+        x.stride(3) == 1
+        and x.stride(2) == HEAD_DIM
+        and x.stride(1) >= x.shape[2] * HEAD_DIM
+        and x.stride(1) % (TENSOR_ALIGNMENT // x.element_size()) == 0
+        and x.stride(0) == x.shape[1] * x.stride(1)
+    )
+
+
+def _check(shape, device, *, token_views=False, **tensors):
+    """Check that the caller's tensors (name=tensor) are BF16 tensors of one shape [B, S, H, HEAD_DIM] (shape, or that
+    of the first tensor for None) without an empty dimension, contiguous (token_views: or a view whose tokens are
+    rows at one pitch, token_rows), on one device (device, or that of the first tensor), at 256-byte aligned
+    addresses; return both."""
     for name, x in tensors.items():
         if (
             not torch.is_tensor(x)
             or x.dtype != torch.bfloat16
             or x.dim() != 4
             or x.shape[3] != HEAD_DIM
-            or not x.is_contiguous()
+            or not (x.is_contiguous() or (token_views and token_rows(x)))
             or (shape is not None and tuple(x.shape) != shape)
         ):
             raise ValueError(
                 f"{name} must be a contiguous BF16 tensor of shape "
                 f"{list(shape) if shape else '[B, S, H, %d]' % HEAD_DIM}"
+                + (" or a view of a fused projection with that shape" if token_views else "")
             )
         if x.numel() == 0:
             raise ValueError(
@@ -141,8 +155,9 @@ def prepare(q, k, v, workspace, pv=None, rank=DEFAULT_RANK, rows=None, valid_seq
     """Run the preparation: write the operands of the attention into the workspace and return them (views into it).
 
     Args:
-        q, k, v: BF16 [B, S, H, 128], contiguous, on one device, at 256-byte aligned addresses (as every allocation
-            and every view at an offset of a multiple of 128 elements is).
+        q, k, v: BF16 [B, S, H, 128] on one device, at 256-byte aligned addresses (as every allocation and every view
+            at an offset of a multiple of 128 elements is): contiguous, or the slices of a fused projection
+            [B, S, Hq + 2 Hkv, 128], whose tokens the kernels read in place at the projection's pitch.
         workspace: uint8 [>= workspace_size(B, S, H, device, pv, rank)] on that device, 256-byte aligned, any content.
         rows: int32 [m] on that device, not empty: the tokens the compensation basis is estimated on.
             * None is the default draw, sample_rows(seq_len, device, rank=rank); a packed multimodal sequence passes
@@ -158,7 +173,7 @@ def prepare(q, k, v, workspace, pv=None, rank=DEFAULT_RANK, rows=None, valid_seq
               caller, [m] or [B, m] per batch element, are taken as given, and a row from n on stands for token n - 1.
     """
     family, pv = _kernel(pv, rank)
-    shape, device = _check(None, None, q=q, k=k, v=v)
+    shape, device = _check(None, None, token_views=True, q=q, k=k, v=v)
     if (
         not torch.is_tensor(workspace)
         or workspace.dtype != torch.uint8

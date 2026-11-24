@@ -82,11 +82,15 @@ def _gram(
     bh: Int32,
     S: Int32,
     H: Int32,
+    QP: Int32,
+    KP: Int32,
     NQK: Int32,
     NCQ: Int32,
     lens,
 ):
     """Stage in VH the sum of the trace-normalized Gram matrices of the sampled q and k rows of bh, 256 rows per chunk.
+
+    * QP, KP: the bytes between consecutive tokens of q and of k (256 H for a contiguous tensor).
 
     * All 288 threads participate (eight warps stage, four read TMEM rows); the step's last barrier publishes VH.
     * lens: None, or (the global address of the valid prefix lengths, rows per sample, mapped rows). With rows per
@@ -142,17 +146,16 @@ def _gram(
                 cc = it & 15
                 tok = Int32(cute.arch.load(sptr(Uint32, st.rbb + tt * 4), Uint32))
                 nb = Int32(16) * Int32((ch * 256 + tt) < NQK) * alive
-                off = ((Int64(batch) * Int64(S) + Int64(tok)) * Int64(H) + Int64(head)) * Int64(
-                    256
-                ) + Int64(cc * 16)
+                row = Int64(batch) * Int64(S) + Int64(tok)
+                off = Int64(head * 256 + cc * 16)
                 dst = (
                     (tt >> 3) * 2048
                     + (cc >> 3) * 1024
                     + (tt & 7) * 128
                     + (((cc & 7) ^ (tt & 7)) << 4)
                 )
-                cp_async16(st.dmb + dst, qb + off, nb)
-                cp_async16(st.zbb + dst, kb + off, nb)
+                cp_async16(st.dmb + dst, qb + row * Int64(QP) + off, nb)
+                cp_async16(st.zbb + dst, kb + row * Int64(KP) + off, nb)
         cute.arch.cp_async_commit_group()
         cute.arch.cp_async_wait_group(0)
         cute.arch.fence_proxy("async.shared", space="cta")
@@ -1297,7 +1300,7 @@ def _write_basis(st, uT: cute.Tensor, bh: Int32):
 
 
 @cute.jit
-def _eig_body(qtens, ktens, rows, hadamard, uT, S, H, NQK, NCQ, RANK, lens):
+def _eig_body(qtens, ktens, rows, hadamard, uT, S, H, QP, KP, NQK, NCQ, RANK, lens):
     """Solve one eigenproblem per CTA: CTA bh writes the Q/K basis U of (batch, head) bh, U^T [B, H, RANK, 128].
 
     * The launch is a programmatic dependent of the clear launch and releases its own dependent at once: the V pass
@@ -1316,7 +1319,7 @@ def _eig_body(qtens, ktens, rows, hadamard, uT, S, H, NQK, NCQ, RANK, lens):
     st = _eig_state(tidx, RANK)
     # DMB/YLB hold aligned Gram operand images until TC completion. The normalized matrix is then staged in VH, whose
     # first reflector is written only after all paired-row math threads have loaded their register tiles.
-    _gram(st, qtens, ktens, rows, bh, S, H, NQK, NCQ, lens)
+    _gram(st, qtens, ktens, rows, bh, S, H, QP, KP, NQK, NCQ, lens)
 
     # Householder tridiagonalization: the reflectors in VH, tau, and the tridiagonal matrix (d, e)
     pair = _load_row_pairs(st)
@@ -1377,12 +1380,14 @@ def eig_kernel(
     uT: cute.Tensor,
     S: Int32,
     H: Int32,
+    QP: Int32,
+    KP: Int32,
     NQK: Int32,
     NCQ: Int32,
     RANK: cutlass.Constexpr,
 ):
     """Run the eigensolver CTA (_eig_body) of a call whose batch elements are all full: rows [NQK] are tokens."""
-    _eig_body(qtens, ktens, rows, hadamard, uT, S, H, NQK, NCQ, RANK, None)
+    _eig_body(qtens, ktens, rows, hadamard, uT, S, H, QP, KP, NQK, NCQ, RANK, None)
 
 
 @cute.kernel
@@ -1395,6 +1400,8 @@ def eig_kernel_lens(
     lens: cute.Tensor,
     S: Int32,
     H: Int32,
+    QP: Int32,
+    KP: Int32,
     NQK: Int32,
     NCQ: Int32,
     RANK: cutlass.Constexpr,
@@ -1411,6 +1418,8 @@ def eig_kernel_lens(
         uT,
         S,
         H,
+        QP,
+        KP,
         NQK,
         NCQ,
         RANK,
