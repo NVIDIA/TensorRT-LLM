@@ -728,7 +728,6 @@ class DSparkRMSNormRoPEPageWriteKernel(DSparkRMSNormRoPEKernel):
         start_pos: cute.Tensor,
         capacities: cute.Tensor,
     ):
-        tidx, _, _ = cute.arch.thread_idx()
         row, _, _ = cute.arch.block_idx()
         position = start_pos[row] - 1
         page = cutlass.Int32(-1)
@@ -738,34 +737,6 @@ class DSparkRMSNormRoPEPageWriteKernel(DSparkRMSNormRoPEKernel):
                 page = block_tables[row, logical_page]
         if page >= 0 and page < kv_cache.shape[0]:
             cache_pos = position % self.page_size
-
-            sum_sq = cutlass.Float32(0.0)
-            for item in cutlass.range_constexpr(self.elements_per_thread):
-                dim = tidx + item * self.num_threads
-                value = cutlass.Float32(x[row, dim])
-                sum_sq += value * value
-            sum_sq = cute.arch.warp_reduction_sum(sum_sq)
-            inverse_rms = cute.math.rsqrt(sum_sq / self.hidden_dim + self.eps)
-
-            for item in cutlass.range_constexpr(self.nope_elements_per_thread):
-                dim = tidx + item * self.num_threads
-                value = cutlass.Float32(x[row, dim]) * inverse_rms
-                value *= cutlass.Float32(weight[dim])
-                kv_cache[cutlass.Int64(page), cache_pos, dim] = value.to(kv_cache.element_type)
-
-            for item in cutlass.range_constexpr(self.pairs_per_thread):
-                pair = tidx + item * self.num_threads
-                real_dim = self.nope_dim + pair * 2
-                imag_dim = real_dim + 1
-                real = cutlass.Float32(x[row, real_dim]) * inverse_rms
-                imag = cutlass.Float32(x[row, imag_dim]) * inverse_rms
-                real *= cutlass.Float32(weight[real_dim])
-                imag *= cutlass.Float32(weight[imag_dim])
-                cos = cutlass.Float32(freqs[row, pair, 0])
-                sin = cutlass.Float32(freqs[row, pair, 1])
-                kv_cache[cutlass.Int64(page), cache_pos, real_dim] = (real * cos - imag * sin).to(
-                    kv_cache.element_type
-                )
-                kv_cache[cutlass.Int64(page), cache_pos, imag_dim] = (imag * cos + real * sin).to(
-                    kv_cache.element_type
-                )
+            self.store_normalized_row(
+                x, row, weight, freqs, row, kv_cache[cutlass.Int64(page), cache_pos, None]
+            )
