@@ -894,8 +894,6 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
         every group is live. The runner selects it per tuning bucket
         (``Sm107Mxfp8FusedFc12MoeRunner._sparse_gather_for_bucket``), so each
         compiled kernel contains one loop body.
-    :param fc2_stream_weights: Cache policy for the FC2 B (weight) TMA loads
-        alone; ``None`` follows ``stream_weights``.
     :param stream_weights: Give the FC1/FC2 B (weight) TMA loads L2 evict-first
         priority. Intended for decode shapes with little weight reuse across M
         tiles (about seven or more active experts per rank); leave it False
@@ -916,18 +914,10 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
         scheduler: str = "static",
         sparse_gather: bool = False,
         stream_weights: bool = False,
-        fc2_stream_weights: bool | None = None,
     ):
         self.sf_vec_size = sf_vec_size
         self.sparse_gather = sparse_gather
         self.stream_weights = stream_weights
-        # The FC2 weight loads may take a cache policy of their own. A
-        # localized inner-channel shard reduces FC2 over a short K, so its
-        # FC2 weight working set is small enough to keep in L2 while the FC1
-        # weights still stream; ``None`` inherits ``stream_weights``.
-        self.fc2_stream_weights = (
-            stream_weights if fc2_stream_weights is None else fc2_stream_weights
-        )
         self.topk = topk
         self.acc_dtype = cutlass.Float32
         self.mma_inst_shape = mma_inst_shape
@@ -3089,16 +3079,16 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                     # passed explicitly: a staged loop cannot capture them); only one loop is
                     # traced, so neither variant pays for the other.
                     def gather_fc1_a_row(
-                        i,
-                        A_gmem_thread_offset,
-                        a_token_offset_tensor,
-                        a_predicate_tensor,
-                        tFC1AgA_ktile,
-                        tFC1AsA_ktile,
-                        a_atom_copy,
-                        a_elems,
-                        a_k_atom,
-                        a_k_passes,
+                        i: Union[int, cutlass.Int32],
+                        A_gmem_thread_offset: cutlass.Int32,
+                        a_token_offset_tensor: cute.Tensor,
+                        a_predicate_tensor: cute.Tensor,
+                        tFC1AgA_ktile: cute.Tensor,
+                        tFC1AsA_ktile: cute.Tensor,
+                        a_atom_copy: cute.CopyAtom,
+                        a_elems: int,
+                        a_k_atom: int,
+                        a_k_passes: int,
                     ) -> None:
                         A_gmem_row_offset = A_gmem_thread_offset + cute.assume(
                             a_token_offset_tensor[i] * tFC1AgA_ktile.layout[0].stride,
@@ -3416,9 +3406,6 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
             weight_cache_policy = None
             if cutlass.const_expr(self.stream_weights):
                 weight_cache_policy = streaming_weight_cache_policy()
-            fc2_weight_cache_policy = None
-            if cutlass.const_expr(self.fc2_stream_weights):
-                fc2_weight_cache_policy = streaming_weight_cache_policy()
             fc1_b_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_ab_stage
             )
@@ -3578,7 +3565,7 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                         tFC2BsB[(None, fc2_b_producer_state.index)],
                         tma_bar_ptr=fc2_b_barrier,
                         mcast_mask=b_full_mcast_mask,
-                        cache_policy=fc2_weight_cache_policy,
+                        cache_policy=weight_cache_policy,
                     )
                     cute.copy(
                         tma_atom_fc2_sfb,
