@@ -332,9 +332,9 @@ it with NVFP4 cold pages at the same cold-tier quota.
 
 ### Reconstruction Quality
 
-`tests/microbenchmarks/kv_cache_compression/turboquant_quality.py` measures the normalized MSE
-`||x - x_hat||^2 / ||x||^2` of BF16 K/V vectors with head dimension 128 on structured inputs
-("outlier channels" has two channels 10-25x larger than the rest, like real K):
+BF16 K/V vectors with head dimension 128, encoded into cold Pages and decoded back, have this
+normalized MSE `||x - x_hat||^2 / ||x||^2` on structured inputs ("outlier channels" has two
+channels 10-25x larger than the rest, like real K):
 
 | Bits | Paper (d = 128) | Gaussian | Outlier channels | Sparse | One-hot | All-equal | Norms 1e-6..1e6 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -347,9 +347,9 @@ The per-vector least-squares scale puts TurboQuant slightly below the paper's di
 inputs; the all-equal vector, a single direction and so a single sample of the error, lands up
 to 8% above it.
 
-KVCacheManagerV2 re-encodes a Page each time it offloads the Page again after an onboard. The
-same tool repeats the round trip on the outlier-channel input, each time re-encoding the decoded
-Page:
+KVCacheManagerV2 re-encodes a Page each time it offloads the Page again after an onboard.
+Repeating the round trip on the outlier-channel input, each time re-encoding the decoded Page,
+gives:
 
 | Bits | 1 round trip | 4 round trips | 16 round trips |
 | --- | --- | --- | --- |
@@ -364,9 +364,9 @@ TurboQuant-prod is not offered because its
 error compounds instead; a prototype measured 0.55, 16.9, and 2.3e6 after 1, 4, and 16 round trips
 at 2 bits, and 0.051, 0.31, and 7.0 at 4 bits.
 
-With `--vectors FILE --rope 64`, the tool runs the same round trips on real vectors. On 6,144 MLA
-latents of GLM-5.3 (BF16, 512 NoPE + 64 RoPE values; 48 layers x 128 tokens read from the KV cache
-of an end-to-end run), the normalized MSE of the whole latent is:
+The same round trips on real vectors, 6,144 MLA latents of GLM-5.3 (BF16, 512 NoPE + 64 RoPE
+values; 48 layers x 128 tokens read from the KV cache of an end-to-end run), give this normalized
+MSE for the whole latent:
 
 | Bits | 1 / 4 / 16 round trips | 1 / 4 / 16 round trips with `skip_rope_quantization` |
 | --- | --- | --- |
@@ -379,11 +379,11 @@ values), so keeping them lossless lowers the error of the whole latent.
 
 ### Encode and Decode Time
 
-`tests/microbenchmarks/kv_cache_compression/bench_cold_page_codec.py` times one encode and one
-decode call (256 Pages per call unless noted, cold Pages in pinned host memory, median of 20)
-for TurboQuant and NVFP4 on the same GPU, and the speed of light (SOL) of the same transfer. On
-one GB300, with the pinned memory on the GPU's own CPU socket (the GPU reads it at 211 GB/s and
-writes it at 193 GB/s) and on the other socket (126 GB/s and 122 GB/s):
+Each time below is one encode or one decode call (256 Pages per call unless noted, cold Pages in
+pinned host memory, median of 20) for TurboQuant and NVFP4 on the same GPU, measured with the
+speed of light (SOL) of the same transfer. On one GB300, with the pinned memory on the GPU's own
+CPU socket (the GPU reads it at 211 GB/s and writes it at 193 GB/s) and on the other socket
+(126 GB/s and 122 GB/s):
 
 | Case | Geometry and TurboQuant setting | Cold Page KiB, TurboQuant / NVFP4 | Own socket: encode / decode us (vs NVFP4) | Other socket: encode / decode us (vs NVFP4) |
 | --- | --- | --- | --- | --- |
@@ -408,8 +408,8 @@ DeepSeek-V4 CSA rows are one 512-value instance by default; NVFP4's default form
 their RoPE as two FP4 components, which makes its encode slow, so `dsv4-csa-skiprope-bf16-mse4`
 compares like with like. Small calls are bound by fixed costs, such as the one decode launch per
 instance of a 576-value latent. The launch shapes of rows wider than 256 values were measured on
-GB300 (SM103) and apply to SM100-family GPUs; other GPUs use generic shapes. Run the benchmark on
-your system before relying on these numbers.
+GB300 (SM103) and apply to SM100-family GPUs; other GPUs use generic shapes. Measure on your
+system before relying on these numbers.
 
 ### End-to-End Smoke Test
 
