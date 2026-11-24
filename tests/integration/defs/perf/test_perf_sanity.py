@@ -26,7 +26,6 @@ import secrets
 import shutil
 import socket
 import subprocess
-import sys
 import tempfile
 import time
 import urllib.request
@@ -1929,7 +1928,6 @@ class AccuracyConfig:
 
     Shape mirrors the existing top-level `accuracy:` block in disagg yamls:
         enable_accuracy_test: bool
-        pytest_nodeid: str  # optional HTTP suite; nonzero exit fails the lane
         env_var: dict[str, str]
         tasks:
           <task_name>:
@@ -1947,7 +1945,6 @@ class AccuracyConfig:
         self.enable_accuracy_test = bool(accuracy_data.get("enable_accuracy_test", False))
         self.env_var = dict(accuracy_data.get("env_var") or {})
         self.tasks = dict(accuracy_data.get("tasks") or {})
-        self.pytest_nodeid = accuracy_data.get("pytest_nodeid")
 
     @classmethod
     def from_dict(cls, data: Optional[dict]) -> Optional["AccuracyConfig"]:
@@ -2045,26 +2042,6 @@ class AccuracyConfig:
         server_idx: int,
     ) -> None:
         """Run all configured accuracy tasks against the live server."""
-        if self.pytest_nodeid:
-            run_env = os.environ.copy()
-            run_env.update({k: str(v) for k, v in self.env_var.items()})
-            run_env["DISAGG_ACCURACY_URL"] = f"http://{server_hostname}:{server_port}"
-            run_env["DISAGG_ACCURACY_MODEL"] = get_model_dir(model_name) or model_name
-            subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "pytest",
-                    "-v",
-                    "-s",
-                    self.pytest_nodeid,
-                    f"--junitxml={output_dir}/accuracy.{server_idx}.xml",
-                ],
-                cwd=os.path.join(get_llm_root(), "tests/integration/defs"),
-                env=run_env,
-                check=True,
-                timeout=DEFAULT_TIMEOUT,
-            )
         for cmd, log_file, run_env, task_name in self.build_lm_eval_invocations(
             model_name, server_hostname, server_port, output_dir, server_idx
         ):
