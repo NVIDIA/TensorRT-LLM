@@ -1072,8 +1072,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.helix_context_local_slots = None
         cache_mapping = getattr(self.kv_cache_manager, "mapping", None)
         if (not self.enable_context_mla_with_cached_kv or self.num_contexts == 0
-                or cached_token_lens is None or cache_mapping is None
-                or not cache_mapping.has_cp_helix()):
+                or cached_token_lens is None or cache_mapping is None):
+            return
+        cp_world, cp_rank = helix_page_owner(cache_mapping)
+        if cp_world == 1:
             return
         # Context batches run eagerly. Build once per batch on the host,
         # then share the device view across all MLA layers.
@@ -1085,7 +1087,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         positions += torch.repeat_interleave(
             cached_token_lens[:self.num_contexts] - starts, lengths)
         page = self.kv_cache_manager.tokens_per_block
-        cp_world, cp_rank = helix_page_owner(cache_mapping)
         owned = (positions // page) % cp_world == cp_rank
         slots = helix_local_len_tensor(positions, page, cp_world, cp_rank)
         slots.masked_fill_(~owned, -1)

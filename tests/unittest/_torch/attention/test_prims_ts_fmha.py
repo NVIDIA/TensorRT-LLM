@@ -16,9 +16,11 @@
 import math
 from collections.abc import Iterator
 from dataclasses import asdict, replace
+from enum import IntEnum
 from types import SimpleNamespace
 from unittest.mock import Mock, create_autospec
 
+import numpy as np
 import pytest
 import torch
 from packaging.version import Version
@@ -2206,10 +2208,23 @@ def _get_test_mla_wrapper(
     )
 
 
+class _HelixWorld(IntEnum):
+    PAIR = 2
+
+
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("initial_layout", ["replica", "sharded", "ulysses"])
+@pytest.mark.parametrize(
+    "initial_layout,cp_size",
+    [
+        ("replica", 2),
+        ("sharded", 2),
+        ("ulysses", 2),
+        pytest.param("sharded", np.int64(2), id="sharded-numpy"),
+        pytest.param("sharded", _HelixWorld.PAIR, id="sharded-enum"),
+    ],
+)
 def test_mla_decode_preserves_live_cache_ownership(
-    monkeypatch: pytest.MonkeyPatch, initial_layout: str
+    monkeypatch: pytest.MonkeyPatch, initial_layout: str, cp_size: int
 ) -> None:
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(
@@ -2229,6 +2244,7 @@ def test_mla_decode_preserves_live_cache_ownership(
         def plan(
             self, *, cp_world: int, cp_interleave_size: int, page_size: int, **_kwargs: object
         ) -> None:
+            prims_mla_module._validate_mla_cp(cp_world, cp_interleave_size)
             self.cp_world = cp_world
             self.cp_interleave_size = cp_interleave_size
             self.page_size = page_size
@@ -2255,7 +2271,9 @@ def test_mla_decode_preserves_live_cache_ownership(
     monkeypatch.setattr(prims_ts_module.thop, "build_trtllm_gen_kv_cache_metadata", build_metadata)
     mappings = {
         "replica": Mapping(),
-        "sharded": Mapping(world_size=2, rank=1, cp_size=2, cp_config={"cp_type": CpType.HELIX}),
+        "sharded": Mapping(
+            world_size=2, rank=1, cp_size=cp_size, cp_config={"cp_type": CpType.HELIX}
+        ),
         "ulysses": Mapping(world_size=2, rank=1, cp_size=2, cp_config={"cp_type": CpType.ULYSSES}),
     }
     attn = _Attention(head_dim=576, is_mla=True, num_heads=4)

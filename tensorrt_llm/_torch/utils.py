@@ -926,5 +926,5 @@ def helix_local_len_tensor(global_lens: torch.Tensor, tokens_per_block: int,
 def helix_page_owner(mapping: Mapping) -> tuple[int, int]:
     """Return the physical KV-page world and rank; non-Helix caches are replicated."""
     if mapping.has_cp_helix():
-        return mapping.cp_size, mapping.cp_rank
+        return int(mapping.cp_size), int(mapping.cp_rank)
     return 1, 0

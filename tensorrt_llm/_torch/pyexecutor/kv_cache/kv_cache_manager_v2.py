@@ -2768,8 +2768,8 @@ class KVCacheManagerV2(BaseResourceManager):
         # Helix super-block ledger: bookkeeping runs in GLOBAL tokens, one
         # ledger block = cp_size physical pages (one per rank), while
         # self.tokens_per_block stays the PHYSICAL kernel page size.
-        self._has_cp_helix = mapping.has_cp_helix()
         self._helix_cp_size, self._helix_cp_rank = helix_page_owner(mapping)
+        self._has_cp_helix = self._helix_cp_size > 1
         self._ledger_tokens_per_block = tokens_per_block * self._helix_cp_size
         if self._has_cp_helix:
             if kv_cache_config.enable_block_reuse:
