@@ -1125,6 +1125,7 @@ def test_forward_failure_before_periodic_snapshot_completion(tp: bool) -> None:
     engine = Mock(route_capture=None)
     engine.forward.side_effect = error
     executor = _forward_step_executor(engine)
+    executor._finish_periodic_snapshots = True
     batch = ScheduledRequests()
     batch.periodic_snapshot_tp = tp
 

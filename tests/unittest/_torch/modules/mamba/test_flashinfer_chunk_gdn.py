@@ -283,7 +283,7 @@ def test_sm100_checkpoint_state_io_dtype(
 @pytest.mark.skipif(
     not _supported_arch() or not is_sm_100f(), reason="requires SM100/SM103 GDN prefill"
 )
-@pytest.mark.parametrize("use_cp", [False, True])
+@pytest.mark.parametrize("use_cp", [False, True, "auto"])
 @pytest.mark.parametrize("with_workspace", [False, True])
 def test_sm100_bf16_state_with_fp32_checkpoints(use_cp, with_workspace):
     """Save FP32 checkpoints from a BF16 pool without changing the scan result."""

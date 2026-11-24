@@ -4047,14 +4047,149 @@ class TestChunkedContext:
         req.is_dummy_request = False
         req.py_multimodal_data = None
 
-        assert not sched.schedule_request([req], set()).context_requests
-        assert req.py_periodic_snapshot_fallback
         out = sched.schedule_request([req], set())
 
         assert ids(out.context_requests) == [0]
         assert req.context_chunk_size == 256
         assert attempts == [1024, 256]
         assert not req.py_periodic_snapshot_fallback
+        mgr.release_periodic_snapshots.assert_called_once_with(req)
+
+    def test_periodic_first_chunk_retry_resumes_suspended_cache(self) -> None:
+        attempts = []
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        mgr.periodic_snapshot_capacity = 4
+        mgr.kv_cache_config = SimpleNamespace(
+            mamba_state_config=SimpleNamespace(periodic_snapshot_interval=256)
+        )
+        mgr.reserve_periodic_snapshots.return_value = True
+
+        def prepare(req: Mock) -> bool:
+            mgr.kv_cache_map[req.py_request_id].is_active = True
+            return True
+
+        def resize(req: Mock, tokens: int) -> bool:
+            cache = mgr.kv_cache_map[req.py_request_id]
+            assert cache.is_active
+            attempts.append(tokens)
+            if tokens > 256:
+                cache.is_active = False
+                return False
+            return True
+
+        mgr.prepare_context.side_effect = prepare
+        mgr.resize_context.side_effect = resize
+        sched = make_scheduler(
+            mgr, max_num_tokens=1024, ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 64)
+        )
+        req = make_ctx_request(0, context_remaining_length=2048, is_last_context_chunk=False)
+        req.expect_snapshot_points = list(range(256, 2049, 256))
+        req.is_dummy_request = False
+        req.py_multimodal_data = None
+
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.context_requests) == [0]
+        assert req.context_chunk_size == 256
+        assert attempts == [1024, 256]
+        assert mgr.prepare_context.call_count == 2
+        mgr.release_periodic_snapshots.assert_called_once_with(req)
+
+    @pytest.mark.parametrize("baseline_fits", [False, True])
+    def test_periodic_retry_preempts_only_after_baseline_failure(self, baseline_fits: bool) -> None:
+        attempts = []
+        mgr = make_kv_cache_manager(tokens_per_block=64, has_cache_tier_below_gpu=False)
+        mgr.periodic_snapshot_capacity = 4
+        mgr.kv_cache_config = SimpleNamespace(
+            mamba_state_config=SimpleNamespace(periodic_snapshot_interval=256)
+        )
+        mgr.reserve_periodic_snapshots.return_value = True
+
+        def prepare(req: Mock) -> bool:
+            mgr.kv_cache_map[req.py_request_id].is_active = True
+            return True
+
+        def resize(req: Mock, tokens: int) -> bool:
+            if req.py_request_id != 0:
+                return True
+            assert mgr.kv_cache_map[0].is_active
+            attempts.append(tokens)
+            if tokens > 256 or not baseline_fits:
+                mgr.kv_cache_map[0].is_active = False
+                return False
+            return True
+
+        mgr.prepare_context.side_effect = prepare
+        mgr.resize_context.side_effect = resize
+        sched = make_scheduler(
+            mgr, max_num_tokens=1024, ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 64)
+        )
+        req = make_ctx_request(0, context_remaining_length=2048, is_last_context_chunk=False)
+        req.expect_snapshot_points = list(range(256, 2049, 256))
+        req.is_dummy_request = False
+        req.py_multimodal_data = None
+        victim = make_ctx_request(99, 100, is_first_context_chunk=False)
+
+        out = sched.schedule_request([req, victim], set())
+
+        assert attempts == [1024, 256]
+        if baseline_fits:
+            assert 0 in ids(out.context_requests)
+            assert req.context_chunk_size == 256
+            mgr.preempt_request.assert_not_called()
+        else:
+            assert 0 not in ids(out.context_requests)
+            assert ids(out.recompute_paused_requests) == [99]
+            assert req.py_periodic_snapshot_fallback
+            mgr.preempt_request.assert_called_once_with(victim)
+        mgr.release_periodic_snapshots.assert_called_once_with(req)
+
+    def test_periodic_retry_propagates_snapshot_release_failure_once(self) -> None:
+        mgr = make_kv_cache_manager(tokens_per_block=64, resize_context_fn=lambda *_: False)
+        mgr.periodic_snapshot_capacity = 4
+        mgr.kv_cache_config = SimpleNamespace(
+            mamba_state_config=SimpleNamespace(periodic_snapshot_interval=256)
+        )
+        mgr.reserve_periodic_snapshots.return_value = True
+        failure = RuntimeError("snapshot release failed")
+        mgr.release_periodic_snapshots.side_effect = failure
+        sched = make_scheduler(
+            mgr, max_num_tokens=1024, ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 64)
+        )
+        req = make_ctx_request(0, context_remaining_length=2048, is_last_context_chunk=False)
+        req.expect_snapshot_points = list(range(256, 2049, 256))
+        req.is_dummy_request = False
+        req.py_multimodal_data = None
+
+        with pytest.raises(RuntimeError) as caught:
+            sched.schedule_request([req], set())
+
+        assert caught.value is failure
+        mgr.release_periodic_snapshots.assert_called_once_with(req)
+
+    def test_periodic_cross_context_release_failure_is_not_retried(self) -> None:
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        mgr.periodic_snapshot_capacity = 4
+        mgr.kv_cache_config = SimpleNamespace(
+            mamba_state_config=SimpleNamespace(periodic_snapshot_interval=256)
+        )
+        mgr.reserve_periodic_snapshots.return_value = True
+        failure = RuntimeError("snapshot release failed")
+        mgr.release_periodic_snapshots.side_effect = failure
+        sched = make_scheduler(
+            mgr, max_num_tokens=1024, ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 64)
+        )
+        req = make_ctx_request(
+            0, context_remaining_length=2048, is_last_context_chunk=False, encoder_output_len=32
+        )
+        req.expect_snapshot_points = list(range(256, 2049, 256))
+        req.is_dummy_request = False
+        req.py_multimodal_data = None
+
+        with pytest.raises(RuntimeError) as caught:
+            sched.schedule_request([req], set())
+
+        assert caught.value is failure
         mgr.release_periodic_snapshots.assert_called_once_with(req)
 
     def test_periodic_fallback_does_not_reenable_inforward_tail_extension(self):
@@ -4086,8 +4221,6 @@ class TestChunkedContext:
         req.is_dummy_request = False
         req.py_multimodal_data = None
 
-        assert not sched.schedule_request([req], set()).context_requests
-        assert req.py_periodic_snapshot_fallback
         out = sched.schedule_request([req], set())
 
         assert ids(out.context_requests) == [0]

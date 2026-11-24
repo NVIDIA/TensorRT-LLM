@@ -1200,6 +1200,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             and self.local_num_mamba_layers > 0
             and self.enable_block_reuse
             and not self.is_draft
+            and self.spec_config is None
             and not self.is_disagg
             and self.kv_connector_manager is None
             and self.mapping.pp_size == 1

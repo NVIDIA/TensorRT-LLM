@@ -27,6 +27,7 @@ def _manager(max_tokens):
         tokens_per_block=64,
         num_locality_domains=1,
         enable_block_reuse=True,
+        spec_config=None,
         is_disagg=False,
         kv_connector_manager=None,
         is_draft=False,
@@ -124,6 +125,24 @@ def test_tp2_gdn_allocates_bounded_staging_for_consensus(monkeypatch):
 
     assert manager.periodic_snapshot_capacity == 4
     assert allocate.call_args.args[0] == [1, 4, 2, 128, 128]
+
+
+def test_speculative_decoding_does_not_allocate_periodic_staging(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TLLM_USE_FLASHINFER_GDN_PREFILL", "1")
+    monkeypatch.setattr(
+        inforward_snapshot, "is_flashinfer_gdn_prefill_supported_arch", lambda: True
+    )
+    allocate = Mock(return_value=object())
+    monkeypatch.setattr(module.torch, "empty", allocate)
+    manager = _manager(8192)
+    manager.spec_config = object()
+
+    module.MambaHybridCacheManagerV2._setup_periodic_snapshots(manager)
+
+    assert manager.periodic_snapshot_capacity == 0
+    allocate.assert_not_called()
 
 
 @pytest.mark.parametrize("is_disagg, has_connector", [(True, False), (False, True)])

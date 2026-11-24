@@ -2112,9 +2112,14 @@ class KVCacheV2Scheduler(RequestScheduler):
         try:
             if not self._try_allocate_context(req, resize_tokens):
                 if periodic_reserved:
+                    periodic_reserved = False
                     self.kv_cache_manager.release_periodic_snapshots(req)
                     req.py_periodic_snapshot_fallback = True
-                    return ScheduleAction.SKIP, 0, False
+                    # A failed first-chunk resize can suspend the cache, so
+                    # prepare it again before retrying the baseline boundary.
+                    return self._try_schedule_context_chunked(
+                        req, budget, preempt_for_pages, token_cap, False
+                    )
                 # Out of pages, as in _try_schedule_context_full.
                 if preempt_for_pages(req):
                     return ScheduleAction.STOP, 0, False
@@ -2123,6 +2128,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             cross_action = self._try_schedule_cross_context(req)
             if cross_action is not ScheduleAction.SCHEDULED:
                 if periodic_reserved:
+                    periodic_reserved = False
                     self.kv_cache_manager.release_periodic_snapshots(req)
                 self._suspend_request(req)
                 return cross_action, 0, False

@@ -34,6 +34,7 @@ from unittest.mock import patch
 
 if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
     from kv_cache_manager_v2 import (
+        BAD_PAGE_INDEX,
         DEFAULT_BEAM_INDEX,
         AttentionLayerConfig,
         BufferConfig,
@@ -54,6 +55,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
     )
 else:
     from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+        BAD_PAGE_INDEX,
         DEFAULT_BEAM_INDEX,
         AttentionLayerConfig,
         BufferConfig,
@@ -118,6 +120,7 @@ class TestPendingSsmSnapshot(unittest.TestCase):
         enable_partial_reuse: bool = False,
         max_util_for_resume: float = 0.97,
         enable_locality_domains: bool = False,
+        include_ple_roles: bool = False,
     ) -> KVCacheManagerConfig:
         layers = []
         for layer_id in range(2):
@@ -131,10 +134,19 @@ class TestPendingSsmSnapshot(unittest.TestCase):
                 )
             )
         for layer_id in range(2, 4):
+            buffers = [BufferConfig(role=DataRole("ssm_state"), size=8192)]
+            if include_ple_roles and layer_id == 2:
+                buffers.extend(
+                    [
+                        BufferConfig(role=DataRole("conv_state"), size=4096),
+                        BufferConfig(role=DataRole("ple_conv_state"), size=2048),
+                        BufferConfig(role=DataRole("ple_ngram_context"), size=32),
+                    ]
+                )
             layers.append(
                 SsmLayerConfig(
                     layer_id=LayerId(layer_id),
-                    buffers=[BufferConfig(role=DataRole("ssm_state"), size=8192)],
+                    buffers=buffers,
                 )
             )
         return KVCacheManagerConfig(
@@ -271,6 +283,9 @@ class TestPendingSsmSnapshot(unittest.TestCase):
         self.assertEqual(kv_cache.num_committed_tokens, expected_reuse)
         self.assertTrue(kv_cache.resume(self.stream))
         kv_cache.capacity = expected_reuse
+        self.assertNotEqual(
+            kv_cache.get_ssm_block_base_index(self._ssm_layer_group()), BAD_PAGE_INDEX
+        )
         # Checks the attention pages and that the SSM page holds the snapshot.
         self.engine.execute([Step(kv_cache, [], prompt[:expected_reuse])], self.stream)
         kv_cache.close()
@@ -317,6 +332,13 @@ class TestPendingSsmSnapshot(unittest.TestCase):
 
     def test_multiple_pending_snapshots_commit_in_order_and_reuse(self) -> None:
         self._setup()
+        self._check_multiple_pending_snapshots()
+
+    def test_multiple_pending_snapshots_restore_ple_roles(self) -> None:
+        self._setup(include_ple_roles=True)
+        self._check_multiple_pending_snapshots()
+
+    def _check_multiple_pending_snapshots(self) -> None:
         prompt = self._tokens(110)
         points = [32, 64, 96]
         kv_cache = self.manager.create_kv_cache()
@@ -346,6 +368,7 @@ class TestPendingSsmSnapshot(unittest.TestCase):
 
         for point in points:
             self._check_reuse(prompt[:point] + self._tokens(4), point)
+        self.stream_holder.synchronize()
 
     def test_multiple_pending_snapshot_allocation_rolls_back_when_full(self) -> None:
         self._setup(gpu_quota=1 << 20, max_util_for_resume=1.0)
