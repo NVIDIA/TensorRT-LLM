@@ -23,6 +23,11 @@ from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2Trtl
 from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Layout
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    KVCacheLayerOwner,
+    KVCacheLayerSpec,
+    Role,
+)
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     ATTENTION_DP_DUMMY_REQUEST_ID,
     LlmRequest,
@@ -34,6 +39,7 @@ from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.runtime.kv_cache_manager_v2 import ReusePolicy
 
 DRAFT_LEN = 5
 BLOCK = 128
@@ -45,7 +51,7 @@ skip_pre_blackwell = pytest.mark.skipif(
 )
 
 
-def _manager(attention_dp, disaggregated, scratch, block=BLOCK):
+def _manager(attention_dp, disaggregated, scratch, block=BLOCK, *, draft_stages=0):
     return CSA2CacheManager(
         KvCacheConfig(
             max_gpu_total_bytes=512 << 20,
@@ -66,6 +72,20 @@ def _manager(attention_dp, disaggregated, scratch, block=BLOCK):
         vocab_size=8192,
         layout=CSA2Layout((0, 2, 2, 1), (1, 3), (1, 3), window_size=128, index_topk=4),
         spec_config=DSparkDecodingConfig(max_draft_len=DRAFT_LEN),
+        layer_specs=[
+            KVCacheLayerSpec(
+                global_layer_id=4 + stage,
+                owner=KVCacheLayerOwner.DRAFT,
+                dtype=DataType.BF16,
+                num_kv_heads=1,
+                head_dim=512,
+                buffer_roles=(Role.KEY,),
+                sliding_window_size=129,
+                reuse_policy=ReusePolicy.PRIVATE,
+            )
+            for stage in range(draft_stages)
+        ]
+        or None,
     )
 
 
@@ -168,6 +188,9 @@ def _forward_inputs(metadata, count):
         "block_offsets": metadata.kv_cache_block_offsets[:, :count],
         "positions": metadata.csa2_positions,
     }
+    draft = metadata.kv_cache_manager.draft_page_table()
+    if draft is not None:
+        outputs["draft_pages"] = draft[:count]
     for name in (
         "csa2_global_page_tables",
         "_csa2_swa_page_tables",
@@ -462,7 +485,9 @@ def test_steady_decode_reuses_converted_tables(
 ):
     rng = random.Random(seed)
     conversions = _counted_conversions(monkeypatch)
-    manager = _manager(attention_dp, disaggregated, scratch, block)
+    manager = _manager(
+        attention_dp, disaggregated, scratch, block, draft_stages=3 if attention_dp else 0
+    )
     reusing, converting = _Executor(manager), _Executor(manager)
     active, pending, padding = [], {}, None
     next_id, previous_ids = 1, None

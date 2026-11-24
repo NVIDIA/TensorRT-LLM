@@ -187,7 +187,6 @@ class DecoderRunner(ScheduledModelRunner):
     # runs a guided decoder, which reads the logits of every batch.
     keep_greedy_only_outputs = True
     _draft_context_preparer = None
-    _draft_generation_preparer = None
 
     # Optional execution paths that a subclass can turn off.
     _context_warmups_supported = True
@@ -224,9 +223,6 @@ class DecoderRunner(ScheduledModelRunner):
             self._draft_context_preparer = (
                 prepare_context,
                 speculative_model.draft_model,
-            )
-            self._draft_generation_preparer = getattr(
-                worker, "prepare_managed_generation_cache", None
             )
         if config.compile_only_piecewise_graphs:
             assert isinstance(model, DecoderModelForCausalLM), (
@@ -874,27 +870,6 @@ class DecoderRunner(ScheduledModelRunner):
                     execution_requests.generation_requests,
                 )
 
-            draft_cache_prepared = False
-            if (
-                self._draft_generation_preparer is not None
-                and enable_spec_decode
-                and can_run_graph
-                and not is_dummy
-                and not self._use_beam_search
-                and execution_requests.num_context_requests == 0
-                and execution_requests.num_generation_requests > 0
-                and not execution_requests.is_attention_dp_phase_idle
-                and not execution_promoted_context_ids
-            ):
-                _, draft_model = self._draft_context_preparer
-                draft_cache_prepared = self._draft_generation_preparer(
-                    draft_model,
-                    spec_metadata,
-                    attn_metadata,
-                    resource_manager,
-                    [request.py_request_id for request in execution_requests.all_requests()],
-                )
-
             # Pack the step's small input copies into one upload and one scatter at the
             # graph replay. Only a replay of an already captured graph, which always
             # reaches the flush, may open a pack.
@@ -937,11 +912,7 @@ class DecoderRunner(ScheduledModelRunner):
                     is_dummy=is_dummy,
                     gather_context_logits=gather_context_logits,
                 )
-            if (
-                enable_spec_decode
-                and self._draft_context_preparer is not None
-                and not draft_cache_prepared
-            ):
+            if enable_spec_decode and self._draft_context_preparer is not None:
                 prepare_context, draft_model = self._draft_context_preparer
                 prepare_context(draft_model, spec_metadata, attn_metadata, resource_manager)
             inputs = prepared.kwargs

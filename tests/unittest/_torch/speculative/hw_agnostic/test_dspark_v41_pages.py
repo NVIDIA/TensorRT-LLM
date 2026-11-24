@@ -28,6 +28,7 @@ def test_context_worker_rebinds_managed_pages_without_draft_decode():
         get_layer_cache_spec=lambda _: spec,
         get_buffers=Mock(return_value=object()),
         max_blocks_per_seq=8,
+        draft_page_table=lambda: torch.empty((2, 8), dtype=torch.int32),
     )
     manager.get_draft_kv_cache_view = lambda: manager
     worker = SimpleNamespace(
@@ -39,6 +40,7 @@ def test_context_worker_rebinds_managed_pages_without_draft_decode():
         _ctx_len=torch.empty(3),
         _draft_page_versions={0: object()},
         _draft_page_indices={0: (0, (1,))},
+        _draft_page_capacities={0: 128},
         _managed_residency={42: object()},
         _uploaded_slots=(0,),
         _uploaded_capacities=(128,),
@@ -108,29 +110,6 @@ def test_retained_pages_preserve_context_holes_and_reject_missing_generation_kv(
         DSv41DSparkWorker._page_indices(worker, cache, False)
 
 
-def test_early_generation_preparation_uses_execution_order_and_checks_manager():
-    manager = object()
-    worker = SimpleNamespace(
-        _draft_kv_manager=manager,
-        _draft_reuse_policy=ReusePolicy.PRIVATE,
-        mapping=SimpleNamespace(cp_size=1),
-        _lazy_init=Mock(),
-        _prepare_page_tables=Mock(),
-        get_draft_kv_cache_manager=lambda _: manager,
-    )
-    metadata = SimpleNamespace(request_ids=[43, 42])
-    assert DSv41DSparkWorker.prepare_managed_generation_cache(
-        worker, object(), metadata, object(), object(), [42, 43]
-    )
-    worker._prepare_page_tables.assert_called_once_with([42, 43], 0)
-    assert metadata._dspark_worker is worker
-    worker.get_draft_kv_cache_manager = lambda _: object()
-    assert not DSv41DSparkWorker.prepare_managed_generation_cache(
-        worker, object(), metadata, object(), object(), [42, 43]
-    )
-    assert worker._prepare_page_tables.call_count == 1
-
-
 def test_unchanged_private_pages_skip_staging_events_and_scratch_resets(monkeypatch):
     class StablePages(SimpleNamespace):
         def __getattribute__(self, name):
@@ -139,7 +118,9 @@ def test_unchanged_private_pages_skip_staging_events_and_scratch_resets(monkeypa
             return super().__getattribute__(name)
 
     cache = StablePages(history_length=140, page_storage_version=3, num_blocks=2, is_active=True)
-    manager = SimpleNamespace(kv_cache_map={42: cache}, tokens_per_block=128)
+    manager = SimpleNamespace(
+        kv_cache_map={42: cache}, tokens_per_block=128, draft_page_table_prepared=lambda _: False
+    )
     worker = SimpleNamespace(
         _draft_kv_manager=manager,
         _draft_reuse_policy=ReusePolicy.PRIVATE,
@@ -153,6 +134,10 @@ def test_unchanged_private_pages_skip_staging_events_and_scratch_resets(monkeypa
         _draft_page_indices={0: (0, (7, 8))},
         _uploaded_slots=(0,),
         _uploaded_capacities=(256,),
+        _table_slots=(0,),
+        _draft_block_tables=None,
+        _draft_managed_block_tables=None,
+        _draft_fallback_block_tables=None,
         _ctx_len=torch.tensor([140, 17]),
         _valid_len=torch.tensor([128, 9]),
     )
@@ -173,7 +158,7 @@ def test_unchanged_private_pages_skip_staging_events_and_scratch_resets(monkeypa
     assert worker._valid_len.tolist() == [128, 9]
 
 
-def test_private_page_updates_preserve_execution_order_without_redundant_gathers(monkeypatch):
+def test_private_fallback_pages_preserve_execution_order_and_managed_pages_skip_copies(monkeypatch):
     caches = {
         42: SimpleNamespace(
             history_length=140, page_storage_version=1, num_blocks=2, is_active=True
@@ -185,7 +170,9 @@ def test_private_page_updates_preserve_execution_order_without_redundant_gathers
     tables = {id(caches[42]): (0, (7, 8)), id(caches[43]): (1, (9, 10))}
     storage = torch.full((6, 8), BAD_PAGE_INDEX, dtype=torch.int32)
     worker = SimpleNamespace(
-        _draft_kv_manager=SimpleNamespace(kv_cache_map=caches, tokens_per_block=128),
+        _draft_kv_manager=SimpleNamespace(
+            kv_cache_map=caches, tokens_per_block=128, draft_page_table_prepared=lambda _: False
+        ),
         _draft_reuse_policy=ReusePolicy.PRIVATE,
         _graph_dummy_id_floor=1 << 60,
         _req_to_slot={42: 0, 43: 1},
@@ -200,8 +187,11 @@ def test_private_page_updates_preserve_execution_order_without_redundant_gathers
         _draft_table_storage=storage,
         _draft_slot_block_tables=storage[:3],
         _draft_block_tables=storage[3:],
+        _draft_managed_block_tables=storage[3:],
+        _draft_fallback_block_tables=storage[3:],
         _draft_page_versions={},
         _draft_page_indices={},
+        _draft_page_capacities={},
         _draft_metadata_host_buffers=[],
         _draft_updates_device=None,
         _draft_indices_device=None,
@@ -233,12 +223,12 @@ def test_private_page_updates_preserve_execution_order_without_redundant_gathers
     assert worker._draft_slot_block_tables[0, :2].tolist() == [7, 11]
     assert worker._draft_block_tables[1, :2].tolist() == [7, 11]
     assert worker._page_indices.call_count == 3
-    assert gather.call_count == 2
+    assert gather.call_count == 3
 
     DSv41DSparkWorker._prepare_page_tables(worker, [43], 0)
     assert worker._batch_to_slot.tolist() == [1, 2, 2]
     assert worker._draft_capacities.tolist() == [384, 0, 0]
-    assert gather.call_count == 3
+    assert gather.call_count == 4
 
     # A narrower window can advance inside one native history block.
     worker._draft_kv_manager.tokens_per_block = 256
@@ -252,6 +242,18 @@ def test_private_page_updates_preserve_execution_order_without_redundant_gathers
     DSv41DSparkWorker._prepare_page_tables(worker, [43], 0)
     assert worker._page_indices.call_count == calls + 1
     assert worker._draft_page_indices[1] == (1, (10,))
+
+    # Once target preparation published this execution order, draft generation
+    # only updates its row state and capacities, including a native page change.
+    worker._draft_kv_manager.draft_page_table_prepared = lambda _: True
+    calls, gathers = worker._page_indices.call_count, gather.call_count
+    for blocks in (2, 3, 3):
+        caches[43].num_blocks = blocks
+        caches[43].page_storage_version += 1
+        DSv41DSparkWorker._prepare_page_tables(worker, [43], 0)
+        assert worker._draft_capacities.tolist() == [blocks * 256, 0, 0]
+    assert worker._page_indices.call_count == calls
+    assert gather.call_count == gathers
 
 
 @pytest.mark.parametrize(

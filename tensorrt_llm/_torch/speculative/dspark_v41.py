@@ -27,11 +27,14 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
         self._draft_kv_buffers = ()
         self._draft_layer_ids = ()
         self._draft_block_tables = None
+        self._draft_managed_block_tables = None
+        self._draft_fallback_block_tables = None
         self._draft_slot_block_tables = None
         self._draft_table_storage = None
         self._draft_capacities = None
         self._draft_page_versions = {}
         self._draft_page_indices = {}
+        self._draft_page_capacities = {}
         self._managed_residency = {}
         self._draft_metadata_host_buffers = []
         self._uploaded_slots = None
@@ -86,35 +89,24 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
                 (slots + shape[0], shape[1]), dtype=torch.int32, device=self._ctx_len.device
             )
             self._draft_slot_block_tables = self._draft_table_storage[:slots]
-            self._draft_block_tables = self._draft_table_storage[slots:]
+            self._draft_fallback_block_tables = self._draft_table_storage[slots:]
+            self._draft_block_tables = self._draft_fallback_block_tables
+            managed_table = manager.draft_page_table()
+            if managed_table is None or managed_table.shape[0] < shape[0]:
+                raise ValueError("The manager's draft page table does not cover the worker batch")
+            self._draft_managed_block_tables = managed_table[: shape[0]]
             self._draft_capacities = torch.zeros(
                 shape[0], dtype=torch.long, device=self._ctx_len.device
             )
             self._draft_page_versions.clear()
             self._draft_page_indices.clear()
+            self._draft_page_capacities.clear()
             self._managed_residency.clear()
             self._uploaded_slots = None
             self._uploaded_capacities = None
             self._table_slots = None
         spec_metadata._dspark_worker = self
         self._prepare_page_tables(spec_metadata.request_ids, attn_metadata.num_contexts)
-
-    def prepare_managed_generation_cache(
-        self, draft_model, spec_metadata, attn_metadata, resource_manager, request_ids: list[int]
-    ) -> bool:
-        """Stage bound PRIVATE decode pages before attention input preparation."""
-        if (
-            self._draft_kv_manager is None
-            or self._draft_reuse_policy != ReusePolicy.PRIVATE
-            or self.mapping.cp_size != 1
-            or spec_metadata is None
-            or self.get_draft_kv_cache_manager(resource_manager) is not self._draft_kv_manager
-        ):
-            return False
-        self._lazy_init(draft_model, spec_metadata, attn_metadata)
-        spec_metadata._dspark_worker = self
-        self._prepare_page_tables(request_ids, 0)
-        return True
 
     def _page_indices(self, cache, is_context: bool) -> tuple[int, tuple[int, ...]]:
         manager = self._draft_kv_manager
@@ -149,6 +141,15 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
     def _prepare_page_tables(self, request_ids: list[int], num_contexts: int) -> None:
         manager = self._draft_kv_manager
         private = self._draft_reuse_policy == ReusePolicy.PRIVATE
+        native = private and not num_contexts
+        managed = native and manager.draft_page_table_prepared(request_ids)
+        # CTX keeps a snapshot: its encoder/decoder passes can prepare inner
+        # batches after this call. GEN's single target pass publishes its draft
+        # table directly, including the stable address captured by each graph.
+        table = self._draft_managed_block_tables if native else self._draft_fallback_block_tables
+        if self._draft_block_tables is not table:
+            self._draft_block_tables = table
+            self._table_slots = None
         versioned_window = private and not num_contexts and manager.tokens_per_block == self._win
         real_rows = [
             row
@@ -176,7 +177,9 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
             page_version = cache.page_storage_version
             # A page-sized window moves only at a history-block boundary, which
             # the native storage version already tracks alongside page changes.
-            if (
+            if managed:
+                version = (cache, page_version, True)
+            elif (
                 versioned_window
                 and previous is not None
                 and previous[0] is cache
@@ -188,14 +191,24 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
                 first = max(0, cache.history_length - self._win) // manager.tokens_per_block
                 version = (cache, page_version, first, cache.num_blocks, row < num_contexts)
             if previous != version:
-                table = self._page_indices(cache, row < num_contexts)
-                if self._draft_page_indices.get(slot) != table:
-                    updates.append((slot, row, *table))
-                    self._draft_page_indices[slot] = table
+                if managed:
+                    self._draft_page_capacities[slot] = cache.num_blocks * manager.tokens_per_block
+                else:
+                    table = self._page_indices(cache, row < num_contexts)
+                    if self._draft_page_indices.get(slot) != table:
+                        updates.append((slot, row, *table))
+                        self._draft_page_indices[slot] = table
                 self._draft_page_versions[slot] = version
-            first, indices = self._draft_page_indices[slot]
-            capacities[row] = (first + len(indices)) * manager.tokens_per_block
+            if managed:
+                capacities[row] = self._draft_page_capacities[slot]
+            else:
+                first, indices = self._draft_page_indices[slot]
+                capacities[row] = (first + len(indices)) * manager.tokens_per_block
             if self._managed_residency.get(rid) is not cache:
+                if managed:
+                    # Validate a new/resumed cache once. Later page changes are
+                    # published by the same native batch conversion as target KV.
+                    self._page_indices(cache, False)
                 position = cache.history_length
                 length = min(position, self._win)
                 if row < num_contexts and self._draft_reuse_policy == ReusePolicy.PRIVATE:
@@ -213,11 +226,12 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
         capacity_values = tuple(capacities)
         slots_changed = self._uploaded_slots != slot_values
         capacities_changed = self._uploaded_capacities != capacity_values
-        if not updates and not slots_changed and not capacities_changed:
+        if managed:
+            self._table_slots = None
+        gather_table = not managed and self._table_slots != slot_values
+        if not updates and not slots_changed and not capacities_changed and not gather_table:
             return
-        # With an unchanged execution order, publish changed pages to both
-        # table views in one scatter instead of gathering the entire table.
-        direct = private and self._table_slots == slot_values
+        direct = private and not native and self._table_slots == slot_values
         count = sum(len(indices) for _, _, _, indices in updates) * (2 if direct else 1)
         host = next(
             (item for item in self._draft_metadata_host_buffers if item["event"].query()), None
@@ -274,7 +288,7 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
                 DSparkCopySite.PAGE_CAPACITIES, self._draft_capacities, host["capacities"]
             )
             self._uploaded_capacities = capacity_values
-        if not direct and (updates or self._table_slots != slot_values):
+        if not managed and not direct and (updates or gather_table):
             torch.index_select(
                 self._draft_slot_block_tables, 0, self._batch_to_slot, out=self._draft_block_tables
             )

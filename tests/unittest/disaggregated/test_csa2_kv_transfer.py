@@ -38,7 +38,7 @@ from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.runtime.kv_cache_manager_v2 import _introspection
+from tensorrt_llm.runtime.kv_cache_manager_v2 import ReusePolicy, _introspection
 
 pytestmark = skip_pre_blackwell
 
@@ -78,6 +78,7 @@ def _managers(
                     head_dim=512,
                     buffer_roles=(Role.KEY,),
                     sliding_window_size=129,
+                    reuse_policy=ReusePolicy.PRIVATE,
                 )
                 for stage in range(draft_stages)
             ]
@@ -221,12 +222,21 @@ def test_csa2_shared_draft_kv_handoff(monkeypatch, ctx_tp, gen_tp):
         lengths = kwargs["request_lengths"]
         ctx_managers, gen_managers = kwargs["ctx_managers"], kwargs["gen_managers"]
         ctx_ids, gen_ids = kwargs["ctx_request_ids"], kwargs["gen_request_ids"]
+        for target in gen_managers:
+            target.compute_batch_page_tables(gen_ids, 0)
         for row, length in enumerate(lengths):
             source = ctx_managers[0]
             for target in gen_managers:
                 for layer in target.draft_layer_ids:
                     src_pages = source.get_batch_cache_indices([ctx_ids[row]], layer)[0]
                     dst_pages = target.get_batch_cache_indices([gen_ids[row]], layer)[0]
+                    converted = target.draft_page_table()[row, : len(dst_pages)]
+                    torch.testing.assert_close(
+                        converted,
+                        torch.tensor(dst_pages, dtype=torch.int32, device=converted.device),
+                        rtol=0,
+                        atol=0,
+                    )
                     src = source.get_buffers(layer, kv_layout="HND")
                     dst = target.get_buffers(layer, kv_layout="HND")
                     first = max(0, length + 1 - 129) // TOKENS_PER_BLOCK

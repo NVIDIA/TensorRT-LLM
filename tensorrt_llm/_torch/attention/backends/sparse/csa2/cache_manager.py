@@ -1207,6 +1207,7 @@ class CSA2CacheManager(KVCacheManagerV2):
         already read them.
         """
         count = len(request_ids)
+        self._batch_caches = None
         self._batch_page_tables = self._device_batch_page_tables[:, :count]
         self._batch_scratch = None
         stream = self._wait_for_page_table_conversion()
@@ -1227,7 +1228,6 @@ class CSA2CacheManager(KVCacheManagerV2):
             self._num_page_table_reuses += 1
             return None
         self._batch_rows = np.empty(0, dtype=np.int32)
-        self._batch_caches = None
         if not count:
             self._batch_conversion_inputs = None
             if swa_out is not None:
@@ -1243,11 +1243,12 @@ class CSA2CacheManager(KVCacheManagerV2):
             self._batch_scratch = scratch[0]
         if page_versions is None:
             page_versions = [cache.page_storage_version for cache in caches]
-        self._batch_caches = (tuple(request_ids), caches, page_versions)
+        batch_caches = (tuple(request_ids), caches, page_versions)
         inputs = None
         if not num_contexts:
             inputs = (self._batch_rows, caches, list(page_versions), scratch, swa_out)
             if _same_conversion_inputs(inputs, self._batch_conversion_inputs):
+                self._batch_caches = batch_caches
                 self._num_page_table_reuses += 1
                 return None
         changed = _changed_rows(inputs, self._batch_conversion_inputs)
@@ -1278,6 +1279,7 @@ class CSA2CacheManager(KVCacheManagerV2):
         self._table_live[:count] = live
         if swa_out is None:
             self._swa_table_live[:count] = live
+        self._batch_caches = batch_caches
         self._batch_conversion_inputs = inputs
         return live
 
@@ -1503,6 +1505,15 @@ class CSA2CacheManager(KVCacheManagerV2):
             return None
         return batch[1], batch[2]
 
+    def draft_page_table(self) -> torch.Tensor | None:
+        """Graph-stable draft table, converted with the target's tables."""
+        return self._draft_page_table
+
+    def draft_page_table_prepared(self, request_ids) -> bool:
+        """Whether the last batch conversion describes this execution order."""
+        batch = self._batch_caches
+        return batch is not None and batch[0] == tuple(request_ids)
+
     def batch_page_table(self, spec, width: int) -> torch.Tensor:
         """Converted int32 ``[requests, width]`` table of ``spec`` for the last computed batch."""
         return self._batch_page_tables[self._batch_page_index[spec], :, :width]
@@ -1676,9 +1687,24 @@ class CSA2CacheManager(KVCacheManagerV2):
                     converter.scratch_pages_per_block,
                 ]
             )
+        self._draft_page_table_index = None
+        layers = self.draft_layer_ids
+        if layers:
+            geometry = []
+            for layer in layers:
+                pool = self.layer_to_pool_mapping_dict[self.layer_offsets[layer]]
+                scale = self.get_layer_page_index_scale(layer)
+                stride = self._get_cache_view_page_stride(scale, 1)
+                geometry.append((pool, scale // stride))
+            if any(item != geometry[0] for item in geometry[1:]):
+                raise ValueError("DSpark stages require identical page-table geometry")
+            self._draft_page_table_index = len(params)
+            # get_buffers() already points at the stage's layer offset. Draft
+            # windows use ordinary base pages, without SWA scratch mappings.
+            params.append([*geometry[0], 0, 0, 0])
         params = np.asarray(params, dtype=np.int32).reshape(-1, 5)
         self._scratch_pools, params[:, 3] = np.unique(params[:, 0], return_inverse=True)
-        # Keep native pool indices, excluding unreferenced trailing draft pools.
+        # Keep native pool indices, including the draft when it is present.
         self._batch_page_pool_count = int(params[:, 0].max(initial=-1)) + 1
         if -(-self.max_seq_len // self.tokens_per_block) > self.max_blocks_per_seq:
             raise ValueError("CSA2 page tables must cover max_seq_len")
@@ -1693,7 +1719,7 @@ class CSA2CacheManager(KVCacheManagerV2):
         with torch.cuda.stream(self._stream):
             self._device_batch_page_params = torch.from_numpy(params).to(device)
             self._device_batch_page_tables = torch.full(
-                (len(specs), capacity, self.max_blocks_per_seq),
+                (len(params), capacity, self.max_blocks_per_seq),
                 BAD_PAGE_INDEX,
                 dtype=torch.int32,
                 device=device,
@@ -1711,6 +1737,11 @@ class CSA2CacheManager(KVCacheManagerV2):
             # Batch (or changed) rows, then each row's column bound.
             self._device_batch_rows = torch.empty(2 * capacity, dtype=torch.int32, device=device)
             self._device_changed_rows = torch.empty(2 * capacity, dtype=torch.int32, device=device)
+            self._draft_page_table = (
+                None
+                if self._draft_page_table_index is None
+                else self._device_batch_page_tables[self._draft_page_table_index]
+            )
             self._device_row_iota = torch.arange(capacity, dtype=torch.int32, device=device)
         self._device_changed_base = None
         # (stream, rows and bounds) of the last upload into _device_batch_rows.
