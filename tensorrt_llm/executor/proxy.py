@@ -567,14 +567,17 @@ class GenerationExecutorProxy(GenerationExecutor):
 
     def _mark_engine_dead(self, error: Optional[BaseException] = None) -> None:
         """Set the sticky flag and push EngineDeadError onto pending results."""
-        if self._engine_dead:
-            return
-        self._engine_dead = True
+        with self._admission_lock:
+            if self._engine_dead:
+                return
+            self._engine_dead = True
+            # Own the notifications before shutdown can clear the registry.
+            results = list(self._results.values())
         dead_error = EngineDeadError(error)
-        # Snapshot to avoid mutation-during-iteration; best-effort per result.
+        # Deliver outside the admission lock so queue notification cannot block it.
         # Use put() (not put_nowait()) so the async _SyncQueue path also wakes
         # the awaiting event loop, not just the sync Queue path.
-        for result in list(self._results.values()):
+        for result in results:
             try:
                 result.queue.put(dead_error)
             except Exception:  # noqa: BLE001 - a full/closed queue must not stop the sweep
@@ -1497,18 +1500,19 @@ class GenerationExecutorProxy(GenerationExecutor):
             self._handle_background_error()
 
     def _finish_pending_requests(self) -> None:
-        # The reader has exited. No more terminal responses can arrive for
-        # unfinished requests. Dead-engine callers already have EngineDeadError.
-        if not self._engine_dead:
-            for client_id, result in list(self._results.items()):
-                try:
-                    result.queue.put(
-                        ErrorResponse(client_id, 'Executor proxy shut down',
-                                      client_id))
-                except AsyncQueue.EventLoopShutdownError:
-                    # The result is queued, but its consumer loop can no longer be notified.
-                    continue
-        self._results.clear()
+        # The reader has exited. Either the death sweep owns the notifications,
+        # or shutdown takes ownership before a later death can snapshot them.
+        with self._admission_lock:
+            results = [] if self._engine_dead else list(self._results.items())
+            self._results.clear()
+        for client_id, result in results:
+            try:
+                result.queue.put(
+                    ErrorResponse(client_id, 'Executor proxy shut down',
+                                  client_id))
+            except AsyncQueue.EventLoopShutdownError:
+                # The result is queued, but its consumer loop can no longer be notified.
+                continue
 
     def _close_ipc_queues(self) -> None:
         for name in ('request_queue', 'worker_init_status_queue',

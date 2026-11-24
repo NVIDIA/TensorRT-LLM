@@ -453,6 +453,111 @@ def test_aresult_stays_failed_after_engine_dead():
     asyncio.run(run())
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("first", ["engine_death", "shutdown"])
+def test_death_and_shutdown_handoff_notifies_async_result_once(
+    monkeypatch: pytest.MonkeyPatch, first: str
+) -> None:
+    """A paused terminal notifier retains ownership when the registry is cleared."""
+    from tensorrt_llm.executor.utils import ErrorResponse
+    from tensorrt_llm.llmapi.utils import AsyncQueue
+
+    async def run() -> None:
+        proxy = _bare_proxy()
+        result = GenerationResult.__new__(GenerationResult)
+        result.aqueue = AsyncQueue()
+        result.queue = result.aqueue.sync_q
+        result._done = False
+        result._terminal_error = None
+        result._background_error_handler = None
+        result._error_msg = None
+        proxy._results = {7: result}
+        cause = RuntimeError("worker died")
+        waiting = asyncio.Event()
+        real_wait = result.aqueue._event.wait
+
+        async def observe_wait() -> bool:
+            waiting.set()
+            return await real_wait()
+
+        monkeypatch.setattr(result.aqueue._event, "wait", observe_wait)
+        put = Mock(wraps=result.queue.put)
+        monkeypatch.setattr(result.queue, "put", put)
+        entered, release = threading.Event(), threading.Event()
+        completed = _Future()
+
+        def pause_notification() -> None:
+            entered.set()
+            if not release.wait(timeout=5):
+                raise TimeoutError("terminal notification was not released")
+
+        def dead_error(error: BaseException | None = None) -> EngineDeadError:
+            assert proxy._engine_dead
+            pause_notification()
+            return EngineDeadError(error)
+
+        def shutdown_error(client_id: int, message: str, request_id: int) -> ErrorResponse:
+            pause_notification()
+            return ErrorResponse(client_id, message, request_id)
+
+        def mark_dead() -> None:
+            proxy._mark_engine_dead(cause)
+
+        if first == "engine_death":
+            monkeypatch.setattr(proxy_module, "EngineDeadError", dead_error)
+            notify_first, notify_second = mark_dead, proxy._finish_pending_requests
+        else:
+            monkeypatch.setattr(proxy_module, "ErrorResponse", shutdown_error)
+            notify_first, notify_second = proxy._finish_pending_requests, mark_dead
+
+        def notify() -> None:
+            try:
+                notify_first()
+            except Exception as error:  # noqa: BLE001 - transfer owned-thread failures to the test
+                completed.set_exception(error)
+            else:
+                completed.set_result(None)
+
+        notifier = threading.Thread(target=notify)
+        waiter = asyncio.create_task(result.aresult())
+        try:
+            # observe_wait does not yield until the real empty-queue wait is entered.
+            await asyncio.wait_for(waiting.wait(), timeout=5)
+            assert not waiter.done()
+            assert result.aqueue.empty()
+            notifier.start()
+            assert entered.wait(timeout=5)
+            notify_second()
+            release.set()
+            notifier.join(timeout=5)
+            assert not notifier.is_alive()
+            completed.result(timeout=1)
+            if first == "engine_death":
+                with pytest.raises(EngineDeadError) as raised:
+                    await asyncio.wait_for(asyncio.shield(waiter), timeout=1)
+                assert raised.value.root_cause is cause
+                assert result._terminal_error is raised.value
+            else:
+                assert await asyncio.wait_for(asyncio.shield(waiter), timeout=1) is result
+                assert result.error == "Executor proxy shut down"
+            mark_dead()
+            proxy._finish_pending_requests()
+            put.assert_called_once()
+            assert result.aqueue.empty()
+            assert not proxy._results
+        finally:
+            release.set()
+            try:
+                if notifier.ident is not None:
+                    notifier.join(timeout=5)
+            finally:
+                waiter.cancel()
+                await asyncio.wait_for(asyncio.gather(waiter, return_exceptions=True), timeout=1)
+            assert not notifier.is_alive()
+
+    asyncio.run(run())
+
+
 def test_submit_fast_fails_when_engine_already_dead():
     """submit() must reject new work immediately once the engine is dead."""
     proxy = _bare_proxy()
