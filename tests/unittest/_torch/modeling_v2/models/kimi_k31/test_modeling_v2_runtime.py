@@ -7,12 +7,30 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.cache_manager import (
+    DeepseekV4CacheManager,
+)
+from tensorrt_llm._torch.attention.backends.sparse.dsa.cache_manager import (
+    DSACacheManager,
+    DSACacheManagerV2,
+    is_dsa_cache_manager,
+)
+from tensorrt_llm._torch.modeling_v2.models.kimi_k31.ops.attention.dsa_cache import (
+    is_dsa_cache_manager as is_k31_dsa_cache_manager,
+)
+from tensorrt_llm._torch.modeling_v2.models.kimi_k31.ops.ssm.kda_dsa_cache_manager import (
+    KimiK3DSAHybridCacheManager,
+)
+from tensorrt_llm._torch.modeling_v2.models.kimi_k31.ops.ssm.rubin_kda_dsa_cache_manager import (
+    RubinKdaDsaHybridCacheManager,
+)
 from tensorrt_llm._torch.modeling_v2.models.kimi_k31.runtime import (
     K31_RUNTIME_HOOKS,
     K31CountFirstAdmission,
 )
 from tensorrt_llm._torch.modules.kimi_kda.cache_manager import KimiK3HybridCacheManager
 from tensorrt_llm._torch.pyexecutor._util import get_kv_cache_manager_cls
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
@@ -60,6 +78,30 @@ def test_dsa_on_the_hybrid_model_needs_the_declared_manager(monkeypatch):
             KvCacheConfig(use_kv_cache_manager_v2=False),
             model_declares_manager=True,
         )
+
+
+@pytest.mark.parametrize(
+    ("manager_type", "has_mapping"),
+    [
+        (KVCacheManagerV2, False),
+        (
+            DeepseekV4CacheManager,
+            False,
+        ),  # Also exposes indexer buffers, with a different page mapping.
+        (KimiK3DSAHybridCacheManager, True),
+        (RubinKdaDsaHybridCacheManager, True),
+    ],
+)
+def test_v2_dsa_indexer_page_mapping(manager_type: type, has_mapping: bool) -> None:
+    manager = object.__new__(manager_type)
+    assert hasattr(manager, "provides_dsa_indexer_k_cache") is has_mapping
+    assert is_dsa_cache_manager(manager) is has_mapping
+    assert is_k31_dsa_cache_manager(manager) is has_mapping
+
+
+@pytest.mark.parametrize("manager_type", [DSACacheManager, DSACacheManagerV2])
+def test_native_dsa_managers_keep_their_page_mapping(manager_type: type) -> None:
+    assert is_dsa_cache_manager(object.__new__(manager_type))
 
 
 def _plan(**overrides):

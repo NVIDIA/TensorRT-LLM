@@ -394,7 +394,7 @@ def test_enqueue_request_wraps_lora_load_error():
 
 
 @pytest.mark.cpu_only
-def test_helix_prompt_without_generation_room_is_rejected():
+def test_helix_v2_generation_budget_at_sequence_limit():
     """A Helix prompt on KVCacheManagerV2 counts whole against max_seq_len."""
     worker = object.__new__(BaseWorker)
     worker.doing_shutdown = True
@@ -416,6 +416,14 @@ def test_helix_prompt_without_generation_room_is_rejected():
         worker._enqueue_request(request)
 
     assert str(error.value) == context_length_exceeded_message(1024, 1024)
+    worker.engine.enqueue_request.assert_not_called()
+
+    request = GenerationRequest(
+        prompt_token_ids=[1] * 1023,
+        sampling_params=SamplingParams(max_tokens=8)).set_id(4)
+    assert worker._enqueue_request(request) == 1
+    worker.engine.enqueue_request.assert_called_once()
+    assert worker.engine.enqueue_request.call_args.args[0].max_tokens == 1
 
 
 def test_lora_request_does_not_probe_filesystem_on_init(tmp_path):

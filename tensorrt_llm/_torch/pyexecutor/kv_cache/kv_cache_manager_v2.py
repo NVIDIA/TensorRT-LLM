@@ -2405,8 +2405,6 @@ class KVCacheManagerV2(BaseResourceManager):
     # True on hybrid Mamba/GDN managers; __init__ then coerces a positive
     # recompute tail to a full re-prefill.
     _has_recurrent_state: bool = False
-    # True on a manager that also holds a DSA indexer K cache with the DSA page mapping (is_dsa_cache_manager).
-    provides_dsa_indexer_k_cache: bool = False
     # Staging rows per batch for recurrent-state snapshots taken inside the
     # forward (the GDN cache manager's in-forward snapshots); 0 = none.
     inforward_snapshot_rows: int = 0

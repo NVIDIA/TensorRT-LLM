@@ -83,4 +83,7 @@ def derive_indexer_k_cache_layer_mask(
 def is_dsa_cache_manager(cache_manager: object) -> bool:
     """Return whether a manager holds the DSA indexer K cache (the Kimi K3.1 hybrid manager sets
     ``provides_dsa_indexer_k_cache``; the drafters' KV cache managers do not)."""
-    return getattr(cache_manager, "provides_dsa_indexer_k_cache", False)
+    return (
+        hasattr(cache_manager, "provides_dsa_indexer_k_cache")
+        and cache_manager.provides_dsa_indexer_k_cache is True
+    )

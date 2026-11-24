@@ -311,8 +311,10 @@ def test_quota_conversions_cost_the_draft_layers(quota):
 class _PageBounds:
     def __init__(self, pages):
         self.pages = pages
+        self.queried_layers = []
 
     def get_page_index_upper_bound(self, layer_id, role):
+        self.queried_layers.append(int(layer_id))
         return self.pages[int(layer_id)]
 
 
@@ -328,7 +330,7 @@ def test_free_blocks_count_the_model_layers(layout_policy):
     seamed = _seamed_manager()
     manager = object.__new__(_HybridManager)
     manager._unified_draft_layer_specs = seamed._unified_draft_layer_specs
-    manager.kv_cache_map = {}
+    manager.kv_cache_map = {engine_manager._GUARD_PAGE_REQUEST_ID: object()}
     manager._attention_cache_layout_policy = layout_policy
     manager.num_local_layers = 42
     manager.kv_factor = 1
@@ -337,8 +339,18 @@ def test_free_blocks_count_the_model_layers(layout_policy):
     manager.impl = _PageBounds(pages)
     manager._is_local_mamba_layer = lambda layer: layer < 30
     assert manager.get_num_free_blocks() == (30 if layout_policy is None else 7)
+    assert manager.impl.queried_layers == (list(range(40)) if layout_policy is None else [])
+
+    manager.impl.queried_layers.clear()
+    manager.kv_cache_map[1] = object()
+    with pytest.raises(AssertionError, match="kv cache manager is empty"):
+        manager.get_num_free_blocks()
+    assert manager.impl.queried_layers == []
+    del manager.kv_cache_map[1]
+
     manager._unified_draft_layer_specs = {}
     assert manager.get_num_free_blocks() == (90 if layout_policy is None else 7)
+    assert manager.impl.queried_layers == (list(range(42)) if layout_policy is None else [])
 
 
 # --- The engine's rewind keeps the drafter's history and scratch -----------

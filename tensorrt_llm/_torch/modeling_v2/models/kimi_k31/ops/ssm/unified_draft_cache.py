@@ -13,7 +13,7 @@ The mixin goes before the engine manager in the family manager's bases (``K31Hyb
 engine methods that lay out the draft layers (``_lay_out_regions``), describe them (``_explicit_layer_spec``,
 ``_get_pool_roles``, ``_is_local_mamba_layer``, ``get_layer_owner``, ``draft_layer_ids``, ``get_buffers``), size every
 allocation and the pools for them (``_kv_alloc_extra_tokens``, ``_generation_kv_capacity_headroom``, the quota
-conversions, ``get_num_free_blocks``) and keep the drafter's history over a request's life
+conversions, ``_get_num_free_blocks_for_layers``) and keep the drafter's history over a request's life
 (``_resume_context_cache``, ``_create_kv_cache``, ``update_resources``, ``free_resources``, ``_shutdown_caches``).
 Before construction, the classmethod ``unified_draft_cache_kwargs`` declares the ``draft_*`` constructor arguments of
 a deployment, or none, and refuses the drafter settings the cache cannot serve. The DFlash worker reads a unified
@@ -27,7 +27,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any, Collection, List, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Collection, Iterable, List, Optional, Sequence
 
 import torch
 
@@ -37,7 +37,6 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     Role,
     _estimate_cache_size_components,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import MambaRole
 from tensorrt_llm._utils import (
     TensorWrapper,
     convert_to_torch_tensor,
@@ -573,30 +572,11 @@ class UnifiedDraftCacheMixin:
             + self._get_generation_request_capacity() * generation_swa_size_per_request
         )
 
-    def get_num_free_blocks(self) -> int:
-        """``MambaHybridCacheManagerV2.get_num_free_blocks`` over the model layers.
-
-        The draft layers follow the model layers' ledger blocks, so they never bound the count.
-        """
-        num_free_blocks = super().get_num_free_blocks()
-        if not self._unified_draft_layer_specs or self._attention_cache_layout_policy is not None:
-            return num_free_blocks
-        attention_pages = []
-        ssm_pages = []
-        for local_layer_idx in range(self.num_local_layers):
-            layer_id = LayerId(local_layer_idx)
-            if self._is_local_mamba_layer(local_layer_idx):
-                ssm_pages.append(
-                    self.impl.get_page_index_upper_bound(layer_id, MambaRole.SSM_STATE)
-                    // self._ssm_page_index_scale
-                )
-            elif local_layer_idx not in self._unified_draft_layer_specs:
-                attention_pages.append(
-                    self.impl.get_page_index_upper_bound(layer_id, Role.KEY) // self.kv_factor
-                )
-        if attention_pages:
-            return max(attention_pages)
-        return max(ssm_pages) if ssm_pages else 0
+    def _get_num_free_blocks_for_layers(self, local_layer_ids: Iterable[int]) -> int:
+        """Standalone draft layers follow the target's ledger blocks and do not bound warmup."""
+        return super()._get_num_free_blocks_for_layers(
+            layer for layer in local_layer_ids if layer not in self._unified_draft_layer_specs
+        )
 
     def _resume_context_cache(self, req: LlmRequest, kv_cache: _KVCache) -> bool:
         """The engine's resume; once a request's first context chunk resumed, its draft history starts."""

@@ -1191,5 +1191,6 @@ def is_dsa_cache_manager(cache_manager: object) -> bool:
     opts in with ``provides_dsa_indexer_k_cache = True``."""
     return isinstance(cache_manager, (DSACacheManager, DSACacheManagerV2)) or (
         isinstance(cache_manager, KVCacheManagerV2)
+        and hasattr(cache_manager, "provides_dsa_indexer_k_cache")
         and cache_manager.provides_dsa_indexer_k_cache is True
     )
