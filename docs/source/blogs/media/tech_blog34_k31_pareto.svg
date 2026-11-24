@@ -52,6 +52,6 @@
 <text x="614.0" y="76" font-size="13" fill="#0b0b0b">Day 0: v1 Kimi K3 code, K3 drafter</text>
 <line x1="576.0" x2="604.0" y1="94" y2="94" stroke="#2a78d6" stroke-width="3" stroke-linecap="round"/>
 <circle cx="590.0" cy="94" r="6" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
-<text x="614.0" y="98" font-size="13" fill="#0b0b0b">Modeling V2: K3.1 targets, DFlash2</text>
+<text x="614.0" y="98" font-size="13" fill="#0b0b0b">Modeling V2: K3.1 ModelCores, DFlash2</text>
 <text x="8" y="564" font-size="12" fill="#898781">Each marker is one measured configuration (label: concurrency). Throughput includes prefix-cache hits.</text>
 </svg>
