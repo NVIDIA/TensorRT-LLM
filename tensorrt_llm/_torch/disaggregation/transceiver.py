@@ -1785,7 +1785,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             # one to close while the local above is still unassigned; read it back off the adapter.
             if session is None and fetches is not None:
                 session = self._legacy_session(fetches)
-            close_succeeded = session is None or session.close() is not False
+            # Same retirement gate as reap_sync_receives(): a failed receive whose other
+            # writers have not all reported stays tracked so the reaper retires it later.
+            close_succeeded = session is None or (
+                not self._retirement_blocked(session) and session.close() is not False
+            )
             if close_succeeded:
                 self._recv_sessions.pop(rid, None)
                 self._recv_reqs.pop(rid, None)
