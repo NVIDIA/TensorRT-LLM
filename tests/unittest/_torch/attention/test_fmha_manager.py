@@ -746,7 +746,16 @@ def test_xqa_without_perf_gain_yields_only_to_a_later_serving_library(
     events: list[tuple] = []
     attn, manager = _make_manager()
     generation = {None, FmhaPhase.GENERATION}
-    xqa = FakePhasedFmha(attn, generation, "xqa", events)
+    fake_xqa_cls = type(
+        "FakeXqaFmha",
+        (FakePhasedFmha,),
+        {
+            "kv_exceeds_beam_search_window": staticmethod(
+                fmha_manager.XqaFmha.kv_exceeds_beam_search_window
+            )
+        },
+    )
+    xqa = fake_xqa_cls(attn, generation, "xqa", events)
     xqa.has_perf_gain = lambda *_args: has_perf_gain
     libs = {"xqa": xqa}
     for name in later_names:
@@ -759,7 +768,10 @@ def test_xqa_without_perf_gain_yields_only_to_a_later_serving_library(
     metadata.beam_width = 1
     forward_args = AttentionForwardArgs(attention_input_type=AttentionInputType.generation_only)
 
-    with patch.object(fmha_manager, "_is_fmha_cache_enabled", return_value=use_cache):
+    with (
+        patch.object(fmha_manager, "_is_fmha_cache_enabled", return_value=use_cache),
+        patch.object(fmha_manager, "XqaFmha", fake_xqa_cls),
+    ):
         for _ in range(2):
             selected = manager.select(attn, torch.empty((1, 4)), None, None, metadata, forward_args)
             assert selected is libs[expected]

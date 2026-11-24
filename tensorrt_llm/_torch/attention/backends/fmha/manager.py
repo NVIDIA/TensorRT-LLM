@@ -659,9 +659,9 @@ class FmhaManager:
             supported = fmha.is_supported(q, k, v, metadata, forward_args, phase=phase)
         else:
             supported = fmha.is_supported(q, k, v, metadata, forward_args)
-        if not supported or fmha is not self._xqa:
+        if not supported or not isinstance(fmha, XqaFmha):
             return supported
-        if self._xqa.has_perf_gain(q, k, v, metadata, forward_args):
+        if fmha.has_perf_gain(q, k, v, metadata, forward_args):
             return True
         later_fmha_libs = self.fmha_libs[self.fmha_libs.index(fmha) + 1 :]
         return not any(

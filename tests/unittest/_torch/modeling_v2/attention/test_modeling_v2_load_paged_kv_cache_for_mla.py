@@ -753,7 +753,7 @@ def test_fp8_quant_mode_and_out_dtype_rejections() -> None:
         message = _raises(
             lambda: _call(env, metadata, 1, torch.bfloat16, scale_t, quant_mode=QM_NVFP4_KV_CACHE)
         )
-        assert "hostKvCachePoolPointers.dim() == 3" in message, message
+        assert "host_kv_cache_pool_pointers must be 3-D" in message, message
 
         for out_dtype in (torch.float8_e4m3fn, torch.int8, torch.float64):
             message = _raises(lambda od=out_dtype: _call(env, metadata, 1, od, scale_t))
