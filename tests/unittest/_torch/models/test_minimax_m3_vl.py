@@ -1582,6 +1582,12 @@ def _hand_rolled_processor_input_ids(
     return tokenizer.encode(out, add_special_tokens=False)
 
 
+# NOTE: this test only checks the real processor when it loads. If
+# _load_real_processor() returns None, the test falls back to
+# _hand_rolled_processor_input_ids, a copy of the same expansion formula, so it can
+# pass without ever using the real processor. It is removed from the test list. To
+# re-add it, make the test fail when the processor cannot load instead of falling
+# back.
 def test_real_checkpoint_processor_input_ids_match_trt_build_helper():
     """TRT helper matches the real HF/SGLang processor.
 
@@ -1710,6 +1716,14 @@ def test_real_checkpoint_processor_input_ids_match_trt_build_helper():
     assert oracle_input_ids[end + 1] == ve_id
 
 
+# NOTE: despite its name, this test never calls the real processor. It compares the
+# helper with a hand-written copy of the processor's expansion, for grid_t=1 and no
+# timestamps only. The helper writes one bracket around the whole video, while the
+# processor writes one per temporal patch, so grid_t > 1 would fail until the helper
+# changes. It is removed from the test list. The real video coverage is in
+# test_real_checkpoint_video_fast_path_matches_processor_input_ids and its two-video
+# variant. To re-add this test, compare against the real processor's
+# input_ids and grid_thw.
 def test_real_checkpoint_processor_video_input_ids_match_trt_build_helper():
     """Video-capable prompts also go through the bracketed contract.
 
