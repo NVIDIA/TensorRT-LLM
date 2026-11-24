@@ -26,12 +26,19 @@ from unittest.mock import Mock
 
 import pytest
 
+import tensorrt_llm._torch.disaggregation.native.transfer as transfer_mod
+import tensorrt_llm._torch.disaggregation.transceiver as transceiver_mod
+from tensorrt_llm._torch.disaggregation.base import TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
 from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
     CtxTransferStatus,
     GenTransferStatus,
 )
+from tensorrt_llm._torch.disaggregation.native.extent import Chunk
 from tensorrt_llm._torch.disaggregation.native.transfer import (
+    AgentResult,
+    KVRecvTask,
+    Receiver,
     RxSession,
     TaskStatus,
     TransferWorker,
@@ -1645,3 +1652,92 @@ def test_gen_idle_skip_deferred_publication_keeps_lockstep() -> None:
     assert not any(t._recv_sessions for t in ranks)
     round_()
     assert all(t._gen_idle_agreed for t in ranks)
+
+
+@pytest.mark.parametrize("writer_result", [AgentResult.SUCCESS, AgentResult.FAILED])
+def test_sync_receive_timeout_keeps_destination_until_silent_writer_reports(
+    writer_result: AgentResult, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A blocking receive whose wait expires before its only writer reported stays open.
+
+    The writer was asked and may still be writing, so the timed-out receive is
+    cancelled and kept tracked rather than closed; once the writer reports, the
+    reaper retires it exactly once.
+    """
+    monkeypatch.setattr(transfer_mod.tensorrt_llm.bindings, "global_steady_clock_now", lambda: 0)
+    rid = 141
+    token = b"report-token"
+    receiver = object.__new__(Receiver)
+    receiver._enforce_physical_ownership = False
+    receiver._sessions_lock = threading.Lock()
+    receiver._sessions = {}
+    receiver._pre_cancelled_rids = {}
+    receiver._shutdown = False
+    receiver._registrar = SimpleNamespace(
+        self_rank_info=SimpleNamespace(instance_name="gen", instance_rank=0)
+    )
+    session = RxSession(
+        request_id=rid,
+        params=DisaggregatedParams(disagg_request_id=rid),
+        receiver=receiver,
+        timeout_s=0.01,
+    )
+
+    def publish(task: KVRecvTask) -> None:
+        task.expected_transfers = 1
+        task._kv_result_report_tokens = {3: token}
+        session.mark_transferring(task.slice_id)
+
+    receiver.dispatch_task = publish
+    session.receive(
+        Chunk(
+            block_ids_per_layer_groups=[],
+            kind_per_layer_group=[],
+            token_range=TokenRange(start=0, end=0),
+            is_last=True,
+        )
+    )
+
+    request = SimpleNamespace(
+        request_id=rid,
+        py_request_id=rid,
+        py_disaggregated_params=DisaggregatedParams(disagg_request_id=rid),
+    )
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._recv_sessions = {}
+    transceiver._recv_reqs = {}
+    transceiver._pending_rank_info_admissions = None
+    transceiver._page_table = None
+    transceiver._validate_bridge_req = lambda req, synchronous=False: True
+    transceiver._create_cache_extent = lambda req: SimpleNamespace(local=None)
+    transceiver._open_peer_source = lambda req: SimpleNamespace(
+        fetch=lambda extent, expected_write_bytes: None
+    )
+    transceiver._legacy_session = lambda fetches: session
+    monkeypatch.setattr(transceiver_mod, "_chunk_bytes_by_kind", lambda table, chunk: (0, 0))
+    closes: list[bool] = []
+    real_close = session.close
+
+    def counted_close() -> bool:
+        closes.append(real_close())
+        return closes[-1]
+
+    monkeypatch.setattr(session, "close", counted_close)
+
+    transceiver.request_and_receive_sync(request)
+
+    assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
+    assert closes == []
+    assert session.status == SessionStatus.CANCELLED
+    assert transceiver._recv_sessions == {rid: session}
+    assert transceiver._recv_reqs == {rid: request}
+    assert transceiver.reap_sync_receives() is False
+    assert closes == []
+
+    session.process_kv_agent_result(3, 0, True, writer_result, token)
+    assert transceiver.reap_sync_receives() is True
+    assert closes == [True]
+    assert transceiver._recv_sessions == {}
+    assert transceiver._recv_reqs == {}
+    assert transceiver.reap_sync_receives() is False
+    assert closes == [True]

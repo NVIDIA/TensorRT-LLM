@@ -2223,7 +2223,12 @@ def test_bounce_sender_reports_physical_failure_only_after_drain(monkeypatch, sc
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("ranks", "evidence"),
-    [((), None), ((0, 2, 7), 133), ((0, 10**6), frozenset({0, 10**6}))],
+    [
+        ((), None),
+        ((0, 2, 7), (0, 133)),
+        ((64, 65, 66, 67, 68, 69, 70, 71), (64, 255)),
+        ((0, 10**6), (frozenset({0, 10**6}),)),
+    ],
 )
 def test_retired_sender_retains_compact_peer_publication_evidence(ranks, evidence):
     rid = 117
@@ -2235,8 +2240,8 @@ def test_retired_sender_retains_compact_peer_publication_evidence(ranks, evidenc
     if evidence is None:
         assert isinstance(retired, float)
     else:
-        assert retired[1] == evidence
-    for rank in (0, 1, 2, 7, 64, 10**6):
+        assert retired[1:] == evidence
+    for rank in (0, 1, 2, 7, 63, 64, 68, 71, 72, 10**6):
         assert sender._has_peer_publication_locked(rid, rank) is (rank in ranks)
 
 
@@ -5165,3 +5170,106 @@ def test_lost_bounce_result_lets_retirement_settle_the_peer(monkeypatch):
     assert ctx.close()
     queued = [item for item in list(sender._send_task_queues[0].queue) if isinstance(item, tuple)]
     assert [_kv_result_code(message) for _, message in queued] == [AgentResult.NOT_SUBMITTED]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("posted_members", [0, 1])
+def test_bounce_writer_settles_a_transfer_whose_creation_failed_before_posting(
+    monkeypatch, posted_members
+):
+    rid = 151
+    sender = _make_bounce_ctx_sender()
+    sender._add_req_info(rid, 0, _bounce_publication(rid))
+    ctx = transfer_mod.TxSession(rid, DisaggregatedParams(disagg_request_id=rid), sender)
+    ctx.send(_sole_piece())
+    posted = Mock()
+    posted.wait.return_value = True
+    sender._agent = Mock(bounce_enabled=True)
+    sender._agent.check_remote_descs.return_value = True
+    sender._agent.submit_transfer_requests.side_effect = [posted] * posted_members + [
+        RuntimeError("createXferReq failed")
+    ]
+    dealer = Mock()
+    sender._get_result_dealer = Mock(return_value=dealer)
+    member = Mock(op=transfer_mod.TransferOp.WRITE, remote_name="gen")
+    group = transfer_mod._TransferRequestGroup((member, member))
+    monkeypatch.setattr(transfer_mod.Sender, "_make_agent_request", lambda *_a, **_k: group)
+    meta = _bounce_kv_write_meta(ctx, rid, 0)
+    meta.expected_transfers = 1
+
+    if posted_members:
+        with pytest.raises(RuntimeError, match="createXferReq"):
+            sender._deliver_kv_to_agent(meta)
+    else:
+        sender._deliver_kv_to_agent(meta)
+
+    sent = [call.args[0] for call in dealer.send.call_args_list]
+    receiver, session = _make_one_writer_bounce_rx(rid, aux=False)
+    for message in sent:
+        Receiver._process_kv_agent_result(receiver, b"", message)
+    slot = _OneSlotAllocator(rid)
+    slot.apply_reuse_decision(session.close())
+    if posted_members:
+        # A posted group member may still access the destination.
+        assert sent == []
+        assert ctx._kv_writing_peer_ranks == {0}
+        assert not slot.is_reusable
+    else:
+        assert [_kv_result_code(message) for message in sent] == [AgentResult.NOT_SUBMITTED]
+        assert ctx._kv_settled_peer_ranks == {0}
+        assert slot.is_reusable
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("failure", ["send", "connect"])
+def test_interrupted_bounce_request_fan_out_stops_awaiting_only_unasked_writers(failure):
+    rid = 152
+    receiver = object.__new__(Receiver)
+    receiver._sessions_lock = threading.Lock()
+    receiver._sessions = {}
+    receiver._pre_cancelled_rids = {}
+    receiver._enforce_physical_ownership = False
+    receiver._shutdown = False
+    receiver._agent = SimpleNamespace(bounce_enabled=True)
+    receiver._build_recv_req_info = Mock(
+        return_value=SimpleNamespace(unique_rid=rid, slice_id=0, to_bytes=Mock(return_value=b""))
+    )
+    receiver._registrar = SimpleNamespace(
+        get_peer_overlap=Mock(return_value=SimpleNamespace(ranks=[0, 1, 2])),
+        self_rank_info=SimpleNamespace(instance_name="gen", instance_rank=0),
+    )
+    receiver._get_sender_info = Mock(
+        return_value=SimpleNamespace(sender_endpoints=["ctx0", "ctx1", "ctx2"], dp_size=1)
+    )
+    asked = []
+
+    def request_sender_data(endpoint: str, _payload: bytes, _token: bytes) -> None:
+        asked.append(endpoint)
+        if endpoint == "ctx1":
+            if failure == "connect":
+                raise transfer_mod._RequestNotSent("REQUEST_DATA send interrupted")
+            raise RuntimeError("REQUEST_DATA send interrupted")
+
+    receiver._request_sender_data = request_sender_data
+    session = RxSession(
+        request_id=rid,
+        params=DisaggregatedParams(disagg_request_id=rid, ctx_dp_rank=0),
+        receiver=receiver,
+    )
+    with pytest.raises(RuntimeError, match="send interrupted") as raised:
+        session.receive(_sole_piece())
+    session.fail_admission(raised.value)
+
+    assert asked == ["ctx0", "ctx1"]
+    tokens = session._kv_tasks[0]._kv_result_report_tokens
+    # Rank 1's request may have been queued before its send raised; a failed
+    # connection proves it was never asked.
+    awaited = (0, 1) if failure == "send" else (0,)
+    assert set(tokens) == set(awaited)
+    slot = _OneSlotAllocator(rid)
+    for rank in awaited:
+        slot.apply_reuse_decision(session.close())
+        assert not slot.is_reusable
+        session.process_kv_agent_result(rank, 0, True, AgentResult.SUCCESS, tokens[rank])
+    slot.apply_reuse_decision(session.close())
+    assert slot.is_reusable

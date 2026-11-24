@@ -179,6 +179,10 @@ class _DestinationDrainUnproven(RuntimeError):
         self.status = status
 
 
+class _RequestNotSent(RuntimeError):
+    """No REQUEST_DATA reached the transport, so the writer was never asked."""
+
+
 class ReceiveAdmissionFenced(RuntimeError):
     """The agent closed receive admission before this destination was published."""
 
@@ -637,6 +641,16 @@ def _admit_kv_write_locked(session: Optional["TxSession"], task: "SendTaskBase",
     writing.add(peer)
 
 
+def _withdraw_kv_write_locked(session: Optional["TxSession"], task: "SendTaskBase", peer: int):
+    """Undo ``_admit_kv_write_locked`` for a write that never reached the backend.
+
+    The caller holds ``session.lock``.
+    """
+    writing = getattr(session, "_kv_writing_peer_ranks", None)
+    if writing is not None and isinstance(task, KVSendTask):
+        writing.discard(peer)
+
+
 @dataclass
 class _PendingSettlement:
     write_meta: WriteMeta
@@ -832,9 +846,12 @@ class Sender(SenderBase):
         # timed out), oldest first. A REQUEST_DATA for one of them must be answered FAILED:
         # parking it as an early generation-first request would leave the peer's receive
         # unresolved for good. Protected by _sessions_lock.
-        # An empty publication cohort needs only its timestamp. Dense small
-        # cohorts use one mask, while sparse ranks do not grow the mask.
-        self._retired_rids: dict[int, float | tuple[float, int | frozenset[int]]] = {}
+        # An empty publication cohort needs only its timestamp. A cohort that
+        # spans fewer than 64 ranks is its lowest rank plus a mask relative to
+        # it, while sparse ranks do not grow the mask.
+        self._retired_rids: dict[
+            int, float | tuple[float, int, int] | tuple[float, frozenset[int]]
+        ] = {}
         self._shutdown = False
         self._shutdown_requested = False
         self._instance_rank = self._registrar.self_rank_info.instance_rank
@@ -1589,7 +1606,18 @@ class Sender(SenderBase):
                     task._native_inflight += 1
             try:
                 for index, member in enumerate(requests):
-                    status = self._agent.submit_transfer_requests(member)
+                    try:
+                        status = self._agent.submit_transfer_requests(member)
+                    except RuntimeError as error:
+                        # The native bounce-capable agent raises only before it
+                        # posts a request. Earlier members of a group were posted.
+                        if index > 0 or getattr(self._agent, "bounce_enabled", False) is not True:
+                            raise
+                        with session.lock if session is not None else nullcontext():
+                            _withdraw_kv_write_locked(session, task, peer_rank)
+                        raise _TransferNotSubmittedError(
+                            "NIXL could not create the transfer request"
+                        ) from error
                     if index == 0 and on_submitted is not None:
                         with disagg_diagnostics.suppress_diagnostic_errors():
                             on_submitted()
@@ -3185,8 +3213,9 @@ class Sender(SenderBase):
                     ranks = self._peer_requests.get(unique_rid)
                     if not ranks:
                         retired = retired_at
-                    elif all(0 <= rank < 64 for rank in ranks):
-                        retired = (retired_at, sum(1 << rank for rank in ranks))
+                    elif max(ranks) - min(ranks) < 64:
+                        base = min(ranks)
+                        retired = (retired_at, base, sum(1 << (rank - base) for rank in ranks))
                     else:
                         retired = (retired_at, frozenset(ranks))
                 self._retired_rids[unique_rid] = retired
@@ -3199,10 +3228,10 @@ class Sender(SenderBase):
                 return rank in self._peer_requests.get(unique_rid, ())
         if not isinstance(retired, tuple):
             return False
-        ranks = retired[1]
-        if isinstance(ranks, int):
-            return 0 <= rank < 64 and bool(ranks & (1 << rank))
-        return rank in ranks
+        if len(retired) == 3:
+            _, base, mask = retired
+            return 0 <= rank - base < 64 and bool(mask & (1 << (rank - base)))
+        return rank in retired[1]
 
     def send_cancel_to_receivers(self, unique_rid: int, *, failure: bool = False) -> None:
         """Cancel peer receives, retaining their writers when failure precedes retirement."""
@@ -4439,18 +4468,29 @@ class Receiver(ReceiverBase):
                     return
                 # Cache sender endpoints so cancel() can send CANCEL_SESSION to them.
                 session._sender_endpoints.update(sender_endpoints)
-                for rank in peer_overlap.ranks:
+                ranks = list(peer_overlap.ranks)
+                for index, rank in enumerate(ranks):
                     if task._perf_timer is not None:
                         task._perf_timer.record_task_start(rank)
                     send_timestamp = None
                     if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
                         with disagg_diagnostics.suppress_diagnostic_errors():
                             send_timestamp = disagg_diagnostics.capture_timestamp()
-                    self._request_sender_data(
-                        peer_infos.sender_endpoints[rank],
-                        receiver_req_bytes,
-                        task._kv_result_report_tokens[rank],
-                    )
+                    try:
+                        self._request_sender_data(
+                            peer_infos.sender_endpoints[rank],
+                            receiver_req_bytes,
+                            task._kv_result_report_tokens[rank],
+                        )
+                    except (LookupError, _RequestNotSent):
+                        # Raised before any send, so this rank was never asked either.
+                        session.withdraw_unasked_writers(task, ranks[index:])
+                        raise
+                    except Exception:
+                        # A failed send may still have queued this rank's request.
+                        # Later ranks were never asked, so none can return a token.
+                        session.withdraw_unasked_writers(task, ranks[index + 1 :])
+                        raise
                     if send_timestamp is not None:
                         with disagg_diagnostics.suppress_diagnostic_errors():
                             disagg_diagnostics.emit_event(
@@ -4835,7 +4875,10 @@ class Receiver(ReceiverBase):
         # receiver_info serialized once and reused for every peer rank (block-table msgpack isn't free at fan-out).
         # The report token is per-writer, so it travels as its own frame.
         logger.debug("Sending data request to endpoint '%s'", endpoint)
-        messenger = self._get_or_connect_dealer(endpoint)
+        try:
+            messenger = self._get_or_connect_dealer(endpoint)
+        except Exception as error:
+            raise _RequestNotSent(f"no connection to sender endpoint {endpoint!r}") from error
         messenger.send([MessageType.REQUEST_DATA, receiver_info_bytes, kv_result_report_token])
 
     def __del__(self):
@@ -5135,6 +5178,16 @@ class RxSession(RxSessionBase):
             if self._aux_physical_owner is not None:
                 self._aux_physical_owner.finish_publication()
             return True
+
+    def withdraw_unasked_writers(self, task: KVRecvTask, ranks: list[int]) -> None:
+        """Stop awaiting writers that were never sent ``task``'s REQUEST_DATA."""
+        with self.lock:
+            for rank in ranks:
+                task._kv_result_report_tokens.pop(rank, None)
+            if self._need_aux and task.slice_id == 0:
+                self._aux_expected_writers = min(
+                    self._aux_expected_writers, len(task._kv_result_report_tokens)
+                )
 
     def mark_transferring(self, slice_id: int, writer_cohort: Optional[set[int]] = None) -> bool:
         if not self._enforce_physical_ownership:

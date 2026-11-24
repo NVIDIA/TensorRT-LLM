@@ -1775,6 +1775,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
                 settlement_outcome = "completed"
             else:
+                if session.status not in (SessionStatus.ERROR, SessionStatus.CANCELLED):
+                    # The wait expired before any writer reported, so a writer may still be
+                    # writing. Cancel as the asynchronous timeout does: the retirement gate then
+                    # holds the cancelled receive while it has transferring tasks.
+                    session.cancel()
                 req.state = LlmRequestState.DISAGG_TRANS_ERROR
                 settlement_outcome = "failed"
         except ReceiveAdmissionFenced as error:
