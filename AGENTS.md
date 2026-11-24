@@ -134,6 +134,7 @@ Encoder and LLM forward Params are execution views.
 | **Attention backends** | `TorchLlmArgs.attn_backend` selects kernel: `TRTLLM` (default), `FlashInfer`, `FlashAttention` |
 | **Distributed execution** | Tensor/pipeline parallelism via `Mapping` class, multiple backends (MPI, Ray, RPC) |
 | **Auto-discovery** | Models self-register via `automodel.py`, resolved by HF config `architectures` field |
+| **Per-step device copies** | New per-step H2D/D2D copies in runtime code go through `_torch/pyexecutor/device_copy.py` with a named `CopySite`; a model opts in by declaring a `CopyPlan` (`copy_plan`). The step-input pack (`step_inputs.py`, `h2d_cache.py`, `tensorrt_llm/_device_copy.py`, `RuntimeHooks.pack_*` / `skip_unchanged_h2d`) is legacy: keep its users working, add no new ones. See [the copy plan guide](docs/source/developer-guide/device-copy-plan.md) |
 
 ## VisualGen
 
@@ -159,6 +160,7 @@ Key files:
 - **Copyright year** — update to current year when modifying existing files; add full header to new files.
 - **Avoid broad exception handling** — catch specific exceptions, not bare `except:` (see `CODING_GUIDELINES.md`).
 - **One concern per PR** — avoid scope creep. If a PR touches unrelated areas, split it.
+- **Replacing a shared runtime mechanism** — add the new one beside the old, opt-in and off by default, so code on the old one keeps its behavior and performance; move models in follow-up PRs and delete the old mechanism last. Do not delete or change the old API in the PR that introduces the new one.
 - **User-facing configuration classes** - when editing or defining any user-facing configuration classes (particularly `BaseLlmArgs` or any class used in its fields), you **MUST** follow the Pydantic guidelines in `CODING_GUIDELINES.md`.
 
 ## Development Workflow

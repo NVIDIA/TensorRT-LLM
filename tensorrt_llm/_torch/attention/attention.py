@@ -536,6 +536,14 @@ def maybe_allgather_for_helix_cp(
     return hidden_states
 
 
+def _is_forward_metadata(attn_metadata: AttentionMetadata) -> bool:
+    """Whether ``attn_metadata`` is the metadata registered for the current model forward."""
+    extra_attrs = get_model_extra_attrs()
+    metadata_ref = (extra_attrs.get("attention_metadata")
+                    if extra_attrs is not None else None)
+    return metadata_ref is not None and metadata_ref() is attn_metadata
+
+
 class Attention(nn.Module):
     # A gated layer offers o_proj's static FP8 input scale to the KV-replica GQA decode, whose merge then writes
     # o_proj's E4M3 input (AttentionForwardArgs.gated_out_scale).
@@ -1221,7 +1229,7 @@ class Attention(nn.Module):
             if "mrope_position_deltas" in mrope_config:
                 mrope_position_deltas = mrope_config["mrope_position_deltas"]
 
-        use_custom_inplace_op = self._use_custom_inplace_op()
+        use_custom_inplace_op = self._use_custom_inplace_op(attn_metadata)
         # A GQA decode layer offers its output gate to the backend kernels; the custom op cannot carry it.
         backend_gate = (output_gate if self.use_gqa_decode_fmha
                         and self.sparse_attn_hooks is None
@@ -1277,14 +1285,21 @@ class Attention(nn.Module):
 
         return output
 
-    def _use_custom_inplace_op(self) -> bool:
+    def _use_custom_inplace_op(self, attn_metadata: AttentionMetadata) -> bool:
         """Whether forward_impl runs the backend through attn_custom_op_inplace (torch.compile or breakable CUDA
-        graph)."""
+        graph).
+
+        Under a breakable CUDA graph, metadata other than the forward's registered one (e.g. a draft
+        view) runs the backend directly when the backend needs no host-side plan for it.
+        """
         # Currently only TRTLLM and FLASHINFER support the custom inplace op.
         return (self.register_to_config
                 and (self.attn_backend == "TRTLLM"
                      or self.attn_backend == "FLASHINFER")
-                and (is_torch_compiling() or is_in_breakable_cuda_graph())
+                and (is_torch_compiling() or
+                     (is_in_breakable_cuda_graph() and
+                      (_is_forward_metadata(attn_metadata)
+                       or not self.attn.runs_without_host_plan(attn_metadata))))
                 and not self.is_marlin_enabled)
 
     def forward(
@@ -1351,7 +1366,7 @@ class Attention(nn.Module):
         # The custom op cannot carry a KV-append plan to the backend.
         q, k, v, gate, kv_append = self.preprocess_qkv(
             qkv, position_ids, attn_metadata if self.use_gqa_decode_fmha
-            and not self._use_custom_inplace_op() else None)
+            and not self._use_custom_inplace_op(attn_metadata) else None)
         q, k, v = self.convert_qkv(q, k, v)
 
         if attention_sinks is not None:

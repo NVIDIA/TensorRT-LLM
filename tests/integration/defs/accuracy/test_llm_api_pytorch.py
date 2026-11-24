@@ -388,8 +388,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             assert quant_config.quant_mode.has_fp4_kv_cache()
             manager = executor.kv_cache_manager
             assert isinstance(manager, Fp4MlaKVCacheManagerV2)
-            assert manager.get_mla_v_scale_pool().numel() > 0
-            assert manager.get_fp4_mla_hp_pool().numel() > 0
+            assert manager.fp4_mla_layout.get_mla_v_scale_pool().numel() > 0
+            assert manager.fp4_mla_layout.get_fp4_mla_hp_pool().numel() > 0
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
             mla_layers = [
@@ -3321,6 +3321,50 @@ class TestQwen3_4B(LlmapiAccuracyTestHarness):
                 f"[AL] test_eagle3 acceptance_length = {acceptance_length:.3f}")
             assert_acceptance_length("TestQwen3_4B::test_eagle3",
                                      acceptance_length)
+
+
+@skip_no_sm120
+class TestGemma4_E4B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "google/gemma-4-E4B-it"
+    MODEL_PATH = f"{llm_models_root()}/gemma/gemma-4-E4B-it"
+    MTP_MODEL_PATH = f"{llm_models_root()}/gemma/gemma-4-E4B-it-assistant"
+    # Gemma 4 GSM8K: chat template with thinking off, a final-answer format prompt, and room for
+    # the full answer (256 tokens cuts many off).
+    GSM8K_MAX_OUTPUT_LEN = 1024
+    GSM8K_EVALUATOR_KWARGS = {
+        "apply_chat_template":
+        True,
+        "system_prompt":
+        ("Solve each math problem. End your answer with exactly one final "
+         "line in this format: #### <number>"),
+        "chat_template_kwargs": {
+            "enable_thinking": False,
+        },
+    }
+
+    def test_bf16_mtp(self, monkeypatch):
+        """MTP assistant with the overlap scheduler and CUDA graphs on FlashInfer."""
+        monkeypatch.setattr(GSM8K, "MAX_OUTPUT_LEN", self.GSM8K_MAX_OUTPUT_LEN)
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                        free_gpu_memory_fraction=0.8)
+        with LLM(self.MODEL_PATH,
+                 max_batch_size=32,
+                 max_seq_len=GSM8K.MAX_INPUT_LEN + self.GSM8K_MAX_OUTPUT_LEN,
+                 disable_mm_encoder=True,
+                 kv_cache_config=kv_cache_config,
+                 cuda_graph_config=CudaGraphConfig(max_batch_size=32,
+                                                   enable_padding=True),
+                 prefill_cuda_graph_backend="breakable",
+                 prefill_capture_num_tokens=[512, 1024, 2048, 4096],
+                 speculative_config=MTPDecodingConfig(
+                     max_draft_len=3, speculative_model=self.MTP_MODEL_PATH),
+                 max_stats_len=-1,
+                 enable_iter_perf_stats=True) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.GSM8K_EVALUATOR_KWARGS)
+            assert_acceptance_length_for_llm("TestGemma4_E4B::test_bf16_mtp",
+                                             llm)
 
 
 class TestQwen3_8B(LlmapiAccuracyTestHarness):
