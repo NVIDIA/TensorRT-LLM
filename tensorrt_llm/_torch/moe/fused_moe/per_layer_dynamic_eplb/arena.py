@@ -11,15 +11,15 @@ lazy until the rebalance path is enabled.
 """
 
 import math
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 from torch.utils._python_dispatch import _disable_current_modes
 
 from tensorrt_llm.logger import logger
 
-__all__ = ["SharedSlotArenaProvider", "allocate_rebalance_arena"]
+__all__ = ["SharedSlotArenaProvider", "allocate_rebalance_arena", "run_collective_phase"]
 
 BUFFER_ALIGNMENT = 2 * 1024 * 1024
 
@@ -184,6 +184,34 @@ class _EpComm:
         with _disable_current_modes():
             torch.distributed.all_gather_object(values, value, group=self.process_group)
         return values
+
+
+def run_collective_phase(
+    comm: _EpComm, world: int, label: str, operation: Callable[[], object]
+) -> None:
+    """Run ``operation`` on this rank, then raise on every EP rank if it failed on any.
+
+    An EP collective: every rank of ``comm`` must call it with the same
+    ``label`` at the same point. The ranks exchange their outcomes, so that a
+    failure on one rank (VMM resources, for example) raises the root cause on
+    every rank instead of leaving the others waiting at their next collective.
+    The error names each failed rank and chains this rank's own exception.
+    """
+    error: Exception | None = None
+    try:
+        operation()
+    except Exception as exc:  # noqa: BLE001 - shared with the peers, then raised
+        error = exc
+    outcomes = list(comm.allgather(None if error is None else f"{type(error).__name__}: {error}"))
+    if len(outcomes) != world:
+        raise RuntimeError(
+            f"{label}: the outcome exchange returned {len(outcomes)} EP ranks; expected {world}"
+        ) from error
+    failures = [f"rank {rank}: {outcome}" for rank, outcome in enumerate(outcomes) if outcome]
+    if failures:
+        raise RuntimeError(
+            f"{label} failed on {len(failures)} of {world} EP ranks: " + "; ".join(failures)
+        ) from error
 
 
 class _RawPointer:
@@ -497,12 +525,15 @@ def _create_multicast(vmm: _Vmm, comm: Any, rank: int, specs: List[_MulticastSpe
 @dataclass
 class _HelperSet:
     """One physical helper-slot set: a chunk per large plane, one multicast
-    object per hierarchy level, and that object's view base per plane."""
+    object per hierarchy level, and that object's view base per plane. A pool
+    without helper multicast keeps only the chunks."""
 
     chunks: Dict[str, Any]
     level_bases: Tuple[Dict[str, int], ...]
     level_specs: Tuple[_MulticastSpec, ...]
     zeroed: bool = False
+    #: Fabric handle of each chunk, for peers that map it with unicast access.
+    shareables: Dict[str, bytes] = field(default_factory=dict)
 
 
 @dataclass
@@ -533,11 +564,16 @@ class _SharedSlotPool:
     ``per_layer_sets`` the pool adds one set per layer as the layers are built,
     so only a layer's own copies write its helper rows; otherwise every layer
     shares two sets. No extra synchronization guards reuse of a shared set:
-    layer ``i``'s copy follows HALO-Q's all-rank exchange, which every rank
+    layer ``i``'s copy follows its planner's all-rank exchange, which every rank
     enters only after MAIN finished the previous layers' MegaMoE.
 
     READY terminals stay per layer because one forward shares its generation
     across layers. They and the fp32 planes live in per-layer records.
+
+    Without ``helper_multicast`` (HALO-R) a helper set gets no multicast
+    object: peers write its rows with unicast stores through mappings of its
+    chunks (``peer_helper_bases``). Every multicast object and bind then
+    belongs to the record pages, and per-layer sets add none.
     """
 
     def __init__(
@@ -552,6 +588,7 @@ class _SharedSlotPool:
         comm: Any,
         owner_registry: List["_SharedSlotPool"],
         per_layer_sets: bool,
+        helper_multicast: bool = True,
     ) -> None:
         from tensorrt_llm._torch.moe.kernels.megamoe_scheduler.sami import hierarchy_group_sizes
 
@@ -605,6 +642,8 @@ class _SharedSlotPool:
         self.layer_count = 0
         self.sets: Tuple[_HelperSet, ...] = ()
         self.per_layer_sets = per_layer_sets
+        self.helper_multicast = helper_multicast
+        self._peer_helper_bases: Dict[int, Dict[Tuple[int, str], int]] = {}
         self._construction_complete = False
         self._owner_registry = owner_registry
         self._owner_registry.append(self)
@@ -640,20 +679,8 @@ class _SharedSlotPool:
             ),
         )
 
-    def _collective_phase(self, label: str, operation: Any) -> None:
-        error = None
-        try:
-            operation()
-        except Exception as exc:
-            error = f"{type(exc).__name__}: {exc}"
-        errors = self.comm.allgather(error)
-        if len(errors) != self.world:
-            raise RuntimeError(
-                f"shared-slot cleanup {label} returned {len(errors)} ranks; expected {self.world}"
-            )
-        failures = [f"rank {rank}: {item}" for rank, item in enumerate(errors) if item]
-        if failures:
-            raise RuntimeError(f"shared-slot cleanup {label} failed: {'; '.join(failures)}")
+    def _collective_phase(self, label: str, operation: Callable[[], object]) -> None:
+        run_collective_phase(self.comm, self.world, f"shared-slot cleanup {label}", operation)
 
     def _close_producers(self) -> None:
         for producer in self._producers.values():
@@ -682,8 +709,8 @@ class _SharedSlotPool:
         )
         if len(preflight) != self.world:
             raise RuntimeError(
-                f"shared-slot cleanup preflight returned {len(preflight)} ranks; "
-                f"expected {self.world}"
+                f"shared-slot cleanup preflight: the outcome exchange returned "
+                f"{len(preflight)} EP ranks; expected {self.world}"
             )
         if not all(item["local_safe"] for item in preflight):
             return False
@@ -713,6 +740,7 @@ class _SharedSlotPool:
                 lambda: self._on_device(self.vmm.release_created_handles),
             )
             self._closed = True
+            self._peer_helper_bases = {}
             if self in self._owner_registry:
                 self._owner_registry.remove(self)
             self.sets = ()
@@ -726,9 +754,12 @@ class _SharedSlotPool:
             return tuple(_HelperSet({}, tuple({} for _ in self.groups), ()) for _ in range(count))
         sets, specs = [], []
         for _ in range(count):
-            chunks = {p.name: self.vmm.create(self.helper_bytes[p.name])[0] for p in self.large}
+            created = {p.name: self.vmm.create(self.helper_bytes[p.name]) for p in self.large}
+            chunks = {name: handle for name, (handle, _) in created.items()}
+            shareables = {name: shareable for name, (_, shareable) in created.items()}
             level_bases, level_specs = [], []
-            for members in self.groups:
+            # Unicast-only sets keep their chunks and get no multicast object.
+            for members in self.groups if self.helper_multicast else ():
                 bases: Dict[str, int] = {}
                 mappings: List[int] = []
                 for plane in self.large:
@@ -754,8 +785,11 @@ class _SharedSlotPool:
                 specs.append(spec)
                 level_specs.append(spec)
                 level_bases.append(bases)
-            sets.append(_HelperSet(chunks, tuple(level_bases), tuple(level_specs)))
-        _create_multicast(self.vmm, comm, self.rank, specs)
+            sets.append(
+                _HelperSet(chunks, tuple(level_bases), tuple(level_specs), shareables=shareables)
+            )
+        if self.helper_multicast:
+            _create_multicast(self.vmm, comm, self.rank, specs)
         return tuple(sets)
 
     def _create_page(self, comm: Any) -> _RecordPage:
@@ -782,6 +816,46 @@ class _SharedSlotPool:
         ]
         _create_multicast(self.vmm, comm, self.rank, specs)
         return _RecordPage(tuple(uc_ptrs), tuple(mc_ptrs), tuple(specs))
+
+    def peer_helper_bases(self, helper_set: int) -> Dict[Tuple[int, str], int]:
+        """Map every peer's chunks of one helper set for unicast access, collectively once per set.
+
+        Layer views expose only a peer's home rows; a unicast copy into a
+        peer's helper slots needs the chunks themselves. Returns
+        ``{(peer, plane name): address of the peer's helper row 0}`` for every
+        large plane of ``helper_set``. The first call for a set is collective;
+        later calls return the cached mappings, which are released with the
+        pool. Layers map their sets in construction order, so every rank makes
+        the same collective calls.
+        """
+        if self._closed:
+            raise RuntimeError("cannot map helper chunks of a closed shared-slot pool")
+        if not 0 <= helper_set < len(self.sets):
+            raise ValueError(
+                f"helper set {helper_set} is not one of the pool's {len(self.sets)} sets"
+            )
+        bases = self._peer_helper_bases.get(helper_set)
+        if bases is None:
+            local = dict(self.sets[helper_set].shareables)
+            gathered = self.comm.allgather(local)
+            if len(gathered) != self.world:
+                raise RuntimeError("shared-slot helper exchange returned an incomplete EP")
+            names = {plane.name for plane in self.large}
+            bases = {}
+            for peer, shareables in enumerate(gathered):
+                if peer == self.rank:
+                    continue
+                if set(shareables) != names:
+                    raise RuntimeError(
+                        "shared-slot helper chunks differ across the EP communicator"
+                    )
+                for plane in self.large:
+                    nbytes = self.helper_bytes[plane.name]
+                    address = self.vmm.reserve(nbytes)
+                    self.vmm.map(address, nbytes, self.vmm.import_(shareables[plane.name]))
+                    bases[(peer, plane.name)] = address
+            self._peer_helper_bases[helper_set] = bases
+        return bases
 
     def _flat(self, owner: _SharedLayer, pointer: int, nbytes: int) -> torch.Tensor:
         holder = _RawPointer(pointer, nbytes)
@@ -865,7 +939,8 @@ class _SharedSlotPool:
                 LivePlaneView(
                     name=plane.name,
                     uc_views=uc_views,
-                    mc_view=level_views[0],
+                    # A unicast-only helper set has no multicast alias.
+                    mc_view=level_views[0] if level_views else None,
                     aliases_same_backing=True,
                     backing_owner=layer,
                 )
@@ -880,8 +955,13 @@ class _SharedSlotPool:
             aliases_same_backing=True,
             backing_owner=layer,
         )
+        base = LiveWeightArena(planes=tuple(planes), terminals=terminals)
+        if not self.helper_multicast:
+            # Without helper multicast there are no HALO levels to bind: the
+            # unicast copy binds the base arena directly.
+            return base, tekit_views, layer, sum(self.home_bytes.values())
         arena = HierarchicalLiveWeightArena(
-            base=LiveWeightArena(planes=tuple(planes), terminals=terminals),
+            base=base,
             group_sizes=self.group_sizes,
             group_mc_views=tuple(group_views),
             group_mc_owners=tuple(group_owners),
@@ -897,9 +977,19 @@ class SharedSlotArenaProvider:
     maps one of the two banks shared by all layers. The broadcaster requests
     the arena again after Parameters are bound, so a provider memoizes its
     first build and requires identical geometry.
+
+    ``helper_multicast`` off (HALO-R) gives helper sets no multicast object;
+    the provider then returns the layer's base ``LiveWeightArena``, without
+    HALO levels.
     """
 
-    def __init__(self, owner: Any, *, per_layer_helper_sets: bool = False) -> None:
+    def __init__(
+        self,
+        owner: Any,
+        *,
+        per_layer_helper_sets: bool = False,
+        helper_multicast: bool = True,
+    ) -> None:
         # The model-level per-layer dynamic manager owns both the geometry cache
         # and creation order. No Mapping attribute or process-global registry
         # participates in allocation lifetime.
@@ -911,6 +1001,7 @@ class SharedSlotArenaProvider:
         self._pools = pools
         self._pool_order = order
         self._per_layer_helper_sets = bool(per_layer_helper_sets)
+        self._helper_multicast = bool(helper_multicast)
         self.buffer_bytes = 0
         self.group_sizes: Tuple[int, ...] = ()
         self.pool: Optional[_SharedSlotPool] = None
@@ -938,6 +1029,7 @@ class SharedSlotArenaProvider:
             int(device),
             bundle,
             self._per_layer_helper_sets,
+            self._helper_multicast,
         )
         if self._built is not None:
             if self._signature != signature:
@@ -970,6 +1062,7 @@ class SharedSlotArenaProvider:
                 comm=comm,
                 owner_registry=self._pool_order,
                 per_layer_sets=self._per_layer_helper_sets,
+                helper_multicast=self._helper_multicast,
             )
             self._pools[key] = pool
         self._built, self._tekit_views, self.layer, self.buffer_bytes = pool.build_layer(comm)
@@ -1025,7 +1118,8 @@ def allocate_rebalance_arena(
     )
     # Initialize READY terminals explicitly before peers can observe them.
     # This startup-only reset does not depend on allocator initialization details.
-    arena.base.terminals.local_view.zero_()
+    # A pool without helper multicast returns the base arena itself.
+    getattr(arena, "base", arena).terminals.local_view.zero_()
     torch.cuda.synchronize()
     ep_comm.barrier()
     bound = arena.bind(
@@ -1045,7 +1139,7 @@ def allocate_rebalance_arena(
         bundle=bundle,
         plane_names=plane_names,
         # The bound hierarchy exposes local plane views through its base arena.
-        local_plane_views=tuple(bound.base.local_plane_views),
+        local_plane_views=tuple(getattr(bound, "base", bound).local_plane_views),
         tekit_alias_views=tuple(provider.tekit_alias(name) for name in plane_names),
         home_experts=int(home_experts),
         helper_slots=int(helper_slots),

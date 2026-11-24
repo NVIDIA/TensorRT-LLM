@@ -22,24 +22,33 @@ collective or auxiliary copy submitter is needed in the serving path.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Optional, Tuple, TypeVar
 
 import torch
 
 from tensorrt_llm.logger import logger
 
+if TYPE_CHECKING:
+    from torch.distributed import ProcessGroup
+
+    from tensorrt_llm.mapping import Mapping
+
+    from .arena import RebalanceLiveArena
+    from .manager import PerLayerDynamicMoeLoadBalancer
+
 __all__ = [
     "RebalanceSlotSchedulerGroup",
     "SchedulerSpinBound",
     "build_rebalance_slot_scheduler_group",
+    "build_scheduler_group_from_manager",
 ]
 
 
 class SchedulerSpinBound:
-    """Bound of the HALO-Q scheduler's cross-rank waits, chosen per launch.
+    """Bound of the planner kernel's cross-rank waits, chosen per launch.
 
-    HALO-Q exchanges route counts with every EP rank inside the kernel and
-    traps once a peer is later than this bound. During warmup, one-time JIT
+    HALO-Q and HALO-R exchange route counts with every EP rank inside the
+    kernel and trap once a peer is later than this bound. During warmup, one-time JIT
     compilation and autotuning can delay a healthy rank by minutes. As a MoE
     communication timeout proxy, the bound follows every warmup transition:
     warmup gets the warmup timeout, and serving the serving timeout or the
@@ -50,15 +59,18 @@ class SchedulerSpinBound:
     Args:
         warmup_seconds: The MoE communication warmup timeout.
         is_tuning: Returns whether kernels are being profiled.
+        planner_name: The planner whose scheduler waits, such as "HALO-Q"; it
+            names the bound in the timeout logs.
     """
 
-    name = "per-layer dynamic EPLB HALO-Q"
-
-    def __init__(self, *, warmup_seconds: int, is_tuning: Callable[[], bool]) -> None:
+    def __init__(
+        self, *, warmup_seconds: int, is_tuning: Callable[[], bool], planner_name: str
+    ) -> None:
         from tensorrt_llm._torch.moe.kernels.megamoe_scheduler.cuda_scheduler.runtime import (
             spin_cycles_for_timeout,
         )
 
+        self.name = f"per-layer dynamic EPLB {planner_name}"
         self._spin_cycles_for_timeout = spin_cycles_for_timeout
         self._is_tuning = is_tuning
         self.warmup_cycles = spin_cycles_for_timeout(warmup_seconds)
@@ -79,7 +91,7 @@ class _LiveBankLeaseProvider:
     """Authorize ordered reuse, not a claim of completed GPU work on the host.
 
     release_generation_after() registers the local consumer; the next fused
-    HALO-Q + TMA launch orders COPY after it on MAIN. prove() is legal right
+    launch (the planner and its copy) orders COPY after it on MAIN. prove() is legal right
     before that launch. The launch's bounded all-rank count exchange precedes its plan,
     and its copy follows the plan in the same CTAs. Therefore a delayed peer
     consumer blocks every rank's overwrite without a host-side barrier.
@@ -103,13 +115,28 @@ class _LiveBankLeaseProvider:
             or group._scheduled_generation != generation + 1
             or group.scheduler_stream is not group.copy_stream
         ):
-            raise RuntimeError("Live-bank reuse lacks the consumer/HALO-Q ordering chain")
+            raise RuntimeError(
+                f"Live-bank reuse lacks the consumer/{group.planner_name} ordering chain"
+            )
         self.bound_copy_module.mark_collective_reuse_safe(self, generation)
         self.proved_generation = generation
 
 
 class RebalanceSlotSchedulerGroup:
-    """One layer's scheduler, copy endpoint, and paired consumer generations."""
+    """One layer's scheduler, copy endpoint, and paired consumer generations.
+
+    HALO-Q's group. Another planner's group subclasses it and, besides
+    ``__init__``, overrides only these hooks, each documented with what an override must keep:
+    ``_bind_copy_endpoint`` (the copy endpoint), ``_bind_main_stream`` (whether
+    MAIN may change), ``_wait_route_epoch`` (MAIN's route wait),
+    ``plan_finish`` (the READY generation lent to MegaMoE), ``finish``
+    (the release of a generation) and ``forget_helper_residency`` (the reset
+    of helper residency on a rebind). The checks every planner shares, such as
+    ``_check_owner`` and the generation pairing, stay here.
+    """
+
+    # Names the planner in this group's errors.
+    planner_name = "HALO-Q"
 
     def __init__(
         self,
@@ -139,9 +166,6 @@ class RebalanceSlotSchedulerGroup:
         )
         from tensorrt_llm._torch.moe.kernels.megamoe_scheduler.cuda_scheduler.runtime import (
             symmetric_buffer_ints,
-        )
-        from tensorrt_llm._torch.moe.kernels.megamoe_scheduler.sami import (
-            HierarchicalSamiWeightBroadcast,
         )
 
         ep_size = int(mapping.moe_ep_size)
@@ -191,8 +215,8 @@ class RebalanceSlotSchedulerGroup:
 
         logical_expert_count = self.home_experts * ep_size
 
-        # Use the EP rank, not the CUDA ordinal. HALO-Q and the TMA copy run in
-        # the same CTAs, one per auxiliary SM.
+        # Use the EP rank, not the CUDA ordinal. The planner and its copy run
+        # in the same CTAs, one per auxiliary SM.
         cfg = CudaSchedulerConfig(
             ep_size=ep_size,
             logical_expert_count=logical_expert_count,
@@ -223,14 +247,18 @@ class RebalanceSlotSchedulerGroup:
             )
         if error != driver.CUresult.CUDA_SUCCESS or not supported:
             raise RuntimeError("MoE rebalance requires 64-bit CUDA stream memory operations")
-        # CTAs of the fused launches whose routes are written, and its value
-        # after the latest launch. Only those launches change it.
+        # The device route counter: each CTA of a fused launch adds one once
+        # its routes are written, and MAIN's route wait (_wait_route_epoch)
+        # waits on it. HALO-Q's counter only grows, and _route_target is its
+        # value after the latest launch. A group whose route wait resets the
+        # counter (HALO-R's) waits for a constant instead and ignores
+        # _route_target.
         self._route_epoch = torch.zeros(1, dtype=torch.int64, device=f"cuda:{self.device}")
         self._route_epoch_ptr = int(self._route_epoch.data_ptr())
         self._route_target = 0
 
         # Every peer address must be connected before the first fused launch;
-        # HALO-Q performs an all-rank exchange on the COPY stream.
+        # the planner kernel performs an all-rank exchange on the COPY stream.
         self.symmetric = FabricSymmetricBuffer(
             4 * symmetric_buffer_ints(ep_size, logical_expert_count), self.device
         )
@@ -250,31 +278,59 @@ class RebalanceSlotSchedulerGroup:
         # connect_peer_bases() synchronized this device, so its zeroed exchange
         # buffer and peer mappings are complete. The barrier extends that to every
         # rank before any rank binds its copy and can launch the fused kernel,
-        # whose HALO-Q exchange writes into its peers' buffers.
+        # whose count exchange writes into its peers' buffers.
         ep_comm.barrier()
+
+        self._bind_copy_endpoint(arena=arena, helper_residency=bool(helper_residency))
+
+        # The previous consumer precedes the next launch's EP rendezvous.
+        self.lease = _LiveBankLeaseProvider(self)
+        self.broadcaster.bind_generation_reuse_authority(self.lease)
+
+        logger.debug("[MegaMoECuteDsl] layer=%s rebalance producer initialized", layer_idx)
+
+    def _bind_copy_endpoint(self, *, arena: RebalanceLiveArena, helper_residency: bool) -> None:
+        """Build this layer's copy endpoint as ``self.broadcaster`` and bind it to the scheduler.
+
+        ``__init__`` calls it once every rank has connected the scheduler's
+        peers, before the lease binds; a producer with another copy endpoint
+        overrides it. It sets ``self.broadcaster`` before binding, so that the
+        pool's collective shutdown can close a partially bound endpoint.
+        HALO-Q's endpoint is the hierarchical TMA broadcast.
+        """
+        from tensorrt_llm._torch.moe.kernels.megamoe_scheduler.sami import (
+            HierarchicalSamiWeightBroadcast,
+        )
 
         # The provider must return the existing arena with identical bundle geometry.
         # A second allocation would separate the loader aliases from the copy target.
         bundle = arena.bundle
         self.broadcaster = HierarchicalSamiWeightBroadcast(
-            comm=ep_comm,
+            comm=self._ep_comm,
             device=self.device,
             bundle=bundle,
             helper_count=self.helper_slots,
-            global_expert_count=logical_expert_count,
+            global_expert_count=self.home_experts * self.ep_size,
             arena_provider=arena.provider,
             tma_sm_count=self.auxiliary_sms,
             tma_warps=7,
             tma_route="plan",
-            helper_residency=bool(helper_residency),
+            helper_residency=helper_residency,
         )
         self.broadcaster.bind_scheduler(self.scheduler, self.scheduler_stream, self._route_epoch)
 
-        # The previous consumer precedes the next HALO-Q EP rendezvous.
-        self.lease = _LiveBankLeaseProvider(self)
-        self.broadcaster.bind_generation_reuse_authority(self.lease)
+    def forget_helper_residency(self) -> None:
+        """Hook: the layer handle calls it on every rebind of the same backend; HALO-Q's does nothing.
 
-        logger.debug("[MegaMoECuteDsl] layer=%s rebalance producer initialized", layer_idx)
+        A standard load binds every layer twice, as ConfigurableMoE and its
+        backend each run ``post_load_weights``, so the second bind of every
+        default load reaches this call, and raising here would break every
+        load. HALO-Q's residency table (kept only with ``per_layer_resident``)
+        is set only when the copy endpoint binds, so this hook cannot reset
+        it. MegaMoE has no weight reload (``pre_reload_weights`` raises), so
+        failing closed for HALO-Q belongs with the first reload path. HALO-R
+        overrides it with an EP-collective reset.
+        """
 
     def close(self) -> None:
         """Release this layer after the owning pool has drained device work."""
@@ -299,6 +355,11 @@ class RebalanceSlotSchedulerGroup:
         self.arena = None
 
     def _check_owner(self) -> None:
+        """Check that this open group's device and MAIN stream are current.
+
+        Every planner shares it. A current stream other than the bound MAIN
+        goes to the ``_bind_main_stream`` hook.
+        """
         if self._closed:
             raise RuntimeError("Rebalance scheduler group is closed")
         # Runs several times per layer: read the raw device and stream instead
@@ -308,17 +369,41 @@ class RebalanceSlotSchedulerGroup:
         handle = torch._C._cuda_getCurrentRawStream(self.device)
         if handle == self._execution_stream_handle:
             return
+        self._bind_main_stream(handle)
+
+    def _bind_main_stream(self, handle: int) -> None:
+        """Hook: ``_check_owner`` calls it when the current stream (raw ``handle``) is not the bound MAIN.
+
+        HALO-Q binds MAIN once for life. An override decides whether and when
+        MAIN may change, must pass a stream it has not validated before
+        through ``_validate_main_stream`` and must set
+        ``_execution_stream_handle``.
+        """
         if self._execution_stream_handle is not None:
             raise RuntimeError(
                 "Rebalance MAIN stream cannot change; every executor of a model "
                 "engine must submit on its one execution stream"
             )
+        self._validate_main_stream(handle)
+        self._execution_stream_handle = handle
+
+    def _validate_main_stream(self, handle: int) -> torch.cuda.Stream:
+        """Return the current stream, raw ``handle``, if it can be MAIN: not COPY and of lower priority."""
         stream = torch.cuda.current_stream(self.device)
         if handle == self._stream_handle or stream.priority <= self.copy_stream.priority:
             raise RuntimeError("MAIN must be distinct from the higher-priority COPY stream")
-        self._execution_stream_handle = handle
+        return stream
 
     def _wait_route_epoch(self, stream_handle: int) -> None:
+        """Hook: queue on ``stream_handle`` (MAIN) a wait until the latest launch's routes are written.
+
+        HALO-Q waits until the route counter reaches ``_route_target``. An
+        override must queue a device wait that no MAIN work queued after it
+        can pass before every CTA of the latest launch has written its routes,
+        and must not wait on the host. It may skip the wait only for a launch
+        whose capture has ended, so that its kernel never runs; its ``finish``
+        then aborts the endpoint.
+        """
         (error,) = self._driver.cuStreamWaitValue64(
             stream_handle, self._route_epoch_ptr, self._route_target, self._wait_value_geq
         )
@@ -329,8 +414,8 @@ class RebalanceSlotSchedulerGroup:
         """Submit contiguous CUDA int32 routes [tokens, topk] without staging.
 
         The route producer must allocate and write this tensor on MAIN and must
-        not overwrite it until HALO-Q finishes. The group holds the tensor until
-        wait_for_routes() orders MAIN after the route epoch. Every HALO-Q CTA
+        not overwrite it until the planner finishes. The group holds the tensor
+        until wait_for_routes() orders MAIN after the route epoch. Every CTA
         reads its routes before it raises that epoch, so the caching allocator
         can only reuse the block for MAIN work queued after that wait. This needs
         no COPY-stream allocator event, which every later allocation would poll
@@ -342,7 +427,9 @@ class RebalanceSlotSchedulerGroup:
             raise RuntimeError("Previous rebalance plan has no paired finish")
         if self._routes_in_flight is not None:
             # Only a failed submission leaves routes that MAIN never waited for.
-            raise RuntimeError("Routes of an earlier HALO-Q launch were never ordered on MAIN")
+            raise RuntimeError(
+                f"Routes of an earlier {self.planner_name} launch were never ordered on MAIN"
+            )
         if (
             not isinstance(logical_expert_ids, torch.Tensor)
             or logical_expert_ids.ndim != 2
@@ -373,7 +460,7 @@ class RebalanceSlotSchedulerGroup:
             spin_cycles=self._spin_bound.cycles(),
         )
         if generation != self._scheduled_generation:
-            raise RuntimeError("TMA and HALO-Q generation mismatch")
+            raise RuntimeError(f"Copy endpoint and {self.planner_name} generation mismatch")
         self._route_target = route_target
         self._generation = generation
         part = (outputs, num_tokens)
@@ -387,6 +474,10 @@ class RebalanceSlotSchedulerGroup:
 
         It queues no device work itself: plan_schedule() checked the owner of
         this pending plan, and the route wait checks it again.
+
+        Hook: returns the physical routes and the READY generation that
+        MegaMoE's gate waits for, HALO-Q's launched generation. An override
+        must call this method and may only replace the generation it returns.
         """
         if part is not self._plan_part or part is None:
             raise RuntimeError("plan_finish requires this group's pending plan")
@@ -404,7 +495,7 @@ class RebalanceSlotSchedulerGroup:
         return physical, self._generation
 
     def wait_for_routes(self) -> None:
-        """Order the first MAIN route read after HALO-Q, without a host wait.
+        """Order the first MAIN route read after the planner, without a host wait.
 
         The first call of a generation checks the owner and queues the stream
         wait. Later calls of that generation return at once: their consumers
@@ -418,7 +509,7 @@ class RebalanceSlotSchedulerGroup:
             raise RuntimeError("No scheduler generation is available")
         self._wait_route_epoch(self._execution_stream_handle)
         self._route_wait_generation = generation
-        # MAIN work queued from here on runs after every HALO-Q read of the routes.
+        # MAIN work queued from here on runs after every planner read of the routes.
         self._routes_in_flight = None
 
     def plan(
@@ -437,6 +528,9 @@ class RebalanceSlotSchedulerGroup:
         The consumer is ``completion_event``, or without it the MAIN work
         queued so far: the MegaMoE launch that read this generation, if any.
         The next fused launch, submitted on MAIN, orders COPY after it.
+
+        Hook: an override must call this method before it queues any work;
+        after it, the override may join COPY into MAIN or abort its endpoint.
         """
         self._check_owner()
         if (
@@ -470,8 +564,43 @@ def build_rebalance_slot_scheduler_group(
     auxiliary SM budget, helper-slot mode and scheduler spin bound; the
     communicator is resolved before the stream.
     """
+    return build_scheduler_group_from_manager(
+        RebalanceSlotSchedulerGroup,
+        arena=arena,
+        manager=manager,
+        mapping=mapping,
+        ep_process_group=ep_process_group,
+        home_experts=home_experts,
+        helper_slots=helper_slots,
+        topk=topk,
+        max_tokens_per_rank=max_tokens_per_rank,
+        layer_idx=layer_idx,
+    )
+
+
+_GroupT = TypeVar("_GroupT", bound=RebalanceSlotSchedulerGroup)
+
+
+def build_scheduler_group_from_manager(
+    group_cls: type[_GroupT],
+    *,
+    arena: RebalanceLiveArena,
+    manager: PerLayerDynamicMoeLoadBalancer,
+    mapping: Mapping,
+    ep_process_group: ProcessGroup,
+    home_experts: int,
+    helper_slots: int,
+    topk: int,
+    max_tokens_per_rank: int,
+    layer_idx: Optional[int],
+) -> _GroupT:
+    """Build one layer's ``group_cls`` from its manager.
+
+    Every planner's builder takes these keywords and the same manager
+    resources; the communicator is resolved before the stream.
+    """
     device = int(mapping.local_rank)
-    return RebalanceSlotSchedulerGroup(
+    return group_cls(
         arena=arena,
         mapping=mapping,
         ep_comm=manager.get_ep_comm(ep_process_group),

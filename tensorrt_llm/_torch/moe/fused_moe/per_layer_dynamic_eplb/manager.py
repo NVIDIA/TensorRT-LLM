@@ -48,6 +48,13 @@ class PerLayerDynamicMoeLoadBalancer(BaseMoeLoadBalancer):
             raise ValueError(f"unknown helper_slot_mode {helper_slot_mode!r}")
         # Resident helper experts need helper rows that only their layer writes.
         self.helper_residency = helper_slot_mode == "per_layer_resident"
+        from .registry import PER_LAYER_DYNAMIC_PLANNERS
+
+        self.planner = str(getattr(config, "planner", "halo_q"))
+        if self.planner not in PER_LAYER_DYNAMIC_PLANNERS:
+            raise ValueError(f"unknown per-layer dynamic EPLB planner {self.planner!r}")
+        # The planner's scheduler group builder and capabilities.
+        self.planner_spec = PER_LAYER_DYNAMIC_PLANNERS[self.planner]
 
         # State read by the shared lifecycle and by the engine.
         self._previous_balancer = None
@@ -77,7 +84,7 @@ class PerLayerDynamicMoeLoadBalancer(BaseMoeLoadBalancer):
         return (
             f"PerLayerDynamicMoeLoadBalancer(ep_rank={self.ep_rank}, "
             f"ep_size={self.ep_size}, num_slots={self.num_slots}, "
-            f"auxiliary_sms={self.auxiliary_sms})"
+            f"auxiliary_sms={self.auxiliary_sms}, planner={self.planner})"
         )
 
     def is_static_routing(self) -> bool:
@@ -145,7 +152,7 @@ class PerLayerDynamicMoeLoadBalancer(BaseMoeLoadBalancer):
         return self._ep_comm
 
     def get_scheduler_spin_bound(self) -> Any:
-        """Return the HALO-Q spin bound shared by this model's layers.
+        """Return the spin bound of this model's planner, shared by its layers.
 
         It is registered with the MoE communication timeout guard, which
         lengthens it while the engine warms up.
@@ -161,6 +168,7 @@ class PerLayerDynamicMoeLoadBalancer(BaseMoeLoadBalancer):
             spin_bound = SchedulerSpinBound(
                 warmup_seconds=get_moe_comm_timeout_budgets().warmup_seconds,
                 is_tuning=lambda: AutoTuner.get().is_tuning_mode,
+                planner_name=self.planner.upper().replace("_", "-"),
             )
             register_moe_comm_timeout_proxy(spin_bound)
             self._scheduler_spin_bound = spin_bound
@@ -170,7 +178,13 @@ class PerLayerDynamicMoeLoadBalancer(BaseMoeLoadBalancer):
         """Create a per-layer provider scoped to this model manager."""
         from .arena import SharedSlotArenaProvider
 
-        provider = SharedSlotArenaProvider(self, per_layer_helper_sets=self.helper_residency)
+        # Only a copy that stores through multicast (HALO-Q's) needs its
+        # helper sets bound to multicast objects; HALO-R's relay is unicast.
+        provider = SharedSlotArenaProvider(
+            self,
+            per_layer_helper_sets=self.helper_residency,
+            helper_multicast=self.planner_spec.needs_helper_multicast,
+        )
         self._arena_providers.append(provider)
         return provider
 
