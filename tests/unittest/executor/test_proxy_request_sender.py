@@ -299,6 +299,67 @@ def test_batched_quit_failure_is_best_effort(
     assert len(warnings) == 1 and "peer closed" in warnings[0]
 
 
+@pytest.mark.parametrize("stop_mode", ["profile", "engine", "deadline", "healthy"])
+def test_send_waiting_for_writer_observes_cancellation(
+    monkeypatch: pytest.MonkeyPatch, stop_mode: str
+) -> None:
+    proxy = _bare_proxy()
+    proxy.request_queue = _RecordingQueue()
+    lock = threading.RLock()
+    entered = threading.Event()
+    done = threading.Event()
+    errors: list[Exception] = []
+
+    def acquire(blocking: bool = True, timeout: float = -1) -> bool:
+        entered.set()
+        return lock.acquire(blocking, timeout)
+
+    monkeypatch.setattr(
+        proxy, "_request_send_lock", SimpleNamespace(acquire=acquire, release=lock.release)
+    )
+
+    def send() -> None:
+        try:
+            proxy._send_request(
+                "control",
+                should_stop=proxy._profile_send_stopped if stop_mode == "profile" else None,
+            )
+        except Exception as error:
+            errors.append(error)
+        finally:
+            done.set()
+
+    caller = threading.Thread(target=send)
+    try:
+        with lock:
+            caller.start()
+            assert entered.wait(5.0)
+            if stop_mode == "profile":
+                proxy._profile_control_cancelled = True
+            elif stop_mode == "engine":
+                proxy._engine_dead = True
+            elif stop_mode == "deadline":
+                proxy._request_shutdown_deadline = time.monotonic() - 1.0
+            if stop_mode == "healthy":
+                assert not done.is_set()
+            else:
+                assert done.wait(5.0)
+                assert not proxy.request_queue.messages
+    finally:
+        if caller.ident is not None:
+            caller.join(5.0)
+    assert not caller.is_alive()
+    assert lock.acquire(timeout=5.0)
+    lock.release()
+    if stop_mode == "healthy":
+        assert not errors
+        assert proxy.request_queue.messages == ["control"]
+    else:
+        assert len(errors) == 1
+        assert isinstance(errors[0], RequestSendCancelled)
+        assert not proxy.request_queue.messages
+
+
 def test_batched_request_is_captured_when_sent():
     proxy = _bare_proxy()
     sent = []

@@ -299,6 +299,8 @@ class GenerationExecutorProxy(GenerationExecutor):
     _RESULT_RECV_TIMEOUT_S = 0.1
     _DISPATCH_DRAIN_TIMEOUT_S = 5.0
     _DISPATCH_STOP_TIMEOUT_S = 5.0
+    # Maximum interval between stop checks while the request writer is busy.
+    _REQUEST_SEND_LOCK_POLL_S = 0.05
     # Set from gen_prompt_tail_tokens; None sends full prompts.
     _prompt_tail: Optional[PromptTailPolicy] = None
 
@@ -1407,15 +1409,20 @@ class GenerationExecutorProxy(GenerationExecutor):
         if self._request_sender is None:
             # The active writer can be a profiling call. A cancellation send
             # during teardown must not wait indefinitely for that writer.
-            deadline = self._request_shutdown_deadline
-            timeout = -1 if deadline is None else max(
-                0.0, deadline - time.monotonic())
-            if not self._request_send_lock.acquire(timeout=timeout):
-                raise RequestSendCancelled(
-                    "Executor proxy request send cancelled during shutdown.")
+            stop = should_stop or self._request_send_stopped
+            while True:
+                deadline = self._request_shutdown_deadline
+                remaining = (self._REQUEST_SEND_LOCK_POLL_S if deadline is None
+                             else deadline - time.monotonic())
+                if stop() or remaining <= 0:
+                    raise RequestSendCancelled(
+                        "Executor proxy request send cancelled during shutdown."
+                    )
+                if self._request_send_lock.acquire(
+                        timeout=min(self._REQUEST_SEND_LOCK_POLL_S, remaining)):
+                    break
             try:
-                self.request_queue.put_interruptible(
-                    request, should_stop or self._request_send_stopped)
+                self.request_queue.put_interruptible(request, stop)
             finally:
                 self._request_send_lock.release()
         else:
