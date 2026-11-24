@@ -44,8 +44,6 @@ from .indexer import (
 from .kernels import fused_dsa_decode_metadata
 from .key_shard import (
     HELIX_KEY_SHARD_LOCAL_K,
-    HELIX_KEY_SHARD_MAX_ROWS,
-    HELIX_KEY_SHARD_MIN_SEQS,
     KEY_SHARD_MIN_SEQS,
     KEY_SHARD_TOKENS_PER_BLOCK,
     get_key_shard_merge,
@@ -187,7 +185,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     # Key-sharded decode indexer (key_shard.key_shard_enabled): TP ranks score disjoint 64-token key blocks and merge
     # their local Top-K. ``key_shard_world`` is the TP size when active (1 = off); ``key_shard_next_n`` is the
     # verify width the per-step local views were built for (0 = not built this step). Under Helix CP
-    # (TRTLLM_DSA_HELIX_KEY_SHARD=1) the ranks are the CP group and the local views are the rank's own pages.
+    # (helix_key_shard.helix_key_shard_enabled) the ranks are the CP group and the local views are the rank's own
+    # pages.
     key_shard_world: int = field(default=1, init=False)
     key_shard_merge: Optional[object] = field(default=None, init=False)
     key_shard_next_n: int = field(default=0, init=False)
@@ -469,17 +468,15 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             return
         helix = self.enable_helix
         world = self.mapping.cp_size if helix else self.mapping.tp_size
-        if helix:
-            rows_max = HELIX_KEY_SHARD_MAX_ROWS
-            local_k = HELIX_KEY_SHARD_LOCAL_K
-        else:
-            # The merge workspace serves every decode row of a full batch (each sequence verifies its draft
-            # tokens too); it keeps every row's local scores (fp32, max_seq_len / world wide). The cache manager's
-            # draft length is fixed at construction, so every metadata copy (and every rank) sizes the same
-            # workspace.
-            draft_len = int(getattr(self.kv_cache_manager, "max_draft_len", 0) or 0)
-            rows_max = self.max_num_sequences * (1 + draft_len)
-            local_k = key_shard_local_k(self.num_sparse_topk, world)
+        # The merge workspace serves every decode row of a full batch (each sequence verifies its draft
+        # tokens too); it keeps every row's local scores (fp32, max_seq_len / world wide). The cache manager's
+        # draft length is fixed at construction, so every metadata copy (and every rank) sizes the same
+        # workspace.
+        draft_len = int(getattr(self.kv_cache_manager, "max_draft_len", 0) or 0)
+        rows_max = self.max_num_sequences * (1 + draft_len)
+        local_k = (
+            HELIX_KEY_SHARD_LOCAL_K if helix else key_shard_local_k(self.num_sparse_topk, world)
+        )
         # Under Helix max_blocks_per_seq already counts this rank's pages.
         local_blocks = self.kv_cache_manager.max_blocks_per_seq
         if not helix:
@@ -549,7 +546,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         if (
             self.is_ragged_verify
             or num_gen_tokens % num_gen
-            or num_gen < (HELIX_KEY_SHARD_MIN_SEQS if self.enable_helix else KEY_SHARD_MIN_SEQS)
+            # The floor applies to the TP path only (see KEY_SHARD_MIN_SEQS).
+            or (not self.enable_helix and num_gen < KEY_SHARD_MIN_SEQS)
         ):
             return
         next_n = num_gen_tokens // num_gen
@@ -2637,8 +2635,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.skip_indexer_for_ctx_reqs = False
 
         # Under Helix kv_lens are this rank's share of each sequence, which does
-        # not bound the global Top-K; the indexer runs and merge_helix_topk
-        # reduces the per-rank selections instead.
+        # not bound the global Top-K; the indexer runs and merge_helix_topk or
+        # the key-sharded merge reduces the per-rank selections instead.
         if self.num_generations > 0 and self.enable_indexer_skip and not self.enable_helix:
             # Minus the number of extra KV tokens because when using one-model MTP, the
             # draft layers needs more KV tokens for the next draft forwards.

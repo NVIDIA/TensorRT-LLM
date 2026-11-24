@@ -44,9 +44,12 @@ from ..params import get_indexer_mqa_logits_elem_budget, use_self_sampling_gvr
 from . import prefill_share
 from .cache_manager import get_indexer_k_data_bytes_per_token, resolve_indexer_k_dtype
 from .helix_key_shard import (
+    count_score_mismatches,
     count_set_mismatches,
     helix_key_shard_verify_enabled,
     helix_key_shard_verify_full,
+    helix_local_topk,
+    kept_scores,
     reference_local_topk,
 )
 from .kernels import (
@@ -2959,9 +2962,13 @@ class Indexer(nn.Module):
         local_rows = metadata.key_shard_local_topk[:rows]
         # Exact local Top-L by score over each row's owned keys. The CuTe radix is fast on these short rows (context
         # / tp) and insensitive to ties; the merge certificate compares scores only, so its tie order is irrelevant.
-        torch.ops.trtllm.cute_dsl_indexer_topk_decode(
-            logits[:, :local_len], row_lens, local_rows, merge.local_k, 1
-        )
+        if helix:
+            # Helix has no batch floor, so small batches reach here: always one CTA per row (see helix_local_topk).
+            helix_local_topk(logits[:, :local_len], row_lens, local_rows)
+        else:
+            torch.ops.trtllm.cute_dsl_indexer_topk_decode(
+                logits[:, :local_len], row_lens, local_rows, merge.local_k, 1
+            )
         merge.pack(local_rows, row_lens)
         if not helix:
             merge.merge(decode_rows)
@@ -2995,6 +3002,11 @@ class Indexer(nn.Module):
         ``full`` = ``(q, weights, q_scale, k_cache)``: the reference scores come from the default Helix path's
         logits (DeepGEMM paged MQA over the per-token expanded rows, bounded by the Helix bounds) instead of
         this path's local logits; the log adds the largest score difference over the rows' valid columns.
+
+        Rows can differ as index sets without either selection being wrong: an exact tie at the cut-off, or
+        (``full``) two scores that the two logits kernels round into a different order. The log therefore also
+        counts the rows whose kept scores differ over all ranks, within twice that largest score difference;
+        that count is 0 for equivalent selections.
         """
         mapping = metadata.mapping
         rows = merged_rows.shape[0]
@@ -3042,11 +3054,19 @@ class Indexer(nn.Module):
             mapping,
             dim=0,
         )
+        max_diff = float(diff_all.max())
+        # Both selections' scores are read from this path's logits, so only the selections differ.
+        score_rows = count_score_mismatches(
+            cp_allgather(kept_scores(local_logits, merged_rows).unsqueeze(0), mapping, dim=0),
+            cp_allgather(kept_scores(local_logits, reference).unsqueeze(0), mapping, dim=0),
+            tolerance=2 * max_diff,
+        )
         if mapping.cp_rank == 0:
             logger.info(
                 f"DSA helix key-shard verify{' full' if full is not None else ''} layer {self.layer_idx}: "
                 f"{totals[0]} of {totals[3]} rows differ (symmetric difference {totals[1]} of {totals[2]} kept "
-                f"entries) vs merge_helix_topk; max |score diff| {float(diff_all.max()):.4g}"
+                f"entries) vs merge_helix_topk; max |score diff| {max_diff:.4g}; "
+                f"kept scores differ in {score_rows} of {rows} rows"
             )
 
     def _mtp_last_accepted_rows(

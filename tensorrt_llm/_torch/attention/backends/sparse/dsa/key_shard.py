@@ -42,13 +42,14 @@ _INT64_MIN = tl.constexpr(-(2**63))
 _INT64_MIN_PLUS1 = tl.constexpr(-(2**63) + 1)
 
 
-# Fewest decode sequences for which a step takes the key-sharded path. The pack / merge add a near-constant ~20 us
-# per layer, so the sharded path only wins once the batch holds enough index keys. The decision depends only on the
-# batch size, so every rank takes the same path and each CUDA graph captures one of them.
+# Fewest decode sequences for which a TP step takes the key-sharded path. The pack / merge add a near-constant
+# ~20 us per layer, so the sharded path only wins once the batch holds enough index keys. The decision depends only
+# on the batch size, so every rank takes the same path and each CUDA graph captures one of them.
+# Helix has no floor: its ranks hold only their own pages, so every decode step merges, and merge_helix_topk (an NCCL
+# all-gather plus a Top-K, a scatter and a sort over cp * K candidates in PyTorch operators) costs the same at any
+# batch size.
 KEY_SHARD_MIN_SEQS = 11
-# Helix key-sharded merge: fewest decode sequences, decode rows of the merge workspace and keys each rank sends.
-HELIX_KEY_SHARD_MIN_SEQS = 8
-HELIX_KEY_SHARD_MAX_ROWS = 128
+# Helix key-sharded merge: keys each rank sends per row.
 HELIX_KEY_SHARD_LOCAL_K = 512
 
 
