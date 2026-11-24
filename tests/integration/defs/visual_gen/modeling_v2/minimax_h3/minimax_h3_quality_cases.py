@@ -26,13 +26,14 @@ import torch
 from diffusers import ModularPipeline
 from PIL import Image
 from test_common.llm_data import get_checkpoint
+from test_common.visual_gen.h3_rollout import load_default_h3_visual_gen
 
 from defs.examples.visual_gen.visual_gen_test_utils import (
     _cleanup_cuda,
     _disable_inductor_compile_worker_quiesce,
     _multi_resolution_log_stft_distance,
 )
-from tensorrt_llm import VisualGen, VisualGenParams
+from tensorrt_llm import VisualGenParams
 from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.default_pipeline.pipeline import (
     MiniMaxH3Pipeline,
 )
@@ -420,9 +421,8 @@ def check_public_visual_gen_api_smoke() -> None:
     """Generate joint video/audio through the public VisualGen executor API."""
     checkpoint_path = _minimax_h3_checkpoint_path()
     _disable_inductor_compile_worker_quiesce()
-    visual_gen = VisualGen(
-        model=checkpoint_path,
-        args=VisualGenArgs(
+    visual_gen = load_default_h3_visual_gen(
+        VisualGenArgs(
             model=checkpoint_path,
             compilation_config=CompilationConfig(skip_warmup=True),
             torch_compile_config=TorchCompileConfig(enable=True),
@@ -568,7 +568,7 @@ def check_text_encoder_tp_lpips(tmp_path, monkeypatch, world_size):
             cuda_graph_config={"enable": False},
             compilation_config={"skip_warmup": True},
         )
-        engine = VisualGen(model=checkpoint, args=args)
+        engine = load_default_h3_visual_gen(args)
         try:
             assert engine.default_params.num_inference_steps == 50
             output = engine.generate(
@@ -615,7 +615,7 @@ def check_ulysses_parallel_vae_lpips(tmp_path, ulysses_size, vae_size, backend):
             cuda_graph_config={"enable": False},
             compilation_config={"skip_warmup": True},
         )
-        engine = VisualGen(model=args.model, args=args)
+        engine = load_default_h3_visual_gen(args)
         try:
             assert engine.default_params.num_inference_steps == 50
             output = engine.generate(
@@ -686,7 +686,7 @@ def check_tp2_example_lpips(tmp_path):
         assert not args.cuda_graph_config.enable
         # Keep the reference identical to the example except for TP degree.
         args.parallel_config.tp_size = tp_size
-        engine = VisualGen(model=model, args=args)
+        engine = load_default_h3_visual_gen(args)
         try:
             assert engine.default_params.num_inference_steps == 50
             output = engine.generate(

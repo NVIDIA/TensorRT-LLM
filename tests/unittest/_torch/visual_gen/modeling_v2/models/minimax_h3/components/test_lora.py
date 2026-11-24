@@ -26,8 +26,9 @@ from .test_minimax_h3_transformer import (
 @torch.inference_mode()
 def test_turbo_lora_matches_premerged_h3(tmp_path: Path) -> None:
     """Compare both output streams with the same adapter merged before model preparation."""
+    width = 32
     config = _make_model_config(
-        num_layers=1, num_refiner_layers=1, hidden_size=32, ffn_dim=32, attention_head_dim=16
+        num_layers=1, num_refiner_layers=1, hidden_size=width, ffn_dim=width, attention_head_dim=16
     )
     base = MiniMaxH3Transformer3DModel(config).cuda().eval()
     _initialize_weights(base, scale=0.1)
@@ -46,10 +47,20 @@ def test_turbo_lora_matches_premerged_h3(tmp_path: Path) -> None:
         projection = reference.get_submodule(module_name)
         a = torch.zeros(1, projection.in_features)
         a[0, 0] = 1
-        b = (torch.arange(projection.out_features) % 2 * 2 - 1).float().unsqueeze(1)
+        rows = torch.arange(1, projection.out_features + 1, dtype=torch.float32)
         pairs[f"{adapter_name}.lora_A.weight"] = a
-        pairs[f"{adapter_name}.lora_B.weight"] = b
-        projection.weight[:, 0].add_(b.flatten().to(projection.weight))
+        pairs[f"{adapter_name}.lora_B.weight"] = (rows / (2 * width)).unsqueeze(1)
+
+    # Rank-one A selects column zero. Turbo fc1 packs gate then up, and AdaLN packs shift then scale.
+    first_half = torch.arange(1, width + 1, device="cuda", dtype=torch.float32) / (2 * width)
+    second_half = first_half + 0.5
+    gate, up = reference.transformer_blocks[0].ff.gate_up_proj.weight.chunk(2)
+    gate[:, 0].add_(first_half)
+    up[:, 0].add_(second_half)
+    reference.token_refiner.refiner_blocks[0].attn.to_out[0].weight[:, 0].add_(first_half)
+    shift, scale = reference.norm_out.linear.weight.chunk(2)
+    shift[:, 0].add_(first_half)
+    scale[:, 0].add_(second_half)
 
     path = tmp_path / "adapter.safetensors"
     save_file(pairs, str(path))

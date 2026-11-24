@@ -1421,35 +1421,30 @@ def test_bf16_configuration_opts_into_the_fused_swiglu_epilogue(
 )
 def test_bf16_blocks_run_the_fused_swiglu_epilogue(monkeypatch: pytest.MonkeyPatch) -> None:
     """With eligible shapes every refiner and transformer block's FFN takes the fused op once."""
-    if not gated_mlp_module.gate_up_swiglu_quack_available():
-        pytest.skip("QuACK gemm_act is unavailable")
-    # The kernel is built on first use; when it does not build against the installed CUTLASS
-    # DSL it disables itself and GatedMLP falls back, which is not what this test is about.
-    gated_mlp_module.gate_up_swiglu_quack_bf16(
-        torch.randn(16, 64, dtype=torch.bfloat16, device="cuda"),
-        torch.randn(128, 64, dtype=torch.bfloat16, device="cuda"),
-    )
-    if not gated_mlp_module.gate_up_swiglu_quack_available():
-        pytest.skip("QuACK gemm_act does not run against the installed CUTLASS DSL (see warning)")
+    monkeypatch.setattr(gated_mlp_module, "_quack_failed", False)
+    assert gated_mlp_module.gate_up_swiglu_quack_available(), "QuACK gemm_act is required"
     model = h3.MiniMaxH3Transformer3DModel(
         _make_model_config(num_layers=2, num_refiner_layers=1, **_NVFP4_SHAPES)
     ).to("cuda")
     _initialize_weights(model, scale=0.1)
-    calls: list[int] = []
-    op = gated_mlp_module.gate_up_swiglu_quack_bf16
+    provider = gated_mlp_module.quack_gate_up_swiglu
+    completed_calls = 0
 
-    def tracked(*args: object, **kwargs: object) -> torch.Tensor:
-        calls.append(1)
-        return op(*args, **kwargs)
+    def tracked(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        nonlocal completed_calls
+        result = provider(x, weight)
+        completed_calls += 1
+        return result
 
-    monkeypatch.setattr(gated_mlp_module, "gate_up_swiglu_quack_bf16", tracked)
+    monkeypatch.setattr(gated_mlp_module, "quack_gate_up_swiglu", tracked)
     hidden_states = torch.randn(7, 32, dtype=torch.bfloat16, device="cuda")
+    blocks = _ff_modules(model)
+    assert len(blocks) == 3
     with torch.inference_mode():
-        for ff in _ff_modules(model):
-            assert ff.fuse_bf16_gate_up_swiglu
-            assert ff._can_fuse_gate_up_swiglu_bf16(hidden_states)
+        for expected_calls, ff in enumerate(blocks, start=1):
             ff(hidden_states)
-    assert len(calls) == 3
+            assert completed_calls == expected_calls, "QuACK GEMM did not complete for this block"
+    torch.cuda.synchronize()
 
 
 @pytest.mark.parametrize("world_size", [2, 4, 8])
