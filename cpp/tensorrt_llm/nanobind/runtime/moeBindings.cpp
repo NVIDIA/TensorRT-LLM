@@ -134,8 +134,8 @@ void initMoeBindings(nb::module_& m)
             "the iterations started so far and restart the statistics and the update plan",
             nb::call_guard<nb::gil_scoped_release>())
         .def("check_slots_writable", &tr::MoeLoadBalancer::checkSlotsWritable,
-            "Under Wide-EP fault tolerance, raise unless no iteration runs or is queued and the online EPLB worker is "
-            "done with the last one",
+            "Under Wide-EP fault tolerance, raise unless no iteration runs or is queued and abandon_iterations ended "
+            "the weight updates of the last one",
             nb::call_guard<nb::gil_scoped_release>())
         .def("shutdown", &tr::MoeLoadBalancer::shutdown, "Shutdown the load balancer and clean up resources",
             nb::call_guard<nb::gil_scoped_release>());
