@@ -59,6 +59,7 @@ from tensorrt_llm.llmapi.llm_args import (
     KvCacheConfig,
     MoeLoadBalancerConfig,
     MoePerLayerDynamicLoadBalancerConfig,
+    MoeWarmupPlacementConfig,
     MTPDecodingConfig,
     MultimodalConfig,
     NGramDecodingConfig,
@@ -1849,6 +1850,20 @@ def test_r1_dep16_without_eplb_keeps_the_allgather_without_multi_node_nvlink(mon
     _set_mnnvl(monkeypatch, False)
     config = _model_config(_r1_config(), **_layout(16, True, 1, 16))
     assert _qualified(modeling_v2_resolve(config, _llm_args("require"))) == _R1_DEFAULT_TARGET
+
+
+def test_r1_static_eplb_with_warmup_placement_keeps_the_builtin_model():
+    """Warmup placement moves the experts of the layers registered with its controller; the
+    default target registers none, so the deployment keeps the built-in model rather than
+    run without the placement it asked for."""
+    warmup = MoeWarmupPlacementConfig(start_step=0, interval_steps=1)
+    balancer = MoeLoadBalancerConfig(num_slots=288, warmup_placement=warmup)
+    config = replace(_model_config(_r1_config(), **_DEP4), moe_load_balancer=balancer)
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
+    with pytest.raises(
+        ValueError, match="static EPLB with moe_config.load_balancer.warmup_placement"
+    ):
+        modeling_v2_resolve(config, _llm_args("require"))
 
 
 @pytest.mark.usefixtures("_glm52_sm")
