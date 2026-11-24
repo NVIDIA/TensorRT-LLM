@@ -35,6 +35,7 @@ def configure_checkpoint(config: DiffusionPipelineConfig, manifest: dict) -> Non
     mapping = getattr(config, "visual_gen_mapping", None) or config.mapping
     if mapping.world_size != 1:
         raise ValueError("FastH3 VSA requires a single GPU.")
+    config.parallel.validate_world_size(mapping.world_size)
     if config.extra_attrs.get("workflow") == "ref2va":
         raise ValueError("FastH3 VSA supports text-to-video only.")
     attention = config.attention

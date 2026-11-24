@@ -17,7 +17,7 @@ from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
 from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
 from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
 from tensorrt_llm._torch.visual_gen.pipeline_registry import AutoPipeline
-from tensorrt_llm.visual_gen.args import AttentionConfig
+from tensorrt_llm.visual_gen.args import AttentionConfig, ParallelConfig, VisualGenArgs
 
 pytestmark = pytest.mark.cpu_only
 
@@ -35,6 +35,19 @@ def _checkpoint(path, manifest=None):
     )
     if manifest is not None:
         (path / "fastvideo_inference.json").write_text(manifest)
+
+
+def test_fasth3_rejects_text_encoder_tp_on_one_gpu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _checkpoint(tmp_path, json.dumps({"schema_version": "fasth3-inference-contract-v1"}))
+    monkeypatch.setenv(H3_V2, "1")
+    args = VisualGenArgs(
+        model=str(tmp_path), parallel_config=ParallelConfig(text_encoder_tp_size=2)
+    )
+    config = DiffusionPipelineConfig.from_pretrained(str(tmp_path), args=args)
+    with pytest.raises(ValueError, match=r"text_encoder_tp_size \(2\) exceeds world_size \(1\)"):
+        AutoPipeline.resolve_class(config, str(tmp_path))
 
 
 @pytest.mark.parametrize("recipe", ["NVFP4", "FP8_PER_CHANNEL_PER_TOKEN"])

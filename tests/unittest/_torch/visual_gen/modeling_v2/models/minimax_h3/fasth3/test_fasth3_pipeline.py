@@ -32,7 +32,7 @@ from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.fasth3.pipelin
 )
 from tensorrt_llm._torch.visual_gen.modeling_v2.models.minimax_h3.pipeline_registry import route
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent
-from tensorrt_llm.visual_gen.args import AttentionConfig
+from tensorrt_llm.visual_gen.args import AttentionConfig, ParallelConfig
 
 from .._pipeline_fixtures import SyntheticFastH3Pipeline, SyntheticH3Pipeline
 
@@ -78,6 +78,7 @@ def test_fasth3_generation_steps_follow_inference_contract(
     config = SimpleNamespace(
         attention=AttentionConfig(),
         mapping=SimpleNamespace(world_size=1),
+        parallel=ParallelConfig(),
         extra_attrs={},
         device="cpu",
         model_configs={},

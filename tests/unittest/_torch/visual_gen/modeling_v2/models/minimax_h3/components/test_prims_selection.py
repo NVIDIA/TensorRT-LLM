@@ -12,6 +12,11 @@ from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 pytestmark = pytest.mark.cpu_only
 
 
+@pytest.fixture
+def prims_available(monkeypatch):
+    monkeypatch.setattr(prims, "is_context_prims_available", lambda name: True)
+
+
 @pytest.mark.parametrize(
     ("value", "message"),
     [
@@ -26,6 +31,23 @@ def test_h3_fmha_registry_errors(monkeypatch, value, message):
         prims.H3PrimTS(None, {})
 
 
+def test_sparse_only_admission_for_fp8_and_vc(monkeypatch):
+    monkeypatch.setenv("TLLM_FMHA_LIBS", "prims_ts_block_sparse")
+    probes = []
+
+    def available(name):
+        probes.append(name)
+        return True
+
+    monkeypatch.setattr(prims, "is_context_prims_available", available)
+    prims.H3PrimTS(None, {})
+    with pytest.raises(RuntimeError, match="VC attention requires an available dense PrimTS"):
+        prims.H3PrimTS(QuantAttentionConfig(qk_dtype="bf16", v_dtype="fp8", vc_attention=True), {})
+    assert not probes
+    prims.H3PrimTS(QuantAttentionConfig(qk_dtype="bf16", v_dtype="fp8"), {})
+    assert probes == ["prims_ts_block_sparse"]
+
+
 @pytest.mark.parametrize(
     ("value", "explicit_dense", "sparse_first"),
     [
@@ -37,7 +59,7 @@ def test_h3_fmha_registry_errors(monkeypatch, value, message):
         ("-prims_ts,+prims_ts,-fallback", True, True),
     ],
 )
-def test_h3_dense_prims_policy(monkeypatch, value, explicit_dense, sparse_first):
+def test_h3_dense_prims_policy(monkeypatch, prims_available, value, explicit_dense, sparse_first):
     if value is None:
         monkeypatch.delenv("TLLM_FMHA_LIBS", raising=False)
     else:
@@ -55,7 +77,7 @@ def test_h3_dense_prims_policy(monkeypatch, value, explicit_dense, sparse_first)
             impl(q, q, q, None, skip_softmax=False, skip_threshold_active=False)
 
 
-def test_routed_sage_passes_quantization_recipe(monkeypatch):
+def test_routed_sage_passes_quantization_recipe(monkeypatch, prims_available):
     monkeypatch.setenv("TLLM_FMHA_LIBS", "prims_ts_block_sparse")
     recipe = QuantAttentionConfig(
         qk_dtype="fp8", v_dtype="fp8", q_block_size=1, k_block_size=16, v_block_size=1
@@ -78,7 +100,7 @@ def test_routed_sage_passes_quantization_recipe(monkeypatch):
     assert impl(q, q, q, routes, skip_softmax=False, skip_threshold_active=False) is q
 
 
-def test_optional_sage_plan_fallback(monkeypatch):
+def test_optional_sage_plan_fallback(monkeypatch, prims_available):
     monkeypatch.setenv("TLLM_FMHA_LIBS", "prims_ts_block_sparse,fallback")
     recipe = QuantAttentionConfig(
         qk_dtype="fp8",
@@ -106,7 +128,7 @@ def test_optional_sage_plan_fallback(monkeypatch):
         instance(y, y, y, None, skip_softmax=False, skip_threshold_active=False)
 
 
-def test_vc_denoising_schedule(monkeypatch):
+def test_vc_denoising_schedule(monkeypatch, prims_available):
     monkeypatch.setenv("TLLM_FMHA_LIBS", "+prims_ts")
     recipe = QuantAttentionConfig(qk_dtype="bf16", v_dtype="fp8", vc_attention=True)
     state = {}

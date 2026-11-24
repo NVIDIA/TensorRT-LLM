@@ -82,6 +82,61 @@ def _attention_pair(config, num_heads=1, *, v1_sparse=None, v2_sparse=None):
     return v1, v2
 
 
+def test_h3_primts_unavailable_keeps_native_sage_fallback(monkeypatch):
+    from tensorrt_llm._torch.attention.backends.fmha.prims_ts import PrimsTSFmha
+    from tensorrt_llm._torch.attention.backends.sparse.params import (
+        BlockSparseForwardInputs,
+        SparseBackendForwardArgs,
+    )
+    from tensorrt_llm._torch.visual_gen.modeling_v2.catalog.attention.prims_routed_attention import (
+        PrimsRoutes,
+    )
+    from tensorrt_llm.bindings.internal import thop
+
+    monkeypatch.setenv("TLLM_FMHA_LIBS", "+prims_ts")
+    # The PrimTS availability probe requires this binding. Native context attention uses run_context.
+    monkeypatch.delattr(thop, "trtllm_gen_generation_preprocess", raising=False)
+    recipe = QuantAttentionConfig(
+        qk_dtype="fp8",
+        v_dtype="fp8",
+        q_block_size=1,
+        k_block_size=16,
+        v_block_size=1,
+        smooth_v=True,
+    )
+    v1, v2 = _attention_pair(AttentionConfig(backend="TRTLLM", quant_attention_config=recipe))
+    assert not any(isinstance(fmha, PrimsTSFmha) for fmha in v1._fmha_manager.fmha_libs)
+    rng = torch.Generator(device="cuda").manual_seed(42)
+    q, k, v = [
+        torch.randn(1, 128, 1, 128, device="cuda", dtype=torch.bfloat16, generator=rng)
+        for _ in range(3)
+    ]
+    inputs = dict(batch_size=1, seq_len=128)
+    expected = v1.forward(q, k, v, **inputs)
+    actual = v2.forward(q, k, v, **inputs)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert v2.state["h3_thop"]
+    routes = PrimsRoutes(
+        q_block_size=128,
+        kv_block_size=128,
+        max_blocks_per_row=1,
+        block_indptr=torch.tensor([[[0, 1]]], dtype=torch.int32, device=q.device),
+        block_indices=torch.tensor([0], dtype=torch.int32, device=q.device),
+    )
+    with pytest.raises(RuntimeError, match="No TRT-LLM attention FMHA library"):
+        v1.forward(
+            q,
+            k,
+            v,
+            **inputs,
+            sparse_backend_args=SparseBackendForwardArgs(
+                block_sparse_inputs=BlockSparseForwardInputs(**routes)
+            ),
+        )
+    with pytest.raises(RuntimeError, match="available PrimTS block-sparse"):
+        v2.forward(q, k, v, **inputs, routes=routes)
+
+
 @pytest.mark.parametrize("qk_dtype", ["bf16", "fp8"])
 def test_h3_per_tensor_fp8_dense_and_routed(monkeypatch, qk_dtype):
     from tensorrt_llm._torch.attention.backends.sparse.params import (

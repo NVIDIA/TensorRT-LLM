@@ -9,7 +9,10 @@ import os
 import torch
 
 from tensorrt_llm._torch.visual_gen.runtime import QuantAttentionConfig, logger
-from tensorrt_llm._torch.visual_gen.runtime.fmha import enabled_fmha_libraries
+from tensorrt_llm._torch.visual_gen.runtime.fmha import (
+    enabled_fmha_libraries,
+    is_context_prims_available,
+)
 
 from ....catalog.attention.prims_dense_attention import prims_dense_attention, vc_token_permutation
 from ....catalog.attention.prims_routed_attention import (
@@ -48,29 +51,38 @@ class H3PrimTS:
         self.recipe = recipe
         self.metadata_state = metadata_state
         enabled = enabled_fmha_libraries()
+        self._enabled = enabled
+        self._available: dict[str, bool] = {}
         self.fallback_enabled = "fallback" in enabled
-        self.block_sparse_enabled = "prims_ts_block_sparse" in enabled
         self.dense_explicitly_enabled = "prims_ts" in enabled and any(
             token.strip().removeprefix("+").strip() == "prims_ts"
             for token in os.environ.get("TLLM_FMHA_LIBS", "").split(",")
         )
-        self.smooth_v_plan = self.block_sparse_enabled and (
+        self.smooth_v_plan = "prims_ts_block_sparse" in enabled and (
             not self.fallback_enabled
             or enabled.index("prims_ts_block_sparse") < enabled.index("fallback")
         )
-        if recipe is not None and recipe.vc_attention and "prims_ts" not in enabled:
-            raise RuntimeError("The VC attention recipe requires TLLM_FMHA_LIBS=+prims_ts.")
+        if recipe is not None and recipe.vc_attention and not self._has_prims("prims_ts"):
+            raise RuntimeError(
+                "VC attention requires an available dense PrimTS provider (TLLM_FMHA_LIBS=+prims_ts)."
+            )
         if (
             recipe is not None
             and recipe.q_block_size == 0
-            and "prims_ts" not in enabled
-            and not self.block_sparse_enabled
+            and not (self._has_prims("prims_ts") or self._has_prims("prims_ts_block_sparse"))
         ):
-            raise RuntimeError("The per-tensor FP8 recipe requires TLLM_FMHA_LIBS=+prims_ts.")
+            raise RuntimeError(
+                "The per-tensor FP8 recipe requires an available PrimTS provider (TLLM_FMHA_LIBS=+prims_ts)."
+            )
         self.dense_plans = {}
         self.vc_shape = None
         self.vc_grouping = None
         self.vc_step = None
+
+    def _has_prims(self, name: str) -> bool:
+        if name not in self._available:
+            self._available[name] = name in self._enabled and is_context_prims_available(name)
+        return self._available[name]
 
     @torch.compiler.disable
     def __call__(
@@ -85,9 +97,9 @@ class H3PrimTS:
     ):
         recipe = self.recipe
         if routes is not None:
-            if not self.block_sparse_enabled:
+            if not self._has_prims("prims_ts_block_sparse"):
                 raise RuntimeError(
-                    "H3 sparse attention requires the PrimTS block-sparse FMHA library."
+                    "H3 sparse attention requires an available PrimTS block-sparse FMHA library."
                 )
             if recipe is not None and recipe.vc_attention:
                 raise ValueError("VC-Attention requires a dense attention plan.")
@@ -95,20 +107,27 @@ class H3PrimTS:
         if recipe is None:
             return None
         if recipe.vc_attention or recipe.q_block_size == 0:
-            if not self.dense_explicitly_enabled:
-                raise RuntimeError("The per-tensor FP8 recipe requires TLLM_FMHA_LIBS=+prims_ts.")
+            if not self.dense_explicitly_enabled or not self._has_prims("prims_ts"):
+                raise RuntimeError(
+                    "The per-tensor FP8 recipe requires an available dense PrimTS provider (TLLM_FMHA_LIBS=+prims_ts)."
+                )
             if skip_softmax:
                 raise ValueError("Per-tensor and VC PrimTS attention require dense attention.")
             return self._dense_fp8(q, k, v)
         if recipe.smooth_v:
-            if self.smooth_v_plan and not skip_threshold_active:
+            if (
+                self.smooth_v_plan
+                and not skip_threshold_active
+                and self._has_prims("prims_ts_block_sparse")
+            ):
                 out = self._block_sparse(q, k, v, None)
                 if out is not None:
                     return out
-            logger.warning_once(
-                "The attention op quantizes V without the V smoothing this SageAttention recipe requests.",
-                key="fallback_fmha_sage_attn_smooth_v",
-            )
+            if self.fallback_enabled:
+                logger.warning_once(
+                    "The attention op quantizes V without the V smoothing this SageAttention recipe requests.",
+                    key="fallback_fmha_sage_attn_smooth_v",
+                )
         return None
 
     def _block_sparse(self, q, k, v, routes):
