@@ -290,6 +290,11 @@ def test_external_embeddings_reuse_common_item_metadata(model):
     )
     params = MultimodalParams(multimodal_data=extra["multimodal_data"])
 
+    image = "<|vision_start|>{}<|vision_end|>"
+    processor._tokenizer.assert_called_once_with(
+        image.format("<|image_pad|>" * 4) + " and " + image.format("<|image_pad|>" * 9),
+        return_tensors="pt",
+    )
     assert result == tokens
     assert params.get_item_layout() == ((("image", 0), ("image", 1)), (4, 9))
     assert params.multimodal_data["multimodal_embedding"] == embeddings
