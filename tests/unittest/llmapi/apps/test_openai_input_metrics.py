@@ -14,6 +14,7 @@ from test_common.serve.app_factory import AggConfig, isolated_serve_env
 from tensorrt_llm.bindings.executor import RequestPerfMetrics
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.metrics.perf_utils import _input_processing_observer, _time_input_processing
+from tensorrt_llm.sampling_params import SamplingParams
 from tensorrt_llm.serve.anthropic_protocol import AnthropicCreateBatchRequest
 from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest, ResponsesRequest
 from tensorrt_llm.serve.perf_metrics import (
@@ -198,7 +199,7 @@ async def test_total_includes_inline_preprocessing_but_not_generation(
         ),
         patch(
             "tensorrt_llm.serve.openai_server.responses_api_request_preprocess",
-            new=AsyncMock(return_value=({"prompt": "hi"}, None)),
+            new=AsyncMock(return_value=({"prompt": "hi"}, SamplingParams())),
         ),
         patch(
             "tensorrt_llm.serve.openai_server.responses_api_create_response",

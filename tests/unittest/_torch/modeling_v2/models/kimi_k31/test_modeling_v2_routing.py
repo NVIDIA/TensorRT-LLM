@@ -458,8 +458,12 @@ _NEAR_MISSES = {
     ),
     "nvfp4-experts": (dict(quant_format="nvfp4"), "MXFP4"),
     "no-dsa-sparse": (
-        dict(config_kwargs=dict(sparse=False), sparse=RocketSparseAttentionConfig()),
-        "DSA",
+        dict(
+            config_kwargs=dict(sparse=False),
+            sparse=RocketSparseAttentionConfig(),
+            kv=dict(enable_block_reuse=False),
+        ),
+        re.escape("algorithm 'dsa' (got 'rocket')"),
     ),
     # Every target runs FP8 index keys and FP8 latents (checked before the layout and the GPU).
     "fp4-index-keys": (dict(config_kwargs=dict(indexer_k_dtype="fp4")), "indexer_k_dtype 'fp4'"),
