@@ -1272,6 +1272,34 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         else:
             videos = None
         proc_kwargs = dict(mm_processor_kwargs)
+        if videos:
+            video_kwargs = proc_kwargs
+            if "videos_kwargs" in proc_kwargs:
+                video_kwargs = proc_kwargs["videos_kwargs"].copy()
+                proc_kwargs["videos_kwargs"] = video_kwargs
+                # HF reads video options from the nested dict when present.
+                for key in ("video_metadata", "fps", "num_frames",
+                            "do_sample_frames"):
+                    if key in proc_kwargs and key not in video_kwargs:
+                        video_kwargs[key] = proc_kwargs.pop(key)
+            if "video_metadata" not in video_kwargs:
+                fps = video_kwargs.get("fps")
+                if fps is not None and video_kwargs.get(
+                        "do_sample_frames",
+                        self.processor.video_processor.do_sample_frames):
+                    fps = None  # HF will use the requested fps as a sampling target.
+                video_metadata = []
+                for video in video_datas:
+                    # HF indexes the decoded frames if it samples again.
+                    num_frames = len(video.frames)
+                    sampled_fps = video.metadata.get("fps")
+                    total = video.metadata.get("total_num_frames")
+                    if sampled_fps and total:
+                        sampled_fps *= num_frames / total
+                    rate = fps if fps is not None else sampled_fps
+                    video_metadata.append(
+                        dict(total_num_frames=num_frames, fps=rate))
+                video_kwargs["video_metadata"] = video_metadata
         processor = _qwen_processor_for_media(self.processor, proc_kwargs,
                                               images, videos)
         # transformers 5.x's ``ProcessorMixin._merge_kwargs`` strictly
