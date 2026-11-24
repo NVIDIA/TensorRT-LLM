@@ -372,6 +372,32 @@ def test_descriptor_preserves_captured_instance_evidence(tmp_path: Path) -> None
     assert [result["status"] for result in results] == ["matched", "unverified"]
 
 
+@pytest.mark.parametrize("flag", [False, True])
+def test_short_circuit_setattr_marks_conditional_member_unverified(
+    tmp_path: Path, flag: bool
+) -> None:
+    results = _check(
+        tmp_path,
+        "class Real:\n    limit = 1\n",
+        f"""
+        from types import SimpleNamespace
+        from test_common.interface_checks import verify_instance
+
+        flag = {flag!r}
+        always = SimpleNamespace()
+        if setattr(always, "limit", 1) or flag:
+            pass
+        verify_instance(always, "production:Real", members=("limit",))
+
+        state = SimpleNamespace()
+        if flag and setattr(state, "limit", 1):
+            pass
+        verify_instance(state, "production:Real", members=("limit",))
+        """,
+    )
+    assert [result["status"] for result in results] == ["matched", "unverified"]
+
+
 def test_namespace_reads_preserve_instance_evidence(tmp_path: Path) -> None:
     results = _check(
         tmp_path,

@@ -4794,6 +4794,7 @@ def test_v2_hybrid_debug_logs_prefix_reuse_only_on_rank_zero(
         kv_cache_retention_config: KvCacheRetentionConfig | None = None,
         custom_priority_callback: "PagePriorityCallback | None" = None,
         locality_domain_id: int | None = None,
+        optional_reuse_max_backtrack: int = 0,
     ) -> SimpleNamespace:
         return kv_cache
 

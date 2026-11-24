@@ -1811,6 +1811,15 @@ class Analyzer:
         if isinstance(expression, ast.Lambda):
             return
         nodes = list(statements(expression, after_children=True))
+        # Operands after the first may be skipped by short-circuiting.
+        conditional_calls = {
+            call
+            for operator in nodes
+            if isinstance(operator, ast.BoolOp)
+            for operand in operator.values[1:]
+            for call in statements(operand)
+            if isinstance(call, ast.Call)
+        }
         assignments = [node for node in nodes if isinstance(node, ast.NamedExpr)]
         # Track a single alias in an eager expression with a known source value.
         track_alias = len(assignments) == 1 and not any(
@@ -1852,6 +1861,7 @@ class Analyzer:
                 continue
             elif (
                 name == "setattr"
+                and node not in conditional_calls
                 and len(node.args) == 3
                 and not node.keywords
                 and isinstance(node.args[1], ast.Constant)
