@@ -58,6 +58,7 @@ from ..attention.backends.sparse.minimax_m3 import (
 from ..attention.backends.sparse.minimax_m3.common import get_sparse_layer_ids, index_head_range
 from ..attention.backends.sparse.params import SparseBackendForwardArgs
 from ..attention.backends.trtllm import TrtllmAttention
+from ..attention.metadata.core import TrtllmCoreMetadata
 from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams, MiniMaxAllReduceRMS
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
@@ -935,7 +936,9 @@ def _extract_minimax_m3_attention_extra_attrs(layer_idx: str):
     metadata_ref = extra_attrs.get("attention_metadata")
     assert metadata_ref is not None, "Attention metadata is not set"
     metadata = metadata_ref()
-    assert isinstance(metadata, AttentionMetadata), "Invalid MiniMax-M3 attention metadata"
+    assert isinstance(metadata, (AttentionMetadata, TrtllmCoreMetadata)), (
+        "Invalid MiniMax-M3 attention metadata"
+    )
 
     attn_layers = extra_attrs.get("attn_layers")
     assert attn_layers is not None, "Attention layer is not registered"

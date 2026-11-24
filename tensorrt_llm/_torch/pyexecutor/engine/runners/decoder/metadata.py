@@ -130,6 +130,7 @@ class DecoderMetadata:
                 + ", ".join(t.__name__ for t in self.attn_metadata.attached_types())
                 + ")"
             )
+            self._arm_msa_policy(kv_cache_manager)
             return self.attn_metadata
 
         config = self.model.model_config.pretrained_config
@@ -174,10 +175,13 @@ class DecoderMetadata:
         from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_backend import (
             MiniMaxM3MsaSparseAttentionMetadata,
         )
+        from tensorrt_llm._torch.attention.metadata.minimax_m3 import MiniMaxM3MsaMetadata
 
-        if not isinstance(
-            self.attn_metadata, MiniMaxM3MsaSparseAttentionMetadata
-        ) or not isinstance(kv_cache_manager, MiniMaxM3KVCacheManagerV2):
+        if isinstance(self.attn_metadata, TrtllmCoreMetadata):
+            has_msa_metadata = self.attn_metadata.get_metadata(MiniMaxM3MsaMetadata) is not None
+        else:
+            has_msa_metadata = isinstance(self.attn_metadata, MiniMaxM3MsaSparseAttentionMetadata)
+        if not has_msa_metadata or not isinstance(kv_cache_manager, MiniMaxM3KVCacheManagerV2):
             raise ValueError(
                 "RuntimeHooks.msa requires the MiniMax-M3 MSA sparse attention backend and KV cache, "
                 f"got {type(self.attn_metadata).__name__} and {type(kv_cache_manager).__name__}"

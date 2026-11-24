@@ -150,6 +150,10 @@ def build_feature_attention_metadata(
     """
     from tensorrt_llm._torch.attention.backends.sparse.csa2.backend import CSA2TrtllmAttention
     from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import DeepseekV4TrtllmAttention
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import (
+        MiniMaxM3MsaSparseAttention,
+        MiniMaxM3SparseRuntimeBackend,
+    )
     from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
     from tensorrt_llm._torch.attention.metadata.base import (
         UnsupportedMetadataConfiguration,
@@ -176,6 +180,10 @@ def build_feature_attention_metadata(
         StandaloneDSparkDraftMetadata,
         SuffixAutomatonDraftMetadata,
     )
+    from tensorrt_llm._torch.attention.metadata.minimax_m3 import (
+        MiniMaxM3MsaMetadata,
+        MiniMaxM3TritonMetadata,
+    )
     from tensorrt_llm._torch.attention.metadata.mla_context import MlaContextMetadata
     from tensorrt_llm._torch.attention.metadata.recurrent import RecurrentStateMetadata
     from tensorrt_llm._torch.attention.metadata.sparse import SparseMetadata
@@ -187,15 +195,19 @@ def build_feature_attention_metadata(
 
     is_deepseek_v4 = issubclass(attention_backend, DeepseekV4TrtllmAttention)
     is_csa2 = issubclass(attention_backend, CSA2TrtllmAttention)
+    is_minimax_m3_triton = issubclass(attention_backend, MiniMaxM3SparseRuntimeBackend)
+    is_minimax_m3_msa = issubclass(attention_backend, MiniMaxM3MsaSparseAttention)
     # A backend with metadata of its own keeps state the feature metadata do not carry.
     if (
         not is_deepseek_v4
         and not is_csa2
+        and not is_minimax_m3_triton
+        and not is_minimax_m3_msa
         and attention_backend.Metadata is not TrtllmAttentionMetadata
     ):
         raise UnsupportedMetadataConfiguration(
             f"the attention backend {attention_backend.__name__} (only TrtllmAttention, "
-            "DeepSeek-V4 and CSA2 are covered)"
+            "DeepSeek-V4, CSA2 and MiniMax-M3 are covered)"
         )
     if model_config.is_generation is False or getattr(
         model_config.pretrained_config, "is_encoder_decoder", False
@@ -223,6 +235,10 @@ def build_feature_attention_metadata(
         metadata_types.append(DeepseekV4Metadata)
     elif is_csa2:
         metadata_types.append(CSA2Metadata)
+    elif is_minimax_m3_triton:
+        metadata_types.append(MiniMaxM3TritonMetadata)
+    elif is_minimax_m3_msa:
+        metadata_types.append(MiniMaxM3MsaMetadata)
     else:
         metadata_types.append(SparseMetadata)
     is_hybrid = isinstance(kv_cache_manager, BaseMambaCacheManager)
