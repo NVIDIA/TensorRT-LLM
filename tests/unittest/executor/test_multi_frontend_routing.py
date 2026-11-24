@@ -302,6 +302,15 @@ class TestClassicFrontendProxyEndToEnd:
         from tensorrt_llm.sampling_params import SamplingParams
 
         proxy, worker_ingress, hmac_key, result_addrs = self._make_proxy_and_fake_worker(tmp_path)
+        completed = threading.Event()
+
+        class _ResultRegistry(dict):
+            def pop(self, key: object, default: object = None) -> object:
+                value = super().pop(key, default)
+                completed.set()
+                return value
+
+        proxy._results = _ResultRegistry(proxy._results)
         worker_lane = FusedIpcQueue(
             (result_addrs[1], hmac_key),
             is_server=False,
@@ -318,6 +327,9 @@ class TestClassicFrontendProxyEndToEnd:
             worker_lane.put(ErrorResponse(client_id, "boom", 1))
             with pytest.raises(RequestError, match="boom"):
                 result.result(timeout=5)
+            # Queue delivery precedes the dispatcher's final registry bookkeeping.
+            assert completed.wait(5)
+            assert client_id not in proxy._results
             proxy.shutdown()
             assert not proxy.dispatch_result_thread.is_alive()
             assert not proxy._results

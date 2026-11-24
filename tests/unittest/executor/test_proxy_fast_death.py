@@ -807,7 +807,9 @@ def test_shutdown_joins_real_dispatcher_before_socket_close(
     proxy.garbage_collection_gen0_threshold = None
     proxy.doing_shutdown = False
     received = threading.Event()
+    lane_ready = threading.Event()
     closing_dispatcher = threading.Event()
+    writer_completed = _Future()
     proxy.result_queue = FusedIpcQueue(
         (f"ipc://{tmp_path / 'result.sock'}", b"private-test-key"),
         is_server=True,
@@ -823,7 +825,10 @@ def test_shutdown_joins_real_dispatcher_before_socket_close(
 
     def recv() -> object:
         received.set()
-        return real_recv()
+        batch = real_recv()
+        if batch == []:
+            lane_ready.set()
+        return batch
 
     def close() -> None:
         assert not proxy.dispatch_result_thread.is_alive()
@@ -837,20 +842,30 @@ def test_shutdown_joins_real_dispatcher_before_socket_close(
     monkeypatch.setattr(proxy.result_queue.queue, "_recv_data", recv)
     monkeypatch.setattr(proxy.result_queue, "close", close)
     monkeypatch.setattr(proxy, "_stop_dispatch_thread", stop)
-    monkeypatch.setattr(proxy, "_DISPATCH_DRAIN_TIMEOUT_S", 0.1)
+    # A healthy tail exits on its sentinel; only missing-sentinel cases need a short drain.
+    monkeypatch.setattr(proxy, "_DISPATCH_DRAIN_TIMEOUT_S", 5.0 if send_tail else 0.1)
     # Neither timed idle receive nor healthy responses should call poll().
     monkeypatch.setattr(proxy.result_queue.queue.socket, "poll", _Mock(side_effect=AssertionError))
 
     def send_final_batch() -> None:
-        assert closing_dispatcher.wait(10)
-        worker_lane.put([ErrorResponse(7, "final worker response", 7), None])
+        try:
+            worker_lane.put([])
+            assert closing_dispatcher.wait(10)
+            worker_lane.put([ErrorResponse(7, "final worker response", 7), None])
+        except Exception as error:  # noqa: BLE001 - transfer owned-thread failures to the test
+            writer_completed.set_exception(error)
+        else:
+            writer_completed.set_result(None)
 
     writer = threading.Thread(target=send_final_batch) if send_tail else None
     try:
+        if writer is not None:
+            writer.start()
         proxy._start_dispatch_threads()
         assert received.wait(5)
         if writer is not None:
-            writer.start()
+            # A decoded warm-up batch proves the IPC lane works before shutdown.
+            assert lane_ready.wait(5)
         proxy.doing_shutdown = True
         proxy.shutdown()
         # No sleep or extra join before the at-return lifetime assertion.
@@ -860,6 +875,7 @@ def test_shutdown_joins_real_dispatcher_before_socket_close(
         if send_tail:
             assert pending.queue.get_nowait().error_msg == "final worker response"
             assert not proxy.dispatch_result_thread.stop_event.is_set()
+            writer_completed.result(timeout=5)
     finally:
         if writer is not None and writer.ident is not None:
             closing_dispatcher.set()
