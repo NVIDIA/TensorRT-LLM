@@ -4,7 +4,10 @@
 
 Each port is opt-in through its own environment variable, read at use time, and takes effect
 only where it was validated: SM107 with the CuTe DSL Rubin kernels (the predicate the K3 FP8
-weight-read GEMM uses). Elsewhere a set switch is ignored with one warning per switch.
+weight-read GEMM uses). Elsewhere a set switch is ignored with one warning per switch. The
+exception is :data:`PORTABLE_ON_SM103`: switches whose kernels hold no SM107-specific content (a
+launch attribute or an ordering of ordinary instructions) are also honoured on SM103 with the CuTe
+DSL (GB300). They stay opt-in and off by default.
 
 * :func:`mk1_value` / :func:`mk1_enabled` read a switch; :func:`mk1_cache_key` returns the
   switches' effective values for a CuTe compile-cache key, so a compiled kernel never
@@ -35,6 +38,30 @@ def mk1_platform_supported() -> bool:
     return get_sm_version() == 107 and IS_CUTLASS_DSL_RUBIN_AVAILABLE
 
 
+#: Switches that are honoured on SM103 (GB300) as well. Only switches whose kernels are
+#: architecture-generic belong here (plain CuTe/PTX with PDL and multicast stores, no SM107-only
+#: instruction; verified to run on SM103). They run on SM100 and SM107 through the same gate.
+PORTABLE_ON_SM103 = frozenset(
+    {
+        "TRTLLM_K3_KDA_VERIFY_PDL",
+        "TRTLLM_K3_OPROJ_LAMPORT",
+        "TRTLLM_K3_ATTN_RES_EARLY_TRIGGER",
+    }
+)
+#: Largest value of a switch that was validated on SM103 (higher values are ignored there).
+#: ``TRTLLM_K3_ATTN_RES_EARLY_TRIGGER=2`` (trigger at kernel entry) needs every dependent to read only
+#: constants before its own ``griddepcontrol.wait`` and was not validated on SM103.
+_SM103_MAX_VALUE = {"TRTLLM_K3_ATTN_RES_EARLY_TRIGGER": 1}
+
+
+@functools.cache
+def _sm103_portable_platform() -> bool:
+    """SM103 (GB300) with the CuTe DSL available: where :data:`PORTABLE_ON_SM103` run."""
+    from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+
+    return get_sm_version() == 103 and IS_CUTLASS_DSL_AVAILABLE
+
+
 def mk1_value(name: str, choices: Sequence[int] = (0, 1)) -> int:
     """Effective value of switch ``name``: its integer value, or 0 when unset or unsupported.
 
@@ -51,6 +78,15 @@ def mk1_value(name: str, choices: Sequence[int] = (0, 1)) -> int:
         raise ValueError(f"{name} must be one of {sorted(choices)}, got {raw!r}")
     if value == 0 or mk1_platform_supported():
         return value
+    if name in PORTABLE_ON_SM103 and _sm103_portable_platform():
+        if value <= _SM103_MAX_VALUE.get(name, value):
+            return value
+        logger.warning_once(
+            f"{name}={raw} is ignored on SM103: only values up to {_SM103_MAX_VALUE[name]} were "
+            "validated there.",
+            key=f"mk1_gate_sm103_{name}",
+        )
+        return 0
     logger.warning_once(
         f"{name}={raw} is ignored: the Kimi K3 MK1 ports need SM107 with the CuTe DSL Rubin kernels.",
         key=f"mk1_gate_{name}",

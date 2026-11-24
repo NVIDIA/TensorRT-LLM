@@ -753,6 +753,7 @@ class KDAKernelDispatch:
         self,
         *,
         mxfp8_output: bool = False,
+        sf_deepgemm: bool = False,
         A_log_f32: Optional[torch.Tensor] = None,
         dt_bias_f32: Optional[torch.Tensor] = None,
         **kwargs,
@@ -768,13 +769,18 @@ class KDAKernelDispatch:
         ``A_log_f32`` / ``dt_bias_f32``: FP32 copies of ``A_log`` / ``dt_bias``
         (the mixer casts those parameters to BF16), read only by the Kernel
         Factory verify kernel; the CuTe DSL kernels read ``A_log`` / ``dt_bias``.
+
+        ``sf_deepgemm`` (with ``mxfp8_output``): the FP8 output's scales come back in DeepGEMM's
+        packed MN-major int32 layout (``trtllm::kda_mtp_decode_fp8_dg``; SM100/103 consumers).
         """
         if self.verify_kernel_path != "optimized":
             raise RuntimeError(
                 "mtp_verify called on non-optimized path; use the module's "
                 "sequential FLA verify fallback instead."
             )
-        if self._kf_verify:
+        if sf_deepgemm and not mxfp8_output:
+            raise ValueError("sf_deepgemm requires mxfp8_output")
+        if self._kf_verify and not sf_deepgemm:
             kf_kwargs = _with_fp32_gate_constants(kwargs, A_log_f32, dt_bias_f32)
             reason = _kf_verify_ineligibility(kf_kwargs, mxfp8_output)
             if reason is None:
@@ -794,7 +800,11 @@ class KDAKernelDispatch:
         _load_mtp_module()  # registers both BF16 and FP8 MTP ops
         if mxfp8_output:
             kwargs.pop("fuse_output_norm", None)
-            op = torch.ops.trtllm.kda_mtp_decode_fp8
+            op = (
+                torch.ops.trtllm.kda_mtp_decode_fp8_dg
+                if sf_deepgemm
+                else torch.ops.trtllm.kda_mtp_decode_fp8
+            )
         else:
             op = torch.ops.trtllm.kda_mtp_decode
         return op(**kwargs)

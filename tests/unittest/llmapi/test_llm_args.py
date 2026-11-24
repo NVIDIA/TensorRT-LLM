@@ -2213,6 +2213,52 @@ class TestPiecewiseCudaGraphCaptureDefaults:
         engine._prefill_cuda_graph_num_tokens = [128, 256, 512]
         assert engine._get_padding_params(129, 1, None) == (256, True, None)
 
+    def test_context_only_breakable_body_runs_mixed_batches_eagerly(self):
+        from tensorrt_llm._torch.pyexecutor.model_engine import \
+            PyTorchModelEngine
+
+        engine = object.__new__(PyTorchModelEngine)
+        engine.enable_attention_dp = False
+        engine.prefill_cuda_graph_backend = PrefillCudaGraphBackend.BREAKABLE
+        engine._prefill_cuda_graph_num_tokens = [128, 256, 512]
+
+        # A body that serves every batch composition pads (and replays) a
+        # mixed batch too.
+        engine._breakable_cuda_graph_context_only = False
+        assert engine._get_padding_params(
+            129, 1, None, has_generation_requests=True) == (256, True, None)
+
+        # A body that serves batches of context requests only never sees one:
+        # the mixed batch runs eagerly and unpadded, a context-only batch is
+        # unaffected.
+        engine._breakable_cuda_graph_context_only = True
+        assert engine._get_padding_params(
+            129, 1, None, has_generation_requests=True) == (129, False, None)
+        assert engine._get_padding_params(129, 1, None) == (256, True, None)
+        assert engine._get_padding_params(
+            129, 1, None, has_generation_requests=False) == (256, True, None)
+
+    def test_context_only_breakable_body_is_refused_with_attention_dp(self):
+        from tensorrt_llm._torch.pyexecutor.model_engine import \
+            PyTorchModelEngine
+
+        context_only = torch.nn.Module()
+        context_only.breakable_cuda_graph_context_only = True
+        any_batch = torch.nn.Module()
+        engine = object.__new__(PyTorchModelEngine)
+
+        engine.enable_attention_dp = False
+        assert engine._declares_context_only_breakable_body(context_only)
+        assert not engine._declares_context_only_breakable_body(any_batch)
+
+        # Under attention DP the pad-and-replay decision comes from the
+        # per-rank context request counts: it cannot keep a context-only body
+        # away from a rank that also has generation requests.
+        engine.enable_attention_dp = True
+        with pytest.raises(ValueError, match="attention DP"):
+            engine._declares_context_only_breakable_body(context_only)
+        assert not engine._declares_context_only_breakable_body(any_batch)
+
     def test_attention_dp_prefill_graph_uses_all_rank_decision(self):
         from tensorrt_llm._torch.pyexecutor.model_engine import \
             PyTorchModelEngine

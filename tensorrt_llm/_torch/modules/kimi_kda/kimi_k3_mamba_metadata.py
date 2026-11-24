@@ -6,6 +6,7 @@ import torch
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
+from tensorrt_llm._torch.pyexecutor.input_commit import active_input_commit
 
 from ._kda_flashinfer_schedule import KDAFlashInferSchedule, flashinfer_prefill_requested
 
@@ -67,7 +68,14 @@ class KimiK3MambaMetadata(Mamba2Metadata):
         super().prepare(attn_metadata)
 
         batch_size = attn_metadata.seq_lens.shape[0]
-        self._state_indices_long[:batch_size].copy_(self.state_indices[:batch_size])
+        input_commit = active_input_commit()
+        if input_commit is not None and self.state_indices_staged:
+            # The int32 indices are written by the commit too; stage the same values.
+            input_commit.stage(
+                self._state_indices_long[:batch_size], self.state_indices_cpu[:batch_size]
+            )
+        else:
+            self._state_indices_long[:batch_size].copy_(self.state_indices[:batch_size])
         self.state_indices_long = self._state_indices_long[:batch_size]
 
         context_lengths = attn_metadata.seq_lens[: attn_metadata.num_contexts].tolist()

@@ -3009,6 +3009,32 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         "over context and block that replaces the fixup; it does not degrade, "
         "and a build that cannot run it raises with the reason.")
 
+    context_kv_only: bool = Field(
+        default=False,
+        description=
+        "Set on the context servers of disaggregated serving with a standalone "
+        "MLA DSpark drafter. The context server never drafts: it builds the "
+        "drafter's context KV from the target hidden states during prefill and "
+        "transfers it to the generation server with the prompt KV. With this "
+        "set it loads only what that needs (the context projection and each "
+        "drafter layer's latent projection and norm) and rejects generation "
+        "requests. Requires the KV cache manager V2 and the unified draft "
+        "cache, which an MLA drafter opts into with "
+        "TLLM_DSPARK_UNIFIED_MLA_DRAFT_CACHE=1.")
+
+    context_kv_dtype: Literal["auto", "fp8"] = Field(
+        default="auto",
+        description=
+        "Storage dtype of a standalone MLA DSpark drafter's context KV (one "
+        "latent per token and drafter layer) in the unified draft cache of the "
+        "KV cache manager V2. 'auto' keeps the drafter's weight dtype (BF16). "
+        "'fp8' stores FP8 E4M3 latents at a unit per-tensor scale, halving the "
+        "draft cache bytes per token and the context-to-generation transfer of "
+        "them, and the generation server's block decode reads them with the "
+        "FP8 CuTe DSL MLA decode, so it requires attention_backend CUTEDSL "
+        "(the MLA drafter's AUTO choice). The context and generation servers "
+        "of disaggregated serving must set the same value.")
+
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
         self.max_total_draft_tokens = self.max_draft_len

@@ -151,6 +151,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         SPLIT_V: cutlass.Constexpr[int],
         BF16_MMA: cutlass.Constexpr[bool],
         USE_PDL: cutlass.Constexpr[bool],
+        SF_DEEPGEMM: cutlass.Constexpr[bool],
         stream: cuda.CUstream,
     ):
         if cutlass.const_expr(USE_ZERO_ACCEPTED):
@@ -385,6 +386,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             BF16_MMA,
             tiled_mma_f32a,
             USE_PDL,
+            SF_DEEPGEMM,
         )
         if cutlass.const_expr(SPLIT_V == 2):
             # cluster pair: the two CTAs of a (head, request) must be co-scheduled (in-place state)
@@ -679,6 +681,19 @@ def _verify_pdl_for_call(packed_token_layout: bool, accepted_converted: bool) ->
     return True
 
 
+def _pad4(rows: int) -> int:
+    return (rows + 3) // 4 * 4
+
+
+def deepgemm_scale_view(scale_words: torch.Tensor, rows: int, heads: int) -> torch.Tensor:
+    """The ``[rows, heads / 4]`` int32 MN-major view of a ``sf_deepgemm`` scale buffer.
+
+    Same shape and strides ``(1, ceil4(rows))`` as the scale of
+    ``fp8_quantize_1x128_packed_ue8m0(x, False)``, which DeepGEMM's ``fp8_gemm_nt`` consumes.
+    """
+    return scale_words.as_strided((rows, heads // 4), (1, _pad4(rows)))
+
+
 def _precompute_control_tensor(device: torch.device, enabled: bool) -> torch.Tensor:
     dev = torch.device(device)
     key = (dev.index if dev.index is not None else torch.cuda.current_device(), bool(enabled))
@@ -751,6 +766,7 @@ def kda_mtp_decode_impl(
     onorm_eps: float = 1e-5,
     fuse_output_norm: bool = False,
     quantize_output: bool = False,
+    sf_deepgemm: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Launch the fused KDA MTP verify kernel. See the module docstring.
 
@@ -789,11 +805,16 @@ def kda_mtp_decode_impl(
             epilogue using section-strided ``onorm_g`` and ``onorm_weight``.
         quantize_output: return the normalized activation directly as MXFP8
             E4M3 plus packed UE8M0 1x128 scales for a prequantized projection.
+        sf_deepgemm: with ``quantize_output``, return the scales in DeepGEMM's packed MN-major
+            layout (a flat int32 tensor of ``HV / 4`` rows of ``ceil4(T_total)`` words, see
+            ``deepgemm_scale_view``) instead of the R128c4 layout of the CuTe MXFP8 GEMM.
 
     Returns either BF16 ``[1, T_total, H, V]`` or, with
     ``quantize_output=True``, E4M3 ``[T_total, H*V]`` and packed UE8M0 scales
     in the flat uint8 R128c4 layout consumed by the CuTe MXFP8 GEMM.
     """
+    if sf_deepgemm and not quantize_output:
+        raise ValueError("sf_deepgemm requires quantize_output=True.")
     _, T_total, _, D = x_q.shape
     H = A_log.shape[0]
     HV = g.shape[2] if g.ndim == 4 else H
@@ -823,12 +844,21 @@ def kda_mtp_decode_impl(
             dtype=torch.float8_e4m3fn,
             device=x_q.device,
         )
-        scale_rows = (T_total + 127) // 128 * 128
-        output_scale = torch.empty(
-            (scale_rows * HV * 4,),
-            dtype=torch.uint8,
-            device=x_q.device,
-        )
+        if sf_deepgemm:
+            if HV % 4 != 0:
+                raise ValueError("sf_deepgemm needs a head count divisible by 4.")
+            # int32 words of four consecutive 128-column scales, MN-major, rows padded to 4.
+            output_scale_words = torch.empty(
+                (HV // 4) * _pad4(T_total), dtype=torch.int32, device=x_q.device
+            )
+            output_scale = output_scale_words.view(torch.uint8)
+        else:
+            scale_rows = (T_total + 127) // 128 * 128
+            output_scale = torch.empty(
+                (scale_rows * HV * 4,),
+                dtype=torch.uint8,
+                device=x_q.device,
+            )
     elif out is None:
         output_shape = (1, T_total, HV, V_dim)
         if packed_token_layout:
@@ -938,7 +968,7 @@ def kda_mtp_decode_impl(
     use_pdl = _verify_pdl_for_call(bool(packed_token_layout), accepted_converted)
     # The compact two-CTAs-per-SM layout when TRTLLM_KDA_MTP_COMPACT=1 and
     # its policy holds; bitwise identical to the default (3xTF32) path of the in-tree kernel.
-    compact, compact_two_ctas = select_compact_layout(
+    compact, compact_two_ctas = (False, False) if sf_deepgemm else select_compact_layout(
         device=x_q.device,
         split_v=split_v,
         num_tiles=HV * N,
@@ -993,6 +1023,7 @@ def kda_mtp_decode_impl(
         float(onorm_eps),
         bool(fuse_output_norm),
         bool(quantize_output),
+        bool(sf_deepgemm),
         split_v,
         bf16_math,
         compact,
@@ -1006,7 +1037,7 @@ def kda_mtp_decode_impl(
             f"num_spec={num_spec} zero_accepted={use_zero_accepted} "
             f"regular_metadata={use_regular_metadata} "
             f"fuse_output_norm={fuse_output_norm} "
-            f"quantize_output={quantize_output} split_v={split_v} bf16_math={bf16_math} "
+            f"quantize_output={quantize_output} sf_deepgemm={sf_deepgemm} split_v={split_v} bf16_math={bf16_math} "
             f"compact={compact} compact_two_ctas={compact_two_ctas} pdl={use_pdl}"
         )
         if compact:
@@ -1020,6 +1051,8 @@ def kda_mtp_decode_impl(
             launcher = _run_kda_decode_mtp
             variant_kwargs = {"BF16_MMA": bf16_math}
         variant_kwargs.update(USE_PDL=use_pdl)
+        if not compact:
+            variant_kwargs.update(SF_DEEPGEMM=bool(sf_deepgemm))
         _compiled_cache[key] = cute.compile(
             launcher,
             _from_dlpack_arg(h0_arg),
@@ -1117,7 +1150,7 @@ def kda_mtp_decode_impl(
     )
 
     if quantize_output:
-        return out, output_scale
+        return out, (output_scale_words if sf_deepgemm else output_scale)
     return out
 
 
@@ -1394,6 +1427,162 @@ if IS_CUTLASS_DSL_AVAILABLE:
         output_scale = torch.empty(
             (scale_rows * heads * 4,),
             dtype=torch.uint8,
+            device=x_q.device,
+        )
+        return output, output_scale
+
+    @torch.library.custom_op(
+        "trtllm::kda_mtp_decode_fp8_dg",
+        mutates_args=(
+            "cs_q",
+            "cs_k",
+            "cs_v",
+            "recurrent_state",
+            "k_cache",
+            "g_cache",
+            "v_cache",
+            "beta_cache",
+        ),
+        device_types="cuda",
+    )
+    def kda_mtp_decode_fp8_dg(
+        x_q: torch.Tensor,
+        x_k: torch.Tensor,
+        x_v: torch.Tensor,
+        w_q: torch.Tensor,
+        w_k: torch.Tensor,
+        w_v: torch.Tensor,
+        cs_q: torch.Tensor,
+        cs_k: torch.Tensor,
+        cs_v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        recurrent_state: torch.Tensor,
+        k_cache: torch.Tensor,
+        g_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        beta_cache: torch.Tensor,
+        ssm_state_indices: torch.Tensor,
+        cu_seqlens: Optional[torch.Tensor],
+        num_spec: int,
+        num_accepted_tokens: torch.Tensor,
+        lower_bound: float,
+        scale: Optional[float] = None,
+        zero_accepted_hint: bool = False,
+        regular_metadata_hint: bool = False,
+        packed_token_layout: bool = False,
+        onorm_g: Optional[torch.Tensor] = None,
+        onorm_weight: Optional[torch.Tensor] = None,
+        onorm_eps: float = 1e-5,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Fused KDA verify, gated RMSNorm, and 1x128 quantization with DeepGEMM-packed scales."""
+        return kda_mtp_decode_impl(
+            x_q=x_q,
+            x_k=x_k,
+            x_v=x_v,
+            w_q=w_q,
+            w_k=w_k,
+            w_v=w_v,
+            cs_q=cs_q,
+            cs_k=cs_k,
+            cs_v=cs_v,
+            g=g,
+            beta=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            recurrent_state=recurrent_state,
+            k_cache=k_cache,
+            g_cache=g_cache,
+            v_cache=v_cache,
+            beta_cache=beta_cache,
+            ssm_state_indices=ssm_state_indices,
+            cu_seqlens=cu_seqlens,
+            num_spec=num_spec,
+            num_accepted_tokens=num_accepted_tokens,
+            lower_bound=lower_bound,
+            scale=scale,
+            zero_accepted_hint=zero_accepted_hint,
+            regular_metadata_hint=regular_metadata_hint,
+            packed_token_layout=packed_token_layout,
+            onorm_g=onorm_g,
+            onorm_weight=onorm_weight,
+            onorm_eps=onorm_eps,
+            fuse_output_norm=True,
+            quantize_output=True,
+            sf_deepgemm=True,
+        )
+
+    @kda_mtp_decode_fp8_dg.register_fake
+    def _(
+        x_q: torch.Tensor,
+        x_k: torch.Tensor,
+        x_v: torch.Tensor,
+        w_q: torch.Tensor,
+        w_k: torch.Tensor,
+        w_v: torch.Tensor,
+        cs_q: torch.Tensor,
+        cs_k: torch.Tensor,
+        cs_v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        recurrent_state: torch.Tensor,
+        k_cache: torch.Tensor,
+        g_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        beta_cache: torch.Tensor,
+        ssm_state_indices: torch.Tensor,
+        cu_seqlens: Optional[torch.Tensor],
+        num_spec: int,
+        num_accepted_tokens: torch.Tensor,
+        lower_bound: float,
+        scale: Optional[float] = None,
+        zero_accepted_hint: bool = False,
+        regular_metadata_hint: bool = False,
+        packed_token_layout: bool = False,
+        onorm_g: Optional[torch.Tensor] = None,
+        onorm_weight: Optional[torch.Tensor] = None,
+        onorm_eps: float = 1e-5,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        del (
+            x_k,
+            w_q,
+            w_k,
+            w_v,
+            cs_q,
+            cs_k,
+            cs_v,
+            g,
+            beta,
+            A_log,
+            dt_bias,
+            recurrent_state,
+            k_cache,
+            g_cache,
+            v_cache,
+            beta_cache,
+            ssm_state_indices,
+            cu_seqlens,
+            num_spec,
+            num_accepted_tokens,
+            lower_bound,
+            scale,
+            zero_accepted_hint,
+            regular_metadata_hint,
+            packed_token_layout,
+            onorm_g,
+            onorm_weight,
+            onorm_eps,
+        )
+        rows = x_q.shape[1]
+        heads = x_v.shape[2]
+        output = x_q.new_empty((rows, heads * x_v.shape[3]), dtype=torch.float8_e4m3fn)
+        output_scale = torch.empty(
+            ((heads // 4) * _pad4(rows),),
+            dtype=torch.int32,
             device=x_q.device,
         )
         return output, output_scale

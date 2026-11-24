@@ -28,6 +28,9 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
+from tensorrt_llm._torch.pyexecutor.input_commit import (
+    active_input_commit, copy_small_pinned_pair,
+    gen_host_bundle_kernels_enabled)
 from tensorrt_llm._torch.pyexecutor.kda_replay_seed import (
     BATCHED_REPLAY_SEED_ENV, ReplaySeedPlan, batched_replay_seed_enabled,
     build_replay_seed_plan, seed_replay_caches, warmup_replay_seed_kernels)
@@ -260,6 +263,15 @@ def _host_slots_to_device(slots: List[int],
                         and prefer_pinned()).to(device, non_blocking=True)
 
 
+def _pinned_snapshot(src: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """A fresh host copy of ``src``, pinned when ``device`` is a GPU."""
+    snapshot = torch.empty(src.shape,
+                           dtype=src.dtype,
+                           pin_memory=device.type == "cuda" and prefer_pinned())
+    snapshot.copy_(src)
+    return snapshot
+
+
 def _copy_from_host_snapshot(dst: torch.Tensor, src: torch.Tensor) -> None:
     """Copy reusable host staging ``src`` into ``dst`` without a host sync.
 
@@ -267,12 +279,7 @@ def _copy_from_host_snapshot(dst: torch.Tensor, src: torch.Tensor) -> None:
     executor iteration, refilling ``src`` before the first copy has run. Each
     copy therefore reads a fresh pinned snapshot; ``dst`` keeps its address.
     """
-    snapshot = torch.empty(src.shape,
-                           dtype=src.dtype,
-                           pin_memory=dst.device.type == "cuda"
-                           and prefer_pinned())
-    snapshot.copy_(src)
-    dst.copy_(snapshot, non_blocking=True)
+    dst.copy_(_pinned_snapshot(src, dst.device), non_blocking=True)
 
 
 def _mamba_rank_offset(mapping: Mapping) -> int:
@@ -1467,8 +1474,15 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
         if n > 0:
             self._dummy_request_mask_host[:n].copy_(
                 torch.tensor(is_dummy, dtype=torch.bool))
-        _copy_from_host_snapshot(self._dummy_request_mask,
-                                 self._dummy_request_mask_host)
+        input_commit = active_input_commit()
+        if input_commit is not None:
+            # Staging copies the host values into the commit's arena now, so it is a snapshot
+            # like _copy_from_host_snapshot.
+            input_commit.stage(self._dummy_request_mask,
+                               self._dummy_request_mask_host)
+        else:
+            _copy_from_host_snapshot(self._dummy_request_mask,
+                                     self._dummy_request_mask_host)
 
     def _reset_context_mamba_slots(self, num_contexts: int) -> None:
         if num_contexts == 0:
@@ -4131,14 +4145,53 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                         f"request {req.py_request_id}")
                 self._host_state_indices[i] = base_index
 
-        _copy_from_host_snapshot(self.cuda_state_indices,
-                                 self._host_state_indices)
         is_dummy = [req.is_dummy for req in requests]
-        self._refresh_dummy_request_mask(is_dummy)
+        if not self._upload_state_indices_and_dummy_mask(is_dummy):
+            _copy_from_host_snapshot(self.cuda_state_indices,
+                                     self._host_state_indices)
+            self._refresh_dummy_request_mask(is_dummy)
         state_values = self._host_state_indices[:n].tolist()
         for req, value, dummy in zip(requests, state_values, is_dummy):
             self._request_id_to_state_index[req.py_request_id] = value
             self._request_id_to_is_dummy[req.py_request_id] = dummy
+
+    @torch.inference_mode()
+    def _upload_state_indices_and_dummy_mask(self,
+                                             is_dummy: List[bool]) -> bool:
+        """TRTLLM_GEN_HOST_BUNDLE=1: both uploads of _setup_state_indices in one kernel.
+
+        Same stream position and destinations as the two copies, without two
+        copy-engine handoffs in front of the next step's input chain. Like
+        _copy_from_host_snapshot, the kernel reads fresh pinned snapshots of
+        the host buffers (an admission and the scheduled batch may refill
+        those in one iteration before the first upload has run); the pinned
+        allocator does not see a kernel's reads, so the snapshots are held
+        until an event recorded after the kernel has completed. Returns False
+        (nothing uploaded) to fall back to the copies.
+        """
+        if (not gen_host_bundle_kernels_enabled()
+                or active_input_commit() is not None
+                or self._dummy_request_mask is None):
+            return False
+        n = len(is_dummy)
+        assert n <= self._dummy_request_mask_host.shape[0]
+        self._dummy_request_mask_host.zero_()
+        if n > 0:
+            self._dummy_request_mask_host[:n].copy_(
+                torch.tensor(is_dummy, dtype=torch.bool))
+        device = self.cuda_state_indices.device
+        sources = (_pinned_snapshot(self._host_state_indices, device),
+                   _pinned_snapshot(self._dummy_request_mask_host, device))
+        if not copy_small_pinned_pair(self.cuda_state_indices, sources[0],
+                                      self._dummy_request_mask, sources[1]):
+            return False
+        done = torch.cuda.Event()
+        done.record()
+        held = getattr(self, "_state_upload_snapshots", [])
+        self._state_upload_snapshots = [(snap, event) for snap, event in held
+                                        if not event.query()]
+        self._state_upload_snapshots.append((sources, done))
+        return True
 
     def get_state_indices(self,
                           request_ids: Optional[List[int]] = None,

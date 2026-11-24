@@ -43,6 +43,9 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..kimi_k3_cache_policy import get_kimi_k3_fp8_kv_layer_ids
 from ..pyexecutor.config_utils import is_mla
+from ..pyexecutor.input_commit import (active_input_commit, bundle_census,
+                                       copy_block_offsets_jobs,
+                                       gen_host_bundle_kernels_enabled)
 from ..ugpu.runtime import UgpuRuntime
 from ..utils import (compute_swizzled_sf_shape, get_global_attrs,
                      get_model_extra_attrs)
@@ -973,19 +976,30 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 group may straddle a page boundary onto two ranks). None on
                 the single-token path, where the boolean flag carries it.
         """
+        input_commit = active_input_commit()
         if helix_position_offsets is not None and self.helix_position_offsets is not None:
             num_tokens = len(helix_position_offsets)
             self.helix_position_offsets_cpu[:num_tokens].copy_(
                 torch.tensor(helix_position_offsets, dtype=torch.int))
-            self.helix_position_offsets[:num_tokens].copy_(
-                self.helix_position_offsets_cpu[:num_tokens], non_blocking=True)
+            if input_commit is not None:
+                input_commit.stage(self.helix_position_offsets[:num_tokens],
+                                   self.helix_position_offsets_cpu[:num_tokens])
+            else:
+                self.helix_position_offsets[:num_tokens].copy_(
+                    self.helix_position_offsets_cpu[:num_tokens],
+                    non_blocking=True)
 
         if helix_is_inactive_rank is not None and self.helix_is_inactive_rank is not None:
             batch_size = len(helix_is_inactive_rank)
             self.helix_is_inactive_rank_cpu[:batch_size].copy_(
                 torch.tensor(helix_is_inactive_rank, dtype=torch.bool))
-            self.helix_is_inactive_rank[:batch_size].copy_(
-                self.helix_is_inactive_rank_cpu[:batch_size], non_blocking=True)
+            if input_commit is not None:
+                input_commit.stage(self.helix_is_inactive_rank[:batch_size],
+                                   self.helix_is_inactive_rank_cpu[:batch_size])
+            else:
+                self.helix_is_inactive_rank[:batch_size].copy_(
+                    self.helix_is_inactive_rank_cpu[:batch_size],
+                    non_blocking=True)
 
         self._helix_spec_tokens_valid = False
         if helix_owned_new_tokens is not None:
@@ -1155,6 +1169,33 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self._mla_ctx_cu_seqlens_valid = True
         return self.mla_ctx_cu_q_seqlens[:num_ctx + 1]
 
+    def _copy_target_and_draft_block_offsets(self) -> bool:
+        """Both block-offset copies of prepare() in one Triton launch.
+
+        Returns False (nothing launched) unless both KV cache managers would
+        take the Triton copy and their copy indices live in different
+        buffers (each manager's index mapper fills its own buffer, which the
+        kernel reads when it runs).
+        """
+        jobs = []
+        for manager, dst in ((self.kv_cache_manager,
+                              self.kv_cache_block_offsets),
+                             (self.draft_kv_cache_manager,
+                              self.draft_kv_cache_block_offsets)):
+            make_job = getattr(manager, "block_offsets_copy_job", None)
+            job = None if make_job is None else make_job(
+                dst, self.request_ids, self.beam_width, self.num_contexts,
+                self.num_seqs)
+            if job is None:
+                bundle_census().count("block_offsets_pair_fallback")
+                return False
+            jobs.append(job)
+        if jobs[0][2].data_ptr() == jobs[1][2].data_ptr():
+            bundle_census().count("block_offsets_pair_fallback")
+            return False
+        copy_block_offsets_jobs(jobs)
+        return True
+
     def prepare(self) -> None:
         # The FP8 scratch metadata view is shared by every local FP4 MLA layer
         # in one eager context forward and must be rebuilt for the next batch.
@@ -1186,8 +1227,13 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             device='cpu',
         )
         self.prompt_lens_cpu[:self.num_seqs].copy_(prompt_lens)
-        self.prompt_lens_cuda[:self.num_seqs].copy_(
-            self.prompt_lens_cpu[:self.num_seqs], non_blocking=True)
+        input_commit = active_input_commit()
+        if input_commit is not None:
+            input_commit.stage(self.prompt_lens_cuda[:self.num_seqs],
+                               self.prompt_lens_cpu[:self.num_seqs])
+        else:
+            self.prompt_lens_cuda[:self.num_seqs].copy_(
+                self.prompt_lens_cpu[:self.num_seqs], non_blocking=True)
 
         # number of tokens in the kv cache for each sequence in the batch
         cached_token_lens = torch.tensor(
@@ -1223,9 +1269,13 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # the sequence length including the cached tokens and the input tokens.
         self.kv_lens[:self.num_seqs].copy_(
             kv_lens + self.kv_cache_params.num_extra_kv_tokens)
-        self.kv_lens_cuda[:self.num_seqs].copy_(maybe_pin_memory(
-            kv_lens[:self.num_seqs]),
-                                                non_blocking=True)
+        if input_commit is not None:
+            input_commit.stage(self.kv_lens_cuda[:self.num_seqs],
+                               kv_lens[:self.num_seqs])
+        else:
+            self.kv_lens_cuda[:self.num_seqs].copy_(maybe_pin_memory(
+                kv_lens[:self.num_seqs]),
+                                                    non_blocking=True)
         # total kv lens for context requests and generation requests, without extra tokens
         self.host_total_kv_lens[0] = kv_lens[:self.num_contexts].sum().item()
         self.host_total_kv_lens[1] = kv_lens[self.num_contexts:self.
@@ -1263,16 +1313,22 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             if not spec_active and self.kv_cache_manager.tokens_per_block:
                 max_blocks = ceil_div(max_kv_len,
                                       self.kv_cache_manager.tokens_per_block)
-            self.kv_cache_manager.copy_batch_block_offsets(
-                self.kv_cache_block_offsets,
-                self.request_ids,
-                self.beam_width,
-                self.num_contexts,
-                self.num_seqs,
-                max_blocks=max_blocks)
+            # TRTLLM_GEN_HOST_BUNDLE=1: the target and draft tables in one
+            # Triton launch (same entries as the two copies below).
+            paired = (self.draft_kv_cache_manager is not None
+                      and gen_host_bundle_kernels_enabled()
+                      and self._copy_target_and_draft_block_offsets())
+            if not paired:
+                self.kv_cache_manager.copy_batch_block_offsets(
+                    self.kv_cache_block_offsets,
+                    self.request_ids,
+                    self.beam_width,
+                    self.num_contexts,
+                    self.num_seqs,
+                    max_blocks=max_blocks)
 
             # Also prepare draft KV cache block offsets if draft_kv_cache_manager exists
-            if self.draft_kv_cache_manager is not None:
+            if self.draft_kv_cache_manager is not None and not paired:
                 # Use the wrapper method which works for both V1 and V2
                 self.draft_kv_cache_manager.copy_batch_block_offsets(
                     self.draft_kv_cache_block_offsets,

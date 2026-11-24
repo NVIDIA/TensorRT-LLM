@@ -19,13 +19,14 @@ from __future__ import annotations
 
 import math
 import os
+import weakref
 from typing import List, Optional, Tuple
 
 import torch
 from fla.modules import ShortConvolution
 from torch import nn
 
-from tensorrt_llm._utils import get_env_flag
+from tensorrt_llm._utils import get_env_flag, get_sm_version
 from tensorrt_llm.logger import logger
 
 from ....models.modeling_utils import QuantConfig
@@ -34,16 +35,36 @@ from ...attention_backend import AttentionMetadata
 from ...distributed import AllReduce, AllReduceStrategy
 from ...model_config import ModelConfig
 from ...modules.multi_stream_utils import maybe_execute_in_parallel
+from ...pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
+from ...utils import get_model_extra_attrs
 from ..kimi_k3_oproj_lamport import K3LamportDelta
 from ..linear import Linear
 from ..mamba.causal_conv1d import causal_conv1d_fn
 from ..mamba.fuse_elementwise_ops import extract_transpose_prefill_slice
 from ..mamba.layernorm_gated import RMSNorm, rms_norm_gated_token_major
 from ..mamba.recurrent_state_cache import reset_recurrent_state_rows
-from ._kda_flashinfer_prefill import forward_prefill_flashinfer, select_flashinfer_prefill
+from ._kda_flashinfer_prefill import (
+    forward_prefill_flashinfer,
+    forward_prefill_flashinfer_breakable,
+    run_prefill_core,
+    select_flashinfer_prefill,
+)
 from ._kda_kernels import KDAKernelDispatch, copy_kda_replay_conv_window, fused_kda_post_conv
 
 _KDA_INDEXED_STATE_POOL_ENABLED = os.environ.get("TLLM_KDA_ENABLE_INDEXED_STATE_POOL", "1") == "1"
+# TRTLLM_K3_BCG_KDA_WHOLE=1 (read once at import): under the breakable prefill CUDA graph, run the
+# whole KDA mixer (projections, o_proj and the all-reduce included) eagerly between graph segments
+# instead of only its batch-dependent core. The break handles every prefill path of the mixer, so
+# it is the fallback when the split FlashInfer prefill is not in use, and a switch to separate a
+# core split problem from a plain breakable-graph problem. The model still declares its captured
+# body context-only, so the engine replays no batch with generation requests in either mode.
+_KDA_BCG_WHOLE_MIXER = get_env_flag("TRTLLM_K3_BCG_KDA_WHOLE", False)
+# TRTLLM_K3_KDA_OUT_QUANT_DG=1 (read once at import; SM100/103 with DeepGEMM projections): the fused
+# verify kernel quantizes its gated-norm output to E4M3 with DeepGEMM-packed UE8M0 scales in its
+# epilogue and o_proj consumes the pair, instead of a separate quantize kernel after the verify
+# kernel. Same E4M3 codes and scales as the standalone quantizer (the Rubin MXFP8-output epilogue
+# computes them the same way; only the scale layout differs).
+_KDA_OUT_QUANT_DG = get_env_flag("TRTLLM_K3_KDA_OUT_QUANT_DG", False)
 # Heuristic ported from SGLang's Blackwell cutoff:
 # https://github.com/sgl-project/sglang/blob/e84bbf68efb683c9e2eef4168c5198042544599d/python/sglang/srt/models/kimi_k3.py#L946-L954
 # It has not been tuned for TensorRT-LLM; benchmark and retune it for TRT-LLM's
@@ -143,6 +164,47 @@ def _kda_expand_fla_conv_cache(conv_state: torch.Tensor) -> torch.Tensor:
     return torch.nn.functional.pad(conv_state, (1, 0))
 
 
+def _extract_kda_extra_attrs(layer_idx: str):
+    """Resolve the live attention metadata and the KDA module registered as ``layer_idx``."""
+    extra_attrs = get_model_extra_attrs()
+    assert extra_attrs is not None, "Model extra attrs is not set"
+
+    metadata_ref = extra_attrs.get("attention_metadata")
+    assert metadata_ref is not None, "Attention metadata is not set"
+    metadata = metadata_ref()
+    assert isinstance(metadata, AttentionMetadata), "Metadata must be AttentionMetadata"
+
+    kda_layers = extra_attrs.get("kda_layers")
+    assert kda_layers is not None, "KDA layers are not registered"
+    kda_layer_ref = kda_layers.get(layer_idx)
+    assert kda_layer_ref is not None, f"Cannot find KDA layer for layer {layer_idx}"
+    kda_layer = kda_layer_ref()
+    assert isinstance(kda_layer, KimiKDALinearAttention), "Layer must be a KimiKDALinearAttention"
+    return metadata, kda_layer
+
+
+def kda_prefill_core_inplace(
+    conv_input: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    layer_idx: str,
+    output: torch.Tensor,
+) -> None:
+    """Run the batch-dependent FlashInfer prefill core of one KDA layer into ``output``."""
+    metadata, kda_layer = _extract_kda_extra_attrs(layer_idx)
+    kda_layer._run_prefill_core_breakable(conv_input, g, beta, metadata, output)
+
+
+def kda_mixer_inplace(hidden_states: torch.Tensor, layer_idx: str, output: torch.Tensor) -> None:
+    """Run one whole KDA mixer eagerly into ``output`` (``[rows, hidden]``)."""
+    metadata, kda_layer = _extract_kda_extra_attrs(layer_idx)
+    kda_layer._run_mixer_breakable(hidden_states, metadata, output)
+
+
+maybe_bcg_kda_prefill_core_inplace = eager_on_graph(kda_prefill_core_inplace)
+maybe_bcg_kda_mixer_inplace = eager_on_graph(kda_mixer_inplace)
+
+
 class KimiKDALinearAttention(nn.Module):
     """Production Kimi K3 KDA module with direct cache-pool ownership."""
 
@@ -160,6 +222,20 @@ class KimiKDALinearAttention(nn.Module):
         lin = cfg.linear_attn_config
         self.hidden_size = cfg.hidden_size
         self.layer_idx = layer_idx
+        # Registered by name so the breakable prefill CUDA graph can find the module again from
+        # inside an eager break (see ``kda_prefill_core_inplace``).
+        self.layer_idx_str = str(layer_idx)
+        self.register_to_config = False
+        if model_config is not None:
+            kda_layers = model_config.extra_attrs.setdefault("kda_layers", {})
+            suffix = 0
+            # ``layer_idx`` is local to one attention stack; keep the first registration under
+            # "<layer_idx>" and suffix later collisions so no stack overwrites another's entry.
+            while self.layer_idx_str in kda_layers:
+                self.layer_idx_str = f"{layer_idx}_{suffix}"
+                suffix += 1
+            kda_layers[self.layer_idx_str] = weakref.ref(self)
+            self.register_to_config = True
         self.head_dim = lin["head_dim"]
         self.head_k_dim = self.head_dim
         self.conv_size = lin["short_conv_kernel_size"]
@@ -425,6 +501,23 @@ class KimiKDALinearAttention(nn.Module):
             and proj is not None
             and bool(getattr(proj, "supports_prequantized_input", False))
             and callable(getattr(proj, "forward_prequantized", None))
+        ) or self._prequantized_deepgemm()
+
+    def _prequantized_deepgemm(self) -> bool:
+        """SM100/103: the attn_res kernel writes its FP8 output in DeepGEMM's packed scale layout
+        (``TRTLLM_K3_ATTN_RES_FP8_DG``) and the fused q|k|v|g projection is the DeepGEMM one, so
+        ``forward_prequantized_deepgemm`` consumes it (the input quantize kernel disappears)."""
+        if get_sm_version() not in (100, 103):
+            return False
+        from ...cute_dsl_kernels.blackwell import k3_attn_res
+
+        proj = self.qkvg_proj
+        return bool(
+            getattr(k3_attn_res, "SF_DEEPGEMM", False)
+            and self._qkvg_proj_weight is None
+            and proj is not None
+            and getattr(proj, "supports_deepgemm_prequantized_gate", False)
+            and callable(getattr(proj, "forward_prequantized_deepgemm", None))
         )
 
     def consumes_prequantized_input(self, attn_metadata, num_rows: int) -> bool:
@@ -453,6 +546,95 @@ class KimiKDALinearAttention(nn.Module):
         attn_metadata: AttentionMetadata,
         hidden_fp8=None,
     ) -> torch.Tensor:
+        """Select the eager path or the breakable-CUDA-graph path.
+
+        Inside a breakable prefill CUDA graph (capture or replay) ``hidden_states`` has one row
+        per padded token; the rows past ``attn_metadata.num_tokens`` are padding. The graph
+        zero-fills what the eager break leaves untouched, so the padding rows come back as zeros
+        and stay finite through the rest of the model.
+        """
+        if self.register_to_config and is_in_breakable_cuda_graph():
+            return self._forward_breakable(hidden_states)
+        return self._forward_eager(hidden_states, attn_metadata, hidden_fp8)
+
+    def _forward_breakable(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Context rows only; the row-wise stages are captured and the batch-dependent core is not.
+
+        With the FlashInfer prefill and its fused convolution (the padded batch needs the token-major
+        layout) the input projections and the gated output projection (with its all-reduce) are
+        graph-capturable; the state reset, convolution and chunk recurrence read the batch metadata
+        and run eagerly between graph segments. Otherwise, or with ``TRTLLM_K3_BCG_KDA_WHOLE=1``,
+        the whole mixer runs eagerly.
+        """
+        if self._kda_flashinfer_prefill and self._kda_fi_fuse_conv and not _KDA_BCG_WHOLE_MIXER:
+            out = forward_prefill_flashinfer_breakable(
+                self,
+                hidden_states,
+                lambda conv_input, g, beta, o: maybe_bcg_kda_prefill_core_inplace(
+                    conv_input, g, beta, self.layer_idx_str, o
+                ),
+            )
+            if self._o_allreduce is not None:
+                # Head-sharded TP: sum the row-sharded o_proj partials (see ``_forward_eager``).
+                out = self._o_allreduce(out)
+            return out
+        out = hidden_states.new_zeros((hidden_states.shape[0], self.hidden_size))
+        maybe_bcg_kda_mixer_inplace(hidden_states, self.layer_idx_str, out)
+        return out
+
+    def _run_prefill_core_breakable(
+        self,
+        conv_input: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        output: torch.Tensor,
+    ) -> None:
+        """Eager break of the split FlashInfer prefill: fill ``output[:, :num_tokens]``.
+
+        ``output`` is the graph-owned ``[1, rows, H, D]`` recurrence output, zero-filled by the
+        graph; the padding rows are left untouched.
+        """
+        num_prefills = attn_metadata.num_contexts
+        if attn_metadata.seq_lens.shape[0] != num_prefills:
+            raise RuntimeError(
+                "The split KDA prefill of the breakable CUDA graph serves context-only batches; "
+                "the engine must not replay it for a batch with generation requests"
+            )
+        mamba_metadata = attn_metadata.mamba_metadata
+        layer_cache = attn_metadata.kv_cache_manager.mamba_layer_cache(self.layer_idx)
+        num_tokens = attn_metadata.num_tokens
+        o = run_prefill_core(
+            self,
+            conv_input,
+            g,
+            beta,
+            mamba_metadata.query_start_loc_long[: num_prefills + 1],
+            mamba_metadata,
+            num_prefills,
+            layer_cache.conv,
+            layer_cache.temporal,
+            layer_cache,
+            num_tokens=num_tokens,
+        )
+        output[:, :num_tokens].copy_(o)
+
+    def _run_mixer_breakable(
+        self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata, output: torch.Tensor
+    ) -> None:
+        """Eager break: the whole mixer into ``output[:num_tokens]`` (the graph zeroed the rest)."""
+        num_tokens = attn_metadata.num_tokens
+        out = self._forward_eager(hidden_states[:num_tokens], attn_metadata)
+        if not isinstance(out, torch.Tensor):
+            raise TypeError(f"The breakable CUDA graph needs a tensor output, got {type(out)}")
+        output[:num_tokens].copy_(out)
+
+    def _forward_eager(
+        self,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        hidden_fp8=None,
+    ) -> torch.Tensor:
         """``hidden_states``: flattened ``[num_tokens, hidden]`` (ctx tokens
         first, then one token per generation request).
 
@@ -460,6 +642,13 @@ class KimiKDALinearAttention(nn.Module):
         ``hidden_states`` already quantized for the fused q|k|v|g projection
         (``accepts_prequantized_input``); used by pure-generation verification batches.
         """
+        # A prefill CUDA graph batch can carry padding rows after the tokens (eager forwards of
+        # such a batch happen while the graphs are still being set up); they leave as zeros.
+        # Metadata without a token count (module tests) describes an unpadded batch.
+        num_rows = hidden_states.shape[0]
+        num_tokens = getattr(attn_metadata, "num_tokens", num_rows)
+        if num_rows != num_tokens:
+            hidden_states = hidden_states[:num_tokens]
         mamba_metadata = attn_metadata.mamba_metadata
         num_prefills = attn_metadata.num_contexts
         num_ctx_tokens = attn_metadata.num_ctx_tokens
@@ -533,6 +722,8 @@ class KimiKDALinearAttention(nn.Module):
             # published into a Lamport mailbox leaves the sum to the attention
             # residual, TRTLLM_K3_OPROJ_LAMPORT).
             out = self._o_allreduce(out)
+        if hidden_states.shape[0] != num_rows:
+            out = torch.nn.functional.pad(out, (0, 0, 0, num_rows - hidden_states.shape[0]))
         return out
 
     def _has_kda_replay_caches(self, layer_cache) -> bool:
@@ -1111,6 +1302,12 @@ class KimiKDALinearAttention(nn.Module):
             if qkvg_weight is not None:
                 return torch.nn.functional.linear(x, qkvg_weight)
             if x_fp8 is not None:
+                if self._prequantized_deepgemm():
+                    rows = x_fp8.act.shape[0]
+                    padded = (rows + 3) // 4 * 4
+                    words = x_fp8.scale.view(torch.int32)
+                    scale = words.as_strided((rows, words.numel() // padded), (1, padded))
+                    return fused_qkvg.forward_prequantized_deepgemm(x_fp8.act, scale)
                 return fused_qkvg.forward_prequantized(x_fp8.act, x_fp8.scale)
             return fused_qkvg(x)
 
@@ -1218,6 +1415,15 @@ class KimiKDALinearAttention(nn.Module):
         mxfp8_output = self._fp8_resident_projections and bool(
             getattr(self.o_proj, "supports_prequantized_input", False)
         )
+        # SM100/103: the DeepGEMM o_proj takes the E4M3 output with packed scales (opt-in).
+        dg_output = (
+            _KDA_OUT_QUANT_DG
+            and get_sm_version() in (100, 103)
+            and not mxfp8_output
+            and self._fp8_resident_projections
+            and H % 4 == 0
+            and bool(getattr(self.o_proj, "supports_deepgemm_prequantized_input", False))
+        )
         forward_prequantized = None
         if mxfp8_output:
             forward_prequantized = getattr(self.o_proj, "forward_prequantized", None)
@@ -1269,8 +1475,16 @@ class KimiKDALinearAttention(nn.Module):
             onorm_weight=self._onorm_w_f32,
             onorm_eps=self.o_norm.eps,
             fuse_output_norm=True,
-            mxfp8_output=mxfp8_output,
+            mxfp8_output=mxfp8_output or dg_output,
+            sf_deepgemm=dg_output,
         )
+        if dg_output:
+            from ...custom_ops.cute_dsl_kimi_k3_kda_mtp_ops import deepgemm_scale_view
+
+            act, scale_words = out
+            return self.o_proj.forward_prequantized_deepgemm(
+                act, deepgemm_scale_view(scale_words, T_total, H)
+            )
         if mxfp8_output:
             if not isinstance(out, tuple):
                 raise RuntimeError("MXFP8-output MTP KDA must return activation and scale")

@@ -46,6 +46,7 @@ from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import (
     compute_probs_from_logits,
     sampling_batch_spec_dec_one_model_for_rejection,
 )
+from tensorrt_llm._torch.speculative import fast_block_verification as fbv
 from tensorrt_llm._torch.speculative import fast_rejection_sampling as frs
 from tensorrt_llm._torch.speculative import interface as itf
 from tensorrt_llm._torch.speculative.interface import rejection_sampling_one_model
@@ -696,6 +697,134 @@ def test_chi2_draft_tokens_follow_stored_proposal():
         stat, dof, pv = _chi2_pvalue(toks[:, i], q[i] / q[i].sum())
         print(f"draft position {i}: chi2={stat:.1f} dof={dof} p={pv:.3f}")
         assert pv > 1e-3
+
+
+# First verify of a request handed off from a context server: its K draft tokens are placeholders
+# (token 0), and the executor flags the request (py_needs_onehot_draft_probs) so that the proposal
+# rows of its slot are one-hot at token 0 before the verify reads them. The tests below pin the
+# kernel and writer contract that hand-off relies on, for the token-wise verifier and for block
+# verification (TLLM_SPEC_BLOCK_VERIFY); they do not run the executor code, which
+# tests/unittest/_torch/executor/test_disagg_gen_placeholder_drafts.py and
+# TestDisaggGenHandoffPlaceholderDrafts (tests/unittest/_torch/executor/test_py_executor.py) gate.
+_PLACEHOLDER_P0 = 0.25
+_PLACEHOLDER_V = 4096
+_VERIFIERS = pytest.mark.parametrize(
+    "verify",
+    [frs.fast_rs_verify, fbv.fast_rs_verify_block],
+    ids=["token_wise", "block_verification"],
+)
+
+
+def _placeholder_target_logits(gen, p0=_PLACEHOLDER_P0, support=31):
+    """[K + 1, _PLACEHOLDER_V] logits: token 0 has probability ``p0`` in every row, the rest of
+    the mass sits on ``support`` random tokens."""
+    lg = torch.full((K + 1, _PLACEHOLDER_V), -30.0, device=DEV)
+    idx = torch.stack(
+        [
+            torch.randperm(_PLACEHOLDER_V - 1, generator=gen, device=DEV)[:support] + 1
+            for _ in range(K + 1)
+        ]
+    )
+    lg.scatter_(1, idx, torch.randn(K + 1, support, generator=gen, device=DEV))
+    rest = torch.logsumexp(lg[:, 1:].double(), dim=1)
+    lg[:, 0] = (rest + math.log(p0 / (1.0 - p0))).float()
+    return lg.contiguous()
+
+
+def _verify_placeholders(tgt_one, buf, g, trials, verify=frs.fast_rs_verify):
+    """Verify token-0 drafts of ``g`` requests (slots 0..g-1) against ``buf`` over consecutive
+    offset windows; returns the accepted-token rows and the accepted counts."""
+    tgt = tgt_one.repeat(g, 1).contiguous()
+    temps = torch.ones(g * (K + 1), device=DEV)
+    slots = torch.arange(g, dtype=torch.int64, device=DEV)
+    drafts = torch.zeros((g, K), dtype=torch.int32, device=DEV)
+    seeds = torch.full((g,), 5, dtype=torch.int64, device=DEV)
+    rows, counts = [], []
+    for t in range(trials):
+        offs = torch.full((g,), (K + 1) * t, dtype=torch.int64, device=DEV)
+        acc, num = verify(tgt, temps, drafts, slots, -1, buf, seeds, offs)
+        rows.append(acc.cpu().numpy())
+        counts.append(num.cpu().numpy())
+    return np.concatenate(rows), np.concatenate(counts)
+
+
+def _check_verified_rows(acc, num):
+    """Every row is a well-formed verify output: the accepted placeholders, one target token,
+    then -1 padding."""
+    assert ((num >= 1) & (num <= K + 1)).all()
+    cols = np.arange(K + 1)[None, :]
+    tau = (num - 1)[:, None]
+    assert (acc[cols < tau] == 0).all()
+    emitted = acc[cols == tau]
+    assert ((emitted >= 0) & (emitted < _PLACEHOLDER_V)).all()
+    assert (acc[cols > tau] == -1).all()
+
+
+@_VERIFIERS
+def test_onehot_placeholder_rows_keep_the_first_verify_exact(verify):
+    """Contract the hand-off fix relies on, not a test of the fix: K placeholder drafts of token 0
+    against the one-hot rows that ``write_padding_onehot_draft_probs`` stores. Token 0 is accepted
+    with probability p(0) and a rejection resamples p without it, so the first emitted token
+    follows the target, and the second follows it given the first was accepted. Block
+    verification decides the whole block jointly, but its emitted tokens follow the target too:
+    the first one is token 0 exactly when at least one placeholder is accepted (its correction
+    row at position 0 has no mass on token 0)."""
+    gen = torch.Generator(device=DEV).manual_seed(5150)
+    g = 256
+    tgt_one = _placeholder_target_logits(gen)
+    # Uninitialised memory, as torch.empty hands out: the writer must overwrite all of it.
+    buf = torch.full((g + 1, K, _PLACEHOLDER_V), float("nan"), device=DEV)
+    meta = types.SimpleNamespace(
+        use_rejection_sampling=True,
+        draft_probs=buf,
+        draft_probs_last_dim=_PLACEHOLDER_V,
+        draft_probs_vocab_size=_PLACEHOLDER_V,
+    )
+    itf.SpecMetadata.write_padding_onehot_draft_probs(meta, list(range(g)), K)
+
+    acc, num = _verify_placeholders(tgt_one, buf, g, trials=16, verify=verify)
+
+    _check_verified_rows(acc, num)
+    assert ((acc[:, 0] == 0) == (num >= 2)).all()
+    p0 = torch.softmax(tgt_one[0].double(), -1).cpu().numpy()
+    p1 = torch.softmax(tgt_one[1].double(), -1).cpu().numpy()
+    accept0 = float((num >= 2).mean())
+    sigma = math.sqrt(_PLACEHOLDER_P0 * (1.0 - _PLACEHOLDER_P0) / len(num))
+    s0, d0, pv0 = _chi2_pvalue(acc[:, 0], p0)
+    s1, d1, pv1 = _chi2_pvalue(acc[num >= 2, 1], p1)
+    print(
+        f"P(accept token 0) = {accept0:.4f} (p(0) = {_PLACEHOLDER_P0}); first token chi2={s0:.1f} "
+        f"dof={d0} p={pv0:.3f}; second chi2={s1:.1f} dof={d1} p={pv1:.3f}"
+    )
+    assert abs(accept0 - _PLACEHOLDER_P0) < 4 * sigma
+    assert pv0 > 1e-3 and pv1 > 1e-3
+
+
+@_VERIFIERS
+@pytest.mark.parametrize("stale", [False, True], ids=["zero_rows", "stale_rows"])
+def test_unwritten_proposal_rows_accept_every_placeholder(stale, verify):
+    """Characterization test of the defect the hand-off fix prevents; it records what the kernel
+    does today with rows nobody wrote and is not a requirement. Without the one-hot write the
+    first verify is not exact: a zero row accepts every placeholder (``u * q < p`` holds for
+    q = 0), and a row left by an earlier occupant of the slot accepts it with probability
+    min(1, p(0) / q(0)), about 1 for a proposal that put little mass on token 0. The exact rate
+    at position 0 is p(0) = 0.25. Block verification takes the limit weight of a token the
+    proposal excludes (q = 0: weight 1 where the target allows it), so a zero row gives it no
+    division by zero and the same outcome: every sub-block accepted, well-formed outputs."""
+    gen = torch.Generator(device=DEV).manual_seed(90210)
+    g = 64
+    tgt_one = _placeholder_target_logits(gen)
+    if stale:
+        old = torch.softmax(torch.randn((g, K, _PLACEHOLDER_V), generator=gen, device=DEV), dim=-1)
+        buf = torch.cat([old, torch.zeros((1, K, _PLACEHOLDER_V), device=DEV)])
+    else:
+        buf = torch.zeros((g + 1, K, _PLACEHOLDER_V), device=DEV)
+
+    acc, num = _verify_placeholders(tgt_one, buf, g, trials=4, verify=verify)
+
+    _check_verified_rows(acc, num)
+    assert float((num >= 2).mean()) > 0.99
+    assert float((num == K + 1).mean()) > 0.99
 
 
 def _independence_pvalue(pairs):
