@@ -325,6 +325,7 @@ set(TLLM_FACADE_COMPONENT_TARGETS
     tllm_common_cuda
     tllm_common_environment
     tllm_common_error
+    tllm_common_fp8
     tllm_common_ip
     tllm_common_logging
     tllm_common_mcast_registry

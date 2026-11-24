@@ -179,8 +179,19 @@ set_target_properties(
   tllm_common_op_utils PROPERTIES CXX_EXTENSIONS OFF POSITION_INDEPENDENT_CODE
                                                      ON)
 
-add_library(common_src OBJECT cudaArchitectures.cpp cudaFp8Utils.cu
-                              sageQuant.cu)
+add_library(tllm_common_fp8 STATIC cudaFp8Utils.cu)
+add_library(tllm::common_fp8 ALIAS tllm_common_fp8)
+target_link_libraries(
+  tllm_common_fp8
+  PUBLIC tllm::common_cuda
+  PRIVATE tllm::common_environment)
+target_compile_features(tllm_common_fp8 PUBLIC cxx_std_20)
+set_target_properties(
+  tllm_common_fp8
+  PROPERTIES CXX_EXTENSIONS OFF POSITION_INDEPENDENT_CODE ON CUDA_STANDARD 20
+             CUDA_STANDARD_REQUIRED ON CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+
+add_library(common_src OBJECT cudaArchitectures.cpp sageQuant.cu)
 
 list(JOIN CMAKE_CUDA_ARCHITECTURES_ORIG "," TRTLLM_BUILT_CUDA_ARCHITECTURES)
 list(JOIN CMAKE_CUDA_ARCHITECTURES_WITH_KERNELS ","
