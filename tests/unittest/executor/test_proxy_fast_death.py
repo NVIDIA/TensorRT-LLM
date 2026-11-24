@@ -587,6 +587,51 @@ def test_exit_pre_shutdown_preserves_explicit_errors(
         assert raised.value is error
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("fatal_cleanup", [False, True])
+def test_monitor_warns_for_incomplete_fatal_cleanup(
+    monkeypatch: pytest.MonkeyPatch, fatal_cleanup: bool
+) -> None:
+    proxy = _bare_proxy()
+    proxy._shutdown_complete = True
+    proxy._fatal_error = None
+    monkeypatch.setattr(proxy, "_check_mpi_workers", lambda: False)
+    monkeypatch.setattr(proxy, "_check_remote_worker_death", lambda: False)
+    monkeypatch.setattr(
+        proxy._shutdown_event, "wait", lambda timeout: setattr(proxy, "doing_shutdown", True)
+    )
+    cleanup = Mock(side_effect=TimeoutError("profile cleanup incomplete"))
+    monkeypatch.setattr(proxy, "_pre_shutdown", cleanup)
+    warning = Mock()
+    debug = Mock()
+    monkeypatch.setattr(proxy_module.logger, "warning", warning)
+    monkeypatch.setattr(proxy_module.logger, "debug", debug)
+    monkeypatch.setattr(proxy_module.logger, "error", Mock())
+    worker_error = RuntimeError("worker failed")
+    if fatal_cleanup:
+        proxy._error_queue.put(worker_error)
+    else:
+        monkeypatch.setattr(
+            proxy, "_drain_error_queue", Mock(side_effect=OSError("poll unavailable"))
+        )
+
+    proxy._error_monitor_loop()
+
+    if fatal_cleanup:
+        assert proxy._fatal_error is worker_error
+        assert not proxy._pre_shutdown_complete
+        cleanup.assert_called_once_with()
+        warning.assert_called_once()
+        assert "shutdown() can retry" in warning.call_args.args[0]
+        assert "profile cleanup incomplete" in warning.call_args.args[0]
+        debug.assert_not_called()
+    else:
+        assert proxy._fatal_error is None
+        cleanup.assert_not_called()
+        warning.assert_not_called()
+        debug.assert_called_once()
+
+
 def test_submit_fast_fails_when_engine_already_dead():
     """submit() must reject new work immediately once the engine is dead."""
     proxy = _bare_proxy()

@@ -680,8 +680,14 @@ class GenerationExecutorProxy(GenerationExecutor):
                 if self._fatal_error is not None:
                     return
             except Exception as exc:
-                logger.debug(f"Error monitor: unexpected exception (ignored): "
-                             f"{exc!r}")
+                if self._fatal_error is not None:
+                    logger.warning(
+                        "Error monitor: failed executor cleanup may be incomplete; "
+                        f"shutdown() can retry: {exc!r}")
+                else:
+                    logger.debug(
+                        f"Error monitor: unexpected exception (ignored): {exc!r}"
+                    )
 
             # Backstop poll only; the latency-sensitive propagation path is
             # event-driven (see _handle_worker_death), so a coarse interval is
@@ -916,7 +922,12 @@ class GenerationExecutorProxy(GenerationExecutor):
             )
 
     def _close_profile_control(self) -> None:
-        """Drain admitted calls, then interrupt them at the shutdown deadline."""
+        """Drain live-engine calls for the profile grace, then cancel and unwind.
+
+        This grace also caps healthy calls independently of their normal ACK
+        deadlines. Cancellation can end a local wait before the worker finishes
+        flushing its trace; it does not imply a successful profile ACK.
+        """
         executor = getattr(self, "_profile_control_executor", None)
         if executor is None:
             return
@@ -949,16 +960,11 @@ class GenerationExecutorProxy(GenerationExecutor):
                                 timeout: float) -> None:
         """Dispatch a profile-control request onto the owning thread.
 
-        ``shutdown()`` drains and clears ``_profile_control_executor``, so a
-        request arriving during or after teardown would otherwise fail with
-        ``AttributeError`` on ``None``. Raise ``RuntimeError`` instead — the
-        HTTP handlers already map it to a controlled response.
-
-        ``pre_shutdown()`` flips ``doing_shutdown`` and sends the quit
-        sentinel to the workers well before ``shutdown()`` clears the
-        executor, so check that first: a request submitted in that window
-        would otherwise block for the whole ack timeout waiting on workers
-        that are already exiting.
+        ``pre_shutdown()`` closes admission before draining and clearing
+        ``_profile_control_executor``. Reject new calls during or after teardown
+        with ``RuntimeError`` instead of submitting work to a closing pool or
+        dereferencing ``None``. The HTTP handlers map this to a controlled
+        response.
         """
         with self._admission_lock:
             executor = self._profile_control_executor
@@ -1355,6 +1361,9 @@ class GenerationExecutorProxy(GenerationExecutor):
         for result in list(self._results.values()):
             result.abort()
 
+    # Local profile-close grace, including for a healthy engine. Normal ACK
+    # budgets do not extend this grace; cancellation and a separate unwind
+    # interval follow it.
     _PROFILE_SHUTDOWN_TIMEOUT_S = 5.0
     _REQUEST_SHUTDOWN_TIMEOUT_S = 5.0
 
