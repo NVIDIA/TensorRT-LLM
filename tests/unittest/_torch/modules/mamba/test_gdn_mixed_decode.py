@@ -214,20 +214,23 @@ def test_mixed_decode_matches_decode_only(
 
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("preallocated", [False, True])
+@pytest.mark.parametrize("fused_conv", [False, True])
 def test_mixed_decode_keeps_periodic_prefill_snapshots(
     state_dtype: torch.dtype,
     preallocated: bool,
+    fused_conv: bool,
     request: pytest.FixtureRequest,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A prefill can publish intermediate states while unrelated requests decode."""
     monkeypatch.setenv("TLLM_USE_FLASHINFER_GDN_PREFILL", "1")
-    monkeypatch.setenv("FORCE_DETERMINISTIC", "1")
+    monkeypatch.setenv("FORCE_DETERMINISTIC", "0" if fused_conv else "1")
     if not gdn_mixer._use_flashinfer_gdn_prefill():
         pytest.skip("FlashInfer GDN prefill is unavailable on this GPU")
     gdn_mixer._resolve_chunk_gated_delta_rule.cache_clear()
     request.addfinalizer(gdn_mixer._resolve_chunk_gated_delta_rule.cache_clear)
     monkeypatch.setattr(gdn_mixer, "_gdn_prefill_use_cp", lambda _tokens: "auto")
+    monkeypatch.setattr(Qwen3NextGatedDeltaNet, "_fused_conv_post_conv", fused_conv)
 
     torch.manual_seed(2743)
     layer = _make_layer()
@@ -297,7 +300,11 @@ def test_mixed_decode_keeps_periodic_prefill_snapshots(
     # Warm the kernel before comparing live requests and independently run prefixes.
     run(length, 0)
     expected_output, expected_conv, expected_state = run(length, num_decodes)
-    actual_output, actual_conv, actual_state = run(length, num_decodes, with_snapshots=True)
+    with patch.object(
+        gdn_mixer, "fused_gdn_conv_post_conv", wraps=gdn_mixer.fused_gdn_conv_post_conv
+    ) as fused_call:
+        actual_output, actual_conv, actual_state = run(length, num_decodes, with_snapshots=True)
+    assert fused_call.called is fused_conv
     torch.testing.assert_close(
         actual_output[:, length:], expected_output[:, length:], rtol=0, atol=0
     )

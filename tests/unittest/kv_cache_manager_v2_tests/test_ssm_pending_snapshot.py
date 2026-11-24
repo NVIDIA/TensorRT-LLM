@@ -27,6 +27,7 @@ import itertools
 import os
 import sys
 import unittest
+from contextlib import ExitStack
 from importlib.util import find_spec
 from typing import TYPE_CHECKING, cast
 from unittest.mock import patch
@@ -335,20 +336,19 @@ class TestPendingSsmSnapshot(unittest.TestCase):
 
     def test_multiple_pending_snapshot_allocation_rolls_back_when_full(self) -> None:
         self._setup(gpu_quota=1 << 20, max_util_for_resume=1.0)
-        kv_cache = self.manager.create_kv_cache()
-        self.assertTrue(kv_cache.resume(self.stream))
-        fillers = []
-        while self._ssm_free_slots() > 1:
-            filler = self.manager.create_kv_cache()
-            self.assertTrue(filler.resume(self.stream))
-            fillers.append(filler)
-        self.assertEqual(self._ssm_free_slots(), 1)
-        self.assertEqual(kv_cache.acquire_ssm_snapshot_slots(2), [])
-        self.assertEqual(self._ssm_free_slots(), 1)
-        self.assertIsNone(kv_cache.pending_ssm_snapshot_slot)
-        kv_cache.close()
-        for filler in fillers:
-            filler.close()
+        with ExitStack() as cleanup:
+            kv_cache = self.manager.create_kv_cache()
+            cleanup.callback(kv_cache.close)
+            self.assertTrue(kv_cache.resume(self.stream))
+            while (free_before := self._ssm_free_slots()) > 1:
+                filler = self.manager.create_kv_cache()
+                cleanup.callback(filler.close)
+                self.assertTrue(filler.resume(self.stream))
+                self.assertLess(self._ssm_free_slots(), free_before)
+            self.assertEqual(self._ssm_free_slots(), 1)
+            self.assertEqual(kv_cache.acquire_ssm_snapshot_slots(2), [])
+            self.assertEqual(self._ssm_free_slots(), 1)
+            self.assertIsNone(kv_cache.pending_ssm_snapshot_slot)
 
     def test_multiple_pending_snapshots_release_on_suspend(self) -> None:
         self._setup()
@@ -520,23 +520,23 @@ class TestPendingSsmSnapshot(unittest.TestCase):
     def test_acquire_without_free_page_returns_none(self) -> None:
         # Resume never refuses for utilization, so the SSM pool can be filled to the last page.
         self._setup(max_util_for_resume=1.0)
-        kv_cache = self.manager.create_kv_cache()
-        self.assertTrue(kv_cache.resume(self.stream))
-        # Each empty active cache holds exactly one live SSM page and nothing is committed, so
-        # once they take every free SSM page there is nothing left to allocate or evict.
-        fillers = []
-        while self._ssm_free_slots() > 0:
-            filler = self.manager.create_kv_cache()
-            self.assertTrue(filler.resume(self.stream))
-            fillers.append(filler)
-        self.assertIsNone(kv_cache.acquire_ssm_snapshot_slot())
-        self.assertIsNone(kv_cache.pending_ssm_snapshot_slot)
-        fillers.pop().close()
-        self.assertIsNotNone(kv_cache.acquire_ssm_snapshot_slot())
-        self.assertEqual(self._ssm_free_slots(), 0)
-        kv_cache.close()
-        for filler in fillers:
-            filler.close()
+        with ExitStack() as cleanup:
+            kv_cache = self.manager.create_kv_cache()
+            cleanup.callback(kv_cache.close)
+            self.assertTrue(kv_cache.resume(self.stream))
+            # An active empty cache owns a live SSM page and has no evictable snapshot.
+            fillers = []
+            while (free_before := self._ssm_free_slots()) > 0:
+                filler = self.manager.create_kv_cache()
+                cleanup.callback(filler.close)
+                self.assertTrue(filler.resume(self.stream))
+                self.assertLess(self._ssm_free_slots(), free_before)
+                fillers.append(filler)
+            self.assertIsNone(kv_cache.acquire_ssm_snapshot_slot())
+            self.assertIsNone(kv_cache.pending_ssm_snapshot_slot)
+            fillers[-1].close()
+            self.assertIsNotNone(kv_cache.acquire_ssm_snapshot_slot())
+            self.assertEqual(self._ssm_free_slots(), 0)
 
 
 if __name__ == "__main__":

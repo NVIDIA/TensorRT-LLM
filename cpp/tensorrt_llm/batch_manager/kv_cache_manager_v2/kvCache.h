@@ -835,7 +835,8 @@ private:
     void _dropPendingSsmSnapshot();
     void _dropPendingSsmSnapshots();
     std::vector<int> _acquireSsmSnapshotSlots(int count, bool allowEviction);
-    bool _resize(std::optional<int> capacity, std::optional<int> historyLength, bool allowEviction);
+    bool _resize(std::optional<int> capacity, std::optional<int> historyLength, bool allowEviction,
+        bool completeOptionalRecovery);
 
     // Re-attach committed tree blocks of ours that the tail-prune walk detached while we
     // still referenced them (triggered by evicting an unheld SSM snapshot). Relinks the

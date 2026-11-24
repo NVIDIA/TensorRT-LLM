@@ -111,3 +111,71 @@ def test_prefill_checkpoints_store_states_for_each_reusable_prefix(state_dtype):
             conv[slots[row]], mixed_qkv[point - width : point].T, rtol=0, atol=0
         )
     assert torch.equal(ssm[0], live_before)
+
+
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("use_cp", ["auto", True, False])
+@pytest.mark.skipif(
+    torch.cuda.is_available() and not is_flashinfer_gdn_prefill_supported_arch(),
+    reason="FlashInfer GDN prefill requires SM90, SM100/SM103/SM107 or SM120/SM121",
+)
+def test_prefill_suffix_from_saved_snapshot_matches_cold_scan(state_dtype, use_cp):
+    """A stored checkpoint can resume the same suffix as a cold GDN scan."""
+    from tensorrt_llm._torch.modules.fla.flashinfer_chunk import chunk_gated_delta_rule
+
+    torch.manual_seed(743)
+    tokens, heads, dim, interval, width = 256, 2, 128, 64, 3
+    q = torch.nn.functional.normalize(
+        torch.randn(1, tokens, heads, dim, device="cuda"), dim=-1
+    ).bfloat16()
+    k = torch.nn.functional.normalize(
+        torch.randn(1, tokens, heads, dim, device="cuda"), dim=-1
+    ).bfloat16()
+    v = (torch.randn(1, tokens, heads, dim, device="cuda") * 0.1).bfloat16()
+    g = -0.05 * torch.rand(1, tokens, heads, device="cuda")
+    beta = torch.rand(1, tokens, heads, device="cuda")
+    states = (0.01 * torch.randn(8, heads, dim, dim, device="cuda")).to(state_dtype)
+    conv = torch.randn(8, 16, width, device="cuda", dtype=torch.bfloat16)
+    mixed_qkv = torch.randn(tokens, 16, device="cuda", dtype=torch.bfloat16)
+    points, slot_ids = [64, 128, 192], [5, 2, 7]
+    slots = torch.tensor(slot_ids, device="cuda", dtype=torch.int32)
+    indices = torch.tensor(
+        [i for point in points for i in range(point - width, point)],
+        device="cuda",
+        dtype=torch.int64,
+    )
+    checkpoints = torch.empty(4, heads, dim, dim, device="cuda", dtype=torch.float32)
+    cold_output, cold_final = chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state=states[:1],
+        output_final_state=True,
+        cu_seqlens=torch.tensor([0, tokens], device="cuda", dtype=torch.int32),
+        use_cp=use_cp,
+        state_checkpoints=checkpoints,
+        checkpoint_cu_starts=torch.tensor([0, 4], device="cuda", dtype=torch.int32),
+        checkpoint_every_n_tokens=interval,
+    )
+    windows = gather_conv_snapshot_windows(mixed_qkv, indices, len(points), width)
+    store_gdn_snapshots(states, conv, checkpoints[: len(points)], windows, slots)
+
+    # Use the same GDN output/state tolerance as the existing prefix comparison.
+    tol = dict(rtol=1.6e-2, atol=1e-3)
+    for point, slot in zip(points, slot_ids):
+        resumed_output, resumed_final = chunk_gated_delta_rule(
+            q[:, point:],
+            k[:, point:],
+            v[:, point:],
+            g[:, point:],
+            beta[:, point:],
+            initial_state=states[slot : slot + 1],
+            output_final_state=True,
+            cu_seqlens=torch.tensor([0, tokens - point], device="cuda", dtype=torch.int32),
+            use_cp=use_cp,
+        )
+        torch.testing.assert_close(resumed_output, cold_output[:, point:], **tol)
+        torch.testing.assert_close(resumed_final, cold_final, **tol)
+        torch.testing.assert_close(conv[slot], mixed_qkv[point - width : point].T, rtol=0, atol=0)

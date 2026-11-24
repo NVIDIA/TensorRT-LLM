@@ -1,12 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from tensorrt_llm._torch.modules.mamba.gdn_multi_snapshot import gather_conv_snapshot_windows
+from tensorrt_llm._torch.modules.mamba.mamba2_mixer import Mamba2Mixer
 from tensorrt_llm._torch.modules.mamba.mamba_multi_snapshot import store_mamba_snapshots
 from tensorrt_llm._torch.modules.mamba.ssd_state_passing import _state_passing_fwd
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.multi_snapshot import (
+    PeriodicSnapshotBatch,
+)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
@@ -96,3 +102,82 @@ def test_ssd_prefill_checkpoints_match_separate_prefix_prefills(state_dtype):
     for row, point in enumerate((128, 256, 384)):
         expected = scan(point)
         torch.testing.assert_close(checkpoints[row], expected[0], rtol=1e-2, atol=2e-3)
+
+
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_mamba_mixer_saves_selected_prefix_states(state_dtype):
+    """The mixer saves nonadjacent checkpoints in the requested cache slots."""
+    torch.manual_seed(916)
+    tokens, heads, head_dim, d_state, groups, chunk = 512, 2, 32, 32, 1, 128
+    inner, conv_dim, width = heads * head_dim, heads * head_dim + 2 * groups * d_state, 3
+    projected = (0.1 * torch.randn(tokens, inner + conv_dim + heads, device="cuda")).bfloat16()
+    initial_conv = (0.1 * torch.randn(8, conv_dim, width, device="cuda")).bfloat16()
+    initial_ssm = (0.01 * torch.randn(8, heads, head_dim, d_state, device="cuda")).to(state_dtype)
+    mixer = SimpleNamespace(
+        layer_idx=0,
+        tp_d_inner=inner,
+        tp_conv_dim=conv_dim,
+        tp_ngroups=groups,
+        tp_nheads=heads,
+        head_dim=head_dim,
+        d_state=d_state,
+        chunk_size=chunk,
+        _token_major_conv=True,
+        _mamba_ssm_cache_dtype=state_dtype,
+        delta_softplus=True,
+        A=-torch.rand(heads, device="cuda") - 1,
+        D=torch.rand(heads, device="cuda"),
+        dt_bias=torch.rand(heads, device="cuda"),
+        conv1d=SimpleNamespace(
+            weight=(0.1 * torch.randn(conv_dim, width + 1, device="cuda")).bfloat16(),
+            bias=(0.1 * torch.randn(conv_dim, device="cuda")).bfloat16(),
+        ),
+    )
+    points, pending_slots = [128, 384], [5, 2]
+    snapshot = PeriodicSnapshotBatch(
+        interval=chunk,
+        checkpoint_count=4,
+        checkpoint_cu_starts=torch.tensor([0, 4], device="cuda"),
+        checkpoint_rows=torch.tensor([0, 2], device="cuda"),
+        positions=torch.tensor(points, device="cuda"),
+        conv_indices=torch.tensor(
+            [i for point in points for i in range(point - width, point)], device="cuda"
+        ),
+        slots=torch.tensor(pending_slots, device="cuda"),
+    )
+
+    def run(length, periodic=None):
+        conv, ssm = initial_conv.clone(), initial_ssm.clone()
+        metadata = SimpleNamespace(
+            state_indices=torch.tensor([0], device="cuda", dtype=torch.int32),
+            cu_seqlens=torch.tensor([0, length], device="cuda", dtype=torch.int32),
+            seq_idx=torch.zeros(1, length, device="cuda", dtype=torch.int32),
+            has_initial_states=torch.ones(1, device="cuda", dtype=torch.bool),
+            use_initial_states=True,
+            chunk_indices=torch.arange(length // chunk, device="cuda", dtype=torch.int32),
+            chunk_offsets=torch.zeros(length // chunk, device="cuda", dtype=torch.int32),
+            periodic_snapshot=periodic,
+        )
+        layer_cache = SimpleNamespace(conv=conv, temporal=ssm)
+        attention = SimpleNamespace(
+            num_contexts=1,
+            seq_lens=torch.tensor([length], device="cuda"),
+            num_ctx_tokens=length,
+            num_tokens=length,
+            kv_cache_manager=SimpleNamespace(mamba_layer_cache=lambda _: layer_cache),
+        )
+        output = torch.empty(length, inner, device="cuda", dtype=torch.bfloat16)
+        Mamba2Mixer.forward_core(
+            mixer, projected[:length].clone(), attention, metadata, None, output
+        )
+        return output, conv, ssm
+
+    expected_output, expected_conv, expected_ssm = run(tokens)
+    actual_output, actual_conv, actual_ssm = run(tokens, snapshot)
+    torch.testing.assert_close(actual_output, expected_output, rtol=1e-2, atol=2e-3)
+    torch.testing.assert_close(actual_conv[0], expected_conv[0], rtol=0, atol=0)
+    torch.testing.assert_close(actual_ssm[0], expected_ssm[0], rtol=1e-2, atol=2e-3)
+    for point, slot in zip(points, pending_slots):
+        _, prefix_conv, prefix_ssm = run(point)
+        torch.testing.assert_close(actual_conv[slot], prefix_conv[0], rtol=0, atol=0)
+        torch.testing.assert_close(actual_ssm[slot], prefix_ssm[0], rtol=1e-2, atol=2e-3)

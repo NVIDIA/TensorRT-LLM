@@ -1771,15 +1771,16 @@ void KvCache::_snapshotPartialBlockToTree(BlockOrdinal ordinal, bool commitSsm, 
 
 bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLength, bool completeOptionalRecovery)
 {
-    return _resize(capacity, historyLength, true);
+    return _resize(capacity, historyLength, /*allowEviction=*/true, completeOptionalRecovery);
 }
 
 bool KvCache::tryResizeCapacityWithoutEviction(int capacity)
 {
-    return _resize(capacity, std::nullopt, false);
+    return _resize(capacity, std::nullopt, /*allowEviction=*/false, /*completeOptionalRecovery=*/false);
 }
 
-bool KvCache::_resize(std::optional<int> capacity, std::optional<int> historyLength, bool allowEviction)
+bool KvCache::_resize(
+    std::optional<int> capacity, std::optional<int> historyLength, bool allowEviction, bool completeOptionalRecovery)
 {
     KVCM2_API_GUARD();
     auto const lock = mManager->lockExclusive();

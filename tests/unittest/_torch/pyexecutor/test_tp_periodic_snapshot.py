@@ -65,6 +65,12 @@ class _Context:
         return self.context_current_position + self.context_chunk_size == self.prompt_len
 
 
+class _CompletionMismatchContext(_Context):
+    @property
+    def is_last_context_chunk(self):
+        return True
+
+
 class _CommitMetadataErrorContext(_Context):
     @property
     def context_chunk_size(self):
@@ -282,9 +288,7 @@ def test_different_pause_decisions_fail_together_before_forward():
 
 @pytest.mark.cpu_only
 def test_different_context_completion_fails_together_before_forward():
-    requests = [_Context(), _Context()]
-    requests[1].prompt_len = 256
-    requests[1].context_remaining_length = 256
+    requests = [_Context(), _CompletionMismatchContext()]
     batches = [ScheduledRequests(), ScheduledRequests()]
     managers = [_Manager(), _Manager()]
     for batch, request in zip(batches, requests):
@@ -391,6 +395,8 @@ def _gloo_rank(rank, rendezvous, ready, results):
             "success",
             "reservation_failure",
             "reservation_error",
+            "resize_after_growth_error",
+            "partial_resize_error",
             "rollback_error",
             "rollback_false",
             "release_error",
@@ -405,15 +411,13 @@ def _gloo_rank(rank, rendezvous, ready, results):
             "different_pause",
             "different_completion",
         ):
-            request = (
-                _CommitMetadataErrorContext()
-                if rank == 1 and scenario == "commit_metadata_error"
-                else _Context()
-            )
+            if rank == 1 and scenario == "commit_metadata_error":
+                request = _CommitMetadataErrorContext()
+            elif rank == 1 and scenario == "different_completion":
+                request = _CompletionMismatchContext()
+            else:
+                request = _Context()
             batch = ScheduledRequests()
-            if scenario == "different_completion" and rank == 1:
-                request.prompt_len = 256
-                request.context_remaining_length = 256
             if scenario != "different_baseline" or rank == 0:
                 batch.append_context_request(request)
             if scenario == "different_pause" and rank == 1:
@@ -426,6 +430,23 @@ def _gloo_rank(rank, rendezvous, ready, results):
                 ),
                 reservation_error=scenario == "reservation_error" and rank == 1,
             )
+            if rank == 1 and scenario == "resize_after_growth_error":
+                cache = manager.kv_cache_map[9]
+                resize = cache.try_resize_capacity_without_eviction
+
+                def fail_after_growth(capacity):
+                    assert resize(capacity)
+                    raise RuntimeError("injected resize_after_growth_error")
+
+                cache.try_resize_capacity_without_eviction = fail_after_growth
+            if rank == 1 and scenario == "partial_resize_error":
+                cache = manager.kv_cache_map[9]
+
+                def fail_after_partial_growth(capacity):
+                    cache.partial_page_count = capacity // 64
+                    raise RuntimeError("injected partial_resize_error")
+
+                cache.try_resize_capacity_without_eviction = fail_after_partial_growth
             if rank == 0 and scenario in ("rollback_error", "rollback_false"):
                 cache = manager.kv_cache_map[9]
                 resize = cache.try_resize_capacity_without_eviction
@@ -485,6 +506,8 @@ def _gloo_rank(rank, rendezvous, ready, results):
                     finish_periodic_snapshots_tp(batch, manager, GlooDist())
             except RuntimeError as exc:
                 error = str(exc)
+            if rank == 1 and scenario == "partial_resize_error":
+                assert manager.kv_cache_map[9].partial_page_count == 16
             observations.append(
                 (
                     scenario,
@@ -551,6 +574,10 @@ def _gloo_rank(rank, rendezvous, ready, results):
 
 
 @pytest.mark.cpu_only
+@pytest.mark.skipif(
+    not torch.distributed.is_available() or not torch.distributed.is_gloo_available(),
+    reason="requires the Gloo distributed backend",
+)
 def test_two_process_gloo_agreement_and_failure_paths(tmp_path):
     """Each case uses two real processes and matching collectives, bounded by the process-group timeout."""
     ctx = multiprocessing.get_context("spawn")
@@ -574,7 +601,11 @@ def test_two_process_gloo_agreement_and_failure_paths(tmp_path):
         for worker in workers:
             if worker.is_alive():
                 worker.terminate()
-                worker.join()
+                worker.join(timeout=5)
+                if worker.is_alive():
+                    worker.kill()
+                    worker.join(timeout=5)
+                assert not worker.is_alive(), "Gloo worker did not exit after termination"
         results.close()
 
     assert set(observations) == {0, 1}
@@ -583,6 +614,8 @@ def test_two_process_gloo_agreement_and_failure_paths(tmp_path):
             success,
             failed,
             error,
+            resize_after_growth_error,
+            partial_resize_error,
             rollback_error,
             rollback_false,
             release_error,
@@ -606,6 +639,15 @@ def test_two_process_gloo_agreement_and_failure_paths(tmp_path):
         assert failed == ("reservation_failure", 256, 256, None, None)
         assert error[:4] == ("reservation_error", 256, 256, None)
         assert "injected reservation error" in error[4]
+        assert resize_after_growth_error[:4] == (
+            "resize_after_growth_error",
+            256,
+            256 if rank == 0 else 1024,
+            None,
+        )
+        assert "injected resize_after_growth_error" in resize_after_growth_error[4]
+        assert partial_resize_error[:4] == ("partial_resize_error", 256, 256, None)
+        assert "injected partial_resize_error" in partial_resize_error[4]
         for label, observation in (
             ("rollback_error", rollback_error),
             ("rollback_false", rollback_false),
@@ -700,6 +742,17 @@ def _native_collective_rank(rank, rendezvous, ready, results, backend):
             if self.fail_commit_fill:
                 raise RuntimeError("injected native commit fill error")
 
+    class FailAfterNativeGrowth:
+        def __init__(self, cache):
+            self.cache = cache
+
+        def __getattr__(self, name):
+            return getattr(self.cache, name)
+
+        def try_resize_capacity_without_eviction(self, capacity):
+            assert self.cache.try_resize_capacity_without_eviction(capacity)
+            raise RuntimeError("injected error after native growth")
+
     ready.wait()
     torch.cuda.set_device(rank if backend == "nccl" else 0)
     distributed.init_process_group(
@@ -736,6 +789,7 @@ def _native_collective_rank(rank, rendezvous, ready, results, backend):
             "success",
             "reservation_failure",
             "capacity_failure",
+            "resize_after_growth_error",
             "finish_failure",
             "commit_failure",
         ):
@@ -763,6 +817,8 @@ def _native_collective_rank(rank, rendezvous, ready, results, backend):
             batch.append_context_request(request)
             dist = TorchDist()
             manager.fail_commit_fill = scenario == "commit_failure" and rank == 1
+            if scenario == "resize_after_growth_error" and rank == 1:
+                manager.kv_cache_map[9] = FailAfterNativeGrowth(cache)
             error = None
             try:
                 coordinate_periodic_snapshot(
@@ -802,7 +858,9 @@ def _native_collective_rank(rank, rendezvous, ready, results, backend):
                 assert cache.pending_ssm_snapshot_slot is None
                 assert cache.history_length == history_before
                 assert native.get_storage_statistics()[group].free == available_before
-                if scenario not in ("commit_failure", "finish_failure"):
+                if scenario not in ("commit_failure", "finish_failure") and not (
+                    scenario == "resize_after_growth_error" and rank == 1
+                ):
                     assert native.get_storage_statistics()[attention_group].free == attention_before
             if plan is not None:
                 manager.release_periodic_snapshots(request)
@@ -811,6 +869,11 @@ def _native_collective_rank(rank, rendezvous, ready, results, backend):
                 # The production executor terminates the rank group; this test
                 # resets its isolated cache only to exercise the next case.
                 assert cache.try_resize_capacity_without_eviction(256)
+            if scenario == "resize_after_growth_error" and rank == 1:
+                # Production terminates the group; reset this isolated cache
+                # only so subsequent test scenarios start from the baseline.
+                assert cache.try_resize_capacity_without_eviction(256)
+                manager.kv_cache_map[9] = cache
             if scenario == "success":
                 assert native.get_storage_statistics()[group].free == free_before
             if filler is not None:
@@ -853,12 +916,18 @@ def _run_two_process_native_cache_reservation(tmp_path, backend):
         for worker in workers:
             if worker.is_alive():
                 worker.terminate()
-                worker.join()
+                worker.join(timeout=5)
+                if worker.is_alive():
+                    worker.kill()
+                    worker.join(timeout=5)
+                assert not worker.is_alive(), "native-cache worker did not exit after termination"
         results.close()
 
     assert set(observations) == {0, 1}
     for rank in (0, 1):
-        success, failure, capacity_failure, finish_failure, commit_failure = observations[rank]
+        success, failure, capacity_failure, growth_error, finish_failure, commit_failure = (
+            observations[rank]
+        )
         assert success[:4] == ("success", 1024, 1024, (1024, (256, 512, 768), 3))
         assert failure[:4] == ("reservation_failure", 256, 256, None)
         assert success[5] is True
@@ -868,6 +937,15 @@ def _run_two_process_native_cache_reservation(tmp_path, backend):
         assert capacity_failure[:4] == ("capacity_failure", 256, 256, None)
         assert capacity_failure[5] is True
         assert capacity_failure[6] == ([(1, 0), (0,)] if rank == 0 else [(0, 0), (0,)])
+        assert growth_error[:4] == (
+            "resize_after_growth_error",
+            256,
+            256 if rank == 0 else 1024,
+            None,
+        )
+        assert growth_error[5] is True
+        assert growth_error[6] == ([(1, 0), (0,)] if rank == 0 else [(0, 1), (0,)])
+        assert "injected error after native growth" in growth_error[7]
         assert commit_failure[0] == "commit_failure"
         assert commit_failure[3] is None
         assert commit_failure[5] is True
@@ -882,13 +960,23 @@ def _run_two_process_native_cache_reservation(tmp_path, backend):
             assert failure[4] == 2
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or not torch.distributed.is_available()
+    or not torch.distributed.is_gloo_available(),
+    reason="requires a CUDA device and the Gloo distributed backend",
+)
 def test_two_process_native_cache_reservation_with_gloo(tmp_path):
     """Two processes share one GPU; each owns real cache pools and a Gloo rank."""
     _run_two_process_native_cache_reservation(tmp_path, "gloo")
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
+@pytest.mark.skipif(
+    torch.cuda.device_count() < 2
+    or not torch.distributed.is_available()
+    or not torch.distributed.is_nccl_available(),
+    reason="requires two CUDA devices and the NCCL distributed backend",
+)
 def test_two_gpu_native_cache_reservation_with_nccl(tmp_path):
     """Two GPUs agree on native reservations and a one-rank resource failure."""
     _run_two_process_native_cache_reservation(tmp_path, "nccl")
@@ -1050,7 +1138,7 @@ def test_periodic_tp_propagates_fatal_prefetch_errors(
 ):
     executor = object.__new__(PyExecutor)
     executor._periodic_snapshot_tp_used = periodic_tp_used
-    executor.model_engine = SimpleNamespace(model=object())
+    executor.model_engine = SimpleNamespace(model=MultimodalModelMixin())
     executor.previous_batch = None
     executor.active_requests = [
         SimpleNamespace(state=executor_module.LlmRequestState.CONTEXT_INIT, py_request_id=9)
@@ -1073,11 +1161,8 @@ def test_periodic_tp_propagates_fatal_prefetch_errors(
         error.__suppress_context__ = suppress_context
     log = Mock()
     monkeypatch.setattr(executor_module, "logger", log)
-    monkeypatch.setattr(
-        executor_module,
-        "maybe_prefetch_mm_encoder_for_next_iter",
-        Mock(side_effect=error),
-    )
+    prefetch = Mock(side_effect=error)
+    monkeypatch.setattr(executor_module, "maybe_prefetch_mm_encoder_for_next_iter", prefetch)
     batch = ScheduledRequests()
     if raises:
         with pytest.raises(RuntimeError) as caught:
@@ -1087,6 +1172,7 @@ def test_periodic_tp_propagates_fatal_prefetch_errors(
             assert prior_message in str(log.error.call_args)
     else:
         executor._maybe_prefetch_next_iter_mm_encoders(batch)
+    prefetch.assert_called_once()
 
 
 @pytest.mark.cpu_only

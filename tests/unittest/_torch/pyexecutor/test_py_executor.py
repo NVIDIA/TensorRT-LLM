@@ -1095,19 +1095,27 @@ def test_periodic_snapshot_commit_waits_for_input_copy(has_plan: bool, tp: bool)
     )
     executor._wait_for_model_engine_input_copy = Mock(side_effect=lambda: events.append("wait"))
     with (
-        patch("torch.cuda.current_stream", return_value=Mock()),
-        patch("torch.cuda.stream", return_value=nullcontext()),
+        patch(
+            "tensorrt_llm._torch.pyexecutor.py_executor.current_cuda_stream", return_value=Mock()
+        ),
+        patch(
+            "tensorrt_llm._torch.pyexecutor.py_executor.CudaStreamScope", return_value=nullcontext()
+        ),
         patch("tensorrt_llm._torch.pyexecutor.py_executor.ExpertStatistic.set_iter"),
         patch(
             "tensorrt_llm._torch.pyexecutor.py_executor.finish_periodic_snapshots_tp",
             side_effect=lambda requests, manager, _dist: manager.finish_periodic_snapshots(
                 requests
             ),
-        ),
+        ) as finish_tp,
     ):
         PyExecutor._forward_step(executor, batch)
 
     assert events == (["forward", "wait", "commit"] if has_plan else ["forward", "commit"])
+    if tp:
+        finish_tp.assert_called_once_with(batch, executor.kv_cache_manager, executor.dist)
+    else:
+        finish_tp.assert_not_called()
     executor._handle_errors.assert_not_called()
 
 

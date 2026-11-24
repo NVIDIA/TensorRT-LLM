@@ -297,6 +297,7 @@ l0_b200:
   - unittest/_torch/moe/test_draft_experts_nvfp4.py
   - unittest/_torch/modules/mamba
   - unittest/_torch/modules/qwen4_exp/test_ple_snapshot.py
+  - unittest/_torch/modules/test_qwen4_exp_ple.py::test_ple_periodic_snapshots_resume_prefill_suffix
   - unittest/_torch/modules/tests_lora_modules
   # DWDP expert prefetch on real streams and copies; the peer-GPU gather
   # cases skip below 2 GPUs.

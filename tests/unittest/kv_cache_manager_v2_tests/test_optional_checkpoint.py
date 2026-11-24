@@ -189,6 +189,11 @@ def test_reuse_status_and_optional_selection_bindings(
         assert reader.resume(stream.cuda_stream)
         if checkpoint_endpoint is not None:
             assert reader.get_base_page_indices(encoder)[0] == restored_page
+            # A tentative no-eviction expansion and rollback must preserve recovery.
+            assert reader.try_resize_capacity_without_eviction(12)
+            assert reader.get_base_page_indices(encoder)[0] == restored_page
+            assert reader.try_resize_capacity_without_eviction(8)
+            assert reader.get_base_page_indices(encoder)[0] == restored_page
             assert reader.resize(12)
             # Reserving/rolling back capacity cannot retire uncomputed history.
             assert reader.resize(8, 8)

@@ -235,6 +235,7 @@ class Qwen4ExpHybridCacheManager(InforwardSnapshotHost, MambaHybridCacheManagerV
             for buffers in self._inforward_stage_ple.values()
             for tensor in buffers
         )
+
     # The parent opts in because its draft pool is attention-only. QSA's is
     # not: each draft layer adds a Role.INDEX_KEY buffer and a
     # QSA_INDEX_POSITION page, unvalidated for cross-request reuse.

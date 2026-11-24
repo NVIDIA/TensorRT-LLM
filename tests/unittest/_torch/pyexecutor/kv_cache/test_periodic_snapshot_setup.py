@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.modules.fla import inforward_snapshot
+from tensorrt_llm._torch.modules.mamba.cache_manager import NemotronHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
     mamba_cache_manager_v2 as module,
 )
@@ -143,6 +144,26 @@ def test_disaggregated_or_connector_execution_keeps_existing_chunking(
 
     assert manager.periodic_snapshot_capacity == 0
     allocate.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "layout,fi_ssd,stochastic_rounding,expected",
+    [
+        ("x_b_c", "0", False, True),
+        ("q_k_v", "0", False, False),
+        ("x_b_c", "1", False, False),
+        ("x_b_c", "0", True, False),
+    ],
+)
+def test_nemotron_periodic_snapshot_kernel_compatibility(
+    monkeypatch, layout, fi_ssd, stochastic_rounding, expected
+):
+    monkeypatch.setenv("TRTLLM_USE_MAMBA_FI_SSD", fi_ssd)
+    manager = object.__new__(NemotronHybridCacheManager)
+    manager._state_layout = SimpleNamespace(conv_state_layout=layout)
+    manager._mamba_ssm_stochastic_rounding = stochastic_rounding
+
+    assert manager._periodic_snapshot_compatible() is expected
 
 
 @pytest.mark.parametrize("cleanup_fails", [False, True])
