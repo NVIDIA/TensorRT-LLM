@@ -230,6 +230,52 @@ classes:
     kind: pydantic
     members: {}
     status: null
+  tensorrt_llm.visual_gen.args.BatchingConfig:
+    bases:
+    - tensorrt_llm.llmapi.utils.StrictBaseModel
+    computed_fields: {}
+    config:
+      extra: forbid
+    fields:
+      max_batch_size:
+        alias: null
+        annotation: builtins.int
+        default: 1
+        discriminator: null
+        frozen: null
+        metadata:
+        - fields:
+            ge: 1
+          type: annotated_types.Ge
+        required: false
+        serialization_alias: null
+        status: prototype
+        validate_default: null
+        validation_alias: null
+      max_queue_delay_ms:
+        alias: null
+        annotation: builtins.float
+        default: 0.0
+        discriminator: null
+        frozen: null
+        metadata:
+        - fields:
+            ge: 0
+          type: annotated_types.Ge
+        - fields:
+            le: 2147483647
+          type: annotated_types.Le
+        - fields:
+            allow_inf_nan: false
+          type: pydantic._internal._fields._general_metadata_cls.<locals>._PydanticGeneralMetadata
+        required: false
+        serialization_alias: null
+        status: prototype
+        validate_default: null
+        validation_alias: null
+    kind: pydantic
+    members: {}
+    status: null
   tensorrt_llm.visual_gen.args.CacheDiTConfig:
     bases:
     - tensorrt_llm.visual_gen.args.BaseCacheConfig
@@ -639,6 +685,21 @@ classes:
         status: prototype
         validate_default: null
         validation_alias: null
+      text_encoder_tp_size:
+        alias: null
+        annotation: builtins.int
+        default: 1
+        discriminator: null
+        frozen: null
+        metadata:
+        - fields:
+            ge: 1
+          type: annotated_types.Ge
+        required: false
+        serialization_alias: null
+        status: prototype
+        validate_default: null
+        validation_alias: null
       tp_layout:
         alias: null
         annotation: Optional[Literal['replicated', 'token_sharded']]
@@ -855,6 +916,36 @@ classes:
         status: prototype
         validate_default: null
         validation_alias: null
+      vc_attention:
+        alias: null
+        annotation: builtins.bool
+        default: false
+        discriminator: null
+        frozen: null
+        metadata: []
+        required: false
+        serialization_alias: null
+        status: prototype
+        validate_default: null
+        validation_alias: null
+      vc_repair_budget:
+        alias: null
+        annotation: builtins.float
+        default: 0.0
+        discriminator: null
+        frozen: null
+        metadata:
+        - fields:
+            ge: 0.0
+          type: annotated_types.Ge
+        - fields:
+            lt: 1.0
+          type: annotated_types.Lt
+        required: false
+        serialization_alias: null
+        status: prototype
+        validate_default: null
+        validation_alias: null
     kind: pydantic
     members: {}
     status: null
@@ -944,6 +1035,73 @@ classes:
         factory: builtins.list
         frozen: null
         metadata: []
+        required: false
+        serialization_alias: null
+        status: prototype
+        validate_default: null
+        validation_alias: null
+    kind: pydantic
+    members: {}
+    status: null
+  tensorrt_llm.visual_gen.args.SeaCacheConfig:
+    bases:
+    - tensorrt_llm.visual_gen.args.BaseCacheConfig
+    computed_fields: {}
+    config:
+      extra: forbid
+    fields:
+      cache_backend:
+        alias: null
+        annotation: Literal['seacache']
+        default: seacache
+        discriminator: null
+        frozen: null
+        metadata: []
+        required: false
+        serialization_alias: null
+        status: null
+        validate_default: null
+        validation_alias: null
+      max_continuous_cached_steps:
+        alias: null
+        annotation: builtins.int
+        default: 2
+        discriminator: null
+        frozen: null
+        metadata:
+        - fields:
+            ge: -1
+          type: annotated_types.Ge
+        required: false
+        serialization_alias: null
+        status: prototype
+        validate_default: null
+        validation_alias: null
+      max_warmup_steps:
+        alias: null
+        annotation: builtins.int
+        default: 12
+        discriminator: null
+        frozen: null
+        metadata:
+        - fields:
+            ge: 0
+          type: annotated_types.Ge
+        required: false
+        serialization_alias: null
+        status: prototype
+        validate_default: null
+        validation_alias: null
+      threshold:
+        alias: null
+        annotation: builtins.float
+        default: 0.25
+        discriminator: null
+        frozen: null
+        metadata:
+        - fields:
+            gt: 0.0
+          type: annotated_types.Gt
         required: false
         serialization_alias: null
         status: prototype
@@ -1135,11 +1293,23 @@ classes:
         status: prototype
         validate_default: null
         validation_alias: null
+      batching_config:
+        alias: null
+        annotation: tensorrt_llm.visual_gen.args.BatchingConfig
+        discriminator: null
+        factory: tensorrt_llm.visual_gen.args.BatchingConfig
+        frozen: null
+        metadata: []
+        required: false
+        serialization_alias: null
+        status: prototype
+        validate_default: null
+        validation_alias: null
       cache_config:
         alias: null
         annotation: Optional[Annotated[Union[tensorrt_llm.visual_gen.args.TeaCacheConfig,
-          tensorrt_llm.visual_gen.args.CacheDiTConfig], FieldInfo(annotation=NoneType,
-          required=True, discriminator='cache_backend')]]
+          tensorrt_llm.visual_gen.args.CacheDiTConfig, tensorrt_llm.visual_gen.args.SeaCacheConfig],
+          FieldInfo(annotation=NoneType, required=True, discriminator='cache_backend')]]
         default: null
         discriminator: null
         frozen: null
@@ -1307,7 +1477,7 @@ classes:
             kind: POSITIONAL_OR_KEYWORD
             name: self
             required: true
-          returns: Optional[Literal['teacache', 'cache_dit']]
+          returns: Optional[Literal['teacache', 'cache_dit', 'seacache']]
         setter: null
         status: null
       cache_dit:
@@ -1358,6 +1528,20 @@ classes:
           required: true
         returns: VisualGenArgs
         status: prototype
+      seacache:
+        deleter: null
+        getter:
+          async: false
+          async_generator: false
+          binding: property
+          parameters:
+          - annotation: <unspecified>
+            kind: POSITIONAL_OR_KEYWORD
+            name: self
+            required: true
+          returns: Optional[tensorrt_llm.visual_gen.args.SeaCacheConfig]
+        setter: null
+        status: null
       teacache:
         deleter: null
         getter:
@@ -2141,6 +2325,18 @@ classes:
         status: null
         validate_default: null
         validation_alias: null
+      token_order:
+        alias: null
+        annotation: Literal['native', 'morton', 'hilbert']
+        default: native
+        discriminator: null
+        frozen: null
+        metadata: []
+        required: false
+        serialization_alias: null
+        status: null
+        validate_default: null
+        validation_alias: null
     kind: pydantic
     members:
       resolve_disabled_until_timestep:
@@ -2532,9 +2728,13 @@ exports:
   AttentionConfig:
     annotation: tensorrt_llm.visual_gen.args.AttentionConfig
     provider: tensorrt_llm.visual_gen.args
+  BatchingConfig:
+    annotation: tensorrt_llm.visual_gen.args.BatchingConfig
+    provider: tensorrt_llm.visual_gen.args
   CacheConfig:
-    annotation: Annotated[Union[tensorrt_llm.visual_gen.args.TeaCacheConfig, tensorrt_llm.visual_gen.args.CacheDiTConfig],
-      FieldInfo(annotation=NoneType, required=True, discriminator='cache_backend')]
+    annotation: Annotated[Union[tensorrt_llm.visual_gen.args.TeaCacheConfig, tensorrt_llm.visual_gen.args.CacheDiTConfig,
+      tensorrt_llm.visual_gen.args.SeaCacheConfig], FieldInfo(annotation=NoneType,
+      required=True, discriminator='cache_backend')]
     provider: tensorrt_llm.visual_gen.args
   CacheDiTConfig:
     annotation: tensorrt_llm.visual_gen.args.CacheDiTConfig
@@ -2565,6 +2765,9 @@ exports:
     provider: tensorrt_llm.models.modeling_utils
   RuntimeLoRAConfig:
     annotation: tensorrt_llm.visual_gen.args.RuntimeLoRAConfig
+    provider: tensorrt_llm.visual_gen.args
+  SeaCacheConfig:
+    annotation: tensorrt_llm.visual_gen.args.SeaCacheConfig
     provider: tensorrt_llm.visual_gen.args
   SkipSoftmaxAttentionConfig:
     annotation: tensorrt_llm.visual_gen.sparse_attention.SkipSoftmaxAttentionConfig
@@ -2609,6 +2812,7 @@ exports:
     provider: tensorrt_llm.visual_gen.visual_gen
 lazy_exports:
   AttentionConfig: tensorrt_llm.visual_gen.args
+  BatchingConfig: tensorrt_llm.visual_gen.args
   CacheConfig: tensorrt_llm.visual_gen.args
   CacheDiTConfig: tensorrt_llm.visual_gen.args
   CompilationConfig: tensorrt_llm.visual_gen.args
@@ -2620,6 +2824,7 @@ lazy_exports:
   QuantAttentionConfig: tensorrt_llm.visual_gen.args
   QuantConfig: tensorrt_llm.models.modeling_utils
   RuntimeLoRAConfig: tensorrt_llm.visual_gen.args
+  SeaCacheConfig: tensorrt_llm.visual_gen.args
   SkipSoftmaxAttentionConfig: tensorrt_llm.visual_gen.args
   SolAttentionConfig: tensorrt_llm.visual_gen.args
   SparseAttentionConfig: tensorrt_llm.visual_gen.args
