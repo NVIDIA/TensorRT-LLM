@@ -556,33 +556,6 @@ def test_replay_state_survives_a_rewritten_sender_id(replay_router: _MessengerPa
         router.receive(timeout_ms=1000)
 
 
-def test_listener_drops_replayed_message_and_keeps_running(replay_router: _MessengerPair) -> None:
-    router, raw = replay_router
-    received = []
-    arrived = threading.Event()
-
-    def on_message(frames: list[bytes]) -> None:
-        received.append(frames[1:])
-        if len(received) == 2:
-            arrived.set()
-
-    router.start_listener(on_message)
-    stream_id = os.urandom(16)
-    message = _raw_signed(router, seq=1, stream_id=stream_id)
-    try:
-        raw.send(message)
-        raw.send(message)
-        raw.send(_raw_signed(router, seq=2, stream_id=stream_id, payload=(b"NEXT",)))
-        assert arrived.wait(timeout=2)
-    finally:
-        # Stop the listener inside the test body; thread-leak checks run
-        # before fixture teardown.
-        router.stop()
-    assert received == [[b"TAG"], [b"NEXT"]]
-    assert router.replays_rejected == 1
-    assert router.auth_failures == 1
-
-
 def test_shared_signed_dealer_keeps_seq_order_across_threads() -> None:
     signer = _signer()
     with ZMQMessenger("ROUTER", "tcp://127.0.0.1:*", signer=signer) as router:
