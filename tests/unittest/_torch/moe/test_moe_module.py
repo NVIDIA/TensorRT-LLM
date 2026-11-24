@@ -36,6 +36,7 @@ import traceback
 from contextlib import nullcontext
 from itertools import product
 from typing import List, Optional
+from unittest.mock import patch
 
 import cloudpickle
 import pytest
@@ -86,6 +87,7 @@ from tensorrt_llm._torch.moe.fused_moe import (
     create_moe,
 )
 from tensorrt_llm._torch.moe.fused_moe.communication.deep_ep_low_latency import DeepEPLowLatency
+from tensorrt_llm._torch.moe.fused_moe.impl_environment import collect_moe_environment
 from tensorrt_llm._torch.moe.fused_moe.interface import MoE, MoEWeightLoadingMode
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
@@ -495,6 +497,10 @@ def _test_moe_worker(
     swiglu_beta: float = 0,
     swiglu_limit: float = float("inf"),
     bias_dtype: Optional[torch.dtype] = None,
+    without_pre_quant_scale: bool = False,
+    required_pre_quant_scale: bool = False,
+    omitted_pre_quant_scale_flag: bool = False,
+    simulate_sm89_scale_loading: bool = False,
 ):
     """
     Test MoE module worker function.
@@ -533,6 +539,10 @@ def _test_moe_worker(
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
             bias_dtype=bias_dtype,
+            without_pre_quant_scale=without_pre_quant_scale,
+            required_pre_quant_scale=required_pre_quant_scale,
+            omitted_pre_quant_scale_flag=omitted_pre_quant_scale_flag,
+            simulate_sm89_scale_loading=simulate_sm89_scale_loading,
         )
     except Exception:
         traceback.print_exc()
@@ -556,6 +566,10 @@ def _test_moe_worker_impl(
     swiglu_beta: float = 0,
     swiglu_limit: float = float("inf"),
     bias_dtype: Optional[torch.dtype] = None,
+    without_pre_quant_scale: bool = False,
+    required_pre_quant_scale: bool = False,
+    omitted_pre_quant_scale_flag: bool = False,
+    simulate_sm89_scale_loading: bool = False,
 ):
     """Actual implementation of _test_moe_worker."""
     # Default routing logits dtype to model dtype if not specified
@@ -618,6 +632,12 @@ def _test_moe_worker_impl(
         quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
             quant_algo, x, backend_type
         )
+        if without_pre_quant_scale or omitted_pre_quant_scale_flag:
+            if without_pre_quant_scale:
+                quant_config.pre_quant_scale = required_pre_quant_scale
+            else:
+                assert "pre_quant_scale" not in quant_config.model_fields_set
+            quant_kwargs["weight_loading_mode"] = MoEWeightLoadingMode.VANILLA
         quantize_util = quantize_util_cls(
             num_experts=num_experts,
             dtype=dtype,
@@ -634,6 +654,8 @@ def _test_moe_worker_impl(
                 ActivationType.SwigluBias if is_minimax_megamoe else ActivationType.Swiglu
             ),
         )
+        if without_pre_quant_scale or omitted_pre_quant_scale_flag:
+            quantize_util.weight_loading_mode = MoEWeightLoadingMode.VANILLA
         ref_cls = quant_kwargs.pop("ref_cls", None)
         ref_module_kwargs = {}
 
@@ -709,6 +731,23 @@ def _test_moe_worker_impl(
                 weights = quantize_util.create_weights(**quant_kwargs)
                 ref_weights = weights
 
+            if without_pre_quant_scale:
+                ref_weights = {
+                    key: torch.ones_like(value) if key.endswith(".pre_quant_scale") else value
+                    for key, value in weights.items()
+                }
+                weights = {
+                    key: value
+                    for key, value in ref_weights.items()
+                    if not key.endswith(".pre_quant_scale")
+                }
+            elif omitted_pre_quant_scale_flag:
+                weights = {
+                    key: torch.full_like(value, 1.5) if key.endswith(".pre_quant_scale") else value
+                    for key, value in weights.items()
+                }
+                ref_weights = weights
+
             # For EPLB, keep backend weights on CPU.
             if enable_eplb:
                 for key, value in weights.items():
@@ -717,7 +756,17 @@ def _test_moe_worker_impl(
                 if ref_weights is weights:
                     ref_weights = copy.deepcopy(weights)
 
+            if without_pre_quant_scale and required_pre_quant_scale:
+                with pytest.raises(KeyError, match=r"\.pre_quant_scale"):
+                    fused_moe.load_weights([weights])
+                return
             fused_moe.load_weights([weights])
+            if simulate_sm89_scale_loading:
+                assert fused_moe.backend.sm_version == 90
+                with patch.object(fused_moe.backend, "sm_version", 89):
+                    with pytest.raises(KeyError, match=r"\.pre_quant_scale"):
+                        fused_moe.quant_method.load_quant_scales(fused_moe.backend, weights)
+                return
             fused_moe.post_load_weights()
             fused_moe.cuda(f"cuda:{mapping.rank}")
 
@@ -1625,6 +1674,48 @@ def test_configurable_moe_single_gpu(
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         swiglu_limit=swiglu_limit,
+    )
+
+
+@pytest.mark.parametrize("required_pre_quant_scale", [False, True])
+def test_cutlass_w4a8_without_pre_quant_scale(required_pre_quant_scale: bool) -> None:
+    if not torch.cuda.is_available() or get_sm_version() != 90:
+        pytest.skip("CUTLASS W4A8 ModelOpt scales require SM90")
+    if not collect_moe_environment().oss_cutlass_moe:
+        pytest.skip("CUTLASS W4A8 requires an OSS CUTLASS build")
+    _test_moe_worker(
+        moe_backend=MoeBackendType.CUTLASS.value,
+        dtype=torch.bfloat16,
+        quant_algo=QuantAlgo.W4A8_AWQ,
+        without_pre_quant_scale=True,
+        required_pre_quant_scale=required_pre_quant_scale,
+    )
+
+
+def test_cutlass_w4a8_undeclared_pre_quant_scale() -> None:
+    if not torch.cuda.is_available() or get_sm_version() != 90:
+        pytest.skip("CUTLASS W4A8 ModelOpt scales require SM90")
+    if not collect_moe_environment().oss_cutlass_moe:
+        pytest.skip("CUTLASS W4A8 requires an OSS CUTLASS build")
+    _test_moe_worker(
+        moe_backend=MoeBackendType.CUTLASS.value,
+        dtype=torch.bfloat16,
+        quant_algo=QuantAlgo.W4A8_AWQ,
+        omitted_pre_quant_scale_flag=True,
+    )
+
+
+def test_cutlass_w4a8_sm89_without_pre_quant_scale() -> None:
+    if not torch.cuda.is_available() or get_sm_version() != 90:
+        pytest.skip("CUTLASS W4A8 ModelOpt scales require SM90 for test setup")
+    if not collect_moe_environment().oss_cutlass_moe:
+        pytest.skip("CUTLASS W4A8 requires an OSS CUTLASS build")
+    _test_moe_worker(
+        moe_backend=MoeBackendType.CUTLASS.value,
+        dtype=torch.bfloat16,
+        quant_algo=QuantAlgo.W4A8_AWQ,
+        without_pre_quant_scale=True,
+        simulate_sm89_scale_loading=True,
     )
 
 
