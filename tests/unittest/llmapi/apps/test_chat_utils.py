@@ -1323,12 +1323,18 @@ class TestEmbedsParts:
         with pytest.raises(ValueError, match="exceed the"):
             parse_chat_message_content_part(part, mm_tracker)
 
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("resolve_media", [True, False])
-    def test_byte_limit_applies_only_to_decoded_media(self, monkeypatch, resolve_media):
+    async def test_byte_limit_applies_only_to_decoded_media(self, monkeypatch, resolve_media):
+        import gc
+        import warnings
+
         import torch
 
         data = _b64_tensor(torch.zeros(16, 16))
         monkeypatch.setenv(_chat_utils.MM_EMBEDS_MAX_BYTES_ENV, str(len(data)))
+        decoder = AsyncMock()
+        monkeypatch.setattr(_chat_utils, "async_load_base64_tensor", decoder)
         part = {"type": "image_embeds", "image_embeds": {"data": data}}
         messages = [{"role": "user", "content": [part, part]}]
 
@@ -1344,9 +1350,14 @@ class TestEmbedsParts:
         if resolve_media:
             with pytest.raises(ValueError, match="exceed the"):
                 parse()
-        else:
-            # A generation-only worker discards the parts without decoding them.
-            parse()[1].close()
+            return
+        # A generation-only worker discards the parts without decoding them.
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            assert await parse()[1] == (None, None)
+            gc.collect()
+        decoder.assert_not_called()
+        assert not [w for w in caught if "never awaited" in str(w.message)]
 
     @pytest.mark.parametrize(
         ("failure", "match"),
