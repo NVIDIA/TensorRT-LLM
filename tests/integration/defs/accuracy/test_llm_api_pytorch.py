@@ -1505,8 +1505,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @skip_pre_blackwell
     @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_less_device_memory(60000)
-    @pytest.mark.parametrize(
-        "mode", ["reuse", "reuse_preempt", "reuse_host_offload"])
+    @pytest.mark.parametrize("mode",
+                             ["reuse", "reuse_preempt", "reuse_host_offload"])
     def test_bfloat16_agg_helix_cp2(self, mode: str) -> None:
         """GSM8K on aggregated Helix (TP1 x CP2) with block reuse.
 
