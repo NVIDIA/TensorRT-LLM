@@ -499,7 +499,15 @@ class VisualGen:
         """
         request = self._session_request(prompt, params)
         channel = self.executor.open_session(request)
-        channel.wait_open()
+        try:
+            channel.wait_open()
+        except BaseException as e:
+            if not isinstance(e, Exception):
+                # Interrupted while waiting (``KeyboardInterrupt``): the open may
+                # still succeed with nobody holding the session, so it is closed
+                # as soon as the worker acknowledges it.
+                self.executor.session_close(channel)
+            raise
         return VisualGenSession(self.executor, channel)
 
     @set_api_status("prototype")

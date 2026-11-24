@@ -503,6 +503,7 @@ def test_coordinator_drains_ready_batch_responses_without_repeated_input_wait():
         client._init_ipc = Mock(return_value=True)
         client._cleanup_ipc = Mock()
         client._process_controls = Mock()
+        client._fail_open_sessions = Mock()
         client._request_to_send = None
         client.pending_requests = Mock(wraps=queue.Queue())
         ready = deque(DiffusionResponse(i) for i in range(3))

@@ -135,11 +135,17 @@ class SessionState:
         written: Dict[str, Tuple[Tuple[int, ...], torch.dtype]],
     ) -> SessionResultMessage:
         """Build the message for the views the pipeline wrote (stream name to shape
-        and dtype, shapes already checked by the buffer that handed them out).
+        and dtype, byte fit already checked by the buffer that handed them out).
         Each stream's start is its position, which then moves by the extent along
-        the stream axis; an unknown stream name raises before anything moves."""
+        the stream axis; an unknown stream name, or a shape without the stream
+        axis, raises ``ValueError`` before anything moves."""
         caps = self.capabilities
-        counts = {name: shape[caps.stream(name).axis] for name, (shape, _) in written.items()}
+        counts = {}
+        for name, (shape, _) in written.items():
+            axis = caps.stream(name).axis
+            if len(shape) <= axis:
+                raise ValueError(f"stream {name!r}: shape {tuple(shape)} has no axis {axis}")
+            counts[name] = shape[axis]
         position: Dict[str, Tuple[int, int]] = {}
         for name, count in counts.items():
             start = self.stream_positions[name]

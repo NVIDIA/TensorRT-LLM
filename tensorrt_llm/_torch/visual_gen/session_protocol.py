@@ -112,7 +112,7 @@ class SessionControl(SessionCommand):
 
 @dataclass
 class SessionReply:
-    """A message from rank 0 about one session; the client's router hands it to
+    """A message from rank 0 about one session; the client's dispatcher hands it to
     that session's channel."""
 
     session_id: int
@@ -128,6 +128,15 @@ class SessionOpened(SessionReply):
     slots: Optional[List[SlotHandles]] = None  # indexed by slot id
     error: Optional[str] = None
     error_type: Optional[str] = None
+
+    def exception(self) -> Optional[Exception]:
+        """What ``open_session`` raises for this reply: ``ValueError`` when the
+        request is at fault, ``MemoryError`` for lack of capacity, ``RuntimeError``
+        otherwise; ``None`` when the session opened."""
+        if self.error is None:
+            return None
+        kind = {"client": ValueError, "capacity": MemoryError}.get(self.error_type, RuntimeError)
+        return kind(f"Session open failed: {self.error}")
 
 
 class AdmissionFailure(Enum):
@@ -146,6 +155,17 @@ class SessionAdmitted(SessionReply):
     advance_index: Optional[int] = None
     error: Optional[str] = None
     failure: Optional[AdmissionFailure] = None
+
+    def exception(self) -> Optional[Exception]:
+        """What ``submit`` raises for this reply, or ``None`` when the value was
+        admitted."""
+        if self.error is None:
+            return None
+        kind = {
+            AdmissionFailure.QUEUE_FULL: SessionQueueFull,
+            AdmissionFailure.ENDED: SessionEnded,
+        }.get(self.failure, ValueError)
+        return kind(self.error)
 
 
 class ResultType(Enum):

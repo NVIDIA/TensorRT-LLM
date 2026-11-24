@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import Future
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 import torch
@@ -62,6 +63,20 @@ __all__ = [
 ]
 
 
+@dataclass
+class _SlotHold:
+    """The session's hold on the delivery slot one result views.
+
+    The session that issued the result owns the hold: it sets ``released`` and
+    returns the slot to the worker when the next result is requested. The result
+    only reads it.
+    """
+
+    channel: SessionChannel  # asked at access time whether the session is gone
+    slot_id: int
+    released: bool = False
+
+
 @set_api_status("prototype")
 class SessionResult:
     """One result of a session.
@@ -83,7 +98,7 @@ class SessionResult:
         done: bool,
         error: Optional[str],
         *,
-        lease: Optional[Tuple[SessionChannel, int]] = None,
+        slot_hold: Optional[_SlotHold] = None,
     ):
         self.request_id: int = request_id  # the session
         self.sequence: int = sequence  # delivery order within the session
@@ -92,25 +107,26 @@ class SessionResult:
         self.done: bool = done
         self.error: Optional[str] = error
         # Views over the worker's slot, or the caller's own memory after copy().
-        # None once the slot went back to the worker: reading outputs then raises.
-        self._outputs: Optional[Dict[str, torch.Tensor]] = dict(outputs)
-        # Set while the media views a worker slot: the session's channel, asked at
-        # access time whether the session is gone, and the slot to return. None
-        # for a copy or a terminal, which own nothing on the worker.
-        self._lease: Optional[Tuple[SessionChannel, int]] = lease
+        self._outputs: Dict[str, torch.Tensor] = dict(outputs)
+        # The session's hold on the delivery slot the media views; reading outputs
+        # raises once the session released it. None when outputs is the caller's
+        # own memory (a copy) or empty (a terminal).
+        self._slot_hold: Optional[_SlotHold] = slot_hold
 
     @property
     def outputs(self) -> Dict[str, torch.Tensor]:
-        if self._outputs is None:
-            raise SessionLeaseExpired(
-                f"result {self.sequence} of session {self.request_id} expired; "
-                "call copy() before requesting the next result to keep its media"
-            )
-        if self._lease is not None and self._lease[0].lease_lost is not None:
-            raise SessionLeaseExpired(
-                f"result {self.sequence} of session {self.request_id} expired: "
-                f"{self._lease[0].lease_lost}"
-            )
+        hold = self._slot_hold
+        if hold is not None:
+            if hold.released:
+                raise SessionLeaseExpired(
+                    f"result {self.sequence} of session {self.request_id} expired; "
+                    "call copy() before requesting the next result to keep its media"
+                )
+            if hold.channel.lease_lost is not None:
+                raise SessionLeaseExpired(
+                    f"result {self.sequence} of session {self.request_id} expired: "
+                    f"{hold.channel.lease_lost}"
+                )
         return self._outputs
 
     @property
@@ -146,20 +162,8 @@ class SessionResult:
             self.error,
         )
 
-    def release(self) -> Optional[int]:
-        """Give up the lease.
-
-        The views die; the result is the slot to return to the worker, or ``None``
-        for a copy or a terminal, which hold no slot.
-        """
-        lease, self._lease = self._lease, None
-        if lease is None:
-            return None
-        self._outputs = None
-        return lease[1]
-
     def __repr__(self) -> str:
-        streams = {name: tuple(t.shape) for name, t in (self._outputs or {}).items()}
+        streams = {name: tuple(t.shape) for name, t in self._outputs.items()}
         return (
             f"SessionResult(sequence={self.sequence}, advance_index={self.advance_index}, "
             f"streams={streams}, position={self.position}, done={self.done}, error={self.error!r})"
@@ -245,9 +249,9 @@ class VisualGenSession:
     def __init__(self, client: DiffusionRemoteClient, channel: SessionChannel):
         self._client = client  # sends the session's commands to the worker
         self._channel = channel  # this session's record on the client: replies land here
-        # The one result whose slot the client is holding; requesting the next
-        # result, or closing, expires it and returns the slot.
-        self._held: Optional[SessionResult] = None
+        # The hold on the slot of the one result the client is reading; requesting
+        # the next result, or closing, releases it and returns the slot.
+        self._held: Optional[_SlotHold] = None
 
     # ---- introspection
 
@@ -414,7 +418,6 @@ class VisualGenSession:
             if taken is ResultType.ENDED:
                 return None
             if taken is not None:
-                self._held = taken
                 return taken
             self._channel.notification().result()
 
@@ -426,7 +429,6 @@ class VisualGenSession:
             if taken is ResultType.ENDED:
                 return None
             if taken is not None:
-                self._held = taken
                 return taken
             await asyncio.wrap_future(self._channel.notification())
 
@@ -487,10 +489,10 @@ class VisualGenSession:
         held, self._held = self._held, None
         if held is None:
             return False
-        slot_id = held.release()
-        if slot_id is None or self._channel.lease_lost is not None:
+        held.released = True
+        if self._channel.lease_lost is not None:
             return False
-        self._client.session_return_slot(self._channel, slot_id)
+        self._client.session_return_slot(self._channel, held.slot_id)
         return True
 
     def _build_result(self, message: SessionResultMessage) -> SessionResult:
@@ -499,7 +501,9 @@ class VisualGenSession:
             slot = self._channel.slots[message.slot_id]
             for name, (shape, dtype) in message.streams.items():
                 outputs[name] = make_view(slot[name], tuple(shape), dtype)
-        lease = None if message.slot_id is None else (self._channel, message.slot_id)
+        # The channel takes the result it has built, so the slot is held from here.
+        slot_hold = None if message.slot_id is None else _SlotHold(self._channel, message.slot_id)
+        self._held = slot_hold
         return SessionResult(
             self.request_id,
             message.sequence,
@@ -508,5 +512,5 @@ class VisualGenSession:
             message.position,
             message.type is ResultType.TERMINAL,
             message.error,
-            lease=lease,
+            slot_hold=slot_hold,
         )

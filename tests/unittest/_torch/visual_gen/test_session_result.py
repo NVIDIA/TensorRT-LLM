@@ -22,19 +22,30 @@ from tensorrt_llm.visual_gen.session import SessionResult
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="device media needs CUDA")
 
 
-def test_copy_of_device_media_is_complete_when_it_returns():
+def test_copy_of_device_media_is_complete_when_it_returns(monkeypatch):
     """A device clone is queued on the caller's stream; the worker reuses the slot
     with no view of that stream. ``copy()`` returns only once its reads are done,
-    so a slot overwritten right after the return cannot leak into the owned copy."""
+    so a slot overwritten right after the return cannot leak into the owned copy.
+    The event recorded right behind the clone on that stream says whether the
+    clone had finished when ``copy()`` returned."""
     slot = torch.full((16 << 20,), 1, dtype=torch.uint8, device="cuda")
     result = SessionResult(1, 0, 0, {"video": slot}, {"video": (0, 1)}, False, None)
     worker = torch.cuda.Stream()
     torch.cuda.synchronize()
     torch.cuda._sleep(2_000_000_000)  # the caller's own pending work, ahead of the clone
-    pending = torch.cuda.Event()
-    pending.record()
+    clone = torch.Tensor.clone
+    cloned = []
+
+    def clone_then_mark(tensor, *args, **kwargs):
+        out = clone(tensor, *args, **kwargs)
+        cloned.append(torch.cuda.Event())
+        cloned[-1].record()
+        return out
+
+    monkeypatch.setattr(torch.Tensor, "clone", clone_then_mark)
     keep = result.copy()
-    assert pending.query(), "copy() returned with its source read still queued"
+    monkeypatch.undo()
+    assert len(cloned) == 1 and cloned[0].query(), "copy() returned before its clone finished"
     with torch.cuda.stream(worker):
         slot.fill_(2)  # the worker's next advance writing the reused slot
     torch.cuda.synchronize()

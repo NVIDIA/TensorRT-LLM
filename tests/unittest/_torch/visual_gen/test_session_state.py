@@ -192,6 +192,9 @@ def test_media_result_advances_the_stream_positions():
     with pytest.raises(ValueError):
         state.media_result(2, 0, {"depth": ((1, 8, 4, 6), torch.uint8)})  # not declared
     assert state.stream_positions == {"video": 16, "audio": 1000}  # nothing moved
+    with pytest.raises(ValueError, match="has no axis 1"):
+        state.media_result(2, 0, {"video": ((8,), torch.uint8)})  # no stream axis
+    assert state.stream_positions == {"video": 16, "audio": 1000}
     terminal = state.terminal_result()
     assert terminal.type is ResultType.TERMINAL and terminal.error is None
     assert terminal.sequence == 2

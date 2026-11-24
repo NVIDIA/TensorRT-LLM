@@ -35,6 +35,9 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from tensorrt_llm._torch.shared_tensor.shared_tensor import _LocalTensorStore
+from tensorrt_llm._torch.visual_gen import executor as executor_module
+from tensorrt_llm._torch.visual_gen import slot_pool as slot_pool_module
 from tensorrt_llm._torch.visual_gen.executor import (
     DiffusionExecutor,
     DiffusionRemoteClient,
@@ -66,7 +69,9 @@ from tensorrt_llm._torch.visual_gen.session_protocol import (
     SessionResultMessage,
     SessionSubmit,
 )
+from tensorrt_llm._torch.visual_gen.slot_pool import SlotPool
 from tensorrt_llm.visual_gen.session import VisualGenSession
+from tensorrt_llm.visual_gen.visual_gen import VisualGen
 
 pytestmark = pytest.mark.cpu_only
 
@@ -214,7 +219,7 @@ def _make_client():
 
 class Harness:
     """Wires the client's outgoing queue to the executor's fake socket and the
-    executor's responses to the client's router, each on its own thread, and runs
+    executor's responses to the client's dispatcher, each on its own thread, and runs
     the executor's session loop on a third."""
 
     def __init__(self, pipeline, session_config=None, *, forward_controls=True):
@@ -225,7 +230,7 @@ class Harness:
         self._stop = threading.Event()
         self.worker_error: Optional[BaseException] = None
         # Reply gates: while a kind is held, its messages queue up here in order
-        # and are routed when released; other kinds keep flowing. Lets a test
+        # and are dispatched when released; other kinds keep flowing. Lets a test
         # observe "accepted but not yet delivered" deterministically.
         self._held_kinds: set = set()
         self.responses: list = []  # ordinary-request answers the worker sent
@@ -286,14 +291,15 @@ class Harness:
                 item = self.executor.response_queue.get(timeout=0.02)
             except queue.Empty:
                 continue
+            # Dispatched under the lock ``release`` dispatches under, so a reply that
+            # arrives during a release never overtakes the held ones.
             with self._hold_lock:
                 if self._held_kinds and isinstance(item, tuple(self._held_kinds)):
                     self._held_replies.append(item)  # released later, in order
-                    continue
-            if isinstance(item, SessionReply):
-                self.client._route_session_reply(item)
-            else:
-                self.responses.append(item)  # an ordinary request's answer: kept for the test
+                elif isinstance(item, SessionReply):
+                    self.client._dispatch_session_reply(item)
+                else:
+                    self.responses.append(item)  # an ordinary request's answer
 
     def hold(self, *kinds):
         with self._hold_lock:
@@ -303,8 +309,8 @@ class Harness:
         with self._hold_lock:
             self._held_kinds.clear()
             held, self._held_replies = self._held_replies, []
-        for item in held:
-            self.client._route_session_reply(item)
+            for item in held:
+                self.client._dispatch_session_reply(item)
 
     def held(self, kind) -> bool:
         with self._hold_lock:
@@ -607,7 +613,8 @@ def test_one_result_request_and_one_submit_at_a_time(harness):
             # a second request from another thread must be refused, not queued.
             t = threading.Thread(target=wait_for_result)
             t.start()
-            time.sleep(0.1)
+            channel = h.client._sessions[s.request_id]
+            _wait_until(lambda: channel._reader is not None, what="the first read's reservation")
             with pytest.raises(SessionError, match="already in progress"):
                 next(results)
             with pytest.raises(SessionError, match="already in progress"):
@@ -645,6 +652,158 @@ def test_missing_declared_initial_result_ends_the_session_with_an_error(harness)
             with s.results() as results:
                 terminal = next(results)
             assert terminal.done and "initial result" in terminal.error
+
+
+class RankOneViewPipeline(CountingPipeline):
+    """Reports a view without the stream axis (the video stream counts along axis 1)."""
+
+    def advance(self, state, inputs, slot):
+        view = slot["video"].view((4,), torch.uint8)
+        return AdvanceResult(written={"video": view})
+
+
+def test_view_without_the_stream_axis_ends_the_session_and_frees_its_slot(harness):
+    with harness(RankOneViewPipeline(initial=False), SimpleNamespace(delivery_slots=1)) as h:
+        with h.open() as s:
+            s.submit("controls", 1)
+            with s.results() as results:
+                terminal = next(results)
+            assert terminal.done and "has no axis 1" in terminal.error
+
+
+def test_failed_open_leaves_no_slot_storage_behind(harness):
+    """The harness worker shares the client's process, so slot handles are stashed
+    in the process-local store until a client maps them; a refused open has no
+    client to do that."""
+    before = set(_LocalTensorStore._store)
+    with harness(CountingPipeline(open_fails=True)) as h:
+        with pytest.raises(ValueError, match="bad prompt"):
+            h.open()
+    assert set(_LocalTensorStore._store) == before
+
+
+def test_slot_pool_that_fails_part_way_releases_what_it_exported(monkeypatch):
+    caps = CountingPipeline().session_capabilities(None)
+    build = slot_pool_module._stream_buffer
+    built = []
+
+    def failing(spec, device, *, local):
+        if len(built) == 1:
+            raise MemoryError("no room for the second buffer")
+        built.append(build(spec, device, local=local))
+        return built[-1]
+
+    monkeypatch.setattr(slot_pool_module, "_stream_buffer", failing)
+    before = set(_LocalTensorStore._store)
+    with pytest.raises(MemoryError):
+        SlotPool(caps, 2, torch.device("cpu"), local=True)
+    assert len(built) == 1 and set(_LocalTensorStore._store) == before
+
+
+def test_slots_that_fail_to_map_fail_the_open_and_free_the_worker(harness, monkeypatch):
+    pipe = CountingPipeline(initial=False)
+    with harness(pipe) as h:
+        real = executor_module.map_slots
+        monkeypatch.setattr(
+            executor_module, "map_slots", lambda handles: (_ for _ in ()).throw(OSError("no map"))
+        )
+        with pytest.raises(RuntimeError, match="cannot map the delivery slots"):
+            h.open()
+        _wait_until(lambda: pipe.closed == 1, what="the worker to close the unusable session")
+        assert h.client._sessions == {}
+        monkeypatch.setattr(executor_module, "map_slots", real)
+        channel = h.client.open_session(_request(2))
+        channel.wait_open(timeout=10)
+        VisualGenSession(h.client, channel).close()
+        assert pipe.opened == 2
+
+
+def test_engine_shutdown_settles_a_session_the_worker_never_confirmed(harness):
+    with harness(CountingPipeline(initial=False)) as h:
+        s = h.open()
+        channel = h.client._sessions[s.request_id]
+        results = s.results()
+        outcome = {}
+
+        def read():
+            try:
+                outcome["result"] = next(results)
+            except BaseException as exc:  # noqa: BLE001
+                outcome["error"] = exc
+
+        reader = threading.Thread(target=read)
+        reader.start()
+        _wait_until(lambda: channel._reader is not None, what="the read's reservation")
+        h.hold(SessionClosed)  # the worker's confirmation never reaches the client
+        closing = h.client.session_close(channel)
+        h.client._fail_open_sessions(SessionEnded("the engine shut down"))
+        reader.join(timeout=10)
+        assert not reader.is_alive(), "the read was left waiting"
+        assert "error" in outcome, outcome
+        assert isinstance(closing.exception(timeout=10), SessionEnded)
+        assert h.client._sessions == {}
+
+
+def test_a_result_offers_no_public_way_to_drop_its_slot(harness):
+    """Only the session returns a slot, when the next result is requested."""
+    pipe = CountingPipeline(initial=False)
+    with harness(pipe, SimpleNamespace(delivery_slots=1, idle_timeout=None)) as h:
+        with h.open() as s, s.results() as results:
+            s.submit("controls", 1)
+            s.submit("controls", 2)
+            r0 = next(results)
+            assert not hasattr(r0, "release")
+            assert next(results).advance_index == 1  # the request returned r0's slot
+            with pytest.raises(SessionLeaseExpired):
+                r0.outputs
+
+
+def test_interrupted_open_gives_the_session_up(harness, monkeypatch):
+    pipe = CountingPipeline(initial=False)
+    with harness(pipe) as h:
+        engine = VisualGen.__new__(VisualGen)
+        engine.executor = h.client
+        try:
+            monkeypatch.setattr(engine, "_session_request", lambda prompt, params: _request(1))
+            h.send_gate.clear()  # the open stays unsent while the caller is interrupted
+
+            def interrupted(self, timeout=None):
+                raise KeyboardInterrupt
+
+            monkeypatch.setattr(SessionChannel, "wait_open", interrupted)
+            with pytest.raises(KeyboardInterrupt):
+                engine.open_session("p")
+            monkeypatch.undo()
+            h.send_gate.set()
+            # The open succeeds with nobody holding it and is closed at once.
+            _wait_until(lambda: pipe.closed == 1, what="the abandoned session to close")
+            _wait_until(lambda: h.client._sessions == {}, what="the session's retirement")
+            channel = h.client.open_session(_request(2))
+            channel.wait_open(timeout=10)
+            VisualGenSession(h.client, channel).close()
+            assert pipe.opened == 2
+        finally:
+            engine.executor = None  # nothing for ``VisualGen.__del__`` to shut down
+
+
+def test_generation_requests_queue_under_the_session_lock():
+    """A session's retirement filters the queue under ``_sessions_lock``; a
+    generation request enqueued meanwhile waits for it instead of landing in the
+    middle and overtaking the ones being put back."""
+    client = _make_client()
+    client._iter_stats = SimpleNamespace(record_enqueue=lambda depth: None)
+    done = threading.Event()
+
+    def enqueue():
+        client.enqueue_requests([_request(5)])
+        done.set()
+
+    with client._sessions_lock:
+        t = threading.Thread(target=enqueue)
+        t.start()
+        assert not done.wait(0.2) and client.pending_requests.empty()
+    t.join(timeout=10)
+    assert done.is_set() and client.pending_requests.qsize() == 1
 
 
 def test_close_discards_queued_inputs_and_second_session_opens(harness):
@@ -821,9 +980,15 @@ class CollectivePipeline(CountingPipeline):
             raise ValueError("rejected in preparation")
 
     def _collective(self, phase):
-        if self.rank == self.fail_rank and self.fail_phase == phase:
+        # ``<phase>_parked``: the failing rank raises as in ``<phase>``; the other
+        # stays alive outside any collective, so only the coordinator ends it.
+        parked = self.fail_phase == f"{phase}_parked"
+        if self.rank == self.fail_rank and (parked or self.fail_phase == phase):
             self.events.append(f"raise:{phase}")
             raise RuntimeError(f"rank {self.rank} failed in {phase}")
+        if parked:
+            self.events.append(f"parked:{phase}")
+            threading.Event().wait()
         self.events.append(f"enter:{phase}")
         dist.all_reduce(torch.zeros(1))
         self.events.append(f"leave:{phase}")
@@ -1039,6 +1204,23 @@ class _RankProcess:
         return self.stderr_path.read_text()[-2000:]
 
 
+@pytest.fixture
+def start_rank(tmp_path):
+    """Start rank processes that are killed when the test ends, however it ends."""
+    started = []
+
+    def start(rank, port, fail_rank, fail_phase, timeout_s):
+        proc = _RankProcess(rank, port, fail_rank, fail_phase, tmp_path, timeout_s)
+        started.append(proc)
+        return proc
+
+    yield start
+    for proc in started:
+        if proc.is_alive():
+            proc.kill()
+        proc.join(timeout=10)
+
+
 def _free_port():
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
@@ -1063,11 +1245,11 @@ def _published(ex):
 
 @pytest.mark.parametrize("fail_phase", ["open", "advance", "open_event", "advance_event"])
 @pytest.mark.parametrize("fail_rank", [0, 1])
-def test_rank_local_exception_is_fatal_not_a_hung_collective(tmp_path, fail_rank, fail_phase):
+def test_rank_local_exception_is_fatal_not_a_hung_collective(start_rank, fail_rank, fail_phase):
     """Rank 0 as a thread in this process (the external-launch shape), rank 1 as a
     dedicated process."""
     port = _free_port()
-    child = _RankProcess(1, port, fail_rank, fail_phase, tmp_path, COLLECTIVE_TIMEOUT_S)
+    child = start_rank(1, port, fail_rank, fail_phase, COLLECTIVE_TIMEOUT_S)
     child.ready()
     rank0_events = _EventLog()
     outcome = {}
@@ -1129,12 +1311,12 @@ def test_rank_local_exception_is_fatal_not_a_hung_collective(tmp_path, fail_rank
         assert any(isinstance(m, SessionOpened) for m in published)
 
 
-def test_request_rejected_in_preparation_on_every_rank_leaves_the_group_in_step(tmp_path):
+def test_request_rejected_in_preparation_on_every_rank_leaves_the_group_in_step(start_rank):
     """Rank 0 as a thread in this process, rank 1 as a dedicated process. Both
     reject the first request in ``prepare_request``; the open is refused to the
     client and the same two ranks then serve a session."""
     port = _free_port()
-    child = _RankProcess(1, port, -1, "prepare", tmp_path, COLLECTIVE_TIMEOUT_S)
+    child = start_rank(1, port, -1, "prepare", COLLECTIVE_TIMEOUT_S)
     child.ready()
     rank0_events = _EventLog()
     outcome = {}
@@ -1174,18 +1356,18 @@ def test_request_rejected_in_preparation_on_every_rank_leaves_the_group_in_step(
     assert any(isinstance(m, SessionClosed) and m.session_id == 2 for m in published)
 
 
-def test_coordinator_contains_the_group_when_a_rank_dies(tmp_path):
+def test_coordinator_contains_the_group_when_a_rank_dies(start_rank):
     """Both ranks as dedicated processes under a client whose liveness check runs
-    the way the background thread runs it. Rank 1 dies in its advance; the
-    coordinator notices, fails the public session (the parked waiter raises) and
-    kills rank 0, which is inside the pipeline collective, long before that
-    collective's timeout. Only liveness is wired to the workers here; the
-    session channel is the client's own, so the public failure comes from the
-    abort path and nothing else."""
+    the way the background thread runs it. Rank 1 dies in its advance while rank
+    0 is parked in its own, outside any collective, so nothing but the
+    coordinator can end it. The coordinator notices, fails the public session
+    (the parked waiter raises) and kills rank 0. Only liveness is wired to the
+    workers here; the session channel is the client's own, so the public failure
+    comes from the abort path and nothing else."""
     port = _free_port()
     timeout_s = 20.0
-    rank0 = _RankProcess(0, port, 1, "advance", tmp_path, timeout_s)
-    rank1 = _RankProcess(1, port, 1, "advance", tmp_path, timeout_s)
+    rank0 = start_rank(0, port, 1, "advance_parked", timeout_s)
+    rank1 = start_rank(1, port, 1, "advance_parked", timeout_s)
     rank0.ready()
     rank1.ready()
     rank0.go()
@@ -1235,14 +1417,11 @@ def test_coordinator_contains_the_group_when_a_rank_dies(tmp_path):
                 proc.kill()
 
     assert rank1.exitcode == 1, rank1.stderr()
-    # The survivor ends one of two ways, both inside the bound: killed by the
-    # coordinator (negative exit), or, where the transport reports the dead peer
-    # at once (Linux gloo), by its own fatal exit from the collective (exit 1).
-    # Never a normal return.
-    assert rank0.exitcode != 0, rank0.stderr()
+    # The survivor was killed by the coordinator: a signal, not an exit of its own.
+    assert rank0.exitcode < 0, rank0.stderr()
     raise_ts = next(ts for ts, n in rank1.events() if n == "raise:advance")
-    assert rank0.exited_at - raise_ts < timeout_s * 0.5  # contained before any collective timeout
-    assert _names(rank0.events())[-1] == "enter:advance"  # ended inside the collective
+    assert rank0.exited_at - raise_ts < timeout_s * 0.5
+    assert _names(rank0.events())[-1] == "parked:advance"  # alive and idle until killed
     assert "exited" in client._worker_failure
     assert isinstance(waiter.get("error"), RuntimeError) and "exited" in str(waiter["error"])
     assert waiter["ended"] - raise_ts < timeout_s * 0.5
@@ -2109,8 +2288,8 @@ def test_worker_refuses_an_open_and_a_generate_while_a_session_is_open(harness):
     with harness(CountingPipeline(initial=False)) as h:
         with h.open() as s:
             replies = []
-            original = h.client._route_session_reply
-            h.client._route_session_reply = lambda r: (replies.append(r), original(r))[1]
+            original = h.client._dispatch_session_reply
+            h.client._dispatch_session_reply = lambda r: (replies.append(r), original(r))[1]
             # Straight onto the worker's socket: an open that slipped past the client.
             h.executor.requests_ipc.put_nowait(SessionOpen(_request(7)))
             generate = _request(8)
@@ -2128,7 +2307,7 @@ def test_worker_refuses_an_open_and_a_generate_while_a_session_is_open(harness):
             answer = next(r for r in h.responses if r.request_id == 8)
             assert isinstance(answer, DiffusionResponse)
             assert answer.error_type == "capacity" and "is open" in answer.error_msg
-            h.client._route_session_reply = original
+            h.client._dispatch_session_reply = original
             assert next(s.results()).advance_index == 0
             assert h.pipeline.opened == 1
 
@@ -2328,19 +2507,19 @@ def test_cancelled_open_still_unsent_does_not_leave_an_ownerless_session(harness
         _run_async(run)
 
 
-def test_open_reply_routing_tolerates_a_cancelled_lifecycle_future():
+def test_open_reply_dispatch_tolerates_a_cancelled_lifecycle_future():
     client = _make_client()
     channel = client.open_session(_request(9))
     channel._opened.cancel()  # a caller that bypassed the shield
-    client._route_session_reply(
+    client._dispatch_session_reply(
         SessionOpened(9, capabilities={"inputs": [], "streams": []}, slots=[])
     )
     assert list(client._sessions) == [9]  # success recorded, nothing raised
-    client._route_session_reply(SessionClosed(9))
+    client._dispatch_session_reply(SessionClosed(9))
     assert client._sessions == {}
     channel = client.open_session(_request(10))
     channel._opened.cancel()
-    client._route_session_reply(SessionOpened(10, error="bad prompt", error_type="client"))
+    client._dispatch_session_reply(SessionOpened(10, error="bad prompt", error_type="client"))
     assert client._sessions == {}
 
 
@@ -2592,7 +2771,7 @@ def test_closed_session_retires_its_unsent_submits_in_the_dispatcher():
     waiting = client.session_close(channel)  # control path: goes out at once
     client._process_controls()
     assert client.controls_ipc.sent[-1].type is ControlType.CLOSE
-    client._route_session_reply(SessionClosed(1))  # the worker confirmed
+    client._dispatch_session_reply(SessionClosed(1))  # the worker confirmed
     assert waiting.result(timeout=1) is None
     with pytest.raises(SessionEnded):
         parked.result(timeout=1)
@@ -2632,12 +2811,12 @@ def test_close_before_the_open_is_acknowledged_waits_for_the_acknowledgement():
     closed = client.session_close(channel)  # opened is still pending
     client._process_controls()
     assert client.controls_ipc.sent == []  # nothing crossed early
-    client._route_session_reply(
+    client._dispatch_session_reply(
         SessionOpened(1, capabilities={"inputs": [], "streams": []}, slots=[])
     )
     client._process_controls()
     assert client.controls_ipc.sent[-1].type is ControlType.CLOSE  # now, after the ack
-    client._route_session_reply(SessionClosed(1))
+    client._dispatch_session_reply(SessionClosed(1))
     assert closed.result(timeout=1) is None and client._sessions == {}
 
 
@@ -3007,7 +3186,7 @@ def test_close_between_reservation_and_enqueue_leaves_no_stale_submit():
 
     def reserve_then_close(name, for_advance=False):
         fut = original(name, for_advance)
-        client._route_session_reply(SessionClosed(1))  # retirement runs now: nothing queued yet
+        client._dispatch_session_reply(SessionClosed(1))  # retirement runs now: nothing queued yet
         return fut
 
     channel.reserve_submit = reserve_then_close
@@ -3034,7 +3213,7 @@ def test_close_between_advance_reservation_and_enqueue_leaves_no_stale_submit():
 
     def plan_then_close(name):
         fut = original(name)
-        client._route_session_reply(SessionClosed(1))
+        client._dispatch_session_reply(SessionClosed(1))
         return fut
 
     channel.plan_advance = plan_then_close
@@ -3087,7 +3266,7 @@ def test_interrupted_advance_validation_releases_both_reservations(harness):
 
 def _worker_closes_after_the_reservation(h, s):
     """Wrap plan_advance so the idle close (terminal retained, SessionClosed
-    routed) has landed after the submit was reserved and before it is published."""
+    dispatched) has landed after the submit was reserved and before it is published."""
     channel = h.client._sessions[s.request_id]
     original = channel.plan_advance
 

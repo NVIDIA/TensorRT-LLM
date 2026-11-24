@@ -57,6 +57,10 @@ class StreamBuffer:
         if device.type != "cuda" and _page_lock(self.storage):
             weakref.finalize(self, _page_unlock, self.storage).atexit = False
 
+    def release_handle(self) -> None:
+        """Consume the exported handle when no client will map it."""
+        SharedTensorContainer.release_dict(self.handle)
+
     @property
     def device(self) -> torch.device:
         return self.storage.device
@@ -118,10 +122,16 @@ class SlotPool:
     ) -> None:
         if num_slots < 1:
             raise ValueError("a session needs at least one delivery slot")
-        self._slots: List[DeliverySlot] = [
-            {spec.name: _stream_buffer(spec, device, local=local) for spec in capabilities.streams}
-            for _ in range(num_slots)
-        ]
+        self._slots: List[DeliverySlot] = []
+        try:
+            for _ in range(num_slots):
+                slot: DeliverySlot = {}
+                self._slots.append(slot)
+                for spec in capabilities.streams:
+                    slot[spec.name] = _stream_buffer(spec, device, local=local)
+        except BaseException:
+            self.release_handles()
+            raise
         # Indices of the slots nobody holds, oldest return first.
         self._free: Deque[int] = deque(range(num_slots))
 
@@ -151,6 +161,13 @@ class SlotPool:
         if slot_id in self._free:
             raise ValueError(f"slot {slot_id} returned twice")
         self._free.append(slot_id)
+
+    def release_handles(self) -> None:
+        """Consume every exported handle of a pool whose handles will not reach
+        a client (the open failed), so the exports stop holding the storage."""
+        for slot in self._slots:
+            for buffer in slot.values():
+                buffer.release_handle()
 
     def export_handles(self) -> List[SlotHandles]:
         """One handle dict per slot per stream, for ``SessionOpened``. Each handle is
@@ -194,14 +211,23 @@ def _page_unlock(storage: torch.Tensor) -> None:
 def map_slots(handles: List[SlotHandles]) -> List[Dict[str, torch.Tensor]]:
     """The client's mapping of a session's slot pool from the handles in
     ``SessionOpened``: ``mapped[slot_id][stream]`` is a flat tensor over the
-    worker's buffer. Each handle maps exactly once; call this once per session."""
-    return [
-        {
-            name: SharedTensorContainer.from_dict(handle).get_local_view()
-            for name, handle in slot.items()
-        }
-        for slot in handles
-    ]
+    worker's buffer. Each handle maps exactly once; call this once per session.
+    When a handle fails to map, the ones not yet mapped are consumed too and the
+    error is raised."""
+    pending = [(i, name, handle) for i, slot in enumerate(handles) for name, handle in slot.items()]
+    mapped: List[Dict[str, torch.Tensor]] = [{} for _ in handles]
+    try:
+        while pending:
+            i, name, handle = pending.pop(0)
+            mapped[i][name] = SharedTensorContainer.from_dict(handle).get_local_view()
+    except BaseException:
+        for _, _, handle in pending:
+            try:
+                SharedTensorContainer.release_dict(handle)
+            except Exception as exc:
+                logger.warning(f"slot pool: could not release an unmapped handle: {exc}")
+        raise
+    return mapped
 
 
 __all__ = [

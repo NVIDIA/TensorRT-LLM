@@ -1105,6 +1105,8 @@ class DiffusionExecutor:
             # abort and the reply carries the failure class.
             logger.error(f"Worker {self.device_id}: session {session_id} refused: {e}")
             logger.error(traceback.format_exc())
+            if pool is not None:
+                pool.release_handles()
             self._send_tag(_RankTag.OPEN_ABORT)
             # Asking an unsupported pipeline for a session is the caller's mistake;
             # what the pipeline itself raised is classified by the pipeline.
@@ -1121,6 +1123,7 @@ class DiffusionExecutor:
         try:
             pipeline_state, outcome = self._open_pipeline(req, initial_slot)
         except Exception as e:
+            pool.release_handles()  # the client never gets them
             self.response_queue.put(
                 SessionOpened(
                     session_id, error=str(e), error_type=pipeline.classify_request_failure(e)
@@ -1562,7 +1565,7 @@ class PendingSubmit(NamedTuple):
 class SessionChannel:
     """Coordinator side of one session: the hand-off point between the main
     thread (the public ``VisualGenSession`` calls) and the client's background
-    thread (which routes the worker's replies here). Nine members, one per
+    thread (which dispatches the worker's replies here). Nine members, one per
     fact, each described at its field below.
     """
 
@@ -1582,7 +1585,7 @@ class SessionChannel:
         # The one submit in flight: input name plus the admission reply. Set until
         # its caller finishes, so a second submit is refused meanwhile.
         self._submit: Optional[PendingSubmit] = None
-        # The one read in flight. A fresh future per wait: the router completes it
+        # The one read in flight. A fresh future per wait: the dispatcher completes it
         # when the queue changes; the reader re-arms under the lock, never missing one.
         self._reader: Optional[Future] = None
         # Unread stream entries in order: MEDIA and TERMINAL from the worker, then
@@ -2201,9 +2204,12 @@ class DiffusionRemoteClient:
             raise RuntimeError(self._worker_failure)
 
         req_ids = []
-        for req in requests:
-            self.pending_requests.put(req)
-            req_ids.append(req.request_id)
+        # Under the lock a session's retirement filters the queue under, so a
+        # request never lands in the middle of that and jumps the ones before it.
+        with self._sessions_lock:
+            for req in requests:
+                self.pending_requests.put(req)
+                req_ids.append(req.request_id)
         # Record one snapshot per enqueue so a /metrics consumer sees the
         # queued-request transitions even if the dispatcher drains the queue
         # before the next poll.
@@ -2393,7 +2399,9 @@ class DiffusionRemoteClient:
         parked = self._request_to_send
         if isinstance(parked, SessionSubmit) and parked.session_id == session_id:
             self._request_to_send = None
-        with self._sessions_lock:  # serialized against a submit being published
+        # Every producer of the queue publishes under this lock, so nothing is
+        # enqueued between the drain and the refill and the order is kept.
+        with self._sessions_lock:
             kept = []
             while True:
                 try:
@@ -2488,7 +2496,7 @@ class DiffusionRemoteClient:
                     break
                 response = self.responses_ipc.get()
                 if isinstance(response, SessionReply):
-                    self._route_session_reply(response)
+                    self._dispatch_session_reply(response)
                 elif isinstance(response, DiffusionResponse):
                     if response.request_id == -1:
                         logger.info("DiffusionClient: Received READY signal")
@@ -2648,44 +2656,46 @@ class DiffusionRemoteClient:
             channel.on_open(after_open)
         return close
 
-    def _route_session_reply(self, reply: Any) -> None:
+    def _dispatch_session_reply(self, reply: Any) -> None:
+        """Hand one worker reply to its session's channel (background thread). A
+        session that is over leaves the registry before its channel wakes anyone,
+        so a caller woken by the reply can open the next session at once."""
         with self._sessions_lock:
             channel = self._sessions.get(reply.session_id)
         if channel is None:
             # Normal after a close: a reply to a command that crossed it in flight.
             logger.debug(f"DiffusionClient: reply for closed session {reply.session_id}")
-            return
-        if isinstance(reply, SessionOpened):
-            if reply.error is not None:
-                with self._sessions_lock:
-                    self._sessions.pop(reply.session_id, None)
-                error_type = reply.error_type
-                message = f"Session open failed: {reply.error}"
-                exc: Exception = (
-                    ValueError(message)
-                    if error_type == "client"
-                    else MemoryError(message)
-                    if error_type == "capacity"
-                    else RuntimeError(message)
-                )
-                channel.open_failed(exc)
-                return
-            channel.open_succeeded(reply.capabilities or {}, map_slots(reply.slots or []))
+        elif isinstance(reply, SessionOpened):
+            self._session_opened(channel, reply)
         elif isinstance(reply, SessionAdmitted):
-            error: Optional[Exception] = None
-            if reply.error is not None:
-                error = {
-                    AdmissionFailure.QUEUE_FULL: SessionQueueFull,
-                    AdmissionFailure.ENDED: SessionEnded,
-                }.get(reply.failure, ValueError)(reply.error)
-            channel.admitted(reply.advance_index, error)
+            channel.admitted(reply.advance_index, reply.exception())
         elif isinstance(reply, SessionResultMessage):
             channel.deliver(reply)
         elif isinstance(reply, SessionClosed):
-            with self._sessions_lock:
-                self._sessions.pop(reply.session_id, None)
+            self._forget_session(reply.session_id)
             channel.worker_closed()
             self._retire_unsent(reply.session_id)
+
+    def _session_opened(self, channel: SessionChannel, reply: SessionOpened) -> None:
+        error, slots = reply.exception(), None
+        if error is None:
+            try:
+                slots = map_slots(reply.slots or [])
+            except Exception as e:
+                # The worker holds the session open; without its slots the client
+                # cannot use it, so the open fails and the worker is told to close.
+                logger.error(f"DiffusionClient: session {reply.session_id} slots: {e}")
+                error = RuntimeError(f"Session open failed: cannot map the delivery slots: {e}")
+                self._enqueue_control(SessionControl(reply.session_id, ControlType.CLOSE))
+        if error is not None:
+            self._forget_session(reply.session_id)
+            channel.open_failed(error)
+        else:
+            channel.open_succeeded(reply.capabilities or {}, slots)
+
+    def _forget_session(self, session_id: int) -> None:
+        with self._sessions_lock:
+            self._sessions.pop(session_id, None)
 
     def get_iteration_stats(self) -> List[Dict]:
         """Return all buffered iteration-stats snapshots and clear the buffer.
@@ -2766,6 +2776,7 @@ class DiffusionRemoteClient:
                 self._process_responses(max_responses=self.args.batching_config.max_batch_size)
             await asyncio.sleep(0.001)  # Yield control to allow other coroutines to run
 
+        self._fail_open_sessions(SessionEnded("the engine shut down"))
         self._cleanup_ipc()
 
         # Keep the event loop available long enough for outstanding result
@@ -2774,6 +2785,21 @@ class DiffusionRemoteClient:
         # within one polling interval and remains bounded.
         while self._worker_failure is not None and not self._shutdown_started:
             await asyncio.sleep(POLL_TIMEOUT)
+
+    def _fail_open_sessions(self, error: Exception) -> None:
+        """No reply will be read any more (the engine shut down, or the worker
+        group is gone): every session still registered ends with ``error``, which
+        wakes its pending open, read, submit and close and expires its results.
+        The registry is emptied under its lock and the sessions are failed outside
+        it, so a caller woken here can call back into the client."""
+        with self._sessions_lock:
+            channels = list(self._sessions.values())
+            self._sessions.clear()
+        for channel in channels:
+            try:
+                channel.fail(error)
+            except Exception as e:
+                logger.error(f"DiffusionClient: failing session {channel.session_id}: {e}")
 
     def _check_worker_liveness(self) -> Optional[str]:
         if (
@@ -2808,15 +2834,13 @@ class DiffusionRemoteClient:
             return
 
         # Lifecycle tests build partial clients without session state; nothing to fail then.
-        sessions = getattr(self, "_sessions", None)
+        has_sessions = getattr(self, "_sessions", None) is not None
         sessions_lock = getattr(self, "_sessions_lock", None) or contextlib.nullcontext()
         with sessions_lock:
-            # Recorded under the same lock open_session reserves under, so no
-            # open can register after this snapshot (see open_session).
+            # open_session checks _worker_failure under this lock before it
+            # registers a session, so once the failure is set no new session
+            # can be added to the registry.
             self._worker_failure = worker_failure
-            channels = list(sessions.values()) if sessions else []
-            if sessions:
-                sessions.clear()
         request_to_discard = self._request_to_send
         self._request_to_send = None
         logger.error(self._worker_failure)
@@ -2837,12 +2861,8 @@ class DiffusionRemoteClient:
             if controls_lock is not None:
                 with controls_lock:
                     self._controls.clear()
-            if channels:
-                for channel in channels:
-                    try:
-                        channel.fail(RuntimeError(worker_failure))
-                    except Exception as e:
-                        logger.error(f"DiffusionClient: failing session {channel.session_id}: {e}")
+            if has_sessions:
+                self._fail_open_sessions(RuntimeError(worker_failure))
         finally:
             # Whatever happened above, the survivors are killed: a surviving rank
             # may be blocked in a collective that can never complete after
