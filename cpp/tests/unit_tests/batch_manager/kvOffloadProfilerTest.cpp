@@ -50,12 +50,6 @@ public:
     {
         return manager.computeBlockTransferBytes(pools, tokens);
     }
-
-    static void copy(legacy::KVCacheTransferManager& manager, legacy::BlockPtr const& src, legacy::BlockPtr const& dst,
-        std::vector<legacy::KVCacheBlockPool> const& pools, bool offload, int tokens)
-    {
-        manager.copyBlock(src, dst, pools, offload, tokens);
-    }
 };
 } // namespace tensorrt_llm::testing
 
@@ -474,7 +468,7 @@ void expectLegacyRoundTrip(
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
     std::memset(secondary->data(), 0, secondary->getSizeInBytes());
     CallbackGuard callback;
-    tensorrt_llm::testing::KVCacheTransferManagerTestAccess::copy(manager, src, dst, {pool}, true, tokens);
+    manager.offload(src, dst, {pool}, tokens);
     manager.syncTransfers();
     stream->synchronize();
     bool const packed = dtype == tensorrt_llm::DataType::kINT4 || dtype == tensorrt_llm::DataType::kFP4;
@@ -506,9 +500,12 @@ void expectLegacyRoundTrip(
     }
     ASSERT_EQ(cudaMemset(primary->data(), 0, primary->getSizeInBytes()), cudaSuccess);
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
-    tensorrt_llm::testing::KVCacheTransferManagerTestAccess::copy(manager, dst, src, {pool}, false, tokens);
+    manager.onboard(dst, src, {pool}, tokens);
     manager.syncTransfers();
     stream->synchronize();
+    auto const stats = manager.getAndResetTransferStats();
+    EXPECT_EQ(stats.offloadBytes, static_cast<std::size_t>(expectedBytes));
+    EXPECT_EQ(stats.onboardBytes, static_cast<std::size_t>(expectedBytes));
     if (selected)
     {
         ASSERT_EQ(observations().size(), 2);
@@ -560,9 +557,10 @@ TEST_F(KvOffloadProfilerTest, LegacyDeviceReuseIsNotOffload)
     auto src = std::make_shared<legacy::KVCacheBlock>(11, tensorrt_llm::kernels::KVCacheIndex(0));
     auto dst = std::make_shared<legacy::KVCacheBlock>(12, tensorrt_llm::kernels::KVCacheIndex(1));
     CallbackGuard callback;
-    tensorrt_llm::testing::KVCacheTransferManagerTestAccess::copy(manager, src, dst, {pool}, true, 3);
+    manager.onboard(src, dst, {pool}, 3);
     manager.syncTransfers();
     stream->synchronize();
+    EXPECT_EQ(manager.getAndResetTransferStats().intraDeviceCopyBytes, 192U);
     EXPECT_TRUE(observations().empty());
 }
 

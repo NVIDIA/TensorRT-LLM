@@ -100,12 +100,13 @@ private:
      * \param numTokensToCopy if > 0, partial copy is done
      * \param mode            See \ref executor::KvCacheTransferMode
      * \param directory       Directory to save the file if mode is GDS or POSIX_DEBUG_FALLBACK
+     * \return Byte count for transfer statistics across all pools.
      *
      * The default param is set to executor::KvCacheTransferMode::DRAM.
      */
-    void copyBlock(BlockPtr const& src, BlockPtr const& dst, std::vector<KVCacheBlockPool> const& pools, bool isOffload,
-        int numTokensToCopy = 0, executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM,
-        std::string const& directory = "");
+    [[nodiscard]] std::size_t copyBlock(BlockPtr const& src, BlockPtr const& dst,
+        std::vector<KVCacheBlockPool> const& pools, bool isOffload, int numTokensToCopy = 0,
+        executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM, std::string const& directory = "");
 
     //! \brief Compute total bytes actually transferred for a block copy across all pools.
     //! \param pools The pool descriptors.

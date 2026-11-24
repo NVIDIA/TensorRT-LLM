@@ -138,7 +138,7 @@ PoolTransferSize poolTransferSize(KVCacheBlockPool const& pool, int requestedTok
 
 //! Copy KV blocks through the selected memory or file transport, honoring supported partial-copy layouts.
 //! Direct DRAM host/device copies may emit submission metadata; device reuse and file transfers do not.
-void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
+std::size_t KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
     std::vector<KVCacheBlockPool> const& pools, bool isOffload, int numTokensToCopy, executor::KvCacheTransferMode mode,
     std::string const& directory)
 {
@@ -149,12 +149,13 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
     {
         TLLM_LOG_DEBUG("Using DRAM-based copy (GPU <-> CPU) for this block.");
 
-        // Iterate over all pools, partial-copy logic
+        std::size_t totalBytes = 0;
         for (size_t poolIdx = 0; poolIdx < pools.size(); ++poolIdx)
         {
             auto const& pool = pools[poolIdx];
 
             auto const transferSize = poolTransferSize(pool, numTokensToCopy);
+            totalBytes += transferSize.bytes;
             auto const stream = (isOffload ? mOffloadManager : mOnboardManager).getStream().get();
             detail::KvCacheTransferScope scope;
             scope.startHostDeviceCopy(*(src->isPrimary() ? pool.primaryPtr : pool.secondaryPtr),
@@ -225,7 +226,7 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
         }
 
         TLLM_LOG_DEBUG("copyBlock: DRAM mode complete. Returning...");
-        return;
+        return totalBytes;
     }
 
     std::vector<kvc::FileDesc> fileBlobs;
@@ -283,6 +284,7 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
 
         mLoopbackAgent->executeLoopbackRequest(memoryDescs, fileDescs, isOffload);
     }
+    return computeBlockTransferBytes(pools, numTokensToCopy);
 }
 
 //
@@ -347,12 +349,11 @@ void KVCacheTransferManager::onboard(BlockPtr const& offloadedBlock, BlockPtr co
         mPendingWrites.erase(blockPendingWriteItr);
     }
 
-    copyBlock(offloadedBlock, block, pools, false, numTokensToCopy, mode, directory);
+    auto const bytes = copyBlock(offloadedBlock, block, pools, false, numTokensToCopy, mode, directory);
 
     // Update transfer statistics — distinguish host→GPU onboard from GPU→GPU intra-device copy
     {
         std::lock_guard<std::mutex> lock(mStatsMutex);
-        auto bytes = computeBlockTransferBytes(pools, numTokensToCopy);
         if (offloadedBlock->isPrimary())
         {
             ++mIntraDeviceCopyBlockCount;
@@ -402,13 +403,13 @@ void KVCacheTransferManager::offload(BlockPtr const& block, BlockPtr const& offl
         mPendingWrites.erase(offloadBlockPendingWriteItr);
     }
 
-    copyBlock(block, offloadBlock, pools, true, numTokensToCopy, mode, directory);
+    auto const bytes = copyBlock(block, offloadBlock, pools, true, numTokensToCopy, mode, directory);
 
     // Update transfer statistics
     {
         std::lock_guard<std::mutex> lock(mStatsMutex);
         ++mOffloadBlockCount;
-        mOffloadByteCount += computeBlockTransferBytes(pools, numTokensToCopy);
+        mOffloadByteCount += bytes;
     }
 
     // Record new pending read from block
