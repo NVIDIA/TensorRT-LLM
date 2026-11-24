@@ -4633,3 +4633,68 @@ def test_kv_result_with_bad_report_token_is_rejected(peer_rank: int, token: byte
             kv_result_report_token=token,
         )
     assert task.status != transfer_mod.TaskStatus.TRANSFERRED
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("recovery_enabled", [False, True])
+def test_repeated_peer_metadata_load_failures_rebuild_the_agent(monkeypatch, recovery_enabled):
+    sender = _make_owned_sender()
+    sender._enforce_physical_ownership = False
+    sender._agent = Mock()
+    sender._agent.load_remote_agent.side_effect = RuntimeError("NIXL_ERR_INVALID_PARAM")
+    sender._admission_lock = threading.Lock()
+    sender._agent_failed = False
+    sender._agent_generation = 4
+    sender._peer_transfer_counts = {}
+    sender._recover_agent = Mock() if recovery_enabled else None
+    now = time.monotonic()
+    monkeypatch.setattr(transfer_mod.time, "monotonic", lambda: now)
+    sender._deferred_remote_agents["decode0"] = (b"descriptor", 0.0)
+
+    for _ in range(transfer_mod._PEER_LOAD_ATTEMPTS_BEFORE_RECOVERY + 1):
+        with sender._loaded_remote_agents_lock:
+            sender._load_deferred_peer_locked("decode0")
+        now += 1.1
+
+    # The descriptor stays retained for the rebuilt agent to replay.
+    assert sender._deferred_remote_agents["decode0"][0] == b"descriptor"
+    if recovery_enabled:
+        assert sender._agent_failed
+        sender._recover_agent.assert_called_once_with(4)
+        # A fenced agent loads nothing more until recovery replaces it.
+        assert (
+            sender._agent.load_remote_agent.call_count
+            == transfer_mod._PEER_LOAD_ATTEMPTS_BEFORE_RECOVERY
+        )
+    else:
+        assert not sender._agent_failed
+        assert (
+            sender._agent.load_remote_agent.call_count
+            == transfer_mod._PEER_LOAD_ATTEMPTS_BEFORE_RECOVERY + 1
+        )
+
+
+@pytest.mark.cpu_only
+def test_successful_peer_metadata_load_resets_the_failure_count(monkeypatch):
+    sender = _make_owned_sender()
+    sender._agent = Mock()
+    sender._agent.load_remote_agent.side_effect = [RuntimeError("transient"), None] * 3
+    sender._admission_lock = threading.Lock()
+    sender._agent_failed = False
+    sender._agent_generation = 0
+    sender._peer_transfer_counts = {}
+    sender._remote_agent_descriptors = {}
+    sender._recover_agent = Mock()
+    now = time.monotonic()
+    monkeypatch.setattr(transfer_mod.time, "monotonic", lambda: now)
+
+    for _ in range(3):
+        sender._deferred_remote_agents["decode0"] = (b"descriptor", 0.0)
+        for _ in range(2):
+            with sender._loaded_remote_agents_lock:
+                sender._load_deferred_peer_locked("decode0")
+            now += 1.1
+        assert "decode0" in sender._loaded_remote_agents
+        sender._loaded_remote_agents.discard("decode0")
+    sender._recover_agent.assert_not_called()
+    assert not sender._agent_failed

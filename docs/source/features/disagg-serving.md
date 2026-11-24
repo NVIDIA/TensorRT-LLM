@@ -762,7 +762,10 @@ legacy path. Released terminal peer errors remain request scoped; an unretirable
 native handle fences the local agent and starts recovery. If replaying a peer's
 metadata fails, healthy peers remain available. The sender retains the failed
 descriptor and retries it on a later request, at most once per second per peer,
-without requiring the receiver to send a new registration message.
+without requiring the receiver to send a new registration message. After three
+consecutive failures for one peer, the sender rebuilds its local agent and replays
+every retained descriptor, because a failed load can leave state that blocks
+later loads of the same peer on that agent.
 
 The fence closes new send and receive admission. Pending GEN admissions remain
 queued and return speculative allocations while the agent recovers. New CTX

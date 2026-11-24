@@ -123,6 +123,8 @@ _FALLBACK_TX_WAIT_SLICE_S = 1.0
 # an overall deadline. KvCacheTransceiverV2 requires a configured transfer
 # timeout before it creates either sender or receiver sessions.
 _FALLBACK_TX_OVERALL_TIMEOUT_S = 60.0
+# Consecutive failed metadata loads for one peer before the local agent is rebuilt.
+_PEER_LOAD_ATTEMPTS_BEFORE_RECOVERY = 3
 _RANK_INFO_AUTH_CONTEXT = b"trtllm-rank-info-request-v1\0"
 _RANK_INFO_NONCE_BYTES = 32
 _RANK_INFO_AUTH_TAG_BYTES = 32
@@ -839,6 +841,7 @@ class Sender(SenderBase):
         self._recover_agent: Optional[Callable[[int], None]] = None
         self._remote_agent_descriptors: dict[str, bytes] = {}
         self._deferred_remote_agents: dict[str, tuple[bytes, float]] = {}
+        self._peer_load_failures: dict[str, int] = {}
         self._peer_transfer_counts: dict[str, int] = {}
         self._peer_refresh_enabled = (
             _ucx_peer_refresh_supported()
@@ -1269,9 +1272,28 @@ class Sender(SenderBase):
                 self._agent.invalidate_remote_agent(name)
                 self._loaded_remote_agents.discard(name)
             self._agent.load_remote_agent(name, descriptor)
-        except RuntimeError:
+        except RuntimeError as error:
             self._deferred_remote_agents[name] = (descriptor, time.monotonic() + 1.0)
+            failures = self.__dict__.setdefault("_peer_load_failures", {})
+            failures[name] = failures.get(name, 0) + 1
+            recover = getattr(self, "_recover_agent", None)
+            if recover is None or failures[name] < _PEER_LOAD_ATTEMPTS_BEFORE_RECOVERY:
+                if failures[name] == 1:
+                    logger.warning(f"Loading NIXL metadata for peer {name} failed: {error}")
+                return
+            # A failed load can leave backend connection state under this peer
+            # name that makes every later load on this agent fail. A rebuilt
+            # agent starts without it and replays the retained descriptor.
+            logger.error(
+                f"Loading NIXL metadata for peer {name} failed {failures[name]} times; "
+                f"rebuilding the local agent: {error}"
+            )
+            failures.clear()
+            with self._admission_lock:
+                self._agent_failed = True
+            recover(self._agent_generation)
             return
+        getattr(self, "_peer_load_failures", {}).pop(name, None)
         self._remote_agent_descriptors[name] = descriptor
         self._loaded_remote_agents.add(name)
         del self._deferred_remote_agents[name]
