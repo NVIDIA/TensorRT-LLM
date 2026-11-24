@@ -223,8 +223,22 @@ class MiniMaxM3MsaMetadata(Metadata):
         super().__init__(registry, config)
         params = self.sparse_metadata_params
         self._msa_params = params if isinstance(params, MiniMaxM3SparseMetadataParams) else None
+        if config.is_cuda_graph:
+            # The metadata of a CUDA graph batch size shares the buffers of the
+            # one it is created from; see init_cuda_graph_metadata.
+            return
         self._create_msa_buffers()
         self._validate_decode_kernel_support()
+
+    def init_cuda_graph_metadata(self, graph_metadata: "MiniMaxM3MsaMetadata") -> None:
+        """Start the MSA state of a CUDA graph batch size from this one.
+
+        The buffers are sized for the worst-case geometry, so the graph
+        metadata of every batch size share them instead of holding their own.
+        """
+        for name, value in vars(self).items():
+            if name not in ("_registry", "config"):
+                setattr(graph_metadata, name, value)
 
     def prepare(self, inputs: "BatchInputs") -> None:
         if inputs.stage_host:
