@@ -170,23 +170,21 @@ class LoraParamBuilder:
         enable_spec_decode: bool,
         runtime_draft_len: int,
     ) -> dict:
-        """Eager mode LoRA parameter preparation logic.
+        """Build eager-mode LoRA parameters keyed by ``layer_id`` then ``module_id``.
 
-        lora_params: dict
-        {
-            layer_id: dict
-            {
-                module_id: dict
-                {
-                    adapter_size: torch tensor: int
-                    weight_pointers: torch tensor: int64
-                }
-            }
-        }
+        Each ``(layer_id, module_id)`` entry contains CPU contiguous tensors ordered by
+        ``scheduled_requests.all_requests()``:
+        - ``adapter_size``: ``int32`` tensor of shape ``[num_requests]``
+        - ``weight_pointers``: ``int64`` tensor of shape ``[3 * num_requests]`` holding
+          ``(weights_in, weights_out, scaling_vec)`` pointer triples per request
+
+        Requests without an entry for a ``(layer_id, module_id)`` receive zeros. When at
+        least one entry is present, ``host_request_types``, ``prompt_lens_cpu``, and
+        ``num_seqs`` metadata keys are also populated. Returned per-entry tensors are
+        views into shared backing tables, so callers must treat them as read-only and not
+        resize or rebind them in place.
         """
         request_list = scheduled_requests.all_requests()
-        if not request_list:
-            return {}
 
         # Map each distinct lora_task_id (in first-seen order) to a column 1..num_adapters;
         # column 0 stays zero for base requests and adapters with empty config lists.
@@ -216,9 +214,7 @@ class LoraParamBuilder:
 
         num_cols = len(adapter_configs) + 1
         ptr_row_len = 3 * num_cols
-        lora_params: dict = {}
         entry_rows: dict[tuple[int, int], tuple[list[int], list[int]]] = {}
-        entry_targets: list[tuple[dict, int]] = []
         sizes_by_entry: list[list[int]] = []
         ptrs_by_entry: list[list[int]] = []
 
@@ -227,9 +223,7 @@ class LoraParamBuilder:
         for adapter_col, configs in enumerate(adapter_configs, start=1):
             ptr_base = adapter_col * 3
             for module in configs:
-                layer_id = module.layer_id
-                module_id = module.module_id
-                key = (layer_id, module_id)
+                key = (module.layer_id, module.module_id)
                 pair = entry_rows.get(key)
                 if pair is None:
                     sizes_row = [0] * num_cols
@@ -238,12 +232,6 @@ class LoraParamBuilder:
                     entry_rows[key] = pair
                     sizes_by_entry.append(sizes_row)
                     ptrs_by_entry.append(ptrs_row)
-                    layer_dict = lora_params.get(layer_id)
-                    if layer_dict is None:
-                        layer_dict = {}
-                        lora_params[layer_id] = layer_dict
-                    layer_dict[module_id] = None
-                    entry_targets.append((layer_dict, module_id))
                 else:
                     sizes_row, ptrs_row = pair
 
@@ -253,26 +241,23 @@ class LoraParamBuilder:
                 scaling_vec_pointer = module.scaling_vec_pointer
                 ptrs_row[ptr_base + 2] = 0 if scaling_vec_pointer is None else scaling_vec_pointer
 
-        num_entries = len(entry_targets)
-        num_requests = len(req_adapter_cols)
+        num_entries = len(entry_rows)
         req_idx = torch.tensor(req_adapter_cols, dtype=torch.int64, device="cpu")
         sizes_table = torch.tensor(sizes_by_entry, dtype=torch.int32, device="cpu")
         ptrs_table = torch.tensor(ptrs_by_entry, dtype=torch.int64, device="cpu").view(
             num_entries, num_cols, 3
         )
 
-        sizes_out = sizes_table.index_select(1, req_idx).contiguous().unbind(0)
-        ptrs_out = (
-            ptrs_table.index_select(1, req_idx)
-            .contiguous()
-            .view(num_entries, 3 * num_requests)
-            .unbind(0)
-        )
+        sizes_out = sizes_table.index_select(1, req_idx).unbind(0)
+        ptrs_out = ptrs_table.index_select(1, req_idx).flatten(1).unbind(0)
 
-        for (layer_dict, module_id), size_t, ptr_t in zip(entry_targets, sizes_out, ptrs_out):
-            layer_dict[module_id] = {
-                "adapter_size": size_t,
-                "weight_pointers": ptr_t,
+        lora_params: dict = {}
+        for (layer_id, module_id), adapter_size, weight_pointers in zip(
+            entry_rows, sizes_out, ptrs_out
+        ):
+            lora_params.setdefault(layer_id, {})[module_id] = {
+                "adapter_size": adapter_size,
+                "weight_pointers": weight_pointers,
             }
 
         host_request_types = attn_metadata.host_request_types
