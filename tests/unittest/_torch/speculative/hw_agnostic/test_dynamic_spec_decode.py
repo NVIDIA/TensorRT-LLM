@@ -68,44 +68,44 @@ def test_dynamic_draft_len(enforce_single_worker):
         max_num_tokens=8192,
         max_seq_len=96,
     )
-    llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
-
     prompts = [
         "The president of the United States is",
     ]
     sampling_params = SamplingParams(max_tokens=50, temperature=0)
-    with patch(
-        "tensorrt_llm._torch.speculative.draft_budget.get_draft_len_for_batch_size",
-        mock_get_draft_len_for_batch_size,
-    ):
-        results_spec = llm_spec.generate(prompts, sampling_params)
-        generated_text_spec = [result.outputs[0].text for result in results_spec]
-    # Prefill consumes 94 positions and emits the first output token. The
-    # next forward must run a single target row to occupy the last position.
-    boundary_prompt = [17] * 94
-    boundary_params = SamplingParams(max_tokens=8, temperature=0, ignore_eos=True)
-    executor = llm_spec._executor.engine
-    widths = []
-    prepare = executor._handle_dynamic_draft_len
+    with LLM(**llm_common_config, speculative_config=spec_config) as llm_spec:
+        with patch(
+            "tensorrt_llm._torch.speculative.draft_budget.get_draft_len_for_batch_size",
+            mock_get_draft_len_for_batch_size,
+        ):
+            results_spec = llm_spec.generate(prompts, sampling_params)
+            generated_text_spec = [result.outputs[0].text for result in results_spec]
+        # Prefill consumes 94 positions and emits the first output token. The
+        # next forward must run a single target row to occupy the last position.
+        boundary_prompt = [17] * 94
+        boundary_params = SamplingParams(max_tokens=8, temperature=0, ignore_eos=True)
+        executor = llm_spec._executor.engine
+        widths = []
+        prepare = executor._handle_dynamic_draft_len
 
-    def record_width(batch):
-        prepare(batch)
-        if batch.generation_requests:
-            widths.append(executor.runtime_draft_len)
+        def record_width(batch):
+            prepare(batch)
+            if batch.generation_requests:
+                widths.append(executor.runtime_draft_len)
 
-    with patch.object(executor, "_handle_dynamic_draft_len", record_width):
-        boundary_tokens = (
-            llm_spec.generate([boundary_prompt], boundary_params)[0].outputs[0].token_ids
+        with patch.object(executor, "_handle_dynamic_draft_len", record_width):
+            boundary_tokens = (
+                llm_spec.generate([boundary_prompt], boundary_params)[0].outputs[0].token_ids
+            )
+        assert widths == [0]
+        assert len(boundary_tokens) == 2
+
+    with LLM(**llm_common_config) as llm_ref:
+        results_ref = llm_ref.generate(prompts, sampling_params)
+        generated_text_ref = [result.outputs[0].text for result in results_ref]
+        assert (
+            boundary_tokens
+            == llm_ref.generate([boundary_prompt], boundary_params)[0].outputs[0].token_ids
         )
-    assert widths == [0]
-    assert len(boundary_tokens) == 2
-    llm_spec.shutdown()
-
-    llm_ref = LLM(**llm_common_config)
-    results_ref = llm_ref.generate(prompts, sampling_params)
-    generated_text_ref = [result.outputs[0].text for result in results_ref]
-    assert boundary_tokens == llm_ref.generate([boundary_prompt], boundary_params)[0].outputs[0].token_ids
-    llm_ref.shutdown()
 
     for text_spec, text_ref in zip(generated_text_spec, generated_text_ref):
         assert text_spec == text_ref
