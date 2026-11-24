@@ -58,7 +58,7 @@ The checkpoint is in the Hugging Face format: `config.json` (`model_type: kimi_k
 | :-- | --: | :-- | :-- | :-- |
 | Aggregated TEP8 | 8 | one server: `tensor_parallel_size: 8`, `moe_expert_parallel_size: 8` | `kimi_k31_pro_mxfp4__sm_103__tep` | GSM8K, GPQA Diamond, Kimi Vendor Verifier (including images) |
 | Aggregated DEP16 | 16 | one server: `tensor_parallel_size: 16`, `moe_expert_parallel_size: 16`, `enable_attention_dp: true` | `kimi_k31_pro_mxfp4__sm_103__dep` | GSM8K, GPQA Diamond, Kimi Vendor Verifier (including images), BEAM (1M-token contexts) |
-| Disaggregated: 2x TEP8 context, DEP16 generation, DCX | 32 | two TEP8 context servers, one DEP16 generation server, a router | context `__sm_103__tep`, generation `__sm_103__dep` | GSM8K, GPQA Diamond, Kimi Vendor Verifier (text), BEAM (1M-token contexts) |
+| Disaggregated: 2x TEP8 context, DEP16 generation, DCX | 32 | two TEP8 context servers, one DEP16 generation server, a router | context `__sm_103__tep`, generation `__sm_103__dep` | GSM8K, GPQA Diamond, Kimi Vendor Verifier (including images), BEAM (1M-token contexts) |
 
 All three run FP8 KV caches and DFlash2 speculative decoding.
 
@@ -67,7 +67,7 @@ Routing takes the attention-TP performance target for TEP8 with an FP8 KV cache,
 | Feature | Status |
 | :-- | :-- |
 | DFlash2 speculative decoding | Supported: one-engine DFlash with the DFlash2 drafter and block verification (`use_rejection_sampling: true`). |
-| Image input | Supported on the aggregated deployments. The disaggregated configuration below runs text-only context servers. |
+| Image input | Supported on aggregated servers and through the disaggregated router when the context servers run MoonViT. |
 | KV cache block reuse | Opt-in (`kv_cache_config.enable_block_reuse: true`); it also keeps KDA recurrent-state snapshots. Works with DFlash2. |
 | Chunked prefill | Supported; required when prompts can be longer than `max_num_tokens`. |
 | Disaggregated serving | Python transceiver over NIXL only; drafter context transfer (DCX) is always on with DFlash2. |
@@ -272,7 +272,7 @@ These options are set in the YAML file passed to `trtllm-serve --config`. See th
 * **Reasoning:** Thinking is on by default, with effort `max`. Turn it off per request with `"thinking": {"type": "disabled"}`, `"reasoning_effort": "none"` or `"chat_template_kwargs": {"thinking": false}`. Set the effort with `thinking.effort` or `reasoning_effort`: `low`, `high` or `max`; a `thinking.effort` outside these values returns HTTP 400, and a `reasoning_effort` with no Kimi equivalent (for example `medium`) leaves the default. Explicit `chat_template_kwargs` take precedence, then the `thinking` object, then `reasoning_effort`. With `--reasoning_parser kimi_k31`, the reasoning is returned in `reasoning_content` and the answer in `content`.
 * **Tool calling:** With `--tool_parser kimi_k3`, calls are returned in `tool_calls`. `tool_choice` accepts `auto`, `required` and `none`. Tools can also be declared on system messages (message-level tools, a Kimi API extension). With DFlash2, `tool_choice: "required"` is requested through the chat template: the model normally calls a tool, but a response without one is possible.
 * **Sampling:** Use `temperature` 1.0 and `top_p` 0.95. `TRTLLM_KIMI_PARAM_POLICY=1` in the server environment enforces Kimi's pinned sampling parameters: `top_p` 0.95 (unset or `1.0` is coerced, other values return HTTP 400), no presence or frequency penalty, `n` 1 and `temperature` within [0, 1]. Kimi Vendor Verifier certification runs need it.
-* **Images:** The aggregated deployments accept images as `image_url` content parts (data URLs, or `http(s)` URLs that the server downloads). Image tokens count against `max_seq_len`.
+* **Images:** Aggregated servers and the disaggregated router accept images as `image_url` content parts (data URLs, or `http(s)` URLs that the server downloads). Image tokens count against `max_seq_len`.
 * **Usage reporting:** Streaming responses report `usage` in the final chunk without `stream_options`. `usage.prompt_tokens` excludes the 3-token generation-channel opener that ends the rendered prompt.
 * **Conversation routing:** Requests that carry `"conversation_params": {"conversation_id": "<id>"}` stay on the attention-DP rank (DEP16) or the context server (disaggregated) that holds the conversation's cache.
 
@@ -371,7 +371,7 @@ Disaggregated serving runs separate context (prefill) and generation (decode) se
   ```
 
 * An FP8 KV cache and KV cache manager V2 on both sides. Block reuse is on for the context servers (multi-turn prefixes) and off for the generation servers.
-* The context servers run without the overlap scheduler and without the vision tower (`disable_mm_encoder: true`), so the configuration below is text-only. For image requests, use a context server with the vision tower: remove `disable_mm_encoder`, `prefill_cuda_graph_backend` and `prefill_capture_num_tokens` from its configuration and leave `TLLM_MULTIMODAL_DISAGGREGATED` unset.
+* For image requests, enable MoonViT on the context servers. Leave `TLLM_MULTIMODAL_DISAGGREGATED` unset and set `disable_mm_encoder: false`. The TEP8 context server can keep `prefill_cuda_graph_backend: breakable` for text batches. Batches carrying image inputs run eagerly. The image benchmarks use `max_num_tokens: 32768` for context. The router can keep `gen_strip_message_history: true` with `gen_tokids_ctxbytes: true`. The generation server receives the full prompt token IDs and image KV over the handoff, including images from earlier turns. It can set `disable_mm_encoder: true`.
 * **Drafter context transfer (DCX)** is always on with DFlash2: the KV cache transfer carries the drafter's prompt context, so the generation server drafts from the first token. A context server (`--server_role context`) runs a context-only drafter. Set its `max_draft_len` to the generation server's. A pair in which only one side carries the drafter context is refused at registration.
 * Environment on every context and generation rank, in addition to the DEP16 environment of [Launch the TensorRT LLM Server](#launch-the-tensorrt-llm-server):
 
@@ -550,7 +550,6 @@ LLM_MODELS_ROOT=/path/to/models pytest \
 ## Known Limitations
 
 * **Guided decoding and DFlash2.** DFlash2 with block verification does not allow a guided-decoding backend, so `response_format` is not constrained and `tool_choice: "required"` is requested through the chat template on these deployments. Adding `guided_decoding_backend` to a configuration above fails at startup (`use_rejection_sampling=True is not supported for this configuration: guided decoding is enabled`). For grammar-enforced tool calls and structured outputs, serve without speculative decoding with `guided_decoding_backend: xgrammar` and `--reasoning_parser kimi_k31` on an aggregated server; the guided-decoding tests were validated this way. Keeping DFlash2 with `use_rejection_sampling: false` is also accepted: sampled requests are then verified by exact match, which accepts fewer drafted tokens per step than block verification, so decoding is slower at the recommended `temperature` of 1.0 (greedy requests are unaffected).
-* **Images in disaggregated serving.** The disaggregated configuration above runs text-only context servers.
 * **Long contexts.** The aggregated TEP8 configuration is validated at `max_seq_len` 131072; use DEP16 or the disaggregated configuration for contexts up to 1,048,576 tokens.
 * **KV cache dtypes.** `fp8` and `auto` only.
 * **Determinism.** Greedy decoding is not bitwise reproducible across runs and batch compositions; scores vary by a few tenths of a point between runs.

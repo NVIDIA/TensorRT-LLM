@@ -8493,7 +8493,7 @@ def profiling_image_rows(
 
 
 _NO_LOCAL_TOWER = (
-    "Image input is not supported: this server runs no vision tower (disable_mm_encoder, "
+    "Cannot encode this image prompt because this server has no vision tower (disable_mm_encoder, "
     "TLLM_MULTIMODAL_DISAGGREGATED, or a checkpoint without vision tower weights)."
 )
 
@@ -8527,10 +8527,10 @@ def image_embeddings(
     step that needs it) and its rows stay on the request's multimodal data for the later chunks.
 
     Raises:
-        NotImplementedError: If an image reaches a server that runs no local vision tower, which admission
-            (``validate_image_request``) refuses first.
+        NotImplementedError: If a context step needs to encode an image without a local vision tower.
     """
-    if not multimodal_params:
+    # Decode-only rows already have the image KV transferred from the context worker.
+    if num_contexts == 0 or not multimodal_params:
         return []
     if tower is None:
         raise NotImplementedError(_NO_LOCAL_TOWER)
@@ -8627,9 +8627,8 @@ class K31VLWrapper(PreTrainedModel):
         self.model_config = model_config
         self._vlm_pretrained_config = config
 
-        # The vision tower is built and filled by the weight loader. Text-only
-        # serving (disable_mm_encoder) and E/P disaggregation both run without
-        # a local vision tower.
+        # The weight loader builds MoonViT for local image prefill. A disaggregated
+        # generation worker consumes the image KV from its context worker.
         self.mm_encoder: Optional[K31VisionTower] = None
         self._skip_mm_encoder = multimodal_disaggregated() or model_config.disable_mm_encoder
 
@@ -8963,6 +8962,9 @@ def run_on_large_datastack_chunk(fn: Callable[..., Any], /, *args: Any, **kwargs
 
 class ModelingV2KimiK31ProMxfp4Sm103Tep(KimiK31ForConditionalGeneration):
     """Kimi K3.1 Pro MXFP4, sm_103, attention TP perf layouts (TEP8, TEP16 MoE TP4 x EP4, TEP32 MoE TP4 x EP8)."""
+
+    # The decoder body can replay text-only prefill. Batches with image inputs run eagerly.
+    supports_prefill_cuda_graph = True
 
     def __init__(self, model_config, *args, **kwargs) -> None:
         super().__init__(model_config, *args, **kwargs)

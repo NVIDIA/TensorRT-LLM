@@ -6,11 +6,10 @@
 :data:`KIMI_K31_PLACEHOLDER_METADATA` for model_type ``kimi_k31``. The driver process builds the processor without
 building the model, so this module imports no target. :class:`K31InputProcessor` runs the checkpoint's HF
 ``AutoProcessor`` (Moon-Patch tiling of each image), expands each media placeholder to one token per output embedding,
-and states the encoder items (one per image: its patches and output embeddings). Kimi K3.1 takes images only; a
-target that runs no vision tower refuses them in its own admission check, before the request is scheduled. The
-processed images (``multimodal_data["image"]``: ``pixel_values`` and ``image_grid_thw``) are what the targets' vision
-tower (``K31VisionTower`` in their ``modeling.py``) reads, and :func:`moonvit_max_image_grid` is the largest image
-the processor produces.
+and describes each image's patches and output embeddings. Image prefill requires a local vision tower.
+Disaggregated generation uses the KV from the context server. Each target's ``K31VisionTower`` reads
+``pixel_values`` and ``image_grid_thw`` from ``multimodal_data["image"]``. The largest grid the processor
+produces is given by :func:`moonvit_max_image_grid`.
 
 A prompt without images is tokenized by :class:`KimiPromptEncoder`: a Kimi checkpoint ships a tiktoken tokenizer
 (``TikTokenTokenizer`` in its ``tokenization_kimi.py``), and Hugging Face's generic slow path splits the added tokens

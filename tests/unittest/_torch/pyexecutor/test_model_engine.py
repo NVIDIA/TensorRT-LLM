@@ -852,6 +852,21 @@ class ModelEngineTestCase(unittest.TestCase):
         self.assertTrue(is_multimodal(engine.model, engine.input_processor))
         engine._validate_breakable_cuda_graph_compatibility()
 
+    def test_breakable_with_local_image_encoder_requires_wrapper_opt_in(self) -> None:
+        engine = object.__new__(ModelEngine)
+        engine.model = DummyLegacyMultimodalIndexModel()
+        engine.model.llm = Mock(spec=DecoderModelForCausalLM)
+        engine.model.mm_encoder = torch.nn.Identity()
+        engine.input_processor = Mock(spec=BaseMultimodalInputProcessor)
+        engine.llm_args = SimpleNamespace(
+            prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE, disable_mm_encoder=False
+        )
+
+        with self.assertRaisesRegex(ValueError, "multimodal models"):
+            engine._validate_breakable_cuda_graph_compatibility()
+        engine.model.supports_prefill_cuda_graph = True
+        engine._validate_breakable_cuda_graph_compatibility()
+
     def test_restore_after_refit_never_touches_the_kv_cache(self) -> None:
         """The re-wrap hook must not run the warm-up KV-cache cleanup.
 

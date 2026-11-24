@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Kimi K3.1's image input processor: processor geometry, encoder items, the image-only refusal, the text-only refusal
-of the ModelOpt NVFP4 checkpoint.
+"""Tests for Kimi K3.1 image inputs, request admission and prompt tokenization.
 
 The processor tests stub the HF image processor's ``media_proc_cfg``, so all but one test run without a checkpoint.
 That one runs the real processor through the LLM API's hashing wrapper when ``LLM_MODELS_ROOT`` holds the Kimi-K3
@@ -11,6 +10,7 @@ checkpoint (K3.1's image input is K3's).
 from __future__ import annotations
 
 import math
+from importlib import import_module
 from types import SimpleNamespace
 
 import pytest
@@ -24,6 +24,7 @@ from tensorrt_llm._torch.modeling_v2.models.kimi_k31.input_processor import (
     moonvit_max_image_grid,
 )
 from tensorrt_llm._torch.models import modeling_kimi_k3_vl
+from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 #: K3.1's checkpoint processor limits (``preprocessor_config.json`` ``media_proc_cfg``).
 K31_MEDIA = {
@@ -140,6 +141,29 @@ def test_prompts_with_other_modalities_are_refused():
             },
             None,
         )
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "kimi_k31_pro_mxfp4__sm_103__tep",
+        "kimi_k31_pro_mxfp4__sm_103__dep",
+        "kimi_k31_pro_mxfp4__sm_10x__default",
+    ],
+)
+def test_generation_only_image_request_needs_no_local_tower(target: str) -> None:
+    modeling = import_module(f"tensorrt_llm._torch.modeling_v2.models.kimi_k31.{target}.modeling")
+    image = MultimodalParams(multimodal_data={"image": _payload((1, 2, 2))})
+    request = SimpleNamespace(
+        py_multimodal_data=image.multimodal_data, is_generation_only_request=True
+    )
+
+    modeling.validate_image_request(None, request)
+    assert modeling.image_embeddings(None, [image], num_contexts=0) == []
+
+    request.is_generation_only_request = False
+    with pytest.raises(ValueError, match="no vision tower"):
+        modeling.validate_image_request(None, request)
 
 
 # ---------------------------------------------------------------------------

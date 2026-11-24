@@ -174,8 +174,8 @@ def load(model, weights) -> None:
     if model._skip_mm_encoder:
         if vision:
             logger.info(
-                f"Kimi K3.1: {len(vision)} vision tower / projector keys not loaded (no local vision tower); "
-                "image requests are refused at admission"
+                f"Kimi K3.1: skipping {len(vision)} vision tower / projector weights "
+                "because local image encoding is disabled."
             )
     else:
         if model.mm_encoder is None:
@@ -188,8 +188,7 @@ def load(model, weights) -> None:
             )
         if not model.mm_encoder.load_weights(weights):
             logger.warning(
-                "Kimi K3.1: the checkpoint has no vision tower weights; the server runs no vision tower and "
-                "refuses image requests at admission."
+                "Kimi K3.1: the checkpoint has no vision tower weights for local image prefill."
             )
             model.mm_encoder = None
 
