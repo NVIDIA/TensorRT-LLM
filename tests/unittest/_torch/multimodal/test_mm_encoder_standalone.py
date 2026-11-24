@@ -976,7 +976,9 @@ def _synthetic_videos(frame_counts: tuple[int, ...]) -> list[VideoData]:
 
 def _video_inputs(llm: LLM, videos: list[VideoData]) -> dict:
     """Chat prompt with one placeholder per video, plus the raw videos."""
-    prompt = llm.tokenizer.apply_chat_template(
+    # Older Qwen2.5-VL checkpoints ship a text-only tokenizer chat template;
+    # the processor loads the multimodal one from chat_template.json.
+    prompt = llm.input_processor.processor.apply_chat_template(
         [{
             "role":
             "user",
