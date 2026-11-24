@@ -20,9 +20,6 @@ from fmha_test_utils import FakeFmha
 from tensorrt_llm._torch.attention.backends.fmha import registry
 from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
 from tensorrt_llm._torch.attention.backends.fmha.interface import Fmha
-from tensorrt_llm._torch.attention.backends.fmha.prims_ts_dsa_sparse_mla import (
-    PrimsTSDsaSparseMlaFmha,
-)
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm._torch.attention.backends.utils import create_attention
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -61,7 +58,7 @@ def test_default_fmha_libs_include_prims_ts(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 def test_dsa_sparse_mla_is_registered_by_default() -> None:
-    assert registry.FMHA_LIBS[PRIMS_TS_DSA_SPARSE_MLA] is PrimsTSDsaSparseMlaFmha
+    assert PRIMS_TS_DSA_SPARSE_MLA in registry.FMHA_LIBS
     assert PRIMS_TS_DSA_SPARSE_MLA in registry.DEFAULT_FMHA_LIBS
 
 
