@@ -328,12 +328,14 @@ def test_extract_moe_lora_tensors_cuda_graph_wires_slot_tables():
         "use_cuda_graph_mode": True,
         "cuda_graph_params": params,
         "num_seqs": num_seqs,
+        "data_type": torch.float8_e4m3fn,
     }
     kwargs = CutlassMoELoraMixin._extract_moe_lora_tensors_cuda_graph(_ExtractStub(0), lora_params)
     assert kwargs is not None
 
     # max_rank is the global cap, not a per-step value.
     assert kwargs["lora_max_low_rank"] == rank
+    assert kwargs["lora_dtype"] == torch.float8_e4m3fn
 
     # All three modules present, mapped to their kernel slots.
     for kernel, module_id in (

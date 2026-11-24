@@ -35,7 +35,7 @@ from typing import Mapping, Optional
 
 from tensorrt_llm.logger import logger
 
-from .waiting_queue import WaitingQueue
+from .waiting_queue import QueuedLoadTracker, WaitingQueue
 
 GEN_ADMISSION_ENV = "TLLM_GEN_ADMISSION_TTFT_PERCENTILE"
 
@@ -337,6 +337,7 @@ class GenAdmissionWaitingQueue(WaitingQueue):
         # Key for never-stamped items: the latest key seen, the same on every rank.
         self._last_key = 0.0
         self.admitted_by_tier: collections.Counter = collections.Counter()
+        self.queued_load = QueuedLoadTracker()
 
     def enable_rank0(self) -> Optional[FirstTokenTimer]:
         """Log on this rank and, for ``auto``, time admission -> first token."""
@@ -387,6 +388,7 @@ class GenAdmissionWaitingQueue(WaitingQueue):
         self._compact()
         self._order = None
         bisect.insort(self._entries, entry, key=lambda e: (e[0], e[1]))
+        self.queued_load.add(entry[4])
 
     def _build_order(self) -> list[tuple]:
         """(entry, tier) in admission order: each one is the pick once those before it are gone."""
@@ -419,6 +421,27 @@ class GenAdmissionWaitingQueue(WaitingQueue):
             self._compact()
             self._order = self._build_order()[::-1]
         return self._order[-1]
+
+    @property
+    def target_s(self) -> Optional[float]:
+        """The ``auto`` policy's TTFT target X once it is set, else None."""
+        return self.adaptive.X if self.adaptive is not None else None
+
+    def num_at_risk(self, slack_s: float) -> int:
+        """Waiting requests with at most ``slack_s`` to spare against X (late
+        ones included) if the next pop is one of them, else 0 (GEN slot
+        preemption)."""
+        ada, now = self.adaptive, self._now
+        if ada is None or ada.X is None or now is None or not self:
+            return 0
+
+        def at_risk(entry) -> bool:
+            orig, _, _, keyed, _ = entry
+            return keyed and ada.X - (now - orig + ada.s2f_s) <= slack_s
+
+        if not at_risk(self._next()[0]):
+            return 0
+        return sum(1 for e in self._entries if e[1] not in self._popped and at_risk(e))
 
     def mark_admitted(self, items: Iterable) -> None:
         now = self._now
@@ -457,6 +480,7 @@ class GenAdmissionWaitingQueue(WaitingQueue):
         self._order.pop()
         self._popped.add(entry[1])
         item = entry[4]
+        self.queued_load.discard(item.id)
         item._gen_admission_tier = tier
         return item
 
@@ -464,6 +488,16 @@ class GenAdmissionWaitingQueue(WaitingQueue):
         if not self:
             raise IndexError("peek from an empty queue")
         return self._next()[0][4]
+
+    def peek_requests(self, k: int) -> list:
+        if k <= 0 or not self:
+            return []
+        self._next()  # builds the admission order
+        return [entry[4] for entry, _ in self._order[: -k - 1 : -1]]
+
+    def admission_groups(self, requests: list) -> list[int]:
+        """One group per request: the admission order is kept."""
+        return list(range(len(requests)))
 
     def prepend_request(self, request) -> None:
         self._insert(self._make_entry(request, next(self._prepend_counter)))
@@ -477,6 +511,8 @@ class GenAdmissionWaitingQueue(WaitingQueue):
         self._compact()
         self._order = None
         self._entries = [e for e in self._entries if e[4].id not in request_ids]
+        for request_id in request_ids:
+            self.queued_load.discard(request_id, all_items=True)
 
     def __bool__(self) -> bool:
         return len(self) > 0

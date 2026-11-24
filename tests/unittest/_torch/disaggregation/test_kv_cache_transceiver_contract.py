@@ -97,6 +97,7 @@ def test_v2_early_return_paths_are_typed() -> None:
 
     v2._ever_had_recv_session = False
     v2._gen_need_sync = False
+    v2._init_gen_idle_poll(False)
     gen_status = v2.check_gen_transfer_status(0)
     assert isinstance(gen_status, GenTransferStatus)
     assert gen_status == GenTransferStatus([], [], [])

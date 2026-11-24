@@ -27,7 +27,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import torch
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 
 from tensorrt_llm._torch.peft.lora.loaders import HfLoraLoader
 from tensorrt_llm._torch.peft.lora.manager import LoraManager, supports_native_fp8_lora
@@ -234,7 +234,7 @@ class TestLoraManagerRetainDeviceTensors(unittest.TestCase):
     "Native FP8 LoRA requires SM90 or SM100",
 )
 class TestLoraManagerFp8(unittest.TestCase):
-    def test_hf_loader_reports_dense_fp8_dtype(self):
+    def test_hf_loader_reports_fp8_dtype(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             adapter_dir = Path(tmpdir) / "adapter"
             adapter_dir.mkdir()
@@ -247,9 +247,9 @@ class TestLoraManagerFp8(unittest.TestCase):
 
             loader = HfLoraLoader([str(adapter_dir)])
 
-        self.assertEqual(loader.get_dense_lora_dtype(), torch.float8_e4m3fn)
+        self.assertEqual(loader.get_lora_dtype(), torch.float8_e4m3fn)
 
-    def test_hf_loader_ignores_expert_only_fp8_dtype(self):
+    def test_hf_loader_reports_expert_only_fp8_adapter_dtype(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             adapter_dir = Path(tmpdir) / "adapter"
             adapter_dir.mkdir()
@@ -257,7 +257,7 @@ class TestLoraManagerFp8(unittest.TestCase):
 
             loader = HfLoraLoader([str(adapter_dir)])
 
-        self.assertIsNone(loader.get_dense_lora_dtype())
+        self.assertEqual(loader.get_lora_dtype(), torch.float8_e4m3fn)
 
     def test_fp8_dora_is_rejected(self):
         model_config = MockModelConfig()
@@ -288,7 +288,7 @@ class TestLoraManagerFp8(unittest.TestCase):
                     uids=["fp8-dora"],
                 )
 
-    def test_fp8_moe_weights_are_converted_to_model_dtype(self):
+    def test_fp8_moe_weights_remain_fp8(self):
         model_config = MockModelConfig(
             lora_target_modules=["moe_h_to_4h"],
             trtllm_modules_to_hf_modules={"moe_h_to_4h": "mlp.experts.gate_proj"},
@@ -311,9 +311,9 @@ class TestLoraManagerFp8(unittest.TestCase):
                 uids=["fp8-moe"],
             )
 
-        self.assertEqual(manager.cpp_lora_weights["fp8-moe"].dtype, torch.bfloat16)
+        self.assertEqual(manager.cpp_lora_weights["fp8-moe"].dtype, torch.float8_e4m3fn)
 
-    def test_mixed_fp8_dense_and_moe_modules_are_rejected_before_cache_mutation(self):
+    def test_mixed_fp8_dense_and_moe_modules_use_one_fp8_cache_dtype(self):
         model_config = MockModelConfig(
             lora_target_modules=["attn_q", "moe_h_to_4h"],
             trtllm_modules_to_hf_modules={
@@ -335,14 +335,96 @@ class TestLoraManagerFp8(unittest.TestCase):
             adapter_dir.mkdir()
             _create_dummy_hf_moe_lora_adapter(adapter_dir, include_dense=True)
 
+            manager.load_from_hf(
+                model_dirs=[str(adapter_dir)],
+                model_config=model_config,
+                uids=["mixed-fp8"],
+            )
+
+        self.assertEqual(manager.cpp_lora_weights["mixed-fp8"].dtype, torch.float8_e4m3fn)
+
+    def test_fp8_moe_misaligned_rank_is_rejected_before_cache_mutation(self):
+        model_config = MockModelConfig(
+            lora_target_modules=["moe_h_to_4h"],
+            trtllm_modules_to_hf_modules={"moe_h_to_4h": "mlp.experts.gate_proj"},
+            dtype="bfloat16",
+        )
+        manager = LoraManager(
+            mapping=Mapping(world_size=1, rank=0, tp_size=1),
+            model_config=model_config,
+            cpp_peft_cache_manager=MagicMock(),
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            adapter_dir = Path(tmpdir)
+            _create_dummy_hf_moe_lora_adapter(adapter_dir, rank=8)
+            with self.assertRaisesRegex(ValueError, "multiples of 16.*rank=8"):
+                manager.load_from_hf(
+                    model_dirs=[str(adapter_dir)], model_config=model_config, uids=["misaligned"]
+                )
+        self.assertNotIn("misaligned", manager.cpp_lora_weights)
+
+    def test_fp8_moe_and_bf16_dense_are_rejected_before_cache_mutation(self):
+        model_config = MockModelConfig(
+            lora_target_modules=["attn_q", "moe_h_to_4h"],
+            trtllm_modules_to_hf_modules={
+                "attn_q": "q_proj",
+                "attn_k": "k_proj",
+                "attn_v": "v_proj",
+                "moe_h_to_4h": "mlp.experts.gate_proj",
+            },
+            dtype="bfloat16",
+        )
+        manager = LoraManager(
+            mapping=Mapping(world_size=1, rank=0, tp_size=1),
+            model_config=model_config,
+            cpp_peft_cache_manager=MagicMock(),
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            adapter_dir = Path(tmpdir)
+            _create_dummy_hf_moe_lora_adapter(adapter_dir, include_dense=True)
+            weights_path = str(adapter_dir / "adapter_model.safetensors")
+            weights = load_file(weights_path)
+            weights = {
+                name: tensor.to(torch.bfloat16) if "self_attn" in name else tensor
+                for name, tensor in weights.items()
+            }
+            save_file(weights, weights_path)
+            with self.assertRaisesRegex(ValueError, "checkpoint weights must have one dtype"):
+                HfLoraLoader([str(adapter_dir)]).get_lora_dtype()
             with self.assertRaisesRegex(ValueError, "one PEFT cache dtype"):
                 manager.load_from_hf(
-                    model_dirs=[str(adapter_dir)],
-                    model_config=model_config,
-                    uids=["mixed-fp8"],
+                    model_dirs=[str(adapter_dir)], model_config=model_config, uids=["mixed"]
                 )
+        self.assertNotIn("mixed", manager.cpp_lora_weights)
 
-        self.assertNotIn("mixed-fp8", manager.cpp_lora_weights)
+    def test_heterogeneous_expert_dtypes_are_rejected(self):
+        model_config = MockModelConfig(
+            lora_target_modules=["moe_h_to_4h"],
+            trtllm_modules_to_hf_modules={"moe_h_to_4h": "mlp.experts.gate_proj"},
+            dtype="bfloat16",
+        )
+        manager = LoraManager(
+            mapping=Mapping(world_size=1, rank=0, tp_size=1),
+            model_config=model_config,
+            cpp_peft_cache_manager=MagicMock(),
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            adapter_dir = Path(tmpdir)
+            _create_dummy_hf_moe_lora_adapter(adapter_dir)
+            weights_path = str(adapter_dir / "adapter_model.safetensors")
+            weights = load_file(weights_path)
+            weights = {
+                name: tensor.to(torch.bfloat16) if ".experts.1." in name else tensor
+                for name, tensor in weights.items()
+            }
+            save_file(weights, weights_path)
+            with self.assertRaisesRegex(ValueError, "checkpoint weights must have one dtype"):
+                HfLoraLoader([str(adapter_dir)]).get_lora_dtype()
+            with self.assertRaisesRegex(ValueError, "MoE LoRA experts must have one output dtype"):
+                manager.load_from_hf(
+                    model_dirs=[str(adapter_dir)], model_config=model_config, uids=["heterogeneous"]
+                )
+        self.assertNotIn("heterogeneous", manager.cpp_lora_weights)
 
     def test_partial_qkv_fp8_adapter_uses_fp8_placeholders(self):
         model_config = MockModelConfig(dtype="bfloat16")
@@ -517,7 +599,8 @@ class TestLoraManagerFp8(unittest.TestCase):
                 dtype=torch.float8_e4m3fn,
                 input_dtype=torch.float8_e5m2,
             )
-            self.assertIsNone(HfLoraLoader([str(adapter_dir)]).get_dense_lora_dtype())
+            with self.assertRaisesRegex(ValueError, "checkpoint weights must have one dtype"):
+                HfLoraLoader([str(adapter_dir)]).get_lora_dtype()
 
             with self.assertRaisesRegex(
                 ValueError, "FP8 LoRA input and output weights must have the same dtype"

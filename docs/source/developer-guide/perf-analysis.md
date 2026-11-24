@@ -237,6 +237,41 @@ ENABLE_PERFECT_ROUTER=1 trtllm-serve ...
 | Similar performance with/without perfect router | Router load balancing is not a bottleneck; focus optimization efforts elsewhere |
 | Significant improvement with perfect router | The learned router is causing load imbalance; consider router optimization or load balancing strategies |
 
+### Replacing Expert IDs Instead of Logits
+
+`ENABLE_PERFECT_ROUTER=expert_ids` keeps the learned router and its routing
+method, then replaces the routed expert IDs with a perfectly balanced
+assignment: every EP rank and every expert receives an equal share of the
+routes (within one) for any token count, and the receiver order is rotated by
+the sender rank. The routing scales are left as computed.
+
+Use it where logits cannot steer the routing, for example the DeepSeek-V4 hash
+layers, which pick experts from the token IDs, or where the token count changes
+every iteration, as in context-only benchmarks: the IDs come from one cached
+table per expert geometry, sized to `max_num_tokens`, so no logits are
+synthesized per token count.
+
+It applies where the MoE scheduler computes the routed expert IDs outside the
+MoE kernel: always with `MEGAMOE_CUTEDSL`, `CUTLASS`, `DEEPGEMM` and `CUTEDSL`,
+and with other backends under attention DP or with DeepSeek-V4 routing. A
+backend that routes inside its kernel, such as `TRTLLM` without attention DP,
+has no routed expert IDs to replace: the mode logs a warning and has no effect
+there, so use `ENABLE_PERFECT_ROUTER=1` instead.
+
+With the load balancer off, the gap to a plain run bounds what any MoE load
+balancer can gain:
+
+```bash
+# Learned routing, load balancer off
+trtllm-bench ...
+# Perfectly balanced routing, load balancer off (upper bound)
+ENABLE_PERFECT_ROUTER=expert_ids trtllm-bench ...
+```
+
+The layer-wise benchmarks (`examples/layer_wise_benchmarks`) accept the same
+environment variable with `--balance-method NotModified` and without
+`--replay-file-path`, whose recorded routing would replace the balanced IDs.
+
 ### Supported Models
 
 ```{note}

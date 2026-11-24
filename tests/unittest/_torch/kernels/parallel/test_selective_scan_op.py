@@ -294,6 +294,7 @@ class TestFunctional(unittest.TestCase):
                          nheads,
                          device=device,
                          dtype=torch_dtype)
+        dt_pad0 = None
         if nheads_pad0:
             dt_pad0 = torch.randn(total_num_tokens,
                                   nheads_pad0,
@@ -306,29 +307,28 @@ class TestFunctional(unittest.TestCase):
                          device=device,
                          dtype=torch_dtype)
         D = torch.randn(nheads, device=device)
-        if has_z:
-            z = torch.randn_like(x)
+        z = torch.randn_like(x) if has_z else None
         host_request_types = torch.tensor([0 if req_type == 'context' else 1] *
                                           batch_size,
                                           dtype=torch.int32)
         if not remove_padding or req_type == 'generation':
             x = x.view(-1, seq_len, dim)
             dt = dt.view(-1, seq_len, nheads)
-            if nheads_pad0:
+            if dt_pad0 is not None:
                 dt_pad0 = dt_pad0.view(-1, seq_len, nheads_pad0)
             BC = BC.view(-1, seq_len, ngroups * dstate * 2)
-            if has_z:
+            if z is not None:
                 z = z.view(-1, seq_len, dim)
         xBC = torch.concat([x, BC], dim=-1).contiguous()
-        if has_z:
+        if z is not None:
             zxBCdt = torch.concat([z, torch.randn_like(xBC), dt] + ([
                 dt_pad0,
-            ] if nheads_pad0 else []),
+            ] if dt_pad0 is not None else []),
                                   dim=-1).contiguous()
         else:
             zxBCdt = torch.concat([torch.randn_like(xBC), dt] + ([
                 dt_pad0,
-            ] if nheads_pad0 else []),
+            ] if dt_pad0 is not None else []),
                                   dim=-1).contiguous()
 
         if remove_padding and req_type == "generation":
@@ -349,7 +349,7 @@ class TestFunctional(unittest.TestCase):
         B_ref = BC[..., 0:ngroups * dstate].detach().clone()
         C_ref = BC[..., ngroups * dstate:].detach().clone()
         D_ref = D.detach().clone()
-        z_ref = z.detach().clone() if has_z else None
+        z_ref = z.detach().clone() if z is not None else None
 
         is_mamba2 = True
         slot_mapping = None

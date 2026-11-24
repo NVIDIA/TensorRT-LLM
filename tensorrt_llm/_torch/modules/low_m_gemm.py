@@ -3,15 +3,26 @@
 
 import functools
 import os
-from typing import Any, List, Optional
+import threading
+import weakref
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import torch
 
-from tensorrt_llm._utils import is_sm_100f
+from tensorrt_llm._utils import is_blackwell_datacenter, is_sm_100f
 from tensorrt_llm.logger import logger
+from tensorrt_llm.math_utils import pad_up
 
-from ..autotuner import AutoTuner, DynamicTensorSpec, TunableRunner, TuningConfig
+from ..autotuner import (
+    AutoTuner,
+    DistributedTuningStrategy,
+    DynamicTensorSpec,
+    TunableRunner,
+    TuningConfig,
+)
+from ..cute_dsl_utils import graph_safe_from_dlpack
 from ..flashinfer_utils import get_env_enable_pdl
+from . import low_m_mma_gemm
 
 _BACKEND_ENV = "TRTLLM_LOW_M_GEMM_BACKEND"
 
@@ -40,6 +51,7 @@ _M_DIM_SPEC = DynamicTensorSpec(
 _MAX_M = 32
 
 _AUTOTUNER_OP_NAME = "trtllm::low_m_bf16_gemm"
+_FP8_AUTOTUNER_OP_NAME = "trtllm::low_m_fp8_gemm"
 
 # A module that holds a plain [N, K] BF16 weight but is not a Linear -- a
 # hand-written MoE router gate, say -- opts into the race by setting this
@@ -154,11 +166,16 @@ class _DirectGemmRunner(TunableRunner):
     inputs: ``[a [M,K] BF16, b_t [K,N] col-major BF16]``.
     """
 
-    def __init__(self, *, pdl: bool) -> None:
+    def __init__(self, *, pdl: bool, whole_bucket_tiles: bool = False) -> None:
         self.pdl = pdl
+        # Above the exact buckets, offer only 1-row tiles: a tactic timed at a coarse bucket's top must also serve
+        # every smaller row count of the bucket, or apply() falls back to cuBLAS where it does not.
+        self.whole_bucket_tiles = whole_bucket_tiles
 
     def unique_id(self) -> tuple:
-        return ("direct", bool(self.pdl))
+        return ("direct", bool(self.pdl)) + (
+            ("whole_bucket_tiles",) if self.whole_bucket_tiles else ()
+        )
 
     def is_tactic_compatible(
         self,
@@ -202,6 +219,8 @@ class _DirectGemmRunner(TunableRunner):
                 seen.setdefault(dataclasses.astuple(t), None)
         except ValueError:
             pass
+        if self.whole_bucket_tiles and m > _MAX_EXACT_DIRECT_M:
+            seen = dict.fromkeys((block, outputs, 1) for block, outputs, _ in seen)
         return list(seen)
 
     def forward(
@@ -306,6 +325,144 @@ class _SplitKGemmRunner(TunableRunner):
 
 
 # ---------------------------------------------------------------------------
+# TunableRunners for the SM10x warp-MMA GEMM (BF16, and FP8 per-tensor weights)
+# ---------------------------------------------------------------------------
+
+
+def _warp_mma_tactics(m: int, k: int, n: int, fp8: bool) -> List[Any]:
+    if not low_m_mma_gemm.warp_mma_supported() or k % 64 or n % 8 or not 1 <= m <= _MAX_M:
+        return []
+    return low_m_mma_gemm.candidate_tactics(m, n, k, fp8)
+
+
+class _WarpMmaGemmRunner(TunableRunner):
+    """AutoTuner runner for the warp-MMA kernel (``modules/low_m_mma_gemm.py``) in the BF16 race.
+
+    It prefetches each CTA's weight tiles into registers and splits K over warps (optionally over a CTA
+    cluster); tactics are ``(k_warps, n_tiles, ksplit, swap_ab, min_blocks)`` around its heuristic.
+
+    inputs: ``[a [M,K] BF16, b_t [K,N] col-major BF16]``; no bias.
+    """
+
+    def unique_id(self) -> tuple:
+        return ("warp_mma",)
+
+    def get_valid_tactics(
+        self,
+        inputs: List[torch.Tensor],
+        profile: Any,
+        **kwargs: Any,
+    ) -> List[Any]:
+        if kwargs.get("bias") is not None:
+            return []
+        a, b_t = inputs[0], inputs[1]
+        return _warp_mma_tactics(int(a.shape[0]), int(a.shape[1]), int(b_t.shape[1]), fp8=False)
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        *,
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        a, b_t = inputs[0], inputs[1]
+        return low_m_mma_gemm.low_m_mma_gemm(
+            x16=a, w_bf16=b_t.t(), tactic_bf16=None if tactic == -1 else tuple(tactic)
+        )
+
+
+class _CuBLASFp8GemmRunner(TunableRunner):
+    """Baseline of the FP8 race: what ``FP8QDQLinearMethod`` runs, the static per-tensor quantization of a BF16
+    input (``quantize``) then cuBLAS scaled-mm.
+
+    inputs: ``[a [M,K] BF16 or E4M3, w [N,K] E4M3, weight_scale, input_scale]``; ``out_dtype`` kwarg.
+    """
+
+    _TACTIC = ("cublas",)
+
+    def __init__(self, *, quantize: bool) -> None:
+        self.quantize = quantize
+
+    def unique_id(self) -> tuple:
+        return ("cublas_fp8", self.quantize)
+
+    def get_valid_tactics(
+        self,
+        inputs: List[torch.Tensor],
+        profile: Any,
+        **kwargs: Any,
+    ) -> List[Any]:
+        return [self._TACTIC]
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        *,
+        tactic: Any = None,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        a, w, weight_scale, input_scale = inputs
+        if self.quantize:
+            a, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(a, input_scale)
+        return torch.ops.trtllm.cublas_scaled_mm(
+            a,
+            w.t(),
+            scale_a=input_scale,
+            scale_b=weight_scale,
+            bias=None,
+            out_dtype=kwargs.get("out_dtype", torch.bfloat16),
+        )
+
+
+class _WarpMmaFp8GemmRunner(TunableRunner):
+    """AutoTuner runner for the warp-MMA kernel in the FP8 race: E4M3 activations, or BF16 activations
+    quantized in registers with the static input scale (``quantize``), bitwise the baseline's quantization.
+
+    inputs: as ``_CuBLASFp8GemmRunner``.
+    """
+
+    def __init__(self, *, quantize: bool, single_cta_k: bool = False) -> None:
+        self.quantize = quantize
+        # Only tactics without split-K (ksplit 1): the ones a conv1d epilogue can run with.
+        self.single_cta_k = single_cta_k
+
+    def unique_id(self) -> tuple:
+        return ("warp_mma_fp8", self.quantize) + (("single_cta_k",) if self.single_cta_k else ())
+
+    def get_valid_tactics(
+        self,
+        inputs: List[torch.Tensor],
+        profile: Any,
+        **kwargs: Any,
+    ) -> List[Any]:
+        a, w = inputs[0], inputs[1]
+        tactics = _warp_mma_tactics(int(a.shape[0]), int(a.shape[1]), int(w.shape[0]), fp8=True)
+        return [t for t in tactics if t[2] == 1] if self.single_cta_k else tactics
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        *,
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        a, w, weight_scale, input_scale = inputs
+        return low_m_mma_gemm.low_m_mma_gemm(
+            x16=a if self.quantize else None,
+            x8=None if self.quantize else a,
+            w_fp8=w,
+            weight_scale=weight_scale,
+            input_scale=input_scale,
+            fp8_act="quant" if self.quantize else "fp8",
+            out_dtype=kwargs.get("out_dtype", torch.bfloat16),
+            tactic=None if tactic == -1 else tuple(tactic),
+        )
+
+
+# ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
 
@@ -314,14 +471,29 @@ class _SplitKGemmRunner(TunableRunner):
 LOW_M_GEMM_ACTIVE = _parse_enabled()
 
 
-def _should_apply_low_m_gemm(input: torch.Tensor) -> bool:
-    """Fast pre-filter: check the global enable flag and M upper bound only."""
-    if not LOW_M_GEMM_ACTIVE:
+def low_m_gemm_takes_rows(module: Optional[torch.nn.Module], rows: int) -> bool:
+    """Whether a GEMM of ``rows`` rows takes the low-M path: the global enable flag (or a dispatcher attached to
+    ``module``) and the M upper bound (``_MAX_M``, or the module's own ceiling, ``LowMGemmDispatcher.limit_rows``)."""
+    dispatcher = getattr(module, "_low_m_gemm_dispatcher", None)
+    if not LOW_M_GEMM_ACTIVE and dispatcher is None:
         return False
-    if input.ndim < 1:
+    # The AutoTuner race is host code that torch.compile cannot trace.
+    if torch.compiler.is_compiling() or rows > _MAX_M:
+        return False
+    return dispatcher is None or dispatcher.takes_rows(module, rows)
+
+
+def _should_apply_low_m_gemm(input: torch.Tensor, module: Optional[torch.nn.Module] = None) -> bool:
+    """Fast pre-filter: :func:`low_m_gemm_takes_rows` for the rows of ``input``, after the enable flag (or a
+    dispatcher attached to ``module``) and the compile check, which cost no shape reads."""
+    if not LOW_M_GEMM_ACTIVE and getattr(module, "_low_m_gemm_dispatcher", None) is None:
+        return False
+    if input.ndim < 1 or torch.compiler.is_compiling():
         return False
     k = int(input.shape[-1])
-    return k > 0 and input.numel() <= _MAX_M * k
+    if k <= 0:
+        return False
+    return low_m_gemm_takes_rows(module, input.numel() // k)
 
 
 class LowMGemmDispatcher:
@@ -344,6 +516,11 @@ class LowMGemmDispatcher:
        (M-bucket, K, N) shape it encounters and caches the winner.
     """
 
+    # The direct kernel's coarse buckets offer only tactics that serve every row count of the bucket.
+    whole_bucket_direct_tiles: bool = False
+    # Per module: the most rows it takes on the low-M path (limit_rows); None: no limits.
+    _max_rows: Optional[Dict[torch.nn.Module, int]] = None
+
     def __init__(self) -> None:
         # _prepared: runners + TuningConfig have been created (set by _init_runners).
         self._prepared = False
@@ -354,6 +531,12 @@ class LowMGemmDispatcher:
         # Direct (SIMT register-prefetch) runner — no-bias only; cuBLAS handles
         # biased calls when neither low-M kernel wins.
         self._direct: Optional[_DirectGemmRunner] = None
+        # Warp-MMA runner (no bias) and the FP8 race's runners, keyed by
+        # whether the input is quantized in the kernel (BF16 input).
+        self._warp_mma: Optional[_WarpMmaGemmRunner] = None
+        self._fp8_runners: dict = {}
+        # The FP8 race of callers that need a single-CTA K warp-MMA tactic: that runner alone.
+        self._fp8_runners_single_cta_k: dict = {}
         # cuBLAS runners compete in every AutoTuner race as a safety baseline.
         self._cublas_no_bias: Optional[_CuBLASGemmRunner] = None
         self._cublas_with_bias: Optional[_CuBLASGemmRunner] = None
@@ -365,6 +548,9 @@ class LowMGemmDispatcher:
         # Saved ``force`` flag from :meth:`attach` so :meth:`_init_runners` can
         # honour it without requiring an extra argument.
         self._force: bool = False
+        # Tune on every rank: ranks of the group see different shapes (attention DP), so a rank-local cache
+        # hit must not skip a collective a peer enters.
+        self.per_rank_tuning: bool = False
 
     def attach(
         self,
@@ -391,6 +577,10 @@ class LowMGemmDispatcher:
         if not LOW_M_GEMM_ACTIVE and not force:
             return
         for name, module in model.named_modules():
+            if getattr(module, "_low_m_gemm_dispatcher", None) is not None:
+                # A model that prepared its own dispatcher (e.g. Qwen3.5, with its row limits and tactics) keeps it:
+                # the loader's generic one must not replace it.
+                continue
             if module.__class__.__name__.endswith("Linear") or getattr(
                 module, LOW_M_GEMM_OPT_IN_ATTR, False
             ):
@@ -409,27 +599,49 @@ class LowMGemmDispatcher:
         if self._prepared:
             return
         if not LOW_M_GEMM_ACTIVE and not self._force:
-            # Mark prepared *before* returning so repeated apply() calls in the
-            # inactive-but-not-forced path skip the check without creating runners
-            # that would remain None.  apply() re-checks LOW_M_GEMM_ACTIVE / force_active
-            # before reaching here, so the None-runner state is never observed by callers.
-            self._prepared = True
+            # Stay unprepared: a later forced call must still create the runners.
             return
         pdl = get_env_enable_pdl()
         self._runner_no_bias = _SplitKGemmRunner(has_bias=False, pdl=pdl)
         self._runner_with_bias = _SplitKGemmRunner(has_bias=True, pdl=pdl)
         # Direct SIMT runner: no-bias only; wins for M=1 with narrow N on K=8192.
-        self._direct = _DirectGemmRunner(pdl=pdl)
+        self._direct = _DirectGemmRunner(pdl=pdl, whole_bucket_tiles=self.whole_bucket_direct_tiles)
+        self._warp_mma = _WarpMmaGemmRunner()
         # cuBLAS runners — always included as competitors so the AutoTuner can
         # fall back to cuBLAS for shapes where neither custom kernel is fastest.
         self._cublas_no_bias = _CuBLASGemmRunner(has_bias=False)
         self._cublas_with_bias = _CuBLASGemmRunner(has_bias=True)
+        # cuBLAS first: the cache-miss fallback (runners[0]) is the stock path.
+        self._fp8_runners = {
+            quantize: [
+                _CuBLASFp8GemmRunner(quantize=quantize),
+                _WarpMmaFp8GemmRunner(quantize=quantize),
+            ]
+            for quantize in (False, True)
+        }
+        self._fp8_runners_single_cta_k = {
+            quantize: [_WarpMmaFp8GemmRunner(quantize=quantize, single_cta_k=True)]
+            for quantize in (False, True)
+        }
         self._tuning_config = TuningConfig(
             dynamic_tensor_specs=(_M_DIM_SPEC,),
             use_cold_l2_cache=True,
-            # Use CUDA-graph-based profiling when PDL is off; PDL and CUDA-graph
-            # capture conflict so we fall back to standard timing in that case.
-            use_cuda_graph=not pdl,
+            # Time device work as the decode CUDA graphs replay it, PDL launches
+            # included: eager timing adds each runner's host launch cost, which
+            # exceeds these kernels' device time and the graphs never pay.
+            use_cuda_graph=True,
+            # The ranks of the group split the race: each builds and times its
+            # share of every runner's tactics, and the merge keeps the fastest,
+            # so every rank runs the same winner (ranks running different
+            # kernels would let the slowest set the pace of each collective).
+            # The direct kernel is built per exact (M, N, K, tactic), so one
+            # rank racing every candidate alone takes most of warmup. Under
+            # attention DP the ranks' shapes differ, so each tunes its own.
+            distributed_tuning_strategy=(
+                DistributedTuningStrategy.INDEPENDENT
+                if self.per_rank_tuning
+                else DistributedTuningStrategy.PARALLEL
+            ),
         )
         # Mark prepared only after all runners and the tuning config exist so the
         # invariant "_prepared implies runners are non-None" always holds.
@@ -438,6 +650,18 @@ class LowMGemmDispatcher:
             "Low-M BF16 GEMM dispatcher initialised "
             "(split-K tensor-core + SIMT direct vs cuBLAS AutoTuner; best kernel per shape)."
         )
+
+    def limit_rows(self, module: torch.nn.Module, max_rows: int) -> None:
+        """Keep ``module`` off the low-M path above ``max_rows`` rows."""
+        if self._max_rows is None:
+            self._max_rows = {}
+        self._max_rows[module] = max_rows
+
+    def takes_rows(self, module: torch.nn.Module, rows: int) -> bool:
+        """Whether ``module`` takes the low-M path at ``rows`` rows under its ``limit_rows`` ceiling."""
+        if self._max_rows is None:
+            return True
+        return rows <= self._max_rows.get(module, _MAX_M)
 
     def prepare(
         self,
@@ -514,12 +738,14 @@ class LowMGemmDispatcher:
                 that activate it via a mechanism other than the env var (e.g. a
                 future ``use_low_m_low_latency_gemm`` LLM arg).
         """
-        if not LOW_M_GEMM_ACTIVE and not force_active:
+        if not LOW_M_GEMM_ACTIVE and not (force_active or self._force):
+            return None
+        if torch.compiler.is_compiling():
             return None
         if not self._prepared:
             # Unit tests and direct callers that bypass ModelEngine / attach().
-            # Save force so _init_runners() can honour it.
-            self._force = force_active
+            # Never drop the force of attach(): the runners must exist past the gate above.
+            self._force = self._force or force_active
             self._init_runners()
         if not self._is_candidate_shape(input_tensor, weight, bias):
             return None
@@ -537,10 +763,11 @@ class LowMGemmDispatcher:
         cublas_runner = self._cublas_with_bias if has_bias else self._cublas_no_bias
         runners: List = [cublas_runner, splitk_runner]
         if not has_bias:
-            # Include the direct SIMT runner for unbiased calls; it silently
-            # returns [] for biased inputs so it is safe to always pass, but
-            # excluding it for biased calls keeps the race concise.
+            # Include the direct SIMT and warp-MMA runners for unbiased calls;
+            # they return [] for biased inputs so it is safe to always pass,
+            # but excluding them for biased calls keeps the race concise.
             runners.append(self._direct)
+            runners.append(self._warp_mma)
         best_runner, best_tactic = AutoTuner.get().choose_one(
             _AUTOTUNER_OP_NAME,
             runners,
@@ -586,6 +813,133 @@ class LowMGemmDispatcher:
             return out_view.clone()
         return out_view
 
+    def _fp8_choice(
+        self,
+        input_2d: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        input_scale: torch.Tensor,
+        out_dtype: torch.dtype,
+        single_cta_k: bool = False,
+    ):
+        """(runner, tactic, inputs) of the FP8 race for this call, or None when the shape is no candidate.
+        ``single_cta_k``: the race of the warp-MMA tactics without split-K alone."""
+        if not self._prepared:
+            self._init_runners()
+        k = int(input_2d.shape[-1])
+        if (
+            torch.is_grad_enabled()
+            or input_2d.dim() != 2
+            or not 1 <= int(input_2d.shape[0]) <= _MAX_M
+            or input_2d.dtype not in (torch.bfloat16, torch.float8_e4m3fn)
+            or weight.dtype != torch.float8_e4m3fn
+            or int(weight.shape[1]) != k
+            or not input_2d.is_contiguous()
+            or not weight.is_contiguous()
+            or not low_m_mma_gemm.warp_mma_supported()
+        ):
+            return None
+        quantize = input_2d.dtype != torch.float8_e4m3fn
+        inputs = [input_2d, weight, weight_scale, input_scale]
+        runner, tactic = AutoTuner.get().choose_one(
+            _FP8_AUTOTUNER_OP_NAME,
+            (self._fp8_runners_single_cta_k if single_cta_k else self._fp8_runners)[quantize],
+            self._tuning_config,
+            inputs,
+            out_dtype=out_dtype,
+        )
+        return runner, tactic, inputs
+
+    def apply_fp8(
+        self,
+        input_tensor: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        input_scale: torch.Tensor,
+        out_dtype: torch.dtype,
+        single_cta_k: bool = False,
+    ) -> Optional[torch.Tensor]:
+        """``input @ weight.T`` for an FP8 per-tensor (static input scale) projection from the FP8 race, or None
+        for the normal path. A BF16 input is quantized with ``input_scale``. ``single_cta_k``: as
+        :meth:`warp_mma_tactic`."""
+        if not LOW_M_GEMM_ACTIVE and not self._force:
+            return None
+        if torch.compiler.is_compiling():
+            return None
+        input_2d = input_tensor.reshape(-1, input_tensor.shape[-1])
+        choice = self._fp8_choice(
+            input_2d, weight, weight_scale, input_scale, out_dtype, single_cta_k
+        )
+        if choice is None:
+            return None
+        runner, tactic, inputs = choice
+        out = runner(inputs, tactic=tactic, out_dtype=out_dtype)
+        return out.view(*input_tensor.shape[:-1], weight.shape[0])
+
+    def warp_mma_tactic(
+        self,
+        num_rows: int,
+        weight: torch.Tensor,
+        weight_scale: Optional[torch.Tensor] = None,
+        input_scale: Optional[torch.Tensor] = None,
+        quantize: bool = True,
+        single_cta_k: bool = False,
+    ) -> Optional[Tuple[int, ...]]:
+        """The warp-MMA tactic this dispatcher's race picked for ``num_rows`` rows of the projection ``weight``
+        (the FP8 race for an E4M3 weight, with a BF16 input when ``quantize``; else the BF16 race), or None:
+        another runner won, the shape was not tuned, or the race is being tuned (callers then run the plain
+        projection, which tunes it).
+
+        Fused users launch the warp-MMA kernel with this tactic, so they run where the plain projection would,
+        with its summation order.
+
+        ``single_cta_k`` (E4M3 weight): the race of the warp-MMA tactics without split-K alone, for a fused user
+        whose epilogue needs one CTA per output tile (``apply_fp8(..., single_cta_k=True)`` tunes it); an untuned
+        shape takes the heuristic tactic, so the fused kernel always runs outside tuning.
+        """
+        # The race is host code that torch.compile cannot trace.
+        if torch.compiler.is_compiling():
+            return None
+        tuner = AutoTuner.get()
+        if (not LOW_M_GEMM_ACTIVE and not self._force) or tuner.is_tuning_mode:
+            return None
+        if not 1 <= num_rows <= _MAX_M or not low_m_mma_gemm.warp_mma_supported():
+            return None
+        if not self._prepared:
+            self._init_runners()
+        n, k = int(weight.shape[0]), int(weight.shape[1])
+        if weight.dtype == torch.float8_e4m3fn:
+            op = _FP8_AUTOTUNER_OP_NAME
+            runners = (self._fp8_runners_single_cta_k if single_cta_k else self._fp8_runners)[
+                quantize
+            ]
+            shapes = (
+                torch.Size((num_rows, k)),
+                weight.shape,
+                weight_scale.shape,
+                input_scale.shape,
+            )
+        else:
+            op = _AUTOTUNER_OP_NAME
+            runners = [self._cublas_no_bias, self._runner_no_bias, self._direct, self._warp_mma]
+            shapes = (torch.Size((num_rows, k)), torch.Size((k, n)))
+        hit, runner_id, tactic, _ = tuner.profiling_cache.search_cache(
+            op, runners, shapes, self._tuning_config
+        )
+        if not hit or runners[runner_id] is not runners[-1] or tactic == -1:
+            single = single_cta_k and weight.dtype == torch.float8_e4m3fn
+            return low_m_mma_gemm.default_tactic(num_rows, n, k) if single else None
+        return tuple(tactic)
+
+
+def low_m_gemm_dispatcher(module: torch.nn.Module) -> Optional[LowMGemmDispatcher]:
+    """The dispatcher of ``module`` (attached by ``prepare_low_m_gemm``), the process-global one when
+    ``TRTLLM_LOW_M_GEMM_BACKEND`` activates it, else None."""
+    dispatcher = getattr(module, "_low_m_gemm_dispatcher", None)
+    if dispatcher is None and LOW_M_GEMM_ACTIVE:
+        dispatcher = _DISPATCHER
+    return dispatcher
+
 
 # Process-global fallback dispatcher used by callers that bypass
 # ``prepare_low_m_gemm`` (e.g. unit tests or direct kernel benchmarks).
@@ -597,6 +951,8 @@ _DISPATCHER = LowMGemmDispatcher()
 def prepare_low_m_gemm(
     model: torch.nn.Module,
     force: bool = False,
+    per_rank_tuning: bool = False,
+    whole_bucket_direct_tiles: bool = False,
 ) -> LowMGemmDispatcher:
     """Create a per-engine dispatcher and attach it to every eligible submodule.
 
@@ -615,11 +971,17 @@ def prepare_low_m_gemm(
         force: Attach even when ``TRTLLM_LOW_M_GEMM_BACKEND`` is not set
             (reserved for callers that activate the dispatcher via a future
             LLM arg).
+        per_rank_tuning: Tune each rank on its own (attention DP: the ranks'
+            projections see different token counts).
+        whole_bucket_direct_tiles: Race the direct kernel at the coarse M
+            buckets only with tactics that serve every row count of the bucket.
 
     Returns:
         The newly created :class:`LowMGemmDispatcher` for this engine.
     """
     dispatcher = LowMGemmDispatcher()
+    dispatcher.per_rank_tuning = per_rank_tuning
+    dispatcher.whole_bucket_direct_tiles = whole_bucket_direct_tiles
     dispatcher.attach(model, force=force)
     return dispatcher
 
@@ -646,10 +1008,679 @@ def apply_low_m_gemm(
     return dispatcher.apply(module, input_tensor, weight, bias, force_active=force_active)
 
 
+# ---------------------------------------------------------------------------
+# Decode-sized projections over FP8 weights without activation quantization:
+# ``mxfp8_lowm_linear`` and ``fp8_grouped_lowm`` run one CuTe DSL warp-MMA GEMM
+# (``kernels/blackwell/lowm_fp8_mma_gemm``): BF16 activations times FP8
+# weights dequantized exactly in registers, FP32 accumulation.
+# ---------------------------------------------------------------------------
+
+
+@functools.lru_cache(maxsize=None)
+def lowm_fp8_supported() -> bool:
+    return torch.cuda.is_available() and torch.cuda.get_device_capability() in (
+        (10, 0),
+        (10, 3),
+        (10, 7),
+    )
+
+
+def default_k_warps(k: int) -> int:
+    """Split-K warps per CTA for the MMA kernel (one CTA per 8 output columns)."""
+    chunks = k // 64
+    valid = [kw for kw in (1, 2, 4, 8) if chunks % kw == 0]
+    if not valid:
+        raise ValueError(f"unsupported K={k} for the low-M FP8 MMA GEMM")
+    return next((kw for kw in valid if chunks // kw <= 8), valid[-1])
+
+
+def lowm_fp8_mma_fits(m: int, n: int, k: int) -> bool:
+    """Whether the MMA kernel serves an ``[m, k] x [n, k]`` problem on this device."""
+    return lowm_fp8_supported() and 0 < m <= 64 and n % 8 == 0 and k > 0 and k % 64 == 0
+
+
+@functools.lru_cache(maxsize=None)
+def lowm_mma_options() -> Tuple[bool, bool]:
+    """``(bf16_dequant, swap_ab)`` of the MMA kernel; both give the plain kernel's bits."""
+    return is_blackwell_datacenter(), is_blackwell_datacenter()
+
+
+def lowm_tiles(n: int, rows: int, group_n: int = 0) -> int:
+    """8-column tiles per CTA that let the MMA kernel swap its operands at <= 8 rows, else 1."""
+    if 0 < rows <= 8 and lowm_mma_options()[1] and n % 16 == 0 and group_n % 16 == 0:
+        return 2
+    return 1
+
+
+@functools.lru_cache(maxsize=None)
+def _compiled_mma(
+    m: int,
+    n: int,
+    k: int,
+    use_pdl: bool,
+    split_n: int,
+    group_n: int = 0,
+    rope_head_dim: int = 0,
+    rope_positions: int = 0,
+    scale_block128: bool = False,
+    scale_swizzled: bool = False,
+    bf16_weights: bool = False,
+    out_dtype: torch.dtype = torch.bfloat16,
+    k_warps: int = 0,
+    a_rope_head_dim: int = 0,
+    a_rms_eps: Optional[float] = None,
+    n_tiles: int = 1,
+    bf16_dequant: bool = False,
+    swap_ab: bool = False,
+    index_pack: bool = False,
+    out_swiglu_limit: float = 0.0,
+    release_after_wait: bool = False,
+):
+    import cuda.bindings.driver as cuda
+    import cutlass.cute as cute
+
+    from ..kernels.blackwell.lowm_fp8_mma_gemm import LowMFp8MmaGemmKernel
+
+    kernel = LowMFp8MmaGemmKernel(
+        num_rows=m,
+        k_extent=k,
+        k_warps=k_warps or default_k_warps(k),
+        use_pdl=use_pdl,
+        split_n=split_n,
+        scale_block128=scale_block128,
+        group_n=group_n,
+        rope_head_dim=rope_head_dim,
+        scale_swizzled=scale_swizzled,
+        bf16_weights=bf16_weights,
+        a_rope_head_dim=a_rope_head_dim,
+        a_rms_norm=a_rms_eps is not None,
+        a_rms_eps=a_rms_eps or 0.0,
+        n_tiles=n_tiles,
+        bf16_dequant=bf16_dequant,
+        swap_ab=swap_ab,
+        index_pack=index_pack,
+        out_swiglu_limit=out_swiglu_limit,
+        release_after_wait=release_after_wait,
+    )
+    dev = torch.device("cuda")
+    groups = n // group_n if group_n else 1
+    a = torch.empty((m, groups * k), dtype=torch.bfloat16, device=dev)
+    b = torch.empty((n, 2 * k if bf16_weights else k), dtype=torch.uint8, device=dev)
+    if bf16_weights:
+        s = _no_scale(dev)
+    elif scale_block128:
+        s = torch.empty((n // 128, k // 128), dtype=torch.float32, device=dev)
+    elif scale_swizzled:
+        s = torch.empty((pad_up(n, 128) * pad_up(k // 32, 4),), dtype=torch.uint8, device=dev)
+    else:
+        s = torch.empty((n, k // 32), dtype=torch.uint8, device=dev)
+    if index_pack:
+        c = torch.empty((m, n // 2), dtype=torch.uint8, device=dev)
+        c2 = torch.empty((m, n // 32), dtype=torch.uint8, device=dev)
+    elif split_n:
+        c = torch.empty((m, split_n), dtype=out_dtype, device=dev)
+        c2 = torch.empty((m, n - split_n), dtype=out_dtype, device=dev)
+    elif out_swiglu_limit > 0.0:
+        c = c2 = torch.empty((m, n // 2), dtype=out_dtype, device=dev)
+    else:
+        c = c2 = torch.empty((m, n), dtype=out_dtype, device=dev)
+    pos = torch.empty((m,), dtype=torch.int32, device=dev)
+    cos_sin = torch.empty((max(rope_positions, 1), 2, 32), dtype=torch.float32, device=dev)
+    gamma = torch.empty((1, k if a_rms_eps is not None else 8), dtype=torch.bfloat16, device=dev)
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    return cute.compile(
+        kernel,
+        graph_safe_from_dlpack(a),
+        graph_safe_from_dlpack(b),
+        graph_safe_from_dlpack(s),
+        graph_safe_from_dlpack(c),
+        graph_safe_from_dlpack(c2),
+        graph_safe_from_dlpack(pos),
+        graph_safe_from_dlpack(cos_sin),
+        graph_safe_from_dlpack(gamma),
+        stream,
+    )
+
+
+# Row counts of the MMA kernels outside decode CUDA graphs: each up to 8 rows, as decode batches
+# run, then whole 16-row tiles. A call with M rows runs the kernel of the smallest bucket that
+# holds them, on its rows padded to the bucket with whatever rows the staging buffer holds: every
+# output row comes from its own A row alone (16-row MMA tiles, a K order fixed by K), so the padding
+# leaves the real rows bitwise unchanged, and the row counts of eager steps compile at most one
+# kernel per bucket. A call whose
+# exact M already has a kernel, such as a decode CUDA graph's, runs that one unpadded. A decode
+# CUDA graph's warmup and capture keep the exact M of the graph; any other capture runs the
+# kernels its eager warmup compiled. A kernel option that a caller derives from the row count
+# (``lowm_tiles``, the CSA2 query tiles) must change only at a bucket boundary, so that all the
+# row counts of a bucket ask for the same kernel.
+_MMA_ROW_BUCKETS: tuple[int, ...] = (1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 48, 64)
+# The arguments after M of every _compiled_mma call outside decode CUDA graphs so far, as
+# (positional, keyword items). Append-only, and bounded by the distinct GEMM shapes and options.
+_MMA_SIGNATURES: Dict[Tuple[tuple, tuple], None] = {}
+# (M, arguments after M) of every kernel built through _mma_kernel or the prewarm.
+_MMA_BUILT: Set[Tuple[int, Tuple[tuple, tuple]]] = set()
+# (M, arguments after M, decode-graph pass) -> (kernel, row count) of every call so far.
+_MMA_ROUTES: Dict[Tuple[int, Tuple[tuple, tuple], bool], Tuple[Any, int]] = {}
+# Serializes the updates of _MMA_BUILT and _MMA_ROUTES that follow a compile, so that host threads
+# routing one GEMM at once leave its exact kernel in place.
+_MMA_LOCK = threading.Lock()
+
+
+@functools.lru_cache(maxsize=None)
+def _decode_graph_flag() -> Callable[[], bool]:
+    """``linear.flashinfer_mxfp8_decode_graph_capture_active``, imported on first use (``linear``
+    imports this module)."""
+    from .linear import flashinfer_mxfp8_decode_graph_capture_active
+
+    return flashinfer_mxfp8_decode_graph_capture_active
+
+
+def _decode_graph_pass() -> bool:
+    """Whether the current call runs in a decode CUDA graph's warmup or capture."""
+    return _decode_graph_flag()()
+
+
+def _mma_kernel(m: int, *args, **kwargs) -> Tuple[Any, int]:
+    """The MMA kernel ``_compiled_mma`` builds for a call with ``m`` rows, and its row count.
+
+    Outside a decode CUDA graph pass a call is recorded for ``prewarm_mma_row_buckets`` and gets
+    the kernel of its row bucket, unless its exact row count already has one.
+    """
+    signature = (args, tuple(kwargs.items()))
+    graph_pass = _decode_graph_pass()
+    route = _MMA_ROUTES.get((m, signature, graph_pass))
+    if route is not None:
+        return route
+    rows = m
+    if 1 <= m <= _MMA_ROW_BUCKETS[-1] and not graph_pass:
+        _MMA_SIGNATURES.setdefault(signature, None)
+        if (m, signature) not in _MMA_BUILT:
+            rows = next(rows for rows in _MMA_ROW_BUCKETS if rows >= m)
+    fn = _compiled_mma(rows, *args, **kwargs)
+    with _MMA_LOCK:
+        if rows != m and (m, signature) in _MMA_BUILT:
+            # Another thread built the exact kernel while this one compiled the bucket's.
+            fn, rows = _compiled_mma(m, *args, **kwargs), m
+        elif rows == m and (m, signature) not in _MMA_BUILT:
+            # Eager calls of this row count now run the new exact kernel.
+            _MMA_ROUTES.pop((m, signature, False), None)
+        _MMA_BUILT.add((rows, signature))
+        route = _MMA_ROUTES[(m, signature, graph_pass)] = (fn, rows)
+    return route
+
+
+def _pad_rows(t: torch.Tensor, rows: int) -> torch.Tensor:
+    """``t`` with zero rows appended up to ``rows`` rows."""
+    if t.shape[0] >= rows:
+        return t
+    return torch.nn.functional.pad(t, (0, 0) * (t.dim() - 1) + (0, rows - t.shape[0]))
+
+
+# Per host thread, then per (stream, device, dtype, rows, row shape): the A operand buffer of padded
+# launches. Its rows past a launch's own hold earlier launches' rows, which reach only output rows
+# that launch drops. Threads that submit to one stream never share a buffer, and a thread's buffers
+# are freed when it exits.
+_A_STAGING = threading.local()
+
+
+def _staging_buffers() -> Dict[tuple, torch.Tensor]:
+    """The calling thread's staging buffers."""
+    buffers = getattr(_A_STAGING, "buffers", None)
+    if buffers is None:
+        buffers = _A_STAGING.buffers = {}
+    return buffers
+
+
+def release_mma_staging_buffers() -> None:
+    """Free the calling thread's staging buffers; its next padded eager launch allocates anew."""
+    _A_STAGING.buffers = {}
+
+
+def _a_operand(x: torch.Tensor, rows: int) -> Tuple[torch.Tensor, Any]:
+    """The A operand of a launch on ``rows`` rows and its CuTe view: ``x`` itself when it has the
+    rows, else ``x`` copied into the first rows of a ``rows``-row buffer of the calling thread and
+    the current stream."""
+    if x.shape[0] >= rows:
+        return x, graph_safe_from_dlpack(x)
+    shape = (rows,) + tuple(x.shape[1:])
+    if torch.cuda.is_current_stream_capturing():
+        # Under capture the buffer comes from the graph's private pool: keep it to this capture.
+        buf = x.new_zeros(shape)
+        buf[: x.shape[0]].copy_(x.detach())
+        return buf, graph_safe_from_dlpack(buf)
+    staging = _staging_buffers()
+    key = (torch.cuda.current_stream(x.device).cuda_stream, x.device, x.dtype, rows, x.shape[1:])
+    buf = staging.get(key)
+    if buf is None:
+        # A normal tensor even under inference mode, so calls in and out of it can both write it.
+        with torch.inference_mode(False):
+            buf = staging[key] = x.new_zeros(shape)
+    # Detached, so a reused buffer never joins the autograd graph of a caller's input.
+    buf[: x.shape[0]].copy_(x.detach())
+    return buf, _cute_view(buf)
+
+
+def prewarm_mma_row_buckets(max_rows: Optional[int] = None) -> Tuple[int, int]:
+    """Compile the row buckets of the MMA GEMMs called so far outside decode CUDA graphs, up to the
+    first bucket that holds ``max_rows`` rows (every bucket without a bound); return how many
+    kernels it compiled and for how many GEMMs.
+
+    Run after the eager warmup forwards and before CUDA graph capture, it compiles the buckets they
+    did not reach before a capture or a request can need them. A GEMM that no call outside a decode
+    CUDA graph has run yet is not covered. A bucket that fails to compile is reported and left to
+    its first call; the other buckets still compile.
+    """
+    buckets = _MMA_ROW_BUCKETS
+    if max_rows is not None:
+        last = next((i for i, rows in enumerate(buckets) if rows >= max_rows), len(buckets) - 1)
+        buckets = buckets[: last + 1]
+    compiled = 0
+    signatures = list(_MMA_SIGNATURES)
+    for args, kwargs in signatures:
+        for rows in buckets:
+            if (rows, (args, kwargs)) in _MMA_BUILT:
+                continue
+            try:
+                _compiled_mma(rows, *args, **dict(kwargs))
+            except Exception as e:
+                # A prewarm miss only defers this compile to the first call that needs it.
+                logger.warning(
+                    f"Low-M MMA GEMM row bucket {rows} of {args} {dict(kwargs)} not prewarmed. "
+                    f"{type(e).__name__}: {e}"
+                )
+                continue
+            with _MMA_LOCK:
+                _MMA_BUILT.add((rows, (args, kwargs)))
+            compiled += 1
+        logger.debug(f"Low-M MMA GEMM row buckets compiled for {args} {dict(kwargs)}")
+    return compiled, len(signatures)
+
+
+@functools.lru_cache(maxsize=None)
+def _no_scale(device) -> torch.Tensor:
+    """The scale argument of BF16 weights, which have none."""
+    return torch.zeros((1,), dtype=torch.uint8, device=device)
+
+
+@functools.lru_cache(maxsize=None)
+def _no_gamma(device) -> torch.Tensor:
+    """The norm-weight argument of kernels without the A RMS norm."""
+    return torch.zeros((1, 8), dtype=torch.bfloat16, device=device)
+
+
+class _ThreadViews(dict):
+    """A host thread's cached CuTe views: tensor ``id`` -> (weak reference to the tensor, layout key,
+    view). The cache owns the weak references, and their callbacks hold it weakly, so a thread's
+    cache and views go with the thread even while the tensors live on."""
+
+
+# Per host thread: CuTe views of the base tensors that launches pass call after call (weights, their
+# scales, the placeholder arguments), one DLPack export per tensor and layout, dropped with the
+# tensor. A launch keeps its argument descriptors on the views it is given, so threads never share
+# a view.
+_CUTE_VIEWS = threading.local()
+
+
+def _views() -> _ThreadViews:
+    """The calling thread's cached CuTe views."""
+    views = getattr(_CUTE_VIEWS, "views", None)
+    if views is None:
+        views = _CUTE_VIEWS.views = _ThreadViews()
+    return views
+
+
+def _drop_view(cache: "weakref.ReferenceType[_ThreadViews]", tensor_id: int, ref: Any) -> None:
+    """Weak-reference callback of a cached tensor: drop its view if its thread's cache remains."""
+    views = cache()
+    if views is not None and views.get(tensor_id, (None,))[0] is ref:
+        del views[tensor_id]
+
+
+def _cute_view(t: torch.Tensor, dtype: Optional[torch.dtype] = None) -> Any:
+    """``graph_safe_from_dlpack`` of ``t`` (as ``dtype``), reused by the calling thread while ``t``
+    keeps its storage and layout. A view is exported anew on every call: views are made per call."""
+    if t._base is not None:
+        return graph_safe_from_dlpack(t if dtype is None else t.view(dtype))
+    views = _views()
+    key = (t.data_ptr(), dtype, t.shape, t.stride())
+    entry = views.get(id(t))
+    if entry is not None and entry[0]() is t:
+        if entry[1] == key:
+            return entry[2]
+        ref = entry[0]
+    else:
+        ref = weakref.ref(t, functools.partial(_drop_view, weakref.ref(views), id(t)))
+    view = graph_safe_from_dlpack(t if dtype is None else t.view(dtype))
+    views[id(t)] = (ref, key, view)
+    return view
+
+
+# CuTe stream objects by CUDA stream handle.
+_CU_STREAMS: Dict[int, Any] = {}
+
+
+def _current_cu_stream() -> Any:
+    """The ``cuda.CUstream`` of the current CUDA stream."""
+    handle = torch.cuda.current_stream().cuda_stream
+    stream = _CU_STREAMS.get(handle)
+    if stream is None:
+        import cuda.bindings.driver as cuda
+
+        stream = _CU_STREAMS[handle] = cuda.CUstream(handle)
+    return stream
+
+
+@functools.lru_cache(maxsize=None)
+def _rope_placeholders(m: int, device):
+    """The (positions [m] int32, cos/sin [1, 2, 32] fp32) arguments of kernels without RoPE."""
+    return (
+        torch.zeros((m,), dtype=torch.int32, device=device),
+        torch.zeros((1, 2, 32), dtype=torch.float32, device=device),
+    )
+
+
+def mxfp8_lowm_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    scale_lin: torch.Tensor,
+    *,
+    split_n: int = 0,
+    rope: Optional[Tuple[torch.Tensor, torch.Tensor, int]] = None,
+    scale_swizzled: bool = False,
+    rms_norm: Optional[Tuple[torch.Tensor, float]] = None,
+    n_tiles: int = 1,
+    swiglu_out_limit: Optional[float] = None,
+    release_after_wait: bool = False,
+) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
+    """y = x @ dequant(weight).T for small M, in BF16.
+
+    x: [M, K] bf16 contiguous; weight: [N, K] e4m3 (N a multiple of 8); scale_lin: [N, K/32]
+    uint8 (UE8M0, linear layout), or with ``scale_swizzled`` the 1-D CUTLASS-swizzled scales of
+    an MXFP8 ``Linear``. With ``split_n`` the result is returned as two contiguous
+    tensors ``(y[:, :split_n], y[:, split_n:])`` written directly by the kernel.
+    ``rope``: (positions [M] int, cos/sin [P, 2, 32] fp32, head_dim) applies interleaved RoPE to
+    the last 64 columns of every head of the output.
+    ``rms_norm``: (gamma [K] bf16, eps) projects the RMS-normalized rows of x,
+    ``rms_norm(x) * gamma``, instead of x. ``n_tiles`` (N a multiple of ``8 * n_tiles``): 8-column
+    tiles per CTA, the same result with fewer CTAs.
+    ``swiglu_out_limit`` = L (``swiglu_out_supported``): ``weight`` is a ``[2I, K]`` gate | up
+    weight and the result ``swiglu(x @ dequant(weight).T, swiglu_limit=L)`` ``[M, I]``, bit for
+    bit. ``release_after_wait``: dependents are released after this launch's dependency wait.
+    """
+    m, k = x.shape
+    n = weight.shape[0]
+    if n % (8 * n_tiles):
+        raise ValueError(f"N={n} is not a multiple of {8 * n_tiles}")
+    out_swiglu_limit = 0.0
+    if swiglu_out_limit is not None:
+        if not swiglu_out_supported(m, k, weight, swiglu_out_limit):
+            raise ValueError(f"no SwiGLU output (limit {swiglu_out_limit}) for {m} x {k} x {n}")
+        if split_n or rope is not None or rms_norm is not None or scale_swizzled or n_tiles != 1:
+            raise ValueError("swiglu_out_limit takes a plain launch")
+        out_swiglu_limit = float(swiglu_out_limit)
+    bf16_dequant, swap_ab = lowm_mma_options()
+    fn, rows = _mma_kernel(
+        m,
+        n,
+        k,
+        get_env_enable_pdl(),
+        split_n,
+        0,
+        0 if rope is None else rope[2],
+        0 if rope is None else rope[1].shape[0],
+        scale_swizzled=scale_swizzled,
+        a_rms_eps=None if rms_norm is None else float(rms_norm[1]),
+        n_tiles=n_tiles,
+        bf16_dequant=bf16_dequant,
+        swap_ab=swap_ab,
+        out_swiglu_limit=out_swiglu_limit,
+        release_after_wait=release_after_wait,
+    )
+    x, x_view = _a_operand(x, rows)
+    if out_swiglu_limit:
+        out = out2 = torch.empty((rows, n // 2), dtype=torch.bfloat16, device=x.device)
+    elif split_n:
+        out = torch.empty((rows, split_n), dtype=torch.bfloat16, device=x.device)
+        out2 = torch.empty((rows, n - split_n), dtype=torch.bfloat16, device=x.device)
+    else:
+        out = out2 = torch.empty((rows, n), dtype=torch.bfloat16, device=x.device)
+    if rope is None:
+        positions, cos_sin = _rope_placeholders(rows, x.device)
+    else:
+        positions, cos_sin, _ = rope
+        positions = _pad_rows(positions.reshape(-1).to(torch.int32), rows)
+    stream = _current_cu_stream()
+    fn(
+        x_view,
+        _cute_view(weight, torch.uint8),
+        _cute_view(scale_lin),
+        graph_safe_from_dlpack(out),
+        graph_safe_from_dlpack(out2),
+        _cute_view(positions) if rope is None else graph_safe_from_dlpack(positions),
+        _cute_view(cos_sin),
+        _cute_view(_no_gamma(x.device) if rms_norm is None else rms_norm[0].view(1, k)),
+        stream,
+    )
+    if rows != m:
+        out, out2 = out[:m], out2[:m]
+    return (out, out2) if split_n else out
+
+
+def _is_bf16_value(value: float) -> bool:
+    """Whether ``value`` (rounded to FP32) is exactly a BF16 value."""
+    import struct
+
+    return not struct.unpack("<I", struct.pack("<f", value))[0] & 0xFFFF
+
+
+def swiglu_out_supported(m: int, k: int, weight: torch.Tensor, limit: Optional[float]) -> bool:
+    """Whether ``mxfp8_lowm_linear(x [m, k], weight, ..., swiglu_out_limit=limit)`` runs: a positive
+    BF16-valued limit, an E4M3 ``[2I, k]`` weight with I a multiple of 4, m <= 64, k % 64 == 0."""
+    return (
+        limit is not None
+        and limit > 0.0
+        and _is_bf16_value(limit)
+        and weight.dtype == torch.float8_e4m3fn
+        and weight.dim() == 2
+        and weight.shape[1] == k
+        and 0 < m <= 64
+        and weight.shape[0] % 8 == 0
+        and k > 0
+        and k % 64 == 0
+    )
+
+
+def mxfp8_lowm_index_query(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    scale_swizzled: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """RoPE'd index queries ``x @ dequant(weight).T`` as ``(data int8 [M, H, 64], scales uint8
+    [M, H, 4])``, bit for bit ``pack_index_queries_split`` of the plain ``mxfp8_lowm_linear``."""
+    m, k = x.shape
+    n = weight.shape[0]
+    if n % 128:
+        raise ValueError(f"N={n} is not a whole number of 128-wide heads")
+    heads = n // 128
+    bf16_dequant, swap_ab = lowm_mma_options()
+    fn, rows = _mma_kernel(
+        m,
+        n,
+        k,
+        get_env_enable_pdl(),
+        0,
+        0,
+        128,
+        cos_sin.shape[0],
+        scale_swizzled=True,
+        n_tiles=4,
+        bf16_dequant=bf16_dequant,
+        swap_ab=swap_ab,
+        index_pack=True,
+    )
+    x, x_view = _a_operand(x, rows)
+    data = torch.empty((rows, heads, 64), dtype=torch.uint8, device=x.device)
+    scales = torch.empty((rows, heads, 4), dtype=torch.uint8, device=x.device)
+    stream = _current_cu_stream()
+    fn(
+        x_view,
+        _cute_view(weight, torch.uint8),
+        _cute_view(scale_swizzled),
+        graph_safe_from_dlpack(data.view(rows, heads * 64)),
+        graph_safe_from_dlpack(scales.view(rows, heads * 4)),
+        graph_safe_from_dlpack(_pad_rows(positions.reshape(-1).to(torch.int32), rows)),
+        _cute_view(cos_sin),
+        _cute_view(_no_gamma(x.device)),
+        stream,
+    )
+    if rows != m:
+        data, scales = data[:m], scales[:m]
+    return data.view(torch.int8), scales
+
+
+def bf16_lowm_linear(
+    x: torch.Tensor, weight: torch.Tensor, out_dtype: torch.dtype = torch.float32
+) -> torch.Tensor:
+    """y = x @ weight.T for small M with BF16 weights, accumulated in FP32.
+
+    x: [M, K] bf16 contiguous; weight: [N, K] bf16 contiguous (N a multiple of 8).
+    """
+    m, k = x.shape
+    n = weight.shape[0]
+    # Two weight vectors per lane and K chunk: twice the FP8 split keeps as many loads per warp.
+    k_warps = 2 * default_k_warps(k)
+    fn, rows = _mma_kernel(
+        m,
+        n,
+        k,
+        get_env_enable_pdl(),
+        0,
+        bf16_weights=True,
+        out_dtype=out_dtype,
+        k_warps=k_warps if (k // 64) % k_warps == 0 else 0,
+    )
+    x, x_view = _a_operand(x, rows)
+    out = torch.empty((rows, n), dtype=out_dtype, device=x.device)
+    positions, cos_sin = _rope_placeholders(rows, x.device)
+    stream = _current_cu_stream()
+    fn(
+        x_view,
+        _cute_view(weight, torch.uint8),
+        _cute_view(_no_scale(x.device)),
+        graph_safe_from_dlpack(out),
+        graph_safe_from_dlpack(out),
+        _cute_view(positions),
+        _cute_view(cos_sin),
+        _cute_view(_no_gamma(x.device)),
+        stream,
+    )
+    return out if rows == m else out[:m]
+
+
+def mxfp8_linear_scale(module: torch.nn.Module) -> Optional[torch.Tensor]:
+    """Linear [N, K/32] UE8M0 scales of an MXFP8 ``Linear`` (cached on the module).
+
+    The CUTLASS path stores the scales swizzled; this undoes it once. Returns
+    None while a CUDA graph is being captured and the cache is cold.
+    """
+    cached = getattr(module, "_lowm_scale_lin", None)
+    if cached is not None:
+        return cached
+    if torch.cuda.is_current_stream_capturing():
+        return None
+    weight = module.weight
+    n, k = weight.shape
+    scale = module.weight_scale
+    if scale.dim() == 2 and scale.shape == (n, k // 32):
+        lin = scale.contiguous()
+    else:
+        from ..utils import unswizzle_sf
+
+        lin = unswizzle_sf(scale, n, k, 32)[:n, : k // 32].contiguous()
+    module._lowm_scale_lin = lin
+    return lin
+
+
+def fp8_grouped_lowm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    group_n: int,
+    inverse_rope: Optional[Tuple[torch.Tensor, torch.Tensor, int]] = None,
+    n_tiles: int = 1,
+    release_after_wait: bool = False,
+) -> torch.Tensor:
+    """Grouped small-M GEMM over FP8 weights.
+
+    x: [M, G*K] bf16 contiguous; weight: [G*group_n, K] e4m3 (groups stacked along N);
+    scale: [G*group_n/128, K/128] fp32 power-of-two multipliers (128x128 blocks) or
+    [G*group_n, K/32] uint8 UE8M0 (linear layout). Returns [M, G*group_n] with
+    ``out[:, g*group_n:(g+1)*group_n] = x[:, g*K:(g+1)*K] @ dequant(weight[g]).T``.
+    ``inverse_rope``: (positions [M] int32, cos/sin [P, 2, 32] fp32, head_dim) rotates the last
+    64 columns of every head of x back as they load, as ``mla_rope_inplace(inverse=True)``.
+    ``n_tiles``: 8-column tiles per CTA (``group_n`` a multiple of ``8 * n_tiles``), same result.
+    ``release_after_wait``: dependents are released after this launch's dependency wait.
+    """
+    m = x.shape[0]
+    n, k = weight.shape
+    if (group_n or n) % (8 * n_tiles):
+        raise ValueError(f"N={group_n or n} is not a multiple of {8 * n_tiles}")
+    block128 = scale.dtype == torch.float32
+    bf16_dequant, swap_ab = lowm_mma_options()
+    fn, rows = _mma_kernel(
+        m,
+        n,
+        k,
+        get_env_enable_pdl(),
+        0,
+        group_n,
+        scale_block128=block128,
+        rope_positions=0 if inverse_rope is None else inverse_rope[1].shape[0],
+        a_rope_head_dim=0 if inverse_rope is None else inverse_rope[2],
+        n_tiles=n_tiles,
+        bf16_dequant=bf16_dequant,
+        swap_ab=swap_ab,
+        release_after_wait=release_after_wait,
+    )
+    x, x_view = _a_operand(x, rows)
+    out = torch.empty((rows, n), dtype=torch.bfloat16, device=x.device)
+    if inverse_rope is None:
+        pos, cos_sin = _rope_placeholders(rows, x.device)
+    else:
+        pos, cos_sin, _ = inverse_rope
+        pos = _pad_rows(pos, rows)
+    stream = _current_cu_stream()
+    fn(
+        x_view,
+        _cute_view(weight, torch.uint8),
+        _cute_view(scale),
+        graph_safe_from_dlpack(out),
+        graph_safe_from_dlpack(out),
+        _cute_view(pos) if inverse_rope is None else graph_safe_from_dlpack(pos),
+        _cute_view(cos_sin),
+        _cute_view(_no_gamma(x.device)),
+        stream,
+    )
+    return out if rows == m else out[:m]
+
+
 __all__ = [
     "LOW_M_GEMM_ACTIVE",
     "LOW_M_GEMM_OPT_IN_ATTR",
     "_MAX_M",
     "apply_low_m_gemm",
+    "bf16_lowm_linear",
+    "fp8_grouped_lowm",
+    "low_m_gemm_dispatcher",
+    "lowm_fp8_supported",
+    "lowm_mma_options",
+    "lowm_tiles",
+    "mxfp8_linear_scale",
+    "mxfp8_lowm_index_query",
+    "mxfp8_lowm_linear",
     "prepare_low_m_gemm",
+    "prewarm_mma_row_buckets",
+    "release_mma_staging_buffers",
 ]

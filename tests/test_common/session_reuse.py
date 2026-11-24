@@ -19,6 +19,10 @@ Pool isolation and reuse rules:
                               construction seam. Reused IPC workers have
                               thread-local allreduce state incompatible with
                               RPC's rank-0 engine-setup thread.
+- child processes          -> a test starting one drains the cache first:
+                              the child cannot use cached pools but shares
+                              their GPUs (nvidia-smi is exempt; os.fork and
+                              os.posix_spawn are not intercepted)
 - tests passing their own ``_mpi_session`` (the explicit fixtures) -> never
   reach the patched seam
 - ``@pytest.mark.private_mpi_session`` -> explicit opt-out: the cache is
@@ -66,14 +70,6 @@ _PATCH_TARGETS = (
 # to avoid carrying IPC thread-local state into RPC engine setup.
 _RPC_PATCH_TARGET = "tensorrt_llm.executor.rpc_proxy"
 _ALL_PATCH_TARGETS = _PATCH_TARGETS + (_RPC_PATCH_TARGET,)
-
-# Worker-side HF weight cache for cache-managed pools only: set (if absent)
-# around the spawn so the workers freeze it, then restored — private/RPC
-# pools keep the production default (cache off).
-_WEIGHT_CACHE_ENV = {
-    "TRTLLM_HF_WEIGHT_CACHE": "1",
-    "TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES": "1",
-}
 
 
 _RETIRE_THREADS: list[threading.Thread] = []
@@ -413,16 +409,12 @@ class SessionReuseCache:
         the prefetch layer (or on a shadow miss) the synchronous spawn is
         unchanged.
 
-        The worker-side HF weight cache env is frozen into the workers via
-        the library's ``env_overrides`` channel (parent env untouched, so
-        acquire-time snapshot comparisons still match); an explicit user
-        setting of either var is respected and left untouched. Prefetched
-        shadows were armed with the same overlay. wait_shutdown: shutdown of
-        this pool blocks until its workers exited, so a successor cannot
-        race the GPU-memory release.
+        The workers inherit the suite's environment unchanged, so checkpoint
+        loading in a reused pool takes the same path as in production.
+        wait_shutdown: shutdown of this pool blocks until its workers exited,
+        so a successor cannot race the GPU-memory release.
         """
         snapshot = _spawn_snapshot()
-        overrides = {k: v for k, v in _WEIGHT_CACHE_ENV.items() if k not in os.environ}
         real = None
         prefetcher = _prefetcher()
         if prefetcher is not None:
@@ -436,13 +428,13 @@ class SessionReuseCache:
             # collection still fails, unidentified workers may remain alive;
             # an immediate retry would overlap another MPI bootstrap with
             # them, so propagate the fail-closed error.
-            real = real_cls(n_workers=n_workers, wait_shutdown=True, env_overrides=overrides)
+            real = real_cls(n_workers=n_workers, wait_shutdown=True)
         if prefetcher is not None:
             try:
                 # Restock only after the current pool is ready. On a shadow
                 # miss, scheduling before the synchronous spawn would make
                 # two MPI pools bootstrap concurrently on the same GPUs.
-                prefetcher.schedule_shadow(n_workers, env_overlay=overrides)
+                prefetcher.schedule_shadow(n_workers)
             except Exception:
                 pass
         real._reuse_uses = 0
@@ -471,7 +463,7 @@ class SessionReuseCache:
         """Bypass the cache for the current test (private_mpi_session)."""
         self._suspended = suspended
 
-    def drain(self, timeout: float = 60.0) -> None:
+    def drain(self, timeout: float = 60.0, reason: str | None = None) -> None:
         """Shut down all cached pools in parallel (frees GPU/CPU footprint).
 
         Also reaps in-flight retire threads: drain runs at natural rendezvous
@@ -484,6 +476,8 @@ class SessionReuseCache:
             pools, self._pools = list(self._pools.values()), {}
         if not pools:
             return
+        if reason:
+            print(f"[session-reuse] draining before {reason}", flush=True)
 
         threads = [
             # daemon: a wedged pool shutdown must not keep the interpreter

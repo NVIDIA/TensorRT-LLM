@@ -1181,16 +1181,17 @@ def test_tp_shard_loader_matches_manual_slice(tp_size):
 
 
 @situ_supported
+@pytest.mark.parametrize("tp_size", [8, 16], ids=lambda n: f"tp{n}")
 @pytest.mark.parametrize("num_tokens", [1, 16], ids=lambda n: f"tokens{n}")
-def test_tp8_sharded_forward_matches_whole_expert(num_tokens):
-    """Sum of 8 TP-shard partial outputs == whole-expert reference.
+def test_tp_sharded_forward_matches_whole_expert(num_tokens, tp_size):
+    """Sum of the TP-shard partial outputs == whole-expert reference.
 
     Per-element MXFP4/MXFP8 numerics are identical between the two layouts
-    (group-32 boundaries align: 384 % 32 == 0), so the only expected error
-    is bf16 rounding of the per-shard FC2 partial sums.
+    (group-32 boundaries align: 384 and 192 are multiples of 32), so the only
+    expected error is bf16 rounding of the per-shard FC2 partial sums. At TP16
+    each shard's 192-wide slice is zero-padded to 256 and run as valid 192.
     """
-    tp_size = 8
-    ipp = _TP_INTERMEDIATE // tp_size  # 384 — the production TP8 shard size
+    ipp = _TP_INTERMEDIATE // tp_size  # 384 at TP8; 192 at TP16 (the no-spec layout)
     bank = _make_packed_expert_bank(_TP_EXPERTS, _TP_INTERMEDIATE, _TP_HIDDEN)
     gate = _make_test_gate()
 
@@ -2543,6 +2544,25 @@ def test_mega_format_transform_is_slot_blockwise() -> None:
         )
 
     whole = _run(0, num_slots)
+    bundle = method._live_weight_bundle_layout(hidden, intermediate, expand_intermediate)
+    planes = {plane.name: plane for plane in bundle.planes}
+    for tensor, name in zip(
+        whole,
+        (
+            "mega_fc1_weight",
+            "mega_fc1_weight_sf",
+            "mega_fc2_weight",
+            "mega_fc2_weight_sf",
+        ),
+    ):
+        shape, stride, dtype_name, element_size, pointer_alignment = planes[name].storage_metadata(
+            num_slots
+        )
+        assert tuple(tensor.shape) == shape
+        assert tuple(tensor.stride()) == stride
+        assert tensor.dtype == getattr(torch, dtype_name)
+        assert tensor.element_size() == element_size
+        assert tensor.data_ptr() % pointer_alignment == 0
 
     for chunk in (1, 3, 16):  # 16 > num_slots: the single-call degenerate case
         pieces = [_run(lo, min(lo + chunk, num_slots)) for lo in range(0, num_slots, chunk)]

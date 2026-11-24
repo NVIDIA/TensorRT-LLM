@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -449,7 +449,7 @@ struct CutlassGemmConfig
 
     int getTileConfigAsInt() const
     {
-        if (sm_version == 120 || sm_version == 121)
+        if (sm_version >= 120 && sm_version < 130)
             return (int) tile_config_sm120;
         if (sm_version >= 100 && sm_version < 120)
             return (int) tile_config_sm100;
@@ -463,7 +463,7 @@ struct CutlassGemmConfig
 
     std::string getTileConfigAsName() const
     {
-        if (sm_version == 120 || sm_version == 121)
+        if (sm_version >= 120 && sm_version < 130)
             return get_tile_shape_name(tile_config_sm120);
         if (sm_version >= 100 && sm_version < 120)
             return get_tile_shape_name(tile_config_sm100);

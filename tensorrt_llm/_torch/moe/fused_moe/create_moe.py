@@ -10,6 +10,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from .activation import DEFAULT_MOE_ACTIVATION, MoEActivation
 from .configurable_moe import ConfigurableMoE
+from .cutedsl import TrtllmCutedslFusedFc12Mxfp8Impl
 from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cute_dsl_fc12 import CuteDslFc12FusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
@@ -115,9 +116,16 @@ def create_moe_backend(
     # backend that cannot run under a load balancer already declines in
     # ``can_implement``.
     eplb_enabled = get_moe_load_balancer() is not None
+    load_balancer_config = getattr(model_config, "moe_load_balancer", None)
+    eplb_mode = (getattr(load_balancer_config, "mode", "standard")
+                 if eplb_enabled else "disabled")
     if eplb_enabled and not moe_cls.capabilities.supports_eplb:
         raise ValueError(
             f"{moe_cls.__name__} does not support the MoE load balancer.")
+    if (eplb_mode == "per_layer_dynamic"
+            and not moe_cls.capabilities.supports_per_layer_dynamic_eplb):
+        raise ValueError(
+            f"{moe_cls.__name__} does not support per-layer dynamic EPLB.")
 
     if bias and not moe_cls.capabilities.supports_expert_bias:
         raise ValueError(f"bias not supported in {moe_cls.__name__}.")
@@ -179,7 +187,8 @@ def create_moe_backend(
             layer_idx=layer_idx,
             activation=activation,
         )
-    elif issubclass(moe_cls, (CuteDslFusedMoE, CuteDslFc12FusedMoE)):
+    elif issubclass(moe_cls, (CuteDslFusedMoE, CuteDslFc12FusedMoE,
+                              TrtllmCutedslFusedFc12Mxfp8Impl)):
         return moe_cls(
             routing_method=routing_method,
             num_experts=num_experts,

@@ -37,6 +37,7 @@ The following guidance will mostly focus on benchmarks using `trtllm-bench` CLI.
       - [Supported Quantization Modes](#supported-quantization-modes)
     - [Preparing a Dataset](#preparing-a-dataset)
     - [Running with the PyTorch Workflow](#running-with-the-pytorch-workflow)
+      - [Keeping Host Stalls out of the Measured Run](#keeping-host-stalls-out-of-the-measured-run)
       - [Benchmarking with LoRA Adapters in PyTorch workflow](#benchmarking-with-lora-adapters-in-pytorch-workflow)
       - [Running multi-modal models in the PyTorch Workflow](#running-multi-modal-models-in-the-pytorch-workflow)
       - [Quantization in the PyTorch Flow](#quantization-in-the-pytorch-flow)
@@ -250,6 +251,23 @@ trtllm-bench --model meta-llama/Llama-3.1-8B \
   --dataset /tmp/synthetic_128_128.txt \
   --backend pytorch
 ```
+
+#### Keeping Host Stalls out of the Measured Run
+
+With many short requests, for example context-only runs at high concurrency,
+rank 0 can be bound by host work, and a pause there makes every other rank wait
+at the next collective. `TRTLLM_WORKER_DISABLE_GC=1` disables Python's cyclic
+garbage collector in the worker processes, so a full collection over the
+in-flight requests cannot pause a rank. Memory held in reference cycles is then
+not freed until the run ends, so set it identically in every run you compare.
+
+With `TRTLLM_PROXY_BATCH_REQUESTS=1`, the executor proxy pickles each request on
+the submitting thread and a background thread sends each burst to the rank-0
+worker as one message, so the worker receives and authenticates one message per
+burst instead of one per request. The sender thread must take the GIL first, so
+while the submitting thread keeps running Python, as a busy `trtllm-serve` event
+loop does, a lone request can wait up to the interpreter's switch interval (5 ms
+by default) before it is sent.
 
 #### Benchmarking with LoRA Adapters in PyTorch workflow
 

@@ -1,0 +1,2049 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""Unit tests for the per-iteration request-aggregate fields on InflightBatchingStats.
+
+``PyExecutor._update_iter_stats`` populates the following members on
+``stats.inflight_batching_stats`` in addition to the pre-existing
+``num_context_requests`` / ``num_gen_requests`` / ``num_paused_requests`` /
+``num_scheduled_requests`` / ``micro_batch_id``:
+
+  * ``num_ctx_kv_tokens`` — tokens read from prior state
+      (prefix-cache hits + previously-chunked tokens) summed across
+      scheduled context requests; dummy-filtered.
+  * ``num_gen_kv_tokens`` — total KV context length summed across
+      scheduled generation requests; dummy-filtered.
+  * ``num_queued_context_requests`` — normal context-type requests
+      (``REQUEST_TYPE_CONTEXT_AND_GENERATION`` / ``REQUEST_TYPE_CONTEXT_ONLY``)
+      sitting in the executor_request_queue; excludes shutdown/cancel
+      control items and requests without a payload.
+  * ``num_queued_ctx_tokens`` — prompt-token sum across the above.
+  * ``num_queued_gen_requests`` — generation-only queued requests
+      (``REQUEST_TYPE_GENERATION_ONLY``), typically disagg-decode items
+      awaiting KV transfer before decoding.
+  * ``num_queued_gen_kv_tokens`` — prompt-token sum across the above;
+      acts as the KV budget each request will occupy post-transfer.
+  * ``num_paused_kv_tokens`` — total KV context length summed across
+      paused (preempted-decode) requests; dummy-filtered.
+
+These tests invoke the real ``PyExecutor._update_iter_stats`` as an
+unbound call against a minimal fake ``self``. Exercising the production
+function directly (rather than a duplicated shim) catches drift from
+refactors, renamed attributes, or silent unit changes in the populate
+block.
+
+Attention-DP-specific cases verify that dummy padding is excluded from
+planner/FPM metrics and that rank-local iter-stats payloads are emitted
+only when all ranks line up on the same iteration.
+"""
+
+from __future__ import annotations
+
+import json
+import types
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from tensorrt_llm._torch.pyexecutor.adp_iter_stats import (
+    _ITERATION_STATS_OPTIONAL_FIELDS,
+    _ITERATION_STATS_SCALAR_FIELDS,
+    ADPIterStatsBuffer,
+    _snapshot_kv_cache_stats,
+)
+from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import RankIterStatsPayload, RankState
+from tensorrt_llm._torch.pyexecutor.scheduler.rank_state import RankSpecDecodingStats
+from tensorrt_llm.bindings.executor import (
+    InflightBatchingStats,
+    IterationStats,
+    KvCacheStats,
+    RequestStats,
+    SpecDecodingStats,
+)
+from tensorrt_llm.executor.base_worker import BaseWorker
+from tensorrt_llm.metrics.perf import PerfMetricsCollector
+
+pytestmark = pytest.mark.cpu_only
+
+
+class _StubRequest:
+    """Stub LlmRequest exposing only the accessors ``_update_iter_stats`` reads.
+
+    Attributes:
+      py_last_context_chunk: tuple (start, end) — the (begin_compute,
+        begin_compute + chunk_size) pair cached by ``_update_request_states``
+        before state mutation. ``start`` is the primary source of
+        ``num_ctx_kv_tokens``. Set to None for decode/paused reqs.
+      context_current_position: fallback source consulted when
+        ``py_last_context_chunk`` is None.
+      _num_tokens: return value for ``get_num_tokens()``, used for decode
+        and paused (preempted-decode) requests.
+    """
+
+    _next_id = 0
+
+    def __init__(
+        self,
+        *,
+        context_chunk_size: int = 0,
+        context_current_position: int = 0,
+        num_tokens: int = 0,
+        is_attention_dp_dummy: bool = False,
+        is_cuda_graph_dummy: bool = False,
+        is_dummy_request: bool = False,
+        is_context_init_state: bool = False,
+        context_remaining_length: int = 0,
+        is_disagg_generation_init_state: bool = False,
+        is_finished: bool = False,
+        state=None,
+        num_draft_tokens: int = 0,
+        py_draft_tokens=None,
+        py_num_accepted_draft_tokens=None,
+    ):
+        _StubRequest._next_id += 1
+        self.py_request_id = _StubRequest._next_id
+        self.is_context_init_state = is_context_init_state
+        self.context_remaining_length = context_remaining_length
+        self.is_disagg_generation_init_state = is_disagg_generation_init_state
+        self.is_finished = is_finished
+        self.state = state
+        self.is_child = False
+        self.context_current_position = context_current_position
+        # py_last_context_chunk = (begin_compute, end_compute). For a fresh
+        # prefill, begin_compute == 0; for continuations, == prev position.
+        if context_chunk_size > 0:
+            self.py_last_context_chunk = (
+                context_current_position,
+                context_current_position + context_chunk_size,
+            )
+        else:
+            self.py_last_context_chunk = None
+        self._num_tokens = num_tokens
+        self.is_attention_dp_dummy = is_attention_dp_dummy
+        self.is_cuda_graph_dummy = is_cuda_graph_dummy
+        self.is_dummy_request = is_dummy_request
+        # Speculative-decoding accessors read by the specdec-stats aggregation
+        # branch of ``_update_iter_stats``. Defaults match a non-drafted request
+        # (draft_len resolves to 0, so it is skipped by the ``draft_len > 0``
+        # gate). A dummy gen request mirrors resource_manager.add_dummy_requests'
+        # is_gen branch: py_draft_tokens = [1] * k plus an accepted count.
+        self.num_draft_tokens = num_draft_tokens
+        self.py_draft_tokens = py_draft_tokens
+        self.py_num_accepted_draft_tokens = py_num_accepted_draft_tokens
+
+    @property
+    def is_dummy(self) -> bool:
+        return self.is_attention_dp_dummy or self.is_cuda_graph_dummy or self.is_dummy_request
+
+    def get_num_tokens(self, beam: int = 0) -> int:
+        return self._num_tokens
+
+
+class _StubScheduledBatch:
+    def __init__(
+        self,
+        context_reqs=None,
+        gen_reqs=None,
+        paused_reqs=None,
+        recompute_paused_reqs=None,
+    ):
+        self.context_requests = list(context_reqs or [])
+        self.generation_requests = list(gen_reqs or [])
+        self.paused_requests = list(paused_reqs or [])
+        self.recompute_paused_requests = list(recompute_paused_reqs or [])
+
+    @property
+    def num_context_requests(self):
+        return len(self.context_requests)
+
+    @property
+    def num_generation_requests(self):
+        return len(self.generation_requests)
+
+
+class _StubQueueItem:
+    _next_id = 0
+
+    def __init__(
+        self,
+        input_token_ids,
+        *,
+        is_normal_request: bool = True,
+        request_type=None,
+    ):
+        # request_type defaults to REQUEST_TYPE_CONTEXT_AND_GENERATION,
+        # matching the executor::Request constructor default. Tests that
+        # exercise disagg routing (REQUEST_TYPE_CONTEXT_ONLY /
+        # REQUEST_TYPE_GENERATION_ONLY) pass it explicitly.
+        if request_type is None:
+            from tensorrt_llm.bindings.executor import RequestType
+
+            request_type = RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION
+        from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
+
+        self.request = types.SimpleNamespace(
+            input_token_ids=input_token_ids,
+            num_input_tokens=len(input_token_ids),
+            py_prompt_trimmed_prefix=0,
+            request_type=request_type,
+            priority=DEFAULT_REQUEST_PRIORITY,
+        )
+        self.is_normal_request = is_normal_request
+        self.is_canceled_request = False
+        # Stable id so the populate block's drift-warning log has a value
+        # to reference even if a future branch exercises item.id.
+        _StubQueueItem._next_id += 1
+        self.id = _StubQueueItem._next_id
+
+
+def _build_fake_self(
+    queued_items,
+    model_engine_iter_states,
+    *,
+    enable_attention_dp=False,
+    waiting_items=(),
+    active_requests=(),
+    rank=0,
+    canceled_ids=(),
+    inflight_ids=(),
+    parked_items=(),
+):
+    """Minimal 'self' for ``PyExecutor._update_iter_stats(self, ...)``.
+
+    Stubs only the ``self.*`` attributes the method actually reads:
+
+    Setup reads (run before per-request aggregation):
+      * ``max_num_active_requests``, ``iter_counter`` — scalars
+      * ``executor_request_queue.get_request_queue_size()`` — for
+        top-level ``num_queued_requests`` (not one of the fields
+        exercised here)
+      * ``resource_manager.resource_managers.get(...)`` — a KV cache manager
+        reporting zeroed ``KvCacheStats`` and no per-iteration KV stats (the
+        KV fields are not exercised here)
+      * ``drafter`` — None (spec-decode block no-ops when
+        ``stats.specdec_stats`` is None, which is the default on a fresh
+        ``IterationStats``)
+
+    Per-request aggregation reads:
+      * ``executor_request_queue.get_request_queue().queue`` — source for
+        ``num_queued_context_requests`` / ``num_queued_ctx_tokens``
+      * ``model_engine.iter_states`` — stubbed as the post-forward side
+        channel so regression tests can verify ``_update_iter_stats`` uses
+        the explicit scheduled-batch stats argument instead.
+    """
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    fake = MagicMock()
+    fake._perf_metrics = PerfMetricsCollector()
+    fake.dist.rank = 0
+    fake.global_rank = 0
+    fake.max_num_active_requests = 64
+    fake.iter_counter = 1
+    fake.executor_request_queue.get_request_queue_size.return_value = len(queued_items)
+    fake.executor_request_queue.get_request_queue.return_value.queue = queued_items
+    kv_cache_manager = MagicMock()
+    kv_cache_manager.get_kv_cache_stats.return_value = KvCacheStats()
+    kv_cache_manager.get_iteration_stats.return_value = None
+    fake.resource_manager.resource_managers.get.return_value = kv_cache_manager
+    fake._kv_iter_stats_interval = 1
+    fake._last_kv_iter_stats_fetch_iter = None
+    fake.drafter = None
+    fake.model_engine = types.SimpleNamespace(iter_states=model_engine_iter_states)
+    fake.enable_attention_dp = enable_attention_dp
+    fake.dist.rank = rank
+    from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
+
+    fake.waiting_queue = FCFSWaitingQueue()
+    fake.waiting_queue.add_requests(waiting_items)
+    fake.request_accumulated = list(parked_items)
+    fake.active_requests = list(active_requests)
+    fake.canceled_req_ids = list(canceled_ids)
+    fake.inflight_req_ids = set(inflight_ids)
+    # Bind the real dummy-request predicate: a bare MagicMock auto-generates a
+    # child Mock for attribute access (always truthy when called), which would
+    # classify every request as dummy and zero out all per-request aggregates.
+    fake._is_stats_dummy_request = PyExecutor._is_stats_dummy_request
+    return fake
+
+
+def _invoke_update_iter_stats(
+    scheduled_batch,
+    queued_items,
+    *,
+    num_ctx_tokens,
+    enable_attention_dp=False,
+    scheduled_batch_stats=None,
+    specdec=False,
+    waiting_items=(),
+    active_requests=(),
+    rank=0,
+    canceled_ids=(),
+    inflight_ids=(),
+    parked_items=(),
+    current_batch=None,
+):
+    """Call real ``PyExecutor._update_iter_stats`` unbound; return the stats.
+
+    Patches ``torch.cuda.mem_get_info`` so the method can run on hosts
+    without a live CUDA context (the call is unconditional for
+    ``gpu_mem_usage`` but the value is not consumed by the fields
+    under test).
+
+    Parameters
+    ----------
+    scheduled_batch : _StubScheduledBatch
+    queued_items    : list[_StubQueueItem]
+    num_ctx_tokens  : int | None
+        If int, wired into the fake ``model_engine.iter_states`` side channel.
+    scheduled_batch_stats : ScheduledBatchStats | None
+        Explicit scheduled-batch counters passed to ``_update_iter_stats``.
+        When None, defaults to the same partial ``num_ctx_tokens`` payload used
+        by older tests.
+    specdec : bool
+        Allocate ``stats.specdec_stats`` so the speculative-decoding
+        aggregation branch runs. On a fresh ``IterationStats`` this member is
+        None (production sets it in ``_get_init_iter_stats`` only when spec
+        decode is enabled), and the branch is skipped otherwise.
+    """
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor, ScheduledBatchStats
+
+    model_engine_iter_states = (
+        None if num_ctx_tokens is None else {"num_ctx_tokens": num_ctx_tokens}
+    )
+    if scheduled_batch_stats is None:
+        scheduled_batch_stats = ScheduledBatchStats(num_ctx_tokens=num_ctx_tokens)
+
+    fake_self = _build_fake_self(
+        queued_items,
+        model_engine_iter_states,
+        enable_attention_dp=enable_attention_dp,
+        waiting_items=waiting_items,
+        active_requests=active_requests,
+        rank=rank,
+        canceled_ids=canceled_ids,
+        inflight_ids=inflight_ids,
+        parked_items=parked_items,
+    )
+
+    stats = IterationStats()
+    # The method reads ``stats.inflight_batching_stats.*`` unconditionally;
+    # the default on a fresh IterationStats is None, so we allocate one.
+    stats.inflight_batching_stats = InflightBatchingStats()
+    if specdec:
+        stats.specdec_stats = SpecDecodingStats()
+
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.py_executor.torch.cuda.mem_get_info",
+        return_value=(1 << 30, 1 << 30),
+    ):
+        PyExecutor._update_iter_stats(
+            fake_self,
+            stats,
+            iter_latency_ms=10.0,
+            num_completed_requests=0,
+            scheduled_batch=scheduled_batch,
+            micro_batch_id=0,
+            scheduled_batch_stats=scheduled_batch_stats,
+            current_batch=current_batch,
+        )
+    return stats
+
+
+# ---------------------------------------------------------------------------
+# Populate tests: call the real ``_update_iter_stats`` and assert on the
+# inflight_batching_stats request-aggregate fields it populates.
+# These are the fields Dynamo publishes as forward-pass metrics.
+# ---------------------------------------------------------------------------
+
+
+def test_empty_iteration():
+    stats = _invoke_update_iter_stats(_StubScheduledBatch(), [], num_ctx_tokens=0)
+    ifb = stats.inflight_batching_stats
+    assert ifb.num_context_requests == 0
+    assert ifb.num_gen_requests == 0
+    assert ifb.num_paused_requests == 0
+    assert ifb.num_ctx_kv_tokens == 0
+    assert ifb.num_gen_kv_tokens == 0
+    assert ifb.num_queued_context_requests == 0
+    assert ifb.num_queued_ctx_tokens == 0
+    assert ifb.num_queued_gen_requests == 0
+    assert ifb.num_queued_gen_kv_tokens == 0
+    assert ifb.num_paused_kv_tokens == 0
+
+
+def test_prefill_only_no_prefix_cache():
+    # Two fresh prefill requests: prompts of 100 and 200 tokens, chunk size
+    # == full prompt (no chunked prefill). No prefix cache hits.
+    reqs = [
+        _StubRequest(context_chunk_size=100, context_current_position=0),
+        _StubRequest(context_chunk_size=200, context_current_position=0),
+    ]
+    stats = _invoke_update_iter_stats(
+        _StubScheduledBatch(context_reqs=reqs), [], num_ctx_tokens=300
+    )
+    ifb = stats.inflight_batching_stats
+    assert ifb.num_context_requests == 2
+    assert ifb.num_ctx_kv_tokens == 0  # py_last_context_chunk[0] == 0 for both
+
+
+def test_prefill_with_prefix_cache_hit():
+    # Prompt 1000 tokens; 256 already in prefix cache (prepopulatedPromptLen).
+    # Chunk size = remaining = 744. py_last_context_chunk = (256, 1000);
+    # start=256 is the precomputed-tokens count.
+    reqs = [
+        _StubRequest(context_chunk_size=744, context_current_position=256),
+    ]
+    stats = _invoke_update_iter_stats(
+        _StubScheduledBatch(context_reqs=reqs), [], num_ctx_tokens=744
+    )
+    ifb = stats.inflight_batching_stats
+    assert ifb.num_context_requests == 1
+    assert ifb.num_ctx_kv_tokens == 256
+
+
+def test_chunked_prefill_continuation():
+    # Chunked prefill: 3-chunk request, each chunk 512. This is step 2:
+    # chunk size 512, previously computed 512 (== context_current_position).
+    # py_last_context_chunk = (512, 1024); start=512.
+    reqs = [
+        _StubRequest(context_chunk_size=512, context_current_position=512),
+    ]
+    stats = _invoke_update_iter_stats(
+        _StubScheduledBatch(context_reqs=reqs), [], num_ctx_tokens=512
+    )
+    ifb = stats.inflight_batching_stats
+    assert ifb.num_context_requests == 1
+    assert ifb.num_ctx_kv_tokens == 512
+
+
+def test_decode_only():
+    # Two decode requests: 1024 total context and 2048 total context.
+    reqs = [
+        _StubRequest(num_tokens=1024),
+        _StubRequest(num_tokens=2048),
+    ]
+    stats = _invoke_update_iter_stats(_StubScheduledBatch(gen_reqs=reqs), [], num_ctx_tokens=0)
+    ifb = stats.inflight_batching_stats
+    assert ifb.num_gen_requests == 2
+    assert ifb.num_gen_kv_tokens == 3072
+    assert ifb.num_context_requests == 0
+    assert ifb.num_ctx_kv_tokens == 0
+
+
+def test_mixed_prefill_and_decode():
+    ctx = [_StubRequest(context_chunk_size=128, context_current_position=0)]
+    gen = [_StubRequest(num_tokens=500), _StubRequest(num_tokens=700)]
+    stats = _invoke_update_iter_stats(
+        _StubScheduledBatch(context_reqs=ctx, gen_reqs=gen), [], num_ctx_tokens=128
+    )
+    ifb = stats.inflight_batching_stats
+    assert ifb.num_context_requests == 1
+    assert ifb.num_gen_requests == 2
+    assert ifb.num_gen_kv_tokens == 1200
+
+
+def test_queued_context_requests_from_request_queue():
+    items = [
+        _StubQueueItem(input_token_ids=list(range(256))),
+        _StubQueueItem(input_token_ids=list(range(1024))),
+    ]
+    stats = _invoke_update_iter_stats(_StubScheduledBatch(), items, num_ctx_tokens=0)
+    ifb = stats.inflight_batching_stats
+    assert ifb.num_queued_context_requests == 2
+    assert ifb.num_queued_ctx_tokens == 1280
+
+
+def test_queued_tokens_include_the_prompt_prefix_a_tail_transport_left_out():
+    """The same request is counted alike in the ingress queue and the waiting queue."""
+    items = [_StubQueueItem(input_token_ids=list(range(256))) for _ in range(2)]
+    for item in items:
+        item.request.py_prompt_trimmed_prefix = 1000
+    stats = _invoke_update_iter_stats(
+        _StubScheduledBatch(), items[:1], num_ctx_tokens=0, waiting_items=items[1:]
+    )
+    ifb = stats.inflight_batching_stats
+    assert ifb.num_queued_context_requests == 2
+    assert ifb.num_queued_ctx_tokens == 2 * 1256
+
+
+def test_queued_filters_non_normal_requests():
+    # Shutdown / cancel / control items should be ignored.
+    items = [
+        _StubQueueItem(input_token_ids=list(range(100)), is_normal_request=False),
+        _StubQueueItem(input_token_ids=list(range(50))),
+    ]
+    stats = _invoke_update_iter_stats(_StubScheduledBatch(), items, num_ctx_tokens=0)
+    ifb = stats.inflight_batching_stats
+    assert ifb.num_queued_context_requests == 1
+    assert ifb.num_queued_ctx_tokens == 50
+
+
+@pytest.mark.parametrize("enable_attention_dp", [False, True])
+def test_queued_includes_pre_admission_queue_once(enable_attention_dp):
+    from tensorrt_llm.bindings.executor import RequestType
+
+    ingress = _StubQueueItem(list(range(100)))
+    waiting_context = _StubQueueItem(list(range(200)))
+    waiting_decode = _StubQueueItem(
+        list(range(300)),
+        request_type=RequestType.REQUEST_TYPE_GENERATION_ONLY,
+    )
+    control = _StubQueueItem([0], is_normal_request=False)
+    missing_payload = _StubQueueItem([0])
+    missing_payload.request = None
+    canceled = _StubQueueItem(list(range(400)))
+    cancel = _StubQueueItem([0], is_normal_request=False)
+    cancel.id = canceled.id
+    cancel.is_canceled_request = True
+    stats = _invoke_update_iter_stats(
+        _StubScheduledBatch(),
+        [ingress, canceled, cancel],
+        num_ctx_tokens=0,
+        enable_attention_dp=enable_attention_dp,
+        waiting_items=[ingress, waiting_context, waiting_decode, control, missing_payload],
+    )
+    ifb = stats.inflight_batching_stats
+    assert ifb.num_queued_context_requests == 2
+    assert ifb.num_queued_ctx_tokens == 300
+    assert ifb.num_queued_gen_requests == 1
+    assert ifb.num_queued_gen_kv_tokens == 300
+    assert stats.num_queued_requests == 3
+
+
+def test_queued_counts_admitted_prefill_remaining_tokens():
+    scheduled = _StubRequest(is_context_init_state=True, context_remaining_length=900)
+    waiting = _StubRequest(
+        is_context_init_state=True,
+        context_remaining_length=300,
+        context_current_position=700,
+    )
+    paused = _StubRequest(is_context_init_state=True, context_remaining_length=200)
+    dummy = _StubRequest(
+        is_context_init_state=True,
+        context_remaining_length=999,
+        is_attention_dp_dummy=True,
+    )
+    finished = _StubRequest(
+        is_context_init_state=True,
+        context_remaining_length=999,
+        is_finished=True,
+    )
+    canceled = _StubRequest(is_context_init_state=True, context_remaining_length=999)
+    inflight = _StubRequest(is_context_init_state=True, context_remaining_length=999)
+    decode = _StubRequest(num_tokens=1000)
+    transferring = _StubRequest(num_tokens=500, is_disagg_generation_init_state=True)
+    stats = _invoke_update_iter_stats(
+        _StubScheduledBatch(context_reqs=[scheduled], paused_reqs=[paused]),
+        [],
+        num_ctx_tokens=100,
+        active_requests=[
+            scheduled,
+            waiting,
+            paused,
+            dummy,
+            finished,
+            canceled,
+            inflight,
+            decode,
+            transferring,
+        ],
+        canceled_ids=[canceled.py_request_id],
+        inflight_ids=[inflight.py_request_id],
+    )
+    ifb = stats.inflight_batching_stats
+    assert ifb.num_queued_context_requests == 1
+    assert ifb.num_queued_ctx_tokens == 300
+    assert ifb.num_queued_gen_requests == 1
+    assert ifb.num_queued_gen_kv_tokens == 500
+    assert ifb.num_paused_requests == 1
+    assert stats.num_queued_requests == 2
+
+
+def test_attention_dp_local_backlog_excludes_replicated_waiting_queue():
+    active = _StubRequest(is_context_init_state=True, context_remaining_length=300)
+    stats = _invoke_update_iter_stats(
+        _StubScheduledBatch(),
+        [_StubQueueItem(list(range(100)))],
+        num_ctx_tokens=0,
+        enable_attention_dp=True,
+        rank=1,
+        waiting_items=[_StubQueueItem(list(range(200)))],
+        active_requests=[active],
+    )
+    assert stats.inflight_batching_stats.num_queued_context_requests == 1
+    assert stats.inflight_batching_stats.num_queued_ctx_tokens == 300
+
+
+@pytest.mark.parametrize("enable_attention_dp", [False, True])
+def test_queued_includes_requests_parked_behind_control_request(enable_attention_dp):
+    """Requests fetched after a control request stay queued while it drains."""
+    from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
+        CONTROL_REQUEST_ID,
+        RequestQueueItem,
+    )
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+    from tensorrt_llm.bindings.executor import RequestType
+
+    def normal(req_id, num_tokens, request_type=RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION):
+        return RequestQueueItem(
+            req_id,
+            types.SimpleNamespace(
+                num_input_tokens=num_tokens,
+                py_prompt_trimmed_prefix=0,
+                request_type=request_type,
+            ),
+        )
+
+    envelope = [
+        RequestQueueItem(CONTROL_REQUEST_ID),
+        normal(1_000_001, 200),
+        normal(1_000_002, 300, RequestType.REQUEST_TYPE_GENERATION_ONLY),
+        normal(1_000_003, 400),
+        RequestQueueItem(1_000_003, is_canceled_request=True),
+        RequestQueueItem(CONTROL_REQUEST_ID),
+    ]
+    fetcher = types.SimpleNamespace(
+        control_requests=[],
+        request_accumulated=[],
+        dist=types.SimpleNamespace(rank=0),
+    )
+    assert PyExecutor._handle_special_queue_items(fetcher, envelope) == []
+    assert len(fetcher.control_requests) == 1
+    assert fetcher.request_accumulated == envelope[1:]
+
+    stats = _invoke_update_iter_stats(
+        _StubScheduledBatch(),
+        [_StubQueueItem(list(range(100)))],  # Arrived during the drain; still in ingress.
+        num_ctx_tokens=0,
+        enable_attention_dp=enable_attention_dp,
+        parked_items=fetcher.request_accumulated,
+    )
+    ifb = stats.inflight_batching_stats
+    # The cancelled request and the second control item are not backlog.
+    assert ifb.num_queued_context_requests == 2
+    assert ifb.num_queued_ctx_tokens == 300
+    assert ifb.num_queued_gen_requests == 1
+    assert ifb.num_queued_gen_kv_tokens == 300
+    assert stats.num_queued_requests == 3
+
+
+def test_queued_excludes_current_overlap_batch():
+    """The previous batch's record must not report the batch now running as queued."""
+    previous = _StubRequest(num_tokens=1000)
+    # Admitted after the previous batch was built. A non-final chunk is in the
+    # current forward pass, so the request is still context-init with tokens left.
+    chunking = _StubRequest(is_context_init_state=True, context_remaining_length=64)
+    # Paused by the current batch, which resets them to context-init.
+    paused_now = _StubRequest(is_context_init_state=True, context_remaining_length=700)
+    recompute_paused_now = _StubRequest(is_context_init_state=True, context_remaining_length=900)
+    waiting = _StubRequest(is_context_init_state=True, context_remaining_length=300)
+
+    def collect(current_batch):
+        return _invoke_update_iter_stats(
+            _StubScheduledBatch(gen_reqs=[previous]),
+            [],
+            num_ctx_tokens=0,
+            active_requests=[previous, chunking, paused_now, recompute_paused_now, waiting],
+            current_batch=current_batch,
+        )
+
+    stats = collect(
+        _StubScheduledBatch(
+            context_reqs=[chunking],
+            paused_reqs=[paused_now],
+            recompute_paused_reqs=[recompute_paused_now],
+        )
+    )
+    ifb = stats.inflight_batching_stats
+    assert ifb.num_queued_context_requests == 1
+    assert ifb.num_queued_ctx_tokens == 300
+    assert stats.num_queued_requests == 1
+    # The scheduled counters still describe the previous batch only.
+    assert ifb.num_gen_requests == 1
+    assert ifb.num_context_requests == 0
+    assert ifb.num_paused_requests == 0
+
+    # Without a running batch (non-overlap, drain paths) all four are backlog.
+    ifb = collect(None).inflight_batching_stats
+    assert ifb.num_queued_context_requests == 4
+    assert ifb.num_queued_ctx_tokens == 64 + 700 + 900 + 300
+
+
+@pytest.mark.parametrize("enable_attention_dp,rank", [(False, 0), (True, 1)])
+def test_queued_counts_gen_first_context_waiting_for_peer(enable_attention_dp, rank):
+    """A generation-first context request parked until its peer is ready is unscheduled prefill."""
+    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+
+    waiting_for_peer = _StubRequest(
+        context_remaining_length=400,
+        state=LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER,
+    )
+    promoted = _StubRequest(
+        is_context_init_state=True,
+        context_remaining_length=300,
+        state=LlmRequestState.CONTEXT_INIT,
+    )
+    canceled = _StubRequest(
+        context_remaining_length=999,
+        state=LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER,
+    )
+    decode = _StubRequest(num_tokens=1000, state=LlmRequestState.GENERATION_IN_PROGRESS)
+    stats = _invoke_update_iter_stats(
+        _StubScheduledBatch(),
+        [],
+        num_ctx_tokens=0,
+        enable_attention_dp=enable_attention_dp,
+        rank=rank,
+        active_requests=[waiting_for_peer, promoted, canceled, decode],
+        canceled_ids=[canceled.py_request_id],
+    )
+    ifb = stats.inflight_batching_stats
+    assert ifb.num_queued_context_requests == 2
+    assert ifb.num_queued_ctx_tokens == 700
+    assert ifb.num_queued_gen_requests == 0
+    assert stats.num_queued_requests == 2
+
+
+def test_queued_routes_by_request_type():
+    # Disaggregated serving: a decode engine receives
+    # REQUEST_TYPE_GENERATION_ONLY items that await KV transfer from a
+    # prefill engine before starting decode. They belong in the
+    # queued-gen counters, not the queued-context counters. A prefill
+    # engine sees REQUEST_TYPE_CONTEXT_ONLY items, which are real
+    # queued-prefill work and count in the context counters alongside
+    # default-type (CONTEXT_AND_GENERATION) items.
+    from tensorrt_llm.bindings.executor import RequestType
+
+    items = [
+        # Non-disagg default: queued-context work, len=100.
+        _StubQueueItem(
+            input_token_ids=list(range(100)),
+            request_type=RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION,
+        ),
+        # Disagg prefill side: queued-context work, len=200.
+        _StubQueueItem(
+            input_token_ids=list(range(200)),
+            request_type=RequestType.REQUEST_TYPE_CONTEXT_ONLY,
+        ),
+        # Disagg decode side: queued-gen work, len=512.
+        _StubQueueItem(
+            input_token_ids=list(range(512)),
+            request_type=RequestType.REQUEST_TYPE_GENERATION_ONLY,
+        ),
+        # Disagg decode side: queued-gen work, len=1024.
+        _StubQueueItem(
+            input_token_ids=list(range(1024)),
+            request_type=RequestType.REQUEST_TYPE_GENERATION_ONLY,
+        ),
+    ]
+    stats = _invoke_update_iter_stats(_StubScheduledBatch(), items, num_ctx_tokens=0)
+    ifb = stats.inflight_batching_stats
+    # Two context-flavoured items -> queued-context counters.
+    assert ifb.num_queued_context_requests == 2
+    assert ifb.num_queued_ctx_tokens == 300  # 100 + 200
+    # Two generation-only items -> queued-gen counters.
+    assert ifb.num_queued_gen_requests == 2
+    assert ifb.num_queued_gen_kv_tokens == 1536  # 512 + 1024
+
+
+def test_paused_decode_requests():
+    paused = [
+        _StubRequest(num_tokens=300),
+        _StubRequest(num_tokens=800),
+    ]
+    recompute_paused = [_StubRequest(num_tokens=700)]
+    stats = _invoke_update_iter_stats(
+        _StubScheduledBatch(paused_reqs=paused, recompute_paused_reqs=recompute_paused),
+        [],
+        num_ctx_tokens=0,
+    )
+    ifb = stats.inflight_batching_stats
+    assert ifb.num_paused_requests == 3
+    assert ifb.num_paused_kv_tokens == 1800
+
+
+def test_dummy_filtering_on_kv_token_fields():
+    """Verify dummy requests are excluded from KV-token-weighted counters."""
+    # Dummy-padding added by Attention-DP or CUDA graph capture must not
+    # contribute to the KV-token-weighted fields under test
+    # (num_ctx_kv_tokens, num_gen_kv_tokens, num_paused_kv_tokens).
+    # The existing count fields (num_context_requests / num_gen_requests /
+    # num_paused_requests) are set directly from ``scheduled_batch``
+    # properties earlier in _update_iter_stats, so they DO include dummies.
+    # This asymmetry is by design for the new KV-token fields: Dynamo
+    # wants "real work only" for its autoscaling signal.
+    ctx = [
+        _StubRequest(
+            context_chunk_size=100,
+            context_current_position=0,
+            is_attention_dp_dummy=True,
+        ),
+        _StubRequest(
+            context_chunk_size=300,
+            context_current_position=75,
+            is_cuda_graph_dummy=True,
+        ),
+        _StubRequest(context_chunk_size=200, context_current_position=50),
+    ]
+    gen = [
+        _StubRequest(num_tokens=1024, is_attention_dp_dummy=True),
+        _StubRequest(num_tokens=2048, is_cuda_graph_dummy=True),
+    ]
+    paused = [
+        _StubRequest(num_tokens=500, is_attention_dp_dummy=True),
+        _StubRequest(num_tokens=700, is_cuda_graph_dummy=True),
+    ]
+    stats = _invoke_update_iter_stats(
+        _StubScheduledBatch(context_reqs=ctx, gen_reqs=gen, paused_reqs=paused),
+        [],
+        num_ctx_tokens=300,
+    )
+    ifb = stats.inflight_batching_stats
+    # Count fields include dummies (populated directly from scheduled_batch).
+    assert ifb.num_context_requests == 3
+    assert ifb.num_gen_requests == 2
+    assert ifb.num_paused_requests == 2
+    # KV-token-weighted new fields filter dummies.
+    assert ifb.num_ctx_kv_tokens == 50  # only the non-dummy's start
+    assert ifb.num_gen_kv_tokens == 0  # dummy gen filtered
+    assert ifb.num_paused_kv_tokens == 0  # dummy paused filtered
+
+
+def test_attention_dp_dummy_filtering_on_count_fields():
+    """Verify Attention-DP mode excludes dummy padding from rank-local counts."""
+    # Under attention-DP, the rank-local payload emitted for each rank must
+    # exclude ADP and CUDA graph dummy padding from request counts too.
+    ctx = [
+        _StubRequest(
+            context_chunk_size=100,
+            context_current_position=0,
+            is_attention_dp_dummy=True,
+        ),
+        _StubRequest(
+            context_chunk_size=150,
+            context_current_position=25,
+            is_cuda_graph_dummy=True,
+        ),
+        _StubRequest(context_chunk_size=200, context_current_position=50),
+    ]
+    gen = [
+        _StubRequest(num_tokens=1024, is_attention_dp_dummy=True),
+        _StubRequest(num_tokens=1536, is_cuda_graph_dummy=True),
+        _StubRequest(num_tokens=2048),
+    ]
+    paused = [
+        _StubRequest(num_tokens=500, is_attention_dp_dummy=True),
+        _StubRequest(num_tokens=600, is_cuda_graph_dummy=True),
+        _StubRequest(num_tokens=700),
+    ]
+
+    stats = _invoke_update_iter_stats(
+        _StubScheduledBatch(context_reqs=ctx, gen_reqs=gen, paused_reqs=paused),
+        [],
+        num_ctx_tokens=300,
+        enable_attention_dp=True,
+    )
+    ifb = stats.inflight_batching_stats
+    assert ifb.num_context_requests == 1
+    assert ifb.num_gen_requests == 1
+    assert ifb.num_paused_requests == 1
+    assert ifb.num_scheduled_requests == 2
+    assert ifb.num_ctx_kv_tokens == 50
+    assert ifb.num_gen_kv_tokens == 2048
+    assert ifb.num_paused_kv_tokens == 700
+
+
+def test_full_mixed_iteration():
+    # Realistic scenario: 3 prefill (1 fresh, 2 continuing chunks), 4 decode,
+    # 2 preempted, 3 queued.
+    ctx = [
+        _StubRequest(context_chunk_size=1024, context_current_position=0),
+        _StubRequest(context_chunk_size=512, context_current_position=1024),
+        _StubRequest(context_chunk_size=256, context_current_position=768),
+    ]
+    gen = [_StubRequest(num_tokens=n) for n in (500, 1500, 2500, 3500)]
+    paused = [_StubRequest(num_tokens=n) for n in (400, 900)]
+    qitems = [_StubQueueItem(input_token_ids=list(range(n))) for n in (256, 512, 1024)]
+
+    stats = _invoke_update_iter_stats(
+        _StubScheduledBatch(context_reqs=ctx, gen_reqs=gen, paused_reqs=paused),
+        qitems,
+        num_ctx_tokens=1024 + 512 + 256,
+    )
+
+    ifb = stats.inflight_batching_stats
+    assert ifb.num_context_requests == 3
+    # py_last_context_chunk[0] per req = 0, 1024, 768
+    assert ifb.num_ctx_kv_tokens == 0 + 1024 + 768
+    assert ifb.num_gen_requests == 4
+    assert ifb.num_gen_kv_tokens == 500 + 1500 + 2500 + 3500
+    assert ifb.num_queued_context_requests == 3
+    assert ifb.num_queued_ctx_tokens == 256 + 512 + 1024
+    assert ifb.num_paused_requests == 2
+    assert ifb.num_paused_kv_tokens == 400 + 900
+
+
+def test_num_ctx_kv_tokens_ignores_iter_states_side_channel():
+    """Regression guard: num_ctx_kv_tokens must not read iter_states.
+
+    Under overlap scheduling the ``model_engine.iter_states["num_ctx_tokens"]``
+    side channel is rewritten by the current iteration's forward step
+    before the previous batch's stats are emitted, so consuming it would
+    report the wrong iteration's count. This test pushes a deliberately
+    wrong value into ``iter_states`` and confirms the field is still
+    computed from per-request ``py_last_context_chunk``. If someone
+    re-introduces the side-channel read, this test fails.
+    """
+    ctx = [_StubRequest(context_chunk_size=744, context_current_position=256)]
+    stats = _invoke_update_iter_stats(
+        _StubScheduledBatch(context_reqs=ctx), [], num_ctx_tokens=99999
+    )
+    # py_last_context_chunk = (256, 1000); precomputed = start = 256.
+    # If the side channel were consulted, we'd see 99999.
+    ifb = stats.inflight_batching_stats
+    assert ifb.num_context_requests == 1
+    assert ifb.num_ctx_kv_tokens == 256
+
+
+def test_num_ctx_tokens_uses_scheduled_batch_stats_not_model_engine_side_channel():
+    """Regression guard: num_ctx_tokens must come from scheduled-batch stats."""
+    from tensorrt_llm._torch.pyexecutor.py_executor import ScheduledBatchStats
+
+    ctx = [_StubRequest(context_chunk_size=744, context_current_position=256)]
+    stats = _invoke_update_iter_stats(
+        _StubScheduledBatch(context_reqs=ctx),
+        [],
+        num_ctx_tokens=99999,
+        scheduled_batch_stats=ScheduledBatchStats(num_ctx_tokens=744),
+    )
+
+    ifb = stats.inflight_batching_stats
+    assert ifb.num_ctx_tokens == 744
+
+
+def test_num_gen_kv_tokens_uses_scheduled_batch_stats():
+    """Regression guard: decode KV must not include post-sample token growth."""
+    from tensorrt_llm._torch.pyexecutor.py_executor import ScheduledBatchStats
+
+    gen = [_StubRequest(num_tokens=1025)]
+    stats = _invoke_update_iter_stats(
+        _StubScheduledBatch(gen_reqs=gen),
+        [],
+        num_ctx_tokens=0,
+        scheduled_batch_stats=ScheduledBatchStats(num_gen_kv_tokens=1024),
+    )
+
+    ifb = stats.inflight_batching_stats
+    assert ifb.num_gen_kv_tokens == 1024
+
+
+# ---------------------------------------------------------------------------
+# Speculative-decoding aggregation tests: the specdec branch of
+# ``_update_iter_stats`` sums draft/accepted tokens across generation
+# requests and derives the acceptance length. Attention-DP / CUDA-graph
+# padding adds *generation* dummies carrying synthetic
+# ``py_draft_tokens = [1] * k`` and a spec-sampler accepted count
+# (resource_manager.add_dummy_requests is_gen branch); they must not enter
+# the aggregate or they depress the reported acceptance rate/length. This
+# path is distinct from the KV-token dummy filtering above and is only
+# reached when ``stats.specdec_stats`` is allocated (spec decode enabled).
+# ---------------------------------------------------------------------------
+
+
+def test_specdec_excludes_dummy_generation_requests():
+    """Regression guard: dummy gen requests must not pollute specdec AR/AL.
+
+    One real drafted request (k=4, 3 accepted) alongside an attention-DP
+    dummy and a CUDA-graph dummy, each mirroring the is_gen dummy branch
+    (``num_draft_tokens == 0`` with ``py_draft_tokens = [1] * 4``). The
+    aggregate must reflect only the real request: 4 draft tokens, 3
+    accepted, one drafted request, and acceptance_length = (3 + 1) / 1.
+
+    Without the ``is_dummy`` filter each dummy would contribute draft_len=4
+    (counted from the non-zero ``py_draft_tokens``) and 0 accepted, giving
+    num_requests_with_draft=3 and a depressed acceptance_length of
+    (3 + 3) / 3 = 2.0 instead of 4.0.
+    """
+    real = _StubRequest(num_draft_tokens=4, py_num_accepted_draft_tokens=3)
+    adp_dummy = _StubRequest(
+        py_draft_tokens=[1, 1, 1, 1],
+        py_num_accepted_draft_tokens=0,
+        is_attention_dp_dummy=True,
+    )
+    cuda_graph_dummy = _StubRequest(
+        py_draft_tokens=[1, 1, 1, 1],
+        py_num_accepted_draft_tokens=0,
+        is_cuda_graph_dummy=True,
+    )
+    stats = _invoke_update_iter_stats(
+        _StubScheduledBatch(gen_reqs=[real, adp_dummy, cuda_graph_dummy]),
+        [],
+        num_ctx_tokens=0,
+        specdec=True,
+    )
+    sd = stats.specdec_stats
+    assert sd.num_draft_tokens == 4
+    assert sd.num_accepted_tokens == 3
+    assert sd.num_requests_with_draft_tokens == 1
+    assert sd.acceptance_length == 4.0
+
+
+def test_specdec_all_dummy_generation_requests_yield_zero():
+    """An iteration of only dummy gen requests reports no drafted work."""
+    dummies = [
+        _StubRequest(py_draft_tokens=[1, 1, 1, 1], is_attention_dp_dummy=True),
+        _StubRequest(py_draft_tokens=[1, 1, 1, 1], is_cuda_graph_dummy=True),
+    ]
+    stats = _invoke_update_iter_stats(
+        _StubScheduledBatch(gen_reqs=dummies),
+        [],
+        num_ctx_tokens=0,
+        specdec=True,
+    )
+    sd = stats.specdec_stats
+    assert sd.num_draft_tokens == 0
+    assert sd.num_accepted_tokens == 0
+    assert sd.num_requests_with_draft_tokens == 0
+    assert sd.acceptance_length == 0.0
+
+
+def test_specdec_aggregates_multiple_real_requests():
+    """Baseline: with no dummies, every real drafted request is aggregated."""
+    reqs = [
+        _StubRequest(num_draft_tokens=4, py_num_accepted_draft_tokens=3),
+        _StubRequest(num_draft_tokens=4, py_num_accepted_draft_tokens=1),
+    ]
+    stats = _invoke_update_iter_stats(
+        _StubScheduledBatch(gen_reqs=reqs),
+        [],
+        num_ctx_tokens=0,
+        specdec=True,
+    )
+    sd = stats.specdec_stats
+    assert sd.num_draft_tokens == 8
+    assert sd.num_accepted_tokens == 4
+    assert sd.num_requests_with_draft_tokens == 2
+    # (total_accepted + num_requests_with_draft) / num_requests_with_draft
+    assert sd.acceptance_length == (4 + 2) / 2
+
+
+# ---------------------------------------------------------------------------
+# Attention-DP fanout tests: completed rank-local payloads are carried by the
+# next ADP allgather, then rank 0 appends one row per ADP rank.
+# ---------------------------------------------------------------------------
+
+
+def _make_adp_iteration_stats(
+    *,
+    iter_id=7,
+    num_context_requests=0,
+    num_ctx_tokens=0,
+    num_ctx_kv_tokens=0,
+    num_gen_requests=0,
+    num_gen_kv_tokens=0,
+    num_paused_requests=0,
+    num_paused_kv_tokens=0,
+    num_queued_context_requests=0,
+    num_queued_ctx_tokens=0,
+    num_queued_gen_requests=0,
+    num_queued_gen_kv_tokens=0,
+):
+    ifb = InflightBatchingStats()
+    ifb.num_context_requests = num_context_requests
+    ifb.num_ctx_tokens = num_ctx_tokens
+    ifb.num_ctx_kv_tokens = num_ctx_kv_tokens
+    ifb.num_gen_requests = num_gen_requests
+    ifb.num_gen_kv_tokens = num_gen_kv_tokens
+    ifb.num_paused_requests = num_paused_requests
+    ifb.num_paused_kv_tokens = num_paused_kv_tokens
+    ifb.num_scheduled_requests = num_context_requests + num_gen_requests
+    ifb.num_queued_context_requests = num_queued_context_requests
+    ifb.num_queued_ctx_tokens = num_queued_ctx_tokens
+    ifb.num_queued_gen_requests = num_queued_gen_requests
+    ifb.num_queued_gen_kv_tokens = num_queued_gen_kv_tokens
+
+    stats = IterationStats()
+    stats.iter = iter_id
+    stats.inflight_batching_stats = ifb
+    return stats
+
+
+class _KvWindowIterStats:
+    """KV-cache iteration stats of one window; each counter reads as its name's length."""
+
+    def __getattr__(self, name):
+        return len(name)
+
+
+def _make_request_stats(request_id):
+    req_stats = RequestStats()
+    req_stats.id = request_id
+    return req_stats
+
+
+def _build_adp_stats_buffer(pending_stats, *, is_rank0=True):
+    buffer = ADPIterStatsBuffer()
+    buffer.queue(
+        pending_stats,
+        [_make_request_stats(42)] if is_rank0 else None,
+        kv_iter_stats={16: _KvWindowIterStats()} if is_rank0 else None,
+        is_rank0=is_rank0,
+        host_step_time_ms=11.0 if is_rank0 else None,
+        prev_device_step_time_ms=9.0 if is_rank0 else None,
+        gpu_forward_time_ms=7.0 if is_rank0 else None,
+    )
+    return buffer
+
+
+def _make_kv_cache_snapshot(offset: int) -> KvCacheStats:
+    """Build distinct native counters for a rank's cache.
+
+    Args:
+        offset: Value distinguishing each rank and cache pool.
+
+    Returns:
+        A native KV snapshot with a fractional hit rate.
+    """
+    stats = KvCacheStats()
+    stats.max_num_blocks = 100 + 2 * offset
+    stats.free_num_blocks = 80 + offset
+    stats.used_num_blocks = 20 + offset
+    stats.tokens_per_block = 16 + offset
+    stats.alloc_total_blocks = 50 + offset
+    stats.alloc_new_blocks = 30 + offset
+    stats.reused_blocks = 12 + offset
+    stats.missed_blocks = 7 + offset
+    # Deliberately distinct from reused / (reused + missed): preserve the
+    # measured float, rather than recomputing or truncating it in transport.
+    stats.cache_hit_rate = 0.375 + offset / 256
+    return stats
+
+
+@pytest.mark.parametrize("include_kv_cache_load", [False, True])
+def test_attention_dp_fanout_preserves_rank_local_kv_snapshots(
+    include_kv_cache_load: bool,
+) -> None:
+    """Transport all native KV fields without copying rank 0 or later mutations."""
+    buffers = [ADPIterStatsBuffer(), ADPIterStatsBuffer()]
+    states = []
+    expected = []
+    for rank, buffer in enumerate(buffers):
+        stats = _make_adp_iteration_stats(iter_id=9, num_gen_requests=rank + 1)
+        stats.kv_cache_stats = _make_kv_cache_snapshot(rank * 10)
+        stats.cross_kv_cache_stats = _make_kv_cache_snapshot(rank * 10 + 30)
+        expected.append(json.loads(stats.to_json_str()))
+        buffer.queue(stats, is_rank0=rank == 0)
+        # The queued payload must own primitive values, not native references.
+        stats.kv_cache_stats.used_num_blocks = 99
+        stats.kv_cache_stats.cache_hit_rate = 0.0
+        stats.cross_kv_cache_stats.alloc_total_blocks = 999
+        stats.kv_cache_stats = _make_kv_cache_snapshot(50)
+        stats.cross_kv_cache_stats = _make_kv_cache_snapshot(60)
+        payload = buffer.next_payload()
+        payload.kv_used_blocks = 70 + rank
+        payload.kv_total_blocks = 700 + rank
+        payload.kv_load_timestamp_ns = 123 + rank
+        state = RankState(rank=rank, iter_stats=payload)
+        states.append(RankState.deserialize(state.serialize(include_kv_cache_load)))
+
+    rows = buffers[0].finalize(states, is_rank0=True)
+
+    assert len(rows) == 2
+    for rank, row in enumerate(rows):
+        exported = json.loads(row)
+        assert exported["attentionDpRank"] == rank
+        assert exported["inflightBatchingStats"]["numGenRequests"] == rank + 1
+        assert exported["kvCacheStats"] == expected[rank]["kvCacheStats"]
+        # IterationStats JSON omits the cross-cache object; check the transported snapshot.
+        cross = states[rank].iter_stats.cross_kv_cache_stats
+        expected_cross = _make_kv_cache_snapshot(rank * 10 + 30)
+        assert cross.max_num_blocks == expected_cross.max_num_blocks
+        assert cross.free_num_blocks == expected_cross.free_num_blocks
+        assert cross.used_num_blocks == expected_cross.used_num_blocks
+        assert cross.tokens_per_block == expected_cross.tokens_per_block
+        assert cross.alloc_total_blocks == expected_cross.alloc_total_blocks
+        assert cross.alloc_new_blocks == expected_cross.alloc_new_blocks
+        assert cross.reused_blocks == expected_cross.reused_blocks
+        assert cross.missed_blocks == expected_cross.missed_blocks
+        assert cross.cache_hit_rate == expected_cross.cache_hit_rate
+
+
+def _exchange_idle_heartbeat(buffers, *, iter_id=9, idle_heartbeat=True, busy_rank=None):
+    """Queue a zero-duration snapshot on every rank and fan it out on rank 0."""
+    states = []
+    for rank, buffer in enumerate(buffers):
+        stats = _make_adp_iteration_stats(
+            iter_id=iter_id, num_gen_requests=1 if rank == busy_rank else 0
+        )
+        stats.kv_cache_stats = _make_kv_cache_snapshot(rank * 10)
+        buffer.queue(
+            stats,
+            is_rank0=rank == 0,
+            host_step_time_ms=0.0,
+            prev_device_step_time_ms=0.0,
+            gpu_forward_time_ms=0.0,
+            idle_heartbeat=idle_heartbeat,
+        )
+        states.append(RankState(rank=rank, iter_stats=buffer.next_payload()))
+    # Every rank finalizes the same gathered states; only rank 0 gets rows.
+    for buffer in buffers[1:]:
+        assert buffer.finalize(states, is_rank0=False) == []
+        assert buffer.last_idle_rank_states is None
+    return buffers[0].finalize(states, is_rank0=True)
+
+
+def test_attention_dp_idle_heartbeat_repeats_per_rank_rows_without_an_exchange():
+    """Rank 0 repeats the exchanged idle rows from its own fresh snapshot."""
+    buffers = [ADPIterStatsBuffer(), ADPIterStatsBuffer()]
+    exchanged = [json.loads(row) for row in _exchange_idle_heartbeat(buffers)]
+    assert [row["attentionDpRank"] for row in exchanged] == [0, 1]
+    assert all(row["isQueueSnapshot"] is True for row in exchanged)
+    assert buffers[0].last_idle_rank_states is not None
+    assert buffers[0].next_payload() is None
+
+    fresh = _make_adp_iteration_stats(iter_id=10)
+    fresh.timestamp = "fresh"
+    fresh.gpu_mem_usage = 4321
+    fresh.kv_cache_stats = _make_kv_cache_snapshot(5)
+    repeated = [json.loads(row) for row in buffers[0].make_idle_heartbeat_rows(fresh, "overlap")]
+
+    assert [row["attentionDpRank"] for row in repeated] == [0, 1]
+    for row in repeated:
+        assert row["timestamp"] == "fresh"
+        assert row["iter"] == 10
+        assert row["gpuMemUsage"] == 4321
+        assert row["iterLatencyMS"] == 0
+        assert row["isQueueSnapshot"] is True
+        assert row["inflightBatchingStats"]["numScheduledRequests"] == 0
+        assert "requestStats" not in row and "kvCacheIterationStats" not in row
+        assert (row["hostStepTimeMS"], row["prevDeviceStepTimeMS"]) == (0.0, 0.0)
+        assert row["gpuForwardTimeMS"] == 0.0
+        assert row["schedulerMode"] == "overlap"
+        # A repeated row has the fields of the exchanged one (which had no scheduler mode).
+        assert row.keys() - {"schedulerMode"} == exchanged[row["attentionDpRank"]].keys()
+    # Rank 0's row follows its fresh snapshot; the parked peer keeps its own.
+    assert (
+        repeated[0]["kvCacheStats"]["usedNumBlocks"] == _make_kv_cache_snapshot(5).used_num_blocks
+    )
+    assert repeated[1]["kvCacheStats"] == exchanged[1]["kvCacheStats"]
+    assert (
+        repeated[1]["kvCacheStats"]["usedNumBlocks"] == _make_kv_cache_snapshot(10).used_num_blocks
+    )
+    # Each repeat is made from the snapshot it is given. Requests that reached rank 0's
+    # queues since the exchange are rank 0's: the parked peer still has nothing queued.
+    later = _make_adp_iteration_stats(
+        iter_id=10, num_queued_context_requests=2, num_queued_ctx_tokens=64
+    )
+    later.timestamp = "later"
+    later_rows = [json.loads(row) for row in buffers[0].make_idle_heartbeat_rows(later)]
+    assert [row["timestamp"] for row in later_rows] == ["later", "later"]
+    assert [row["numQueuedRequests"] for row in later_rows] == [2, 0]
+    assert [row["inflightBatchingStats"]["numQueuedCtxTokens"] for row in later_rows] == [64, 0]
+
+
+@pytest.mark.parametrize("case", ["measured", "peer-scheduled", "nothing-pending"])
+def test_attention_dp_idle_rows_expire_with_the_next_fanout(case):
+    """Only the latest fanout, and only an all-rank idle one, may be repeated."""
+    buffers = [ADPIterStatsBuffer(), ADPIterStatsBuffer()]
+    _exchange_idle_heartbeat(buffers)
+    assert buffers[0].last_idle_rank_states is not None
+
+    if case == "measured":
+        rows = _exchange_idle_heartbeat(buffers, iter_id=10, idle_heartbeat=False)
+        assert len(rows) == 2
+        assert not any("isQueueSnapshot" in json.loads(row) for row in rows)
+    elif case == "peer-scheduled":
+        rows = _exchange_idle_heartbeat(buffers, iter_id=10, busy_rank=1)
+        assert len(rows) == 2
+    else:
+        assert buffers[0].finalize([RankState(rank=0), RankState(rank=1)], is_rank0=True) == []
+
+    assert buffers[0].last_idle_rank_states is None
+    assert not buffers[0].last_fanout_is_busy_queue_snapshot
+    assert buffers[0].make_idle_heartbeat_rows(_make_adp_iteration_stats(iter_id=11)) == []
+
+
+def test_attention_dp_pending_idle_heartbeat_is_superseded_on_every_rank():
+    """A second pending heartbeat would keep the buffers from ever draining."""
+    for is_rank0 in (True, False):
+        buffer = ADPIterStatsBuffer()
+        buffer.queue(_make_adp_iteration_stats(iter_id=8, num_gen_requests=1), is_rank0=is_rank0)
+        for iter_id in (9, 10, 11):
+            buffer.queue(
+                _make_adp_iteration_stats(iter_id=iter_id),
+                is_rank0=is_rank0,
+                idle_heartbeat=True,
+            )
+        # The measured record stays; only the newest heartbeat is behind it.
+        assert sorted(buffer._payloads) == [8, 11]
+        assert buffer.next_payload().iter_stats_iter == 8
+
+
+def test_attention_dp_finalize_reports_whether_it_settled_an_iteration():
+    buffers = [ADPIterStatsBuffer(), ADPIterStatsBuffer()]
+    idle_states = [RankState(rank=0), RankState(rank=1)]
+    assert buffers[0].finalize(idle_states, is_rank0=True) == []
+    assert not buffers[0].last_finalize_settled
+
+    # Rank 1 has no record for rank 0's iteration yet: nothing is settled.
+    buffers[0].queue(_make_adp_iteration_stats(iter_id=9, num_gen_requests=1), is_rank0=True)
+    waiting = [RankState(rank=0, iter_stats=buffers[0].next_payload()), RankState(rank=1)]
+    for rank, buffer in enumerate(buffers):
+        assert buffer.finalize(waiting, is_rank0=rank == 0) == []
+        assert not buffer.last_finalize_settled
+
+    # Rank 1 answers with a placeholder on the next exchange.
+    aligned = [
+        RankState(rank=rank, iter_stats=buffer.next_payload())
+        for rank, buffer in enumerate(buffers)
+    ]
+    assert len(buffers[0].finalize(aligned, is_rank0=True)) == 2
+    assert buffers[0].last_finalize_settled
+
+
+def test_attention_dp_snapshot_sharing_an_iteration_with_measured_work_is_not_a_queue_snapshot():
+    """A peer's measured row must not be rate-limited away with rank 0's snapshot."""
+    buffers = [ADPIterStatsBuffer(), ADPIterStatsBuffer()]
+    buffers[0].queue(
+        _make_adp_iteration_stats(iter_id=9, num_queued_context_requests=1),
+        is_rank0=True,
+        is_queue_snapshot=True,
+    )
+    buffers[1].queue(_make_adp_iteration_stats(iter_id=9, num_gen_requests=3), is_rank0=False)
+    states = [
+        RankState(rank=rank, iter_stats=buffer.next_payload())
+        for rank, buffer in enumerate(buffers)
+    ]
+
+    rows = [json.loads(row) for row in buffers[0].finalize(states, is_rank0=True)]
+
+    assert [row["attentionDpRank"] for row in rows] == [0, 1]
+    assert rows[1]["inflightBatchingStats"]["numGenRequests"] == 3
+    # Rank 0 measured no duration for this record, so every row of it is marked.
+    assert all(row["isQueueSnapshot"] is True for row in rows)
+    assert not buffers[0].last_fanout_is_busy_queue_snapshot
+    assert buffers[0].last_idle_rank_states is None
+
+
+def test_attention_dp_zero_duration_fanout_keeps_only_the_ranks_with_work():
+    """Rank 0's empty snapshot row is dropped; the peer's row does not depend on it."""
+    buffers = [ADPIterStatsBuffer(), ADPIterStatsBuffer()]
+    buffers[0].queue(_make_adp_iteration_stats(iter_id=9), is_rank0=True, is_queue_snapshot=True)
+    buffers[1].queue(_make_adp_iteration_stats(iter_id=9, num_gen_requests=3), is_rank0=False)
+    states = [
+        RankState(rank=rank, iter_stats=buffer.next_payload())
+        for rank, buffer in enumerate(buffers)
+    ]
+
+    rows = [json.loads(row) for row in buffers[0].finalize(states, is_rank0=True)]
+
+    assert [row["attentionDpRank"] for row in rows] == [1]
+    assert rows[0]["inflightBatchingStats"]["numGenRequests"] == 3
+    assert rows[0]["inflightBatchingStats"]["numScheduledRequests"] == 3
+    assert not buffers[0].last_fanout_is_busy_queue_snapshot
+    assert not buffers[0].last_fanout_has_rank0_row
+
+
+def _fan_out_queue_snapshot(queued_per_rank, *, iter_id=9, buffers=None):
+    """Queue a busy engine's queue snapshot on every rank and fan it out on rank 0.
+
+    Args:
+        queued_per_rank: Each rank's queued counters, in ``_QUEUED_FIELDS`` order.
+        iter_id: The iteration every rank reports.
+        buffers: The ranks' buffers, to fan out a second snapshot on the same ones.
+
+    Returns:
+        Rank 0's buffer and its decoded rows.
+    """
+    buffers = buffers or [ADPIterStatsBuffer() for _ in queued_per_rank]
+    states = []
+    for rank, (buffer, queued) in enumerate(zip(buffers, queued_per_rank)):
+        stats = _make_adp_iteration_stats(
+            iter_id=iter_id, **dict(zip(RankIterStatsPayload._QUEUED_FIELDS, queued))
+        )
+        buffer.queue(stats, is_rank0=rank == 0, is_queue_snapshot=True)
+        states.append(RankState(rank=rank, iter_stats=buffer.next_payload()))
+    # The states travel through the routing exchange; every rank finalizes them.
+    states = [RankState.deserialize(state.serialize()) for state in states]
+    for buffer in buffers[1:]:
+        assert buffer.finalize(states, is_rank0=False) == []
+    return buffers[0], [json.loads(row) for row in buffers[0].finalize(states, is_rank0=True)]
+
+
+def _queued_counters(row):
+    """A decoded row's queued counters, in ``_QUEUED_FIELDS`` order."""
+    ifb = row["inflightBatchingStats"]
+    return (
+        ifb["numQueuedContextRequests"],
+        ifb["numQueuedCtxTokens"],
+        ifb["numQueuedGenRequests"],
+        ifb["numQueuedGenKvTokens"],
+    )
+
+
+def test_attention_dp_fanout_marks_busy_queue_snapshots():
+    """Only a zero-duration snapshot of a busy engine is a queue snapshot."""
+    buffer, rows = _fan_out_queue_snapshot([(0, 0, 0, 0), (1, 0, 0, 0)])
+
+    # The backlog is rank 1's, so the row is rank 1's; rank 0 has nothing to report.
+    assert [row["attentionDpRank"] for row in rows] == [1]
+    assert rows[0]["isQueueSnapshot"] is True
+    assert _queued_counters(rows[0]) == (1, 0, 0, 0)
+    assert rows[0]["numQueuedRequests"] == 1
+    assert buffer.last_fanout_is_busy_queue_snapshot
+    assert buffer.last_fanout_queued_counters == ((0, 0, 0, 0), (1, 0, 0, 0))
+    assert not buffer.last_fanout_has_rank0_row
+    assert buffer.last_idle_rank_states is None
+
+    _exchange_idle_heartbeat([buffer, ADPIterStatsBuffer()], iter_id=10)
+    assert not buffer.last_fanout_is_busy_queue_snapshot
+
+
+def test_attention_dp_queue_snapshot_reports_each_ranks_own_backlog():
+    """Every rank with a backlog has a row with its own counters; their sum is the engine's."""
+    queued = [(3, 300, 1, 50), (0, 0, 0, 0), (2, 200, 0, 0), (1, 70, 4, 900)]
+
+    buffer, rows = _fan_out_queue_snapshot(queued)
+
+    # Rank 1 has neither scheduled nor queued work.
+    assert [row["attentionDpRank"] for row in rows] == [0, 2, 3]
+    assert [_queued_counters(row) for row in rows] == [queued[0], queued[2], queued[3]]
+    assert [row["numQueuedRequests"] for row in rows] == [4, 2, 5]
+    assert [sum(counters) for counters in zip(*map(_queued_counters, rows))] == [6, 570, 5, 950]
+    assert all(row["isQueueSnapshot"] is True for row in rows)
+    assert all(row["inflightBatchingStats"]["numScheduledRequests"] == 0 for row in rows)
+    assert buffer.last_fanout_is_busy_queue_snapshot
+    assert buffer.last_fanout_queued_counters == tuple(queued)
+    assert buffer.last_fanout_has_rank0_row
+
+
+def test_attention_dp_queue_snapshot_counters_follow_the_backlog_between_ranks():
+    """The same total on another rank is a different snapshot."""
+    buffers = [ADPIterStatsBuffer(), ADPIterStatsBuffer()]
+    _, first = _fan_out_queue_snapshot([(2, 200, 0, 0), (1, 100, 0, 0)], buffers=buffers)
+    first_counters = buffers[0].last_fanout_queued_counters
+    _, moved = _fan_out_queue_snapshot(
+        [(1, 100, 0, 0), (2, 200, 0, 0)], iter_id=10, buffers=buffers
+    )
+
+    assert [row["numQueuedRequests"] for row in first] == [2, 1]
+    assert [row["numQueuedRequests"] for row in moved] == [1, 2]
+    assert first_counters == ((2, 200, 0, 0), (1, 100, 0, 0))
+    assert buffers[0].last_fanout_queued_counters == ((1, 100, 0, 0), (2, 200, 0, 0))
+
+
+def test_attention_dp_fanout_emits_rank_local_rows():
+    """Verify ADP fanout emits one row per rank with that rank's scheduled and queued work."""
+    # Rank 0 emits one stats row per ADP rank. Scheduled and queued fields
+    # stay rank-local so FPM can reveal load imbalance; the queued load of
+    # the engine is the sum over the rows.
+    rank0_stats = _make_adp_iteration_stats(
+        iter_id=9,
+        num_context_requests=1,
+        num_ctx_tokens=100,
+        num_ctx_kv_tokens=10,
+        num_gen_requests=2,
+        num_gen_kv_tokens=20,
+        num_paused_requests=1,
+        num_paused_kv_tokens=5,
+        num_queued_context_requests=7,
+        num_queued_ctx_tokens=700,
+        num_queued_gen_requests=8,
+        num_queued_gen_kv_tokens=800,
+    )
+    rank0_stats.iter_latency_ms = 12.5
+    buffer = _build_adp_stats_buffer(rank0_stats)
+    rank0_state = RankState(rank=0, iter_stats=buffer.next_payload())
+    rank1_state = RankState(
+        rank=1,
+        iter_stats=RankIterStatsPayload(
+            has_iter_stats=1,
+            iter_stats_iter=9,
+            num_context_requests=3,
+            num_ctx_tokens=300,
+            num_ctx_kv_tokens=30,
+            num_gen_requests=4,
+            num_gen_kv_tokens=40,
+            num_paused_requests=2,
+            num_paused_kv_tokens=25,
+            num_queued_context_requests=1,
+            num_queued_ctx_tokens=400,
+            num_queued_gen_requests=1,
+            num_queued_gen_kv_tokens=500,
+        ),
+    )
+
+    rows = buffer.finalize(
+        [RankState.deserialize(state.serialize()) for state in (rank1_state, rank0_state)],
+        is_rank0=True,
+        scheduler_mode="overlap",
+    )
+
+    assert len(rows) == 2
+    assert buffer.last_fanout_has_rank0_row
+
+    rank0_row = json.loads(rows[0])
+    rank0_ifb = rank0_row["inflightBatchingStats"]
+    assert rank0_row["attentionDpRank"] == 0
+    assert rank0_row["iterLatencyMS"] == 12.5
+    assert rank0_ifb["numContextRequests"] == 1
+    assert rank0_ifb["numCtxTokens"] == 100
+    assert rank0_ifb["numCtxKvTokens"] == 10
+    assert rank0_ifb["numGenRequests"] == 2
+    assert rank0_ifb["numGenKvTokens"] == 20
+    assert rank0_ifb["numPausedRequests"] == 1
+    assert rank0_ifb["numPausedKvTokens"] == 5
+    assert rank0_ifb["numScheduledRequests"] == 3
+    assert rank0_ifb["numQueuedContextRequests"] == 7
+    assert rank0_ifb["numQueuedCtxTokens"] == 700
+    assert rank0_ifb["numQueuedGenRequests"] == 8
+    assert rank0_ifb["numQueuedGenKvTokens"] == 800
+    assert rank0_row["numQueuedRequests"] == 15
+    assert [req["id"] for req in rank0_row["requestStats"]] == [42]
+    assert list(rank0_row["kvCacheIterationStats"]) == ["16"]
+    assert rank0_row["hostStepTimeMS"] == 11.0
+    assert rank0_row["prevDeviceStepTimeMS"] == 9.0
+    assert rank0_row["gpuForwardTimeMS"] == 7.0
+    assert rank0_row["schedulerMode"] == "overlap"
+
+    rank1_row = json.loads(rows[1])
+    rank1_ifb = rank1_row["inflightBatchingStats"]
+    assert rank1_row["attentionDpRank"] == 1
+    assert rank1_row["iterLatencyMS"] == 12.5
+    assert rank1_ifb["numContextRequests"] == 3
+    assert rank1_ifb["numCtxTokens"] == 300
+    assert rank1_ifb["numCtxKvTokens"] == 30
+    assert rank1_ifb["numGenRequests"] == 4
+    assert rank1_ifb["numGenKvTokens"] == 40
+    assert rank1_ifb["numPausedRequests"] == 2
+    assert rank1_ifb["numPausedKvTokens"] == 25
+    assert rank1_ifb["numScheduledRequests"] == 7
+    assert rank1_ifb["numQueuedContextRequests"] == 1
+    assert rank1_ifb["numQueuedCtxTokens"] == 400
+    assert rank1_ifb["numQueuedGenRequests"] == 1
+    assert rank1_ifb["numQueuedGenKvTokens"] == 500
+    assert rank1_row["numQueuedRequests"] == 2
+    # The engine's queued load is the sum over the rank rows.
+    assert rank0_row["numQueuedRequests"] + rank1_row["numQueuedRequests"] == 17
+    assert [
+        sum(counters) for counters in zip(_queued_counters(rank0_row), _queued_counters(rank1_row))
+    ] == [8, 1100, 9, 1300]
+    # Request and KV iteration stats are reported on rank 0 only.
+    assert "requestStats" not in rank1_row
+    assert "kvCacheIterationStats" not in rank1_row
+    assert rank1_row["hostStepTimeMS"] == 11.0
+    assert rank1_row["prevDeviceStepTimeMS"] == 9.0
+    assert rank1_row["gpuForwardTimeMS"] == 7.0
+    assert rank1_row["schedulerMode"] == "overlap"
+
+    assert buffer._payloads == {}
+    assert buffer.next_payload() is None
+
+
+@pytest.mark.parametrize("rank0_idle", [False, True])
+@pytest.mark.parametrize("include_kv_cache_load", [False, True])
+def test_attention_dp_specdec_fanout_uses_rank_local_counts(
+    rank0_idle: bool, include_kv_cache_load: bool
+) -> None:
+    """Transport asymmetric real/dummy work without copying rank 0's AL."""
+    real_requests = [
+        [] if rank0_idle else [_StubRequest(num_draft_tokens=3, py_num_accepted_draft_tokens=2)],
+        [
+            _StubRequest(num_draft_tokens=3, py_num_accepted_draft_tokens=0),
+            _StubRequest(num_draft_tokens=3, py_num_accepted_draft_tokens=1),
+            _StubRequest(num_draft_tokens=3, py_num_accepted_draft_tokens=2),
+        ],
+    ]
+    buffers = []
+    rank_states = []
+    for rank, requests in enumerate(real_requests):
+        dummies = [
+            _StubRequest(py_draft_tokens=[1, 1, 1], is_attention_dp_dummy=True),
+            _StubRequest(py_draft_tokens=[1, 1, 1], is_cuda_graph_dummy=True),
+        ]
+        stats = _invoke_update_iter_stats(
+            _StubScheduledBatch(gen_reqs=requests + dummies),
+            [],
+            num_ctx_tokens=0,
+            specdec=True,
+        )
+        stats.iter = 7
+        buffer = _build_adp_stats_buffer(stats, is_rank0=rank == 0)
+        buffers.append(buffer)
+        state = RankState(rank=rank, iter_stats=buffer.next_payload())
+        rank_states.append(RankState.deserialize(state.serialize(include_kv_cache_load)))
+
+    rows = buffers[0].finalize(rank_states, is_rank0=True)
+    assert len(rows) == 2
+    specs = [json.loads(row)["specDecodingStats"] for row in rows]
+    expected_counts = [(0, 0, 0) if rank0_idle else (3, 2, 1), (9, 3, 3)]
+    for spec, (drafted, accepted, requests) in zip(specs, expected_counts):
+        assert spec is not None
+        assert spec["numDraftTokens"] == drafted
+        assert spec["numAcceptedTokens"] == accepted
+        assert spec["numRequestsWithDraftTokens"] == requests
+        assert spec["acceptanceLength"] == pytest.approx(
+            (accepted + requests) / requests if requests else 0.0
+        )
+
+    accepted = sum(spec["numAcceptedTokens"] for spec in specs)
+    requests = sum(spec["numRequestsWithDraftTokens"] for spec in specs)
+    assert (accepted + requests) / requests == pytest.approx(2.0 if rank0_idle else 2.25)
+
+
+def test_attention_dp_specdec_fanout_does_not_fill_synthetic_rank_from_rank0() -> None:
+    """An explicit zero payload must not inherit another rank's drafting."""
+    stats = _invoke_update_iter_stats(
+        _StubScheduledBatch(
+            gen_reqs=[_StubRequest(num_draft_tokens=3, py_num_accepted_draft_tokens=2)]
+        ),
+        [],
+        num_ctx_tokens=0,
+        specdec=True,
+    )
+    stats.iter = 7
+    buffer = _build_adp_stats_buffer(stats)
+    rows = buffer.finalize(
+        [
+            RankState(rank=0, iter_stats=buffer.next_payload()),
+            RankState(rank=1, iter_stats=RankIterStatsPayload(has_iter_stats=1, iter_stats_iter=7)),
+        ],
+        is_rank0=True,
+    )
+    specs = [json.loads(row)["specDecodingStats"] for row in rows]
+    assert specs[0]["numRequestsWithDraftTokens"] == 1
+    assert specs[1] is None
+
+
+def test_attention_dp_fanout_rows_match_serializing_each_rank_stats():
+    """Fanout rows equal serializing each rank's own IterationStats at scrape time."""
+    rank0_stats = _make_adp_iteration_stats(
+        iter_id=9,
+        num_gen_requests=25,
+        num_gen_kv_tokens=4_600_000,
+        num_queued_gen_requests=4,
+        num_queued_gen_kv_tokens=700_000,
+    )
+    rank0_stats.timestamp = "10-25-2026 17:30:00"
+    rank0_stats.iter_latency_ms = 19.123456789
+    rank0_stats.num_active_requests = 25
+    rank0_stats.num_queued_requests = 4
+    rank0_stats.num_completed_requests = 2
+    rank0_stats.gpu_mem_usage = 250 << 30
+    rank0_stats.inflight_batching_stats.micro_batch_id = 1
+    rank0_stats.inflight_batching_stats.avg_num_decoded_tokens_per_iter = 3.51
+    kv_cache_stats = KvCacheStats()
+    kv_cache_stats.max_num_blocks = 80_000
+    kv_cache_stats.used_num_blocks = 60_000
+    rank0_stats.kv_cache_stats = kv_cache_stats
+    specdec_stats = SpecDecodingStats()
+    specdec_stats.num_draft_tokens = 125
+    specdec_stats.acceptance_length = 3.52
+    rank0_stats.specdec_stats = specdec_stats
+    buffer = _build_adp_stats_buffer(rank0_stats)
+    states = [RankState(rank=0, iter_stats=buffer.next_payload())]
+    for rank in range(1, 6):
+        payload = RankIterStatsPayload(
+            has_iter_stats=1,
+            iter_stats_iter=9,
+            num_context_requests=rank % 2,
+            num_ctx_tokens=1000 * rank,
+            num_ctx_kv_tokens=100 * rank,
+            num_gen_requests=23 + rank,
+            num_gen_kv_tokens=4_400_000 + rank,
+            num_paused_requests=rank // 3,
+            num_paused_kv_tokens=7 * rank,
+            num_queued_context_requests=rank % 3,
+            num_queued_ctx_tokens=50 * rank,
+            num_queued_gen_requests=rank // 2,
+            num_queued_gen_kv_tokens=9 * rank,
+            kv_cache_stats=(
+                None if rank == 3 else _snapshot_kv_cache_stats(_make_kv_cache_snapshot(rank))
+            ),
+            specdec_stats=(
+                None
+                if rank == 4
+                else RankSpecDecodingStats(
+                    num_draft_tokens=10 * rank,
+                    num_accepted_tokens=3 * rank,
+                    num_requests_with_draft_tokens=rank,
+                )
+            ),
+        )
+        states.append(RankState(rank=rank, iter_stats=payload))
+    expected = [
+        BaseWorker._stats_serializer(
+            (
+                ADPIterStatsBuffer._make_rank_iter_stats(rank0_stats, state),
+                [_make_request_stats(42)] if state.rank == 0 else None,
+                {16: _KvWindowIterStats()} if state.rank == 0 else None,
+                state.rank,
+                11.0,
+                9.0,
+                "non_overlap",
+                7.0,
+            )
+        )
+        for state in states
+    ]
+
+    rows = buffer.finalize(states[::-1], is_rank0=True, scheduler_mode="non_overlap")
+
+    assert [json.loads(row) for row in rows] == [json.loads(row) for row in expected]
+    assert [BaseWorker._stats_serializer(row) for row in rows] == rows
+    # Every rank's row has its own queued counters, also the ones spliced into the first.
+    assert [json.loads(row)["numQueuedRequests"] for row in rows] == [4, 1, 3, 1, 3, 4]
+    assert [_queued_counters(json.loads(row)) for row in rows[1:]] == [
+        (rank % 3, 50 * rank, rank // 2, 9 * rank) for rank in range(1, 6)
+    ]
+
+
+def test_attention_dp_fanout_waits_for_complete_matching_payloads():
+    """Verify ADP fanout waits until every rank reports the rank-0 iteration."""
+    rank0_stats = _make_adp_iteration_stats(iter_id=9, num_context_requests=1)
+    buffer = _build_adp_stats_buffer(rank0_stats)
+    rank0_state = RankState(rank=0, iter_stats=buffer.next_payload())
+    missing_rank1_state = RankState(rank=1)
+
+    records = buffer.finalize([rank0_state, missing_rank1_state], is_rank0=True)
+
+    assert records == []
+    assert buffer.next_payload() is rank0_state.iter_stats
+
+    mismatched_rank1_state = RankState(
+        rank=1,
+        iter_stats=RankIterStatsPayload(
+            has_iter_stats=1,
+            iter_stats_iter=8,
+            num_context_requests=2,
+        ),
+    )
+
+    records = buffer.finalize([rank0_state, mismatched_rank1_state], is_rank0=True)
+
+    assert records == []
+    assert buffer.next_payload() is rank0_state.iter_stats
+
+
+def test_attention_dp_fanout_buffers_multiple_pending_payloads():
+    """Verify ADP fanout keeps multiple pending iterations ordered by iter id."""
+    rank0_stats_9 = _make_adp_iteration_stats(iter_id=9, num_context_requests=1)
+    rank0_stats_10 = _make_adp_iteration_stats(iter_id=10, num_context_requests=2)
+    buffer = _build_adp_stats_buffer(rank0_stats_9)
+
+    buffer.queue(
+        rank0_stats_10,
+        ["req-stats-10"],
+        kv_iter_stats={0: "pending-kv-10"},
+        is_rank0=True,
+    )
+
+    assert sorted(buffer._payloads) == [9, 10]
+    assert buffer.next_payload().iter_stats_iter == 9
+
+
+def test_attention_dp_fanout_clears_when_rank0_stats_object_missing():
+    """Verify ADP fanout drops stale state if rank-0 stats are unavailable."""
+    rank0_stats = _make_adp_iteration_stats(iter_id=9, num_context_requests=1)
+    buffer = _build_adp_stats_buffer(rank0_stats)
+    rank0_state = RankState(rank=0, iter_stats=buffer.next_payload())
+    rank1_state = RankState(
+        rank=1,
+        iter_stats=RankIterStatsPayload(
+            has_iter_stats=1,
+            iter_stats_iter=9,
+            num_context_requests=2,
+        ),
+    )
+    buffer._rank0_iter_stats.pop(9)
+
+    records = buffer.finalize([rank0_state, rank1_state], is_rank0=True)
+
+    assert records == []
+    assert buffer._payloads == {}
+    assert buffer.next_payload() is None
+    assert buffer._rank0_req_stats == {}
+    assert buffer._rank0_kv_iter_stats == {}
+
+
+def test_attention_dp_fanout_aligns_non_rank0_to_rank0_iter():
+    """Verify non-rank0 buffers synthesize zero payloads to align to rank 0."""
+    rank1_stats = _make_adp_iteration_stats(iter_id=10, num_context_requests=3)
+    rank1_stats.kv_cache_stats = _make_kv_cache_snapshot(10)
+    buffer = _build_adp_stats_buffer(rank1_stats, is_rank0=False)
+    rank0_state = RankState(
+        rank=0,
+        iter_stats=RankIterStatsPayload(
+            has_iter_stats=1,
+            iter_stats_iter=9,
+            num_context_requests=1,
+        ),
+    )
+    rank1_state = RankState(rank=1, iter_stats=buffer.next_payload())
+
+    records = buffer.finalize([rank0_state, rank1_state], is_rank0=False)
+
+    assert records == []
+    next_payload = buffer.next_payload()
+    assert next_payload.iter_stats_iter == 9
+    assert next_payload.num_context_requests == 0
+    assert next_payload.kv_cache_stats is None
+    assert next_payload.cross_kv_cache_stats is None
+    assert 9 in buffer._synthetic_iters
+    assert 10 in buffer._payloads
+
+    rank0_stats = _make_adp_iteration_stats(iter_id=9, num_context_requests=1)
+    rank0_stats.kv_cache_stats = _make_kv_cache_snapshot(0)
+    rank0_stats.cross_kv_cache_stats = _make_kv_cache_snapshot(30)
+    rank0_buffer = _build_adp_stats_buffer(rank0_stats)
+    # A measured rank uses the snapshot framing while the idle rank stays compact.
+    states = [
+        RankState.deserialize(state.serialize())
+        for state in (
+            RankState(rank=0, iter_stats=rank0_buffer.next_payload()),
+            RankState(rank=1, iter_stats=next_payload),
+        )
+    ]
+    rows = [json.loads(row) for row in rank0_buffer.finalize(states, is_rank0=True)]
+    assert len(rows) == 2
+    assert rows[0]["kvCacheStats"]["usedNumBlocks"] == 20
+    assert states[0].iter_stats.cross_kv_cache_stats.used_num_blocks == 50
+    assert rows[0]["inflightBatchingStats"]["numContextRequests"] == 1
+    idle_row = rows[1]
+    assert idle_row["kvCacheStats"] is None
+    assert states[1].iter_stats.cross_kv_cache_stats is None
+    assert idle_row["inflightBatchingStats"]["numContextRequests"] == 0
+    assert idle_row["inflightBatchingStats"]["numScheduledRequests"] == 0
+    assert buffer._payloads[10].kv_cache_stats.max_num_blocks == 120
+
+    # A measured payload replaces the synthetic placeholder for the same iter.
+    measured = _make_adp_iteration_stats(iter_id=9)
+    measured.kv_cache_stats = _make_kv_cache_snapshot(5)
+    buffer.queue(measured, is_rank0=False)
+    assert buffer.next_payload().kv_cache_stats.max_num_blocks == 110
+    assert 9 not in buffer._synthetic_iters
+
+
+def test_attention_dp_fanout_copy_lists_cover_iteration_stats_fields():
+    """Guard the copied and rank-local field lists against native schema drift."""
+    actual_fields = {
+        field
+        for field in dir(IterationStats())
+        if not field.startswith("_") and field != "to_json_str"
+    }
+    copied_fields = (
+        set(_ITERATION_STATS_SCALAR_FIELDS)
+        | set(_ITERATION_STATS_OPTIONAL_FIELDS)
+        | {"inflight_batching_stats", "kv_cache_stats", "cross_kv_cache_stats", "specdec_stats"}
+    )
+
+    assert copied_fields == actual_fields
+
+
+# ---------------------------------------------------------------------------
+# Serializer test: confirm the C++ NLOHMANN serializer exposes every new
+# InflightBatchingStats member under its expected camelCase key, nested
+# inside the ``inflightBatchingStats`` object. Distinct values per field
+# so a cross-wiring bug (e.g. swapped keys) fails the assertion rather
+# than round-tripping silently.
+# ---------------------------------------------------------------------------
+
+
+def test_to_json_str_roundtrip_includes_new_inflight_batching_stats_fields():
+    """Confirm the C++ NLOHMANN serializer emits every new InflightBatchingStats key.
+
+    Every new request-aggregate field must appear in the JSON dict under
+    its expected camelCase key, nested inside ``inflightBatchingStats``.
+    """
+    import json as _json
+
+    ifb = InflightBatchingStats()
+    ifb.num_scheduled_requests = 12
+    ifb.num_context_requests = 5
+    ifb.num_gen_requests = 7
+    ifb.num_paused_requests = 3
+    ifb.num_ctx_tokens = 2048
+    ifb.micro_batch_id = 4
+    ifb.avg_num_decoded_tokens_per_iter = 1.25
+    ifb.num_ctx_kv_tokens = 256
+    ifb.num_gen_kv_tokens = 9000
+    ifb.num_queued_context_requests = 11
+    ifb.num_queued_ctx_tokens = 4096
+    ifb.num_queued_gen_requests = 6
+    ifb.num_queued_gen_kv_tokens = 2345
+    ifb.num_paused_kv_tokens = 1500
+
+    stats = IterationStats()
+    stats.inflight_batching_stats = ifb
+
+    d = _json.loads(stats.to_json_str())
+    ifb_d = d["inflightBatchingStats"]
+    # Existing keys still round-trip.
+    assert ifb_d["numScheduledRequests"] == 12
+    assert ifb_d["numContextRequests"] == 5
+    assert ifb_d["numGenRequests"] == 7
+    assert ifb_d["numPausedRequests"] == 3
+    assert ifb_d["numCtxTokens"] == 2048
+    # New keys round-trip under the expected camelCase.
+    assert ifb_d["numCtxKvTokens"] == 256
+    assert ifb_d["numGenKvTokens"] == 9000
+    assert ifb_d["numQueuedContextRequests"] == 11
+    assert ifb_d["numQueuedCtxTokens"] == 4096
+    assert ifb_d["numQueuedGenRequests"] == 6
+    assert ifb_d["numQueuedGenKvTokens"] == 2345
+    assert ifb_d["numPausedKvTokens"] == 1500
+
+
+# ---------------------------------------------------------------------------
+# Iter labeling: stats.iter is stamped at batch CONSTRUCTION time in
+# _get_init_iter_stats, and _update_iter_stats must NOT overwrite it from the
+# live self.iter_counter. Under the overlap and PP schedulers _update_iter_stats
+# runs in a later loop than the one that built the batch, so re-stamping from
+# the live counter mislabels the record by 1+ iterations.
+# ---------------------------------------------------------------------------
+
+
+def test_update_iter_stats_does_not_overwrite_construction_iter():
+    """Regression guard: ``_update_iter_stats`` must not re-stamp ``stats.iter``.
+
+    Before the fix this method assigned ``stats.iter = self.iter_counter``,
+    which under the overlap and PP schedulers reflected the loop CONSUMING
+    the batch rather than the one that BUILT it — mislabeling the record by
+    1+ iterations. Construct an ``IterationStats`` with a known iter, pass it
+    through ``_update_iter_stats`` with a deliberately different live counter,
+    and confirm the construction-time stamp survives.
+    """
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    fake_self = _build_fake_self(queued_items=[], model_engine_iter_states={"num_ctx_tokens": 0})
+    # Live counter is several loops ahead of when the batch was built; any
+    # accidental re-stamp would surface here.
+    fake_self.iter_counter = 999
+
+    stats = IterationStats()
+    stats.inflight_batching_stats = InflightBatchingStats()
+    # Construction-time stamp (what _get_init_iter_stats would have written
+    # at iter 17, several loops ago under overlap scheduling).
+    stats.iter = 17
+
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.py_executor.torch.cuda.mem_get_info",
+        return_value=(1 << 30, 1 << 30),
+    ):
+        PyExecutor._update_iter_stats(
+            fake_self,
+            stats,
+            iter_latency_ms=10.0,
+            num_completed_requests=0,
+            scheduled_batch=_StubScheduledBatch(),
+            micro_batch_id=0,
+        )
+
+    # If someone re-introduces ``stats.iter = self.iter_counter`` this becomes 999.
+    assert stats.iter == 17
+    assert fake_self._perf_metrics.latest_rank["captureIter"] == 999
+    assert fake_self._perf_metrics.latest_rank["batchIter"] == 17
+
+
+@pytest.mark.parametrize(
+    "is_queue_snapshot,idle_heartbeat,queued_tokens,peer_queued_tokens,iter_latency_ms,"
+    "expected_ranks",
+    [
+        (True, False, 0, 0, 0.0, []),
+        (True, True, 0, 0, 0.0, [0, 1]),
+        (True, True, 300, 0, 0.0, [0]),
+        # A backlog on any rank vetoes the heartbeat; the row is that rank's.
+        (True, True, 0, 300, 0.0, [1]),
+        (False, False, 300, 0, 12.5, [0, 1]),
+        # The record's kind is what the caller said, not what its latency suggests.
+        (False, False, 300, 0, 0.0, [0, 1]),
+    ],
+    ids=[
+        "busy-empty",
+        "all-idle",
+        "queue-veto",
+        "peer-queue-veto",
+        "timed-dummy",
+        "measured-zero-latency",
+    ],
+)
+def test_attention_dp_idle_heartbeat_requires_global_idle(
+    is_queue_snapshot,
+    idle_heartbeat,
+    queued_tokens,
+    peer_queued_tokens,
+    iter_latency_ms,
+    expected_ranks,
+):
+    stats = _make_adp_iteration_stats(
+        iter_id=11,
+        num_queued_context_requests=int(queued_tokens > 0),
+        num_queued_ctx_tokens=queued_tokens,
+    )
+    stats.iter_latency_ms = iter_latency_ms
+    buffer = ADPIterStatsBuffer()
+    buffer.queue(
+        stats,
+        is_rank0=True,
+        is_queue_snapshot=is_queue_snapshot,
+        idle_heartbeat=idle_heartbeat,
+    )
+    rows = buffer.finalize(
+        [
+            RankState(rank=0, iter_stats=buffer.next_payload()),
+            RankState(
+                rank=1,
+                iter_stats=RankIterStatsPayload(
+                    has_iter_stats=1,
+                    iter_stats_iter=11,
+                    num_queued_context_requests=int(peer_queued_tokens > 0),
+                    num_queued_ctx_tokens=peer_queued_tokens,
+                ),
+            ),
+        ],
+        is_rank0=True,
+    )
+    rows = [json.loads(row) for row in rows]
+    assert [row["attentionDpRank"] for row in rows] == expected_ranks
+    # Only a heartbeat that found every rank's queues empty may be repeated without an exchange.
+    assert (buffer.last_idle_rank_states is not None) == (
+        idle_heartbeat and not queued_tokens and not peer_queued_tokens
+    )
+    for row in rows:
+        assert row["inflightBatchingStats"]["numScheduledRequests"] == 0
+        assert row["iterLatencyMS"] == iter_latency_ms
+        assert row.get("isQueueSnapshot", False) is is_queue_snapshot
+
+
+def test_queued_scan_skips_unreadable_active_request_state():
+    """A released native request must not fail stats collection."""
+
+    class _Released:
+        py_request_id = 9001
+        parent_request_id = None
+        is_child = False
+        is_finished = False
+        state = None
+        is_context_init_state = True
+        is_disagg_generation_init_state = False
+
+        @property
+        def context_remaining_length(self):
+            raise RuntimeError("request released")
+
+    class _ReleasedGen(_Released):
+        py_request_id = 9002
+        is_context_init_state = False
+        is_disagg_generation_init_state = True
+
+        def get_num_tokens(self, beam):
+            raise RuntimeError("request released")
+
+    stats = _invoke_update_iter_stats(
+        _StubScheduledBatch(),
+        [],
+        num_ctx_tokens=0,
+        active_requests=[_Released(), _ReleasedGen()],
+    )
+    ifb = stats.inflight_batching_stats
+    assert ifb.num_queued_context_requests == 0
+    assert ifb.num_queued_gen_requests == 0

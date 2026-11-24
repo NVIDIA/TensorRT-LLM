@@ -433,6 +433,7 @@ def _logic_ulysses_replicated_kv_impl(
         head_dim=head_dim,
     )
     attention = UlyssesAttention(inner_backend=inner, process_group=None)
+    compile_counter = None
     if compile_backend is not None:
         from torch._dynamo.testing import CompileCounterWithBackend
 
@@ -513,7 +514,7 @@ def _logic_ulysses_replicated_kv_impl(
             msg=f"Rank {rank}: replicated K/V padding changed Ulysses attention output",
         )
 
-    if compile_backend is not None:
+    if compile_counter is not None:
         assert compile_counter.frame_count == 1, "fullgraph must compile exactly one graph"
         has_replicated_kv_op = any(
             "visual_gen_replicated_kv_attention" in str(node.target)

@@ -20,12 +20,15 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn.functional as F
+from _torch.helpers import triton_num_compiled
 from torch import nn
 
 from tensorrt_llm._torch.models.modeling_dspark import _build_mla_block_fixup
 from tensorrt_llm._torch.speculative.dflash import DFlashWorker
 from tensorrt_llm._torch.speculative.spec_tail_kernels import (
+    _paged_latent_prepare_kernel,
     decode_draft_block_table,
+    dflash_paged_latent_prepare,
     strict_accept,
 )
 from tensorrt_llm.llmapi.llm_args import DFlashDecodingConfig
@@ -64,7 +67,61 @@ def test_strict_accept_matches_eager(num_ctx, num_gens, draft_len):
     assert torch.equal(accepted[num_ctx:], ref_accepted[num_ctx:])
 
 
-def test_decode_draft_block_table_matches_eager():
+def test_strict_accept_one_variant_for_all_batches():
+    """Serving changes the request counts every iteration: one compiled kernel serves them all."""
+    import triton
+
+    from tensorrt_llm._torch.speculative import spec_tail_kernels
+
+    caches = getattr(spec_tail_kernels._strict_accept_kernel, "device_caches", None)
+    if caches is None:
+        pytest.skip("this Triton has no JITFunction.device_caches")
+    device = triton.runtime.driver.active.get_current_device()
+    draft_len = 5
+
+    def run(num_ctx, num_gens, offset, row_stride, col_stride):
+        target = torch.randint(0, 4, (num_ctx + num_gens * (draft_len + 1),), device="cuda")
+        # The draft tokens as a view into a wider buffer: any start offset (pointer alignment),
+        # row stride and column stride. Rows may overlap; the kernel only reads the draft.
+        buffer = torch.randint(
+            0,
+            4,
+            (offset + num_gens * row_stride + draft_len * col_stride,),
+            device="cuda",
+            dtype=torch.int32,
+        )
+        draft = buffer.as_strided((num_gens, draft_len), (row_stride, col_stride), offset)
+        accepted, num_accepted = strict_accept(target, draft, num_ctx, num_ctx + num_gens)
+        ref_accepted, ref_num = _eager_strict_accept(target, draft, num_ctx, num_ctx + num_gens)
+        assert torch.equal(num_accepted, ref_num)
+        assert torch.equal(accepted[num_ctx:], ref_accepted[num_ctx:])
+
+    run(3, 0, 0, draft_len + 2, 1)
+    variants = len(caches[device][0])
+    for row_stride in (draft_len + 2, 16):
+        for col_stride in (1, 2):
+            for num_ctx, num_gens in [
+                (1, 0),
+                (16, 0),
+                (17, 0),
+                (0, 1),
+                (0, 16),
+                (2, 5),
+                (1, 130),
+                (200, 7),
+            ]:
+                for offset in (0, 1):
+                    run(num_ctx, num_gens, offset, row_stride, col_stride)
+    assert len(caches[device][0]) == variants
+
+
+@pytest.mark.parametrize("block_offset", [0, 3])
+def test_decode_draft_block_table_matches_eager(block_offset: int) -> None:
+    """The decoded table is the clamped, divided layer-relative offsets
+    (``src - block_offset``, with ``src`` left untouched); the count is each
+    row's extent, one past its last backed entry, so a sliding window that
+    released the low entries leaves the count covering the positions the row
+    still addresses."""
     num_pools, rows, n_blocks, divisor = 2, 9, 3000, 6
     gen = torch.Generator(device="cuda").manual_seed(1)
     src = torch.randint(
@@ -77,16 +134,30 @@ def test_decode_draft_block_table_matches_eager():
     view = src[1, :rows, 0]
     view[0] = -torch.randint(1, 1 << 20, (n_blocks,), device="cuda", generator=gen).to(torch.int32)
     view[1] = 0
+    view[2] = block_offset
+    # A windowed row: entries 0..99 released, 100..139 backed, the rest unfunded.
+    view[3] = -1
+    view[3, 100:140] = (
+        torch.arange(100, 140, device="cuda", dtype=torch.int32) * divisor + block_offset
+    )
     assert bool((view < 0).float().mean() > 0.3) and bool((view == 0).float().mean() > 0.2)
     table = torch.full((rows + 3, n_blocks), -7, dtype=torch.int32, device="cuda")
     counts = torch.full((rows + 3,), -7, dtype=torch.long, device="cuda")
-    decode_draft_block_table(view, divisor, table, counts)
-    encoded = view.to(torch.int64)
-    assert torch.equal(counts[:rows], (encoded >= 0).sum(dim=1))
+    original = src.clone()
+    decode_draft_block_table(view, divisor, table, counts, block_offset=block_offset)
+    assert torch.equal(src, original)
+    encoded = view.to(torch.int64) - block_offset
+    ordinals = torch.arange(1, n_blocks + 1, device="cuda")
+    extent = torch.where(encoded >= 0, ordinals, 0).max(dim=1).values
+    assert torch.equal(counts[:rows], extent)
+    assert counts[3].item() == 140
+    assert torch.equal(table[3, 100:140], torch.arange(100, 140, device="cuda", dtype=torch.int32))
     expected = encoded.clamp(min=0).div(divisor, rounding_mode="floor").to(torch.int32)
     assert torch.equal(table[:rows], expected)
     assert counts[0].item() == 0 and bool((table[0] == 0).all())
-    assert counts[1].item() == n_blocks and bool((table[1] == 0).all())
+    assert counts[1].item() == (n_blocks if block_offset == 0 else 0)
+    assert bool((table[1] == 0).all())
+    assert counts[2].item() == n_blocks and bool((table[2] == 0).all())
     assert bool((table[rows:] == -7).all()) and bool((counts[rows:] == -7).all())
 
 
@@ -143,12 +214,18 @@ def _paged_worker(draft_len, page_size, max_blocks, num_slots, layers, head_dim,
     perm = torch.randperm(pages, device="cuda", generator=gen).to(torch.int32)
     worker._ctx_block_tables = perm[: num_slots * max_blocks].view(num_slots, max_blocks).clone()
     worker._ctx_block_counts = torch.zeros(num_slots, dtype=torch.long, device="cuda")
+    worker._ctx_base_pages = torch.zeros(num_slots, dtype=torch.long, device="cuda")
+    worker._ctx_block_tables_read = torch.zeros_like(worker._ctx_block_tables)
     worker._resolved_mask_token_id = 3
     return worker, storage
 
 
+@pytest.mark.parametrize("based", [False, True], ids=["no_base", "based"])
 @pytest.mark.parametrize("draft_len", [3, 7])
-def test_paged_latent_prepare_matches_eager(draft_len):
+def test_paged_latent_prepare_matches_eager(draft_len: int, based: bool) -> None:
+    """The fused generation-step preparation matches the eager one, including
+    the read view rebased past each slot's base pages: the advertised context,
+    the rebased block-table rows and the block placement."""
     vocab, hidden, features, layers, head_dim = 100, 64, 128, 3, 96
     page_size, max_blocks, num_slots, max_ctx = 16, 6, 10, 70
     num_ctx_reqs, num_gens = 1, 6
@@ -166,6 +243,11 @@ def test_paged_latent_prepare_matches_eager(draft_len):
     worker._batch_to_slot_buffer.tensor[:batch] = slots
     worker._ctx_len[:5] = torch.tensor([10, 3, 66, 5, 40], device="cuda")
     worker._ctx_block_counts[:batch] = torch.tensor([0, 3, 6, 2, 0, 1, 1], device="cuda")
+    if based:
+        # Slot 2 (row 2) advertises past its base, so its read row shifts by
+        # it; slot 4 (row 3) advertises less than its base, reads nothing and
+        # shifts only to the page holding its context. The dummy slot keeps 0.
+        worker._ctx_base_pages[:5] = torch.tensor([0, 1, 1, 1, 2], device="cuda")
     num_accepted = torch.tensor([1, 2, width, 3, 1, 2, 1], dtype=torch.int32, device="cuda")
     accepted = torch.randint(
         0, vocab, (batch, width), dtype=torch.int32, device="cuda", generator=gen
@@ -193,6 +275,7 @@ def test_paged_latent_prepare_matches_eager(draft_len):
     def prepare(fused):
         w = copy.copy(worker)
         w._ctx_len = worker._ctx_len.clone()
+        w._ctx_block_tables_read = worker._ctx_block_tables_read.clone()
         pool_storage = storage.clone()
         w._ctx_kv_buf = [pool_storage[:, layer] for layer in range(layers)]
         w._ctx_kv_ptrs = torch.tensor([p.data_ptr() for p in w._ctx_kv_buf], device="cuda")
@@ -253,9 +336,13 @@ def test_paged_latent_prepare_matches_eager(draft_len):
     assert bool(shared.any()) and bool(untouched.any())
 
     rows = eager["ctx_cache_batch_idx"]
+    read_rows = eager["ctx_page_table"].index_select(0, rows)
+    assert torch.equal(fused["ctx_page_table"].index_select(0, rows), read_rows)
+    if based:
+        assert not torch.equal(read_rows, worker._ctx_block_tables.index_select(0, rows))
     fixup = _build_mla_block_fixup(
         eager["num_ctx_per_req"],
-        worker._ctx_block_tables.index_select(0, rows).long(),
+        read_rows.long(),
         draft_len,
         page_size,
     )
@@ -265,3 +352,42 @@ def test_paged_latent_prepare_matches_eager(draft_len):
     assert torch.equal(placement.offsets, fixup.offsets)
     assert torch.equal(placement.seq_lens, fixup.seq_lens_i32)
     assert torch.equal(placement.kv_bounds, fixup.kv_bounds_i32)
+
+
+def test_paged_latent_prepare_reuses_the_compiled_kernel_across_batches():
+    page_size, max_blocks, max_batch, width = 16, 4, 32, 4
+    slot_of_row = torch.arange(max_batch, device="cuda")
+    ctx_len = torch.zeros(max_batch + 1, dtype=torch.int64, device="cuda")
+    base_pages = torch.zeros(max_batch + 1, dtype=torch.int64, device="cuda")
+    block_counts = torch.full((max_batch,), max_blocks, dtype=torch.int64, device="cuda")
+    block_tables = torch.arange(max_batch * max_blocks, dtype=torch.int32, device="cuda")
+    num_accepted = torch.ones(max_batch, dtype=torch.int32, device="cuda")
+    accepted = torch.zeros((max_batch, width), dtype=torch.int32, device="cuda")
+    seq_lens = torch.zeros(max_batch, dtype=torch.int32, device="cuda")
+
+    def prepare(first_row, num_gens):
+        dflash_paged_latent_prepare(
+            num_accepted,
+            accepted,
+            slot_of_row[first_row : first_row + num_gens],
+            ctx_len,
+            base_pages,
+            block_counts,
+            block_tables.view(max_batch, max_blocks),
+            seq_lens,
+            first_row,
+            dummy_slot=max_batch,
+            max_ctx=page_size * max_blocks,
+            page_size=page_size,
+            block_size=width,
+            width=width,
+        )
+
+    # One BLOCK_G (16); the first rows are 0, 1, multiples of 16 and neither,
+    # and an odd first row misaligns the int64 slot view.
+    batches = [(0, 9), (1, 16), (3, 12), (16, 16), (2, 9)]
+    prepare(*batches[0])
+    compiled = triton_num_compiled(_paged_latent_prepare_kernel)
+    for batch in batches[1:]:
+        prepare(*batch)
+    assert triton_num_compiled(_paged_latent_prepare_kernel) == compiled

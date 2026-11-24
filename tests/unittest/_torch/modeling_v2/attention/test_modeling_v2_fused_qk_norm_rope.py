@@ -7,11 +7,9 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.fused_qk_norm_rope import (
-    FusedQkNormRope,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.fused_qk_norm_rope import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell
+from tensorrt_llm._torch.modeling_v2.catalog.attention.fused_qk_norm_rope import FusedQkNormRope
+from tensorrt_llm._torch.modeling_v2.catalog.attention.fused_qk_norm_rope import (  # noqa: E501
     fused_qk_norm_rope as op,
 )
 
@@ -162,6 +160,11 @@ _QWEN_MAIN = dict(num_heads_q=24, num_heads_k=2, num_heads_v=2, head_dim=256, **
 _QWEN_INDEX_HEADS = dict(num_heads_q=4, num_heads_k=1, num_heads_v=1, head_dim=128)
 _QWEN_INDEX_MROPE = dict(**_QWEN_INDEX_HEADS, **_QWEN_MROPE)
 _QWEN_INDEX_PLAIN = dict(**_QWEN_INDEX_HEADS, **_QWEN_ROPE)
+# One rank's main heads under attention TP2 / TP4 on the fused input projection row (the heads
+# after k pass as v and only set the row stride), and the MTP draft layer's compact TP4 row.
+_QWEN_TP2_ROW = dict(_QWEN_MAIN, num_heads_q=12, num_heads_k=1, num_heads_v=16)
+_QWEN_TP4_ROW = dict(_QWEN_MAIN, num_heads_q=6, num_heads_k=1, num_heads_v=10)
+_QWEN_TP4_MTP = dict(_QWEN_MAIN, num_heads_q=6, num_heads_k=1, num_heads_v=1)
 
 # The shapes each shipped target calls this entry with, by target directory
 # under `models/`. The entry's own `CELLS` are the op's whoever calls it.
@@ -180,7 +183,7 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
             ),
         ),
     ),
-    "qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__tp1": (
+    "qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default": (
         Cell(
             why="qwen4_exp main rope, decode: one token, Gemma norm and interleaved mRoPE "
             "with three distinct position rows",
@@ -258,6 +261,29 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
         Cell(
             why="qwen4_exp index rope (plain), 8192-token prefill: under GEMMA_PREFILL_ATOL",
             spec=dict(tokens=8192, gemma_prefill_band=True, **_QWEN_INDEX_PLAIN),
+        ),
+    ),
+    # Its tp1 / dep2 / dep4 calls are the NVFP4 target's shapes above.
+    "qwen4_exp/qwen3_8_flash_next_fp8__sm_103__unified": (
+        Cell(
+            why="qwen4_exp tp2 fused-row main rope, 1 token: 12 q / 1 k, 16 tail heads",
+            spec=dict(tokens=1, **_QWEN_TP2_ROW),
+        ),
+        Cell(
+            why="qwen4_exp tp2 fused-row main rope, 8192-token prefill, under GEMMA_PREFILL_ATOL",
+            spec=dict(tokens=8192, gemma_prefill_band=True, **_QWEN_TP2_ROW),
+        ),
+        Cell(
+            why="qwen4_exp tp4 fused-row main rope, 1 token: 6 q / 1 k, 10 tail heads",
+            spec=dict(tokens=1, **_QWEN_TP4_ROW),
+        ),
+        Cell(
+            why="qwen4_exp tp4 fused-row main rope, 8192-token prefill, under GEMMA_PREFILL_ATOL",
+            spec=dict(tokens=8192, gemma_prefill_band=True, **_QWEN_TP4_ROW),
+        ),
+        Cell(
+            why="qwen4_exp tep4 MTP draft compact qkv 6 q / 1 k / 1 v, 1024 rows (128 x 8 verify)",
+            spec=dict(tokens=1024, **_QWEN_TP4_MTP),
         ),
     ),
 }
@@ -417,3 +443,39 @@ def test_guard_refuses_a_position_id_count_that_is_not_the_token_count() -> None
     with pytest.raises(AssertionError, match="one position per token"):
         with validating(op):
             op(qkv, **kwargs)
+
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability() != (10, 0), reason="the Kimi K3 cell is certified on sm_100"
+)
+def test_bf16_neox_kimi_k3_drafter() -> None:
+    torch.manual_seed(9)
+    for num_heads_q, num_heads_kv in ((6, 1), (24, 4)):
+        for num_tokens in (1, 8, 64):
+            qkv = torch.randn(
+                num_tokens,
+                (num_heads_q + 2 * num_heads_kv) * 64,
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+            kwargs: dict = dict(
+                num_heads_q=num_heads_q,
+                num_heads_k=num_heads_kv,
+                num_heads_v=num_heads_kv,
+                head_dim=64,
+                rotary_dim=64,
+                eps=1e-5,
+                q_weight=torch.randn(64, dtype=torch.bfloat16, device="cuda") * 0.1 + 1.0,
+                k_weight=torch.randn(64, dtype=torch.bfloat16, device="cuda") * 0.1 + 1.0,
+                base=10000.0,
+                is_neox=True,
+                position_ids=torch.randint(
+                    0, 32768, (num_tokens,), dtype=torch.int32, device="cuda"
+                ),
+            )
+            ref = op.reference(qkv, **kwargs)
+            v_start = (num_heads_q + num_heads_kv) * 64
+            v_before = qkv[:, v_start:].clone()
+            op(qkv, **kwargs)
+            torch.testing.assert_close(qkv, ref, rtol=1.6e-2, atol=0.02)
+            assert torch.equal(qkv[:, v_start:], v_before)

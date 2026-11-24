@@ -24,7 +24,9 @@
 #if ENABLE_MULTI_DEVICE
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime_api.h>
+#include <mpi.h>
 #include <nccl.h>
+#include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
 #include <torch/extension.h>
 #endif
 
@@ -45,6 +47,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #if ENABLE_MULTI_DEVICE
@@ -72,6 +75,19 @@ TRTLLM_NAMESPACE_BEGIN
 
 namespace common::nccl_util
 {
+
+// Associate comm with ranks in an existing host communicator without taking ownership.
+// The caller must keep hostComm valid until comm is destroyed.
+void registerHostCommunicator(ncclComm_t comm, MPI_Comm hostComm, std::vector<int> const& ranks);
+
+// Associate comm with a weak reference to hostComm. Empty ranks selects the entire group.
+// Consensus fails if hostComm has expired.
+void registerHostCommunicator(
+    ncclComm_t comm, c10::intrusive_ptr<c10d::ProcessGroup> const& hostComm, std::vector<int> ranks = {});
+
+// Blocking host consensus: returns true only if every participating rank votes true.
+// Votes on overlapping groups sharing a host communicator must run in matching order across ranks.
+bool hostAllTrue(ncclComm_t comm, bool localOk);
 
 //==============================================================================
 // NCCL Resource Management
@@ -113,6 +129,27 @@ public:
 private:
     NcclCommResourceManager() = default;
     ~NcclCommResourceManager();
+
+    friend void registerHostCommunicator(ncclComm_t, MPI_Comm, std::vector<int> const&);
+    friend void registerHostCommunicator(ncclComm_t, c10::intrusive_ptr<c10d::ProcessGroup> const&, std::vector<int>);
+    friend bool hostAllTrue(ncclComm_t, bool);
+
+    struct MpiHostGroup
+    {
+        MPI_Comm comm;
+        std::vector<int> ranks;
+    };
+
+    struct PgHostGroup
+    {
+        c10::weak_intrusive_ptr<c10d::ProcessGroup> comm;
+        std::vector<int> ranks;
+    };
+
+    using HostCommunicator = std::variant<MpiHostGroup, PgHostGroup>;
+    void registerHostCommunicator(ncclComm_t comm, HostCommunicator hostComm, int size, int rank);
+    HostCommunicator lookupHostCommunicator(ncclComm_t comm) const;
+    std::unordered_map<ncclComm_t, HostCommunicator> mHostCommunicators;
 
     using ResourceEntry = std::pair<ResourceCleanupFunc, std::string>;
 
@@ -174,13 +211,16 @@ private:
 //==============================================================================
 
 // Returns true if NCCL window buffers (ncclMemAlloc / ncclCommWindowRegister)
-// are supported for the given real SM version, integrated-device flag, and runtime NCCL version.
+// are supported for the given SM version, integrated-device flag, and runtime NCCL version.
 // Exposed for focused unit testing of platform/version gates.
-bool isNcclWindowSupportedForPlatform(int realSmVersion, bool isIntegrated, int ncclRuntimeVersion);
+bool isNcclWindowSupportedForPlatform(int smVersion, bool isIntegrated, int ncclRuntimeVersion);
 
 // Returns true if the compile-time and runtime NCCL versions support window buffers
 // and the current CUDA device is not in a known-unsupported platform/version set.
 bool isNcclWindowSupported();
+
+// NCCL 2.30.7 is the first public release supporting window registration during capture.
+bool isNcclWindowRegistrationCaptureSupported();
 
 //==============================================================================
 // NCCL Window Buffer Allocation
@@ -234,9 +274,9 @@ public:
     // Eager requests only reuse unowned buffers. A request made during CUDA graph capture first
     // reuses buffers owned by that PyTorch graph memory pool, then may claim an unowned buffer for it.
     // Uses best-fit strategy: selects the smallest eligible buffer that meets the size requirement.
-    // New allocation/registration is prohibited during capture.
-    // Uses the supplied stream for capture detection, stream-scoped reuse eligibility, and allocation
-    // synchronization. Callers using a non-default stream must pass it explicitly.
+    // New allocation/registration during capture requires NCCL runtime 2.30.7+ and a graph-pool owner.
+    // Uses the supplied stream for capture detection and stream-scoped reuse eligibility.
+    // Callers using a non-default stream must pass it explicitly.
     NCCLWindowBuffer requestBuffer(ncclComm_t comm, size_t size, cudaStream_t stream = nullptr);
 
     // Select the allocation domain on this host thread. owner == -1 explicitly selects eager;
@@ -246,6 +286,11 @@ public:
     // therefore must be called at the same explicit lifecycle boundary on every rank. Buffers
     // still in use are returned when their deterministic tensor scope ends.
     void releaseGraphPoolOwner(int64_t owner);
+
+    // While set on this host thread, requestBuffer returns an invalid buffer without touching the
+    // pool, so callers fall back to plain memory. Used where ranks are not SPMD, such as PARALLEL
+    // autotuning. Returns the previous setting.
+    bool setWindowAllocationSuppressed(bool suppressed);
 
     // Search for a buffer by pointer. Returns an invalid buffer if not found.
     // This matches the UBManager.search_buffer() interface.
@@ -305,6 +350,22 @@ public:
     // Get the number of buffers in use for a communicator
     size_t getBufferInUseCount(ncclComm_t comm) const;
 
+    //! \brief Window buffers held on one device across all communicators.
+    //!
+    //! Sizes are as requested; ncclMemAlloc rounds each allocation up to its granularity.
+    struct DeviceUsage
+    {
+        size_t bufferCount{0}; //!< Buffers pooled on the device, checked out or not.
+        size_t totalBytes{0};  //!< Requested bytes of those buffers.
+        size_t inUseBytes{0};  //!< Requested bytes of the buffers currently checked out.
+    };
+
+    //! \brief Usage on `device`; all zero for a device with no buffers.
+    //!
+    //! Reads totals kept under their own lock, so it never waits for a window allocation or
+    //! registration in progress, which hold mMutex across collectives with other ranks.
+    DeviceUsage getDeviceUsage(int device) const;
+
     // Check if a communicator is valid (non-null)
     // Note: We don't track cleaned-up comms because NCCL can reuse memory addresses.
     // All non-null comms are considered valid and will be registered when first used.
@@ -318,7 +379,11 @@ public:
 private:
     friend class NCCLWindowAllocatorTestAccess;
 
-    NCCLWindowAllocator() = default;
+    NCCLWindowAllocator()
+        : mCaptureRegistrationSupported(isNcclWindowRegistrationCaptureSupported())
+    {
+    }
+
     ~NCCLWindowAllocator() = default;
 
     // Allocate a new buffer and register it with NCCL as a window
@@ -348,7 +413,7 @@ private:
 
     // Drain the sticky CUDA error left by a failed symmetric allocation.
     static cudaError_t clearCudaErrorIfSymmetricAllocationFailed(
-        int localAllocOk, CudaGetLastErrorFunc getLastError = cudaGetLastError) noexcept;
+        bool localAllocOk, CudaGetLastErrorFunc getLastError = cudaGetLastError) noexcept;
 
     // Search for a buffer by pointer (assumes mMutex is already locked)
     NCCLWindowBuffer searchBufferLocked(ncclComm_t comm, void* ptr) const;
@@ -376,6 +441,11 @@ private:
         uint64_t releaseEpoch{0};
     };
 
+    // Keep mDeviceUsage in step with mBufferPool. Each assumes mMutex is already locked and takes mUsageMutex.
+    void addEntryUsageLocked(BufferEntry const& entry);
+    void removeEntryUsageLocked(BufferEntry const& entry);
+    void setInUseLocked(BufferEntry& entry, bool inUse);
+
     struct TensorLeaseScope;
 
     struct TensorLease
@@ -401,9 +471,13 @@ private:
     void quarantineTensorLeaseLocked(TensorLease const& tensorLease);
     void assertLifecycleWarning() const noexcept;
 
+    bool const mCaptureRegistrationSupported;
     mutable std::mutex mMutex;
     std::atomic_bool mSuppressLifecycleWarningAssertionsForTest{false};
     std::unordered_map<ncclComm_t, std::vector<BufferEntry>> mBufferPool;
+    // Per-device totals of mBufferPool, guarded by mUsageMutex (taken after mMutex, never before it).
+    mutable std::mutex mUsageMutex;
+    std::unordered_map<int, DeviceUsage> mDeviceUsage;
     std::unordered_set<ncclComm_t> mRegisteredComms;
     // Smallest request size that is known to fail collectively for each communicator.
     // Requests below the recorded size may still succeed and already-pooled buffers are always

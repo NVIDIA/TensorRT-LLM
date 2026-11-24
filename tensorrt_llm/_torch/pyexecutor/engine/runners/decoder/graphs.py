@@ -8,7 +8,7 @@ import functools
 import os
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from typing import Any, NamedTuple, Protocol
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, Protocol
 
 import torch
 
@@ -25,7 +25,13 @@ from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
 )
 from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import BreakableCUDAGraphRunner
-from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner, KeyType
+from tensorrt_llm._torch.pyexecutor.config_utils import is_decode_only
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
+    CUDAGraphRunner,
+    GraphVariant,
+    KeyType,
+    sampling_variant,
+)
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, get_draft_token_length
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
@@ -34,6 +40,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     ResourceManager,
     ResourceManagerType,
 )
+from tensorrt_llm._torch.pyexecutor.runtime_hooks import runtime_hooks_of
 from tensorrt_llm._torch.pyexecutor.sampler import SampleStateTensors
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import SampleType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -46,11 +53,7 @@ from tensorrt_llm._torch.speculative import (
 from tensorrt_llm._torch.speculative.utils import get_static_draft_len
 from tensorrt_llm._torch.utils import get_per_request_prefill_cuda_graph_flag
 from tensorrt_llm.inputs.multimodal import _has_mm_payload_keys
-from tensorrt_llm.llmapi.llm_args import (
-    BaseSparseAttentionConfig,
-    PrefillCudaGraphBackend,
-    SeqLenAwareSparseAttentionConfig,
-)
+from tensorrt_llm.llmapi.llm_args import BaseSparseAttentionConfig, PrefillCudaGraphBackend
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -58,8 +61,28 @@ from ...lora import LoraParamBuilder
 from ..common import get_top_level_model, prepare_multimodal_indices
 from .config import DecoderRunnerConfig
 from .dummy_requests import DummyRequestFactory
-from .metadata import DecoderMetadata
+from .inputs import DecoderInputPreparer
+from .locality_domain import locality_domain_forkjoin_enabled
+from .metadata import (
+    DecoderMetadata,
+    resolve_mamba_metadata_cls,
+    supports_advanced_draft_sampling,
+    supports_temperature_only_graphs,
+)
 from .warmup import WarmupAgreement
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.modules.linear import MXFP8LinearMethod
+
+# Context requests per warmup batch whose breakable prefill graph breaks get
+# CUDA graphs; the short prefill iterations these graphs speed up rarely
+# schedule more, and their breaks run eagerly.
+_BREAK_GRAPH_NUM_CONTEXTS = (1, 2)
+
+
+def _skip_warmup_pass_requested() -> bool:
+    """Whether TLLM_CUDA_GRAPH_SKIP_WARMUP_PASS=1 asks to capture without the warmup-only pass."""
+    return os.environ.get("TLLM_CUDA_GRAPH_SKIP_WARMUP_PASS", "0") == "1"
 
 
 def _make_single_token_context_graph_batch(
@@ -114,6 +137,34 @@ def _make_single_token_context_graph_batch(
     graph_batch.paused_requests = list(scheduled_requests.paused_requests)
     promoted_context_request_ids = frozenset(request.py_request_id for request in context_requests)
     return graph_batch, promoted_context_request_ids
+
+
+def _variant_capture_passes(
+    max_seq_len_list: list[int],
+    graph_variants: tuple[GraphVariant, ...],
+    batch_size: int,
+    draft_len: int,
+) -> list[tuple[int, tuple[int, ...]]]:
+    """(warm-up length, value of every graph variant) passes of one graph shape.
+
+    Every value of every variant is captured at every warm-up length, except
+    for a variant that ties its values to the lengths (``capture_passes``),
+    which has to be the first one.
+    """
+    passes: list[tuple[int, tuple[int, ...]]] = [(length, ()) for length in max_seq_len_list]
+    for index, variant in enumerate(graph_variants):
+        values = variant.values(batch_size, draft_len)
+        if variant.capture_passes is not None:
+            assert index == 0, f"graph variant {variant.name} ties values to warm-up lengths"
+            passes = [
+                (length, (value,))
+                for length, value in variant.capture_passes(max_seq_len_list, values)
+            ]
+        else:
+            passes = [
+                (length, settled + (value,)) for length, settled in passes for value in values
+            ]
+    return passes
 
 
 def compute_dynamic_draft_len_mapping(config: DecoderRunnerConfig) -> dict[int, int] | None:
@@ -182,13 +233,19 @@ class DecoderCudaGraphs:
 
     A model family that prepares capture batches differently, or captures
     shapes beyond the generation ones, overrides ``_prepare_capture_batch``
-    and ``_capture_additional_cuda_graphs``.
+    and ``_capture_additional_cuda_graphs``. One whose capture relies on the
+    warmup-only pass sets ``supports_single_pass_capture`` to False.
     """
+
+    # Whether a warmup batch already ran an in-forward Mamba snapshot split (its Triton copy kernels compiled).
+    _inforward_split_warmed: bool = False
+    # Whether TLLM_CUDA_GRAPH_SKIP_WARMUP_PASS=1 may capture these graphs in one pass.
+    supports_single_pass_capture: ClassVar[bool] = True
 
     def __init__(
         self,
         *,
-        cuda_graph_runner: CUDAGraphRunner | None,
+        cuda_graph_runner: CUDAGraphRunner,
         breakable_cuda_graph_runner: BreakableCUDAGraphRunner | None,
         config: DecoderRunnerConfig,
         mapping: Mapping,
@@ -205,8 +262,10 @@ class DecoderCudaGraphs:
         torch_compile_bypass: Callable[[], contextlib.AbstractContextManager[None]],
         context_promotion_supported: bool,
         warmup_inputs: torch.Tensor | None = None,
+        inputs: DecoderInputPreparer | None = None,
     ) -> None:
         self.cuda_graph_runner = cuda_graph_runner
+        self._inputs = inputs
         self.breakable_cuda_graph_runner = breakable_cuda_graph_runner
         self._config = config
         self.mapping = mapping
@@ -225,6 +284,10 @@ class DecoderCudaGraphs:
         # Promoted context rows carry no per-sequence extra model inputs.
         self._context_promotion_supported = context_promotion_supported
         self._force_lora_graph_for_capture: bool | None = None
+        self._inforward_split_warmed = False
+        # The one-engine sampling variants captured when cuda_graph_config.sampling_variants lists them.
+        self._sampling_variants: frozenset[str] | None = None
+        self._capturing_in_one_pass = False
 
     def forward_discarded_warmup(
         self,
@@ -252,7 +315,7 @@ class DecoderCudaGraphs:
     @property
     def enabled(self) -> bool:
         """Return whether generation batches may run as CUDA graphs."""
-        return self.cuda_graph_runner is not None and self.cuda_graph_runner.enabled
+        return self.cuda_graph_runner.enabled
 
     def register_sample_type_resolver(self, resolver: Callable | None) -> None:
         """Register how a batch maps to its sampling tier, for the graph key."""
@@ -263,10 +326,11 @@ class DecoderCudaGraphs:
         scheduled_requests: ScheduledRequests,
         resource_manager: ResourceManager,
         runtime_draft_len: int,
+        sampling_mode: int | None = None,
     ) -> contextlib.AbstractContextManager[ScheduledRequests]:
         """Pad ``scheduled_requests`` with dummy rows up to a captured batch size."""
         return self.cuda_graph_runner.pad_batch(
-            scheduled_requests, resource_manager, runtime_draft_len
+            scheduled_requests, resource_manager, runtime_draft_len, sampling_mode
         )
 
     def select(
@@ -306,16 +370,19 @@ class DecoderCudaGraphs:
         return GraphSelection(key, graph_attn_metadata, graph_spec_metadata, use_lora_graph)
 
     def attention_dp_execution_batch(
-        self, scheduled_requests: ScheduledRequests
+        self, scheduled_requests: ScheduledRequests, runtime_draft_len: int = 0
     ) -> ScheduledRequests:
         """Give a phase-idle rank its retained graph row without admitting work."""
         if not scheduled_requests.is_attention_dp_phase_idle:
             return scheduled_requests
         if scheduled_requests.batch_size or scheduled_requests.encoder_requests:
             raise ValueError("An attention-DP phase-idle batch must be semantically empty")
-        dummy = self.cuda_graph_runner.padding_dummy_requests.get(0)
+        dummy = self.cuda_graph_runner.padding_dummy_requests.get(runtime_draft_len)
         if dummy is None:
-            raise RuntimeError("The retained attention-DP execution row is missing")
+            raise RuntimeError(
+                f"The retained attention-DP execution row for draft length {runtime_draft_len} "
+                "is missing"
+            )
         execution_requests = ScheduledRequests()
         execution_requests.attention_dp_phase = scheduled_requests.attention_dp_phase
         execution_requests.is_attention_dp_phase_idle = True
@@ -329,32 +396,175 @@ class DecoderCudaGraphs:
 
     def reset_padding_dummies(self) -> None:
         """Drop padding dummies that belong to an earlier KV cache manager."""
-        self.cuda_graph_runner.padding_dummy_requests = {}
+        self.cuda_graph_runner.reset_padding_dummies()
 
     def preallocate_padding_dummies(self, resource_manager: ResourceManager) -> None:
         """Allocate the padding dummies while the KV cache is still empty."""
         self.cuda_graph_runner.preallocate_padding_dummies(resource_manager)
 
-    def warmup_and_capture(self, resource_manager: ResourceManager) -> None:
+    def warmup_and_capture(
+        self, resource_manager: ResourceManager, *, allow_single_pass: bool = False
+    ) -> None:
         """Warm up every graph shape, then capture them all.
 
         Attention kernels can switch implementations at smaller batch sizes and
         require a larger workspace, so the first pass grows the workspace to
         its maximum size. The second pass runs the final per-shape warmup and
-        captures without resizing the workspace.
+        captures without resizing the workspace. ``allow_single_pass`` lets
+        ``TLLM_CUDA_GRAPH_SKIP_WARMUP_PASS=1`` try one pass first.
         """
         with self.cuda_graph_runner.allow_capture():
-            self.cuda_graph_runner.is_warmup_only = True
-            try:
-                self.run_cuda_graph_warmup(resource_manager)
-            finally:
-                self.cuda_graph_runner.is_warmup_only = False
-            self.reset_padding_dummies()
-            # Captured graphs keep the MoE communication timeouts that were
-            # current at capture, and serving replays them, so capture with the
-            # serving timeouts. The warmup-only pass above keeps the warmup ones.
+            if not (allow_single_pass and self._capture_in_one_pass(resource_manager)):
+                self.cuda_graph_runner.is_warmup_only = True
+                try:
+                    self.run_cuda_graph_warmup(resource_manager)
+                finally:
+                    self.cuda_graph_runner.is_warmup_only = False
+                self.reset_padding_dummies()
+                # Captured graphs keep the MoE communication timeouts that were
+                # current at capture, and serving replays them, so capture with the
+                # serving timeouts. The warmup-only pass above keeps the warmup ones.
+                with moe_comm_serving_timeouts():
+                    self.run_cuda_graph_warmup(resource_manager)
+        self._warm_inforward_split(resource_manager)
+
+    def _plans_inforward_splits(self, resource_manager: ResourceManager) -> bool:
+        """Whether the KV cache manager plans in-forward Mamba snapshot splits of context chunks."""
+        kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
+        return (
+            isinstance(kv_cache_manager, KVCacheManagerV2)
+            and kv_cache_manager.inforward_snapshot_rows > 0
+        )
+
+    def _warm_inforward_split(self, resource_manager: ResourceManager) -> None:
+        """Run one eager context request with an in-forward Mamba snapshot split, so that the split's kernels
+        (gdn_inforward_split.py) compile before serving where no break-graph capture ran one (prefill CUDA graphs
+        disabled, or no bucket with graphable breaks). Their compiled variants depend only on the model's strides
+        and the persistent split-index buffer, so one batch covers every later split."""
+        if (
+            self._inforward_split_warmed
+            or self.mapping.has_cp_helix()
+            or is_decode_only(self.sparse_attention_config)
+            or not self._plans_inforward_splits(resource_manager)
+        ):
+            return
+        kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
+        # Room for the longest tail after the shortest main part (GDNMambaMetadata._warmup_inforward_split_plan).
+        num_tokens = (
+            kv_cache_manager.inforward_snapshot_min_main
+            + kv_cache_manager.inforward_snapshot_max_tail
+        )
+        if num_tokens > self._config.max_num_tokens:
+            return
+        logger.info(f"Running in-forward Mamba snapshot split warmup ({num_tokens} tokens)")
+        with (
+            self.no_cuda_graph(),
+            resolve_mamba_metadata_cls(self.model, kv_cache_manager).inforward_split_for_warmup(),
+        ):
+            warmup_request = self._dummy_requests.create_warmup_request(
+                resource_manager, num_tokens, 0, num_context_requests=1
+            )
+            with self._dummy_requests.release_batch_context(
+                warmup_request, resource_manager
+            ) as batch:
+                self._agreement.assert_all_tp_ranks_have_warmup_batch(batch, num_tokens)
+                if batch is None:
+                    return
+                self.forward_discarded_warmup(
+                    batch,
+                    resource_manager,
+                    enable_spec_decode=self._config.is_spec_decode,
+                    runtime_draft_len=get_static_draft_len(self._config.spec_config),
+                )
+                torch.cuda.synchronize()
+        self._inforward_split_warmed = True
+
+    def _capture_in_one_pass(self, resource_manager: ResourceManager) -> bool:
+        """Capture the decode graphs in one pass if TLLM_CUDA_GRAPH_SKIP_WARMUP_PASS=1 asks for it.
+
+        The graphs are kept only if, on every rank, no captured graph's top-level attention or
+        speculative-decoding metadata tensor moved by the last capture; buffers held elsewhere are
+        not checked. On False the graphs it captured are discarded.
+        """
+        if not self.cuda_graph_runner.enabled:
+            return False
+        # Every rank joins, so a rank without the switch keeps all ranks on two passes.
+        requested = _skip_warmup_pass_requested()
+        blocker = self._single_pass_blocker() if requested else None
+        if not self._agreement.agree_flag(requested and blocker is None):
+            if requested:
+                logger.warning(
+                    "TLLM_CUDA_GRAPH_SKIP_WARMUP_PASS=1 is ignored: "
+                    f"{blocker or 'not every rank set it or can use it'}"
+                )
+            return False
+        logger.info(
+            "TLLM_CUDA_GRAPH_SKIP_WARMUP_PASS=1: capturing the decode CUDA graphs in one pass, each "
+            "shape's eager forward with the warmup MoE communication timeouts and its capture with "
+            "the serving ones"
+        )
+        self._capturing_in_one_pass = True
+        try:
+            self.run_cuda_graph_warmup(resource_manager, capture_prefill=False)
+        finally:
+            self._capturing_in_one_pass = False
+        moved_tensors = self.cuda_graph_runner.moved_graph_tensors()
+        num_graphs = len(self.cuda_graph_runner.graphs)
+        if self._agreement.agree_flag(not moved_tensors):
+            logger.info(f"Captured {num_graphs} decode CUDA graphs without the warmup-only pass")
             with moe_comm_serving_timeouts():
-                self.run_cuda_graph_warmup(resource_manager)
+                self._capture_prefill_cuda_graphs(resource_manager)
+            return True
+        logger.warning(
+            f"TLLM_CUDA_GRAPH_SKIP_WARMUP_PASS=1: discarding {num_graphs} decode CUDA graphs and "
+            "capturing them again after a warmup-only pass, since a captured graph's metadata "
+            "tensor moved on at least one rank (this rank: "
+            f"{', '.join(moved_tensors[:3]) or 'none'}{', ...' if len(moved_tensors) > 3 else ''}). "
+            "Unset it for this model to avoid the extra pass."
+        )
+        self.cuda_graph_runner.clear()
+        return False
+
+    def _single_pass_blocker(self) -> str | None:
+        """Why this rank may not try the single pass; None when nothing only the warmup-only
+        pass does is needed and the ranks can agree."""
+        if self.cuda_graph_runner.graphs:
+            return "decode CUDA graphs were already captured"
+        # A stage that skips a shape for lack of KV cache leaves its peers waiting at the line-up.
+        if self.mapping.has_pp():
+            return "pipeline parallelism is not supported"
+        # One gate per duty of the warmup-only pass in run_cuda_graph_warmup.
+        if self._lora.cuda_graph_manager is not None:
+            return "LoRA CUDA graphs tune their kernels in the warmup-only pass"
+        if self._flashinfer_mxfp8_autotune_methods():
+            return "FlashInfer MXFP8 decode GEMMs tune their tactics in the warmup-only pass"
+        from tensorrt_llm._torch.modules.linear import cuda_graph_gemm_tuning_enabled
+
+        # cuda_graph_gemm_tuning ignores the knob on more than one rank.
+        if cuda_graph_gemm_tuning_enabled() and self.mapping.world_size == 1:
+            return "TLLM_CUDA_GRAPH_GEMM_TUNING tunes the GEMMs in the warmup-only pass"
+        if not self.supports_single_pass_capture:
+            return f"{type(self).__name__} relies on the warmup-only pass"
+        if self._agreement.is_distributed_forward() and self._agreement.allgather() is None:
+            return "the ranks cannot agree on it through this engine's communicator"
+        return None
+
+    def _flashinfer_mxfp8_autotune_methods(self) -> list["MXFP8LinearMethod"]:
+        """The FlashInfer MXFP8 decode GEMMs whose tactics the warmup-only pass tunes."""
+        from tensorrt_llm._torch.modules.linear import MXFP8LinearMethod
+
+        return [
+            quant_method
+            for module in self.model.modules()
+            if isinstance(
+                (quant_method := getattr(module, "quant_method", None)), MXFP8LinearMethod
+            )
+            and quant_method.needs_flashinfer_autotune
+        ]
 
     def _prepare_capture_batch(
         self,
@@ -371,9 +581,6 @@ class DecoderCudaGraphs:
 
     @contextlib.contextmanager
     def no_cuda_graph(self) -> Iterator[None]:
-        if self.cuda_graph_runner is None:
-            yield
-            return
         _run_cuda_graphs = self.cuda_graph_runner.enabled
         self.cuda_graph_runner.enabled = False
         try:
@@ -450,10 +657,15 @@ class DecoderCudaGraphs:
             and not ced_enabled
             and self._config.max_beam_width == 1
             and self._context_promotion_supported
-            # PLE owns recurrent n-gram and convolution state. Promoting a
-            # fresh final-context row would skip its cache-slot reset.
+            # PLE owns recurrent n-gram and convolution state, and other models
+            # may declare state that only their context path resets. Promoting
+            # a fresh final-context row would skip its cache-slot reset.
             and not self._model_uses_ple_recurrent_state
+            and not self._model_resets_recurrent_state_in_context
             and self.mapping.cp_size == 1
+            # Promoted rows are re-sorted by domain with the generation rows,
+            # while sampling still walks the semantic batch in its own order.
+            and not locality_domain_forkjoin_enabled(kv_cache_manager)
         ):
             return scheduled_requests, frozenset()
         return _make_single_token_context_graph_batch(
@@ -479,6 +691,18 @@ class DecoderCudaGraphs:
         if not self._config.use_mrope or not _has_mm_payload_keys(multimodal_data):
             return True
         return CUDAGraphRunner._get_mrope_position_delta(request) is not None
+
+    @functools.cached_property
+    def _model_resets_recurrent_state_in_context(self) -> bool:
+        """Whether the causal LM declares state that only its context path resets.
+
+        Reads ``DecoderModelForCausalLM.resets_recurrent_state_in_context`` from
+        the causal LM the engine holds or, for a multimodal wrapper, from its
+        ``llm``.
+        """
+        model = getattr(self.model, "_orig_mod", self.model)
+        causal_lm = getattr(get_top_level_model(model), "llm", model)
+        return bool(getattr(causal_lm, "resets_recurrent_state_in_context", False))
 
     @functools.cached_property
     def _model_uses_ple_recurrent_state(self) -> bool:
@@ -507,6 +731,8 @@ class DecoderCudaGraphs:
         enable_spec_decode: bool,
         gather_context_logits: bool,
         position_id_offsets: torch.Tensor | None,
+        is_dummy: bool = False,
+        static_inputs_staged: int = 0,
     ) -> Any:
         """Run the model by replaying the graph for ``key``, capturing it first if needed.
 
@@ -529,6 +755,8 @@ class DecoderCudaGraphs:
                 enable_spec_decode=enable_spec_decode,
                 gather_context_logits=gather_context_logits,
                 position_id_offsets=position_id_offsets,
+                is_dummy=is_dummy,
+                static_inputs_staged=static_inputs_staged,
             )
 
     def _run(
@@ -544,12 +772,15 @@ class DecoderCudaGraphs:
         enable_spec_decode: bool,
         gather_context_logits: bool,
         position_id_offsets: torch.Tensor | None,
+        is_dummy: bool = False,
+        static_inputs_staged: int = 0,
     ) -> Any:
         breakable_runner = self.breakable_cuda_graph_runner
         if key is None:
             num_tokens = inputs["input_ids"].shape[0]
             can_run_breakable_graph = (
                 breakable_runner is not None
+                and (not is_dummy or breakable_runner.is_capturing_break_graphs)
                 and get_per_request_prefill_cuda_graph_flag()
                 and not gather_context_logits
                 and breakable_runner.has_graph(num_tokens)
@@ -573,11 +804,18 @@ class DecoderCudaGraphs:
                     inputs,
                     enable_spec_decode=enable_spec_decode,
                     postprocess_fn=postprocess_inputs,
+                    # Serving replays the timeouts current at capture.
+                    capture_scope=functools.partial(moe_comm_serving_timeouts, quiet=True),
+                    record_tensor_ptrs=self._capturing_in_one_pass,
                 )
 
             if self.cuda_graph_runner.is_warmup_only:
                 outputs = capture_outputs
             elif needs_capture:
+                if self._capturing_in_one_pass:
+                    # The replay waits on peers under serving timeouts, so line the ranks up first.
+                    torch.cuda.synchronize()
+                    self._agreement.agree_flag(True)
                 # Refresh attention metadata for the current batch's
                 # draft cache before replaying the captured graph.
                 saved_draft = prepare_attn_metadata_for_draft_replay(
@@ -585,7 +823,10 @@ class DecoderCudaGraphs:
                 )
                 try:
                     outputs = self.cuda_graph_runner.replay(
-                        key, inputs, position_id_offsets=position_id_offsets
+                        key,
+                        inputs,
+                        position_id_offsets=position_id_offsets,
+                        static_inputs_staged=static_inputs_staged,
                     )
                 finally:
                     restore_attn_metadata_after_draft_replay(attn_metadata, saved_draft)
@@ -596,13 +837,18 @@ class DecoderCudaGraphs:
                 try:
                     with MoeLoadBalancerIterContext(moe_load_balancer):
                         outputs = self.cuda_graph_runner.replay(
-                            key, inputs, position_id_offsets=position_id_offsets
+                            key,
+                            inputs,
+                            position_id_offsets=position_id_offsets,
+                            static_inputs_staged=static_inputs_staged,
                         )
                 finally:
                     restore_attn_metadata_after_draft_replay(attn_metadata, saved_draft)
         return outputs
 
-    def _get_graphs_to_capture(self, cuda_graph_batch_sizes: list[int]) -> list[tuple[int, int]]:
+    def _get_graphs_to_capture(
+        self, cuda_graph_batch_sizes: list[int]
+    ) -> list[tuple[int, int] | tuple[int, int, int]]:
         """Determine which (batch_size, draft_len) graphs to capture.
 
         Returns:
@@ -624,6 +870,33 @@ class DecoderCudaGraphs:
             )
             return graphs
 
+        if self._inputs is not None and self._inputs._dspark_confidence_enabled:
+            max_draft_len = int(self._config.spec_config.max_draft_len)
+            native_graphs = [(bs, max_draft_len) for bs in cuda_graph_batch_sizes]
+            if not self._inputs._dspark_trims_submitted_tokens:
+                return native_graphs
+            from tensorrt_llm._torch.speculative.dspark_planner import ExactSpsCostTable
+
+            exact_table = self._inputs._dspark_sps_cost_table
+            if not isinstance(exact_table, ExactSpsCostTable):
+                raise RuntimeError(
+                    "DSpark confidence graph capture requires an authenticated exact SPS table"
+                )
+            ragged_graphs = [
+                (bs, max_draft_len, verifier_budget)
+                for bs in cuda_graph_batch_sizes
+                for verifier_budget in exact_table.production_candidate_budgets(bs)
+            ]
+            # Full K keeps the ordinary native graph. Compact layouts have
+            # distinct keys; they cannot alias its uniform attention layout.
+            graphs = native_graphs + ragged_graphs
+            logger.info(
+                f"DSpark ragged verification: capturing {len(graphs)} graphs "
+                f"({len(native_graphs)} native static-K{max_draft_len} graphs + "
+                f"{len(ragged_graphs)} exact measured (G,V) cells)."
+            )
+            return graphs
+
         # Case 2: Static draft length
         # Match the runtime_draft_len semantics enforced in resolve_runtime_draft_len:
         # logical K for linear-tree modes, total tree tokens for tree decoding.
@@ -639,13 +912,19 @@ class DecoderCudaGraphs:
             draft_lengths.append(0)
         return [(bs, draft_len) for bs in cuda_graph_batch_sizes for draft_len in draft_lengths]
 
-    def run_cuda_graph_warmup(self, resource_manager: ResourceManager) -> None:
-        """Warm up or capture CUDA graphs for the configured graph shapes."""
+    def run_cuda_graph_warmup(
+        self, resource_manager: ResourceManager, *, capture_prefill: bool = True
+    ) -> None:
+        """Warm up or capture CUDA graphs for the configured graph shapes.
+
+        ``capture_prefill=False`` leaves a capture pass's prefill graphs to the caller.
+        """
         is_warmup_only = self.cuda_graph_runner.is_warmup_only
         metric_name = (
             "gen_cuda_graph_warmup_seconds" if is_warmup_only else "gen_cuda_graph_capture_seconds"
         )
         with timing_metric(metric_name, self._metrics):
+            # Each is_warmup_only duty below needs a gate in _single_pass_blocker.
             # Include LoRA autotuning and its PP cache hand-off/cleanup in
             # warmup timing, including when this rank has no graph shapes.
             lora_context = (
@@ -667,7 +946,7 @@ class DecoderCudaGraphs:
                 # Context-only workers only use the separate prefill capture.
                 if not context_only:
                     from tensorrt_llm._torch.modules.linear import (
-                        MXFP8LinearMethod,
+                        cuda_graph_gemm_tuning,
                         flashinfer_mxfp8_autotune,
                         flashinfer_mxfp8_decode_graph_capture,
                     )
@@ -675,27 +954,68 @@ class DecoderCudaGraphs:
                     # The automatic MiniMax-M3 MXFP8 selection is decode-graph-only.
                     # Tune every generation graph shape during the warmup-only pass.
                     # Keep piecewise context/prefill capture on the native backend.
-                    flashinfer_methods = [
-                        quant_method
-                        for module in self.model.modules()
-                        if isinstance(
-                            (quant_method := getattr(module, "quant_method", None)),
-                            MXFP8LinearMethod,
-                        )
-                        and quant_method.needs_flashinfer_autotune
-                    ]
+                    flashinfer_methods = self._flashinfer_mxfp8_autotune_methods()
                     flashinfer_autotune_context = (
                         flashinfer_mxfp8_autotune()
                         if is_warmup_only and flashinfer_methods
                         else contextlib.nullcontext()
                     )
-                    with flashinfer_autotune_context, flashinfer_mxfp8_decode_graph_capture():
+                    with (
+                        flashinfer_autotune_context,
+                        flashinfer_mxfp8_decode_graph_capture(),
+                        cuda_graph_gemm_tuning(
+                            tune=is_warmup_only, world_size=self.mapping.world_size
+                        ),
+                    ):
                         self._capture_generation_cuda_graphs(resource_manager)
+                    if (
+                        is_warmup_only
+                        and runtime_hooks_of(self.model).merge_tuned_tactics_across_ranks
+                    ):
+                        # Tactics tuned while warming the decode graphs agree across
+                        # ranks before the capture pass reads them.
+                        AutoTuner.get().post_tune_merge_tactics()
                     self._capture_additional_cuda_graphs(resource_manager)
-        # Piecewise graphs have separate capture machinery and do not use the
-        # whole-model attention workspace. Capture them only on the second pass.
-        if not is_warmup_only:
+                    if is_warmup_only and any(
+                        method.tune_mxfp8_backends for method in flashinfer_methods
+                    ):
+                        from tensorrt_llm._torch.custom_ops.mxfp8_gemm import agree_mxfp8_tactics
+                        from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
+                            _MXFP8_GEMM_AUTOTUNED_OP,
+                        )
+
+                        # Every rank captures the GEMM kernels most ranks tuned.
+                        agree_mxfp8_tactics(_MXFP8_GEMM_AUTOTUNED_OP)
+                        cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH")
+                        if cache_path:
+                            AutoTuner.get().profiling_cache.save_cache(
+                                cache_path, self.mapping.rank
+                            )
+        # Piecewise graphs skip the attention workspace, so only a capture pass captures them.
+        if not is_warmup_only and capture_prefill:
             self._capture_prefill_cuda_graphs(resource_manager)
+
+    @staticmethod
+    def _decode_sm_count() -> int:
+        """Streaming multiprocessors of the device the decode graphs replay on."""
+        return int(
+            torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+        )
+
+    def _decode_graph_variants(self, resource_manager: ResourceManager) -> list[GraphVariant]:
+        """Graph variants the decode graphs are keyed by, besides their shape; none for most decodes.
+
+        The attention backend declares them (``AttentionBackend.decode_graph_variants``),
+        asked at capture, once the KV cache exists.
+        """
+        return self._config.attention_backend.decode_graph_variants(
+            kv_cache_manager=resource_manager.get_resource_manager(
+                ResourceManagerType.KV_CACHE_MANAGER
+            ),
+            model=self.model,
+            mapping=self.mapping,
+            sm_count_fn=self._decode_sm_count,
+        )
 
     def _capture_generation_cuda_graphs(self, resource_manager: ResourceManager) -> None:
         """Warm up or capture pure-generation CUDA graph shapes."""
@@ -719,14 +1039,11 @@ class DecoderCudaGraphs:
         # avoid creating warmup requests whose position_ids exceed the RoPE
         # table (max_position_embeddings).
         effective_max_seq_len = self._config.max_seq_len
-        if self.mapping is not None and self.mapping.has_cp_helix():
+        if self.mapping.has_cp_helix():
             effective_max_seq_len = self._config.max_seq_len // self.mapping.cp_size
 
-        sparse_config = self.sparse_attention_config
-        if (
-            isinstance(sparse_config, SeqLenAwareSparseAttentionConfig)
-            and sparse_config.needs_separate_short_long_cuda_graphs()
-        ):
+        short_long_seq_len_threshold = self.cuda_graph_runner.short_long_seq_len_threshold
+        if short_long_seq_len_threshold is not None:
             # For short sequences, subtract the maximum runtime tokens consumed
             # by a generation step so all current-step tokens stay within the
             # sequence length threshold. PARD uses 2K tokens here, not K+1.
@@ -734,7 +1051,7 @@ class DecoderCudaGraphs:
                 self._config.max_draft_len
             )
             # For long sequences, use the default maximum sequence length.
-            max_seq_len = sparse_config.seq_len_threshold - max_runtime_tokens_per_gen_step
+            max_seq_len = short_long_seq_len_threshold - max_runtime_tokens_per_gen_step
             if max_seq_len < effective_max_seq_len:
                 max_seq_len_list = [effective_max_seq_len, max_seq_len]
             else:
@@ -742,11 +1059,35 @@ class DecoderCudaGraphs:
         else:
             max_seq_len_list = [effective_max_seq_len]
 
+        # Without variants (every decode but some FP4 MLA ones) the capture
+        # leaves the graph runner's variant state alone.
+        graph_variants = tuple(self._decode_graph_variants(resource_manager))
+        if graph_variants:
+            self.cuda_graph_runner.set_graph_variants(graph_variants)
+            shapes = sorted(
+                {
+                    entry[:2]
+                    for entry in graphs_to_capture
+                    if entry[0] <= self._config.max_batch_size
+                }
+            )
+            for variant in graph_variants:
+                families = sum(len(variant.values(bs, draft_len)) for bs, draft_len in shapes)
+                logger.info(
+                    f"Decode graphs keyed by {variant.name}: {families} (shape, value) families "
+                    f"over {len(shapes)} generation graph shapes."
+                )
+
+        def _capture_passes(bs: int, draft_len: int) -> list[tuple[int, tuple[int, ...]]]:
+            """(warm-up length, value of every graph variant) passes of one graph shape."""
+            return _variant_capture_passes(max_seq_len_list, graph_variants, bs, draft_len)
+
         def _run_capture_pass(
             force_non_greedy: bool,
             label: str,
             force_lora_graph: bool,
             sample_type: SampleType | None = None,
+            temperature_only: bool = False,
         ) -> None:
             assert self._force_lora_graph_for_capture is None
             self._force_lora_graph_for_capture = force_lora_graph
@@ -758,36 +1099,38 @@ class DecoderCudaGraphs:
             pinned_tier = sample_type or SampleType.FULL
             self.cuda_graph_runner.set_capture_sample_type(pinned_tier)
             try:
-                for bs, draft_len in graphs_to_capture:
+                for entry in graphs_to_capture:
+                    bs, draft_len = entry[:2]
+                    verify_bucket = entry[2] if len(entry) == 3 else None
                     if bs > self._config.max_batch_size:
                         continue
 
-                    for max_seq_len in max_seq_len_list:
+                    for max_seq_len, variant_values in _capture_passes(bs, draft_len):
+                        for variant, value in zip(graph_variants, variant_values):
+                            self.cuda_graph_runner.set_capture_variant(variant.name, value)
                         warmup_request = self._dummy_requests.create_cuda_graph_warmup_request(
                             resource_manager,
                             bs,
                             draft_len,
                             max_seq_len,
                             force_non_greedy=force_non_greedy,
+                            temperature_only=temperature_only,
                         )
                         with self._dummy_requests.release_batch_context(
                             warmup_request, resource_manager
                         ) as batch:
-                            if batch is None:
-                                # No KV cache space for this batch size. During KV
-                                # cache estimation this makes the profiling peak
-                                # unrepresentative (the final executor still
-                                # captures this graph), so don't skip silently.
-                                logger.warning(
-                                    f"Skipping CUDA graph warmup ({label}) for "
-                                    f"batch size={bs}, draft_len={draft_len}: "
-                                    f"not enough KV cache space."
-                                )
+                            if not self._agreement.agree_capture_batch(batch, label, bs, draft_len):
                                 continue
+                            if verify_bucket is not None:
+                                self._set_warmup_ragged_windows(batch, verify_bucket, draft_len)
                             logger.info(
                                 f"Run generation-only CUDA graph {operation} ({label}) "
                                 f"for batch size={bs}, draft_len={draft_len}, "
                                 f"max_seq_len={max_seq_len}"
+                                + "".join(
+                                    f", {variant.name}={value}"
+                                    for variant, value in zip(graph_variants, variant_values)
+                                )
                             )
                             enable_spec_decode = draft_len > 0 or (
                                 self._config.spec_config is not None
@@ -814,6 +1157,10 @@ class DecoderCudaGraphs:
             finally:
                 self._force_lora_graph_for_capture = None
                 self.cuda_graph_runner.set_capture_sample_type(None)
+                for variant in graph_variants:
+                    self.cuda_graph_runner.set_capture_variant(variant.name, None)
+                if self._inputs is not None and self._inputs._dspark_confidence_enabled:
+                    self.cuda_graph_runner.agreed_ragged_bucket = None
 
         if self._lora.cuda_graph_manager is None:
             lora_graph_cases = [False]
@@ -839,9 +1186,19 @@ class DecoderCudaGraphs:
             self._config.spec_config is not None
             and self._config.spec_config.spec_dec_mode.use_one_engine()
         )
+        temperature_only_graphs = uses_own_spec_decoder and (
+            self._config.samples_from_vocab_shards
+            or (
+                self._metadata.spec_metadata is not None
+                and self._metadata.spec_metadata.temperature_only_graphs
+            )
+        )
 
         def _capture_variant(
-            label: str, force_non_greedy: bool = False, sample_type: SampleType | None = None
+            label: str,
+            force_non_greedy: bool = False,
+            sample_type: SampleType | None = None,
+            temperature_only: bool = False,
         ) -> None:
             for use_lora_graph in lora_graph_cases:
                 variant_label = label
@@ -852,6 +1209,7 @@ class DecoderCudaGraphs:
                     label=variant_label,
                     force_lora_graph=use_lora_graph,
                     sample_type=sample_type,
+                    temperature_only=temperature_only,
                 )
 
         if uses_own_spec_decoder:
@@ -862,8 +1220,18 @@ class DecoderCudaGraphs:
             #
             # Dummy warmup requests carry no sampling params, so the greedy pass
             # needs no override while the advanced one has to force the flag.
-            _capture_variant("greedy")
-            _capture_variant("advanced sampling", force_non_greedy=True)
+            variants = self._sampling_variants_to_capture(temperature_only_graphs)
+            if "greedy" in variants:
+                _capture_variant("greedy")
+            if "advanced" in variants:
+                _capture_variant("advanced sampling", force_non_greedy=True)
+            if "temperature_only" in variants:
+                # Temperature-only batches replay the vocabulary-sharded Gumbel-max
+                # target sampling (the advanced pass records the stock sampler: its
+                # params enable top-k / top-p / min-p).
+                _capture_variant(
+                    "temperature-only sampling", force_non_greedy=True, temperature_only=True
+                )
         else:
             # TorchSampler branch: FULL carries no sampling in the graph and is
             # what every batch replays unless in-graph sampling is enabled, so it
@@ -886,6 +1254,93 @@ class DecoderCudaGraphs:
         # This is a defensive guard.
         if self._metadata.spec_metadata is not None:
             self._metadata.spec_metadata.is_all_greedy_sample = True
+            self._metadata.spec_metadata.is_all_temperature_only = False
+            self._metadata.spec_metadata.temperature_only = False
+
+    def _sampling_variants_to_capture(self, temperature_only_graphs: bool) -> frozenset[str]:
+        """One-engine sampling variants to capture; cuda_graph_config.sampling_variants narrows them."""
+        listed = getattr(self._config.cuda_graph_config, "sampling_variants", None)
+        if listed is not None:
+            # Judged from the config: the speculative metadata may not exist before the first pass.
+            # Batches never select temperature_only with rejection sampling or penalties, which
+            # the vocabulary-shard sampler (DSpark) excludes too.
+            spec_config = self._config.spec_config
+            temperature_only_graphs = self._config.samples_from_vocab_shards or (
+                supports_temperature_only_graphs(self._config, self.mapping)
+                and not (spec_config.use_rejection_sampling or spec_config.enable_penalty)
+            )
+        supported = {"greedy"}
+        if supports_advanced_draft_sampling(self._config.spec_config):
+            supported.add("advanced")
+        if temperature_only_graphs:
+            supported.add("temperature_only")
+        if listed is None:
+            return frozenset(supported)
+        if not supported.issuperset(listed):
+            raise ValueError(
+                f"cuda_graph_config.sampling_variants lists {sorted(set(listed) - supported)}, "
+                f"but this engine can capture only {sorted(supported)}"
+            )
+        self._sampling_variants = frozenset(listed)
+        return self._sampling_variants
+
+    def warn_uncaptured_sampling_variant(self, spec_metadata: SpecMetadata) -> None:
+        """Log once per variant that a decode batch runs eagerly because its variant is not listed."""
+        if self._sampling_variants is None:
+            return
+        variant = sampling_variant(spec_metadata)
+        if variant not in self._sampling_variants:
+            logger.warning_once(
+                f"A decode batch with {variant} sampling runs eagerly: "
+                f"cuda_graph_config.sampling_variants captured {sorted(self._sampling_variants)}",
+                key=f"uncaptured_sampling_variant_{variant}",
+            )
+
+    def _capture_break_graphs(
+        self,
+        resource_manager: ResourceManager,
+        num_tokens: int,
+        *,
+        enable_spec_decode: bool,
+        runtime_draft_len: int,
+    ) -> None:
+        """Capture the CUDA graphs of a prefill bucket's graphable breaks (see
+        eager_on_graph) on warmup batches of each _BREAK_GRAPH_NUM_CONTEXTS
+        request count, with and without in-forward Mamba snapshot splits when
+        the cache manager plans them."""
+        variants = [contextlib.nullcontext]
+        split_variant = None
+        if self._plans_inforward_splits(resource_manager):
+            kv_cache_manager = resource_manager.get_resource_manager(
+                ResourceManagerType.KV_CACHE_MANAGER
+            )
+            split_variant = resolve_mamba_metadata_cls(
+                self.model, kv_cache_manager
+            ).inforward_split_for_warmup
+            variants.append(split_variant)
+        for num_contexts in _BREAK_GRAPH_NUM_CONTEXTS:
+            for variant in variants:
+                warmup_request = self._dummy_requests.create_warmup_request(
+                    resource_manager, num_tokens, 0, num_context_requests=num_contexts
+                )
+                with self._dummy_requests.release_batch_context(
+                    warmup_request, resource_manager
+                ) as batch:
+                    self._agreement.assert_all_tp_ranks_have_warmup_batch(batch, num_tokens)
+                    if batch is None:
+                        continue
+                    with variant():
+                        self.breakable_cuda_graph_runner.capture_break_graphs(
+                            lambda: self._forward_warmup(
+                                batch,
+                                resource_manager,
+                                enable_spec_decode=enable_spec_decode,
+                                runtime_draft_len=runtime_draft_len,
+                            ),
+                            self._warmup_inputs,
+                        )
+                    if variant is split_variant:
+                        self._inforward_split_warmed = True
 
     def _capture_prefill_cuda_graphs(self, resource_manager: ResourceManager) -> None:
         """Warm up and capture prefill CUDA graphs, timing each phase separately.
@@ -898,6 +1353,17 @@ class DecoderCudaGraphs:
             self._config.prefill_cuda_graph_backend == PrefillCudaGraphBackend.PIECEWISE
             and not self._config.torch_compile_enabled
         ):
+            return
+        if is_decode_only(self.sparse_attention_config):
+            logger.warning(
+                "Skipping prefill CUDA graph capture: this worker serves "
+                "decode only and never runs a context batch."
+            )
+            return
+        if self.breakable_cuda_graph_runner is not None and not getattr(
+            self.breakable_cuda_graph_runner.layer_model, "supports_prefill_cuda_graph", True
+        ):
+            logger.info("Skipping prefill CUDA graph capture: no prefill replays the whole body")
             return
 
         logger.info("Running prefill CUDA graph warmup...")
@@ -912,6 +1378,7 @@ class DecoderCudaGraphs:
         )
         enable_spec_decode = self._config.is_spec_decode
         runtime_draft_len = get_static_draft_len(self._config.spec_config)
+        break_graph_bytes = 0
         with capture_context, self.no_cuda_graph():
             for num_tokens in prefill_cuda_graph_num_tokens:
                 warmup_request = self._dummy_requests.create_warmup_request(
@@ -928,7 +1395,7 @@ class DecoderCudaGraphs:
                     if self.breakable_cuda_graph_runner is not None:
                         runner = self.breakable_cuda_graph_runner
                         try:
-                            runner.capture(
+                            captured = runner.capture(
                                 num_tokens,
                                 lambda: self._forward_warmup(
                                     batch,
@@ -937,7 +1404,16 @@ class DecoderCudaGraphs:
                                     runtime_draft_len=runtime_draft_len,
                                 ),
                                 self._warmup_inputs,
+                                can_capture=lambda: getattr(
+                                    self._metadata.attn_metadata, "decoder_replay_plan", None
+                                )
+                                is None,
                             )
+                            if not captured:
+                                logger.info(
+                                    "Skipping breakable prefill graph capture for "
+                                    f"{num_tokens} tokens: decoder replay changes boundary metadata"
+                                )
                         finally:
                             self._metrics["ctx_cuda_graph_warmup_seconds"] += runner.metrics.get(
                                 BreakableCUDAGraphRunner.CUDA_GRAPH_WARMUP_METRIC, 0.0
@@ -963,6 +1439,27 @@ class DecoderCudaGraphs:
                                 runtime_draft_len=runtime_draft_len,
                             )
                             torch.cuda.synchronize()
+                # Break graphs remove host time, which dominates only the
+                # shorter prefill iterations.
+                if (
+                    self.breakable_cuda_graph_runner is not None
+                    and num_tokens <= self._config.max_num_tokens // 4
+                    and self.breakable_cuda_graph_runner.has_graphable_breaks(num_tokens)
+                ):
+                    free_bytes = torch.cuda.mem_get_info()[0]
+                    with timing_metric("ctx_cuda_graph_capture_seconds", self._metrics):
+                        self._capture_break_graphs(
+                            resource_manager,
+                            num_tokens,
+                            enable_spec_decode=enable_spec_decode,
+                            runtime_draft_len=runtime_draft_len,
+                        )
+                    break_graph_bytes += free_bytes - torch.cuda.mem_get_info()[0]
+        if self.breakable_cuda_graph_runner is not None:
+            logger.info(
+                f"Captured {self.breakable_cuda_graph_runner.num_break_graphs} breakable "
+                f"prefill graph break graphs, {break_graph_bytes / 2**20:.0f} MiB"
+            )
 
         # The logits allocations grow with the number of requests and are not
         # part of the captured model body. Warm up the largest request count so
@@ -1003,9 +1500,32 @@ class DecoderCudaGraphs:
                     torch.cuda.synchronize()
 
     def release(self, *, release_nccl_window_owners: bool = True) -> None:
-        if self.cuda_graph_runner is not None:
-            self.cuda_graph_runner.clear(release_nccl_window_owners=release_nccl_window_owners)
+        self.cuda_graph_runner.clear(release_nccl_window_owners=release_nccl_window_owners)
         if self.breakable_cuda_graph_runner is not None:
             self.breakable_cuda_graph_runner.clear(
                 release_nccl_window_owners=release_nccl_window_owners
             )
+
+    def _set_warmup_ragged_windows(self, batch, verify_bucket: int, draft_len: int) -> None:
+        """Give a capture batch per-request windows summing to ``verify_bucket``.
+
+        The warmup batch must hit the bucket total exactly, or the graph is
+        keyed under a total no runtime batch produces and every ragged step
+        silently falls back to eager. Any split with the right sum captures
+        the right shape (the raggedness lives in the contents of qo_indptr).
+        """
+        requests = batch.generation_requests
+        if not requests:
+            return
+        from tensorrt_llm._torch.speculative.ragged_helpers import RaggedVerifyLayout
+
+        lens = torch.ones(len(requests), dtype=torch.int32)
+        layout = RaggedVerifyLayout.from_verify_lens(
+            lens, graph_num_tokens=int(verify_bucket), total_verify_tokens=len(requests)
+        )
+        filled = layout.fill_bucket(max_verify_len=1 + int(draft_len))
+        for request, tokens in zip(requests, filled.verify_lens.tolist()):
+            request.py_verify_len = int(tokens) - 1
+        # Publish to the runner too: the graph key carries this value, and the
+        # runtime fit never runs during capture.
+        self.cuda_graph_runner.agreed_ragged_bucket = int(verify_bucket)

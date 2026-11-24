@@ -745,17 +745,32 @@ def is_sm_100f(sm_version=None):
     return sm_version >= 100 and sm_version < 110
 
 
+def is_blackwell_datacenter(sm_version=None):
+    """SM 10.0 or SM 10.3 (B200 / B300 class); unlike ``is_sm_100f``, not SM 10.7."""
+    if sm_version is None:
+        sm_version = get_sm_version()
+    return sm_version in (100, 103)
+
+
+@lru_cache(maxsize=1)
+def is_sm_120f(sm_version=None):
+    if sm_version is None:
+        sm_version = get_sm_version()
+    return sm_version >= 120 and sm_version < 130
+
+
 @lru_cache(maxsize=1)
 def is_flashinfer_gdn_prefill_supported_arch(sm_version=None):
     """Whether FlashInfer ships the GDN (gated-delta-rule) chunk-prefill kernel.
 
-    FlashInfer builds the chunk-prefill kernel for Hopper (SM90) and Blackwell
-    (SM100/SM103/SM120/SM121). On other architectures the kernel aborts at launch,
-    so callers must fall back to the vendored Triton kernels.
+    FlashInfer builds the chunk-prefill kernel for Hopper (SM90), the SM100
+    family (SM100/SM103/SM107) and consumer Blackwell (SM120/SM121). On other
+    architectures the kernel aborts at launch, so callers must fall back to the
+    vendored Triton kernels.
     """
     if sm_version is None:
         sm_version = get_sm_version()
-    return sm_version in (90, 100, 103, 120, 121)
+    return sm_version in (90, 100, 103, 107, 120, 121)
 
 
 @lru_cache(maxsize=1)
@@ -1215,9 +1230,13 @@ class KVCacheEventSerializer:
 
     @staticmethod
     def _mm_key_to_json(data):
-        # MmKey is a tuple of (hash_bytes, start_offset, uuid)
-        # where uuid is optional (None if content-hashed)
-        if len(data) == 3:
+        # V2 uses a four-element internal form to mark UUID as additive:
+        # (digest_bytes, start_offset, uuid, preserve_digest_hash). V1 retains
+        # the legacy three-element form where UUID replaces the hash field.
+        preserve_digest_hash = len(data) == 4 and data[3]
+        if len(data) == 4:
+            hash_array, start_offset, uuid, _ = data
+        elif len(data) == 3:
             hash_array, start_offset, uuid = data
         else:
             # Backward compatibility: old format (hash_array, start_offset)
@@ -1227,14 +1246,14 @@ class KVCacheEventSerializer:
         # Convert array to hex string
         hash_hex = ''.join(f'{b:02x}' for b in hash_array)
 
-        # Use UUID from C++ if available, otherwise use hash_hex
-        hash_or_uuid = uuid if uuid is not None else hash_hex
-
-        return {
+        result = {
             "type": "mm_key",
-            "hash": hash_or_uuid,
+            "hash": hash_hex if preserve_digest_hash or uuid is None else uuid,
             "start_offset": start_offset
         }
+        if preserve_digest_hash and uuid is not None:
+            result["uuid"] = uuid
+        return result
 
     @staticmethod
     def _mm_keys_to_json(data):
@@ -1352,6 +1371,51 @@ def maybe_pin_memory(tensor: torch.Tensor) -> torch.Tensor:
     if prefer_pinned() and not tensor.is_pinned():
         return tensor.pin_memory()
     return tensor
+
+
+def wait_event(event: torch.cuda.Event) -> None:
+    """``event.synchronize()``, skipped for a completed event: ``synchronize``
+    releases the GIL even then, ``query`` keeps it."""
+    if not event.query():
+        event.synchronize()
+
+
+_current_cuda_streams: dict[tuple[int, int], torch.cuda.Stream] = {}
+
+
+def current_cuda_stream(
+        device_index: Optional[int] = None) -> torch.cuda.Stream:
+    """``torch.cuda.current_stream()`` without a per-call device lookup or Stream construction."""
+    if device_index is None:
+        device_index = torch._C._cuda_getDevice()
+    key = (device_index, torch._C._cuda_getCurrentRawStream(device_index))
+    stream = _current_cuda_streams.get(key)
+    if stream is None:
+        stream = _current_cuda_streams[key] = torch.cuda.current_stream(
+            device_index)
+    return stream
+
+
+class CudaStreamScope:
+    """``torch.cuda.stream(stream)`` for a stream of the current device, without
+    the per-call device lookups."""
+
+    __slots__ = ("_stream", "_previous")
+
+    def __init__(self, stream: Optional[torch.cuda.Stream]) -> None:
+        self._stream = stream
+        self._previous = None
+
+    def __enter__(self) -> None:
+        if self._stream is not None:
+            self._previous = torch.cuda.current_stream(
+                self._stream.device_index)
+            torch.cuda.set_stream(self._stream)
+
+    def __exit__(self, *exc_info) -> None:
+        if self._previous is not None:
+            torch.cuda.set_stream(self._previous)
+            self._previous = None
 
 
 def async_tensor_h2d(data, dtype: torch.dtype,

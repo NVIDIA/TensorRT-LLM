@@ -7,13 +7,16 @@ import weakref
 from collections import namedtuple
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
-from typing import (TYPE_CHECKING, Any, Dict, Generic, List, Literal, Optional,
-                    Protocol, Tuple, Type, TypeVar, Union)
+from typing import (TYPE_CHECKING, Any, Callable, Dict, Generic, List, Literal,
+                    NamedTuple, Optional, Protocol, Sequence, Tuple, Type,
+                    TypeVar, Union)
 
 import torch
 from typing_extensions import Self
 
 if TYPE_CHECKING:
+    from ...attention.backends.prims_ts.vc_attention.quantization import \
+        VCAttentionOperands
     from ...model_config import ModelConfig
     from ...modules.mamba.mamba2_metadata import Mamba2Metadata
     from ...pyexecutor.kv_cache.mixed_precision_staging import \
@@ -21,6 +24,7 @@ if TYPE_CHECKING:
     from ...speculative.interface import SpecMetadata
     from ...speculative.spec_tree_manager import SpecTreeManager
     from ..kernels.sage_quant import SageQuantized
+    from .fmha.gqa_decode import KvAppendPlan
 
 from tensorrt_llm._utils import get_hf_rope_theta, maybe_pin_memory
 from tensorrt_llm.functional import (AttentionMaskType, PositionEmbeddingType,
@@ -36,6 +40,7 @@ from ...pyexecutor.kv_cache.mamba_cache_manager import BaseMambaCacheManager
 from ...pyexecutor.resource_manager import KVCacheManager
 from ...pyexecutor.trace_log_utils import log_tensor_size
 from ...utils import get_model_extra_attrs
+from .cpp_schema import cpp_field
 from .sparse.params import (SparseBackendForwardArgs, SparseMetadataParams,
                             SparseRuntimeParams)
 
@@ -65,6 +70,44 @@ class AttentionInputType(IntEnum):
     mixed = 0  # contains both context and generation
     context_only = 1
     generation_only = 2
+
+
+class GraphVariant(NamedTuple):
+    """One more dimension the decode graphs are keyed by, declared by the attention backend.
+
+    The backend lists its variants in ``AttentionBackend.decode_graph_variants``.
+    A decode step has one integer value of the variant, and graphs captured
+    for different values are different graphs. The runner does not know what
+    a value means: it captures the values a graph shape can take, keys every
+    step by its value, and tells the attention metadata of a graph which
+    value the graph serves (``AttentionMetadata.set_decode_graph_variant``).
+
+    Ranks that must replay the same graph take the largest value among their
+    own, so a graph of a larger value has to be valid for a step of a smaller
+    one.
+
+    A value may change only what a rank computes for its own rows, such as
+    the attention kernel it launches. It must not change the work the ranks
+    share inside a graph (what they exchange, or the shapes they exchange it
+    in). A runner that reuses a graph shape agreed elsewhere replays without
+    exchanging the values (``DSparkCUDAGraphRunner._agree_graph_shape``), so
+    its ranks may replay graphs of different values in the same step.
+    """
+    name: str
+    # Values the graphs of a shape (batch size, draft length) are captured
+    # for, ascending. A shape with one value is keyed by it without measuring
+    # the step.
+    values: Callable[[int, int], Tuple[int, ...]]
+    # A step's value, from its shape and the KV length each of its rows reads.
+    of_step: Callable[[int, int, List[int]], int]
+    # The value a step replays when no graph of its own value was captured,
+    # from that value and the ones captured for the step's shape.
+    replayable: Callable[[int, Sequence[int]], int]
+    # (warm-up length, value) of the capture passes of a shape, from the
+    # warm-up lengths of the capture and the shape's values. None captures
+    # every value at every length. Only the first variant may set it.
+    capture_passes: Optional[Callable[[Sequence[int], Tuple[int, ...]],
+                                      List[Tuple[int, int]]]] = None
 
 
 @dataclass(kw_only=True)
@@ -194,6 +237,12 @@ class AttentionMetadata:
     # This buffer is currently only used for TrtllmAttentionMetadata.
     cache_indirection: Optional[torch.Tensor] = None
     cuda_graph_buffers: dict[str, list[torch.Tensor]] = None
+    forward_scratch_buffers: Optional[Buffers] = None
+    """Runner-local storage shared across graphs within one forward, not persistent state.
+
+    Warmup registers capacity; capture must not grow it. CUDAGraphRunner.clear()
+    releases the pool, unlike the potentially process-wide cuda_graph_buffers.
+    """
 
     _saved_tensors: Dict[str, torch.Tensor] = field(init=False,
                                                     default_factory=dict)
@@ -211,6 +260,9 @@ class AttentionMetadata:
     # Mixed-precision KV: the staging copy attention reads, created by the
     # first prepare() on a manager with mixed-precision layers.
     mixed_precision_staging: Optional["MixedPrecisionKVStaging"] = field(
+        init=False, default=None, repr=False, compare=False)
+    # The same for the MTP layers of a separate draft manager; swapped in for draft forwards.
+    draft_mixed_precision_staging: "MixedPrecisionKVStaging | None" = field(
         init=False, default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -353,47 +405,88 @@ class AttentionMetadata:
         """
         self._prepare_mamba_metadata()
 
-    def _has_mixed_precision_kv(self) -> bool:
-        """Whether the KV cache manager holds mixed-precision layers."""
+    def support_steady_gen_step(self) -> bool:
+        """Whether ``prepare_steady_gen_step`` may advance this metadata."""
+        return False
+
+    def _has_mixed_precision_staging(self) -> bool:
+        """Whether this backend runs attention on a staging copy of the mixed-precision layers."""
         # isinstance guards against mocks and against V1 managers, which have
         # no mixed-precision layers.
-        high_layers = getattr(self.kv_cache_manager, "high_layers", None)
-        return isinstance(high_layers, dict) and bool(high_layers)
+        manager = self.kv_cache_manager
+        high_layers = getattr(manager, "mixed_precision_high_layers", None)
+        # The cold-page window keeps the history at the high precision and reads
+        # the high rows through the page tables instead of a staging copy.
+        return (isinstance(high_layers, dict) and bool(high_layers)
+                and manager.mixed_precision_low_dtype
+                != manager.mixed_precision_high_dtype)
 
     def prepare_mixed_precision_kv(self, layout: str,
                                    tokens_per_block: int) -> None:
-        """Create the staging copy on first use, then refresh it per batch."""
+        """Create the staging copies on first use, then refresh them per batch."""
+        self.mixed_precision_staging = self._refresh_mixed_precision_kv(
+            self.mixed_precision_staging, self.kv_cache_manager, "mixed",
+            layout, tokens_per_block)
+        draft = self.draft_kv_cache_manager
+        draft_high_layers = getattr(draft, "mixed_precision_high_layers", None)
+        # A draft view runs on the draft manager itself and has no draft of its own.
+        if (draft is not self.kv_cache_manager
+                and isinstance(draft_high_layers, dict) and draft_high_layers):
+            self.draft_mixed_precision_staging = self._refresh_mixed_precision_kv(
+                self.draft_mixed_precision_staging, draft, "draft_mixed",
+                layout, tokens_per_block)
+
+    def sync_draft_mixed_precision_staging(
+            self) -> "MixedPrecisionKVStaging | None":
+        """Give the draft staging copy the target's lengths at the start of a draft forward.
+
+        A mixed-precision MTP draft manager holds the same tokens as the target manager,
+        and overlap-scheduler corrections may have changed the target's lengths on the
+        device since prepare().
+
+        Returns:
+            The draft staging copy; None without a separate mixed-precision draft manager.
+        """
+        draft = self.draft_mixed_precision_staging
+        if draft is not None:
+            draft.lengths.copy_(self.mixed_precision_staging.lengths)
+        return draft
+
+    def _refresh_mixed_precision_kv(
+            self, view: "MixedPrecisionKVStaging | None",
+            manager: KVCacheManagerV2, name: str, layout: str,
+            tokens_per_block: int) -> "MixedPrecisionKVStaging":
         from ...pyexecutor.kv_cache.mixed_precision_staging import \
             MixedPrecisionKVStaging
 
-        view = self.mixed_precision_staging
-        if view is None or view.manager is not self.kv_cache_manager:
+        if view is None or view.manager is not manager:
             # Built once per metadata object (eager or CUDA graph copy); the
             # reserved buffer-pool block is shared, so the staging copy is
             # allocated and zeroed once per rank and the KV budget profiling
             # run already accounts for it.
             buffers = (self.cuda_graph_buffers if self.cuda_graph_buffers
                        is not None else get_memory_buffers())
-            view = MixedPrecisionKVStaging(self.kv_cache_manager,
+            view = MixedPrecisionKVStaging(manager,
                                            buffers,
                                            rows=self.max_num_sequences
                                            or self.max_num_requests,
                                            layout=layout,
                                            pool_layout=self.kv_layout,
-                                           tokens_per_block=tokens_per_block)
+                                           tokens_per_block=tokens_per_block,
+                                           name=name)
             logger.info_once(
-                "Mixed-precision KV staging on this rank: "
+                f"Mixed-precision KV staging ({name}) on this rank: "
                 f"{view.staging_bytes / (1 << 20):.1f} MiB = {view.rows} "
                 f"requests x {view.max_blocks_per_seq} pages x "
                 f"{view.max_page_bytes} B ({layout}, {tokens_per_block} "
                 "tokens per page)",
-                key="mixed_precision_kv_staging")
-            self.mixed_precision_staging = view
+                key=f"{name}_precision_kv_staging")
         view.update(self.request_ids,
                     self.kv_cache_params.num_cached_tokens_per_seq,
                     self.seq_lens.tolist(),
                     capture_graph=self.is_cuda_graph)
         self._on_mixed_precision_kv_prepared(view)
+        return view
 
     def _on_mixed_precision_kv_prepared(
             self, view: "MixedPrecisionKVStaging") -> None:
@@ -403,7 +496,9 @@ class AttentionMetadata:
             self, layer_idx: int) -> Optional["MixedPrecisionKVStaging"]:
         """Return the staging cache of a mixed-precision layer, else None."""
         staging = self.mixed_precision_staging
-        if staging is None or layer_idx not in staging.pools:
+        if (staging is None or layer_idx not in staging.pools
+                or staging.manager is not self.kv_cache_manager):
+            # No staging for a layer without a mixed-precision high pool, or of a manager not in use.
             return None
         return staging
 
@@ -448,7 +543,8 @@ class AttentionMetadata:
 
         if self.mamba_metadata is None:
             if isinstance(self.kv_cache_manager, BaseMambaCacheManager):
-                metadata_cls = self.mamba_metadata_cls
+                metadata_cls = self.mamba_metadata_cls or getattr(
+                    self.kv_cache_manager, "mamba_metadata_cls", None)
                 if metadata_cls is None:
                     from ...modules.mamba.mamba2_metadata import Mamba2Metadata
                     metadata_cls = Mamba2Metadata
@@ -462,17 +558,25 @@ class AttentionMetadata:
 
         self.mamba_metadata.prepare(self)
 
-    def create_cuda_graph_metadata(self,
-                                   max_batch_size: int,
-                                   sub_cross_metadata: bool = False,
-                                   max_draft_tokens: int = 0,
-                                   buffers=None,
-                                   encode_only: bool = False) -> Self:
+    def create_cuda_graph_metadata(
+            self,
+            max_batch_size: int,
+            sub_cross_metadata: bool = False,
+            max_draft_tokens: int = 0,
+            buffers=None,
+            encode_only: bool = False,
+            *,
+            forward_scratch_buffers: Optional[Buffers] = None) -> Self:
         """
         Creates metadata for CUDA graph execution.
         CUDA graphs require to use pre-allocated buffers for all tensors in fields.
         Please do not re-allocate any tensors stored inside AttentionMetadata
         after the initial warmup run when you're using CUDA graphs.
+
+        forward_scratch_buffers belongs to the caller's runner and is shared by
+        its graphs within one forward. Warmup must register capacity before
+        capture; persistent state must not use this pool. The runner releases
+        it in clear(), independently of cuda_graph_buffers.
 
         When encode_only is True, initialize seq_lens as ones(max_batch_size)
         and leave num_contexts at the caller's discretion.
@@ -483,9 +587,15 @@ class AttentionMetadata:
         cuda_graph_metadata = copy.copy(self)
         cuda_graph_metadata.is_cuda_graph = True
         cuda_graph_metadata.cuda_graph_buffers = buffers
+        cuda_graph_metadata.forward_scratch_buffers = forward_scratch_buffers
         if self.has_cross_sub_metadata:
             cuda_graph_metadata.cross = cuda_graph_metadata.cross.create_cuda_graph_metadata(
-                max_batch_size, True, max_draft_tokens, buffers, encode_only)
+                max_batch_size,
+                True,
+                max_draft_tokens,
+                buffers,
+                encode_only,
+                forward_scratch_buffers=forward_scratch_buffers)
         if not sub_cross_metadata:
             # Set to None to force the cuda graph metadata to allocate a tensor
             # with the correct batch size. See seq_lens setter for how this works.
@@ -520,6 +630,30 @@ class AttentionMetadata:
             cuda_graph_metadata.num_contexts = 0
         cuda_graph_metadata.__post_init__()
         return cuda_graph_metadata
+
+    def set_decode_graph_variant(self, name: str, value: Optional[int]) -> None:
+        """Fix a decode graph variant for the CUDA graph this metadata serves.
+
+        A CUDA graph runner that keys its decode graphs by a variant the
+        backend declared (``AttentionBackend.decode_graph_variants``) passes
+        the value of the graph this metadata serves, so the decode captured in
+        the graph behaves as that value says instead of deciding on each call.
+
+        Args:
+            name: The variant's name.
+            value: Its value for this graph; None restores the per-call
+                decision.
+
+        Raises:
+            ValueError: This metadata serves no variant of that name. The base
+                metadata serves none, as its backend declares none.
+        """
+        raise ValueError(
+            f"{type(self).__name__} serves no decode graph variant {name!r}.")
+
+    def decode_graph_variant(self, name: str) -> Optional[int]:
+        """The value set by ``set_decode_graph_variant``; None when unset."""
+        return None
 
     def prepare_for_spec_dec(self, *fields) -> None:
         assert len(self._saved_tensors) == 0, (
@@ -1004,48 +1138,49 @@ AttentionMask = Union[PredefinedAttentionMask, CustomAttentionMask]
 class AttentionForwardArgs:
     """Per-forward optional arguments for attention backends."""
 
+    # Caller-facing output buffer, allocated here when absent. Native kernels
+    # consume the per-phase slice in ``FmhaParams.output``, not this full buffer.
     output: Optional[torch.Tensor] = None
     output_sf: Optional[torch.Tensor] = None
-
-    out_scale: Optional[torch.Tensor] = None
-    out_scale_sf: Optional[torch.Tensor] = None
-    kv_scale_orig_quant: Optional[torch.Tensor] = None
-    kv_scale_quant_orig: Optional[torch.Tensor] = None
-
-    attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL
-    attention_input_type: AttentionInputType = AttentionInputType.mixed
-    attention_window_size: Optional[int] = None
-    attention_mask_data: Optional[torch.Tensor] = None
-    attention_sinks: Optional[torch.Tensor] = None
-    relative_attention_bias: Optional[torch.Tensor] = None
-    relative_attention_max_distance: int = 0
-    cross_kv: Optional[torch.Tensor] = None
-
+    variable_window_token_starts: Optional[torch.Tensor] = cpp_field(
+        dtype=torch.int32)
+    variable_window_token_ends: Optional[torch.Tensor] = cpp_field(
+        dtype=torch.int32)
+    kv_scale_orig_quant: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
+    kv_scale_quant_orig: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
+    out_scale: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
+    out_scale_sf: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
     latent_cache: Optional[torch.Tensor] = None
     q_pe: Optional[torch.Tensor] = None
     mrope_rotary_cos_sin: Optional[torch.Tensor] = None
-    mrope_position_deltas: Optional[torch.Tensor] = None
-
+    mrope_position_deltas: Optional[torch.Tensor] = cpp_field(dtype=torch.int32)
     softmax_stats_tensor: Optional[torch.Tensor] = None
-    chunked_prefill_buffer_batch_size: int = 1
-
-    cu_q_seqlens: Optional[torch.Tensor] = None
-    cu_kv_seqlens: Optional[torch.Tensor] = None
-    fmha_scheduler_counter: Optional[torch.Tensor] = None
-    # Testing only: skip the RoPE step of MLA generation (the standalone harness
-    # feeds a pre-RoPE'd fused_q). The TRTLLM backend then appends the new latent
-    # and inits the trtllm-gen scheduler buffers itself.
-    skip_mla_rope_generation: bool = False
-
-    mla_bmm1_scale: Optional[torch.Tensor] = None
-    mla_bmm2_scale: Optional[torch.Tensor] = None
+    # Output tag: a provider may write compact base-2 LSE into the first half
+    # of the caller's pair-capacity buffer. Other providers retain max/sum.
+    softmax_stats_is_lse: bool = False
+    attention_sinks: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
+    cu_q_seqlens: Optional[torch.Tensor] = cpp_field(dtype=torch.int32)
+    cu_kv_seqlens: Optional[torch.Tensor] = cpp_field(dtype=torch.int32)
+    fmha_scheduler_counter: Optional[torch.Tensor] = cpp_field(
+        dtype=torch.uint32)
+    # Locality domain this call runs against; -1 means the whole batch.
+    locality_domain_id: int = -1
+    mla_bmm1_scale: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
+    mla_bmm2_scale: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
     quant_q_buffer: Optional[torch.Tensor] = None
-    # Per-tensor FP8 scale (fp32 [1]) for the fused DSv4 FP8-Q-quant path.
-    # When non-None alongside `quant_q_buffer`, the C++ op skips
-    # `quantizeCopyInputToFp8Kernel`.
-    quant_scale_qkv: Optional[torch.Tensor] = None
-
-    dsv4_inv_rope_cos_sin_cache: Optional[torch.Tensor] = None
+    cross_kv: Optional[torch.Tensor] = None
+    relative_attention_bias: Optional[torch.Tensor] = None
+    # Caller-quantized FP8 Q for the MLA FP8 context / fused generation paths;
+    # only meaningful together with `quant_q_buffer`. The fused paths that
+    # quantize into `quant_q_buffer` (DSv4 generation / context RoPE) read the
+    # value as the quant scale. The non-sparse FP8 context path reads only the
+    # presence: its FMHA dequantizes Q / K / V with the kv cache scale, so
+    # caller-quantized FP8 `k` / `v` and `quant_q_buffer` must have been
+    # quantized with `kv_scale_orig_quant`, and this tensor must carry that
+    # scale.
+    quant_scale_qkv: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
+    dsv4_inv_rope_cos_sin_cache: Optional[torch.Tensor] = cpp_field(
+        dtype=torch.float32)
     enable_dsv4_epilogue_fusion: bool = False
 
     # Fused kv_a_layernorm, DSv4 sparse context path. When set, `latent_cache` is the
@@ -1054,6 +1189,13 @@ class AttentionForwardArgs:
     kv_norm_weight: Optional[torch.Tensor] = None
     kv_norm_eps: float = 1e-6
 
+    attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL
+    attention_input_type: AttentionInputType = AttentionInputType.mixed
+    attention_window_size: Optional[int] = None
+    attention_mask_data: Optional[torch.Tensor] = cpp_field(dtype=torch.bool)
+    relative_attention_max_distance: int = 0
+    chunked_prefill_buffer_batch_size: int = 1
+    skip_mla_rope_generation: bool = False
     sage_attn_num_elts_per_blk_q: int = 0
     sage_attn_num_elts_per_blk_k: int = 0
     sage_attn_num_elts_per_blk_v: int = 0
@@ -1069,12 +1211,29 @@ class AttentionForwardArgs:
     # E4M3 with one scale each, folded into the softmax and output scales.
     qk_fp8_per_tensor: bool = False
     v_fp8_per_tensor: bool = False
+    # VC-Attention recipe of the PrimTS FMHA library. The caller prepares the
+    # operands (K in grouped token order, V as E4M3 tile residuals with its
+    # scale and means, under QK8 the rotated E4M3 Q and K with their block
+    # scales) and the library runs the matching plan on them.
+    vc_attention: bool = False
+    vc_operands: Optional["VCAttentionOperands"] = None
 
     # Packed QKV for non-MLA attention. MLA always passes a separate query.
     is_fused_qkv: bool = False
     update_kv_cache: bool = True
+    # Attention output gate [num_tokens, ...] offered to the FMHA library: one that multiplies sigmoid(gate) into
+    # the output sets output_gate_applied, and the caller applies the gate otherwise.
+    output_gate: Optional[torch.Tensor] = None
+    output_gate_applied: bool = False
+    # o_proj's static FP8 input scale offered together with output_gate: an FMHA library that applies the gate may
+    # also write the gated output as E4M3 at this scale, byte for byte as o_proj's own static quant would, into
+    # output_fp8 [num_tokens, num_heads * head_dim]; the caller then passes output_fp8 to o_proj (output unwritten).
+    gated_out_scale: Optional[torch.Tensor] = None
+    output_fp8: Optional[torch.Tensor] = None
+    # Paged FP8 query / K / V the caller already wrote for this generation-only call (fmha/gqa_decode.py).
+    kv_append: Optional["KvAppendPlan"] = None
     # Optional normalized diffusion timestep for timestep-varying sparse attention.
-    timestep: Optional[torch.Tensor] = None
+    timestep: Optional[Union[torch.Tensor, float]] = None
     # Dense-prefix (0) or sparse (1) phase of a timestep-scheduled sparse
     # algorithm, resolved on the host by the caller. When set, backends use it
     # instead of reading ``timestep``, which CUDA Graph capture cannot do.
@@ -1085,9 +1244,16 @@ class AttentionForwardArgs:
         default_factory=SparseRuntimeParams)
 
     @property
+    def softmax_stats(self) -> Optional[torch.Tensor]:
+        """Return the written normalizer view, with final width one for base-2 LSE."""
+        stats = self.softmax_stats_tensor
+        if stats is None or not self.softmax_stats_is_lse:
+            return stats
+        return stats.view(-1)[:stats.numel() // 2].view(*stats.shape[:-1], 1)
+
+    @property
     def mask_type(self) -> int:
-        """Integer mask type accepted by the C++ attention op
-        (``causal`` or ``padding``)."""
+        """Return the mask type this forward pass asks the native attention op for."""
         if self.attention_mask == PredefinedAttentionMask.CAUSAL:
             return int(AttentionMaskType.causal)
         if self.attention_mask == PredefinedAttentionMask.FULL:
@@ -1110,23 +1276,19 @@ _ATTENTION_FORWARD_ARGS_FIELDS = frozenset(
 
 
 def merge_attention_forward_args(
-    forward_args: Optional[AttentionForwardArgs],
-    kwargs: Dict[str, Any],
-) -> AttentionForwardArgs:
+        forward_args: Optional[AttentionForwardArgs],
+        kwargs: Dict[str, Any]) -> AttentionForwardArgs:
     """Merge legacy attention kwargs into explicit forward arguments."""
-
     unknown_kwargs = sorted(set(kwargs) - _ATTENTION_FORWARD_ARGS_FIELDS)
     if unknown_kwargs:
         raise ValueError(
             f"Unknown attention forward arguments: {unknown_kwargs}")
-
     if forward_args is not None:
         if kwargs:
             raise ValueError(
                 "Pass attention forward options either through forward_args "
                 f"or as legacy kwargs, not both: {sorted(kwargs)}")
         return forward_args
-
     return AttentionForwardArgs(**kwargs)
 
 
@@ -1167,6 +1329,11 @@ class AttentionBackend(Generic[TMetadata]):
         after self.quant_config is reset.
         """
         self.quant_config = new_quant_config
+
+    def runs_without_host_plan(self, metadata: TMetadata) -> bool:
+        """Whether a forward over ``metadata`` reads all its inputs on the device, so a CUDA graph
+        can capture it without host-side preparation at replay."""
+        return False
 
     def forward(self,
                 q: torch.Tensor,
@@ -1210,6 +1377,27 @@ class AttentionBackend(Generic[TMetadata]):
         return False
 
     @classmethod
+    def decode_graph_variants(
+            cls, *, kv_cache_manager: Any, model: torch.nn.Module,
+            mapping: Mapping, sm_count_fn: Callable[[],
+                                                    int]) -> List[GraphVariant]:
+        """Graph variants the decode CUDA graphs of this backend are keyed by, besides their shape.
+
+        The decoder graph runner asks once, at capture, when the KV cache
+        exists, and keys the graphs by what it gets. The backend's metadata
+        has to serve every variant returned here
+        (``AttentionMetadata.set_decode_graph_variant``). Default: none.
+
+        Args:
+            kv_cache_manager: The KV cache manager of the decode.
+            model: The model whose decode the graphs capture.
+            mapping: The parallel layout of this rank.
+            sm_count_fn: Streaming multiprocessors of the device the graphs
+                replay on, read only when a variant depends on it.
+        """
+        return []
+
+    @classmethod
     def support_multi_item_scoring(cls) -> bool:
         return False
 
@@ -1239,6 +1427,36 @@ class AttentionBackend(Generic[TMetadata]):
         that prefix.
         """
         return True
+
+    @classmethod
+    def runtime_workspace_min_tokens(
+        cls,
+        model_config: "ModelConfig",
+        mapping: Mapping,
+        *,
+        max_num_tokens: int,
+        runtime_features: AttentionRuntimeFeatures,
+    ) -> int:
+        """Minimum tokens priced at ``runtime_workspace_bytes_per_token``.
+
+        The estimator calls this only for a nonzero per-token workspace rate
+        with an admission cap. It subtracts staging actually covered by the
+        profiling peak before reserving additional memory. Backends whose
+        workspace is not chunk-bounded return zero, as does the default.
+        """
+        return 0
+
+    @classmethod
+    def runtime_workspace_profiled_tokens(
+        cls,
+        model_config: "ModelConfig",
+        *,
+        profiled_prompt_len: int,
+        max_num_tokens: int,
+        max_batch_size: int,
+    ) -> int:
+        """Workspace tokens actually staged by the fresh-prefill profiling path."""
+        return 0
 
     @classmethod
     def runtime_workspace_fixed_bytes(

@@ -318,8 +318,8 @@ def _run_one_rank() -> int:
     RANK, WORLD = rank, world
     HOST_GROUP = dist.new_group(backend="gloo")
 
-    from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import allreduce as entry
     from tensorrt_llm._torch.distributed import communicator
+    from tensorrt_llm._torch.modeling_v2.catalog.comm import allreduce as entry
     from tensorrt_llm._utils import torch_pybind11_abi
     from tensorrt_llm.bindings.internal.process_group import init_pg
     from tensorrt_llm.mapping import Mapping

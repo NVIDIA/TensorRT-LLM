@@ -38,7 +38,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     KVCacheManager,
     get_pp_layers,
 )
-from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
+from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, prefer_pinned
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import DataRole
@@ -129,7 +129,8 @@ class MambaState(Protocol):
         conv_states: list[torch.Tensor],
     ) -> None: ...
 
-    def reset_slots(self, slots: torch.Tensor, host_slots: list[int]) -> None: ...
+    def reset_slots(self, slots: torch.Tensor, host_slots: list[int]) -> None:
+        """Reset the state of the context requests in recurrent-state ``slots``."""
 
     def update(self, batch: MambaAcceptanceBatch) -> None: ...
 
@@ -171,6 +172,11 @@ class _PrefixReuseDiagnostics(Protocol):
     def _get_num_reusable_tokens_before_hybrid_pruning(self) -> int: ...
 
     def _get_num_reusable_tokens_before_pruning(self) -> int: ...
+
+
+def _is_disagg_context_server(is_disagg: bool) -> bool:
+    """Whether this worker only serves the context phase of disagg requests."""
+    return is_disagg and os.getenv("TRTLLM_DISAGG_ROLE") == "context"
 
 
 def _get_num_cuda_graph_padding_dummy_slots(
@@ -304,6 +310,16 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
         return self.all_conv_states[self.mamba_layer_offsets[layer_idx]]
 
 
+def _host_slots_to_device(slots: list[int], device: torch.device) -> torch.Tensor:
+    """Copy host slot IDs without synchronizing queued GPU work.
+
+    Each copy uses fresh pinned storage so later host writes cannot race it.
+    """
+    return torch.tensor(
+        slots, dtype=torch.long, pin_memory=device.type == "cuda" and prefer_pinned()
+    ).to(device, non_blocking=True)
+
+
 def _get_mamba_hybrid_pool_size(max_batch_size: int, mapping: Mapping) -> int:
     """Return the internal Mamba state pool size for MixedMambaHybridCacheManager."""
     pool_size = max_batch_size
@@ -323,11 +339,7 @@ def _promote_mamba_state_kernel(
     dst_ptr,
     src_idx_ptr,
     accepted_position_source_ptr,
-    num_accepted_tokens_ptr,
     blk_ptr,
-    replay_pnat_ptr,
-    replay_cache_buf_idx_ptr,
-    dummy_request_mask_ptr,
     num_gens,
     count,
     src_s_layer,
@@ -336,9 +348,6 @@ def _promote_mamba_state_kernel(
     dst_s_layer,
     dst_s_block,
     POSITION_SOURCE_IS_TOKEN_COUNT: tl.constexpr,
-    REPLAY_STEP_WIDTH: tl.constexpr,
-    REPLAY_HISTORY_SIZE: tl.constexpr,
-    UPDATE_REPLAY_BOOKKEEPING: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     # One program copies a BLOCK-sized tile of the contiguous inner state for a
@@ -353,21 +362,6 @@ def _promote_mamba_state_kernel(
         accepted_position -= 1
     acc = accepted_position.to(tl.int64)
     blk = tl.load(blk_ptr + g).to(tl.int64)
-
-    # The replay metadata update is batch-scoped, so layer 0's first copy tile
-    # owns it. This folds PNAT and active-buffer maintenance into the existing
-    # accepted-convolution-state promotion launch.
-    if UPDATE_REPLAY_BOOKKEEPING:
-        if (layer == 0) & (tile == 0):
-            num_accepted_tokens = tl.load(num_accepted_tokens_ptr + g)
-            is_dummy_request = tl.load(dummy_request_mask_ptr + g)
-            pnat = tl.load(replay_pnat_ptr + blk)
-            cache_buf_idx = tl.load(replay_cache_buf_idx_ptr + blk)
-            wrote_checkpoint = pnat + REPLAY_STEP_WIDTH > REPLAY_HISTORY_SIZE
-            next_pnat = tl.where(wrote_checkpoint, num_accepted_tokens, pnat + num_accepted_tokens)
-            next_cache_buf_idx = tl.where(wrote_checkpoint, 1 - cache_buf_idx, cache_buf_idx)
-            tl.store(replay_pnat_ptr + blk, next_pnat, mask=~is_dummy_request)
-            tl.store(replay_cache_buf_idx_ptr + blk, next_cache_buf_idx, mask=~is_dummy_request)
 
     # int64 throughout: per-layer strides are O(1e8), so layer*stride overflows
     # int32 and would corrupt addresses / fault.
@@ -385,13 +379,7 @@ def _promote_mamba_state_triton(
     src_state_indices: torch.Tensor,
     accepted_position_source: torch.Tensor,
     dst_state_indices: torch.Tensor,
-    num_accepted_tokens: Optional[torch.Tensor] = None,
     position_source_is_token_count: bool = False,
-    replay_pnat: Optional[torch.Tensor] = None,
-    replay_cache_buf_idx: Optional[torch.Tensor] = None,
-    dummy_request_mask: Optional[torch.Tensor] = None,
-    replay_step_width: int = 0,
-    replay_history_size: int = 0,
     BLOCK: int = 2048,
 ) -> None:
     """Scatter each generation request's accepted draft-step recurrent state
@@ -408,15 +396,10 @@ def _promote_mamba_state_triton(
         intermediate: ``[num_layers, max_batch_size, T, *state_shape]`` dense.
         src_state_indices, accepted_position_source, dst_state_indices:
             ``[num_gens]`` int.
-        num_accepted_tokens: ``[num_gens]`` accepted-token counts. Required
-            when replay bookkeeping is enabled.
         position_source_is_token_count: Whether ``accepted_position_source``
             contains accepted-token counts instead of zero-based intermediate
             state positions. When true, the kernel subtracts one while
             computing the source position.
-        replay_pnat, replay_cache_buf_idx, dummy_request_mask: Optional replay
-            metadata. When supplied together, the kernel advances PNAT and the
-            active history buffer while promoting the convolution state.
 
     For each gen ``g``::
 
@@ -433,25 +416,6 @@ def _promote_mamba_state_triton(
     num_gens = src_state_indices.shape[0]
     if num_gens == 0:
         return
-    update_replay_bookkeeping = replay_pnat is not None
-    if update_replay_bookkeeping:
-        assert num_accepted_tokens is not None
-        assert replay_cache_buf_idx is not None
-        assert dummy_request_mask is not None
-        assert replay_step_width > 0
-        assert replay_history_size >= replay_step_width
-        assert replay_pnat.dtype == torch.int32
-        assert replay_cache_buf_idx.dtype == torch.int32
-        assert dummy_request_mask.dtype == torch.bool
-        assert dummy_request_mask.numel() >= num_gens
-    else:
-        # Compile-time-disabled pointer arguments still require tensors.
-        num_accepted_tokens = accepted_position_source
-        assert replay_cache_buf_idx is None
-        assert dummy_request_mask is None
-        replay_pnat = dst_state_indices
-        replay_cache_buf_idx = dst_state_indices
-        dummy_request_mask = dst_state_indices
     count = 1
     for s in dst.shape[2:]:
         count *= s
@@ -466,11 +430,7 @@ def _promote_mamba_state_triton(
         dst,
         src_state_indices,
         accepted_position_source,
-        num_accepted_tokens,
         dst_state_indices,
-        replay_pnat,
-        replay_cache_buf_idx,
-        dummy_request_mask,
         num_gens,
         count,
         intermediate.stride(0),
@@ -479,9 +439,6 @@ def _promote_mamba_state_triton(
         dst.stride(0),
         dst.stride(1),
         POSITION_SOURCE_IS_TOKEN_COUNT=position_source_is_token_count,
-        REPLAY_STEP_WIDTH=replay_step_width,
-        REPLAY_HISTORY_SIZE=replay_history_size,
-        UPDATE_REPLAY_BOOKKEEPING=update_replay_bookkeeping,
         BLOCK=BLOCK,
     )
 
@@ -585,8 +542,17 @@ def _estimate_mamba_hybrid_cache_cost(
     extra_state_bytes_per_rank: int = 0,
     is_draft: bool = False,
     use_separate_draft_kv_cache: bool = False,
+    attention_slope_override: Optional[int] = None,
+    attention_page_bytes_override: int = 0,
+    draft_scratch_tokens: int = 0,
     **kwargs,
 ) -> Tuple[int, int]:
+    """Return the hybrid cache's (bytes per token, fixed bytes) estimate.
+
+    ``draft_scratch_tokens`` is the capacity each request holds beyond its
+    history for a drafter whose layers share the manager; it is charged to the
+    attention layers here, and the caller charges the draft layers.
+    """
     spec_config = kwargs.get("spec_config")
     params, local_mamba_layers, local_attention_layers = _get_local_mamba_cache_layout(
         model_config,
@@ -595,19 +561,23 @@ def _estimate_mamba_hybrid_cache_cost(
         is_draft=is_draft,
         use_separate_draft_kv_cache=use_separate_draft_kv_cache,
     )
-    attention_slope = (
-        KVCacheManager.get_cache_size_per_token(
-            model_config,
-            mapping,
-            num_layers=local_attention_layers,
-            **kwargs,
+    attention_slope = attention_slope_override
+    if attention_slope is None:
+        attention_slope = (
+            KVCacheManager.get_cache_size_per_token(
+                model_config,
+                mapping,
+                num_layers=local_attention_layers,
+                **kwargs,
+            )
+            if local_attention_layers > 0
+            else 0
         )
-        if local_attention_layers > 0
-        else 0
-    )
     state_bytes_per_rank = local_mamba_layers * params.get_states_bytes_per_layer(mapping)
     state_bytes_per_rank += extra_state_bytes_per_rank
-    max_resident_sequences = max_batch_size * mapping.pp_size
+    max_resident_sequences = max_batch_size * mapping.pp_size + int(
+        kwargs.get("gen_preemption_headroom", 0)
+    )
 
     if include_explicit_snapshots:
         fixed_rules, unaligned_fixed_rules = _mamba_snapshot_rule_counts(
@@ -631,8 +601,11 @@ def _estimate_mamba_hybrid_cache_cost(
         partial_attention_slots = max_resident_sequences if has_non_live_ssm_capacity else 0
     else:
         partial_attention_slots = max_resident_sequences * unaligned_fixed_rules
-    intercept = (
-        fixed_state_slots * state_bytes_per_rank + partial_attention_slots * attention_block_bytes
+    # attention_page_bytes_override adds the per-sequence attention state
+    # that a retained partial page also pins (an attention layout's ring of
+    # recent tokens).
+    intercept = fixed_state_slots * state_bytes_per_rank + partial_attention_slots * (
+        attention_block_bytes + attention_page_bytes_override
     )
 
     if interval is None:
@@ -641,6 +614,7 @@ def _estimate_mamba_hybrid_cache_cost(
         regular_slope = math.ceil(state_bytes_per_rank / interval)
         if has_unaligned_periodic_snapshot and not cap_partial_attention_snapshots:
             regular_slope += math.ceil(attention_block_bytes / interval)
+    intercept += max_batch_size * draft_scratch_tokens * attention_slope
     return attention_slope + regular_slope, intercept
 
 
@@ -708,7 +682,7 @@ def _promote_intermediate_states(
 ) -> None:
     """Copy accepted positions from [layer, batch, step, ...] into per-layer pools."""
     # Preserve the established kernel monkeypatch point without coupling the
-    # concrete intermediate and replay algorithms through inheritance.
+    # model-owned recurrent states through inheritance.
     from tensorrt_llm._torch.pyexecutor.kv_cache import mamba_cache_manager
 
     if stacked is not None:

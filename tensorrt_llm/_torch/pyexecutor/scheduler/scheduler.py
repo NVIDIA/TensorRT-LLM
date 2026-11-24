@@ -30,6 +30,7 @@ from ..llm_request import (
     get_mm_items_for_chunk,
     get_mm_pending_items,
     make_mm_encoder_transient_cache_key,
+    release_consumed_mm_items,
 )
 
 RequestList = list[LlmRequest]
@@ -125,11 +126,11 @@ class SchedulerOutput(
 
 def is_decoder_context_request_waiting_for_encoder_output(req: LlmRequest) -> bool:
     """Return whether decoder-context scheduling is blocked on encoder output."""
-    if not req.is_context_init_state:
-        return False
-
+    # The attribute is unset outside encoder-decoder models; read it before the state binding.
     ready_event = getattr(req, "py_encoder_output_ready_event", None)
-    return ready_event is not None and not ready_event.query()
+    if ready_event is None or not req.is_context_init_state:
+        return False
+    return not ready_event.query()
 
 
 def drop_decoder_context_requests_waiting_for_encoder_output(
@@ -173,13 +174,49 @@ def _get_lora_task_id(req: LlmRequest):
     return (1, lora_id)
 
 
-def _get_forced_context_chunk_size(req: LlmRequest) -> int:
-    next_point = min(
-        (point for point in req.expect_snapshot_points if point > req.context_current_position),
-        default=None,
+def _is_midchunk_snapshot_point(req: LlmRequest, point: int) -> bool:
+    """Whether the cache manager takes the snapshot at ``point`` inside a context step.
+
+    The cache manager sets ``py_midchunk_snapshot_alignment`` when it can store
+    a recurrent-state snapshot at a point inside the step, for the last
+    snapshot point and only at that alignment relative to the step start.
+    """
+    alignment = getattr(req, "py_midchunk_snapshot_alignment", None)
+    return (
+        isinstance(alignment, int)
+        and point < req.prompt_len
+        and point == max(req.expect_snapshot_points)
+        and (point - req.context_current_position) % alignment == 0
     )
-    if next_point is None:
+
+
+def _is_midchunk_pass_point(req: LlmRequest, point: int) -> bool:
+    """Whether a context step may pass the snapshot point ``point``.
+
+    The cache manager sets ``py_midchunk_pass_point`` to a point (not the last
+    one) whose snapshot it can take inside a context step. A step holds at
+    most one such snapshot.
+    """
+    alignment = getattr(req, "py_midchunk_snapshot_alignment", None)
+    return (
+        isinstance(alignment, int)
+        and point == getattr(req, "py_midchunk_pass_point", None)
+        and point < req.prompt_len
+        and (point - req.context_current_position) % alignment == 0
+    )
+
+
+def _get_forced_context_chunk_size(req: LlmRequest) -> int:
+    later_points = sorted(
+        point for point in req.expect_snapshot_points if point > req.context_current_position
+    )
+    if not later_points or _is_midchunk_snapshot_point(req, later_points[0]):
         return req.context_remaining_length
+    next_point = later_points[0]
+    if len(later_points) > 1 and _is_midchunk_pass_point(req, next_point):
+        # The snapshot at the next point is taken inside the step, which ends
+        # at the following point at the latest.
+        next_point = later_points[1]
     next_position = min(next_point, req.prompt_len)
     return max(0, next_position - req.context_current_position)
 
@@ -190,11 +227,12 @@ def _is_forced_context_chunk_boundary(req: LlmRequest, chunk_size: int) -> bool:
 
 
 class RemoteTailPhase(Enum):
-    """Fleet-wide GEN phase for conditional disaggregation with attention DP."""
+    """Fleet-wide GEN admission for remote-tail attention DP."""
 
     NONE = "none"
     CONTEXT = "context"
     DECODE = "decode"
+    MIXED = "mixed"
 
 
 class ScheduledRequests:
@@ -233,6 +271,9 @@ class ScheduledRequests:
     """Maps a request id to the prompt-ordered indices of its multimodal items
     selected for encoder execution this iteration (only items whose encoder
     outputs are still missing). ``None`` when no items were scheduled."""
+    paused_in_place_ids: frozenset[int]
+    """Generation requests paused in place or displaced by a forced resume:
+    left out of this batch, but their drafter state must be kept."""
 
     def __init__(self):
         self.attention_dp_phase: RemoteTailPhase | None = None
@@ -245,6 +286,7 @@ class ScheduledRequests:
         self.recompute_paused_requests: RequestList = []
         self.added_inflight_req_ids: list[int] = []
         self.scheduled_mm_encoder_items: dict[int, list[int]] | None = None
+        self.paused_in_place_ids: frozenset[int] = frozenset()
 
     @property
     def is_generation_only(self) -> bool:
@@ -371,6 +413,52 @@ class RequestScheduler(ABC):
         Only schedulers that allocate KV cache while scheduling have anything
         to release; the default is a no-op.
         """
+
+    def take_lost_kv_requests(self) -> list[tuple[LlmRequest, str]]:
+        """Requests whose KV pages a failed remote cache level took, which the
+        executor must fail, with their error messages.
+
+        Only the KV cache manager V2 scheduler loses pages this way; the
+        default has none.
+        """
+        return []
+
+    def set_disagg_transfer_admission_controller(self, controller) -> None:
+        """Register the executor's disaggregated KV-transfer window
+        (DisaggTransferAdmissionController), when it bounds admission.
+
+        Only schedulers that allocate KV cache while scheduling use it, to skip
+        the generation-init requests the window would defer; the default is a
+        no-op.
+        """
+
+    def set_retiring_gen_receives_probe(self, probe: Callable[[], bool]) -> None:
+        """Register a live probe for rank-local receive resources being retired.
+
+        Only schedulers with transfer-aware deadlock detection use it; the
+        default is a no-op.
+
+        Args:
+            probe: Whether cancelled receives still retain local resources.
+        """
+
+    def set_async_transfer_manager(self, mgr) -> None:
+        """Register the executor's AsyncTransferManager, which owns the KV
+        pages of finished disaggregated sends until they land.
+
+        Only schedulers with transfer-aware deadlock detection use it; the
+        default is a no-op.
+        """
+
+    @property
+    def ctx_demote_uncached_tokens(self) -> int:
+        """Long-prefill demotion threshold in uncached tokens; 0 (the default) when off."""
+        return 0
+
+    def take_decision_counters(self) -> tuple[int, int, int, int]:
+        """Return and reset the holds since the last call: gen-init cap, gen-init transfer budget,
+        decoder-tail hold passes, and requests whose final window was held."""
+        return (0, 0, 0, 0)
 
 
 @dataclass
@@ -551,6 +639,9 @@ class BindMicroBatchScheduler(MicroBatchScheduler):
 
         ctx_chunk_config_cpp = None
         if ctx_chunk_config is not None:
+            _check_forced_chunk_context_limit(
+                ctx_chunk_config[0], ctx_chunk_config[1], max_num_tokens
+            )
             ctx_chunk_config_cpp = tb_internal.batch_manager.ContextChunkingConfig(
                 ctx_chunk_config[0]._to_pybind(), ctx_chunk_config[1]
             )
@@ -719,6 +810,30 @@ class MultimodalScheduler(RequestScheduler):
     @property
     def scheduling_state_range(self) -> tuple[LlmRequestState, LlmRequestState]:
         return self.scheduler.scheduling_state_range
+
+    def set_disagg_transfer_admission_controller(self, controller) -> None:
+        self.scheduler.set_disagg_transfer_admission_controller(controller)
+
+    def take_lost_kv_requests(self) -> list[tuple[LlmRequest, str]]:
+        return self.scheduler.take_lost_kv_requests()
+
+    def set_retiring_gen_receives_probe(self, probe: Callable[[], bool]) -> None:
+        """Forward the local retirement probe to the wrapped scheduler.
+
+        Args:
+            probe: Whether cancelled receives still retain local resources.
+        """
+        self.scheduler.set_retiring_gen_receives_probe(probe)
+
+    def set_async_transfer_manager(self, mgr) -> None:
+        self.scheduler.set_async_transfer_manager(mgr)
+
+    @property
+    def ctx_demote_uncached_tokens(self) -> int:
+        return self.scheduler.ctx_demote_uncached_tokens
+
+    def take_decision_counters(self) -> tuple[int, int, int, int]:
+        return self.scheduler.take_decision_counters()
 
     def _new_encoder_step(self) -> _MultimodalEncoderStep:
         return _MultimodalEncoderStep(
@@ -1090,6 +1205,9 @@ class MultimodalScheduler(RequestScheduler):
         """
         ready_context_requests: RequestList = []
         protected_items: set[tuple[int, int]] = set()
+        # KV reuse can start a prefill past outputs that were bound while it was at zero.
+        for chunk in chunks:
+            release_consumed_mm_items(chunk.request, self.encoder_cache)
         for chunk in chunks:
             request = chunk.request
             state = request.py_mm_encoder_state
@@ -1307,6 +1425,47 @@ class ContextChunkingConfig:
     chunk_unit_size: int
 
 
+def _to_chunking_policy(policy: Any) -> ChunkingPolicy:
+    """Return the ``ChunkingPolicy`` for a policy given in any of its representations.
+
+    The executor hands the schedulers a ``ContextChunkingPolicy`` (llmapi StrEnum);
+    callers may also pass a ``ChunkingPolicy``, the C++ binding enum or a string,
+    so the name is matched rather than the object. Unknown names fall back to
+    FIRST_COME_FIRST_SERVED.
+    """
+    if isinstance(policy, ChunkingPolicy):
+        return policy
+    name = str(policy)
+    if "EQUAL_PROGRESS" in name:
+        return ChunkingPolicy.EQUAL_PROGRESS
+    if "FORCE_CHUNK" in name:
+        return ChunkingPolicy.FORCE_CHUNK
+    return ChunkingPolicy.FIRST_COME_FIRST_SERVED
+
+
+def _check_forced_chunk_context_limit(
+    policy: Any, chunk_unit_size: int, max_num_tokens: Optional[int]
+) -> None:
+    """Reject a ``max_num_tokens`` below one FORCE_CHUNK unit.
+
+    ``max_num_tokens`` is the schedulers' context-length limit. They reject such
+    a limit on every context request (see ``_chunk_forced`` and
+    ``microBatchScheduler.cpp``), so the configuration is rejected when the
+    scheduler is created instead.
+    """
+    if _to_chunking_policy(policy) != ChunkingPolicy.FORCE_CHUNK or max_num_tokens is None:
+        return
+    if max_num_tokens < chunk_unit_size:
+        raise ValueError(
+            f"max_num_tokens ({max_num_tokens}) must be at least the "
+            f"FORCE_CHUNK context chunk unit ({chunk_unit_size}). Increase "
+            "max_num_tokens. FORCE_CHUNK is selected for a hybrid linear-attention "
+            "model with kv_cache_config.enable_block_reuse, with the KV cache block "
+            "size as the unit; otherwise it comes from "
+            "scheduler_config.context_chunking_policy."
+        )
+
+
 class MicroBatchScheduler:
     """Base class to match structure."""
 
@@ -1340,6 +1499,10 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
         self.max_num_tokens = max_num_tokens
         self.ctx_chunk_config = ctx_chunk_config
         self.max_context_length = max_num_tokens
+        if ctx_chunk_config is not None:
+            _check_forced_chunk_context_limit(
+                ctx_chunk_config.chunking_policy, ctx_chunk_config.chunk_unit_size, max_num_tokens
+            )
         # Match C++ MicroBatchScheduler defaults (see algorithms.cpp line 68-70)
         self.no_schedule_until_state = no_schedule_until_state
         self.no_schedule_after_state = no_schedule_after_state
@@ -2798,19 +2961,9 @@ class SimpleUnifiedScheduler(RequestScheduler):
         # 2. Initialize Python MicroBatch Scheduler
         py_chunk_config = None
         if ctx_chunk_config:
-            # Fix: Use string comparison to identify the policy.
-            # This works regardless of whether the input is a Python Enum, C++ Binding Enum, or String.
-            input_policy = ctx_chunk_config[0]
-
-            if "EQUAL_PROGRESS" in str(input_policy):
-                policy_enum = ChunkingPolicy.EQUAL_PROGRESS
-            elif "FORCE_CHUNK" in str(input_policy):
-                policy_enum = ChunkingPolicy.FORCE_CHUNK
-            else:
-                # Default to FCFS for FIRST_COME_FIRST_SERVED or others
-                policy_enum = ChunkingPolicy.FIRST_COME_FIRST_SERVED
-
-            py_chunk_config = ContextChunkingConfig(policy_enum, ctx_chunk_config[1])
+            py_chunk_config = ContextChunkingConfig(
+                _to_chunking_policy(ctx_chunk_config[0]), ctx_chunk_config[1]
+            )
 
         self.micro_batch_scheduler = PyMicroBatchScheduler(
             max_batch_size=max_batch_size,

@@ -92,12 +92,6 @@ def test_output_config_pickle():
     assert additional_model_output.gather_context == True
 
 
-def test_prompt_tuning_config():
-    embedding_table = torch.ones(100, 64)
-    config = trtllm.PromptTuningConfig(embedding_table)
-    assert (config.embedding_table == embedding_table).all()
-
-
 @pytest.mark.cpu_only
 def test_multimodal_input():
     multimodal_hashes = [[1, 2, 3], [4, 5, 6]]
@@ -288,7 +282,6 @@ def test_request():
         "bad_words": [[4, 5, 6]],
         "stop_words": [[7, 8, 9]],
         "embedding_bias": torch.ones(1),
-        "prompt_tuning_config": trtllm.PromptTuningConfig(torch.ones(100, 64)),
         "lora_config": trtllm.LoraConfig(1),
         "client_id": 1234,
     }
@@ -302,18 +295,16 @@ def test_request():
                 assert attr_value == v
     assert isinstance(request.sampling_config, trtllm.SamplingConfig)
     assert isinstance(request.output_config, trtllm.OutputConfig)
-    assert isinstance(request.prompt_tuning_config, trtllm.PromptTuningConfig)
-    assert (request.prompt_tuning_config.embedding_table == torch.ones(
-        100, 64)).all()
     assert isinstance(request.lora_config, trtllm.LoraConfig)
+    assert not hasattr(request, "prompt_tuning_config")
+    with pytest.raises(TypeError, match="incompatible function arguments"):
+        trtllm.Request(**kwargs, prompt_tuning_config=None)
 
 
 def test_result():
     result = trtllm.Result()
     result.is_final = True
     result.output_token_ids = [[1, 2, 3]]
-    result.cum_log_probs = [1.0, 2.0, 3.0]
-    result.log_probs = [[1.0, 2.0, 3.0]]
     result.finish_reasons = [trtllm.FinishReason.LENGTH]
     result.sequence_index = 1
     result.is_sequence_final = True
@@ -323,8 +314,6 @@ def test_result():
     result.request_perf_metrics.last_iter = 33
     assert result.is_final is True
     assert result.output_token_ids == [[1, 2, 3]]
-    assert result.cum_log_probs == [1.0, 2.0, 3.0]
-    assert result.log_probs == [[1.0, 2.0, 3.0]]
     assert result.finish_reasons == [trtllm.FinishReason.LENGTH]
     assert result.sequence_index == 1
     assert result.is_sequence_final is True
@@ -338,8 +327,6 @@ def test_result_pickle():
     result = trtllm.Result()
     result.is_final = True
     result.output_token_ids = [[1, 2, 3]]
-    result.cum_log_probs = [1.0, 2.0, 3.0]
-    result.log_probs = [[1.0, 2.0, 3.0]]
     result.finish_reasons = [trtllm.FinishReason.LENGTH]
     result.sequence_index = 1
     result.is_sequence_final = True
@@ -350,12 +337,13 @@ def test_result_pickle():
                             1]), [10, 20, 30], 1, "disagg_info_endpoint_24680")
     result.request_perf_metrics = trtllm.RequestPerfMetrics()
     result.request_perf_metrics.last_iter = 33
+    assert len(result.__getstate__()) == 9
+    assert not hasattr(result, "cum_log_probs")
+    assert not hasattr(result, "log_probs")
     result_str = pickle.dumps(result)
     result_copy = pickle.loads(result_str)
     assert result.is_final == result_copy.is_final
     assert result.output_token_ids == result_copy.output_token_ids
-    assert result.cum_log_probs == result_copy.cum_log_probs
-    assert result.log_probs == result_copy.log_probs
     assert result.finish_reasons == result_copy.finish_reasons
     assert result.sequence_index == result_copy.sequence_index
     assert result.is_sequence_final == result_copy.is_sequence_final
@@ -368,6 +356,15 @@ def test_result_pickle():
     assert result.context_phase_params.ctx_dp_rank == result_copy.context_phase_params.ctx_dp_rank
     assert result.context_phase_params.disagg_info_endpoint == result_copy.context_phase_params.disagg_info_endpoint
     assert result.request_perf_metrics.last_iter == result_copy.request_perf_metrics.last_iter
+
+
+@pytest.mark.cpu_only
+def test_result_rejects_retired_pickle_layout() -> None:
+    state = trtllm.Result().__getstate__()
+    old_state = (*state[:2], None, None, *state[2:])
+    restored = trtllm.Result.__new__(trtllm.Result)
+    with pytest.raises(RuntimeError, match="Invalid Result state"):
+        restored.__setstate__(old_state)
 
 
 @pytest.mark.cpu_only
@@ -1032,7 +1029,10 @@ def test_request_pickle():
                              max_tokens=5,
                              streaming=False,
                              client_id=123,
-                             sampling_config=samplingConfig)
+                             sampling_config=samplingConfig,
+                             cache_salt="request-pickle",
+                             priority=0.75,
+                             disagg_request_id=456)
     request_copy = pickle.loads(pickle.dumps(request))
 
     assert request.sampling_config.beam_width == request_copy.sampling_config.beam_width
@@ -1044,3 +1044,7 @@ def test_request_pickle():
     assert request.output_config.return_log_probs == request_copy.output_config.return_log_probs
     assert request.guided_decoding_params == request_copy.guided_decoding_params
     assert request.kv_cache_retention_config == request_copy.kv_cache_retention_config
+    assert request_copy.client_id == 123
+    assert request_copy.priority == 0.75
+    assert request_copy.disagg_request_id == 456
+    assert request_copy.cache_salt == "request-pickle"

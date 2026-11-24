@@ -46,9 +46,11 @@ import pytest
 import requests
 import yaml
 from defs.common import get_free_port_in_ci, parse_gsm8k_output
-from defs.conftest import get_device_count, get_device_memory, llm_models_root
+from defs.conftest import (get_device_count, get_device_memory, get_sm_version,
+                           is_sm_100f, is_sm_120f, llm_models_root)
 from defs.trt_test_alternative import (Popen, cleanup_process_tree, print_info,
                                        print_warning)
+from test_common.moe_tactics import fp8_block_scales_moe_tactic
 
 # Install aiperf in requirements-dev.txt will affect triton and pytorch version mismatch
 # def aiperf_install():
@@ -458,6 +460,11 @@ def is_port_available(port: int,
         ModelConfig(model_dir="DeepSeek-R1/DeepSeek-R1-0528-FP4",
                     tp_size=4,
                     memory_requirement=172032),
+        # Configuration for Muse Spark Open with NVFP4 checkpoints (4 GPU setup, requires GB300 288GB)
+        # memory_requirement is in MiB (192 GB = 196608 MiB)
+        ModelConfig(model_dir="Muse-Spark-Open-816B-A42B-NVFP4",
+                    tp_size=4,
+                    memory_requirement=196608),
     ],
     ids=lambda x: f"{os.path.basename(x.model_dir)}_tp{x.tp_size}")
 def test_run_stress_test(config, stress_time_timeout, capacity_scheduler_policy,
@@ -553,11 +560,13 @@ def stress_test(config,
     if run_performance:
         performance_config = PerformanceParams()
 
-        # For DeepSeek-V3 or DeepSeek-R1 specific parameters
-        if "DeepSeek-V3" in config.model_dir or "DeepSeek-R1" in config.model_dir:
+        # For DeepSeek-V3, DeepSeek-R1 or Muse Spark Open specific parameters
+        if ("DeepSeek-V3" in config.model_dir
+                or "DeepSeek-R1" in config.model_dir
+                or "Muse-Spark-Open" in config.model_dir):
             performance_config = PerformanceParams(
                 test_timeout=
-                36000  # 10 hours for DeepSeek-V3 or DeepSeek-R1, change this value if needed
+                36000  # 10 hours for large MoE models, change this value if needed
             )
 
     # For DeepSeek-V3 or DeepSeek-R1 specific server parameters
@@ -582,6 +591,24 @@ def stress_test(config,
             wait_interval=test_server_config.wait_interval,
             max_wait_seconds=
             28800,  # DeepSeek-V3 or DeepSeek-R1 specific wait time (8 hours)
+            health_check_timeout=test_server_config.health_check_timeout)
+
+    # Muse Spark Open server parameters: its single-node GB300 serving recipe
+    # (TP4/EP4), with a 0.4 KV cache fraction for the stress load
+    if "Muse-Spark-Open" in config.model_dir:
+        os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+        test_server_config = ServerConfig(
+            port=test_server_config.port,
+            host=test_server_config.host,
+            pp_size=test_server_config.pp_size,
+            ep_size=config.tp_size,  # TP4/EP4 on one GB300 node
+            max_batch_size=256,
+            max_num_tokens=8192,
+            kv_cache_free_gpu_memory_fraction=0.4,
+            capacity_scheduler_policy=test_server_config.
+            capacity_scheduler_policy,
+            wait_interval=test_server_config.wait_interval,
+            max_wait_seconds=7200,  # loading the checkpoint can take ~30 min
             health_check_timeout=test_server_config.health_check_timeout)
 
     # Create a StressTestConfig with customized time parameters if provided
@@ -641,39 +668,66 @@ def stress_test(config,
 
         extra_llm_options["enable_attention_dp"] = True
 
-        # Set MOE backend based on GPU architecture and checkpoint type
-        # B200/GB200 (Blackwell, SM100+) with FP8 checkpoints: use DEEPGEMM backend
-        # B200/GB200 (Blackwell, SM100+) with NVFP4 checkpoints: use CUTEDSL backend
-        # H100/H200 (Hopper, SM90) with FP8 checkpoints: use CUTLASS backend (default)
-        try:
-            import torch
-            if torch.cuda.is_available():
-                device_capability = torch.cuda.get_device_capability(0)
-                is_blackwell = device_capability[0] >= 10
-                is_nvfp4 = "FP4" in config.model_dir.upper()
+        # Pin the MoE tactic per GPU family and checkpoint type:
+        # SM100 family (B200/GB200/B300/GB300): CuteDSL grouped GEMM for NVFP4,
+        #   DeepGEMM grouped GEMM for FP8 block scales;
+        # SM120 family with NVFP4: CUTLASS (the b12x kernels do not support
+        #   the attention DP and expert parallelism set above);
+        # any other case (Hopper, SM120 family with FP8): the default AUTO
+        #   selection.
+        sm_version = get_sm_version()
+        is_nvfp4 = "FP4" in config.model_dir.upper()
+        moe_tactic = None
+        if is_sm_100f(sm_version):
+            moe_tactic = ("cutedsl.grouped_gemm"
+                          if is_nvfp4 else fp8_block_scales_moe_tactic())
+        elif is_sm_120f(sm_version) and is_nvfp4:
+            moe_tactic = "cutlass"
 
-                if is_blackwell:
-                    if is_nvfp4:
-                        moe_backend = "CUTEDSL"
-                    else:
-                        moe_backend = "DEEPGEMM"
-
-                    extra_llm_options["moe_config"] = {
-                        "backend": moe_backend,
-                    }
-                    checkpoint_type = "NVFP4" if is_nvfp4 else "FP8"
-                    print_info(
-                        f"Detected GPU architecture is SM{device_capability[0]}{device_capability[1]} (Blackwell), "
-                        f"using {moe_backend} MOE backend for DeepSeek-R1/DeepSeek-V3 with {checkpoint_type} checkpoints"
-                    )
-        except Exception as e:
-            print_warning(f"Failed to detect GPU architecture: {e}. "
-                          "Using default MOE backend (CUTLASS).")
+        if moe_tactic is not None:
+            extra_llm_options["moe_config"] = {
+                "tactic": moe_tactic,
+            }
+            checkpoint_type = "NVFP4" if is_nvfp4 else "FP8"
+            print_info(
+                f"Detected GPU architecture is SM{sm_version}, "
+                f"using MoE tactic {moe_tactic} for DeepSeek-R1/DeepSeek-V3 with {checkpoint_type} checkpoints"
+            )
 
         extra_llm_options.update({
             "cuda_graph_config": {
                 "enable_padding": True,
                 "batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
+            },
+            "print_iter_log": True,
+        })
+
+    # Muse Spark Open LLM-API options for the same recipe (tp/ep/batch/token/
+    # kv-fraction values are passed on the CLI instead)
+    if "Muse-Spark-Open" in config.model_dir:
+        extra_llm_options.update({
+            "max_seq_len": 49152,
+            "trust_remote_code": True,
+            "enable_chunked_prefill": True,
+            "disable_overlap_scheduler": False,
+            "attn_backend": "TRTLLM",
+            "allreduce_strategy": "NCCL",
+            "guided_decoding_backend": "xgrammar",
+            "cuda_graph_config": {
+                "max_batch_size": 256,
+                "enable_padding": True,
+            },
+            "moe_config": {
+                "tactic": "trtllm_gen",
+            },
+            "kv_cache_config": {
+                # FP8 KV cache is required on SM103 when chunked prefill or
+                # block reuse is enabled (head-dimension-64 paged-context
+                # FMHA constraint).
+                "dtype": "fp8",
+                "enable_block_reuse": True,
+                "enable_partial_reuse": True,
+                "free_gpu_memory_fraction": 0.4,
             },
             "print_iter_log": True,
         })
@@ -796,6 +850,7 @@ def stress_test(config,
 
             # Run baseline accuracy test first if enabled
             baseline_accuracy_success = True
+            baseline_accuracy_value = None
             if stress_config and stress_config.enable_accuracy_test:
                 baseline_accuracy_success, baseline_accuracy_value = run_accuracy_test(
                     model_path, test_server_config, stress_config, "baseline")
@@ -1198,16 +1253,21 @@ def stress_stage(model_name,
         request_count = int(stress_request_rate * stress_time)
         test_timeout = stress_config.stress_timeout
 
-    # Cap request count for large MoE models (DeepSeek-V3/R1) to prevent timeout
-    if "DeepSeek-V3" in model_path or "DeepSeek-R1" in model_path:
-        max_sustainable_rate = 3.0  # req/s - conservative estimate
+    # Cap request count for large MoE models to prevent timeout
+    if ("DeepSeek-V3" in model_path or "DeepSeek-R1" in model_path
+            or "Muse-Spark-Open" in model_path):
+        if "Muse-Spark-Open" in model_path:
+            # The rate cap keeps the stress stage near its nominal duration
+            # without risking the timeout.
+            max_sustainable_rate = 30.0  # req/s
+        else:
+            max_sustainable_rate = 3.0  # req/s - conservative estimate
         max_request_count = int(max_sustainable_rate *
                                 stress_config.stress_time)
         if request_count > max_request_count:
             print_info(
                 f"Capping request_count from {request_count} to {max_request_count} "
-                f"for DeepSeek V3/R1 model (sustainable rate: {max_sustainable_rate} req/s)"
-            )
+                f"(sustainable rate: {max_sustainable_rate} req/s)")
             request_count = max_request_count
 
     print_info(

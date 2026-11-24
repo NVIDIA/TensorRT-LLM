@@ -27,6 +27,8 @@ from tensorrt_llm._torch.pyexecutor.kv_cache_events import (
 )
 from tensorrt_llm.llmapi.llm_args import KVEventsConfig
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _unused_tcp_port() -> int:
     with socket.socket() as sock:

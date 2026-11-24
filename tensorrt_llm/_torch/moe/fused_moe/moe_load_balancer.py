@@ -4,9 +4,10 @@
 import gc
 import os
 import threading
+from abc import ABC, abstractmethod
 from contextlib import AbstractContextManager, nullcontext
 from multiprocessing import resource_tracker, shared_memory
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -21,6 +22,11 @@ from tensorrt_llm._torch.utils import EventType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.model_config import ModelConfig
+
+    from .moe_warmup_placement import WarmupPlacementController
+
 
 def _tensor_to_weight(t: torch.Tensor) -> _tbr.MoeWeight:
     """
@@ -29,7 +35,16 @@ def _tensor_to_weight(t: torch.Tensor) -> _tbr.MoeWeight:
     Args:
         t: The tensor to convert
     """
-    assert t.dim() <= 2, "t.dim() should be less than or equal to 2"
+    if t.dim() > 2:
+        # MoeWeight is a 2D (height, width, pitch) cudaMemcpy2D descriptor, so a
+        # higher-rank weight -- e.g. a TRTLLM-Gen BlockMajorK expert weight,
+        # [K / blockK, Mn, blockK] -- is described by its leading dims collapsed,
+        # which covers the same bytes. Contiguity makes that flatten a view; a
+        # copy would leave weight_ptr dangling once this function returns.
+        assert t.is_contiguous(), (
+            f"a {t.dim()}D weight must be contiguous to be described by a "
+            f"single pitch, shape={tuple(t.shape)}, strides={t.stride()}")
+        t = t.flatten(0, -2)
     shape = [1, 1]
     pitch = 1
     elt_size = torch.tensor([], dtype=t.dtype).element_size()
@@ -125,8 +140,6 @@ class HostMoeTensorSharer:
             expert_id: The ID of the expert
             name: The name of the weight
         """
-        assert len(tensor_shape
-                   ) <= 2, "tensor_shape dim must be less than or equal to 2"
         assert 0 <= expert_id < self.expert_count
         assert expert_id < self.expert_start or expert_id >= self.expert_end
         if name not in self.name_info:
@@ -148,8 +161,6 @@ class HostMoeTensorSharer:
             name: The name of the weight
             t: The weight tensor
         """
-        assert len(
-            t.shape) <= 2, "tensor_shape dim must be less than or equal to 2"
         assert t.is_contiguous() == True, "t.is_contiguous() must be True"
         assert (expert_id, name) not in self.shared_tensors.keys()
         assert self.expert_start <= expert_id < self.expert_end
@@ -279,7 +290,10 @@ class HostMoeTensorSharer:
 
     def pre_shutdown_cleanup(self):
         """
-        Clean up the resources before C++ shutdown and barrier
+        Close this rank's mappings of the shared host weights.
+
+        Call after the C++ load balancer has shut down, so no weight update
+        still reads them, and before the barrier that lets the owner unlink them.
         """
         for shm in self.imported_shms:
             shm.close()
@@ -302,6 +316,9 @@ class SingleLayerMoeLoadBalancer:
     A class representing a single layer of the Mixture of Experts (MoE) load balancer.
     This class wraps the C++ implementation of SingleLayerMoeLoadBalancer.
     """
+
+    # Standard EPLB routes to slot IDs and has no per-invocation replica plan.
+    produces_replica_plan = False
 
     def __init__(
             self,
@@ -748,7 +765,9 @@ class SingleLayerMoeLoadBalancer:
 
     def py_pre_shutdown_cleanup(self):
         """
-        Clean up the resources before C++ shutdown and barrier
+        Close this rank's mappings of the shared host weights.
+
+        Call after the C++ shutdown and before the barrier.
         """
         if self.updates_enabled:
             self.host_tensor_sharer.pre_shutdown_cleanup()
@@ -761,21 +780,129 @@ class SingleLayerMoeLoadBalancer:
             self.host_tensor_sharer.post_shutdown_cleanup()
 
 
-# Global variable to store the current active MoeLoadBalancer instance
+# Global variable to store the current active MoE load balancer instance
 _current_moe_load_balancer = threading.local()
 
 
-class MoeLoadBalancer:
+class BaseMoeLoadBalancer(ABC):
+    """Model-level lifecycle shared by every MoE load-balancer mode.
+
+    Model construction enters the balancer as a context manager so that MoE
+    layers register through ``get_moe_load_balancer``. The engine drives each
+    forward through ``MoeLoadBalancerIterContext`` (``set_iter_info``,
+    ``start_iter``, and ``end_iter`` or, when the forward raises,
+    ``abort_iter``), and workers release resources with a collective
+    ``shutdown``. Subclasses initialize ``_previous_balancer``,
+    ``enable_statistic`` and ``enable_update_weights``.
+    """
+
+    @abstractmethod
+    def is_static_routing(self) -> bool:
+        """Whether the placement stays fixed, so no iteration hooks run."""
+
+    def is_dynamic_routing(self) -> bool:
+        return not self.is_static_routing()
+
+    @abstractmethod
+    def set_repeated_for_next_layer(self, repeated_count: int) -> None:
+        """Set how many times the next added layer is invoked per forward."""
+
+    @abstractmethod
+    def add_layer(self,
+                  expert_count: int,
+                  top_k: int,
+                  slot_count_per_rank: int,
+                  aux_stream: Optional[torch.cuda.Stream] = None):
+        """Register one MoE layer and return its layer load balancer."""
+
+    @abstractmethod
+    def register_weight_slots_after_to_cuda(self) -> None:
+        """Register weight slots after the model has been moved to CUDA."""
+
+    @abstractmethod
+    def finalize_model(self) -> None:
+        """Finish model-level setup after every layer has been added."""
+
+    @abstractmethod
+    def set_warm_up_iter_count(self, iter_count: int) -> None:
+        """Set the number of warm-up iterations."""
+
+    @abstractmethod
+    def start_iter(self) -> None:
+        """Start one forward iteration."""
+
+    @abstractmethod
+    def end_iter(self) -> None:
+        """End the current forward iteration."""
+
+    def abort_iter(self, error: BaseException) -> None:
+        """End an iteration whose forward raised ``error``; defaults to ``end_iter``."""
+        self.end_iter()
+
+    @abstractmethod
+    def shutdown(self, local_safe: bool = True) -> bool:
+        """Collectively release resources; return False if any rank is unsafe."""
+
+    def set_iter_info(self, enable_statistic: Optional[bool],
+                      enable_update_weights: Optional[bool]):
+        if enable_statistic is not None:
+            self.enable_statistic = enable_statistic
+        if enable_update_weights is not None:
+            self.enable_update_weights = enable_update_weights
+
+    def __enter__(self):
+        """
+        Enter the context manager.
+
+        Returns:
+            The load balancer instance
+        """
+        # Save the previous load balancer (if any)
+        try:
+            self._previous_balancer = getattr(_current_moe_load_balancer,
+                                              'instance', None)
+        except AttributeError:
+            self._previous_balancer = None
+
+        # Set the current instance as the active load balancer
+        _current_moe_load_balancer.instance = self
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """
+        Exit the context manager.
+
+        Args:
+            exc_type: The exception type
+            exc_val: The exception value
+            exc_tb: The exception traceback
+
+        Returns:
+            False to not suppress exceptions
+        """
+        # Restore the previous load balancer
+        if self._previous_balancer is not None:
+            _current_moe_load_balancer.instance = self._previous_balancer
+        else:
+            delattr(_current_moe_load_balancer, 'instance')
+
+        # Do not suppress exceptions
+        return False
+
+
+class MoeLoadBalancer(BaseMoeLoadBalancer):
     """
     A class representing a Mixture of Experts (MoE) load balancer.
     This class can be used as a context manager to manage the lifecycle of a MoeLoadBalancer.
     """
 
-    def __init__(self,
-                 ep_rank: int,
-                 ep_size: int,
-                 layer_updates_per_iter: int,
-                 shared_memory_base_name: Optional[str] = None):
+    def __init__(
+            self,
+            ep_rank: int,
+            ep_size: int,
+            layer_updates_per_iter: int,
+            shared_memory_base_name: Optional[str] = None,
+            warmup_placement: Optional["WarmupPlacementController"] = None):
         """
         Initialize a MoeLoadBalancer instance.
 
@@ -784,7 +911,14 @@ class MoeLoadBalancer:
             ep_size: The total number of processes in expert parallelism
             layer_updates_per_iter: The number of layers to update per iteration
             shared_memory_base_name: Shared memory base name, will use 'moe_shared' if None
+            warmup_placement: Optional ``WarmupPlacementController`` that re-places the experts
+                of the static layers during warmup, then freezes (needs static routing).
         """
+        if warmup_placement is not None and layer_updates_per_iter > 0:
+            raise ValueError(
+                "warmup placement keeps the layers static; it needs layer_updates_per_iter == 0"
+            )
+        self.warmup_placement = warmup_placement
         self.is_shutdown = True
         self.ep_rank = ep_rank
         self.ep_size = ep_size
@@ -806,16 +940,17 @@ class MoeLoadBalancer:
 
         self.next_layer_repeated_count = None
 
+    # Without per-layer dynamic EPLB, executor teardown is rank-local and this
+    # balancer is released by its own finalizer, which unlinks its shared memory.
+    shutdown_on_finalize = True
+
     def __del__(self):
-        if not self.is_shutdown:
+        if not getattr(self, "is_shutdown", True):
             self.shutdown()
 
     def is_static_routing(self):
         # if we don't update, then it is statistic routing.
         return self.layer_updates_per_iter == 0
-
-    def is_dynamic_routing(self):
-        return not self.is_static_routing()
 
     def _setup_mpi_comm(self):
         global_mpi_comm = tensorrt_llm.mpi_comm()
@@ -897,6 +1032,8 @@ class MoeLoadBalancer:
         for single_layer_load_balancer in self.single_layer_load_balancers:
             single_layer_load_balancer.py_finalize_model()
         self.load_balancer_impl.finalize_model()
+        if self.warmup_placement is not None:
+            self.warmup_placement.finalize()
         torch.cuda.empty_cache()
 
     def set_warm_up_iter_count(self, iter_count: int):
@@ -907,13 +1044,6 @@ class MoeLoadBalancer:
             iter_count: The number of warm-up iterations
         """
         self.load_balancer_impl.set_warm_up_iter_count(iter_count)
-
-    def set_iter_info(self, enable_statistic: Optional[bool],
-                      enable_update_weights: Optional[bool]):
-        if enable_statistic is not None:
-            self.enable_statistic = enable_statistic
-        if enable_update_weights is not None:
-            self.enable_update_weights = enable_update_weights
 
     def reconfigure_mask_only(self, dead_ranks: list[int]) -> None:
         """
@@ -949,19 +1079,25 @@ class MoeLoadBalancer:
         self.in_iter = False
         self.iter_id += 1
 
-    def shutdown(self):
-        """
-        Shutdown the load balancer and release resources.
-        """
+    def shutdown(self, local_safe: bool = True) -> bool:
+        """Collectively release resources after an all-rank safety preflight."""
+        if self.is_shutdown:
+            return True
+        local_safe = bool(local_safe and not self.in_iter)
+        if not all(self.shared_mpi_comm.allgather(local_safe)):
+            return False
+        # Stop the C++ weight-update threads first. They read the host weights
+        # that the cleanup below closes.
+        self.load_balancer_impl.shutdown()
         for single_layer_load_balancer in self.single_layer_load_balancers:
             single_layer_load_balancer.py_pre_shutdown_cleanup()
-        self.load_balancer_impl.shutdown()
         # use this sync to make sure all the shm resources can be cleaned up
         self.shared_mpi_comm.barrier()
         for single_layer_load_balancer in self.single_layer_load_balancers:
             single_layer_load_balancer.py_post_shutdown_cleanup()
         self.shared_mpi_comm.barrier()
         self.is_shutdown = True
+        return True
 
     def __repr__(self):
         """
@@ -972,50 +1108,13 @@ class MoeLoadBalancer:
         """
         return f"MoeLoadBalancer(ep_rank={self.ep_rank}, ep_size={self.ep_size}, layer_updates_per_iter={self.layer_updates_per_iter})"
 
-    def __enter__(self):
-        """
-        Enter the context manager.
-
-        Returns:
-            The MoeLoadBalancer instance
-        """
-        # Save the previous load balancer (if any)
-        try:
-            self._previous_balancer = getattr(_current_moe_load_balancer,
-                                              'instance', None)
-        except AttributeError:
-            self._previous_balancer = None
-
-        # Set the current instance as the active load balancer
-        _current_moe_load_balancer.instance = self
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """
-        Exit the context manager.
-
-        Args:
-            exc_type: The exception type
-            exc_val: The exception value
-            exc_tb: The exception traceback
-
-        Returns:
-            False to not suppress exceptions
-        """
-        # Restore the previous load balancer
-        if self._previous_balancer is not None:
-            _current_moe_load_balancer.instance = self._previous_balancer
-        else:
-            delattr(_current_moe_load_balancer, 'instance')
-
-        # Do not suppress exceptions
-        return False
-
 
 moe_model_arch_list = [
     'DeepseekV3ForCausalLM',
     'DeepseekV32ForCausalLM',
     'DeepseekV4ForCausalLM',
+    'DeepseekV41ForCausalLM',
+    'DeepseekV41ForConditionalGeneration',
     'GlmMoeDsaForCausalLM',
     'GptOssForCausalLM',
     'KimiK25ForConditionalGeneration',
@@ -1041,38 +1140,116 @@ moe_model_arch_list = [
 
 def maybe_create_moe_load_balancer(
     model_config, mapping: Optional[Mapping]
-) -> AbstractContextManager[MoeLoadBalancer | None]:
+) -> AbstractContextManager[BaseMoeLoadBalancer | None]:
     ep_rank = model_config.mapping.moe_ep_rank
     ep_size = model_config.mapping.moe_ep_size
     model_arch = model_config.pretrained_config.architectures[0]
     using_ep = mapping and mapping.moe_ep_size > 1
     in_supported_model_arch = model_arch in moe_model_arch_list
     using_smart_router = mapping and mapping.moe_cluster_size > 1
-    moe_load_balancer: AbstractContextManager[MoeLoadBalancer
+    moe_load_balancer: AbstractContextManager[BaseMoeLoadBalancer
                                               | None] = nullcontext()
-    if in_supported_model_arch and using_ep and not using_smart_router and model_config.moe_load_balancer is not None:
-        model_config.moe_load_balancer.setup(ep_rank=ep_rank, ep_size=ep_size)
-        if model_config.moe_load_balancer.layer_updates_per_iter > 0:
-            # TODO: remove this when supported.
-            # cpu_arch = platform.machine().lower()
-            # assert cpu_arch == 'aarch64', "online load balancer only support aarch64, e.g. GB200 now, x86 coming soon."
-            pass
+    config = model_config.moe_load_balancer
+    mode = getattr(config, "mode", "standard")
+    if config is not None and mode == "per_layer_dynamic":
+        if not in_supported_model_arch:
+            raise ValueError(
+                "per-layer dynamic EPLB does not support model architecture "
+                f"{model_arch!r}")
+        if not using_ep:
+            raise ValueError("per-layer dynamic EPLB requires expert "
+                             "parallelism (moe_ep_size > 1)")
+        if using_smart_router:
+            raise ValueError(
+                "per-layer dynamic EPLB is incompatible with smart routing "
+                "(moe_cluster_size > 1)")
+    if getattr(config, "warmup_placement", None) is not None:
+        if not in_supported_model_arch:
+            raise ValueError(
+                f"warmup placement does not support model architecture {model_arch!r}"
+            )
+        if not using_ep:
+            raise ValueError(
+                "warmup placement requires expert parallelism (moe_ep_size > 1)"
+            )
+        if using_smart_router:
+            raise ValueError(
+                "warmup placement is incompatible with smart routing (moe_cluster_size > 1)"
+            )
+        if mapping.world_size != ep_size:
+            raise ValueError(
+                "warmup placement requires pure expert parallelism: "
+                f"world size {mapping.world_size} != moe_ep_size {ep_size}")
 
-        moe_load_balancer = MoeLoadBalancer(
-            ep_rank=ep_rank,
-            ep_size=ep_size,
-            layer_updates_per_iter=model_config.moe_load_balancer.
-            layer_updates_per_iter)
-        logger.info(
-            f"Created MoE LoadBalancer, layer_updates_per_iter={model_config.moe_load_balancer.layer_updates_per_iter}..."
-        )
+    if (in_supported_model_arch and using_ep and not using_smart_router
+            and config is not None):
+        config.setup(ep_rank=ep_rank, ep_size=ep_size)
+        if mode == "per_layer_dynamic":
+            from .per_layer_dynamic_eplb import PerLayerDynamicMoeLoadBalancer
+
+            moe_load_balancer = PerLayerDynamicMoeLoadBalancer(
+                ep_rank=ep_rank,
+                ep_size=ep_size,
+                config=config,
+                mapping=mapping,
+            )
+            logger.info(
+                "Created per-layer dynamic MoE LoadBalancer, num_slots=%s, "
+                "auxiliary_sms=%s...",
+                config.num_slots,
+                getattr(config, "auxiliary_sms", 4),
+            )
+        elif mode == "standard":
+            if config.layer_updates_per_iter > 0:
+                # TODO: remove this when supported.
+                # cpu_arch = platform.machine().lower()
+                # assert cpu_arch == 'aarch64', "online load balancer only support aarch64, e.g. GB200 now, x86 coming soon."
+                pass
+
+            warmup_placement = _create_warmup_placement(model_config, ep_rank,
+                                                        ep_size)
+            moe_load_balancer = MoeLoadBalancer(
+                ep_rank=ep_rank,
+                ep_size=ep_size,
+                layer_updates_per_iter=config.layer_updates_per_iter,
+                warmup_placement=warmup_placement)
+            logger.info(
+                "Created standard MoE LoadBalancer, layer_updates_per_iter=%s, "
+                "warmup placement %s...",
+                config.layer_updates_per_iter,
+                "on" if warmup_placement is not None else "off",
+            )
+        else:
+            raise ValueError(f"Unknown MoE load-balancer mode: {mode!r}")
     return moe_load_balancer
+
+
+def _create_warmup_placement(
+        model_config: "ModelConfig", ep_rank: int,
+        ep_size: int) -> Optional["WarmupPlacementController"]:
+    """The controller of ``moe_load_balancer.warmup_placement``, or None when unset."""
+    from .moe_warmup_placement import (WarmupPlacementController,
+                                       register_controller)
+    settings = model_config.moe_load_balancer.warmup_placement
+    if settings is None:
+        return None
+    # MoE layers past the target's decoder layers are draft (MTP) layers.
+    text_config = getattr(model_config.pretrained_config, "text_config", None)
+    if text_config is None:
+        text_config = model_config.pretrained_config
+    num_layers = getattr(text_config, "num_hidden_layers", None)
+    controller = WarmupPlacementController(settings,
+                                           ep_rank=ep_rank,
+                                           ep_size=ep_size,
+                                           num_target_layers=num_layers)
+    register_controller(controller)
+    return controller
 
 
 class MoeLoadBalancerIterContext:
 
     def __init__(self,
-                 moe_load_balancer: Optional[MoeLoadBalancer],
+                 moe_load_balancer: Optional[BaseMoeLoadBalancer],
                  enable_statistic: Optional[bool] = None,
                  enable_updates: Optional[bool] = None):
         self.moe_load_balancer = moe_load_balancer
@@ -1107,16 +1284,19 @@ class MoeLoadBalancerIterContext:
         """
         if self.moe_load_balancer is not None and not self.moe_load_balancer.is_static_routing(
         ):
-            self.moe_load_balancer.end_iter()
+            if exc_type is None:
+                self.moe_load_balancer.end_iter()
+            else:
+                self.moe_load_balancer.abort_iter(exc_val)
         return False
 
 
-def get_moe_load_balancer() -> Optional[MoeLoadBalancer]:
+def get_moe_load_balancer() -> Optional[BaseMoeLoadBalancer]:
     """
-    Get the current active MoeLoadBalancer instance.
+    Get the current active MoE load balancer instance.
 
     Returns:
-        The current active MoeLoadBalancer instance, or None if not in a MoeLoadBalancer context
+        The current active load balancer instance, or None if not in a load-balancer context
     """
     try:
         return getattr(_current_moe_load_balancer, 'instance', None)

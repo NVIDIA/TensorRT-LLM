@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+# All rights reserved. SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License"); you may not
+# use this file except in compliance with the License. You may obtain a copy of
+# the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+# License for the specific language governing permissions and limitations under
+# the License.
+
 add_custom_target(flash_mla)
 
 if(WIN32)
@@ -64,7 +79,7 @@ if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.3)
   list(APPEND SUPPORT_ARCHS "90")
 endif()
 if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.9)
-  list(APPEND SUPPORT_ARCHS "100" "103")
+  list(APPEND SUPPORT_ARCHS "100" "103" "107")
 endif()
 
 # Find intersection of supported and requested architectures
@@ -197,8 +212,7 @@ if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.9)
   )
 endif()
 
-# Disable LTO before creating target (similar to DeepEP) Let CMake generate
-# fatbinData for CUDA separable compilation
+# Disable LTO before creating target (similar to DeepEP)
 set(CMAKE_INTERPROCEDURAL_OPTIMIZATION FALSE)
 
 pybind11_add_module(flash_mla_cpp_tllm ${FLASH_MLA_SOURCES})
@@ -210,8 +224,10 @@ set_target_properties(
              CXX_SCAN_FOR_MODULES OFF
              CUDA_STANDARD 20
              CUDA_STANDARD_REQUIRED ON
-             CUDA_SEPARABLE_COMPILATION ON
-             CUDA_RESOLVE_DEVICE_SYMBOLS ON
+             # Whole-program compilation, as FlashMLA's own build does:
+             # relocatable device code makes ptxas spill registers in the
+             # attention kernels.
+             CUDA_SEPARABLE_COMPILATION OFF
              LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/flash_mla_cpp_tllm.version
              INSTALL_RPATH "${TORCH_INSTALL_PREFIX}/lib"
              BUILD_WITH_INSTALL_RPATH TRUE)

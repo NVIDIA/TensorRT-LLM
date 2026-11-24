@@ -3,13 +3,9 @@
 
 # Stability reference for the `trtllm-serve` CLI surface.
 #
-# Every Click option of every subcommand registered on `trtllm-serve` MUST be
-# listed here with an explicit stability status. The gated subcommand list is
-# derived from `main.commands` in tensorrt_llm/commands/serve.py, so a newly
-# registered subcommand is gated automatically and needs a section here. The
-# CI test (`tests/unittest/api_stability/test_serve_cli.py`) diffs the live
-# Click group against this file and fails on any divergence, including a
-# subcommand with no section and a section for an unregistered subcommand.
+# Every option on a subcommand listed in `GATED_SUBCOMMANDS` must have an explicit
+# stability status here. The CI test (`tests/unittest/api_stability/test_serve_cli.py`)
+# diffs the live Click group against this file and fails on any divergence.
 #
 # Allowed statuses (forward transitions only):
 #     prototype  ->  beta  ->  stable  ->  deprecated  (-> removed after grace period)
@@ -347,8 +343,8 @@ commands:
         - "--num_postprocess_workers"
       num_serve_frontends:
         type: int
-        default: 1
-        status: prototype
+        default: 8
+        status: beta
         required: false
         multiple: false
         is_flag: false
@@ -381,6 +377,24 @@ commands:
         is_flag: true
         flags:
         - "--openengine-enable-load-metrics"
+      openengine_metrics_host:
+        type: str
+        default: null
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--openengine-metrics-host"
+      openengine_metrics_port:
+        type: int
+        default: null
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--openengine-metrics-port"
       otlp_traces_endpoint:
         type: str
         default: null
@@ -419,7 +433,7 @@ commands:
         flags:
         - "--post_processor_hook"
       reasoning_parser:
-        type: Choice(['auto', 'deepseek-r1', 'deepseek_v4', 'deepseek_v41', 'gemma4', 'glm', 'glm45', 'glm47', 'glm_moe_dsa', 'k-exaone', 'kimi_k2', 'kimi_k25', 'kimi_k3', 'laguna', 'minimax_m2', 'minimax_m2_append_think', 'minimax_m3', 'nano-v3', 'nemotron-v3', 'poolside_v1', 'qwen3', 'qwen3_5'])
+        type: Choice(['auto', 'deepseek-r1', 'deepseek_v4', 'deepseek_v41', 'gemma4', 'glm', 'glm45', 'glm47', 'glm_moe_dsa', 'k-exaone', 'kimi_k2', 'kimi_k25', 'kimi_k3', 'laguna', 'minimax_m2', 'minimax_m2_append_think', 'minimax_m3', 'musespark', 'nano-v3', 'nemotron-v3', 'poolside_v1', 'qwen3', 'qwen3_5'])
         default: null
         status: prototype
         required: false
@@ -494,7 +508,7 @@ commands:
         flags:
         - "--tokenizer"
       tool_parser:
-        type: Choice(['auto', 'deepseek_v3', 'deepseek_v31', 'deepseek_v32', 'deepseek_v4', 'deepseek_v41', 'gemma4', 'glm4', 'glm47', 'kimi_k2', 'kimi_k3', 'minimax_m2', 'minimax_m3', 'poolside_v1', 'qwen3', 'qwen3_coder'])
+        type: Choice(['auto', 'deepseek_v3', 'deepseek_v31', 'deepseek_v32', 'deepseek_v4', 'deepseek_v41', 'gemma4', 'glm4', 'glm47', 'kimi_k2', 'kimi_k3', 'minimax_m2', 'minimax_m3', 'musespark', 'poolside_v1', 'qwen3', 'qwen3_coder'])
         default: null
         status: prototype
         required: false
@@ -784,6 +798,7 @@ commands:
         is_flag: true
         flags:
         - "--trust_remote_code"
+
   embeddings:
     options:
       extra_llm_api_options:
@@ -897,144 +912,3 @@ commands:
         is_flag: true
         flags:
         - "--trust_remote_code"
-  mooncake_master:
-    options:
-      binary:
-        type: str
-        default: mooncake_master
-        status: prototype
-        required: false
-        multiple: false
-        is_flag: false
-        flags:
-        - "--binary"
-      eviction_ratio:
-        type: float
-        default: 0.05
-        status: prototype
-        required: false
-        multiple: false
-        is_flag: false
-        flags:
-        - "--eviction_ratio"
-      heartbeat_seconds:
-        type: int
-        default: 300
-        status: prototype
-        required: false
-        multiple: false
-        is_flag: false
-        flags:
-        - "--heartbeat_seconds"
-      metadata_server:
-        type: str
-        default: P2PHANDSHAKE
-        status: prototype
-        required: false
-        multiple: false
-        is_flag: false
-        flags:
-        - "--metadata_server"
-      metrics_port:
-        type: int
-        default: 9004
-        status: prototype
-        required: false
-        multiple: false
-        is_flag: false
-        flags:
-        - "--metrics_port"
-      namespace:
-        type: str
-        default: trtllm
-        status: prototype
-        required: false
-        multiple: false
-        is_flag: false
-        flags:
-        - "--namespace"
-      pool_file:
-        type: str
-        default: null
-        status: prototype
-        required: false
-        multiple: false
-        is_flag: false
-        flags:
-        - "--pool_file"
-      protocol:
-        type: str
-        default: rdma
-        status: prototype
-        required: false
-        multiple: false
-        is_flag: false
-        flags:
-        - "--protocol"
-      rpc_port:
-        type: int
-        default: 50051
-        status: prototype
-        required: false
-        multiple: false
-        is_flag: false
-        flags:
-        - "--rpc_port"
-      run_dir:
-        type: str
-        default: null
-        status: prototype
-        required: false
-        multiple: false
-        is_flag: false
-        flags:
-        - "--run_dir"
-      telemetry:
-        type: bool
-        default: true
-        status: beta
-        required: false
-        multiple: false
-        is_flag: true
-        flags:
-        - "--no-telemetry"
-        - "--telemetry"
-      timeout:
-        type: float
-        default: 60.0
-        status: prototype
-        required: false
-        multiple: false
-        is_flag: false
-        flags:
-        - "--timeout"
-  mooncake_pool_report:
-    options:
-      master_log:
-        type: str
-        default: null
-        status: prototype
-        required: false
-        multiple: false
-        is_flag: false
-        flags:
-        - "--master_log"
-      run_dir:
-        type: str
-        default: null
-        status: prototype
-        required: true
-        multiple: false
-        is_flag: false
-        flags:
-        - "--run_dir"
-      telemetry:
-        type: bool
-        default: true
-        status: beta
-        required: false
-        multiple: false
-        is_flag: true
-        flags:
-        - "--no-telemetry"
-        - "--telemetry"

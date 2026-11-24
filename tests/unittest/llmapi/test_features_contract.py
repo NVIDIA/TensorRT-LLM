@@ -59,7 +59,6 @@ def _args(**kwargs):
         "speculative_config": None,
         "kv_cache_config": _KV_DEFAULT,
         "cuda_graph_config": None,
-        "extended_runtime_perf_knob_config": None,
         "enable_chunked_prefill": False,
         "parallel_config": llm_args._ParallelConfig(),
     }

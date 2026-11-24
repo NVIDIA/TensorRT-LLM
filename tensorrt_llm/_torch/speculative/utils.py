@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 from ..pyexecutor.config_utils import (is_glm5_next, is_nemotron_hybrid,
                                        match_nemotron_h_layer_types)
 from ..pyexecutor.sampler import TorchSampler
+from ..pyexecutor.sampler.watermark import WatermarkSpecState
 from ..speculative.interface import SpecMetadata
 from .dflash import DFlashSpecMetadata, DFlashWorker
 from .draft_target import (DraftTargetOneModelSpecMetadata,
@@ -339,7 +340,9 @@ def get_spec_metadata(spec_config,
                       max_num_tokens,
                       spec_resource_manager=None,
                       max_seq_len=262144,
-                      num_seq_slots=None):
+                      num_seq_slots=None,
+                      temperature_only_graphs=False,
+                      watermark_config=None):
     metadata = _build_spec_metadata(spec_config,
                                     model_config,
                                     max_num_requests,
@@ -358,8 +361,13 @@ def get_spec_metadata(spec_config,
         # dispatcher routes to a backend that takes no min_p argument -- so the filter is
         # dropped with nothing raised. One assignment here keeps them in step.
         metadata.advanced_sampling_mode = spec_config.advanced_sampling_mode
+        metadata.rejection_sample_method = spec_config.rejection_sample_method
         if num_seq_slots is not None:
             metadata.num_seq_slots = num_seq_slots
+        metadata.temperature_only_graphs = temperature_only_graphs
+        if watermark_config is not None:
+            metadata.watermark = WatermarkSpecState(watermark_config,
+                                                    max_seq_len=max_seq_len)
     return metadata
 
 
@@ -651,6 +659,46 @@ def get_spec_resource_manager(model_engine):
     return None
 
 
+def _watermark_unsupported_reason(spec_config,
+                                  watermark_config=None) -> Optional[str]:
+    """Why text watermarking cannot be served by this one-model configuration, or None.
+
+    With exact-match verification the watermark relies on the target's own sample at every
+    verified position, committed in order. Tree rows follow root paths and relaxed
+    acceptance commits non-matching tokens, so neither is supported. Rejection sampling
+    accepts drafts that the target did not sample: it needs either dual-key watermarking
+    (the drafts are drawn under one key, the token after the accepted prefix under a second
+    one) or the explicit opt-in to leave accepted drafts unmarked.
+    """
+    if _is_effective_dynamic_tree(spec_config):
+        return (
+            "Text watermarking is not supported with tree (dynamic tree) speculative "
+            "decoding. Use a linear speculation mode or disable speculative decoding."
+        )
+    if (getattr(spec_config, "use_rejection_sampling", False)
+            and watermark_config is not None):
+        dual_key = watermark_config.algorithm == "gumbel_dual_key"
+        if not dual_key and not watermark_config.allow_target_only_watermarking:
+            return (
+                "Text watermarking with use_rejection_sampling needs "
+                "watermark_config.algorithm='gumbel_dual_key', or "
+                "allow_target_only_watermarking=True to leave accepted draft tokens "
+                "unmarked (the signal weakens with the acceptance rate). Alternatively "
+                "disable use_rejection_sampling to keep exact-match verification."
+            )
+        if dual_key and spec_config.spec_dec_mode.is_parallel_draft():
+            return (
+                "watermark_config.algorithm='gumbel_dual_key' is not supported "
+                "with parallel-draft speculation. Use an autoregressive drafter "
+                "(Eagle3, MTP, DraftTarget) or allow_target_only_watermarking=True."
+            )
+    if getattr(spec_config, "use_relaxed_acceptance_for_thinking", False):
+        return (
+            "Text watermarking is not supported with relaxed acceptance for thinking. "
+            "Disable use_relaxed_acceptance_for_thinking.")
+    return None
+
+
 def get_spec_decoder(
     sampler_args: TorchSampler.Args,
     spec_config: "DecodingBaseConfig",
@@ -669,10 +717,13 @@ def get_spec_decoder(
         # supported yet and are rejected at admission rather than mispenalized.
         penalty_supported = not _is_effective_dynamic_tree(spec_config)
         fused_sampling = (spec_config.advanced_sampling_mode.is_fused)
-        return SpecSampler(sampler_args,
-                           enable_penalty=spec_config.enable_penalty,
-                           penalty_supported=penalty_supported,
-                           fused_sampling=fused_sampling)
+        return SpecSampler(
+            sampler_args,
+            enable_penalty=spec_config.enable_penalty,
+            penalty_supported=penalty_supported,
+            fused_sampling=fused_sampling,
+            watermark_unsupported_reason=_watermark_unsupported_reason(
+                spec_config, sampler_args.watermark_config))
     raise ValueError(
         f"Unsupported speculative decoding mode: {spec_config.spec_dec_mode}")
 
@@ -724,7 +775,14 @@ def update_spec_config_from_draft_model_config(spec_config,
 def get_spec_worker(spec_config,
                     model_config,
                     mapping,
-                    use_separate_draft_kv_cache: bool = False):
+                    use_separate_draft_kv_cache: bool = False,
+                    key_exchange=None,
+                    spec_decode_fast_paths: bool = False):
+    """The one-engine worker of spec_config. key_exchange: the TP key
+    exchange (ll_exchange.TPKeyExchange) the linear Eagle3 / MTP-Eagle
+    worker samples vocabulary-sharded logits with, or None.
+    spec_decode_fast_paths: the model takes the one-engine speculative fast
+    paths (SpecDecOneEngineForCausalLM.spec_decode_fast_paths)."""
     spec_dec_mode = spec_config.spec_dec_mode
     if spec_dec_mode.is_mtp_vanilla():
         return MTPWorker(spec_config,
@@ -740,7 +798,9 @@ def get_spec_worker(spec_config,
         return MTPEagleWorker(spec_config,
                               model_config,
                               use_separate_draft_kv_cache,
-                              mapping=mapping)
+                              mapping=mapping,
+                              key_exchange=key_exchange,
+                              spec_decode_fast_paths=spec_decode_fast_paths)
     if spec_dec_mode.is_eagle3_one_model():
         if _is_effective_dynamic_tree(spec_config):
             return Eagle3OneModelDynamicTreeWorker(spec_config, mapping,
@@ -748,7 +808,9 @@ def get_spec_worker(spec_config,
         return Eagle3OneModelWorker(
             spec_config,
             mapping=mapping,
-            use_separate_draft_kv_cache=use_separate_draft_kv_cache)
+            use_separate_draft_kv_cache=use_separate_draft_kv_cache,
+            key_exchange=key_exchange,
+            spec_decode_fast_paths=spec_decode_fast_paths)
     if spec_dec_mode.is_pard():
         return PARDWorker(spec_config, mapping, use_separate_draft_kv_cache)
     if spec_dec_mode.is_dflash():
@@ -761,6 +823,10 @@ def get_spec_worker(spec_config,
     # slot convention on top of DFlashWorker.
     if spec_dec_mode.is_dspark():
         if spec_config.draft_is_embedded_in_target:
+            if spec_config.use_ancestral_draft_sampling:
+                raise ValueError(
+                    "use_ancestral_draft_sampling=True is not supported with a "
+                    "drafter embedded in the target checkpoint.")
             return DSv4DSparkWorker(spec_config, mapping,
                                     use_separate_draft_kv_cache)
         return DSparkWorker(spec_config, mapping, use_separate_draft_kv_cache)
@@ -786,6 +852,23 @@ def get_num_extra_kv_tokens(spec_config):
     return 0
 
 
+def get_draft_block_width(spec_config, *, shift_label: bool = True) -> int:
+    """Block width the worker drafting for ``spec_config`` appends per request.
+
+    0 when that worker does not append a block to a paged draft KV cache.
+    ``shift_label`` selects the checkpoint's slot convention for standalone DSpark.
+    """
+    if spec_config is None:
+        return 0
+    if spec_config.spec_dec_mode.is_dflash():
+        return DFlashWorker.block_width_for(spec_config)
+    if (spec_config.spec_dec_mode.is_dspark()
+            and not spec_config.draft_is_embedded_in_target):
+        return DSparkWorker.block_width_for(spec_config,
+                                            shift_label=shift_label)
+    return 0
+
+
 def get_draft_kv_cache_manager(spec_config, resource_manager):
     """
     Return the one-model draft cache manager, including a shared draft KV view
@@ -804,7 +887,9 @@ def get_draft_kv_cache_manager(spec_config, resource_manager):
     target = resource_manager.get_resource_manager(
         ResourceManagerType.KV_CACHE_MANAGER)
     get_view = getattr(target, "get_draft_kv_cache_view", None)
-    return get_view() if get_view is not None else None
+    view = get_view() if get_view is not None else None
+    # A unified manager's request resources are already handled through target.
+    return None if view is target else view
 
 
 def update_spec_config_from_model_config(spec_config,
@@ -884,7 +969,6 @@ def update_spec_config_from_model_config(spec_config,
         raise ValueError(
             "A replacement MTP checkpoint must contain at least one head")
     spec_config.num_nextn_predict_layers = num_nextn_predict_layers
-    spec_config._validate_moe_backend_compatibility(model_config_resolved=True)
     is_vanilla = spec_config.spec_dec_mode.is_mtp_vanilla()
 
     # Resolve max_draft_len when the user didn't set it:

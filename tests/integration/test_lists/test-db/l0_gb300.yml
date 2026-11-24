@@ -18,7 +18,35 @@ l0_gb300:
       stage: pre_merge
       backend: pytorch
   tests:
+  # MiniMax-M3 target unit tests.
+  - unittest/_torch/modeling_v2/models/minimax_m3/test_m3_fixed_e8m0.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/activation
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/attention
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/embedding
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/gemm
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/ops/moe
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/norm
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/spec
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/test_modeling_v2_m3_capture_boundary.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/test_modeling_v2_m3_dispatch.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/test_modeling_v2_m3_prebuild.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/test_modeling_v2_m3_rank_agreement.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/activation
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/attention
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/embedding
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/gemm
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/ops/moe
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/norm
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/spec
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/test_modeling_v2_m3_capture_boundary.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/test_modeling_v2_m3_dispatch.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/test_modeling_v2_m3_prebuild.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/test_modeling_v2_m3_rank_agreement.py
   # ------------- PyTorch tests ---------------
+  # EPLB host-accessible memory takes the GPU NUMA path on Grace Blackwell; checks its memory-monitor records.
+  - unittest/_torch/memory/test_memory_monitor_native.py::test_eplb_host_accessible_memory_is_recorded
+  # MLA context head slices, including FP8 scale-block boundaries.
+  - unittest/_torch/modules/test_linear_output_slice.py
   # ------------- DeepSeek-V4.1 model, Engram and DSpark ---------------
   - unittest/_torch/modeling/test_modeling_deepseekv41.py
   - unittest/_torch/modules/test_engram_decode_hash.py
@@ -38,11 +66,13 @@ l0_gb300:
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v2_kv_cache-True-True-cutlass-auto]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_fp8_block_scales[latency] # Cover nvbugs 5461712 and 5505402
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_fp8_adp4_mtp3_trtllm_ple_offload
-  - accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_nvfp4_adp4_mtp3_trtllm_ple_offload
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_nvfp4_adp4_mtp3_trtllm
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_nvfp4_adp4_megamoe_cutedsl_ple_offload
   - accuracy/test_disaggregated_serving.py::TestQwen3_8_Flash_Next::test_fp8_nixl_python[prefix_cache]
+  - unittest/kv_cache_manager_v2_tests/test_kv_cache_manager_v2.py::TestSparseResolve::test_colliding_selections_preserve_slots_and_eviction
   - unittest/_torch/moe/kernels/parallel
   - unittest/_torch/kernels/parallel TIMEOUT (90)
+  - unittest/_torch/misc/test_autotuner.py::test_nvmmh_tactics_compute_the_product
   # Kimi K3 KDA unit tests (single GPU, random weights, no checkpoint).
   - unittest/_torch/modules/kimi_kda/test_kda_flashinfer_prefill.py
   - unittest/_torch/modules/kimi_kda/test_kda_fused_prefill_conv.py
@@ -55,7 +85,46 @@ l0_gb300:
   - unittest/_torch/modules/kimi_kda/test_kimi_kda_verify_parity.py
   - unittest/_torch/modules/kimi_kda/test_kda_mtp_decode_cute_parity.py
   - unittest/_torch/modules/kimi_kda/test_kimi_kda_fused_verify_parity.py
+  - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_decode_dispatch.py
+  - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_persistent_sm_reserve.py
   - unittest/_torch/visual_gen/kernels/parallel
+  # Ungrouped noaux_tc top-16 + moe_sort routing kernel and the MoE tables hand-off.
+  - unittest/_torch/moe/test_kimi_k3_route_sort.py
+  - unittest/_torch/moe/test_moe_sorted_routing.py
+  # Router-logits kernel in the MoE gate (the kernel test runs with kernels/parallel above).
+  - unittest/_torch/moe/test_kimi_k3_moe_gate.py::test_router_logits_kernel_matches_router_gemm
+  # Qwen3.5 decode kernels: low-M warp-MMA GEMM, TRTLLM-gen NVFP4 MoE decode / route fronts, draft experts,
+  # GDN fused target verify.
+  - unittest/_torch/modules/test_low_m_mma_gemm.py
+  - unittest/_torch/modules/mamba/test_gdn_kernel_optimizations.py
+  - unittest/_torch/moe/test_moe_decode_front.py
+  - unittest/_torch/moe/test_draft_experts_nvfp4.py
+  - unittest/_torch/modules/test_embedding_lookup.py
+  # GQA decode FMHA libraries (SM100 runs them with unittest/_torch/attention in l0_b200).
+  - unittest/_torch/attention/test_gqa_decode_fmha.py
+  # One-model speculative decoding: step copies, MXFP8 draft head, MTP fc input, steady prepare.
+  - unittest/_torch/kernels/test_spec_step_copies.py
+  - unittest/_torch/pyexecutor/engine/runners/decoder/test_inputs.py -k "test_spec_decode_graph_step_gather_kernel"
+  - unittest/_torch/modules/test_mxfp8_draft_head.py
+  - unittest/_torch/modules/test_q35_mtp_glue.py
+  - unittest/_torch/pyexecutor/test_steady_spec_prepare.py
+  # KV cache manager v2 remote cache level: only the fabric transport cases (Grace host memory), which no other
+  # stage can run. The NIXL cases run with the whole unittest/kv_cache_manager_v2_tests directory in l0_a10 and
+  # l0_b200 (pre-merge) and l0_h100 (post-merge); the host-only (cpu_only) cases run in l0_cpu.
+  - unittest/kv_cache_manager_v2_tests/test_remote_fabric_available.py
+  - unittest/kv_cache_manager_v2_tests/test_remote_level.py -k "fabric"
+  - unittest/kv_cache_manager_v2_tests/test_remote_capacity.py -k "fabric"
+  # Muse Spark Open decoder fast paths on one GPU: the fused Triton kernels and the
+  # GB300 cluster boundary kernel, against their reference compositions.
+  - unittest/_torch/modeling/test_musespark_open_router_projection.py
+  - unittest/_torch/modeling/test_musespark_open_full_routing.py
+  - unittest/_torch/modeling/test_musespark_open_norm_gate.py
+  - unittest/_torch/modeling/test_musespark_open_moe_finalize.py
+  - unittest/_torch/modeling/test_musespark_open_pre_expert_quant.py
+  - unittest/_torch/modeling/test_musespark_open_moe_prepare_overlap.py
+  - unittest/_torch/modeling/test_musespark_open_boundary_fusion.py
+  - unittest/_torch/modeling/test_musespark_open_cluster_boundary.py
+  - unittest/_torch/modeling/test_musespark_open_finalize_local.py
 - condition:
     ranges:
       system_gpu_count:
@@ -77,7 +146,75 @@ l0_gb300:
   # Two-rank cases include uneven/empty attention-DP batches and bounded CSA2 replay.
   - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_engram[world2-row-sharded]
   - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_decoder_bounded_replay[world2]
-  # NVFP4 DSpark accuracy and acceptance gates cover TP4 and attention-DP4.
+  # DSpark Markov chain and forked draft prep over IPC and MNNVL.
+  - unittest/_torch/speculative/test_dspark_markov_chain.py
+  - unittest/_torch/multi_gpu/test_dspark_draft_prep.py
+  # NVFP4 DSpark accuracy and acceptance gates cover TP4 and attention-DP4; attention-DP4 runs the
+  # 1017 export with MXFP4 Engram tables (its FP8-table variant runs post-merge).
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV41::test_gsm8k_dspark[nvfp4-tp4] TIMEOUT (120)
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV41::test_gsm8k_dspark[nvfp4-dp4] TIMEOUT (120)
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV41::test_gsm8k_dspark[nvfp4-1017-dp4] TIMEOUT (120)
   - accuracy/test_glm53_flash.py::TestGLM53FlashFP8::test_mtp[tp_size=4-ep_size=4] TIMEOUT (60)
+  # Exact LongBench v2 offload parity: TP2/EP2 context and generation workers. Pre-merge
+  # keeps GLM with an NVFP4 latent and V4 with block reuse; the FP8 variants run post-merge
+  # (l0_gb300_multi_gpus).
+  - unittest/_torch/attention/sparse/dsa/test_dsa_indexer.py::test_indexer_projection_is_batch_invariant
+  - accuracy/test_disaggregated_serving.py::TestGLM52NVFP4::test_kv_cache_offload[kv_dtype=nvfp4] TIMEOUT (30)
+  - accuracy/test_disaggregated_serving.py::TestDeepSeekV4Flash::test_kv_cache_offload_block_reuse TIMEOUT (30)
+  # qwen4_exp target, pre-merge: tep4 with three drafts and IndexShare, gsm8k and then
+  # 3k-6k-token pass keys with their acceptance-length floor. The other layouts and KV dtypes
+  # run post-merge (l0_gb300_multi_gpus).
+  - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_mtp3_gsm8k_and_long_context TIMEOUT (60)
+  # Qwen3.5 TP decode: KV-replica FP8 decode (TP2 / TP4), the MNNVL all-reduce + RMSNorm kernels and the LL TP
+  # exchanges (sampling, RoPE gather, group merge) at group sizes 2 and 4.
+  - unittest/_torch/attention/multi_gpu/test_gqa_kv_replica.py
+  - unittest/_torch/multi_gpu/test_mnnvl_fused_allreduce_norm.py
+  - unittest/_torch/multi_gpu/test_ll_exchange.py
+  # qwen4_exp FP8 target, pre-merge: its 2- and 4-rank collective matrices (l0_b300 skips them),
+  # tep4 MTP3 over an FP8 KV pool, and tep4 MTP3 with IndexShare over 3k-6k-token pass keys (the
+  # sparse attention path) with their acceptance-length floor. dep4 and dep2 disaggregated run
+  # post-merge.
+  - unittest/_torch/modeling_v2/models/qwen4_exp/qwen3_8_flash_next_fp8__sm_103__unified/comm
+  - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_fp8__sm_103__unified/test_accuracy.py::TestModelingV2Qwen38FlashNextFp8Sm103Unified::test_mtp3_gsm8k[tep4_fp8_kv_breakable] TIMEOUT (60)
+  - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_fp8__sm_103__unified/test_accuracy.py::TestModelingV2Qwen38FlashNextFp8Sm103Unified::test_mtp3_long_context TIMEOUT (60)
+
+# K3 collectives, decode-path exchanges and the dep16 MegaMoE at EP4, four ranks in one
+# NVLink domain.
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 4
+        lte: 4
+    wildcards:
+      gpu:
+      - '*gb110*'
+      - '*gb300*'
+      linux_distribution_name: ubuntu*
+      cpu: aarch64
+    terms:
+      stage: pre_merge
+      backend: pytorch
+  tests:
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__dep16/test_k3_megamoe.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_fused_moe/test_k3_latent_reduce.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/kernels/k3_markov/test_k3_markov.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/comm/test_k3_mnnvl_comm.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_fused_moe/test_k3_moe_front.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_fused_moe/test_k3_fused_moe_push.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/kernels/k3_moe_engines/test_k3_moe_push.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_sandwich/test_k3_sandwich.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/kernels/k3_spec_accept/test_k3_spec_accept_sharded.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/comm/test_modeling_v2_k3_latent_reduce_op_matrix.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/moe/test_modeling_v2_k3_moe_front_op_matrix.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/comm/test_modeling_v2_k3_sandwich_oproj_op_matrix.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_modeling_v2_k3_sandwich_plain_op_matrix.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/comm/test_modeling_v2_k3_sandwich_tail_op_matrix.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_modeling_v2_kimi_k3_decode_comm_tp16_moetp4ep4_op_matrix.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_mnnvl_mcast_workspace_op_matrix.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_modeling_v2_k3_spec_accept_op_matrix.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_modeling_v2_k3_markov_op_matrix.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_modeling_v2_kimi_k3_decode_comm_tp16_moetp16ep1_op_matrix.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_modeling_v2_kimi_k3_decode_moe_tp16_moetp16ep1_op_matrix.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/comm/test_modeling_v2_mnnvl_allgather_split_op_matrix.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/comm/test_modeling_v2_mnnvl_allreduce_attn_res_op_matrix.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/comm/test_modeling_v2_mnnvl_fusion_allreduce_op_matrix.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/comm/test_modeling_v2_k3_allreduce_op_matrix.py

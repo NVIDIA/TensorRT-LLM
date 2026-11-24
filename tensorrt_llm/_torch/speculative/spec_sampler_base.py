@@ -22,6 +22,7 @@ output into slot-indexed buffers, starts the async D2H copy, and updates
 requests host-side. Buffer shapes derive entirely from ``TorchSampler.Args``.
 """
 
+import math
 from dataclasses import dataclass
 from typing import Optional
 
@@ -29,10 +30,12 @@ import torch
 
 from ..._device_copy import DeviceCopyBuffer
 from ..._utils import prefer_pinned
+from ...bindings.executor import FinishReason
 from ...sampling_params import SamplingParams
 from ..kernels.spec_step_copies import op as spec_step_copies
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from ..pyexecutor.resource_manager import BaseResourceManager
+from ..pyexecutor.runtime_hooks import SpecStepFold
 from ..pyexecutor.sampler import (
     DEFAULT_BEAM_IDX,
     AsyncWorkerMixin,
@@ -40,13 +43,14 @@ from ..pyexecutor.sampler import (
     SampleState,
     SampleStateTensors,
     TorchSampler,
-    add_token,
     int_tensor,
 )
 from ..pyexecutor.sampler.penalties import has_occurrence_penalty
 from ..pyexecutor.sampler.sampler_common import _request_get_sampling_params, top_p_decay_active
-from ..pyexecutor.sampler.sampler_features import handle_stop_criteria
+from ..pyexecutor.sampler.sampler_features import max_token_room, meet_stop_token_criteria
+from ..pyexecutor.sampler.watermark import request_carries_watermark
 from ..pyexecutor.scheduler import ScheduledRequests
+from .spec_store_scatter import spec_store_scatter
 
 # Rejection messages for the sampling features the one-model speculative path
 # cannot honor. They are module constants because two places raise them: the
@@ -74,6 +78,11 @@ UNSUPPORTED_TOP_P_DECAY_MSG = (
     "top_p_decay is not supported with one-model speculative decoding. "
     "Drop top_p_decay / top_p_min from the request, or disable "
     "speculative decoding."
+)
+UNSUPPORTED_LOGITS_POST_PROCESSOR_MSG = (
+    "logits_processor (a logits post-processor callback) is not supported with one-model "
+    "speculative decoding. Drop logits_processor from the request, or disable speculative "
+    "decoding."
 )
 UNSUPPORTED_MIN_P_MSG = (
     "min_p requires 'advanced_sampling_mode: full' in the speculative decoding "
@@ -115,6 +124,10 @@ def one_model_sampling_rejection_reason(
         return UNSUPPORTED_NO_REPEAT_NGRAM_MSG
     if sampling_params.embedding_bias is not None:
         return UNSUPPORTED_EMBEDDING_BIAS_MSG
+    # A per-request callback becomes py_logits_post_processors; the one-model path never
+    # calls it (a fused verify may not even materialize the full logits).
+    if sampling_params.logits_processor:
+        return UNSUPPORTED_LOGITS_POST_PROCESSOR_MSG
     # The same predicate top_p_decay_active() delegates to, so "active" cannot
     # mean one thing here and another in the sampler.
     if SamplingParams.params_imply_top_p_decay_active(sampling_params.top_p_decay):
@@ -168,10 +181,18 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
     draft length every mode used to compute for itself.
     """
 
-    SampleState = SampleStateSpec
+    # The model's speculative step-input staging, when it opted into one (bind_spec_step_fold).
+    spec_step_fold: Optional[SpecStepFold] = None
+    # Copy the store on the D2H side stream also on the steps a step fold's forward stored the rows, when the fold
+    # awaits the copies through its store_copies_done (RuntimeHooks.sampler_d2h_side_stream).
+    d2h_side_stream_copies: bool = False
+    # Keep the stored rows' slot ids in a device buffer re-uploaded only when they change
+    # (RuntimeHooks.spec_small_h2d).
+    static_slot_ids: bool = False
+    _slot_ids_host: Optional[list[int]] = None
+    _slot_ids_cuda: Optional[torch.Tensor] = None
 
-    def is_generation_model(self) -> bool:
-        return True
+    SampleState = SampleStateSpec
 
     def validate_request(self, request: LlmRequest) -> None:
         """Reject sampling parameters the one-model speculative path cannot honor.
@@ -193,6 +214,11 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
                 f"{', '.join(unsupported_outputs)}. Drop these options from "
                 "the request, or disable speculative decoding."
             )
+
+        # A greedy request cannot carry a watermark, so it is served normally.
+        reason = getattr(self, "_watermark_unsupported_reason", None)
+        if reason is not None and request_carries_watermark(self._watermark_config, request):
+            raise ValueError(reason)
 
         sampling_config = request.sampling_config
         if sampling_config is None:
@@ -231,8 +257,8 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         """Reject logits-side sampling features the one-model path cannot apply.
 
         TorchSampler implements min_length, bad_words, no_repeat_ngram_size,
-        embedding_bias and top_p_decay by editing the target logits before
-        sampling. The one-model path has no logits-editing hook, so each is
+        embedding_bias, top_p_decay and logits post-processor callbacks by editing
+        the target logits before sampling. The one-model path has no logits-editing hook, so each is
         rejected here instead of being silently dropped.
 
         Each check gates on a non-neutral value rather than on presence, since a
@@ -251,18 +277,78 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             raise ValueError(UNSUPPORTED_NO_REPEAT_NGRAM_MSG)
         if getattr(request, "py_embedding_bias", None) is not None:
             raise ValueError(UNSUPPORTED_EMBEDDING_BIAS_MSG)
+        # The one-model sampler never calls a request's logits post-processors, and a fused
+        # verify (e.g. the MiniMax-M3 shard verify) does not even gather the full logits, so
+        # the callback would be skipped silently.
+        if getattr(request, "py_logits_post_processors", None):
+            raise ValueError(UNSUPPORTED_LOGITS_POST_PROCESSOR_MSG)
         # Reuse the handler's own predicate so "active" cannot drift between paths.
         if top_p_decay_active(_request_get_sampling_params(request)):
             raise ValueError(UNSUPPORTED_TOP_P_DECAY_MSG)
 
     @dataclass(kw_only=True)
     class Store:
-        """Storage for speculative decoding tensors."""
+        """Storage for speculative decoding tensors.
 
+        The host-read tensors are views of ``host_read``, so one D2H copy snapshots them.
+        """
+
+        host_read: torch.Tensor
         new_tokens: torch.Tensor
         next_new_tokens: torch.Tensor
         next_draft_tokens: torch.Tensor
         new_tokens_lens: torch.Tensor
+
+        @classmethod
+        def allocate(
+            cls,
+            *,
+            num_slots: int,
+            accepted_len: int,
+            draft_len: int,
+            beam_width: int,
+            device: str = "cuda",
+        ) -> "SpecSampler.Store":
+            """A store for ``num_slots`` slots."""
+            new_tokens_shape = (accepted_len, num_slots, beam_width)
+            host_read = int_tensor(
+                (math.prod(new_tokens_shape) + num_slots * (1 + draft_len),), device=device
+            )
+            new_tokens, new_tokens_lens, next_draft_tokens = cls._host_read_views(
+                host_read, new_tokens_shape, (num_slots, draft_len)
+            )
+            return cls(
+                host_read=host_read,
+                new_tokens=new_tokens,
+                next_new_tokens=int_tensor((draft_len + 1, num_slots, beam_width), device=device),
+                next_draft_tokens=next_draft_tokens,
+                new_tokens_lens=new_tokens_lens,
+            )
+
+        @staticmethod
+        def _host_read_views(
+            host_read: torch.Tensor,
+            new_tokens_shape: tuple[int, ...],
+            next_draft_tokens_shape: tuple[int, ...],
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            lens_start = math.prod(new_tokens_shape)
+            drafts_start = lens_start + next_draft_tokens_shape[0]
+            return (
+                host_read[:lens_start].view(new_tokens_shape),
+                host_read[lens_start:drafts_start],
+                host_read[drafts_start:].view(next_draft_tokens_shape),
+            )
+
+        def views_of(self, host_read: torch.Tensor) -> SampleStateTensorsSpec:
+            """The host-read tensors of a copy of ``host_read``."""
+            new_tokens, new_tokens_lens, next_draft_tokens = self._host_read_views(
+                host_read, tuple(self.new_tokens.shape), tuple(self.next_draft_tokens.shape)
+            )
+            return SampleStateTensorsSpec(
+                new_tokens=new_tokens,
+                new_tokens_lens=new_tokens_lens,
+                next_draft_tokens=next_draft_tokens,
+            )
 
     def __init__(
         self,
@@ -271,6 +357,7 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         enable_penalty: bool = False,
         penalty_supported: bool = True,
         fused_sampling: bool = False,
+        watermark_unsupported_reason: Optional[str] = None,
     ):
         """
         Initialize the speculative sampler.
@@ -283,9 +370,13 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             penalty_supported: whether this speculation mode's row layout is one
                 the penalties can map (linear modes yes, tree modes not yet).
             fused_sampling: whether the configured sampler supports min_p.
+            watermark_unsupported_reason: why this speculation mode cannot serve watermarked
+                requests (None when it can). Such requests are rejected at admission.
         """
         self._enable_penalty = enable_penalty
         self._penalty_supported = penalty_supported
+        self._watermark_config = args.watermark_config
+        self._watermark_unsupported_reason = watermark_unsupported_reason
         self._fused_sampling = fused_sampling
         self._async_worker_init(args.enable_async_worker)
         self.mapping = None
@@ -309,33 +400,93 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         self.max_accepted_path_len = args.max_draft_len + 1
         self._store_scatter: Optional[spec_step_copies.SlotScatter] = None
         self._slot_table_buffer: Optional[DeviceCopyBuffer] = None
-        if spec_step_copies.is_supported():
+        self._slot_table_slots: Optional[list[int]] = None
+        if spec_step_copies.slot_scatter_supported():
             self._store_scatter = spec_step_copies.SlotScatter()
             self._slot_table_buffer = DeviceCopyBuffer(
                 torch.zeros((seq_slots,), dtype=torch.int32, device="cuda"),
                 pin_memory=prefer_pinned(),
             )
-        # Recorded after the last step's host copies of the stores, which read
+        # Recorded after the last step's host snapshot of the stores, which reads
         # them on the D2H side stream.
         self._store_copies_done: Optional[torch.cuda.Event] = None
-        self.store = self.Store(
-            new_tokens=int_tensor((self.max_accepted_path_len, seq_slots, self.max_beam_width)),
-            next_new_tokens=int_tensor(
-                (args.max_total_draft_tokens + 1, seq_slots, self.max_beam_width)
-            ),
-            next_draft_tokens=int_tensor((seq_slots, args.max_total_draft_tokens)),
-            new_tokens_lens=int_tensor((seq_slots,)),
+        self.store = self.Store.allocate(
+            num_slots=seq_slots,
+            accepted_len=self.max_accepted_path_len,
+            draft_len=args.max_total_draft_tokens,
+            beam_width=self.max_beam_width,
         )
+        # The last batch's slots and their device tensor.
+        self._last_slot_index: Optional[tuple[tuple[int, ...], torch.Tensor]] = None
 
-    def _request_common_handling(
+    def _slot_index(self, slot_ids: list[int]) -> torch.Tensor:
+        """The batch's slots as a device tensor, reused while they do not change."""
+        key = tuple(slot_ids)
+        if self._last_slot_index is None or self._last_slot_index[0] != key:
+            slots = torch.tensor(key, dtype=torch.long, pin_memory=prefer_pinned()).to(
+                device="cuda", non_blocking=True
+            )
+            self._last_slot_index = (key, slots)
+        return self._last_slot_index[1]
+
+    def _device_slot_ids(self, seq_slots: list[int]) -> torch.Tensor:
+        """The slot ids on the device, uploaded only when they differ from the last upload.
+
+        The buffer is this sampler's own: only this method writes it, so the last uploaded
+        list describes its contents, and the stream orders each upload after the scatter that
+        read the previous ids.
+        """
+        n = len(seq_slots)
+        if self._slot_ids_cuda is None or self._slot_ids_cuda.numel() < n:
+            self._slot_ids_cuda = torch.empty(max(n, 8), dtype=torch.long, device="cuda")
+            self._slot_ids_host = None
+        if self._slot_ids_host != list(seq_slots):
+            self._slot_ids_cuda[:n].copy_(
+                torch.tensor(seq_slots, dtype=torch.long, pin_memory=prefer_pinned()),
+                non_blocking=True,
+            )
+            self._slot_ids_host = list(seq_slots)
+        return self._slot_ids_cuda[:n]
+
+    def _copy_outputs_to_host(
         self,
-        request: LlmRequest,
-        next_draft_tokens: list[list[int]],
-        runtime_draft_len: Optional[int],
-    ) -> None:
-        """Common handling for both context and generation requests."""
-        request.py_draft_tokens = next_draft_tokens[request.py_seq_slot][:runtime_draft_len]
-        request.py_decoding_iter += 1
+        o_verify_lens: Optional[torch.Tensor],
+        forward_stored_rows: bool,
+        store_copies_done: Optional[torch.cuda.Event] = None,
+    ) -> tuple[SampleStateTensorsSpec, Optional[torch.cuda.Event]]:
+        """Host copies of the step's stored outputs, and the side-stream event to await them by (or None).
+
+        The per-slot store is copied on the D2H side stream, so the copies overlap the next step's input staging
+        instead of preceding it on the main stream. That is sound while nothing rewrites the store before the next
+        ``sample_async`` waits on ``_store_copies_done``, which holds when this sampler stored the rows itself.
+        ``verify_lens`` is a forward output buffer the next replay rewrites, so it is always copied on the main
+        stream.
+
+        When the forward stored the rows (a step fold), the next replay rewrites the store, so the copies stay on
+        the main stream unless the fold awaits them: with ``d2h_side_stream_copies`` and the fold's
+        ``store_copies_done``, that event is recorded on the side stream after the copies and the forward waits
+        on it before it writes the store.
+        """
+        verify_lens = self._copy_to_host(o_verify_lens) if o_verify_lens is not None else None
+        fold_awaits_copies = self.d2h_side_stream_copies and store_copies_done is not None
+        if self._async_worker_active() or (forward_stored_rows and not fold_awaits_copies):
+            host = self.store.views_of(self._copy_to_host(self.store.host_read))
+            host.verify_lens = verify_lens
+            return host, None
+        with self._make_side_stream_copier() as copier:
+            host_read = copier.stage_copy_to_host(self.store.host_read)
+        host = self.store.views_of(host_read)
+        host.verify_lens = verify_lens
+        self._store_copies_done = copier.event
+        if store_copies_done is not None and copier.event is not None:
+            # The fold's forward waits on it before every store write, whoever stored this step's rows.
+            store_copies_done.record(self._d2h_side_stream)
+        return host, copier.event
+
+    def bind_spec_step_fold(self, spec_step_fold: SpecStepFold) -> None:
+        """Let the model's forward store into this sampler's per-slot store (see SpecStepFold)."""
+        self.spec_step_fold = spec_step_fold
+        spec_step_fold.bind_sampler_store(self.store)
 
     def update_requests(
         self,
@@ -379,44 +530,54 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
                         "the executed window, original proposals, and token storage"
                     )
 
+        max_accepted_path_len = self.max_accepted_path_len
+        max_seq_len = self.max_seq_len
+        draft_lens = state.draft_lens
         for req_idx, req in enumerate(state.requests):
             if req.state == LlmRequestState.GENERATION_COMPLETE:
                 continue
-            num_new_tokens = new_tokens_lens_list[req.py_seq_slot]
-            # new_tokens is sized to this bound, and add_token indexes a plain
-            # host-side list, so a violation would otherwise surface as an
-            # opaque IndexError.
-            assert num_new_tokens <= self.max_accepted_path_len, (
+            seq_slot = req.py_seq_slot
+            assert seq_slot is not None
+            num_new_tokens = new_tokens_lens_list[seq_slot]
+            # new_tokens is sized to this bound; fail clearly, not with an IndexError.
+            assert num_new_tokens <= max_accepted_path_len, (
                 f"accepted {num_new_tokens} tokens in one step, but new_tokens is "
-                f"sized for {self.max_accepted_path_len}"
+                f"sized for {max_accepted_path_len}"
             )
+            # handle_stop_criteria inlined, with the per-request reads hoisted.
+            end_id = req.py_end_id
+            room = max_token_room(req, max_seq_len, beam_idx)
+            stop_words = req.py_stop_words_list
             for i in range(num_new_tokens):
-                new_token = add_token(req, new_tokens, beam_idx=beam_idx, step=i)
-                if handle_stop_criteria(
-                    req, new_token, max_seq_len=self.max_seq_len, beam_idx=beam_idx
-                ):
+                new_token = new_tokens[i][seq_slot][beam_idx]
+                req.add_new_token(new_token, beam_idx)
+                if new_token == end_id:
+                    req.finish_by(FinishReason.END_ID, beam_idx)
                     break
-            req.py_num_accepted_draft_tokens = num_new_tokens - 1
-            # Pair the acceptance count with the draft count of the SAME step,
-            # snapshotted at sample_async time: _request_common_handling below
-            # replaces py_draft_tokens with the next step's buffer, so its
-            # length must not be used as the denominator (0 for the request's
-            # prefill step, where nothing was verified).
+                if i + 1 >= room:
+                    req.finish_by(FinishReason.LENGTH, beam_idx)
+                    break
+                if stop_words and meet_stop_token_criteria(req, new_token, beam_idx):
+                    req.finish_by(FinishReason.STOP_WORDS, beam_idx)
+                    break
+            num_accepted = num_new_tokens - 1
+            req.py_num_accepted_draft_tokens = num_accepted
+            # Pair acceptance with the SAME step's draft count, snapshotted at sample_async time
+            # (0 at prefill): py_draft_tokens is replaced below with the next step's buffer.
             verified_len = (
                 token_windows[req_idx] - 1 if token_windows is not None else runtime_draft_len
             )
-            drafted_len = state.draft_lens[req_idx] if state.draft_lens is not None else 0
+            drafted_len = draft_lens[req_idx] if draft_lens is not None else 0
             req.py_num_draft_tokens_verified = min(drafted_len, verified_len)
-            req.py_rewind_len = verified_len - req.py_num_accepted_draft_tokens
-            self._request_common_handling(req, next_draft_tokens_list, runtime_draft_len)
+            req.py_rewind_len = verified_len - num_accepted
+            req.py_draft_tokens = next_draft_tokens_list[seq_slot][:runtime_draft_len]
+            req.py_decoding_iter += 1
 
     def _scatter_to_stores(
         self, outputs: dict[str, torch.Tensor], num_skip: int, slots: list[int]
     ) -> None:
         """Move rows ``num_skip`` onward of the forward's outputs into the stores at ``slots``."""
         num_sampling_requests = len(slots)
-        slots_device = torch.as_tensor(slots, dtype=torch.long)
-        slots_device = slots_device.to(device="cuda", non_blocking=True)
 
         o_new_tokens = outputs["new_tokens"][num_skip : num_skip + num_sampling_requests]
         o_new_tokens_lens = outputs["new_tokens_lens"][num_skip : num_skip + num_sampling_requests]
@@ -425,7 +586,16 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         ]
         o_next_new_tokens = outputs["next_new_tokens"][num_skip : num_skip + num_sampling_requests]
 
-        # Pad or truncate to match fixed-size store buffers for index_copy_.
+        slots_device = (
+            self._device_slot_ids(slots) if self.static_slot_ids else self._slot_index(slots)
+        )
+        step_fold = self.spec_step_fold
+        if step_fold is not None and step_fold.scatter(
+            slots_device, o_new_tokens, o_next_new_tokens, o_new_tokens_lens, o_next_draft_tokens
+        ):
+            return
+
+        # Pad or truncate to match fixed-size store buffers for the scatter.
         # The worker output width tracks runtime_draft_len, which dynamic draft
         # length shrinks below the statically allocated store width.
         new_tokens_width = self.store.new_tokens.shape[0]
@@ -450,11 +620,25 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         elif o_next_new_tokens.shape[1] > next_new_tokens_width:
             o_next_new_tokens = o_next_new_tokens[:, :next_new_tokens_width]
 
-        # Use index_copy_ for efficient copying (slots are unique)
-        self.store.new_tokens.squeeze(-1).T.index_copy_(0, slots_device, o_new_tokens)
-        self.store.next_new_tokens.squeeze(-1).T.index_copy_(0, slots_device, o_next_new_tokens)
-        self.store.new_tokens_lens.index_copy_(0, slots_device, o_new_tokens_lens)
-        self.store.next_draft_tokens.index_copy_(0, slots_device, o_next_draft_tokens)
+        # The scatter reads one output row and writes one store slot per request, unchecked.
+        num_slots = self.store.new_tokens_lens.shape[0]
+        if any(
+            rows.shape[0] != num_sampling_requests
+            for rows in (o_new_tokens, o_new_tokens_lens, o_next_draft_tokens, o_next_new_tokens)
+        ) or (slots and not (min(slots) >= 0 and max(slots) < num_slots)):
+            raise ValueError("speculative outputs need one row and an in-range slot per request")
+
+        spec_store_scatter(
+            slots_device,
+            o_new_tokens,
+            o_next_new_tokens,
+            o_new_tokens_lens,
+            o_next_draft_tokens,
+            self.store.new_tokens.squeeze(-1),
+            self.store.next_new_tokens.squeeze(-1),
+            self.store.new_tokens_lens,
+            self.store.next_draft_tokens,
+        )
 
     def sample_async(
         self,
@@ -543,10 +727,17 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             # The previous step's host copies may still be reading the stores.
             torch.cuda.current_stream().wait_event(self._store_copies_done)
         slots = [r.py_seq_slot for r in sampling_requests]
-        scattered = False
-        if self._store_scatter is not None:
+        step_fold = self.spec_step_fold
+        forward_stored_rows = step_fold is not None and step_fold.sampler_rows_stored(
+            outputs, num_skip, slots
+        )
+        scattered = forward_stored_rows
+        # A model's step fold scatters the stores itself, in _scatter_to_stores.
+        if not scattered and step_fold is None and self._store_scatter is not None:
             # A step whose batch is unchanged leaves the slot table as it is.
-            self._slot_table_buffer.update(torch.tensor(slots, dtype=torch.int32))
+            if slots != self._slot_table_slots:
+                self._slot_table_buffer.update(torch.tensor(slots, dtype=torch.int32))
+                self._slot_table_slots = slots
             scattered = self._store_scatter.scatter(
                 outputs,
                 num_skip,
@@ -567,33 +758,11 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             next_draft_tokens=self.store.next_draft_tokens,
         )
 
-        if self._async_worker_active():
-            host_tensors = SampleStateTensorsSpec(
-                new_tokens=self._copy_to_host(self.store.new_tokens),
-                new_tokens_lens=self._copy_to_host(self.store.new_tokens_lens),
-                next_draft_tokens=self._copy_to_host(self.store.next_draft_tokens),
-                verify_lens=(
-                    self._copy_to_host(o_verify_lens) if o_verify_lens is not None else None
-                ),
-            )
-            sampler_event = self._record_sampler_event()
-        else:
-            # The next step's input preparation waits on this stream and only
-            # needs the stores, so the host copies run on the side stream.
-            # update_requests syncs their event before reading them, and the
-            # next step's store update waits for it on this stream.
-            host_verify_lens = (
-                self._copy_to_host(o_verify_lens) if o_verify_lens is not None else None
-            )
-            with self._make_side_stream_copier() as copier:
-                host_tensors = SampleStateTensorsSpec(
-                    new_tokens=copier.stage_copy_to_host(self.store.new_tokens),
-                    new_tokens_lens=copier.stage_copy_to_host(self.store.new_tokens_lens),
-                    next_draft_tokens=copier.stage_copy_to_host(self.store.next_draft_tokens),
-                    verify_lens=host_verify_lens,
-                )
-            self._store_copies_done = copier.event
-            sampler_event = self._record_sampler_event(side_stream_event=copier.event)
+        store_copies_done = getattr(step_fold, "store_copies_done", None) if step_fold else None
+        host_tensors, side_stream_event = self._copy_outputs_to_host(
+            o_verify_lens, forward_stored_rows, store_copies_done
+        )
+        sampler_event = self._record_sampler_event(side_stream_event=side_stream_event)
 
         # Add dummy draft tokens to context requests for KV cache preparation
         for request in finished_context_requests:

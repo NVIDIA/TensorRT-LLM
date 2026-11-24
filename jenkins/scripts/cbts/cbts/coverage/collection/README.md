@@ -133,10 +133,10 @@ yet anyway.
 - **Unit tests** (`test_unittests_v2[entry]`): the inner pytest carries no plugin, so the whole batch
   runs under the one inherited `CBTS_TEST_ID`, which equals the test-db entry. This matches CBTS's
   selection granularity.
-- `co_qualname` gives `Class.method`, so results roll up function → class → file.
-- Comprehension, generator and lambda frames are skipped, and so is any frame whose qualname
-  contains `<locals>`: a decorator's `wrapper` or a registered callback leaves no row however often
-  it runs. The consumer widens such a change to file level; see `COLLECTION.md` §5.1.
+- `co_qualname` gives `Class.method`, so results roll up function → class → file. A named closure
+  (a decorator's `wrapper`, a registered callback) keeps its full nested qualname and rolls up the
+  same way; only a generator expression or lambda frame is skipped, since neither has a positional
+  identity to record one by. See `COLLECTION.md` §5.1.
 
 ## Taint
 

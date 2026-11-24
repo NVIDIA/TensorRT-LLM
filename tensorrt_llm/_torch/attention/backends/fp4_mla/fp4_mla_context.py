@@ -20,10 +20,12 @@ from typing import TYPE_CHECKING, Callable, Optional, Tuple
 import torch
 import triton
 
-from tensorrt_llm._utils import get_sm_version, prefer_pinned
+from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.quantization.mode import QuantMode
 
+from .config import fp4_mla_cache_layout
+from .config import require_fp4_mla_fp8_context_support as require_fp4_mla_fp8_context_support
 from .fp4_mla_kernels import _fp8_mla_context_block_table_kernel
 
 if TYPE_CHECKING:
@@ -31,23 +33,6 @@ if TYPE_CHECKING:
         TrtllmAttention,
         TrtllmAttentionMetadata,
     )
-
-
-_FP8_CONTEXT_SUPPORTED_SMS = {90, 100, 103, 107, 120}
-_FP8_CONTEXT_SCRATCH_ATTR = "_fp4_mla_fp8_context_scratch"
-
-
-def require_fp4_mla_fp8_context_support() -> None:
-    """Validate support for TRT-LLM's FP8 MLA context FMHA."""
-    sm = get_sm_version()
-    if sm not in _FP8_CONTEXT_SUPPORTED_SMS:
-        supported_sms = ", ".join(
-            str(supported_sm) for supported_sm in sorted(_FP8_CONTEXT_SUPPORTED_SMS)
-        )
-        raise RuntimeError(
-            f"FP4 MLA context requires TRT-LLM FP8 FMHA, which is not "
-            f"supported on SM{sm}. Supported SM versions: {supported_sms}."
-        )
 
 
 def _execute_fp8_context_with_cache_update(
@@ -94,6 +79,9 @@ class _Fp8MlaContextCacheManagerView:
     kv_cache_pool_mapping: torch.Tensor
     layer_offsets: Tuple[int, ...]
     dtype: DataType = DataType.FP8
+    # The scratch holds one layer with no sliding window, so TRT-LLM attention
+    # falls back to the partition's max_seq_len for the attention window.
+    max_attention_window_vec: Tuple[Optional[int], ...] = (None,)
 
 
 @dataclass
@@ -356,6 +344,37 @@ def _build_fp8_mla_context_metadata(
     # per-token position-offset input.
     fp8_meta.helix_position_offsets = meta.fp4_mla_state.positions[: meta.num_ctx_tokens]
     return fp8_meta
+
+
+def get_or_create_fp8_mla_context_scratch(
+    kv_cache_manager: object,
+    meta: "TrtllmAttentionMetadata",
+    *,
+    device: torch.device,
+    head_dim: int,
+) -> "_Fp8MlaContextScratch":
+    """Return the FP8 MLA context scratch of the manager's cache layout, creating or validating it."""
+    cache_layout = fp4_mla_cache_layout(kv_cache_manager)
+    if cache_layout is None:
+        raise RuntimeError(
+            "FP8 MLA context scratch requires a KV cache manager with the FP4 MLA cache layout."
+        )
+    created = False
+
+    def create_scratch() -> _Fp8MlaContextScratch:
+        nonlocal created
+        created = True
+        return _Fp8MlaContextScratch.create(meta, device=device, head_dim=head_dim)
+
+    scratch = cache_layout.get_or_create_fp8_context_scratch(create_scratch)
+    assert isinstance(scratch, _Fp8MlaContextScratch)
+    if not created:
+        fp8_context_state = meta.fp4_mla_state.fp8_context_state
+        if fp8_context_state is None or fp8_context_state[0] is not scratch:
+            assert scratch.matches(meta, device=device, head_dim=head_dim), (
+                "FP8 MLA context scratch geometry must be shared by all layers of its KV manager."
+            )
+    return scratch
 
 
 def _get_fp8_mla_context_metadata(
