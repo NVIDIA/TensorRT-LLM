@@ -47,6 +47,9 @@ if TYPE_CHECKING:
 
     from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 
+from ..attention.backends.fp4_mla.config import \
+    FP4_BLOCK_SIZE as FP4_MLA_QUANTIZATION_TILE_SIZE
+from ..attention.backends.fp4_mla.config import FP4_MLA_TOKENS_PER_BLOCK
 from ..attention.backends.interface import AttentionRuntimeFeatures
 from ..attention.backends.utils import get_attention_backend
 from ..distributed import Distributed
