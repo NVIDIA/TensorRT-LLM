@@ -47,6 +47,7 @@
 #include <torch/extension.h>
 #include <type_traits>
 #include <unordered_map>
+#include <vector>
 
 using namespace tensorrt_llm::kernels;
 namespace tc = tensorrt_llm::common;
@@ -2618,12 +2619,8 @@ void MLA::initContext()
         // Context attention of MLA is different
         fmhaParams.numKvHeads = num_heads;
         fmhaParams.headSize = mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim;
-        // Ideally this should be mMLAParams.v_head_dim, but because we initialize both MLA
-        // context(v_head_dim=128) and gen(v_head_dim=512) runners in a single op, the headSizeV
-        // will be set to 512 when we create the gen attention op and that could fail to create
-        // the FmhaDispatcher for context phase. Luckily, for deepseek, qk_nope_head_dim is the
-        // same as v_head_dim in context phase.
-        fmhaParams.headSizeV = mMLAParams.qk_nope_head_dim;
+        // Context and generation MLA ops are built separately, so this is the context layer's own V width.
+        fmhaParams.headSizeV = mMLAParams.v_head_dim;
         fmhaParams.qScaling = q_scaling;
     }
     applyFeatures(fmhaParams);
@@ -3138,9 +3135,125 @@ tensorrt_llm::common::op::AttentionContextWorkspaceLayout MLA::contextWorkspaceL
     return AttentionWorkspaceManager::buildContextLayout(workspaceSizes);
 }
 
+namespace
+{
+
+// Row budget of one packed group, bounding a batched windowed call's scratch (a group holds at least one sequence).
+constexpr int64_t kMlaWindowedPackedRowsPerGroup = 2048;
+
+struct MlaWindowedPackedGroup
+{
+    int32_t start;
+    int32_t end;
+    int64_t rows;
+    int32_t maxBlock;
+    int32_t maxQ;
+};
+
+// Groups the call's sequences to fit the row budget. A sequence's block keeps its newest
+// min(kvLen, window + qLen - 1) keys, the reach of its oldest query.
+std::vector<MlaWindowedPackedGroup> mlaWindowedPackedGroups(FmhaParams const& p, int32_t const window)
+{
+    int32_t const* const hostKvLens = p.getHostPastKeyValueLengths();
+    int32_t const* const hostQLens = p.getHostContextLengths();
+    std::vector<int32_t> packedLens(static_cast<std::size_t>(p.batch_size));
+    for (int32_t b = 0; b < p.batch_size; ++b)
+    {
+        packedLens[b] = static_cast<int32_t>(
+            std::min<int64_t>(static_cast<int64_t>(hostKvLens[b]), static_cast<int64_t>(window) + hostQLens[b] - 1));
+    }
+    std::vector<MlaWindowedPackedGroup> groups;
+    for (int32_t start = 0; start < p.batch_size;)
+    {
+        MlaWindowedPackedGroup group{start, start, 0, 0, 0};
+        do
+        {
+            group.rows += packedLens[group.end];
+            group.maxBlock = std::max(group.maxBlock, packedLens[group.end]);
+            group.maxQ = std::max(group.maxQ, hostQLens[group.end]);
+            ++group.end;
+        } while (group.end < p.batch_size && group.rows + packedLens[group.end] <= kMlaWindowedPackedRowsPerGroup);
+        groups.push_back(group);
+        start = group.end;
+    }
+    return groups;
+}
+
+// Offsets of the windowed scratch: [cumKv | kvLens | staged output rows | packed QKV rows].
+struct MlaWindowedPackedScratch
+{
+    int64_t lensOffset;
+    int64_t stagingOffset;
+    int64_t packedOffset;
+    int64_t totalBytes;
+};
+
+MlaWindowedPackedScratch mlaWindowedPackedScratch(
+    std::vector<MlaWindowedPackedGroup> const& groups, int64_t packedRowBytes, int64_t outRowBytes)
+{
+    MlaWindowedPackedScratch scratch{0, 0, 0, 0};
+    if (groups.empty())
+    {
+        return scratch;
+    }
+    int64_t maxRows = 0;
+    int32_t maxSeqs = 0;
+    for (auto const& group : groups)
+    {
+        maxRows = std::max(maxRows, group.rows);
+        maxSeqs = std::max(maxSeqs, group.end - group.start);
+    }
+    auto const roundUp16 = [](int64_t value) { return (value + 15) / 16 * 16; };
+    int64_t const cumBytes = static_cast<int64_t>(maxSeqs + 1) * sizeof(int32_t);
+    int64_t const lensBytes = static_cast<int64_t>(maxSeqs) * sizeof(int32_t);
+    scratch.lensOffset = roundUp16(cumBytes);
+    scratch.stagingOffset = roundUp16(scratch.lensOffset + lensBytes);
+    scratch.packedOffset = roundUp16(scratch.stagingOffset + maxRows * outRowBytes);
+    scratch.totalBytes = scratch.packedOffset + maxRows * packedRowBytes;
+    return scratch;
+}
+
+// Byte widths of the [Q | K | V] packed row segments and of one output row.
+struct MlaWindowedPackedBytes
+{
+    int64_t q;
+    int64_t k;
+    int64_t v;
+    int64_t packedRow;
+    int64_t outRow;
+};
+
+MlaWindowedPackedBytes mlaWindowedPackedBytes(bool const fp8Context, int64_t const ioElemBytes, int32_t const numQHeads,
+    int32_t const numKvHeads, int32_t const qkDim, int32_t const vHeadDim)
+{
+    int64_t const elemBytes = fp8Context ? 1 : ioElemBytes;
+    int64_t const q = static_cast<int64_t>(numQHeads) * qkDim * elemBytes;
+    int64_t const k = static_cast<int64_t>(numKvHeads) * qkDim * elemBytes;
+    int64_t const v = static_cast<int64_t>(numKvHeads) * vHeadDim * elemBytes;
+    // The FMHA writes the output in the io dtype even for fp8 operands.
+    return {q, k, v, q + k + v, static_cast<int64_t>(numQHeads) * vHeadDim * ioElemBytes};
+}
+
+} // namespace
+
 size_t MLA::getWorkspaceSizeForContext(FmhaParams const& p) const
 {
-    return p.num_tokens == 0 ? 0 : contextWorkspaceLayout(p).totalSize;
+    if (p.num_tokens == 0)
+    {
+        return 0;
+    }
+    std::size_t total = contextWorkspaceLayout(p).totalSize;
+    // A repacked windowed call keeps its scratch past the layout in the same workspace.
+    int32_t const window = p.cyclic_attention_window_size;
+    if (!useSparseMLA() && mFmhaDispatcher->usesTrtllmGen() && window > 0 && p.max_past_kv_length > window)
+    {
+        int32_t const qkDim = mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim;
+        MlaWindowedPackedBytes const bytes = mlaWindowedPackedBytes(
+            mFP8ContextMLA, p.getQueryInput().element_size(), mNumAttnHeads, num_heads, qkDim, mMLAParams.v_head_dim);
+        total += static_cast<std::size_t>(
+            mlaWindowedPackedScratch(mlaWindowedPackedGroups(p, window), bytes.packedRow, bytes.outRow).totalBytes);
+    }
+    return total;
 }
 
 size_t MLA::getWorkspaceSizeForGeneration(FmhaParams const& p) const noexcept
@@ -3598,8 +3711,97 @@ int MLA::enqueueContext(FmhaParams const& p, cudaStream_t stream)
         fmhaParams.chunkedAttentionSize = *p.attn.attention_chunk_size;
     }
 
-    // Run the fmha kernel.
-    mFmhaDispatcher->run(fmhaParams);
+    // A sliding-window call whose history exceeds the window needs a windowed mask, which depends on
+    // this call's kv length, so the fixed probe cannot vouch for it.
+    int32_t const window = p.cyclic_attention_window_size;
+    bool const windowedContext
+        = !useSparseMLA() && mFmhaDispatcher->usesTrtllmGen() && window > 0 && fmhaParams.kvSeqLen > window;
+    if (!windowedContext || mFmhaDispatcher->isSupported(fmhaParams))
+    {
+        // Run the fmha kernel.
+        mFmhaDispatcher->run(fmhaParams);
+        sync_check_cuda_error(stream);
+        return 0;
+    }
+
+    // No separate-Q/K/V kernel carries a windowed mask; the packed-QKV layout does but needs
+    // qLen == kvLen per sequence. So each sequence is truncated to its newest
+    // min(kvLen, window + qLen - 1) keys with its queries in the last qLen rows of the block; the
+    // window mask in truncated coordinates then reads exactly the keys of the true window.
+    std::vector<MlaWindowedPackedGroup> const groups = mlaWindowedPackedGroups(p, window);
+    TLLM_CHECK_WITH_INFO(fmhaParams.softmaxStatsPtr == nullptr,
+        "Windowed MLA context cannot produce softmax statistics: a packed row is not a query row.");
+    bool const usesChunkedAttention = fmhaParams.chunkedAttentionSize > 0 && fmhaParams.chunkedAttentionSize != INT_MAX
+        && fmhaParams.chunkedAttentionSize < fmhaParams.kvSeqLen;
+    TLLM_CHECK_WITH_INFO(!usesChunkedAttention,
+        "Windowed MLA context cannot repack a chunked-attention call: truncation shifts absolute positions.");
+
+    int32_t const qkDim = mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim;
+    MlaWindowedPackedBytes const bytes = mlaWindowedPackedBytes(
+        mFP8ContextMLA, static_cast<int64_t>(sizeof(T)), mNumAttnHeads, num_heads, qkDim, mMLAParams.v_head_dim);
+
+    // The scratch lives past the context layout in the workspace that getWorkspaceSizeForContext reserved.
+    MlaWindowedPackedScratch const packedScratch = mlaWindowedPackedScratch(groups, bytes.packedRow, bytes.outRow);
+    int64_t const workspaceSize = contextWorkspaceLayout(p).totalSize;
+    TLLM_CHECK_WITH_INFO(static_cast<int64_t>(p.workspace.numel()) >= workspaceSize + packedScratch.totalBytes,
+        "The attention workspace (%lld bytes) does not hold the windowed packed scratch (%lld bytes past %lld).",
+        static_cast<long long>(p.workspace.numel()), static_cast<long long>(packedScratch.totalBytes),
+        static_cast<long long>(workspaceSize));
+    char* const scratchBase = static_cast<char*>(p.getWorkspace()) + workspaceSize;
+    int32_t* const packedCumKv = reinterpret_cast<int32_t*>(scratchBase);
+    int32_t* const packedKvLens = reinterpret_cast<int32_t*>(scratchBase + packedScratch.lensOffset);
+    void* const stagingO = scratchBase + packedScratch.stagingOffset;
+    void* const packedQkv = scratchBase + packedScratch.packedOffset;
+
+    // V comes from the call's own V tensor unless the fp8 path quantized it into the workspace.
+    int64_t vSrcRowBytes = bytes.v;
+    if (!mFP8ContextMLA || mla.fp8_kv_input)
+    {
+        if (p.value_input.has_value())
+        {
+            vSrcRowBytes = p.value_input->stride(0) * p.value_input->element_size();
+        }
+        else if (fmhaParams.vStrideInBytes > 0)
+        {
+            vSrcRowBytes = fmhaParams.vStrideInBytes;
+        }
+    }
+
+    // Per group, query and key lengths are both the block length; the host maximum block sizes the grid.
+    MHARunnerParams packedParams = fmhaParams;
+    packedParams.qkvPtr = packedQkv;
+    packedParams.qPtr = nullptr;
+    packedParams.kPtr = nullptr;
+    packedParams.vPtr = nullptr;
+    packedParams.kvPtr = nullptr;
+    packedParams.vStrideInBytes = 0;
+    packedParams.outputPtr = stagingO;
+    packedParams.cuQSeqLenPtr = packedCumKv;
+    packedParams.cuKvSeqLenPtr = packedCumKv;
+    packedParams.kvSeqLenPtr = packedKvLens;
+    packedParams.cuMaskRowsPtr = nullptr;
+    for (auto const& group : groups)
+    {
+        packedParams.b = group.end - group.start;
+        packedParams.totalQSeqLen = static_cast<int>(group.rows);
+        packedParams.totalKvSeqLen = static_cast<int>(group.rows);
+        packedParams.qSeqLen = group.maxBlock;
+        packedParams.kvSeqLen = group.maxBlock;
+        TLLM_CHECK_WITH_INFO(mFmhaDispatcher->isSupported(packedParams, AttentionInputLayout::PACKED_QKV),
+            "No windowed MLA context kernel (kv length %d, window %d, q length %d, block of %d rows).",
+            fmhaParams.kvSeqLen, window, p.input_seq_length, group.maxBlock);
+
+        invokeMlaWindowedPackedSeqLens(
+            contextCuQSeqlens, contextCuKvSeqlens, group.start, group.end, window, packedCumKv, packedKvLens, stream);
+        invokeMlaWindowedPackedQkvPack(fmhaParams.qPtr, fmhaParams.kPtr, fmhaParams.vPtr, bytes.q, bytes.k,
+            vSrcRowBytes, static_cast<int32_t>(bytes.q), static_cast<int32_t>(bytes.k), static_cast<int32_t>(bytes.v),
+            packedQkv, bytes.packedRow, packedCumKv, contextCuQSeqlens, contextCuKvSeqlens, group.start, group.end,
+            group.maxBlock, stream);
+
+        mFmhaDispatcher->run(packedParams, AttentionInputLayout::PACKED_QKV);
+        invokeMlaWindowedPackedOutputCompact(stagingO, fmhaParams.outputPtr, bytes.outRow, packedCumKv,
+            contextCuQSeqlens, group.start, group.end, group.maxQ, stream);
+    }
     sync_check_cuda_error(stream);
     return 0;
 }
@@ -3750,8 +3952,21 @@ int MLA::enqueueGeneration(FmhaParams const& p, cudaStream_t stream)
         // Not used in the generation kernels as contiguous_kv or paged_kv layouts are used.
         tllmRunnerParams.mSumOfSeqLensKv = int(batch_beam * tllmRunnerParams.mMaxSeqLenKv);
 
-        tllmRunnerParams.mLeftSlidingWindow = -1;
-        tllmRunnerParams.mRightSlidingWindow = -1;
+        // Windowed decode: left reach window - 1 (excluding the current token), no right reach.
+        // Token-sparse attention rejects window parameters, so it stays dense.
+        bool const usesSlidingWindow = !useSparseMLA() && p.cyclic_attention_window_size > 0
+            && p.max_past_kv_length > p.cyclic_attention_window_size;
+        if (usesSlidingWindow)
+        {
+            tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::SlidingOrChunkedCausal;
+            tllmRunnerParams.mLeftSlidingWindow = p.cyclic_attention_window_size - 1;
+            tllmRunnerParams.mRightSlidingWindow = 0;
+        }
+        else
+        {
+            tllmRunnerParams.mLeftSlidingWindow = -1;
+            tllmRunnerParams.mRightSlidingWindow = -1;
+        }
         tllmRunnerParams.mChunkedAttentionSize = 0;
 
         // The scaleQ that will be applied to the BMM1 output.

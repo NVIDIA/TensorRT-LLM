@@ -1176,6 +1176,38 @@ def test_dflash_spec_dec_variant_unknown_until_checkpoint_read():
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("scope", ["top_level", "text_config"])
+def test_dflash_embedded_drafter_reads_the_dfly_keys(tmp_path: Path,
+                                                     scope: str) -> None:
+    # An unset speculative_model is the target checkpoint, whose dfly_* keys
+    # (in text_config when present) give the DFly2 geometry.
+    dfly = {
+        "dfly_num_hidden_layers": 5,
+        "dfly_mask_token_id": 120009,
+        "dfly_target_kv_layers": [25, 29, 33, 37, 41],
+        "dfly_target_index_layer": [25, 29, 33, 37, 41],
+    }
+    config = {"architectures": ["HYV4FlashForConditionalGeneration"]}
+    if scope == "text_config":
+        config["text_config"] = dfly
+    else:
+        config.update(dfly)
+    (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+    args = TorchLlmArgs(
+        model=str(tmp_path),
+        skip_tokenizer_init=True,
+        speculative_config=DFlashDecodingConfig(max_draft_len=5),
+    )
+
+    spec = args.speculative_config
+    assert spec.speculative_model == str(tmp_path)
+    assert spec.target_layer_ids == [25, 29, 33, 37, 41]
+    assert spec.mask_token_id == 120009
+    assert spec.spec_dec_variant == 2
+
+
+@pytest.mark.cpu_only
 def test_dspark_target_layer_ids_resolved_from_checkpoint(tmp_path):
     # When the user leaves target_layer_ids unset, the checkpoint's ordered
     # dspark_target_layer_ids must be adopted verbatim.

@@ -182,6 +182,25 @@ void invokeMLARopeContext(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, c
 template <typename T>
 void invokeMLAContextFp8Quantize(MlaParams<T>& params, int total_kv_len, cudaStream_t stream);
 
+// Windowed context MLA repack: trtllm-gen has windowed context kernels only for packed QKV, which
+// needs qLen == kvLen per sequence. Each sequence of the group [seqStart, seqEnd) keeps its newest
+// min(kvLen, window + qLen - 1) keys with its queries in the block's last qLen rows.
+
+// packedCumKv: block start rows (seqEnd - seqStart + 1 entries); packedKvLens: block lengths.
+void invokeMlaWindowedPackedSeqLens(int32_t const* cuQSeqLens, int32_t const* cuKvSeqLens, int32_t seqStart,
+    int32_t seqEnd, int32_t windowSize, int32_t* packedCumKv, int32_t* packedKvLens, cudaStream_t stream);
+
+// Copy each sequence's kept Q/K/V rows into its packed block, addressed in bytes (bf16 or fp8).
+void invokeMlaWindowedPackedQkvPack(void const* qSrc, void const* kSrc, void const* vSrc, int64_t qSrcRowBytes,
+    int64_t kSrcRowBytes, int64_t vSrcRowBytes, int32_t qSegBytes, int32_t kSegBytes, int32_t vSegBytes, void* packed,
+    int64_t packedRowBytes, int32_t const* packedCumKv, int32_t const* cuQSeqLens, int32_t const* cuKvSeqLens,
+    int32_t seqStart, int32_t seqEnd, int32_t maxRows, cudaStream_t stream);
+
+// Copy each sequence's query rows from the packed output back to the compact output rows.
+void invokeMlaWindowedPackedOutputCompact(void const* packedO, void* out, int64_t outRowBytes,
+    int32_t const* packedCumKv, int32_t const* cuQSeqLens, int32_t seqStart, int32_t seqEnd, int32_t maxQSeqLen,
+    cudaStream_t stream);
+
 template <typename T, typename KVCacheBuffer>
 void invokeMLARopeGeneration(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, cudaStream_t stream);
 

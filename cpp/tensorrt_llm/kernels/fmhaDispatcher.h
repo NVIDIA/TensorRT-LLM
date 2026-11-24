@@ -61,6 +61,17 @@ public:
     // Check if any fmha kernel meets the requirements.
     bool isSupported();
 
+    // Check one call: its kv length and window decide the mask (e.g. windowed vs. causal).
+    bool isSupported(tensorrt_llm::kernels::MHARunnerParams const& runnerParams);
+
+    // The same check under a layout other than the fixed one.
+    bool isSupported(tensorrt_llm::kernels::MHARunnerParams const& runnerParams, kernels::AttentionInputLayout layout);
+
+    bool usesTrtllmGen() const
+    {
+        return mUseTllmGen;
+    }
+
     // Does FMHA need a separate Q and Kv input ?
     bool isSeparateQAndKvInput() const
     {
@@ -70,7 +81,14 @@ public:
     // Run the fmha kernel.
     void run(tensorrt_llm::kernels::MHARunnerParams runnerParams);
 
+    // Run the fmha kernel under a layout other than the fixed one.
+    void run(tensorrt_llm::kernels::MHARunnerParams runnerParams, kernels::AttentionInputLayout layout);
+
 private:
+    // The kernel-selection parameters of one call.
+    kernels::TllmGenFmhaRunnerParams makeTllmGenProbeParams(
+        tensorrt_llm::kernels::MHARunnerParams const& runnerParams, kernels::AttentionInputLayout layout) const;
+
     // The fixed fmha parameters.
     kernels::MHARunnerFixedParams mFixedParams;
     // Whether to enable trtllm-gen kernels.

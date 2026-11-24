@@ -160,7 +160,8 @@ def check_architecture_registered(
 
     `model_kwargs["architectures"]`, when set, is checked instead of the checkpoint's,
     since it overrides the config the engine builds from. A custom `checkpoint_loader`
-    is not checked: its `load_config()` decides the architecture.
+    is not checked: its `load_config()` decides the architecture. A modeling_v2 `@routes`
+    registration counts as an implementation unless `modeling_v2` is `off`.
 
     Args:
         llm_args: The resolved LLM arguments.
@@ -179,6 +180,12 @@ def check_architecture_registered(
 
     if any(is_model_arch_known(arch) for arch in architectures):
         return
+    from tensorrt_llm._torch.modeling_v2._router_index import ModelingV2Mode, registered_routes
+
+    if ModelingV2Mode.of(llm_args) is not ModelingV2Mode.OFF:
+        routes = registered_routes()
+        if any(arch in routes for arch in architectures):
+            return
     raise UnsupportedError(
         f"Unknown model architecture: {architectures[0]}. TensorRT-LLM has no "
         f"implementation registered for the checkpoint's architectures {architectures}.",

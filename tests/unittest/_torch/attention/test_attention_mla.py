@@ -384,6 +384,23 @@ scenarios = [
              kv_cache_tokens_per_block=tokens_per_block)
     for kv_cache_dtype in kv_cache_dtype_list for num_layers in [1, 2]
 ]
+# v_head_dim != qk_nope_head_dim (Hy4-Flash: 192 + 64, V 256). num_layers 1 passes a
+# compact V, num_layers 2 the strided joint-projection V view.
+scenarios += [
+    Scenario(kv_cache_dtype=torch.bfloat16,
+             num_layers=num_layers,
+             num_heads=64,
+             num_kv_heads=64,
+             q_lora_rank=1024,
+             kv_lora_rank=512,
+             qk_nope_head_dim=192,
+             qk_rope_head_dim=64,
+             v_head_dim=256,
+             hidden_size=3072,
+             max_position_embeddings=5120,
+             kv_cache_tokens_per_block=tokens_per_block)
+    for num_layers in [1, 2]
+]
 
 accuracy_dict = {
     torch.bfloat16: (3e-2, 3e-3),

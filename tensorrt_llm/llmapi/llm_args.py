@@ -4367,6 +4367,19 @@ def is_dflash2_checkpoint(architectures: Optional[List[str]],
                for arch in (architectures or [])))
 
 
+# Top-level keys of a checkpoint that embeds its own DFly2 draft (HY4-Flash).
+_DFLY_DRAFT_KEYS = ("dfly_num_hidden_layers", "dfly_target_kv_layers",
+                    "dfly_target_index_layer", "dfly_mask_token_id")
+
+
+def embedded_dfly_draft_config(config: dict) -> dict:
+    """The ``dfly_*`` scope (``text_config`` first) of ``config``, or ``{}``."""
+    for scope in (config.get("text_config") or {}, config):
+        if any(key in scope for key in _DFLY_DRAFT_KEYS):
+            return scope
+    return {}
+
+
 class DFlashDecodingConfig(DecodingBaseConfig):
     """Configuration for DFlash speculative decoding.
 
@@ -4456,6 +4469,9 @@ class DFlashDecodingConfig(DecodingBaseConfig):
         hidden states are captured. Called from validation for a local path,
         and again from model loading once a HF repo id has been downloaded.
         Reads the JSON directly, so ``trust_remote_code`` is unused here.
+
+        ``speculative_model`` may name a target checkpoint with an embedded
+        DFly2 draft, whose geometry is its ``dfly_*`` keys.
         """
         if self.speculative_model is None:
             return
@@ -4466,18 +4482,26 @@ class DFlashDecodingConfig(DecodingBaseConfig):
         with open(draft_config_path) as f:
             draft_cfg = translate_speculators_dspark_config(json.load(f))
         dflash_cfg = draft_cfg.get("dflash_config", {})
+        dfly_cfg = embedded_dfly_draft_config(draft_cfg)
 
         if self.target_layer_ids is None:
             layer_ids = dflash_cfg.get("target_layer_ids")
+            if layer_ids is None:
+                # The KV layer list is authoritative for an embedded DFly2 draft.
+                layer_ids = dfly_cfg.get("dfly_target_kv_layers")
+                if layer_ids is None:
+                    layer_ids = dfly_cfg.get("dfly_target_index_layer")
             if layer_ids is not None:
                 self.target_layer_ids = layer_ids
         if self.mask_token_id is None:
             mask_id = dflash_cfg.get("mask_token_id")
+            if mask_id is None:
+                mask_id = dfly_cfg.get("dfly_mask_token_id")
             if mask_id is not None:
                 self.mask_token_id = mask_id
         architectures = draft_cfg.get("architectures")
         self.spec_dec_variant = 2 if (
-            is_dflash2_checkpoint(architectures, dflash_cfg)
+            (is_dflash2_checkpoint(architectures, dflash_cfg) or bool(dfly_cfg))
             and not is_lilicorr_checkpoint(architectures, dflash_cfg)) else 1
         if self.context_recompute_tail is None:
             # Reached only when the user explicitly set None (the default is 0,
@@ -10048,6 +10072,10 @@ class TorchLlmArgs(BaseLlmArgs):
                         "unaffected; expect a lower acceptance rate than the "
                         "same configuration run aggregated.")
                 assert self.speculative_config.max_draft_len > 0, "DFlash max_draft_len must be > 0"
+                # As for MTP: an unset speculative_model means the draft lives
+                # in the target checkpoint (HY4-Flash's ``model.dfly_layers.*``).
+                if self.speculative_config.speculative_model is None:
+                    self.speculative_config.speculative_model = self.model
                 # A Hugging Face repo id is not readable yet: both calls below
                 # then run without the drafter's config.json (the budget check
                 # covers only the token budget), and CachedModelLoader repeats

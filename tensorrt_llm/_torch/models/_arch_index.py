@@ -230,6 +230,7 @@ MULTIMODAL_MODEL_TYPE_TO_MODULE = {
     "gemma3": "modeling_gemma3vl",
     "gemma4": "modeling_gemma4mm",
     "gemma4_unified": "modeling_gemma4_unified",
+    "hy_v4_flash": "modeling_hyv4_flash",
     "hyperclovax_vlm": "modeling_hyperclovax",
     "kimi_k25": "modeling_kimi_k25",
     "kimi_k3": "modeling_kimi_k3_vl",

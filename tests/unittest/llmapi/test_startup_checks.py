@@ -207,6 +207,7 @@ def _arch_args(
         encode_only=encode_only,
         model_kwargs=model_kwargs,
         checkpoint_loader=checkpoint_loader,
+        modeling_v2="auto",
     )
 
 
@@ -258,6 +259,16 @@ def test_externally_declared_architecture_passes(monkeypatch):
     monkeypatch.setitem(
         modeling_utils._EXTERNAL_ARCH_TO_MODULE, "FooBarForCausalLM", "custom_models.foo_bar"
     )
+    startup_checks.check_architecture_registered(
+        _arch_args(), SimpleNamespace(architectures=["FooBarForCausalLM"])
+    )
+
+
+def test_routed_architecture_passes(monkeypatch):
+    # A modeling_v2-only family's @routes registration counts as its implementation.
+    from tensorrt_llm._torch.modeling_v2 import _router_index
+
+    monkeypatch.setitem(_router_index._ROUTES, "FooBarForCausalLM", lambda *args: object)
     startup_checks.check_architecture_registered(
         _arch_args(), SimpleNamespace(architectures=["FooBarForCausalLM"])
     )
