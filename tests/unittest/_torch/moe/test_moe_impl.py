@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""MoE backend unit tests."""
+"""MoE implementation unit tests."""
 
 import ast
 import collections
@@ -149,6 +149,7 @@ from tensorrt_llm._torch.moe.fused_moe.mega_moe import mega_moe_deepgemm as mega
 from tensorrt_llm._torch.moe.fused_moe.moe_resolution import (
     IMPL_PRIORITY,
     _reject_unsupported_activation,
+    backend_family_of,
     build_moe_deployment,
     impl_class_for,
     resolve_moe_impl,
@@ -1859,8 +1860,7 @@ def create_test_impl(
     n_shared_experts: int = 0,
 ) -> MoE:
     """Construct exactly the registered implementation named by the test."""
-    backend_cls = get_impl_class(impl_id)
-    backend_type = impl_test_family(impl_id)
+    impl_cls = get_impl_class(impl_id)
     if locality_domain_policy is None:
         locality_domain_policy = LocalityDomainPolicy(enabled=False)
 
@@ -1875,18 +1875,11 @@ def create_test_impl(
         # TLLM_MOE_ENABLE_SHARED_EXPERT_FUSION=1).
         pretrained_config.n_shared_experts = n_shared_experts
 
-    # CUTE_DSL_B12X is internal-only: the user-facing API selects it on the
-    # CUTEDSL path when SM120/121 + NVFP4 + flashinfer is importable. Route
-    # through "CUTEDSL" so the test exercises the same code path users hit.
-    moe_backend_value = (
-        "CUTEDSL" if backend_type == MoeTestFamily.CUTE_DSL_B12X else backend_type.value
-    )
     model_config = ModelConfig(
         pretrained_config=pretrained_config,
         quant_config=quant_config,
         mapping=mapping,
-        moe_backend=moe_backend_value,
-        moe_tactic=impl_id,
+        moe_backend=backend_family_of(impl_cls),
         locality_domain_policy=locality_domain_policy,
     )
     if n_shared_experts > 0:
@@ -1896,7 +1889,7 @@ def create_test_impl(
         model_config.skip_create_weights_in_init = True
 
     backend = create_moe_backend(
-        moe_cls=backend_cls,
+        moe_cls=impl_cls,
         routing_method=routing_method,
         num_experts=num_experts,
         hidden_size=hidden_size,
@@ -1911,7 +1904,6 @@ def create_test_impl(
     )
     if n_shared_experts > 0:
         backend.create_weights()
-    assert type(backend).descriptor.impl_id == impl_id
     return backend
 
 
@@ -7388,7 +7380,7 @@ def test_unresolvable_layer_error_carries_rejection_details():
 # ``torch.ops.trtllm.fused_moe`` is replaced by a recorder, so a leaf reaching
 # for state it does not carry fails here without a GPU, and the kernel flags,
 # the weight view and the LoRA operands each leaf passes must follow its own
-# declarations, which ``test_moe_impl.test_cutlass_leaf_declarations`` pins.
+# declarations, which ``test_moe_impl_identity.test_cutlass_leaf_declarations`` pins.
 
 _CUTLASS_FUSED_MOE_OP_LEAVES = tuple(
     leaf

@@ -18,7 +18,7 @@ import logging
 import os
 import time
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from itertools import product
 from types import SimpleNamespace
@@ -39,6 +39,7 @@ from tensorrt_llm._torch.moe.fused_moe.activation import (
     SwigluBiasActivation,
     activation_constant_names,
 )
+from tensorrt_llm._torch.moe.fused_moe.impl_base import MoEImplBase
 from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoEDeployment,
     MoEProblem,
@@ -48,12 +49,12 @@ from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
 )
 from tensorrt_llm._torch.moe.fused_moe.impl_environment import collect_moe_environment
 from tensorrt_llm._torch.moe.fused_moe.impl_identity import MOE_IMPL_REGISTRY, MoEImplId
-from tensorrt_llm._torch.moe.fused_moe.interface import MoE
 from tensorrt_llm._torch.moe.fused_moe.mega_moe.mega_moe_cute_dsl import (
     is_megamoe_cute_dsl_runtime_available,
 )
 from tensorrt_llm._torch.moe.fused_moe.moe_resolution import IMPL_PRIORITY, backend_family_of
 from tensorrt_llm._torch.utils import ActivationType, is_gated_activation
+from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 G_LOGGER = logging.getLogger(__name__)
@@ -63,7 +64,11 @@ G_LOGGER = logging.getLogger(__name__)
 # MoE test policy groups
 # ============================================================================
 class MoeTestFamily(str, Enum):
-    """Groups sharing test input preparation and CI policy, not impl selectors."""
+    """Group implementations that share test input preparation and CI policy.
+
+    Some values also serve as ``moe_backend`` configuration literals. Tests
+    select a specific implementation by its full impl ID.
+    """
 
     CUTLASS = "CUTLASS"
     TRTLLM = "TRTLLM"
@@ -78,8 +83,18 @@ class MoeTestFamily(str, Enum):
     MARLIN = "MARLIN"
 
 
-def get_impl_class(impl_id: str) -> type[MoE]:
-    """Look up an exact registered test implementation; never select a fallback."""
+def get_impl_class(impl_id: str) -> type[MoEImplBase]:
+    """Look up a MoE implementation by its exact ID.
+
+    Args:
+        impl_id: Full ``provider.technique.kernel_name.quant`` ID.
+
+    Returns:
+        The implementation class registered under that ID.
+
+    Raises:
+        ValueError: If the ID is malformed or unregistered.
+    """
     identity = MoEImplId.parse(impl_id)
     impl_cls = MOE_IMPL_REGISTRY.lookup(identity)
     if impl_cls is None:
@@ -88,7 +103,17 @@ def get_impl_class(impl_id: str) -> type[MoE]:
 
 
 def impl_test_family(impl_id: str) -> MoeTestFamily:
-    """Return the input/skip policy group of an already pinned implementation."""
+    """Find the test family for a pinned MoE implementation.
+
+    Args:
+        impl_id: Full ID of a registered implementation.
+
+    Returns:
+        The family used for test input preparation and skip rules.
+
+    Raises:
+        ValueError: If the ID is malformed, unregistered, or has no test family.
+    """
     impl_cls = get_impl_class(impl_id)
     if impl_cls.descriptor.identity.kernel_name == "b12x":
         return MoeTestFamily.CUTE_DSL_B12X
@@ -96,7 +121,17 @@ def impl_test_family(impl_id: str) -> MoeTestFamily:
 
 
 def get_test_impl_ids(families: list[MoeTestFamily]) -> list[str]:
-    """Enumerate registered identities within the suite's existing policy groups."""
+    """List implementation IDs for a test matrix.
+
+    Args:
+        families: Test families to include.
+
+    Returns:
+        Matching IDs in ``IMPL_PRIORITY`` order, or an empty list if none match.
+
+    Raises:
+        ValueError: If an ID in the priority list cannot be mapped to a test family.
+    """
     return [
         cls.descriptor.impl_id
         for cls in IMPL_PRIORITY
@@ -105,15 +140,41 @@ def get_test_impl_ids(families: list[MoeTestFamily]) -> list[str]:
     ]
 
 
+def impl_serves_quant(impl_id: str, quant_algo: QuantAlgo | None) -> bool:
+    """Check the quantization format published by a MoE implementation.
+
+    Args:
+        impl_id: Full implementation ID.
+        quant_algo: Quantization algorithm, or ``None`` for unquantized.
+
+    Returns:
+        Whether the ID's quantization field matches the canonical format.
+
+    Raises:
+        ValueError: If the implementation ID is malformed.
+    """
+    return MoEImplId.parse(impl_id).quant == normalize_quant(canonical_quant(quant_algo))
+
+
 def get_test_impl_id(family: MoeTestFamily, quant_algo: QuantAlgo | None) -> str:
-    """Pin the single identity of a focused test's family and quantization."""
-    quant = normalize_quant(canonical_quant(quant_algo))
+    """Find the unique implementation for a test family and quantization format.
+
+    Args:
+        family: Test family to search.
+        quant_algo: Quantization algorithm, or ``None`` for an unquantized implementation.
+
+    Returns:
+        The full ID of the implementation matching the family and canonical quantization format.
+
+    Raises:
+        ValueError: If zero or multiple implementations match. For an ambiguous
+            match, specify the intended implementation's full ID in the test.
+    """
     matches = [
-        impl_id
-        for impl_id in get_test_impl_ids([family])
-        if MoEImplId.parse(impl_id).quant == quant
+        impl_id for impl_id in get_test_impl_ids([family]) if impl_serves_quant(impl_id, quant_algo)
     ]
     if len(matches) != 1:
+        quant = normalize_quant(canonical_quant(quant_algo))
         raise ValueError(f"Test must name one exact impl for {family}/{quant}: {matches}")
     return matches[0]
 
@@ -779,26 +840,6 @@ def should_skip_megamoe_deepgemm(
     return None
 
 
-def should_skip_cute_dsl_b12x(
-    backend_type: MoeTestFamily,
-    comm_method: Optional[str] = None,
-    moe_tp_size: int = 1,
-    parallel_mode: Optional[str] = None,
-) -> Optional[str]:
-    """Check multi-rank constraints omitted from the capability query."""
-    if backend_type != MoeTestFamily.CUTE_DSL_B12X:
-        return None
-
-    if comm_method is not None or parallel_mode is not None:
-        return (
-            "CuteDslB12xFusedMoE rejects expert parallelism / alltoall; "
-            f"got comm_method={comm_method}, parallel_mode={parallel_mode}."
-        )
-    if moe_tp_size != 1:
-        return f"CuteDslB12xFusedMoE requires ep_size=1; got moe_tp_size={moe_tp_size}."
-    return None
-
-
 def should_skip_megamoe_cutedsl(
     backend_type: MoeTestFamily,
     quant_algo: Optional[QuantAlgo] = None,
@@ -1053,6 +1094,8 @@ def get_quick_skip_reason(
     swiglu_gptoss_style: bool = False,
     seq_len: Optional[int] = None,
     activation_type: ActivationType = ActivationType.Swiglu,
+    *,
+    b12x_mapping: Mapping | None = None,
 ) -> Optional[str]:
     """Return the first reason a test configuration is unsupported.
 
@@ -1116,7 +1159,6 @@ def get_quick_skip_reason(
                 else activation_constant_names(activation)
             ),
         )
-        # Multi-rank constraints are checked by the helpers below.
         deployment = MoEDeployment(
             ep_size=1,
             tp_size=1,
@@ -1125,6 +1167,14 @@ def get_quick_skip_reason(
             num_slots=0 if model_config is None else model_config.num_experts,
             env=collect_moe_environment(),
         )
+        if backend_type == MoeTestFamily.CUTE_DSL_B12X and b12x_mapping is not None:
+            deployment = replace(
+                deployment,
+                ep_size=b12x_mapping.moe_ep_size,
+                tp_size=b12x_mapping.moe_tp_size,
+                parallel_size=b12x_mapping.tp_size,
+                use_dp=b12x_mapping.enable_attention_dp,
+            )
         verdict = impl_cls.can_implement(problem, deployment)
         if not verdict.eligible:
             return f"{verdict.reject_reason.value}: {verdict.detail}"
@@ -1172,7 +1222,6 @@ def get_quick_skip_reason(
                 model_config=model_config,
                 swiglu_gptoss_style=swiglu_gptoss_style,
             ),
-            lambda: should_skip_cute_dsl_b12x(backend_type),
         ]
         for check in skip_checks:
             skip_reason = check()
@@ -1490,6 +1539,7 @@ def iter_base_test_configs(
     routing_methods: list[type] | None = None,
     *,
     activation_type: ActivationType = ActivationType.Swiglu,
+    b12x_mapping: Mapping | None = None,
 ) -> Iterator[
     tuple[
         float,
@@ -1520,6 +1570,7 @@ def iter_base_test_configs(
         quant_algos: List of quantization algorithms
         routing_methods: List of routing method classes (default: [RenormalizeMoeRoutingMethod])
         activation_type: Activation kind for eligibility and accuracy skip checks.
+        b12x_mapping: Use the worker topology for B12x eligibility and TP shard alignment.
 
     Yields:
         Tuple of (swiglu_alpha, swiglu_beta, swiglu_limit, model_config, seq_len,
@@ -1532,7 +1583,7 @@ def iter_base_test_configs(
         (impl_id, quant_algo)
         for impl_id in impl_ids
         for quant_algo in quant_algos
-        if MoEImplId.parse(impl_id).quant == normalize_quant(canonical_quant(quant_algo))
+        if impl_serves_quant(impl_id, quant_algo)
     ]
     for (
         swiglu_alpha,
@@ -1551,6 +1602,7 @@ def iter_base_test_configs(
             swiglu_gptoss_style=swiglu_gptoss_style,
             seq_len=seq_len,
             activation_type=activation_type,
+            b12x_mapping=b12x_mapping,
         )
         routing_name = routing_method_cls.__name__.replace("MoeRoutingMethod", "")
         swiglu_id = (

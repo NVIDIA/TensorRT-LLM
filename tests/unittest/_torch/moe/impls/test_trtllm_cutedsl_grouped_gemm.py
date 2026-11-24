@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""FC1 gate/up weight interleave contracts of the CuTe DSL MoE weight method.
+"""CuTe DSL MoE tests for FC1 gate/up weight interleaving and FC2 tile selection.
 
 The Rubin NVFP4 kernels read FC1 B and its block scales in ``[gate16, up16]``
 row groups, the Blackwell kernels in ``[up64, gate64]`` groups. These tests pin
@@ -9,6 +9,8 @@ define the same layout (MegaMoE's packing and the kernel author's reference
 permutation), and check that the weight method picks the order by SM and
 applies the identical permutation on the device weights and on the EPLB host
 mirrors.
+
+The FC2 tests check the N tile size override, its caching and invalid values.
 """
 
 from collections.abc import Generator

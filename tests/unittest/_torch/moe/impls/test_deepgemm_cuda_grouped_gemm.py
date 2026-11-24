@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Differential correctness test for ``fused_expand_group_quant_fp8``.
+"""Differential correctness tests for DeepGemm's fused expand/quant and gather/finalize.
 
 The DeepGemm pre-GEMM pipeline used to be::
 
@@ -17,7 +17,7 @@ Because the eliminated "expand" step is a pure data copy (no arithmetic) and the
 new kernel runs the exact same quant op-sequence over the same input group, the
 result is **bit-identical** -- there is no floating-point reordering, and the
 outputs are FP8 bytes + packed int32 scales, so there is no FMA/rounding
-ambiguity. This test therefore asserts strict equality.
+ambiguity. The expand/quant test checks both outputs for exact equality.
 
 To make the "expanded buffer == compact source, reordered" invariant exact, the
 source ``x`` is **fp32**: ``moe_permute_op`` produces an fp32 expanded buffer, so
@@ -25,6 +25,11 @@ the old kernel (reading the fp32 expanded buffer) and the new kernel (reading
 fp32 ``x``) load identical values. This is precisely the off-by-one-prone index
 encoding the kernel relies on (``unpermuted_idx = k_rank * num_tokens +
 token_id``, k_rank slow), so the test directly guards it against the real maps.
+
+After GEMM, the unfused path gathers the expert output into a buffer and calls
+``moe_finalize_scale_op`` to weight and reduce it. ``triton_fused_gather_finalize``
+reads the expert output directly. The test compares their BF16 outputs with
+``rtol=atol=1e-2`` to allow for differences in multiply-add rounding.
 
 Run as::
 
@@ -50,16 +55,16 @@ from tensorrt_llm._utils import get_sm_version
 
 skip_unsupported = pytest.mark.skipif(
     not torch.cuda.is_available() or get_sm_version() < 90,
-    reason="Requires CUDA SM90+ (DeepGemm MoE pre-GEMM kernels)",
+    reason="Requires CUDA SM90+ (DeepGemm MoE kernels)",
 )
 
 GROUP_SIZE = 128
 
 
 @dataclass(frozen=True)
-class ExpandQuantShape:
+class DeepGemmShape:
     name: str
-    num_source_tokens: int
+    num_rows: int
     hidden: int
     num_experts: int
     top_k: int
@@ -68,13 +73,22 @@ class ExpandQuantShape:
 # Anchors mirror the PR-2 microbench sweep (study-plan note): the model anchor
 # (32 x 8 x 4096 x 128), the small corner, and a medium batch. ``hidden`` is a
 # multiple of the 128 quant group size (required by both kernels).
-SHAPES = [
-    ExpandQuantShape("anchor", num_source_tokens=32, hidden=4096, num_experts=128, top_k=8),
-    ExpandQuantShape("anchor_h7168", num_source_tokens=32, hidden=7168, num_experts=128, top_k=8),
-    ExpandQuantShape("small", num_source_tokens=1, hidden=512, num_experts=8, top_k=4),
-    ExpandQuantShape("medium_batch", num_source_tokens=64, hidden=7168, num_experts=128, top_k=8),
-    ExpandQuantShape("topk4", num_source_tokens=16, hidden=4096, num_experts=64, top_k=4),
-]
+def _shapes(single_token: DeepGemmShape) -> list[DeepGemmShape]:
+    return [
+        DeepGemmShape("anchor", num_rows=32, hidden=4096, num_experts=128, top_k=8),
+        DeepGemmShape("anchor_h7168", num_rows=32, hidden=7168, num_experts=128, top_k=8),
+        single_token,
+        DeepGemmShape("medium_batch", num_rows=64, hidden=7168, num_experts=128, top_k=8),
+        DeepGemmShape("topk4", num_rows=16, hidden=4096, num_experts=64, top_k=4),
+    ]
+
+
+EXPAND_QUANT_SHAPES = _shapes(
+    DeepGemmShape("small", num_rows=1, hidden=512, num_experts=8, top_k=4)
+)
+GATHER_FINALIZE_SHAPES = _shapes(
+    DeepGemmShape("single_token", num_rows=1, hidden=512, num_experts=64, top_k=4)
+)
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -138,12 +152,12 @@ def test_skip_data_expand_omits_unused_outputs() -> None:
 
 
 @skip_unsupported
-@pytest.mark.parametrize("shape", SHAPES, ids=lambda s: s.name)
-def test_fused_expand_quant_matches_unfused(shape: ExpandQuantShape) -> None:
+@pytest.mark.parametrize("shape", EXPAND_QUANT_SHAPES, ids=lambda s: s.name)
+def test_fused_expand_quant_matches_unfused(shape: DeepGemmShape) -> None:
     device = "cuda"
     gen = torch.Generator(device=device).manual_seed(1234)
 
-    num_rows = shape.num_source_tokens
+    num_rows = shape.num_rows
     hidden = shape.hidden
     num_experts = shape.num_experts
     top_k = shape.top_k
@@ -152,11 +166,9 @@ def test_fused_expand_quant_matches_unfused(shape: ExpandQuantShape) -> None:
     cluster_size, cluster_rank = 1, 0
     num_experts_per_node = num_experts
 
-    # Per-row distinct top-k experts with positive normalized weights.
-    logits = torch.randn((num_rows, num_experts), device=device, dtype=torch.float32, generator=gen)
-    topk_vals, topk_ids = logits.topk(top_k, dim=-1)
-    token_selected_experts = topk_ids.to(torch.int32)
-    token_final_scales = torch.softmax(topk_vals, dim=-1).to(torch.float32)
+    token_selected_experts, token_final_scales = _make_routing(
+        num_rows, num_experts, top_k, device=device, generator=gen
+    )
 
     # fp32 source: makes the expanded buffer an exact copy of x, so the old and
     # new kernels read bit-identical values (see module docstring).
@@ -242,30 +254,6 @@ def test_fused_expand_quant_matches_unfused(shape: ExpandQuantShape) -> None:
         )
 
 
-skip_finalize_unsupported = pytest.mark.skipif(
-    not torch.cuda.is_available() or get_sm_version() < 90,
-    reason="Requires CUDA SM90+ (DeepGemm MoE post-GEMM kernels)",
-)
-
-
-@dataclass(frozen=True)
-class GatherFinalizeShape:
-    name: str
-    num_rows: int
-    hidden: int
-    num_experts: int
-    top_k: int
-
-
-GATHER_FINALIZE_SHAPES = [
-    GatherFinalizeShape("anchor", num_rows=32, hidden=4096, num_experts=128, top_k=8),
-    GatherFinalizeShape("anchor_h7168", num_rows=32, hidden=7168, num_experts=128, top_k=8),
-    GatherFinalizeShape("single_token", num_rows=1, hidden=512, num_experts=64, top_k=4),
-    GatherFinalizeShape("medium_batch", num_rows=64, hidden=7168, num_experts=128, top_k=8),
-    GatherFinalizeShape("topk4", num_rows=16, hidden=4096, num_experts=64, top_k=4),
-]
-
-
 def _make_routing(
     num_rows: int, num_experts: int, top_k: int, *, device: str, generator: torch.Generator
 ):
@@ -283,9 +271,9 @@ def _make_routing(
     return token_selected_experts, token_final_scales
 
 
-@skip_finalize_unsupported
+@skip_unsupported
 @pytest.mark.parametrize("shape", GATHER_FINALIZE_SHAPES, ids=lambda s: s.name)
-def test_fused_gather_finalize_matches_unfused(shape: GatherFinalizeShape) -> None:
+def test_fused_gather_finalize_matches_unfused(shape: DeepGemmShape) -> None:
     device = "cuda"
     gen = torch.Generator(device=device).manual_seed(1234)
 

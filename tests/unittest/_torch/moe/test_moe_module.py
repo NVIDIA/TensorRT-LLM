@@ -51,6 +51,7 @@ from _torch.moe.moe_test_utils import (
     get_quick_skip_reason,
     get_test_impl_id,
     get_test_impl_ids,
+    impl_serves_quant,
     impl_test_family,
     iter_base_test_configs,
     replay_tactics_and_check,
@@ -91,8 +92,6 @@ from tensorrt_llm._torch.moe.fused_moe import (
     create_moe,
 )
 from tensorrt_llm._torch.moe.fused_moe.communication.deep_ep_low_latency import DeepEPLowLatency
-from tensorrt_llm._torch.moe.fused_moe.impl_contract import canonical_quant, normalize_quant
-from tensorrt_llm._torch.moe.fused_moe.impl_identity import MoEImplId
 from tensorrt_llm._torch.moe.fused_moe.interface import MoE, MoEWeightLoadingMode
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
@@ -496,6 +495,7 @@ def _test_moe_worker(
     swiglu_beta: float = 0,
     swiglu_limit: float = float("inf"),
     bias_dtype: Optional[torch.dtype] = None,
+    quant_test_family: Optional[MoeTestFamily] = None,
 ):
     """
     Test MoE module worker function.
@@ -515,6 +515,7 @@ def _test_moe_worker(
         swiglu_limit: SwiGLU limit parameter (default=inf, non-gptoss)
         bias_dtype: Data type for routing bias (default: same as dtype).
                     Use torch.float32 to test fp32 bias plumbing.
+        quant_test_family: Selects the quantized test inputs and numerical reference.
     """
     try:
         _test_moe_worker_impl(
@@ -534,6 +535,7 @@ def _test_moe_worker(
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
             bias_dtype=bias_dtype,
+            quant_test_family=quant_test_family,
         )
     except Exception:
         traceback.print_exc()
@@ -557,6 +559,7 @@ def _test_moe_worker_impl(
     swiglu_beta: float = 0,
     swiglu_limit: float = float("inf"),
     bias_dtype: Optional[torch.dtype] = None,
+    quant_test_family: Optional[MoeTestFamily] = None,
 ):
     """Actual implementation of _test_moe_worker."""
     # Default routing logits dtype to model dtype if not specified
@@ -617,7 +620,7 @@ def _test_moe_worker_impl(
 
         # Setup quantization
         quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
-            quant_algo, x, backend_type
+            quant_algo, x, quant_test_family or backend_type
         )
         quantize_util = quantize_util_cls(
             num_experts=num_experts,
@@ -1068,8 +1071,7 @@ COMM_METHODS = [
 # fused kernel, so the test harness must NOT force a host
 # ``Communication.dispatch`` strategy: the ``IGNORE`` comm sentinel tells the
 # worker (``comm_method_type == MEGAMOE_IGNORE_COMM_METHOD``) to pop
-# ``TRTLLM_FORCE_COMM_METHOD`` and let the backend take the fused path. Both
-# backends share the same multi-GPU parallel-mode coverage.
+# ``TRTLLM_FORCE_COMM_METHOD`` and let the backend take the fused path.
 MEGAMOE_IGNORE_COMM_METHOD = "IGNORE"
 MEGAMOE_PARALLEL_MODES = ["DEP"] if IS_CI_MODE else ["DEP", "TEP"]
 # SwiGLU parameters for swiglu_gptoss_style testing
@@ -1170,8 +1172,8 @@ def should_skip_MegaMoEDeepGemm(
             f"forcing {comm_method}."
         )
 
-    if parallel_mode not in ("DEP", "TEP"):
-        return f"MegaMoEDeepGemm Phase 1 is MoE-EP only (got {parallel_mode})"
+    if parallel_mode != "DEP":
+        return f"MegaMoEDeepGemm multi-GPU tests require DEP (got {parallel_mode})"
 
     base_reason = should_skip_megamoe_deepgemm(
         backend_type,
@@ -1258,7 +1260,7 @@ def generate_multi_gpu_test_params(
     model_configs,
     seq_lens,
     dtypes,
-    backend_types,
+    test_families,
     quant_algos,
     routing_methods,
 ) -> List:
@@ -1272,7 +1274,7 @@ def generate_multi_gpu_test_params(
         model_configs: List of MoeModelConfig
         seq_lens: List of sequence lengths
         dtypes: List of data types
-        backend_types: List of backend types
+        test_families: Test families to include in the implementation matrix.
         quant_algos: List of quantization algorithms
         routing_methods: List of routing method classes
 
@@ -1298,9 +1300,10 @@ def generate_multi_gpu_test_params(
             model_configs,
             seq_lens,
             dtypes,
-            get_test_impl_ids(backend_types),
+            get_test_impl_ids(test_families),
             quant_algos,
             routing_methods,
+            b12x_mapping=_create_mapping_for_parallel_mode(4, parallel_mode),
         ):
             # Check multi-GPU specific skip conditions (short-circuit on first match)
             backend_type = impl_test_family(impl_id)
@@ -1496,7 +1499,7 @@ def _generate_focused_multi_gpu_test_params(
 
 
 def generate_base_test_params(
-    swiglu_combos, model_configs, seq_lens, dtypes, backend_types, quant_algos, routing_methods
+    swiglu_combos, model_configs, seq_lens, dtypes, test_families, quant_algos, routing_methods
 ) -> List:
     """
     Generate test parameter combinations for base tests.
@@ -1506,7 +1509,7 @@ def generate_base_test_params(
         model_configs: List of MoeModelConfig
         seq_lens: List of sequence lengths
         dtypes: List of data types
-        backend_types: List of backend types
+        test_families: Test families to include in the implementation matrix.
         quant_algos: List of quantization algorithms
         routing_methods: List of routing method classes
 
@@ -1531,7 +1534,7 @@ def generate_base_test_params(
         model_configs,
         seq_lens,
         dtypes,
-        get_test_impl_ids(backend_types),
+        get_test_impl_ids(test_families),
         quant_algos,
         routing_methods,
     ):
@@ -1562,7 +1565,7 @@ BASE_TEST_PARAMS = generate_base_test_params(
     model_configs=MOE_MODEL_CONFIGS,
     seq_lens=SEQ_LENS,
     dtypes=DTYPES,
-    backend_types=TEST_FAMILIES,
+    test_families=TEST_FAMILIES,
     quant_algos=QUANT_ALGOS,
     routing_methods=ROUTING_METHODS,
 )
@@ -1710,7 +1713,14 @@ def _create_routing_method_with_bias(routing_method_cls, top_k, num_experts, bia
             else "trtllm.trtllm_gen.fused_moe.nvfp4",
             QuantAlgo.NVFP4,
         ),
-        ("trtllm.trtllm_gen.fused_moe.fp8_block_scales", QuantAlgo.FP8_BLOCK_SCALES),
+        (
+            {
+                90: "deepgemm.cuda.hopper_grouped_gemm.fp8_block_scales",
+                120: "trtllm.triton.grouped_gemm.fp8_block_scales",
+                121: "trtllm.triton.grouped_gemm.fp8_block_scales",
+            }.get(get_sm_version(), "trtllm.trtllm_gen.fused_moe.fp8_block_scales"),
+            QuantAlgo.FP8_BLOCK_SCALES,
+        ),
         ("trtllm.trtllm_gen.fused_moe.w4a8_mxfp4_mxfp8", QuantAlgo.W4A8_MXFP4_MXFP8),
         ("trtllm.cutlass.grouped_gemm.fp8", QuantAlgo.FP8),
     ],
@@ -1772,6 +1782,7 @@ def test_moe_fp32_routing_bias(routing_method_cls, moe_model_config, impl_id, qu
         routing_method_cls=routing_method_cls,
         dtype_routing_logits=dtype_routing_logits,
         bias_dtype=torch.float32,
+        quant_test_family=backend_type,
     )
 
 
@@ -1781,13 +1792,13 @@ def test_moe_fp32_routing_bias(routing_method_cls, moe_model_config, impl_id, qu
 @pytest.mark.parametrize("seq_len", [6, 192])
 def test_dsv4_fused_route_quant_matches_separate_launches(impl_id, seq_len):
     """The one-launch DeepSeek-V4 routing + NVFP4 quantization leaves the MoE output bitwise."""
-    moe_backend = impl_test_family(impl_id)
+    test_family = impl_test_family(impl_id)
     model = MoeModelConfig(num_experts=256, top_k=6, hidden_size=2048, intermediate_size=512)
     dtype = torch.bfloat16
     skip_reason = (
-        should_skip_trtllm(moe_backend, QuantAlgo.NVFP4, model)
-        if moe_backend == MoeTestFamily.TRTLLM
-        else should_skip_megamoe_cutedsl(moe_backend, QuantAlgo.NVFP4, dtype, model)
+        should_skip_trtllm(test_family, QuantAlgo.NVFP4, model)
+        if test_family == MoeTestFamily.TRTLLM
+        else should_skip_megamoe_cutedsl(test_family, QuantAlgo.NVFP4, dtype, model)
     )
     if skip_reason:
         pytest.skip(skip_reason)
@@ -1805,7 +1816,7 @@ def test_dsv4_fused_route_quant_matches_separate_launches(impl_id, seq_len):
     x = torch.randn((seq_len, model.hidden_size), dtype=dtype, device="cuda")
     router_logits = torch.randn((seq_len, model.num_experts), dtype=torch.float32, device="cuda")
     quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
-        QuantAlgo.NVFP4, x, moe_backend
+        QuantAlgo.NVFP4, x, test_family
     )
     quant_kwargs.pop("ref_cls", None)
     quantize_util = quantize_util_cls(
@@ -1827,7 +1838,7 @@ def test_dsv4_fused_route_quant_matches_separate_launches(impl_id, seq_len):
         max_num_tokens=256,
     )
     # Unfinalized (per-expert rows, weights, permutation), as the model's fused all-reduce takes it.
-    unfinalized = moe_backend == MoeTestFamily.TRTLLM
+    unfinalized = test_family == MoeTestFamily.TRTLLM
     with create_moe(
         routing_method=routing_method, reduce_results=not unfinalized, model_config=model_cfg
     ) as fused_moe:
@@ -1863,11 +1874,11 @@ def test_dspark_draft_fused_route_quant_matches_separate_launches(seq_len, monke
     """The DSpark draft bank (top-3 of 128, bias-selected) on TRTLLM-Gen MXFP4 x MXFP8 routes and
     quantizes its input in one launch, and the MoE output is bitwise that of the separate
     routing, scale cast and quantization launches."""
-    moe_backend = MoeTestFamily.TRTLLM
-    impl_id = get_test_impl_id(moe_backend, QuantAlgo.W4A8_MXFP4_MXFP8)
+    test_family = MoeTestFamily.TRTLLM
+    impl_id = get_test_impl_id(test_family, QuantAlgo.W4A8_MXFP4_MXFP8)
     model = MoeModelConfig(num_experts=128, top_k=3, hidden_size=2048, intermediate_size=512)
     dtype = torch.bfloat16
-    skip_reason = should_skip_trtllm(moe_backend, QuantAlgo.W4A8_MXFP4_MXFP8, model)
+    skip_reason = should_skip_trtllm(test_family, QuantAlgo.W4A8_MXFP4_MXFP8, model)
     if skip_reason:
         pytest.skip(skip_reason)
     torch.manual_seed(3)
@@ -1884,7 +1895,7 @@ def test_dspark_draft_fused_route_quant_matches_separate_launches(seq_len, monke
     x = torch.randn((seq_len, model.hidden_size), dtype=dtype, device="cuda")
     router_logits = torch.randn((seq_len, model.num_experts), dtype=torch.float32, device="cuda")
     quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
-        QuantAlgo.W4A8_MXFP4_MXFP8, x, moe_backend
+        QuantAlgo.W4A8_MXFP4_MXFP8, x, test_family
     )
     quant_kwargs.pop("ref_cls", None)
     quantize_util = quantize_util_cls(
@@ -1946,7 +1957,7 @@ MULTI_GPU_TEST_PARAMS = generate_multi_gpu_test_params(
     model_configs=MOE_MODEL_CONFIGS,
     seq_lens=[8] if IS_CI_MODE else SEQ_LENS,
     dtypes=DTYPES,
-    backend_types=[
+    test_families=[
         # Marlin gets focused ALLGATHER coverage below instead of the
         # COMM_METHODS grid.
         b
@@ -1969,7 +1980,7 @@ MULTI_GPU_TEST_PARAMS += generate_multi_gpu_test_params(
     model_configs=[MoeModelConfig(8, 1, 512, 512)],
     seq_lens=[8],
     dtypes=[torch.bfloat16],
-    backend_types=[MoeTestFamily.TRTLLM],
+    test_families=[MoeTestFamily.TRTLLM],
     quant_algos=[QuantAlgo.W4A8_MXFP4_FP8],
     routing_methods=[RenormalizeMoeRoutingMethod],
 )
@@ -2609,7 +2620,7 @@ def generate_eplb_test_params(
     model_configs,
     num_slots_list,
     dtypes,
-    backend_types,
+    test_families,
     quant_algos,
     routing_methods,
 ) -> List:
@@ -2624,7 +2635,7 @@ def generate_eplb_test_params(
         model_configs: List of MoeModelConfig
         num_slots_list: List of EPLB slots (must be > num_experts)
         dtypes: List of data types
-        backend_types: List of backend types
+        test_families: Test families to include in the implementation matrix.
         quant_algos: List of quantization algorithms
         routing_methods: List of routing method classes
 
@@ -2648,11 +2659,11 @@ def generate_eplb_test_params(
         model_configs,
         num_slots_list,
         dtypes,
-        get_test_impl_ids(backend_types),
+        get_test_impl_ids(test_families),
         quant_algos,
         routing_methods,
     ):
-        if MoEImplId.parse(impl_id).quant != normalize_quant(canonical_quant(quant_algo)):
+        if not impl_serves_quant(impl_id, quant_algo):
             continue
         backend_type = impl_test_family(impl_id)
         # Get skip reason using existing logic
@@ -2796,7 +2807,7 @@ EPLB_TEST_PARAMS = (
         model_configs=EPLB_MODEL_CONFIGS,
         num_slots_list=EPLB_NUM_SLOTS_LIST,
         dtypes=DTYPES,
-        backend_types=[
+        test_families=[
             b
             for b in TEST_FAMILIES
             if b not in (MoeTestFamily.MEGAMOE_DEEPGEMM, MoeTestFamily.MEGAMOE_CUTEDSL)

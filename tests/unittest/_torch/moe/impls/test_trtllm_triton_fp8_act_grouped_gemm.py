@@ -13,10 +13,12 @@ from _torch.moe.impls._triton_fp8_test_utils import (
     _make_inputs,
     _per_block_cast_to_fp8_fp32,
     _run_moe_fp8_act_reference,
+    requires_cuda,
     skip_pre_hopper,
 )
 
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_triton_fp8_block_scale import (
+    _moe_align_small,
     prewarm_triton_fp8_block_scale_moe_fp8_act,
     run_triton_fp8_block_scale_moe_fp8_act,
 )
@@ -123,3 +125,66 @@ def test_fp8_act_prewarm_leaves_nothing_to_compile(hidden: int) -> None:
             swiglu_limit=limit,
         )
         assert _compiled_kernel_count() == compiled, f"{num_tokens} tokens compiled a kernel"
+
+
+_BLOCK = 16  # _BLOCK_SIZE_M of the FP8-activation GEMMs.
+
+
+def _check_alignment(
+    topk_ids: torch.Tensor,
+    sorted_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_post_pad: torch.Tensor,
+    num_experts: int,
+    block_size: int,
+) -> None:
+    """Every expert gets a block-padded range holding exactly its own pairs."""
+    flat_ids = topk_ids.flatten()
+    counts = torch.bincount(flat_ids, minlength=num_experts)
+    padded = (counts + block_size - 1) // block_size * block_size
+    offsets = torch.cumsum(padded, dim=0) - padded
+    assert num_post_pad.item() == padded.sum().item(), "incorrect total after expert padding"
+
+    expected_expert_ids = torch.repeat_interleave(
+        torch.arange(num_experts, dtype=torch.int32, device=topk_ids.device),
+        padded // block_size,
+    )
+    torch.testing.assert_close(expert_ids[: expected_expert_ids.numel()], expected_expert_ids)
+    for expert in range(num_experts):
+        start, count = offsets[expert].item(), counts[expert].item()
+        end = start + padded[expert].item()
+        expected_tokens = torch.nonzero(flat_ids == expert).flatten().to(torch.int32)
+        torch.testing.assert_close(sorted_ids[start : start + count].sort().values, expected_tokens)
+        # Padding slots hold the one-past-the-end pair index.
+        assert (sorted_ids[start + count : end] == flat_ids.numel()).all(), (
+            f"incorrect padding token for expert {expert}"
+        )
+
+
+@requires_cuda
+@pytest.mark.parametrize("num_experts", [8, 60, 72, 288])
+@pytest.mark.parametrize("num_tokens, top_k", [(1, 8), (5, 4), (16, 8)])
+def test_moe_align_small_matches_reference(num_experts: int, num_tokens: int, top_k: int) -> None:
+    """The single-program alignment, sized as the FP8-activation path sizes it."""
+    g = torch.Generator(device="cuda").manual_seed(num_experts * 100 + num_tokens)
+    topk_ids = torch.randint(0, num_experts, (num_tokens, top_k), device="cuda", generator=g)
+    num_pairs = topk_ids.numel()
+    num_m_blocks = min(num_pairs, num_pairs // _BLOCK + num_experts)
+
+    sorted_ids, expert_ids, num_post_pad = _moe_align_small(
+        topk_ids, _BLOCK, num_experts, num_m_blocks
+    )
+
+    _check_alignment(topk_ids, sorted_ids, expert_ids, num_post_pad, num_experts, _BLOCK)
+
+
+@requires_cuda
+def test_moe_align_small_concentrated_routing() -> None:
+    """All pairs on two experts, so each spans several blocks (the common case
+    under expert parallelism, where pairs pile onto the local experts)."""
+    topk_ids = torch.tensor([[0, 3]] * 40, device="cuda")
+    num_pairs = topk_ids.numel()
+    sorted_ids, expert_ids, num_post_pad = _moe_align_small(
+        topk_ids, _BLOCK, 4, min(num_pairs, num_pairs // _BLOCK + 4)
+    )
+    _check_alignment(topk_ids, sorted_ids, expert_ids, num_post_pad, 4, _BLOCK)
