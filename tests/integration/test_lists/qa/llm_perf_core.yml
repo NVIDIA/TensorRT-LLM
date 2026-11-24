@@ -20,6 +20,10 @@ llm_perf_core:
 # 12: VR200 single-node test cases
 # 13: B300/GB300 single-GPU tests with >260 GiB per GPU
 # 14: SM100 GLM-5.3-Flash NVFP4 TP4/EP4 test cases
+# 15: Kimi K3 NVFP4 DEP8, B300
+# 16: GLM 5.3 Flash BF16 KV and Qwen3.8 Flash-Next MTP3, SM103
+# 17: MiniMax M3.1 Flash TP2/EP1, VR200/SM107
+# 18: Muse Spark Open AgentX, GB300/SM103
 # ===============================================================================
 
 
@@ -462,3 +466,71 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[glm_5.3_flash_nvfp4-serve-pytorch-streaming-float4-maxbs:64-maxnt:16384-kv_frac:0.5-input_output_len:1024,1024-reqs:320-con:64-ep:4-tp:4-gpus:4] TIMEOUT(120)
   - perf/test_perf.py::test_perf[glm_5.3_flash_nvfp4_mtp-serve-pytorch-streaming-float4-maxbs:64-maxnt:16384-kv_frac:0.5-input_output_len:1024,1024-reqs:5-con:1-ep:4-tp:4-gpus:4] TIMEOUT(120)
   - perf/test_perf.py::test_perf[glm_5.3_flash_nvfp4_mtp-serve-pytorch-streaming-float4-maxbs:64-maxnt:16384-kv_frac:0.5-input_output_len:1024,1024-reqs:320-con:64-ep:4-tp:4-gpus:4] TIMEOUT(120)
+
+
+# 15: Kimi K3 NVFP4 DEP8 on one B300 node.
+# PR #22078; NVFP4 weights and NVFP4 KV, attention DP + EP8.
+# Startup OOM is tracked by NVBug 7139159; keep the default autotuner path.
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 8
+      compute_capability:
+        gte: 10.3
+        lte: 10.3
+  tests:
+  - perf/test_perf.py::test_perf[kimi_k3_nvfp4_dep8-serve-pytorch-streaming-float4-maxbs:8-maxnt:1024-kv_frac:0.8-input_output_len:1024,1024-reqs:5-con:1-ep:8-tp:8-gpus:8] TIMEOUT(180)
+  - perf/test_perf.py::test_perf[kimi_k3_nvfp4_dep8-serve-pytorch-streaming-float4-maxbs:8-maxnt:1024-kv_frac:0.8-input_output_len:1024,1024-reqs:40-con:8-ep:8-tp:8-gpus:8] TIMEOUT(180)
+  - perf/test_perf.py::test_perf[kimi_k3_nvfp4_dep8-serve-pytorch-streaming-float4-maxbs:8-maxnt:1024-kv_frac:0.8-input_output_len:1024,1024-reqs:160-con:32-ep:8-tp:8-gpus:8] TIMEOUT(180)
+
+
+# 16: Four-GPU MTP3 on GB300/SM103.
+# PR #21019: GLM BF16 KV / 128-token pages; #21621: Qwen FP8 KV / breakable prefill.
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 4
+      compute_capability:
+        gte: 10.3
+        lte: 10.3
+  tests:
+  - perf/test_perf.py::test_perf[glm_5.3_flash_nvfp4_mtp_bf16_kv-serve-pytorch-streaming-float4-maxbs:32-maxnt:8192-kv_frac:0.8-input_output_len:8192,1024-reqs:5-con:1-ep:4-tp:4-gpus:4] TIMEOUT(180)
+  - perf/test_perf.py::test_perf[glm_5.3_flash_nvfp4_mtp_bf16_kv-serve-pytorch-streaming-float4-maxbs:32-maxnt:8192-kv_frac:0.8-input_output_len:8192,1024-reqs:40-con:8-ep:4-tp:4-gpus:4] TIMEOUT(180)
+  - perf/test_perf.py::test_perf[glm_5.3_flash_nvfp4_mtp_bf16_kv-serve-pytorch-streaming-float4-maxbs:32-maxnt:8192-kv_frac:0.8-input_output_len:8192,1024-reqs:160-con:32-ep:4-tp:4-gpus:4] TIMEOUT(180)
+  - perf/test_perf.py::test_perf[qwen3.8_flash_next_fp8_mtp_tep4-serve-pytorch-streaming-float8-maxbs:128-maxnt:8192-kv_frac:0.6-input_output_len:8192,1024-reqs:5-con:1-ep:4-tp:4-gpus:4] TIMEOUT(180)
+  - perf/test_perf.py::test_perf[qwen3.8_flash_next_fp8_mtp_tep4-serve-pytorch-streaming-float8-maxbs:128-maxnt:8192-kv_frac:0.6-input_output_len:8192,1024-reqs:40-con:8-ep:4-tp:4-gpus:4] TIMEOUT(180)
+  - perf/test_perf.py::test_perf[qwen3.8_flash_next_fp8_mtp_tep4-serve-pytorch-streaming-float8-maxbs:128-maxnt:8192-kv_frac:0.6-input_output_len:8192,1024-reqs:160-con:32-ep:4-tp:4-gpus:4] TIMEOUT(180)
+
+
+# 17: MiniMax M3.1 Flash MXFP8/NVFP4 TP2/EP1 on VR200.
+# PR #22261; one mixed-precision checkpoint, without and with DSpark7; NVFP4 KV.
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 2
+      compute_capability:
+        gte: 10.7
+        lte: 10.7
+  tests:
+  - perf/test_perf.py::test_perf[minimax_m3.1_flash_nvfp4-serve-pytorch-streaming-float4-maxbs:64-maxnt:8192-kv_frac:0.6-input_output_len:8192,1024-reqs:5-con:1-ep:1-tp:2-gpus:2] TIMEOUT(180)
+  - perf/test_perf.py::test_perf[minimax_m3.1_flash_nvfp4-serve-pytorch-streaming-float4-maxbs:64-maxnt:8192-kv_frac:0.6-input_output_len:8192,1024-reqs:40-con:8-ep:1-tp:2-gpus:2] TIMEOUT(180)
+  - perf/test_perf.py::test_perf[minimax_m3.1_flash_nvfp4-serve-pytorch-streaming-float4-maxbs:64-maxnt:8192-kv_frac:0.6-input_output_len:8192,1024-reqs:160-con:32-ep:1-tp:2-gpus:2] TIMEOUT(180)
+  - perf/test_perf.py::test_perf[minimax_m3.1_flash_nvfp4_dspark-serve-pytorch-streaming-float4-maxbs:64-maxnt:8192-kv_frac:0.6-input_output_len:8192,1024-reqs:5-con:1-ep:1-tp:2-gpus:2] TIMEOUT(180)
+  - perf/test_perf.py::test_perf[minimax_m3.1_flash_nvfp4_dspark-serve-pytorch-streaming-float4-maxbs:64-maxnt:8192-kv_frac:0.6-input_output_len:8192,1024-reqs:40-con:8-ep:1-tp:2-gpus:2] TIMEOUT(180)
+  - perf/test_perf.py::test_perf[minimax_m3.1_flash_nvfp4_dspark-serve-pytorch-streaming-float4-maxbs:64-maxnt:8192-kv_frac:0.6-input_output_len:8192,1024-reqs:160-con:32-ep:1-tp:2-gpus:2] TIMEOUT(180)
+
+
+# 18: Muse Spark Open NVFP4 AgentX balanced recipe on GB300.
+# PR #22498; 24 multi-turn sessions, 1M context window, 640 GiB host KV per node.
+# AgentX request failures observed in validation are tracked by NVBug 7139161.
+# input_len denotes the context limit; AgentX replays trace lengths for 3600s
+# after warmup. This case does not use a synthetic ISL/OSL dataset.
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 4
+      compute_capability:
+        gte: 10.3
+        lte: 10.3
+  tests:
+  - perf/test_perf.py::test_perf[muse_spark_open_nvfp4_agentx-serve-pytorch-streaming-float4-maxbs:24-maxnt:8192-kv_frac:0.8-input_len:1048576-con:24-ep:4-tp:4-gpus:4] TIMEOUT(240)
