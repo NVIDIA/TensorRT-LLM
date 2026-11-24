@@ -63,6 +63,7 @@ from tensorrt_llm._torch.utils import AuxStreamType, model_extra_attrs
 from tensorrt_llm.functional import AllReduceStrategy, PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.llmapi.llm_args import (
     DeepSeekV4SparseAttentionConfig,
+    DSparkDecodingConfig,
     KvCacheConfig,
     MTPDecodingConfig,
 )
@@ -2019,12 +2020,21 @@ def test_fused_rope_context_positions(num_heads: int, cached_offset: int) -> Non
     _assert_matches(quant_q, q_pe, reference, num_heads)
 
 
-def test_deepseek_v4_declares_ragged_verification_for_the_embedded_draft():
-    def model_config(spec_config):
-        return SimpleNamespace(spec_config=spec_config)
+def test_deepseek_v4_declares_ragged_verification_for_the_embedded_draft(tmp_path):
+    def model_config(name: str, weight_name: str) -> ModelConfig:
+        # The DSpark config reads the draft form from the checkpoint's weight index.
+        checkpoint = tmp_path / name
+        checkpoint.mkdir()
+        (checkpoint / "config.json").write_text(json.dumps({"model_type": "deepseek_v4"}))
+        (checkpoint / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {weight_name: "model.safetensors"}})
+        )
+        return ModelConfig(
+            spec_config=DSparkDecodingConfig(max_draft_len=5, speculative_model=str(checkpoint))
+        )
 
-    embedded = SimpleNamespace(draft_is_embedded_in_target=True)
-    standalone = SimpleNamespace(draft_is_embedded_in_target=False)
-    assert DeepseekV4ForCausalLM.supports_ragged_verification(model_config(embedded))
-    assert not DeepseekV4ForCausalLM.supports_ragged_verification(model_config(standalone))
-    assert not DeepseekV4ForCausalLM.supports_ragged_verification(model_config(None))
+    embedded = model_config("embedded", "mtp.0.norm.weight")
+    standalone = model_config("standalone", "layers.0.norm.weight")
+    assert DeepseekV4ForCausalLM.supports_ragged_verification(embedded)
+    assert not DeepseekV4ForCausalLM.supports_ragged_verification(standalone)
+    assert not DeepseekV4ForCausalLM.supports_ragged_verification(ModelConfig())
