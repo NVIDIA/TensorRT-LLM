@@ -9,7 +9,7 @@ By NVIDIA TensorRT LLM team
 
 **Table of Contents**
 - [Introduction](#introduction)
-- [MLPerf Training v6.1 results at a glance](#mlperf-training-v61-results-at-a-glance)
+- [MLPerf Training v6.1 results](#mlperf-training-v61-results)
 - [Inference in RL: A Different Optimization Problem](#inference-in-rl-a-different-optimization-problem)
   - [Rollout in One Training Step](#rollout-in-one-training-step)
   - [RL Rollout vs. Online Serving](#rl-rollout-vs-online-serving)
@@ -31,11 +31,11 @@ By NVIDIA TensorRT LLM team
 
 TensorRT-LLM has all the essential capabilities to serve as the rollout engine in reinforcement learning (RL) training, including in-flight weight updates, pause and resume of generation, and APIs for asynchronous training. These capabilities are built on an opt-in [Ray orchestrator](https://nvidia.github.io/TensorRT-LLM/features/ray-orchestrator.html), as many modern RL frameworks favor the flexibility of Ray for placing different types of workers. TensorRT-LLM is officially integrated with [NVIDIA NeMo RL](https://github.com/NVIDIA-NeMo/RL), and its worker extension and collective RPC interfaces make it straightforward to integrate with other custom RL frameworks. In this blog, we showcase our latest MLPerf Training v6.1 result on the RL track and take a deep dive into how we achieved the fastest time to train among submissions at the same training scale.
 
-## MLPerf Training v6.1 results at a glance
+## MLPerf Training v6.1 results
 
 In MLPerf Training v6.1, MLCommons added a new benchmark: Qwen3.5-397B, a large-scale LLM post-training workload and the first of its kind in MLPerf Training. Post-training underpins much of the recent progress in agentic AI. In this benchmark, [Qwen3.5-397B-A17B](https://huggingface.co/Qwen/Qwen3.5-397B-A17B), an MoE model with 17B active parameters per token that combines Gated DeltaNet linear-attention layers with full-attention layers, is trained with Group Relative Policy Optimization (GRPO) to solve software engineering tasks. The score of this benchmark is the time to train to a target accuracy, excluding validation time.
 
-In large-scale RL training, rollout is often the bottleneck: the throughput of the rollout engine sets the pace for the end-to-end time to train. At the same scale of `56` accelerators, **NVIDIA Vera Rubin with NeMo RL and TensorRT-LLM ranks first at `28.466` minutes** ([our submission](https://results.mlcommons.org/training#view=submission&benchmark=qwen35_397b_grpo&rid=6.1-0119%3Aqwen35_397b_grpo), Figure 1), compared to submissions on NVIDIA GB300 and GB200 GPUs. On NVIDIA Vera Rubin, **submissions that use TensorRT-LLM as the rollout engine rank first at `56`, `64` and `1,024` GPUs**. For example, a Nebius submission ([6.1-0135](https://results.mlcommons.org/training#view=submission&benchmark=qwen35_397b_grpo&rid=6.1-0135%3Aqwen35_397b_grpo)) using NeMo RL and TensorRT-LLM reached `24.82` minutes at `64` GPUs (Figure 2).
+In large-scale RL training, rollout is often the bottleneck: the throughput of the rollout engine sets the pace for the end-to-end time to train. At the same scale of `56` accelerators, **NVIDIA Vera Rubin with NeMo RL and TensorRT-LLM ranks first at `28.466` minutes** ([our submission](https://results.mlcommons.org/training#view=submission&benchmark=qwen35_397b_grpo&rid=6.1-0119%3Aqwen35_397b_grpo), Figure 1), compared to submissions on NVIDIA GB300 and GB200 GPUs.
 
 <div align="center">
 <figure>
@@ -43,6 +43,8 @@ In large-scale RL training, rollout is often the bottleneck: the throughput of t
 </figure>
 </div>
 <p align="center"><sub><em>Figure 1: Time to train at the same scale of 56 accelerators in the Qwen3.5 397B GRPO benchmark. NVIDIA Vera Rubin with NeMo RL and TensorRT-LLM (in green) ranks first at 28.466 minutes. Source: <a href="https://results.mlcommons.org/training#benchmark=qwen35_397b_grpo&amp;round=v6.1">MLCommons MLPerf Training v6.1 results</a> (<a href="https://results.mlcommons.org/training#view=submission&amp;benchmark=qwen35_397b_grpo&amp;rid=6.1-0119%3Aqwen35_397b_grpo">submission details</a>).</em></sub></p>
+
+On NVIDIA Vera Rubin, **submissions that use TensorRT-LLM as the rollout engine rank first at `56`, `64` and `1,024` GPUs**. For example, a Nebius submission ([6.1-0135](https://results.mlcommons.org/training#view=submission&benchmark=qwen35_397b_grpo&rid=6.1-0135%3Aqwen35_397b_grpo)) using NeMo RL and TensorRT-LLM reached `24.82` minutes at `64` GPUs (Figure 2).
 
 <div align="center">
 <figure>
