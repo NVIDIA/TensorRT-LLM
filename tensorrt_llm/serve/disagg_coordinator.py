@@ -1109,7 +1109,7 @@ class CoordinatorClient(DisaggCoordinator):
         except Exception as error:  # noqa: BLE001
             self._is_ready = False
             logger.warning(f"CoordinatorClient state sync failed: {error}")
-        return self._is_ready
+        return self._can_serve()
 
     async def _await_coordinator(self) -> Dict[str, Any]:
         """Poll the coordinator's /cluster_info until reachable, or raise.
@@ -1203,21 +1203,26 @@ class CoordinatorClient(DisaggCoordinator):
         """Use cached readiness or await shared refresh work within the caller budget."""
         if self._stopping:
             return False
-        if not self._is_ready:
+        if not self._can_serve():
             # Another fleet worker may have passed /health before this worker's
             # next background poll. Refresh its local routing state before rejecting.
             try:
                 # Limit this caller's wait without interrupting shared preparation.
-                return await asyncio.wait_for(
+                await asyncio.wait_for(
                     asyncio.shield(self._get_refresh_task()),
                     timeout=COORDINATOR_READINESS_TIMEOUT_S,
                 )
             except asyncio.TimeoutError:
-                return False
-        return self._is_ready
+                pass
+        return self._can_serve()
+
+    def _can_serve(self) -> bool:
+        return self._is_ready and (
+            not self._context_cancellation_enabled or self._ctx_router.has_prepared_server
+        )
 
     async def _apply_cluster_info(self, info: Dict[str, Any]) -> None:
-        """Publish readiness only after local routing state is fully prepared."""
+        """Serve only through a ready coordinator and locally verified routes."""
         self._is_ready = False
         if (
             info.get("context_cancellation_enabled", False)
@@ -1229,8 +1234,11 @@ class CoordinatorClient(DisaggCoordinator):
             )
         self._sync_delegating_router_configs(info)
         await self._sync_router_server_lists(info)
-        self._sync_render_fingerprints(info)
-        self._is_ready = info.get("is_ready", False)
+        if not self._context_cancellation_enabled:
+            self._sync_render_fingerprints(info)
+        self._is_ready = bool(info.get("is_ready")) and (
+            not self._context_cancellation_enabled or self._ctx_router.has_prepared_server
+        )
 
     def _sync_render_fingerprints(self, info: Dict[str, Any]) -> None:
         published = info.get("render_fingerprints")
@@ -1252,7 +1260,6 @@ class CoordinatorClient(DisaggCoordinator):
 
     async def _sync_router_server_lists(self, info: Dict[str, Any]) -> None:
         server_lists = info.get("server_lists")
-        context_admissions = None
         if self._context_cancellation_enabled:
             context_admissions = info.get("context_admissions")
             if not isinstance(context_admissions, dict) or not isinstance(server_lists, dict):
@@ -1268,53 +1275,58 @@ class CoordinatorClient(DisaggCoordinator):
                 or (info.get("is_ready") and not desired_ctx)
             ):
                 raise ServerPreparationPending("Waiting for the coordinator's admitted CTX pool")
+            # Revoke every stale route before GEN preparation or a joining CTX can yield.
+            ctx = self._ctx_router
+            local = ctx._local if isinstance(ctx, CoordinatorDelegatingRouter) else ctx
+            local.retire_context_registrations(context_admissions)
+            await self._sync_router_servers(self._gen_router, server_lists.get("generation", []))
+            self._sync_render_fingerprints(info)
+            # The request gate checks the independently published CTX pool as well.
+            self._is_ready = bool(info.get("is_ready"))
+            try:
+                # One slow join must not indefinitely delay the next coordinator snapshot.
+                await asyncio.wait_for(
+                    local.sync_context_grants(
+                        server_lists.get("context", []),
+                        context_admissions,
+                        self._request_timeout_s,
+                        mirror=isinstance(ctx, CoordinatorDelegatingRouter),
+                    ),
+                    timeout=self._request_timeout_s,
+                )
+            except asyncio.TimeoutError as error:
+                if not self._can_serve():
+                    self._is_ready = False
+                    raise ServerPreparationPending("Timed out verifying CTX grants") from error
+                logger.warning("CTX join timed out; retaining admitted peers")
+            except (ServerPreparationPending, ContextCancellationCapabilityError):
+                self._is_ready = False
+                raise
+            return
         if server_lists is None:
             return
-        router_servers = (
-            (self._ctx_router, server_lists.get("context", [])),
-            (self._gen_router, server_lists.get("generation", [])),
-        )
-        for router, servers in router_servers:
-            admissions = context_admissions if router is self._ctx_router else None
-            if isinstance(router, CoordinatorDelegatingRouter):
-                if admissions is None:
-                    await router.sync_servers(servers)
-                else:
-                    await router.sync_servers(servers, context_admissions=admissions)
-                continue
-            desired = set(servers)
-            if admissions is not None:
-                # A protected frontend must stop using superseded grants as soon
-                # as it sees the snapshot, even if another worker is slow to prove.
-                for server in list(router.servers):
-                    if server not in desired or (
-                        router.server_registration_id(server) != admissions[server]
-                    ):
-                        await router.remove_server(server)
-                for server in desired:
-                    if (
-                        server in router.servers
-                        and router.server_registration_id(server) == admissions[server]
-                    ):
-                        continue
-                    if not await router.add_server(
-                        server, registration_id=admissions[server], raise_on_capability_error=True
-                    ):
-                        raise ServerPreparationPending(f"Failed to prepare {server}")
-            for server in desired - set(router.servers):
-                if not await router.add_server(server):
-                    raise RuntimeError(
-                        f"Failed to prepare {server} before adding it to the "
-                        f"{router.server_role.name} router"
-                    )
-            await router.prepare_servers(list(desired))
-            unprepared = desired - router.prepared_servers
-            if unprepared:
+        await self._sync_router_servers(self._ctx_router, server_lists.get("context", []))
+        await self._sync_router_servers(self._gen_router, server_lists.get("generation", []))
+
+    @staticmethod
+    async def _sync_router_servers(router: Router, servers: list[str]) -> None:
+        if isinstance(router, CoordinatorDelegatingRouter):
+            await router.sync_servers(servers)
+            return
+        desired = set(servers)
+        for server in desired - set(router.servers):
+            if not await router.add_server(server):
                 raise RuntimeError(
-                    f"Servers are not prepared for {router.server_role.name}: {sorted(unprepared)}"
+                    f"Failed to prepare {server} before adding it to the {router.server_role.name} router"
                 )
-            for server in set(router.servers) - desired:
-                await router.remove_server(server)
+        await router.prepare_servers(list(desired))
+        unprepared = desired - router.prepared_servers
+        if unprepared:
+            raise RuntimeError(
+                f"Servers are not prepared for {router.server_role.name}: {sorted(unprepared)}"
+            )
+        for server in set(router.servers) - desired:
+            await router.remove_server(server)
 
     async def cluster_info(self) -> Dict[str, Any]:
         try:

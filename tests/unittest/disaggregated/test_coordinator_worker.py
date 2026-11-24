@@ -2229,43 +2229,77 @@ async def test_fleet_matching_cancellation_mode_prepares_before_ready(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("replacement", [False, True], ids=["removed", "same-url"])
-async def test_protected_round_robin_revokes_before_waiting_for_worker(
-    monkeypatch: pytest.MonkeyPatch, replacement: bool
+@pytest.mark.parametrize("join", ["removed", "same-url", "cold"])
+@pytest.mark.parametrize("routing", ["round_robin", "load_balancing"])
+async def test_protected_frontend_serves_verified_peer_during_failing_join(
+    monkeypatch: pytest.MonkeyPatch, join: str, routing: str
 ) -> None:
-    client = CoordinatorClient("http://coordinator", _context_cancellation_config(monkeypatch))
+    config = _context_cancellation_config(monkeypatch, router=routing)
+    client = CoordinatorClient("http://coordinator", config)
     router = client.ctx_router
+    local = getattr(router, "_local", router)
+    service = OpenAIDisaggregatedService(config, client, Mock())
     verified = {"supports_logical_context_cancellation": True}
-    router._fetch_server_info = AsyncMock(return_value=verified)
+    local._fetch_server_info = AsyncMock(return_value=verified)
     old = "departed:8000"
     keep = "healthy:8000"
-    new = old if replacement else "joining:8000"
+    new = old if join == "same-url" else "joining:8000"
     entered, release = asyncio.Event(), asyncio.Event()
 
-    def snapshot(grants: dict[str, str]) -> dict:
+    def snapshot(grants: dict[str, str], *, ready: bool = True) -> dict:
         return {
+            "is_ready": ready,
+            "context_cancellation_enabled": True,
             "server_lists": {"context": list(grants), "generation": []},
             "context_admissions": grants,
         }
 
-    async def pending(*args: object) -> dict:
+    async def pending(server: str, _timeout: float) -> dict:
+        if server == keep:
+            return verified
         entered.set()
         await release.wait()
         raise RuntimeError("worker not ready")
 
-    await client._sync_router_server_lists(snapshot({old: "v1", keep: "healthy"}))
-    router._fetch_server_info.side_effect = pending
-    refresh = asyncio.create_task(
-        client._sync_router_server_lists(snapshot({keep: "healthy", new: "v2"}))
-    )
+    request = CompletionRequest(model="m", prompt="one")
+    if join != "cold":
+        await client._apply_cluster_info(snapshot({old: "v1", keep: "healthy"}))
+    client._sync_render_fingerprints = Mock(wraps=client._sync_render_fingerprints)
+    local._fetch_server_info.side_effect = pending
+    client.cluster_info = AsyncMock(return_value=snapshot({new: "v2", keep: "healthy"}))
+    refresh = client._get_refresh_task()
     try:
         await asyncio.wait_for(entered.wait(), 2)
         assert router.servers == [keep]
+        client._sync_render_fingerprints.assert_called_once_with(client.cluster_info.return_value)
         assert router.server_registration_id(keep) == "healthy"
+        await asyncio.wait_for(service._require_ready(), 1)
+        if isinstance(router, CoordinatorDelegatingRouter):
+            router._post_select = AsyncMock(
+                return_value={"server": keep, "info": {"context_admission": "healthy"}}
+            )
+        assert (await router.get_next_server(request, req_id=41))[0] == keep
+        if isinstance(router, CoordinatorDelegatingRouter):
+            router._post_select.return_value = {"server": new, "info": {"context_admission": "v2"}}
+            router._finish_async = AsyncMock()
+            with pytest.raises(ServerPreparationPending):
+                await router.get_next_server(request, req_id=42)
+            router._finish_async.assert_awaited_once_with(42, False, context_admission="v2")
         release.set()
-        with pytest.raises(ServerPreparationPending, match="Failed to prepare"):
-            await refresh
+        assert await refresh
         assert router.servers == [keep]
+        await service._require_ready()
+        client.cluster_info.return_value = snapshot({keep: "healthy"}, ready=False)
+        assert not await client._refresh_coordinator_state()
+        assert not await client.is_ready()
+        client.cluster_info.return_value = snapshot({}, ready=False)
+        with pytest.raises(ServerPreparationPending) as failure:
+            await service.openai_completion(request)
+        with pytest.raises(HTTPException) as response:
+            OpenAIDisaggServer._handle_exception(
+                SimpleNamespace(_perf_metrics_collector=Mock()), failure.value
+            )
+        assert response.value.status_code == 503
     finally:
         release.set()
         await asyncio.gather(refresh, return_exceptions=True)
@@ -2380,7 +2414,7 @@ async def test_replaced_delegated_ctx_url_is_not_a_prepared_worker(
         edge._local._fetch_server_info.side_effect = RuntimeError("probe temporarily unavailable")
         with pytest.raises(ServerPreparationPending):
             await client._apply_cluster_info(info)
-        assert edge.servers == [server] and not edge.has_prepared_server
+        assert not edge.servers and not edge.has_prepared_server
         service = OpenAIDisaggregatedService(config, client, Mock())
         with pytest.raises(ServerPreparationPending) as failure:
             await service.openai_completion(CompletionRequest(model="m", prompt="one"))

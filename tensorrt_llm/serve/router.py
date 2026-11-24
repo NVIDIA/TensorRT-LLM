@@ -775,34 +775,49 @@ class Router(ABC):
             for server, info in self._server_info.items() if server in servers
         }
 
-    async def _mirror_context_servers(self, servers: list[str],
-                                      admissions: dict[str, str],
-                                      timeout_s: float) -> None:
-        """Verify changed CTX registrations before publishing the new pool."""
-        # Revoke obsolete registrations before any worker probe yields.
-        retained = {
-            server: tag
-            for server, tag in self._server_registration_ids.items()
-            if admissions.get(server) == tag
-        }
-        self._server_registration_ids = retained
-        for server in servers:
-            if server in retained:
-                continue
+    async def sync_context_grants(self,
+                                  servers: list[str],
+                                  admissions: dict[str, str],
+                                  timeout_s: float,
+                                  *,
+                                  mirror: bool = False) -> None:
+        """Publish each independently verified CTX grant while this snapshot remains current."""
+        self.retire_context_registrations(admissions)
+        verified = self._server_registration_ids.copy()
+        self._server_registration_ids = verified
+
+        async def verify(server: str) -> Optional[RuntimeError]:
             try:
-                info = await self._fetch_server_info(server, timeout_s)
-            except ContextCancellationCapabilityError:
-                raise
-            except RuntimeError as error:
-                raise ServerPreparationPending(
-                    f"CTX probe unavailable for {server}") from error
-            _check_context_capability(server, info)
-        async with self._lock:
-            if self._server_registration_ids is not retained:
-                raise ServerPreparationPending(
-                    "A newer CTX admission snapshot superseded the probe")
-            self._server_registration_ids = dict(admissions)
-            self._mirror_servers_locked(servers)
+                async with self._context_probe_limit:
+                    info = await self._fetch_server_info(server, timeout_s)
+                async with self._lock:
+                    if self._server_registration_ids is verified:
+                        if mirror:
+                            _check_context_capability(server, info)
+                            self._publish_server(server, admissions[server])
+                        else:
+                            self._publish_context_registration(
+                                server, admissions[server], info)
+            except (ContextCancellationCapabilityError,
+                    ServerPreparationPending) as error:
+                logger.warning(
+                    f"CTX grant at {server} remains unverified: {error}")
+                return error
+            except (RuntimeError, OSError) as error:
+                logger.warning(f"CTX probe unavailable for {server}: {error}")
+                return ServerPreparationPending(
+                    f"CTX probe unavailable for {server}")
+            return None
+
+        errors = await asyncio.gather(*(verify(server) for server in servers
+                                        if server not in verified))
+        if self._server_registration_ids is not verified:
+            raise ServerPreparationPending(
+                "A newer CTX admission snapshot superseded the probe")
+        if not verified:
+            for error in errors:
+                if error is not None:
+                    raise error
 
     @abstractmethod
     async def get_next_server(self,
@@ -3120,9 +3135,10 @@ class CoordinatorDelegatingRouter(Router):
         if context_admissions is None:
             await self._local.mirror_servers(servers)
         else:
-            await self._local._mirror_context_servers(servers,
-                                                      context_admissions,
-                                                      self._request_timeout_s)
+            await self._local.sync_context_grants(servers,
+                                                  context_admissions,
+                                                  self._request_timeout_s,
+                                                  mirror=True)
 
     def set_unpredicted_priority(self, priority: float) -> None:
         # The local router computes the routing key's priority.
