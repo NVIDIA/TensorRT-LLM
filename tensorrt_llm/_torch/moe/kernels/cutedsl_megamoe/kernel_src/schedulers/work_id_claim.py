@@ -7,10 +7,18 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 from cutlass._mlir import ir
-from cutlass._mlir.dialects import nvvm as _nvvm
 from cutlass.cutlass_dsl import Boolean, Int32, Int64, extract_mlir_values, new_from_mlir_values
 
-from ...helpers.ptx_helpers import mbarrier_arrive_expect_tx_on_peer, nanosleep, store_i32_to_peer_cluster_smem_async
+from ...helpers.cluster_pipeline import (
+    consumer_release_cluster,
+    consumer_wait_cluster,
+    producer_acquire_cluster,
+)
+from ...helpers.ptx_helpers import (
+    mbarrier_arrive_expect_tx_on_peer,
+    nanosleep,
+    store_i32_to_peer_cluster_smem_async,
+)
 
 
 class GridStrideWorkIdState:
@@ -403,7 +411,7 @@ def _claim_atomic_counter_work_id(
     selected_counter_pointer = work_id_state.counter_pointer + Int32(atomic_counter_index)
 
     if work_id_state.is_leader_cta:
-        cluster_pipeline.producer_acquire(work_id_state.producer_state)
+        producer_acquire_cluster(cluster_pipeline, work_id_state.producer_state, work_id_state.cluster_size)
         full_barrier_pointer = cluster_pipeline.sync_object_full.get_barrier(work_id_state.producer_state.index)
         thread_idx, _, _ = cute.arch.thread_idx()
         lane_idx = thread_idx % Int32(32)
@@ -418,10 +426,12 @@ def _claim_atomic_counter_work_id(
             mbarrier_arrive_expect_tx_on_peer(full_barrier_pointer, Int32(4), lane_idx)
     work_id_state.producer_state.advance()
 
-    cluster_pipeline.consumer_wait(work_id_state.consumer_state)
+    # Both halves of the slot handoff cross CTAs: acquire the slot at cluster scope
+    # before reading it, and release it at cluster scope afterwards.
+    consumer_wait_cluster(cluster_pipeline, work_id_state.consumer_state, work_id_state.cluster_size)
     linear_work_id = broadcast_tensor[0]
     cute.arch.fence_acq_rel_cta()
-    cluster_pipeline.sync_object_empty.arrive(work_id_state.consumer_state.index, Int32(0))
+    consumer_release_cluster(cluster_pipeline, work_id_state.consumer_state, work_id_state.cluster_size)
     work_id_state.consumer_state.advance()
     return linear_work_id, work_id_state
 
@@ -450,7 +460,7 @@ def broadcast_atomic_counter_ready(
     cluster_pipeline = work_id_state.cluster_pipeline
 
     if work_id_state.is_leader_cta:
-        cluster_pipeline.producer_acquire(work_id_state.producer_state)
+        producer_acquire_cluster(cluster_pipeline, work_id_state.producer_state, work_id_state.cluster_size)
         full_barrier_pointer = cluster_pipeline.sync_object_full.get_barrier(
             work_id_state.producer_state.index
         )
@@ -482,12 +492,12 @@ def broadcast_atomic_counter_ready(
             )
     work_id_state.producer_state.advance()
 
-    cluster_pipeline.consumer_wait(work_id_state.consumer_state)
+    # Both halves of the slot handoff cross CTAs: acquire the slot at cluster scope
+    # before reading it, and release it at cluster scope afterwards.
+    consumer_wait_cluster(cluster_pipeline, work_id_state.consumer_state, work_id_state.cluster_size)
     ready_payload = broadcast_tensor[0]
     cute.arch.fence_acq_rel_cta()
-    cluster_pipeline.sync_object_empty.arrive(
-        work_id_state.consumer_state.index, Int32(0)
-    )
+    consumer_release_cluster(cluster_pipeline, work_id_state.consumer_state, work_id_state.cluster_size)
     work_id_state.consumer_state.advance()
     return ready_payload != Int32(0), work_id_state
 
@@ -533,7 +543,7 @@ def broadcast_atomic_counter_ready_or_claim(
     )
 
     if work_id_state.is_leader_cta:
-        cluster_pipeline.producer_acquire(work_id_state.producer_state)
+        producer_acquire_cluster(cluster_pipeline, work_id_state.producer_state, work_id_state.cluster_size)
         full_barrier_pointer = cluster_pipeline.sync_object_full.get_barrier(
             work_id_state.producer_state.index
         )
@@ -575,12 +585,12 @@ def broadcast_atomic_counter_ready_or_claim(
             )
     work_id_state.producer_state.advance()
 
-    cluster_pipeline.consumer_wait(work_id_state.consumer_state)
+    # Both halves of the slot handoff cross CTAs: acquire the slot at cluster scope
+    # before reading it, and release it at cluster scope afterwards.
+    consumer_wait_cluster(cluster_pipeline, work_id_state.consumer_state, work_id_state.cluster_size)
     payload = broadcast_tensor[0]
     cute.arch.fence_acq_rel_cta()
-    cluster_pipeline.sync_object_empty.arrive(
-        work_id_state.consumer_state.index, Int32(0)
-    )
+    consumer_release_cluster(cluster_pipeline, work_id_state.consumer_state, work_id_state.cluster_size)
     work_id_state.consumer_state.advance()
     return payload == Int32(-1), payload, work_id_state
 
@@ -595,7 +605,9 @@ def initialize_fixed_group_mixed_cga_work_id_state(
         broadcast_tensor = cute.make_tensor(atomic_counter_state.broadcast_pointer, cute.make_layout((1,)))
         cluster_pipeline = atomic_counter_state.cluster_pipeline
         if atomic_counter_state.is_leader_cta:
-            cluster_pipeline.producer_acquire(atomic_counter_state.producer_state)
+            producer_acquire_cluster(
+                cluster_pipeline, atomic_counter_state.producer_state, atomic_counter_state.cluster_size
+            )
             full_barrier_pointer = cluster_pipeline.sync_object_full.get_barrier(
                 atomic_counter_state.producer_state.index
             )
@@ -616,10 +628,14 @@ def initialize_fixed_group_mixed_cga_work_id_state(
                 mbarrier_arrive_expect_tx_on_peer(full_barrier_pointer, Int32(4), lane_idx)
         atomic_counter_state.producer_state.advance()
 
-        cluster_pipeline.consumer_wait(atomic_counter_state.consumer_state)
+        # Both halves of the slot handoff cross CTAs: acquire the slot at cluster scope
+        # before reading it, and release it at cluster scope afterwards.
+        consumer_wait_cluster(cluster_pipeline, atomic_counter_state.consumer_state, atomic_counter_state.cluster_size)
         fallback_ordinal = broadcast_tensor[0]
         cute.arch.fence_acq_rel_cta()
-        cluster_pipeline.sync_object_empty.arrive(atomic_counter_state.consumer_state.index, Int32(0))
+        consumer_release_cluster(
+            cluster_pipeline, atomic_counter_state.consumer_state, atomic_counter_state.cluster_size
+        )
         atomic_counter_state.consumer_state.advance()
 
         fallback_group_idx = fallback_ordinal // Int32(work_id_state.split_factor)
@@ -648,7 +664,9 @@ def _claim_fixed_group_fallback_work_id(
     selected_counter_pointer = atomic_counter_state.counter_pointer + Int32(atomic_counter_index)
 
     if atomic_counter_state.is_leader_cta:
-        cluster_pipeline.producer_acquire(atomic_counter_state.producer_state)
+        producer_acquire_cluster(
+            cluster_pipeline, atomic_counter_state.producer_state, atomic_counter_state.cluster_size
+        )
         full_barrier_pointer = cluster_pipeline.sync_object_full.get_barrier(atomic_counter_state.producer_state.index)
         thread_idx, _, _ = cute.arch.thread_idx()
         lane_idx = thread_idx % Int32(32)
@@ -708,10 +726,12 @@ def _claim_fixed_group_fallback_work_id(
             mbarrier_arrive_expect_tx_on_peer(full_barrier_pointer, Int32(4), lane_idx)
     atomic_counter_state.producer_state.advance()
 
-    cluster_pipeline.consumer_wait(atomic_counter_state.consumer_state)
+    # Both halves of the slot handoff cross CTAs: acquire the slot at cluster scope
+    # before reading it, and release it at cluster scope afterwards.
+    consumer_wait_cluster(cluster_pipeline, atomic_counter_state.consumer_state, atomic_counter_state.cluster_size)
     claimed_payload = broadcast_tensor[0]
     cute.arch.fence_acq_rel_cta()
-    cluster_pipeline.sync_object_empty.arrive(atomic_counter_state.consumer_state.index, Int32(0))
+    consumer_release_cluster(cluster_pipeline, atomic_counter_state.consumer_state, atomic_counter_state.cluster_size)
     atomic_counter_state.consumer_state.advance()
     work_id_state.atomic_counter_state = atomic_counter_state
     work_id_state.claimed_counter_index = (claimed_payload >> Int32(31)) & Int32(1)
@@ -752,7 +772,7 @@ def _claim_cluster_launch_control_work_id(
     if not use_bootstrap:
         state_before_leader_query = work_id_state
         if work_id_state.is_leader_cta:
-            work_id_state.cluster_pipeline.producer_acquire(work_id_state.producer_state)
+            producer_acquire_cluster(work_id_state.cluster_pipeline, work_id_state.producer_state)
             response_barrier = work_id_state.cluster_pipeline.producer_get_barrier(work_id_state.producer_state)
             with cute.arch.elect_one():
                 cute.arch.issue_clc_query(response_barrier, work_id_state.response_pointer)
@@ -760,12 +780,15 @@ def _claim_cluster_launch_control_work_id(
             work_id_state = state_before_leader_query
         work_id_state.producer_state.advance()
 
+        # The CLC unit writes the response into this CTA's slot through the async proxy and completes this
+        # CTA's own barrier, as a multicast TMA load does; the pipeline's CTA-scope wait is the DSL's own
+        # choice for it (``PipelineClcFetchAsync.consumer_wait``), so it stays.
         work_id_state.cluster_pipeline.consumer_wait(work_id_state.consumer_state)
         (cluster_origin_m, cluster_origin_n, grid_l, response_is_valid) = cute.arch.clc_response(
             work_id_state.response_pointer
         )
         cute.arch.fence_acq_rel_cta()
-        work_id_state.cluster_pipeline.consumer_release(work_id_state.consumer_state)
+        consumer_release_cluster(work_id_state.cluster_pipeline, work_id_state.consumer_state)
         work_id_state.consumer_state.advance()
 
         work_id_state.grid_m = cluster_origin_m + work_id_state.cta_coord_in_cluster[0]
@@ -803,7 +826,7 @@ def _claim_clc_mixed_cga_work_id(
         cluster_pipeline = work_id_state.cluster_pipeline
         state_before_leader_query = work_id_state
         if work_id_state.is_leader_cta:
-            cluster_pipeline.producer_acquire(work_id_state.producer_state)
+            producer_acquire_cluster(cluster_pipeline, work_id_state.producer_state, work_id_state.cluster_size)
             full_barrier_pointer = cluster_pipeline.sync_object_full.get_barrier(work_id_state.producer_state.index)
             thread_idx, _, _ = cute.arch.thread_idx()
             lane_idx = thread_idx % Int32(32)
@@ -816,18 +839,16 @@ def _claim_clc_mixed_cga_work_id(
             work_id_state = state_before_leader_query
         work_id_state.producer_state.advance()
 
+        # The CLC unit writes the response into this CTA's slot through the async proxy and completes this
+        # CTA's own barrier, as a multicast TMA load does; the pipeline's CTA-scope wait is the DSL's own
+        # choice for it (``PipelineClcFetchAsync.consumer_wait``), so it stays.
         cluster_pipeline.consumer_wait(work_id_state.consumer_state)
         (cluster_origin_m, cluster_origin_n, grid_l, response_is_valid) = cute.arch.clc_response(
             work_id_state.response_pointer
         )
         cute.arch.fence_acq_rel_cta()
         cute.arch.fence_proxy("async.shared", space="cta")
-        # Cluster-scoped release orders this CTA's read of the response before the leader's next overwrite.
-        cute.arch.mbarrier_arrive(
-            cluster_pipeline.sync_object_empty.get_barrier(work_id_state.consumer_state.index),
-            Int32(0),
-            scope=_nvvm.MemScopeKind.CLUSTER,
-        )
+        consumer_release_cluster(cluster_pipeline, work_id_state.consumer_state, work_id_state.cluster_size)
         work_id_state.consumer_state.advance()
 
         work_id_state.grid_m = cluster_origin_m + work_id_state.cta_coord_in_cluster[0]

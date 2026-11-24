@@ -1934,7 +1934,7 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
             ),
         ),
     ),
-    "qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default": (
+    "qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default": (
         Cell(
             why="qwen4_exp decode: one token over 512 experts, top-10 renormalized, H 2560 / I 640",
             spec=dict(tokens=1, **_QWEN4_EXP),
