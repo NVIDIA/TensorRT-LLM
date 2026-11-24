@@ -193,7 +193,10 @@ class RubinMegaMoERunner(Sm100MegaMoENvfp4Runner):
             flag_batch,
             epi_flag_batch,
             token_back_ready_granularity,
+            combine_dedup,
         ) = _unpack_tactic(tactic)
+        if combine_dedup:
+            raise ValueError("The GLM Rubin runner does not support combine_dedup.")
         (
             launch_cluster_count,
             preferred_cluster_count,
