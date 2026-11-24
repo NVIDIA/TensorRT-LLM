@@ -24,6 +24,7 @@ from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.quantization.mode import QuantMode
 
+from .config import fp4_mla_cache_layout
 from .config import require_fp4_mla_fp8_context_support as require_fp4_mla_fp8_context_support
 from .fp4_mla_kernels import _fp8_mla_context_block_table_kernel
 
@@ -32,9 +33,6 @@ if TYPE_CHECKING:
         TrtllmAttention,
         TrtllmAttentionMetadata,
     )
-
-
-_FP8_CONTEXT_SCRATCH_ATTR = "_fp4_mla_fp8_context_scratch"
 
 
 def _execute_fp8_context_with_cache_update(
@@ -346,6 +344,37 @@ def _build_fp8_mla_context_metadata(
     # per-token position-offset input.
     fp8_meta.helix_position_offsets = meta.fp4_mla_state.positions[: meta.num_ctx_tokens]
     return fp8_meta
+
+
+def get_or_create_fp8_mla_context_scratch(
+    kv_cache_manager: object,
+    meta: "TrtllmAttentionMetadata",
+    *,
+    device: torch.device,
+    head_dim: int,
+) -> "_Fp8MlaContextScratch":
+    """Return the FP8 MLA context scratch of the manager's cache layout, creating or validating it."""
+    cache_layout = fp4_mla_cache_layout(kv_cache_manager)
+    if cache_layout is None:
+        raise RuntimeError(
+            "FP8 MLA context scratch requires a KV cache manager with the FP4 MLA cache layout."
+        )
+    created = False
+
+    def create_scratch() -> _Fp8MlaContextScratch:
+        nonlocal created
+        created = True
+        return _Fp8MlaContextScratch.create(meta, device=device, head_dim=head_dim)
+
+    scratch = cache_layout.get_or_create_fp8_context_scratch(create_scratch)
+    assert isinstance(scratch, _Fp8MlaContextScratch)
+    if not created:
+        fp8_context_state = meta.fp4_mla_state.fp8_context_state
+        if fp8_context_state is None or fp8_context_state[0] is not scratch:
+            assert scratch.matches(meta, device=device, head_dim=head_dim), (
+                "FP8 MLA context scratch geometry must be shared by all layers of its KV manager."
+            )
+    return scratch
 
 
 def _get_fp8_mla_context_metadata(
