@@ -21,6 +21,7 @@ attached-frontend proxy lifecycle over real ipc:// sockets.
 
 import os
 import threading
+from contextlib import ExitStack
 from types import SimpleNamespace
 
 import pytest
@@ -239,8 +240,9 @@ class TestClassicFrontendProxyEndToEnd:
             with pytest.raises(RuntimeError, match="shutting down|shut down"):
                 proxy.submit(GenerationRequest([4], SamplingParams()))
         finally:
-            proxy.shutdown()
-            worker_ingress.close()
+            with ExitStack() as cleanup:
+                cleanup.callback(worker_ingress.close)
+                proxy.shutdown()
 
     def test_check_health_and_submit_reflect_fatal_error(self, tmp_path) -> None:
         from tensorrt_llm.executor.request import GenerationRequest
@@ -260,8 +262,9 @@ class TestClassicFrontendProxyEndToEnd:
             assert proxy.dispatch_result_thread is None
             assert not worker_ingress.poll(0.1)
         finally:
-            proxy.shutdown()
-            worker_ingress.close()
+            with ExitStack() as cleanup:
+                cleanup.callback(worker_ingress.close)
+                proxy.shutdown()
 
     def test_dispatch_routes_own_lane_responses(self, tmp_path) -> None:
         import zmq
@@ -293,6 +296,7 @@ class TestClassicFrontendProxyEndToEnd:
             assert not proxy._results
             assert not worker_ingress.poll(0.1)
         finally:
-            proxy.shutdown()
-            worker_lane.close()
-            worker_ingress.close()
+            with ExitStack() as cleanup:
+                cleanup.callback(worker_ingress.close)
+                cleanup.callback(worker_lane.close)
+                proxy.shutdown()
