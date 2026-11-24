@@ -67,7 +67,8 @@ class MoeExecutionState:
         self.ep_group_health = ep_group_health
         self.ep_rank = ep_rank
         self._device = device
-        # The kernels read the abort state at its host address, which must be pinned memory.
+        # The kernels read the abort state at its host address, so the all-to-all ops take it only in
+        # pinned memory.
         if confidential_compute_enabled():
             raise RuntimeError(
                 "Wide-EP fault tolerance is not supported with Confidential Computing: the MoE "
@@ -78,8 +79,6 @@ class MoeExecutionState:
             dtype=torch.int32,
             pin_memory=prefer_pinned(),
         )
-        if not self.abort.is_pinned():
-            raise RuntimeError("The MoE All-to-All abort state requires pinned host memory")
         self._abort_words = self.abort.numpy()[_ABORT_WORDS]
         # Orders the updates of ``requested`` by request_abort and rearm.
         self._abort_lock = threading.Lock()

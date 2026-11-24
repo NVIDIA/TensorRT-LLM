@@ -126,6 +126,21 @@ def test_cancel_and_exclusion_on_replay() -> None:
     assert abort[:2].tolist() == [0, 0]
 
 
+def test_ops_refuse_a_pageable_abort_state() -> None:
+    """The kernels read the abort state at its host address, so the ops take it only pinned."""
+    workspace, meta, experts, payload = a2a_workspace(2)
+    controls, _ = _rank_mask_controls(1)
+    pageable = {**controls, "abort_state": torch.zeros(_ABORT_WORDS, dtype=torch.int32)}
+    with pytest.raises(RuntimeError, match="pinned host memory"):
+        a2a_dispatch(workspace, meta, experts, pageable, payload)
+    received, offset, _ = a2a_dispatch(workspace, meta, experts, controls, payload)
+    with pytest.raises(RuntimeError, match="pinned host memory"):
+        a2a_combine(workspace, meta, received[0], offset, pageable)
+    with pytest.raises(RuntimeError, match="pinned host memory"):
+        torch.ops.trtllm.moe_a2a_check_incomplete_round(workspace, meta, 0, pageable["abort_state"])
+    torch.cuda.synchronize()
+
+
 @pytest.mark.parametrize("ep_size, rank", [(2, 0), (72, 70)], ids=["first_word", "second_word"])
 def test_no_peer_writes_after_incomplete_round(ep_size: int, rank: int) -> None:
     """Until the workspace reset, a dispatch writes nothing into rows a peer may still read."""
