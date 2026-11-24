@@ -12967,10 +12967,8 @@ class PyExecutor:
                 continue
             request.py_kv_transfer_timed_out = False
             request.finish_by_reason(FinishReason.CANCELLED)
-            request.decoding_iter = request.py_decoding_iter
-            response = request.create_response()
+            response = prepare_response(request, publish_metadata=True)
             if response is not None:
-                response.result.cached_tokens = request.cached_tokens
                 self._pending_transfer_responses.append(
                     (request.py_request_id, response))
             self._pending_response_terminations.append(request)
