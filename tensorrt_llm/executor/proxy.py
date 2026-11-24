@@ -49,7 +49,7 @@ from ..llmapi.tracer import enable_llm_tracer, get_tracer, global_tracer
 from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
                             enable_llm_debug, logger_debug, print_colored)
 from .executor import GenerationExecutor
-from .ipc import FusedIpcQueue, IpcQueue
+from .ipc import FusedIpcQueue, IpcQueue, RequestSendCancelled
 from .postproc_worker import PostprocWorker, PostprocWorkerConfig
 from .prompt_tail import PromptTailPolicy
 from .request import (CancellingRequest, GenerationRequest, StartProfileRequest,
@@ -129,6 +129,10 @@ def _send_quit(request_queue: IpcQueue, should_stop: Callable[[],
         logger.warning(f"Executor proxy quit could not be delivered: {exc}")
 
 
+class _RequestSenderClosed(RuntimeError):
+    """The batched request sender no longer accepts requests."""
+
+
 class _RequestSender:
     """Batch a proxy's requests to the rank-0 worker on one background thread.
 
@@ -177,7 +181,8 @@ class _RequestSender:
         """
         with self._cond:
             if self._closed:
-                raise RuntimeError("Executor proxy request sender is closed.")
+                raise _RequestSenderClosed(
+                    "Executor proxy request sender is closed.")
             if self._thread is None:
                 self._thread = threading.Thread(target=self._run,
                                                 daemon=True,
@@ -250,14 +255,19 @@ class _RequestSender:
             try:
                 self._request_queue.put_interruptible(batch, self._send_stopped)
             except Exception as e:
-                # Pickling already completed in the caller. Do not continue
-                # after a transport failure and silently lose an earlier batch.
-                self._error_queue.put_nowait(e)
                 with self._cond:
+                    unsent = len(batch) + len(self._pending)
                     self._closed = True
                     self._pending.clear()
                     self._stopping = True
                     send_sentinel = self._send_sentinel
+                if isinstance(e, RequestSendCancelled):
+                    logger.warning("Executor proxy request sender stopped with "
+                                   f"{unsent} request(s) unsent: {e}")
+                else:
+                    # Pickling already completed in the caller. Report all
+                    # other failures, even if shutdown began during the send.
+                    self._error_queue.put_nowait(e)
                 break
         if send_sentinel:
             # A bare None, not a batch: the worker stops at a top-level None.
@@ -803,7 +813,14 @@ class GenerationExecutorProxy(GenerationExecutor):
         # send back a finished result.
         if self._request_send_stopped():
             return
-        self._send_request(CancellingRequest(request_id))
+        try:
+            self._send_request(CancellingRequest(request_id))
+        except RequestSendCancelled:
+            # Teardown or engine death supplies the terminal notification.
+            return
+        except _RequestSenderClosed:
+            if not self.doing_shutdown:
+                raise
 
     # Per-call timeouts for the synchronous worker round-trip. The stop
     # path can take up to 30s because PyExecutor.stop_profile itself
@@ -1335,11 +1352,7 @@ class GenerationExecutorProxy(GenerationExecutor):
     def _abort_all_requests(self) -> None:
         # Results may finish while the snapshot is cancelled.
         for result in list(self._results.values()):
-            try:
-                result.abort()
-            except RuntimeError:
-                if not self._request_send_stopped():
-                    raise
+            result.abort()
 
     _PROFILE_SHUTDOWN_TIMEOUT_S = 5.0
     _REQUEST_SHUTDOWN_TIMEOUT_S = 5.0
@@ -1356,7 +1369,7 @@ class GenerationExecutorProxy(GenerationExecutor):
                     self._request_shutdown_deadline = time.monotonic(
                     ) + self._REQUEST_SHUTDOWN_TIMEOUT_S
                 try:
-                    if cancel_requests and not self._engine_dead:
+                    if cancel_requests:
                         self._abort_all_requests()
                 finally:
                     self._close_request_sender(send_sentinel=send_sentinel)
@@ -1377,7 +1390,8 @@ class GenerationExecutorProxy(GenerationExecutor):
         send_sentinel = (self.workers_started
                          and (not self.mpi_futures
                               or any(not f.done() for f in self.mpi_futures)))
-        self._drain_control_and_requests(cancel_requests=self.workers_started,
+        self._drain_control_and_requests(cancel_requests=self.workers_started
+                                         and not self._engine_dead,
                                          send_sentinel=send_sentinel)
 
     def _send_request(self,
@@ -1399,7 +1413,7 @@ class GenerationExecutorProxy(GenerationExecutor):
             timeout = -1 if deadline is None else max(
                 0.0, deadline - time.monotonic())
             if not self._request_send_lock.acquire(timeout=timeout):
-                raise RuntimeError(
+                raise RequestSendCancelled(
                     "Executor proxy request send cancelled during shutdown.")
             try:
                 self.request_queue.put_interruptible(
@@ -2029,6 +2043,13 @@ class GenerationExecutorFrontendProxy(GenerationExecutorProxy):
             return self._fatal_error is None and not self.doing_shutdown
 
         return True
+
+    def _request_send_stopped(self) -> bool:
+        # A local fatal error does not establish that the shared engine is dead.
+        # Keep this lane's cancellation traffic bounded by its shutdown budget.
+        return (self._request_transport_closed
+                or (self._request_shutdown_deadline is not None
+                    and time.monotonic() >= self._request_shutdown_deadline))
 
     def _pre_shutdown(self) -> None:
         with self._admission_lock:

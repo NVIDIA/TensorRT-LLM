@@ -20,6 +20,7 @@ attached-frontend proxy lifecycle over real ipc:// sockets.
 """
 
 import os
+import pickle
 import threading
 from contextlib import ExitStack
 from types import SimpleNamespace
@@ -244,23 +245,49 @@ class TestClassicFrontendProxyEndToEnd:
                 cleanup.callback(worker_ingress.close)
                 proxy.shutdown()
 
-    def test_check_health_and_submit_reflect_fatal_error(self, tmp_path) -> None:
-        from tensorrt_llm.executor.request import GenerationRequest
+    @pytest.mark.parametrize("batching", [False, True])
+    def test_check_health_and_submit_reflect_fatal_error(
+        self, tmp_path, monkeypatch, batching
+    ) -> None:
+        from tensorrt_llm.executor.request import CancellingRequest, GenerationRequest
         from tensorrt_llm.executor.utils import EngineDeadError
         from tensorrt_llm.sampling_params import SamplingParams
 
+        monkeypatch.setenv("TRTLLM_PROXY_BATCH_REQUESTS", "1" if batching else "0")
         proxy, worker_ingress, _, _ = self._make_proxy_and_fake_worker(tmp_path)
         try:
             assert proxy.check_health()
             assert proxy.model_world_size == 1
             assert proxy.dispatch_result_thread is None
-            proxy._set_fatal_error(RuntimeError("rank0 worker died"))
+            results = [proxy.submit(GenerationRequest([i], SamplingParams())) for i in (1, 2)]
+            received = []
+            while len(received) < len(results):
+                assert worker_ingress.poll(5)
+                message = worker_ingress.get()
+                received.extend([pickle.loads(p) for p in message] if batching else [message])
+            assert [r.id for r in received] == [r.request_id for r in results]
+            assert all(isinstance(r, GenerationRequest) for r in received)
+
+            # A local fatal error must not leave work running on the shared engine.
+            proxy._set_fatal_error(RuntimeError("frontend dispatcher failed"))
             assert not proxy.check_health()
             with pytest.raises(EngineDeadError):
-                proxy.submit(GenerationRequest([1], SamplingParams()))
+                proxy.submit(GenerationRequest([3], SamplingParams()))
             proxy.shutdown()
-            assert proxy.dispatch_result_thread is None
-            assert not worker_ingress.poll(0.1)
+            assert not proxy.dispatch_result_thread.is_alive()
+            assert not proxy._results
+            cancels = []
+            while len(cancels) < len(results):
+                assert worker_ingress.poll(5)
+                message = worker_ingress.get()
+                cancels.extend([pickle.loads(p) for p in message] if batching else [message])
+            assert all(isinstance(r, CancellingRequest) for r in cancels)
+            assert [r.id for r in cancels] == [r.request_id for r in results]
+            for result in results:
+                with pytest.raises(EngineDeadError):
+                    result.result(timeout=1)
+            proxy.shutdown()
+            assert not worker_ingress.poll(0.1), "no duplicate cancel or global engine quit"
         finally:
             with ExitStack() as cleanup:
                 cleanup.callback(worker_ingress.close)

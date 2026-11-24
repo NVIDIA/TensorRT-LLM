@@ -14,8 +14,9 @@ import time
 from types import SimpleNamespace
 
 import pytest
+import zmq
 
-from tensorrt_llm.executor.ipc import IpcQueue
+from tensorrt_llm.executor.ipc import IpcQueue, RequestSendCancelled
 from tensorrt_llm.executor.proxy import (
     GenerationExecutorProxy,
     _create_request_sender,
@@ -56,7 +57,7 @@ class _RecordingQueue:
 
     def put_interruptible(self, msg, should_stop):
         if should_stop():
-            raise RuntimeError("request send cancelled")
+            raise RequestSendCancelled("request send cancelled")
         self.put(msg)
 
     def put_nowait(self, msg):
@@ -240,18 +241,32 @@ def test_pre_shutdown_sends_the_sentinel_itself_if_nothing_else_wrote(batching):
     assert request_queue.writer == shutdown.ident
 
 
-def test_transport_error_reaches_error_queue():
-    class _FailingQueue:
-        def put_interruptible(self, msg, should_stop):
-            raise RuntimeError("socket closed")
+@pytest.mark.parametrize("error_type", [RuntimeError, zmq.ZMQError, AssertionError])
+def test_transport_error_reaches_error_queue(error_type) -> None:
+    stopped = threading.Event()
+    failure = error_type("socket or debug failure")
 
+    class _FailingQueue:
+        def put_interruptible(self, msg, should_stop) -> None:
+            stopped.set()
+            raise failure
+
+    proxy = _bare_proxy()
     error_queue = queue.Queue()
-    sender = _RequestSender(_FailingQueue(), error_queue)
-    sender.send(pickle.dumps("a"))
-    sender.close(timeout=10)
-    error = error_queue.get_nowait()
-    assert isinstance(error, RuntimeError)
-    assert str(error) == "socket closed"
+    sender = _RequestSender(_FailingQueue(), error_queue, stopped.is_set)
+    proxy._request_sender = sender
+    try:
+        sender.send(pickle.dumps("a"))
+        sender._thread.join(timeout=2.0)
+        assert not sender._thread.is_alive()
+        assert error_queue.get_nowait() is failure
+        # A sender that stopped itself is not an orderly frontend shutdown.
+        assert not proxy.doing_shutdown
+        with pytest.raises(RuntimeError, match="sender is closed"):
+            proxy.abort_request(1)
+        assert error_queue.empty()
+    finally:
+        sender.close(timeout=2.0)
 
 
 def test_batched_quit_failure_is_best_effort(monkeypatch):
@@ -378,9 +393,9 @@ def test_absent_peer_send_is_interrupted_before_transport_close(monkeypatch, bat
         assert proxy._request_transport_closed
         caller.join(timeout=2.0)
         assert not caller.is_alive()
-        assert not errors.empty() if batching else outcome
+        assert errors.empty() if batching else outcome
     finally:
-        proxy._request_send_stopped.set()
+        proxy._engine_dead = True
         proxy._close_request_sender()
         if caller.ident is not None:
             caller.join(timeout=2.0)
@@ -440,6 +455,128 @@ def test_generation_send_waiting_at_admission_is_rejected_after_close(monkeypatc
     assert len(errors) == 1
     proxy._close_request_sender()
     assert proxy.request_queue.messages == []
+
+
+def test_abort_racing_orderly_sender_close_is_harmless(monkeypatch) -> None:
+    proxy = _bare_proxy()
+    proxy.doing_shutdown = True
+    proxy.request_queue = _RecordingQueue()
+    errors = queue.Queue()
+    proxy._request_sender = _RequestSender(proxy.request_queue, errors)
+    sender_closed = threading.Event()
+    original_close = proxy._request_sender.close
+
+    def close(*args, **kwargs) -> bool:
+        result = original_close(*args, **kwargs)
+        sender_closed.set()
+        return result
+
+    monkeypatch.setattr(proxy._request_sender, "close", close)
+    closer = threading.Thread(target=proxy._close_request_sender)
+    try:
+        # Hold the transport open after the sender stops accepting requests.
+        with proxy._request_send_lock:
+            closer.start()
+            assert sender_closed.wait(timeout=2.0)
+            assert not proxy._request_transport_closed
+            proxy.abort_request(1)
+        closer.join(timeout=2.0)
+        assert not closer.is_alive()
+        assert proxy._request_transport_closed
+        assert not proxy.request_queue.messages
+        assert errors.empty()
+    finally:
+        closer.join(timeout=2.0)
+        proxy._close_request_sender()
+        assert not closer.is_alive()
+
+
+@pytest.mark.parametrize("failure", [None, RuntimeError("debug failure")])
+def test_abort_racing_send_deadline_only_ignores_cancellation(monkeypatch, failure) -> None:
+    proxy = _bare_proxy()
+    proxy.request_queue = IpcQueue(is_server=True)
+    original_send = proxy._send_request
+
+    def send(request) -> None:
+        proxy._request_shutdown_deadline = time.monotonic() - 1.0
+        if failure is not None:
+            raise failure
+        original_send(request)
+
+    monkeypatch.setattr(proxy, "_send_request", send)
+    proxy._results = {1: SimpleNamespace(abort=lambda: proxy.abort_request(1))}
+    try:
+        if failure is None:
+            proxy._abort_all_requests()
+        else:
+            with pytest.raises(RuntimeError, match="debug failure"):
+                proxy._abort_all_requests()
+        assert not proxy.request_queue._setup_done
+    finally:
+        proxy.request_queue.close()
+
+
+@pytest.mark.parametrize("batching", [False, True])
+@pytest.mark.parametrize("failure_kind", ["transport", "thread_safety"])
+def test_send_failure_is_not_hidden_when_budget_expires(
+    monkeypatch, batching, failure_kind
+) -> None:
+    proxy = _bare_proxy()
+    proxy.request_queue = IpcQueue(is_server=True)
+    errors = queue.Queue()
+    if failure_kind == "thread_safety":
+        proxy.request_queue._zmq_debug_enabled = True
+        proxy.request_queue._check_thread_safety()
+        original_check = proxy.request_queue._check_thread_safety
+
+        def check() -> None:
+            proxy._request_shutdown_deadline = time.monotonic() - 1.0
+            original_check()
+
+        monkeypatch.setattr(proxy.request_queue, "_check_thread_safety", check)
+    else:
+        original_send = proxy.request_queue._send_data
+
+        def send(*args, **kwargs) -> None:
+            # The socket's writer provokes an actual ZeroMQ ENOTSOCK error.
+            proxy.request_queue.socket.close(linger=0)
+            proxy._request_shutdown_deadline = time.monotonic() - 1.0
+            try:
+                original_send(*args, **kwargs)
+            finally:
+                proxy.request_queue.socket = None
+
+        monkeypatch.setattr(proxy.request_queue, "_send_data", send)
+    if batching:
+        proxy._request_sender = _RequestSender(
+            proxy.request_queue, errors, proxy._request_send_stopped
+        )
+
+    def abort() -> None:
+        try:
+            proxy.abort_request(1)
+        except (RuntimeError, zmq.ZMQError) as exc:
+            errors.put_nowait(exc)
+
+    caller = threading.Thread(target=abort)
+    try:
+        caller.start()
+        caller.join(timeout=2.0)
+        assert not caller.is_alive()
+        proxy._close_request_sender()
+        error = errors.get_nowait()
+        if failure_kind == "thread_safety":
+            assert isinstance(error, RuntimeError)
+            assert "thread safety violation" in str(error)
+        else:
+            assert isinstance(error, zmq.ZMQError)
+            assert error.errno == zmq.ENOTSOCK
+        assert errors.empty()
+    finally:
+        caller.join(timeout=2.0)
+        proxy._close_request_sender()
+        proxy.request_queue.close()
+        assert not caller.is_alive()
 
 
 def test_dead_engine_abort_does_not_attempt_transport():

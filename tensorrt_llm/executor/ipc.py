@@ -38,6 +38,10 @@ from ..llmapi.utils import (ManagedThread, enable_llm_debug, logger_debug,
 CLOSE_LINGER_MS = 1000
 
 
+class RequestSendCancelled(RuntimeError):
+    """A proxy-owned send stopped before delivery because it was cancelled."""
+
+
 class ZeroMqQueue:
     ''' A Queue-like container for IPC using ZeroMQ. '''
 
@@ -235,7 +239,7 @@ class ZeroMqQueue:
         """
         cancelled = "Executor proxy request send cancelled during shutdown."
         if should_stop():
-            raise RuntimeError(cancelled)
+            raise RequestSendCancelled(cancelled)
         self.setup_lazily()
         self._check_thread_safety()
         if not getattr(self, "_interruptible_send_configured", False):
@@ -250,7 +254,7 @@ class ZeroMqQueue:
                     return
                 except zmq.Again:
                     continue
-        raise RuntimeError(cancelled)
+        raise RequestSendCancelled(cancelled)
 
     def put_nowait(self, obj: Any, routing_id: Optional[bytes] = None):
         """Send an object without waiting for a writable peer.
