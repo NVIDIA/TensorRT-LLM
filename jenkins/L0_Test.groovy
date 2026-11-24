@@ -2236,11 +2236,18 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     "export ${varName}=\"${escapedValue}\""
                 }.join('\n')
 
+                // The platform selects the pool/account; the stage owns the allocation size.
+                // Multi-node VR200 jobs reuse the x4 pool, whose default args pin one node.
+                def partitionAllocationArgs = partition.additionalArgs
+                if (nodeCount > 1) {
+                    partitionAllocationArgs = partitionAllocationArgs.replaceAll(
+                        /(?:^|\s)--(?:nodes|gpus|gpus-per-node)(?:=|\s+)\S+/, "")
+                }
                 def scriptLaunchPrefix = """#!/bin/bash
                     #SBATCH ${exemptionComment}
                     #SBATCH --output=${slurmJobLogPath}
                     ${taskArgs.collect { "#SBATCH $it" }.join('\n')}
-                    #SBATCH ${partition.additionalArgs}
+                    #SBATCH ${partitionAllocationArgs}
                     ${slurmExcludeDirective}
                     ${partition?.time ? "#SBATCH --time=${partition.time}" : "#SBATCH --time=${SlurmConfig.DEFAULT_TIMEOUT_SHORT}"}
                     ${(partition?.name && partition.name != "unspecified") ? "#SBATCH --partition=${partition.name}" : ""}
@@ -6639,6 +6646,11 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     fullSet += SBSASlurmTestConfigs.keySet()
 
     multiNodesSBSAConfigs = [
+        // Dedicated 1P1D accuracy + natural DFlash2 AL; each role owns TEP GPUs.
+        "GB300-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-MuseSpark-TEP4-Post-Merge-1": ["auto:gb300-flex", "l0_gb300_disagg_musespark_tep4", 1, 1, 8, 2],
+        "GB300-16_GPUs-4_Nodes-PyTorch-Disagg-PerfSanity-MuseSpark-TEP8-Post-Merge-1": ["auto:gb300-flex", "l0_gb300_disagg_musespark_tep8", 1, 1, 16, 4],
+        "VR200-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-MuseSpark-TEP4-Post-Merge-1": ["auto:vr200-x4", "l0_vr200_disagg_musespark_tep4", 1, 1, 8, 2],
+        "VR200-16_GPUs-4_Nodes-PyTorch-Disagg-PerfSanity-MuseSpark-TEP8-Post-Merge-1": ["auto:vr200-x4", "l0_vr200_disagg_musespark_tep8", 1, 1, 16, 4],
         // Each GB200 testcase below uses 8 GPUs and 2 nodes.
         // https://nvbugs/5598863 (uncorrectable NVLink error detected during the execution) may not exist in OCI machines.
         "GB200-8_GPUs-2_Nodes-PyTorch-1": ["auto:gb200-flex", "l0_gb200_multi_nodes", 1, 2, 8, 2],
