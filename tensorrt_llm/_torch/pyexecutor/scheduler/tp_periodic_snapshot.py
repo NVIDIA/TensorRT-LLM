@@ -80,6 +80,7 @@ def coordinate_periodic_snapshot(
             and cache.is_active
             and not req.is_dummy_request
             and not req.py_multimodal_data
+            and not getattr(req, "py_draft_tokens", None)
             and req.py_mamba_inforward_snapshot_point is None
             and manager.context_replay_tokens(req) is None
             and not any(start < point < baseline_end for point in points)
@@ -125,6 +126,8 @@ def coordinate_periodic_snapshot(
     )
     if plan.end < req.prompt_len and plan.end not in req.expect_snapshot_points:
         desired = ((plan.end - start) // chunk_unit_size) * chunk_unit_size
+        if plan.points:
+            desired = max(desired, plan.points[-1] - start)
         plan = plan_periodic_snapshot_chunk(
             start,
             start + desired,

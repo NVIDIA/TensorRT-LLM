@@ -118,6 +118,8 @@ class CopySite(CopySiteEnum):
     # TrtllmAttentionMetadata.
     ATTN_KV_LENS = ("attn.kv_lens", Direction.H2D)
     ATTN_PROMPT_LENS = ("attn.prompt_lens", Direction.H2D)
+    # Recurrent metadata: periodic checkpoint and cache-slot indices.
+    MAMBA_PERIODIC_SNAPSHOT_INDICES = ("mamba.periodic_snapshot_indices", Direction.H2D)
     # SpecMetadata: the one-model speculative sampler's per-step Philox seeds and offsets (first read by the forward).
     SPEC_RNG_REQUEST_SEEDS = ("spec.rng_request_seeds", Direction.H2D)
     SPEC_RNG_REQUEST_OFFSETS = ("spec.rng_request_offsets", Direction.H2D)

@@ -1989,6 +1989,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                 and not has_recovery
                 and not req.is_dummy_request
                 and not getattr(req, "py_multimodal_data", None)
+                and get_draft_token_length(req) == 0
                 and self.draft_kv_cache_manager is None
                 and self._pregrown_context_tokens(req) == 0
             ):
@@ -2044,6 +2045,10 @@ class KVCacheV2Scheduler(RequestScheduler):
             force_chunk and _is_forced_context_chunk_boundary(req, chunk_size)
         ):
             chunk_size = (chunk_size // self.chunk_unit_size) * self.chunk_unit_size
+            if periodic_points:
+                # A reached checkpoint is also a valid chunk boundary, even
+                # when the remaining budget is smaller than chunk_unit_size.
+                chunk_size = max(chunk_size, periodic_points[-1] - req.context_current_position)
 
         # Run exactly the pre-grown chunk, or wait for a pass with enough budget;
         # a longer chunk would grow the capacity again before the history catches up.

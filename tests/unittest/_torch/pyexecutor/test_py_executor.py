@@ -1119,6 +1119,26 @@ def test_periodic_snapshot_commit_waits_for_input_copy(has_plan: bool, tp: bool)
     executor._handle_errors.assert_not_called()
 
 
+@pytest.mark.parametrize("tp", [False, True])
+def test_forward_failure_before_periodic_snapshot_completion(tp: bool) -> None:
+    error = RuntimeError("forward failed before snapshot completion")
+    engine = Mock(route_capture=None)
+    engine.forward.side_effect = error
+    executor = _forward_step_executor(engine)
+    batch = ScheduledRequests()
+    batch.periodic_snapshot_tp = tp
+
+    if tp:
+        with pytest.raises(RuntimeError) as raised:
+            _run_forward_step(executor, batch)
+        assert raised.value is error
+        executor._handle_errors.assert_not_called()
+    else:
+        assert _run_forward_step(executor, batch) is None
+        executor._handle_errors.assert_called_once_with(str(error))
+    executor.kv_cache_manager.finish_periodic_snapshots.assert_not_called()
+
+
 class MockPyExecutor:
     """A mock PyExecutor class for testing request handling logic.
 

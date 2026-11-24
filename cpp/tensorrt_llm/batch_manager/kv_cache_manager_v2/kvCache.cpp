@@ -3040,7 +3040,9 @@ std::vector<int> KvCache::_acquireSsmSnapshotSlots(int count, bool allowEviction
 
     auto& storageMgr = mManager->storage();
     auto const poolGroup = storageMgr.getPoolGroupIndex(kHotLevel, *ssmLcId);
-    if (!allowEviction && storageMgr.numLocalityDomains() > 1)
+    // A multi-domain reservation cannot guarantee all-or-nothing eviction.
+    // Keep the legacy single-slot path while declining multi-slot planning.
+    if (storageMgr.numLocalityDomains() > 1 && (!allowEviction || count > 1))
         return {};
     if (!allowEviction && storageMgr.getStatistics(kHotLevel, poolGroup).free < count)
         return {};
@@ -3054,6 +3056,14 @@ std::vector<int> KvCache::_acquireSsmSnapshotSlots(int count, bool allowEviction
     { _recordDroppedPages(pages, cacheLevel); };
     try
     {
+        if (allowEviction && count > 1 && storageMgr.numLocalityDomains() == 1
+            && storageMgr.getStatistics(kHotLevel, poolGroup).free < count)
+        {
+            // Check the whole request before evicting any reusable page.
+            TypedVec<PoolGroupIndex, SlotCount> requirements(storageMgr.numPoolGroups(kHotLevel), 0);
+            requirements.at(poolGroup) = count;
+            storageMgr.prepareFreeSlots(kHotLevel, requirements, migrationRecorder, dropRecorder, localityDomainId());
+        }
         for (int i = 0; i < count; ++i)
         {
             auto page = makeShared<UncommittedPage>(*this, kBadBlockOrdinal, *ssmLcId, kHotLevel, kDefaultBeamIndex);

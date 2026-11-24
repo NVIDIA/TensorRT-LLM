@@ -167,8 +167,11 @@ class TestPendingSsmSnapshot(unittest.TestCase):
             self._setup(enable_locality_domains=True)
         self.assertEqual(self.manager.num_locality_domains, 2)
         cache = self.manager.create_kv_cache(locality_domain_id=0)
-        self.assertTrue(cache.resume(self.stream))
-        self.assertTrue(cache.resize(self.TOKENS_PER_BLOCK))
+        with ExitStack() as cleanup:
+            cleanup.callback(cache.close)
+            self.assertTrue(cache.resume(self.stream))
+            self.assertTrue(cache.resize(self.TOKENS_PER_BLOCK))
+            cleanup.pop_all()
         return cache
 
     def test_localized_single_snapshot_keeps_existing_behavior(self) -> None:
@@ -188,6 +191,16 @@ class TestPendingSsmSnapshot(unittest.TestCase):
             self.assertFalse(cache.try_resize_capacity_without_eviction(2 * capacity))
             self.assertEqual(cache.capacity, capacity)
             self.assertEqual(cache.acquire_ssm_snapshot_slots_without_eviction(2), [])
+            self.assertIsNone(cache.pending_ssm_snapshot_slot)
+            self.assertEqual(self._ssm_free_slots(), free_slots)
+        finally:
+            cache.close()
+
+    def test_localized_multiple_snapshot_reservation_falls_back(self) -> None:
+        cache = self._localized_cache()
+        try:
+            free_slots = self._ssm_free_slots()
+            self.assertEqual(cache.acquire_ssm_snapshot_slots(2), [])
             self.assertIsNone(cache.pending_ssm_snapshot_slot)
             self.assertEqual(self._ssm_free_slots(), free_slots)
         finally:
@@ -350,6 +363,64 @@ class TestPendingSsmSnapshot(unittest.TestCase):
             self.assertEqual(self._ssm_free_slots(), 1)
             self.assertIsNone(kv_cache.pending_ssm_snapshot_slot)
 
+    def test_failed_multiple_reservation_preserves_reusable_snapshot(self) -> None:
+        self._setup(gpu_quota=1 << 20, max_util_for_resume=1.0)
+        prompt = self._tokens(64)
+        with ExitStack() as cleanup:
+            source = self.manager.create_kv_cache()
+            cleanup.callback(source.close)
+            self.assertTrue(source.resume(self.stream))
+            self._snapshot_step(source, prompt, 32)
+            source.history_length = 32
+            source.commit(prompt[:32], ssm_from_pending=True)
+            snapshot_page = self._tree_ssm_page(prompt[:32])
+            self.assertIsNotNone(snapshot_page)
+            source.stop_committing()
+            source.close()
+
+            target = self.manager.create_kv_cache()
+            cleanup.callback(target.close)
+            self.assertTrue(target.resume(self.stream))
+            while (free_before := self._ssm_free_slots()) > 0:
+                filler = self.manager.create_kv_cache()
+                cleanup.callback(filler.close)
+                self.assertTrue(filler.resume(self.stream))
+                self.assertLess(self._ssm_free_slots(), free_before)
+
+            self.assertEqual(target.acquire_ssm_snapshot_slots(2), [])
+            self.assertIsNone(target.pending_ssm_snapshot_slot)
+            self.assertEqual(self._tree_ssm_page(prompt[:32]), snapshot_page)
+
+    def test_multiple_reservation_succeeds_with_enough_evictable_snapshots(self) -> None:
+        self._setup(gpu_quota=1 << 20, max_util_for_resume=1.0)
+        with ExitStack() as cleanup:
+            for _ in range(2):
+                prompt = self._tokens(64)
+                source = self.manager.create_kv_cache()
+                cleanup.callback(source.close)
+                self.assertTrue(source.resume(self.stream))
+                self._snapshot_step(source, prompt, 32)
+                source.history_length = 32
+                source.commit(prompt[:32], ssm_from_pending=True)
+                self.assertIsNotNone(self._tree_ssm_page(prompt[:32]))
+                source.stop_committing()
+                source.close()
+
+            target = self.manager.create_kv_cache()
+            cleanup.callback(target.close)
+            self.assertTrue(target.resume(self.stream))
+            while (free_before := self._ssm_free_slots()) > 0:
+                filler = self.manager.create_kv_cache()
+                cleanup.callback(filler.close)
+                self.assertTrue(filler.resume(self.stream))
+                self.assertLess(self._ssm_free_slots(), free_before)
+
+            slots = target.acquire_ssm_snapshot_slots(2)
+            self.assertEqual(len(slots), 2)
+            self.assertEqual(len(set(slots)), 2)
+            target.release_ssm_snapshot_slots()
+            self.assertEqual(self._ssm_free_slots(), 2)
+
     def test_multiple_pending_snapshots_release_on_suspend(self) -> None:
         self._setup()
         kv_cache = self.manager.create_kv_cache()
@@ -369,6 +440,34 @@ class TestPendingSsmSnapshot(unittest.TestCase):
         self.assertTrue(kv_cache.resume(self.stream))
         self.assertEqual(self._ssm_free_slots(), free_before)
         kv_cache.close()
+
+    def test_failed_pending_commit_releases_all_slots_and_can_retry(self) -> None:
+        self._setup()
+        prompt = self._tokens(64)
+        with ExitStack() as cleanup:
+            cache = self.manager.create_kv_cache()
+            cleanup.callback(cache.close)
+            self.assertTrue(cache.resume(self.stream))
+            self.assertTrue(cache.resize(32))
+            free_before = self._ssm_free_slots()
+            self.assertEqual(len(cache.acquire_ssm_snapshot_slots(3)), 3)
+
+            with self.assertRaises(ValueError):
+                cache.commit(prompt, ssm_from_pending=True)
+
+            self.assertIsNone(cache.pending_ssm_snapshot_slot)
+            self.assertEqual(self._ssm_free_slots(), free_before)
+            self.assertEqual(cache.num_committed_tokens, 0)
+            self._prefill(cache, prompt[:32])
+            slot = cache.acquire_ssm_snapshot_slot()
+            self.assertIsNotNone(slot)
+            self._write_ssm_slot(cache, slot, prompt[31])
+            cache.commit(prompt[:32], ssm_from_pending=True)
+            self.assertIsNone(cache.pending_ssm_snapshot_slot)
+            self.assertEqual(self._tree_ssm_page(prompt[:32]), (slot, self.TOKENS_PER_BLOCK))
+            cache.stop_committing()
+
+        self._check_reuse(prompt, 32)
 
     def test_no_eviction_reservation_and_capacity_rollback(self) -> None:
         self._setup()

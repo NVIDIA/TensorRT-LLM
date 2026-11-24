@@ -144,7 +144,7 @@ class _Manager:
         pass
 
 
-def _run_pair(batches, managers, *, expect_errors=False):
+def _run_pair(batches, managers, *, expect_errors=False, extra_budget=768, chunk_unit_size=64):
     exchange = _Exchange()
     errors = []
 
@@ -154,9 +154,9 @@ def _run_pair(batches, managers, *, expect_errors=False):
                 batches[rank],
                 managers[rank],
                 exchange.for_rank(rank),
-                extra_budget=768,
+                extra_budget=extra_budget,
                 max_context_length=1024,
-                chunk_unit_size=64,
+                chunk_unit_size=chunk_unit_size,
             )
         except BaseException as error:
             errors.append(error)
@@ -189,6 +189,20 @@ def test_two_ranks_extend_the_same_scheduled_context():
         (1024, (256, 512, 768)),
         (1024, (256, 512, 768)),
     ]
+
+
+@pytest.mark.cpu_only
+def test_two_ranks_extend_to_checkpoint_with_partial_decode_budget():
+    requests = [_Context(), _Context()]
+    batches = [ScheduledRequests(), ScheduledRequests()]
+    managers = [_Manager(), _Manager()]
+    for batch, request in zip(batches, requests):
+        batch.append_context_request(request)
+
+    _run_pair(batches, managers, extra_budget=767, chunk_unit_size=1024)
+
+    assert [request.context_chunk_size for request in requests] == [768, 768]
+    assert [manager.reservation for manager in managers] == [(768, (256, 512))] * 2
 
 
 @pytest.mark.cpu_only
@@ -263,6 +277,22 @@ def test_same_baseline_with_one_ineligible_rank_keeps_the_batch():
     managers = [_Manager(), _Manager()]
     managers[1].kv_cache_map[9].is_active = False
     for batch, request in zip(batches, requests):
+        batch.append_context_request(request)
+
+    _run_pair(batches, managers)
+
+    assert [request.context_chunk_size for request in requests] == [256, 256]
+    assert all(manager.reservation is None for manager in managers)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("draft_ranks", [(0,), (0, 1)])
+def test_context_draft_tokens_keep_the_tp_baseline(draft_ranks):
+    requests = [_Context(), _Context()]
+    batches = [ScheduledRequests(), ScheduledRequests()]
+    managers = [_Manager(), _Manager()]
+    for rank, (batch, request) in enumerate(zip(batches, requests)):
+        request.py_draft_tokens = [1, 2, 3] if rank in draft_ranks else []
         batch.append_context_request(request)
 
     _run_pair(batches, managers)
@@ -737,6 +767,16 @@ def _native_collective_rank(rank, rendezvous, ready, results, backend):
             return result
 
         release_periodic_snapshots = MambaHybridCacheManagerV2.release_periodic_snapshots
+        finish_periodic_snapshots = MambaHybridCacheManagerV2.finish_periodic_snapshots
+
+        def _reuse_token_source(self, request):
+            return request.test_tokens
+
+        def _augment_tokens_for_block_reuse(self, tokens, request, *, start, end):
+            return tokens[start:end]
+
+        def _count_snapshot_commit(self, request, point):
+            pass
 
         def _fill_fresh_kv_pages(self, request_id):
             if self.fail_commit_fill:
@@ -752,6 +792,20 @@ def _native_collective_rank(rank, rendezvous, ready, results, backend):
         def try_resize_capacity_without_eviction(self, capacity):
             assert self.cache.try_resize_capacity_without_eviction(capacity)
             raise RuntimeError("injected error after native growth")
+
+    class FailSecondNativeCommit:
+        def __init__(self, cache):
+            self.cache = cache
+            self.commits = 0
+
+        def __getattr__(self, name):
+            return getattr(self.cache, name)
+
+        def commit(self, *args, **kwargs):
+            self.commits += 1
+            if self.commits == 2:
+                raise RuntimeError("injected second snapshot commit error")
+            return self.cache.commit(*args, **kwargs)
 
     ready.wait()
     torch.cuda.set_device(rank if backend == "nccl" else 0)
@@ -880,6 +934,49 @@ def _native_collective_rank(rank, rendezvous, ready, results, backend):
                 filler.release_ssm_snapshot_slots()
                 filler.close()
                 filler = None
+
+        # A rank may fail only after a snapshot is already reusable. Run the
+        # actual finish loop last: its partially committed cache is not reusable
+        # as the original batch after the group-wide error.
+        manager = NativeManager(cache)
+        request = _Context()
+        request.test_tokens = list(range(1024))
+        batch = ScheduledRequests()
+        batch.append_context_request(request)
+        dist = TorchDist()
+        free_before_finish = native.get_storage_statistics()[group].free
+        coordinate_periodic_snapshot(
+            batch, manager, dist, extra_budget=768, max_context_length=1024, chunk_unit_size=64
+        )
+        assert batch.periodic_snapshot_tp
+        if rank == 1:
+            manager.kv_cache_map[9] = FailSecondNativeCommit(cache)
+        error = None
+        try:
+            finish_periodic_snapshots_tp(batch, manager, dist)
+        except RuntimeError as exc:
+            error = str(exc)
+        committed = cache.num_committed_tokens
+        assert cache.pending_ssm_snapshot_slot is None
+        assert not manager.periodic_snapshot_plan
+        free_after_finish = native.get_storage_statistics()[group].free
+        reuse = native.create_kv_cache(input_tokens=request.test_tokens[:257])
+        try:
+            reused_tokens = reuse.num_committed_tokens
+            assert reuse.resume(stream.cuda_stream)
+        finally:
+            reuse.close()
+        observations.append(
+            (
+                "partial_finish_failure",
+                committed,
+                reused_tokens,
+                free_before_finish,
+                free_after_finish,
+                dist.votes,
+                error,
+            )
+        )
     finally:
         if filler is not None:
             filler.release_ssm_snapshot_slots()
@@ -925,9 +1022,15 @@ def _run_two_process_native_cache_reservation(tmp_path, backend):
 
     assert set(observations) == {0, 1}
     for rank in (0, 1):
-        success, failure, capacity_failure, growth_error, finish_failure, commit_failure = (
-            observations[rank]
-        )
+        (
+            success,
+            failure,
+            capacity_failure,
+            growth_error,
+            finish_failure,
+            commit_failure,
+            partial_finish_failure,
+        ) = observations[rank]
         assert success[:4] == ("success", 1024, 1024, (1024, (256, 512, 768), 3))
         assert failure[:4] == ("reservation_failure", 256, 256, None)
         assert success[5] is True
@@ -937,6 +1040,8 @@ def _run_two_process_native_cache_reservation(tmp_path, backend):
         assert capacity_failure[:4] == ("capacity_failure", 256, 256, None)
         assert capacity_failure[5] is True
         assert capacity_failure[6] == ([(1, 0), (0,)] if rank == 0 else [(0, 0), (0,)])
+        for observation in (success, failure, capacity_failure):
+            assert observation[7] is None, (rank, observation[0], observation[7])
         assert growth_error[:4] == (
             "resize_after_growth_error",
             256,
@@ -956,6 +1061,14 @@ def _run_two_process_native_cache_reservation(tmp_path, backend):
         assert finish_failure[5] is True
         assert finish_failure[6] == [(1, 0), (0,), (int(rank == 1),)]
         assert "injected native forward commit error" in finish_failure[7]
+        assert partial_finish_failure[:3] == (
+            "partial_finish_failure",
+            256 if rank == 1 else 768,
+            256,
+        )
+        assert partial_finish_failure[4] == partial_finish_failure[3] - (1 if rank == 1 else 3)
+        assert partial_finish_failure[5] == [(1, 0), (0,), (int(rank == 1),)]
+        assert "injected second snapshot commit error" in partial_finish_failure[6]
         if rank == 1:
             assert failure[4] == 2
 

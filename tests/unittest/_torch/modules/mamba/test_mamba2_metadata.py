@@ -15,7 +15,7 @@
 """Unit tests for Mamba2 metadata preparation optimizations."""
 
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -44,6 +44,10 @@ from tensorrt_llm._torch.modules.mamba.replay_metadata import (
     ReplayMamba2Metadata,
     _build_replay_work_items_torch,
     _build_replay_work_items_triton,
+)
+from tensorrt_llm._torch.pyexecutor import device_copy
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.multi_snapshot import (
+    PeriodicSnapshotReservation,
 )
 
 skip_no_cuda = pytest.mark.skipif(
@@ -325,6 +329,56 @@ class TestCuSeqlensToChunkIndicesOffsets:
 
 @skip_no_cuda
 class TestMamba2Metadata:
+    @pytest.mark.parametrize("use_copier", [False, True])
+    def test_prepare_periodic_snapshot_uploads_index_values(self, use_copier):
+        manager = _StateIndexCacheManager([3])
+        manager.periodic_snapshot_plan = {
+            10: PeriodicSnapshotReservation(0, 1024, 256, (256, 512, 768), (5, 2, 7))
+        }
+        manager.periodic_snapshot_capacity = 4
+        manager.conv_state_shape = (1, 3)
+        seq_lens = torch.tensor([1024], dtype=torch.int)
+        attn_metadata = SimpleNamespace(
+            seq_lens=seq_lens,
+            seq_lens_cuda=seq_lens.cuda(),
+            num_contexts=1,
+            num_ctx_tokens=1024,
+            kv_cache_manager=manager,
+            request_ids=[10],
+            kv_cache_params=SimpleNamespace(num_cached_tokens_per_seq=[0]),
+        )
+        metadata = Mamba2Metadata(max_batch_size=1, chunk_size=256)
+        copier = (
+            device_copy.DeviceCopier(
+                device_copy.CopyPlan(merge={device_copy.CopySite.ATTN_KV_LENS}),
+                torch.device("cuda"),
+            )
+            if use_copier
+            else None
+        )
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+
+        with (
+            device_copy.active(copier),
+            patch.object(device_copy, "copy", wraps=device_copy.copy) as copy,
+            torch.cuda.stream(stream),
+        ):
+            metadata.prepare(attn_metadata)
+            ready = torch.cuda.Event()
+            ready.record(stream)
+        torch.cuda.current_stream().wait_event(ready)
+
+        assert copy.call_count == 1
+        assert copy.call_args.args[0] is device_copy.CopySite.MAMBA_PERIODIC_SNAPSHOT_INDICES
+        snapshot = metadata.periodic_snapshot
+        assert snapshot.checkpoint_count == 4
+        assert snapshot.checkpoint_cu_starts.cpu().tolist() == [0, 4]
+        assert snapshot.checkpoint_rows.cpu().tolist() == [0, 1, 2]
+        assert snapshot.positions.cpu().tolist() == [256, 512, 768]
+        assert snapshot.conv_indices.cpu().tolist() == [253, 254, 255, 509, 510, 511, 765, 766, 767]
+        assert snapshot.slots.cpu().tolist() == [5, 2, 7]
+
     def test_prepare_handles_tensor_cached_tokens(self):
         metadata = Mamba2Metadata(max_batch_size=4, chunk_size=8)
         seq_lens = torch.tensor([4, 3], dtype=torch.int)

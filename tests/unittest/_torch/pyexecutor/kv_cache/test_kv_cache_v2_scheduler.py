@@ -4144,6 +4144,59 @@ class TestChunkedContext:
         assert context.context_chunk_size == 1024, context.context_chunk_size
         mgr.reserve_periodic_snapshots.assert_called_once_with(context, 1024, (256, 512, 768))
 
+    @pytest.mark.parametrize("capacity, expected_chunk", [(0, 256), (4, 768)])
+    def test_periodic_snapshot_keeps_checkpoint_under_partial_decode_budget(
+        self, capacity, expected_chunk
+    ):
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        mgr.periodic_snapshot_capacity = capacity
+        mgr._periodic_snapshot_supports_mixed_decode = True
+        mgr.is_speculative.return_value = False
+        mgr.kv_cache_config = SimpleNamespace(
+            mamba_state_config=SimpleNamespace(periodic_snapshot_interval=256)
+        )
+        mgr.reserve_periodic_snapshots.return_value = True
+        sched = make_scheduler(
+            mgr, max_num_tokens=1024, ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 1024)
+        )
+        context = make_ctx_request(0, context_remaining_length=2048, is_last_context_chunk=False)
+        context.expect_snapshot_points = list(range(256, 2049, 256))
+        context.is_dummy_request = False
+        context.py_multimodal_data = None
+
+        out = sched.schedule_request([context, make_gen_request(1)], set())
+
+        assert ids(out.generation_requests) == [1]
+        assert ids(out.context_requests) == [0]
+        assert context.context_chunk_size == expected_chunk
+        if capacity:
+            mgr.reserve_periodic_snapshots.assert_called_once_with(context, 768, (256, 512))
+        else:
+            mgr.reserve_periodic_snapshots.assert_not_called()
+
+    def test_periodic_snapshot_preserves_baseline_for_context_with_draft_tokens(self):
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        mgr.periodic_snapshot_capacity = 4
+        mgr.kv_cache_config = SimpleNamespace(
+            mamba_state_config=SimpleNamespace(periodic_snapshot_interval=256)
+        )
+        mgr.reserve_periodic_snapshots.return_value = True
+        sched = make_scheduler(
+            mgr, max_num_tokens=1024, ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 64)
+        )
+        context = make_ctx_request(
+            0, context_remaining_length=1024, num_draft_tokens=3, is_last_context_chunk=False
+        )
+        context.expect_snapshot_points = [256, 512, 768, 1024]
+        context.is_dummy_request = False
+        context.py_multimodal_data = None
+
+        out = sched.schedule_request([context], set())
+
+        assert ids(out.context_requests) == [0]
+        assert context.context_chunk_size == 256
+        mgr.reserve_periodic_snapshots.assert_not_called()
+
     def test_tp_periodic_snapshots_first_schedule_the_safe_baseline(self):
         mgr = make_kv_cache_manager(tokens_per_block=64)
         mgr.periodic_snapshot_capacity = 4

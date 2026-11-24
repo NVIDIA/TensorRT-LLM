@@ -23,6 +23,7 @@ import triton.language as tl
 
 from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
+from tensorrt_llm._torch.pyexecutor import device_copy
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
     CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.multi_snapshot import (
@@ -343,9 +344,17 @@ class Mamba2Metadata:
             0, indices.checkpoint_count, *indices.checkpoint_rows,
             *indices.positions, *indices.conv_indices, *indices.slots
         ]
-        device_values = torch.tensor(flat,
-                                     dtype=torch.long,
-                                     device=self.state_indices.device)
+        host_values = torch.tensor(flat,
+                                   dtype=torch.long,
+                                   pin_memory=prefer_pinned())
+        device_values = torch.empty_like(host_values,
+                                         device=self.state_indices.device)
+        device_copy.copy(device_copy.CopySite.MAMBA_PERIODIC_SNAPSHOT_INDICES,
+                         device_values, host_values)
+        if device_copy.CHECK_MODE:
+            device_copy.expect_landed(
+                device_copy.CopySite.MAMBA_PERIODIC_SNAPSHOT_INDICES,
+                device_values)
         offset = 2
         rows = device_values[offset:offset + count]
         offset += count

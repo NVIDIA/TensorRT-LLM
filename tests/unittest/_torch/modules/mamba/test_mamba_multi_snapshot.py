@@ -64,9 +64,10 @@ def test_ssd_boundaries_and_conv_windows_match_independent_recurrence(state_dtyp
 
 
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
-def test_ssd_prefill_checkpoints_match_separate_prefix_prefills(state_dtype):
+def test_ssd_prefill_checkpoints_match_separate_prefix_prefills(state_dtype, monkeypatch):
     from tensorrt_llm._torch.modules.mamba.ssd_combined import mamba_chunk_scan_combined
 
+    monkeypatch.setenv("TRTLLM_USE_MAMBA_FI_SSD", "0")
     torch.manual_seed(915)
     tokens, heads, dim, states, chunk = 512, 2, 32, 32, 128
     x = (0.1 * torch.randn(1, tokens, heads, dim, device="cuda")).bfloat16()
@@ -105,8 +106,9 @@ def test_ssd_prefill_checkpoints_match_separate_prefix_prefills(state_dtype):
 
 
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
-def test_mamba_mixer_saves_selected_prefix_states(state_dtype):
+def test_mamba_mixer_saves_selected_prefix_states(state_dtype, monkeypatch):
     """The mixer saves nonadjacent checkpoints in the requested cache slots."""
+    monkeypatch.setenv("TRTLLM_USE_MAMBA_FI_SSD", "0")
     torch.manual_seed(916)
     tokens, heads, head_dim, d_state, groups, chunk = 512, 2, 32, 32, 1, 128
     inner, conv_dim, width = heads * head_dim, heads * head_dim + 2 * groups * d_state, 3
