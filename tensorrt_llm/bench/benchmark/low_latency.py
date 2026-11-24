@@ -303,6 +303,8 @@ def latency_command(
 
         llm = get_llm(runtime_config, kwargs)
         startup_metrics = llm.startup_metrics
+        engine_config = (llm._executor.get_engine_config()
+                         if llm._executor else {})
 
         ignore_eos = True if runtime_config.decoding_config.decoding_mode == SpeculativeDecodingMode.NONE else False
         eos_id = tokenizer.eos_token_id if not ignore_eos else -1
@@ -365,7 +367,8 @@ def latency_command(
                                        logger,
                                        kwargs,
                                        True,
-                                       startup_metrics=startup_metrics)
+                                       startup_metrics=startup_metrics,
+                                       engine_config=engine_config)
         # Generate reports for statistics, output tokens, and request info.
         generate_json_report(options.report_json,
                              report_utility.get_statistics_dict)
