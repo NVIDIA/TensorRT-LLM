@@ -989,14 +989,7 @@ def _moe_block_folds_shared(rows, monkeypatch):
             sh_gug=gug.t(),
             sh_dn=dn.t(),
         )
-        return M._moe_block(
-            core,
-            x,
-            (L),
-            None,
-            mm=M._decode_projection,
-            defer=True,
-        )
+        return M._moe_block(core, x, L, None, mm=M._decode_projection, defer=True)
 
     out = [block(r) for r in range(4)]
     torch.cuda.synchronize()

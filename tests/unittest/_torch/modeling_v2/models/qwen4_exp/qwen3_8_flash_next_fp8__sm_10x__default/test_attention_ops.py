@@ -2024,18 +2024,14 @@ def _prl_site(monkeypatch, built, prologue, site):
     with monkeypatch.context() as m:
         m.setattr(M, "qwen4_exp_attn_decode_prologue", counted)
         if not prologue:
-            m.setattr(
-                M,
-                "_decode_prologue",
-                (lambda kv, sparse: False),
-            )
+            m.setattr(M, "_decode_prologue", lambda kv, sparse: False)
         if site == "trunk":
             qkv = torch.empty(rows, core.qkv_width, dtype=PRL_BF, device=PRL_DEV)
             scratch = torch.empty(rows, core.index_scratch_width, dtype=PRL_BF, device=PRL_DEV)
             # The FP8 KV range probe reads the packed K/V on both branches; this is its last layer.
             target = types.SimpleNamespace(core=core, _kv_probe=M._KvRangeProbe(PRL_LAYER))
             out = M.DecodeTarget._attention_block(
-                (target), x, PRL_LAYER, L, qkv, scratch, None, qsa,
+                target, x, PRL_LAYER, L, qkv, scratch, None, qsa,
                 {"predicted_tokens_per_seq": p}, False,
             )  # fmt: skip
             assert target._kv_probe is None, "the probe reported on its last layer and was dropped"
@@ -2048,15 +2044,7 @@ def _prl_site(monkeypatch, built, prologue, site):
             )
             vectors = (qsa[0], qsa[1], qsa[6], qsa[7], qsa[8], qsa[9], qsa[10])
             qkv, gate, iq = M._mtp_attention_planes(
-                core,
-                L,
-                x,
-                (draft),
-                vectors,
-                p,
-                True,
-                True,
-                M._decode_projection,
+                core, L, x, draft, vectors, p, True, True, M._decode_projection
             )
     torch.cuda.synchronize()
     if site == "trunk":
@@ -2327,7 +2315,7 @@ def _probe_forward(probe, peaks):
 
 def test_a_forward_within_the_e4m3_range_is_silent(monkeypatch) -> None:
     logger = Mock()
-    monkeypatch.setattr(M, "logger", (logger))
+    monkeypatch.setattr(M, "logger", logger)
     assert _probe_forward(M._KvRangeProbe(PROBE_LAST), (1.0, 300.0, 448.0)) == [True, True, False]
     logger.warning.assert_not_called()
 
@@ -2337,7 +2325,7 @@ def test_a_magnitude_past_the_e4m3_maximum_is_reported_once(monkeypatch, peak) -
     """A negative value counts by its magnitude; a NaN counts as out of range. The oversized value
     is in a middle layer: the report waits for the forward's last one."""
     logger = Mock()
-    monkeypatch.setattr(M, "logger", (logger))
+    monkeypatch.setattr(M, "logger", logger)
     assert _probe_forward(M._KvRangeProbe(PROBE_LAST), (1.0, peak, 1.0)) == [True, True, False]
     logger.warning.assert_called_once()
     assert "e4m3 maximum 448" in logger.warning.call_args.args[0]
@@ -2372,7 +2360,7 @@ def test_the_probe_runs_only_when_asked_over_an_fp8_pool() -> None:
 
 def test_observing_under_capture_reads_nothing(monkeypatch) -> None:
     logger = Mock()
-    monkeypatch.setattr(M, "logger", (logger))
+    monkeypatch.setattr(M, "logger", logger)
     probe = M._KvRangeProbe(PROBE_LAST)
     k, v = _probe_kv(1000.0)
     scratch = torch.zeros(1, device=DEV)

@@ -107,14 +107,7 @@ def _fake_target(metadata, batch, pools, stage, input_ids=None):
     target = types.SimpleNamespace(core=core, _step=None)
     hi = torch.tensor([c for *_, c, _ in batch], dtype=torch.bool, device=DEV)
     total = sum(length for _, _, length, _, _ in batch)
-    split = _m.PrefillTarget._split_of(
-        (target),
-        metadata,
-        len(batch),
-        0,
-        hi,
-        total,
-    )
+    split = _m.PrefillTarget._split_of(target, metadata, len(batch), 0, hi, total)
     target._step = types.SimpleNamespace(split=split, input_ids=input_ids)
     return target
 

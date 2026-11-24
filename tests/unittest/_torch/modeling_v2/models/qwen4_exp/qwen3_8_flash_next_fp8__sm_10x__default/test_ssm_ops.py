@@ -1163,22 +1163,10 @@ def test_gdn_replay_precompile_is_every_key_a_verify_step_launches(
     launched = []
     # An empty cache: every launch reaches `_compile`, which records the key instead.
     monkeypatch.setattr(cr, "_COMPILED", {})
-    monkeypatch.setattr(
-        cr,
-        "_compile",
-        (lambda key, kern: launched.append(key) or (lambda *a: None)),
-    )
+    monkeypatch.setattr(cr, "_compile", lambda key, kern: launched.append(key) or (lambda *a: None))
     # The conv runs as its own kernel unless folded; the fold's operands are the engine's layout.
-    monkeypatch.setattr(
-        _m,
-        "causal_conv1d_token_major",
-        (lambda mq, *a, **k: mq.contiguous()),
-    )
-    monkeypatch.setattr(
-        _m,
-        "gdn_conv_fold_supported",
-        (lambda *a: True),
-    )
+    monkeypatch.setattr(_m, "causal_conv1d_token_major", lambda mq, *a, **k: mq.contiguous())
+    monkeypatch.setattr(_m, "gdn_conv_fold_supported", lambda *a: True)
     h, hv = GVR_GEOM[member]
     key_dim, value_dim = h * GVR_K, hv * GVR_V
     conv_dim = 2 * key_dim + value_dim
