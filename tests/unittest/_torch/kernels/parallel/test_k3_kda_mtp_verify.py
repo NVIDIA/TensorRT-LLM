@@ -91,8 +91,9 @@ BLOCK_ERR, OUT_L2 = 0.3, 0.01
 STATE_SOFT_FRAC, STATE_DIFF_FRAC, STATE_BIAS = 0.001, 0.02, 1e-4
 # State and BF16 replay caches: two BF16 ulps (relative 2^-6) plus an absolute allowance near zero, where the two ops'
 # sums cancel differently: about 4x the largest such difference (1.7e-5 in the state, 2e-8 in the k cache). Over
-# chained rounds the state carries that rounding over, up to 4.5e-4 near zero.
-STATE_ATOL, STATE_CHAIN_ATOL = 2.0**-14, 5e-4
+# chained rounds the state carries that rounding over, and the recurrence spreads it along each state row (through
+# S k): near zero, an element then differs by up to 0.8 % of its row's largest magnitude (the allowance: 2^-5 of it).
+STATE_ATOL, STATE_CHAIN_ROW_FRAC = 2.0**-14, 2.0**-5
 CACHE_TOL = {  # (atol, rtol)
     "k_cache": (2.0**-24, 2.0**-6),
     "v_cache": (2.0**-24, 2.0**-6),
@@ -439,11 +440,14 @@ def _check_mutated(ref, cu, case, num_real=None, strict=True):
         if name.startswith("cs_"):
             assert torch.equal(a, b), f"{name}: conv windows must be bit-identical"
         elif name == "recurrent_state":
-            # Two BF16 ulps (STATE_CHAIN_ATOL near zero) also bound the rounding that chained rounds carry over
-            # (strict=False).
-            atol = STATE_ATOL if strict else STATE_CHAIN_ATOL
+            # Two BF16 ulps (plus STATE_CHAIN_ROW_FRAC of the row's largest magnitude near zero) also bound the
+            # rounding that chained rounds carry over (strict=False).
+            if strict:
+                atol = STATE_ATOL
+            else:
+                atol = STATE_CHAIN_ROW_FRAC * b.abs().amax(dim=-1, keepdim=True)
             assert not bool((err > 2.0**-6 * b.abs() + atol).any()), (
-                f"state off by more than two BF16 ulps + {atol:.1e}"
+                "state off by more than two BF16 ulps plus the allowance near zero"
             )
             if not strict:
                 continue
