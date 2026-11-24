@@ -58,7 +58,9 @@ def _model_paths():
     return target, draft
 
 
-def _generate(config, speculative, use_cuda_graph, sampling_params, prompts=PROMPTS):
+def _generate(
+    config, speculative, use_cuda_graph, sampling_params, prompts=PROMPTS, one_at_a_time=False
+):
     target, draft = _model_paths()
     kwargs = dict(
         model=target,
@@ -73,7 +75,10 @@ def _generate(config, speculative, use_cuda_graph, sampling_params, prompts=PROM
         )
     llm = LLM(**kwargs)
     try:
-        outputs = llm.generate(prompts, sampling_params)
+        if one_at_a_time:
+            outputs = [llm.generate([p], sampling_params)[0] for p in prompts]
+        else:
+            outputs = llm.generate(prompts, sampling_params)
         return [(o.prompt_token_ids, list(o.outputs[0].token_ids)) for o in outputs]
     finally:
         llm.shutdown()
@@ -209,9 +214,10 @@ def test_eagle3_watermark_with_rejection_sampling(watermark_kwargs):
 def test_dual_key_routing_diversifies_repeated_prompts():
     if torch.cuda.get_device_properties(0).total_memory / 1e9 < 35:
         pytest.skip("Not enough memory to load the target model")
-    # The same prompt twice: with the first key only (alpha=0) the two requests repeat each other,
-    # which also shows the watermark is applied; routing tokens to the second key at random makes
-    # them diverge. Without deduplication, no repeated context falls back to ordinary sampling.
+    # The same prompt twice, one request at a time so that batch composition cannot change the
+    # numerics: with the first key only (alpha=0) the two requests repeat each other, which also
+    # shows the watermark is applied; routing tokens to the second key at random makes them
+    # diverge. Without deduplication, no repeated context falls back to ordinary sampling.
     params = SamplingParams(max_tokens=MAX_TOKENS, temperature=0.8, top_p=0.95, ignore_eos=True)
     prompts = PROMPTS * 2
     count = len(PROMPTS)
@@ -223,7 +229,7 @@ def test_dual_key_routing_diversifies_repeated_prompts():
             alpha=alpha,
             deduplicate_contexts="none",
         )
-        return _generate(config, False, False, params, prompts)
+        return _generate(config, False, False, params, prompts, one_at_a_time=True)
 
     control = run(0.0)
     assert all(control[i][1] == control[i + count][1] for i in range(count))
