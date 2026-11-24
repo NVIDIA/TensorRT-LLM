@@ -349,7 +349,12 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
                 self._close_rpc_client()
             return
         if not self._uses_collective_shutdown():
-            self._shutdown_rank_local()
+            try:
+                self._shutdown_rank_local()
+            except BaseException:
+                # Publish client-only retry only after worker teardown unwinds.
+                self._rpc_client_close_pending = True
+                raise
             return
         self._shutdown_event.set()
         logger_debug("Shutting down GenerationExecutorRpcProxy", color="yellow")

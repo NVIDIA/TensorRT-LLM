@@ -421,6 +421,7 @@ def _rpc_proxy(per_layer_dynamic=True):
     proxy = cls()
     proxy.worker_kwargs = {"llm_args": _llm_args(per_layer_dynamic)}
     proxy._shutdown_event = threading.Event()
+    proxy._rpc_client_close_pending = False
     proxy.main_loop = None
     proxy.main_loop_task_obj = None
     proxy.main_loop_thread = None
@@ -516,21 +517,71 @@ def test_rpc_proxy_client_close_failure_retries_only_client(
 
 
 @pytest.mark.parametrize("failure_site", ["remote", "mpi"])
-def test_rpc_rank_local_prior_failure_does_not_start_client_close(failure_site: str) -> None:
+@pytest.mark.parametrize("close_fails", [False, True])
+def test_rpc_rank_local_prior_failure_defers_client_close_for_retry(
+    failure_site: str, close_fails: bool
+) -> None:
     error = RuntimeError("worker teardown failed")
+    close_error = TimeoutError("client still closing")
     proxy = _rpc_proxy(per_layer_dynamic=False)
-    proxy.rpc_client = _RpcClient([], error if failure_site == "remote" else None)
-    proxy.rpc_client.close = Mock()
+    proxy.rpc_client = _RpcClient([])
+    proxy.rpc_client.close = Mock(side_effect=[close_error, None] if close_fails else None)
     session = SimpleNamespace(shutdown=Mock(side_effect=error))
     proxy.mpi_session = session
+    teardown_entered = threading.Event()
+    release_teardown = threading.Event()
+    errors = []
 
-    with pytest.raises(RuntimeError) as raised:
-        proxy.shutdown()
-    assert raised.value is error
+    def shutdown_remote() -> None:
+        teardown_entered.set()
+        assert release_teardown.wait(timeout=5)
+        if failure_site == "remote":
+            raise error
+
+    proxy.shutdown_remote = Mock(side_effect=shutdown_remote)
+
+    def shutdown() -> None:
+        try:
+            proxy.shutdown()
+        except BaseException as caught:
+            errors.append(caught)
+
+    thread = threading.Thread(target=shutdown)
+    thread.start()
+    try:
+        assert teardown_entered.wait(timeout=5)
+        assert proxy._shutdown_event.is_set()
+        # A concurrent caller must not close the client during worker teardown.
+        shutdown()
+        assert errors == []
+        proxy.rpc_client.close.assert_not_called()
+        assert not getattr(proxy, "_rpc_client_close_pending", False)
+    finally:
+        release_teardown.set()
+        thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert len(errors) == 1 and errors[0] is error
     assert proxy.mpi_session is session
     assert session.shutdown.call_count == int(failure_site == "mpi")
     proxy.rpc_client.close.assert_not_called()
-    assert not getattr(proxy, "_rpc_client_close_pending", False)
+    assert proxy._rpc_client_close_pending
+    assert proxy._shutdown_event.is_set()
+
+    if close_fails:
+        with pytest.raises(TimeoutError) as raised:
+            proxy.shutdown()
+        assert raised.value is close_error
+        assert proxy._rpc_client_close_pending
+        assert proxy._shutdown_event.is_set()
+
+    proxy.shutdown()
+    proxy.shutdown()
+    assert proxy.rpc_client.close.call_count == (2 if close_fails else 1)
+    assert not proxy._rpc_client_close_pending
+    assert proxy._shutdown_event.is_set()
+    assert proxy.mpi_session is session
+    proxy.shutdown_remote.assert_called_once()
+    assert session.shutdown.call_count == int(failure_site == "mpi")
 
 
 def test_rpc_server_completes_commit_only_after_response_send():
