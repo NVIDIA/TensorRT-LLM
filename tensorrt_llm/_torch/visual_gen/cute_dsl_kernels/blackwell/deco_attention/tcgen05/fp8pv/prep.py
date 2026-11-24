@@ -258,8 +258,9 @@ def run(
     nsm = num_sms(dev)
     BH = B * H
     # The V scan runs beside the eigensolver CTAs, V_CTAS_PER_SM per SM. A pass of at most V_SMALL_PASS_BYTES per
-    # free SM is launched on the SMs that the eigensolver launch leaves free; a larger one on every SM.
-    free = max(nsm - BH, V_SMALL_PASS_MIN_SMS)
+    # free SM is launched on the SMs that the eigensolver launch leaves free (at least V_SMALL_PASS_MIN_SMS, at most
+    # the device's); a larger one on every SM.
+    free = min(nsm, max(nsm - BH, V_SMALL_PASS_MIN_SMS))
     v_sms = free if BH < nsm and B * S * H * 16 * 40 <= V_SMALL_PASS_BYTES * free else nsm
     v_units = B * ((S + V_BLOCK - 1) // V_BLOCK)
     v_grid = min(V_CTAS_PER_SM * v_sms, v_units)
