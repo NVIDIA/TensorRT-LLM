@@ -86,10 +86,6 @@ The [router](pipeline_registry.py) selects a target before building the transfor
 | Base H3 | [default_pipeline/](default_pipeline/) handles BF16, FP8, block-scaled FP8 and NVFP4 | The default is 50 sigma points including zero, giving 49 updates. |
 | FastH3 (`schema_version` starts with `fasth3-` in `fastvideo_inference.json`) | [fasth3/](fasth3/) | The checkpoint supplies the schedule. FastH3 8-Step V2 uses nine points and eight updates. |
 
-Block-scaled FP8 MLPs on SM100 and SM103 require the `catalog/activation` native extension from the matching wheel.
-
-For routed TRTLLM attention, use block-scaled Sage to quantize Q/K/V. The block-sparse runner executes per-tensor FP8 recipes in the input dtype. For VC repair, use KV lengths divisible by 128. With a partial final tile, PrimTS includes padded keys in the softmax denominator.
-
 ## Test a change
 
 During the H3 rollout, include a change to an existing shared implementation only when the same supported configuration would otherwise behave differently in V1 and V2. Track defects inherited by both versions separately.
