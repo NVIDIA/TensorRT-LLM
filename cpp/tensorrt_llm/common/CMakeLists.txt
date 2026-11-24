@@ -102,27 +102,45 @@ if(ENABLE_CUBLASLT_FP4_GEMM)
   target_compile_definitions(tllm_common_cublas PUBLIC ENABLE_CUBLASLT_FP4_GEMM)
 endif()
 
-add_library(tllm_common_attention_workspace STATIC attentionWorkspace.cpp
-                                                   sageScaleGeometry.cpp)
+add_library(tllm_common_sage_scale_geometry STATIC sageScaleGeometry.cpp)
+add_library(tllm::common_sage_scale_geometry ALIAS
+            tllm_common_sage_scale_geometry)
+target_link_libraries(tllm_common_sage_scale_geometry
+                      PUBLIC tllm::common_headers)
+target_compile_features(tllm_common_sage_scale_geometry PUBLIC cxx_std_20)
+set_target_properties(tllm_common_sage_scale_geometry
+                      PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+add_library(tllm_common_attention_workspace STATIC attentionWorkspace.cpp)
 add_library(tllm::common_attention_workspace ALIAS
             tllm_common_attention_workspace)
-target_link_libraries(tllm_common_attention_workspace
-                      PUBLIC tllm::common_headers)
+target_link_libraries(
+  tllm_common_attention_workspace
+  PUBLIC tllm::common_headers
+  PRIVATE tllm::common_sage_scale_geometry)
 target_include_directories(tllm_common_attention_workspace SYSTEM
                            PUBLIC ${CUDAToolkit_INCLUDE_DIRS})
 target_compile_features(tllm_common_attention_workspace PUBLIC cxx_std_20)
 set_target_properties(tllm_common_attention_workspace
                       PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+add_library(tllm_common_sage_quant STATIC sageQuant.cu)
+add_library(tllm::common_sage_quant ALIAS tllm_common_sage_quant)
+target_link_libraries(
+  tllm_common_sage_quant
+  PUBLIC tllm::common_cuda tllm::common_sage_scale_geometry
+  PRIVATE tllm::kernel_cutlass_headers)
+
+target_compile_features(tllm_common_sage_quant PUBLIC cxx_std_20)
+set_target_properties(
+  tllm_common_sage_quant
+  PROPERTIES CXX_EXTENSIONS OFF POSITION_INDEPENDENT_CODE ON CUDA_STANDARD 20
+             CUDA_STANDARD_REQUIRED ON CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+add_cuda_architectures(tllm_common_sage_quant 89)
+
 add_library(
-  common_src OBJECT
-  cudaArchitectures.cpp
-  cudaFp8Utils.cu
-  mcastDevMemUtils.cpp
-  ncclUtils.cpp
-  opUtils.cpp
-  safetensors.cpp
-  sageQuant.cu)
+  common_src OBJECT cudaArchitectures.cpp cudaFp8Utils.cu mcastDevMemUtils.cpp
+                    ncclUtils.cpp opUtils.cpp safetensors.cpp)
 
 list(JOIN CMAKE_CUDA_ARCHITECTURES_ORIG "," TRTLLM_BUILT_CUDA_ARCHITECTURES)
 list(JOIN CMAKE_CUDA_ARCHITECTURES_WITH_KERNELS ","
