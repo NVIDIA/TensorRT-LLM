@@ -89,6 +89,7 @@ class ZeroMqQueue:
         self.socket = None
 
         self._setup_done = False
+        self._interruptible_send_configured = False
         self.name = name
         self.socket = self.context.socket(socket_type)
         self.socket.set_hwm(0)
@@ -233,16 +234,29 @@ class ZeroMqQueue:
                                                                 bool]) -> None:
         """Send on a proxy-owned socket until delivery or local cancellation.
 
-        Other queues retain their blocking send behavior. A finite socket send
-        timeout adds no poll to successful sends and lets the owning thread
-        observe cancellation without another thread closing its socket.
+        A 50 ms SNDTIMEO remains on this socket after its first interruptible
+        send. Later blocking sends on the same socket can therefore raise
+        ``zmq.Again``; other sockets are unchanged. Successful sends add no
+        poll, while retries let the owning thread observe cancellation without
+        another thread closing its socket.
+
+        Args:
+            obj: Object to serialize and deliver to the peer.
+            should_stop: Predicate checked before setup and between send
+                attempts. Returning True cancels delivery; the predicate must
+                return promptly for cancellation to remain responsive.
+
+        Raises:
+            RequestSendCancelled: Local cancellation interrupted delivery.
+                This exception is a RuntimeError subclass.
+            zmq.ZMQError: A transport error other than a retryable send timeout.
         """
         cancelled = "Executor proxy request send cancelled during shutdown."
         if should_stop():
             raise RequestSendCancelled(cancelled)
         self.setup_lazily()
         self._check_thread_safety()
-        if not getattr(self, "_interruptible_send_configured", False):
+        if not self._interruptible_send_configured:
             self.socket.setsockopt(zmq.SNDTIMEO, 50)
             self._interruptible_send_configured = True
         data = self._prepare_data(obj)

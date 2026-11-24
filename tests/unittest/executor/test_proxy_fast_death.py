@@ -881,7 +881,7 @@ def test_shutdown_joins_real_dispatcher_before_socket_close(
             closing_dispatcher.set()
             writer.join(timeout=5)
         if proxy.dispatch_result_thread is not None and proxy.dispatch_result_thread.is_alive():
-            # Failure cleanup only: a baseline reader cannot be closed while blocked.
+            # Failure cleanup only: stop the reader before closing its socket.
             proxy.dispatch_result_thread.stop()
             if writer is None:
                 worker_lane.put(None)

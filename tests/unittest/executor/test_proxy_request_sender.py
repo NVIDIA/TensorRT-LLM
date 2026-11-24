@@ -194,7 +194,9 @@ def test_close_during_interpreter_finalization_does_not_join():
     assert request_queue.messages == [_payloads("first"), _payloads("queued")]
 
 
-def test_proxy_finalizer_does_not_start_shutdown_during_late_finalization(monkeypatch):
+def test_proxy_finalizer_does_not_start_shutdown_during_late_finalization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     proxy = _bare_proxy()
     calls = []
     monkeypatch.setattr(proxy, "shutdown", lambda: calls.append("shutdown"))
@@ -269,7 +271,7 @@ def test_transport_error_reaches_error_queue(error_type) -> None:
         sender.close(timeout=2.0)
 
 
-def test_batched_quit_failure_is_best_effort(monkeypatch):
+def test_batched_quit_failure_is_best_effort(monkeypatch: pytest.MonkeyPatch) -> None:
     from tensorrt_llm.executor import proxy as proxy_module
 
     warnings = []
@@ -328,7 +330,7 @@ def test_worker_unpacks_batched_requests_in_order():
     assert list(_incoming_requests(request_queue)) == ["a", "b", "c", "d"]
 
 
-def test_sender_preserves_fifo_and_bare_quit_with_private_peer():
+def test_sender_preserves_fifo_and_bare_quit_with_private_peer() -> None:
     request_queue = IpcQueue(is_server=True)
     peer = IpcQueue(request_queue.address, is_server=False)
     sender = _RequestSender(request_queue, queue.Queue())
@@ -351,7 +353,9 @@ def test_sender_preserves_fifo_and_bare_quit_with_private_peer():
 
 @pytest.mark.parametrize("batching", [False, True])
 @pytest.mark.parametrize("engine_dead", [False, True])
-def test_absent_peer_send_is_interrupted_before_transport_close(monkeypatch, batching, engine_dead):
+def test_absent_peer_send_is_interrupted_before_transport_close(
+    monkeypatch: pytest.MonkeyPatch, batching: bool, engine_dead: bool
+) -> None:
     proxy = _bare_proxy()
     proxy.request_queue = IpcQueue(is_server=True)
     proxy._REQUEST_SHUTDOWN_TIMEOUT_S = 0.05
@@ -403,7 +407,7 @@ def test_absent_peer_send_is_interrupted_before_transport_close(monkeypatch, bat
         proxy.request_queue.close()
 
 
-def test_close_reports_a_noncooperative_sender_instead_of_success():
+def test_close_reports_a_noncooperative_sender_instead_of_success() -> None:
     request_queue = _RecordingQueue(block_first_put=True)
     sender = _RequestSender(request_queue, queue.Queue())
     sender.send(pickle.dumps("generate"))
@@ -418,7 +422,9 @@ def test_close_reports_a_noncooperative_sender_instead_of_success():
 
 
 @pytest.mark.parametrize("batching", [False, True])
-def test_generation_send_waiting_at_admission_is_rejected_after_close(monkeypatch, batching):
+def test_generation_send_waiting_at_admission_is_rejected_after_close(
+    monkeypatch: pytest.MonkeyPatch, batching: bool
+) -> None:
     proxy = _bare_proxy()
     proxy.request_queue = _RecordingQueue()
     proxy._request_sender = _RequestSender(proxy.request_queue, queue.Queue()) if batching else None
@@ -579,7 +585,7 @@ def test_send_failure_is_not_hidden_when_budget_expires(
         assert not caller.is_alive()
 
 
-def test_dead_engine_abort_does_not_attempt_transport():
+def test_dead_engine_abort_does_not_attempt_transport() -> None:
     proxy = _bare_proxy()
     proxy._engine_dead = True
     proxy.request_queue = _RecordingQueue(block_first_put=True)

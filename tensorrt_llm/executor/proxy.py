@@ -158,7 +158,7 @@ class _RequestSender:
     def __init__(self,
                  request_queue: IpcQueue,
                  error_queue: Queue,
-                 should_stop: Optional[Callable[[], bool]] = None):
+                 should_stop: Optional[Callable[[], bool]] = None) -> None:
         self._request_queue = request_queue
         self._error_queue = error_queue
         self._should_stop = should_stop
@@ -1115,7 +1115,7 @@ class GenerationExecutorProxy(GenerationExecutor):
         the reader to local stop; its socket receive timeout makes that stop
         interruptible without a poll in the per-response path.
         """
-        thread = getattr(self, "dispatch_result_thread", None)
+        thread = self.dispatch_result_thread
         if thread is None or not thread.is_alive():
             return
         if thread is threading.current_thread():
@@ -1382,8 +1382,7 @@ class GenerationExecutorProxy(GenerationExecutor):
         self._worker_process_monitor.close()
 
         # Wake the error monitor thread immediately so it exits cleanly
-        if hasattr(self, '_shutdown_event'):
-            self._shutdown_event.set()
+        self._shutdown_event.set()
 
         # A remote session has no local futures; for a local session notify
         # surviving workers even if some ranks have already exited.
@@ -1395,7 +1394,7 @@ class GenerationExecutorProxy(GenerationExecutor):
                                          send_sentinel=send_sentinel)
 
     def _send_request(self,
-                      request,
+                      request: object,
                       *,
                       should_stop: Optional[Callable[[], bool]] = None) -> None:
         """Send a request to the rank-0 worker.
@@ -1451,7 +1450,7 @@ class GenerationExecutorProxy(GenerationExecutor):
         that has been writing ``request_queue``: the sender thread once it has
         started, the caller otherwise.
         """
-        deadline = getattr(self, "_request_shutdown_deadline", None)
+        deadline = self._request_shutdown_deadline
         if deadline is None:
             deadline = time.monotonic() + self._REQUEST_SHUTDOWN_TIMEOUT_S
             self._request_shutdown_deadline = deadline
@@ -1466,8 +1465,7 @@ class GenerationExecutorProxy(GenerationExecutor):
             raise TimeoutError(
                 "Executor proxy request transport is still closing.")
         try:
-            if send_sentinel and not getattr(self, "_request_transport_closed",
-                                             False):
+            if send_sentinel and not self._request_transport_closed:
                 _send_quit(self.request_queue, self._request_send_stopped)
             self._request_transport_closed = True
         finally:
@@ -1502,6 +1500,19 @@ class GenerationExecutorProxy(GenerationExecutor):
                 self._pre_shutdown_complete = True
 
     def shutdown(self) -> None:
+        """Reclaim this proxy's owned workers, threads and transports.
+
+        Cleanup is serialized across callers. A cleanup failure permits a
+        later shutdown attempt, not new generation requests. Once cleanup
+        succeeds, subsequent shutdown calls are no-ops. Worker failures can
+        still be reported after local cleanup completes.
+
+        Raises:
+            TimeoutError: An owned resource did not stop within its shutdown
+                budget. Retry from an external thread to finish cleanup.
+            RuntimeError: Shutdown would join its own resource-owning thread.
+            EngineDeadError: A worker failure is reported after cleanup.
+        """
         # Serializes finalizers only; worker callbacks never need this lock
         # to make progress. Mark closed only after all owned cleanup succeeds.
         with self._shutdown_lock:

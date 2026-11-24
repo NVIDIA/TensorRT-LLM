@@ -590,8 +590,11 @@ def test_caller_thread_never_touches_zmq_queue(bare_proxy, tmp_path):
 @pytest.mark.parametrize("batching", [False, True])
 @pytest.mark.parametrize("acknowledge", [False, True])
 def test_profile_close_settles_running_and_queued_calls_with_private_peer(
-    bare_proxy, monkeypatch, batching, acknowledge
-):
+    bare_proxy: GenerationExecutorProxy,
+    monkeypatch: pytest.MonkeyPatch,
+    batching: bool,
+    acknowledge: bool,
+) -> None:
     proxy = bare_proxy
     proxy.request_queue = IpcQueue(is_server=True)
     proxy.profile_ack_queue = None
@@ -690,7 +693,9 @@ def test_profile_close_settles_running_and_queued_calls_with_private_peer(
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("profile_error", [False, True], ids=["missing_ack", "failed_drain"])
-def test_profile_shutdown_still_delivers_cancel_and_quit(bare_proxy, monkeypatch, profile_error):
+def test_profile_shutdown_still_delivers_cancel_and_quit(
+    bare_proxy: GenerationExecutorProxy, monkeypatch: pytest.MonkeyPatch, profile_error: bool
+) -> None:
     proxy = bare_proxy
     proxy.workers_started = True
     proxy.mpi_futures = [concurrent.futures.Future()]
@@ -732,7 +737,7 @@ def test_profile_shutdown_still_delivers_cancel_and_quit(bare_proxy, monkeypatch
 
 
 @pytest.mark.cpu_only
-def test_profile_close_does_not_start_an_unused_worker(bare_proxy):
+def test_profile_close_does_not_start_an_unused_worker(bare_proxy: GenerationExecutorProxy) -> None:
     proxy = bare_proxy
     proxy.doing_shutdown = True
     proxy._close_profile_control()
