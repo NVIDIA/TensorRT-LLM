@@ -683,6 +683,9 @@ class AdaptiveMoeLoadBalancer(BaseMoeLoadBalancer):
         failed = calibrate.write_cache(path, text) if self.ep_rank == 0 else None
         if failed:
             logger.warning(f"adaptive EPLB keeps its calibration in memory only: {failed}")
+        keep = self.config.calibration_cache_max_entries
+        for kept in calibrate.evict(path, keep) if self.ep_rank == 0 and not failed else ():
+            logger.warning(f"adaptive EPLB could not evict the old calibration {kept}")
         return model, None
 
     def platform_gap(self, backend: AdaptiveEplbBackend) -> str | None:

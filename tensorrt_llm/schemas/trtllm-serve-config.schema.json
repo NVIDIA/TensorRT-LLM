@@ -5311,6 +5311,14 @@
           "status": "prototype",
           "title": "Calibration Cache Dir"
         },
+        "calibration_cache_max_entries": {
+          "default": 32,
+          "description": "Calibrations `calibration_cache_dir` keeps: after rank 0 writes one, it deletes the oldest by write time beyond this many, each with its `.times.json`; 0 keeps all. Only files that parse as calibrations count or are deleted, so a shared directory keeps everything else. An entry with its times is about 37 KB, so 32 keep about 1.2 MB: room for the identities of several deployments (GPU, EP size, slots, decode kernels) across a few builds and drivers, while a calibration evicted too early costs one more measurement in the warmup (about 40 s at EP32).",
+          "minimum": 0,
+          "status": "prototype",
+          "title": "Calibration Cache Max Entries",
+          "type": "integer"
+        },
         "calibration_designs": {
           "default": 128,
           "description": "Random slot-row designs timed per decode bucket by the `auto` calibration, every fourth held out. At least 12: the held-out scale is a line fitted on three or more designs, the fewest that leave it a residual.",

@@ -1298,6 +1298,11 @@
     {
       "capture_policy": "int",
       "kind": "value",
+      "path": "moe_config.load_balancer.calibration_cache_max_entries"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
       "path": "moe_config.load_balancer.calibration_designs"
     },
     {

@@ -18,6 +18,7 @@ import hashlib
 import importlib.metadata
 import json
 import os
+import re
 import time
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
@@ -25,6 +26,7 @@ from types import SimpleNamespace
 from typing import Callable
 
 import numpy as np
+import pynvml
 import torch
 
 import tensorrt_llm
@@ -70,15 +72,37 @@ def cache_path(config: object, identity: dict) -> Path | None:
     if not root:
         return None
     key = dict(identity, settings=asdict(Settings.of(config)), schema=CALIBRATION)
-    wheels = importlib.metadata.distributions(name="tensorrt_llm")  # the build: its source commit,
+    wheels = importlib.metadata.distributions(name="tensorrt_llm")  # the build: its source commit
     build = [u for w in wheels for u in w.metadata.get_all("Project-URL") or [] if "/commit/" in u]
-    lib = Path(tensorrt_llm.__file__).parent / "libs" / "libth_common.so"  # else its library file
-    build = build or ([lib.stat().st_size, lib.stat().st_mtime_ns] if lib.is_file() else None)
+    lib = Path(tensorrt_llm.__file__).parent / "libs" / "libth_common.so"  # and its kernels' bytes,
+    build.append(file_sha256(lib) if lib.is_file() else None)  # also when replaced under one wheel
     fit = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()  # this measurement and its fit
-    key.update(trtllm_version=tensorrt_llm.__version__, build=build, fit=fit)
+    key.update(trtllm_version=tensorrt_llm.__version__, build=build, fit=fit, **platform_versions())
     folder = Path(os.path.expanduser(root))
     folder = folder if config.calibration_cache_dir else folder / "adaptive_eplb"
     return folder / f"{digest(key)}.json"
+
+
+def file_sha256(path: Path) -> str:
+    """The sha256 of the file at ``path``, read 1 MiB at a time (0.2 s for a 234 MB library)."""
+    sha = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            sha.update(chunk)
+    return sha.hexdigest()
+
+
+def platform_versions() -> dict:
+    """What changes the kernels' times or the designs outside the run's identity: the GPU driver and
+    its CUDA version (NVML), the CUDA runtime, numpy (its generator draws the designs and keeps no
+    stream across versions)."""
+    pynvml.nvmlInit()
+    try:
+        driver, cuda = pynvml.nvmlSystemGetDriverVersion(), pynvml.nvmlSystemGetCudaDriverVersion()
+    finally:
+        pynvml.nvmlShutdown()
+    driver = driver.decode() if isinstance(driver, bytes) else driver
+    return dict(driver=driver, cuda=cuda, cuda_runtime=torch.version.cuda, numpy=np.__version__)
 
 
 def read_cache(path: Path | None) -> str | None:
@@ -100,6 +124,37 @@ def write_cache(path: Path | None, text: str) -> str | None:
     except OSError as error:
         return f"{path} is not writable ({type(error).__name__}: {error})"
     return None
+
+
+def evict(written: Path, keep: int) -> list[str]:
+    """Delete all but the ``keep`` newest calibrations beside ``written`` (by write time; never
+    ``written``), each with its ``.times.json`` first; 0 keeps all. Only ``<sha256>.json`` files of
+    this schema count, so a shared directory keeps everything else; a file another process deleted
+    first is no failure. Why a file stayed, never an exception: a failure here loses only space."""
+    if keep <= 0:
+        return []
+    entries, failed = [], []
+    try:
+        for path in written.parent.glob("*.json"):
+            if path == written or not re.fullmatch(r"[0-9a-f]{64}\.json", path.name):
+                continue
+            try:
+                doc = json.loads(path.read_text())
+                if isinstance(doc, dict) and doc.get("schema") == CALIBRATION[0]:
+                    entries.append((path.stat().st_mtime_ns, path.name, path))
+            except (OSError, ValueError):  # gone, or not a calibration
+                continue
+    except OSError as error:
+        return [f"{written.parent} ({type(error).__name__}: {error})"]
+    for *_, path in sorted(entries, reverse=True)[keep - 1 :]:
+        for part in (path.with_suffix(".times.json"), path):
+            try:
+                part.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                failed.append(f"{part} ({type(error).__name__}: {error})")
+    return failed
 
 
 def make_designs(g: SimpleNamespace, n: int, rng: np.random.Generator) -> np.ndarray:

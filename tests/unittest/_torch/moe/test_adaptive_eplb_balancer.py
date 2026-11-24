@@ -34,6 +34,12 @@ def cpu_ops(monkeypatch):
     monkeypatch.setattr(torch.ops.trtllm, "adaptive_eplb_record", reference.record, False)
 
 
+@pytest.fixture(autouse=True)
+def versions(monkeypatch):
+    """The cache key's driver and CUDA versions without NVML: no driver on a CPU node."""
+    monkeypatch.setattr(calibrate, "platform_versions", lambda: dict(driver="580", numpy="2"))
+
+
 def _balancer(ep_rank: int = 1, **fields) -> AdaptiveMoeLoadBalancer:
     config = MoeAdaptiveLoadBalancerConfig(num_slots=NUM_SLOTS, **fields)
     config.setup(ep_rank=ep_rank, ep_size=EP_SIZE)
@@ -629,6 +635,17 @@ def test_a_miss_calibrates_in_the_warmup_and_caches_it_for_the_next_start(monkey
     assert (
         "start" in seen and len(timer.made) == 2 and len(list(tmp_path.glob("*[0-9a-f].json"))) == 2
     )
+
+
+def test_a_new_calibration_evicts_the_oldest_beyond_the_cache_entries(monkeypatch, tmp_path):
+    monkeypatch.setattr(calibrate, "LiveTimer", _timer())
+    config = dict(SMALL, calibration_cache_dir=str(tmp_path), calibration_cache_max_entries=1)
+    _prepare(monkeypatch, config=config)[0].before_capture()
+    (first,) = tmp_path.glob("*[0-9a-f].json")
+    _prepare(monkeypatch, tokens=(8,), config=config)[0].before_capture()  # another identity
+    (second,) = tmp_path.glob("*[0-9a-f].json")
+    left = [second, second.with_suffix(".times.json")]  # the first went with its times
+    assert second != first and sorted(tmp_path.iterdir()) == left
 
 
 def test_buckets_of_different_tiles_calibrate_and_price_each_at_its_own(monkeypatch, tmp_path):

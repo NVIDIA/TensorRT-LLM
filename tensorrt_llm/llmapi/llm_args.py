@@ -2446,6 +2446,11 @@ class MoeAdaptiveLoadBalancerConfig(_MoeLoadBalancerConfigBase):
         description=
         "Directory of the calibrations `time_model: auto` measures, one file per run identity, which rank 0 reads and writes; beside each, `<file>.times.json` keeps every bucket's design times to audit or replay its fit. Defaults to `adaptive_eplb` under `TRTLLM_CACHE_DIR`, where the autotuner keeps its cache; without either, or when the directory is not writable, a calibration lives in memory for the run only.",
         status="prototype")
+    calibration_cache_max_entries: NonNegativeInt = Field(
+        default=32,
+        description=
+        "Calibrations `calibration_cache_dir` keeps: after rank 0 writes one, it deletes the oldest by write time beyond this many, each with its `.times.json`; 0 keeps all. Only files that parse as calibrations count or are deleted, so a shared directory keeps everything else. An entry with its times is about 37 KB, so 32 keep about 1.2 MB: room for the identities of several deployments (GPU, EP size, slots, decode kernels) across a few builds and drivers, while a calibration evicted too early costs one more measurement in the warmup (about 40 s at EP32).",
+        status="prototype")
     calibration_designs: PositiveInt = Field(
         default=128,
         ge=12,
