@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Bitwise FFN fusions for the qualified EarlyTop8 SM107 Ulysses shards."""
+"""Bitwise FFN fusions for SM107 Ulysses shards on mixed whole-block FP8/BF16 checkpoints."""
 
 import os
 from typing import Literal
@@ -161,7 +161,7 @@ def _eligible(block: Fp8UlyssesMlpMixin, dtype: torch.dtype, device: torch.devic
 
 
 def initialize_block_ops(transformer: MiniMaxH3Transformer3DModel) -> None:
-    """Prepare eligible EarlyTop8 block kernels once after the checkpoint is loaded."""
+    """Prepare eligible mixed FP8/BF16 block kernels once after the checkpoint is loaded."""
     device = transformer.proj_out.weight.device
     if device.type != "cuda" or torch.cuda.get_device_capability(device) != (10, 7):
         return

@@ -300,7 +300,7 @@ class Fp8UlyssesTransformer(MiniMaxH3Transformer3DModel):
 def _initialize_sm107_gen_fmha(transformer) -> bool:
     """Bind pure SM107 trtllm-gen-fp16sm FMHA + symmetric-memory V amax; SM103 stays on cuDNN."""
     device = transformer.proj_out.weight.device
-    if device.type != "cuda" or torch.cuda.get_device_capability(device) != (10, 7):
+    if device.type != "cuda":
         return False
     attentions = [block.attn for block in transformer.transformer_blocks]
     if not attentions or not all(isinstance(a, Fp8UlyssesAttention) for a in attentions):
@@ -321,6 +321,20 @@ def _initialize_sm107_gen_fmha(transformer) -> bool:
         or a.use_async_ulysses
         for a in attentions
     ):
+        return False
+    local_gen_ok = torch.cuda.get_device_capability(device) == (10, 7)
+    if local_gen_ok:
+        try:
+            local_gen_ok = bool(
+                torch.ops.trtllm.fmha_dense_fp8_is_supported(128, 14, torch.bfloat16, True)
+            )
+        except (RuntimeError, AttributeError):
+            local_gen_ok = False
+    if torch.distributed.is_initialized():
+        gen_vote = torch.tensor(1 if local_gen_ok else 0, dtype=torch.int32, device=device)
+        torch.distributed.all_reduce(gen_vote, op=torch.distributed.ReduceOp.MIN, group=group)
+        local_gen_ok = int(gen_vote.item()) == 1
+    if not local_gen_ok:
         return False
     inner = CuDNNAttention(
         num_heads=14,
