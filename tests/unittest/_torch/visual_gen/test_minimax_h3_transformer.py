@@ -550,6 +550,8 @@ def test_blocks_share_the_token_tags_and_the_padding_mask(monkeypatch) -> None:
     # Padding between the tokens, then other padding refilled into the caller's tags tensor.
     tags, mask = forward(torch.tensor([1, -1, 2, 0], device="cuda"))
     assert torch.equal(mask, (tags >= 0)[None])
+    # An unchanged input reuses both tensors on the next forward (attention backends key their plans on them).
+    assert forward() == (tags, mask)
     inputs["token_tags"].copy_(torch.tensor([1, 2, -1, -1], device="cuda"))
     tags, mask = forward()
     assert torch.equal(mask, (tags >= 0)[None])

@@ -307,13 +307,19 @@ def test_deco_rank_64_follows_the_scores(require_deco_kernels) -> None:
 
 def test_deco_large_caller_draw_follows_the_scores(require_deco_kernels) -> None:
     """A caller's draw of more than 512 rows reaches the later sampling chunks of the
-    preparation."""
+    preparation: two draws that share their first 512 rows and differ in the 513th, an outlier
+    row, give different bases."""
     device = require_deco_kernels()
     seq_len = 1024
     q, k, v = _random_qkv(1, seq_len, 2, device, q_scale=4.0)
     gen = torch.Generator(device=device).manual_seed(1)
-    rows = torch.randperm(seq_len, generator=gen, device=device)[:513].to(torch.int32)
-    _assert_follows_the_scores(_kernels(q, k, v, rows=rows), q, k, v)
+    perm = torch.randperm(seq_len, generator=gen, device=device)
+    rows = perm[:513].to(torch.int32)
+    other = torch.cat([perm[:512], perm[513:514]]).to(torch.int32)
+    q[:, perm[513]] *= 16  # the row only the second draw samples weighs on the basis
+    out, out_other = (_kernels(q, k, v, rows=r) for r in (rows, other))
+    _assert_follows_the_scores(out, q, k, v)
+    assert not torch.equal(out, out_other)
 
 
 def _two_stream_rounds(device_index: int, result) -> None:
@@ -367,10 +373,11 @@ def test_deco_preparations_on_two_streams_finish(require_deco_kernels) -> None:
     assert child.exitcode == 0
 
 
-def test_deco_kernel_api_takes_aligned_tensors_only(require_deco_kernels) -> None:
+def test_deco_kernel_api_host_checks(require_deco_kernels, monkeypatch: pytest.MonkeyPatch) -> None:
     """The kernels move q, k, v and out through TMA descriptors and vector stores that assume
     256-byte aligned base addresses: a view into an allocation at an offset of 128 elements is
-    served, one at an offset of one or of eight elements is rejected."""
+    served, one at an offset of one or of eight elements is rejected.
+    Beside the alignment, the host side resolves its devices: see the checks at the end."""
     device = require_deco_kernels()
     shape = (1, 256, 2, HEAD_DIM)
     q, k, v = _random_qkv(*shape[:3], device)
@@ -400,6 +407,33 @@ def test_deco_kernel_api_takes_aligned_tensors_only(require_deco_kernels) -> Non
         assert torch.equal(attn.forward(misaligned, k, v), attn.forward(q, k, v))
     with pytest.raises(ValueError, match="empty dimension"):
         deco_attention.prepare(q[:, :0], k[:, :0], v[:, :0], workspace, "fp8")
+    # rows and valid_seq_lens are read through descriptors that assume 16-byte addresses: a view at an offset
+    # of one element is rejected, not misread.
+    ints = torch.zeros(9, dtype=torch.int32, device=device)
+    lens = ints[1:2].fill_(shape[1])
+    rows = ints[1:9].copy_(torch.arange(8, dtype=torch.int32, device=device))
+    with pytest.raises(ValueError, match="aligned"):
+        deco_attention.prepare(q, k, v, workspace, "fp8", valid_seq_lens=lens)
+    with pytest.raises(ValueError, match="aligned"):
+        deco_attention.prepare(q, k, v, workspace, "fp8", rows=rows)
+
+    # The rotation matrix is built on the CPU whatever the default device is, and the SM count of
+    # "cuda" is that of the current device, not a value cached under the string.
+    from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell.deco_attention import runtime
+
+    rotation = deco_attention.inputs.hadamard(device).clone()
+    deco_attention.inputs.hadamard.cache_clear()
+    torch.set_default_device(device)
+    try:
+        assert torch.equal(deco_attention.inputs.hadamard(device), rotation)
+    finally:
+        torch.set_default_device("cpu")
+    assert runtime.num_sms("cuda") == runtime.num_sms(torch.device("cuda", device.index))
+    counts = {0: 10, 1: 20}
+    monkeypatch.setattr(runtime, "_num_sms", lambda index: counts[index])
+    for index in counts:
+        monkeypatch.setattr(torch.cuda, "current_device", lambda index=index: index)
+        assert runtime.num_sms("cuda") == counts[index]
 
 
 @pytest.mark.parametrize("v_dtype", V_DTYPES)
@@ -767,8 +801,10 @@ def test_deco_sm120_nvfp4_split_units_merge_a_padded_half(require_deco_kernels) 
 
     device = require_deco_kernels("nvfp4")
     seq_len, valid_seq_len, num_heads = 3200, 2049, 1
-    _, split_units, _ = split_plan(1, seq_len, num_heads, num_sms(device))
-    assert split_units > 0
+    full_units, split_units, split_tile = split_plan(1, seq_len, num_heads, num_sms(device))
+    # The split units are the last query tiles: the first of them starts below the valid length, and the valid
+    # keys reach past the split point, so the merge of a valid query tile has two non-empty halves.
+    assert split_units > 0 and full_units * 128 < valid_seq_len and split_tile * 128 < valid_seq_len
     q, k, v = _random_qkv(1, seq_len, num_heads, device, q_scale=4.0)
     lens = torch.tensor([valid_seq_len], dtype=torch.int32, device=device)
     num_bytes = deco_attention.workspace_size(1, seq_len, num_heads, device, "nvfp4")

@@ -198,7 +198,29 @@ def _logic_h3_ulysses_and_parallel_vae(
     tolerance = {"rtol": 2e-3, "atol": 2e-3} if backend != "DECO" else {"rtol": 0.0, "atol": 1e-2}
     with torch.inference_mode():
         expected = reference(**inputs)
-        actual = candidate(**inputs)
+        if backend == "DECO":
+            # Every joint block of the sharded model reaches the DeCo kernels with the whole padded sequence.
+            from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell import deco_attention
+
+            prepare, calls = deco_attention.prepare, []
+
+            def recording(q, *args, **kwargs):
+                calls.append((tuple(q.shape), kwargs["valid_seq_lens"], kwargs["rows"]))
+                return prepare(q, *args, **kwargs)
+
+            deco_attention.prepare = recording
+            try:
+                actual = candidate(**inputs)
+            finally:
+                deco_attention.prepare = prepare
+            # the whole padded sequence with the head shard, the mask as the valid length that excludes its
+            # last row only, and basis rows drawn from the tags
+            assert len(calls) == len(candidate.transformer_blocks)
+            for shape, lens, rows in calls:
+                assert shape == (1, 8194, 4 // ulysses_size, 128)
+                assert lens.tolist() == [8193] and rows is not None and rows.numel() > 0
+        else:
+            actual = candidate(**inputs)
     torch.testing.assert_close(actual.sample, expected.sample, **tolerance)
     torch.testing.assert_close(actual.audio_sample, expected.audio_sample, **tolerance)
     # Exercise the same VAE group and real gathers, including an idle tail rank
@@ -218,13 +240,18 @@ def _logic_h3_ulysses_and_parallel_vae(
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires two CUDA GPUs")
 @pytest.mark.parametrize("async_ulysses", [False, True], ids=["nccl", "async"])
 @pytest.mark.parametrize("backend", ["VANILLA", "FA4", "TRTLLM", "FLASHINFER", "DECO"])
-def test_h3_ulysses_and_parallel_vae(backend: str, async_ulysses: bool) -> None:
+def test_h3_ulysses_and_parallel_vae(
+    backend: str, async_ulysses: bool, require_deco_kernels
+) -> None:
     if backend == "TRTLLM" and torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("TRTLLM H3 requires SM100 or SM103")
     if backend == "FA4" and torch.cuda.get_device_capability()[0] < 10:
         pytest.skip("FA4 requires SM100 or newer")
-    if backend == "DECO" and torch.cuda.get_device_capability()[0] not in (10, 12):
-        pytest.skip("DeCo-Attention requires SM100, SM103, SM107 or SM120")
+    if backend == "DECO":
+        # the kernel package answers for the current GPU; the second must be the same model
+        require_deco_kernels()
+        if torch.cuda.get_device_capability(1) != torch.cuda.get_device_capability(0):
+            pytest.skip("DeCo-Attention on two GPUs needs two GPUs of one model")
     if torch.cuda.device_count() < 2:
         pytest.skip(f"Test requires 2 GPUs, only {torch.cuda.device_count()} available")
     run_distributed(
