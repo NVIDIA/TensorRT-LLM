@@ -604,6 +604,10 @@ class TestKVCacheV2LoRA:
         )
 
     # LoRA + eviction — V2 matches V1
+    # NOTE: does not exercise eviction despite its name. The KV pool is large
+    # enough that nothing is evicted, so the only assertion is V1/V2 output
+    # equality, same as the other LoRA tests. Not in any test list until it is
+    # rewritten to size the pool so blocks are evicted, and to assert that.
     def test_lora_eviction(self):
         self._run_v1_v2_lora(
             SHORT_PROMPTS,

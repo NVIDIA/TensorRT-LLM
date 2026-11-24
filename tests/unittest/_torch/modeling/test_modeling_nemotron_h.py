@@ -148,6 +148,10 @@ def test_nemotron_h_sanity(mamba_ssm_cache_dtype, model_folder):
         nemotron_h.generate(text_prompts_with_completions, sampling_params)
 
 
+# NOTE: does not test what its name says. max_tokens=1 finishes the request at
+# prefill, so no decode step runs: CUDA-graph decode replay and overlap decode
+# never happen, and the asserts only check for non-empty output. Not in any test
+# list until it generates >= 8 tokens and compares eager vs CG vs CG+overlap.
 @skip_gpu_memory_less_than((2 * 30 + 1) * 2**30)
 def test_nemotron_h_cuda_graph_overlap_scheduler():
     """Real-weight Nano smoke: eager, CUDA-graph, and CG+overlap all generate.

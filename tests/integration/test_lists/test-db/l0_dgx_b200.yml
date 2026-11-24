@@ -245,7 +245,7 @@ l0_dgx_b200:
   # ------------- MoE communication unit tests (multi-GPU) ---------------
   - unittest/_torch/moe/multi_gpu/test_nvlink_one_sided.py TIMEOUT (30)
   # ------------- VisualGen multi-GPU tests ---------------
-  - unittest/_torch/visual_gen/multi_gpu/test_attn2d_attention.py -k "not test_missing_support_lse_raises and not test_missing_head_attrs_raises"
+  - unittest/_torch/visual_gen/multi_gpu/test_attn2d_attention.py
   - unittest/_torch/visual_gen/multi_gpu/test_cosmos3_transformer_parallel.py
   - unittest/_torch/visual_gen/multi_gpu/test_parallel_wino_vae.py
   - unittest/_torch/visual_gen/multi_gpu/test_flux2_transformer_parallel.py
