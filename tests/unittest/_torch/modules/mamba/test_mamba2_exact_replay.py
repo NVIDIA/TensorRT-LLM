@@ -26,10 +26,14 @@ from tensorrt_llm._torch.modules.mamba.mamba2_mixer import Mamba2Mixer
 from tensorrt_llm._torch.modules.mamba.replay_metadata import ReplayMamba2Metadata
 from tensorrt_llm._torch.modules.mamba.selective_state_update import selective_state_update
 from tensorrt_llm._torch.modules.mamba.ssd_combined import mamba_chunk_scan_combined
+from tensorrt_llm._torch.pyexecutor._util import _create_kv_cache_manager
+from tensorrt_llm._torch.pyexecutor.config_utils import extract_mamba_kv_cache_params
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import CppMambaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import MambaStateLayout
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, KvCacheConfig, MambaStateConfig
 from tensorrt_llm.mapping import Mapping
 
@@ -394,6 +398,44 @@ def test_a_step_makes_no_synchronizing_call():
         torch.cuda.set_sync_debug_mode("default")
 
 
+class _RecordingBuffer:
+    """Stands in for a static device buffer and keeps the host tensors copied into it."""
+
+    def __init__(self, tensor):
+        self.tensor = tensor
+        self.sources = []
+
+    def __getitem__(self, index):
+        target = self.tensor[index]
+
+        def copy_(source, non_blocking=False):
+            self.sources.append(source)
+            return target.copy_(source, non_blocking=non_blocking)
+
+        return SimpleNamespace(copy_=copy_)
+
+
+def test_every_prepare_stages_its_rows_in_host_memory_of_its_own():
+    """The copies do not block, and under pipeline parallelism the next
+    micro-batch is prepared before they have to run."""
+    metadata = _metadata(4)
+    names = ("replay_pos", "replay_has_boundary", "replay_conv_has_initial")
+    buffers = {name: _RecordingBuffer(getattr(metadata, name)) for name in names}
+    for name, buffer in buffers.items():
+        setattr(metadata, name, buffer)
+    prepare_exact_replay_rows(metadata, [0, CHUNK + 2, 5], 3, 1, CHUNK)
+    first = {name: buffer.sources[0].clone() for name, buffer in buffers.items()}
+    prepare_exact_replay_rows(metadata, [CHUNK, 0, 2 * CHUNK + 7], 3, 0, CHUNK)
+    torch.cuda.synchronize()
+    for name, buffer in buffers.items():
+        staged, restaged = buffer.sources
+        assert not torch.equal(staged, restaged)
+        # The second call left what the first one staged as it was.
+        assert torch.equal(staged, first[name])
+        assert staged.is_pinned() == prefer_pinned()
+        assert buffer.tensor[:3].tolist() == restaged.tolist()
+
+
 def test_decode_groups_match_isolated_rows():
     """A decode batch is scanned in groups; every row keeps the bits it has alone."""
     torch.manual_seed(13)
@@ -424,7 +466,7 @@ def test_a_request_that_starts_in_generation_decodes_like_a_one_token_prefill():
     prefilled = base.clone()
     expected = [_run(layer, prefilled, projected[:1], [1], 1, [1], [False])]
     # The slot's previous owner left a boundary state and a convolution state;
-    # the manager clears the replay buffers of a request that starts in generation.
+    # the manager clears the replay buffers of a request that has run no token.
     decoded = base.clone()
     decoded.temporal.fill_(float("nan"))
     decoded.conv.fill_(float("nan"))
@@ -719,6 +761,98 @@ def test_the_component_switch_selects_exact_replay_alone(monkeypatch):
         manager.shutdown()
 
 
+@pytest.mark.parametrize("value, warned", [("1", True), ("0", False), (None, False)])
+def test_the_flashinfer_ssd_switch_is_reported_as_unused(monkeypatch, value, warned):
+    """Decode replays the Triton SSD arithmetic, so prefill cannot take the FlashInfer scan."""
+    if value is None:
+        monkeypatch.delenv("TRTLLM_USE_MAMBA_FI_SSD", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_USE_MAMBA_FI_SSD", value)
+    logged = {"info": [], "warning": []}
+    logger = mamba2_cache_manager.logger
+    monkeypatch.setattr(logger, "info_once", lambda *msg, key: logged["info"].append(msg[0]))
+    monkeypatch.setattr(logger, "warning_once", lambda *msg, key: logged["warning"].append(msg[0]))
+    manager = _build_manager(monkeypatch)
+    try:
+        assert isinstance(manager._speculative_state, Mamba2ExactReplayState)
+        assert any(
+            "TRTLLM_USE_MAMBA_FI_SSD" in message and "TRTLLM_MAMBA_TOKEN_MAJOR_CONV" in message
+            for message in logged["info"]
+        )
+        assert (
+            any("TRTLLM_USE_MAMBA_FI_SSD=1" in message for message in logged["warning"]) == warned
+        )
+    finally:
+        manager.shutdown()
+
+
+def _nemotron_config():
+    """The fields of a Nemotron-H config that the cache geometry is read from."""
+    return SimpleNamespace(
+        hybrid_override_pattern="M*",
+        ssm_state_size=DSTATE,
+        conv_kernel=4,
+        mamba_num_heads=HEADS,
+        n_groups=GROUPS,
+        mamba_head_dim=HEAD_DIM,
+        chunk_size=CHUNK,
+        torch_dtype=torch.bfloat16,
+        hidden_size=256,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        num_hidden_layers=2,
+        vocab_size=4096,
+    )
+
+
+def test_the_cache_parameters_carry_the_chunk_size_of_the_config():
+    config = _nemotron_config()
+    assert extract_mamba_kv_cache_params(config).mamba_chunk_size == CHUNK
+    # Without it the manager keeps the default kernels and logs the reason.
+    del config.chunk_size
+    assert extract_mamba_kv_cache_params(config).mamba_chunk_size is None
+
+
+def test_the_factory_passes_the_chunk_size_to_the_nemotron_manager_only(monkeypatch):
+    """`_create_kv_cache_manager` is the one place that hands a model's chunk size to its manager."""
+    captured = {}
+
+    class RecordingNemotronManager(NemotronHybridCacheManager):
+        def __init__(self, *args, **kwargs):
+            captured["nemotron"] = kwargs
+
+    class RecordingCppManager(CppMambaHybridCacheManager):
+        def __init__(self, *args, **kwargs):
+            captured["cpp"] = kwargs
+
+    monkeypatch.setenv("FORCE_DETERMINISTIC", "1")
+    warnings = []
+    monkeypatch.setattr(
+        mamba2_cache_manager.logger, "warning_once", lambda *msg, key: warnings.append(msg[0])
+    )
+    for manager_cls in (RecordingNemotronManager, RecordingCppManager):
+        _create_kv_cache_manager(
+            model_engine=None,
+            kv_cache_manager_cls=manager_cls,
+            mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+            kv_cache_config=KvCacheConfig(max_tokens=4096),
+            tokens_per_block=32,
+            max_seq_len=512,
+            max_batch_size=4,
+            spec_config=None,
+            sparse_attention_config=None,
+            max_num_tokens=8192,
+            max_beam_width=1,
+            kv_connector_manager=None,
+            model_config=SimpleNamespace(pretrained_config=_nemotron_config(), quant_config=None),
+            dtype=torch.bfloat16,
+        )
+    assert captured["nemotron"]["mamba_chunk_size"] == CHUNK
+    # A manager without exact replay does not take the argument; the reason is logged.
+    assert "mamba_chunk_size" not in captured["cpp"]
+    assert any("not the Python V2 hybrid cache manager" in message for message in warnings)
+
+
 @pytest.mark.parametrize(
     "override, sm, reason",
     [
@@ -853,6 +987,54 @@ def test_decode_through_the_manager_matches_a_single_shot_prefill(monkeypatch):
             _slot_state(manager, request, prompt + steps),
             _slot_state(manager, reference, prompt + steps),
         )
+    finally:
+        manager.shutdown()
+
+
+def test_a_promoted_one_token_prompt_starts_from_a_cleared_slot(monkeypatch):
+    """The manager prepares a one-token prompt as a context request; the runner
+    then runs it as a decode row, so no prefill clears what its slot held."""
+    torch.manual_seed(37)
+    manager = _build_manager(monkeypatch)
+    layer = _make_layer()
+    metadata = manager.mamba_metadata_cls(max_batch_size=4, chunk_size=CHUNK)
+    steps = 3
+    inputs = _randn(steps, WIDTH)
+    try:
+        reference = _request(1, list(range(1, steps + 1)))
+        assert manager.prepare_context(reference)
+        expected = _context_chunk(manager, layer, metadata, reference, inputs)
+        expected_state = _slot_state(manager, reference, steps)
+
+        request = _request(2, [1000])
+        assert manager.prepare_context(request)
+        assert request.context_current_position == 0
+        assert manager.resize_context(request, num_tokens=1)
+        # What an earlier owner can leave in a slot, here in every slot.
+        cache = manager.mamba_layer_cache(0)
+        for name in ("conv", "temporal", "replay_x", "replay_dt", "replay_B"):
+            getattr(cache, name).fill_(float("nan"))
+        batch = ScheduledRequests()
+        batch.append_context_request(request)
+        manager.prepare_resources(batch)
+        outputs = []
+        output = torch.empty(1, D_INNER, device="cuda", dtype=torch.bfloat16)
+        for step in range(steps):
+            if step == 1:
+                # The prompt is done; the request goes on as a generation request.
+                request.context_current_position = 1
+                manager.update_context_resources(batch)
+                manager._setup_state_indices([request], num_contexts=0)
+            # A decode row on every step; the first one has no cached tokens.
+            attn = _manager_attn(manager, [request], [1], 0, [step])
+            if step < 2:
+                metadata.prepare(attn)
+            else:
+                metadata.prepare_steady_gen_step(attn)
+            layer.forward_core(inputs[step : step + 1], attn, metadata, None, output)
+            outputs.append(output.clone())
+        torch.testing.assert_close(torch.cat(outputs), expected, rtol=0, atol=0)
+        _assert_same_state(_slot_state(manager, request, steps), expected_state)
     finally:
         manager.shutdown()
 

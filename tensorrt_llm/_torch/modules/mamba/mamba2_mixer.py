@@ -515,6 +515,9 @@ class Mamba2Mixer(nn.Module):
             # Mamba2 kernels): prefill and decode share the chunked-scan
             # arithmetic from each slot's last chunk boundary. The manager
             # binds it only for a bfloat16 model without speculative decoding.
+            # It runs the Triton SSD kernels and the token-major convolution
+            # kernel: TRTLLM_USE_MAMBA_FI_SSD and
+            # TRTLLM_MAMBA_TOKEN_MAJOR_CONV do not apply to it.
             assert spec_metadata is None and zxbcdt.dtype == torch.bfloat16
             exact_replay_forward_core(self, zxbcdt, attn_metadata,
                                       mamba_metadata, layer_cache,

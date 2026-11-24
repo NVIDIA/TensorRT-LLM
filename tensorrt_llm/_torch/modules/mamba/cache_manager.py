@@ -610,10 +610,10 @@ class Mamba2ExactReplayState:
         pin_ssd_autotune_configs()
 
     def reset_replay_slots(self, slots: torch.Tensor) -> None:
-        """Clear the buffers of requests that start in generation.
+        """Clear the buffers of requests that have run no token.
 
-        No prefill has cleared them, and a newly acquired slot holds arbitrary
-        bytes that a decode scan would read.
+        A newly acquired slot holds arbitrary bytes, and a request whose first
+        token runs as a decode row scans them without a prefill clearing them.
         """
         for views in self._pool_layers or ():
             for role in _EXACT_REPLAY_ROLES.values():
@@ -798,7 +798,8 @@ class NemotronHybridCacheManager(MambaHybridCacheManagerV2):
         self._replay_region = None
         self._mamba_chunk_size = kwargs.pop("mamba_chunk_size", None)
         self._exact_replay_is_disagg = bool(kwargs.get("is_disagg", False))
-        # Requests whose exact-replay buffers a prefill or a reset has cleared.
+        # Requests this manager has prepared before: their exact-replay buffers
+        # were cleared then, or hold their own tokens.
         self._exact_replay_requests: set[int] = set()
         kwargs.setdefault("conv_state_layout", "x_b_c")
         super().__init__(*args, **kwargs)
@@ -817,10 +818,17 @@ class NemotronHybridCacheManager(MambaHybridCacheManagerV2):
         if reason is None:
             logger.info_once(
                 "Deterministic Mamba2: decode replays the chunked-scan arithmetic from each "
-                "slot's last chunk boundary. Every row uses the token-major convolution "
-                "kernel, whatever TRTLLM_MAMBA_TOKEN_MAJOR_CONV selects.",
+                "slot's last chunk boundary. Prefill and decode run the Triton SSD kernels and "
+                "the token-major convolution kernel, whatever TRTLLM_USE_MAMBA_FI_SSD and "
+                "TRTLLM_MAMBA_TOKEN_MAJOR_CONV select.",
                 key="mamba2_exact_replay",
             )
+            if os.environ.get("TRTLLM_USE_MAMBA_FI_SSD", "0") == "1":
+                logger.warning_once(
+                    "TRTLLM_USE_MAMBA_FI_SSD=1 has no effect on the deterministic Mamba2 "
+                    "kernels: prefill runs the Triton SSD scan that decode replays.",
+                    key="mamba2_exact_replay_fi_ssd",
+                )
             return Mamba2ExactReplayState(self._mamba_chunk_size)
         logger.warning_once(
             f"Deterministic Mamba2 keeps the default prefill and decode kernels because {reason}",
@@ -988,13 +996,19 @@ class NemotronHybridCacheManager(MambaHybridCacheManagerV2):
             )
         state = self._speculative_state
         if isinstance(state, Mamba2ExactReplayState) and self.local_num_mamba_layers:
-            # A request that starts in generation (CUDA-graph padding, warmup,
-            # a one-token prompt promoted to a decode row) never runs a prefill
-            # that clears its buffers.
+            # A decode row scans its whole buffer row, so a request that has
+            # run no token must start from cleared buffers, and only a prefill
+            # clears them itself. A request that starts in generation
+            # (CUDA-graph padding, warmup) never runs one. Neither does a
+            # one-token prompt the runner turns into a decode row: that happens
+            # after this call, so it is still a context request here. A context
+            # request that resumes (a later chunk, a reused prefix) is past
+            # position 0 and keeps its buffers.
             fresh = [
                 self._request_id_to_state_index[req.py_request_id]
-                for req in requests[num_contexts:]
+                for row, req in enumerate(requests)
                 if req.py_request_id not in self._exact_replay_requests
+                and (row >= num_contexts or req.context_current_position == 0)
             ]
             if fresh:
                 state.reset_replay_slots(

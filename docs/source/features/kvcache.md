@@ -347,8 +347,10 @@ layer in the model dtype (2.3 MiB per layer for Nemotron-H 8B, next to 4 MiB of
 FP32 state), and the pool is sized for it. A decode step scans its row's partial
 chunk instead of updating one token, which is slower per Mamba2 layer (for the
 Nemotron-H 8B geometry on GB200: 0.23 ms to 0.73 ms at batch 32 and 0.26 ms to
-2.89 ms at batch 128). Every row uses the token-major convolution kernel,
-whatever `TRTLLM_MAMBA_TOKEN_MAJOR_CONV` selects.
+2.89 ms at batch 128). Prefill and decode run the Triton SSD kernels and the
+token-major convolution kernel: `TRTLLM_USE_MAMBA_FI_SSD` and
+`TRTLLM_MAMBA_TOKEN_MAJOR_CONV` have no effect, and
+`TRTLLM_USE_MAMBA_FI_SSD=1` logs a warning.
 
 ### KV Cache Salting for Secure Reuse
 

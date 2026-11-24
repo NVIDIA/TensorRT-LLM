@@ -274,17 +274,12 @@ class ReplayMamba2Metadata(Mamba2Metadata):
         self.replay_n_writes = torch.zeros(1, dtype=torch.int32, device="cuda")
         # Exact replay (deterministic Mamba2 kernels, see exact_replay.py): each
         # row's position in its chunk, whether it has a boundary state and a
-        # convolution state, the host staging of the three, the context rows'
-        # host copies, and the offsets of one-token sequences.
+        # convolution state, the context rows' host copies, and the offsets of
+        # one-token sequences. A full prepare() stages the three device buffers
+        # in host memory of its own.
         self.replay_pos = torch.zeros(max_batch_size, dtype=torch.long, device="cuda")
         self.replay_has_boundary = torch.zeros(max_batch_size, dtype=torch.bool, device="cuda")
         self.replay_conv_has_initial = torch.ones(max_batch_size, dtype=torch.bool, device="cuda")
-        self.replay_pos_host = torch.zeros(
-            max_batch_size, dtype=torch.long, pin_memory=prefer_pinned()
-        )
-        self.replay_flags_host = torch.zeros(
-            2, max_batch_size, dtype=torch.bool, pin_memory=prefer_pinned()
-        )
         self.replay_prefill_n_pre: list[int] = []
         self.replay_prefill_has_boundary: list[bool] = []
         self.replay_arange = torch.arange(max_batch_size + 1, dtype=torch.int32, device="cuda")

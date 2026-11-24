@@ -22,6 +22,10 @@ consumed when the current token completes it.
 
 A row's position in its chunk follows from the tokens its request has already
 run (``num_cached_tokens_per_seq``), so no per-slot counter is kept.
+
+Prefill runs the Triton SSD kernels that decode replays, and every row the
+token-major convolution kernel, so ``TRTLLM_USE_MAMBA_FI_SSD`` and
+``TRTLLM_MAMBA_TOKEN_MAJOR_CONV`` have no effect here.
 """
 
 from __future__ import annotations
@@ -32,6 +36,8 @@ from typing import TYPE_CHECKING
 
 import torch
 from einops import rearrange
+
+from tensorrt_llm._utils import prefer_pinned
 
 from .causal_conv1d import causal_conv1d_fn
 from .ssd_bmm import _bmm_chunk_fwd, _bmm_chunk_fwd_kernel
@@ -178,7 +184,10 @@ def prepare_exact_replay_rows(
     boundary state exists) and ``metadata.replay_conv_has_initial`` (a
     convolution state exists) with one host-to-device copy each, and the host
     lists ``replay_prefill_n_pre`` and ``replay_prefill_has_boundary`` of the
-    context rows.
+    context rows. The copies do not block and read host memory allocated for
+    this call: under pipeline parallelism the next micro-batch is prepared
+    without waiting for them, so staging shared between calls could be
+    rewritten before they run.
 
     Args:
         metadata: The step's Mamba2 metadata (``ReplayMamba2Metadata``).
@@ -192,8 +201,9 @@ def prepare_exact_replay_rows(
         cached = num_cached_tokens[:batch_size].to(dtype=torch.int64, device="cpu")
     else:
         cached = torch.tensor(list(num_cached_tokens[:batch_size]), dtype=torch.int64)
-    pos_host = metadata.replay_pos_host[:batch_size]
-    flags_host = metadata.replay_flags_host[:, :batch_size]
+    pinned = prefer_pinned()
+    pos_host = torch.empty(batch_size, dtype=torch.int64, pin_memory=pinned)
+    flags_host = torch.empty(2, batch_size, dtype=torch.bool, pin_memory=pinned)
     torch.remainder(cached, chunk_size, out=pos_host)
     torch.ge(cached, chunk_size, out=flags_host[0])
     torch.gt(cached, 0, out=flags_host[1])

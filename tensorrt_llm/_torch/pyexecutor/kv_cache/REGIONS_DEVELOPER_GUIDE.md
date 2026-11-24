@@ -91,7 +91,7 @@ Mamba2 exact replay (`Mamba2ExactReplayState`, the deterministic Mamba2 kernels 
 `modules/mamba/exact_replay.py`) is the shared-slot case without a provider: it is not a
 speculative-decoding state, so `NemotronHybridCacheManager` adds its partial-chunk buffers to the
 recurrent `SsmLayerConfig` itself (`_get_recurrent_buffer_configs`), binds their views in
-`_setup_model_state` and clears the buffers of a request that starts in generation in
+`_setup_model_state` and clears the buffers of a request that has run no token in
 `_setup_state_indices`. A snapshot, a suspension or a slot move carries them with the boundary
 state. The state keeps no bookkeeping of its own: `ReplayMamba2Metadata` derives each row's position
 in its chunk from the tokens its request has run (`num_cached_tokens_per_seq`) and moves the rows on
