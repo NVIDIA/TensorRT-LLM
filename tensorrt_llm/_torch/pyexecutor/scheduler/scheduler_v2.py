@@ -1041,11 +1041,9 @@ class KVCacheV2Scheduler(RequestScheduler):
             pending_ctx, starved_ctx = (
                 sorted(
                     reqs,
-                    key=lambda r: (
-                        not (
-                            r.state_value == self._context_init_state_value
-                            and self._pregrown_context_tokens(r) > 0
-                        )
+                    key=lambda r: not (
+                        r.state_value == self._context_init_state_value
+                        and self._pregrown_context_tokens(r) > 0
                     ),
                 )
                 for reqs in (pending_ctx, starved_ctx)

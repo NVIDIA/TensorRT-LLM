@@ -945,37 +945,35 @@ def _construct_worker_config(
     return worker_config
 
 
-def test_old_binding_disables_recovery_before_mpi_qualification(monkeypatch) -> None:
-    from tensorrt_llm._torch.disaggregation import transceiver as module
-    from tensorrt_llm._torch.disaggregation.native import transfer
+def _patch_multi_rank_recovery(monkeypatch, *, handle_retirement: bool, qualify: Mock) -> None:
+    """Make a two-rank MPI executor whose recovery qualification ``qualify`` decides."""
+    monkeypatch.setattr(
+        transfer_mod.NixlTransferAgent, "supports_handle_retirement", handle_retirement
+    )
+    monkeypatch.setattr(transceiver_mod, "ENABLE_MULTI_DEVICE", True)
+    monkeypatch.setattr(transceiver_mod, "mpi_disabled", lambda: False)
+    monkeypatch.setattr(transceiver_mod, "_retirement_executor_comm", qualify)
 
-    monkeypatch.setattr(transfer.NixlTransferAgent, "supports_handle_retirement", False)
-    monkeypatch.setattr(module, "ENABLE_MULTI_DEVICE", True)
-    monkeypatch.setattr(module, "mpi_disabled", lambda: False)
+
+def test_old_binding_disables_recovery_before_mpi_qualification(monkeypatch) -> None:
     qualify = Mock(side_effect=ValueError("MPI_THREAD_MULTIPLE is required"))
-    monkeypatch.setattr(module, "_retirement_executor_comm", qualify)
+    _patch_multi_rank_recovery(monkeypatch, handle_retirement=False, qualify=qualify)
     config = _construct_worker_config(monkeypatch, _make_cache_config(), world_size=2)
     qualify.assert_not_called()
     assert config.recovery_fatal_callback is None
-    assert not transfer.agent_recovery_supported(False, False, 0)
+    assert not transfer_mod.agent_recovery_supported(False, False, 0)
 
 
 @pytest.mark.parametrize("unqualified_rank", [None, 0, 1])
 def test_recovery_falls_back_when_rank_lacks_executor_mpi(monkeypatch, unqualified_rank) -> None:
-    from tensorrt_llm._torch.disaggregation import transceiver as module
-    from tensorrt_llm._torch.disaggregation.native import transfer
-
-    monkeypatch.setattr(transfer.NixlTransferAgent, "supports_handle_retirement", True)
-    monkeypatch.setattr(transfer, "use_pure_python_transfer_agent", lambda: False)
-    monkeypatch.setattr(module, "ENABLE_MULTI_DEVICE", True)
-    monkeypatch.setattr(module, "mpi_disabled", lambda: False)
+    monkeypatch.setattr(transfer_mod, "use_pure_python_transfer_agent", lambda: False)
     communicator = Mock()
     error = "MPI world differs from executor Mapping"
     qualify = Mock(
         return_value=communicator,
         side_effect=ValueError(error) if unqualified_rank == 0 else None,
     )
-    monkeypatch.setattr(module, "_retirement_executor_comm", qualify)
+    _patch_multi_rank_recovery(monkeypatch, handle_retirement=True, qualify=qualify)
 
     def allgather(vote):
         return [vote, (True, error) if len(vote) == 2 and unqualified_rank == 1 else vote]

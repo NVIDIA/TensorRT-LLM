@@ -2060,8 +2060,8 @@ class TestKVCacheFailuresCtxChunked:
         managers = (mgr, draft_mgr, cross_mgr)
         for manager in managers:
             manager.kv_cache_map[0] = Mock(is_active=False)
-            manager.free_resources.side_effect = lambda req, manager=manager: (
-                manager.kv_cache_map.pop(req.py_request_id)
+            manager.free_resources.side_effect = (
+                lambda req, manager=manager: manager.kv_cache_map.pop(req.py_request_id)
             )
         sched = make_scheduler(
             mgr,
@@ -3545,8 +3545,8 @@ class TestCrossKVAllocationFailures:
         failed_cache = Mock(capacity=0)
         failed_cache.resize.return_value = failure != "resize"
         cross_mgr.kv_cache_map[0] = failed_cache
-        cross_mgr._resume_and_restore.side_effect = lambda req_id, cache: (
-            not (failure == "resume" and cache is failed_cache)
+        cross_mgr._resume_and_restore.side_effect = lambda req_id, cache: not (
+            failure == "resume" and cache is failed_cache
         )
 
         def prepare_context(req: Mock, reuse_limit: int | None = None) -> bool:
@@ -3555,8 +3555,8 @@ class TestCrossKVAllocationFailures:
 
         self_mgr.prepare_context.side_effect = prepare_context
         for manager in (self_mgr, cross_mgr):
-            manager.free_resources.side_effect = lambda req, manager=manager: (
-                manager.kv_cache_map.pop(req.py_request_id)
+            manager.free_resources.side_effect = (
+                lambda req, manager=manager: manager.kv_cache_map.pop(req.py_request_id)
             )
         sched = make_encoder_scheduler(
             self_mgr,

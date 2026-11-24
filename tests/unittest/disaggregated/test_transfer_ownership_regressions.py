@@ -177,6 +177,14 @@ def _make_rx_session(receiver: object, rid: int) -> RxSession:
     )
 
 
+def _make_bounce_receiver_probe() -> _ReceiverProbe:
+    receiver = _ReceiverProbe()
+    receiver._enforce_physical_ownership = False
+    receiver._agent = SimpleNamespace(bounce_enabled=True)
+    receiver._registrar = Mock()
+    return receiver
+
+
 def _make_owned_receiver() -> Receiver:
     receiver = object.__new__(Receiver)
     receiver._enforce_physical_ownership = True
@@ -1297,6 +1305,17 @@ def _make_owned_sender() -> transfer_mod.Sender:
     return sender
 
 
+def _make_legacy_sender(*, instance_rank: int = 0) -> transfer_mod.Sender:
+    """A non-owned CTX sender that resolves peer rank ``r`` to endpoint ``str(r)``."""
+    sender = _make_owned_sender()
+    sender._enforce_physical_ownership = False
+    sender._instance_rank = instance_rank
+    sender._registrar = SimpleNamespace(
+        get_peer_rank_info=lambda _name, rank: SimpleNamespace(self_endpoint=str(rank))
+    )
+    return sender
+
+
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("diagnostics_enabled", [False, True])
 @pytest.mark.parametrize("perf_enabled", [False, True])
@@ -1611,12 +1630,7 @@ def test_legacy_cancel_ack_outlives_parked_adp_routes_and_stays_rank_local(faile
     other.receive(_sole_piece())
     _publish_report_tokens(other, ranks=(0, 1))
 
-    sender = _make_owned_sender()
-    sender._enforce_physical_ownership = False
-    sender._instance_rank = 1
-    sender._registrar = SimpleNamespace(
-        get_peer_rank_info=lambda _name, rank: SimpleNamespace(self_endpoint=str(rank))
-    )
+    sender = _make_legacy_sender(instance_rank=1)
     sender._peer_requests[rid] = {
         rank: SimpleNamespace(context_first=False, instance_rank=rank) for rank in (0, 1)
     }
@@ -1657,11 +1671,7 @@ def test_legacy_cancel_ack_outlives_parked_adp_routes_and_stays_rank_local(faile
 @pytest.mark.parametrize("aux", [False, True])
 def test_legacy_routed_cancel_drains_admitted_writes_and_fences_late_writes(aux) -> None:
     rid = 107
-    sender = _make_owned_sender()
-    sender._enforce_physical_ownership = False
-    sender._registrar = SimpleNamespace(
-        get_peer_rank_info=lambda _name, rank: SimpleNamespace(self_endpoint=str(rank))
-    )
+    sender = _make_legacy_sender()
     dealer = Mock()
     sender._get_or_connect_thread_dealer = Mock(return_value=dealer)
     params = DisaggregatedParams(disagg_request_id=rid)
@@ -1733,10 +1743,7 @@ def test_routed_cancel_preserves_fence_during_ack_registration(retired) -> None:
 @pytest.mark.cpu_only
 def test_bounce_adp_success_closes_after_the_selected_group_finishes():
     rid = 119
-    receiver = _ReceiverProbe()
-    receiver._enforce_physical_ownership = False
-    receiver._agent = SimpleNamespace(bounce_enabled=True)
-    receiver._registrar = Mock()
+    receiver = _make_bounce_receiver_probe()
     session = RxSession(
         request_id=rid,
         params=DisaggregatedParams(
@@ -1763,20 +1770,12 @@ def test_bounce_adp_success_closes_after_the_selected_group_finishes():
 @pytest.mark.parametrize("evict_route", [False, True])
 def test_bounce_cancel_settles_parked_write_with_original_token(evict_route):
     rid = 121
-    receiver = _ReceiverProbe()
-    receiver._enforce_physical_ownership = False
-    receiver._agent = SimpleNamespace(bounce_enabled=True)
-    receiver._registrar = Mock()
+    receiver = _make_bounce_receiver_probe()
     session = _make_rx_session(receiver, rid)
     session.receive(_sole_piece())
     _publish_report_tokens(session, ranks=(0, 1) if evict_route else (1,))
     receiver._get_session = lambda _: session
-    sender = _make_owned_sender()
-    sender._enforce_physical_ownership = False
-    sender._instance_rank = 1
-    sender._registrar = SimpleNamespace(
-        get_peer_rank_info=lambda _name, rank: SimpleNamespace(self_endpoint=str(rank))
-    )
+    sender = _make_legacy_sender(instance_rank=1)
     info = transfer_mod.RecvReqInfo(
         rid,
         "gen",
@@ -1819,11 +1818,7 @@ def test_bounce_cancel_settles_parked_write_with_original_token(evict_route):
 
 @pytest.mark.cpu_only
 def test_unclaimed_routed_cancel_reclaims_extra_state_but_keeps_the_fence(monkeypatch):
-    sender = _make_owned_sender()
-    sender._enforce_physical_ownership = False
-    sender._registrar = SimpleNamespace(
-        get_peer_rank_info=lambda _name, rank: SimpleNamespace(self_endpoint=str(rank))
-    )
+    sender = _make_legacy_sender()
     sender._get_or_connect_thread_dealer = Mock(return_value=Mock())
     now = time.monotonic()
     monkeypatch.setattr(transfer_mod.time, "monotonic", lambda: now)
@@ -1851,6 +1846,69 @@ def _make_bounce_ctx_sender() -> transfer_mod.Sender:
     return sender
 
 
+def _make_bounce_ctx(
+    rid: int, *, aux: bool = False, ranks: tuple[int, ...] = (0,)
+) -> tuple[transfer_mod.Sender, transfer_mod.TxSession]:
+    """A bounce CTX sender holding ``rid``'s publications, and ``rid``'s TxSession.
+
+    ``aux`` publishes an auxiliary slot and makes the request generation-first.
+    """
+    sender = _make_bounce_ctx_sender()
+    for rank in ranks:
+        sender._add_req_info(rid, rank, _bounce_publication(rid, rank=rank, aux=aux))
+    params = DisaggregatedParams(disagg_request_id=rid)
+    if aux:
+        params.schedule_style = DisaggScheduleStyle.GENERATION_FIRST
+    return sender, transfer_mod.TxSession(rid, params, sender)
+
+
+def _capture_bounce_results(sender: transfer_mod.Sender, monkeypatch) -> Mock:
+    """Send every CTX result through one dealer and build opaque agent requests."""
+    dealer = Mock()
+    sender._get_result_dealer = Mock(return_value=dealer)
+    monkeypatch.setattr(transfer_mod.Sender, "_make_agent_request", lambda *_a, **_k: object())
+    return dealer
+
+
+def _bounce_kv_write_meta(ctx, rid, peer, *, is_last=True, expected_transfers=2):
+    return SimpleNamespace(
+        src_ptrs=np.zeros(1),
+        dst_ptrs=np.zeros(1),
+        sizes=np.ones(1, dtype=np.int64),
+        task=ctx.kv_tasks[0],
+        unique_rid=rid,
+        slice_id=0,
+        receiver_slice_id=0,
+        peer_rank=peer,
+        peer_endpoint=str(peer),
+        is_last_slice=is_last,
+        kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
+        requires_destination_drain=True,
+        agent_generation=0,
+        expected_transfers=expected_transfers,
+    )
+
+
+def _bounce_aux_write_meta(aux_task, rid):
+    return SimpleNamespace(
+        task=aux_task,
+        unique_rid=rid,
+        peer_rank=0,
+        peer_endpoint="0",
+        src_ptrs=np.zeros(1),
+        agent_generation=0,
+        expected_transfers=1,
+        meta_type=transfer_mod.WriteMetaType.AUX,
+    )
+
+
+def _closes_reusably(session: RxSession, rid: int) -> bool:
+    """Whether ``session.close()`` lets the caller release its slot."""
+    slot = _OneSlotAllocator(rid)
+    slot.apply_reuse_decision(session.close())
+    return slot.is_reusable
+
+
 def _bounce_publication(rid: int, *, rank: int = 0, aux: bool = False) -> transfer_mod.RecvReqInfo:
     return transfer_mod.RecvReqInfo(
         sender_req_id=rid,
@@ -1866,10 +1924,7 @@ def _bounce_publication(rid: int, *, rank: int = 0, aux: bool = False) -> transf
 
 
 def _make_one_writer_bounce_rx(rid: int, *, aux: bool) -> tuple[_ReceiverProbe, RxSession]:
-    receiver = _ReceiverProbe()
-    receiver._enforce_physical_ownership = False
-    receiver._agent = SimpleNamespace(bounce_enabled=True)
-    receiver._registrar = Mock()
+    receiver = _make_bounce_receiver_probe()
     schedule_style = (
         DisaggScheduleStyle.GENERATION_FIRST if aux else DisaggScheduleStyle.CONTEXT_FIRST
     )
@@ -1913,14 +1968,10 @@ def _kv_result_code(message: list[bytes]) -> AgentResult:
 @pytest.mark.parametrize("is_last_slice", [False, True])
 def test_routed_bounce_cancel_during_a_write_reports_after_that_write(monkeypatch, is_last_slice):
     rid = 136
-    sender = _make_bounce_ctx_sender()
-    sender._add_req_info(rid, 0, _bounce_publication(rid))
-    ctx = transfer_mod.TxSession(rid, DisaggregatedParams(disagg_request_id=rid), sender)
+    sender, ctx = _make_bounce_ctx(rid)
     ctx.send(_sole_piece(is_last=is_last_slice))
     receiver, session = _make_one_writer_bounce_rx(rid, aux=False)
-    dealer = Mock()
-    sender._get_result_dealer = Mock(return_value=dealer)
-    monkeypatch.setattr(transfer_mod.Sender, "_make_agent_request", lambda *_a, **_k: object())
+    dealer = _capture_bounce_results(sender, monkeypatch)
 
     def admit_then_cancel(task, peer_rank, *_args, **_kwargs):
         with ctx.lock:
@@ -1933,35 +1984,17 @@ def test_routed_bounce_cancel_during_a_write_reports_after_that_write(monkeypatc
 
     sender._submit_transfer = admit_then_cancel
     sender._deliver_kv_to_agent(
-        SimpleNamespace(
-            src_ptrs=np.zeros(1),
-            dst_ptrs=np.zeros(1),
-            sizes=np.ones(1, dtype=np.int64),
-            task=ctx.kv_tasks[0],
-            unique_rid=rid,
-            slice_id=0,
-            receiver_slice_id=0,
-            peer_rank=0,
-            peer_endpoint="0",
-            is_last_slice=is_last_slice,
-            kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
-            requires_destination_drain=True,
-            agent_generation=0,
-            expected_transfers=1,
-        )
+        _bounce_kv_write_meta(ctx, rid, 0, is_last=is_last_slice, expected_transfers=1)
     )
 
     sent = [call.args[0] for call in dealer.send.call_args_list]
     expected = [AgentResult.SUCCESS] + ([] if is_last_slice else [AgentResult.NOT_SUBMITTED])
     assert [_kv_result_code(message) for message in sent] == expected
     assert not ctx._kv_writing_peer_ranks
-    slot = _OneSlotAllocator(rid)
     for message in sent:
-        assert not slot.is_reusable
         Receiver._process_kv_agent_result(receiver, b"", message)
     _deliver_ctx_evidence(sender, receiver)
-    slot.apply_reuse_decision(session.close())
-    assert slot.is_reusable
+    assert _closes_reusably(session, rid)
 
 
 @pytest.mark.cpu_only
@@ -1983,9 +2016,7 @@ def test_context_first_bounce_request_after_retirement_reports_no_submission():
     assert _kv_result_code(message) is AgentResult.NOT_SUBMITTED
     Receiver._process_kv_agent_result(receiver, b"", message)
     assert session.has_failed()
-    slot = _OneSlotAllocator(rid)
-    slot.apply_reuse_decision(session.close())
-    assert slot.is_reusable
+    assert _closes_reusably(session, rid)
 
 
 @pytest.mark.cpu_only
@@ -2043,12 +2074,7 @@ def test_explicit_routed_cancel_keeps_a_candidate_fence(monkeypatch):
 @pytest.mark.parametrize("aux_started", [False, True])
 def test_routed_bounce_cancel_reports_queued_aux_after_kv_success(aux_started):
     rid = 134
-    sender = _make_bounce_ctx_sender()
-    sender._add_req_info(rid, 0, _bounce_publication(rid, aux=True))
-    params = DisaggregatedParams(
-        disagg_request_id=rid, schedule_style=DisaggScheduleStyle.GENERATION_FIRST
-    )
-    ctx = transfer_mod.TxSession(rid, params, sender)
+    sender, ctx = _make_bounce_ctx(rid, aux=True)
     ctx.send_aux()
     if aux_started:
         with ctx.lock:
@@ -2060,13 +2086,11 @@ def test_routed_bounce_cancel_reports_queued_aux_after_kv_success(aux_started):
     sender._handle_cancel_session([MessageType.CANCEL_SESSION, str(rid).encode(), b"gen", b"0"])
     delivered = _deliver_ctx_evidence(sender, receiver)
 
-    slot = _OneSlotAllocator(rid)
     if aux_started:
         # The started AUX write keeps the slot until its own result arrives, and
         # its peer's KV settlement waits for that write as well.
         assert delivered == [MessageType.SESSION_QUIESCED]
-        slot.apply_reuse_decision(session.close())
-        assert not slot.is_reusable
+        assert not _closes_reusably(session, rid)
         session.process_aux_agent_result(0, AgentResult.SUCCESS)
     else:
         assert delivered == [
@@ -2074,23 +2098,15 @@ def test_routed_bounce_cancel_reports_queued_aux_after_kv_success(aux_started):
             MessageType.KV_AGENT_RESULT,
             MessageType.SESSION_QUIESCED,
         ]
-    slot.apply_reuse_decision(session.close())
-    assert slot.is_reusable
+    assert _closes_reusably(session, rid)
 
 
 @pytest.mark.cpu_only
 def test_aux_worker_reports_failure_when_routed_cancel_wins_admission(monkeypatch):
     rid = 135
-    sender = _make_bounce_ctx_sender()
-    sender._add_req_info(rid, 0, _bounce_publication(rid, aux=True))
-    params = DisaggregatedParams(
-        disagg_request_id=rid, schedule_style=DisaggScheduleStyle.GENERATION_FIRST
-    )
-    ctx = transfer_mod.TxSession(rid, params, sender)
+    sender, ctx = _make_bounce_ctx(rid, aux=True)
     aux_task = ctx.send_aux()
-    dealer = Mock()
-    sender._get_result_dealer = Mock(return_value=dealer)
-    monkeypatch.setattr(transfer_mod.Sender, "_make_agent_request", lambda *_a, **_k: object())
+    dealer = _capture_bounce_results(sender, monkeypatch)
 
     def cancel_then_refuse(*_args, **_kwargs):
         # The started claim is already taken; cancellation must leave this peer to the worker.
@@ -2098,15 +2114,7 @@ def test_aux_worker_reports_failure_when_routed_cancel_wins_admission(monkeypatc
         raise transfer_mod._TransferNotSubmittedError("NIXL transfer session is closed or fenced")
 
     sender._submit_transfer = cancel_then_refuse
-    write_meta = SimpleNamespace(
-        task=aux_task,
-        unique_rid=rid,
-        peer_rank=0,
-        peer_endpoint="0",
-        src_ptrs=np.zeros(1),
-        agent_generation=0,
-    )
-    sender._deliver_aux_to_agent(write_meta)
+    sender._deliver_aux_to_agent(_bounce_aux_write_meta(aux_task, rid))
 
     dealer.send.assert_called_once_with(
         transfer_mod._make_aux_result_msg(0, rid, AgentResult.FAILED)
@@ -2252,21 +2260,14 @@ def test_mixed_bounce_rank_receives_proof_for_fenced_first_publication(
     other_writer_failed, sender_retired
 ):
     rid = 114
-    sender = _make_owned_sender()
-    sender._enforce_physical_ownership = False
-    sender._registrar = SimpleNamespace(
-        get_peer_rank_info=lambda _name, rank: SimpleNamespace(self_endpoint=str(rank))
-    )
+    sender = _make_legacy_sender()
     ctx = transfer_mod.TxSession(rid, DisaggregatedParams(disagg_request_id=rid), sender)
     sender._peer_requests[rid] = {0: SimpleNamespace(instance_rank=0)}
     sender._handle_cancel_session([MessageType.CANCEL_SESSION, b"114", b"gen", b"0"])
     if sender_retired:
         assert ctx.close()
 
-    receiver = _ReceiverProbe()
-    receiver._enforce_physical_ownership = False
-    receiver._agent = SimpleNamespace(bounce_enabled=True)
-    receiver._registrar = Mock()
+    receiver = _make_bounce_receiver_probe()
     session = _make_rx_session(receiver, rid)
     session.receive(_sole_piece())
     _publish_report_tokens(session, ranks=(0, 1))
@@ -2938,12 +2939,8 @@ def _two_writer_receive_failed_by_one(
     rank 4 has not reported yet. Returns the receiver, the receive, a
     transceiver polling it and the request it carries.
     """
-    receiver = object.__new__(Receiver)
+    receiver = _make_owned_receiver()
     receiver._enforce_physical_ownership = False
-    receiver._sessions_lock = threading.Lock()
-    receiver._sessions = {}
-    receiver._pre_cancelled_rids = {}
-    receiver._shutdown = False
     receiver._registrar = SimpleNamespace(
         self_rank_info=SimpleNamespace(instance_name="gen", instance_rank=0)
     )
@@ -4732,9 +4729,7 @@ def test_kv_result_with_bad_report_token_is_rejected(peer_rank: int, token: byte
 @pytest.mark.parametrize("ctx_cancels_first", [False, True])
 def test_bounce_cancel_settles_unsubmitted_destination_in_either_cancel_order(ctx_cancels_first):
     rid = 137
-    sender = _make_bounce_ctx_sender()
-    sender._add_req_info(rid, 0, _bounce_publication(rid))
-    ctx = transfer_mod.TxSession(rid, DisaggregatedParams(disagg_request_id=rid), sender)
+    sender, ctx = _make_bounce_ctx(rid)
     receiver, session = _make_one_writer_bounce_rx(rid, aux=False)
     routed = [MessageType.CANCEL_SESSION, str(rid).encode(), b"gen", b"0"]
 
@@ -4749,9 +4744,7 @@ def test_bounce_cancel_settles_unsubmitted_destination_in_either_cancel_order(ct
     delivered = _deliver_ctx_evidence(sender, receiver)
 
     assert delivered.count(MessageType.KV_AGENT_RESULT) == 1
-    slot = _OneSlotAllocator(rid)
-    slot.apply_reuse_decision(session.close())
-    assert slot.is_reusable
+    assert _closes_reusably(session, rid)
     # The settled destination admits no later write from this session.
     request = SimpleNamespace(op=transfer_mod.TransferOp.WRITE, remote_name="gen", dst_descs=())
     sender._agent = SimpleNamespace(check_remote_descs=lambda *_: True, bounce_enabled=True)
@@ -4765,9 +4758,7 @@ def test_bounce_cancel_settles_unsubmitted_destination_in_either_cancel_order(ct
 @pytest.mark.cpu_only
 def test_bounce_pieces_after_a_session_error_settle_once_and_admit_nothing():
     rid = 139
-    sender = _make_bounce_ctx_sender()
-    sender._add_req_info(rid, 0, _bounce_publication(rid))
-    ctx = transfer_mod.TxSession(rid, DisaggregatedParams(disagg_request_id=rid), sender)
+    sender, ctx = _make_bounce_ctx(rid)
     for _ in range(2):
         ctx.send(_sole_piece(is_last=False))
     ctx.set_exception("an unrelated peer failed")
@@ -4847,39 +4838,15 @@ def test_unchanged_failing_descriptor_rebuilds_the_agent_once(monkeypatch):
     assert recoveries == [0, 1]
 
 
-def _bounce_kv_write_meta(ctx, rid, peer, *, is_last=True):
-    return SimpleNamespace(
-        src_ptrs=np.zeros(1),
-        dst_ptrs=np.zeros(1),
-        sizes=np.ones(1, dtype=np.int64),
-        task=ctx.kv_tasks[0],
-        unique_rid=rid,
-        slice_id=0,
-        receiver_slice_id=0,
-        peer_rank=peer,
-        peer_endpoint=str(peer),
-        is_last_slice=is_last,
-        kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
-        requires_destination_drain=True,
-        agent_generation=0,
-        expected_transfers=2,
-    )
-
-
 @pytest.mark.cpu_only
 def test_retiring_a_failed_bounce_session_settles_a_peer_whose_write_is_still_queued(
     monkeypatch,
 ):
     rid = 301
-    sender = _make_bounce_ctx_sender()
-    for rank in (0, 1):
-        sender._add_req_info(rid, rank, _bounce_publication(rid, rank=rank))
-    ctx = transfer_mod.TxSession(rid, DisaggregatedParams(disagg_request_id=rid), sender)
+    sender, ctx = _make_bounce_ctx(rid, ranks=(0, 1))
     ctx.send(_sole_piece())
-    dealer = Mock()
     sender._agent = SimpleNamespace(name="ctx", bounce_enabled=True)
-    sender._get_result_dealer = Mock(return_value=dealer)
-    monkeypatch.setattr(transfer_mod.Sender, "_make_agent_request", lambda *_a, **_k: object())
+    dealer = _capture_bounce_results(sender, monkeypatch)
 
     def fail_write(task, peer_rank, *_args, **_kwargs):
         with ctx.lock:
@@ -4905,34 +4872,23 @@ def test_retiring_a_failed_bounce_session_settles_a_peer_whose_write_is_still_qu
     receiver, session = _make_one_writer_bounce_rx(rid, aux=False)
     _deliver_ctx_evidence(sender, receiver)
     Receiver._process_kv_agent_result(receiver, b"", dealer.send.call_args.args[0])
-    slot = _OneSlotAllocator(rid)
-    slot.apply_reuse_decision(session.close())
-    assert slot.is_reusable
+    assert _closes_reusably(session, rid)
 
 
 @pytest.mark.cpu_only
 def test_kv_no_submission_also_settles_the_peers_unstarted_aux(monkeypatch):
     rid = 401
-    sender = _make_bounce_ctx_sender()
+    sender, ctx = _make_bounce_ctx(rid, aux=True)
     sender._agent = SimpleNamespace(name="ctx", bounce_enabled=True)
-    sender._add_req_info(rid, 0, _bounce_publication(rid, aux=True))
-    params = DisaggregatedParams(
-        disagg_request_id=rid, schedule_style=DisaggScheduleStyle.GENERATION_FIRST
-    )
-    ctx = transfer_mod.TxSession(rid, params, sender)
     ctx.send(_sole_piece())
     aux_task = ctx.send_aux()
-    dealer = Mock()
-    sender._get_result_dealer = Mock(return_value=dealer)
-
-    monkeypatch.setattr(transfer_mod.Sender, "_make_agent_request", lambda *_a, **_k: object())
+    dealer = _capture_bounce_results(sender, monkeypatch)
 
     def refuse(*_args, **_kwargs):
         raise transfer_mod._TransferNotSubmittedError("rejected before backend submission")
 
     sender._submit_transfer = refuse
-    meta = _bounce_kv_write_meta(ctx, rid, 0)
-    meta.expected_transfers = 1
+    meta = _bounce_kv_write_meta(ctx, rid, 0, expected_transfers=1)
     sender._deliver_kv_to_agent(meta)
     kv_sent = [call.args[0] for call in dealer.send.call_args_list]
     assert [message[0] for message in kv_sent] == [
@@ -4944,24 +4900,12 @@ def test_kv_no_submission_also_settles_the_peers_unstarted_aux(monkeypatch):
     receiver, session = _make_one_writer_bounce_rx(rid, aux=True)
     Receiver._process_aux_agent_result(receiver, b"", kv_sent[0])
     Receiver._process_kv_agent_result(receiver, b"", kv_sent[1])
-    slot = _OneSlotAllocator(rid)
-    slot.apply_reuse_decision(session.close())
-    assert slot.is_reusable
+    assert _closes_reusably(session, rid)
     # The queued AUX write behind it was claimed and never reaches the backend.
     submitted = []
     sender._submit_transfer = lambda _task, peer, *_a, **_k: submitted.append(peer) or (True, None)
     dealer.reset_mock()
-    sender._deliver_aux_to_agent(
-        SimpleNamespace(
-            task=aux_task,
-            unique_rid=rid,
-            peer_rank=0,
-            peer_endpoint="0",
-            src_ptrs=np.zeros(1),
-            agent_generation=0,
-            expected_transfers=1,
-        )
-    )
+    sender._deliver_aux_to_agent(_bounce_aux_write_meta(aux_task, rid))
     assert submitted == []
     dealer.send.assert_not_called()
 
@@ -4969,19 +4913,12 @@ def test_kv_no_submission_also_settles_the_peers_unstarted_aux(monkeypatch):
 @pytest.mark.cpu_only
 def test_held_bounce_aux_defers_its_peers_kv_settlement_until_drained(monkeypatch):
     rid = 501
-    sender = _make_bounce_ctx_sender()
+    sender, ctx = _make_bounce_ctx(rid, aux=True)
     sender._agent = SimpleNamespace(name="ctx", bounce_enabled=True)
-    sender._add_req_info(rid, 0, _bounce_publication(rid, aux=True))
-    params = DisaggregatedParams(
-        disagg_request_id=rid, schedule_style=DisaggScheduleStyle.GENERATION_FIRST
-    )
-    ctx = transfer_mod.TxSession(rid, params, sender)
     ctx.send(_sole_piece())
     # A late publication can put the AUX write ahead of the peer's KV write.
     aux_task = ctx.send_aux()
-    dealer = Mock()
-    sender._get_result_dealer = Mock(return_value=dealer)
-    monkeypatch.setattr(transfer_mod.Sender, "_make_agent_request", lambda *_a, **_k: object())
+    dealer = _capture_bounce_results(sender, monkeypatch)
     status = Mock()
     status.wait_for_bounce_scatter_drain.return_value = False
 
@@ -4989,18 +4926,7 @@ def test_held_bounce_aux_defers_its_peers_kv_settlement_until_drained(monkeypatc
         raise transfer_mod._DestinationDrainUnproven("scatter outstanding", status)
 
     sender._submit_transfer = undrained
-    sender._deliver_aux_to_agent(
-        SimpleNamespace(
-            task=aux_task,
-            unique_rid=rid,
-            peer_rank=0,
-            peer_endpoint="0",
-            src_ptrs=np.zeros(1),
-            agent_generation=0,
-            expected_transfers=1,
-            meta_type=transfer_mod.WriteMetaType.AUX,
-        )
-    )
+    sender._deliver_aux_to_agent(_bounce_aux_write_meta(aux_task, rid))
     assert ctx.close()
     receiver, session = _make_one_writer_bounce_rx(rid, aux=True)
 
@@ -5015,17 +4941,14 @@ def test_held_bounce_aux_defers_its_peers_kv_settlement_until_drained(monkeypatc
         dealer.reset_mock()
 
     deliver()
-    slot = _OneSlotAllocator(rid)
     sender._poll_in_doubt_transfers(0)
     deliver()
-    slot.apply_reuse_decision(session.close())
-    assert not slot.is_reusable
+    assert not _closes_reusably(session, rid)
 
     status.wait_for_bounce_scatter_drain.return_value = True
     sender._poll_in_doubt_transfers(0)
     deliver()
-    slot.apply_reuse_decision(session.close())
-    assert slot.is_reusable
+    assert _closes_reusably(session, rid)
     assert ctx._kv_settled_peer_ranks == {0}
 
 
@@ -5145,14 +5068,10 @@ def test_registration_raced_by_agent_recovery_publishes_the_new_descriptor(monke
 @pytest.mark.cpu_only
 def test_lost_bounce_result_lets_retirement_settle_the_peer(monkeypatch):
     rid = 141
-    sender = _make_bounce_ctx_sender()
-    sender._add_req_info(rid, 0, _bounce_publication(rid))
-    ctx = transfer_mod.TxSession(rid, DisaggregatedParams(disagg_request_id=rid), sender)
+    sender, ctx = _make_bounce_ctx(rid)
     ctx.send(_sole_piece())
-    dealer = Mock()
+    dealer = _capture_bounce_results(sender, monkeypatch)
     dealer.send.side_effect = ConnectionError("result socket closed")
-    sender._get_result_dealer = Mock(return_value=dealer)
-    monkeypatch.setattr(transfer_mod.Sender, "_make_agent_request", lambda *_a, **_k: object())
 
     def admit(task, peer_rank, *_args, **_kwargs):
         with ctx.lock:
@@ -5160,8 +5079,7 @@ def test_lost_bounce_result_lets_retirement_settle_the_peer(monkeypatch):
         return True, None
 
     sender._submit_transfer = admit
-    meta = _bounce_kv_write_meta(ctx, rid, 0)
-    meta.expected_transfers = 1
+    meta = _bounce_kv_write_meta(ctx, rid, 0, expected_transfers=1)
     with pytest.raises(ConnectionError):
         sender._deliver_kv_to_agent(meta)
     assert not ctx._kv_writing_peer_ranks
@@ -5178,9 +5096,7 @@ def test_bounce_writer_settles_a_transfer_whose_creation_failed_before_posting(
     monkeypatch, posted_members
 ):
     rid = 151
-    sender = _make_bounce_ctx_sender()
-    sender._add_req_info(rid, 0, _bounce_publication(rid))
-    ctx = transfer_mod.TxSession(rid, DisaggregatedParams(disagg_request_id=rid), sender)
+    sender, ctx = _make_bounce_ctx(rid)
     ctx.send(_sole_piece())
     posted = Mock()
     posted.wait.return_value = True
@@ -5194,8 +5110,7 @@ def test_bounce_writer_settles_a_transfer_whose_creation_failed_before_posting(
     member = Mock(op=transfer_mod.TransferOp.WRITE, remote_name="gen")
     group = transfer_mod._TransferRequestGroup((member, member))
     monkeypatch.setattr(transfer_mod.Sender, "_make_agent_request", lambda *_a, **_k: group)
-    meta = _bounce_kv_write_meta(ctx, rid, 0)
-    meta.expected_transfers = 1
+    meta = _bounce_kv_write_meta(ctx, rid, 0, expected_transfers=1)
 
     if posted_members:
         with pytest.raises(RuntimeError, match="createXferReq"):
@@ -5207,29 +5122,24 @@ def test_bounce_writer_settles_a_transfer_whose_creation_failed_before_posting(
     receiver, session = _make_one_writer_bounce_rx(rid, aux=False)
     for message in sent:
         Receiver._process_kv_agent_result(receiver, b"", message)
-    slot = _OneSlotAllocator(rid)
-    slot.apply_reuse_decision(session.close())
+    reusable = _closes_reusably(session, rid)
     if posted_members:
         # A posted group member may still access the destination.
         assert sent == []
         assert ctx._kv_writing_peer_ranks == {0}
-        assert not slot.is_reusable
+        assert not reusable
     else:
         assert [_kv_result_code(message) for message in sent] == [AgentResult.NOT_SUBMITTED]
         assert ctx._kv_settled_peer_ranks == {0}
-        assert slot.is_reusable
+        assert reusable
 
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("failure", ["send", "connect"])
 def test_interrupted_bounce_request_fan_out_stops_awaiting_only_unasked_writers(failure):
     rid = 152
-    receiver = object.__new__(Receiver)
-    receiver._sessions_lock = threading.Lock()
-    receiver._sessions = {}
-    receiver._pre_cancelled_rids = {}
+    receiver = _make_owned_receiver()
     receiver._enforce_physical_ownership = False
-    receiver._shutdown = False
     receiver._agent = SimpleNamespace(bounce_enabled=True)
     receiver._build_recv_req_info = Mock(
         return_value=SimpleNamespace(unique_rid=rid, slice_id=0, to_bytes=Mock(return_value=b""))

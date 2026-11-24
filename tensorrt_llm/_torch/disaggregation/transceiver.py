@@ -1053,6 +1053,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             local_outcome.append(list(locally_verified))
         if local_session_count is not None:
             local_outcome.append([local_session_count])
+        intents_index = len(local_outcome)
         if failure_intents is not None:
             local_outcome.append(list(failure_intents))
         if agent_ready is not None:
@@ -1068,10 +1069,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         global_cancelled = self._union(all_c)
         global_failed = self._union(all_f)
         global_completed = self._intersection(all_done, n)
-        extra_index = 3 + int(locally_quiesced is not None) + int(locally_verified is not None)
-        extra_index += int(local_session_count is not None)
         intents = (
-            self._union([p[extra_index] for p in packed]) if failure_intents is not None else set()
+            self._union([p[intents_index] for p in packed])
+            if failure_intents is not None
+            else set()
         )
         # Internal failures use cancellation for drain, without becoming user cancellations.
         global_failed.update(intents)
@@ -1100,12 +1101,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             result.append({rid for rid in to_process if rid in global_verified})
         if local_session_count is not None:
             result.append(all(p[idx][0] == 0 for p in packed))
-            idx += 1
         if failure_intents is not None:
             result.append(intents)
-            idx += 1
         if agent_ready is not None:
-            result.append(all(p[idx][0] for p in packed))
+            result.append(all(p[-1][0] for p in packed))
         return tuple(result)
 
     def _local_agent_ready(self) -> bool:
@@ -1151,24 +1150,23 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         """Reuse session cancellation; it fences publication and retains live accessors."""
         for rid in intents:
             session = sessions.get(rid)
-            if session is None:
+            if not isinstance(session, (TxSession, RxSession)) or getattr(
+                session, "_failure_cancel_notified", False
+            ):
                 continue
-            if isinstance(session, (TxSession, RxSession)):
-                if getattr(session, "_failure_cancel_notified", False):
-                    continue
-                error = RuntimeError("KV transfer agent unavailable")
-                try:
-                    if isinstance(session, TxSession):
-                        session._logical_outcomes.fail(error)
-                        session.cancel_local(by_peer=True)
-                        session._sender.send_cancel_to_receivers(rid, failure=True)
-                    else:
-                        session.record_recovery_failure(error)
-                        if not session.cancel(by_peer=True):
-                            session.notify_cancel()
-                    session._failure_cancel_notified = True
-                except RuntimeError as error:
-                    logger.warning(f"Transfer {rid} failure cancellation will retry: {error}")
+            error = RuntimeError("KV transfer agent unavailable")
+            try:
+                if isinstance(session, TxSession):
+                    session._logical_outcomes.fail(error)
+                    session.cancel_local(by_peer=True)
+                    session._sender.send_cancel_to_receivers(rid, failure=True)
+                else:
+                    session.record_recovery_failure(error)
+                    if not session.cancel(by_peer=True):
+                        session.notify_cancel()
+                session._failure_cancel_notified = True
+            except RuntimeError as error:
+                logger.warning(f"Transfer {rid} failure cancellation will retry: {error}")
 
     def _gen_consensus_outcome(self, to_process, cancelled, failed, completed, locally_verified):
         sessions = self._recv_sessions

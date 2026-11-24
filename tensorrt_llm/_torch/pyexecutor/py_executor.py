@@ -10857,7 +10857,6 @@ class PyExecutor:
 
         cancelled_model_ids = self._cancelled_disagg_model_request_ids()
         excluded_model_ids = cancelled_model_ids
-        inflight_request_ids = self.inflight_req_ids
         held_failures = self._held_transfer_failures()
         if held_failures and self.dist.pp_size == 1:
             held_requests = [req for req, _ in held_failures.values()]
@@ -10885,10 +10884,10 @@ class PyExecutor:
             ]
         batcher = self.ctx_decoder_batcher
         if batcher is not None:
-            batcher.before_schedule(scheduling_requests, inflight_request_ids)
+            batcher.before_schedule(scheduling_requests, self.inflight_req_ids)
         try:
             scheduler_output = self.scheduler.schedule_request(
-                scheduling_requests, inflight_request_ids)
+                scheduling_requests, self.inflight_req_ids)
         finally:
             if batcher is not None:
                 batcher.after_schedule()
@@ -11094,22 +11093,16 @@ class PyExecutor:
             req for req in self.active_requests
             if req.py_request_id in failed_ids
         ]
-        scheduled_batch.encoder_requests = [
-            req for req in scheduled_batch.encoder_requests
-            if req.py_request_id not in failed_ids
-        ]
-        scheduled_batch.reset_context_requests([
-            req for req in scheduled_batch.context_requests
-            if req.py_request_id not in failed_ids
-        ])
-        scheduled_batch.generation_requests = [
-            req for req in scheduled_batch.generation_requests
-            if req.py_request_id not in failed_ids
-        ]
-        scheduled_batch.recompute_paused_requests = [
-            req for req in scheduled_batch.recompute_paused_requests
-            if req.py_request_id not in failed_ids
-        ]
+
+        def surviving(rows):
+            return [req for req in rows if req.py_request_id not in failed_ids]
+
+        batch = scheduled_batch
+        batch.encoder_requests = surviving(batch.encoder_requests)
+        batch.reset_context_requests(surviving(batch.context_requests))
+        batch.generation_requests = surviving(batch.generation_requests)
+        batch.recompute_paused_requests = surviving(
+            batch.recompute_paused_requests)
         self._handle_errors(
             "KV cache admission made no progress within the scheduler limit",
             requests=failed,
@@ -12927,12 +12920,9 @@ class PyExecutor:
                 request for request in failed_requests
                 if self._transfer_owns_request_blocks(request)
             ]
-            # A held context request is part-way through a pipelined send.
-            # Its remaining chunks will not run, so the send never gets its
-            # last slice and nothing else would retire it. Cancel it: the
-            # send reaper retires the session once its submitted writes
-            # drain, and a session retired here already no longer holds the
-            # request.
+            # A held context request's pipelined send never gets its last
+            # chunk. Cancel it so the send reaper retires the session once
+            # its writes drain; a session retired here no longer holds it.
             for request in held_requests:
                 if getattr(request, "is_context_only_request", False) is True:
                     self.disagg.request_cancellation(request)
@@ -12965,8 +12955,7 @@ class PyExecutor:
             if (getattr(request, "context_remaining_length", 0) > 0 and getattr(
                     request, "context_current_position", None) == 0):
                 request.py_kv_reuse_poisoned = True
-            # A failure parked earlier is the request's outcome; a later error
-            # (such as the retirement of the transfer it waited on) does not
+            # A failure parked earlier is the outcome; a later error does not
             # replace it.
             held = self._held_transfer_failures().pop(id(request), None)
             error_responses[req_id] = LlmResponse(

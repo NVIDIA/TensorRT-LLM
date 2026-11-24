@@ -626,6 +626,20 @@ def _make_aux_result_msg(instance_rank: int, unique_rid: int, result: AgentResul
     ]
 
 
+def _expired_oldest_first(entries: dict, now: float, ttl_s: float) -> list:
+    """Return keys of ``entries`` older than ``ttl_s``; values are ordered oldest first.
+
+    Each value is a timestamp, or a tuple whose first item is one.
+    """
+    expired = []
+    for key, value in entries.items():
+        recorded_at = value[0] if isinstance(value, tuple) else value
+        if now - recorded_at <= ttl_s:
+            break
+        expired.append(key)
+    return expired
+
+
 def _admit_kv_write_locked(session: Optional["TxSession"], task: "SendTaskBase", peer: int):
     """Admit a KV write to ``peer``; the caller holds ``session.lock``.
 
@@ -649,6 +663,17 @@ def _withdraw_kv_write_locked(session: Optional["TxSession"], task: "SendTaskBas
     writing = getattr(session, "_kv_writing_peer_ranks", None)
     if writing is not None and isinstance(task, KVSendTask):
         writing.discard(peer)
+
+
+def _retire_unreleased_statuses(
+    statuses: list[tuple[TransferStatus, "SendTaskBase", threading.Event]],
+) -> None:
+    """Return the in-flight reservations of handles whose agent was shut down."""
+    for _status, task, retired in statuses:
+        with task.lock:
+            task._native_inflight -= 1
+        retired.set()
+    statuses.clear()
 
 
 @dataclass
@@ -984,24 +1009,13 @@ class Sender(SenderBase):
         now = time.monotonic()
         with self._sessions_lock:
             # Oldest first (see clear_session), so only expired entries are visited.
-            expired = []
-            for rid, retired in self._retired_rids.items():
-                retired_at = retired[0] if isinstance(retired, tuple) else retired
-                if now - retired_at <= self._RETIRED_SESSION_TTL_S:
-                    break
-                expired.append(rid)
+            expired = _expired_oldest_first(self._retired_rids, now, self._RETIRED_SESSION_TTL_S)
             routed = getattr(self, "_routed_cancels", {})
-            expired_routed = []
-            for rid, cancelled_at in routed.items():
-                if now - cancelled_at <= self._RETIRED_SESSION_TTL_S:
-                    break
-                expired_routed.append(rid)
+            expired_routed = _expired_oldest_first(routed, now, self._RETIRED_SESSION_TTL_S)
             candidate_fences = getattr(self, "_expired_publication_fences", {})
-            expired_candidates = []
-            for rid, fenced_at in candidate_fences.items():
-                if now - fenced_at <= self._RETIRED_SESSION_TTL_S:
-                    break
-                expired_candidates.append(rid)
+            expired_candidates = _expired_oldest_first(
+                candidate_fences, now, self._RETIRED_SESSION_TTL_S
+            )
             pending_rids = (
                 {rid for rid, _ in getattr(self, "_pending_session_quiescence", ())}
                 if expired or expired_routed or expired_candidates
@@ -1019,7 +1033,7 @@ class Sender(SenderBase):
                 if rid in pending_rids:
                     continue
                 if rid in self._sessions or rid in self._retired_rids:
-                    # The session's own retirement now bounds this fence.
+                    # The session's own retirement bounds this fence.
                     del candidate_fences[rid]
                     continue
                 with self._peer_requests_lock:
@@ -1029,12 +1043,7 @@ class Sender(SenderBase):
                 routed.pop(rid, None)
                 self._pre_cancelled_rids.pop(rid, None)
             proofs = getattr(self, "_expired_bounce_requests", {})
-            expired_proofs = []
-            for key, (expired_at, _, _) in proofs.items():
-                if now - expired_at <= self._RETIRED_SESSION_TTL_S:
-                    break
-                expired_proofs.append(key)
-            for key in expired_proofs:
+            for key in _expired_oldest_first(proofs, now, self._RETIRED_SESSION_TTL_S):
                 del proofs[key]
             for rid in expired:
                 if rid in pending_rids:
@@ -1099,15 +1108,29 @@ class Sender(SenderBase):
         )
         self._send_failed_result_to_receiver(info, defer_to_worker=True)
 
+    def _no_submission_msg(
+        self, unique_rid: int, slice_id: int, token: bytes, terminal: bool = True
+    ) -> list[bytes]:
+        return _make_kv_result_msg(
+            self._instance_rank,
+            unique_rid,
+            slice_id,
+            terminal,
+            AgentResult.NOT_SUBMITTED,
+            kv_result_report_token=token,
+        )
+
+    def _send_aux_failed(self, write_meta: WriteMeta) -> None:
+        self._get_result_dealer(write_meta.peer_endpoint).send(
+            _make_aux_result_msg(self._instance_rank, write_meta.unique_rid, AgentResult.FAILED)
+        )
+
     def _send_kv_no_submission(self, write_meta: WriteMeta) -> None:
         self._get_result_dealer(write_meta.peer_endpoint).send(
-            _make_kv_result_msg(
-                self._instance_rank,
+            self._no_submission_msg(
                 write_meta.unique_rid,
                 write_meta.receiver_slice_id,
-                True,
-                AgentResult.NOT_SUBMITTED,
-                kv_result_report_token=write_meta.kv_result_report_token,
+                write_meta.kv_result_report_token,
             )
         )
 
@@ -1115,9 +1138,7 @@ class Sender(SenderBase):
         if aux_failure is None:
             return
         if aux_failure:
-            self._get_result_dealer(write_meta.peer_endpoint).send(
-                _make_aux_result_msg(self._instance_rank, write_meta.unique_rid, AgentResult.FAILED)
-            )
+            self._send_aux_failed(write_meta)
         self._send_kv_no_submission(write_meta)
 
     def _settle_peer_after_aux(self, session: "TxSession", peer_rank: int) -> None:
@@ -1150,13 +1171,8 @@ class Sender(SenderBase):
             self._send_kv_no_submission(write_meta)
 
     def _send_no_submission(self, info: RecvReqInfo, *, terminal: bool = True) -> None:
-        message = _make_kv_result_msg(
-            self._instance_rank,
-            info.unique_rid,
-            info.slice_id or 0,
-            terminal,
-            AgentResult.NOT_SUBMITTED,
-            kv_result_report_token=info.kv_result_report_token,
+        message = self._no_submission_msg(
+            info.unique_rid, info.slice_id or 0, info.kv_result_report_token, terminal
         )
         try:
             endpoint = self._get_result_receiver_endpoint(info)
@@ -1906,6 +1922,9 @@ class Sender(SenderBase):
         )
 
         owned = self._owns_task(write_meta.task)
+        requires_drain = getattr(write_meta, "requires_destination_drain", False)
+        # A bounce destination is settled with NOT_SUBMITTED when no write reaches it.
+        settles_unsubmitted = not owned and requires_drain
         with self._sessions_lock:
             session = self._get_session(write_meta.unique_rid)
         if session is None:
@@ -1916,7 +1935,7 @@ class Sender(SenderBase):
             if owned:
                 write_meta.task.retire_unsubmitted_physical_operation(write_meta.peer_rank)
             write_meta.task.fail(RuntimeError(msg))
-            if not owned and getattr(write_meta, "requires_destination_drain", False):
+            if settles_unsubmitted:
                 self._report_unsubmitted_kv(None, write_meta)
             return
         assert write_meta.slice_id is not None
@@ -1937,7 +1956,7 @@ class Sender(SenderBase):
                 should_abort = False
 
         if should_abort:
-            if not owned and getattr(write_meta, "requires_destination_drain", False):
+            if settles_unsubmitted:
                 task.fail(
                     RuntimeError(
                         f"session {write_meta.unique_rid} {status.value}, transfer aborted"
@@ -1971,11 +1990,7 @@ class Sender(SenderBase):
             return
 
         agent_result = AgentResult.SUCCESS
-        drained_failure = (
-            AgentResult.FAILED_QUIESCED
-            if getattr(write_meta, "requires_destination_drain", False)
-            else AgentResult.FAILED
-        )
+        drained_failure = AgentResult.FAILED_QUIESCED if requires_drain else AgentResult.FAILED
         submitted_and_completed = False
         backend_submitted = False
         pending_bounce_status = None
@@ -2001,7 +2016,7 @@ class Sender(SenderBase):
                 if owned:
                     task.retire_unsubmitted_physical_operation(write_meta.peer_rank)
                 task.fail(RuntimeError(f"failed to build the KV transfer request: {e}"))
-                if not owned and getattr(write_meta, "requires_destination_drain", False):
+                if settles_unsubmitted:
                     self._report_unsubmitted_kv(session, write_meta)
                     return
                 self._get_result_dealer(
@@ -2059,29 +2074,24 @@ class Sender(SenderBase):
                     f"KV write for {write_meta.unique_rid} still lacks bounce drain evidence: {error}"
                 )
                 agent_result = AgentResult.FAILED
-                if getattr(write_meta, "requires_destination_drain", False):
+                if requires_drain:
                     pending_bounce_status = error.status
                 task.fail(RuntimeError(str(error)))
             except _TransferNotSubmittedError as error:
                 routed_cancelled = getattr(session, "_routed_cancelled", False) is True
-                if not owned and getattr(write_meta, "requires_destination_drain", False):
-                    if not routed_cancelled and not session.has_failed():
-                        logger.error(
-                            "KV transfer rejected before backend submission: "
-                            f"unique_rid={write_meta.unique_rid} slice={write_meta.slice_id} "
-                            f"peer_rank={write_meta.peer_rank}: {error}; cause={error.__cause__}"
-                        )
+                if not routed_cancelled and not (settles_unsubmitted and session.has_failed()):
+                    logger.error(
+                        "KV transfer rejected before backend submission: "
+                        f"unique_rid={write_meta.unique_rid} slice={write_meta.slice_id} "
+                        f"peer_rank={write_meta.peer_rank}: {error}; cause={error.__cause__}"
+                    )
+                if settles_unsubmitted:
                     task.fail(error)
                     self._report_unsubmitted_kv(session, write_meta)
                     return
                 if routed_cancelled:
                     return
                 # Backend admission failed, so local resources are safe to retire.
-                logger.error(
-                    "KV transfer rejected before backend submission: "
-                    f"unique_rid={write_meta.unique_rid} slice={write_meta.slice_id} "
-                    f"peer_rank={write_meta.peer_rank}: {error}; cause={error.__cause__}"
-                )
                 agent_result = drained_failure
                 task.fail(error)
         elif owned:
@@ -2124,7 +2134,6 @@ class Sender(SenderBase):
                 write_meta, result_msg, bounce_status=pending_bounce_status
             )
             return
-        bounce = getattr(write_meta, "requires_destination_drain", False)
         tracked = not owned and isinstance(session, TxSession)
         try:
             self._get_result_dealer(write_meta.peer_endpoint).send(result_msg)
@@ -2142,7 +2151,7 @@ class Sender(SenderBase):
                 session._finish_kv_write(
                     write_meta.peer_rank,
                     final=agent_result != AgentResult.SUCCESS or write_meta.is_last_slice,
-                    bounce=bounce,
+                    bounce=requires_drain,
                 ),
             )
 
@@ -2193,11 +2202,7 @@ class Sender(SenderBase):
             write_meta.task.fail(RuntimeError(msg))
             if not owned:
                 # Nothing was written; the receiver drops a report it already has.
-                self._get_result_dealer(write_meta.peer_endpoint).send(
-                    _make_aux_result_msg(
-                        self._instance_rank, write_meta.unique_rid, AgentResult.FAILED
-                    )
-                )
+                self._send_aux_failed(write_meta)
             return
         aux_task = session.aux_task
         assert aux_task is not None, f"aux_task is None for session {write_meta.unique_rid}"
@@ -2270,11 +2275,7 @@ class Sender(SenderBase):
                     # Cancellation skipped this started peer's claim; only this
                     # worker can tell the receiver that its slot was never written.
                     if session._claim_aux_terminal_result(write_meta.peer_rank):
-                        self._get_result_dealer(write_meta.peer_endpoint).send(
-                            _make_aux_result_msg(
-                                self._instance_rank, write_meta.unique_rid, AgentResult.FAILED
-                            )
-                        )
+                        self._send_aux_failed(write_meta)
                     self._settle_peer_after_aux(session, write_meta.peer_rank)
                     return
                 logger.error(
@@ -2814,14 +2815,7 @@ class Sender(SenderBase):
                 )
         if expired_proof is not None:
             _, slice_id, token = expired_proof
-            message = _make_kv_result_msg(
-                self._instance_rank,
-                unique_rid,
-                slice_id,
-                True,
-                AgentResult.NOT_SUBMITTED,
-                kv_result_report_token=token,
-            )
+            message = self._no_submission_msg(unique_rid, slice_id, token)
             self._send_task_queues[hash((unique_rid, rank)) % self._num_threads].put(
                 (peer.self_endpoint, message)
             )
@@ -3729,8 +3723,9 @@ class TxSession(TxSessionBase):
             req_infos = list((self._sender._get_req_info(self.disagg_request_id) or {}).values())
             no_kv_submitted = not self._enforce_physical_ownership and not self.kv_tasks
             unsubmitted_kv: list[RecvReqInfo] = []
-            if report_unsubmitted_aux and not self._enforce_physical_ownership:
+            if report_unsubmitted_aux:
                 aux_failures = self._claim_unsubmitted_aux_failures_locked(req_infos)
+            if report_unsubmitted_aux and not self._enforce_physical_ownership:
                 # Settling an idle bounce peer under this lock fences its later
                 # writes; a writing peer reports once its write finishes.
                 for info in req_infos:
@@ -3741,8 +3736,6 @@ class TxSession(TxSessionBase):
                         unsubmitted_kv.append(info)
                         if aux_failure:
                             aux_failures.append(info)
-            elif report_unsubmitted_aux:
-                aux_failures = self._claim_unsubmitted_aux_failures_locked(req_infos)
         self._report_unsubmitted_aux_failures(aux_failures)
         for info in unsubmitted_kv:
             self._sender._send_no_submission(info)
@@ -4289,8 +4282,7 @@ class Receiver(ReceiverBase):
             with self._sessions_lock:
                 if self._shutdown:
                     raise RuntimeError("cannot create an RxSession after Receiver shutdown")
-                sender_ref = getattr(self, "_recovery_sender", None)
-                sender = sender_ref() if sender_ref is not None else None
+                sender = self._live_recovery_sender()
                 with sender._admission_lock if sender is not None else nullcontext():
                     if sender is not None and (sender._agent_failed or sender._shutdown_requested):
                         raise ReceiveAdmissionFenced(
@@ -4575,9 +4567,12 @@ class Receiver(ReceiverBase):
             raise ValueError("ctx_info_endpoint is required")
         return ep  # str (backward compat)
 
-    def _local_agent_generation(self) -> int:
+    def _live_recovery_sender(self) -> Optional[Sender]:
         sender_ref = getattr(self, "_recovery_sender", None)
-        sender = sender_ref() if sender_ref is not None else None
+        return sender_ref() if sender_ref is not None else None
+
+    def _local_agent_generation(self) -> int:
+        sender = self._live_recovery_sender()
         return 0 if sender is None else sender._agent_generation
 
     def _should_register_peer(self, params: DisaggregatedParams) -> bool:
@@ -5597,22 +5592,14 @@ class RxSession(RxSessionBase):
         if not self._enforce_physical_ownership:
             if self._bounce_writers_pending():
                 return False
-            if self._terminal_status == SessionStatus.CANCELLED:
-                return (
-                    not any(
-                        (
-                            self._legacy_outstanding_writers(task)
-                            if task._legacy_published and task._kv_result_report_tokens
-                            else task.status == TaskStatus.TRANSFERRING
-                        )
-                        for task in self._kv_tasks
-                    )
-                    and not self._terminal_aux_awaits_writers()
-                )
-            return (
-                not any(task.status == TaskStatus.TRANSFERRING for task in self._kv_tasks)
-                and not self._terminal_aux_awaits_writers()
+            cancelled = self._terminal_status == SessionStatus.CANCELLED
+            writing = any(
+                self._legacy_outstanding_writers(task)
+                if cancelled and task._legacy_published and task._kv_result_report_tokens
+                else task.status == TaskStatus.TRANSFERRING
+                for task in self._kv_tasks
             )
+            return not writing and not self._terminal_aux_awaits_writers()
         retirement = getattr(self, "_retirement", None)
         if retirement is not None and not retirement.can_retire():
             return False
@@ -6490,11 +6477,7 @@ class TransferWorker:
                     check_deadline()
                     # Only terminal handles may reach teardown. Interrupted writes
                     # remain rooted and are polled above until they are terminal.
-                    for _status, task, retired in sender._unreleased_statuses:
-                        with task.lock:
-                            task._native_inflight -= 1
-                        retired.set()
-                    sender._unreleased_statuses.clear()
+                    _retire_unreleased_statuses(sender._unreleased_statuses)
                     if sender._shutdown_requested:
                         self._registered_mem.clear()
                         return True
@@ -6602,11 +6585,7 @@ class TransferWorker:
                 if self._agent is not None:
                     self._agent.shutdown()
                     self._agent = None
-                for _status, task, retired in sender._unreleased_statuses:
-                    with task.lock:
-                        task._native_inflight -= 1
-                    retired.set()
-                sender._unreleased_statuses.clear()
+                _retire_unreleased_statuses(sender._unreleased_statuses)
                 self._registered_mem.clear()
         watchdog = getattr(self, "_retirement_watchdog", None)
         if watchdog is not None:

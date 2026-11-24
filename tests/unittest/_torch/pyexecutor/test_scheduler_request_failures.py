@@ -14,40 +14,61 @@ from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 
 pytestmark = pytest.mark.cpu_only
 
+ADMISSION_ERROR = "KV cache admission made no progress within the scheduler limit"
+COLLECTIVES = {"tp": "tp_allgather", "cp": "tp_cp_allgather", "pp": "allgather"}
 
-@pytest.mark.parametrize("parallelism", ["tp", "cp", "pp"])
-def test_asymmetric_admission_failure_uses_request_error_path(parallelism):
+
+def _executor(dist, active_requests=(), *, attention_dp=False):
+    executor = object.__new__(PyExecutor)
+    executor._reset_scheduler_failure_state()
+    executor._is_kv_manager_v2, executor.enable_attention_dp = True, attention_dp
+    executor.dist = dist
+    executor.active_requests = list(active_requests)
+    executor._handle_errors = Mock()
+    return executor
+
+
+def _two_rank_executors(parallelism, on_gather=None):
+    """Two executors whose ``parallelism`` vote collective meets at a barrier."""
     barrier = threading.Barrier(2, timeout=5)
     votes = [None, None]
 
-    def gather(rank, value):
-        votes[rank] = value
+    def gather(rank, vote):
+        if on_gather is not None:
+            on_gather(rank)
+        votes[rank] = vote
         barrier.wait()
         result = list(votes)
         barrier.wait()
         return result
 
+    executors = []
+    for rank in range(2):
+        dist = SimpleNamespace(
+            **{f"{p}_size": 2 if p == parallelism else 1 for p in "tp cp pp".split()}
+        )
+        setattr(dist, COLLECTIVES[parallelism], lambda vote, rank=rank: gather(rank, vote))
+        executors.append(_executor(dist))
+    return executors
+
+
+def _on_both_ranks(fn, args_by_rank):
+    """Run ``fn`` concurrently once per rank and return its futures."""
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        return [pool.submit(fn, *args) for args in args_by_rank]
+
+
+@pytest.mark.parametrize("parallelism", ["tp", "cp", "pp"])
+def test_asymmetric_admission_failure_uses_request_error_path(parallelism):
     failed = [
         SimpleNamespace(py_request_id=7, is_last_context_chunk=True),
         SimpleNamespace(py_request_id=9),
     ]
     healthy = SimpleNamespace(py_request_id=8, is_last_context_chunk=True)
-    executors, batches = [], []
-    for rank in range(2):
-        executor = object.__new__(PyExecutor)
-        executor._reset_scheduler_failure_state()
-        executor._is_kv_manager_v2 = True
-        executor.enable_attention_dp = False
+    executors, batches = _two_rank_executors(parallelism), []
+    for rank, executor in enumerate(executors):
         executor._scheduler_failure_sync_tick = 63
-        executor.dist = SimpleNamespace(
-            cp_size=2 if parallelism == "cp" else 1,
-            tp_size=2 if parallelism == "tp" else 1,
-            pp_size=2 if parallelism == "pp" else 1,
-        )
-        collective = {"tp": "tp_allgather", "cp": "tp_cp_allgather", "pp": "allgather"}[parallelism]
-        setattr(executor.dist, collective, lambda ids, rank=rank: gather(rank, ids))
         executor.active_requests = [healthy, *failed]
-        executor._handle_errors = Mock()
         batch = ScheduledRequests()
         batch.failed_requests = failed.copy() if rank == 1 else []
         batch.generation_requests = (
@@ -60,18 +81,13 @@ def test_asymmetric_admission_failure_uses_request_error_path(parallelism):
             if rank == 0
             else []
         )
-        executors.append(executor)
         batches.append(batch)
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        futures = [pool.submit(e._fail_scheduler_requests, b) for e, b in zip(executors, batches)]
-        for future in futures:
-            future.result(timeout=10)
-    for rank, (executor, batch) in enumerate(zip(executors, batches)):
+    for future in _on_both_ranks(PyExecutor._fail_scheduler_requests, zip(executors, batches)):
+        future.result()
+    for executor, batch in zip(executors, batches):
         assert batch.generation_requests == []
         executor._handle_errors.assert_called_once_with(
-            "KV cache admission made no progress within the scheduler limit",
-            requests=failed,
-            charge_budget=False,
+            ADMISSION_ERROR, requests=failed, charge_budget=False
         )
     assert batches[0].context_requests == [healthy]
 
@@ -132,7 +148,7 @@ def test_admission_failure_delivers_one_error_and_cleans_up_once():
     assert response.request_id == blocked.py_request_id
     assert executor._response_channel.responses[7] == [response]
     assert 7 not in executor._response_channel.result_wait_queues
-    assert response.error_msg == "KV cache admission made no progress within the scheduler limit"
+    assert response.error_msg == ADMISSION_ERROR
     executor.sampler.release_request.assert_called_once_with(blocked)
     executor.resource_manager.free_resources.assert_called_once_with(blocked)
     executor._error_budget.consume.assert_not_called()
@@ -143,40 +159,32 @@ def test_admission_failure_delivers_one_error_and_cleans_up_once():
 
 
 def test_model_parallel_failure_votes_are_batched_and_adp_is_rank_local():
-    executor = object.__new__(PyExecutor)
-    executor._reset_scheduler_failure_state()
-    executor._is_kv_manager_v2, executor.enable_attention_dp = True, False
     failed = SimpleNamespace(py_request_id=7)
-    executor.active_requests = [failed]
-    executor.dist = SimpleNamespace(
-        tp_size=1,
-        cp_size=1,
-        pp_size=3,
-        allgather=Mock(return_value=[([7], False), ([], False), ([], False)]),
+    allgather = Mock(return_value=[([7], False), ([], False), ([], False)])
+    executor = _executor(
+        SimpleNamespace(tp_size=1, cp_size=1, pp_size=3, allgather=allgather), [failed]
     )
-    executor._handle_errors = Mock()
     batch = ScheduledRequests()
     batch.failed_requests = [failed]
     for _ in range(63):
         executor._fail_scheduler_requests(batch)
-    executor.dist.allgather.assert_not_called()
+    allgather.assert_not_called()
     executor._handle_errors.assert_not_called()
     executor._fail_scheduler_requests(batch)
-    executor.dist.allgather.assert_called_once_with(([7], False))
+    allgather.assert_called_once_with(([7], False))
     executor._handle_errors.assert_called_once()
 
     executor.enable_attention_dp = True
     executor.dist.pp_size, executor.dist.tp_size = 1, 3
-    executor.dist.allgather.reset_mock()
+    allgather.reset_mock()
     batch.failed_requests = [failed]
     executor._fail_scheduler_requests(batch)
-    executor.dist.allgather.assert_not_called()
+    allgather.assert_not_called()
     assert executor._handle_errors.call_count == 2
 
 
 def test_held_transfer_remains_visible_to_the_scheduler_hold_probe():
     executor = object.__new__(PyExecutor)
-    executor._reset_scheduler_failure_state()
     executor._disagg_coordinator = SimpleNamespace(has_local_retiring_gen_receives=False)
     executor._transfer_held_failures = {7: (object(), "parked receive")}
     assert executor._has_scheduler_transfer_holds()
@@ -186,16 +194,14 @@ def test_held_transfer_remains_visible_to_the_scheduler_hold_probe():
 
 @pytest.mark.parametrize("progress", [False, True])
 def test_persistent_admission_failures_escalate_only_without_progress(progress):
-    executor = object.__new__(PyExecutor)
-    executor._reset_scheduler_failure_state()
-    executor._is_kv_manager_v2, executor.enable_attention_dp = True, False
-    executor.dist = SimpleNamespace(
-        tp_size=2, cp_size=1, pp_size=1, tp_allgather=lambda vote: [vote, ([], False)]
-    )
     failed = SimpleNamespace(py_request_id=7)
     healthy = SimpleNamespace(py_request_id=8)
-    executor.active_requests = [failed, healthy]
-    executor._handle_errors = Mock()
+    executor = _executor(
+        SimpleNamespace(
+            tp_size=2, cp_size=1, pp_size=1, tp_allgather=lambda vote: [vote, ([], False)]
+        ),
+        [failed, healthy],
+    )
     executor._scheduler_stall_rounds = 2 if progress else 0
     for round_id in range(3):
         batch = ScheduledRequests()
@@ -214,24 +220,19 @@ def test_persistent_admission_failures_escalate_only_without_progress(progress):
 
 
 def test_adp_failure_consensus_covers_both_cp_and_pp_without_tp_vote():
-    executor = object.__new__(PyExecutor)
-    executor._reset_scheduler_failure_state()
-    executor._scheduler_failure_sync_tick = 63
-    executor._is_kv_manager_v2, executor.enable_attention_dp = True, True
-    executor.dist = SimpleNamespace(
+    failed = [SimpleNamespace(py_request_id=rid) for rid in (7, 9)]
+    dist = SimpleNamespace(
         tp_size=2,
         cp_size=2,
         pp_size=2,
         cp_allgather=Mock(return_value=[([], False), ([7], False)]),
         pp_allgather=Mock(return_value=[([7], False), ([9], False)]),
     )
-    failed = [SimpleNamespace(py_request_id=rid) for rid in (7, 9)]
-    executor.active_requests = failed
-    executor._handle_errors = Mock()
-    batch = ScheduledRequests()
-    executor._fail_scheduler_requests(batch)
-    executor.dist.cp_allgather.assert_called_once_with(([], False))
-    executor.dist.pp_allgather.assert_called_once_with(([7], False))
+    executor = _executor(dist, failed, attention_dp=True)
+    executor._scheduler_failure_sync_tick = 63
+    executor._fail_scheduler_requests(ScheduledRequests())
+    dist.cp_allgather.assert_called_once_with(([], False))
+    dist.pp_allgather.assert_called_once_with(([7], False))
     assert executor._handle_errors.call_args.kwargs["requests"] == failed
 
 
@@ -244,15 +245,11 @@ def test_mpi_scheduler_failure_consensus_spans_cp_and_pp():
     rank = world.Get_rank()
     cp, pp = world.Split(rank // 2, rank), world.Split(rank % 2, rank)
     try:
-        executor = object.__new__(PyExecutor)
-        executor._reset_scheduler_failure_state()
-        executor._is_kv_manager_v2 = executor.enable_attention_dp = True
-        executor.dist = SimpleNamespace(
+        failed = SimpleNamespace(py_request_id=7)
+        dist = SimpleNamespace(
             tp_size=1, cp_size=2, pp_size=2, cp_allgather=cp.allgather, pp_allgather=pp.allgather
         )
-        failed = SimpleNamespace(py_request_id=7)
-        executor.active_requests = [failed]
-        executor._handle_errors = Mock()
+        executor = _executor(dist, [failed], attention_dp=True)
         for round_id in range(3):
             executor._scheduler_failure_sync_tick = 63
             batch = ScheduledRequests()
@@ -294,56 +291,29 @@ def test_mpi_scheduler_failure_consensus_spans_cp_and_pp():
 
 @pytest.mark.parametrize("parallelism", ["tp", "cp", "pp"])
 def test_rejected_rows_never_reset_stall_rounds_without_execution(parallelism):
-    barrier = threading.Barrier(2, timeout=5)
-    votes = [None, None]
-
-    def gather(rank, vote):
-        votes[rank] = vote
-        barrier.wait()
-        result = list(votes)
-        barrier.wait()
-        return result
-
-    executors = []
-    for rank in range(2):
-        executor = object.__new__(PyExecutor)
-        executor._reset_scheduler_failure_state()
-        executor._is_kv_manager_v2, executor.enable_attention_dp = True, False
-        executor.dist = SimpleNamespace(
-            tp_size=2 if parallelism == "tp" else 1,
-            cp_size=2 if parallelism == "cp" else 1,
-            pp_size=2 if parallelism == "pp" else 1,
-        )
-        collective = {"tp": "tp_allgather", "cp": "tp_cp_allgather", "pp": "allgather"}[parallelism]
-        setattr(executor.dist, collective, lambda vote, rank=rank: gather(rank, vote))
-        executor._handle_errors = Mock()
-        executors.append(executor)
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        # Each round is a new arrival, accepted by rank 0 and rejected by rank
-        # 1. Agreement leaves no executable rows on either rank.
-        for round_id in range(3):
-            request = SimpleNamespace(py_request_id=round_id)
-            batches = []
-            for rank, executor in enumerate(executors):
-                executor.active_requests = [request]
-                executor._scheduler_failure_sync_tick = 63
-                batch = ScheduledRequests()
-                batch.generation_requests = [request] if rank == 0 else []
-                batch.failed_requests = [request] if rank == 1 else []
-                batches.append(batch)
-            futures = [
-                pool.submit(ex._fail_scheduler_requests, batch)
-                for ex, batch in zip(executors, batches)
-            ]
-            for executor, batch, future in zip(executors, batches, futures):
-                if round_id == 2:
-                    with pytest.raises(RuntimeError, match="three failure rounds"):
-                        future.result(timeout=10)
-                else:
-                    future.result(timeout=10)
-                    assert not batch.all_requests()
-                assert executor._scheduler_stall_rounds == round_id + 1
-                assert not executor._scheduler_progress_since_vote
+    executors = _two_rank_executors(parallelism)
+    # Each round is a new arrival, accepted by rank 0 and rejected by rank
+    # 1. Agreement leaves no executable rows on either rank.
+    for round_id in range(3):
+        request = SimpleNamespace(py_request_id=round_id)
+        batches = []
+        for rank, executor in enumerate(executors):
+            executor.active_requests = [request]
+            executor._scheduler_failure_sync_tick = 63
+            batch = ScheduledRequests()
+            batch.generation_requests = [request] if rank == 0 else []
+            batch.failed_requests = [request] if rank == 1 else []
+            batches.append(batch)
+        futures = _on_both_ranks(PyExecutor._fail_scheduler_requests, zip(executors, batches))
+        for executor, batch, future in zip(executors, batches, futures):
+            if round_id == 2:
+                with pytest.raises(RuntimeError, match="three failure rounds"):
+                    future.result()
+            else:
+                future.result()
+                assert not batch.all_requests()
+            assert executor._scheduler_stall_rounds == round_id + 1
+            assert not executor._scheduler_progress_since_vote
     assert all(ex._handle_errors.call_count == 2 for ex in executors)
 
 
@@ -361,70 +331,34 @@ def test_local_rejection_from_tick_zero_never_starts_a_request_on_one_rank(
     vote on pass 64.
     """
     num_passes = 64
-    barrier = threading.Barrier(2, timeout=5)
-    votes = [None, None]
-    gather_passes = [[], []]
-
-    def gather(rank, vote, pass_id):
-        gather_passes[rank].append(pass_id[0])
-        votes[rank] = vote
-        barrier.wait()
-        result = list(votes)
-        barrier.wait()
-        return result
-
     request = SimpleNamespace(py_request_id=7)
-
+    # The scheduler fails a request only in a pass without progress.
     rescheduled_at = None if rescheduled_as is None else 10
+    pass_ids, gather_passes = [None, None], [[], []]
+    executors = _two_rank_executors(
+        parallelism, on_gather=lambda rank: gather_passes[rank].append(pass_ids[rank])
+    )
 
-    def scheduled(pass_id):
-        # The scheduler fails a request only in a pass without progress.
-        if rescheduled_at is not None and pass_id >= rescheduled_at:
-            return [request]
-        return []
-
-    def run(rank, executor, pass_id):
+    def run(rank, executor):
         executed = []
-        for pass_id[0] in range(num_passes):
+        for pass_ids[rank] in range(num_passes):
+            pass_id = pass_ids[rank]
             batch = ScheduledRequests()
-            setattr(batch, f"{rescheduled_as or 'generation'}_requests", scheduled(pass_id[0]))
-            batch.failed_requests = [request] if rank == 1 and pass_id[0] == 0 else []
+            rows = [request] if rescheduled_at is not None and pass_id >= rescheduled_at else []
+            setattr(batch, f"{rescheduled_as or 'generation'}_requests", rows)
+            batch.failed_requests = [request] if rank == 1 and pass_id == 0 else []
             executor._fail_scheduler_requests(batch)
             assert batch.failed_requests == []
             rows = batch.encoder_requests + batch.all_requests()
             executed.append([req.py_request_id for req in rows])
-            if pass_id[0] < num_passes - 1:
+            if pass_id < num_passes - 1:
                 executor._handle_errors.assert_not_called()
         return executed
 
-    executors, pass_ids = [], []
-    for rank in range(2):
-        executor = object.__new__(PyExecutor)
-        executor._reset_scheduler_failure_state()
+    for executor in executors:
         assert executor._scheduler_failure_sync_tick == 0
-        executor._is_kv_manager_v2, executor.enable_attention_dp = True, False
-        executor.dist = SimpleNamespace(
-            tp_size=2 if parallelism == "tp" else 1,
-            cp_size=2 if parallelism == "cp" else 1,
-            pp_size=2 if parallelism == "pp" else 1,
-        )
-        pass_id = [None]
-        collective = {"tp": "tp_allgather", "cp": "tp_cp_allgather", "pp": "allgather"}[parallelism]
-        setattr(
-            executor.dist,
-            collective,
-            lambda vote, rank=rank, pass_id=pass_id: gather(rank, vote, pass_id),
-        )
         executor.active_requests = [request]
-        executor._handle_errors = Mock()
-        executors.append(executor)
-        pass_ids.append(pass_id)
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        futures = [
-            pool.submit(run, rank, executor, pass_id)
-            for rank, (executor, pass_id) in enumerate(zip(executors, pass_ids))
-        ]
-        executed = [future.result(timeout=10) for future in futures]
+    executed = [f.result() for f in _on_both_ranks(run, enumerate(executors))]
 
     assert gather_passes == [[num_passes - 1], [num_passes - 1]]
     # Every pass runs the same rows on both ranks: nobody starts 7 alone.
@@ -436,9 +370,7 @@ def test_local_rejection_from_tick_zero_never_starts_a_request_on_one_rank(
         if rescheduled_at is None:
             # The stalled request fails on both ranks in the same vote.
             executor._handle_errors.assert_called_once_with(
-                "KV cache admission made no progress within the scheduler limit",
-                requests=[request],
-                charge_budget=False,
+                ADMISSION_ERROR, requests=[request], charge_budget=False
             )
         else:
             # Scheduling it again withdraws rank 1's stale proposal.
