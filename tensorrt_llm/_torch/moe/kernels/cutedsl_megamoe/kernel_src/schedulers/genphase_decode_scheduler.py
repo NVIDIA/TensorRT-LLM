@@ -145,6 +145,7 @@ from .fc12_mapping import (
     make_fc12_done_tile,
     map_phase_interleaved_fc12_work_id,
     reset_phase_interleaved_cursors_for_owner,
+    resolve_phase_interleaved_stream_extent,
 )
 from .non_clc_mixed_cga import NonClcMixedCgaConfig, NonClcMixedCgaSchedulerWorker
 
@@ -456,6 +457,11 @@ class GenphaseDecodeFc12Scheduler(SchedulerBase):
         work_tile = make_fc12_done_tile(True)
         worker = self._work_id_worker
         mapping = self._mapping
+        if cutlass.const_expr(self.die_count == 1):
+            # The die-blind mapping bounds each stream by its extent over all local experts; resolve it
+            # once, after the sizes are ready, like the phase-interleaved scheduler.
+            if mapping.stream_token_blocks < Int32(0):
+                mapping = resolve_phase_interleaved_stream_extent(mapping)
         source = self._source
         coord = worker.cta_coord_in_preferred_cluster
         resolved = Boolean(False)
