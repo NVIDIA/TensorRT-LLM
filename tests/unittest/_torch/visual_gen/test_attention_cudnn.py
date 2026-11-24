@@ -57,6 +57,8 @@ def _require_cudnn(quant_dtype: str | None) -> None:
         pytest.skip("cuDNN attention backend requires CUDA.")
     if quant_dtype is not None and torch.cuda.get_device_capability()[0] < 10:
         pytest.skip("cuDNN FP8/MXFP8 SDPA requires a Blackwell-class GPU (sm100+).")
+    if quant_dtype == "mxfp8" and torch.cuda.get_device_capability()[0] == 12:
+        pytest.skip("cuDNN MXFP8 SDPA has no SM120 engine; only per-tensor FP8 is supported.")
 
 
 def _make_qkv(batch, num_heads, num_kv_heads, seq_q, seq_kv, head_dim, device):
