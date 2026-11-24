@@ -1,14 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""CPU contract tests for MiniMax-H3 SM107 pure trtllm-gen-fp16sm routing, scratch bounds, audio graph, and FP8 YAMLs."""
+"""CPU contract tests for MiniMax-H3 SM107 trtllm-gen-fp16sm routing, scratch bounds, audio graph and FP8 YAMLs."""
 
 from __future__ import annotations
 
 import ast
 import math
+import unittest
 from pathlib import Path
 from types import SimpleNamespace
-import unittest
+
+import pytest
+
+pytestmark = pytest.mark.cpu_only
 
 REPO = Path(__file__).resolve().parents[6]
 U4 = REPO / "tensorrt_llm/_torch/visual_gen/models/minimax_h3/minimax_h3_fp8__sm_103_107__u4"
@@ -152,7 +156,11 @@ class TestFp8PureGenFmhaContracts(unittest.TestCase):
         )
         self.assertTrue(ns107["_initialize_sm107_gen_fmha"](tr))
         qkv = SimpleNamespace(
-            ndim=3, shape=(1, 1, 3 * 56 * 128), dtype="BF16", is_cuda=True, is_contiguous=lambda: True
+            ndim=3,
+            shape=(1, 1, 3 * 56 * 128),
+            dtype="BF16",
+            is_cuda=True,
+            is_contiguous=lambda: True,
         )
         for _ in range(5):
             self.assertEqual(attn._fused_packed_forward(qkv, ("C", "S")), "DIRECT_FP8")
@@ -210,7 +218,9 @@ class TestFp8PureGenFmhaContracts(unittest.TestCase):
             ),
             "triton": SimpleNamespace(cdiv=lambda a, b: (a + b - 1) // b),
         }
-        exec(compile(ast.Module(body=body, type_ignores=[]), str(U4 / "qkv_exchange.py"), "exec"), ns)
+        exec(
+            compile(ast.Module(body=body, type_ignores=[]), str(U4 / "qkv_exchange.py"), "exec"), ns
+        )
 
         class _FakeDev:
             type = "cuda"

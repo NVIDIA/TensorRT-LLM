@@ -6,9 +6,9 @@ from __future__ import annotations
 
 import ast
 import math
+import unittest
 from pathlib import Path
 from types import SimpleNamespace
-import unittest
 
 try:
     import pytest
@@ -117,7 +117,9 @@ def _load_output_exchange_namespace():
         ),
         "FP8QDQLinearMethod": _FakeFP8Method,
     }
-    exec(compile(ast.Module(body=body, type_ignores=[]), str(U4 / "output_exchange.py"), "exec"), ns)
+    exec(
+        compile(ast.Module(body=body, type_ignores=[]), str(U4 / "output_exchange.py"), "exec"), ns
+    )
     return ns
 
 
@@ -158,7 +160,9 @@ def _load_pipeline_namespace(output_ns):
             compiler=SimpleNamespace(disable=lambda fn: fn),
         ),
         "AttentionTensorLayout": SimpleNamespace(NHD="NHD", HND="HND"),
-        "MiniMaxH3Attention": type("MiniMaxH3Attention", (), {"__init__": lambda self, *a, **k: None}),
+        "MiniMaxH3Attention": type(
+            "MiniMaxH3Attention", (), {"__init__": lambda self, *a, **k: None}
+        ),
         "static_fp8_output_scale": output_ns["static_fp8_output_scale"],
         "exchange_fp8_output": fake_exchange,
         "exchange_bf16_output": fake_exchange_bf16,
@@ -208,9 +212,7 @@ class TestFp8U4OutputExchangeContracts(unittest.TestCase):
     def test_static_fp8_output_scale_rejects_unqualified_linears(self):
         cases = {
             "unquantized_method": _make_linear(quant_method=_FakeUnquantMethod()),
-            "subclass_method": _make_linear(
-                quant_method=type("SubFP8", (_FakeFP8Method,), {})()
-            ),
+            "subclass_method": _make_linear(quant_method=type("SubFP8", (_FakeFP8Method,), {})()),
             "wrong_dtype_none": _make_linear(dtype=None),
             "wrong_dtype_fp16": _make_linear(dtype="fp16"),
             "tp_all_reduce": _make_linear(all_reduce=object()),

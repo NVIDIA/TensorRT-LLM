@@ -29,7 +29,9 @@ def _is_supported_fp8_vae_cuda(device: torch.device) -> bool:
     )
 
 
-def configure_u4_video_vae_pre_load(vae, device: torch.device, *, max_shapes: int | None = None) -> bool:
+def configure_u4_video_vae_pre_load(
+    vae, device: torch.device, *, max_shapes: int | None = None
+) -> bool:
     """Enable VAE decoder chunk CUDA graphs on SM103/SM107 before ``super().post_load_weights()``."""
     if vae is None or not _is_supported_fp8_vae_cuda(device):
         return False

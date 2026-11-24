@@ -17,7 +17,7 @@ from tensorrt_llm._torch.visual_gen.models.minimax_h3.minimax_h3_fp8__sm_103_107
 )
 
 
-class _HarnessBlock(block_ops.Fp8UlyssesMlpMixin, Fp8UlyssesBlock):
+class _HarnessBlock(Fp8UlyssesBlock):
     def __init__(self) -> None:
         torch.nn.Module.__init__(self)
 

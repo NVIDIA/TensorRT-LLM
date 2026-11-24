@@ -143,7 +143,11 @@ def exchange_fp8_output(
         )
     rows = attn_out.shape[1] // _ULYSSES_SIZE
     flat = attn_out.contiguous().reshape(-1)
-    send = quantize_static_fp8(flat, input_scale).view(torch.uint8).view(_ULYSSES_SIZE, rows, _LOCAL_WIDTH)
+    send = (
+        quantize_static_fp8(flat, input_scale)
+        .view(torch.uint8)
+        .view(_ULYSSES_SIZE, rows, _LOCAL_WIDTH)
+    )
     recv = torch.empty_like(send)
     torch.distributed.all_to_all_single(recv.view(-1), send.view(-1), group=group)
     return unpack_u4_output(recv, block_r=block_r).view(torch.float8_e4m3fn)

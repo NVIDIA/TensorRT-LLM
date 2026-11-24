@@ -72,7 +72,7 @@ def _config(
         quant_config_dict=layer_quant,
         dynamic_weight_quant=dynamic,
         attention=SimpleNamespace(backend=backend, quant_attention_config=qac),
-        visual_gen_mapping=SimpleNamespace(ulysses_size=ulysses),
+        visual_gen_mapping=SimpleNamespace(ulysses_size=ulysses, world_size=ulysses, cp_size=1),
         mapping=SimpleNamespace(tp_size=tp),
         parallel=SimpleNamespace(async_ulysses=async_ulysses),
         extra_attrs=extra,
