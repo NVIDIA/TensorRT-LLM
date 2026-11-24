@@ -27,6 +27,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.testclient import TestClient
 
+from tensorrt_llm.executor.utils import EngineDeadError, RequestError
 from tensorrt_llm.inputs.chat_template_guard import UnusedChatTemplateKwargsError
 from tensorrt_llm.serve import openai_server as openai_server_module
 from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
@@ -624,16 +625,25 @@ def test_chat_stream_cancelled_by_a_disconnect_logs_no_error(monkeypatch, server
     "steps", [[], [["data: one\n\n"]]], ids=["before_the_first_frame", "after_a_frame"]
 )
 @pytest.mark.parametrize("route", ["openai_chat", "chat_harmony"])
+@pytest.mark.parametrize(
+    ("failure", "client_message"),
+    [
+        (EngineDeadError(RuntimeError("worker rank 3 (pid 4242) exited")), "Internal server error"),
+        (RequestError("worker rank 3 (pid 4242) rejected the request"), None),
+    ],
+    ids=["internal_failure", "request_error"],
+)
 def test_chat_stream_logs_a_failure_and_ends_with_an_error_event(
-    monkeypatch, server_logger, route, steps
+    monkeypatch, server_logger, failure, client_message, route, steps
 ):
     """A failed generation is logged, and the stream ends with an error event and [DONE].
 
-    A completion stream ends the same way, because HTTP 200 was already sent.
+    A completion stream ends the same way, because HTTP 200 was already sent. The event carries
+    a request error's message, and a generic message for an internal failure.
     """
 
     async def run():
-        generation = _StreamedGeneration(steps, then=RuntimeError("engine failed"))
+        generation = _StreamedGeneration(steps, then=failure)
         stream, server = await _chat_stream(monkeypatch, generation, route)
         return [frame async for frame in stream], server
 
@@ -643,11 +653,11 @@ def test_chat_stream_logs_a_failure_and_ends_with_an_error_event(
     assert frames[: len(sent)] == sent
     # OpenAI clients raise on an event whose data carries an "error" object.
     error = json.loads(frames[len(sent)][len("data: ") :])["error"]
-    assert (error["message"], error["type"]) == ("engine failed", "server_error")
+    assert (error["message"], error["type"]) == (client_message or str(failure), "server_error")
     assert frames[len(sent) + 1 :] == ["data: [DONE]\n\n"]
     server._extract_metrics.assert_not_awaited()
     server_logger.error.assert_called_once()
-    assert "engine failed" in server_logger.error.call_args.args[0]
+    assert str(failure) in server_logger.error.call_args.args[0]
 
 
 def test_chat_stream_failure_after_done_adds_no_error_event(monkeypatch, server_logger):
