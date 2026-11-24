@@ -15,6 +15,7 @@
 import contextlib
 import enum
 import errno
+import gc
 import itertools
 import json
 import math
@@ -27,6 +28,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import weakref
 from types import SimpleNamespace
 from typing import Any, List
 
@@ -3480,18 +3482,43 @@ def test_parallel_jit_warmup_runs_pending_profiles_on_a_thread_pool(
     tuner.clear_cache()
 
 
-def test_parallel_jit_warmup_worker_failure_is_left_to_profiling(monkeypatch):
+@pytest.mark.parametrize("unprintable_later", [False, True])
+def test_parallel_jit_warmup_worker_failure_is_left_to_profiling(
+        monkeypatch, unprintable_later):
     """A profile that fails on the warmup pool does not fail choose_one: the
-    profiling loop still runs every profile on the calling thread."""
+    profiling loop still runs every profile on the calling thread, after the
+    failed probes' tensors have been released without cyclic GC, even when
+    a later failure's message cannot be formatted."""
     monkeypatch.delenv("TLLM_AUTOTUNER_PARALLEL_JIT_WARMUP", raising=False)
     caller = threading.get_ident()
+    warmup_tensors: list[weakref.ReferenceType[torch.Tensor]] = []
+    retained_while_profiling: list[bool] = []
+    messages: list[str] = []
+    warmup_thread_calls = threading.local()
+    unprintable_failure_raised = threading.Event()
+    monkeypatch.setattr(autotuner.logger, "info", messages.append)
+
+    class UnprintableWarmupError(RuntimeError):
+
+        def __str__(self):
+            raise ReferenceError("failure message is unavailable")
 
     class WorkerFailingRunner(ThreadRecordingRunner):
         calls: list[tuple[int, int]] = []
 
         def forward(self, /, inputs, *, tactic=-1, **kwargs):
             if threading.get_ident() != caller:
+                workspace = torch.empty_like(inputs[0])
+                warmup_tensors.extend(
+                    (weakref.ref(inputs[0]), weakref.ref(workspace)))
+                if unprintable_later:
+                    if getattr(warmup_thread_calls, "has_failed", False):
+                        unprintable_failure_raised.set()
+                        raise UnprintableWarmupError()
+                    warmup_thread_calls.has_failed = True
                 raise RuntimeError("fails on warmup threads only")
+            retained_while_profiling.append(
+                any(reference() is not None for reference in warmup_tensors))
             return super().forward(inputs, tactic=tactic, **kwargs)
 
     tuner = AutoTuner.get()
@@ -3499,18 +3526,34 @@ def test_parallel_jit_warmup_worker_failure_is_left_to_profiling(monkeypatch):
     buckets = (4, 8, 16, 32, 64, 128)
     config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
         0, 0, buckets), ),
-                          parallel_jit_warmup=4)
+                          parallel_jit_warmup=2 if unprintable_later else 4)
     x = torch.randn(128, 64, device="cuda")
     w = torch.randn(64, 128, device="cuda")
-    with autotune():
-        tuner.choose_one("autotuner_test::parallel_jit_warmup_worker_failure",
-                         [WorkerFailingRunner()], config, [x, w])
+    gc_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        with autotune():
+            tuner.choose_one(
+                "autotuner_test::parallel_jit_warmup_worker_failure",
+                [WorkerFailingRunner()], config, [x, w])
 
-    assert {m for m, _ in WorkerFailingRunner.calls} == set(buckets)
-    assert all(t == caller for _, t in WorkerFailingRunner.calls)
-    assert not tuner.stats.failed_profiling_count.get(
-        "autotuner_test::parallel_jit_warmup_worker_failure")
-    tuner.clear_cache()
+        assert len(warmup_tensors) == 2 * len(buckets)
+        if unprintable_later:
+            assert unprintable_failure_raised.is_set()
+        assert retained_while_profiling and not any(retained_while_profiling)
+        assert all(reference() is None for reference in warmup_tensors)
+        assert {m for m, _ in WorkerFailingRunner.calls} == set(buckets)
+        assert all(t == caller for _, t in WorkerFailingRunner.calls)
+        assert not tuner.stats.failed_profiling_count.get(
+            "autotuner_test::parallel_jit_warmup_worker_failure")
+        assert any(f"{len(buckets)} failed and are left to profiling "
+                   "(RuntimeError: fails on warmup threads only)" in message
+                   for message in messages)
+    finally:
+        tuner.clear_cache()
+        if gc_enabled:
+            gc.enable()
+        gc.collect()
 
 
 @pytest.mark.parametrize(

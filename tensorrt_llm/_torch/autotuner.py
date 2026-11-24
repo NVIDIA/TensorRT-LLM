@@ -23,6 +23,7 @@ import inspect
 import itertools
 import json
 import os
+import threading
 import time
 import zlib
 from abc import ABC, abstractmethod
@@ -1989,9 +1990,12 @@ class AutoTuner:
         # One stream for all workers: the allocator caches their blocks where
         # the profiling loop below allocates, and GPU time is not the cost here.
         stream = torch.cuda.current_stream()
-        failures = []
+        failure_count = 0
+        first_failure = ""
+        failure_lock = threading.Lock()
 
         def warm(profile: OptimizationProfile) -> None:
+            nonlocal failure_count, first_failure
             torch.cuda.set_device(device)
             try:
                 with torch.cuda.stream(stream):
@@ -2003,8 +2007,12 @@ class AutoTuner:
                                 tensors, profile, **kwargs):
                             runner(tensors, tactic=tactic, **kwargs)
                     stream.synchronize()
-            except Exception as e:  # noqa: BLE001 - the profiling loop reports it
-                failures.append(e)
+            except Exception as exc:  # noqa: BLE001 - the profiling loop reports it
+                with failure_lock:
+                    failure_count += 1
+                    is_first_failure = failure_count == 1
+                if is_first_failure:
+                    first_failure = f"{type(exc).__name__}: {exc}"
 
         start = time.perf_counter()
         with concurrent.futures.ThreadPoolExecutor(
@@ -2014,9 +2022,8 @@ class AutoTuner:
         logger.info(f"[Autotuner] {custom_op}: ran {len(order)} profiles on "
                     f"{num_threads} threads to drive their JIT in "
                     f"{time.perf_counter() - start:.1f}s" +
-                    (f"; {len(failures)} failed and are left to profiling "
-                     f"({type(failures[0]).__name__}: {failures[0]})"
-                     if failures else ""))
+                    (f"; {failure_count} failed and are left to profiling "
+                     f"({first_failure})" if failure_count else ""))
 
     @staticmethod
     def _run_profile_runner(runner: TunableRunner, inputs: List[torch.Tensor],
