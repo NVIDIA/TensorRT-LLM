@@ -1093,6 +1093,96 @@ class PrimsTSFmha(PhasedFmha):
             return 1, 1
         return int(metadata.mapping.cp_size), int(metadata.tokens_per_block)
 
+    def _mla_decode_static_unsupported_reason(
+        self, layer: torch.nn.Module, metadata: "TrtllmAttentionMetadata"
+    ) -> Optional[str]:
+        """Return why this layer's MLA generation cannot use PrimTS, from configuration alone.
+
+        Covers the request-independent conditions of :meth:`_is_supported_with_reason`
+        for generation-only MLA. Dispatch still checks every request.
+        """
+        attn = self.attn
+        if not attn.is_mla_enable:
+            return "the layer is not MLA."
+        if not self._explicitly_enabled and get_sm_version() not in self.SUPPORTED_MLA_SMS:
+            return "MLA generation is enabled by the performance policy only on SM100/SM103/SM107."
+        if metadata.is_cross:
+            return "cross attention is not supported."
+        if getattr(layer, "out_scale", None) is not None:
+            return "quantized attention output is not supported."
+        if attn.sparse_params is not None or metadata.num_sparse_topk > 0:
+            return "sparse attention is not supported."
+        reason = get_paged_kv_storage_unsupported_reason(attn, metadata)
+        if reason is None:
+            reason = get_paged_kv_policy_unsupported_reason(
+                attn, metadata, allow_fp8_kv_cache=True, allow_linear_mla=True
+            )
+        if reason is not None:
+            return reason
+        if metadata.tokens_per_block not in self.SUPPORTED_PAGE_SIZES:
+            return f"page size {metadata.tokens_per_block} is unsupported."
+        if attn.num_kv_heads != 1 or not 0 < attn.num_heads <= 128:
+            return "MLA decode requires one KV head and at most 128 local query heads."
+        if getattr(layer, "dtype", None) != torch.bfloat16:
+            return "MLA decode requires BF16 query input and output."
+        if attn.kv_lora_rank != 512 or attn.qk_rope_head_dim != 64:
+            return "MLA decode requires kv_lora_rank=512 and qk_rope_head_dim=64."
+        if attn.head_dim != attn.kv_lora_rank + attn.qk_rope_head_dim:
+            return "MLA head dimension must equal the latent plus RoPE dimensions."
+        if attn.qk_nope_head_dim is None or attn.qk_nope_head_dim <= 0:
+            return "MLA decode requires a positive qk_nope_head_dim."
+        is_fp8_kv = QuantMode(attn.quant_mode).has_fp8_kv_cache()
+        expected_dtype = torch.float8_e4m3fn if is_fp8_kv else torch.bfloat16
+        if metadata.kv_cache_manager.dtype != torch_dtype_to_binding(expected_dtype):
+            return "the KV-cache dtype does not match the MLA decode kernel."
+        if is_fp8_kv and getattr(metadata.kv_cache_manager, "mla_kv_cache_residual_dim", 0):
+            return "FP8 MLA requires a full FP8 KV cache without a high-precision residual."
+        return None
+
+    def mla_decode_warmup_profile(
+        self, layer: torch.nn.Module, metadata: "TrtllmAttentionMetadata"
+    ) -> Optional[_MlaDecodePlan]:
+        """Return the dense MLA decode plan of a local layer's generation, before any forward.
+
+        The profile carries the arguments :meth:`run_mla_generation` plans with,
+        except the request count and query width, which the caller expands.
+        ``None`` means PrimTS cannot serve this layer's generation.
+        """
+        reason = self._mla_decode_static_unsupported_reason(layer, metadata)
+        if reason is not None:
+            logger.debug(f"PrimTS dense MLA decode warmup skips a layer: {reason}")
+            return None
+        attn = self.attn
+        block_offsets = metadata.kv_cache_block_offsets
+        tokens_per_block = int(metadata.tokens_per_block)
+        kernel_dtype = (
+            torch.float8_e4m3fn if QuantMode(attn.quant_mode).has_fp8_kv_cache() else torch.bfloat16
+        )
+        # MLA generation passes softmax statistics, and so plans base-2 LSE,
+        # exactly when Helix splits the KV cache across context-parallel ranks.
+        helix = metadata.mapping.has_cp_helix()
+        device = block_offsets.device
+        if device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        return _MlaDecodePlan(
+            device=device,
+            batch_size=1,
+            num_qo_heads=int(attn.num_heads),
+            kv_lora_rank=int(attn.kv_lora_rank),
+            qk_rope_head_dim=int(attn.qk_rope_head_dim),
+            page_size=tokens_per_block,
+            max_kv_len=int(block_offsets.shape[-1]) * tokens_per_block,
+            max_q_len=1,
+            packed_query=False,
+            q_dtype=kernel_dtype,
+            kv_dtype=kernel_dtype,
+            out_dtype=torch.bfloat16,
+            mask_type="causal",
+            lse_mode="base2" if helix else "none",
+            cp_world=int(metadata.mapping.cp_size) if helix else 1,
+            cp_interleave_size=tokens_per_block if helix else 1,
+        )
+
     def forward(
         self,
         q: torch.Tensor,

@@ -146,6 +146,17 @@ def encode_payload(device_index: int, rows: int, heads: int, plan_kwargs: dict) 
     return {"device_index": device_index, "rows": rows, "heads": heads, "plan_kwargs": kwargs}
 
 
+DENSE_MLA_DECODE = "dense_mla_decode"
+
+
+def encode_dense_payload(device_index: int, plan_kwargs: dict) -> dict[str, Any]:
+    """JSON-safe description of one ``BatchMLADecodePagedTSWrapper.plan`` call."""
+    kwargs = dict(plan_kwargs)
+    for name in ("q_dtype", "kv_dtype", "out_dtype"):
+        kwargs[name] = str(kwargs[name]).removeprefix("torch.")
+    return {"kind": DENSE_MLA_DECODE, "device_index": device_index, "plan_kwargs": kwargs}
+
+
 def run_precompile_workers(payloads: Sequence[dict[str, Any]], workers: int) -> None:
     """Run the encoded plans with up to ``workers`` compiler processes and join them."""
     from tensorrt_llm.llmapi._llmapi_process_guard import _cleanup_group
@@ -210,6 +221,6 @@ def precompile_payloads(payloads: Sequence[dict[str, Any]], *, local_ranks: int 
         )
         return
     logger.info(
-        f"PrimTS sparse MLA precompiled {len(payloads)} kernel variants with {workers} workers "
+        f"PrimTS MLA precompiled {len(payloads)} kernel variants with {workers} workers "
         f"in {time.perf_counter() - start:.1f} s"
     )

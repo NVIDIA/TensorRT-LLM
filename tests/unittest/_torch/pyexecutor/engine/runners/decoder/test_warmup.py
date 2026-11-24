@@ -1082,9 +1082,12 @@ def test_decode_prewarm_failure_still_reaches_barrier() -> None:
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("kind", ["sparse", "dense"])
 @pytest.mark.parametrize("cp_size,tp_size", [(1, 4), (2, 1)])
-def test_prims_ts_prewarm_prepares_metadata_and_barriers(cp_size: int, tp_size: int) -> None:
-    from tensorrt_llm._torch.attention.backends.fmha import prims_ts_sparse_mla
+def test_prims_ts_prewarm_prepares_metadata_and_barriers(
+    kind: str, cp_size: int, tp_size: int
+) -> None:
+    from tensorrt_llm._torch.attention.backends.fmha import prims_ts_mla_warmup, prims_ts_sparse_mla
     from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.metadata import (
         DeepseekV4TrtllmAttentionMetadata,
     )
@@ -1099,50 +1102,79 @@ def test_prims_ts_prewarm_prepares_metadata_and_barriers(cp_size: int, tp_size: 
 
     owner = SimpleNamespace(
         _config=SimpleNamespace(
-            attention_backend=SimpleNamespace(Metadata=DeepseekV4TrtllmAttentionMetadata),
+            attention_backend=SimpleNamespace(
+                Metadata=DeepseekV4TrtllmAttentionMetadata
+                if kind == "sparse"
+                else TrtllmAttentionMetadata
+            ),
             spec_config=MTPDecodingConfig(max_draft_len=5),
+            max_batch_size=8,
+            max_num_tokens=64,
         ),
         _metadata=SimpleNamespace(setup_attention=Mock(side_effect=build_metadata)),
+        _prims_ts_dense_mla_warmup=Mock(),
         model=object(),
-        mapping=SimpleNamespace(cp_size=cp_size, tp_size=tp_size),
+        mapping=SimpleNamespace(
+            cp_size=cp_size, tp_size=tp_size, world_size=cp_size * tp_size, gpus_per_node=8
+        ),
         dist=Mock(),
     )
     gather = owner.dist.tp_cp_allgather if cp_size > 1 else owner.dist.tp_allgather
     gather.side_effect = lambda status: events.append("gather") or [status, None]
     manager, draft_manager = Mock(spec=KVCacheManagerV2), Mock(spec=KVCacheManagerV2)
     resources = ResourceManager({ResourceManagerType.DRAFT_KV_CACHE_MANAGER: draft_manager})
-    with (
-        patch.object(
-            prims_ts_sparse_mla,
-            "warmup_prims_ts_sparse_mla",
-            side_effect=lambda *args, **kwargs: events.append("kernels"),
-        ) as warm,
-        patch.object(torch.cuda, "synchronize", side_effect=lambda: events.append("sync")),
-    ):
-        DecoderWarmup._prewarm_prims_ts_sparse_mla(owner, resources, manager)
+    prewarm = getattr(DecoderWarmup, f"_prewarm_prims_ts_{kind}_mla")
+    layers = [(object(), object())]
+    with contextlib.ExitStack() as stack:
+        if kind == "sparse":
+            warm = stack.enter_context(
+                patch.object(
+                    prims_ts_sparse_mla,
+                    "warmup_prims_ts_sparse_mla",
+                    side_effect=lambda *args, **kwargs: events.append("kernels"),
+                )
+            )
+        else:
+            stack.enter_context(
+                patch.object(prims_ts_mla_warmup, "dense_mla_decode_layers", return_value=layers)
+            )
+            warm = owner._prims_ts_dense_mla_warmup.prepare
+            warm.side_effect = lambda *args, **kwargs: events.append("kernels")
+        stack.enter_context(
+            patch.object(torch.cuda, "synchronize", side_effect=lambda: events.append("sync"))
+        )
+        prewarm(owner, resources, manager)
         assert events == ["metadata", "kernels", "sync", "gather"]
         gather.assert_called_once_with(None)
         assert metadata.cu_seq_lens.is_inference()
-        warm.assert_called_once_with(owner.model, metadata)
+        if kind == "sparse":
+            warm.assert_called_once_with(owner.model, metadata)
+        else:
+            warm.assert_called_once_with(
+                layers, metadata, max_batch_size=8, max_num_tokens=64, local_ranks=cp_size * tp_size
+            )
         owner._metadata.setup_attention.assert_called_once_with(manager, draft_manager)
 
         if cp_size > 1:
             local_error = FileNotFoundError("missing kernel")
             warm.side_effect = local_error
             with pytest.raises(FileNotFoundError) as failed:
-                DecoderWarmup._prewarm_prims_ts_sparse_mla(owner, resources, manager)
+                prewarm(owner, resources, manager)
             assert failed.value is local_error
             gather.assert_called_with("FileNotFoundError: missing kernel")
         else:
             gather.side_effect = None
             gather.return_value = [None, "FileNotFoundError: missing kernel"]
             with pytest.raises(RuntimeError, match="on a peer: FileNotFoundError: missing kernel"):
-                DecoderWarmup._prewarm_prims_ts_sparse_mla(owner, resources, manager)
+                prewarm(owner, resources, manager)
 
         events.clear()
         owner.dist.reset_mock()
-        owner._config.attention_backend.Metadata = TrtllmAttentionMetadata
-        DecoderWarmup._prewarm_prims_ts_sparse_mla(owner, resources, manager)
+        if kind == "sparse":
+            owner._config.attention_backend.Metadata = TrtllmAttentionMetadata
+        else:
+            layers.clear()
+        prewarm(owner, resources, manager)
         assert events == [] and not owner.dist.mock_calls
 
 

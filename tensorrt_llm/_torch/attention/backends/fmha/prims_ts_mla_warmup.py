@@ -1,10 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Startup-only planning for dense MLA profiles already selected by PrimTS."""
+"""Startup-only planning for dense PrimTS MLA profiles.
+
+Decode kernels are prepared from layer configuration before the first warmup
+forward; profiles that forwards selected are completed after graph capture.
+"""
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import asdict, dataclass, replace
 from enum import Enum, auto
 from functools import partial
@@ -14,6 +18,9 @@ import torch
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+    from tensorrt_llm._torch.attention.mla import MLA
+
+    from .prims_ts import PrimsTSFmha
 
 
 class _ScaleKind(Enum):
@@ -184,17 +191,182 @@ def _plan_decode(profile: _MlaDecodePlan, workspace: torch.Tensor) -> None:
         del wrapper, workspace
 
 
+def _decode_workspace_size(profile: _MlaDecodePlan) -> int:
+    from tensorrt_llm._torch.attention.backends.prims_ts import (
+        get_prims_ts_batch_mla_decode_workspace_size,
+    )
+
+    return get_prims_ts_batch_mla_decode_workspace_size(
+        batch_size=profile.batch_size,
+        num_qo_heads=profile.num_qo_heads,
+        kv_lora_rank=profile.kv_lora_rank,
+        qk_rope_head_dim=profile.qk_rope_head_dim,
+        page_size=profile.page_size,
+        max_kv_len=profile.max_kv_len,
+        max_q_len=profile.max_q_len,
+        q_dtype=profile.q_dtype,
+        kv_dtype=profile.kv_dtype,
+        out_dtype=profile.out_dtype,
+        mask_type=profile.mask_type,
+        cp_world=profile.cp_world,
+        cp_interleave_size=profile.cp_interleave_size,
+        device=profile.device,
+    )
+
+
+def _decode_batch_sizes(width: int, *, max_batch_size: int, max_num_tokens: int) -> range:
+    return range(1, min(max_batch_size, max_num_tokens // width) + 1)
+
+
+def decode_query_widths(metadata: TrtllmAttentionMetadata) -> tuple[int, ...]:
+    """Query widths of dense MLA generation: one token, plus the verification
+    width of a static draft length (``1 + max_total_draft_tokens``)."""
+    draft = int(getattr(metadata, "max_total_draft_tokens", None) or 0)
+    return (1,) if draft <= 0 else (1, 1 + draft)
+
+
+def dense_mla_decode_layers(model: torch.nn.Module) -> list[tuple[MLA, PrimsTSFmha]]:
+    """Local dense MLA layers whose generation backend enables PrimTS."""
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
+    from tensorrt_llm._torch.attention.mla import MLA
+
+    from .prims_ts import PrimsTSFmha
+
+    layers = []
+    for module in model.modules():
+        if not isinstance(module, MLA) or module.sparse_attn_hooks is not None:
+            continue
+        if not any(True for _ in module.parameters()):
+            continue  # Another pipeline stage owns this layer.
+        backend = module.mqa
+        manager = getattr(backend, "_fmha_manager", None)
+        if not isinstance(backend, TrtllmAttention) or manager is None:
+            continue
+        layers.extend(
+            (module, library) for library in manager.fmha_libs if isinstance(library, PrimsTSFmha)
+        )
+    return layers
+
+
 class PrimsTSDenseMlaWarmup:
     """Deduplicate public startup profiles without retaining runtime workspace.
 
-    Context covers the configured normalized envelope. Decode expands batch
-    counts only for widths and modes observed in this model's startup plans;
-    arbitrary future proposal widths from variable drafters are not inferred.
-    PrimTS owns compiled-kernel deduplication behind its public plan methods.
+    :meth:`prepare` loads decode kernels from layer configuration before the
+    first forward. :meth:`run` then completes the profiles forwards selected:
+    context covers the configured normalized envelope, and decode expands
+    batch counts for the widths and modes observed in this model's startup
+    plans; arbitrary future proposal widths from variable drafters are not
+    inferred. PrimTS owns compiled-kernel deduplication behind its public plan
+    methods.
     """
 
     def __init__(self) -> None:
         self._completed: set[_MlaContextPlan | _MlaDecodePlan] = set()
+
+    def prepare(
+        self,
+        layers: Sequence[tuple[MLA, PrimsTSFmha]],
+        metadata: TrtllmAttentionMetadata | None,
+        *,
+        max_batch_size: int,
+        max_num_tokens: int,
+        local_ranks: int = 1,
+    ) -> tuple[int, int]:
+        """Load every dense decode kernel the layers' generation can select.
+
+        Each layer's profile (:meth:`PrimsTSFmha.mla_decode_warmup_profile`) is
+        expanded over :func:`decode_query_widths` and every request count the
+        batch limits allow. Plans resolved without compiling identify the
+        distinct kernels; with the PrimTS precompile pool enabled, kernels
+        missing from the disk cache compile in parallel worker processes. This
+        process then loads each kernel once, so no warmup forward compiles one.
+        With ``FLASHINFER_DISABLE_JIT=1``, a kernel missing from the disk cache
+        is skipped; a forward that selects it reports the miss.
+        Returns the numbers of distinct kernels and of worker compile requests.
+        """
+        from flashinfer.jit.core import MissingJITCacheError
+
+        from tensorrt_llm._torch.attention.backends.prims_ts.mla_decode import (
+            BatchMLADecodePagedTSWrapper,
+        )
+        from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+        from tensorrt_llm.logger import logger
+
+        from . import prims_ts_precompile
+
+        if not isinstance(metadata, TrtllmAttentionMetadata):
+            return 0, 0
+        templates = {
+            profile
+            for layer, library in layers
+            if (profile := library.mla_decode_warmup_profile(layer, metadata)) is not None
+            and profile.device.type == "cuda"
+        }
+        profiles = {
+            replace(template, batch_size=batch_size, max_q_len=width)
+            for template in templates
+            for width in decode_query_widths(metadata)
+            for batch_size in _decode_batch_sizes(
+                width, max_batch_size=max_batch_size, max_num_tokens=max_num_tokens
+            )
+        } - self._completed
+        if not profiles:
+            return 0, 0
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("PrimTS dense MLA startup planning cannot run during capture.")
+
+        can_fan_out = prims_ts_precompile.pool_enabled(local_ranks=local_ranks)
+        # One representative plan per distinct kernel. Plans differ in request
+        # count and width; kernels differ only where the launch policy changes.
+        # Planning without compiling allocates no workspace.
+        kernels: dict[object, _MlaDecodePlan] = {}
+        payloads = []
+        wrapper = BatchMLADecodePagedTSWrapper()
+        for profile in sorted(profiles, key=lambda p: (p.max_q_len, p.batch_size)):
+            wrapper.plan(**asdict(profile), zero_empty_rows=False, compile=False)
+            kernel = wrapper._plan_state.compile_spec
+            if kernel in kernels:
+                continue
+            kernels[kernel] = profile
+            if can_fan_out and not wrapper.is_kernel_cached():
+                plan_kwargs = asdict(profile)
+                device = plan_kwargs.pop("device")
+                plan_kwargs["zero_empty_rows"] = False
+                device_index = (
+                    device.index if device.index is not None else torch.cuda.current_device()
+                )
+                payloads.append(prims_ts_precompile.encode_dense_payload(device_index, plan_kwargs))
+        del wrapper
+        if payloads:
+            prims_ts_precompile.precompile_payloads(payloads, local_ranks=local_ranks)
+
+        workspace_sizes: dict[torch.device, int] = {}
+        for profile in kernels.values():
+            size = _decode_workspace_size(profile)
+            workspace_sizes[profile.device] = max(workspace_sizes.get(profile.device, 0), size)
+        workspaces: dict[torch.device, torch.Tensor] = {}
+        deferred = 0
+        try:
+            for device, size in workspace_sizes.items():
+                workspaces[device] = torch.empty(size, dtype=torch.uint8, device=device)
+            for profile in kernels.values():
+                try:
+                    _plan_decode(profile, workspaces[profile.device])
+                except MissingJITCacheError:
+                    # With JIT disabled, let a forward that selects this kernel report the miss.
+                    deferred += 1
+        finally:
+            workspaces.clear()
+        # Each expanded profile's kernel is loaded in this process or, with JIT
+        # disabled and the kernel missing from the disk cache, left to the forward.
+        self._completed.update(profiles)
+        logger.info(
+            f"PrimTS dense MLA decode prepared {len(kernels) - deferred} kernels for "
+            f"{len(profiles)} profiles before the first forward ({len(payloads)} sent to the "
+            f"precompile pool, {deferred} cache misses deferred); "
+            f"query widths: {sorted({p.max_q_len for p in profiles})}."
+        )
+        return len(kernels), len(payloads)
 
     def run(
         self,
@@ -206,9 +378,6 @@ class PrimsTSDenseMlaWarmup:
         max_seq_len: int,
     ) -> tuple[int, int]:
         """Load selected providers' missing profiles outside CUDA graph capture."""
-        from tensorrt_llm._torch.attention.backends.prims_ts import (
-            get_prims_ts_batch_mla_decode_workspace_size,
-        )
         from tensorrt_llm._torch.attention.backends.trtllm import (
             TrtllmAttention,
             TrtllmAttentionMetadata,
@@ -256,22 +425,7 @@ class PrimsTSDenseMlaWarmup:
         } - self._completed
         workspace_sizes: dict[torch.device, int] = {}
         for profile in decodes:
-            size = get_prims_ts_batch_mla_decode_workspace_size(
-                batch_size=profile.batch_size,
-                num_qo_heads=profile.num_qo_heads,
-                kv_lora_rank=profile.kv_lora_rank,
-                qk_rope_head_dim=profile.qk_rope_head_dim,
-                page_size=profile.page_size,
-                max_kv_len=profile.max_kv_len,
-                max_q_len=profile.max_q_len,
-                q_dtype=profile.q_dtype,
-                kv_dtype=profile.kv_dtype,
-                out_dtype=profile.out_dtype,
-                mask_type=profile.mask_type,
-                cp_world=profile.cp_world,
-                cp_interleave_size=profile.cp_interleave_size,
-                device=profile.device,
-            )
+            size = _decode_workspace_size(profile)
             workspace_sizes[profile.device] = max(workspace_sizes.get(profile.device, 0), size)
 
         workspaces: dict[torch.device, torch.Tensor] = {}

@@ -286,6 +286,11 @@ def test_decoder_runner_warmup_bypasses_only_auxiliary_phases(monkeypatch, enabl
     )
     monkeypatch.setattr(
         warmup,
+        "_prewarm_prims_ts_dense_mla",
+        lambda *args: observed.append(("prims_ts_dense", None)),
+    )
+    monkeypatch.setattr(
+        warmup,
         "_prewarm_fmha_libraries",
         lambda _: observed.append(("_prewarm_fmha_libraries", None)),
     )
@@ -321,6 +326,7 @@ def test_decoder_runner_warmup_bypasses_only_auxiliary_phases(monkeypatch, enabl
     assert observed == [
         ("_prewarm_fmha_libraries", None),
         ("prims_ts", None),
+        ("prims_ts_dense", None),
         ("_run_attention_warmup", not enabled),
         ("_general_warmup", True),
         ("_run_autotuner_warmup", not enabled),

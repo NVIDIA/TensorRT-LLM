@@ -54,10 +54,17 @@ def _plan(payload: dict[str, Any]) -> None:
     from tensorrt_llm._torch.attention.backends.prims_ts import mla_decode
 
     kwargs = payload["plan_kwargs"].copy()
-    kwargs["q_dtype"] = getattr(torch, kwargs["q_dtype"])
-    wrapper = mla_decode.BatchSparseMLADecodePagedTSWrapper()
     try:
-        wrapper.plan(device, payload["rows"], payload["heads"], **kwargs)
+        # prims_ts_precompile.DENSE_MLA_DECODE; this standalone script cannot import it.
+        if payload.get("kind") == "dense_mla_decode":
+            for name in ("q_dtype", "kv_dtype", "out_dtype"):
+                kwargs[name] = getattr(torch, kwargs[name])
+            wrapper = mla_decode.BatchMLADecodePagedTSWrapper()
+            wrapper.plan(device, **kwargs)
+        else:
+            kwargs["q_dtype"] = getattr(torch, kwargs["q_dtype"])
+            wrapper = mla_decode.BatchSparseMLADecodePagedTSWrapper()
+            wrapper.plan(device, payload["rows"], payload["heads"], **kwargs)
     except Exception as error:
         # Native compilation failures need the specialization that triggered them.
         raise RuntimeError(f"PrimTS worker could not compile {payload!r}: {error}") from error

@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
 import functools
 import inspect
 import math
@@ -861,6 +862,15 @@ def _run_prims_ts_kimi_k3_full_attention(
             assert isinstance(params.meta.kv_cache_manager, KVCacheManagerV2)
         generation_calls.append(params.batch_size)
         run_generation(fmha, params)
+        # Startup derives this plan from configuration before any forward.
+        profile = fmha.mla_decode_warmup_profile(module, params.meta)
+        assert profile is not None
+        assert (
+            dataclasses.replace(
+                profile, batch_size=params.batch_size, max_q_len=params.input_seq_length
+            )
+            in fmha._mla_decode_plan_profiles
+        )
 
     monkeypatch.setattr(PrimsTSFmha, "run_mla_context", record_context)
     monkeypatch.setattr(PrimsTSFmha, "run_mla_generation", record_generation)
