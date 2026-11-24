@@ -14,10 +14,12 @@
 # limitations under the License.
 """Environment variables read by trtllm-serve.
 
-Every variable that ``tensorrt_llm/serve/`` (except ``scripts/``) and the
-trtllm-serve CLI (``tensorrt_llm/commands/serve.py``,
-``tensorrt_llm/commands/serve_cli/``) read is declared here once, with its
-type, its default and what it does. Read a variable as ``envs.NAME`` after
+Every variable that ``tensorrt_llm/serve/`` and the trtllm-serve CLI
+(``tensorrt_llm/commands/serve.py``, ``tensorrt_llm/commands/serve_cli/``) read
+is declared here once, with its type, its default and what it does. Exceptions
+are the published ``scripts/`` client package and the ``render/trtllm-render``
+bootstrap, which reads ``CUDA_HOME`` before it can import ``tensorrt_llm``.
+Read a variable as ``envs.NAME`` after
 ``from tensorrt_llm.serve import envs``. A lint
 (``tests/unittest/serve/test_envs.py``) rejects direct reads of ``os.environ``
 in those directories and ``from tensorrt_llm.serve.envs import NAME``, which
@@ -288,8 +290,8 @@ _DEPLOY: tuple[EnvVar, ...] = (
         lambda: float(os.environ.get("TRTLLM_DISAGG_COORDINATOR_RESERVATION_TIMEOUT", 180.0)),
         default="180.0",
         description=(
-            "Seconds a disaggregated coordinator holds a worker reservation before it expires; "
-            "a value that is not a number raises ValueError."
+            "Worker reservation lifetime in seconds before the request-timeout floor is applied; "
+            "pooled seats also have a six-hour floor. A value that is not a number raises ValueError."
         ),
     ),
     EnvVar(
@@ -409,8 +411,8 @@ _DEPLOY: tuple[EnvVar, ...] = (
         _raw("TRTLLM_WEB_SEARCH"),
         default="unset: off",
         description=(
-            "Web-search provider behind the Responses API web_search tool (brave, tavily, "
-            "searxng or off); read per request."
+            "Web-search provider behind the Responses API web_search tool (mojeek, wikipedia, "
+            "brave, tavily, searxng or off); read per request."
         ),
     ),
     EnvVar(
@@ -454,7 +456,7 @@ _DEPLOY: tuple[EnvVar, ...] = (
         default="unset: ignore",
         description=(
             "What the Responses endpoint does with a web_search tool it cannot honour: ignore "
-            "or reject; the caller normalizes the value and warns on an unknown one."
+            "or reject. Unknown values warn and select reject (HTTP 400 for an unavailable tool)."
         ),
     ),
     EnvVar(
@@ -491,10 +493,13 @@ _DEPLOY: tuple[EnvVar, ...] = (
         "TRTLLM_DISAGG_SHARED_DRAFT_KV",
         "deploy",
         _raw("TRTLLM_DISAGG_SHARED_DRAFT_KV"),
-        default="unset: auto",
+        default="unset: resolved by the MPI launcher or each worker",
         description=(
             "Whether disaggregated workers share the drafter's KV cache: 1, 0 or auto. The MPI "
-            "worker resolves auto and rejects 1 when the model configuration cannot share it."
+            "launcher leaves unset for attention-TP-only differences or compatible one-sided "
+            "configurations, and resolves it otherwise; explicit auto is always resolved. When "
+            "left unset, workers default to auto only when their manager hosts draft layers. "
+            "An incompatible explicit 1 is rejected."
         ),
         also_read_by=("tensorrt_llm/_torch/pyexecutor/_util.py",),
     ),
@@ -572,7 +577,10 @@ _INTERNAL: tuple[EnvVar, ...] = (
         _raw("TRTLLM_DISAGG_WORKER_PROCESS_ID", "0"),
         default="0",
         description="Index of a fleet worker process (0 to N-1), set per worker by the launcher.",
-        also_read_by=("tensorrt_llm/llmapi/disagg_utils.py",),
+        also_read_by=(
+            "tensorrt_llm/llmapi/disagg_utils.py",
+            "tensorrt_llm/usage/startup_state.py",
+        ),
     ),
     EnvVar(
         "TLLM_DISAGG_INSTANCE_IDX",
@@ -583,6 +591,7 @@ _INTERNAL: tuple[EnvVar, ...] = (
             "Index of the server configuration an MPI worker serves, set by the MPI leader "
             "before it relaunches the worker."
         ),
+        also_read_by=("tensorrt_llm/usage/startup_state.py",),
     ),
     EnvVar(
         "TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT",
@@ -595,11 +604,11 @@ _INTERNAL: tuple[EnvVar, ...] = (
         "TLLM_EXECUTOR_ATTACH_INFO",
         "internal",
         lambda: os.getenv("TLLM_EXECUTOR_ATTACH_INFO") is not None,
-        default="unset: this process is the launcher, not an attached frontend",
+        default="unset: no executor attach information remains in the environment",
         description=(
-            "Present in every attached frontend the launcher starts. It carries the executor's "
-            "attach information, HMAC keys included, which only the executor reads; serving "
-            "code reads just whether it is set."
+            "Executor attach information, including HMAC keys, initially passed to attached "
+            "frontends. Serving code checks only its presence; the executor reads and removes "
+            "it during creation so descendants do not inherit the keys."
         ),
         secret=True,
         also_read_by=("tensorrt_llm/executor/executor.py", "tensorrt_llm/llmapi/llm.py"),
@@ -613,6 +622,7 @@ _INTERNAL: tuple[EnvVar, ...] = (
         also_read_by=(
             "tensorrt_llm/executor/executor.py",
             "tensorrt_llm/grpc/openengine/server.py",
+            "tensorrt_llm/usage/startup_state.py",
         ),
     ),
     EnvVar(
@@ -660,10 +670,12 @@ _INTERNAL: tuple[EnvVar, ...] = (
         default="unset",
         description=(
             "Role of this process in a disaggregated deployment (context, generation, "
-            "coordinator or server_coordinator), set by the launcher for model code and usage "
-            "telemetry."
+            "coordinator or server_coordinator) for model code and usage telemetry. Set by the "
+            "launcher, or by operators for Python API and gRPC deployments before creating "
+            "the model."
         ),
         also_read_by=(
+            "tensorrt_llm/_torch/attention/backends/fp4_mla/cache_manager.py",
             "tensorrt_llm/_torch/configs/deepseek_v41.py",
             "tensorrt_llm/_torch/models/modeling_deepseekv41.py",
             "tensorrt_llm/_torch/pyexecutor/kv_cache/mamba_cache_manager/common.py",
@@ -693,7 +705,10 @@ _EXTERNAL: tuple[EnvVar, ...] = (
             "Global rank of this process, set by Open MPI; the disaggregated MPI worker picks "
             "its CUDA device from it."
         ),
-        also_read_by=("cpp/tensorrt_llm/common/logger.cpp",),
+        also_read_by=(
+            "cpp/tensorrt_llm/common/logger.cpp",
+            "tensorrt_llm/usage/startup_state.py",
+        ),
     ),
     EnvVar(
         "SLURM_PROCID",
@@ -704,7 +719,10 @@ _EXTERNAL: tuple[EnvVar, ...] = (
             "Global rank of this process, set by Slurm; the disaggregated MPI worker uses it "
             "when Open MPI's rank is absent."
         ),
-        also_read_by=("tensorrt_llm/_torch/visual_gen/executor.py",),
+        also_read_by=(
+            "tensorrt_llm/_torch/visual_gen/executor.py",
+            "tensorrt_llm/usage/startup_state.py",
+        ),
     ),
 )
 
