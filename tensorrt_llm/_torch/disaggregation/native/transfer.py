@@ -1339,10 +1339,14 @@ class Sender(SenderBase):
             failures[name] = failures.get(name, 0) + 1
             rebuilt_for = self.__dict__.setdefault("_peer_rebuild_descriptors", {})
             recover = getattr(self, "_recover_agent", None)
+            receives_active = getattr(self, "_receives_active", None)
             if (
                 recover is None
                 or failures[name] < _PEER_LOAD_ATTEMPTS_BEFORE_RECOVERY
                 or rebuilt_for.get(name) == descriptor
+                # A rebuild waits for every receive to retire while all sends stay
+                # fenced; keep this failure peer-local until it can run promptly.
+                or (receives_active is not None and receives_active())
             ):
                 if failures[name] == 1:
                     logger.warning(f"Loading NIXL metadata for peer {name} failed: {error}")
@@ -1931,7 +1935,7 @@ class Sender(SenderBase):
         agent_result = AgentResult.SUCCESS
         drained_failure = (
             AgentResult.FAILED_QUIESCED
-            if write_meta.requires_destination_drain
+            if getattr(write_meta, "requires_destination_drain", False)
             else AgentResult.FAILED
         )
         submitted_and_completed = False
@@ -2017,7 +2021,7 @@ class Sender(SenderBase):
                     f"KV write for {write_meta.unique_rid} still lacks bounce drain evidence: {error}"
                 )
                 agent_result = AgentResult.FAILED
-                if write_meta.requires_destination_drain:
+                if getattr(write_meta, "requires_destination_drain", False):
                     pending_bounce_status = error.status
                 task.fail(RuntimeError(str(error)))
             except _TransferNotSubmittedError as error:
@@ -2082,19 +2086,25 @@ class Sender(SenderBase):
                 write_meta, result_msg, bounce_status=pending_bounce_status
             )
             return
-        self._get_result_dealer(write_meta.peer_endpoint).send(result_msg)
+        bounce = getattr(write_meta, "requires_destination_drain", False)
+        tracked = not owned and isinstance(session, TxSession)
+        try:
+            self._get_result_dealer(write_meta.peer_endpoint).send(result_msg)
+        except Exception:
+            if tracked:
+                # The write itself finished; let cancellation or retirement
+                # settle this peer instead of leaving it in flight for good.
+                session._finish_kv_write(write_meta.peer_rank, final=False, bounce=False)
+            raise
         # A bounce SUCCESS resolves only after the receiver's scatter ACK, so this
         # destination holds no access from this peer once the result is out.
-        if (
-            not owned
-            and getattr(write_meta, "requires_destination_drain", False)
-            and isinstance(session, TxSession)
-        ):
+        if tracked:
             self._send_peer_no_submission(
                 write_meta,
                 session._finish_kv_write(
                     write_meta.peer_rank,
                     final=agent_result != AgentResult.SUCCESS or write_meta.is_last_slice,
+                    bounce=bounce,
                 ),
             )
 
@@ -3736,15 +3746,18 @@ class TxSession(TxSessionBase):
         with self.lock:
             return self._settle_unsubmitted_peer_locked(peer_rank)
 
-    def _finish_kv_write(self, peer_rank: int, *, final: bool) -> Optional[bool]:
-        """Retire a bounce peer's admitted KV write after its result was sent.
+    def _finish_kv_write(self, peer_rank: int, *, final: bool, bounce: bool) -> Optional[bool]:
+        """Retire a peer's admitted KV write after its result was sent.
 
         Returns None unless the worker must report that no further KV write
-        follows: the write was not the peer's last and this session will not
-        send more. Otherwise whether an auxiliary failure must be reported too.
+        reaches a bounce peer: the write was not the peer's last and this
+        session will not send more. Otherwise whether an auxiliary failure must
+        be reported too.
         """
         with self.lock:
             self._kv_writing_peer_ranks.discard(peer_rank)
+            if not bounce:
+                return None
             if final:
                 self._kv_settled_peer_ranks.add(peer_rank)
                 return None
@@ -4652,6 +4665,14 @@ class Receiver(ReceiverBase):
             except Exception as e:
                 logger.warning(f"send_cancel_to_senders: failed for rid={unique_rid}: {e}")
         return sent
+
+    def has_live_sessions(self) -> bool:
+        """Whether any receive session may still hold published destinations."""
+        with self._sessions_lock:
+            return any(
+                not isinstance(entry, weakref.ReferenceType) or entry() is not None
+                for entry in self._sessions.values()
+            )
 
     def _start_listener(self):
         def handle_message(messages: list[bytes]) -> bool:
@@ -6241,6 +6262,13 @@ class TransferWorker:
                             recover(generation)
 
                     self._sender._recover_agent = request_recovery
+                    receiver_ref = weakref.ref(self._receiver)
+
+                    def receives_active() -> bool:
+                        receiver = receiver_ref()
+                        return receiver is not None and receiver.has_live_sessions()
+
+                    self._sender._receives_active = receives_active
                     self._receiver._recovery_sender = weakref.ref(self._sender)
                 else:
                     logger.warning(
