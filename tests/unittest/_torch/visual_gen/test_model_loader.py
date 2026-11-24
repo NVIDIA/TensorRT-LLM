@@ -232,7 +232,7 @@ def test_runtime_lora_checks_target_component_quantization(tmp_path, target_comp
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("step_quant", [False, True])
-def test_pipeline_loader_orders_runtime_lora_before_stage_construction(monkeypatch, step_quant):
+def test_pipeline_loader_orders_runtime_lora_before_component_setup(monkeypatch, step_quant):
     from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
     from tensorrt_llm._torch.visual_gen.offloading import PipelineOffloader
     from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
@@ -258,12 +258,6 @@ def test_pipeline_loader_orders_runtime_lora_before_stage_construction(monkeypat
 
         def all_offload_pipeline_components(self):
             return self.offload_pipeline_components()
-
-        def deferred_transformer_quant_tensor_ids(self):
-            return set()
-
-        def _setup_transformer_quant_graphs(self):
-            pass
 
         def load_transformer_weights(self, checkpoint_dir):
             events.append("load_transformer_weights")

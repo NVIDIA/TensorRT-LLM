@@ -267,8 +267,7 @@ quantization automatically; without it, typed configurations retain static loadi
 They retain both BF16 and quantized Linear weights: roughly 1.5 times the BF16
 weight storage for FP8, or 1.3 times for NVFP4 including scales, before auxiliary
 buffers and loading peaks. These ratios describe weights, not total pipeline memory.
-LoRA-modified stages also retain their own changed weights. Unchanged compatible
-weights are shared between execution paths.
+LoRA-modified stages also retain their own changed weights.
 LTX-2 refinement follows its native LoRA precision policy: NVFP4 LoRA targets
 can use merged BF16 weights.
 

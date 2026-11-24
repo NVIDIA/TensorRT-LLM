@@ -101,6 +101,12 @@ class BaseDiffusionModel(nn.Module):
         the shared registrations.
         """
         quant_config = self.model_config.attention.quant_attention_config
+        if quant_config is not None and quant_config.ignore_steps:
+            state = self.model_config.attention_metadata_state
+            runner.register_extra_key_fn(
+                "attention_quant_ignored",
+                lambda *args, **kwargs: state.get("attention_quant_ignored", False),
+            )
         if (
             quant_config is not None
             and quant_config.vc_attention

@@ -219,7 +219,6 @@ def create_attention(
     max_seq_len: int = 4096,
     attention_config: Optional[AttentionConfig] = None,
     attention_metadata_state: Optional[dict] = None,
-    module_name: Optional[str] = None,
     **kwargs,
 ) -> AttentionBackend:
     """
@@ -245,17 +244,11 @@ def create_attention(
         attention_metadata_state: Optional per-component VisualGen attention state.
             It keeps shape-stable attention metadata alive across layers and
             CUDA Graph captures. Required for TRTLLM and shared by FlashInfer layers.
-        module_name: Attention path used to match quantization exclusions.
         **kwargs: Additional backend-specific arguments
 
     Returns:
         AttentionBackend instance
     """
-    recipe = attention_config.quant_attention_config if attention_config is not None else None
-    if recipe is not None and is_quant_excluded(recipe, module_name):
-        recipe = None
-        kwargs["quant_attention_config"] = None
-
     sparse_config = (
         attention_config.sparse_attention_config if attention_config is not None else None
     )
@@ -263,6 +256,7 @@ def create_attention(
     is_vsa = sparse_algorithm == "vsa"
     is_sol = sparse_algorithm == "sol_attn"
 
+    recipe = getattr(attention_config, "quant_attention_config", None)
     backend_name = backend.upper()
     attn_cls = get_visual_gen_attention_backend(
         backend_name, sparse_algorithm, get_quant_algorithm(recipe)

@@ -1283,6 +1283,7 @@ class TestLTX2TwoStageLoRAHelpers:
             pipeline = Pipeline(config)
             weights = torch.randn(128, 128, dtype=torch.bfloat16)
         pipeline.load_transformer_quant_weights(weights)
+        pipeline._assert_cuda_graph_safe_lora_bindings = lambda: None
         original = pipeline.transformer.proj.weight.detach().clone()
         original_method = pipeline.transformer.proj.quant_method
         future = Future()
@@ -1295,16 +1296,16 @@ class TestLTX2TwoStageLoRAHelpers:
             ltx2_two_stages.LTX2TwoStagesPipeline._load_two_stage_components(
                 pipeline, torch.device("cuda"), torch.bfloat16, "", "lora", future
             )
-        pipeline._setup_transformer_quant_graphs()
         dispatcher = pipeline._transformer_quant_dispatchers["transformer"]
         inputs = torch.randn(1, 128, dtype=torch.bfloat16, device="cuda")
+        pipeline._distilled_lora_weight_cache.bind_merged()
         try:
             with (
                 torch.inference_mode(),
                 observe_quantization_paths(dispatcher, device_only=use_cuda_graph) as trace,
             ):
                 for _ in range(2):
-                    with pipeline.transformer_quant_stage("refinement"):
+                    with pipeline.transformer_quant_stage(ignore_steps_offset=0):
                         pipeline._distilled_lora_weight_cache.bind_merged()
                         try:
                             for step in range(2):
@@ -1330,7 +1331,7 @@ class TestLTX2TwoStageLoRAHelpers:
                 runners = [
                     runner
                     for name, runner in pipeline._cuda_graph_runners.items()
-                    if name.startswith("transformer_refinement_")
+                    if name.startswith("transformer_")
                 ]
                 assert len(runners) == 2 and all(runner.graphs for runner in runners)
             else:
@@ -1343,7 +1344,7 @@ class TestLTX2TwoStageLoRAHelpers:
 
     @pytest.mark.cpu_only
     @pytest.mark.parametrize("with_lora", [False, True])
-    def test_quant_variants_keep_stage_weights_topology_and_request_inputs_isolated(
+    def test_step_ignore_reuses_native_stage_weights_topology_and_request_inputs(
         self, with_lora, tmp_path
     ):
         from concurrent.futures import Future
@@ -1355,9 +1356,6 @@ class TestLTX2TwoStageLoRAHelpers:
         from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
         from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
         from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
-        from tensorrt_llm._torch.visual_gen.quantization.transformer_quant_dispatcher import (
-            bind_model_weights,
-        )
         from tensorrt_llm.visual_gen.args import QuantAttentionConfig, RuntimeLoRAConfig
 
         class Model(ToyDiT):
@@ -1404,7 +1402,7 @@ class TestLTX2TwoStageLoRAHelpers:
         base_models = [model for _, model in pipeline.transformer_quant_models()]
         for model in base_models:
             model.eval()
-        bind_model_weights(base_models[0], base_models[1])
+        assert len(base_models) == 1
         adapter = tmp_path / "runtime-lora.safetensors"
         save_file(
             {
@@ -1429,40 +1427,31 @@ class TestLTX2TwoStageLoRAHelpers:
             "lora" if with_lora else "",
             future,
         )
-        dispatcher = pipeline._transformer_quant_dispatchers["transformer"]
-        refinement_models = [model for _, model in dispatcher.models("refinement")]
-        assert len(refinement_models) == 2
-        assert all(not model.training for model in refinement_models)
-        assert all(model.topology == "base" for model in base_models)
+        assert not pipeline._transformer_quant_dispatchers
+        assert [model for _, model in pipeline.transformer_quant_models()] == base_models
         stage1_weight = base_models[0].blocks[0].linear.weight
-        stage2_weight = refinement_models[0].blocks[0].linear.weight
-        assert stage1_weight is not stage2_weight
-        assert refinement_models[1].blocks[0].linear.weight is stage2_weight
-        assert (stage1_weight.data_ptr() == stage2_weight.data_ptr()) == (not with_lora)
         cache = pipeline._distilled_lora_weight_cache
-        assert cache.applied_count == int(with_lora)
+        assert (cache.applied_count if cache is not None else 0) == int(with_lora)
         pipeline.scheduler = SimpleNamespace(timesteps=torch.arange(8))
         pipeline.spatial_upsampler = torch.nn.Identity()
         latents = torch.zeros(1, 1, 1, 1, 1)
 
         def stage1(**kwargs):
-            assert dispatcher.stage == "base"
+            assert pipeline._quant_ignore_step_offset == 0
             assert all(model.topology == "base" for model in base_models)
             assert torch.equal(stage1_weight, original)
             return ltx2_two_stages.PipelineOutput(video=latents)
 
         def stage2(**kwargs):
-            assert dispatcher.stage == "refinement"
-            assert cache._bound_state == "merged"
-            assert all(model.topology == "refinement" for model in refinement_models)
-            assert all(model.topology == "base" for model in base_models)
+            assert pipeline._quant_ignore_step_offset == 8
+            assert pipeline._lora_cuda_graph_state == "merged"
+            assert all(model.topology == "refinement" for model in base_models)
             caches = pipeline.prepare_transformer_inputs("prepare_text_cache")
             for _ in pipeline._profile_denoise_steps(range(3)):
                 assert pipeline.resolve_transformer_inputs(caches) == (
                     "refinement",
                     id(pipeline.transformer),
                 )
-                assert torch.equal(stage1_weight, original)
                 weight = pipeline.transformer.blocks[0].linear.weight
                 assert torch.equal(weight, original + delta if with_lora else original)
             if fail:
@@ -1473,6 +1462,7 @@ class TestLTX2TwoStageLoRAHelpers:
             patch.object(ltx2_two_stages.LTX2Pipeline, "forward", side_effect=stage1),
             patch.object(pipeline, "_refinement_denoise", side_effect=stage2),
             patch.object(ltx2_two_stages, "upsample_video", return_value=latents),
+            patch.object(ltx2_two_stages, "_should_save_bf16_weights", return_value=False),
         ):
             for fail in (False, True, False):
                 if fail:
@@ -1480,11 +1470,12 @@ class TestLTX2TwoStageLoRAHelpers:
                         pipeline.forward(prompt="test", seed=0, output_type="latent")
                 else:
                     pipeline.forward(prompt="test", seed=0, output_type="latent")
-                assert cache._bound_state == "original"
-                assert all(model.topology == "base" for model in refinement_models)
-                assert torch.equal(stage1_weight, original)
-                assert dispatcher.stage == "base" and dispatcher.step is None
+                if cache is not None:
+                    assert cache._bound_state == "original"
+                assert all(model.topology == "base" for model in base_models)
+                assert pipeline._quant_ignore_step_offset == 0
                 assert pipeline._lora_cuda_graph_state == "original"
+                assert torch.equal(pipeline.transformer.blocks[0].linear.weight, original)
 
     def test_bf16_snapshot_gate_uses_preload_memory(self, monkeypatch):
         """Pre-load memory is the whole-pipeline budget and wins over current memory."""
@@ -1621,7 +1612,6 @@ class TestLTX2TwoStageLoRAHelpers:
         from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
         from tensorrt_llm._torch.visual_gen.quantization.transformer_quant_dispatcher import (
             TransformerQuantSchedule,
-            fixed_quant_config,
         )
         from tensorrt_llm.visual_gen.args import LinearQuantConfig, QuantAttentionConfig
 
@@ -1650,40 +1640,29 @@ class TestLTX2TwoStageLoRAHelpers:
         pipeline = object.__new__(Pipeline)
         BasePipeline.__init__(pipeline, config)
         dispatcher = pipeline._transformer_quant_dispatchers["transformer"]
-        for key in dispatcher.schedule.keys:
-            dispatcher.add(
-                key,
-                ToyDiT(
-                    block_count=1,
-                    model_config=fixed_quant_config(config.model_configs["transformer"], key),
-                ),
-                stage="refinement",
-            )
         for stage1_count in (8, 10):
             pipeline.scheduler = SimpleNamespace(timesteps=torch.arange(stage1_count))
-            for stage, offset, count in (
-                ("base", 0, stage1_count),
-                ("refinement", stage1_count, 3),
-            ):
-                with pipeline.transformer_quant_stage(stage, ignore_steps_offset=offset):
+            for offset, count in ((0, stage1_count), (stage1_count, 3)):
+                with pipeline.transformer_quant_stage(ignore_steps_offset=offset):
                     for local_step, _ in pipeline._profile_denoise_steps(range(count)):
                         step = offset + local_step
                         model_config = pipeline.transformer.model_config
-                        assert dispatcher.step == local_step
                         assert model_config.attention_metadata_state["denoise_step"] == (
                             local_step,
                             count,
                         )
                         assert (model_config.quant_config.quant_algo is None) == (step == 9)
-                        assert (model_config.attention.quant_attention_config is None) == (
+                        assert model_config.attention_metadata_state["attention_quant_ignored"] == (
                             step == 8
                         )
-            assert dispatcher.stage == "base" and dispatcher.step is None
+            assert pipeline.transformer is dispatcher.select(None)
         pipeline.scheduler = SimpleNamespace(timesteps=torch.arange(8))
-        dispatcher.schedule = TransformerQuantSchedule(linear=frozenset({11}))
+        pipeline._transformer_quant_schedules["transformer"] = TransformerQuantSchedule(
+            linear=frozenset({11})
+        )
         with pytest.raises(ValueError, match="11 steps"):
             next(pipeline._profile_denoise_steps(range(8)))
-        assert dispatcher.step is None
+        assert pipeline.transformer is dispatcher.select(None)
 
     def test_two_stage_forward_rejects_indivisible_stage2_tokens(self):
         """forward() fails fast at request entry when the full-resolution token

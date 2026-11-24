@@ -489,7 +489,8 @@ def _run_ltx2_two_stage_generation(directory: Path, settings: dict) -> None:
                 publish_step(value)
                 current = None
                 if value is not None:
-                    stage, step = dispatcher.stage, value[0]
+                    stage = "refinement" if pipeline._quant_ignore_step_offset else "base"
+                    step = value[0]
                     global_step = step + (stage1_steps if stage == "refinement" else 0)
                     projection = pipeline.transformer.get_submodule(
                         "transformer_blocks.0.attn1.qkv_proj"
@@ -504,7 +505,7 @@ def _run_ltx2_two_stage_generation(directory: Path, settings: dict) -> None:
                         step=step,
                         global_step=global_step,
                         variant="transformer_"
-                        + dispatcher.variant_name(stage, dispatcher.schedule.key(step)),
+                        + dispatcher.variant_name(global_step in dispatcher.schedule.linear),
                     )
 
             with ExitStack() as stack:
@@ -531,7 +532,8 @@ def _run_ltx2_two_stage_generation(directory: Path, settings: dict) -> None:
             else:
                 assert bf16 > 0 and quantized == 0, route
             assert attention_bf16 > 0 and attention_quantized == 0, route
-        assert dispatcher.stage == "base" and dispatcher.step is None
+        assert pipeline._quant_ignore_step_offset == 0
+        assert pipeline.transformer is dispatcher.select(None)
         assert pipeline._distilled_lora_weight_cache._bound_state == "original"
         assert (
             video.shape

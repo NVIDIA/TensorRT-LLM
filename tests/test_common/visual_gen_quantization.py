@@ -18,6 +18,7 @@ from torch import nn
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.linear import Linear, LinearMethodBase, UnquantizedLinearMethod
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor
+from tensorrt_llm._torch.visual_gen.attention.attention import Attention
 from tensorrt_llm._torch.visual_gen.attention.backends.interface import (
     AttentionBackend,
     AttentionTensorLayout,
@@ -27,13 +28,11 @@ from tensorrt_llm._torch.visual_gen.attention.backends.parallel import (
     RingAttention,
     UlyssesAttention,
 )
-from tensorrt_llm._torch.visual_gen.attention.backends.utils import create_attention
-from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+from tensorrt_llm._torch.visual_gen.attention.backends.utils import is_quant_excluded
+from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig, DiffusionPipelineConfig
+from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
+from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
-from tensorrt_llm._torch.visual_gen.quantization.transformer_quant_dispatcher import (
-    TransformerQuantDispatcher,
-    TransformerQuantSchedule,
-)
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.visual_gen.args import AttentionConfig, LinearQuantConfig, QuantAttentionConfig
 
@@ -223,7 +222,14 @@ def observe_quantization_paths(
             if isinstance(module, GatedMLP):
                 for method_name in ("_fused_gate_up_swiglu", "_fused_gate_up_swiglu_bf16"):
                     observe_fused_projection(module, name, method_name)
-            for attribute in ("attn", "backend"):
+            for attribute in (
+                "attn",
+                "backend",
+                "_attn",
+                "_bf16_attn",
+                "_attn_stage2",
+                "_bf16_attn_stage2",
+            ):
                 backend = getattr(module, attribute, None)
                 if isinstance(backend, AttentionBackend):
                     observe_attention(backend, name)
@@ -323,10 +329,30 @@ class _ToyLinear(nn.Linear):
         return self.quant_method.apply(self, inputs, self.bias)
 
 
-class _ToyAttention(nn.Module):
-    def __init__(self, backend: AttentionBackend) -> None:
-        super().__init__()
-        self.attn = backend
+class _ToyAttention(Attention):
+    """Exercise the production backend selection without unused QKV projections."""
+
+    def __init__(self, config: DiffusionModelConfig, index: int) -> None:
+        nn.Module.__init__(self)
+        self.attn_backend = config.attention.backend
+        self.layer_idx = index
+        self.head_dim = 128
+        self.quant_config = config.quant_config
+        self.dtype = torch.bfloat16
+        self.module_name = f"blocks.{index}.attention"
+        self.sparse_params = None
+        self._attention_metadata_state = config.attention_metadata_state
+        recipe = config.attention.quant_attention_config
+        self._quantization_excluded = recipe is not None and is_quant_excluded(
+            recipe, self.module_name
+        )
+        self._attn, self._bf16_attn = self._create_attention_backends(
+            config,
+            num_heads=1,
+            num_kv_heads=1,
+            enable_sequence_parallel=False,
+            use_ulysses=False,
+        )
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         qkv = inputs.unsqueeze(2)
@@ -359,25 +385,14 @@ class ToyDiTBlock(nn.Module):
             self.linear.post_load_weights()
         else:
             self.linear = _ToyLinear(quant.quant_algo is not None and not excluded)
-        arguments = dict(
-            backend=config.attention.backend,
-            layer_idx=index,
-            num_heads=1,
-            head_dim=128,
-            dtype=torch.bfloat16,
-            attention_config=config.attention,
-            attention_metadata_state=config.attention_metadata_state,
-            module_name=f"blocks.{index}.attention",
-        )
         if real_kernels:
-            backend = create_attention(**arguments)
+            self.attention = _ToyAttention(config, index)
         else:
             with patch(
                 "tensorrt_llm._torch.visual_gen.attention.backends.utils.get_visual_gen_attention_backend",
                 return_value=ToyAttentionBackend,
             ):
-                backend = create_attention(**arguments)
-        self.attention = _ToyAttention(backend)
+                self.attention = _ToyAttention(config, index)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         return self.attention(self.linear(inputs))
@@ -429,24 +444,38 @@ class ToyDiT(nn.Module):
             inputs = block(inputs)
         return inputs
 
+    def register_cuda_graph_extra_key_fns(self, runner) -> None:
+        BaseDiffusionModel.register_cuda_graph_extra_key_fns(self, runner)
 
-def make_toy_quant_dispatcher(
+
+def make_toy_quant_pipeline(
     *, linear_quant_ignore_steps=(), attention_quant_ignore_steps=(), **kwargs
 ):
-    """Build independent fixed DiT paths using the production high-level selector."""
-    schedule = TransformerQuantSchedule(
-        frozenset(linear_quant_ignore_steps), frozenset(attention_quant_ignore_steps)
-    )
-    dispatcher = TransformerQuantDispatcher(schedule)
-    linear = kwargs.pop("quantized_linear", True)
-    attention = kwargs.pop("quantized_attention", True)
-    for key in schedule.keys:
-        dispatcher.add(
-            key,
-            ToyDiT(
-                quantized_linear=linear and not key[0],
-                quantized_attention=attention and not key[1],
-                **kwargs,
+    """Use production pipeline scheduling with random-weight native or CPU-double kernels."""
+    real_kernels = kwargs.get("real_kernels", False)
+    config = DiffusionModelConfig(
+        component_name="transformer",
+        quant_config=LinearQuantConfig(
+            quant_algo="NVFP4" if real_kernels else "FP8",
+            ignore_steps=list(linear_quant_ignore_steps),
+        ),
+        dynamic_weight_quant=True,
+        force_dynamic_quantization=True,
+        attention=AttentionConfig(
+            backend="CUTEDSL",
+            quant_attention_config=QuantAttentionConfig(
+                qk_dtype="nvfp4", v_dtype="fp8", ignore_steps=list(attention_quant_ignore_steps)
             ),
-        )
-    return dispatcher
+        ),
+        attention_metadata_state={},
+    )
+
+    class Pipeline(BasePipeline):
+        def _init_transformer(self):
+            self.transformer = ToyDiT(
+                model_config=self.pipeline_config.model_configs["transformer"], **kwargs
+            )
+
+    return Pipeline(
+        DiffusionPipelineConfig(cuda_graph={"enable": False}, model_configs={"transformer": config})
+    )

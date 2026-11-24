@@ -33,11 +33,7 @@ from tensorrt_llm._torch.modules.linear import Linear, UnquantizedLinearMethod, 
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor, gelu_tanh
 from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMode
-from tensorrt_llm._torch.visual_gen.attention.backends.parallel import (
-    UlyssesAttention,
-    wrap_parallel_attention,
-)
-from tensorrt_llm._torch.visual_gen.attention.backends.utils import create_attention
+from tensorrt_llm._torch.visual_gen.attention.backends.parallel import UlyssesAttention
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
@@ -195,8 +191,10 @@ class LTX2Attention(Attention):
         # fresh cp wrapper over the SAME cp group (a shared wrapper would carry the
         # wrong head-count metadata and reallocate its shape-keyed buffers across
         # CUDA-graphed topologies).
-        self._attn_default = self.attn
+        self._attn_default = self._attn
+        self._bf16_attn_default = self._bf16_attn
         self._attn_stage2 = self._attn_default
+        self._bf16_attn_stage2 = self._bf16_attn_default
         if stage2_ulysses_group is not None and enable_sp:
             # Inner backend sized like the default stack (local head counts
             # divided by the ulysses group size).
@@ -209,22 +207,10 @@ class LTX2Attention(Attention):
                     f"num_key_value_heads ({H_kv}) divisible by the stage-2 "
                     f"ulysses group size ({s2})"
                 )
-            inner = create_attention(
-                backend=self.attn_backend,
-                layer_idx=self.layer_idx,
+            self._attn_stage2, self._bf16_attn_stage2 = self._create_attention_backends(
+                config,
                 num_heads=H // s2,
-                head_dim=self.head_dim,
                 num_kv_heads=H_kv // s2,
-                quant_config=self.quant_config,
-                dtype=self.dtype,
-                attention_config=config.attention,
-                attention_metadata_state=config.attention_metadata_state,
-                module_name=self.module_name,
-                sparse_params=self.sparse_params,
-            )
-            self._attn_stage2 = wrap_parallel_attention(
-                inner,
-                visual_gen_mapping=vgm,
                 enable_sequence_parallel=enable_sp,
                 use_ulysses=True,
                 async_ulysses=self._use_async_ulysses,
@@ -251,8 +237,8 @@ class LTX2Attention(Attention):
         Called only via ``LTXModel.set_ulysses_topology``. A no-op when the two
         stacks alias one instance (no stage2 group, or cfg_size == 1).
         """
-        self._modules.pop("attn", None)
-        self.attn = self._attn_stage2 if is_stage2 else self._attn_default
+        self._attn = self._attn_stage2 if is_stage2 else self._attn_default
+        self._bf16_attn = self._bf16_attn_stage2 if is_stage2 else self._bf16_attn_default
         self.is_ulysses = isinstance(self.attn, UlyssesAttention)
 
     def _init_qkv_proj(self):

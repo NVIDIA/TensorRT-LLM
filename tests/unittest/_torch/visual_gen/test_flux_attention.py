@@ -336,7 +336,7 @@ if __name__ == "__main__":
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("quantized", [False, True])
-def test_flux_fixed_attention_qkv_quantization(quantized: bool) -> None:
+def test_flux_step_ignore_controls_producer_qkv_quantization(quantized: bool) -> None:
     """Flux QKV preparation uses BF16 when attention quantization is ignored."""
     from unittest.mock import patch
 
@@ -344,7 +344,10 @@ def test_flux_fixed_attention_qkv_quantization(quantized: bool) -> None:
 
     attention = FluxJointAttention.__new__(FluxJointAttention)
     torch.nn.Module.__init__(attention)
-    attention.requires_static_e4m3_attention = quantized
+    attention.requires_static_e4m3_attention = True
+    attention._quantization_excluded = False
+    attention._bf16_attn = object()
+    attention._attention_metadata_state = {"attention_quant_ignored": not quantized}
     attention._static_e4m3_attention_scales_loaded = True
     attention.added_kv_proj_dim = None
     attention.pre_only = True

@@ -49,13 +49,9 @@ from .modules.vae.parallel_vae_interface import ParallelVAEFactory
 from .offloading import OffloadPipelineStage, PipelineOffloader, transformer_component_offload_name
 from .profiler import VisualGenProfiler
 from .quantization.transformer_quant_dispatcher import (
-    QuantIgnoreKey,
     TransformerQuantDispatcher,
     TransformerQuantSchedule,
-    bind_model_weights,
     fixed_quant_config,
-    reuse_transformer_weights,
-    share_non_linear_parameters,
 )
 
 
@@ -214,7 +210,7 @@ class BasePipeline(nn.Module):
         """
         try:
             num_steps = len(timesteps) if hasattr(timesteps, "__len__") else None
-            if num_steps is None and getattr(self, "_transformer_quant_dispatchers", {}):
+            if num_steps is None and getattr(self, "_transformer_quant_schedules", {}):
                 timesteps = tuple(timesteps)
                 num_steps = len(timesteps)
             if not self._is_warmup and num_steps is not None:
@@ -227,47 +223,61 @@ class BasePipeline(nn.Module):
             self._publish_denoise_step(None)
 
     def _validate_quant_ignore_steps(self, num_steps: int) -> None:
-        """Validate the exclusions currently used by each dispatcher."""
-        for component, dispatcher in getattr(self, "_transformer_quant_dispatchers", {}).items():
+        """Validate exclusions against the active stage's local step range."""
+        offset = getattr(self, "_quant_ignore_step_offset", 0)
+        for component, schedule in getattr(self, "_transformer_quant_schedules", {}).items():
+            schedule = schedule.for_stage(offset)
             for field, ignored in (
-                ("quant_config", dispatcher.schedule.linear),
-                ("attention_config.quant_attention_config", dispatcher.schedule.attention),
+                ("quant_config", schedule.linear),
+                ("attention_config.quant_attention_config", schedule.attention),
             ):
                 invalid = sorted(step for step in ignored if step >= num_steps)
                 if invalid:
                     raise ValueError(
                         f"{field}.ignore_steps contains out-of-range indices {invalid} for "
-                        f"{component} stage '{dispatcher.stage}': the active step schedule has "
-                        f"{num_steps} steps. Every index must be smaller than {num_steps}."
+                        f"{component}: the active step schedule has {num_steps} steps. "
+                        f"Every index must be smaller than {num_steps}."
                     )
 
     def _publish_denoise_step(self, denoise_step: Optional[Tuple[int, int]]) -> None:
-        """Record the current denoising step in each transformer component's attention state."""
+        """Select Linear instances and publish attention's decision before forward."""
         step = None if denoise_step is None else denoise_step[0]
-        for name, dispatcher in getattr(self, "_transformer_quant_dispatchers", {}).items():
-            setattr(self, name, dispatcher.select(step))
-        # Partially built pipelines, as the unit tests construct them, may not resolve
-        # their component list yet; they have no attention state to publish into.
+        if step is not None:
+            step += getattr(self, "_quant_ignore_step_offset", 0)
+        dispatchers = getattr(self, "_transformer_quant_dispatchers", {})
+        schedules = getattr(self, "_transformer_quant_schedules", {})
+        forced = getattr(self, "_forced_quant_ignore_key", None)
+        # Partially constructed pipelines may not have resolved their components yet.
         for name in getattr(self, "transformer_components", None) or ():
-            model = getattr(self, name, None)
-            model_config = getattr(model, "model_config", None)
-            state = getattr(model_config, "attention_metadata_state", None)
-            if state is not None:
-                state["denoise_step"] = denoise_step
-        if denoise_step is None:
-            for dispatcher in getattr(self, "_transformer_quant_dispatchers", {}).values():
-                for _, model in dispatcher.models():
-                    state = model.model_config.attention_metadata_state
-                    if state is not None:
-                        state["denoise_step"] = None
+            schedule = schedules.get(name)
+            ignore_attention = False
+            if schedule is not None and schedule.attention:
+                ignore_attention = step in schedule.attention if forced is None else forced[1]
+            if name in dispatchers:
+                dispatcher = dispatchers[name]
+                forced_linear = None if forced is None else forced[0]
+                setattr(self, name, dispatcher.select(step, force_ignore=forced_linear))
+                models = dispatcher.variants.values()
+            else:
+                models = (getattr(self, name, None),)
+            for model in models:
+                state = getattr(
+                    getattr(model, "model_config", None), "attention_metadata_state", None
+                )
+                if state is not None:
+                    state["denoise_step"] = denoise_step
+                    state["attention_quant_ignored"] = ignore_attention
+                    bf16_state = state.get("bf16_attention_metadata_state")
+                    if bf16_state is not None:
+                        bf16_state["denoise_step"] = denoise_step
 
-    def _fixed_pipeline_quant_config(self, key: QuantIgnoreKey) -> "DiffusionPipelineConfig":
+    def _fixed_pipeline_quant_config(self, linear_quant_ignored: bool) -> "DiffusionPipelineConfig":
         configs = {
             name: fixed_quant_config(
                 config,
-                key if key in self._transformer_quant_schedules[name].keys else (False, False),
+                linear_quant_ignored and name in self._transformer_quant_dispatchers,
             )
-            for name, config in self._transformer_quant_source_configs.items()
+            for name, config in self.pipeline_config.model_configs.items()
         }
         return self._pipeline_config_with_model_configs(configs)
 
@@ -287,209 +297,118 @@ class BasePipeline(nn.Module):
         )
 
     def _init_transformer_quant_paths(self) -> None:
-        """Reuse model-specific constructors with resolved, fixed configurations."""
+        """Build a second native Transformer only for Linear step exclusions."""
         self._transformer_quant_dispatchers = nn.ModuleDict()
-        self._transformer_quant_stage_names = ["base"]
         configs = getattr(self.pipeline_config, "model_configs", {})
         schedules = {
             name: TransformerQuantSchedule.from_config(config) for name, config in configs.items()
         }
         self._transformer_quant_schedules = schedules
-        self._transformer_quant_source_configs = configs
-        keys = {key for schedule in schedules.values() for key in schedule.keys}
-        self._transformer_quant_keys = tuple(sorted(keys)) or ((False, False),)
-        if len(keys) <= 1:
-            self._init_transformer()
-            return
+        self._quant_ignore_step_offset = 0
+        self._forced_quant_ignore_key = None
         original = self.pipeline_config
+        models = {}
         try:
-            for key in self._transformer_quant_keys:
-                self.pipeline_config = self._fixed_pipeline_quant_config(key)
-                self._init_transformer()
-                for name in self.transformer_components:
-                    schedule = schedules[name]
-                    if key not in schedule.keys:
-                        continue
-                    if name not in self._transformer_quant_dispatchers:
-                        self._transformer_quant_dispatchers[name] = TransformerQuantDispatcher(
-                            schedule
-                        )
-                    self._transformer_quant_dispatchers[name].add(key, getattr(self, name))
+            if any(schedule.linear or schedule.attention for schedule in schedules.values()):
+                self.pipeline_config = self._fixed_pipeline_quant_config(False)
+            self._init_transformer()
+            self.pipeline_config = original
+            models = {name: getattr(self, name) for name in self.transformer_components}
+            schedules = {name: schedules[name] for name in models}
+            self._transformer_quant_schedules = schedules
+            if not any(schedule.linear for schedule in schedules.values()):
+                return
+            for name, schedule in schedules.items():
+                if schedule.linear:
+                    dispatcher = TransformerQuantDispatcher(schedule)
+                    dispatcher.add(False, models[name])
+                    self._transformer_quant_dispatchers[name] = dispatcher
+            self.pipeline_config = self._fixed_pipeline_quant_config(True)
+            self._init_transformer()
+            for name, dispatcher in self._transformer_quant_dispatchers.items():
+                dispatcher.add(True, getattr(self, name))
         finally:
             self.pipeline_config = original
+            for name, model in models.items():
+                setattr(self, name, model)
         self._publish_denoise_step(None)
 
     @contextlib.contextmanager
-    def transformer_quant_context(
-        self, key: QuantIgnoreKey, *, stage: str = "base"
-    ) -> Iterator[None]:
-        """Bind real component models for a native pipeline lifecycle operation."""
+    def transformer_quant_context(self, linear_quant_ignored: bool) -> Iterator[None]:
+        """Bind real Linear component models for a native lifecycle operation."""
         dispatchers = getattr(self, "_transformer_quant_dispatchers", {})
-        if not dispatchers:
-            yield
-            return
-        with self.transformer_quant_stage(stage):
-            original = self.pipeline_config
-            previous = {name: getattr(self, name) for name in dispatchers}
-            try:
-                configs = dict(original.model_configs)
-                for name, dispatcher in dispatchers.items():
-                    effective = key if key in dispatcher.schedule.keys else (False, False)
-                    model = dispatcher.variants[dispatcher.variant_name(stage, effective)]
-                    setattr(self, name, model)
-                    configs[name] = model.model_config
+        original = self.pipeline_config
+        previous = {name: getattr(self, name) for name in dispatchers}
+        try:
+            configs = dict(getattr(original, "model_configs", {}))
+            for name, dispatcher in dispatchers.items():
+                model = dispatcher.variants[dispatcher.variant_name(linear_quant_ignored)]
+                setattr(self, name, model)
+                configs[name] = model.model_config
+            if dispatchers:
                 self.pipeline_config = self._pipeline_config_with_model_configs(configs)
-                yield
-            finally:
-                self.pipeline_config = original
-                for name, model in previous.items():
-                    setattr(self, name, model)
-
-    def _transformer_quant_paths(self) -> Iterator[tuple[str, QuantIgnoreKey]]:
-        return itertools.product(
-            getattr(self, "_transformer_quant_stage_names", ("base",)),
-            getattr(self, "_transformer_quant_keys", ((False, False),)),
-        )
+            yield
+        finally:
+            self.pipeline_config = original
+            for name, model in previous.items():
+                setattr(self, name, model)
 
     def transformer_quant_models(
-        self, component: str | None = None, *, stage: str | None = None
+        self, component: str | None = None
     ) -> Iterator[tuple[str, nn.Module]]:
-        """Yield registered module paths and models, including independent stages."""
+        """Visit every native Linear instance, or the single native component."""
         dispatchers = getattr(self, "_transformer_quant_dispatchers", {})
         for name in self.transformer_components:
             if component is not None and component != name:
                 continue
-            dispatcher = dispatchers[name] if name in dispatchers else None
-            if dispatcher is None:
+            if name not in dispatchers:
                 yield name, getattr(self, name)
             else:
-                for variant_name, model in dispatcher.models(stage):
+                for variant_name, model in dispatchers[name].models():
                     yield f"_transformer_quant_dispatchers.{name}.variants.{variant_name}", model
 
-    def deferred_transformer_quant_tensor_ids(self) -> set[int]:
-        """Avoid allocating duplicate Linear buffers for attention-only variants."""
-        from tensorrt_llm._torch.modules.linear import Linear
-
-        deferred: set[int] = set()
-        for dispatcher in self._transformer_quant_dispatchers.values():
-            seen: set[bool] = set()
-            for key in dispatcher.schedule.keys:
-                model = dispatcher.variants[dispatcher.variant_name("base", key)]
-                if key[0] in seen:
-                    for module in model.modules():
-                        if isinstance(module, Linear):
-                            deferred.update(
-                                id(tensor) for tensor in module.parameters(recurse=False)
-                            )
-                            deferred.update(id(tensor) for tensor in module.buffers(recurse=False))
-                seen.add(key[0])
-        return deferred
-
     def load_transformer_quant_weights(self, weights: dict) -> None:
-        """Load each Linear format once, then bind completed weights to sibling paths."""
-        if not self._transformer_quant_dispatchers:
+        """Load each native Linear instance from the original checkpoint."""
+        if not getattr(self, "_transformer_quant_dispatchers", {}):
             self.load_weights(weights)
             return
-        sources = {}
-        for key in self._transformer_quant_keys:
-            with self.transformer_quant_context(key), contextlib.ExitStack() as stack:
-                for name, dispatcher in self._transformer_quant_dispatchers.items():
-                    effective = key if key in dispatcher.schedule.keys else (False, False)
-                    model = getattr(self, name)
-                    source = sources.get((name, effective[0]))
-                    stack.enter_context(
-                        reuse_transformer_weights(
-                            source,
-                            model,
-                            require_dynamic_weights=bool(dispatcher.schedule.linear),
-                        )
-                    )
+        for linear_quant_ignored in (False, True):
+            with self.transformer_quant_context(linear_quant_ignored):
                 self.load_weights(weights)
-                for name, dispatcher in self._transformer_quant_dispatchers.items():
-                    model = getattr(self, name)
-                    if hasattr(model, "post_load_weights"):
-                        model.post_load_weights()
-                    effective = key if key in dispatcher.schedule.keys else (False, False)
-                    source = sources.setdefault((name, effective[0]), model)
-                    if source is not model:
-                        share_non_linear_parameters(source, model)
+        for _, model in self.transformer_quant_models():
+            if hasattr(model, "post_load_weights"):
+                model.post_load_weights()
 
     def _setup_transformer_quant_graphs(self) -> None:
-        if not self._transformer_quant_dispatchers:
-            self._setup_cuda_graphs()
+        self._setup_cuda_graphs()
+        dispatchers = self._transformer_quant_dispatchers
+        runners = self._cuda_graph_runners
+        if not dispatchers or not runners:
             return
-        runners = dict(self._cuda_graph_runners)
-        seen = getattr(self, "_quant_graph_model_ids", set())
-        self._quant_graph_model_ids = seen
-        for stage, key in self._transformer_quant_paths():
-            with self.transformer_quant_context(key, stage=stage):
-                models = [getattr(self, name) for name in self.transformer_components]
-                if all(id(model) in seen for model in models):
-                    continue
-                self._cuda_graph_runners = {}
-                self._setup_cuda_graphs()
-                seen.update(id(model) for model in models)
-                for name, runner in self._cuda_graph_runners.items():
-                    runners[f"{name}_{TransformerQuantDispatcher.variant_name(stage, key)}"] = (
-                        runner
-                    )
-        self._cuda_graph_runners = runners
 
-    @contextlib.contextmanager
-    def transformer_quant_stage(
-        self, stage: str, *, ignore_steps_offset: int = 0
-    ) -> Iterator[None]:
-        """Select a stable weight version for a complete denoising stage."""
-        previous = {
-            name: (dispatcher.stage, dispatcher.step, dispatcher.schedule)
-            for name, dispatcher in getattr(self, "_transformer_quant_dispatchers", {}).items()
+        # Keep the existing runners for components whose Linear precision stays fixed.
+        self._cuda_graph_runners = {
+            name: runner for name, runner in runners.items() if name not in dispatchers
         }
         try:
-            for name, dispatcher in getattr(self, "_transformer_quant_dispatchers", {}).items():
-                dispatcher.stage = stage
-                dispatcher.schedule = self._transformer_quant_schedules[name].for_stage(
-                    ignore_steps_offset
-                )
-                setattr(self, name, dispatcher.select(None))
+            with self.transformer_quant_context(True):
+                self._setup_cuda_graphs()
+            for name in dispatchers:
+                runners[f"{name}_quantized"] = runners.pop(name)
+                runners[f"{name}_bf16"] = self._cuda_graph_runners[name]
+        finally:
+            self._cuda_graph_runners = runners
+
+    @contextlib.contextmanager
+    def transformer_quant_stage(self, *, ignore_steps_offset: int) -> Iterator[None]:
+        """Translate stage-local loop indices without changing the native models."""
+        previous = getattr(self, "_quant_ignore_step_offset", 0)
+        try:
+            self._quant_ignore_step_offset = ignore_steps_offset
             yield
         finally:
-            for name, dispatcher in getattr(self, "_transformer_quant_dispatchers", {}).items():
-                dispatcher.stage, step, dispatcher.schedule = previous[name]
-                setattr(self, name, dispatcher.select(step))
-
-    def build_transformer_quant_stage(self, stage: str, prepare: Callable) -> None:
-        """Build native models once and apply a stage's weight update in isolation."""
-        from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
-
-        previous = {name: getattr(self, name) for name in self.transformer_components}
-        config = self.pipeline_config
-        sources = {}
-        try:
-            for key in self._transformer_quant_keys:
-                self.pipeline_config = self._fixed_pipeline_quant_config(key)
-                with MetaInitMode():
-                    self._init_transformer()
-                for name, dispatcher in self._transformer_quant_dispatchers.items():
-                    effective = key if key in dispatcher.schedule.keys else (False, False)
-                    variant_name = dispatcher.variant_name(stage, effective)
-                    if variant_name in dispatcher.variants:
-                        continue
-                    model = getattr(self, name)
-                    source = sources.get((name, effective[0]))
-                    if source is None:
-                        source = dispatcher.variants[dispatcher.variant_name("base", effective)]
-                        bind_model_weights(source, model, share_parameters=False)
-                        prepare(model)
-                        sources[name, effective[0]] = model
-                    else:
-                        bind_model_weights(source, model)
-                    model.train(source.training)
-                    dispatcher.add(effective, model, stage)
-            self._transformer_quant_stage_names.append(stage)
-        finally:
-            self.pipeline_config = config
-            for name, model in previous.items():
-                setattr(self, name, model)
+            self._quant_ignore_step_offset = previous
+            self._publish_denoise_step(None)
 
     def prepare_transformer_inputs(self, method: str, **kwargs: Any) -> Any:
         """Prepare model-dependent request inputs once for every active-stage path."""
@@ -497,10 +416,7 @@ class BasePipeline(nn.Module):
             return getattr(self.transformer, method)(**kwargs)
         dispatcher = self._transformer_quant_dispatchers["transformer"]
         return _TransformerQuantInputs(
-            {
-                id(model): getattr(model, method)(**kwargs)
-                for _, model in dispatcher.models(dispatcher.stage)
-            }
+            {id(model): getattr(model, method)(**kwargs) for _, model in dispatcher.models()}
         )
 
     def resolve_transformer_inputs(self, value: Any) -> Any:
@@ -512,9 +428,11 @@ class BasePipeline(nn.Module):
 
     def all_offload_pipeline_components(self) -> dict[str, nn.Module]:
         """Expose every fixed path under its original logical offload component."""
+        if not getattr(self, "_transformer_quant_dispatchers", {}):
+            return self.offload_pipeline_components()
         components: dict[str, list[nn.Module]] = {}
-        for stage, key in self._transformer_quant_paths():
-            with self.transformer_quant_context(key, stage=stage):
+        for linear_quant_ignored in (False, True):
+            with self.transformer_quant_context(linear_quant_ignored):
                 for name, module in self.offload_pipeline_components().items():
                     group = components.setdefault(name, [])
                     if all(module is not other for other in group):
@@ -565,7 +483,7 @@ class BasePipeline(nn.Module):
             model = getattr(self, name, None)
             if model is None:
                 continue
-            if id(model) in getattr(self, "_quant_graph_model_ids", ()):
+            if name in self._cuda_graph_runners:
                 continue
 
             runner = CUDAGraphRunner(
@@ -1327,17 +1245,16 @@ class BasePipeline(nn.Module):
 
     def _run_warmup_pass(self, shapes, steps) -> None:
         """Run one warmup pass over all shapes (denoise loop with dummy inputs)."""
-        dispatchers = getattr(self, "_transformer_quant_dispatchers", {})
+        schedules = getattr(self, "_transformer_quant_schedules", {})
+        keys = {(False, False)} | {
+            key for schedule in schedules.values() for key in schedule.warmup_keys
+        }
         try:
-            for key in getattr(self, "_transformer_quant_keys", ((False, False),)):
-                for dispatcher in dispatchers.values():
-                    dispatcher.forced_key = (
-                        key if key in dispatcher.schedule.keys else (False, False)
-                    )
+            for key in sorted(keys):
+                self._forced_quant_ignore_key = key
                 self._run_fixed_warmup_pass(shapes, steps)
         finally:
-            for dispatcher in dispatchers.values():
-                dispatcher.forced_key = None
+            self._forced_quant_ignore_key = None
             self._publish_denoise_step(None)
 
     def _run_fixed_warmup_pass(self, shapes, steps) -> None:

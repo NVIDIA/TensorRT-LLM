@@ -68,10 +68,9 @@ Subclasses can override `register_cuda_graph_extra_key_fns()` to add model-speci
 
 ## Capture and Replay
 
-With Linear or attention `ignore_steps`, the pipeline selects a fixed Transformer
-instance before entering its graph. Each instance has its own runner and metadata;
-warmup visits every reachable instance. Existing shape and sparse-phase keys still
-apply within each runner.
+Linear `ignore_steps` uses a separate graph runner for each Transformer instance.
+Attention `ignore_steps` adds the attention quantization state to the graph key.
+Warmup covers the configured combinations.
 
 Capture is lazy:
 

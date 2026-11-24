@@ -521,14 +521,28 @@ def _logic_attention_ignore_steps(
     expected = F.scaled_dot_product_attention(
         *(value.transpose(1, 2).float() for value in full_values)
     ).transpose(1, 2)[:, start:end]
-    from tensorrt_llm._torch.visual_gen.quantization.transformer_quant_dispatcher import (
-        TransformerQuantDispatcher,
-        TransformerQuantSchedule,
-    )
+    from tensorrt_llm._torch.visual_gen.attention.attention import Attention
 
-    holder = TransformerQuantDispatcher(TransformerQuantSchedule(attention=frozenset((0, 2))))
+    holder = torch.nn.Module()
+    attention = Attention.__new__(Attention)
+    torch.nn.Module.__init__(attention)
+    holder.attention = attention
+    state = {}
+    attention._attention_metadata_state = state
+    attention._quantization_excluded = False
     wrapper = UlyssesAttention if parallelism == "ulysses" else RingAttention
-    for key in holder.schedule.keys:
+    recipe = (
+        QuantAttentionConfig(
+            qk_dtype="fp8",
+            v_dtype="fp8",
+            q_block_size=1,
+            k_block_size=16,
+            v_block_size=1,
+        )
+        if backend == "TRTLLM"
+        else QuantAttentionConfig(qk_dtype="nvfp4", v_dtype="fp8")
+    )
+    for ignored in (False, True):
         selected = create_attention(
             backend=backend,
             layer_idx=0,
@@ -538,29 +552,19 @@ def _logic_attention_ignore_steps(
             attention_metadata_state={},
             attention_config=AttentionConfig(
                 backend=backend,
-                quant_attention_config=None
-                if key[1]
-                else (
-                    QuantAttentionConfig(
-                        qk_dtype="fp8",
-                        v_dtype="fp8",
-                        q_block_size=1,
-                        k_block_size=16,
-                        v_block_size=1,
-                    )
-                    if backend == "TRTLLM"
-                    else QuantAttentionConfig(qk_dtype="nvfp4", v_dtype="fp8")
-                ),
+                quant_attention_config=None if ignored else recipe,
             ),
         )
-        model = torch.nn.Module()
-        model.attention = torch.nn.Module()
-        model.attention.attn = wrapper(selected, process_group=dist.group.WORLD)
-        holder.add(key, model)
+        setattr(
+            attention,
+            "_bf16_attn" if ignored else "_attn",
+            wrapper(selected, process_group=dist.group.WORLD),
+        )
     with observe_quantization_paths(holder) as trace:
         for step in range(3):
             trace.step = step
-            selected = holder.select(step).attention.attn
+            state["attention_quant_ignored"] = step in (0, 2)
+            selected = holder.attention.attn
             if backend == "TRTLLM":
                 from unittest.mock import patch
 

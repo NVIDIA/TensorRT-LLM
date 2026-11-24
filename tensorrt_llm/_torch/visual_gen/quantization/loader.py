@@ -415,11 +415,6 @@ class DynamicLinearWeightLoader:
         self, module: Linear, name: str, weight_dicts: List[Dict[str, torch.Tensor]]
     ) -> None:
         """Load weights into Linear module with optional quantization."""
-        from .transformer_quant_dispatcher import current_weight_reuse
-
-        reuse = current_weight_reuse(self.model_config.component_name)
-        if reuse is not None and id(module) in reuse.reused_modules:
-            return
         module_quant_config = getattr(module, "quant_config", None)
         if module_quant_config is not None:
             quant_algo = module_quant_config.quant_algo
@@ -432,10 +427,7 @@ class DynamicLinearWeightLoader:
             self._check_static_quant_scales(weight_dict, quant_algo, name, module)
             self._check_static_nvfp4_input_scale(module, weight_dict, quant_algo, name)
 
-        if quant_algo is not None and (
-            (reuse is not None and reuse.require_dynamic_weights)
-            or getattr(self.quant_config, "ignore_steps", [])
-        ):
+        if quant_algo is not None and getattr(self.quant_config, "ignore_steps", []):
             for weight_dict in weight_dicts:
                 self._validate_linear_step_ignore_weight_loading(weight_dict, quant_algo, name)
 

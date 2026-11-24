@@ -24,9 +24,9 @@ from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxAttentionConfig,
 
 from ...modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from ...utils import Fp4QuantizedTensor
-from ..config import DiffusionModelConfig
+from ..config import DiffusionModelConfig, create_attention_metadata_state
 from ..modules.rms_norm import RMSNormTPAware
-from .backends.interface import AttentionTensorLayout
+from .backends.interface import AttentionBackend, AttentionTensorLayout
 from .backends.parallel import wrap_parallel_attention
 from .backends.utils import create_attention, get_quant_algorithm, is_quant_excluded
 
@@ -205,7 +205,7 @@ class Attention(nn.Module):
             and not config.dynamic_weight_quant
         )
 
-        attention_metadata_state = getattr(config, "attention_metadata_state", None)
+        self._attention_metadata_state = config.attention_metadata_state
 
         if self.qk_norm:
             # "full": norm over all heads combined (e.g. WAN, dim=q_dim)
@@ -293,21 +293,6 @@ class Attention(nn.Module):
             sparse_params = sparse_config.to_sparse_params()
         self.sparse_params = sparse_params
 
-        # Create compute backend
-        self.attn = create_attention(
-            backend=backend_name,
-            layer_idx=self.layer_idx,
-            num_heads=backend_num_heads,
-            head_dim=self.head_dim,
-            num_kv_heads=backend_num_kv_heads,
-            quant_config=self.quant_config,
-            dtype=self.dtype,
-            attention_config=config.attention,
-            attention_metadata_state=attention_metadata_state,
-            module_name=self.module_name,
-            sparse_params=sparse_params,
-        )
-
         if enable_sequence_parallel and is_separate_qkv_cross_attention and vgm is not None:
             ring_size = vgm.ring_size
             if ring_size > 1:
@@ -316,13 +301,66 @@ class Attention(nn.Module):
                     "parallelism; use enable_sequence_parallel=False or Ulysses/Attention2D."
                 )
 
-        self.attn = wrap_parallel_attention(
-            self.attn,
-            visual_gen_mapping=vgm,
+        self._attn, self._bf16_attn = self._create_attention_backends(
+            config,
+            num_heads=backend_num_heads,
+            num_kv_heads=backend_num_kv_heads,
             enable_sequence_parallel=enable_sequence_parallel,
             use_ulysses=use_ulysses,
             async_ulysses=use_ulysses and async_ulysses,
         )
+
+    def _create_attention_backends(
+        self, config: DiffusionModelConfig, *, num_heads: int, num_kv_heads: int, **parallel_kwargs
+    ) -> tuple[AttentionBackend, AttentionBackend | None]:
+        """Build native backend stacks with fixed recipes and independent plan caches."""
+
+        def build(attention_config, metadata_state):
+            inner = create_attention(
+                backend=self.attn_backend,
+                layer_idx=self.layer_idx,
+                num_heads=num_heads,
+                head_dim=self.head_dim,
+                num_kv_heads=num_kv_heads,
+                quant_config=self.quant_config,
+                dtype=self.dtype,
+                attention_config=attention_config,
+                attention_metadata_state=metadata_state,
+                sparse_params=self.sparse_params,
+            )
+            return wrap_parallel_attention(
+                inner, visual_gen_mapping=config.visual_gen_mapping, **parallel_kwargs
+            )
+
+        if self._quantization_excluded:
+            attention = config.attention.model_copy(update={"quant_attention_config": None})
+            return build(attention, self._attention_metadata_state), None
+
+        default = build(config.attention, self._attention_metadata_state)
+        recipe = config.attention.quant_attention_config
+        bf16 = None
+        if recipe is not None and recipe.ignore_steps:
+            metadata = self._attention_metadata_state.setdefault(
+                "bf16_attention_metadata_state", create_attention_metadata_state()
+            )
+            bf16 = build(
+                config.attention.model_copy(update={"quant_attention_config": None}), metadata
+            )
+        return default, bf16
+
+    @property
+    def attention_quantization_enabled(self) -> bool:
+        """Also controls producer-fused Q/K/V quantization before attention runs."""
+        return not self._quantization_excluded and not (
+            self._bf16_attn is not None
+            and self._attention_metadata_state.get("attention_quant_ignored", False)
+        )
+
+    @property
+    def attn(self) -> AttentionBackend:
+        if self._bf16_attn is not None and not self.attention_quantization_enabled:
+            return self._bf16_attn
+        return self._attn
 
     @staticmethod
     def _qualified_module_name(
