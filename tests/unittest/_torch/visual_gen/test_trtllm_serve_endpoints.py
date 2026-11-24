@@ -46,10 +46,7 @@ from tensorrt_llm.serve.visual_gen_utils import VIDEO_STORE
 from tensorrt_llm.visual_gen.output import VisualGenMetrics, VisualGenOutput
 
 if TYPE_CHECKING:
-    from tensorrt_llm.serve.openai_protocol import (
-        ImageEditRequest,
-        VideoGenerationRequest,
-    )
+    from tensorrt_llm.serve.openai_protocol import ImageEditRequest, VideoGenerationRequest
     from tensorrt_llm.serve.openai_server import OpenAIServer
     from tensorrt_llm.visual_gen import VisualGenParams
 from tensorrt_llm.visual_gen.params import prepare_reference_slots, validate_visual_gen_params
