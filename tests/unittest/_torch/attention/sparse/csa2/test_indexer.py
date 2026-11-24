@@ -280,14 +280,30 @@ def test_sm107_capped_gvr_masks_holes_during_graph_replay(monkeypatch):
     def check_replay():
         graph.replay()
         valid_columns = valid[:, columns // INDEX_PAGE_ROWS] & (columns < visible[:, None])
-        expected = logits.masked_fill(~valid_columns, -torch.inf).topk(top_k, dim=1).indices
-        torch.testing.assert_close(output.long(), expected.sort(dim=1).values)
+        expected = torch.full_like(output, -1, dtype=torch.long)
+        for row, mask in enumerate(valid_columns):
+            valid_indices = columns[mask]
+            count = min(top_k, valid_indices.numel())
+            selected = logits[row, valid_indices].topk(count).indices
+            expected[row, :count] = valid_indices[selected].sort().values
+        torch.testing.assert_close(output.long(), expected)
 
     # Keep scores fixed. Each metadata update removes columns from the previous Top-K.
-    visible.copy_(torch.tensor([width - 17, 768], device="cuda", dtype=torch.int32))
+    full_lengths = visible.new_tensor([width - 17, 768])
+    visible.copy_(full_lengths)
     check_replay()
     valid[0, -2:] = False
     valid[1, 10] = False
+    check_replay()
+
+    visible.copy_(visible.new_tensor([0, top_k - 1]))
+    check_replay()
+
+    # Refill the output before shortening a row by invalidating pages alone.
+    visible.copy_(full_lengths)
+    check_replay()
+    valid[1].fill_(False)
+    valid[1, 1] = True
     check_replay()
 
 
