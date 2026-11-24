@@ -561,9 +561,10 @@ class DecoderWarmup:
             and self.guided_decoder is None
             and not isinstance(kv_cache_manager, MambaHybridCacheManager)
         )
-        # Helix CP and decode-only workers never run a context batch, so every
-        # phase below warms up pure-generation shapes only. Both follow from the
-        # configuration, so every rank takes the same branch.
+        # Helix ranks on a disaggregated generation server and decode-only
+        # workers never run a context batch, so every phase below warms up
+        # pure-generation shapes only. Aggregated Helix ranks prefill too. All
+        # follow from the configuration, so every rank takes the same branch.
         generation_only = _generation_only(self)
         # A capturable guided decoder rules out the general warmup's generation
         # requests only: the autotuner below runs its context step with the
