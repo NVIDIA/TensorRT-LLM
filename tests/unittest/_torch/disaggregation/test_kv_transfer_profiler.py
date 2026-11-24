@@ -736,7 +736,7 @@ def test_v2_pending_send_failure_is_private_until_cleanup(cleanup: str) -> None:
     assert not owner._profile_send_failures
     expected = (
         {17: "failed"}
-        if cleanup == "failed"
+        if cleanup in ("failed", "prepare-shutdown")
         else ({17: "complete"} if cleanup == "completed" else {})
     )
     assert owner.get_send_terminal_outcomes() == expected
@@ -1033,10 +1033,11 @@ def test_submission_failure_preserves_partial_or_unknown_admission(
         assert not wrapper._records and not backend.observed
 
 
+@pytest.mark.parametrize("prepare_first", [False, True])
 def test_shutdown_preserves_ready_v2_send_outcome_after_partial_poll_failure(
-    monkeypatch: pytest.MonkeyPatch, events: list
+    monkeypatch: pytest.MonkeyPatch, events: list, prepare_first: bool
 ) -> None:
-    """Keep a completed send's outcome when another send prevents poll return."""
+    """Preserve both send outcomes across a refused close and a shutdown retry."""
     owner = _v2_owner()
     owner._ever_had_send_session = True
     owner._ctx_need_tp_sync = owner._ctx_need_pp_sync = False
@@ -1071,7 +1072,12 @@ def test_shutdown_preserves_ready_v2_send_outcome_after_partial_poll_failure(
         wrapper.check_context_transfer_status(0)
     assert owner.get_send_terminal_outcomes() == {17: "complete"}
     assert len(wrapper._records) == 2
+    with pytest.raises(RuntimeError, match="session close refused"):
+        wrapper.shutdown()
+    assert len(events) == 2
     sessions[1].close.return_value = True
+    if prepare_first:
+        wrapper.prepare_shutdown()
     wrapper.shutdown()
     wrapper.shutdown()
 
@@ -1079,13 +1085,13 @@ def test_shutdown_preserves_ready_v2_send_outcome_after_partial_poll_failure(
         "trtllm::kv_transfer_submit",
         "trtllm::kv_transfer_submit",
         "trtllm::kv_transfer_complete",
-        "trtllm::kv_transfer_cancelled",
+        "trtllm::kv_transfer_failed",
     ]
     assert events[2][1] == events[0][1] and events[3][1] == events[1][1]
     assert not wrapper._records and not owner.get_send_terminal_outcomes()
     assert not owner._send_sessions and not owner._send_reqs
     sessions[0].close.assert_called_once_with()
-    assert sessions[1].close.call_count == 2
+    assert sessions[1].close.call_count == 3
     owner._transfer_worker.shutdown.assert_called_once_with()
     owner._dist.tp_allgather.assert_not_called()
 

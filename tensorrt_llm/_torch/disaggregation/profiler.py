@@ -145,6 +145,9 @@ class _ProfiledKvCacheTransceiver(KvCacheTransceiver):
     def get_send_terminal_outcomes(self) -> dict[int, SendTerminalOutcome]:
         return self._transceiver.get_send_terminal_outcomes()
 
+    def get_pending_send_failures(self) -> set[int]:
+        return self._transceiver.get_pending_send_failures()
+
     @property
     def receive_completion_uses_request_state(self) -> bool:
         return self._transceiver.receive_completion_uses_request_state
@@ -517,9 +520,11 @@ class _ProfiledKvCacheTransceiver(KvCacheTransceiver):
     def shutdown(self) -> None:
         """Preserve ready outcomes and settle only authoritatively retired transfers."""
         outcomes: dict[int, SendTerminalOutcome] = {}
+        pending_failures: set[int] = set()
         if self._records:
             try:
                 outcomes = self._transceiver.get_send_terminal_outcomes()
+                pending_failures = self._transceiver.get_pending_send_failures()
             except _OBSERVATION_ERRORS as error:
                 _profiler.warn_profiler_failure(
                     "trtllm::kv_transfer", "kv", "shutdown send outcomes", error
@@ -543,6 +548,10 @@ class _ProfiledKvCacheTransceiver(KvCacheTransceiver):
                 if owned is not False:
                     self._discard(record)
                     continue
-                outcome = "cancelled"
+                outcome = (
+                    "failed"
+                    if record.direction == "send" and record.status_id in pending_failures
+                    else "cancelled"
+                )
             self._finish(record, outcome)
         return result

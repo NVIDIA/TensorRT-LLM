@@ -803,7 +803,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         for rid, session in list(self._send_sessions.items()):
             self._close_session_or_raise(session, rid, "shutdown")
         self._send_sessions.clear()
-        self._profile_send_failures.clear()
+        # Preparation can release sessions before the profiler's final shutdown snapshot.
+        for rid in self._profile_send_failures.copy():
+            self._record_send_terminal_outcome(rid, "failed")
         self._send_reqs.clear()
         self._recv_sessions.clear()
         self._recv_reqs.clear()
@@ -1318,6 +1320,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def get_send_terminal_outcomes(self) -> dict[int, SendTerminalOutcome]:
         """Return only ready observed outcomes, without scanning pending sends."""
         return dict(self._profile_send_outcomes)
+
+    def get_pending_send_failures(self) -> set[int]:
+        """Snapshot failure evidence without claiming the sends have retired."""
+        return self._profile_send_failures.copy()
 
     @staticmethod
     def _ownership_blocks_retirement(session: object) -> bool:
@@ -1936,6 +1942,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         cancelled, failed, completed, quiesced_ids = self._ctx_consensus_outcome(
             to_process, cancelled, failed, completed, locally_quiesced
         )
+        if failed and self._profile_send_observers:
+            self._profile_send_failures.update(self._profile_send_observers.intersection(failed))
         quiesced = set(quiesced_ids)
         cancelled = [rid for rid in cancelled if rid in quiesced]
         failed = [rid for rid in failed if rid in quiesced]

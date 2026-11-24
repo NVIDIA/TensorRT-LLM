@@ -384,6 +384,10 @@ class KvCacheTransceiver(ABC):
         """
         return {}
 
+    def get_pending_send_failures(self) -> set[int]:
+        """Snapshot observed send failures whose resources have not yet been released."""
+        return set()
+
     @property
     def receive_completion_uses_request_state(self) -> bool:
         """Whether receive outcomes require observing request-state mutation."""
