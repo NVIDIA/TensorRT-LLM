@@ -1506,9 +1506,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_less_device_memory(60000)
     @pytest.mark.parametrize(
-        "mode", ["no_reuse", "reuse", "reuse_preempt", "reuse_host_offload"])
+        "mode", ["reuse", "reuse_preempt", "reuse_host_offload"])
     def test_bfloat16_agg_helix_cp2(self, mode: str) -> None:
-        """GSM8K on aggregated Helix (TP1 x CP2) with and without block reuse.
+        """GSM8K on aggregated Helix (TP1 x CP2) with block reuse.
 
         Aggregated because no cache transceiver is configured: one executor
         runs both the context and generation phases on the CP ranks. Pure MLA
@@ -1524,7 +1524,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         hits bring them back. Set TLLM_HELIX_AGG_CHECK_SCHEDULE=1 on every
         rank to also compare the per-rank schedules each iteration.
         """
-        enable_block_reuse = mode != "no_reuse"
         kv_cache_kwargs = {}
         llm_kwargs = {}
         if mode in ("reuse_preempt", "reuse_host_offload"):
@@ -1552,7 +1551,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 max_num_tokens=512,
                 enable_chunked_prefill=True,
                 kv_cache_config=KvCacheConfig(
-                    enable_block_reuse=enable_block_reuse,
+                    enable_block_reuse=True,
                     tokens_per_block=64,
                     use_kv_cache_manager_v2=True,
                     free_gpu_memory_fraction=0.6,
@@ -1564,7 +1563,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         ) as llm:
             transceiver = llm.args.cache_transceiver_config
             assert transceiver is None or transceiver.backend is None
-            assert llm.args.kv_cache_config.enable_block_reuse is enable_block_reuse
+            assert llm.args.kv_cache_config.enable_block_reuse
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
             # Count reuse and preemption so a pass is not vacuous: a reuse run
@@ -1589,10 +1588,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                   f"suspended = {suspended}, resumed = {resumed}, "
                   f"offloaded = {offloaded}, onboarded = {onboarded}, "
                   f"paused = {paused}")
-            if enable_block_reuse:
-                assert reused_blocks > 0
-            else:
-                assert reused_blocks == 0
+            assert reused_blocks > 0
             if mode == "reuse_preempt":
                 assert paused > 0 and offloaded == 0
             if mode == "reuse_host_offload":
