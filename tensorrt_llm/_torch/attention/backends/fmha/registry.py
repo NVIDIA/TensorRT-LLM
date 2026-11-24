@@ -49,7 +49,16 @@ DEFAULT_FMHA_LIBS = (
 
 
 def fmha_lib(name: str) -> Callable[[type[_FmhaT]], type[_FmhaT]]:
-    """Register an FMHA class for name lookup without changing the default order."""
+    """Register an FMHA class for name lookup without changing the default order.
+
+    Args:
+        name: Registered library name used in fmha_libs and TLLM_FMHA_LIBS.
+            It must be nonempty, have no surrounding whitespace or commas,
+            and must not start with a plus or minus sign.
+
+    Raises:
+        ValueError: If the name is invalid or is registered to a different FMHA class.
+    """
     if not name or name != name.strip() or name[0] in "+-" or "," in name:
         raise ValueError(f"Invalid FMHA library name {name!r}.")
 
