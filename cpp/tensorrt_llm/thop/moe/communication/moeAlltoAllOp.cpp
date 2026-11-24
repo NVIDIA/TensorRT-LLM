@@ -140,8 +140,7 @@ inline uint64_t const* resolveActiveRankMask(
     return static_cast<uint64_t const*>(t.const_data_ptr());
 }
 
-// The kernels read the host abort state through unified virtual addressing, so the caller allocates it in pinned
-// memory. MoeExecutionState checks that once, when it allocates the abort state.
+// The kernels read the host abort state through unified virtual addressing, so it must be in pinned memory.
 inline tensorrt_llm::kernels::moe_comm::MoeA2AAbortState* resolveAbortState(torch::optional<torch::Tensor> const& abort)
 {
     using tensorrt_llm::kernels::moe_comm::MoeA2AAbortState;
@@ -150,9 +149,9 @@ inline tensorrt_llm::kernels::moe_comm::MoeA2AAbortState* resolveAbortState(torc
         return nullptr;
     }
     torch::Tensor const& t = abort.value();
-    TORCH_CHECK(t.is_cpu() && t.scalar_type() == torch::kInt32 && t.dim() == 1 && t.numel() == kAbortStateWords
-            && t.is_contiguous(),
-        "abort_state must be a contiguous int32 CPU tensor of ", kAbortStateWords, " elements");
+    TORCH_CHECK(t.is_cpu() && t.is_pinned() && t.scalar_type() == torch::kInt32 && t.dim() == 1
+            && t.numel() == kAbortStateWords && t.is_contiguous(),
+        "abort_state must be a contiguous int32 tensor of ", kAbortStateWords, " elements in pinned host memory");
     return static_cast<MoeA2AAbortState*>(t.data_ptr());
 }
 
