@@ -363,10 +363,10 @@ def test_absent_peer_send_is_interrupted_before_transport_close(monkeypatch, bat
             outcome.append(exc)
 
     caller = threading.Thread(target=send)
-    caller.start()
-    assert entered.wait(timeout=2.0)
-    sender_thread = proxy._request_sender._thread if batching else None
     try:
+        caller.start()
+        assert entered.wait(timeout=2.0)
+        sender_thread = proxy._request_sender._thread if batching else None
         proxy._engine_dead = engine_dead
         started = time.monotonic()
         proxy._close_request_sender(send_sentinel=True)
@@ -380,8 +380,11 @@ def test_absent_peer_send_is_interrupted_before_transport_close(monkeypatch, bat
         assert not caller.is_alive()
         assert not errors.empty() if batching else outcome
     finally:
-        caller.join(timeout=2.0)
+        proxy._request_send_stopped.set()
         proxy._close_request_sender()
+        if caller.ident is not None:
+            caller.join(timeout=2.0)
+        assert not caller.is_alive()
         proxy.request_queue.close()
 
 
