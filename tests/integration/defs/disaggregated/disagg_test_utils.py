@@ -534,14 +534,46 @@ def service_discovery(request, disagg_port, work_dir):
     """
     if request.param == "etcd":
         data_dir = f"{work_dir}/disagg_test-etcd-{uuid.uuid4()}"
-        etcd = subprocess.Popen(["etcd", "--data-dir", data_dir])
-        yield etcd, "etcd://localhost:2379"
+        client_port = get_free_port()
+        peer_port = get_free_port()
+        client_url = f"http://127.0.0.1:{client_port}"
+        peer_url = f"http://127.0.0.1:{peer_port}"
+        etcd = subprocess.Popen(
+            [
+                "etcd",
+                "--data-dir",
+                data_dir,
+                "--listen-client-urls",
+                client_url,
+                "--advertise-client-urls",
+                client_url,
+                "--listen-peer-urls",
+                peer_url,
+                "--initial-advertise-peer-urls",
+                peer_url,
+                "--initial-cluster",
+                f"default={peer_url}",
+            ]
+        )
         try:
+            deadline = time.monotonic() + 30
+            while True:
+                if etcd.poll() is not None:
+                    raise RuntimeError(f"etcd exited during startup with code {etcd.returncode}")
+                try:
+                    response = requests.get(f"{client_url}/health", timeout=1)
+                    if response.status_code == 200:
+                        break
+                except requests.RequestException:
+                    pass
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Timed out after 30s waiting for etcd to become healthy")
+                time.sleep(0.1)
+            yield etcd, f"etcd://127.0.0.1:{client_port}"
+        finally:
             etcd.kill()
             etcd.wait(timeout=10)
-            shutil.rmtree(data_dir)
-        except Exception:
-            print(f"Failed to kill etcd: {traceback.format_exc()}")
+            shutil.rmtree(data_dir, ignore_errors=True)
     else:
         yield None, f"http://localhost:{disagg_port}"
 
