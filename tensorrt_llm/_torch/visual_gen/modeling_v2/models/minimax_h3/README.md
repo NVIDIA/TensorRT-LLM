@@ -34,6 +34,12 @@ A family or target can own all four layers. H3 keeps its model blocks in `compon
 
 Write or port a kernel when existing V2 ops and library APIs do not support the required layout or hardware, compute a different result, or miss a measured performance target. **Put it with the op that owns the computation.** Build new C++/CUDA ops with their catalog, family or target and register them under its V2 namespace. Reuse the existing registration when calling a shared kernel. [Native build guide](../../../../../../cpp/tensorrt_llm/visual_gen/README.md)
 
+### How a component differs from an op
+
+**A component owns part of the model.** The [H3 DiT attention component](components/attention.py) takes hidden states and returns the layer output. It owns the projection and normalization weights, forms Q/K/V, applies Q/K normalization and RoPE, and applies the output projection after attention. When Ulysses is enabled, it uses the [Ulysses component](components/ulysses_attention.py) to coordinate the exchanges around attention.
+
+**An op owns a specific calculation.** The [FA4 attention op](../../catalog/attention/flash_attention_4.py) takes prepared Q, K and V, a softmax scale and masking options. It computes attention and returns the weighted values and log-sum-exp. You can test that calculation directly with tensors. Changing how H3 projects its hidden states or distributes heads across ranks belongs in the component.
+
 ### When to extract an op
 
 Extract an op when you can **describe its result from its arguments and have a reason to implement or test it separately**. For H3’s Q/K transform, the caller supplies the projected tensors, normalization weights and rotation tables. The [op test](../../../../../../tests/unittest/_torch/visual_gen/modeling_v2/models/minimax_h3/ops/test_rope.py) runs the fused kernel and a plain PyTorch calculation on the same inputs and compares their Q and K outputs.
