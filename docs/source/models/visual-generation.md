@@ -71,6 +71,7 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 | **LTX-2** | Yes | Yes | Yes | Yes | No | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes |
 | **LTX-2.3** | Yes | Yes | No | No | No | No | No | Yes | Yes | Yes | Yes | Yes | No | No | No | No | No |
 | **MiniMax-H3** | Yes | Yes | No | No | No | Yes | No | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | No |
+| **MiniMax-H3-Image** | No | No | No | No | No | No | No | No | No | No | Not validated | Yes | No | No | No | No | No |
 | **FastH3** | Yes | Yes | No | No | No | No | No | No | No | No | Yes | Yes | No | No | No | No | No |
 | **Qwen-Image** | Yes | Yes | Yes | Yes | No | No | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No | No |
 | **Qwen-Image-Layered** | Yes | No | No | Yes | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No | No |
@@ -172,6 +173,15 @@ FLUX.2 and Qwen-Image-Edit accept a list of reference images on `image_reference
 The same fields carry references over `trtllm-serve`; see [`examples/visual_gen/serve/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/serve) for request examples.
 
 ## MiniMax-H3-Image
+
+The validated single-GPU eager profile uses the `TRTLLM` attention backend for
+the DiT and PyTorch SDPA for the text encoder. `trtllm-serve` image generation
+was verified on a GB100 GPU at 2048x2048 with six steps and seed 42; its output
+was pixel-identical to eager generation through the Python API. `torch.compile`
+with the default `enable_fullgraph: false` completed generation, but output
+equivalence is not validated: the measured AlexNet LPIPS against eager was
+0.1038 for the validation prompt. Compilation therefore remains unvalidated
+in the feature matrix.
 
 Use the [image example](../../../examples/visual_gen/models/minimax_h3_image.py)
 with the [single-GPU config](../../../examples/visual_gen/configs/minimax-h3-image-bf16-1gpu.yaml)
