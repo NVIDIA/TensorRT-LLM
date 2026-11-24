@@ -314,6 +314,7 @@ def test_a_failure_not_about_memory_gets_no_advice():
                     frame=frame,
                     capability=capability(),
                     tag="startup_failed",
+                    timestamp_ns=1,
                     pid=1,
                     rank=0,
                     device_index=0,

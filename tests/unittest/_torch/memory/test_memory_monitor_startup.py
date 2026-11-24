@@ -333,9 +333,7 @@ def test_failed_step_gets_its_advice_only_for_an_out_of_memory_failure(monkeypat
     startup.set_stage_advice({"kv_cache": "KV cache"}, {"kv_cache": "reduce the fraction"})
     for out_of_memory, expected in ((True, "reduce the fraction"), (False, "")):
         calls.clear()
-        tagging._log_window_result(
-            tagging.TagSnapshot(supported=False), failed=True, out_of_memory=out_of_memory
-        )
+        tagging._log_window_result(failed=True, out_of_memory=out_of_memory)
         assert calls[0]["suggestion"] == expected, f"out_of_memory={out_of_memory}"
         # A failure that is not about memory gets no advice at all, not the
         # largest group's generic advice in place of the step's.

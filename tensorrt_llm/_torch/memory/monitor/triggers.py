@@ -84,6 +84,7 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import json
 import logging
 import os
 import re
@@ -99,7 +100,7 @@ from tensorrt_llm.logger import logger
 
 from . import providers
 from .capability import tagging_supported
-from .capture import capture, render_capture
+from .capture import capture, render_capture, structured_report
 from .schema import GIB
 from .settings import (
     DEFAULT_OOM_INTERVAL_S,
@@ -299,6 +300,14 @@ def _check_settings(world_size: int | None) -> None:
         )
 
 
+def unavailable_report(rank: int | None, reason: str) -> dict:
+    return {"tag": "on_demand", "rank": rank, "status": "unavailable", "reason": reason}
+
+
+def report_log_message(report: dict | str) -> str:
+    return json.dumps(report, separators=(",", ":")) if isinstance(report, dict) else report
+
+
 def report_now(
     tag: str,
     rank: int | None = None,
@@ -311,13 +320,14 @@ def report_now(
     force: bool = False,
     device_index: int | None = None,
     save: bool = True,
-) -> str | None:
+    startup_oom: bool = False,
+) -> dict | str | None:
     """Render the monitor for this process, or ``None`` if it is disabled.
 
     ``force`` renders it even when disabled; see :func:`capture`.
 
-    Returns the text without logging it; the caller decides where it goes
-    (the log, an exception message, a crash dump). With ``save`` it is also
+    Returns a JSON-compatible record for machine consumers and text for OOM diagnostics.
+    The caller chooses the destination (log, exception message, or crash dump). With ``save`` it is also
     written to ``TLLM_MEM_MONITOR_DIR`` when that is set. ``record_baseline``
     makes this reading the one later reports compare against. Without
     ``advise`` the report gives no tuning advice, for a failure that tuning
@@ -349,13 +359,16 @@ def report_now(
         return None
 
     try:
-        text = render_capture(snapshot)
+        structured = tag in ("on_demand", "periodic", "startup_complete") or (
+            tag == "startup_failed" and not startup_oom
+        )
+        report = structured_report(snapshot) if structured else render_capture(snapshot)
     except Exception as exc:  # a report must not add a failure
         logger.warning(f"memory monitor: rendering {tag!r} failed ({type(exc).__name__}: {exc})")
         return None
     if save:
-        _save(text, tag, snapshot.rank)
-    return text
+        _save(report, tag, snapshot.rank)
+    return report
 
 
 _UNSAFE_FILE_CHARS = re.compile(r"[^A-Za-z0-9._-]")
@@ -363,7 +376,7 @@ _UNSAFE_FILE_CHARS = re.compile(r"[^A-Za-z0-9._-]")
 _PERIODIC_TAG = "periodic"
 
 
-def _save(text: str, tag: str, rank: int | None) -> str | None:
+def _save(text: str | dict, tag: str, rank: int | None) -> str | None:
     """Write a report to ``TLLM_MEM_MONITOR_DIR``; the path, or ``None``.
 
     The directory is created ``0o700`` and the file ``0o600``: a report
@@ -383,12 +396,13 @@ def _save(text: str, tag: str, rank: int | None) -> str | None:
     rank_part = "x" if rank is None else str(rank)
     safe_tag = _UNSAFE_FILE_CHARS.sub("_", tag) or "report"
     prefix = f"memory_rank{rank_part}_pid{os.getpid()}_"
-    path = os.path.join(directory, f"{prefix}{stamp}_{safe_tag}.txt")
+    extension = "jsonl" if isinstance(text, dict) else "log"
+    path = os.path.join(directory, f"{prefix}{stamp}_{safe_tag}.{extension}")
     try:
         os.makedirs(directory, mode=0o700, exist_ok=True)
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w") as handle:
-            handle.write(text + "\n")
+            handle.write(report_log_message(text) + "\n")
         if safe_tag == _PERIODIC_TAG:
             _prune_periodic(os.path.join(directory, prefix), path)
     except (OSError, ValueError) as exc:
@@ -702,7 +716,7 @@ class _PeriodicReporter:
         while not self._stop.wait(self._interval):
             report = report_now(tag="periodic", rank=self._rank, device_index=self._device)
             if report is not None:
-                logger.info(f"memory monitor:\n{report}")
+                logger.info(report_log_message(report))
 
     def stop(self) -> None:
         self._stop.set()

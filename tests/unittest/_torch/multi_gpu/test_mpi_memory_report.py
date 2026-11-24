@@ -55,11 +55,11 @@ def test_every_rank_has_an_entry_and_shutdown_is_prompt(monkeypatch, full_mode):
         llm.generate(["Hello"], SamplingParams(max_tokens=4))
         reports = llm.get_memory_report()
         assert len(reports) == 2, reports
-        assert "rank=0" in reports[0] and "This process uses" in reports[0]
+        assert reports[0]["rank"] == 0 and reports[0]["groups"]["kv_cache"] > 0
         if full_mode:
-            assert "rank=1" in reports[1] and "This process uses" in reports[1]
+            assert reports[1]["rank"] == 1 and reports[1]["groups"]["kv_cache"] > 0
         else:
-            assert reports[1].startswith("rank 1: not gathered")
+            assert reports[1]["rank"] == 1 and reports[1]["status"] == "unavailable"
     finally:
         started = time.monotonic()
         llm.shutdown()

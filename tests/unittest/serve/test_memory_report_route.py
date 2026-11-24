@@ -49,7 +49,9 @@ def _env(*extra, mode="1", key=_ENV_KEY):
 def _build(serve_env, config):
     server = serve_env.build_openai_server(config)
     factory = AsyncMock if config.rl_control else MagicMock
-    server.generator.get_memory_report = factory(return_value=["rank 0 report"])
+    server.generator.get_memory_report = factory(
+        return_value=[{"rank": 0, "status": "ok", "groups": {"kv_cache": 1024}}]
+    )
     return server, serve_env.client(server.app, lifespan=False)
 
 
@@ -72,7 +74,9 @@ def test_returns_each_workers_report(serve_env, asynchronous, from_config, key):
     _, client = _build(serve_env, config)
     response = _get(client, key)
     assert response.status_code == 200
-    assert response.json() == {"reports": ["rank 0 report"]}
+    assert response.json() == {
+        "reports": [{"rank": 0, "status": "ok", "groups": {"kv_cache": 1024}}]
+    }
 
 
 def test_requires_authentication(serve_env):
@@ -126,7 +130,7 @@ def test_concurrent_requests_share_one_gather(serve_env):
     def slow_report():
         calls.append(1)
         release.wait(5)
-        return ["rank 0 report"]
+        return [{"rank": 0, "status": "ok", "groups": {"kv_cache": 1024}}]
 
     server.generator.get_memory_report = slow_report
 

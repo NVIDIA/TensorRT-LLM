@@ -22,7 +22,8 @@ changes it: no ``empty_cache()``, no synchronisation, no peak-stat reset.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+import time
+from dataclasses import asdict, dataclass
 
 import torch
 
@@ -51,6 +52,8 @@ class MonitorCapture:
     pid: int
     rank: int | None
     device_index: int
+    timestamp_ns: int
+    failed_stage: startup.StageSample | None = None
     checks: tuple[CheckResult, ...] = ()
     #: One line saying what happened, shown above the summary (e.g. the
     #: failed allocation on OOM).
@@ -247,6 +250,7 @@ def capture(
     # tags: a snapshot costs milliseconds, and two would disagree. The sleep
     # release state is pinned for the same reason: sleep or wakeup on another
     # thread must not change it between the readings below.
+    timestamp_ns = time.time_ns()
     segments = _segments(device_index)
     with released_tags_pinned():
         torch_reading = read_torch(device_index, segments)
@@ -271,6 +275,8 @@ def capture(
         pid=os.getpid(),
         rank=rank,
         device_index=device_index,
+        timestamp_ns=timestamp_ns,
+        failed_stage=startup.failed_stage() if tag == "startup_failed" else None,
         checks=checks,
         headline=headline,
         baseline=baseline,
@@ -279,6 +285,64 @@ def capture(
         startup_steps=startup_steps,
         unattributed_sites=sites or None,
     )
+
+
+def structured_report(snapshot: MonitorCapture) -> dict:
+    """One rank's JSON-compatible report. All memory quantities are bytes."""
+    frame = snapshot.frame
+    totals = group_totals(frame)
+    device = frame.device
+    plan = startup.memory_plan()
+    released = any(e.released for e in frame.entries) or any(
+        pool.released for pool in frame.torch.pools or ()
+    )
+    return {
+        "timestamp_ns": snapshot.timestamp_ns,
+        "tag": snapshot.tag,
+        "status": "ok",
+        "rank": snapshot.rank,
+        "pid": snapshot.pid,
+        "device": snapshot.device_index,
+        "device_total_bytes": device.total,
+        "device_free_bytes": device.free,
+        "process_used_bytes": device.process_used,
+        "process_missing_reason": device.process_missing_reason
+        if device.process_used is None
+        else None,
+        "accounted_bytes": totals.process_total,
+        "accounted_bytes_is_upper_bound": totals.process_total_is_upper_bound,
+        "groups": {group.name.lower(): size for group, size in totals.sizes.items()},
+        "baseline_bytes": (
+            {group.name.lower(): size for group, size in snapshot.baseline.items()}
+            if snapshot.baseline is not None
+            else None
+        ),
+        "torch": {
+            "reserved_bytes": frame.torch.reserved,
+            "live_bytes": frame.torch.live,
+            "pools": [{**asdict(pool), "pool_id": list(pool.pool_id)} for pool in frame.torch.pools]
+            if frame.torch.pools is not None
+            else None,
+        },
+        "entries": [asdict(entry) for entry in frame.entries],
+        "group_members_bytes": {
+            group.name.lower(): dict(members) for group, members in totals.members.items()
+        },
+        "unmeasured": list(totals.unmeasured),
+        "startup_tagging_supported": get_frozen_map().supported,
+        "checks": [asdict(check) for check in snapshot.checks],
+        "capability": asdict(snapshot.capability),
+        "startup_plan": asdict(plan) if plan is not None and not released else None,
+        "startup_steps": [asdict(stage) for stage in startup.stages()]
+        if snapshot.startup_steps
+        else [],
+        "failed_stage": asdict(snapshot.failed_stage)
+        if snapshot.failed_stage is not None
+        else None,
+        "unattributed_sites": snapshot.unattributed_sites,
+        "headline": snapshot.headline,
+        "suggestion": snapshot.suggestion,
+    }
 
 
 def render_capture(snapshot: MonitorCapture) -> str:

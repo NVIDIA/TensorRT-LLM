@@ -552,7 +552,7 @@ def test_report_files_have_safe_names(monkeypatch, tmp_path):
     monkeypatch.setenv(mod.DIR_VAR, str(tmp_path))
     path = mod._save("text", "warmup/before_warmup", rank=1)
     assert path is not None and os.path.dirname(path) == str(tmp_path)
-    assert path.endswith("_warmup_before_warmup.txt")
+    assert path.endswith("_warmup_before_warmup.log")
     assert "Z-" in os.path.basename(path), "named in UTC"
 
 
@@ -568,9 +568,9 @@ def test_report_files_are_private_and_periodic_ones_are_capped(monkeypatch, tmp_
     assert stat.S_IMODE(directory.stat().st_mode) == 0o700, "only the owner may list it"
     assert stat.S_IMODE(os.stat(path).st_mode) == 0o600, "only the owner may read it"
 
-    periodic = [mod._save(f"periodic {i}", "periodic", rank=0) for i in range(5)]
-    mod._save("other rank", "periodic", rank=1)
-    kept = sorted(p.name for p in directory.glob("memory_rank0_*_periodic.txt"))
+    periodic = [mod._save({"sequence": i}, "periodic", rank=0) for i in range(5)]
+    mod._save({"rank": 1}, "periodic", rank=1)
+    kept = sorted(p.name for p in directory.glob("memory_rank0_*_periodic.jsonl"))
     assert kept == sorted(os.path.basename(p) for p in periodic[-3:]), "the newest three"
     assert len(list(directory.glob("memory_rank1_*"))) == 1, "another rank's are its own"
     assert os.path.exists(path), "reports other than periodic ones are kept"
@@ -590,8 +590,8 @@ def test_periodic_files_are_kept_in_the_order_they_were_written(monkeypatch, tmp
         return f"20261101T{next(hours)}0000Z"
 
     monkeypatch.setattr(mod.time, "strftime", strftime)
-    written = [mod._save(f"periodic {i}", "periodic", rank=0) for i in range(6)]
-    kept = {p.name for p in tmp_path.glob("*_periodic.txt")}
+    written = [mod._save({"sequence": i}, "periodic", rank=0) for i in range(6)]
+    kept = {p.name for p in tmp_path.glob("*_periodic.jsonl")}
     assert kept == {os.path.basename(p) for p in written[-3:]}, "the newest three written"
 
 
@@ -752,21 +752,28 @@ def test_baseline_is_taken_when_startup_completes(monkeypatch):
     monkeypatch.setattr(tagging, "tagging_supported", lambda: False)
     startup.clear()
     try:
-        # A half-built executor is not a state to measure growth from.
-        with pytest.raises(RuntimeError):
-            with tagging.startup_window():
-                raise RuntimeError("load failed")
-        assert startup.baseline() is None
-        assert "since warmup" not in report_now(tag="later"), "after a failed startup"
-
         texts = []
         real = triggers.report_now
         monkeypatch.setattr(
             triggers, "report_now", lambda **kw: texts.append(real(**kw)) or texts[-1]
         )
+        # A half-built executor is not a state to measure growth from.
+        with pytest.raises(RuntimeError):
+            with tagging.startup_window():
+                startup.record_failed_stage("kv_cache", 123456789)
+                raise RuntimeError("load failed")
+        failed = texts.pop()["failed_stage"]
+        assert (failed["stage"], failed["free_before"], failed["free_after"]) == (
+            "kv_cache",
+            123456789,
+            None,
+        )
+        assert startup.baseline() is None
+        assert "since warmup" not in report_now(tag="later"), "after a failed startup"
+
         with tagging.startup_window():
             pass
-        assert texts and "since warmup" not in texts[0], "the startup report itself"
+        assert texts[0]["tag"] == "startup_complete" and texts[0]["baseline_bytes"] is None
 
         held = torch.empty(512 * MB, dtype=torch.uint8, device="cuda")
         try:

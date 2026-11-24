@@ -15,6 +15,7 @@
 """Reporting while serving: periodic, on request, and from other threads,
 plus startup attribution of memory that worker threads allocate."""
 
+import json
 import threading
 import time
 from types import SimpleNamespace
@@ -67,10 +68,12 @@ class TestPeriodic:
         monkeypatch.setenv(triggers.DIR_VAR, str(tmp_path))
         assert triggers.install_oom_reporter()
         deadline = time.monotonic() + 30
-        while not list(tmp_path.glob("*_periodic.txt")) and time.monotonic() < deadline:
+        while not list(tmp_path.glob("*_periodic.jsonl")) and time.monotonic() < deadline:
             time.sleep(0.05)
-        assert list(tmp_path.glob("*_periodic.txt"))
         triggers.uninstall_oom_reporter()
+        (first, *_) = sorted(tmp_path.glob("*_periodic.jsonl"))
+        record = json.loads(first.read_text())
+        assert record["tag"] == "periodic" and record["status"] == "ok"
         assert not any(t.name == "memory-monitor-periodic" for t in threading.enumerate())
 
 
@@ -165,8 +168,9 @@ class TestOnRequest:
         monkeypatch.setenv("TLLM_MEM_MONITOR", "0")
         monkeypatch.setenv(triggers.DIR_VAR, str(tmp_path))
         worker = SimpleNamespace(engine=SimpleNamespace(device_id=torch.cuda.current_device()))
-        (text,) = BaseWorker.get_memory_report(worker)
-        assert "This process uses" in text
+        (record,) = BaseWorker.get_memory_report(worker)
+        assert record["status"] == "ok" and record["device_total_bytes"] > 0
+        assert json.loads(json.dumps(record)) == record
         assert not list(tmp_path.iterdir()), "on-demand reports are not written to files"
 
 
@@ -174,13 +178,13 @@ class TestOnRequest:
 def test_an_encode_only_llm_reports_its_own_process(monkeypatch):
     from tensorrt_llm.llmapi.llm import LLM
 
-    monkeypatch.setattr(triggers, "report_now", lambda **kw: f"report ({kw['tag']})")
+    monkeypatch.setattr(triggers, "report_now", lambda **kw: {"tag": kw["tag"], "rank": kw["rank"]})
     llm = SimpleNamespace(_encode_only=True)
-    assert LLM.get_memory_report(llm) == ["report (on_demand)"]
+    assert LLM.get_memory_report(llm) == [{"tag": "on_demand", "rank": 0}]
 
     monkeypatch.setattr(triggers, "report_now", lambda **kw: None)
     assert LLM.get_memory_report(llm) == [
-        "rank 0: the report could not be built; see this process's log"
+        triggers.unavailable_report(0, "the report could not be built; see this process's log")
     ]
 
 
@@ -192,11 +196,19 @@ def test_async_llm_gathers_every_workers_reports():
 
     async def collective_rpc(method):
         assert method == "get_memory_report"
-        return [["rank 0 report", "rank 1 report"], None, ["", "rank 2 report"]]
+        return [
+            [{"rank": 0, "status": "ok"}, {"rank": 1, "status": "ok"}],
+            None,
+            ["", {"rank": 2, "status": "ok"}],
+        ]
 
     llm = SimpleNamespace(collective_rpc=collective_rpc)
     reports = asyncio.run(AsyncLLM.get_memory_report(llm))
-    assert reports == ["rank 0 report", "rank 1 report", "rank 2 report"]
+    assert reports == [
+        {"rank": 0, "status": "ok"},
+        {"rank": 1, "status": "ok"},
+        {"rank": 2, "status": "ok"},
+    ]
 
 
 @pytest.mark.cpu_only
@@ -216,9 +228,11 @@ def test_every_rank_has_an_entry(monkeypatch):
     engine.gather_memory_reports = lambda: PyExecutor.gather_memory_reports(engine)
     monkeypatch.setattr(triggers, "report_now", lambda **kw: None)
     reports = BaseWorker.get_memory_report(SimpleNamespace(engine=engine))
-    assert reports[0] == "rank 0: the report could not be built; see this rank's log"
-    assert [r.split(":")[0] for r in reports[1:]] == ["rank 1", "rank 2"]
-    assert "TLLM_MEM_MONITOR=1" in reports[1]
+    assert reports[0] == triggers.unavailable_report(
+        0, "the report could not be built; see this rank's log"
+    )
+    assert [r["rank"] for r in reports[1:]] == [1, 2]
+    assert "TLLM_MEM_MONITOR=1" in reports[1]["reason"]
 
     # Ray workers each answer for themselves; nothing to add.
     engine._disable_mpi = True
@@ -238,7 +252,7 @@ def test_real_out_of_memory_is_reported_once_it_escapes(monkeypatch, tmp_path):
     assert not list(tmp_path.iterdir()), "a caught OOM"
     # What the executor's error handler passes on once the error escapes.
     triggers.notify_error(error)
-    (path,) = tmp_path.glob("*_out_of_memory.txt")
+    (path,) = tmp_path.glob("*_out_of_memory.log")
     text = path.read_text()
     assert "PyTorch could not allocate 1048576.00 GiB" in text
     assert "This process uses" in text
@@ -280,8 +294,18 @@ def test_llm_returns_each_workers_report():
     llm._encode_only = False
     # Rank 0's worker answers for every rank under MPI; Ray workers each
     # answer for themselves. Either way one flat list comes back.
-    llm._collective_rpc = MagicMock(return_value=[["rank 0", "rank 1"], None, ["rank 2"]])
-    assert llm.get_memory_report() == ["rank 0", "rank 1", "rank 2"]
+    llm._collective_rpc = MagicMock(
+        return_value=[
+            [{"rank": 0, "status": "ok"}, {"rank": 1, "status": "ok"}],
+            None,
+            [{"rank": 2, "status": "ok"}],
+        ]
+    )
+    assert llm.get_memory_report() == [
+        {"rank": 0, "status": "ok"},
+        {"rank": 1, "status": "ok"},
+        {"rank": 2, "status": "ok"},
+    ]
     llm._collective_rpc.assert_called_once_with("get_memory_report")
     # Allowed on a multi-rank MPI executor.
     _check_collective_rpc_guard(2, None, None, method="get_memory_report")
@@ -337,7 +361,7 @@ def _ranks(monkeypatch, world, listening):
     monkeypatch.setattr(ranks, "_POLL_S", 0.005)
     monkeypatch.setattr(ranks, "_SEND_POLL_S", 0.005)
     monkeypatch.setattr(
-        triggers, "report_now", lambda tag, rank=None, **_: f"report of rank {rank}"
+        triggers, "report_now", lambda tag, rank=None, **_: {"rank": rank, "status": "ok"}
     )
     box, lock = {}, threading.Lock()
     reporters = [
@@ -355,7 +379,7 @@ def test_rank_zero_gathers_every_rank(monkeypatch):
     reporters, _, _ = _ranks(monkeypatch, 3, {1, 2})
     try:
         got = reporters[0].gather(timeout=10)
-        assert got == ["report of rank 1", "report of rank 2"], "in rank order"
+        assert got == [{"rank": 1, "status": "ok"}, {"rank": 2, "status": "ok"}], "in rank order"
     finally:
         for r in reporters:
             r.stop()
@@ -363,7 +387,10 @@ def test_rank_zero_gathers_every_rank(monkeypatch):
     reporters, _, _ = _ranks(monkeypatch, 3, {1})
     try:
         got = reporters[0].gather(timeout=0.3)
-        assert got == ["report of rank 1", "rank 2: no report within 0.3 s"], "a silent rank"
+        assert got == [
+            {"rank": 1, "status": "ok"},
+            triggers.unavailable_report(2, "no report within 0.3 s"),
+        ], "a silent rank"
     finally:
         for r in reporters:
             r.stop()
@@ -372,7 +399,9 @@ def test_rank_zero_gathers_every_rank(monkeypatch):
     with lock:  # rank 1's answer to request 0, which timed out long ago
         box.setdefault((1, 0, ranks._REPLY_TAG), []).append((0, "stale"))
     got = reporters[0].gather(timeout=0.2)
-    assert got == ["rank 1: no report within 0.2 s"], "a late answer is dropped"
+    assert got == [triggers.unavailable_report(1, "no report within 0.2 s")], (
+        "a late answer is dropped"
+    )
 
 
 @pytest.mark.cpu_only
@@ -418,8 +447,8 @@ def test_a_gather_overlapping_shutdown_returns_at_once(monkeypatch):
     gathering.join(5)
     assert not gathering.is_alive() and time.monotonic() - started < 5, "not the 30 s timeout"
     assert result == [
-        "rank 1: not gathered; shutting down",
-        "rank 2: not gathered; shutting down",
+        triggers.unavailable_report(1, "not gathered; shutting down"),
+        triggers.unavailable_report(2, "not gathered; shutting down"),
     ]
     assert reporters[0].gather() == result, "a gather after stop() does not ask at all"
 
