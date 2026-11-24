@@ -144,8 +144,6 @@ from dataclasses import dataclass
 from collections.abc import Callable
 from typing import Any, Tuple
 
-import importlib
-
 import cutlass
 import cutlass.experimental.cuda as cuda
 import cutlass.cute as cute
@@ -3180,9 +3178,6 @@ class FmhaTs:
             is_causal=is_causal,
             window_size_left=window_size_left,
         )
-        # Load helpers before staged Sage copies enter GPU control flow.
-        importlib.import_module(f"{__package__}.helpers_paged")
-
         if causal_single_kv_tile and (not is_causal or head_paired):
             raise ValueError(
                 "causal_single_kv_tile requires query-paired causal attention"
@@ -3295,7 +3290,11 @@ class FmhaTs:
         # VC-Attention skips no correction. The skip keeps a stale row max,
         # under which a larger score codes past VC_EXPCAST_CODE_BIAS and out of
         # the E4M3 range. The exact per-tile max keeps every code at or below it.
-        if enable_skip_correction and not cfg.vc_attention:
+        # E4M3 V skips none either. A stale row max lets P reach 2^threshold, so
+        # P can only be scaled by 1 before the E4M3 cast and every P below 2^-10
+        # rounds to zero while the row sum still counts it. The exact max keeps
+        # P at or below 1, scaled by 448, which holds P down to 2^-18.
+        if enable_skip_correction and not cfg.vc_attention and v_dtype.width == 16:
             cfg.corr_skip_threshold_log2 = _CORR_SKIP_THRESHOLD_LOG2
         cfg.uses_ldtm_stat = uses_ldtm_stat
         cfg.fp8_psmem_early_token = fp8_psmem_early_token

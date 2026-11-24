@@ -2369,6 +2369,13 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
         # NOTE: Setting disable_fuse_rope to True to do mrope fusion in the model engine by pre-computing rotary_cos_sin in the model engine
         disable_fuse_rope = kwargs.get('disable_fuse_rope', False)
         model_config.pretrained_config.disable_fuse_rope = disable_fuse_rope
+        # Checkpoints set tie_word_embeddings only at the top level, but the LM
+        # is built from text_config, which lacks it in transformers>=5.
+        text_config = getattr(model_config.pretrained_config, 'text_config',
+                              None)
+        if text_config is not None:
+            text_config.tie_word_embeddings = (
+                model_config.pretrained_config.tie_word_embeddings)
         # In transformers 5.x, rope_scaling is a property that reads
         # rope_parameters, which may not exist on Qwen2_5_VLConfig.
         # Use getattr to safely check and initialize.

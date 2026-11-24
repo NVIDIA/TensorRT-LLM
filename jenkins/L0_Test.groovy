@@ -30,6 +30,7 @@ import com.nvidia.bloom.ContainerRuntime
 import com.nvidia.bloom.FailureEvidenceCollector
 import com.nvidia.bloom.SshAuthMethod
 import org.jenkinsci.plugins.workflow.cps.CpsThread
+import org.jenkinsci.plugins.workflow.steps.FlowInterruptedException
 import org.jsoup.Jsoup
 import org.jenkinsci.plugins.pipeline.modeldefinition.Utils as jUtils
 import trtllm.FailureClassifier
@@ -380,7 +381,7 @@ def getShortenedJenkinsInstanceName() {
 }
 
 def isCbtsStage(String stageName) {
-    // Pipeline-level eligibility (post-merge gate + kill switch) is decided in L0_MergeRequest.groovy and propagated via testFilter.
+    // The pipeline-level kill switch is propagated by L0_MergeRequest.groovy.
     if (!(testFilter[(CBTS_COVERAGE)] ?: false)) {
         return false
     }
@@ -388,12 +389,15 @@ def isCbtsStage(String stageName) {
     if (stageName.contains("Perf")) {
         return false
     }
+    if (stageName.contains("-Ray-")) {
+        return false
+    }
     // Skip stages with no product Python coverage: TensorRT (legacy) and CPP (gtest).
     if (stageName.contains("TensorRT") || stageName.contains("CPP")) {
         return false
     }
-    // Phase 1: single-GPU only; multi-GPU / multi-node stages carry the "_GPUs" / "_Nodes" token.
-    if (stageName.contains("_GPUs") || stageName.contains("_Nodes")) {
+    // The context channel is limited to a single node.
+    if (stageName.contains("_Nodes")) {
         return false
     }
     return !CBTS_EXCLUDE_STAGES.contains(stageName)
@@ -633,40 +637,58 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
 
         // Collect coverage before packaging results.
         if (isCbtsStage(stageName)) {
+            boolean interruptionWasActualInsideTimeout = false
             try {
-                CloudManager.withSlurmSshCredentials(pipeline, clusterName, cluster) { remote ->
-                    def remoteWs = "/home/svc_tensorrt/bloom/scripts/${nodeName}"
-                    def cbtsLocalDir = "${stageName}/cbts${postTag}"
-                    def cbtsArchive = "cbts_coverage_${stageName}.tar.gz"
-                    sh "mkdir -p ${cbtsLocalDir}"
-                    timeout(time: 5, unit: 'MINUTES') {
-                        // Pack remote coverage and discard empty archives.
-                        Utils.exec(
-                            pipeline,
-                            script: Utils.sshUserCmd(
-                                remote,
-                                "\"cd '${remoteWs}' && sleep 2 && " +
-                                "tar czf '${cbtsArchive}' .cbtscov.${stageName}* 2>/dev/null; " +
-                                "tar tzf '${cbtsArchive}' 2>/dev/null | grep -q . || rm -f '${cbtsArchive}'\""
-                            ),
-                            returnStatus: true,
-                            numRetries: 3,
-                        )
-                        def gotArchive = Utils.exec(
-                            pipeline,
-                            script: scpFromRemoteCmd(remote, "${remoteWs}/${cbtsArchive}", "${cbtsLocalDir}/"),
-                            returnStatus: true,
-                            numRetries: 3,
-                        ) == 0
-                        if (gotArchive) {
-                            // Aggregation flattens directories; tag retry filenames too.
-                            def coverageTransformOpt = postTag ? "--transform 's|[.]sqlite\$|${postTag}.sqlite|'" : ""
-                            sh "tar xzf ${cbtsLocalDir}/${cbtsArchive} ${coverageTransformOpt} -C ${cbtsLocalDir}/ && rm -f ${cbtsLocalDir}/${cbtsArchive}"
-                        } else {
-                            echo "CBTS: no coverage archive retrieved for ${stageName} (no coverage data or transfer skipped)."
+                timeout(time: 5, unit: 'MINUTES') {
+                    try {
+                        CloudManager.withSlurmSshCredentials(pipeline, clusterName, cluster) { remote ->
+                            def remoteWs = "/home/svc_tensorrt/bloom/scripts/${nodeName}"
+                            def cbtsLocalDir = "${stageName}/cbts${postTag}"
+                            def cbtsArchive = "cbts_coverage_${stageName}.tar.gz"
+                            sh "mkdir -p ${cbtsLocalDir}"
+                            def archiveScript = "cd '${remoteWs}' && { sleep 2; " +
+                                "if tar czf '${cbtsArchive}' .cbtscov.${stageName}*.sqlite; then " +
+                                "tar tzf '${cbtsArchive}' >/dev/null; else rm -f '${cbtsArchive}'; exit 1; fi; }"
+                            def archiveScriptB64 = archiveScript.bytes.encodeBase64().toString()
+                            def archiveStatus = Utils.exec(
+                                pipeline,
+                                script: Utils.sshUserCmd(remote, "\"echo ${archiveScriptB64} | base64 -d | bash\""),
+                                returnStatus: true,
+                                numRetries: 3,
+                            )
+                            if (archiveStatus != 0) {
+                                echo "CBTS: no coverage archive created for ${stageName} (remote status ${archiveStatus})."
+                            } else {
+                                def gotArchive = Utils.exec(
+                                    pipeline,
+                                    script: scpFromRemoteCmd(remote, "${remoteWs}/${cbtsArchive}", "${cbtsLocalDir}/"),
+                                    returnStatus: true,
+                                    numRetries: 3,
+                                ) == 0
+                                if (gotArchive) {
+                                    // Aggregation flattens directories; tag retry filenames too.
+                                    def coverageTransformOpt = postTag ? "--transform 's|[.]sqlite\$|${postTag}.sqlite|'" : ""
+                                    sh "tar xzf ${cbtsLocalDir}/${cbtsArchive} ${coverageTransformOpt} -C ${cbtsLocalDir}/ && rm -f ${cbtsLocalDir}/${cbtsArchive}"
+                                } else {
+                                    echo "CBTS: coverage archive transfer failed for ${stageName}."
+                                }
+                            }
                         }
+                    } catch (FlowInterruptedException e) {
+                        interruptionWasActualInsideTimeout = e.isActualInterruption()
+                        throw e
                     }
                 }
+            } catch (FlowInterruptedException e) {
+                // Jenkins marks this timeout non-actual only after leaving its own block.
+                if (interruptionWasActualInsideTimeout && !e.isActualInterruption() &&
+                    e.causes && e.causes.every { it.class.simpleName == 'ExceededTimeout' }) {
+                    echo "CBTS: coverage pull for ${stageName} timed out; continuing."
+                } else {
+                    throw e
+                }
+            } catch (InterruptedException e) {
+                throw e
             } catch (Exception e) {
                 echo "CBTS: coverage pull for ${stageName} skipped (${e.message}); continuing."
             }
@@ -2157,7 +2179,7 @@ def getPytestBaseCommandLine(
         "--output-dir=${outputPath}/",
         "--csv=${outputPath}/report.csv",
         "-o junit_logging=${jUnitLogging}",
-        // Coverage capture: only CBTS (post-merge) stages instrument, via cbts_plugin / sitecustomize.
+        // Coverage capture: eligible CBTS stages instrument via cbts_plugin / sitecustomize.
         cbtsMode ? "-p cbts_plugin" : "",
         "--periodic-junit",
         // Keep an existing report path out of pytest's initial collection-path discovery.
@@ -7902,9 +7924,11 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB300-4_GPUs-PyTorch-1": ["auto:gb300-x4", "l0_gb300", 1, 3, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-2": ["auto:gb300-x4", "l0_gb300", 2, 3, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-3": ["auto:gb300-x4", "l0_gb300", 3, 3, 4, 1, true, false],
-        "GB300-4_GPUs-PyTorch-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus", 1, 3, 4, 1, true, false],
-        "GB300-4_GPUs-PyTorch-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus", 2, 3, 4, 1, true, false],
-        "GB300-4_GPUs-PyTorch-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus", 3, 3, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus", 1, 5, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus", 2, 5, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus", 3, 5, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-Post-Merge-4": ["auto:gb300-x4", "l0_gb300_multi_gpus", 4, 5, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-Post-Merge-5": ["auto:gb300-x4", "l0_gb300_multi_gpus", 5, 5, 4, 1, true, false],
     ]
     // PerfSanity post-merge stages end in -k_of_N and run on the official post-merge builds whose
     // BUILD_NUMBER % N == k % N: key models (DeepSeek-V4.1-Flash, Kimi-K3, MiniMax-M3, GLM-5.3-Flash,
@@ -7923,6 +7947,16 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-{split}_of_4",
         "auto:gb300-x4",
         "l0_gb300_multi_gpus_perf_sanity",
+        4,
+        4,
+        1, true
+    )
+    // Cold-start warmup time of the key-model cases (test_warmup): each case every 4 builds,
+    // one split per build.
+    SBSASlurmTestConfigs += buildStageConfigs(
+        "GB300-4_GPUs-PyTorch-PerfSanity-Warmup-Post-Merge-{split}_of_4",
+        "auto:gb300-x4",
+        "l0_gb300_multi_gpus_perf_sanity_warmup",
         4,
         4,
         1, true

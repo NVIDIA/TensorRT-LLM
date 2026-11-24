@@ -38,7 +38,8 @@ from ..distributed import AllReduceStrategy
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..modules.bf16_draft_head import BF16DraftHead, build_bf16_draft_head
 from ..modules.logits_processor import LogitsProcessor
-from ..pyexecutor import step_inputs
+from ..pyexecutor import device_copy, step_inputs
+from ..pyexecutor.device_copy import CopySite
 from ..pyexecutor.resource_manager import ResourceManagerType
 
 if TYPE_CHECKING:
@@ -66,7 +67,8 @@ from .greedy_argmax import greedy_argmax
 from .spec_tail_kernels import strict_accept
 from .vocab_parallel import (VocabParallelHead, VocabShardedLogits,
                              is_vocab_sharded_lm_head, key_exchange_takes,
-                             sharded_greedy_argmax, tp_pair_exchange)
+                             sharded_greedy_argmax, tp_pair_exchange,
+                             vocab_parallel_temperature_enabled)
 
 
 def _watermark_active(spec_metadata) -> bool:
@@ -97,7 +99,8 @@ def supports_sharded_target_sampling(spec_config, mapping) -> bool:
 def _temperature_only(spec_metadata, temperature_capable: bool) -> bool:
     """Graph key bit of the temperature-only variant: the variant is captured,
     the batch samples, every sampled row can be drawn on the sharded logits
-    (temperature only, no seed of its own), and the batch takes neither
+    (temperature only, no seed of its own, a temperature at or above the
+    greedy threshold), and the batch takes neither
     rejection sampling nor penalties. Seeded rows keep main's per-row Philox
     streams on the stock sampler."""
     return bool(spec_metadata.temperature_only_graphs and temperature_capable
@@ -106,12 +109,11 @@ def _temperature_only(spec_metadata, temperature_capable: bool) -> bool:
                 and not spec_metadata.enable_penalty)
 
 
-def _set_temperature_only(spec_metadata, temperature_capable: bool,
-                          all_temperature_only: bool) -> None:
+def _set_temperature_only(spec_metadata, all_temperature_only: bool) -> None:
     """Set both temperature-only graph key bits from a sampling scan's values;
     ``is_all_greedy_sample`` already holds the group-synchronized value."""
     spec_metadata.temperature_only = _temperature_only(spec_metadata,
-                                                       temperature_capable)
+                                                       all_temperature_only)
     all_temperature_only = (all_temperature_only
                             and spec_metadata.shard_temperature_only_graphs)
     spec_metadata.local_all_temperature_only = all_temperature_only
@@ -622,6 +624,9 @@ _UNSEEDED_RNG_WINDOW_KEY = "unseeded"
 # so each slot leaves them room before the next one starts.
 _RNG_SLOT_SPAN = 32
 
+# SamplingConfig and the CUDA kernels both represent temperatures in float32.
+_SHARD_TEMPERATURE_MIN = float(np.float32(GREEDY_TEMPERATURE_THRESHOLD))
+
 
 @dataclass(frozen=True, slots=True)
 class OneModelSamplingParams:
@@ -643,7 +648,8 @@ class OneModelSamplingParams:
     def is_shard_sampleable(self) -> bool:
         """Temperature-only and unseeded: a row the vocabulary-sharded samplers may draw. A seeded
         row stays on the stock sampler, so its tokens do not depend on the rest of the batch."""
-        return self.is_temperature_only and self.seed is None
+        return (self.is_temperature_only and self.seed is None
+                and self.temperature >= _SHARD_TEMPERATURE_MIN)
 
     @classmethod
     def of_request(cls, request: "LlmRequest") -> "OneModelSamplingParams":
@@ -699,11 +705,17 @@ def one_model_sampling_mode(requests, spec_metadata: "SpecMetadata") -> int:
 
 def _upload_host_values(dst: torch.Tensor,
                         values: np.ndarray,
-                        pack: bool = False) -> None:
-    """Copy ``values`` into the head of ``dst`` without blocking; ``pack`` lets the copy move to the open
-    step-input pack's flush (a plain copy when no pack is open)."""
+                        pack: bool = False,
+                        site: Optional[CopySite] = None) -> None:
+    """Copy ``values`` into the head of ``dst`` without blocking.
+
+    With ``site``, a model that declares a copy plan (an active copier) may merge the copy. Otherwise ``pack`` lets the
+    copy move to the open step-input pack's flush (a plain copy when no pack is open).
+    """
     src = maybe_pin_memory(torch.from_numpy(values))
-    if pack:
+    if site is not None and device_copy.current() is not None:
+        device_copy.copy(site, dst[:len(values)], src)
+    elif pack:
         step_inputs.copy_(dst[:len(values)], src)
     else:
         dst[:len(values)].copy_(src, non_blocking=True)
@@ -1213,10 +1225,14 @@ class SpecMetadata:
 
         # The forward is the first reader of these buffers.
         pack = self.pack_rng_uploads
-        _upload_host_values(self.request_seeds, request_seeds, pack)
-        _upload_host_values(self.request_offsets, request_offsets, pack)
-        _upload_host_values(self.seeds, flat_seeds, pack)
-        _upload_host_values(self.offsets, flat_offsets, pack)
+        _upload_host_values(self.request_seeds, request_seeds, pack,
+                            CopySite.SPEC_RNG_REQUEST_SEEDS)
+        _upload_host_values(self.request_offsets, request_offsets, pack,
+                            CopySite.SPEC_RNG_REQUEST_OFFSETS)
+        _upload_host_values(self.seeds, flat_seeds, pack,
+                            CopySite.SPEC_RNG_SEEDS)
+        _upload_host_values(self.offsets, flat_offsets, pack,
+                            CopySite.SPEC_RNG_OFFSETS)
 
     def prepare_rejection_sampling_buffers(self):
         """
@@ -1608,19 +1624,13 @@ class SpecMetadata:
             cached = self._sampling_scan_cache
             if cached is not None and cached[0] == scan_key:
                 (_, per_request_normalized, per_request_slot_ids,
-                 self.is_all_greedy_sample, temperature_capable,
-                 all_temperature_only) = cached
-                _set_temperature_only(self, temperature_capable,
-                                      all_temperature_only)
+                 self.is_all_greedy_sample, all_temperature_only) = cached
+                _set_temperature_only(self, all_temperature_only)
                 return per_request_normalized, per_request_slot_ids
 
         per_request_normalized: list[tuple[float, int, float, float, int]] = []
         has_non_greedy_requests = False
         all_temperature_only = True
-        # Whether every sampled row can be drawn on the sharded logits (see
-        # _temperature_only).
-        temperature_capable = True
-        temperature_graphs = self.temperature_only_graphs
         per_request_slot_ids: list[int] = []
         ragged_verify = self.is_ragged_verify
         default_generation_tokens = 1 + self.runtime_draft_len
@@ -1641,9 +1651,6 @@ class SpecMetadata:
 
             has_non_greedy_requests |= not params.is_greedy
             all_temperature_only &= params.is_greedy or params.is_shard_sampleable
-            if (temperature_graphs and not params.is_greedy
-                    and not params.is_shard_sampleable):
-                temperature_capable = False
 
             per_request_normalized.append(
                 (params.temperature, params.top_k, params.top_p, params.min_p,
@@ -1670,12 +1677,11 @@ class SpecMetadata:
         # value rather than resurrect the local value.
         if self.group_all_greedy_sample is not None:
             self.is_all_greedy_sample = self.group_all_greedy_sample
-        _set_temperature_only(self, temperature_capable, all_temperature_only)
+        _set_temperature_only(self, all_temperature_only)
         if scan_key is not None:
             self._sampling_scan_cache = (scan_key, per_request_normalized,
                                          per_request_slot_ids,
                                          self.is_all_greedy_sample,
-                                         temperature_capable,
                                          all_temperature_only)
         return per_request_normalized, per_request_slot_ids
 
@@ -2035,9 +2041,9 @@ class SpecWorkerBase(nn.Module, ABC):
     #: in only if its other uses of the logits are dtype-safe too.
     reads_lm_head_dtype_logits: bool = False
 
-    # Whether the worker's acceptance reads the target logits of a greedy
-    # batch only through ``_sample_tokens_for_batch``, so that
-    # ``target_logits`` may hand it this rank's vocab shard instead (see
+    # Whether the worker's acceptance reads the target logits of a greedy or
+    # temperature-only batch only through ``_sample_tokens_for_batch``, so
+    # that ``target_logits`` may hand it this rank's vocab shard instead (see
     # ``enable_vocab_parallel_argmax``). The tree workers (their verification
     # reads every tree node's logits) and DFlash / DSpark (their own
     # VocabParallelHead selection) leave it False.
@@ -2243,13 +2249,19 @@ class SpecWorkerBase(nn.Module, ABC):
     def enable_vocab_parallel_argmax(self, lm_head, key_exchange) -> bool:
         """Select the greedy target tokens of this worker from the vocab
         shard of ``lm_head`` (and greedy draft tokens of a vocab-sharded draft
-        head through ``key_exchange``) instead of the gathered logits.
+        head through ``key_exchange``) instead of the gathered logits. With a
+        key exchange and ``TLLM_SPEC_VOCAB_PARALLEL_TEMPERATURE=1`` (opt-in),
+        the target tokens of temperature-only batches are drawn on the shard
+        too (Gumbel-max in the exchange, see
+        :meth:`_sample_sharded_temperature`), unless the acceptance reads more
+        than the selected target tokens.
 
         Collective over the TP group: every rank calls it at construction,
         with the same arguments. ``key_exchange`` is the TP group's
-        ``ll_exchange.TPKeyExchange`` or None; the NCCL pair exchange takes
-        the rows it cannot. Returns whether the worker takes the path; it
-        does not for a worker whose acceptance reads the logits otherwise
+        ``ll_exchange.TPKeyExchange`` or None (its setup agrees on failure
+        across the group); the NCCL pair exchange takes the greedy rows it
+        cannot. Returns whether the worker takes the path; it does not for a
+        worker whose acceptance reads the logits otherwise
         (``verifies_on_target_shard``) or a head that is not vocab-sharded.
         """
         if not (self.verifies_on_target_shard
@@ -2264,13 +2276,26 @@ class SpecWorkerBase(nn.Module, ABC):
         self._target_pair_exchange = tp_pair_exchange(lm_head.mapping,
                                                       AllReduceStrategy.NCCL)
         self._vocab_parallel_argmax = True
+        if (self.key_exchange is not None
+                and vocab_parallel_temperature_enabled()
+                and self._verifies_target_by_argmax()):
+            self._samples_sharded_temperature = True
         logger.info(
             f"{type(self).__name__}: vocab-parallel greedy argmax enabled "
             f"(tp={lm_head.mapping.tp_size}, shard={lm_head.out_features}, "
             f"key exchange="
-            f"{'none' if self.key_exchange is None else self.key_exchange.transport})"
-        )
+            f"{'none' if self.key_exchange is None else self.key_exchange.transport}, "
+            f"temperature-only sampling on the shard="
+            f"{self._samples_sharded_temperature})")
         return True
+
+    @property
+    def samples_sharded_temperature(self) -> bool:
+        """Whether temperature-only batches may draw their target tokens on
+        the vocab shard, so the engine captures the temperature-only CUDA
+        graph variant (``SpecMetadata.temperature_only_graphs``). Identical
+        on every TP rank."""
+        return self._samples_sharded_temperature
 
     def _shard_selection_allowed(self, spec_metadata) -> bool:
         """Whether this batch's sampling lets the target tokens come from the

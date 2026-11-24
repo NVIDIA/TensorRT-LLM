@@ -19,10 +19,11 @@ from tensorrt_llm._torch.attention.backends import (FlashInferAttention,
                                                     FlashInferAttentionMetadata)
 from tensorrt_llm._torch.attention.backends import \
     flashinfer as flashinfer_backend
+from tensorrt_llm._torch.attention.backends import triton_prefill
 from tensorrt_llm._torch.attention.backends.flashinfer import (
     FlashInferWrappers, PlanParams)
-from tensorrt_llm._torch.attention.backends.interface import \
-    PredefinedAttentionMask
+from tensorrt_llm._torch.attention.backends.interface import (
+    CustomAttentionMask, PredefinedAttentionMask)
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
     KVCacheManagerV2
@@ -33,6 +34,18 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
+
+
+@pytest.mark.cpu_only
+def test_flashinfer_rejects_swa_scratch_before_buffer_allocation() -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager.enable_swa_scratch_reuse = True
+    metadata = object.__new__(FlashInferAttentionMetadata)
+    metadata.kv_cache_manager = manager
+    with pytest.raises(
+            ValueError,
+            match="FlashInfer attention does not support SWA scratch reuse"):
+        metadata.__post_init__()
 
 
 class TestingFlashInferAttentionMetadata(FlashInferAttentionMetadata):
@@ -1156,6 +1169,167 @@ class TestFlashInferAttention(unittest.TestCase):
                         result_2[context_sequence_lengths[0]:, :],
                         result_3[context_sequence_lengths[1]:, :],
                     )))
+
+            # Reuse the final context+generation batch to exercise variable
+            # prefill bounds without losing the sliding window on decode.
+            if scenario.full_page_table:
+                for layer in layers:
+                    self.assertFalse(
+                        layer.supports_variable_window(attn_metadata))
+                return
+            window = 8
+            length = context_sequence_lengths[1]
+            prefix = past_seen_tokens[1]
+            positions = torch.arange(prefix,
+                                     prefix + length,
+                                     device=device,
+                                     dtype=torch.int32)
+            starts = (positions - window + 1).clamp_min(0)
+            nhd_metadata = TestingFlashInferAttentionMetadata(
+                seq_lens=attn_metadata.seq_lens,
+                num_contexts=1,
+                kv_cache_params=attn_metadata.kv_cache_params,
+                max_num_requests=2,
+                max_num_tokens=8192,
+                kv_cache_manager=kv_cache_manager,
+                request_ids=[1, 3],
+                kv_layout="NHD")
+            nhd_metadata.prepare()
+            for attn_layer_idx, flashinfer_attn in enumerate(layers):
+                context_qs, context_ks, context_vs = contexts_per_layer[
+                    attn_layer_idx]
+                gen_qs, gen_ks, gen_vs = gens_per_layer[attn_layer_idx]
+                q = torch.cat((context_qs[1], gen_qs[1]))
+                k = torch.cat((context_ks[1], gen_ks[1]))
+                v = torch.cat((context_vs[1], gen_vs[1]))
+                reference = flashinfer_attn.forward(
+                    q, k, v, attn_metadata, attention_window_size=window)
+                self.assertTrue(
+                    flashinfer_attn.supports_variable_window(attn_metadata))
+                with mock.patch.object(
+                        triton_prefill,
+                        "triton_prefill_with_custom_mask",
+                        wraps=triton_prefill.triton_prefill_with_custom_mask
+                ) as compact:
+                    actual = flashinfer_attn.forward(
+                        q,
+                        k,
+                        v,
+                        attn_metadata,
+                        attention_window_size=window,
+                        variable_window_token_starts=starts,
+                        variable_window_token_ends=positions)
+                compact.assert_called_once()
+                self.assertIs(
+                    compact.call_args.kwargs["variable_window_token_starts"],
+                    starts)
+                self.assertIs(
+                    compact.call_args.kwargs["variable_window_token_ends"],
+                    positions)
+                with mock.patch.object(flashinfer_attn, "has_fp8_kv_cache",
+                                       True), self.assertRaisesRegex(
+                                           ValueError, "without FP8 KV"):
+                    flashinfer_attn.forward(
+                        q,
+                        k,
+                        v,
+                        attn_metadata,
+                        variable_window_token_starts=starts,
+                        variable_window_token_ends=positions)
+                torch.testing.assert_close(actual[:length],
+                                           reference[:length],
+                                           atol=1e-2,
+                                           rtol=1e-2)
+                torch.testing.assert_close(actual[length:], reference[length:])
+
+                # Dense custom-mask fallback must preserve decode's sliding window too.
+                kv_positions = torch.arange(prefix + length, device=device)
+                dense_mask = ((kv_positions[None, :] >= starts[:, None])
+                              & (kv_positions[None, :] <= positions[:, None]))
+                dense_mask_flat = dense_mask.flatten().contiguous()
+                with mock.patch.object(
+                        flashinfer_attn, "flashinfer_backend",
+                        "trtllm-gen"), mock.patch.object(
+                            triton_prefill,
+                            "triton_prefill_with_custom_mask",
+                            wraps=triton_prefill.triton_prefill_with_custom_mask
+                        ) as prefill:
+                    dense_actual = flashinfer_attn.forward(
+                        q,
+                        k,
+                        v,
+                        attn_metadata,
+                        attention_window_size=window,
+                        attention_mask=CustomAttentionMask.CUSTOM,
+                        attention_mask_data=dense_mask_flat)
+                prefill.assert_called_once()
+                self.assertIs(prefill.call_args.kwargs["custom_mask"],
+                              dense_mask_flat)
+                self.assertEqual(prefill.call_args.kwargs["max_len_extend"],
+                                 length)
+                torch.testing.assert_close(dense_actual[:length],
+                                           reference[:length],
+                                           atol=1e-2,
+                                           rtol=1e-2)
+                torch.testing.assert_close(dense_actual[length:],
+                                           reference[length:],
+                                           atol=1e-2,
+                                           rtol=1e-2)
+
+                # The same cached-prefix mixed batch must work in NHD as well.
+                nhd_reference = flashinfer_attn.forward(
+                    q, k, v, nhd_metadata, attention_window_size=window)
+                nhd_actual = flashinfer_attn.forward(
+                    q,
+                    k,
+                    v,
+                    nhd_metadata,
+                    attention_window_size=window,
+                    variable_window_token_starts=starts,
+                    variable_window_token_ends=positions)
+                torch.testing.assert_close(nhd_actual[:length],
+                                           nhd_reference[:length],
+                                           atol=1e-2,
+                                           rtol=1e-2)
+                torch.testing.assert_close(nhd_actual[length:],
+                                           nhd_reference[length:])
+
+                # Reuse the backend instance to exercise its request-time probe.
+                for owner, attribute, value in (
+                    (flashinfer_attn, "flashinfer_backend", "trtllm-gen"),
+                    (flashinfer_attn, "is_mla_enable", True),
+                    (attn_metadata, "kv_cache_manager", None),
+                ):
+                    with mock.patch.object(owner, attribute, value):
+                        self.assertFalse(
+                            flashinfer_attn.supports_variable_window(
+                                attn_metadata))
+                with mock.patch.object(type(attn_metadata),
+                                       "num_contexts",
+                                       new_callable=mock.PropertyMock,
+                                       return_value=0):
+                    self.assertFalse(
+                        flashinfer_attn.supports_variable_window(attn_metadata))
+                self.assertFalse(
+                    flashinfer_attn.supports_variable_window(SimpleNamespace()))
+                for geometry in (dict(head_dim=8), dict(num_kv_heads=0),
+                                 dict(num_heads=0),
+                                 dict(num_heads=3, num_kv_heads=2)):
+                    with mock.patch.multiple(flashinfer_attn, **geometry):
+                        self.assertFalse(
+                            flashinfer_attn.supports_variable_window(
+                                attn_metadata))
+                quant_config = flashinfer_attn.quant_config
+                try:
+                    for config, expected in ((None, True), (QuantConfig(
+                            kv_cache_quant_algo=QuantAlgo.FP8), False), (None,
+                                                                         True)):
+                        flashinfer_attn.update_quant_config(config)
+                        self.assertEqual(
+                            flashinfer_attn.supports_variable_window(
+                                attn_metadata), expected)
+                finally:
+                    flashinfer_attn.update_quant_config(quant_config)
 
         finally:
             kv_cache_manager.shutdown()

@@ -9,7 +9,8 @@ import torch
 # Tier-2 sourcing: a vendored Triton callable reached as ordinary Python. QSA's
 # kernel plane has no torch.ops surface.
 from tensorrt_llm._torch.attention.backends.sparse.qsa import kernels as _qsa_kernels
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 #: This checkpoint's selection width: `indexer_budget` 2048 tokens over
 #: `indexer_compress_ratio` 4.
@@ -110,7 +111,7 @@ class QsaMtpReuseTopk(OpWrapper):
     Called by the qwen4_exp target at every layout.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     CELLS: tuple[Cell, ...] = (
         # ---- decode batch: one row per request; the first 16 requests sit at the
@@ -197,7 +198,7 @@ class QsaMtpReuseTopk(OpWrapper):
 
     Source: tier 2, an in-tree Triton kernel in the QSA attention backend,
     JIT-compiled on first call for the device it runs on; the cells were driven
-    through that JIT path on sm_103 (GB300). One program per output row, no
+    through that JIT path on sm_103 and sm_107. One program per output row, no
     autotune, no PDL.
 
     The default target (tp4 / tep4 / dep4) calls it with the same geometry on every

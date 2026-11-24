@@ -15404,7 +15404,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
   - `Homepage`: https://github.com/lark-parser/lark
 
 
-## llguidance (0.7.29)
+## llguidance (1.7.6)
 
 ### Licenses
 License: `MIT`

@@ -14,7 +14,8 @@ import triton
 # `import tensorrt_llm._torch.custom_ops` alone does not make
 # torch.ops.trtllm.rms_norm_gated_token_major resolve.
 import tensorrt_llm._torch.modules.mamba.layernorm_gated as _layernorm_gated
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 #: The checkpoint's GDN epilogue: 48 value heads of 128, `output_gate_type: sigmoid`.
 _CKPT = dict(heads=48, width=128, dtype=torch.bfloat16, eps=1e-6, gate_activation="sigmoid")
@@ -50,30 +51,14 @@ def _prefill_multirow(x: torch.Tensor, z: torch.Tensor, gate_activation: str) ->
 
 
 def _direct_launch(x, z, weight, eps, gate_activation):
-    """The registered op's own multi-row launch (same kernel, 4 rows a tile, its tiles per
-    program and fast-path hints, PDL by the op's policy), skipping only the custom-op dispatch."""
-    rows, n = x.shape
+    """The registered op's own multi-row launch (`_launch_multirow_kernel`: same kernel, 4 rows
+    a tile, its tiles per program, fast-path hints and PDL policy), skipping only the custom-op
+    dispatch."""
     out = torch.empty_like(x)
-    rows_per_tile = _layernorm_gated._MULTIROW_ROWS
-    groups = (
-        _layernorm_gated._MULTIROW_GROUPS
-        if rows >= _layernorm_gated._MULTIROW_GROUPS_MIN_ROWS
-        else 1
-    )
-    grid = triton.cdiv(rows, rows_per_tile * groups)
-    device = x.device.index
-    pdl = _layernorm_gated._multirow_pdl(grid, device)
-    with torch.cuda.device(device):
-        _layernorm_gated._rms_norm_gated_fwd_multirow_kernel[(grid,)](
-            x, out, weight, z, None, None, x.stride(0), out.stride(0), z.stride(0), rows, eps,
-            N=n, ROWS=rows_per_tile, HEADS_PER_TOK=z.shape[1],
-            GATE_SIGMOID=gate_activation == "sigmoid", WEIGHT_IS_DELTA=False,
-            LAUNCH_WITH_PDL=pdl, CONTIG=(x.stride(0) == n and out.stride(0) == n),
-            EVEN=(rows % (rows_per_tile * groups) == 0),
-            num_warps=_layernorm_gated._MULTIROW_NUM_WARPS,
-            EARLY_TRIGGER=_layernorm_gated._pdl_device_policy(device)[0], GROUPS=groups,
-            launch_pdl=pdl,
-        )  # fmt: skip
+    _layernorm_gated._launch_multirow_kernel(
+        x, out, weight, z, None, None, eps, grouped=True, early_trigger=True,
+        HEADS_PER_TOK=z.shape[1], GATE_SIGMOID=gate_activation == "sigmoid", WEIGHT_IS_DELTA=False,
+    )  # fmt: skip
     return out
 
 
@@ -113,7 +98,7 @@ class RmsNormGatedTokenMajor(OpWrapper):
     owns both projections producing `x` and `z`, and every reshape.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     CELLS: tuple[Cell, ...] = (
         Cell(
@@ -164,11 +149,10 @@ class RmsNormGatedTokenMajor(OpWrapper):
     it off. The 8-row programs reduce a row's mean square in another order
     than the 4-row ones (one-ulp differences on some outputs). With
     `direct_launch=True` (the FP8 target) below the 8-row threshold, the 4-row
-    launch is made here (`_direct_launch`, a copy of the registered op's own),
-    skipping only the custom-op dispatch: 24 instead of 39 us of host time a
-    call on GB300. The test holds it bitwise equal to the op at the
-    direct-launch cells and more shapes, so a change to the op's launch fails
-    there.
+    launch is made here (`_direct_launch`, through the registered op's own
+    launch helper), skipping only the custom-op dispatch: 24 instead of 39 us of
+    host time a call on GB300. The test holds it bitwise equal to the op at the
+    direct-launch cells and more shapes.
 
     Loud (measured), so not guarded: 3-D `x` (ValueError), a `z` not covering `x`
     (AssertionError "does not match x shape"; 2-D `z` ValueError), an unknown
@@ -182,7 +166,7 @@ class RmsNormGatedTokenMajor(OpWrapper):
     output is freshly allocated and contiguous; no input is mutated.
 
     Both kernels are Triton, JIT-compiled at first call for the running GPU;
-    the cells ran that JIT path on sm_103 (GB300, 152 SMs).
+    the cells ran that JIT path on sm_103 and sm_107.
 
     Certified: bf16 `x` with the sigmoid gate over the in_proj column view of
     `z`, N = 128.
