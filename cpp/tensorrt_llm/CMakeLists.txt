@@ -321,6 +321,7 @@ set(TLLM_FACADE_COMPONENT_TARGETS
     tllm_batch_request_info
     tllm_batch_rnn_cache_routing
     tllm_batch_scheduler
+    tllm_common_attention_workspace
     tllm_common_cublas
     tllm_common_cuda
     tllm_common_cuda_architectures

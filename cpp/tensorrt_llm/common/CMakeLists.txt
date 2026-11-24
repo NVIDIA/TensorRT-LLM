@@ -212,6 +212,17 @@ target_compile_definitions(
     TRTLLM_BUILT_CUDA_ARCHITECTURES=${TRTLLM_BUILT_CUDA_ARCHITECTURES}
     TRTLLM_SUPPORTED_CUDA_ARCHITECTURES=${TRTLLM_SUPPORTED_CUDA_ARCHITECTURES})
 
+add_library(tllm_common_attention_workspace STATIC attentionWorkspace.cpp)
+add_library(tllm::common_attention_workspace ALIAS
+            tllm_common_attention_workspace)
+target_link_libraries(tllm_common_attention_workspace
+                      PUBLIC tllm::common_headers)
+target_include_directories(tllm_common_attention_workspace SYSTEM
+                           PUBLIC ${CUDAToolkit_INCLUDE_DIRS})
+target_compile_features(tllm_common_attention_workspace PUBLIC cxx_std_20)
+set_target_properties(tllm_common_attention_workspace
+                      PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 add_library(common_src OBJECT sageQuant.cu)
 add_cuda_architectures(common_src 89)
 set_property(TARGET common_src PROPERTY POSITION_INDEPENDENT_CODE ON)

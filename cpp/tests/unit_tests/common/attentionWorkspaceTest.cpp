@@ -58,6 +58,92 @@ void expectNextSlice(char const* name, Slice const& slice, size_t size, size_t& 
 
 } // namespace
 
+TEST(AttentionWorkspaceManagerTest, RaggedUnfusedSelfAttentionUsesPaddedTokenCounts)
+{
+    auto const sizes = tcop::AttentionWorkspaceManager::buildUnfusedContextSizes({.elementSize = sizeof(half),
+        .batchSize = 4,
+        .querySequenceLength = 64,
+        .kvSequenceLength = 64,
+        .crossKvLength = 0,
+        .packedTokenCount = 100,
+        .numQueryHeads = 8,
+        .numAttnKvHeads = 2,
+        .headSize = 64});
+
+    EXPECT_EQ(sizes.attentionMask, 32768);
+    EXPECT_EQ(sizes.cuQSeqlens, 20);
+    EXPECT_EQ(sizes.cuKvSeqlens, 20);
+    EXPECT_EQ(sizes.cuMaskRows, 20);
+    EXPECT_EQ(sizes.qBuf, 262144);
+    EXPECT_EQ(sizes.kBuf, 65536);
+    EXPECT_EQ(sizes.vBuf, 65536);
+    EXPECT_EQ(sizes.qkBuf, 262144);
+    EXPECT_EQ(sizes.qkvBuf, 262144);
+    EXPECT_EQ(sizes.qkFloatBuf, 524288);
+    EXPECT_EQ(sizes.paddingOffset, 1024);
+    EXPECT_EQ(sizes.encoderPaddingOffset, 0);
+    EXPECT_EQ(sizes.tokensInfo, 800);
+}
+
+TEST(AttentionWorkspaceManagerTest, RaggedUnfusedCrossAttentionUsesPaddedTokenCounts)
+{
+    auto const sizes = tcop::AttentionWorkspaceManager::buildUnfusedContextSizes({.elementSize = sizeof(half),
+        .batchSize = 4,
+        .querySequenceLength = 64,
+        .kvSequenceLength = 32,
+        .crossKvLength = 32,
+        .packedTokenCount = 100,
+        .numQueryHeads = 8,
+        .numAttnKvHeads = 2,
+        .headSize = 64});
+
+    EXPECT_EQ(sizes.attentionMask, 16384);
+    EXPECT_EQ(sizes.cuQSeqlens, 20);
+    EXPECT_EQ(sizes.cuKvSeqlens, 20);
+    EXPECT_EQ(sizes.cuMaskRows, 20);
+    EXPECT_EQ(sizes.qBuf, 262144);
+    EXPECT_EQ(sizes.kBuf, 32768);
+    EXPECT_EQ(sizes.vBuf, 32768);
+    EXPECT_EQ(sizes.qkBuf, 131072);
+    EXPECT_EQ(sizes.qkvBuf, 262144);
+    EXPECT_EQ(sizes.qkFloatBuf, 262144);
+    EXPECT_EQ(sizes.paddingOffset, 1024);
+    EXPECT_EQ(sizes.encoderPaddingOffset, 512);
+    EXPECT_EQ(sizes.tokensInfo, 800);
+}
+
+TEST(AttentionWorkspaceManagerTest, UnfusedGroupedQuerySizesDistinguishQueryAndKvHeads)
+{
+    tcop::AttentionUnfusedContextWorkspaceParams params{.elementSize = sizeof(half),
+        .batchSize = 3,
+        .querySequenceLength = 5,
+        .kvSequenceLength = 2,
+        .crossKvLength = 2,
+        .packedTokenCount = 7,
+        .numQueryHeads = 4,
+        .numAttnKvHeads = 1,
+        .headSize = 8};
+    auto const sizes = tcop::AttentionWorkspaceManager::buildUnfusedContextSizes(params);
+    EXPECT_EQ(sizes.attentionMask, 60);
+    EXPECT_EQ(sizes.qBuf, 960);
+    EXPECT_EQ(sizes.qkvBuf, 960);
+    EXPECT_EQ(sizes.kBuf, 96);
+    EXPECT_EQ(sizes.vBuf, 96);
+    EXPECT_EQ(sizes.qkBuf, 240);
+    EXPECT_EQ(sizes.qkFloatBuf, 480);
+    EXPECT_EQ(sizes.paddingOffset, 60);
+    EXPECT_EQ(sizes.encoderPaddingOffset, 24);
+    EXPECT_EQ(sizes.tokensInfo, sizeof(int2) * 7);
+
+    params.packedTokenCount = 15;
+    auto const denseSizes = tcop::AttentionWorkspaceManager::buildUnfusedContextSizes(params);
+    EXPECT_EQ(denseSizes.qBuf, sizes.qBuf);
+    EXPECT_EQ(denseSizes.kBuf, sizes.kBuf);
+    EXPECT_EQ(denseSizes.qkBuf, sizes.qkBuf);
+    EXPECT_EQ(denseSizes.paddingOffset, sizes.paddingOffset);
+    EXPECT_EQ(denseSizes.tokensInfo, sizeof(int2) * 15);
+}
+
 TEST(AttentionWorkspaceManagerTest, ContextLayoutMatchesAttentionOpOrdering)
 {
     tcop::AttentionContextWorkspaceSizes sizes{};
