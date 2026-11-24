@@ -158,6 +158,7 @@ class TmemOResource(MlaResource):
             cta_idx_q,
             self.cu_seqlens_q,
             batch_idx,
+            cp_rank=self.cp_rank,
         )
         return runtime_local_kv_tiles(
             self.cfg, seq_len_kv, requested_splits=self.runtime_split_kv

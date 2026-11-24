@@ -127,7 +127,7 @@ def test_midchunk_fetch():
 
 @pytest.mark.cpu_only
 def test_inforward_split():
-    from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import InforwardSnapshotEntry
+    from tensorrt_llm._torch.modules.fla.inforward_snapshot import InforwardSnapshotEntry
 
     fam = _fam()
     manager = SimpleNamespace(conv_state_shape=(12, 3), state_index={11: 7, 13: 2}.__getitem__)

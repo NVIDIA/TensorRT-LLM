@@ -38,6 +38,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 def _make_stub_executor(rank=0, queued_items=None):
     queued_items = queued_items if queued_items is not None else []
     stub = SimpleNamespace()
+    stub._benchmark_sweep = False
     stub.control_requests = []
     stub.request_accumulated = []
     stub.active_requests = []

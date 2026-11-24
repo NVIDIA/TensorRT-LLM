@@ -344,6 +344,53 @@ def test_engine_captures_encoder_graphs_with_original_token_budget(
     model.encoder._blocks_graph_runner.capture_all.assert_called_once_with(torch.device("cpu"))
 
 
+@pytest.mark.parametrize(
+    ("encoder_max_num_tokens", "max_num_tokens", "tower_budget"),
+    [(None, 4096, 4096), (1024, 4096, 1024), (None, None, 128)],
+    ids=["configured", "encoder_budget", "resolved"],
+)
+def test_mm_encoder_builder_sizes_the_towers_with_the_configured_token_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    encoder_max_num_tokens: int | None,
+    max_num_tokens: int | None,
+    tower_budget: int,
+) -> None:
+    """A merged item fits a prompt shorter than its patches, so the clamped budget is too small."""
+    from tensorrt_llm._torch.pyexecutor.engine import model_setup
+
+    model = SimpleNamespace(model_config=SimpleNamespace())
+    loader = Mock()
+    loader.load.return_value = (model, None)
+    for name in ("init_process_setup", "configure_autotuner_nvmmh", "prepare_loaded_model"):
+        monkeypatch.setattr(model_setup, name, Mock())
+    monkeypatch.setattr(model_setup, "create_model_loader", Mock(return_value=loader))
+    monkeypatch.setattr(model_setup, "resolve_max_seq_len", lambda model, max_seq_len: max_seq_len)
+    monkeypatch.setattr(model_setup, "create_engine_input_processor", Mock())
+    monkeypatch.setattr(
+        model_setup, "compile_model", Mock(return_value=SimpleNamespace(model=model))
+    )
+    monkeypatch.setattr(model_setup.MultimodalEncoderRunner, "create", Mock())
+    setup_metadata, setup_graphs = Mock(), Mock()
+    monkeypatch.setattr(model_setup, "setup_mm_encoder_attn_metadata", setup_metadata)
+    monkeypatch.setattr(model_setup, "setup_mm_encoder_cuda_graphs", setup_graphs)
+    llm_args = SimpleNamespace(
+        max_num_tokens=max_num_tokens,
+        encoder_max_num_tokens=encoder_max_num_tokens,
+        get_runtime_sizes=lambda: (1, max_num_tokens, 128, 1),
+        multimodal_config=None,
+        cuda_graph_config=None,
+        prefill_capture_num_tokens=None,
+    )
+
+    with model_setup.build_mm_encoder_runner(
+        llm_args, model_path="", checkpoint_loader=Mock(), mapping=Mapping(), dist=None
+    ) as built:
+        assert built.max_num_tokens == 128
+
+    assert setup_metadata.call_args.args[2] == tower_budget
+    assert setup_graphs.call_args.kwargs["max_num_tokens"] == tower_budget
+
+
 @pytest.mark.parametrize("enable_padding", [False, True])
 @pytest.mark.parametrize("automatic", [False, True], ids=["explicit", "automatic"])
 def test_encoder_graphs_preserve_eager_metadata_capacity(

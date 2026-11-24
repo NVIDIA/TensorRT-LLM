@@ -103,6 +103,18 @@ bool find_special_algo(cublasLtMatmulAlgo_t& algo, std::shared_ptr<CublasMMWrapp
     if ((aType == CUDA_R_16BF || aType == CUDA_R_16F) && (outType == aType || outType == CUDA_R_32F)
         && compType == CUBLAS_COMPUTE_32F)
     {
+        if (tensorrt_llm::common::getSMVersion() == 120)
+        {
+            if (auto iter = cublas_lut::sm120_bf16_algo_list.find({mp2, k, n});
+                iter != cublas_lut::sm120_bf16_algo_list.end())
+            {
+                check_cuda_error(cublasLtMatmulAlgoInit(cublasWrapper->getCublasLtHandle(), compType, scaleType, aType,
+                    bType, outType, outType, iter->second[0], &algo));
+                set_algo_attr(algo, iter->second);
+                TLLM_LOG_DEBUG("Found SM120 cublasLt algo for m=%d, k=%d, n=%d\n", m, k, n);
+                return true;
+            }
+        }
         // TODO: remove this after cublas fix the heuristic for Spark
         algo_list = tensorrt_llm::common::getSMVersion() == 121 ? &cublas_lut::spark_bf16_algo_list
                                                                 : &cublas_lut::bf16_algo_list;

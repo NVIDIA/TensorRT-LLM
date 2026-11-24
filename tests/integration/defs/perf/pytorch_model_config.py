@@ -231,6 +231,41 @@ def get_model_yaml_config(model_label: str,
                 },
             }
         },
+        # Spark Flash-Next bench: no TRTLLM-Gen MoE, and MTP does not run on these backends.
+        {
+            'patterns': [
+                'qwen3.8_flash_next_fp4-bench-pytorch-streaming-',
+                'qwen3.8_flash_next_fp8-bench-pytorch-streaming-',
+            ],
+            'config': {
+                'speculative_config': None,
+            }
+        },
+        {
+            'patterns': ['qwen3.8_flash_next_fp4-bench-pytorch-streaming-'],
+            'config': {
+                'moe_config': {
+                    'backend': 'CUTEDSL',
+                },
+            }
+        },
+        {
+            'patterns': ['qwen3.8_flash_next_fp8-bench-pytorch-streaming-'],
+            'config': {
+                'moe_config': {
+                    'backend': 'CUTLASS',
+                },
+            }
+        },
+        {
+            'patterns': ['qwen3.8_27b'],
+            'config': {
+                'trust_remote_code': True,
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                },
+            }
+        },
         # Deepseek default cases
         {
             'patterns': ['deepseek_r1'],
@@ -915,6 +950,23 @@ def get_model_yaml_config(model_label: str,
                 'attn_backend': 'FLASHINFER',
             }
         },
+        {
+            'patterns': ['nemotron_3_nano_30b', 'nemotron_3_nano_4b'],
+            'config': {
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                    'mamba_ssm_cache_dtype': 'float32',
+                },
+            }
+        },
+        {
+            'patterns': ['nemotron_3_nano_30b'],
+            'config': {
+                'moe_config': {
+                    'backend': 'CUTLASS',
+                },
+            }
+        },
         # Nemotron-3-Nano-Omni-30B-NVFP4 (text + image multimodal)
         {
             'patterns': ['nemotron_3_nano_omni_nvfp4'],
@@ -1007,6 +1059,25 @@ def get_model_yaml_config(model_label: str,
                 },
             }
         },
+        {
+            'patterns': [
+                'nemotron_3_super_120b_fp8-bench-pytorch-streaming-',
+            ],
+            'config': {
+                # CUDA graphs with the overlap scheduler hang across two DGX Spark nodes.
+                'disable_overlap_scheduler': True,
+                'enable_chunked_prefill': True,
+                'moe_config': {
+                    'backend': 'CUTLASS',
+                },
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                    'mamba_ssm_cache_dtype': 'float16',
+                    'mamba_ssm_stochastic_rounding': True,
+                    'mamba_ssm_philox_rounds': 5,
+                },
+            }
+        },
         # Nemotron-3-Super-120B-NVFP4_MTP (streaming/low-latency variant for spark perf)
         {
             'patterns': [
@@ -1062,7 +1133,7 @@ def get_model_yaml_config(model_label: str,
                 },
             }
         },
-        # Nemotron-3-Ultra-550B-NVFP4 throughput variant, aligned with curated yaml (served from HF).
+        # Nemotron-3-Ultra-550B-NVFP4 throughput variant, aligned with curated yaml (synced HF submodule).
         {
             'patterns': ['nemotron_3_ultra_550b_nvfp4-serve-pytorch-'],
             'config': {

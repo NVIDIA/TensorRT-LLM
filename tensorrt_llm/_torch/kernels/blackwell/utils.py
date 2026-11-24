@@ -57,6 +57,8 @@ from cutlass.cute.typing import AddressSpace, Numeric, Pointer, Type
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 TRTLLM_ENABLE_PDL = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+# A memory clobber, as in CUTLASS C++: no memory access moves across the asm.
+_PDL_ASM_CONSTRAINTS = "~{memory}"
 
 
 # WAR for CuTeDSL make_ptr implementation
@@ -471,7 +473,7 @@ def griddepcontrol_wait(*, loc=None, ip=None) -> None:
         res=None,
         operands_=[],
         asm_string="griddepcontrol.wait;",
-        constraints="",
+        constraints=_PDL_ASM_CONSTRAINTS,
         has_side_effects=True,
         asm_dialect=llvm.AsmDialect.AD_ATT,
         loc=loc,
@@ -491,7 +493,7 @@ def griddepcontrol_launch_dependents(*, loc=None, ip=None) -> None:
         res=None,
         operands_=[],
         asm_string="griddepcontrol.launch_dependents;",
-        constraints="",
+        constraints=_PDL_ASM_CONSTRAINTS,
         has_side_effects=True,
         asm_dialect=llvm.AsmDialect.AD_ATT,
         loc=loc,

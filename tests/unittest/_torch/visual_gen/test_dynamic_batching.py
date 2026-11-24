@@ -344,6 +344,7 @@ def test_executor_routes_each_success_or_failure_and_continues(failure):
     executor.rank = 0
     executor.device_id = 0
     executor.in_client_process = True
+    executor.memory_monitor = Mock()
     executor.response_queue = queue.Queue()
     executor.pipeline = SimpleNamespace(
         default_generation_params={},
