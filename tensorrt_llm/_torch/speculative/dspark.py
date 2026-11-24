@@ -120,6 +120,12 @@ class DSparkSpecMetadata(SpecMetadata):
     captured_hidden_states: Optional[torch.Tensor] = None
 
     def __post_init__(self):
+        # Keep the full slot capacity across CUDA graph copies, whose
+        # max_num_requests is narrowed to the captured graph bucket.
+        self.num_seq_slots = self.num_seq_slots or self.max_num_requests
+        # Same for the engine batch, which sizes the worker's progress slots.
+        self.max_generation_batch = self.max_generation_batch or self.max_num_requests
+
         self.batch_indices_cuda = torch.empty(
             [self.max_num_requests],
             dtype=torch.int,
@@ -332,7 +338,10 @@ class DSv4DSparkWorker(SpecWorkerBase):
         self._publish_position_ceiling(draft_model, attn_metadata, block_size)
 
         if self._ctx_len is None:
-            max_batch = spec_metadata.max_num_requests
+            # Allocated once, so span the engine batch rather than
+            # max_num_requests, which create_cuda_graph_metadata narrows to the
+            # captured graph bucket (see the DFlash counterpart).
+            max_batch = spec_metadata.max_generation_batch
             draft_model.configure_generation_autotuner(max_batch)
             self._num_stages = draft_model.num_stages
             self._win = int(draft_model._attn_params["window_size"])
@@ -367,7 +376,8 @@ class DSv4DSparkWorker(SpecWorkerBase):
             if not self._free_slots:
                 raise RuntimeError(
                     "DSpark has no free progress slots for request "
-                    f"{req_id}; increase max_num_requests"
+                    f"{req_id}: all {len(self._req_to_slot)} worker progress slots "
+                    "are in use; increase max_batch_size"
                 )
             slot = self._free_slots.popleft()
             self._req_to_slot[req_id] = slot
