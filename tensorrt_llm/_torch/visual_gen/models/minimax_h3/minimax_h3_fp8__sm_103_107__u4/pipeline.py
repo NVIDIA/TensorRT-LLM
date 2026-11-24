@@ -5,15 +5,15 @@
 import torch
 
 from tensorrt_llm._torch.visual_gen.attention.attention import AttentionTensorLayout
-from tensorrt_llm._torch.visual_gen.attention.backends.cudnn import _a3_fmha_dense_fp8, CuDNNAttention
+from tensorrt_llm._torch.visual_gen.attention.backends.cudnn import (
+    CuDNNAttention,
+    _a3_fmha_dense_fp8,
+)
 from tensorrt_llm._torch.visual_gen.attention.backends.parallel import UlyssesAttention
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent
 
 from ..pipeline_minimax_h3 import MiniMaxH3Pipeline
-from ..transformer_minimax_h3 import (
-    MiniMaxH3Attention,
-    MiniMaxH3Transformer3DModel,
-)
+from ..transformer_minimax_h3 import MiniMaxH3Attention, MiniMaxH3Transformer3DModel
 from .block_ops import Fp8UlyssesMlpMixin, initialize_block_ops
 from .output_exchange import (
     exchange_bf16_output,
@@ -66,9 +66,7 @@ class Fp8UlyssesAttention(MiniMaxH3Attention):
             scale_version = None
         key = (id(out_linear), scale.data_ptr(), scale_version)
         if key != self._fp8_out_scale_cache_key:
-            self._fp8_out_scale_valid = bool(
-                torch.isfinite(scale).all() and (scale > 0).all()
-            )
+            self._fp8_out_scale_valid = bool(torch.isfinite(scale).all() and (scale > 0).all())
             self._fp8_out_scale_cache_key = key
         return scale if self._fp8_out_scale_valid else None
 
@@ -151,7 +149,9 @@ class Fp8UlyssesAttention(MiniMaxH3Attention):
             valid_seq_len=valid_seq_len,
         )
 
-    def _direct_fp8_packed_exchange(self, send, descales, out_scale, rows, backend, skip_t: float, **kwargs):
+    def _direct_fp8_packed_exchange(
+        self, send, descales, out_scale, rows, backend, skip_t: float, **kwargs
+    ):
         group = backend.process_group
         recv = torch.empty_like(send)
         torch.distributed.all_to_all_single(
@@ -165,7 +165,9 @@ class Fp8UlyssesAttention(MiniMaxH3Attention):
         mask = kwargs.get("key_padding_mask")
         if mask is not None:
             valid_len = backend.inner_backend._padding_prefix_lengths(mask)[0]
-            raw_fp8 = torch.zeros((1, 4 * rows, 14, 128), dtype=torch.float8_e4m3fn, device=send.device)
+            raw_fp8 = torch.zeros(
+                (1, 4 * rows, 14, 128), dtype=torch.float8_e4m3fn, device=send.device
+            )
             if valid_len > 0:
                 _a3_fmha_dense_fp8(
                     q[:, :valid_len],

@@ -205,7 +205,9 @@ def _stream_key(device: torch.device) -> tuple[torch.device, int]:
     return (device, int(stream_id))
 
 
-def _get_u4_scratch(rows: int, tokens_per_program: int, device: torch.device) -> dict[str, torch.Tensor]:
+def _get_u4_scratch(
+    rows: int, tokens_per_program: int, device: torch.device
+) -> dict[str, torch.Tensor]:
     skey = _stream_key(device)
     shape_key = (rows, tokens_per_program)
     cached = _U4_SCRATCH.get(skey)
@@ -282,10 +284,16 @@ def qk_norm_rope_pack_qkv(
         HEADS_PER_PROGRAM=8,
         num_warps=num_warps,
     )
-    _v_partial_maxima[(v_tiles,)](v_view, partials_v, valid_rows, v_view.stride()[1:3], 8192, num_warps=8)
+    _v_partial_maxima[(v_tiles,)](
+        v_view, partials_v, valid_rows, v_view.stride()[1:3], 8192, num_warps=8
+    )
     maxima = sc["maxima"]
-    _final_maxima[(2,)](partials_qk, maxima, qk_tiles, triton.next_power_of_2(qk_tiles), num_warps=8)
-    _final_maxima[(1,)](partials_v, maxima[2:3], v_tiles, triton.next_power_of_2(v_tiles), num_warps=8)
+    _final_maxima[(2,)](
+        partials_qk, maxima, qk_tiles, triton.next_power_of_2(qk_tiles), num_warps=8
+    )
+    _final_maxima[(1,)](
+        partials_v, maxima[2:3], v_tiles, triton.next_power_of_2(v_tiles), num_warps=8
+    )
     torch.distributed.all_reduce(maxima, op=torch.distributed.ReduceOp.MAX, group=group)
     dyn = (maxima.float() / 448.0).clamp_min(1.0 / (448.0 * 512.0))
     descales = dyn.bfloat16().float()
@@ -343,16 +351,22 @@ def pack_qkstatic_u4(
     v_view = qkv[:, :, 2 * hd :].view(1, rows, 56, 128)
     v_tiles = max(1, triton.cdiv(valid_rows * 56 * 128, 8192))
     partials_v = sc["partials_v"][:v_tiles]
-    _v_partial_maxima[(v_tiles,)](v_view, partials_v, valid_rows, v_view.stride()[1:3], 8192, num_warps=8)
+    _v_partial_maxima[(v_tiles,)](
+        v_view, partials_v, valid_rows, v_view.stride()[1:3], 8192, num_warps=8
+    )
     if symm_amax is not None:
         symmetric, local = symm_amax.begin()
-        _final_maxima[(1,)](partials_v, local[2:3], v_tiles, triton.next_power_of_2(v_tiles), num_warps=8)
+        _final_maxima[(1,)](
+            partials_v, local[2:3], v_tiles, triton.next_power_of_2(v_tiles), num_warps=8
+        )
         gathered = symm_amax.gather(symmetric)
         v_amax_ptr = gathered.view(-1)[2:]
         amax_n, amax_stride = 4, 4
     else:
         v_max = sc["v_max"]
-        _final_maxima[(1,)](partials_v, v_max, v_tiles, triton.next_power_of_2(v_tiles), num_warps=8)
+        _final_maxima[(1,)](
+            partials_v, v_max, v_tiles, triton.next_power_of_2(v_tiles), num_warps=8
+        )
         torch.distributed.all_reduce(v_max, op=torch.distributed.ReduceOp.MAX, group=group)
         v_amax_ptr = v_max
         amax_n, amax_stride = 1, 1

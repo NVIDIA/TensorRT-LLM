@@ -5,9 +5,13 @@
 from __future__ import annotations
 
 import ast
+import unittest
 from pathlib import Path
 from types import SimpleNamespace
-import unittest
+
+import pytest
+
+pytestmark = pytest.mark.cpu_only
 
 U4 = (
     Path(__file__).resolve().parents[6]
@@ -65,9 +69,7 @@ def _load_vae_opt(capability: tuple[int, int]):
 class TestFp8U4VaeOptContracts(unittest.TestCase):
     def test_module_does_not_eagerly_import_nvfp4_scenario_config(self):
         tree = ast.parse((U4 / "vae_opt.py").read_text())
-        top_imports = [
-            node for node in tree.body if isinstance(node, (ast.Import, ast.ImportFrom))
-        ]
+        top_imports = [node for node in tree.body if isinstance(node, (ast.Import, ast.ImportFrom))]
         for imp in top_imports:
             mod = getattr(imp, "module", "") or ""
             self.assertNotIn("nvfp4", mod)
