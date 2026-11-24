@@ -3,6 +3,12 @@
 
 import asyncio
 import base64
+import binascii
+# The decoder walks pickle opcodes; nothing is unpickled.
+import pickletools  # nosec B403
+import struct
+import sys
+import zipfile
 from collections import defaultdict
 from io import BytesIO
 from pathlib import Path
@@ -66,6 +72,410 @@ def load_base64_image_embeds(str_content: str) -> torch.Tensor:
                                               weights_only=True,
                                               map_location="cpu")
     return image_data
+
+
+# A ``torch.save`` pickle of one tensor is a single call
+# ``_rebuild_tensor_v2(storage, offset, size, stride, requires_grad,
+# OrderedDict())`` whose storage is a persistent id. Client payloads are never
+# unpickled or passed to ``torch.load``: the pickle's stack is replayed
+# symbolically, only that shape is accepted, and the tensor is built from the
+# replayed fields over the storage record that ``zipfile`` read.
+_TENSOR_REBUILD = "torch._utils _rebuild_tensor_v2"
+_TENSOR_HOOKS = "collections OrderedDict"
+_TENSOR_STORAGE_DTYPES = {
+    "torch FloatStorage": torch.float32,
+    "torch BFloat16Storage": torch.bfloat16,
+    "torch HalfStorage": torch.float16,
+}
+_TENSOR_PICKLE_OPS = frozenset({
+    "PROTO", "FRAME", "GLOBAL", "STACK_GLOBAL", "BINPUT", "LONG_BINPUT",
+    "MEMOIZE", "MARK", "BINUNICODE", "SHORT_BINUNICODE", "BININT", "BININT1",
+    "BININT2", "LONG1", "TUPLE", "TUPLE1", "TUPLE2", "TUPLE3", "EMPTY_TUPLE",
+    "NEWFALSE", "NEWTRUE", "BINPERSID", "REDUCE", "STOP"
+})
+# A single tensor's pickle is about 160 bytes.
+_TENSOR_PICKLE_MAX_BYTES = 4096
+# torch.save writes seven records for one tensor, about 600 bytes of central
+# directory; zipfile parses all of it up front.
+_TENSOR_ARCHIVE_MAX_DIRECTORY_BYTES = 4096
+_ZIP_EOCD = struct.Struct("<4s4x2H2IH")
+_ZIP64_EOCD = struct.Struct("<4s36xQQ")
+_ZIP64_LOCATOR = struct.Struct("<4s4xQ4x")
+_BASE64_WHITESPACE = str.maketrans("", "", " \t\r\n")
+# Base64 is decoded in slices of this many characters (a multiple of 4): each
+# call holds the GIL, so slices bound the event-loop stall of a worker thread.
+_BASE64_SLICE_CHARS = 1 << 18
+_TENSOR_ARCHIVE_RECORDS = frozenset({
+    "data.pkl", "byteorder", "version", ".format_version", ".storage_alignment",
+    ".data/version", ".data/serialization_id"
+})
+
+
+class _PickleGlobal(NamedTuple):
+    name: str
+
+
+class _PickleCall(NamedTuple):
+    func: object
+    args: tuple
+
+
+class _PicklePersistentId(NamedTuple):
+    pid: object
+
+
+class _TensorSpec(NamedTuple):
+    """The ``_rebuild_tensor_v2`` fields of a checked tensor pickle."""
+    key: str
+    dtype: torch.dtype
+    storage_numel: int
+    offset: int
+    size: Tuple[int, ...]
+    stride: Tuple[int, ...]
+
+
+_PICKLE_MARK = object()
+
+
+def _replay_tensor_pickle(pickled: bytes) -> object:
+    """Replay the pickle's stack without calling anything; return its result."""
+    try:
+        ops = list(pickletools.genops(pickled))
+    except ValueError as e:
+        raise ValueError(f"Tensor payload pickle is malformed: {e}") from e
+    stack: List[object] = []
+    try:
+        for opcode, arg, _ in ops:
+            name = opcode.name
+            if name not in _TENSOR_PICKLE_OPS:
+                raise ValueError(
+                    f"Tensor payload uses unsupported pickle opcode {name}.")
+            if name == "STOP":
+                break
+            if name in ("PROTO", "FRAME", "BINPUT", "LONG_BINPUT", "MEMOIZE"):
+                continue
+            if name == "MARK":
+                stack.append(_PICKLE_MARK)
+            elif name in ("GLOBAL", "STACK_GLOBAL"):
+                if name == "STACK_GLOBAL":
+                    qualname, module = stack.pop(), stack.pop()
+                    if not (isinstance(module, str)
+                            and isinstance(qualname, str)):
+                        raise ValueError("Tensor payload pickle is malformed.")
+                    arg = f"{module} {qualname}"
+                if (arg not in (_TENSOR_REBUILD, _TENSOR_HOOKS)
+                        and arg not in _TENSOR_STORAGE_DTYPES):
+                    raise ValueError(
+                        f"Tensor payload references {arg!r}; only one "
+                        "float16, bfloat16 or float32 tensor is accepted "
+                        "(unsupported dtype or type).")
+                stack.append(_PickleGlobal(arg))
+            elif name == "NEWFALSE" or name == "NEWTRUE":
+                stack.append(name == "NEWTRUE")
+            elif name == "EMPTY_TUPLE":
+                stack.append(())
+            elif name in ("TUPLE1", "TUPLE2", "TUPLE3", "TUPLE"):
+                start = (len(stack) -
+                         int(name[-1]) if name != "TUPLE" else len(stack) -
+                         stack[::-1].index(_PICKLE_MARK))
+                items = tuple(stack[start:])
+                if start < 0 or _PICKLE_MARK in items:
+                    raise ValueError("Tensor payload pickle is malformed.")
+                del stack[start - (name == "TUPLE"):]
+                stack.append(items)
+            elif name == "BINPERSID":
+                stack.append(_PicklePersistentId(stack.pop()))
+            elif name == "REDUCE":
+                args = stack.pop()
+                if not isinstance(args, tuple):
+                    raise ValueError("Tensor payload pickle is malformed.")
+                stack.append(_PickleCall(stack.pop(), args))
+            elif arg is not None:
+                stack.append(arg)
+    except (IndexError, ValueError) as e:
+        if isinstance(e, ValueError) and str(e).startswith("Tensor payload"):
+            raise
+        raise ValueError("Tensor payload pickle is malformed.") from e
+    if len(stack) != 1:
+        raise ValueError(
+            "Tensor payload pickle must rebuild exactly one tensor.")
+    return stack[0]
+
+
+def _is_int_tuple(value: object) -> bool:
+    return isinstance(value, tuple) and all(
+        type(v) is int and v >= 0 for v in value)
+
+
+def _check_tensor_pickle(pickled: bytes, max_bytes: int) -> _TensorSpec:
+    """Check that a pickle rebuilds one bounded tensor and return its fields."""
+    if len(pickled) > _TENSOR_PICKLE_MAX_BYTES:
+        raise ValueError(
+            f"Tensor payload pickle is {len(pickled)} bytes; one tensor needs "
+            f"far less than {_TENSOR_PICKLE_MAX_BYTES}.")
+    root = _replay_tensor_pickle(pickled)
+    malformed = ValueError(
+        "Tensor payload pickle must rebuild exactly one tensor.")
+    if not (isinstance(root, _PickleCall) and root.func
+            == _PickleGlobal(_TENSOR_REBUILD) and len(root.args) == 6):
+        raise malformed
+    storage, offset, size, stride, requires_grad, hooks = root.args
+    if hooks != _PickleCall(_PickleGlobal(_TENSOR_HOOKS), ()):
+        raise malformed
+    pid = storage.pid if isinstance(storage, _PicklePersistentId) else None
+    if not (isinstance(pid, tuple) and len(pid) == 5 and pid[0] == "storage"
+            and isinstance(pid[1], _PickleGlobal) and isinstance(pid[2], str)
+            and isinstance(pid[3], str) and type(pid[4]) is int):
+        raise malformed
+    dtype = _TENSOR_STORAGE_DTYPES.get(pid[1].name)
+    if dtype is None:
+        raise malformed
+    element_size = dtype.itemsize
+    if not (type(offset) is int and offset >= 0 and _is_int_tuple(size)
+            and _is_int_tuple(stride) and len(size) == len(stride)
+            and isinstance(requires_grad, bool) and pid[4] >= 0):
+        raise malformed
+    # A zero-sized dim or a size-1 dim leaves other values out of the extent
+    # check below; bound them so as_strided never sees an overflowing value.
+    if max((offset, *size, *stride)) > max_bytes:
+        raise ValueError(
+            f"Tensor payload size, stride or offset exceeds {max_bytes}.")
+    storage_bytes = pid[4] * element_size
+    logical_bytes = element_size
+    span = 1
+    for dim in size:
+        logical_bytes *= dim
+        span *= max(dim, 1)
+    if max(logical_bytes, storage_bytes) > max_bytes:
+        raise ValueError(
+            f"Tensor payload describes {max(logical_bytes, storage_bytes)} "
+            f"bytes, over the {max_bytes}-byte limit.")
+    # torch multiplies the sizes in order, so a zero-sized dim does not stop
+    # the others' product from overflowing.
+    if span > max_bytes:
+        raise ValueError(
+            f"Tensor payload sizes multiply to {span}, over {max_bytes}.")
+    # A view repeating its storage (expand, overlapping strides) would let a
+    # small archive decode to a large tensor.
+    if logical_bytes > storage_bytes:
+        raise ValueError("Tensor payload view repeats storage elements; save a "
+                         "contiguous tensor.")
+    if logical_bytes and offset + sum(
+        (d - 1) * s for d, s in zip(size, stride)) >= pid[4]:
+        raise ValueError("Tensor payload view reaches past its storage.")
+    return _TensorSpec(pid[2], dtype, pid[4], offset, size, stride)
+
+
+def _check_central_directory_size(content: bytes) -> None:
+    """Bound the central directory zipfile will parse, as torch.save writes it.
+
+    torch.save ends the archive with a comment-free end-of-central-directory
+    record, preceded by a zip64 one. Like zipfile, the directory size is taken
+    from the zip64 record when its locator is present (large archives store a
+    placeholder in the plain record).
+    """
+    tail = content[-_ZIP_EOCD.size:]
+    if len(tail) < _ZIP_EOCD.size:
+        raise ValueError("Tensor payload must be a torch.save zip archive.")
+    signature, _, _, size, _, comment = _ZIP_EOCD.unpack(tail)
+    if signature != b"PK\x05\x06" or comment:
+        raise ValueError("Tensor payload must end with a torch.save zip "
+                         "directory record and no comment.")
+    locator = len(content) - _ZIP_EOCD.size - _ZIP64_LOCATOR.size
+    if locator >= 0 and content[locator:locator + 4] == b"PK\x06\x07":
+        # zipfile reads the zip64 record where the locator points (newer
+        # versions) or right before the locator (older ones); torch.save
+        # writes it right before, so require both to be the same record.
+        if (_ZIP64_LOCATOR.unpack_from(content, locator)[1]
+                != locator - _ZIP64_EOCD.size):
+            raise ValueError("Tensor payload zip64 directory record must "
+                             "directly precede its locator.")
+        record = content[max(locator - _ZIP64_EOCD.size, 0):locator]
+        if (len(record) != _ZIP64_EOCD.size
+                or _ZIP64_EOCD.unpack(record)[0] != b"PK\x06\x06"):
+            raise ValueError("Tensor payload zip64 directory record is "
+                             "malformed.")
+        size = _ZIP64_EOCD.unpack(record)[1]
+    if size > _TENSOR_ARCHIVE_MAX_DIRECTORY_BYTES:
+        raise ValueError(f"Tensor payload archive's central directory is over "
+                         f"{_TENSOR_ARCHIVE_MAX_DIRECTORY_BYTES} bytes.")
+
+
+def _read_tensor_archive(content: bytes,
+                         max_bytes: int) -> Tuple[_TensorSpec, torch.Tensor]:
+    """Check a ``torch.save`` archive of one tensor and read its storage.
+
+    Only the zip format with the records ``torch.save`` writes for one tensor,
+    all uncompressed and little-endian, is accepted, and the pickle may only
+    rebuild one float16, bfloat16 or float32 tensor.
+
+    Returns:
+        The tensor's fields and its storage record's bytes as a uint8 tensor.
+    """
+    _check_central_directory_size(content)
+    try:
+        with zipfile.ZipFile(BytesIO(content)) as archive:
+            members = archive.infolist()
+            names = [m.filename for m in members]
+            prefix = names[0].split("/", 1)[0] + "/" if names else ""
+            records = [n[len(prefix):] for n in names if n.startswith(prefix)]
+            data = [r for r in records if r.startswith("data/")]
+            if (len(records) != len(names) or len(set(names)) != len(names)
+                    or "data.pkl" not in records or len(data) > 1
+                    or any(r not in _TENSOR_ARCHIVE_RECORDS
+                           for r in records if not r.startswith("data/"))):
+                raise ValueError(
+                    "Tensor payload archive must hold only the records "
+                    "torch.save writes for one tensor.")
+            total = 0
+            for member in members:
+                # zipfile reads compress_size bytes even for a stored member,
+                # so the two sizes must agree for file_size to bound reads.
+                if (member.compress_type != zipfile.ZIP_STORED
+                        or member.compress_size != member.file_size):
+                    raise ValueError(
+                        "Tensor payload members must be uncompressed.")
+                total += member.file_size
+            if total > max_bytes:
+                raise ValueError(
+                    f"Tensor payload expands to {total} bytes, over the "
+                    f"{max_bytes}-byte limit.")
+            # Metadata records are sized before they are read.
+            pickle_size = archive.getinfo(prefix + "data.pkl").file_size
+            if pickle_size > _TENSOR_PICKLE_MAX_BYTES:
+                raise ValueError(
+                    f"Tensor payload pickle is {pickle_size} bytes; one tensor "
+                    f"needs far less than {_TENSOR_PICKLE_MAX_BYTES}.")
+            spec = _check_tensor_pickle(archive.read(prefix + "data.pkl"),
+                                        max_bytes)
+            storage_bytes = spec.storage_numel * spec.dtype.itemsize
+            # The archive must hold the storage bytes before they are
+            # allocated; the declared sizes alone are the client's to choose.
+            if (data != [f"data/{spec.key}"] or
+                    archive.getinfo(prefix + data[0]).file_size != storage_bytes
+                    or storage_bytes > len(content)):
+                raise ValueError(
+                    "Tensor payload storage record does not match its tensor.")
+            if (prefix + "byteorder" in names
+                    and (archive.getinfo(prefix + "byteorder").file_size
+                         != len(b"little")
+                         or archive.read(prefix + "byteorder") != b"little")):
+                raise ValueError("Tensor payload must be little-endian.")
+            # Copy in chunks into the tensor's buffer, so no second full copy
+            # exists; zipfile checks the record's CRC once all of it is read.
+            # The buffer is not zero-filled, since every byte is overwritten.
+            storage = torch.empty(storage_bytes,
+                                  dtype=torch.uint8,
+                                  device="cpu")
+            view, filled = memoryview(storage.numpy()), 0
+            with archive.open(prefix + data[0]) as record:
+                while chunk := record.read(1 << 20):
+                    if filled + len(chunk) > storage_bytes:
+                        break
+                    view[filled:filled + len(chunk)] = chunk
+                    filled += len(chunk)
+            if filled != storage_bytes:
+                raise ValueError("Tensor payload storage record is truncated.")
+    except (ValueError, MemoryError):
+        raise
+    except Exception as e:
+        # zipfile raises many types (BadZipFile, NotImplementedError,
+        # RuntimeError, EOFError, ...) on malformed archives.
+        raise ValueError(
+            f"Tensor payload must be a torch.save zip archive: {e}") from e
+    return spec, storage
+
+
+def _b64decode_strict(text: str, strip_whitespace: bool = False) -> bytes:
+    """Decode standard base64, rejecting characters outside its alphabet.
+
+    The text is decoded a slice at a time, carrying incomplete quartets over,
+    so no call holds the GIL for the whole payload. Padding may only end it.
+    """
+    if sys.version_info >= (3, 11):
+        # Unlike base64.b64decode, this does not first copy the text to bytes.
+        def decode(piece: str) -> bytes:
+            return binascii.a2b_base64(piece, strict_mode=True)
+    else:
+
+        def decode(piece: str) -> bytes:
+            return base64.b64decode(piece, validate=True)
+
+    parts, carry, padded = [], "", False
+    for start in range(0, len(text), _BASE64_SLICE_CHARS):
+        piece = text[start:start + _BASE64_SLICE_CHARS]
+        if strip_whitespace:
+            piece = piece.translate(_BASE64_WHITESPACE)
+        if padded:
+            # Only stripped whitespace may follow the padding.
+            if piece:
+                raise ValueError("data after padding")
+            continue
+        piece = carry + piece
+        if start + _BASE64_SLICE_CHARS < len(text):
+            cut = len(piece) - len(piece) % 4
+            piece, carry = piece[:cut], piece[cut:]
+            if "=" in piece:
+                if carry:
+                    raise ValueError("data after padding")
+                padded = True
+        else:
+            carry = ""
+        parts.append(decode(piece))
+    return b"".join(parts)
+
+
+def load_base64_tensor(data: str, *, max_bytes: int) -> torch.Tensor:
+    """Decode one dense tensor from base64-encoded ``torch.save`` bytes.
+
+    The payload is never unpickled: its archive and pickle are checked and the
+    tensor is built from the checked fields. The tensor's logical size is at
+    most ``max_bytes``, and peak allocation here is about twice the decoded
+    payload (the payload plus the tensor's storage). Only little-endian
+    float16, bfloat16 and float32 tensors load. Callers check shape.
+
+    Args:
+        data: Standard base64 text of a ``torch.save`` file; ASCII whitespace
+            such as line breaks is ignored.
+        max_bytes: Upper bound on the decoded payload size.
+
+    Returns:
+        The decoded tensor on CPU.
+    """
+    if not isinstance(data, str):
+        raise TypeError(f"Tensor payload must be a base64 string, got "
+                        f"{type(data).__name__}.")
+    encoded_limit = 4 * ((max_bytes + 2) // 3)
+    # Line-wrapped (MIME style) text adds up to two characters per 76.
+    if len(data) > encoded_limit + encoded_limit // 38 + 2:
+        raise ValueError(
+            f"Tensor payload is {len(data)} base64 characters, over the "
+            f"{max_bytes}-byte limit.")
+    # Base64 is ASCII; checked first because translate() is slow on other text.
+    if not data.isascii():
+        raise ValueError("Tensor payload is not valid base64: non-ASCII text.")
+    try:
+        content = _b64decode_strict(data)
+    except ValueError as e:
+        # Line-wrapped base64 is accepted; only then is whitespace stripped.
+        try:
+            content = _b64decode_strict(data, strip_whitespace=True)
+        except ValueError:
+            raise ValueError(f"Tensor payload is not valid base64: {e}") from e
+    if len(content) > max_bytes:
+        raise ValueError(f"Tensor payload is {len(content)} bytes, over the "
+                         f"{max_bytes}-byte limit.")
+    spec, storage = _read_tensor_archive(content, max_bytes)
+    return storage.view(spec.dtype).as_strided(spec.size, spec.stride,
+                                               spec.offset)
+
+
+async def async_load_base64_tensor(data: str, *,
+                                   max_bytes: int) -> torch.Tensor:
+    """Run :func:`load_base64_tensor` in a worker thread, off the event loop."""
+    return await asyncio.to_thread(load_base64_tensor,
+                                   data,
+                                   max_bytes=max_bytes)
 
 
 def load_image(image: Union[str, Image.Image],
