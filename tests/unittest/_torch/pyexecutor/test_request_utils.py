@@ -2355,6 +2355,10 @@ def test_response_bounds_additional_outputs(output_kind: str, serializer: Module
     live_outputs.setdefault("routed_experts", [])
     append("routed_experts", first * 6)
     restored = serializer.loads(serializer.dumps(response))
+    assert restored.result._py_result._additional_context_output_lengths is None
+    assert restored.result._py_result._additional_generation_output_lengths is None
+    assert snapshot._additional_context_output_lengths is not None
+    assert snapshot._additional_generation_output_lengths is not None
     diff = request.py_result.get_diff()
     chunks = (
         diff.additional_context_outputs_list

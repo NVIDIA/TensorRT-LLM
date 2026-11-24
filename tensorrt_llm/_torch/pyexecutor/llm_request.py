@@ -489,7 +489,9 @@ class PyResult:
                 self._additional_context_output_lengths),
             _additional_generation_outputs=self._bounded_additional_outputs(
                 self._additional_generation_outputs,
-                self._additional_generation_output_lengths))
+                self._additional_generation_output_lengths),
+            _additional_context_output_lengths=None,
+            _additional_generation_output_lengths=None)
         return state
 
     def reset_diff(self):
