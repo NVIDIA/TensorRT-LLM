@@ -94,7 +94,7 @@ from typing import Iterator
 
 import torch
 
-from tensorrt_llm._startup_errors import OomKind, out_of_memory_kind
+from tensorrt_llm._startup_errors import OomKind, _exception_chain, out_of_memory_kind
 from tensorrt_llm.logger import logger
 
 from . import providers
@@ -477,7 +477,9 @@ def _finish_report_slot(produced: bool) -> None:
             _last_report_at = time.monotonic()
 
 
-def _report_oom(headline: str, *, background: bool = False, incident: str = "") -> None:
+def _report_oom(
+    headline: str, *, armed: _Armed, background: bool = False, incident: str = ""
+) -> None:
     """Emit one OOM report, subject to the shared rate limit. Never raises.
 
     With ``background`` the report is built on a short-lived thread, so the
@@ -485,11 +487,11 @@ def _report_oom(headline: str, *, background: bool = False, incident: str = "") 
     slot is still taken here, so a burst of errors starts one report.
     """
     global _background_report
-    armed = _armed
-    if armed is None or _suspended or getattr(_reporting, "active", False):
-        return
-    if not _claim_report_slot():
-        return
+    with _arm_lock:
+        if _armed is not armed or _suspended or getattr(_reporting, "active", False):
+            return
+        if not _claim_report_slot():
+            return
     device = armed.device
     rank = armed.rank
     if not background:
@@ -610,8 +612,8 @@ def _on_out_of_memory(
         )
 
 
-def _failed_allocation_of(message: str) -> _FailedAllocation | None:
-    """The recorded failed PyTorch allocation, if ``message`` is its error.
+def _failed_allocation_of(armed: _Armed, *messages: str) -> _FailedAllocation | None:
+    """The recorded allocation for this executor, if the reported error chain matches.
 
     Consumed when it matches. Matched by size and device rather than by
     time alone: callers catch some PyTorch OOMs and recover, and a later,
@@ -619,10 +621,12 @@ def _failed_allocation_of(message: str) -> _FailedAllocation | None:
     """
     global _last_failed_allocation
     with _arm_lock:
+        if _armed is not armed:
+            return None
         failed = _last_failed_allocation
         if failed is None or time.monotonic() - failed.at > _FAILED_ALLOCATION_WINDOW_S:
             return None
-        if failed.ambiguous or not failed.is_reported_by(message):
+        if failed.ambiguous or not any(failed.is_reported_by(message) for message in messages):
             return None
         _last_failed_allocation = None
         return failed
@@ -697,13 +701,17 @@ def notify_error(
         if not is_device_oom(text if error is None else error):
             return
         first_line = _headline_line(text)
-        failed = _failed_allocation_of(text)
+        chain = _exception_chain(error) if error is not None else ()
+        failed = _failed_allocation_of(armed, text, *(str(exc) for exc in chain))
         if failed is not None:
             headline = f"OUT OF MEMORY: {failed.describe()}. Error: {first_line}"
         else:
             headline = f"OUT OF MEMORY: {first_line}"
         _report_oom(
-            headline, background=background, incident=failed.snapshot_summary if failed else ""
+            headline,
+            armed=armed,
+            background=background,
+            incident=failed.snapshot_summary if failed else "",
         )
     except Exception as exc:  # an error path must not gain a second error
         # A monitor bug would otherwise turn OOM reports off without a trace.
