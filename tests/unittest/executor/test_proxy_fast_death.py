@@ -148,6 +148,9 @@ class _FakeWorkerInitStatusQueue:
     def put(self, message):
         self.acks.append(message)
 
+    def close(self) -> None:
+        pass
+
 
 class _DeadAfterRegistrationMonitor:
     """Report a worker death only after the proxy registers identities."""
