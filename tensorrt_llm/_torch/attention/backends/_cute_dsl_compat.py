@@ -13,7 +13,7 @@ from typing import Any, TextIO
 
 from filelock import FileLock
 from flashinfer.jit import cute_dsl_core
-from flashinfer.jit.core import get_tmpdir, logger
+from flashinfer.jit.core import MissingJITCacheError, get_tmpdir, logger
 from flashinfer.jit.cute_dsl_core import JitSpecCuteDsl as _FlashInferJitSpecCuteDsl
 from flashinfer.jit.cute_dsl_core import _hash_source_files, _read_meta, cute_dsl_cache_disabled
 
@@ -96,6 +96,18 @@ class JitSpecCuteDsl(_FlashInferJitSpecCuteDsl):
                 f"Failed to load cached CuTe-DSL kernel {self.object_path}: {e}. Recompiling."
             )
             return None
+
+    def build_and_load(self) -> Any:
+        if os.environ.get("FLASHINFER_DISABLE_JIT"):
+            cached = self.try_load()
+            if cached is None:
+                raise MissingJITCacheError(
+                    f"JIT compilation is disabled via FLASHINFER_DISABLE_JIT and no usable "
+                    f"cached kernel was found for {self.name}.",
+                    spec=self,
+                )
+            return cached
+        return super().build_and_load()
 
     def build(self) -> None:
         logger.info(f"Compiling CuTe-DSL kernel {self.name}")

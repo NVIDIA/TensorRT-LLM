@@ -1510,6 +1510,8 @@ def test_workers_publish_cold_variants_for_jit_disabled_parent(monkeypatch) -> N
     from pathlib import Path
     from unittest.mock import patch
 
+    from flashinfer.jit.core import MissingJITCacheError
+
     from tensorrt_llm._torch.attention.backends._cute_dsl_compat import JitSpecCuteDsl
     from tensorrt_llm._torch.attention.backends.fmha import prims_ts_precompile as pp
     from tensorrt_llm._torch.attention.backends.fmha.prims_ts_dsa_sparse_mla import (
@@ -1554,6 +1556,13 @@ def test_workers_publish_cold_variants_for_jit_disabled_parent(monkeypatch) -> N
     assert not stale.object_path.exists()
     monkeypatch.setenv("FLASHINFER_DISABLE_JIT", "1")
     mla_decode._get_compiled_mla_decode.cache_clear()
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.attention.backends._cute_dsl_compat.get_tmpdir",
+        lambda: pytest.fail("JIT-disabled cache lookups must not request a lock"),
+    )
+    with pytest.raises(MissingJITCacheError) as miss:
+        stale.build_and_load()
+    assert miss.value.spec is stale
     for payload in payloads:
         wrapper = mla_decode.BatchSparseMLADecodePagedTSWrapper()
         wrapper.plan(device, payload["rows"], 64, **kwargs)
