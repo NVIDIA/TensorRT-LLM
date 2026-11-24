@@ -637,6 +637,51 @@ class TestSkippedGenerationStepUndo:
         assert manager._kda_replay.acceptance_pending == {6}
 
 
+class TestSparseOffloadRetainedStep:
+    """A kept decode step is reused by the sparse-offload manager, not stranded."""
+
+    @staticmethod
+    def make(retained: dict[int, int]):
+        from tensorrt_llm._torch.attention.backends.sparse.offload import SparseOffloadCacheMixin
+
+        class _OffloadManager(SparseOffloadCacheMixin, KVCacheManagerV2):
+            pass
+
+        manager = object.__new__(_OffloadManager)
+        manager._enable_kv_cache_offload = True
+        manager._sparse_batch = None
+        # The step the connector kept: one input token reserved beyond history.
+        cache = Mock(is_active=True, capacity=11, history_length=10)
+        manager.kv_cache_map = {7: cache}
+        manager._retained_generation_allocations = dict(retained)
+        manager._allocated_draft_lens = {}
+        manager._inflight_draft_lens = {}
+        manager._ensure_generation_beam_width = lambda req, kv_cache: True
+        manager._generation_draft_slots = lambda req: 0
+        return manager, cache
+
+    def test_the_retry_consumes_the_retained_step(self):
+        manager, cache = self.make(retained={7: 0})
+
+        assert manager.try_allocate_generation(SimpleNamespace(py_request_id=7))
+
+        # The step is reused as is, and booked like any allocation, so the forward
+        # settles it and the next step reserves its own input token.
+        assert manager._retained_generation_allocations == {}
+        assert manager._allocated_draft_lens == {7: 0}
+        assert manager._inflight_draft_lens == {7: [0]}
+        cache.resize.assert_not_called()
+
+    def test_a_reserved_step_without_a_retained_entry_is_left_alone(self):
+        manager, cache = self.make(retained={})
+
+        assert manager.try_allocate_generation(SimpleNamespace(py_request_id=7))
+
+        assert manager._allocated_draft_lens == {}
+        assert manager._inflight_draft_lens == {}
+        cache.resize.assert_not_called()
+
+
 class TestUnchunkedIsPureShrink:
     """With chunking off, ``resize_context`` already covered the whole prompt.
 

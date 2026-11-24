@@ -2203,3 +2203,36 @@ def test_failed_load_hooks_can_be_bound_on_the_worker_instance() -> None:
     worker.take_failed_async_load_requests = None
     with pytest.raises(ValueError, match="take_failed_async_load_requests"):
         KvCacheConnectorManager._validate_failed_load_reporting(worker)
+
+
+def test_loads_of_a_skipped_forward_are_waited_on_every_layer() -> None:
+    """A synchronous load is only waited for by the forward's layer hooks.
+
+    When attention-DP peers skip the forward after this owner started its loads,
+    the owner waits for every layer, as the forward would have, and for the
+    stream, so a later SKIP cannot free pages the worker still writes.
+    """
+    manager = _manager()
+    manager.register_load_layers([0, 1, 2])
+    stream = MagicMock()
+
+    # Nothing was started: nothing to wait for.
+    manager.finish_loads_of_skipped_forward(stream)
+    manager.worker.wait_for_layer_load.assert_not_called()
+
+    # A forward ran: its layer hooks already waited.
+    manager.mark_loads_started()
+    manager.mark_loads_waited()
+    manager.finish_loads_of_skipped_forward(stream)
+    manager.worker.wait_for_layer_load.assert_not_called()
+
+    # The forward is skipped: every layer is waited for once, then the stream.
+    manager.mark_loads_started()
+    manager.finish_loads_of_skipped_forward(stream)
+    manager.finish_loads_of_skipped_forward(stream)
+    assert [c.args for c in manager.worker.wait_for_layer_load.call_args_list] == [
+        (0, stream),
+        (1, stream),
+        (2, stream),
+    ]
+    stream.synchronize.assert_called_once()
