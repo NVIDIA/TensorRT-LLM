@@ -374,6 +374,11 @@ def _check_sm107_ull(llm_args: TorchLlmArgs) -> None:
         )
     if llm_args.guided_decoding_backend is not None:
         raise NoTarget("the sm107 Kimi K3 ULL target does not support guided_decoding_backend")
+    if llm_args.moe_config.backend != "CUTEDSL_FC12":
+        raise NoTarget("the sm107 Kimi K3 ULL target requires moe_config.backend CUTEDSL_FC12")
+    preemption = getattr(getattr(llm_args, "scheduler_config", None), "gen_preemption", None)
+    if getattr(preemption, "enabled", False):
+        raise NoTarget("the sm107 Kimi K3 ULL target does not support GEN slot preemption")
 
     spec = llm_args.speculative_config
     draft_len = getattr(spec, "max_draft_len", None)
@@ -508,6 +513,9 @@ def route(
                 ModelingV2KimiK3Nvfp4Sm107Helix16Moetp16ep1,
             )
 
+            model_config.extra_attrs["kimi_k3_ull_pin_executor"] = _worker_env(
+                llm_args, "TLLM_NUMA_AWARE_WORKER_AFFINITY"
+            ) in (None, "1")
             return ModelingV2KimiK3Nvfp4Sm107Helix16Moetp16ep1
         from .kimi_k3_nvfp4__sm_107__dep16.modeling import ModelingV2KimiK3Nvfp4Sm107Dep16
 

@@ -1036,7 +1036,8 @@ class K3MlaQFusedKernel:
         for t, xw in rows:
             if t < Int32(self.t_pad):
                 self.quantize_row(t, xw, lane, eps, nw_s, ew_s, act_s, bsc_s)
-        cute.arch.barrier()
+        # Both CTAs must exist before q_b_tile publishes into peer shared memory.
+        _cluster_sync()
         self.stamp(tidx, ts, 2)
         if tidx == 0:
             # W_UK into L2 behind the q_b weight (it is read after the q_b MMAs).

@@ -2663,9 +2663,10 @@ def forward_gen_q_fused(
         rows_per_seq=rows_per_seq or gen_len * heads,
         use_pdl=USE_PDL,
         norm=(norm.weight, norm.variance_epsilon) if fuse_norm else None,
-        # features.ull2_mla_decode_pdl: the decode (a programmatic dependent reading only the
-        # query after its wait) starts its prologue as this kernel's CTAs finish.
-        early_trigger=_gen_F.ull2_mla_decode_pdl,
+        # The decode prefetches KV before its grid wait. An aux-stream append is joined by
+        # kv_ready below. On a single stream Q must first wait for the append before releasing
+        # the decode, so Q triggers its dependent from the epilogue.
+        early_trigger=_gen_F.ull2_mla_decode_pdl and kv_stream is not None,
     )
     fp4_mla_decode.mark_query_launch(md)
     if kv_stream is not None:
@@ -4742,7 +4743,7 @@ class K3UllMambaMetadata(Mamba2Metadata):
 
 def native_process_group(rank: int, world: int = 16):
     """The default NCCL process group of the ``world`` generation ranks (``rank`` this one's),
-    created once: MPI rank 0 picks a TCP rendezvous and broadcasts it. Reused when the default
+    created once: MPI rank 0 starts the TCP store and broadcasts its address. Reused when the default
     group already exists with the same rank and size."""
     import torch.distributed as dist
 
@@ -4761,23 +4762,25 @@ def native_process_group(rank: int, world: int = 16):
             f"Kimi K3 ULL: the MPI world is rank {comm.Get_rank()} of {comm.Get_size()}, not "
             f"{rank} of {world}"
         )
+    timeout = timedelta(minutes=5)
+    store = None
     rendezvous = None
     if rank == 0:
         try:
             host = socket.gethostbyname(socket.gethostname())
             if host.startswith("127.") and world > 1:
                 raise ValueError("the NCCL rendezvous must be reachable from the other nodes")
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                sock.bind(("", 0))
-                port = sock.getsockname()[1]
-            rendezvous = (host, port, None)
-        except (OSError, ValueError) as error:
+            store = dist.TCPStore(
+                host, 0, world, is_master=True, timeout=timeout, wait_for_workers=False
+            )
+            rendezvous = (host, store.port, None)
+        except (OSError, RuntimeError, ValueError) as error:
             rendezvous = (None, None, str(error))
     host, port, error = comm.bcast(rendezvous, root=0)
     if error is not None:
         raise RuntimeError(f"Kimi K3 ULL: process group rendezvous failed: {error}")
-    timeout = timedelta(minutes=5)
-    store = dist.TCPStore(host, port, world, rank == 0, timeout=timeout)
+    if store is None:
+        store = dist.TCPStore(host, port, world, is_master=False, timeout=timeout)
     dist.init_process_group(
         backend="cuda:nccl,cpu:gloo",
         store=store,
@@ -9870,11 +9873,12 @@ class KimiK3Helix16UllForCausalLM(
             if features.embedding_gather:
                 hooks = replace(hooks, decode_prologue=spec_decode_head)
             if features.pack_step_inputs:
-                hooks = make_runtime_hooks(hooks)
+                hooks = make_runtime_hooks(hooks, pin_executor=self._pin_executor)
             self._step_shell_hooks = hooks
         return hooks
 
     def __init__(self, model_config: ModelConfig):
+        self._pin_executor = model_config.extra_attrs.get("kimi_k3_ull_pin_executor", True)
         cfg = _get_text_config(model_config.pretrained_config)
         assert model_config.mapping.pp_size == 1, "Kimi K3 does not support pipeline parallelism"
         spec_config = getattr(model_config, "spec_config", None)

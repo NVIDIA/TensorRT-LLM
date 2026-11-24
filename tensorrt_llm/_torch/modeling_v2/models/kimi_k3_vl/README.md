@@ -14,7 +14,7 @@
 | `kimi_k3_nvfp4__sm_107__dep16` | sm_107 | NVFP4 | generation: attention DP over 16 ranks, MoE EP16, `MEGAMOE_CUTEDSL` |
 | `kimi_k3_nvfp4__sm_107__helix8_moeep8` | sm_107 | NVFP4 | generation: Helix CP8 (TP1, no attention DP, NCCL off for the all-to-all), MoE EP8, `CUTEDSL_FC12` |
 | `kimi_k3_nvfp4__sm_107__helix8_moetp2ep4` | sm_107 | NVFP4 | generation: Helix CP8 as above, MoE TP2 x EP4, `CUTEDSL_FC12` |
-| `kimi_k3_nvfp4__sm_107__helix16_moetp16ep1` | sm_107 | NVFP4 | ultra-low-latency generation: Helix CP16 (TP1, no attention DP, NCCL off for the all-to-all), MoE TP16, DSpark 7, at most 4 requests |
+| `kimi_k3_nvfp4__sm_107__helix16_moetp16ep1` | sm_107 | NVFP4 | ultra-low-latency generation: Helix CP16 (TP1, no attention DP, NCCL off for the all-to-all), MoE TP16, `CUTEDSL_FC12`, DSpark 7, at most 4 requests |
 
 ## Blackwell targets (sm_100)
 
@@ -35,7 +35,8 @@ The MXFP4 checkpoint runs on sm_100 on two targets, TP16 with the experts split 
 The NVFP4 checkpoint runs on sm_107 only, on five specialized targets, each one layout of the
 recipe below. Routing admits exactly these layouts; anything else raises `NoTarget` with the facts
 it saw (`modeling_v2="require"` turns that into an error). The Helix16 ULL layout requires a KV cache
-transceiver and declines an explicit non-generation role or a guided decoding backend.
+transceiver and declines an explicit non-generation role, a guided decoding backend, or GEN slot
+preemption.
 
 The recipe:
 

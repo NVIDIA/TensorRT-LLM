@@ -85,6 +85,7 @@ def _model_config(mapping: Mapping, *, spec: str = "DSPARK", expert_algo: str = 
         mapping=mapping,
         spec_config=spec_config,
         quant_config=SimpleNamespace(kv_cache_quant_algo=None),
+        extra_attrs={},
     )
 
 
@@ -374,6 +375,16 @@ def test_ull_generation_server_routes_to_the_ull_target(max_batch_size):
             "disaggregated generation server",
         ),
         (_ull_args(guided_decoding_backend="xgrammar"), "guided_decoding_backend"),
+        (
+            _ull_args(moe_config=SimpleNamespace(backend="CUTLASS")),
+            "moe_config.backend CUTEDSL_FC12",
+        ),
+        (
+            _ull_args(
+                scheduler_config=SimpleNamespace(gen_preemption=SimpleNamespace(enabled=True))
+            ),
+            "GEN slot preemption",
+        ),
     ],
 )
 def test_ull_declines_other_generation_steps(llm_args, match):
@@ -412,7 +423,11 @@ def test_route_declines_a_non_ull_helix16_moetp16ep1_before_importing_the_target
         routing.route(_model_config(_helix16_moetp16()), _ull_args(max_batch_size=8), _SM107)
 
 
-def test_route_returns_the_ull_target():
-    cls = routing.route(_model_config(_helix16_moetp16()), _ull_args(), _SM107)
+def test_route_returns_the_ull_target(monkeypatch):
+    monkeypatch.setenv("TLLM_NUMA_AWARE_WORKER_AFFINITY", "1")
+    model_config = _model_config(_helix16_moetp16())
+    args = _ull_args(env_overrides={"TLLM_NUMA_AWARE_WORKER_AFFINITY": "0"})
+    cls = routing.route(model_config, args, _SM107)
     assert cls.__name__ == _TARGET_CLASSES["kimi_k3_nvfp4__sm_107__helix16_moetp16ep1"]
     assert cls.__module__ == f"{_FAMILY}.kimi_k3_nvfp4__sm_107__helix16_moetp16ep1.modeling"
+    assert model_config.extra_attrs["kimi_k3_ull_pin_executor"] is False

@@ -8,8 +8,11 @@ import ast
 import json
 import pathlib
 import re
+from datetime import timedelta
+from types import SimpleNamespace
 
 import pytest
+import torch
 
 from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kimi_k3_nvfp4__sm_107__helix16_moetp16ep1 import (  # noqa: E501
     modeling as layer0,
@@ -184,3 +187,30 @@ def test_manifest_source_references_have_digests():
             assert path in data["source_sha256"], key
             assert line.isdecimal() and int(line) > 0, key
             assert ref["symbol"].strip(), key
+
+
+def test_rendezvous_broadcasts_a_listening_store(monkeypatch):
+    import tensorrt_llm._utils as trtllm_utils
+
+    dist = torch.distributed
+    client = None
+
+    def bcast(endpoint, *, root):
+        nonlocal client
+        assert root == 0
+        host, port, error = endpoint
+        assert error is None
+        client = dist.TCPStore(host, port, is_master=False, timeout=timedelta(seconds=2))
+        client.set("ready", "set before init_process_group")
+        return endpoint
+
+    def init_process_group(**kwargs):
+        assert kwargs["store"].get("ready") == b"set before init_process_group"
+
+    comm = SimpleNamespace(Get_size=lambda: 1, Get_rank=lambda: 0, bcast=bcast)
+    monkeypatch.setattr(trtllm_utils, "mpi_comm", lambda: comm)
+    monkeypatch.setattr(layer0.socket, "gethostbyname", lambda host: "127.0.0.1")
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(dist, "is_initialized", lambda: False)
+    monkeypatch.setattr(dist, "init_process_group", init_process_group)
+    layer0.native_process_group(rank=0, world=1)

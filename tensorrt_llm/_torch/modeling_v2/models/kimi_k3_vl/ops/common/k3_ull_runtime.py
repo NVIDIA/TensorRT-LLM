@@ -219,7 +219,13 @@ class StepShellEvents:
     interval before the overlap loop; :meth:`on_iteration`, the events' optional per-iteration call,
     rescans the threads and logs the fold counters."""
 
-    def __init__(self) -> None:
+    _gil_lock = threading.Lock()
+    _gil_users = 0
+    _gil_original = 0.0
+
+    def __init__(self, *, pin_executor: bool = True) -> None:
+        self._pin_executor = pin_executor
+        self._gil_active = False
         self.pin: Optional[ExecutorThreadPin] = None
 
     def after_warmup(self) -> None:
@@ -227,12 +233,27 @@ class StepShellEvents:
 
     def before_overlap_loop(self) -> None:
         # Runs on the executor thread. ExecutorThreadPin.create logs and returns None on an OS refusal.
-        self.pin = ExecutorThreadPin.create()
-        sys.setswitchinterval(GIL_SWITCH_US * 1e-6)
-        logger.info(f"{_LOG}: thread switch interval {sys.getswitchinterval() * 1e6:.0f} us")
+        if self._pin_executor:
+            self.pin = ExecutorThreadPin.create()
+        with StepShellEvents._gil_lock:
+            if self._gil_active:
+                return
+            if StepShellEvents._gil_users == 0:
+                StepShellEvents._gil_original = sys.getswitchinterval()
+                sys.setswitchinterval(GIL_SWITCH_US * 1e-6)
+                logger.info(
+                    f"{_LOG}: thread switch interval {sys.getswitchinterval() * 1e6:.0f} us"
+                )
+            StepShellEvents._gil_users += 1
+            self._gil_active = True
 
     def at_shutdown(self) -> None:
-        return
+        with StepShellEvents._gil_lock:
+            if self._gil_active:
+                StepShellEvents._gil_users -= 1
+                self._gil_active = False
+                if StepShellEvents._gil_users == 0:
+                    sys.setswitchinterval(StepShellEvents._gil_original)
 
     def on_iteration(self, iteration: int) -> None:
         if self.pin is not None:
@@ -449,11 +470,13 @@ def fold_block_offsets_copy(
     return True
 
 
-def make_runtime_hooks(base: Optional[RuntimeHooks] = None) -> RuntimeHooks:
+def make_runtime_hooks(
+    base: Optional[RuntimeHooks] = None, *, pin_executor: bool = True
+) -> RuntimeHooks:
     """``base`` (the defaults when None) plus the step shell. Build it once per model: the engine
     binds its buffers to the returned fold and its pack to the module."""
     fold = OverlapFixupFold()
-    events = StepShellEvents()
+    events = StepShellEvents(pin_executor=pin_executor)
 
     def make_pack(device: torch.device) -> StepInputPack:
         global _PACK

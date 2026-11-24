@@ -46,9 +46,11 @@ from ..k3r_gemm.low_m_bf16_splitk import (
     SplitKDenseGemmKernel,
     SplitKTactic,
     _align_up,
+    _fence_tcgen05,
     _from_dlpack_dynamic,
     _smem_bytes,
     _store_shared_remote_v4,
+    _wait_cluster,
     validate_tactic,
 )
 
@@ -461,6 +463,7 @@ class SplitKArPushGemmKernel(SplitKDenseGemmKernel):
     ):
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
         cute.arch.mbarrier_wait(bar_tmem_alloc, 0)
+        _fence_tcgen05()
         acc_view = cute.make_tensor(
             cute.arch.retrieve_tmem_ptr(self.acc_dtype, 16, tmem_base_ptr),
             acc_layout,
@@ -484,8 +487,10 @@ class SplitKArPushGemmKernel(SplitKDenseGemmKernel):
         thr_t2r = tiled_copy_t2r.get_slice(epi_tid)
 
         cute.arch.mbarrier_wait(bar_mma_epilog, 0)
+        _fence_tcgen05()
         cute_ext.partition_and_copy(thr_t2r, acc_view, rAcc)
         cute.arch.fence_view_async_tmem_load()
+        _fence_tcgen05(before=True)
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
 
         if cutlass.const_expr(self.split_k > 1):
@@ -510,7 +515,7 @@ class SplitKArPushGemmKernel(SplitKDenseGemmKernel):
                     cute.arch.mbarrier_arrive_and_expect_tx(
                         bar_reduce, self.expected_transaction_bytes
                     )
-                cute.arch.mbarrier_wait(bar_reduce, 0)
+                _wait_cluster(bar_reduce, Int32(0))
                 for peer in cutlass.range_constexpr(self.split_k - 1):
                     for value_idx in cutlass.range_constexpr(values_per_thread):
                         rAcc[value_idx] = (

@@ -170,18 +170,29 @@ def test_executor_pin_moves_the_other_threads(monkeypatch):
     assert calls == [(555, frozenset({4}))]
 
 
-def test_before_overlap_loop_sets_the_switch_interval(monkeypatch):
-    monkeypatch.setattr(runtime.ExecutorThreadPin, "create", classmethod(lambda cls: None))
+def test_overlap_loops_restore_the_switch_interval_after_the_last_exit(monkeypatch):
+    pin_calls = []
+    monkeypatch.setattr(
+        runtime.ExecutorThreadPin, "create", classmethod(lambda cls: pin_calls.append(True))
+    )
     previous = sys.getswitchinterval()
+    events = runtime.StepShellEvents()
+    unpinned = runtime.StepShellEvents(pin_executor=False)
     try:
-        events = runtime.StepShellEvents()
         events.before_overlap_loop()
+        unpinned.before_overlap_loop()
+        assert pin_calls == [True]
         # CPython keeps the interval in whole microseconds (200e-6 reads back as 199e-6).
         assert round(sys.getswitchinterval() * 1e6) in (199, 200)
         events.on_iteration(runtime.PIN_REFRESH_ITERS)  # no pin: only the fold counters
         events.after_warmup()
         events.at_shutdown()
+        assert round(sys.getswitchinterval() * 1e6) in (199, 200)
+        unpinned.at_shutdown()
+        assert abs(sys.getswitchinterval() - previous) < 2e-6
     finally:
+        events.at_shutdown()
+        unpinned.at_shutdown()
         sys.setswitchinterval(previous)
 
 

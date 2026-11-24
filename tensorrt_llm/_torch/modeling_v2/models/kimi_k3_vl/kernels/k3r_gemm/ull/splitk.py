@@ -30,6 +30,8 @@ from flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk import (
     _store_shared_remote_v4,
 )
 
+from ..low_m_bf16_splitk import _fence_tcgen05, _wait_cluster
+
 CTA_K, ATOM_K = 128, 64  # K per tile; K per 128-byte swizzle atom (one A box)
 
 __all__ = ["SplitKTactic", "SplitKGemm"]
@@ -57,21 +59,6 @@ def _tma_load_evict_first(smem, mbar, tensor_map, k0, row0, *, loc=None, ip=None
     operands = [smem.toint().ir_value(), tensor_map.ir_value(), k0.ir_value()]
     operands += [row0.ir_value(), mbar.toint().ir_value()]
     _asm(code, "r,l,r,r,r", operands, loc, ip)
-
-
-@dsl_user_op
-def _wait_cluster(mbar, phase, *, loc=None, ip=None):
-    """``cute.arch.mbarrier_wait`` at ``.acquire.cluster`` (remote ``st.async``)."""
-    code = "{ .reg .pred P1; LAB_WAIT: "
-    code += "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 P1, [$0], $1, "
-    code += "10000000; @P1 bra.uni DONE; bra.uni LAB_WAIT; DONE: }"
-    _asm(code, "r,r", [mbar.toint().ir_value(), phase.ir_value()], loc, ip)
-
-
-@dsl_user_op
-def _fence_tcgen05(*, before=False, loc=None, ip=None):
-    side = "before" if before else "after"
-    _asm(f"tcgen05.fence::{side}_thread_sync;", "", [], loc, ip)
 
 
 def _smem(dtype, size, alignment, layout=None):

@@ -318,6 +318,40 @@ def _store_shared_remote_v4(
     )
 
 
+@dsl_user_op
+def _wait_cluster(mbar: cute.Pointer, phase: Int32, *, loc=None, ip=None) -> None:
+    """Wait for a peer's remote st.async transaction at cluster scope."""
+    llvm.inline_asm(
+        None,
+        [mbar.toint(loc=loc, ip=ip).ir_value(), phase.ir_value()],
+        "{ .reg .pred P1; LAB_WAIT: "
+        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 P1, [$0], $1, "
+        "10000000; @P1 bra.uni DONE; bra.uni LAB_WAIT; DONE: }",
+        "r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _fence_tcgen05(*, before: bool = False, loc=None, ip=None) -> None:
+    side = "before" if before else "after"
+    llvm.inline_asm(
+        None,
+        [],
+        f"tcgen05.fence::{side}_thread_sync;",
+        "",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
 #: Rank that gathers partials and stores the output.
 OWNER_RANK = 0
 
@@ -642,6 +676,7 @@ class SplitKDenseGemmKernel:
     ):
         num_tmem_cols = 256
         cute.arch.alloc_tmem(num_tmem_cols, tmem_base_ptr, is_two_cta=False)
+        _fence_tcgen05(before=True)
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
         cute.arch.relinquish_tmem_alloc_permit(is_two_cta=False)
 
@@ -652,6 +687,7 @@ class SplitKDenseGemmKernel:
         for k_tile in cutlass.range(k_tile_count, unroll=1):
             stage = k_tile % self.num_ab_stage
             cute.arch.mbarrier_wait(bar_full + stage, full_phase)
+            _fence_tcgen05()
             for k_block in range(mma_inst_tile_k):
                 if k_block == 0:
                     mma_atom.set(tcgen05.Field.ACCUMULATE, k_tile != 0)
@@ -670,8 +706,11 @@ class SplitKDenseGemmKernel:
 
         with cute.arch.elect_one():
             tcgen05.commit(bar_mma_epilog, None, self.cta_group)
+        # The release arrival belongs to phase one, after all pointer consumers have arrived.
+        cute.arch.mbarrier_wait(bar_tmem_alloc, 0)
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
         cute.arch.mbarrier_wait(bar_tmem_alloc, 1)
+        _fence_tcgen05()
         cute.arch.dealloc_tmem(tmem_ptr, num_tmem_cols, is_two_cta=False)
 
     @cute.experimental.jit
@@ -694,6 +733,7 @@ class SplitKDenseGemmKernel:
         # Wait until MMA publishes the TMEM base pointer.
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
         cute.arch.mbarrier_wait(bar_tmem_alloc, 0)
+        _fence_tcgen05()
 
         acc_view = cute.make_tensor(
             cute.arch.retrieve_tmem_ptr(self.acc_dtype, 16, tmem_base_ptr),
@@ -757,9 +797,11 @@ class SplitKDenseGemmKernel:
                 rBiasAcc.store(rBias.load().to(self.acc_dtype))
 
         cute.arch.mbarrier_wait(bar_mma_epilog, 0)
+        _fence_tcgen05()
         cute_ext.partition_and_copy(thr_t2r, acc_view, rAcc)
         # Make tcgen05.ld visible before TMEM release and RMEM use.
         cute.arch.fence_view_async_tmem_load()
+        _fence_tcgen05(before=True)
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
 
         # Peers publish FP32 partials; only rank 0 reduces and stores.
@@ -788,7 +830,7 @@ class SplitKDenseGemmKernel:
                     cute.arch.mbarrier_arrive_and_expect_tx(
                         bar_reduce, self.expected_transaction_bytes
                     )
-                cute.arch.mbarrier_wait(bar_reduce, 0)
+                _wait_cluster(bar_reduce, Int32(0))
                 for peer in cutlass.range_constexpr(self.split_k - 1):
                     for value_idx in cutlass.range_constexpr(values_per_thread):
                         rAcc[value_idx] = (
