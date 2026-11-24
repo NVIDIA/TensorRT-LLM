@@ -250,7 +250,7 @@ class LocalityDomainExecutor:
 
 
 class _Bound:
-    def __init__(self, x, lengths, output, n, cr, rows, sms, sm):
+    def __init__(self, x, lengths, output, n, cr, rows, sms, sm, next_n):
         self.workspace = torch.zeros(gvr.workspace_bytes(), device=x.device, dtype=torch.uint8)
         self.logits, self.lengths, self.output = x, lengths, output
         compile_guard = gvr._COMPILE_LOCK_16BIT if x.dtype != torch.float32 else nullcontext()
@@ -260,7 +260,7 @@ class _Bound:
                 x.shape[1],
                 output.shape[1],
                 n,
-                1,
+                next_n,
                 cr,
                 sms,
                 sm,
@@ -362,7 +362,8 @@ class PreparedRowTopK:
     Retain allocations and the executor until the graphs are destroyed. Values and
     lengths may change while the addresses and row ownership stay fixed.
     ``mode`` reports the selected execution path.
-    Lengths are uncompressed token counts. Only ``next_n=1`` is supported.
+    Each request supplies one uncompressed KV length for its ``next_n`` consecutive
+    logits rows, as in ``run_varlen``. Domain splits must fall between requests.
     """
 
     def __init__(
@@ -372,6 +373,7 @@ class PreparedRowTopK:
         indices,
         *,
         max_seq_len,
+        next_n=1,
         compress_ratio=1,
         row_counts=None,
         co_local=False,
@@ -387,6 +389,7 @@ class PreparedRowTopK:
                 kv_lens,
                 indices,
                 max_seq_len=max_seq_len,
+                next_n=next_n,
                 compress_ratio=compress_ratio,
                 row_counts=row_counts,
                 co_local=co_local,
@@ -408,6 +411,7 @@ class PreparedRowTopK:
         indices,
         *,
         max_seq_len,
+        next_n,
         compress_ratio,
         row_counts,
         co_local,
@@ -430,8 +434,13 @@ class PreparedRowTopK:
             raise ValueError("Logits must be FP32, FP16 or BF16")
         if indices.dtype != torch.int32 or kv_lens.dtype != torch.int32:
             raise ValueError("Output and lengths must be int32")
-        if kv_lens.shape != (rows,) or indices.shape != (rows, k):
-            raise ValueError("Lengths and output must match logits rows")
+        next_n = operator.index(next_n)
+        if next_n < 1 or rows % next_n:
+            raise ValueError("next_n must be positive and divide the number of logits rows")
+        if kv_lens.shape != (rows // next_n,):
+            raise ValueError("kv_lens must contain one length per request")
+        if indices.shape != (rows, k):
+            raise ValueError("Output must match logits rows")
         if not kv_lens.is_contiguous() or not indices.is_contiguous() or logits.stride(1) != 1:
             raise ValueError("Lengths/output must be contiguous, and logits columns contiguous")
         if indices.data_ptr() % 16:
@@ -472,7 +481,7 @@ class PreparedRowTopK:
         self.locality_allocation = verified is not None
         choice = (
             choose_locality(logits.dtype, k, max_seq_len, rows, sms, sm)
-            if self.locality_allocation
+            if counts is not None and all(count % next_n == 0 for count in counts)
             else None
         )
         if choice is not None and counts is not None:
@@ -518,13 +527,14 @@ class PreparedRowTopK:
                                     break
                             bound = _Bound(
                                 x[offset : offset + count],
-                                kv_lens[offset : offset + count],
+                                kv_lens[offset // next_n : (offset + count) // next_n],
                                 indices[offset : offset + count],
                                 max_seq_len,
                                 compress_ratio,
                                 rows,
                                 sms,
                                 sm,
+                                next_n,
                             )
                             if plan is None:
                                 # Check the final cluster size after native dispatch overrides.
@@ -557,6 +567,7 @@ class PreparedRowTopK:
                         rows,
                         sms,
                         sm,
+                        next_n,
                     ),
                     None,
                 )

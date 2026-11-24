@@ -191,11 +191,19 @@ def _check_replay(
     cr: int = 1,
     *,
     replay_lengths: list[int] | None = None,
+    next_n: int = 1,
 ) -> None:
+    def row_lengths(request_lengths):
+        return [
+            max(0, (length - next_n + token + 1) // cr)
+            for length in request_lengths
+            for token in range(next_n)
+        ]
+
     original = x.clone()
     call()
     torch.cuda.synchronize()
-    _check_exact(x, out, [n] * len(x))
+    _check_exact(x, out, row_lengths([n * cr] * len(lengths)))
     assert torch.equal(x, original)
     graph = torch.cuda.CUDAGraph()
     try:
@@ -203,17 +211,19 @@ def _check_replay(
             call()
         # Replay once with the prepared envelope, then with changed scores and lengths.
         for step in range(2):
-            valid = [n] * len(x)
+            request_lengths = [n] * len(lengths)
             if step == 1:
-                valid = (
+                request_lengths = (
                     replay_lengths
                     if replay_lengths is not None
                     else [
                         (0, out.shape[1] - 3, out.shape[1] + 3, n - 11)[r % 4]
-                        for r in range(len(x))
+                        for r in range(len(lengths))
                     ]
                 )
-            lengths.copy_(torch.tensor(valid, dtype=torch.int32, device=x.device) * cr)
+            totals = [v * cr for v in request_lengths]
+            lengths.copy_(torch.tensor(totals, dtype=torch.int32, device=x.device))
+            valid = row_lengths(totals)
             x.copy_(original if step == 0 else -original)
             for row, count in enumerate(valid):
                 x[row, count:] = float("inf")
@@ -250,6 +260,39 @@ def test_rubin_gvr_graph_exactness(dtype: torch.dtype, k: int, rows: int, n: int
         n,
         cr,
     )
+
+
+@pytest.mark.parametrize("next_n", [1, 3, 5])
+@_rubin_gpu
+def test_rubin_gvr_prepared_next_n_graph(next_n: int) -> None:
+    # Keep the logits shape fixed while changing how rows are grouped into requests.
+    rows, n, k = 15, 2048, 512
+    x = torch.empty((rows, n), dtype=torch.float32, device="cuda")
+    _fill(x, n)
+    lengths = torch.full((rows // next_n,), n, dtype=torch.int32, device=x.device)
+    out = torch.empty((rows, k), dtype=torch.int32, device=x.device)
+    prepared = locality.PreparedRowTopK(x, lengths, out, next_n=next_n, max_seq_len=n)
+    try:
+        _check_replay(prepared, x, lengths, out, n, next_n=next_n)
+    finally:
+        prepared.close()
+
+
+@pytest.mark.parametrize("dtype,next_n,cr", [(torch.float16, 2, 1), (torch.bfloat16, 5, 4)])
+@_rubin_gpu
+def test_rubin_gvr_prepared_mtp_graph(dtype, next_n, cr):
+    batch, n, k = 4, 8192, 512
+    x = torch.empty((batch * next_n, n), dtype=dtype, device="cuda")
+    _fill(x, n)
+    lengths = torch.full((batch,), n * cr, dtype=torch.int32, device=x.device)
+    out = torch.empty((len(x), k), dtype=torch.int32, device=x.device)
+    prepared = locality.PreparedRowTopK(
+        x, lengths, out, next_n=next_n, max_seq_len=n * cr, compress_ratio=cr
+    )
+    try:
+        _check_replay(prepared, x, lengths, out, n, cr, next_n=next_n)
+    finally:
+        prepared.close()
 
 
 @pytest.mark.parametrize("k,rows,n", [(512, 1, 8195), (2048, 16, 8207)])
@@ -348,24 +391,31 @@ def test_rubin_gvr_output_alignment_graph() -> None:
         prepared.close()
 
 
-@pytest.mark.parametrize("dtype", _DTYPES)
-@pytest.mark.parametrize("k", [512, 1024, 2048])
+@pytest.mark.parametrize(
+    "dtype,k,next_n",
+    [(dtype, k, 1) for dtype in _DTYPES for k in (512, 1024, 2048)] + [(torch.float32, 1024, 3)],
+)
 @_rubin_gpu
 def test_rubin_gvr_locality_graph(
-    dtype: torch.dtype, k: int, domain_executor: locality.LocalityDomainExecutor
+    dtype: torch.dtype, k: int, next_n: int, domain_executor: locality.LocalityDomainExecutor
 ) -> None:
     """Full-batch planning and per-domain workspaces survive graph replay."""
     rows, n = max(512, (512 * domain_executor.physical_sm_count + 207) // 208), 131075
+    if next_n > 1:
+        weights = [domain.sm_count for domain in domain_executor.domains]
+        multiple = next_n * sum(weights) // gcd(*weights)
+        rows = (rows + multiple - 1) // multiple * multiple
     cr = 1 if k == 2048 else 4
     with _localized_rows(rows, n, dtype, domain_executor) as (x, counts):
         _fill(x, n)
-        lengths = torch.full((rows,), n * cr, dtype=torch.int32, device="cuda")
+        lengths = torch.full((rows // next_n,), n * cr, dtype=torch.int32, device="cuda")
         out = torch.empty((rows, k), dtype=torch.int32, device="cuda")
         prepared = locality.PreparedRowTopK(
             x,
             lengths,
             out,
             max_seq_len=n * cr,
+            next_n=next_n,
             compress_ratio=cr,
             co_local=True,
             row_counts=counts,
@@ -374,7 +424,7 @@ def test_rubin_gvr_locality_graph(
         try:
             if counts is None:
                 assert prepared.mode == "tuned" and prepared.executor is None
-                _check_replay(prepared, x, lengths, out, n, cr)
+                _check_replay(prepared, x, lengths, out, n, cr, next_n=next_n)
                 return
             assert prepared.locality_allocation and prepared.mode == "local_preserve"
             assert len(prepared.parts) == sum(c > 0 for c in counts)
@@ -383,7 +433,7 @@ def test_rubin_gvr_locality_graph(
                 x.shape[1],
                 k,
                 n,
-                1,
+                next_n,
                 cr,
                 domain_executor.physical_sm_count,
                 107,
@@ -391,7 +441,7 @@ def test_rubin_gvr_locality_graph(
                 device_index=x.get_device(),
             )
             assert all(bound.launcher is plan for _, bound, _ in prepared.parts)
-            _check_replay(prepared, x, lengths, out, n, cr)
+            _check_replay(prepared, x, lengths, out, n, cr, next_n=next_n)
         finally:
             prepared.close()
         assert not domain_executor.closed  # Caller-owned resources outlive a prepared call.
@@ -1035,14 +1085,42 @@ def test_rubin_gvr_preserves_full_batch_plan(
         locality._Domain(i, count, Mock(), Mock(), Mock()) for i, count in enumerate(budgets)
     ]
     monkeypatch.setattr(locality, "_allocation_rows", lambda *_: counts)
+    lengths = lengths[:4]
     prepared = locality.PreparedRowTopK(
-        x, lengths, output, max_seq_len=32, executor=executor, co_local=True
+        x, lengths, output, next_n=2, max_seq_len=32, executor=executor, co_local=True
     )
     assert prepared.mode == "local_preserve"
     assert [call.args[0].shape[0] for call in bound.call_args_list] == list(counts)
-    assert all(call.args[5:8] == (8, 208, 107) for call in bound.call_args_list)
+    assert all(call.args[5:] == (8, 208, 107, 2) for call in bound.call_args_list)
+    offset = 0
+    for binding, count in zip(bound.call_args_list, counts):
+        assert binding.args[1].data_ptr() == lengths[offset // 2 :].data_ptr()
+        assert len(binding.args[1]) == count // 2
+        offset += count
     prepared.close()
     assert not executor.closed
+
+
+def test_rubin_gvr_mtp_split_request(host_preparation, monkeypatch):
+    x, lengths, output, bound = host_preparation
+    monkeypatch.setattr(locality, "_allocation_rows", lambda *_: (3, 5))
+    make_executor = Mock()
+    monkeypatch.setattr(locality, "LocalityDomainExecutor", make_executor)
+    lengths = lengths[:4]
+    prepared = locality.PreparedRowTopK(x, lengths, output, next_n=2, max_seq_len=32, co_local=True)
+    assert prepared.locality_allocation and prepared.mode == "tuned"
+    make_executor.assert_not_called()
+    assert bound.call_count == 1 and bound.call_args.args[1] is lengths
+    assert bound.call_args.args[-1] == 2
+    prepared.close()
+
+
+@pytest.mark.parametrize("next_n,length_count", [(0, 8), (3, 2), (2, 8)])
+def test_rubin_gvr_invalid_request_shape(host_preparation, next_n, length_count):
+    x, lengths, output, bound = host_preparation
+    with pytest.raises(ValueError, match="next_n|one length per request"):
+        locality.PreparedRowTopK(x, lengths[:length_count], output, next_n=next_n, max_seq_len=32)
+    bound.assert_not_called()
 
 
 @pytest.mark.parametrize("capturing", [False, True])
