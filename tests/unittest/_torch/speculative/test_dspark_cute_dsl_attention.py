@@ -326,11 +326,20 @@ def test_fused_dsv4_dspark_attention_cuda_graph_replay(heads, page_size, batch_r
     ends = (17, 65, 127, 128, 129, 193, 255)
     if page_size == 128:
         ends += tuple(range(256, 384))
+    full_tables = inputs["block_tables"][:2].clone()
     for end in ends:
         inputs["positions"][:2].copy_(torch.tensor([end, end + 1], device="cuda"))
         lengths = [128 if end >= 256 else 127, 1, 128]
         inputs["valid_lengths"].copy_(torch.tensor(lengths * batch_repeats, device="cuda"))
-        inputs["block_tables"][:2].copy_(inputs["block_tables"][:2].roll(1, dims=1))
+        inputs["block_tables"][:2].copy_(full_tables.roll(end, dims=1))
+        if page_write:
+            # Native PRIVATE tables retain only the live window; capacity is
+            # the addressable table extent, including unmapped columns.
+            for row, position in enumerate((end, end + 1)):
+                first = max(0, position - min(128, lengths[row])) // page_size
+                last = (position + page_size - 1) // page_size
+                inputs["block_tables"][row, :first] = -1
+                inputs["block_tables"][row, last:] = -1
         inputs["kv_pages"].normal_()
         block_x.normal_()
         block_phases = freqs[inputs["positions"][:, None] + 1 + torch.arange(6, device="cuda")]

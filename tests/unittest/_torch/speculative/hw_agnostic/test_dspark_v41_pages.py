@@ -9,6 +9,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from tensorrt_llm._torch.pyexecutor import device_copy
 from tensorrt_llm._torch.speculative.dspark_v41 import DSv41DSparkWorker
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX, ReusePolicy
 
@@ -41,7 +42,6 @@ def test_context_worker_rebinds_managed_pages_without_draft_decode():
         _draft_page_versions={0: object()},
         _draft_prepared_batch=object(),
         _draft_page_indices={0: (0, (1,))},
-        _draft_page_capacities={0: 128},
         _managed_residency={42: object()},
         _uploaded_slots=(0,),
         _uploaded_capacities=(128,),
@@ -162,13 +162,17 @@ def test_unchanged_private_pages_skip_staging_events_and_scratch_resets(monkeypa
 
 
 def test_private_fallback_pages_preserve_execution_order_and_managed_pages_skip_copies(monkeypatch):
+    version_reads = []
+
+    class Cache(SimpleNamespace):
+        def __getattribute__(self, name):
+            if name == "page_storage_version":
+                version_reads.append(name)
+            return super().__getattribute__(name)
+
     caches = {
-        42: SimpleNamespace(
-            history_length=140, page_storage_version=1, num_blocks=2, is_active=True
-        ),
-        43: SimpleNamespace(
-            history_length=268, page_storage_version=1, num_blocks=3, is_active=True
-        ),
+        42: Cache(history_length=140, page_storage_version=1, num_blocks=2, is_active=True),
+        43: Cache(history_length=268, page_storage_version=1, num_blocks=3, is_active=True),
     }
     tables = {id(caches[42]): (0, (7, 8)), id(caches[43]): (1, (9, 10))}
     storage = torch.full((6, 8), BAD_PAGE_INDEX, dtype=torch.int32)
@@ -198,7 +202,6 @@ def test_private_fallback_pages_preserve_execution_order_and_managed_pages_skip_
         _draft_page_versions={},
         _draft_prepared_batch=None,
         _draft_page_indices={},
-        _draft_page_capacities={},
         _draft_metadata_host_buffers=[],
         _draft_updates_device=None,
         _draft_indices_device=None,
@@ -215,6 +218,8 @@ def test_private_fallback_pages_preserve_execution_order_and_managed_pages_skip_
     worker._clear_slot = DSv41DSparkWorker._clear_slot.__get__(worker)
     gather = Mock(wraps=torch.index_select)
     monkeypatch.setattr(torch, "index_select", gather)
+    upload = Mock(wraps=device_copy.copy)
+    monkeypatch.setattr(device_copy, "copy", upload)
     DSv41DSparkWorker._prepare_page_tables(worker, [42, 43], 0)
     assert worker._draft_block_tables[0, :2].tolist() == [7, 8]
     assert worker._draft_block_tables[1, 1:3].tolist() == [9, 10]
@@ -252,24 +257,31 @@ def test_private_fallback_pages_preserve_execution_order_and_managed_pages_skip_
     assert worker._draft_page_indices[1] == (1, (10,))
 
     # Once target preparation published this execution order, draft generation
-    # only updates its row state and capacities, including a native page change.
+    # uses its addressable extent without uploading per-request block growth.
     worker._draft_kv_manager.draft_page_table_prepared = lambda _: True
     snapshot = [None]
     worker._draft_kv_manager.draft_page_table_state = lambda: snapshot[0]
     calls, gathers = worker._page_indices.call_count, gather.call_count
+    native_uploads = None
     for blocks in (2, 3, 3):
         caches[43].num_blocks = blocks
         caches[43].page_storage_version += 1
         snapshot[0] = object()
+        version_reads.clear()
         DSv41DSparkWorker._prepare_page_tables(worker, [43], 0)
-        assert worker._draft_capacities.tolist() == [blocks * 256, 0, 0]
+        assert not version_reads
+        assert worker._draft_capacities.tolist() == [8 * 256, 0, 0]
+        if native_uploads is None:
+            native_uploads = upload.call_count
+        else:
+            assert upload.call_count == native_uploads
         # The target's unchanged snapshot also covers the slot and capacity
         # metadata. Reading native properties again would duplicate its work.
         with monkeypatch.context() as patch:
             patch.setattr(worker._draft_kv_manager, "kv_cache_map", {})
             DSv41DSparkWorker._prepare_page_tables(worker, [43], 0)
         assert worker._batch_to_slot.tolist() == [1, 2, 2]
-        assert worker._draft_capacities.tolist() == [blocks * 256, 0, 0]
+        assert worker._draft_capacities.tolist() == [8 * 256, 0, 0]
     assert worker._page_indices.call_count == calls
     assert gather.call_count == gathers
     # A different request still needs its own slot even if it aliases the

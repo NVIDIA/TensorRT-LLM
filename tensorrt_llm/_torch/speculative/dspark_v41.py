@@ -34,7 +34,6 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
         self._draft_capacities = None
         self._draft_page_versions = {}
         self._draft_page_indices = {}
-        self._draft_page_capacities = {}
         self._draft_prepared_batch = None
         self._managed_residency = {}
         self._draft_metadata_host_buffers = []
@@ -101,7 +100,6 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
             )
             self._draft_page_versions.clear()
             self._draft_page_indices.clear()
-            self._draft_page_capacities.clear()
             self._draft_prepared_batch = None
             self._managed_residency.clear()
             self._uploaded_slots = None
@@ -179,6 +177,9 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
         slots = [self._scratch_slot] * len(request_ids)
         updates = []
         capacities = [0] * self._draft_capacities.shape[0]
+        # Unmapped native pages are BAD_PAGE_INDEX. The published table's fixed
+        # width bounds addressing; zero capacities keep synthetic rows masked.
+        native_capacity = table.shape[1] * manager.tokens_per_block if managed else 0
         for row in real_rows:
             rid = request_ids[row]
             cache = manager.kv_cache_map[rid]
@@ -186,35 +187,30 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
             if slot is None:
                 slot = self._assign_slot(rid, reset=False)
             slots[row] = slot
-            previous = self._draft_page_versions.get(slot)
-            page_version = cache.page_storage_version
-            # A page-sized window moves only at a history-block boundary, which
-            # the native storage version already tracks alongside page changes.
             if managed:
-                version = (cache, page_version, True)
-            elif (
-                versioned_window
-                and previous is not None
-                and previous[0] is cache
-                and previous[1] == page_version
-                and previous[-1] is False
-            ):
-                version = previous
+                capacities[row] = native_capacity
             else:
-                first = max(0, cache.history_length - self._win) // manager.tokens_per_block
-                version = (cache, page_version, first, cache.num_blocks, row < num_contexts)
-            if previous != version:
-                if managed:
-                    self._draft_page_capacities[slot] = cache.num_blocks * manager.tokens_per_block
+                previous = self._draft_page_versions.get(slot)
+                page_version = cache.page_storage_version
+                # A page-sized window moves only at a history-block boundary,
+                # which the native storage version tracks alongside page changes.
+                if (
+                    versioned_window
+                    and previous is not None
+                    and previous[0] is cache
+                    and previous[1] == page_version
+                    and previous[-1] is False
+                ):
+                    version = previous
                 else:
+                    first = max(0, cache.history_length - self._win) // manager.tokens_per_block
+                    version = (cache, page_version, first, cache.num_blocks, row < num_contexts)
+                if previous != version:
                     table = self._page_indices(cache, row < num_contexts)
                     if self._draft_page_indices.get(slot) != table:
                         updates.append((slot, row, *table))
                         self._draft_page_indices[slot] = table
-                self._draft_page_versions[slot] = version
-            if managed:
-                capacities[row] = self._draft_page_capacities[slot]
-            else:
+                    self._draft_page_versions[slot] = version
                 first, indices = self._draft_page_indices[slot]
                 capacities[row] = (first + len(indices)) * manager.tokens_per_block
             if self._managed_residency.get(rid) is not cache:
