@@ -9,30 +9,10 @@ import triton
 import triton.language as tl
 
 _LOG2E = math.log2(math.e)
-_FP16SM_K_SHIFT_SCALE = 32.0
+_QK_STATIC_DESCALE_128 = math.sqrt(1.0 / ((128.0**-0.5) * _LOG2E))
 # Bounded O(1) per-(device, stream) scratch cache: retains at most one shape per stream.
 _U4_SCRATCH: dict[tuple[torch.device, int], tuple[tuple[int, int], dict[str, torch.Tensor]]] = {}
-_U1_SCRATCH: dict[tuple[torch.device, int], tuple[tuple[int, int], dict[str, torch.Tensor]]] = {}
-
-
-def complementary_fp16sm_descales(
-    dyn_descales: torch.Tensor,
-    *,
-    head_dim: int = 128,
-    k_shift_scale: float = _FP16SM_K_SHIFT_SCALE,
-) -> torch.Tensor:
-    """Fold ``sm_scale * log2(e)`` into dynamic Q/K descales with a power-of-two K shift."""
-    product = 1.0 / ((head_dim**-0.5) * _LOG2E)
-    s_q = dyn_descales[0]
-    s_k = dyn_descales[1]
-    s_v = dyn_descales[2].bfloat16().float()
-    # Keep max|Q/dq| >= 0.125 (8x above E4M3 subnormal) so tiny K cannot round Q to zero,
-    # while leaving normal H3 layers on the exact power-of-two 32 * s_k mantissa grid.
-    dk_lo = (product / (3584.0 * s_q)).clamp(min=1e-4)
-    dk_hi = (product / s_q).clamp(min=dk_lo, max=product * 1e4)
-    dk = (k_shift_scale * s_k).clamp(min=dk_lo, max=dk_hi)
-    dq = product / dk
-    return torch.stack([dq, dk, s_v])
+_QKSTATIC_SCRATCH: dict[tuple[torch.device, int], tuple[int, dict[str, torch.Tensor]]] = {}
 
 
 @triton.jit
@@ -258,9 +238,6 @@ def qk_norm_rope_pack_qkv(
     *,
     tokens_per_program: int = 1,
     num_warps: int = 1,
-    gen_fp16sm: bool = False,
-    k_shift_scale: float = _FP16SM_K_SHIFT_SCALE,
-    symm_amax=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run fused BF16 QK-norm + RoPE with atomic-free local maxima, global MAX, and FP8 pack."""
     rows = qkv.shape[1]
@@ -306,22 +283,12 @@ def qk_norm_rope_pack_qkv(
         num_warps=num_warps,
     )
     _v_partial_maxima[(v_tiles,)](v_view, partials_v, valid_rows, v_view.stride()[1:3], 8192, num_warps=8)
-    if symm_amax is not None:
-        symmetric, local = symm_amax.begin()
-        _final_maxima[(2,)](partials_qk, local, qk_tiles, triton.next_power_of_2(qk_tiles), num_warps=8)
-        _final_maxima[(1,)](partials_v, local[2:3], v_tiles, triton.next_power_of_2(v_tiles), num_warps=8)
-        gathered = symm_amax.gather(symmetric)
-        maxima = gathered[:, :3].amax(dim=0)
-    else:
-        maxima = sc["maxima"]
-        _final_maxima[(2,)](partials_qk, maxima, qk_tiles, triton.next_power_of_2(qk_tiles), num_warps=8)
-        _final_maxima[(1,)](partials_v, maxima[2:3], v_tiles, triton.next_power_of_2(v_tiles), num_warps=8)
-        torch.distributed.all_reduce(maxima, op=torch.distributed.ReduceOp.MAX, group=group)
+    maxima = sc["maxima"]
+    _final_maxima[(2,)](partials_qk, maxima, qk_tiles, triton.next_power_of_2(qk_tiles), num_warps=8)
+    _final_maxima[(1,)](partials_v, maxima[2:3], v_tiles, triton.next_power_of_2(v_tiles), num_warps=8)
+    torch.distributed.all_reduce(maxima, op=torch.distributed.ReduceOp.MAX, group=group)
     dyn = (maxima.float() / 448.0).clamp_min(1.0 / (448.0 * 512.0))
-    if gen_fp16sm:
-        descales = complementary_fp16sm_descales(dyn, head_dim=128, k_shift_scale=k_shift_scale)
-    else:
-        descales = dyn.bfloat16().float()
+    descales = dyn.bfloat16().float()
     strides = tuple(t.stride()[1:3] for t in (q_buf, k_buf, v_view))
     send = sc["send"]
     _pack[(triton.cdiv(rows, 4), 4, 3)](
@@ -330,64 +297,27 @@ def qk_norm_rope_pack_qkv(
     return send.view(torch.float8_e4m3fn), descales
 
 
-@triton.jit
-def _quant_u1_plane(
-    q_ptr,
-    k_ptr,
-    v_ptr,
-    descales_ptr,
-    out_q_ptr,
-    out_k_ptr,
-    out_v_ptr,
-    rows,
-    qs: tl.constexpr,
-    ks: tl.constexpr,
-    vs: tl.constexpr,
-):
-    row = tl.program_id(0) * 4 + tl.arange(0, 4)
-    plane = tl.program_id(1)
-    head = tl.program_id(2) * 8 + tl.arange(0, 8)
-    dim = tl.arange(0, 128)
-    mask = row[:, None, None] < rows
-    if plane == 0:
-        src = tl.load(q_ptr + row[:, None, None] * qs[0] + head[None, :, None] * qs[1] + dim[None, None, :], mask, 0)
-        dst = out_q_ptr
-    elif plane == 1:
-        src = tl.load(k_ptr + row[:, None, None] * ks[0] + head[None, :, None] * ks[1] + dim[None, None, :], mask, 0)
-        dst = out_k_ptr
-    else:
-        src = tl.load(v_ptr + row[:, None, None] * vs[0] + head[None, :, None] * vs[1] + dim[None, None, :], mask, 0)
-        dst = out_v_ptr
-    factor = 1.0 / tl.load(descales_ptr + plane)
-    val = tl.clamp(src.to(tl.float32) * factor, -448.0, 448.0).to(tl.float8e4nv)
-    out_off = row[:, None, None] * (56 * 128) + head[None, :, None] * 128 + dim[None, None, :]
-    tl.store(dst + out_off, val.to(tl.uint8, bitcast=True), mask)
-
-
-def _get_u1_scratch(rows: int, tokens_per_program: int, device: torch.device) -> dict[str, torch.Tensor]:
+def _get_qkstatic_scratch(rows: int, device: torch.device) -> dict[str, torch.Tensor]:
     skey = _stream_key(device)
-    shape_key = (rows, tokens_per_program)
-    cached = _U1_SCRATCH.get(skey)
-    if cached is not None and cached[0] == shape_key:
+    cached = _QKSTATIC_SCRATCH.get(skey)
+    if cached is not None and cached[0] == rows:
         return cached[1]
-    t_blocks = triton.cdiv(rows, tokens_per_program)
-    qk_tiles = t_blocks * (56 // 8)
     v_tiles = max(1, triton.cdiv(rows * 56 * 128, 8192))
     sc = {
-        "q_buf": torch.empty((1, rows, 56, 128), dtype=torch.bfloat16, device=device),
-        "k_buf": torch.empty((1, rows, 56, 128), dtype=torch.bfloat16, device=device),
-        "partials_qk": torch.empty((2, qk_tiles), dtype=torch.int32, device=device),
         "partials_v": torch.empty((v_tiles,), dtype=torch.int32, device=device),
-        "maxima": torch.empty((3,), dtype=torch.float32, device=device),
-        "q8": torch.empty((1, rows, 56, 128), dtype=torch.uint8, device=device),
-        "k8": torch.empty((1, rows, 56, 128), dtype=torch.uint8, device=device),
-        "v8": torch.empty((1, rows, 56, 128), dtype=torch.uint8, device=device),
+        "v_max": torch.empty((1,), dtype=torch.float32, device=device),
+        "scales": torch.tensor(
+            [_QK_STATIC_DESCALE_128, _QK_STATIC_DESCALE_128, 1.0],
+            dtype=torch.float32,
+            device=device,
+        ),
+        "send": torch.empty((4, rows, 3, 14, 128), dtype=torch.float8_e4m3fn, device=device),
     }
-    _U1_SCRATCH[skey] = (shape_key, sc)
+    _QKSTATIC_SCRATCH[skey] = (rows, sc)
     return sc
 
 
-def qk_norm_rope_quant_u1_asym(
+def pack_qkstatic_u4(
     qkv: torch.Tensor,
     weight_q: torch.Tensor,
     weight_k: torch.Tensor,
@@ -395,71 +325,93 @@ def qk_norm_rope_quant_u1_asym(
     sin: torch.Tensor,
     eps: float,
     valid_rows: int,
+    group,
     *,
-    tokens_per_program: int = 4,
-    num_warps: int = 4,
-    k_shift_scale: float = _FP16SM_K_SHIFT_SCALE,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Single-GPU QK-norm + RoPE + dynamic complementary FP8 quantization for trtllm-gen-fp16sm."""
+    symm_amax=None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Single-pass static Q/K (folded sm_scale * log2 e) + dynamic V FP8 pack for SM107 U4."""
+    from ..minimax_h3_nvfp4__sm_107__u1_u4.kernels import fused_fp8_qk
+
     rows = qkv.shape[1]
     hd = 56 * 128
-    qkv2 = qkv.contiguous().view(rows, 3 * hd)
-    sc = _get_u1_scratch(rows, tokens_per_program, qkv.device)
-    q_buf, k_buf = sc["q_buf"], sc["k_buf"]
-    v_view = qkv2[:, 2 * hd :].view(1, rows, 56, 128)
-    t_blocks = triton.cdiv(rows, tokens_per_program)
-    h_blocks = 56 // 8
-    qk_tiles = t_blocks * h_blocks
+    rotation = cos.shape[-1]
+    c0, c1, tail = fused_fp8_qk._v2_groups(128, rotation)
+    cos_c, sin_c = cos.contiguous(), sin.contiguous()
+    sc = _get_qkstatic_scratch(rows, qkv.device)
+    send = sc["send"]
+    scales = sc["scales"].clone()
+    v_view = qkv[:, :, 2 * hd :].view(1, rows, 56, 128)
     v_tiles = max(1, triton.cdiv(valid_rows * 56 * 128, 8192))
-    partials_qk = sc["partials_qk"]
     partials_v = sc["partials_v"][:v_tiles]
-    _qk_norm_rope_and_max_kernel[(t_blocks, h_blocks, 2)](
-        qkv2,
-        q_buf,
-        k_buf,
-        partials_qk,
-        weight_q,
-        weight_k,
-        cos,
-        sin,
-        rows,
-        valid_rows,
-        rows,
-        t_blocks,
-        h_blocks,
-        qkv2.stride(0),
-        hd,
-        hd,
-        cos.stride(0),
-        cos.stride(1),
-        sin.stride(0),
-        sin.stride(1),
-        float(eps),
-        HEAD_DIM=128,
-        NUM_CHUNKS=128 // _ROPE_CHUNK,
-        CHUNK=_ROPE_CHUNK,
-        NUM_ROT_HALF_CHUNKS=cos.shape[1] // 2 // _ROPE_CHUNK,
-        TOKENS_PER_PROGRAM=tokens_per_program,
-        HEADS_PER_PROGRAM=8,
-        num_warps=num_warps,
-    )
     _v_partial_maxima[(v_tiles,)](v_view, partials_v, valid_rows, v_view.stride()[1:3], 8192, num_warps=8)
-    maxima = sc["maxima"]
-    _final_maxima[(2,)](partials_qk, maxima, qk_tiles, triton.next_power_of_2(qk_tiles), num_warps=8)
-    _final_maxima[(1,)](partials_v, maxima[2:3], v_tiles, triton.next_power_of_2(v_tiles), num_warps=8)
-    dyn = (maxima.float() / 448.0).clamp_min(1.0 / (448.0 * 512.0))
-    descales = complementary_fp16sm_descales(dyn, head_dim=128, k_shift_scale=k_shift_scale)
-    q8, k8, v8 = sc["q8"], sc["k8"], sc["v8"]
-    strides = tuple(t.stride()[1:3] for t in (q_buf, k_buf, v_view))
-    _quant_u1_plane[(triton.cdiv(rows, 4), 3, 56 // 8)](
-        q_buf, k_buf, v_view, descales, q8, k8, v8, rows, *strides, num_warps=4
+    if symm_amax is not None:
+        symmetric, local = symm_amax.begin()
+        _final_maxima[(1,)](partials_v, local[2:3], v_tiles, triton.next_power_of_2(v_tiles), num_warps=8)
+        gathered = symm_amax.gather(symmetric)
+        v_amax_ptr = gathered.view(-1)[2:]
+        amax_n, amax_stride = 4, 4
+    else:
+        v_max = sc["v_max"]
+        _final_maxima[(1,)](partials_v, v_max, v_tiles, triton.next_power_of_2(v_tiles), num_warps=8)
+        torch.distributed.all_reduce(v_max, op=torch.distributed.ReduceOp.MAX, group=group)
+        v_amax_ptr = v_max
+        amax_n, amax_stride = 1, 1
+    for plane, w in enumerate((weight_q, weight_k)):
+        fused_fp8_qk._tensor_cast_g_kernel[(rows,)](
+            qkv[..., plane * hd : (plane + 1) * hd],
+            w,
+            cos_c,
+            sin_c,
+            scales,
+            scales[plane : plane + 1],
+            send,
+            scales,
+            rows,
+            float(eps),
+            STATIC=True,
+            SAT_COUNT=False,
+            H=56,
+            D=128,
+            ROT=rotation,
+            BLOCK_H=8,
+            ROW_STRIDE=3 * hd,
+            PACKED=True,
+            HL=14,
+            WHICH=plane,
+            C0=c0,
+            C1=c1,
+            TAIL=tail,
+            HALF_EQ=True,
+            num_warps=2,
+        )
+    fused_fp8_qk._tensor_cast_kernel[(rows,)](
+        qkv[..., 2 * hd :],
+        weight_q,
+        cos_c,
+        sin_c,
+        v_amax_ptr,
+        scales[2:3],
+        send,
+        scales,
+        rows,
+        float(eps),
+        NORM_ROPE=False,
+        OUT_FP8=True,
+        STATIC=False,
+        SAT_COUNT=False,
+        H=56,
+        D=128,
+        ROT=rotation,
+        BLOCK_H=8,
+        ROW_STRIDE=3 * hd,
+        PACKED=True,
+        HL=14,
+        WHICH=2,
+        AMAX_N=amax_n,
+        AMAX_STRIDE=amax_stride,
+        num_warps=2,
     )
-    return (
-        q8.view(torch.float8_e4m3fn).flatten(2),
-        k8.view(torch.float8_e4m3fn).flatten(2),
-        v8.view(torch.float8_e4m3fn).flatten(2),
-        descales,
-    )
+    return send, scales
 
 
 def pack_qkv(q, k, v, valid_rows: int, group) -> tuple[torch.Tensor, torch.Tensor]:

@@ -21,25 +21,18 @@ from .output_exchange import (
     exchange_prequantized_fp8_output,
     static_fp8_output_scale,
 )
-from .qkv_exchange import pack_qkv, qk_norm_rope_pack_qkv
+from .qkv_exchange import pack_qkstatic_u4, pack_qkv, qk_norm_rope_pack_qkv
 from .vae_opt import (
     configure_u4_video_vae_post_load,
     configure_u4_video_vae_pre_load,
     install_audio_vae_cuda_graph,
 )
 
-_HYBRID_CUDNN_INITIAL_STEPS = 11
-_HYBRID_DIRECT_FP8_OUT_START_STEP = 20
-_HYBRID_SKIP_CORR_T1_START_STEP = 25
-
 
 class Fp8UlyssesAttention(MiniMaxH3Attention):
     _fp8_output_exchange_enabled: bool = True
     _bf16_output_unpack_enabled: bool = True
     _fused_qk_pack_enabled: bool = True
-    _hybrid_cudnn_initial_steps: int = 11
-    _hybrid_direct_fp8_out_start: int = 20
-    _hybrid_t1_start: int = 25
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -48,18 +41,12 @@ class Fp8UlyssesAttention(MiniMaxH3Attention):
         self._fp8_output_exchange_calls = 0
         self._bf16_output_exchange_calls = 0
         self._fused_qk_pack_calls = 0
-        self._hybrid_gen_backend = None
-        self._hybrid_gen_t1_backend = None
-        self._hybrid_symm_amax = None
-        self._hybrid_direct_fp8_supported = False
-        self._hybrid_step_state = None
-        self._hybrid_cudnn_steps = self._hybrid_cudnn_initial_steps
-        self._hybrid_direct_fp8_steps = self._hybrid_direct_fp8_out_start
-        self._hybrid_t1_steps = self._hybrid_t1_start
+        self._gen_fp16sm_backend = None
+        self._gen_symm_amax = None
+        self._gen_direct_fp8_supported = False
         self._hybrid_cudnn_fmha_calls = 0
         self._hybrid_gen_fmha_calls = 0
         self._hybrid_direct_fp8_out_calls = 0
-        self._hybrid_t1_calls = 0
 
     def _validated_fp8_output_scale(self) -> torch.Tensor | None:
         if not self._fp8_output_exchange_enabled:
@@ -226,13 +213,35 @@ class Fp8UlyssesAttention(MiniMaxH3Attention):
         )
         valid_rows = max(0, min(rows, total - rank * rows))
         cos, sin = rotary_emb
-        step = self._hybrid_step_state["step"] if self._hybrid_step_state is not None else -1
-        use_gen = self._hybrid_gen_backend is not None and step >= self._hybrid_cudnn_steps
-        pack_kwargs = {}
-        if use_gen:
-            pack_kwargs["gen_fp16sm"] = True
-        if self._hybrid_symm_amax is not None:
-            pack_kwargs["symm_amax"] = self._hybrid_symm_amax
+        if self._gen_fp16sm_backend is not None:
+            send, descales = pack_qkstatic_u4(
+                qkv,
+                self.norm_q.weight,
+                self.norm_k.weight,
+                cos,
+                sin,
+                float(self.norm_q.variance_epsilon),
+                valid_rows,
+                self.attn.process_group,
+                symm_amax=self._gen_symm_amax,
+            )
+            self._fused_qk_pack_calls += 1
+            self._hybrid_gen_fmha_calls += 1
+            if self._gen_direct_fp8_supported:
+                out_scale = self._validated_fp8_output_scale()
+                if out_scale is not None:
+                    return self._direct_fp8_packed_exchange(
+                        send,
+                        descales,
+                        out_scale,
+                        rows,
+                        self._gen_fp16sm_backend,
+                        0.0,
+                        **kwargs,
+                    )
+            return self._exchange_packed_output(
+                send, descales, rows, backend=self._gen_fp16sm_backend, **kwargs
+            )
         send, descales = qk_norm_rope_pack_qkv(
             qkv,
             self.norm_q.weight,
@@ -242,32 +251,8 @@ class Fp8UlyssesAttention(MiniMaxH3Attention):
             float(self.norm_q.variance_epsilon),
             valid_rows,
             self.attn.process_group,
-            **pack_kwargs,
         )
         self._fused_qk_pack_calls += 1
-        if use_gen:
-            self._hybrid_gen_fmha_calls += 1
-            use_t1 = step >= self._hybrid_t1_steps
-            if use_t1:
-                self._hybrid_t1_calls += 1
-            if self._hybrid_direct_fp8_supported and step >= self._hybrid_direct_fp8_steps:
-                out_scale = self._validated_fp8_output_scale()
-                if out_scale is not None:
-                    return self._direct_fp8_packed_exchange(
-                        send,
-                        descales,
-                        out_scale,
-                        rows,
-                        self._hybrid_gen_backend,
-                        1.0 if use_t1 else 0.0,
-                        **kwargs,
-                    )
-            backend = (
-                self._hybrid_gen_t1_backend
-                if use_t1 and self._hybrid_gen_t1_backend is not None
-                else self._hybrid_gen_backend
-            )
-            return self._exchange_packed_output(send, descales, rows, backend=backend, **kwargs)
         self._hybrid_cudnn_fmha_calls += 1
         return self._exchange_packed_output(send, descales, rows, **kwargs)
 
@@ -312,23 +297,17 @@ class Fp8UlyssesTransformer(MiniMaxH3Transformer3DModel):
     replicate_token_refiner = True
 
 
-def _initialize_sm107_hybrid_fmha(
-    transformer,
-    *,
-    cudnn_initial_steps: int = _HYBRID_CUDNN_INITIAL_STEPS,
-    direct_fp8_out_start: int = _HYBRID_DIRECT_FP8_OUT_START_STEP,
-    skip_corr_t1_start: int = _HYBRID_SKIP_CORR_T1_START_STEP,
-) -> dict[str, int] | None:
-    """Bind SM107 selective cuDNN (early steps) -> trtllm-gen-fp16sm (late steps) routing."""
+def _initialize_sm107_gen_fmha(transformer) -> bool:
+    """Bind pure SM107 trtllm-gen-fp16sm FMHA + symmetric-memory V amax; SM103 stays on cuDNN."""
     device = transformer.proj_out.weight.device
     if device.type != "cuda" or torch.cuda.get_device_capability(device) != (10, 7):
-        return None
+        return False
     attentions = [block.attn for block in transformer.transformer_blocks]
     if not attentions or not all(isinstance(a, Fp8UlyssesAttention) for a in attentions):
-        return None
+        return False
     stock = attentions[0].attn
     if not isinstance(stock, UlyssesAttention) or stock.world_size != 4:
-        return None
+        return False
     group = stock.process_group
     if any(
         not isinstance(a.attn, UlyssesAttention)
@@ -342,7 +321,7 @@ def _initialize_sm107_hybrid_fmha(
         or a.use_async_ulysses
         for a in attentions
     ):
-        return None
+        return False
     inner = CuDNNAttention(
         num_heads=14,
         num_kv_heads=14,
@@ -353,18 +332,7 @@ def _initialize_sm107_hybrid_fmha(
         fp8_skip_corr_threshold=0.0,
         fp8_strided_views=True,
     )
-    inner_t1 = CuDNNAttention(
-        num_heads=14,
-        num_kv_heads=14,
-        head_dim=128,
-        dtype=torch.bfloat16,
-        quant_attention_config=stock.inner_backend.quant_attention_config,
-        fp8_dense_fmha="trtllm-gen-fp16sm",
-        fp8_skip_corr_threshold=1.0,
-        fp8_strided_views=True,
-    )
     gen_backend = UlyssesAttention(inner, group)
-    gen_t1_backend = UlyssesAttention(inner_t1, group)
     symm_amax = None
     symm_cls = None
     try:
@@ -396,25 +364,15 @@ def _initialize_sm107_hybrid_fmha(
         )
     except (RuntimeError, AttributeError):
         direct_fp8_ok = False
-    step_state = {"step": 0}
     for attention in attentions:
-        attention._hybrid_gen_backend = gen_backend
-        attention._hybrid_gen_t1_backend = gen_t1_backend
-        attention._hybrid_symm_amax = symm_amax
-        attention._hybrid_direct_fp8_supported = direct_fp8_ok
-        attention._hybrid_step_state = step_state
-        attention._hybrid_cudnn_steps = int(cudnn_initial_steps)
-        attention._hybrid_direct_fp8_steps = int(direct_fp8_out_start)
-        attention._hybrid_t1_steps = int(skip_corr_t1_start)
-    transformer.register_forward_hook(
-        lambda _m, _i, _o: step_state.__setitem__("step", step_state["step"] + 1)
-    )
-    return step_state
+        attention._gen_fp16sm_backend = gen_backend
+        attention._gen_symm_amax = symm_amax
+        attention._gen_direct_fp8_supported = direct_fp8_ok
+    return True
 
 
 class MiniMaxH3Fp8U4Pipeline(MiniMaxH3Pipeline):
     def _init_transformer(self) -> None:
-        self._hybrid_step_state: dict[str, int] | None = None
         self.transformer = Fp8UlyssesTransformer(
             self.pipeline_config.model_configs[PipelineComponent.TRANSFORMER]
         )
@@ -423,15 +381,6 @@ class MiniMaxH3Fp8U4Pipeline(MiniMaxH3Pipeline):
         configure_u4_video_vae_pre_load(self.vae, self.device)
         super().post_load_weights()
         initialize_block_ops(self.transformer)
-        self._hybrid_step_state = _initialize_sm107_hybrid_fmha(self.transformer)
+        _initialize_sm107_gen_fmha(self.transformer)
         configure_u4_video_vae_post_load(self.vae, self.device, ulysses_size=4, enable_fp8=True)
         install_audio_vae_cuda_graph(getattr(self, "audio_vae", None), self.device)
-
-    def forward(self, *args, **kwargs):
-        if self._hybrid_step_state is not None:
-            self._hybrid_step_state["step"] = 0
-        try:
-            return super().forward(*args, **kwargs)
-        finally:
-            if self._hybrid_step_state is not None:
-                self._hybrid_step_state["step"] = 0

@@ -259,22 +259,19 @@ def attention_projection(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if raw.shape[-1] != 7168 or raw.numel() // 7168 != hidden.numel() // 5376:
         raise ValueError("Expected matching attention [*,7168] and hidden [*,5376] rows")
-    if raw.dtype == torch.float8_e4m3fn:
-        activation = raw
+    quant, _ = modules_for_device(raw.device.index)
+    if (
+        quant is not None
+        and raw.is_cuda
+        and raw.dtype == torch.bfloat16
+        and raw.is_contiguous()
+        and raw.data_ptr() % 16 == 0
+    ):
+        activation = quant.quantize_config(
+            raw, input_scale, quant_factor, 0, quant.pdl, BLOCKS, THREADS
+        )
     else:
-        quant, _ = modules_for_device(raw.device.index)
-        if (
-            quant is not None
-            and raw.is_cuda
-            and raw.dtype == torch.bfloat16
-            and raw.is_contiguous()
-            and raw.data_ptr() % 16 == 0
-        ):
-            activation = quant.quantize_config(
-                raw, input_scale, quant_factor, 0, quant.pdl, BLOCKS, THREADS
-            )
-        else:
-            activation = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(raw, input_scale)[0]
+        activation = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(raw, input_scale)[0]
     activation = activation.reshape(-1, 7168)
     if projection_residual.supports(
         activation, weight, hidden, modulation, indices, projection_residual.ATTENTION_OUTPUT_GATE
