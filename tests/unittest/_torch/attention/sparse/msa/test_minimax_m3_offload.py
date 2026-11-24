@@ -54,6 +54,8 @@ HEAD_DIM = 128
 TOPK = 16
 BATCH = 4
 SPARSE_LAYERS = (1, 3)
+# MiniMax-M3 keeps some layers dense. MiniMax-M3.1-Flash has none, so every layer is offloaded.
+LAYOUTS = {"mixed": SPARSE_LAYERS, "all_sparse": (0, 1, 2, 3)}
 
 
 @pytest.fixture(autouse=True)
@@ -70,6 +72,7 @@ def _manager(
     *,
     offload: bool = True,
     block_reuse: bool = False,
+    sparse_layers: tuple[int, ...] = SPARSE_LAYERS,
 ) -> MiniMaxM3KVCacheManagerV2:
     return MiniMaxM3KVCacheManagerV2(
         kv_cache_config=KvCacheConfig(
@@ -84,7 +87,7 @@ def _manager(
         max_batch_size=BATCH,
         mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
         dtype=dtype,
-        sparse_layer_ids=SPARSE_LAYERS,
+        sparse_layer_ids=sparse_layers,
         sparse_attention_config=MiniMaxM3SparseAttentionConfig(
             implementation="msa",
             indexer_kv_dtype="fp8",
@@ -96,22 +99,24 @@ def _manager(
     )
 
 
+@pytest.mark.parametrize("layout", list(LAYOUTS))
 @pytest.mark.parametrize("dtype", [DataType.BF16, DataType.HALF, DataType.FP8, DataType.NVFP4])
 @pytest.mark.parametrize("heads", [1, 2, 4])
 def test_m3_resident_and_offloaded_transfer_views_match(
-    dtype: DataType, heads: int, monkeypatch: pytest.MonkeyPatch
+    dtype: DataType, heads: int, layout: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Native transfer maps every dense, sparse and index pool in both directions."""
     monkeypatch.setenv("TRTLLM_KV_GUARD_PAGE", "zero")
-    resident = _manager(dtype, heads, 40 * PAGE, offload=False)
-    offloaded = _manager(dtype, heads, 40 * PAGE)
+    sparse_layers = LAYOUTS[layout]
+    resident = _manager(dtype, heads, 40 * PAGE, offload=False, sparse_layers=sparse_layers)
+    offloaded = _manager(dtype, heads, 40 * PAGE, sparse_layers=sparse_layers)
     try:
-        assert not set(offloaded._guard_page_by_layer) & set(SPARSE_LAYERS)
+        assert not set(offloaded._guard_page_by_layer) & set(sparse_layers)
         assert offloaded.get_cache_bytes_per_token() == sum(
             offloaded.get_layer_bytes_per_token(layer, Role.ALL) for layer in range(4)
         )
         for layer in offloaded.impl.init_config.layers:
-            if int(layer.layer_id) not in SPARSE_LAYERS:
+            if int(layer.layer_id) not in sparse_layers:
                 assert all(
                     buffer.role not in (Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE)
                     for buffer in layer.buffers
@@ -142,7 +147,10 @@ def test_m3_resident_and_offloaded_transfer_views_match(
                 if local_view.pool_role == frozenset({"key", "value"}):
                     main_layer_sets.add(local_layers)
                 registrar.get_kv_map(peer, local_key, peer_key)
-            assert main_layer_sets == {frozenset({0, 2}), frozenset(SPARSE_LAYERS)}
+            dense_layers = frozenset(range(4)) - frozenset(sparse_layers)
+            assert main_layer_sets == {frozenset(sparse_layers)} | (
+                {dense_layers} if dense_layers else set()
+            )
     finally:
         offloaded.shutdown()
         resident.shutdown()
@@ -206,6 +214,53 @@ def test_m3_offload_rejects_arenas_past_int32_write_slots(monkeypatch: pytest.Mo
             manager.get_sparse_offload_descriptors()
         monkeypatch.setattr(cache_manager, "_MAX_SPARSE_ARENA_TOKEN_SLOTS", max(cells) * PAGE)
         assert set(manager.get_sparse_offload_descriptors()) == set(SPARSE_LAYERS)
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.parametrize("dtype", [DataType.FP8, DataType.NVFP4])
+def test_m3_offload_clears_each_arena_once(
+    dtype: DataType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Startup zeroes each physical arena once, through one contiguous range.
+
+    Every offloaded layer's view starts at its pool's base and spans the whole pool, with
+    overlapping K and V planes, so clearing through the views would write each pool once per
+    layer and plane.
+    """
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import cache_manager
+
+    clears = []
+    zero_ = torch.Tensor.zero_
+
+    def recording_zero_(tensor: torch.Tensor) -> torch.Tensor:
+        clears.append(tensor)
+        return zero_(tensor)
+
+    monkeypatch.setattr(cache_manager, "_KV_POOL_ZERO_INIT", True)
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.Tensor, "zero_", recording_zero_)
+        manager = _manager(dtype, 2, 8 * PAGE)
+    try:
+        views = [manager.get_sparse_arena_buffers(layer, "HND") for layer in SPARSE_LAYERS]
+        if dtype == DataType.NVFP4:
+            views += [
+                manager.get_sparse_arena_buffers(layer, "HND", scales=True)
+                for layer in SPARSE_LAYERS
+            ]
+        # Each arena's extent is the furthest byte any of its layer views can address.
+        extents: dict[int, int] = {}
+        for view in views:
+            last = sum((size - 1) * stride for size, stride in zip(view.shape, view.stride()))
+            extent = (last + 1) * view.element_size()
+            extents[view.data_ptr()] = max(extents.get(view.data_ptr(), 0), extent)
+        # Both sparse layers share each pool, so their views alias.
+        assert len(extents) == (2 if dtype == DataType.NVFP4 else 1)
+        for base, extent in extents.items():
+            at_base = [tensor for tensor in clears if tensor.data_ptr() == base]
+            assert len(at_base) == 1, "each arena must be cleared exactly once"
+            assert at_base[0].is_contiguous()
+            assert at_base[0].numel() * at_base[0].element_size() == extent
     finally:
         manager.shutdown()
 
@@ -281,16 +336,21 @@ def _attention(
 
 
 @pytest.mark.parametrize("dtype", [DataType.FP8, DataType.NVFP4])
-@pytest.mark.parametrize("heads", [1, 2, 4])
+@pytest.mark.parametrize(
+    "heads,layout", [(1, "mixed"), (2, "mixed"), (4, "mixed"), (2, "all_sparse")]
+)
 @pytest.mark.parametrize("shorter_prefix", [False, True], ids=["same_prompt", "shorter_prefix"])
 def test_m3_offload_reuses_received_prompt(
-    dtype: DataType, heads: int, shorter_prefix: bool
+    dtype: DataType, heads: int, layout: str, shorter_prefix: bool
 ) -> None:
     """Reuse a received prompt or its shorter prefix, then decode across a partial page."""
+    sparse_layers = LAYOUTS[layout]
     shared_blocks = 5
     prompt_len = (shared_blocks + 1) * PAGE - 1
     max_blocks = shared_blocks + 3
-    manager = _manager(dtype, heads, max_blocks * PAGE, block_reuse=True)
+    manager = _manager(
+        dtype, heads, max_blocks * PAGE, block_reuse=True, sparse_layers=sparse_layers
+    )
     generator = torch.Generator(device="cuda").manual_seed(283)
     quant = torch.ones(3, dtype=torch.float32, device="cuda")
     nvfp4 = dtype == DataType.NVFP4
@@ -322,7 +382,7 @@ def test_m3_offload_reuses_received_prompt(
                 if nvfp4
                 else None,
             )
-            for layer in SPARSE_LAYERS
+            for layer in sparse_layers
         }
         first_pages = {}
         for rid in (1, 2):
@@ -350,7 +410,7 @@ def test_m3_offload_reuses_received_prompt(
                     assert pages[:shared_blocks] == first_pages[layer][:shared_blocks]
                 else:
                     first_pages[layer] = pages
-                if layer in SPARSE_LAYERS:
+                if layer in sparse_layers:
                     index = manager.get_index_k_buffer(layer).view(torch.uint8)
                     for page in range(start // PAGE, shared_blocks + 1):
                         index[pages[page]].fill_(layer + page + rid)
@@ -412,7 +472,7 @@ def test_m3_offload_reuses_received_prompt(
                 q = torch.randn((1, 16 * heads, HEAD_DIM), device="cuda", generator=generator).to(
                     torch.bfloat16
                 )
-                for layer in SPARSE_LAYERS:
+                for layer in sparse_layers:
                     k, v = (
                         torch.randn((1, heads, HEAD_DIM), device="cuda", generator=generator).to(
                             torch.bfloat16
@@ -471,18 +531,20 @@ def test_m3_offload_reuses_received_prompt(
 
 
 @pytest.mark.parametrize(
-    "dtype,heads,graph",
+    "dtype,heads,graph,layout",
     [
-        (DataType.BF16, 2, False),
-        (DataType.HALF, 1, False),
-        (DataType.FP8, 1, False),
-        (DataType.FP8, 4, True),
-        (DataType.NVFP4, 1, False),
-        (DataType.NVFP4, 2, True),
+        (DataType.BF16, 2, False, "mixed"),
+        (DataType.HALF, 1, False, "mixed"),
+        (DataType.FP8, 1, False, "mixed"),
+        (DataType.FP8, 4, True, "mixed"),
+        (DataType.NVFP4, 1, False, "mixed"),
+        (DataType.NVFP4, 2, True, "mixed"),
+        (DataType.FP8, 2, False, "all_sparse"),
+        (DataType.NVFP4, 2, True, "all_sparse"),
     ],
 )
 def test_m3_offload_matches_resident_across_partial_blocks_eviction_and_reseating(
-    dtype: DataType, heads: int, graph: bool, monkeypatch: pytest.MonkeyPatch
+    dtype: DataType, heads: int, graph: bool, layout: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Bitwise data/scale and attention parity, including replay with changing batch rows.
 
@@ -491,10 +553,11 @@ def test_m3_offload_matches_resident_across_partial_blocks_eviction_and_reseatin
     requests cross page boundaries at different steps. Padded graph queries
     must never write into another request's arena or become native Batch members.
     """
+    sparse_layers = LAYOUTS[layout]
     history_blocks = 2 * TOPK * heads + 7
     max_blocks = history_blocks + 4
     max_seq_len = max_blocks * PAGE
-    manager = _manager(dtype, heads, max_seq_len)
+    manager = _manager(dtype, heads, max_seq_len, sparse_layers=sparse_layers)
     generator = torch.Generator(device="cuda").manual_seed(437)
     nvfp4 = dtype == DataType.NVFP4
     requests = [
@@ -515,7 +578,7 @@ def test_m3_offload_matches_resident_across_partial_blocks_eviction_and_reseatin
     ]
     try:
         for layer in manager.kv_cache_manager_py_config.layers:
-            sparse = int(layer.layer_id) in SPARSE_LAYERS
+            sparse = int(layer.layer_id) in sparse_layers
             for buffer in layer.buffers:
                 assert buffer.is_sparse == (sparse and buffer.role != Role.INDEX_KEY)
             if sparse:
@@ -559,7 +622,7 @@ def test_m3_offload_matches_resident_across_partial_blocks_eviction_and_reseatin
                 dtype=torch.int8 if nvfp4 else binding_to_torch_dtype(dtype),
                 device="cuda",
             )
-            for layer in SPARSE_LAYERS
+            for layer in sparse_layers
         }
         resident_scales = {
             layer: torch.zeros(
@@ -569,13 +632,13 @@ def test_m3_offload_matches_resident_across_partial_blocks_eviction_and_reseatin
             )
             if nvfp4
             else None
-            for layer in SPARSE_LAYERS
+            for layer in sparse_layers
         }
         resident_table = torch.full((BATCH, max_blocks), -1, dtype=torch.int32, device="cuda")
         for request_number, request in enumerate(requests):
             assert manager.prepare_disagg_gen_init(request)
             rid, prompt = request.py_request_id, request.prompt_len
-            for layer in SPARSE_LAYERS:
+            for layer in sparse_layers:
                 k, v = (
                     torch.randn(
                         (max_seq_len, heads, HEAD_DIM), device="cuda", generator=generator
@@ -607,12 +670,12 @@ def test_m3_offload_matches_resident_across_partial_blocks_eviction_and_reseatin
                 torch.zeros((BATCH, heads, HEAD_DIM), dtype=torch.bfloat16, device="cuda")
                 for _ in range(2)
             )
-            for layer in SPARSE_LAYERS
+            for layer in sparse_layers
         }
-        outputs = {layer: torch.empty_like(q) for layer in SPARSE_LAYERS}
+        outputs = {layer: torch.empty_like(q) for layer in sparse_layers}
 
         def decode():
-            for layer in SPARSE_LAYERS:
+            for layer in sparse_layers:
                 k, v = inputs[layer]
                 MiniMaxM3MsaSparseAttention.write_layer_caches(
                     SimpleNamespace(layer_idx=layer),
@@ -707,7 +770,7 @@ def test_m3_offload_matches_resident_across_partial_blocks_eviction_and_reseatin
                         dtype=torch.int32,
                     )
                     assert (topk[position, head] >= 0).sum() == min(TOPK, history // PAGE + 1)
-            for layer in SPARSE_LAYERS:
+            for layer in sparse_layers:
                 k, v = inputs[layer]
                 k.zero_()
                 v.zero_()
@@ -741,7 +804,7 @@ def test_m3_offload_matches_resident_across_partial_blocks_eviction_and_reseatin
             assert (metadata.msa_sparse_write_slots[len(active) :] == -1).all()
             # Padded queries are no Batch members, but attention reads their block 0.
             assert (metadata.msa_sparse_block_table[len(active) : BATCH, 0] >= 0).all()
-            for layer in SPARSE_LAYERS:
+            for layer in sparse_layers:
                 expected = torch.empty_like(q)
                 _attention(
                     q,
@@ -767,7 +830,7 @@ def test_m3_offload_matches_resident_across_partial_blocks_eviction_and_reseatin
                     f"step={step}, request={rid}: history "
                     f"{manager.kv_cache_map[rid].history_length}, expected {history + 1}"
                 )
-                for layer in SPARSE_LAYERS:
+                for layer in sparse_layers:
                     data, scales = reference[rid, layer]
                     page = history // PAGE
                     valid = history % PAGE + 1

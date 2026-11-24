@@ -746,6 +746,7 @@ def _test_sparse_offload_long_context(
     index_topk: int,
     unit_tokens: int,
     block_reuse: bool = False,
+    generation_prefix: str = "",
     server_waiting_timeout: int = 1200,
 ) -> None:
     """Require exact resident/offload tokens and real host fetches.
@@ -759,6 +760,10 @@ def _test_sparse_offload_long_context(
 
     Exact comparisons use eager, deterministic TP attention. CUDA graph replay
     and request remapping remain covered by the native offload component tests.
+
+    ``generation_prefix`` is appended, as tokens, after the chat template's
+    generation prompt. A model whose template cannot disable thinking passes
+    the think-end token that opens a direct answer.
     """
     is_m3 = gen_server_config["sparse_attention_config"][
         "algorithm"] == "minimax_m3"
@@ -800,6 +805,9 @@ def _test_sparse_offload_long_context(
                                                return_dict=False,
                                                add_generation_prompt=True,
                                                **template_args)
+        if generation_prefix:
+            prompt += tokenizer.encode(generation_prefix,
+                                       add_special_tokens=False)
         assert len(prompt) // unit_tokens > index_topk and len(
             prompt
         ) <= 32768, (
@@ -3417,6 +3425,60 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
 
 
+def _run_minimax_m3_kv_cache_offload(model_path: str,
+                                     model_name: str,
+                                     kv_dtype: str,
+                                     *,
+                                     block_reuse: bool,
+                                     generation_prefix: str = "") -> None:
+    """The MiniMax-M3 family's offload parity profile: CTX TP2/EP2 -> GEN TP2/EP2."""
+    common = {
+        "tensor_parallel_size": 2,
+        "moe_expert_parallel_size": 2,
+        "modeling_v2": "off",
+        "trust_remote_code": True,
+        "disable_overlap_scheduler": True,
+        "moe_config": {
+            "backend": "CUTLASS"
+        },
+        "kv_cache_config": {
+            "dtype": kv_dtype,
+            "free_gpu_memory_fraction": 0.6
+        },
+        "cache_transceiver_config": {
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
+            "kv_transfer_timeout_ms": 600000,
+        },
+        "sparse_attention_config": {
+            "algorithm": "minimax_m3",
+            "implementation": "msa",
+            "indexer_kv_dtype": "fp8",
+        },
+    }
+    disagg = {
+        "hostname": "localhost",
+        "backend": "pytorch",
+        "context_servers": {
+            "num_instances": 1
+        },
+        "generation_servers": {
+            "num_instances": 1
+        },
+    }
+    _test_sparse_offload_long_context(
+        disagg,
+        copy.deepcopy(common),
+        copy.deepcopy(common),
+        model_path,
+        model_name=model_name,
+        index_topk=16 * 2,
+        unit_tokens=128,
+        block_reuse=block_reuse,
+        generation_prefix=generation_prefix,
+    )
+
+
 @skip_pre_blackwell
 class TestMiniMaxM3(LlmapiAccuracyTestHarness):
 
@@ -3438,50 +3500,11 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
 
     def _run_kv_cache_offload(self, kv_dtype: str, *,
                               block_reuse: bool) -> None:
-        common = {
-            "tensor_parallel_size": 2,
-            "moe_expert_parallel_size": 2,
-            "modeling_v2": "off",
-            "trust_remote_code": True,
-            "disable_overlap_scheduler": True,
-            "moe_config": {
-                "backend": "CUTLASS"
-            },
-            "kv_cache_config": {
-                "dtype": kv_dtype,
-                "free_gpu_memory_fraction": 0.6
-            },
-            "cache_transceiver_config": {
-                "backend": "NIXL",
-                "transceiver_runtime": "PYTHON",
-                "kv_transfer_timeout_ms": 600000,
-            },
-            "sparse_attention_config": {
-                "algorithm": "minimax_m3",
-                "implementation": "msa",
-                "indexer_kv_dtype": "fp8",
-            },
-        }
-        disagg = {
-            "hostname": "localhost",
-            "backend": "pytorch",
-            "context_servers": {
-                "num_instances": 1
-            },
-            "generation_servers": {
-                "num_instances": 1
-            },
-        }
-        _test_sparse_offload_long_context(
-            disagg,
-            copy.deepcopy(common),
-            copy.deepcopy(common),
+        _run_minimax_m3_kv_cache_offload(
             f"{llm_models_root()}/MiniMax-M3-NVFP4",
-            model_name="nvidia/MiniMax-M3-NVFP4",
-            index_topk=16 * 2,
-            unit_tokens=128,
-            block_reuse=block_reuse,
-        )
+            "nvidia/MiniMax-M3-NVFP4",
+            kv_dtype,
+            block_reuse=block_reuse)
 
     @pytest.mark.skip_less_device(6)
     @pytest.mark.skip_less_device_memory(140000)
@@ -3675,3 +3698,24 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                 f"Eagle3 chat-GSM8K acceptance length too low: " \
                 f"{chat_length:.3f} (threshold 3.4, reference 3.518 from " \
                 f"the drafter card)"
+
+
+@skip_pre_blackwell
+class TestMiniMaxM31Flash(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "MiniMaxAI/MiniMax-M3.1-Flash"
+    MODEL_PATH = f"{llm_models_root()}/MiniMax-M3.1-Flash"
+
+    @pytest.mark.timeout(3600)
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(140000)
+    @parametrize_with_ids("kv_dtype", ["nvfp4"])
+    def test_kv_cache_offload_block_reuse(self, kv_dtype: str) -> None:
+        """Every layer is sparse and offloaded; repeated prompts reuse received KV."""
+        # The chat template has an adaptive thinking mode only. MiniMax-M3's template
+        # disables thinking by opening the answer with the think-end token, so the
+        # prompts here end with it too.
+        _run_minimax_m3_kv_cache_offload(self.MODEL_PATH,
+                                         self.MODEL_NAME,
+                                         kv_dtype,
+                                         block_reuse=True,
+                                         generation_prefix="</mm:think>")

@@ -229,7 +229,7 @@ void Batch::_allocateCopyDesc()
                 desc.deviceBase = run.deviceBase
                     + static_cast<uint64_t>(_sparseArena(lcId).shape().bufferSlotInPool[static_cast<size_t>(buffer)])
                         * run.cellsPerBuffer * run.bufferBytes;
-                desc.leaseStride = static_cast<uint32_t>(run.cellsPerLease) * run.bufferBytes;
+                desc.cellsPerLease = static_cast<uint32_t>(run.cellsPerLease);
                 desc.cellBytes = run.bufferBytes;
                 desc.layout = run.layout;
                 desc.width = run.width;

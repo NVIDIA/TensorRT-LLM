@@ -486,8 +486,9 @@ Enable offload only on the generation worker and use matching KV precision
 on the context worker. An offloading worker serves only generation requests, so
 it requires a `cache_transceiver_config`. Offload requires single-token,
 single-beam generation, pipeline parallel size 1, and no speculative decoding.
-`gpu_cache_factor` multiplies the maximum union size (`sparse_topk_blocks` times
-local KV heads), with one additional block reserved for writing. A larger factor
+`gpu_cache_factor` multiplies the maximum union size (`sparse_topk_blocks`, which
+MSA fixes at 16, times local KV heads), with one additional block reserved for
+writing. A larger factor
 holds more of each request's recently selected blocks on the GPU, so fewer
 decode steps wait for host fetches, at the cost of GPU memory per request. In a
 32K-input decode benchmark on two GB300 GPUs, a factor of 6 reached a 95.5%

@@ -711,9 +711,10 @@ __device__ void copySparseUnitsImpl(
         // Direction only chooses which of the two is read.
         auto* cold = reinterpret_cast<char*>(
             desc.hostBase + hostPage * desc.hostPageStride + static_cast<uint64_t>(srcUnit) * desc.layout.unitStride);
-        auto* hot = reinterpret_cast<char*>(desc.deviceBase + static_cast<uint64_t>(lease.value()) * desc.leaseStride
-            + static_cast<uint64_t>(slot / args.unitsPerPage) * desc.cellBytes
-            + static_cast<uint64_t>(dstUnit) * desc.layout.unitStride);
+        auto const cell = static_cast<uint64_t>(lease.value()) * desc.cellsPerLease
+            + static_cast<uint64_t>(slot / args.unitsPerPage);
+        auto* hot = reinterpret_cast<char*>(
+            desc.deviceBase + cell * desc.cellBytes + static_cast<uint64_t>(dstUnit) * desc.layout.unitStride);
         bool const fetching = args.direction == SparseCopyDirection::kFetch;
         char const* src = fetching ? cold : hot;
         char* dst = fetching ? hot : cold;

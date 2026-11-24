@@ -7149,7 +7149,7 @@
                 "const": true
               },
               "sparse_topk_blocks": {
-                "minimum": 1
+                "const": 16
               }
             },
             "required": [

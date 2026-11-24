@@ -445,7 +445,7 @@ def _serve_schema() -> dict:
                     "implementation": {"const": "msa"},
                     "sparse_disable_index_value": {"const": True},
                     "sparse_block_size": {"const": 128},
-                    "sparse_topk_blocks": {"minimum": 1},
+                    "sparse_topk_blocks": {"const": 16},
                 },
                 "required": ["implementation"],
             },

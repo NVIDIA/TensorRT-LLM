@@ -1509,6 +1509,14 @@ def test_sparse_offload_indexer_default(
             False,
         ),
         (
+            {"implementation": "msa", "enable_kv_cache_offload": True, "sparse_topk_blocks": 16},
+            True,
+        ),
+        (
+            {"implementation": "msa", "enable_kv_cache_offload": True, "sparse_topk_blocks": 8},
+            False,
+        ),
+        (
             {"implementation": "msa", "enable_kv_cache_offload": True, "sparse_topk_blocks": 0},
             False,
         ),

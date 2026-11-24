@@ -729,13 +729,15 @@ can run first — which is the order the model requires. Idempotent while the wa
 the resolve probes residency before taking a victim, so the fetch's own resolve finds the
 entry and reuses it.
 
-With the default `include_partial_units=False`, nothing is fetched for it. An in-flight
-unit's host page is not written until the watermark passes it, so the resolve excludes
-in-flight ordinals from the copy list (`ordinal < historyUnits`). This serves compressed
-units produced only when all their input tokens are available.
+With `include_partial_units=False`, the default for the other sparse models, nothing is
+fetched for it. An in-flight unit's host page is not written until the watermark passes
+it, so the resolve excludes in-flight ordinals from the copy list
+(`ordinal < historyUnits`). This serves compressed units produced only when all their
+input tokens are available.
 
-`include_partial_units=True` serves blocks to which the model appends each token, as in
-MiniMax-M3. History units use `floor(history / unit_tokens)` and capacity units use
+MiniMax-M3 offload always sets `include_partial_units=True`; it is not configurable. Its
+blocks receive a token appended each step, which this mode serves. History units use
+`floor(history / unit_tokens)` and capacity units use
 `ceil(capacity / unit_tokens)`, reserving the growing block on every step. A miss for that
 block restores its host prefix before exposing the write index; a hit leaves live writes
 intact. The fetch work list includes one extra entry per row for that prefix. Write

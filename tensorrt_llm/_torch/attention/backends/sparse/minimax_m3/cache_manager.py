@@ -349,6 +349,9 @@ class MiniMaxM3SparseOffloadMixin(SparseOffloadCacheMixin):
         self._m3_topk_blocks = 0 if config is None else config.sparse_topk_blocks
         self._m3_offload_descriptors: dict[int, SparseOffloadLayerDescriptor] | None = None
         self._m3_arena_views: dict[tuple[int, bool], torch.Tensor] = {}
+        # Each physical arena as {base address: bytes}. The layer views alias one another,
+        # since every one starts at its pool's base and spans the whole pool.
+        self._m3_arena_regions: dict[int, int] = {}
 
     def _set_m3_offloaded_layers(self, sparse_layer_ids: Sequence[int]) -> None:
         self._m3_offloaded_layer_ids = (
@@ -491,10 +494,12 @@ class MiniMaxM3SparseOffloadMixin(SparseOffloadCacheMixin):
         elements = heads * page * dim
         shape = (descriptor.arena_row_counts[k_index] - offset, 2, heads, page, dim)
         strides = (elements, offset * elements, page * dim, dim, 1)
-        view = convert_to_torch_tensor(
-            TensorWrapper(descriptor.arena_base_addresses[k_index], dtype, shape, strides=strides)
-        )
+        base = descriptor.arena_base_addresses[k_index]
+        view = convert_to_torch_tensor(TensorWrapper(base, dtype, shape, strides=strides))
         self._m3_arena_views[key] = view
+        self._m3_arena_regions[base] = (
+            descriptor.arena_row_counts[k_index] * elements * view.element_size()
+        )
         return view
 
     def get_sparse_offload_scratch_bytes(self, config: KVCacheManagerConfig) -> int:
@@ -770,11 +775,14 @@ class MiniMaxM3KVCacheManagerV2(MiniMaxM3SparseOffloadMixin, KVCacheManagerV2):
             for view in (
                 *self._kv_buffers.values(),
                 *self._block_scale_buffers.values(),
-                *self._m3_arena_views.values(),
                 *self._index_k_buffers.values(),
             ):
                 if view is not None:
                     view.zero_()
+            # Every offloaded layer's arena view spans its whole pool, with overlapping K and V
+            # planes, so each physical arena is cleared once as one contiguous byte range.
+            for base, nbytes in self._m3_arena_regions.items():
+                convert_to_torch_tensor(TensorWrapper(base, torch.uint8, [nbytes])).zero_()
 
     @staticmethod
     def main_kv_is_head_major(sparse_attention_config: Any, dtype: Optional[DataType]) -> bool:

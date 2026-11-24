@@ -4102,6 +4102,8 @@ class TestSparseDataPath(unittest.TestCase):
         chunks: int = 1,
         buffer_bytes: int | None = None,
         write_back_granularity: int = 1,
+        max_cached_units: int | None = None,
+        host_sparse_pool_quota: int | None = None,
     ) -> KVCacheManager:
         return KVCacheManager(
             KVCacheManagerConfig(
@@ -4130,12 +4132,15 @@ class TestSparseDataPath(unittest.TestCase):
                         ],
                         sparse_cache=SparseCacheConfig(
                             num_selected_blocks=cls.SELECTED,
-                            max_cached_units=cls.CELLS,
+                            max_cached_units=cls.CELLS
+                            if max_cached_units is None
+                            else max_cached_units,
                             unit_tokens=cls.TPB,
                             include_partial_units=include_partial_units,
                         ),
                     )
                 ],
+                host_sparse_pool_quota=host_sparse_pool_quota,
             )
         )
 
@@ -4338,6 +4343,98 @@ class TestSparseDataPath(unittest.TestCase):
                 batch.remove_kv_cache(cache)
         finally:
             if cache is not None:
+                cache.close()
+            manager.shutdown()
+
+    def test_leases_4_gib_apart_fetch_into_their_own_cells(self):
+        """Two requests whose leases start 4 GiB apart in the cell arena.
+
+        A lease here is 4096 cells of 1 MiB, so its byte stride is exactly 2**32: a 32-bit
+        stride would put both leases' cells in one place. Each request's fetched cell must
+        hold its own page, which also checks that the second fetch left the first intact.
+        """
+        ctypes, cudart, torch = self._deps()
+        buffer_bytes = 1 << 20
+        cells = 4096
+        rows = 2
+        arena_bytes = rows * cells * buffer_bytes
+        if torch.cuda.mem_get_info()[0] < arena_bytes + (1 << 30):
+            raise unittest.SkipTest(
+                f"the cell arena needs {arena_bytes >> 30} GiB of free GPU memory"
+            )
+        # The hot pages are host memory, a row for each slot the GPU quota buys the 256-byte
+        # index pool. Under the default host quota, 1 MiB pages would pin most of host memory,
+        # and shutdown waits for that fill. 128 MiB still holds the 64 blocks of the constraint.
+        manager = self._manager(
+            buffer_bytes=buffer_bytes, max_cached_units=cells, host_sparse_pool_quota=128 << 20
+        )
+        caches = []
+        try:
+            lg = manager.get_layer_group_id(0)
+            pool = int(manager.get_mem_pool_base_address(LayerId(0), "key"))
+            stride = manager.get_page_stride(LayerId(0), "key")
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                batch = Batch(
+                    manager,
+                    handle,
+                    max_batch_size=rows,
+                    max_blocks_per_seq=8,
+                    index_tables=manager.sparse_index_table_specs(),
+                )
+                arena = int(batch.get_sparse_cache_base_address(LayerId(0), "key"))
+                # The arena holds one buffer, so its region is both leases' cells back to back.
+                # Zeroed, a cell no fetch reached cannot hold a page's bytes by chance.
+                (err,) = cudart.cudaMemset(arena, 0, arena_bytes)
+                self.assertEqual(int(err), 0)
+                torch.cuda.synchronize()
+
+                ordinal = 1
+                patterns = {}
+                for seed in (7, 11):
+                    cache = manager.create_kv_cache()
+                    caches.append(cache)
+                    self.assertTrue(cache.resume(handle))
+                    row = batch.add_kv_cache(cache)
+                    self.assertTrue(cache.resize(4 * self.TPB, 4 * self.TPB))
+                    patterns[row] = self._pattern(buffer_bytes, seed)
+                    pages = [int(x) for x in cache.get_base_page_indices(lg)]
+                    ctypes.memmove(pool + pages[ordinal] * stride, patterns[row], buffer_bytes)
+                self.assertEqual(sorted(patterns), list(range(rows)))
+
+                batch.publish()
+                selected = torch.tensor([[ordinal, -1]] * rows, dtype=torch.int32, device="cuda")
+                out = torch.full((rows, 1, self.SELECTED), 12345, dtype=torch.int32, device="cuda")
+                batch.fetch_sparse_pages([BufferId(0, "key")], selected, out, handle)
+                torch.cuda.synchronize()
+
+                indices = {row: int(out[row][0][0]) for row in range(rows)}
+                self.assertNotIn(BAD_PAGE_INDEX, indices.values())
+                self.assertGreaterEqual(
+                    max(indices.values()),
+                    cells,
+                    "the second lease's cell must lie at or past 4 GiB",
+                )
+                for row, index in indices.items():
+                    got = bytearray(buffer_bytes)
+                    sink = (ctypes.c_ubyte * buffer_bytes).from_buffer(got)
+                    (err,) = cudart.cudaMemcpy(
+                        ctypes.addressof(sink),
+                        arena + index * buffer_bytes,
+                        buffer_bytes,
+                        cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost,
+                    )
+                    self.assertEqual(int(err), 0)
+                    self.assertEqual(
+                        bytes(got),
+                        patterns[row],
+                        f"row {row}'s cell does not hold its page's bytes",
+                    )
+                batch.flush_sparse_units([4 * self.TPB] * rows)
+                for cache in caches:
+                    batch.remove_kv_cache(cache)
+        finally:
+            for cache in caches:
                 cache.close()
             manager.shutdown()
 

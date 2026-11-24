@@ -1389,10 +1389,11 @@ class MiniMaxM3SparseAttentionConfig(_SparseKvCacheOffloadConfigMixin,
                 raise ValueError(
                     "MiniMax-M3 KV cache offload requires sparse_disable_index_value=True."
                 )
-            if self.sparse_topk_blocks <= 0:
+            if self.sparse_topk_blocks != 16:
                 raise ValueError(
-                    "MiniMax-M3 KV cache offload requires positive sparse_topk_blocks."
-                )
+                    "MiniMax-M3 KV cache offload requires sparse_topk_blocks=16, "
+                    "the only value the 'msa' implementation supports; got "
+                    f"{self.sparse_topk_blocks}.")
         if self.implementation == "msa" and self.sparse_block_size != 128:
             raise ValueError(
                 "MiniMax-M3 'msa' implementation requires sparse_block_size == "

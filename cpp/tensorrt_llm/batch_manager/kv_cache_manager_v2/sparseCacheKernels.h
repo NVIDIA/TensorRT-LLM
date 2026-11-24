@@ -280,9 +280,10 @@ struct SparseCopyRun
 //! its entry within the page table -- can be folded in here instead of being paid per work
 //! item.
 //!
-//! Sixteen-byte aligned and exactly four of them wide, so the load vectorises; the strides
-//! are 32-bit because a page, a lease and a cell are all far smaller than that, and only
-//! their products with a page or lease index need the wider type.
+//! Sixteen-byte aligned and exactly four of them wide, so the load vectorises. The fields
+//! are 32-bit: a page and a cell are far smaller than 4 GiB, and a lease is held as a cell
+//! count because its bytes are not -- its pool holds every layer's buffers. Only their
+//! products with an index need the wider type.
 struct alignas(16) SparseCopyDesc
 {
     //! Base this buffer's converted page indices are relative to. Shared by the buffers of
@@ -295,16 +296,16 @@ struct alignas(16) SparseCopyDesc
     //! share an entry and so share this pointer; buffers of one request do not.
     int32_t const* pageTable;
     //! This buffer's sub-region of its pool in the cell arena, which is the pool's base
-    //! plus its slot there. A lease's cells follow at `leaseIndex * leaseStride`.
+    //! plus its slot there. A lease's cells follow at `leaseIndex * cellsPerLease` cells.
     CUdeviceptr deviceBase;
 
     uint32_t hostPageStride;
     uint32_t pageTableStride;
     //! Blocks a row's page table describes; an ordinal past them is outside this call.
     uint32_t numBlocks;
-    //! Bytes one lease takes in this pool's region, which is its cells there times the
-    //! cell size. Multiplied by a lease index, so widened at the multiply.
-    uint32_t leaseStride;
+    //! Cells one lease takes in this pool's region. Its bytes can pass 4 GiB, so a lease's
+    //! offset is formed in 64 bits from this and `cellBytes`.
+    uint32_t cellsPerLease;
     //! Bytes of one cell, which is one buffer's worth of pages.
     uint32_t cellBytes;
 

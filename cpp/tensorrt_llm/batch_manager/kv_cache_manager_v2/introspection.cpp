@@ -538,7 +538,7 @@ std::vector<uint8_t> KvCacheIntrospection::sparseUnitCopy(std::vector<uint8_t> c
         desc.pageTableStride = static_cast<uint32_t>(numBlocks);
         desc.numBlocks = static_cast<uint32_t>(numBlocks);
         desc.deviceBase = devicePtr + static_cast<uint64_t>(i) * static_cast<uint64_t>(cellsPerBuffer) * bufferBytes;
-        desc.leaseStride = static_cast<uint32_t>(bufferBytes);
+        desc.cellsPerLease = 1;
         desc.cellBytes = static_cast<uint32_t>(bufferBytes);
         desc.layout.numChunks = numChunks;
         desc.layout.chunkBytes = chunkBytes;
