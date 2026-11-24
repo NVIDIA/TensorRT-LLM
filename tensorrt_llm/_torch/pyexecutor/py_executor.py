@@ -112,6 +112,7 @@ from .cuda_graph_runner import ADPShapeAgreement
 from .disagg_adapter import PyExecutorEffects, PyExecutorRequestRegistry
 from .dwdp import DwdpManager
 from .engine.model_setup import DYNAMO_RECOMPILE_LIMIT
+from .engine.multimodal import _validate_multimodal_input
 from .error_classification import ErrorBudget
 from .executor_request_queue import (PREFIX_LOAD_COMPLETION_REQUEST_ID,
                                      ExecutorRequestQueue,
@@ -9234,7 +9235,8 @@ class PyExecutor:
 
         # Perform model-specific validation, for models that define the hook.
         # An executor without a model engine has no hook to call.
-        model = getattr(getattr(self, "model_engine", None), "model", None)
+        engine = getattr(self, "model_engine", None)
+        model = getattr(engine, "model", None)
         validate = getattr(model, "validate_request", None)
         if validate is not None:
             validate(request)
@@ -9247,8 +9249,10 @@ class PyExecutor:
         # handled batch-wide.
         mm_data = getattr(request, 'py_multimodal_data', None)
         if mm_data:
-            validate_mm = getattr(self.model_engine.model,
-                                  'validate_multimodal_request_data', None)
+            _validate_multimodal_input(model, mm_data,
+                                       getattr(engine, "input_processor", None))
+            validate_mm = getattr(model, 'validate_multimodal_request_data',
+                                  None)
             if validate_mm is not None:
                 validate_mm(mm_data)
 

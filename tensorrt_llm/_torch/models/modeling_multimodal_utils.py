@@ -34,6 +34,7 @@ from transformers.image_processing_backends import TorchvisionBackend
 
 from tensorrt_llm._torch.modules.embedding import Embedding
 from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.multimodal_data import MEDIA_MODALITIES
 from tensorrt_llm.logger import logger
 
 
@@ -172,10 +173,16 @@ def _is_mm_disagg() -> bool:
     return os.getenv(_MULTIMODAL_ENV_NAME, "0") == "1"
 
 
+def has_multimodal_input(
+    mm_data: dict | None,
+    keys: tuple[str, ...] = (*MEDIA_MODALITIES, "multimodal_embedding")
+) -> bool:
+    """Whether processed input carries raw media or precomputed embeddings."""
+    return bool(mm_data) and any(mm_data.get(key) is not None for key in keys)
+
+
 def has_raw_multimodal_payload(param: MultimodalParams) -> bool:
-    multimodal_data = param.multimodal_data or {}
-    return any(
-        multimodal_data.get(m) is not None for m in ("image", "video", "audio"))
+    return has_multimodal_input(param.multimodal_data, MEDIA_MODALITIES)
 
 
 # Processor *output* keys that transformers 5.x's

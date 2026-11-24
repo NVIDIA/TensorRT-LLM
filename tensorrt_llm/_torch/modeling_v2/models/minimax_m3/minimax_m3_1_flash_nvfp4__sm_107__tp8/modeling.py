@@ -122,6 +122,7 @@ from tensorrt_llm._torch.modeling_v2.catalog.norm.flashinfer_rmsnorm import flas
 from tensorrt_llm._torch.modeling_v2.catalog.quantization.fp4_quantize import fp4_quantize
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.native import family_ops
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.add_rmsnorm import m31_fused_add_rmsnorm
+from tensorrt_llm._torch.models.modeling_multimodal_utils import has_multimodal_input
 from tensorrt_llm._torch.models.modeling_speculative import (
     _draft_loader_moe_kwargs,
     _draft_moe_selection,
@@ -6994,7 +6995,9 @@ class ModelingV2MiniMaxM31FlashNvfp4Sm107Tp8(
         """One engine step: the target forward, then the logits (or, with speculation, the worker's verify and
         draft, and on a decode step the spec fold's store of its outputs). Text only."""
         multimodal_params = kwargs.pop("multimodal_params", None) or []
-        if any(p is not None and getattr(p, "multimodal_data", None) for p in multimodal_params):
+        if any(
+            p is not None and has_multimodal_input(p.multimodal_data) for p in multimodal_params
+        ):
             raise ValueError(
                 "this MiniMax-M3 target is text only; the request carries multimodal input"
             )

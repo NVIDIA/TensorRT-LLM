@@ -16,6 +16,7 @@ import torch
 from torch import nn
 
 from tensorrt_llm._torch.hostfunc import drain_captured_hostfuncs
+from tensorrt_llm._torch.models import modeling_multimodal_utils as mm_utils
 from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     MultimodalEncoderContractError,
@@ -32,6 +33,7 @@ from tensorrt_llm.inputs.multimodal import (
     get_multimodal_item_metadata,
     strip_mm_encoder_inputs,
 )
+from tensorrt_llm.inputs.multimodal_data import MEDIA_MODALITIES
 from tensorrt_llm.inputs.registry import (
     BaseMultimodalDummyInputsBuilder,
     BaseMultimodalInputProcessor,
@@ -103,6 +105,48 @@ def is_multimodal(model: nn.Module, input_processor: InputProcessor) -> bool:
     if isinstance(model, MultimodalModelMixin):
         return True
     return isinstance(input_processor, BaseMultimodalInputProcessor)
+
+
+def _validate_multimodal_input(
+    model: nn.Module,
+    mm_data: dict,
+    input_processor: InputProcessor | None = None,
+) -> None:
+    """Check media and embedding payloads for the Modeling V2 model serving the request."""
+    model = getattr(model, "_orig_mod", model)
+    if not any(
+        cls.__module__.startswith("tensorrt_llm._torch.modeling_v2.") for cls in type(model).__mro__
+    ):
+        return
+
+    has_media = mm_utils.has_multimodal_input(mm_data, MEDIA_MODALITIES)
+    has_embeds = mm_data.get("multimodal_embedding") is not None
+    if not (has_media or has_embeds):
+        return
+
+    # V2 composites expose their first local encoder as mm_encoder. Targets
+    # with a standalone vision tower expose it as vision_tower.
+    has_encoder = (
+        getattr(model, "mm_encoder", None) is not None
+        or getattr(model, "vision_tower", None) is not None
+    )
+    if has_media and not has_encoder:
+        raise ValueError(f"{type(model).__name__} has no local multimodal encoder for raw media")
+    if has_embeds and not (
+        mm_utils._is_mm_disagg()
+        and (
+            isinstance(model, MultimodalModelMixin)
+            or has_encoder
+            or (
+                getattr(model, "supported_encoder_attention_backends", None)
+                and isinstance(input_processor, BaseMultimodalInputProcessor)
+            )
+        )
+    ):
+        raise ValueError(
+            "Precomputed multimodal embeddings require a multimodal model "
+            "in encoder/prefill disaggregated mode"
+        )
 
 
 def mm_item_scheduling_enabled(llm_args: TorchLlmArgs, model: nn.Module) -> bool:

@@ -84,9 +84,6 @@ from . import weights as _weights
 # and the certification is per arch.
 _SM = (10, 0)
 
-#: ``multimodal_data`` entries that carry media for an encoder, or encoder output in place of it.
-_MEDIA_KEYS = frozenset({"audio", "image", "video", "multimodal_embedding"})
-
 #: Stock code the generic path runs outside the catalog, declared so it is not consumed silently: every
 #: tensorrt_llm import of this module that computes (this target's unit tests check the list both ways, with
 #: ``_glm5_next_generic_calls.py``). An entry leaves the list when a catalog entry replaces it.
@@ -2085,16 +2082,3 @@ class ModelingV2Glm53FlashNvfp4Sm100Default(Glm5NextForCausalLM):
 
     def load_weights(self, weights: Any, weight_mapper: BaseWeightMapper | None = None) -> None:
         _weights.load(self, weights, weight_mapper)
-
-    def validate_multimodal_request_data(self, mm_data: dict) -> None:
-        """Refuse, at admission, a request whose multimodal payload carries media: this target runs no encoder.
-
-        Refusing here fails that request alone; the forward would otherwise serve its text without the media.
-        A payload without media is accepted.
-        """
-        media = sorted(key for key in _MEDIA_KEYS if mm_data.get(key) is not None)
-        if media:
-            raise ValueError(
-                f"{type(self).__name__} serves this checkpoint's language model only and does not accept "
-                f"multimodal input; the request carries {', '.join(media)}"
-            )

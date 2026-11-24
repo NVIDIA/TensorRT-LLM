@@ -605,32 +605,6 @@ def test_fp8_constructor_refuses_what_route_declines():
         ModelingV2Glm53FlashFp8Sm10xTp4(config)
 
 
-@pytest.mark.parametrize(
-    "multimodal_data, refused",
-    [
-        (None, None),
-        ({}, None),
-        ({"image": {"pixel_values": torch.zeros(1)}}, "image"),
-        ({"video": {"pixel_values_videos": torch.zeros(1)}}, "video"),
-    ],
-    ids=["text", "empty-payload", "image", "video"],
-)
-def test_fp8_target_refuses_media_on_admission(multimodal_data, refused):
-    """The text-only target fails a media request on admission, as that request's own error."""
-    from types import SimpleNamespace
-
-    from tensorrt_llm._torch.modeling_v2.models.glm5_next.glm_5_3_flash_fp8__sm_10x__tp4.modeling import (
-        ModelingV2Glm53FlashFp8Sm10xTp4,
-    )
-
-    request = SimpleNamespace(py_multimodal_data=multimodal_data)
-    if refused is None:
-        ModelingV2Glm53FlashFp8Sm10xTp4.validate_request(None, request)
-        return
-    with pytest.raises(ValueError, match=f"carries {refused} input"):
-        ModelingV2Glm53FlashFp8Sm10xTp4.validate_request(None, request)
-
-
 # The NVFP4 tp4 target: sm_100 and sm_103, with the engine it is written for.
 
 

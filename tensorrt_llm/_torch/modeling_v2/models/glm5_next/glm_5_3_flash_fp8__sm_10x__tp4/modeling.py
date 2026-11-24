@@ -48,6 +48,7 @@ from tensorrt_llm._torch.modeling_v2.catalog.comm.allgather import allgather
 from tensorrt_llm._torch.modeling_v2.catalog.comm.allreduce import allreduce, allreduce_group_args
 from tensorrt_llm._torch.modeling_v2.catalog.comm.reducescatter import reducescatter
 from tensorrt_llm._torch.modeling_v2.catalog.norm.flashinfer_rmsnorm import flashinfer_rmsnorm
+from tensorrt_llm._torch.models.modeling_multimodal_utils import has_multimodal_input
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
 from tensorrt_llm._torch.speculative import get_spec_worker, should_use_separate_draft_kv_cache
 from tensorrt_llm._utils import mpi_disabled
@@ -73,7 +74,6 @@ from .schedule import DENSE_MLP, LINEAR_ATTENTION, StepSchedule
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
-    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
     from tensorrt_llm._torch.speculative.interface import SpecMetadata
 
 #: The TP all-reduce of more rows than this runs on NCCL; fewer on the one-shot kernel,
@@ -746,17 +746,6 @@ class ModelingV2Glm53FlashFp8Sm10xTp4(
         """The text config's context limit; the model has no RoPE (NoPE MLA, KDA)."""
         return int(self.text_config.max_position_embeddings)
 
-    def validate_request(self, request: LlmRequest) -> None:
-        """Reject media on admission, as that request's own error: the vision tower is not built,
-        and the forward would assert on the whole step."""
-        data = request.py_multimodal_data or {}
-        media = [kind for kind in ("image", "video") if data.get(kind)]
-        if media:
-            raise ValueError(
-                f"this GLM-5.3-Flash deployment serves text only (disable_mm_encoder); the "
-                f"request carries {' and '.join(media)} input"
-            )
-
     def set_guided_decoder(self, guided_decoder: CapturableGuidedDecoder) -> bool:
         if self.spec_worker is not None:
             return self.spec_worker.set_guided_decoder(guided_decoder)
@@ -796,8 +785,10 @@ class ModelingV2Glm53FlashFp8Sm10xTp4(
         neither of which this deployment runs) is cut back to its ``num_tokens`` rows before
         the decoder, as the built-in model cuts its output. Context logits go through the
         shell's ``LMHead``, whose bounded context-logits plan the logits processor applies."""
-        multimodal = kwargs.get("multimodal_params")
-        assert not multimodal, "this target serves text only"
+        multimodal = kwargs.get("multimodal_params") or []
+        assert not any(
+            p is not None and has_multimodal_input(p.multimodal_data) for p in multimodal
+        ), "this target serves text only"
         if attn_metadata.padded_num_tokens is not None:
             num_tokens = attn_metadata.num_tokens
             input_ids = input_ids[:num_tokens]
