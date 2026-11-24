@@ -887,6 +887,35 @@ def test_deco_skipped_tile_leaves_zero_scales(require_deco_kernels, v_dtype: str
     assert torch.equal(out, _kernels(q, k, v, v_dtype, valid_seq_lens=lens))
 
 
+def test_deco_batch_stride_past_2_to_the_24_tokens(require_deco_kernels) -> None:
+    """A call whose tokens times heads exceed 2^24 addresses its second batch element from its own
+    rows: the batch strides of the attention's views are 64-bit products. Short valid lengths
+    keep the run quick; the second element's prefix is checked against its own SDPA and must
+    differ from the first's."""
+    device = require_deco_kernels()
+    batch_size, seq_len, num_heads, valid = 2, 419456, 40, 1024
+    assert seq_len * num_heads > 2**24
+    need = 5 * batch_size * seq_len * num_heads * 128 * 2
+    if torch.cuda.get_device_properties(device).total_memory < need:
+        pytest.skip("the inputs, the output and the workspace of this call need more memory")
+    gen = torch.Generator(device=device).manual_seed(0)
+    q, k, v = (
+        torch.randn((batch_size, seq_len, num_heads, 128), generator=gen, device=device).bfloat16()
+        for _ in range(3)
+    )
+    q[:, :valid] *= 4
+    lens = torch.full((batch_size,), valid, dtype=torch.int32, device=device)
+    out = _kernels(q, k, v, valid_seq_lens=lens)
+    for b in range(batch_size):
+        ref = _sdpa(q[b : b + 1, :valid], k[b : b + 1, :valid], v[b : b + 1, :valid])
+        uniform = v[b : b + 1, :valid].float().mean(dim=1, keepdim=True).expand_as(ref)
+        assert _relative_error(out[b : b + 1, :valid], ref) < max(
+            0.5 * _relative_error(uniform, ref), 0.02
+        )
+    assert not torch.equal(out[0, :valid], out[1, :valid])
+    assert not out[:, valid:].any()
+
+
 def test_deco_sm120_short_sequence_takes_the_valid_length(require_deco_kernels) -> None:
     """The SM120 FP8 kernel of a sequence shorter than one key tile attends the valid prefix of
     a padded sample only, whatever the padding holds, and returns zero rows after it."""
