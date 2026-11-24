@@ -661,6 +661,51 @@ class TestOpenAIChatIntegration:
         assert postproc.chat_template_kwargs["enable_thinking"] is thinking
         assert postproc.tool_parser_grammar_constrained is True
 
+    @pytest.mark.parametrize("required_chat_client", ["nemotron_h"], indirect=True)
+    @pytest.mark.parametrize(
+        ("thinking", "token_ids"),
+        [(False, {"prompt_token_ids": [1]}), (True, {"prompt_token_ids_b64": "AQAAAA=="})],
+    )
+    def test_strict_required_tool_grammar_matches_across_handoff(
+        self, required_chat_client, thinking, token_ids
+    ):
+        client, server, rendered = required_chat_client
+        rendered["thinking"] = thinking
+        body = self.required_body()
+        body["tools"][0]["function"]["strict"] = True
+        # The context renderer determines the mode even when the request kwargs disagree.
+        body["chat_template_kwargs"] = {"enable_thinking": not thinking}
+        response = client.post(
+            "/v1/chat/completions",
+            json={**body, "disaggregated_params": {"request_type": "context_only"}},
+        )
+        assert response.status_code == 200, response.text
+        context_grammar = rendered["generation"]["sampling_params"].guided_decoding.structural_tag
+        context_args = server._create_chat_response.call_args.args[1].postproc_args
+        assert context_args.tool_parser_grammar_constrained
+        resolved = context_args.chat_template_kwargs["thinking"]
+        assert resolved is thinking
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                **body,
+                **token_ids,
+                "disaggregated_params": {
+                    "request_type": "generation_only",
+                    "resolved_thinking": resolved,
+                },
+            },
+        )
+        assert response.status_code == 200, response.text
+        assert (
+            rendered["generation"]["sampling_params"].guided_decoding.structural_tag
+            == context_grammar
+        )
+        assert server._create_chat_response.call_args.args[
+            1
+        ].postproc_args.tool_parser_grammar_constrained
+
     @pytest.mark.parametrize(
         "change",
         [
@@ -668,7 +713,11 @@ class TestOpenAIChatIntegration:
             {"prompt_token_ids": [1, 2]},
             {"prompt_token_ids_b64": "AQAAAA=="},
             {"add_generation_prompt": False},
-            {"disaggregated_params": {"request_type": "context_only"}},
+            {"prompt_token_ids": [1], "disaggregated_params": {"request_type": "generation_only"}},
+            {
+                "prompt_token_ids": [1],
+                "disaggregated_params": {"request_type": "context_only", "resolved_thinking": True},
+            },
             {"response_format": {"type": "json_object"}},
         ],
     )

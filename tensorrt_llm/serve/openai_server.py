@@ -287,11 +287,16 @@ def _validate_required_tool_grammar_request(
             "--reasoning_parser nemotron-v3 (or a compatible parser alias).")
     if not request.tools and not has_dynamic_tools:
         raise ValueError("tool_choice='required' requires tools.")
-    if (request.prompt_token_ids is not None or request.prompt_token_ids_b64
-            or not request.add_generation_prompt
-            or request.disaggregated_params is not None):
-        raise ValueError("Required tool grammars need chat messages with "
-                         "add_generation_prompt=True on a native server.")
+    if not request.add_generation_prompt:
+        raise ValueError(
+            "Required tool grammars need add_generation_prompt=True.")
+    if request.prompt_token_ids is not None or request.prompt_token_ids_b64:
+        handoff = request.disaggregated_params
+        if (handoff is None or handoff.request_type != "generation_only"
+                or handoff.resolved_thinking is None):
+            raise ValueError(
+                "Required tool grammars with prompt token IDs need the context "
+                "worker's resolved thinking mode on a generation-only request.")
     if sampling_params.guided_decoding is not None:
         raise ValueError(
             "tool_choice='required' cannot be combined with response_format "
