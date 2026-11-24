@@ -138,7 +138,9 @@ def create_attention(
 
         if not issubclass(attn_cls, TrtllmAttention):
             raise ValueError(
-                "FMHA library selection requires a TRTLLM attention backend.")
+                "FMHA library selection requires a TrtllmAttention backend. "
+                f"Requested backend {backend_name!r} resolved to {attn_cls.__name__}."
+            )
         kwargs.update(fmha_libs=fmha_libs, use_fmha_libs_env=use_fmha_libs_env)
 
     return attn_cls(

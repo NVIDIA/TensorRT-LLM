@@ -3471,7 +3471,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             )
         self._rebuild_fmha_manager()
 
-    def _rebuild_fmha_manager(self) -> FmhaManager:
+    def _rebuild_fmha_manager(self) -> None:
         manager = FmhaManager(self,
                               fmha_libs=self._fmha_libs,
                               use_fmha_libs_env=self._use_fmha_libs_env)
@@ -3491,7 +3491,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             (fmha
              for fmha in manager.fmha_libs if isinstance(fmha, GqaDecodeFmha)),
             None)
-        return manager
 
     @classmethod
     def runtime_workspace_bytes_per_token(cls, model_config: "ModelConfig",
