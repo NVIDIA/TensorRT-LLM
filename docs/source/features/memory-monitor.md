@@ -29,7 +29,7 @@ The memory monitor is a prototype and its report format may change.
 | Value | Mode | What it does |
 |---|---|---|
 | unset or `oom` | out-of-memory reports (default) | A report for an out-of-memory error the executor's own error handling sees -- a failed request, a crashed executor loop, a failed wakeup -- once the executor has started. PyTorch allocator failures capture a snapshot by default. |
-| `1` (or `full`) | full | Also records startup and reports when it finishes, compares later reports with that point, installs process-wide hooks so that errors from background threads and logged errors are reported too (see [Hooks](#hooks-installed-in-full-mode)), and enables periodic reports and, with a runtime-control key, `GET /memory_report`. |
+| `1` (or `full`) | full | Also records startup and reports when it finishes, compares later reports with that point, installs process-wide hooks so that errors from background threads and logged errors are reported too (see [Hooks](#hooks-installed-by-the-monitor)), and enables periodic reports and, with a runtime-control key, `GET /memory_report`. |
 | `0` (or `off`) | off | No reports are produced on their own. |
 
 ```yaml
@@ -292,7 +292,9 @@ published only if the failure reaches error handling.
 The snapshot runs synchronously for allocator failures, including failures
 the application catches and recovers from. It temporarily uses host memory
 and can delay exception delivery. Only the rendered report of the most recent failure
-is retained. If there is no matching snapshot (including non-PyTorch OOMs
+is retained. If a second failure arrives while an earlier failure is still pending,
+the monitor withholds attribution until the 30-second matching window expires.
+If there is no matching snapshot (including non-PyTorch OOMs
 and disabled capture), the report gives the error and marks the fault-time
 data unavailable. It does not substitute later component readings.
 

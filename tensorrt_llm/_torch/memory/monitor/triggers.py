@@ -232,6 +232,7 @@ class _FailedAllocation:
     reserved_bytes: int | None
     at: float
     snapshot_summary: str = ""
+    ambiguous: bool = False
 
     def describe(self) -> str:
         held = ""
@@ -579,18 +580,25 @@ def _on_out_of_memory(
             summary += f"\nFault-time memory capture incomplete ({type(exc).__name__})."
         finally:
             _reporting.active = False
-    if _armed is not armed:
-        return
-    _last_failed_allocation = _FailedAllocation(
-        device=device,
-        requested_bytes=requested_bytes,
-        pytorch_limit=pytorch_limit,
-        device_free=device_free,
-        live_bytes=live,
-        reserved_bytes=reserved,
-        at=time.monotonic(),
-        snapshot_summary=summary,
-    )
+    with _arm_lock:
+        if _armed is not armed:
+            return
+        now = time.monotonic()
+        previous = _last_failed_allocation
+        # The error handler may run on another thread. Once two unconsumed
+        # failures overlap, this single slot cannot identify both errors.
+        ambiguous = previous is not None and now - previous.at <= _FAILED_ALLOCATION_WINDOW_S
+        _last_failed_allocation = _FailedAllocation(
+            device=device,
+            requested_bytes=requested_bytes,
+            pytorch_limit=pytorch_limit,
+            device_free=device_free,
+            live_bytes=live,
+            reserved_bytes=reserved,
+            at=now,
+            snapshot_summary="" if ambiguous else summary,
+            ambiguous=ambiguous,
+        )
 
 
 def _failed_allocation_of(message: str) -> _FailedAllocation | None:
@@ -601,13 +609,14 @@ def _failed_allocation_of(message: str) -> _FailedAllocation | None:
     unrelated failure must not be blamed on the allocation they handled.
     """
     global _last_failed_allocation
-    failed = _last_failed_allocation
-    if failed is None or time.monotonic() - failed.at > _FAILED_ALLOCATION_WINDOW_S:
-        return None
-    if not failed.is_reported_by(message):
-        return None
-    _last_failed_allocation = None
-    return failed
+    with _arm_lock:
+        failed = _last_failed_allocation
+        if failed is None or time.monotonic() - failed.at > _FAILED_ALLOCATION_WINDOW_S:
+            return None
+        if failed.ambiguous or not failed.is_reported_by(message):
+            return None
+        _last_failed_allocation = None
+        return failed
 
 
 def _device_nearly_full() -> bool:

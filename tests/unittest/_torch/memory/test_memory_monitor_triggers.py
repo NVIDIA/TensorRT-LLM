@@ -246,6 +246,16 @@ def test_torch_observer_only_records(armed):
     mod.notify_error(_TORCH_OOM)
     assert "could not allocate" not in emitted[0]["headline"]
 
+    # Neither error may consume an ambiguous snapshot, even after the first lookup.
+    reset()
+    _oom(mod)
+    _oom(mod)
+    assert mod._failed_allocation_of(_TORCH_OOM) is None
+    assert mod._failed_allocation_of(_TORCH_OOM) is None
+    clock[0] += mod._FAILED_ALLOCATION_WINDOW_S + 1
+    _oom(mod)
+    assert mod._failed_allocation_of(_TORCH_OOM) is not None
+
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("broken", ["is_device_oom", "_failed_allocation_of", "report_now"])
