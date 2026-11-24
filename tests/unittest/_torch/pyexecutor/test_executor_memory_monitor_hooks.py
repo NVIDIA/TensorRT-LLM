@@ -465,14 +465,19 @@ def test_an_unmonitored_executor_says_why_it_has_no_reports(monkeypatch):
     executor._memory_monitor_released = False
     executor._disable_mpi = False
     executor.dist = SimpleNamespace(rank=0, world_size=2)
-    expected = triggers.unavailable_report(1, providers.NOT_MONITORED)
-    assert executor.gather_memory_reports() == [expected]
+    rank_one = {
+        "tag": "on_demand",
+        "rank": 1,
+        "status": "unavailable",
+        "reason": providers.NOT_MONITORED,
+    }
+    assert executor.gather_memory_reports() == [rank_one]
 
     monkeypatch.setattr(triggers, "report_now", mock.Mock(side_effect=AssertionError("built")))
     worker = SimpleNamespace(engine=executor)
     assert BaseWorker.get_memory_report(worker) == [
-        triggers.unavailable_report(0, providers.NOT_MONITORED),
-        expected,
+        {"tag": "on_demand", "rank": 0, "status": "unavailable", "reason": providers.NOT_MONITORED},
+        rank_one,
     ]
 
 
