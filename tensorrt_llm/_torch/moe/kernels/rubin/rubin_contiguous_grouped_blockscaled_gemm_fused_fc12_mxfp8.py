@@ -891,8 +891,8 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
         that skips 16-row groups lying wholly beyond a tile's valid rows (decode
         tiles with a few real rows per 128-row tile). Leave it False for full
         tiles: that keeps the statically unrolled loop, which is faster when
-        every group is live. The runner selects it per compile from the static
-        shapes (``Sm107Mxfp8FusedFc12MoeRunner._use_sparse_gather``), so each
+        every group is live. The runner selects it per tuning bucket
+        (``Sm107Mxfp8FusedFc12MoeRunner._sparse_gather_for_bucket``), so each
         compiled kernel contains one loop body.
     :param fc2_stream_weights: Cache policy for the FC2 B (weight) TMA loads
         alone; ``None`` follows ``stream_weights``.
