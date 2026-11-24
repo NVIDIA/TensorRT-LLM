@@ -132,7 +132,9 @@ class BindingsNixlTransferAgent(BaseTransferAgent):
             f"agent_buffer_size_mb={agent_buffer_size_mb} "
             f"agent_bounce_params={agent_bounce_params or {}} "
             f"UCX_TLS={os.environ.get('UCX_TLS', '<unset>')} "
-            f"UCX_LOG_LEVEL={os.environ.get('UCX_LOG_LEVEL', '<unset>')}"
+            f"UCX_LOG_LEVEL={os.environ.get('UCX_LOG_LEVEL', '<unset>')} "
+            "UCX_CUDA_IPC_CACHE_MAX_REGIONS="
+            f"{os.environ.get('UCX_CUDA_IPC_CACHE_MAX_REGIONS', '<unset>')}"
         )
 
     def shutdown(self):

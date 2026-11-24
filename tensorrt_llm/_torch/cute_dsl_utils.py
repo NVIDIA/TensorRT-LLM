@@ -89,6 +89,25 @@ _SM_RESERVE_ENV = "TRTLLM_CUTEDSL_SM_RESERVE"
 _sm_reserve_announced = set()
 
 
+def set_sm_reserve(reserve: int) -> None:
+    """Keep ``reserve`` SMs out of persistent grids from now on (0 = none), through
+    ``TRTLLM_CUTEDSL_SM_RESERVE`` (a kernel that holds SMs for the whole step sets it, e.g. the
+    dense DWDP gather). A nonzero ``reserve`` must leave at least one SM of the current device."""
+    if reserve < 0:
+        raise ValueError(f"SM reserve must be non-negative, got {reserve}")
+    if reserve:
+        import torch
+
+        if torch.cuda.is_available():
+            sm_count = torch.cuda.get_device_properties(
+                torch.cuda.current_device()).multi_processor_count
+            if reserve >= sm_count:
+                raise ValueError(
+                    f"SM reserve {reserve} must leave at least one of {sm_count} SMs"
+                )
+    os.environ[_SM_RESERVE_ENV] = str(reserve)
+
+
 def sm_reserve() -> int:
     """SMs to keep out of persistent grids, from ``TRTLLM_CUTEDSL_SM_RESERVE`` (0 = none)."""
     try:

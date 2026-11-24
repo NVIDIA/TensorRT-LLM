@@ -129,6 +129,25 @@ def _fp4_mla_cutedsl_fused_v_transpose_enabled() -> bool:
     return _env_enabled_default(FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE_ENV, False)
 
 
+# The serve launcher exports the disaggregated worker role to every rank.
+DISAGG_ROLE_ENV = "TRTLLM_DISAGG_ROLE"
+
+
+def is_fp4_mla_context_only_worker(is_disagg: bool) -> bool:
+    """Whether this worker keeps a single (context-only) FP4 MLA cache copy.
+
+    A dedicated disaggregated CTX worker never decodes, so it omits the
+    generation-only V-scale and packed-V sidecars. The generation worker
+    rebuilds them from the transferred K and K scales.
+    """
+    return bool(is_disagg) and os.getenv(DISAGG_ROLE_ENV) == "context"
+
+
+def is_fp4_mla_context_only_cache(kv_cache_manager: Any) -> bool:
+    """Whether ``kv_cache_manager`` holds a context-only FP4 MLA cache."""
+    return getattr(kv_cache_manager, "fp4_mla_context_only_cache", False) is True
+
+
 FP4_MLA_PACKED_Q_ENV = "TRTLLM_FP4_MLA_PACKED_Q"
 # Packed decode: each request owns a 128-row-padded block of [query token, head]
 # Q rows, the kernel splits KV across grid.z tasks and reads per-row causal
@@ -137,6 +156,31 @@ _FP4_MLA_PACKED_MAX_M = 1024
 _FP4_MLA_PACKED_MAX_SPLITS = 16
 _FP4_MLA_PACKED_MIN_TILES_PER_SPLIT = 2
 _FP4_MLA_SPLIT_KV_ENV = "TRTLLM_FP4_MLA_SPLIT_KV"
+# Opt-in makespan task plan (fp4_mla_packed_reduce.plan_packed_tasks_lpt). Needs a kernel
+# module with SUPPORTS_ORDERED_PLAN.
+_FP4_MLA_LPT_PLAN_ENV = "TRTLLM_FP4_MLA_LPT_PLAN"
+# "0" keeps short packed tasks off the 160K shared-memory page-plan profile and
+# on the next bucketed runtime profile, which reads page ids from global memory.
+_FP4_MLA_PAGE_PLAN_ENV = "TRTLLM_FP4_MLA_PAGE_PLAN"
+# Default on where the kernel module supports it (SUPPORTS_ORDERED_PLAN): the packed plan
+# simulates the waves to pick the task length and runs the full tasks first. "0" keeps the
+# rule's task length and request order, the only plan of kernel modules without that support.
+FP4_MLA_PACKED_WAVE_PLAN_ENV = "TRTLLM_FP4_MLA_PACKED_WAVE_PLAN"
+# Opt-in (Kimi-K3 ULL): the packed decode is a programmatic dependent of the kernel that
+# writes its query (k3_mla_q_fused, which then releases its dependents at entry). The
+# decode's prologue (barriers, TMEM, plan, page table, the first KV tile) runs before its
+# griddepcontrol.wait, the query load right after it. Applies when the query rows come from that
+# kernel and everything else the decode reads was written by kernels that completed before it
+# was launched (the KV update on the aux stream; no plan / lengths / page-table launch in the
+# decode call itself).
+ULL2_MLA_DECODE_PDL_ENV = "TRTLLM_K3_ULL2_MLA_DEC_PDL"
+# Opt-in (Kimi-K3 ULL): where a packed decode whose split reduction a consumer folds
+# (``DeferredPackedReduce(release_early=False)``: the fused Helix tail of a small batch) releases
+# that consumer. "epilogue": once its producer warps have finished the last KV tile, so the
+# consumer stages what does not depend on the decode (W_UV, the task plan) during the decode's
+# partial store instead of after the decode's completion. Unset / "0": only the completion
+# releases it (the late tail).
+ULL3_MLA_TAIL_TRIGGER_ENV = "TRTLLM_K3_ULL3_MLA_TAIL_TRIGGER"
 
 
 def _fp4_mla_packed_q_enabled() -> bool:
@@ -203,15 +247,93 @@ def _cutedsl_backend_available() -> bool:
         return False
 
 
+# A model-specific variant of the packed CuTe DSL decode kernel module (same interface as
+# fp4_mla_cutedsl_mufu16), installed by the model that owns it; None selects the shared one.
+_CUTEDSL_KERNEL_MODULE_OVERRIDE: Optional[Any] = None
+
+
+def set_fp4_mla_cutedsl_kernel_module(module: Optional[Any]) -> None:
+    """Install ``module`` as the CuTe DSL decode kernel module (None restores the shared one).
+
+    It must provide the interface of ``fp4_mla_cutedsl_mufu16``. Installing a different module
+    than the current one raises: the packed plan and split reduction of a step must match the
+    kernel that wrote the partials.
+    """
+    global _CUTEDSL_KERNEL_MODULE_OVERRIDE
+    if (
+        module is not None
+        and _CUTEDSL_KERNEL_MODULE_OVERRIDE is not None
+        and module is not _CUTEDSL_KERNEL_MODULE_OVERRIDE
+    ):
+        raise RuntimeError(
+            "An FP4 MLA CuTe DSL kernel module is already installed: "
+            f"{_CUTEDSL_KERNEL_MODULE_OVERRIDE.__name__}, not {module.__name__}."
+        )
+    _CUTEDSL_KERNEL_MODULE_OVERRIDE = module
+
+
 def _fp4_mla_cutedsl_kernel_module() -> Any:
     if _fp4_mla_cutedsl_fused_v_transpose_enabled():
         from . import fp4_mla_cutedsl_mufu16_fused_v_transpose
 
         return fp4_mla_cutedsl_mufu16_fused_v_transpose
 
+    if _CUTEDSL_KERNEL_MODULE_OVERRIDE is not None:
+        return _CUTEDSL_KERNEL_MODULE_OVERRIDE
+
     from . import fp4_mla_cutedsl_mufu16
 
     return fp4_mla_cutedsl_mufu16
+
+
+def _fp4_mla_kernel_supports(module: Any, capability: str) -> bool:
+    """Whether the CuTe DSL kernel module declares ``capability`` (e.g. SUPPORTS_ORDERED_PLAN)."""
+    return bool(getattr(module, capability, False))
+
+
+def _fp4_mla_kernel_supports_f16_partials(module: Any) -> bool:
+    """Whether the kernel module stores normalized FP16 split partials (SPLIT_PARTIAL_DTYPES)."""
+    import torch
+
+    return torch.float16 in tuple(getattr(module, "SPLIT_PARTIAL_DTYPES", ()))
+
+
+def _fp4_mla_lpt_plan_enabled(module: Any) -> bool:
+    """TRTLLM_FP4_MLA_LPT_PLAN=1 with a kernel module that stores partials by plan slot."""
+    return _env_enabled_default(_FP4_MLA_LPT_PLAN_ENV, False) and _fp4_mla_kernel_supports(
+        module, "SUPPORTS_ORDERED_PLAN"
+    )
+
+
+def _fp4_mla_wave_plan_enabled(module: Any) -> bool:
+    """The wave plan (TRTLLM_FP4_MLA_PACKED_WAVE_PLAN, default on) where the kernel supports it."""
+    return _env_enabled_default(FP4_MLA_PACKED_WAVE_PLAN_ENV, True) and _fp4_mla_kernel_supports(
+        module, "SUPPORTS_ORDERED_PLAN"
+    )
+
+
+def _fp4_mla_page_plan_enabled() -> bool:
+    return _env_enabled_default(_FP4_MLA_PAGE_PLAN_ENV, True)
+
+
+def ull2_mla_decode_pdl_enabled() -> bool:
+    return _env_enabled_default(ULL2_MLA_DECODE_PDL_ENV, False)
+
+
+def ull3_mla_tail_trigger() -> int:
+    """The decode's ``launch_dependents`` mode for a late-released fold consumer (0: none)."""
+    value = os.environ.get(ULL3_MLA_TAIL_TRIGGER_ENV, "0").strip().lower()
+    if value == "epilogue":
+        epilogue = getattr(_fp4_mla_cutedsl_kernel_module(), "LAUNCH_DEPENDENTS_EPILOGUE", 0)
+        if not epilogue:
+            raise ValueError(
+                f"{ULL3_MLA_TAIL_TRIGGER_ENV}=epilogue needs a CuTe DSL kernel module with "
+                "LAUNCH_DEPENDENTS_EPILOGUE."
+            )
+        return epilogue
+    if value not in ("", "0"):
+        raise ValueError(f"{ULL3_MLA_TAIL_TRIGGER_ENV}={value!r}: expected 0 or epilogue")
+    return 0
 
 
 def _ceil_div(lhs: int, rhs: int) -> int:

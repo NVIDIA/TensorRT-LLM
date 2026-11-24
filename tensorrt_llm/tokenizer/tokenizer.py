@@ -17,6 +17,7 @@ import contextlib
 import importlib
 import os
 import pickle  # nosec B403
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -63,6 +64,26 @@ except ImportError:
         f"HF incremental detokenization is unsupported by tokenizer<0.21.0; fallback to TRTLLM incremental detokenization."
     )
     TLLM_INCREMENTAL_DETOKENIZATION_BACKEND = "TRTLLM"
+
+
+def _kimi_batch_encoding(tok, ids: List[int]):
+    """``tok.prepare_for_model(ids, add_special_tokens=True, return_tensors="pt", prepend_batch_axis=True)``.
+
+    Same values, int64 dtype and (1, n) shapes, but the lists become tensors through numpy: transformers converts
+    them element by element in Python (~35 ms per 100k tokens). Returns None for an encoding that is not all int
+    lists, so the caller takes transformers' path.
+    """
+    import numpy as np
+    import torch
+    from transformers import BatchEncoding
+    enc = tok.prepare_for_model(ids, add_special_tokens=True)
+    if not all(isinstance(v, list) for v in enc.values()):
+        return None
+    return BatchEncoding({
+        key:
+        torch.from_numpy(np.asarray([value], dtype=np.int64))
+        for key, value in enc.items()
+    })
 
 
 class TokenizerBase(PreTrainedTokenizerBase):
@@ -275,7 +296,23 @@ class TransformersTokenizer(TokenizerBase):
             )
             return (TransformersTokenizer, (self.tokenizer, ))
 
+    def _requires_pt_from_kimi_tokenizer(self, text, args, kwargs) -> bool:
+        tok = self.tokenizer
+        return (isinstance(text, str) and not args and kwargs == {
+            "return_tensors": "pt"
+        } and type(tok).__name__ == "TikTokenTokenizer"
+                and type(tok).__module__.endswith(".tokenization_kimi"))
+
     def __call__(self, text: str, *args, **kwargs) -> Any:
+        if self._requires_pt_from_kimi_tokenizer(text, args, kwargs):
+            ids = self.encode(text, add_special_tokens=False)
+            enc = _kimi_batch_encoding(self.tokenizer, ids)
+            if enc is not None:
+                return enc
+            return self.tokenizer.prepare_for_model(ids,
+                                                    add_special_tokens=True,
+                                                    return_tensors="pt",
+                                                    prepend_batch_axis=True)
         return self.tokenizer(text, *args, **kwargs)
 
     @property
@@ -290,7 +327,37 @@ class TransformersTokenizer(TokenizerBase):
     def name_or_path(self) -> str:
         return self.tokenizer.name_or_path
 
+    def _can_run_kimi_fast_encode(self, text, args, kwargs) -> bool:
+        tok = self.tokenizer
+        return (isinstance(text, str)
+                and type(tok).__name__ == "TikTokenTokenizer"
+                and type(tok).__module__.endswith(".tokenization_kimi")
+                and not args and kwargs == {
+                    "add_special_tokens": False
+                } and not getattr(tok, "do_lower_case", False)
+                and not getattr(tok, "split_special_tokens", False)
+                and all(not (v.lstrip or v.rstrip or v.single_word)
+                        for v in tok.added_tokens_decoder.values()))
+
     def encode(self, text: str, *args, **kwargs) -> List[int]:
+        tok = self.tokenizer
+        if self._can_run_kimi_fast_encode(text, args, kwargs):
+            # Keep HF's added-token boundaries; native encode on the entire
+            # string can assign different IDs to marker strings. The guards
+            # above leave unsupported normalization/AddedToken options to HF.
+            added = tok.get_added_vocab()
+            if not added:
+                return tok.encode(text, *args, **kwargs)
+            pattern = "(" + "|".join(
+                re.escape(s)
+                for s in sorted(added, key=len, reverse=True)) + ")"
+            result = []
+            for piece in re.split(pattern, text):
+                if piece in added:
+                    result.append(added[piece])
+                elif piece:
+                    result.extend(tok.encode(piece))
+            return result
         return self.tokenizer.encode(text, *args, **kwargs)
 
     def num_special_tokens_to_add(self, pair: bool = False) -> int:
@@ -528,8 +595,16 @@ class TransformersTokenizer(TokenizerBase):
             last_new_tokens + pending_tokens,
             skip_special_tokens=skip_special_tokens,
             spaces_between_special_tokens=spaces_between_special_tokens)
-        if not flush and (len(curr_new_text.rstrip()) <= len(
-                last_new_text.rstrip()) or curr_new_text.endswith("�")):
+        # Kimi's byte decoder preserves trailing whitespace, so it can be
+        # emitted immediately instead of accumulating pending whitespace tokens.
+        byte_level_kimi = (type(self.tokenizer).__name__ == "TikTokenTokenizer"
+                           and hasattr(self.tokenizer, "byte_decoder"))
+        compare_curr = curr_new_text if byte_level_kimi else curr_new_text.rstrip(
+        )
+        compare_last = last_new_text if byte_level_kimi else last_new_text.rstrip(
+        )
+        if not flush and (len(compare_curr) <= len(compare_last)
+                          or curr_new_text.endswith("�")):
             return prev_text, {
                 'last_new_tokens': last_new_tokens,
                 'pending_tokens': pending_tokens
@@ -658,6 +733,17 @@ def tokenizer_factory(obj: Optional[Union[str, Path, PreTrainedTokenizerBase,
         raise TypeError(f"Unrecognized tokenizer {obj}")
 
 
+def _is_byte_level_vocab(tokenizer) -> bool:
+    """Whether vocabulary strings use the byte-to-unicode mapping (" " is "Ġ").
+
+    Some tiktoken tokenizers (e.g. Kimi's) expose their vocabulary that way,
+    like byte-level BPE tokenizers; xgrammar must then decode it as byte-level
+    or no grammar can match a space or a multi-byte character.
+    """
+    ids = tokenizer.encode(" ", add_special_tokens=False)
+    return bool(ids) and tokenizer.convert_ids_to_tokens(ids)[0] == "Ġ"
+
+
 def _xgrammar_tokenizer_info(tokenizer):
     # Reference: https://github.com/mlc-ai/xgrammar/blob/b9a16de54e1e0eff58da14c65750414cceaf1a6f/python/xgrammar/tokenizer_info.py#L133
     if isinstance(tokenizer, TokenizerBase):
@@ -687,8 +773,12 @@ def _xgrammar_tokenizer_info(tokenizer):
     elif ("vocab_file" in tokenizer.vocab_files_names
           and "tiktoken" in tokenizer.vocab_files_names["vocab_file"]):
         return {
-            "encoded_vocab": encoded_vocab,
-            "stop_token_ids": stop_token_ids
+            "encoded_vocab":
+            encoded_vocab,
+            "stop_token_ids":
+            stop_token_ids,
+            "vocab_type":
+            "byte_level" if _is_byte_level_vocab(tokenizer) else "raw",
         }
     else:
         raise ValueError(f"Unsupported tokenizer type: {type(tokenizer)}")

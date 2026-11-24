@@ -222,6 +222,8 @@ class TrtllmGenFusedMoEBase(MoEImplBase):
         # Cached for autotune profile sizing (forward path passes
         # tune_max_num_tokens to the MoE op).
         self.max_num_tokens = model_config.max_num_tokens
+        # Bounds one rank's rows of a MoE chunk (see max_tokens_per_rank_capacity).
+        self._moe_max_num_tokens = model_config.moe_max_num_tokens
 
         self.op_backend: MoEOpBackend = get_op_backend(self.provider)
 
@@ -399,6 +401,126 @@ class TrtllmGenFusedMoEBase(MoEImplBase):
             requires_grad=False,
         )
         self.register_parameter("w2_bias", self.w2_bias)
+
+    # ---- per-layer dynamic EPLB --------------------------------------------
+    #: Expert-indexed kernel operands, in kernel argument order. Those that are
+    #: per-expert tensors become live-weight planes under per-layer dynamic EPLB.
+    _LIVE_WEIGHT_PLANE_NAMES: ClassVar[tuple[str, ...]] = (
+        "w3_w1_weight",
+        "w3_w1_weight_scale",
+        "w3_w1_bias",
+        "w2_weight",
+        "w2_weight_scale",
+        "w2_bias",
+        "fc31_alpha",
+        "fc31_scale_c",
+        "fc2_alpha",
+        "act_alpha",
+        "act_beta",
+        "act_clamp",
+    )
+
+    def _uses_replica_plans(self) -> bool:
+        layer = self.layer_load_balancer
+        return bool(layer is not None and layer.produces_replica_plan)
+
+    @property
+    def compute_slot_count(self) -> int:
+        """Slots per rank the kernel computes: ``H`` resident experts plus helpers.
+
+        ``expert_size_per_partition`` stays the resident/checkpoint axis ``H``;
+        per-layer dynamic EPLB appends the layer handle's ``S`` helper slots to
+        every expert-indexed kernel operand. Without it this is ``H``.
+        """
+        resident = int(self.expert_size_per_partition)
+        if not self._uses_replica_plans():
+            return resident
+        return resident + int(self.layer_load_balancer.helper_slots_per_rank)
+
+    @property
+    def ep_process_group(self) -> None:
+        """No torch EP group: the EPLB runtime forms its own from ``mapping``."""
+        return None
+
+    @property
+    def max_tokens_per_rank_capacity(self) -> int:
+        """The most token rows one rank routes in one MoE chunk.
+
+        Chunking keeps ``num_dp_ranks * rows_per_rank`` within
+        ``moe_max_num_tokens``, and a rank never routes more than
+        ``max_num_tokens`` in one chunk-free forward.
+        """
+        dp_size = max(1, int(self.mapping.dp_size)) if self.use_dp else 1
+        chunk_rows = -(-int(self._moe_max_num_tokens) // dp_size)
+        return max(int(self.max_num_tokens), chunk_rows)
+
+    def _local_slot_window(self, replica_plan: object | None) -> tuple[int, int]:
+        """``(local_expert_offset, local_num_experts)`` of this forward's kernel.
+
+        Under a replica plan, routes are physical slots ``rank * M + slot`` and
+        every expert-indexed operand holds ``M`` rows.
+        """
+        if replica_plan is None:
+            return self.slot_start, self.expert_size_per_partition
+        compute = self.compute_slot_count
+        if (
+            int(replica_plan.resident_experts_per_rank) != int(self.expert_size_per_partition)
+            or int(replica_plan.compute_slots_per_rank) != compute
+            or int(self.w3_w1_weight.shape[0]) != compute
+        ):
+            raise RuntimeError(
+                f"{type(self).__name__} replica-plan geometry does not match its "
+                f"weights: plan H/M={replica_plan.resident_experts_per_rank}/"
+                f"{replica_plan.compute_slots_per_rank}, backend H/M="
+                f"{self.expert_size_per_partition}/{compute}, weight rows "
+                f"{self.w3_w1_weight.shape[0]}."
+            )
+        return self.ep_rank * compute, compute
+
+    def _bind_live_weight_planes(self) -> None:
+        """Move the final expert operands onto the layer's ``H + S`` arena.
+
+        Runs once, after loading and every in-place transform, on every EP rank
+        in the same layer order: allocating the arena and building the
+        HALO-Q/TMA producer are collective. A no-op without per-layer dynamic
+        EPLB.
+        """
+        if not self._uses_replica_plans():
+            return
+        if not self.capabilities.supports_per_layer_dynamic_eplb:
+            raise RuntimeError(
+                f"{type(self).__name__} does not consume per-layer dynamic EPLB plans"
+            )
+        from ..per_layer_dynamic_eplb.live_planes import bind_live_weight_planes
+
+        layer = self.layer_load_balancer
+        if layer.live_weight_arena is not None:
+            raise RuntimeError(
+                f"{type(self).__name__} layer {self.layer_idx}: the per-layer dynamic "
+                "EPLB planes are bound once; their derived state cannot be rebuilt"
+            )
+        resident = int(self.expert_size_per_partition)
+        names = []
+        for name in self._LIVE_WEIGHT_PLANE_NAMES:
+            value = getattr(self, name, None)
+            if isinstance(value, torch.Tensor) and value.dim() >= 1:
+                if int(value.shape[0]) != resident:
+                    raise RuntimeError(
+                        f"{type(self).__name__}.{name} has {value.shape[0]} rows; "
+                        f"per-layer dynamic EPLB expects one per resident expert ({resident})"
+                    )
+                names.append(name)
+        bind_live_weight_planes(
+            self,
+            names,
+            hidden=self.hidden_size,
+            intermediate=self.intermediate_size_per_partition,
+            ep_process_group=self.ep_process_group,
+        )
+        # The replaced tensors are free; return them to the driver before the
+        # next layer's arena allocation.
+        torch.cuda.empty_cache()
+        layer.bind_backend(self)
 
     def supports_moe_output_in_alltoall_workspace(self) -> bool:
         """Whether ``run_moe`` fills a caller-supplied output buffer.

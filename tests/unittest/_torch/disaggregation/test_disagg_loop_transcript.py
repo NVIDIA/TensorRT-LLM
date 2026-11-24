@@ -57,6 +57,7 @@ _COLLECTIVE_COORDINATOR_CALLS = {
     "poll_gen_transfers",  # gen transfer status consensus
     "poll_progress_when_idle",  # ctx transfer status consensus
     "align_gen_admission_across_cp",  # cp_allgather of the admitted gen-init ids
+    "align_gen_admission_across_tp",  # tp_allgather_int64 of the admitted gen-init ids
     "receive_gen_init",  # async receive polls gen status consensus
     "reap_context_sends",  # ctx transfer status consensus
     "handle_timeouts_synced",  # tp_allgather_int64 under ADP
@@ -96,8 +97,13 @@ def _recording_coordinator(calls: list) -> DisaggTransferCoordinator:
         calls.append(("align_gen_admission_across_cp", admitted))
         return admitted
 
+    def align_gen_admission_across_tp(admitted):
+        calls.append(("align_gen_admission_across_tp", admitted))
+        return admitted
+
     coordinator.admit = admit
     coordinator.align_gen_admission_across_cp = align_gen_admission_across_cp
+    coordinator.align_gen_admission_across_tp = align_gen_admission_across_tp
     return coordinator
 
 
@@ -223,6 +229,7 @@ _SCHEDULE_HEAD = [
     ("check_transfer_timeouts",),
     ("admit", []),
     ("align_gen_admission_across_cp", []),
+    ("align_gen_admission_across_tp", []),
     ("receive_gen_init", []),
     ("poll_progress_when_idle",),
 ]

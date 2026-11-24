@@ -49,13 +49,39 @@ _NCCL_SYMMETRIC_ZERO_COPY: bool = (os.environ.get(
 # Bytes of the full all-reduce message (tokens * hidden * ranks * element size) up to which the
 # MNNVL path uses the one-shot kernel; mirrors kOneShotSizeThreshold in thop/allreduceOp.cpp and
 # the same TLLM_MNNVL_ONESHOT_THRESHOLD_BYTES override, so the lamport workspace is sized for it.
-_MNNVL_ONE_SHOT_THRESHOLD_BYTES = int(
-    os.environ.get("TLLM_MNNVL_ONESHOT_THRESHOLD_BYTES", 64 * 1024 * 8 * 2))
-if _MNNVL_ONE_SHOT_THRESHOLD_BYTES < 0:
-    # The native side rejects a negative value too; fail at import with the variable's name.
-    raise ValueError(
-        "TLLM_MNNVL_ONESHOT_THRESHOLD_BYTES must be a non-negative integer, got "
-        f"{_MNNVL_ONE_SHOT_THRESHOLD_BYTES}")
+_MNNVL_ONE_SHOT_THRESHOLD_ENV = "TLLM_MNNVL_ONESHOT_THRESHOLD_BYTES"
+# Another name for the same override (the Kimi K3 Rubin recipes set this one). When only this
+# name is set, its value is exported under _MNNVL_ONE_SHOT_THRESHOLD_ENV, which the C++ op reads
+# on its first call, so both sides switch at the same size.
+_MNNVL_ONE_SHOT_THRESHOLD_ALIAS_ENV = "TRTLLM_MNNVL_AR_ONESHOT_MAX_BYTES"
+
+
+def _mnnvl_one_shot_threshold_bytes() -> int:
+    value = os.environ.get(_MNNVL_ONE_SHOT_THRESHOLD_ENV)
+    alias = os.environ.get(_MNNVL_ONE_SHOT_THRESHOLD_ALIAS_ENV)
+    if alias is not None:
+        if value is None:
+            os.environ[_MNNVL_ONE_SHOT_THRESHOLD_ENV] = alias
+            value = alias
+            logger.info(
+                f"[MNNVL AllReduce] one-shot threshold {alias} bytes from "
+                f"{_MNNVL_ONE_SHOT_THRESHOLD_ALIAS_ENV} (exported as "
+                f"{_MNNVL_ONE_SHOT_THRESHOLD_ENV})")
+        elif int(alias) != int(value):
+            raise ValueError(
+                f"{_MNNVL_ONE_SHOT_THRESHOLD_ALIAS_ENV}={alias} and "
+                f"{_MNNVL_ONE_SHOT_THRESHOLD_ENV}={value} disagree; they name the same "
+                "threshold, set one of them")
+    threshold = int(value) if value is not None else 64 * 1024 * 8 * 2
+    if threshold < 0:
+        # The native side rejects a negative value too; fail at import with the variable's name.
+        raise ValueError(
+            f"{_MNNVL_ONE_SHOT_THRESHOLD_ENV} must be a non-negative integer, got "
+            f"{threshold}")
+    return threshold
+
+
+_MNNVL_ONE_SHOT_THRESHOLD_BYTES = _mnnvl_one_shot_threshold_bytes()
 
 _thread_local = threading.local()
 

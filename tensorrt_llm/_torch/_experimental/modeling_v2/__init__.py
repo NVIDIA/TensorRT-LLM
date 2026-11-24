@@ -30,6 +30,7 @@ from ._router_index import (
     MODELING_V2_VALIDATE_ENV,
     ModelingV2Mode,
     NoTarget,
+    modeling_v2_dflash_ctx_bytes_per_slot,
     modeling_v2_resolve,
     step_contract_enabled,
 )
@@ -38,6 +39,7 @@ __all__ = [
     "MODELING_V2_VALIDATE_ENV",
     "ModelingV2Mode",
     "NoTarget",
+    "modeling_v2_dflash_ctx_bytes_per_slot",
     "modeling_v2_resolve",
     "step_contract_enabled",
 ]

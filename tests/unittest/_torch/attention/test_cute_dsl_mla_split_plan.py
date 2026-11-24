@@ -54,15 +54,21 @@ def test_plan_mla_split_kv_policy(kv_lens: list[int], rows: int, expected: list[
     assert plan == expected
 
 
-def test_plan_kernel_matches_host_mirror() -> None:
+@pytest.mark.parametrize("piece_cost", [None, 0, 30])
+def test_plan_kernel_matches_host_mirror(piece_cost) -> None:
+    """Every piece cost (default: the target decode's), and every block size the launch picks
+    for the batch (one warp of lanes up to the request cap)."""
     mod = _plan_mod()
     generator = torch.Generator().manual_seed(3)
+    cost = {} if piece_cost is None else {"piece_cost": piece_cost}
     for rows in (1, 4, 8):
-        for batch in (1, 3, 8, 16, 37, 128):
+        for batch in (1, 3, 8, 16, 37, 128, 300, 1024):
             kv = torch.randint(1, 300_000, (batch,), generator=generator)
             kv[0] = 262144  # a long one
             kv_lens = kv.tolist()
-            expected = mod.plan_mla_split_kv(kv_lens, rows_per_request=rows, wave_clusters=WAVE)
+            expected = mod.plan_mla_split_kv(
+                kv_lens, rows_per_request=rows, wave_clusters=WAVE, **cost
+            )
             cache_seqs = torch.tensor(kv_lens, dtype=torch.int32, device="cuda")
             plan = torch.full((batch + 3,), -5, dtype=torch.int32, device="cuda")
             mod.launch_mla_split_kv_plan(
@@ -71,6 +77,7 @@ def test_plan_kernel_matches_host_mirror() -> None:
                 num_requests=batch,
                 rows_per_request=rows,
                 wave_clusters=WAVE,
+                **cost,
             )
             torch.cuda.synchronize()
             assert plan[:batch].tolist() == expected, (rows, batch, kv_lens[:4])
@@ -212,3 +219,119 @@ def test_runner_variable_split_matches_uniform_split(
         torch.testing.assert_close(
             log_partition[finite], ref_log_partition[finite], rtol=1e-4, atol=1e-4
         )
+
+
+@pytest.mark.parametrize("split_kv,plan", [(7, None), (32, [22, 3, 9]), (32, [32, 1, 13])])
+def test_fp8_reduce_unroll_is_bitwise(monkeypatch, split_kv: int, plan) -> None:
+    """TRTLLM_K3_DRAFT3_REDUCE_UNROLL: the FP8 split-KV reduction gives the same bits for every
+    unroll, uniform and planned splits, eager and under CUDA graph, and the unrolled kernels are
+    the ones that ran."""
+    import cutlass
+
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import CuteDSLNVMlaDecodeBlackwellRunner
+
+    torch.manual_seed(11)
+    device = torch.device("cuda")
+    num_heads, seq_len_q, page_size, max_batch_size = 64, 8, 128, 32
+    latent_dim, rope_dim = 512, 64
+    kv_lens = [5508, 358, 1508]
+    batch_size = len(kv_lens)
+    blocks_per_sequence = math.ceil(max(kv_lens) / page_size)
+    num_pages = batch_size * blocks_per_sequence
+    softmax_scale = 1.0 / math.sqrt(192)
+    q_storage = (
+        torch.randn(batch_size, seq_len_q, num_heads, latent_dim + rope_dim, device=device) * 0.1
+    ).to(torch.float8_e4m3fn)
+    cache_storage = (
+        torch.randn(num_pages, page_size, latent_dim + rope_dim, device=device) * 0.1
+    ).to(torch.float8_e4m3fn)
+    page_table = (
+        torch.randperm(num_pages, device=device)
+        .to(torch.int32)
+        .view(batch_size, blocks_per_sequence)
+        .transpose(0, 1)
+    )
+    cache_seqs = torch.tensor(kv_lens, dtype=torch.int32, device=device)
+    runner = CuteDSLNVMlaDecodeBlackwellRunner(
+        in_dtype=cutlass.Float8E4M3FN,
+        num_heads=num_heads,
+        seq_len_q=seq_len_q,
+        page_size=page_size,
+        max_batch_size=max_batch_size,
+        emit_softmax_stats=True,
+    )
+    workspace = torch.zeros(
+        runner.get_max_padded_workspace_size(
+            num_heads, seq_len_q, latent_dim, max_batch_size, cutlass.Float32
+        ),
+        device=device,
+        dtype=torch.uint8,
+    )
+    inputs = [
+        q_storage[..., :latent_dim].permute(2, 3, 1, 0),
+        q_storage[..., latent_dim:].permute(2, 3, 1, 0),
+        cache_storage[..., :latent_dim].permute(1, 2, 0),
+        cache_storage[..., latent_dim:].permute(1, 2, 0),
+        page_table,
+        cache_seqs,
+    ]
+    tail = [
+        cache_seqs.repeat_interleave(seq_len_q),
+        torch.tensor([softmax_scale], device=device),
+        torch.tensor([1.0], device=device),
+    ]
+    if plan is not None:
+        tail.append(torch.tensor(plan, dtype=torch.int32, device=device))
+
+    def launch(out, stats):
+        runner.forward(
+            inputs + [out.permute(2, 3, 1, 0), workspace, stats] + tail,
+            tactic=((128, 128), (128, 256), split_kv, False),
+        )
+
+    def fresh():
+        return (
+            torch.full(
+                (batch_size, seq_len_q, num_heads, latent_dim),
+                float("nan"),
+                device=device,
+                dtype=torch.bfloat16,
+            ),
+            torch.full((batch_size * seq_len_q, num_heads, 2), float("nan"), device=device),
+        )
+
+    # The unroll each launch compiled in (called only when the split workspace is used).
+    applied = []
+    resolve = CuteDSLNVMlaDecodeBlackwellRunner._kernel_reduce_unroll.__func__
+
+    def record(cls, kernel_class):
+        applied.append(resolve(cls, kernel_class))
+        return applied[-1]
+
+    monkeypatch.setattr(CuteDSLNVMlaDecodeBlackwellRunner, "_kernel_reduce_unroll", classmethod(record))
+
+    results = {}
+    for unroll in ("1", "4", "8"):
+        monkeypatch.setenv("TRTLLM_K3_DRAFT3_REDUCE_UNROLL", unroll)
+        results[unroll] = fresh()
+        launch(*results[unroll])
+    torch.cuda.synchronize()
+    assert applied == [1, 4, 8]
+    ref_out, ref_stats = results["1"]
+    assert not torch.isnan(ref_out.float()).any()
+    for unroll in ("4", "8"):
+        out, stats = results[unroll]
+        assert torch.equal(out.view(torch.int16), ref_out.view(torch.int16)), unroll
+        assert torch.equal(stats.view(torch.int32), ref_stats.view(torch.int32)), unroll
+
+    monkeypatch.setenv("TRTLLM_K3_DRAFT3_REDUCE_UNROLL", "8")
+    captured = fresh()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch(*captured)
+    for t in captured:
+        t.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(captured[0].view(torch.int16), ref_out.view(torch.int16))
+    assert torch.equal(captured[1].view(torch.int32), ref_stats.view(torch.int32))

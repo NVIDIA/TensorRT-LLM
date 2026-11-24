@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,7 +24,9 @@ from tensorrt_llm._utils import mpi_disabled
 
 
 class CpType(StrEnum):
-    # CP type for ulysses parallelism
+    # CP type for ulysses parallelism: the CP ranks split the sequence for the
+    # token-wise layers and act as one replica with the TP ranks otherwise
+    # (attention heads, KV cache and MoE span tp_size * cp_size ranks).
     ULYSSES = "ULYSSES"
     # CP type for ring attention
     RING = "RING"
@@ -59,7 +61,8 @@ class MappingBase:
             enable_lm_head_tp_in_adp=False,
             dwdp_size=0,
             dwdp_rank=0,
-            helix_repurposed_cp_size=1):
+            helix_repurposed_cp_size=1,
+            helix_repurposed_cp_config=None):
         # Validate and store DWDP configuration
         if dwdp_size < 0 or dwdp_size == 1:
             raise ValueError(
@@ -71,6 +74,11 @@ class MappingBase:
         self._dwdp_rank = dwdp_rank
         # CP size folded into tp by repurpose_helix_cp_to_tp(); 1 otherwise.
         self._helix_repurposed_cp_size = helix_repurposed_cp_size
+        # cp_config of the helix mapping repurpose_helix_cp_to_tp() folded;
+        # empty otherwise. Not part of equality: a repurposed mapping is the
+        # same TP layout whatever exchange its helix original used.
+        self._helix_repurposed_cp_config = dict(helix_repurposed_cp_config
+                                                or {})
 
         # set default values for non-moe cases
         # or where only one MOE parallelism size is specified
@@ -92,7 +100,8 @@ class MappingBase:
                 cp_config["cp_type"] = CpType(cp_type_str)
             cp_type = cp_config.get("cp_type", CpType.ULYSSES)
 
-        moe_world_size = tp_size if cp_type == CpType.ULYSSES else tp_size * cp_size
+        self._cp_type = cp_type
+        moe_world_size = tp_size * cp_size
 
         # DWDP override: when dwdp_size > 1, decouple the fused-MoE EP layout
         # from DWDP. Setting ``moe_ep_size = 1`` makes the fused MoE backend
@@ -180,7 +189,7 @@ class MappingBase:
                 f"but got {tp_size} * {cp_size} != {attn_tp_size} * {attn_cp_size}"
             )
 
-        if moe_ep_size != 1 and cp_size > 1 and cp_type != CpType.HELIX:
+        if moe_ep_size != 1 and cp_size > 1 and cp_type == CpType.RING:
             raise NotImplementedError(
                 f"CP {cp_type} doesn't support MoE tp/ep yet")
 
@@ -266,18 +275,29 @@ class MappingBase:
         self._rank = rank
 
     @property
+    def moe_group_rank(self) -> int:
+        """This rank's index in its pipeline stage's MoE TP x cluster x EP group.
+
+        The TP rank, except under Ulysses CP, whose MoE group spans the TP x CP
+        ranks: there it is the TP-major, CP-minor flat rank.
+        """
+        if self.has_cp_ulysses():
+            return self.tp_rank * self.cp_size + self.cp_rank
+        return self.tp_rank
+
+    @property
     def moe_tp_rank(self):
-        return self.tp_rank // (self.moe_ep_size * self.moe_cluster_size)
+        return self.moe_group_rank // (self.moe_ep_size * self.moe_cluster_size)
 
     @property
     def moe_cluster_rank(self):
-        return self.tp_rank % self.moe_cluster_size
+        return self.moe_group_rank % self.moe_cluster_size
 
     @property
     def moe_ep_rank(self):
         if self._dwdp_size > 1:
             return self._dwdp_moe_ep_rank
-        return self.tp_rank % self.moe_ep_size
+        return self.moe_group_rank % self.moe_ep_size
 
     @property
     def dwdp_size(self) -> int:
@@ -313,6 +333,10 @@ class MappingBase:
         return self._helix_repurposed_cp_size
 
     @property
+    def helix_repurposed_cp_config(self) -> dict:
+        return dict(self._helix_repurposed_cp_config)
+
+    @property
     def tp_group_shares_requests(self) -> bool:
         """Whether every rank of the TP group serves the same requests.
 
@@ -337,8 +361,8 @@ class MappingBase:
         return mapping
 
     def has_cp_ulysses(self):
-        return self.cp_size > 1 and self.cp_config.get(
-            "cp_type") == CpType.ULYSSES
+        # cp_type defaults to ULYSSES when cp_config does not name one.
+        return self.cp_size > 1 and self._cp_type == CpType.ULYSSES
 
     def has_cp_helix(self):
         return self.cp_size > 1 and self.cp_config.get(
@@ -489,6 +513,7 @@ class MappingBase:
             'dwdp_size': self._dwdp_size,
             'dwdp_rank': self._dwdp_rank,
             'helix_repurposed_cp_size': self._helix_repurposed_cp_size,
+            'helix_repurposed_cp_config': self._helix_repurposed_cp_config,
         }
 
 
@@ -615,7 +640,8 @@ class Mapping(MappingBase):
             enable_lm_head_tp_in_adp=False,
             dwdp_size=0,
             dwdp_rank=0,
-            helix_repurposed_cp_size=1):
+            helix_repurposed_cp_size=1,
+            helix_repurposed_cp_config=None):
         super().__init__(world_size=world_size,
                          rank=rank,
                          gpus_per_node=gpus_per_node,
@@ -633,7 +659,8 @@ class Mapping(MappingBase):
                          enable_lm_head_tp_in_adp=enable_lm_head_tp_in_adp,
                          dwdp_size=dwdp_size,
                          dwdp_rank=dwdp_rank,
-                         helix_repurposed_cp_size=helix_repurposed_cp_size)
+                         helix_repurposed_cp_size=helix_repurposed_cp_size,
+                         helix_repurposed_cp_config=helix_repurposed_cp_config)
 
     def repurpose_helix_cp_to_tp(self):
         # In helix parallelism, CP is relevant only for the attention layer. These ranks are repurposed to TP
@@ -656,7 +683,50 @@ class Mapping(MappingBase):
             enable_lm_head_tp_in_adp=self.enable_lm_head_tp_in_adp,
             dwdp_size=self._dwdp_size,
             dwdp_rank=self._dwdp_rank,
-            helix_repurposed_cp_size=self.cp_size)
+            helix_repurposed_cp_size=self.cp_size,
+            helix_repurposed_cp_config=self.cp_config)
+
+    def helix_mapping_for_kv_heads(
+            self,
+            num_kv_heads: int,
+            inherit_cp_config: bool = False) -> "Mapping":
+        """Helix attention mapping for a dense model on a repurposed helix group.
+
+        When the flattened TP group of a repurpose_helix_cp_to_tp() mapping is
+        wider than the model's KV heads, head TP would replicate each KV head.
+        Shard heads over tp = num_kv_heads instead and the sequence over the
+        remaining cp = tp_size // num_kv_heads ranks (consecutive ranks, as in
+        Mapping's CP groups). Returns self when that does not apply, including
+        when that cp does not divide the original helix cp (target tp > 1): the
+        unified KV cache keeps each drafter cp span inside one helix ledger block.
+
+        ``inherit_cp_config=True`` gives the new mapping the cp_config of the
+        helix mapping this one was repurposed from (its all-to-all transport,
+        e.g. ``use_nccl_for_alltoall: false`` for the MNNVL exchange), with
+        cp_type HELIX; otherwise its cp_config is ``{cp_type: HELIX}`` alone,
+        i.e. the NCCL all-to-all.
+        """
+        if (self.helix_repurposed_cp_size <= 1 or self.enable_attention_dp
+                or self.pp_size != 1 or num_kv_heads <= 0
+                or self.tp_size <= num_kv_heads
+                or self.tp_size % num_kv_heads != 0
+                or self.helix_repurposed_cp_size %
+            (self.tp_size // num_kv_heads) != 0):
+            return self
+        cp_config = {"cp_type": CpType.HELIX}
+        if inherit_cp_config:
+            cp_config = {**self._helix_repurposed_cp_config, **cp_config}
+        return Mapping(world_size=self.world_size,
+                       rank=self.rank,
+                       gpus_per_node=self.gpus_per_node,
+                       cp_size=self.tp_size // num_kv_heads,
+                       cp_config=cp_config,
+                       tp_size=num_kv_heads,
+                       pp_size=1,
+                       moe_tp_size=self.moe_tp_size,
+                       moe_ep_size=self.moe_ep_size,
+                       moe_cluster_size=self.moe_cluster_size,
+                       enable_lm_head_tp_in_adp=self.enable_lm_head_tp_in_adp)
 
     # DeviceMesh specific methods
     @property

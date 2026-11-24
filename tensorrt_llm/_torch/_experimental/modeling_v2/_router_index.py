@@ -41,6 +41,7 @@ target.
 from __future__ import annotations
 
 import enum
+import json
 import os
 from typing import TYPE_CHECKING, Callable, Dict, Optional, Tuple
 
@@ -66,6 +67,53 @@ def routes(*architectures: str):
         return route
 
     return register
+
+
+# architectures[0] -> the per-slot bytes of the drafter context a family's own DFlash worker
+# allocates, filled by ``@dflash_context_for``.
+_DFLASH_CONTEXTS: Dict[str, Callable[..., Optional[int]]] = {}
+
+
+def dflash_context_for(*architectures: str):
+    """Declare the per-request-slot DFlash drafter context of these ``architectures[0]`` values.
+
+    The decorated ``fn(llm_args, draft_config) -> Optional[int]`` returns the bytes one request
+    slot of the drafter context takes on a GPU, as the family's DFlash worker allocates it under
+    those arguments (``draft_config`` is the drafter checkpoint's config.json, or None when it is
+    not readable yet), or None to keep the engine's estimate. The config-time DFlash buffer check
+    runs before any target is routed and otherwise sizes the engine's own dense context, which a
+    family whose worker lays its drafter context out differently does not allocate.
+    """
+
+    def register(fn):
+        for arch in architectures:
+            _DFLASH_CONTEXTS[arch] = fn
+        return fn
+
+    return register
+
+
+def modeling_v2_dflash_ctx_bytes_per_slot(
+    llm_args: "TorchLlmArgs", draft_config: Optional[dict]
+) -> Optional[int]:
+    """Per-slot bytes of the DFlash drafter context the model's family declares, or None.
+
+    None when ``modeling_v2`` is ``off``, when the target checkpoint's config.json is not a
+    readable local file (a hub id before download), or when its family declares no
+    ``@dflash_context_for``: the engine's estimate then applies.
+    """
+    if ModelingV2Mode.of(llm_args) is ModelingV2Mode.OFF:
+        return None
+    path = os.path.join(str(llm_args.model), "config.json")
+    if not os.path.isfile(path):
+        return None
+    with open(path) as f:
+        architectures = json.load(f).get("architectures") or []
+    if not architectures:
+        return None
+    registered_routes()  # imports every family's routing module
+    fn = _DFLASH_CONTEXTS.get(architectures[0])
+    return fn(llm_args, draft_config) if fn is not None else None
 
 
 def registered_routes() -> Dict[str, Callable[..., type]]:

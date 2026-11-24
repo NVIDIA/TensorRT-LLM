@@ -51,6 +51,14 @@ enum class PageStatus : int
     DROPPABLE = 2, // Allow eviction and dropping.
 };
 
+// Ownership domain of an attention layer. Standalone draft pools precede target pools in
+// the storage layout.
+enum class CacheDomain : int
+{
+    kStandaloneDraft = 0,
+    kTarget = 1,
+};
+
 enum class CacheTier : int
 {
     GPU_MEM = 0,

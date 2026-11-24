@@ -1135,8 +1135,13 @@ def create_input_processor(
             input_processor_cls = INPUT_PROCESSOR_REGISTRY._input_processors_cls_by_model_type \
                 .get(model_cls)
         except RuntimeError:  # unregistered model
-            logger.info("Unregistered model, using DefaultInputProcessor")
-            input_processor_cls = None
+            # A family that exists only in modeling_v2 has no zoo class to key
+            # the registry by; its architecture module names the processor.
+            from tensorrt_llm._torch._experimental.modeling_v2._architecture_index import \
+                input_processor_class
+            input_processor_cls = input_processor_class(config)
+            if input_processor_cls is None:
+                logger.info("Unregistered model, using DefaultInputProcessor")
         if input_processor_cls is not None:
             if (issubclass(input_processor_cls, BaseMultimodalInputProcessor)
                     and input_processor_cls.supports_tokenization_cache):

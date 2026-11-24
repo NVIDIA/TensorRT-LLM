@@ -107,19 +107,23 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
         configuration. Rebuilt from ``self.activation`` and not from a snapshot
         taken in ``create_weights``: under meta init those slots are themselves
         meta at that point, so a snapshot would carry no values.
+
+        With per-layer dynamic EPLB, the final per-expert operands then move
+        onto the layer's helper-slot arena (``_bind_live_weight_planes``).
         """
         super().cache_derived_state()
-        if not self.is_situ_activation:
-            return
-        params = materialize_activation_params(
-            self.activation,
-            resolve_activation_support(self),
-            num_local_experts=self.expert_size_per_partition,
-            device=self.act_alpha.device,
-            owner=type(self).__name__,
-        )
-        self.act_alpha.data.copy_(params.alpha)
-        self.act_beta.data.copy_(params.beta)
+        if self.is_situ_activation:
+            params = materialize_activation_params(
+                self.activation,
+                resolve_activation_support(self),
+                num_local_experts=self.expert_size_per_partition,
+                device=self.act_alpha.device,
+                owner=type(self).__name__,
+            )
+            self.act_alpha.data.copy_(params.alpha)
+            self.act_beta.data.copy_(params.beta)
+        # Last: the per-expert operands are final now.
+        self._bind_live_weight_planes()
 
     def run_moe(
         self,
@@ -140,6 +144,7 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
         output1_scale_scalar = get_data_or_none(self, "fc31_scale_c")
         output1_scale_gate_scalar = get_data_or_none(self, "fc31_alpha")
         output2_scale_scalar = get_data_or_none(self, "fc2_alpha")
+        local_expert_offset, local_num_experts = self._local_slot_window(ctx.replica_plan)
 
         outputs = self.op_backend.run_fp4_block_scale_moe(
             k.router_logits,
@@ -163,8 +168,8 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
             k.n_group,
             k.topk_group,
             intermediate_size_per_partition_padded,
-            self.slot_start,
-            self.expert_size_per_partition,
+            local_expert_offset,
+            local_num_experts,
             k.routed_scaling_factor,
             self.routing_method.routing_method_type,
             do_finalize=k.do_finalize,

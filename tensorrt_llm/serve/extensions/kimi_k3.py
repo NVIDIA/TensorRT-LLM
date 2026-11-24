@@ -29,7 +29,11 @@ from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
     StreamOptions,
 )
-from tensorrt_llm.serve.serving_extensions import ServingExtension, register_serving_extension
+from tensorrt_llm.serve.serving_extensions import (
+    RequiredToolChoiceMode,
+    ServingExtension,
+    register_serving_extension,
+)
 
 # Valid function-tool name for message-level tools: no leading digit, word
 # chars/dash only, at most 256 chars.
@@ -124,13 +128,25 @@ def validate_kimi_dynamic_tools(request: ChatCompletionRequest) -> None:
 class KimiK3ServingExtension(ServingExtension):
     """Kimi/Moonshot API semantics for kimi_k3 chat requests."""
 
+    # The reference renderer keeps unparsable tool-call argument strings verbatim and renders a
+    # system message's tools as an in-conversation tool declaration.
+    lenient_tool_call_arguments = True
+    keeps_message_tools = True
+
+    # Thinking efforts the checkpoint chat template renders.
+    _THINKING_EFFORTS = ("low", "high", "max")
+
     # Trailing tokens of the native K3 generation prompt (the channel opener
     # ``<|open|>think|response<|sep|>``) that are not reported as prompt usage.
     _GENERATION_CHANNEL_OPENER_TOKENS = 3
 
     def allows_required_tool_choice(self) -> bool:
-        """K3 enforces ``tool_choice="required"`` through its template."""
+        """K3's template asks for a call on ``tool_choice="required"``."""
         return True
+
+    def required_tool_choice_mode(self) -> RequiredToolChoiceMode:
+        """Enforce the call with the kimi_k3 tool grammar when the request allows it."""
+        return "prefer_grammar"
 
     def serialize_tool(self, tool) -> Dict[str, Any]:
         """Drop pydantic-injected null defaults (strict, description, parameters).
@@ -188,6 +204,11 @@ class KimiK3ServingExtension(ServingExtension):
             enabled = request.thinking.type != "disabled"
             derived["thinking"] = enabled
             if enabled and request.thinking.effort is not None:
+                if request.thinking.effort not in self._THINKING_EFFORTS:
+                    raise ValueError(
+                        f"thinking.effort must be one of {', '.join(self._THINKING_EFFORTS)}; "
+                        f"got {request.thinking.effort!r}."
+                    )
                 derived["thinking_effort"] = request.thinking.effort
         if (
             "reasoning_effort" in request.model_fields_set
@@ -205,7 +226,7 @@ class KimiK3ServingExtension(ServingExtension):
             if effort == "none":
                 if request.thinking is None:
                     derived["thinking"] = False
-            elif effort in ("low", "high", "max"):
+            elif effort in self._THINKING_EFFORTS:
                 derived["thinking_effort"] = effort
             # Other efforts (e.g. harmony's "medium") have no K3 equivalent;
             # leave the template default.

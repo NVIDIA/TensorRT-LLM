@@ -2,11 +2,34 @@
 # SPDX-License-Identifier: Apache-2.0
 from typing import Generic, Optional, Type
 
+from ...mapping import Mapping
 from ..model_config import ModelConfig
 from ..utils import model_extra_attrs
 from .modeling_utils import (DecoderModelForCausalLM, TConfig, TModel,
                              get_registered_model_class,
                              get_registered_vision_encoder)
+
+
+def check_cp_ulysses_support(model_cls: Type,
+                             mapping: Optional[Mapping]) -> None:
+    """Refuse a Ulysses CP mapping for a model class that does not implement it.
+
+    Ulysses context parallelism needs the model to split the sequence over the
+    CP ranks; no engine module does it on the model's behalf.
+    """
+    if mapping is None or not mapping.has_cp_ulysses():
+        return
+    name = getattr(model_cls, "__name__", str(model_cls))
+    if not getattr(model_cls, "supports_cp_ulysses", False):
+        raise ValueError(
+            f"{name} does not support Ulysses context parallelism "
+            f"(context_parallel_size={mapping.cp_size}, cp_config cp_type ULYSSES): "
+            "use context_parallel_size=1, or cp_type HELIX where the model supports it."
+        )
+    if mapping.enable_attention_dp:
+        raise ValueError(
+            "Ulysses context parallelism does not support attention DP "
+            f"({name}, context_parallel_size={mapping.cp_size}).")
 
 
 class AutoModelForCausalLM(Generic[TModel, TConfig]):
@@ -69,6 +92,7 @@ class AutoModelForCausalLM(Generic[TModel, TConfig]):
             raise ValueError(
                 f"Unknown architecture for AutoModelForCausalLM: {config.pretrained_config.architectures[0]}"
             )
+        check_cp_ulysses_support(cls, config.mapping)
         if issubclass(cls, DecoderModelForCausalLM):
             config._frozen = False
             config.skip_create_weights_in_init = True

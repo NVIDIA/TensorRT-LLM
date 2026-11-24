@@ -184,6 +184,25 @@ class RawRequestResponseHooks(ResponseHooks):
             ))
 
 
+def _ensure_single_sequence(request) -> None:
+    """Refuse a request for more than one sequence per prompt.
+
+    The KV cache transfer between a context and a generation server is keyed by
+    the request's ``disagg_request_id``, which every sequence of an ``n > 1``
+    (or ``best_of > 1``) sampling request shares, so its sequences cannot each
+    receive the prompt's KV cache. Beam search is a single request and is not
+    affected here.
+    """
+    if getattr(request, "use_beam_search", False):
+        return
+    n = getattr(request, "n", None) or 1
+    best_of = getattr(request, "best_of", None) or 1
+    if max(n, best_of) > 1:
+        raise ValueError(
+            "Disaggregated serving returns one sequence per request; "
+            f"n={n} and best_of={best_of} are not supported.")
+
+
 def _upstream_error_message(error: aiohttp.ClientResponseError) -> str:
     """Recover the worker's own error text without leaking the worker.
 
@@ -430,6 +449,7 @@ class OpenAIDisaggServer:
                 try:
                     ensure_request_chat_template_allowed(
                         req, self._allow_request_chat_template)
+                    _ensure_single_sequence(req)
                 except ValueError as e:
                     raise HTTPException(status_code=400, detail=str(e)) from e
                 self._extract_conversation_id(

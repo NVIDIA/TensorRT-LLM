@@ -24,3 +24,244 @@ l0_gr100:
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16/moe
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16/quantization
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16/spec
+  # The Kimi K3 Rubin target's unit tests, one entry per op directory plus its two
+  # top-level files. Its comm test (MNNVL all-reduce) runs several ranks and, like
+  # GLM's, waits for a multi-GPU GR100 stage. Its cpu_only cases are in l0_cpu.
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/kda
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/kernels
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/mla
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/moe
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/spec
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/test_k3_engine_probes.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/test_k3_ull_shared_fork.py
+  # The Kimi K3.1 family's single-GPU kernel and op tests certified on sm_107 (an entry is certified
+  # there when its ARCHS lists SM_107), one entry per file; the other tests under kernels/ and ops/
+  # are not certified on sm_107, except the 4-rank comm-module tests, which run on GB300 only. The
+  # rubin_multirank tests run 2, 4 or 8 ranks and, like GLM's, wait for a multi-GPU GR100 stage.
+  # The cpu_only files are in l0_cpu.
+  - unittest/_torch/modeling_v2/models/kimi_k31/kernels/activation/test_sigmoid_gate_mul_kernel.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/kernels/attention/test_rubin_helix_kept_gather.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/kernels/comm/test_rubin_lamport_finish_pdl.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/kernels/comm/test_rubin_ull_k3_lamport_finish_p14_sm10x.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/kernels/gemm/test_mxfp8_quantize_r128c4_kernel.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/kernels/gemm/test_rubin_dense_blockscaled_gemm_pdl.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/kernels/gemm/test_rubin_dense_blockscaled_gemm_split_k.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/kernels/gemm/test_rubin_l2_prefetch.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/kernels/moe/test_rubin_route_tail.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/kernels/moe/test_rubin_route_tail_cfg.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/kernels/moe/test_rubin_router_exact.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/kernels/norm/test_rubin_attn_res.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/kernels/norm/test_rubin_attn_res_persistent_x.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/kernels/spec/test_dflash2_selector_walk.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/kernels/spec/test_dflash2_top32.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/kernels/ssm/test_rubin_fused_prefill_conv.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/kernels/ssm/test_rubin_kda_fab.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/kernels/ssm/test_rubin_kda_mtp_decode_parity.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/kernels/ssm/test_rubin_rms_norm_gated.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/kernels/ssm/test_rubin_rms_norm_gated_token_major_cute.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/activation/test_rubin_situ_and_mul_mxfp8.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/activation/test_sigmoid_gate_mul.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/activation/test_situ_and_mul.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/attention/test_rubin_dkv_topk_read.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/attention/test_rubin_dsa_key_shard.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/attention/test_rubin_dsa_key_shard_select_pack.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/attention/test_rubin_dsa_nvfp4_ctx_gather_fp8.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/attention/test_rubin_dsa_nvfp4_gather_fp8.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/attention/test_rubin_dsa_small_entries.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/attention/test_rubin_fp4_mqa_logits.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/attention/test_rubin_fp4_paged_mqa_logits.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/attention/test_rubin_fp4_paged_mqa_logits_deepgemm.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/attention/test_rubin_fp8_paged_mqa_logits.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/attention/test_rubin_fused_dsa_helix_decode_metadata.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/attention/test_rubin_gvr_topk.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/attention/test_rubin_helix_kept_gather_op.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/attention/test_rubin_idx_fp4_quantize.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/attention/test_rubin_idx_k_cache_scatter_fp4.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/attention/test_rubin_idx_weights.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/attention/test_rubin_mla_ctx_q_fp8.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/attention/test_rubin_mla_ctx_wuk_fp8.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/attention/test_rubin_mla_wuv_gate.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/attention/test_rubin_mqa_logits_metadata.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/embedding/test_rubin_ull_step_begin.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/gemm/test_fused_a_gemm.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/gemm/test_low_m_linear_helix8.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/gemm/test_rubin_bf16_gemm_push_oproj.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/gemm/test_rubin_l2_prefetch_op.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/gemm/test_rubin_latent_up_resident.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/gemm/test_rubin_linear.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/gemm/test_rubin_lt_gemm.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/gemm/test_rubin_mxfp8_gemm.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/gemm/test_rubin_mxfp8_linear.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/gemm/test_rubin_mxfp8_linear_prequantized.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/gemm/test_rubin_mxfp8_linear_row_store.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/gemm/test_rubin_mxfp8_quantize.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/gemm/test_rubin_mxfp8_weight_scales.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/gemm/test_rubin_upcast_fp32.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/moe/test_dsv3_router_gemm_op.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/moe/test_rubin_cutedsl_moe.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/moe/test_rubin_fc12_cells.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/moe/test_rubin_fc12_die_claim.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/moe/test_rubin_fc12_l2_prefetch.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/moe/test_rubin_megamoe_quantize.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/moe/test_rubin_moe_back_norm.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/moe/test_rubin_moe_residual_add.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/moe/test_rubin_route_tail_op.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/moe/test_rubin_route_topk_out.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/moe/test_rubin_route_topk_wide.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/moe/test_rubin_router_logits.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/moe/test_rubin_router_tf32_partials.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/moe/test_rubin_ull_push_gemm.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/norm/test_attn_res_add_rmsnorm_fwd.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/norm/test_attn_res_fwd.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/norm/test_attn_res_rmsnorm_fwd.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/norm/test_rubin_attn_res_add_rmsnorm_persistent.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/norm/test_rubin_attn_res_add_rmsnorm_persistent_x.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/norm/test_rubin_attn_res_lamport.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/norm/test_rubin_attn_res_moe_add_rmsnorm.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/norm/test_rubin_attn_res_rmsnorm.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/norm/test_rubin_layer_norm.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/spec/test_dflash2_block_verify.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/spec/test_dflash2_pdl_norms.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/spec/test_dflash2_global_top32.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/spec/test_dflash2_greedy_verify.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/spec/test_dflash2_grouped_conv.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/spec/test_rubin_ull_dflash2_conv_proj_fold.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/spec/test_rubin_ull_dflash2_query_fold.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/spec/test_dflash2_proposal_load.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/spec/test_dflash2_selector_draft.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/spec/test_dflash2_selector_greedy_path.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/spec/test_dflash2_selector_greedy_tokens.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/spec/test_dflash2_step_glue.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/spec/test_dflash2_window_rows.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/spec/test_mla_norm_rope.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/spec/test_strict_accept.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/spec/test_rubin_dflash2_helix_combine.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/spec/test_rubin_dflash2_window_bits.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/spec/test_rubin_dflash2_window_fp32.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/spec/test_rubin_dflash2_window_plan.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/spec/test_rubin_dflash2_window_triton.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/spec/test_rubin_ull_dflash2_rank_topk_walk.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/ssm/test_copy_kda_replay_conv_window.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/ssm/test_kda_decode_one_token.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/ssm/test_kda_mtp_commit_pending_drafts.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/ssm/test_kda_mtp_verify.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/ssm/test_kda_prefill.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/ssm/test_kda_prefill_conv.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/ssm/test_reset_recurrent_state_rows.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/ssm/test_rms_norm_gated_token_major.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/ssm/test_rubin_kda_bf16_state_cells.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/ssm/test_rubin_kda_decode.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/ssm/test_rubin_kda_decode_fused_fab.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/ssm/test_rubin_kda_dsa_cache_manager.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/ssm/test_rubin_kda_dsa_cache_manager_gen_extra_slots.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/ssm/test_rubin_kda_dsa_cache_manager_inflight_prefix.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/ssm/test_rubin_kda_dsa_cache_manager_pool_zero.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/ssm/test_rubin_kda_fp8_packed_prefill.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/ssm/test_rubin_kda_fused_gate_linear.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/ssm/test_rubin_kda_fused_gate_rows.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/ssm/test_rubin_kda_h8_fused_gate.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/ssm/test_rubin_kda_mtp_verify.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/ssm/test_rubin_kda_mxfp8_input.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/ssm/test_rubin_kda_mxfp8_k32.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/ssm/test_rubin_kda_prefill.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/ssm/test_rubin_kda_prefill_flashinfer.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/ssm/test_rubin_kda_relay.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/ssm/test_rubin_kda_handoff.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/ssm/test_rubin_kda_prefill_phases.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/ssm/test_rubin_kda_replay_seed.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/ssm/test_rubin_kda_verify_pdl.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/ssm/test_rubin_rms_norm_gated_token_major.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/ssm/test_store_kda_replay_conv_window.py
+  # The K3.1 Rubin targets' single-GPU tests: the dep16 DSA decode streams' replay, the dep16 MoE
+  # front levers' bytes, the helix8 GEMM pins' bytes, the dep16 router's widened input, the DFlash2
+  # worker contract's GPU cases, the cep DKV read's fused indices against its plain steps, the
+  # helix workers' rejection sampling, the dep16 sparse MLA decode at 128 heads against an FP32
+  # attention (mla_gen_pad128),
+  # the forced acceptance under CUDA graph replay, the helix8 drafter's vocab-shard top-32, the
+  # helix8 fork_q replay, the import closure (it needs the image), the prefill indexer's schedule
+  # and the vision tower against the general target's (its checkpoint cases need K31_NVFP4_CKPT).
+  - unittest/_torch/modeling_v2/models/kimi_k31/test_rubin_dep16_dsa_fork_sm107.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/test_rubin_dep16_dense_dwdp.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/test_rubin_dep16_mla_gen_pad128_sm107.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/test_rubin_dep16_moe_front_sm107.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/test_rubin_dep16_router_widen_sm107.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/test_rubin_dflash2_worker_contract.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/test_rubin_cep_dense_dwdp.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/test_rubin_cep_dkv_read.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/test_rubin_dflash2_rejection_sampling.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/test_rubin_ctx_first_drafts.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/test_rubin_forced_acceptance_rows.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/test_rubin_helix8_draft_shard.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/test_rubin_helix8_draft_lowm_sm107.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/test_rubin_helix8_fork_q.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/test_rubin_helix8_gemm_pins_sm107.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/test_rubin_helix8_idx_fork.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/test_rubin_import_closure.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/test_rubin_prefill_schedule.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/test_rubin_vision_tower.py
+  # Engine tests of shared code the K3.1 Rubin targets run on SM 10.7: the DSA indexer's FP4 key
+  # rounding, sparse MLA, the MLA context FP8 quantize and the Rubin split-K guard. The Rubin cases
+  # stand beside the existing tests of the same code.
+  - unittest/_torch/attention/sparse/dsa/test_cat_mxfp4_rne.py::test_fused_cat_fp4_rounds_ties_toward_zero
+  - unittest/_torch/attention/sparse/dsa/test_dsa_sparse_mla.py
+  - unittest/_torch/attention/sparse/dsa/test_mla_context_fp8_quantize.py
+  - unittest/_torch/kernels/parallel/test_cute_dsl_rubin_split_k_guard.py
+  # CuTe DSL FC12 with presorted tokens runs on SM107 only.
+  - unittest/_torch/moe/test_cute_dsl_fc12_presorted.py
+  # The Kimi K3.1 ULL generation target (kimi_k31_pro_nvfp4__sm_107__helix16_moetp16ep1) and the
+  # OpWrapper tests of its family operations (ops/<kind>/test_rubin_ull_*.py), one entry per file:
+  # the other tests in those directories are listed above or not certified on sm_107.
+  - unittest/_torch/modeling_v2/models/kimi_k31/kimi_k31_pro_nvfp4__sm_107__helix16_moetp16ep1
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/activation/test_rubin_ull_situ_and_mul.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/attention/test_rubin_ull_dsa_dcp_value.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/attention/test_rubin_ull_dsa_index_front.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/attention/test_rubin_ull_dsa_indexer_prologue.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/attention/test_rubin_ull_dsa_indexer_score.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/attention/test_rubin_ull_dsa_key_shard_select.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/attention/test_rubin_ull_dsa_mla_query.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/attention/test_rubin_ull_dsa_output_gate.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/attention/test_rubin_ull_dsa_query_wait.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/attention/test_rubin_ull_dsa_sparse_dcp_decode.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/attention/test_rubin_ull_dsa_value_oproj.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/comm/test_rubin_cp_fp8_rows.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/comm/test_rubin_ull_helix_post_process_native.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/comm/test_rubin_ull_helix_tail.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/comm/test_rubin_ull_mnnvl_fusion_allreduce.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/common/test_rubin_ull_spin_trap.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/embedding/test_rubin_ull_begin_fold.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/gemm/test_rubin_draft_push_act_fold.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/gemm/test_rubin_ull_bf16_linear.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/gemm/test_rubin_ull_bf16_low_m_gemm.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/gemm/test_rubin_ull_dense0_down_push.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/gemm/test_rubin_ull_dense0_situ_gate_up.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/gemm/test_rubin_ull_prepared_projection.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/gemm/test_rubin_ull_warp_splitk_gemm.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/moe/test_rubin_ull_moe_route.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/moe/test_rubin_ull_nv_routed_experts.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/norm/test_rubin_ull_cluster_attn_res.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/spec/test_rubin_ull_dflash2_headtp_decode.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/spec/test_rubin_ull_dflash2_headtp_ring.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/spec/test_rubin_ull_dflash2_windowed_history.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/spec/test_rubin_ull_dflash2_helix_window.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/spec/test_rubin_ull_next_new_tokens_rewind.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/spec/test_rubin_ull_select_accept.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/ssm/test_rubin_ull_kda_decode.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/ssm/test_rubin_ull_kda_decode_checkpoint.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/ssm/test_rubin_ull_kda_head_verify.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/ssm/test_rubin_ull_kda_head_fp32.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/ssm/test_rubin_ull_kda_head_multi_fp32.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/ssm/test_rubin_ull_kda_fold_fp32.py
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops/ssm/test_rubin_ull_kda_verify.py
+  # Engine code the ULL target adds: the decode-step fold, the one KV-length refresh per step
+  # (kv_lens_refresh_once), the DSA metadata staging, fused Helix
+  # decode metadata, key-sharded Top-K and per-layer pool views, the zeroed KV cache manager V2
+  # pools and the evict-first hint of the CuTe DSL FP8 paged MQA logits.
+  - unittest/_torch/attention/sparse/dsa/test_cute_dsl_fp8_paged_mqa_logits.py::test_cute_dsl_fp8_paged_mqa_logits_kv_evict_first_bitwise
+  - unittest/_torch/attention/sparse/dsa/test_dsa_helix_fused_meta.py
+  - unittest/_torch/attention/sparse/dsa/test_dsa_helix_key_shard.py
+  - unittest/_torch/attention/sparse/dsa/test_dsa_key_shard.py
+  - unittest/_torch/attention/sparse/dsa/test_dsa_pool_view_per_layer.py
+  - unittest/_torch/attention/sparse/dsa/test_dsa_staged_prepare.py
+  - unittest/_torch/attention/test_kv_cache_v2_pool_zero.py
+  - unittest/_torch/executor/test_ull_step_fold.py
+  - unittest/_torch/executor/test_kv_lens_refresh_once.py

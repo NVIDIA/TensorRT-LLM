@@ -901,6 +901,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .value("DROPPABLE", kv::PageStatus::DROPPABLE)
         .export_values();
 
+    nb::enum_<kv::CacheDomain>(m, "CacheDomain")
+        .value("STANDALONE_DRAFT", kv::CacheDomain::kStandaloneDraft)
+        .value("TARGET", kv::CacheDomain::kTarget);
+
     nb::enum_<kv::CacheTier>(m, "CacheTier")
         .value("GPU_MEM", kv::CacheTier::GPU_MEM)
         .value("HOST_MEM", kv::CacheTier::HOST_MEM)
@@ -1407,18 +1411,21 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .value("OPTIONAL", kv::AttentionReusePolicy::OPTIONAL);
 
     nb::class_<kv::AttnLifeCycle>(m, "AttnLifeCycle")
-        .def(nb::init<std::optional<int>, int, bool, kv::AttentionReusePolicy>(), nb::arg("window_size").none(),
-            nb::arg("num_sink_blocks"), nb::arg("is_sparse") = false,
-            nb::arg("reuse_policy") = kv::AttentionReusePolicy::REQUIRED)
+        .def(nb::init<std::optional<int>, int, bool, kv::AttentionReusePolicy, kv::CacheDomain>(),
+            nb::arg("window_size").none(), nb::arg("num_sink_blocks"), nb::arg("is_sparse") = false,
+            nb::arg("reuse_policy") = kv::AttentionReusePolicy::REQUIRED,
+            nb::arg("cache_domain") = kv::CacheDomain::kTarget)
         // Sink tokens round up to whole blocks. Bound rather than repeated in Python so the
         // connector's view of a life cycle is built by the same code as the allocator's.
         .def_static("make", &kv::AttnLifeCycle::make, nb::arg("window_size").none(), nb::arg("num_sink_tokens").none(),
             nb::arg("tokens_per_block"), nb::arg("is_sparse") = false,
-            nb::arg("reuse_policy") = kv::AttentionReusePolicy::REQUIRED)
+            nb::arg("reuse_policy") = kv::AttentionReusePolicy::REQUIRED,
+            nb::arg("cache_domain") = kv::CacheDomain::kTarget)
         .def_prop_ro("window_size", [](kv::AttnLifeCycle const& self) { return self.windowSize; })
         .def_ro("num_sink_blocks", &kv::AttnLifeCycle::numSinkBlocks)
         .def_ro("is_sparse", &kv::AttnLifeCycle::isSparse)
         .def_ro("reuse_policy", &kv::AttnLifeCycle::reusePolicy)
+        .def_ro("cache_domain", &kv::AttnLifeCycle::cacheDomain)
         .def("get_stale_range", &kv::AttnLifeCycle::getStaleRange, nb::arg("history_length"),
             nb::arg("tokens_per_block"))
         .def("__eq__", &kv::AttnLifeCycle::operator==);
@@ -1627,14 +1634,16 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
 
     nb::class_<kv::AttentionLayerConfig>(m, "AttentionLayerConfig")
         .def(nb::init<kv::LayerId, std::vector<kv::BufferConfig>, std::optional<int>, std::optional<int>,
-                 kv::AttentionReusePolicy>(),
+                 kv::AttentionReusePolicy, kv::CacheDomain>(),
             nb::arg("layer_id"), nb::arg("buffers"), nb::arg("sliding_window_size") = std::nullopt,
-            nb::arg("num_sink_tokens") = std::nullopt, nb::arg("reuse_policy") = kv::AttentionReusePolicy::REQUIRED)
+            nb::arg("num_sink_tokens") = std::nullopt, nb::arg("reuse_policy") = kv::AttentionReusePolicy::REQUIRED,
+            nb::arg("cache_domain") = kv::CacheDomain::kTarget)
         .def_rw("layer_id", &kv::AttentionLayerConfig::layerId)
         .def_rw("buffers", &kv::AttentionLayerConfig::buffers)
         .def_rw("sliding_window_size", &kv::AttentionLayerConfig::slidingWindowSize)
         .def_rw("num_sink_tokens", &kv::AttentionLayerConfig::numSinkTokens)
         .def_rw("reuse_policy", &kv::AttentionLayerConfig::reusePolicy)
+        .def_rw("cache_domain", &kv::AttentionLayerConfig::cacheDomain)
         .def_prop_ro("window_size", &kv::AttentionLayerConfig::windowSize) DEF_COPY(kv::AttentionLayerConfig);
 
     nb::enum_<kv::LayerType>(m, "LayerType")
@@ -1995,7 +2004,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::call_guard<nb::gil_scoped_release>())
         .def(
             "commit",
-            [](kv::KvCache& self, nb::object acceptedInputTokens, nb::object beamSearchIndices, bool isEnd)
+            [](kv::KvCache& self, nb::object acceptedInputTokens, nb::object beamSearchIndices, bool isEnd,
+                bool ssmFromPending)
             {
                 // An empty token list with is_end=True must still stop committing, so we do not
                 // early-return on empty; commit() handles it. beam_search_indices is only
@@ -2014,12 +2024,17 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                         TLLM_CHECK_WITH_INFO(!(self.textOnly() && !knownNoDigest),
                             "commit() received a digest token on a text_only sequence — hashing would be corrupted");
                         nb::gil_scoped_release release;
-                        self.commit(view, isEnd);
+                        self.commit(view, isEnd, ssmFromPending);
                     });
             },
             nb::arg("accepted_input_tokens"), nb::arg("beam_search_indices").none() = nb::none(),
-            nb::arg("is_end") = false)
+            nb::arg("is_end") = false, nb::arg("ssm_from_pending") = false)
         .def("stop_committing", &kv::KvCache::stopCommitting, nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "acquire_ssm_snapshot_slot", &kv::KvCache::acquireSsmSnapshotSlot, nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro("pending_ssm_snapshot_slot", &kv::KvCache::pendingSsmSnapshotSlot)
+        .def(
+            "release_ssm_snapshot_slot", &kv::KvCache::releaseSsmSnapshotSlot, nb::call_guard<nb::gil_scoped_release>())
         .def(
             "get_base_page_indices",
             [](kv::KvCache const& self, int layerGroupId, int beamIdx)

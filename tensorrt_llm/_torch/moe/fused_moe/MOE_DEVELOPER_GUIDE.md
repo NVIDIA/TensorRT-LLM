@@ -216,6 +216,7 @@ Still on old path (standalone, with embedded communication):
 | `routing.py` | Routing methods (`TopKRouting`, etc.) |
 | `moe_comm_timeout_guard.py` | Device-side timeouts of communication kernels, relaxed during warmup — budget resolution and `MoECommTimeoutProxy` registration (see [Communication timeouts](#communication-timeouts)) |
 | `moe_load_balancer.py` | EPLB implementation |
+| `per_layer_dynamic_eplb/` | Per-layer dynamic EPLB, created by `maybe_create_moe_load_balancer`: model-level `manager`, per-layer handle `layer`, live-weight `arena`, HALO-Q/TMA `planner`, and `live_planes`, which moves a backend's expert operands onto the arena |
 | `moe_op_backend.py` | Op backend registry for TRTLLMGen (flashinfer/trtllm ops) |
 
 ### Backends (`fused_moe/`)
@@ -228,7 +229,7 @@ Still on old path (standalone, with embedded communication):
 | `cutedsl/dense_gemm.py` (+ the `fused_moe_densegemm.py` alias module) | `TrtllmCutedslDenseGemmNvfp4Impl` (aliased as `DenseGEMMFusedMoE`) | SM100/SM103 | NVFP4 min-latency; CuTe DSL dense GEMM packs all experts into one matrix (vs Cutlass per-expert scatter), efficient for small token counts | `EXTERNAL_COMM` |
 | `cutedsl/grouped_gemm/` (+ the `fused_moe_cute_dsl.py` alias module) | the abstract `CuteDslFusedMoEBase` (aliased as `CuteDslFusedMoE`) and its two leaves, `TrtllmCutedslGroupedGemmNvfp4Impl` (`trtllm.cutedsl.grouped_gemm.nvfp4`) and `TrtllmCutedslGroupedGemmBf16Impl` (`trtllm.cutedsl.grouped_gemm.none`) | SM100/SM103/SM107; BF16 SM107 only | High throughput NVFP4, generally faster than Cutlass; unquantized BF16 SwiGLU on Rubin | `EXTERNAL_COMM` |
 | `fused_moe_cute_dsl_b12x.py` | `CuteDslB12xNvfp4FusedMoE` and `CuteDslB12xW4a16Nvfp4FusedMoE` (shared mixin `CuteDslB12xFusedMoEBase`, aliased as `CuteDslB12xFusedMoE`) | SM120/SM121 | NVFP4 (CUTLASS prefill, FlashInfer b12x decode) and W4A16 NVFP4 (b12x for every call), best on RTX PRO 6000 and DGX Spark. They head the `CUTEDSL` family, so they win on SM120/121 when flashinfer is present and yield to the grouped-GEMM leaves otherwise. Single-GPU-shaped topology only: with no dispatch/combine kernel they reject `ep_size > 1` and attention-DP | `EXTERNAL_COMM` |
-| `cutedsl/fused_fc12.py` (+ the `fused_moe_cute_dsl_fc12.py` alias module) | `TrtllmCutedslFusedFc12Nvfp4Impl` (`trtllm.cutedsl.fused_fc12.nvfp4`, aliased as `CuteDslFc12FusedMoE`) | SM107 (Rubin) | NVFP4 fused FC1+FC2 in one persistent kernel (`cute_dsl_nvfp4_fc12_fused_rubin`) with a trace-time SwiGLU or SiTU epilogue, keeping the FC1→FC2 intermediate on-chip; shares `TrtllmCutedslGroupedGemmNvfp4Impl`'s NVFP4 weight layout and autotune runner; reachable through the `CUTEDSL_FC12` family or a pinned `impl_id`; needs `MoEDep.CUTEDSL_RUBIN`; non-uGPU | `EXTERNAL_COMM` |
+| `cutedsl/fused_fc12.py` (+ the `fused_moe_cute_dsl_fc12.py` alias module) | `TrtllmCutedslFusedFc12Nvfp4Impl` (`trtllm.cutedsl.fused_fc12.nvfp4`, aliased as `CuteDslFc12FusedMoE`) | SM107 (Rubin) | NVFP4 fused FC1+FC2 in one persistent kernel (`cute_dsl_nvfp4_fc12_fused_rubin`) with a trace-time SwiGLU or SiTU epilogue, keeping the FC1→FC2 intermediate on-chip; shares `TrtllmCutedslGroupedGemmNvfp4Impl`'s NVFP4 weight layout and autotune runner; reachable through the `CUTEDSL_FC12` family or a pinned `impl_id`; needs `MoEDep.CUTEDSL_RUBIN`; non-uGPU. Like the NVFP4 grouped-GEMM leaf, it uses `moe_sort` tables a router attached to the top-k ids (`presorted_routing`, e.g. the Kimi-K3 routing tail) instead of running `moe_sort`, and runs at their tile size instead of the autotuned one; a caller may hand it an output and counters zeroed ahead of the call (`new_zeroed_output` / `zeroed_output`) | `EXTERNAL_COMM` |
 | `mega_moe/mega_moe_deepgemm.py` | `DeepgemmCudaW4a8Mxfp4Mxfp8Impl` (aliased as `MegaMoEDeepGemm`) | SM100/SM103/SM107 | W4A8_MXFP4_MXFP8 via DeepGEMM `fp8_fp4_mega_moe` fused dispatch+GEMM+act+GEMM+combine kernel; requires `hidden_size % 512 == 0` | `FUSED_COMM` |
 | `mega_moe/mega_moe_cute_dsl.py` | `TrtllmCutedslMegaMoeNvfp4Impl` (aliased as `MegaMoECuteDsl`) | SM100/SM103/SM107 | NVFP4 fused dispatch+FC1+act+FC2+combine; internally selects one of its per-architecture kernel variants. Requires CUDA 13 Cutlass DSL and a symmetric-memory provider. Uses uniform activation constants and applies routing weights before FC2 quantization for DeepSeek-V4, after FC2 for other models | `FUSED_COMM` |
 | `marlin/` (+ the `fused_moe_marlin.py` alias module) | the abstract `MarlinFusedMoEBase` and its two leaves, `MarlinCudaNvfp4Impl` and `MarlinCudaW4a16Nvfp4Impl` | SM89-SM99 | W4A16 NVFP4 on Ada/Hopper (BF16 activations + FP4 weights, single-launch `marlin_nvfp4_moe_gemm`); attention-DP + EP via external comm (plain BF16 dispatch payload); non-NVFP4 layers (e.g. unquantized MTP draft layers) degrade to Cutlass, recorded in the `MoEResolutionReport`; no dynamic EPLB | `EXTERNAL_COMM` |
@@ -402,7 +403,7 @@ the package.
 | File | Role |
 |------|------|
 | `identity.py` | the identity segments (`PROVIDER_TRTLLM`, `TECHNIQUE_CUTEDSL`, `KERNEL_*`), and the grouped-GEMM query and id helper |
-| `kernel_inputs.py` | what more than one kernel takes: the `NvFp4WeightView` dataclass, and free functions taking the impl, `finalize_routing_scales` and `quantize_input_nvfp4`, which every NVFP4 leaf here binds as `quantize_input` |
+| `kernel_inputs.py` | what more than one kernel takes: the `NvFp4WeightView` dataclass, and free functions taking the impl, `finalize_routing_scales`, `quantize_input_nvfp4`, which every NVFP4 leaf here binds as `quantize_input`, and `sort_routing` (`moe_sort`, or the tables a router attached, `presorted_routing`) |
 | `runners.py` | the outer autotune runners: NVFP4, which the fused-FC12 runner narrows to its tiles, and BF16 |
 | `grouped_gemm/base.py` | `CuteDslFusedMoEBase`, the abstract root of the two grouped-GEMM leaves: construction, the output-memset overlap stream, the locality-domain plan, the weight lifecycle |
 | `grouped_gemm/eligibility.py` | the checks both grouped-GEMM leaves' `can_implement` compose, as free functions |
@@ -851,6 +852,52 @@ set wrong has a test that catches it:
 - `FusedCommMoEScheduler` calls `backend.quantize_input(...)` for every chunk including zero-token chunks (so peer ranks can cross the in-kernel NVLink barrier). Each fused-comm backend therefore MUST make `quantize_input` tolerate `x.shape[0] == 0` and return its own empty tensor layout; the scheduler does NOT synthesize backend-specific empty tensors.
 - Dynamic EPLB requires backend and quantization-method support; backends gate wrapper-level constraints in `validate_configurable_moe`. `MegaMoEDeepGemm` routes to slot IDs and migrates the transformed DG weights its quantization method registers (`num_slots % ep_size == 0`). `TrtllmCutedslMegaMoeNvfp4Impl` declares `supports_eplb=True`; its quantization method registers the MegaMoE-format derived params and `fc1_norm_const` with the load balancer alongside the raw NVFP4 family, so per-slot migration stays byte-consistent.
 - `FUSED_COMM` backends use `ignore_allreduce=False` for EPLB statistic update because the fused kernel AllReduces routing stats internally.
+- Per-layer dynamic EPLB uses `MoeConfig.load_balancer.mode=per_layer_dynamic` with
+  `num_slots` greater than the model expert count. Each rank keeps its
+  `num_experts / ep_size` resident experts (`H`) and gets
+  `(num_slots - num_experts) / ep_size` helper slots (`S`), so a route is a
+  physical slot `rank * M + slot` with `M = H + S`. Only implementations whose
+  capabilities declare `supports_per_layer_dynamic_eplb` are eligible (today
+  `TrtllmTrtllmGenNvfp4Impl`); `MoeConfig` resolves `AUTO` to `TRTLLM` and
+  rejects other explicit backends. CUDA graphs are disabled.
+- The workers need `CUDA_SCALE_LAUNCH_QUEUES=4x` in their environment before
+  CUDA initializes; the manager refuses to start without it.
+- HALO-Q and the in-switch TMA copy run as one kernel on the higher-priority
+  copy stream, one CTA per auxiliary SM. Each CTA raises a device route epoch
+  once its routes are written, then copies the hot experts' weights into the
+  helper slots of their teams over NVLink multicast and publishes READY (its
+  generation) into every rank's per-layer `uint64[EP]` terminals. Each layer
+  binds one main stream, the executor's execution stream.
+- `ExternalCommMoEScheduler` drives it per chunk: routing, then
+  `_load_balancer_route` submits the kernel (and runs a function installed with
+  `MoE.load_balancer_overlap`, e.g. the model's shared expert, right after the
+  submission); the input quantization runs beside HALO-Q; the first reader of
+  the physical routes (the dispatch) waits for the route epoch
+  (`MoEReplicaPlan.wait_for_routes`, a stream memory wait); `run_moe` follows
+  `MoEReplicaPlan.wait_for_helper_weights`, one stream memory wait per EP rank
+  on its READY terminal; the post-`run_moe` hook releases the plan, and the
+  next submission of the layer orders the copy stream after the main-stream
+  work queued so far. Expert statistics and the layer-wise calibrator record the
+  logical routes before the route. Chunks stay on the main stream.
+- The backend keeps `expert_size_per_partition = H` for loading; after the
+  last in-place transform (`cache_derived_state`) it calls
+  `per_layer_dynamic_eplb.live_planes.bind_live_weight_planes`, which describes
+  its expert-indexed operands (weights, block scales, per-expert scalars) as a
+  `BundleLayout`, allocates the layer's `H + S` arena collectively, copies the
+  resident rows, seeds the helper rows from resident rows and rebinds each
+  operand to its `[H + S, ...]` arena view; then the layer handle's
+  `bind_backend` builds the HALO-Q/TMA producer. `run_moe` takes
+  `local_expert_offset = rank * M` and `local_num_experts = M` from the replica
+  plan (`compute_slot_count`).
+- HALO-Q waits for every EP rank inside the kernel and traps once a peer is
+  later than its spin bound, which `SchedulerSpinBound` takes from the MoE
+  communication timeout guard.
+- `helper_slot_mode=per_layer_resident` gives each layer its own helper-slot
+  set and skips experts a whole team already holds; `shared_banks` alternates
+  two banks across layers and copies every helper expert every forward.
+- The native kernels bound the logical expert count by
+  `MEGAMOE_TMA_GPU_PLAN_MAX_EXPERTS` (1024); the Python scheduler's
+  `MAX_EXPERTS` must match it.
 
 ## Canonical Examples
 

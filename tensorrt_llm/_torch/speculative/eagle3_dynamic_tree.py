@@ -963,11 +963,16 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 # We fill at most max_path_len-1 positions, taking the first ones from draft.
                 # All shapes are static Python ints: CUDA-graph-safe.
                 n_fill = accept_token.shape[1] - 1  # max_path_len - 1
-                accept_token[:, 1 : n_fill + 1].copy_(
-                    spec_metadata.draft_tokens.reshape(num_gens, N - 1)[:, :n_fill].to(
-                        accept_token.dtype
-                    )
+                fill = spec_metadata.draft_tokens.reshape(num_gens, N - 1)[:, :n_fill].to(
+                    accept_token.dtype
                 )
+                # Rows the override does not force keep their accepted path.
+                real_rows = self._real_draft_rows(spec_metadata, num_gens)
+                if real_rows is not None:
+                    fill = torch.where(
+                        real_rows.unsqueeze(1), fill, accept_token[:, 1 : n_fill + 1]
+                    )
+                accept_token[:, 1 : n_fill + 1].copy_(fill)
 
             self._finalize_dynamic_tree_verify_outputs(
                 accept_index=accept_index,

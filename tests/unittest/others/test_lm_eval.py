@@ -50,6 +50,7 @@ from tensorrt_llm.evaluate.lm_eval import (
     GSM8K,
     LM_EVAL_DEFAULT_IMAGE_PLACEHOLDER,
     MAX_IN_FLIGHT_ENV_VAR,
+    LmEvalEvaluator,
     LmEvalWrapper,
     MultimodalLmEvalWrapper,
     _override_stop_strings,
@@ -1563,6 +1564,28 @@ def test_e2e_harness_final_score_over_mocked_llm():
     )
     score = results["results"]["toy_arith"]["exact_match,strict-match"]
     assert score == pytest.approx(0.75)
+
+
+@pytest.mark.parametrize("preserve_budget,expected_budget", [(False, 256), (True, 2048)])
+def test_text_evaluator_output_budget(monkeypatch, preserve_budget, expected_budget):
+    """The public evaluator honors an explicit larger thinking budget when requested."""
+    task = _toy_task()
+    task.set_config(
+        key="generation_kwargs", value={"until": ["\n"], "do_sample": False, "max_gen_toks": 256}
+    )
+    monkeypatch.setattr("lm_eval.tasks.get_task_dict", lambda *args, **kwargs: {"toy_arith": task})
+    llm = _canned_llm(_E2E_RESPONSES)
+    llm.generate_async = MagicMock(side_effect=llm.generate_async)
+    evaluator = LmEvalEvaluator(
+        task_name="toy_arith",
+        preserve_caller_max_tokens=preserve_budget,
+        shuffle_dataset=False,
+    )
+    assert evaluator.evaluate(llm, SamplingParams(max_tokens=2048)) == pytest.approx(75.0)
+    assert len(llm.generate_async.call_args_list) == len(_E2E_DOCS)
+    assert {
+        call.kwargs["sampling_params"].max_tokens for call in llm.generate_async.call_args_list
+    } == {expected_budget}
 
 
 def test_e2e_partial_scores_match_final_score():

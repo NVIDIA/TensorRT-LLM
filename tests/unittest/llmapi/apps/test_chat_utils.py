@@ -618,6 +618,53 @@ class TestMmItemOrderReturn:
         assert item_order == expected
 
 
+class TestMessageParsingFromServingExtension:
+    """Message-parsing flags of ``parse_chat_messages_coroutines`` come from the serving extension.
+
+    Kimi keeps unparsable tool-call arguments and a system message's tools.
+    """
+
+    _TOOL = {"type": "function", "function": {"name": "get_weather", "parameters": {}}}
+    _RAW_ARGUMENTS = '{"city": "Paris"'
+
+    def _messages(self) -> list:
+        return [
+            {"role": "system", "content": "", "tools": [self._TOOL]},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_0",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": self._RAW_ARGUMENTS},
+                    }
+                ],
+            },
+        ]
+
+    @pytest.mark.parametrize("model_type", ["kimi_k3", "kimi_k31"])
+    def test_kimi_keeps_raw_arguments_and_message_tools(self, model_type: str) -> None:
+        conversation, mm_coroutine, _, _ = parse_chat_messages_coroutines(
+            self._messages(), None, model_type_override=model_type, resolve_media=False
+        )
+        mm_coroutine.close()
+        assert conversation[0]["tools"] == [self._TOOL]
+        tool_call = conversation[1]["tool_calls"][0]
+        assert tool_call["function"]["arguments"] == self._RAW_ARGUMENTS
+
+    def test_default_extension_keeps_strict_parsing(self) -> None:
+        with pytest.raises(ValueError, match="must be valid JSON"):
+            parse_chat_messages_coroutines(
+                self._messages(), None, model_type_override="llama", resolve_media=False
+            )
+        conversation, mm_coroutine, _, _ = parse_chat_messages_coroutines(
+            self._messages()[:1], None, model_type_override="llama", resolve_media=False
+        )
+        mm_coroutine.close()
+        assert "tools" not in conversation[0]
+
+
 class TestParseChatMessageContentPart:
     """Unit tests for parse_chat_message_content_part."""
 

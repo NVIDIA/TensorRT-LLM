@@ -20,9 +20,13 @@ Tests for:
 - ADPRouter interface and DefaultADPRouter
 - Piggybacking per-rank iter-stats payloads on the existing ADP allgather
 - Strict/relaxed attention-DP request routing while respecting rank capacity
+- KV-balanced admission of generation-only requests
+- The opt-in hold of bound conversations in ConversationAwareADPRouter
 """
 
 import inspect
+import random
+from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
 import numpy as np
@@ -33,6 +37,9 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.request_utils import get_from_waiting_queue
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import (
+    ADP_HOLD_MAX_S,
+    KV_BALANCE_MAX_SKIPPED_ROUNDS,
+    KV_BALANCE_WINDOW,
     ADPRouter,
     ConversationAwareADPRouter,
     DefaultADPRouter,
@@ -43,8 +50,17 @@ from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import (
     build_active_requests_for_overlap,
     count_retiring_requests,
     is_retiring_request,
+    plan_kv_balanced_admission,
 )
+from tensorrt_llm._torch.pyexecutor.scheduler.gen_admission_queue import (
+    TIER_OLDEST,
+    GenAdmissionConfig,
+    GenAdmissionWaitingQueue,
+)
+from tensorrt_llm._torch.pyexecutor.scheduler.waiting_queue import PriorityWaitingQueue
+from tensorrt_llm.bindings.executor import RequestType
 from tensorrt_llm.conversation_params import ConversationParams
+from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
 from tensorrt_llm.llmapi.llm_args import AttentionDpConfig
 from tensorrt_llm.scheduling_params import SchedulingParams
 
@@ -1634,6 +1650,22 @@ class TestConversationAwareADPRouter:
         self._route(router, self._states(2), [child_turn2])
         assert child_turn2.request.py_uncached_prefill_tokens == 500
 
+    def test_uncached_prefill_estimate_does_not_depend_on_the_rank(self):
+        """A turn that overflows off its full home rank is estimated like a turn
+        at home, and the next turn back home is measured against it."""
+        router = self._router(tp_size=2)
+        router.set_publish_uncached_estimate(True)
+        opener = _make_conv_request_item(0, "A", num_tokens=5000)
+        home = self._route(router, self._states(2), [opener])[0]
+        full = [0, 0]
+        full[home] = 4
+        overflow = _make_conv_request_item(1, "A", num_tokens=5300)
+        assert self._route(router, self._states(2, full), [overflow], cap=4)[1] != home
+        assert overflow.request.py_uncached_prefill_tokens == 300
+        back = _make_conv_request_item(2, "A", num_tokens=5600)
+        assert self._route(router, self._states(2), [back])[2] == home
+        assert back.request.py_uncached_prefill_tokens == 300
+
     def test_no_conversation_id_falls_back_and_is_not_recorded(self):
         router = self._router(tp_size=4)
         items = [_make_conv_request_item(i, None) for i in range(8)]
@@ -1920,6 +1952,371 @@ class TestConversationAwareADPRouter:
         assert sum(len(v) for v in assign.values()) == 8  # nothing dropped
 
 
+def _hold_router(hold=True, tp_size=4, max_s=ADP_HOLD_MAX_S):
+    """ConversationAwareADPRouter with the hold of bound conversations on (or off)."""
+    router = ConversationAwareADPRouter(
+        dist=_mock_dist(tp_size=tp_size),
+        new_conv_placement="least_tokens",
+        hold_bound_conversations=hold,
+    )
+    router._hold_max_s = max_s
+    router.rank0_clock = lambda: 0.0
+    return router
+
+
+def _closed_loop_ctx(hold, *, lanes=560, ticks=300, window=100, seed=3):
+    """Synthetic closed-loop context server driven through pop_requests + route_requests
+    the way PyExecutor._fetch_new_requests drives them.
+
+    16 attention-DP ranks x 32 slots; a tick is one iteration (2 s) in which each rank
+    prefills 16384 uncached tokens, long prefills demoted for up to 8 iterations. A turn
+    holds its slot through its prefill and 3 more ticks (KV transfer); its lane sends the
+    next turn 5-13 ticks later, 2k-11k tokens longer; a conversation ends after 30 turns
+    and the lane opens a new one (8k-40k tokens). A rank caches the last prompt it
+    prefilled per conversation (no eviction), so a turn on its home rank prefills ~6.5k
+    tokens and a turn elsewhere its whole prompt (~120k). Every rank stalls for 15 ticks
+    at tick 40. Returns turns prefilled per tick and the cached share of prompt tokens
+    over the last ``window`` ticks, per-rank prefills in that window, and the longest
+    queue wait in seconds."""
+    ranks, cap, chunk, dt, xfer, max_turns, demote_iters = 16, 32, 16384, 2.0, 3, 30, 8
+    router = _hold_router(hold=hold, tp_size=ranks)
+    router.set_publish_uncached_estimate(True)
+    clock = [0.0]
+    router.rank0_clock = lambda: clock[0]
+    rng = random.Random(seed)
+    queue = FCFSWaitingQueue()
+    active = [[] for _ in range(ranks)]  # [item, uncached left, demoted iterations, xfer left]
+    cache = [{} for _ in range(ranks)]
+    counters = {"req": 0, "conv": 0}
+
+    def new_conv(lane):
+        counters["conv"] += 1
+        lane.update(conv=f"c{counters['conv']}", turn=0, prompt=rng.randint(8000, 40000))
+
+    lanes_state = []
+    for i in range(lanes):  # warm start: each lane mid-conversation, cached on its home rank
+        lane = {}
+        new_conv(lane)
+        lane["turn"] = rng.randint(1, max_turns - 1)
+        lane["prompt"] += (lane["turn"] - 1) * 6500
+        router._record_target_rank(lane["conv"], i % ranks)
+        router._conv_last_prompt[lane["conv"]] = lane["prompt"]
+        router._conv_home_prompt[lane["conv"]] = (lane["prompt"], i % ranks)
+        cache[i % ranks][lane["conv"]] = lane["prompt"]
+        lane["prompt"] += rng.randint(2000, 11000)
+        lane["next_t"] = rng.randint(0, 18)
+        lanes_state.append(lane)
+
+    window_stats = {"done": 0, "prompt": 0, "cached": 0, "done_r": [0] * ranks}
+    max_wait_s = 0.0
+    for t in range(ticks):
+        clock[0] = t * dt
+        in_window = t >= ticks - window
+        for lane in lanes_state:
+            if lane["next_t"] == t:
+                counters["req"] += 1
+                request = SimpleNamespace(
+                    py_scheduling_params=None,
+                    py_conversation_params=ConversationParams(conversation_id=lane["conv"]),
+                    num_input_tokens=lane["prompt"],
+                    request_type=RequestType.REQUEST_TYPE_CONTEXT_ONLY,
+                )
+                item = RequestQueueItem(counters["req"], request)
+                item.lane, item.arrival = lane, t
+                queue.append(item)
+        states = [
+            RankState(
+                rank=r,
+                num_active_requests=len(active[r]),
+                num_active_tokens=sum(e[0].request.num_input_tokens for e in active[r]),
+            )
+            for r in range(ranks)
+        ]
+        budget = ranks * cap - sum(len(a) for a in active)
+        popped, placement = router.pop_requests(queue, states, budget, cap)
+        assign, expected = router.route_requests(states, popped, cap, placement=placement)
+        for r in range(ranks):
+            for item in assign[r]:
+                conv = item.request.py_conversation_params.conversation_id
+                prompt = item.request.num_input_tokens
+                cached = min(cache[r].get(conv, 0), prompt)
+                active[r].append([item, max(prompt - cached, 1), 0, xfer])
+                max_wait_s = max(max_wait_s, (t - item.arrival) * dt)
+                if in_window:
+                    window_stats["prompt"] += prompt
+                    window_stats["cached"] += cached
+            assert len(active[r]) <= cap and len(active[r]) <= expected
+        for r in range(ranks):
+            if 40 <= t < 55:
+                continue  # stalled
+            for e in [e for e in active[r] if e[1] == 0]:
+                e[3] -= 1
+                if e[3] <= 0:
+                    active[r].remove(e)
+                    lane = e[0].lane
+                    lane["turn"] += 1
+                    if lane["turn"] >= max_turns:
+                        new_conv(lane)
+                    else:
+                        lane["prompt"] += rng.randint(2000, 11000)
+                    lane["next_t"] = t + 1 + rng.randint(5, 13)
+            budget_tokens = chunk
+            todo = [e for e in active[r] if e[1] > 0]
+            order = sorted(todo, key=lambda e: e[1] > chunk and e[2] < demote_iters)
+            for e in order:
+                if e[1] > chunk and e[2] < demote_iters:
+                    e[2] += 1
+            for e in order:
+                if budget_tokens <= 0:
+                    break
+                take = min(budget_tokens, e[1])
+                e[1] -= take
+                budget_tokens -= take
+                if e[1] == 0:
+                    cache[r][e[0].lane["conv"]] = e[0].request.num_input_tokens
+                    if in_window:
+                        window_stats["done"] += 1
+                        window_stats["done_r"][r] += 1
+    return {
+        "turns_per_tick": window_stats["done"] / window,
+        "hit": window_stats["cached"] / max(1, window_stats["prompt"]),
+        "done_per_rank": window_stats["done_r"],
+        "max_wait_s": max_wait_s,
+        "stats": dict(router._hold_stats),
+    }
+
+
+class TestConversationAwareHold:
+    """Hold of bound conversations (attention_dp_config.kv_cache_routing_hold_bound_conversations,
+    default off): a context turn of a bound conversation whose home rank is full stays queued for
+    that rank instead of re-prefilling its cached prefix on another rank; the scan pops past it."""
+
+    CAP = 2
+
+    @staticmethod
+    def _states(active, tokens=None):
+        tokens = tokens or [10 * a for a in active]
+        return [
+            RankState(rank=r, num_active_requests=a, num_active_tokens=tokens[r])
+            for r, a in enumerate(active)
+        ]
+
+    def _bind(self, router, conv, rank, prompt):
+        """Route a first turn of ``prompt`` tokens to ``rank``: binds ``conv`` there."""
+        first = _make_conv_request_item(
+            900 + rank, conv, target_dp_rank=rank, attention_dp_relax=False, num_tokens=prompt
+        )
+        tp_size = router.dist.tp_size
+        router.route_requests(
+            self._states([0] * tp_size), [first], max_num_active_requests=self.CAP
+        )
+        assert router._conv_to_rank[conv] == rank
+
+    def _round(self, router, queue, states):
+        budget = len(states) * self.CAP - sum(s.num_active_requests for s in states)
+        popped, placement = router.pop_requests(queue, states, budget, self.CAP)
+        assign, _ = router.route_requests(states, popped, self.CAP, placement=placement)
+        return {item.id: rank for rank, items in assign.items() for item in items}
+
+    def test_off_by_default(self):
+        router = _hold_router(hold=False)
+        assert router.needs_rank0_clock is False and router.hold_log == ""
+        assert DefaultADPRouter.needs_rank0_clock is False
+        self._bind(router, "A", 0, 50_000)
+        queue = FCFSWaitingQueue(
+            [_make_conv_request_item(1, "A", num_tokens=56_000), _make_conv_request_item(2, "B")]
+        )
+        pos = self._round(router, queue, self._states([2, 0, 0, 0]))
+        # The full home rank's turn is popped and overflows (re-prefills elsewhere).
+        assert set(pos) == {1, 2} and pos[1] != 0
+        assert router._conv_to_rank["A"] == 0
+
+    def test_factory_router_asks_for_rank0_clock_only_with_hold(self):
+        for hold in (False, True):
+            cfg = AttentionDpConfig(
+                kv_cache_routing_conversation_affinity=True,
+                kv_cache_routing_hold_bound_conversations=hold,
+            )
+            router = ADPRouter.create(
+                dist=_mock_dist(tp_size=4),
+                has_seq_slot_headroom=True,
+                kv_cache_manager=None,
+                attention_dp_config=cfg,
+            )
+            assert isinstance(router, ConversationAwareADPRouter)
+            assert router.needs_rank0_clock is hold
+
+    @pytest.mark.parametrize("hold", [False, True])
+    def test_executor_feeds_rank0_clock_to_the_router(self, hold):
+        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+        executor = object.__new__(PyExecutor)
+        executor.dist = _mock_dist(tp_size=4)
+        executor.hang_detector = MagicMock()
+        executor._gen_admission = GenAdmissionConfig()  # FCFS: no clock of its own
+        executor.adp_router = ConversationAwareADPRouter(
+            dist=executor.dist, hold_bound_conversations=hold
+        )
+        broadcaster = executor._create_request_broadcaster()
+        assert broadcaster.sync_clock is hold
+        broadcaster.rank0_now = 12.5
+        assert executor.adp_router.rank0_clock() == (12.5 if hold else None)
+
+    def test_full_home_with_long_prefix_is_held_and_others_pass(self):
+        router = _hold_router()
+        self._bind(router, "A", 0, 50_000)
+        self._bind(router, "C", 1, 50_000)
+        queue = FCFSWaitingQueue(
+            [
+                _make_conv_request_item(1, "A", num_tokens=56_000),
+                _make_conv_request_item(2, "B", num_tokens=500),  # new conversation
+                _make_conv_request_item(3, "C", num_tokens=56_000),
+            ]
+        )
+        pos = self._round(router, queue, self._states([2, 0, 0, 0]))
+        assert 1 not in pos  # held for rank 0, not overflowed
+        assert pos[3] == 1  # popped past the held turn, home
+        assert pos[2] in (2, 3)  # new conversation: least loaded rank with room
+        assert [item.id for item in queue] == [1]
+        assert router._hold_stats == {"held": 1, "held_total": 1, "overflow": 0, "valve": 0}
+        assert router.hold_log == (
+            ", adp_held = 1, adp_held_total = 1, adp_overflow = 0, adp_valve = 0"
+        )
+        # Rank 0 frees a slot: the held turn goes home.
+        assert self._round(router, queue, self._states([1, 1, 1, 0])) == {1: 0}
+        assert not queue
+        assert router._hold_stats == {"held": 0, "held_total": 1, "overflow": 0, "valve": 0}
+
+    def test_short_cached_prefix_overflows(self):
+        router = _hold_router()
+        self._bind(router, "A", 0, 1_000)  # below the 16384-token default
+        queue = FCFSWaitingQueue([_make_conv_request_item(1, "A", num_tokens=4_000)])
+        pos = self._round(router, queue, self._states([2, 0, 0, 0]))
+        assert pos[1] != 0
+        assert router._conv_to_rank["A"] == 0  # still bound home
+        assert router._hold_stats == {"held": 0, "held_total": 0, "overflow": 1, "valve": 0}
+
+    def test_valve_overflows_after_max_wait(self):
+        router = _hold_router(max_s=60.0)
+        now = [100.0]
+        router.rank0_clock = lambda: now[0]
+        self._bind(router, "A", 0, 50_000)
+        queue = FCFSWaitingQueue([_make_conv_request_item(1, "A", num_tokens=56_000)])
+        full = self._states([2, 0, 0, 0])
+        for now[0] in (100.0, 130.0, 159.9):
+            assert self._round(router, queue, full) == {}
+        now[0] = 160.0
+        pos = self._round(router, queue, full)
+        assert pos[1] != 0
+        assert router._conv_to_rank["A"] == 0
+        assert router._hold_stats == {"held": 0, "held_total": 1, "overflow": 1, "valve": 1}
+
+    def test_hold_timer_starts_once_rank0_clock_is_known(self):
+        router = _hold_router(max_s=60.0)
+        now = [None]
+        router.rank0_clock = lambda: now[0]
+        self._bind(router, "A", 0, 50_000)
+        queue = FCFSWaitingQueue([_make_conv_request_item(1, "A", num_tokens=56_000)])
+        full = self._states([2, 0, 0, 0])
+        for now[0] in (None, 1000.0, 1059.0):
+            assert self._round(router, queue, full) == {}
+        now[0] = 1060.0
+        assert 1 in self._round(router, queue, full)
+        assert router._hold_stats["held_total"] == 1 and router._hold_stats["valve"] == 1
+
+    @pytest.mark.parametrize("hold", [False, True])
+    def test_new_conversation_does_not_take_a_reserved_home_slot(self, hold):
+        router = _hold_router(hold=hold)
+        self._bind(router, "A", 0, 50_000)
+        # Rank 0 has one free slot and the lightest token load, so least_tokens puts the
+        # new conversation X there unless A's home slot is reserved first.
+        states = self._states([1, 2, 1, 1], tokens=[0, 900, 900, 900])
+        queue = FCFSWaitingQueue(
+            [
+                _make_conv_request_item(1, "X", num_tokens=500),
+                _make_conv_request_item(2, "A", num_tokens=56_000),
+            ]
+        )
+        pos = self._round(router, queue, states)
+        if hold:
+            assert pos[2] == 0 and pos[1] in (2, 3)
+        else:
+            assert pos[1] == 0 and pos[2] in (2, 3)
+
+    def test_strict_explicit_rank_of_a_new_conversation_is_reserved(self):
+        router = _hold_router()
+        self._bind(router, "A", 1, 50_000)
+        queue = FCFSWaitingQueue(
+            [
+                _make_conv_request_item(
+                    1, "N", target_dp_rank=1, attention_dp_relax=False, num_tokens=500
+                ),
+                _make_conv_request_item(2, "A", num_tokens=56_000),
+                _make_conv_request_item(
+                    3, "M", target_dp_rank=0, attention_dp_relax=False, num_tokens=500
+                ),
+            ]
+        )
+        # Rank 1 has one slot: N reserves it first, so A is held; rank 0 is full, so M waits
+        # in the queue as get_from_waiting_queue leaves it.
+        pos = self._round(router, queue, self._states([2, 1, 0, 0]))
+        assert pos == {1: 1}
+        assert [item.id for item in queue] == [2, 3]
+        assert router._hold_stats["held"] == 1
+
+    def test_generation_only_turn_is_never_held(self):
+        router = _hold_router()
+        self._bind(router, "A", 0, 50_000)
+        item = _make_conv_request_item(1, "A", num_tokens=56_000)
+        item.request.request_type = RequestType.REQUEST_TYPE_GENERATION_ONLY
+        queue = FCFSWaitingQueue([item])
+        pos = self._round(router, queue, self._states([2, 0, 0, 0]))
+        assert pos[1] != 0  # routed as without the hold
+        assert router._hold_stats == {"held": 0, "held_total": 0, "overflow": 0, "valve": 0}
+
+    def test_hold_keeps_prompt_history_without_publishing(self):
+        router = _hold_router()
+        item = _make_conv_request_item(1, "A", target_dp_rank=2, num_tokens=5_000)
+        router.route_requests(self._states([0, 0, 0, 0]), [item], max_num_active_requests=4)
+        assert router._conv_home_prompt["A"] == (5_000, 2)
+        assert not isinstance(item.request.py_uncached_prefill_tokens, int)
+
+    def test_hold_routing_is_deterministic_across_ranks(self):
+        def run():
+            router = _hold_router()
+            now = [0.0]
+            router.rank0_clock = lambda: now[0]
+            for rank, conv in enumerate("ABCD"):
+                self._bind(router, conv, rank, 50_000)
+            queue = FCFSWaitingQueue()
+            trace = []
+            for step in range(8):
+                now[0] = 9.0 * step
+                queue.extend(
+                    _make_conv_request_item(100 * step + k, conv, num_tokens=60_000 + k)
+                    for k, conv in enumerate(["A", "A", "B", f"n{step}", "C", "D"])
+                )
+                active = [(step + r) % 3 for r in range(4)]
+                trace.append(sorted(self._round(router, queue, self._states(active)).items()))
+            return trace, [item.id for item in queue], router._hold_stats
+
+        assert run() == run()
+
+    def test_closed_loop_cliff_without_hold_and_recovery_with_it(self):
+        """560 lanes on 16 ranks x 32 slots, one 30 s stall of every rank. Without the
+        hold the overflowed re-prefills keep every rank full and the server stays near
+        4 turns per tick at a ~20 % cache hit; with it, it returns to ~35 turns per tick
+        at ~94 % and no rank starves."""
+        old = _closed_loop_ctx(hold=False)
+        new = _closed_loop_ctx(hold=True)
+        assert old["turns_per_tick"] < 10 and old["hit"] < 0.6, old
+        assert new["turns_per_tick"] > 30 and new["hit"] > 0.9, new
+        mean_per_rank = sum(new["done_per_rank"]) / len(new["done_per_rank"])
+        assert min(new["done_per_rank"]) > 0.7 * mean_per_rank, new
+        assert new["max_wait_s"] <= 60.0, new
+        assert new["stats"]["held_total"] > 0, new
+
+
 class TestNumInputTokens:
     """The cheap token-count accessor used by the routers (avoids copying the
     full input_token_ids list just to count it)."""
@@ -1939,3 +2336,321 @@ class TestNumInputTokens:
                 raise AssertionError("input_token_ids must not be materialized")
 
         assert _num_input_tokens(_Req()) == 1234
+
+
+def _gen_item(
+    req_id,
+    num_tokens,
+    priority=DEFAULT_REQUEST_PRIORITY,
+    request_type=RequestType.REQUEST_TYPE_GENERATION_ONLY,
+):
+    request = SimpleNamespace(
+        num_input_tokens=num_tokens,
+        request_type=request_type,
+        py_scheduling_params=None,
+        py_conversation_params=None,
+        priority=priority,
+    )
+    return RequestQueueItem(req_id, request)
+
+
+def _gen_queue(token_counts):
+    return FCFSWaitingQueue([_gen_item(i, n) for i, n in enumerate(token_counts)])
+
+
+def _states(tokens, active):
+    return [
+        RankState(rank=r, num_active_requests=a, num_active_tokens=t)
+        for r, (t, a) in enumerate(zip(tokens, active))
+    ]
+
+
+def _ids(items):
+    return [item.id for item in items]
+
+
+def _kv_router(tp_size):
+    return DefaultADPRouter(dist=_mock_dist(tp_size=tp_size), kv_balanced_admission=True)
+
+
+@pytest.mark.parametrize(
+    "tokens,loads,counts,slots,budget,forced,groups,expected",
+    [
+        # More candidates than slots: closest to the mean load.
+        ([5000, 200, 1500], [15000, 6000], [3, 3], 4, 2, None, None, [(0, 1), (1, 0)]),
+        ([1, 2, 3, 4, 5], [0, 0, 0], [2, 0, 3], 2, 5, None, None, [(1, 1), (0, 1)]),
+        # The largest request count is not raised while another rank can take the request.
+        ([100, 100, 100], [0, 50000, 60000], [2, 1, 1], 16, 2, None, None, [(0, 1), (1, 2)]),
+        ([20000], [100000, 10000, 95000, 99000], [6, 4, 2, 2], 16, 1, None, None, [(0, 1)]),
+        # Whole window: largest first, best fit below the KV maximum.
+        ([1000, 9000], [0, 5000], [0, 0], 4, 4, None, None, [(1, 0), (0, 1)]),
+        ([30000], [100000, 20000, 60000], [4, 3, 3], 16, 1, None, None, [(0, 2)]),
+        # Forced candidates first.
+        ([9000, 100], [100, 50], [0, 0], 1, 1, [True, False], None, [(0, 1)]),
+        # Groups go in order, even against a better fit or a forced candidate.
+        ([9000, 100], [50000, 50000], [7, 8], 8, 1, None, None, [(1, 0)]),
+        ([9000, 100], [50000, 50000], [7, 8], 8, 1, None, [0, 1], [(0, 0)]),
+        ([300, 9000], [0, 0], [7, 8], 8, 1, [False, True], [0, 1], [(0, 0)]),
+        ([100, 200, 9000, 50], [0, 0], [0, 0], 8, 3, None, [0, 0, 1, 1], [(1, 0), (0, 1), (3, 0)]),
+        # Requests of different groups admitted together are placed largest first:
+        # best fit when the whole window is admitted, else the least-loaded rank.
+        ([1000, 50000], [100000, 0], [7, 7], 8, 2, None, [0, 1], [(1, 1), (0, 0)]),
+        ([1000, 50000, 3000], [100000, 0], [7, 7], 8, 2, None, [0, 1, 2], [(1, 1), (0, 0)]),
+        # A round of 7 admissions on 3 ranks may fill a rank up to ceil(7 / 3) = 3.
+        (
+            [90] + [10] * 6,
+            [0, 0, 0],
+            [0, 0, 0],
+            4,
+            7,
+            None,
+            None,
+            [(0, 0), (1, 1), (2, 1), (3, 1), (4, 2), (5, 2), (6, 2)],
+        ),
+        ([1], [0], [0], 1, 0, None, None, []),
+    ],
+)
+def test_plan_kv_balanced_admission(tokens, loads, counts, slots, budget, forced, groups, expected):
+    forced = forced or [False] * len(tokens)
+    assert (
+        plan_kv_balanced_admission(tokens, forced, loads, counts, slots, budget, groups) == expected
+    )
+
+
+class TestDefaultADPRouterKVBalance:
+    @pytest.mark.parametrize(
+        "config,env,enabled",
+        [
+            (None, None, False),
+            (AttentionDpConfig(), None, False),
+            (AttentionDpConfig(enable_kv_balanced_admission=True), None, True),
+            (None, "1", True),  # TRTLLM_ADP_KV_BALANCE, the environment alias
+        ],
+    )
+    def test_config_turns_it_on(self, monkeypatch, config, env, enabled):
+        if env is None:
+            monkeypatch.delenv("TRTLLM_ADP_KV_BALANCE", raising=False)
+        else:
+            monkeypatch.setenv("TRTLLM_ADP_KV_BALANCE", env)
+        router = ADPRouter.create(
+            dist=_mock_dist(tp_size=2), has_seq_slot_headroom=False, attention_dp_config=config
+        )
+        assert type(router) is DefaultADPRouter and router.kv_balanced_admission is enabled
+        chosen, placement = router.pop_requests(
+            _gen_queue([8000, 300, 400]), _states([20000, 21000], [8, 7]), 1, 8
+        )
+        assert (_ids(chosen), placement) == (([2], {2: 1}) if enabled else ([0], {}))
+
+    def test_pop_plans_the_rank_and_ages_the_rest(self):
+        router = _kv_router(2)
+        queue = _gen_queue([8000, 300, 400])
+        states = _states([20000, 21000], [8, 7])  # only rank 1 has a slot
+        chosen, placement = router.pop_requests(queue, states, 4, max_num_active_requests=8)
+        assert _ids(chosen) == [2] and placement == {2: 1} and _ids(queue) == [0, 1]
+        assert router._kv_balance_skipped_rounds == {0: 1, 1: 1}
+        # A round that admits nothing does not age.
+        assert router.pop_requests(queue, _states([0, 0], [8, 8]), 4, 8) == ([], {})
+        assert router._kv_balance_skipped_rounds == {0: 1, 1: 1}
+
+    def test_request_passed_over_too_often_is_admitted_next(self):
+        router = _kv_router(2)
+        router._kv_balance_skipped_rounds = {0: KV_BALANCE_MAX_SKIPPED_ROUNDS}
+        chosen, _ = router.pop_requests(
+            _gen_queue([8000, 300]), _states([20000, 21300], [7, 8]), 4, 8
+        )
+        assert _ids(chosen) == [0]
+        assert router._kv_balance_skipped_rounds == {1: 1}
+
+    def test_only_the_head_window_is_considered(self):
+        router = _kv_router(2)
+        # The best fit (10 tokens) sits just behind the window.
+        queue = _gen_queue([1000] * KV_BALANCE_WINDOW + [10])
+        chosen, _ = router.pop_requests(
+            queue, _states([0, 0], [0, 1]), 1, max_num_active_requests=1
+        )
+        assert _ids(chosen) == [0]
+
+    def test_burst_is_planned_in_one_round(self):
+        router = _kv_router(4)
+        queue = _gen_queue([1000 * (1 + i % 7) for i in range(2 * KV_BALANCE_WINDOW)])
+        chosen, placement = router.pop_requests(queue, _states([0] * 4, [0] * 4), 64, 16)
+        assert len(chosen) == 2 * KV_BALANCE_WINDOW and not queue
+        assert set(placement) == set(_ids(chosen))
+
+    @pytest.mark.parametrize(
+        "case",
+        [
+            "kv_balance_off",
+            "single_rank",
+            # A window entry that KV balance does not place sends the round to FIFO.
+            "context_request",
+            "special_item",
+            "child_requests",
+            "explicit_dp_rank",
+        ],
+    )
+    def test_fifo_fallback(self, case):
+        single_rank = case == "single_rank"
+        router = _kv_router(1 if single_rank else 2)
+        last = _gen_item(3, 400)
+        if case == "context_request":
+            last.request.request_type = RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION
+        elif case == "special_item":
+            last.request = None
+        elif case == "child_requests":
+            last.child_req_ids = [99]
+        elif case == "explicit_dp_rank":
+            last.request.py_scheduling_params = SimpleNamespace(
+                attention_dp_rank=1, attention_dp_relax=False
+            )
+        queue = _gen_queue([8000, 300, 400])
+        queue.append(last)
+        states = _states([0], [7]) if single_rank else _states([20000, 21000], [8, 7])
+        chosen, placement = router.pop_requests(
+            queue, states, 1, 8, kv_balance=case != "kv_balance_off"
+        )
+        assert _ids(chosen) == [0] and placement == {}
+        assert router._kv_balance_skipped_rounds == {}
+
+    def test_route_follows_the_plan_and_uses_the_heap_without_one(self):
+        router = _kv_router(2)
+        items = [_gen_item(i, n) for i, n in enumerate([9000, 3000, 3000, 3000])]
+        states = _states([0, 0], [0, 0])
+        assignment, expected = router.route_requests(states, items, 4)
+        assert [len(assignment[r]) for r in range(2)] == [2, 2] and expected == 2
+        plan = {item.id: 1 for item in items}
+        assignment, expected = router.route_requests(states, items, 4, plan)
+        assert assignment == {0: [], 1: items} and expected == 4
+
+    def test_no_capacity_does_not_touch_the_queue(self):
+        class _UntouchableQueue(FCFSWaitingQueue):
+            def peek_requests(self, k):
+                raise AssertionError("queue read without capacity")
+
+            def __iter__(self):
+                raise AssertionError("queue read without capacity")
+
+        router = _kv_router(2)
+        queue = _UntouchableQueue([_gen_item(i, 100) for i in range(4)])
+        assert router.pop_requests(queue, _states([0, 0], [0, 0]), 0, 8) == ([], {})
+
+    def test_large_priority_queue_is_not_sorted(self, monkeypatch):
+        def _no_full_scan(self, *args):
+            raise AssertionError("whole priority heap sorted or rebuilt")
+
+        monkeypatch.setattr(PriorityWaitingQueue, "__iter__", _no_full_scan)
+        monkeypatch.setattr(PriorityWaitingQueue, "remove_by_ids", _no_full_scan)
+        queue = PriorityWaitingQueue()
+        queue.add_requests(_gen_item(i, 100 + i % 50, priority=(i % 5) / 10) for i in range(2000))
+        router = _kv_router(2)
+        chosen, _ = router.pop_requests(queue, _states([0, 0], [0, 0]), 4, 8)
+        # Only top-priority requests (ids 4, 9, 14, ...) are admitted.
+        assert len(chosen) == 4 and all(item.id % 5 == 4 for item in chosen)
+        assert len(queue) == 2000 - 4
+
+    @pytest.mark.parametrize("policy", ["fcfs", "priority"])
+    def test_requests_not_admitted_keep_their_queue_order(self, policy):
+        items = [_gen_item(i, 8000 if i % 3 else 300, priority=(i * 3 % 4) / 10) for i in range(40)]
+        queue = FCFSWaitingQueue(items) if policy == "fcfs" else PriorityWaitingQueue()
+        if policy == "priority":
+            queue.add_requests(items)
+        order = _ids(queue)
+        router = _kv_router(2)
+        admitted, _ = router.pop_requests(queue, _states([20000, 21000], [7, 7]), 2, 8)
+        chosen = set(_ids(admitted))
+        assert len(chosen) == 2 and chosen <= set(order[:KV_BALANCE_WINDOW])
+        assert [queue.pop_request().id for _ in range(len(queue))] == [
+            i for i in order if i not in chosen
+        ]
+
+    def test_lower_priority_request_waits_for_a_higher_priority_one(self):
+        router = _kv_router(2)
+        queue = PriorityWaitingQueue()
+        # By KV alone the 100-token request fits rank 0 better.
+        queue.add_requests([_gen_item(0, 100, priority=0.5), _gen_item(1, 9000, priority=0.9)])
+        chosen, _ = router.pop_requests(queue, _states([50000, 50000], [7, 8]), 1, 8)
+        assert _ids(chosen) == [1] and _ids(queue) == [0]
+
+    def test_priority_displacement_restarts_the_skip_count(self):
+        router = _kv_router(2)
+        queue = PriorityWaitingQueue()
+        queue.add_requests(_gen_item(i, 100 + i) for i in range(KV_BALANCE_WINDOW))
+        states = _states([0, 0], [0, 0])
+        router.pop_requests(queue, states, 1, 8)
+        passed_over = set(router._kv_balance_skipped_rounds)
+        assert len(passed_over) == KV_BALANCE_WINDOW - 1
+        # Higher-priority arrivals push the passed-over requests out of the window.
+        queue.add_requests(
+            _gen_item(KV_BALANCE_WINDOW + i, 100, priority=1.0) for i in range(KV_BALANCE_WINDOW)
+        )
+        router.pop_requests(queue, states, 1, 8)
+        assert not passed_over & set(router._kv_balance_skipped_rounds)
+
+    def test_gen_admission_order_is_kept_and_reported(self):
+        router = _kv_router(2)
+        queue = GenAdmissionWaitingQueue(GenAdmissionConfig(ttft_percentile=100.0))
+        for i in range(KV_BALANCE_WINDOW + 8):
+            item = _gen_item(i, 8000 if i % 3 else 300)
+            # Original arrival runs opposite to the GEN arrival order.
+            item.admit_arrival, item.admit_orig_arrival = float(i), float(-i)
+            queue.add_request(item)
+        order = _ids(queue.peek_requests(len(queue)))
+        chosen, _ = router.pop_requests(queue, _states([20000, 21000], [7, 7]), 2, 8)
+        assert set(_ids(chosen)) == set(order[:2])
+        assert queue.admitted_by_tier == {TIER_OLDEST: 2}
+        assert [queue.pop_request().id for _ in range(len(queue))] == order[2:]
+
+    def test_equal_priorities_admit_like_fcfs(self):
+        rng = random.Random(0)
+        routers = [_kv_router(4) for _ in range(2)]
+        queues = [FCFSWaitingQueue(), PriorityWaitingQueue()]
+        tokens, counts = [0] * 4, [0] * 4
+        next_id = 0
+        for _ in range(60):
+            for _ in range(rng.choice([0, 1, 3])):
+                length = int(rng.lognormvariate(9.0, 1.0))
+                for queue in queues:
+                    queue.add_request(_gen_item(next_id, length))
+                next_id += 1
+            states = _states(tokens, counts)
+            budget = rng.choice([0, 1, 2])
+            (fcfs, fcfs_plan), (prio, prio_plan) = [
+                r.pop_requests(q, states, budget, 8) for r, q in zip(routers, queues)
+            ]
+            assert _ids(fcfs) == _ids(prio) and fcfs_plan == prio_plan
+            assert _ids(queues[0]) == _ids(queues[1])
+            assignment, _ = routers[0].route_requests(states, fcfs, 8, fcfs_plan)
+            for rank, assigned in assignment.items():
+                counts[rank] += len(assigned)
+                tokens[rank] += sum(item.request.num_input_tokens for item in assigned)
+            for rank in range(4):  # requests finish now and then
+                if counts[rank] and rng.random() < 0.3:
+                    counts[rank] -= 1
+                    tokens[rank] = tokens[rank] * counts[rank] // (counts[rank] + 1)
+
+    def test_trickle_fill_keeps_the_largest_request_count_at_the_fair_share(self):
+        """Gen-only fill without departures: no rank goes above ceil(requests / ranks)."""
+        num_ranks, slots = 16, 16
+        rng = random.Random(0)
+        router = _kv_router(num_ranks)
+        tokens, counts = [0] * num_ranks, [0] * num_ranks
+        queue = FCFSWaitingQueue()
+        next_id = 0
+        while next_id < num_ranks * slots or queue:
+            for _ in range(min(rng.choice([1, 2]), num_ranks * slots - next_id)):
+                queue.append(_gen_item(next_id, int(rng.lognormvariate(9.5, 1.0))))
+                next_id += 1
+            states = _states(tokens, counts)
+            chosen, placement = router.pop_requests(queue, states, len(queue), slots)
+            assignment, _ = router.route_requests(states, chosen, slots, placement)
+            for rank, items in assignment.items():
+                counts[rank] += len(items)
+                tokens[rank] += sum(item.request.num_input_tokens for item in items)
+            assert max(counts) == -(-sum(counts) // num_ranks), counts
+        assert counts == [slots] * num_ranks
+
+    def test_affinity_routers_keep_fifo_admission(self):
+        router = ConversationAwareADPRouter(dist=_mock_dist(tp_size=2))
+        queue = _gen_queue([8000, 300, 400])
+        chosen, placement = router.pop_requests(queue, _states([20000, 21000], [8, 7]), 1, 8)
+        assert _ids(chosen) == [0] and placement == {}

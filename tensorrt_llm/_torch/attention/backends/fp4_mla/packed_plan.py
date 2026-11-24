@@ -14,7 +14,10 @@ from .config import (
     FP4_MLA_SCALE_ROW_GROUP,
     _ceil_div,
     _fp4_mla_cutedsl_kernel_module,
+    _fp4_mla_lpt_plan_enabled,
     _fp4_mla_packed_rows_per_seq,
+    _fp4_mla_page_plan_enabled,
+    _fp4_mla_wave_plan_enabled,
 )
 from .layout import _ensure_workspace_tensor
 
@@ -29,6 +32,20 @@ def _get_sm_count(device: torch.device) -> int:
         count = torch.cuda.get_device_properties(index).multi_processor_count
         _SM_COUNT_CACHE[index] = count
     return count
+
+
+def _count_fp4_mla_metadata_launch(metadata: Any) -> None:
+    """Count a kernel that writes decode metadata (plan, lengths, page table) on the current
+    stream; a decode launched right after one must not read that metadata before its wait."""
+    metadata.fp4_mla_state.metadata_launches += 1
+
+
+def mark_fp4_mla_query_launch(metadata: Any) -> None:
+    """Record that the kernel writing this step's query rows was just launched (the fused
+    query, ``TRTLLM_K3_ULL2_MLA_DEC_PDL``): a decode launched as its programmatic dependent
+    requires that no metadata kernel was launched since."""
+    state = metadata.fp4_mla_state
+    state.query_launch_mark = state.metadata_launches
 
 
 def _packed_wave_tasks(device: torch.device, m_tiles: int) -> int:
@@ -83,6 +100,12 @@ class _PackedPlanGeometry(NamedTuple):
     helix_kv_bounds: torch.Tensor | None
     plan: torch.Tensor | None
     key: tuple | None
+    # Decode clusters per task and the wave's clusters when the makespan plan
+    # is on, else 0.
+    lpt_m_tiles: int = 0
+    lpt_wave_clusters: int = 0
+    # The wave plan (task length by simulated waves, full tasks first).
+    wave_plan: bool = False
 
 
 def _fp4_mla_packed_plan_geometry(
@@ -137,6 +160,8 @@ def _fp4_mla_packed_plan_geometry(
     split_kv_len = max(task_tiles * 256, 256)
     # The kernels clamp the plan to the compiled profile (a bucket >= split_kv_len).
     module = _fp4_mla_cutedsl_kernel_module()
+    if not _fp4_mla_page_plan_enabled():
+        split_kv_len = max(split_kv_len, module.SMEM_P4_PAGE_PLAN_PROFILE_KV + 1)
     profile_tiles = module._select_runtime_kv_profile(split_kv_len) // 256
     if splits == 1:
         return _PackedPlanGeometry(
@@ -164,6 +189,9 @@ def _fp4_mla_packed_plan_geometry(
         device=device,
     )
     kv_lens = metadata.fp4_mla_state.generation_kv_lens
+    lpt_m_tiles = m_tiles if _fp4_mla_lpt_plan_enabled(module) else 0
+    lpt_wave_clusters = max(1, _get_sm_count(device) // 2) if lpt_m_tiles else 0
+    wave_plan = _fp4_mla_wave_plan_enabled(module)
     key = (
         num_requests,
         splits,
@@ -174,6 +202,8 @@ def _fp4_mla_packed_plan_geometry(
         kv_lens.data_ptr() if isinstance(kv_lens, torch.Tensor) else 0,
         helix_kv_bounds.data_ptr() if helix_kv_bounds is not None else 0,
         plan.data_ptr(),
+        lpt_m_tiles,
+        wave_plan,
     )
     return _PackedPlanGeometry(
         num_requests,
@@ -186,6 +216,9 @@ def _fp4_mla_packed_plan_geometry(
         helix_kv_bounds,
         plan,
         key,
+        lpt_m_tiles,
+        lpt_wave_clusters,
+        wave_plan,
     )
 
 
@@ -217,6 +250,7 @@ def _launch_fp4_mla_packed_plan(
     """Write the step's packed split plan, fused with the generation lengths when given."""
     from .fp4_mla_packed_reduce import launch_packed_plan
 
+    _count_fp4_mla_metadata_launch(metadata)
     launch_packed_plan(
         kv_lens,
         geometry.plan,
@@ -227,5 +261,8 @@ def _launch_fp4_mla_packed_plan(
         query_len=geometry.query_len,
         helix_kv_bounds=geometry.helix_kv_bounds,
         generation_lengths=generation_lengths,
+        lpt_m_tiles=geometry.lpt_m_tiles,
+        lpt_wave_clusters=geometry.lpt_wave_clusters,
+        wave_plan=geometry.wave_plan,
     )
     metadata.fp4_mla_state.packed_plan_key = geometry.key

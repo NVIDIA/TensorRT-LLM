@@ -19,8 +19,15 @@ from tensorrt_llm._torch.nccl_window_graph import (
     release_nccl_window_graph_owner,
 )
 from tensorrt_llm._utils import local_mpi_rank, mpi_rank, mpi_world_size
+from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.logger import logger
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
+from tensorrt_llm.tools.layer_wise_benchmarks.engine_runner import (
+    EngineRunner,
+    merge_llm_args,
+    prefix_num_layers,
+    select_backend,
+)
 from tensorrt_llm.tools.layer_wise_benchmarks.mark_utils import mark_ranges
 from tensorrt_llm.tools.layer_wise_benchmarks.runner import BalanceMethod, Runner
 
@@ -43,6 +50,21 @@ parser.add_argument(
     help="Comma separated indices of layers, should be a contiguous range",
 )
 parser.add_argument("--run-type", type=str, choices=["CTX", "GEN"])
+parser.add_argument(
+    "--backend",
+    type=str,
+    choices=["auto", "layers", "engine"],
+    help='How layers are built and run. "layers": call model.model.layers[i] directly.'
+    ' "engine": build the first N layers (layer_indices must be 0..N-1) through the serving'
+    " executor and replay its generation step, for models without per-layer modules"
+    ' (modeling_v2 targets). Default "auto": "engine" for architectures modeling_v2 routes.',
+)
+parser.add_argument(
+    "--llm-args",
+    help="Engine backend only: TorchLlmArgs fields merged over the ones derived from these"
+    " options (speculative_config, sparse_attention_config, kv_cache_config, ...). A YAML path"
+    " on the command line, or a mapping in the config file.",
+)
 parser.add_argument("--scaled-from", type=int)
 # KV cache related args
 parser.add_argument("--max-batch-size", type=int)
@@ -189,6 +211,37 @@ if args.spec_max_draft_len is not None:
             f"--spec-max-draft-len {args.spec_max_draft_len} implies a single seq_len_q"
             f" {args.spec_max_draft_len + 1}, got {args.seq_len_q_list}"
         )
+if args.backend is None:
+    args.backend = "auto"
+if isinstance(args.llm_args, str):
+    with open(args.llm_args) as f:
+        args.llm_args = yaml.safe_load(f) or {}
+elif args.llm_args is None:
+    args.llm_args = {}
+args.backend = select_backend(args.backend, args.model, args.llm_args)
+if args.backend == "engine":
+    if args.run_type != "GEN":
+        parser.error("the engine backend measures --run-type GEN only")
+    if args.balance_method is None:
+        args.balance_method = "NotModified"
+    if args.balance_ratio_list is None:
+        args.balance_ratio_list = [None]
+    if args.scaled_from is not None or args.balance_method != "NotModified":
+        parser.error(
+            "the engine backend runs the model as served: no --scaled-from, and"
+            " --balance-method NotModified"
+        )
+    prefix_num_layers(args.layer_indices)
+    needed_tokens = max(args.batch_size_list) * max(args.seq_len_q_list)
+    max_num_tokens = args.llm_args.get("max_num_tokens", args.max_num_tokens)
+    if max_num_tokens > needed_tokens:
+        logger.warning(
+            f"Layer-wise benchmarks: max_num_tokens {max_num_tokens} > the {needed_tokens} tokens"
+            " measured; the executor autotunes every bucket up to it at startup (minutes for"
+            " serving-sized values). Leave max_num_tokens unset unless a larger graph is needed."
+        )
+elif args.llm_args:
+    parser.error("--llm-args applies to the engine backend only")
 print(args)
 
 # Speculative decoding shape only: the harness has no sampler, so no drafts are
@@ -207,25 +260,27 @@ local_rank = local_mpi_rank()
 torch.cuda.set_device(local_rank)
 
 # Create KV cache manager
-logger.info("Layer-wise benchmarks: Create KV cache manager")
 mapping = Runner.create_mapping(enable_attention_dp=args.enable_attention_dp)
-kv_cache_manager = Runner.create_kv_cache_manager(
-    args.model,
-    mapping,
-    tokens_per_block=args.tokens_per_block,
-    max_batch_size=args.max_batch_size,
-    max_seq_len=args.max_seq_len,
-    kv_cache_dtype=args.kv_cache_dtype,
-    mamba_ssm_cache_dtype=args.mamba_ssm_cache_dtype,
-    layer_indices=args.layer_indices,
-    kv_pool_headroom=args.kv_pool_headroom,
-    enable_swa_scratch_reuse=args.enable_swa_scratch_reuse,
-    spec_config=spec_config,
-    vision_config=args.vision_config,
-    use_kv_cache_manager_v2=args.use_kv_cache_manager_v2,
-)
+kv_cache_manager = None
+if args.backend == "layers":
+    logger.info("Layer-wise benchmarks: Create KV cache manager")
+    kv_cache_manager = Runner.create_kv_cache_manager(
+        args.model,
+        mapping,
+        tokens_per_block=args.tokens_per_block,
+        max_batch_size=args.max_batch_size,
+        max_seq_len=args.max_seq_len,
+        kv_cache_dtype=args.kv_cache_dtype,
+        mamba_ssm_cache_dtype=args.mamba_ssm_cache_dtype,
+        layer_indices=args.layer_indices,
+        kv_pool_headroom=args.kv_pool_headroom,
+        enable_swa_scratch_reuse=args.enable_swa_scratch_reuse,
+        spec_config=spec_config,
+        vision_config=args.vision_config,
+        use_kv_cache_manager_v2=args.use_kv_cache_manager_v2,
+    )
+    logger.info("Layer-wise benchmarks: Create KV cache manager  ... Done")
 attn_workspace = torch.empty((0,), device="cuda", dtype=torch.int8)
-logger.info("Layer-wise benchmarks: Create KV cache manager  ... Done")
 
 # Create other global objects
 AutoTuner.get().clear_cache()
@@ -234,23 +289,54 @@ mark_ranges()
 
 # Create runner
 logger.info("Layer-wise benchmarks: Create runner")
-runner = Runner(
-    args.model,
-    mapping,
-    load_format=args.load_format,
-    moe_backend=args.moe_backend,
-    layer_indices=args.layer_indices,
-    scaled_from=args.scaled_from,
-    max_seq_len=args.max_seq_len,
-    max_num_tokens=args.max_num_tokens,
-    moe_max_num_tokens=args.moe_max_num_tokens,
-    kv_cache_dtype=args.kv_cache_dtype,
-    mamba_ssm_cache_dtype=args.mamba_ssm_cache_dtype,
-    use_low_precision_moe_combine=args.use_low_precision_moe_combine,
-    use_cuda_graph=args.use_cuda_graph,
-    spec_config=spec_config,
-    vision_config=args.vision_config,
-)
+if args.backend == "engine":
+    # The executor builds the KV cache, autotunes and captures the CUDA graphs of
+    # batch_size_list; the options above give the defaults, llm_args the rest.
+    engine_llm_args = {
+        "model": args.model,
+        "tensor_parallel_size": mapping.tp_size,
+        "moe_expert_parallel_size": mapping.moe_ep_size,
+        "enable_attention_dp": mapping.enable_attention_dp,
+        "load_format": args.load_format,
+        "max_batch_size": args.max_batch_size,
+        "max_seq_len": args.max_seq_len,
+        "max_num_tokens": args.max_num_tokens,
+        "enable_autotuner": args.enable_autotuner,
+        "kv_cache_config": {
+            "dtype": args.kv_cache_dtype,
+            "mamba_ssm_cache_dtype": args.mamba_ssm_cache_dtype,
+            "enable_block_reuse": False,
+            **({"tokens_per_block": args.tokens_per_block} if args.tokens_per_block else {}),
+        },
+        **({"moe_config": {"backend": args.moe_backend}} if args.moe_backend else {}),
+        "cuda_graph_config": {"batch_sizes": sorted(set(args.batch_size_list))}
+        if args.use_cuda_graph
+        else None,
+    }
+    runner = EngineRunner(
+        args.model,
+        llm_args=TorchLlmArgs(**merge_llm_args(engine_llm_args, args.llm_args)),
+        layer_indices=args.layer_indices,
+    )
+    kv_cache_manager = runner.kv_cache_manager
+else:
+    runner = Runner(
+        args.model,
+        mapping,
+        load_format=args.load_format,
+        moe_backend=args.moe_backend,
+        layer_indices=args.layer_indices,
+        scaled_from=args.scaled_from,
+        max_seq_len=args.max_seq_len,
+        max_num_tokens=args.max_num_tokens,
+        moe_max_num_tokens=args.moe_max_num_tokens,
+        kv_cache_dtype=args.kv_cache_dtype,
+        mamba_ssm_cache_dtype=args.mamba_ssm_cache_dtype,
+        use_low_precision_moe_combine=args.use_low_precision_moe_combine,
+        use_cuda_graph=args.use_cuda_graph,
+        spec_config=spec_config,
+        vision_config=args.vision_config,
+    )
 logger.info("Layer-wise benchmarks: Create runner  ... Done")
 
 calibrator = get_calibrator()
@@ -334,7 +420,8 @@ run_pack = runner.create_run_pack(
     kv_cache_manager=kv_cache_manager,
     attn_workspace=attn_workspace,
 )
-if args.enable_autotuner:
+# The engine backend's executor already autotuned in its warmup.
+if args.enable_autotuner and args.backend == "layers":
     cache_path = os.getenv("TLLM_AUTOTUNER_CACHE_PATH") or None
     AutoTuner.get().setup_distributed_state(mapping)
     with autotune(cache_path=cache_path):
@@ -342,8 +429,8 @@ if args.enable_autotuner:
 else:
     run_pack()
 
-# Prefill KV cache
-if args.run_type == "GEN":
+# Prefill KV cache. The engine backend fills its cache pools with seeded random bytes instead.
+if args.run_type == "GEN" and args.backend == "layers":
     logger.info("Layer-wise benchmarks: Create runner for prefill")
     ctx_seq_len_q = max(args.seq_len_kv_cache_list)
     ctx_batch_size = min(
@@ -429,7 +516,14 @@ events = [
     torch.cuda.Event(enable_timing=True) for _ in range(args.warmup_times + args.run_times + 1)
 ]
 [e.record() for e in events]  # Explicitly warmup events because torch is lazy
+engine_events = [
+    (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+    for _ in range(args.warmup_times + args.run_times)
+]
+[e.record() for pair in engine_events for e in pair]
 
+# The engine backend's run pack replays the executor's own CUDA graph.
+capture_graph = args.use_cuda_graph and args.backend == "layers"
 torch.cuda.cudart().cudaProfilerStart()
 with nvtx.annotate(f"layer_wise_benchmarks args {json.dumps(args.__dict__)}"):
     pass  # Use `annotate` instead of `mark` to avoid addition lines on the Nsight Systems UI
@@ -458,7 +552,7 @@ for batch_size, seq_len_q, seq_len_kv_cache, balance_ratio in itertools.product(
         balance_method=BalanceMethod[args.balance_method], balance_ratio=balance_ratio
     ):
         run_pack()
-        if args.use_cuda_graph:
+        if capture_graph:
             with with_multi_stream(True):
                 g = torch.cuda.CUDAGraph()
                 # Bind NCCL-window buffers requested during capture to this graph's pool.
@@ -475,23 +569,38 @@ for batch_size, seq_len_q, seq_len_kv_cache, balance_ratio in itertools.product(
             events[i].record()
             replay_iter = replay_start_iter + i % (replay_stop_iter - replay_start_iter + 1)
             calibrator.pre_step(replay_iter)
-            with nvtx.annotate(nvtx_message):
-                if args.use_cuda_graph:
-                    g.replay()
-                else:
-                    run_pack()
+            if args.backend == "engine":
+                # Time and mark the replay alone: the engine prepares its inputs on the host first.
+                run_pack(events=engine_events[i], nvtx_message=nvtx_message)
+                if i > 0:
+                    # As the overlap scheduler does: the host runs at most one step ahead.
+                    engine_events[i - 1][1].synchronize()
+            else:
+                with nvtx.annotate(nvtx_message):
+                    if capture_graph:
+                        g.replay()
+                    else:
+                        run_pack()
             calibrator.post_step(replay_iter)
         events[-1].record()
         calibrator.stop()
     torch.cuda.synchronize()
-    if args.use_cuda_graph:
+    if capture_graph:
         # Hand the pool's NCCL-window buffers back only after the graph is gone.
         g.reset()
         release_nccl_window_graph_owner(graph_pool)
 
     # Print statistics
     #   Print before `cudaProfilerStop` to ensure messages are included in the profile
-    time_list = [start.elapsed_time(stop) for start, stop in zip(events, events[1:])]
+    if args.backend == "engine":
+        time_list = [start.elapsed_time(stop) for start, stop in engine_events]
+        host_list = [start.elapsed_time(stop) for start, stop in zip(events, events[1:])]
+        print(
+            f"[RANK {rank}]  engine step incl. host input preparation: median"
+            f" {np.median(host_list[args.warmup_times :]) * 1000:.1f} (us)"
+        )
+    else:
+        time_list = [start.elapsed_time(stop) for start, stop in zip(events, events[1:])]
     time_list = time_list[args.warmup_times :]
     print(
         f"[RANK {rank}]"
@@ -507,3 +616,6 @@ for batch_size, seq_len_q, seq_len_kv_cache, balance_ratio in itertools.product(
         f"  (us)"
     )
 torch.cuda.cudart().cudaProfilerStop()
+
+if args.backend == "engine":
+    runner.shutdown()

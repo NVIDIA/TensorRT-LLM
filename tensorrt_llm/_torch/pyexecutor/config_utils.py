@@ -144,34 +144,44 @@ def is_hybrid_linear(config):
         is_kimi_linear(config) or is_qwen4_exp(config) or is_glm5_next(config)
 
 
+def _kimi_composite_text_config(config):
+    """The nested Kimi text config of a composite (text + vision) Kimi config, or None.
+
+    A composite is recognized by its ``text_config`` being the Kimi text config
+    (model_type "kimi_linear"), not by its own model_type, so every composite
+    built on the Kimi K3 text core takes the same KDA hybrid-cache paths.
+    """
+    if getattr(config, "model_type", None) == "kimi_linear":
+        return None
+    text_config = getattr(config, "text_config", None)
+    if getattr(text_config, "model_type", None) != "kimi_linear":
+        return None
+    return text_config
+
+
 def is_kimi_linear(config):
     """True for Kimi K3 ("kimi_linear") hybrid KDA + MLA text models.
 
-    Handles both the flattened text config (model_type "kimi_linear") and the
-    composite VLM config (model_type "kimi_k3" with a nested text_config).
+    Handles both the flattened text config (model_type "kimi_linear") and a
+    composite VLM config (e.g. model_type "kimi_k3") with a nested
+    text_config.
     """
-    model_type = getattr(config, "model_type", None)
-    if model_type == "kimi_linear":
+    if getattr(config, "model_type", None) == "kimi_linear":
         return getattr(config, "linear_attn_config", None) is not None
-    if model_type == "kimi_k3":
-        text_config = getattr(config, "text_config", None)
-        return text_config is not None and is_kimi_linear(text_config)
-    return False
+    text_config = _kimi_composite_text_config(config)
+    return text_config is not None and is_kimi_linear(text_config)
 
 
 def unwrap_kimi_text_config(config):
     """Return the flattened Kimi text config.
 
-    ``is_kimi_linear`` accepts both the flattened text config and the
-    composite "kimi_k3" config with a nested ``text_config``; consumers read
-    text-level fields (``linear_attn_config``, ``num_hidden_layers``, ...),
-    so they must unwrap the composite form first.
+    ``is_kimi_linear`` accepts both the flattened text config and a composite
+    config with a nested ``text_config``; consumers read text-level fields
+    (``linear_attn_config``, ``num_hidden_layers``, ...), so they must unwrap
+    the composite form first.
     """
-    if getattr(config, "model_type", None) == "kimi_k3":
-        text_config = getattr(config, "text_config", None)
-        if text_config is not None:
-            return text_config
-    return config
+    text_config = _kimi_composite_text_config(config)
+    return config if text_config is None else text_config
 
 
 def get_kimi_linear_layer_masks(config):
@@ -403,11 +413,15 @@ def is_mla(config):
 
 
 def supports_fp4_mla_attention(model_config: "ModelConfig") -> bool:
-    """Whether the model uses the dedicated dense TRTLLM FP4 MLA path."""
-    return (is_mla(model_config.pretrained_config)
-            and model_config.attn_backend == "TRTLLM"
+    """Whether the model uses the dedicated dense TRTLLM FP4 MLA path.
+
+    Among hybrid linear-attention models only Kimi K3 (KDA + MLA) qualifies:
+    its V2 hybrid cache manager composes the FP4 MLA cache layout.
+    """
+    config = model_config.pretrained_config
+    return (is_mla(config) and model_config.attn_backend == "TRTLLM"
             and model_config.sparse_attention_config is None
-            and not is_hybrid_linear(model_config.pretrained_config))
+            and (not is_hybrid_linear(config) or is_kimi_linear(config)))
 
 
 def uses_fp4_mla_attention(model_config: "ModelConfig") -> bool:
@@ -516,7 +530,8 @@ def mamba_effective_tp_size(mapping) -> int:
     stays head-sharded across it. Must match the runtime pool construction
     (mamba_cache_manager) or the budget split withholds unsharded-state bytes
     the allocator never uses (observed: 27.2 GiB/rank mis-withheld on a
-    helix16 gen worker whose real pool is 1/16-sharded).
+    helix16 gen worker whose real pool is 1/16-sharded). Ulysses CP shards it
+    over its TP x CP ranks like TP.
     """
     if mapping.has_cp_helix():
         if mapping.enable_attention_dp:
@@ -524,6 +539,9 @@ def mamba_effective_tp_size(mapping) -> int:
         return mapping.tp_size * mapping.cp_size
     if mapping.enable_attention_dp:
         return 1
+    if mapping.cp_size > 1 and mapping.has_cp_ulysses():
+        # Ulysses splits the heads over the TP x CP ranks (attn_tp_size).
+        return mapping.tp_size * mapping.cp_size
     return mapping.tp_size
 
 
@@ -853,6 +871,12 @@ def match_nemotron_h_layer_types(model_config, layer_types):
     return [_NEMOTRON_H_LEGACY_LAYER_TYPES.get(t, t) for t in layer_types]
 
 
+def modeling_v2_load_config(config_dict: dict, **kwargs):
+    """The config a modeling_v2-only family serves for this config.json, or None."""
+    from .._experimental.modeling_v2._architecture_index import load_config
+    return load_config(config_dict, **kwargs)
+
+
 def load_pretrained_config(model_name_or_path: str,
                            trust_remote_code: bool = False,
                            checkpoint_format: Optional[str] = None,
@@ -872,6 +896,12 @@ def load_pretrained_config(model_name_or_path: str,
             MistralConfigLoader
         model_config = MistralConfigLoader().load(
             model_name_or_path).pretrained_config
+    elif (model_config := modeling_v2_load_config(config_dict,
+                                                  **kwargs)) is not None:
+        # A family that exists only in modeling_v2 builds its own config,
+        # whatever trust_remote_code says, so the checkpoint's remote code is
+        # never imported.
+        pass
     elif is_speculators_dspark_config(config_dict):
         # A DSpark drafter in the vLLM speculators format: no top-level
         # model_type, and its auto_map needs the speculators package. Build

@@ -34,7 +34,7 @@ pytestmark = pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "model_type,expected",
     [
-        ("kimi_k3", "template"),
+        ("kimi_k3", "prefer_grammar"),
         ("nemotron_h_omni", "grammar"),
         ("nemotron_h", "grammar"),
         ("qwen3", None),
@@ -176,10 +176,49 @@ class TestBuiltinExtensions:
 
     @pytest.mark.parametrize(
         "model_type,expected",
-        [("kimi_k3", "template"), ("nemotron_h", "grammar"), ("nemotron_h_omni", "grammar")],
+        [("kimi_k3", "prefer_grammar"), ("nemotron_h", "grammar"), ("nemotron_h_omni", "grammar")],
     )
     def test_required_tool_choice_loads_builtins(self, clean_registry, model_type, expected):
         assert required_tool_choice_mode(model_type) == expected
+
+    def test_modeling_v2_family_extension_resolves_through_the_index(
+        self, clean_registry, monkeypatch
+    ) -> None:
+        """A modeling_v2-only model_type gets its architecture module's serving extension.
+
+        The extension is registered on the first lookup.
+        """
+        from types import ModuleType
+
+        from tensorrt_llm._torch._experimental.modeling_v2 import _architecture_index
+
+        class FamilyExtension(ServingExtension):
+            lenient_tool_call_arguments = True
+
+        module = ModuleType("probe_architecture")
+        module.serving_extension = FamilyExtension
+        monkeypatch.setattr(
+            _architecture_index,
+            "architecture_module",
+            lambda model_type: module if model_type == "probe_family" else None,
+        )
+        extension = serving_extensions.get_serving_extension("probe_family")
+        assert isinstance(extension, FamilyExtension)
+        assert serving_extensions._BY_MODEL_TYPE["probe_family"] is extension
+        assert serving_extensions.get_serving_extension("probe_family") is extension
+        assert required_tool_choice_mode("probe_family") is None
+        # Any other model_type keeps the all-defaults extension.
+        assert serving_extensions.get_serving_extension("probe_other") is (
+            serving_extensions._DEFAULT_EXTENSION
+        )
+
+    def test_kimi_k31_resolves_to_the_kimi_extension(self, clean_registry) -> None:
+        from tensorrt_llm.serve.extensions.kimi_k3 import KimiK3ServingExtension
+
+        assert isinstance(
+            serving_extensions.get_serving_extension("kimi_k31"), KimiK3ServingExtension
+        )
+        assert required_tool_choice_mode("kimi_k31") == "prefer_grammar"
 
     def test_gpt_oss_resolves_to_gpt_oss_extension(self, clean_registry) -> None:
         hook = structured_output_format_for("gpt_oss")
@@ -575,7 +614,10 @@ class TestOpenAIChatIntegration:
             {"prompt_token_ids": [1, 2]},
             {"prompt_token_ids_b64": "AQAAAA=="},
             {"add_generation_prompt": False},
-            {"disaggregated_params": {"request_type": "context_only"}},
+            {
+                "prompt_token_ids": [1, 2],
+                "disaggregated_params": {"request_type": "generation_only"},
+            },
             {"response_format": {"type": "json_object"}},
         ],
     )
@@ -586,6 +628,27 @@ class TestOpenAIChatIntegration:
         expected_status = 422 if change.get("tools") == [] else 400
         assert response.status_code == expected_status, response.text
         assert "generation" not in rendered
+
+    @pytest.mark.parametrize(
+        "change",
+        [
+            {"disaggregated_params": {"request_type": "context_only"}},
+            {
+                "prompt_token_ids": [1, 2],
+                "disaggregated_params": {
+                    "request_type": "generation_only",
+                    "resolved_thinking": False,
+                },
+            },
+        ],
+    )
+    def test_required_grammar_on_disaggregated_workers(self, required_chat_client, change):
+        # The context worker renders the prompt; the generation worker builds the
+        # same grammar from the reasoning mode the context worker relayed.
+        client, server, rendered = required_chat_client
+        response = client.post("/v1/chat/completions", json={**self.required_body(), **change})
+        assert response.status_code == 200, response.text
+        assert rendered["generation"]["sampling_params"].guided_decoding is not None
 
     @pytest.mark.parametrize(
         "model_type,parser,backend",

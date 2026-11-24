@@ -363,6 +363,10 @@ class DFlashForCausalLM(nn.Module):
     # tests), so the config cap stands.
     _runtime_position_ceiling = None
 
+    # True for a drafter built for a disaggregated context server: it only
+    # stores the context KV and holds no modules for the block decode.
+    context_kv_only = False
+
     @classmethod
     def _resolve_auto_attention_backend(cls) -> str:
         """Turn ``AUTO`` into a concrete backend for this drafter family."""
@@ -441,6 +445,12 @@ class DFlashForCausalLM(nn.Module):
             finally:
                 pretrained_cfg.architectures = original_archs
 
+        if dflash_attention_backend == "AUTO":
+            dflash_attention_backend = self._resolve_auto_attention_backend()
+        self._helix_mapping = self._shard_context_kv_by_helix(
+            draft_config, dflash_attention_backend
+        )
+
         # Remove spec_config to prevent recursive spec-dec initialization
         draft_config_no_spec = replace(draft_config, spec_config=None, lm_head_gather_output=False)
         # ModelConfig.extra_attrs is init=False, so dataclasses.replace() does
@@ -469,8 +479,6 @@ class DFlashForCausalLM(nn.Module):
         self.block_size = dflash_config.get(
             "block_size", getattr(pretrained_config, "block_size", None)
         )
-        if dflash_attention_backend == "AUTO":
-            dflash_attention_backend = self._resolve_auto_attention_backend()
         self.dflash_attention_backend = dflash_attention_backend
         self.check_valid_attention_backend(self.dflash_attention_backend)
         # Each backend loads only its own ops; the rest stay None so the
@@ -609,6 +617,14 @@ class DFlashForCausalLM(nn.Module):
         self._sliding_layers_causal = False
         self._validate_gqa_shape()
         self._warn_inferred_attention_windows()
+
+    def _shard_context_kv_by_helix(self, draft_config, attention_backend: str):
+        """The helix mapping that shards this drafter's context KV by page, or None.
+
+        The generic drafter keeps head TP. A drafter whose context KV is
+        sharded over helix CP ranks overrides this hook.
+        """
+        return None
 
     def _validate_gqa_shape(self):
         """Reject a backbone the block decode cannot express.

@@ -28,6 +28,27 @@ def _build(spec, seed):
     return logits, bias, spec["n_group"], spec["topk_group"], spec["topk"], spec["scale"]
 
 
+# The cells of every Kimi K3.1 target: the general one and the SM 10.3 perf targets copied from it.
+_K31_TARGET_CELLS: tuple[Cell, ...] = (
+    *(
+        Cell(
+            why=f"kimi k3.1 router outside the kernel, {tokens} token(s): fp32 logits, "
+            "896 experts in one group, top-16, unscaled",
+            spec=dict(
+                tokens=tokens,
+                experts=896,
+                n_group=1,
+                topk_group=1,
+                topk=16,
+                scale=1.0,
+                logits_dtype=torch.float32,
+            ),
+        )
+        for tokens in (1, 8, 256, 8192)
+    ),
+)
+
+
 # The shapes each shipped target calls this entry with, by target directory
 # under `models/`. The entry's own `CELLS` are the op's whoever calls it.
 TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
@@ -50,6 +71,9 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
             ),
         ),
     ),
+    "kimi_k31/kimi_k31_pro_mxfp4__sm_10x__default": _K31_TARGET_CELLS,
+    "kimi_k31/kimi_k31_pro_mxfp4__sm_103__tep": _K31_TARGET_CELLS,
+    "kimi_k31/kimi_k31_pro_mxfp4__sm_103__dep": _K31_TARGET_CELLS,
 }
 
 CELLS = certified_cells(op, TARGET_CELLS)

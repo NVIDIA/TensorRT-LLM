@@ -15,7 +15,10 @@ from tensorrt_llm._torch.pyexecutor.model_loader import (
     validate_and_set_kv_cache_quant,
     validate_encoder_decoder_kv_cache_config,
 )
-from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
+from tensorrt_llm.llmapi.llm_args import (
+    DeepSeekSparseAttentionConfig,
+    MiniMaxM3SparseAttentionConfig,
+)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
@@ -222,6 +225,55 @@ def test_validate_and_set_kv_cache_quant_sm107_downgrade_propagates_to_quant_con
         assert layer_quant_config.kv_cache_quant_algo == expected
 
 
+class _TargetServingNvfp4KvCache:
+    """A modeling_v2 target whose own attention serves an NVFP4 KV cache."""
+
+    handles_nvfp4_kv_cache = True
+
+
+class _TargetWithoutDeclaration:
+    """A modeling_v2 target that declares nothing about an NVFP4 KV cache."""
+
+
+@pytest.mark.parametrize("requested_dtype", ["nvfp4", "auto"])
+@pytest.mark.parametrize(
+    "target",
+    [None, _TargetWithoutDeclaration, _TargetServingNvfp4KvCache],
+    ids=["built-in-model", "target-without-declaration", "target-serving-nvfp4"],
+)
+@pytest.mark.parametrize("sm_version", [100, 107], ids=["sm100", "sm107"])
+def test_validate_and_set_kv_cache_quant_keeps_nvfp4_for_a_target_that_serves_it(
+    monkeypatch: pytest.MonkeyPatch,
+    sm_version: int,
+    target: type | None,
+    requested_dtype: str,
+) -> None:
+    """On SM107 a DSA model's NVFP4 KV cache runs as FP8, as trtllm-gen reads
+    none there, unless the modeling_v2 target the loader routed to declares
+    that its own attention serves one (``handles_nvfp4_kv_cache``). The
+    per-layer QuantConfigs follow. Elsewhere the NVFP4 cache stays either way."""
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.model_loader.get_sm_version", lambda: sm_version
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.model_loader.torch.cuda.is_available",
+        lambda: True,
+    )
+    model_config = _make_mixed_precision_model_config()
+    model_config.sparse_attention_config = DeepSeekSparseAttentionConfig()
+    model_config.modeling_v2_target = target
+    if requested_dtype == "auto":
+        model_config.quant_config.kv_cache_quant_algo = QuantAlgo.NVFP4
+        for layer_quant_config in model_config.quant_config_dict.values():
+            layer_quant_config.kv_cache_quant_algo = QuantAlgo.NVFP4
+    validate_and_set_kv_cache_quant(model_config, requested_dtype)
+    keeps = sm_version != 107 or target is _TargetServingNvfp4KvCache
+    expected = QuantAlgo.NVFP4 if keeps else QuantAlgo.FP8
+    assert model_config.quant_config.kv_cache_quant_algo == expected
+    for layer_quant_config in model_config.quant_config_dict.values():
+        assert layer_quant_config.kv_cache_quant_algo == expected
+
+
 def _write_safetensors_header(checkpoint_dir, tensor_dtype, tensor_shape):
     shard_name = "model-00001-of-00001.safetensors"
     header = {
@@ -347,6 +399,59 @@ def test_deepseek_v4_missing_compress_ratios_raises(tmp_path, monkeypatch):
 
     with pytest.raises(ValueError, match="compress_ratios"):
         ModelConfig.from_pretrained(str(tmp_path))
+
+
+def _dsa_indexer_probe_config():
+    """A config that is none of the DSA architectures but states where its indexer fields live."""
+    from transformers import PretrainedConfig
+
+    indexer = types.SimpleNamespace(index_n_heads=8, index_head_dim=64, index_topk=256)
+
+    class DsaIndexerProbeConfig(PretrainedConfig):
+        model_type = "dsa_indexer_probe"
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+
+        @property
+        def dsa_indexer_config(self):
+            return indexer
+
+    return DsaIndexerProbeConfig(architectures=["DsaIndexerProbe"], num_hidden_layers=2)
+
+
+def test_dsa_indexer_config_supplies_the_sparse_attention_fields(tmp_path, monkeypatch):
+    """The DSA sparse-attention config is built from the config's ``dsa_indexer_config``,
+    keeping the fields the user set; a None ``index_topk`` takes the checkpoint's."""
+    from tensorrt_llm._torch import model_config as model_config_module
+    from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig
+
+    pretrained_config = _dsa_indexer_probe_config()
+    monkeypatch.setattr(
+        model_config_module, "load_pretrained_config", lambda *args, **kwargs: pretrained_config
+    )
+
+    sparse = ModelConfig.from_pretrained(str(tmp_path)).sparse_attention_config
+    assert isinstance(sparse, DeepSeekSparseAttentionConfig)
+    assert (sparse.index_n_heads, sparse.index_head_dim, sparse.index_topk) == (8, 64, 256)
+
+    requested = DeepSeekSparseAttentionConfig(index_topk=None)
+    sparse = ModelConfig.from_pretrained(
+        str(tmp_path), sparse_attention_config=requested
+    ).sparse_attention_config
+    assert sparse.index_topk == 256
+
+
+def test_no_dsa_config_without_an_indexer(tmp_path, monkeypatch):
+    from transformers import PretrainedConfig
+
+    from tensorrt_llm._torch import model_config as model_config_module
+
+    pretrained_config = PretrainedConfig(architectures=["DummyArchitecture"])
+    monkeypatch.setattr(
+        model_config_module, "load_pretrained_config", lambda *args, **kwargs: pretrained_config
+    )
+    assert ModelConfig.from_pretrained(str(tmp_path)).sparse_attention_config is None
 
 
 def test_model_config_sets_is_encoder_decoder_from_pretrained_config():

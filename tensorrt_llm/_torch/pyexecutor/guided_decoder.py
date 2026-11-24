@@ -40,6 +40,24 @@ def row_has_valid_token(row: torch.Tensor, vocab_size_padded: int) -> bool:
     return bool(row[num_words].item() & ((1 << num_tail_bits) - 1))
 
 
+def _grammar_stop_token_ids(request: LlmRequest) -> Optional[List[int]]:
+    """The request's end id and single-token stop words.
+
+    A grammar that has run to completion only admits its stop tokens, so they
+    must be the request's own terminators; otherwise the model is forced onto
+    the tokenizer's EOS, which need not stop the request.
+    """
+    if request.py_guided_decoding_params is None:
+        return None
+    stop_ids = []
+    if request.py_end_id is not None and request.py_end_id >= 0:
+        stop_ids.append(request.py_end_id)
+    for word in request.py_stop_words_list or ():
+        if len(word) == 1 and word[0] not in stop_ids:
+            stop_ids.append(word[0])
+    return stop_ids or None
+
+
 @dataclass(slots=True)
 class GuidedRequest:
     """A snapshot of an LlmRequest that contains relevant fields for guided decoding.
@@ -55,6 +73,9 @@ class GuidedRequest:
     is_last_context_chunk: bool = False
     is_generation_in_progress_state: bool = False
     is_generation_only_first_iteration: bool = False
+
+    # Terminators of the request; a completed grammar admits these.
+    stop_token_ids: Optional[List[int]] = None
 
     new_token: Optional[int] = None
     is_draft: bool = False
@@ -98,6 +119,7 @@ class GuidedRequest:
                 == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY
                 and request.py_decoding_iter == 1
                 and request.py_batch_idx is None),
+            stop_token_ids=_grammar_stop_token_ids(request),
             new_token=request.get_last_tokens(0),
             draft_tokens=request.py_draft_tokens,
             num_accepted_draft_tokens=request.py_num_accepted_draft_tokens)
@@ -255,7 +277,7 @@ class GuidedDecoder:
 
                 if matcher_init:
                     matcher = self.grammar_matcher_factory.create(
-                        req.guided_decoding_params)
+                        req.guided_decoding_params, req.stop_token_ids)
                     self.grammar_matchers[slot] = matcher
 
                 if matcher_advance:
@@ -486,7 +508,7 @@ class GuidedDecoder:
             if req.is_generation_only_first_iteration:
                 self.grammar_matchers[
                     req.seq_slot] = self.grammar_matcher_factory.create(
-                        req.guided_decoding_params)
+                        req.guided_decoding_params, req.stop_token_ids)
 
     @nvtx_range("GuidedDecoder.init_disagg_gen_requests")
     def init_disagg_gen_requests(self) -> None:

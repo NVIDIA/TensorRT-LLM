@@ -22,10 +22,13 @@ new requests across ADP ranks.
 Protocol:
     1. Each rank builds its local RankState
     2. All ranks exchange RankState via allgather
-    3. ADPRouter.route_requests() distributes new requests
+    3. ADPRouter.pop_requests() pops the requests to admit and may plan their ranks
+    4. ADPRouter.route_requests() distributes them, following that plan
 
 Includes:
-    - DefaultADPRouter: load-balanced min-heap routing
+    - DefaultADPRouter: load-balanced min-heap routing; with
+      enable_kv_balanced_admission, generation-only (disaggregated decode)
+      requests are admitted and placed by KV length
     - KVCacheAwareADPRouter: cache-aware routing that factors in
       prefix match length from the KV cache radix tree
 """
@@ -34,14 +37,17 @@ from __future__ import annotations
 
 import heapq
 import math
+import os
 import random
 from abc import ABC, abstractmethod
 from collections import OrderedDict, namedtuple
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 
+from tensorrt_llm.bindings.executor import RequestType
 from tensorrt_llm.logger import logger
 
 from ..llm_request import LlmRequestState
+from ..request_utils import can_process_attention_dp_request, get_from_waiting_queue
 from .rank_state import RankIterStatsPayload, RankState
 
 if TYPE_CHECKING:
@@ -49,8 +55,23 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 
     from ..executor_request_queue import RequestQueueItem
+    from .waiting_queue import WaitingQueue
 
 HeapVal = namedtuple("HeapVal", ["num_tokens", "num_requests", "rank", "request_list"])
+
+# KV-balanced admission chooses among this many requests at the head of the queue,
+# or among all that fit when there is room for more.
+KV_BALANCE_WINDOW = 32
+# A request passed over in this many admitting rounds while in that window is
+# admitted next (under PRIORITY, a request pushed out of the window starts over).
+KV_BALANCE_MAX_SKIPPED_ROUNDS = 64
+
+# Limits of the hold of bound conversations in ConversationAwareADPRouter
+# (attention_dp_config.kv_cache_routing_hold_bound_conversations; see the field's description):
+# a turn is held only if it expects at least this many cached tokens on its home rank,
+# and for at most this many seconds of rank 0's clock.
+ADP_HOLD_MIN_CACHED_TOKENS = 16384
+ADP_HOLD_MAX_S = 60.0
 
 
 def _num_input_tokens(request) -> int:
@@ -62,6 +83,124 @@ def _num_input_tokens(request) -> int:
     if isinstance(num_input_tokens, int):
         return num_input_tokens
     return len(getattr(request, "input_token_ids", []))
+
+
+def _is_kv_balanced_request(req_item) -> bool:
+    """Generation-only request without child requests or ``attention_dp_rank``."""
+    request = req_item.request
+    if request is None or req_item.child_req_ids:
+        return False
+    if request.request_type != RequestType.REQUEST_TYPE_GENERATION_ONLY:
+        return False
+    scheduling_params = getattr(request, "py_scheduling_params", None)
+    return scheduling_params is None or scheduling_params.attention_dp_rank is None
+
+
+def plan_kv_balanced_admission(
+    candidate_tokens: List[int],
+    candidate_forced: List[bool],
+    rank_tokens: List[int],
+    rank_num_requests: List[int],
+    max_requests_per_rank: int,
+    max_new_requests: int,
+    candidate_groups: Optional[List[int]] = None,
+) -> List[Tuple[int, int]]:
+    """Plan which candidates to admit and on which rank.
+
+    A lockstep decode step waits for the rank with the most KV and for the rank
+    with the most requests. No admission takes a rank above the largest request
+    count, or above the fair share after this round if that is higher, while
+    another rank can take it. Groups are admitted in order: whole groups first,
+    then, in the first group that does not fit, each slot takes the candidate
+    that brings its rank closest to the mean load (forced candidates first).
+    Candidates of whole groups are placed together, largest first: to the rank
+    each leaves closest below the KV maximum (best fit) when the whole window is
+    admitted, otherwise to the least-loaded rank.
+
+    Args:
+        candidate_tokens: KV tokens of each candidate, in queue order.
+        candidate_forced: Whether each candidate must be admitted first.
+        rank_tokens: KV tokens per rank.
+        rank_num_requests: Requests per rank.
+        max_requests_per_rank: Request slots per rank.
+        max_new_requests: Upper bound on the number of admissions.
+        candidate_groups: Admission group of each candidate (see
+            ``WaitingQueue.admission_groups``); ``None`` is one group.
+
+    Returns:
+        ``(candidate_index, rank)`` pairs in admission order.
+    """
+    loads = list(rank_tokens)
+    counts = list(rank_num_requests)
+    num_ranks = len(counts)
+    free_slots = sum(max(0, max_requests_per_rank - count) for count in counts)
+    budget = min(max_new_requests, free_slots, len(candidate_tokens))
+    plan: List[Tuple[int, int]] = []
+    if budget <= 0:
+        return plan
+    if candidate_groups is None:
+        candidate_groups = [0] * len(candidate_tokens)
+    count_cap = max(max(counts), math.ceil((sum(counts) + budget) / num_ranks))
+
+    def count_rise(rank: int) -> int:
+        return max(0, counts[rank] + 1 - count_cap)
+
+    def open_ranks() -> List[int]:
+        return [r for r in range(num_ranks) if counts[r] < max_requests_per_rank]
+
+    def best_fit_rank(tokens: int) -> int:
+        max_load = max(loads)
+
+        def key(rank: int) -> Tuple[int, int, int, int]:
+            load_rise = max(0, loads[rank] + tokens - max_load)
+            if count_rise(rank) == 0 and load_rise == 0:
+                return 0, 0, max_load - loads[rank] - tokens, rank
+            return count_rise(rank), load_rise, loads[rank], rank
+
+        return min(open_ranks(), key=key)
+
+    def least_loaded_rank() -> int:
+        return min(open_ranks(), key=lambda r: (count_rise(r), loads[r], counts[r], r))
+
+    def admit(idx: int, rank: int) -> None:
+        plan.append((idx, rank))
+        loads[rank] += candidate_tokens[idx]
+        counts[rank] += 1
+
+    whole: List[int] = []
+    partial: List[int] = []
+    for group in dict.fromkeys(candidate_groups):
+        members = [i for i, g in enumerate(candidate_groups) if g == group]
+        if len(members) > budget:
+            partial = members
+            break
+        whole += members
+        budget -= len(members)
+        if budget == 0:
+            break
+
+    # Candidates admitted in the same round start together, so queue order does
+    # not bind their placement.
+    window_admitted = len(whole) == len(candidate_tokens)
+    for idx in sorted(whole, key=lambda i: (-candidate_tokens[i], i)):
+        admit(idx, best_fit_rank(candidate_tokens[idx]) if window_admitted else least_loaded_rank())
+
+    if partial and budget:
+        avg_candidate_tokens = sum(candidate_tokens[i] for i in partial) / len(partial)
+        target = (sum(loads) + avg_candidate_tokens * budget) / num_ranks
+        for _ in range(budget):
+            forced = [idx for idx in partial if candidate_forced[idx]]
+            if forced:
+                idx, rank = forced[0], best_fit_rank(candidate_tokens[forced[0]])
+            else:
+                _, _, idx, rank = min(
+                    (count_rise(r), abs(candidate_tokens[i] - (target - loads[r])), i, r)
+                    for r in open_ranks()
+                    for i in partial
+                )
+            admit(idx, rank)
+            partial.remove(idx)
+    return plan
 
 
 def is_retiring_request(request) -> bool:
@@ -92,11 +231,14 @@ class ADPRouter(ABC):
     the scope of this class.
 
     Interface:
-        Input:  list[RankState], list[Request]
-        Output: dict[rank, list[Request]]
+        pop_requests:   WaitingQueue, list[RankState] -> list[Request], planned ranks
+        route_requests: list[RankState], list[Request], planned ranks
+                        -> dict[rank, list[Request]]
     """
 
     needs_prefix_matches: bool = False
+    # True if pop_requests reads rank 0's clock (``rank0_clock``, set by PyExecutor).
+    needs_rank0_clock: bool = False
 
     def __init__(self, dist: Distributed, has_seq_slot_headroom: bool = False):
         self.dist = dist
@@ -143,6 +285,7 @@ class ADPRouter(ABC):
                 max_sessions=attention_dp_config.kv_cache_routing_max_sessions,
                 fair_share_multiplier=attention_dp_config.kv_cache_routing_fair_share_multiplier,
                 new_conv_placement=attention_dp_config.kv_cache_routing_new_conv_placement,
+                hold_bound_conversations=attention_dp_config.kv_cache_routing_hold_bound_conversations,
             )
 
         if (
@@ -176,7 +319,16 @@ class ADPRouter(ABC):
                 account_for_in_transfer=attention_dp_config.kv_cache_routing_account_for_in_transfer,
             )
 
-        return DefaultADPRouter(dist=dist, has_seq_slot_headroom=has_seq_slot_headroom)
+        return DefaultADPRouter(
+            dist=dist,
+            has_seq_slot_headroom=has_seq_slot_headroom,
+            # TRTLLM_ADP_KV_BALANCE=1 is an environment alias of
+            # attention_dp_config.enable_kv_balanced_admission.
+            kv_balanced_admission=(
+                attention_dp_config is not None and attention_dp_config.enable_kv_balanced_admission
+            )
+            or os.environ.get("TRTLLM_ADP_KV_BALANCE", "0") == "1",
+        )
 
     @abstractmethod
     def create_rank_state(
@@ -204,6 +356,7 @@ class ADPRouter(ABC):
         num_connector_transfers: int = 0,
         connector_poll_failed: bool = False,
         include_kv_cache_load: bool = False,
+        num_buffered_responses: int = 0,
     ) -> list[RankState]:
         """Build local RankState, allgather across DP ranks, return all states.
 
@@ -224,6 +377,11 @@ class ADPRouter(ABC):
                 awaiting response delivery before their slots can be freed.
             connector_poll_failed: Whether the local completion poll failed;
                 all owners must then enter the executor's error vote.
+            num_buffered_responses: Responses this rank holds for the next
+                synchronized response flush, e.g. the error response of a
+                request that already left ``active_requests``. They count as
+                retiring requests, so the fleet does not take the blocking idle
+                fetch while one of them is still undelivered.
         """
         if self.exclude_retiring_requests:
             active_requests_for_overlap = build_active_requests_for_overlap(active_requests)
@@ -232,7 +390,7 @@ class ADPRouter(ABC):
             active_requests_for_overlap = active_requests
             num_retiring_requests = 0
         local_state = self.create_rank_state(active_requests_for_overlap, new_requests or [])
-        local_state.num_retiring_requests = num_retiring_requests
+        local_state.num_retiring_requests = num_retiring_requests + num_buffered_responses
         local_state.copy_iter_stats_from(iter_stats_payload)
         if forward_work is not None:
             local_state.num_context_requests, local_state.num_generation_requests = forward_work
@@ -262,6 +420,40 @@ class ADPRouter(ABC):
         max_requests, max_tokens = loads_per_cp_rank.max(axis=0)
         local_state.num_active_requests = int(max_requests)
         local_state.num_active_tokens = int(max_tokens)
+
+    def pop_requests(
+        self,
+        waiting_queue: WaitingQueue,
+        all_rank_states: list[RankState],
+        max_new_requests: int,
+        max_num_active_requests: int,
+        kv_balance: bool = True,
+    ) -> Tuple[List[RequestQueueItem], Dict[int, int]]:
+        """Pop the requests to admit; FIFO by default.
+
+        Every rank sees the same queue and rank states, so all ranks pop the same
+        requests.
+
+        Args:
+            waiting_queue: Queue to pop from.
+            all_rank_states: State of all ranks (from allgather).
+            max_new_requests: Maximum number of requests to admit.
+            max_num_active_requests: Maximum active requests per rank.
+            kv_balance: False (warmup, the benchmark fill phase) pops in queue
+                order: no KV-balanced admission and no hold.
+
+        Returns:
+            The requests to admit, and the ranks planned for them (request id ->
+            rank) to pass to ``route_requests``; empty when no ranks are planned.
+        """
+        requests = get_from_waiting_queue(
+            waiting_queue,
+            max_new_requests,
+            enable_attention_dp=True,
+            max_num_active_requests=max_num_active_requests,
+            all_ranks_num_active_requests=[s.num_active_requests for s in all_rank_states],
+        )
+        return requests, {}
 
     @staticmethod
     def _assign_explicit_dp_ranks(
@@ -321,6 +513,7 @@ class ADPRouter(ABC):
         all_rank_states: list[RankState],
         new_requests: list[RequestQueueItem],
         max_num_active_requests: int,
+        placement: Optional[Dict[int, int]] = None,
     ) -> Tuple[Dict[int, List[RequestQueueItem]], int]:
         """Assign new requests to ranks based on gathered rank states.
 
@@ -328,6 +521,9 @@ class ADPRouter(ABC):
             all_rank_states: State of all ranks (from allgather).
             new_requests: New RequestQueueItems to distribute.
             max_num_active_requests: Maximum active requests per rank.
+            placement: Ranks planned by ``pop_requests`` (request id -> rank).
+                When not empty, it covers every request in ``new_requests``.
+                Routers whose ``pop_requests`` plans no ranks ignore it.
 
         Returns:
             Tuple of:
@@ -352,7 +548,26 @@ class DefaultADPRouter(ADPRouter):
            keyed on (num_active_tokens, num_active_requests), so ranks with
            fewer tokens get more requests. Requests are sorted by token count
            (descending) for better load balancing.
+
+    With ``kv_balanced_admission`` (``AttentionDpConfig.enable_kv_balanced_admission``),
+    generation-only requests are admitted by KV load: while the first
+    ``KV_BALANCE_WINDOW`` queued requests (or all that fit) are all such requests,
+    ``pop_requests`` plans admission and placement together
+    (``plan_kv_balanced_admission``, ordered by ``WaitingQueue.admission_groups``)
+    and returns the planned ranks, which ``route_requests`` follows. A single
+    rank, warmup and the benchmark fill phase admit in queue order.
     """
+
+    def __init__(
+        self,
+        dist: Distributed,
+        has_seq_slot_headroom: bool = False,
+        kv_balanced_admission: bool = False,
+    ):
+        super().__init__(dist, has_seq_slot_headroom=has_seq_slot_headroom)
+        self.kv_balanced_admission = kv_balanced_admission
+        # Request id -> admitting rounds it was passed over in the window.
+        self._kv_balance_skipped_rounds: Dict[int, int] = {}
 
     def create_rank_state(
         self,
@@ -369,11 +584,69 @@ class DefaultADPRouter(ADPRouter):
             num_active_tokens=num_active_tokens,
         )
 
+    def pop_requests(
+        self,
+        waiting_queue: WaitingQueue,
+        all_rank_states: list[RankState],
+        max_new_requests: int,
+        max_num_active_requests: int,
+        kv_balance: bool = True,
+    ) -> Tuple[List[RequestQueueItem], Dict[int, int]]:
+        # A single rank has no placement to choose.
+        if (
+            not (self.kv_balanced_admission and kv_balance)
+            or max_new_requests <= 0
+            or len(all_rank_states) <= 1
+        ):
+            return super().pop_requests(
+                waiting_queue, all_rank_states, max_new_requests, max_num_active_requests
+            )
+        free_slots = sum(
+            max(0, max_num_active_requests - s.num_active_requests) for s in all_rank_states
+        )
+        window = waiting_queue.peek_requests(
+            max(KV_BALANCE_WINDOW, min(max_new_requests, free_slots))
+        )
+        if not window or not all(_is_kv_balanced_request(item) for item in window):
+            return super().pop_requests(
+                waiting_queue, all_rank_states, max_new_requests, max_num_active_requests
+            )
+
+        skipped_rounds = self._kv_balance_skipped_rounds
+        plan = plan_kv_balanced_admission(
+            candidate_tokens=[_num_input_tokens(item.request) for item in window],
+            candidate_forced=[
+                skipped_rounds.get(item.id, 0) >= KV_BALANCE_MAX_SKIPPED_ROUNDS for item in window
+            ],
+            rank_tokens=[s.num_active_tokens for s in all_rank_states],
+            rank_num_requests=[s.num_active_requests for s in all_rank_states],
+            max_requests_per_rank=max_num_active_requests,
+            max_new_requests=max_new_requests,
+            candidate_groups=waiting_queue.admission_groups(window),
+        )
+        chosen = [window[idx] for idx in sorted(idx for idx, _ in plan)]
+        placement = {window[idx].id: rank for idx, rank in plan}
+        chosen_ids = set(placement)
+        if chosen_ids:
+            # Pop the window and put the rest back in order (no remove_by_ids).
+            popped = [waiting_queue.pop_request() for _ in window]
+            waiting_queue.prepend_requests(item for item in popped if item.id not in chosen_ids)
+            waiting_queue.mark_admitted(chosen)
+        # Only a round that admitted something passes the others over.
+        skipped = 1 if chosen else 0
+        self._kv_balance_skipped_rounds = {
+            item.id: skipped_rounds.get(item.id, 0) + skipped
+            for item in window
+            if item.id not in chosen_ids
+        }
+        return chosen, placement
+
     def route_requests(
         self,
         all_rank_states: list[RankState],
         new_requests: list[RequestQueueItem],
         max_num_active_requests: int,
+        placement: Optional[Dict[int, int]] = None,
     ) -> Tuple[Dict[int, List[RequestQueueItem]], int]:
         tp_size = len(all_rank_states)
         all_ranks_new_requests: Dict[int, List[RequestQueueItem]] = {
@@ -381,6 +654,17 @@ class DefaultADPRouter(ADPRouter):
         }
         all_ranks_num_active_requests = [s.num_active_requests for s in all_rank_states]
         all_ranks_num_active_tokens = [s.num_active_tokens for s in all_rank_states]
+
+        if placement:
+            # Admitted by KV-balanced admission: place them as planned.
+            for item in new_requests:
+                rank = placement[item.id]
+                all_ranks_new_requests[rank].append(item)
+                all_ranks_num_active_requests[rank] += 1
+            expected_num_active_requests = self._expected_num_active_requests(
+                all_ranks_num_active_requests, 0, tp_size, hard_cap=max_num_active_requests
+            )
+            return all_ranks_new_requests, expected_num_active_requests
 
         def get_relax_value(req_item):
             scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
@@ -652,7 +936,9 @@ class KVCacheAwareADPRouter(ADPRouter):
         all_rank_states: list[RankState],
         new_requests: list[RequestQueueItem],
         max_num_active_requests: int,
+        placement: Optional[Dict[int, int]] = None,
     ) -> Tuple[Dict[int, List[RequestQueueItem]], int]:
+        # placement is unused: this router's pop_requests plans no ranks.
         tp_size = len(all_rank_states)
         all_ranks_new_requests: Dict[int, List[RequestQueueItem]] = {
             s.rank: [] for s in all_rank_states
@@ -806,7 +1092,9 @@ class ConversationAwareADPRouter(ADPRouter):
     default, ``least_queued``, or ``least_tokens``), and every later request with
     the same ``conversation_id`` returns to that rank, keeping the conversation's
     KV-cache prefix on one rank. Requests without a ``conversation_id`` fall
-    back to the same ``new_conv_placement`` policy.
+    back to the same ``new_conv_placement`` policy. A later request whose rank
+    is full overflows to another rank, unless the hold
+    (``hold_bound_conversations``, see ``__init__``) keeps it queued for its rank.
     """
 
     # Default LRU cap on the conversation->rank map (entries are ~tens of
@@ -820,20 +1108,29 @@ class ConversationAwareADPRouter(ADPRouter):
         max_sessions: int = DEFAULT_MAX_SESSIONS,
         fair_share_multiplier: float = 2.0,
         new_conv_placement: str = "round_robin",
+        hold_bound_conversations: bool = False,
     ):
         super().__init__(dist, has_seq_slot_headroom=has_seq_slot_headroom)
         self._conv_to_rank: "OrderedDict[str, int]" = OrderedDict()
         # Uncached-prefill estimate for the V2 scheduler's long-prefill
-        # demotion: within a conversation the prompt only grows and the rank
-        # that served the previous turn caches its prompt, so on that rank
-        # uncached ~= prompt_len - previous prompt_len; on any other rank, and
-        # for an unseen conversation, uncached == prompt_len. Keyed by
-        # conversation_id, not by the routing key: sub-agents that share their
-        # parent's affinity id have prompts of their own. Off until the
-        # scheduler that consumes it turns it on (set_publish_uncached_estimate).
+        # demotion: within a conversation the prompt only grows, so a later
+        # turn is estimated as prompt_len - previous prompt_len and an unseen
+        # conversation as prompt_len. The estimate does not depend on the rank
+        # the turn lands on: a turn that overflowed off its home rank (home at
+        # max_num_active_requests) is estimated like a turn at home, so
+        # demotion does not hold it in that rank's active requests. Holding
+        # overflow turns keeps ranks at the cap, which overflows more returning
+        # turns; under a burst of returning turns the attention-DP group then
+        # stays in that state. Keyed by conversation_id, not by the routing
+        # key: sub-agents that share their parent's affinity id have prompts of
+        # their own. Off until the scheduler that consumes it turns it on
+        # (set_publish_uncached_estimate).
         self._publish_uncached_estimate_enabled = False
-        # conversation_id -> (prompt_len, rank) of its last turn on its home rank.
-        self._conv_last_prompt: "OrderedDict[str, Tuple[int, int]]" = OrderedDict()
+        # conversation_id -> prompt_len of its last turn.
+        self._conv_last_prompt: "OrderedDict[str, int]" = OrderedDict()
+        # conversation_id -> (prompt_len, rank) of its last turn on its home
+        # rank: what that rank caches, which the hold (below) measures.
+        self._conv_home_prompt: "OrderedDict[str, Tuple[int, int]]" = OrderedDict()
         self._max_sessions = max(1, int(max_sessions))
         self._fair_share_multiplier = max(1.0, float(fair_share_multiplier))
         self._new_conv_placement = (
@@ -842,6 +1139,27 @@ class ConversationAwareADPRouter(ADPRouter):
             else "round_robin"
         )
         self._round_robin_cursor = 0
+        # Hold of bound conversations (kv_cache_routing_hold_bound_conversations;
+        # limits ADP_HOLD_*): an overflowed turn re-prefills its whole prompt on
+        # another rank, which under load can keep every rank overflowing.
+        # Generation-only requests are never held.
+        self._hold = bool(hold_bound_conversations)
+        self.needs_rank0_clock = self._hold
+        # Rank 0's time in seconds (the same on every rank), None while unknown.
+        self.rank0_clock = lambda: None
+        self._hold_min_cached = ADP_HOLD_MIN_CACHED_TOKENS
+        self._hold_max_s = ADP_HOLD_MAX_S
+        # Held request id -> rank 0 time of its first hold (None: clock unknown).
+        self._hold_since: Dict[int, Optional[float]] = {}
+        # Ids of the turns the last pop_requests reserved a home slot for.
+        self._hold_home_ids: Set[int] = set()
+        # held now (last pop), held at least once, overflowed, overflowed by the valve
+        self._hold_stats = {"held": 0, "held_total": 0, "overflow": 0, "valve": 0}
+        if self._hold:
+            logger.info(
+                f"[adp_router][conv] hold bound conversations: min cached "
+                f"{self._hold_min_cached} tokens, max wait {self._hold_max_s:g} s"
+            )
 
     def create_rank_state(
         self,
@@ -884,30 +1202,139 @@ class ConversationAwareADPRouter(ADPRouter):
         """Publish py_uncached_prefill_tokens only while the scheduler uses it."""
         self._publish_uncached_estimate_enabled = enabled
 
+    def _remember(self, history: "OrderedDict", conv_id: str, value) -> None:
+        history[conv_id] = value
+        history.move_to_end(conv_id)
+        while len(history) > self._max_sessions:
+            history.popitem(last=False)
+
     def _publish_uncached_estimate(
         self, req_item: RequestQueueItem, rank: int, home_rank: Optional[int]
     ) -> None:
-        """Estimate the request's uncached prefill on ``rank`` and publish it on
-        the request (see __init__). ``home_rank`` is the rank its routing key was
-        bound to before this placement, None for a new binding."""
+        """Estimate the request's uncached prefill from its conversation's
+        previous prompt length and publish it on the request (see __init__).
+        With the hold on, also note what its home rank caches: ``home_rank`` is
+        the rank its routing key was bound to before this placement on ``rank``,
+        None for a new binding."""
         req = req_item.request
-        if not self._publish_uncached_estimate_enabled or req is None:
+        if not (self._publish_uncached_estimate_enabled or self._hold) or req is None:
             return
         conversation_params = req.py_conversation_params
         conv_id = None if conversation_params is None else conversation_params.conversation_id
         prompt = _num_input_tokens(req)
-        prev = None if conv_id is None else self._conv_last_prompt.get(conv_id)
-        if prev is not None and prev[1] == rank:
-            req.py_uncached_prefill_tokens = max(prompt - prev[0], 0)
-        else:
-            req.py_uncached_prefill_tokens = prompt
+        if self._publish_uncached_estimate_enabled:
+            prev = None if conv_id is None else self._conv_last_prompt.get(conv_id)
+            req.py_uncached_prefill_tokens = prompt if prev is None else max(prompt - prev, 0)
+            if conv_id is not None:
+                self._remember(self._conv_last_prompt, conv_id, prompt)
         # An overflow turn's prefix stays off the home rank: keep the home entry
         # so the next turn back home is measured against what that rank caches.
-        if conv_id is not None and (home_rank is None or rank == home_rank):
-            self._conv_last_prompt[conv_id] = (prompt, rank)
-            self._conv_last_prompt.move_to_end(conv_id)
-            while len(self._conv_last_prompt) > self._max_sessions:
-                self._conv_last_prompt.popitem(last=False)
+        if self._hold and conv_id is not None and (home_rank is None or rank == home_rank):
+            self._remember(self._conv_home_prompt, conv_id, (prompt, rank))
+
+    def _home_rank(self, req_item: RequestQueueItem) -> Optional[int]:
+        """Home rank of a bound conversation's context turn, else None."""
+        req = req_item.request
+        if (
+            req is None
+            or getattr(req, "request_type", None) == RequestType.REQUEST_TYPE_GENERATION_ONLY
+        ):
+            return None
+        conv_id = self._conversation_id(req_item)
+        return None if conv_id is None else self._conv_to_rank.get(conv_id)
+
+    def _cached_on(self, req_item: RequestQueueItem, rank: int) -> int:
+        """Prompt tokens of the request that ``rank`` caches: its conversation's
+        last prompt there, 0 if its last turn on its home rank was elsewhere."""
+        conversation_params = req_item.request.py_conversation_params
+        prev = (
+            None
+            if conversation_params is None
+            else self._conv_home_prompt.get(conversation_params.conversation_id)
+        )
+        if prev is None or prev[1] != rank:
+            return 0
+        return min(prev[0], _num_input_tokens(req_item.request))
+
+    def pop_requests(
+        self,
+        waiting_queue: WaitingQueue,
+        all_rank_states: list[RankState],
+        max_new_requests: int,
+        max_num_active_requests: int,
+        kv_balance: bool = True,
+    ) -> Tuple[List[RequestQueueItem], Dict[int, int]]:
+        """FIFO (the base class) unless the hold is on. With the hold, a context
+        turn of a bound conversation is popped only into a free slot of its home
+        rank, which it reserves for ``route_requests``; if that rank is full it
+        stays queued (see ``kv_cache_routing_hold_bound_conversations``) and the
+        scan goes on. Other requests are popped as ``get_from_waiting_queue``
+        pops them, into the remaining slots. ``kv_balance`` False (warmup, the
+        benchmark fill phase) pops in queue order, with no hold. Every rank sees
+        the same queue, rank states and rank-0 clock, so all ranks pop the same
+        requests."""
+        self._hold_home_ids = set()
+        if not (self._hold and kv_balance) or len(all_rank_states) <= 1:
+            return super().pop_requests(
+                waiting_queue, all_rank_states, max_new_requests, max_num_active_requests
+            )
+        counts = [s.num_active_requests for s in all_rank_states]
+        budget = min(max_new_requests, sum(max(0, max_num_active_requests - c) for c in counts))
+        now = self.rank0_clock()
+        stats = self._hold_stats
+        admitted: List[RequestQueueItem] = []
+        pending: List[RequestQueueItem] = []
+        num_admitted = 0
+        while num_admitted < budget and waiting_queue:
+            req_item = waiting_queue.peek_request()
+            size = 1 + len(req_item.child_req_ids or ())
+            if num_admitted + size > budget:
+                break
+            waiting_queue.pop_request()
+            home = self._home_rank(req_item)
+            if home is None:
+                if not can_process_attention_dp_request(req_item, counts, max_num_active_requests):
+                    pending.append(req_item)
+                    continue
+            elif counts[home] < max_num_active_requests:
+                counts[home] += 1
+                self._hold_home_ids.add(req_item.id)
+            else:
+                if self._cached_on(req_item, home) >= self._hold_min_cached:
+                    since = self._hold_since.get(req_item.id)
+                    if since is None:
+                        stats["held_total"] += req_item.id not in self._hold_since
+                        self._hold_since[req_item.id] = since = now
+                    if now is None or now - since < self._hold_max_s:
+                        pending.append(req_item)
+                        continue
+                    stats["valve"] += 1
+                stats["overflow"] += 1
+            self._hold_since.pop(req_item.id, None)
+            admitted.append(req_item)
+            num_admitted += size
+        if not waiting_queue:
+            # Scanned to the end: drop the timers of requests no longer queued.
+            self._hold_since = {
+                item.id: self._hold_since[item.id]
+                for item in pending
+                if item.id in self._hold_since
+            }
+        stats["held"] = len(self._hold_since)
+        waiting_queue.prepend_requests(pending)
+        waiting_queue.mark_admitted(admitted)
+        return admitted, {}
+
+    @property
+    def hold_log(self) -> str:
+        """Hold counters for the iteration log; empty while the hold is off."""
+        if not self._hold:
+            return ""
+        stats = self._hold_stats
+        return (
+            f", adp_held = {stats['held']}, adp_held_total = {stats['held_total']}, "
+            f"adp_overflow = {stats['overflow']}, adp_valve = {stats['valve']}"
+        )
 
     def _assign_new_conversation_explicit_dp_ranks(
         self,
@@ -951,7 +1378,9 @@ class ConversationAwareADPRouter(ADPRouter):
         all_rank_states: list[RankState],
         new_requests: list[RequestQueueItem],
         max_num_active_requests: int,
+        placement: Optional[Dict[int, int]] = None,
     ) -> Tuple[Dict[int, List[RequestQueueItem]], int]:
+        # placement is unused: this router's pop_requests plans no ranks.
         tp_size = len(all_rank_states)
         all_ranks_new_requests: Dict[int, List[RequestQueueItem]] = {
             s.rank: [] for s in all_rank_states
@@ -965,6 +1394,25 @@ class ConversationAwareADPRouter(ADPRouter):
             return scheduling_params.attention_dp_relax
 
         sorted_requests = sorted(new_requests, key=get_relax_value)
+
+        # 0) Hold on: the turns pop_requests reserved a home slot for go home
+        #    first, so explicit ranks, new conversations and overflow turns
+        #    cannot take those slots.
+        if self._hold_home_ids:
+            rest: List[RequestQueueItem] = []
+            for req_item in sorted_requests:
+                conv_id = self._conversation_id(req_item)
+                rank = (
+                    self._conv_to_rank.get(conv_id) if req_item.id in self._hold_home_ids else None
+                )
+                if rank is None or all_ranks_num_active_requests[rank] >= max_num_active_requests:
+                    rest.append(req_item)
+                    continue
+                self._record_target_rank(conv_id, rank)
+                self._publish_uncached_estimate(req_item, rank, rank)
+                all_ranks_new_requests[rank].append(req_item)
+                all_ranks_num_active_requests[rank] += 1
+            sorted_requests = rest
 
         # 1) Honour an explicit attention_dp_rank for a new conversation and
         #    record that placement. Existing conversations keep their binding.

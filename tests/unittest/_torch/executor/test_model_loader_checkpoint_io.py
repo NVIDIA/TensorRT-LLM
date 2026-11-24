@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from typing import Any, Iterator, Literal
 from unittest.mock import MagicMock
@@ -382,6 +382,40 @@ def test_legacy_weight_session_defers_load_until_enter() -> None:
     with session as loaded_weights:
         assert loaded_weights is weights
     checkpoint_loader.load_weights.assert_called_once_with("/checkpoint", mapping=mapping)
+
+
+class _ReadsItsOwnCheckpoint:
+    """A model class that reads its own checkpoint, as a modeling_v2 target may."""
+
+    def __init__(self) -> None:
+        self.opened = []
+
+    def open_checkpoint_weights(self, checkpoint_dir: str, mapping: object):
+        self.opened.append((checkpoint_dir, mapping))
+        return nullcontext({"own.weight": "lazy"})
+
+
+def test_model_reads_its_own_checkpoint_in_place_of_the_builtin_hf_loader() -> None:
+    model = _ReadsItsOwnCheckpoint()
+    mapping = object()
+
+    with _open_checkpoint_weight_session(
+        HfCheckpointLoader(), "/checkpoint", mapping=mapping, model=model
+    ) as weights:
+        assert weights == {"own.weight": "lazy"}
+    assert model.opened == [("/checkpoint", mapping)]
+
+
+def test_another_checkpoint_loader_still_reads_for_such_a_model() -> None:
+    model = _ReadsItsOwnCheckpoint()
+    weights = {"loader.weight": object()}
+    checkpoint_loader = SimpleNamespace(load_weights=MagicMock(return_value=weights))
+
+    with _open_checkpoint_weight_session(
+        checkpoint_loader, "/checkpoint", mapping=object(), model=model
+    ) as loaded_weights:
+        assert loaded_weights is weights
+    assert model.opened == []
 
 
 def test_checkpoint_session_times_preparation_and_finalization_separately(

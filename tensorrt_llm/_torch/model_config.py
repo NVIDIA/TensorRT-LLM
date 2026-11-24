@@ -39,10 +39,14 @@ from tensorrt_llm._utils import (get_sm_version, is_sm_100f,
                                  torch_dtype_to_binding)
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.functional import AllReduceStrategy
+# Re-exported: callers import MoeLoadBalancerConfig from this module.
+from tensorrt_llm.llmapi.llm_args import \
+    MoeLoadBalancerConfig  # noqa: F401  # isort: skip
 from tensorrt_llm.llmapi.llm_args import (CSA2SparseAttentionConfig,
                                           DeepSeekSparseAttentionConfig,
                                           DeepSeekV4SparseAttentionConfig,
-                                          KvCacheConfig, MoeLoadBalancerConfig,
+                                          KvCacheConfig,
+                                          MoeLoadBalancerConfigType,
                                           MultimodalConfig)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -59,7 +63,7 @@ from tensorrt_llm.quantization.utils.fp4_utils import (
 
 if TYPE_CHECKING:
     from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
-    from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
+    from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig, DkvConfig,
                                               KvCacheCompressionConfig,
                                               LoraConfig, SparseAttentionConfig,
                                               SpeculativeConfig)
@@ -274,6 +278,8 @@ class ModelConfig(Generic[TConfig]):
     lora_config: Optional["LoraConfig"] = None
     sparse_attention_config: Optional["SparseAttentionConfig"] = None
     kv_cache_compression_config: Optional["KvCacheCompressionConfig"] = None
+    # TorchLlmArgs.dkv_config: the distributed KV of a Ulysses CP context server, or None.
+    dkv_config: Optional["DkvConfig"] = None
 
     is_generation: bool = True
     is_encoder_decoder: bool = False
@@ -286,7 +292,7 @@ class ModelConfig(Generic[TConfig]):
     _moe_max_num_tokens_is_default: Optional[bool] = field(default=None,
                                                            repr=False,
                                                            compare=False)
-    moe_load_balancer: Optional[MoeLoadBalancerConfig] = None
+    moe_load_balancer: Optional[MoeLoadBalancerConfigType] = None
 
     attn_backend: str = 'TRTLLM'
     # Effective threshold requested for trtllm-gen MLA skip-correction. Zero
@@ -1212,23 +1218,36 @@ class ModelConfig(Generic[TConfig]):
                 # derive its hash multipliers) has no other way to find it.
                 if not getattr(pretrained_config, '_name_or_path', None):
                     pretrained_config._name_or_path = str(checkpoint_dir)
+                # DSA checkpoints: DeepSeek-V3.2 / GLM-MoE-DSA carry the
+                # indexer fields on the config itself; any other config may
+                # state the (sub-)config that carries them
+                # (``dsa_indexer_config``).
                 if pretrained_config.architectures[0] in [
                         "DeepseekV32ForCausalLM", "GlmMoeDsaForCausalLM"
                 ]:
+                    dsa_pretrained_config = pretrained_config
+                else:
+                    dsa_pretrained_config = getattr(pretrained_config,
+                                                    'dsa_indexer_config', None)
+                if dsa_pretrained_config is not None:
                     sparse_attention_config = kwargs.get(
                         'sparse_attention_config')
                     indexer_rope_interleave = getattr(
-                        pretrained_config, 'indexer_rope_interleave', False)
+                        dsa_pretrained_config, 'indexer_rope_interleave', False)
                     if sparse_attention_config:
-                        index_n_heads = sparse_attention_config.index_n_heads or pretrained_config.index_n_heads
-                        index_head_dim = sparse_attention_config.index_head_dim or pretrained_config.index_head_dim
+                        index_n_heads = sparse_attention_config.index_n_heads or dsa_pretrained_config.index_n_heads
+                        index_head_dim = sparse_attention_config.index_head_dim or dsa_pretrained_config.index_head_dim
                         # Explicit-set check (see V4 path above): only honor a
                         # user-provided index_topk; otherwise take the
                         # checkpoint value rather than a truthy subclass default.
-                        if 'index_topk' in sparse_attention_config.model_fields_set:
+                        # A serialized copy of the arguments marks every field as
+                        # set, so a None index_topk still means "take the checkpoint's".
+                        if ('index_topk'
+                                in sparse_attention_config.model_fields_set and
+                                sparse_attention_config.index_topk is not None):
                             index_topk = sparse_attention_config.index_topk
                         else:
-                            index_topk = pretrained_config.index_topk
+                            index_topk = dsa_pretrained_config.index_topk
                         indexer_max_chunk_size = sparse_attention_config.indexer_max_chunk_size
                         skip_indexer_for_short_seqs = sparse_attention_config.skip_indexer_for_short_seqs
                         use_cute_dsl_topk = sparse_attention_config.use_cute_dsl_topk
@@ -1240,9 +1259,9 @@ class ModelConfig(Generic[TConfig]):
                         indexer_k_dtype = sparse_attention_config.indexer_k_dtype
                         index_share_for_mtp_iteration = sparse_attention_config.index_share_for_mtp_iteration
                     else:
-                        index_n_heads = pretrained_config.index_n_heads
-                        index_head_dim = pretrained_config.index_head_dim
-                        index_topk = pretrained_config.index_topk
+                        index_n_heads = dsa_pretrained_config.index_n_heads
+                        index_head_dim = dsa_pretrained_config.index_head_dim
+                        index_topk = dsa_pretrained_config.index_topk
                         indexer_max_chunk_size = None
                         skip_indexer_for_short_seqs = True
                         use_cute_dsl_topk = False

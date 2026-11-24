@@ -78,6 +78,18 @@ def _unified_cache_defaults(cache_root: str) -> dict[str, str]:
     }
 
 
+def _setup_rank_local_compile_cache() -> None:
+    """Opt-in (``TLLM_K31_RANK_LOCAL_CACHE=1``): private node-local Triton and Inductor caches per rank.
+
+    Runs before :func:`_setup_unified_cache` so that its ``setdefault`` keeps the private directories.
+    See ``tensorrt_llm/_rank_local_cache.py``; :func:`~tensorrt_llm._rank_local_cache.setup` reads the
+    switch and does nothing when it is off.
+    """
+    from ._rank_local_cache import setup
+
+    setup()
+
+
 def _setup_unified_cache() -> None:
     """Configure compiled-artifact cache defaults before framework imports."""
     cache_root = os.environ.get(_UNIFIED_CACHE_ROOT_ENV)
@@ -170,6 +182,7 @@ def _setup_vendored_triton_kernels():
 
 def _prepare_environment() -> None:
     """Phase 1: environment and library preparation, before the Torch import."""
+    _setup_rank_local_compile_cache()
     _set_numexpr_thread_default()
     _keep_inductor_compile_pool_alive()
     _setup_unified_cache()

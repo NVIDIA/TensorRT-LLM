@@ -188,9 +188,13 @@ def _shutdown_manager(manager, monkeypatch):
     """Exercise real shutdown while replacing only the native pool teardown."""
     manager._recurrent_buffers = {"buffer": object()}
     manager._branch_snapshot_points = {"request": object()}
+    manager._requested_snapshot_points = {"request": {64}}
     if isinstance(manager, Qwen4ExpHybridCacheManager):
         manager._ple_conv_states = {42: object()}
         manager._ple_ngram_contexts = {42: object()}
+    if isinstance(manager, KimiK3HybridCacheManager):
+        manager._kda_midchunk_snapshots = {42: object()}
+        manager._kda_midchunk_handed_out = {42}
 
     def check_before_pool_shutdown():
         assert manager.intermediate_state_indices is None
@@ -198,9 +202,12 @@ def _shutdown_manager(manager, monkeypatch):
         assert manager.intermediate_conv_states is None
         assert not manager._recurrent_buffers
         assert not manager._branch_snapshot_points
+        assert not manager._requested_snapshot_points
         assert not manager.all_ssm_states and not manager.all_conv_states
         if isinstance(manager, Qwen4ExpHybridCacheManager):
             assert not manager._ple_conv_states and not manager._ple_ngram_contexts
+        if isinstance(manager, KimiK3HybridCacheManager):
+            assert not manager._kda_midchunk_snapshots and not manager._kda_midchunk_handed_out
 
     pool_shutdown = Mock(side_effect=check_before_pool_shutdown)
     monkeypatch.setattr(KVCacheManagerV2, "shutdown", pool_shutdown)

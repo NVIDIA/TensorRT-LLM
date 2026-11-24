@@ -1326,6 +1326,7 @@ class EncoderDecoderRunner(DecoderRunner):
     _steady_gen_cache_supported = False
     _eager_workspace_reclaim_supported = False
     _deferred_decode_outputs_supported = False
+    _input_commit_supported = False
 
     def __init__(
         self,

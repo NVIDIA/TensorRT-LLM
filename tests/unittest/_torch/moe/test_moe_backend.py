@@ -71,6 +71,7 @@ from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
 from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe_backend
 from tensorrt_llm._torch.moe.fused_moe.cutedsl import (
     TrtllmCutedslDenseGemmNvfp4Impl,
+    TrtllmCutedslFusedFc12Nvfp4Impl,
     TrtllmCutedslGroupedGemmBf16Impl,
     TrtllmCutedslGroupedGemmNvfp4Impl,
 )
@@ -330,6 +331,37 @@ _MEGAMOE_BACKEND_TYPES = {
     MoeBackendType.MEGAMOE_DEEPGEMM,
     MoeBackendType.MEGAMOE_CUTEDSL,
 }
+
+
+def test_external_comm_scheduler_plans_caller_output_buffer():
+    """Without external communication a caller buffer of the output's shape and dtype becomes
+    the plan's output buffer when the backend writes into a supplied buffer; anything else
+    leaves the backend to allocate its own."""
+    backend = SimpleNamespace(supports_moe_output_in_alltoall_workspace=lambda: True)
+    moe = SimpleNamespace(comm=None, enable_alltoall=False, hidden_size=8, backend=backend)
+    scheduler = ExternalCommMoEScheduler(moe)
+    storage = torch.empty(6 * 8 + 6 * 16, dtype=torch.bfloat16)
+    buffer = storage[: 6 * 8].view(6, 8)
+
+    def plan(output, num_tokens=6, dtype=torch.bfloat16, do_finalize=True):
+        return scheduler._build_comm_plan(
+            [num_tokens], dtype, do_finalize, num_tokens=num_tokens, moe_output=output
+        )
+
+    assert plan(buffer).moe_output is buffer
+    assert not plan(buffer).payload_in_workspace
+    assert plan(None).moe_output is None
+    assert plan(buffer, num_tokens=5).moe_output is None
+    assert plan(buffer, dtype=torch.float16).moe_output is None
+    assert plan(buffer, do_finalize=False).moe_output is None
+    assert plan(storage[: 6 * 16].view(6, 16)[:, :8]).moe_output is None  # not contiguous
+    # A backend that emits its own output tensor.
+    backend.supports_moe_output_in_alltoall_workspace = lambda: False
+    assert plan(buffer).moe_output is None
+    backend.supports_moe_output_in_alltoall_workspace = lambda: True
+    # External combine: the backend output is not the layer output.
+    moe.comm = SimpleNamespace(supports_post_quant_dispatch=lambda: True)
+    assert plan(buffer).moe_output is None
 
 
 def test_fused_comm_scheduler_accepts_singleton_non_dp_token_metadata():
@@ -792,6 +824,99 @@ def test_scheduler_skips_async_quantization_without_backend_support(monkeypatch)
     assert scheduler._should_quantize_input_async(torch.empty(2, 4)) is False
 
 
+class _StopChunk(Exception):
+    """Ends a stubbed chunk once its routing and input join have been issued."""
+
+
+def _join_order_scheduler(backend, log: list) -> ExternalCommMoEScheduler:
+    """A scheduler over a stub MoE whose routing, input join and input
+    quantization append to ``log``. The chunk stops at the quantization, or at
+    the run context when a fused route+quant already quantized."""
+
+    def apply(router_logits, input_ids):
+        del input_ids
+        log.append("route")
+        rows = router_logits.shape[0]
+        return torch.zeros(rows, 2, dtype=torch.int32), torch.ones(rows, 2)
+
+    def stop(*args, **kwargs):
+        del args, kwargs
+        log.append("quantize")
+        raise _StopChunk
+
+    backend.quantize_input = stop
+    scheduler = ExternalCommMoEScheduler.__new__(ExternalCommMoEScheduler)
+    scheduler._build_run_context = stop
+    scheduler.moe = SimpleNamespace(
+        backend=backend,
+        comm=None,
+        apply_router_weight_on_input=False,
+        routing_method=SimpleNamespace(
+            requires_separated_routing=True, experts_per_token=2, apply=apply
+        ),
+        layer_load_balancer=None,
+        layer_idx=0,
+        num_slots=4,
+        _load_balancer_start_wait_gpu_stage=lambda is_first_call: None,
+        _using_load_balancer=lambda: False,
+    )
+    return scheduler
+
+
+def _run_chunk_until_quantize(scheduler: ExternalCommMoEScheduler, log: list) -> None:
+    # Quantized upstream on another stream, as on the K3 latent chain: no async
+    # quantization takes over the join.
+    x = Fp4QuantizedTensor(
+        torch.empty(3, 4, dtype=torch.uint8),
+        torch.empty(3, 1, dtype=torch.uint8),
+        is_sf_swizzled=False,
+    )
+    with pytest.raises(_StopChunk):
+        scheduler._forward_chunk_impl(
+            x,
+            torch.empty(3, 4),
+            output_dtype=torch.bfloat16,
+            all_rank_num_tokens=[3],
+            use_dp_padding=False,
+            is_first_call=True,
+            is_last_call=True,
+            input_ready_event=SimpleNamespace(wait=lambda: log.append("join")),
+        )
+
+
+@pytest.mark.cpu_only
+def test_scheduler_routes_before_joining_input_when_fused_route_quant_declines() -> None:
+    """Routing reads only router_logits; a declined fused route+quant must not
+    order it behind the producer of x (on K3, the route tail behind the
+    latent-down GEMM)."""
+    log = []
+    backend = TrtllmCutedslFusedFc12Nvfp4Impl.__new__(TrtllmCutedslFusedFc12Nvfp4Impl)
+    _run_chunk_until_quantize(_join_order_scheduler(backend, log), log)
+
+    assert log == ["route", "join", "quantize"]
+
+
+@pytest.mark.cpu_only
+def test_scheduler_leaves_input_join_to_accepting_fused_route_quant() -> None:
+    log = []
+
+    def try_fused_route_quant(x, router_logits, input_ready_event=None):
+        input_ready_event.wait()
+        log.append("fused")
+        rows = router_logits.shape[0]
+        return torch.zeros(rows, 2, dtype=torch.int32), torch.ones(rows, 2), x, None
+
+    backend = SimpleNamespace(
+        _supports_load_balancer=lambda: True,
+        input_requirement=SimpleNamespace(routing_scales_dtype=None),
+        try_fused_route_quant=try_fused_route_quant,
+    )
+    _run_chunk_until_quantize(_join_order_scheduler(backend, log), log)
+
+    # One join, by the backend; the run context is reached without a second.
+    assert log == ["join", "fused", "quantize"]
+
+
 # =====================================================================
 # do_finalize=False: construction-time validation, the model-owned
 # finalize the scheduler runs before the combine, and the one-sided
@@ -1184,10 +1309,17 @@ def test_kimi_fused_route_quant_skips_prequantized_input(monkeypatch) -> None:
         scaling_factor=torch.empty(1, 112, dtype=torch.uint8),
     )
 
+    input_ready_event = Mock()
     assert (
-        backend.try_fused_route_quant(hidden_states, torch.empty(1, 896, dtype=torch.float32))
+        backend.try_fused_route_quant(
+            hidden_states,
+            torch.empty(1, 896, dtype=torch.float32),
+            input_ready_event=input_ready_event,
+        )
         is None
     )
+    # Declining leaves the join to the scheduler, after the routing.
+    input_ready_event.wait.assert_not_called()
 
 
 def test_kimi_mxfp8_quantized_tensor_handoff() -> None:
@@ -3804,6 +3936,7 @@ def run_backend_moe(
     dtype: torch.dtype,
     router_logits: torch.Tensor = None,
     trtllm_use_router_logits: bool = True,
+    moe_output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Run MoE computation with backend-specific parameters.
@@ -3820,6 +3953,8 @@ def run_backend_moe(
             unless the backend routes outside its kernel. Otherwise it uses
             token_selected_experts and token_final_scales.
             Note: When both are provided, TRTLLM only uses (topk_ids and topk_weights).
+        moe_output: Output buffer handed to the backend in the comm plan (external-comm
+            backends only), as ``ExternalCommMoEScheduler`` does for a caller's buffer.
     """
     # Common args for all backends (default: token_final_scales=float32)
     args = dict(
@@ -3856,16 +3991,83 @@ def run_backend_moe(
     # builds a plan on every path, FusedCommMoEScheduler never does because the
     # fused kernel owns the exchange. Single GPU with no comm strategy, so this
     # is the no-comm plan: quantize_input ran locally and left the scale factors
-    # swizzled, no alltoall, and no workspace-backed output buffer.
+    # swizzled, no alltoall, and no workspace-backed output buffer (``moe_output``
+    # is a caller's buffer, if any).
     if backend.scheduler_kind == MoESchedulerKind.EXTERNAL_COMM:
         args["comm_plan"] = MoECommPlan(
             input_sf_swizzled=True,
             enable_alltoall=False,
-            moe_output=None,
+            moe_output=moe_output,
             payload_in_workspace=False,
         )
 
     return backend.run_moe(MoERunContext(**args), workspace=workspace)
+
+
+@pytest.mark.skipif(
+    get_sm_version() not in (100, 103), reason="CuteDSL NVFP4 MoE runs on SM100/SM103"
+)
+def test_cutedsl_nvfp4_run_moe_writes_caller_output_buffer():
+    """The CuteDSL NVFP4 finalize writes into a plan output buffer that is a slice of a larger,
+    NaN-filled allocation (memset + scatter-add stay inside the slice)."""
+    seq_len, num_experts, top_k, hidden_size, intermediate_size = 7, 8, 2, 512, 512
+    dtype = torch.bfloat16
+    mapping = Mapping()
+    mapping.rank = mpi_rank()
+    with torch.device(f"cuda:{mapping.rank}"):
+        torch.manual_seed(0)
+        AutoTuner.get().setup_distributed_state(mapping)
+        routing_method = RenormalizeMoeRoutingMethod(top_k=top_k)
+        x = torch.randn((seq_len, hidden_size), dtype=dtype, device="cuda")
+        router_logits = torch.randn((seq_len, num_experts), dtype=dtype, device="cuda")
+        quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+            QuantAlgo.NVFP4, x, MoeBackendType.CUTEDSL
+        )
+        quantize_util = quantize_util_cls(
+            num_experts=num_experts,
+            dtype=dtype,
+            intermediate_size=intermediate_size,
+            hidden_size=hidden_size,
+            quant_config=quant_config,
+        )
+        backend = create_test_backend(
+            backend_type=MoeBackendType.CUTEDSL,
+            routing_method=routing_method,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            quant_config=quant_config,
+            mapping=mapping,
+        )
+        backend.load_weights([quantize_util.create_weights(**quant_kwargs)])
+        backend.post_load_weights()
+        backend.cuda()
+
+        def run(moe_output=None):
+            token_selected_experts, token_final_scales = routing_method.apply(router_logits)
+            x_quantized, x_sf = backend.quantize_input(x, post_quant_comm=False)
+            return run_backend_moe(
+                backend,
+                MoeBackendType.CUTEDSL,
+                x_quantized,
+                x_sf,
+                token_selected_experts,
+                token_final_scales,
+                dtype,
+                router_logits,
+                moe_output=moe_output,
+            )
+
+        guard = 64
+        storage = torch.full((guard + seq_len * hidden_size + guard,), float("nan"), dtype=dtype)
+        buffer = storage[guard : guard + seq_len * hidden_size].view(seq_len, hidden_size)
+        with torch.inference_mode():
+            expected = run()
+            output = run(buffer)
+        assert output.data_ptr() == buffer.data_ptr()
+        torch.testing.assert_close(output, expected)
+        assert storage[:guard].isnan().all() and storage[-guard:].isnan().all()
 
 
 # =====================================================================

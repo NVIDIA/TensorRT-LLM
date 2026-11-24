@@ -113,6 +113,7 @@ def test_from_kv_cache_manager_uses_first_nonzero_kv_head_count(monkeypatch) -> 
         cp_size=1,
         cp_rank=0,
         enable_attention_dp=False,
+        has_cp_ulysses=lambda: False,
     )
     manager = SimpleNamespace(
         mapping=mapping,
@@ -148,6 +149,7 @@ def test_from_kv_cache_manager_preserves_attention_dp_on_attention_free_stage(
         cp_size=1,
         cp_rank=0,
         enable_attention_dp=True,
+        has_cp_ulysses=lambda: False,
     )
     manager = SimpleNamespace(
         mapping=mapping,
@@ -186,6 +188,7 @@ def test_rank_info_represents_cache_element_bytes(
             cp_size=1,
             cp_rank=0,
             enable_attention_dp=False,
+            has_cp_ulysses=lambda: False,
         ),
         pp_layers=[0],
         num_kv_heads_per_layer=[4],
@@ -203,3 +206,40 @@ def test_rank_info_represents_cache_element_bytes(
     restored = RankInfo.from_bytes(rank_info.to_bytes())
     assert restored.attention.element_bytes == expected_element_bytes
     assert isinstance(restored.attention.element_bytes, expected_type)
+
+
+@pytest.mark.parametrize("cp_size", [8, 16])
+def test_ulysses_context_group_presents_as_tp(monkeypatch, cp_size) -> None:
+    """A Ulysses CP rank shows its peers the TP layout over TP x CP.
+
+    A cep8 context group meets a TP 8 generation group 1:1, a cep16 one 2:1, as a TP 8 or 16
+    context group would.
+    """
+    monkeypatch.setattr(rank_info_module, "build_page_table_from_manager", lambda _manager: None)
+    for rank in (0, cp_size - 1):
+        manager = SimpleNamespace(
+            mapping=SimpleNamespace(
+                rank=rank,
+                tp_size=1,
+                tp_rank=0,
+                pp_size=1,
+                pp_rank=0,
+                dp_size=1,
+                cp_size=cp_size,
+                cp_rank=rank,
+                enable_attention_dp=False,
+                has_cp_ulysses=lambda: True,
+            ),
+            pp_layers=[0],
+            num_kv_heads_per_layer=[1],
+            tokens_per_block=64,
+            head_dim=576,
+            dtype=bindings.DataType.FP8,
+            kv_factor=1,
+        )
+
+        info = RankInfo.from_kv_cache_manager("ctx", manager, device_id=0)
+
+        assert (info.tp_size, info.tp_rank, info.cp_size, info.cp_rank) == (cp_size, rank, 1, 0)
+        assert (info.dp_size, info.dp_rank) == (1, 0)
+        assert MambaPolicy._mamba_tp(info) == (cp_size, rank)

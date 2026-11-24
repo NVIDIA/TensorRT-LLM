@@ -67,6 +67,7 @@
 #include <cfloat>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <limits>
@@ -1132,6 +1133,23 @@ void invokeAttnResPersistentFusedFwd(AttnResFwdParams const& params, cudaStream_
     int num_sm = 0;
     TLLM_CUDA_CHECK(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev));
     TLLM_CHECK_WITH_INFO(num_sm > 0, "attn_res persistent fused: failed to query the SM count of device %d", dev);
+    // A resident side kernel (DWDP fabric gather) may own TRTLLM_CUTEDSL_SM_RESERVE SMs for the whole
+    // step; a grid sized for every SM would then run a second, mostly idle wave. Opt-in via
+    // TRTLLM_K3_ATTN_RES_SM_RESERVE=1.
+    static bool const honor_reserve = []
+    {
+        char const* v = std::getenv("TRTLLM_K3_ATTN_RES_SM_RESERVE");
+        return v != nullptr && v[0] == '1';
+    }();
+    char const* reserve_env = honor_reserve ? std::getenv("TRTLLM_CUTEDSL_SM_RESERVE") : nullptr;
+    if (reserve_env != nullptr)
+    {
+        int const reserve = std::atoi(reserve_env);
+        if (reserve > 0 && reserve < num_sm)
+        {
+            num_sm -= reserve;
+        }
+    }
 
     using namespace sm100::fwd_prod_v2;
 

@@ -34,6 +34,19 @@ def _build(spec, seed):
     return x, residual, weight, spec["eps"]
 
 
+# The cells of every Kimi K3.1 target: the general one and the SM 10.3 perf targets copied from it.
+_K31_TARGET_CELLS: tuple[Cell, ...] = (
+    Cell(
+        why="kimi k3.1 drafter hidden 7168, one 8-row draft block",
+        spec=dict(shape=(8, 7168), dtype=torch.bfloat16, eps=1e-5),
+    ),
+    Cell(
+        why="kimi k3.1 drafter hidden 7168, five 8-row draft blocks",
+        spec=dict(shape=(40, 7168), dtype=torch.bfloat16, eps=1e-5),
+    ),
+)
+
+
 # The shapes each shipped target calls this entry with, by target directory
 # under `models/`. The entry's own `CELLS` are the op's whoever calls it.
 TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
@@ -49,6 +62,9 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
             spec=dict(shape=(1, 2880), dtype=torch.bfloat16, eps=1e-5),
         ),
     ),
+    "kimi_k31/kimi_k31_pro_mxfp4__sm_10x__default": _K31_TARGET_CELLS,
+    "kimi_k31/kimi_k31_pro_mxfp4__sm_103__tep": _K31_TARGET_CELLS,
+    "kimi_k31/kimi_k31_pro_mxfp4__sm_103__dep": _K31_TARGET_CELLS,
 }
 
 CELLS = certified_cells(op, TARGET_CELLS)

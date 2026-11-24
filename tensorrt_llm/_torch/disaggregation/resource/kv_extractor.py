@@ -24,6 +24,7 @@ from tensorrt_llm._torch.disaggregation.base.region import (
     RegionExtractorBase,
     SpecRegion,
 )
+from tensorrt_llm._torch.disaggregation.resource.dkv import manager_dkv, split_expanded_dkv_views
 from tensorrt_llm._torch.disaggregation.resource.page import (
     BUFFER_ENTRY_DTYPE,
     AttentionLayerGroup,
@@ -170,6 +171,18 @@ class KVRegionExtractorV1(RegionExtractorBase):
 # ---------------------------------------------------------------------------
 
 
+def _has_standalone_draft_cache(manager) -> bool:
+    """Whether *manager* owns unified standalone draft layers (DSpark)."""
+    return getattr(manager, "has_standalone_draft_cache", False) is True
+
+
+def _standalone_draft_layer_ids(manager) -> tuple:
+    """Model layer ids of the manager's unified standalone draft layers, if any."""
+    if not _has_standalone_draft_cache(manager):
+        return ()
+    return tuple(manager.draft_layer_ids)
+
+
 def _compute_global_layer_ids(manager, lg_idx: int) -> List[int]:
     """Compute collision-free layer IDs for a pool group for disaggregated transfer.
 
@@ -199,8 +212,22 @@ def _compute_global_layer_ids(manager, lg_idx: int) -> List[int]:
             )
         return global_layer_ids
 
+    # Unified standalone draft layers follow the target's layers; their model
+    # ids (``draft_layer_ids``) are past every target layer id.
+    draft_local_to_global = {
+        manager.layer_offsets[layer_id]: layer_id
+        for layer_id in _standalone_draft_layer_ids(manager)
+    }
+
     if not hasattr(manager, "_layer_attn_to_layer_id"):
         # Standard: local_layer_id is index into pp_layers
+        if draft_local_to_global:
+            return [
+                draft_local_to_global[int(lid)]
+                if int(lid) in draft_local_to_global
+                else manager.pp_layers[lid]
+                for lid in local_layer_ids
+            ]
         return [manager.pp_layers[lid] for lid in local_layer_ids]
 
     # Virtual layers: build inverse mapping internal_layer_id -> (model_layer, attn_type)
@@ -215,6 +242,8 @@ def _compute_global_layer_ids(manager, lg_idx: int) -> List[int]:
     inverse = {}
     for (model_layer, attn_type), layer_id in manager._layer_attn_to_layer_id.items():
         inverse.setdefault(layer_id, (model_layer, attn_type.value))
+    for local_layer_id, draft_layer in draft_local_to_global.items():
+        inverse[local_layer_id] = (draft_layer, 0)
 
     # Use the full enum range for consistent encoding across all PP ranks.
     # Different PP ranks may have different subsets of attention types (e.g.,
@@ -327,6 +356,63 @@ def _build_pool_views_for_variant(
     return pool_views
 
 
+def _build_draft_pool_views(manager, variant, pg_desc) -> Tuple[PhysicalPoolGroup, List[PoolView]]:
+    """Expose a standalone draft layer group's buffers as physical-token pages.
+
+    Under helix a draft slot holds ``expansion`` physical pages per buffer
+    (one per ledger subpage), K subpages then V subpages. The transfer
+    addresses single physical pages, so the pool is re-described with one
+    page per slot, and each role gets its own view: the head mapper then
+    copies one physical page per block without treating the intervening
+    subpages as part of its payload. Block ids for this group are the
+    expanded page indices (``CacheReuseAdapter.get_block_ordinals``).
+    """
+    if len(variant.coalesced_buffers) != 1 or len(pg_desc.pools) != 1:
+        raise ValueError("Standalone draft layers must share one equal-sized K/V pool")
+    buffer = variant.coalesced_buffers[0]
+    first_layer = buffer.buffer_ids[0].layer_id
+    expansion = int(manager.impl.get_page_index_converter(first_layer, Role.KEY).expansion)
+    buffer_size = int(buffer.single_buffer_size)
+    if buffer_size % expansion:
+        raise ValueError("Draft buffer size is not divisible by its page expansion")
+    page_bytes = buffer_size // expansion
+    physical_pool = pg_desc.pools[0]
+    slot_bytes = int(physical_pool.slot_bytes)
+    if slot_bytes % page_bytes:
+        raise ValueError("Draft pool slots must contain whole physical-token pages")
+    pool_group = PhysicalPoolGroup(
+        pools=[
+            PhysicalPool(
+                base_address=int(physical_pool.base_address),
+                slot_bytes=page_bytes,
+                num_slots=int(pg_desc.num_slots) * (slot_bytes // page_bytes),
+                slot_stride_bytes=page_bytes,
+            )
+        ]
+    )
+    entries_by_role: Dict[str, list] = defaultdict(list)
+    for index, buffer_id in enumerate(buffer.buffer_ids):
+        if buffer_id.role not in (Role.KEY, Role.VALUE):
+            raise ValueError("Standalone draft transfer expects only K/V buffers")
+        entries_by_role[str(buffer_id.role)].append(
+            (int(buffer_id.layer_id), index * buffer_size, page_bytes)
+        )
+    # Canonical view order (by lowest slot offset): the table is matched against peers.
+    views = []
+    for role, entries in sorted(entries_by_role.items(), key=lambda item: item[1][0][1]):
+        entries = np.array(sorted(entries, key=lambda entry: entry[1]), dtype=BUFFER_ENTRY_DTYPE)
+        views.append(
+            PoolView(
+                pool_idx=0,
+                buffer_entries=entries,
+                pool_role=frozenset({role}),
+                mapper_kind=MapperKind.INDEXED,
+                bytes_per_layer=page_bytes,
+            )
+        )
+    return pool_group, views
+
+
 def _build_page_table_v2(manager) -> KVCachePageTable:
     """Build a KVCachePageTable from a KVCacheManagerV2.
 
@@ -397,6 +483,9 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
     pool_groups: List[PhysicalPoolGroup] = []
     storage_pg_to_list_idx: Dict[int, int] = {}
     layer_groups_by_id: List[LayerGroup | None] = [None] * len(manager.impl.layer_grouping)
+    draft_local_layer_ids = frozenset(
+        int(manager.layer_offsets[layer_id]) for layer_id in _standalone_draft_layer_ids(manager)
+    )
 
     for pg_desc in pool_group_descs:
         storage_pg_idx = int(pg_desc.pool_group_index)
@@ -427,6 +516,32 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
                 LocalLayer(local_layer_id=int(iid), global_layer_id=int(gid))
                 for iid, gid in zip(all_internal_layer_ids, all_global_layer_ids)
             ]
+
+            first_layer_id = int(all_internal_layer_ids[0])
+            if draft_local_layer_ids and first_layer_id in draft_local_layer_ids:
+                if not all(int(lid) in draft_local_layer_ids for lid in all_internal_layer_ids):
+                    raise ValueError(
+                        f"Layer group {layer_group_id} mixes standalone draft and target layers"
+                    )
+                # Standalone draft KV: a distinct cache domain whose pages are
+                # addressed per physical token page on the drafter's own rank grid.
+                draft_pool_group, pool_views = _build_draft_pool_views(manager, variant, pg_desc)
+                draft_pool_group_idx = len(pool_groups)
+                pool_groups.append(draft_pool_group)
+                draft_identity = manager.get_draft_transfer_identity()
+                layer_groups_by_id[layer_group_id] = AttentionLayerGroup(
+                    pool_group_idx=draft_pool_group_idx,
+                    local_layers=local_layers,
+                    pool_views=pool_views,
+                    kv_head_num_per_rank=int(manager.num_kv_heads_per_layer[first_layer_id]),
+                    sliding_window_size=_window_size_for_layer(first_layer_id),
+                    cp_as_tp=True,
+                    total_kv_head_num=int(draft_identity["num_kv_heads"]),
+                    cp_as_tp_shards=int(manager._draft_cp_size),
+                    draft_window_size=draft_identity["window_size"],
+                    draft_window_declared=True,
+                )
+                continue
 
             # A life cycle is recurrent when its layers are the manager's
             # mamba layers. Recurrent and attention layers never share a life
@@ -502,11 +617,16 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
             raise ValueError(f"Missing V2 layer group descriptor for layer group {layer_group_id}")
         layer_groups.append(layer_group)
 
-    return KVCachePageTable(
+    page_table = KVCachePageTable(
         tokens_per_block=config.tokens_per_block,
         layer_groups=layer_groups,
         pool_groups=pool_groups,
     )
+    if manager_dkv(manager) is not None:
+        # A DKV manager's blocks are DKV blocks; peers address physical pages.
+        page_table.tokens_per_block = int(manager.tokens_per_block)
+        split_expanded_dkv_views(manager, page_table)
+    return page_table
 
 
 def build_page_table_from_manager(manager: KVCacheManagerV2) -> KVCachePageTable:

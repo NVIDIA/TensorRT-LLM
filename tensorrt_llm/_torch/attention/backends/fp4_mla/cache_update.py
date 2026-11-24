@@ -32,6 +32,7 @@ from .config import (
     _fp4_mla_q1_kv_blocks_per_program,
     _fp4_mla_q1_prefix_blocks_per_program,
     _HPUpdatePhase,
+    is_fp4_mla_context_only_cache,
 )
 from .fp4_mla_kernels import (
     _fp4_mla_context_cache_update_kernel,
@@ -255,7 +256,7 @@ def _scatter_fp4_mla_kv_cache_2d_context(
     latent_cache: torch.Tensor,
     kv_cache: torch.Tensor,
     sf_cache: torch.Tensor,
-    v_sf: torch.Tensor,
+    v_sf: Optional[torch.Tensor],
     global_scale: torch.Tensor,
     rotary_cos_sin: Optional[torch.Tensor],
     q_context: Optional[torch.Tensor],
@@ -350,6 +351,10 @@ def _scatter_fp4_mla_kv_cache_2d_context(
     v_packed_output = v_packed_base if write_v_packed else kv_cache
     v_packed_s0 = v_packed_output.stride(0) if write_v_packed else 0
     v_packed_s1 = v_packed_output.stride(1) if write_v_packed else 0
+    # A context-only cache (disaggregated CTX worker) stores no V scales; the
+    # kernel then bounds pages and layers by the K cache and the HP pool.
+    store_v_scale = v_sf is not None
+    v_sf_output = v_sf if store_v_scale else sf_cache
 
     _fp4_mla_context_cache_update_kernel[
         (
@@ -359,7 +364,7 @@ def _scatter_fp4_mla_kv_cache_2d_context(
     ](
         kv_cache,
         sf_cache,
-        v_sf,
+        v_sf_output,
         v_packed_output,
         latent_cache,
         q_context_view,
@@ -374,8 +379,8 @@ def _scatter_fp4_mla_kv_cache_2d_context(
         metadata.fp4_mla_state.paged_kv_indices.shape[0],
         metadata.fp4_mla_state.paged_kv_indptr.shape[0],
         metadata.fp4_mla_state.batch_indices.shape[0],
-        v_sf.shape[1],
-        v_sf.shape[0],
+        v_sf.shape[1] if store_v_scale else kv_cache.shape[0],
+        v_sf.shape[0] if store_v_scale else hp_pool.shape[1],
         num_contexts,
         num_hp_pages,
         token_offset,
@@ -392,8 +397,8 @@ def _scatter_fp4_mla_kv_cache_2d_context(
         q_context_view.stride(0),
         q_context_view.stride(1) if apply_q_rope else 0,
         q_context_view.stride(2) if apply_q_rope else 0,
-        v_sf.stride(0),
-        v_sf.stride(1),
+        v_sf.stride(0) if store_v_scale else 0,
+        v_sf.stride(1) if store_v_scale else 0,
         v_packed_s0,
         v_packed_s1,
         pool_s0,
@@ -417,6 +422,7 @@ def _scatter_fp4_mla_kv_cache_2d_context(
         POOL_HEAD_D=pool_head_dim,
         STORE_HP_TAIL=store_hp_tail,
         WRITE_V_PACKED=write_v_packed,
+        STORE_V_SCALE=store_v_scale,
     )
     return store_hp_tail
 
@@ -447,6 +453,7 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
     v_page_offset: int,
     helix_position_offsets: Optional[torch.Tensor],
     helix_is_inactive_rank: Optional[torch.Tensor],
+    write_q_rows: bool = True,
 ) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     num_contexts = metadata.num_contexts
     num_seqs = metadata.num_seqs
@@ -643,7 +650,7 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
         num_gen,
         max(
             kv_work_blocks,
-            max_gen_len * q_head_blocks * q_work_blocks,
+            max_gen_len * q_head_blocks * q_work_blocks if write_q_rows else 0,
         ),
     )
     store_k_residual = _fp4_mla_attention_backend() in _FP4_MLA_K_RESIDUAL_BACKENDS
@@ -737,6 +744,7 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
             WRITE_Q=True,
             Q1_KV_BLOCKS_PER_PROGRAM=q1_kv_blocks_per_program_variant,
             Q_ROWS_PER_SEQ=q_rows_per_seq,
+            WRITE_Q_ROWS=write_q_rows,
             maxnreg=56,
         )
 
@@ -773,6 +781,7 @@ def scatter_fp4_mla_kv_cache(
     helix_is_inactive_rank: Optional[torch.Tensor] = None,
     q_context: Optional[torch.Tensor] = None,
     q_nope_head_dim: Optional[int] = None,
+    q_rows_external: bool = False,
 ) -> bool:
     """Quantize MLA latent tokens and scatter them into the paged FP4 cache.
 
@@ -803,7 +812,14 @@ def scatter_fp4_mla_kv_cache(
     pool. When ``q_quant_input`` is supplied, the generation kernel also emits
     backend-ready residual FP4 Q. The return value reports whether the current
     phase updated the HP pool.
+
+    With ``q_rows_external`` (generation only) the Q buffers are prepared and
+    recorded on ``metadata`` as usual, but the kernel leaves them to the caller
+    (the Kimi-K3 fused query kernel writes them): it updates the KV cache only, and
+    ``q_pe`` / ``q_rope_out`` / ``q_quant_input`` only provide shapes.
     """
+    if q_rows_external and phase != "generation":
+        raise ValueError("FP4 MLA q_rows_external applies to the generation phase only.")
     if phase == "generation":
         metadata.fp4_mla_state.generation_cache_scattered = False
         metadata.fp4_mla_state.prequantized_q = None
@@ -852,7 +868,10 @@ def scatter_fp4_mla_kv_cache(
 
     if phase not in ("context", "generation"):
         raise ValueError("FP4 MLA scatter requires phase='context' or 'generation'.")
-    if getattr(metadata.fp4_mla_state, "v_scale_pool", None) is None:
+    context_only_cache = is_fp4_mla_context_only_cache(getattr(metadata, "kv_cache_manager", None))
+    if context_only_cache and phase != "context":
+        raise RuntimeError("FP4 MLA context-only cache cannot execute generation.")
+    if not context_only_cache and getattr(metadata.fp4_mla_state, "v_scale_pool", None) is None:
         raise RuntimeError("FP4 MLA scatter requires the auxiliary V scale pool.")
     if metadata.page_size % FP4_BLOCK_SIZE != 0:
         raise ValueError(
@@ -873,7 +892,11 @@ def scatter_fp4_mla_kv_cache(
         )
 
     sf_cache = sf_cache.view(torch.float8_e4m3fn)
-    v_sf = get_fp4_mla_v_scale_pool_view(metadata, v_head_dim=v_head_dim)
+    v_sf = (
+        None
+        if context_only_cache
+        else get_fp4_mla_v_scale_pool_view(metadata, v_head_dim=v_head_dim)
+    )
     num_dim_blocks = triton.cdiv(head_dim, FP4_BLOCK_SIZE)
     sf_per_page = metadata.page_size // FP4_BLOCK_SIZE
 
@@ -900,7 +923,9 @@ def scatter_fp4_mla_kv_cache(
                 "FP4 MLA generation requires rotary_cos_sin, q_pe, q_rope_out, "
                 "and q_quant_input for fused RoPE, cache update, and Q quantization."
             )
-        if not can_fuse_fp4_mla_q_quant(metadata, q_quant_input, q_pe, latent_cache):
+        if not q_rows_external and not can_fuse_fp4_mla_q_quant(
+            metadata, q_quant_input, q_pe, latent_cache
+        ):
             raise ValueError(
                 "Fused FP4 MLA Q quantization received an unsupported shape, dtype, "
                 "scale mode, or backend."
@@ -922,6 +947,8 @@ def scatter_fp4_mla_kv_cache(
         metadata.fp4_mla_state.prequantized_q_sf = q_sf_out
         metadata.fp4_mla_state.q_batch_capacity = q_batch_capacity
         metadata.fp4_mla_state.prequantized_q_rows_per_seq = q_rows_per_seq
+        # Whether another kernel writes this step's query rows (see ULL2_MLA_DECODE_PDL_ENV).
+        metadata.fp4_mla_state.q_rows_external = bool(q_rows_external)
         hp_pool_updated = True
     cutedsl_backend = _fp4_mla_attention_backend() == _FP4_MLA_CUTEDSL_BACKEND
     fused_v_transpose = cutedsl_backend and _fp4_mla_cutedsl_fused_v_transpose_enabled()
@@ -930,7 +957,7 @@ def scatter_fp4_mla_kv_cache(
     v_packed_base = None
     v_page_offset = 0
     direct_v_packed_write = False
-    if cutedsl_backend and not fused_v_transpose:
+    if cutedsl_backend and not fused_v_transpose and not context_only_cache:
         persistent_v_packed = _get_cutedsl_persistent_v_packed_cache(
             metadata,
             local_layer,
@@ -1043,6 +1070,7 @@ def scatter_fp4_mla_kv_cache(
             v_page_offset=v_page_offset,
             helix_position_offsets=helix_position_offsets,
             helix_is_inactive_rank=helix_is_inactive_rank,
+            write_q_rows=not q_rows_external,
         )
         v_pack_page_ids = _fp4_mla_generation_page_ids(
             metadata, metadata.num_seqs - metadata.num_contexts
@@ -1055,7 +1083,12 @@ def scatter_fp4_mla_kv_cache(
     cutedsl_repack_kv_lens = None
     cutedsl_repack_generation_lens = None
     cutedsl_repack_max_touched_pages = 1
-    if cutedsl_backend and not fused_v_transpose and not direct_v_packed_write:
+    if (
+        cutedsl_backend
+        and not fused_v_transpose
+        and not direct_v_packed_write
+        and not context_only_cache
+    ):
         if phase == "context":
             num_contexts = metadata.num_contexts
             cutedsl_v_pack_page_ids = metadata.fp4_mla_state.paged_kv_indices[
@@ -1092,6 +1125,10 @@ def scatter_fp4_mla_kv_cache(
             generation_lens=cutedsl_repack_generation_lens,
             max_touched_pages=cutedsl_repack_max_touched_pages,
         )
+    if context_only_cache:
+        # Only decode reads V scales and packed V; a generation worker
+        # rebuilds them from the transferred K and K scales.
+        return hp_pool_updated
     _maybe_update_triton_v_packed_cache(
         metadata,
         layer_idx,

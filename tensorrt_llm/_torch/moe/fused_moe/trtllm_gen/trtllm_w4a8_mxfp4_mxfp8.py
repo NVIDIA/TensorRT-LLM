@@ -51,6 +51,7 @@ class TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl(TRTLLMGenW4a8Mxfp4Mxfp8Base):
         self,
         x: torch.Tensor | MxFp8QuantizedTensor,
         router_logits: torch.Tensor,
+        input_ready_event: torch.cuda.Event | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
         """Fuse Kimi K3 no-aux routing and MXFP8 input quantization.
 
@@ -93,6 +94,8 @@ class TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl(TRTLLMGenW4a8Mxfp4Mxfp8Base):
         ):
             return None
 
+        if input_ready_event is not None:
+            input_ready_event.wait()
         return torch.ops.trtllm.kimi_k3_noaux_tc_mxfp8_quant(
             router_logits, bias, x, routing.routed_scaling_factor
         )

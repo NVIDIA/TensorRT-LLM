@@ -159,6 +159,51 @@ def test_create_kv_cache_swa_endpoint_priority(
         assert kwargs["custom_priority_callback"](255, AttnLifeCycle(4096, 0)) == 70
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("is_dummy", [False, True])
+def test_create_kv_cache_forwards_custom_priority_callback(is_dummy: bool) -> None:
+    """A caller's priority callback (a subclass's _context_priority_callback) reaches
+    the backend and takes the place of the SWA endpoint priority; dummies get none."""
+    manager = object.__new__(KVCacheManagerV2)
+    manager._swa_endpoint_rewind = 1024
+    manager.block_reuse_policy = BlockReusePolicy.ALL_REUSABLE
+    manager.enable_block_reuse = True
+    manager.is_draft = False
+    manager.tokens_per_block = 32
+    manager.kv_cache_map = {}
+    manager.index_mapper = Mock()
+    manager.index_mapper.num_free_slots.return_value = 1
+    manager.max_beam_width = 1
+    manager.num_pools = 0
+    manager.impl = Mock()
+    manager.impl.create_kv_cache.return_value.beam_width = 1
+
+    def callback(_ordinal, _life_cycle):
+        return 0
+
+    manager._create_kv_cache(
+        0,
+        None,
+        None,
+        is_dummy=is_dummy,
+        expected_prompt_length=8192,
+        custom_priority_callback=callback,
+    )
+
+    kwargs = manager.impl.create_kv_cache.call_args.kwargs
+    if is_dummy:
+        assert "custom_priority_callback" not in kwargs
+    else:
+        assert kwargs["custom_priority_callback"] is callback
+
+
+@pytest.mark.cpu_only
+def test_context_priority_callback_defaults_to_none() -> None:
+    """The base manager keeps the backend's default page priorities."""
+    manager = object.__new__(KVCacheManagerV2)
+    assert manager._context_priority_callback(Mock()) is None
+
+
 def _commit_released_prompt(core: KVCacheManager, prompt: list[int], priority_callback) -> None:
     """Run a prompt through a real cache and release it, leaving its pages reusable."""
     cache = core.create_kv_cache(None, prompt, custom_priority_callback=priority_callback)
@@ -1657,6 +1702,7 @@ def test_record_branch_snapshot_point(
     )
     kv_cache = Mock(num_committed_tokens=0)
     kv_cache._get_num_reusable_tokens_before_pruning.return_value = 512
+    kv_cache._get_num_reusable_tokens_before_hybrid_pruning.return_value = 512
 
     manager._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens)
 
@@ -2152,6 +2198,66 @@ def test_generation_dummy_does_not_reuse_real_request_prefix() -> None:
     finally:
         if dummy is not None:
             manager.free_resources(dummy[0])
+        manager.shutdown()
+
+
+@pytest.mark.parametrize("rank", range(8))
+@pytest.mark.parametrize("dtype", [DataType.FP8, DataType.NVFP4])
+def test_helix_generation_dummy_cache_covers_speculative_positions(
+    monkeypatch: pytest.MonkeyPatch, rank: int, dtype: DataType
+) -> None:
+    """Every warmup token addresses history backed by the global cache ledger."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    dist = SimpleNamespace(allreduce=lambda value, op: value, local_world_size=1)
+    monkeypatch.setattr(Distributed, "get", lambda mapping: dist)
+    cp_size, page_size, draft_len = 8, 64, 7
+    token_counts = [8, 64, 385, 513]
+    manager = KVCacheManagerV2(
+        KvCacheConfig(enable_block_reuse=False, max_gpu_total_bytes=4 << 20),
+        CacheType.SELFKONLY,
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=576,
+        tokens_per_block=page_size,
+        max_seq_len=1024,
+        max_batch_size=len(token_counts),
+        max_num_tokens=len(token_counts) * (draft_len + 1),
+        mapping=Mapping(
+            world_size=cp_size,
+            cp_size=cp_size,
+            tp_size=1,
+            rank=rank,
+            cp_config={"cp_type": "HELIX"},
+        ),
+        dtype=dtype,
+    )
+    requests = None
+    try:
+        requests = manager.add_dummy_requests(
+            list(range(len(token_counts))),
+            token_nums=token_counts,
+            is_gen=True,
+            max_num_draft_tokens=draft_len,
+        )
+        assert requests is not None
+        for request, token_count in zip(requests, token_counts):
+            generated_len = request.max_beam_num_tokens - request.py_prompt_len
+            base = request.total_input_len_cp + generated_len - 1
+            assert base == token_count - 1
+            assert generated_len == 1
+            local_history = sum(
+                (position // page_size) % cp_size == rank for position in range(base)
+            )
+            assert request.py_prompt_len == local_history
+            active = (base // page_size) % cp_size == rank
+            assert request.py_helix_is_inactive_rank == (not active)
+            assert request.seqlen_this_rank_cp == local_history + int(active)
+            cache = manager.kv_cache_map[request.py_request_id]
+            assert cache.capacity >= base + draft_len + 1
+    finally:
+        for request in requests or []:
+            manager.free_resources(request)
         manager.shutdown()
 
 

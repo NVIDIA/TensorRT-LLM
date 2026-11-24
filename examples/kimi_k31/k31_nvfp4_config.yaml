@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# trtllm-serve nvidia/kimi_k31_pro_nvfp4 --config examples/kimi_k31/k31_nvfp4_config.yaml
+# One modeling-v2 target on SM100/SM103/SM107; each of the three cache selectors is independent.
+# Set TLLM_KIMI_K3_FP8_KV_LAYERS="" for all-NVFP4 main storage, or leave it unset
+# for the final two MLA layers in FP8. A comma-separated list selects explicit layers.
+modeling_v2: require
+tensor_parallel_size: 8
+moe_expert_parallel_size: 8
+enable_attention_dp: false
+trust_remote_code: true
+disable_overlap_scheduler: false
+max_batch_size: 8
+max_num_tokens: 8192
+max_seq_len: 8192
+cuda_graph_config:
+  max_batch_size: 8
+moe_config:
+  backend: TRTLLM
+kv_cache_config:
+  dtype: nvfp4 # fp8 or nvfp4
+  mamba_ssm_cache_dtype: bfloat16 # float32 or bfloat16
+  use_kv_cache_manager_v2: true
+  tokens_per_block: 64
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.5
+sparse_attention_config:
+  algorithm: dsa
+  indexer_k_dtype: fp4 # fp8 or fp4

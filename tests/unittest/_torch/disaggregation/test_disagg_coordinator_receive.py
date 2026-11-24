@@ -18,12 +18,14 @@ from unittest.mock import Mock
 
 import pytest
 from coordinator_harness import CoordinatorHarness, TransferRequest
-from fake_dist import FakeDistGroup
+from fake_dist import FakeDistGroup, FakeDistMismatch
+from fake_kv_cache_transceiver import FakeKvCacheTransceiver
 
 from tensorrt_llm._torch.disaggregation.orchestration.coordinator import (
     DisaggTransferCoordinator,
     NoopDisaggCoordinator,
 )
+from tensorrt_llm._torch.distributed.communicator import ReduceOp
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import ScheduledRequests
@@ -333,6 +335,92 @@ def test_gen_only_benchmark_marks_requests_complete_without_a_transceiver_call(
     assert h.transceiver.call_log == []
     assert h.effects.prepared == [admitted]
     assert h.effects.failed == []
+
+
+# -- TP ranks without attention DP ---------------------------------------------
+
+
+class _WorldConsensusTransceiver(FakeKvCacheTransceiver):
+    """Fake whose generation status poll is a collective over the TP group, as
+    ``KvCacheTransceiverV2`` gathers over the world without attention DP."""
+
+    def __init__(self, dist) -> None:
+        super().__init__()
+        self._dist = dist
+        self.has_retired_send_session = lambda req: False
+
+    def check_gen_transfer_status(self, at_least_request_num):
+        self._dist.tp_allgather(sorted(self._pending_recvs))
+        return super().check_gen_transfer_status(at_least_request_num)
+
+
+def _tp_ranks(group: FakeDistGroup) -> list:
+    """One V2 harness per rank of a single TP group, all on the consensus fake."""
+    ranks = []
+    for rank in range(group.world_size):
+        h = CoordinatorHarness(dist=group.rank(rank), is_kv_manager_v2=True)
+        h.transceiver = _WorldConsensusTransceiver(h.dist)
+        h.coordinator._transceiver = h.transceiver
+        ranks.append(h)
+    return ranks
+
+
+def _schedule_iteration(h: CoordinatorHarness, fitting: list, *, align_tp: bool) -> None:
+    """The disagg calls of one pp=1 scheduling pass, then the next collective
+    of the loop (the request broadcast that opens the next iteration)."""
+    h.coordinator.poll_gen_transfers()
+    admitted = h.coordinator.align_gen_admission_across_cp(fitting)
+    if align_tp:
+        admitted = h.coordinator.align_gen_admission_across_tp(admitted)
+    h.coordinator.receive_gen_init(admitted)
+    h.dist.tp_allreduce(0, op=ReduceOp.MAX)
+
+
+def test_tp_ranks_admitting_different_requests_deadlock_the_receive_consensus() -> None:
+    """The failure the TP alignment prevents. TP rank 1 still holds the KV of a
+    request whose cancel completed only on rank 0, so its scheduler cannot fit
+    the next gen-init request that rank 0 fits. Rank 0 then enters the gen
+    status collective of receive_gen_init alone while rank 1 has moved on."""
+    group = FakeDistGroup(world_size=2, tp_size=2)
+    ranks = _tp_ranks(group)
+    fitting = {0: [_gen_init(ranks[0], 7)], 1: []}
+    _gen_init(ranks[1], 7)
+
+    with pytest.raises(FakeDistMismatch, match="tp_allgather.*tp_allreduce"):
+        group.run(lambda rank: _schedule_iteration(ranks[rank], fitting[rank], align_tp=False))
+
+
+def test_tp_alignment_keeps_skewed_tp_ranks_on_the_same_receives() -> None:
+    """With the alignment, rank 0 defers the request rank 1 could not fit and
+    gives back its V2 KV; both ranks run the same collectives, and admit the
+    request together once rank 1 fits it too."""
+    group = FakeDistGroup(world_size=2, tp_size=2)
+    ranks = _tp_ranks(group)
+    replicas = [_gen_init(h, 7) for h in ranks]
+    fitting = {0: [replicas[0]], 1: []}
+
+    group.run(lambda rank: _schedule_iteration(ranks[rank], fitting[rank], align_tp=True))
+
+    assert [h.effects.reverted for h in ranks] == [[[replicas[0]]], []]
+    assert [req.state for req in replicas] == [LlmRequestState.DISAGG_GENERATION_INIT] * 2
+    assert ranks[0].transceiver.call_log == ranks[1].transceiver.call_log
+    assert ranks[0].transceiver.call_log == ["check_gen_transfer_status:0"]
+
+    group.run(lambda rank: _schedule_iteration(ranks[rank], [replicas[rank]], align_tp=True))
+
+    assert [req.state for req in replicas] == [
+        LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+    ] * 2
+    assert ranks[0].transceiver.call_log == ranks[1].transceiver.call_log
+    assert ranks[0].transceiver.call_log[1:] == [
+        "check_gen_transfer_status:0",
+        "request_and_receive_async:7",
+        "check_gen_transfer_status:0",
+    ]
+    assert [[name for name, _ in h.dist.calls] for h in ranks] == [
+        ["tp_allgather", "tp_allgather_int64", "tp_allgather", "tp_allreduce"]
+        + ["tp_allgather", "tp_allgather_int64", "tp_allgather", "tp_allreduce"]
+    ] * 2
 
 
 # -- deferred receive publication ----------------------------------------------

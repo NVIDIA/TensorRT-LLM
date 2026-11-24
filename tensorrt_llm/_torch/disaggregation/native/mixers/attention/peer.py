@@ -14,6 +14,7 @@
 # limitations under the License.
 
 from collections.abc import Sequence
+from dataclasses import replace
 from typing import Optional
 
 import numpy as np
@@ -26,8 +27,16 @@ from tensorrt_llm._torch.disaggregation.base.region import (
     SpecRegionPair,
 )
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
-from tensorrt_llm._torch.disaggregation.resource.page import CacheKind, KVCachePageTable, MapperKind
-from tensorrt_llm._torch.disaggregation.resource.utils import find_replicated_role_mismatch
+from tensorrt_llm._torch.disaggregation.resource.page import (
+    AttentionLayerGroup,
+    CacheKind,
+    KVCachePageTable,
+    MapperKind,
+)
+from tensorrt_llm._torch.disaggregation.resource.utils import (
+    find_replicated_role_mismatch,
+    get_layer_to_layer_group,
+)
 from tensorrt_llm._utils import nvtx_range
 
 
@@ -560,12 +569,23 @@ class AttentionPolicy:
     def validate_peer_compatible(
         self_page_table: Optional[KVCachePageTable],
         peer_page_table: Optional[KVCachePageTable],
+        self_tokens_per_block: Optional[int] = None,
+        peer_tokens_per_block: Optional[int] = None,
     ) -> None:
-        """Reject a peer whose PAGED groups declare different replicated roles.
+        """Reject a peer whose PAGED groups declare incompatible storage.
 
         Pool matching drops a view with no counterpart silently, so an
         index-key side cache the peer never declares would leave the receiver
-        holding zeroed state instead of raising. Raises ``ValueError``.
+        holding zeroed state instead of raising. Standalone draft
+        (``cp_as_tp``) groups on overlapping layers must also agree on their
+        rank grid and global head count and, given both sides' tokens per
+        block, on bytes per token: draft pages are copied as bytes, so a
+        storage dtype that differs between the peers (a DSpark drafter's
+        ``speculative_config.context_kv_dtype``) would be reinterpreted.
+        When both peers declare it, draft groups must also keep the same
+        drafter history window: the receiver restores a history only into a
+        manager with the sender's window, so a mismatch would fail every
+        request after the KV moved. Raises ``ValueError``.
         """
         differing = find_replicated_role_mismatch(self_page_table, peer_page_table, CacheKind.PAGED)
         if differing:
@@ -573,6 +593,108 @@ class AttentionPolicy:
                 "AttentionPolicy.validate_peer_compatible: replicated roles differ on "
                 f"overlapping layers: {differing}"
             )
+        if self_page_table is None or peer_page_table is None:
+            return
+        local_layers = get_layer_to_layer_group(self_page_table, CacheKind.PAGED)
+        peer_layers = get_layer_to_layer_group(peer_page_table, CacheKind.PAGED)
+        for layer in sorted(local_layers.keys() & peer_layers.keys()):
+            local = self_page_table.layer_groups[local_layers[layer]]
+            peer = peer_page_table.layer_groups[peer_layers[layer]]
+            if not isinstance(local, AttentionLayerGroup) or not isinstance(
+                peer, AttentionLayerGroup
+            ):
+                continue
+            if not local.cp_as_tp and not peer.cp_as_tp:
+                continue
+            if local.cp_as_tp != peer.cp_as_tp:
+                raise ValueError(
+                    f"Attention peers disagree on standalone draft storage of layer {layer}"
+                )
+            if local.total_kv_head_num != peer.total_kv_head_num:
+                raise ValueError(
+                    f"Standalone draft peers have different global KV head counts on layer "
+                    f"{layer} (local {local.total_kv_head_num}, peer {peer.total_kv_head_num})"
+                )
+            if (
+                local.draft_window_declared
+                and peer.draft_window_declared
+                and local.draft_window_size != peer.draft_window_size
+            ):
+                raise ValueError(
+                    f"Standalone draft peers keep different drafter history windows on layer "
+                    f"{layer} (local {AttentionPolicy._draft_window_text(local)}, peer "
+                    f"{AttentionPolicy._draft_window_text(peer)}); a received draft history is "
+                    "restored only into a manager with the same window. Keep the same draft "
+                    "window on the context and generation servers (the model's draft-window "
+                    "setting)."
+                )
+            if self_tokens_per_block and peer_tokens_per_block:
+                local_bytes = AttentionPolicy._draft_bytes_per_token(local, self_tokens_per_block)
+                peer_bytes = AttentionPolicy._draft_bytes_per_token(peer, peer_tokens_per_block)
+                if local_bytes != peer_bytes:
+                    raise ValueError(
+                        f"Standalone draft peers store layer {layer} with different bytes "
+                        f"per token (local {local_bytes}, peer {peer_bytes}); set the same "
+                        "speculative_config.context_kv_dtype on the context and generation "
+                        "servers."
+                    )
+
+    @staticmethod
+    def _draft_window_text(layer_group: AttentionLayerGroup) -> str:
+        """A draft group's history window as the pairing error names it."""
+        if layer_group.draft_window_size is None:
+            return "the whole history"
+        return f"the last {layer_group.draft_window_size} tokens"
+
+    @staticmethod
+    def _draft_bytes_per_token(layer_group: AttentionLayerGroup, tokens_per_block: int) -> dict:
+        """Bytes per token of each role's page in a standalone draft layer group."""
+        return {
+            "/".join(sorted(view.pool_role)): view.bytes_per_layer / tokens_per_block
+            for view in layer_group.pool_views
+            if view.bytes_per_layer is not None
+        }
+
+    @staticmethod
+    def draft_rank_grid(rank_info: RankInfo) -> tuple[int, int]:
+        """(size, rank) of the flattened rank grid a standalone drafter's KV uses.
+
+        Mirrors ``KVCacheManagerV2.draft_cp_rank``: under helix CP the drafter
+        shards over the flattened TP x CP grid (CP-minor, as ``Mapping`` does),
+        independently of attention DP. Without helix it follows the attention
+        TP grid, collapsed to one rank under attention DP.
+        """
+        if rank_info.cp_size > 1:
+            return (
+                rank_info.tp_size * rank_info.cp_size,
+                rank_info.tp_rank * rank_info.cp_size + rank_info.cp_rank,
+            )
+        if rank_info.attention is not None and rank_info.attention.enable_attention_dp:
+            return 1, 0
+        return rank_info.tp_size, rank_info.tp_rank
+
+    @staticmethod
+    def draft_group_rank_info(rank_info: RankInfo, layer_group: AttentionLayerGroup) -> RankInfo:
+        """Rank info under which a standalone draft group's heads are mapped.
+
+        The draft group is laid out on ``draft_rank_grid`` with its own heads
+        per rank, and has no CP or attention-DP split of its own.
+        """
+        tp_size, tp_rank = AttentionPolicy.draft_rank_grid(rank_info)
+        return replace(
+            rank_info,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            cp_size=1,
+            cp_rank=0,
+            dp_size=1,
+            attention=replace(
+                rank_info.attention,
+                kv_heads_per_rank=layer_group.kv_head_num_per_rank,
+                is_mla=False,
+                enable_attention_dp=False,
+            ),
+        )
 
     def check_peer_compatible(self, peer_ri: RankInfo) -> bool:
         a = self._ri.attention

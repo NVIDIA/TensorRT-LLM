@@ -175,3 +175,56 @@ def test_many_context_warmup_keeps_each_chunk_inside_sequence_limit(
     assert sum(expected) == tokens
     assert max(expected) <= config.max_seq_len - 1
     assert len(expected) == min(tokens, config.max_batch_size)
+
+
+def test_fp4_mla_context_only_cache_skips_generation_warmup():
+    # A single-copy FP4 MLA cache has no V sidecars, so generation warmup and
+    # decode-graph capture must not run; prefill warmup still does.
+    requests, manager, resources = _warmup_fixture(False)
+    manager.fp4_mla_context_only_cache = True
+    assert requests.create_warmup_request(resources, 8, 8) is None
+    assert requests.create_cuda_graph_warmup_request(resources, 8, 0) is None
+    manager.add_dummy_requests.assert_not_called()
+    batch = requests.create_warmup_request(resources, 32, 0)
+    assert batch is not None
+    assert not batch.generation_requests
+    assert sum(request.context_chunk_size for request in batch.context_requests) == 32
+
+
+@pytest.mark.parametrize("flag", [None, "fp4_mla_context_only_cache", "kda_context_only"])
+def test_attention_warmup_proposes_no_generation_shape_on_a_context_only_cache(flag):
+    # Seen on Rubin: a DWDP context worker cannot agree on skipping a shape
+    # (WarmupAgreement.allgather is None), so a proposed generation shape that
+    # create_warmup_request refuses on a context-only cache was fatal. Context-
+    # only caches must drop the generation and mixed shapes before proposing.
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup import DecoderWarmup
+
+    requests, manager, resources = _warmup_fixture(False)
+    if flag is not None:
+        setattr(manager, flag, True)
+    proposed = []
+
+    def create_warmup_request(_resources, num_tokens, num_gen_requests, **_kwargs):
+        proposed.append((num_tokens, num_gen_requests))
+        return None
+
+    warmup = SimpleNamespace(
+        _config=SimpleNamespace(
+            attention_backend=SimpleNamespace(Metadata=TrtllmAttentionMetadata),
+            max_total_draft_tokens=5,
+        ),
+        guided_decoder=None,
+        _dummy_requests=SimpleNamespace(
+            create_warmup_request=create_warmup_request,
+            release_batch_context=requests.release_batch_context,
+        ),
+        _graphs=SimpleNamespace(no_cuda_graph=contextlib.nullcontext),
+        _agreement=SimpleNamespace(should_run_warmup_batch=lambda batch, *_: batch is not None),
+    )
+    DecoderWarmup._run_attention_warmup(warmup, resources, can_run_general_warmup=True)
+    if flag is None:
+        assert proposed == [(6, 1), (1, 0), (7, 1)]
+    else:
+        assert proposed == [(1, 0)]
+    assert requests.generation_shapes_supported(resources) is (flag is None)

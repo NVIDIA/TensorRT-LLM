@@ -56,6 +56,13 @@ class Fp4MlaState:
     prequantized_q_sf: torch.Tensor | None = None
     q_batch_capacity: int | None = None
     prequantized_q_rows_per_seq: int | None = None
+    # Whether another kernel writes this step's query rows (the generation cache update only
+    # prepared the buffers; see ULL2_MLA_DECODE_PDL_ENV).
+    q_rows_external: bool = False
+    # Kernels launched so far that write decode metadata (plan, lengths, page table), and that
+    # count when the kernel writing the query rows was launched (TRTLLM_K3_ULL2_MLA_DEC_PDL).
+    metadata_launches: int = 0
+    query_launch_mark: int | None = None
     fp8_context_state: tuple[_Fp8MlaContextScratch, TrtllmAttentionMetadata] | None = None
     _paged_kv_indptr: torch.Tensor | None = None
     paged_kv_indptr_decode: torch.Tensor | None = None

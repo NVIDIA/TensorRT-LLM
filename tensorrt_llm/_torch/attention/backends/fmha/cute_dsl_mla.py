@@ -28,6 +28,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
 )
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.bindings import DataType
 from tensorrt_llm.logger import logger
 
 from .interface import FmhaPhase
@@ -54,8 +55,15 @@ _SPLIT_PLAN_MIN_TILES = 4
 # Fixed cost of one piece (cluster launch, Q load, pipeline fill, partial store
 # and its reduction) in KV tiles, fitted on SM107 forced-split sweeps (H96,
 # 14K-256K KV, B1-B16): with it the wave-quantized makespan picks the measured
-# optimum within 5%.
+# optimum within 5%. Callers whose decode geometry was fitted separately pass
+# their own ``piece_cost``.
 _SPLIT_PLAN_PIECE_COST_TILES = 60
+# The plan kernel is one program over the batch, padded to a power of two of at
+# least one warp: its candidate cuts are each a reduction over the batch, so a
+# block sized for the maximum request count would make every launch pay for
+# _SPLIT_PLAN_MAX_REQUESTS lanes.
+_SPLIT_PLAN_MIN_BLOCK = 32
+_SPLIT_PLAN_LANES_PER_WARP = 256
 
 
 @triton.jit(
@@ -147,10 +155,16 @@ def launch_mla_split_kv_plan(
     rows_per_request: int,
     wave_clusters: int,
     max_split: int = _SPLIT_PLAN_MAX_SPLIT,
+    piece_cost: int = _SPLIT_PLAN_PIECE_COST_TILES,
 ) -> None:
-    """Write the per-request split counts for ``cache_seqs`` into ``plan`` (one launch)."""
+    """Write the per-request split counts for ``cache_seqs`` into ``plan`` (one launch).
+
+    The same plan as ``plan_mla_split_kv`` with the same arguments.
+    """
     if not 0 < num_requests <= _SPLIT_PLAN_MAX_REQUESTS:
         raise ValueError(f"split plan supports 1..{_SPLIT_PLAN_MAX_REQUESTS} requests")
+    if piece_cost < 0:
+        raise ValueError(f"split plan piece cost must be >= 0, got {piece_cost}")
     for name, tensor in (("cache_seqs", cache_seqs), ("plan", plan)):
         if (
             tensor.dtype != torch.int32
@@ -160,6 +174,7 @@ def launch_mla_split_kv_plan(
             or not tensor.is_cuda
         ):
             raise ValueError(f"{name} must be a contiguous CUDA int32 vector of >= {num_requests}")
+    block = max(_SPLIT_PLAN_MIN_BLOCK, triton.next_power_of_2(num_requests))
     _mla_split_kv_plan_kernel[(1,)](
         cache_seqs,
         plan,
@@ -169,10 +184,10 @@ def launch_mla_split_kv_plan(
         max(max_split, 1),
         KV_TILE=_SPLIT_PLAN_KV_TILE,
         MIN_TILES=_SPLIT_PLAN_MIN_TILES,
-        PIECE_COST=_SPLIT_PLAN_PIECE_COST_TILES,
+        PIECE_COST=int(piece_cost),
         MAX_PIECES=_SPLIT_PLAN_MAX_SPLIT,
-        BLOCK=_SPLIT_PLAN_MAX_REQUESTS,
-        num_warps=4,
+        BLOCK=block,
+        num_warps=max(1, min(4, block // _SPLIT_PLAN_LANES_PER_WARP)),
     )
 
 
@@ -267,6 +282,25 @@ class CuteDslMlaFmha(PhasedFmha):
         if q.dtype in (torch.float16, torch.bfloat16):
             return q.dtype
         return None
+
+    @staticmethod
+    def _supports_mixed_batch(
+        attn: "TrtllmAttention",
+        meta: "TrtllmAttentionMetadata",
+    ) -> bool:
+        """Whether this generation call may run next to context requests."""
+        if meta.num_contexts == 0:
+            return True
+        kv_cache_manager = meta.kv_cache_manager
+        if kv_cache_manager is None or getattr(kv_cache_manager, "dtype", None) != DataType.NVFP4:
+            return False
+        layer_offsets = getattr(kv_cache_manager, "layer_offsets", {})
+        get_kv_cache_dtype = getattr(kv_cache_manager, "get_kv_cache_dtype", None)
+        return (
+            callable(get_kv_cache_dtype)
+            and attn.layer_idx in layer_offsets
+            and get_kv_cache_dtype(attn.layer_idx) == DataType.FP8
+        )
 
     @staticmethod
     def _to_cutlass_dtype(dtype: torch.dtype):
@@ -446,8 +480,11 @@ class CuteDslMlaFmha(PhasedFmha):
         if fwd.attention_input_type != AttentionInputType.generation_only:
             return False, "CuTe DSL MLA FMHA only supports generation-only attention."
         # Disable mixed context/generation batches until the CuTe DSL host
-        # overhead is reduced.
-        if meta.num_contexts != 0 or meta.num_generations <= 0:
+        # overhead is reduced, except when an NVFP4 manager exposes this layer
+        # through its FP8 fallback pool. TRTLLM-Gen cannot consume that
+        # combination with 128-token pages, while this path already slices all
+        # generation inputs and page tables past meta.num_contexts.
+        if meta.num_generations <= 0 or not self._supports_mixed_batch(attn, meta):
             return False, "CuTe DSL MLA FMHA only supports decode-only batches."
         if meta.beam_width != 1:
             return False, f"Beam search is not supported, got beam_width={meta.beam_width}."
@@ -503,18 +540,18 @@ class CuteDslMlaFmha(PhasedFmha):
         # The same failure without Helix: an FP8-KV multi-token verify group
         # (e.g. DSpark under attention DP, where every rank keeps all 96 heads)
         # is not in the FP8 perf table, and on SM100/SM103 the next library is
-        # FlashInfer TRTLLM-Gen, which rejects these head counts. The kernel
-        # packs (token, head) rows into 128-row M tiles, so any H <= 128 with a
+        # FlashInfer TRTLLM-Gen, which rejects these head counts. SM107 has no
+        # TRTLLM-Gen FMHA, so there the next library is the generic fallback,
+        # which is several times slower on these groups. The kernel packs
+        # (token, head) rows into 128-row M tiles, so any H <= 128 with a
         # linear-chain causal verify is valid (can_implement below still has the
-        # final say). SM107 is left out on purpose: TRTLLM-Gen FMHA is
-        # unavailable there and such a request already reaches the default
-        # TRTLLM path.
+        # final say).
         fp8_wide_head_verify_group = (
             64 < attn.num_heads < 128
             and seq_len_q > 1
             and meta.helix_position_offsets is None
             and self._get_kernel_dtype(attn, q) == torch.float8_e4m3fn
-            and get_sm_version() in (100, 103)
+            and get_sm_version() in (100, 103, 107)
         )
         if not (helix_h96_verify_group or fp8_wide_head_verify_group):
             # Perf gate (NOT a correctness limit).

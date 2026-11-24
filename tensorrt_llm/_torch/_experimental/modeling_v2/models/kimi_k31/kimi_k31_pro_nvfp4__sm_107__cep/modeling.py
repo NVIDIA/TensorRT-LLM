@@ -1,0 +1,5760 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""ModelingV2 target: Kimi K3.1 Pro NVFP4 (ModelOpt) / sm_107 / cep -- context parallelism N, MoE EP N.
+
+One recipe and one layout of N ranks (N bound at construction), so the forward carries no recipe or
+layout branch:
+
+* checkpoint: the ModelOpt NVFP4 export as stored. The routed experts are NVFP4 (per-tensor
+  input scale 1.0); the shared experts and the KDA projections are MXFP8 (one UE8M0 scale per 32
+  values of a row); MLA, the latent MoE projections, the router, norms, embedding and LM head are
+  BF16. Nothing is quantized at load time.
+* caches: FP8 (E4M3, scale 1) MLA latent KV on all 24 DSA layers, FP8 index keys, FP32 KDA
+  recurrent state.
+* speculative decoding: DFlash2, with an FP8 drafter context history.
+* layout: TP 1 and Ulysses context parallelism N (``context_parallel_size: N``, ``cp_config``
+  ``cp_type: ULYSSES``; no attention DP; N in ``_CP_SIZES``, the Mapping's CP size), MoE EP N over
+  the CP group. The CP ranks split the step's rows: CP rank ``r`` runs rows ``[r * rows, (r + 1) * rows)``,
+  ``rows = ceil(num_tokens / N)``, through every layer (context parallelism). The MLA layers append
+  every new token on every rank (all-gather of the new latent rows and index keys) and score and
+  attend their own query rows with all 96 heads; the KDA layers run, by default, the sequence split
+  with a serial FP32 hand-off (construction option ``kda_split``, ``model_kwargs``
+  ``kimi_k31_kda_split``: ``"handoff"``; ``ops/ssm/rubin_kda_handoff``): every rank runs all 96
+  heads over its own rows and a request that spans ranks hands its FP32 end state and its 3-row
+  convolution halo to the next rank; a step whose longest request spans more than
+  ``_KDA_HANDOFF_MAX_SPAN`` ranks, or with fewer than 3 rows per rank, runs Ulysses instead.
+  ``"ulysses"`` always runs Ulysses (one all-to-all hands each rank its 96 / N heads for all
+  rows, one brings the recurrence output back, BF16); both move rows with the one-sided MNNVL push
+  (``ops/comm/rubin_cp_push``), as does the indexer's balanced split. ``"ulysses_fp8"`` sends the
+  Ulysses all-to-alls as E4M3 rows with FP32 scales per 128 columns over NCCL, and ``"relay"`` runs
+  the sequence split with the start states composed by their owners (``ops/ssm/rubin_kda_relay``,
+  NCCL); the routed
+  experts EP N (896 / N per rank) on each rank's rows, through the all-to-all around the CuteDSL
+  experts (``moe_config.backend`` ``CUTEDSL``) or MegaMoE (``MEGAMOE_CUTEDSL``), optionally under a
+  static expert placement (construction option ``kimi_k31_expert_placement``). Context servers only
+  (it feeds a TEP8 generation server: the caches keep the TP layout, the MLA latents and index keys
+  whole on every rank, the KDA state head-sharded).
+  Port of the CEP16 context parallelism of the generic Kimi K3.1 model, eager.
+
+Text only: the checkpoint's vision tower and projector are expected leftovers of the load, and
+admission refuses media (``validate_request``).
+
+Construction binds layout, role and recipe (module constants, closures, helper arguments); the
+forward dispatches only on per-step facts (row counts, whether a step has context rows). Every
+model kernel call goes through an OpWrapper, from modeling_v2's ``catalog/`` or the family's
+``ops/``; small torch glue (argmax, where, cat, gather, masked_fill, sum, repeat_interleave) runs
+inline.
+"""
+
+from __future__ import annotations
+
+import copy
+import functools
+import itertools
+import math
+import time
+import weakref
+from types import MappingProxyType
+from typing import Any, Callable, NamedTuple, Optional
+
+import torch
+from torch import nn
+from transformers import PretrainedConfig
+
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.flashinfer_silu_and_mul import (
+    flashinfer_silu_and_mul,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.mla_rope_append_paged_kv_assign_q import (
+    mla_rope_append_paged_kv_assign_q,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
+    thop_attention,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.bmm_out import bmm_out
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.noaux_tc_op import noaux_tc_op
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_fused_add_rmsnorm import (
+    flashinfer_fused_add_rmsnorm,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
+    flashinfer_rmsnorm,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (
+    fp4_quantize,
+)
+from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
+from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.modeling_speculative import external_drafter_config_kwargs
+from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
+from tensorrt_llm._torch.pyexecutor.sampler.ops import flashinfer as flashinfer_sampling
+from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import GREEDY_TEMPERATURE_THRESHOLD
+from tensorrt_llm._torch.speculative import should_use_separate_draft_kv_cache
+from tensorrt_llm._torch.speculative.dflash import DFlashWorker as _EngineDFlashWorker
+from tensorrt_llm._torch.speculative.interface import SpecWorkerBase
+from tensorrt_llm._torch.speculative.vocab_parallel import VocabShardedLogits
+from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm.functional import RopeEmbeddingUtils
+from tensorrt_llm.logger import logger
+from tensorrt_llm.quantization.mode import QuantAlgo
+
+from ..ops.activation.rubin_situ_and_mul_mxfp8 import rubin_situ_and_mul_mxfp8
+from ..ops.activation.sigmoid_gate_mul import k31_sigmoid_gate_mul
+from ..ops.activation.situ_and_mul import situ_and_mul
+from ..ops.attention.convert_req_index_to_global import convert_req_index_to_global
+from ..ops.attention.fp8_mqa_logits import fp8_mqa_logits
+from ..ops.attention.fused_cat_fp8 import fused_cat_fp8
+from ..ops.attention.gather_k_cache_paged import k31_gather_k_cache_paged
+from ..ops.attention.indexer_k_cache_scatter_op import indexer_k_cache_scatter_op
+from ..ops.attention.indexer_topk_prefill import indexer_topk_prefill
+from ..ops.attention.rubin_cp_dkv import (
+    DkvPlan,
+    IndexSlots,
+    OwnerWrite,
+    dkv_plan,
+    index_mirror_views,
+    index_slots,
+    owner_write,
+    peer_tokens,
+    read_pointers,
+)
+from ..ops.attention.rubin_cp_mla_rows import (
+    RowMove,
+    balanced_query_bounds,
+    own_row_slices,
+    own_row_tiles,
+    row_move,
+    row_move_blocks,
+    slice_lengths,
+)
+from ..ops.attention.rubin_dkv_topk_read import (
+    rubin_dkv_rows_read,
+    rubin_dkv_topk_read,
+    rubin_dkv_topk_read_fused,
+)
+from ..ops.attention.rubin_dsa_backend import attention_backend_for as rubin_attention_backend_for
+from ..ops.attention.rubin_dsa_backend import rubin_dsa_backend_cls
+from ..ops.attention.rubin_dsa_topk_remap import rubin_dsa_topk_remap
+from ..ops.attention.rubin_gvr_topk_prefill import rubin_gvr_topk_prefill
+from ..ops.attention.rubin_mla_ctx_q_fp8 import rubin_mla_ctx_q_fp8
+from ..ops.attention.rubin_mla_ctx_wuk_fp8 import rubin_mla_ctx_wuk_fp8
+from ..ops.attention.rubin_mla_wuv_gate import rubin_mla_wuv_gate
+from ..ops.attention.rubin_pad_heads import rubin_pad_heads
+from ..ops.comm.allgather_module import allgather_module
+from ..ops.comm.rubin_cp_fp8_rows import rubin_cp_fp8_pack, rubin_cp_fp8_unpack
+from ..ops.comm.rubin_cp_push import (
+    CpPushBlock,
+    CpPushWorkspace,
+    push_chunks,
+    rubin_cp_push,
+    rubin_cp_push_workspace,
+)
+from ..ops.comm.rubin_cp_rows import CpRows, cp_rows, rubin_cp_allgather, rubin_cp_alltoall
+from ..ops.gemm.rubin_linear import rubin_linear
+from ..ops.gemm.rubin_mxfp8_gemm import rubin_mxfp8_gemm
+from ..ops.gemm.rubin_mxfp8_linear import rubin_mxfp8_linear
+from ..ops.gemm.rubin_upcast_fp32 import rubin_upcast_fp32
+from ..ops.moe._rubin_expert_placement import balanced_for, read_expert_placement
+from ..ops.moe.dsv3_router_gemm_op import dsv3_router_gemm_op
+from ..ops.moe.replica_balance import ReplicaBalanceLog
+from ..ops.moe.rubin_cutedsl_fc1 import rubin_cutedsl_fc1
+from ..ops.moe.rubin_cutedsl_fc2_finalize import check_cutedsl_lever_env, rubin_cutedsl_fc2_finalize
+from ..ops.moe.rubin_megamoe import (
+    check_megamoe_lever_env,
+    megamoe_ep_group,
+    rubin_megamoe,
+    rubin_megamoe_workspace,
+)
+from ..ops.moe.rubin_moe_a2a import (
+    CFT_MAX_BATCH,
+    a2a_use_cft,
+    check_a2a_lever_env,
+    dispatch_issued,
+    rubin_moe_a2a_combine,
+    rubin_moe_a2a_dispatch,
+    rubin_moe_a2a_workspace,
+)
+from ..ops.moe.rubin_moe_replica_plan import (
+    RESIDENT_PLAN,
+    ReplicaCadence,
+    ReplicaPlacements,
+    ReplicaRouter,
+    bind_replica_planes,
+    current_replica_manager,
+    plane_tensors,
+    replica_layers,
+    rubin_moe_replica_route,
+)
+from ..ops.moe.rubin_moe_residual_add import rubin_moe_residual_add
+from ..ops.moe.rubin_moe_sort import rubin_moe_sort
+from ..ops.moe.rubin_moe_zero_local_rows import rubin_moe_zero_local_rows
+from ..ops.norm.attn_res_add_rmsnorm_fwd import attn_res_add_rmsnorm_fwd
+from ..ops.norm.attn_res_fwd import attn_res_fwd
+from ..ops.norm.attn_res_rmsnorm_fwd import attn_res_rmsnorm_fwd
+from ..ops.norm.rubin_attn_res_add_rmsnorm_persistent import rubin_attn_res_add_rmsnorm_persistent
+from ..ops.norm.rubin_attn_res_moe_add_rmsnorm import (
+    rubin_attn_res_moe_add_rmsnorm,
+    rubin_attn_res_moe_add_rmsnorm_mx,
+)
+from ..ops.norm.rubin_attn_res_rmsnorm import rubin_attn_res_add_rmsnorm, rubin_attn_res_rmsnorm
+from ..ops.norm.rubin_layer_norm import rubin_layer_norm
+from ..ops.spec.dflash2_block_verify import dflash2_block_verify_seeded
+from ..ops.spec.dflash2_global_top32 import k31_dflash2_merge_top32, k31_dflash2_shard_top32
+from ..ops.spec.dflash2_greedy_verify import dflash2_greedy_verify
+from ..ops.spec.dflash2_grouped_conv import dflash2_grouped_conv
+from ..ops.spec.dflash2_proposal_load import k31_dflash2_proposal_load
+from ..ops.spec.dflash2_sampling import DFlash2ProposalStore, dflash2_sampled_step
+from ..ops.spec.dflash2_selector_draft import k31_dflash2_selector_draft
+from ..ops.spec.dflash2_selector_greedy_path import k31_dflash2_selector_greedy_path
+from ..ops.spec.dflash2_window_rows import dflash2_window_rows
+from ..ops.spec.draft_context_cache import DRAFT_FP8_KV_SCALE
+from ..ops.spec.flashinfer_compute_probs_from_logits import flashinfer_compute_probs_from_logits
+from ..ops.spec.flashinfer_sample_from_logits import flashinfer_sample_from_logits
+from ..ops.spec.fused_compute_probs_from_logits import fused_compute_probs_from_logits
+from ..ops.spec.fused_sample_from_logits import fused_sample_from_logits
+from ..ops.spec.mla_norm_rope import dflash2_mla_block_rope, dflash2_mla_ctx_norm_rope
+from ..ops.spec.rubin_dflash2_window_fp32 import rubin_dflash2_window_fp32
+from ..ops.spec.strict_accept import strict_accept
+from ..ops.spec.vocab_parallel_argmax import vocab_parallel_argmax
+from ..ops.spec.vocab_parallel_sample import vocab_parallel_sample
+from ..ops.ssm.reset_recurrent_state_rows import reset_recurrent_state_rows
+from ..ops.ssm.rubin_kda_dsa_cache_manager import (
+    bind_kv_cache_args,
+    select_rubin_kv_cache_manager_cls,
+)
+from ..ops.ssm.rubin_kda_handoff import HALO as _KDA_HALO
+from ..ops.ssm.rubin_kda_handoff import KdaHandoffPlan, kda_handoff_layer, kda_handoff_plan
+from ..ops.ssm.rubin_kda_handoff import max_span as _kda_max_span
+from ..ops.ssm.rubin_kda_metadata import RubinKdaMetadata
+from ..ops.ssm.rubin_kda_prefill import rubin_kda_prefill
+from ..ops.ssm.rubin_kda_prefill_conv import rubin_kda_prefill_conv
+from ..ops.ssm.rubin_kda_relay import (
+    kda_relay_plan,
+    relay_gather_input,
+    relay_histories,
+    relay_own,
+    relay_pack,
+    relay_starts,
+    rubin_kda_relay_correct,
+    rubin_kda_relay_prefill,
+)
+from ..ops.ssm.rubin_rms_norm_gated_token_major import rubin_rms_norm_gated_token_major
+from . import weights as _weights
+
+# Identity. The server role is the one routing records (``routing.disagg_role``), fixed at
+# construction; the target itself reads no environment variable.
+_TARGET = "kimi_k31_pro_nvfp4__sm_107__cep"
+_COMPUTE_CAPABILITY = (10, 7)
+_LAYOUT = "cep"
+_ROLES = ("context",)
+
+# The recipe; routing admits no other.
+_QUANT_ALGO = "MIXED_PRECISION"  # hf_quant_config.json of the ModelOpt export
+_INDEXER_K_DTYPE = "fp8"
+_STATE_DTYPE = torch.float32  # KDA recurrent state (mamba_ssm_cache_dtype)
+_DRAFT_HISTORY_DTYPE = torch.float8_e4m3fn
+
+# The K3.1 text model the code is written for; the core asserts the config matches.
+_K31 = MappingProxyType(
+    {
+        "hidden_size": 7168,
+        "num_hidden_layers": 93,
+        "vocab_size": 163840,
+        "num_attention_heads": 96,
+        "q_lora_rank": 1536,
+        "kv_lora_rank": 512,
+        "qk_nope_head_dim": 128,
+        "qk_rope_head_dim": 64,
+        "v_head_dim": 128,
+        "rms_norm_eps": 1e-5,
+        "intermediate_size": 33792,
+        "first_k_dense_replace": 1,
+        "num_experts": 896,
+        "num_experts_per_token": 16,
+        "num_expert_group": 1,
+        "routed_scaling_factor": 1.0,
+        "moe_intermediate_size": 3072,
+        "num_shared_experts": 2,
+        "routed_expert_hidden_size": 3584,
+        "activation_situ_beta": 4.0,
+        "activation_situ_linear_beta": 25.0,
+        "attn_res_block_size": 12,
+    }
+)
+_K31_KDA = MappingProxyType(
+    {"num_heads": 96, "head_dim": 128, "short_conv_kernel_size": 4, "gate_lower_bound": -5.0}
+)
+_K31_DSA = MappingProxyType(
+    {"index_num_heads": 32, "index_head_dim": 128, "index_topk": 2048, "index_rope_dim": 0}
+)
+
+# The layout; the core asserts the Mapping matches. N, the context-parallel size, is the Mapping's
+# Ulysses CP size (world N, TP 1, MoE EP N; the KDA recurrence runs 96 / N heads over all rows).
+_CP_SIZES = (8, 16)
+_TP = 1
+_ATTENTION_DP = False
+_MLA_QUERY_HEADS = 96
+_KDA_TP = 1  # the KDA projections, gate norm and o_proj run whole on this rank's rows
+_MOE_TP = 1
+
+# Launch constants per server role, logged in one line at startup; a key in _DETAILS is
+# logged inside its parent's value.
+# f_a and b run in the QKVG GEMM, so no [f_a | b] -> f_b chain is left for the aux stream
+# (kda_bfa_aux_stream_max_rows 0). A verify step of three requests or more takes o_proj's MXFP8
+# operand from the verify kernel (kda_o_proj_mx_handoff).
+_CONSTANTS = MappingProxyType(
+    {
+        "context": MappingProxyType(
+            {
+                "attn_res_topology": "per_token",
+                "draft_ctx_latent": "precompute_context_kv",
+                "draft_ctx_weights": "history",
+                "draft_history_dtype": "fp8",
+                "index_k_gather_triton": "layout_gated",
+                "indexer_logits_elem_budget": 536870912,
+                "kda_fused_prefill_conv": True,
+                "kda_gated_rmsnorm_multirow": "shape_gated",
+                "kda_handoff_prep_ahead": True,
+                "kda_prefill": "bt16",
+                "kda_qkvg_fused": True,
+                "cp_kda": "ulysses_nccl_a2a",
+                "cp_mla": "allgather_kv_own_rows",
+                "cp_moe": "a2a_own_rows",
+                "dkv_read_fused": True,
+                "mla_ctx_fused_q_fp8": True,
+                "mla_ctx_gate_in_wuv": True,
+                "mla_ctx_wuk_fp8": True,
+                "mla_output_gate": "sigmoid_gate_mul",
+                "moe_backend": ("cutedsl", "megamoe_cutedsl"),
+                "mxfp8_gemm": "rubin_dense_blockscaled_gemm",
+                "pad128_prefill": True,
+                "router_bf16": True,
+                "shared_down_mx_handoff": True,
+                "shared_gate_up_fused": True,
+                "topk_remap_triton": "shape_gated",
+                "zero_gpu_pools": True,
+            }
+        ),
+    }
+)
+
+# Detail key -> the key whose logged value it belongs to.
+_DETAILS = MappingProxyType({})
+
+
+# fp8_kv_layers None: every DSA layer's latent KV is FP8.
+_CACHE_ARGS = MappingProxyType(
+    {
+        "context": MappingProxyType(
+            {
+                "fp8_kv_layers": None,
+                "indexer_k_dtype": "fp8",
+                "kv_dtype": "fp8",
+                "state_dtype": torch.float32,
+                "zero_gpu_pools": True,
+            }
+        ),
+    }
+)
+
+# The MoE padding-row mask serves a prefill CUDA graph, which these targets do not capture.
+_MOE_ARGS = MappingProxyType(
+    {
+        "context": MappingProxyType(
+            {
+                "mask_graph_padding_rows": False,
+            }
+        ),
+    }
+)
+
+# The context server's all-to-all decides counted writes by the engine's rule (no forced mode).
+_MOE_A2A_FORCE_CFT = None
+
+# Stock engine names this file imports directly, each a computation outside the family's ops
+# (test_rubin_flat_shape.py checks the list); helpers reached through the family's ops/ are not
+# listed.
+UNCERTIFIED_GENERIC_CALLS = (
+    "tensorrt_llm._torch.models.modeling_speculative.external_drafter_config_kwargs",
+    "tensorrt_llm._torch.models.modeling_utils.DecoderModel",
+    "tensorrt_llm._torch.models.modeling_utils.DecoderModelForCausalLM",
+    "tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer",
+    "tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla.GREEDY_TEMPERATURE_THRESHOLD",
+    "tensorrt_llm._torch.speculative.dflash.DFlashWorker",
+    "tensorrt_llm._torch.speculative.interface.SpecWorkerBase",
+    "tensorrt_llm._torch.speculative.should_use_separate_draft_kv_cache",
+    "tensorrt_llm._torch.speculative.vocab_parallel.VocabShardedLogits",
+    "tensorrt_llm._utils.prefer_pinned",
+    "tensorrt_llm.functional.RopeEmbeddingUtils",
+)
+
+
+# --------------------------------------------------------------------------------------------------
+# Step and runtime interface: one step's batch state, the runtime resources, the weight views.
+#
+# A block function (the KDA, MLA + DSA, MoE and drafter blocks) reads what it needs of another
+# block through these and nothing else:
+#
+# * ``L``: one layer's weight view at this rank's share (``_KdaW``, ``_MlaW``, ``_MoeW``,
+#   ``_DenseW``), read once off the realized parameters in ``post_load_weights``;
+# * ``st``: ``_Step``, this step's batch state, projected once per forward from the engine's
+#   metadata (``_build_step_args``); ``st.dsa`` is the step's DSA state (``_DsaStep``);
+# * ``rt``: ``_Rt``, the runtime resources (streams, communication closures, workspaces, the
+#   identity RoPE table), built once in ``post_load_weights`` and never during a CUDA graph
+#   capture.
+#
+# Block functions (positional parameters fixed):
+#
+# * KDA: ``kda_prefill(L, x, st, rt)``;
+# * MLA + DSA: ``mla_prefill(L, i, x, st, rt)``;
+# * MoE: ``latent_moe(L, i, x, st, rt)``, ``dense_mlp(L0, x, st, rt)``;
+# * DFlash2: ``draft_step(DW, hidden_streams, st, rt)``, the container ``DraftModel`` and the
+#   worker ``DFlashWorker`` (``draft_config_for`` builds the drafter's config).
+#
+# The mixers and ``dense_mlp`` return ``[rows of x, hidden]`` BF16, whole: each rank runs every
+# head (the KDA recurrence under Ulysses) and the whole dense MLP over its own rows of the step, so
+# no slot reduces anything. ``latent_moe`` returns ``_MoeOut(routed, shared)``: the routed
+# experts' output (back from the all-to-all) and the shared experts', whole for the rank's rows.
+# The next mix adds ``bf16(routed + shared)`` to the residual (``moe_norm``, ``moe_add``).
+#
+# ``i`` is the global layer index. ``x`` holds this rank's ``st.cp.rows`` rows of the step (see
+# the context parallelism section); rows past ``st.cp.live`` are zero padding. Every step is a
+# context step (``PrefillTarget``); ``DecodeTarget`` refuses.
+#
+# The attention residual. Each layer mixes the running prefix sum with the bank of block snapshots
+# (``attn_res``) ahead of each sublayer; a layer at a block boundary first stores its input stream
+# in the bank and starts the prefix sum over. The slots are ``_Rt``'s (the core calls them, the
+# blocks do not); each picks its kernel by the step's row count (``_mix_slots``).
+# --------------------------------------------------------------------------------------------------
+
+# Rows per call of the attn_res_fwd kernel; longer prefill chunks run in slices.
+_ATTN_RES_OP_MAX_TOKENS = 16384
+# The per-token fused mix: up to 1 row with the per-token topology, 32 with the split one.
+_FUSED_MAX_ROWS = {"per_token": 1, 1: 32}
+# Candidates (snapshots + the prefix sum) the persistent kernel takes: 2 to 9.
+_PERSISTENT_MAX_CANDIDATES = 9
+# Rows of one R128c4 scale tile: up to here the mix stores the KDA input's MXFP8 form.
+_MX_TILE_ROWS = 128
+# rt.events: the (fork, join) of the attention phase's side work, and of the indexer's work on
+# the layer input alone (dsa_idx_fork).
+_EV_ATTN = 0
+_EV_IDX = 1
+# The sparse MLA attends to this many Top-K entries per query row (index_topk).
+_DSA_TOPK = _K31_DSA["index_topk"]
+# The indexer's output rows, one buffer per step (the engine's cached-buffer name).
+_DSA_TOPK_OUT = "indexer_topk_out_buffer"
+
+
+class _DsaStep(NamedTuple):
+    """One step's DSA state for the MLA layers, read once a step off the family DSA metadata.
+
+    Tensors are metadata buffers or views of them, so a captured graph reads what the replayed
+    step's ``prepare`` wrote. ``nc`` / ``ng`` / ``nct`` are the step's context requests,
+    generation requests and context rows (0, ``num_generations``, 0 on a decode step).
+    """
+
+    next_n: int  # rows per generation request (1 + the verified draft length); 1 without them
+    skip_gen: bool  # md.skip_indexer_for_gen_reqs: the generation rows take topk_dense
+    skip_ctx: bool  # md.skip_indexer_for_ctx_reqs: the context rows take topk_dense (short)
+    # Index-key insert (every live row of the step, once, before the phases split).
+    slot_fp8: torch.Tensor  # md.slot_mapping_fp8
+    slot_scale: torch.Tensor  # md.slot_mapping_scale
+    # Decode logits: FP8 DSL paged MQA logits, strided, one atom per request.
+    ctx_lens: torch.Tensor  # md.gen_indexer_kv_lens_cuda_runtime
+    block_table: torch.Tensor  # md.indexer_k_cache_block_offsets[nc:nc + ng]
+    sched: torch.Tensor  # md.scheduler_metadata_buffer
+    max_len: int  # md.get_indexer_max_seq_len()
+    # Top-K.
+    gen_kv_lens: torch.Tensor  # md.kv_lens_cuda_runtime[nc:nc + ng]
+    topk_out: torch.Tensor  # the indexer's Top-K rows of the step [num_tokens, index_topk] int32
+    topk_dense: torch.Tensor  # md.topk_indices_buffer: the dense Top-K (skip_ctx / skip_gen)
+    radix_aux_indices: torch.Tensor  # md.radix_aux_indices
+    radix_aux_logits: torch.Tensor  # md.radix_aux_logits
+    # Local Top-K -> global latent-pool rows.
+    req_idx_ctx: torch.Tensor  # md.req_idx_per_token[:nct]
+    req_idx_gen: torch.Tensor  # md.req_idx_per_token[nct:num_tokens] - nc
+    block_table_ctx: torch.Tensor  # md.block_table[:nc]
+    block_table_gen: torch.Tensor  # md.block_table[nc:num_seqs]
+    tokens_per_block: int
+    # Prefill (context rows): chunks with their query tiles, and the full-KV gather slots.
+    chunks: Any  # md.indexer_prefill_chunks: token / key bounds, cu_seqlen_ks / _ke, tile plan
+    cu_ks: torch.Tensor | None  # md.cu_seqlen_ks[:nct]: each context row's first key
+    cu_ke: torch.Tensor | None  # md.cu_seqlen_ke[:nct]: each context row's key end
+    num_ctx_kv_tokens: int  # md.num_ctx_kv_tokens
+    k_slot_fp8: torch.Tensor | None  # md.slot_mapping_fp8_fullkv; None without context rows
+    k_slot_scale: torch.Tensor | None  # md.slot_mapping_scale_fullkv; None without context rows
+    # The MLA ops' step arguments (request-major). The indexer's own query split of a prefill
+    # chunk is not used: each rank scores its own rows (``_idx_prefill``).
+    rope_gen: dict  # mla_rope_generation's metadata arguments
+    sparse_gen: dict  # thop_attention's metadata arguments, generation call
+    sparse_ctx: dict  # the same object: the context call reads the same batch state
+
+
+class _Step(NamedTuple):
+    """One step's batch state: what the blocks read of the engine's metadata, read once a step.
+
+    ``DecodeTarget`` states ``num_contexts`` and ``num_ctx_tokens`` as 0 instead of reading them.
+    """
+
+    md: Any  # the step's attention metadata (the family DSA metadata)
+    kda_md: Any  # md.mamba_metadata: KDA state slots, query offsets, snapshot plan
+    cache: Any  # md.kv_cache_manager: KDA state and conv pools, DSA latent and index-key caches
+    position_ids: torch.Tensor  # [num_tokens] int32
+    num_tokens: int  # md.num_tokens: the live rows; the inputs may carry padding rows after them
+    num_contexts: int  # context requests
+    num_ctx_tokens: int  # context rows, the step's first rows
+    num_generations: int  # generation requests
+    rows_per_gen: int  # rows per generation request: 1 + the draft length the step verifies
+    all_rank_num_tokens: tuple[int, ...]  # every DP rank's row count
+    spec_md: Any  # the DFlash2 spec metadata (hidden-state taps), None without a drafter
+    cuda_graph: bool  # md.is_cuda_graph: a CUDA graph's warmup or capture (the stream plans)
+    dsa: _DsaStep  # the step's DSA state (indexer, Top-K, sparse MLA)
+    cp: CpRows  # this rank's rows of the step
+    cp_mla: _CpMla  # the sparse MLA of this rank's rows: its slices' attention-op arguments
+    kda_relay: Any  # the sequence-split KDA's step plan (KdaRelayPlan); None under Ulysses
+    # The push Ulysses' two device tables ((s0, d0, n) per destination: out, back), None when the
+    # step runs neither the push Ulysses nor its fallback.
+    kda_push: Any
+    # The serial hand-off's step plan (KdaHandoffPlan); None: the step runs the push Ulysses.
+    kda_handoff: Any
+
+
+class _MoeOut(NamedTuple):
+    """A latent-MoE layer's output, both parts whole; the next mix adds ``bf16(routed + shared)``."""
+
+    routed: torch.Tensor  # [rows, hidden] BF16: latent all-reduce + norm + latent_up
+    shared: torch.Tensor  # [rows, hidden] BF16: the shared experts, all-reduced
+
+
+class _MixW(NamedTuple):
+    """The weights of one attention-residual mix: score projection and norm, then the output norm."""
+
+    proj: torch.Tensor  # the *_res_proj weight flattened [H]
+    res_norm: torch.Tensor  # the *_res_norm weight [H] (scores the candidates)
+    out_norm: torch.Tensor  # the RMSNorm the mix feeds [H]
+
+
+class _Streams(NamedTuple):
+    """The core's side streams, made once at construction (never during a capture)."""
+
+    aux: torch.cuda.Stream  # rt.aux_stream: norm and indexer quant overlap, shared experts
+    fork: torch.cuda.Stream  # rt.fork_stream: q_b beside the indexer's query projection
+    idx: torch.cuda.Stream  # rt.idx_stream: the indexer's keys and weights (dsa_idx_fork)
+    latent: torch.cuda.Stream  # latent_down beside the router
+    memset: torch.cuda.Stream  # the CuteDSL experts' output memset beside FC1
+
+
+class _DsaPools:
+    """The DSA layers' cache views and the facts their step state needs (``rt.dsa_pools``).
+
+    ``bind`` reads the views off the cache manager on the first step and again when the manager
+    object changes (the KV estimation builds one, the final run another); it allocates nothing,
+    so a capture may call it. All MLA layers share one FP8 latent pool (the manager raises
+    otherwise), which their page parameters index.
+    """
+
+    def __init__(
+        self,
+        mla_layers: tuple[int, ...],
+        rope_positions: int,
+        gen_requests: int | None,
+        balanced_indexer: bool = False,
+        new_rows: str = "ownerwrite",
+    ) -> None:
+        # Generation requests the decode-logits arena holds: one on a context server (an
+        # attention-DP dummy), else the engine's request limit.
+        self.gen_requests = gen_requests
+        self.mla_layers = mla_layers
+        self.rope_positions = rope_positions  # positions rt.mla_rope covers
+        self.cache: Any = None
+        self.idx_k_cache: dict[int, torch.Tensor] = {}  # layer -> its INDEX_KEY page view
+        self.pool_params: dict[int, tuple[int, int]] = {}  # layer -> (page scale, layer offset)
+        self.local: dict[int, int] = {}  # layer -> the manager's local layer index
+        self.tokens_per_block = 0
+        # The decode-logits arena of the MLA + DSA block: allocated by the first (eager) forward,
+        # before any capture.
+        self.idx_logits: torch.Tensor | None = None
+        # Under DKV (the cache manager's dkv): the group, its attention life cycle, every rank's
+        # latent pool as token rows, one rank's copy in pages of one layer, a token row's bytes,
+        # the local layers.
+        self.dkv: Any = None
+        self.dkv_lc = 0
+        self.peer_tokens: torch.Tensor | None = None
+        self.rows_per_rank = 0
+        self.row_bytes = 0
+        self.num_local_layers = 0
+        # Sharded index keys under DKV: each layer's view of every rank's index keys, a
+        # slot's bytes in a layer view, and one rank's copy's bytes in the mapping.
+        self.idx_mirror: dict[int, torch.Tensor] = {}
+        self.idx_slot_bytes = 0
+        self.idx_rank_bytes = 0
+        # The indexer scores the rows of a cost-balanced split (``_idx_split``), not its own rows,
+        # moving the rows that change rank with the CP group's push (``rt.cp_push``).
+        self.balanced_indexer = balanced_indexer
+        # How the step's new latent rows and index keys reach the cache under DKV
+        # (``_NEW_ROWS_ATTR``): pushed to the owners of their pages, all-gathered, or both with
+        # the owners' rows checked against the all-gather.
+        self.new_rows = new_rows
+
+    def bind(self, cache: Any) -> None:
+        """Take the step's cache manager's views (a new manager replaces the old views)."""
+        if cache is self.cache:
+            return
+        assert int(cache.max_seq_len) <= self.rope_positions, (
+            f"the identity RoPE table covers {self.rope_positions} positions, the KV cache "
+            f"{cache.max_seq_len}"
+        )
+        self.cache = cache
+        self.idx_logits = None
+        self.local = {i: int(cache.layer_offsets[i]) for i in self.mla_layers}
+        self.idx_k_cache = {i: cache.get_indexer_k_cache_buffers(i) for i in self.mla_layers}
+        # The prefill's paged index-key gather (k31_gather_k_cache_paged) reads each view as
+        # [pages, tokens per page, 1, bytes per token] uint8 with contiguous tokens: checked once.
+        for view in self.idx_k_cache.values():
+            _, _, heads, per_token = view.shape
+            assert (
+                heads == 1
+                and view.dtype == torch.uint8
+                and view.stride(3) == 1
+                and view.stride(1) == per_token
+            ), f"the paged index-key gather cannot read a {tuple(view.shape)} {view.dtype} view"
+        self.pool_params = {
+            i: tuple(cache.get_primary_pool_page_index_params(self.local[i]))
+            for i in self.mla_layers
+        }
+        pool = cache.get_unique_primary_pool()  # raises unless the MLA layers share one pool
+        self.tokens_per_block = int(cache.tokens_per_block)
+        self.max_pages = -(-int(cache.max_seq_len) // self.tokens_per_block)
+        self.dkv = getattr(cache, "dkv", None)
+        if self.dkv is not None:
+            peers = cache.dkv_latent_peers
+            self.dkv_lc = cache.dkv_life_cycle
+            page_bytes = pool.shape[-1] * pool.element_size()
+            self.row_bytes = page_bytes // self.tokens_per_block
+            # The read's rows address the peer mapping from the pool's first slot: the pool's page
+            # parameters are relative to the attention op's pool pointer, which must be that slot.
+            first = self.local[self.mla_layers[0]]
+            pointer = int(
+                cache.kv_cache_pool_pointers[int(cache.kv_cache_pool_mapping[first][0])][0]
+            )
+            if pointer != pool.data_ptr() or peers.row_bytes != page_bytes:
+                raise ValueError("the DKV read needs the latent pool's first slot as the pointer")
+            self.peer_tokens = peer_tokens(peers, self.row_bytes)
+            self.rows_per_rank = peers.rows_per_rank
+            self.num_local_layers = int(cache.num_local_layers)
+            ipeers = getattr(cache, "dkv_index_peers", None)
+            self.idx_mirror = {}
+            if ipeers is not None:
+                own = next(b for b, _, r in cache.dkv_peer_pools() if r is ipeers)
+                self.idx_mirror = index_mirror_views(ipeers, own, self.idx_k_cache)
+                view = next(iter(self.idx_k_cache.values()))
+                self.idx_slot_bytes = int(cache.indexer_k_cache_page_scale) * view.stride(0)
+                self.idx_rank_bytes = int(ipeers.stride)
+
+
+class _MoeComm(NamedTuple):
+    """The MoE sublayer's runtime resources (``rt.moe_comm``), built once in post_load_weights.
+
+    One set of events serves every layer: each use records before it waits, in issue order.
+    """
+
+    latent_stream: torch.cuda.Stream  # latent_down
+    memset_stream: torch.cuda.Stream  # the CuteDSL output memset (eager steps too)
+    shared_fork: torch.cuda.Event
+    shared_join: torch.cuda.Event
+    latent_fork: torch.cuda.Event
+    latent_ready: torch.cuda.Event
+    memset_ready: torch.cuda.Event
+
+
+class _Rt(NamedTuple):
+    """The runtime resources one forward reads, built once in ``post_load_weights``.
+
+    No field is a per-layer helper object: the blocks call the family entries with these
+    resources as arguments.
+    """
+
+    dsa_pools: _DsaPools  # the DSA layers' index-key caches and page parameters
+    mla_rope: torch.Tensor  # the MLA kernels' RoPE table: identity rotations (K3.1 MLA is NoPE)
+    aux_stream: torch.cuda.Stream  # the side stream (norm / indexer quant overlap, shared)
+    fork_stream: torch.cuda.Stream  # q_b beside the indexer's query projection (graph steps)
+    idx_stream: torch.cuda.Stream  # the indexer's keys and weights (dsa_idx_fork)
+    events: tuple  # (fork, join) CUDA event pairs, indexed _EV_ATTN, _EV_IDX
+    attn_res_norm: Callable  # (prefix, bank, mw) -> normed
+    add_norm: Callable  # (prefix, addend, bank, mw) -> (prefix + addend, normed)
+    moe_norm: Callable  # (prefix, moe_out, bank, mw) -> (prefix + bf16(routed + shared), normed)
+    moe_norm_mx: Callable  # moe_norm whose normed rows may come as (normed, codes, scales)
+    reduce_norm: Callable  # (prefix, partial, bank, mw) -> (prefix, normed)
+    attn_res_mix: Callable  # (prefix, bank, mw) -> the pre-norm mixture (a drafter tap)
+    rms_norm: Callable  # (x, weight) -> normed
+    moe_add: Callable  # (prefix, moe_out) -> prefix + bf16(routed + shared)
+    reduce: Callable  # (out) -> out: block outputs are whole on this rank's rows
+    moe_comm: _MoeComm  # the MoE sublayer's streams and events
+    a2a: Any  # CUTEDSL: the all-to-all workspace and metainfo (the MoE block's); else None
+    megamoe: Any  # MEGAMOE_CUTEDSL: MegaMoE's per-bucket symmetric buffers; else None
+    moe_forward: tuple  # (begin, end) of a forward: the EPLB load record's, no-ops without EPLB
+    # The most rows a rank routes per all-to-all or MegaMoE launch:
+    # ceil(min(max_num_tokens, moe_max_num_tokens) / N).
+    moe_rows: int
+    moe_ctx: Callable  # (L, x, st, rt) -> _MoeOut: the MoE block, shared experts beside or after
+    cp_mapping: Any  # the Mapping whose CP group splits the rows (the row all-gathers)
+    cp_group: tuple  # that CP group's global ranks, in CP rank order (the KDA all-to-alls)
+    kda_cp: _KdaCp  # this rank's share of the KDA recurrence (Ulysses), fixed by N
+    cp_push: CpPushWorkspace  # the CP group's one-sided MNNVL push (row moves, all-to-alls)
+    cp_fence: torch.Tensor  # an empty push's table (zeros): a fence of the CP group on the push
+    draft: Any  # the DFlash2 drafter's bound window entry, plan buffers and scratch
+
+
+class _KdaW(NamedTuple):
+    """A KDA layer's mixer at this rank's share (parameters ``l{i}_kda_<field>``).
+
+    Checkpoint keys under ``language_model.model.layers.{i}.self_attn.``; P is all 96 KDA heads
+    x 128 (the projections, gate norm and o_proj run whole on this rank's rows), P / N this rank's
+    Ulysses heads (the recurrence). An MXFP8 weight is its E4M3 values (``*_w``) and UE8M0 1x32
+    scales relaid for the dense block-scaled GEMM (``*_s``).
+    """
+
+    layer: int  # derived: the global layer index, which selects the layer's state slots
+    # q, k, v, g (4P), f_a (128), b (heads) rows, then zero rows to a multiple of 16 (``w1_rows``
+    # stacks the six projections at load)
+    qkvgfab_w: torch.Tensor
+    qkvgfab_s: torch.Tensor  # their scales, stacked the same way (whole 128-row tiles each)
+    fb: torch.Tensor  # f_b_proj [P, 128], BF16
+    o_w: torch.Tensor  # o_proj [H, P]
+    o_s: torch.Tensor
+    # The recurrence's weights at this rank's recurrence heads: its Ulysses share (P / N), or all
+    # 96 under the sequence split.
+    conv: torch.Tensor  # q_conv1d, k_conv1d, v_conv1d: those heads' channels [3P / N or 3P, 4]
+    a_log: torch.Tensor  # A_log, those heads, FP32
+    dt_bias: torch.Tensor  # dt_bias, those heads' channels, FP32
+    o_norm: torch.Tensor  # o_norm.weight, the gated output RMSNorm [128]
+
+
+class _MlaW(NamedTuple):
+    """An MLA (DSA) layer's attention at this rank's share (parameters ``l{i}_mla_<field>``).
+
+    Checkpoint keys under ``language_model.model.layers.{i}.self_attn.``; the ``idx_*`` fields are
+    its DSA indexer's (``indexer.*``), whole on every rank. ``*_t`` fields are transposed views,
+    taken once.
+    """
+
+    q_a_norm: torch.Tensor  # q_a_layernorm.weight [q_lora]
+    kv_a_norm: torch.Tensor  # kv_a_layernorm.weight [kv_lora]
+    q_b: (
+        torch.Tensor
+    )  # q_b_proj: the query heads this rank computes [heads x (nope + rope), q_lora]
+    g: torch.Tensor  # g_proj, the sigmoid output gate: this rank's share [o_heads x v, H]
+    o: torch.Tensor  # o_proj: this rank's input columns [H, o_heads x v]
+    idx_wk_wp: (
+        torch.Tensor
+    )  # indexer.wk then indexer.weights_proj rows [index_dim + heads, H], FP32
+    idx_k_norm_w: torch.Tensor  # indexer.k_norm.weight [index_dim], FP32
+    idx_k_norm_b: torch.Tensor  # indexer.k_norm.bias [index_dim], FP32
+    # Derived from l{i}_mla_kv_b (kv_b_proj regrouped: [every head's k_nope ; every head's v],
+    # kv_lora wide), l{i}_mla_qkv_a (q_a_proj and kv_a_proj_with_mqa rows, stacked
+    # [q_lora + kv_lora + rope, H]) and l{i}_mla_idx_wq_b (indexer.wq_b [index_heads x index_dim,
+    # q_lora], BF16).
+    k_b: torch.Tensor  # derived: kv_b's k_nope rows [heads, nope, kv_lora], the query absorption
+    v_b_t: torch.Tensor  # derived: kv_b's v rows [heads, kv_lora, v], the output expansion
+    qkv_a_t: torch.Tensor  # derived: qkv_a.t()
+    idx_wq_b_t: torch.Tensor  # derived: idx_wq_b.t()
+
+
+class _MoeW(NamedTuple):
+    """A latent-MoE layer's dense weights at this rank's share (parameters ``l{i}_moe_<field>``).
+
+    Checkpoint keys under ``language_model.model.layers.{i}.block_sparse_moe.``. The routed experts
+    are the ``l{i}_moe_fc*`` rows of ``w2_rows``, read here like the rest.
+    """
+
+    router: torch.Tensor  # gate.weight [num_experts, H]: BF16, FP32 where router_bf16 is off
+    router_bias: torch.Tensor  # gate.e_score_correction_bias [num_experts], FP32
+    shared_gu_w: torch.Tensor  # shared_experts gate_proj then up_proj: this rank's rows [2S, H]
+    shared_gu_s: torch.Tensor
+    shared_dn_w: torch.Tensor  # shared_experts down_proj: this rank's columns [H, S]
+    shared_dn_s: torch.Tensor
+    latent_down: torch.Tensor  # routed_expert_down_proj [latent, H], BF16
+    latent_norm: torch.Tensor  # routed_expert_norm.weight [latent]
+    latent_up: torch.Tensor  # routed_expert_up_proj [H, latent], BF16
+    # The routed experts of this rank's window, as ``w2_rows`` declares them (E local experts, I
+    # this rank's slice of an expert's intermediate):
+    fc1_w: torch.Tensor  # w1 / w3 rows, 16 gate then 16 up: [E, 2I, latent / 2] E2M1 pairs (U8)
+    fc1_s: torch.Tensor  # their block scales [E, 2I, latent / 16] (E4M3 bytes), swizzled
+    fc2_w: torch.Tensor  # w2 [E, latent, I / 2]
+    fc2_s: torch.Tensor  # its block scales [E, latent, I / 16], swizzled
+    fc31_in_scale: torch.Tensor  # [1] FP32: the experts' input quantization scale
+    fc2_in_scale: torch.Tensor  # [1] FP32: FC1's output quantization scale
+    fc31_alpha: torch.Tensor  # [E] FP32: FC1's dequantization scale per expert
+    fc2_alpha: torch.Tensor  # [E] FP32: FC2's
+    fc1_norm_const: torch.Tensor  # [E] FP32: MegaMoE's FC2 input scale per expert
+    expert_offset: int  # derived: the first expert (slot) of this rank's window
+    # Per-layer dynamic EPLB, bound at construction (``moe_config.load_balancer``): E above is the
+    # slots this rank computes (H resident experts, then S helper slots), the routed ids are slots.
+    num_experts: int  # derived: the routed id space (the experts, or every rank's slots)
+    plan: Callable  # derived: (logical ids) -> (routed ids, plan with the two waits)
+    finish: Callable  # derived: (plan) -> None, once the experts' kernels are queued
+    record: Callable  # derived: (logical ids, routed ids) -> None, the EPLB load record
+
+
+# The _MoeW fields that read a parameter (the rest are derived).
+_MOE_DERIVED = ("expert_offset", "num_experts", "plan", "finish", "record")
+_MOE_PARAMS = tuple(f for f in _MoeW._fields if f not in _MOE_DERIVED)
+
+
+class _DenseW(NamedTuple):
+    """Layer 0's dense MLP at this rank's share (parameters ``l0_dense_<field>``), BF16.
+
+    Checkpoint keys under ``language_model.model.layers.0.mlp.``.
+    """
+
+    gu: torch.Tensor  # gate_proj then up_proj: this rank's rows [2D, H]
+    dn: torch.Tensor  # down_proj: this rank's columns [H, D]
+
+
+class _LayerW(NamedTuple):
+    """One decoder layer: its mixer and MLP views and its two attention-residual mixes.
+
+    The mixes read ``l{i}_attn_*`` / ``l{i}_mlp_*`` (checkpoint keys under
+    ``language_model.model.layers.{i}.``). Exactly one of ``kda`` / ``mla`` and one of ``moe`` /
+    ``dense`` is set; the forward tells layers apart by these, not by type.
+    """
+
+    kda: _KdaW | None
+    mla: _MlaW | None
+    moe: _MoeW | None
+    dense: _DenseW | None
+    pre: _MixW  # the mix ahead of the mixer (self_attention_res_*, input_layernorm)
+    mid: _MixW  # the mix ahead of the MLP (mlp_res_*, post_attention_layernorm)
+    boundary: bool  # the layer opens an attn_res block (stores its input stream)
+    n_bank: int  # snapshots in the bank when the layer starts
+
+
+class _HeadW(NamedTuple):
+    """The model's weights outside its layers, BF16.
+
+    Checkpoint keys under ``language_model.model.``; the LM head is the shell's ``lm_head``.
+    """
+
+    embed: torch.Tensor  # embed_tokens.weight [vocab, H]
+    out: _MixW  # the output mix (output_attn_res_*, norm)
+    n_bank: int  # snapshots in the bank after the last layer
+
+
+def _sparse_args(md: Any, nc: int, nct: int) -> dict:
+    """thop_attention's metadata arguments of one step: what the sparse MLA call reads.
+
+    The context counts are the step's as the target states them (0 on a decode step).
+    """
+    return dict(
+        workspace_=md.effective_workspace,
+        sequence_length=md.kv_lens_cuda_runtime,
+        host_past_key_value_lengths=md.kv_lens_runtime,
+        host_total_kv_lens=md.host_total_kv_lens,
+        context_lengths=md.prompt_lens_cuda_runtime,
+        host_context_lengths=md.prompt_lens_cpu_runtime,
+        host_request_types=md.host_request_types_runtime,
+        max_context_q_len_override=md.max_context_q_len_override,
+        kv_cache_block_offsets=md.kv_cache_block_offsets,
+        host_kv_cache_pool_pointers=md.host_kv_cache_pool_pointers,
+        host_kv_cache_pool_mapping=md.host_kv_cache_pool_mapping,
+        cache_indirection=md.cache_indirection,
+        block_ids_per_seq=md.block_ids_per_seq,
+        tokens_per_block=md.tokens_per_block,
+        max_num_requests=md.max_num_requests,
+        max_num_sequences=md.max_num_sequences,
+        beam_width=md.effective_beam_width,
+        use_paged_context_fmha=md.use_paged_context_fmha,
+        helix_position_offsets=md.helix_position_offsets,
+        helix_is_inactive_rank=md.helix_is_inactive_rank,
+        is_spec_decoding_enabled=md.is_spec_decoding_enabled,
+        use_spec_decoding=md.use_spec_decoding,
+        is_spec_dec_tree=md.is_spec_dec_tree,
+        spec_decoding_generation_lengths=md.spec_decoding_generation_lengths,
+        spec_decoding_position_offsets_for_cpp=md.spec_decoding_position_offsets_for_cpp,
+        spec_decoding_packed_mask=md.spec_decoding_packed_mask,
+        spec_decoding_bl_tree_mask_offset=md.spec_decoding_bl_tree_mask_offset,
+        spec_decoding_bl_tree_mask=md.spec_decoding_bl_tree_mask,
+        spec_decoding_target_max_draft_tokens=md.max_total_draft_tokens,
+        force_prepare_spec_dec_tree_mask=md.force_prepare_spec_dec_tree_mask,
+        spec_bl_tree_first_sparse_mask_offset_kv=md.spec_bl_tree_first_sparse_mask_offset_kv,
+        num_sparse_topk=md.num_sparse_topk,
+        flash_mla_tile_scheduler_metadata=md.flash_mla_tile_scheduler_metadata,
+        flash_mla_num_splits=md.flash_mla_num_splits,
+        num_contexts=nc,
+        num_ctx_tokens=nct,
+        max_context_length=md.max_context_length,
+        max_seq_len=md.max_seq_len,
+        trtllm_gen_jit_warmup=md.trtllm_gen_jit_warmup,
+        is_cross=md.is_cross,
+    )
+
+
+def _rope_args(md: Any, cache: Any, nc: int) -> dict:
+    """mla_rope_generation's metadata arguments of one step: what the rope call reads."""
+    return dict(
+        sequence_length=md.kv_lens_cuda_runtime,
+        host_past_key_value_lengths=md.kv_lens_runtime,
+        host_context_lengths=md.prompt_lens_cpu_runtime,
+        num_contexts=nc,
+        kv_cache_block_offsets=md.kv_cache_block_offsets,
+        host_kv_cache_pool_pointers=cache.kv_cache_pool_pointers,
+        host_kv_cache_pool_mapping=cache.kv_cache_pool_mapping,
+        block_ids_per_seq=md.block_ids_per_seq,
+        helix_tensor_params=[md.helix_position_offsets, md.helix_is_inactive_rank],
+        residual_dim=getattr(cache, "mla_kv_cache_residual_dim", 0),
+        tokens_per_block=cache.tokens_per_block,
+        attention_window_size=int(md.max_seq_len),
+        beam_width=md.beam_width,
+    )
+
+
+def _dsa_step_args(md: Any, pools: _DsaPools, num_tokens: int, nc: int, nct: int, ng: int):
+    """Project the DSA metadata onto this step's ``_DsaStep``, once per forward.
+
+    ``nc`` / ``nct`` are 0 on a decode step (the decode target states them). The routing refuses
+    ragged verification, so every generation request carries ``next_n`` rows and the MLA ops take
+    the request-major presentation.
+    """
+    assert not md.is_ragged_verify, "cep runs uniform verify blocks only"
+    num_gen_rows = num_tokens - nct
+    next_n = num_gen_rows // ng if ng else 1
+    req_idx_gen = md.req_idx_per_token[nct:num_tokens]
+    sparse = _sparse_args(md, nc, nct)
+    return _DsaStep(
+        next_n=next_n,
+        skip_gen=bool(md.skip_indexer_for_gen_reqs),
+        skip_ctx=bool(md.skip_indexer_for_ctx_reqs),
+        slot_fp8=md.slot_mapping_fp8,
+        slot_scale=md.slot_mapping_scale,
+        ctx_lens=md.gen_indexer_kv_lens_cuda_runtime,
+        block_table=md.indexer_k_cache_block_offsets[nc : nc + ng],
+        sched=md.scheduler_metadata_buffer,
+        max_len=int(md.get_indexer_max_seq_len()),
+        gen_kv_lens=md.kv_lens_cuda_runtime[nc : nc + ng],
+        # A rank reads only the Top-K rows its indexer scored, which the indexer writes whole (-1
+        # past a short window): the buffer is left uninitialized, where get_empty without graph
+        # buffers zero-fills it.
+        topk_out=(
+            torch.empty(
+                (num_tokens, _DSA_TOPK), dtype=torch.int32, device=md.req_idx_per_token.device
+            )
+            if md.cuda_graph_buffers is None
+            else md.get_empty(
+                md.cuda_graph_buffers,
+                (num_tokens, _DSA_TOPK),
+                cache_name=_DSA_TOPK_OUT,
+                dtype=torch.int32,
+                capture_graph=md.is_cuda_graph,
+            )
+        ),
+        topk_dense=md.topk_indices_buffer,
+        radix_aux_indices=md.radix_aux_indices,
+        radix_aux_logits=md.radix_aux_logits,
+        req_idx_ctx=md.req_idx_per_token[:nct],
+        req_idx_gen=req_idx_gen - nc if nc else req_idx_gen,
+        block_table_ctx=md.block_table[:nc],
+        block_table_gen=md.block_table[nc : nc + ng],
+        tokens_per_block=pools.tokens_per_block,
+        chunks=md.indexer_prefill_chunks if nct else None,
+        cu_ks=md.cu_seqlen_ks[:nct] if nct else None,
+        cu_ke=md.cu_seqlen_ke[:nct] if nct else None,
+        num_ctx_kv_tokens=int(md.num_ctx_kv_tokens) if nct else 0,
+        # The metadata sets these only in a step with context requests (the indexer's prefill
+        # plan): a generation server's metadata never has them.
+        k_slot_fp8=md.slot_mapping_fp8_fullkv if nct else None,
+        k_slot_scale=md.slot_mapping_scale_fullkv if nct else None,
+        rope_gen=_rope_args(md, md.kv_cache_manager, nc),
+        sparse_gen=sparse,
+        sparse_ctx=sparse,
+    )
+
+
+def _layer_views(core: Any) -> tuple[_LayerW, ...]:
+    """Read every layer's weight views off the realized parameters, once.
+
+    Views only: ``w1_rows`` declares every parameter in the layout and dtype its kernel reads
+    (the fused KDA projection), so nothing here copies or re-points a parameter.
+    """
+    d = core.dims
+    w = core.w
+    kda_layers, mla_layers = set(d.kda_layers), set(d.mla_layers)
+    moe_layers, dense_layers = set(d.moe_layers), set(d.dense_layers)
+    views = []
+    for i in range(d.num_layers):
+
+        def p(name: str, i: int = i) -> torch.Tensor:
+            return w[f"l{i}_{name}"]
+
+        mla = None
+        if i in mla_layers:
+            kv_b = p("mla_kv_b")
+            k_rows = d.mla_heads * d.nope
+            mla = _MlaW(
+                q_a_norm=p("mla_q_a_norm"),
+                kv_a_norm=p("mla_kv_a_norm"),
+                q_b=p("mla_q_b"),
+                g=p("mla_g"),
+                o=p("mla_o"),
+                idx_wk_wp=p("mla_idx_wk_wp"),
+                idx_k_norm_w=p("mla_idx_k_norm_w"),
+                idx_k_norm_b=p("mla_idx_k_norm_b"),
+                k_b=kv_b[:k_rows].view(d.mla_heads, d.nope, d.kv_lora),
+                v_b_t=kv_b[k_rows:].view(d.mla_heads, d.v_dim, d.kv_lora).transpose(1, 2),
+                qkv_a_t=p("mla_qkv_a").t(),
+                idx_wq_b_t=p("mla_idx_wq_b").t(),
+            )
+        kda = None
+        if i in kda_layers:
+            kda = _KdaW(
+                layer=i,
+                qkvgfab_w=p("kda_qkvgfab_w"),
+                qkvgfab_s=p("kda_qkvgfab_s"),
+                fb=p("kda_fb"),
+                o_w=p("kda_o_w"),
+                o_s=p("kda_o_s"),
+                conv=p("kda_conv"),
+                a_log=p("kda_a_log"),
+                dt_bias=p("kda_dt_bias"),
+                o_norm=p("kda_o_norm"),
+            )
+        moe = None
+        if i in moe_layers:
+            moe = _MoeW(**{f: p(f"moe_{f}") for f in _MOE_PARAMS}, **_moe_routing(core, i))
+        dense = (
+            _DenseW(**{f: p(f"dense_{f}") for f in _DenseW._fields}) if i in dense_layers else None
+        )
+        views.append(
+            _LayerW(
+                kda=kda,
+                mla=mla,
+                moe=moe,
+                dense=dense,
+                pre=_MixW(p("attn_res_proj").view(-1), p("attn_res_norm"), p("attn_norm")),
+                mid=_MixW(p("mlp_res_proj").view(-1), p("mlp_res_norm"), p("mlp_norm")),
+                boundary=i % d.attn_res_block == 0,
+                n_bank=-(-i // d.attn_res_block),
+            )
+        )
+    return tuple(views)
+
+
+def _moe_resident_plan(ids: torch.Tensor) -> tuple:
+    """No load balancer: the routed ids are the logical experts."""
+    return ids, RESIDENT_PLAN
+
+
+def _moe_no_finish(plan: Any) -> None:
+    return None
+
+
+def _moe_no_record(ids: torch.Tensor, slots: torch.Tensor) -> None:
+    return None
+
+
+def _moe_routing(core: Any, i: int) -> dict:
+    """Layer ``i``'s routed window and plan closures (``_MoeW``'s derived fields): its own
+    experts without a load balancer, else its EPLB layer's slots and replica plans."""
+    d = core.dims
+    handle = None if core.eplb is None else core.eplb[i]
+    if handle is None:
+        return dict(
+            expert_offset=d.expert_offset,
+            num_experts=_K31["num_experts"],
+            plan=_moe_resident_plan,
+            finish=_moe_no_finish,
+            record=_moe_no_record,
+        )
+    slots = int(handle.compute_slots_per_rank)
+    router = core.replica_routers.get(i)
+    return dict(
+        expert_offset=d.moe_ep_rank * slots,
+        num_experts=slots * d.moe_ep,
+        plan=functools.partial(rubin_moe_replica_route, handle) if router is None else router.plan,
+        finish=handle.finish_replica_plan if router is None else router.finish,
+        record=functools.partial(core.balance_log.record, handle.layer_idx),
+    )
+
+
+def _head_view(core: Any) -> _HeadW:
+    """Read the model's own weights off the realized parameters, once."""
+    d = core.dims
+    w = core.w
+    return _HeadW(
+        embed=w["embed"],
+        out=_MixW(w["out_res_proj"].view(-1), w["out_res_norm"], w["final_norm"]),
+        n_bank=-(-d.num_layers // d.attn_res_block),
+    )
+
+
+def _identity_rope_table(positions: int, rope_dim: int, device: Any) -> torch.Tensor:
+    """The MLA kernels' RoPE table with cos 1, sin 0 everywhere: the rotation is a copy.
+
+    The layout of the engine's ``create_rope_const_params`` for ``rope_gpt_neox`` with
+    ``duplicate_data``: FP32 ``[1, positions * rope_dim * 2]``, (cos, sin) pairs.
+    """
+    table = torch.zeros(1, positions * rope_dim * 2, dtype=torch.float32, device=device)
+    table.view(-1, 2)[:, 0] = 1.0
+    return table
+
+
+def _mix_slots(c: Any, eps: float) -> dict[str, Callable]:
+    """The attention-residual slots of one server role (``c`` = ``_CONSTANTS[role]``).
+
+    The row count picks the kernel, in this order: the PDL kernel up to
+    ``attn_res_pdl_max_m`` rows, then (split topology) the persistent kernel above 32 rows, then
+    the per-token kernel, then the unfused mix and norm. With ``fuse_moe_residual`` a MoE output
+    joins the residual in one kernel: inside the PDL mix up to ``attn_res_pdl_max_m`` rows, else
+    ``rubin_moe_residual_add`` before the mix (the deferred MoE residual update).
+    """
+    pdl_max_m = c["attn_res_pdl_max_m"] if c.get("attn_res_pdl") == 2 else 0
+    persistent = c["attn_res_topology"] == 1
+    fused_max = _FUSED_MAX_ROWS[c["attn_res_topology"]]
+    fuse_moe_residual = bool(c.get("fuse_moe_residual", False))
+
+    def use_persistent(rows: int, k: int) -> bool:
+        return persistent and rows > _FUSED_MAX_ROWS[1] and k + 1 <= _PERSISTENT_MAX_CANDIDATES
+
+    def rms_norm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        return flashinfer_rmsnorm(x, weight, eps)
+
+    def attn_res_mix(prefix: torch.Tensor, bank: torch.Tensor, mw: _MixW) -> torch.Tensor:
+        rows, hidden = prefix.shape
+        k = bank.shape[0]
+        out = torch.empty_like(prefix) if rows > _ATTN_RES_OP_MAX_TOKENS else None
+        for lo in range(0, rows, _ATTN_RES_OP_MAX_TOKENS):
+            hi = min(rows, lo + _ATTN_RES_OP_MAX_TOKENS)
+            mix = attn_res_fwd(
+                prefix[lo:hi].reshape(hi - lo, 1, hidden),
+                bank[:, lo:hi].reshape(k, hi - lo, 1, hidden),
+                mw.proj,
+                mw.res_norm,
+                eps,
+            )[0].view(hi - lo, hidden)
+            if out is None:
+                return mix
+            out[lo:hi] = mix
+        return out
+
+    def attn_res_norm(prefix: torch.Tensor, bank: torch.Tensor, mw: _MixW) -> torch.Tensor:
+        rows, hidden = prefix.shape
+        k = bank.shape[0]
+        if k == 0:
+            return rms_norm(prefix, mw.out_norm)
+        if rows <= pdl_max_m:
+            return rubin_attn_res_rmsnorm(
+                prefix, bank, mw.proj, mw.res_norm, mw.out_norm, eps, eps, early_trigger=False
+            )
+        if use_persistent(rows, k):
+            return rubin_attn_res_add_rmsnorm_persistent(
+                prefix.view(rows, 1, hidden),
+                None,
+                bank.view(k, rows, 1, hidden),
+                mw.proj,
+                mw.res_norm,
+                mw.out_norm,
+                eps,
+                eps,
+            )[1].view(rows, hidden)
+        if rows <= fused_max:
+            return attn_res_rmsnorm_fwd(
+                prefix.view(rows, 1, hidden),
+                bank.view(k, rows, 1, hidden),
+                mw.proj,
+                mw.res_norm,
+                mw.out_norm,
+                eps,
+                eps,
+            ).view(rows, hidden)
+        return rms_norm(attn_res_mix(prefix, bank, mw), mw.out_norm)
+
+    def add_norm(prefix: torch.Tensor, addend: torch.Tensor, bank: torch.Tensor, mw: _MixW):
+        """``(prefix + addend, normed mix)``: the sum rounds to BF16 as a torch add does."""
+        rows, hidden = prefix.shape
+        k = bank.shape[0]
+        if k and rows <= pdl_max_m:
+            return rubin_attn_res_add_rmsnorm(
+                prefix,
+                addend,
+                bank,
+                mw.proj,
+                mw.res_norm,
+                mw.out_norm,
+                eps,
+                eps,
+                early_trigger=False,
+            )
+        if k and use_persistent(rows, k):
+            updated, normed = rubin_attn_res_add_rmsnorm_persistent(
+                prefix.view(rows, 1, hidden),
+                addend.view(rows, 1, hidden),
+                bank.view(k, rows, 1, hidden),
+                mw.proj,
+                mw.res_norm,
+                mw.out_norm,
+                eps,
+                eps,
+            )
+            return updated.view(rows, hidden), normed.view(rows, hidden)
+        if k and rows <= fused_max:
+            updated, normed = attn_res_add_rmsnorm_fwd(
+                prefix.view(rows, 1, hidden),
+                addend.view(rows, 1, hidden),
+                bank.view(k, rows, 1, hidden),
+                mw.proj,
+                mw.res_norm,
+                mw.out_norm,
+                eps,
+                eps,
+            )
+            return updated.view(rows, hidden), normed.view(rows, hidden)
+        updated = prefix + addend
+        return updated, attn_res_norm(updated, bank, mw)
+
+    def moe_add(prefix: torch.Tensor, m: _MoeOut) -> torch.Tensor:
+        """``bf16(prefix + bf16(routed + shared))``: two round-to-nearest adds either way."""
+        if fuse_moe_residual:
+            return rubin_moe_residual_add(m.routed, m.shared, prefix)
+        return prefix + (m.routed + m.shared)
+
+    def moe_norm(prefix: torch.Tensor, m: _MoeOut, bank: torch.Tensor, mw: _MixW):
+        """``(prefix + bf16(routed + shared), normed mix)``."""
+        if fuse_moe_residual and bank.shape[0] and prefix.shape[0] <= pdl_max_m:
+            return rubin_attn_res_moe_add_rmsnorm(
+                prefix,
+                m.routed,
+                m.shared,
+                bank,
+                mw.proj,
+                mw.res_norm,
+                mw.out_norm,
+                eps,
+                eps,
+                early_trigger=False,
+            )
+        updated = moe_add(prefix, m)
+        return updated, attn_res_norm(updated, bank, mw)
+
+    def moe_norm_mx(prefix: torch.Tensor, m: _MoeOut, bank: torch.Tensor, mw: _MixW):
+        """``moe_norm`` with the normed rows' MXFP8 form: ``(prefix, (normed, codes, scales))``.
+
+        In the PDL kernel, up to one scale tile: the codes and R128c4 scales are the catalog
+        quantizer's (what the projection's ``rubin_mxfp8_linear`` makes of the rows), so the KDA
+        projection multiplies them without its quantization kernel. Elsewhere ``moe_norm``.
+        """
+        rows = prefix.shape[0]
+        if fuse_moe_residual and bank.shape[0] and rows <= min(pdl_max_m, _MX_TILE_ROWS):
+            updated, normed, codes, scales = rubin_attn_res_moe_add_rmsnorm_mx(
+                prefix,
+                m.routed,
+                m.shared,
+                bank,
+                mw.proj,
+                mw.res_norm,
+                mw.out_norm,
+                eps,
+                eps,
+                False,  # entry_trigger
+                True,  # mx_atom: one 128-row tile's atoms are its R128c4 scales
+                1,  # mx_atom_blocks
+                early_trigger=False,
+                mx_exact=True,
+            )
+            return updated, (normed, codes, scales)
+        return moe_norm(prefix, m, bank, mw)
+
+    return dict(
+        rms_norm=rms_norm,
+        attn_res_mix=attn_res_mix,
+        attn_res_norm=attn_res_norm,
+        add_norm=add_norm,
+        moe_add=moe_add,
+        moe_norm=moe_norm,
+        moe_norm_mx=moe_norm_mx,
+    )
+
+
+def _whole(out: torch.Tensor) -> torch.Tensor:
+    """A block's output on this rank's rows: already whole (every head ran on the rows)."""
+    return out
+
+
+def _moe_no_forward() -> None:
+    return None
+
+
+def _moe_begin(cadence: Any, log: Any) -> None:
+    """A forward's start under a replan cadence: whether it replans, then the load record."""
+    cadence.begin()
+    log.begin_forward()
+
+
+def _build_runtime(core: Any) -> _Rt:
+    """Build the runtime resources: streams, events, the norm slots, the RoPE table.
+
+    No slot reduces: every block returns this rank's rows whole. The MoE's workspace (the
+    all-to-all's or MegaMoE's, ``core.moe_backend``) is built here, a collective over the EP group;
+    ``DraftModel.bind_runtime`` sets ``rt.draft``.
+    """
+    c = _CONSTANTS[core.role]
+    d = core.dims
+    mix = _mix_slots(c, core.eps)
+    # weights.py's ``dims`` keeps layer 0's MLP whole on every rank.
+    assert d.dense_inter == _K31["intermediate_size"], d.dense_inter
+    s = core.streams
+    cfg = core.model_config
+    a2a = megamoe = None
+    if core.moe_backend == "megamoe_cutedsl":
+        # MegaMoE's buffers over the EP group, the whole world (collective): every ladder bucket up
+        # to one rank's rows of the largest step (ceil(min(max_num_tokens, moe_max_num_tokens) /
+        # N)), the top bucket a whole step's rows (one launch per layer; a larger step launches in
+        # chunks of it). The generation kernel's token-path levers stay at their defaults.
+        megamoe = rubin_megamoe_workspace(
+            megamoe_ep_group(cfg.mapping),
+            d.moe_ep_rank,
+            d.moe_ep,
+            d.local_experts,
+            d.latent,
+            d.moe_inter,
+            core.moe_rows,
+            core.moe_rows,
+            core.w["embed"].device,
+        )
+    if core.moe_backend == "cutedsl":
+        # The all-to-all's workspace over the EP group (collective): up to one rank's rows of the
+        # largest step (ceil(max_num_tokens / N)), the NVFP4 latent out and the BF16 latent back
+        # (FP8 on the wire, BF16 when moe_config.use_low_precision_moe_combine is false;
+        # get_model_defaults sets it true where the arguments leave it out), and the engine's
+        # counted-write rule (the MoE block runs the same).
+        a2a = rubin_moe_a2a_workspace(
+            cfg.mapping,
+            num_experts=core.routed_ids,
+            top_k=_K31["num_experts_per_token"],
+            max_num_tokens_per_rank=core.moe_rows,
+            hidden_size=d.latent,
+            dtype=torch.bfloat16,
+            use_low_precision_combine=bool(cfg.use_low_precision_moe_combine),
+            force_cft=None,
+        )
+    moe_comm = _MoeComm(
+        latent_stream=s.latent,
+        memset_stream=s.memset,
+        **{f: torch.cuda.Event() for f in _MoeComm._fields[2:]},
+    )
+    balanced = _idx_split(core.model_config) == "balanced"
+    kc = _kda_cp(d.cp)
+    return _Rt(
+        dsa_pools=_DsaPools(
+            d.mla_layers,
+            core.rope_positions,
+            1 if core.role == "context" else None,
+            balanced,
+            _new_rows(core.model_config),
+        ),
+        mla_rope=_identity_rope_table(core.rope_positions, d.rope, core.w["embed"].device),
+        aux_stream=s.aux,
+        fork_stream=s.fork,
+        idx_stream=s.idx,
+        events=(
+            (torch.cuda.Event(), torch.cuda.Event()),  # _EV_ATTN
+            (torch.cuda.Event(), torch.cuda.Event()),  # _EV_IDX
+        ),
+        attn_res_norm=mix["attn_res_norm"],
+        add_norm=mix["add_norm"],
+        moe_norm=mix["moe_norm"],
+        moe_norm_mx=mix["moe_norm_mx"],
+        reduce_norm=mix["add_norm"],
+        attn_res_mix=mix["attn_res_mix"],
+        rms_norm=mix["rms_norm"],
+        moe_add=mix["moe_add"],
+        reduce=_whole,
+        moe_comm=moe_comm,
+        a2a=a2a,
+        megamoe=megamoe,
+        moe_forward=(
+            (_moe_no_forward, _moe_no_forward)
+            if core.balance_log is None
+            else (
+                core.balance_log.begin_forward
+                if core.replica_cadence is None
+                else functools.partial(_moe_begin, core.replica_cadence, core.balance_log),
+                core.balance_log.end_forward,
+            )
+        ),
+        moe_rows=core.moe_rows,
+        moe_ctx=_MOE_CTX[(core.moe_backend, core.shared_overlap)],
+        cp_mapping=cfg.mapping,
+        cp_group=tuple(cfg.mapping.cp_group),
+        kda_cp=kc,
+        cp_push=rubin_cp_push_workspace(
+            cfg.mapping, _cp_push_region(core.kda_split, int(cfg.max_num_tokens), d.cp, kc)
+        ),
+        cp_fence=torch.zeros(3 * d.cp, dtype=torch.int32, device=core.w["embed"].device),
+        draft=None,
+    )
+
+
+# --------------------------------------------------------------------------------------------------
+# KDA: a KDA layer's context prefill (cep), the shared pieces; the block is ``kda_prefill`` in
+# the context parallelism section.
+#
+# The fused ``[q | k | v | g | f_a | b]`` projection (one MXFP8 GEMM, the checkpoint's
+# ``in_proj_qkvgfab``) and the BF16 ``f_b`` GEMM on its ``f_a`` columns run on this rank's rows with
+# whole weights; the gated delta rule of this rank's 96 / N heads runs on the cache manager's FP32
+# state pool over every row (the fused short convolution and the BT16 chunked prefill with its
+# mid-chunk snapshots); the gated output RMSNorm (the token-major kernel) and the MXFP8 ``o_proj``
+# GEMM run on this rank's rows over all 96 heads.
+#
+# Reads of the layer view (``st.cache.mamba_layer_cache(L.layer)``): ``conv`` and ``temporal`` (this
+# rank's 96 / N heads: the cache manager shards the state over the Ulysses group as over TP N);
+# ``commit_conv_window`` where the view
+# has replay caches (a disaggregated context server's has none).
+# --------------------------------------------------------------------------------------------------
+
+# This rank's KDA heads (K = V = head_dim).
+_KDA_H = _K31_KDA["num_heads"] // _KDA_TP
+_KDA_D = _K31_KDA["head_dim"]
+_KDA_P = _KDA_H * _KDA_D
+# Columns of the fused projection: q, k, v, g (P each), f_a (head_dim), b (heads), zero padding.
+_KDA_G0 = 3 * _KDA_P
+_KDA_FA0 = 4 * _KDA_P
+_KDA_B0 = _KDA_FA0 + _KDA_D
+_KDA_B1 = _KDA_B0 + _KDA_H
+_KDA_LOWER_BOUND = _K31_KDA["gate_lower_bound"]
+_KDA_EPS = _K31["rms_norm_eps"]
+_KDA_SCALE = _KDA_D**-0.5
+# Read from the logged constant table, so that the log states what runs.
+_KDA_PREFILL_MODE = _CONSTANTS["context"]["kda_prefill"]
+# The hand-off computes each lead's chunk factors before its rounds (``kda_handoff_layer``'s
+# ``prep_ahead``): the serial chain keeps only the state recursions; the same bits.
+_KDA_HANDOFF_PREP_AHEAD = _CONSTANTS["context"]["kda_handoff_prep_ahead"]
+
+
+def _kda_project(
+    L: _KdaW, x: torch.Tensor, mx: tuple[torch.Tensor, torch.Tensor] | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the fused projection ``y`` [rows, N] and the forget-gate logits [rows, P].
+
+    ``mx``: the MXFP8 form of ``x`` (codes, R128c4 scales) when the mix stored it.
+    """
+    if mx is None:
+        y = rubin_mxfp8_linear(x, L.qkvgfab_w, L.qkvgfab_s)
+    else:
+        y = rubin_mxfp8_gemm(mx[0], L.qkvgfab_w, mx[1], L.qkvgfab_s)
+    # F.linear reads the f_a columns through their row stride, so nothing is copied.
+    g = rubin_linear(y[:, _KDA_FA0:_KDA_B0], L.fb, False)
+    return y, g
+
+
+def _kda_heads(y: torch.Tensor, col: int) -> torch.Tensor:
+    """Columns ``[col, col + P)`` of ``y`` as a ``[1, rows, H, D]`` view."""
+    return y[:, col : col + _KDA_P].unflatten(1, (_KDA_H, _KDA_D)).unsqueeze(0)
+
+
+def _kda_beta(y: torch.Tensor) -> torch.Tensor:
+    """The beta logits as a ``[1, rows, H]`` view."""
+    return y[:, _KDA_B0:_KDA_B1].unsqueeze(0)
+
+
+def _kda_snapshot_windows(y: torch.Tensor, conv_pool: torch.Tensor, snap: Any) -> None:
+    """Store the raw conv window that ends before each snapshot point into its pool slot."""
+    width = conv_pool.shape[-1]
+    offsets = torch.arange(-width, 0, device=y.device)
+    tokens = (snap.token_indices[:, None] + offsets).reshape(-1)
+    rows = y[:, : conv_pool.shape[1]].index_select(0, tokens)
+    windows = rows.view(snap.num_snapshots, width, -1).transpose(1, 2)
+    conv_pool.index_copy_(0, snap.slots, windows.to(conv_pool.dtype))
+
+
+def _kda_commit_window(lc: Any, slots: torch.Tensor, conv: torch.Tensor) -> None:
+    """Copy the live conv windows of ``slots`` into the view's replay caches, where it has them.
+
+    Read as the engine's KDA mixer reads it: only a ``KDAReplayLayerCache`` has
+    ``has_kda_replay_caches``. A disaggregated context server keeps no replay state; its
+    generation server seeds the replay caches from the transferred conv state.
+    """
+    if getattr(lc, "has_kda_replay_caches", False):
+        lc.commit_conv_window(slots, conv)
+
+
+# --------------------------------------------------------------------------------------------------
+# MLA + DSA (cep): the 24 DSA layers' projections, indexer, sparse MLA and output gate, the shared
+# pieces; the block is ``mla_prefill`` in the context parallelism section.
+#
+# Every K3.1 MLA layer is a DSA layer, and both its attention and its indexer are NoPE: the MLA
+# kernels read the identity RoPE table ``rt.mla_rope`` and the indexer rotates nothing
+# (``index_rope_dim`` 0). On this rank's rows: ``[q_a | kv_a]`` (``cublas_mm``), the two RMSNorms,
+# ``q_b`` (``rubin_linear``); the indexer's ``wq_b`` (``cublas_mm``) and FP32 ``[wk | weights_proj]``
+# with TF32 (``rubin_linear``, its input widened by ``rubin_upcast_fp32``), the key LayerNorm, the
+# two FP8 cat-quantizations and the weight scaling; after the attention the output gate
+# ``attn * sigmoid(g_proj(x))`` and ``o_proj`` (``rubin_linear``). The absorbed sparse MLA runs at
+# 128 heads (pad128): the query and its RoPE columns are padded with zero heads
+# (``rubin_pad_heads``), so TRTLLM-Gen runs its Q64 KeepsAb kernels, and the padding heads' outputs
+# are dropped. With ``mla_ctx_wuk_fp8`` W_UK writes the FP8 query in its epilogue
+# (``rubin_mla_ctx_wuk_fp8``, no BF16 query); with ``mla_ctx_gate_in_wuv`` W_UV applies the output
+# gate in its epilogue (``rubin_mla_wuv_gate``) and ``o_proj`` reads its rows.
+# --------------------------------------------------------------------------------------------------
+
+# MLA shape (_K31): per head 128 NoPE + 64 RoPE query / key columns, 128 values; the latent
+# row is kv_lora + rope wide.
+_MLA_Q_LORA = _K31["q_lora_rank"]
+_MLA_KV_LORA = _K31["kv_lora_rank"]
+_MLA_ROPE = _K31["qk_rope_head_dim"]
+_MLA_NOPE = _K31["qk_nope_head_dim"]
+_MLA_V = _K31["v_head_dim"]
+_MLA_QK = _MLA_NOPE + _MLA_ROPE
+_MLA_LATENT = _MLA_KV_LORA + _MLA_ROPE
+_MLA_EPS = _K31["rms_norm_eps"]  # q_a_layernorm, kv_a_layernorm
+# cep: all 96 query heads on this rank's rows, also o_proj's input heads.
+_MLA_HEADS = _MLA_QUERY_HEADS
+_MLA_OUT_HEADS = _MLA_QUERY_HEADS
+# The context call's head count (pad128); the padding buffers are cleared in 64-element rows.
+_MLA_PAD_HEADS = 128
+_MLA_PAD_ROW = 64
+# W_UK writes the context call's FP8 query in its epilogue (mla_ctx_wuk_fp8): see _mla_ctx_query.
+_MLA_CTX_WUK_FP8 = bool(_CONSTANTS["context"]["mla_ctx_wuk_fp8"])
+# W_UV applies the output gate in its epilogue (mla_ctx_gate_in_wuv): see mla_prefill.
+_MLA_CTX_GATE_IN_WUV = bool(_CONSTANTS["context"]["mla_ctx_gate_in_wuv"])
+# AttentionInputType of the attention op's two calls.
+_MLA_CONTEXT = 1
+_MLA_GENERATION = 2
+
+# The DSA indexer (_K31_DSA): 32 heads x 128, position-free, Top-2048.
+_IDX_HEADS = _K31_DSA["index_num_heads"]
+_IDX_DIM = _K31_DSA["index_head_dim"]
+_IDX_HALF = _IDX_DIM // 2  # the cat-quantization takes two halves of each head
+_IDX_TOPK = _K31_DSA["index_topk"]
+_IDX_K_NORM_EPS = _K31["rms_norm_eps"]  # index_k_norm_eps (_check_build ties them)
+# softmax scale x heads^-0.5, folded with the per-head query scale into the logits weights.
+_IDX_WEIGHT_SCALE = _IDX_DIM**-0.5 * _IDX_HEADS**-0.5
+#: Logged once per process by the first CUDA graph decode step: the indexer's keys and weights ran
+#: on the idx stream, beside ``[q_a | kv_a]`` (dsa_idx_fork).
+_IDX_FORK_LINE = (
+    "Kimi K3.1 Rubin DSA: indexer key / weights prologue on its own stream beside [q_a | kv_a]"
+)
+#: Logged once per process by the first CUDA graph decode step: the logits weights took the
+#: query scales and the constant in one kernel (``rubin_idx_weights``).
+_IDX_SHORT_LINE = "Kimi K3.1 Rubin DSA indexer decode: (w * qs) * scale in one kernel"
+#: Logged once per process by the first CUDA graph decode step: ``g_proj(x)`` was issued on the
+#: fork stream after q_b, off the path from the attention to ``o_proj`` (dsa_gate_early).
+_MLA_GATE_FORK_LINE = "Kimi K3.1 Rubin MLA: output gate projection on the fork stream after q_b"
+# The decode logits arena's row stride is a multiple of the DSL kernel's 256-key split.
+_IDX_LOGITS_ALIGN = 256
+# The decode logits run one atom per request: next_n x index heads within one 256-wide MMA tile.
+_IDX_DSL_MAX_ATOM_N = 256
+# The Top-K remap runs the Triton kernel from this many rows on (the C++ op below it).
+_IDX_REMAP_TRITON_ROWS = 256
+# The self-sampling GVR Top-K's deterministic kernels (ties to the smaller index).
+_IDX_GVR_DETERMINISTIC = True
+# The radix Top-K's split workspace: blocks per row.
+_IDX_RADIX_BLOCKS = 10
+
+# The attention op's layer constants for a K3.1 DSA layer: absorbed MLA over an FP8 latent cache
+# (quant_mode 128), one KV head of 576, the identity RoPE table (rope_gpt_neox, 64 dims;
+# ``_identity_rope_table``), values kv_lora wide. Unset KV scales read as 1.0 in the MLA kernels
+# (the unit scales of the FP8 cache); the MLA path reads only the cos / sin table, no inverse
+# frequencies. Skip-softmax, spcompress and sage attention are off. The query's FP8 scale
+# (quant_scale_qkv) is each call's own: the context call's FP8 query form passes one.
+_MLA_ATTN = dict(
+    k=None,
+    v=None,
+    output_sf=None,
+    out_scale=None,
+    kv_scale_orig_quant=None,
+    kv_scale_quant_orig=None,
+    rotary_inv_freq=None,
+    attention_sinks=None,
+    is_fused_qkv=False,
+    update_kv_cache=True,
+    predicted_tokens_per_seq=1,
+    num_heads=_MLA_HEADS,
+    num_kv_heads=1,
+    head_size=_MLA_LATENT,
+    mask_type=1,
+    quant_mode=128,
+    q_scaling=1.0,
+    position_embedding_type=2,
+    rope_dim=_MLA_ROPE,
+    rope_base=10000.0,
+    rope_scale_type=0,
+    rope_scale=1.0,
+    rope_short_m_scale=1.0,
+    rope_long_m_scale=1.0,
+    is_mla_enable=True,
+    chunked_prefill_buffer_batch_size=1,
+    q_lora_rank=_MLA_Q_LORA,
+    kv_lora_rank=_MLA_KV_LORA,
+    qk_nope_head_dim=_MLA_NOPE,
+    qk_rope_head_dim=_MLA_ROPE,
+    v_head_dim=_MLA_KV_LORA,
+    rope_append=True,
+    mrope_rotary_cos_sin=None,
+    mrope_position_deltas=None,
+    attention_chunk_size=None,
+    skip_softmax_stat=None,
+    skip_correction_threshold=0.0,
+    sparse_kv_indices=None,
+    sparse_kv_offsets=None,
+    sparse_attn_offsets=None,
+    sparse_attn_indices_block_size=1,
+    sparse_attn_kv_lens=None,
+    aux_kv_cache_pool_ptr=None,
+    skip_softmax_threshold_scale_factor_prefill=0.0,
+    skip_softmax_threshold_scale_factor_decode=0.0,
+    sage_attn_num_elts_per_blk_q=0,
+    sage_attn_num_elts_per_blk_k=0,
+    sage_attn_num_elts_per_blk_v=0,
+    sage_attn_qk_int8=False,
+    dsv4_inv_rope_cos_sin_cache=None,
+    enable_dsv4_epilogue_fusion=False,
+    kv_norm_weight=None,
+    kv_norm_eps=1e-6,
+    cross_kv=None,
+    relative_attention_bias=None,
+    relative_attention_max_distance=0,
+    # MLA presents its query separately: the context FMHA is not paged, whatever the step's
+    # metadata says.
+    use_paged_context_fmha=False,
+)
+# The context call at 128 heads.
+_MLA_ATTN_PAD128 = dict(_MLA_ATTN, num_heads=_MLA_PAD_HEADS)
+# The RoPE kernel's layer constants (the same layer, the same table).
+_MLA_ROPE_GEN = dict(
+    kv_scale_orig_quant=None,
+    kv_scale_quant_orig=None,
+    kv_cache_scale_orig_quant=None,
+    out_scale=None,
+    predicted_tokens_per_seq=1,
+    num_heads=_MLA_HEADS,
+    num_kv_heads=1,
+    head_size=_MLA_LATENT,
+    quant_mode=128,
+    q_scaling=1.0,
+    q_lora_rank=_MLA_Q_LORA,
+    kv_lora_rank=_MLA_KV_LORA,
+    qk_nope_head_dim=_MLA_NOPE,
+    qk_rope_head_dim=_MLA_ROPE,
+    v_head_dim=_MLA_KV_LORA,
+    rope_append=True,
+)
+
+
+def _mla_project(L: _MlaW, x: torch.Tensor, st: _Step, rt: _Rt) -> tuple:
+    """``[q_a | kv_a]`` and the two RMSNorms on every row of ``x``: (normed q_a, latent row).
+
+    On graph steps kv_a's norm runs on the side stream beside q_a's.
+    """
+    q_a, ckv, k_pe = cublas_mm(x, L.qkv_a_t).split([_MLA_Q_LORA, _MLA_KV_LORA, _MLA_ROPE], -1)
+    if st.cuda_graph:
+        fork, join = rt.events[_EV_ATTN]
+        main = torch.cuda.current_stream()
+        fork.record()
+        qr = flashinfer_rmsnorm(q_a, L.q_a_norm, _MLA_EPS)
+        with torch.cuda.stream(rt.aux_stream):
+            fork.wait()
+            ckv = flashinfer_rmsnorm(ckv, L.kv_a_norm, _MLA_EPS)
+            join.record()
+        join.wait()
+        if not torch.cuda.is_current_stream_capturing():
+            ckv.record_stream(main)
+    else:
+        qr = flashinfer_rmsnorm(q_a, L.q_a_norm, _MLA_EPS)
+        ckv = flashinfer_rmsnorm(ckv, L.kv_a_norm, _MLA_EPS)
+    return qr, torch.cat([ckv, k_pe], -1)
+
+
+def _widen_fp32(x: torch.Tensor) -> torch.Tensor:
+    """``x.float()``, the same bits: ``rubin_upcast_fp32`` on a contiguous ``x``, else the cast.
+
+    ``rubin_upcast_fp32`` moves 16 bytes per access where torch's casting copy moves one element.
+    Its users: the indexer's TF32 projection on a prefill step (a ``[rows, 7168]`` input, the
+    largest widening of the layer) and on a decode graph step (``_idx_keys``), and a generation
+    server's FP32 router (``_moe_router_input``).
+    """
+    return rubin_upcast_fp32(x) if x.is_contiguous() else x.float()
+
+
+def _idx_project(L: _MlaW, x: torch.Tensor, qr: torch.Tensor, st: _Step, rt: _Rt, xf=None) -> tuple:
+    """The indexer's FP8 queries, FP8 keys with their FP32 scales, and FP32 logits weights.
+
+    Shapes ``[rows, 32, 128]``, ``[rows, 128]`` and ``[rows, 32]``, on every row of ``x``.
+    Position-free: each head is quantized as its two halves; nothing rotates. On graph steps the
+    key quantization runs on the side stream beside the query's. ``xf``: ``x`` in FP32 (the TF32
+    projection's input) when the caller widened it, else ``x.float()`` here.
+    """
+    xf = x.float() if xf is None else xf
+    ik, w = rubin_linear(xf, L.idx_wk_wp, True).split([_IDX_DIM, _IDX_HEADS], -1)
+    ik = ik.to(x.dtype)
+    iq = cublas_mm(qr, L.idx_wq_b_t).view(-1, _IDX_HEADS, _IDX_DIM)
+    ik = rubin_layer_norm(ik, L.idx_k_norm_w, L.idx_k_norm_b, _IDX_K_NORM_EPS)
+    iq_a, iq_b = iq.split([_IDX_HALF, _IDX_DIM - _IDX_HALF], -1)
+    ik_a, ik_b = ik.split([_IDX_HALF, _IDX_DIM - _IDX_HALF], -1)
+    if st.cuda_graph:
+        fork, join = rt.events[_EV_ATTN]
+        main = torch.cuda.current_stream()
+        fork.record()
+        q8, qs = fused_cat_fp8(iq_a, iq_b, True)
+        with torch.cuda.stream(rt.aux_stream):
+            fork.wait()
+            k8, ks = fused_cat_fp8(ik_a, ik_b, True)
+            join.record()
+        join.wait()
+        if not torch.cuda.is_current_stream_capturing():
+            k8.record_stream(main)
+            ks.record_stream(main)
+    else:
+        q8, qs = fused_cat_fp8(iq_a, iq_b, True)
+        k8, ks = fused_cat_fp8(ik_a, ik_b, True)
+    qs = qs.view(-1, _IDX_HEADS, 1)
+    w = w * qs.squeeze(-1) * _IDX_WEIGHT_SCALE
+    return q8.view(-1, _IDX_HEADS, _IDX_DIM), k8, ks, w
+
+
+def _idx_insert(i: int, k8: torch.Tensor, ks: torch.Tensor, n: int, st: _Step, rt: _Rt) -> None:
+    """Insert the index keys of the step's ``n`` live rows into layer ``i``'s cache.
+
+    Once a step, before the phases split (context chunk gathers read the keys just written).
+    With sharded index keys under DKV, only the keys this rank owns, then a fence of the
+    group: the gathers read the other ranks' new keys from their caches.
+    """
+    slots = st.cp_mla.idx_slots
+    if slots is None:
+        indexer_k_cache_scatter_op(
+            k8, ks, rt.dsa_pools.idx_k_cache[i], st.dsa.slot_fp8, st.dsa.slot_scale, n
+        )
+        return
+    owned = st.cp_mla.dkv.owned_rows
+    if owned.numel():
+        indexer_k_cache_scatter_op(
+            k8.index_select(0, owned),
+            ks.index_select(0, owned),
+            rt.dsa_pools.idx_k_cache[i],
+            slots.insert_fp8,
+            slots.insert_scale,
+            owned.numel(),
+        )
+    rubin_cp_allgather(owned.new_zeros(1), rt.cp_mapping)
+
+
+def _idx_insert_owned(i: int, k8: torch.Tensor, ks: torch.Tensor, st: _Step, rt: _Rt) -> None:
+    """Insert the index keys of the new tokens this rank owns (an owner write's, in step row
+    order) into layer ``i``'s sharded cache; the owner write's fence follows."""
+    slots = st.cp_mla.idx_slots
+    if k8.shape[0]:
+        indexer_k_cache_scatter_op(
+            k8,
+            ks,
+            rt.dsa_pools.idx_k_cache[i],
+            slots.insert_fp8,
+            slots.insert_scale,
+            k8.shape[0],
+        )
+
+
+def _idx_prefill_topk(q, w, out, ks, ke, k8, ks8, meta) -> None:
+    """One query tile's prefill logits (FP8 MQA over the chunk's keys) and its Top-K into ``out``.
+
+    ``meta`` is DeepGEMM's schedule of the tile, which the step's metadata built (None: the call
+    runs without one, with the same logits). A window no wider than the Top-K takes the radix
+    kernel, as do logits outside the GVR engine's format (the engine ``TopK`` module makes the
+    same choice per call).
+    """
+    if q.shape[0] == 0 or k8.shape[0] == 0:
+        out.fill_(-1)
+        return
+    logits = fp8_mqa_logits(q, k8, ks8.reshape(-1), w, ks, ke, False, schedule_meta=meta)
+    if logits.shape[1] <= _IDX_TOPK or not (
+        logits.stride(1) == 1 and logits.stride(0) % 4 == 0 and logits.data_ptr() % 16 == 0
+    ):
+        indexer_topk_prefill(logits, ks, ke, out, _IDX_TOPK)
+    else:
+        rubin_gvr_topk_prefill(logits, ks, ke, out, _IDX_GVR_DETERMINISTIC)
+
+
+def _idx_remap(
+    i: int, topk: torch.Tensor, req_idx, block_table, st: _Step, rt: _Rt, pool_params=None
+) -> torch.Tensor:
+    """Request-local Top-K columns to latent-pool rows of layer ``i`` (the sparse MLA's indices).
+
+    ``pool_params`` (page scale, layer offset) overrides the layer's: a DKV read buffer holds one
+    layer's pages, at scale 1 and offset 0.
+    """
+    scale, layer_offset = pool_params or rt.dsa_pools.pool_params[i]
+    tpb = st.dsa.tokens_per_block
+    if topk.shape[0] >= _IDX_REMAP_TRITON_ROWS:
+        return rubin_dsa_topk_remap(
+            req_idx, block_table, topk, tpb, _IDX_TOPK, scale * tpb, layer_offset
+        )
+    return convert_req_index_to_global(
+        req_idx, block_table, topk, tpb, _IDX_TOPK, scale * tpb, layer_offset
+    )
+
+
+def _mla_absorb(L: _MlaW, q: torch.Tensor) -> tuple:
+    """The query buffer ``[rows, heads, latent]`` with W_UK applied to the NoPE columns, and q_pe.
+
+    Only the latent columns are written; the attention op (context) or the RoPE kernel
+    (generation) fills the RoPE columns.
+    """
+    q_nope, q_pe = q.view(-1, _MLA_HEADS, _MLA_QK).split([_MLA_NOPE, _MLA_ROPE], -1)
+    fused_q = q.new_empty(q.shape[0], _MLA_HEADS, _MLA_LATENT)
+    bmm_out(q_nope.transpose(0, 1), L.k_b, fused_q[..., :_MLA_KV_LORA].transpose(0, 1))
+    return fused_q, q_pe
+
+
+def _mla_expand(v_b_t: torch.Tensor, latent: torch.Tensor, out: torch.Tensor) -> None:
+    """``out[t, h] = latent[t, h] @ W_UV[h]``: the latent attention output to the value heads."""
+    bmm_out(latent.transpose(0, 1), v_b_t, out.view(-1, latent.shape[1], _MLA_V).transpose(0, 1))
+
+
+def _mla_window(i: int, st: _Step, rt: _Rt) -> int:
+    """The attention window of layer ``i``, read as the engine's attention backend reads it.
+
+    The KV cache manager V2 holds a full-context layer's window as None (only a sliding window is
+    a number); the backend then takes the metadata's ``max_seq_len`` (``TrtllmAttention.forward``).
+    The DSA layers have no sliding window, so every server gets ``max_seq_len`` here.
+    """
+    window = st.cache.max_attention_window_vec[rt.dsa_pools.local[i]]
+    return int(st.md.max_seq_len) if window is None else int(window)
+
+
+def _mla_output(
+    L: _MlaW, x: torch.Tensor, out: torch.Tensor, n: int, gate: Optional[tuple] = None
+) -> torch.Tensor:
+    """Zero the padding rows, gate with ``sigmoid(g_proj(x))`` and project: the o_proj partial.
+
+    ``gate``: ``(g_proj(x), the event recorded after it)`` from the fork stream (decode graph
+    steps, dsa_gate_early); the gate waits for that event right before it reads g. None:
+    ``g_proj(x)`` runs here.
+    """
+    if out.shape[0] > n:
+        out[n:].zero_()
+    if gate is None:
+        g = rubin_linear(x, L.g, False)
+    else:
+        g, ready = gate
+        ready.wait()
+    gated = k31_sigmoid_gate_mul(out, g)
+    return rubin_linear(gated, L.o, False)
+
+
+# --------------------------------------------------------------------------------------------------
+# MoE: the latent MoE of layers 1..92 and layer 0's dense MLP (cep: this rank's rows, MoE EP N).
+#
+# Every rank holds its ``rows`` rows of the step and the 896 / N experts of its EP window. A
+# latent-MoE layer runs:
+#
+# * the router: FP32 logits of the BF16 gate through ``dsv3_router_gemm_op``;
+# * ``latent_down`` (BF16), ``noaux_tc_op``'s top-16 and the NVFP4 input quantization;
+# * under ``CUTEDSL``: the all-to-all dispatch, the CuteDSL grouped GEMMs on this rank's experts
+#   (sort, FC1, FC2 with the finalize scatter into the combine's payload, received rows zeroed
+#   beside FC1) and the all-to-all combine, which return this rank's rows complete;
+# * under ``MEGAMOE_CUTEDSL``: MegaMoE, one persistent kernel that dispatches the rows, runs every
+#   rank's experts (FC1, SiTU, FC2) and combines them back in BF16, launched by every rank on the
+#   current stream (``_moe_megamoe``);
+# * ``routed_expert_norm`` and ``latent_up`` (BF16), and the two shared experts, whole (one MXFP8
+#   gate_up GEMM, SiTU storing the MXFP8 form of its rows (``rubin_situ_and_mul_mxfp8``), the
+#   MXFP8 down GEMM on those codes; no all-reduce).
+#
+# It returns ``_MoeOut(routed, shared)``, both whole; the next mix adds them to the residual. Every
+# rank exchanges ``rows`` rows (its padding rows are zero rows, whose outputs are zero).
+#
+# Steps run in order on the current stream, except the zero of the CuteDSL output's received rows
+# on ``moe_comm.memset_stream`` beside FC1. Same kernels, same bits.
+#
+# MegaMoE waits inside the kernel for every EP rank's launch. Nothing that waits on another rank
+# runs beside it: the work on the side streams during the MoE block is the shared experts (no
+# cross-rank wait) and the DKV's copy-engine reads, and the callbacks ``dispatch_issued`` runs
+# (side-stream traffic placed in the experts' window) are issued after the MegaMoE launch, so
+# they start after it. A collective of the mixers (the all-to-alls, the MNNVL pushes of the KDA
+# and MLA exchanges) runs on the current stream before or after the block, never beside MegaMoE.
+# --------------------------------------------------------------------------------------------------
+
+# K3.1's MoE scalars.
+_MOE_TOP_K = _K31["num_experts_per_token"]
+_MOE_GROUPS = _K31["num_expert_group"]
+_MOE_SCALE = _K31["routed_scaling_factor"]
+_MOE_EPS = _K31["rms_norm_eps"]  # routed_expert_norm
+_MOE_SITU = (_K31["activation_situ_beta"], _K31["activation_situ_linear_beta"])
+# NVFP4 values per input block scale, and the CuteDSL experts' row tile.
+_MOE_SF_VEC = 16
+_MOE_TILE = 128
+# The expert kernels' activation (ActivationType.SiTu).
+_MOE_ACT_SITU = 9
+# The id the all-to-all around the CuteDSL experts gives a slot that routes nowhere (the
+# all-to-all's counted-write mode is _MOE_A2A_FORCE_CFT).
+_MOE_A2A_INVALID_ID = -1
+# A context server's shared experts hand down SiTU's MXFP8 form (logged constant).
+_MOE_CTX_SHARED_MX = _CONSTANTS["context"]["shared_down_mx_handoff"]
+
+
+def _moe_require(role: str, key: str, *values) -> None:
+    """Fail at import if the launch constant asks for a value this block does not run."""
+    if _CONSTANTS[role][key] not in values:
+        raise NotImplementedError(
+            f"MoE block: {role} {key}={_CONSTANTS[role][key]!r}, runs {values}"
+        )
+
+
+_moe_require("context", "router_bf16", True)
+# The MoE backends this block runs, each a ``moe_config.backend`` (``_MOE_BACKENDS``).
+_MOE_BACKENDS = MappingProxyType({"CUTEDSL": "cutedsl", "MEGAMOE_CUTEDSL": "megamoe_cutedsl"})
+if set(_CONSTANTS["context"]["moe_backend"]) != set(_MOE_BACKENDS.values()):
+    raise NotImplementedError(
+        f"MoE block: context moe_backend={_CONSTANTS['context']['moe_backend']!r}, runs "
+        f"{tuple(_MOE_BACKENDS.values())}"
+    )
+# The routing kernel that writes into MegaMoE's bucket computes noaux_tc's top-k of one group.
+if _MOE_GROUPS != 1:
+    raise NotImplementedError(
+        f"MoE block: num_expert_group={_MOE_GROUPS}; the bucket routing runs one"
+    )
+# Every row is routed: the padding-row mask of a prefill CUDA graph step is not run.
+if any(args["mask_graph_padding_rows"] for args in _MOE_ARGS.values()):
+    raise NotImplementedError("mask_graph_padding_rows is set; every row is routed here")
+
+
+def _moe_cublas_linear(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    return cublas_mm(x, w.t())
+
+
+#: The BF16 latent_down / latent_up GEMM (``latent_bf16_gemm``).
+_moe_latent_gemm = _moe_cublas_linear
+
+
+def _moe_router(L: _MoeW, x: torch.Tensor) -> torch.Tensor:
+    """FP32 logits of the BF16 router GEMM (FP32 accumulation): a context server."""
+    return dsv3_router_gemm_op(x, L.router.t(), None, torch.float32)
+
+
+def _moe_route(L: _MoeW, logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(topk_ids int32, topk_weights FP32)`` of the rows' logits: the top-16 experts."""
+    weights, ids = noaux_tc_op(
+        logits, L.router_bias, _MOE_GROUPS, _MOE_GROUPS, _MOE_TOP_K, _MOE_SCALE
+    )
+    return ids, weights
+
+
+def _moe_quantize(L: _MoeW, latent_in: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """NVFP4 values and their linear (unswizzled) block scales ``[rows, latent / 16]``."""
+    x4, sf = fp4_quantize(latent_in, L.fc31_in_scale, _MOE_SF_VEC, False, False)
+    return x4, sf.view(latent_in.shape[0], latent_in.shape[1] // _MOE_SF_VEC)
+
+
+def _moe_shared(L: _MoeW, x: torch.Tensor) -> torch.Tensor:
+    """The shared experts, whole: gate and up in one GEMM, then SiTU."""
+    h = situ_and_mul(rubin_mxfp8_linear(x, L.shared_gu_w, L.shared_gu_s), *_MOE_SITU)
+    return rubin_mxfp8_linear(h, L.shared_dn_w, L.shared_dn_s)
+
+
+def _moe_shared_ctx(L: _MoeW, x: torch.Tensor) -> torch.Tensor:
+    """A context server's shared experts: SiTU hands the down GEMM its MXFP8 operand.
+
+    Under ``_MOE_CTX_SHARED_MX`` the activation's E4M3 codes and R128c4 scales (the down
+    projection's own quantization of the BF16 rows, bit for bit) go straight into the GEMM. A rank
+    without rows keeps ``_moe_shared``.
+    """
+    if not (_MOE_CTX_SHARED_MX and x.shape[0]):
+        return _moe_shared(L, x)
+    gu = rubin_mxfp8_linear(x, L.shared_gu_w, L.shared_gu_s)
+    codes, scales = rubin_situ_and_mul_mxfp8(gu, *_MOE_SITU)
+    return rubin_mxfp8_gemm(codes, L.shared_dn_w, scales, L.shared_dn_s)
+
+
+def _moe_sort(L: _MoeW, ids: torch.Tensor, weights: torch.Tensor) -> tuple:
+    """moe_sort's six tables of this rank's window at the expert kernels' row tile."""
+    return tuple(
+        rubin_moe_sort(
+            ids, weights, L.num_experts, _MOE_TOP_K, L.expert_offset, L.fc1_w.shape[0], _MOE_TILE
+        )
+    )
+
+
+def _moe_cutedsl(L: _MoeW, x4, sf, ids, weights, out, st: _Step, rt: _Rt) -> torch.Tensor:
+    """This rank's experts through the CuteDSL grouped GEMMs into ``out`` ``[rows, latent]`` BF16.
+
+    The finalize scatter-adds into the rows of ``out`` whose routing has a pair of this rank's
+    window, the received rows: the dispatch packs each source's tokens at the front of its slot
+    block and routes the slots past them nowhere (ids -1), and the combine reads only the
+    received rows. Those rows alone are zeroed, on the memset stream beside FC1 on every step
+    (the other rows keep their contents); on an eager step ``out`` and ``ids`` are marked used
+    there.
+    """
+    c = rt.moe_comm
+    num_local = L.fc1_w.shape[0]
+    t2e, t2l, e2p, p2e, _, n = _moe_sort(L, ids, weights)
+    c.latent_fork.record()  # the fork point of the memset stream
+    if not st.cuda_graph:
+        out.record_stream(c.memset_stream)
+        ids.record_stream(c.memset_stream)
+    with torch.cuda.stream(c.memset_stream):
+        c.latent_fork.wait()
+        rubin_moe_zero_local_rows(out, ids, L.expert_offset, num_local)
+        c.memset_ready.record()
+    h, h_sf = rubin_cutedsl_fc1(
+        x4,
+        L.fc1_w,
+        sf,
+        L.fc1_s,
+        L.fc31_alpha,
+        t2e,
+        t2l,
+        p2e,
+        n,
+        L.fc2_in_scale,
+        L.num_experts,
+        _MOE_TOP_K,
+        num_local,
+        L.expert_offset,
+        _MOE_TILE,
+        _MOE_ACT_SITU,
+        *_MOE_SITU,
+    )
+    c.memset_ready.wait()
+    rubin_cutedsl_fc2_finalize(
+        h,
+        L.fc2_w,
+        h_sf,
+        L.fc2_s,
+        L.fc2_alpha,
+        out,
+        t2e,
+        t2l,
+        p2e,
+        n,
+        weights,
+        L.num_experts,
+        _MOE_TOP_K,
+        num_local,
+        L.expert_offset,
+        _MOE_TILE,
+    )
+    return out
+
+
+def _moe_routed(
+    L: _MoeW, latent_in: torch.Tensor, logits: torch.Tensor, runtime_max: int, st: _Step, rt: _Rt
+) -> torch.Tensor:
+    """The routed experts of ``latent_in`` (BF16 ``[rows, latent]``, ``rows`` padded to
+    ``runtime_max`` where a rank has none) by ``logits``: route, all-to-all, this rank's CuteDSL
+    experts, all-to-all back; returns the routed rows ``[rows, latent]`` BF16.
+
+    Under per-layer dynamic EPLB (``L.plan``) the planner runs on its copy stream beside the
+    quantization: the dispatch waits for the physical slots, the experts for every rank's helper
+    copies, and the plan is released once the experts' kernels are queued. Without it ``slots``
+    are the experts and the plan's waits are free.
+    """
+    ids, weights = _moe_route(L, logits)
+    slots, plan = L.plan(ids)
+    x4, sf = _moe_quantize(L, latent_in)
+    cft = a2a_use_cft(rt.a2a.can_use_cft, _MOE_A2A_FORCE_CFT, CFT_MAX_BATCH, runtime_max)
+    plan.wait_for_routes()
+    x4, sf, recv, weights, at, out = rubin_moe_a2a_dispatch(
+        x4,
+        sf,
+        slots,
+        weights,
+        rt.a2a,
+        runtime_max,
+        cft,
+        _MOE_A2A_INVALID_ID,
+        torch.bfloat16,
+        latent_in.shape[1],
+    )
+    dispatch_issued()
+    L.record(ids, slots)
+    plan.wait_for_helper_weights()
+    out = _moe_cutedsl(L, x4, sf, recv, weights, out, st, rt)
+    L.finish(plan)
+    return rubin_moe_a2a_combine(
+        out,
+        latent_in.shape[0],
+        rt.a2a,
+        runtime_max,
+        at,
+        True,
+        rt.a2a.use_low_precision_combine,
+        cft,
+    )
+
+
+def _moe_dep_ctx(L: _MoeW, x: torch.Tensor, st: _Step, rt: _Rt) -> _MoeOut:
+    """A context server's step: the all-to-all around this rank's CuteDSL experts.
+
+    When a rank has no rows, every rank pads to the step's largest count before the collective (as
+    the engine does, so that no rank runs the quantization on zero rows ahead of it): a rank with
+    rows pads its router logits and latent with zero rows after the two GEMMs, a rank without
+    rows runs them on zero rows. The padded rows' outputs are dropped.
+    """
+    rows, runtime_max = x.shape[0], max(st.all_rank_num_tokens)
+    pad = runtime_max - rows if 0 in st.all_rank_num_tokens else 0
+    xg = x.new_zeros(pad, x.shape[1]) if pad and not rows else x
+    logits = _moe_router(L, xg)
+    latent_in = _moe_latent_gemm(xg, L.latent_down)
+    if pad and rows:
+        logits = torch.cat([logits, logits.new_zeros(pad, logits.shape[1])])
+        latent_in = torch.cat([latent_in, latent_in.new_zeros(pad, latent_in.shape[1])])
+    routed = _moe_routed_chunks(L, latent_in, logits, rows, st, rt)
+    latent = flashinfer_rmsnorm(routed[:rows], L.latent_norm, _MOE_EPS)
+    return _MoeOut(_moe_latent_gemm(latent, L.latent_up), _moe_shared_ctx(L, x))
+
+
+def _moe_dep_ctx_streams(L: _MoeW, x: torch.Tensor, st: _Step, rt: _Rt) -> _MoeOut:
+    """``_moe_dep_ctx`` with the shared experts on the side stream beside the routed chain (router,
+    all-to-all, experts, all-to-all back), joined before the block returns; the same bits.
+
+    No record_stream: ``x`` is read on the side stream before the join and freed on this stream
+    after it, and later work on the side stream forks from this stream.
+    """
+    c = rt.moe_comm
+    c.shared_fork.record()
+    with torch.cuda.stream(rt.aux_stream):
+        c.shared_fork.wait()
+        shared = _moe_shared_ctx(L, x)
+        c.shared_join.record()
+    rows, runtime_max = x.shape[0], max(st.all_rank_num_tokens)
+    pad = runtime_max - rows if 0 in st.all_rank_num_tokens else 0
+    xg = x.new_zeros(pad, x.shape[1]) if pad and not rows else x
+    logits = _moe_router(L, xg)
+    latent_in = _moe_latent_gemm(xg, L.latent_down)
+    if pad and rows:
+        logits = torch.cat([logits, logits.new_zeros(pad, logits.shape[1])])
+        latent_in = torch.cat([latent_in, latent_in.new_zeros(pad, latent_in.shape[1])])
+    routed = _moe_routed_chunks(L, latent_in, logits, rows, st, rt)
+    latent = flashinfer_rmsnorm(routed[:rows], L.latent_norm, _MOE_EPS)
+    up = _moe_latent_gemm(latent, L.latent_up)
+    c.shared_join.wait()
+    return _MoeOut(up, shared)
+
+
+def _moe_routed_chunks(
+    L: _MoeW, latent_in: torch.Tensor, logits: torch.Tensor, rows: int, st: _Step, rt: _Rt
+) -> torch.Tensor:
+    """``_moe_routed`` over the step in all-to-all calls of at most ``rt.moe_rows`` rows per rank.
+
+    ``latent_in`` / ``logits`` hold this rank's ``rows`` rows (padded to the step's largest count
+    where a rank has none). A step whose largest count fits runs one call; a larger one runs
+    ``ceil(largest / moe_rows)`` calls on every rank (collective), call ``k`` on each rank's rows
+    ``[k * moe_rows, (k + 1) * moe_rows)``, padded as a step is when a rank has none of them.
+    """
+    counts, cap = st.all_rank_num_tokens, rt.moe_rows
+    runtime_max = max(counts)
+    if runtime_max <= cap:
+        return _moe_routed(L, latent_in, logits, runtime_max, st, rt)
+    parts = []
+    for begin in range(0, runtime_max, cap):
+        sizes = [min(max(n - begin, 0), cap) for n in counts]
+        own, top = min(max(rows - begin, 0), cap), max(sizes)
+        lat, lg = latent_in[begin : begin + own], logits[begin : begin + own]
+        if 0 in sizes and own < top:
+            lat = torch.cat([lat, lat.new_zeros(top - own, lat.shape[1])])
+            lg = torch.cat([lg, lg.new_zeros(top - own, lg.shape[1])])
+        parts.append(_moe_routed(L, lat, lg, top, st, rt)[:own])
+    return torch.cat(parts)
+
+
+def _moe_megamoe_chunk(
+    L: _MoeW, latent_in: torch.Tensor, logits: torch.Tensor, chunk_max: int, rt: _Rt
+) -> torch.Tensor:
+    """One MegaMoE launch over this rank's ``latent_in`` rows (``chunk_max`` the largest row count
+    of the launch over the EP ranks): the top-16 and the NVFP4 quantization (the CuteDSL path's,
+    ``_moe_route`` / ``_moe_quantize``) staged into the launch's bucket. Returns ``[rows, latent]``
+    BF16, a view of the bucket's output that the bucket's next launch overwrites. A rank without
+    rows still launches: the kernel's exchange waits for every rank."""
+    rows = latent_in.shape[0]
+    if rows:
+        ids, weights = _moe_route(L, logits)
+        x4, sf = _moe_quantize(L, latent_in)
+    else:
+        dev = latent_in.device
+        ids = torch.empty(0, _MOE_TOP_K, dtype=torch.int32, device=dev)
+        weights = torch.empty(0, _MOE_TOP_K, dtype=torch.float32, device=dev)
+        x4 = torch.empty(0, latent_in.shape[1] // 2, dtype=torch.uint8, device=dev)
+        sf = torch.empty(0, latent_in.shape[1] // _MOE_SF_VEC, dtype=torch.uint8, device=dev)
+    out = rubin_megamoe(
+        x4,
+        sf,
+        ids,
+        weights,
+        L.fc1_w,
+        L.fc1_s,
+        L.fc2_w,
+        L.fc2_s,
+        L.fc31_alpha,
+        L.fc2_alpha,
+        L.fc1_norm_const,
+        rt.megamoe,
+        chunk_max,
+        rows,
+    )
+    dispatch_issued()
+    return out
+
+
+def _moe_megamoe(
+    L: _MoeW, latent_in: torch.Tensor, logits: torch.Tensor, rows: int, st: _Step, rt: _Rt
+) -> torch.Tensor:
+    """The routed experts of this rank's ``rows`` rows through MegaMoE: ``[rows, latent]`` BF16.
+
+    ``latent_in`` / ``logits`` hold the rows (BF16 latent, FP32 router logits). A step whose
+    largest count fits the top bucket (``rt.moe_rows`` rows a rank) launches once; a larger one
+    launches ``ceil(largest / moe_rows)`` times on every rank, launch ``k`` on each rank's rows
+    ``[k * moe_rows, (k + 1) * moe_rows)`` (``_moe_routed_chunks``' split), a rank past its rows
+    with none. The routing weights apply after FC2; the combine is BF16.
+    """
+    counts, cap = st.all_rank_num_tokens, rt.moe_rows
+    runtime_max = max(counts)
+    if runtime_max <= cap:
+        return _moe_megamoe_chunk(L, latent_in[:rows], logits[:rows], runtime_max, rt)
+    routed = latent_in.new_empty(rows, latent_in.shape[1])
+    for begin in range(0, runtime_max, cap):
+        own = min(max(rows - begin, 0), cap)
+        top = max(min(max(n - begin, 0), cap) for n in counts)
+        part = slice(begin, begin + own)
+        # Copied out: the next launch overwrites the bucket's output.
+        routed[part].copy_(_moe_megamoe_chunk(L, latent_in[part], logits[part], top, rt))
+    return routed
+
+
+def _moe_cep_megamoe(L: _MoeW, x: torch.Tensor, st: _Step, rt: _Rt) -> _MoeOut:
+    """A context step's MoE under MegaMoE, in order on the current stream: router, latent_down,
+    MegaMoE, norm, latent_up; the shared experts whole after them."""
+    rows = x.shape[0]
+    logits = _moe_router(L, x)
+    latent_in = _moe_latent_gemm(x, L.latent_down)
+    routed = _moe_megamoe(L, latent_in, logits, rows, st, rt)
+    latent = flashinfer_rmsnorm(routed, L.latent_norm, _MOE_EPS)
+    return _MoeOut(_moe_latent_gemm(latent, L.latent_up), _moe_shared_ctx(L, x))
+
+
+def _moe_cep_megamoe_streams(L: _MoeW, x: torch.Tensor, st: _Step, rt: _Rt) -> _MoeOut:
+    """``_moe_cep_megamoe`` with the shared experts on the side stream beside the routed chain
+    (router, latent_down, MegaMoE, norm, latent_up), joined before the block returns; the same bits.
+
+    MegaMoE runs on this stream; the shared experts' GEMMs beside it wait on nothing of another
+    rank, so a MegaMoE CTA they delay starts once they leave its SMs. No record_stream: ``x`` is
+    read on the side stream before the join and freed on this stream after it, and later work on
+    the side stream forks from this stream.
+    """
+    c = rt.moe_comm
+    c.shared_fork.record()
+    with torch.cuda.stream(rt.aux_stream):
+        c.shared_fork.wait()
+        shared = _moe_shared_ctx(L, x)
+        c.shared_join.record()
+    rows = x.shape[0]
+    logits = _moe_router(L, x)
+    latent_in = _moe_latent_gemm(x, L.latent_down)
+    routed = _moe_megamoe(L, latent_in, logits, rows, st, rt)
+    latent = flashinfer_rmsnorm(routed, L.latent_norm, _MOE_EPS)
+    up = _moe_latent_gemm(latent, L.latent_up)
+    c.shared_join.wait()
+    return _MoeOut(up, shared)
+
+
+#: The MoE block of a context step by (backend, shared experts beside the routed chain).
+_MOE_CTX = MappingProxyType(
+    {
+        ("cutedsl", False): _moe_dep_ctx,
+        ("cutedsl", True): _moe_dep_ctx_streams,
+        ("megamoe_cutedsl", False): _moe_cep_megamoe,
+        ("megamoe_cutedsl", True): _moe_cep_megamoe_streams,
+    }
+)
+
+
+def dense_mlp(L0: _DenseW, x: torch.Tensor, st: _Step, rt: _Rt) -> torch.Tensor:
+    """Run layer 0's dense SiTU MLP over ``x``; return ``[rows, hidden]``."""
+    h = situ_and_mul(cublas_mm(x, L0.gu.t()), *_MOE_SITU)
+    return cublas_mm(h, L0.dn.t())  # whole: every rank runs the whole MLP on its rows
+
+
+# --------------------------------------------------------------------------------------------------
+# DFlash2: the drafter container, its block step and the speculative worker.
+#
+# The drafter's weights are ``core.w["d_*"]`` (``w3_rows``). ``DraftModel`` holds no parameter of
+# its own: it reads them through the core and answers what the engine's worker, the KV cache
+# creator and the weight loader read off a drafter. ``draft_step`` is the block decode of the five
+# drafter layers, straight-line, every kernel a family or catalog entry.
+#
+# cep: the drafter runs whole on every rank, on the step's rows all-gathered after the trunk, the
+# same on each rank: all 96 query heads, ``o_proj`` and the MLP whole, no collective. The history
+# (one FP8 latent of 576 values per token and drafter layer) lives in the unified draft cache, every
+# rank holding every request's (the TP layout the TEP8 generation server reads). Under DKV the
+# context server stores it like the latent: every rank computes every row, and global page g lives
+# on rank g % N alone (``KVCacheManagerV2.draft_page_split``; ``kimi_k31_dkv_draft``, default on),
+# which sends it.
+# The window attention is the exact FP32 decode over the window's pool rows, its operands staged by
+# two Triton launches; the block's latents go into the pool before each layer's decode, at the slots
+# the next step's accepted rows overwrite.
+# --------------------------------------------------------------------------------------------------
+
+# The drafter history is _DRAFT_HISTORY_DTYPE (FP8 E4M3 at a unit scale), a target constant.
+# speculative_config.context_kv_dtype may leave it to the target ("auto"; None where the config has
+# no such field) or name it ("fp8"); routing and the worker refuse any other value.
+_DRAFT_HISTORY_CONFIGS = (None, "auto", "fp8")
+# Block verification (not token-wise rejection sampling) for a sampled batch.
+_DRAFT_BLOCK_VERIFY = True
+# The engine's dflash_forward keywords, as the worker passes them.
+_DRAFT_FORWARD_ARGS = (
+    "noise_embedding",
+    "query_positions",
+    "num_ctx_per_req",
+    "ctx_k_cache",
+    "ctx_v_cache",
+    "ctx_cache_batch_idx",
+    "ctx_kv_cache",
+    "ctx_page_table",
+    "block_placement",
+)
+#: Forced-acceptance calls between two forced-count lines.
+_FORCED_PERIOD = 200
+# The drafter's attention window in positions, the query's own included (sliding_window).
+_DRAFT_WINDOW = _weights.DRAFT_SHAPE["sliding_window"]
+
+
+class _DraftLayerW(NamedTuple):
+    """One drafter layer at this rank's share: views of ``core.w["d_l{j}_*"]`` (``w3_rows``)."""
+
+    in_norm: torch.Tensor  # [H]
+    post_norm: torch.Tensor  # [H]
+    q_a: torch.Tensor  # [q_lora, H]
+    q_a_norm: torch.Tensor  # [q_lora]
+    q_b: torch.Tensor  # [heads * (nope + rope), q_lora]
+    kv_a: torch.Tensor  # [kv_lora + rope, H]: rows of d_kv_a
+    kv_a_norm: torch.Tensor  # [kv_lora]: a row of d_kv_a_norm
+    k_b: torch.Tensor  # [heads, nope, kv_lora]: W_UK
+    v_b_t: torch.Tensor  # [heads, kv_lora, v]: W_UV, transposed view
+    o: torch.Tensor  # [H, o heads * v]
+    gate_up: torch.Tensor  # [2 * I / tp, H]: gate rows, then up rows
+    down: torch.Tensor  # [H, I / tp]
+    attn_conv_base: torch.Tensor  # [2, taps, H]: side 0 the input's, side 1 the output's
+    attn_conv_proj: torch.Tensor  # [2 * taps * groups, H]
+    mlp_conv_base: torch.Tensor
+    mlp_conv_proj: torch.Tensor
+
+
+class _DraftW(NamedTuple):
+    """The drafter's weights (``DW``); a history-only drafter has no layers and no head."""
+
+    fc: torch.Tensor  # [H, captures * H]
+    layers: tuple  # _DraftLayerW per layer; () on a history-only drafter
+    final_norm: Optional[torch.Tensor]
+
+
+class _DraftStep(NamedTuple):
+    """One block step's drafter state (``st``), from the worker's drafter inputs."""
+
+    block: int  # queries per request: max_draft_len + 1
+    rows: int  # requests * block
+    num_ctx: torch.Tensor  # [B] int64: each request's history length (the block's RoPE base)
+    page_tables: torch.Tensor  # [B, pages] int64: each request's history pages
+    page_size: int
+    positions: torch.Tensor  # [rows]: the queries' positions
+    pools: Any  # per drafter layer, the history pool [pages, 1, 1, page, 576]
+
+
+class _DraftRt(NamedTuple):
+    """The drafter's runtime (``rt.draft``), built at the worker's first prepare, before capture."""
+
+    freqs: torch.Tensor  # [positions, rope / 2] complex64: the drafter's YaRN table
+    softmax_scale: float
+    eps: float
+    kv_scale: float  # the FP8 history's dequant scale
+    taps: int  # the block convolutions' taps
+    groups: int  # channel groups of a convolution's per-position kernel
+    group: int  # channels per group
+
+
+class _Weight(NamedTuple):
+    """An object with ``.weight``: what the engine reads off a drafter's ``fc`` or ``hidden_norm``."""
+
+    weight: torch.Tensor
+
+
+class _CandidateSelector(NamedTuple):
+    """The DFlash2 candidate selector's tables, as the engine reads them."""
+
+    predecessor_codebook: torch.Tensor  # [vocab, rank]
+    successor_codebook: torch.Tensor  # [vocab, rank]
+    hidden_projection_weight: torch.Tensor  # [rank, H]
+    top_k: int
+
+
+class _TargetEmbedding:
+    """The target's embedding table (``core.w["embed"]``, whole) as the drafter's ``embed_tokens``."""
+
+    def __init__(self, core: nn.Module) -> None:
+        self._core = weakref.ref(core)
+
+    def __call__(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return nn.functional.embedding(input_ids, self._core().w["embed"])
+
+
+class _DraftBackbone(NamedTuple):
+    """``draft_model.draft_model_full.model``: the embedding the worker embeds the block with."""
+
+    embed_tokens: Any
+
+
+class _DraftFull(NamedTuple):
+    """``draft_model.draft_model_full``: the backbone and the LM head the drafter shares."""
+
+    model: _DraftBackbone
+    lm_head: Any
+
+
+def _yarn_mscale(scale: float, mscale: float) -> float:
+    """YaRN's attention scale factor."""
+    return 1.0 if scale <= 1 else 0.1 * mscale * math.log(scale) + 1.0
+
+
+def _draft_rope(cfg: Any) -> dict:
+    """The drafter's YaRN parameters (``rope_parameters``, else ``rope_scaling``)."""
+    scaling = getattr(cfg, "rope_parameters", None) or getattr(cfg, "rope_scaling", None) or {}
+    rope_type = scaling.get("rope_type") or scaling.get("type")
+    assert rope_type == "yarn", f"the DFlash2 drafter's RoPE is YaRN, got {rope_type!r}"
+    return dict(
+        base=float(scaling.get("rope_theta") or cfg.rope_theta),
+        scaling_factor=float(scaling["factor"]),
+        original_max_position_embeddings=int(scaling["original_max_position_embeddings"]),
+        beta_fast=float(scaling.get("beta_fast", 32.0)),
+        beta_slow=float(scaling.get("beta_slow", 1.0)),
+        mscale=float(scaling.get("mscale", 1.0)),
+        mscale_all_dim=float(scaling.get("mscale_all_dim", 0.0)),
+    )
+
+
+def _draft_freqs(rope: dict, positions: int, dim: int, device: Any) -> torch.Tensor:
+    """``[positions, dim / 2]`` complex64: the YaRN rotation as adjacent (re, im) pairs.
+
+    The engine's sinusoid table with its frequency half duplicated, read as complex pairs; mscale
+    rides in the modulus.
+    """
+    _, packed = RopeEmbeddingUtils.create_sinusoidal_positions_yarn(
+        num_pos=positions, dim=dim, duplicate_data=True, **rope
+    )
+    table = torch.from_numpy(packed).reshape(positions, dim, 2)
+    cos = table[..., 0].contiguous().to(device)
+    sin = table[..., 1].contiguous().to(device)
+    return torch.complex(cos[..., : dim // 2], sin[..., : dim // 2]).contiguous()
+
+
+def _draft_views(w: nn.ParameterDict, layers: int, nope: int, kv_lora: int) -> _DraftW:
+    """The drafter's views over ``core.w`` (``w3_rows`` lays out every row as read here)."""
+    if "d_final_norm" not in w:
+        return _DraftW(w["d_fc"], (), None)
+    kv_a, kv_a_norm = w["d_kv_a"], w["d_kv_a_norm"]
+    latent = kv_a.shape[0] // layers
+    views = []
+    for j in range(layers):
+        kv_b = w[f"d_l{j}_kv_b"]  # [every head's k_nope rows ; every head's v rows]
+        heads = kv_b.shape[0] // (2 * nope)
+        views.append(
+            _DraftLayerW(
+                in_norm=w[f"d_l{j}_in_norm"],
+                post_norm=w[f"d_l{j}_post_norm"],
+                q_a=w[f"d_l{j}_q_a"],
+                q_a_norm=w[f"d_l{j}_q_a_norm"],
+                q_b=w[f"d_l{j}_q_b"],
+                kv_a=kv_a[j * latent : (j + 1) * latent],
+                kv_a_norm=kv_a_norm[j],
+                k_b=kv_b[: heads * nope].view(heads, nope, kv_lora),
+                v_b_t=kv_b[heads * nope :].view(heads, -1, kv_lora).transpose(1, 2),
+                o=w[f"d_l{j}_o"],
+                gate_up=w[f"d_l{j}_gate_up"],
+                down=w[f"d_l{j}_down"],
+                attn_conv_base=w[f"d_l{j}_attn_conv_base"],
+                attn_conv_proj=w[f"d_l{j}_attn_conv_proj"],
+                mlp_conv_base=w[f"d_l{j}_mlp_conv_base"],
+                mlp_conv_proj=w[f"d_l{j}_mlp_conv_proj"],
+            )
+        )
+    return _DraftW(w["d_fc"], tuple(views), w["d_final_norm"])
+
+
+def draft_config_for(model_config: Any) -> Any:
+    """Build the DFlash2 drafter checkpoint's ``ModelConfig``; None without a speculative config.
+
+    Built as the engine builds an external drafter's. The shell keeps it as ``draft_config`` (the
+    KV cache creator and the draft weight mapper read it) and passes it to ``DraftModel``. The
+    drafter's architecture is weights.py's (``DRAFT_SHAPE``, ``DRAFT_DFLASH``); another one raises
+    here.
+    """
+    spec_config = getattr(model_config, "spec_config", None)
+    if spec_config is None:
+        return None
+    mode = spec_config.spec_dec_mode
+    if not (mode.use_one_engine() and mode.is_dflash()):
+        raise ValueError(
+            "This target drafts with one-engine DFlash (the DFlash2 MLA drafter) only."
+        )
+    draft_config = ModelConfig.from_pretrained(
+        spec_config.speculative_model, **external_drafter_config_kwargs(model_config, spec_config)
+    )
+    # The target's KV dtype; the history's own dtype comes from the container (context_kv_fp8).
+    draft_config.quant_config.kv_cache_quant_algo = model_config.quant_config.kv_cache_quant_algo
+    draft_config.extra_attrs = model_config.extra_attrs
+    cfg = draft_config.pretrained_config
+    for key, want in _weights.DRAFT_SHAPE.items():
+        got = getattr(cfg, key, None)
+        assert got == want, f"the DFlash2 drafter's {key} is {got}, this target runs {want}"
+    dflash = getattr(cfg, "dflash_config", None) or {}
+    for key, want in _weights.DRAFT_DFLASH.items():
+        assert dflash.get(key) == want, f"dflash_config.{key} {dflash.get(key)} is not {want}"
+    layer_types = getattr(cfg, "layer_types", None) or []
+    assert layer_types and all(t == "sliding_attention" for t in layer_types), layer_types
+    assert getattr(cfg, "is_causal", True), "the DFlash2 drafter's block attention is causal"
+    return draft_config
+
+
+class DraftModel(nn.Module):
+    """The DFlash2 drafter the engine's worker drives (cep: whole, 96 heads per rank).
+
+    No parameter or submodule of its own: every weight is ``core.w["d_*"]``, read through the core
+    (held weakly), so meta initialization never leaves a stale tensor here. A module only because
+    the engine counts a context server's drafter tensors through ``parameters()``,
+    ``buffers()`` and ``modules()``.
+
+    ``model_config`` is the drafter's ``ModelConfig`` (``draft_config_for``); the speculative
+    config is the core's. On a context server with ``context_kv_only`` the drafter only builds the
+    history (``fc``, ``hidden_norm``, every layer's latent projection and norm) and gives the
+    engine ``fc``'s column blocks to project the target's captures as they are taken.
+    """
+
+    # The engine's unified draft cache holds the history, in aggregated runs too.
+    supports_unified_draft_cache = True
+    unified_draft_cache_when_aggregated = True
+    # One latent per token and layer (no V half), in pages the block decode reads itself.
+    _kv_factor = 1
+    _num_kv_heads = 1
+    _paged_ctx_cache = True
+    _uses_worker_attention_backend = False
+    _uses_lilicorr = False
+    lilicorr = None
+    is_dflash2 = True
+    dflash_attention_backend = "VANILLA"
+    mask_token_embedding = None
+    # The drafter's helix mapping: None, the history is whole on every rank.
+    _helix_mapping = None
+
+    def __init__(
+        self,
+        core: nn.Module,
+        model_config: ModelConfig,
+        lm_head: nn.Module,
+        logits_processor: nn.Module,
+    ) -> None:
+        super().__init__()
+        spec_config = core.model_config.spec_config
+        self.model_config = model_config
+        self.config = model_config.pretrained_config
+        self._core = weakref.ref(core)
+        # The shell's head, held outside the module tree (it is the shell's child).
+        self._head = (lm_head, logits_processor)
+        cfg = self.config
+        dflash = cfg.dflash_config
+        self.context_kv_only = bool(getattr(spec_config, "context_kv_only", False))
+        history = getattr(spec_config, "context_kv_dtype", None)
+        assert history in _DRAFT_HISTORY_CONFIGS, (
+            f"this target keeps the drafter history in {_DRAFT_HISTORY_DTYPE}: "
+            f"speculative_config.context_kv_dtype {history!r} names another storage"
+        )
+        # The engine sizes the history pool from this flag.
+        self.context_kv_fp8 = _DRAFT_HISTORY_DTYPE == torch.float8_e4m3fn
+        self.block_size = spec_config.max_draft_len + 1
+        self.mask_token_id = dflash["mask_token_id"]
+        self.context_cache_window = int(cfg.sliding_window)
+        self._num_attn_layers = cfg.num_hidden_layers
+        self._num_heads = cfg.num_attention_heads // core.dims.kda_tp
+        self._head_dim = cfg.kv_lora_rank + cfg.qk_rope_head_dim
+        self._rope = _draft_rope(cfg)
+        mscale = _yarn_mscale(self._rope["scaling_factor"], self._rope["mscale_all_dim"])
+        self.softmax_scale = (
+            mscale * mscale / math.sqrt(cfg.qk_nope_head_dim + cfg.qk_rope_head_dim)
+        )
+        self._selector_top_k = int(dflash["selector_top_k"])
+        # Written by the worker before any table is sized: the positions it serves.
+        self._runtime_position_ceiling = None
+        self._dw: Optional[_DraftW] = None
+        self._freqs: Optional[torch.Tensor] = None
+        self._rt: Any = None
+        logger.info(
+            f"DFlash2 drafter: {self._num_attn_layers} layers, {self._num_heads} heads per rank, "
+            f"block {self.block_size}, window {self.context_cache_window}, FP8 history, "
+            f"{'context KV only' if self.context_kv_only else 'full'}"
+        )
+
+    # -- what the engine reads -------------------------------------------------
+
+    def _w(self, key: str) -> torch.Tensor:
+        return self._core().w[key]
+
+    @property
+    def lm_head(self) -> nn.Module:
+        return self._head[0]
+
+    @property
+    def logits_processor(self) -> nn.Module:
+        return self._head[1]
+
+    @property
+    def fc(self) -> _Weight:
+        return _Weight(self._w("d_fc"))
+
+    @property
+    def hidden_norm(self) -> _Weight:
+        return _Weight(self._w("d_hidden_norm"))
+
+    @property
+    def has_candidate_selector(self) -> bool:
+        return not self.context_kv_only
+
+    @property
+    def candidate_selector(self) -> Optional[_CandidateSelector]:
+        if self.context_kv_only:
+            return None
+        return _CandidateSelector(
+            self._w("d_sel_pred"),
+            self._w("d_sel_succ"),
+            self._w("d_sel_hidden_proj"),
+            self._selector_top_k,
+        )
+
+    @property
+    def draft_model_full(self) -> _DraftFull:
+        return _DraftFull(_DraftBackbone(_TargetEmbedding(self._core())), self.lm_head)
+
+    @property
+    def model(self) -> _DraftBackbone:
+        return self.draft_model_full.model
+
+    def _build_fused_kv_buffers(self) -> None:
+        """Nothing to build: ``w3_rows`` stacks every layer's latent projection (``d_kv_a``)."""
+
+    def load_weights_from_target_model(self, target_model: nn.Module) -> None:
+        """Nothing to take: the embedding and the LM head are the target's, read through the core."""
+        del target_model
+
+    def bind_runtime(self, max_rows: int, page_size: int) -> None:
+        """Read the weight views and build the drafter's runtime, before any capture.
+
+        The worker calls it once its history buffers are bound (and again when the KV cache
+        manager is replaced); ``_runtime_position_ceiling`` sizes the RoPE table.
+        """
+        del max_rows, page_size
+        core = self._core()
+        cfg = self.config
+        self._dw = _draft_views(
+            core.w, cfg.num_hidden_layers, cfg.qk_nope_head_dim, cfg.kv_lora_rank
+        )
+        positions = self._runtime_position_ceiling or cfg.max_position_embeddings
+        dflash = cfg.dflash_config
+        draft = _DraftRt(
+            freqs=_draft_freqs(
+                self._rope, int(positions), cfg.qk_rope_head_dim, self._dw.fc.device
+            ),
+            softmax_scale=self.softmax_scale,
+            eps=float(cfg.rms_norm_eps),
+            kv_scale=DRAFT_FP8_KV_SCALE,
+            taps=int(dflash["conv_kernel_size"]),
+            groups=cfg.hidden_size // int(dflash["conv_group_size"]),
+            group=int(dflash["conv_group_size"]),
+        )
+        # Also an attribute: the engine counts a context server's drafter tables off the module.
+        self._freqs = draft.freqs
+        self._rt = core._rt._replace(draft=draft)
+
+    # -- the history -----------------------------------------------------------
+
+    def project_target_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """``hidden_norm(fc(captures))``: the target's captured features in the drafter's space."""
+        fc = self._w("d_fc")
+        return flashinfer_rmsnorm(
+            rubin_linear(hidden_states.to(fc.dtype), fc, False),
+            self._w("d_hidden_norm"),
+            float(self.config.rms_norm_eps),
+        )
+
+    def precompute_context_kv(self, projected_hidden: torch.Tensor, positions: torch.Tensor):
+        """Every layer's history latent: ``([N, layers, 1, 576], None)``.
+
+        One projection over the stacked ``kv_a`` rows, then [RMSNorm | RoPE] of all layers in one
+        launch.
+        """
+        kv_a = self._w("d_kv_a")
+        latent = rubin_linear(projected_hidden.to(kv_a.dtype), kv_a, False)
+        latent = latent.view(projected_hidden.shape[0], self._num_attn_layers, self._head_dim)
+        out = dflash2_mla_ctx_norm_rope(
+            latent,
+            self._w("d_kv_a_norm"),
+            float(self.config.rms_norm_eps),
+            self._rt.draft.freqs,
+            positions.view(-1),
+        )
+        return out.unsqueeze(2), None
+
+    def capture_projection_blocks(self, num_capture_layers: int) -> list[torch.Tensor]:
+        """``fc``'s ``[out, hidden]`` column block per captured layer (views of ``d_fc``)."""
+        fc = self._w("d_fc")
+        width, rest = divmod(fc.shape[1], num_capture_layers)
+        assert not rest, f"fc's {fc.shape[1]} inputs do not split over {num_capture_layers} layers"
+        return [fc[:, i * width : (i + 1) * width] for i in range(num_capture_layers)]
+
+    def finish_capture_projection(self, projected: torch.Tensor) -> torch.Tensor:
+        """``hidden_norm`` of the FP32 sum of the blocks' products, rounded once to fc's dtype."""
+        return flashinfer_rmsnorm(
+            projected.to(self._w("d_fc").dtype),
+            self._w("d_hidden_norm"),
+            float(self.config.rms_norm_eps),
+        )
+
+    # -- the block -------------------------------------------------------------
+
+    def select_candidate_path(
+        self, block_logits, candidate_ids, unary_logits, block_hidden_states, anchor_token_ids
+    ):
+        """The selector's greedy walk: ``block_logits`` rewritten in place to the walked path."""
+        return k31_dflash2_selector_greedy_path(
+            self._w("d_sel_pred"),
+            self._w("d_sel_succ"),
+            self._w("d_sel_hidden_proj"),
+            candidate_ids,
+            unary_logits,
+            block_hidden_states,
+            anchor_token_ids,
+            block_logits,
+        )
+
+    def dflash_forward(
+        self,
+        noise_embedding,
+        query_positions,
+        num_ctx_per_req,
+        ctx_k_cache,
+        ctx_v_cache,
+        ctx_cache_batch_idx,
+        ctx_kv_cache=None,
+        ctx_page_table=None,
+        block_placement=None,
+    ):
+        """The block decode of ``[B, block, hidden]`` noise embeddings; ``[B * block, hidden]``."""
+        del ctx_k_cache, ctx_v_cache, block_placement
+        batch, block, hidden = noise_embedding.shape
+        st = _DraftStep(
+            block=block,
+            rows=batch * block,
+            num_ctx=num_ctx_per_req[:batch].long(),
+            page_tables=ctx_page_table.index_select(0, ctx_cache_batch_idx.long()).long(),
+            page_size=ctx_kv_cache[0].shape[-2],
+            positions=query_positions.reshape(-1),
+            pools=ctx_kv_cache,
+        )
+        return draft_step(self._dw, noise_embedding.reshape(batch * block, hidden), st, self._rt)
+
+
+def draft_step(DW: _DraftW, hidden_streams: torch.Tensor, st: _DraftStep, rt: _Rt) -> torch.Tensor:
+    """One DFlash2 block over the five drafter layers; returns ``[B * block, hidden]``.
+
+    ``hidden_streams`` is the noise block's embedding. Per layer: input norm, the attention conv's
+    input side, the absorbed MLA query, the block latents into the pool, the exact FP32 window
+    decode, W_UV, ``o_proj``, the conv's output side; then the MLP between the MLP conv's two
+    sides. Then the final norm. Every product is whole on the rank, no collective.
+    """
+    d = rt.draft
+    eps, taps, groups, group = d.eps, d.taps, d.groups, d.group
+    rows, block = st.rows, st.block
+    heads, nope, kv_lora = DW.layers[0].k_b.shape
+    latent = DW.layers[0].kv_a.shape[0]
+    # Once per step: each query's window as pool rows, and the block latents' pool slots.
+    window_rows, _ = dflash2_window_rows(
+        st.num_ctx, st.page_tables, block, st.page_size, _DRAFT_WINDOW, _DRAFT_WINDOW, None
+    )
+    block_pos = st.num_ctx.view(-1, 1) + torch.arange(block, device=st.num_ctx.device)
+    store_pages = st.page_tables.gather(1, block_pos // st.page_size).view(-1)
+    store_offsets = (block_pos % st.page_size).view(-1)
+
+    h = hidden_streams
+    residual = h.clone()  # the fused add + norm below updates it in place
+    x = flashinfer_rmsnorm(h, DW.layers[0].in_norm, eps)
+    for j, L in enumerate(DW.layers):
+        if j:
+            x, residual = flashinfer_fused_add_rmsnorm(h, residual, L.in_norm, eps)
+        coef = rubin_linear(x, L.attn_conv_proj, False).view(rows, 2, taps, groups)
+        x = dflash2_grouped_conv(x, coef[:, 0], L.attn_conv_base[0], block, group)
+        qa = flashinfer_rmsnorm(rubin_linear(x, L.q_a, False), L.q_a_norm, eps)
+        q = rubin_linear(qa, L.q_b, False)
+        q = q.view(rows, heads, -1)
+        query = q.new_empty(rows, heads, latent)
+        bmm_out(q[..., :nope].transpose(0, 1), L.k_b, query[..., :kv_lora].transpose(0, 1))
+        pool = st.pools[j][:, 0, 0]  # [pages, page, 576]
+        dflash2_mla_block_rope(
+            q,
+            query,
+            rubin_linear(x, L.kv_a, False),
+            L.kv_a_norm,
+            eps,
+            d.freqs,
+            st.positions,
+            pool,
+            store_pages,
+            store_offsets,
+        )
+        ctx = rubin_dflash2_window_fp32(
+            query, pool.reshape(-1, latent), window_rows, d.softmax_scale, kv_lora, d.kv_scale
+        )
+        attn = ctx.new_empty(rows, heads * L.v_b_t.shape[-1])
+        bmm_out(ctx.transpose(0, 1), L.v_b_t, attn.view(rows, heads, -1).transpose(0, 1))
+        a = rubin_linear(attn, L.o, False)
+        a = dflash2_grouped_conv(a, coef[:, 1], L.attn_conv_base[1], block, group)
+        x, residual = flashinfer_fused_add_rmsnorm(a, residual, L.post_norm, eps)
+        coef = rubin_linear(x, L.mlp_conv_proj, False).view(rows, 2, taps, groups)
+        x = dflash2_grouped_conv(x, coef[:, 0], L.mlp_conv_base[0], block, group)
+        m = rubin_linear(flashinfer_silu_and_mul(rubin_linear(x, L.gate_up, False)), L.down, False)
+        h = dflash2_grouped_conv(m, coef[:, 1], L.mlp_conv_base[1], block, group)
+    h, _ = flashinfer_fused_add_rmsnorm(h, residual, DW.final_norm, eps)
+    return h
+
+
+class DFlashWorker(_EngineDFlashWorker):
+    """The engine's DFlash worker with this target's DFlash2 differences.
+
+    Every method not defined here is the engine's: the managed draft cache and its history, the
+    prefill and paged history stores, the fused generation prepare, the KV-length rewind. Defined
+    here: the unified-cache check and the drafter's runtime (``_lazy_init_ctx_buffers``), the
+    target-metadata hook, acceptance and sampling through the family's spec entries, the
+    forced-acceptance count, the DFlash2 sampled path (selector walk, block verification) and
+    ``_forward_impl``.
+    """
+
+    def __init__(self, spec_config: Any, mapping: Any, use_separate_draft_kv_cache: bool = False):
+        super().__init__(spec_config, mapping, use_separate_draft_kv_cache)
+        history = getattr(spec_config, "context_kv_dtype", None)
+        if history not in _DRAFT_HISTORY_CONFIGS:
+            raise ValueError(
+                f"this target keeps the drafter history in {_DRAFT_HISTORY_DTYPE}: "
+                f"speculative_config.context_kv_dtype {history!r} names another storage; leave "
+                "it 'auto' or set 'fp8'"
+            )
+        if self.force_num_accepted_tokens != 0.0 and self._force_accept_rng_pool is None:
+            raise RuntimeError(
+                "the forced-acceptance draws must exist before any CUDA graph capture"
+            )
+        # The sampled path's proposals by sequence slot, made on its first (eager) step.
+        self._dflash2_proposals: Optional[DFlash2ProposalStore] = None
+        # Forced acceptance: device totals (generation rows, accepted tokens) and Python calls.
+        self._forced: Optional[torch.Tensor] = None
+        self._forced_calls = 0
+        # A vocab-parallel head's shards: how many, and which one this rank holds (one rank
+        # without a mapping).
+        self._vocab_shards = 1 if mapping is None else mapping.tp_size
+        self._vocab_shard = 0 if mapping is None else mapping.tp_rank
+
+    def _draft_reads_target_metadata(self) -> bool:
+        """The drafter reads no target attention metadata: the draft step skips its refresh."""
+        return False
+
+    def _lazy_init_ctx_buffers(
+        self, draft_model, spec_metadata, attn_metadata, draft_kv_cache_manager=None
+    ):
+        """Bind the history to the unified draft cache, then the drafter's runtime.
+
+        Only the unified draft cache of KV cache manager V2 serves this target: anything else
+        raises (routing refuses those deployments first).
+        """
+        if not getattr(draft_kv_cache_manager, "has_standalone_draft_cache", False):
+            raise RuntimeError(
+                "this target's DFlash2 drafter keeps its history in the unified draft cache of KV "
+                "cache manager V2; the step's KV cache manager has none"
+            )
+        fresh = not (self._ctx_buf_inited and self._ctx_kv_manager is draft_kv_cache_manager)
+        super()._lazy_init_ctx_buffers(
+            draft_model, spec_metadata, attn_metadata, draft_kv_cache_manager
+        )
+        if fresh:
+            draft_model.bind_runtime(
+                spec_metadata.max_num_requests * self._compute_block_size, self._ctx_page_size
+            )
+
+    # -- target tokens and acceptance -----------------------------------------
+
+    def _sample_and_accept_draft_tokens_base(
+        self, logits, draft_tokens, num_contexts, batch_size, spec_metadata
+    ):
+        assert spec_metadata is None or not spec_metadata.is_ragged_verify, (
+            "routing refuses ragged verification"
+        )
+        runtime_draft_len = draft_tokens.shape[-1]
+        if isinstance(logits, torch.Tensor) and logits.dim() == 1:
+            logits = logits.unsqueeze(0)
+        target_tokens = self._sample_tokens_for_batch(
+            logits, spec_metadata, num_contexts, batch_size
+        )
+        accepted_tokens, num_accepted_tokens = strict_accept(
+            target_tokens, draft_tokens, num_contexts, batch_size
+        )
+        return accepted_tokens, self._apply_force_accepted_tokens(
+            num_accepted_tokens, num_contexts, runtime_draft_len, spec_metadata=spec_metadata
+        )
+
+    def _apply_force_accepted_tokens(
+        self, num_accepted_tokens, num_contexts, runtime_draft_len: int, spec_metadata=None
+    ):
+        """The engine's forced acceptance; counts what it forced (both verify paths call it)."""
+        out = super()._apply_force_accepted_tokens(
+            num_accepted_tokens, num_contexts, runtime_draft_len, spec_metadata=spec_metadata
+        )
+        if self.force_num_accepted_tokens != 0.0:
+            self._count_forced(out, num_contexts, spec_metadata)
+        return out
+
+    def _count_forced(self, out: torch.Tensor, num_contexts: int, spec_metadata) -> None:
+        """Add this call's forced rows to the device totals; log them every 200 calls.
+
+        Rows that verified placeholder drafts kept their own count and are left out. The totals
+        are device adds, so graph replays count; the line is written from Python calls outside
+        capture (eager steps).
+        """
+        if self._forced is None:
+            self._forced = torch.zeros(2, dtype=torch.int64, device=out.device)
+        capturing = out.is_cuda and torch.cuda.is_current_stream_capturing()
+        if spec_metadata is not None and spec_metadata.is_cuda_graph and not capturing:
+            return  # graph warmup: the engine forced nothing
+        gen = out[num_contexts:]
+        rows = self._real_draft_rows(spec_metadata, gen.shape[0])
+        if rows is None:
+            self._forced[0].add_(gen.shape[0])
+            self._forced[1].add_(gen.sum())
+        else:
+            self._forced[0].add_(rows.sum())
+            self._forced[1].add_(torch.where(rows, gen, 0).sum())
+        self._forced_calls += 1
+        if self._forced_calls % _FORCED_PERIOD == 0 and not capturing:
+            logger.info(self.forced_line())
+
+    def forced_line(self) -> str:
+        """The forced-acceptance line: setting, calls, generation rows, accepted tokens, mean."""
+        rows, accepted = self._forced.tolist() if self._forced is not None else (0, 0)
+        return (
+            f"Kimi K3.1 Rubin forced acceptance: {_TARGET} "
+            f"value={self.force_num_accepted_tokens} calls={self._forced_calls} rows={rows} "
+            f"accepted={accepted} mean={accepted / max(rows, 1):.4f}"
+        )
+
+    def _sample_tokens_for_batch(self, logits, spec_metadata, num_contexts, batch_size):
+        if isinstance(logits, VocabShardedLogits):
+            exchange = logits.head._exchange
+            if spec_metadata.is_all_greedy_sample:
+                return vocab_parallel_argmax(
+                    logits.local, exchange.all_reduce, exchange.tp_size, exchange.tp_rank
+                )
+            rows = logits.num_rows
+            return vocab_parallel_sample(
+                logits.local,
+                spec_metadata.temperatures[:rows],
+                spec_metadata.seeds[:rows],
+                spec_metadata.offsets[:rows],
+                GREEDY_TEMPERATURE_THRESHOLD,
+                exchange.all_reduce,
+                exchange.tp_size,
+                exchange.tp_rank,
+            )
+        if spec_metadata.is_all_greedy_sample:
+            return torch.argmax(logits, dim=-1)
+        num_tokens = logits.shape[0]
+        seed, offset = self._rng_state_per_token(spec_metadata, num_tokens)
+        return self._sample_from_logits(
+            spec_metadata.advanced_sampling_mode,
+            logits,
+            spec_metadata.temperatures[:num_tokens],
+            spec_metadata.top_ks[:num_tokens],
+            spec_metadata.top_ps[:num_tokens],
+            spec_metadata.min_ps[:num_tokens],
+            seed=seed,
+            offset=offset,
+        )
+
+    @staticmethod
+    def _sample_from_logits(
+        advanced_sampling_mode,
+        logits,
+        temperatures,
+        top_ks,
+        top_ps,
+        min_ps,
+        *,
+        seed=None,
+        offset=None,
+    ):
+        if advanced_sampling_mode.is_fused:
+            return fused_sample_from_logits(
+                logits, temperatures, top_ks, top_ps, min_ps, seed, offset
+            )
+        top_ks, top_ps = flashinfer_sampling.resolve_advanced_sampling_filters(
+            advanced_sampling_mode, top_ks, top_ps
+        )
+        return flashinfer_sample_from_logits(logits, temperatures, top_ks, top_ps, seed, offset)
+
+    @staticmethod
+    def _compute_probs_from_logits(
+        advanced_sampling_mode, logits, temperatures, top_ks, top_ps, min_ps
+    ):
+        if advanced_sampling_mode.is_fused:
+            return fused_compute_probs_from_logits(logits, temperatures, top_ks, top_ps, min_ps)
+        top_ks, top_ps = flashinfer_sampling.resolve_advanced_sampling_filters(
+            advanced_sampling_mode, top_ks, top_ps
+        )
+        return flashinfer_compute_probs_from_logits(logits, temperatures, top_ks, top_ps)
+
+    def _target_tokens_from_shard(self, spec_metadata) -> bool:
+        """Whether a step's target tokens come from this rank's vocab shard.
+
+        Never with a guided decoder, which masks the gathered logits.
+        """
+        return self.guided_decoder is None and (
+            spec_metadata.is_all_greedy_sample or self._vocab_parallel.samples
+        )
+
+    def sample_and_accept_draft_tokens(self, logits, attn_metadata, spec_metadata):
+        # A DFlash2 sampling batch verifies the selector's block by block verification; every
+        # other batch takes the engine's acceptance.
+        if dflash2_sampled_step(self, spec_metadata):
+            return self._verify_sampled_block(logits, attn_metadata, spec_metadata)
+        return SpecWorkerBase.sample_and_accept_draft_tokens(
+            self, logits, attn_metadata, spec_metadata
+        )
+
+    # -- the DFlash2 sampled path ----------------------------------------------
+
+    def _proposal_store(self, spec_metadata) -> DFlash2ProposalStore:
+        """The selector's proposals by sequence slot; made on the first sampled (eager) step."""
+        store = self._dflash2_proposals
+        if store is None:
+            assert not torch.cuda.is_current_stream_capturing(), (
+                "the DFlash2 proposal store must exist before any CUDA graph capture"
+            )
+            draft_probs = getattr(spec_metadata, "draft_probs", None)
+            rows = (
+                int(draft_probs.shape[0])
+                if draft_probs is not None
+                else int(spec_metadata.num_seq_slots or spec_metadata.max_num_requests) + 1
+            )
+            store = DFlash2ProposalStore(
+                rows,
+                self.max_draft_len,
+                self._draft_model_ref().candidate_selector.top_k,
+                spec_metadata.batch_slot_ids.device,
+            )
+            self._dflash2_proposals = store
+        return store
+
+    def _sample_block_path(
+        self, draft_model, gen_logits, block_hidden, anchor, spec_metadata, num_contexts, batch_size
+    ):
+        """A sampling batch's draft tokens.
+
+        The selector's lattice over each slot's global top-k, one sampled walk (greedy rows the
+        argmax), the proposals stored by sequence slot.
+        """
+        selector = draft_model.candidate_selector
+        candidate_ids, unary_logits, _ = self._dflash2_global_top_k(
+            gen_logits,
+            spec_metadata,
+            top_k=selector.top_k,
+            full_vocab=selector.predecessor_codebook.shape[0],
+        )
+        seed, offset = self._rng_state_per_request(
+            spec_metadata, num_contexts, batch_size, slot=spec_metadata.rng_draft_slot(0)
+        )
+        store = self._proposal_store(spec_metadata)
+        return k31_dflash2_selector_draft(
+            selector.predecessor_codebook,
+            selector.successor_codebook,
+            candidate_ids,
+            unary_logits,
+            rubin_linear(block_hidden, selector.hidden_projection_weight, False),
+            anchor,
+            seed,
+            offset,
+            spec_metadata.request_temperatures[num_contexts:batch_size],
+            GREEDY_TEMPERATURE_THRESHOLD,
+            store.candidate_ids,
+            store.q,
+            store.tokens,
+            spec_metadata.batch_slot_ids[num_contexts:batch_size],
+        )
+
+    def _verify_sampled_block(self, logits, attn_metadata, spec_metadata):
+        """A sampling batch's acceptance.
+
+        Context rows sample their first token; generation rows verify the selector's block (block
+        verification; greedy rows the strict rule). Returns ``(accepted_tokens [batch, K + 1],
+        num_accepted_tokens [batch])``, int32.
+        """
+        assert not spec_metadata.is_ragged_verify, "routing refuses ragged verification"
+        assert isinstance(logits, torch.Tensor), "sampled verification reads gathered logits"
+        batch_size = attn_metadata.num_seqs
+        num_contexts = attn_metadata.num_contexts
+        num_gens = batch_size - num_contexts
+        device = logits.device
+        draft_tokens = self._reshape_draft_tokens_for_accept(spec_metadata, num_gens, device)
+        logits = self._reshape_logits_for_accept(logits, num_contexts, num_gens, spec_metadata)
+        if logits.dim() == 1:
+            logits = logits.unsqueeze(0)
+        logits = self._apply_occurrence_penalties(
+            logits, draft_tokens, num_contexts, batch_size, spec_metadata
+        )
+        K = draft_tokens.shape[1]
+        store = self._proposal_store(spec_metadata)
+        slot_ids = spec_metadata.batch_slot_ids
+        accepted_tokens = torch.zeros((batch_size, K + 1), dtype=torch.int32, device=device)
+        num_accepted_tokens = torch.ones(batch_size, dtype=torch.int32, device=device)
+        if num_contexts > 0:
+            accepted_tokens[:num_contexts, 0] = self._sample_tokens_for_batch(
+                logits[:num_contexts], spec_metadata, num_contexts, num_contexts
+            ).to(torch.int32)
+            store.invalidate(slot_ids[:num_contexts])
+        if num_gens > 0:
+            start, end = num_contexts, num_contexts + num_gens * (K + 1)
+            gen_logits = self._zero_padding_rows(
+                logits[start:end],
+                spec_metadata,
+                num_contexts,
+                batch_size,
+                K + 1,
+                packed_verify=True,
+            )
+            vocab = gen_logits.shape[-1]
+            target_probs = self._compute_probs_from_logits(
+                spec_metadata.advanced_sampling_mode,
+                gen_logits,
+                spec_metadata.temperatures[start:end],
+                spec_metadata.top_ks[start:end],
+                spec_metadata.top_ps[start:end],
+                spec_metadata.min_ps[start:end],
+            ).view(num_gens, K + 1, vocab)
+            candidate_ids, q = k31_dflash2_proposal_load(
+                store.candidate_ids,
+                store.q,
+                store.tokens,
+                slot_ids[num_contexts:batch_size],
+                draft_tokens,
+            )
+            seed, offset = self._rng_state_per_request(
+                spec_metadata, num_contexts, batch_size, slot=spec_metadata.rng_accept_slot
+            )
+            tau, bonus = dflash2_block_verify_seeded(
+                target_probs, draft_tokens, candidate_ids, q, seed, offset, _DRAFT_BLOCK_VERIFY
+            )
+            greedy = (
+                spec_metadata.request_temperatures[num_contexts:batch_size]
+                <= GREEDY_TEMPERATURE_THRESHOLD
+            )
+            greedy_tau, greedy_bonus = dflash2_greedy_verify(
+                gen_logits.view(num_gens, K + 1, vocab), draft_tokens
+            )
+            tau = torch.where(greedy, greedy_tau, tau)
+            bonus = torch.where(greedy, greedy_bonus, bonus)
+            # Drafts before tau, the bonus at tau; later positions keep drafts (emitted only under
+            # a forced acceptance count).
+            tokens = torch.cat((draft_tokens.long(), draft_tokens[:, -1:].long()), dim=1)
+            tokens = tokens.scatter(1, tau.unsqueeze(1), bonus.unsqueeze(1))
+            accepted_tokens[num_contexts:] = tokens.to(torch.int32)
+            num_accepted_tokens[num_contexts:] = (tau + 1).to(torch.int32)
+        num_accepted_tokens = self._apply_force_accepted_tokens(
+            num_accepted_tokens, num_contexts, K, spec_metadata=spec_metadata
+        )
+        return self._commit_occurrence_counts(
+            (accepted_tokens, num_accepted_tokens), batch_size, spec_metadata
+        )
+
+    def _dflash2_global_top_k(self, gen_logits, spec_metadata, top_k: int, full_vocab: int):
+        """Per-position global top-k candidates and the tensor to score into.
+
+        This rank's top-32; when the drafter's logits are a vocab shard, the shard's ids made
+        global and the gathered pairs merged.
+        """
+        shard = gen_logits.shape[-1]
+        if shard == full_vocab:
+            unary_logits, candidate_ids = k31_dflash2_shard_top32(gen_logits, top_k, 0, False)
+            return candidate_ids, unary_logits, gen_logits
+        assert self._draft_logits_are_sharded(gen_logits, spec_metadata) and (
+            shard * self._vocab_shards == full_vocab
+        ), f"draft logits of width {shard} are neither the vocab {full_vocab} nor a TP shard of it"
+        combined = k31_dflash2_shard_top32(gen_logits, top_k, self._vocab_shard * shard, True)
+        gathered = allgather_module(combined, self.mapping, -1, None)
+        unary_logits, candidate_ids = k31_dflash2_merge_top32(gathered.contiguous(), top_k)
+        block_logits = gen_logits.new_full((*gen_logits.shape[:-1], full_vocab), float("-inf"))
+        return candidate_ids, unary_logits, block_logits
+
+    def _block_gather_ids(self, draft_model, num_gens, block_size, num_draft_tokens, num_rows):
+        """Block-output rows whose hidden states give the K draft logits (slots 1 .. K)."""
+        ids = self._draft_slot_ids(draft_model, num_gens, block_size, num_draft_tokens)
+        return ids.clamp(max=num_rows - 1)
+
+    # -- the step --------------------------------------------------------------
+
+    def _forward_impl(
+        self,
+        input_ids,
+        position_ids,
+        hidden_states,
+        logits,
+        attn_metadata,
+        spec_metadata,
+        draft_model,
+        resource_manager=None,
+    ):
+        batch_size = attn_metadata.num_seqs
+        num_contexts = attn_metadata.num_contexts
+        num_gens = batch_size - num_contexts
+
+        raw_logits = logits
+        logits_vocab_shard = False
+        K = spec_metadata.runtime_draft_len
+        if isinstance(logits, VocabShardedLogits):
+            if K > 0 and self._target_tokens_from_shard(spec_metadata):
+                # The target tokens come from the shard; the engine gathers the shard only for a
+                # logits post-processor.
+                raw_logits = logits.local
+                logits_vocab_shard = True
+            else:
+                logits = raw_logits = allgather_module(
+                    logits.local, logits.head.lm_head.mapping, -1, None
+                ).float()
+
+        if K == 0:
+            return self.skip_drafting(
+                input_ids,
+                position_ids,
+                hidden_states,
+                logits,
+                attn_metadata,
+                spec_metadata,
+                draft_model,
+            )
+
+        draft_kv_cache_manager = self.get_draft_kv_cache_manager(resource_manager)
+        if not self._ctx_buf_inited or self._ctx_kv_manager is not draft_kv_cache_manager:
+            raise RuntimeError("the unified draft cache must be prepared before the forward")
+
+        # Snapshots for the rollback after a warmup or a failed forward; never inside a capture.
+        is_warmup = spec_metadata.is_cuda_graph and not torch.cuda.is_current_stream_capturing()
+        if not torch.cuda.is_current_stream_capturing():
+            self._saved_ctx_len = self._ctx_len.clone()
+            self._saved_ctx_position_offset = self._ctx_position_offset.clone()
+            self._saved_ctx_len_host = list(self._ctx_len_host)
+            self._saved_req_ctx_pos = dict(self._req_ctx_pos)
+            self._ctx_len_restore_pending = True
+
+        self._execute_guided_decoder_if_present(logits)
+
+        accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
+            logits, attn_metadata, spec_metadata
+        )
+
+        if (
+            self._accept_stats is not None
+            and num_gens > 0
+            and not spec_metadata.is_cuda_graph
+            and not torch.cuda.is_current_stream_capturing()
+            and spec_metadata.request_ids is not None
+        ):
+            self._accept_stats.on_accept(
+                spec_metadata.request_ids[num_contexts:batch_size],
+                num_accepted_tokens[num_contexts:batch_size].tolist(),
+            )
+
+        # The KDA states follow the accepted tokens.
+        if num_gens > 0:
+            attn_metadata.kv_cache_manager.update_mamba_states(
+                attn_metadata=attn_metadata,
+                num_accepted_tokens=num_accepted_tokens,
+                state_indices=attn_metadata.mamba_metadata.state_indices,
+            )
+
+        self._prepare_attn_metadata_for_dflash(attn_metadata, spec_metadata)
+        self._prepare_kv_for_draft_forward(
+            attn_metadata, num_accepted_tokens, num_contexts, batch_size
+        )
+
+        # The drafter's RoPE is 1-D: the first (temporal) row of an mrope position tensor.
+        position_ids = position_ids[0, 0] if position_ids.ndim == 3 else position_ids.squeeze(0)
+        total_target_tokens = input_ids.shape[0]
+
+        if num_contexts > 0:
+            self._store_prefill_context(
+                draft_model, spec_metadata, attn_metadata, position_ids, total_target_tokens
+            )
+            if self._ctx_buf_inited and spec_metadata.request_ids:
+                self._rebuild_batch_to_slot(spec_metadata.request_ids)
+
+        drafts = not draft_model.context_kv_only
+        if not drafts and num_gens > 0:
+            self._check_no_real_generation(spec_metadata, num_contexts, batch_size)
+
+        vocab_size = None
+        gen_draft_tokens = None
+        if num_gens > 0 and drafts:
+            inputs = self.prepare_1st_drafter_inputs(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                accepted_tokens=accepted_tokens,
+                num_accepted_tokens=num_accepted_tokens,
+                attn_metadata=attn_metadata,
+                spec_metadata=spec_metadata,
+                draft_model=draft_model,
+                total_target_tokens=total_target_tokens,
+            )
+            with self.draft_kv_cache_context(attn_metadata, None):
+                hidden_states_out = draft_model.dflash_forward(
+                    **{name: inputs[name] for name in _DRAFT_FORWARD_ARGS}
+                )
+                gen_hidden_states = hidden_states_out[
+                    self._block_gather_ids(
+                        draft_model,
+                        num_gens,
+                        self._compute_block_size,
+                        K,
+                        hidden_states_out.shape[0],
+                    )
+                ]
+                block_hidden = gen_hidden_states.reshape(num_gens, K, -1)
+                gen_logits = draft_model.logits_processor(
+                    gen_hidden_states, draft_model.lm_head, attn_metadata, True
+                )
+                gen_logits = gen_logits.reshape(num_gens, K, gen_logits.shape[-1])
+                if dflash2_sampled_step(self, spec_metadata):
+                    gen_draft_tokens = self._sample_block_path(
+                        draft_model,
+                        gen_logits,
+                        block_hidden,
+                        inputs["first_prev_tokens"],
+                        spec_metadata,
+                        num_contexts,
+                        batch_size,
+                    )
+                else:
+                    # One coherent path through the block instead of per-position picks.
+                    gen_logits = self._apply_dflash2_selector(
+                        draft_model,
+                        gen_logits,
+                        block_hidden,
+                        inputs["first_prev_tokens"],
+                        spec_metadata,
+                    )
+                vocab_size = gen_logits.shape[-1]
+                if gen_draft_tokens is None:
+                    gen_draft_tokens = self.sample_draft_tokens(
+                        gen_logits, spec_metadata, batch_size, num_contexts=num_contexts
+                    )
+                if (
+                    self._accept_stats is not None
+                    and self._accept_stats.confidence_provider is not None
+                    and not spec_metadata.is_cuda_graph
+                    and not torch.cuda.is_current_stream_capturing()
+                    and spec_metadata.request_ids is not None
+                    and self._d2t is None
+                ):
+                    self._accept_stats.record_draft_confidence(
+                        spec_metadata.request_ids[num_contexts:batch_size],
+                        draft_model,
+                        block_hidden,
+                        inputs["first_prev_tokens"],
+                        gen_draft_tokens,
+                    )
+        else:
+            # A context-KV-only drafter, or no generation rows: placeholder drafts.
+            gen_draft_tokens = torch.zeros((num_gens, K), dtype=torch.int32, device="cuda")
+
+        # Context requests draft nothing yet; a one-hot draft-prob row keeps them a legal
+        # distribution when they turn into generation requests.
+        self.write_context_onehot_draft_probs(spec_metadata, num_contexts, num_gens, K, vocab_size)
+
+        if num_contexts > 0 and num_gens > 0:
+            ctx_draft_tokens = torch.zeros((num_contexts, K), dtype=torch.int32, device="cuda")
+            next_draft_tokens = torch.cat([ctx_draft_tokens, gen_draft_tokens], dim=0)
+        elif num_contexts > 0:
+            next_draft_tokens = torch.zeros((num_contexts, K), dtype=torch.int32, device="cuda")
+        else:
+            next_draft_tokens = gen_draft_tokens
+
+        self._restore_attn_metadata_from_spec_dec(attn_metadata)
+        self._apply_kv_rewind_after_draft(attn_metadata, spec_metadata)
+        self._rollback_guided_decoder_after_verify(num_accepted_tokens)
+
+        next_new_tokens = self._prepare_next_new_tokens(
+            accepted_tokens,
+            next_draft_tokens,
+            spec_metadata.batch_indices_cuda,
+            batch_size,
+            num_accepted_tokens,
+        )
+
+        # A warmup leaves the history lengths as it found them; real steps keep the updates.
+        if is_warmup:
+            self._ctx_len.copy_(self._saved_ctx_len)
+            self._restore_ctx_len_host()
+        self._ctx_len_restore_pending = False
+
+        return {
+            # The gathered FP32 target logits, or this rank's vocab shard when the target tokens
+            # came from it.
+            "logits": raw_logits,
+            "logits_vocab_shard": logits_vocab_shard,
+            "new_tokens": accepted_tokens,
+            "new_tokens_lens": num_accepted_tokens,
+            "next_draft_tokens": next_draft_tokens,
+            "next_new_tokens": next_new_tokens,
+        }
+
+
+# --------------------------------------------------------------------------------------------------
+# Core, the prefill and decode targets, and the shell with the engine's hooks.
+#
+# The core holds ``self.w`` (the weight table's parameters) and nothing else: no layer, helper or
+# backend object. The two targets run the 93 layers as straight-line code over the views: the mix,
+# the mixer, the mix, the MLP. The shell builds the DFlash2 drafter and its worker at construction,
+# as the DS target builds its MTP worker.
+# --------------------------------------------------------------------------------------------------
+
+# Where routing records the server role in the config's extra_attrs.
+_ROLE_ATTR = "kimi_k31_disagg_role"
+# The construction option of the KDA split over the CP group: the source config attribute that
+# ``model_kwargs`` sets, and its values (the sequence split with the serial FP32 hand-off, the
+# default; Ulysses all-to-alls pushed in BF16, or in FP8 over NCCL; the sequence split with the
+# start-state relay).
+_KDA_SPLIT_ATTR = "kimi_k31_kda_split"
+_KDA_SPLITS = ("handoff", "ulysses", "ulysses_fp8", "relay")
+_KDA_SPLIT_DEFAULT = "handoff"
+# The hand-off runs a step only while its longest request spans at most this many ranks (the
+# hand-off rounds are serial, one per rank a request spans past its first) and the step has at
+# least ``_KDA_HALO`` rows per rank (the convolution halo); other steps run the push Ulysses.
+_KDA_HANDOFF_MAX_SPAN = 8
+# Where routing records the values of the lever variables the target cannot set itself.
+_LEVER_ENV_ATTR = "kimi_k31_lever_env"
+# Where the loader records the dense DWDP manager of the launch (None: dense DWDP is off).
+_DENSE_DWDP_ATTR = "dense_dwdp_manager"
+# The shared experts run beside the routed chain on the side stream (on by default). A deployment
+# turns it off with ``model_kwargs: {text_config: {kimi_k31_moe_shared_beside: false}}``, read at
+# construction from the text config.
+_MOE_SHARED_BESIDE = True
+_MOE_SHARED_BESIDE_KEY = "kimi_k31_moe_shared_beside"
+# A static routed-expert placement (``ops/moe/_rubin_expert_placement``): the path of its file,
+# ``model_kwargs: {kimi_k31_expert_placement: <file>}``, read at construction. Routed-expert slot
+# ``s`` of a placed layer then holds checkpoint expert ``expert_of_slot[s]`` (weights.py relabels the
+# load and the router); unset keeps the identity placement.
+_EXPERT_PLACEMENT_ATTR = "kimi_k31_expert_placement"
+# Under per-layer dynamic EPLB, every this many forwards replan (HALO-Q + helper copies); the
+# forwards between reuse each layer's last helper placement (needs helper_slot_mode
+# per_layer_resident). Text-config key ``kimi_k31_eplb_replan_every`` (model_kwargs) overrides.
+_EPLB_REPLAN_EVERY = 1
+_EPLB_REPLAN_EVERY_KEY = "kimi_k31_eplb_replan_every"
+# Positions past the configured max_seq_len the identity RoPE table also covers (the KV cache
+# adds the draft tokens of a verify block).
+_ROPE_HEADROOM = 4096
+# The prefill Top-K launches a context server meets first on long chunks. The deterministic GVR
+# engine compiles a second variant of a tier's kernel once the logits row stride passes its
+# bitmap limit, 8 x 32 x BLK keys (tier 0: up to 148 rows, BLK 1024; tier 1: up to 296 rows,
+# BLK 512; tier 2: BLK 256), and the engine's prefill warmup launches row strides of at most
+# 33,024. One (rows, row stride) per tier, just past its limit.
+_GVR_PREFILL_PRECOMPILE = ((75, 262_400), (149, 131_328), (297, 65_792))
+
+
+# --------------------------------------------------------------------------------------------------
+# Context parallelism (cep): the step's row split, the KDA (Ulysses), MLA + DSA (own query rows)
+# and MoE (own rows) blocks of a context step, and the two targets.
+#
+# The executor is Ulysses CP N without attention DP: every rank holds the whole batch's metadata
+# and inputs. CP rank ``r`` runs rows ``[r * rows, (r + 1) * rows)`` of the step through every layer
+# (``st.cp``, ``cp_rows``); the residual stream, the attention-residual bank and every mix hold
+# ``rows`` rows, the padding rows of the last ranks zero throughout (zero rows mix, normalize,
+# route and project to zero). The mixers return this rank's rows, whole: nothing is reduced.
+#
+# * KDA (Ulysses): the fused ``[q | k | v | g | f_a | b]`` projection and ``f_b`` on this rank's
+#   rows with whole weights; one all-to-all hands every rank the q / k / v, forget gate and beta of
+#   its 96 / N heads for all rows; the short convolution, the chunked prefill (state pool,
+#   snapshots) of those heads over the whole batch, as a TP N rank would; one all-to-all brings
+#   each rank its rows' recurrence output of all 96 heads; the gated output norm and ``o_proj`` on
+#   its rows. The KDA state stays laid out as under TP N (96 / N heads per rank), which the
+#   generation server's transfer reads.
+# * MLA + DSA: the projections and the indexer's on this rank's rows; one all-gather of the new
+#   latent rows and index keys; every rank inserts every index key and appends every latent row
+#   (the KV stays laid out as under TP: whole on every rank); the indexer scores this rank's query
+#   rows only (its own query tiles of each prefill chunk under the logits budget); the sparse MLA
+#   of this rank's rows runs the attention op's context call over its row slices
+#   (``rubin_cp_mla_rows``), each a chunked-context request whose past KV is the request's cached
+#   tokens and its new tokens before the slice; the call appends nothing (no latent rows) and its
+#   query carries the RoPE columns itself (the identity rotation of K3.1's NoPE MLA).
+# * MoE: the all-to-all around this rank's CuteDSL experts on its rows (every rank holds ``rows``
+#   rows); the shared experts whole on its rows.
+# * The drafter's taps and the final hidden states are all-gathered to the step's rows: the
+#   drafter history and the head run on all rows on every rank, the same on each.
+# --------------------------------------------------------------------------------------------------
+
+
+class _KdaCp(NamedTuple):
+    """This rank's share of the KDA recurrence under Ulysses (``rt.kda_cp``), fixed by N."""
+
+    heads: int  # 96 / N heads
+    channels: int  # heads x head dim
+    # One row of a Ulysses chunk: q, k, v, the forget gate (``channels`` each), the beta logits,
+    # zero columns to 16 bytes; ``pack_beta`` is the beta logits' first column.
+    pack: int
+    pack_beta: int
+    # One row of the pushed Ulysses (bytes): q, k, v (``channels`` each), the beta logits from
+    # byte ``push_beta`` (to 16 bytes), f_a from byte ``push_fa`` (the head side runs f_b).
+    push_row: int
+    push_beta: int
+    push_fa: int
+
+
+def _kda_cp(world: int) -> _KdaCp:
+    """The Ulysses share of a rank of ``world``: its heads, channels and chunk rows."""
+    heads = _K31_KDA["num_heads"] // world
+    channels = heads * _KDA_D
+    beta = 3 * channels * 2
+    fa = beta + -(-heads * 2 // 16) * 16
+    return _KdaCp(
+        heads,
+        channels,
+        -(-(4 * channels + heads) // 8) * 8,
+        4 * channels,
+        fa + _KDA_D * 2,
+        beta,
+        fa,
+    )
+
+
+# The push workspace's receive region holds at least this many bytes; a row move larger than a
+# region runs as several pushes.
+_CP_PUSH_MIN_REGION = 128 << 20
+
+
+def _cp_push_region(kda_split: str, max_num_tokens: int, world: int, kc: _KdaCp) -> int:
+    """Bytes of a receive region of the CP group's push: the pushed Ulysses' larger receive of the
+    largest step (every row of the step out, this rank's rows of every head back), read in place."""
+    rows = -(-max_num_tokens // world)
+    if kda_split not in ("ulysses", "handoff"):
+        return _CP_PUSH_MIN_REGION
+    return max(_CP_PUSH_MIN_REGION, rows * world * kc.push_row, rows * _KDA_P * 2)
+
+
+# The indexer's per-call logits budget (elements): this rank's query tiles of a prefill chunk.
+_CP_IDX_LOGITS_BUDGET = _CONSTANTS["context"]["indexer_logits_elem_budget"]
+# The append of every new latent row ropes a scratch query of one head.
+_CP_APPEND_HEADS = 1
+
+
+class _CpMla(NamedTuple):
+    """The sparse MLA of this rank's rows: its row slices as chunked-context requests.
+
+    None fields on a rank without rows. Built once a step (``_cp_mla_step``); every DSA layer reads
+    it.
+    """
+
+    slices: int  # this rank's row slices (context requests it holds rows of)
+    sparse: dict  # thop_attention's metadata arguments of the slices
+    cu_q: torch.Tensor | None  # [slices + 1] int32 cumulative new tokens, None where md has none
+    cu_kv: torch.Tensor | None  # [slices + 1] int32 cumulative KV lengths, same
+    req_idx: torch.Tensor  # md.req_idx_per_token of this rank's rows (the Top-K remap)
+    # The append of every new latent row: per context request, cumulative cached and KV tokens.
+    cu_cached: torch.Tensor  # [num_contexts + 1] int64
+    cu_kv_all: torch.Tensor  # [num_contexts + 1] int64
+    max_new: int  # the longest request's new tokens
+    req: torch.Tensor  # [slices] int64: the context request of each slice
+    dkv: DkvPlan | None  # the owned-row writes and the Top-K reads under DKV
+    # The balanced indexer split (``_idx_split``): every rank's scored rows (``world + 1``
+    # bounds), this rank's ``[begin, end)`` of them, and the moves of the rows whose rank changes
+    # (the indexer inputs to the scoring rank, the Top-K back). None: the indexer scores this
+    # rank's own rows.
+    idx_bounds: tuple | None = None
+    idx_rows: tuple = (0, 0)
+    idx_to: RowMove | None = None
+    idx_from: RowMove | None = None
+    # Their pushes: per push (device table, the most rows of a destination, rows received).
+    idx_to_push: tuple = ()
+    idx_from_push: tuple = ()
+    # Sharded index keys under DKV: the step's insert and full-KV byte slots.
+    idx_slots: IndexSlots | None = None
+    # Owner writes under DKV (``_NEW_ROWS_ATTR`` not ``allgather``): the step's plan, its row move
+    # to the owners and its pushes (as ``idx_*_push``). None: the new rows are all-gathered.
+    owner: OwnerWrite | None = None
+    owner_move: RowMove | None = None
+    owner_push: tuple = ()
+
+
+def _cp_mla_step(
+    md: Any, base: dict, cp: CpRows, device: Any, pools: _DsaPools, region: int
+) -> _CpMla:
+    """Plan this step's sparse MLA of rows ``[cp.begin, cp.end)`` from the replicated metadata
+    (``region``: bytes of a receive region of the CP group's push)."""
+    nc = int(md.num_contexts)
+    new = [int(n) for n in md.seq_lens[:nc].tolist()]
+    cached = [int(c) for c in md.kv_cache_params.num_cached_tokens_per_seq[:nc]]
+    slices = own_row_slices(new, cp.begin, cp.end)
+    lens = slice_lengths(slices, cached)
+
+    def host(values, dtype=torch.int32):
+        return torch.tensor(list(values), dtype=dtype)
+
+    def cumulative(values, dtype):
+        return torch.tensor([0, *itertools.accumulate(values)], dtype=dtype, device=device)
+
+    req = torch.tensor([s.req for s in slices], dtype=torch.int64, device=device)
+    sparse = dict(base)
+    if slices:
+        blocks = md.kv_cache_block_offsets
+        sparse.update(
+            sequence_length=host(lens.kv).to(device),
+            host_past_key_value_lengths=host(lens.kv),
+            host_total_kv_lens=host((sum(lens.kv), 0)),
+            context_lengths=host(lens.q).to(device),
+            host_context_lengths=host(lens.q),
+            host_request_types=host([0] * len(slices)),
+            kv_cache_block_offsets=None if blocks is None else blocks.index_select(1, req),
+            block_ids_per_seq=None
+            if md.block_ids_per_seq is None
+            else md.block_ids_per_seq.index_select(0, req),
+            num_contexts=len(slices),
+            num_ctx_tokens=cp.live,
+            # A step-invariant value: it keys the C++ AttentionOp cache, which never evicts.
+            max_context_length=md.max_context_length,
+            max_context_q_len_override=None
+            if base.get("max_context_q_len_override") is None
+            else max(lens.q),
+        )
+    has_cu = getattr(md, "cu_q_seqlens", None) is not None
+    return _CpMla(
+        slices=len(slices),
+        sparse=sparse,
+        cu_q=cumulative(lens.q, torch.int32) if has_cu and slices else None,
+        cu_kv=cumulative(lens.kv, torch.int32) if has_cu and slices else None,
+        req_idx=md.req_idx_per_token[cp.begin : cp.end],
+        cu_cached=cumulative(cached, torch.int64),
+        cu_kv_all=cumulative((c + n for c, n in zip(cached, new)), torch.int64),
+        max_new=max(new, default=0),
+        req=req,
+        dkv=(
+            _dkv_step(md, pools, cached, new, {s.req for s in slices}, device)
+            if pools.dkv is not None
+            else None
+        ),
+        **(_idx_split_step(new, cached, cp, device, region) if pools.balanced_indexer else {}),
+        idx_slots=(_index_slots_step(md, pools, cached, new, device) if pools.idx_mirror else None),
+        **(
+            _owner_write_step(md, pools, cached, new, {s.req for s in slices}, cp, device, region)
+            if pools.dkv is not None and pools.new_rows != "allgather"
+            else {}
+        ),
+    )
+
+
+# Bytes of a step row an owner write moves: the BF16 latent, then (sharded index keys) the FP8
+# index key and its FP32 scale.
+_OWNER_LATENT_BYTES = _MLA_LATENT * 2
+_OWNER_KEY_BYTES = _IDX_DIM + 4
+
+
+def _owner_write_step(
+    md: Any,
+    pools: _DsaPools,
+    cached: list,
+    new: list,
+    rows_of: set,
+    cp: CpRows,
+    device: Any,
+    region: int,
+) -> dict:
+    """The step's owner writes (``_CpMla.owner*``): this rank's new rows to the owners of their
+    pages, and the new rows of the requests it holds rows of (``rows_of``) it copies back from
+    them; the pushes' tables go to the device in one copy."""
+    dkv = pools.dkv
+    tables = [dkv.peer_pages((int(rid), pools.dkv_lc)) for rid in md.request_ids[: len(cached)]]
+    scale, _ = pools.pool_params[pools.mla_layers[0]]
+    ow = owner_write(
+        dkv,
+        tables,
+        cached,
+        new,
+        cp.rows,
+        [r in rows_of for r in range(len(cached))],
+        pools.rows_per_rank,
+        scale,
+        device,
+        pools.max_pages,
+    )
+    width = _OWNER_LATENT_BYTES + (_OWNER_KEY_BYTES if pools.idx_mirror else 0)
+    plan = push_chunks(list(ow.blocks), list(ow.recv), cp.rank, region // width)
+    flat = [x for table, _, _ in plan for x in table]
+    tables_dev = torch.tensor(flat, dtype=torch.int32, pin_memory=prefer_pinned())
+    tables_dev = tables_dev.to(device, non_blocking=True).view(-1, 3 * cp.world)
+    move = RowMove(
+        held=cp.live, rows=ow.recv[cp.rank], send=tuple(n for _, _, n in ow.blocks), recv=()
+    )
+    pushes = tuple((tables_dev[k], most, got) for k, (_, most, got) in enumerate(plan))
+    return dict(owner=ow, owner_move=move, owner_push=pushes)
+
+
+def _index_slots_step(
+    md: Any, pools: _DsaPools, cached: list, new: list, device: Any
+) -> IndexSlots:
+    """Sharded index keys: the step's owned inserts and the full-KV slots over every rank's copy."""
+    dkv = pools.dkv
+    tables = [dkv.peer_pages((int(rid), pools.dkv_lc)) for rid in md.request_ids[: len(cached)]]
+    return index_slots(
+        dkv, tables, cached, new, pools.idx_slot_bytes, pools.idx_rank_bytes, _IDX_DIM, device
+    )
+
+
+# Bytes of a moved row of the balanced indexer split: the FP8 query and FP32 weights of the
+# indexer heads out, the Top-K back.
+_IDX_MOVE_OUT = _K31_DSA["index_num_heads"] * (_K31_DSA["index_head_dim"] + 4)
+_IDX_MOVE_BACK = _K31_DSA["index_topk"] * 4
+
+
+def _idx_split_step(new: list, cached: list, cp: CpRows, device: Any, region: int) -> dict:
+    """The step's balanced indexer split (``_CpMla.idx_*``): rows of equal indexer cost per rank
+    (a row of a request with ``cached`` cached tokens scores ``cached + i + 1`` keys), or nothing
+    when that is the equal split itself (or the step has rows that are not context rows). The
+    moves' push tables go to the device in one copy."""
+    bounds = balanced_query_bounds(new, cached, cp.world)
+    equal = tuple(min(r * cp.rows, cp.num_tokens) for r in range(cp.world)) + (cp.num_tokens,)
+    if bounds == equal or bounds[-1] != cp.num_tokens:
+        return {}
+    pushes = [
+        push_chunks(*row_move_blocks(a, b, cp.rank), cp.rank, region // width)
+        for a, b, width in ((equal, bounds, _IDX_MOVE_OUT), (bounds, equal, _IDX_MOVE_BACK))
+    ]
+    flat = [x for plan in pushes for table, _, _ in plan for x in table]
+    tables = torch.tensor(flat, dtype=torch.int32, pin_memory=prefer_pinned()).to(
+        device, non_blocking=True
+    )
+    tables = tables.view(-1, 3 * cp.world)
+    k = len(pushes[0])
+    return dict(
+        idx_bounds=bounds,
+        idx_rows=(bounds[cp.rank], bounds[cp.rank + 1]),
+        idx_to=row_move(equal, bounds, cp.rank),
+        idx_from=row_move(bounds, equal, cp.rank),
+        idx_to_push=tuple((tables[i], most, got) for i, (_, most, got) in enumerate(pushes[0])),
+        idx_from_push=tuple(
+            (tables[k + i], most, got) for i, (_, most, got) in enumerate(pushes[1])
+        ),
+    )
+
+
+def _dkv_step(
+    md: Any, pools: _DsaPools, cached: list, new: list, rows_of: set, device: Any
+) -> DkvPlan:
+    """The step's DKV plan: owned-row writes, and the Top-K reads of the context requests with
+    rows on this rank (``rows_of``): only their history is read."""
+    dkv = pools.dkv
+    tables = [dkv.peer_pages((int(rid), pools.dkv_lc)) for rid in md.request_ids[: len(cached)]]
+    scale, _ = pools.pool_params[pools.mla_layers[0]]
+    needed = [r in rows_of for r in range(len(cached))]
+    return dkv_plan(
+        dkv,
+        tables,
+        cached,
+        new,
+        pools.rows_per_rank,
+        scale,
+        device,
+        needed,
+        pools.max_pages,
+    )
+
+
+def _build_step_args(
+    md: Any,
+    position_ids: torch.Tensor,
+    spec_metadata: Any,
+    pools: _DsaPools,
+    rank: int,
+    world: int,
+    kda: tuple[bool, bool, bool],
+    region: int,
+) -> _Step:
+    """Project the engine's metadata onto this step's ``_Step`` (the step contract).
+
+    The Ulysses CP N executor (``world`` ranks) replicates the batch: ``md`` holds every row of the
+    step.
+    A cep server serves context steps only (``PrefillTarget``), so the step has no generation rows.
+    The MoE runs every rank's ``rows`` rows (``all_rank_num_tokens``). ``pools`` must be bound to
+    the step's cache manager. ``kda`` (bound at construction): plan the relay, the hand-off, the
+    push Ulysses (where the step does not hand off); ``region``: bytes of a receive region of the
+    CP group's push.
+    """
+    num_tokens = int(md.num_tokens)
+    num_contexts, num_ctx_tokens = md.num_contexts, md.num_ctx_tokens
+    assert md.num_generations == 0 and num_ctx_tokens == num_tokens, (
+        f"a cep context step has context rows only: {num_ctx_tokens} of {num_tokens} rows, "
+        f"{md.num_generations} generation requests"
+    )
+    cp = cp_rows(num_tokens, world, rank)
+    dsa = _dsa_step_args(md, pools, num_tokens, num_contexts, num_ctx_tokens, 0)
+    relay, handoff, push = kda
+    hand = _kda_handoff_step(md, rank, world, region) if handoff else None
+    return _Step(
+        md=md,
+        kda_md=md.mamba_metadata,
+        cache=md.kv_cache_manager,
+        position_ids=position_ids.view(-1),
+        num_tokens=num_tokens,
+        num_contexts=num_contexts,
+        num_ctx_tokens=num_ctx_tokens,
+        num_generations=0,
+        rows_per_gen=1,
+        all_rank_num_tokens=(cp.rows,) * world,
+        spec_md=spec_metadata,
+        cuda_graph=bool(md.is_cuda_graph),
+        dsa=dsa,
+        cp=cp,
+        cp_mla=_cp_mla_step(md, dsa.sparse_ctx, cp, position_ids.device, pools, region),
+        kda_relay=_kda_relay_step(md, rank, world) if relay else None,
+        kda_push=_kda_push_tables(cp, position_ids.device) if push and hand is None else None,
+        kda_handoff=hand,
+    )
+
+
+def _kda_relay_step(md: Any, rank: int, world: int) -> Any:
+    """The sequence-split KDA's plan of this step from the replicated metadata (host values: the
+    new tokens, whether each request continues a cached state, the block-reuse snapshots)."""
+    kmd = md.mamba_metadata
+    n = int(md.num_contexts)
+    snap = kmd.kda_snapshot
+    return kda_relay_plan(
+        lengths=md.seq_lens[:n].tolist(),
+        has_init=kmd.has_initial_states_cpu[:n].tolist(),
+        snapshots=() if snap is None else snap.host,
+        world=world,
+        rank=rank,
+        heads=_KDA_H,
+        slots=kmd.state_indices[:n],
+    )
+
+
+def _kda_handoff_step(md: Any, rank: int, world: int, region: int) -> KdaHandoffPlan | None:
+    """The serial hand-off's plan of this step from the replicated metadata, or None where the step
+    runs the push Ulysses instead: fewer than ``_KDA_HALO`` rows per rank, or a request spanning
+    more than ``_KDA_HANDOFF_MAX_SPAN`` ranks."""
+    kmd = md.mamba_metadata
+    n = int(md.num_contexts)
+    lengths = [int(x) for x in md.seq_lens[:n].tolist()]
+    if sum(lengths) < _KDA_HALO * world or _kda_max_span(lengths, world) > _KDA_HANDOFF_MAX_SPAN:
+        return None
+    snap = kmd.kda_snapshot
+    return kda_handoff_plan(
+        lengths=lengths,
+        has_init=[bool(x) for x in kmd.has_initial_states_cpu[:n].tolist()],
+        snapshots=() if snap is None else tuple((req, off) for req, _, off in snap.host),
+        world=world,
+        rank=rank,
+        heads=_KDA_H,
+        slots=kmd.state_indices[:n],
+        region=region,
+        snapshot_slots=None if snap is None else snap.slots,
+    )
+
+
+def _kda_push_tables(cp: CpRows, device: Any) -> tuple[torch.Tensor, torch.Tensor]:
+    """The pushed Ulysses' tables of the step: out (this rank's live rows to row ``rank * rows`` of
+    every rank), back (rank ``d``'s live rows of this rank's heads to rank ``d``)."""
+    out = [(0, cp.rank * cp.rows, cp.live)] * cp.world
+    back = [(d * cp.rows, 0, cp_rows(cp.num_tokens, cp.world, d).live) for d in range(cp.world)]
+    flat = [x for row in out + back for x in row]
+    t = torch.tensor(flat, dtype=torch.int32, pin_memory=prefer_pinned()).to(
+        device, non_blocking=True
+    )
+    return t[: 3 * cp.world], t[3 * cp.world :]
+
+
+def _cp_gather(x: torch.Tensor, st: _Step, rt: _Rt) -> torch.Tensor:
+    """Every rank's ``[rows, ...]`` rows, in row order: the step's ``[num_tokens, ...]`` rows."""
+    return rubin_cp_allgather(x, rt.cp_mapping)[: st.num_tokens]
+
+
+def _cp_pad(own: torch.Tensor, st: _Step) -> torch.Tensor:
+    """This rank's ``live`` rows ``own``, zero rows to ``rows``."""
+    cp = st.cp
+    if cp.live == cp.rows:
+        return own
+    padded = own.new_zeros((cp.rows, *own.shape[1:]))
+    padded[: cp.live].copy_(own)
+    return padded
+
+
+def _cp_rows_of(full: torch.Tensor, st: _Step) -> torch.Tensor:
+    """This rank's rows of a step-wide ``[num_tokens, ...]`` tensor, zero rows to ``rows``."""
+    return _cp_pad(full[st.cp.begin : st.cp.end], st)
+
+
+def _kda_core(
+    L: _KdaW, src: torch.Tensor, g: torch.Tensor, beta: torch.Tensor, st: _Step, kc: _KdaCp
+):
+    """This rank's ``kc.heads`` KDA heads over every context row: the short convolution, the chunked
+    prefill on the state pool (its snapshots too); ``[rows of the step, P / N]``.
+
+    ``src`` is the dense ``[q | k | v]`` of those heads, ``g`` their forget-gate logits, ``beta``
+    their beta logits, each ``[num_tokens, ...]``.
+    """
+    md = st.kda_md
+    n = st.num_contexts
+    rows = src.shape[0]
+    lc = st.cache.mamba_layer_cache(L.layer)
+    slots = md.state_indices[:n]
+    has_init = md.has_initial_states[:n]
+    snap = md.kda_snapshot
+    if snap is not None:
+        # Before the convolution, which moves the live windows on.
+        _kda_snapshot_windows(src, lc.conv, snap)
+    # Fresh requests start from a zero state; the convolution clears their windows itself.
+    reset_recurrent_state_rows(lc.temporal, slots, has_init)
+    q, k, v = rubin_kda_prefill_conv(
+        src=src,
+        weight=L.conv,
+        conv_state=lc.conv,
+        starts=md.query_start_loc[: n + 1],
+        slots=slots,
+        has_init=has_init,
+        max_seqlen=md.kda_max_seqlen,
+    )
+    o = rubin_kda_prefill(
+        q=q,
+        k=k,
+        v=v,
+        g=g.view(1, rows, kc.heads, _KDA_D),
+        beta=beta.unsqueeze(0),
+        state_pool=lc.temporal,
+        state_indices=slots,
+        cu_seqlens=md.query_start_loc_long[: n + 1],
+        A_log=L.a_log,
+        dt_bias=L.dt_bias,
+        scale=_KDA_SCALE,
+        lower_bound=_KDA_LOWER_BOUND,
+        mode=_KDA_PREFILL_MODE,
+        seq_order=md.kda_seq_order,
+        cu_chunks=md.kda_cu_chunks,
+        snapshot_rows=None if snap is None else snap.pool_rows,
+        snapshot_chunks=None if snap is None else snap.chunks,
+    )
+    # A replay cache exists only on a generation server; a context server has none.
+    _kda_commit_window(lc, slots, lc.conv)
+    return o.view(rows, kc.channels)
+
+
+def kda_prefill(L: _KdaW, x: torch.Tensor, st: _Step, rt: _Rt) -> torch.Tensor:
+    """Run the KDA mixer over this rank's rows ``x`` (Ulysses, pushed); return ``[rows, hidden]``.
+
+    Push 1 hands rank ``j`` a row per token of the step: its heads' raw q / k / v and beta logits,
+    and f_a (the head side runs its rows of ``f_b``); push 2 hands every rank its rows' recurrence
+    output of all 96 heads, rank ``j``'s heads as columns ``[j P / N, (j + 1) P / N)``. Both are
+    copies straight between the projection, the recurrence output and the peers' receive regions,
+    which the convolution, the forget gate, the recurrence and the output norm read in place.
+    """
+    cp, kc, ws = st.cp, rt.kda_cp, rt.cp_push
+    rows, n, live = x.shape[0], st.num_tokens, cp.live
+    pc, hc, w1 = kc.channels, kc.heads, kc.push_row
+    out_table, back_table = st.kda_push
+    y = rubin_mxfp8_linear(x, L.qkvgfab_w, L.qkvgfab_s)
+    pitch = y.stride(0) * y.element_size()
+    sent = [
+        CpPushBlock(y[:, s * _KDA_P :], pitch, pc * 2, pc * 2, s * pc * 2, w1, 0, live)
+        for s in range(3)
+    ]
+    sent.append(CpPushBlock(y[:, _KDA_B0:], pitch, hc * 2, hc * 2, kc.push_beta, w1, 0, live))
+    sent.append(CpPushBlock(y[:, _KDA_FA0:], pitch, 0, _KDA_D * 2, kc.push_fa, w1, 0, live))
+    got = rubin_cp_push(ws, sent, out_table)[: n * w1].view(torch.bfloat16).view(n, w1 // 2)
+    fa = got[:, kc.push_fa // 2 : kc.push_fa // 2 + _KDA_D]
+    g = rubin_linear(fa, L.fb[cp.rank * pc : (cp.rank + 1) * pc], False)
+    beta = got[:, kc.push_beta // 2 : kc.push_beta // 2 + hc]
+    o = _kda_core(L, got, g, beta, st, kc)
+    back = CpPushBlock(o, pc * 2, 0, pc * 2, 0, _KDA_P * 2, pc * 2, rows)
+    heads = rubin_cp_push(ws, (back,), back_table)[: rows * _KDA_P * 2]
+    return _kda_out(L, x, y, heads.view(torch.bfloat16).view(rows, _KDA_H, _KDA_D), st)
+
+
+def _kda_out(
+    L: _KdaW, x: torch.Tensor, y: torch.Tensor, o: torch.Tensor, st: _Step
+) -> torch.Tensor:
+    """The gated output norm and ``o_proj`` of this rank's live rows of the recurrence output
+    ``o`` (``[>= live, H, D]``, all 96 heads); ``[rows, hidden]``, zero past the live rows."""
+    live = st.cp.live
+    if not live:
+        return x.new_zeros(x.shape[0], x.shape[1])
+    core = rubin_rms_norm_gated_token_major(
+        x=o[:live].reshape(live * _KDA_H, _KDA_D),
+        z=y[:live, _KDA_G0:_KDA_FA0].view(live, _KDA_H, _KDA_D),
+        weight=L.o_norm,
+        eps=_KDA_EPS,
+        gate_activation="sigmoid",
+    )
+    out = rubin_mxfp8_linear(core.view(live, _KDA_P), L.o_w, L.o_s)
+    return _cp_pad(out, st)
+
+
+class _KdaPair(NamedTuple):
+    """A KDA layer under the hand-off: its view with all 96 heads' recurrence weights, and the
+    view with this rank's Ulysses share of them (the steps that do not hand off)."""
+
+    whole: _KdaW
+    ulysses: _KdaW
+
+
+def _kda_ulysses_view(L: _KdaW, rank: int, world: int) -> _KdaW:
+    """``L`` (the recurrence weights of all 96 heads) with the convolution, ``A_log`` and
+    ``dt_bias`` of rank ``rank``'s Ulysses heads, as copies (the prefill takes 16-byte aligned
+    gate parameters; at cep16 a rank's 6 heads of ``A_log`` start at 24-byte offsets)."""
+    hc = _KDA_H // world
+    pc = hc * _KDA_D
+    conv = torch.cat(
+        [L.conv[s * _KDA_P + rank * pc : s * _KDA_P + (rank + 1) * pc] for s in range(3)]
+    )
+    return L._replace(
+        conv=conv,
+        a_log=L.a_log[rank * hc : (rank + 1) * hc].clone(),
+        dt_bias=L.dt_bias[rank * pc : (rank + 1) * pc].clone(),
+    )
+
+
+def kda_prefill_handoff(L: _KdaPair, x: torch.Tensor, st: _Step, rt: _Rt) -> torch.Tensor:
+    """Run the KDA mixer over this rank's rows ``x`` (sequence split, serial FP32 hand-off); return
+    ``[rows, hidden]``. A step without a hand-off plan runs the pushed Ulysses (``kda_prefill``).
+
+    All 96 heads over this rank's live rows (``ops/ssm/rubin_kda_handoff``): the cached states and
+    windows of the requests that start here come from their owners (x1, with the 3-row halo of a
+    request that continues from the previous rank), one launch runs the fragments that start a
+    request, the hand-off rounds pass each continuing request's FP32 end state to the next rank,
+    which runs its lead fragment from it, and the end states, windows and snapshots go back to the
+    owners (x3); then the gated output norm and ``o_proj`` on its live rows.
+    """
+    hp = st.kda_handoff
+    if hp is None:
+        return kda_prefill(L.ulysses, x, st, rt)
+    W = L.whole
+    y, g = _kda_project(W, x)
+    lc = st.cache.mamba_layer_cache(W.layer)
+    o = kda_handoff_layer(
+        hp,
+        rt.cp_push,
+        y[:, :_KDA_G0],
+        g,
+        y[:, _KDA_B0:_KDA_B1],
+        W.conv,
+        W.a_log,
+        W.dt_bias,
+        lc.temporal,
+        lc.conv,
+        _KDA_SCALE,
+        _KDA_LOWER_BOUND,
+        _KDA_PREFILL_MODE,
+        _KDA_HANDOFF_PREP_AHEAD,
+    )
+    _kda_commit_window(lc, hp.slots_all, lc.conv)
+    return _kda_out(W, x, y, o, st)
+
+
+def kda_prefill_fp8(L: _KdaW, x: torch.Tensor, st: _Step, rt: _Rt) -> torch.Tensor:
+    """``kda_prefill`` with FP8 all-to-alls (``kda_split: "ulysses_fp8"``); return ``[rows, hidden]``.
+
+    All-to-all 1 hands rank ``j`` a byte row per token: its heads' q / k / v as E4M3 codes with one
+    FP32 scale per 128 columns, then ``f_a`` and its heads' beta logits in BF16; the head side
+    computes the forget gate of its heads from ``f_a`` (its rows of ``f_b``). All-to-all 2 brings the
+    recurrence output back as E4M3 rows with their scales. As the generic K3.1 context parallelism
+    (``TLLM_KIMI_K31_CP_FP8_A2A=all``).
+    """
+    cp, kc = st.cp, rt.kda_cp
+    rows, world, n = x.shape[0], cp.world, st.num_tokens
+    pc, hc = kc.channels, kc.heads
+    gd = pc // 128
+    # The forget gate runs on the head side (its heads' rows of f_b), so only the fused GEMM here.
+    y = rubin_mxfp8_linear(x, L.qkvgfab_w, L.qkvgfab_s)
+    # All-to-all 1: [3 sections x (codes | scales)] then [f_a | beta] in BF16, padded to 16 bytes.
+    code1, extra = 3 * pc, _KDA_D + hc
+    off1 = code1 + 3 * gd * 4
+    wb1 = -(-(off1 + 2 * extra) // 16) * 16
+    send = x.new_empty((world, rows, wb1), dtype=torch.uint8)
+    for s in range(3):
+        rubin_cp_fp8_pack(
+            x=y[:, s * _KDA_P : (s + 1) * _KDA_P],
+            buf=send,
+            dest_stride=rows * wb1,
+            row_stride=wb1,
+            gd=gd,
+            code_off=s * pc,
+            scale_off=code1 + s * gd * 4,
+        )
+    tail = send.view(torch.bfloat16)[:, :, off1 // 2 : off1 // 2 + extra]
+    tail[..., :_KDA_D].copy_(y[:, _KDA_FA0:_KDA_B0].unsqueeze(0).expand(world, rows, _KDA_D))
+    tail[..., _KDA_D:].copy_(y[:, _KDA_B0:_KDA_B1].view(rows, world, hc).transpose(0, 1))
+    got = rubin_cp_alltoall(send.unbind(0), rt.cp_group).view(world * rows, wb1)
+    src = y.new_empty((n, code1))
+    for s in range(3):
+        rubin_cp_fp8_unpack(
+            buf=got,
+            out=src,
+            rows=n,
+            num_src=1,
+            src_stride=0,
+            row_stride=wb1,
+            gd=gd,
+            code_off=s * pc,
+            scale_off=code1 + s * gd * 4,
+            out_col_off=s * pc,
+        )
+    gate = got.view(torch.bfloat16)[:n, off1 // 2 : off1 // 2 + extra]
+    g = rubin_linear(gate[:, :_KDA_D], L.fb[cp.rank * pc : (cp.rank + 1) * pc], False)
+    o = _kda_core(L, src, g, gate[:, _KDA_D:].contiguous(), st, kc)
+    # All-to-all 2: this rank's heads of every row, as E4M3 rows, back to the rows' ranks.
+    wb2 = -(-(pc + gd * 4) // 16) * 16
+    back = x.new_empty((cp.padded_tokens, wb2), dtype=torch.uint8)
+    rubin_cp_fp8_pack(x=o, buf=back, dest_stride=0, row_stride=wb2, gd=gd, code_off=0, scale_off=pc)
+    if n < cp.padded_tokens:
+        back[n:].zero_()
+    heads = rubin_cp_alltoall(back.view(world, rows, wb2).unbind(0), rt.cp_group)
+    o_rows = y.new_empty((rows, _KDA_P))
+    rubin_cp_fp8_unpack(
+        buf=heads,
+        out=o_rows,
+        rows=rows,
+        num_src=world,
+        src_stride=rows * wb2,
+        row_stride=wb2,
+        gd=gd,
+        code_off=0,
+        scale_off=pc,
+        out_col_off=0,
+    )
+    core = rubin_rms_norm_gated_token_major(
+        x=o_rows.view(rows * _KDA_H, _KDA_D),
+        z=y[:, _KDA_G0:_KDA_FA0].view(rows, _KDA_H, _KDA_D),
+        weight=L.o_norm,
+        eps=_KDA_EPS,
+        gate_activation="sigmoid",
+    )
+    out = rubin_mxfp8_linear(core.view(rows, _KDA_P), L.o_w, L.o_s)
+    if cp.live < rows:
+        out[cp.live :].zero_()
+    return out
+
+
+def kda_prefill_relay(L: _KdaW, x: torch.Tensor, st: _Step, rt: _Rt) -> torch.Tensor:
+    """Run the KDA mixer over this rank's rows ``x`` (sequence split); return ``[rows, hidden]``.
+
+    All 96 heads over this rank's rows: the 3-row convolution histories in one all-gather, both
+    passes of its segments in one launch, the segments' transitions to the head owners (the state
+    pools stay head-sharded, as under Ulysses) and their start states back, in two all-to-alls
+    (``ops/ssm/rubin_kda_relay``); then the gated output norm and ``o_proj`` on its live rows.
+    """
+    rp, cp = st.kda_relay, st.cp
+    rows, live = x.shape[0], cp.live
+    y, g = _kda_project(L, x)
+    lc = st.cache.mamba_layer_cache(L.layer)
+    gathered = rubin_cp_allgather(relay_gather_input(rp, y, lc.conv), rt.cp_mapping)
+    o = states = win = snap_win = None
+    if rp.nseg:
+        win = relay_histories(rp, y, gathered)
+        snap_win = win.index_select(0, rp.snap_local)
+        q, k, v = rubin_kda_prefill_conv(
+            src=y[:live],
+            weight=L.conv,
+            conv_state=win,
+            starts=rp.conv_starts,
+            slots=rp.conv_slots,
+            has_init=rp.conv_init,
+            max_seqlen=rp.max_seqlen,
+        )
+        states = y.new_empty((rp.nseg + rp.naff, _KDA_H, _KDA_D, _KDA_D), dtype=torch.float32)
+        o = rubin_kda_relay_prefill(
+            q=q,
+            k=k,
+            v=v,
+            g=g[:live].view(1, live, _KDA_H, _KDA_D),
+            beta=_kda_beta(y)[:, :live],
+            states=states,
+            state_rows=rp.state_rows,
+            cu_seqlens=rp.cu_seqlens,
+            src_rows=rp.src_rows,
+            seq_flags=rp.seq_flags,
+            A_log=L.a_log,
+            dt_bias=L.dt_bias,
+            scale=_KDA_SCALE,
+            lower_bound=_KDA_LOWER_BOUND,
+            seq_order=rp.seq_order,
+            cu_chunks=rp.cu_chunks,
+            out_rows=rp.out_rows,
+        )[0]
+    send = relay_pack(rp, states, win, snap_win)
+    recv = rubin_cp_alltoall(send.unbind(0), rt.cp_group)
+    send = relay_own(rp, recv, lc.temporal, lc.conv)
+    if send is not None:
+        recv = rubin_cp_alltoall(send.unbind(0), rt.cp_group)
+        if rp.naff:
+            rubin_kda_relay_correct(o, relay_starts(rp, recv), rp.corr)
+    _kda_commit_window(lc, rp.slots, lc.conv)
+    if not live:
+        return x.new_zeros(rows, x.shape[1])
+    core = rubin_rms_norm_gated_token_major(
+        x=o[:live].reshape(live * _KDA_H, _KDA_D),
+        z=y[:live, _KDA_G0:_KDA_FA0].view(live, _KDA_H, _KDA_D),
+        weight=L.o_norm,
+        eps=_KDA_EPS,
+        gate_activation="sigmoid",
+    )
+    out = rubin_mxfp8_linear(core.view(live, _KDA_P), L.o_w, L.o_s)
+    return _cp_pad(out, st)
+
+
+def _mla_ctx_query(L: _MlaW, q_nope: torch.Tensor, rows: int) -> tuple:
+    """The context call's query at 128 heads in FP8: (a one-row stand-in, the FP8 query).
+
+    W_UK writes the real heads' latent columns in BF16, and ``rubin_mla_ctx_q_fp8`` converts them
+    the way the op converts a BF16 query (unit scale, round to nearest even, saturated), with zero
+    padding heads. Given the FP8 buffer and its unit scale, the op's RoPE kernel writes the RoPE
+    columns in FP8 (from the padded ``q_pe``, unchanged: K3.1's MLA is NoPE), sets the FMHA's
+    scales, and the op skips its own quantization and reads no BF16 query: one row stands in for
+    the query's shape. Under ``_MLA_CTX_WUK_FP8`` W_UK writes the same FP8 bytes in its epilogue
+    (``rubin_mla_ctx_wuk_fp8``: each product rounded to BF16 as the BMM rounds it, then converted) and
+    no BF16 query exists.
+    """
+    if _MLA_CTX_WUK_FP8:
+        quant_q = torch.empty(
+            rows, _MLA_PAD_HEADS, _MLA_LATENT, dtype=torch.float8_e4m3fn, device=q_nope.device
+        )
+        rubin_mla_ctx_wuk_fp8(quant_q[..., :_MLA_KV_LORA], q_nope, L.k_b)
+        return q_nope.new_empty(1, _MLA_PAD_HEADS * _MLA_LATENT).expand(rows, -1), quant_q
+    latent_q = q_nope.new_empty(rows, _MLA_HEADS, _MLA_KV_LORA)
+    bmm_out(q_nope.transpose(0, 1), L.k_b, latent_q.transpose(0, 1))
+    quant_q = torch.empty(
+        rows, _MLA_PAD_HEADS, _MLA_LATENT, dtype=torch.float8_e4m3fn, device=q_nope.device
+    )
+    rubin_mla_ctx_q_fp8(quant_q[..., :_MLA_KV_LORA], latent_q, _MLA_HEADS)
+    return latent_q.new_empty(1, _MLA_PAD_HEADS * _MLA_LATENT).expand(rows, -1), quant_q
+
+
+def _mla_append(i: int, latent: torch.Tensor, st: _Step, rt: _Rt, owned: bool = False) -> None:
+    """Append every new latent row of the step (``[num_tokens, 576]``) to layer ``i``'s cache.
+
+    Under DKV only the rows this rank owns, at their rank-local positions; ``owned``: ``latent``
+    is those rows already (an owner write's).
+    """
+    md, c = st.md, st.cp_mla
+    led = c.dkv
+    if led is not None and not owned:
+        latent = latent.index_select(0, led.owned_rows)
+    cu_cached, cu_kv, max_new = (
+        (c.cu_cached, c.cu_kv_all, c.max_new)
+        if led is None
+        else (led.cu_cached, led.cu_kv, led.max_new)
+    )
+    if latent.shape[0] == 0:
+        return
+    scratch = latent.new_empty(latent.shape[0], _CP_APPEND_HEADS * _MLA_QK)
+    mla_rope_append_paged_kv_assign_q(
+        scratch,
+        latent,
+        st.num_contexts,
+        cu_cached,
+        cu_kv,
+        max_new,
+        rt.mla_rope,
+        _CP_APPEND_HEADS,
+        _MLA_NOPE,
+        _MLA_ROPE,
+        _MLA_KV_LORA,
+        md.kv_cache_block_offsets,
+        st.cache.kv_cache_pool_pointers,
+        st.cache.kv_cache_pool_mapping,
+        None,
+        0,
+        rt.dsa_pools.local[i],
+        rt.dsa_pools.tokens_per_block,
+        _mla_window(i, st, rt),
+        1,
+        _MLA_ATTN["quant_mode"],
+    )
+
+
+def _idx_prefill(i: int, q8, w, k8, ks, st: _Step, rt: _Rt, rows=None) -> torch.Tensor:
+    """The request-local Top-K ``[e - b, 2048]`` of context rows ``rows = (b, e)``, by default
+    this rank's own rows.
+
+    ``q8`` / ``w``: those rows; ``k8`` / ``ks``: the index keys of every new token (None under
+    owner writes with sharded keys: read from the owners' caches like a chunk's). Per
+    prefill chunk: gather the chunk's index keys (cached and new) from the cache, then score this
+    rank's rows of the chunk in query tiles of at most the logits budget (no DeepGEMM schedule:
+    the step's plan tiles the whole chunk). A short prompt takes the dense Top-K; a step the
+    metadata did not chunk scores the new keys.
+    """
+    d, cp = st.dsa, st.cp
+    b, e = rows if rows is not None else (cp.begin, cp.end)
+    if d.skip_ctx:
+        return d.topk_dense[b:e]
+    topk = d.topk_out[b:e]
+    if d.chunks is None:
+        kv = d.num_ctx_kv_tokens
+        if kv == 0:
+            topk.fill_(-1)
+        elif k8 is None or (st.cp_mla.owner is not None and rt.dsa_pools.new_rows == "verify"):
+            # Owner writes with sharded keys: the step's keys from their owners' caches.
+            slots = st.cp_mla.idx_slots
+            ck8, cks = k31_gather_k_cache_paged(
+                rt.dsa_pools.idx_mirror[i], slots.full_fp8, slots.full_scale, 0, kv, _IDX_DIM
+            )
+            if k8 is not None and not (
+                _same_bytes(ck8, k8[:kv]) and _same_bytes(cks.view(-1), ks[:kv].view(-1))
+            ):
+                raise RuntimeError(
+                    f"{_TARGET} owner writes, layer {i}, rank {st.cp.rank}: the step's index keys "
+                    "in their owners' caches differ from the all-gather"
+                )
+            k8, ks = ck8, cks
+        for g0, g1 in own_row_tiles(0, st.num_ctx_tokens, b, e, kv, _CP_IDX_LOGITS_BUDGET):
+            _idx_prefill_topk(
+                q8[g0 - b : g1 - b],
+                w[g0 - b : g1 - b],
+                topk[g0 - b : g1 - b],
+                d.cu_ks[g0:g1],
+                d.cu_ke[g0:g1],
+                k8[:kv],
+                ks[:kv],
+                None,
+            )
+        return topk
+    slots = st.cp_mla.idx_slots
+    if slots is None:
+        k_cache, slot_fp8, slot_scale = rt.dsa_pools.idx_k_cache[i], d.k_slot_fp8, d.k_slot_scale
+    else:
+        k_cache, slot_fp8, slot_scale = rt.dsa_pools.idx_mirror[i], slots.full_fp8, slots.full_scale
+    for chunk in d.chunks:
+        t0, t1 = chunk.token_start, chunk.token_end
+        keys = chunk.k_token_end - chunk.k_token_start
+        tiles = own_row_tiles(t0, t1, b, e, keys, _CP_IDX_LOGITS_BUDGET)
+        if not tiles:
+            continue
+        if keys <= 0:
+            topk[tiles[0][0] - b : tiles[-1][1] - b].fill_(-1)
+            continue
+        ck8, cks = k31_gather_k_cache_paged(
+            k_cache, slot_fp8, slot_scale, chunk.k_token_start, keys, _IDX_DIM
+        )
+        for g0, g1 in tiles:
+            _idx_prefill_topk(
+                q8[g0 - b : g1 - b],
+                w[g0 - b : g1 - b],
+                topk[g0 - b : g1 - b],
+                chunk.cu_seqlen_ks[g0 - t0 : g1 - t0],
+                chunk.cu_seqlen_ke[g0 - t0 : g1 - t0],
+                ck8,
+                cks,
+                None,
+            )
+    return topk
+
+
+# Under DKV the read's indices come from one CuTe DSL launch (rubin_dkv_topk_read_fused): the
+# Top-K remap over the new tokens' pages, the copied history rows, the -1 padding at row 0 and
+# page 0 zeroed. False runs the same as four steps: zero_, _idx_remap, rubin_dkv_topk_read, clamp.
+_DKV_READ_FUSED = _CONSTANTS["context"]["dkv_read_fused"]
+
+
+def _mla_read(i: int, latent, topk: torch.Tensor, st: _Step, rt: _Rt) -> tuple:
+    """Layer ``i``'s DKV read: a local buffer the sparse MLA attends, and the Top-K as its rows.
+
+    The buffer's head holds the step's new tokens in pages, as a replicated cache would hold them
+    (``DkvPlan.table``): appended from ``latent`` (every new row, all-gathered), or under owner
+    writes every new row of this rank's requests copied from their owners' pools after the owner
+    writes' fence (``rubin_dkv_rows_read``; ``verify``: ``latent`` given, compared with its
+    append); behind them, the history rows this rank's Top-K (``topk``, request-local) selects,
+    copied once each from their owners through the peer mapping (``rubin_dkv_topk_read``). Returns the buffer (kept
+    alive for the attention call), the attention op's sparse arguments over it, and the indices,
+    whose -1 padding points at row 0 of the buffer's zeroed page 0 (``_DKV_READ_FUSED``: one
+    launch for the indices and the zeros).
+    """
+    c, p = st.cp_mla, rt.dsa_pools
+    led = c.dkv
+    tpb = p.tokens_per_block
+    _, layer_offset = p.pool_params[i]
+    new_rows = led.pages * tpb
+    rows = new_rows + min(led.hist_src.numel(), topk.numel())
+    kv = topk.new_empty((rows, p.row_bytes), dtype=torch.uint8)
+    if not _DKV_READ_FUSED:
+        # Page 0 is never written (it stands for the history blocks), but the Top-K's padding is
+        # pointed at its row 0 below and the kernel loads that row; keep it finite.
+        kv[:tpb].zero_()
+    pointers, mapping = read_pointers(kv, p.num_local_layers)
+    if c.owner is None:
+        _mla_read_append(i, latent, kv, (pointers, mapping), st, rt)
+    elif c.owner.new_src.numel():
+        own = c.owner
+        rows_new = rubin_dkv_rows_read(
+            kv.new_empty((own.new_src.numel(), p.row_bytes)),
+            p.peer_tokens,
+            own.new_src,
+            own.new_pos,
+            own.new_count,
+            layer_offset * tpb,
+        )
+        kv.view(torch.int64).index_copy_(0, own.new_dst, rows_new.view(torch.int64))
+        if latent is not None:
+            ref = kv.new_empty((new_rows, p.row_bytes))
+            _mla_read_append(i, latent, ref, read_pointers(ref, p.num_local_layers), st, rt)
+            if not torch.equal(ref.index_select(0, own.new_dst), rows_new):
+                raise RuntimeError(
+                    f"{_TARGET} owner writes, layer {i}, rank {st.cp.rank}: the new rows read "
+                    "from their owners differ from the all-gather's append"
+                )
+    if _DKV_READ_FUSED:
+        # The remap, the history rows, the padding at row 0 and page 0's zeros in one launch after
+        # the history copy, bit for bit the four steps below.
+        indices = rubin_dkv_topk_read_fused(
+            kv,
+            new_rows,
+            topk,
+            c.req_idx,
+            led.table,
+            tpb,
+            tpb,
+            0,
+            led.hist_start,
+            led.hist_len,
+            led.hist_src,
+            p.peer_tokens,
+            layer_offset * tpb,
+        )
+    else:
+        new_idx = _idx_remap(i, topk, c.req_idx, led.table, st, rt, (1, 0))
+        indices = rubin_dkv_topk_read(
+            kv,
+            new_rows,
+            topk,
+            c.req_idx,
+            new_idx,
+            led.hist_start,
+            led.hist_len,
+            led.hist_src,
+            p.peer_tokens,
+            layer_offset * tpb,
+        )
+        # The sparse MLA kernel masks the Top-K's -1 padding by position, but its TMA gather can
+        # still read past the end of ``kv`` for those entries; point them at row 0, which always
+        # exists and is zeroed above (a masked entry still enters the product, and 0 * NaN is NaN).
+        indices = indices.clamp(min=0)
+    sparse = dict(
+        c.sparse,
+        kv_cache_block_offsets=led.offsets.index_select(1, c.req),
+        host_kv_cache_pool_pointers=pointers,
+        host_kv_cache_pool_mapping=mapping,
+    )
+    return kv, sparse, indices
+
+
+def _mla_read_append(i: int, latent: torch.Tensor, kv: torch.Tensor, pool: tuple, st, rt) -> None:
+    """Append every new latent row of the step (``latent``) into the head of a DKV read buffer
+    ``kv`` (``pool``: its pointers and layer mapping), as a replicated cache holds them."""
+    c, p = st.cp_mla, rt.dsa_pools
+    led = c.dkv
+    pointers, mapping = pool
+    scratch = latent.new_empty(latent.shape[0], _CP_APPEND_HEADS * _MLA_QK)
+    mla_rope_append_paged_kv_assign_q(
+        scratch,
+        latent,
+        st.num_contexts,
+        c.cu_cached,
+        c.cu_kv_all,
+        c.max_new,
+        rt.mla_rope,
+        _CP_APPEND_HEADS,
+        _MLA_NOPE,
+        _MLA_ROPE,
+        _MLA_KV_LORA,
+        led.offsets,
+        pointers,
+        mapping,
+        None,
+        0,
+        p.local[i],
+        p.tokens_per_block,
+        _mla_window(i, st, rt),
+        1,
+        _MLA_ATTN["quant_mode"],
+    )
+
+
+def _mla_context(
+    L, i, q, q8, w, k8, ks, out, st: _Step, rt: _Rt, latent, latent_all, topk=None, gate_x=None
+):
+    """Sparse MLA of this rank's live rows at 128 heads, then W_UV of the 96 real heads into
+    ``out``: the indexer's Top-K of those rows, its remap and the attention op's context call over
+    the rank's row slices (``st.cp_mla``), with the query in FP8 (``_mla_ctx_query``).
+
+    ``latent``: this rank's live rows' latent, which the op appends at their positions of what it
+    reads (bytes the step's append wrote there already: the op's RoPE kernel, which writes the
+    FP8 query's RoPE columns and the FMHA's scales, runs only with it). Under DKV the call reads
+    a local buffer of the selected rows (``_mla_read``; ``latent_all``: every new latent row).
+    Given ``gate_x`` (the layer input, every row of ``out``), ``g_proj(gate_x)`` runs after the
+    attention and W_UV writes the gated rows (``rubin_mla_wuv_gate``): ``out``'s rows past the live
+    rows are gated zeros.
+    """
+    rows = q.shape[0]
+    c = st.cp_mla
+    q_nope, q_pe = q.view(rows, _MLA_HEADS, _MLA_QK).split([_MLA_NOPE, _MLA_ROPE], -1)
+    q_pe_pad = q.new_empty(rows, _MLA_PAD_HEADS, _MLA_ROPE)
+    rubin_pad_heads(q_pe_pad, q_pe, _MLA_HEADS)
+    stand_in, quant_q = _mla_ctx_query(L, q_nope, rows)
+    if topk is None:
+        topk = _idx_prefill(i, q8, w, k8, ks, st, rt)
+    kv = None
+    if c.dkv is None:
+        sparse = c.sparse
+        indices = _idx_remap(i, topk, c.req_idx, st.dsa.block_table_ctx, st, rt)
+    else:
+        kv, sparse, indices = _mla_read(i, latent_all, topk, st, rt)
+    lat = thop_attention(
+        q=stand_in,
+        output=q.new_empty(rows, _MLA_PAD_HEADS * _MLA_KV_LORA),
+        latent_cache=latent,
+        q_pe=q_pe_pad,
+        rotary_cos_sin=rt.mla_rope,
+        local_layer_idx=rt.dsa_pools.local[i],
+        attention_input_type=_MLA_CONTEXT,
+        attention_window_size=_mla_window(i, st, rt),
+        rope_max_positions=rt.dsa_pools.rope_positions,
+        rope_original_max_positions=rt.dsa_pools.rope_positions,
+        softmax_stats_tensor=None,
+        cu_q_seqlens=c.cu_q,
+        cu_kv_seqlens=c.cu_kv,
+        fmha_scheduler_counter=None,
+        mla_bmm1_scale=None,
+        mla_bmm2_scale=None,
+        quant_q_buffer=quant_q,
+        # The FP8 query's scale, applied to the RoPE kernel's FP8 columns: 1, as the op's own
+        # quantization of a BF16 query applies it.
+        quant_scale_qkv=torch.ones(1, dtype=torch.float32, device=q.device),
+        sparse_attn_indices=indices,
+        **{**sparse, **_MLA_ATTN_PAD128},
+    )
+    del kv
+    heads = lat.view(rows, _MLA_PAD_HEADS, _MLA_KV_LORA)[:, :_MLA_HEADS]
+    if gate_x is None:
+        _mla_expand(L.v_b_t, heads, out)
+    else:
+        rubin_mla_wuv_gate(out, heads, L.v_b_t, rubin_linear(gate_x, L.g, False))
+
+
+def _dkv_fence(st: _Step, rt: _Rt) -> None:
+    """Under DKV, the group's GPU fence before the step's first read of another rank's pages, when
+    a rank copied pages of the batch in this step's cache preparation (a host-tier restore, a
+    partial-reuse copy; the flag comes with the page exchange, the same on every rank): those
+    copies may still be in flight on the owner, so the group first meets in a one-element
+    all-gather on the execution stream, which on each owner runs after its copies, and every read
+    of the step (each DSA layer's ``_mla_read``, the sharded index keys' gathers) is issued after
+    it on the same stream.
+    """
+    p = rt.dsa_pools
+    if p.dkv is not None and p.dkv.take_fence():
+        rubin_cp_allgather(st.position_ids.new_zeros(1), rt.cp_mapping)
+
+
+def mla_prefill(L: _MlaW, i: int, x: torch.Tensor, st: _Step, rt: _Rt) -> torch.Tensor:
+    """Layer ``i``'s MLA + DSA over this rank's rows ``x``; ``[rows, hidden]``, whole.
+
+    The projections run on this rank's rows; the new tokens' latent rows and index keys are
+    all-gathered, inserted and appended on every rank, or under DKV with owner writes pushed to
+    the owners of their pages (``_cp_owner_write``); the indexer and the sparse MLA run this
+    rank's live rows.
+    """
+    live = st.cp.live
+    qr, latent = _mla_project(L, x, st, rt)
+    q = rubin_linear(qr, L.q_b, False)
+    q8, k8, ks, w = _idx_project(L, x, qr, st, rt, _widen_fp32(x))
+    if st.cp_mla.owner is None:
+        latent_all = _cp_gather(latent, st, rt)
+        k8_all = _cp_gather(k8.view(torch.uint8), st, rt).view(k8.dtype)
+        ks_all = _cp_gather(ks, st, rt)
+        _idx_insert(i, k8_all, ks_all, st.num_tokens, st, rt)
+        _mla_append(i, latent_all, st, rt)
+    else:
+        latent_all, k8_all, ks_all = _cp_owner_write(i, latent, k8, ks, st, rt)
+    topk = _idx_balanced(i, q8, w, k8_all, ks_all, st, rt)
+    out = x.new_empty(x.shape[0], _MLA_OUT_HEADS * _MLA_V)
+    if live:
+        # Under _MLA_CTX_GATE_IN_WUV W_UV gates every row of out (the padding rows' zeros too), and
+        # o_proj reads them as _mla_output's o_proj reads its gated rows.
+        gate_in_wuv = _MLA_CTX_GATE_IN_WUV
+        _mla_context(
+            L,
+            i,
+            q[:live],
+            q8[:live],
+            w[:live],
+            k8_all,
+            ks_all,
+            out if gate_in_wuv else out[:live],
+            st,
+            rt,
+            latent[:live],
+            latent_all,
+            topk,
+            gate_x=x if gate_in_wuv else None,
+        )
+        if gate_in_wuv:
+            return rubin_linear(out, L.o, False)
+    return _mla_output(L, x, out, live)
+
+
+def _same_bytes(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """Whether ``a`` and ``b`` hold the same bytes. The ``verify`` checks compare copies, and a
+    copy carries a NaN bit for bit, which ``torch.equal`` on floating tensors calls unequal."""
+    return torch.equal(a.contiguous().view(torch.uint8), b.contiguous().view(torch.uint8))
+
+
+def _nonfinite(t: torch.Tensor) -> int:
+    """The non-finite values of a floating tensor; 0 for other dtypes."""
+    return int(torch.isfinite(t).logical_not().sum()) if t.is_floating_point() else 0
+
+
+def _owned_rows_diff(a: torch.Tensor, b: torch.Tensor, owned: torch.Tensor, st: _Step) -> str:
+    """Where an owner's received rows ``a`` differ from the all-gather's ``b`` (step rows
+    ``owned``): how many rows, the first of them, the ranks that computed them, and the
+    non-finite values on each side."""
+    finite = f"non-finite values {_nonfinite(a)} received, {_nonfinite(b)} all-gathered"
+    if a.shape != b.shape or a.dtype != b.dtype:
+        return f"{tuple(a.shape)} {a.dtype} received, {tuple(b.shape)} {b.dtype}; {finite}"
+    n = a.shape[0]
+    bytes_a = a.contiguous().view(torch.uint8).view(n, -1)
+    bytes_b = b.contiguous().view(torch.uint8).view(n, -1)
+    rows = owned[(bytes_a != bytes_b).any(1)]
+    by_rank = torch.bincount(rows // st.cp.rows, minlength=st.cp.world).tolist()
+    return (
+        f"{rows.numel()} of {n} rows, first step rows {rows[:4].tolist()}, "
+        f"by computing rank {by_rank}; {finite}"
+    )
+
+
+def _cp_owner_write(i: int, latent, k8, ks, st: _Step, rt: _Rt) -> tuple:
+    """Layer ``i``'s new rows under DKV with owner writes: this rank's live rows of the latent
+    (and, with sharded index keys, of the index keys) go to the owners of their pages in one push
+    (``_CpMla.owner*``); each owner appends the latent rows and inserts the keys it received, its
+    owned new tokens in step row order; then the group meets on an empty push, after which every
+    rank's new rows are in their owners' pools (the indexer and the read buffer read them there).
+
+    Returns ``(latent_all, k8_all, ks_all)``: the step's every new row where a later phase still
+    takes it (whole index keys: the keys, all-gathered and inserted as before; ``verify``: all
+    three, all-gathered, after checking the owners' rows against them), else None.
+    """
+    c, p = st.cp_mla, rt.dsa_pools
+    live = st.cp.live
+    order = c.owner.send_order
+    sharded = c.idx_slots is not None
+    verify = p.new_rows == "verify"
+    latent_all = k8_all = ks_all = None
+    if verify or not sharded:
+        k8_all = _cp_gather(k8.view(torch.uint8), st, rt).view(k8.dtype)
+        ks_all = _cp_gather(ks, st, rt)
+    if verify:
+        latent_all = _cp_gather(latent, st, rt)
+    send = [latent[:live].index_select(0, order)]
+    if sharded:
+        send += [
+            k8[:live].view(torch.uint8).index_select(0, order),
+            ks[:live].index_select(0, order),
+        ]
+    got = _cp_move_rows(send, c.owner_move, c.owner_push, rt.cp_push)
+    if verify:
+        owned = c.dkv.owned_rows
+        want = [latent_all.index_select(0, owned)]
+        if sharded:
+            want += [k8_all.view(torch.uint8).index_select(0, owned), ks_all.index_select(0, owned)]
+        for name, a, b in zip(("latent", "index keys", "index key scales"), got, want):
+            if not _same_bytes(a, b):
+                raise RuntimeError(
+                    f"{_TARGET} owner writes, layer {i}, rank {st.cp.rank}: the owned {name} "
+                    f"differ from the all-gather: {_owned_rows_diff(a, b, owned, st)}"
+                )
+        if st.cp.rank == 0 and (bad := _nonfinite(latent_all)):
+            logger.warning(
+                f"{_TARGET} owner writes, layer {i}: {bad} non-finite values in the step's "
+                f"{st.num_tokens} new latent rows; the owned rows match the all-gather bytes"
+            )
+    _mla_append(i, got[0], st, rt, owned=True)
+    if sharded:
+        _idx_insert_owned(i, got[1].view(k8.dtype), got[2], st, rt)
+    else:
+        _idx_insert(i, k8_all, ks_all, st.num_tokens, st, rt)
+    rubin_cp_push(rt.cp_push, (CpPushBlock(rt.cp_fence, 4, 0, 4, 0, 4, 0, 0),), rt.cp_fence)
+    return latent_all, k8_all, ks_all
+
+
+def _idx_balanced(i: int, q8, w, k8_all, ks_all, st: _Step, rt: _Rt) -> torch.Tensor | None:
+    """Under the balanced indexer split, this rank's own rows' Top-K: every rank scores its rows
+    of equal cost. Only the rows whose rank changes travel, pushed each way over the CP group:
+    their indexer queries and weights to the scoring rank, their Top-K back (every rank joins
+    both, with or without rows). None: own rows, scored in the layer.
+    """
+    c = st.cp_mla
+    if c.idx_bounds is None or st.dsa.skip_ctx:
+        return None
+    b, e = c.idx_rows
+    q8_b, w_b = _cp_move_rows([q8, w], c.idx_to, c.idx_to_push, rt.cp_push)
+    scored = _idx_prefill(i, q8_b, w_b, k8_all, ks_all, st, rt, (b, e))
+    return _cp_move_rows([scored], c.idx_from, c.idx_from_push, rt.cp_push)[0]
+
+
+def _cp_move_rows(tensors: list, move: RowMove, pushes: tuple, ws: CpPushWorkspace) -> list:
+    """Move rows between two row splits of the step (``RowMove``) with the CP group's push
+    ``ws``: ``tensors`` hold this rank's rows of the source split as their first rows
+    (``[rows, ...]``, any dtype, rows of whole 4-byte words); returns its rows of the destination
+    split, ``[move.rows, ...]`` each. ``pushes`` (``_CpMla.idx_*_push``): per push, its device
+    table, the most rows of a destination and the rows received. Each tensor lands in its own
+    plane of the region; one push returns views of the region (valid until the next push), more
+    pushes copy their rows out."""
+    widths = [math.prod(t.shape[1:]) * t.element_size() for t in tensors]
+    flat = [t.reshape(t.shape[0], math.prod(t.shape[1:])) for t in tensors]
+    cap = ws.region // sum(widths)
+    planes = list(itertools.accumulate([0] + [cap * wd for wd in widths[:-1]]))
+
+    def receive(table: torch.Tensor, most: int) -> torch.Tensor:
+        blocks = [
+            CpPushBlock(f, f.stride(0) * f.element_size(), 0, wd, plane, wd, 0, most)
+            for f, wd, plane in zip(flat, widths, planes)
+        ]
+        return rubin_cp_push(ws, blocks, table)
+
+    def part(region: torch.Tensor, k: int, rows: int) -> torch.Tensor:
+        t = tensors[k]
+        view = region[planes[k] : planes[k] + rows * widths[k]].view(t.dtype)
+        return view.view(rows, *t.shape[1:])
+
+    if len(pushes) == 1:
+        table, most, got = pushes[0]
+        region = receive(table, most)
+        return [part(region, k, got) for k in range(len(tensors))]
+    out = [t.new_empty((move.rows, *t.shape[1:])) for t in tensors]
+    done = 0
+    for table, most, got in pushes:
+        region = receive(table, most)
+        for k in range(len(tensors)):
+            out[k][done : done + got].copy_(part(region, k, got))
+        done += got
+    return out
+
+
+def latent_moe(L: _MoeW, i: int, x: torch.Tensor, st: _Step, rt: _Rt) -> _MoeOut:
+    """Run layer ``i``'s latent MoE over this rank's rows ``x``: the all-to-all around this rank's
+    CuteDSL experts, the shared experts whole; return both parts."""
+    return rt.moe_ctx(L, x, st, rt)
+
+
+class _CpTap:
+    """A drafter tap of this rank's rows: the spec metadata gets the step's rows, all-gathered."""
+
+    def __init__(self, spec_md: Any, st: _Step, rt: _Rt) -> None:
+        self._spec_md, self._st, self._rt = spec_md, st, rt
+
+    def is_layer_capture(self, layer: int) -> bool:
+        return self._spec_md.is_layer_capture(layer)
+
+    def maybe_capture_hidden_states(self, layer: int, hidden: torch.Tensor, residual: Any) -> None:
+        self._spec_md.maybe_capture_hidden_states(
+            layer, _cp_gather(hidden, self._st, self._rt), residual
+        )
+
+
+#: The indexer's query split (``model_kwargs: {trtllm_cep_indexer_split: ...}``): ``balanced``,
+#: the default, scores rows of equal indexer cost per rank (the Top-K comes back to the rows'
+#: ranks); ``equal`` scores each rank's own rows. The sparse MLA keeps the equal rows either way.
+_IDX_SPLIT_ATTR = "trtllm_cep_indexer_split"
+
+
+#: How the step's new latent rows and index keys reach the cache under DKV
+#: (``model_kwargs: {trtllm_cep_new_rows: ...}``): ``ownerwrite``, the default, pushes each rank's
+#: rows to the owners of their pages, which append them, then the group meets on an empty push and
+#: the readers copy the step's new rows of their requests from the owners' pools; ``allgather``
+#: all-gathers every new row to every rank; ``verify`` runs the owner writes and checks them
+#: against the all-gather byte for byte (each layer: the rows every owner appends and inserts, the
+#: rows every reader copies), raising on a difference; it also checks the drafter history's owned rows
+#: (``DFlashWorker.verify_split_context_store``). Without DKV the new rows are always all-gathered;
+#: with whole index keys (``index_layout: whole``) the keys are, the latent is pushed.
+_NEW_ROWS_ATTR = "trtllm_cep_new_rows"
+_NEW_ROWS = ("ownerwrite", "allgather", "verify")
+
+
+def _new_rows(model_config: ModelConfig) -> str:
+    """The new rows' path under DKV (``ownerwrite`` unless the config says otherwise)."""
+    cfg = model_config.pretrained_config
+    configs = [c for c in (cfg, getattr(cfg, "text_config", None)) if c is not None]
+    mode = next(
+        (str(v) for c in configs if (v := getattr(c, _NEW_ROWS_ATTR, None)) is not None),
+        "ownerwrite",
+    )
+    if mode not in _NEW_ROWS:
+        raise ValueError(f"{_NEW_ROWS_ATTR}={mode!r}: one of {_NEW_ROWS}")
+    return mode
+
+
+def _idx_split(model_config: ModelConfig) -> str:
+    """The indexer's query split of the cep group (``balanced`` unless the config says ``equal``)."""
+    cfg = model_config.pretrained_config
+    configs = [c for c in (cfg, getattr(cfg, "text_config", None)) if c is not None]
+    split = next(
+        (str(v) for c in configs if (v := getattr(c, _IDX_SPLIT_ATTR, None)) is not None),
+        "balanced",
+    )
+    if split not in ("balanced", "equal"):
+        raise ValueError(f"{_IDX_SPLIT_ATTR}={split!r}: balanced or equal")
+    return split
+
+
+def _adp_view(model_config: ModelConfig) -> ModelConfig:
+    """``model_config`` over the attention-DP view of its mapping, the Ulysses CP ranks as DP ranks.
+
+    The shell builds its LM head whole on it, and the drafter worker runs on it: after the trunk
+    every rank holds the step's rows, the same on each, and runs the head, the drafter history
+    and the drafts whole, as a dep16 rank does for its own requests.
+    """
+    view = copy.copy(model_config)
+    view._frozen = False
+    mapping = model_config.mapping
+    flat = dict(tp_size=mapping.tp_size * mapping.cp_size, cp_size=1, cp_config={})
+    view.mapping = type(mapping).from_dict(
+        dict(mapping.to_dict(), **flat, enable_attention_dp=True)
+    )
+    view._frozen = model_config._frozen
+    return view
+
+
+# --------------------------------------------------------------------------------------------------
+# Dense DWDP (``dwdp_config.enable_dense``, bound at construction): the engine row-shards the dense
+# weights of the MoE layers 1..92 over the CP group (every CP rank holds them whole) and gathers
+# each layer into staging slots two layers ahead of its use (``modules/dwdp/dense``). The target
+# names those weights per layer (``_DenseRoots``), rebuilds its views when setup repoints them
+# (``dense_dwdp_rebind``) and opens the read windows in the prefill loop (``_DenseHooks``).
+# --------------------------------------------------------------------------------------------------
+
+# The ``core.w`` parameters (``l{i}_<name>``) dense DWDP moves, per segment of a MoE layer: the
+# mixer ("attn": the KDA layer, or MLA with its DSA indexer) and the MoE block's dense weights
+# ("moe": the router, the shared experts and the latent projections and norm). The routed
+# experts and the router bias stay, and so do the mixes, layer 0 and the model's own weights;
+# the engine also keeps every parameter below its size threshold (1 MiB) in place.
+_DENSE_ATTN_KDA = tuple(f"kda_{f}" for f in _KdaW._fields if f != "layer")
+_DENSE_ATTN_MLA = tuple(
+    f"mla_{f}"
+    for f in (
+        "qkv_a",
+        "q_a_norm",
+        "kv_a_norm",
+        "q_b",
+        "kv_b",
+        "g",
+        "o",
+        "idx_wq_b",
+        "idx_wk_wp",
+        "idx_k_norm_w",
+        "idx_k_norm_b",
+    )
+)
+_DENSE_MOE = tuple(
+    f"moe_{f}"
+    for f in (
+        "router",
+        "shared_gu_w",
+        "shared_gu_s",
+        "shared_dn_w",
+        "shared_dn_s",
+        "latent_down",
+        "latent_norm",
+        "latent_up",
+    )
+)
+_DENSE_SEGMENTS = ("attn", "moe")
+
+
+class _DenseRoots:
+    """Layer ``i``'s dense DWDP roots (``modules.dwdp.dense.types.DenseRootsProvider``): its
+    parameters of each segment, by name in ``core.w``; none on a layer without the MoE block."""
+
+    def __init__(self, w: nn.ParameterDict, names: dict[str, frozenset[str]]) -> None:
+        self._w, self._names = w, names
+
+    def dense_dwdp_roots(self, segment: str) -> list[tuple]:
+        """``[("w", core.w, names)]``, or ``[]`` where the layer stays replicated."""
+        if segment not in _DENSE_SEGMENTS:
+            raise ValueError(f"dense DWDP segment must be one of {_DENSE_SEGMENTS}: {segment!r}")
+        names = self._names.get(segment)
+        return [("w", self._w, names)] if names else []
+
+
+def _dense_roots(core: Any) -> list[_DenseRoots]:
+    """Every layer's dense DWDP roots, in layer order."""
+    d = core.dims
+    kda, moe = set(d.kda_layers), set(d.moe_layers)
+    roots = []
+    for i in range(d.num_layers):
+        names = {}
+        if i in moe:
+            attn = _DENSE_ATTN_KDA if i in kda else _DENSE_ATTN_MLA
+            names = {
+                "attn": frozenset(f"l{i}_{n}" for n in attn),
+                "moe": frozenset(f"l{i}_{n}" for n in _DENSE_MOE),
+            }
+        roots.append(_DenseRoots(core.w, names))
+    return roots
+
+
+class _DenseHooks:
+    """The dense DWDP read windows of the prefill loop (``DenseDwdpManager`` /
+    ``DenseDWDP``): H0 before the first layer, H1 before a MoE layer's mixer reads its weights,
+    H2 after the mixer's last read, H3 after the MoE block's. Every hook is a no-op until the
+    engine's setup committed the runtime (``manager.dense``), and on the layers it does not
+    cover. Every read runs on the current stream on a context step (``st.cuda_graph`` is False:
+    the side streams of graph steps never run here)."""
+
+    def __init__(self, manager: Any) -> None:
+        self._manager = manager
+
+    def dense_begin(self) -> None:
+        if self._manager.dense is not None:
+            self._manager.ensure_primed()
+
+    def dense_wait(self, i: int) -> None:
+        dense = self._manager.dense
+        if dense is not None and dense.covers(i):
+            dense.wait_layer(i)
+
+    def dense_attn_done(self, i: int) -> None:
+        dense = self._manager.dense
+        if dense is not None and dense.covers(i):
+            dense.attention_done(i)
+
+    def dense_moe_done(self, i: int) -> None:
+        dense = self._manager.dense
+        if dense is not None and dense.covers(i):
+            dense.layer_done(i)
+
+
+class _NoDenseHooks:
+    """``_DenseHooks`` without dense DWDP: every hook does nothing."""
+
+    def dense_begin(self) -> None:
+        pass
+
+    def dense_wait(self, i: int) -> None:
+        pass
+
+    def dense_attn_done(self, i: int) -> None:
+        pass
+
+    def dense_moe_done(self, i: int) -> None:
+        pass
+
+
+class PrefillTarget:
+    """Context steps: this rank's rows of the step through every layer, context-parallel."""
+
+    def __init__(self, core: KimiK31ProNvfp4Sm107CepCore) -> None:
+        self._layers = core._layers
+        self._head = core._head
+        self._rt = core._rt
+        self._rank = core.model_config.mapping.cp_rank
+        self._world = core.dims.cp
+        self._dense = core._dense_hooks
+        split = core.kda_split
+        # What a step plans for its KDA layers: the relay, the hand-off, the pushed Ulysses.
+        self._kda_plans = (split == "relay", split == "handoff", split in ("ulysses", "handoff"))
+        self._push_region = self._rt.cp_push.region
+        self._kda = {
+            "handoff": kda_prefill_handoff,
+            "ulysses": kda_prefill,
+            "ulysses_fp8": kda_prefill_fp8,
+            "relay": kda_prefill_relay,
+        }[split]
+        if split == "handoff":
+            # Each KDA layer with both its whole recurrence weights and its Ulysses share.
+            self._layers = tuple(
+                L
+                if L.kda is None
+                else L._replace(
+                    kda=_KdaPair(L.kda, _kda_ulysses_view(L.kda, self._rank, self._world))
+                )
+                for L in core._layers
+            )
+
+    def forward(
+        self,
+        attn_metadata: AttentionMetadata,
+        input_ids: torch.Tensor | None,
+        position_ids: torch.Tensor,
+        inputs_embeds: torch.Tensor | None,
+        spec_metadata: Any,
+    ) -> torch.Tensor:
+        """Run the layers over this rank's rows; return the step's final hidden states."""
+        rt, head, dense = self._rt, self._head, self._dense
+        dense.dense_begin()  # H0
+        rt.dsa_pools.bind(attn_metadata.kv_cache_manager)
+        st = _build_step_args(
+            attn_metadata,
+            position_ids,
+            spec_metadata,
+            rt.dsa_pools,
+            self._rank,
+            self._world,
+            self._kda_plans,
+            self._push_region,
+        )
+        _dkv_fence(st, rt)
+        n = st.num_tokens
+        if inputs_embeds is None:
+            h = _cp_pad(nn.functional.embedding(input_ids[st.cp.begin : st.cp.end], head.embed), st)
+        else:
+            h = _cp_rows_of(inputs_embeds[:n], st)
+        spec = None if st.spec_md is None else _CpTap(st.spec_md, st, rt)
+        bank = h.new_empty(head.n_bank, h.shape[0], h.shape[1])
+        prefix, pending = h, None
+        rt.moe_forward[0]()
+        for i, L in enumerate(self._layers):
+            prefix, x = _mix_in(rt, prefix, pending, bank[: L.n_bank], L.pre, _tap(spec, i - 1))
+            if L.boundary:
+                bank[L.n_bank].copy_(prefix)
+            dense.dense_wait(i)  # H1
+            if L.kda is not None:
+                o = self._kda(L.kda, x, st, rt)
+            else:
+                o = mla_prefill(L.mla, i, x, st, rt)
+            dense.dense_attn_done(i)  # H2
+            if L.boundary:
+                prefix = rt.reduce(o)
+                x = rt.attn_res_norm(prefix, bank[: L.n_bank + 1], L.mid)
+            else:
+                prefix, x = rt.add_norm(prefix, rt.reduce(o), bank[: L.n_bank], L.mid)
+            if L.moe is not None:
+                pending = latent_moe(L.moe, i, x, st, rt)
+            else:
+                pending = dense_mlp(L.dense, x, st, rt)
+            dense.dense_moe_done(i)  # H3
+        out = _mix_out(rt, prefix, pending, bank, head, _tap(spec, len(self._layers) - 1))
+        rt.moe_forward[1]()
+        return _cp_gather(out, st, rt)
+
+
+class DecodeTarget:
+    """Generation-only steps: a cep server serves context steps only."""
+
+    def __init__(self, core: KimiK31ProNvfp4Sm107CepCore) -> None:
+        self._layers = core._layers
+
+    def forward(
+        self,
+        attn_metadata: AttentionMetadata,
+        input_ids: torch.Tensor | None,
+        position_ids: torch.Tensor,
+        inputs_embeds: torch.Tensor | None,
+        spec_metadata: Any,
+    ) -> torch.Tensor:
+        """Refuse: routing gives cep the context role only, whose steps all have context rows."""
+        raise RuntimeError(
+            f"{_TARGET} serves context steps only; a generation step reached it "
+            f"({attn_metadata.num_generations} generation requests)"
+        )
+
+
+def _one_per_target(name: str, values: Any) -> Any:
+    """The value all roles of this target share (one backend class serves them all)."""
+    found = set(values)
+    assert len(found) == 1, f"the roles of this target disagree on {name}: {found}"
+    return found.pop()
+
+
+# The DSA backend, and so the DSA metadata class, of this target's constants.
+_DSA_BACKEND = rubin_dsa_backend_cls(
+    kv_lens_refresh_once=_one_per_target(
+        "kv_lens_refresh_once",
+        (bool(_CONSTANTS[r].get("kv_lens_refresh_once", False)) for r in _ROLES),
+    ),
+    helix_fused_meta=_one_per_target(
+        "helix_fused_meta",
+        (bool(_CONSTANTS[r].get("dsa_helix_fused_meta", False)) for r in _ROLES),
+    ),
+)
+
+
+def _gvr_prefill_precompile(role: str) -> None:
+    """Compile the long-chunk variants of the context server's prefill Top-K before serving.
+
+    One launch of the target's prefill Top-K (``rubin_gvr_topk_prefill``, in the deterministic
+    order the indexer runs it, ``_IDX_GVR_DETERMINISTIC``) per ``_GVR_PREFILL_PRECOMPILE`` shape,
+    on zero logits with full-row windows; the indices are dropped. The kernels, their variants and
+    the engine's choice between them are unchanged: a later step launches the variant it would
+    otherwise have compiled itself, at its first long chunk. A generation server runs no prefill
+    and skips this. Out of memory skips a shape, whose variant then compiles at first use as
+    before. One line per process.
+    """
+    if role != "context":
+        return
+    top_k = _K31_DSA["index_topk"]
+    t0 = time.perf_counter()
+    ran = []
+    for rows, stride in _GVR_PREFILL_PRECOMPILE:
+        try:
+            logits = torch.zeros((rows, stride), dtype=torch.float32, device="cuda")
+            starts = torch.zeros((rows,), dtype=torch.int32, device="cuda")
+            ends = torch.full((rows,), stride, dtype=torch.int32, device="cuda")
+            out = torch.empty((rows, top_k), dtype=torch.int32, device="cuda")
+            rubin_gvr_topk_prefill(logits, starts, ends, out, _IDX_GVR_DETERMINISTIC)
+        except torch.cuda.OutOfMemoryError:
+            logger.warning(
+                f"Kimi K3.1 Rubin prefill Top-K pre-compile: {_TARGET}: {rows}x{stride} out of "
+                "memory; that variant compiles at its first use"
+            )
+            continue
+        ran.append(f"{rows}x{stride}")
+    torch.cuda.synchronize()
+    logger.info_once(
+        f"Kimi K3.1 Rubin prefill Top-K pre-compiled: {_TARGET}: {len(ran)} of "
+        f"{len(_GVR_PREFILL_PRECOMPILE)} GVR launches past the bitmap limit ({', '.join(ran)}) "
+        f"in {time.perf_counter() - t0:.1f} s",
+        key=f"{_TARGET} prefill Top-K pre-compile",
+    )
+
+
+def _kda_split(pretrained_config: Any) -> str:
+    """The KDA split the deployment's ``model_kwargs`` chose (``kimi_k31_kda_split``), read off the
+    source config before the text config replaces it; the serial hand-off when unset."""
+    split = getattr(pretrained_config, _KDA_SPLIT_ATTR, _KDA_SPLIT_DEFAULT)
+    assert split in _KDA_SPLITS, f"{_KDA_SPLIT_ATTR} {split!r}, not one of {_KDA_SPLITS}"
+    return split
+
+
+def _moe_backend(model_config: ModelConfig) -> str:
+    """The MoE backend the deployment names (``moe_config.backend``): MegaMoE for
+    ``MEGAMOE_CUTEDSL``, the all-to-all around the CuteDSL experts otherwise (routing admits only
+    ``CUTEDSL`` beside it)."""
+    return _MOE_BACKENDS.get(str(model_config.moe_backend).upper(), "cutedsl")
+
+
+def _expert_placement(model_config: ModelConfig, moe_layers: tuple, moe_ep: int) -> Any:
+    """The static expert placement the deployment names (``_EXPERT_PLACEMENT_ATTR`` on the text
+    config, from ``model_kwargs``): its tables by MoE layer, or None. A placement balanced for an
+    EP size this one does not divide still loads (a relabeling), with a warning."""
+    path = getattr(model_config.pretrained_config, _EXPERT_PLACEMENT_ATTR, None)
+    if not path:
+        return None
+    tables, file_ep = read_expert_placement(str(path), _K31["num_experts"], moe_layers, moe_ep)
+    if not balanced_for(file_ep, moe_ep):
+        logger.warning(
+            f"{_TARGET}: expert placement {path} was balanced for EP {file_ep}; EP {moe_ep} is not "
+            "a divisor of it, so the placement loads but its balance does not carry over"
+        )
+    logger.info(
+        f"Kimi K3.1 Rubin MoE: static expert placement {path}: {len(tables)} placed layers "
+        f"(balanced for EP {file_ep}, EP {moe_ep})"
+    )
+    return tables
+
+
+def _server_role(model_config: ModelConfig) -> str:
+    """The server role, ``context`` or ``generation``, as routing recorded it.
+
+    Routing records the role in ``extra_attrs`` and the loader carries it across its rebuild of
+    the config. A config that did not come through routing has none: the target refuses it.
+    """
+    role = model_config.extra_attrs.get(_ROLE_ATTR)
+    assert role is not None, (
+        f"no server role in extra_attrs[{_ROLE_ATTR!r}]: routing.py records it when it returns "
+        "this target"
+    )
+    assert role in _ROLES, f"this target serves {_ROLES}; routing recorded the role {role!r}"
+    return role
+
+
+def _check_lever_env(role: str, lever_env: dict, moe_backend: str = "cutedsl") -> None:
+    """Refuse lever variables that contradict this target's launch constants.
+
+    ``lever_env`` is what routing read of the lever variables. The target passes its levers to the
+    kernels as constants and reads none of these variables, which the engine paths it replaces
+    read: one set to another value would be ignored silently. ``moe_backend``: the MoE backend
+    the server builds (``_MOE_BACKENDS``), whose variables are checked. The per-call logits
+    budget is the one the engine's KV cache estimate reserves.
+    """
+    constants = _CONSTANTS[role]
+    assert moe_backend in constants["moe_backend"], moe_backend
+    if moe_backend == "cutedsl":
+        check_cutedsl_lever_env(lever_env)
+        check_a2a_lever_env(lever_env, force_cft=_MOE_A2A_FORCE_CFT)
+    else:
+        check_megamoe_lever_env(lever_env)
+    budget = lever_env.get("TLLM_INDEXER_MQA_LOGITS_ELEM_BUDGET")
+    want = constants["indexer_logits_elem_budget"]
+    if budget is not None and budget.strip() != str(want):
+        raise ValueError(
+            f"TLLM_INDEXER_MQA_LOGITS_ELEM_BUDGET={budget}: the target's per-call logits budget "
+            f"is {want}, which the engine's KV cache estimate must reserve"
+        )
+
+
+def _check_build(model_config: ModelConfig) -> None:
+    """Assert what routing admitted: the GPU, the K3.1 text model, this layout and the recipe."""
+    cap = torch.cuda.get_device_capability()
+    assert cap == _COMPUTE_CAPABILITY, f"this target runs on sm_107, not sm_{cap[0]}{cap[1]}"
+    cfg = model_config.pretrained_config
+    cfg = getattr(cfg, "text_config", None) or cfg
+    for key, want in _K31.items():
+        assert getattr(cfg, key, None) == want, f"{key} {getattr(cfg, key, None)} is not {want}"
+    for group, table in (("linear_attn_config", _K31_KDA), ("dsa_config", _K31_DSA)):
+        holder = getattr(cfg, group, None)
+        for key, want in table.items():
+            got = holder.get(key) if isinstance(holder, dict) else getattr(holder, key, None)
+            assert got == want, f"{group}.{key} {got} is not {want}"
+    # The indexer's key norm runs at rms_norm_eps; a checkpoint naming another epsilon is not this
+    # recipe's.
+    dsa = getattr(cfg, "dsa_config", None) or {}
+    eps = (
+        dsa.get("index_k_norm_eps")
+        if isinstance(dsa, dict)
+        else getattr(dsa, "index_k_norm_eps", None)
+    )
+    assert eps is None or eps == _K31["rms_norm_eps"], f"dsa_config.index_k_norm_eps {eps}"
+    m = model_config.mapping
+    n = m.cp_size
+    assert n in _CP_SIZES, f"not {_LAYOUT}: CP {n}, not one of {_CP_SIZES}"
+    assert m.has_cp_ulysses() and not m.has_cp_helix(), f"not {_LAYOUT}: CP {m.cp_config}"
+    layout = (m.world_size, m.tp_size, m.pp_size, m.cp_size, bool(m.enable_attention_dp))
+    assert layout == (n, _TP, 1, n, _ATTENTION_DP), f"not {_LAYOUT}{n}: {layout}"
+    assert (m.moe_tp_size, m.moe_ep_size) == (_MOE_TP, n), (m.moe_tp_size, m.moe_ep_size)
+    quant = model_config.quant_config
+    assert quant.quant_algo == _QUANT_ALGO, f"checkpoint {quant.quant_algo}, not {_QUANT_ALGO}"
+    assert quant.kv_cache_quant_algo == QuantAlgo.FP8, f"KV {quant.kv_cache_quant_algo}, not FP8"
+    state = str(getattr(quant, "mamba_ssm_cache_dtype", None)).removeprefix("torch.")
+    assert state == str(_STATE_DTYPE).removeprefix("torch."), f"KDA state {state}, not FP32"
+    sparse = model_config.sparse_attention_config
+    assert getattr(sparse, "algorithm", None) == "dsa", sparse
+    assert getattr(sparse, "indexer_k_dtype", None) == _INDEXER_K_DTYPE, sparse
+    spec = model_config.spec_config
+    assert spec is not None and spec.spec_dec_mode.is_dflash(), "DFlash2 is part of the recipe"
+    assert spec.spec_dec_mode.use_one_engine(), "DFlash2 runs one-engine"
+
+
+def _text_config(model_config: ModelConfig) -> ModelConfig:
+    """The engine's config over the checkpoint's text config; quant exclusions named as here."""
+    text = copy.copy(model_config)
+    text._frozen = False
+    cfg = model_config.pretrained_config
+    text.pretrained_config = getattr(cfg, "text_config", None) or cfg
+    quant = text.quant_config
+    if quant is not None and quant.exclude_modules:
+        quant = copy.copy(quant)
+        names = []
+        for name in quant.exclude_modules:
+            if name.startswith("language_model."):
+                name = name[len("language_model.") :]
+                name = "model." + name if name.startswith("layers.") else name
+            names.append(name)
+        quant.exclude_modules = names
+        text.quant_config = quant
+    text.skip_create_weights_in_init = True
+    text._frozen = True
+    return text
+
+
+def _tap(spec_md: Any, layer: int) -> tuple | None:
+    """``(spec_md, layer)`` when the drafter reads layer ``layer``'s output stream, else None."""
+    if spec_md is None or layer < 0 or not spec_md.is_layer_capture(layer):
+        return None
+    return spec_md, layer
+
+
+def _mix_in(
+    rt: _Rt,
+    prefix: torch.Tensor,
+    pending: Any,
+    bank: torch.Tensor,
+    mw: _MixW,
+    tap,
+    mx: bool = False,
+):
+    """The mix ahead of a mixer; returns ``(prefix, normed)``.
+
+    ``pending``: the previous layer's MLP output, which joins the prefix sum here, in the mix
+    kernel where it serves the row count: a ``_MoeOut`` through ``moe_norm``, layer 0's whole
+    dense output through ``add_norm``. A tapped layer's stream, the pre-norm mixture, goes to the
+    drafter first, so its mix and norm run apart. ``mx`` (a decode step's KDA layer): a
+    ``_MoeOut`` goes through ``moe_norm_mx``, so ``normed`` may come as ``(rows, codes, scales)``.
+    """
+    moe = isinstance(pending, _MoeOut)
+    if tap is None:
+        if pending is None:
+            return prefix, rt.attn_res_norm(prefix, bank, mw)
+        if moe:
+            return (rt.moe_norm_mx if mx else rt.moe_norm)(prefix, pending, bank, mw)
+        return rt.add_norm(prefix, pending, bank, mw)
+    if pending is not None:
+        prefix = rt.moe_add(prefix, pending) if moe else prefix + pending
+    mix = rt.attn_res_mix(prefix, bank, mw)
+    tap[0].maybe_capture_hidden_states(tap[1], mix, None)
+    return prefix, rt.rms_norm(mix, mw.out_norm)
+
+
+def _mix_out(rt: _Rt, prefix: torch.Tensor, pending: Any, bank: torch.Tensor, head: _HeadW, tap):
+    """The output mix after the last layer; returns the final hidden states.
+
+    The last MLP output joins the prefix sum first (``moe_add``), the drafter reads its tap of the
+    last layer, then the mix and the final norm run.
+    """
+    if pending is not None:
+        prefix = rt.moe_add(prefix, pending) if isinstance(pending, _MoeOut) else prefix + pending
+    if tap is not None:
+        tap[0].maybe_capture_hidden_states(tap[1], rt.attn_res_mix(prefix, bank, head.out), None)
+    return rt.attn_res_norm(prefix, bank, head.out)
+
+
+class KimiK31ProNvfp4Sm107CepCore(DecoderModel):
+    """The K3.1 text model at this rank's share: the weight table, the views and the two targets."""
+
+    def __init__(self, model_config: ModelConfig, kda_split: str = _KDA_SPLIT_DEFAULT) -> None:
+        super().__init__(model_config)
+        self.role = _server_role(model_config)
+        # How the KDA recurrence splits over the CP group (``_KDA_SPLITS``); weights.dims reads it.
+        self.kda_split = kda_split
+        # The MoE backend (``_MOE_BACKENDS``), from moe_config.backend.
+        self.moe_backend = _moe_backend(model_config)
+        self.lever_env = model_config.extra_attrs.get(_LEVER_ENV_ATTR)
+        if self.lever_env is not None:
+            _check_lever_env(self.role, self.lever_env, self.moe_backend)
+        self.eps = float(model_config.pretrained_config.rms_norm_eps)
+        # The static expert placement over the MoE layers, or None (weights.dims reads it).
+        self.expert_placement = None
+        d = _weights.dims(self)
+        self.expert_placement = _expert_placement(model_config, d.moe_layers, d.moe_ep)
+        self.dims = d._replace(expert_of_slot=self.expert_placement)
+        self.w = _weights.declare(self.dims)
+        # Dense DWDP: the engine's manager, registered before the model is built, or None.
+        dense_manager = model_config.extra_attrs.get(_DENSE_DWDP_ATTR)
+        self._dense_hooks = _NoDenseHooks() if dense_manager is None else _DenseHooks(dense_manager)
+        # Per-layer dynamic EPLB (moe_config.load_balancer mode per_layer_dynamic): the engine's
+        # manager is current while the model is built; each MoE layer registers its handle here
+        # and binds its live weights after loading. None without it.
+        manager = current_replica_manager()
+        d = self.dims
+        if manager is not None and self.moe_backend != "cutedsl":
+            raise ValueError(
+                f"{_TARGET}: per-layer dynamic EPLB runs the CuteDSL experts behind the all-to-all "
+                f"(moe_config.backend CUTEDSL), not {model_config.moe_backend}"
+            )
+        self.eplb_manager = manager
+        self.eplb = (
+            None
+            if manager is None
+            else dict(
+                zip(
+                    d.moe_layers,
+                    replica_layers(manager, _K31["num_experts"], _MOE_TOP_K, len(d.moe_layers)),
+                )
+            )
+        )
+        # The routed id space: the experts, or the slots of every rank.
+        self.routed_ids = _K31["num_experts"] if manager is None else int(manager.num_slots)
+        # The most rows a rank routes per all-to-all: its share of the step's rows, capped by its
+        # share of the MoE token budget (moe_config.max_num_tokens); a larger step runs the MoE
+        # in that many rows per call (``_moe_routed_chunks``).
+        budget = int(model_config.max_num_tokens)
+        budget = min(budget, int(model_config.moe_max_num_tokens or budget))
+        self.moe_rows = -(-budget // d.cp)
+        # The shared experts beside the routed chain on the side stream (``_MOE_SHARED_BESIDE``,
+        # or the text config's ``_MOE_SHARED_BESIDE_KEY`` from model_kwargs).
+        self.shared_overlap = bool(
+            getattr(model_config.pretrained_config, _MOE_SHARED_BESIDE_KEY, _MOE_SHARED_BESIDE)
+        )
+        self.balance_log: ReplicaBalanceLog | None = None
+        self._eplb_owners: tuple = ()
+        every = int(
+            getattr(model_config.pretrained_config, _EPLB_REPLAN_EVERY_KEY, _EPLB_REPLAN_EVERY)
+        )
+        self.replica_cadence = None
+        self.replica_routers: dict = {}
+        if manager is not None and every > 1:
+            if not manager.helper_residency:
+                raise ValueError(
+                    f"{_TARGET}: reusing helper placements (replan every {every}) needs "
+                    "moe_config.load_balancer.helper_slot_mode per_layer_resident"
+                )
+            self.replica_cadence = ReplicaCadence(every)
+        # Made once, never during a capture.
+        self.streams = _Streams(*(torch.cuda.Stream() for _ in _Streams._fields))
+        max_seq_len = model_config.max_seq_len
+        self.rope_positions = (
+            int(model_config.pretrained_config.max_position_embeddings)
+            if max_seq_len is None
+            else int(max_seq_len) + _ROPE_HEADROOM
+        )
+        self._layers: tuple | None = None
+        self._head: _HeadW | None = None
+        self._rt: _Rt | None = None
+        self._prefill: PrefillTarget | None = None
+        self._decode: DecodeTarget | None = None
+
+    def post_load_weights(self) -> None:
+        """Build the views, the runtime resources and the two targets, once the weights are real.
+
+        Runs once: the shell calls it and so does the loader's walk over the modules.
+        """
+        if self._prefill is not None:
+            return
+        if self.eplb is not None:
+            self._bind_eplb()
+        self._layers = _layer_views(self)
+        self._head = _head_view(self)
+        self._rt = _build_runtime(self)
+        self._prefill = PrefillTarget(self)
+        self._decode = DecodeTarget(self)
+        n = self.dims.cp
+        kda = {
+            "ulysses": f"{self._rt.kda_cp.heads} KDA heads (Ulysses)",
+            "ulysses_fp8": f"{self._rt.kda_cp.heads} KDA heads (Ulysses, FP8 all-to-alls)",
+            "relay": f"{_KDA_H} KDA heads over its rows (sequence split, state relay)",
+            "handoff": (
+                f"{_KDA_H} KDA heads over its rows (sequence split, serial FP32 hand-off; pushed "
+                f"Ulysses of {self._rt.kda_cp.heads} heads past a span of "
+                f"{_KDA_HANDOFF_MAX_SPAN} ranks)"
+            ),
+        }[self.kda_split]
+        logger.info(
+            f"Kimi K3.1 Rubin layout: {_TARGET}: {_LAYOUT}{n} (Ulysses CP {n}, MoE EP {n}, "
+            f"{kda} and {_K31['num_experts'] // n} experts per rank)"
+        )
+        if self.moe_backend == "megamoe_cutedsl":
+            launch = "MegaMoE launch"
+        else:
+            wire = "FP8" if self._rt.a2a.use_low_precision_combine else "BF16"
+            launch = f"all-to-all ({wire} combine)"
+        logger.info(
+            f"Kimi K3.1 Rubin MoE: {self.moe_backend}, {self.moe_rows} rows per rank per {launch}, "
+            f"shared experts {'beside the routed chain' if self.shared_overlap else 'after it'}, "
+            f"{len(self.expert_placement or ())} layers under a static expert placement"
+        )
+        log_constants(
+            self.role,
+            draft_context_kv_only=self.dims.draft_context_kv_only,
+            lever_env=self.lever_env,
+            moe_backend=self.moe_backend,
+        )
+        _gvr_prefill_precompile(self.role)
+
+    def dense_dwdp_layers(self) -> list[_DenseRoots]:
+        """The layers' dense DWDP roots, for the engine's dense DWDP setup."""
+        return _dense_roots(self)
+
+    def dense_dwdp_rebind(self) -> None:
+        """Rebuild the views and the targets over the parameters dense DWDP setup repointed (or
+        restored): a derived view (``k_b``, ``qkv_a_t``, ...) must not keep a moved weight's
+        original storage, or a rolled-back slot."""
+        self._layers = _layer_views(self)
+        self._prefill = PrefillTarget(self)
+        self._decode = DecodeTarget(self)
+
+    def _bind_eplb(self) -> None:
+        """Move every MoE layer's routed-expert operands onto its EPLB arena (H resident experts,
+        then S helper slots) and build its planner, in layer order: collective over the EP group.
+        Then the load record (``ops/moe/replica_balance``)."""
+        d, m = self.dims, self.model_config.mapping
+        rows = -(-int(self.model_config.max_num_tokens) // d.cp)
+        self._eplb_owners = tuple(
+            bind_replica_planes(
+                handle,
+                plane_tensors(self.w, f"l{i}_moe_"),
+                mapping=m,
+                layer_idx=i,
+                max_tokens_per_rank=rows,
+                hidden=d.latent,
+                intermediate=d.moe_inter,
+            )
+            for i, handle in self.eplb.items()
+        )
+        manager = self.eplb_manager
+        handle = next(iter(self.eplb.values()))
+        if self.replica_cadence is not None:
+            placements = ReplicaPlacements(
+                manager, m, len(self.eplb), int(handle.helper_slots_per_rank)
+            )
+            self.replica_routers = {
+                i: ReplicaRouter(h, self.replica_cadence, placements, row)
+                for row, (i, h) in enumerate(self.eplb.items())
+            }
+        self.balance_log = ReplicaBalanceLog(
+            ep_rank=d.moe_ep_rank,
+            ep_size=d.moe_ep,
+            home_experts=int(handle.resident_experts_per_rank),
+            compute_slots=int(handle.compute_slots_per_rank),
+            num_layers=len(self.eplb),
+            top_k=_MOE_TOP_K,
+            ep_comm=functools.partial(manager.get_ep_comm, None, m),
+        )
+        logger.info(
+            f"Kimi K3.1 Rubin MoE: per-layer dynamic EPLB on {len(self.eplb)} layers: "
+            f"{manager.num_slots} slots, {handle.resident_experts_per_rank} resident experts + "
+            f"{handle.helper_slots_per_rank} helper slots per rank, {manager.auxiliary_sms} "
+            f"auxiliary SMs, helper slots {manager.config.helper_slot_mode}, replan every "
+            f"{1 if self.replica_cadence is None else self.replica_cadence.every} forwards"
+        )
+
+    def _select_target(self, attn_metadata: AttentionMetadata) -> PrefillTarget | DecodeTarget:
+        """Pick this step's target from ``num_contexts`` alone (constant per decode graph)."""
+        return self._decode if attn_metadata.num_contexts == 0 else self._prefill
+
+    def forward(
+        self,
+        attn_metadata: AttentionMetadata,
+        input_ids: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        spec_metadata: Any = None,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        """Run this step's target."""
+        return self._select_target(attn_metadata).forward(
+            attn_metadata, input_ids, position_ids, inputs_embeds, spec_metadata
+        )
+
+
+class ModelingV2KimiK31ProNvfp4Sm107Cep(
+    DecoderModelForCausalLM[KimiK31ProNvfp4Sm107CepCore, PretrainedConfig]
+):
+    """Kimi K3.1 Pro NVFP4, sm_107, cep: the shell and the engine hooks.
+
+    The spec decoding wiring is the DS target's: the shell holds the drafter container
+    (``draft_model``) and the engine's worker (``spec_worker``, a submodule the loader walks),
+    and its forward runs the trunk, the target logits and the worker.
+    """
+
+    # The family KDA metadata class the executor builds.
+    mamba_metadata_cls = RubinKdaMetadata
+    # The trunk splits each step's rows over the Ulysses CP group itself.
+    supports_cp_ulysses = True
+
+    def __init__(self, model_config: ModelConfig) -> None:
+        _check_build(model_config)
+        kda_split = _kda_split(model_config.pretrained_config)
+        text = _text_config(model_config)
+        cfg = text.pretrained_config
+        # model_kwargs land on the checkpoint's outer config; the target reads the text config.
+        for attr in (_IDX_SPLIT_ATTR, _EXPERT_PLACEMENT_ATTR, _NEW_ROWS_ATTR):
+            value = getattr(model_config.pretrained_config, attr, None)
+            if value is not None and getattr(cfg, attr, None) is None:
+                setattr(cfg, attr, value)
+        core = KimiK31ProNvfp4Sm107CepCore(text, kda_split)
+        # The LM head and the drafter worker run whole on every rank (``_adp_view``); the engine
+        # keeps reading the Ulysses CP N config.
+        shell = _adp_view(text)
+        super().__init__(core, config=shell, hidden_size=cfg.hidden_size, vocab_size=cfg.vocab_size)
+        self.model_config = text
+        # The executor reads the generation parameters (eos_token_id, ...) off the text config.
+        frozen, model_config._frozen = model_config._frozen, False
+        model_config.pretrained_config = cfg
+        model_config._frozen = frozen
+        # The cache manager the executor builds later reads these (extra_init_kwargs).
+        bind_kv_cache_args(text, **_CACHE_ARGS[core.role])
+        self.spec_config = text.spec_config
+        self.draft_config = draft_config_for(text)
+        self.draft_model = DraftModel(core, self.draft_config, self.lm_head, self.logits_processor)
+        self.spec_worker = DFlashWorker(
+            self.spec_config,
+            shell.mapping.mapping_for_full_rows(),
+            should_use_separate_draft_kv_cache(self.spec_config),
+        )
+        self.spec_worker.set_draft_model(self.draft_model)
+        self.spec_worker.set_target_model(self)
+        self.spec_worker.verify_split_context_store = _new_rows(text) == "verify"
+
+    @classmethod
+    def get_model_defaults(cls, llm_args: Any) -> dict:
+        """Return the engine defaults this target needs: 64-token KV pages, block reuse opt-in.
+
+        Under ``CUTEDSL`` (the all-to-all around the CuteDSL experts) the server also combines in
+        FP8 where the arguments leave ``moe_config.use_low_precision_moe_combine`` out; a value
+        they name wins. MegaMoE combines in BF16 and takes no default.
+        """
+        defaults = {"kv_cache_config": {"enable_block_reuse": False, "tokens_per_block": 64}}
+        if llm_args.moe_config.backend == "CUTEDSL":
+            defaults["moe_config"] = {"use_low_precision_moe_combine": True}
+        return defaults
+
+    @classmethod
+    def requires_kv_cache_manager_v2(cls, pretrained_config: Any = None) -> bool:
+        """Say whether the target needs KV cache manager V2: the DSA index keys live in it."""
+        if pretrained_config is None:
+            return False
+        text = getattr(pretrained_config, "text_config", None) or pretrained_config
+        return getattr(text, "dsa_config", None) is not None
+
+    @classmethod
+    def get_preferred_transceiver_runtime(cls, pretrained_config: Any = None) -> Any:
+        """Return the KV transceiver runtime the target needs: only Python NIXL moves KDA state."""
+        return "PYTHON"
+
+    @classmethod
+    def select_kv_cache_manager_cls(
+        cls,
+        model_config: Any,
+        kv_cache_config: Any,
+        is_disagg: bool = False,
+        cache_transceiver_config: Any = None,
+    ) -> Any:
+        """Return the family KDA + DSA cache manager class, after the family's config checks."""
+        selected = select_rubin_kv_cache_manager_cls(
+            model_config,
+            kv_cache_config,
+            is_disagg=is_disagg,
+            cache_transceiver_config=cache_transceiver_config,
+        )
+        assert selected is not None, "this target runs the family KDA + DSA cache manager only"
+        return selected
+
+    @staticmethod
+    def open_checkpoint_weights(checkpoint_dir: str, mapping: Any = None) -> Any:
+        """Open the checkpoint lazily (weights.py)."""
+        return _weights.open_checkpoint_weights(checkpoint_dir)
+
+    def attention_backend_for(self, backend_name: str, sparse_params: Any) -> Any:
+        """Return the family DSA backend (a class fact: built shells and bare ones agree)."""
+        return rubin_attention_backend_for(backend_name, sparse_params, _DSA_BACKEND)
+
+    def validate_request(self, request: Any) -> None:
+        """Refuse media before the request is scheduled: cep runs no vision tower, so an image's
+        placeholders would prefill as text. The request fails alone, where the forward would fail
+        the batch."""
+        if getattr(request, "py_multimodal_data", None):
+            raise ValueError(f"Image input is not supported: {_TARGET} runs no vision tower")
+
+    def forward(
+        self,
+        attn_metadata: AttentionMetadata,
+        input_ids: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        return_context_logits: bool = False,
+        spec_metadata: Any = None,
+        resource_manager: Any = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Run one engine step: the core, the target logits and the DFlash2 worker.
+
+        ``position_ids`` reaches the worker in the engine's ``[1, T]`` shape.
+        """
+        hidden = self.model(
+            attn_metadata=attn_metadata,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            spec_metadata=spec_metadata,
+        )
+        rows = attn_metadata.num_tokens if attn_metadata.padded_num_tokens is not None else None
+        if rows is not None:
+            hidden = hidden[:rows]
+            input_ids = input_ids[:rows] if input_ids is not None else None
+            position_ids = position_ids[..., :rows] if position_ids is not None else None
+        logits = self.spec_worker.target_logits(
+            self.spec_worker.target_head_rows(hidden, attn_metadata, spec_metadata),
+            self.lm_head,
+            self.logits_processor,
+            attn_metadata,
+            spec_metadata,
+            self.draft_model,
+        )
+        return self.spec_worker(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            hidden_states=hidden,
+            logits=logits,
+            attn_metadata=attn_metadata,
+            spec_metadata=spec_metadata,
+            draft_model=self.draft_model,
+            resource_manager=resource_manager,
+        )
+
+    def load_weights(self, weights: Any, *args: Any, **kwargs: Any) -> None:
+        """Fill the parameters from the target checkpoint (weights.py).
+
+        Refused once dense DWDP moved the dense weights: they are views of staging slots that
+        several layers share and the next gather overwrites.
+        """
+        if getattr(self.model, "_dense_dwdp_active", False):
+            raise RuntimeError(
+                f"{_TARGET}: dense DWDP (dwdp_config.enable_dense) moved the dense weights into "
+                "staging slots; launch without it to load weights again"
+            )
+        _weights.load(self, weights)
+
+    def load_draft_weights(self, weights: Any, weight_mapper: Any = None) -> None:
+        """Fill the drafter from its checkpoint (weights.py)."""
+        _weights.load_draft(self, weights, weight_mapper)
+
+    def set_guided_decoder(self, guided_decoder) -> bool:
+        """Attach the grammar decoder to the DFlash target-token verification."""
+        return self.spec_worker.set_guided_decoder(guided_decoder)
+
+    def post_load_weights(self) -> None:
+        """Run the shell's and then the core's post-load steps."""
+        super().post_load_weights()
+        self.model.post_load_weights()
+
+
+# --------------------------------------------------------------------------------------------------
+# The launch-constants line: ``log_constants(role)`` logs one INFO line at startup with the
+# role's ``_CONSTANTS`` (a ``_DETAILS`` key inside its parent's value), so a run records the
+# constants it used.
+# --------------------------------------------------------------------------------------------------
+
+
+def constants_line(
+    role: str, *, draft_context_kv_only: bool | None = None, moe_backend: str | None = None
+) -> str:
+    """The startup constants line of ``role``; the drafter's load fact and the MoE backend the
+    server built override the expectation."""
+    table = dict(_CONSTANTS[role])
+    if draft_context_kv_only is not None and "draft_ctx_weights" in table:
+        table["draft_ctx_weights"] = "history" if draft_context_kv_only else "full"
+    if moe_backend is not None:
+        table["moe_backend"] = moe_backend
+    details: dict[str, list[str]] = {}
+    for key in sorted(table):
+        parent = _DETAILS.get(key)
+        if parent is not None and parent in table:
+            details.setdefault(parent, []).append(f"{key}={table[key]}")
+    items = []
+    for key in sorted(table):
+        if _DETAILS.get(key) in table:
+            continue
+        extra = details.get(key)
+        items.append(f"{key}={table[key]}" + (f"({','.join(extra)})" if extra else ""))
+    return f"Kimi K3.1 Rubin constants: {_TARGET}/{role} ({len(items)}): " + ", ".join(items)
+
+
+#: The lever variables the startup line states: read in C++ (the context servers' MoE routing
+#: kernels) and by the engine's KV cache estimate.
+_LEVER_ENV_LOGGED = ("TLLM_ROUTING_DISABLE_COOP_LAUNCH", "TLLM_INDEXER_MQA_LOGITS_ELEM_BUDGET")
+
+
+def log_constants(
+    role: str,
+    *,
+    draft_context_kv_only: bool | None = None,
+    lever_env: dict | None = None,
+    moe_backend: str | None = None,
+) -> None:
+    """Log this target's launch constants for ``role`` in one line, then the lever variables.
+
+    From ``lever_env`` (what routing read): the values of the lever variables the target cannot set
+    itself.
+    """
+    logger.info(
+        constants_line(role, draft_context_kv_only=draft_context_kv_only, moe_backend=moe_backend)
+    )
+    if lever_env is None:
+        return
+    items = ", ".join(f"{k}={lever_env.get(k, 'unset')}" for k in _LEVER_ENV_LOGGED)
+    logger.info(f"Kimi K3.1 Rubin lever env: {_TARGET}/{role}: {items}")
+    # The context servers' routing kernels run without cooperative launch (read in C++).
+    if role == "context" and lever_env.get("TLLM_ROUTING_DISABLE_COOP_LAUNCH") != "1":
+        logger.warning(
+            f"{_TARGET}/context: TLLM_ROUTING_DISABLE_COOP_LAUNCH is not 1; the MoE routing "
+            "kernels launch cooperatively"
+        )

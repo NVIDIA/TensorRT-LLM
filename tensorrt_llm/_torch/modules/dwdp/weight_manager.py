@@ -31,12 +31,20 @@ Design invariants:
 Timeline visualization:
     compute_stream: [forward L3] --wait(prefetch[0])--> [forward L4] --wait(prefetch[1])--> [forward L5]
     copy_stream:    --wait(consume[0])--> [P2P L4] --wait(consume[1])--> [P2P L5]
+
+Cross-step schedule (``TRTLLM_DWDP_CROSS_STEP_PREFETCH=1``): a ``CyclicPrefetchSchedule`` treats
+the MoE layers of consecutive forward passes as one cyclic sequence, so the last MoE layers of a
+pass prefetch the first layers of the next one and each layer is gathered once per pass.  Its
+entry points are ``start_forward``, ``wait_and_bind_scheduled`` and ``finish_layer``; a slot is
+released right after the MoE that read it is enqueued.  ``TRTLLM_DWDP_PREFETCH_SLOTS`` (default 2)
+sets the number of slots for this schedule.
 """
 
 from __future__ import annotations
 
 import bisect
 import logging
+import os
 import traceback
 from typing import Dict, List, Optional, Tuple
 
@@ -49,6 +57,7 @@ except ImportError:
     logger = logging.getLogger(__name__)
 
 from . import fabric_gather
+from .prefetch_schedule import CyclicPrefetchSchedule
 from .specs import PeerRanges, lookup_owner
 from .weight_buffer import WeightBuffer
 
@@ -68,6 +77,43 @@ _CopyBatch = Tuple[List[int], List[int], List[int]]
 # destination, source, 16-byte-line-count and group-boundary tensors, plus the
 # number of blocks each group gets.
 _GatherPlan = Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]
+
+_CROSS_STEP_PREFETCH_ENV = "TRTLLM_DWDP_CROSS_STEP_PREFETCH"
+_PREFETCH_SLOTS_ENV = "TRTLLM_DWDP_PREFETCH_SLOTS"
+_DEFAULT_PREFETCH_SLOTS = 2
+
+
+def cross_step_prefetch_enabled() -> bool:
+    """Whether ``TRTLLM_DWDP_CROSS_STEP_PREFETCH=1`` selects the cyclic cross-step prefetch schedule."""
+    return os.environ.get(_CROSS_STEP_PREFETCH_ENV, "0") == "1"
+
+
+def prefetch_slot_count(cross_step_prefetch: bool) -> int:
+    """Number of prefetch buffer slots.
+
+    ``TRTLLM_DWDP_PREFETCH_SLOTS`` (at least 2) applies to the cross-step schedule only; the
+    per-step protocol is double-buffered.
+    """
+    raw = os.environ.get(_PREFETCH_SLOTS_ENV)
+    if not raw:
+        return _DEFAULT_PREFETCH_SLOTS
+    try:
+        slots = int(raw)
+    except ValueError:
+        slots = 0
+    if slots < 2:
+        logger.warning(
+            f"[DWDP] {_PREFETCH_SLOTS_ENV}={raw!r} must be an integer >= 2; "
+            f"using {_DEFAULT_PREFETCH_SLOTS}"
+        )
+        return _DEFAULT_PREFETCH_SLOTS
+    if slots != _DEFAULT_PREFETCH_SLOTS and not cross_step_prefetch:
+        logger.warning(
+            f"[DWDP] {_PREFETCH_SLOTS_ENV}={slots} needs {_CROSS_STEP_PREFETCH_ENV}=1; "
+            f"using {_DEFAULT_PREFETCH_SLOTS}"
+        )
+        return _DEFAULT_PREFETCH_SLOTS
+    return slots
 
 
 class DWDPWeightManager:
@@ -102,6 +148,10 @@ class DWDPWeightManager:
         "_use_gather",
         "_gather_plans",
         "_released",
+        "_num_slots",
+        "_layer_order",
+        "_schedule",
+        "_schedule_restarts",
     )
 
     def __init__(
@@ -114,6 +164,7 @@ class DWDPWeightManager:
         dwdp_rank: int,
         dwdp_size: int,
         contention_opt: bool = False,
+        cross_step_prefetch: bool = False,
     ) -> None:
         """Initialize the DWDPWeightManager.
 
@@ -144,9 +195,14 @@ class DWDPWeightManager:
                 to reduce single-NVLink-link contention.  Plans are cached
                 per layer since peer ``data_ptr()`` and destination
                 ``data_ptr()`` are stable after initialization.
+            cross_step_prefetch: Drive the prefetch with a ``CyclicPrefetchSchedule``
+                over ``weight_buffer.num_slots`` slots (``start_forward``,
+                ``wait_and_bind_scheduled``, ``finish_layer``) instead of the per-step
+                double-buffer protocol.
 
         Raises:
-            ValueError: If dwdp_rank is out of range or dwdp_size is invalid.
+            ValueError: If dwdp_rank is out of range, dwdp_size is invalid, or the
+                buffer has more than 2 slots without the cross-step schedule.
         """
         if dwdp_size <= 0:
             raise ValueError(f"dwdp_size must be positive, got {dwdp_size}")
@@ -173,13 +229,29 @@ class DWDPWeightManager:
         device = torch.device("cuda", weight_buffer.device_id)
         self._copy_stream = torch.cuda.Stream(device=device)
 
-        # Double-buffer events: one per buffer slot (0 and 1).
+        self._num_slots = weight_buffer.num_slots
+        self._layer_order = {layer: order for order, layer in enumerate(self._moe_layer_indices)}
+        self._schedule: Optional[CyclicPrefetchSchedule] = None
+        self._schedule_restarts = 0
+        if cross_step_prefetch and self._moe_layer_indices:
+            self._schedule = CyclicPrefetchSchedule(len(self._moe_layer_indices), self._num_slots)
+        elif self._num_slots != 2:
+            raise ValueError(
+                f"The per-step DWDP prefetch is double-buffered; {self._num_slots} buffer slots "
+                f"need the cross-step schedule"
+            )
+
+        # Buffer-slot events: one per buffer slot.
         # prefetch_events[i]: recorded on copy_stream after P2P copy into slot i.
         #   Waited on by compute_stream (RAW — must finish copy before read).
         # consume_events[i]: recorded on compute_stream after forward using slot i.
         #   Waited on by copy_stream (WAR — must finish read before overwrite).
-        self._prefetch_events: List[torch.cuda.Event] = [torch.cuda.Event() for _ in range(2)]
-        self._consume_events: List[torch.cuda.Event] = [torch.cuda.Event() for _ in range(2)]
+        self._prefetch_events: List[torch.cuda.Event] = [
+            torch.cuda.Event() for _ in range(self._num_slots)
+        ]
+        self._consume_events: List[torch.cuda.Event] = [
+            torch.cuda.Event() for _ in range(self._num_slots)
+        ]
         self._transport = None
 
         # Initialize consume_events as "already signaled" so the first prefetch
@@ -221,7 +293,9 @@ class DWDPWeightManager:
             f"weights={self._weight_names}, "
             f"experts_per_rank={self._experts_per_rank}, "
             f"contention_opt={contention_opt}, "
-            f"gather={self._use_gather}"
+            f"gather={self._use_gather}, "
+            f"cross_step_prefetch={self._schedule is not None}, "
+            f"slots={self._num_slots}"
         )
 
     @property
@@ -238,6 +312,16 @@ class DWDPWeightManager:
     def dwdp_size(self) -> int:
         """Total number of DWDP ranks."""
         return self._dwdp_size
+
+    @property
+    def num_slots(self) -> int:
+        """Number of prefetch buffer slots."""
+        return self._num_slots
+
+    @property
+    def cross_step_prefetch(self) -> bool:
+        """Whether the cyclic cross-step schedule drives the prefetch."""
+        return self._schedule is not None
 
     def is_moe_layer(self, layer_idx: int) -> bool:
         """Check if a given layer index is a MoE layer.
@@ -559,15 +643,20 @@ class DWDPWeightManager:
         # before the forward pass reads the data.
         compute_stream.wait_event(self._prefetch_events[buf_idx])
 
-        # Bind full [num_experts, ...] tensors to the backend module's parameters.
-        # The tensor is a composite view: local region is zero-copy MNNVL,
-        # remote regions contain the freshly P2P-copied expert weights.
+        self._bind_full_tensors(backend_module, layer_idx)
+
+        logger.debug(f"[DWDPWeightManager] Bound weights: layer={layer_idx}, buf_slot={buf_idx}")
+
+    def _bind_full_tensors(self, backend_module: torch.nn.Module, layer_idx: int) -> None:
+        """Bind the full [num_experts, ...] tensors of ``layer_idx`` to the backend parameters.
+
+        The tensor is a composite view: local region is zero-copy MNNVL, remote regions
+        contain the freshly P2P-copied expert weights.
+        """
         for name in self._weight_names:
             full_tensor = self._weight_buffer.get_full_tensor(layer_idx, name)
             param = getattr(backend_module, name)
             param.data = full_tensor
-
-        logger.debug(f"[DWDPWeightManager] Bound weights: layer={layer_idx}, buf_slot={buf_idx}")
 
     def record_compute(self, layer_idx: int) -> None:
         """Record that the current layer has finished consuming its buffer slot.
@@ -576,7 +665,7 @@ class DWDPWeightManager:
         the current compute stream. CUDA stream ordering then guarantees that
         the consume event cannot complete until the kernel has stopped reading
         the slot. The copy stream waits on this event before reusing the slot
-        for the layer two positions ahead in the MoE sequence.
+        for the layer ``num_slots`` positions ahead in the MoE sequence.
 
         Args:
             layer_idx: MoE layer whose compute was just enqueued.
@@ -592,6 +681,112 @@ class DWDPWeightManager:
         )
         self._consume_events[buf_idx].record(compute_stream)
         logger.debug(f"[DWDPWeightManager] Compute recorded: layer={layer_idx}, buf_slot={buf_idx}")
+
+    # --- Cross-step schedule (TRTLLM_DWDP_CROSS_STEP_PREFETCH=1) ---
+
+    def start_forward(self) -> None:
+        """Prefetch the first MoE layers of the coming forward pass.
+
+        Enqueues nothing when the last layers of the previous pass already prefetched them.
+
+        Raises:
+            RuntimeError: If the cross-step schedule is not enabled.
+        """
+        schedule = self._require_schedule()
+        orders, abandoned_read = schedule.start_forward()
+        self._enqueue_scheduled(orders, abandoned_read)
+
+    def wait_and_bind_scheduled(self, backend_module: torch.nn.Module, layer_idx: int) -> None:
+        """Cross-step counterpart of ``wait_and_bind``.
+
+        Prefetches the layer first if nothing did (a pass without ``start_forward``, e.g. a
+        warmup forward, or a pass that restarts the sequence), waits for its copy and binds the
+        full tensors.  The slot is released by ``finish_layer``.
+
+        Args:
+            backend_module: MoE backend module whose weight parameters are rebound.
+            layer_idx: MoE layer index whose weights to bind.
+
+        Raises:
+            KeyError: If layer_idx is not a valid MoE layer.
+            RuntimeError: If the cross-step schedule is not enabled.
+        """
+        schedule = self._require_schedule()
+        orders, abandoned_read = schedule.bind(self._order_of(layer_idx))
+        self._enqueue_scheduled(orders, abandoned_read)
+        buf_idx = self._weight_buffer.buffer_index_for_layer(layer_idx)
+        compute_stream = torch.cuda.current_stream(
+            torch.device("cuda", self._weight_buffer.device_id)
+        )
+        compute_stream.wait_event(self._prefetch_events[buf_idx])
+        self._bind_full_tensors(backend_module, layer_idx)
+
+    def finish_layer(self, layer_idx: int) -> None:
+        """Release ``layer_idx``'s slot and issue the prefetches this unblocks.
+
+        Called right after the MoE of ``layer_idx`` is enqueued: the slot's consume event
+        (``record_compute``) fires once the kernels enqueued so far on the compute stream
+        finish.  For the last MoE layers the unblocked prefetches are the first layers of the
+        next forward pass.
+
+        Args:
+            layer_idx: MoE layer whose MoE was just enqueued.
+
+        Raises:
+            KeyError: If layer_idx is not a valid MoE layer.
+            RuntimeError: If the cross-step schedule is not enabled or layer_idx is not bound.
+        """
+        schedule = self._require_schedule()
+        order = self._order_of(layer_idx)
+        self.record_compute(layer_idx)
+        self._enqueue_scheduled(schedule.consume(order), abandoned_read=False)
+
+    def invalidate_prefetch(self) -> None:
+        """Drop the prefetches issued ahead of the next forward pass.
+
+        Call after the source expert weights change; the next pass gathers its first layers
+        again.  No-op without the cross-step schedule.
+        """
+        if self._schedule is None:
+            return
+        self._enqueue_scheduled([], self._schedule.invalidate())
+
+    def _require_schedule(self) -> CyclicPrefetchSchedule:
+        if self._schedule is None:
+            raise RuntimeError(
+                f"DWDP cross-step prefetch is not enabled (set {_CROSS_STEP_PREFETCH_ENV}=1)"
+            )
+        return self._schedule
+
+    def _order_of(self, layer_idx: int) -> int:
+        if layer_idx not in self._layer_order:
+            raise KeyError(
+                f"Layer {layer_idx} is not a MoE layer. Valid layers: {self._moe_layer_indices}"
+            )
+        return self._layer_order[layer_idx]
+
+    def _enqueue_scheduled(self, orders: List[int], abandoned_read: bool) -> None:
+        """Enqueue the prefetches of MoE orders ``orders`` returned by the schedule."""
+        if abandoned_read:
+            # A layer bound by a forward pass that did not finish may still be reading its slot,
+            # and its consume event was never recorded.
+            logger.warning(
+                "[DWDPWeightManager] Prefetch sequence restarted after an unfinished forward "
+                "pass; synchronizing the device before reusing its buffer slots"
+            )
+            torch.cuda.synchronize(self._weight_buffer.device_id)
+        restarts = self._schedule.num_restarts
+        if restarts != self._schedule_restarts:
+            self._schedule_restarts = restarts
+            # Power-of-two counts only: a model that systematically breaks the sequence still shows up.
+            if restarts & (restarts - 1) == 0:
+                logger.warning(
+                    f"[DWDPWeightManager] Cross-step prefetch sequence restarted "
+                    f"({restarts} restart(s) so far): a forward pass did not run the MoE layers "
+                    f"in order"
+                )
+        for order in orders:
+            self.prefetch_layer(self._moe_layer_indices[order])
 
     def release(self) -> None:
         """Synchronize outstanding work and release all owned VMM resources."""

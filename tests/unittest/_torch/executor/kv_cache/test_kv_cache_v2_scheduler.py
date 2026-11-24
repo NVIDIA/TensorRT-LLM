@@ -23,14 +23,26 @@ from unittest.mock import Mock, call, patch
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.ced_replay import EncoderReplay, encoder_replay_tokens
+from tensorrt_llm._torch.pyexecutor.kv_cache import (
+    kv_cache_manager_v2 as kv_cache_manager_v2_module,
+)
+from tensorrt_llm._torch.pyexecutor.kv_cache.dkv import Dkv
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BlockReusePolicy,
     KVCacheManagerV2,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp
-from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import BudgetTracker, ScheduleAction
-from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, ContextChunkingPolicy
+from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import (
+    BudgetTracker,
+    ScheduleAction,
+    ShortestPrefillFirstOrder,
+)
+from tensorrt_llm.llmapi.llm_args import (
+    CapacitySchedulerPolicy,
+    ContextChunkCapConfig,
+    ContextChunkingPolicy,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -724,6 +736,7 @@ def make_scheduler(
     cross_kv_cache_manager: Mock | None = None,
     enable_prefix_aware_scheduling: bool = True,
     enable_recompute_pause: bool = True,
+    **extra,
 ) -> object:
     """Create KVCacheV2Scheduler, patching isinstance check for mock mgr."""
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
@@ -752,6 +765,7 @@ def make_scheduler(
             enable_prefix_aware_scheduling=enable_prefix_aware_scheduling,
             enable_recompute_pause=enable_recompute_pause,
             **kwargs,
+            **extra,
         )
 
 
@@ -5306,3 +5320,1075 @@ class TestLongContextDemotion:
             assert ids(out.context_requests) == [long_id]
         else:
             assert ids(out.recompute_paused_requests) == [long_id]
+
+
+class TestLongContextDemotionExact:
+    """TLLM_V2_CTX_DEMOTE_EXACT=1: the demotion classifies by the prefix cache.
+    An estimate above the threshold is probed once against the radix tree, a
+    request whose cache is held is judged by its exact remainder, and one
+    ordered as short whose first prepare shows a long remainder is deferred."""
+
+    ENV = {
+        "TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS": "1024",
+        "TLLM_V2_CTX_DEMOTE_MAX_ITERS": "0",
+        "TLLM_V2_CTX_DEMOTE_EXACT": "1",
+    }
+
+    def _make(self, env=None, reused=None, prepared_remaining=None):
+        """`reused`: probe result per request id. `prepared_remaining`: the exact
+        remainder prepare_context leaves per request id (its claimed reuse)."""
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        reused = reused or {}
+        prepared_remaining = prepared_remaining or {}
+
+        def prepare(req, reuse_limit=None):
+            mgr.kv_cache_map[req.py_request_id]  # the request now holds a cache
+            if req.py_request_id in prepared_remaining:
+                req.context_remaining_length = prepared_remaining[req.py_request_id]
+            return True
+
+        mgr.prepare_context.side_effect = prepare
+        mgr.probe_context_reuse.side_effect = lambda req: reused.get(req.py_request_id)
+        with patch.dict("os.environ", env or self.ENV):
+            sched = make_scheduler(mgr, max_num_tokens=1024, ctx_chunk_config=(None, 64))
+        return sched, mgr
+
+    def _req(self, request_id, remaining, estimate, prompt_len=None):
+        req = make_ctx_request(
+            request_id, context_remaining_length=remaining, prompt_len=prompt_len
+        )
+        req.py_uncached_prefill_tokens = estimate
+        req.py_uncached_prefill_probed = False
+        return req
+
+    def test_off_by_default(self):
+        sched, mgr = self._make(env=dict(self.ENV, TLLM_V2_CTX_DEMOTE_EXACT="0"), reused={1: 9_800})
+        long_req, forked = self._req(0, 10_000, 10_000), self._req(1, 10_000, 10_000)
+        out = sched.schedule_request([long_req, forked], set())
+        assert ids(out.context_requests) == [0]
+        mgr.probe_context_reuse.assert_not_called()
+
+    def test_probe_releases_a_request_over_a_cached_prefix(self):
+        """A forked sub-agent: unseen conversation, so the router estimates the
+        whole prompt, but 9800 of its 10000 tokens are cached."""
+        sched, mgr = self._make(reused={0: 0, 1: 9_800}, prepared_remaining={1: 200})
+        long_req, forked = self._req(0, 10_000, 10_000), self._req(1, 10_000, 10_000)
+        out = sched.schedule_request([long_req, forked], set())
+        assert ids(out.context_requests) == [1, 0]
+        assert forked.py_uncached_prefill_tokens == 200
+        assert forked.context_chunk_size == 200
+        assert long_req.context_chunk_size == 768  # leftover 824, rounded to the chunk unit
+        # One probe per request: the second iteration reuses the refined estimates.
+        sched.schedule_request([long_req], set())
+        assert mgr.probe_context_reuse.call_count == 2
+
+    def test_held_cache_is_judged_by_its_exact_remainder(self):
+        """A continuing turn whose prefix was evicted: the router estimates 256,
+        but the cache it holds leaves 10000 tokens to prefill."""
+        sched, mgr = self._make()
+        lost, short = self._req(0, 10_000, 256), self._req(1, 256, 256)
+        mgr.kv_cache_map[0]
+        out = sched.schedule_request([lost, short], set())
+        assert ids(out.context_requests) == [1, 0]
+        assert lost.context_chunk_size == 768
+        mgr.probe_context_reuse.assert_not_called()
+
+    def test_first_prepare_defers_a_request_found_long(self):
+        """Deferred to the tail of the iteration's context order; its released
+        first-chunk admission is prepared again there."""
+        sched, mgr = self._make(prepared_remaining={0: 10_000})
+        lost, short = self._req(0, 10_000, 256), self._req(1, 256, 256)
+        out = sched.schedule_request([lost, short], set())
+        assert ids(out.context_requests) == [1, 0]
+        assert short.context_chunk_size == 256
+        assert lost.context_chunk_size == 768
+        assert sched._ctx_demote_skips == {0: 1}  # counted as demoted for aging
+        assert mgr.prepare_context.call_count == 3  # lost twice (deferred, retried), short once
+        # The deferral released the first-chunk admission before the retry.
+        mgr.free_resources.assert_called_once_with(lost)
+
+    def test_released_deferral_keeps_its_exact_remainder_for_the_aging_bound(self):
+        """A deferral that finds no budget later in its iteration has released
+        its claim, so the next iterations order it by the remainder it kept, not
+        by the router's estimate: demoted without another prepare and release,
+        then let through by the aging bound."""
+        sched, mgr = self._make(
+            env=dict(self.ENV, TLLM_V2_CTX_DEMOTE_MAX_ITERS="2"), prepared_remaining={0: 10_000}
+        )
+        mgr.free_resources.side_effect = lambda req: mgr.kv_cache_map.pop(req.py_request_id)
+        lost = self._req(0, 10_000, 256)
+        # At the threshold (`> T` is false): never demoted, takes the whole budget.
+        hogs = [self._req(request_id, 1024, 1024) for request_id in (1, 2, 3)]
+        out = sched.schedule_request([lost, hogs[0]], set())
+        assert ids(out.context_requests) == [1]
+        assert sched._ctx_demote_skips == {0: 1}
+        mgr.free_resources.assert_called_once_with(lost)
+        out = sched.schedule_request([lost, hogs[1]], set())
+        assert ids(out.context_requests) == [2]
+        assert sched._ctx_demote_skips == {0: 2}
+        assert sched._unscheduled_first_chunk_claims == {("defer", False, True): 1}
+        mgr.free_resources.assert_called_once_with(lost)
+        out = sched.schedule_request([lost, hogs[2]], set())
+        assert ids(out.context_requests) == [0]
+        assert lost.context_chunk_size == 1024
+        assert lost.py_uncached_prefill_tokens is None
+        assert sched._ctx_demote_skips == {}
+        mgr.probe_context_reuse.assert_not_called()
+
+    def test_request_found_short_is_not_deferred(self):
+        sched, _ = self._make(prepared_remaining={0: 512})
+        first, second = self._req(0, 512, 512), self._req(1, 256, 256)
+        out = sched.schedule_request([first, second], set())
+        assert ids(out.context_requests) == [0, 1]
+        assert sched._ctx_demote_skips == {}
+
+    def test_waiting_request_is_probed_again(self):
+        """A request waiting for an in-flight prefix (TRTLLM_KV_V2_WAIT_FOR_INFLIGHT_PREFIX)
+        is probed again once it stops waiting: its first probe predates that prefix."""
+        reused = {1: 0}
+        sched, mgr = self._make(reused=reused, prepared_remaining={1: 200})
+        sched._wait_for_inflight_prefix = True
+        mgr.plan_context_waits.side_effect = lambda reqs: {1}
+        waiting = self._req(1, 10_000, 10_000)
+        out = sched.schedule_request([waiting], set())
+        assert ids(out.context_requests) == []
+        assert waiting.py_uncached_prefill_tokens == 10_000
+        assert not waiting.py_uncached_prefill_probed
+        # The prefix owner committed 9800 shared tokens; the waiter is released.
+        reused[1] = 9_800
+        mgr.plan_context_waits.side_effect = lambda reqs: set()
+        out = sched.schedule_request([waiting], set())
+        assert ids(out.context_requests) == [1]
+        assert waiting.py_uncached_prefill_tokens == 200
+        assert waiting.context_chunk_size == 200
+        assert mgr.probe_context_reuse.call_count == 2
+
+
+class TestUnscheduledFirstChunkClaim:
+    """TLLM_V2_KEEP_UNSCHEDULED_FIRST_CHUNK_CLAIM=1: a first context chunk that is
+    not scheduled keeps its cache claim unless admission ran out of KV pages. By
+    default every unscheduled first chunk that holds a claim releases it. Both
+    are counted per schedule action."""
+
+    DEMOTE_ENV = {
+        "TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS": "1024",
+        "TLLM_V2_CTX_DEMOTE_MAX_ITERS": "0",
+        "TLLM_V2_CTX_DEMOTE_EXACT": "1",
+    }
+
+    def _make(self, keep, prepared_remaining=None, resize_context_fn=None):
+        mgr = make_kv_cache_manager(tokens_per_block=64, resize_context_fn=resize_context_fn)
+        prepared_remaining = prepared_remaining or {}
+
+        def prepare(req, reuse_limit=None):
+            mgr.kv_cache_map[req.py_request_id]  # the request now holds a cache
+            if req.py_request_id in prepared_remaining:
+                req.context_remaining_length = prepared_remaining[req.py_request_id]
+            return True
+
+        mgr.prepare_context.side_effect = prepare
+        mgr.free_resources.side_effect = lambda req: mgr.kv_cache_map.pop(req.py_request_id)
+        env = dict(self.DEMOTE_ENV, TLLM_V2_KEEP_UNSCHEDULED_FIRST_CHUNK_CLAIM="1" if keep else "0")
+        with patch.dict("os.environ", env):
+            sched = make_scheduler(mgr, max_num_tokens=1024, ctx_chunk_config=(None, 64))
+        return sched, mgr
+
+    @staticmethod
+    def _req(request_id, remaining, estimate):
+        req = make_ctx_request(request_id, context_remaining_length=remaining)
+        req.py_uncached_prefill_tokens = estimate
+        req.py_uncached_prefill_probed = False
+        return req
+
+    @pytest.mark.parametrize("keep", [False, True], ids=["release", "keep"])
+    def test_deferred_first_chunk(self, keep):
+        """A request ordered as short and found long is deferred to the tail of
+        the iteration either way; only the default releases its claim first."""
+        sched, mgr = self._make(keep, prepared_remaining={0: 10_000})
+        lost, short = self._req(0, 10_000, 256), self._req(1, 256, 256)
+        out = sched.schedule_request([lost, short], set())
+        assert ids(out.context_requests) == [1, 0]
+        assert lost.context_chunk_size == 768
+        assert sched._unscheduled_first_chunk_claims == {("defer", False, not keep): 1}
+        if keep:
+            mgr.free_resources.assert_not_called()
+        else:
+            mgr.free_resources.assert_called_once_with(lost)
+
+    def test_kept_claim_is_judged_by_its_exact_remainder_next_pass(self):
+        """A kept claim is not matched again: the next pass orders the request by
+        the remainder its held cache leaves, so it is demoted without a deferral."""
+        sched, mgr = self._make(True, prepared_remaining={0: 10_000})
+        lost, short = self._req(0, 10_000, 256), self._req(1, 1024, 1024)
+        out = sched.schedule_request([lost, short], set())
+        assert ids(out.context_requests) == [1]  # the short one takes the whole budget
+        out = sched.schedule_request([lost], set())
+        assert ids(out.context_requests) == [0]
+        assert lost.context_chunk_size == 1024
+        assert sched._ctx_demote_skips == {0: 2}  # deferred in pass 1, demoted in pass 2
+        assert sched._unscheduled_first_chunk_claims == {("defer", False, False): 1}
+        mgr.free_resources.assert_not_called()
+        mgr.probe_context_reuse.assert_not_called()
+
+    @pytest.mark.parametrize("keep", [False, True], ids=["release", "keep"])
+    def test_out_of_pages_releases(self, keep):
+        sched, mgr = self._make(keep, resize_context_fn=lambda req, n: False)
+        req = self._req(0, 256, 256)
+        out = sched.schedule_request([req], set())
+        assert ids(out.context_requests) == []
+        mgr.free_resources.assert_called_once_with(req)
+        assert sched._unscheduled_first_chunk_claims == {("skip", True, True): 1}
+
+    def test_no_claim_is_not_counted(self):
+        """A first chunk skipped before prepare_context holds nothing to release."""
+        sched, mgr = self._make(True)
+        mgr.prepare_context.side_effect = lambda req, reuse_limit=None: False
+        out = sched.schedule_request([self._req(0, 256, 256)], set())
+        assert ids(out.context_requests) == []
+        assert sched._unscheduled_first_chunk_claims == {}
+
+
+# ===========================================================================
+# Waiting for an in-flight prefix
+# ===========================================================================
+
+
+class TestGenInitDecodeHeadroom:
+    """TRTLLM_DISAGG_GEN_INIT_DECODE_HEADROOM_TOKENS: a disagg gen-init request is admitted only while each
+    pool group keeps that many tokens of decode growth for every resident generation request."""
+
+    LOOKAHEAD = 1024
+
+    def _schedule(self, monkeypatch, available, on=True):
+        if on:
+            monkeypatch.setenv("TRTLLM_DISAGG_GEN_INIT_DECODE_HEADROOM_TOKENS", str(self.LOOKAHEAD))
+        else:
+            monkeypatch.delenv("TRTLLM_DISAGG_GEN_INIT_DECODE_HEADROOM_TOKENS", raising=False)
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        mgr.token_growth_slots_per_block.return_value = {0: 2}
+        mgr.get_available_primary_slots.return_value = [available]
+        resident = make_gen_request(0)
+        resident.py_max_new_tokens = None
+        mgr.kv_cache_map[0] = Mock(capacity=640, is_active=True)  # 10 blocks, grows 16
+        arriving = make_disagg_request(1, context_remaining_length=6400, prompt_len=6400)
+        arriving.py_max_new_tokens = None  # 100 prompt blocks, grows 16
+        sched = make_scheduler(mgr)
+        return sched.schedule_request([resident, arriving], set())
+
+    def test_admits_while_the_growth_of_every_resident_request_fits(self, monkeypatch):
+        # (100 + 16 + 16) blocks x 2 slots per block.
+        out = self._schedule(monkeypatch, available=264)
+        assert ids(out.fitting_disagg_gen_init_requests) == [1]
+        assert ids(out.generation_requests) == [0]
+
+    def test_defers_when_the_pool_cannot_keep_the_headroom(self, monkeypatch):
+        out = self._schedule(monkeypatch, available=263)
+        assert ids(out.fitting_disagg_gen_init_requests) == []
+        assert ids(out.generation_requests) == [0]
+
+    def test_off_admits_regardless(self, monkeypatch):
+        out = self._schedule(monkeypatch, available=0, on=False)
+        assert ids(out.fitting_disagg_gen_init_requests) == [1]
+
+
+class TestInflightPrefixWait:
+    """TRTLLM_KV_V2_WAIT_FOR_INFLIGHT_PREFIX: a new context request the manager
+    plans to wait (plan_context_waits) stays queued this pass, without a cache
+    claim; the requests behind it are scheduled."""
+
+    @pytest.mark.parametrize("chunk_config", [(None, 64), None])
+    @pytest.mark.parametrize("enabled", [True, False])
+    def test_waiting_request_is_skipped_without_preparing(self, chunk_config, enabled):
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        mgr.plan_context_waits.side_effect = lambda reqs: {1}
+        with patch.object(kv_cache_manager_v2_module, "_WAIT_FOR_INFLIGHT_PREFIX", enabled):
+            sched = make_scheduler(mgr, max_num_tokens=4096, ctx_chunk_config=chunk_config)
+        reqs = [make_ctx_request(i, context_remaining_length=500) for i in range(3)]
+
+        out = sched.schedule_request(reqs, set())
+
+        scheduled = ids(out.context_requests)
+        prepared = [c.args[0].py_request_id for c in mgr.prepare_context.call_args_list]
+        if enabled:
+            assert scheduled == [0, 2] and 1 not in prepared
+        else:
+            assert scheduled == [0, 1, 2]
+            mgr.plan_context_waits.assert_not_called()
+
+
+class TestGenSkipBlocked:
+    """TLLM_V2_GEN_SKIP_BLOCKED: a generation request that finds no pages (no tier to evict to) no longer
+    ends the pass; the generation requests behind it are tried without eviction, context requests wait."""
+
+    @staticmethod
+    def _schedule(monkeypatch, on):
+        if on:
+            monkeypatch.setenv("TLLM_V2_GEN_SKIP_BLOCKED", "1")
+        else:
+            monkeypatch.delenv("TLLM_V2_GEN_SKIP_BLOCKED", raising=False)
+        mgr = make_kv_cache_manager(
+            can_evict=False, try_allocate_generation_fn=lambda req: req.py_request_id != 0
+        )
+        sched = make_scheduler(mgr)
+        reqs = [make_gen_request(0), make_gen_request(1), make_ctx_request(2, 10)]
+        return sched.schedule_request(reqs, set()), mgr
+
+    def test_off_stops_at_the_blocked_request(self, monkeypatch):
+        out, mgr = self._schedule(monkeypatch, on=False)
+        assert ids(out.generation_requests) == []
+        assert ids(out.context_requests) == []
+
+    def test_on_schedules_the_generation_requests_behind_it(self, monkeypatch):
+        out, mgr = self._schedule(monkeypatch, on=True)
+        assert ids(out.generation_requests) == [1]
+        assert ids(out.context_requests) == []
+        mgr.suspend_request.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Per-request chunk cap, equal progress, and the DKV admission rules
+# ---------------------------------------------------------------------------
+
+
+def _long_ctx(request_id, remaining, snapshot_points=()):
+    req = make_ctx_request(request_id, context_remaining_length=remaining)
+    req.expect_snapshot_points = list(snapshot_points)
+    req.py_midchunk_snapshot_alignment = None
+    req.py_uncached_prefill_tokens = None
+    return req
+
+
+def _cap(tokens, min_waiting=24):
+    return ContextChunkCapConfig(max_tokens_per_request=tokens, min_waiting_requests=min_waiting)
+
+
+class TestContextChunkCap:
+    def test_each_request_is_capped_while_enough_wait(self):
+        sched = make_scheduler(
+            make_kv_cache_manager(),
+            max_num_tokens=4096,
+            ctx_chunk_config=(None, 64),
+            context_chunk_cap=_cap(1000, min_waiting=3),
+        )
+        reqs = [_long_ctx(i, 3000) for i in range(3)]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.context_requests) == [0, 1, 2]
+        # Capped at 1000, then rounded down to the chunk unit like a budget-shortened chunk.
+        assert [r.context_chunk_size for r in reqs] == [960, 960, 960]
+
+    def test_a_request_with_few_waiting_keeps_the_whole_budget(self):
+        sched = make_scheduler(
+            make_kv_cache_manager(),
+            max_num_tokens=4096,
+            ctx_chunk_config=(None, 64),
+            context_chunk_cap=_cap(1000, min_waiting=3),
+        )
+        reqs = [_long_ctx(i, 3000) for i in range(2)]
+        sched.schedule_request(reqs, set())
+        assert [r.context_chunk_size for r in reqs] == [3000, 1088]
+
+    def test_zero_min_waiting_caps_every_step(self):
+        sched = make_scheduler(
+            make_kv_cache_manager(),
+            max_num_tokens=4096,
+            ctx_chunk_config=(None, 64),
+            context_chunk_cap=_cap(1000, min_waiting=0),
+        )
+        req = _long_ctx(0, 3000)
+        sched.schedule_request([req], set())
+        assert req.context_chunk_size == 960
+
+    def test_a_capped_chunk_that_ends_the_prompt_is_not_rounded(self):
+        sched = make_scheduler(
+            make_kv_cache_manager(),
+            max_num_tokens=4096,
+            ctx_chunk_config=(None, 64),
+            context_chunk_cap=_cap(1000, min_waiting=0),
+        )
+        req = _long_ctx(0, 1000)
+        sched.schedule_request([req], set())
+        assert req.context_chunk_size == 1000
+
+    def test_forced_snapshot_chunks_are_capped_too(self):
+        """Hybrid models with block reuse run FORCE_CHUNK: the cap shortens a chunk that would run
+        to its next snapshot point, and a shortened chunk ends on a chunk unit."""
+        sched = make_scheduler(
+            make_kv_cache_manager(),
+            max_num_tokens=8192,
+            ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 64),
+            context_chunk_cap=_cap(1000, min_waiting=0),
+        )
+        req = _long_ctx(0, 6000, snapshot_points=[5000, 6000])
+        sched.schedule_request([req], set())
+        assert req.context_chunk_size == 960
+        short = _long_ctx(1, 6000, snapshot_points=[700, 6000])
+        sched.schedule_request([short], set())
+        assert short.context_chunk_size == 700
+
+    def test_the_cap_needs_chunked_prefill(self):
+        sched = make_scheduler(
+            make_kv_cache_manager(), max_num_tokens=4096, context_chunk_cap=_cap(1000, 0)
+        )
+        req = _long_ctx(0, 3000)
+        sched.schedule_request([req], set())
+        assert req.context_chunk_size == 3000
+
+
+class TestEqualProgress:
+    def _three(self):
+        return [_long_ctx(0, 10000), _long_ctx(1, 500), _long_ctx(2, 10000)]
+
+    def test_the_budget_is_split_by_water_level(self):
+        sched = make_scheduler(
+            make_kv_cache_manager(),
+            max_num_tokens=4096,
+            ctx_chunk_config=(ContextChunkingPolicy.EQUAL_PROGRESS, 64),
+        )
+        reqs = self._three()
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.context_requests) == [0, 1, 2]
+        # The short request takes its 500; the two long ones split the other 3596 (1798 each,
+        # rounded down to the chunk unit).
+        assert [r.context_chunk_size for r in reqs] == [1792, 500, 1792]
+
+    def test_first_come_first_served_is_unchanged(self):
+        sched = make_scheduler(
+            make_kv_cache_manager(),
+            max_num_tokens=4096,
+            ctx_chunk_config=(ContextChunkingPolicy.FIRST_COME_FIRST_SERVED, 64),
+        )
+        reqs = self._three()
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.context_requests) == [0]
+        assert reqs[0].context_chunk_size == 4096
+
+    def test_kept_under_a_forced_chunk_policy(self):
+        """The creator replaces EQUAL_PROGRESS with FORCE_CHUNK for recurrent snapshots; the
+        split still applies, and the snapshot points still end chunks."""
+        sched = make_scheduler(
+            make_kv_cache_manager(),
+            max_num_tokens=4096,
+            ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 64),
+            equal_progress=True,
+        )
+        reqs = [
+            _long_ctx(0, 10000, [10000]),
+            _long_ctx(1, 10000, [300, 10000]),
+            _long_ctx(2, 10000, [10000]),
+        ]
+        sched.schedule_request(reqs, set())
+        # The split counts each request with its next forced chunk (300 for the second).
+        assert [r.context_chunk_size for r in reqs] == [1856, 300, 1920]
+
+    def test_an_estimate_counts_the_router_reuse(self):
+        sched = make_scheduler(
+            make_kv_cache_manager(),
+            max_num_tokens=4096,
+            ctx_chunk_config=(ContextChunkingPolicy.EQUAL_PROGRESS, 64),
+        )
+        reqs = self._three()
+        # The router expects the third request to compute only 1000 of its 10000 tokens.
+        reqs[2].py_uncached_prefill_tokens = 1000
+        sched.schedule_request(reqs, set())
+        # Over [500, 1000, 10000] the first request's level is 4096 - 1500 = 2596.
+        assert reqs[0].context_chunk_size == 2560
+
+
+def _dkv_manager(**kwargs):
+    """A mocked manager of a DKV group: real ``Dkv``, scheduler-facing DKV hooks recorded."""
+    mgr = make_kv_cache_manager(enable_block_reuse=True, **kwargs)
+    mgr.dkv = Dkv(2, 0, 64, lambda obj: [obj, obj])
+    mgr.dkv_claim_ready.side_effect = lambda req: True
+    mgr.unpin_dkv_context_reuse.side_effect = lambda keep=None: False
+    return mgr
+
+
+class TestDkvAdmission:
+    def test_the_group_agrees_before_any_decision_reads_the_reuse(self):
+        mgr = _dkv_manager()
+        mgr.plan_context_waits.side_effect = lambda reqs: {1}
+        sched = make_scheduler(mgr, max_num_tokens=8192, ctx_chunk_config=(None, 64))
+        sched._wait_for_inflight_prefix = True
+        reqs = [_long_ctx(i, 1000) for i in range(3)]
+        sched.schedule_request(reqs, set())
+        names = [c[0] for c in mgr.method_calls]
+        assert names.index("agree_dkv_context_reuse") < names.index("plan_context_waits")
+        assert names.index("plan_context_waits") < names.index("pin_dkv_context_reuse")
+        # Waiters are not pinned; the agreement covers every new context request.
+        (agreed, _), _ = mgr.agree_dkv_context_reuse.call_args
+        (pinned, _), _ = mgr.pin_dkv_context_reuse.call_args
+        assert ids(agreed) == [0, 1, 2] and ids(pinned) == [0, 2]
+        last_claim = max(i for i, name in enumerate(names) if name == "prepare_context")
+        assert names.index("release_dkv_reuse_pins") > last_claim
+
+    def test_only_the_free_request_slots_are_pinned(self):
+        mgr = _dkv_manager()
+        sched = make_scheduler(
+            mgr, max_batch_size=2, max_num_tokens=8192, ctx_chunk_config=(None, 64)
+        )
+        reqs = [_long_ctx(i, 1000) for i in range(4)]
+        sched.schedule_request(reqs, set())
+        (pinned, _), _ = mgr.pin_dkv_context_reuse.call_args
+        assert ids(pinned) == [0, 1]
+
+    def test_a_request_without_a_verified_claim_waits(self):
+        mgr = _dkv_manager()
+        mgr.dkv_claim_ready.side_effect = lambda req: req.py_request_id != 1
+        sched = make_scheduler(mgr, max_num_tokens=8192, ctx_chunk_config=(None, 64))
+        reqs = [_long_ctx(i, 1000) for i in range(3)]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.context_requests) == [0, 2]
+        assert [c.args[0].py_request_id for c in mgr.prepare_context.call_args_list] == [0, 2]
+
+    @pytest.mark.parametrize("chunked", [False, True])
+    def test_pins_are_given_back_when_a_request_finds_no_pages(self, chunked):
+        """Two pinned prefixes fill the pool, so neither request can allocate. The first
+        request's failure gives the other pins back and it retries once; the request whose pin
+        was given back waits for the next step."""
+        state = {"pinned": True, "ready": {0, 1}}
+
+        def unpin(keep=None):
+            was = state["pinned"]
+            state["pinned"] = False
+            state["ready"] = {keep}
+            return was
+
+        mgr = _dkv_manager(resize_context_fn=lambda req, n: not state["pinned"])
+        mgr.unpin_dkv_context_reuse.side_effect = unpin
+        mgr.dkv_claim_ready.side_effect = lambda req: req.py_request_id in state["ready"]
+        sched = make_scheduler(
+            mgr, max_num_tokens=8192, ctx_chunk_config=(None, 64) if chunked else None
+        )
+        reqs = [_long_ctx(0, 1000), _long_ctx(1, 1000)]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.context_requests) == [0]
+        mgr.unpin_dkv_context_reuse.assert_called_once_with(0)
+        assert mgr.resize_context.call_count == 2
+
+    def test_without_dkv_nothing_is_unpinned(self):
+        mgr = make_kv_cache_manager(resize_context_fn=lambda req, n: False)
+        sched = make_scheduler(mgr, max_num_tokens=8192, ctx_chunk_config=(None, 64))
+        out = sched.schedule_request([_long_ctx(0, 1000)], set())
+        assert out.context_requests == []
+        mgr.unpin_dkv_context_reuse.assert_not_called()
+        mgr.pin_dkv_context_reuse.assert_not_called()
+
+    def test_decisions_read_only_the_agreed_reuse(self):
+        """Every rank of the group must take the same decisions: the prefix-aware skip (this
+        rank's radix tree) is off, and the equal-progress split counts the agreed reuse."""
+        mgr = _dkv_manager(block_reuse_policy=BlockReusePolicy.ALL_REUSABLE)
+        mgr.probe_context_reuse.side_effect = lambda req: 3000
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=4096,
+            ctx_chunk_config=(ContextChunkingPolicy.EQUAL_PROGRESS, 64),
+        )
+        assert not sched._prefix_skip_enabled
+        reqs = [_long_ctx(i, 4000 + 1000 * i) for i in range(3)]
+        sched.schedule_request(reqs, set())
+        mgr.probe_first_new_block_key.assert_not_called()
+        # Needs 1000 / 2000 / 3000 after the agreed 3000-token reuse; the mock claims none of it,
+        # so each request offers its whole remainder against the others' estimates.
+        assert [r.context_chunk_size for r in reqs] == [1344, 1344, 1408]
+
+
+# ===========================================================================
+# Shortest prefill first and its combination with long-prefill demotion
+# ===========================================================================
+
+
+_SPF_ENV = "TRTLLM_SCHED_SHORTEST_PREFILL_FIRST"
+_AGING_ENV = "TRTLLM_SCHED_SHORTEST_PREFILL_AGING_FACTOR"
+_ADMIT_LOG_ENV = "TRTLLM_SCHED_CTX_ADMIT_LOG"
+_RELEASE_ENV = "TRTLLM_SCHED_SHORTEST_PREFILL_RELEASE_KEEPS_KEY"
+_DEMOTE_ENVS = (
+    "TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS",
+    "TLLM_V2_CTX_DEMOTE_MAX_ITERS",
+    "TLLM_V2_CTX_DEMOTE_EXACT",
+)
+
+
+@pytest.fixture
+def admission_env(monkeypatch):
+    for name in (_SPF_ENV, _AGING_ENV, _ADMIT_LOG_ENV, _RELEASE_ENV) + _DEMOTE_ENVS:
+        monkeypatch.delenv(name, raising=False)
+    return monkeypatch
+
+
+def _reuse_settling_manager(reuse_by_id, **kwargs):
+    """Manager whose prefix probe and prepare agree on each request's reuse."""
+
+    def prepare_context(req, reuse_limit=None):
+        if req.is_first_context_chunk:
+            reused = reuse_by_id.get(req.py_request_id, 0)
+            req.context_remaining_length = req.prompt_len - reused
+        return True
+
+    mgr = make_kv_cache_manager(prepare_context_fn=prepare_context, **kwargs)
+    mgr.probe_context_reuse.side_effect = lambda req: reuse_by_id.get(req.py_request_id, 0)
+    return mgr
+
+
+def _admit_chunk(req):
+    """Advance a mock context request past the chunk it was just given."""
+    req.context_current_position += req.context_chunk_size
+    req.context_remaining_length -= req.context_chunk_size
+    req.is_first_context_chunk = False
+
+
+@pytest.fixture
+def unit_aging(admission_env):
+    """Shortest prefill first aged by exactly each request's own work, so the bounds show at
+    small sizes."""
+    admission_env.setenv(_SPF_ENV, "1")
+    admission_env.setenv(_AGING_ENV, "1")
+
+
+class TestShortestPrefillFirstPolicy:
+    """Pending context is tried shortest prefill first, aged by admitted context tokens."""
+
+    @pytest.mark.parametrize(
+        "env", [{}, {_SPF_ENV: "1", _AGING_ENV: "0"}], ids=["without_opt_in", "zero_factor"]
+    )
+    def test_arrival_order(self, admission_env, env):
+        for name, value in env.items():
+            admission_env.setenv(name, value)
+        mgr = _reuse_settling_manager({})
+        sched = make_scheduler(mgr, max_num_tokens=150)
+        out = sched.schedule_request([make_ctx_request(1, 1000), make_ctx_request(2, 100)], set())
+        # FCFS: the long prompt does not fit and ends admission.
+        assert ids(out.context_requests) == []
+        mgr.probe_context_reuse.assert_not_called()
+
+    def test_on_with_opt_in(self, admission_env):
+        admission_env.setenv(_SPF_ENV, "1")
+        sched = make_scheduler(make_kv_cache_manager())
+        assert isinstance(sched._shortest_prefill_first, ShortestPrefillFirstOrder)
+        assert sched._shortest_prefill_first.work == 0
+        assert (
+            sched._shortest_prefill_first.aging_factor
+            == ShortestPrefillFirstOrder.DEFAULT_AGING_FACTOR
+            == 64
+        )
+
+    @pytest.mark.parametrize("value", ["0", ""])
+    def test_off_unless_set_to_one(self, admission_env, value):
+        admission_env.setenv(_SPF_ENV, value)
+        sched = make_scheduler(make_kv_cache_manager())
+        assert sched._shortest_prefill_first is None
+        assert sched._ctx_admission_log is None
+
+    @pytest.mark.parametrize("factor", [0, 1, 8, 64, 256])
+    def test_aging_factor_from_env(self, admission_env, factor):
+        admission_env.setenv(_SPF_ENV, "1")
+        admission_env.setenv(_AGING_ENV, str(factor))
+        sched = make_scheduler(_reuse_settling_manager({2: 950}), max_num_tokens=120)
+        assert sched._shortest_prefill_first.aging_factor == factor
+        sched.schedule_request([make_ctx_request(1, 100), make_ctx_request(2, 1000)], set())
+        assert sched._shortest_prefill_first._key == {1: 100 * factor, 2: 50 * factor}
+
+    def test_aging_factor_in_startup_log(self, admission_env):
+        admission_env.setenv(_SPF_ENV, "1")
+        admission_env.setenv(_AGING_ENV, "16")
+        with patch("tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2.logger") as log:
+            make_scheduler(make_kv_cache_manager())
+        infos = [c.args[0] for c in log.info.call_args_list]
+        assert any("context admission:" in m and "(factor 16)" in m for m in infos)
+
+    @pytest.mark.parametrize("value", ["-1", "two", "1.5"])
+    def test_invalid_aging_factor_rejected(self, admission_env, value):
+        admission_env.setenv(_SPF_ENV, "1")
+        admission_env.setenv(_AGING_ENV, value)
+        with pytest.raises(ValueError, match=_AGING_ENV):
+            make_scheduler(make_kv_cache_manager())
+
+    def test_aging_factor_ignored_without_opt_in(self, admission_env):
+        admission_env.setenv(_AGING_ENV, "8")
+        with patch("tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2.logger") as log:
+            sched = make_scheduler(make_kv_cache_manager())
+        assert sched._shortest_prefill_first is None
+        warnings = [c.args[0] for c in log.warning.call_args_list]
+        assert any(f"{_AGING_ENV} is ignored" in w for w in warnings)
+
+    def test_shortest_uncached_prompt_first(self, admission_env):
+        admission_env.setenv(_SPF_ENV, "1")
+        mgr = _reuse_settling_manager({})
+        sched = make_scheduler(mgr, max_num_tokens=150)
+        out = sched.schedule_request([make_ctx_request(1, 1000), make_ctx_request(2, 100)], set())
+        assert ids(out.context_requests) == [2]
+
+    def test_order_uses_the_reusable_prefix(self, admission_env):
+        admission_env.setenv(_SPF_ENV, "1")
+        # Request 2 has the longer prompt but only 50 uncached tokens.
+        mgr = _reuse_settling_manager({2: 950})
+        sched = make_scheduler(mgr, max_num_tokens=120)
+        out = sched.schedule_request([make_ctx_request(1, 100), make_ctx_request(2, 1000)], set())
+        assert ids(out.context_requests) == [2]
+
+    def test_ties_keep_arrival_order(self, admission_env):
+        admission_env.setenv(_SPF_ENV, "1")
+        sched = make_scheduler(_reuse_settling_manager({}), max_num_tokens=150)
+        out = sched.schedule_request([make_ctx_request(3, 100), make_ctx_request(1, 100)], set())
+        assert ids(out.context_requests) == [3]
+
+    def test_started_prefill_ranks_by_remaining_context(self, admission_env):
+        admission_env.setenv(_SPF_ENV, "1")
+        mgr = _reuse_settling_manager({})
+        sched = make_scheduler(mgr, max_num_tokens=200, ctx_chunk_config=(None, 64))
+        started = make_ctx_request(
+            1, context_remaining_length=300, prompt_len=5000, is_first_context_chunk=False
+        )
+        fresh = make_ctx_request(2, context_remaining_length=150)
+        out = sched.schedule_request([started, fresh], set())
+        assert ids(out.context_requests)[0] == 2
+        assert fresh.context_chunk_size == 150
+        # The started request is ranked by what it has left, without a probe.
+        assert [c.args[0].py_request_id for c in mgr.probe_context_reuse.call_args_list] == [2]
+
+    def test_probe_runs_once_per_request(self, admission_env):
+        admission_env.setenv(_SPF_ENV, "1")
+        mgr = _reuse_settling_manager({})
+        sched = make_scheduler(mgr, max_num_tokens=50)
+        waiting = [make_ctx_request(1, 300), make_ctx_request(2, 200)]
+        for _ in range(3):
+            assert ids(sched.schedule_request(waiting, set()).context_requests) == []
+        assert mgr.probe_context_reuse.call_count == 2
+        # Bookkeeping is dropped once a request is no longer pending.
+        sched.schedule_request([waiting[1]], set())
+        assert set(sched._shortest_prefill_first._arrival_work) == {2}
+
+    def test_clock_counts_admitted_context_tokens(self, admission_env):
+        admission_env.setenv(_SPF_ENV, "1")
+        sched = make_scheduler(
+            _reuse_settling_manager({}), max_num_tokens=192, ctx_chunk_config=(None, 64)
+        )
+        long_ctx = make_ctx_request(1, context_remaining_length=5000, is_last_context_chunk=False)
+        sched.schedule_request([long_ctx, make_ctx_request(2, 64)], set())
+        assert sched._shortest_prefill_first.work == 64 + 128
+
+    @pytest.mark.parametrize(
+        "factor, expected",
+        [("1", [[2], [3], [4], [1]]), ("8", [[2], [3], [4], [5]]), (None, [[2], [3], [4], [5]])],
+        ids=["factor_1", "factor_8", "default_factor"],
+    )
+    def test_later_arrivals_overtake_until_admitted_work_covers_the_gap(
+        self, admission_env, factor, expected
+    ):
+        admission_env.setenv(_SPF_ENV, "1")
+        if factor is not None:
+            admission_env.setenv(_AGING_ENV, factor)
+        sched = make_scheduler(_reuse_settling_manager({}), max_num_tokens=410)
+        long_ctx = make_ctx_request(1, 400)
+        admitted = []
+        for request_id in (2, 3, 4, 5):
+            out = sched.schedule_request([long_ctx, make_ctx_request(request_id, 100)], set())
+            admitted.append(ids(out.context_requests))
+        # Request 1's key is 0 + F * 400. The k-th 100-token arrival's is 100 * (k - 1) + F * 100,
+        # so request 1 is overtaken until F * 300 tokens have been admitted. With F = 1 the
+        # fourth arrival ties and the earlier request wins.
+        assert admitted == expected
+
+    def test_prompt_that_keeps_progressing_reaches_the_front(self, admission_env, unit_aging):
+        mgr = _reuse_settling_manager({})
+        sched = make_scheduler(mgr, max_num_tokens=192, ctx_chunk_config=(None, 64))
+        long_ctx = make_ctx_request(1, context_remaining_length=5000, is_last_context_chunk=False)
+        for step in range(27):
+            short = make_ctx_request(100 + step, 64)
+            out = sched.schedule_request([long_ctx, short], set())
+            if step < 26:
+                # 192 * step + 64 < 5000: the short arrival goes first and the long prompt
+                # takes the rest of the budget.
+                assert ids(out.context_requests) == [1, short.py_request_id]
+                assert short.context_chunk_size == 64
+                assert long_ctx.context_chunk_size == 128
+            else:
+                # The scheduler has admitted 4992 context tokens since request 1 arrived:
+                # a 64-token arrival's key (5056) is past its 5000.
+                assert ids(out.context_requests) == [1]
+                assert long_ctx.context_chunk_size == 192
+            _admit_chunk(long_ctx)
+
+    def test_prompt_crowded_out_reaches_the_front(self, admission_env, unit_aging):
+        mgr = _reuse_settling_manager({})
+        sched = make_scheduler(mgr, max_num_tokens=128, ctx_chunk_config=(None, 64))
+        long_ctx = make_ctx_request(1, context_remaining_length=5000, is_last_context_chunk=False)
+        admitted = []
+        for step in range(40):
+            out = sched.schedule_request([long_ctx, make_ctx_request(100 + step, 128)], set())
+            admitted.append(ids(out.context_requests))
+        # Each 128-token arrival takes the whole budget while its key, 128 * (step + 1),
+        # is below request 1's 5000: 39 passes. Then request 1 goes first.
+        assert admitted[:39] == [[100 + step] for step in range(39)]
+        assert admitted[39] == [1]
+
+
+class TestShortestPrefillFirstBounds:
+    @pytest.mark.parametrize("spf", [False, True])
+    def test_newcomer_short_of_pages_does_not_preempt_started_prefill(self, admission_env, spf):
+        if spf:
+            admission_env.setenv(_SPF_ENV, "1")
+        mgr = make_kv_cache_manager(
+            resize_context_fn=lambda req, n: req.py_request_id != 2,
+            has_cache_tier_below_gpu=False,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        started = make_ctx_request(1, 300, prompt_len=5000, is_first_context_chunk=False)
+        newcomer = make_ctx_request(2, 100)
+        out = sched.schedule_request([started, newcomer], set())
+        assert ids(out.context_requests) == [1]
+        assert ids(out.recompute_paused_requests) == []
+        mgr.preempt_request.assert_not_called()
+
+    def test_started_prefill_may_still_preempt_under_spf(self, admission_env):
+        admission_env.setenv(_SPF_ENV, "1")
+        mgr = make_kv_cache_manager(
+            resize_context_fn=lambda req, n: req.py_request_id != 1,
+            has_cache_tier_below_gpu=False,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        started = make_ctx_request(1, 300, prompt_len=5000, is_first_context_chunk=False)
+        newer_started = make_ctx_request(2, 600, prompt_len=5000, is_first_context_chunk=False)
+        out = sched.schedule_request([started, newer_started], set())
+        # The protection applies to requests that have not started prefilling;
+        # between started requests the usual newest-first preemption holds.
+        assert ids(out.recompute_paused_requests) == [2]
+
+
+class TestShortestPrefillFirstWithDemotion:
+    """Both on: demotion sets the class, shortest prefill first the order within it."""
+
+    DEMOTE = {"TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS": "1024", "TLLM_V2_CTX_DEMOTE_MAX_ITERS": "0"}
+
+    def _make(self, menv, env, spf, max_num_tokens=1088, **mgr_kwargs):
+        for name, value in env.items():
+            menv.setenv(name, value)
+        if spf:
+            menv.setenv(_SPF_ENV, "1")
+        return make_scheduler(
+            make_kv_cache_manager(tokens_per_block=64, **mgr_kwargs),
+            max_num_tokens=max_num_tokens,
+            ctx_chunk_config=(None, 64),
+        )
+
+    def _req(self, request_id, remaining, estimate=None, kv_start=0):
+        req = make_ctx_request(
+            request_id, context_remaining_length=remaining, is_first_context_chunk=kv_start == 0
+        )
+        req.context_current_position = kv_start
+        req.py_uncached_prefill_tokens = estimate
+        req.py_uncached_prefill_probed = False
+        return req
+
+    def _four(self):
+        # Arrival order: long 10k, long 3k, short 900, short 100.
+        return [
+            self._req(0, 10_000, estimate=10_000),
+            self._req(1, 3_000, estimate=3_000),
+            self._req(2, 900, estimate=900),
+            self._req(3, 100, estimate=100),
+        ]
+
+    @pytest.mark.parametrize("spf", [False, True])
+    def test_shortest_first_within_each_class(self, admission_env, spf):
+        sched = self._make(admission_env, self.DEMOTE, spf)
+        out = sched.schedule_request(self._four(), set())
+        if spf:
+            # Short class 100 then 900, then the long class from its shortest (3k) on.
+            assert ids(out.context_requests) == [3, 2, 1]
+        else:
+            # Demotion alone: each class in arrival order.
+            assert ids(out.context_requests) == [2, 3, 0]
+
+    def test_demotion_class_comes_before_the_work(self, admission_env):
+        """The router over-estimates request 4 (a fork over a cached prefix): demoted, it waits
+        behind the whole short class although its real work is smaller."""
+        sched = self._make(admission_env, self.DEMOTE, spf=True)
+        reqs = self._four() + [self._req(4, 500, estimate=5_000)]
+        sched.schedule_request(reqs, set())
+        assert reqs[2].context_chunk_size == 900
+        assert reqs[4].context_chunk_size == 64
+
+    def test_shortest_first_alone_ignores_the_classes(self, admission_env):
+        sched = self._make(admission_env, {}, spf=True, max_num_tokens=1088)
+        out = sched.schedule_request(self._four(), set())
+        assert ids(out.context_requests) == [3, 2, 1]
+        assert sched.ctx_demote_uncached_tokens == 0
+
+    def test_request_let_through_by_the_aging_bound_is_fully_aged(self, admission_env):
+        admission_env.setenv(_AGING_ENV, "64")
+        sched = self._make(
+            admission_env, dict(self.DEMOTE, TLLM_V2_CTX_DEMOTE_MAX_ITERS="2"), spf=True
+        )
+        long_req = self._req(0, 10_000, estimate=10_000)
+        admitted = []
+        for step in range(4):
+            hog = self._req(100 + step, 960, estimate=960)
+            out = sched.schedule_request([long_req, hog], set())
+            admitted.append(ids(out.context_requests))
+        # Two passes demoted, then let through for good: its key is its clock reading (0),
+        # below every later arrival's, as arrival order would have it.
+        assert admitted == [[100, 0], [101, 0], [0], [0]]
+        assert sched._shortest_prefill_first._key[0] == 0
+
+    def test_released_request_keeps_its_key_with_release_keeps_key(self, admission_env):
+        admission_env.setenv(_AGING_ENV, "64")
+        admission_env.setenv(_RELEASE_ENV, "1")
+        sched = self._make(
+            admission_env, dict(self.DEMOTE, TLLM_V2_CTX_DEMOTE_MAX_ITERS="2"), spf=True
+        )
+        assert not sched._shortest_prefill_first.release_aged
+        long_req = self._req(0, 10_000, estimate=10_000)
+        admitted = []
+        for step in range(4):
+            hog = self._req(100 + step, 960, estimate=960)
+            out = sched.schedule_request([long_req, hog], set())
+            admitted.append(ids(out.context_requests))
+        # Let through, it leaves the demoted class but keeps 64 x 10k: the short arrivals
+        # still go first.
+        assert admitted == [[100, 0], [101, 0], [102, 0], [103, 0]]
+        assert sched._shortest_prefill_first._key[0] == 64 * 10_000
+
+    @pytest.mark.parametrize("value", [None, "0", "key"])
+    def test_release_fully_ages_unless_set_to_one(self, admission_env, value):
+        if value is not None:
+            admission_env.setenv(_RELEASE_ENV, value)
+        sched = self._make(admission_env, self.DEMOTE, spf=True)
+        assert sched._shortest_prefill_first.release_aged
+
+    def test_release_mode_in_startup_log(self, admission_env):
+        admission_env.setenv(_RELEASE_ENV, "1")
+        with patch("tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2.logger") as log:
+            self._make(admission_env, self.DEMOTE, spf=True)
+        infos = [c.args[0] for c in log.info.call_args_list]
+        assert any(
+            "within each long-prefill demotion class, released requests keep their key" in m
+            for m in infos
+        )
+
+    def test_release_mode_ignored_without_opt_in(self, admission_env):
+        admission_env.setenv(_RELEASE_ENV, "1")
+        with patch("tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2.logger") as log:
+            sched = self._make(admission_env, self.DEMOTE, spf=False)
+        assert sched._shortest_prefill_first is None
+        warnings = [c.args[0] for c in log.warning.call_args_list]
+        assert any(f"{_RELEASE_ENV} is ignored" in w for w in warnings)
+
+    def test_without_the_release_rule_the_long_request_would_keep_waiting(self, admission_env):
+        """Control for the test above: the same work term without demotion keeps the long
+        request behind fresh short arrivals."""
+        admission_env.setenv(_AGING_ENV, "64")
+        sched = self._make(admission_env, {}, spf=True)
+        long_req = self._req(0, 10_000)
+        for step in range(4):
+            hog = self._req(100 + step, 960)
+            out = sched.schedule_request([long_req, hog], set())
+            assert ids(out.context_requests) == [100 + step, 0]
+
+    def test_exact_probe_is_reused(self, admission_env):
+        env = dict(self.DEMOTE, TLLM_V2_CTX_DEMOTE_EXACT="1")
+        sched = self._make(admission_env, env, spf=True)
+        mgr = sched.kv_cache_manager
+        mgr.probe_context_reuse.side_effect = lambda req: {0: 9_500}.get(req.py_request_id, 0)
+        # Estimated long, but 9.5k of its 10k prompt are cached: exact remainder 500.
+        cached = self._req(0, 10_000, estimate=10_000)
+        short = self._req(1, 900, estimate=900)
+        sched.schedule_request([cached, short], set())
+        probed = [c.args[0].py_request_id for c in mgr.probe_context_reuse.call_args_list]
+        # Demotion probed request 0 once; the order reused it and probed only request 1.
+        assert probed.count(0) == 1 and probed.count(1) == 1
+        assert sched._shortest_prefill_first.uncached_estimate(0) == 500
+
+    def test_preemption_keeps_arrival_order(self, admission_env):
+        sched = self._make(
+            admission_env,
+            self.DEMOTE,
+            spf=True,
+            resize_context_fn=lambda req, n: req.py_request_id != 1,
+            has_cache_tier_below_gpu=False,
+        )
+        long_req = self._req(0, 5_000, estimate=10_000, kv_start=5_000)
+        short = self._req(1, 256, estimate=256)
+        out = sched.schedule_request([long_req, short], set())
+        sched.kv_cache_manager.preempt_request.assert_not_called()
+        assert ids(out.context_requests) == [0]
+
+
+class TestShortestPrefillFirstInflightPrefix:
+    def test_waiting_request_is_probed_again(self, admission_env):
+        admission_env.setenv(_SPF_ENV, "1")
+        reuse = {}
+        mgr = _reuse_settling_manager(reuse, tokens_per_block=64)
+        waits = [{1}, set()]
+        mgr.plan_context_waits.side_effect = lambda reqs: waits.pop(0)
+        with patch.object(kv_cache_manager_v2_module, "_WAIT_FOR_INFLIGHT_PREFIX", True):
+            sched = make_scheduler(mgr, max_num_tokens=1100, ctx_chunk_config=(None, 64))
+        owner = make_ctx_request(0, 1000, is_last_context_chunk=False)
+        follower = make_ctx_request(1, 1000)
+        out = sched.schedule_request([owner, follower], set())
+        assert ids(out.context_requests) == [0]
+        _admit_chunk(owner)
+        # The owner has computed the shared prefix: the follower now has 64 tokens left.
+        reuse[1] = 936
+        newcomer = make_ctx_request(2, 500)
+        out = sched.schedule_request([owner, follower, newcomer], set())
+        assert ids(out.context_requests)[0] == 1
+        probed = [c.args[0].py_request_id for c in mgr.probe_context_reuse.call_args_list]
+        assert probed.count(1) == 2
+
+
+class TestContextAdmissionLog:
+    def test_one_line_per_request_at_its_last_chunk(self, admission_env):
+        admission_env.setenv(_ADMIT_LOG_ENV, "1")
+        sched = make_scheduler(
+            _reuse_settling_manager({1: 200}), max_num_tokens=512, ctx_chunk_config=(None, 64)
+        )
+        req = make_ctx_request(1, 1000, is_last_context_chunk=False)
+        with patch("tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2.logger") as log:
+            sched.schedule_request([req], set())
+            _admit_chunk(req)
+            req.is_last_context_chunk = True
+            sched.schedule_request([req], set())
+        lines = [c.args[0] for c in log.info.call_args_list if "ctx_admit" in c.args[0]]
+        assert len(lines) == 1
+        assert "id=1 uncached=800 bin=lt2k" in lines[0]
+        assert "chunks=2 demoted=0 released=0 sjf_work=-" in lines[0]
+        assert not sched._ctx_admission_log._started
+
+    def test_counts_demoted_passes_and_sjf_work(self, admission_env):
+        admission_env.setenv(_ADMIT_LOG_ENV, "1")
+        admission_env.setenv(_SPF_ENV, "1")
+        admission_env.setenv("TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS", "1024")
+        admission_env.setenv("TLLM_V2_CTX_DEMOTE_MAX_ITERS", "1")
+        sched = make_scheduler(
+            _reuse_settling_manager({}), max_num_tokens=1024, ctx_chunk_config=(None, 64)
+        )
+        long_req = make_ctx_request(0, 20_000, is_last_context_chunk=False)
+        long_req.py_uncached_prefill_tokens = 20_000
+        long_req.py_uncached_prefill_probed = False
+        hog = make_ctx_request(1, 1024)
+        hog.py_uncached_prefill_tokens = 1024
+        with patch("tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2.logger") as log:
+            out = sched.schedule_request([long_req, hog], set())
+            assert ids(out.context_requests) == [1]
+            out = sched.schedule_request([long_req], set())
+            assert ids(out.context_requests) == [0]
+            long_req.is_last_context_chunk = True
+            _admit_chunk(long_req)
+            sched.schedule_request([long_req], set())
+        lines = [c.args[0] for c in log.info.call_args_list if "ctx_admit" in c.args[0]]
+        assert any("id=1 uncached=1024 bin=lt2k" in m and "sjf_work=1024" in m for m in lines)
+        line0 = [m for m in lines if "id=0 " in m]
+        assert len(line0) == 1
+        assert "uncached=20000 bin=16k-32k" in line0[0]
+        assert "chunks=2 demoted=1 released=1 sjf_work=-" in line0[0]
+
+    def test_cancelled_request_leaves_no_entry(self, admission_env):
+        admission_env.setenv(_ADMIT_LOG_ENV, "1")
+        sched = make_scheduler(
+            _reuse_settling_manager({}), max_num_tokens=128, ctx_chunk_config=(None, 64)
+        )
+        req = make_ctx_request(1, 1000, is_last_context_chunk=False)
+        sched.schedule_request([req], set())
+        sched.schedule_request([], set())
+        book = sched._ctx_admission_log
+        assert not book._seen and not book._started and not book._demoted

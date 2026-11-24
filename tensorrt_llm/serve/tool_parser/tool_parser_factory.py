@@ -62,7 +62,12 @@ def resolve_auto_tool_parser(model: str) -> Optional[str]:
         config = json.load(f)
 
     model_type = config.get("model_type", "")
-    return MODEL_TYPE_TO_TOOL_PARSER.get(model_type)
+    if model_type in MODEL_TYPE_TO_TOOL_PARSER:
+        return MODEL_TYPE_TO_TOOL_PARSER[model_type]
+    # A model family served only by modeling_v2 states its parser.
+    from tensorrt_llm._torch._experimental.modeling_v2._architecture_index import serve_parser
+
+    return serve_parser(model_type, "tool")
 
 
 class ToolParserFactory:

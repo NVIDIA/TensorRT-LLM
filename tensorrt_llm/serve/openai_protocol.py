@@ -1103,6 +1103,13 @@ class ChatCompletionRequest(OpenAIBaseModel):
     # emits per turn, so parallel emission remains model behavior either way.
     parallel_tool_calls: Optional[bool] = None
     user: Optional[str] = None
+    # Standard OpenAI field that some agent clients send on every request
+    # (kimi-code, Codex). Accepted and ignored: the prefix cache matches by
+    # content, so a per-session key would only fragment it.
+    prompt_cache_key: Optional[str] = Field(
+        default=None,
+        description=("Accepted for OpenAI client compatibility; ignored."),
+    )
     reasoning_effort: Optional[ReasoningEffort | Literal[
         "low", "medium", "high", "max", "none"]] = Field(
             default=ReasoningEffort.LOW,

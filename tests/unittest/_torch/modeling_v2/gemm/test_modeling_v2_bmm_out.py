@@ -44,22 +44,85 @@ def _build(spec, seed):
     targets hand the op a transposed view of a buffer the forward already
     holds, so the product lands in place. The parent buffer comes back too,
     because "did it land there" is the thing worth asserting.
+
+    Three optional keys describe the views the kimi k3.1 MLA hands the op, all
+    head-major transposes of token-major buffers: `a_parent=(heads, width)`
+    makes `a` the `[:, :batch, :k]` slice of a `[m, heads, width]` buffer,
+    transposed to `[batch, m, k]`; `b_transposed` makes `b` the
+    `.transpose(1, 2)` of a stored `[batch, n, k]` weight; and
+    `out_parent=(heads, width)` makes `out` the same kind of slice-and-transpose
+    view of a `[m, heads, width]` buffer (`transposed_out` must be set).
     """
     g = torch.Generator(device="cuda").manual_seed(seed)
     b, m, k, n, dt = spec["batch"], spec["m"], spec["k"], spec["n"], spec["dtype"]
-    a = torch.randn(b, m, k, generator=g, device="cuda").to(dt)
-    w = torch.randn(b, k, n, generator=g, device="cuda").to(dt)
+    a_parent = spec.get("a_parent")
+    if a_parent is None:
+        a = torch.randn(b, m, k, generator=g, device="cuda").to(dt)
+    else:
+        heads, width = a_parent
+        a = torch.randn(m, heads, width, generator=g, device="cuda").to(dt)[:, :b, :k]
+        a = torch.transpose(a, 0, 1)
+    if spec.get("b_transposed"):
+        w = torch.transpose(torch.randn(b, n, k, generator=g, device="cuda").to(dt), 1, 2)
+    else:
+        w = torch.randn(b, k, n, generator=g, device="cuda").to(dt)
+    out_parent = spec.get("out_parent")
     if spec["transposed_out"]:
-        parent = torch.zeros(m, b, n, dtype=dt, device="cuda")
-        out = torch.transpose(parent, 0, 1)
+        heads, width = out_parent if out_parent is not None else (b, n)
+        parent = torch.zeros(m, heads, width, dtype=dt, device="cuda")
+        out = torch.transpose(parent[:, :b, :n], 0, 1)
         # Only a decode-shaped cell escapes this: transposing a dim of extent 1
         # leaves a tensor torch still calls contiguous, so the assertion would
         # be about the shape rather than about the view.
         assert m == 1 or not out.is_contiguous()
     else:
+        assert out_parent is None, "out_parent describes a transposed out"
         parent = torch.zeros(b, m, n, dtype=dt, device="cuda")
         out = parent
     return a, w, out, parent
+
+
+# The cells of every Kimi K3.1 target: the general one and the SM 10.3 perf targets copied from it.
+_K31_TARGET_CELLS: tuple[Cell, ...] = (
+    # q_nope absorb: a = q[..., :128] of the [T, h, 192] q (head-major view), b = the stored
+    # [h, 512, 128] k_b_proj_trans transposed, out = the [:, :h, :512] slice of the
+    # [T, h_attn, 576] fused_q (h_attn = 128 when 96 heads are padded for the sparse kernel).
+    *(
+        Cell(
+            why=f"kimi k3.1 q_nope absorb, {h} heads per rank, T={t}",
+            spec=dict(
+                batch=h,
+                m=t,
+                k=128,
+                n=512,
+                dtype=torch.bfloat16,
+                transposed_out=True,
+                a_parent=(h, 192),
+                b_transposed=True,
+                out_parent=(128 if h == 96 else h, 576),
+            ),
+        )
+        for h, t in ((96, 1), (96, 8), (96, 2048), (24, 1), (12, 8), (6, 2048))
+    ),
+    # V expand: a = the [:, :h] slice of the [T, h_attn, 512] attention output, b = the
+    # stored [h, 128, 512] v_b_proj transposed, out = the [T, h, 128] output buffer.
+    *(
+        Cell(
+            why=f"kimi k3.1 v expand, {h} heads per rank, T={t}",
+            spec=dict(
+                batch=h,
+                m=t,
+                k=512,
+                n=128,
+                dtype=torch.bfloat16,
+                transposed_out=True,
+                a_parent=(128 if h == 96 else h, 512),
+                b_transposed=True,
+            ),
+        )
+        for h, t in ((96, 1), (96, 8), (96, 2048), (24, 1), (12, 8), (6, 2048))
+    ),
+)
 
 
 # The shapes each shipped target calls this entry with, by target directory
@@ -79,6 +142,9 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
             spec=dict(batch=64, m=2048, k=128, n=512, dtype=torch.bfloat16, transposed_out=True),
         ),
     ),
+    "kimi_k31/kimi_k31_pro_mxfp4__sm_10x__default": _K31_TARGET_CELLS,
+    "kimi_k31/kimi_k31_pro_mxfp4__sm_103__tep": _K31_TARGET_CELLS,
+    "kimi_k31/kimi_k31_pro_mxfp4__sm_103__dep": _K31_TARGET_CELLS,
 }
 
 CELLS = certified_cells(op, TARGET_CELLS)

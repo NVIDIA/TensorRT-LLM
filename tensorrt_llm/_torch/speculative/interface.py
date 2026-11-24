@@ -32,11 +32,14 @@ from ..attention.backends.interface import AttentionMetadata
 from ..attention.backends.trtllm import (AttentionBackend, TrtllmAttention,
                                          TrtllmAttentionMetadata)
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
+from ..pyexecutor.input_commit import active_input_commit
 from ..pyexecutor.resource_manager import ResourceManagerType
 
 if TYPE_CHECKING:
     from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
+    from ..pyexecutor.kv_cache.standalone_draft_cache import DraftHistoryUpdate
     from ..pyexecutor.llm_request import LlmRequest
+    from ..pyexecutor.resource_manager import ResourceManager
 
 if IS_FLASHINFER_AVAILABLE:
     import flashinfer
@@ -84,6 +87,11 @@ FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR = "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS"
 # a valid prompt lookahead token so CUDA-graph replay can select the sampled
 # token without a separate validity buffer.
 INVALID_PROMPT_LOOKAHEAD_TOKEN = -1
+
+# Token IDs are nonnegative. A worker marks a context request it drafted nothing
+# for with this value in its next_draft_tokens row; the sampler then gives the
+# request no draft tokens, so a context server sends none.
+CONTEXT_NO_DRAFT_TOKEN = -1
 
 # RNG pool configuration for the fractional (probabilistic) component of the
 # synthetic acceptance rate. Pool size MUST be a power of two so we can use
@@ -337,6 +345,11 @@ class SpeculativeDecodingMode(IntEnum):
     def is_parallel_draft(self):
         return self.is_pard() or self.is_dflash() or self.is_dspark()
 
+    def drafts_context_requests(self):
+        """Whether a context step drafts for its requests. The parallel-draft
+        workers do not: they give context requests zero placeholder drafts."""
+        return not self.is_parallel_draft()
+
     def is_ngram(self):
         return self == SpeculativeDecodingMode.NGRAM
 
@@ -477,10 +490,19 @@ class SpecMetadata:
     draft_tokens: Optional[torch.Tensor] = None
     # The length of the draft tokens.
     draft_lens: Optional[torch.Tensor] = None
+    # Forced acceptance only: whether each generation row, in batch order,
+    # verifies drafts the drafter made. False marks placeholder drafts, such
+    # as those of a request's first generation step after a context step of a
+    # parallel-draft mode or after a disaggregated handoff. Shape:
+    # [max_num_requests]. None forces every generation row.
+    real_draft_rows: Optional[torch.Tensor] = None
     # Immediate prompt token following each context request's current chunk.
     # Shape: [max_num_requests]. Final-chunk rows contain
     # INVALID_PROMPT_LOOKAHEAD_TOKEN.
     context_prompt_lookahead_tokens: Optional[torch.Tensor] = None
+    # Host: whether each context request's current chunk is its last, in batch
+    # order. Shape: (num_contexts).
+    context_last_chunk: Optional[List[bool]] = None
     # The request ID of each sequence in the batch.
     # The shape is (batch_size).
     request_ids: Optional[List[int]] = None
@@ -880,7 +902,13 @@ class SpecMetadata:
                                        dtype=torch.int64,
                                        device='cuda')
 
+        # Set by the decoder runner for a batched input commit (input_commit.py).
+        input_commit = active_input_commit()
+
         def _upload(dst: torch.Tensor, values: list[int]) -> None:
+            if input_commit is not None:
+                input_commit.stage(dst[:len(values)], values)
+                return
             dst[:len(values)].copy_(torch.tensor(values,
                                                  dtype=torch.int64,
                                                  pin_memory=prefer_pinned()),
@@ -1131,6 +1159,24 @@ class SpecMetadata:
                              device=self.draft_probs.device)
         self.draft_probs[slots, :draft_len, :onehot_vocab] = 0.0
         self.draft_probs[slots, :draft_len, 0] = 1.0
+
+    def write_real_draft_rows(self, real_draft_rows: List[bool]) -> None:
+        """Write which generation rows verify drafts the drafter made.
+
+        Forced acceptance reads ``real_draft_rows``, possibly in a captured CUDA
+        graph, so the buffer is allocated once and written eagerly before the
+        forward. Rows past this batch keep stale values that nothing reads.
+        """
+        if self.real_draft_rows is None:
+            self.real_draft_rows = torch.ones((self.max_num_requests, ),
+                                              dtype=torch.bool,
+                                              device='cuda')
+        if real_draft_rows:
+            rows = torch.tensor(real_draft_rows,
+                                dtype=torch.bool,
+                                pin_memory=prefer_pinned())
+            self.real_draft_rows[:len(real_draft_rows)].copy_(rows,
+                                                              non_blocking=True)
 
     def dp_num_tokens(self) -> int:
         """Return the attention-DP token count for the current batch.
@@ -1417,18 +1463,26 @@ class SpecMetadata:
 
         self._populate_request_rng_state(requests, per_request_normalized)
 
+        # Set by the decoder runner for a batched input commit (input_commit.py).
+        input_commit = active_input_commit()
+
+        def _upload(dst: torch.Tensor, values: list,
+                    dtype: torch.dtype) -> None:
+            if input_commit is not None:
+                input_commit.stage(dst[:len(values)], values)
+                return
+            dst[:len(values)].copy_(torch.tensor(values,
+                                                 dtype=dtype,
+                                                 pin_memory=prefer_pinned()),
+                                    non_blocking=True)
+
         # Always-populate the per-request slot id table when rejection sampling
         # is configured: it's tiny (max_num_requests longs) and needed at
         # draft-sampler time to scatter draft probs by slot. The penalties need the
         # same table to map logits rows back to their slot, so they enable it too.
         if (self.use_rejection_sampling
                 or self.enable_penalty) and self.batch_slot_ids is not None:
-            self.batch_slot_ids[:len(per_request_slot_ids)].copy_(
-                torch.tensor(per_request_slot_ids,
-                             dtype=torch.long,
-                             pin_memory=prefer_pinned()),
-                non_blocking=True,
-            )
+            _upload(self.batch_slot_ids, per_request_slot_ids, torch.long)
 
         # Penalties are independent of the greedy/advanced split -- they rewrite the
         # logits before sampling, so an all-greedy batch is penalized too (its argmax
@@ -1466,30 +1520,12 @@ class SpecMetadata:
                 if fill_min_p:
                     request_min_ps.append(mp_val)
 
-            self.request_temperatures[:len(request_temperatures)].copy_(
-                torch.tensor(request_temperatures,
-                             dtype=torch.float32,
-                             pin_memory=prefer_pinned()),
-                non_blocking=True)
-            self.request_top_ks[:len(request_top_ks)].copy_(
-                torch.tensor(request_top_ks,
-                             dtype=torch.int32,
-                             pin_memory=prefer_pinned()),
-                non_blocking=True,
-            )
-            self.request_top_ps[:len(request_top_ps)].copy_(
-                torch.tensor(request_top_ps,
-                             dtype=torch.float32,
-                             pin_memory=prefer_pinned()),
-                non_blocking=True,
-            )
+            _upload(self.request_temperatures, request_temperatures,
+                    torch.float32)
+            _upload(self.request_top_ks, request_top_ks, torch.int32)
+            _upload(self.request_top_ps, request_top_ps, torch.float32)
             if fill_min_p:
-                self.request_min_ps[:len(request_min_ps)].copy_(
-                    torch.tensor(request_min_ps,
-                                 dtype=torch.float32,
-                                 pin_memory=prefer_pinned()),
-                    non_blocking=True,
-                )
+                _upload(self.request_min_ps, request_min_ps, torch.float32)
 
             # Pre-compute top_k_max on the CPU so CUDA-graph capture does not
             # encounter boolean-tensor indexing (dynamic size) or .item()
@@ -1513,19 +1549,11 @@ class SpecMetadata:
                 if fill_min_p:
                     min_ps.extend(mp_val for _ in range(num_tokens))
 
-            self.temperatures[:len(temperatures)].copy_(torch.tensor(
-                temperatures, dtype=torch.float32, pin_memory=prefer_pinned()),
-                                                        non_blocking=True)
-            self.top_ks[:len(top_ks)].copy_(torch.tensor(
-                top_ks, dtype=torch.int32, pin_memory=prefer_pinned()),
-                                            non_blocking=True)
-            self.top_ps[:len(top_ps)].copy_(torch.tensor(
-                top_ps, dtype=torch.float32, pin_memory=prefer_pinned()),
-                                            non_blocking=True)
+            _upload(self.temperatures, temperatures, torch.float32)
+            _upload(self.top_ks, top_ks, torch.int32)
+            _upload(self.top_ps, top_ps, torch.float32)
             if fill_min_p:
-                self.min_ps[:len(min_ps)].copy_(torch.tensor(
-                    min_ps, dtype=torch.float32, pin_memory=prefer_pinned()),
-                                                non_blocking=True)
+                _upload(self.min_ps, min_ps, torch.float32)
 
     def _sampling_params_buffers_need_update(
         self, per_request_normalized: list[tuple[float, int, float, float, int]]
@@ -1632,6 +1660,11 @@ class SpecWorkerBase(nn.Module, ABC):
     Provides common functionality for sampling and token handling.
     """
 
+    # Set by a worker whose TP ranks draft independently: _agree_draft_tokens
+    # gives a request-sharing group its rank 0's drafts, since a rank with
+    # other drafts would accept a different count and hang in a TP collective.
+    agree_draft_tokens_across_tp: bool = False
+
     def __init__(self, use_separate_draft_kv_cache: bool = False):
         super().__init__()
         self.guided_decoder: Optional["CapturableGuidedDecoder"] = None
@@ -1650,13 +1683,18 @@ class SpecWorkerBase(nn.Module, ABC):
         # Static draft->target vocab offset map, cached once the draft model is
         # loaded (see set_draft_model). None when draft and target share a vocab.
         self._d2t: Optional[torch.Tensor] = None
-        # Lazily-initialized state for the fractional synthetic acceptance
-        # rate. The pool is a fixed-seed, rank-independent table of uniform
-        # [0, 1) values; the counter is a device-side int64 advanced in-place
-        # inside captured CUDA graphs (mirroring the existing flashinfer
-        # seed/offset pattern in `_sample_tokens_for_batch`).
+        # State for the fractional synthetic acceptance rate. The pool is a
+        # fixed-seed, rank-independent table of uniform [0, 1) values; the
+        # counter is a device-side int64 advanced in-place inside captured
+        # CUDA graphs (mirroring the existing flashinfer seed/offset pattern
+        # in `_sample_tokens_for_batch`).
         self._force_accept_rng_pool: Optional[torch.Tensor] = None
         self._force_accept_rng_counter: Optional[torch.Tensor] = None
+        if self.force_num_accepted_tokens != 0.0:
+            # Build it now rather than on first use: CUDA graph warmup skips
+            # forced acceptance, so the first use can fall inside a capture.
+            self._ensure_force_accept_rng_state(
+                torch.device("cuda" if torch.cuda.is_available() else "cpu"))
         self._auxiliary_state_handlers: list[
             AuxiliarySpeculativeStateHandler] = []
 
@@ -1677,6 +1715,30 @@ class SpecWorkerBase(nn.Module, ABC):
         for handler in self._auxiliary_state_handlers:
             handler.commit_speculative_states(num_accepted_tokens,
                                               state_indices, num_contexts)
+
+    def prepare_managed_draft_cache(
+        self,
+        draft_model: Optional[nn.Module],
+        spec_metadata: "SpecMetadata",
+        attn_metadata: AttentionMetadata,
+        resource_manager: "ResourceManager",
+    ) -> None:
+        """Stage draft context the KV cache manager owns before a forward.
+
+        Called after the inputs are prepared and before eager execution,
+        CUDA graph capture or replay. A worker whose drafter keeps its context
+        KV in the target manager's draft layers restores the requests' draft
+        history and block tables here; the default does nothing.
+        """
+
+    def snapshot_managed_draft_history(self) -> Optional["DraftHistoryUpdate"]:
+        """Read back this forward's draft history for publication.
+
+        Called after every non-warmup forward. The executor publishes the
+        returned update once the iteration's sampling has completed; the
+        default has none.
+        """
+        return None
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -1705,13 +1767,67 @@ class SpecWorkerBase(nn.Module, ABC):
                 elif spec_metadata is None and isinstance(a, SpecMetadata):
                     spec_metadata = a
         try:
-            return self._forward_impl(*args, **kwargs)
+            outputs = self._forward_impl(*args, **kwargs)
+            if self.agree_draft_tokens_across_tp:
+                self._agree_draft_tokens(outputs)
+            return outputs
         finally:
             self._ensure_spec_dec_state_restored(attn_metadata, spec_metadata)
 
     @abstractmethod
     def _forward_impl(self, *args, **kwargs):
         """Worker-specific forward logic, called by SpecWorkerBase.forward."""
+
+    def _draft_agreement_mapping(self):
+        """The TP group (helix CP folded in) when its ranks serve the same
+        requests; None for one rank or under attention DP."""
+        mapping = getattr(self, "mapping", None)
+        if mapping is None:
+            return None
+        if mapping.has_cp_helix():
+            mapping = mapping.repurpose_helix_cp_to_tp()
+        if mapping.tp_size <= 1 or not mapping.tp_group_shares_requests:
+            return None
+        return mapping
+
+    def _agree_draft_tokens(self, outputs) -> None:
+        """Give ``next_draft_tokens`` ``[rows, K]`` and the draft columns of
+        ``next_new_tokens`` ``[rows, 1 + K]`` the group rank 0's values
+        (column 0 already agrees): one int32 all-gather over ranks with the
+        same rows, no host sync, capturable."""
+        mapping = self._draft_agreement_mapping()
+        if mapping is None or not isinstance(outputs, dict):
+            return
+        drafts = outputs.get("next_draft_tokens")
+        if drafts is None or drafts.numel() == 0:
+            return
+        if drafts.dim() != 2:
+            raise ValueError(
+                "next_draft_tokens must be [rows, draft_len] to agree across "
+                f"the TP group; got shape {tuple(drafts.shape)}")
+        rows, width = drafts.shape
+        new_tokens = outputs.get("next_new_tokens")
+        if new_tokens is not None and tuple(
+                new_tokens.shape) != (rows, width + 1):
+            raise ValueError(
+                "next_new_tokens must be [rows, 1 + draft_len] (the last "
+                "accepted token, then the drafts) to agree across the TP "
+                f"group; got {tuple(new_tokens.shape)} for drafts "
+                f"{tuple(drafts.shape)}")
+        from ..distributed.ops import allgather
+        agreed = allgather(drafts.contiguous(), mapping, dim=0)[:rows]
+        outputs["next_draft_tokens"] = agreed
+        if new_tokens is not None:
+            outputs["next_new_tokens"] = torch.cat(
+                [new_tokens[:, :1],
+                 agreed.to(new_tokens.dtype)], dim=1)
+
+    def target_head_rows(self, hidden_states: torch.Tensor, attn_metadata,
+                         spec_metadata) -> torch.Tensor:
+        """The rows of the target's final ``hidden_states`` that the target
+        head reads (``spec_metadata.gather_ids``), handed to
+        ``target_logits``."""
+        return hidden_states[spec_metadata.gather_ids]
 
     def target_logits(self, hidden_states: torch.Tensor, lm_head,
                       logits_processor, attn_metadata, spec_metadata,
@@ -1882,7 +1998,7 @@ class SpecWorkerBase(nn.Module, ABC):
 
     def _ensure_force_accept_rng_state(self, device: torch.device) -> None:
         """
-        Lazily build the deterministic RNG state used by
+        Build, once, the deterministic RNG state used by
         :meth:`_apply_force_accepted_tokens` for fractional synthetic
         acceptance rates.
 
@@ -1891,9 +2007,10 @@ class SpecWorkerBase(nn.Module, ABC):
         (TP ranks must agree on the per-iteration accepted-token count, or
         downstream collectives expecting identical shapes will hang).
 
-        First-call allocation must happen during eager warmup — never inside
-        a captured CUDA graph. The CUDA-graph runner already runs warmup
-        forwards before capture, which satisfies this in practice.
+        The allocation must never run inside a captured CUDA graph. CUDA
+        graph warmup skips forced acceptance, so ``__init__`` builds the
+        state whenever forced acceptance is set; the call here only covers a
+        worker whose ``force_num_accepted_tokens`` is set after construction.
         """
         if self._force_accept_rng_pool is not None:
             return
@@ -1933,6 +2050,12 @@ class SpecWorkerBase(nn.Module, ABC):
         every rank draws the same uniform values and therefore agrees on the
         accepted-token count for every request in every iteration.
 
+        Only the generation rows that verify drafts the drafter made are
+        forced. A row that verifies placeholder drafts, such as a request's
+        first generation step after a context step of a parallel-draft mode,
+        keeps its natural count. Every row still draws from the pool, so a
+        forced row's count does not depend on which other rows are forced.
+
         Args:
             num_accepted_tokens: Tensor of shape [batch_size] with current
                 accepted counts (target token + accepted draft tokens).
@@ -1943,6 +2066,8 @@ class SpecWorkerBase(nn.Module, ABC):
                 there — warmup batches use dummy requests whose KV cache and
                 draft buffers are not populated for an inflated accepted
                 count, which would drive downstream MTP ops out-of-bounds.
+                Its ``real_draft_rows`` selects the rows to force; without
+                them every generation row is forced.
 
         Returns:
             Modified num_accepted_tokens tensor.
@@ -1996,11 +2121,27 @@ class SpecWorkerBase(nn.Module, ABC):
             # ``base_total + extra`` is at most ``int_part + 2``; clamp so we
             # never exceed the available draft slots.
             force_total_tokens = (base_total + extra).clamp_(max=max_total)
+        else:
+            force_total_tokens = base_total
+
+        real_rows = self._real_draft_rows(
+            spec_metadata, num_accepted_tokens.shape[0] - num_contexts)
+        if real_rows is None:
             num_accepted_tokens[num_contexts:] = force_total_tokens
         else:
-            num_accepted_tokens[num_contexts:] = base_total
-
+            # Static shapes: a select, not a filtered write.
+            gen = num_accepted_tokens[num_contexts:]
+            gen.copy_(torch.where(real_rows, force_total_tokens, gen))
         return num_accepted_tokens
+
+    @staticmethod
+    def _real_draft_rows(spec_metadata,
+                         num_gens: int) -> Optional[torch.Tensor]:
+        """Whether each of the ``num_gens`` generation rows verifies drafts the
+        drafter made (``SpecMetadata.real_draft_rows``); None when the step
+        marks no rows, which forces every row."""
+        rows = getattr(spec_metadata, "real_draft_rows", None)
+        return None if rows is None else rows[:num_gens]
 
     def _sample_and_accept_draft_tokens_base(
         self,
@@ -2743,8 +2884,13 @@ class SpecWorkerBase(nn.Module, ABC):
                 # so that when _apply_force_accepted_tokens inflates num_accepted_tokens
                 # the decoder reads valid draft tokens instead of zeros.
                 # Slice bounds are Python ints (static at CUDA-graph capture time).
-                gen_accepted[:,
-                             1:runtime_draft_len + 1].copy_(full_draft_tokens)
+                # Rows it does not force keep the kernel's tokens.
+                fill = full_draft_tokens
+                real_rows = self._real_draft_rows(spec_metadata, num_gens)
+                if real_rows is not None:
+                    fill = torch.where(real_rows.unsqueeze(1), fill,
+                                       gen_accepted[:, 1:runtime_draft_len + 1])
+                gen_accepted[:, 1:runtime_draft_len + 1].copy_(fill)
 
             accepted_tokens[num_contexts:] = gen_accepted
             num_accepted_tokens[num_contexts:] = gen_num_accepted

@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <arpa/inet.h>
 #include <chrono>
+#include <cstdlib>
 #include <cuda.h>
 #include <dirent.h>
 #include <fcntl.h>
@@ -37,6 +38,7 @@
 #include <numeric>
 #include <set>
 #include <shared_mutex>
+#include <string>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <thread>
@@ -800,10 +802,52 @@ nixl_status_t NixlTransferStatus::queryStatus() const
     return false;
 }
 
+namespace
+{
+
+// nixlAgent's internal lock mode. RW guards the agent's tables with a reader/writer mutex that every
+// createXferReq / postXferReq / getXferStatus takes in shared mode; NONE leaves them unguarded and
+// relies on this wrapper's own mLock for register/load versus submit. The bounce path drives the
+// agent from its own threads, so it always keeps RW.
+nixl_thread_sync_t resolveNixlThreadSync(std::string const& agentName, bool bounceEnabled)
+{
+    char const* raw = std::getenv("TRTLLM_NIXL_THREAD_SYNC");
+    std::string const value = raw == nullptr ? std::string{} : std::string{raw};
+    nixl_thread_sync_t mode = nixl_thread_sync_t::NIXL_THREAD_SYNC_RW;
+    if (value == "none")
+    {
+        mode = nixl_thread_sync_t::NIXL_THREAD_SYNC_NONE;
+    }
+    else if (value == "strict")
+    {
+        mode = nixl_thread_sync_t::NIXL_THREAD_SYNC_STRICT;
+    }
+    else if (!value.empty() && value != "rw")
+    {
+        TLLM_LOG_WARNING("NixlTransferAgent(%s): ignoring TRTLLM_NIXL_THREAD_SYNC=%s (expected rw, none or strict)",
+            agentName.c_str(), value.c_str());
+    }
+    if (bounceEnabled && mode == nixl_thread_sync_t::NIXL_THREAD_SYNC_NONE)
+    {
+        TLLM_LOG_WARNING(
+            "NixlTransferAgent(%s): TRTLLM_NIXL_THREAD_SYNC=none ignored because the bounce buffer is enabled",
+            agentName.c_str());
+        mode = nixl_thread_sync_t::NIXL_THREAD_SYNC_RW;
+    }
+    TLLM_LOG_INFO("NixlTransferAgent(%s): NIXL thread sync %s", agentName.c_str(),
+        mode == nixl_thread_sync_t::NIXL_THREAD_SYNC_NONE
+            ? "none"
+            : (mode == nixl_thread_sync_t::NIXL_THREAD_SYNC_STRICT ? "strict" : "rw"));
+    return mode;
+}
+
+} // namespace
+
 NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
     : mName{config.mName}
 {
     bool const mpiEnabled = !common::getBoolEnv("TLLM_DISABLE_MPI");
+    nixl_thread_sync_t const threadSync = resolveNixlThreadSync(config.mName, config.agentBufferSizeMb > 0);
     TLLM_CHECK_WITH_INFO(config.rank.has_value() == config.worldSize.has_value(),
         "NIXL agent config fields 'rank' and 'worldSize' must be specified together");
 
@@ -837,8 +881,8 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
         uint32_t numWorker = config.backendParams.find("num_workers") != config.backendParams.end()
             ? std::stoi(config.backendParams.at("num_workers"))
             : 1;
-        nixlAgentConfig nixlConfig{config.useProgThread, true, port, nixl_thread_sync_t::NIXL_THREAD_SYNC_RW, numWorker,
-            0, 10000, config.enableTelemetry};
+        nixlAgentConfig nixlConfig{
+            config.useProgThread, true, port, threadSync, numWorker, 0, 10000, config.enableTelemetry};
         std::string localIp = common::getLocalIp(common::getEnvNixlInterface(), mRank);
         // Bracket IPv6 literals (RFC 3986) so the last ':' always separates the port;
         // IPv4 keeps the legacy "ip:port" format for cross-version compatibility.
@@ -855,8 +899,8 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
             ? std::stoi(config.backendParams.at("num_workers"))
             : 1;
         mAddress.clear();
-        nixlAgentConfig nixlConfig{config.useProgThread, false, 0, nixl_thread_sync_t::NIXL_THREAD_SYNC_RW, numWorker,
-            0, 10000, config.enableTelemetry};
+        nixlAgentConfig nixlConfig{
+            config.useProgThread, false, 0, threadSync, numWorker, 0, 10000, config.enableTelemetry};
         mRawAgent = std::make_shared<nixlAgent>(config.mName, std::move(nixlConfig));
     }
 

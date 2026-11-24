@@ -5,11 +5,13 @@
 
 from __future__ import annotations
 
+import importlib
 import math
 import os
 import sys
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 import torch
 
@@ -35,7 +37,12 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_man
 )
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, DataRole
+from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+    DEFAULT_BEAM_INDEX,
+    BufferConfig,
+    DataRole,
+    _KVCache,
+)
 
 _MAMBA_SSM_SEED_MASK = (1 << 62) - 1
 _MAMBA_SSM_UINT64_MASK = (1 << 64) - 1
@@ -116,7 +123,15 @@ _KDA_BETA_CACHE_ALIGNMENT_BYTES = 16
 _KDA_REPLAY_COUNT_BYTES = 16
 _KDA_REPLAY_COUNT_ROLE = DataRole("prev_num_accepted_tokens")
 _KDA_REPLAY_CONV_ROLES = ("kda_conv_q", "kda_conv_k", "kda_conv_v")
+_KDA_REPLAY_DRAFT_ROLES = ("kda_k_cache", "kda_g_cache", "kda_v_cache", "kda_beta_cache")
 _KDA_DRAFT_RECORDS_ROLE = "kda_state_tok"
+# The Kimi K3 (k3_rubin) package's KDA kernels and metadata.
+_K3_KDA_PACKAGE = "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.k3_rubin.kda"
+# Seed the replay caches of transferred requests in all layers with one launch
+# per buffer kind (the K3 package's seed_kda_replay_layers) instead of a loop of
+# small copies per layer. Falls back to the loop when the package cannot be
+# imported, the states are not on a GPU, or the layers' views differ in layout.
+_KDA_BATCHED_REPLAY_SEED = os.environ.get("TRTLLM_KDA_BATCHED_REPLAY_SEED", "1") == "1"
 
 
 def _is_disagg_context_server(is_disagg: bool) -> bool:
@@ -425,6 +440,9 @@ class KDAReplayState:
         self._seed_request_counter = 0
         self._seed_rank_offset = 0
         self._conv_section_dims: tuple[int, ...] = ()
+        # Batched seeding plan of seed_transferred_slots: None until first use,
+        # False when the per-layer loop is used.
+        self._batched_seed_plan: object | None = None
 
     def validate(self, context: MambaStateLayout) -> None:
         if context.spec_config is None:
@@ -564,6 +582,7 @@ class KDAReplayState:
         self._conv_section_dims = context.conv_section_dims
         self._ssm_states = tuple(ssm_states)
         self._conv_states = tuple(conv_states)
+        self._batched_seed_plan = None
         self._committed_window = context.conv_state_shape[1] if conv_states else 0
         states = ssm_states
         if not states:
@@ -648,11 +667,14 @@ class KDAReplayState:
                 )
                 for slot in host_slots
             ]
-            self.rand_seed[slots] = torch.tensor(
+            # Fresh pinned staging and a non-blocking upload, as in _host_slots_to_device: a
+            # pageable torch.tensor(..., device=) would wait for the decode step in flight.
+            seeds = torch.tensor(
                 seeds,
                 dtype=torch.int64,
-                device=self.rand_seed.device,
+                pin_memory=self.rand_seed.is_cuda and prefer_pinned(),
             )
+            self.rand_seed.index_copy_(0, slots, seeds.to(self.rand_seed.device, non_blocking=True))
 
     def relocate_slots(self, old_slots: list[int], new_slots: list[int]) -> None:
         if self.prev_num_accepted_tokens is None:
@@ -702,15 +724,14 @@ class KDAReplayState:
             section_offsets.append(section_offsets[-1] + section_dim)
 
         self.prev_num_accepted_tokens.index_fill_(0, state_indices, 0)
+        plan = self._get_batched_seed_plan()
+        if plan is not None:
+            kernels, plan = plan
+            kernels.seed_kda_replay_layers(plan, state_indices)
+            return
         for layer_offset, conv_state in enumerate(self._conv_states):
             replay = self._layer_cache_fields(layer_offset)
-            for name in (
-                *_KDA_REPLAY_CONV_ROLES,
-                "kda_k_cache",
-                "kda_g_cache",
-                "kda_v_cache",
-                "kda_beta_cache",
-            ):
+            for name in (*_KDA_REPLAY_CONV_ROLES, *_KDA_REPLAY_DRAFT_ROLES):
                 buffer = replay.get(name)
                 if buffer is not None:
                     buffer.index_fill_(0, state_indices, 0)
@@ -723,6 +744,52 @@ class KDAReplayState:
                 buffer[:, :, :committed_window].index_copy_(
                     0, state_indices, section.to(buffer.dtype)
                 )
+
+    def _get_batched_seed_plan(self) -> tuple[object, object] | None:
+        """The K3 package's seed kernels and their plan over the bound views, if usable."""
+        if self._batched_seed_plan is None:
+            self._batched_seed_plan = self._plan_batched_seed() or False
+        return self._batched_seed_plan or None
+
+    def _plan_batched_seed(self) -> tuple[object, object] | None:
+        conv_states = self._conv_states
+        if (
+            not _KDA_BATCHED_REPLAY_SEED
+            or not conv_states
+            or not conv_states[0].is_cuda
+            or len(self._conv_section_dims) != 3
+            or len(set(self._conv_section_dims)) != 1
+        ):
+            return None
+        try:
+            kernels = importlib.import_module(f"{_K3_KDA_PACKAGE}._kda_kernels")
+        except ImportError as error:
+            logger.warning(
+                "TRTLLM_KDA_BATCHED_REPLAY_SEED: the K3 package's seed kernels are "
+                f"unavailable ({error}); seeding KDA replay caches layer by layer."
+            )
+            return None
+        layers = [self._layer_cache_fields(offset) for offset in range(len(conv_states))]
+        plan = kernels.plan_kda_replay_seed(
+            conv_states,
+            [tuple(layer[name] for name in _KDA_REPLAY_CONV_ROLES) for layer in layers],
+            [
+                [layer[name] for layer in layers]
+                for name in _KDA_REPLAY_DRAFT_ROLES
+                if layers[0].get(name) is not None
+            ],
+        )
+        if plan is None or plan.committed != self._committed_window:
+            logger.warning(
+                "TRTLLM_KDA_BATCHED_REPLAY_SEED: the KDA layers' replay buffers do not "
+                "share one layout; seeding KDA replay caches layer by layer."
+            )
+            return None
+        logger.info(
+            f"KDA replay caches of transferred requests are seeded in all {len(conv_states)} "
+            "local KDA layers with one launch per buffer kind"
+        )
+        return kernels, plan
 
     def record_acceptance(
         self,
@@ -775,7 +842,9 @@ class KDAReplayState:
                 num_accepted,
                 state_tok=replay.get(_KDA_DRAFT_RECORDS_ROLE),
             )
-        self.prev_num_accepted_tokens[slot] = 0
+        # zero_() on the element view stays stream-ordered; assigning a Python scalar
+        # through the index stages it on the host and waits for the step in flight.
+        self.prev_num_accepted_tokens[slot].zero_()
 
     def _layer_replay_buffers(self) -> tuple[torch.Tensor, ...]:
         buffers = (
@@ -810,6 +879,7 @@ class KDAReplayState:
         self.kda_state_tok = None
         self.intermediate_indices = None
         self.rand_seed = None
+        self._batched_seed_plan = None
 
 
 def bind_kda_replay_pool(state: KDAReplayState, manager: MambaHybridCacheManagerV2) -> None:
@@ -840,6 +910,7 @@ def bind_kda_replay_pool(state: KDAReplayState, manager: MambaHybridCacheManager
         )
 
     state.pool_layers = []
+    state._batched_seed_plan = None
     for layer_id in manager.mamba_pp_layers:
         layer = {}
         for name, (dtype, shape) in layout.items():
@@ -897,10 +968,50 @@ def get_kda_replay_num_spec(
     return kda_mtp_replay_num_spec(spec_config.tokens_per_gen_step - 1)
 
 
+# Opt-in: prefill a context request whose last recurrent-state snapshot point
+# lies inside its final chunk in one step. The KDA layers write the snapshot
+# (state and convolution window at the point) into a pending V2 SSM page that
+# the context update commits by move. Needs the pending SSM snapshot pages of
+# the C++ V2 cache backend, the V2 scheduler and a KDA prefill that stores
+# state snapshots (the K3 Rubin package's CuTe DSL prefill); otherwise the
+# point keeps splitting the chunk.
+_KDA_MIDCHUNK_SNAPSHOT = os.environ.get("TRTLLM_KDA_MIDCHUNK_SNAPSHOT", "0") == "1"
+# With mid-chunk snapshots, the other snapshot points of a context request
+# (its branch point where it leaves the cached prefix, points requested by
+# requests waiting for its prefix, additional offsets) are snapshotted inside
+# a context step as well instead of splitting the step there. A step holds
+# one such snapshot, so it then ends at the following snapshot point at the
+# latest. 0 splits at those points.
+_KDA_MIDCHUNK_BRANCH_SNAPSHOT = os.environ.get("TRTLLM_KDA_MIDCHUNK_BRANCH_SNAPSHOT", "1") == "1"
+# KDA layers that store mid-chunk snapshots. Their metadata fetches each
+# step's plan from the manager (get_kda_midchunk_snapshots).
+_MIDCHUNK_SNAPSHOT_KDA_PACKAGE = _K3_KDA_PACKAGE
+
+
+class _KDAMidchunkSnapshot(NamedTuple):
+    """A recurrent-state snapshot taken inside a request's context step."""
+
+    # Prompt position of the snapshot; tokens [0, point) are committed with it.
+    point: int
+    # Tokens of the step before the snapshot point.
+    offset: int
+    # Pending SSM page that receives the snapshot. None on a rank without
+    # local KDA layers, or when no page was available (snapshot skipped).
+    slot: int | None
+
+
 class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
-    """KDA/MLA cache layout and K3-only replay lifecycle handling."""
+    """KDA/MLA cache layout and K3-only replay lifecycle handling.
+
+    With ``TRTLLM_KDA_MIDCHUNK_SNAPSHOT=1`` a context request whose last
+    snapshot point lies inside its last context chunk is prefilled in one step
+    (see ``_KDA_MIDCHUNK_SNAPSHOT``), and so are its other snapshot points (see
+    ``_KDA_MIDCHUNK_BRANCH_SNAPSHOT``).
+    """
 
     kda_context_only = False
+    # Step alignment of mid-chunk snapshot points; None when they are off.
+    _kda_midchunk_snapshot_alignment: int | None = None
 
     @override
     def __init__(
@@ -918,8 +1029,14 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         self._requested_num_spec = kda_replay_num_spec
         self._requested_draft_records = kda_draft_records
         self._kda_replay: KDAReplayState | None = None
+        self._kda_midchunk_snapshots: dict[int, _KDAMidchunkSnapshot] = {}
+        # Requests whose snapshot plan the KDA metadata fetched this step.
+        self._kda_midchunk_handed_out: set[int] = set()
+        self._kda_midchunk_snapshots_taken_total = 0
+        self._kda_midchunk_snapshots_skipped_total = 0
         kwargs.setdefault("conv_state_layout", "q_k_v")
         super().__init__(*args, **kwargs)
+        self._kda_midchunk_snapshot_alignment = self._get_kda_midchunk_snapshot_alignment()
 
     @override
     def _initialize_spec_state(self) -> KDAIntermediateState | KDAReplayState | None:
@@ -997,6 +1114,234 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
             )
         return super()._build_cache_config(config)
 
+    def _get_kda_midchunk_snapshot_alignment(self) -> int | None:
+        """Step alignment of mid-chunk snapshot points, or None when disabled.
+
+        Depends only on configuration shared by all ranks, so that every rank
+        merges the same context chunks.
+        """
+        if not _KDA_MIDCHUNK_SNAPSHOT or not self.enable_block_reuse or self.is_draft:
+            return None
+        if not hasattr(_KVCache, "acquire_ssm_snapshot_slot"):
+            logger.warning(
+                "TRTLLM_KDA_MIDCHUNK_SNAPSHOT=1 is ignored: the KV cache manager V2 "
+                "C++ backend has no pending SSM snapshot pages (rebuild TensorRT-LLM "
+                "from this source tree)."
+            )
+            return None
+        try:
+            kernels = importlib.import_module(f"{_MIDCHUNK_SNAPSHOT_KDA_PACKAGE}._kda_kernels")
+            metadata = importlib.import_module(
+                f"{_MIDCHUNK_SNAPSHOT_KDA_PACKAGE}.kimi_k3_mamba_metadata"
+            )
+        except ImportError as error:
+            logger.warning(
+                "TRTLLM_KDA_MIDCHUNK_SNAPSHOT=1 is ignored: the KDA prefill that "
+                f"stores state snapshots is unavailable ({error})."
+            )
+            return None
+        if not kernels.kda_prefill_supports_state_snapshots():
+            logger.warning(
+                "TRTLLM_KDA_MIDCHUNK_SNAPSHOT=1 is ignored: the KDA prefill kernel "
+                "that stores state snapshots is unavailable."
+            )
+            return None
+        logger.info("KDA mid-chunk recurrent-state snapshots are enabled")
+        return metadata.KDA_PREFILL_CHUNK_SIZE
+
+    @property
+    @override
+    def _snapshot_counters_at_info(self) -> bool:
+        return (
+            self._kda_midchunk_snapshot_alignment is not None or super()._snapshot_counters_at_info
+        )
+
+    @override
+    def _format_branch_snapshot_counters(self) -> str:
+        counters = super()._format_branch_snapshot_counters()
+        if self._kda_midchunk_snapshot_alignment is None:
+            return counters
+        return (
+            f"{counters} "
+            f"midchunk_snapshots_taken={self._kda_midchunk_snapshots_taken_total} "
+            f"midchunk_snapshots_skipped={self._kda_midchunk_snapshots_skipped_total}"
+        )
+
+    @override
+    def prepare_expect_snapshot_points(self, requests) -> None:
+        super().prepare_expect_snapshot_points(requests)
+        # Read by the scheduler (_get_forced_context_chunk_size): the last
+        # snapshot point no longer splits the context chunk, and a step may
+        # pass the next other point.
+        alignment = self._kda_midchunk_snapshot_alignment
+        for request in requests:
+            request.py_midchunk_snapshot_alignment = (
+                alignment if not request.is_dummy_request else None
+            )
+            request.py_midchunk_pass_point = self._midchunk_pass_point(
+                request, request.context_current_position
+            )
+
+    def _midchunk_pass_point(self, request, current_position: int) -> int | None:
+        """The next snapshot point a context step may pass, if any.
+
+        Every point ahead of the cursor but the last one qualifies; the last
+        point merges by ``_is_midchunk_snapshot_point`` instead.
+        """
+        if (
+            self._kda_midchunk_snapshot_alignment is None
+            or not _KDA_MIDCHUNK_BRANCH_SNAPSHOT
+            or request.is_dummy_request
+        ):
+            return None
+        points = sorted(
+            point for point in request.expect_snapshot_points if point > current_position
+        )
+        return points[0] if len(points) > 1 else None
+
+    @override
+    def _apply_branch_snapshot_point(self, request, context_current_position=None) -> None:
+        super()._apply_branch_snapshot_point(request, context_current_position)
+        current_position = (
+            request.context_current_position
+            if context_current_position is None
+            else context_current_position
+        )
+        request.py_midchunk_pass_point = self._midchunk_pass_point(request, current_position)
+
+    def _plan_kda_midchunk_snapshot(self, request) -> tuple[int, int] | None:
+        """``(point, offset)`` of a snapshot inside this context step, if any."""
+        alignment = getattr(request, "py_midchunk_snapshot_alignment", None)
+        if not isinstance(alignment, int) or self._kda_midchunk_snapshot_alignment is None:
+            return None
+        start = request.context_current_position
+        end = start + request.context_chunk_size
+        # The scheduler lets at most one point into a step, but a point
+        # requested after the step was scheduled can add another; the
+        # deepest one is taken then.
+        points = [
+            point
+            for point in request.expect_snapshot_points
+            if start < point < end and (point - start) % alignment == 0
+        ]
+        if not points:
+            return None
+        return points[-1], points[-1] - start
+
+    def _prepare_kda_midchunk_snapshots(self, context_requests) -> None:
+        self._kda_midchunk_handed_out.clear()
+        for request in context_requests:
+            request_id = request.py_request_id
+            stale = self._kda_midchunk_snapshots.pop(request_id, None)
+            kv_cache = self.kv_cache_map.get(request_id)
+            if stale is not None and kv_cache is not None:
+                kv_cache.release_ssm_snapshot_slot()
+            plan = self._plan_kda_midchunk_snapshot(request)
+            if plan is None or kv_cache is None:
+                continue
+            point, offset = plan
+            slot = None
+            if self.local_num_mamba_layers > 0:
+                slot = kv_cache.acquire_ssm_snapshot_slot()
+                if slot is None:
+                    self._kda_midchunk_snapshots_skipped_total += 1
+                    logger.debug(
+                        "KDA mid-chunk snapshot skipped for request "
+                        f"{request_id} at {point}: no SSM page available"
+                    )
+            self._kda_midchunk_snapshots[request_id] = _KDAMidchunkSnapshot(point, offset, slot)
+
+    def get_kda_midchunk_snapshots(self, request_ids: list[int]) -> list[tuple[int, int, int]]:
+        """``(batch index, slot, offset)`` of this step's snapshots.
+
+        ``request_ids`` are the step's context requests in batch order; the
+        offset counts the request's tokens of this step before the snapshot.
+        Called by the KDA metadata of a model whose prefill stores the
+        snapshots; only snapshots handed out here are committed.
+        """
+        if not self._kda_midchunk_snapshots:
+            return []
+        snapshots = []
+        for index, request_id in enumerate(request_ids):
+            snapshot = self._kda_midchunk_snapshots.get(request_id)
+            if snapshot is not None and snapshot.slot is not None:
+                snapshots.append((index, snapshot.slot, snapshot.offset))
+                self._kda_midchunk_handed_out.add(request_id)
+        return snapshots
+
+    def _disable_kda_midchunk_snapshots(self, request_id: int) -> None:
+        """Stop planning snapshots that the model does not take.
+
+        The KDA layers of the running model never fetched a planned snapshot,
+        so its pending page holds no state. Every rank runs the same model and
+        reaches this on the same step.
+        """
+        logger.warning(
+            "TRTLLM_KDA_MIDCHUNK_SNAPSHOT=1 is turned off: the KDA layers did not "
+            f"take the mid-chunk snapshot of request {request_id} (the model's KDA "
+            "prefill does not store state snapshots)."
+        )
+        self._kda_midchunk_snapshot_alignment = None
+
+    def _commit_kda_midchunk_snapshot(self, request, snapshot: _KDAMidchunkSnapshot) -> None:
+        """Commit the prompt up to the snapshot point with the pending SSM page.
+
+        Runs before the context update of the step, in the order of a step that
+        ended at the point: history to the point, then the commit.
+        """
+        needs_page = self.local_num_mamba_layers > 0
+        if needs_page and snapshot.slot is None:
+            # Already counted as skipped when no page was available.
+            return
+        request_id = request.py_request_id
+        kv_cache = self.kv_cache_map.get(request_id)
+        if kv_cache is None or not kv_cache.is_active:
+            # Suspension released the pending page.
+            self._kda_midchunk_snapshots_skipped_total += int(needs_page)
+            return
+        has_page = not needs_page or kv_cache.pending_ssm_snapshot_slot == snapshot.slot
+        # Without a fetch by the KDA metadata the pending page holds no state.
+        filled = not needs_page or request_id in self._kda_midchunk_handed_out
+        self._kda_midchunk_handed_out.discard(request_id)
+        # A step that did not run leaves the context position before the point.
+        step_ran = request.context_current_position >= snapshot.point
+        if (
+            not has_page
+            or not filled
+            or not step_ran
+            or kv_cache.num_committed_tokens >= snapshot.point
+        ):
+            kv_cache.release_ssm_snapshot_slot()
+            self._kda_midchunk_snapshots_skipped_total += int(needs_page)
+            if has_page and step_ran and not filled:
+                self._disable_kda_midchunk_snapshots(request_id)
+            return
+        if not kv_cache.resize(None, snapshot.point):
+            raise ValueError(
+                "Failed to resize history length of V2 Mamba cache for "
+                f"request {request_id} to {snapshot.point} tokens "
+                "at a mid-chunk snapshot"
+            )
+        tokens = self._augment_tokens_for_block_reuse(
+            request.get_tokens(DEFAULT_BEAM_INDEX),
+            request,
+            start=kv_cache.num_committed_tokens,
+            end=snapshot.point,
+        )
+        kv_cache.commit(tokens, ssm_from_pending=needs_page)
+        if needs_page:
+            self._kda_midchunk_snapshots_taken_total += 1
+            self._count_snapshot_commit(request, snapshot.point)
+
+    @override
+    def update_context_resources(self, scheduled_batch) -> None:
+        if self._kda_midchunk_snapshots:
+            for request in scheduled_batch.context_requests:
+                snapshot = self._kda_midchunk_snapshots.pop(request.py_request_id, None)
+                if snapshot is not None:
+                    self._commit_kda_midchunk_snapshot(request, snapshot)
+        super().update_context_resources(scheduled_batch)
+
     @override
     def suspend_request(self, request) -> None:
         replay = self._kda_replay
@@ -1041,6 +1386,8 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
     @override
     def prepare_resources(self, scheduled_batch) -> None:
         super().prepare_resources(scheduled_batch)
+        if self._kda_midchunk_snapshot_alignment is not None:
+            self._prepare_kda_midchunk_snapshots(scheduled_batch.context_requests)
         replay = self._kda_replay
         if replay is None or self.local_num_mamba_layers == 0:
             return
@@ -1064,6 +1411,11 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
 
     @override
     def free_resources(self, request, pin_on_release: bool = False) -> None:
+        self._kda_midchunk_handed_out.discard(request.py_request_id)
+        if self._kda_midchunk_snapshots.pop(request.py_request_id, None) is not None:
+            kv_cache = self.kv_cache_map.get(request.py_request_id)
+            if kv_cache is not None and kv_cache.is_active:
+                kv_cache.release_ssm_snapshot_slot()
         if self._kda_replay is not None:
             self._kda_replay.suspended_requests.discard(request.py_request_id)
             self._kda_replay.acceptance_pending.discard(request.py_request_id)
@@ -1179,6 +1531,12 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
     def seed_kda_replay_caches_for_disagg_gen(self, request_ids: list[int]) -> None:
         """Compatibility entry point; the executor uses the generic transfer hook."""
         self.on_state_transfer_complete(request_ids)
+
+    @override
+    def shutdown(self) -> None:
+        self._kda_midchunk_snapshots.clear()
+        self._kda_midchunk_handed_out.clear()
+        super().shutdown()
 
 
 def resolve_kimi_ssm_cache_dtype(config) -> torch.dtype:

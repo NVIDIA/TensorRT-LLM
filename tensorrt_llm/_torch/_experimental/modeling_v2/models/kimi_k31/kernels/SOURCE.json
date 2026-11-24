@@ -1,0 +1,2385 @@
+{
+ "rev": "5a8365f24b",
+ "relayout_rev": "62e9c0de3c6f324df2b9b566ba0c50206fa780cf",
+ "files": {
+  "kernels/attention/rubin_ull_dsa_core_check.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/kernels/dsa_core_check.py",
+   "source_sha256": "c37e20f2b787f2fce2dee07d8c45425f03cb85690f48c3bcd4626872996fa3a1",
+   "import_edits": 0,
+   "local_edits": [
+    "docstring: the check is the features.K31Features.dsa_core_check diagnostic (no environment switch)"
+   ],
+   "sha256": "1a3dfa01af52eaad9e0e94e986e4f30a15b982c541d70beddf72457427bd6a15",
+   "target_path": "kernels/dsa_core_check.py"
+  },
+  "kernels/attention/rubin_ull_dsa_index.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/dsa_index/__init__.py",
+   "source_sha256": "77d010ed82895251c87c6aa491ea9182073d9a89bbe717d100b326243afe7b79",
+   "import_edits": 6,
+   "local_edits": [
+    "docstring: TLLM_K31_FLAT_DSA_INDEXER_TOPS removed",
+    "kill switches TLLM_K31_FLAT_DSA_INDEXER_{SCORE,KV_ROWS} removed (the default path kept)",
+    "the scorer launch goes through the target's OpWrapper ops.attention.dsa_indexer_score",
+    "the select/pack (and LL exchange merge) launch goes through the target's OpWrapper ops.dsa.dsa_key_shard_select",
+    "no environment reads (target rule): the CuTe indexer, the LL exchange merge (where the runner supports it, else the Triton merge) and the split kernels fixed as served; TLLM_K31_FLAT_DSA_INDEXER_{CUTE,CUTE_MERGE,EXCHANGE} removed with the flag-merge branch"
+   ],
+   "sha256": "444e63b2149f7c5ff5efe22df0940a7ab90d9fb34266f6992939ce488a2a280a",
+   "target_path": "kernels/dsa_index/__init__.py"
+  },
+  "kernels/attention/rubin_ull_dsa_index_exchange.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/dsa_index/exchange.py",
+   "source_commit": "16a5cef394d4eb0113f35cffdc4b5b72a1360150",
+   "source_sha256": "81ff088c05691f209971558332921fa0370729291f4ed950773703bddb86f6a9",
+   "import_edits": 2,
+   "local_edits": [
+    "the DSA stack (1112): merge_exchange(pub=...) publishes each row's threshold LL pair for the speculative decode (rescued rows after their winners, a done pair last) and then leaves the epoch ticket to the decode; block_pairs() factored out"
+   ],
+   "sha256": "ae66ebf0c09423ea3c47b9d1616e0e3750d5a7405660303ff6ee88df84f5fd0b",
+   "target_path": "kernels/dsa_index/exchange.py"
+  },
+  "kernels/attention/rubin_ull_dsa_index_local_topk.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/dsa_index/local_topk.py",
+   "source_commit": "16a5cef394d4eb0113f35cffdc4b5b72a1360150",
+   "source_sha256": "212788454be17e81151fa8c8a8d99f2002a82f436344f119729a05c429d1291e",
+   "import_edits": 3,
+   "local_edits": [
+    "the DSA stack (1112): KeyShardClusterExchangeKernel(publish=True): the split merge grid triggers its dependents at once and publishes into pub_addr (a new last kernel argument)"
+   ],
+   "sha256": "b90299d0b1dd44e7c2e1d7e0c51277ac5e3a3f637a9984c470c4d11c28b6bfac",
+   "upstream": {
+    "repo": "vllm-project/vllm",
+    "rev": "e3ddbdbd60",
+    "path": "vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/dsa/indexer.py",
+    "what": "IndexerLocalTopk (adapted; see the file header)"
+   },
+   "target_path": "kernels/dsa_index/local_topk.py"
+  },
+  "kernels/attention/rubin_ull_dsa_index_logits.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/dsa_index/logits.py",
+   "source_sha256": "4c68cc3072c1caecbc75ae389664412482fdcd6ddf87c2799ce1afc8de86a7ab",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "4c68cc3072c1caecbc75ae389664412482fdcd6ddf87c2799ce1afc8de86a7ab",
+   "target_path": "kernels/dsa_index/logits.py"
+  },
+  "kernels/attention/rubin_ull_dsa_index_prologue.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/dsa_index/prologue.py",
+   "source_sha256": "ba5e4b8c03a6bf89099bf9bfec78fc6a28c09370223398a8a0eb96e700aa418e",
+   "import_edits": 1,
+   "local_edits": [],
+   "sha256": "2cddfc60f1361662e724c64bdac92fe7b613c0ce65a1a57b4eaf01f2561c0c39",
+   "target_path": "kernels/dsa_index/prologue.py"
+  },
+  "kernels/attention/rubin_ull_dsa_index_ptx.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/dsa_index/ptx.py",
+   "source_sha256": "aaf2309fb7675060436f08f363b8b248f2447214838f6b6f6c664645d7cedb13",
+   "import_edits": 0,
+   "local_edits": [
+    "ld_shared_v4_if / zero_shared_v4_if (16-byte shared loads / zeroing, for the radix resolve)",
+    "the DSA stack (1112): fence_acq_rel_gpu_if (the merge grid's publish fence)"
+   ],
+   "sha256": "b5b5b365b9259a36c7618fd7fe6e994a06c3d78097a2d344c1e87ac57f9269a1",
+   "target_path": "kernels/dsa_index/ptx.py"
+  },
+  "kernels/attention/rubin_ull_dsa_index_score.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/dsa_index/score.py",
+   "source_sha256": "ce66fd3d0bdade7b9d0958f5c4a166211df9cdec2d4d13e74cf5d9087e39588f",
+   "import_edits": 1,
+   "local_edits": [
+    "the epilogue override (and the two-split-accumulator layout it allowed, wrong key scale at 512k x 32 rows) and the unused non-hold epilogue removed; the layout is score_epilogue(q)",
+    "no environment reads (target rule): one CTA per SM, the early PDL trigger and the post-wait schedule as constants (EARLY_TRIGGER, EARLY_SCHEDULE); TLLM_K31_FLAT_DSA_INDEXER_SCORE_{CTAS,EARLY} and TLLM_K31_FLAT_DSA_SCORE_LATE_TRIGGER removed",
+    "the DSA stack (1112): ScoreKernel(preload=True) reads its schedule, its first item's block table entries and its complete key tiles before the PDL wait (the tile copies factored into issue_tile)"
+   ],
+   "sha256": "5af5022459f424af2ea01df0d90508c483c0d40dd9b76efb800593ffb8ca7a22",
+   "upstream": {
+    "repo": "vllm-project/vllm",
+    "rev": "e3ddbdbd60",
+    "path": "vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/dsa/indexer.py",
+    "what": "IndexerScore (adapted; see the file header)"
+   },
+   "target_path": "kernels/dsa_index/score.py"
+  },
+  "kernels/attention/rubin_ull_dsa_index_select_pack.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/dsa_index/select_pack.py",
+   "source_commit": "16a5cef394d4eb0113f35cffdc4b5b72a1360150",
+   "source_sha256": "1c340a7b138aa9824818eda1cbc533497171fad7e53495ef13b9041f4afb8f66",
+   "import_edits": 7,
+   "local_edits": [
+    "never-set switches TLLM_K31_FLAT_DSA_INDEXER_{CLUSTER,SHARE_KEYS,TOPS,TOPS_FROM} removed (their defaults kept)",
+    "no environment reads (target rule): split kernels fixed on; TLLM_K31_FLAT_DSA_INDEXER_SPLIT_KERNELS removed",
+    "KeyShardSelectPackKernel.resolve: each owner's bins read with ld.shared.v4 and zeroed right away (clear_hist not needed after the scan), boundary bin picked in registers; same (bucket, above, count)",
+    "the DSA stack (1112): KeyShardSelectPack publishes threshold pairs for supported speculative decode calls"
+   ],
+   "sha256": "fad11a54da0a5856693f68d840d701bcf54e40923bb2a316cfdf6faa85986bbd",
+   "target_path": "kernels/dsa_index/select_pack.py"
+  },
+  "kernels/attention/rubin_ull_dsa_oproj_fused.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/kernels/vendor/vllm_mr8/specialized_decode/cutedsl/oproj/consumer.py",
+   "import_edits": 0,
+   "local_edits": [
+    "the DSA stack (1112, dsa_value_oproj): new family file adapted from the vendored MR8 OprojFused (consumer.py, producer compute with x_shared + polled_x) and the vendored vllm_main DcpValue.kernel_rows / merge_row / poll_pair (mla/dcp.py): grid (8, 14) with physical clusters 0-5 as per-head merge clusters (W_UV slice in shared memory before the PDL wait, DSMEM gather of the 8 merged rows, DcpValue projection + gate into a Lamport x buffer, other parity re-armed), every CTA waits before reading layer data, the x poll bounded (spin_trap sites 195-197)"
+   ],
+   "upstream": {
+    "repo": "vllm-project/vllm",
+    "rev": "e3ddbdbd60",
+    "path": "vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/mla/dcp.py",
+    "what": "DcpValue.kernel_rows / merge_row (adapted, with MR8 OprojFused; see the file header)"
+   },
+   "sha256": "28c19c1b750699bdd9124315e6c18720c136e20c94086e1017849d950ae8c0e2"
+  },
+  "kernels/attention/rubin_ull_dsa_qproj.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/flat_dsa_qproj_kernel.py",
+   "source_sha256": "cda9c769a011cff9a171039750de5bd7c67ae9ac1209cd95038520afe7d8774b",
+   "import_edits": 2,
+   "local_edits": [],
+   "sha256": "5d6d72f8593436201e1c2969dfdaa0ebb0e40a63872d1e50cb90db24af0ff744",
+   "target_path": "kernels/dsa_qproj.py"
+  },
+  "kernels/attention/rubin_ull_dsa_spec_decode.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/kernels/vendor/vllm_main/specialized_decode/cutedsl/dsa/attn_sparse.py",
+   "import_edits": 0,
+   "local_edits": [
+    "the DSA stack (1112): new family file adapted from the vendored SparseDcpDecode kernel: no griddepcontrol.wait, the staged candidates from the own LL slot, masked by the merge grid's published threshold, the rescued rows over the written winners, the epoch ticket"
+   ],
+   "upstream": {
+    "repo": "vllm-project/vllm",
+    "rev": "e3ddbdbd60",
+    "path": "vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/dsa/attn_sparse.py",
+    "what": "SparseDcpDecode (adapted; see the file header)"
+   },
+   "sha256": "e8534581115c4bc68805ba0c94b2b3364dbec3980d340f0f4b31353d59d2f27f"
+  },
+  "kernels/attention/rubin_ull_glm_indexer_prologue.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16/ops/dsa/_indexer_prologue.py",
+   "source_sha256": "c3927fb4fe6ba860ab61769a3891ae42387f8e0c494d28cf3a55ce2459dcd938",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "c3927fb4fe6ba860ab61769a3891ae42387f8e0c494d28cf3a55ce2459dcd938",
+   "target_path": "kernels/glm_indexer_prologue.py"
+  },
+  "kernels/attention/rubin_ull_mla_output_gate.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/mla/output_gate.py",
+   "source_sha256": "24911a6cb739187408ccd3a58ed9e709e0ba5a788c4f1c9e3a5acc5c8da969fd",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "24911a6cb739187408ccd3a58ed9e709e0ba5a788c4f1c9e3a5acc5c8da969fd",
+   "target_path": "kernels/mla_output_gate.py"
+  },
+  "kernels/attention/rubin_ull_query_wait.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/kernels/query_wait.py",
+   "source_commit": "fb8a3247a17840609f20a37291ef2860b23e7931",
+   "source_sha256": "6c1ef44025e1c7945c58bedb303028f27a15dfce06bb0f7afd7a093aded79954",
+   "import_edits": 5,
+   "local_edits": [
+    "docstring: the poll bound is common.spin.SPIN_NS (no environment switch)",
+    "the DSA stack (1113): release_after_poll: the dependents are released after the CTA's polls, not at once; the default is the vendored release"
+   ],
+   "sha256": "d2eb4e99362dfc4bd9b6e728584d66b6ce25c6410c796fc93a0d908230814ebf",
+   "upstream": {
+    "repo": "none",
+    "what": "K3.1-owned (TensorRT-LLM), not vendored"
+   },
+   "target_path": "kernels/query_wait.py"
+  },
+  "kernels/comm/rubin_ull_helix_tail_gate.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/kernels/k3_helix_tail_gate.py",
+   "source_sha256": "0aed51c229da0bd2c17b2a56dbe1e77fdff2d28184a656fd0c7ad26ba1f5a695",
+   "import_edits": 6,
+   "local_edits": [],
+   "sha256": "b4ab3601453af5dbe17f21cfeecf6dc23031d5dd52e2a16e688f6c5e3103748d",
+   "target_path": "kernels/k3_helix_tail_gate.py"
+  },
+  "kernels/comm/rubin_ull_k3_helix_a2a_fused.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k3_vl/k3_rubin/kernels/helix_a2a_fused.py",
+   "source_sha256": "c998e531973f1a8bfbddb9c8d6a97092bd99b0d4f52ce11a901eeb77d0ba942c",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "c998e531973f1a8bfbddb9c8d6a97092bd99b0d4f52ce11a901eeb77d0ba942c",
+   "target_path": "kernels/k3/helix_a2a_fused.py"
+  },
+  "kernels/comm/rubin_ull_k3_helix_tail.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k3_vl/k3_rubin/kernels/k3_helix_tail.py",
+   "source_sha256": "f7f44be7932ff6e1680bb3289e0c027a9b4225fa0acfdda385cf17dfe4644d4f",
+   "import_edits": 3,
+   "local_edits": [],
+   "sha256": "9474962457b62dec2b30f1b6f5202a22a349c5f20d089daa814af24df44ccd75",
+   "target_path": "kernels/k3/k3_helix_tail.py"
+  },
+  "kernels/comm/rubin_ull_k3_lamport_ar.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k3_vl/k3_rubin/kernels/k3_lamport_ar.py",
+   "source_sha256": "d4824b382ffc79e160917acc1f106425e2c0757a895c0523581845575786fdce",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "d4824b382ffc79e160917acc1f106425e2c0757a895c0523581845575786fdce",
+   "target_path": "kernels/k3/k3_lamport_ar.py"
+  },
+  "kernels/comm/rubin_ull_k3_latent_ar_norm.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k3_vl/k3_rubin/kernels/k3_latent_ar_norm.py",
+   "source_sha256": "0e3ad6822eaa1a97c2e4e31ee4e838d24f1f5c6fd85e608dd4795fb47e163be9",
+   "import_edits": 2,
+   "local_edits": [],
+   "sha256": "99031fff0406c787c49238a2c6aab9362cd5cbba85caf3c493cbe08ea2031b70",
+   "target_path": "kernels/k3/k3_latent_ar_norm.py"
+  },
+  "kernels/common/rubin_ull_k3_features.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k3_vl/k3_rubin/features.py",
+   "source_sha256": "01a090054243b60933a227b76ad255a5428996bb96a815b8396b147187e388ea",
+   "import_edits": 0,
+   "local_edits": [
+    "no environment reads (target rule): select(), selected(), PROFILES and the retired-variable tables removed (never called in this target); active() is K3Features()"
+   ],
+   "sha256": "a0e955e8a74a8d367a0e2162f4aaf6d713c74ba0e62ed062b57cad90576e2497",
+   "target_path": "kernels/k3/features.py"
+  },
+  "kernels/common/rubin_ull_k3_launch_attrs.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k3_vl/k3_rubin/kernels/k3_launch_attrs.py",
+   "source_sha256": "ebeb365105ae2ddc49c9bf3bad14bb96c45937bf6f636c8f866ce089feb01efb",
+   "import_edits": 2,
+   "local_edits": [],
+   "sha256": "76d879d9c134c9648c2a45e7d306afea270406cc074b3a5d7661d832c9baaf9a",
+   "target_path": "kernels/k3/k3_launch_attrs.py"
+  },
+  "kernels/common/rubin_ull_spin_trap.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/kernels/spin_trap.py",
+   "source_commit": "16a5cef394d4eb0113f35cffdc4b5b72a1360150",
+   "source_sha256": "1b43e93ebc55dfb6558e125c811cac07015a00d41f4c799fe48346fd801f3ade",
+   "import_edits": 1,
+   "local_edits": [
+    "DSA stack: a daemon watcher thread reads the record's claim word every WATCH_PERIOD_S and logs it once claimed (no CUDA call); log_trap prints once per process with host / pid / device"
+   ],
+   "sha256": "09721bcdce70497f3931d59d63fa6d7b088ed937f95e6adce393d5525a31e736",
+   "upstream": {
+    "repo": "none",
+    "what": "K3.1-owned (TensorRT-LLM), not vendored"
+   }
+  },
+  "kernels/common/rubin_ull_spin_trap_wait.py": {
+   "source": "none",
+   "source_sha256": null,
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "262337411611fdfeade5fdb34e7510a871cfdcbe5dbbdd8153501b9b8651fff4",
+   "upstream": {
+    "repo": "none",
+    "what": "K3.1-owned (TensorRT-LLM), new in the V2 target: the kernel of the spin_trap_wait entry (ops/common/rubin_ull_spin_trap.py), built only from rubin_ull_spin_trap; no r10 counterpart"
+   }
+  },
+  "kernels/embedding/rubin_ull_flat_begin.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/kernels/flat_begin.py",
+   "source_commit": "9daea5dec1780415da49be50dc0608eb3cee20c9",
+   "source_sha256": "a9a0dd0f8f369aa0eb3690e9ccb3b9312d6bc9bf000ca2a3832b4db42555b53f",
+   "import_edits": 0,
+   "local_edits": [
+    "no environment reads (target rule): the unused TLLM_K31_FLAT_BEGIN_FOLD kill switch (begin_fold_enabled) removed"
+   ],
+   "sha256": "014bc68137fa0a32264d2fe96ccd554e3ca8cdc0fa414fd0528426684f52c8c8",
+   "target_path": "kernels/flat_begin.py"
+  },
+  "kernels/embedding/rubin_ull_step_begin.py": {
+   "source": "none",
+   "source_sha256": null,
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "b0b9c2123416c64663c26b572ec3fb5cabe030e3f0d1c83a116c04077376e4c8",
+   "upstream": {
+    "repo": "none",
+    "what": "K3.1-owned (TensorRT-LLM), new in the V2 target: the decode step's first three launches as one, behind ops/embedding/rubin_ull_step_begin.py. It calls the engine's _spec_head_prep_kernel (speculative/spec_head_kernels.py), the engine's _dg_sm100_schedule (attention/backends/sparse/dsa/kernels.py) and kernels/embedding/rubin_ull_flat_begin.py's _flat_begin_kernel unchanged (imported), and carries the per-program bodies of the engine's _fused_dsa_helix_decode_metadata_kernel (same file) with the program id as an argument; no r10 counterpart"
+   }
+  },
+  "kernels/gemm/rubin_ull_fp8_block_scale_low_m_gemm.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/kernels/fp8_block_scale_low_m_gemm.py",
+   "source_sha256": "f49943e7ee3679b727153ce02ad882e3da48f7f40dcac08914dde7167a217076",
+   "import_edits": 3,
+   "local_edits": [],
+   "sha256": "ed6c382f4160c8a1f27fa02e50762b618a277965828b0c33dcf3544dca4d037a",
+   "target_path": "kernels/fp8_block_scale_low_m_gemm.py"
+  },
+  "kernels/gemm/rubin_ull_k3_dense0.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k3_vl/k3_rubin/kernels/k3_dense0.py",
+   "source_sha256": "6c1ed4ebd87c995ba434529f4fc05ff95c425b8b24505bde225220c7a548c86f",
+   "import_edits": 5,
+   "local_edits": [],
+   "sha256": "e7b400accd19deff7d222d6bf5bc8b65b2309f72ec981c726adb5c3222992f9a",
+   "target_path": "kernels/k3/k3_dense0.py"
+  },
+  "kernels/gemm/rubin_ull_k3_fp8w_lowm_gemm.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k3_vl/k3_rubin/kernels/k3_fp8w_lowm_gemm.py",
+   "source_sha256": "be77ab5be50edba849540c8a49fc286dd248e78f2b8935c1be8933d36c9fd973",
+   "import_edits": 2,
+   "local_edits": [
+    "the torch custom op trtllm::k3_fp8w_lowm_gemm and its fake removed (no caller in the target; it stays a plain Python call)"
+   ],
+   "sha256": "03bb02a95b8b68aac0651495433b945d2f6b6376090ae354f98d3698d5050905",
+   "target_path": "kernels/k3/k3_fp8w_lowm_gemm.py"
+  },
+  "kernels/gemm/rubin_ull_k3_fp8w_lowm_mxfp8.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k3_vl/k3_rubin/kernels/k3_fp8w_lowm_mxfp8.py",
+   "source_sha256": "ae66053a6b8bdc2cabc70b3259fd09a048b194ffc65991b43a758a2c564ebead",
+   "import_edits": 5,
+   "local_edits": [],
+   "sha256": "e5780e11a86535bd31fb2c93cba685ab1312d640a3390c04965f90e091a85ff8",
+   "target_path": "kernels/k3/k3_fp8w_lowm_mxfp8.py"
+  },
+  "kernels/gemm/rubin_ull_k3_latent_fp8_gemm.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k3_vl/k3_rubin/kernels/k3_latent_fp8_gemm.py",
+   "source_sha256": "28dd5f31a25fbe7650acd24f1b9745650c004fc295feb80e458f1bb4482149c5",
+   "import_edits": 2,
+   "local_edits": [
+    "the torch custom op trtllm::k3_latent_down_fp4 and its fake removed, the docstring names the function (no caller in the target; it stays a plain Python call)"
+   ],
+   "sha256": "78b941aa58bb9d8f104ff47dee4bd92d7e4e7ac834dbe9df1010c29213f58318",
+   "target_path": "kernels/k3/k3_latent_fp8_gemm.py"
+  },
+  "kernels/gemm/rubin_ull_k3_low_m_bf16_splitk.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k3_vl/k3_rubin/kernels/low_m_bf16_splitk.py",
+   "source_sha256": "9c992b09e92b00904e22edde6e396cbbd3ac7bc00e97e1f129ed6af74ba8d4c8",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "59cfbbb4eaaeef98565b9891bc1ff76768032bbff494c5b36d7383fab4ea3aee",
+   "target_path": "kernels/k3/low_m_bf16_splitk.py"
+  },
+  "kernels/gemm/rubin_ull_latent_fp8_gemm.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/kernels/k3_latent_fp8_gemm.py",
+   "source_sha256": "31269c955a1d841bbb4b9d572c7be0f2be82123f2d1de69fde3501c3e27d1d11",
+   "import_edits": 2,
+   "local_edits": [
+    "the torch custom op trtllm::k31r_k3_latent_down_fp4 and its fake removed, the docstring names the function (no caller in the target; it stays a plain Python call)"
+   ],
+   "sha256": "7082270d66d8d66f32dd09fe5b9bdf44161f1cf732505b71c4a0de20386b0dfb",
+   "target_path": "kernels/k3_latent_fp8_gemm.py"
+  },
+  "kernels/gemm/rubin_ull_low_m_gemm_plans.py": {
+   "source": "tensorrt_llm/_torch/modules/low_m_gemm_plans.py",
+   "source_sha256": "5060ea7b0a2fffa0d801a91f2a8bd2410ad7619a2e8a8c245660e8b77c0e29d6",
+   "source_rev": "5a8365f24b",
+   "import_edits": 0,
+   "local_edits": [
+    "LowMGemmPlan: low_m_gemm.py's alias defined here instead of imported"
+   ],
+   "sha256": "1ef27786ccd22f300ff03d23bac60c71f23fb058a541d0137e6d2ed16d0f7e9e",
+   "target_path": "kernels/low_m_gemm_plans.py"
+  },
+  "kernels/moe/rubin_ull_experts_nv_experts.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/experts/nv_experts.py",
+   "source_sha256": "f1cf571f46f789934213fe8aa7084a3e8a76138fd509f3f2085c29686d922d4f",
+   "import_edits": 10,
+   "local_edits": [
+    "by-path loader replaced (5 statements)",
+    "RubinNvExpertsKernel passes max_grid to RubinExpertsKernel"
+   ],
+   "sha256": "18944323a530cda54b09cb1d204b24d60b6789f03f53523d8b8e22b3fcadb6ba",
+   "target_path": "kernels/experts/nv_experts.py"
+  },
+  "kernels/moe/rubin_ull_experts_nv_experts_runtime.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/experts/nv_experts_runtime.py",
+   "source_sha256": "cf68509f9df4c5270904445389cdad2d9fcb5451ba96d8b0da17755d2f576419",
+   "import_edits": 6,
+   "local_edits": [
+    "by-path loader replaced (11 statements)",
+    "max_grid(device) from experts_runtime.grids (TP16); compile_experts passes it to the kernel"
+   ],
+   "sha256": "3fa9307bb0386813d85eb5cf03eb116f154153fff210a1298cf724ad863d7816",
+   "target_path": "kernels/experts/nv_experts_runtime.py"
+  },
+  "kernels/moe/rubin_ull_k3_fused_router.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k3_vl/k3_rubin/kernels/k3_fused_router.py",
+   "source_sha256": "9bbf3e1912c7c8d8ed47185f6633c72b405b7b809dac04d63cf291cb9fba77b5",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "9bbf3e1912c7c8d8ed47185f6633c72b405b7b809dac04d63cf291cb9fba77b5",
+   "target_path": "kernels/k3/k3_fused_router.py"
+  },
+  "kernels/moe/rubin_ull_k3_moe_tail1.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k3_vl/k3_rubin/kernels/k3_moe_tail1.py",
+   "source_sha256": "4570328e6cdcf2675a9b3adae0e077e277ca364f20d6ef6f684c0f78916ee4c6",
+   "import_edits": 2,
+   "local_edits": [],
+   "sha256": "47df02dbfd5ddb96d1b20cec87158e0e63788fbe394f2c7aad2e9d324532b44b",
+   "target_path": "kernels/k3/k3_moe_tail1.py"
+  },
+  "kernels/moe/rubin_ull_k3_route_tail.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k3_vl/k3_rubin/kernels/k3_route_tail.py",
+   "source_sha256": "0e64cb454deb6e668f742fe5387c7f1655acc5a4a5640390ad2316f7168dd6f0",
+   "import_edits": 3,
+   "local_edits": [],
+   "sha256": "35b99517c9d3413685b92230cf4af8ed68a3c6d9ffcca96e9e4fc9f2ec4829b1",
+   "target_path": "kernels/k3/k3_route_tail.py"
+  },
+  "kernels/moe/rubin_ull_k3_shared_persist.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k3_vl/k3_rubin/kernels/k3_shared_persist.py",
+   "source_sha256": "3ab426c651b82c2433a91bc42ff9f1b5d71b4fa1de6b757d3c0b8374cb4a540b",
+   "import_edits": 3,
+   "local_edits": [],
+   "sha256": "4933e8b3837ddc4988db9a2098138bf05e77ff8b5c5d6e6a0c158ff9f1d11dc6",
+   "target_path": "kernels/k3/k3_shared_persist.py"
+  },
+  "kernels/moe/rubin_ull_front.py": {
+   "source": "none",
+   "source_sha256": null,
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "f4126cf82708094b3ddcb6336d868100b3700fed43609d25b549433edf81cea3",
+   "upstream": {
+    "repo": "none",
+    "what": "K3.1-owned (TensorRT-LLM), from the family's Rubin modeling_v2 (feat/kimi-k3.1-pro): the low-latency MoE front's route kernel (rubin_route_tail polling the front workspace) and its MNNVL workspace, behind ops/moe/rubin_ull_front_bf16.py (the sm_107 default and tep8 targets); a trimmed rewrite of kimi_k3_vl/k3_rubin/kernels/k3_ull_front.py's route and gather, not a copy"
+   }
+  },
+  "kernels/moe/rubin_ull_push_gemm.py": {
+   "source": "none",
+   "source_sha256": null,
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "d0bbb66d9c54a586af97fc4f9a94b797c93c8218f43e2f7309159291ff5f24c5",
+   "upstream": {
+    "repo": "none",
+    "what": "K3.1-owned (TensorRT-LLM), from the family's Rubin modeling_v2 (feat/kimi-k3.1-pro): the low-M BF16 split-K GEMM of kernels/spec/rubin_draft_gemm_push.py whose owner CTA pushes into a Lamport call (AG rows or SLOT slots), and run_ull_front_bf16 composing the sharded MoE front with rubin_ull_front.py; behind ops/moe/rubin_ull_front_bf16.py and ops/moe/rubin_ull_cp_tail.py"
+   }
+  },
+  "kernels/spec/rubin_ull_k3_dspark_draft_gemm_push.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k3_vl/k3_rubin/kernels/dspark_draft_gemm_push.py",
+   "source_sha256": "2853ad8f5e7f3e59ec82c073862432047acd76aa2588b966b6b14709a3ede5b7",
+   "import_edits": 3,
+   "local_edits": [],
+   "sha256": "b8b7aa39739a500f8c6b5a9ea436016642c6c49a06a1bd0bff676b9cac778c4c",
+   "target_path": "kernels/k3/dspark_draft_gemm_push.py"
+  },
+  "kernels/spec/rubin_ull_k3_spec_tail_kernels.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k3_vl/k3_rubin/spec/spec_tail_kernels.py",
+   "source_sha256": "923062b40a13777a14aa03f25fa5268b7c7d9b9c3dc2a3209460cac6e006acc1",
+   "import_edits": 2,
+   "local_edits": [
+    "no V1 module: tp_mode compared with \"column\" (TensorParallelMode is a str enum)",
+    "fused_select_accept / _select_accept_kernel: optional count operand (int64 [2], += generation rows and their accepted tokens in the program)",
+    "fused_select_accept / _select_accept_kernel: optional real_rows operand (bool per generation row, SpecMetadata.real_draft_rows): with force, only those rows are forced and counted"
+   ],
+   "sha256": "8c403a7e7193baea326849d381e3b59e219ebdc4fe9b5e931a4bc4deff0a6483",
+   "target_path": "kernels/k3/spec_tail_kernels.py"
+  },
+  "kernels/spec/rubin_ull_spec_tail_kernels.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/spec/spec_tail_kernels.py",
+   "source_sha256": "898e9f21bfbc003617ed8b5fce34ace64f8f173449e46eeeb2b8e3c704c72ffc",
+   "import_edits": 3,
+   "local_edits": [
+    "no V1 module: tp_mode compared with \"column\" (TensorParallelMode is a str enum)"
+   ],
+   "sha256": "0ff43915bf195136014fd8f6b3836ac84c09ffdad2e9a574bc7d48770f037b36",
+   "target_path": "kernels/spec/spec_tail_kernels.py"
+  },
+  "kernels/ssm/rubin_ull_kda_cute_dsl_kimi_k3_kda_mtp_ops.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/kda/cute_dsl_kimi_k3_kda_mtp_ops.py",
+   "source_sha256": "734854d851cc8465933772bca2ab0b461abecbf2c7b1f3dfcb78b3f8f840cd22",
+   "import_edits": 6,
+   "local_edits": [],
+   "sha256": "16f83d6b1e037bb5927142ee5fae53cfa15cdef90533f847c31bfa0f3fe92073",
+   "target_path": "kernels/kda/cute_dsl_kimi_k3_kda_mtp_ops.py"
+  },
+  "kernels/ssm/rubin_ull_kda_head_fp32.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/kda/head_fp32.py",
+   "source_commit": "7da6f70b273e0d2040268615407167f68202e5e1",
+   "source_sha256": "c71854b3020c7b44bd7d2f7a5b123032505fca281fe3932424886a01e195c8b4",
+   "import_edits": 2,
+   "local_edits": [
+    "docstring: the provenance is kernels/SOURCE.json (r10: kda/HEAD_FP32_SOURCE.json)",
+    "PreparedKdaHeadFp32.order: \"sibling\" launches MR8's SignalGemm (compile_signal, no programmatic event) and the head without the main stream's wait on SignalGemm's event, which is MR8's own PreparedKdaHead.run_verify order; \"event\" keeps SignalGemmEvent and the wait"
+   ],
+   "sha256": "2753d057ceaa7a0c8b439490132122fb135f7e7899b692fd895436b9735fe118",
+   "upstream": {
+    "repo": "none",
+    "what": "K3.1-owned (TensorRT-LLM), derived from MR8 df90f706c5 cutedsl/kda/head.py and head_verify.py (vendored unchanged under kernels/vendor/vllm_mr8); not vendored",
+    "derived": {
+     "mr8_commit": "df90f706c5b62178dcb26da1c2093f58cd3bc121",
+     "source_files": {
+      "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/head.py": "558a537d7f850ff7fd021d84418c531393ebac8af945309719887113704ae09b",
+      "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/head_verify.py": "d944619e7465a2249d8d04096d52cdaeb38d84acd68d66662a4b8255be785ea7"
+     },
+     "private_path": "kda/head_fp32.py",
+     "status": "modified",
+     "changes": [
+      "poll_fa: the `while state == 0` F_A row poll spins with kernels.spin_trap.tick (site 211; a/b/c = state/target/token): past spin_trap.BOUND_NS it writes the trap record (mapped pinned host memory) and traps",
+      "rearm: the last reader's `while seen < target` counter wait spins with kernels.spin_trap.tick (site 212; a/b = seen/target)",
+      "head.py module helpers are reached through the vendored module (_head._acquire_load, _prim.at, ...) instead of relative imports",
+      "compile_head_verify -> compile_head_verify_fp32: builds KdaHeadVerifyFp32 at FP32 state (bf16_state=False fixed, no bf16_state argument)",
+      "PreparedKdaHead.prepare_caches -> PreparedKdaHeadFp32.prepare_caches: one request x q verify shapes only (no q = 1 batches, no KdaHeadMulti), FP32 state only",
+      "SignalGemm.__call__ -> SignalGemmEvent.__call__: the same launch plus programmatic_event=event, programmatic_event_trigger_at_block_start=1 (kernel body inherited, unchanged)",
+      "compile_signal -> compile_signal_event: compiles SignalGemmEvent (event as a call argument)",
+      "PreparedKdaHead.run_verify -> PreparedKdaHeadFp32.run_verify: one request x q only; SignalGemmEvent with the layer's fa_event on the side stream, then the main stream waits on fa_event before KdaHeadVerifyFp32"
+     ],
+     "kernel_body_changes": "the two bounded waits only; every other instruction and every output / checkpoint bit unchanged",
+     "vendored_files_unchanged": true,
+     "definitions": [
+      {
+       "source_file": "head.py",
+       "source_definition": "KdaHead.poll_fa",
+       "source_definition_sha256": "44b2d0368afe5e264fb99eb14285f46312ebb8e70ff228235bdbeaad731f9781",
+       "private_definition": "KdaHeadVerifyFp32.poll_fa",
+       "diff": [
+        "--- mr8/head.py:KdaHead.poll_fa",
+        "+++ head_fp32.py:KdaHeadVerifyFp32.poll_fa",
+        "@@ -2,9 +2,8 @@",
+        "     def poll_fa(self, fa_beta, counter, target, token, quarter, head):",
+        "-        \"\"\"This lane's F_A words (8 x 2) and beta: F_A's rows are polled directly",
+        "-        until no BF16 half is the 0xFFFF sentinel the last reader re-fills (one round",
+        "-        trip less than the counter, then the row). A genuine 0xFFFF value cannot",
+        "-        hang: once F_A's counter completes the row is reloaded after the acquire.\"\"\"",
+        "+        \"\"\"MR8's ``KdaHead.poll_fa`` with a bounded ``while state == 0``: this lane's F_A",
+        "+        words (8 x 2) and beta, polled until no BF16 half is the 0xFFFF sentinel (the",
+        "+        counter as the fallback for a genuine 0xFFFF value).\"\"\"",
+        "         lane = cute.arch.lane_idx()",
+        "         words = cute.make_rmem_tensor(17, Uint32)",
+        "-        beta_word = at(fa_beta, token, 128 + (head - head % 2))",
+        "+        beta_word = _at(fa_beta, token, 128 + (head - head % 2))",
+        "         state = Int32(2)",
+        "@@ -12,9 +11,13 @@",
+        "             state = Int32(0)",
+        "+        spins, since = spin_trap.start()",
+        "         while state == 0:",
+        "+            spins, since = spin_trap.tick(",
+        "+                spins, since, SITE_POLL_FA, self.trap_record, state, target, token",
+        "+            )",
+        "             bad = False",
+        "             for c in cutlass.range_constexpr(8):",
+        "-                source = at(fa_beta, token, 16 * c + 4 * quarter)",
+        "-                pair = load_words(source, count=2, word_type=\"u32\", scope=\"gpu\")",
+        "+                source = _at(fa_beta, token, 16 * c + 4 * quarter)",
+        "+                pair = _load_words(source, count=2, word_type=\"u32\", scope=\"gpu\")",
+        "                 words[2 * c], words[2 * c + 1] = pair",
+        "-            words[16] = load_words(beta_word, count=1, word_type=\"u32\", scope=\"gpu\")[0]",
+        "+            words[16] = _load_words(beta_word, count=1, word_type=\"u32\", scope=\"gpu\")[0]",
+        "             for i in cutlass.range_constexpr(17):",
+        "@@ -27,3 +30,3 @@",
+        "                 if lane == 0:",
+        "-                    done = Int32(Int32(_acquire_load(counter)) >= target)",
+        "+                    done = Int32(Int32(_head._acquire_load(counter)) >= target)",
+        "                 if cute.arch.shuffle_sync(done, 0) != 0:",
+        "@@ -32,7 +35,7 @@",
+        "             for c in cutlass.range_constexpr(8):",
+        "-                source = at(fa_beta, token, 16 * c + 4 * quarter)",
+        "-                words[2 * c], words[2 * c + 1] = load_activation_bf16x4(source)",
+        "-            words[16] = load_words(beta_word, count=1, word_type=\"u32\", mutable=True)[0]",
+        "+                source = _at(fa_beta, token, 16 * c + 4 * quarter)",
+        "+                words[2 * c], words[2 * c + 1] = _head.load_activation_bf16x4(source)",
+        "+            words[16] = _load_words(beta_word, count=1, word_type=\"u32\", mutable=True)[0]",
+        "         ar = [(words[2 * c], words[2 * c + 1]) for c in range(8)]",
+        "         half = (words[16] >> Uint32(16 * (head % 2))) & Uint32(0xFFFF)",
+        "-        return ar, BFloat16(bits_float(half << Uint32(16)))",
+        "+        return ar, BFloat16(_bits_float(half << Uint32(16)))"
+       ]
+      },
+      {
+       "source_file": "head.py",
+       "source_definition": "KdaHead.rearm",
+       "source_definition_sha256": "e940407f0b9d8b595abb54c5aa32dc822ed66eb403e16774bd6b1764def46436",
+       "private_definition": "KdaHeadVerifyFp32.rearm",
+       "diff": [
+        "--- mr8/head.py:KdaHead.rearm",
+        "+++ head_fp32.py:KdaHeadVerifyFp32.rearm",
+        "@@ -2,9 +2,9 @@",
+        "     def rearm(self, counter, target, lane, fa_beta=None):",
+        "-        \"\"\"The last of the head CTAs past the F_A counter re-arms the pair (and, with",
+        "-        ``fa_poll``, once F_A's counter is complete, re-fills its rows with the",
+        "-        sentinel).\"\"\"",
+        "+        \"\"\"MR8's ``KdaHead.rearm`` with a bounded ``while seen < target``: the last of the",
+        "+        head CTAs past the F_A counter waits for the counter to complete, re-arms the",
+        "+        pair and re-fills F_A's rows with the sentinel.\"\"\"",
+        "         last = Int32(0)",
+        "         if (target > 0) & (lane == 0):",
+        "-            readers = Int32(CLUSTER * self.heads)",
+        "-            if Int32(_fetch_add(counter + 4)) == readers - 1:",
+        "+            readers = Int32(_head.CLUSTER * self.heads)",
+        "+            if Int32(_head._fetch_add(counter + 4)) == readers - 1:",
+        "                 last = Int32(1)",
+        "@@ -12,7 +12,11 @@",
+        "                     # readers may have seen F_A's rows before its counter adds landed",
+        "-                    seen = Int32(_acquire_load(counter))",
+        "+                    seen = Int32(_head._acquire_load(counter))",
+        "+                    spins, since = spin_trap.start()",
+        "                     while seen < target:",
+        "-                        seen = Int32(_acquire_load(counter))",
+        "-                _store_zero(counter)",
+        "-                _store_zero(counter + 4)",
+        "+                        spins, since = spin_trap.tick(",
+        "+                            spins, since, SITE_REARM, self.trap_record, seen, target",
+        "+                        )",
+        "+                        seen = Int32(_head._acquire_load(counter))",
+        "+                _head._store_zero(counter)",
+        "+                _head._store_zero(counter + 4)",
+        "         if cutlass.const_expr(self.fa_poll):"
+       ]
+      },
+      {
+       "source_file": "head_verify.py",
+       "source_definition": "compile_head_verify",
+       "source_definition_sha256": "be116549e933ad5feee65f853c7029e0bd39640e6f9c82e1eab922ae1d5e8c26",
+       "private_definition": "compile_head_verify_fp32",
+       "diff": [
+        "--- mr8/head_verify.py:compile_head_verify",
+        "+++ head_fp32.py:compile_head_verify_fp32",
+        "@@ -1,10 +1,6 @@",
+        " @cache",
+        "-def compile_head_verify(heads, bf16_state, has_bias, specs, arch, tile, hidden, polled):",
+        "-    \"\"\"``KdaHeadVerify`` for ``specs`` (the tensors of ``PreparedKdaHead._tensors`` plus",
+        "-    accepted); ``tile``: ``KdaHeadWide``'s (stages, K per stage, ...): its K per stage,",
+        "-    with VERIFY_STAGES ring stages, VERIFY_TMEM_TILES tensor-memory tiles and",
+        "-    VERIFY_EARLY_LOADS A tiles before the PDL wait.\"\"\"",
+        "+def compile_head_verify_fp32(heads, has_bias, specs, arch, tile, hidden, polled, record):",
+        "+    \"\"\"MR8's ``compile_head_verify`` for ``KdaHeadVerifyFp32`` (FP32 state); ``record``: the",
+        "+    ``spin_trap`` record's device address.\"\"\"",
+        "     from cutlass.cute.runtime import make_fake_stream, make_fake_tensor",
+        "-",
+        "-    from ..common.host import fake",
+        " ",
+        "@@ -15,11 +11,16 @@",
+        " ",
+        "-    tensors = [fake(shape, stride, dtype) for shape, stride, dtype in specs]",
+        "+    tensors = [_host.fake(shape, stride, dtype) for shape, stride, dtype in specs]",
+        "     scalars = (Float32(-5), Float32(128**-0.5), Float32(1e-6))",
+        "-    cta_k = tile[1]",
+        "-    kernel = KdaHeadVerify(",
+        "-        heads, stages=VERIFY_STAGES, cta_k=cta_k, tmem_tiles=VERIFY_TMEM_TILES,",
+        "-        early_loads=VERIFY_EARLY_LOADS, hidden=hidden, bf16_state=bf16_state,",
+        "+    kernel = KdaHeadVerifyFp32(",
+        "+        heads,",
+        "+        stages=_verify.VERIFY_STAGES,",
+        "+        cta_k=tile[1],",
+        "+        tmem_tiles=_verify.VERIFY_TMEM_TILES,",
+        "+        early_loads=_verify.VERIFY_EARLY_LOADS,",
+        "+        hidden=hidden,",
+        "+        bf16_state=False,",
+        "         has_bias=has_bias,",
+        "-    )  # fmt: skip",
+        "+    )",
+        "     kernel.polled_out = polled",
+        "+    kernel.trap_record = record",
+        "     args = (matrix(1), matrix(1), cutlass.Int64(0), *tensors, *scalars)"
+       ]
+      },
+      {
+       "source_file": "head.py",
+       "source_definition": "PreparedKdaHead.prepare_caches",
+       "source_definition_sha256": "21dccd191dc1c95708f0933aaef0da3c6265bc9ee61c2abc47b7312c012af636",
+       "private_definition": "PreparedKdaHeadFp32.prepare_caches",
+       "diff": [
+        "--- mr8/head.py:PreparedKdaHead.prepare_caches",
+        "+++ head_fp32.py:PreparedKdaHeadFp32.prepare_caches",
+        "@@ -1,42 +1,34 @@",
+        "     def prepare_caches(self, caches):",
+        "-        arch = architecture(self.device)",
+        "-        bf16_state = caches[1].dtype == torch.bfloat16",
+        "+        if self.batches or any(b != q for b, q in self.verify):",
+        "+            raise ValueError(\"PreparedKdaHeadFp32 runs one request x q verify rows only\")",
+        "+        if caches[1].dtype != torch.float32:",
+        "+            raise TypeError(\"PreparedKdaHeadFp32 needs the FP32 KDA state\")",
+        "+        if self.tile is None:",
+        "+            raise ValueError(\"PreparedKdaHeadFp32 needs KdaHeadWide's tile\")",
+        "+        arch = _host.architecture(self.device)",
+        "+        record = spin_trap.record_address()",
+        "         meta = dict(device=\"meta\")",
+        "         with torch.accelerator.device_index(self.device.index):",
+        "-            self.fa_code = compile_signal(FA_TACTIC, arch)",
+        "-            for b in self.batches:",
+        "-                slots = torch.empty((b,), dtype=torch.int32, **meta)",
+        "+            self.fa_code = compile_signal_event(_head.FA_TACTIC, arch)",
+        "+            # SignalGemmEvent's programmatic event (timing off, created by a first record)",
+        "+            self.fa_event = torch.cuda.Event(enable_timing=False)",
+        "+            self.fa_event.record(torch.cuda.current_stream(self.device))",
+        "+            for b, q in self.verify:",
+        "+                if b in _head.FA_TACTIC_ROWS:",
+        "+                    compile_signal_event(_head.FA_TACTIC_ROWS[b], arch)",
+        "+                slots = torch.empty((1, q), dtype=torch.int32, **meta)",
+        "                 out = torch.empty(b, self.core.dim, dtype=torch.bfloat16, **meta)",
+        "-                specs = tuple(map(layout, self._tensors(caches, slots, out)))",
+        "-                self.kernels[b] = compile_head(",
+        "-                    self.core.heads, HEAD_STAGES, bf16_state, self.core.has_bias,",
+        "-                    specs, arch, self.tile, self.weight.shape[1],",
+        "-                )  # fmt: skip",
+        "-                if b in self.polled:",
+        "-                    self.polled_kernels[b] = compile_head(",
+        "-                        self.core.heads, HEAD_STAGES, bf16_state, self.core.has_bias,",
+        "-                        specs, arch, self.tile, self.weight.shape[1], True,",
+        "-                    )  # fmt: skip",
+        "-            for b, q in self.verify:",
+        "-                from .head_multi import compile_head_multi",
+        "-",
+        "-                if b in FA_TACTIC_ROWS:",
+        "-                    compile_signal(FA_TACTIC_ROWS[b], arch)",
+        "-                from .head_verify import compile_head_verify",
+        "-",
+        "-                slots = torch.empty((b // q, q), dtype=torch.int32, **meta)",
+        "-                out = torch.empty(b, self.core.dim, dtype=torch.bfloat16, **meta)",
+        "-                accepted = torch.empty((b // q,), dtype=torch.int32, **meta)",
+        "+                accepted = torch.empty((1,), dtype=torch.int32, **meta)",
+        "                 tensors = (*self._tensors(caches, slots, out), accepted)",
+        "-                specs = tuple(map(layout, tensors))",
+        "-                if b == q:",
+        "-                    self.verify_kernels[b, q] = compile_head_verify(",
+        "-                        self.core.heads, bf16_state, self.core.has_bias, specs, arch,",
+        "-                        self.tile, self.weight.shape[1], b in self.polled,",
+        "-                    )  # fmt: skip",
+        "-                else:  # several requests: KdaHeadMulti",
+        "-                    self.verify_kernels[b, q] = compile_head_multi(",
+        "-                        self.core.heads, bf16_state, self.core.has_bias, specs, arch,",
+        "-                        b // q, self.weight.shape[1], b in self.polled, tokens=q,",
+        "-                    )  # fmt: skip",
+        "+                specs = tuple(map(_host.layout, tensors))",
+        "+                self.verify_kernels[b, q] = compile_head_verify_fp32(",
+        "+                    self.core.heads,",
+        "+                    self.core.has_bias,",
+        "+                    specs,",
+        "+                    arch,",
+        "+                    self.tile,",
+        "+                    self.weight.shape[1],",
+        "+                    b in self.polled,",
+        "+                    record,",
+        "+                )",
+        "         return self"
+       ]
+      },
+      {
+       "source_file": "head.py",
+       "source_definition": "SignalGemm.__call__",
+       "source_definition_sha256": "5cc83130f45fb8020434a295f14c1b4ebbedbe5a883ef0fb1e8d56da21450a05",
+       "private_definition": "SignalGemmEvent.__call__",
+       "diff": [
+        "--- mr8/head.py:SignalGemm.__call__",
+        "+++ head_fp32.py:SignalGemmEvent.__call__",
+        "@@ -2,5 +2,11 @@",
+        "     def __call__(",
+        "-        self, a: cute.Tensor, b: cute.Tensor, c: cute.Tensor, a_map: cutlass.Int64,",
+        "-        counter: cutlass.Int64, stream: _cuda.CUstream,",
+        "-    ):  # fmt: skip",
+        "+        self,",
+        "+        a: cute.Tensor,",
+        "+        b: cute.Tensor,",
+        "+        c: cute.Tensor,",
+        "+        a_map: cutlass.Int64,",
+        "+        counter: cutlass.Int64,",
+        "+        stream: _cuda.CUstream,",
+        "+        event: _cuda.CUevent,",
+        "+    ):",
+        "         self.kernel(a, b, c, a_map, counter).launch(",
+        "@@ -16,2 +22,4 @@",
+        "             use_pdl=True,",
+        "+            programmatic_event=event,",
+        "+            programmatic_event_trigger_at_block_start=1,",
+        "         )"
+       ]
+      },
+      {
+       "source_file": "head.py",
+       "source_definition": "compile_signal",
+       "source_definition_sha256": "20c5357ffa1190e2bed478b1000f9ae0ff321641008873837a6e4b0c2f3bc375",
+       "private_definition": "compile_signal_event",
+       "diff": [
+        "--- mr8/head.py:compile_signal",
+        "+++ head_fp32.py:compile_signal_event",
+        "@@ -1,3 +1,4 @@",
+        " @cache",
+        "-def compile_signal(tactic, arch):",
+        "+def compile_signal_event(tactic, arch):",
+        "+    \"\"\"MR8's ``compile_signal`` for ``SignalGemmEvent`` (the event is a call argument).\"\"\"",
+        "     from cutlass.cute.runtime import make_fake_stream, make_fake_tensor",
+        "@@ -9,7 +10,6 @@",
+        " ",
+        "-    kernel = SignalGemm(tactic=SplitKTactic(*tactic))",
+        "+    kernel = SignalGemmEvent(tactic=_head.SplitKTactic(*tactic))",
+        "     args = (fake(1), fake(1), fake(0), cutlass.Int64(0), cutlass.Int64(0))",
+        "-    stream_arg = make_fake_stream()",
+        "     return cute.experimental.compile(",
+        "-        kernel, *args, stream_arg, options=f\"--gpu-arch={arch}\"",
+        "+        kernel, *args, make_fake_stream(), _cuda.CUevent(0), options=f\"--gpu-arch={arch}\"",
+        "     )"
+       ]
+      },
+      {
+       "source_file": "head.py",
+       "source_definition": "PreparedKdaHead.run_verify",
+       "source_definition_sha256": "b52cf1b1acfee7c8a20774bae2bd92aeb286160709143a6330317f8de1583499",
+       "private_definition": "PreparedKdaHeadFp32.run_verify",
+       "diff": [
+        "--- mr8/head.py:PreparedKdaHead.run_verify",
+        "+++ head_fp32.py:PreparedKdaHeadFp32.run_verify",
+        "@@ -1,24 +1,29 @@",
+        "     def run_verify(self, x, out, *, caches, slots, accepted, rearm=None):",
+        "-        \"\"\"``KdaHeadVerify`` of one request x q verify rows (``slots`` [1, q], vLLM's",
+        "-        spec slots; ``accepted`` [1]), or ``KdaHeadMulti`` of b // q requests;",
+        "-        ``rearm`` as ``run`` (the kernel is the polled variant when the batch is in",
+        "-        ``polled``).\"\"\"",
+        "+        \"\"\"MR8's ``PreparedKdaHead.run_verify`` (one request x q verify rows), with",
+        "+        ``SignalGemmEvent`` on the side stream and the head behind its programmatic event.\"\"\"",
+        "         b, q = x.shape[0], slots.shape[1]",
+        "-        requests = b // q",
+        "+        if b != q:",
+        "+            raise ValueError(\"PreparedKdaHeadFp32 runs one request x q verify rows only\")",
+        "         fa = self.fa_out[:b]",
+        "         counter = cutlass.Int64(self.counter.data_ptr())",
+        "-        fa_tactic = FA_TACTIC_ROWS.get(b, FA_TACTIC)",
+        "+        fa_tactic = _head.FA_TACTIC_ROWS.get(b, _head.FA_TACTIC)",
+        "         fa_code = self.fa_code",
+        "-        if fa_tactic != FA_TACTIC:",
+        "-            fa_code = compile_signal(fa_tactic, architecture(self.device))",
+        "+        if fa_tactic != _head.FA_TACTIC:",
+        "+            fa_code = compile_signal_event(fa_tactic, _host.architecture(self.device))",
+        "+        event = _cuda.CUevent(int(self.fa_event.cuda_event))",
+        "         with torch.cuda.stream(self.side.fork()):",
+        "             fa_code(",
+        "-                matrix_view(self.fa_weight), matrix_view(x),",
+        "-                matrix_view(fa, output=True), cutlass.Int64(self.fa_map.data_ptr()),",
+        "-                counter, stream(self.device),",
+        "-            )  # fmt: skip",
+        "+                _head.matrix_view(self.fa_weight),",
+        "+                _head.matrix_view(x),",
+        "+                _head.matrix_view(fa, output=True),",
+        "+                cutlass.Int64(self.fa_map.data_ptr()),",
+        "+                counter,",
+        "+                _host.stream(self.device),",
+        "+                event,",
+        "+            )",
+        "+        torch.cuda.current_stream(self.device).wait_event(self.fa_event)",
+        "         if slots.stride() != (slots.shape[1], 1):",
+        "             slots = slots.contiguous()",
+        "-        tensors = (*self._tensors(caches, slots[:requests], out), accepted[:requests])",
+        "-        views = [to_cute(t, 16) for t in tensors]",
+        "+        tensors = (*self._tensors(caches, slots[:1], out), accepted[:1])",
+        "+        views = [_host.to_cute(t, 16) for t in tensors]",
+        "         if (rearm is None) != (b not in self.polled):",
+        "@@ -28,7 +33,12 @@",
+        "         self.verify_kernels[b, q](",
+        "-            matrix_view(self.weight), matrix_view(x),",
+        "+            _head.matrix_view(self.weight),",
+        "+            _head.matrix_view(x),",
+        "             cutlass.Int64(self.map.data_ptr()),",
+        "-            *views, *self.core.scalars, counter, Int32(target),",
+        "-            cutlass.Int64(address), stream(self.device),",
+        "-        )  # fmt: skip",
+        "+            *views,",
+        "+            *self.core.scalars,",
+        "+            counter,",
+        "+            Int32(target),",
+        "+            cutlass.Int64(address),",
+        "+            _host.stream(self.device),",
+        "+        )",
+        "         return out"
+       ]
+      }
+     ],
+     "vendored_at": {
+      "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/head.py": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/kda/head.py",
+      "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/head_verify.py": "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/kda/head_verify.py"
+     }
+    }
+   }
+  },
+  "kernels/ssm/rubin_ull_kda_head_multi_fp32.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/kernels/vendor/vllm_mr8/specialized_decode/cutedsl/kda/head_multi.py",
+   "source_sha256": "b67db007a0fd78d8d3817912b824393c25b07a9d11b5f0900c84eb6d9b6866cf",
+   "import_edits": 0,
+   "local_edits": [
+    "derived, not a copy: KdaHeadMulti subclassed as KdaHeadMultiFp32 (KdaHeadMulti, KdaHeadVerifyFp32): poll_fa / rearm resolve to kernels/ssm/rubin_ull_kda_head_fp32.py's bounded waits (spin_trap sites 211 / 212); the vendored head_multi.py / head.py unchanged",
+    "compile_head_multi -> compile_head_multi_fp32: KdaHeadMultiFp32 at 2 requests x q8 (MULTI_TILE[2, 8]), bf16_state=False, polled_out=False fixed, trap_record set",
+    "PreparedKdaHead.prepare_caches -> PreparedKdaHeadMultiFp32.prepare_caches: the (16, 8) verify shape only, FP32 state only, no polled output; SignalGemm FA_TACTIC_ROWS[16] in the layer's head order (PreparedKdaHeadFp32._signal)",
+    "PreparedKdaHead.run_verify (several-requests branch) -> PreparedKdaHeadMultiFp32.run_verify: 2 x q8 only, SignalGemm on the side stream in order \"sibling\" (MR8's) or \"event\" (SignalGemmEvent + the main stream's wait), as PreparedKdaHeadFp32.run_verify"
+   ],
+   "sha256": "4c3891fee055cd6d233a810f78adc42c55d8b849790b969d6e6116f301a2a4df",
+   "upstream": {
+    "repo": "none",
+    "what": "K3.1-owned (TensorRT-LLM): the 16-row (2 x q8) fused KDA head at FP32 state (A1), derived from MR8 df90f706c5 cutedsl/kda/head_multi.py and head.py (vendored unchanged under kernels/vendor/vllm_mr8), behind ops/ssm/rubin_ull_kda_head_multi_fp32.py",
+    "derived": {
+     "mr8_commit": "df90f706c5b62178dcb26da1c2093f58cd3bc121",
+     "source_files": {
+      "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/head_multi.py": "b67db007a0fd78d8d3817912b824393c25b07a9d11b5f0900c84eb6d9b6866cf",
+      "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/head.py": "558a537d7f850ff7fd021d84418c531393ebac8af945309719887113704ae09b"
+     },
+     "status": "modified",
+     "kernel_body_changes": "the two bounded F_A waits only (KdaHeadVerifyFp32's); every other instruction KdaHeadMulti's",
+     "vendored_files_unchanged": true
+    }
+   }
+  },
+  "kernels/ssm/rubin_ull_kda_io.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/flat_kda_io.py",
+   "source_sha256": "2a8d79314fddaae0ceaab3bdbdc569f0fd9e721dd054f0fa4937dd09e7df851d",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "2a8d79314fddaae0ceaab3bdbdc569f0fd9e721dd054f0fa4937dd09e7df851d",
+   "target_path": "kernels/kda_io.py"
+  },
+  "kernels/ssm/rubin_ull_kda_kernels.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/kda/_kda_kernels.py",
+   "source_sha256": "3bb5888d47f63166db88de671da273019327976ed2d03403d8b0008ba6c3549b",
+   "import_edits": 1,
+   "local_edits": [
+    "no V1 module: _kda_decode from the sibling copy; the replay kernels, commit_kda_pending_drafts and the fused-verify sizing (is_kda_mtp_verify_available, kda_mtp_max_num_spec, kda_mtp_replay_num_spec) copied from tensorrt_llm/_torch/modules/kimi_kda/_kda_kernels.py, the commit's cache replay loading its op module by _load_commit_module",
+    "kda/cute_dsl_kimi_k3_kda_mtp_ops is rubin_ull_kda_cute_dsl_kimi_k3_kda_mtp_ops",
+    "deleted the KDA prefill dispatch (KDAKernelDispatch, fused_kda_post_conv, the in-tree prefill loader and kda_prefill_supports_state_snapshots) and the decode launcher import: the generation target never prefills and never dispatches through it"
+   ],
+   "sha256": "60d11eb86dc8b834651d1cdf3e85a1c7cf03e932e1b37a64873491dad56081d6",
+   "target_path": "kernels/kda/_kda_kernels.py"
+  },
+  "kernels/ssm/rubin_ull_kda_kimi_k3_mamba_metadata.py": {
+   "source": "tensorrt_llm/_torch/modules/kimi_kda/kimi_k3_mamba_metadata.py",
+   "source_sha256": "c6830ed63b4890bcfbc1661d791057864df2258a2ac6af657a62f92f7ecb0a44",
+   "source_rev": "5a8365f24b",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "c6830ed63b4890bcfbc1661d791057864df2258a2ac6af657a62f92f7ecb0a44",
+   "target_path": "kernels/kda/kimi_k3_mamba_metadata.py"
+  },
+  "kernels/ssm/rubin_ull_kda_mtp_decode.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/kda/kernels/kda_mtp_decode.py",
+   "source_sha256": "7a82a293ec728c1e1bdd8401a586adbc0794edd814ba5fa5a1284c48eda9d731",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "7a82a293ec728c1e1bdd8401a586adbc0794edd814ba5fa5a1284c48eda9d731",
+   "target_path": "kernels/kda/kda_mtp_decode.py"
+  },
+  "kernels/ssm/rubin_ull_kda_mtp_decode_2cta.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/kda/kernels/kda_mtp_decode_2cta.py",
+   "source_sha256": "adde9800364329b6ab1d08c30ec6fd0e596edff0ddefaf00cee46bdda32a47a5",
+   "import_edits": 3,
+   "local_edits": [],
+   "sha256": "c634a395c216035ae7597b3f67cd0feb5c7640491c356d021aeb3b204ba52fb5",
+   "target_path": "kernels/kda/kda_mtp_decode_2cta.py"
+  },
+  "kernels/ssm/rubin_ull_kda_mtp_decode_v2.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/kda/kernels/kda_mtp_decode_v2.py",
+   "source_sha256": "5ca2bd0b76bfb308b5c5e3df7dc9da89673d3620e8fab2e63dd794fceef7b433",
+   "import_edits": 3,
+   "local_edits": [],
+   "sha256": "96e6936f78fe3fd822882698b5a1f61a8a6197b7339b20042e4caebe1b006743",
+   "target_path": "kernels/kda/kda_mtp_decode_v2.py"
+  },
+  "kernels/vendor/vllm_main/specialized_decode/__init__.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_main/specialized_decode/__init__.py",
+   "source_sha256": "cff34e81ad9dd9f8e2eba2c194f3c15647e23319aaec8b9a1198de2ed2ef122b",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "9dd2caa6053152e9220428a8dee15090947435ca0af389faae96b81feed25859",
+   "target_path": "kernels/vllm_main/specialized_decode/__init__.py"
+  },
+  "kernels/vendor/vllm_main/specialized_decode/cutedsl/__init__.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_main/specialized_decode/cutedsl/__init__.py",
+   "source_sha256": "deea7cf7263b8bb1343fcb5d8aca66aff1063b8c03343945725df8f70fdae0a9",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "c799f6c485a17c76a7cfaaaa919c7bb282b829c5e551649a0f13022d79b2ab53",
+   "target_path": "kernels/vllm_main/specialized_decode/cutedsl/__init__.py"
+  },
+  "kernels/vendor/vllm_main/specialized_decode/cutedsl/common/__init__.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_main/specialized_decode/cutedsl/common/__init__.py",
+   "source_sha256": "88f54fbf1bb1ec0dff1674b523a859635917c72ff887e293118208b35758c936",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "90b369362a3b0db914f387e48776bf2d4123ff1a540770fcb493a1e4e031484f",
+   "target_path": "kernels/vllm_main/specialized_decode/cutedsl/common/__init__.py"
+  },
+  "kernels/vendor/vllm_main/specialized_decode/cutedsl/common/host.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_main/specialized_decode/cutedsl/common/host.py",
+   "source_sha256": "2d093cfb3f15113ce378871b5729ef4622b8ee9af813d6f143abc25013703014",
+   "import_edits": 2,
+   "local_edits": [],
+   "sha256": "a36082c6e621728e160b40ba2db865471c43718753a08021d63f085464409801",
+   "target_path": "kernels/vllm_main/specialized_decode/cutedsl/common/host.py"
+  },
+  "kernels/vendor/vllm_main/specialized_decode/cutedsl/common/policy.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_main/specialized_decode/cutedsl/common/policy.py",
+   "source_sha256": "e361ace068ab7cd02dac00d95d2bd2a2865fe8382a8c11cee2d9e5f86c10038b",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "17d57ae55a109e4fade862a18d52b99c7042fe124e74ce86f58c281faa296e41",
+   "target_path": "kernels/vllm_main/specialized_decode/cutedsl/common/policy.py"
+  },
+  "kernels/vendor/vllm_main/specialized_decode/cutedsl/common/primitives.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_main/specialized_decode/cutedsl/common/primitives.py",
+   "source_sha256": "032245f2475db31b8652cf04c49d4938655c9ef32719d315275909317a564762",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "e419d67167be439466d6fd0666f14f8c390411c80db5054834c3d68a512bf3d5",
+   "target_path": "kernels/vllm_main/specialized_decode/cutedsl/common/primitives.py"
+  },
+  "kernels/vendor/vllm_main/specialized_decode/cutedsl/common/spin.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_main/specialized_decode/cutedsl/common/spin.py",
+   "source_sha256": "aac1bb9b7af2a40fb5e27848697af832186c95dd7bbcfa26e72a31f2fdf8573a",
+   "import_edits": 0,
+   "local_edits": [
+    "no environment reads (target rule): SPIN_NS fixed at the served 2^26 us; TLLM_K31_FLAT_DSA_SPIN_US removed",
+    "refresh_words (TensorRT-LLM local, DcpValue batched re-poll): one predicated volatile reload of a first load, without waiting, so the reloads of several still-unpublished slots overlap before their bounded polls"
+   ],
+   "sha256": "c8ae0fcf9378fdbb7c67b5a28c12d966621d0f2bc6b884f378f8ff6f784dd27d",
+   "upstream": {
+    "repo": "none",
+    "what": "TensorRT-LLM local module (bounded polls) beside the vendored vLLM files, not from vLLM; k31_ull/k3_vllm/vllm_main/VENDOR_SOURCE.json local_modules"
+   },
+   "target_path": "kernels/vllm_main/specialized_decode/cutedsl/common/spin.py"
+  },
+  "kernels/vendor/vllm_main/specialized_decode/cutedsl/dsa/__init__.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_main/specialized_decode/cutedsl/dsa/__init__.py",
+   "source_sha256": "1e841f3b526f3637e1fbc35b9122636fe9283ee95ff5cfc5a187d32d5f37620c",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "355dfc66f30a9fb7a15e12bf19b916b3d3423eef3e4adc201bc0c138dfb76cb5",
+   "target_path": "kernels/vllm_main/specialized_decode/cutedsl/dsa/__init__.py"
+  },
+  "kernels/vendor/vllm_main/specialized_decode/cutedsl/dsa/attn_sparse.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_main/specialized_decode/cutedsl/dsa/attn_sparse.py",
+   "source_sha256": "0c8aaa5a0ff1d03e6d725292f7c5afe8bb48924820858041fc2dc67d0fd5653b",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "7569ca8421c8d8b806bd10e1d936f7afcd39d177442dac9b194e9a3908f10f24",
+   "target_path": "kernels/vllm_main/specialized_decode/cutedsl/dsa/attn_sparse.py"
+  },
+  "kernels/vendor/vllm_main/specialized_decode/cutedsl/gemm/__init__.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_main/specialized_decode/cutedsl/gemm/__init__.py",
+   "source_sha256": "3f6a2c99447c4e39d0a04aa2bca29004dda148fd78343ec8bf01c9e338cb9393",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "b9d19cc775c638930c2656aa5d3247a9c8e60cb71f4992c353df9d8b06f694f5",
+   "target_path": "kernels/vllm_main/specialized_decode/cutedsl/gemm/__init__.py"
+  },
+  "kernels/vendor/vllm_main/specialized_decode/cutedsl/gemm/warp_splitk.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_main/specialized_decode/cutedsl/gemm/warp_splitk.py",
+   "source_sha256": "6d0742872d814f0a0ecf00dab2089432038b7f492b6f3aa04185564a31338a5d",
+   "import_edits": 0,
+   "local_edits": [
+    "provenance comment: the FlashInfer release (0.7.3.dev20261030) moved here from the file"
+   ],
+   "sha256": "06879f713bafda233e92e288f4d5266eb2692e9dc5ee78c89db010d37090edf1",
+   "target_path": "kernels/vllm_main/specialized_decode/cutedsl/gemm/warp_splitk.py"
+  },
+  "kernels/vendor/vllm_main/specialized_decode/cutedsl/mla/__init__.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_main/specialized_decode/cutedsl/mla/__init__.py",
+   "source_sha256": "8c75d6593987df8aca1843fc0ea3dfd9ec8ff36c5103107be33c9a92b9702d28",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "dfb7f4aa34676e5132f126e0d7ab8ee42088a53acc4171a5ccd92c8069866788",
+   "target_path": "kernels/vllm_main/specialized_decode/cutedsl/mla/__init__.py"
+  },
+  "kernels/vendor/vllm_main/specialized_decode/cutedsl/mla/dcp.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_main/specialized_decode/cutedsl/mla/dcp.py",
+   "source_sha256": "4e037756a80bf30bcef07a066cfe4007622b6f010215931bb0923e9bea022be2",
+   "import_edits": 1,
+   "local_edits": [
+    "port of r10 fb8a3247a1 (TensorRT-LLM local change, in place): with compile_value(record=) a timed-out LSE / partial-row poll writes the K3.1 trap record (kernels/common/rubin_ull_spin_trap.py) and traps (sites 191-194); with the default record=0 the kernel is unchanged; the diff is upstream.trap_diff",
+    "DcpValue.merge_row (TensorRT-LLM local change): after the weights barrier, every polled source's still-unpublished first load is reloaded once (common.spin.refresh_words) before the polls in source order, so late sources cost one round trip together instead of one each; merge order, re-arm and the bounded-poll / trap contract unchanged (bitwise-identical output)"
+   ],
+   "sha256": "c430d8c2c6818b535a1763bd1d29d232cb8d16ff9249545d1c68145729a09f9b",
+   "upstream": {
+    "repo": "vllm-project/vllm",
+    "rev": "e3ddbdbd60f3a3e97b3c128ef94e92169a86c081",
+    "path": "vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/mla/dcp.py",
+    "sha256": "c402e4bec4838f418dc929864305c02cd4d90308e8ff9d5c33ae55c3d94ab861",
+    "modified": true,
+    "reason": "bounded mailbox polls (common.spin: globaltimer deadline, device timeout counter as a trailing kernel argument) in DcpValue's LSE / partial-row polls; kernel math unchanged; with compile_value(record=) a timed-out poll writes K3.1's kernels.spin_trap record and traps (sites 191-194)",
+    "upstream_diff": "git diff a16cff37fc 5f41da84b3 -- tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_main/specialized_decode/cutedsl/mla/dcp.py (a16cff37fc vendored upstream unmodified apart from imports and the origin line; 5f41da84b3 is the k31_ull copy above); k31_ull/k3_vllm/vllm_main/VENDOR_SOURCE.json local_changes",
+    "status": "modified",
+    "trap_diff": {
+     "base": "the TensorRT-LLM local dcp.py before the spin_trap change (r10 s5b 4c1e63cecc; this tree's copy before the port of fb8a3247a1)",
+     "why_in_place": "the three LSE polls are inline in DcpValue.merge_row / merge_projected / merge (module-level poll_words / count_late calls), so a K3.1-owned subclass would have to copy those three kernel methods (~200 lines) to change one line each, and a call-site check of the spins counter could only trap a layer later, without the lane / request / head",
+     "diff": [
+      "@@ -34,2 +34,6 @@ from ..common.policy import batch_table",
+      " from ..common.spin import count_late, poll_words",
+      "+# TensorRT-LLM local change: a timed-out poll writes K3.1's trap record and traps (trap_record).",
+      "+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k31.kernels.common import (  # noqa: E402,I001",
+      "+    rubin_ull_spin_trap as spin_trap,",
+      "+)",
+      " from ..common.primitives import (",
+      "@@ -64,2 +68,5 @@ LSE_SENT = 0xFFFFFFFF  # a NaN pattern the merge never sends",
+      " SPIN_LSE, SPIN_ROWS = 1, 2",
+      "+# TensorRT-LLM local change: K3.1 spin_trap sites (the spin-site audit's #19) of a timed-out LSE poll",
+      "+# (merge_row / merge_projected / merge) and partial-row poll (poll_pair).",
+      "+SITE_LSE_ROW, SITE_LSE_PROJECTED, SITE_LSE_MERGE, SITE_PAIR = 191, 192, 193, 194",
+      " # The LSE of an empty or invalid source: finite, so the merge never forms inf - inf.",
+      "@@ -270,2 +277,6 @@ class DcpValue:",
+      " ",
+      "+    # TensorRT-LLM local change: nonzero (kernels.spin_trap.record_address(), set by",
+      "+    # compile_value): a timed-out poll writes the trap record and traps instead of going on.",
+      "+    trap_record = 0",
+      "+",
+      "     def __init__(",
+      "@@ -461,2 +472,4 @@ class DcpValue:",
+      "                 count_late(at(args[14], SPIN_LSE), late)",
+      "+                if cutlass.const_expr(self.trap_record != 0):  # TensorRT-LLM local change",
+      "+                    spin_trap.expired(late, SITE_LSE_ROW, self.trap_record, lane, t, head)",
+      "                 store_words(source, (Uint32(LSE_SENT),))",
+      "@@ -710,2 +723,4 @@ class DcpValue:",
+      "                 count_late(at(args[14], SPIN_LSE), late)",
+      "+                if cutlass.const_expr(self.trap_record != 0):  # TensorRT-LLM local change",
+      "+                    spin_trap.expired(late, SITE_LSE_PROJECTED, self.trap_record, lane, t0 + warp, head)",
+      "                 store_words(source, (Uint32(LSE_SENT),))",
+      "@@ -798,2 +813,4 @@ class DcpValue:",
+      "                 count_late(at(args[14], SPIN_LSE), late)",
+      "+                if cutlass.const_expr(self.trap_record != 0):  # TensorRT-LLM local change",
+      "+                    spin_trap.expired(late, SITE_LSE_MERGE, self.trap_record, lane, t0 + warp, head)",
+      "                 store_words(source, (Uint32(LSE_SENT),))",
+      "@@ -879,2 +896,4 @@ class DcpValue:",
+      "         count_late(at(spins, SPIN_ROWS), late)",
+      "+        if cutlass.const_expr(self.trap_record != 0):  # TensorRT-LLM local change",
+      "+            spin_trap.expired(late, SITE_PAIR, self.trap_record)",
+      "         store_words(source, (Uint32(PAIR_SENT),) * n)",
+      "@@ -904,2 +923,3 @@ def compile_value(",
+      "     rows_per_cta=None,",
+      "+    record=0,",
+      " ):",
+      "@@ -911,3 +931,4 @@ def compile_value(",
+      "     per-row valid counts. `partials`: the format of its DcpMailbox;",
+      "-    `rows_per_cta`: DcpValue's (`pushed`).\"\"\"",
+      "+    `rows_per_cta`: DcpValue's (`pushed`). `record` (TensorRT-LLM local change): DcpValue's",
+      "+    `trap_record`.\"\"\"",
+      "     f32, i32 = torch.float32, torch.int32",
+      "@@ -942,2 +963,3 @@ def compile_value(",
+      "         )",
+      "+    value.trap_record = record  # TensorRT-LLM local change",
+      "     totals = fake((batch // q,), None, i32, 4)"
+     ],
+     "source": "r10 fb8a3247a1 (k31_ull/k3_vllm/vllm_main/VENDOR_SOURCE.json), the import line rewritten to the family layout"
+    }
+   },
+   "target_path": "kernels/vllm_main/specialized_decode/cutedsl/mla/dcp.py"
+  },
+  "kernels/vendor/vllm_main/specialized_decode/symm.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_main/specialized_decode/symm.py",
+   "source_sha256": "5342ef39aeca94a3faecc93cd437fc6e4bc43fc4c472a2cea0ca1b207bbb7134",
+   "import_edits": 2,
+   "local_edits": [],
+   "sha256": "dea026ccadf10a3f395b0811f307804f6426403e72aa17a7d9d60193e25e29ae",
+   "target_path": "kernels/vllm_main/specialized_decode/symm.py"
+  },
+  "kernels/vendor/vllm_mr8/_vllm/_custom_ops.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_shim/vllm/_custom_ops.py",
+   "source_sha256": "e04393d6e3491fefafa97cd45b5afa041554ed01d42a716370743e379d8f5769",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "7e102a2b2b843edf8da7f49be680976356db76a2d38786a8da7bb6b303aac7fd",
+   "target_path": "kernels/mr8/_vllm/_custom_ops.py"
+  },
+  "kernels/vendor/vllm_mr8/_vllm/config/__init__.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_shim/vllm/config/__init__.py",
+   "source_sha256": "e3f9ef3c8073e8ed98d05eb2bcb60556752d9d7369da77c4849afd4b340dbef5",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "0b782d650d445684deb897917127f8ff9428a405ab18055b8ce3ac1b1182d00e",
+   "target_path": "kernels/mr8/_vllm/config/__init__.py"
+  },
+  "kernels/vendor/vllm_mr8/_vllm/distributed/__init__.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_shim/vllm/distributed/__init__.py",
+   "source_sha256": "2175aa503258998225787b4226f95c2843a2da569316a7ba8e0f3b9945762f0b",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "d6362543b893ceb0cd68dddae0d6595975bdc191e4f9cfc36fd02e4e26e41f34",
+   "target_path": "kernels/mr8/_vllm/distributed/__init__.py"
+  },
+  "kernels/vendor/vllm_mr8/_vllm/envs.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_shim/vllm/envs.py",
+   "source_sha256": "148952cbd6c010989e16c75c10c88b8ac0cce8cec3d051a00cd17cf9ede867c5",
+   "import_edits": 0,
+   "local_edits": [
+    "no environment reads (target rule): the unused VLLM_CACHE_ROOT removed"
+   ],
+   "sha256": "8ec98d1cc996907bec4b9ca77a700889a45f24b08bbf83ec623e35d6da1a8f7a",
+   "target_path": "kernels/mr8/_vllm/envs.py"
+  },
+  "kernels/vendor/vllm_mr8/_vllm/logger.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_shim/vllm/logger.py",
+   "source_sha256": "752c35475ef33c7b9960f9190d5a56d69cc2345441c5d391e0bbbdedd506bfdb",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "6900d122c9c12315592772f46b2972899f7836187d637707c19578e869889d89",
+   "target_path": "kernels/mr8/_vllm/logger.py"
+  },
+  "kernels/vendor/vllm_mr8/_vllm/model_executor/__init__.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_shim/vllm/model_executor/__init__.py",
+   "source_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+   "target_path": "kernels/mr8/_vllm/model_executor/__init__.py"
+  },
+  "kernels/vendor/vllm_mr8/_vllm/model_executor/kernels/__init__.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_shim/vllm/model_executor/kernels/__init__.py",
+   "source_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+   "target_path": "kernels/mr8/_vllm/model_executor/kernels/__init__.py"
+  },
+  "kernels/vendor/vllm_mr8/_vllm/model_executor/kernels/linear/__init__.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_shim/vllm/model_executor/kernels/linear/__init__.py",
+   "source_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+   "target_path": "kernels/mr8/_vllm/model_executor/kernels/linear/__init__.py"
+  },
+  "kernels/vendor/vllm_mr8/_vllm/model_executor/kernels/linear/cute_dsl/__init__.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_shim/vllm/model_executor/kernels/linear/cute_dsl/__init__.py",
+   "source_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+   "target_path": "kernels/mr8/_vllm/model_executor/kernels/linear/cute_dsl/__init__.py"
+  },
+  "kernels/vendor/vllm_mr8/_vllm/model_executor/kernels/linear/cute_dsl/skinny_gemm.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_shim/vllm/model_executor/kernels/linear/cute_dsl/skinny_gemm.py",
+   "source_sha256": "e0a6debf0cd6564350f48737cd868d55679a006ac1332afe9eb16bb3ee2ab1a9",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "1141569a64ac6e8c630a43236e74045187a574ba0be86a6d2d95b5ec4c5da696",
+   "target_path": "kernels/mr8/_vllm/model_executor/kernels/linear/cute_dsl/skinny_gemm.py"
+  },
+  "kernels/vendor/vllm_mr8/_vllm/model_executor/layers/__init__.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_shim/vllm/model_executor/layers/__init__.py",
+   "source_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+   "target_path": "kernels/mr8/_vllm/model_executor/layers/__init__.py"
+  },
+  "kernels/vendor/vllm_mr8/_vllm/model_executor/layers/fused_moe/__init__.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_shim/vllm/model_executor/layers/fused_moe/__init__.py",
+   "source_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+   "target_path": "kernels/mr8/_vllm/model_executor/layers/fused_moe/__init__.py"
+  },
+  "kernels/vendor/vllm_mr8/_vllm/model_executor/layers/fused_moe/moe_output.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_shim/vllm/model_executor/layers/fused_moe/moe_output.py",
+   "source_sha256": "a3403d804281088605da5f356f8d996375555b50f5e78a0d66b410eec3a9143f",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "adfbe2746d8bcf7a0eedfe8844d2e14b1b51e32df246f3f8327ec8f06ac86fdd",
+   "target_path": "kernels/mr8/_vllm/model_executor/layers/fused_moe/moe_output.py"
+  },
+  "kernels/vendor/vllm_mr8/_vllm/model_executor/layers/mamba/__init__.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_shim/vllm/model_executor/layers/mamba/__init__.py",
+   "source_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+   "target_path": "kernels/mr8/_vllm/model_executor/layers/mamba/__init__.py"
+  },
+  "kernels/vendor/vllm_mr8/_vllm/model_executor/layers/mamba/mamba_utils.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_shim/vllm/model_executor/layers/mamba/mamba_utils.py",
+   "source_sha256": "34532947ed7b7fdfe939b78f18bd3cff3cb494bd39cb65955076c9bd180acfc5",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "b74bd94427c54c71f96dab48ce61d7826de8b54ae2e310e8ffac4b9ed659aa0f",
+   "target_path": "kernels/mr8/_vllm/model_executor/layers/mamba/mamba_utils.py"
+  },
+  "kernels/vendor/vllm_mr8/_vllm/platforms/__init__.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_shim/vllm/platforms/__init__.py",
+   "source_sha256": "b119bc4b614d0fc29122c860ad04d7718a6a884611aff359ba37273036a64bd9",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "7fd2badaac1d9fafa09ed79473f80426d40905b425d06753584cda5f7f82bb40",
+   "target_path": "kernels/mr8/_vllm/platforms/__init__.py"
+  },
+  "kernels/vendor/vllm_mr8/_vllm/triton_utils.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_shim/vllm/triton_utils.py",
+   "source_sha256": "7050ec2054a285e3618b94115d17b0d5a4805e7fb634c40eebaaaef9079e220a",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "8fe29e485d18a63ab9944aa134141271896a7a1dde94e286afd7e7c309f1bf9f",
+   "target_path": "kernels/mr8/_vllm/triton_utils.py"
+  },
+  "kernels/vendor/vllm_mr8/ops/__init__.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/ops/__init__.py",
+   "source_sha256": "b3acb180d92be9417ec5d3eb36f474aadd976a0642663b5bffdbbe5b715eb49f",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "9c6ecc8dd40fcb45b112b4b10252289c90ca70dbf12c0138fb588943b5a9beaa",
+   "target_path": "kernels/mr8/ops/__init__.py"
+  },
+  "kernels/vendor/vllm_mr8/ops/attn_res.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/ops/attn_res.py",
+   "source_sha256": "38c4d67cdb8366cd7b959305ddd251c6b9c9fa408e7481d3dac05ebf3b44028c",
+   "import_edits": 3,
+   "local_edits": [],
+   "sha256": "7e55f2a765535293ec084bda92b9e7fe20d06eddad2233ff2b1296fa9dc7b1c4",
+   "target_path": "kernels/mr8/ops/attn_res.py"
+  },
+  "kernels/vendor/vllm_mr8/ops/cute_dsl/__init__.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/ops/cute_dsl/__init__.py",
+   "source_sha256": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "cfae634ed4efeac443c5040e10f45d6def21808e577c188b5aac1b1efd666de6",
+   "target_path": "kernels/mr8/ops/cute_dsl/__init__.py"
+  },
+  "kernels/vendor/vllm_mr8/ops/cute_dsl/latent_moe_tail/__init__.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/ops/cute_dsl/latent_moe_tail/__init__.py",
+   "source_sha256": "4bcaf876ba15075b72d507e57874afb0634334658908872c1fce9d0a705e00cb",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "8e6e55515c9a74d64b6015f4b122bbe2ddc13a03bc93f3be68c63b11629fd149",
+   "target_path": "kernels/mr8/ops/cute_dsl/latent_moe_tail/__init__.py"
+  },
+  "kernels/vendor/vllm_mr8/ops/cute_dsl/latent_moe_tail/allreduce_rmsnorm_reduce_scatter_early_exit.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/ops/cute_dsl/latent_moe_tail/allreduce_rmsnorm_reduce_scatter_early_exit.py",
+   "source_sha256": "126dbd3736ceda0d368b1d651a4d21fc77c6db4ef874e5c2d6a472f8bc8dfd48",
+   "import_edits": 1,
+   "local_edits": [],
+   "sha256": "ee89ac60c15634f9be96b851b3d2e8ae0df45dae30e6c01349fd14a3b07cf6a3",
+   "target_path": "kernels/mr8/ops/cute_dsl/latent_moe_tail/allreduce_rmsnorm_reduce_scatter_early_exit.py"
+  },
+  "kernels/vendor/vllm_mr8/ops/cute_dsl/latent_moe_tail/fused_add_multicast_gemm.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/ops/cute_dsl/latent_moe_tail/fused_add_multicast_gemm.py",
+   "source_sha256": "e823a9aa6580385d42de9cabe19ec05935eff0cabef559376c887c158479a20c",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "e823a9aa6580385d42de9cabe19ec05935eff0cabef559376c887c158479a20c",
+   "target_path": "kernels/mr8/ops/cute_dsl/latent_moe_tail/fused_add_multicast_gemm.py"
+  },
+  "kernels/vendor/vllm_mr8/ops/cute_dsl/latent_moe_tail/fused_add_multicast_skinny_gemm.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/ops/cute_dsl/latent_moe_tail/fused_add_multicast_skinny_gemm.py",
+   "source_sha256": "5dc562a6839e4a1065cb8d87624d00f349c6789f86be3ab018416c6882e16ff6",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "3f302ba6ccc1d805beff6888bcaf1870c74fbeab64fd23c5a7444a8a8f89451a",
+   "target_path": "kernels/mr8/ops/cute_dsl/latent_moe_tail/fused_add_multicast_skinny_gemm.py"
+  },
+  "kernels/vendor/vllm_mr8/ops/cute_dsl/latent_moe_tail/lamport_copy.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/ops/cute_dsl/latent_moe_tail/lamport_copy.py",
+   "source_sha256": "0ac91077676730d9a8c7f3793116d7936c7794f8b00fc6cb46d21077fd103e98",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "764ca252f7e42baa2f6015720f97464676b2e94fcc20bd1f43522ba1b18a6edc",
+   "target_path": "kernels/mr8/ops/cute_dsl/latent_moe_tail/lamport_copy.py"
+  },
+  "kernels/vendor/vllm_mr8/ops/cute_dsl/latent_moe_tail/primitives.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/ops/cute_dsl/latent_moe_tail/primitives.py",
+   "source_sha256": "b3eb9c6e1f3e146c8d1ebe54d8b69d701bb95b00c21fff994e2cccf34db2c861",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "8c00b4e31d48071eabeda4b321e946ab6c23e874c27eac2931b513ed83b501a8",
+   "target_path": "kernels/mr8/ops/cute_dsl/latent_moe_tail/primitives.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/__init__.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/__init__.py",
+   "source_sha256": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "cfae634ed4efeac443c5040e10f45d6def21808e577c188b5aac1b1efd666de6",
+   "target_path": "kernels/mr8/specialized_decode/__init__.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/__init__.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/__init__.py",
+   "source_sha256": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "cfae634ed4efeac443c5040e10f45d6def21808e577c188b5aac1b1efd666de6",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/__init__.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/attn_res/__init__.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/attn_res/__init__.py",
+   "source_sha256": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "cfae634ed4efeac443c5040e10f45d6def21808e577c188b5aac1b1efd666de6",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/attn_res/__init__.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/attn_res/kernel.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/attn_res/kernel.py",
+   "source_sha256": "ed5c581604dad4f8d998216509cb97cd4c903eb4ae392e1dc743e79e06369497",
+   "import_edits": 2,
+   "local_edits": [],
+   "sha256": "a23dd6190b591b09a026466c01a218bb4c4a3ad5f383da5e814bcaab2450401f",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/attn_res/kernel.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/attn_res/prepared.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/attn_res/prepared.py",
+   "source_sha256": "a361c786fbb885ded05483fe54e48fe9b336878d8b944c5865a6783c8bd2105a",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "283f2e6964efb3acbba2275f9cda527e942d2e4bbc88148114d13a3f16f8aa78",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/attn_res/prepared.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/attn_res/rows.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/attn_res/rows.py",
+   "source_sha256": "a7022cc3c48895a23e1b988afb5e3cd94a2b6f47aca79c3b80f15758e2b72257",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "bf0c764d92500a5850f898ba642bc7c54bff0792776c5344c04d89b47949aa72",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/attn_res/rows.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/attn_res/sharded.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/attn_res/sharded.py",
+   "source_sha256": "47cf2ef9d10e57ccb99efdb488248570f99e16cdc3351c9a9d676073ca8d1974",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "0894112ca003d27c2ef07d3f3014c203247bf994899b7b99e256959e49be2d66",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/attn_res/sharded.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/common/__init__.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/common/__init__.py",
+   "source_sha256": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "cfae634ed4efeac443c5040e10f45d6def21808e577c188b5aac1b1efd666de6",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/common/__init__.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/common/dies.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/common/dies.py",
+   "source_sha256": "6800a8e6c219a16e32596e3fc9139c10dce914a74e977d66e6d5e79e8900d857",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "0d3a7830a686e2bd417d6b872724ebf554af67fb6f20d0484b3b3906b1253a12",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/common/dies.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/common/host.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/common/host.py",
+   "source_sha256": "09223f516860b83c3bd1357879337f1c4593c00c61ff51231d5d8e69d5d038ac",
+   "import_edits": 1,
+   "local_edits": [],
+   "sha256": "352e962f3922923261cb79de83003c8ceda06c2055bb282f0419780d25069b40",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/common/host.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/common/mailbox.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/common/mailbox.py",
+   "source_sha256": "0b74ad6c34109576e6b9814c40d3d8c52039aed3d82658a4dd81b1fd41d417e0",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "407f0ddd5cff356eea1e1c896fdb394d7e4b2bd6ced8f6b78eaaf674e156ca71",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/common/mailbox.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/common/policy.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/common/policy.py",
+   "source_sha256": "ea8aa4ff9e7af62aa9391f9fabf1ab989ba766d20c2424d95800adf922c92015",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "648ea690d947ae110479fb0caed42fd6cbfd2614aa8975b60713e51c8a358301",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/common/policy.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/common/prefetch.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/common/prefetch.py",
+   "source_sha256": "1fc41d043e57bb462e60379f1d68c2a784ac5e7a1de73b64ac2fd29bd91799cd",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "de676360f6029b49b833e0e2d1daa07ee233fb11bf05928bf7677b6ba3b29ff8",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/common/prefetch.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/common/primitives.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/common/primitives.py",
+   "source_sha256": "bb703eab616bc42462194c8a25a586e4e78540ce6909a4043a266bd76f955162",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "4de9f0482ccb08eba7f693b02bc9ec53fddf3f402fd229df81def77bc05beb91",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/common/primitives.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/common/tensormap.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/common/tensormap.py",
+   "source_sha256": "251bc446045432d7a0912f12b923e189de0064a9d52fa8d8d8cdf9f31f6b7c6f",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "440a84dcdc922e3ba99edc84981c5a396b621c49566c6d95c8375f36c1b22649",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/common/tensormap.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/common/twoshot.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/common/twoshot.py",
+   "source_sha256": "a7025cfb3d78f7fb8e67ba95cdc1b858f3b0592cc7258d32f7b9a7bc047b076d",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "bac0f5908ee9da63cb10ce90d700318fcca4b9a8fdbe99635cebc9ae8ca6ec44",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/common/twoshot.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/common/w8.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/common/w8.py",
+   "source_sha256": "9437775dbf7f18c93e299f0b1ad8f7b641ea20e20d5e41ef59e3e9def1ee670e",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "9437775dbf7f18c93e299f0b1ad8f7b641ea20e20d5e41ef59e3e9def1ee670e",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/common/w8.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/gemm/__init__.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/gemm/__init__.py",
+   "source_sha256": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "cfae634ed4efeac443c5040e10f45d6def21808e577c188b5aac1b1efd666de6",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/gemm/__init__.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/gemm/projection.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/gemm/projection.py",
+   "source_sha256": "3f1ca473d90a5b0a7fc4a8e0873da9ac6fca5bb9e83fcd9946301eb6f40e8210",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "7cb853f50bb4d0528c9f71c39fec1e702c6b190d00f55536b65f402b72f54f8e",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/gemm/projection.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/gemm/splitk.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/gemm/splitk.py",
+   "source_sha256": "fbb561b60efa814fdb90e9b28676946e69e264b7168f8f4ab4318d964850078a",
+   "import_edits": 0,
+   "local_edits": [
+    "provenance comment and docstring: the FlashInfer release (v0.7.0.post1) moved here from the file"
+   ],
+   "sha256": "37e90f5c6f6e63b6838772fd5eee0fc55adef5a9f97586eb143ab533dd0055f0",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/gemm/splitk.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/gemm/splitk_ring.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/gemm/splitk_ring.py",
+   "source_sha256": "89e5f9eaa941cf68fe445d962fc1e07f12420e15f67f48f38594cbfc890b9981",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "8cc5358f8e1b489541be8b6ad2a677de51972e626e036f39d5489ac41ca378a1",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/gemm/splitk_ring.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/gemm/splitk_situ.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/gemm/splitk_situ.py",
+   "source_sha256": "8c048c652e0cac406fd56a03bf97d154599ad8d6a99f2de517a2fbc5cd08ed93",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "27b1eb4c86276615bb0ee8c8d5d1267dd000b8ee4956626eec1e147a7eab8bda",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/gemm/splitk_situ.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/gemm/splitk_situ64.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/gemm/splitk_situ64.py",
+   "source_sha256": "7c68b184b88a9e6126d286ec9b7c7db910410bd3992b5be249a6a4f7a45c4f0a",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "f49cf1ec575050c92278b799bb13ff326756737ab0a0f3ed1564404255328017",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/gemm/splitk_situ64.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/gemm/splitk_tmem.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/gemm/splitk_tmem.py",
+   "source_sha256": "428aabc9eec23d3d4bd78b1940325c823c964e06b73790e1f24db90848a7c2cb",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "eb7ccfcabbf9967a6392fa367cc4e71c14a5393af317a77dafc461ad2e43fcfd",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/gemm/splitk_tmem.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/gemm/splitk_tmem64.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/gemm/splitk_tmem64.py",
+   "source_sha256": "5d487cb3c4f493df36a9052c2170fa92a928cc1dd560acc3c0f764a33ee6fe01",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "88e7afc418c587068e6de3bd51596ff4cfbcc7d3daa052503e2384e93bf3e686",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/gemm/splitk_tmem64.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/gemm/ws_gemm.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/gemm/ws_gemm.py",
+   "source_sha256": "5d04acca3647d033e738183e5adb01241c706e7d6e2f304869e53bb3a34f9c61",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "ee0778cff4554eb6635e81f138c086b0bd3cf180b3b9b0947f9493fbf7a034ac",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/gemm/ws_gemm.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/kda/__init__.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/__init__.py",
+   "source_sha256": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "cfae634ed4efeac443c5040e10f45d6def21808e577c188b5aac1b1efd666de6",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/kda/__init__.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/kda/head.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/head.py",
+   "source_sha256": "558a537d7f850ff7fd021d84418c531393ebac8af945309719887113704ae09b",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "89f6ec330c60a7679074235b40d13c9ed900c48efb41834f997b0f365c26a183",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/kda/head.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/kda/head_multi.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/head_multi.py",
+   "source_sha256": "b67db007a0fd78d8d3817912b824393c25b07a9d11b5f0900c84eb6d9b6866cf",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "36c55ecf49643131903ac505c47c63bccfe3fcbe80094da9a4d4bc745da27d1a",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/kda/head_multi.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/kda/head_verify.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/head_verify.py",
+   "source_sha256": "d944619e7465a2249d8d04096d52cdaeb38d84acd68d66662a4b8255be785ea7",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "0235e6616261edbcfa282c02ab14d34afad39157fb45f6045e9500c4606ef674",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/kda/head_verify.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/kda/inproj64.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/inproj64.py",
+   "source_sha256": "c264ca68fe39093526b0e5be9dcc4f5403aab62c2665cb2f7b673cbb14de1fcc",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "a6dc056ff0666de281d4e781b1046c90799a340e539ec6d853ad55b64e8c5070",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/kda/inproj64.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/kda/kernel.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/kernel.py",
+   "source_sha256": "323898118dec3e3603c14a82547cf6e32980be499af82468249933db8a1ad70d",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "7e60bdc178d6470024f73fb00a67b721053fc12e4fddf239c22a95b931215e13",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/kda/kernel.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/kda/prepared.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/prepared.py",
+   "source_sha256": "c61491c3b9ea0af552ba3966340f4e87c8b6862cf0f90e18a0a1ade8dbafbf44",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "f75b70d1edb94888a4f7f9f17f523c1b7303b00e5f5a349f91f796f84fb0d8f3",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/kda/prepared.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/kda/verify.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/verify.py",
+   "source_sha256": "a2c43a2578df3c2afcf6fd079f89816ca297deaaa632506f856291c7f42134bd",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "9050b398f8ad93b71bfd39d34da5b5fc59be1e5636e7fec3a9c3944a0761634f",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/kda/verify.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/kda/verify_stream.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/verify_stream.py",
+   "source_sha256": "83625f8c24a3e24b501d5515d31375abb4580a0f7c6483f1351aa961a30a91d2",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "b6ae806363c4759dda6ab6fb8dd60072f20e693996cb67a5af827b4d148d9fb6",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/kda/verify_stream.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/kda/verify_stream3.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/verify_stream3.py",
+   "source_sha256": "572b6ffa88a4e5d006610041a6b35321a914c70cf488d9805dc23da12e8e2eff",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "b7d30d75990fd3fd5e8d2a2a5150652e23af543787d5d6814bd787bd19c2729b",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/kda/verify_stream3.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/kda/verify_wide.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/verify_wide.py",
+   "source_sha256": "fed84fd29d5bde5e71430ec94e651d04974cc5f68da40a611fb8f31444c4c6a5",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "8211518f6b2cd50e9b6bd7c6347c11e4d8774f2a7111997e97cc895b5d73d228",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/kda/verify_wide.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/mla/__init__.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/mla/__init__.py",
+   "source_sha256": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "cfae634ed4efeac443c5040e10f45d6def21808e577c188b5aac1b1efd666de6",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/mla/__init__.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/mla/core.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/mla/core.py",
+   "source_sha256": "f30e90d497fe7ab9340ecfffca9ed7b0f36610b087ca62df0a4fb95b8b2d9794",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "3f641bd9a0fc77293ef8e86821685f7ea06e4176ddf8310293ec15feec47be10",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/mla/core.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/mla/core_p2.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/mla/core_p2.py",
+   "source_sha256": "04f57f1b041ab87e1c0965bc64db54426b4ac3080a159dafa99845f15cf3e434",
+   "import_edits": 0,
+   "local_edits": [
+    "no environment reads (target rule): P2_NR / P2_NV / DS_DEBUG / P2_EPI / DS_PRE replaced by their defaults (8, 12, none, shfl, 1)"
+   ],
+   "sha256": "892813a8730d6bd7c1e49abe75eca8ad5fb89ffc976e312ae0e26be68a050ae9",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/mla/core_p2.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/mla/core_q.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/mla/core_q.py",
+   "source_sha256": "44d13ccdf7bc242151b22aa8c048deeaa7f8fa1c939aaad25dcffd5ee0b60638",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "40529f21ff0ae69e1e20f2c1bcbf57010b4a98b76afb8d1d3e7b437f307e25cf",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/mla/core_q.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/mla/core_ts.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/mla/core_ts.py",
+   "source_sha256": "200f9c097652955668953a1884a598c8efd5448489830d1ac171d98edee9834e",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "be29a728c3a5bfb23235fa18b928bae66ca71e0c2ffdf20f6fe740b9f9dbd5ae",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/mla/core_ts.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/mla/core_umma.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/mla/core_umma.py",
+   "source_sha256": "d901fe7da19b697e3c2d82cbda5dbcc75ecb777571b18fbbf89f6c27d449af4b",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "11159bed9c66817d8961c0ea271876b542039825631bb19bb1051e6404368d6a",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/mla/core_umma.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/mla/dcp.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/mla/dcp.py",
+   "source_sha256": "0dc36c94367a0fd18912e71516a40fb3e28770e69a7d213c471ab6d93ae7ce95",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "f6e9bed45dc83dc40562e4864654b486fe3302fdeec84f60f0eece20a349ec74",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/mla/dcp.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/mla/prepared.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/mla/prepared.py",
+   "source_sha256": "4456b6ff7e8861a2c8cdaf3bd992150f77adb0969b9a8748ed3c86e5c3b632be",
+   "import_edits": 1,
+   "local_edits": [],
+   "sha256": "602b390fe33ee8f02b956031a8369efca084111f444dcc01b5e16790a42ecbe5",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/mla/prepared.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/mla/query.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/mla/query.py",
+   "source_sha256": "0602bb39d42d2db29edfae6cee0202a876584a6d96f182e5f7b63d6d225a5f19",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "961d716be28c84b0b7bbef1ea99be13d1be4481db38f75e9b6b87cdf73fe9c38",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/mla/query.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/mla/qvalid.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/mla/qvalid.py",
+   "source_sha256": "3be38295213b1abe39d4b1c44556cc528b3e7737bd4ab239bee949ea586b8664",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "08fc1925fe96f01dc3e8556e3f2f3aeeea764c9e48b84a37f5e9bf7a39c8abff",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/mla/qvalid.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/mla/rows.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/mla/rows.py",
+   "source_sha256": "c2574c7f50a7a9c13d503c4e95c2d8b8658a87a9dd6603cb893516e384cb548f",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "dbe50b7f9f0e43c68dbff3b3dbcb6bea4a308c17415187e1d130eb76dfd76900",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/mla/rows.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/mla/value.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/mla/value.py",
+   "source_sha256": "42af64b1ef354c0509834d7796cf9f032a380a9f5a5ff2234aa2268da92943c8",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "130f756bb779452cc5abb88d0184271a608904b1d21685b6d306ee86b14d3466",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/mla/value.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/mla/wlist.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/mla/wlist.py",
+   "source_sha256": "f0991de2f34f3ce500cdce57678d03781f8112fe3152a7faed1f2238406d38ca",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "6a7e844eeb8fb92c3df99dbd0a6736635f072a663a47b88dda6009cefb527f5e",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/mla/wlist.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/moe/__init__.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/__init__.py",
+   "source_sha256": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "cfae634ed4efeac443c5040e10f45d6def21808e577c188b5aac1b1efd666de6",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/moe/__init__.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/moe/experts.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/experts.py",
+   "source_sha256": "c5633071d8864f274df9e84fca18154d8570bd4238366a12a23b82fca35606dd",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "774b9c02bbf0dae6a09e5a2ac2df67f4201d3eb894ea685d10fb739f844ebf2d",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/moe/experts.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/moe/experts_rubin.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/experts_rubin.py",
+   "source_sha256": "9754094753737e3765c2352c09e919c821e55595eff2f18f530fe393756eac07",
+   "import_edits": 0,
+   "local_edits": [
+    "rearm_peers: also re-arms slot grid + cta when cta < max_grid - grid (max_grid: new constructor argument, the largest grid on the workspace; None = slots), so every fast_exchange call re-arms the peer slots of every CTA up to max_grid across grid changes; at max_grid the extra re-arm is not compiled"
+   ],
+   "sha256": "b042c9767e655c9a8ef6f958eb9eb26e19c3a916be376a3404462179b08b1d46",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/moe/experts_rubin.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/moe/experts_rubin64.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/experts_rubin64.py",
+   "source_sha256": "724001f2ef8e2309d46e7fb630dbcd1bd4ea001640bb86944e3bb1cbada63f2d",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "1f9f0b2be3a3f640c7f62ce427dc9250df33e84e706e8cb888f96838c803e0ef",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/moe/experts_rubin64.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/moe/experts_runtime.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/experts_runtime.py",
+   "source_sha256": "785570886994615d972c73ecf94c8407f638a2ec406c793f5f7f2b9de9296686",
+   "import_edits": 1,
+   "local_edits": [],
+   "sha256": "3d2528e62c6f5eb3f69042bb2182b6b08326cd855231ffa3daded4de9b29d700",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/moe/experts_runtime.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/moe/experts_vw.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/experts_vw.py",
+   "source_sha256": "f49b69919c2fee94896fcaa24099a59a8fe69740bcb18e338a44efd0449d9eda",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "ff3740bcd4b3882e2fce7221333afe10add11609965d069dfaeaa95beda40b8d",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/moe/experts_vw.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/moe/experts_wide.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/experts_wide.py",
+   "source_sha256": "6eb5f422884790837b4b38496b614ce19cc8688e779491b1214dd51be371b409",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "35c51a9d1d46dba8ea65c1fed537d449b12f128123b7571796c0130676d3f59b",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/moe/experts_wide.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/moe/front.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/front.py",
+   "source_sha256": "2b455eb7a03a68a8cdfc2fa919bf7083a45b235d9c2f9eef982ed4abf3673a89",
+   "import_edits": 1,
+   "local_edits": [
+    "the routing launch of SharedFront.route goes through the target's OpWrapper ops.moe.moe_route"
+   ],
+   "sha256": "d5de5fad61143f1ab5121682bc75095e38a930039c119377afee7d3c19de3606",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/moe/front.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/moe/front_tmem.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/front_tmem.py",
+   "source_sha256": "b41985d96be58cd8bc94c79bc0622e1957f6baded98ed310295b97e0f8fb8b6c",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "f93f6eb577d017aff083f7c8ff87dd3570d23acd96565f486af15ac6f5929ada",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/moe/front_tmem.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/moe/prepared.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/prepared.py",
+   "source_sha256": "7423a71f39d982e3af5a21459dd0386da39243afc6df736580c3ca3d822dd146",
+   "import_edits": 6,
+   "local_edits": [
+    "stock_router / stock_partials: the two function-local vllm.model_executor imports map to the vendored _vllm package like the file's other vLLM imports (fcdd030e95)"
+   ],
+   "sha256": "2a7885cce090f843481419854db8c226e1f014b9f9041b9b53ca7c3c635ffb42",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/moe/prepared.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/moe/shared.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/shared.py",
+   "source_sha256": "06fab77c585a9e99b67cd87b9d3b4578b89c532c6b52839c170917572726a6d5",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "8a402d1be47222061b5b73fb332f2ce465a613470b3bc03723dc93f9229c9da7",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/moe/shared.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/moe/tail.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/tail.py",
+   "source_sha256": "30afbbadcfad6c25113471444b36fa4779ec5dc3d4cf1ac215e2a6b48f36bc9f",
+   "import_edits": 0,
+   "local_edits": [
+    "WaveMoeTail: late_rms over two groups on the one-shot mma.sync grid (TP16, B9-16): assert widened, the late path stores x * gamma into the group tiles when not tcgen05"
+   ],
+   "sha256": "ff72a1a95ef1951efc946435fb7875e832d057576f5fc8d0cde861d1ad17bb4d",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/moe/tail.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/moe/tail_rows.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/tail_rows.py",
+   "source_sha256": "b59f35946a7c399b3029df6e899f76ecbdec944140e32a457f90e55ecdc30666",
+   "import_edits": 1,
+   "local_edits": [],
+   "sha256": "0653ba37727f5590944a7fc09e1e7959b0ec6a0c407b6239280ebe5b12e55a27",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/moe/tail_rows.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/moe/tail_runtime.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/tail_runtime.py",
+   "source_sha256": "247a9d097fee933a2ec089ef8f4ffe4cc9209010dfba907dd29cb8d10a5e048b",
+   "import_edits": 0,
+   "local_edits": [
+    "compile_tail: late_rms keyword (publish one-shot WaveMoeTail late RMS; None: RUBIN_WAVE_LATE_RMS)"
+   ],
+   "sha256": "25c57a99a653057a73b126ae79589ce63156febe057bf347f5814ee67934f6c9",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/moe/tail_runtime.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/moe/up_tmem.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/up_tmem.py",
+   "source_sha256": "250ad2a736c8563661baabca7bdf8e212b35c125eb8f29ed9e2d31f7b5ee57e3",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "549e6880b568463263c3a2cee695d4f8cd41b81e46ecff6e481309456bdacf93",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/moe/up_tmem.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/oproj/__init__.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/oproj/__init__.py",
+   "source_sha256": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "cfae634ed4efeac443c5040e10f45d6def21808e577c188b5aac1b1efd666de6",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/oproj/__init__.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/oproj/consumer.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/oproj/consumer.py",
+   "source_sha256": "c5cd8671f99151180ff983299ce000f22b7053546de650d0ce489aee5a33d22a",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "08dee3ee518e0873221951001b2d019befd9094d007b4b3d92df40aebe45515a",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/oproj/consumer.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/oproj/prepared.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/oproj/prepared.py",
+   "source_sha256": "2c2522b427aa84b7bd8b9189e56989d5c76da022ad0951f9ba007e3e7c1faf18",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "6bd5380bd7db2bde9c6bbdb38fafe5eeb87147d094d96fff476db12c6f300d66",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/oproj/prepared.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/cutedsl/oproj/producer.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/oproj/producer.py",
+   "source_sha256": "8c8b690c41e27f0d8f3b672d225fd1661bcdb471db89ec31eba916925bfe86ec",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "200aa32937a674fb91eea2c73060a0da25e82260f2e128a65a0bd2520454227c",
+   "target_path": "kernels/mr8/specialized_decode/cutedsl/oproj/producer.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/runtime/__init__.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/runtime/__init__.py",
+   "source_sha256": "0efa0642e5fd047e06f3ecbb92c74b7385ab01badfe6c1ab9f9bdc309a4a4a34",
+   "import_edits": 4,
+   "local_edits": [],
+   "sha256": "90e87ab43ddf15fe82cc75a0438f68b28508b1650fd08fb9c7ea454d3de42510",
+   "target_path": "kernels/mr8/specialized_decode/runtime/__init__.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/runtime/prefetch.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/runtime/prefetch.py",
+   "source_sha256": "d793c8024180c3fc1d2978c0e0c269f6938f40e8269303c4aafe059e2c1dc1fd",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "2c56f16a0a122a6ad04b84e6baff0b69c53f7bb8585c3e1d3b1ef1e18fdfc3ab",
+   "target_path": "kernels/mr8/specialized_decode/runtime/prefetch.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/runtime/providers.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/runtime/providers.py",
+   "source_sha256": "d5a4277af648c0892726f26e0295c430b9c3ff382507d620a8845e05cfd610cf",
+   "import_edits": 4,
+   "local_edits": [],
+   "sha256": "b32df351b42176b13578f6210712a08e36035648a2e8988eebc9df65099e9d8e",
+   "target_path": "kernels/mr8/specialized_decode/runtime/providers.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/runtime/seams.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/runtime/seams.py",
+   "source_sha256": "b5a8f47ea714eb1e4314a2c75603bd7ecbcac38119e8ca175f54c94e8ac93f31",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "668e9aca7bfc7d774d8063cfb2196cbd40f80c70e88f362ab2502faf754e5207",
+   "target_path": "kernels/mr8/specialized_decode/runtime/seams.py"
+  },
+  "kernels/vendor/vllm_mr8/specialized_decode/shapes.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/k31_ull/k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/shapes.py",
+   "source_sha256": "2a2f98334bd3f69063f3bfa18f3f485ff9b3d727aadaecf67ce30e4dfb4dc899",
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "77d749590bd7e37d4eed1cababc1e3b73bf8c4ae8a029b5995302f21e3d86d16",
+   "target_path": "kernels/mr8/specialized_decode/shapes.py"
+  },
+  "kernels/spec/rubin_ull_dflash2_helix_window.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/kernels/spec/dflash2_helix_window.py",
+   "source_commit": "145b4d27eb46ed397422b1ed979a2838e123a484",
+   "source_sha256": "42f019315e0031795bc751e82dd5c8566053fe370b195077a08a9d6ec4e7bd2a",
+   "import_edits": 0,
+   "local_edits": [
+    "source_commit is the head of tekit !11074 (draft); to be replaced by an import of the feat op once it merges",
+    "pack_helix_window: a table_rows operand; request r reads page-table row table_rows[r] (module docstring says so)",
+    "pack_helix_window: the page index widened to int64 before the pool offset (page * POOL_STRIDE wraps in int32 past 2**31 bytes)"
+   ],
+   "sha256": "af738803c003573067679c1b9b44629d688c7accf193ae6f8afc59bc506c1ad1"
+  },
+  "kernels/spec/rubin_ull_dflash2_headtp_decode.py": {
+   "source": "none",
+   "source_sha256": null,
+   "import_edits": 0,
+   "local_edits": [
+    "_partial_ranked / _ranked_merge launch with PDL: gdc_wait then gdc_launch_dependents at entry, launch_pdl=True; arithmetic unchanged",
+    "_partial_ranked splits the 512 latent columns over SPLITS CTAs (FP32 split sums, lse from split 0); _ranked_merge adds the splits in order and rounds once to BF16; launch_ranked takes a ptxas register cap (maxnreg); _ranked_merge runs over V in programs of V / vsplit columns; one split may store BF16 partials (the rounding the merge does first)"
+   ],
+   "sha256": "ff19e68784a143be643bee79c076252ddfda5467bd9b6b0053b1e8be8484920d",
+   "upstream": {
+    "repo": "none",
+    "what": "K3.1-owned (TensorRT-LLM), new in the V2 target: the head-parallel DFlash2 drafter window's Triton kernels (the fused shared-key decode and the ranked path: per helix page group partial with W_UV, log-sum-exp merge), behind ops/spec/rubin_ull_dflash2_headtp_decode.py; no r10 counterpart"
+   }
+  },
+  "kernels/spec/rubin_ull_dflash2_headtp_ring.py": {
+   "source": "none",
+   "source_sha256": null,
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "478dede81f75af287ee98b21d3c6ffdc1825dfa3b35b3b1950cab48f7c611f5d",
+   "upstream": {
+    "repo": "none",
+    "what": "K3.1-owned (TensorRT-LLM), new in the V2 target: the head-parallel drafter ring's step-targets kernel (per request the ring slot and the (page, offset) rows of the step's verify latents and block) and its first-GEN window fill (pack and scatter of every new request's window), behind ops/spec/rubin_ull_dflash2_headtp_ring.py; no r10 counterpart"
+   }
+  },
+  "kernels/ssm/rubin_ull_kda_checkpoint_seed.py": {
+   "source": "none",
+   "source_sha256": null,
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "dbc7e30282b102f27ada6a9a9fcfba25c541392c2abe917fca19fe3555ced5e7",
+   "upstream": {
+    "repo": "none",
+    "what": "K3.1-owned (TensorRT-LLM), new in the V2 target: the KDA checkpoint seed of transferred requests (checkpoint 0 and the committed conv window of every local layer, one launch), behind ops/ssm/rubin_ull_kda_dsa_cache_manager.py; no r10 counterpart"
+   }
+  },
+  "kernels/spec/rubin_ull_dflash2_conv_proj_fold.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/kernels/vendor/vllm_main/specialized_decode/cutedsl/gemm/warp_splitk.py",
+   "source_sha256": "ecc5ca87088d38f33c67452d188ad32b74406af94d15dad04f3905e686fc47b2",
+   "import_edits": 0,
+   "local_edits": [
+    "derived, not a copy: CpAsyncWarpSplitKKernel's kernel restated as ConvProjWarpSplitKKernel (the vendored module's helpers imported, the vendored file unchanged)",
+    "paired output rows: tile T row r loads / stores weight row side * taps * groups + (r % taps) * groups + (T % tiles_per_side) * (output_tile // taps) + r // taps (same per-output K order and reduction)",
+    "side-0 epilogue: the reduce warp keeps the BF16-rounded coefficients in shared memory; the 4 compute warps convolve 8 rows x 8 groups x 16 channels with dflash2_grouped_conv's FP32 order (add.rn / mul.rn, select, cvt.rn); x and base loaded before the K loop (x after a griddepcontrol.wait of the compute warps)",
+    "bias operand dropped; PDL always on"
+   ],
+   "sha256": "4e8888cf3a0306539e63190e7e8f569592e3019e6a9aae2cf065332133a02442",
+   "upstream": {
+    "repo": "none",
+    "what": "K3.1-owned (TensorRT-LLM): the DFlash2 drafter's conv kernel projection with the side-0 grouped convolution in its epilogue (N2), behind ops/spec/rubin_ull_dflash2_conv_proj_fold.py"
+   }
+  },
+  "kernels/spec/rubin_ull_dflash2_query_fold.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/kernels/vendor/vllm_main/specialized_decode/cutedsl/gemm/warp_splitk.py",
+   "source_sha256": "ecc5ca87088d38f33c67452d188ad32b74406af94d15dad04f3905e686fc47b2",
+   "import_edits": 0,
+   "local_edits": [
+    "derived, not a copy: CpAsyncWarpSplitKKernel's kernel restated as DraftQueryFoldKernel (the vendored module's helpers imported, the vendored file unchanged)",
+    "q_a RMSNorm on the K loop: each compute lane sums the squares of its B fragments (token lane // 4), two shuffles and a shared-memory exchange give each token's sum, the reduce warp scales the 4-warp sum by rsqrt(mean + eps) before rounding (the norm weight is folded into the weight by the host)",
+    "RoPE epilogue: on a head's rope tiles the reduce warp rotates adjacent-lane pairs (one shuffle) with cos / sin loaded before the K loop",
+    "one extra CTA (a warp per token) does the block latents' RMSNorm + RoPE + FP8 store with mla_norm_rope.py's arithmetic (torch-order sum of squares), after its PDL wait",
+    "activation is the [q_a | kv_a] projection, its first q_lora columns read; grid has one token tile; bias operand dropped; PDL always on"
+   ],
+   "sha256": "aee3e9140a519294b91887ad4a4b6054624910547c7c04f2ba9f3a73257520c8",
+   "upstream": {
+    "repo": "none",
+    "what": "K3.1-owned (TensorRT-LLM): the DFlash2 drafter's q_a norm + absorbed query + RoPE + block latent store in one launch (N3), behind ops/spec/rubin_ull_dflash2_query_fold.py"
+   }
+  },
+  "kernels/spec/rubin_ull_dflash2_rank_topk_walk.py": {
+   "source": "none",
+   "source_sha256": null,
+   "import_edits": 0,
+   "local_edits": [],
+   "sha256": "3e888d6f8a09e93699f9f182a50669a8fb1e28e1d22574e8505f7e53f75a0f50",
+   "upstream": {
+    "repo": "none",
+    "what": "K3.1-owned (TensorRT-LLM), new in the V2 target: the DFlash2 drafter's greedy tail under TP16 vocabulary parallelism in two kernels and one Lamport hop (RankTop32PublishKernel: shard top-32 and its multicast into every rank's Lamport buffer; SelectorWalkMcKernel: merge, TF32 bilinear scores and the selector walk, with rank 0's drafts published for the draft agreement), behind ops/spec/rubin_ull_dflash2_rank_topk_walk.py; it reuses kernels/spec/dflash2_top32.py and dflash2_selector_walk.py (imported, unchanged); no r10 counterpart"
+   }
+  },
+  "kernels/ssm/rubin_ull_kda_fold_fp32.py": {
+   "source": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k31/kernels/vendor/vllm_mr8/specialized_decode/cutedsl/kda/inproj64.py",
+   "source_sha256": "c264ca68fe39093526b0e5be9dcc4f5403aab62c2665cb2f7b673cbb14de1fcc",
+   "import_edits": 0,
+   "local_edits": [
+    "derived, not a copy: KdaInProj64 subclassed as KdaInProjFold (q8, requests 3 / 4): prefetch is MR8's with the request loads (slots / accepted / conv taps) guarded by request < requests; every other instruction KdaInProj64's",
+    "compile_inproj64 -> compile_fold: KdaInProjFold at requests x q8; PreparedKdaInProj64 -> PreparedKdaFold: specs of requests x q8 metadata with a 64-row prepared scratch, the registers check kept, run_fold = the in-projection then the prepared verify",
+    "KdaVerifyCols subclassed as KdaVerifyColsFp32: finish_fa's light poll and full looks bounded (spin_trap sites 213 / 214); every other instruction KdaVerifyCols'",
+    "prepared.executable's prepared branch -> compile_verify_cols: KdaVerifyColsFp32 at an explicit schedule (1.8.2.8: one pass, two CTAs per SM, eight-CTA clusters), FP32 state, spare 1; the vendored tables unchanged"
+   ],
+   "sha256": "7d2527be5b0efb4604b791b6e1adb47c31d9594c98bf279fe0d26d104d1ccabc",
+   "upstream": {
+    "repo": "none",
+    "what": "K3.1-owned (TensorRT-LLM): the 24 / 32-row (3 / 4 x q8) folded KDA verify pair at FP32 state, derived from MR8 df90f706c5 KDA_FOLD64 (cutedsl/kda/inproj64.py, verify.py, prepared.py; vendored unchanged under kernels/vendor/vllm_mr8), behind ops/ssm/rubin_ull_kda_fold_fp32.py",
+    "derived": {
+     "mr8_commit": "df90f706c5b62178dcb26da1c2093f58cd3bc121",
+     "source_files": {
+      "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/inproj64.py": "c264ca68fe39093526b0e5be9dcc4f5403aab62c2665cb2f7b673cbb14de1fcc",
+      "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/verify.py": "a2c43a2578df3c2afcf6fd079f89816ca297deaaa632506f856291c7f42134bd",
+      "k3_vllm/vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/prepared.py": "c61491c3b9ea0af552ba3966340f4e87c8b6862cf0f90e18a0a1ade8dbafbf44"
+     },
+     "status": "modified",
+     "kernel_body_changes": "KdaInProjFold.prefetch's request guard and KdaVerifyColsFp32.finish_fa's two bounded waits only",
+     "vendored_files_unchanged": true
+    }
+   }
+  }
+ },
+ "vendor": {
+  "mr8": {
+   "files": {
+    "__init__.py": "acedcc3710aa80c49a9678289ffdd2f295a9c3a710c9cfb84925f0184d4784a1",
+    "chain.py": "1f5e615f79fa2e065b3078a642fcd270d6b803e806a9208fe565928aa8d2ce69",
+    "fake_k3.py": "f6e8ca009d4d1afa57551ee929ef71ab3f6b7677619854ea8635e161240d847b",
+    "nv_moe.py": "352a42de402e835982617c682dfc5a6347888e7768c877759915e1f375b6f40c",
+    "routing_n1_nt.json": "c2f2d8b2b760cf04399f142014f853e68ff187a6e898687e32112deba50630d6",
+    "sources.py": "8d5999c5366c6929505af61f2d76c58721b4e1634e58bdc2786285cc2252e2a6",
+    "vllm_mr8/MR8_SHA": "9cd22e653d027b3e0fb9881a3f584b3ba6607d76ac28806b1a95b910e91d9300",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/__init__.py": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/ops/__init__.py": "b3acb180d92be9417ec5d3eb36f474aadd976a0642663b5bffdbbe5b715eb49f",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/ops/attn_res.py": "38c4d67cdb8366cd7b959305ddd251c6b9c9fa408e7481d3dac05ebf3b44028c",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/ops/cute_dsl/__init__.py": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/ops/cute_dsl/kda_skinny_gemm.py": "e8c891b8028a10dbe1b7d957a969c63e7a954592e93fa7d12161c29aab800712",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/ops/cute_dsl/latent_moe_tail/__init__.py": "4bcaf876ba15075b72d507e57874afb0634334658908872c1fce9d0a705e00cb",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/ops/cute_dsl/latent_moe_tail/allreduce_rmsnorm_reduce_scatter_early_exit.py": "126dbd3736ceda0d368b1d651a4d21fc77c6db4ef874e5c2d6a472f8bc8dfd48",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/ops/cute_dsl/latent_moe_tail/fused_add_multicast_gemm.py": "e823a9aa6580385d42de9cabe19ec05935eff0cabef559376c887c158479a20c",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/ops/cute_dsl/latent_moe_tail/fused_add_multicast_skinny_gemm.py": "5dc562a6839e4a1065cb8d87624d00f349c6789f86be3ab018416c6882e16ff6",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/ops/cute_dsl/latent_moe_tail/lamport_copy.py": "0ac91077676730d9a8c7f3793116d7936c7794f8b00fc6cb46d21077fd103e98",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/ops/cute_dsl/latent_moe_tail/primitives.py": "b3eb9c6e1f3e146c8d1ebe54d8b69d701bb95b00c21fff994e2cccf34db2c861",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/ops/fused_mla_key_concat_kv_cache.py": "3e01c9bb06f13ad2fcced4a37d773412392e953652b88d5ba7545c14bd1a5bca",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/ops/kda_segscan.py": "0470d382aba00211bf7318c255d0bd265aa2a3f0c3a880ab96e12b772f6edf3d",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/ops/latent_moe_tail.py": "3b2911f47b985354a84edc90bbda95ba7399e0dc142f30b8dddf8f22ad0efbed",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/ops/recoverssm.py": "6f45a4592f9f188cb04af44bb02d050be2279c82d1f59f3c2d9d6adf1eb844d1",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/ops/situ_and_mul.py": "e2ccf3179c5dede10d152ffd0646a6fab9080fcc51e36166a282c8edb1a4bae0",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/ops/third_party/__init__.py": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/ops/third_party/kda/__init__.py": "d99d5234f0d837ae9698f55dc1664daf902038534656b3f111fbb37b9a4e792f",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/ops/third_party/kda/chunk.py": "ab56a2e2af4257115bc3961d7aed8070e8a5203ce7255d418c2d3fb3e0f3bad4",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/ops/third_party/kda/chunk_intra.py": "9fc37cfe7455adeaa511130e2a73edeeea301145456a82907b552c0c75ad203c",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/ops/third_party/kda/chunk_intra_token_parallel.py": "90270f95f23209f96cbfba8e07976cd37890924934c2f508336f4372bae337ee",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/ops/third_party/kda/fused_recurrent.py": "b94860d4af018237f7316fe807c53ab3ab2d50e268e6b1e707d9e170f40aa214",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/ops/vision_fa4_warmup.py": "5a45c7fdfe3700a7e42baf935118e58072e52878a1126614a34b8187e2c5cbb8",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/__init__.py": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/__init__.py": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/attn_res/__init__.py": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/attn_res/kernel.py": "ed5c581604dad4f8d998216509cb97cd4c903eb4ae392e1dc743e79e06369497",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/attn_res/prepared.py": "a361c786fbb885ded05483fe54e48fe9b336878d8b944c5865a6783c8bd2105a",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/attn_res/rows.py": "a7022cc3c48895a23e1b988afb5e3cd94a2b6f47aca79c3b80f15758e2b72257",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/attn_res/sharded.py": "47cf2ef9d10e57ccb99efdb488248570f99e16cdc3351c9a9d676073ca8d1974",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/common/__init__.py": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/common/dies.py": "6800a8e6c219a16e32596e3fc9139c10dce914a74e977d66e6d5e79e8900d857",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/common/embedding.py": "947f14592df16d76f3d823458da05341788125735389515e05b416c771cb6402",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/common/graph_switch.py": "f6edd9c676289ec91802182bb0494359cae52f9ee2d8ce5e8cebd586a6d33f56",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/common/gumbel.py": "0d393c327e9973f8797689ee8fa6e912c4a710cbb22c3ea43603d55ca841a7c2",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/common/host.py": "09223f516860b83c3bd1357879337f1c4593c00c61ff51231d5d8e69d5d038ac",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/common/mailbox.py": "0b74ad6c34109576e6b9814c40d3d8c52039aed3d82658a4dd81b1fd41d417e0",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/common/policy.py": "ea8aa4ff9e7af62aa9391f9fabf1ab989ba766d20c2424d95800adf922c92015",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/common/prefetch.py": "1fc41d043e57bb462e60379f1d68c2a784ac5e7a1de73b64ac2fd29bd91799cd",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/common/primitives.py": "bb703eab616bc42462194c8a25a586e4e78540ce6909a4043a266bd76f955162",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/common/tensormap.py": "251bc446045432d7a0912f12b923e189de0064a9d52fa8d8d8cdf9f31f6b7c6f",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/common/twoshot.py": "a7025cfb3d78f7fb8e67ba95cdc1b858f3b0592cc7258d32f7b9a7bc047b076d",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/common/w8.py": "9437775dbf7f18c93e299f0b1ad8f7b641ea20e20d5e41ef59e3e9def1ee670e",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/draft/__init__.py": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/draft/allreduce.py": "fb8309423859676fbc038f0909612a9cd09302df207eccb21c50253bad0bc4e1",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/draft/attention.py": "15207d624c0a587af4a0c273c7367a03504bb113b60d0057c55559040868266f",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/draft/context.py": "bd3240c2b253f1c60addf43b8078c1e11135b473599399fb947163c2e9f221ae",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/draft/markov.py": "5491e3b61f26cb68c339cd9698a49332823bfedc7fb358f172e6ef248075a333",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/draft/markov_wide.py": "110ec3af9d4482430998d2eddb2584c30c1e145c145161e122e4cbf416c6f2d8",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/draft/producer.py": "edc699f67a90a6afb8a5859f03ee38658fc45b9ae6cdd6d8c963f5a40bb0769b",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/gemm/__init__.py": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/gemm/projection.py": "3f1ca473d90a5b0a7fc4a8e0873da9ac6fca5bb9e83fcd9946301eb6f40e8210",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/gemm/splitk.py": "fbb561b60efa814fdb90e9b28676946e69e264b7168f8f4ab4318d964850078a",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/gemm/splitk_ring.py": "89e5f9eaa941cf68fe445d962fc1e07f12420e15f67f48f38594cbfc890b9981",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/gemm/splitk_situ.py": "8c048c652e0cac406fd56a03bf97d154599ad8d6a99f2de517a2fbc5cd08ed93",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/gemm/splitk_situ64.py": "7c68b184b88a9e6126d286ec9b7c7db910410bd3992b5be249a6a4f7a45c4f0a",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/gemm/splitk_tmem.py": "428aabc9eec23d3d4bd78b1940325c823c964e06b73790e1f24db90848a7c2cb",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/gemm/splitk_tmem64.py": "5d487cb3c4f493df36a9052c2170fa92a928cc1dd560acc3c0f764a33ee6fe01",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/gemm/ws_gemm.py": "5d04acca3647d033e738183e5adb01241c706e7d6e2f304869e53bb3a34f9c61",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/__init__.py": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/head.py": "558a537d7f850ff7fd021d84418c531393ebac8af945309719887113704ae09b",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/head_multi.py": "b67db007a0fd78d8d3817912b824393c25b07a9d11b5f0900c84eb6d9b6866cf",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/head_verify.py": "d944619e7465a2249d8d04096d52cdaeb38d84acd68d66662a4b8255be785ea7",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/inproj64.py": "c264ca68fe39093526b0e5be9dcc4f5403aab62c2665cb2f7b673cbb14de1fcc",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/kernel.py": "323898118dec3e3603c14a82547cf6e32980be499af82468249933db8a1ad70d",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/prepared.py": "c61491c3b9ea0af552ba3966340f4e87c8b6862cf0f90e18a0a1ade8dbafbf44",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/verify.py": "a2c43a2578df3c2afcf6fd079f89816ca297deaaa632506f856291c7f42134bd",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/verify_stream.py": "83625f8c24a3e24b501d5515d31375abb4580a0f7c6483f1351aa961a30a91d2",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/verify_stream3.py": "572b6ffa88a4e5d006610041a6b35321a914c70cf488d9805dc23da12e8e2eff",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/verify_wide.py": "fed84fd29d5bde5e71430ec94e651d04974cc5f68da40a611fb8f31444c4c6a5",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/mla/__init__.py": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/mla/core.py": "f30e90d497fe7ab9340ecfffca9ed7b0f36610b087ca62df0a4fb95b8b2d9794",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/mla/core_p2.py": "04f57f1b041ab87e1c0965bc64db54426b4ac3080a159dafa99845f15cf3e434",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/mla/core_q.py": "44d13ccdf7bc242151b22aa8c048deeaa7f8fa1c939aaad25dcffd5ee0b60638",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/mla/core_ts.py": "200f9c097652955668953a1884a598c8efd5448489830d1ac171d98edee9834e",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/mla/core_umma.py": "d901fe7da19b697e3c2d82cbda5dbcc75ecb777571b18fbbf89f6c27d449af4b",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/mla/dcp.py": "0dc36c94367a0fd18912e71516a40fb3e28770e69a7d213c471ab6d93ae7ce95",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/mla/prepared.py": "4456b6ff7e8861a2c8cdaf3bd992150f77adb0969b9a8748ed3c86e5c3b632be",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/mla/query.py": "0602bb39d42d2db29edfae6cee0202a876584a6d96f182e5f7b63d6d225a5f19",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/mla/qvalid.py": "3be38295213b1abe39d4b1c44556cc528b3e7737bd4ab239bee949ea586b8664",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/mla/rows.py": "c2574c7f50a7a9c13d503c4e95c2d8b8658a87a9dd6603cb893516e384cb548f",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/mla/value.py": "42af64b1ef354c0509834d7796cf9f032a380a9f5a5ff2234aa2268da92943c8",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/mla/wlist.py": "f0991de2f34f3ce500cdce57678d03781f8112fe3152a7faed1f2238406d38ca",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/__init__.py": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/dense.py": "1810aa152bddb94a9c6bf4d78062cd057e4a22bf120c56877e9dca9906a0dcdf",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/experts.py": "c5633071d8864f274df9e84fca18154d8570bd4238366a12a23b82fca35606dd",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/experts_rubin.py": "9754094753737e3765c2352c09e919c821e55595eff2f18f530fe393756eac07",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/experts_rubin64.py": "724001f2ef8e2309d46e7fb630dbcd1bd4ea001640bb86944e3bb1cbada63f2d",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/experts_runtime.py": "785570886994615d972c73ecf94c8407f638a2ec406c793f5f7f2b9de9296686",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/experts_vw.py": "f49b69919c2fee94896fcaa24099a59a8fe69740bcb18e338a44efd0449d9eda",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/experts_wide.py": "6eb5f422884790837b4b38496b614ce19cc8688e779491b1214dd51be371b409",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/front.py": "2b455eb7a03a68a8cdfc2fa919bf7083a45b235d9c2f9eef982ed4abf3673a89",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/front_rows.py": "723b4b6bd3343803fee88ad608d159a8fd22534775cc60dc574785ee18b583f8",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/front_tmem.py": "b41985d96be58cd8bc94c79bc0622e1957f6baded98ed310295b97e0f8fb8b6c",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/prepared.py": "7423a71f39d982e3af5a21459dd0386da39243afc6df736580c3ca3d822dd146",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/routing.py": "1e56ace96e3ed012032923e3c8e4b6ffec524f80fdbdfb6e95c9843f7c172ed1",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/shared.py": "06fab77c585a9e99b67cd87b9d3b4578b89c532c6b52839c170917572726a6d5",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/small_batch/__init__.py": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/small_batch/chain.py": "6f16c87b43ebe88869c46f93a7ab972f3ea80effe1c0782b2847b03ab2eed83c",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/small_batch/experts.py": "40ef681004a0295d4508b18d8aa46b6fa2c04f8da0ea9f054f3e67b1ca8fd8aa",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/small_batch/front_tp16.py": "b25ae13012fcd1a532ed6885ceefc353fd89604622769673876f886cca429eae",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/small_batch/front_tp8.py": "c9c1b5ba5dd3b4299494b45b47a23ec43ba3dca753d3c25fa88c502da523ef12",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/stock_experts.py": "cd8acf3f5c400bab9900253151f18c794ebeb70be50ca8433c517f975d5b0af5",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/tail.py": "30afbbadcfad6c25113471444b36fa4779ec5dc3d4cf1ac215e2a6b48f36bc9f",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/tail_rows.py": "b59f35946a7c399b3029df6e899f76ecbdec944140e32a457f90e55ecdc30666",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/tail_runtime.py": "247a9d097fee933a2ec089ef8f4ffe4cc9209010dfba907dd29cb8d10a5e048b",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/up_tmem.py": "250ad2a736c8563661baabca7bdf8e212b35c125eb8f29ed9e2d31f7b5ee57e3",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/oproj/__init__.py": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/oproj/consumer.py": "c5cd8671f99151180ff983299ce000f22b7053546de650d0ce489aee5a33d22a",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/oproj/prepared.py": "2c2522b427aa84b7bd8b9189e56989d5c76da022ad0951f9ba007e3e7c1faf18",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/oproj/producer.py": "8c8b690c41e27f0d8f3b672d225fd1661bcdb471db89ec31eba916925bfe86ec",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/verify/__init__.py": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/verify/argmax.py": "d31849e97a9da016443fd11a4357d53e8d97a2ae248b5aeb84b498e1f5671848",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/verify/exchange.py": "fff44f85d6395393d3ac2d4cdbf19c9b4c9b74f648939f936ad8931ec36e1f59",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/verify/lmhead.py": "0041995a224e7114433f6b0810574f5a1127d748a3129b4d3635ce7d0035fdbd",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/runtime/__init__.py": "0efa0642e5fd047e06f3ecbb92c74b7385ab01badfe6c1ab9f9bdc309a4a4a34",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/runtime/decode.py": "c4e001c9db0eec6ce328ecbda4d237bdaac41c653db6fe44d8a1bfc18d53fd9a",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/runtime/draft.py": "c19aa2c754c16ecd9651be483c3f715a5442e2d411b81805981aaf8d2031f8dd",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/runtime/prefetch.py": "d793c8024180c3fc1d2978c0e0c269f6938f40e8269303c4aafe059e2c1dc1fd",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/runtime/providers.py": "d5a4277af648c0892726f26e0295c430b9c3ff382507d620a8845e05cfd610cf",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/runtime/sampled_verify.py": "1e7ae925bc4aee4e88a4415ee182a37fe203ea690c66e32e66ad6f881ae8c912",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/runtime/seams.py": "b5a8f47ea714eb1e4314a2c75603bd7ecbcac38119e8ca175f54c94e8ac93f31",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/runtime/verify.py": "b7a57bc0fcb5fea3e7e626bc2666ab667ededf1103acf6a838bae08f45e619da",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/runtime/warmup.py": "309a7228c8ec9a62273d78cfbe4c650d9b842c960bc53c4021eb95a93f238c2a",
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/shapes.py": "2a2f98334bd3f69063f3bfa18f3f485ff9b3d727aadaecf67ce30e4dfb4dc899",
+    "vllm_shim/vllm/README": "d7f7d79519e2f9af8078b4295831608faeab3072b0007f592cd02f737cb1a72d",
+    "vllm_shim/vllm/_custom_ops.py": "e04393d6e3491fefafa97cd45b5afa041554ed01d42a716370743e379d8f5769",
+    "vllm_shim/vllm/config/__init__.py": "e3f9ef3c8073e8ed98d05eb2bcb60556752d9d7369da77c4849afd4b340dbef5",
+    "vllm_shim/vllm/distributed/__init__.py": "2175aa503258998225787b4226f95c2843a2da569316a7ba8e0f3b9945762f0b",
+    "vllm_shim/vllm/envs.py": "148952cbd6c010989e16c75c10c88b8ac0cce8cec3d051a00cd17cf9ede867c5",
+    "vllm_shim/vllm/forward_context.py": "1abcd710d4ac3bdd9b4b03a414232646df3969c4b3e03cebdf351cd0d86cac46",
+    "vllm_shim/vllm/logger.py": "752c35475ef33c7b9960f9190d5a56d69cc2345441c5d391e0bbbdedd506bfdb",
+    "vllm_shim/vllm/model_executor/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "vllm_shim/vllm/model_executor/kernels/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "vllm_shim/vllm/model_executor/kernels/linear/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "vllm_shim/vllm/model_executor/kernels/linear/cute_dsl/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "vllm_shim/vllm/model_executor/kernels/linear/cute_dsl/skinny_gemm.py": "e0a6debf0cd6564350f48737cd868d55679a006ac1332afe9eb16bb3ee2ab1a9",
+    "vllm_shim/vllm/model_executor/layers/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "vllm_shim/vllm/model_executor/layers/fused_moe/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "vllm_shim/vllm/model_executor/layers/fused_moe/moe_output.py": "a3403d804281088605da5f356f8d996375555b50f5e78a0d66b410eec3a9143f",
+    "vllm_shim/vllm/model_executor/layers/mamba/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "vllm_shim/vllm/model_executor/layers/mamba/mamba_utils.py": "34532947ed7b7fdfe939b78f18bd3cff3cb494bd39cb65955076c9bd180acfc5",
+    "vllm_shim/vllm/model_executor/warmup/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "vllm_shim/vllm/model_executor/warmup/cutedsl_warmup.py": "22769791afceb635216d8edc053b22d1f66cdaee565afe8e9d35aa42f1d551ed",
+    "vllm_shim/vllm/platforms/__init__.py": "b119bc4b614d0fc29122c860ad04d7718a6a884611aff359ba37273036a64bd9",
+    "vllm_shim/vllm/triton_utils.py": "7050ec2054a285e3618b94115d17b0d5a4805e7fb634c40eebaaaef9079e220a",
+    "vllm_shim/vllm/utils/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "vllm_shim/vllm/utils/math_utils.py": "56f556b45c8a2f34fb9911e91841154e5e8c8c008e06f43056146f136d7b68ee"
+   },
+   "local_changes": {
+    "nv_moe.py": {
+     "reason": "Private native NVFP4 kernels; single publish-ordered resident weight bank with direct-output activation gather; host paths only",
+     "source_sha256": "1ab3707d11ff505c93de4f0073e85607241995dd97f95581aa11f1ba62d59c80"
+    },
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/common/w8.py": {
+     "reason": "K3.1 W8A16: new TensorRT-LLM local module (W8A16 weight layout, E4M3 x UE8M0 -> BF16 conversion, staging helpers)",
+     "source_sha256": null
+    },
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/gemm/projection.py": {
+     "reason": "K3.1 W8A16: PreparedProjection accepts a common.w8 weight (E4M3 codes + UE8M0 scales) and runs the W8A16 SplitKGemm; BF16 path unchanged",
+     "source_sha256": "2e44fe4af6adeb81a21cb524fccfb64983e8bc7f642ddf7ac96e6f3c075100f4"
+    },
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/gemm/splitk.py": {
+     "reason": "K3.1 W8A16: SplitKGemm W8A16 variant (FP8 staging ring, converter groups writing the swizzled BF16 A tile; same MMAs, K order and split-K sums); BF16 path unchanged",
+     "source_sha256": "b4455dc9bb543dbdfb0dd6bd73e345681aaf733cce707fd966e0f52c6a2efae9"
+    },
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/kda/head.py": {
+     "reason": "POLLED_OUT comment: the RouteSitu exception now holds by RouteSitu's own wait; code unchanged",
+     "source_sha256": "889b9e91909aeeff292a65a6cfb33e69e5ab4b20f82e33fccac3bbf849b07687"
+    },
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/front.py": {
+     "reason": "Host-only native K3.1 MXFP8 shared provider, completion ordering and local BF16 up shard; RouteSitu: one thread waits (griddepcontrol.wait) before exiting where no role waits (lean polled route + copy, 9-64 rows), restoring MR8's own transitive-completion invariant; other kernel bodies unchanged",
+     "source_sha256": "5cd0defdb24e685ddca87e0765056e69d4696a27f4583bc34ad2832c57f9a1f0"
+    },
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/prepared.py": {
+     "reason": "Host-only native K3.1 MXFP8 shared provider, completion ordering and local BF16 up shard; kernel bodies unchanged",
+     "source_sha256": "73e79e31838aed2b40c404e4812fcd40fc6ccdabf14a3e5f1a838445a9d5ee32"
+    },
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/tail_runtime.py": {
+     "reason": "Host-only native K3.1 MXFP8 shared provider, completion ordering and local BF16 up shard; kernel bodies unchanged",
+     "source_sha256": "fcc62c8e1dc5dc1ac382162904812a7c538c306c4fd4ca9fb192c26409059c4e"
+    },
+    "vllm_mr8/vllm/models/kimi_k3/nvidia/specialized_decode/runtime/prefetch.py": {
+     "reason": "K3.1 flat chain L2 prefetch: PrefetchController(wide=) selects the WIDE tables explicitly (None: by SM count, unchanged), and attention_weights takes an owner's own prefetch_weights list; tables and kernel unchanged",
+     "source_sha256": "5bbaabd605381ba1170e12ef2ca3f686ab5aae3a80dd5f64445f964e6102d9a1"
+    }
+   },
+   "mr8_commit": "df90f706c5",
+   "source_commit": "6904cd9672402ece66a0bca11abdd1830884123a",
+   "source_prefix": "tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k3_vl/k3_vllm/"
+  },
+  "vllm_main": {
+   "files": {
+    "specialized_decode/__init__.py": "9dd2caa6053152e9220428a8dee15090947435ca0af389faae96b81feed25859",
+    "specialized_decode/cutedsl/__init__.py": "c799f6c485a17c76a7cfaaaa919c7bb282b829c5e551649a0f13022d79b2ab53",
+    "specialized_decode/cutedsl/common/__init__.py": "90b369362a3b0db914f387e48776bf2d4123ff1a540770fcb493a1e4e031484f",
+    "specialized_decode/cutedsl/common/host.py": "2d093cfb3f15113ce378871b5729ef4622b8ee9af813d6f143abc25013703014",
+    "specialized_decode/cutedsl/common/policy.py": "17d57ae55a109e4fade862a18d52b99c7042fe124e74ce86f58c281faa296e41",
+    "specialized_decode/cutedsl/common/primitives.py": "e419d67167be439466d6fd0666f14f8c390411c80db5054834c3d68a512bf3d5",
+    "specialized_decode/cutedsl/dsa/__init__.py": "355dfc66f30a9fb7a15e12bf19b916b3d3423eef3e4adc201bc0c138dfb76cb5",
+    "specialized_decode/cutedsl/dsa/attn_sparse.py": "7569ca8421c8d8b806bd10e1d936f7afcd39d177442dac9b194e9a3908f10f24",
+    "specialized_decode/cutedsl/gemm/__init__.py": "b9d19cc775c638930c2656aa5d3247a9c8e60cb71f4992c353df9d8b06f694f5",
+    "specialized_decode/cutedsl/gemm/decode.py": "b0ea2a3ae0241cd7347a96ed2eb7731991d6981d754916991a73612c88130af4",
+    "specialized_decode/cutedsl/gemm/warp_splitk.py": "6d0742872d814f0a0ecf00dab2089432038b7f492b6f3aa04185564a31338a5d",
+    "specialized_decode/cutedsl/mla/__init__.py": "dfb7f4aa34676e5132f126e0d7ab8ee42088a53acc4171a5ccd92c8069866788",
+    "specialized_decode/cutedsl/mla/dcp.py": "4e037756a80bf30bcef07a066cfe4007622b6f010215931bb0923e9bea022be2",
+    "specialized_decode/symm.py": "5342ef39aeca94a3faecc93cd437fc6e4bc43fc4c472a2cea0ca1b207bbb7134"
+   },
+   "local_changes": {
+    "specialized_decode/cutedsl/common/host.py": {
+     "reason": "to_cute from the vendored MR8 tree (vLLM main's moe_tail_fusion not vendored)",
+     "source_sha256": "d3b0acdbb14adef5e77733c357339328e4b1cd7358c382a0ef59a22dd485f70c"
+    },
+    "specialized_decode/cutedsl/gemm/decode.py": {
+     "reason": "PreparedProjection (the cluster split-K SplitKGemm) from the vendored MR8 tree, whose BF16 path is vLLM main's splitk.py (vLLM main's projection.py / splitk.py not vendored)",
+     "source_sha256": "07a630a2de08a717992962a91c224622eecae930656d4252d433c907eb16508d"
+    },
+    "specialized_decode/cutedsl/mla/dcp.py": {
+     "reason": "bounded mailbox polls (common.spin: globaltimer deadline, device timeout counter as a trailing kernel argument) in DcpValue's LSE / partial-row polls; kernel math unchanged; with compile_value(record=) a timed-out poll writes K3.1's kernels.spin_trap record and traps (sites 191-194)",
+     "source_sha256": "c402e4bec4838f418dc929864305c02cd4d90308e8ff9d5c33ae55c3d94ab861",
+     "status": "modified",
+     "trap_diff": {
+      "base": "the TensorRT-LLM local dcp.py before the spin_trap change (r10 s5b 4c1e63cecc; this tree's copy before the port of fb8a3247a1)",
+      "why_in_place": "the three LSE polls are inline in DcpValue.merge_row / merge_projected / merge (module-level poll_words / count_late calls), so a K3.1-owned subclass would have to copy those three kernel methods (~200 lines) to change one line each, and a call-site check of the spins counter could only trap a layer later, without the lane / request / head",
+      "diff": [
+       "@@ -34,2 +34,6 @@ from ..common.policy import batch_table",
+       " from ..common.spin import count_late, poll_words",
+       "+# TensorRT-LLM local change: a timed-out poll writes K3.1's trap record and traps (trap_record).",
+       "+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k31.kernels.common import (  # noqa: E402,I001",
+       "+    rubin_ull_spin_trap as spin_trap,",
+       "+)",
+       " from ..common.primitives import (",
+       "@@ -64,2 +68,5 @@ LSE_SENT = 0xFFFFFFFF  # a NaN pattern the merge never sends",
+       " SPIN_LSE, SPIN_ROWS = 1, 2",
+       "+# TensorRT-LLM local change: K3.1 spin_trap sites (the spin-site audit's #19) of a timed-out LSE poll",
+       "+# (merge_row / merge_projected / merge) and partial-row poll (poll_pair).",
+       "+SITE_LSE_ROW, SITE_LSE_PROJECTED, SITE_LSE_MERGE, SITE_PAIR = 191, 192, 193, 194",
+       " # The LSE of an empty or invalid source: finite, so the merge never forms inf - inf.",
+       "@@ -270,2 +277,6 @@ class DcpValue:",
+       " ",
+       "+    # TensorRT-LLM local change: nonzero (kernels.spin_trap.record_address(), set by",
+       "+    # compile_value): a timed-out poll writes the trap record and traps instead of going on.",
+       "+    trap_record = 0",
+       "+",
+       "     def __init__(",
+       "@@ -461,2 +472,4 @@ class DcpValue:",
+       "                 count_late(at(args[14], SPIN_LSE), late)",
+       "+                if cutlass.const_expr(self.trap_record != 0):  # TensorRT-LLM local change",
+       "+                    spin_trap.expired(late, SITE_LSE_ROW, self.trap_record, lane, t, head)",
+       "                 store_words(source, (Uint32(LSE_SENT),))",
+       "@@ -710,2 +723,4 @@ class DcpValue:",
+       "                 count_late(at(args[14], SPIN_LSE), late)",
+       "+                if cutlass.const_expr(self.trap_record != 0):  # TensorRT-LLM local change",
+       "+                    spin_trap.expired(late, SITE_LSE_PROJECTED, self.trap_record, lane, t0 + warp, head)",
+       "                 store_words(source, (Uint32(LSE_SENT),))",
+       "@@ -798,2 +813,4 @@ class DcpValue:",
+       "                 count_late(at(args[14], SPIN_LSE), late)",
+       "+                if cutlass.const_expr(self.trap_record != 0):  # TensorRT-LLM local change",
+       "+                    spin_trap.expired(late, SITE_LSE_MERGE, self.trap_record, lane, t0 + warp, head)",
+       "                 store_words(source, (Uint32(LSE_SENT),))",
+       "@@ -879,2 +896,4 @@ class DcpValue:",
+       "         count_late(at(spins, SPIN_ROWS), late)",
+       "+        if cutlass.const_expr(self.trap_record != 0):  # TensorRT-LLM local change",
+       "+            spin_trap.expired(late, SITE_PAIR, self.trap_record)",
+       "         store_words(source, (Uint32(PAIR_SENT),) * n)",
+       "@@ -904,2 +923,3 @@ def compile_value(",
+       "     rows_per_cta=None,",
+       "+    record=0,",
+       " ):",
+       "@@ -911,3 +931,4 @@ def compile_value(",
+       "     per-row valid counts. `partials`: the format of its DcpMailbox;",
+       "-    `rows_per_cta`: DcpValue's (`pushed`).\"\"\"",
+       "+    `rows_per_cta`: DcpValue's (`pushed`). `record` (TensorRT-LLM local change): DcpValue's",
+       "+    `trap_record`.\"\"\"",
+       "     f32, i32 = torch.float32, torch.int32",
+       "@@ -942,2 +963,3 @@ def compile_value(",
+       "         )",
+       "+    value.trap_record = record  # TensorRT-LLM local change",
+       "     totals = fake((batch // q,), None, i32, 4)"
+      ],
+      "source": "r10 fb8a3247a1 (k31_ull/k3_vllm/vllm_main/VENDOR_SOURCE.json), the import line rewritten to the family layout"
+     }
+    }
+   },
+   "local_modules": {
+    "specialized_decode/cutedsl/common/spin.py": "TensorRT-LLM local module (bounded polls)"
+   },
+   "origin_line": "one '# Origin: vLLM <commit>, <path> (Apache-2.0); ...' line after the SPDX header",
+   "source": "vllm",
+   "source_commit": "e3ddbdbd60f3a3e97b3c128ef94e92169a86c081",
+   "source_prefix": "vllm/models/kimi_k3/nvidia/specialized_decode/"
+  }
+ }
+}

@@ -20,6 +20,7 @@ from __future__ import annotations
 import ast
 import re
 import sys
+from importlib.util import resolve_name
 from pathlib import Path
 
 import pytest
@@ -118,26 +119,115 @@ def test_every_target_ships_both_products():
                 assert (target_dir / product).is_file(), f"{name}: missing {product}"
 
 
+def _is_entry_module(module: str, target_dir: Path) -> bool:
+    family = f"{_modeling_v2.__name__}.models.{target_dir.parent.name}"
+    roots = (
+        f"{_modeling_v2.__name__}.catalog",
+        f"{_modeling_v2.__name__}._native",
+        f"{family}.ops",
+        f"{family}.{target_dir.name}.ops",
+    )
+    return any(module == root or module.startswith(root + ".") for root in roots)
+
+
+def _is_family_support_module(module: str, target_dir: Path) -> bool:
+    family = f"{_modeling_v2.__name__}.models.{target_dir.parent.name}."
+    if not module.startswith(family):
+        return False
+    name = module[len(family) :].split(".", 1)[0]
+    return not (target_dir.parent / name).is_dir() and (target_dir.parent / f"{name}.py").is_file()
+
+
 def test_targets_do_not_share_files():
     """Isolation is the property being demonstrated; measure it.
 
-    Targets are allowed to import the catalog and nothing else of each
-    other's. A shared helper between two targets is the first step back to
-    the abstraction this package exists to avoid.
+    A target imports model code only from itself, from the operations it may call (the shared catalog, the
+    family's ``ops/`` and its own ``ops/``), from the family's kernels and from family support modules. A helper
+    shared with a sibling target is the first step back to the abstraction this package exists to avoid.
     """
     for arch in _ARCHS:
         for target_dir, name in _routed_targets(arch):
-            for source_file in target_dir.glob("*.py"):
-                text = source_file.read_text()
-                for match in re.finditer(r"^from (\.+)([\w.]*) import", text, re.MULTILINE):
-                    dots, tail = match.group(1), match.group(2)
-                    if len(dots) == 1:
-                        continue  # sibling within the target
-                    assert tail.startswith("catalog"), (
-                        f"{name}: {source_file.name} reaches outside its own "
-                        f"directory for {tail!r}; targets may import the "
-                        f"catalog and nothing else"
-                    )
+            own_target = (
+                f"{_modeling_v2.__name__}.models.{target_dir.parent.name}.{target_dir.name}"
+            )
+            family_kernels = f"{_modeling_v2.__name__}.models.{target_dir.parent.name}.kernels"
+            for source_file in target_dir.rglob("*.py"):
+                package = ".".join(
+                    (_modeling_v2.__name__, *source_file.parent.relative_to(_ROOT).parts)
+                )
+                for node in ast.walk(ast.parse(source_file.read_text())):
+                    if isinstance(node, ast.Import):
+                        modules = [alias.name for alias in node.names]
+                        relative = False
+                    elif isinstance(node, ast.ImportFrom):
+                        module = resolve_name("." * node.level + (node.module or ""), package)
+                        modules = [f"{module}.{alias.name}" for alias in node.names]
+                        relative = node.level > 0
+                    else:
+                        continue
+                    for module in modules:
+                        if not relative and not module.startswith(
+                            f"{_modeling_v2.__name__}.models."
+                        ):
+                            continue
+                        assert (
+                            module == own_target
+                            or module.startswith(own_target + ".")
+                            or _is_entry_module(module, target_dir)
+                            or _is_family_support_module(module, target_dir)
+                            or module == family_kernels
+                            or module.startswith(family_kernels + ".")
+                        ), (
+                            f"{name}: {source_file.relative_to(target_dir)} imports non-owned model code {module}"
+                        )
+
+
+@pytest.mark.parametrize(
+    "source_file, statement, accepted",
+    [
+        ("modeling.py", "from .ops.attention.entry import op", True),
+        ("modeling.py", "from ..ops.attention.entry import op", True),
+        ("modeling.py", "from ..kernels.kernel import op", True),
+        ("modeling.py", "from ....catalog.attention.entry import op", True),
+        ("__init__.py", "from ...._native import load_target_ops", True),
+        ("modeling.py", "from ..sibling.ops.attention.entry import op", False),
+        ("modeling.py", "from ...other.ops.attention.entry import op", False),
+        ("modeling.py", "from ..helper import op", False),
+        ("modeling.py", "from ..modeling_support import op", True),
+        ("modeling.py", "from ..sibling.modeling_support import op", False),
+        ("modeling.py", "from ...other.modeling_support import op", False),
+        ("modeling.py", "from {package}.models.family.modeling_support import op", True),
+        ("modeling.py", "from {package}.models.family.ops.attention.entry import op", True),
+        ("modeling.py", "from {package}.models.family.target.ops.attention.entry import op", True),
+        ("modeling.py", "import {package}.models.family.sibling.ops.attention.entry", False),
+        ("modeling.py", "from {package}.models.other.ops.attention.entry import op", False),
+        ("modeling.py", "from {package}.models.family.ops_extra.entry import op", False),
+        (
+            "ops/attention/entry.py",
+            "from {package}.models.family.sibling.ops.attention.entry import op",
+            False,
+        ),
+    ],
+)
+def test_target_import_isolation(tmp_path, monkeypatch, source_file, statement, accepted):
+    target_dir = tmp_path / "models/family/target"
+    source = target_dir / source_file
+    source.parent.mkdir(parents=True)
+    source.write_text(statement.format(package=_modeling_v2.__name__))
+    (target_dir.parent / "modeling_support.py").touch()
+    sibling = target_dir.parent / "sibling"
+    sibling.mkdir()
+    (sibling / "modeling_support.py").touch()
+    monkeypatch.setattr(sys.modules[__name__], "_ROOT", tmp_path)
+    monkeypatch.setattr(sys.modules[__name__], "_ARCHS", ["family"])
+    monkeypatch.setattr(
+        sys.modules[__name__], "_routed_targets", lambda arch: [(target_dir, "Target")]
+    )
+    if accepted:
+        test_targets_do_not_share_files()
+    else:
+        with pytest.raises(AssertionError, match="non-owned model code"):
+            test_targets_do_not_share_files()
 
 
 # `CELLS = certified_cells(op, TARGET_CELLS)`; the test function's own name
@@ -259,6 +349,9 @@ def test_every_target_has_the_accuracy_gate_of_its_name():
 _NO_CI_STAGE = {
     "unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16/comm": (
         "4 ranks on sm_107; CI has only the single-GPU GR100 stage (auto:gr100-x1)"
+    ),
+    "unittest/_torch/modeling_v2/models/kimi_k31/rubin_multirank": (
+        "2, 4 or 8 ranks on sm_107; CI has only the single-GPU GR100 stage (auto:gr100-x1)"
     ),
 }
 
@@ -409,10 +502,25 @@ def test_every_core_ships_both_targets():
 
 
 def _entry_files() -> list[Path]:
-    """Every entry module: the shared catalog and each target's own ``ops/``."""
+    """Every entry module: the shared catalog, each family's ``ops/`` and each target's own ``ops/``."""
     shared = (_ROOT / "catalog").glob("*/*.py")
+    family = (_ROOT / "models").glob("*/ops/*/*.py")
     owned = (_ROOT / "models").glob("*/*/ops/*/*.py")
-    return sorted(p for p in (*shared, *owned) if p.name != "__init__.py")
+    return sorted(p for p in (*shared, *family, *owned) if p.name != "__init__.py")
+
+
+def test_entry_discovery_covers_family_level_ops(tmp_path, monkeypatch):
+    entries = {
+        tmp_path / "catalog/attention/shared.py",
+        tmp_path / "models/family/ops/attention/family.py",
+        tmp_path / "models/family/target/ops/attention/target.py",
+    }
+    for path in entries:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+        (path.parent / "__init__.py").touch()
+    monkeypatch.setattr(sys.modules[__name__], "_ROOT", tmp_path)
+    assert set(_entry_files()) == entries
 
 
 def _catalog_entries() -> list[tuple[Path, ast.ClassDef]]:

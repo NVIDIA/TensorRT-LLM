@@ -37,6 +37,7 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     SHUTDOWN_REQUEST_ID,
     RequestQueueItem,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache_load import KvLoadTracker
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     ExecutorRequest,
@@ -469,6 +470,7 @@ def test_context_model_capacity_profile_uses_real_dummy_requests(
     )
     executor._validate_token_id_range = Mock()
     executor._validate_request_budget = Mock()
+    executor._validate_request_kv_v2_row = Mock()
 
     if is_warmup:
         PyExecutor._validate_request(executor, request)
@@ -1446,6 +1448,7 @@ def _make_executor_with_kv_cache_manager(kv_cache_manager: object | None) -> PyE
     }
     executor.enable_attention_dp = False
     executor._kv_connector_deadlines = {}
+    executor._pending_transfer_responses = []
     executor.adp_router = Mock(exclude_retiring_requests=False)
     executor._kv_cache_capacity = executor._read_kv_cache_capacity()
     executor._kv_load_tracker = KvLoadTracker(kv_cache_manager, rank=0, enabled=True)
@@ -2634,6 +2637,7 @@ class _StubADPExecutor:
         enable_non_overlap_adp_forward_intent=None,
         peer_forward_intent=_ADPForwardIntent.GENERATION,
         exclude_retiring_requests=True,
+        tp_size=1,
     ):
         self.enable_attention_dp = enable_attention_dp
         self.kv_cache_transceiver = kv_cache_transceiver
@@ -2663,7 +2667,9 @@ class _StubADPExecutor:
         self.model_engine = Mock(max_num_tokens=max_num_tokens, max_seq_len=max_seq_len)
 
         self.dist = Mock()
-        self.dist.tp_size = 1
+        # Peers are modeled by peer_forward_intent; tp_size only says whether
+        # the attention-DP group has any peer at all.
+        self.dist.tp_size = tp_size
         self.dist.cp_size = 1
         self.dist.tp_rank = 0
         self.dist.tp_allgather.side_effect = lambda value: [value]
@@ -3029,10 +3035,15 @@ def _run_non_adp_fetch(active_requests, *, exclude_retiring_requests, max_num_ac
     seen = {}
     stub._fetch_and_enqueue_requests = lambda waiting_queue, live: seen.update(live=live)
 
-    def _pop(waiting_queue, total_num_active_requests, all_ranks_num_active_requests):
+    def _pop(
+        waiting_queue,
+        total_num_active_requests,
+        all_ranks_num_active_requests,
+        allow_kv_balance=True,
+    ):
         seen["active"] = total_num_active_requests
         seen["all_ranks"] = all_ranks_num_active_requests
-        return []
+        return [], {}
 
     stub._pop_from_waiting_queue = _pop
     with patch(
@@ -3206,6 +3217,20 @@ def test_legacy_pad_dummy_allocation_failure_skips_padding(failure):
     assert stub.kv_cache_manager.add_dummy_requests.call_count == 1
     assert len(stub.active_requests) == 1
     assert not any(r.is_attention_dp_dummy for r in stub.active_requests)
+
+
+def test_adp_pad_dummy_is_context_on_fp4_mla_context_only_worker():
+    # A peer's generation intent must not give a single-copy FP4 MLA context
+    # worker a generation dummy: its cache has no V sidecars.
+    stub = _StubADPExecutor(peer_forward_intent=_ADPForwardIntent.GENERATION, tp_size=2)
+    stub.kv_cache_manager.fp4_mla_context_only_cache = True
+
+    _run_pad(stub)
+
+    assert len(stub.add_dummy_calls) == 1
+    assert stub.add_dummy_calls[0]["is_gen"] is False
+    assert stub.add_dummy_calls[0]["token_nums"] == [1]
+    assert stub._adp_dummy_is_gen is False
 
 
 def test_adp_pad_dummy_checks_minimal_context_capacity():
@@ -3599,9 +3624,10 @@ def test_pad_empty_batch_adds_generation_dummy_to_scheduled_batch(has_local_requ
     assert stub.add_dummy_calls[0]["token_nums"] is None
 
 
-def test_pad_empty_batch_uses_context_dummy_on_kda_context_only_worker():
-    stub, scheduled_batch = _unfittable_rank()
-    stub.kv_cache_manager.kda_context_only = True
+@pytest.mark.parametrize("context_only_flag", ["kda_context_only", "fp4_mla_context_only_cache"])
+def test_pad_empty_batch_uses_context_dummy_on_context_only_worker(context_only_flag: str):
+    stub, scheduled_batch = _unfittable_rank(tp_size=2)
+    setattr(stub.kv_cache_manager, context_only_flag, True)
     stub.max_total_draft_tokens = 3
 
     _run_pad_empty(stub, scheduled_batch)
@@ -3619,8 +3645,34 @@ def test_pad_empty_batch_uses_context_dummy_on_kda_context_only_worker():
     assert stub._pending_adp_dummy_request is dummy
 
 
+@pytest.mark.parametrize("context_only_flag", ["kda_context_only", "fp4_mla_context_only_cache"])
+def test_pad_empty_batch_no_op_on_single_rank_context_only_worker(context_only_flag: str):
+    # A tp1 attention-DP context worker (e.g. a Kimi K3 DWDP context server) has no peer
+    # whose forward its empty batch would veto: the iteration skips instead of running a
+    # one-token prefill.
+    stub, scheduled_batch = _unfittable_rank(tp_size=1)
+    setattr(stub.kv_cache_manager, context_only_flag, True)
+
+    _run_pad_empty(stub, scheduled_batch)
+
+    assert stub.add_dummy_calls == []
+    assert scheduled_batch.batch_size == 0
+    assert stub._pending_adp_dummy_request is None
+
+
+@pytest.mark.parametrize("context_only_flag", ["kda_context_only", "fp4_mla_context_only_cache"])
+def test_adp_pad_dummy_no_op_on_single_rank_context_only_worker(context_only_flag: str):
+    stub = _StubADPExecutor(peer_forward_intent=_ADPForwardIntent.CONTEXT, tp_size=1)
+    setattr(stub.kv_cache_manager, context_only_flag, True)
+
+    _run_pad(stub)
+
+    assert stub.add_dummy_calls == []
+    assert stub.active_requests == []
+
+
 def test_pad_empty_batch_context_dummy_checks_capacity_without_draft_reserve():
-    stub, scheduled_batch = _unfittable_rank()
+    stub, scheduled_batch = _unfittable_rank(tp_size=2)
     stub.kv_cache_manager.kda_context_only = True
     stub.max_total_draft_tokens = 3
     # The dummy role can still say generation when no transceiver drives it.
@@ -4434,3 +4486,27 @@ def test_first_token_response_carries_the_prefill_logits(monkeypatch, overlap):
         assert py_result.generation_logits is None
         py_result.append_generation_logits(first_logits + 10)  # the next decode step lands
         assert torch.equal(response.result.generation_logits, first_logits.transpose(0, 1))
+
+
+@pytest.mark.parametrize("prompt_len, rejected", [(19392, False), (19393, True), (128000, True)])
+def test_kv_v2_rejects_prompts_wider_than_the_page_index_row(prompt_len, rejected) -> None:
+    """A prompt past the KV-V2 page-index row fails as one request instead of
+    raising from the context resize inside the scheduler."""
+    executor = types.SimpleNamespace(
+        kv_cache_manager=types.SimpleNamespace(
+            num_extra_kv_tokens=0, max_request_kv_tokens=19392, max_seq_len=19392
+        )
+    )
+    request = types.SimpleNamespace(orig_prompt_len=prompt_len)
+    if rejected:
+        with pytest.raises(ValueError, match="more than the 19392 one request can hold"):
+            PyExecutor._validate_request_kv_v2_row(executor, request)
+    else:
+        PyExecutor._validate_request_kv_v2_row(executor, request)
+
+
+def test_kv_v2_request_row_width_is_in_ledger_tokens() -> None:
+    manager = KVCacheManagerV2.__new__(KVCacheManagerV2)
+    manager.max_blocks_per_seq = 304
+    manager._ledger_tokens_per_block = 64
+    assert manager.max_request_kv_tokens == 304 * 64

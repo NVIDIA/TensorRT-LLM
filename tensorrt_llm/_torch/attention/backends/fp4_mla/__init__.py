@@ -56,6 +56,11 @@ from .config import (
     FP4_MLA_SCALE_ROW_GROUP,
     FP4_MLA_TOKENS_PER_BLOCK,
     HP_BLOCK_SIZE,
+    is_fp4_mla_context_only_cache,
+    is_fp4_mla_context_only_worker,
+    set_fp4_mla_cutedsl_kernel_module,
+    ull2_mla_decode_pdl_enabled,
+    ull3_mla_tail_trigger,
 )
 from .config import _ceil_div as _ceil_div
 from .config import _cutedsl_backend_available as _cutedsl_backend_available
@@ -115,9 +120,12 @@ from .metadata import (
     populate_fp4_mla_append_metadata,
     populate_fp4_mla_generation_lengths,
     populate_helix_spec_buffers,
+    prelaunch_fp4_mla_generation_metadata,
 )
 from .packed_plan import _SM_COUNT_CACHE as _SM_COUNT_CACHE
+from .packed_plan import _count_fp4_mla_metadata_launch as _count_fp4_mla_metadata_launch
 from .packed_plan import _get_sm_count as _get_sm_count
+from .packed_plan import mark_fp4_mla_query_launch
 from .v_cache import (
     _get_cutedsl_persistent_v_packed_cache as _get_cutedsl_persistent_v_packed_cache,
 )
@@ -172,10 +180,17 @@ __all__ = [
     "get_fp4_mla_v_scale_pool_shape",
     "get_fp4_mla_v_scale_pool_size",
     "get_fp4_mla_v_scale_pool_view",
+    "is_fp4_mla_context_only_cache",
+    "is_fp4_mla_context_only_worker",
+    "mark_fp4_mla_query_launch",
     "materialize_fp4_mla_device_page_table",
     "populate_fp4_mla_append_metadata",
     "populate_fp4_mla_generation_lengths",
     "populate_helix_spec_buffers",
+    "prelaunch_fp4_mla_generation_metadata",
     "run_fp4_mla_attention_decode",
     "scatter_fp4_mla_kv_cache",
+    "set_fp4_mla_cutedsl_kernel_module",
+    "ull2_mla_decode_pdl_enabled",
+    "ull3_mla_tail_trigger",
 ]

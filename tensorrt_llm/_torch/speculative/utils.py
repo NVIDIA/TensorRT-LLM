@@ -456,6 +456,9 @@ def _build_spec_metadata(spec_config,
             use_rejection_sampling=use_rejection_sampling,
             vocab_size=vocab_size,
             draft_vocab_size=draft_vocab_size,
+            # A context-KV-only drafter reads the captures only through fc.
+            project_captures=getattr(spec_config, 'context_kv_only', False)
+            is True,
         )
     if spec_config.spec_dec_mode.is_dspark():
         target_layer_ids = getattr(spec_config, 'target_layer_ids', None)

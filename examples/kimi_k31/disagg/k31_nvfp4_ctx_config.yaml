@@ -1,0 +1,45 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# NVIDIA K3.1: TP8 CTX, NVFP4 main / FP4 indexer / BF16 KDA state.
+modeling_v2: require
+tensor_parallel_size: 8
+moe_expert_parallel_size: 8
+enable_attention_dp: false
+context_parallel_size: 1
+disable_overlap_scheduler: false
+enable_chunked_prefill: false
+cuda_graph_config: null
+max_batch_size: 1
+max_num_tokens: 8448
+max_seq_len: 8192
+trust_remote_code: true
+env_overrides:
+  TLLM_KIMI_K3_FP8_KV_LAYERS: ""
+moe_config:
+  backend: TRTLLM
+  max_num_tokens: 33024
+kv_cache_config:
+  enable_block_reuse: false
+  tokens_per_block: 64
+  free_gpu_memory_fraction: 0.25
+  dtype: nvfp4
+  mamba_ssm_cache_dtype: bfloat16
+  use_kv_cache_manager_v2: true
+sparse_attention_config:
+  algorithm: dsa
+  indexer_k_dtype: fp4
+cache_transceiver_config:
+  backend: NIXL
+  transceiver_runtime: PYTHON
+  kv_transfer_timeout_ms: 600000
+  max_tokens_in_buffer: 8448
+  kv_cache_bounce_size_mb: 1024
+speculative_config:
+  decoding_type: DFlash
+  spec_dec_variant: 2
+  context_kv_dtype: auto
+  max_draft_len: 4
+  use_rejection_sampling: true
+  attention_backend: VANILLA
+  speculative_model: /path/to/Kimi-K3.1-Dflash2-Preview
+per_request_spec_decode_stats: true

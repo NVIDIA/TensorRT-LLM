@@ -542,6 +542,10 @@ class DecoderModelForCausalLM(nn.Module,
 
     # Keep FX optimizations for decode and prefill above the PCG capture ceiling.
     use_fx_for_pcg_fallback: ClassVar[bool] = True
+    # Whether the model implements Ulysses context parallelism (Mapping.has_cp_ulysses):
+    # it splits the sequence over the CP ranks itself. AutoModelForCausalLM refuses
+    # a Ulysses CP mapping for a model that does not.
+    supports_cp_ulysses: ClassVar[bool] = False
 
     @staticmethod
     def _checkpoint_has_lm_head_scale(

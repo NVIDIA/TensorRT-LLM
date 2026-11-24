@@ -18,6 +18,8 @@ for constraints.
 | `gen_config_no_sa.yaml` | Generation-server options WITHOUT spec decode — use this first (CUDA graphs ON by default: GSM8K 96.89, 765/2138 tok/s @c64/c256 vs aggregated 643/1972; null `cuda_graph_config` for token-parity debugging) |
 | `disagg_proxy_config.yaml` | `trtllm-serve disaggregated` proxy config (1 ctx + 1 gen) |
 | `benchmark_kimi_k3_dep16.yaml` | Config for the SLURM benchmark harness (`examples/disaggregated/slurm/benchmark/submit.py`) |
+| `k31_dflash2_ctx_config.yaml` | K3.1 modeling-v2 context server (TP8, EP8, DFlash2 with `max_draft_len` 4, Python NIXL transceiver) |
+| `k31_dflash2_gen_config.yaml` | K3.1 modeling-v2 generation server (Helix CP8, TP1, EP8, DFlash2 with `max_draft_len` 4) |
 
 ## K3 constraints baked into the configs
 

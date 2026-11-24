@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 import numpy as np
 
 from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm.bindings import executor as tllm_executor
 from tensorrt_llm.mapping import CpType
 
 from ..distributed import Distributed
@@ -197,6 +198,35 @@ def get_from_waiting_queue(
     return items
 
 
+def is_generation_only_queue_item(req_item) -> bool:
+    """Whether a waiting-queue item is a disaggregated generation-only request."""
+    request = getattr(req_item, "request", None)
+    return (
+        getattr(request, "request_type", None)
+        == tllm_executor.RequestType.REQUEST_TYPE_GENERATION_ONLY
+    )
+
+
+def get_generation_only_from_waiting_queue(
+    waiting_queue: "WaitingQueue", max_req_count: int
+) -> List:
+    """Pop up to ``max_req_count`` generation-only requests from the head of the queue.
+
+    Popping stops at the first item that is not a generation-only request without
+    child requests, so the queue order is kept. Every rank holds the same queue and
+    pops the same items.
+    """
+    items = []
+    while len(items) < max_req_count and waiting_queue:
+        req_item = waiting_queue.peek_request()
+        if req_item.child_req_ids or not is_generation_only_queue_item(req_item):
+            break
+        items.append(waiting_queue.pop_request())
+    if items:
+        waiting_queue.mark_admitted(items)
+    return items
+
+
 def partition_context_for_helix(
     input_token_ids: np.ndarray, cp_rank: int, cp_size: int, tokens_per_block: int
 ) -> Tuple[List[int], List[int], int, int]:
@@ -365,7 +395,8 @@ def merge_requests(
                     exclude_last_generation_logits=exclude_last_generation_logits,
                 )
             return merge_requests_to_llm_requests(new_requests, exclude_last_generation_logits)
-        else:
+        # Ulysses CP ranks take every request whole, as TP ranks do.
+        elif cp_type != CpType.ULYSSES:
             raise NotImplementedError(f"Unsupported cp type {cp_type.name}.")
 
     return merge_requests_to_llm_requests(new_requests, exclude_last_generation_logits)

@@ -415,6 +415,13 @@ class BaseWorker(GenerationExecutor):
             cp_size = 1
             if hasattr(self, "mapping") and self.mapping.cp_size is not None:
                 cp_size = self.mapping.cp_size
+            uses_global_token_budget = False
+            if cp_size > 1 and self.mapping.has_cp_helix():
+                from .._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
+                    KVCacheManagerV2
+
+                uses_global_token_budget = isinstance(
+                    self.engine.kv_cache_manager, KVCacheManagerV2)
             max_seq_len = getattr(self, "max_seq_len", None)
             if max_seq_len is None:
                 logger.warning("`default_max_tokens` cannot be deduced")
@@ -425,17 +432,20 @@ class BaseWorker(GenerationExecutor):
                 else:
                     # use max_tokens if can't deduce default_max_tokens
                     return max_tokens
-            splited_prompt_len = int(len(prompt_token_ids) / cp_size)
-            default_max_tokens = max_seq_len - splited_prompt_len
+            if uses_global_token_budget:
+                # V2 Helix budgets its cache in global tokens.
+                budget_prompt_len = len(prompt_token_ids)
+                max_context_length = max_seq_len
+            else:
+                budget_prompt_len = len(prompt_token_ids) // cp_size
+                max_context_length = max_seq_len * cp_size
+            default_max_tokens = max_seq_len - budget_prompt_len
             if default_max_tokens <= 0:
                 # Reject (never truncate): the prompt leaves no room for even
-                # one generated token. The message reports request-level
-                # totals, not per-CP-rank arithmetic: splited_prompt_len >=
-                # max_seq_len implies len(prompt_token_ids) >= max_seq_len *
-                # cp_size.
+                # one generated token. Report the request-level context limit.
                 raise ValueError(
                     context_length_exceeded_message(
-                        max_context_length=max_seq_len * cp_size,
+                        max_context_length=max_context_length,
                         num_prompt_tokens=len(prompt_token_ids)))
 
             # default_max_tokens is the biggest available value

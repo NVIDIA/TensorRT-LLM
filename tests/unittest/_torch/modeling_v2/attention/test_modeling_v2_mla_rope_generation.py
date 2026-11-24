@@ -66,7 +66,7 @@ from tensorrt_llm.mapping import Mapping
 
 __extra_import_path__ = [".."]
 from _cells import certified_cells  # noqa: E402 — needs the path declared above
-from _validating import validating  # noqa: E402 — needs the path declared above
+from _validating import certifying, validating  # noqa: E402,F401 — needs the path declared above
 
 assert torch.cuda.is_available(), "mla_rope_generation requires a CUDA device"
 
@@ -166,8 +166,10 @@ class _MlaEnv:
         fp8_pool: bool = False,
         orig_quant: Optional[float] = None,
         quant_orig: Optional[float] = None,
+        max_seq_len: int = MAX_SEQ_LEN,
     ) -> None:
         self.max_batch_size = max_batch_size
+        self.max_seq_len = max_seq_len
         self.tokens_per_block = tokens_per_block
         self.num_heads = num_heads
         self.fp8_pool = fp8_pool
@@ -178,7 +180,7 @@ class _MlaEnv:
             num_kv_heads=1,
             head_dim=GEN_HEAD_SIZE,
             tokens_per_block=tokens_per_block,
-            max_seq_len=MAX_SEQ_LEN,
+            max_seq_len=max_seq_len,
             max_batch_size=max_batch_size,
             mapping=Mapping(world_size=1, tp_size=1, rank=0),
             dtype=DataType.FP8 if fp8_pool else DataType.BF16,
@@ -204,7 +206,7 @@ class _MlaEnv:
         rope = RopeParams(
             dim=QK_ROPE_HEAD_DIM,
             theta=10000.0,
-            max_positions=MAX_SEQ_LEN,
+            max_positions=max_seq_len,
             duplicate_data=True,
         )
         _, self.rotary_cos_sin = rope.create_rope_const_params()
@@ -1291,6 +1293,324 @@ def test_fp8_kv_mtp_append_race_control() -> None:
         env.shutdown()
 
 
+# ─── Kimi K3.1 surface ────────────────────────────────────────────────
+# The K3.1 general target's generation call (attention_mla.MLA.forward_absorption_generation,
+# through TrtllmAttention.mla_rope_generation). What differs from deepseek's:
+#
+# * the rope table is the IDENTITY: K3.1's 64-wide rope slot is NoPE, and the target overwrites the
+#   duplicated-layout table with (cos, sin) = (1, 0) after building it, so every "rotation" is a
+#   copy and the appended / quantized rows must equal their inputs bit for bit;
+# * the backend is built with predicted_tokens_per_seq = 1 even for the DFlash2 verify, whose
+#   generation sequences each carry `rows_per_seq` (5 or 8) query rows. The kernel takes the rows
+#   per sequence from the token count (`acc_q_len / num_generations`), not from P, so row `t` of a
+#   sequence still lands at `sequence_length - rows_per_seq + t`;
+# * 96 query heads per rank (attention TP 1 and every attention-DP layout) are padded to 128: the
+#   padding heads of fused_q and q_pe are zero, q_pe is then a contiguous [T, 128, 64] tensor
+#   rather than a view into q, and the quantized query of those heads must come back zero. Other
+#   per-rank head counts (48 .. 3) run unpadded with q_pe a strided view of q;
+# * the latent pool is fp8-e4m3 (scale 1, both scale tensors omitted) or bf16 (`auto` KV dtype),
+#   where quant_q_buffer and the two bmm scales are None and the op writes the roped q into
+#   fused_q's tail instead.
+K31_TARGET = "kimi_k31/kimi_k31_pro_mxfp4__sm_10x__default"
+K31_Q_LORA_RANK = 1536
+#: Long enough that a cell's cached prefix can sit a few thousand tokens deep.
+K31_MAX_SEQ_LEN = 4096
+
+
+def _k31(
+    num_heads: int,
+    pool: str,
+    tokens_per_block: int,
+    rows_per_seq: int,
+    cached: tuple,
+    real_heads: Optional[int] = None,
+) -> dict:
+    return dict(
+        num_heads=num_heads,
+        real_heads=num_heads if real_heads is None else real_heads,
+        kv_lora_rank=KV_LORA_RANK,
+        qk_rope_head_dim=QK_ROPE_HEAD_DIM,
+        qk_nope_head_dim=QK_NOPE_HEAD_DIM,
+        quant_mode=QUANT_MODE_FP8_KV_CACHE if pool == "fp8" else 0,
+        pool=pool,
+        rope="identity",
+        predicted_tokens_per_seq=1,
+        rows_per_seq=rows_per_seq,
+        tokens_per_block=tokens_per_block,
+        q_scaling=1.0,
+        write_scale=None,
+        read_scale=None,
+        cached=tuple(cached),
+    )
+
+
+def _install_identity_rope(cos_sin: torch.Tensor) -> None:
+    """What the K3.1 target does to its backend's table: interleaved (cos, sin) pairs set to (1, 0)."""
+    flat = cos_sin.reshape(-1)
+    flat[0::2] = 1.0
+    flat[1::2] = 0.0
+
+
+def _certify_k31(cell: Cell, arm) -> None:
+    """One K3.1 generation step, checked through the entry's own references.
+
+    Buffers are built the way the target builds them: fused_q's absorbed half holds the BMM output
+    for the real heads, its tail is uninitialized (random here, so a kernel that read it on the fp8
+    path would show), every padding head is zero; quant_q_buffer is pre-filled with a 0xFF sentinel
+    over every head, padding included, so the padding heads coming back zero is the op's own write.
+    """
+    spec = cell.spec
+    arm(op)
+    torch.manual_seed(zlib.crc32(cell.why.encode()) % 2**31)
+    fp8 = spec["pool"] == "fp8"
+    n = spec["rows_per_seq"]
+    num_heads, real_heads = spec["num_heads"], spec["real_heads"]
+    cached = list(spec["cached"])
+    num_gen = len(cached)
+    verify = [n] * num_gen
+    rows = sum(verify)
+    # Request and absolute position of every query row, in row order.
+    req_of_row = [b for b, v in enumerate(verify) for _ in range(v)]
+    positions = [cached[b] + t for b, v in enumerate(verify) for t in range(v)]
+
+    env = _MlaEnv(
+        max_batch_size=4,
+        tokens_per_block=spec["tokens_per_block"],
+        num_heads=num_heads,
+        fp8_pool=fp8,
+        max_seq_len=K31_MAX_SEQ_LEN,
+    )
+    _install_identity_rope(env.rotary_cos_sin)
+    try:
+        rids = list(range(num_gen))
+        env.kv_cache_manager.add_dummy_requests(rids, token_nums=cached)
+        for rid, v in zip(rids, verify):
+            cache = env.kv_cache_manager.kv_cache_map[rid]
+            assert cache.resize(cache.capacity + v)
+        metadata = env.prepare_metadata(rids, verify, 0, cached)
+        kv_lens = [c + v for c, v in zip(cached, verify)]
+        assert max(kv_lens) <= env.max_seq_len
+        num_seqs = len(kv_lens)
+
+        fused_q = torch.randn(rows, num_heads, GEN_HEAD_SIZE, dtype=torch.bfloat16, device="cuda")
+        if real_heads == num_heads:
+            q = torch.randn(
+                rows,
+                num_heads,
+                QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM,
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+            q_pe = q.split([QK_NOPE_HEAD_DIM, QK_ROPE_HEAD_DIM], dim=-1)[1]
+        else:
+            fused_q[:, real_heads:].zero_()
+            q_pe = torch.zeros(
+                rows, num_heads, QK_ROPE_HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+            )
+            q_pe[:, :real_heads].normal_()
+        latent_cache = torch.randn(rows, GEN_HEAD_SIZE, dtype=torch.bfloat16, device="cuda")
+        fused_q_orig, q_pe_orig, latent_orig = fused_q.clone(), q_pe.clone(), latent_cache.clone()
+
+        cu_q_seqlens = torch.full((num_seqs + 1,), -1, dtype=torch.int32, device="cuda")
+        cu_kv_seqlens = torch.full((num_seqs + 1,), -1, dtype=torch.int32, device="cuda")
+        fmha_scheduler_counter = torch.full((1,), 7, dtype=torch.uint32, device="cuda")
+        if fp8:
+            quant_q_buffer = torch.full(
+                (rows, num_heads, GEN_HEAD_SIZE), 255, dtype=torch.uint8, device="cuda"
+            )
+            bmm1 = torch.full((2,), -99.0, dtype=torch.float32, device="cuda")
+            bmm2 = torch.full((1,), -99.0, dtype=torch.float32, device="cuda")
+        else:
+            quant_q_buffer = bmm1 = bmm2 = None
+        pool = env.pool_tensor()
+        pool_before = pool.clone()
+
+        op(
+            fused_q,
+            q_pe,
+            latent_cache,
+            env.rotary_cos_sin,
+            cu_q_seqlens,
+            cu_kv_seqlens,
+            fmha_scheduler_counter,
+            bmm1,
+            bmm2,
+            quant_q_buffer,
+            metadata.kv_lens_cuda_runtime,
+            metadata.kv_lens_runtime,
+            metadata.prompt_lens_cpu_runtime,
+            0,  # num_contexts
+            metadata.kv_cache_block_offsets,
+            env.kv_cache_manager.kv_cache_pool_pointers,
+            env.kv_cache_manager.kv_cache_pool_mapping,
+            None,  # kv_scale_orig_quant
+            None,  # kv_scale_quant_orig
+            None,  # kv_cache_scale_orig_quant
+            None,  # out_scale
+            None,  # block_ids_per_seq
+            [None, None],  # helix_tensor_params
+            spec["predicted_tokens_per_seq"],
+            0,  # layer_idx
+            num_heads,
+            1,  # num_kv_heads
+            GEN_HEAD_SIZE,
+            0,  # residual_dim
+            env.tokens_per_block,
+            env.max_seq_len,  # attention_window_size
+            1,  # beam_width
+            spec["quant_mode"],
+            spec["q_scaling"],
+            K31_Q_LORA_RANK,
+            KV_LORA_RANK,
+            QK_NOPE_HEAD_DIM,
+            QK_ROPE_HEAD_DIM,
+            V_HEAD_DIM,
+            True,  # rope_append
+        )
+        torch.cuda.synchronize()
+
+        half = QK_ROPE_HEAD_DIM // 2
+        table = env.rotary_cos_sin.view(-1, QK_ROPE_HEAD_DIM, 2)
+        store = torch.float8_e4m3fn if fp8 else torch.bfloat16
+
+        def ref(row: torch.Tensor, pos: int) -> torch.Tensor:
+            return op.reference(
+                row, table[pos, :half, 0], table[pos, :half, 1], QK_ROPE_HEAD_DIM, None, store
+            )
+
+        # The identity table really is one: the entry's reference reproduces a plain store of the row.
+        probe = torch.cat([latent_orig[0, :KV_LORA_RANK], latent_orig[0, KV_LORA_RANK:]])
+        _assert_bytes_equal(
+            ref(probe, positions[0]), probe.float().to(store), "identity rope table"
+        )
+
+        # 1. Read-only inputs. fused_q is written only on the bf16 path, and only in its tail.
+        torch.testing.assert_close(q_pe, q_pe_orig, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(latent_cache, latent_orig, rtol=0.0, atol=0.0)
+        if fp8:
+            torch.testing.assert_close(fused_q, fused_q_orig, rtol=0.0, atol=0.0)
+        else:
+            torch.testing.assert_close(
+                fused_q[..., :KV_LORA_RANK], fused_q_orig[..., :KV_LORA_RANK], rtol=0.0, atol=0.0
+            )
+
+        # 2. The query the decode FMHA reads: quant_q_buffer on fp8, fused_q on bf16.
+        query = quant_q_buffer.view(torch.float8_e4m3fn) if fp8 else fused_q
+        for r in range(rows):
+            want = ref(
+                torch.cat([fused_q_orig[r, :, :KV_LORA_RANK], q_pe_orig[r]], dim=-1), positions[r]
+            )
+            if fp8:
+                _compare(query[r], want)
+            else:
+                _assert_bytes_equal(query[r], want, f"bf16 fused_q row {r}")
+        if real_heads != num_heads:
+            pad = query[:, real_heads:].reshape(-1).view(torch.uint8)
+            assert int(pad.count_nonzero()) == 0, "a padding head's query came back non-zero"
+
+        # 3. The decode-FMHA scales (fp8 only; the bf16 path passes None and gets nothing).
+        if fp8:
+            want1, want2 = op.reference_bmm_scales(
+                None, spec["q_scaling"], QK_NOPE_HEAD_DIM, QK_ROPE_HEAD_DIM
+            )
+            torch.testing.assert_close(bmm1.cpu(), want1, rtol=BMM_SCALE_RTOL, atol=0.0)
+            torch.testing.assert_close(bmm2.cpu(), want2, rtol=0.0, atol=0.0)
+
+        # 4. The appended latent rows, one per generation row at its own position.
+        for r in range(rows):
+            got = env.cache_row(rids[req_of_row[r]], positions[r])
+            _assert_bytes_equal(
+                got, ref(latent_orig[r], positions[r]), f"cache row {r} (position {positions[r]})"
+            )
+
+        # 5. Nothing else in the pool moved.
+        changed = pool.view(torch.uint8) != pool_before.view(torch.uint8)
+        idx = changed.nonzero().cpu()
+        got_slots = set(zip(idx[:, 0].tolist(), idx[:, 2].tolist()))
+        want_slots = {env.slot(rids[req_of_row[r]], positions[r]) for r in range(rows)}
+        assert got_slots <= want_slots, f"op touched pool slots {sorted(got_slots - want_slots)}"
+
+        # 6. Scheduler buffers: num_heads q rows per generation row, rows_per_seq rows per sequence
+        #    although the call passes predicted_tokens_per_seq = 1.
+        want_cu_q, want_cu_kv = op.reference_scheduler_buffers(kv_lens, num_heads, n)
+        torch.testing.assert_close(cu_q_seqlens.cpu(), want_cu_q, rtol=0, atol=0)
+        torch.testing.assert_close(cu_kv_seqlens.cpu(), want_cu_kv, rtol=0, atol=0)
+        assert fmha_scheduler_counter.item() == 0
+    finally:
+        env.shutdown()
+
+
+_K31_CELLS = (
+    # attention TP 1 / every attention-DP layout: 96 heads padded to 128.
+    Cell(
+        why="k31 96->128 padded heads, fp8 pool, page 64, decode",
+        spec=_k31(128, "fp8", 64, 1, (63, 2048 + 7, 130), real_heads=96),
+    ),
+    Cell(
+        why="k31 96->128 padded heads, fp8 pool, page 32, DFlash2 verify w5",
+        spec=_k31(128, "fp8", 32, 5, (30, 3000, 1), real_heads=96),
+    ),
+    Cell(
+        why="k31 96->128 padded heads, fp8 pool, page 128, DFlash2 verify w8",
+        spec=_k31(128, "fp8", 128, 8, (125, 1024, 260), real_heads=96),
+    ),
+    Cell(
+        why="k31 96->128 padded heads, bf16 pool, page 64, decode",
+        spec=_k31(128, "bf16", 64, 1, (63, 2048 + 7, 130), real_heads=96),
+    ),
+    Cell(
+        why="k31 96->128 padded heads, bf16 pool, page 32, DFlash2 verify w8",
+        spec=_k31(128, "bf16", 32, 8, (28, 3000, 1), real_heads=96),
+    ),
+    Cell(
+        why="k31 96->128 padded heads, bf16 pool, page 128, DFlash2 verify w5",
+        spec=_k31(128, "bf16", 128, 5, (126, 1024, 260), real_heads=96),
+    ),
+    # attention TP 2..32: 96 / tp heads per rank, unpadded, q_pe a strided view of q.
+    Cell(
+        why="k31 attention TP2: 48 heads, fp8 pool, page 64, decode",
+        spec=_k31(48, "fp8", 64, 1, (63, 700)),
+    ),
+    Cell(
+        why="k31 attention TP2: 48 heads, bf16 pool, page 32, verify w5",
+        spec=_k31(48, "bf16", 32, 5, (30, 700)),
+    ),
+    Cell(
+        why="k31 attention TP4: 24 heads, fp8 pool, page 128, verify w8",
+        spec=_k31(24, "fp8", 128, 8, (125, 900)),
+    ),
+    Cell(
+        why="k31 attention TP4: 24 heads, bf16 pool, page 64, decode",
+        spec=_k31(24, "bf16", 64, 1, (63, 900)),
+    ),
+    Cell(
+        why="k31 attention TP8: 12 heads, fp8 pool, page 32, verify w5",
+        spec=_k31(12, "fp8", 32, 5, (29, 1500)),
+    ),
+    Cell(
+        why="k31 attention TP8: 12 heads, bf16 pool, page 128, verify w8",
+        spec=_k31(12, "bf16", 128, 8, (124, 1500)),
+    ),
+    Cell(
+        why="k31 attention TP16: 6 heads, fp8 pool, page 128, decode",
+        spec=_k31(6, "fp8", 128, 1, (127, 2500)),
+    ),
+    Cell(
+        why="k31 attention TP16: 6 heads, bf16 pool, page 64, verify w5",
+        spec=_k31(6, "bf16", 64, 5, (62, 2500)),
+    ),
+    Cell(
+        why="k31 attention TP32: 3 heads, fp8 pool, page 64, verify w8",
+        spec=_k31(3, "fp8", 64, 8, (60, 3500)),
+    ),
+    Cell(
+        why="k31 attention TP32: 3 heads, bf16 pool, page 32, decode",
+        spec=_k31(3, "bf16", 32, 1, (31, 3500)),
+    ),
+)
+_K31_FP8_CELLS = tuple(cell for cell in _K31_CELLS if cell.spec["pool"] == "fp8")
+
+
 # The shapes each shipped target calls this entry with, by target directory
 # under `models/`. The entry's own `CELLS` are the op's whoever calls it.
 TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
@@ -1318,13 +1638,17 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
             ),
         ),
     ),
+    "kimi_k31/kimi_k31_pro_mxfp4__sm_10x__default": _K31_CELLS,
+    # The perf targets run the FP8 latent pool only (routing sends BF16 latents to the general target).
+    "kimi_k31/kimi_k31_pro_mxfp4__sm_103__tep": _K31_FP8_CELLS,
+    "kimi_k31/kimi_k31_pro_mxfp4__sm_103__dep": _K31_FP8_CELLS,
 }
 
 CELLS = certified_cells(op, TARGET_CELLS)
 
 
 @pytest.mark.parametrize("cell", CELLS, ids=[c.why[:44] for c in CELLS])
-def test_certified_cells(cell) -> None:
+def test_certified_cells(cell, certifying) -> None:  # noqa: F811
     """Drive every configuration the entry claims, through the entry's own
     reference and its own gate.
 
@@ -1338,6 +1662,9 @@ def test_certified_cells(cell) -> None:
     them into one assert loses which happened.
     """
     spec = cell.spec
+    if spec.get("rope") == "identity":
+        _certify_k31(cell, certifying)
+        return
     p = spec["predicted_tokens_per_seq"]
     torch.manual_seed(zlib.crc32(cell.why.encode()) % 2**31)
 

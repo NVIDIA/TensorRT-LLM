@@ -3,7 +3,9 @@
 
 """TRTLLM FP4 MLA helper tests."""
 
+import importlib
 from types import SimpleNamespace
+from typing import Optional
 
 import pytest
 import torch
@@ -12,6 +14,7 @@ import tensorrt_llm
 import tensorrt_llm._torch.attention.backends.fmha.fp4_mla as fp4_mla_fmha_backend
 import tensorrt_llm._torch.attention.backends.fp4_mla as fp4_mla_backend
 import tensorrt_llm._torch.attention.backends.fp4_mla.cache_update as fp4_mla_cache_update
+import tensorrt_llm._torch.attention.backends.fp4_mla.config as fp4_mla_config
 import tensorrt_llm._torch.attention.backends.fp4_mla.decode as fp4_mla_decode
 import tensorrt_llm._torch.attention.backends.fp4_mla.metadata as fp4_mla_metadata
 import tensorrt_llm._torch.attention.backends.fp4_mla.v_cache as fp4_mla_v_cache
@@ -45,7 +48,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionInputType,
 )
 from tensorrt_llm._torch.attention.mla import MLA
-from tensorrt_llm._torch.kimi_k3_cache_policy import KIMI_K3_BF16_KV_LAYERS_ENV
+from tensorrt_llm._torch.kimi_k3_cache_policy import KIMI_K3_FP8_KV_LAYERS_ENV
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BAD_PAGE_INDEX,
     KVCacheManagerV2,
@@ -71,6 +74,25 @@ def _swizzled_sf_offset(
         + ((row_idx % 128) // 32) * 4
         + (row_idx // 128) * (128 * padded_cols)
     )
+
+
+# Kimi-K3's variant of the packed CuTe DSL decode kernel module: it also stores partials by plan
+# slot (the wave / makespan plans), stores normalized FP16 split partials and triggers its
+# programmatic dependents early.
+_K3_FP4_MLA_KERNEL_MODULE = (
+    "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.k3_rubin.kernels."
+    "fp4_mla_mufu16"
+)
+
+
+def _install_cutedsl_kernel_module(monkeypatch, kernel_module: str) -> None:
+    """Run the packed decode on the shared CuTe DSL kernel module or on Kimi-K3's."""
+    module = None
+    if kernel_module == "k3":
+        module = importlib.import_module(_K3_FP4_MLA_KERNEL_MODULE)
+    else:
+        assert kernel_module == "shared"
+    monkeypatch.setattr(fp4_mla_config, "_CUTEDSL_KERNEL_MODULE_OVERRIDE", module)
 
 
 def _is_cutedsl_unavailable() -> bool:
@@ -649,11 +671,11 @@ def test_fp4_mla_v2_cache_size_accounts_for_hp_intercept(monkeypatch) -> None:
     assert intercept == 3 * 2 * (HP_BLOCK_SIZE + 3) * 576 * 2 * 2
 
 
-def test_fp4_mla_v2_cache_size_accounts_for_bf16_fallback(
+def test_fp4_mla_v2_cache_size_accounts_for_fp8_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
-    monkeypatch.setenv(KIMI_K3_BF16_KV_LAYERS_ENV, "3")
+    monkeypatch.setenv(KIMI_K3_FP8_KV_LAYERS_ENV, "3")
     model_config = SimpleNamespace(
         pretrained_config=SimpleNamespace(
             model_type="kimi_linear",
@@ -674,7 +696,7 @@ def test_fp4_mla_v2_cache_size_accounts_for_bf16_fallback(
     )
 
     fp4_bytes_per_token = 320 + 40 + 32
-    assert slope == fp4_bytes_per_token + 576 * torch.bfloat16.itemsize
+    assert slope == fp4_bytes_per_token + 576 * torch.float8_e4m3fn.itemsize
     assert intercept == 3 * (HP_BLOCK_SIZE + 3) * 576 * 2
 
 
@@ -1524,7 +1546,9 @@ def test_fp4_mla_helix_scatter_uses_global_rope_and_local_cache_position(
             FP4_MLA_Q_RESIDUAL_DIM,
             is_act=True,
         )
-        torch.testing.assert_close(state.prequantized_q, expected_q_fp4)
+        # The packed-Q buffer is manager-owned and sized to the batch capacity;
+        # only the leading (token, head) rows belong to this step.
+        torch.testing.assert_close(state.prequantized_q[: expected_q_fp4.shape[0]], expected_q_fp4)
         q_sf_per_token = (head_dim + FP4_MLA_Q_RESIDUAL_DIM) // FP4_BLOCK_SIZE
         valid_q_sf_offsets = torch.tensor(
             [
@@ -1561,6 +1585,14 @@ def test_fp4_mla_helix_scatter_uses_global_rope_and_local_cache_position(
             head_dim=head_dim,
         )
         torch.testing.assert_close(local_token, expected_latent.float(), rtol=0.25, atol=0.2)
+        # The BF16 HP ring is addressed by the global position, as the context
+        # writer and the disaggregated HP-tail transfer address it; the
+        # rank-local cache position would pick a different slot here.
+        hp_ring = kv_cache_manager.fp4_mla_hp_pool_size
+        assert global_position % hp_ring != local_cache_position % hp_ring
+        hp_rows = state.hp_pool[:, 0, 0, :].reshape(state.hp_pool.shape[0], hp_ring, head_dim)
+        written_slots = torch.nonzero(hp_rows.abs().sum(dim=-1))[:, 1].unique().tolist()
+        assert written_slots == [global_position % hp_ring]
         global_slot = _materialize_reference_cache_tokens(
             metadata,
             layer_idx=0,
@@ -2199,8 +2231,10 @@ def test_fp4_mla_attention_decode_cutedsl_helix_mtp5_matches_reference(
         "h12-q8-skew8-s2",
     ],
 )
+@pytest.mark.parametrize("kernel_module", ["shared", "k3"])
 def test_fp4_mla_attention_decode_cutedsl_packed_matches_reference(
     monkeypatch,
+    kernel_module: str,
     num_heads: int,
     query_len_per_seq: int,
     enable_helix: bool,
@@ -2208,6 +2242,7 @@ def test_fp4_mla_attention_decode_cutedsl_packed_matches_reference(
     seq_lens: list[int],
 ) -> None:
     """Packed [query, head] rows, in-kernel KV splits, per-row (Helix) bounds."""
+    _install_cutedsl_kernel_module(monkeypatch, kernel_module)
     _assert_fp4_mla_attention_decode_accuracy(
         monkeypatch,
         backend="cutedsl",
@@ -2220,6 +2255,228 @@ def test_fp4_mla_attention_decode_cutedsl_packed_matches_reference(
         packed_queries=True,
         split_kv=split_kv,
     )
+
+
+@pytest.mark.skipif(
+    _is_cutedsl_unavailable(),
+    reason="requires Rubin SM107 and the CTM/CuTeDSL runtime",
+)
+@pytest.mark.parametrize(
+    "option_env",
+    [
+        {"TRTLLM_FP4_MLA_LPT_PLAN": "1"},
+        {"TRTLLM_FP4_MLA_PAGE_PLAN": "0"},
+        {"TRTLLM_FP4_MLA_REDUCE_SPREAD_STATS": "1"},
+        {
+            "TRTLLM_FP4_MLA_LPT_PLAN": "1",
+            "TRTLLM_FP4_MLA_PAGE_PLAN": "0",
+            "TRTLLM_FP4_MLA_REDUCE_SPREAD_STATS": "1",
+        },
+        {
+            "TRTLLM_FP4_MLA_REDUCE_PDL": "1",
+            "TRTLLM_FP4_MLA_REDUCE_SPREAD_STATS": "1",
+        },
+        {"TRTLLM_FP4_MLA_F16_PARTIALS": "1"},
+        {
+            "TRTLLM_FP4_MLA_LPT_PLAN": "1",
+            "TRTLLM_FP4_MLA_REDUCE_PDL": "1",
+            "TRTLLM_FP4_MLA_REDUCE_SPREAD_STATS": "1",
+            "TRTLLM_FP4_MLA_F16_PARTIALS": "1",
+        },
+    ],
+    ids=[
+        "lpt-plan",
+        "no-page-plan",
+        "spread-stats",
+        "all",
+        "reduce-v2",
+        "f16-partials",
+        "reduce-v2-f16-partials",
+    ],
+)
+@pytest.mark.parametrize(
+    "num_heads,query_len_per_seq,enable_helix,split_kv,seq_lens",
+    [
+        # Skewed: the long requests take several tasks, launched before the
+        # short tails (tasks run in another order than their partial slots).
+        (96, 8, False, 4, [131, 20000, 600, 45000]),
+        (96, 8, True, 4, [131, 20000, 600, 45000]),
+        # Even batch, MTP5 rows (five 128-row tiles, the last half padding).
+        (96, 6, False, 8, [9000, 9000, 9000, 9000]),
+        # Helix with single-task requests in split mode (stats from the reducer).
+        (96, 8, True, 2, [2100, 2300, 2200, 2400, 2000, 2500]),
+        (128, 1, False, 16, [300, 70000, 2200]),
+    ],
+    ids=["h96-q8-skew", "h96-q8-helix-skew", "h96-q6-even", "h96-q8-helix-single", "h128-q1-skew"],
+)
+@pytest.mark.parametrize("kernel_module", ["shared", "k3"])
+def test_fp4_mla_attention_decode_cutedsl_packed_options_match_reference(
+    monkeypatch,
+    kernel_module: str,
+    option_env: dict[str, str],
+    num_heads: int,
+    query_len_per_seq: int,
+    enable_helix: bool,
+    split_kv: int,
+    seq_lens: list[int],
+) -> None:
+    """Opt-in packed decode options keep the reference accuracy. The shared kernel module
+    ignores the options it cannot run (ordered plans, FP16 partials)."""
+    _install_cutedsl_kernel_module(monkeypatch, kernel_module)
+    for name, value in option_env.items():
+        monkeypatch.setenv(name, value)
+    _assert_fp4_mla_attention_decode_accuracy(
+        monkeypatch,
+        backend="cutedsl",
+        fused_v_transpose=False,
+        num_heads=num_heads,
+        seq_lens=seq_lens,
+        seed=43,
+        query_len_per_seq=query_len_per_seq,
+        enable_helix=enable_helix,
+        packed_queries=True,
+        split_kv=split_kv,
+    )
+
+
+_PACKED_OPTION_ENVS = (
+    "TRTLLM_FP4_MLA_REDUCE_PDL",
+    "TRTLLM_FP4_MLA_REDUCE_SPREAD_STATS",
+    "TRTLLM_FP4_MLA_LPT_PLAN",
+    "TRTLLM_FP4_MLA_F16_PARTIALS",
+)
+
+
+def _run_packed_decode_with_env(
+    monkeypatch,
+    metadata,
+    q: torch.Tensor,
+    *,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    with_stats: bool,
+    option_env: dict[str, str],
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    for name in _PACKED_OPTION_ENVS:
+        monkeypatch.delenv(name, raising=False)
+    for name, value in option_env.items():
+        monkeypatch.setenv(name, value)
+    output = torch.full_like(q[..., :kv_lora_rank], float("nan"))
+    softmax_stats = None
+    if with_stats:
+        softmax_stats = torch.full(
+            (*q.shape[:2], 2), float("nan"), dtype=torch.float32, device=q.device
+        )
+    run_fp4_mla_attention_decode(
+        metadata,
+        layer_idx=0,
+        local_layer=0,
+        q=q,
+        output=output,
+        sm_scale=0.1,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        prequantized_q=metadata.fp4_mla_state.prequantized_q,
+        prequantized_q_sf=metadata.fp4_mla_state.prequantized_q_sf,
+        q_batch_capacity=metadata.fp4_mla_state.q_batch_capacity,
+        softmax_stats_tensor=softmax_stats,
+    )
+    torch.cuda.synchronize()
+    return output.clone(), None if softmax_stats is None else softmax_stats.clone()
+
+
+_PACKED_OPTION_CASES = pytest.mark.parametrize(
+    "query_len_per_seq,enable_helix,split_kv,seq_lens,lpt_plan",
+    [
+        # Helix8 MTP7 batches of 1..16 requests (up to 8 tasks per request).
+        (8, True, 8, [3100], False),
+        (8, True, 8, [3100, 2900, 3000, 3300], False),
+        (8, True, 8, [3100, 2900, 3000, 3300, 2800, 3200, 3050, 2950], False),
+        (8, True, 8, [3000 + 37 * i for i in range(16)], False),
+        # Skewed lengths (single- and multi-task requests), with and without stats.
+        (8, True, 4, [131, 9000, 600, 15000], True),
+        (8, False, 4, [131, 9000, 600, 15000], False),
+        # A single task per request: the decode writes the output directly.
+        (8, True, 1, [2100, 2300], False),
+        # MTP5 rows: the last 128-row tile is half padding.
+        (6, True, 8, [5000, 4000, 3000], False),
+    ],
+    ids=["n1", "n4", "n8", "n16", "skew-helix-lpt", "skew", "s1", "q6"],
+)
+
+
+@pytest.mark.skipif(
+    _is_cutedsl_unavailable(),
+    reason="requires Rubin SM107 and the CTM/CuTeDSL runtime",
+)
+@pytest.mark.parametrize(
+    "option_env",
+    [
+        {"TRTLLM_FP4_MLA_REDUCE_PDL": "1"},
+        {
+            "TRTLLM_FP4_MLA_REDUCE_PDL": "1",
+            "TRTLLM_FP4_MLA_REDUCE_SPREAD_STATS": "1",
+        },
+    ],
+    ids=["reduce-pdl", "all"],
+)
+@_PACKED_OPTION_CASES
+@pytest.mark.parametrize("kernel_module", ["shared", "k3"])
+def test_fp4_mla_attention_decode_cutedsl_packed_options_bitwise(
+    monkeypatch,
+    kernel_module: str,
+    option_env: dict[str, str],
+    query_len_per_seq: int,
+    enable_helix: bool,
+    split_kv: int,
+    seq_lens: list[int],
+    lpt_plan: bool,
+) -> None:
+    """Scheduling-only packed decode options reproduce the default path (decode
+    kernel + split reduction) bit for bit, output and Helix stats."""
+    _reset_triton_allocator()
+    _install_cutedsl_kernel_module(monkeypatch, kernel_module)
+    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "cutedsl")
+    monkeypatch.setenv(FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE_ENV, "0")
+    monkeypatch.setenv(fp4_mla_backend.FP4_MLA_PACKED_Q_ENV, "1")
+    monkeypatch.setenv("TRTLLM_FP4_MLA_SPLIT_KV", str(split_kv))
+    (
+        kv_cache_manager,
+        metadata,
+        q,
+        kv_lora_rank,
+        qk_rope_head_dim,
+    ) = _build_fp4_mla_attention_decode_case(
+        seq_lens=seq_lens,
+        num_heads=96,
+        seed=47,
+        query_len_per_seq=query_len_per_seq,
+        enable_helix=enable_helix,
+    )
+    try:
+        base_env = {"TRTLLM_FP4_MLA_LPT_PLAN": "1"} if lpt_plan else {}
+        common = dict(
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            with_stats=enable_helix,
+        )
+        ref_output, ref_stats = _run_packed_decode_with_env(
+            monkeypatch, metadata, q, option_env=base_env, **common
+        )
+        assert not torch.isnan(ref_output).any()
+        for _ in range(2):
+            output, stats = _run_packed_decode_with_env(
+                monkeypatch, metadata, q, option_env={**base_env, **option_env}, **common
+            )
+            assert torch.equal(output, ref_output)
+            if ref_stats is not None:
+                assert torch.equal(stats, ref_stats)
+    finally:
+        torch.cuda.synchronize()
+        _reset_triton_allocator()
+        kv_cache_manager.shutdown()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
 
 @pytest.mark.skipif(
@@ -2648,3 +2905,81 @@ def test_fp4_mla_v_repack_generation_csr_crosses_page_boundary() -> None:
     assert torch.equal(actual, expected)
     assert torch.all(actual[_V_REPACK_HEAD_DIM : 2 * _V_REPACK_HEAD_DIM] == sentinel)
     assert torch.all(actual[3 * _V_REPACK_HEAD_DIM : 4 * _V_REPACK_HEAD_DIM] == sentinel)
+
+
+@pytest.mark.skipif(
+    _is_cutedsl_unavailable(),
+    reason="requires Rubin SM107 and the CTM/CuTeDSL runtime",
+)
+@pytest.mark.parametrize(
+    "option_env",
+    [
+        {"TRTLLM_FP4_MLA_F16_PARTIALS": "1"},
+        {
+            "TRTLLM_FP4_MLA_F16_PARTIALS": "1",
+            "TRTLLM_FP4_MLA_REDUCE_PDL": "1",
+            "TRTLLM_FP4_MLA_REDUCE_SPREAD_STATS": "1",
+        },
+    ],
+    ids=["f16-partials", "f16-partials-all"],
+)
+@_PACKED_OPTION_CASES
+def test_fp4_mla_attention_decode_cutedsl_packed_f16_partials_close(
+    monkeypatch,
+    option_env: dict[str, str],
+    query_len_per_seq: int,
+    enable_helix: bool,
+    split_kv: int,
+    seq_lens: list[int],
+    lpt_plan: bool,
+) -> None:
+    """Normalized FP16 split partials (Kimi-K3's kernel module) stay within BF16 output
+    rounding of the FP32-partial path; the Helix stats depend only on the row state."""
+    _reset_triton_allocator()
+    _install_cutedsl_kernel_module(monkeypatch, "k3")
+    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "cutedsl")
+    monkeypatch.setenv(FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE_ENV, "0")
+    monkeypatch.setenv(fp4_mla_backend.FP4_MLA_PACKED_Q_ENV, "1")
+    monkeypatch.setenv("TRTLLM_FP4_MLA_SPLIT_KV", str(split_kv))
+    (
+        kv_cache_manager,
+        metadata,
+        q,
+        kv_lora_rank,
+        qk_rope_head_dim,
+    ) = _build_fp4_mla_attention_decode_case(
+        seq_lens=seq_lens,
+        num_heads=96,
+        seed=47,
+        query_len_per_seq=query_len_per_seq,
+        enable_helix=enable_helix,
+    )
+    try:
+        base_env = {"TRTLLM_FP4_MLA_LPT_PLAN": "1"} if lpt_plan else {}
+        common = dict(
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            with_stats=enable_helix,
+        )
+        ref_output, ref_stats = _run_packed_decode_with_env(
+            monkeypatch, metadata, q, option_env=base_env, **common
+        )
+        output, stats = _run_packed_decode_with_env(
+            monkeypatch, metadata, q, option_env={**base_env, **option_env}, **common
+        )
+        assert not torch.isnan(output).any()
+        ref = ref_output.float()
+        diff = output.float() - ref
+        # Two BF16 ulps of the row magnitude bound every element; the FP16
+        # partials themselves add ~2^-11 relative error before the BF16 output.
+        row_scale = ref.abs().amax(dim=-1, keepdim=True).clamp_min(1e-6)
+        assert (diff.abs() <= row_scale * 2.0**-7).all()
+        assert diff.norm() <= 2.0**-9 * ref.norm()
+        if ref_stats is not None:
+            torch.testing.assert_close(stats, ref_stats, rtol=1e-6, atol=0.0)
+    finally:
+        torch.cuda.synchronize()
+        _reset_triton_allocator()
+        kv_cache_manager.shutdown()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()

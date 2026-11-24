@@ -40,7 +40,11 @@ if TYPE_CHECKING:
     from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
 
 
-RequiredToolChoiceMode = Literal["template", "grammar"]
+# "template": the chat template asks for a tool call; "grammar": a mandatory
+# tool-call grammar enforces it; "prefer_grammar": the grammar when the request
+# can carry one (xgrammar, request-level tools, a rendered chat prompt),
+# otherwise the template.
+RequiredToolChoiceMode = Literal["template", "grammar", "prefer_grammar"]
 
 
 class OutputMode(enum.Enum):
@@ -62,6 +66,11 @@ class ServingExtension:
     # Part of the rendering fingerprint: bump it when a revision of the extension changes
     # the prompt it renders, so prepared requests from the older revision are refused.
     render_version: int = 1
+
+    # Chat-message parsing: keep an assistant tool call's arguments string verbatim when it is
+    # not valid JSON, and keep the ``tools`` a system message declares.
+    lenient_tool_call_arguments: bool = False
+    keeps_message_tools: bool = False
 
     def render_prompt(
         self, request: "ChatCompletionRequest", res: Any = None
@@ -170,21 +179,40 @@ def register_serving_extension(
 _DEFAULT_EXTENSION = ServingExtension()
 
 
+def _extension_for(model_type: Optional[str]) -> Optional[ServingExtension]:
+    """Extension registered for ``model_type``, or None.
+
+    A model family served only by modeling_v2 states its extension in its
+    architecture module; it is registered here the first time it is asked for.
+    """
+    _load_builtin_extensions()
+    if not model_type:
+        return None
+    extension = _BY_MODEL_TYPE.get(model_type)
+    if extension is None:
+        from tensorrt_llm._torch._experimental.modeling_v2._architecture_index import (
+            serving_extension,
+        )
+
+        extension = serving_extension(model_type)
+        if extension is not None:
+            _BY_MODEL_TYPE[model_type] = extension
+    return extension
+
+
 def get_serving_extension(model_type: Optional[str]) -> ServingExtension:
     """Extension registered for ``model_type``, or the all-defaults extension.
 
     The default extension matches the generic serving path, so callers can
     consult the hooks unconditionally instead of branching on a model name.
     """
-    _load_builtin_extensions()
-    extension = _BY_MODEL_TYPE.get(model_type) if model_type else None
+    extension = _extension_for(model_type)
     return _DEFAULT_EXTENSION if extension is None else extension
 
 
 def apply_model_chat_extensions(request, model_type: Optional[str]) -> None:
     """Run the registered chat-request preprocessing hook, if any."""
-    _load_builtin_extensions()
-    extension = _BY_MODEL_TYPE.get(model_type) if model_type else None
+    extension = _extension_for(model_type)
     if extension is not None:
         extension.apply_chat_extensions(request)
 
@@ -200,6 +228,5 @@ def structured_output_format_for(
 
 def required_tool_choice_mode(model_type: Optional[str]) -> Optional[RequiredToolChoiceMode]:
     """Return required-tool handling for native chat, or None if unsupported."""
-    _load_builtin_extensions()
-    extension = _BY_MODEL_TYPE.get(model_type) if model_type else None
+    extension = _extension_for(model_type)
     return None if extension is None else extension.required_tool_choice_mode()

@@ -25,21 +25,29 @@ produces the same values:
   DFlash generation step whose drafter context is a paged single-latent cache.
 * :func:`store_context_latents` -- the masked store of the context latents of
   every drafter layer into its page pool.
+* :func:`draft_history_values` -- the managed draft history's (length, position)
+  per request, gathered from the drafter's context-length state.
 
 Launch shapes depend only on host batch sizes, so all of them are CUDA-graph
 capturable.
 """
 
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 import torch
 import triton
 import triton.language as tl
 
 _BLOCK_TABLE_BLOCK = 2048
+# Rows per program of _strict_accept_kernel. Fixed, like the arguments in its do_not_specialize list, so
+# one compiled variant per draft length serves every batch: serving changes the request counts on every
+# iteration, and a new variant compiles and loads a module on the sampling path.
+_STRICT_ACCEPT_BLOCK_B = 128
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["draft_ptr", "stride_draft_row", "stride_draft_col", "num_ctx", "num_gen"]
+)
 def _strict_accept_kernel(
     target_ptr,
     draft_ptr,
@@ -108,7 +116,7 @@ def strict_accept(
     num_accepted = torch.empty((batch_size,), dtype=torch.int32, device=device)
     if batch_size == 0:
         return accepted, num_accepted
-    block_b = min(triton.next_power_of_2(max(num_contexts, num_gens, 1)), 128)
+    block_b = _STRICT_ACCEPT_BLOCK_B
     grid = (triton.cdiv(max(num_contexts, num_gens, 1), block_b),)
     _strict_accept_kernel[grid](
         target_tokens,
@@ -237,13 +245,17 @@ def _paged_latent_prepare_kernel(
     blk_offsets_ptr,
     blk_seq_lens_ptr,
     blk_kv_bounds_ptr,
+    position_offset_ptr,
     num_gens,
     first_row,
     dummy_slot,
     max_ctx,
+    cp_rank,
     PAGE_SIZE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     WIDTH: tl.constexpr,
+    CP_SIZE: tl.constexpr,
+    HAS_POSITION_OFFSET: tl.constexpr,
     BLOCK_G: tl.constexpr,
     BLOCK_W: tl.constexpr,
 ):
@@ -271,26 +283,39 @@ def _paged_latent_prepare_kernel(
     tl.store(query_pos_ptr + blk, now[:, None] + j[None, :], mask=qmask)
 
     # Context latents of this step's target tokens: RoPE position, destination
-    # (column clamped into the request's allocation) and write mask.
+    # (column clamped into the request's allocation) and write mask. Under helix
+    # (CP_SIZE > 1) global page p lives on rank p % CP_SIZE as its local page
+    # p // CP_SIZE; positions on other ranks' pages are skipped (mask -1).
     wmask = gm[:, None] & (j[None, :] < WIDTH)
     flat = g[:, None] * WIDTH + j[None, :]
     pos = old[:, None] + j[None, :]
     tl.store(ctx_pos_ptr + flat, pos, mask=wmask)
-    col = tl.maximum(tl.minimum(pos, capacity[:, None] - 1), 0)
+    gpage = pos // PAGE_SIZE
+    col = (gpage // CP_SIZE) * PAGE_SIZE + pos % PAGE_SIZE
+    col = tl.maximum(tl.minimum(col, capacity[:, None] - 1), 0)
     page = tl.load(table_row[:, None] + tl.minimum(col // PAGE_SIZE, max_blocks - 1), mask=wmask)
     tl.store(store_pages_ptr + flat, page.to(tl.int64), mask=wmask)
     tl.store(store_offsets_ptr + flat, col % PAGE_SIZE, mask=wmask)
-    tl.store(store_mask_ptr + flat, (j[None, :] < nacc[:, None]).to(tl.int8), mask=wmask)
+    store = (j[None, :] < nacc[:, None]).to(tl.int8)
+    store = tl.where(gpage % CP_SIZE == cp_rank, store, -1)
+    tl.store(store_mask_ptr + flat, store, mask=wmask)
 
-    # Advance the context length; the shared dummy slot stays empty.
+    # Advance the context length; the shared dummy slot stays empty. A length
+    # clamped at max_ctx moves the history's position offset instead.
     new_len = tl.where(slot == dummy_slot, 0, now)
+    if HAS_POSITION_OFFSET:
+        live = gm & (slot != dummy_slot)
+        offset = tl.load(position_offset_ptr + slot, mask=live, other=0)
+        overflow = tl.maximum(old + nacc - max_ctx, 0)
+        tl.store(position_offset_ptr + slot, offset + overflow, mask=live)
     # Every lane has read its old length before any lane writes a new one.
     tl.debug_barrier()
     tl.store(ctx_len_ptr + slot, new_len, mask=gm)
     tl.store(ctx_len_ptr + dummy_slot, tl.zeros([], dtype=tl.int64))
 
-    # Advertised context, capped so the block still fits in the allocation.
-    num_ctx = tl.minimum(new_len, tl.maximum(capacity - BLOCK_SIZE, 0))
+    # Advertised context, capped so the block still fits in the allocation
+    # (CP_SIZE local pages cover CP_SIZE times as many global positions).
+    num_ctx = tl.minimum(new_len, tl.maximum(capacity * CP_SIZE - BLOCK_SIZE, 0))
     tl.store(num_ctx_ptr + g, num_ctx, mask=gm)
     tl.store(
         seq_lens_ptr + row,
@@ -298,12 +323,20 @@ def _paged_latent_prepare_kernel(
         mask=gm,
     )
 
-    # Block-decode operands: where the block's own latents go, and its bounds.
+    # Block-decode operands: where the block's own latents go, and its bounds
+    # (rank-local slots and lengths under helix, as HelixDraftShard computes).
     bpos = num_ctx[:, None] + j[None, :]
-    bpage = tl.load(table_row[:, None] + tl.minimum(bpos // PAGE_SIZE, max_blocks - 1), mask=qmask)
+    bgpage = bpos // PAGE_SIZE
+    bslot = (bgpage // CP_SIZE) * PAGE_SIZE + bpos % PAGE_SIZE
+    bpage = tl.load(table_row[:, None] + tl.minimum(bslot // PAGE_SIZE, max_blocks - 1), mask=qmask)
     tl.store(blk_pages_ptr + blk, bpage.to(tl.int64), mask=qmask)
-    tl.store(blk_offsets_ptr + blk, bpos % PAGE_SIZE, mask=qmask)
-    seq_len = (num_ctx + BLOCK_SIZE).to(tl.int32)
+    tl.store(blk_offsets_ptr + blk, bslot % PAGE_SIZE, mask=qmask)
+    total = num_ctx + BLOCK_SIZE
+    if CP_SIZE > 1:
+        span = PAGE_SIZE * CP_SIZE
+        rem = total % span - cp_rank * PAGE_SIZE
+        total = (total // span) * PAGE_SIZE + tl.minimum(tl.maximum(rem, 0), PAGE_SIZE)
+    seq_len = total.to(tl.int32)
     tl.store(blk_seq_lens_ptr + g, seq_len, mask=gm)
     tl.store(
         blk_kv_bounds_ptr + blk,
@@ -326,6 +359,9 @@ def dflash_paged_latent_prepare(
     page_size: int,
     block_size: int,
     width: int,
+    position_offset: Optional[torch.Tensor] = None,
+    cp_size: int = 1,
+    cp_rank: int = 0,
 ) -> PagedLatentPrepare:
     """The DFlash generation-step bookkeeping for a paged single-latent context.
 
@@ -348,6 +384,11 @@ def dflash_paged_latent_prepare(
         max_ctx: context length ceiling.
         page_size, block_size, width: page size, drafted block positions and
             target tokens per request.
+        position_offset: the unified draft cache's ``[slots]`` history position
+            offset; takes what a length clamped at ``max_ctx`` loses, in place.
+        cp_size, cp_rank: helix sharding of the context pages
+            (``HelixDraftShard``). With ``cp_size > 1`` the store mask is -1 on
+            other ranks' positions and the block operands are rank-local.
     """
     num_gens = slots.shape[0]
     device = ctx_len.device
@@ -380,13 +421,17 @@ def dflash_paged_latent_prepare(
         block_tables.shape[1],
         seq_lens_cuda,
         *out,
+        ctx_len if position_offset is None else position_offset,
         num_gens,
         first_row,
         dummy_slot,
         max_ctx,
+        cp_rank,
         PAGE_SIZE=page_size,
         BLOCK_SIZE=block_size,
         WIDTH=width,
+        CP_SIZE=cp_size,
+        HAS_POSITION_OFFSET=position_offset is not None,
         BLOCK_G=triton.next_power_of_2(num_gens),
         BLOCK_W=triton.next_power_of_2(max(width, block_size)),
         num_warps=4,
@@ -407,6 +452,7 @@ def _store_context_latents_kernel(
     mask_ptr,
     head_dim,
     BLOCK_D: tl.constexpr,
+    POOL_FP8: tl.constexpr,
 ):
     tok = tl.program_id(0)
     layer = tl.program_id(1)
@@ -414,14 +460,23 @@ def _store_context_latents_kernel(
     dmask = offs < head_dim
     page = tl.load(pages_ptr + tok)
     off = tl.load(offsets_ptr + tok)
-    keep = tl.load(mask_ptr + tok).to(tl.float32)
+    flag = tl.load(mask_ptr + tok)
+    keep = (flag > 0).to(tl.float32)
     src = latent_ptr + tok.to(tl.int64) * stride_latent_tok + layer * stride_latent_layer
     vals = tl.load(src + offs, mask=dmask, other=0.0)
     # The eager path multiplies by the mask in the latent dtype: x * 1 is x and
     # x * 0 a signed zero either way.
     vals = (vals.to(tl.float32) * keep).to(vals.dtype)
+    if POOL_FP8:
+        # to_draft_fp8: saturated E4M3 at unit scale, round to nearest even.
+        vals = tl.minimum(tl.maximum(vals.to(tl.float32), -448.0), 448.0).to(tl.float8e4nv)
     pool = tl.load(pool_ptrs_ptr + layer).to(tl.pointer_type(vals.dtype))
-    tl.store(pool + page * stride_pool_page + off * stride_pool_off + offs, vals, mask=dmask)
+    # A -1 flag leaves the slot untouched (another helix rank owns it).
+    tl.store(
+        pool + page * stride_pool_page + off * stride_pool_off + offs,
+        vals,
+        mask=dmask & (flag >= 0),
+    )
 
 
 def store_context_latents(
@@ -441,14 +496,19 @@ def store_context_latents(
             all with the same strides.
         pool_ptrs: ``[L]`` int64 base addresses of ``pools``.
         pages, offsets: ``[N]`` destination page and offset in the page.
-        mask: ``[N]`` int8 write mask; 0 stores a zeroed latent.
+        mask: ``[N]`` int8 write mask; 0 stores a zeroed latent, -1 leaves the
+            slot untouched.
+
+    An FP8 E4M3 pool stores ``to_draft_fp8`` of the masked latent.
     """
     num_tokens, num_layers, head_dim = latent.shape
     if num_tokens == 0:
         return
     pool0 = pools[0]
     assert latent.stride(-1) == 1 and pool0.stride(-1) == 1
-    assert all(p.stride() == pool0.stride() and p.dtype == latent.dtype for p in pools)
+    assert all(p.stride() == pool0.stride() and p.dtype == pool0.dtype for p in pools)
+    pool_fp8 = pool0.dtype == torch.float8_e4m3fn
+    assert pool_fp8 or pool0.dtype == latent.dtype
     _store_context_latents_kernel[(num_tokens, num_layers)](
         latent,
         latent.stride(0),
@@ -461,5 +521,50 @@ def store_context_latents(
         mask,
         head_dim,
         BLOCK_D=triton.next_power_of_2(head_dim),
+        POOL_FP8=pool_fp8,
         num_warps=4,
     )
+
+
+@triton.jit(do_not_specialize=["n"])
+def _draft_history_values_kernel(ctx_len, position_offset, slots, out, n, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    mask = offs < n
+    slot = tl.load(slots + offs, mask=mask, other=0).to(tl.int64)
+    length = tl.load(ctx_len + slot, mask=mask, other=0)
+    offset = tl.load(position_offset + slot, mask=mask, other=0)
+    tl.store(out + offs * 2, length, mask=mask)
+    tl.store(out + offs * 2 + 1, length + offset, mask=mask)
+
+
+def draft_history_values(
+    ctx_len: torch.Tensor, position_offset: torch.Tensor, slots: torch.Tensor
+) -> torch.Tensor:
+    """``torch.stack((ctx_len[slots], ctx_len[slots] + position_offset[slots]), dim=1)``.
+
+    Args:
+        ctx_len, position_offset: ``[num_slots]`` contiguous tensors of one integer dtype.
+        slots: ``[n]`` slot indices.
+
+    Returns:
+        A new ``[n, 2]`` tensor of ``ctx_len``'s dtype on its device, written on the current
+        stream. CUDA inputs take one single-program launch; other devices the eager ops.
+    """
+    n = slots.shape[0]
+    if not ctx_len.is_cuda:
+        lengths = ctx_len[slots]
+        return torch.stack((lengths, lengths + position_offset[slots]), dim=1)
+    assert ctx_len.is_contiguous() and position_offset.is_contiguous() and slots.is_contiguous()
+    assert position_offset.dtype == ctx_len.dtype
+    out = torch.empty((n, 2), dtype=ctx_len.dtype, device=ctx_len.device)
+    if n:
+        _draft_history_values_kernel[(1,)](
+            ctx_len,
+            position_offset,
+            slots,
+            out,
+            n,
+            BLOCK=max(triton.next_power_of_2(n), 16),
+            num_warps=1,
+        )
+    return out

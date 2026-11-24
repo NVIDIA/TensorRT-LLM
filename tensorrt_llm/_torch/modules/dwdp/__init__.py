@@ -31,6 +31,7 @@ Key design principles:
 """
 
 from .page_pool import PagePool, compute_slot_sizes
+from .prefetch_schedule import CyclicPrefetchSchedule
 from .rendezvous import StoreDwdpGroup, dwdp_global_rank, store_rendezvous_enabled
 from .setup import setup_dwdp, teardown_dwdp
 from .specs import (
@@ -55,7 +56,7 @@ from .vmm import (
     tensor_from_ptr,
 )
 from .weight_buffer import WeightBuffer
-from .weight_manager import DWDPWeightManager
+from .weight_manager import DWDPWeightManager, cross_step_prefetch_enabled
 
 __all__ = [
     # Data classes
@@ -83,6 +84,8 @@ __all__ = [
     "DWDPTransport",
     "WeightBuffer",
     "DWDPWeightManager",
+    "CyclicPrefetchSchedule",
+    "cross_step_prefetch_enabled",
     # Rendezvous
     "StoreDwdpGroup",
     "dwdp_global_rank",

@@ -26,11 +26,16 @@ Uses the grouped-GEMM NVFP4 weight layout (``NVFP4CuteDslFusedMoEMethod``),
 locality-domain (uGPU) support.
 """
 
+import os
+from dataclasses import dataclass
+
 import torch
 
+from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ....autotuner import AutoTuner
+from ....custom_ops.cute_dsl_custom_ops import fc12_counter_layout, fc12_die_sched_requested
 from ....model_config import ModelConfig
 from ....utils import ActivationType, AuxStreamType, EventType
 from ..activation import (
@@ -56,8 +61,69 @@ from ..interface import MoESchedulerKind, _reject
 from ..quantization import MoEWeightLoadingMode, NVFP4CuteDslFusedMoEMethod
 from ..routing import BaseMoeRoutingMethod
 from .identity import KERNEL_FUSED_FC12, PROVIDER_TRTLLM, TECHNIQUE_CUTEDSL
-from .kernel_inputs import NvFp4WeightView, finalize_routing_scales, quantize_input_nvfp4
+from .kernel_inputs import (
+    NvFp4WeightView,
+    finalize_routing_scales,
+    presorted_routing,
+    quantize_input_nvfp4,
+    sort_routing,
+)
 from .runners import CuteDslFusedMoENvfp4Runner
+
+# TRTLLM_K3_FC12_DIE_LAYOUT=1 (default 0): on a two-die GPU (Rubin R200), post_load_weights
+# re-homes this backend's expert weights (w3_w1_weight, w2_weight) into die-alternating memory
+# (``die_locality.die_alternating_copy``: 2 MiB chunks alternating between the dies, same bytes
+# and layout) and releases the originals; results are unchanged. TRTLLM_K3_FC12_DIE_SCHED=1 then
+# lets FC12 CTAs read mostly their own die's weights. Not applied with DWDP or EPLB, which rebind
+# or migrate the weights at run time.
+_K3_FC12_DIE_LAYOUT_ENV = "TRTLLM_K3_FC12_DIE_LAYOUT"
+# TRTLLM_K3_ULL_EXPERTS (default 0): up to 32 tokens, the Kimi-K3 small-batch FC1 + SiTU + FC2 +
+# combine kernel of the Kimi K3 (k3_rubin) package (``_K3_ULL_EXPERTS_MODULE``) serves the call
+# on the same weights and routing tables instead of the fused FC12 kernel.
+_K3_ULL_EXPERTS_ENV = "TRTLLM_K3_ULL_EXPERTS"
+# TRTLLM_K3_ULL_EXPERTS_DIE_MAJOR=1 (default 0; with TRTLLM_K3_ULL_EXPERTS=1): post_load_weights
+# re-homes the expert weights and block scales die-major (k3_ull_experts.die_major_weights: every
+# expert's first half of W1 row blocks and of W2 output rows on die 0, the second halves on die 1;
+# the parameters keep their shapes over the new bytes) and the ULL experts kernel claims its work
+# per die (EP and MoE-TP layouts). Takes precedence over TRTLLM_K3_FC12_DIE_LAYOUT. The FC12 kernel
+# cannot read that layout: every call of such a layer must be served by the ULL kernel
+# (k3_ull_experts.ull_experts_max_tokens), else the call raises.
+_K3_ULL_DIE_MAJOR_ENV = "TRTLLM_K3_ULL_EXPERTS_DIE_MAJOR"
+_K3_ULL_EXPERTS_MODULE = (
+    "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.k3_rubin.moe.k3_ull_experts"
+)
+
+
+def _fc12_counter_words(num_local_experts: int, num_tokens: int, top_k: int) -> int:
+    """FC12 counter words for ``moe_sort``'s tile count at the 128-row tile (more tiles than at
+    256 rows) of ``num_tokens`` tokens with ``top_k`` experts each over ``num_local_experts``."""
+    expanded = num_tokens * top_k
+    filled = min(num_local_experts, expanded)
+    max_tiles = filled + (expanded - filled) // 128
+    return fc12_counter_layout(max_tiles, die_sched=fc12_die_sched_requested())[2]
+
+
+def _k3_ull_experts():
+    """The Kimi-K3 (k3_rubin) package's ULL experts module (imported on first use)."""
+    import importlib
+
+    return importlib.import_module(_K3_ULL_EXPERTS_MODULE)
+
+
+@dataclass
+class Fc12ZeroedOutput:
+    """Output and FC12 counters of one ``CuteDslFc12FusedMoE`` call, zeroed ahead of it.
+
+    ``buffer`` (int32) holds the BF16 ``output`` ``[num_tokens, hidden_size]``, then, from a
+    128-byte boundary, ``counters`` (enough words for ``fc12_counter_layout`` of every tile count
+    the routing can produce). The caller zeroes ``buffer`` on a stream ordered after its
+    allocation, records ``ready`` there and sets ``CuteDslFc12FusedMoE.zeroed_output``.
+    """
+
+    buffer: torch.Tensor
+    output: torch.Tensor
+    counters: torch.Tensor
+    ready: torch.cuda.Event
 
 
 class CuteDslFc12FusedMoENvfp4Runner(CuteDslFusedMoENvfp4Runner):
@@ -81,7 +147,23 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
     """``trtllm.cutedsl.fused_fc12.nvfp4``: FC1+FC2-fused CuteDSL NVFP4 MoE (Rubin/SM107).
 
     Takes the constructor arguments of ``CuteDslFusedMoEBase``.
+
+    When the top-k ids carry ``moe_sort`` outputs for this rank (see
+    :func:`presorted_routing`; the Kimi-K3 routing tail attaches them), the
+    backend runs at their tile size instead of the autotuned one and skips
+    ``moe_sort``.
+
+    A caller that zeroed the output and the kernel's counters ahead of the call
+    (:meth:`new_zeroed_output`, ``zeroed_output``) saves the counter fill and
+    the output memset the fused op otherwise issues right before the kernel.
     """
+
+    #: Set right before a call by a caller that zeroed its output and counters
+    #: (:class:`Fc12ZeroedOutput`); taken by that call's ``run_moe_nvfp4``.
+    zeroed_output: Fc12ZeroedOutput | None = None
+    # ``(output, counters)`` of the taken ``zeroed_output`` until the fused op
+    # on that output consumes them.
+    _zeroed_counters: tuple[torch.Tensor, torch.Tensor] | None = None
 
     # ConfigurableMoE reads this off the backend type: the fused kernel takes
     # per-tile expert ranges, so EP need not divide the expert count.
@@ -256,6 +338,153 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         if dwdp_handle_collector is not None:
             dwdp_handle_collector.register_weights(self)
 
+    # ------------------------------------------------------------------
+    # Output and counters zeroed ahead of a call (caller-driven)
+    # ------------------------------------------------------------------
+    def new_zeroed_output(
+        self, num_tokens: int, top_k: int, device: torch.device, ready: torch.cuda.Event
+    ) -> Fc12ZeroedOutput:
+        """Allocate, on the current stream, the output and FC12 counters of a call on
+        ``num_tokens`` tokens with ``top_k`` experts each (not zeroed yet).
+
+        The fused op checks the counter size again.
+        """
+        counter_words = _fc12_counter_words(self.expert_size_per_partition, num_tokens, top_k)
+        out_elems = num_tokens * self.hidden_size
+        # BF16 pairs per int32 word; the counters start on a 128-byte line.
+        out_words = (out_elems + 1) // 2
+        out_words = (out_words + 31) // 32 * 32
+        buffer = torch.empty(out_words + counter_words, dtype=torch.int32, device=device)
+        output = (
+            buffer[:out_words].view(torch.bfloat16)[:out_elems].view(num_tokens, self.hidden_size)
+        )
+        return Fc12ZeroedOutput(buffer, output, buffer[out_words:], ready)
+
+    def drop_zeroed_output(self) -> None:
+        """Join a ``zeroed_output`` no call took, so the current stream may reuse its buffer."""
+        zeroed, self.zeroed_output = self.zeroed_output, None
+        if zeroed is not None:
+            zeroed.ready.wait()
+
+    def _take_zeroed_output(
+        self, moe_output: torch.Tensor | None, num_tokens: int
+    ) -> torch.Tensor | None:
+        """Take ``zeroed_output`` for this call: join its stream, then return its output in place
+        of ``moe_output`` if the caller passed none or that same output and the shape fits (its
+        counters then wait for the fused op in ``_zeroed_counters``), else ``moe_output``."""
+        zeroed, self.zeroed_output = self.zeroed_output, None
+        # Zeroed on another stream: join it before anything can touch the buffer.
+        zeroed.ready.wait()
+        self._zeroed_counters = None
+        same = moe_output is not None and (
+            moe_output.data_ptr() == zeroed.output.data_ptr()
+            and tuple(moe_output.shape) == tuple(zeroed.output.shape)
+        )
+        if (moe_output is not None and not same) or tuple(zeroed.output.shape) != (
+            num_tokens,
+            self.hidden_size,
+        ):
+            return moe_output
+        self._zeroed_counters = (zeroed.output, zeroed.counters)
+        return zeroed.output
+
+    # ------------------------------------------------------------------
+    # Die placement of the expert weights (two-die GPUs)
+    # ------------------------------------------------------------------
+    def post_load_weights(self) -> None:
+        super().post_load_weights()
+        if (
+            os.environ.get(_K3_ULL_DIE_MAJOR_ENV, "0") == "1"
+            and self.place_expert_weights_die_major()
+        ):
+            return
+        if os.environ.get(_K3_FC12_DIE_LAYOUT_ENV, "0") == "1":
+            self.place_expert_weights_per_die()
+
+    def place_expert_weights_die_major(self) -> bool:
+        """TRTLLM_K3_ULL_EXPERTS_DIE_MAJOR: re-home the expert weights and their block scales
+        die-major for the ULL experts kernel. Returns whether they are placed (placing twice is a
+        no-op); the SM -> die table is measured here too, ahead of CUDA graph capture."""
+        from ....die_locality import sm_die_table
+
+        if getattr(self, "_ull_die_major", False):
+            return True
+        ull = _k3_ull_experts()
+        names = ("w3_w1_weight", "w3_w1_weight_scale", "w2_weight", "w2_weight_scale")
+        if ull.ull_experts_mode() <= 0 or not all(hasattr(self, n) for n in names):
+            return False
+        # die-major weights are read only by the ULL experts kernel, which needs a FC1 row order
+        # it reads
+        if ull.fc1_gate_up16(self) is None:
+            return False
+        if getattr(self, "dwdp_handle_collector", None) is not None or self._using_load_balancer():
+            logger.warning_once(
+                f"{_K3_ULL_DIE_MAJOR_ENV}: not with DWDP or EPLB, which rebind or migrate the "
+                "expert weights",
+                key="ull_die_major_skipped",
+            )
+            return False
+        params = [getattr(self, n) for n in names]
+        # [experts, rows, cols] tensors whose rows split into whole 128-row blocks
+        if any(p.data.dim() != 3 or p.data.size(1) % 256 for p in params):
+            return False
+        copies, placed = ull.die_major_weights(*(p.data for p in params))
+        if not placed:
+            logger.warning_once(
+                f"{_K3_ULL_DIE_MAJOR_ENV}: device has no die-split memory; expert weights keep "
+                "the default placement",
+                key="ull_die_major_unavailable",
+            )
+            return False
+        for p, c in zip(params, copies):
+            p.data = c.view(p.data.shape)
+        del copies
+        self._ull_die_major = True
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        sm_die_table(self.w3_w1_weight.device.index)
+        return True
+
+    def place_expert_weights_per_die(self) -> bool:
+        """Re-home ``w3_w1_weight`` and ``w2_weight`` into die-alternating memory.
+
+        Each weight is copied (same shape, dtype and bytes) into one VA range whose 2 MiB chunks
+        alternate between the two dies, its parameter is pointed at the copy and the original
+        is released. With ``TRTLLM_K3_FC12_DIE_SCHED`` the SM -> die table is measured here too,
+        ahead of CUDA graph capture. Returns whether the weights were placed: not on devices
+        with one die, with DWDP or EPLB, or when the driver does not home a chunk as requested.
+        """
+        from ....die_locality import die_alternating_copy, sm_die_table
+
+        if getattr(self, "dwdp_handle_collector", None) is not None or self._using_load_balancer():
+            logger.warning_once(
+                f"{_K3_FC12_DIE_LAYOUT_ENV}: not placing FC12 expert weights per die with "
+                "DWDP or EPLB, which rebind or migrate them",
+                key="fc12_die_layout_skipped",
+            )
+            return False
+        copies = []
+        for name in ("w3_w1_weight", "w2_weight"):
+            copy = die_alternating_copy(getattr(self, name).data)
+            if copy is None:
+                logger.warning_once(
+                    f"{_K3_FC12_DIE_LAYOUT_ENV}: device has no die-alternating memory; "
+                    "FC12 expert weights keep the default placement",
+                    key="fc12_die_layout_unavailable",
+                )
+                return False
+            copies.append(copy)
+        for name, copy in zip(("w3_w1_weight", "w2_weight"), copies):
+            getattr(self, name).data = copy
+        del copies
+        # The originals' blocks back to the driver: the next layer's copies are driver
+        # allocations outside the caching allocator.
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        if fc12_die_sched_requested():
+            sm_die_table(self.w3_w1_weight.device.index)
+        return True
+
     def _build_local_weight_view(self) -> NvFp4WeightView:
         """Build the weight view from this backend's per-layer weights."""
         return NvFp4WeightView(
@@ -303,6 +532,9 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         assert weight_view is not None
         output_dtype = torch.bfloat16
 
+        if getattr(self, "zeroed_output", None) is not None:
+            moe_output = self._take_zeroed_output(moe_output, token_final_scales.size(0))
+
         if moe_output is None:
             moe_output = torch.empty(
                 (token_final_scales.size(0), self.hidden_size), dtype=output_dtype, device=x.device
@@ -331,6 +563,14 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
             workload_identity=self._epilogue_identity(),
         )
         inputs = [x, token_selected_experts, token_final_scales, x_sf, moe_output, weight_view]
+        # Routing tables a router attached for this rank fix the tile size:
+        # running at their tile skips moe_sort (the Kimi-K3 routing tail emits
+        # 128-row tiles, the best FC12 tile at decode batch sizes).
+        presorted = presorted_routing(
+            token_selected_experts, weight_view.slot_start, weight_view.expert_size_per_partition
+        )
+        if presorted is not None and presorted[0] in CuteDslFc12FusedMoENvfp4Runner._tile_sizes():
+            return runner(inputs, tactic=presorted[0])
         _, best_tactic = tuner.choose_one(
             "CuteDslFc12FusedMoE::run_moe_nvfp4",
             [runner],
@@ -382,7 +622,18 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         esp = weight_view.expert_size_per_partition
         situ_beta, situ_linear_beta = self._situ_betas()
         slot_start = weight_view.slot_start
+        # Counters zeroed with ``moe_output`` (``zeroed_output``), for the one
+        # call on that output; profiling calls on other tensors drop them.
+        fused_kwargs = {}
+        if getattr(self, "_zeroed_counters", None) is not None:
+            zeroed_out, zeroed_counters = self._zeroed_counters
+            self._zeroed_counters = None
+            if zeroed_out is moe_output:
+                fused_kwargs["zeroed_counters"] = zeroed_counters
 
+        routing = sort_routing(
+            self, token_selected_experts, token_final_scales, weight_view, tile_size
+        )
         (
             tile_idx_to_expert_idx,
             tile_idx_to_mn_limit,
@@ -390,26 +641,47 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
             permuted_idx_to_expanded_idx,
             total_num_padded_tokens,
             num_non_exiting_tiles,
-        ) = torch.ops.trtllm.moe_sort(
-            token_selected_experts=token_selected_experts,
-            token_final_scales=token_final_scales,
-            num_experts=self.num_slots,
-            top_k=effective_top_k,
-            local_expert_offset=slot_start,
-            local_num_experts=esp,
-            tile_tokens_dim=tile_size,
-        )
+        ) = routing
+
+        if os.environ.get(_K3_ULL_EXPERTS_ENV, "0") != "0":
+            ull = _k3_ull_experts()
+            if ull.ull_experts_applies(self, x.size(0), weight_view, tile_size, enable_alltoall):
+                # Writes every element of moe_output.
+                return ull.run_ull_experts(
+                    self,
+                    x,
+                    x_sf,
+                    moe_output,
+                    weight_view,
+                    token_final_scales,
+                    routing,
+                    effective_top_k,
+                )
+        if getattr(self, "ull_moeblk", None) is not None:
+            self.ull_moeblk = None
+            raise RuntimeError(
+                "TRTLLM_K3_ULL_MOEBLK: the front published the top-k without moe_sort tables, but "
+                "the ULL experts kernel does not serve this call"
+            )
+        if getattr(self, "_ull_die_major", False):
+            raise RuntimeError(
+                f"{_K3_ULL_DIE_MAJOR_ENV}: this layer's expert weights are die-major, which only "
+                f"the ULL experts kernel reads; {x.size(0)} tokens are outside its range (lower "
+                "max_num_tokens)"
+            )
 
         # One fused op: gather + FC1 GEMM + gated act (SwiGLU or SiTU) + requant
         # + FC2 GEMM + finalize (scatter-add into moe_output = a2a combine
         # workspace).
         # fc1_alpha/fc2_alpha map 1:1 to the two-op path's per-expert global
         # scales (the kernel takes split alphas). The three atomic counters are
-        # allocated + memset inside the op runner. The moe_output zeroing memset
-        # is issued inside the op too (right before the fused kernel, so it is
-        # the kernel's immediate stream predecessor and the PDL prologue can
-        # overlap it); expanded_idx_to_permuted_idx / ep_size / enable_alltoall
-        # are passed through for that memset.
+        # allocated + zeroed inside the op runner, and the moe_output zeroing
+        # memset is issued there right before the fused kernel (so it is the
+        # kernel's immediate stream predecessor and the PDL prologue can overlap
+        # it; expanded_idx_to_permuted_idx / ep_size / enable_alltoall are
+        # passed through for it), unless ``zeroed_counters`` come with an output
+        # that is already zero: then the fused kernel directly follows the
+        # routing on this stream.
         torch.ops.trtllm.cute_dsl_nvfp4_fc12_fused_rubin(
             input=x.view(torch.float4_e2m1fn_x2),
             fc1_weight=weight_view.w3_w1_weight.view(torch.float4_e2m1fn_x2),
@@ -439,5 +711,6 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
             activation_type=int(self.activation_type),
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
+            **fused_kwargs,
         )
         return moe_output

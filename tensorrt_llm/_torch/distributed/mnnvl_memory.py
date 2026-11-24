@@ -371,10 +371,9 @@ class MnnvlMemory:
 
         Every size a comm_split_color_key() implementation reads has to appear here,
         including the ones it reads only through Mapping: moe_tp_rank is
-        tp_rank // (moe_ep_size * moe_cluster_size). moe_cluster_size does not follow from
-        the other entries either, because Mapping derives moe_world_size as tp_size alone
-        under Ulysses CP and as tp_size * cp_size otherwise, so two mappings can agree on
-        everything else listed here and still split into different groups.
+        moe_group_rank // (moe_ep_size * moe_cluster_size). moe_cluster_size does not follow
+        from the other entries either, so two mappings can agree on everything else listed
+        here and still split into different groups.
         """
         return (
             mapping.world_size,
@@ -393,7 +392,16 @@ class MnnvlMemory:
 
     @classmethod
     def comm_split_color_key(cls, mapping: Mapping) -> tuple[int, int]:
-        """Group ranks by PP+CP+MOE_TP, ordering each group by TP rank."""
+        """Group ranks by PP+CP+MOE_TP, ordering each group by TP rank.
+
+        Under Ulysses CP the MoE group spans TP x CP: group by PP+MOE_TP, ordered by
+        Mapping.moe_group_rank.
+        """
+        if getattr(mapping, "has_cp_ulysses", lambda: False)():
+            return (
+                mapping.pp_rank * mapping.moe_tp_size + mapping.moe_tp_rank,
+                mapping.moe_group_rank,
+            )
         return (
             (mapping.pp_rank * mapping.cp_size + mapping.cp_rank) * mapping.moe_tp_size
             + mapping.moe_tp_rank,

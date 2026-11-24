@@ -80,6 +80,9 @@ del _BatchDescFieldSpec, _dataclasses_bd
 BufferConfig = _cpp.BufferConfig
 BufferId = _cpp.BufferId
 CoalescedBuffer = _cpp.CoalescedBuffer
+# None with bindings built before attention layers carried an ownership domain;
+# KVCacheManagerV2 then rejects unified standalone draft layers.
+CacheDomain = getattr(_cpp, "CacheDomain", None)
 CacheTier = _cpp.CacheTier
 CorruptedError = _cpp.CorruptedError
 CuError = _cpp.CuError
@@ -224,6 +227,7 @@ __all__ = [
     "BufferConfig",
     "BufferId",
     "CoalescedBuffer",
+    "CacheDomain",
     "CacheLevel",
     "CacheTier",
     "CacheTierConfig",

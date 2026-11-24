@@ -1861,7 +1861,9 @@ void invokeMLAContextFp8Quantize(MlaParams<T>& params, int total_kv_len, cudaStr
             {
                 constexpr int threads_per_block = 288;
                 constexpr int num_tokens_per_block = threads_per_block * 16 / 576 * sizeof(T);
-                dim3 grid(int(tensorrt_llm::common::divUp(total_kv_len, num_tokens_per_block)), 1, params.head_num);
+                // Absorption mode quantizes Q only (K and V stay in the paged cache), so the grid covers the
+                // acc_q_len Q tokens.
+                dim3 grid(int(tensorrt_llm::common::divUp(params.acc_q_len, num_tokens_per_block)), 1, params.head_num);
 
                 TLLM_LOG_DEBUG(
                     "Launching quantizeCopyInputToFp8Kernel with grid_size: (%d, %d, %d), threads_per_block: %d, "
@@ -1880,7 +1882,8 @@ void invokeMLAContextFp8Quantize(MlaParams<T>& params, int total_kv_len, cudaStr
             {
                 constexpr int threads_per_block = 256;
                 constexpr int num_tokens_per_block = threads_per_block * 16 / 512 * sizeof(T);
-                dim3 grid(int(tensorrt_llm::common::divUp(total_kv_len, num_tokens_per_block)), 1, params.head_num);
+                // Q only, as above.
+                dim3 grid(int(tensorrt_llm::common::divUp(params.acc_q_len, num_tokens_per_block)), 1, params.head_num);
 
                 TLLM_LOG_DEBUG(
                     "Launching quantizeCopyInputToFp8Kernel with grid_size: (%d, %d, %d), threads_per_block: %d, "
@@ -1895,6 +1898,27 @@ void invokeMLAContextFp8Quantize(MlaParams<T>& params, int total_kv_len, cudaStr
                         srcVTokenStride, params.quant_scale_qkv, params.bmm1_scale, params.bmm2_scale,
                         params.quant_scale_o, params.dequant_scale_q, params.dequant_scale_kv, params.host_bmm1_scale);
             }
+        }
+        else if (params.fp8_kv_input)
+        {
+            // K and V are FP8 already: quantize Q only, or nothing when it is FP8 too. Block 0 still writes
+            // the BMM scales.
+            constexpr int threads_per_block = 384;
+            constexpr int num_tokens_per_block = threads_per_block * 16 / 192 * sizeof(T);
+            int const q_len = params.fp8_q_input ? 0 : params.acc_q_len;
+            dim3 grid(std::max(1, int(tensorrt_llm::common::divUp(q_len, num_tokens_per_block))), 1,
+                params.fp8_q_input ? 1 : params.head_num);
+
+            TLLM_LOG_DEBUG(
+                "Launching quantizeCopyInputToFp8Kernel (FP8 K/V input) with grid_size: (%d, %d, %d), "
+                "threads_per_block: %d, acc_q_len: %d, fp8_q_input: %d",
+                grid.x, grid.y, grid.z, threads_per_block, params.acc_q_len, params.fp8_q_input);
+
+            quantizeCopyInputToFp8Kernel<T, threads_per_block, 128, 64, 128, false>
+                <<<grid, threads_per_block, 0, stream>>>(params.q_buf, static_cast<__nv_fp8_e4m3*>(params.quant_q_buf),
+                    nullptr, nullptr, nullptr, nullptr, q_len, /*total_kv_len=*/0, /*src_v_token_stride=*/0,
+                    params.quant_scale_qkv, params.bmm1_scale, params.bmm2_scale, params.quant_scale_o,
+                    params.dequant_scale_q, params.dequant_scale_kv, params.host_bmm1_scale);
         }
         else
         {

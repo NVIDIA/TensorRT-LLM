@@ -207,6 +207,9 @@ struct AttentionLayerConfig
     // Private working pages never constrain prefix matching or enter the tree.
     AttentionReusePolicy reusePolicy = AttentionReusePolicy::REQUIRED;
 
+    // Layers in different ownership domains share neither a lifecycle nor a storage pool.
+    CacheDomain cacheDomain = CacheDomain::kTarget;
+
     [[nodiscard]] std::optional<int> windowSize() const noexcept
     {
         return slidingWindowSize;

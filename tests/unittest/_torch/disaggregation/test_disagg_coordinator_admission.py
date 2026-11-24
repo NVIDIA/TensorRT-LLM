@@ -5,12 +5,13 @@ start receiving this iteration, and the scheduler V2 allocation revert for
 the ones that may not.
 
 Admission is rank-local (rank 0 decides under PP, every rank for itself under
-attention DP), so every case runs one ``CoordinatorHarness``. The CP alignment
-cases stand in for the CP peers through the harness dist's ``cp_allgather``.
+attention DP), so every case runs one ``CoordinatorHarness``. The CP and TP
+alignment cases stand in for the peers through the harness dist's gathers.
 """
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 from coordinator_harness import CoordinatorHarness, TransferRequest
 
@@ -18,6 +19,7 @@ from tensorrt_llm._torch.disaggregation.orchestration.admission import (
     DisaggTransferAdmissionController,
 )
 from tensorrt_llm._torch.disaggregation.orchestration.coordinator import (
+    _request_ids_digest,
     transfer_window_bypass_eligible,
 )
 from tensorrt_llm.bindings import LlmRequestState
@@ -321,3 +323,108 @@ def test_cp_alignment_is_skipped_without_cp() -> None:
 
     assert h.coordinator.align_gen_admission_across_cp(admitted) == admitted
     assert dist.gathered == []
+
+
+# -- align_gen_admission_across_tp ---------------------------------------------
+
+
+def _tp_dist(peer_admitted_ids, tp_size=2, rank=0) -> SimpleNamespace:
+    """This TP rank's dist: its gathers return this rank's payload followed by
+    each peer's, computed from the peers' admitted ids, and record every call."""
+
+    def tp_allgather_int64(values):
+        dist.calls.append(("tp_allgather_int64", list(values)))
+        peers = [[len(ids), _request_ids_digest(ids)] for ids in peer_admitted_ids]
+        return np.asarray([list(values), *peers], dtype=np.int64)
+
+    def tp_allgather(ids, *, small_payload=False):
+        dist.calls.append(("tp_allgather", list(ids)))
+        return [ids, *peer_admitted_ids]
+
+    dist = SimpleNamespace(
+        rank=rank, tp_size=tp_size, pp_size=1, cp_size=1, world_size=tp_size, calls=[]
+    )
+    dist.tp_allgather_int64 = tp_allgather_int64
+    dist.tp_allgather = tp_allgather
+    return dist
+
+
+def test_tp_alignment_keeps_an_agreed_admission_after_one_fixed_size_exchange() -> None:
+    """Ranks that admitted the same requests (in any order) exchange only the
+    count and digest, keep the list object and revert nothing."""
+    dist = _tp_dist([[2, 1], [1, 2], [2, 1]], tp_size=4)
+    h = CoordinatorHarness(is_kv_manager_v2=True, dist=dist)
+    admitted = [_candidate(1), _candidate(2)]
+
+    assert h.coordinator.align_gen_admission_across_tp(admitted) is admitted
+    assert [name for name, _ in dist.calls] == ["tp_allgather_int64"]
+    assert h.effects.reverted == []
+
+
+@pytest.mark.parametrize(
+    "peer_admitted_ids",
+    [
+        pytest.param([[1, 3]], id="tp2"),
+        pytest.param([[1, 2, 3], [3, 1], [1, 3]], id="tp4"),
+        pytest.param([[1, 3, 4]], id="same-count-different-ids"),
+    ],
+)
+def test_tp_alignment_keeps_only_requests_every_tp_rank_admitted(peer_admitted_ids) -> None:
+    """A request this rank admitted but a TP peer did not, because the peer's
+    KV still holds a request this rank already finished, is dropped and its V2
+    KV growth reverted; the rest keep this rank's admission order."""
+    dist = _tp_dist(peer_admitted_ids, tp_size=len(peer_admitted_ids) + 1)
+    h = CoordinatorHarness(is_kv_manager_v2=True, dist=dist)
+    first, second, third = _candidate(1), _candidate(2), _candidate(3)
+
+    aligned = h.coordinator.align_gen_admission_across_tp([first, second, third])
+
+    assert aligned == [first, third]
+    assert h.effects.reverted == [[second]]
+    assert dist.calls[0][0] == "tp_allgather_int64"
+    assert dist.calls[1] == ("tp_allgather", [1, 2, 3])
+
+
+def test_tp_alignment_gathers_even_when_nothing_was_admitted() -> None:
+    """The exchange runs whatever this rank admitted, so the number of
+    collectives cannot depend on admission; a peer's admission alone admits
+    nothing here."""
+    dist = _tp_dist([[5]])
+    h = CoordinatorHarness(is_kv_manager_v2=True, dist=dist)
+
+    assert h.coordinator.align_gen_admission_across_tp([]) == []
+    assert [name for name, _ in dist.calls] == ["tp_allgather_int64", "tp_allgather"]
+    assert h.effects.reverted == []
+
+
+def test_tp_alignment_on_v1_drops_without_reverting() -> None:
+    h = CoordinatorHarness(dist=_tp_dist([[]]))
+
+    assert h.coordinator.align_gen_admission_across_tp([_candidate(1)]) == []
+    assert h.effects.reverted == []
+
+
+@pytest.mark.parametrize(
+    "tp_size, enable_attention_dp",
+    [pytest.param(1, False, id="tp1"), pytest.param(2, True, id="attention-dp")],
+)
+def test_tp_alignment_is_skipped_without_replicated_tp_requests(
+    tp_size, enable_attention_dp
+) -> None:
+    """With one TP rank, or under attention DP where each TP rank owns its own
+    requests, there is nothing to align and no exchange."""
+    dist = _tp_dist([[]] * (tp_size - 1), tp_size=tp_size)
+    h = CoordinatorHarness(
+        is_kv_manager_v2=True, dist=dist, enable_attention_dp=enable_attention_dp
+    )
+    admitted = [_candidate(1)]
+
+    assert h.coordinator.align_gen_admission_across_tp(admitted) is admitted
+    assert dist.calls == []
+
+
+def test_request_ids_digest_ignores_order_and_separates_sets() -> None:
+    assert _request_ids_digest([3, 1, 2]) == _request_ids_digest([1, 2, 3])
+    assert _request_ids_digest([1, 4]) != _request_ids_digest([2, 3])
+    assert _request_ids_digest([]) != _request_ids_digest([0])
+    assert -(2**63) <= _request_ids_digest([2**64 - 1]) < 2**63

@@ -203,3 +203,29 @@ def test_forced_writer_keeps_a_shared_alias_cache_coherent(monkeypatch) -> None:
     metadata.update(_host([1, 2]))
     assert storage.tolist() == [1, 2]
     assert writes == [[1, 2], [1, 2], [9, 2], [1, 2]]
+
+
+def test_holds_matches_the_skip_decision() -> None:
+    dst = torch.zeros(8, dtype=torch.int32)
+    buffer = DeviceCopyBuffer(dst)
+    assert not buffer.holds(_host([5, 6]))
+    buffer.update(_host([5, 6, 7]))
+    assert buffer.holds(_host([5, 6, 7]))
+    assert buffer.holds(_host([5, 6]))
+    assert not buffer.holds(_host([5, 6, 7, 8]))
+    assert not buffer.holds(_host([5, 9]))
+
+
+def test_record_written_makes_a_caller_write_count() -> None:
+    dst = torch.zeros(8, dtype=torch.int32)
+    buffer = DeviceCopyBuffer(dst)
+    buffer.update(_host([5, 6, 7, 8]))
+    # The caller writes the buffer itself (e.g. with a fused kernel) and records it.
+    dst[:2] = _host([1, 2])
+    buffer.record_written(_host([1, 2]))
+    assert buffer.holds(_host([1, 2, 7, 8]))
+    _tamper(dst)
+    buffer.update(_host([1, 2, 7, 8]))
+    assert dst.eq(SENTINEL).all()
+    buffer.update(_host([1, 2, 7, 9]))
+    assert dst[:4].tolist() == [1, 2, 7, 9]

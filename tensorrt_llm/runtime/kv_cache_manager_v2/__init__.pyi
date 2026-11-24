@@ -89,11 +89,17 @@ class PageIndexMode(enum.IntEnum):
     SHARED = 0
     PER_LAYER = 1
 
+class CacheDomain(enum.Enum):
+    """Ownership domain of an attention layer; standalone draft pools precede target pools."""
+
+    STANDALONE_DRAFT = 0
+    TARGET = 1
+
 LifeCycleId = NewType("LifeCycleId", int)
 LayerGroupId: TypeAlias = LifeCycleId
 
 class AttnLifeCycle:
-    """The attention life cycle, keyed by window, sink tokens, sparsity, and reuse policy."""
+    """The attention life cycle, keyed by window, sinks, sparsity, reuse and cache domain."""
 
     def __init__(
         self,
@@ -101,6 +107,7 @@ class AttnLifeCycle:
         num_sink_blocks: int,
         is_sparse: bool = False,
         reuse_policy: AttentionReusePolicy = ...,
+        cache_domain: CacheDomain = ...,
     ) -> None: ...
     @staticmethod
     def make(
@@ -109,6 +116,7 @@ class AttnLifeCycle:
         tokens_per_block: int,
         is_sparse: bool = False,
         reuse_policy: AttentionReusePolicy = ...,
+        cache_domain: CacheDomain = ...,
     ) -> "AttnLifeCycle": ...
     @property
     def window_size(self) -> int | None: ...
@@ -118,6 +126,8 @@ class AttnLifeCycle:
     def is_sparse(self) -> bool: ...
     @property
     def reuse_policy(self) -> AttentionReusePolicy: ...
+    @property
+    def cache_domain(self) -> CacheDomain: ...
     def get_stale_range(self, history_length: int, tokens_per_block: int) -> HalfOpenRange: ...
 
 CacheLevel = NewType("CacheLevel", int)
@@ -277,6 +287,7 @@ class AttentionLayerConfig:
     sliding_window_size: int | None = None
     num_sink_tokens: int | None = None
     reuse_policy: AttentionReusePolicy = AttentionReusePolicy.REQUIRED
+    cache_domain: CacheDomain = CacheDomain.TARGET
     @property
     def window_size(self) -> int | None: ...
 
@@ -658,7 +669,12 @@ class _KVCache:
         accepted_input_tokens: Sequence[TokenIdExt],
         beam_search_indices: Sequence[int] | None = None,
         is_end: bool = False,
+        ssm_from_pending: bool = False,
     ) -> None: ...
+    def acquire_ssm_snapshot_slot(self) -> int | None: ...
+    @property
+    def pending_ssm_snapshot_slot(self) -> int | None: ...
+    def release_ssm_snapshot_slot(self) -> None: ...
     @property
     def num_committed_tokens(self) -> int: ...
     @property

@@ -22,8 +22,12 @@ strict-tools structural-tag grammar builder. No GPU or checkpoint required.
 """
 
 import json
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from tensorrt_llm.serve.extensions.kimi_k3 import (
@@ -44,6 +48,8 @@ from tensorrt_llm.serve.tool_parser.kimi_k3_tool_parser import (
     _parse_attrs,
     _unescape_attr,
 )
+
+from .openai_server_stub import make_stub_openai_server
 
 # The L0 CPU stage invokes registered files with `-m cpu_only`; without this
 # marker every test is deselected and pytest exits with code 5.
@@ -293,10 +299,25 @@ class TestKimiExtensionMapping:
         assert self.kwargs_of(req)["thinking"] is True
         assert self.kwargs_of(req)["thinking_effort"] == "low"
 
+    @pytest.mark.parametrize("model_type", ["kimi_k3", "kimi_k31"])
     @pytest.mark.parametrize("effort", ["low", "high", "max"])
-    def test_reasoning_effort_applies_when_thinking_effort_absent(self, effort: str) -> None:
-        req = self.apply(thinking={"type": "enabled", "keep": "all"}, reasoning_effort=effort)
+    def test_reasoning_effort_applies_when_thinking_effort_absent(
+        self, effort: str, model_type: str
+    ) -> None:
+        req = self.apply(
+            model_type=model_type,
+            thinking={"type": "enabled", "keep": "all"},
+            reasoning_effort=effort,
+        )
         assert self.kwargs_of(req)["thinking_effort"] == effort
+
+    @pytest.mark.parametrize("model_type", ["kimi_k3", "kimi_k31"])
+    def test_medium_thinking_effort_rejected(self, model_type: str) -> None:
+        with pytest.raises(ValidationError, match="effort"):
+            self.apply(
+                model_type=model_type,
+                thinking={"type": "enabled", "keep": "all", "effort": "medium"},
+            )
 
     def test_reasoning_effort_none_disables_thinking_when_alone(self) -> None:
         req = self.apply(reasoning_effort="none")
@@ -313,8 +334,9 @@ class TestKimiExtensionMapping:
         assert self.kwargs_of(req)["thinking"] is False
         assert "thinking_effort" not in self.kwargs_of(req)
 
-    def test_medium_effort_has_no_k3_equivalent(self) -> None:
-        req = self.apply(reasoning_effort="medium")
+    @pytest.mark.parametrize("model_type", ["kimi_k3", "kimi_k31"])
+    def test_medium_effort_has_no_kimi_equivalent(self, model_type: str) -> None:
+        req = self.apply(model_type=model_type, reasoning_effort="medium")
         assert "thinking_effort" not in self.kwargs_of(req)
         assert "thinking" not in self.kwargs_of(req)
 
@@ -500,7 +522,7 @@ class TestKimiK3StrictGrammar:
         strict["function"]["strict"] = True
         loose = {
             "type": "function",
-            "function": {"name": "search", "parameters": {"type": "object"}},
+            "function": {"name": "search", "parameters": {"type": "object"}, "strict": False},
         }
         fmt = self.build(monkeypatch, [strict, loose])
         assert fmt["type"] == "triggered_tags"
@@ -570,3 +592,497 @@ class TestKimiK3StrictGrammar:
         strict["function"]["strict"] = True
         fmt = self.build(monkeypatch, [strict])
         xgrammar.Grammar.from_structural_tag(json.dumps({"type": "structural_tag", "format": fmt}))
+
+
+class TestKimiK3RequiredToolGrammar:
+    """tool_choice="required": the grammar admits only messages that call a tool."""
+
+    CALL = (
+        '<|open|>tools<|sep|><|open|>call tool="get_weather" index="1"<|sep|>'
+        '<|open|>argument key="city" type="string"<|sep|>Beijing<|close|>argument<|sep|>'
+        "<|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|>"
+    )
+
+    @staticmethod
+    def accepts(tools: list, text: str, thinking: bool) -> bool:
+        import xgrammar
+        from xgrammar.testing import _is_grammar_accept_string
+
+        tag = KimiK3ToolParser().build_required_structural_tag(
+            [ChatCompletionToolsParam.model_validate(t) for t in tools], thinking=thinking
+        )
+        return _is_grammar_accept_string(xgrammar.Grammar.from_structural_tag(tag), text)
+
+    def test_thinking_message_with_a_call(self) -> None:
+        text = "Look it up.<|close|>think<|sep|><|open|>response<|sep|><|close|>response<|sep|>"
+        assert self.accepts([WEATHER_TOOL], text + self.CALL, thinking=True)
+
+    def test_non_thinking_message_starts_in_the_response(self) -> None:
+        assert self.accepts([WEATHER_TOOL], "On it.<|close|>response<|sep|>" + self.CALL, False)
+        # The think channel is closed in the prompt already.
+        text = "x<|close|>think<|sep|><|open|>response<|sep|><|close|>response<|sep|>" + self.CALL
+        assert not self.accepts([WEATHER_TOOL], text, thinking=False)
+
+    def test_a_tool_call_is_mandatory(self) -> None:
+        answer = "Sunny.<|close|>response<|sep|><|close|>message<|sep|>"
+        assert not self.accepts([WEATHER_TOOL], answer, thinking=False)
+
+    def test_only_declared_tools_and_arguments(self) -> None:
+        prefix = "<|close|>response<|sep|>"
+        other_tool = self.CALL.replace("get_weather", "get_time")
+        assert not self.accepts([WEATHER_TOOL], prefix + other_tool, thinking=False)
+        # city is required, so the call needs an argument.
+        empty = (
+            '<|open|>tools<|sep|><|open|>call tool="get_weather" index="1"<|sep|>'
+            "<|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|>"
+        )
+        assert not self.accepts([WEATHER_TOOL], prefix + empty, thinking=False)
+
+    def test_non_string_arguments_follow_their_schema(self) -> None:
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "forecast",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"days": {"type": "integer", "minimum": 1}},
+                },
+            },
+        }
+
+        def call(value: str) -> str:
+            return (
+                '<|close|>response<|sep|><|open|>tools<|sep|><|open|>call tool="forecast" '
+                'index="1"<|sep|><|open|>argument key="days" type="number"<|sep|>'
+                f"{value}<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|>"
+                "<|close|>message<|sep|>"
+            )
+
+        assert self.accepts([tool], call("3"), thinking=False)
+        assert not self.accepts([tool], call("three"), thinking=False)
+
+    @staticmethod
+    def one_call(tool: str, key: str, xtml_type: str, value: str) -> str:
+        return (
+            f'<|close|>response<|sep|><|open|>tools<|sep|><|open|>call tool="{tool}" index="1"<|sep|>'
+            f'<|open|>argument key="{key}" type="{xtml_type}"<|sep|>{value}<|close|>argument<|sep|>'
+            "<|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|>"
+        )
+
+    def test_referenced_parameter_follows_its_definition(self) -> None:
+        # KVV tool_call_json_schema TestReferences:16 as the verifier sends it:
+        # the parameter is a $ref into $defs, and the definition refers to itself.
+        case = {
+            "type": "object",
+            "required": ["node"],
+            "properties": {
+                "node": {
+                    "anyOf": [
+                        {"type": "null"},
+                        {
+                            "type": "object",
+                            "required": ["next"],
+                            "properties": {
+                                "next": {"$ref": "#/$defs/case"},
+                                "value": {"type": "string"},
+                            },
+                        },
+                    ]
+                }
+            },
+        }
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "walle",
+                "parameters": {
+                    "type": "object",
+                    "required": ["value"],
+                    "additionalProperties": False,
+                    "properties": {"value": {"$ref": "#/$defs/case"}},
+                    "$defs": {"case": case},
+                },
+            },
+        }
+        for value in ('{"node": null}', '{"node": {"next": {"node": null}}}'):
+            assert self.accepts([tool], self.one_call("walle", "value", "object", value), False)
+        for value in ('{"value": null}', '{"next": null}', '{"node": {"next": {"value": "x"}}}'):
+            assert not self.accepts([tool], self.one_call("walle", "value", "object", value), False)
+        # Written as a raw string, the JSON text would reach the tool as a string.
+        raw = self.one_call("walle", "value", "string", '{"node": null}')
+        assert not self.accepts([tool], raw, thinking=False)
+
+    def test_root_reference_is_the_parameters_document(self) -> None:
+        # "#" points at the whole parameters object (which requires "node"),
+        # not at the property it appears in.
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "walle",
+                "parameters": {
+                    "type": "object",
+                    "required": ["node"],
+                    "properties": {
+                        "node": {
+                            "anyOf": [
+                                {"type": "null"},
+                                {
+                                    "type": "object",
+                                    "required": ["next"],
+                                    "properties": {"next": {"$ref": "#"}},
+                                },
+                            ]
+                        }
+                    },
+                },
+            },
+        }
+        assert self.accepts([tool], self.one_call("walle", "node", "null", "null"), False)
+        nested = self.one_call("walle", "node", "object", '{"next": {"node": null}}')
+        assert self.accepts([tool], nested, thinking=False)
+        no_node = self.one_call("walle", "node", "object", '{"next": {"next": null}}')
+        assert not self.accepts([tool], no_node, thinking=False)
+        # Each tag's value has the type its attribute names.
+        for xtml_type, value in (("null", '{"next": {"node": null}}'), ("object", "null")):
+            mismatch = self.one_call("walle", "node", xtml_type, value)
+            assert not self.accepts([tool], mismatch, thinking=False)
+
+    def test_union_parameters_get_a_tag_per_type(self) -> None:
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "pick",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "n": {
+                            "anyOf": [
+                                {"type": "integer", "minimum": 1},
+                                {"type": "string", "enum": ["auto"]},
+                            ]
+                        },
+                        "m": {
+                            "oneOf": [
+                                {"type": "null"},
+                                {"type": "array", "items": {"type": "integer"}},
+                            ]
+                        },
+                    },
+                },
+            },
+        }
+        for key, xtml_type, value in (
+            ("n", "number", "3"),
+            ("n", "string", "auto"),
+            ("m", "null", "null"),
+            ("m", "array", "[1, 2]"),
+        ):
+            assert self.accepts([tool], self.one_call("pick", key, xtml_type, value), False)
+        for key, xtml_type, value in (
+            ("n", "string", "manual"),
+            ("n", "boolean", "true"),
+            ("m", "array", '["a"]'),
+            ("m", "object", "{}"),
+            ("m", "null", "[1]"),
+            ("m", "array", "null"),
+        ):
+            assert not self.accepts([tool], self.one_call("pick", key, xtml_type, value), False)
+
+    def test_unconstrained_parameters_stay_permissive(self) -> None:
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "echo",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "x": {"description": "anything"},
+                        "y": {"$ref": "https://example.com/schema.json"},
+                    },
+                },
+            },
+        }
+        assert self.accepts([tool], self.one_call("echo", "x", "string", "hi"), False)
+        assert self.accepts([tool], self.one_call("echo", "x", "object", '{"a": 1}'), False)
+        # A reference outside the document cannot be resolved, so its value is free.
+        assert self.accepts([tool], self.one_call("echo", "y", "custom", "raw"), False)
+
+    def test_tool_names_the_wire_format_cannot_carry(self) -> None:
+        tool = json.loads(json.dumps(WEATHER_TOOL))
+        tool["function"]["name"] = "a<b"
+        parser = KimiK3ToolParser()
+        assert (
+            parser.build_required_structural_tag(
+                [ChatCompletionToolsParam.model_validate(tool)], thinking=True
+            )
+            is None
+        )
+
+    def test_channel_text_cannot_close_another_tag(self) -> None:
+        # A non-thinking response that closes as a think channel (or closes the message first)
+        # would stay inside the response text with <|open|> and <|end_of_msg|> masked: the model
+        # then repeats <|close|>message<|sep|> until the token limit and never calls a tool.
+        for close in ("<|close|>think<|sep|>", "<|close|>message<|sep|>", "<|close|>tools<|sep|>"):
+            text = f"I'll do it.{close}On it.<|close|>response<|sep|>" + self.CALL
+            assert not self.accepts([WEATHER_TOOL], text, thinking=False)
+        for close in ("<|close|>response<|sep|>", "<|close|>message<|sep|>"):
+            text = (
+                f"Hm.{close}more<|close|>think<|sep|><|open|>response<|sep|>"
+                "<|close|>response<|sep|>" + self.CALL
+            )
+            assert not self.accepts([WEATHER_TOOL], text, thinking=True)
+        # Each channel still ends at its own close, and other text stays free.
+        assert self.accepts(
+            [WEATHER_TOOL], "See: a < b.<|close|>response<|sep|>" + self.CALL, False
+        )
+
+    READ_TOOL = {
+        "type": "function",
+        "function": {
+            "name": "read",
+            "description": "Read a file from disk.",
+            "strict": True,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "limit": {"type": "number"},
+                },
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+    @staticmethod
+    def read_call(body: str) -> str:
+        return (
+            '<|close|>response<|sep|><|open|>tools<|sep|><|open|>call tool="read" index="1"<|sep|>'
+            f"{body}<|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|>"
+        )
+
+    @classmethod
+    def json_call(cls, arguments: str) -> str:
+        return cls.read_call(f'<|open|>json type="object"<|sep|>{arguments}<|close|>json<|sep|>')
+
+    LIMIT_ONLY = '<|open|>argument key="limit" type="number"<|sep|>3<|close|>argument<|sep|>'
+
+    @pytest.mark.parametrize("strict", ["omitted", None, True])
+    def test_strict_tool_arguments_follow_its_schema(
+        self, monkeypatch: pytest.MonkeyPatch, strict: str | bool | None
+    ) -> None:
+        # Strict + required: a forced call whose arguments are the strict schema's JSON object.
+        monkeypatch.setenv("TRTLLM_KIMI_K3_STRICT_TOOL_GRAMMAR", "1")
+        tool = json.loads(json.dumps(self.READ_TOOL))
+        if strict == "omitted":
+            tool["function"].pop("strict")
+        else:
+            tool["function"]["strict"] = strict
+        tools = [tool]
+        assert self.accepts(tools, self.json_call('{"path": ""}'), thinking=False)
+        assert self.accepts(tools, self.json_call('{"path": "a.txt", "limit": 3}'), thinking=False)
+        assert not self.accepts(tools, self.json_call("{}"), thinking=False)
+        assert not self.accepts(tools, self.json_call('{"limit": 3}'), thinking=False)
+        assert not self.accepts(tools, self.json_call('{"path": "a", "mode": 1}'), thinking=False)
+        assert not self.accepts(tools, self.read_call(self.LIMIT_ONLY), thinking=False)
+        assert not self.accepts(tools, self.read_call(""), thinking=False)
+        # The call stays mandatory.
+        answer = "I cannot.<|close|>response<|sep|><|close|>message<|sep|>"
+        assert not self.accepts(tools, answer, thinking=False)
+        thinking = "Hm.<|close|>think<|sep|><|open|>response<|sep|>"
+        assert self.accepts(tools, thinking + self.json_call('{"path": "x"}'), thinking=True)
+
+    def test_strict_and_non_strict_tools_in_one_request(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("TRTLLM_KIMI_K3_STRICT_TOOL_GRAMMAR", "1")
+        loose = json.loads(json.dumps(WEATHER_TOOL))
+        loose["function"]["strict"] = False
+        tools = [self.READ_TOOL, loose]
+        weather = (
+            '<|close|>response<|sep|><|open|>tools<|sep|><|open|>call tool="get_weather" index="1"'
+            '<|sep|><|open|>argument key="city" type="string"<|sep|>Paris<|close|>argument<|sep|>'
+            "<|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|>"
+        )
+        assert self.accepts(tools, weather, thinking=False)
+        assert self.accepts(tools, self.json_call('{"path": "x"}'), thinking=False)
+        assert not self.accepts(tools, self.read_call(self.LIMIT_ONLY), thinking=False)
+
+    def test_strict_tool_keeps_the_xtml_body_without_the_gate(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("TRTLLM_KIMI_K3_STRICT_TOOL_GRAMMAR", "0")
+        tools = [self.READ_TOOL]
+        assert self.accepts(tools, self.read_call(self.LIMIT_ONLY), thinking=False)
+        assert not self.accepts(tools, self.json_call('{"path": ""}'), thinking=False)
+
+
+@pytest.mark.parametrize(
+    "tail, expected",
+    [
+        ("<|open|>user<|sep|>hi<|close|>user<|sep|><|open|>think<|sep|>", True),
+        ("<|open|>user<|sep|>hi<|close|>user<|sep|><|open|>response<|sep|>", False),
+        ("<|open|>user<|sep|>hi<|close|>user<|sep|>", None),
+    ],
+)
+def test_kimi_k3_thinking_resolves_from_the_prompt(tail: str, expected) -> None:
+    from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
+
+    assert ReasoningParserFactory.resolve_prefilled_thinking("kimi_k3", tail) is expected
+
+
+def test_agent_client_chat_request_with_prompt_cache_key_validates() -> None:
+    """kimi-code sends prompt_cache_key on every chat request; it is accepted and ignored."""
+    body = {
+        "model": "kimi-k3.1",
+        "messages": [{"role": "user", "content": "hello"}],
+        "prompt_cache_key": "session-1234",
+        "thinking": {"type": "enabled", "effort": "max", "keep": "all"},
+        "max_completion_tokens": 4096,
+        "stream": True,
+    }
+    request = ChatCompletionRequest.model_validate(body)
+    assert request.prompt_cache_key == "session-1234"
+    assert request.thinking.effort == "max" and request.thinking.keep == "all"
+    assert request.max_completion_tokens == 4096
+    # The key never becomes a cache salt, which would isolate each session's prefix cache.
+    assert request.cache_salt is None
+    # The router re-serializes the request for the workers; the field survives the round trip.
+    assert ChatCompletionRequest.model_validate(request.model_dump(exclude_unset=True)) == request
+
+
+@pytest.mark.parametrize(
+    "model_type, tool_arg, reasoning_arg, expected",
+    [
+        # Kimi K3.1 checkpoints get the kimi_k3 parsers when no option is given.
+        ("kimi_k31", None, None, ("kimi_k3", "kimi_k3")),
+        # Kimi K3 keeps explicit-only parsers.
+        ("kimi_k3", None, None, (None, None)),
+        ("kimi_k3", "auto", "kimi_k3", ("auto", "kimi_k3")),
+        ("kimi_k3", "none", "none", (None, None)),
+        # "none" keeps a parser off; explicit choices are kept.
+        ("kimi_k31", "none", "none", (None, None)),
+        ("kimi_k31", "none", None, (None, "kimi_k3")),
+        ("kimi_k31", "kimi_k2", "auto", ("kimi_k2", "auto")),
+        # Other models keep the previous behaviour: no parser unless asked for.
+        ("llama", None, None, (None, None)),
+        ("llama", "none", "none", (None, None)),
+    ],
+)
+def test_serve_default_parsers(tmp_path, model_type, tool_arg, reasoning_arg, expected):
+    from tensorrt_llm.commands.serve import _default_parsers
+
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": model_type}))
+    assert _default_parsers(str(tmp_path), tool_arg, reasoning_arg) == expected
+
+
+@pytest.mark.parametrize("model_type, expected", [("kimi_k31", "kimi_k3"), ("llama", None)])
+def test_auto_parsers_of_a_modeling_v2_family(tmp_path, model_type, expected):
+    # Kimi K3.1 exists only in modeling_v2; its family states the parsers "auto" resolves to.
+    from tensorrt_llm.llmapi.reasoning_parser import resolve_auto_reasoning_parser
+    from tensorrt_llm.serve.tool_parser.tool_parser_factory import resolve_auto_tool_parser
+
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": model_type}))
+    assert resolve_auto_tool_parser(str(tmp_path)) == expected
+    assert resolve_auto_reasoning_parser(str(tmp_path)) == expected
+
+
+class _StrictToolTokenizer:
+    """Minimal non-thinking chat renderer for the HTTP request tests."""
+
+    def __init__(self) -> None:
+        self.tokenizer = self
+        self.vocab_size = 1024
+        self.name_or_path = None
+
+    def apply_chat_template(self, *args, **kwargs) -> str:
+        return '<|open|>message role="assistant"<|sep|><|open|>response<|sep|>'
+
+    def encode(self, text, **kwargs) -> list[int]:
+        return [1, 2, 3]
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+@pytest.mark.parametrize(
+    "gate,strict,constrained",
+    [
+        (None, "omitted", False),
+        ("0", "omitted", False),
+        ("1", "omitted", True),
+        ("1", None, True),
+        ("1", True, True),
+        ("1", False, False),
+    ],
+)
+def test_chat_route_defaults_tool_constraints(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    dynamic: bool,
+    gate: str | None,
+    strict: str | bool | None,
+    constrained: bool,
+) -> None:
+    """KVV-style requests reach the engine with schema constraints when opted in."""
+    import xgrammar
+    from xgrammar.testing import _is_grammar_accept_string
+
+    if gate is None:
+        monkeypatch.delenv("TRTLLM_KIMI_K3_STRICT_TOOL_GRAMMAR", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_KIMI_K3_STRICT_TOOL_GRAMMAR", gate)
+    captured = {}
+
+    def generate_async(*, sampling_params, **kwargs):
+        captured["guided"] = sampling_params.guided_decoding
+        return SimpleNamespace(prompt_token_ids=[1, 2, 3], finished=True)
+
+    server = make_stub_openai_server(
+        tmp_path,
+        "test-kimi",
+        SimpleNamespace(model_type="kimi_k3", vocab_size=1024),
+        generate_async,
+        tokenizer=_StrictToolTokenizer(),
+    )
+    server.tool_parser = "kimi_k3"
+    server.generator.args.reasoning_parser = "kimi_k3"
+    server.generator.args.guided_decoding_backend = "xgrammar"
+    server.await_disconnected = AsyncMock()
+    server._create_chat_response = AsyncMock(
+        return_value=SimpleNamespace(model_dump=lambda: {"ok": True})
+    )
+    app = FastAPI()
+    app.add_api_route("/v1/chat/completions", server.openai_chat, methods=["POST"])
+    tool = json.loads(json.dumps(WEATHER_TOOL))
+    if strict != "omitted":
+        tool["function"]["strict"] = strict
+    body = {
+        "model": "test-kimi",
+        "messages": [USER_MSG],
+        "tool_choice": "auto",
+        "reasoning_effort": "none",
+        "max_tokens": 64,
+    }
+    if dynamic:
+        body["messages"] = [dynamic_system_msg([tool]), USER_MSG]
+    else:
+        body["tools"] = [tool]
+    with TestClient(app) as client:
+        response = client.post("/v1/chat/completions", json=body)
+    assert response.status_code == 200, response.text
+    guided = captured["guided"]
+    if not constrained:
+        assert guided is None
+        return
+    assert guided is not None
+    grammar = xgrammar.Grammar.from_structural_tag(guided.structural_tag)
+
+    def call(arguments: str) -> str:
+        return (
+            '<|open|>tools<|sep|><|open|>call tool="get_weather" index="1"<|sep|>'
+            f'<|open|>json type="object"<|sep|>{arguments}<|close|>json<|sep|>'
+            "<|close|>call<|sep|><|close|>tools<|sep|>"
+        )
+
+    assert _is_grammar_accept_string(grammar, call('{"city": "Beijing"}'))
+    assert not _is_grammar_accept_string(grammar, call("{}"))
+    assert not _is_grammar_accept_string(grammar, call('{"city": 42}'))

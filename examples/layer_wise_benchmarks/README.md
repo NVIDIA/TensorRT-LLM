@@ -9,7 +9,7 @@ Only a contiguous slice of transformer layers runs under `nsys` — no full mode
 | Where | What it owns |
 |-------|--------------|
 | `examples/layer_wise_benchmarks/` (this directory) | CLI (`run.py`), launchers (`run.sh`, `mpi_launch.sh`, `slurm_*.sh`), parsers (`parse.py`, `parse_e2e.py`, `correlation.py`), HTML templates, sample configs. |
-| `tensorrt_llm/tools/layer_wise_benchmarks/` | Runtime library: `Runner`, `Calibrator`, `mark_ranges()`. Handles model construction, KV-cache setup, and MoE routing manipulation. |
+| `tensorrt_llm/tools/layer_wise_benchmarks/` | Runtime library: `Runner`, `EngineRunner` (engine backend), `Calibrator`, `mark_ranges()`. Handles model construction, KV-cache setup, and MoE routing manipulation. |
 
 The example directory is thin glue; the library does the real work.
 
@@ -122,6 +122,14 @@ NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --model $K3 --layer-indices 4,5,6,
 # Run Kimi K3 at the serving parallelism (DEP16, see examples/kimi_k3/eval_extra_llm_options.yaml)
 NP=16 ./mpi_launch.sh ./run.sh config_gen.yaml --model $K3 --layer-indices 4,5,6,7 --tokens-per-block 64 --moe-backend TRTLLM --moe-backend-for-prefill TRTLLM --seq-len-q 1 --moe-max-num-tokens 33024 --use-low-precision-moe-combine
 
+# Run Kimi K3.1 (modeling_v2 target, engine backend, see "Engine backend" below): the first 4
+# layers at the serving tep8 recipe, batch sizes 1-8 and KV 1k/8k in one run; set
+# llm_args.speculative_config.speculative_model in the config to the DFlash2 drafter checkpoint
+# first. K3.1 needs at least 4 layers (layer 3 is the first MLA layer, which DSA requires).
+NP=8 ./mpi_launch.sh ./run.sh config_gen_k31_engine.yaml --model $K31
+# Layers 4..7 = the difference of this run and the one above
+NP=8 ./mpi_launch.sh ./run.sh config_gen_k31_engine.yaml --model $K31 --layer-indices 0,1,2,3,4,5,6,7
+
 # Run with DeepEP A2A
 NP=4 ./mpi_launch.sh -x TRTLLM_FORCE_COMM_METHOD=DEEPEP ./run.sh config_ctx.yaml --moe-backend CUTEDSL
 NP=4 ./mpi_launch.sh -x TRTLLM_FORCE_COMM_METHOD=DEEPEP ./run.sh config_gen.yaml --moe-backend CUTEDSL
@@ -135,6 +143,20 @@ NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --balance-method ImbalancedRanks -
 NP=4 ./mpi_launch.sh ./run.sh config_ctx.yaml --balance-method ImbalancedExperts --balance-ratio 0.5
 NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --balance-method ImbalancedExperts --balance-ratio 0.5
 ```
+
+### Engine backend
+
+A modeling_v2 target (Kimi K3.1 on SM107, for example) runs its layers as one forward over its own caches and metadata, so `model.model.layers[i]` does not exist. For such models `--backend engine` builds the first N layers through the serving executor and replays its generation step; `--backend auto` (the default) picks it for every architecture modeling_v2 routes. The run flow, the CLI and the output stay the same.
+
+- **Layers:** `layer_indices` must be `0..N-1`. The config, the checkpoint and the ModelOpt per-layer quantization config are cut to the first N layers while the model loads, and nothing else is built. A window `[a, b)` is the difference of two runs.
+- **Serving settings:** the executor is built from `TorchLlmArgs` derived from the options above (parallelism, `max_batch_size`, `max_seq_len`, `kv_cache_dtype`, …) and merged with `llm_args` (a mapping in the config file, or `--llm-args <yaml>`). Speculative decoding, sparse attention and MoE backend come from there, as in serving.
+- **CUDA graphs:** with `use_cuda_graph` the executor captures `batch_size` during its warmup. Each measured step must replay a captured graph, or the run stops: an eager step runs other kernels.
+- **Shapes:** GEN only. Every request has `seq_len_kv_cache` cached tokens and `seq_len_q` tokens per step (1 + the draft length the speculative config sets).
+- **Data:** every cache pool (KV, indexer, recurrent state) is refilled with the same seeded random bytes before each problem size, and input token ids are seeded random. Runs with the same config see the same data; the values are not a real prompt's.
+- **Timing:** the reported time runs from just before the CUDA graph replay to the end of the step; a second line reports the step including the engine's host-side input preparation.
+- **Startup:** the executor's warmup JIT-compiles kernels, autotunes and captures graphs before the first step. Keep `max_num_tokens` at its default (`max(batch_size) * max(seq_len_q)`): the autotuner tunes every bucket up to it, and a serving-sized 8192 adds minutes. Put several `batch_size` / `seq_len_kv_cache` values in one run instead of one run per shape; the graph of each batch size is captured once at startup. To reuse work across runs, point `TLLM_AUTOTUNER_CACHE_PATH` at a file (a per-rank cache is loaded at startup and saved at exit) and keep the JIT caches (`TRTLLM_CACHE_DIR`, `TRITON_CACHE_DIR`, `CUTE_DSL_CACHE_DIR`, a per-rank `DG_JIT_CACHE_DIR`) on persistent storage instead of node-local `/tmp`.
+- **Not supported:** `--scaled-from`, `--balance-method` other than `NotModified`, CTX.
+- **Known gap:** DFlash2 maps every request of the benchmark batch to the drafter's empty slot, so the drafter part of the step is cheaper than in serving.
 
 ### Run with Slurm
 

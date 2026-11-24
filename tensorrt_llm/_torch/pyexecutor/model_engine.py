@@ -41,7 +41,7 @@ from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..models.modeling_utils import DecoderModelForCausalLM, timing_metric
 from ..moe.expert_statistic import ExpertStatistic
 from ..moe.fused_moe.moe_comm_timeout_guard import set_moe_comm_warmup
-from ..moe.fused_moe.moe_load_balancer import MoeLoadBalancer
+from ..moe.fused_moe.moe_load_balancer import BaseMoeLoadBalancer
 from ..nccl_window_tensor_scope import install_eager_nccl_window_tensor_scopes
 from ..route_capture import ROUTE_CAPTURE_ATTR, RouteCapture
 from ..speculative import SpecMetadata, update_spec_config_from_loaded_model
@@ -265,7 +265,7 @@ class ModelEngine:
                 load_format=self.llm_args.load_format,
                 partial_model_loading=self.llm_args.is_partial_model_loading,
             )
-        self.moe_load_balancer: Optional[MoeLoadBalancer] = None
+        self.moe_load_balancer: Optional[BaseMoeLoadBalancer] = None
         if model is None:
             lora_config: Optional[LoraConfig] = self.llm_args.lora_config
             # Keep the model_loader to support reloading the model weights later
@@ -283,7 +283,7 @@ class ModelEngine:
             # Open checkpoint and load the LLM module object.
             self.model, moe_load_balancer = self.model_loader.load(
                 checkpoint_dir=model_path, checkpoint_loader=checkpoint_loader)
-            if isinstance(moe_load_balancer, MoeLoadBalancer):
+            if isinstance(moe_load_balancer, BaseMoeLoadBalancer):
                 self.moe_load_balancer = moe_load_balancer
         else:
             self.model = model
@@ -533,8 +533,15 @@ class ModelEngine:
         sparse_params = (sparse_attention_config.to_sparse_params(
             pretrained_config=self.model.model_config.pretrained_config)
                          if sparse_attention_config is not None else None)
-        self.attn_backend = get_attention_backend(self.llm_args.attn_backend,
-                                                  sparse_params=sparse_params)
+        # A modeling_v2 target may run its own attention backend (and with it
+        # its own metadata class) for the sparse algorithm it implements.
+        own_backend = getattr(self.model, "attention_backend_for", None)
+        self.attn_backend = (own_backend(self.llm_args.attn_backend,
+                                         sparse_params)
+                             if own_backend is not None else None)
+        if self.attn_backend is None:
+            self.attn_backend = get_attention_backend(
+                self.llm_args.attn_backend, sparse_params=sparse_params)
 
         runner_cls = resolve_runner_type(self.model, self.llm_args)
         if self.is_spec_decode and issubclass(runner_cls, NoKVCacheRunner):

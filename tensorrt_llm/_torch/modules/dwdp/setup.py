@@ -52,7 +52,7 @@ from tensorrt_llm.logger import logger
 from .specs import LayerWeightSpecs, PeerRanges, WeightSpec, lookup_owner
 from .transport import DWDPTransport
 from .weight_buffer import WeightBuffer
-from .weight_manager import DWDPWeightManager
+from .weight_manager import DWDPWeightManager, prefetch_slot_count
 
 # Sentinel attribute to mark idempotent setup completion.
 # Must match the attribute name read in DeepseekV3Model.forward().
@@ -94,6 +94,7 @@ def setup_dwdp(
     num_experts_per_worker: int,
     num_prefetch_experts: int,
     contention_opt: bool = False,
+    cross_step_prefetch: bool = False,
 ) -> Optional[DWDPWeightManager]:
     """Set up DWDP for a model after weight loading.
 
@@ -124,6 +125,10 @@ def setup_dwdp(
             redundancy: adjacent ranks' ranges overlap by
             ``num_experts_per_worker - num_prefetch_experts`` experts and
             ``lookup_owner`` resolves the lowest-rank owner.
+        contention_opt: Copy-engine prefetch as one interleaved
+            ``cudaMemcpyBatchAsync`` per layer (``DwdpConfig.contention_opt``).
+        cross_step_prefetch: Use the cyclic cross-step prefetch schedule;
+            the buffer then gets ``TRTLLM_DWDP_PREFETCH_SLOTS`` slots (default 2).
 
     Returns:
         A ready-to-use DWDPWeightManager if DWDP is enabled, ``None`` otherwise.
@@ -235,6 +240,7 @@ def setup_dwdp(
             local_end=local_end,
             dwdp_size=mapping.dwdp_size,
             device_id=device_id,
+            num_slots=prefetch_slot_count(cross_step_prefetch),
         )
     except BaseException:
         _release_during_rollback(transport, "transport")
@@ -270,6 +276,7 @@ def setup_dwdp(
             dwdp_rank=mapping.dwdp_rank,
             dwdp_size=mapping.dwdp_size,
             contention_opt=contention_opt,
+            cross_step_prefetch=cross_step_prefetch,
         )
     except BaseException:
         _release_during_rollback(weight_buffer, "weight buffer")

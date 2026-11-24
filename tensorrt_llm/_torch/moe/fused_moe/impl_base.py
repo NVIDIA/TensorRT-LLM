@@ -284,7 +284,10 @@ class MoEImplBase(
     def run_moe(self, ctx: MoERunContext) -> torch.Tensor: ...
 
     def try_fused_route_quant(
-        self, x: "torch.Tensor", router_logits: "torch.Tensor"
+        self,
+        x: "torch.Tensor",
+        router_logits: "torch.Tensor",
+        input_ready_event: "torch.cuda.Event | None" = None,
     ) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None":
         """Offer to fuse routing and input quantization into one launch.
 
@@ -295,6 +298,12 @@ class MoEImplBase(
         Declining is the default and the common case: the one implementation
         that accepts is shape-, SM-, and quant-specialized and checks all of
         that itself. Overriding this is how a backend opts in.
+
+        ``input_ready_event`` marks ``x`` as written on another stream. An
+        implementation that accepts joins it before the launch that reads
+        ``x``. Declining leaves it pending: the scheduler then routes first
+        (routing reads only ``router_logits``) and joins before quantization,
+        so the routing overlaps whatever produces ``x``.
         """
         return None
 

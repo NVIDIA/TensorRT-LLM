@@ -153,6 +153,8 @@ def test_the_spec_model_hands_the_workers_target_logits_to_its_forward():
     calls = {}
 
     class Worker:
+        target_head_rows = SpecWorkerBase.target_head_rows
+
         def target_logits(self, *args):
             calls["target_logits"] = args
             return "worker logits"
@@ -179,3 +181,40 @@ def test_the_spec_model_hands_the_workers_target_logits_to_its_forward():
     assert torch.equal(rows, hidden[gather_ids])
     assert rest == ["lm_head", "processor", attn_metadata, spec_metadata, "drafter"]
     assert calls["forward"]["logits"] == "worker logits"
+
+
+def test_the_spec_model_hands_the_workers_head_rows_to_target_logits():
+    """A worker that picks the head rows itself (e.g. skips an identity gather) gets them
+    into ``target_logits`` unchanged."""
+    hidden = torch.randn(4, 8)
+    calls = {}
+
+    class Worker:
+        def target_head_rows(self, hidden_states, attn_metadata, spec_metadata):
+            calls["target_head_rows"] = (hidden_states, attn_metadata, spec_metadata)
+            return hidden_states
+
+        def target_logits(self, *args):
+            calls["target_logits"] = args
+            return "worker logits"
+
+        def __call__(self, **kwargs):
+            return "worker outputs"
+
+    model = object.__new__(SpecDecOneEngineForCausalLM)
+    torch.nn.Module.__init__(model)
+    model.model = lambda **kwargs: hidden
+    model.layer_idx = -1
+    model.spec_worker = Worker()
+    model.lm_head, model.logits_processor, model.draft_model = "lm_head", "processor", "drafter"
+    spec_metadata = SimpleNamespace(
+        is_layer_capture=lambda layer: False, gather_ids=torch.arange(4)
+    )
+    attn_metadata = SimpleNamespace(padded_num_tokens=None, num_tokens=4)
+
+    SpecDecOneEngineForCausalLM.forward(
+        model, attn_metadata, input_ids=torch.arange(4), spec_metadata=spec_metadata
+    )
+
+    assert calls["target_head_rows"][1:] == (attn_metadata, spec_metadata)
+    assert calls["target_logits"][0] is hidden

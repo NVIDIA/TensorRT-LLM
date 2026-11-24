@@ -51,6 +51,8 @@ from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig, KvCacheConfig, MoeC
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
+from . import layer_truncation
+
 
 class BalanceMethod(IntEnum):
     NotModified = 1
@@ -593,6 +595,79 @@ class Runner:
             yield
         finally:
             tensorrt_llm._torch.model_config.load_pretrained_config = load_pretrained_config
+
+    @staticmethod
+    @contextlib.contextmanager
+    def truncate_layers_ctx(checkpoint_dir: str, num_layers: Optional[int]):
+        """Build the model at ``checkpoint_dir`` with only its first ``num_layers`` decoder layers.
+
+        Inside the context its config, per-layer quantization config and checkpoint session hide
+        layers ``num_layers..`` (see ``layer_truncation``); other checkpoints (a drafter) are
+        untouched. Raises on exit if no checkpoint key was hidden, so a renamed loader hook
+        cannot silently build the full model.
+        """
+        if num_layers is None:
+            yield
+            return
+        from tensorrt_llm._torch import model_config as model_config_module
+        from tensorrt_llm._torch.pyexecutor import model_loader as model_loader_module
+
+        target = os.path.realpath(checkpoint_dir)
+        total = layer_truncation.checkpoint_num_layers(checkpoint_dir)
+        if total is None or total <= num_layers:
+            raise ValueError(
+                f"{checkpoint_dir}: cannot truncate to {num_layers} layers; its config.json "
+                f"states {total}"
+            )
+        hidden = [0]
+
+        def is_target(path) -> bool:
+            return path is not None and os.path.realpath(str(path)) == target
+
+        load_pretrained_config_orig = model_config_module.load_pretrained_config
+        from_pretrained_orig = ModelConfig.__dict__["from_pretrained"]
+        open_session_orig = model_loader_module._open_checkpoint_weight_session
+
+        def load_pretrained_config(model_name_or_path, *args, **kwargs):
+            config = load_pretrained_config_orig(model_name_or_path, *args, **kwargs)
+            if is_target(model_name_or_path):
+                layer_truncation.truncate_config(config, num_layers)
+            return config
+
+        def from_pretrained(cls, checkpoint_dir, *args, **kwargs):
+            model_config = from_pretrained_orig.__func__(cls, checkpoint_dir, *args, **kwargs)
+            if is_target(checkpoint_dir) and model_config.quant_config_dict:
+                layer_truncation.filter_layer_keys(
+                    model_config.quant_config_dict, num_layers, total
+                )
+            return model_config
+
+        @contextlib.contextmanager
+        def open_session(checkpoint_loader, checkpoint_dir, **kwargs):
+            with open_session_orig(checkpoint_loader, checkpoint_dir, **kwargs) as weights:
+                if is_target(checkpoint_dir):
+                    dropped, moved = layer_truncation.filter_layer_keys(weights, num_layers, total)
+                    hidden[0] += dropped
+                    logger.info(
+                        f"Layer-wise benchmarks: hid {dropped} checkpoint tensors of layers "
+                        f"{num_layers}..{total - 1}, renumbered {moved} past {total - 1}"
+                    )
+                yield weights
+
+        model_config_module.load_pretrained_config = load_pretrained_config
+        ModelConfig.from_pretrained = classmethod(from_pretrained)
+        model_loader_module._open_checkpoint_weight_session = open_session
+        try:
+            yield
+        finally:
+            model_config_module.load_pretrained_config = load_pretrained_config_orig
+            ModelConfig.from_pretrained = from_pretrained_orig
+            model_loader_module._open_checkpoint_weight_session = open_session_orig
+        if not hidden[0]:
+            raise RuntimeError(
+                f"Layer-wise benchmarks: truncating to {num_layers} layers hid no checkpoint "
+                "tensor; the loader no longer goes through _open_checkpoint_weight_session"
+            )
 
     @staticmethod
     @contextlib.contextmanager

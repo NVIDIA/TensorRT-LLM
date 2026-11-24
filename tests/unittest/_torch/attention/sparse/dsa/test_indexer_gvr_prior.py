@@ -76,6 +76,7 @@ def test_indexer_forward_uses_prior_only_for_temporal_gvr(
         get_indexer_k_cache_buffers=Mock(return_value=torch.empty(0)),
     )
     metadata = SimpleNamespace(
+        enable_helix=False,
         kv_cache_manager=cache_manager,
         num_contexts=num_contexts,
         num_generations=num_generations,
@@ -86,6 +87,7 @@ def test_indexer_forward_uses_prior_only_for_temporal_gvr(
         is_cuda_graph=False,
         is_ragged_verify=False,
         ragged_row_kv_lens=Mock(return_value=None),
+        helix_spec_row_kv_lens=Mock(return_value=None),
         get_empty=lambda buffers, shape, **kwargs: torch.full(shape, -1, dtype=torch.int32),
         skip_indexer_for_ctx_reqs=False,
         skip_indexer_for_gen_reqs=False,

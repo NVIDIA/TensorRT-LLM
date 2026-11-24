@@ -3,6 +3,7 @@
 
 import ast
 import functools
+import inspect
 import itertools
 import math
 import os
@@ -48,6 +49,15 @@ except ImportError:
 # where a static grid runs a second wave.
 _DENSE_GEMM_SCHEDULER_ENV = "TRTLLM_CUTEDSL_DENSE_GEMM_SCHEDULER"
 _dense_gemm_scheduler_announced = set()
+# TRTLLM_CUTEDSL_DENSE_GEMM_MAX_SPLIT_K=<n> (n >= 1) limits the SM107 dense
+# block-scaled GEMM autotuner to split-K factors up to n (unset: every factor
+# the runner offers). 1 tunes without split-K, at a fraction of the compiles.
+_DENSE_GEMM_MAX_SPLIT_K_ENV = "TRTLLM_CUTEDSL_DENSE_GEMM_MAX_SPLIT_K"
+_dense_gemm_max_split_k_announced = set()
+# TRTLLM_CUTEDSL_FP8_OUT_UNTUNED_TACTICS=0 makes untuned FP8-output Rubin dense
+# block-scaled GEMMs run the fallback 128x128 1-CTA tile instead of the
+# runner's untuned_fp8_output_tactics (default 1).
+_FP8_OUT_UNTUNED_TACTICS_ENV = "TRTLLM_CUTEDSL_FP8_OUT_UNTUNED_TACTICS"
 
 
 def _dense_gemm_scheduler_override() -> Optional[str]:
@@ -77,6 +87,35 @@ def _dense_gemm_scheduler_modes(default: Tuple[str, ...]) -> Tuple[str, ...]:
     return tuple(mode for mode in default if mode == override)
 
 
+def _dense_gemm_max_split_k() -> Optional[int]:
+    """Split-K cap set by the env var, read at use time; None if unset."""
+    raw = os.environ.get(_DENSE_GEMM_MAX_SPLIT_K_ENV, "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value < 1:
+        raise ValueError(f"{_DENSE_GEMM_MAX_SPLIT_K_ENV} must be a positive "
+                         f"integer, got {raw!r}")
+    if value not in _dense_gemm_max_split_k_announced:
+        _dense_gemm_max_split_k_announced.add(value)
+        logger.info(
+            f"[cute_dsl_custom_ops] {_DENSE_GEMM_MAX_SPLIT_K_ENV}={value}: "
+            f"SM107 dense GEMM tactics limited to split-K <= {value}")
+    return value
+
+
+def _dense_gemm_split_k_candidates(default: Tuple[int, ...]) -> Tuple[int, ...]:
+    """Split-K candidates after the env cap: ``default`` when no cap is set,
+    otherwise the factors of ``default`` up to the cap."""
+    cap = _dense_gemm_max_split_k()
+    if cap is None:
+        return default
+    return tuple(split_k for split_k in default if split_k <= cap)
+
+
 # Torch schema parsing rejects ``inf`` as a default value.
 SWIGLU_LIMIT_SCALAR_DISABLED = -1.0
 _CUDA_MAX_GRID_DIM_Z = 65_535
@@ -86,6 +125,108 @@ _CUTEDSL_FC2_N_TILE_SIZES = (128, 256)
 # Legacy Rubin ops use a float sentinel for absent SiTU soft-caps.
 # The Blackwell act-fusion op accepts Optional[float] directly.
 SITU_BETA_DISABLED = -1.0
+
+
+def fc12_counter_layout(num_tiles: int,
+                        die_sched: bool = False) -> Tuple[int, int, int]:
+    """Int32 word layout of the fused FC12 kernel's atomic counters for ``num_tiles`` M tiles.
+
+    Returns ``(fc1_scheduler_counter, fc2_scheduler_counter, total)``: ``fc1_ready`` takes the
+    first ``num_tiles`` words and each scheduler counter starts its own 128-byte line. With
+    ``die_sched`` (die-local claiming) each phase has one counter per die, die 1's on the line
+    after die 0's. Every word must be zero when the kernel starts.
+    """
+    ints_per_line = 32
+    lines_per_phase = 2 if die_sched else 1
+    fc1_at = (num_tiles + ints_per_line - 1) // ints_per_line * ints_per_line
+    fc2_at = fc1_at + lines_per_phase * ints_per_line
+    return fc1_at, fc2_at, fc2_at + lines_per_phase * ints_per_line
+
+
+# TRTLLM_K3_FC12_SM_RESERVE=<n> (default 0): the fused FC12 MoE kernel
+# (Sm107BlockScaledContiguousGroupedGemmFusedFc12Runner) launches enough whole
+# clusters fewer (at least one) to leave n SMs without an FC12 CTA, on top of
+# TRTLLM_CUTEDSL_SM_RESERVE. One FC12 CTA fills an SM's register file, so the
+# kernels other streams issue while FC12 runs (the Kimi-K3 shared expert's
+# activation, down GEMM and all-reduce) otherwise get SMs only as FC12's CTAs
+# exit; with the reserve they run beside it. FC12 hands its tiles out through
+# atomic counters, so fewer CTAs change only which CTA computes a tile.
+_K3_FC12_SM_RESERVE_ENV = "TRTLLM_K3_FC12_SM_RESERVE"
+
+
+def fc12_max_active_clusters(max_active_clusters: int,
+                             cluster_size: int) -> int:
+    """Persistent clusters of the fused FC12 kernel out of ``max_active_clusters`` clusters of
+    ``cluster_size`` CTAs, with ``TRTLLM_K3_FC12_SM_RESERVE`` applied (read at each call)."""
+    reserve = int(os.environ.get(_K3_FC12_SM_RESERVE_ENV, "0"))
+    if reserve < 0:
+        raise ValueError(
+            f"{_K3_FC12_SM_RESERVE_ENV} must be >= 0, got {reserve}")
+    if reserve == 0:
+        return max_active_clusters
+    return max(1,
+               max_active_clusters - math.ceil(reserve / max(1, cluster_size)))
+
+
+# TRTLLM_K3_FC12_DIE_SCHED=1 (default 0): die-local tile claiming in the fused
+# FC12 MoE kernel on a two-die GPU (Rubin R200). It applies to a call when both
+# expert weights are die-alternating copies (TRTLLM_K3_FC12_DIE_LAYOUT=1,
+# ``die_locality.die_alternating_copy``), the kernel runs 1-CTA clusters (tile
+# size 128) and the device's SM -> die table is known. Each FC12 phase then
+# keeps one work counter per die and a CTA takes the tiles whose weight rows sit
+# on its own die before the other die's remaining ones. Only the CTA that
+# computes a tile changes.
+_K3_FC12_DIE_SCHED_ENV = "TRTLLM_K3_FC12_DIE_SCHED"
+# TRTLLM_K3_FC12_DIE_SCHED_MIN_TOKENS=<n> (default 1): die-local claiming only for
+# calls of at least n tokens; smaller calls keep the die-oblivious scheduler on
+# the same die-alternating weights (at one decode request the claim overhead
+# outweighs the locality gain).
+_K3_FC12_DIE_SCHED_MIN_TOKENS_ENV = "TRTLLM_K3_FC12_DIE_SCHED_MIN_TOKENS"
+
+# TRTLLM_K3_FC12_SCHED_LOOKAHEAD=2 (default 1): the fused FC12 kernel's
+# scheduler warp (1-CTA clusters) claims a tile while the TMA-B warp still
+# streams the tile before the current one, instead of while it streams the
+# current one: the claim (atomic, expert lookup) gets one more tile's time to
+# hide; at the end of a phase a CTA can hold one more claimed tile.
+_K3_FC12_SCHED_LOOKAHEAD_ENV = "TRTLLM_K3_FC12_SCHED_LOOKAHEAD"
+
+
+def fc12_die_sched_requested() -> bool:
+    """Whether ``TRTLLM_K3_FC12_DIE_SCHED`` asks for die-local claiming (read at
+    each call)."""
+    return os.environ.get(_K3_FC12_DIE_SCHED_ENV, "0") == "1"
+
+
+def fc12_sched_lookahead(cluster_size: int) -> int:
+    """Scheduler lookahead of the fused FC12 kernel
+    (``TRTLLM_K3_FC12_SCHED_LOOKAHEAD``, read at each call; 1 for multi-CTA
+    clusters)."""
+    lookahead = int(os.environ.get(_K3_FC12_SCHED_LOOKAHEAD_ENV, "1"))
+    if lookahead not in (1, 2):
+        raise ValueError(
+            f"{_K3_FC12_SCHED_LOOKAHEAD_ENV} must be 1 or 2, got {lookahead}")
+    return lookahead if cluster_size == 1 else 1
+
+
+def fc12_die_sm_words(
+        fc1_weight: torch.Tensor,
+        fc2_weight: torch.Tensor,
+        cluster_size: int,
+        num_tokens: Optional[int] = None) -> Optional[Tuple[int, ...]]:
+    """The fused FC12 kernel's ``die_sm_words`` for a call of ``num_tokens``
+    tokens on these expert weights, or None (die-oblivious claiming): see
+    ``TRTLLM_K3_FC12_DIE_SCHED`` and ``TRTLLM_K3_FC12_DIE_SCHED_MIN_TOKENS``."""
+    if not fc12_die_sched_requested() or cluster_size != 1:
+        return None
+    min_tokens = int(os.environ.get(_K3_FC12_DIE_SCHED_MIN_TOKENS_ENV, "1"))
+    if num_tokens is not None and num_tokens < min_tokens:
+        return None
+    from ..die_locality import (is_die_alternating, pack_sm_die_words,
+                                sm_die_table)
+    if not (is_die_alternating(fc1_weight) and is_die_alternating(fc2_weight)):
+        return None
+    table = sm_die_table(fc1_weight.device.index)
+    return None if table is None else pack_sm_die_words(table)
 
 
 def _canonicalize_situ_beta(situ_beta: float) -> Optional[float]:
@@ -9122,11 +9263,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      acc_dtype,
                      output_dtype,
                      num_next_n_atoms=1,
-                     atom=None):
+                     atom=None,
+                     kv_evict_first=False):
             """Compile kernel using fake tensors + TVM FFI."""
+            # kv_evict_first extends the key only when set, so the 12-element keys
+            # other callers build for the default kernel stay valid.
             key = (compute_block_kv, phys_block_kv, num_heads, head_dim, next_n,
                    num_sms, num_epi_subtiles, epi_dtype, acc_dtype,
-                   output_dtype, num_next_n_atoms, atom)
+                   output_dtype, num_next_n_atoms, atom) + (
+                       (kv_evict_first, ) if kv_evict_first else ())
             if key in cls.kernel_cache:
                 return
 
@@ -9203,6 +9348,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 epi_dtype=to_cutlass[epi_dtype],
                 acc_dtype=to_cutlass[acc_dtype],
                 output_dtype=to_cutlass[output_dtype],
+                # Only when set: kernels without the argument keep working.
+                **({
+                    "kv_evict_first": True
+                } if kv_evict_first else {}),
             )
 
             compiled = cute.compile(
@@ -9240,6 +9389,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             output_dtype: torch.dtype = torch.float32,
             num_next_n_atoms: int = 1,
             atom: Optional[int] = None,
+            kv_evict_first: bool = False,
+            out: Optional[torch.Tensor] = None,
         ) -> torch.Tensor:
             """Execute FP8 paged MQA logits kernel.
 
@@ -9258,6 +9409,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 num_next_n_atoms: in-kernel split of next_n into atoms; the
                     schedule must enumerate B * num_next_n_atoms atom rows
                 atom: tile width, required when the split is uneven
+                kv_evict_first: load the K cache with the L2 evict-first
+                    hint (bitwise-identical logits; keeps them L2-resident
+                    for the Top-K that reads them next)
+                out: optional fp32 [B*next_n, >= align256(max_context_len)]
+                    row-major destination with unit column stride (the
+                    kernel also writes the alignment padding); default: the
+                    persistent arena buffer
             Returns:
                 logits: [B*next_n, max_context_len] output_dtype
             """
@@ -9290,25 +9448,34 @@ if IS_CUTLASS_DSL_AVAILABLE:
             SPLIT_KV = compute_block_kv * 2  # NUM_MATH_WG = 2
             aligned_max_ctx = (
                 (max_context_len + SPLIT_KV - 1) // SPLIT_KV) * SPLIT_KV
-            # Use a persistent arena buffer instead of a per-forward torch.empty
-            # so the output address stays stable across CUDA-graph replays.
-            _reserve = torch.cuda.is_current_stream_capturing()
-            logits = get_memory_buffers().get_buffer(
-                [B * next_n, aligned_max_ctx],
-                output_dtype,
-                buffer_name="cute_dsl_mqa_logits",
-                reserve_buffer=_reserve,
-            )
-            logits = logits[:, :max_context_len]
+            if out is not None:
+                assert (out.dtype == output_dtype and out.dim() == 2
+                        and out.shape[0] >= B * next_n
+                        and out.shape[1] >= aligned_max_ctx
+                        and out.stride(1) == 1)
+                logits = out[:B * next_n, :max_context_len]
+            else:
+                # Use a persistent arena buffer instead of a per-forward torch.empty
+                # so the output address stays stable across CUDA-graph replays.
+                _reserve = torch.cuda.is_current_stream_capturing()
+                logits = get_memory_buffers().get_buffer(
+                    [B * next_n, aligned_max_ctx],
+                    output_dtype,
+                    buffer_name="cute_dsl_mqa_logits",
+                    reserve_buffer=_reserve,
+                )
+                logits = logits[:, :max_context_len]
 
             # Compile if needed (fake tensors, no real data required)
             key = (compute_block_kv, phys_block_kv, H, D, next_n, num_sms,
                    num_epi_subtiles, epi_dtype, acc_dtype, output_dtype,
-                   num_next_n_atoms, atom)
+                   num_next_n_atoms, atom) + (
+                       (kv_evict_first, ) if kv_evict_first else ())
             if key not in cls.kernel_cache:
                 cls._compile(compute_block_kv, phys_block_kv, H, D, next_n,
                              num_sms, num_epi_subtiles, epi_dtype, acc_dtype,
-                             output_dtype, num_next_n_atoms, atom)
+                             output_dtype, num_next_n_atoms, atom,
+                             kv_evict_first)
             compiled = cls.kernel_cache[key]
 
             # FP8 q needs uint8 view to match compile-time dtype
@@ -9337,6 +9504,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         output_dtype: torch.dtype = torch.float32,
         num_next_n_atoms: int = 1,
         atom: Optional[int] = None,
+        kv_evict_first: bool = False,
     ) -> torch.Tensor:
         if not is_sm_100f():
             raise ValueError(
@@ -9370,7 +9538,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             acc_dtype=acc_dtype,
             output_dtype=output_dtype,
             num_next_n_atoms=num_next_n_atoms,
-            atom=atom)
+            atom=atom,
+            kv_evict_first=kv_evict_first)
 
     @torch.library.register_fake("trtllm::cute_dsl_fp8_paged_mqa_logits")
     def _(
@@ -9387,6 +9556,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         output_dtype: torch.dtype = torch.float32,
         num_next_n_atoms: int = 1,
         atom: Optional[int] = None,
+        kv_evict_first: bool = False,
     ) -> torch.Tensor:
         B = q.shape[0]
         next_n = q.shape[1]
@@ -9394,6 +9564,51 @@ if IS_CUTLASS_DSL_AVAILABLE:
                            max_context_len,
                            dtype=output_dtype,
                            device=q.device)
+
+    @torch.library.custom_op("trtllm::cute_dsl_fp8_paged_mqa_logits_into",
+                             mutates_args=("out", ),
+                             device_types="cuda")
+    def cute_dsl_fp8_paged_mqa_logits_into(
+        q: torch.Tensor,
+        kv_fused: torch.Tensor,
+        weights: torch.Tensor,
+        context_lens: torch.Tensor,
+        block_table: torch.Tensor,
+        schedule_meta: torch.Tensor,
+        max_context_len: int,
+        out: torch.Tensor,
+        kv_evict_first: bool = False,
+    ) -> None:
+        """``cute_dsl_fp8_paged_mqa_logits`` (FP32 epilogue and output, one atom)
+        writing into ``out`` [B*next_n, >= align256(max_context_len)] instead
+        of the arena buffer (e.g. a symmetric workspace other ranks read)."""
+        if not is_sm_100f():
+            raise ValueError(
+                f"CuteDSL: SM version {get_sm_version()} is not supported. "
+                f"CuteDSL FP8 Paged MQA Logits only supports SM 100 family.")
+        CuteDSLPagedMQALogitsRunner.forward(q,
+                                            kv_fused,
+                                            weights,
+                                            context_lens,
+                                            block_table,
+                                            schedule_meta,
+                                            max_context_len,
+                                            kv_evict_first=kv_evict_first,
+                                            out=out)
+
+    @torch.library.register_fake("trtllm::cute_dsl_fp8_paged_mqa_logits_into")
+    def _(
+        q: torch.Tensor,
+        kv_fused: torch.Tensor,
+        weights: torch.Tensor,
+        context_lens: torch.Tensor,
+        block_table: torch.Tensor,
+        schedule_meta: torch.Tensor,
+        max_context_len: int,
+        out: torch.Tensor,
+        kv_evict_first: bool = False,
+    ) -> None:
+        return None
 
     # ------------------------------------------------------------------ #
     #  CuTe DSL MiniMax-M3 index decode scoring (SM100 family)            #
@@ -12107,6 +12322,34 @@ if IS_CUTLASS_DSL_AVAILABLE:
         _WORKSPACE_ALIGN = 128
         _LSE_DTYPE_BYTES = 4  # float32
 
+        # TRTLLM_K3_DRAFT3_REDUCE_UNROLL=<n> (FP8 kernel, n > 1): the split-KV
+        # reduction loads n splits' partials per round before summing them
+        # (same order, same bits); 1 / unset: one split at a time. Only kernels
+        # whose constructor takes ``reduce_unroll`` apply it.
+        _REDUCE_UNROLL_ENV = "TRTLLM_K3_DRAFT3_REDUCE_UNROLL"
+
+        @classmethod
+        def _reduce_unroll(cls) -> int:
+            try:
+                return max(1, int(os.environ.get(cls._REDUCE_UNROLL_ENV, "1")))
+            except ValueError:
+                return 1
+
+        @classmethod
+        def _kernel_reduce_unroll(cls, kernel_class) -> int:
+            """``_reduce_unroll()`` where ``kernel_class`` takes a
+            ``reduce_unroll`` argument, else 1 (with a one-time warning when
+            the env asks for more)."""
+            unroll = cls._reduce_unroll()
+            if unroll > 1 and "reduce_unroll" not in inspect.signature(
+                    kernel_class.__init__).parameters:
+                logger.warning_once(
+                    f"{cls._REDUCE_UNROLL_ENV}={unroll} is inert: "
+                    f"{kernel_class.__name__} has no reduce_unroll argument.",
+                    key="cute_dsl_mla_reduce_unroll_unsupported")
+                return 1
+            return unroll
+
         _MMA_TILE_M = 128
         _MAX_SPLIT_KV = 32
         # CTA waves the split targets: with one wave, the longest request of a
@@ -12177,6 +12420,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
             """Packed 128-row query tiles per request: the kernel packs the
             ``seq_len_q * num_heads`` query rows into the M tile."""
             return ceil_div(num_heads * seq_len_q, cls._MMA_TILE_M)
+
+        @classmethod
+        def get_split_plan_geometry(cls, num_heads: int,
+                                    seq_len_q: int) -> Tuple[int, int]:
+            """``(rows_per_request, wave_clusters)`` for the per-request split
+            plan (``launch_mla_split_kv_plan``) of the launch ``forward``
+            makes: every split of a request takes one 2-CTA cluster per packed
+            query tile, and one wave holds ``max_active_blocks`` CTAs."""
+            return (cls.get_num_q_tiles(num_heads, seq_len_q),
+                    max(
+                        cls._get_max_active_blocks() //
+                        cls._CLUSTER_SHAPE_MNK[0], 1))
 
         @classmethod
         def get_default_split_kv(cls, B: int, S: int,
@@ -12714,6 +12969,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if not use_workspace:
                 block_split_kvs = None
             is_var_split_kv = block_split_kvs is not None
+            reduce_unroll = (self._kernel_reduce_unroll(self.kernel_class)
+                             if has_fp8_input and use_workspace else 1)
             # split_kv is a runtime Int32; only the workspace use is compiled in.
             cache_key = self.unique_id() + (
                 out_dtype,
@@ -12723,6 +12980,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 is_persistent,
                 kv_bounds is not None,
                 is_var_split_kv,
+                reduce_unroll,
             )
             if cache_key not in CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache:
                 # A compile outside the tuning window stalls the serving loop
@@ -12754,6 +13012,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     reducer_max_splits=(MLA_DECODE_MAX_SPLITS
                                         if is_var_split_kv else 32),
                     emit_softmax_stats=self.emit_softmax_stats,
+                    **({
+                        "reduce_unroll": reduce_unroll
+                    } if reduce_unroll > 1 else {}),
                 )
                 q_latent_ct = cute.runtime.from_dlpack(
                     q_latent,
@@ -13793,6 +14054,28 @@ if IS_CUTLASS_DSL_AVAILABLE:
             assert packed_scale.shape == (expected_scale_numel, )
             assert packed_scale.is_contiguous()
 
+        @functools.lru_cache(maxsize=None)
+        def _rubin_untuned_tactic_can_run(runner_cls, entry, n: int,
+                                          real_k: int) -> bool:
+            """Whether ``runner_cls``'s FP8-output kernel implements an
+            ``untuned_fp8_output_tactics`` entry for N x K problems.
+
+            M enters ``can_implement`` only through the CTA count along M,
+            which the caller checks, so the probe uses the smallest such M.
+            """
+            (mma_tiler_mnk, mma_inst_shape, cluster_shape_mn, _, _,
+             epi_tile_n) = entry
+            cta_tile_m = mma_tiler_mnk[0] // (2 if mma_inst_shape[0] == 256 else
+                                              1)
+            if cta_tile_m < 128 or mma_tiler_mnk[1] % epi_tile_n != 0:
+                return False
+            probe_m = cta_tile_m * cluster_shape_mn[0]
+            return runner_cls.kernel_class.can_implement(
+                (probe_m, n, real_k, 1), runner_cls.a_dtype, runner_cls.b_dtype,
+                runner_cls.sf_dtype, cutlass.Float8E4M3FN, "k", "k", "n",
+                runner_cls.sf_vec_size, mma_tiler_mnk, mma_inst_shape,
+                cluster_shape_mn)
+
         class CuteDSLBlockScaledRubinLinear(TunableRunner):
             """Datatype-agnostic block-scaled Linear runner for SM107.
 
@@ -13821,7 +14104,19 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                                                "clc_dynamic")
             mixed_scheduler_mode_candidates: ClassVar[Tuple[str,
                                                             ...]] = ("static", )
+            # Narrowed at use time by TRTLLM_CUTEDSL_DENSE_GEMM_MAX_SPLIT_K, see
+            # _dense_gemm_split_k_candidates().
             split_k_candidates: ClassVar[Tuple[int, ...]] = (1, 2, 4, 8)
+            # Tactics that replace the fallback 128x128 1-CTA tile for
+            # FP8-output GEMMs run without a tuned tactic (autotuner cache
+            # miss or tactic -1). Rows ``(min_m, {scheduler: (mma_tiler_mnk,
+            # mma_inst_shape, cluster_shape_mn, use_prefetch, raster_order,
+            # epi_tile_n)}, unpinned_scheduler)``, largest ``min_m`` first;
+            # the scheduler pinned by TRTLLM_CUTEDSL_DENSE_GEMM_SCHEDULER
+            # selects the entry. M below the last row, a pinned scheduler
+            # without an entry, or a tile the problem cannot run keeps the
+            # fallback tile.
+            untuned_fp8_output_tactics: ClassVar[Tuple] = ()
             # Whether an output_tensor without partition_id is a plain in-place
             # GEMM. Otherwise a missing partition_id is rejected.
             allow_unpartitioned_output: ClassVar[bool] = False
@@ -13833,23 +14128,34 @@ if IS_CUTLASS_DSL_AVAILABLE:
                          use_tvm_ffi: bool = True):
                 super().__init__()
 
-                if output_dtype != torch.bfloat16:
+                if output_dtype != torch.bfloat16 and not (
+                        self.gemm_name == "MXFP8"
+                        and output_dtype == torch.float8_e4m3fn):
                     raise ValueError(
-                        f"CuteDSL {self.gemm_name} only supports bfloat16 output, "
-                        f"got {output_dtype}")
+                        f"CuteDSL {self.gemm_name} does not support output dtype "
+                        f"{output_dtype}")
                 self.output_dtype = output_dtype
+                self.c_dtype = (cutlass.Float8E4M3FN if output_dtype
+                                == torch.float8_e4m3fn else cutlass.BFloat16)
                 self.to_userbuffers = to_userbuffers
                 self.use_tvm_ffi = use_tvm_ffi
 
             def unique_id(self):
-                # The scheduler pin narrows the tactic space, so it is part of
-                # the autotuner cache key: a cache file written without the pin
-                # must not hand a static or mixed-cluster tactic to a pinned
-                # run (or the reverse).  Unpinned runs keep the old key.
+                # The scheduler pin and the split-K cap narrow the tactic
+                # space, so they are part of the autotuner cache key: a cache
+                # file written without them must not hand a static,
+                # mixed-cluster or larger split-K tactic to a narrowed run (or
+                # the reverse).  Runs without them keep the old key, and so
+                # does a cap that leaves every split-K candidate in place.
                 base = (self.output_dtype, self.to_userbuffers,
                         self.use_tvm_ffi)
                 override = _dense_gemm_scheduler_override()
-                return base if override is None else base + (override, )
+                key = base if override is None else base + (override, )
+                split_ks = _dense_gemm_split_k_candidates(
+                    self.split_k_candidates)
+                if split_ks != tuple(self.split_k_candidates):
+                    key += (("split_k", split_ks), )
+                return key
 
             def __hash__(self):
                 return hash(self.unique_id())
@@ -13858,6 +14164,50 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 if not isinstance(other, self.__class__):
                     return False
                 return self.unique_id() == other.unique_id()
+
+            def untuned_default_tactic(self, m: int, n: int,
+                                       k: int) -> Optional[tuple]:
+                """Base tactic for an untuned FP8-output [m, k] x [n, k] GEMM.
+
+                The tactic carries split_k 1 and a tenth element, the epilogue
+                subtile N.
+                None keeps the fallback 128x128 1-CTA tile. All tiles of this
+                kernel accumulate K in the same order and the epilogue applies
+                the same per-element conversion, so the output does not depend
+                on the tactic.
+                """
+                if (self.output_dtype != torch.float8_e4m3fn
+                        or not self.untuned_fp8_output_tactics
+                        or os.environ.get(_FP8_OUT_UNTUNED_TACTICS_ENV,
+                                          "1") == "0"):
+                    return None
+                for (min_m, by_scheduler,
+                     unpinned) in self.untuned_fp8_output_tactics:
+                    if m < min_m:
+                        continue
+                    scheduler = _dense_gemm_scheduler_override() or unpinned
+                    entry = by_scheduler.get(scheduler)
+                    if entry is None:
+                        return None
+                    (mma_tiler_mnk, mma_inst_shape, cluster_shape_mn,
+                     use_prefetch, raster_order, epi_tile_n) = entry
+                    use_2cta = mma_inst_shape[0] == 256
+                    cta_tile_m = mma_tiler_mnk[0] // (2 if use_2cta else 1)
+                    if ceil_div(m, cta_tile_m) < cluster_shape_mn[0]:
+                        return None
+                    if (scheduler == "clc_dynamic" and raster_order == "n"
+                            and not _clc_raster_n_has_launchable_grid(
+                                m, n, 1, mma_tiler_mnk[:2], use_2cta,
+                                cluster_shape_mn)):
+                        return None
+                    if not _rubin_untuned_tactic_can_run(
+                            self.__class__, entry, n,
+                            k * self.packed_k_multiplier):
+                        return None
+                    return ("base", mma_tiler_mnk, mma_inst_shape,
+                            cluster_shape_mn, False, use_prefetch, scheduler,
+                            raster_order, 1, epi_tile_n)
+                return None
 
             def get_valid_tactics(
                 self,
@@ -13897,11 +14247,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
                 # Both swap orientations use the original N as C's physical
                 # contiguous dimension and require 16-byte BF16 alignment.
-                output_aligned = (n % 8 == 0)
+                output_alignment = 16 if self.output_dtype == torch.float8_e4m3fn else 8
+                output_aligned = n % output_alignment == 0
                 if not output_aligned:
                     logger.debug(
                         f"CuteDSL: Output N={n} does not meet the 16-byte "
-                        f"alignment requirement (N%8={n%8}). Skipping all tactics."
+                        f"alignment requirement (N%{output_alignment}={n % output_alignment}). Skipping all tactics."
                     )
                     return []
 
@@ -13958,6 +14309,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 ]
                 raster_order_candidates = self.raster_order_candidates
                 use_prefetch_candidates = [True, False]
+                split_k_candidates = _dense_gemm_split_k_candidates(
+                    self.split_k_candidates)
 
                 valid_tactics = []
                 for (
@@ -13983,13 +14336,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         kernel_m = m
                         kernel_n = n
 
-                    for split_k in self.split_k_candidates:
+                    for split_k in split_k_candidates:
                         if self.__class__.kernel_class.can_implement(
                             (kernel_m, kernel_n, real_k, batch_size),
                                 self.a_dtype,
                                 self.b_dtype,
                                 self.sf_dtype,
-                                cutlass.BFloat16,
+                                self.c_dtype,
                                 a_major,
                                 b_major,
                                 c_major,
@@ -14044,7 +14397,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             self.a_dtype,
                             self.b_dtype,
                             self.sf_dtype,
-                            cutlass.BFloat16,
+                            self.c_dtype,
                             a_major,
                             b_major,
                             c_major,
@@ -14116,7 +14469,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     tactic: Tiling and cluster strategy:
                         base: ("base", mma_tiler_mnk, mma_inst_shape,
                         cluster_shape, swap_ab, use_prefetch, scheduler_mode,
-                        raster_order, split_k)
+                        raster_order, split_k[, epi_tile_n]); a missing tactic
+                        (cache miss or -1) of an FP8-output GEMM takes
+                        ``untuned_default_tactic``.
                         mixed: ("mixed_clusters", mma_tiler_mnk,
                         mma_inst_shape, preferred_cluster_shape,
                         fallback_cluster_shape, swap_ab, use_prefetch,
@@ -14127,8 +14482,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 Returns:
                     torch.Tensor: Output tensor of shape (m, n), dtype: bf16.
                 """
+                if not (isinstance(tactic, tuple) and len(tactic) > 0):
+                    untuned = self.untuned_default_tactic(
+                        inputs[0].shape[0], inputs[1].shape[0],
+                        inputs[0].shape[1])
+                    if untuned is not None:
+                        tactic = untuned
                 sf_vec_size = self.sf_vec_size
                 split_k = 1
+                epi_tile_n = None
 
                 if (isinstance(tactic, tuple) and len(tactic) > 0
                         and isinstance(tactic[0], str)):
@@ -14157,11 +14519,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         else:
                             scheduler_mode, raster_order = tuning_options
                     else:
-                        if len(tactic) not in {6, 7, 8, 9}:
+                        if len(tactic) not in {6, 7, 8, 9, 10}:
                             raise ValueError(
                                 "CuteDSL SM107 base tactics must use Boolean "
-                                "use_prefetch with an optional scheduler mode "
-                                "and raster order, followed by split_k")
+                                "use_prefetch with an optional scheduler mode, "
+                                "raster order, split_k and epilogue subtile N")
                         (_, mma_tiler_mnk, mma_inst_shape, cluster_shape_mn,
                          swap_ab, use_prefetch, *tuning_options) = tactic
                         preferred_cluster_shape_mn = None
@@ -14171,8 +14533,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             scheduler_mode = tuning_options[0]
                         if len(tuning_options) >= 2:
                             raster_order = tuning_options[1]
-                        if len(tuning_options) == 3:
+                        if len(tuning_options) >= 3:
                             split_k = tuning_options[2]
+                        if len(tuning_options) == 4:
+                            epi_tile_n = tuning_options[3]
                 elif isinstance(tactic, tuple) and len(tactic) == 5:
                     kernel_variant = "base"
                     (mma_tiler_mnk, mma_inst_shape, cluster_shape_mn, swap_ab,
@@ -14227,6 +14591,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
                 m, k, n = a_tensor.shape[0], a_tensor.shape[1], b_tensor.shape[
                     0]
+
+                if split_k > 1:
+                    self._check_split_k(split_k, k * self.packed_k_multiplier,
+                                        mma_tiler_mnk[2])
 
                 partition_id = kwargs.get("partition_id", -1)
                 # A caller-owned output is a locality-domain half GEMM, except on
@@ -14318,7 +14686,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 b_sf_ptr = self.make_cute_dsl_global_pointer(
                     b_sf_tensor, self.sf_dtype, self.sf_assumed_align)
                 c_ptr = self.make_cute_dsl_global_pointer(
-                    c_tensor, cutlass.BFloat16, 16)
+                    c_tensor, self.c_dtype, 16)
 
                 # get stream
                 torch_stream = torch.cuda.current_stream()
@@ -14398,12 +14766,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     max_active_preferred_clusters = get_max_activate_clusters(
                         preferred_cluster_shape_mn[0] *
                         preferred_cluster_shape_mn[1])
-                cache_key = (kernel_variant, sf_vec_size, mma_tiler_mnk,
-                             mma_inst_shape, preferred_cluster_shape_mn,
-                             cluster_shape_mn, swap_ab, use_prefetch,
-                             raster_order, scheduler_mode, split_k,
-                             locality_domain_half_gemm, self.use_tvm_ffi,
-                             max_active_preferred_clusters, max_active_clusters)
+                cache_key = (self.output_dtype, kernel_variant, sf_vec_size,
+                             mma_tiler_mnk, mma_inst_shape,
+                             preferred_cluster_shape_mn, cluster_shape_mn,
+                             swap_ab, use_prefetch, raster_order,
+                             scheduler_mode, split_k, locality_domain_half_gemm,
+                             self.use_tvm_ffi, max_active_preferred_clusters,
+                             max_active_clusters, epi_tile_n)
                 alpha_cute_tensor = cute.runtime.from_dlpack(alpha_tensor)
 
                 # get stream
@@ -14421,7 +14790,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         b_sf_ptr = self.make_cute_dsl_global_pointer(
                             b_sf_tensor, self.sf_dtype, self.sf_assumed_align)
                         c_ptr = self.make_cute_dsl_global_pointer(
-                            c_tensor, cutlass.BFloat16, 16)
+                            c_tensor, self.c_dtype, 16)
                         alpha_cute_tensor = cute.runtime.from_dlpack(
                             alpha_tensor)
                         # make faked stream
@@ -14469,6 +14838,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             raster_order=raster_order,
                             scheduler_type=scheduler_type,
                             split_k=split_k,
+                            epi_tile_n=epi_tile_n,
                         )
                     # Note: when tvm_ffi fake stream is used, at least one parameter should be tensor type,
                     # so we make alpha as the cute.Tensor type in the jit func.
@@ -14563,6 +14933,24 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 else:
                     return
 
+            def _check_split_k(self, split_k: int, real_k: int,
+                               k_tile: int) -> None:
+                """Refuse a split-K tactic the kernel cannot run; call it
+                before anything is allocated or launched (forward also runs
+                explicit tactics, and such a launch can fault or hang the GPU):
+                K must be whole K tiles in a count split_k divides; FP8 output
+                runs split_k 1 only (the splits reduce-add into C)."""
+                if (k_tile < 1 or real_k % k_tile != 0
+                        or (real_k // k_tile) % split_k != 0):
+                    raise ValueError(
+                        f"CuteDSL SM107 {self.gemm_name}: split_k={split_k} "
+                        f"needs K={real_k} in whole K tiles of {k_tile}, a "
+                        "count split_k divides")
+                if self.c_dtype == cutlass.Float8E4M3FN:
+                    raise ValueError(
+                        f"CuteDSL SM107 {self.gemm_name}: FP8 output runs "
+                        f"split_k=1 only, got split_k={split_k}")
+
         class CuteDSLNVFP4RubinLinear(CuteDSLBlockScaledRubinLinear):
             """SM107 NVFP4 runner backed by the persistent dense kernel."""
 
@@ -14608,6 +14996,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
             allow_unswapped_small_m_fallback = True
             raster_order_candidates = ("m", "n")
             mixed_scheduler_mode_candidates = ("static", "clc_dynamic")
+            # K3 MLA cached-prefix kv_b expansion (M x 512 -> 24576, FP8
+            # output): with K=512 the epilogue bounds the GEMM, and 2-CTA
+            # 256x256 tiles with 128x128 epilogue subtiles run 1.3-1.6x
+            # faster than the fallback tile for M >= 8192 on Rubin.
+            untuned_fp8_output_tactics = ((1024, {
+                "static":
+                ((256, 256, 128), (256, 256, 64), (2, 1), False, "m", 128),
+                "clc_dynamic":
+                ((256, 256, 128), (256, 256, 64), (2, 1), False, "m", 128),
+            }, "static"), )
             tuning_config = TuningConfig(
                 dynamic_tensor_specs=(DynamicTensorSpec(
                     0, 0, get_last_power_of_2_num_tokens_buckets,
@@ -14677,11 +15075,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
             """Run the SM107 dense MXFP8 GEMM with K32 R128c4 UE8M0 scales.
 
             ``fine_grained_m`` enables Kimi K3's 16-token low-M tuning buckets.
+            FP8 output keeps the BF16 rounding of the result and uses a unit
+            output scale, for the NVFP4 MLA context FMHA scratch.
             """
-            if output_dtype != torch.bfloat16:
+            if output_dtype not in (torch.bfloat16, torch.float8_e4m3fn):
                 raise ValueError(
-                    f"CuteDSL MXFP8 only supports bfloat16 output, got "
-                    f"{output_dtype}")
+                    f"CuteDSL MXFP8 supports bfloat16 or float8_e4m3fn output, "
+                    f"got {output_dtype}")
             if (sm_version := get_sm_version()) != 107:
                 raise ValueError(
                     f"CuteDSL MXFP8 SM107 GEMM requires SM107, got SM{sm_version}."
@@ -14718,7 +15118,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         ) -> torch.Tensor:
             shape = list(mat_a.shape)
             shape[-1] = mat_b.shape[-2]
-            return mat_a.new_empty(shape, dtype=torch.bfloat16)
+            return mat_a.new_empty(shape, dtype=output_dtype)
 
         @torch.library.custom_op(
             "trtllm::cute_dsl_mxfp8_gemm_inplace_rubin",
@@ -18566,8 +18966,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             The gated epilogue is SwiGLU or SiTU (trace-time specialization).
             The only interface delta versus the existing CuteDSL backend is the
             three int32 atomic counters (fc1_ready / fc1_scheduler_counter /
-            fc2_scheduler_counter), which are allocated and memset to zero here
-            on every launch.  Geometry follows the routing tile: tile_size=128
+            fc2_scheduler_counter), which are allocated and zeroed here on every
+            launch unless the caller hands over ``zeroed_counters`` (see
+            ``forward``).  Geometry follows the routing tile: tile_size=128
             runs 1-CTA (mma_tiler 128x{128,256}, cluster (1,1)) and
             tile_size=256 runs 2-CTA (mma_tiler 256x{128,256}, cluster (2,1));
             the autotuner picks between them per shape.  scheduler="l2_atomic".
@@ -18589,7 +18990,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     enable_alltoall: bool = False,
                     activation_type: ActivationType = ActivationType.Swiglu,
                     situ_beta: Optional[float] = None,
-                    situ_linear_beta: Optional[float] = None):
+                    situ_linear_beta: Optional[float] = None,
+                    zeroed_counters: Optional[torch.Tensor] = None):
                 super().__init__()
                 self.num_experts = num_experts
                 self.top_k = top_k
@@ -18605,6 +19007,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 # is the fused kernel's immediate stream predecessor).
                 self.ep_size = ep_size
                 self.enable_alltoall = enable_alltoall
+                # int32 words the caller zeroed, together with the output, for
+                # one launch (``None``: zeroed here). Not part of the tactic.
+                self.zeroed_counters = zeroed_counters
                 if (sm_version := get_sm_version()) != 107:
                     raise ValueError(
                         f"{self.__class__.kernel_class.__name__} supports SM 107 "
@@ -18797,34 +19202,51 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 fc1_sfc = torch.empty(m * interm_size // sf_vec,
                                       dtype=fc1_sfa.dtype,
                                       device=fc1_sfa.device)
-                # Three atomic counters zeroed by one fill (they sit on the
-                # routing chain); each scheduler counter on its own 128 B line.
-                ints_per_line = 32
-                fc1_at = ((num_tiles + ints_per_line - 1) // ints_per_line *
-                          ints_per_line)
-                fc2_at = fc1_at + ints_per_line
-                counters = torch.zeros(fc2_at + ints_per_line,
-                                       dtype=torch.int32,
-                                       device=fc1_a.device)
+                # Three atomic counters, zero at launch (fc1_ready, then each
+                # scheduler counter on its own 128 B line). The caller's
+                # ``zeroed_counters`` come zeroed together with ``fc2_c`` (on a
+                # stream the caller joined before this op) and serve one launch:
+                # never while tuning, whose profiling launches reuse their
+                # inputs. Otherwise one fill zeroes the counters here.
+                # Die-local claiming (TRTLLM_K3_FC12_DIE_SCHED): one counter
+                # per die and phase.
+                die_sm_words = fc12_die_sm_words(
+                    fc1_b, fc2_b, cluster_shape_mn[0] * cluster_shape_mn[1],
+                    num_tokens)
+                die_sched = die_sm_words is not None
+                sched_lookahead = fc12_sched_lookahead(cluster_shape_mn[0] *
+                                                       cluster_shape_mn[1])
+                fc1_at, fc2_at, counter_words = fc12_counter_layout(
+                    num_tiles, die_sched=die_sched)
+                # Words of a phase's scheduler counters: die 1's is word 32.
+                sched_words = 33 if die_sched else 1
+                tuning = AutoTuner.get().is_tuning_mode
+                prezeroed = (self.zeroed_counters is not None and not tuning
+                             and self.zeroed_counters.numel() >= counter_words)
+                if prezeroed:
+                    counters = self.zeroed_counters
+                else:
+                    counters = torch.zeros(counter_words,
+                                           dtype=torch.int32,
+                                           device=fc1_a.device)
                 fc1_ready = counters[:num_tiles]
-                fc1_scheduler_counter = counters[fc1_at:fc1_at + 1]
-                fc2_scheduler_counter = counters[fc2_at:fc2_at + 1]
+                fc1_scheduler_counter = counters[fc1_at:fc1_at + sched_words]
+                fc2_scheduler_counter = counters[fc2_at:fc2_at + sched_words]
 
-                # Zero the scatter-add output right before the fused kernel so
-                # the memset becomes the kernel's immediate stream predecessor
-                # (PDL prologue can then overlap a longer predecessor than the
-                # 1-int counter). The zeroing must run on every launch: autotune()
-                # keeps is_tuning_mode set for its whole context, including the
-                # final real launch, so gating the memset on it would leave real
+                # Zero the scatter-add output on this stream right before the
+                # fused kernel, unless it came zeroed with ``zeroed_counters``.
+                # The zeroing must run on every other launch: autotune() keeps
+                # is_tuning_mode set for its whole context, including the final
+                # real launch, so gating the memset on it would leave real
                 # outputs unzeroed. While tuning, the profiling inputs carry an
                 # uninitialised expanded_idx (see Fc12FusedInputsHelper
                 # .inputs_pre_hook), so use an index-free full zero there instead
                 # of the sparse, index-driven memset; it is semantically equivalent
                 # (a superset of the rows the finalize scatter-adds into) and still
                 # charges a memset to the profiled time.
-                if AutoTuner.get().is_tuning_mode:
+                if tuning:
                     fc2_c.zero_()
-                else:
+                elif not prezeroed:
                     torch.ops.trtllm.moe_output_memset_inplace(
                         input=fc2_c,
                         tile_idx_to_mn_limit=tile_idx_to_mn_limit,
@@ -18912,8 +19334,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 # runners): avoids re-querying HardwareInfo on every forward
                 # and during CUDA-graph capture. FC12 never runs inside a
                 # locality-domain context, so this is the full-device value.
-                max_active_clusters = get_max_activate_clusters(
-                    cluster_shape_mn[0] * cluster_shape_mn[1])
+                # TRTLLM_K3_FC12_SM_RESERVE leaves whole clusters out of it.
+                cluster_size = cluster_shape_mn[0] * cluster_shape_mn[1]
+                max_active_clusters = fc12_max_active_clusters(
+                    get_max_activate_clusters(cluster_size), cluster_size)
 
                 # The fused kernel exposes only ``__call__`` (cute.Tensor args),
                 # no ptr-based wrapper. ``make_ordered_layout`` needs an MLIR
@@ -18924,11 +19348,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 sf_vec_cx = self.scaling_vector_size
                 tile_size_cx = self.tile_size
                 top_k_cx = self.top_k
+                sched_words_cx = sched_words
                 cache_key = (self.scaling_vector_size, self.tile_size,
                              self.top_k, mma_tiler, mma_inst_shape,
                              cluster_shape_mn, max_active_clusters,
                              self.swiglu_limit, int(self.activation_type),
                              self.situ_beta, self.situ_linear_beta)
+                if die_sched:
+                    cache_key += (die_sm_words, )
+                if sched_lookahead != 1:
+                    cache_key += (("sched_lookahead", sched_lookahead), )
                 if cache_key not in self.__class__.kernel_cache:
                     gemm = self.__class__.kernel_class(
                         self.scaling_vector_size,
@@ -18943,6 +19372,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         activation_type=self.activation_type,
                         situ_beta=self.situ_beta,
                         situ_linear_beta=self.situ_linear_beta,
+                        die_sm_words=die_sm_words,
+                        sched_lookahead=sched_lookahead,
                     )
 
                     @cute.jit
@@ -19032,10 +19463,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                                      (num_tiles, )))
                         fc1_sched = cute.make_tensor(fc1_sched_ptr,
                                                      layout=cute.make_layout(
-                                                         (1, )))
+                                                         (sched_words_cx, )))
                         fc2_sched = cute.make_tensor(fc2_sched_ptr,
                                                      layout=cute.make_layout(
-                                                         (1, )))
+                                                         (sched_words_cx, )))
                         w2 = cute.make_tensor(w2_ptr,
                                               layout=cute.make_ordered_layout(
                                                   (fc2_n, fc2_k, l),
@@ -19181,6 +19612,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             activation_type: ActivationType = ActivationType.Swiglu,
             situ_beta: float = SITU_BETA_DISABLED,
             situ_linear_beta: float = SITU_BETA_DISABLED,
+            zeroed_counters: Optional[torch.Tensor] = None,
         ) -> torch.Tensor:
             tuner = AutoTuner.get()
             runner = Sm107BlockScaledContiguousGroupedGemmFusedFc12Runner(
@@ -19196,6 +19628,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 activation_type=ActivationType(activation_type),
                 situ_beta=_canonicalize_situ_beta(situ_beta),
                 situ_linear_beta=_canonicalize_situ_beta(situ_linear_beta),
+                zeroed_counters=zeroed_counters,
             )
             # Input order matches Fc12FusedInputsHelper (FC1 prefix 0..9 mirrors
             # GatherGroupedGemmInputsHelper; FC2 tensors 10..14; expanded_idx 15
@@ -19220,7 +19653,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         @torch.library.custom_op(
             "trtllm::cute_dsl_nvfp4_fc12_fused_rubin",
-            mutates_args=("output", ),
+            mutates_args=("output", "zeroed_counters"),
             schema=
             "(Tensor input, Tensor fc1_weight, Tensor input_scale, Tensor fc1_weight_scale, "
             "Tensor fc1_alpha, Tensor tile_idx_to_group_idx, Tensor tile_idx_to_mn_limit, "
@@ -19234,7 +19667,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             "SymInt scaling_vector_size=16, "
             "str? precomputed_tactic=None, "
             f"SymInt activation_type={int(ActivationType.Swiglu)}, "
-            "float situ_beta=-1.0, float situ_linear_beta=-1.0) -> ()",
+            "float situ_beta=-1.0, float situ_linear_beta=-1.0, "
+            "Tensor(a29!)? zeroed_counters=None) -> ()",
             device_types="cuda")
         def cute_dsl_nvfp4_fc12_fused_rubin(
             input: torch.Tensor,
@@ -19266,6 +19700,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             activation_type: int = int(ActivationType.Swiglu),
             situ_beta: float = SITU_BETA_DISABLED,
             situ_linear_beta: float = SITU_BETA_DISABLED,
+            zeroed_counters: Optional[torch.Tensor] = None,
         ) -> None:
             # In-place: finalize scatter-adds into ``output`` (mutates_args);
             # the op returns nothing so it does not alias its own input.
@@ -19279,7 +19714,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 swiglu_limit, precomputed_tactic, expanded_idx_to_permuted_idx,
                 ep_size, enable_alltoall,
                 "trtllm::cute_dsl_nvfp4_fc12_fused_rubin",
-                ActivationType(activation_type), situ_beta, situ_linear_beta)
+                ActivationType(activation_type), situ_beta, situ_linear_beta,
+                zeroed_counters)
 
         @torch.library.register_fake("trtllm::cute_dsl_nvfp4_fc12_fused_rubin")
         def _(
@@ -19312,5 +19748,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             activation_type: int = int(ActivationType.Swiglu),
             situ_beta: float = SITU_BETA_DISABLED,
             situ_linear_beta: float = SITU_BETA_DISABLED,
+            zeroed_counters: Optional[torch.Tensor] = None,
         ) -> None:
             return None

@@ -36,6 +36,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
+from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
 
@@ -51,7 +52,7 @@ def test_python_runtime_rejects_non_nixl_backend_at_creation(backend: str) -> No
 
 
 def test_python_runtime_rejects_non_helix_cp_at_creation() -> None:
-    """cp_size > 1 without helix is rejected by _check_compatible at
+    """cp_size > 1 without helix or Ulysses is rejected by _check_compatible at
     creation; the resolver deliberately does not gate on CP (helix is
     supported, and a per-server cp check would resolve ctx and gen servers
     to different runtimes)."""
@@ -59,9 +60,10 @@ def test_python_runtime_rejects_non_helix_cp_at_creation() -> None:
     mapping = Mock()
     mapping.cp_size = 2
     mapping.has_cp_helix.return_value = False
+    mapping.has_cp_ulysses.return_value = False
     mapping.cp_config = {"cp_type": "star_attention"}
 
-    with pytest.raises(ValueError, match="only cp_size == 1 or helix CP"):
+    with pytest.raises(ValueError, match="only cp_size == 1, helix or Ulysses CP"):
         transceiver_module.create_kv_cache_transceiver(
             mapping, Mock(), Mock(spec=KVCacheManagerV2), Mock(), config
         )
@@ -131,3 +133,11 @@ def test_python_runtime_rejects_separate_legacy_mamba_manager() -> None:
         transceiver_module.create_kv_cache_transceiver(
             None, None, manager, None, config, mamba_cache_manager=legacy_mamba
         )
+
+
+def test_cpp_runtime_refuses_ulysses_cp() -> None:
+    """The C++ transceiver's WorldConfig would read Ulysses CP ranks as Helix token shards."""
+    mapping = Mapping(world_size=8, rank=0, cp_size=8, cp_config={"cp_type": "ULYSSES"})
+
+    with pytest.raises(ValueError, match="transceiver_runtime='PYTHON' only"):
+        transceiver_module.mapping_to_world_config(mapping)

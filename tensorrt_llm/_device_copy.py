@@ -18,11 +18,31 @@ class DeviceCopyBuffer:
     def tensor(self) -> torch.Tensor:
         return self._tensor
 
-    def update(self, host: torch.Tensor, *, force: bool = False) -> None:
+    def holds(self, host: torch.Tensor) -> bool:
+        """Whether the leading elements of the buffer were last written from ``host``'s values,
+        i.e. whether ``update(host)`` would skip its copy."""
         flat = host.reshape(-1)
         n = flat.numel()
         last = self._last_host_values
-        if not force and last is not None and last.numel() >= n and torch.equal(last[:n], flat):
+        return last is not None and last.numel() >= n and torch.equal(last[:n], flat)
+
+    def record_written(self, host: torch.Tensor) -> None:
+        """Record that the caller wrote ``host``'s values to the leading elements of the buffer
+        (stream-ordered, as ``update`` does), so later updates compare against them."""
+        flat = host.reshape(-1)
+        n = flat.numel()
+        last = self._last_host_values
+        if last is None or last.numel() <= n:
+            self._last_host_values = flat.clone()
+        else:
+            last = last.clone()
+            last[:n] = flat
+            self._last_host_values = last
+
+    def update(self, host: torch.Tensor, *, force: bool = False) -> None:
+        flat = host.reshape(-1)
+        n = flat.numel()
+        if not force and self.holds(flat):
             if _verify_skipped_device_copies:
                 if self._tensor.is_cuda:
                     if torch.cuda.is_current_stream_capturing():
@@ -37,9 +57,4 @@ class DeviceCopyBuffer:
         staging = torch.empty_like(flat, device="cpu", pin_memory=self._pin_memory)
         staging.copy_(flat)
         self._tensor.view(-1)[:n].copy_(staging, non_blocking=True)
-        if last is None or last.numel() <= n:
-            self._last_host_values = flat.clone()
-        else:
-            last = last.clone()
-            last[:n] = flat
-            self._last_host_values = last
+        self.record_written(flat)

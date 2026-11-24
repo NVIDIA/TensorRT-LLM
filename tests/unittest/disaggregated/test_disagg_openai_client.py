@@ -31,7 +31,11 @@ from tensorrt_llm.serve.disagg_auth import (
     validate_internal_disagg_request,
     validate_subagent_affinity,
 )
-from tensorrt_llm.serve.openai_client import OpenAIHttpClient, _encode_request_body
+from tensorrt_llm.serve.openai_client import (
+    GEN_RETRY_UNDELIVERED_ONLY_ENV,
+    OpenAIHttpClient,
+    _encode_request_body,
+)
 from tensorrt_llm.serve.openai_protocol import (
     CompletionRequest,
     CompletionResponse,
@@ -909,8 +913,11 @@ class TestDisaggIdRegenOnRetry:
             internal_disagg_auth_key="secret",
             disagg_id_generator=AsyncMock(return_value=1000) if regenerate_id else None,
         )
+        # A generation leg is retried only while undelivered, and keeps its ID.
         session.post.side_effect = [
-            aiohttp.ClientError("transient"),
+            aiohttp.ClientError("transient")
+            if role == ServerRole.CONTEXT
+            else aiohttp.ServerDisconnectedError(),
             self._mock_http_ok(self._ok_response()),
         ]
         request = CompletionRequest(
@@ -928,7 +935,8 @@ class TestDisaggIdRegenOnRetry:
         )
 
         await client.send_request(request)
-        expected_ids = [42, 1000 if regenerate_id else 42]
+        id_changed = regenerate_id and role == ServerRole.CONTEXT
+        expected_ids = [42, 1000 if id_changed else 42]
 
         # Serialized attempts retain their own IDs when a context retry
         # regenerates the request ID.
@@ -954,7 +962,7 @@ class TestDisaggIdRegenOnRetry:
             assert (
                 headers[0][INTERNAL_DISAGG_AUTH_HEADER] == headers[1][INTERNAL_DISAGG_AUTH_HEADER]
             )
-        if regenerate_id:
+        if id_changed:
             assert (
                 headers[0][SUBAGENT_AFFINITY_AUTH_HEADER]
                 != headers[1][SUBAGENT_AFFINITY_AUTH_HEADER]
@@ -1620,6 +1628,10 @@ class TestRemoteTailHandoffRetry:
     ):
         openai_client._role = role
         openai_client._bounded_replay_on_generation = bounded_replay
+        # The generation-leg rows cover the opt-out
+        # (TRTLLM_DISAGG_GEN_RETRY_UNDELIVERED_ONLY=0); TestGenerationLegRetry
+        # covers the default.
+        openai_client._gen_retry_undelivered_only = False
         openai_client._retry_interval_sec = 0
         # Transient TCP failures retain their budget even without normal retries.
         openai_client._max_retries = 0 if error_type is aiohttp.ServerDisconnectedError else 2
@@ -1655,3 +1667,226 @@ class TestRemoteTailHandoffRetry:
         mock_router.finish_request.assert_awaited_once_with(
             completion_request, mock_session, success=True, req_id=42
         )
+
+
+class TestGenerationLegRetry:
+    """A generation leg is retried only while it cannot have reached the server.
+
+    This is the default; ``TRTLLM_DISAGG_GEN_RETRY_UNDELIVERED_ONLY=0`` opts
+    out. The generation leg of a disaggregated request names the context
+    server's KV-cache send session through ``disagg_request_id``. Once the
+    generation server may have accepted the request, the KV cache is consumed
+    (or was released after a failed transfer), so a second post would wait for
+    KV cache that is never sent.
+    """
+
+    _ORIGINAL_ID = 4242
+
+    @pytest.fixture(autouse=True)
+    def _default_env(self, monkeypatch):
+        monkeypatch.delenv(GEN_RETRY_UNDELIVERED_ONLY_ENV, raising=False)
+
+    def _make_client(self, session, role=ServerRole.GENERATION):
+        _reset_prometheus_registry()
+        router = AsyncMock(spec=Router)
+        router.servers = ["localhost:8000"]
+        router.get_next_server = AsyncMock(return_value=("localhost:8000", None))
+        router.finish_request = AsyncMock()
+        ids = iter(range(9000, 9100))
+
+        async def next_id():
+            return next(ids)
+
+        client = OpenAIHttpClient(
+            router=router,
+            role=role,
+            timeout_secs=10,
+            max_retries=1,
+            retry_interval_sec=0,
+            session=session,
+            disagg_id_generator=next_id,
+        )
+        return client, router
+
+    def _make_request(self, stream: bool):
+        return CompletionRequest(
+            model="m",
+            prompt=[1, 2, 3],
+            stream=stream,
+            disaggregated_params=DisaggregatedParams(
+                request_type="generation_only",
+                first_gen_tokens=[7],
+                ctx_request_id=self._ORIGINAL_ID,
+                disagg_request_id=self._ORIGINAL_ID,
+            ),
+        )
+
+    @staticmethod
+    def _mock_truncated_stream():
+        """A 200 event stream that is cut before its first chunk."""
+        r = AsyncMock()
+        r.status = 200
+        r.headers = {"Content-Type": "text/event-stream"}
+
+        async def iter_any():
+            raise aiohttp.ClientPayloadError("Response payload is not completed")
+            yield b""  # pragma: no cover - makes this an async generator
+
+        r.content = AsyncMock()
+        r.content.iter_any = iter_any
+        r.__aenter__ = AsyncMock(return_value=r)
+        r.__aexit__ = AsyncMock(return_value=False)
+        return r
+
+    @staticmethod
+    def _mock_ok_stream():
+        r = AsyncMock()
+        r.status = 200
+        r.headers = {"Content-Type": "text/event-stream"}
+
+        async def iter_any():
+            yield b'data: "ok"\n\n'
+
+        r.content = AsyncMock()
+        r.content.iter_any = iter_any
+        r.__aenter__ = AsyncMock(return_value=r)
+        r.__aexit__ = AsyncMock(return_value=False)
+        return r
+
+    @pytest.mark.asyncio
+    async def test_truncated_stream_is_not_retried(self):
+        """The generation server failed the request after sending its headers."""
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        session.post.side_effect = [self._mock_truncated_stream(), self._mock_ok_stream()]
+        client, router = self._make_client(session)
+        req = self._make_request(stream=True)
+
+        generator = await client.send_request(req)
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            with pytest.raises(aiohttp.ClientPayloadError):
+                async for _ in generator:
+                    pass
+
+        assert session.post.call_count == 1
+        assert req.disaggregated_params.disagg_request_id == self._ORIGINAL_ID
+        router.finish_request.assert_called_once_with(req, session, success=False)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [400, 500])
+    async def test_http_error_status_is_not_retried(self, status):
+        """A failed KV transfer comes back as an HTTP error from the generation server."""
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        r = AsyncMock()
+        r.status = status
+        r.reason = "Bad Request" if status == 400 else "Internal Server Error"
+        r.headers = {"Content-Type": "application/json"}
+        r.text = AsyncMock(return_value="Error in kv cache transfer for generation requests")
+        r.__aenter__ = AsyncMock(return_value=r)
+        r.__aexit__ = AsyncMock(return_value=False)
+        session.post.return_value = r
+        client, _ = self._make_client(session)
+
+        req = self._make_request(stream=False)
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            with pytest.raises(aiohttp.ClientResponseError):
+                await client.send_request(req)
+
+        assert session.post.call_count == 1
+        assert req.disaggregated_params.disagg_request_id == self._ORIGINAL_ID
+
+    @pytest.mark.asyncio
+    async def test_timeout_before_response_is_not_retried(self):
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        session.post.side_effect = asyncio.TimeoutError()
+        client, _ = self._make_client(session)
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            with pytest.raises(asyncio.TimeoutError):
+                await client.send_request(self._make_request(stream=False))
+
+        assert session.post.call_count == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "error",
+        [
+            aiohttp.ClientConnectorError(Mock(), OSError(111, "Connection refused")),
+            aiohttp.ServerDisconnectedError(),
+            ConnectionResetError(),
+            aiohttp.ClientOSError(errno.ECONNRESET, "Connection reset by peer"),
+        ],
+        ids=["connect", "server_disconnected", "connection_reset", "wrapped_connection_reset"],
+    )
+    async def test_undelivered_request_is_retried_with_same_id(self, error):
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        session.post.side_effect = [error, self._mock_ok_stream()]
+        client, router = self._make_client(session)
+        req = self._make_request(stream=True)
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            generator = await client.send_request(req)
+            chunks = [chunk async for chunk in generator]
+
+        assert chunks == [b'data: "ok"\n\n']
+        assert session.post.call_count == 2
+        assert req.disaggregated_params.disagg_request_id == self._ORIGINAL_ID
+        router.finish_request.assert_called_once_with(req, session, success=True)
+
+    @pytest.mark.asyncio
+    async def test_context_request_retry_is_unchanged(self):
+        """Context requests keep retrying after a response error, with a new id."""
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        ok = AsyncMock()
+        ok.status = 200
+        ok.headers = {"Content-Type": "application/json"}
+        ok.json = AsyncMock(
+            return_value=CompletionResponse(
+                model="m",
+                usage=UsageInfo(prompt_tokens=1, completion_tokens=1),
+                choices=[CompletionResponseChoice(index=0, text="ok")],
+            ).model_dump()
+        )
+        ok.__aenter__ = AsyncMock(return_value=ok)
+        ok.__aexit__ = AsyncMock(return_value=False)
+        bad = AsyncMock()
+        bad.status = 500
+        bad.reason = "Internal Server Error"
+        bad.headers = {"Content-Type": "application/json"}
+        bad.text = AsyncMock(return_value="boom")
+        bad.__aenter__ = AsyncMock(return_value=bad)
+        bad.__aexit__ = AsyncMock(return_value=False)
+        session.post.side_effect = [bad, ok]
+        client, _ = self._make_client(session, role=ServerRole.CONTEXT)
+        req = CompletionRequest(
+            model="m",
+            prompt="hi",
+            stream=False,
+            disaggregated_params=DisaggregatedParams(
+                request_type="context_only", disagg_request_id=self._ORIGINAL_ID
+            ),
+        )
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            resp = await client.send_request(req)
+
+        assert isinstance(resp, CompletionResponse)
+        assert session.post.call_count == 2
+        assert req.disaggregated_params.disagg_request_id != self._ORIGINAL_ID
+
+    @pytest.mark.asyncio
+    async def test_switch_off_retries_with_new_id(self, monkeypatch):
+        """With the switch set to 0 a generation leg retries with a new id."""
+        monkeypatch.setenv(GEN_RETRY_UNDELIVERED_ONLY_ENV, "0")
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        session.post.side_effect = [self._mock_truncated_stream(), self._mock_ok_stream()]
+        client, router = self._make_client(session)
+        req = self._make_request(stream=True)
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            generator = await client.send_request(req)
+            chunks = [chunk async for chunk in generator]
+
+        assert chunks == [b'data: "ok"\n\n']
+        assert session.post.call_count == 2
+        assert req.disaggregated_params.disagg_request_id != self._ORIGINAL_ID
+        router.finish_request.assert_called_once_with(req, session, success=True)

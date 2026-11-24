@@ -234,8 +234,7 @@ def _helix_note_nccl_specialization(partial_o: torch.Tensor,
         "cache_size_limit.", len(_HELIX_NCCL_SHAPES), limit)
 
 
-@torch.compile(dynamic=False)
-def _helix_nccl_pre_alltoall(
+def _helix_nccl_pre_alltoall_eager(
     partial_o: torch.Tensor,
     softmax_stats: torch.Tensor,
     zero_kv_mask: Optional[torch.Tensor],
@@ -269,11 +268,18 @@ def _helix_nccl_pre_alltoall(
     return chunks
 
 
-@torch.compile(dynamic=False)
-def _helix_nccl_post_alltoall(
+def _helix_nccl_post_alltoall_eager(
         gathered: List[torch.Tensor]) -> List[torch.Tensor]:
     """Reformat the gathered partials into the helix_post_process layout."""
     return [t.transpose(1, 2).contiguous() for t in gathered]
+
+
+# The compiled reformats of the NCCL path (one inductor specialization per
+# shape); the ``*_eager`` functions give the same values without compiling.
+_helix_nccl_pre_alltoall = torch.compile(
+    dynamic=False)(_helix_nccl_pre_alltoall_eager)
+_helix_nccl_post_alltoall = torch.compile(
+    dynamic=False)(_helix_nccl_post_alltoall_eager)
 
 
 def _helix_post_process(
@@ -285,6 +291,7 @@ def _helix_post_process(
     aux_stream: Optional[torch.cuda.Stream] = None,
     ln_events: Optional[list] = None,
     zero_kv_mask: Optional[torch.Tensor] = None,
+    compile_nccl_reformat: bool = True,
 ) -> torch.Tensor:
     """Helix CP post-processing: all-to-all exchange and combine partial
     attention outputs across CP ranks.
@@ -303,16 +310,26 @@ def _helix_post_process(
     When *aux_stream* and *ln_events* are provided the two
     ``.contiguous()`` calls in the FIFO-v1 path are overlapped on
     separate CUDA streams for better performance.
+
+    ``compile_nccl_reformat=False`` runs the NCCL path's reformats eagerly
+    (same values, no inductor compile). For callers that meet new shapes in
+    the middle of a multi-rank forward: a compile there loads a module while
+    the other ranks already wait in the NCCL all-to-all, and that load can
+    block every rank.
     """
     if mapping.cp_config.get("use_nccl_for_alltoall", True):
         # NCCL path. Sanitize is folded into _helix_nccl_pre_alltoall so
         # inductor can fuse it into the reformat.
-        _helix_note_nccl_specialization(partial_o, softmax_stats,
-                                        mapping.cp_size)
-        chunks = _helix_nccl_pre_alltoall(partial_o, softmax_stats,
-                                          zero_kv_mask, mapping.cp_size)
+        if compile_nccl_reformat:
+            _helix_note_nccl_specialization(partial_o, softmax_stats,
+                                            mapping.cp_size)
+            pre, post = _helix_nccl_pre_alltoall, _helix_nccl_post_alltoall
+        else:
+            pre = _helix_nccl_pre_alltoall_eager
+            post = _helix_nccl_post_alltoall_eager
+        chunks = pre(partial_o, softmax_stats, zero_kv_mask, mapping.cp_size)
         gathered = alltoall_helix(chunks, mapping.cp_group)
-        gathered = _helix_nccl_post_alltoall(gathered)
+        gathered = post(gathered)
         return torch.ops.trtllm.helix_post_process(gathered[0], gathered[1],
                                                    1.0)
     else:

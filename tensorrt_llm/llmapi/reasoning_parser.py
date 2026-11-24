@@ -774,7 +774,12 @@ def resolve_auto_reasoning_parser(model: str) -> Optional[str]:
     if model_type in _QWEN3_MODEL_TYPES:
         return _resolve_qwen3_reasoning_parser(model)
 
-    return MODEL_TYPE_TO_REASONING_PARSER.get(model_type)
+    if model_type in MODEL_TYPE_TO_REASONING_PARSER:
+        return MODEL_TYPE_TO_REASONING_PARSER[model_type]
+    # A model family served only by modeling_v2 states its parser.
+    from tensorrt_llm._torch._experimental.modeling_v2._architecture_index import \
+        serve_parser
+    return serve_parser(model_type, "reasoning")
 
 
 @register_reasoning_parser("nemotron-v3")
@@ -1213,12 +1218,22 @@ class KimiK3ReasoningParser(BaseReasoningParser):
     """
 
     needs_raw_special_tokens = True
+    # The generation prompt ends inside the think channel when thinking is on
+    # and inside the response channel when it is off.
+    resolves_thinking_from_prompt = True
+    reasoning_start = "<|open|>think<|sep|>"
+    reasoning_end = "<|close|>think<|sep|>"
 
     OPEN = "<|open|>"
     CLOSE = "<|close|>"
     SEP = "<|sep|>"
     EOM = "<|end_of_msg|>"
     TOOLS_END = CLOSE + "tools" + SEP
+
+    @classmethod
+    def resolve_unmarked_prompt(cls, tail: str) -> Optional[bool]:
+        """A prompt that opens the response channel has thinking off."""
+        return False if tail.endswith(cls.OPEN + "response" + cls.SEP) else None
 
     def __init__(self,
                  *,

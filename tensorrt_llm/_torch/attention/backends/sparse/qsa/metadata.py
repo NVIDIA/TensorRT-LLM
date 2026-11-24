@@ -375,7 +375,7 @@ class QSAAttentionMetadata(TrtllmAttentionMetadata):
         # depends on the updated lengths.
         self._refresh_qsa_token_mapping()
 
-    def update_for_spec_dec(self) -> None:
+    def update_for_spec_dec(self, refresh_device_metadata: bool = True) -> None:
         """Refresh the row mapping after a draft step repacks the batch.
 
         The first draft step rewrites seq_lens from one row per accepted token
@@ -383,7 +383,7 @@ class QSAAttentionMetadata(TrtllmAttentionMetadata):
         packed-row mapping built during prepare() no longer describes the rows
         the next draft step attends over.
         """
-        super().update_for_spec_dec()
+        super().update_for_spec_dec(refresh_device_metadata)
         self.on_update_kv_lens()
 
 

@@ -362,6 +362,39 @@ moonshotai/Kimi-K3:
   # 1,319 samples on SM107; 96.0 keeps margin for run-to-run variation.
   - quant_algo: MIXED_PRECISION
     accuracy: 96.0
+nvidia/kimi_k31_pro_nvfp4:
+  # Initial acceptance requirements, not measured accuracy references.
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: FP8
+    spec_dec_algo: DFlash
+    extra_acc_spec: fp8_fp32
+    accuracy: 97.0
+    threshold: 97.0
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: NVFP4
+    spec_dec_algo: DFlash
+    extra_acc_spec: fp4_bf16
+    accuracy: 97.0
+    threshold: 97.0
+moonshotai/Kimi-K3.1-Pro:
+  # TestModelingV2KimiK31ProMxfp4Sm10xDefault::test_gsm8k_dep16 and test_gsm8k_tep8 (FP8 KV, FP8
+  # index keys) share this key. The earlier built-in K3.1 implementation measured DEP16 97.84 and
+  # TEP8 98.03 on GB300 (mean 97.94; greedy, with lossless speculation).
+  - kv_cache_quant_algo: FP8
+    accuracy: 97.94
+  # TestModelingV2KimiK31ProMxfp4Sm10xDefault::test_gsm8k_tep8_bf16_kv (kv_cache_config.dtype auto: the
+  # checkpoint's BF16 latent KV cache on the general target). Held to the FP8 entry's accuracy: the BF16 latents
+  # skip the FP8 rounding. Measured 97.84 on GB300 (TEP8, greedy, no speculation).
+  - accuracy: 97.94
+  # TestModelingV2KimiK31ProNvfp4Sm107{Dep16,Helix8,Helix16Moetp16ep1,Tep8} (Rubin: the ModelOpt NVFP4 export, FP8 KV,
+  # FP8 index keys, FP32 KDA state, DFlash2). This export has no reference
+  # mean of its own here: the reference is the MXFP4 checkpoint's lossless mean above, and a single
+  # pass fails below the fixed floor of 95.0.
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: FP8
+    spec_dec_algo: DFlash
+    accuracy: 97.94
+    threshold: 95.0
 nvidia/Nemotron-MOE:
   - accuracy: 88.249
   - quant_algo: FP8

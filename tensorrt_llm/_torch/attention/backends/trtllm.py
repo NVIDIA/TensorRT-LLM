@@ -40,13 +40,15 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.math_utils import ceil_div
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+from ...kimi_k3_cache_policy import get_kimi_k3_fp8_kv_layer_ids
 from ...pyexecutor.config_utils import is_mla
+from ...pyexecutor.input_commit import active_input_commit
 from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
                       get_model_extra_attrs, helix_local_len_tensor)
 from ..kernels.sage_quant import SageQuantized, sage_quantize
 from .fmha.manager import FmhaManager
-from .fp4_mla import (can_fuse_fp4_mla_q_quant, populate_helix_spec_buffers,
-                      scatter_fp4_mla_kv_cache)
+from .fp4_mla import (can_fuse_fp4_mla_q_quant, load_fp4_mla_chunked_kv_cache,
+                      populate_helix_spec_buffers, scatter_fp4_mla_kv_cache)
 from .fp4_mla.state import Fp4MlaState
 from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMask, AttentionMetadata,
@@ -694,7 +696,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if state is not None:
             state.on_update_kv_lens(self)
 
-    def update_for_spec_dec(self) -> None:
+    def update_for_spec_dec(self, refresh_device_metadata: bool = True) -> None:
         if self.enable_flash_mla:
             self._flash_mla_metadata_valid = False
         self._invalidate_mla_scheduler_buffers()
@@ -731,19 +733,31 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 group may straddle a page boundary onto two ranks). None on
                 the single-token path, where the boolean flag carries it.
         """
+        # Set by the decoder runner for a batched input commit (input_commit.py).
+        input_commit = active_input_commit()
         if helix_position_offsets is not None and self.helix_position_offsets is not None:
             num_tokens = len(helix_position_offsets)
             self.helix_position_offsets_cpu[:num_tokens].copy_(
                 torch.tensor(helix_position_offsets, dtype=torch.int))
-            self.helix_position_offsets[:num_tokens].copy_(
-                self.helix_position_offsets_cpu[:num_tokens], non_blocking=True)
+            if input_commit is not None:
+                input_commit.stage(self.helix_position_offsets[:num_tokens],
+                                   self.helix_position_offsets_cpu[:num_tokens])
+            else:
+                self.helix_position_offsets[:num_tokens].copy_(
+                    self.helix_position_offsets_cpu[:num_tokens],
+                    non_blocking=True)
 
         if helix_is_inactive_rank is not None and self.helix_is_inactive_rank is not None:
             batch_size = len(helix_is_inactive_rank)
             self.helix_is_inactive_rank_cpu[:batch_size].copy_(
                 torch.tensor(helix_is_inactive_rank, dtype=torch.bool))
-            self.helix_is_inactive_rank[:batch_size].copy_(
-                self.helix_is_inactive_rank_cpu[:batch_size], non_blocking=True)
+            if input_commit is not None:
+                input_commit.stage(self.helix_is_inactive_rank[:batch_size],
+                                   self.helix_is_inactive_rank_cpu[:batch_size])
+            else:
+                self.helix_is_inactive_rank[:batch_size].copy_(
+                    self.helix_is_inactive_rank_cpu[:batch_size],
+                    non_blocking=True)
 
         self._helix_spec_tokens_valid = False
         if helix_owned_new_tokens is not None:
@@ -920,10 +934,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         """Restore backend state modified for draft-forward execution."""
         return None
 
-    def token_major_gen_view(self) -> Optional["TokenMajorGenView"]:
+    def token_major_gen_view(self,
+                             token_sparse: bool = False
+                             ) -> Optional["TokenMajorGenView"]:
         """The token-major generation presentation, or None.
 
-        None on every backend but DSA, and on every uniform DSA batch. See
+        None on every backend but DSA. DSA returns it for ragged verify batches
+        and, for a token-sparse call, for every Helix generation batch.
+        ``token_sparse`` marks a sparse-MLA call. See
         ``DSAtrtllmAttentionMetadata.token_major_gen_view``.
         """
         return None
@@ -1011,8 +1029,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             device='cpu',
         )
         self.prompt_lens_cpu[:self.num_seqs].copy_(prompt_lens)
-        self.prompt_lens_cuda[:self.num_seqs].copy_(
-            self.prompt_lens_cpu[:self.num_seqs], non_blocking=True)
+        # Set by the decoder runner for a batched input commit (input_commit.py).
+        input_commit = active_input_commit()
+        if input_commit is not None:
+            input_commit.stage(self.prompt_lens_cuda[:self.num_seqs],
+                               self.prompt_lens_cpu[:self.num_seqs])
+        else:
+            self.prompt_lens_cuda[:self.num_seqs].copy_(
+                self.prompt_lens_cpu[:self.num_seqs], non_blocking=True)
 
         # number of tokens in the kv cache for each sequence in the batch
         cached_token_lens = torch.tensor(
@@ -1065,9 +1089,13 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # the sequence length including the cached tokens and the input tokens.
         self.kv_lens[:self.num_seqs].copy_(
             kv_lens + self.kv_cache_params.num_extra_kv_tokens)
-        self.kv_lens_cuda[:self.num_seqs].copy_(maybe_pin_memory(
-            kv_lens[:self.num_seqs]),
-                                                non_blocking=True)
+        if input_commit is not None:
+            input_commit.stage(self.kv_lens_cuda[:self.num_seqs],
+                               kv_lens[:self.num_seqs])
+        else:
+            self.kv_lens_cuda[:self.num_seqs].copy_(maybe_pin_memory(
+                kv_lens[:self.num_seqs]),
+                                                    non_blocking=True)
         # total kv lens for context requests and generation requests, without extra tokens
         self.host_total_kv_lens[0] = kv_lens[:self.num_contexts].sum().item()
         self.host_total_kv_lens[1] = kv_lens[self.num_contexts:self.
@@ -1906,8 +1934,21 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             return CSA2TrtllmAttention.runtime_workspace_bytes_per_token(
                 model_config, mapping)
 
+        fp8_fallback_layers = frozenset()
+        if quant_mode is not None and getattr(quant_mode, "has_fp4_kv_cache",
+                                              lambda: False)():
+            fp8_fallback_layers = get_kimi_k3_fp8_kv_layer_ids(
+                config, nvfp4_enabled=True)
+        has_local_fp8_fallback = bool(
+            fp8_fallback_layers and fp8_fallback_layers.intersection(
+                mapping.pp_layers(
+                    int((getattr(config, "text_config", None)
+                         or config).num_hidden_layers))))
+        # FP8 fallback layers stage the same context buffers as an all-FP8
+        # model, even though the model-wide cache quantization is NVFP4.
         fp8_context_mla = (quant_config is not None
-                           and quant_config.quant_mode.has_fp8_kv_cache()
+                           and (quant_config.quant_mode.has_fp8_kv_cache()
+                                or has_local_fp8_fallback)
                            and get_sm_version() in (90, 100, 103, 107, 120))
         if not fp8_context_mla:
             return 0
@@ -2256,9 +2297,14 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata,
             TrtllmAttentionMetadata,
         )
-        token_major_view = (metadata.token_major_gen_view()
-                            if forward_args.attention_input_type
-                            == AttentionInputType.generation_only else None)
+        token_major_view = None
+        if (forward_args.attention_input_type ==
+                AttentionInputType.generation_only):
+            # Sparse indices are predicted further down; the backend's sparse
+            # params already say whether this call is token-sparse.
+            token_major_view = metadata.token_major_gen_view(
+                token_sparse=self.is_mla_enable
+                and self.sparse_params is not None)
         if metadata.enable_flash_mla and token_major_view is not None:
             raise ValueError(
                 "FlashMLA does not support ragged token-major generation; "
@@ -2686,6 +2732,21 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         assert self.is_mla_enable and self.mla_params is not None
         assert metadata.kv_cache_manager is not None
 
+        if self.uses_fp4_mla_attention:
+            # Dense FP4 MLA storage: dequantize the cached prefix partition
+            # from the NVFP4 K / K-scale roles of KV cache manager V2.
+            return load_fp4_mla_chunked_kv_cache(
+                metadata,
+                self.layer_idx,
+                num_ctx_cached_tokens=num_ctx_cached_tokens,
+                cu_chunked_seq_len=cu_chunked_seq_len,
+                chunked_global_offset=chunked_global_offset,
+                chunked_max_seq_len=chunked_max_seq_len,
+                out_dtype=out_dtype,
+                kv_lora_rank=self.mla_params.kv_lora_rank,
+                qk_rope_head_dim=self.mla_params.qk_rope_head_dim,
+            )
+
         if metadata.max_ctx_cached_token_len == 0:
             empty_kv = torch.empty((0, self.mla_params.kv_lora_rank),
                                    dtype=out_dtype,
@@ -2717,6 +2778,71 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.quant_mode,
         )
         return output_kv, output_k_pe
+
+    def append_fp4_mla_context_cache(
+        self,
+        q: torch.Tensor,
+        latent_cache: torch.Tensor,
+        metadata: TrtllmAttentionMetadata,
+    ) -> None:
+        """Apply Q/K RoPE and append one context chunk to FP4 MLA storage.
+
+        The FP4 counterpart of ``mla_rope_append_paged_kv_assign_q``: rotates
+        Q and the current K in place (``latent_cache``) and writes the chunk
+        to the NVFP4 cache and the BF16 HP tail. Each context chunk must start
+        on a 16-token FP4 quantization tile.
+        """
+        if not self.uses_fp4_mla_attention or self.mla_params is None:
+            raise RuntimeError(
+                "FP4 MLA context append requires dense FP4 MLA attention.")
+        if metadata.fp4_mla_state is None or metadata.fp4_mla_state.positions is None:
+            raise RuntimeError(
+                "FP4 MLA context append requires token positions.")
+        self._ensure_rope_table_size(metadata.max_seq_len)
+        hp_pool_updated = scatter_fp4_mla_kv_cache(
+            metadata,
+            latent_cache[:metadata.num_ctx_tokens],
+            self.layer_idx,
+            token_offset=0,
+            phase="context",
+            local_layer=self.get_fp4_mla_local_layer_idx(metadata),
+            v_head_dim=self.mla_params.kv_lora_rank,
+            rotary_cos_sin=self.rotary_cos_sin,
+            q_context=q,
+            q_nope_head_dim=self.mla_params.qk_nope_head_dim,
+        )
+        if not hp_pool_updated:
+            raise RuntimeError(
+                "Fused FP4 MLA context scatter did not update the HP pool.")
+
+    def forward_fp4_mla_context_partition(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        metadata: TrtllmAttentionMetadata,
+        forward_args: AttentionForwardArgs,
+        *,
+        kv_lens_cuda: torch.Tensor,
+        kv_lens_cpu: torch.Tensor,
+    ):
+        """Run one explicit-KV FP4 MLA chunk partition through FP8 context FMHA."""
+        from .fmha.fp4_mla import Fp4MlaFmha
+
+        for fmha in self._fmha_manager.fmha_libs:
+            if isinstance(fmha, Fp4MlaFmha):
+                return fmha.forward_context_partition(
+                    q,
+                    k,
+                    v,
+                    metadata,
+                    forward_args,
+                    kv_lens_cuda=kv_lens_cuda,
+                    kv_lens_cpu=kv_lens_cpu,
+                )
+        raise RuntimeError(
+            "FP4 MLA chunked prefill requires the Fp4MlaFmha library; check "
+            "TLLM_FMHA_LIBS.")
 
     def mla_rope_append_paged_kv_assign_q(
         self,
@@ -3047,6 +3173,62 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if not hp_pool_updated:
             raise RuntimeError(
                 "Fused FP4 MLA RoPE/cache scatter did not update the HP pool.")
+
+    def fp4_mla_kv_append_generation(
+        self,
+        latent_cache: torch.Tensor,
+        metadata: TrtllmAttentionMetadata,
+        num_q_heads: int,
+    ) -> None:
+        """The KV half of ``_fp4_mla_rope_generation``: append this step's latent rows to the
+        FP4 cache and HP ring, prepare the packed-Q buffers of ``num_q_heads`` heads and record
+        them on ``metadata`` for the decode, without writing the query rows (the caller's
+        fused query kernel writes them). The cache bytes are the full update's."""
+        assert self.kv_lora_rank is not None
+        assert self.qk_rope_head_dim is not None
+        if not self.uses_fp4_mla_attention:
+            raise RuntimeError(
+                "The FP4 MLA KV append requires FP4 MLA attention.")
+        if latent_cache.shape[-1] != self.kv_lora_rank + self.qk_rope_head_dim:
+            raise RuntimeError(
+                "FP4 MLA latent_cache last dimension must be "
+                f"{self.kv_lora_rank + self.qk_rope_head_dim}, got "
+                f"{latent_cache.shape[-1]}.")
+        if (self.rotary_cos_sin is None or latent_cache.dtype != torch.bfloat16
+                or self.rotary_cos_sin.dtype != torch.float32):
+            raise RuntimeError(
+                "FP4 MLA generation requires a BF16 latent cache and an FP32 "
+                "rotary table.")
+        helix_position_offsets = metadata.helix_position_offsets
+        helix_is_inactive_rank = metadata.helix_is_inactive_rank
+        if helix_position_offsets is not None and helix_is_inactive_rank is None:
+            raise RuntimeError("FP4 MLA Helix requires inactive-rank metadata.")
+        self._ensure_rope_table_size(metadata.max_seq_len)
+        num_tokens = latent_cache.shape[0]
+        # Shape-only stand-ins for the query tensors the KV-only update never reads.
+        stub = latent_cache.new_empty(1)
+        q_pe = stub.expand(num_tokens, num_q_heads, self.qk_rope_head_dim)
+        q_input = stub.expand(num_tokens, num_q_heads,
+                              self.kv_lora_rank + self.qk_rope_head_dim)
+        hp_pool_updated = scatter_fp4_mla_kv_cache(
+            metadata,
+            latent_cache,
+            self.layer_idx,
+            token_offset=getattr(metadata, "num_ctx_tokens", 0),
+            phase="generation",
+            local_layer=self.get_fp4_mla_local_layer_idx(metadata),
+            v_head_dim=self.kv_lora_rank,
+            rotary_cos_sin=self.rotary_cos_sin,
+            q_pe=q_pe,
+            q_rope_out=q_pe,
+            q_quant_input=q_input,
+            helix_position_offsets=helix_position_offsets,
+            helix_is_inactive_rank=helix_is_inactive_rank,
+            q_rows_external=True,
+        )
+        if not hp_pool_updated:
+            raise RuntimeError(
+                "FP4 MLA generation KV append did not update the HP pool.")
 
     def can_fuse_fp4_mla_q_quant(
         self,

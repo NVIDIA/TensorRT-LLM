@@ -109,6 +109,7 @@ class WeightBuffer:
         "_layer_states",
         "_moe_layer_indices",
         "_released",
+        "_num_slots",
     )
 
     def __init__(
@@ -121,6 +122,7 @@ class WeightBuffer:
         device_id: int,
         granularity: Optional[int] = None,
         pool_page_size: Optional[int] = None,
+        num_slots: int = 2,
     ):
         """Internal constructor. Use WeightBuffer.create() factory method.
 
@@ -136,7 +138,12 @@ class WeightBuffer:
                 defaults to ``PagePool.DEFAULT_PAGE_SIZE_MULTIPLIER *
                 granularity`` (16MB on GB200). Must be a multiple of
                 granularity.
+            num_slots: Number of prefetch buffer slots; MoE order ``o`` maps
+                its remote experts to slot ``o % num_slots``.
         """
+        if num_slots < 2:
+            raise ValueError(f"num_slots must be at least 2, got {num_slots}")
+        self._num_slots = num_slots
         self._layer_weight_specs = layer_weight_specs
         self._handles = handles
         self._local_start = local_start
@@ -168,6 +175,7 @@ class WeightBuffer:
         local_end: int,
         dwdp_size: int,
         device_id: int,
+        num_slots: int = 2,
     ) -> WeightBuffer:
         """Create all VA mappings and remote page pool.
 
@@ -186,6 +194,8 @@ class WeightBuffer:
             local_end: Last local expert index (exclusive).
             dwdp_size: Number of DWDP ranks.
             device_id: CUDA device ordinal.
+            num_slots: Number of prefetch buffer slots (each holds the remote
+                experts of one MoE layer).
 
         Returns:
             Ready-to-use WeightBuffer with all VA mappings established.
@@ -204,6 +214,7 @@ class WeightBuffer:
             local_end=local_end,
             dwdp_size=dwdp_size,
             device_id=device_id,
+            num_slots=num_slots,
         )
 
         try:
@@ -218,7 +229,9 @@ class WeightBuffer:
                 layer_idx: buffer.buffer_index_for_layer(layer_idx)
                 for layer_idx in layer_weight_specs.keys()
             }
-            slot_sizes = compute_slot_sizes(layouts, buffer_slot_assignments)
+            slot_sizes = compute_slot_sizes(
+                layouts, buffer_slot_assignments, num_slots=buffer._num_slots
+            )
 
             buffer._page_pool = PagePool.create(
                 slot_sizes, device_id, page_size=buffer._pool_page_size
@@ -621,14 +634,19 @@ class WeightBuffer:
         """CUDA device ordinal."""
         return self._device_id
 
+    @property
+    def num_slots(self) -> int:
+        """Number of prefetch buffer slots."""
+        return self._num_slots
+
     def buffer_index_for_layer(self, layer_idx: int) -> int:
-        """Double buffer slot: 0 or 1 based on MoE order (odd/even).
+        """Prefetch buffer slot of a layer: its MoE order modulo ``num_slots``.
 
         Args:
             layer_idx: Layer index.
 
         Returns:
-            Buffer slot index (0 or 1).
+            Buffer slot index in [0, num_slots).
         """
         # Find position of this layer in the MoE layer sequence
         if layer_idx in self._moe_layer_indices:
@@ -636,7 +654,7 @@ class WeightBuffer:
         else:
             moe_order = layer_idx
 
-        return moe_order % 2
+        return moe_order % self._num_slots
 
     def weight_names(self, layer_idx: int) -> List[str]:
         """Get weight names for a specific layer.
@@ -731,12 +749,9 @@ class WeightBuffer:
         }
 
         if self._page_pool is not None:
-            info["page_pool"] = {
-                "page_size": self._page_pool.page_size,
-                "slot0_pages": self._page_pool.num_pages(0),
-                "slot1_pages": self._page_pool.num_pages(1),
-                "slot0_size": self._page_pool.slot_size(0),
-                "slot1_size": self._page_pool.slot_size(1),
-            }
+            info["page_pool"] = {"page_size": self._page_pool.page_size}
+            for slot in range(self._num_slots):
+                info["page_pool"][f"slot{slot}_pages"] = self._page_pool.num_pages(slot)
+                info["page_pool"][f"slot{slot}_size"] = self._page_pool.slot_size(slot)
 
         return info

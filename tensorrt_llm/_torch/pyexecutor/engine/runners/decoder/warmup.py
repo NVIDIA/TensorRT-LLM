@@ -32,8 +32,9 @@ from tensorrt_llm._torch.speculative.utils import get_static_draft_len
 from tensorrt_llm._utils import global_mpi_rank
 from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
 from tensorrt_llm.logger import logger
-from tensorrt_llm.mapping import CpType, Mapping
+from tensorrt_llm.mapping import Mapping
 
+from .dummy_requests import DummyRequestFactory
 from .metadata import resolve_mamba_metadata_cls
 
 if TYPE_CHECKING:
@@ -44,7 +45,6 @@ if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import BaseSparseAttentionConfig
 
     from .config import DecoderRunnerConfig
-    from .dummy_requests import DummyRequestFactory
     from .graphs import DecoderCudaGraphs, ForwardWarmup
     from .inputs import DecoderInputPreparer
     from .metadata import DecoderMetadata
@@ -367,7 +367,7 @@ class DecoderWarmup:
 
         if self.mapping.cp_size > 1:
             cp_type = self.mapping.cp_config.get("cp_type", None)
-            if cp_type != CpType.HELIX:
+            if not (self.mapping.has_cp_helix() or self.mapping.has_cp_ulysses()):
                 logger.info(
                     f"[ModelEngine::warmup] Skipping warmup for cp_type: {None if cp_type is None else cp_type.name}."
                 )
@@ -872,8 +872,18 @@ class DecoderWarmup:
 
         logger.info("Running TRTLLM-Gen FMHA JIT warmup")
 
+        # A context-only cache (disaggregated context server) cannot hold
+        # generation requests on any rank of this forward group; proposing the
+        # shapes anyway fails the agreement where none can be reached (DWDP).
+        generation_shapes = DummyRequestFactory.generation_shapes_supported(resource_manager)
+        if not generation_shapes:
+            logger.info(
+                "Context-only KV cache: skipping the generation and mixed "
+                "TRTLLM-Gen FMHA JIT warmup shapes"
+            )
+
         warmup_requests_configs = []
-        if self.guided_decoder is None:
+        if self.guided_decoder is None and generation_shapes:
             # doesn't support guided decoding
             warmup_requests_configs.append(
                 (1 + self._config.max_total_draft_tokens, 1)
@@ -890,7 +900,7 @@ class DecoderWarmup:
         # here: they always run on a ``MambaHybridCacheManager``, so
         # ``can_run_general_warmup`` is False and the configs above never run.
 
-        if self.guided_decoder is None and can_run_general_warmup:
+        if self.guided_decoder is None and can_run_general_warmup and generation_shapes:
             # The cute_dsl_mla FMHA lib now only support the generation-only batch, we need to
             # warmup the TRTLLM-Gen FMHA lib for the mixed context+generation batch.
             # One MIXED context+generation batch (1 ctx token + 1 gen request).
@@ -1099,7 +1109,11 @@ class DecoderWarmup:
             warmup_configs = [(curr_max_num_tokens, num_gen_requests)]
         else:
             warmup_configs = [(curr_max_num_tokens, 0)]
-            if self.guided_decoder is None and not self.mapping.has_pp():
+            if (
+                self.guided_decoder is None
+                and not self.mapping.has_pp()
+                and DummyRequestFactory.generation_shapes_supported(resource_manager)
+            ):
                 # Add generation request to warmup the autotuner cache.
                 warmup_configs.append((1 + self._config.max_total_draft_tokens, 1))
 

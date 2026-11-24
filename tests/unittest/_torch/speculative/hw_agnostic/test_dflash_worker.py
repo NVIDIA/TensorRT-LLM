@@ -164,3 +164,71 @@ def test_generation_step_keeps_the_dummy_slot_context_empty():
         real_len = 5 + 2 * (step + 1)
         assert worker._ctx_len.tolist() == [real_len, 0, 0]
         assert inputs["num_ctx_per_req"].tolist() == [real_len, 0]
+
+
+def test_managed_draft_history_round_trip_preserves_absolute_position():
+    """A received cache is bound and republished through the executor's public hooks."""
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
+    from tensorrt_llm._torch.pyexecutor.resource_manager import (
+        CacheTypeCpp,
+        DataType,
+        ResourceManagerType,
+    )
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+
+    manager = KVCacheManagerV2(
+        KvCacheConfig(max_tokens=1024, enable_block_reuse=False),
+        CacheTypeCpp.SELF,
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=64,
+        tokens_per_block=32,
+        max_seq_len=128,
+        max_batch_size=2,
+        mapping=Mapping(),
+        dtype=DataType.HALF,
+        is_disagg=True,
+        draft_num_layers=2,
+        draft_num_kv_heads=1,
+        draft_head_dim=64,
+        draft_dtype=DataType.BF16,
+        draft_kv_factor=1,
+        draft_total_num_kv_heads=1,
+        draft_scratch_tokens=8,
+        draft_attention_backend="VANILLA",
+    )
+    request = LlmRequest(
+        request_id=71,
+        max_new_tokens=8,
+        input_tokens=list(range(8)),
+        sampling_config=SamplingConfig(),
+        is_streaming=False,
+    )
+    try:
+        assert manager.prepare_context(request)
+        assert manager.resize_context(request, 8)
+        manager.set_draft_history(request.py_request_id, valid_length=4, position=8)
+        draft = _FakeDraftModel("VANILLA")
+        draft._kv_factor = 1
+        draft._uses_lilicorr = False
+        worker = DFlashWorker(
+            DFlashDecodingConfig(max_draft_len=7, attention_backend="VANILLA"), Mapping()
+        )
+        worker.set_draft_model(draft)
+        spec = SimpleNamespace(max_num_requests=2, request_ids=[request.py_request_id])
+        attn = SimpleNamespace(num_seqs=1, kv_cache_manager=manager)
+        resources = SimpleNamespace(
+            get_resource_manager=lambda kind: (
+                manager if kind == ResourceManagerType.KV_CACHE_MANAGER else None
+            )
+        )
+        worker.prepare_managed_draft_cache(draft, spec, attn, resources)
+        update = worker.snapshot_managed_draft_history()
+        assert update is not None
+        torch.cuda.synchronize()
+        update.publish()
+        history = manager.get_draft_history(request.py_request_id)
+        assert (history.valid_length, history.position) == (4, 8)
+    finally:
+        manager.shutdown()

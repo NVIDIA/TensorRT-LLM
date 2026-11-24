@@ -76,6 +76,24 @@ initial state first, followed by states at interior interval boundaries.  With
 indices, completed boundaries (including an aligned final boundary, excluding
 the initial state) are written directly to the selected rows of `state_ckpt`.
 
+Per-sequence inputs (opt-in, engine route only; `compile(has_src_rows=...,
+has_seq_flags=..., has_aux_state=..., mode="engine")`, derived per call from
+the tensors passed like the state specialization):
+
+* `src_rows` (int32 [N]): sequence b reads q/k/gate/beta from rows
+  `[src_rows[b], src_rows[b] + len_b)` instead of its `cu_seqlens` rows; v,
+  the outputs and the state rows stay per `cu_seqlens` / `state_indices`, so
+  several sequences can share input rows and `out` may have more rows than
+  the inputs.
+* `seq_flags` (int32 [N]): bits 0-1 the initial state (SEQ_INIT_LOAD: the
+  state row as before, SEQ_INIT_ZERO / SEQ_INIT_IDENTITY: synthesized in TMEM
+  without reading memory); SEQ_ZERO_V: v is zero for sequence b and never
+  loaded (no v TMA, no v SMEM read; the rhs `beta * (0 - state*k)` is the same
+  instruction sequence as with zeros in memory, so results are bitwise those of
+  a zero v); SEQ_AUX_STATE: the state row of b is `aux_state[state_indices[b]]`
+  (initial load and final store) instead of the pool's.
+* `aux_state`: a second state tensor with the pool's dtype and row layout.
+
 Reproducing the results::
 
     # single-shape correctness vs the torch MMA reference below
@@ -105,6 +123,14 @@ from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 
 LOG2_E: float = 1.4426950408889634
 DEFAULT_GATE_LOWER_BOUND: float = -5.0
+
+# Per-sequence `seq_flags` bits (see the module docstring).
+SEQ_INIT_MASK: int = 3
+SEQ_INIT_LOAD: int = 0
+SEQ_INIT_ZERO: int = 1
+SEQ_INIT_IDENTITY: int = 2
+SEQ_ZERO_V: int = 4
+SEQ_AUX_STATE: int = 8
 
 
 class CompiledKDA(Protocol):
@@ -177,6 +203,39 @@ def sub_b16x2_input_dtype(
         "sub.f16x2 {$w0}, {$r0}, {$r1};",
         write_only_types=[cutlass.Int32],
         read_only_args=[lhs, rhs],
+    )
+
+
+@cute.jit
+def zero_sub_b16x2_input_dtype(
+    rhs: cutlass.Int32,
+    input_dtype: cutlass.Constexpr,
+) -> cutlass.Int32:
+    """`0 - rhs` on packed pairs: `sub_b16x2_input_dtype` with a zero register
+    as the left operand (the 16-bit sub takes no immediate)."""
+
+    if cutlass.const_expr(input_dtype is cutlass.BFloat16):
+        return prims.inline_ptx_hl(
+            """
+            {
+                .reg .b32 zero;
+                mov.b32 zero, 0;
+                sub.bf16x2 {$w0}, zero, {$r0};
+            }
+            """,
+            write_only_types=[cutlass.Int32],
+            read_only_args=[rhs],
+        )
+    return prims.inline_ptx_hl(
+        """
+        {
+            .reg .b32 zero;
+            mov.b32 zero, 0;
+            sub.f16x2 {$w0}, zero, {$r0};
+        }
+        """,
+        write_only_types=[cutlass.Int32],
+        read_only_args=[rhs],
     )
 
 
@@ -1331,6 +1390,9 @@ def tma_stage_load_inputs(
     tma_mbar,
     tma_tx_bytes: cutlass.Constexpr,
     gate_dtype: cutlass.Constexpr,
+    v_chunk_row=None,
+    load_v=None,
+    tx_bytes=None,
 ) -> None:
     """Issue tensor-operand TMA + sigmoid(beta logits) for one chunk (no wait).
 
@@ -1338,6 +1400,10 @@ def tma_stage_load_inputs(
     beta scalar store MUST precede the mbarrier_arrive_expect_tx: the
     arrive's release (after the warp sync) is the only edge that publishes
     beta to the consumers' acquire (there is no raw_ready relay any more).
+
+    `sequence_start` is the first input row of q/k/gate/beta.  Per-sequence
+    builds pass `v_chunk_row` (the chunk's first v row), `load_v` (0: v is
+    zero and not loaded) and the matching runtime `tx_bytes`.
     """
 
     global_chunk_start = sequence_start + chunk_start
@@ -1358,7 +1424,10 @@ def tma_stage_load_inputs(
         raw_beta_smem[lane] = beta_value
     prims.bar_warp_sync(cute.arch.FULL_MASK)
     if prims.elect_sync():
-        prims.mbarrier_arrive_expect_tx(tma_mbar, tma_tx_bytes)
+        if cutlass.const_expr(tx_bytes is None):
+            prims.mbarrier_arrive_expect_tx(tma_mbar, tma_tx_bytes)
+        else:
+            prims.mbarrier_arrive_expect_tx(tma_mbar, tx_bytes)
     if prims.elect_sync():
         for segment in cutlass.range_constexpr(RAW_F16_TMA_SEGMENTS):
             tma_coord = (
@@ -1380,12 +1449,37 @@ def tma_stage_load_inputs(
                 tma_coord,
                 tma_mbar,
             )
-            prims.cp_async_bulk_tensor_shared_cta_global(
-                raw_v_smem.subview(smem_offset),
-                tma_desc_v.get_ptr(),
-                tma_coord,
-                tma_mbar,
-            )
+            if cutlass.const_expr(v_chunk_row is None and load_v is None):
+                prims.cp_async_bulk_tensor_shared_cta_global(
+                    raw_v_smem.subview(smem_offset),
+                    tma_desc_v.get_ptr(),
+                    tma_coord,
+                    tma_mbar,
+                )
+            else:
+                v_coord = tma_coord
+                if cutlass.const_expr(v_chunk_row is not None):
+                    v_coord = (
+                        cutlass.Int32(segment * RAW_F16_TMA_SWIZZLE_ELEMS),
+                        v_chunk_row,
+                        head_idx,
+                        cutlass.Int32(0),
+                    )
+                if cutlass.const_expr(load_v is None):
+                    prims.cp_async_bulk_tensor_shared_cta_global(
+                        raw_v_smem.subview(smem_offset),
+                        tma_desc_v.get_ptr(),
+                        v_coord,
+                        tma_mbar,
+                    )
+                else:
+                    if load_v != cutlass.Int32(0):
+                        prims.cp_async_bulk_tensor_shared_cta_global(
+                            raw_v_smem.subview(smem_offset),
+                            tma_desc_v.get_ptr(),
+                            v_coord,
+                            tma_mbar,
+                        )
             if cutlass.const_expr(not gate_dtype_is_f32(gate_dtype)):
                 # 16-bit gate: it rides the SAME 16-bit s128 box/swizzle family
                 # as q/k/v, so it folds into this loop (2 x 128 B segments
@@ -3304,6 +3398,126 @@ def tcgen05_store_initial_state_tmem(
 
 
 @cute.jit
+def tcgen05_store_synthesized_state_tmem(
+    tmem_raw_addr,
+    diag_value,
+    warp_idx,
+    lane,
+) -> None:
+    """Initialize recurrent TMEM to `diag_value * I` without a memory read.
+
+    `diag_value` 0 gives the zero state, 1 the identity (DV == DK); the values
+    are exactly those a zero / identity state row in memory would load.  Same
+    thread-to-row mapping as `tcgen05_store_initial_state_tmem(HALF=False)`.
+    """
+
+    base_col_id = tmem_raw_addr & 0xFFFF
+    base_row_id = tmem_raw_addr >> 16
+    tmem_sp = warp_idx % TCGEN05_STATE_K_TMEM_ROW_BLOCKS
+
+    row_id = base_row_id + tmem_sp * THREADS_PER_WARP
+    value_dim = tmem_sp * THREADS_PER_WARP + lane
+    for key_block_start in cutlass.range_constexpr(
+        0,
+        DK,
+        TCGEN05_FINAL_STATE_TMEM_LOAD_COLS,
+    ):
+        state_block = cutlass.Array(
+            cutlass.Float32,
+            TCGEN05_FINAL_STATE_TMEM_LOAD_COLS,
+            alignment=16,
+        )
+        for col in cutlass.range_constexpr(TCGEN05_FINAL_STATE_TMEM_LOAD_COLS):
+            key_dim = key_block_start + col
+            state_block[col] = (
+                diag_value
+                if value_dim == cutlass.Int32(key_dim)
+                else cutlass.Float32(0.0)
+            )
+        projection_col_id = base_col_id + KDA_TMEM_STATE_COL_OFFSET + key_block_start
+        block_addr = (row_id << 16) | projection_col_id
+        block_ptr = cutlass.inttoptr(block_addr, 6, cutlass.Float32)
+        prims.tcgen05_st(
+            "32x32b",
+            block_ptr,
+            state_block[0:TCGEN05_FINAL_STATE_TMEM_LOAD_COLS],
+        )
+
+    prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
+
+
+@cute.jit
+def tcgen05_init_state_tmem_by_flags(
+    tmem_raw_addr,
+    initial_state: cute.Tensor | None,
+    aux_state: cute.Tensor | None,
+    state_slot,
+    bidy,
+    warp_idx,
+    lane,
+    flags,
+) -> None:
+    """Per-sequence builds: the initial state selected by `flags` (`seq_flags`).
+
+    SEQ_INIT_LOAD loads the state row (`aux_state` with SEQ_AUX_STATE), zero
+    and identity are synthesized.
+    """
+
+    init_mode = flags & cutlass.Int32(SEQ_INIT_MASK)
+    if init_mode == cutlass.Int32(SEQ_INIT_LOAD):
+        if cutlass.const_expr(aux_state is not None):
+            if (flags & cutlass.Int32(SEQ_AUX_STATE)) != cutlass.Int32(0):
+                tcgen05_store_initial_state_tmem(
+                    tmem_raw_addr,
+                    aux_state,
+                    None,
+                    cutlass.Int32(0),
+                    state_slot,
+                    bidy,
+                    cutlass.Int32(0),
+                    warp_idx,
+                    lane,
+                    HALF=False,
+                )
+            else:
+                tcgen05_store_initial_state_tmem(
+                    tmem_raw_addr,
+                    initial_state,
+                    None,
+                    cutlass.Int32(0),
+                    state_slot,
+                    bidy,
+                    cutlass.Int32(0),
+                    warp_idx,
+                    lane,
+                    HALF=False,
+                )
+        else:
+            tcgen05_store_initial_state_tmem(
+                tmem_raw_addr,
+                initial_state,
+                None,
+                cutlass.Int32(0),
+                state_slot,
+                bidy,
+                cutlass.Int32(0),
+                warp_idx,
+                lane,
+                HALF=False,
+            )
+    else:
+        diag_value = cutlass.Float32(0.0)
+        if init_mode == cutlass.Int32(SEQ_INIT_IDENTITY):
+            diag_value = cutlass.Float32(1.0)
+        tcgen05_store_synthesized_state_tmem(
+            tmem_raw_addr,
+            diag_value,
+            warp_idx,
+            lane,
+        )
+
+
+@cute.jit
 def pack_state_input_x16(state_block, input_dtype: cutlass.Constexpr):
     """Pack one 16-column FP32 state fragment into an 8-column A fragment."""
 
@@ -3931,8 +4145,13 @@ def tcgen05_stage_rhs_input_tmem(
     shared_acc_stage,
     shared_input_stage,
     input_dtype: cutlass.Constexpr,
+    ZERO_V: cutlass.Constexpr = False,
 ) -> None:
-    """Produce RHS = beta * (v - state*k) into shared_input TMEM by 16-row tiles."""
+    """Produce RHS = beta * (v - state*k) into shared_input TMEM by 16-row tiles.
+
+    ZERO_V=True: v is zero and its SMEM tile is not read; the subtraction keeps
+    a zero register operand so the result is bitwise that of a zero v tile.
+    """
 
     base_col_id = tmem_raw_addr & 0xFFFF
     base_row_id = tmem_raw_addr >> 16
@@ -3964,24 +4183,25 @@ def tcgen05_stage_rhs_input_tmem(
         num=2,
     )
 
-    raw_v_regs0 = prims.ldmatrix(
-        raw_v_ldmatrix_trans_ptr(
-            raw_v_smem,
-            value_dim_base,
-            lane,
-        ),
-        4,
-        prims.MMALayout.COL,
-    )
-    raw_v_regs1 = prims.ldmatrix(
-        raw_v_ldmatrix_trans_ptr(
-            raw_v_smem,
-            value_dim_base + 16,
-            lane,
-        ),
-        4,
-        prims.MMALayout.COL,
-    )
+    if cutlass.const_expr(not ZERO_V):
+        raw_v_regs0 = prims.ldmatrix(
+            raw_v_ldmatrix_trans_ptr(
+                raw_v_smem,
+                value_dim_base,
+                lane,
+            ),
+            4,
+            prims.MMALayout.COL,
+        )
+        raw_v_regs1 = prims.ldmatrix(
+            raw_v_ldmatrix_trans_ptr(
+                raw_v_smem,
+                value_dim_base + 16,
+                lane,
+            ),
+            4,
+            prims.MMALayout.COL,
+        )
     prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
 
     packed_rhs0 = cutlass.Array(
@@ -4007,11 +4227,14 @@ def tcgen05_stage_rhs_input_tmem(
             state_k_val1,
             input_dtype,
         )
-        diff_pair = sub_b16x2_input_dtype(
-            raw_v_regs0[raw_matrix],
-            state_k_pair,
-            input_dtype,
-        )
+        if cutlass.const_expr(ZERO_V):
+            diff_pair = zero_sub_b16x2_input_dtype(state_k_pair, input_dtype)
+        else:
+            diff_pair = sub_b16x2_input_dtype(
+                raw_v_regs0[raw_matrix],
+                state_k_pair,
+                input_dtype,
+            )
         packed_rhs0[reg_idx] = mul_b16x2_input_dtype(
             beta_pair,
             diff_pair,
@@ -4041,11 +4264,14 @@ def tcgen05_stage_rhs_input_tmem(
             state_k_val1,
             input_dtype,
         )
-        diff_pair = sub_b16x2_input_dtype(
-            raw_v_regs1[raw_matrix],
-            state_k_pair,
-            input_dtype,
-        )
+        if cutlass.const_expr(ZERO_V):
+            diff_pair = zero_sub_b16x2_input_dtype(state_k_pair, input_dtype)
+        else:
+            diff_pair = sub_b16x2_input_dtype(
+                raw_v_regs1[raw_matrix],
+                state_k_pair,
+                input_dtype,
+            )
         packed_rhs1[reg_idx] = mul_b16x2_input_dtype(
             beta_pair,
             diff_pair,
@@ -4062,6 +4288,45 @@ def tcgen05_stage_rhs_input_tmem(
 
     prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
     prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
+
+
+@cute.jit
+def tcgen05_stage_rhs_input_tmem_by_flag(
+    tmem_raw_addr,
+    raw_v_smem,
+    raw_beta_smem,
+    warp_idx,
+    lane,
+    shared_acc_stage,
+    shared_input_stage,
+    input_dtype: cutlass.Constexpr,
+    zero_v,
+) -> None:
+    """Per-sequence builds: the RHS stage with the runtime zero-v selector."""
+
+    if zero_v != cutlass.Int32(0):
+        tcgen05_stage_rhs_input_tmem(
+            tmem_raw_addr,
+            raw_v_smem,
+            raw_beta_smem,
+            warp_idx,
+            lane,
+            shared_acc_stage,
+            shared_input_stage,
+            input_dtype,
+            ZERO_V=True,
+        )
+    else:
+        tcgen05_stage_rhs_input_tmem(
+            tmem_raw_addr,
+            raw_v_smem,
+            raw_beta_smem,
+            warp_idx,
+            lane,
+            shared_acc_stage,
+            shared_input_stage,
+            input_dtype,
+        )
 
 
 @cute.jit
@@ -4592,6 +4857,46 @@ def tcgen05_store_final_state_tmem(
                 )
 
 
+@cute.jit
+def tcgen05_store_final_state_tmem_by_flag(
+    tmem_raw_addr,
+    final_state: cute.Tensor,
+    aux_state: cute.Tensor,
+    state_slot,
+    bidy,
+    warp_idx,
+    lane,
+    use_aux,
+) -> None:
+    """Per-sequence builds: the final state into the pool row or, with
+    SEQ_AUX_STATE, into the `aux_state` row."""
+
+    if use_aux != cutlass.Int32(0):
+        tcgen05_store_final_state_tmem(
+            tmem_raw_addr,
+            KDA_TMEM_FINAL_STATE_ACC_COL_OFFSET,
+            aux_state,
+            state_slot,
+            bidy,
+            cutlass.Int32(0),
+            warp_idx,
+            lane,
+            HALF=False,
+        )
+    else:
+        tcgen05_store_final_state_tmem(
+            tmem_raw_addr,
+            KDA_TMEM_FINAL_STATE_ACC_COL_OFFSET,
+            final_state,
+            state_slot,
+            bidy,
+            cutlass.Int32(0),
+            warp_idx,
+            lane,
+            HALF=False,
+        )
+
+
 PACKED_METADATA_THREADS: int = 256
 
 
@@ -4668,6 +4973,9 @@ def kernel(
     cu_ckpts: cute.Tensor | None,
     checkpoint_state_indices: cute.Tensor | None,
     checkpoint_stride_chunks: cutlass.Int32,
+    src_rows: cute.Tensor | None,
+    seq_flags: cute.Tensor | None,
+    aux_state: cute.Tensor | None,
     SAFE_GATE: cutlass.Constexpr,
     GATE_SCALE_LOG2: cutlass.Constexpr,
     gate_dtype: cutlass.Constexpr,
@@ -4676,6 +4984,10 @@ def kernel(
 
     Grid: `(heads, num_sequences, 1)`. Each CTA owns one packed sequence/head
     and iterates over `ceil(sequence_length / 16)` chunks in order.
+
+    Optional per-sequence inputs (module docstring): `src_rows` moves the
+    q/k/gate/beta rows, `seq_flags` selects the initial state (state row / zero
+    / identity), a zero v and the `aux_state` rows.
     """
 
     tidx, _, _ = cute.arch.thread_idx()
@@ -4696,6 +5008,11 @@ def kernel(
     sequence_end = cutlass.Int32(cu_seqlens[bidx + 1])
     seqlen = sequence_end - sequence_start
     num_chunks = cute.ceil_div(seqlen, BT)
+    # First q/k/gate/beta row of the sequence; v and the output stay at
+    # sequence_start.
+    input_start = sequence_start
+    if cutlass.const_expr(src_rows is not None):
+        input_start = cutlass.Int32(src_rows[bidx])
     input_dtype = q.element_type
     if cutlass.const_expr(
         k.element_type != input_dtype or v.element_type != input_dtype
@@ -4703,6 +5020,23 @@ def kernel(
         raise TypeError(
             "KDA CUTLASS primitives kernel expects q/k/v to use the same 16-bit dtype"
         )
+    if cutlass.const_expr(src_rows is not None):
+        if cutlass.const_expr(src_rows.element_type != cutlass.Int32):
+            raise TypeError("KDA src_rows must be int32")
+    if cutlass.const_expr(seq_flags is not None):
+        if cutlass.const_expr(seq_flags.element_type != cutlass.Int32):
+            raise TypeError("KDA seq_flags must be int32")
+    if cutlass.const_expr(aux_state is not None):
+        if cutlass.const_expr(
+            seq_flags is None or initial_state is None or final_state is None
+        ):
+            raise TypeError("KDA aux_state needs seq_flags and state input/output")
+        if cutlass.const_expr(aux_state.element_type != initial_state.element_type):
+            raise TypeError("KDA aux_state must match the state dtype")
+    if cutlass.const_expr(
+        (src_rows is not None or seq_flags is not None) and state_ckpt is not None
+    ):
+        raise TypeError("KDA per-sequence inputs do not support state checkpoints")
     if cutlass.const_expr(raw_gate.element_type != gate_dtype):
         raise TypeError(
             "KDA CUTLASS primitives kernel expects raw_gate to match gate_dtype"
@@ -4995,6 +5329,7 @@ def kernel(
         + DV * BT * v.element_type.width // 8
         + DK * BT * raw_gate.element_type.width // 8
     )
+    tma_v_bytes = cutlass.const_expr(DV * BT * v.element_type.width // 8)
 
     if warp_idx == ROLES.tma_load:
         if prims.elect_sync():
@@ -5095,9 +5430,20 @@ def kernel(
             # first consumption so the wait below is never exposed.  Group
             # coords walk (head-group, token); pair coords walk packed rows
             # from the g-aligned floor of the sequence start.
-            beta_row0 = sequence_start // beta_g
+            beta_row0 = input_start // beta_g
             beta_rows_per_chunk = cutlass.Int32(BT) // beta_g
             beta_head_group = (bidy // cutlass.Int32(8)) * cutlass.Int32(8)
+            # Per-sequence builds: a zero-v sequence issues no v TMA and
+            # expects only the q/k/gate bytes.
+            tma_load_v = None
+            tma_tx = None
+            if cutlass.const_expr(seq_flags is not None):
+                tma_load_v = cutlass.Int32(1) - (
+                    (cutlass.Int32(seq_flags[bidx]) >> 2) & cutlass.Int32(1)
+                )
+                tma_tx = cutlass.Int32(tma_tx_bytes - tma_v_bytes) + (
+                    tma_load_v * cutlass.Int32(tma_v_bytes)
+                )
             for pre in cutlass.range_constexpr(BETA_TMA_LOOKAHEAD):
                 if cutlass.Int32(pre) < num_chunks:
                     if prims.elect_sync():
@@ -5106,7 +5452,7 @@ def kernel(
                             beta_tile_tx,
                         )
                         beta_c0 = beta_head_group
-                        beta_c1 = sequence_start + cutlass.Int32(pre * BT)
+                        beta_c1 = input_start + cutlass.Int32(pre * BT)
                         if beta_g > cutlass.Int32(1):
                             beta_c0 = cutlass.Int32(0)
                             beta_c1 = (
@@ -5142,6 +5488,9 @@ def kernel(
                 # tma_mbar ring slot (consumers wait that slot's parity
                 # directly; this warp never waits completions -- raw_consumed
                 # alone throttles issue to <= RAW_STAGE_COUNT in flight).
+                v_chunk_row = None
+                if cutlass.const_expr(src_rows is not None or seq_flags is not None):
+                    v_chunk_row = sequence_start + chunk_start
                 tma_stage_load_inputs(
                     tma_desc_q,
                     tma_desc_k,
@@ -5155,7 +5504,7 @@ def kernel(
                     raw_v_stage,
                     raw_gate_stage,
                     raw_beta_stage,
-                    sequence_start,
+                    input_start,
                     bidy,
                     lane,
                     chunk_start,
@@ -5163,6 +5512,9 @@ def kernel(
                     tma_mbar.subview(raw_stage),
                     tma_tx_bytes,
                     gate_dtype,
+                    v_chunk_row=v_chunk_row,
+                    load_v=tma_load_v,
+                    tx_bytes=tma_tx,
                 )
                 beta_next = chunk + BETA_TMA_LOOKAHEAD
                 if beta_next < num_chunks:
@@ -5173,7 +5525,7 @@ def kernel(
                             beta_tile_tx,
                         )
                         beta_c0 = beta_head_group
-                        beta_c1 = sequence_start + beta_next * BT
+                        beta_c1 = input_start + beta_next * BT
                         if beta_g > cutlass.Int32(1):
                             beta_c0 = cutlass.Int32(0)
                             beta_c1 = beta_row0 + beta_next * beta_rows_per_chunk
@@ -5730,7 +6082,21 @@ def kernel(
             ckpt_stride = checkpoint_stride_chunks
             ckpt_next = ckpt_stride
             ckpt_slot = cutlass.Int32(cu_ckpts[bidx])
-        if cutlass.const_expr(checkpoint_state_indices is not None):
+        if cutlass.const_expr(seq_flags is not None):
+            cg1_flags = cutlass.Int32(seq_flags[bidx])
+            cg1_zero_v = cg1_flags & cutlass.Int32(SEQ_ZERO_V)
+            cg1_use_aux = cg1_flags & cutlass.Int32(SEQ_AUX_STATE)
+            tcgen05_init_state_tmem_by_flags(
+                tmem_raw_addr,
+                initial_state,
+                aux_state,
+                state_slot,
+                bidy,
+                warp_idx,
+                lane,
+                cg1_flags,
+            )
+        elif cutlass.const_expr(checkpoint_state_indices is not None):
             tcgen05_store_initial_state_tmem(
                 tmem_raw_addr,
                 initial_state,
@@ -5813,16 +6179,29 @@ def kernel(
                 state_k_acc_phase,
             )
             rhs_lane = cute.arch.lane_idx()
-            tcgen05_stage_rhs_input_tmem(
-                tmem_raw_addr,
-                raw_v_stage,
-                raw_beta_stage,
-                warp_idx,
-                rhs_lane,
-                state_k_acc_stage,
-                shared_input_stage,
-                input_dtype,
-            )
+            if cutlass.const_expr(seq_flags is not None):
+                tcgen05_stage_rhs_input_tmem_by_flag(
+                    tmem_raw_addr,
+                    raw_v_stage,
+                    raw_beta_stage,
+                    warp_idx,
+                    rhs_lane,
+                    state_k_acc_stage,
+                    shared_input_stage,
+                    input_dtype,
+                    cg1_zero_v,
+                )
+            else:
+                tcgen05_stage_rhs_input_tmem(
+                    tmem_raw_addr,
+                    raw_v_stage,
+                    raw_beta_stage,
+                    warp_idx,
+                    rhs_lane,
+                    state_k_acc_stage,
+                    shared_input_stage,
+                    input_dtype,
+                )
             shared_acc_event_id += cutlass.Int32(1)
             rhs_ready_arrive(rhs_ready_mbar)
 
@@ -5966,16 +6345,29 @@ def kernel(
             # Epilogue for tcgen05 state*k, staged directly as the next
             # tcgen05 A operand:
             #   shared_input = beta_i * (v_i - state*k_i)
-            tcgen05_stage_rhs_input_tmem(
-                tmem_raw_addr,
-                raw_v_stage,
-                raw_beta_stage,
-                warp_idx,
-                pre_scale_lane,
-                state_k_acc_stage,
-                shared_input_stage,
-                input_dtype,
-            )
+            if cutlass.const_expr(seq_flags is not None):
+                tcgen05_stage_rhs_input_tmem_by_flag(
+                    tmem_raw_addr,
+                    raw_v_stage,
+                    raw_beta_stage,
+                    warp_idx,
+                    pre_scale_lane,
+                    state_k_acc_stage,
+                    shared_input_stage,
+                    input_dtype,
+                    cg1_zero_v,
+                )
+            else:
+                tcgen05_stage_rhs_input_tmem(
+                    tmem_raw_addr,
+                    raw_v_stage,
+                    raw_beta_stage,
+                    warp_idx,
+                    pre_scale_lane,
+                    state_k_acc_stage,
+                    shared_input_stage,
+                    input_dtype,
+                )
             shared_acc_event_id += cutlass.Int32(1)
             rhs_ready_arrive(rhs_ready_mbar)
 
@@ -6079,17 +6471,29 @@ def kernel(
 
         if cutlass.const_expr(final_state is not None):
             final_lane = cute.arch.lane_idx()
-            tcgen05_store_final_state_tmem(
-                tmem_raw_addr,
-                KDA_TMEM_FINAL_STATE_ACC_COL_OFFSET,
-                final_state,
-                state_slot,
-                bidy,
-                cutlass.Int32(0),
-                warp_idx,
-                final_lane,
-                HALF=False,
-            )
+            if cutlass.const_expr(aux_state is not None):
+                tcgen05_store_final_state_tmem_by_flag(
+                    tmem_raw_addr,
+                    final_state,
+                    aux_state,
+                    state_slot,
+                    bidy,
+                    warp_idx,
+                    final_lane,
+                    cg1_use_aux,
+                )
+            else:
+                tcgen05_store_final_state_tmem(
+                    tmem_raw_addr,
+                    KDA_TMEM_FINAL_STATE_ACC_COL_OFFSET,
+                    final_state,
+                    state_slot,
+                    bidy,
+                    cutlass.Int32(0),
+                    warp_idx,
+                    final_lane,
+                    HALF=False,
+                )
         final_state_stored_arrive(final_state_stored_mbar)
 
 
@@ -6114,6 +6518,9 @@ def host(
     cu_ckpts: cute.Tensor | None,
     checkpoint_state_indices: cute.Tensor | None,
     checkpoint_stride_chunks: cutlass.Int32,
+    src_rows: cute.Tensor | None,
+    seq_flags: cute.Tensor | None,
+    aux_state: cute.Tensor | None,
     SAFE_GATE: cutlass.Constexpr,
     GATE_SCALE_LOG2: cutlass.Constexpr,
     THREADS: cutlass.Constexpr,
@@ -6143,11 +6550,31 @@ def host(
         (DV, seqlen, heads, packed_batch),
         stride=(1, DV * heads, DV, v_batch_stride),
     )
+    # With src_rows the rows of v and of the output (cu_seqlens) are their
+    # own row spaces.
+    out_layout = v_layout
+    if cutlass.const_expr(src_rows is not None):
+        v_rows = v.shape[1]
+        v_rows_batch_stride = DV
+        if packed_batch != cutlass.Int32(1):
+            v_rows_batch_stride = DV * v_rows * heads
+        v_layout = cute.make_layout(
+            (DV, v_rows, heads, packed_batch),
+            stride=(1, DV * heads, DV, v_rows_batch_stride),
+        )
+        out_rows = out.shape[1]
+        out_batch_stride = DV
+        if packed_batch != cutlass.Int32(1):
+            out_batch_stride = DV * out_rows * heads
+        out_layout = cute.make_layout(
+            (DV, out_rows, heads, packed_batch),
+            stride=(1, DV * heads, DV, out_batch_stride),
+        )
     q_tma = cute.make_tensor(q.iterator, qk_layout)
     k_tma = cute.make_tensor(k.iterator, qk_layout)
     v_tma = cute.make_tensor(v.iterator, v_layout)
     gate_tma = cute.make_tensor(raw_gate.iterator, qk_layout)
-    out_tma = cute.make_tensor(out.iterator, v_layout)
+    out_tma = cute.make_tensor(out.iterator, out_layout)
     raw_f16_tma_box = (RAW_F16_TMA_SWIZZLE_ELEMS, BT, 1, 1)
     raw_f32_tma_box = (RAW_F32_TMA_SWIZZLE_ELEMS, BT, 1, 1)
     o_tma_box = (O_TMA_SWIZZLE_ELEMS, BT, 1, 1)
@@ -6238,6 +6665,9 @@ def host(
         cu_ckpts,
         checkpoint_state_indices,
         checkpoint_stride_chunks,
+        src_rows,
+        seq_flags,
+        aux_state,
         SAFE_GATE,
         GATE_SCALE_LOG2,
         gate_dtype,
@@ -8713,8 +9143,10 @@ def kernel_chain_dv2(
     u_input_ready_mbar = cutlass.Array(
         cutlass.Int64, 2, space=cutlass.AddressSpace.smem, alignment=8
     )
+    # Two slots: warp 12 commits stateq_done before its wait, so one slot can
+    # complete twice before warp 12 polls it.
     update_ready_mbar = cutlass.Array(
-        cutlass.Int64, 1, space=cutlass.AddressSpace.smem, alignment=8
+        cutlass.Int64, 2, space=cutlass.AddressSpace.smem, alignment=8
     )
     shared_acc_ready_mbar = cutlass.Array(
         cutlass.Int64, 2, space=cutlass.AddressSpace.smem, alignment=8
@@ -8823,7 +9255,8 @@ def kernel_chain_dv2(
                 prims.mbarrier_init(stateq_done_mbar.subview(stage), 1)
             # CG1 fuses the right-half pack/scale while idle CG0 warps 4-7
             # fuse the left half. Both groups must finish before delta.
-            prims.mbarrier_init(update_ready_mbar, 8)
+            for stage in cutlass.range_constexpr(2):
+                prims.mbarrier_init(update_ready_mbar.subview(stage), 8)
             for stage in cutlass.range_constexpr(K2_QSTATE_STAGE_COUNT):
                 prims.mbarrier_init(qstate_acc_ready_mbar.subview(stage), 1)
             prims.mbarrier_init(final_state_stored_mbar, 8)
@@ -8921,7 +9354,6 @@ def kernel_chain_dv2(
     elif warp_idx == ROLES.super_mma:
         tmem_raw_addr = tmem_ptr_i32.load()
         si_phase12 = cutlass.Int32(0)
-        upd_phase12 = cutlass.Int32(0)
         for chunk in cutlass.range(num_chunks, unroll=1):
             raw_stage = chunk % K2_RAW_STAGE_COUNT
             qstate_stage = chunk % K2_QSTATE_STAGE_COUNT
@@ -8958,7 +9390,7 @@ def kernel_chain_dv2(
                 True,
                 DV_HALF,
             )
-            upd_phase12 = update_ready_wait(update_ready_mbar, upd_phase12)
+            update_ready_wait(update_ready_mbar.subview(chunk % 2), (chunk // 2) % 2)
             prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
             xpack_col12 = tcgen05_shared_input_tmem_col_offset(acc_stage)
             tcgen05_chain_issue_qkv_mma(
@@ -8976,7 +9408,6 @@ def kernel_chain_dv2(
         tmem_raw_addr = tmem_ptr_i32.load()
         si_l_phase = cutlass.Int32(0)
         si_phase = cutlass.Int32(0)
-        upd_phase = cutlass.Int32(0)
         for chunk in cutlass.range(num_chunks, unroll=1):
             raw_stage = chunk % K2_RAW_STAGE_COUNT
             raw_phase = (chunk // K2_RAW_STAGE_COUNT) % 2
@@ -9018,7 +9449,7 @@ def kernel_chain_dv2(
             )
 
             xpack_col = tcgen05_shared_input_tmem_col_offset(acc_stage)
-            upd_phase = update_ready_wait(update_ready_mbar, upd_phase)
+            update_ready_wait(update_ready_mbar.subview(chunk % 2), (chunk // 2) % 2)
             prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
             tcgen05_chain_issue_delta_half_mma(
                 w_stage_smem, tmem_raw_addr, xpack_col, input_dtype, 0
@@ -9153,7 +9584,7 @@ def kernel_chain_dv2(
                 input_dtype,
             )
             post_scale_lane = cute.arch.lane_idx()
-            update_ready_arrive(update_ready_mbar)
+            update_ready_arrive(update_ready_mbar.subview(0))
             if cutlass.const_expr(state_ckpt is not None):
                 # Peeled chunk 0's checkpoint (stride 1 only).
                 checkpoint_due = ckpt_next == cutlass.Int32(1)
@@ -9233,7 +9664,7 @@ def kernel_chain_dv2(
                 input_dtype,
             )
             post_scale_lane = cute.arch.lane_idx()
-            update_ready_arrive(update_ready_mbar)
+            update_ready_arrive(update_ready_mbar.subview(chunk % 2))
             if cutlass.const_expr(state_ckpt is not None):
                 # Same contract as the engine-side checkpoint; both M=64 TMEM
                 # halves wait their own k_restore parity slot (the same wait
@@ -9340,7 +9771,7 @@ def kernel_chain_dv2(
                     cutlass.Int32(0),
                 )
                 prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
-                update_ready_arrive(update_ready_mbar)
+                update_ready_arrive(update_ready_mbar.subview(0))
             for chunk in cutlass.range(1, num_chunks, 1, unroll=1):
                 prev = chunk - cutlass.Int32(1)
                 raw_stage = chunk % K2_RAW_STAGE_COUNT
@@ -9379,7 +9810,7 @@ def kernel_chain_dv2(
                     state_input_ready_l_mbar,
                     0,
                 )
-                update_ready_arrive(update_ready_mbar)
+                update_ready_arrive(update_ready_mbar.subview(chunk % 2))
 
 
 @cute.jit
@@ -9568,12 +9999,20 @@ def host_unified(
     state_ckpt: cute.Tensor | None,
     cu_ckpts: cute.Tensor | None,
     checkpoint_state_indices: cute.Tensor | None,
+    src_rows: cute.Tensor | None,
+    seq_flags: cute.Tensor | None,
+    aux_state: cute.Tensor | None,
     SAFE_GATE: cutlass.Constexpr,
     GATE_SCALE_LOG2: cutlass.Constexpr,
     THREADS: cutlass.Constexpr,
     MODE: cutlass.Constexpr,
     gate_dtype: cutlass.Constexpr,
 ) -> None:
+    if cutlass.const_expr(
+        (src_rows is not None or seq_flags is not None or aux_state is not None)
+        and MODE != "engine"
+    ):
+        raise TypeError("KDA per-sequence inputs are built for the engine route only")
     n_seq = cu_seqlens.shape[0] - 1
     heads = q.shape[2]
     h32 = cutlass.Int32(heads)
@@ -9686,6 +10125,9 @@ def host_unified(
             cu_ckpts,
             checkpoint_state_indices,
             checkpoint_stride_chunks,
+            src_rows,
+            seq_flags,
+            aux_state,
             SAFE_GATE,
             GATE_SCALE_LOG2,
             THREADS,
@@ -9702,13 +10144,17 @@ def _unified_fakes(
     has_state_indices: bool,
     has_checkpoint_state_indices: bool,
     gate_dtype: type = cutlass.BFloat16,
+    has_src_rows: bool = False,
+    has_seq_flags: bool = False,
+    has_aux_state: bool = False,
 ) -> tuple:
     """Union fake-tensor set for the single `host_unified` compile.
 
     Independent symbols where lengths are unrelated: cu_chunks (`scu2`) is NOT
     tied to cu_seqlens (`scu`), so the engine route can pass a length-1 dummy;
     ws_qk / ws_diag share `sc` (chunk count), while ws_kd/qd/w use the
-    16-divisible `sc16` (chunk*BT rows).
+    16-divisible `sc16` (chunk*BT rows).  With `src_rows` the output gets its
+    own row count; the per-sequence fakes come last in the returned tuple.
     """
     F = make_fake_compact_tensor
     scu = cute.sym_int64(divisibility=1)
@@ -9721,7 +10167,16 @@ def _unified_fakes(
     sc16 = cute.sym_int64(divisibility=16)
     fq = F(dtype, (1, ss, sh, DK), stride_order=(3, 2, 1, 0), assumed_align=16)
     fk = F(dtype, (1, ss, sh, DK), stride_order=(3, 2, 1, 0), assumed_align=16)
-    fv = F(dtype, (1, ss, sh, DV), stride_order=(3, 2, 1, 0), assumed_align=16)
+    if has_src_rows:
+        # v rows follow cu_seqlens like the output rows: their own count
+        fv = F(
+            dtype,
+            (1, cute.sym_int64(divisibility=1), sh, DV),
+            stride_order=(3, 2, 1, 0),
+            assumed_align=16,
+        )
+    else:
+        fv = F(dtype, (1, ss, sh, DV), stride_order=(3, 2, 1, 0), assumed_align=16)
     fgate = F(gate_dtype, (1, ss, sh, DK), stride_order=(3, 2, 1, 0), assumed_align=16)
     fa_log = F(cutlass.Float32, (sh,), stride_order=(0,), assumed_align=16)
     fdt = F(cutlass.Float32, (sh, DK), stride_order=(1, 0), assumed_align=16)
@@ -9758,7 +10213,11 @@ def _unified_fakes(
         )
 
     fstate = state_pool_fake() if has_state_in else None
-    fout = F(dtype, (1, ss, sh, DV), stride_order=(3, 2, 1, 0), assumed_align=16)
+    if has_src_rows:
+        sso = cute.sym_int64(divisibility=1)
+        fout = F(dtype, (1, sso, sh, DV), stride_order=(3, 2, 1, 0), assumed_align=16)
+    else:
+        fout = F(dtype, (1, ss, sh, DV), stride_order=(3, 2, 1, 0), assumed_align=16)
     ffinal = state_pool_fake() if has_state_out else None
     # State checkpoints: a flat [total_ckpts, H, DV, DK] tensor (same VK layout
     # as final_state) plus per-sequence base offsets; own symbols so capacity is
@@ -9787,6 +10246,28 @@ def _unified_fakes(
         fckpt = None
         fcuk = None
         fcheckpoint_state_indices = None
+    # Per-sequence inputs: [N] int32 rows / flags; aux_state has the pool's row
+    # layout and its own row count.
+    fsrc_rows = (
+        F(cutlass.Int32, (sn,), stride_order=(0,), assumed_align=4)
+        if has_src_rows
+        else None
+    )
+    fseq_flags = (
+        F(cutlass.Int32, (sn,), stride_order=(0,), assumed_align=4)
+        if has_seq_flags
+        else None
+    )
+    faux = (
+        cute.runtime.make_fake_tensor(
+            state_dtype,
+            shape=(cute.sym_int64(divisibility=1), sh, DV, DK),
+            stride=(cute.sym_int64(divisibility=8), DV * DK, DK, 1),
+            assumed_align=16,
+        )
+        if has_aux_state
+        else None
+    )
     return (
         (
             fq,
@@ -9814,6 +10295,7 @@ def _unified_fakes(
         fckpt,
         fcuk,
         fcheckpoint_state_indices,
+        (fsrc_rows, fseq_flags, faux),
     )
 
 
@@ -9900,6 +10382,49 @@ def _uniform_cu_seqlens(batch: int, seqlen: int, device) -> torch.Tensor:
     return cu
 
 
+def _check_per_sequence_inputs(
+    q, v, out, initial_state, final_state, state_ckpt, n_seq, src_rows, seq_flags,
+    aux_state,
+) -> None:
+    """Host checks of the optional per-sequence inputs (engine route)."""
+
+    device = q.device
+    if state_ckpt is not None:
+        raise ValueError("KDA per-sequence inputs do not support state checkpoints")
+    for name, tensor in (("src_rows", src_rows), ("seq_flags", seq_flags)):
+        if tensor is not None and (
+            tensor.device != device
+            or tensor.dtype != torch.int32
+            or tensor.ndim != 1
+            or not tensor.is_contiguous()
+            or tensor.numel() != n_seq
+        ):
+            raise ValueError(
+                f"{name} must be a contiguous CUDA int32 tensor with one entry "
+                "per sequence"
+            )
+    if src_rows is None and (out.shape[1] != q.shape[1] or v.shape != q.shape):
+        raise ValueError("v and out must have the input rows unless src_rows is given")
+    if v.shape[0] != 1 or v.shape[2:] != q.shape[2:] or out.shape[2:] != q.shape[2:]:
+        raise ValueError("v and out must be packed [1, rows, H, D] like q")
+    if aux_state is not None:
+        if seq_flags is None or initial_state is None or final_state is None:
+            raise ValueError("aux_state needs seq_flags and the state input/output")
+        if (
+            aux_state.device != device
+            or aux_state.dtype != initial_state.dtype
+            or aux_state.ndim != 4
+            or tuple(aux_state.shape[1:]) != tuple(initial_state.shape[1:])
+            or tuple(aux_state.stride()[1:]) != (DV * DK, DK, 1)
+            or aux_state.stride(0) % 8
+            or aux_state.data_ptr() % 16
+        ):
+            raise ValueError(
+                "aux_state must have the state pool's dtype and [rows, H, DV, DK] "
+                "row layout"
+            )
+
+
 def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
     """Build the single user host callable over the one compiled `host_unified`.
 
@@ -9929,6 +10454,9 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
         spec["has_state_ckpt"],
         spec["has_state_indices"],
         spec.get("has_checkpoint_state_indices", False),
+        spec.get("has_src_rows", False),
+        spec.get("has_seq_flags", False),
+        spec.get("has_aux_state", False),
     )
 
     def call(
@@ -9955,9 +10483,15 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
         generate_planned_metadata=False,
         state_indices=None,
         checkpoint_state_indices=None,
+        src_rows=None,
+        seq_flags=None,
+        aux_state=None,
     ):
         if checkpoint_state_indices is not None and state_ckpt is None:
             raise ValueError("checkpoint_state_indices requires state_ckpt")
+        per_sequence = (
+            src_rows is not None or seq_flags is not None or aux_state is not None
+        )
         # The state specialization is DERIVED from which state tensors the call
         # actually passes (initial/final/checkpoint present or None); if it
         # differs from this build, transparently delegate to the matching one
@@ -9968,8 +10502,14 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
             state_ckpt is not None,
             state_indices is not None,
             checkpoint_state_indices is not None,
+            src_rows is not None,
+            seq_flags is not None,
+            aux_state is not None,
         )
-        if want != built_states:
+        # Per-sequence inputs exist on the engine route only: such calls run
+        # an engine build for every shape.
+        want_mode = "engine" if per_sequence else spec["mode"]
+        if want != built_states or want_mode != compile_mode:
             sibling = compile(
                 dtype=spec["dtype"],
                 state_dtype=spec["state_dtype"],
@@ -9981,7 +10521,10 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
                 has_state_ckpt=want[2],
                 has_state_indices=want[3],
                 has_checkpoint_state_indices=want[4],
-                mode=spec["mode"],
+                has_src_rows=want[5],
+                has_seq_flags=want[6],
+                has_aux_state=want[7],
+                mode=want_mode,
             )
             return sibling(
                 q,
@@ -10007,6 +10550,9 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
                 planned_cu_chunks=planned_cu_chunks,
                 planned_total_chunks=planned_total_chunks,
                 generate_planned_metadata=generate_planned_metadata,
+                src_rows=src_rows,
+                seq_flags=seq_flags,
+                aux_state=aux_state,
             )
         # One stream.  There used to be an optional `stream_b` that opted into a
         # co-resident k1/k2 overlap; it was removed because the flag-ring it
@@ -10020,6 +10566,8 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
         # build every TMA descriptor from explicit (shape, stride) tuples, so
         # no logical permute is needed anywhere.
         packed_layout = cu_seqlens is not None
+        if per_sequence and not packed_layout:
+            raise ValueError("KDA per-sequence inputs need packed cu_seqlens inputs")
         if not packed_layout:
             bsz = int(q.shape[0])
             tlen = int(q.shape[1])
@@ -10058,6 +10606,11 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
             raise ValueError(
                 "checkpoint_state_indices requires state_ckpt and must be a "
                 "contiguous CUDA int32 tensor"
+            )
+        if per_sequence:
+            _check_per_sequence_inputs(
+                q, v, out, initial_state, final_state, state_ckpt, n_seq,
+                src_rows, seq_flags, aux_state,
             )
         key = (n_seq, str(device), heads, compile_mode)
         kind = decisions.get(key)
@@ -10195,6 +10748,9 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
                 state_ckpt,
                 cu_ckpts_arg,
                 checkpoint_state_indices,
+                src_rows,
+                seq_flags,
+                aux_state,
             )
             return
 
@@ -10268,6 +10824,9 @@ def _make_call(unified: Callable, spec: dict) -> CompiledKDA:
             state_ckpt,
             cu_ckpts_arg,
             checkpoint_state_indices,
+            src_rows,
+            seq_flags,
+            aux_state,
         )
 
     def _ws_size(cu_seqlens, heads, mode=None, *, batch=None, seqlen=None):
@@ -10305,6 +10864,9 @@ def compile(  # noqa: A001
     has_state_indices: bool = False,
     has_checkpoint_state_indices: bool = False,
     mode=None,
+    has_src_rows: bool = False,
+    has_seq_flags: bool = False,
+    has_aux_state: bool = False,
 ) -> CompiledKDA:
     """Compile KDA; the returned callable is the single host entry.
 
@@ -10321,6 +10883,10 @@ def compile(  # noqa: A001
       * "engine" -> engine-only build (decomp branch const-folds away).
       * "decomp" -> decomp-only build (engine branch const-folds away).
     ("auto" is accepted as an alias for None.)
+
+    `has_src_rows` / `has_seq_flags` / `has_aux_state` build the optional
+    per-sequence inputs (module docstring); they need `mode="engine"` and no
+    state checkpoints.
     """
 
     if dtype not in CLI_DTYPES.values():
@@ -10334,9 +10900,16 @@ def compile(  # noqa: A001
         mode = None
     if mode not in (None, "engine", "decomp"):
         raise ValueError(f"Unknown mode: {mode}")
+    if has_src_rows or has_seq_flags or has_aux_state:
+        if mode != "engine":
+            raise ValueError("KDA per-sequence inputs need mode='engine'")
+        if has_state_ckpt:
+            raise ValueError("KDA per-sequence inputs do not support state checkpoints")
+        if has_aux_state and not (has_seq_flags and has_state_in and has_state_out):
+            raise ValueError("KDA aux_state needs seq_flags and state input/output")
     gate_scale_log2 = gate_lower_bound * LOG2_E
 
-    fakes, fckpt, fcuk, fcheckpoint_state_indices = _unified_fakes(
+    fakes, fckpt, fcuk, fcheckpoint_state_indices, sep_fakes = _unified_fakes(
         dtype,
         state_dtype,
         has_state_in,
@@ -10345,6 +10918,9 @@ def compile(  # noqa: A001
         has_state_indices,
         has_checkpoint_state_indices,
         gate_dtype,
+        has_src_rows,
+        has_seq_flags,
+        has_aux_state,
     )
     unified = cute.compile(
         host_unified,
@@ -10359,6 +10935,7 @@ def compile(  # noqa: A001
         fckpt,
         fcuk,
         fcheckpoint_state_indices,
+        *sep_fakes,
         safe_gate,
         gate_scale_log2,
         THREADS_PER_CTA,
@@ -10380,6 +10957,9 @@ def compile(  # noqa: A001
             has_state_indices=has_state_indices,
             has_checkpoint_state_indices=has_checkpoint_state_indices,
             mode=mode,
+            has_src_rows=has_src_rows,
+            has_seq_flags=has_seq_flags,
+            has_aux_state=has_aux_state,
         ),
     )
     # Eager device-module load: keep the module resident from build time with one
@@ -10396,6 +10976,9 @@ def compile(  # noqa: A001
             has_state_indices,
             has_checkpoint_state_indices,
             gate_dtype,
+            has_src_rows,
+            has_seq_flags,
+            has_aux_state,
         )
     return fn
 
@@ -10410,6 +10993,9 @@ def _eager_module_load(
     has_state_indices: bool = False,
     has_checkpoint_state_indices: bool = False,
     gate_dtype: type = cutlass.BFloat16,
+    has_src_rows: bool = False,
+    has_seq_flags: bool = False,
+    has_aux_state: bool = False,
 ) -> None:
     """One launch to make the device module resident so no real call lazy-loads.
 
@@ -10480,6 +11066,19 @@ def _eager_module_load(
                 if has_checkpoint_state_indices
                 else None
             ),
+            # Per-sequence builds: identity inputs (rows of cu_seqlens, state
+            # rows loaded from the pool).
+            src_rows=(
+                torch.zeros(1, dtype=torch.int32, device="cuda")
+                if has_src_rows
+                else None
+            ),
+            seq_flags=(
+                torch.zeros(1, dtype=torch.int32, device="cuda")
+                if has_seq_flags
+                else None
+            ),
+            aux_state=torch.zeros_like(state) if has_aux_state else None,
         )
         torch.cuda.synchronize()
     except Exception:  # noqa: BLE001 — best-effort module preload; never fatal

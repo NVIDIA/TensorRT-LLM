@@ -2661,13 +2661,12 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 "head-TP over the CP group, so there is no request-level DP to add."
             )
         if spec_config is not None:
-            # Helix supports only the standalone DSpark drafter (verified on
-            # the V2 superblock ledger); reject everything else loudly rather
-            # than let an unsupported spec mode run silently wrong.
-            if not spec_config.spec_dec_mode.is_dspark():
+            # Standalone block drafters use the V2 superblock ledger for
+            # page ownership and CTX-to-GEN transfer.
+            if not (spec_config.spec_dec_mode.is_dspark() or spec_config.spec_dec_mode.is_dflash()):
                 raise ValueError(
                     "Kimi K3 helix supports speculative decoding only with "
-                    f"DSpark (standalone drafter); got "
+                    f"DSpark or DFlash (standalone drafter); got "
                     f"{spec_config.decoding_type!r}."
                 )
             # The SpeculationGate acceptance-rate trip permanently disables

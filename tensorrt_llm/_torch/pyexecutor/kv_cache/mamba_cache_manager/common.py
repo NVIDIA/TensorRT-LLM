@@ -585,8 +585,17 @@ def _estimate_mamba_hybrid_cache_cost(
     extra_state_bytes_per_rank: int = 0,
     is_draft: bool = False,
     use_separate_draft_kv_cache: bool = False,
+    attention_slope_override: Optional[int] = None,
+    attention_page_bytes_override: int = 0,
     **kwargs,
 ) -> Tuple[int, int]:
+    """Return the hybrid cache's (bytes per token, fixed bytes) estimate.
+
+    ``attention_slope_override`` replaces the generic per-token attention cost
+    for layouts the generic estimate does not model (dense FP4 MLA), and
+    ``attention_page_bytes_override`` adds the fixed bytes that accompany each
+    retained partial attention page (the FP4 MLA HP-tail page).
+    """
     spec_config = kwargs.get("spec_config")
     params, local_mamba_layers, local_attention_layers = _get_local_mamba_cache_layout(
         model_config,
@@ -595,16 +604,18 @@ def _estimate_mamba_hybrid_cache_cost(
         is_draft=is_draft,
         use_separate_draft_kv_cache=use_separate_draft_kv_cache,
     )
-    attention_slope = (
-        KVCacheManager.get_cache_size_per_token(
-            model_config,
-            mapping,
-            num_layers=local_attention_layers,
-            **kwargs,
+    attention_slope = attention_slope_override
+    if attention_slope is None:
+        attention_slope = (
+            KVCacheManager.get_cache_size_per_token(
+                model_config,
+                mapping,
+                num_layers=local_attention_layers,
+                **kwargs,
+            )
+            if local_attention_layers > 0
+            else 0
         )
-        if local_attention_layers > 0
-        else 0
-    )
     state_bytes_per_rank = local_mamba_layers * params.get_states_bytes_per_layer(mapping)
     state_bytes_per_rank += extra_state_bytes_per_rank
     max_resident_sequences = max_batch_size * mapping.pp_size
@@ -631,8 +642,8 @@ def _estimate_mamba_hybrid_cache_cost(
         partial_attention_slots = max_resident_sequences if has_non_live_ssm_capacity else 0
     else:
         partial_attention_slots = max_resident_sequences * unaligned_fixed_rules
-    intercept = (
-        fixed_state_slots * state_bytes_per_rank + partial_attention_slots * attention_block_bytes
+    intercept = fixed_state_slots * state_bytes_per_rank + partial_attention_slots * (
+        attention_block_bytes + attention_page_bytes_override
     )
 
     if interval is None:
@@ -641,6 +652,31 @@ def _estimate_mamba_hybrid_cache_cost(
         regular_slope = math.ceil(state_bytes_per_rank / interval)
         if has_unaligned_periodic_snapshot and not cap_partial_attention_snapshots:
             regular_slope += math.ceil(attention_block_bytes / interval)
+
+    # A unified standalone draft cache (the draft_* keyword arguments of
+    # KVCacheManagerV2) stores full-history draft layers next to the hybrid
+    # target's attention layers, and every request reserves the drafter's
+    # scratch in the target attention pools as well. Recurrent state keeps
+    # the fixed and snapshot accounting above.
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+        _estimate_draft_cache_size_components,
+        _get_draft_layer_sizes,
+    )
+
+    draft_layer_sizes = _get_draft_layer_sizes(**kwargs)
+    if draft_layer_sizes:
+        draft_scratch_tokens = int(kwargs.get("draft_scratch_tokens") or 0)
+        helix_cp_size = mapping.cp_size if mapping.has_cp_helix() else 1
+        _, draft_slope, draft_fixed = _estimate_draft_cache_size_components(
+            draft_layer_sizes,
+            tokens_per_block,
+            generation_capacity_headroom=1,
+            scratch_tokens=draft_scratch_tokens,
+            helix_cp_size=helix_cp_size // int(kwargs.get("draft_cp_size") or 1),
+        )
+        draft_fixed += draft_scratch_tokens * attention_slope
+        attention_slope += draft_slope
+        intercept += max_batch_size * draft_fixed
     return attention_slope + regular_slope, intercept
 
 

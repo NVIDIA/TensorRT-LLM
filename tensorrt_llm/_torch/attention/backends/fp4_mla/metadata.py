@@ -9,7 +9,13 @@ import triton
 import triton.language as tl
 
 from .config import _FP4_MLA_PAGE_TABLE_TILE_SIZE, FP4_MLA_TOKENS_PER_BLOCK, _ceil_div
-from .packed_plan import _launch_fp4_mla_packed_plan, _PackedPlanGeometry
+from .packed_plan import (
+    _count_fp4_mla_metadata_launch,
+    _fp4_mla_helix_plan_bounds,
+    _fp4_mla_packed_plan_geometry,
+    _launch_fp4_mla_packed_plan,
+    _PackedPlanGeometry,
+)
 
 
 @triton.jit
@@ -807,6 +813,7 @@ def _fp4_mla_uniform_generation_lengths(
                 ),
             )
         else:
+            _count_fp4_mla_metadata_launch(metadata)
             populate_fp4_mla_generation_lengths(
                 kv_lens_gen,
                 prompt_lens_gen,
@@ -823,6 +830,47 @@ def _fp4_mla_uniform_generation_lengths(
     elif plan_pending:
         _launch_fp4_mla_packed_plan(plan_geometry, corrected_kv_lens[:num_gen], metadata)
     return corrected_kv_lens[:num_gen], generation_lens[:num_gen]
+
+
+# Kimi-K3 (``TRTLLM_K3_ULL4_MLA_PLAN_EARLY``, read by the model): the model writes the
+# step's FP4 MLA generation metadata (generation lengths fused with the packed split plan, then
+# the device page table) at the start of a generation-only step on a side stream
+# (prelaunch_fp4_mla_generation_metadata) instead of the first FP4 MLA layer doing it on its
+# critical path (a 1-CTA plan kernel and two page-table kernels before that layer's KV update).
+def prelaunch_fp4_mla_generation_metadata(
+    metadata: Any, *, num_heads: int, use_helix: bool, device: torch.device
+) -> bool:
+    """Launch on the current stream what the first FP4 MLA generation kernel of a step launches
+    for the step's metadata (``scatter_fp4_mla_kv_cache``'s generation path): the generation
+    lengths fused with the packed split plan of ``num_heads`` query heads, then the device page
+    table. Later calls of the step find them current and launch nothing. Returns whether it
+    launched (a generation-only step with the device page table); the caller orders the step's
+    first FP4 MLA kernel after this stream."""
+    state = getattr(metadata, "fp4_mla_state", None)
+    if state is None or not state.device_page_table:
+        return False
+    num_contexts = int(metadata.num_contexts)
+    num_gen = int(metadata.num_seqs) - num_contexts
+    num_tokens = int(metadata.num_tokens)
+    if num_contexts != 0 or num_gen <= 0 or num_tokens % num_gen != 0 or num_heads <= 0:
+        return False
+    # The plan workspace is reallocated on a device mismatch, and tensors carry an index.
+    device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    plan_geometry = _fp4_mla_packed_plan_geometry(
+        metadata,
+        num_heads=num_heads,
+        query_len=num_tokens // num_gen,
+        num_requests=num_gen,
+        device=device,
+        helix_kv_bounds=_fp4_mla_helix_plan_bounds(metadata, num_tokens, use_helix=use_helix),
+    )
+    kv_lens_gen, _ = _fp4_mla_uniform_generation_lengths(
+        metadata, num_tokens, num_gen, plan_geometry=plan_geometry
+    )
+    _materialize_fp4_mla_device_page_table_for_forward(metadata, kv_lens_gen)
+    return True
 
 
 def _materialize_fp4_mla_device_page_table_for_forward(
@@ -848,6 +896,7 @@ def _materialize_fp4_mla_device_page_table_for_forward(
             )
         else:
             generation_kv_lens = metadata.kv_lens_cuda_runtime[num_contexts:num_sequences]
+    _count_fp4_mla_metadata_launch(metadata)
     materialize_fp4_mla_device_page_table(
         metadata,
         metadata.kv_lens_cuda_runtime[:num_sequences],

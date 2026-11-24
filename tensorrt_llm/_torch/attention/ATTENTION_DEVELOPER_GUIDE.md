@@ -547,7 +547,11 @@ The FMHA package is split by role:
   serving (Python NIXL transceiver only) transfers the K, K-scale, and BF16
   HP-tail roles; before its first forward, the generation worker rebuilds the
   derived V-scale and packed-V sidecars from the imported cache
-  (`rebuild_disagg_imported_cache`).
+  (`rebuild_disagg_imported_cache`). A disaggregated context worker
+  (`TRTLLM_DISAGG_ROLE=context`) therefore allocates no sidecars at all
+  (`fp4_mla_context_only_cache`): it stores a single copy of the latent cache,
+  never runs generation, and its warmup and attention-DP padding use context
+  rows only.
 - `fmha/triton_custom_mask.py` implements the Triton custom-mask context phase.
   Custom-mask data applies to context requests; for mixed batches,
   `TrtllmAttention` can pair it with a later causal-generation provider through
@@ -599,6 +603,42 @@ backend code for the current implementation details.
 
 fp8 context-MLA also stages a K/V dequant workspace sized by summed attended KV
 length; it is declared through the workspace memory-accounting contract (§2.3).
+
+For Kimi K3 with an NVFP4 KV cache, the last two MLA layers in the global
+`linear_attn_config.full_attn_layers` schedule use an FP8 KV cache by default.
+`TLLM_KIMI_K3_FP8_KV_LAYERS` replaces the default with a comma-separated list
+of zero-based global MLA layer IDs; an empty value keeps every MLA layer on
+NVFP4. `kimi_k3_cache_policy.py` owns the policy. The FP4 MLA cache manager
+stores these layers in a separate FP8 pool, `MLA` resolves the same selection
+for its attention backends from its layer index, and the memory estimators
+count the FP8 pages and the FP8 context-MLA workspace. KDA state is
+unaffected. Each PP stage still needs at least one NVFP4 MLA layer.
+
+Dense FP4 MLA reads a cached prefix (chunked prefill or KV block reuse) only
+through `MLA.forward_context_with_chunked_prefill_fp4`: the current chunk is
+appended with fused Q/K RoPE (`append_fp4_mla_context_cache`), each cached
+partition is dequantized from FP4 storage (`load_fp4_mla_chunked_kv_cache`),
+and every partition runs the FP8 context FMHA
+(`Fp4MlaFmha.forward_context_partition`) before `merge_attention_for_mla`.
+The cached-KV C++ ops cannot read FP4 storage, so block reuse is disabled
+when chunked prefill is off, and non-final chunks must end on a 16-token
+quantization tile.
+
+Dense FP4 MLA supports Helix context parallelism for generation. Cache pages
+and K/V slots are rank-local, RoPE uses `helix_position_offsets`, and the
+BF16 HP ring is addressed by the global token position on every rank (the
+context writer and the disaggregated HP-tail transfer use global positions),
+so the generation writer adds the global-minus-local offset to its ring slot.
+
+Among hybrid linear-attention models, dense FP4 MLA supports only Kimi K3
+(KDA + MLA). `MambaHybridCacheManagerV2` composes `Fp4MlaV2CacheLayoutPolicy`
+when it receives an NVFP4 SELFKONLY MLA cache: the recurrent layers keep their
+SSM lifecycle, the HP-tail rings are virtual sliding layers after the model's
+local layers, and the hybrid estimator replaces its generic attention cost with
+the FP4 MLA cost. The hybrid composes the disaggregation declarations: SSM
+state keeps the `INDEXED` `Role.ALL` fallback and the FP4 MLA cache roles are
+named explicitly. Recurrent snapshot points are rounded down to a full cache
+block, the only position from which a reused FP4 MLA context can resume.
 
 #### 3.2.4 Sparse side-cache semantics
 

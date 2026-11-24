@@ -18,6 +18,8 @@ Every leaf imports this module, so nothing that varies by quantization format
 belongs here.
 """
 
+import dataclasses
+
 import torch
 
 from ..impl_contract import MoEInputRequirement, MoEStaticCapability
@@ -35,6 +37,12 @@ KERNEL_FUSED_MOE = "fused_moe"
 # than per leaf.
 TRTLLM_GEN_CAPABILITIES = MoEStaticCapability(supports_expert_bias=True, supports_eplb=True)
 
+# A leaf whose ``run_moe`` takes its expert window from a per-layer dynamic EPLB
+# replica plan; the scheduler orders its kernel after the helper-weight copy.
+TRTLLM_GEN_PER_LAYER_DYNAMIC_EPLB_CAPABILITIES = dataclasses.replace(
+    TRTLLM_GEN_CAPABILITIES, supports_per_layer_dynamic_eplb=True
+)
+
 TRTLLM_GEN_INPUT_REQUIREMENT = MoEInputRequirement(
     # The kernels read bf16 scales, and DeepEP dispatch must mark unfilled rows
     # before they arrive.
@@ -46,12 +54,17 @@ TRTLLM_GEN_INPUT_REQUIREMENT = MoEInputRequirement(
 )
 
 
-def trtllm_gen_descriptor(provider: str, quant: str, doc: str) -> MoEImplDescriptor:
-    """Build one leaf's descriptor; only provider and quant ever differ."""
+def trtllm_gen_descriptor(
+    provider: str,
+    quant: str,
+    doc: str,
+    capabilities: MoEStaticCapability = TRTLLM_GEN_CAPABILITIES,
+) -> MoEImplDescriptor:
+    """Build one leaf's descriptor; provider and quant differ, capabilities rarely."""
     return MoEImplDescriptor(
         identity=MoEImplId(provider, TECHNIQUE_TRTLLM_GEN, KERNEL_FUSED_MOE, quant),
         scheduler_kind=MoESchedulerKind.EXTERNAL_COMM,
-        capabilities=TRTLLM_GEN_CAPABILITIES,
+        capabilities=capabilities,
         input_requirement=TRTLLM_GEN_INPUT_REQUIREMENT,
         doc=doc,
     )

@@ -19,6 +19,7 @@ from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import _build_request_multimodal_input
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import get_mrope_dummy_seq_slot
 from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
+from tensorrt_llm._torch.pyexecutor.input_commit import active_input_commit, overlap_fixup_supported
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, get_draft_token_length
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
@@ -31,7 +32,14 @@ from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import RemoteTailPhase
 from tensorrt_llm._torch.speculative import SpecMetadata, get_num_extra_kv_tokens
 from tensorrt_llm._torch.speculative.dspark import DSparkSpecMetadata
-from tensorrt_llm._torch.speculative.interface import INVALID_PROMPT_LOOKAHEAD_TOKEN
+from tensorrt_llm._torch.speculative.interface import (
+    INVALID_PROMPT_LOOKAHEAD_TOKEN,
+    get_force_num_accepted_tokens_float,
+)
+from tensorrt_llm._torch.speculative.spec_head_kernels import (
+    fused_spec_head_prep,
+    spec_head_fusion_enabled,
+)
 from tensorrt_llm._torch.speculative.spec_sampler_base import SampleStateTensorsSpec
 from tensorrt_llm._torch.speculative.utils import get_static_draft_len
 from tensorrt_llm._torch.utils import helix_local_len, set_per_request_prefill_cuda_graph_flag
@@ -62,6 +70,25 @@ from ..common import (
 from ..interface import PreparedInputs
 from .config import DecoderRunnerConfig
 from .metadata import set_spec_metadata_all_rank_num_tokens
+
+
+# Opt-in per metadata class (class attribute ``kv_lens_refresh_once``); the plain DSA metadata leaves it off.
+def _kv_lens_refresh_once(attn_metadata) -> bool:
+    """Whether ``preprocess_inputs`` defers every ``on_update_kv_lens`` of this metadata to one call
+    before it returns, after its last KV-length / position correction, instead of refreshing before
+    and after each correction.
+
+    A metadata class opts in with the class attribute ``kv_lens_refresh_once = True``, and only
+    when its ``on_update_kv_lens`` rebuilds every output it writes from the current inputs
+    (``kv_lens_cuda``, ``seq_lens_cuda``, the block offsets, the Helix per-token buffers), so its
+    state after the last call does not depend on the calls before it, and the corrections in
+    between (positions, ``kv_lens_cuda``, the Helix verify-group buffers) read none of its outputs.
+    The attribute is read from the class, so every step, and every captured decode graph, makes
+    the same choice.
+    """
+    return attn_metadata is not None and bool(
+        getattr(type(attn_metadata), "kv_lens_refresh_once", False)
+    )
 
 
 def resolve_runtime_draft_len(
@@ -231,6 +258,9 @@ class HostLists:
     # tokens this step (marked in _handle_dynamic_draft_len); their stale
     # draft_probs rows are one-hot'd after spec_metadata.prepare().
     padding_gen_slots: list[int] = field(default_factory=list)
+    # Forced acceptance: whether each generation request, in batch order,
+    # verifies drafts the drafter made (see _mark_real_draft_rows).
+    real_draft_rows: list[bool] = field(default_factory=list)
     multimodal_params_list: list[MultimodalParams] = field(default_factory=list)
     # (start_idx, end_idx, (3,1,L) mrope_pos_ids) per multimodal request
     mrope_position_ids: list[tuple[int, int, torch.Tensor]] = field(default_factory=list)
@@ -340,6 +370,11 @@ class DecoderInputPreparer:
             DeviceCopyBuffer(buffers.gather_ids_cuda, pin_memory=prefer_pinned())
             if config.is_spec_decode
             else None
+        )
+        # Forced acceptance applies only to the generation rows that verify drafts the drafter
+        # made, so each pass marks those rows while the variable is set.
+        self._mark_real_drafts = (
+            config.is_spec_decode and get_force_num_accepted_tokens_float() != 0.0
         )
         # Reuse device indices while the scheduled batch stays unchanged.
         self._staged_previous_batch_indices: list[int] | None = None
@@ -817,6 +852,8 @@ class DecoderInputPreparer:
             next_draft_tokens_device,
             enable_spec_decode,
         )
+        if self._mark_real_drafts and spec_config is not None:
+            self._mark_real_draft_rows(host, scheduled_requests, spec_config, runtime_draft_len)
         self._prepare_helix_state(host, kv_cache_manager)
 
         if not self._config.disable_overlap_scheduler and spec_config is not None:
@@ -1219,6 +1256,31 @@ class DecoderInputPreparer:
             else:
                 generation_requests.append(request)
         extend_requests += extend_dummy_requests
+
+    @staticmethod
+    def _mark_real_draft_rows(
+        host: HostInputs,
+        scheduled_requests: ScheduledRequests,
+        spec_config: DecodingBaseConfig,
+        runtime_draft_len: int,
+    ) -> None:
+        """Mark the generation rows that verify drafts the drafter made, for forced acceptance.
+
+        A request's ``py_has_real_drafts`` says whether its next verify reads drafts the drafter
+        made. A step drafts for every generation row when its draft length is nonzero, and for
+        its context rows only in modes whose context step drafts (the parallel-draft workers give
+        context requests zero placeholders). The disaggregated handoff sets the flag from the
+        context server's drafts. The rows follow the batch order: extend, then generation.
+        """
+        drafts = runtime_draft_len > 0
+        rows = host.lists.real_draft_rows
+        for requests in (host.lists.extend_requests, host.lists.generation_requests):
+            for request in requests:
+                rows.append(getattr(request, "py_has_real_drafts", False))
+                request.py_has_real_drafts = drafts
+        drafts = drafts and spec_config.spec_dec_mode.drafts_context_requests()
+        for request in scheduled_requests.context_requests:
+            request.py_has_real_drafts = drafts
 
     def _prepare_helix_state(
         self, host: HostInputs, kv_cache_manager: KVCacheManager | KVCacheManagerV2 | None
@@ -1826,17 +1888,57 @@ class DecoderInputPreparer:
         assert total_num_tokens <= self._config.max_num_tokens, (
             f"total_num_tokens ({total_num_tokens}) should be less than or equal to max_num_tokens ({self._config.max_num_tokens})"  # noqa: E501
         )
+        # Set by the runner for a batched input commit (see input_commit.py).
+        input_commit = active_input_commit()
         # if exist requests that do not have previous batch, copy input_ids and draft_tokens
         if num_tokens > 0:
-            input_ids = torch.tensor(input_ids, dtype=torch.int, pin_memory=prefer_pinned())
-            self._buffers.input_ids_cuda[:num_tokens].copy_(input_ids, non_blocking=True)
+            if input_commit is not None:
+                input_commit.stage(self._buffers.input_ids_cuda[:num_tokens], input_ids)
+            else:
+                input_ids = torch.tensor(input_ids, dtype=torch.int, pin_memory=prefer_pinned())
+                self._buffers.input_ids_cuda[:num_tokens].copy_(input_ids, non_blocking=True)
 
         if num_draft_tokens > 0:
-            draft_tokens = torch.tensor(draft_tokens, dtype=torch.int, pin_memory=prefer_pinned())
-            self._buffers.draft_tokens_cuda[: len(draft_tokens)].copy_(
-                draft_tokens, non_blocking=True
+            if input_commit is not None:
+                input_commit.stage(self._buffers.draft_tokens_cuda[:num_draft_tokens], draft_tokens)
+            else:
+                draft_tokens = torch.tensor(
+                    draft_tokens, dtype=torch.int, pin_memory=prefer_pinned()
+                )
+                self._buffers.draft_tokens_cuda[: len(draft_tokens)].copy_(
+                    draft_tokens, non_blocking=True
+                )
+        if (
+            next_draft_tokens_device is not None
+            and input_commit is not None
+            and overlap_fixup_supported(
+                new_tokens_device, new_tokens_lens_device, next_draft_tokens_device
             )
-        if next_draft_tokens_device is not None:
+        ):
+            # The commit kernel performs the gathers below and writes every element of
+            # both offset buffers (zero outside the previous-step rows). It reads the
+            # previous slots from its arena, so the device index buffers and their
+            # staged-list caches are left as they are.
+            runtime_tokens_per_gen_step = self.get_runtime_tokens_per_gen_step(runtime_draft_len)
+            num_extend_reqeust_wo_dummy = len(extend_requests) - len(extend_dummy_requests)
+            previous_begin = num_extend_reqeust_wo_dummy - previous_batch_len
+            input_commit.set_overlap_fixup(
+                previous_slots=previous_batch_indices,
+                tokens_per_req=runtime_tokens_per_gen_step,
+                draft_width=runtime_tokens_per_gen_step - 1,
+                new_tokens=new_tokens_device,
+                new_tokens_lens=new_tokens_lens_device,
+                next_draft_tokens=next_draft_tokens_device,
+                input_ids=self._buffers.input_ids_cuda,
+                input_ids_start=num_tokens,
+                draft_tokens=self._buffers.draft_tokens_cuda,
+                draft_tokens_start=num_draft_tokens,
+                pos_offsets=self._buffers.previous_pos_id_offsets_cuda,
+                pos_offsets_start=previous_begin * runtime_tokens_per_gen_step,
+                kv_offsets=self._buffers.previous_kv_lens_offsets_cuda,
+                kv_offsets_start=previous_begin,
+            )
+        elif next_draft_tokens_device is not None:
             runtime_tokens_per_gen_step = self.get_runtime_tokens_per_gen_step(runtime_draft_len)
             runtime_draft_token_buffer_width = runtime_tokens_per_gen_step - 1
             num_extend_reqeust_wo_dummy = len(extend_requests) - len(extend_dummy_requests)
@@ -1981,6 +2083,15 @@ class DecoderInputPreparer:
     ) -> None:
         total_num_tokens = host.total_num_tokens
         position_ids = apply_position_id_offset(host.lists.position_ids, model=self.model)
+        input_commit = active_input_commit()
+        if input_commit is not None and not self._config.use_mrope:
+            # Batched input commit: staged, written right before the replay. The host
+            # tensor only serves host readers, so it needs no pinning.
+            host.host_position_ids = torch.tensor(position_ids, dtype=torch.int)
+            input_commit.stage(
+                self._buffers.position_ids_cuda[:total_num_tokens], host.host_position_ids
+            )
+            return
         host_position_ids = torch.tensor(position_ids, dtype=torch.int, pin_memory=prefer_pinned())
         # Use the (3,1,N) MRoPE layout whenever the model declares MRoPE, even
         # for text-only batches: keeping position_ids rank-consistent between
@@ -2278,6 +2389,9 @@ class DecoderInputPreparer:
             total_draft_lens = sum(host.lists.draft_lens)
             spec_metadata.draft_tokens = self._buffers.draft_tokens_cuda[:total_draft_lens]
             spec_metadata.request_ids = host.lists.request_ids
+            spec_metadata.context_last_chunk = [
+                request.is_last_context_chunk for request in scheduled_requests.context_requests
+            ]
             spec_metadata.gather_ids = self._gather_ids_buffer.tensor[: len(host.lists.gather_ids)]
             # num_generations / num_tokens / seq_lens are set above, before the
             # attention-DP allgather that must agree with prepare().
@@ -2293,6 +2407,8 @@ class DecoderInputPreparer:
             spec_metadata.write_padding_onehot_draft_probs(
                 host.lists.padding_gen_slots, runtime_draft_len
             )
+            if self._mark_real_drafts:
+                spec_metadata.write_real_draft_rows(host.lists.real_draft_rows)
             inputs["spec_metadata"] = spec_metadata
 
             if self._config.enable_attention_dp:
@@ -2423,9 +2539,21 @@ class DecoderInputPreparer:
         Make some changes to the device inputs and avoid blocking the async data transfer
         """
         attn_meta = inputs.get("attn_metadata")
+        # kv_lens_refresh_once: one refresh, after the last correction below.
+        refresh_once = _kv_lens_refresh_once(attn_meta)
         # Invalidate per-forward-pass caches so they are recomputed (and captured) on every _forward_step.
-        if attn_meta is not None:
+        if attn_meta is not None and not refresh_once:
             attn_meta.on_update_kv_lens()
+
+        if (
+            enable_spec_decode
+            and spec_head_fusion_enabled()
+            and self._fused_spec_head_prep(inputs, runtime_draft_len)
+        ):
+            # _fused_spec_head_prep refreshed the metadata after its corrections.
+            if self.guided_decoder is not None:
+                self.guided_decoder.token_event.record()
+            return inputs
 
         if enable_spec_decode and not self._config.disable_overlap_scheduler:
             # When enabling overlap scheduler, the kv cache for draft tokens will
@@ -2464,7 +2592,8 @@ class DecoderInputPreparer:
                         inputs["attn_metadata"].kv_lens_cuda[num_ctx_requests:num_seqs] += (
                             self._buffers.previous_kv_lens_offsets_cuda[:num_gen_requests]
                         )
-                    inputs["attn_metadata"].on_update_kv_lens()
+                    if not refresh_once:
+                        inputs["attn_metadata"].on_update_kv_lens()
                 # TRTLLM uses `kv_lens_cuda` above; FlashInfer exposes this backend-specific
                 # correction without coupling the engine to its metadata type.
                 elif hasattr(inputs["attn_metadata"], "apply_spec_decode_kv_lens_offsets"):
@@ -2500,12 +2629,95 @@ class DecoderInputPreparer:
                 md.recompute_helix_spec_buffers(
                     helix_gen_tokens, self.get_runtime_tokens_per_gen_step(runtime_draft_len)
                 )
-                md.on_update_kv_lens()
+                if not refresh_once:
+                    md.on_update_kv_lens()
+
+        if refresh_once:
+            attn_meta.on_update_kv_lens()
 
         if self.guided_decoder is not None:
             self.guided_decoder.token_event.record()
 
         return inputs
+
+    def _fused_spec_head_prep(self, inputs: dict[str, Any], runtime_draft_len: int) -> bool:
+        """The device updates of ``preprocess_inputs`` in one kernel (``TLLM_SPEC_HEAD_FUSION=1``).
+
+        Covers the overlap-scheduler position / KV-length correction and the
+        Helix verify-group buffers (``recompute_helix_spec_buffers``) for int32
+        position ids and KV lengths, and writes the same values. Returns False,
+        having changed nothing, when the step needs the eager path.
+        """
+        md = inputs.get("attn_metadata")
+        if (
+            md is None
+            or md.kv_cache_manager is None
+            or not hasattr(md, "kv_lens_cuda")
+            or self._buffers.previous_pos_id_offsets_cuda is None
+        ):
+            return False
+        overlap = not self._config.disable_overlap_scheduler
+        helix = self.mapping.has_cp_helix() and getattr(md, "_helix_spec_tokens_valid", False)
+        position_ids = inputs["position_ids"]
+        if (
+            not (overlap or helix)
+            or position_ids.ndim != 2
+            or position_ids.dtype != torch.int32
+            or md.kv_lens_cuda.dtype != torch.int32
+        ):
+            return False
+        num_ctx_tokens = md.num_ctx_tokens
+        gen_tokens = inputs["input_ids"].shape[0] - num_ctx_tokens
+        num_ctx_requests = md.num_contexts
+        num_chunked = md.num_chunked_ctx_requests
+        if num_ctx_requests >= num_chunked and num_chunked > 0:
+            # Generation requests with draft tokens run as chunked context requests.
+            kv_start, num_kv = num_ctx_requests - num_chunked, num_chunked
+        else:
+            kv_start, num_kv = num_ctx_requests, md.num_generations
+        helix_kwargs = {}
+        if helix:
+            tokens_per_seq = self.get_runtime_tokens_per_gen_step(runtime_draft_len)
+            # Same uniform-group contract as recompute_helix_spec_buffers.
+            assert gen_tokens % tokens_per_seq == 0, (
+                f"helix spec expects uniform verify groups: {gen_tokens} gen "
+                f"tokens not divisible by group size {tokens_per_seq}"
+            )
+            assert gen_tokens // tokens_per_seq == md.num_generations, (
+                f"helix spec expects uniform verify groups: {gen_tokens} gen "
+                f"tokens over {md.num_generations} generation rows do not all "
+                f"have width {tokens_per_seq}"
+            )
+            helix_kwargs = dict(
+                helix_positions=md.helix_position_offsets,
+                helix_slots=md.helix_local_slots,
+                helix_bounds=md.helix_kv_bounds,
+                num_helix=gen_tokens,
+                tokens_per_block=md.kv_cache_manager.tokens_per_block,
+                cp_size=md.mapping.cp_size,
+                cp_rank=md.mapping.cp_rank,
+                kv_bound_start=md.num_contexts,
+                tokens_per_seq=tokens_per_seq,
+            )
+        prep = dict(
+            position_ids=position_ids[0, num_ctx_tokens:],
+            pos_offsets=self._buffers.previous_pos_id_offsets_cuda,
+            num_pos=gen_tokens,
+            kv_lens=md.kv_lens_cuda,
+            kv_offsets=self._buffers.previous_kv_lens_offsets_cuda,
+            kv_start=kv_start,
+            num_kv=num_kv,
+            has_overlap=overlap,
+            **helix_kwargs,
+        )
+        # A metadata class may take the launch (the keyword arguments of fused_spec_head_prep)
+        # into its model's first launch of the step; it then holds every device read of the
+        # corrected values until that launch.
+        defer = getattr(md, "defer_spec_head_prep", None)
+        if defer is None or not defer(prep):
+            fused_spec_head_prep(**prep)
+        md.on_update_kv_lens()
+        return True
 
     def postprocess_inputs(
         self, inputs: dict[str, Any], *, enable_spec_decode: bool, runtime_draft_len: int

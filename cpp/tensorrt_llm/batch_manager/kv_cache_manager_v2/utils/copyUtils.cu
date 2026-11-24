@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <cstdlib>
 #include <cuda_runtime.h>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -114,7 +115,19 @@ CUresult launchBatchedCopyImpl(
     {
         pTasks = reinterpret_cast<std::array<MMTask, N> const*>(tasks);
     }
-    uint32_t const nbSplits = lowBandwidth ? 1 : divUp(nbBytes, grainBytes * ctaSize * 2);
+    // Host-side copies need few CTAs to saturate the link, but a single CTA per task leaves large pages (e.g.
+    // one recurrent-state page holding every linear-attention layer, > 100 MB) bound by one SM's bandwidth.
+    // Opt-in via TRTLLM_KV_V2_SPLIT_HOST_COPY=1.
+    constexpr uint32_t kLowBandwidthBytesPerCta = 8u << 20;
+    constexpr uint32_t kLowBandwidthMaxSplits = 16;
+    static bool const splitHostCopy = []
+    {
+        char const* v = std::getenv("TRTLLM_KV_V2_SPLIT_HOST_COPY");
+        return v != nullptr && v[0] == '1';
+    }();
+    uint32_t const nbSplits = lowBandwidth
+        ? (splitHostCopy ? std::min(divUp(nbBytes, kLowBandwidthBytesPerCta), kLowBandwidthMaxSplits) : 1u)
+        : divUp(nbBytes, grainBytes * ctaSize * 2);
     void* args[] = {(void*) pTasks, (void*) &nbBytes};
     static CUkernel const kernel = []() -> CUkernel
     {

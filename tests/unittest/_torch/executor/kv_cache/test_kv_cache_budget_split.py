@@ -1340,12 +1340,15 @@ class TestMambaEffectiveTpSize:
     """
 
     @staticmethod
-    def _mapping(*, tp_size: int, cp_size: int, helix: bool, attention_dp: bool) -> SimpleNamespace:
+    def _mapping(
+        *, tp_size: int, cp_size: int, helix: bool, attention_dp: bool, ulysses: bool = False
+    ) -> SimpleNamespace:
         return SimpleNamespace(
             tp_size=tp_size,
             cp_size=cp_size,
             enable_attention_dp=attention_dp,
             has_cp_helix=lambda: helix,
+            has_cp_ulysses=lambda: ulysses,
         )
 
     @pytest.mark.parametrize(
@@ -1361,7 +1364,8 @@ class TestMambaEffectiveTpSize:
             # Helix repurposes the CP ranks as plain TP for recurrent state.
             (2, 8, True, False, 16),
             (1, 16, True, False, 16),
-            # Standard TP: a non-helix mesh never shards state across CP.
+            # Standard TP: a mesh with neither helix nor Ulysses CP never shards state
+            # across CP.
             (8, 1, False, False, 8),
             (8, 4, False, False, 8),
             (1, 1, False, False, 1),
@@ -1375,6 +1379,17 @@ class TestMambaEffectiveTpSize:
         )
 
         assert mamba_effective_tp_size(mapping) == expected
+
+    @pytest.mark.parametrize("tp_size,cp_size", [(1, 8), (1, 16), (2, 4)])
+    def test_ulysses_shards_state_over_tp_x_cp(self, tp_size, cp_size) -> None:
+        """Ulysses CP splits the recurrent heads over its TP x CP ranks, as TP would."""
+        from tensorrt_llm._torch.pyexecutor.config_utils import mamba_effective_tp_size
+
+        mapping = self._mapping(
+            tp_size=tp_size, cp_size=cp_size, helix=False, attention_dp=False, ulysses=True
+        )
+
+        assert mamba_effective_tp_size(mapping) == tp_size * cp_size
 
     def test_budget_sizing_uses_the_shared_rule(self) -> None:
         """``get_states_bytes_per_layer`` must not re-derive the TP degree."""

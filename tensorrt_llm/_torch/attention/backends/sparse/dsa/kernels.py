@@ -468,3 +468,336 @@ def fused_dsa_decode_metadata(
         BLOCK_S=block_s,
         BLOCK_T=block_t,
     )
+
+
+########################################################
+# Fused Helix decode metadata kernel
+########################################################
+
+# DeepGEMM's SM100 paged-MQA-logits schedule (``sm100_paged_mqa_logits_metadata``): every request is
+# split into ``ceil(context_len / 256)`` work units, independent of the ``block_kv`` argument.
+_DG_SM100_SPLIT_KV = 256
+# Rows per step of the schedule program's scan.
+_DG_SCHEDULE_BLOCK_R = 32
+
+
+@triton.jit
+def _dg_sm100_schedule(
+    lens_ptr,  # int32 [num_rows]: context length of each row
+    out_ptr,  # int32 [num_slots + 1, 2] (out)
+    num_rows,
+    num_slots,
+    AT_LEAST_ONE: tl.constexpr,  # read max(lens, 1)
+    SPLIT_KV: tl.constexpr,
+    BLOCK_SM: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+):
+    """``get_paged_mqa_logits_metadata(lens.view(-1, 1), block_kv, num_slots)`` of DeepGEMM's SM100 path.
+
+    Row ``r`` holds ``ceil(lens[r] / SPLIT_KV)`` work units; slot ``s`` starts at unit
+    ``w = s * (total // num_slots) + min(s, total % num_slots)``, written as ``(r, w - prefix[r - 1])``
+    for the row ``r`` whose inclusive prefix first exceeds ``w``, or ``(num_rows, 0)`` past the last
+    row. Lengths are non-negative and the total stays below 2**31, so the int32 arithmetic is
+    DeepGEMM's uint32 arithmetic.
+    """
+    offs_r = tl.arange(0, BLOCK_R)
+    total = tl.sum(tl.zeros([BLOCK_R], dtype=tl.int32), axis=0)
+    for start in range(0, num_rows, BLOCK_R):
+        mask_r = start + offs_r < num_rows
+        lens = tl.load(lens_ptr + start + offs_r, mask=mask_r, other=0)
+        if AT_LEAST_ONE:
+            lens = tl.maximum(lens, 1)
+        total += tl.sum(tl.where(mask_r, (lens + SPLIT_KV - 1) // SPLIT_KV, 0), axis=0)
+    per_slot = total // num_slots
+    rem = total - per_slot * num_slots
+    slot = tl.arange(0, BLOCK_SM)
+    w = slot * per_slot + tl.minimum(slot, rem)
+    # The row of w: the number of inclusive prefixes <= w (prefixes are non-decreasing); the
+    # prefix before it is the largest of those (0 when there is none).
+    row = tl.zeros([BLOCK_SM], dtype=tl.int32)
+    before = tl.zeros([BLOCK_SM], dtype=tl.int32)
+    carry = tl.sum(tl.zeros([BLOCK_R], dtype=tl.int32), axis=0)
+    for start in range(0, num_rows, BLOCK_R):
+        mask_r = start + offs_r < num_rows
+        lens = tl.load(lens_ptr + start + offs_r, mask=mask_r, other=0)
+        if AT_LEAST_ONE:
+            lens = tl.maximum(lens, 1)
+        work = tl.where(mask_r, (lens + SPLIT_KV - 1) // SPLIT_KV, 0)
+        prefix = carry + tl.cumsum(work, 0)
+        le = (prefix[None, :] <= w[:, None]) & mask_r[None, :]
+        row += tl.sum(le.to(tl.int32), axis=1)
+        before = tl.maximum(before, tl.max(tl.where(le, prefix[None, :], 0), axis=1))
+        carry += tl.sum(work, axis=0)
+    tail = row >= num_rows
+    q_idx = tl.where(tail, num_rows, row)
+    split = tl.where(tail, 0, w - before)
+    mask_sm = slot <= num_slots
+    tl.store(out_ptr + slot * 2, q_idx, mask=mask_sm)
+    tl.store(out_ptr + slot * 2 + 1, split, mask=mask_sm)
+
+
+@triton.jit(do_not_specialize=["num_seqs", "num_tokens", "width", "max_blocks", "num_slots"])
+def _fused_dsa_helix_decode_metadata_kernel(
+    seq_lens_ptr,  # int32 [num_seqs]
+    kv_lens_ptr,  # int32 [num_seqs], rank-local
+    block_offsets_ptr,  # int32 [rows, max_blocks], rank-local pages
+    helix_local_slots_ptr,  # int32 [num_tokens], -1 where another rank owns the token
+    helix_kv_bounds_ptr,  # int32 [num_tokens]
+    req_idx_per_token_ptr,  # int32 [num_tokens] (out)
+    slot_fp8_ptr,  # int64 [num_tokens] (out)
+    slot_scale_ptr,  # int64 [num_tokens] (out)
+    gen_kv_indptr_ptr,  # int64 [num_seqs + 1] (out, entries 1..num_seqs)
+    gen_cached_indptr_ptr,  # int64 [num_seqs + 1] (out, entries 1..num_seqs)
+    kv_lens_2d_ptr,  # int32 [num_seqs, >= width] (out)
+    kv_lens_expanded_ptr,  # int32 [num_tokens] (out)
+    schedule_ptr,  # int32 [num_slots + 1, 2] (out, with SCHEDULE): DeepGEMM schedule of kv_lens
+    schedule_expanded_ptr,  # int32 [num_slots + 1, 2] (out, with SCHEDULE): of kv_lens_expanded
+    block_offsets_stride_0,
+    block_offsets_stride_1,
+    kv_lens_2d_stride_0,
+    num_seqs,
+    num_tokens,
+    width,
+    max_blocks,
+    num_slots,
+    tokens_per_block: tl.constexpr,
+    data_bytes_per_token: tl.constexpr,
+    scale_size: tl.constexpr,
+    block_stride: tl.constexpr,
+    scale_base_offset: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+    SCHEDULE: tl.constexpr,
+    SPLIT_KV: tl.constexpr,
+    BLOCK_SM: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    num_token_programs = tl.cdiv(num_tokens, BLOCK_T)
+    # ----- with SCHEDULE, the last two programs: the DeepGEMM schedules --------------------
+    if SCHEDULE:
+        if pid == 1 + num_token_programs:
+            _dg_sm100_schedule(
+                kv_lens_ptr, schedule_ptr, num_seqs, num_slots, False, SPLIT_KV, BLOCK_SM, BLOCK_R
+            )
+            return
+        if pid == 2 + num_token_programs:
+            # kv_lens_expanded = max(helix_kv_bounds, 1), read from the bounds directly.
+            _dg_sm100_schedule(
+                helix_kv_bounds_ptr,
+                schedule_expanded_ptr,
+                num_tokens,
+                num_slots,
+                True,
+                SPLIT_KV,
+                BLOCK_SM,
+                BLOCK_R,
+            )
+            return
+    offs_s = tl.arange(0, BLOCK_S)
+    mask_s = offs_s < num_seqs
+    seq = tl.load(seq_lens_ptr + offs_s, mask=mask_s, other=0)
+
+    # ----- program 0: per-sequence outputs -------------------------------------------------
+    if pid == 0:
+        kv = tl.load(kv_lens_ptr + offs_s, mask=mask_s, other=0)
+        tl.store(gen_kv_indptr_ptr + 1 + offs_s, tl.cumsum(kv.to(tl.int64), 0), mask=mask_s)
+        tl.store(
+            gen_cached_indptr_ptr + 1 + offs_s, tl.cumsum((kv - seq).to(tl.int64), 0), mask=mask_s
+        )
+        offs_w = tl.arange(0, BLOCK_W)
+        kv_2d = kv[:, None] + tl.zeros((BLOCK_S, BLOCK_W), dtype=tl.int32)
+        tl.store(
+            kv_lens_2d_ptr + offs_s[:, None] * kv_lens_2d_stride_0 + offs_w[None, :],
+            kv_2d,
+            mask=mask_s[:, None] & (offs_w[None, :] < width),
+        )
+        return
+
+    # ----- programs 1..: BLOCK_T tokens each ------------------------------------------------
+    t = (pid - 1) * BLOCK_T + tl.arange(0, BLOCK_T)
+    mask_t = t < num_tokens
+    # searchsorted(cumsum(seq_lens), t, right=True): the number of sequence ends <= t.
+    ends = tl.cumsum(seq, 0)
+    before = (ends[None, :] <= t[:, None]) & mask_s[None, :]
+    req = tl.sum(before.to(tl.int32), axis=1)
+    tl.store(req_idx_per_token_ptr + t, req, mask=mask_t)
+
+    # The token's rank-local slot, or no write (-1) where another CP rank owns it.
+    local = tl.load(helix_local_slots_ptr + t, mask=mask_t, other=0).to(tl.int64)
+    owned = local >= 0
+    pos = tl.maximum(local, 0)
+    blk = tl.minimum(pos // tokens_per_block, max_blocks - 1)
+    in_blk = pos % tokens_per_block
+    bid = tl.load(
+        block_offsets_ptr
+        + req.to(tl.int64) * block_offsets_stride_0
+        + blk * block_offsets_stride_1,
+        mask=mask_t,
+        other=0,
+    ).to(tl.int64)
+    fp8 = bid * block_stride + in_blk * data_bytes_per_token
+    scale = bid * block_stride + scale_base_offset + in_blk * scale_size
+    tl.store(slot_fp8_ptr + t, tl.where(owned, fp8, -1), mask=mask_t)
+    tl.store(slot_scale_ptr + t, tl.where(owned, scale, -1), mask=mask_t)
+
+    # Each verify row scores at least one key (the indexer drops the rows of empty bounds).
+    bounds = tl.load(helix_kv_bounds_ptr + t, mask=mask_t, other=1)
+    tl.store(kv_lens_expanded_ptr + t, tl.maximum(bounds, 1), mask=mask_t)
+
+
+def fused_dsa_helix_decode_metadata(
+    seq_lens: torch.Tensor,  # int32 [num_seqs]
+    kv_lens: torch.Tensor,  # int32 [num_seqs]
+    block_offsets: torch.Tensor,  # int32 [rows >= num_seqs, max_blocks]
+    helix_local_slots: torch.Tensor,  # int32 [>= num_tokens]
+    helix_kv_bounds: torch.Tensor,  # int32 [>= num_tokens]
+    req_idx_per_token: torch.Tensor,  # int32 [>= num_tokens] (out)
+    slot_mapping_fp8: torch.Tensor,  # int64 [>= num_tokens] (out)
+    slot_mapping_scale: torch.Tensor,  # int64 [>= num_tokens] (out)
+    gen_kv_indptr: torch.Tensor,  # int64 [>= num_seqs + 1] (out)
+    gen_cached_token_indptr: torch.Tensor,  # int64 [>= num_seqs + 1] (out)
+    kv_lens_2d: torch.Tensor,  # int32 [>= num_seqs, >= width] (out)
+    kv_lens_expanded: torch.Tensor,  # int32 [>= num_tokens] (out)
+    num_tokens: int,
+    width: int,
+    tokens_per_block: int,
+    index_head_dim: int,
+    quant_block_size: int,
+    data_bytes_per_token: int | None = None,
+    schedule: torch.Tensor | None = None,  # int32 [num_slots + 1, 2] (out)
+    schedule_expanded: torch.Tensor | None = None,  # int32 [num_slots + 1, 2] (out)
+) -> None:
+    """The DSA decode metadata of a Helix CP generation step in one Triton launch.
+
+    Writes, for a step of ``num_seqs`` generation requests and ``num_tokens`` verify tokens
+    (no context requests), exactly what the eager chain of ``on_update_kv_lens`` leaves:
+
+    * ``req_idx_per_token[:num_tokens]``: ``searchsorted(cumsum(seq_lens), t, right=True)``;
+    * ``slot_mapping_{fp8,scale}[:num_tokens]``: the token's indexer-K slot at its rank-local
+      position ``helix_local_slots[t]`` in ``block_offsets[req]``, or -1 where another CP rank
+      owns the token (the Helix ownership rewrite of the generic slots);
+    * ``gen_kv_indptr[1:]`` / ``gen_cached_token_indptr[1:]``: the int64 prefix sums of
+      ``kv_lens`` and ``kv_lens - seq_lens`` (entry 0 is not written, as in the eager chain);
+    * ``kv_lens_2d[:num_seqs, :width]``: ``kv_lens`` broadcast over the verify width;
+    * ``kv_lens_expanded[:num_tokens]``: ``max(helix_kv_bounds, 1)``.
+
+    With ``schedule`` and ``schedule_expanded`` (both or neither), the same launch also writes the
+    DeepGEMM SM100 paged-MQA-logits schedules ``get_paged_mqa_logits_metadata`` builds over
+    ``num_slots = schedule.shape[0] - 1`` slots: of ``kv_lens.view(-1, 1)`` into ``schedule`` and of
+    ``kv_lens_expanded[:num_tokens].view(-1, 1)`` into ``schedule_expanded``
+    (:func:`_dg_sm100_schedule`). Without them the schedules are left to the caller.
+
+    Integer arithmetic only, so the outputs are bitwise those of the eager chain.
+    Graph-capturable (no allocation, no host sync).
+    """
+    num_seqs = seq_lens.shape[0]
+    assert num_seqs > 0 and num_tokens > 0
+    assert block_offsets.shape[0] >= num_seqs
+    with_schedule = schedule is not None
+    assert with_schedule == (schedule_expanded is not None)
+    if with_schedule:
+        num_slots = schedule.shape[0] - 1
+        for buf in (schedule, schedule_expanded):
+            assert buf.dtype == torch.int32 and buf.is_contiguous()
+            assert buf.shape == (num_slots + 1, 2)
+        assert num_slots > 0
+    else:
+        num_slots = 1
+        schedule = schedule_expanded = kv_lens_expanded
+    if data_bytes_per_token is None:
+        data_bytes_per_token = index_head_dim
+    scale_size = index_head_dim // quant_block_size * 4  # float32 = 4 bytes
+    block_stride = tokens_per_block * (data_bytes_per_token + scale_size)
+    scale_base_offset = tokens_per_block * data_bytes_per_token
+    block_s = triton.next_power_of_2(num_seqs)
+    block_t = min(128, triton.next_power_of_2(num_tokens))
+    block_w = triton.next_power_of_2(max(width, 1))
+    grid = (1 + triton.cdiv(num_tokens, block_t) + (2 if with_schedule else 0),)
+    _fused_dsa_helix_decode_metadata_kernel[grid](
+        seq_lens,
+        kv_lens,
+        block_offsets,
+        helix_local_slots,
+        helix_kv_bounds,
+        req_idx_per_token,
+        slot_mapping_fp8,
+        slot_mapping_scale,
+        gen_kv_indptr,
+        gen_cached_token_indptr,
+        kv_lens_2d,
+        kv_lens_expanded,
+        schedule,
+        schedule_expanded,
+        block_offsets.stride(0),
+        block_offsets.stride(1),
+        kv_lens_2d.stride(0),
+        num_seqs,
+        num_tokens,
+        width,
+        block_offsets.shape[1],
+        num_slots,
+        tokens_per_block,
+        data_bytes_per_token,
+        scale_size,
+        block_stride,
+        scale_base_offset,
+        BLOCK_S=block_s,
+        BLOCK_T=block_t,
+        BLOCK_W=block_w,
+        SCHEDULE=with_schedule,
+        SPLIT_KV=_DG_SM100_SPLIT_KV,
+        BLOCK_SM=triton.next_power_of_2(num_slots + 1),
+        BLOCK_R=_DG_SCHEDULE_BLOCK_R,
+    )
+
+
+########################################################
+# Helix combine mask of a token-sparse generation batch
+########################################################
+
+
+@triton.jit(do_not_specialize=["num_rows"])
+def _helix_zero_or_empty_rows_kernel(
+    bounds_ptr,  # int [num_rows]: per-token rank-local KV bound (helix_kv_bounds)
+    row_lens_ptr,  # int [num_rows]: kept Top-K entries per row on this rank
+    out_ptr,  # bool [num_rows]
+    num_rows,
+    BLOCK: tl.constexpr,
+):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    valid = offs < num_rows
+    bounds = tl.load(bounds_ptr + offs, mask=valid, other=1)
+    row_lens = tl.load(row_lens_ptr + offs, mask=valid, other=1)
+    tl.store(out_ptr + offs, (bounds == 0) | (row_lens == 0), mask=valid)
+
+
+def helix_zero_or_empty_rows(bounds: torch.Tensor, row_lens: torch.Tensor) -> torch.Tensor:
+    """``(bounds == 0) | (row_lens == 0)`` as one bool tensor, in one launch.
+
+    The Helix combine mask of a token-sparse generation batch: rows this CP rank owns no KV for
+    (zero rank-local bound) or whose Top-K kept nothing on it. The same values as the two compares
+    and the OR of ``MLA._attn_forward_gen``. CUDA-graph safe: no host sync, the launch depends on
+    the static row count only.
+    """
+    num_rows = bounds.shape[0]
+    if (
+        bounds.dim() != 1
+        or row_lens.dim() != 1
+        or row_lens.shape[0] != num_rows
+        or bounds.stride(0) != 1
+        or row_lens.stride(0) != 1
+    ):
+        raise ValueError(
+            f"helix_zero_or_empty_rows: bounds {tuple(bounds.shape)} and row lengths "
+            f"{tuple(row_lens.shape)} must be contiguous 1-D tensors of one length"
+        )
+    out = torch.empty((num_rows,), dtype=torch.bool, device=bounds.device)
+    if num_rows == 0:
+        return out
+    block = min(1024, max(32, triton.next_power_of_2(num_rows)))
+    _helix_zero_or_empty_rows_kernel[(triton.cdiv(num_rows, block),)](
+        bounds, row_lens, out, num_rows, BLOCK=block, num_warps=1 if block <= 256 else 4
+    )
+    return out

@@ -41,12 +41,13 @@ from tensorrt_llm.llmapi import CapacitySchedulerPolicy, SchedulerConfig
 # fmt: off
 from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, BlockReuseConfig,
                                           CacheTransceiverConfig, CalibConfig,
+                                          ContextChunkCapConfig,
                                           ContextChunkingPolicy,
                                           CudaGraphConfig,
                                           DecodeCudaGraphConfig,
                                           DecodingBaseConfig,
                                           DeepSeekV4SparseAttentionConfig,
-                                          DFlashDecodingConfig,
+                                          DFlashDecodingConfig, DkvConfig,
                                           DSparkDecodingConfig,
                                           DynamicBatchConfig,
                                           Eagle3DecodingConfig,
@@ -55,8 +56,9 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, BlockReuseConfig,
                                           ExecutorMemoryType,
                                           ExtendedRuntimePerfKnobConfig,
                                           KvCacheConfig, MambaStateConfig,
-                                          MoeConfig, MTPDecodingConfig,
-                                          MultimodalConfig,
+                                          MoeConfig, MoeLoadBalancerConfig,
+                                          MoePerLayerDynamicLoadBalancerConfig,
+                                          MTPDecodingConfig, MultimodalConfig,
                                           MultimodalEncoderCudaGraphConfig,
                                           NGramDecodingConfig, PeftCacheConfig,
                                           PrefillCudaGraphBackend, PybindMirror,
@@ -252,6 +254,223 @@ moe_backend: TRTLLM
 
 
 @pytest.mark.cpu_only
+class TestMoeConfigPerLayerDynamicEplb:
+
+    @staticmethod
+    def _per_layer_dynamic() -> dict[str, object]:
+        return {"mode": "per_layer_dynamic", "num_slots": 72}
+
+    def test_without_load_balancer_leaves_moe_config_unchanged(self) -> None:
+        config = MoeConfig()
+
+        assert config.load_balancer is None
+        assert config.backend == "AUTO"
+
+    @pytest.mark.parametrize("backend",
+                             ["CUTLASS", "DEEPGEMM", "MEGAMOE_CUTEDSL"])
+    def test_rejects_explicit_incompatible_backend(self, backend: str) -> None:
+        with pytest.raises(
+                ValidationError,
+                match=r"requires moe_config.backend in \('TRTLLM', 'CUTEDSL'\)"
+        ):
+            MoeConfig(backend=backend, load_balancer=self._per_layer_dynamic())
+
+    @pytest.mark.parametrize("backend, resolved", [(None, "TRTLLM"),
+                                                   ("AUTO", "TRTLLM"),
+                                                   ("TRTLLM", "TRTLLM"),
+                                                   ("CUTEDSL", "CUTEDSL")])
+    def test_resolves_auto_and_accepts_compatible_backend(
+            self, backend: str | None, resolved: str) -> None:
+        kwargs = {} if backend is None else {"backend": backend}
+
+        config = MoeConfig(load_balancer=self._per_layer_dynamic(), **kwargs)
+
+        assert isinstance(config.load_balancer,
+                          MoePerLayerDynamicLoadBalancerConfig)
+        assert config.backend == resolved
+        assert config.load_balancer.auxiliary_sms == 4
+        assert config.load_balancer.helper_slot_mode == "per_layer_resident"
+
+    def test_standard_mode_keeps_auto_backend(self) -> None:
+        config = MoeConfig(load_balancer={"num_slots": 64})
+
+        assert isinstance(config.load_balancer, MoeLoadBalancerConfig)
+        assert config.backend == "AUTO"
+
+    @pytest.mark.parametrize(
+        "num_experts, message",
+        [
+            pytest.param(0, "must be positive", id="zero-experts"),
+            pytest.param(65, "must be divisible", id="non-divisible-experts"),
+            pytest.param(72, "must exceed", id="no-helper-capacity"),
+            pytest.param(80, "must exceed", id="negative-helper-capacity"),
+        ],
+    )
+    def test_validates_physical_slot_capacity_after_setup(
+            self, num_experts: int, message: str) -> None:
+        config = MoePerLayerDynamicLoadBalancerConfig(num_slots=72)
+        config.setup(ep_rank=0, ep_size=8)
+
+        with pytest.raises(ValueError, match=message):
+            config.validate_expert_capacity(num_experts)
+
+    def test_accepts_positive_helper_capacity_after_setup(self) -> None:
+        config = MoePerLayerDynamicLoadBalancerConfig(num_slots=72)
+        config.setup(ep_rank=0, ep_size=8)
+
+        config.validate_expert_capacity(num_experts=64)
+        assert config.num_local_slots == 9
+
+    def test_kimi_k31_ep16_slot_layout(self) -> None:
+        # 896 routed experts on 16 EP ranks: 56 resident + 8 helper slots each.
+        config = MoePerLayerDynamicLoadBalancerConfig(num_slots=1024,
+                                                      auxiliary_sms=8)
+        config.setup(ep_rank=3, ep_size=16)
+
+        config.validate_expert_capacity(num_experts=896)
+        assert config.num_local_slots == 64
+        assert config.slot_start == 192
+
+    def test_expert_capacity_requires_setup(self) -> None:
+        config = MoePerLayerDynamicLoadBalancerConfig(num_slots=72)
+        with pytest.raises(ValueError, match=r"Call setup\(\)"):
+            config.validate_expert_capacity(num_experts=64)
+
+    def test_legacy_dictionary_defaults_to_standard_mode(self) -> None:
+        config = MoeConfig(
+            backend="CUTLASS",
+            load_balancer={
+                "num_slots": 64,
+                "layer_updates_per_iter": 2
+            },
+        )
+
+        assert isinstance(config.load_balancer, MoeLoadBalancerConfig)
+        assert config.load_balancer.mode == "standard"
+        assert config.load_balancer.layer_updates_per_iter == 2
+        assert config.backend == "CUTLASS"
+
+    @pytest.mark.parametrize("field", ["num_slots", "auxiliary_sms"])
+    def test_per_layer_dynamic_positive_fields(self, field: str) -> None:
+        values = self._per_layer_dynamic()
+        values[field] = 0
+        with pytest.raises(ValidationError, match=field):
+            MoeConfig(load_balancer=values)
+
+    @pytest.mark.parametrize("auxiliary_sms", [1, 8])
+    def test_per_layer_dynamic_accepts_other_auxiliary_sm_budgets(
+            self, auxiliary_sms: int) -> None:
+        values = self._per_layer_dynamic()
+        values["auxiliary_sms"] = auxiliary_sms
+        config = MoeConfig(load_balancer=values)
+        assert config.load_balancer.auxiliary_sms == auxiliary_sms
+
+    def test_per_layer_dynamic_rejects_more_than_fused_copy_sm_limit(
+            self) -> None:
+        values = self._per_layer_dynamic()
+        values["auxiliary_sms"] = 9
+        with pytest.raises(ValidationError, match="auxiliary_sms"):
+            MoeConfig(load_balancer=values)
+
+    @pytest.mark.parametrize("mode", ["per_layer_resident", "shared_banks"])
+    def test_per_layer_dynamic_accepts_helper_slot_modes(self,
+                                                         mode: str) -> None:
+        values = self._per_layer_dynamic()
+        values["helper_slot_mode"] = mode
+        config = MoeConfig(load_balancer=values)
+        assert config.load_balancer.helper_slot_mode == mode
+
+    def test_per_layer_dynamic_rejects_unknown_helper_slot_mode(self) -> None:
+        values = self._per_layer_dynamic()
+        values["helper_slot_mode"] = "per_layer"
+        with pytest.raises(ValidationError, match="helper_slot_mode"):
+            MoeConfig(load_balancer=values)
+
+    def test_standard_mode_rejects_helper_slot_mode(self) -> None:
+        with pytest.raises(ValidationError, match="helper_slot_mode"):
+            MoeConfig(backend="CUTLASS",
+                      load_balancer={
+                          "mode": "standard",
+                          "num_slots": 64,
+                          "helper_slot_mode": "shared_banks",
+                      })
+
+    def test_per_layer_dynamic_disables_decode_cuda_graph(self) -> None:
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            moe_config={"load_balancer": self._per_layer_dynamic()})
+        assert args.cuda_graph_config is None
+        assert args.moe_config.backend == "TRTLLM"
+
+    def test_without_load_balancer_keeps_cuda_graph_config(self) -> None:
+        args = TorchLlmArgs(model=llama_model_path)
+        assert args.cuda_graph_config is not None
+        assert args.moe_config.load_balancer is None
+
+    def test_per_layer_dynamic_rejects_prefill_cuda_graph(self) -> None:
+        with pytest.raises(ValidationError, match="prefill CUDA graphs"):
+            TorchLlmArgs(
+                model=llama_model_path,
+                prefill_cuda_graph_backend=PrefillCudaGraphBackend.PIECEWISE,
+                moe_config={"load_balancer": self._per_layer_dynamic()})
+
+    def test_legacy_yaml_defaults_to_standard_mode(self,
+                                                   tmp_path: Path) -> None:
+        config_path = tmp_path / "eplb.yaml"
+        config_path.write_text("num_slots: 64\nlayer_updates_per_iter: 2\n")
+
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            moe_config={"load_balancer": str(config_path)},
+        )
+
+        assert isinstance(args.moe_config.load_balancer, MoeLoadBalancerConfig)
+        assert args.moe_config.load_balancer.mode == "standard"
+
+    def test_per_layer_dynamic_yaml_sets_backend(self, tmp_path: Path) -> None:
+        config_path = tmp_path / "eplb.yaml"
+        config_path.write_text("mode: per_layer_dynamic\nnum_slots: 72\n")
+
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            moe_config={"load_balancer": str(config_path)},
+        )
+
+        assert isinstance(args.moe_config.load_balancer,
+                          MoePerLayerDynamicLoadBalancerConfig)
+        assert args.moe_config.backend == "TRTLLM"
+
+    def test_per_layer_dynamic_yaml_is_typed_by_moe_config_before_llm_args(
+            self, tmp_path: Path) -> None:
+        config_path = tmp_path / "eplb.yaml"
+        config_path.write_text("mode: per_layer_dynamic\nnum_slots: 72\n")
+
+        config = MoeConfig(load_balancer=str(config_path))
+
+        assert isinstance(config.load_balancer,
+                          MoePerLayerDynamicLoadBalancerConfig)
+        assert config.backend == "TRTLLM"
+
+    def test_yaml_resolution_preserves_missing_file_error(
+            self, tmp_path: Path) -> None:
+        config_path = tmp_path / "missing.yaml"
+
+        with pytest.raises(FileNotFoundError,
+                           match=r"MoE load balancer config file not found:"):
+            MoeConfig(load_balancer=str(config_path))
+
+    def test_yaml_resolution_preserves_invalid_file_error(
+            self, tmp_path: Path) -> None:
+        config_path = tmp_path / "invalid.yaml"
+        config_path.write_text("mode: per_layer_dynamic\n")
+
+        with pytest.raises(
+                ValidationError,
+                match=r"Failed to load MoE load balancer config file:"):
+            MoeConfig(load_balancer=str(config_path))
+
+
+@pytest.mark.cpu_only
 def test_rejection_sampling_allows_attention_dp(monkeypatch):
     """ADP (incl. ADP+LM-head-TP) supports rejection sampling.
 
@@ -298,6 +517,73 @@ def test_rejection_sampling_still_gated_on_context_parallel():
         TorchLlmArgs(model=llama_model_path,
                      context_parallel_size=2,
                      speculative_config=spec_cfg)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("modeling_v2", ["off", "auto", "require"])
+def test_dflash_cp_rejection_requires_target_validation(tmp_path, monkeypatch,
+                                                        modeling_v2):
+    import tensorrt_llm._torch.flashinfer_utils as fi_utils
+    monkeypatch.setattr(fi_utils, "IS_FLASHINFER_AVAILABLE", True)
+    kwargs = dict(model=tmp_path,
+                  modeling_v2=modeling_v2,
+                  gpus_per_node=4,
+                  tensor_parallel_size=1,
+                  context_parallel_size=8,
+                  cp_config={"cp_type": "HELIX"},
+                  max_batch_size=1,
+                  max_num_tokens=64,
+                  max_seq_len=128,
+                  speculative_config=DFlashDecodingConfig(
+                      max_draft_len=7, use_rejection_sampling=True))
+    if modeling_v2 == "require":
+        args = TorchLlmArgs(**kwargs)
+        assert args.speculative_config.use_rejection_sampling is True
+    else:
+        with pytest.raises(ValueError, match="context parallelism"):
+            TorchLlmArgs(**kwargs)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("cp_size", [1, 8])
+def test_mla_dflash_disagg_does_not_warn_about_degraded_acceptance(
+        tmp_path: Path, cp_size: int) -> None:
+    """Neither worker role warns about a managed MLA drafter; Helix uses TP1."""
+    draft = tmp_path / "draft"
+    draft.mkdir()
+    (draft / "config.json").write_text(
+        json.dumps({
+            "architectures": ["DFlash2DraftModel"],
+            "dflash_config": {
+                "attention_mode": "mla",
+                "target_layer_ids": [0, 1],
+                "conv_kernel_size": 2,
+                "selector_rank": 8
+            },
+        }))
+    with patch.object(llm_args_mod.logger, "warning") as warning:
+        args = TorchLlmArgs(
+            model=tmp_path,
+            gpus_per_node=4,
+            tensor_parallel_size=1,
+            context_parallel_size=cp_size,
+            cp_config={"cp_type": "HELIX"} if cp_size > 1 else None,
+            max_batch_size=1,
+            max_num_tokens=64,
+            max_seq_len=128,
+            kv_cache_config={
+                "use_kv_cache_manager_v2": True,
+                "enable_block_reuse": False
+            },
+            speculative_config=DFlashDecodingConfig(
+                speculative_model=draft,
+                max_draft_len=4,
+                use_rejection_sampling=False,
+                context_kv_dtype="auto"),
+            cache_transceiver_config=CacheTransceiverConfig(backend="NIXL"))
+    assert isinstance(args.speculative_config, DFlashDecodingConfig)
+    assert not any("DFlash acceptance is degraded" in call.args[0]
+                   for call in warning.call_args_list)
 
 
 @pytest.mark.cpu_only
@@ -531,6 +817,64 @@ def test_dspark_block_size_resolved_from_checkpoint(tmp_path):
     )
 
     assert args.speculative_config.block_size == 5
+
+
+@pytest.mark.cpu_only
+def test_dspark_context_kv_fields():
+    spec_cfg = DSparkDecodingConfig(max_draft_len=5)
+    assert spec_cfg.context_kv_only is False
+    assert spec_cfg.context_kv_dtype == "auto"
+
+    spec_cfg = DSparkDecodingConfig(max_draft_len=5,
+                                    context_kv_only=True,
+                                    context_kv_dtype="fp8")
+    assert spec_cfg.context_kv_only is True
+    assert spec_cfg.context_kv_dtype == "fp8"
+
+    with pytest.raises(ValueError):
+        DSparkDecodingConfig(max_draft_len=5, context_kv_dtype="bf16")
+
+
+@pytest.mark.cpu_only
+def test_dflash_context_kv_fields():
+    # Unlike DSpark's, a DFlash drafter's context_kv_dtype defaults to None: no
+    # context transfer and no draft layers in the KV cache.
+    spec_cfg = DFlashDecodingConfig(max_draft_len=3)
+    assert spec_cfg.context_kv_only is False
+    assert spec_cfg.context_kv_dtype is None
+
+    for dtype in ("auto", "fp8"):
+        spec_cfg = DFlashDecodingConfig(max_draft_len=3,
+                                        context_kv_only=True,
+                                        context_kv_dtype=dtype)
+        assert spec_cfg.context_kv_only is True
+        assert spec_cfg.context_kv_dtype == dtype
+
+    with pytest.raises(ValueError):
+        DFlashDecodingConfig(max_draft_len=3, context_kv_dtype="bf16")
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("dict_config", [False, True])
+def test_dflash_disagg_with_context_kv_dtype_does_not_warn(
+        tmp_path: Path, dict_config: bool) -> None:
+    # With context_kv_dtype the drafter's context travels with the prompt KV.
+    speculative_config = DFlashDecodingConfig(max_draft_len=2,
+                                              use_rejection_sampling=False,
+                                              context_kv_dtype="auto")
+    cache_transceiver_config = CacheTransceiverConfig(backend="NIXL")
+    if dict_config:
+        speculative_config = speculative_config.model_dump()
+        cache_transceiver_config = cache_transceiver_config.model_dump()
+
+    with patch.object(llm_args_mod.logger, "warning") as warning:
+        args = TorchLlmArgs(model=tmp_path,
+                            gpus_per_node=1,
+                            speculative_config=speculative_config,
+                            cache_transceiver_config=cache_transceiver_config)
+    assert args.speculative_config.context_kv_dtype == "auto"
+    assert not any("DFlash acceptance is degraded" in call.args[0]
+                   for call in warning.call_args_list)
 
 
 @pytest.mark.cpu_only
@@ -1368,6 +1712,18 @@ def test_BlockReuseConfig_swa_endpoint_rewind_rejects_negative() -> None:
 
 
 @pytest.mark.cpu_only
+def test_BlockReuseConfig_parked_conversation_caches() -> None:
+    assert BlockReuseConfig().max_parked_conversation_caches == 0
+    config = KvCacheConfig(block_reuse_config={
+        "policy": "per_conversation",
+        "max_parked_conversation_caches": 64
+    })
+    assert config.block_reuse_config.max_parked_conversation_caches == 64
+    with pytest.raises(ValidationError, match="max_parked_conversation_caches"):
+        BlockReuseConfig(max_parked_conversation_caches=-1)
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("disabled",
                          ["enable_block_reuse", "use_kv_cache_manager_v2"])
 def test_KvCacheConfig_swa_endpoint_rewind_requires_reuse_and_v2(
@@ -2099,6 +2455,23 @@ def test_SchedulerConfig_declaration() -> None:
     assert PybindMirror.pybind_equals(pybind_config.dynamic_batch_config,
                                       config.dynamic_batch_config._to_pybind())
     assert pybind_config.enable_prefix_aware_scheduling is False
+
+
+@pytest.mark.cpu_only
+def test_SchedulerConfig_context_chunk_cap() -> None:
+    assert SchedulerConfig().context_chunk_cap is None
+    config = SchedulerConfig(
+        context_chunk_cap={"max_tokens_per_request": 16384})
+    assert config.context_chunk_cap == ContextChunkCapConfig(
+        max_tokens_per_request=16384, min_waiting_requests=24)
+    # Not a field of the C++ scheduler config: the conversion leaves it out.
+    assert PybindMirror.maybe_to_pybind(config) is not None
+    with pytest.raises(ValidationError, match="max_tokens_per_request"):
+        ContextChunkCapConfig(max_tokens_per_request=0)
+    with pytest.raises(ValidationError, match="min_waiting_requests"):
+        ContextChunkCapConfig(max_tokens_per_request=1, min_waiting_requests=-1)
+    with pytest.raises(ValidationError, match="Extra inputs"):
+        ContextChunkCapConfig(max_tokens_per_request=1, max_tokens=1)
 
 
 @pytest.mark.cpu_only
@@ -4144,7 +4517,6 @@ class TestPydanticBestPractices:
             "drafter",  # abstract base class type
             "resource_manager",  # abstract base class type
         ],
-        MoeConfig: ["load_balancer"],  # allows multiple types including dict
         RayPlacementConfig: ["placement_groups"],  # contains Ray-specific types
     }
 
@@ -5469,3 +5841,65 @@ class TestDeepseekRuntimePreferences:
         cfg = self._pretrained_config(["DeepseekV3ForCausalLM"], "deepseek_v3")
         _resolve_transceiver_runtime_auto(args, DeepseekV3ForCausalLM, cfg)
         assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+
+
+@pytest.mark.cpu_only
+class TestDkvConfig:
+    """dkv_config: its accepted values, and the launches that cannot hold a DKV group."""
+
+    @staticmethod
+    def _args(tmp_path, **kwargs):
+        base = dict(
+            model=tmp_path,
+            gpus_per_node=8,
+            context_parallel_size=8,
+            cp_config={"cp_type": "ULYSSES"},
+            kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2="auto"))
+        base.update(kwargs)
+        return TorchLlmArgs(**base)
+
+    def test_unset_is_replicated_kv(self, tmp_path):
+        assert self._args(tmp_path).dkv_config is None
+
+    def test_defaults_and_the_v2_manager(self, tmp_path):
+        args = self._args(tmp_path, dkv_config={})
+        assert (args.dkv_config.attention_mode, args.dkv_config.kv_layout,
+                args.dkv_config.index_layout) == ("sp", "page_split", "sharded")
+        assert args.kv_cache_config.use_kv_cache_manager_v2 is True
+
+    def test_every_implemented_value(self, tmp_path):
+        args = self._args(tmp_path,
+                          dkv_config={
+                              "attention_mode": "sp",
+                              "kv_layout": "replicated",
+                              "index_layout": "whole"
+                          })
+        assert args.dkv_config.kv_layout == "replicated"
+        assert args.dkv_config.index_layout == "whole"
+
+    @pytest.mark.parametrize("config", [{
+        "attention_mode": "dp"
+    }, {
+        "kv_layout": "layer_split"
+    }, {
+        "index_layout": "half"
+    }, {
+        "group_size": 8
+    }])
+    def test_unimplemented_values_are_refused(self, config):
+        with pytest.raises(ValidationError):
+            DkvConfig(**config)
+
+    @pytest.mark.parametrize("kwargs, match", [
+        (dict(context_parallel_size=1, cp_config=None,
+              gpus_per_node=1), "Ulysses context parallelism"),
+        (dict(cp_config={"cp_type": "HELIX"}), "Ulysses context parallelism"),
+        (dict(enable_attention_dp=True), r"(?i)attention[_ ]dp"),
+        (dict(kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=False)),
+         "KV cache manager V2"),
+    ],
+                             ids=["no-cp", "helix", "attention-dp", "v1"])
+    def test_launches_without_a_ulysses_group_are_refused(
+            self, tmp_path, kwargs, match):
+        with pytest.raises(ValueError, match=match):
+            self._args(tmp_path, dkv_config={}, **kwargs)

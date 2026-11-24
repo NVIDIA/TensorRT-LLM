@@ -22,7 +22,7 @@ This module owns three concerns and delegates the rest:
   * Layer index registration (SSOT: ``add_layer`` → ``_registered_layers``)
     plus runtime entry points that forward to ``DWDPWeightManager``
     (``prefetch_first_layers``, ``wait_and_bind``,
-    ``record_compute_and_prefetch_next``)
+    ``record_compute_and_prefetch_next``, ``invalidate_prefetch``)
 
 The heavy lifting — MNNVL handle allocation, composite VA layout,
 double-buffer scheduling — lives in ``tensorrt_llm._torch.modules.dwdp``
@@ -42,6 +42,7 @@ from tensorrt_llm._torch.distributed import MPIDist
 from tensorrt_llm._torch.modules.dwdp import (
     DWDPWeightManager,
     StoreDwdpGroup,
+    cross_step_prefetch_enabled,
     dwdp_global_rank,
     setup_dwdp,
     store_rendezvous_enabled,
@@ -77,7 +78,16 @@ class DwdpManager:
     After ``setup()`` returns, the runtime methods (``prefetch_first_layers``,
     ``wait_and_bind``, ``record_compute_and_prefetch_next``) forward to the
     ``DWDPWeightManager`` instance produced by ``setup_dwdp``.
+
+    With ``TRTLLM_DWDP_CROSS_STEP_PREFETCH=1`` they drive the weight manager's
+    cyclic schedule instead: the last MoE layers of a forward pass prefetch the
+    first layers of the next pass, so the gather keeps running across the gap
+    between executor steps.  A CUDA graph capture of a DWDP MoE layer switches
+    the process back to the per-step prefetch.
     """
+
+    #: Whether the cyclic cross-step prefetch schedule is active (set by ``setup``).
+    _cross_step_prefetch: bool = False
 
     def __init__(
         self,
@@ -263,6 +273,7 @@ class DwdpManager:
         """
         layer_indices = sorted(self._registered_layers)
         device_id = torch.cuda.current_device()
+        cross_step_prefetch = cross_step_prefetch_enabled()
         self._weight_manager = setup_dwdp(
             model=model,
             mapping=self._mapping,
@@ -272,6 +283,12 @@ class DwdpManager:
             num_experts_per_worker=self.num_experts_per_worker,
             num_prefetch_experts=self.num_prefetch_experts,
             contention_opt=self.config.contention_opt,
+            cross_step_prefetch=cross_step_prefetch,
+        )
+        self._cross_step_prefetch = bool(
+            cross_step_prefetch
+            and self._weight_manager is not None
+            and self._weight_manager.cross_step_prefetch
         )
         self._model_ref = weakref.ref(model)
         if self._store_rendezvous:
@@ -284,9 +301,16 @@ class DwdpManager:
     # ------------------------------------------------------------------
 
     def prefetch_first_layers(self) -> None:
-        """Warm-up: kick off prefetch for the first MoE layers (double-buffer depth)."""
+        """Warm-up: kick off prefetch for the first MoE layers (double-buffer depth).
+
+        Under the cross-step schedule this enqueues nothing when the previous
+        forward pass already prefetched them.
+        """
         if self._weight_manager is None:
             raise RuntimeError("DwdpManager.setup() has not been called yet")
+        if self._cross_step_prefetch:
+            self._weight_manager.start_forward()
+            return
         first = self._weight_manager.first_moe_layer()
         self._weight_manager.prefetch_layer(first)
         second = self._weight_manager.next_moe_layer(first)
@@ -297,7 +321,12 @@ class DwdpManager:
         """Wait for prefetch and bind full-tensor views onto backend weights."""
         if self._weight_manager is None:
             raise RuntimeError("DwdpManager.setup() has not been called yet")
-        self._weight_manager.wait_and_bind(backend_module, layer_idx)
+        if self._cross_step_prefetch and torch.cuda.is_current_stream_capturing():
+            self._leave_cross_step_prefetch()
+        if self._cross_step_prefetch:
+            self._weight_manager.wait_and_bind_scheduled(backend_module, layer_idx)
+        else:
+            self._weight_manager.wait_and_bind(backend_module, layer_idx)
 
     def record_compute_and_prefetch_next(self, layer_idx: int) -> None:
         """Record compute and maintain the two-layer prefetch window.
@@ -307,12 +336,46 @@ class DwdpManager:
         buffer slot and prefetch the layer two positions ahead. This avoids
         duplicate prefetch of the second layer and prevents reuse of a slot
         before the current kernel has finished reading it.
+
+        Under the cross-step schedule the weight manager's ``finish_layer``
+        records the consumption and issues whatever the released slot unblocks,
+        including the first layers of the next forward pass.
         """
         if self._weight_manager is None:
             raise RuntimeError("DwdpManager.setup() has not been called yet")
+        if self._cross_step_prefetch:
+            self._weight_manager.finish_layer(layer_idx)
+            return
         self._weight_manager.record_compute(layer_idx)
         next_idx = self._weight_manager.next_moe_layer(layer_idx)
         if next_idx is not None:
             next_next_idx = self._weight_manager.next_moe_layer(next_idx)
             if next_next_idx is not None:
                 self._weight_manager.prefetch_layer(next_next_idx)
+
+    def invalidate_prefetch(self) -> None:
+        """Drop prefetches issued ahead of the next forward pass.
+
+        Call after the expert weights may have changed (e.g. a weight update);
+        the next pass gathers its first layers again.  No-op without the
+        cross-step schedule.
+        """
+        if self._cross_step_prefetch and self._weight_manager is not None:
+            self._weight_manager.invalidate_prefetch()
+
+    def _leave_cross_step_prefetch(self) -> None:
+        """Switch to the per-step prefetch for the rest of the process.
+
+        A captured graph replays its prefetches without this manager seeing
+        them, so the cross-step schedule could not tell what the slots hold.
+        """
+        if self._weight_manager.num_slots != 2:
+            raise RuntimeError(
+                "CUDA graph capture of a DWDP MoE layer needs the double-buffered "
+                "per-step prefetch; unset TRTLLM_DWDP_PREFETCH_SLOTS"
+            )
+        logger.warning(
+            "[DwdpManager] CUDA graph capture of a DWDP MoE layer: the cross-step "
+            "prefetch is turned off for this process"
+        )
+        self._cross_step_prefetch = False

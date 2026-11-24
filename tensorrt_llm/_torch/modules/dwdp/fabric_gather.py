@@ -103,6 +103,31 @@ _DENSE_GEMM_SCHEDULER_ENV = "TRTLLM_CUTEDSL_DENSE_GEMM_SCHEDULER"
 _ROUTING_NO_COOP_ENV = "TLLM_ROUTING_DISABLE_COOP_LAUNCH"
 
 
+def available() -> bool:
+    """True if the gather transport is requested and its op is registered."""
+    return is_enabled() and gather_op() is not None
+
+
+def resident_sms(gather: Optional[bool] = None) -> int:
+    """SMs the persistent compute grids leave to the gather; read once, by the DWDP managers.
+
+    ``TRTLLM_CUTEDSL_SM_RESERVE`` pins the count.  Otherwise it is the gather's block count where
+    the gather is the transport and one block of ``THREADS >= 512`` fills an SM; smaller blocks
+    share SMs with the compute kernels and reserve none.
+
+    Args:
+        gather: Whether the gather is the transport; None means :func:`available`, the expert
+            DWDP choice (``DwdpManager``).  Standalone dense DWDP passes its own choice.
+    """
+    pinned = _int_env(_SM_RESERVE_ENV, -1)
+    if pinned >= 0:
+        return pinned
+    uses_gather = available() if gather is None else gather
+    if not uses_gather or THREADS < 512:
+        return 0
+    return total_blocks()
+
+
 def apply_compute_side_defaults() -> None:
     """Tune the CuTeDSL persistent kernels for a resident gather; call before any kernel compiles.
 

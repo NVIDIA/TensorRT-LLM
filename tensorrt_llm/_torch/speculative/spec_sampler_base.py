@@ -47,6 +47,8 @@ from ..pyexecutor.sampler.penalties import has_occurrence_penalty
 from ..pyexecutor.sampler.sampler_common import _request_get_sampling_params, top_p_decay_active
 from ..pyexecutor.sampler.sampler_features import handle_stop_criteria
 from ..pyexecutor.scheduler import ScheduledRequests
+from ..pyexecutor.step_upload_kernels import scatter_spec_store, spec_sampler_fused_scatter_enabled
+from .interface import CONTEXT_NO_DRAFT_TOKEN
 
 # Rejection messages for the sampling features the one-model speculative path
 # cannot honor. They are module constants because two places raise them: the
@@ -315,6 +317,12 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
                 torch.zeros((seq_slots,), dtype=torch.int32, device="cuda"),
                 pin_memory=prefer_pinned(),
             )
+        # TRTLLM_SPEC_SAMPLER_FUSED_SCATTER=1, for steps the slot scatter above does
+        # not take: one kernel for the four store scatters, and the device slot
+        # tensor kept while the batch's slots do not change.
+        self._fused_scatter = spec_sampler_fused_scatter_enabled()
+        self._fused_scatter_slots: Optional[list[int]] = None
+        self._fused_scatter_slots_device: Optional[torch.Tensor] = None
         # Recorded after the last step's host copies of the stores, which read
         # them on the D2H side stream.
         self._store_copies_done: Optional[torch.cuda.Event] = None
@@ -334,7 +342,11 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         runtime_draft_len: Optional[int],
     ) -> None:
         """Common handling for both context and generation requests."""
-        request.py_draft_tokens = next_draft_tokens[request.py_seq_slot][:runtime_draft_len]
+        drafts = next_draft_tokens[request.py_seq_slot][:runtime_draft_len]
+        # A context request the worker drafted nothing for gets no drafts.
+        if drafts and drafts[0] == CONTEXT_NO_DRAFT_TOKEN:
+            drafts = []
+        request.py_draft_tokens = drafts
         request.py_decoding_iter += 1
 
     def update_requests(
@@ -415,8 +427,15 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
     ) -> None:
         """Move rows ``num_skip`` onward of the forward's outputs into the stores at ``slots``."""
         num_sampling_requests = len(slots)
-        slots_device = torch.as_tensor(slots, dtype=torch.long)
-        slots_device = slots_device.to(device="cuda", non_blocking=True)
+        if self._fused_scatter and slots == self._fused_scatter_slots:
+            # The upload of these slots from an earlier step; nothing writes it since.
+            slots_device = self._fused_scatter_slots_device
+        else:
+            slots_device = torch.as_tensor(slots, dtype=torch.long)
+            slots_device = slots_device.to(device="cuda", non_blocking=True)
+            if self._fused_scatter:
+                self._fused_scatter_slots = list(slots)
+                self._fused_scatter_slots_device = slots_device
 
         o_new_tokens = outputs["new_tokens"][num_skip : num_skip + num_sampling_requests]
         o_new_tokens_lens = outputs["new_tokens_lens"][num_skip : num_skip + num_sampling_requests]
@@ -450,6 +469,18 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         elif o_next_new_tokens.shape[1] > next_new_tokens_width:
             o_next_new_tokens = o_next_new_tokens[:, :next_new_tokens_width]
 
+        if self._fused_scatter and scatter_spec_store(
+            slots_device,
+            self.store.new_tokens.squeeze(-1),
+            self.store.next_new_tokens.squeeze(-1),
+            self.store.new_tokens_lens,
+            self.store.next_draft_tokens,
+            o_new_tokens,
+            o_next_new_tokens,
+            o_new_tokens_lens,
+            o_next_draft_tokens,
+        ):
+            return
         # Use index_copy_ for efficient copying (slots are unique)
         self.store.new_tokens.squeeze(-1).T.index_copy_(0, slots_device, o_new_tokens)
         self.store.next_new_tokens.squeeze(-1).T.index_copy_(0, slots_device, o_next_new_tokens)

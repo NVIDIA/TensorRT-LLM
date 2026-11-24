@@ -43,6 +43,76 @@ class NvFp4WeightView:
     slot_start: int
 
 
+def presorted_routing(
+    token_selected_experts: torch.Tensor, local_expert_offset: int, local_num_experts: int
+) -> tuple[int, tuple[torch.Tensor, ...]] | None:
+    """``(tile_size, moe_sort outputs)`` a router attached for this rank, or ``None``.
+
+    Routers that also sort (the Kimi-K3 routing tail) attach
+    ``((local_expert_offset, local_num_experts, tile_size), outputs)`` to the
+    top-k ids as ``_k3_presorted``, where ``outputs`` are the six tensors
+    ``moe_sort`` returns for that expert range and tile size.
+
+    Args:
+        token_selected_experts: Top-k expert ids ``[num_tokens, top_k]``.
+        local_expert_offset: First expert of this rank.
+        local_num_experts: Experts of this rank.
+
+    Returns:
+        ``(tile_size, outputs)`` when the attached tables cover this rank's
+        experts, else ``None``.
+    """
+    presorted = getattr(token_selected_experts, "_k3_presorted", None)
+    if presorted is None:
+        return None
+    (offset, num_local, tile_size), outputs = presorted
+    if (offset, num_local) != (local_expert_offset, local_num_experts):
+        return None
+    return tile_size, outputs
+
+
+def sort_routing(
+    backend: MoEImplBase,
+    token_selected_experts: torch.Tensor,
+    token_final_scales: torch.Tensor | None,
+    weight_view: NvFp4WeightView,
+    tile_size: int,
+) -> tuple[torch.Tensor, ...]:
+    """``moe_sort`` outputs of this rank's experts for ``tile_size``.
+
+    Uses the outputs a router attached to ``token_selected_experts`` (see
+    :func:`presorted_routing`) when they match this rank and tile size, else
+    runs ``moe_sort``.
+
+    Args:
+        backend: The leaf; read for ``num_slots``.
+        token_selected_experts: Top-k expert ids ``[num_tokens, top_k]``.
+        token_final_scales: ``[num_tokens, top_k]`` float32 routing weights.
+        weight_view: This rank's experts (``slot_start``, ``expert_size_per_partition``).
+        tile_size: Rows per routing tile.
+
+    Returns:
+        The six ``moe_sort`` outputs: ``(tile_idx_to_expert_idx,
+        tile_idx_to_mn_limit, expanded_idx_to_permuted_idx,
+        permuted_idx_to_expanded_idx, total_num_padded_tokens,
+        num_non_exiting_tiles)``.
+    """
+    esp = weight_view.expert_size_per_partition
+    slot_start = weight_view.slot_start
+    presorted = presorted_routing(token_selected_experts, slot_start, esp)
+    if presorted is not None and presorted[0] == tile_size:
+        return presorted[1]
+    return torch.ops.trtllm.moe_sort(
+        token_selected_experts=token_selected_experts,
+        token_final_scales=token_final_scales,
+        num_experts=backend.num_slots,
+        top_k=token_selected_experts.size(1),
+        local_expert_offset=slot_start,
+        local_num_experts=esp,
+        tile_tokens_dim=tile_size,
+    )
+
+
 def finalize_routing_scales(backend: MoEImplBase, ctx: MoERunContext) -> torch.Tensor:
     """Per-token expert weights for a CuteDSL finalize epilogue.
 

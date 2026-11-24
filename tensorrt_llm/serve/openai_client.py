@@ -78,6 +78,22 @@ from tensorrt_llm.serve.router import Router
 _msgpack_encoder = msgspec.msgpack.Encoder()
 MSGPACK_HEADERS = {"Content-Type": "application/json", "X-TRTLLM-Msgpack": "1"}
 
+# A disaggregated generation leg is retried only for failures that leave it
+# undelivered, and keeps its disagg_request_id on retry. Set this variable to
+# "0" to retry every failed generation leg under a new disagg_request_id.
+GEN_RETRY_UNDELIVERED_ONLY_ENV = "TRTLLM_DISAGG_GEN_RETRY_UNDELIVERED_ONLY"
+
+# Failures that leave a generation leg undelivered: the connection could not be
+# opened, or the server closed a pooled connection without answering. A
+# connection reset counts too, also when aiohttp wraps it in ClientOSError (see
+# the transient-TCP check in _post_with_retry). Any other failure may happen
+# after the generation server accepted the request.
+_GEN_LEG_RETRYABLE_ERRORS = (
+    aiohttp.ClientConnectorError,
+    aiohttp.ServerDisconnectedError,
+    ConnectionResetError,
+)
+
 # A Responses stream opens with these events before the model emits anything.
 _RESPONSES_OPENING_EVENTS = frozenset((b"response.created", b"response.in_progress"))
 
@@ -247,11 +263,29 @@ class OpenAIHttpClient(OpenAIClient):
                 "Disaggregated HTTP retry is DISABLED by "
                 f"TRTLLM_DISAGG_NO_RETRY=1 for role={role.name}"
             )
+        self._gen_retry_undelivered_only = os.getenv(GEN_RETRY_UNDELIVERED_ONLY_ENV, "1") != "0"
+        if not self._gen_retry_undelivered_only and role == ServerRole.GENERATION:
+            logger.warning(
+                "Disaggregated generation requests are retried under a new "
+                f"disagg_request_id ({GEN_RETRY_UNDELIVERED_ONLY_ENV}=0); such a retry "
+                "cannot be paired with the context server's KV cache"
+            )
         self._retry_interval_sec = retry_interval_sec
         self._disagg_id_generator = disagg_id_generator
         self._request_perf_metrics = request_perf_metrics
         self._internal_disagg_auth_key = internal_disagg_auth_key
         self._bounded_replay_on_generation = bounded_replay_on_generation
+
+    def _is_disagg_generation_leg(self, request: UCompletionRequest) -> bool:
+        """Whether ``request`` takes its prompt KV cache from a context server.
+
+        Such a request is paired with the context server's KV-cache send session
+        by ``disaggregated_params.disagg_request_id``.
+        """
+        if self._role != ServerRole.GENERATION:
+            return False
+        dp = getattr(request, "disaggregated_params", None)
+        return dp is not None and dp.request_type == "generation_only"
 
     def _get_request_headers(self, request: UCompletionRequest) -> dict[str, str]:
         headers = build_subagent_affinity_headers(
@@ -439,11 +473,16 @@ class OpenAIHttpClient(OpenAIClient):
         # attempt that reaches self._max_retries.
         _TRANSIENT_TCP_BUDGET = 0 if self._no_retry or is_remote_tail_handoff else 5
         loop_max = max(max_retries, _TRANSIENT_TCP_BUDGET) + 1
+        # A generation leg is retried only while undelivered and keeps its
+        # disagg_request_id: the id names the context server's KV-cache send
+        # session, so a new id could never be paired with that KV cache, and a
+        # leg the generation server answered has already consumed or failed it.
+        is_gen_leg = self._gen_retry_undelivered_only and self._is_disagg_generation_leg(request)
         for attempt in range(loop_max):
             if attempt > 0:
                 await self._router.renew_request(request, req_id=req_id)
             # Regenerate disagg_request_id on retry to avoid ID collision on workers
-            if attempt > 0 and self._disagg_id_generator is not None:
+            if attempt > 0 and self._disagg_id_generator is not None and not is_gen_leg:
                 dp = getattr(request, "disaggregated_params", None)
                 if dp is not None and getattr(dp, "disagg_request_id", None) is not None:
                     dp.disagg_request_id = await self._disagg_id_generator()
@@ -457,6 +496,7 @@ class OpenAIHttpClient(OpenAIClient):
             if self._request_perf_metrics:
                 headers[RETURN_METRICS_HEADER] = "1"
             headers.update(self._get_request_headers(request))
+            response_started = False
             try:
                 lines_yielded = 0
                 start_time = get_steady_clock_now_in_seconds()
@@ -465,6 +505,7 @@ class OpenAIHttpClient(OpenAIClient):
                     data=body,
                     headers=headers,
                 ) as http_response:
+                    response_started = True
                     response_clock = AdjustedSteadyClock()
                     if self._request_perf_metrics:
                         destination_time = get_steady_clock_now_in_seconds()
@@ -549,6 +590,21 @@ class OpenAIHttpClient(OpenAIClient):
                     e,
                     (aiohttp.ServerDisconnectedError, ConnectionResetError),
                 ) or (isinstance(e, aiohttp.ClientOSError) and e.errno == errno.ECONNRESET)
+                # Once the generation server may have accepted a generation leg,
+                # that attempt owns the request's context KV cache: the transfer
+                # either completed into the abandoned attempt or failed and was
+                # released on the context server. A re-post would wait forever
+                # for KV cache that will never be sent, so fail the request.
+                if is_gen_leg and (
+                    response_started
+                    or not (is_transient_tcp or isinstance(e, _GEN_LEG_RETRYABLE_ERRORS))
+                ):
+                    logger.error(
+                        f"Client error to {url}: {e} - not retrying a generation request "
+                        "the generation server may have accepted",
+                        traceback.format_exc(),
+                    )
+                    raise
                 effective_max = max_retries
                 if is_transient_tcp:
                     effective_max = max(max_retries, _TRANSIENT_TCP_BUDGET)

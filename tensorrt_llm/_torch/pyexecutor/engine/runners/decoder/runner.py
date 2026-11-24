@@ -33,11 +33,19 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     KeyType,
 )
 from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
+from tensorrt_llm._torch.pyexecutor.input_commit import (
+    InputCommit,
+    batched_input_commit_enabled,
+    input_commit_step,
+    warmup_input_commit_kernels,
+)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.sampler.beam_search import PendingBeamHistories
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import SampleType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._torch.pyexecutor.ull_shell import adopt as adopt_step_shell
+from tensorrt_llm._torch.pyexecutor.ull_shell import step_prep_enabled
 from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
 from tensorrt_llm._torch.pyexecutor.workspace import EagerWorkspaceReclaimer
 from tensorrt_llm._torch.speculative import SpecMetadata, get_draft_kv_cache_manager
@@ -46,9 +54,10 @@ from tensorrt_llm._torch.utils import (
     get_per_request_prefill_cuda_graph_flag,
     with_model_extra_attrs,
 )
-from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm._utils import nvtx_range, prefer_pinned
 from tensorrt_llm.llmapi.llm_args import BaseSparseAttentionConfig, PrefillCudaGraphBackend
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.logger import logger
+from tensorrt_llm.mapping import CpType, Mapping
 
 from ...lora import LoraParamBuilder, make_cuda_graph_lora_manager
 from ...model_call import ModelCaller
@@ -123,6 +132,18 @@ class PrefillCompiledModel(torch.nn.Module):
             return getattr(super().__getattr__("eager_model"), name)
 
 
+# Why generation-only CUDA-graph steps stayed on the per-copy upload path (each logged once).
+_INPUT_COMMIT_DECLINED: set[str] = set()
+
+
+def _decline_input_commit(reason: str) -> None:
+    """Keep a generation-only graph step on the per-copy path; log each reason once."""
+    if reason not in _INPUT_COMMIT_DECLINED:
+        _INPUT_COMMIT_DECLINED.add(reason)
+        logger.info(f"InputCommit: generation graph step not committed ({reason})")
+    return None
+
+
 class DecoderRunner(ScheduledModelRunner):
     """Run scheduled decoder generation with its own buffers, graphs and metadata."""
 
@@ -132,6 +153,10 @@ class DecoderRunner(ScheduledModelRunner):
     _steady_gen_cache_supported = True
     _eager_workspace_reclaim_supported = True
     _deferred_decode_outputs_supported = True
+    _input_commit_supported = True
+    # The batched input commit (the step shell's step_prep); None keeps the step on the
+    # per-copy upload path, also for runners built without __init__.
+    _input_commit: InputCommit | None = None
 
     def __init__(
         self,
@@ -151,6 +176,8 @@ class DecoderRunner(ScheduledModelRunner):
         mm_item_scheduler: MultimodalItemScheduler | None = None,
     ) -> None:
         self._model = model
+        # The decode-step shell the model asks for (ull_shell.py), before anything reads it.
+        adopt_step_shell(model)
         if config.compile_only_piecewise_graphs:
             assert isinstance(model, DecoderModelForCausalLM), (
                 "compile_only_piecewise_graphs requires DecoderModelForCausalLM"
@@ -202,6 +229,7 @@ class DecoderRunner(ScheduledModelRunner):
         )
         self._dummy_requests = self._make_dummy_requests()
         self._init_decoder_state()
+        self._input_commit = self._make_input_commit()
         self._inputs = self._make_input_preparer(mm_item_scheduler)
         self._graphs = self._make_cuda_graphs()
         self._initialize_moe_workspace_reclaimer()
@@ -228,6 +256,100 @@ class DecoderRunner(ScheduledModelRunner):
     def _make_dummy_requests(self) -> DummyRequestFactory:
         """Build the factory of warmup and capture dummy requests."""
         return DummyRequestFactory(**self._dummy_requests_kwargs())
+
+    def _make_input_commit(self) -> InputCommit | None:
+        """The batched input commit of this runner's decode steps, or None.
+
+        With TRTLLM_BATCHED_INPUT_COMMIT=1 or the step shell's step_prep, a speculative
+        engine with CUDA graphs gets one; ``_input_commit_for_step`` decides per step.
+        Its kernel is compiled here, since warmup and capture forwards do not use it.
+        """
+        if not (
+            self._input_commit_supported
+            and (batched_input_commit_enabled() or step_prep_enabled())
+            and self._config.is_spec_decode
+            and self._config.cuda_graph_config is not None
+            and prefer_pinned()
+        ):
+            return None
+        commit = InputCommit()
+        warmup_input_commit_kernels(commit)
+        return commit
+
+    def _input_commit_for_step(
+        self,
+        execution_requests: ScheduledRequests,
+        attn_metadata: AttentionMetadata,
+        *,
+        can_run_graph: bool,
+        promoted_context_request_ids: frozenset[int],
+        enable_spec_decode: bool,
+        is_dummy: bool,
+        ced_enabled: bool,
+        spec_tree_manager: Any,
+    ) -> InputCommit | None:
+        """The batched input commit for this step, or None to copy input by input.
+
+        Limited to the input preparation whose device-side reads of the staged buffers
+        were audited: a CUDA-graph replay of a generation-only batch without padding
+        dummies on a one-model, linear speculative engine using TRT-LLM attention
+        without FlashMLA, and without warmup, beam search, MRoPE, LoRA, guided decoding,
+        suffix automaton, attention DP, context parallelism other than helix, or a
+        private decoder cache. FP4 MLA KV caches (``fp4_mla_state``) also need
+        the step shell's step_prep: on such a step their metadata preparation is host-only
+        (``configure_fp4_mla_device_page_table``) and the page table and the append
+        metadata are built inside the graph, after the commit kernel. A ``TrtllmAttentionMetadata``
+        subclass takes part only under step_prep and when the subclass itself declares
+        ``stages_input_commit = True`` (its preparation stages its uploads and commits before
+        any device read of a staged buffer; a target's DSA metadata subclass).
+        """
+        commit = self._input_commit
+        if commit is None or not can_run_graph or is_dummy or ced_enabled:
+            return None
+        if (
+            execution_requests.num_context_requests > 0
+            or promoted_context_request_ids
+            or execution_requests.num_generation_requests == 0
+        ):
+            return None
+        config = self._config
+        spec_config = config.spec_config
+        if (
+            not enable_spec_decode
+            or spec_config is None
+            or not spec_config.spec_dec_mode.use_one_engine()
+            or spec_tree_manager is not None
+            or getattr(spec_config, "sa_config", None) is not None
+        ):
+            return _decline_input_commit("not a linear one-model speculative step")
+        if (
+            config.use_mrope
+            or self._use_beam_search
+            or config.enable_attention_dp
+            or self._lora.model_config is not None
+            or self._lora.cuda_graph_manager is not None
+            or self._inputs.guided_decoder is not None
+        ):
+            return _decline_input_commit(
+                "MRoPE, beam search, attention DP, LoRA or guided decoding"
+            )
+        cp_type = self._mapping.cp_config.get("cp_type") if self._mapping is not None else None
+        if cp_type is not None and cp_type != CpType.HELIX:
+            return _decline_input_commit(f"context parallelism {cp_type}")
+        metadata_type = type(attn_metadata)
+        if metadata_type is not TrtllmAttentionMetadata and not (
+            step_prep_enabled()
+            and issubclass(metadata_type, TrtllmAttentionMetadata)
+            and vars(metadata_type).get("stages_input_commit", False)
+        ):
+            return _decline_input_commit(f"attention metadata {metadata_type.__name__}")
+        if attn_metadata.enable_flash_mla or (
+            getattr(attn_metadata, "fp4_mla_state", None) is not None and not step_prep_enabled()
+        ):
+            return _decline_input_commit("FlashMLA or FP4 MLA KV without step_prep")
+        if any(request.is_dummy for request in execution_requests.generation_requests):
+            return _decline_input_commit("padding dummy requests")
+        return commit
 
     def _make_input_preparer(
         self, mm_item_scheduler: MultimodalItemScheduler | None
@@ -626,12 +748,33 @@ class DecoderRunner(ScheduledModelRunner):
                     execution_requests.generation_requests,
                 )
 
-            with self._cuda_graph_metadata_prepare_scope(
-                attn_metadata,
-                key,
-                execution_requests,
-                execution_promoted_context_ids,
-                enable_spec_decode=enable_spec_decode,
+            # TRTLLM_BATCHED_INPUT_COMMIT / TRTLLM_K3_ULL_STEP_PREP: the preparation stages
+            # its uploads, and one kernel writes them when the block ends (input_commit.py).
+            input_commit = (
+                self._input_commit_for_step(
+                    execution_requests,
+                    attn_metadata,
+                    can_run_graph=can_run_graph,
+                    promoted_context_request_ids=execution_promoted_context_ids,
+                    enable_spec_decode=enable_spec_decode,
+                    is_dummy=is_dummy,
+                    ced_enabled=ced_enabled,
+                    spec_tree_manager=spec_tree_manager if enable_spec_decode else None,
+                )
+                if self._input_commit is not None
+                else None
+            )
+            with (
+                self._cuda_graph_metadata_prepare_scope(
+                    attn_metadata,
+                    key,
+                    execution_requests,
+                    execution_promoted_context_ids,
+                    enable_spec_decode=enable_spec_decode,
+                ),
+                input_commit_step(input_commit)
+                if input_commit is not None
+                else contextlib.nullcontext(),
             ):
                 prepared = self._inputs.prepare_inputs(
                     execution_requests,
@@ -649,8 +792,26 @@ class DecoderRunner(ScheduledModelRunner):
                     is_dummy=is_dummy,
                     gather_context_logits=gather_context_logits,
                 )
+                spec_worker, draft_model = (
+                    self._speculative_worker() if spec_metadata is not None else (None, None)
+                )
+                # A worker whose draft-cache preparation stages its uploads joins the step's
+                # input commit; the others run after it, as the inputs' consumers.
+                draft_cache_staged = (
+                    spec_worker is not None
+                    and input_commit is not None
+                    and getattr(spec_worker, "stages_managed_draft_cache", False)
+                )
+                if draft_cache_staged:
+                    spec_worker.prepare_managed_draft_cache(
+                        draft_model, spec_metadata, attn_metadata, resource_manager
+                    )
             inputs = prepared.kwargs
             runtime_draft_len = prepared.runtime_draft_len
+            if spec_worker is not None and not draft_cache_staged:
+                spec_worker.prepare_managed_draft_cache(
+                    draft_model, spec_metadata, attn_metadata, resource_manager
+                )
             if execution_promoted_context_ids:
                 self._inputs.record_promoted_iter_states(scheduled_requests)
             self._inputs.record_input_copy()
@@ -698,6 +859,15 @@ class DecoderRunner(ScheduledModelRunner):
             if captures_model_body:
                 return outputs
 
+            draft_history_update = None
+            graph_runner = self._graphs.cuda_graph_runner
+            if (
+                spec_worker is not None
+                and not is_dummy
+                and not (graph_runner is not None and graph_runner.is_warmup_only)
+            ):
+                draft_history_update = spec_worker.snapshot_managed_draft_history()
+
             if self.forward_pass_callable is not None:
                 self.forward_pass_callable()
 
@@ -706,7 +876,27 @@ class DecoderRunner(ScheduledModelRunner):
             if not isinstance(outputs, dict):
                 return outputs
             outputs = self._restore_attention_dp_semantic_outputs(semantic_requests, outputs)
-            return {**outputs, "runtime_draft_len": runtime_draft_len}
+            outputs = {**outputs, "runtime_draft_len": runtime_draft_len}
+            if draft_history_update is not None:
+                # Published by the executor once this iteration's sampling is done.
+                outputs["draft_history_update"] = draft_history_update
+            return outputs
+
+    def _speculative_worker(self) -> tuple[Any, torch.nn.Module | None]:
+        """The one-engine speculative worker and its draft model, or ``(None, None)``.
+
+        A multimodal wrapper holds the speculative decoder as ``language_model``
+        or, for Kimi, ``llm``.
+        """
+        for model in (
+            self._model,
+            getattr(self._model, "language_model", None),
+            getattr(self._model, "llm", None),
+        ):
+            spec_worker = getattr(model, "spec_worker", None)
+            if spec_worker is not None:
+                return spec_worker, getattr(model, "draft_model", None)
+        return None, None
 
     @contextmanager
     def _maybe_bypass_torch_compile(self, bypass: bool = False) -> Iterator[None]:

@@ -54,6 +54,11 @@ class DSAParams(SparseParams):
     index_n_heads: Optional[int] = None
     index_head_dim: Optional[int] = None
     index_topk: Optional[int] = None
+    # Rotated channels of each indexer head. None means the MLA's
+    # qk_rope_head_dim; 0 means a position-free (NoPE) indexer.
+    index_rope_dim: Optional[int] = None
+    # Epsilon of the indexer key LayerNorm. None means DeepSeek-V3.2's 1e-6.
+    index_k_norm_eps: Optional[float] = None
     indexer_max_chunk_size: Optional[int] = None
     skip_indexer_for_short_seqs: bool = True
     use_cute_dsl_topk: bool = False

@@ -1,0 +1,47 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Kimi K3.1 Pro NVFP4 on SM107, tep8: decode step of the first N layers through the engine backend.
+layer_indices: [0, 1, 2, 3]  # >= 4: layer 3 is the first MLA layer, which DSA needs
+run_type: GEN
+backend: engine
+load_format: AUTO
+use_cuda_graph: true
+batch_size: [1, 2, 4, 8]  # each one is captured as a CUDA graph at startup
+seq_len_q: 8  # 1 + speculative_config.max_draft_len
+seq_len_kv_cache: [1024, 8192]
+max_seq_len: 8200
+# max_num_tokens is left to its default, max(batch_size) * max(seq_len_q): the executor's
+# autotuner tunes every bucket up to it, and a serving-sized 8192 costs minutes.
+kv_cache_dtype: fp8
+mamba_ssm_cache_dtype: float32
+llm_args:
+  tensor_parallel_size: 8
+  moe_expert_parallel_size: 8
+  enable_attention_dp: false
+  modeling_v2: require
+  trust_remote_code: true
+  # The tep8 target takes a text-only deployment with FP8 drafter history only (with
+  # speculative_config.context_kv_dtype: fp8 below); otherwise routing tries the sm_10x default
+  # target, which does not run CUTEDSL_FC12, and the run stops with NoTarget.
+  disable_mm_encoder: true
+  disable_overlap_scheduler: true
+  cuda_graph_config:
+    enable_padding: true
+  kv_cache_config:
+    use_kv_cache_manager_v2: true
+    tokens_per_block: 64
+    free_gpu_memory_fraction: 0.5
+  moe_config:
+    backend: CUTEDSL_FC12
+    use_low_precision_moe_combine: true
+  sparse_attention_config:
+    algorithm: dsa
+    indexer_k_dtype: fp8
+    enable_heuristic_topk: true
+    use_self_sampling_topk: true
+    gvr_deterministic_topk: true
+  speculative_config:
+    decoding_type: DFlash
+    max_draft_len: 7
+    context_kv_dtype: fp8
+    speculative_model: /path/to/kimi-k3.1-dflash2-preview  # the DFlash2 drafter checkpoint

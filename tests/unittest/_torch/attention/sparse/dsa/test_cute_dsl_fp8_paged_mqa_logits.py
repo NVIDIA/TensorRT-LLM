@@ -26,6 +26,13 @@ skip_not_sm100 = pytest.mark.skipif(
     reason=f"CuTe DSL FP8 Paged MQA Logits only supports SM 100/103, got SM {get_sm_version()}",
 )
 
+# The indexer takes the CuTe DSL logits path on SM107 too (is_sm_100f); the evict-first test
+# added with the K3.1 work runs there as well.
+skip_not_sm100_sm107 = pytest.mark.skipif(
+    get_sm_version() not in (100, 103, 107),
+    reason=f"CuTe DSL FP8 Paged MQA Logits: SM 100/103/107 only, got SM {get_sm_version()}",
+)
+
 
 def _ceil_to_ue8m0(x: torch.Tensor):
     return torch.pow(2.0, torch.ceil(torch.log2(x.abs())))
@@ -408,6 +415,36 @@ def test_cute_dsl_fp8_paged_mqa_logits_kernel_split(
     dsl = dsl_logits.float().masked_fill(~mask, 0)
     ref = ref_logits.float().masked_fill(~mask, 0)
     torch.testing.assert_close(dsl, ref, atol=5e-5, rtol=1e-5)
+
+
+@skip_not_sm100_sm107
+@pytest.mark.parametrize(
+    "num_heads,next_n", [(32, 7), (32, 1), (64, 2)], ids=["h32_n7", "h32_n1", "h64_n2"]
+)
+@pytest.mark.parametrize("batch_size", [1, 16])
+def test_cute_dsl_fp8_paged_mqa_logits_kv_evict_first_bitwise(num_heads, next_n, batch_size):
+    """The L2 evict-first hint on the K-cache loads only changes cache retention: the logits are bitwise identical."""
+    from tensorrt_llm.deep_gemm import get_paged_mqa_logits_metadata
+
+    head_dim, block_kv, avg_ctx = 128, 64, 20000
+    max_model_len = avg_ctx * 2
+    data = _generate_test_data(
+        batch_size, next_n, num_heads, head_dim, block_kv, avg_ctx, max_model_len, fix_length=False
+    )
+    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+    ctx = data["context_lens"]
+    sched = get_paged_mqa_logits_metadata(ctx.view(-1, 1), 64, num_sms)
+    args = (data["q_fp8"], data["kv_fused"], data["weights"], ctx, data["block_table"], sched)
+    plain = torch.ops.trtllm.cute_dsl_fp8_paged_mqa_logits(*args, max_model_len).clone()
+    hinted = torch.ops.trtllm.cute_dsl_fp8_paged_mqa_logits(
+        *args, max_model_len, kv_evict_first=True
+    )
+    row_ctx = ctx[torch.arange(batch_size * next_n, device="cuda") // next_n]
+    valid = torch.arange(max_model_len, device="cuda").unsqueeze(0) < row_ctx.unsqueeze(1)
+    assert torch.equal(
+        plain.masked_fill(~valid, 0).view(torch.int32),
+        hinted.masked_fill(~valid, 0).view(torch.int32),
+    )
 
 
 @skip_not_sm100

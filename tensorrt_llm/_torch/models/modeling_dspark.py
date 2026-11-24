@@ -2252,7 +2252,7 @@ class K3DsparkMLA(nn.Module):
     which is also why the drafter's latent cache is unsharded.
     """
 
-    def __init__(self, model_config, layer_idx: int):
+    def __init__(self, model_config, layer_idx: int, mapping_with_cp: Optional[Mapping] = None):
         super().__init__()
         config = model_config.pretrained_config
         self.layer_idx = layer_idx
@@ -2278,16 +2278,32 @@ class K3DsparkMLA(nn.Module):
                 f"The MLA DSpark drafter does not support context parallelism "
                 f"(cp_size={mapping.cp_size})."
             )
+        # Helix (mapping_with_cp): the latent cache is split by pages over the
+        # CP ranks, so every rank needs every head's query (q_b / kv_b
+        # replicated over the CP group); o_proj stays row-parallel over the
+        # flattened tp x cp group (``mapping``, already repurposed).
+        self.helix_mapping = (
+            mapping_with_cp
+            if mapping_with_cp is not None and mapping_with_cp.has_cp_helix()
+            else None
+        )
+        o_mapping = mapping
+        if self.helix_mapping is not None:
+            mapping = self.helix_mapping
         tp_size = mapping.tp_size
         dp_size = 1
         if mapping.enable_attention_dp:
             dp_size = tp_size
             tp_size = 1
+        elif self.helix_mapping is not None:
+            # CP ranks hold identical head projections: fold them like DP.
+            dp_size = mapping.cp_size
         if self.num_heads % tp_size != 0:
             raise ValueError(
                 f"DSpark MLA drafter has {self.num_heads} heads, not divisible by tp_size {tp_size}."
             )
         self.num_heads_tp = self.num_heads // tp_size
+        self.num_heads_tp_cp = self.num_heads_tp // mapping.cp_size
         attn_mapping = Mapping(
             world_size=mapping.pp_size * dp_size * tp_size,
             tp_size=tp_size,
@@ -2298,7 +2314,7 @@ class K3DsparkMLA(nn.Module):
         )
         self.mapping = attn_mapping
         # Row-parallel o_proj reduces only when the heads are actually split.
-        reduce_output = not mapping.enable_attention_dp and mapping.tp_size > 1
+        reduce_output = not o_mapping.enable_attention_dp and o_mapping.tp_size > 1
 
         skip_init = model_config.skip_create_weights_in_init
         self.q_a_proj = Linear(
@@ -2346,7 +2362,7 @@ class K3DsparkMLA(nn.Module):
             self.hidden_size,
             bias=False,
             dtype=dtype,
-            mapping=attn_mapping,
+            mapping=attn_mapping if self.helix_mapping is None else o_mapping,
             tensor_parallel_mode=TensorParallelMode.ROW,
             reduce_output=reduce_output,
             skip_create_weights_in_init=skip_init,
@@ -2363,11 +2379,11 @@ class K3DsparkMLA(nn.Module):
 class K3DsparkDecoderLayer(DecoderLayer):
     """One drafter layer: MLA projections + dense gated MLP + the two norms."""
 
-    def __init__(self, model_config, layer_idx: int):
+    def __init__(self, model_config, layer_idx: int, mapping_with_cp: Optional[Mapping] = None):
         super().__init__()
         config = model_config.pretrained_config
         self.layer_idx = layer_idx
-        self.self_attn = K3DsparkMLA(model_config, layer_idx)
+        self.self_attn = K3DsparkMLA(model_config, layer_idx, mapping_with_cp)
         self.mlp = GatedMLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
@@ -2392,7 +2408,7 @@ class K3DsparkDecoderLayer(DecoderLayer):
 
 
 class K3DsparkModel(DecoderModel):
-    def __init__(self, model_config):
+    def __init__(self, model_config, mapping_with_cp: Optional[Mapping] = None):
         super().__init__(model_config)
         config = model_config.pretrained_config
         # The drafter ships its own trained embedding rather than sharing the
@@ -2408,7 +2424,7 @@ class K3DsparkModel(DecoderModel):
         )
         self.layers = nn.ModuleList(
             [
-                K3DsparkDecoderLayer(model_config, layer_idx)
+                K3DsparkDecoderLayer(model_config, layer_idx, mapping_with_cp)
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
@@ -2434,7 +2450,19 @@ class K3DsparkForCausalLM(SpecDecOneEngineForCausalLM[K3DsparkModel, PretrainedC
     """
 
     def __init__(self, model_config):
-        super().__init__(K3DsparkModel(model_config), model_config)
+        # Helix: only attention sees CP; build everything else on the
+        # repurposed (CP folded into TP) mapping, then restore it.
+        mapping_with_cp = None
+        if model_config.mapping.has_cp_helix():
+            mapping_with_cp = copy.deepcopy(model_config.mapping)
+            frozen, model_config._frozen = model_config._frozen, False
+            model_config.mapping = mapping_with_cp.repurpose_helix_cp_to_tp()
+            model_config._frozen = frozen
+        super().__init__(K3DsparkModel(model_config, mapping_with_cp), model_config)
+        if mapping_with_cp is not None:
+            frozen, model_config._frozen = model_config._frozen, False
+            model_config.mapping = mapping_with_cp
+            model_config._frozen = frozen
 
 
 # ----------------------------------------------------------------------------

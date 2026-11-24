@@ -206,17 +206,20 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
         slotGroups.push_back(std::move(var));
     }
 
-    // Distinct sparsity and reuse policies need separate GPU pools and eviction queues.
+    // Distinct ownership domains, sparsity and reuse policies need separate GPU pools and
+    // eviction queues. The cache domain leads the key, so standalone draft pool groups precede
+    // the target's in the storage layout.
     struct PoolGroupKey
     {
+        CacheDomain cacheDomain = CacheDomain::kTarget;
         AttentionReusePolicy reusePolicy = AttentionReusePolicy::REQUIRED;
         std::vector<size_t> slotSizes;
         bool isSparse = false;
 
         bool operator<(PoolGroupKey const& other) const
         {
-            return std::tie(reusePolicy, slotSizes, isSparse)
-                < std::tie(other.reusePolicy, other.slotSizes, other.isSparse);
+            return std::tie(cacheDomain, reusePolicy, slotSizes, isSparse)
+                < std::tie(other.cacheDomain, other.reusePolicy, other.slotSizes, other.isSparse);
         }
     };
 
@@ -227,7 +230,9 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
         auto const* attn = std::get_if<AttnLifeCycle>(&registry.getLifeCycle(sg.lifeCycleId));
         bool const isSparse = attn != nullptr && attn->isSparse;
         auto const policy = attn ? attn->reusePolicy : AttentionReusePolicy::REQUIRED;
-        poolGroups[{.reusePolicy = policy, .slotSizes = sizes.raw(), .isSparse = isSparse}].push_back(std::move(sg));
+        auto const domain = attn ? attn->cacheDomain : CacheDomain::kTarget;
+        poolGroups[{.cacheDomain = domain, .reusePolicy = policy, .slotSizes = sizes.raw(), .isSparse = isSparse}]
+            .push_back(std::move(sg));
     }
 
     StorageConfig out;

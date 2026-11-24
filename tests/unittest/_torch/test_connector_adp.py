@@ -1215,7 +1215,7 @@ def test_idle_fleet_polls_saves_without_new_traffic(outcome: str) -> None:
         executor.waiting_queue.__len__.return_value = 0
         executor.request_broadcaster = MagicMock()
         executor.request_broadcaster.broadcast.return_value = ([], {})
-        executor._pop_from_waiting_queue = MagicMock(return_value=[])
+        executor._pop_from_waiting_queue = MagicMock(return_value=([], {}))
         executor.executor_request_queue.get_from_request_queue = MagicMock(return_value=[])
         executor._enable_non_overlap_adp_forward_intent = True
         executor.disable_overlap_scheduler = False
@@ -1364,7 +1364,7 @@ def test_control_drain_keeps_owner_collectives_aligned(loading_rank: int) -> Non
         executor.waiting_queue = MagicMock()
         executor.waiting_queue.__len__.return_value = 0
         executor.enable_iter_perf_stats = False
-        executor._pop_from_waiting_queue = MagicMock(return_value=[])
+        executor._pop_from_waiting_queue = MagicMock(return_value=([], {}))
         executor._enable_non_overlap_adp_forward_intent = True
         executor.disable_overlap_scheduler = False
         executor.previous_batch = None

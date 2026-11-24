@@ -28,6 +28,12 @@ from .page import (
     PoolView,
 )
 
+
+def is_standalone_draft_group(layer_group: object) -> bool:
+    """Whether *layer_group* holds a unified standalone drafter's KV (``cp_as_tp``)."""
+    return isinstance(layer_group, AttentionLayerGroup) and layer_group.cp_as_tp is True
+
+
 # -------------------------------------------------------------------------
 # PhysicalPool helpers
 # -------------------------------------------------------------------------

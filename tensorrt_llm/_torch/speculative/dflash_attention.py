@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Callable, Optional
 
+import numpy as np
 import torch
 
 from tensorrt_llm._torch.cute_dsl_utils import install_cutlass_dsl_compatibility
@@ -187,3 +188,85 @@ def validate_dflash_trtllm_gen_runtime(
         raise RuntimeError(
             f"DFlash TRTLLM context attention does not support head dimension {head_dim}."
         )
+
+
+# FP8 E4M3 storage of an MLA drafter's context latent at a unit per-tensor scale;
+# values saturate at the largest finite value instead of overflowing to NaN.
+DRAFT_FP8_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
+
+
+def to_draft_fp8(x: torch.Tensor) -> torch.Tensor:
+    """``x`` as saturated FP8 E4M3 at the drafter's unit per-tensor scale."""
+    return x.clamp(-DRAFT_FP8_MAX, DRAFT_FP8_MAX).to(torch.float8_e4m3fn)
+
+
+@dataclass(frozen=True)
+class HelixDraftShard:
+    """One rank's share of a drafter's paged context KV under helix, or under a DKV group
+    that splits the draft pages (``KVCacheManagerV2.draft_page_split``).
+
+    Global page ``g`` of a request belongs to CP rank ``g % cp_size``, which
+    stores its pages back to back: local page ``g // cp_size``. Every helper
+    maps global token positions or lengths into that rank-local layout.
+    """
+
+    cp_size: int
+    cp_rank: int
+    page_size: int
+
+    def local_slots(self, positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Rank-local slot of each global position, and whether this rank owns it.
+
+        An unowned position maps to the slot this rank keeps for the token one
+        or more pages away, never one of the ``page_size`` tokens around it.
+        """
+        page = torch.div(positions, self.page_size, rounding_mode="floor")
+        slots = torch.div(page, self.cp_size, rounding_mode="floor") * self.page_size
+        return slots + positions % self.page_size, page % self.cp_size == self.cp_rank
+
+    def owned_rows(self, start: int, end: int) -> tuple[np.ndarray, np.ndarray]:
+        """The positions in ``[start, end)`` this rank owns, on the host: their offsets from
+        ``start`` and their rank-local slots (as ``local_slots``), both int64, in order."""
+        if end <= start:
+            empty = np.empty(0, dtype=np.int64)
+            return empty, empty
+        page, size = self.page_size, self.cp_size
+        first, last = start // page, (end - 1) // page
+        pages = np.arange(first + (self.cp_rank - first) % size, last + 1, size, dtype=np.int64)
+        lo = np.maximum(pages * page, start)
+        counts = np.minimum((pages + 1) * page, end) - lo
+        positions = np.repeat(lo - np.cumsum(counts) + counts, counts) + np.arange(counts.sum())
+        return positions - start, positions // (page * size) * page + positions % page
+
+    def local_lengths(self, lengths: torch.Tensor) -> torch.Tensor:
+        """Number of owned positions below each global length."""
+        span = self.page_size * self.cp_size
+        rem = lengths % span - self.cp_rank * self.page_size
+        return torch.div(lengths, span, rounding_mode="floor") * self.page_size + rem.clamp(
+            0, self.page_size
+        )
+
+
+def combine_helix_partials(
+    out: torch.Tensor, lse: torch.Tensor, empty: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    """Merge per-rank partial attention over disjoint KV shards.
+
+    Args:
+        out: ``[cp, N, H, D]`` partial outputs, one per CP rank.
+        lse: ``[cp, N, H]`` base-2 log-sum-exp of the matching scores, as
+            TRTLLM-Gen returns it.
+        empty: optional ``[cp, N]`` bool, True where a rank held no keys for
+            a row; its partial is ignored whatever the kernel wrote.
+    Returns:
+        ``[N, H, D]`` in ``out``'s dtype.
+    """
+    lse = lse.float()
+    if empty is not None:
+        lse = lse.masked_fill(empty.unsqueeze(-1), float("-inf"))
+    peak = lse.amax(dim=0, keepdim=True)
+    weight = torch.exp2(lse - peak.clamp_min(torch.finfo(torch.float32).min))
+    weight = weight.nan_to_num(nan=0.0)
+    total = weight.sum(dim=0).clamp_min(torch.finfo(torch.float32).tiny)
+    merged = (weight.unsqueeze(-1) * out.float().nan_to_num(0.0)).sum(dim=0)
+    return (merged / total.unsqueeze(-1)).to(out.dtype)

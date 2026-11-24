@@ -1025,15 +1025,14 @@ class LmEvalEvaluator(Evaluator):
             is_force_single_image=is_force_single_image,
             output_dir=self.output_dir,
             sampling_override=sampling_override,
+            preserve_caller_max_tokens=self.preserve_caller_max_tokens,
             partial_scores_every=partial_scores_every,
             partial_scoring_task_dict=self.task_dict
             if partial_scores_every else None,
         )
-        # post_process_fn / preserve_caller_max_tokens only consumed by multimodal.
+        # Only the multimodal wrapper consumes a text post-processor.
         if self.MULTIMODAL:
             lm_kwargs["post_process_fn"] = self.post_process_fn
-            lm_kwargs[
-                "preserve_caller_max_tokens"] = self.preserve_caller_max_tokens
 
         results = lm_eval.evaluate(
             lm=lm_cls(llm, **lm_kwargs),

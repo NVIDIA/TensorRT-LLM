@@ -98,6 +98,24 @@ class DummyRequestFactory:
             return None
         return ctx_token_nums[:-1] + [ctx_token_nums[-1] - 1]
 
+    @staticmethod
+    def generation_shapes_supported(resource_manager: ResourceManager) -> bool:
+        """Whether this worker's KV cache can hold generation requests at all.
+
+        A disaggregated context server keeps no KDA draft-verify state and no
+        FP4 MLA V sidecars, so generation shapes cannot run there. The answer
+        follows from the worker's role, which every rank of its forward group
+        shares, so warmup drops those shapes up front instead of proposing
+        them and failing the per-shape agreement (which DWDP cannot provide).
+        """
+        kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
+        return not (
+            getattr(kv_cache_manager, "kda_context_only", False) is True
+            or getattr(kv_cache_manager, "fp4_mla_context_only_cache", False) is True
+        )
+
     def create_warmup_request(
         self,
         resource_manager: ResourceManager,
@@ -118,9 +136,7 @@ class DummyRequestFactory:
         kv_cache_manager = resource_manager.get_resource_manager(
             ResourceManagerType.KV_CACHE_MANAGER
         )
-        if num_gen_requests and getattr(kv_cache_manager, "kda_context_only", False) is True:
-            # A disaggregated KDA context server keeps no draft-verify state,
-            # so generation shapes cannot run there.
+        if num_gen_requests and not self.generation_shapes_supported(resource_manager):
             return None
         draft_kv_cache_manager = get_draft_kv_cache_manager(
             self._config.spec_config, resource_manager
@@ -307,6 +323,7 @@ class DummyRequestFactory:
         if (
             getattr(kv_cache_manager, "context_swa_layer_limit", None) is not None
             or getattr(kv_cache_manager, "kda_context_only", False) is True
+            or getattr(kv_cache_manager, "fp4_mla_context_only_cache", False) is True
         ):
             return None
         draft_kv_cache_manager = get_draft_kv_cache_manager(

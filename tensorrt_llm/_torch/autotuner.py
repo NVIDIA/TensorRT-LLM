@@ -16,11 +16,14 @@ import ast
 import contextlib
 import copy
 import enum
+import faulthandler
 import fcntl
 import inspect
 import itertools
 import json
+import math
 import os
+import sys
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -46,6 +49,14 @@ from tensorrt_llm.mapping import Mapping
 
 # Unique tag to avoid collisions with other comms
 PP_COMM_TAG_AUTOTUNING = 30000
+
+# Distributed tuning runs host collectives (tactic merge / broadcast) only on
+# choose_one's cache-miss branch, so the tuning group runs in lockstep:
+# _exchange_barrier holds every rank after each exchange.
+# TLLM_AUTOTUNER_HANG_DUMP_S: dump a rank's Python stacks to stderr after it
+# waits that long in one of them (0 = off).
+_HANG_DUMP_ENV = "TLLM_AUTOTUNER_HANG_DUMP_S"
+_HANG_DUMP_DEFAULT_S = 600.0
 
 
 class DistributedTuningStrategy(enum.Enum):
@@ -346,6 +357,7 @@ def autotune(tune_mode: bool = True,
         if autotune_enabled:
             torch.ops.trtllm.set_fine_grained_sync_disabled_override(False)
             logger.info("[Autotuner] Autotuning process ends")
+            logger.info(f"[Autotuner] Summary: {autotuner.stats.summary()}")
 
         try:
             # Merge tactics across ranks in one collective before the cache is
@@ -386,6 +398,32 @@ class AutoTunerStatistics:
                                                     default_factory=dict)
     tuned_op_profiled_configs: Dict[str, int] = field(default_factory=dict)
     tuned_op_time_cost: Dict[str, float] = field(default_factory=dict)
+    # Startup accounting: timed tactic runs, host time of each tactic's first
+    # call (it compiles JIT kernels), and time spent priming cached tactics.
+    tuned_op_tactic_runs: Dict[str, int] = field(default_factory=dict)
+    tuned_op_first_call_seconds: Dict[str, float] = field(default_factory=dict)
+    primed_op_seconds: Dict[str, float] = field(default_factory=dict)
+
+    def summary(self) -> str:
+        """One-line INFO summary of where tuning time went, slowest ops first."""
+        ops = sorted(set(self.tuned_op_time_cost) | set(self.primed_op_seconds),
+                     key=lambda op: -(self.tuned_op_time_cost.get(op, 0.0) +
+                                      self.primed_op_seconds.get(op, 0.0)))
+        total = sum(self.tuned_op_time_cost.values())
+        first = sum(self.tuned_op_first_call_seconds.values())
+        primed = sum(self.primed_op_seconds.values())
+        parts = [
+            f"{op}={self.tuned_op_time_cost.get(op, 0.0):.1f}s"
+            f"(profiles={self.tuned_op_profiled_configs.get(op, 0)},"
+            f"runs={self.tuned_op_tactic_runs.get(op, 0)},"
+            f"first_calls={self.tuned_op_first_call_seconds.get(op, 0.0):.1f}s,"
+            f"primed={self.primed_op_seconds.get(op, 0.0):.1f}s)" for op in ops
+        ]
+        return (f"tuning {total:.1f}s over {len(self.tuned_op_time_cost)} ops, "
+                f"{sum(self.tuned_op_profiled_configs.values())} profiles, "
+                f"{sum(self.tuned_op_tactic_runs.values())} tactic runs, "
+                f"first calls {first:.1f}s, priming {primed:.1f}s | " +
+                ", ".join(parts))
 
     def __str__(self) -> str:
         """Return a string representation of collected statistics.
@@ -932,6 +970,14 @@ class AutoTuner:
     """
     _CUDA_GRAPH_DELAY_MICRO_SECS = 100
     _instance = None
+    # Random dummy inputs: the values go through float32, and drawing a whole
+    # dummy in one call holds two float32 temporaries of its full size at once
+    # (8 bytes per element; 48 GiB for a 6 GiB NVFP4 MoE activation). A dummy of
+    # more elements than _DUMMY_ONE_CALL_MAX_NUMEL is allocated in its own dtype
+    # and filled in slices of _DUMMY_SLICE_NUMEL elements; smaller ones are
+    # drawn in one call.
+    _DUMMY_ONE_CALL_MAX_NUMEL = 1 << 29
+    _DUMMY_SLICE_NUMEL = 1 << 26
 
     def __init__(self, warmup=2, repeat=10, stream_delay_micro_secs=1000):
         # Increase log level for AutoTuner associated logger`
@@ -944,6 +990,7 @@ class AutoTuner:
         self.stream_delay_micro_secs = stream_delay_micro_secs
         self.profiling_cache = AutoTunerProfilingCache()
         self._primed_cached_tactics: set[tuple[str, str, str, str]] = set()
+        self._stats_custom_op: Optional[str] = None
         self.is_tuning_mode = False
         self.skip_dynamic_tuning_buckets = False
 
@@ -969,6 +1016,11 @@ class AutoTuner:
         self._active_capture: Optional['AutoTuner.TacticsCapture'] = None
         # Last captured choose_one() contexts
         self._last_capture: Optional['AutoTuner.TacticsCapture'] = None
+
+        # CUDA graph memory pool shared by the profiling captures of one
+        # choose_one() tuning pass (see _shared_profile_graph_pool).
+        self._profile_graph_pool: Optional[torch.cuda.MemPool] = None
+        self._profile_graph_pool_depth = 0
 
         # Dsitributed tuning state
         self._dist: Optional[Distributed] = None
@@ -1217,22 +1269,24 @@ class AutoTuner:
         # Synchronize ranks before profiling
         if self._should_current_rank_tune(
                 tuning_config.distributed_tuning_strategy):
-            for p in profiles:
-                tensors = self._prepare_input_tensors(p, inputs)
-                is_cache_hit, *_ = self.profiling_cache.search_cache(
-                    custom_op,
-                    runners,
-                    p.get_opt_shapes(),
-                    tuning_config,
-                    apply_map_to_tuning_buckets=False,
-                )
-                if not is_cache_hit:
-                    # Initialize runner and tactic as None in case of no valid tactic or runners are found
-                    with nvtx_range(f"{custom_op}, shape {p.get_opt_shapes()}"):
-                        best_runner_id, best_tactic, min_time, has_tuning_failure_occurred = self._profile_runners(
-                            custom_op, runners, tensors, p, tuning_config,
-                            **kwargs)
-                    new_tuning_failure_occurred = new_tuning_failure_occurred or has_tuning_failure_occurred
+            with self._shared_profile_graph_pool():
+                for p in profiles:
+                    tensors = self._prepare_input_tensors(p, inputs)
+                    is_cache_hit, *_ = self.profiling_cache.search_cache(
+                        custom_op,
+                        runners,
+                        p.get_opt_shapes(),
+                        tuning_config,
+                        apply_map_to_tuning_buckets=False,
+                    )
+                    if not is_cache_hit:
+                        # Initialize runner and tactic as None in case of no valid tactic or runners are found
+                        with nvtx_range(
+                                f"{custom_op}, shape {p.get_opt_shapes()}"):
+                            best_runner_id, best_tactic, min_time, has_tuning_failure_occurred = self._profile_runners(
+                                custom_op, runners, tensors, p, tuning_config,
+                                **kwargs)
+                        new_tuning_failure_occurred = new_tuning_failure_occurred or has_tuning_failure_occurred
 
         self._maybe_sync_cache_data(tuning_config.distributed_tuning_strategy,
                                     custom_op)
@@ -1303,6 +1357,7 @@ class AutoTuner:
             tensors = self._prepare_input_tensors(profile, inputs)
             if tuning_config.inputs_pre_hook is not None:
                 tensors = tuning_config.inputs_pre_hook(tensors)
+            prime_start = time.perf_counter()
             try:
                 with nvtx_range(f"{custom_op} prime tactic {tactic}"):
                     if "do_preparation" in inspect.signature(
@@ -1313,6 +1368,9 @@ class AutoTuner:
                                **kwargs)
                     runner(tensors, tactic=tactic, **kwargs)
                 self._primed_cached_tactics.add(key)
+                self.stats.primed_op_seconds[custom_op] = (
+                    self.stats.primed_op_seconds.get(custom_op, 0.0) +
+                    time.perf_counter() - prime_start)
             except Exception as e:
                 try:
                     torch.cuda.synchronize()
@@ -1358,6 +1416,7 @@ class AutoTuner:
         min_time = float('inf')
         has_tuning_failure_occurred = False
         best_runner_id, best_tactic = None, None
+        self._stats_custom_op = custom_op
         # Pre-walk the runners so we know the total candidate (runner, tactic)
         # pair count before deciding whether to short-circuit profiling. The
         # count is taken BEFORE distributed-strategy splitting; the PARALLEL
@@ -1397,10 +1456,16 @@ class AutoTuner:
             tac = valid_tactics[0]
             if "do_preparation" in runner_arg_names:
                 runner(input_tensors, tactic=-1, do_preparation=True, **kwargs)
+            self.stats.tuned_op_tactic_runs[custom_op] = (
+                self.stats.tuned_op_tactic_runs.get(custom_op, 0) + 1)
+            call_start = time.perf_counter()
             try:
                 with nvtx_range(f"r{runner_id}, tactic {tac} (single-pair)"):
                     self._run_profile_runner(runner, input_tensors, tac,
                                              **kwargs)
+                self.stats.tuned_op_first_call_seconds[custom_op] = (
+                    self.stats.tuned_op_first_call_seconds.get(custom_op, 0.0) +
+                    time.perf_counter() - call_start)
                 best_runner_id, best_tactic = runner_id, tac
                 # No comparable measurement exists; min_time stays 0.0 to
                 # distinguish "recorded without profiling" from a real
@@ -1446,6 +1511,8 @@ class AutoTuner:
                     )
 
                 for tac in valid_tactics:
+                    self.stats.tuned_op_tactic_runs[custom_op] = (
+                        self.stats.tuned_op_tactic_runs.get(custom_op, 0) + 1)
                     try:
                         with nvtx_range(f"r{runner_id}, tactic {tac}"):
                             time_measured = self._profile_single_kernel(
@@ -1550,6 +1617,34 @@ class AutoTuner:
 
         return sizes
 
+    @contextlib.contextmanager
+    def _shared_profile_graph_pool(self):
+        """Let the profiling captures in this scope share one CUDA graph memory pool.
+
+        Every profiling capture is reset before the next one starts. With a pool
+        per capture, each reset drops that pool and the next capture maps its
+        memory again, which under expandable segments costs milliseconds per
+        capture. A shared pool keeps the freed blocks cached for the next
+        capture. The pool is dropped when the outermost scope exits, so its
+        memory is not held across forward passes.
+        """
+        self._profile_graph_pool_depth += 1
+        try:
+            yield
+        finally:
+            self._profile_graph_pool_depth -= 1
+            if self._profile_graph_pool_depth == 0:
+                self._profile_graph_pool = None
+
+    def _profile_graph_pool_handle(self) -> Tuple[int, int]:
+        """Pool handle for one profiling capture: the shared pool inside
+        _shared_profile_graph_pool, otherwise a new pool."""
+        if self._profile_graph_pool_depth == 0:
+            return torch.cuda.graph_pool_handle()
+        if self._profile_graph_pool is None:
+            self._profile_graph_pool = torch.cuda.MemPool()
+        return self._profile_graph_pool.id
+
     def _profile_single_kernel(
         self,
         runner: TunableRunner,
@@ -1592,18 +1687,23 @@ class AutoTuner:
                 if not use_cuda_graph:
                     yield None
                     return
-                graph_pool = torch.cuda.graph_pool_handle()
+                graph_pool = self._profile_graph_pool_handle()
                 completed = False
                 try:
                     yield graph_pool
                     completed = True
                 finally:
                     graph.reset()
+                    # The NCCL-window owner stays per capture even when the
+                    # memory pool is shared: a later capture of the same pool
+                    # gets a new owner.
                     if completed:
                         release_nccl_window_graph_owner(graph_pool)
                     else:
                         # Local profiling failures need not occur on every rank.
                         abandon_nccl_window_graph_owner(graph_pool)
+                        # Do not capture into a pool a failed capture used.
+                        self._profile_graph_pool = None
 
             if self._use_global_timer:
                 start_ts = torch.empty(1, dtype=torch.int64, device='cuda')
@@ -1673,10 +1773,17 @@ class AutoTuner:
 
                 return elapsed_time() / repeat
 
-        # warm up, no timing
-        for _ in range(self.warmup):
+        # warm up, no timing. The first call compiles JIT kernels; its host
+        # time is kept per op for the tuning summary.
+        for i in range(self.warmup):
+            call_start = time.perf_counter()
             self._run_profile_runner(runner, input_tensor_batches[-1], tactic,
                                      **kwargs)
+            if i == 0 and self._stats_custom_op is not None:
+                op = self._stats_custom_op
+                self.stats.tuned_op_first_call_seconds[op] = (
+                    self.stats.tuned_op_first_call_seconds.get(op, 0.0) +
+                    time.perf_counter() - call_start)
 
         fewer_repeat_avg_time = pure_profile(stream, profile_fewer_repeat)
 
@@ -1900,9 +2007,23 @@ class AutoTuner:
         # during the tuning process. This can by controlled in the preparation phase by the runner.
         # It must not use all zero tensors. Otherwise the timing results become unreliable.
         if dtype == torch.float4_e2m1fn_x2:
-            return (torch.rand(shapes, device=device) * 10 - 5).to(
-                torch.uint8).view(dtype)
-        return (torch.rand(shapes, device=device) * 10 - 5).to(dtype)
+            return self._random_dummy(shapes, torch.uint8, device).view(dtype)
+        return self._random_dummy(shapes, dtype, device)
+
+    def _random_dummy(self, shapes: List[int], dtype: torch.dtype,
+                      device: torch.device) -> torch.Tensor:
+        """Uniform [-5, 5) values in ``dtype``; large dummies are filled in
+        slices (see _DUMMY_ONE_CALL_MAX_NUMEL)."""
+        numel = math.prod(shapes)
+        if numel <= self._DUMMY_ONE_CALL_MAX_NUMEL:
+            return (torch.rand(shapes, device=device) * 10 - 5).to(dtype)
+        tensor = torch.empty(shapes, dtype=dtype, device=device)
+        flat = tensor.view(-1)
+        for start in range(0, numel, self._DUMMY_SLICE_NUMEL):
+            stop = min(start + self._DUMMY_SLICE_NUMEL, numel)
+            flat[start:stop].copy_(
+                (torch.rand(stop - start, device=device) * 10 - 5).to(dtype))
+        return tensor
 
     def _prepare_input_tensors(
             self, profile: OptimizationProfile,
@@ -2115,14 +2236,17 @@ class AutoTuner:
         The group is the TP group. Helix CP ranks run the same SPMD forward
         on the same token batch, so Helix adds the CP ranks too. Otherwise a
         Helix generation worker with ``tp_size == 1`` would profile every
-        tactic on every CP rank. The index matches the TP-major, CP-minor
-        order of ``Distributed.tp_cp_allgather``, which merges the results.
+        tactic on every CP rank. Ulysses CP ranks run the same SPMD forward on
+        equal row shares of the batch, so Ulysses adds them as well. The index
+        matches the TP-major, CP-minor order of ``Distributed.tp_cp_allgather``,
+        which merges the results.
         """
         if self.mapping is None:
             return 1, 0
         size = self.mapping.tp_size
         index = self.mapping.tp_rank
-        if self.mapping.has_cp_helix():
+        if self.mapping.has_cp_helix() or getattr(
+                self.mapping, "has_cp_ulysses", lambda: False)():
             size *= self.mapping.cp_size
             index = index * self.mapping.cp_size + self.mapping.cp_rank
         return size, index
@@ -2154,18 +2278,68 @@ class AutoTuner:
             return
 
         if strategy == DistributedTuningStrategy.BROADCAST:
-            self._broadcast_cache_data(custom_op)
+            exchange = self._broadcast_cache_data
         elif strategy == DistributedTuningStrategy.INDEPENDENT:
             return
         elif strategy == DistributedTuningStrategy.MERGE:
-            self._merge_cache_data(custom_op)
+            exchange = self._merge_cache_data
         elif strategy == DistributedTuningStrategy.PARALLEL:
-            self._merge_cache_data(custom_op)
+            exchange = self._merge_cache_data
         else:
             logger.error(
                 f"[AutoTuner] Unknown distributed tuning strategy: {strategy}, falling back to independent"
             )
             return
+        what = f"tactic exchange ({strategy.value}) for {custom_op}"
+        with self._hang_dump_guard(what):
+            exchange(custom_op)
+        self._exchange_barrier(what)
+
+    @contextlib.contextmanager
+    def _hang_dump_guard(self, what: str):
+        """Write this rank's Python stacks to stderr if the guarded collective
+        has not returned after TLLM_AUTOTUNER_HANG_DUMP_S seconds.
+
+        faulthandler's watchdog is a C thread, so the dump also works while
+        the main thread holds the GIL inside a blocking call."""
+        try:
+            timeout = float(
+                os.environ.get(_HANG_DUMP_ENV, str(_HANG_DUMP_DEFAULT_S)))
+        except ValueError:
+            timeout = _HANG_DUMP_DEFAULT_S
+        armed = False
+        if timeout > 0:
+            try:
+                faulthandler.dump_traceback_later(timeout,
+                                                  repeat=False,
+                                                  file=sys.stderr,
+                                                  exit=False)
+                armed = True
+            except Exception as e:  # e.g. a stderr without a file descriptor
+                logger.warning_once(
+                    f"[Autotuner] hang dump unavailable ({e!r}); "
+                    f"collectives run without it",
+                    key=("autotuner", "warning_hang_dump_unavailable"))
+        try:
+            yield
+        finally:
+            if armed:
+                faulthandler.cancel_dump_traceback_later()
+
+    def _group_allgather(self, obj: Any, what: str) -> List[Any]:
+        """Allgather a small object over the tuning group (the TP x CP ranks
+        that _merge_cache_data gathers over)."""
+        with self._hang_dump_guard(what):
+            return self._dist.tp_cp_allgather(obj, small_payload=True)
+
+    def _exchange_barrier(self, what: str) -> float:
+        """Hold every rank after a tactic exchange until all ranks finished it:
+        MPI progresses only inside MPI calls, so with UCX over TCP a rank could
+        leave the exchange with bytes still queued and block in GPU work that
+        waits on its peers. Returns the time spent in milliseconds."""
+        start = time.perf_counter()
+        self._group_allgather(None, f"barrier after {what}")
+        return (time.perf_counter() - start) * 1e3
 
     def _merge_cache_data(self, custom_op: str):
         cache_data = self.profiling_cache.get_specific_custom_op(custom_op)
@@ -2189,7 +2363,11 @@ class AutoTuner:
         if not self._is_distributed():
             return
         merged = dict()
-        for data in self._dist.tp_cp_allgather(obj=self.profiling_cache.cache):
+        what = "post-tune tactic merge"
+        with self._hang_dump_guard(what):
+            gathered = self._dist.tp_cp_allgather(
+                obj=self.profiling_cache.cache)
+        for data in gathered:
             for key, value in data.items():
                 if value[-1] < merged.get(key, [float('inf')])[-1]:
                     merged[key] = value

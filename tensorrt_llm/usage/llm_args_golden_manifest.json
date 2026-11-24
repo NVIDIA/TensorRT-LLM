@@ -29,6 +29,11 @@
     {
       "capture_policy": "bool",
       "kind": "value",
+      "path": "attention_dp_config.enable_kv_balanced_admission"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
       "path": "attention_dp_config.enable_kv_cache_aware_routing"
     },
     {
@@ -50,6 +55,11 @@
       "capture_policy": "float",
       "kind": "value",
       "path": "attention_dp_config.kv_cache_routing_fair_share_multiplier"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "attention_dp_config.kv_cache_routing_hold_bound_conversations"
     },
     {
       "capture_policy": "float",
@@ -276,6 +286,32 @@
     },
     {
       "allowed_values": [
+        "sp"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "dkv_config.attention_mode"
+    },
+    {
+      "allowed_values": [
+        "whole",
+        "sharded"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "dkv_config.index_layout"
+    },
+    {
+      "allowed_values": [
+        "replicated",
+        "page_split"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "dkv_config.kv_layout"
+    },
+    {
+      "allowed_values": [
         "auto",
         "float16",
         "bfloat16",
@@ -291,9 +327,29 @@
       "path": "dwdp_config.contention_opt"
     },
     {
+      "allowed_values": [
+        "per_slice",
+        "batched",
+        "gather"
+      ],
+      "capture_policy": "literal|none",
+      "kind": "categorical",
+      "path": "dwdp_config.copy_mode"
+    },
+    {
       "capture_policy": "int",
       "kind": "value",
       "path": "dwdp_config.dwdp_size"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "dwdp_config.enable_dense"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "dwdp_config.enable_experts"
     },
     {
       "capture_policy": "int",
@@ -610,6 +666,11 @@
       "capture_policy": "int",
       "kind": "value",
       "path": "kv_cache_config.block_reuse_config.max_num_turns"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.block_reuse_config.max_parked_conversation_caches"
     },
     {
       "allowed_values": [
@@ -1062,6 +1123,39 @@
       "path": "moe_config.disable_finalize_fusion"
     },
     {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "moe_config.load_balancer.auxiliary_sms"
+    },
+    {
+      "allowed_values": [
+        "per_layer_resident",
+        "shared_banks"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "moe_config.load_balancer.helper_slot_mode"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "moe_config.load_balancer.layer_updates_per_iter"
+    },
+    {
+      "allowed_values": [
+        "standard",
+        "per_layer_dynamic"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "moe_config.load_balancer.mode"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "moe_config.load_balancer.num_slots"
+    },
+    {
       "capture_policy": "int|none",
       "kind": "value",
       "path": "moe_config.max_num_tokens"
@@ -1357,6 +1451,16 @@
       "capture_policy": "enum[CapacitySchedulerPolicy]",
       "kind": "categorical",
       "path": "scheduler_config.capacity_scheduler_policy"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "scheduler_config.context_chunk_cap.max_tokens_per_request"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "scheduler_config.context_chunk_cap.min_waiting_requests"
     },
     {
       "allowed_values": [
@@ -1697,6 +1801,20 @@
       "capture_policy": "int|none",
       "kind": "value",
       "path": "speculative_config.block_size"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "fp8"
+      ],
+      "capture_policy": "literal|none",
+      "kind": "categorical",
+      "path": "speculative_config.context_kv_dtype"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "speculative_config.context_kv_only"
     },
     {
       "capture_policy": "int|none",

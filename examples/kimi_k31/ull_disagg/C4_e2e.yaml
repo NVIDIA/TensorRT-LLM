@@ -1,0 +1,193 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Kimi K3.1 Pro NVFP4 on VR200, ULL point C4: performance case (AgentX, forced acceptance).
+# Format: this repository's examples/disaggregated/slurm/benchmark/submit.py
+#   python3 <WORK_DIR>/submit.py -c examples/kimi_k31/ull_disagg/C4_e2e.yaml
+# environment.work_dir = a copy of that directory plus the benchmark client that K31_CLIENT selects (the AgentX
+# client; for *_gsm.yaml the needle test and reuse check) and a run_benchmark.sh that runs it (README, Launch).
+# Use this repository's start_worker.sh / start_server.sh (hostnames, and slurm.numa_local below needs it).
+# Fill in every <...> value listed in the README (Placeholders). Everything else is what the recorded run used.
+# Layout: CTX tep8 (TP8, EP8, no attention DP; 2 nodes) + GEN helix16 (CP16 Helix, TP1, MoE TP16 EP1; 4 nodes) = 24 GPUs.
+slurm:
+  script_file: disaggr_torch.slurm
+  partition: <PARTITION>
+  account: <ACCOUNT>
+  job_time: 01:40:00
+  job_name: k31-ull-C4-e2e-feat1178bc4
+  extra_args: <EXTRA_SBATCH_ARGS>
+  set_segment: true
+  # numactl -m 0,1 (NVL72 host-memory policy); the recorded runs did not use it (README, NUMA).
+  numa_bind: true
+  # Each rank on its GPU's NUMA node (CPUs and memory) from the start; replaces numa_bind's -m 0,1 (README, NUMA).
+  numa_local: true
+benchmark:
+  mode: e2e
+  use_nv_sa_benchmark: false
+  multi_round: 1
+  benchmark_ratio: 0.8
+  streaming: true
+  concurrency_list: '4'
+  input_length: 996608
+  output_length: 1024
+  dataset_file: semianalysis_cc_traces_weka_062126
+  env_var:
+    K31_CLIENT: agentx
+    AGENTX_DURATION: 3600
+    AGENTX_EXTRA_ARGS: ''
+    AGENTX_HF_HOME: <HF_HOME>
+    AGENTX_MAX_CTX: 996579
+    AGENTX_POLL_ITER: 0
+    AGENTX_WARMUP_PER_LANE: 3
+hardware:
+  gpus_per_node: 4
+  num_ctx_servers: 1
+  num_gen_servers: 1
+environment:
+  container_mount: <CONTAINER_MOUNTS>
+  container_image: <IMAGE>
+  model_path: <MODEL_PATH>
+  trtllm_repo: <TRTLLM_REPO>
+  build_wheel: false
+  cuda_architectures: ''
+  trtllm_wheel_path: <TRTLLM_WHEEL>
+  work_dir: <WORK_DIR>
+  log_dir: <LOG_DIR>
+  server_health_timeout: 3600
+  worker_env_var: TLLM_LOG_LEVEL=INFO TLLM_KV_CACHE_MANAGER_V2_BACKEND=cpp TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1
+    TLLM_NUMA_AWARE_WORKER_AFFINITY=1 OMP_NUM_THREADS=1 NCCL_GRAPH_MIXING_SUPPORT=0 ENROOT_ALLOW_DEV=yes TRTLLM_KV_V2_SPLIT_HOST_COPY=1
+    TRTLLM_K3_ULL_STEP_PREP=1 TRTLLM_K3_ULL_PIN_EXECUTOR=auto TRTLLM_K3_ULL_GIL_SWITCH_US=200
+    TRTLLM_CACHE_DIR=<TRTLLM_CACHE_DIR>
+  server_env_var: TRTLLM_SERVER_DISABLE_GC=1
+  # Server role (this repository's start_worker.sh runs trtllm-serve without --server_role): the K3.1 routing reads
+  # it from TRTLLM_DISAGG_ROLE, and without it the CTX is taken for a generation server. Our runs
+  # passed --server_role CONTEXT / GENERATION, which sets the same variable.
+  # CTX KV profile (CTX only; GEN unchanged): this env plus free_gpu_memory_fraction 0.6 and avg_seq_len 80000 in
+  # worker_config.ctx.kv_cache_config (README, C4 and C8 CTX KV).
+  ctx_worker_env_var: TRTLLM_DISAGG_ROLE=context TRTLLM_KV_V2_WAIT_FOR_INFLIGHT_PREFIX=1 TRTLLM_KDA_MIDCHUNK_SNAPSHOT=1
+    TLLM_V2_CTX_DEMOTE_EXACT=1 TLLM_V2_CTX_DEMOTE_MAX_ITERS=32
+    TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS=16384 TLLM_V2_LOW_PRIORITY_SNAPSHOT_PROMPT_LEN=16384
+  # Forced acceptance on GEN only (the CTX drafts each request's first block and never verifies drafts). TLLM_BENCHMARK_REQ_QUEUES_SIZE =
+  # the concurrency: GEN's first forward waits until that many requests are queued.
+  gen_worker_env_var: TRTLLM_DISAGG_ROLE=generation TRTLLM_SPEC_SAMPLER_FUSED_SCATTER=1 TRTLLM_STATE_INDEX_COPY_KERNEL=1 TRTLLM_KV_BLOCK_OFFSETS_TRITON=2
+    TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=2.68 TLLM_BENCHMARK_REQ_QUEUES_SIZE=4 TLLM_METRICS_ALL_RANKS=1
+profiling:
+  ctx_profile_range: 10-30
+  gen_profile_range: 200-250
+  nsys_on: false
+accuracy:
+  enable_accuracy_test: false
+worker_config:
+  gen:
+    attn_backend: TRTLLM
+    cache_transceiver_config:
+      backend: NIXL
+      kv_cache_bounce_size_mb: 0
+      kv_transfer_timeout_ms: 600000
+      transceiver_runtime: PYTHON
+    context_parallel_size: 16
+    cp_config:
+      cp_type: HELIX
+      fifo_version: 2
+      tokens_per_block: 64
+      use_nccl_for_alltoall: false
+    cuda_graph_config:
+      batch_sizes:
+      - 1
+      - 2
+      - 3
+      - 4
+      enable_padding: true
+    enable_attention_dp: false
+    kv_cache_config:
+      dtype: fp8
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.45
+      mamba_ssm_cache_dtype: float32
+      tokens_per_block: 64
+      use_kv_cache_manager_v2: true
+    max_batch_size: 4
+    max_num_tokens: 32
+    max_seq_len: 997696
+    modeling_v2: require
+    moe_config:
+      backend: CUTEDSL
+      use_low_precision_moe_combine: false
+    moe_expert_parallel_size: 1
+    moe_tensor_parallel_size: 16
+    num_postprocess_workers: 4
+    print_iter_log: true
+    reasoning_parser: null
+    sparse_attention_config:
+      algorithm: dsa
+      enable_heuristic_topk: true
+      gvr_deterministic_topk: true
+      indexer_k_dtype: fp8
+      use_self_sampling_topk: true
+    speculative_config:
+      advanced_sampling_mode: no_topk_no_topp
+      context_kv_dtype: fp8
+      decoding_type: DFlash
+      max_draft_len: 7
+      speculative_model: <DRAFTER_PATH>
+    stream_interval: 100
+    tensor_parallel_size: 1
+    trust_remote_code: true
+  ctx:
+    attn_backend: TRTLLM
+    cache_transceiver_config:
+      backend: NIXL
+      kv_cache_bounce_size_mb: 0
+      kv_transfer_timeout_ms: 600000
+      transceiver_runtime: PYTHON
+    cuda_graph_config: null
+    # Text-only CTX: the tep8 target takes a text-only deployment with FP8 drafter history only
+    # (context_kv_dtype: fp8 below); otherwise the CTX routes to the sm_10x default target (README).
+    disable_mm_encoder: true
+    disable_overlap_scheduler: true
+    enable_attention_dp: false
+    enable_chunked_prefill: true
+    kv_cache_config:
+      avg_seq_len: 80000
+      block_reuse_config:
+        max_num_turns: 5
+        policy: per_conversation
+      dtype: fp8
+      enable_block_reuse: true
+      free_gpu_memory_fraction: 0.6
+      mamba_ssm_cache_dtype: float32
+      mamba_state_config:
+        additional_snapshot_offsets_from_end:
+        - 0
+        enable_branch_snapshot: true
+      tokens_per_block: 64
+      use_kv_cache_manager_v2: true
+    max_batch_size: 4
+    max_num_tokens: 8192
+    max_seq_len: 996672
+    modeling_v2: require
+    moe_config:
+      backend: CUTEDSL
+      use_low_precision_moe_combine: false
+    moe_expert_parallel_size: 8
+    num_postprocess_workers: 4
+    print_iter_log: true
+    reasoning_parser: null
+    sparse_attention_config:
+      algorithm: dsa
+      enable_heuristic_topk: true
+      gvr_deterministic_topk: true
+      indexer_k_dtype: fp8
+      use_self_sampling_topk: true
+    speculative_config:
+      context_kv_dtype: fp8
+      decoding_type: DFlash
+      max_draft_len: 7
+      speculative_model: <DRAFTER_PATH>
+    stream_interval: 10
+    tensor_parallel_size: 8
+    trust_remote_code: true
+server_config_extra:
+  gen_strip_message_history: true
+  gen_tokids_ctxbytes: true
+  num_workers: 4
+  server_keep_alive_timeout: 3600

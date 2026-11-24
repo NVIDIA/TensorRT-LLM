@@ -7,7 +7,7 @@ from __future__ import annotations
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Callable, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -18,7 +18,7 @@ import tensorrt_llm.bindings
 from tensorrt_llm._torch.attention.backends.interface import MLAParams, PositionalEmbeddingParams
 from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
-from tensorrt_llm._torch.distributed.ops import allgather
+from tensorrt_llm._torch.distributed.ops import allgather, cp_allgather
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.multi_stream_utils import (
@@ -289,6 +289,47 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
         "Hidden size must be a power of 2 for Hadamard transform."
     )
     return hadamard_transform(x, scale=hidden_size**-0.5)
+
+
+def merge_helix_topk(
+    logits: torch.Tensor,
+    topk_rows: torch.Tensor,
+    cp_rank: int,
+    gather_cp: Callable[[torch.Tensor], torch.Tensor],
+) -> None:
+    """Reduce per-rank Top-K rows to the global Top-K across Helix CP ranks.
+
+    Under Helix each CP rank holds a slice of every sequence's KV cache, so its
+    indexer only ranks local tokens. The global Top-K is a subset of the union
+    of the local Top-Ks, so gathering every rank's candidate scores and taking
+    the Top-K of that union reproduces the selection of an unsharded indexer.
+    Local entries that lose to another rank's candidates become -1 in place and
+    the surviving entries move to the front of each row.
+
+    Args:
+        logits: ``[num_tokens, kv_len]`` local indexer scores.
+        topk_rows: ``[num_tokens, k]`` int32 local token indices, -1 for none.
+        cp_rank: This rank's position in the CP group.
+        gather_cp: Stacks a tensor over the CP group along a new leading dim.
+    """
+    num_tokens, k = topk_rows.shape
+    if num_tokens == 0:
+        return
+    valid = topk_rows >= 0
+    scores = torch.gather(logits.float(), 1, topk_rows.clamp(min=0).long())
+    scores = scores.masked_fill(~valid, float("-inf"))
+    # [cp, num_tokens, k] -> [num_tokens, cp * k], ordered by (rank, slot).
+    all_scores = gather_cp(scores).transpose(0, 1).reshape(num_tokens, -1)
+    top_scores, top_pos = torch.topk(all_scores, k, dim=1)
+    owner = torch.div(top_pos, k, rounding_mode="floor")
+    mine = (owner == cp_rank) & torch.isfinite(top_scores)
+    hits = torch.zeros_like(topk_rows, dtype=torch.int32)
+    hits.scatter_add_(1, torch.where(mine, top_pos - owner * k, 0), mine.to(torch.int32))
+    keep = hits > 0
+    # Stable compaction: kept entries first, in their original order.
+    order = torch.sort((~keep).to(torch.int8), dim=1, stable=True).indices
+    compacted = torch.gather(topk_rows.masked_fill(~keep, -1), 1, order)
+    topk_rows.copy_(compacted)
 
 
 def transform_local_topk_and_prepare_pool_view(
@@ -832,7 +873,10 @@ class Indexer(nn.Module):
             raise ValueError("Prepared indexers require exact Top-K selection")
         self.hidden_size = mla_params.hidden_size if mla_params is not None else None
         self.q_lora_rank = mla_params.q_lora_rank if mla_params is not None else None
-        self.rope_dim = mla_params.qk_rope_head_dim if mla_params is not None else 0
+        if sparse_params.index_rope_dim is not None:
+            self.rope_dim = sparse_params.index_rope_dim
+        else:
+            self.rope_dim = mla_params.qk_rope_head_dim if mla_params is not None else 0
         self.n_heads = sparse_params.index_n_heads  # 64
         self.head_dim = sparse_params.index_head_dim  # 128
         self.index_topk = sparse_params.index_topk  # 2048
@@ -869,7 +913,10 @@ class Indexer(nn.Module):
                 skip_create_weights_in_init=skip_create_weights_in_init,
                 use_custom_cublas_mm=True,
             )
-            self.k_norm = LayerNorm(hidden_size=self.head_dim, eps=1e-6)
+            k_norm_eps = sparse_params.index_k_norm_eps
+            self.k_norm = LayerNorm(
+                hidden_size=self.head_dim, eps=1e-6 if k_norm_eps is None else k_norm_eps
+            )
             self.weights_proj = Linear(
                 self.hidden_size,
                 self.n_heads,
@@ -885,12 +932,13 @@ class Indexer(nn.Module):
             # TRTLLM_DSA_INDEXER_BF16 is enabled.
             self._fused_wk_wp_weight: Optional[torch.Tensor] = None
 
-            indexer_rope_interleave = sparse_params.indexer_rope_interleave
-            self.rotary_emb = RotaryEmbedding(
-                pos_embd_params.rope,
-                head_dim=self.rope_dim,
-                is_neox=not indexer_rope_interleave,
-            )
+            if self.rope_dim > 0:
+                indexer_rope_interleave = sparse_params.indexer_rope_interleave
+                self.rotary_emb = RotaryEmbedding(
+                    pos_embd_params.rope,
+                    head_dim=self.rope_dim,
+                    is_neox=not indexer_rope_interleave,
+                )
 
         self.softmax_scale = self.head_dim**-0.5
         # TODO: make it configurable from hf config
@@ -1240,12 +1288,25 @@ class Indexer(nn.Module):
         metadata.host_slot_mapping_fp8[:total_new_kv_tokens] = fp8_flat_indices
         metadata.host_slot_mapping_scale[:total_new_kv_tokens] = scale_flat_indices
 
-        metadata.slot_mapping_fp8[:total_new_kv_tokens].copy_(
-            metadata.host_slot_mapping_fp8[:total_new_kv_tokens], non_blocking=True
-        )
-        metadata.slot_mapping_scale[:total_new_kv_tokens].copy_(
-            metadata.host_slot_mapping_scale[:total_new_kv_tokens], non_blocking=True
-        )
+        # Under Helix the ULL generation target's metadata rewrites the generation rows on the
+        # host first (``helix_host_gen_slot_rows``; None for every other metadata), and the rows
+        # both write are uploaded once with their final values: two staged uploads of the same
+        # bytes would race in the commit kernel.
+        uploads = [slice(0, total_new_kv_tokens)]
+        if metadata.enable_helix and metadata.num_generations > 0:
+            gen_rows = metadata.helix_host_gen_slot_rows(indexer_params)
+            if gen_rows is not None:
+                if gen_rows.start <= total_new_kv_tokens:
+                    uploads = [slice(0, max(total_new_kv_tokens, gen_rows.stop))]
+                else:
+                    uploads.append(gen_rows)
+        for rows in uploads:
+            metadata._stage_or_copy(
+                metadata.slot_mapping_fp8[rows], metadata.host_slot_mapping_fp8[rows]
+            )
+            metadata._stage_or_copy(
+                metadata.slot_mapping_scale[rows], metadata.host_slot_mapping_scale[rows]
+            )
 
     @staticmethod
     def recompute_context_kv_gather_mappings(
@@ -1425,6 +1486,12 @@ class Indexer(nn.Module):
             metadata.kv_lens_cuda_runtime[num_contexts : num_contexts + num_generations]
         )
         metadata.gen_indexer_kv_lens_cuda_runtime = gen_seq_lens
+        if getattr(metadata, "_staging_commit", None) is not None:
+            # A step whose uploads are staged is a CUDA-graph generation replay: its
+            # on_update_kv_lens (preprocess_inputs, inside the graph) rebuilds the 2-D lengths
+            # and every schedule below from the committed lengths, and these would read staged
+            # buffers before the commit kernel writes them.
+            return
         if not metadata.use_expanded_buffers_for_mtp:
             scheduler_context_lens = metadata.update_indexer_kv_lens_2d(gen_seq_lens)
             scheduler_metadata_buffer = get_paged_mqa_logits_metadata(
@@ -2054,7 +2121,12 @@ class Indexer(nn.Module):
             k_cache = metadata.kv_cache_manager.get_indexer_k_cache_buffers(self.layer_idx)
             indexer_max_seq_len = metadata.get_indexer_max_seq_len()
 
-            if self.use_cute_dsl_paged_mqa_logits and not metadata.is_ragged_verify:
+            # Helix verify rows carry per-token bounds the DSL schedule cannot take.
+            if (
+                self.use_cute_dsl_paged_mqa_logits
+                and not metadata.is_ragged_verify
+                and metadata.helix_spec_row_kv_lens(num_gen_tokens) is None
+            ):
                 # DSL kernel design: 1 atom per q (atom = real next_n positions),
                 # kNumNextNAtoms = 1 for any real next_n. The matching schedule
                 # is `scheduler_metadata_buffer` — built in `Indexer.prepare()`
@@ -2221,19 +2293,40 @@ class Indexer(nn.Module):
             )
             assert metadata.radix_aux_indices is not None
             assert metadata.radix_aux_logits is not None
+            # Helix verify tokens carry per-token rank-local bounds, like ragged rows.
+            helix_row_kv_lens = metadata.helix_spec_row_kv_lens(num_gen_tokens)
+            row_kv_lens = (
+                helix_row_kv_lens
+                if helix_row_kv_lens is not None
+                else metadata.ragged_row_kv_lens(num_gen_tokens)
+            )
+            decode_rows = topk_indices_buffer[token_offset : token_offset + num_gen_tokens, :]
             self.top_k(
                 logits_decode,
-                topk_indices_buffer[token_offset : token_offset + num_gen_tokens, :],
+                decode_rows,
                 is_prefill=False,
                 sequence_lengths=gen_kv_lens_cuda,
                 scan_lengths=scan_lengths,
-                row_kv_lens=metadata.ragged_row_kv_lens(num_gen_tokens),
-                next_n=1 if metadata.is_ragged_verify else next_n,
+                row_kv_lens=row_kv_lens,
+                next_n=1 if metadata.is_ragged_verify or helix_row_kv_lens is not None else next_n,
                 max_seq_len=indexer_max_seq_len,
                 gvr_ext_kwargs=gvr_ext_kwargs,
                 radix_aux_indices=metadata.radix_aux_indices,
                 radix_aux_logits=metadata.radix_aux_logits,
             )
+            if metadata.enable_helix and metadata.mapping.cp_size > 1:
+                if helix_row_kv_lens is not None:
+                    # Tokens that see no KV on this rank were scored over a
+                    # placeholder slot; they must not offer candidates.
+                    decode_rows.masked_fill_((helix_row_kv_lens == 0).unsqueeze(1), -1)
+                mapping = metadata.mapping
+                merge_helix_topk(
+                    logits_decode,
+                    decode_rows,
+                    mapping.cp_rank,
+                    lambda t: cp_allgather(t.unsqueeze(0), mapping, dim=0),
+                )
+                metadata.set_helix_sparse_row_lens(decode_rows)
 
         elif has_decode and metadata.skip_indexer_for_gen_reqs:
             # Fill topk_indices_buffer with pre-defined dense topk indices
@@ -2327,6 +2420,13 @@ class Indexer(nn.Module):
         q = self.wq_b(qr)
         k = self.k_norm(indexer_k)
         q = q.view(-1, self.n_heads, self.head_dim)
+        if self.rotary_emb is None:
+            # Position-free indexer: nothing rotates. The fused cat+quantize
+            # kernels take two non-empty halves of each head.
+            half = self.head_dim // 2
+            q_pe, q_nope = q.split([half, self.head_dim - half], dim=-1)
+            k_pe, k_nope = k.split([half, self.head_dim - half], dim=-1)
+            return q_pe, q_nope, k_pe, k_nope
         q_pe, q_nope = q.split([self.rope_dim, self.head_dim - self.rope_dim], dim=-1)
         k_pe, k_nope = k.split([self.rope_dim, self.head_dim - self.rope_dim], dim=-1)
         q_pe, k_pe = self.rotary_emb(position_ids, [q_pe, k_pe.unsqueeze(1)])

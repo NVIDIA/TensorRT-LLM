@@ -20,6 +20,7 @@ from ..pyexecutor.kv_cache.mamba_cache_manager import (
     MambaHybridCacheManagerV2, MixedMambaHybridCacheManager)
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import KVCacheManager
+from .cuda_ipc_cache import bound_cuda_ipc_cache, bound_cuda_ipc_cache_enabled
 
 CacheTransceiverCpp = tensorrt_llm.bindings.internal.batch_manager.CacheTransceiver
 AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
@@ -102,7 +103,11 @@ def _validate_disagg_inflight_cancel_config(
 
 
 def mapping_to_world_config(mapping: Mapping) -> WorldConfig:
-
+    if mapping.has_cp_ulysses():
+        raise ValueError(
+            "Ulysses context parallelism moves its KV cache with "
+            "transceiver_runtime='PYTHON' only: the C++ transceiver would read "
+            "its CP ranks as Helix token shards.")
     return WorldConfig(tensor_parallelism=mapping.tp_size,
                        pipeline_parallelism=mapping.pp_size,
                        context_parallelism=mapping.cp_size,
@@ -152,6 +157,12 @@ def create_kv_cache_transceiver(
             "Using UCX kv-cache transceiver. If your devices are not in the same domain, please consider setting "
             "UCX_CUDA_IPC_ENABLE_MNNVL=n, UCX_RNDV_SCHEME=put_zcopy and/or unset UCX_NET_DEVICES upon server "
             "hangs or lower-than-expected performance.")
+
+    if (cache_transceiver_config.backend in ("UCX", "NIXL")
+            and bound_cuda_ipc_cache_enabled()):
+        # Before any transfer agent opens UCX: cap the peer mappings each
+        # sender keeps cached (see cuda_ipc_cache).
+        bound_cuda_ipc_cache()
 
     # Select transceiver implementation based on transceiver_runtime.
     # transceiver_runtime == None or "CPP" -> use C++ transceiver.

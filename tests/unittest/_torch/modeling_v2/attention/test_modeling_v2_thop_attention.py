@@ -194,6 +194,15 @@ exercised:
    scales in a second pool, unit fp32 [3] second-level scales, bf16 output):
    the pool and its block scales bitwise as the append writes them, and the
    output against `reference` over the NVFP4 values (the cells).
+15. Kimi K3.1's DSA sparse MLA (`_k31_sparse_mla_env`): both MLA phases in
+   absorption mode over a bf16 or fp8 latent pool, each query row attending
+   exactly the up-to-2048 pool rows its sparse_attn_indices row names; the
+   96 heads a rank holds at attention TP 1 / attention DP padded to 128 with
+   zero query heads (the real heads unchanged, each zero head the mean of its
+   row's selected V rows), 48 / 24 / 12 / 6 / 3 heads at attention TP 2..32,
+   decode and DFlash2 verify blocks of 5 and 8, and mixed steps (the cells).
+   The rival test shows the gate separating the selected-rows model from
+   dense causal attention and from a rope slot the op did not write.
 The cells at the end drive the entry's own `reference` and `_compare` over the
 configurations the targets run.
 """
@@ -226,7 +235,8 @@ from tensorrt_llm.functional import RotaryScalingType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
-__extra_import_path__ = [".."]
+__extra_import_path__ = [".", ".."]
+import _k31_sparse_mla_env as k31  # noqa: E402 — needs the path declared above
 from _cells import certified_cells  # noqa: E402 — needs the path declared above
 from _validating import (  # noqa: E402,F401 — needs the path declared above
     ULP,
@@ -2547,7 +2557,10 @@ def test_bf16_paged_context_reads_the_pool_and_batch_state() -> None:
        own new tokens is invisible (the append lands wherever the offsets
        point and is read straight back from there).
     3. use_paged_context_fmha=False on a context call with a cached prefix is
-       silently wrong — no exception, an answer far off the reference.
+       silently wrong — no exception, an answer far off the reference. The
+       packed path then reads the whole cached + new history from the packed
+       QKV, past this call's rows, so the probe hands it a QKV with room for
+       them (otherwise the read faults whenever the next page is unmapped).
     4. context_lengths on a context row must be this call's new-token count;
        0 is far off. A larger value is not probed: the context FMHA then
        writes past the output buffer, which holds this call's new tokens
@@ -2624,9 +2637,13 @@ def test_bf16_paged_context_reads_the_pool_and_batch_state() -> None:
     # (3) the flag itself, and (4) the context length
     penv, pq = prepared()
     assert _bitwise_equal(pq, qkv), "the prepared state is not reproducible"
+    # The first `new` rows of a cached + new buffer: the packed path's read of the
+    # whole history stays inside this allocation.
+    pq_rows = torch.zeros((cached + new, pq.shape[1]), dtype=pq.dtype, device=pq.device)
+    pq_rows[:new] = pq
     _assert_far_outside(
         penv.call_op(
-            pq,
+            pq_rows[:new],
             [new],
             1,
             [0],
@@ -7294,6 +7311,251 @@ def _spread(batch: int, longest: int) -> tuple[int, ...]:
     return tuple(1 + (longest - 1) * i // (batch - 1) for i in range(batch))
 
 
+# Kimi K3.1's MLA layers: DSA sparse MLA in absorption mode, both phases (see _k31_sparse_mla_env).
+# `num_heads` is what the MLA hands the backend per rank -- 96 heads (attention TP 1 and every
+# attention-DP layout) are padded to 128 with zero query heads, `real_heads` -- and 48 / 24 / 12 / 6
+# / 3 are attention TP 2 / 4 / 8 / 16 / 32. `prompts` drive a context call over fresh prompts,
+# `history` + P a generation call (P = 1 decode, 5 and 8 the DFlash2 verify block widths).
+_K31 = dict(dsa_topk=k31.TOPK, pool="bf16", tokens_per_block=64)
+
+
+def _k31_ctx(heads: int, prompts: tuple, **kw) -> dict:
+    return dict(
+        _K31, input_type=MLA_CONTEXT, num_heads=heads, real_heads=heads, prompts=prompts, **kw
+    )
+
+
+def _k31_gen(heads: int, history: tuple, p: int, **kw) -> dict:
+    return dict(
+        _K31,
+        input_type=MLA_GENERATION,
+        num_heads=heads,
+        real_heads=heads,
+        history=history,
+        predicted_tokens_per_seq=p,
+        **kw,
+    )
+
+
+_K31_PAD = dict(num_heads=128, real_heads=96)
+
+K31_SPARSE_MLA_CELLS: tuple[Cell, ...] = (
+    Cell(
+        why="K3.1 ctx 96->128 padded bf16: a 2600-token prompt, rows past 2048 drop keys",
+        spec=dict(_k31_ctx(128, (2600,)), **_K31_PAD),
+    ),
+    Cell(
+        why="K3.1 ctx 96->128 padded fp8: prompts 2300 and 150 in one call",
+        spec=dict(_k31_ctx(128, (2300, 150), pool="fp8"), **_K31_PAD),
+    ),
+    Cell(
+        why="K3.1 ctx 96->128 padded bf16, 32-token pages: prompts 700 and 45",
+        spec=dict(_k31_ctx(128, (700, 45), tokens_per_block=32), **_K31_PAD),
+    ),
+    Cell(
+        why="K3.1 ctx 48 heads (TP2) bf16: a 2100-token prompt",
+        spec=_k31_ctx(48, (2100,)),
+    ),
+    Cell(
+        why="K3.1 ctx 48 heads (TP2) fp8, 128-token pages: prompts 900 and 333",
+        spec=_k31_ctx(48, (900, 333), pool="fp8", tokens_per_block=128),
+    ),
+    Cell(
+        why="K3.1 ctx 24 heads (TP4) fp8: prompts 700 and 300",
+        spec=_k31_ctx(24, (700, 300), pool="fp8"),
+    ),
+    Cell(why="K3.1 ctx 12 heads (TP8) bf16: a 2200-token prompt", spec=_k31_ctx(12, (2200,))),
+    Cell(
+        why="K3.1 ctx 6 heads (TP16) fp8: a 500-token prompt", spec=_k31_ctx(6, (500,), pool="fp8")
+    ),
+    Cell(why="K3.1 ctx 3 heads (TP32) bf16: a 400-token prompt", spec=_k31_ctx(3, (400,))),
+    Cell(
+        why="K3.1 gen 96->128 padded bf16 P=1: histories 3000 and 900",
+        spec=dict(_k31_gen(128, (3000, 900), 1), **_K31_PAD),
+    ),
+    Cell(
+        why="K3.1 gen 96->128 padded fp8 P=1: 16 requests, histories 30..4000",
+        spec=dict(_k31_gen(128, tuple(30 + 265 * i for i in range(16)), 1, pool="fp8"), **_K31_PAD),
+    ),
+    Cell(
+        why="K3.1 gen 96->128 padded fp8 P=5: histories 2500 and 64",
+        spec=dict(_k31_gen(128, (2500, 64), 5, pool="fp8"), **_K31_PAD),
+    ),
+    Cell(
+        why="K3.1 gen 96->128 padded fp8 P=8, 128-token pages: histories 2041 and 4000",
+        spec=dict(_k31_gen(128, (2041, 4000), 8, pool="fp8", tokens_per_block=128), **_K31_PAD),
+    ),
+    Cell(
+        why="K3.1 gen 96->128 padded bf16 P=8, 32-token pages: histories 1000 and 2100",
+        spec=dict(_k31_gen(128, (1000, 2100), 8, tokens_per_block=32), **_K31_PAD),
+    ),
+    Cell(
+        why="K3.1 gen 48 heads fp8 P=1: histories 3000 and 17",
+        spec=_k31_gen(48, (3000, 17), 1, pool="fp8"),
+    ),
+    Cell(
+        why="K3.1 gen 48 heads bf16 P=5: histories 2200 and 600", spec=_k31_gen(48, (2200, 600), 5)
+    ),
+    Cell(why="K3.1 gen 24 heads bf16 P=8: histories 2500 and 70", spec=_k31_gen(24, (2500, 70), 8)),
+    Cell(
+        why="K3.1 gen 12 heads fp8 P=1: histories 2600 and 5",
+        spec=_k31_gen(12, (2600, 5), 1, pool="fp8"),
+    ),
+    Cell(why="K3.1 gen 6 heads bf16 P=5: histories 2100 and 300", spec=_k31_gen(6, (2100, 300), 5)),
+    Cell(
+        why="K3.1 gen 3 heads fp8 P=8: histories 2300 and 40",
+        spec=_k31_gen(3, (2300, 40), 8, pool="fp8"),
+    ),
+    # A later chunk of a chunked prefill: the earlier chunks' rows are already in the pool, and
+    # the chunk's rows attend them through the indices.
+    Cell(
+        why="K3.1 chunk 96->128 padded bf16: 700 rows after a 1900-row prefix, 500 after 0",
+        spec=dict(_k31_ctx(128, (700, 500), prefix=(1900, 0)), **_K31_PAD),
+    ),
+    Cell(
+        why="K3.1 chunk 96->128 padded fp8: 1024 rows after a 3072-row prefix",
+        spec=dict(_k31_ctx(128, (1024,), pool="fp8", prefix=(3072,)), **_K31_PAD),
+    ),
+    # A mixed step: the context call and the generation call share one batch state, prompts
+    # first, as every step that admits a prompt next to running requests does.
+    Cell(
+        why="K3.1 mix 96->128 padded fp8 P=5: prompt 2200 beside histories 2600 and 90",
+        spec=dict(_k31_gen(128, (2600, 90), 5, pool="fp8", prompts=(2200,)), **_K31_PAD),
+    ),
+    Cell(
+        why="K3.1 mix 12 heads bf16 P=1: prompts 300 and 40 beside histories 2050 and 7",
+        spec=_k31_gen(12, (2050, 7), 1, prompts=(300, 40)),
+    ),
+)
+
+
+def _k31_fused_q(
+    rows: int, heads: int, real: int, gen: torch.Generator
+) -> Tuple[torch.Tensor, ...]:
+    """(fused q, q_pe): unit-scale real heads, zero padding heads. The rope slot of q holds
+    garbage on purpose -- the target leaves it unwritten for the op (context) or the
+    rope-generation op (generation) to fill from q_pe."""
+    q = torch.zeros(rows, heads, k31.LATENT_DIM)
+    q[:, :real] = torch.randn(rows, real, k31.LATENT_DIM, generator=gen)
+    q_pe = torch.zeros(rows, heads, k31.QK_ROPE_HEAD_DIM)
+    q_pe[:, :real] = torch.randn(rows, real, k31.QK_ROPE_HEAD_DIM, generator=gen)
+    q[:, :real, k31.KV_LORA_RANK :] = 50.0 * torch.randn(
+        rows, real, k31.QK_ROPE_HEAD_DIM, generator=gen
+    )
+    return q.to(torch.bfloat16).cuda(), q_pe.to(torch.bfloat16).cuda()
+
+
+def _k31_rope_filled(q: torch.Tensor, q_pe: torch.Tensor) -> torch.Tensor:
+    """The fused query with q_pe in its rope slot: what the op attends with (identity rope)."""
+    out = q.clone()
+    out[:, :, k31.KV_LORA_RANK :] = q_pe
+    return out
+
+
+def _k31_gate(out: torch.Tensor, ref: torch.Tensor, fp8_pool: bool) -> None:
+    """bf16 pool: `_compare`. fp8 pool: the fp8 MLA band both MLA phases are gated on above --
+    e4m3 q and latent rows are modelled by `reference(e4m3_inputs=True)`, the kernel's e4m3
+    softmax probabilities are not."""
+    if fp8_pool:
+        torch.testing.assert_close(out, ref, rtol=FP8_MLA_RTOL, atol=FP8_MLA_ATOL)
+    else:
+        _compare(out, ref)
+
+
+def _cell_k31_sparse_mla(cell, arm) -> None:
+    """Drive one K3.1 sparse MLA cell through `__call__` and gate it against `reference`.
+
+    Context: the pool must come back holding every prompt row bitwise at its page and slot (the
+    op's own append). Both phases: the whole output against the entry's reference per row over
+    exactly the selected keys. Padded cells add the padding claim: the real heads equal a
+    reference run at the real head count (so padding changes nothing they compute), and each zero
+    head holds the plain mean of its row's selected V rows (uniform weights; the MLA drops them).
+    """
+    arm(op)
+    spec = cell.spec
+    heads, real = spec["num_heads"], spec["real_heads"]
+    fp8 = spec["pool"] == "fp8"
+    gen = torch.Generator().manual_seed(zlib.crc32(cell.why.encode()))
+    prompts = tuple(spec.get("prompts", ()))
+    history = tuple(spec.get("history", ()))
+    p = spec.get("predicted_tokens_per_seq", 1)
+    prefix = tuple(spec.get("prefix", (0,) * len(prompts)))
+    env = k31.K31SparseMlaEnv(
+        num_heads=heads,
+        tokens_per_block=spec["tokens_per_block"],
+        fp8_pool=fp8,
+        max_seq_len=max([a + b for a, b in zip(prompts, prefix)] + list(history)) + p + 1,
+        max_batch=len(prompts) + len(history),
+        seed=zlib.crc32(cell.why.encode()) + 1,
+    )
+    ctx_ids = list(range(len(prompts)))
+    gen_ids = list(range(len(prompts), len(prompts) + len(history)))
+    for rid in ctx_ids + gen_ids:
+        env.add_request(rid)
+    gen_rows = len(history) * p
+    if history:
+        for rid, ln in zip(gen_ids, history):
+            env.prompt_lens[rid] = ln
+            env.write_rows(
+                rid, torch.randn(ln, k31.LATENT_DIM, generator=gen).to(torch.bfloat16).cuda()
+            )
+        new_rows = torch.randn(gen_rows, k31.LATENT_DIM, generator=gen).to(torch.bfloat16).cuda()
+        for g, rid in enumerate(gen_ids):
+            env.write_rows(rid, new_rows[g * p : (g + 1) * p])
+    for rid, ln in zip(ctx_ids, prefix):
+        if ln:
+            env.write_rows(
+                rid, torch.randn(ln, k31.LATENT_DIM, generator=gen).to(torch.bfloat16).cuda()
+            )
+    calls = []
+    if prompts:
+        rows = sum(prompts)
+        latent = torch.randn(rows, k31.LATENT_DIM, generator=gen).to(torch.bfloat16).cuda()
+        q, q_pe = _k31_fused_q(rows, heads, real, gen)
+        q_ref = _k31_rope_filled(q, q_pe)
+        out, selections = env.context(
+            ctx_ids, list(prompts), q.view(rows, -1), latent, q_pe, gen_request_ids=gen_ids
+        )
+        for rid in ctx_ids:
+            env.check_pool(rid)
+        calls.append((out, q_ref.view(rows, -1), selections))
+    if history:
+        q, q_pe = _k31_fused_q(gen_rows, heads, real, gen)
+        q_ref = _k31_rope_filled(q, q_pe)
+        out, selections = env.generation(
+            gen_ids,
+            q_ref.view(gen_rows, -1),
+            new_rows,
+            q_pe,
+            p,
+            ctx_requests=list(zip(ctx_ids, prompts)),
+            rows_written=True,
+        )
+        calls.append((out, q_ref.view(gen_rows, -1), selections))
+    for out, q_ref, selections in calls:
+        _k31_check_call(env, out, q_ref, selections, heads, real, fp8)
+
+
+def _k31_check_call(env, out, q_ref, selections, heads: int, real: int, fp8: bool) -> None:
+    rows = out.shape[0]
+    assert torch.isfinite(out).all(), "non-finite attention output"
+    ref = env.reference_rows(q_ref, selections)
+    _k31_gate(out, ref, fp8)
+    if real < heads:
+        sample = list(range(0, rows, max(1, rows // 48))) + [rows - 1]
+        real_ref = env.reference_rows(q_ref, selections, num_heads=real, rows=sample)
+        real_out = (
+            out[sample]
+            .view(len(sample), heads, k31.KV_LORA_RANK)[:, :real]
+            .reshape(len(sample), -1)
+        )
+        _k31_gate(real_out, real_ref, fp8)
+        pad_out = out[sample].view(len(sample), heads, k31.KV_LORA_RANK)[:, real:]
+        mean = env.selected_value_mean(selections, sample).to(torch.bfloat16)
+        pad_ref = mean.unsqueeze(1).expand_as(pad_out).reshape(len(sample), -1).contiguous()
+        _k31_gate(pad_out.reshape(len(sample), -1), pad_ref, fp8)
+
+
 # The shapes each shipped target calls this entry with, by target directory
 # under `models/`. The entry's own `CELLS` are the op's whoever calls it.
 TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
@@ -7779,6 +8041,10 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
 }
 
 CELLS = certified_cells(op, TARGET_CELLS)
+# Kimi K3.1 calls this entry from the family's DSA attention op (models/kimi_k31/ops/attention/dsa_attention.py),
+# which all three K3.1 targets run, not from a target's own modules, so its shapes are driven here without a
+# target key.
+CELLS = (*CELLS, *K31_SPARSE_MLA_CELLS)
 
 
 @pytest.mark.parametrize("cell", CELLS, ids=[c.why[:44] for c in CELLS])
@@ -7792,12 +8058,15 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811
     `is_valid`.
 
     The cells that state their batch as `cached`/`new` (or `seg_lens`, with no
-    KV cache) arm `certifying`, so their run is also proof that the entry's
-    own `__call__` and `reference` were the ones exercised.
+    KV cache), and Kimi K3.1's sparse MLA cells (`dsa_topk`), arm
+    `certifying`, so their run is also proof that the entry's own `__call__`
+    and `reference` were the ones exercised.
     """
     spec = cell.spec
     kind = spec["input_type"]
-    if spec.get("kv_cache") == "none":
+    if "dsa_topk" in spec:
+        _cell_k31_sparse_mla(cell, certifying)
+    elif spec.get("kv_cache") == "none":
         _cell_encoder(cell, certifying)
     elif "pool_layout" in spec:
         _cell_layered(cell, certifying)
@@ -7813,3 +8082,45 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811
         _fp8_mla_r1_generation_decode(
             cell.spec["num_heads"], cell.spec.get("predicted_tokens_per_seq", 1)
         )
+
+
+def test_k31_sparse_mla_attends_exactly_the_selected_rows(certifying) -> None:  # noqa: F811
+    """What makes the K3.1 cells a claim about *sparse* attention, measured on rivals.
+
+    A 2600-token prompt and a 3000-token decode at the padded 128 heads: rows that see more than
+    2048 keys attend a random 2048 of them. Gated against the reference over every causal key
+    instead (the op ignoring the indices), those rows fail; so does a context reference that
+    keeps the rope slot q arrived with instead of q_pe (the op not writing it). The pages are
+    shuffled, so a row index the op read as a position instead of a pool row would fail every
+    certified cell already.
+    """
+    certifying(op)
+    gen = torch.Generator().manual_seed(2600)
+    env = k31.K31SparseMlaEnv(
+        num_heads=128, tokens_per_block=64, fp8_pool=False, max_seq_len=3010, max_batch=2, seed=7
+    )
+    env.add_request(0)
+    rows = 2600
+    latent = torch.randn(rows, k31.LATENT_DIM, generator=gen).to(torch.bfloat16).cuda()
+    q, q_pe = _k31_fused_q(rows, 128, 96, gen)
+    q_ref = _k31_rope_filled(q, q_pe).view(rows, -1)
+    q_in = q.view(rows, -1).clone()
+    out, selections = env.context([0], [rows], q.view(rows, -1), latent, q_pe)
+    long_rows = list(range(k31.TOPK, rows, 7))
+    _compare(out[long_rows], env.reference_rows(q_ref, selections, rows=long_rows))
+    dense = [(rid, torch.arange(r + 1)) for r, (rid, _) in enumerate(selections)]
+    with pytest.raises(AssertionError):
+        _compare(out[long_rows], env.reference_rows(q_ref, dense, rows=long_rows))
+    with pytest.raises(AssertionError):
+        _compare(out[long_rows], env.reference_rows(q_in, selections, rows=long_rows))
+
+    env.add_request(1)
+    env.prompt_lens[1] = 3000
+    env.write_rows(1, torch.randn(3000, k31.LATENT_DIM, generator=gen).to(torch.bfloat16).cuda())
+    new_row = torch.randn(1, k31.LATENT_DIM, generator=gen).to(torch.bfloat16).cuda()
+    q, q_pe = _k31_fused_q(1, 128, 96, gen)
+    q_ref = _k31_rope_filled(q, q_pe).view(1, -1)
+    out, selections = env.generation([1], q_ref, new_row, q_pe, 1)
+    _compare(out, env.reference_rows(q_ref, selections))
+    with pytest.raises(AssertionError):
+        _compare(out, env.reference_rows(q_ref, [(1, torch.arange(3001))]))

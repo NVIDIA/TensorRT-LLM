@@ -50,6 +50,22 @@ class WaitingQueue(ABC):
         pass
 
     @abstractmethod
+    def peek_requests(self, k: int) -> list[RequestQueueItem]:
+        """Return up to ``k`` requests in pop order without removing them.
+
+        Implementations must not copy or sort the whole queue for a small ``k``.
+        """
+        pass
+
+    def admission_groups(self, requests: list[RequestQueueItem]) -> list[int]:
+        """Admission group of each request from ``peek_requests``, numbered in pop order.
+
+        Out-of-order admission must finish a group before the next one. Default:
+        one group.
+        """
+        return [0] * len(requests)
+
+    @abstractmethod
     def prepend_request(self, request: RequestQueueItem) -> None:
         """Re-insert a request that could not be scheduled.
 
@@ -130,6 +146,10 @@ class FCFSWaitingQueue(deque, WaitingQueue):
             raise IndexError("peek from an empty queue")
         return self[0]
 
+    def peek_requests(self, k: int) -> list[RequestQueueItem]:
+        """Return up to ``k`` requests from the front of the queue, O(k)."""
+        return list(itertools.islice(self, max(k, 0)))
+
     def prepend_request(self, request: RequestQueueItem) -> None:
         """Prepend a request to the front of the queue."""
         self.appendleft(request)
@@ -175,6 +195,7 @@ class PriorityWaitingQueue(WaitingQueue):
     Complexity:
         - add_request / add_requests: O(log n)
         - pop_request / peek_request: O(log n) / O(1)
+        - peek_requests(k): O(n log k), without copying or sorting the heap
         - remove_by_ids: O(n) rebuild + O(n) heapify
         - __iter__: O(n log n) over a sorted copy (priority order)
     """
@@ -224,6 +245,20 @@ class PriorityWaitingQueue(WaitingQueue):
         if not self._heap:
             raise IndexError("peek from an empty queue")
         return self._heap[0][2]
+
+    def peek_requests(self, k: int) -> list[RequestQueueItem]:
+        """Return up to ``k`` requests in priority order without removing them."""
+        return [e[2] for e in heapq.nsmallest(max(k, 0), self._heap)]
+
+    def admission_groups(self, requests: list[RequestQueueItem]) -> list[int]:
+        """One group per priority."""
+        groups = []
+        group = 0
+        for i, request in enumerate(requests):
+            if i and self._get_priority(request) != self._get_priority(requests[i - 1]):
+                group += 1
+            groups.append(group)
+        return groups
 
     def prepend_request(self, request: RequestQueueItem) -> None:
         """Re-insert a request ahead of all normally-added requests of the same priority.

@@ -4,6 +4,7 @@
 import asyncio
 import base64
 import copy
+import math
 import os
 import random
 import threading
@@ -36,7 +37,8 @@ from tensorrt_llm.serve.router import (COORDINATOR_SELECT_MAX_ATTEMPTS,
                                        KV_CACHE_HASH_ALGO_V1,
                                        KV_CACHE_HASH_ALGO_V2,
                                        KV_CACHE_HASH_ALGO_V2_SHA256_64,
-                                       BlockHashMixin, ConversationRouter,
+                                       ROUTING_CONTENT_REQUIRED, BlockHashMixin,
+                                       ConversationRouter,
                                        CoordinatorDelegatingRouter,
                                        KvCacheAwareRouter,
                                        KvCacheAwareServerState,
@@ -1818,6 +1820,289 @@ async def test_conversation_router_hash_skip_count():
     await r2.finish_request(req_a2)
     await r2.finish_request(req_b2)
     assert sb2 != sa2, "With skip, different content should not match"
+
+
+# ── ConversationRouter: placement of new conversation_ids by content ──
+
+# 16-token hash blocks, every 2nd block remembered, 4-block minimum match.
+_NEW_CONV_ARGS = dict(tokens_per_block=16,
+                      new_conversation_min_match_blocks=4,
+                      new_conversation_match_stride=2)
+# The same, following a match regardless of load.
+_ALWAYS_FOLLOW_ARGS = dict(_NEW_CONV_ARGS,
+                           new_conversation_follow_load_factor=float("inf"))
+_SHARED_PREFIX = list(range(1000, 1128))  # 8 blocks of 16 tokens
+
+
+def _conv_token_request(conversation_id, tokens):
+    return CompletionRequest(
+        model="TinyLlama",
+        prompt=list(tokens),
+        disaggregated_params=DisaggregatedParams(request_type="context_only"),
+        conversation_params=ConversationParams(conversation_id=conversation_id))
+
+
+def _count_hashing(router):
+    calls = []
+    original = router._request_to_block_hashes
+
+    def counting(request):
+        calls.append(request.conversation_params.conversation_id)
+        return original(request)
+
+    router._request_to_block_hashes = counting
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_new_conversation_follows_matching_prefix():
+    """A new conversation_id follows the longest matching conversation.
+
+    With an infinite follow load factor it joins that conversation's server
+    even when the server is the busiest.
+    """
+    servers = ["server1", "server2", "server3"]
+    router = ConversationRouter(server_role=None,
+                                servers=servers,
+                                **_ALWAYS_FOLLOW_ARGS)
+
+    sibling_a = _conv_token_request("t::sa:a", _SHARED_PREFIX + [1] * 40)
+    server_a, _ = await router.get_next_server(sibling_a)
+
+    # Unrelated conversation: least-loaded, i.e. not the busy server_a.
+    other = _conv_token_request("t2", list(range(5000, 5100)))
+    server_other, _ = await router.get_next_server(other)
+    assert server_other != server_a
+
+    # Sibling sharing 8 blocks: follows server_a although it is loaded.
+    sibling_b = _conv_token_request("t::sa:b", _SHARED_PREFIX + [2] * 40)
+    server_b, _ = await router.get_next_server(sibling_b)
+    assert server_b == server_a
+
+    # A shorter shared prefix (2 blocks < 4) falls back to least-loaded.
+    short = _conv_token_request("t::sa:c", _SHARED_PREFIX[:32] + [3] * 90)
+    server_short, _ = await router.get_next_server(short)
+    assert server_short not in (server_a, server_other)
+
+    # An excluded match server is skipped.
+    sibling_d = _conv_token_request("t::sa:d", _SHARED_PREFIX + [4] * 40)
+    server_d, _ = await router.get_next_server(sibling_d,
+                                               exclude_server=server_a)
+    assert server_d != server_a
+
+    assert router._num_new_conversations == 5
+    assert router._num_new_conversations_matched == 1
+    for request in (sibling_a, other, sibling_b, short, sibling_d):
+        await router.finish_request(request)
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_hashes_only_new_conversations():
+    servers = ["server1", "server2"]
+    router = ConversationRouter(server_role=None,
+                                servers=servers,
+                                **_NEW_CONV_ARGS)
+    calls = _count_hashing(router)
+
+    first = _conv_token_request("conv-a", _SHARED_PREFIX + [1] * 8)
+    server, _ = await router.get_next_server(first)
+    await router.finish_request(first)
+    assert calls == ["conv-a"]
+    for turn in range(3):
+        request = _conv_token_request("conv-a",
+                                      _SHARED_PREFIX + [1] * (16 + turn))
+        assert (await router.get_next_server(request))[0] == server
+        await router.finish_request(request)
+    assert calls == ["conv-a"], "known conversation_ids must not be hashed"
+
+    # Disabled (default): explicit conversation_ids are never hashed.
+    default_router = ConversationRouter(server_role=None, servers=servers)
+    default_calls = _count_hashing(default_router)
+    for conv_id in ("conv-a", "conv-b"):
+        request = _conv_token_request(conv_id, _SHARED_PREFIX)
+        await default_router.get_next_server(request)
+        await default_router.finish_request(request)
+    assert default_calls == []
+    assert not default_router._conv_content
+
+
+def test_conversation_router_new_conversation_env(monkeypatch):
+    monkeypatch.setenv("TRTLLM_CONVERSATION_ROUTER_NEW_CONV_MIN_MATCH_BLOCKS",
+                       "12")
+    assert ConversationRouter(server_role=None,
+                              servers=["s"])._new_conv_min_match_blocks == 12
+    assert ConversationRouter(
+        server_role=None, servers=["s"],
+        new_conversation_min_match_blocks=0)._new_conv_min_match_blocks == 0
+    router = create_router(
+        RouterConfig(type="conversation",
+                     args={"new_conversation_min_match_blocks": 3}), ["s"])
+    assert router._new_conv_min_match_blocks == 3
+    monkeypatch.delenv("TRTLLM_CONVERSATION_ROUTER_NEW_CONV_MIN_MATCH_BLOCKS")
+    assert ConversationRouter(server_role=None,
+                              servers=["s"])._new_conv_min_match_blocks == 0
+    with pytest.raises(ValueError):
+        ConversationRouter(server_role=None,
+                           servers=["s"],
+                           new_conversation_match_stride=0)
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_content_memory_is_bounded():
+    servers = ["server1", "server2"]
+    router = ConversationRouter(server_role=None,
+                                servers=servers,
+                                max_content_conversations=2,
+                                **_NEW_CONV_ARGS)
+    for index in range(3):
+        request = _conv_token_request(f"conv-{index}",
+                                      [index] * 64 + _SHARED_PREFIX)
+        await router.get_next_server(request)
+        await router.finish_request(request)
+    assert list(router._conv_content) == ["conv-1", "conv-2"]
+    assert len(router._conv_content_trie._root.children) == 2
+
+    # Removing a server forgets the content of its conversations.
+    server_1 = router._session_table["conv-1"][0]
+    await router.remove_server(server_1)
+    assert "conv-1" not in router._conv_content
+    assert (len(router._conv_content_trie._root.children) == len(
+        router._conv_content))
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_by_key_requests_content_for_new_ids():
+    """Coordinator path: new conversation_ids are placed by content.
+
+    A new conversation_id is placed only once the worker sends its content;
+    known ids are routed by id alone.
+    """
+    servers = ["server1", "server2", "server3"]
+    router = ConversationRouter(server_role=None,
+                                servers=servers,
+                                **_ALWAYS_FOLLOW_ARGS)
+    sibling_a = _conv_token_request("t::sa:a", _SHARED_PREFIX + [1] * 40)
+    sibling_b = _conv_token_request("t::sa:b", _SHARED_PREFIX + [2] * 40)
+
+    key = router.routing_key(sibling_a)
+    assert key == {"conversation_id": "t::sa:a", "num_tokens": 168}
+    server, info, req_id = await router.get_next_server_by_key(key, req_id=1)
+    assert server is None and req_id == 1
+    assert info == {ROUTING_CONTENT_REQUIRED: True}
+    assert sum(router._server_content_load.values()) == 0
+    assert "t::sa:a" not in router._session_table
+
+    server_a, _, _ = await router.get_next_server_by_key(
+        router.content_routing_key(sibling_a), req_id=1)
+    assert server_a in servers
+    # Known id: placed from the id alone.
+    again, _, _ = await router.get_next_server_by_key("t::sa:a", req_id=2)
+    assert again == server_a
+
+    content_key = router.content_routing_key(sibling_b)
+    assert content_key["conversation_id"] == "t::sa:b"
+    server_b, _, _ = await router.get_next_server_by_key(content_key, req_id=3)
+    assert server_b == server_a
+
+    # Without new-conversation matching the key is the id and always places.
+    default_router = ConversationRouter(server_role=None, servers=servers)
+    assert default_router.routing_key(sibling_a) == "t::sa:a"
+    server, _, _ = await default_router.get_next_server_by_key("t::sa:a",
+                                                               req_id=4)
+    assert server in servers
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_follow_is_load_aware():
+    """A match is followed only if its server is not too busy.
+
+    The matched server's backlog may exceed the least-loaded server's by at
+    most factor * matched tokens.
+    """
+    servers = ["server1", "server2", "server3"]
+    router = ConversationRouter(server_role=None,
+                                servers=servers,
+                                **_NEW_CONV_ARGS)
+    assert router._follow_load_factor == 1.0
+    sibling_a = _conv_token_request("t::sa:a", _SHARED_PREFIX + [1] * 40)
+    server_a, _ = await router.get_next_server(sibling_a)
+    assert router._get_content_load(server_a) == 168
+
+    # 168 tokens in flight on server_a vs 0 elsewhere > 96 matched tokens.
+    sibling_b = _conv_token_request("t::sa:b", _SHARED_PREFIX[:96] + [2] * 72)
+    server_b, _ = await router.get_next_server(sibling_b)
+    assert server_b != server_a
+    assert router._num_new_conversations_declined == 1
+
+    # Once server_a is idle the next sibling follows its deepest match
+    # (sibling_a); its backlog is the unmatched part of its prompt.
+    await router.finish_request(sibling_a)
+    sibling_c = _conv_token_request("t::sa:c", _SHARED_PREFIX + [3] * 40)
+    server_c, _ = await router.get_next_server(sibling_c)
+    assert server_c == server_a
+    assert router._get_content_load(server_a) == 168 - 128
+    assert router._num_new_conversations_matched == 1
+    for request in (sibling_b, sibling_c):
+        await router.finish_request(request)
+    assert all(router._get_content_load(s) == 0 for s in servers)
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_known_conversation_load_is_prompt_growth():
+    servers = ["server1", "server2"]
+    router = ConversationRouter(server_role=None,
+                                servers=servers,
+                                **_NEW_CONV_ARGS)
+    loads = []
+    for length in (168, 208, 210):
+        request = _conv_token_request("conv-a", list(range(length)))
+        server, _ = await router.get_next_server(request)
+        loads.append(router._get_content_load(server))
+        await router.finish_request(request)
+    # Full prompt, then the growth since the previous request (>= one block).
+    assert loads == [168, 40, 16]
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_by_key_load_is_released_on_finish():
+    servers = ["server1", "server2"]
+    router = ConversationRouter(server_role=None,
+                                servers=servers,
+                                **_NEW_CONV_ARGS)
+    request = _conv_token_request("conv-a", _SHARED_PREFIX + [1] * 40)
+    content_key = router.content_routing_key(request)
+    assert content_key["num_tokens"] == 168
+    assert content_key["block_tokens"] == 16
+    server, _, _ = await router.get_next_server_by_key(content_key, req_id=7)
+    assert router._server_content_load[server] == 168
+    later = _conv_token_request("conv-a", _SHARED_PREFIX + [1] * 80)
+    again, _, _ = await router.get_next_server_by_key(router.routing_key(later),
+                                                      req_id=8)
+    assert again == server
+    assert router._server_content_load[server] == 168 + 40
+    await router.finish_request_by_id(7)
+    await router.finish_request_by_id(8)
+    assert router._server_content_load[server] == 0
+    # A plain conversation_id key counts one request.
+    router._update_session("conv-b", server, [])
+    await router.get_next_server_by_key("conv-b", req_id=9)
+    assert router._server_content_load[server] == 1
+    await router.finish_request_by_id(9)
+    assert router._server_content_load[server] == 0
+
+
+def test_conversation_router_follow_load_factor_env(monkeypatch):
+    monkeypatch.setenv("TRTLLM_CONVERSATION_ROUTER_FOLLOW_LOAD_FACTOR", "inf")
+    assert math.isinf(
+        ConversationRouter(server_role=None, servers=["s"])._follow_load_factor)
+    assert ConversationRouter(
+        server_role=None,
+        servers=["s"],
+        new_conversation_follow_load_factor=0.5)._follow_load_factor == 0.5
+    with pytest.raises(ValueError):
+        ConversationRouter(server_role=None,
+                           servers=["s"],
+                           new_conversation_follow_load_factor=-1.0)
 
 
 @pytest.mark.asyncio

@@ -130,6 +130,10 @@ from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import (
     trtllm_gen_leaves_in_resolution_order,
 )
 from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.eligibility import check_flashinfer_provider
+from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.identity import (
+    TRTLLM_GEN_CAPABILITIES,
+    TRTLLM_GEN_PER_LAYER_DYNAMIC_EPLB_CAPABILITIES,
+)
 from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
@@ -663,6 +667,52 @@ def test_trtllm_literal_moves_to_flashinfer_under_the_opt_in_flag():
     ):
         report = resolve_moe_impl(_trtllm_gen_model_config())
     assert impl_class_for(report).provider == "flashinfer"
+
+
+def test_per_layer_dynamic_eplb_is_declared_by_the_native_nvfp4_leaf_only():
+    """Its ``run_moe`` takes the kernel's expert window from the replica plan."""
+    assert TrtllmTrtllmGenNvfp4Impl.capabilities is TRTLLM_GEN_PER_LAYER_DYNAMIC_EPLB_CAPABILITIES
+    # The declaration adds that one flag to the family's.
+    assert (
+        dataclasses.replace(
+            TRTLLM_GEN_PER_LAYER_DYNAMIC_EPLB_CAPABILITIES, supports_per_layer_dynamic_eplb=False
+        )
+        == TRTLLM_GEN_CAPABILITIES
+    )
+    for impl_id in _TRTLLM_GEN_IDS:
+        impl = MOE_IMPL_REGISTRY.lookup(MoEImplId.parse(impl_id))
+        assert impl.capabilities.supports_per_layer_dynamic_eplb == (
+            impl is TrtllmTrtllmGenNvfp4Impl
+        ), impl_id
+
+
+def _per_layer_dynamic_eplb_deployment(env: MoEEnvironment) -> MoEDeployment:
+    return dataclasses.replace(
+        _single_rank_deployment(env), eplb_enabled=True, eplb_mode="per_layer_dynamic"
+    )
+
+
+def test_per_layer_dynamic_eplb_keeps_the_trtllm_literal_on_the_nvfp4_leaf():
+    env = _trtllm_gen_environment(flashinfer=True)
+    with override_moe_environment(env):
+        report = resolve_moe_impl(
+            _trtllm_gen_model_config(), deployment=_per_layer_dynamic_eplb_deployment(env)
+        )
+    assert impl_class_for(report) is TrtllmTrtllmGenNvfp4Impl
+    assert report.to_dict()["deployment"]["eplb_mode"] == "per_layer_dynamic"
+
+
+def test_per_layer_dynamic_eplb_refuses_a_leaf_without_the_capability():
+    """A pin on a leaf that ignores replica plans fails instead of running unbalanced."""
+    env = _trtllm_gen_environment(flashinfer=True, use_flashinfer_flag=True)
+    with override_moe_environment(env):
+        report = resolve_moe_impl(
+            _trtllm_gen_model_config(),
+            deployment=_per_layer_dynamic_eplb_deployment(env),
+            impl_id="flashinfer.trtllm_gen.fused_moe.nvfp4",
+        )
+    assert report.winner is None
+    assert [rejection.reason for rejection in report.rejected] == [MoERejectReason.EPLB_UNSUPPORTED]
 
 
 def test_deepseek_v4_routing_is_its_own_problem_but_keeps_v3s_kernel_encoding():

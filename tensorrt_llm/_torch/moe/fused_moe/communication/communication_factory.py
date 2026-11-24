@@ -186,6 +186,20 @@ class CommunicationFactory:
             )
             return AllGatherReduceScatter(mapping)
 
+        # Per-layer dynamic EPLB routes to slot ids rank * (H + S) + slot; DeepEP sizes its
+        # dispatch by H alone (drops helper-slot tokens) and DeepEPLowLatency fails in combine.
+        per_layer_dynamic = (
+            getattr(model_config.moe_load_balancer, "mode", None) == "per_layer_dynamic"
+        )
+        if (
+            per_layer_dynamic
+            and force_method is not None
+            and force_method.upper() in ("DEEPEP", "DEEPEPLOWLATENCY")
+        ):
+            raise ValueError(
+                f"{force_source}={force_method} does not support per-layer dynamic EPLB"
+            )
+
         if force_method is not None:
             strategy = CommunicationFactory._create_forced_method(
                 force_method,
@@ -295,7 +309,11 @@ class CommunicationFactory:
             logger.debug(f"NcclEP not available: {nccl_ep_unavailable_reason}")
 
         # Try DeepEP (if enabled and weight dtype is bfloat16)
-        if os.environ.get("TRTLLM_CAN_USE_DEEP_EP", "1") == "1" and act_dtype == torch.bfloat16:
+        if (
+            not per_layer_dynamic
+            and os.environ.get("TRTLLM_CAN_USE_DEEP_EP", "1") == "1"
+            and act_dtype == torch.bfloat16
+        ):
             try:
                 strategy = DeepEP(
                     mapping,

@@ -1072,7 +1072,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                      device=self._batch_indices.device,
                      out=self._batch_indices[:num_seqs])
 
-    def update_for_spec_dec(self) -> None:
+    def update_for_spec_dec(self, refresh_device_metadata: bool = True) -> None:
         if not self._is_separate_kv_draft_view:
             return
         self._prepare_full_draft_page_table()

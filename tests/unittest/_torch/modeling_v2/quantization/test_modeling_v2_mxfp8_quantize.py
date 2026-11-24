@@ -38,6 +38,19 @@ def _build(spec, seed):
     return torch.randn(spec["shape"], generator=g, device="cuda").to(spec["dtype"])
 
 
+# The cells of every Kimi K3.1 target: the general one and the SM 10.3 perf targets copied from it.
+_K31_TARGET_CELLS: tuple[Cell, ...] = (
+    *(
+        Cell(
+            why=f"kimi k3.1 routed latent 3584 into the MXFP4 MoE runner, {rows} row(s), "
+            "linear scales, already 512-aligned",
+            spec=dict(shape=(rows, 3584), dtype=torch.bfloat16, swizzled=False, alignment=512),
+        )
+        for rows in (1, 8, 2048)
+    ),
+)
+
+
 # The shapes each shipped target calls this entry with, by target directory
 # under `models/`. The entry's own `CELLS` are the op's whoever calls it.
 TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
@@ -47,6 +60,9 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
             spec=dict(shape=(16, 2880), dtype=torch.bfloat16, swizzled=False, alignment=512),
         ),
     ),
+    "kimi_k31/kimi_k31_pro_mxfp4__sm_10x__default": _K31_TARGET_CELLS,
+    "kimi_k31/kimi_k31_pro_mxfp4__sm_103__tep": _K31_TARGET_CELLS,
+    "kimi_k31/kimi_k31_pro_mxfp4__sm_103__dep": _K31_TARGET_CELLS,
 }
 
 CELLS = certified_cells(op, TARGET_CELLS)

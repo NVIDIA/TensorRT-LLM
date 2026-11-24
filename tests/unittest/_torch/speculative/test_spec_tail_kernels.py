@@ -64,6 +64,35 @@ def test_strict_accept_matches_eager(num_ctx, num_gens, draft_len):
     assert torch.equal(accepted[num_ctx:], ref_accepted[num_ctx:])
 
 
+def test_strict_accept_one_variant_for_all_batches():
+    """Serving changes the request counts every iteration: one compiled kernel serves them all."""
+    import triton
+
+    from tensorrt_llm._torch.speculative import spec_tail_kernels
+
+    caches = getattr(spec_tail_kernels._strict_accept_kernel, "device_caches", None)
+    if caches is None:
+        pytest.skip("this Triton has no JITFunction.device_caches")
+    device = triton.runtime.driver.active.get_current_device()
+    draft_len = 5
+
+    def run(num_ctx, num_gens, offset):
+        target = torch.randint(0, 4, (num_ctx + num_gens * (draft_len + 1),), device="cuda")
+        wide = torch.randint(0, 4, (num_gens, draft_len + 2), device="cuda", dtype=torch.int32)
+        draft = wide[:, offset : offset + draft_len]
+        accepted, num_accepted = strict_accept(target, draft, num_ctx, num_ctx + num_gens)
+        ref_accepted, ref_num = _eager_strict_accept(target, draft, num_ctx, num_ctx + num_gens)
+        assert torch.equal(num_accepted, ref_num)
+        assert torch.equal(accepted[num_ctx:], ref_accepted[num_ctx:])
+
+    run(3, 0, 0)
+    variants = len(caches[device][0])
+    for num_ctx, num_gens in [(1, 0), (16, 0), (17, 0), (0, 1), (0, 16), (2, 5), (1, 130), (200, 7)]:
+        for offset in (0, 1):
+            run(num_ctx, num_gens, offset)
+    assert len(caches[device][0]) == variants
+
+
 def test_decode_draft_block_table_matches_eager():
     num_pools, rows, n_blocks, divisor = 2, 9, 3000, 6
     gen = torch.Generator(device="cuda").manual_seed(1)

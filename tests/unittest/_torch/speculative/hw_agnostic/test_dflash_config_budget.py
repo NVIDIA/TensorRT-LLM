@@ -465,8 +465,16 @@ class TestLlmArgsWiring:
         from tensorrt_llm.llmapi.llm_args import CpConfig
 
         monkeypatch.delenv(SKIP_EST_ENV, raising=False)
-        args = self._args(tmp_path, max_batch_size=8, cp_config=CpConfig())
+        args = self._args(tmp_path, max_batch_size=8, cp_config=CpConfig(cp_type="HELIX"))
         assert args._kv_cache_estimation_runs() is False
+
+    def test_estimation_runs_for_ulysses_context_parallelism(self, tmp_path, monkeypatch):
+        """Ulysses CP keeps the TP KV layout, so the KV pool is sized as under TP."""
+        from tensorrt_llm.llmapi.llm_args import CpConfig
+
+        monkeypatch.delenv(SKIP_EST_ENV, raising=False)
+        args = self._args(tmp_path, max_batch_size=8, cp_config=CpConfig(cp_type="ULYSSES"))
+        assert args._kv_cache_estimation_runs() is True
 
     def test_oversized_batch_rejected_through_llm_args(self, tmp_path):
         # A batch that overruns a tight buffer budget at the serve-time

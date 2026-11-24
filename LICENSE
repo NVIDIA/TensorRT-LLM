@@ -31,7 +31,7 @@ Licensed under the BSD 3-Clause License
 CUTLASS
 --------------------------------------------------------------------------------
 Original Source: https://github.com/NVIDIA/cutlass
-Copyright (c) 2017 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+Copyright (c) 2017 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 Licensed under the BSD 3-Clause License
 
 --------------------------------------------------------------------------------
@@ -54,6 +54,7 @@ flash-linear-attention
 --------------------------------------------------------------------------------
 Original Source: https://github.com/fla-org/flash-linear-attention
 Copyright (c) 2023-2025 Songlin Yang
+Copyright (c) 2023-2026 Songlin Yang, Yu Zhang, Zhiyuan Li
 Licensed under the MIT License
 
 --------------------------------------------------------------------------------
@@ -125,6 +126,13 @@ Text Generation Inference
 Original Source: https://github.com/huggingface/text-generation-inference
 Copyright 2022 Hugging Face
 Licensed under the Apache License 2.0
+
+--------------------------------------------------------------------------------
+TokenSpeed MLA (tokenspeed-mla)
+--------------------------------------------------------------------------------
+Original Source: https://github.com/lightseekorg/tokenspeed
+Copyright (c) 2026 LightSeek Foundation <contact@lightseek.org>
+Licensed under the MIT License
 
 --------------------------------------------------------------------------------
 Transformers

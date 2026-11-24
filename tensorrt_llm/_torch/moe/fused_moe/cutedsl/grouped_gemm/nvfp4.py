@@ -40,7 +40,12 @@ from ...impl_identity import MoEImplDescriptor, register_moe_impl
 from ...interface import MoESchedulerKind
 from ...quantization import NVFP4CuteDslFusedMoEMethod
 from ..identity import grouped_gemm_identity
-from ..kernel_inputs import NvFp4WeightView, finalize_routing_scales, quantize_input_nvfp4
+from ..kernel_inputs import (
+    NvFp4WeightView,
+    finalize_routing_scales,
+    quantize_input_nvfp4,
+    sort_routing,
+)
 from ..runners import CuteDslFusedMoENvfp4Runner
 from .base import CuteDslFusedMoEBase
 from .eligibility import check_grouped_gemm_leaf
@@ -386,6 +391,7 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
         else:
             if use_count_native_expert_metadata:
                 raise RuntimeError("Count-native metadata requires DeepEP receive counts")
+            # The routing tail may attach this rank's moe_sort outputs to the ids.
             (
                 tile_idx_to_expert_idx,
                 tile_idx_to_mn_limit,
@@ -393,14 +399,8 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
                 permuted_idx_to_expanded_idx,
                 _total_num_padded_tokens,
                 num_non_exiting_tiles,
-            ) = torch.ops.trtllm.moe_sort(
-                token_selected_experts=token_selected_experts,
-                token_final_scales=token_final_scales,
-                num_experts=self.num_slots,
-                top_k=effective_top_k,
-                local_expert_offset=slot_start,
-                local_num_experts=esp,
-                tile_tokens_dim=tile_size,
+            ) = sort_routing(
+                self, token_selected_experts, token_final_scales, weight_view, tile_size
             )
 
         has_aux_streams = self._has_moe_output_memset_aux_stream()

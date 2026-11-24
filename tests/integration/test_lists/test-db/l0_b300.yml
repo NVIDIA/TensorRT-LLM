@@ -70,11 +70,17 @@ l0_b300:
   - unittest/_torch/modules/test_qwen4_exp_ple_offload.py
   - unittest/_torch/modules/mamba
   - unittest/_torch/modules/tests_lora_modules
+  - unittest/_torch/modules/dwdp/test_dwdp_cross_step_prefetch_gpu.py
   # ------------- MoE components tests ---------------
   - unittest/_torch/moe/test_moe_load_balancer.py
   - unittest/_torch/moe/test_moe_routing.py
   - unittest/_torch/moe/fused_moe/test_deepgemm_fused_gather_finalize.py
   - unittest/_torch/moe/fused_moe/test_deepgemm_fused_expand_quant.py
+  - unittest/_torch/moe/test_cute_dsl_fc12_die.py
+  - unittest/_torch/moe/test_cute_dsl_fc12_prezero.py
+  # ------------- Speculative decoding head and drafter-slot kernels ---------------
+  - unittest/_torch/speculative/test_drafter_slot_reset_no_sync.py
+  - unittest/_torch/speculative/test_spec_head_kernels.py
   # ------------- Kimi K3 NVFP4: expert loading + SiTU ---------------
   # Listed test-by-test on purpose. The rest of this file has 19 failures that
   # predate this work (verified by running the base revision's copy against the

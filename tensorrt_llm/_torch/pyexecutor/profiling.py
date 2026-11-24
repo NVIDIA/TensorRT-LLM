@@ -55,6 +55,8 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import get_global_profiler
 
+from .device_memory_log import device_mem_log_interval, device_memory_snapshot
+
 # Environment-variable names used by both the env-var-driven legacy
 # path and the runtime HTTP-endpoint path. They are duplicated as
 # module-level constants here so callers that only need the manager
@@ -653,6 +655,8 @@ class PyExecutorProfileManager:
             log_ranks = {int(r) for r in log_ranks_str.split(",")}
 
         calibrator = get_calibrator()
+        # Iterations between device/process memory snapshots in the iteration log.
+        device_mem_interval = device_mem_log_interval()
 
         # Local helper so the inner closure does not need to call
         # ``self._activities_from_names`` which would force a
@@ -761,6 +765,8 @@ class PyExecutorProfileManager:
                         executor.num_fetch_requests_cur_rank - prev_fetch_requests_cur_rank
                     )
                     prev_fetch_requests_cur_rank = executor.num_fetch_requests_cur_rank
+                    # ADP hold counters, "" unless the router holds bound conversations.
+                    hold_log = getattr(getattr(executor, "adp_router", None), "hold_log", "")
                     logger.info(
                         f"iter = {executor.iter_counter}, "
                         f"global_rank = {executor.global_rank}, "
@@ -779,7 +785,14 @@ class PyExecutorProfileManager:
                         f"num_fetched = {num_fetched}, "
                         f"num_dummy = {executor.num_dummy_requests}, "
                         f"num_unscheduled = {executor.num_unscheduled_requests}"
+                        f"{hold_log if isinstance(hold_log, str) else ''}"
                     )
+                    if device_mem_interval > 0 and executor.iter_counter % device_mem_interval == 0:
+                        logger.info(
+                            f"device_mem: iter = {executor.iter_counter}, "
+                            f"rank = {executor.dist.rank}, "
+                            f"{device_memory_snapshot()}"
+                        )
 
             # profile_step runs at the start of each executor loop after
             # logging the preceding loop. Clear the counters before the next

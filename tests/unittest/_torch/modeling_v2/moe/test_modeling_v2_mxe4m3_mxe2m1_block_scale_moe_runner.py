@@ -403,6 +403,7 @@ def _ref_moe(
     num_local: int | None = None,
     swap_gate_up: bool = False,
     quantize_intermediate: bool = True,
+    situ: tuple[float, float] | None = None,
 ):
     """Native-torch MoE over dequantized mxfp4 weights, fp32 throughout.
 
@@ -410,6 +411,12 @@ def _ref_moe(
     `[offset, offset + num_local)`. `scales[t, j]` multiplies slot `j`'s
     expert output; nothing is renormalized. The FC1 activation is requantized
     to MXFP8 before FC2, which is what the kernel does.
+
+    `situ=(gate_cap, linear_cap)` replaces the clamped SwiGlu with act_type 3
+    (Kimi's SiTU): `linear_cap*tanh(up/linear_cap) * gate_cap*tanh(gate/gate_cap)
+    * sigmoid(gate)`, where `up` is FC1's first half (x0) and `gate` its second
+    (x1), the halves SwiGlu reads the same way. `alpha`, `beta` and `limit` are
+    then ignored: the caps ride in the kernel's gemm1_alpha / gemm1_beta slots.
     """
     num_tokens, hidden = x_valid.shape
     up_c, up_s, up_b = ref["up"]
@@ -428,13 +435,19 @@ def _ref_moe(
         xe = xf[tok]
         up = xe @ _dequant(up_c[local_e], up_s[local_e]).t() + up_b[local_e]
         gate = xe @ _dequant(gt_c[local_e], gt_s[local_e]).t() + gt_b[local_e]
-        if limit is not None:
-            lim = float(limit[local_e])
-            gate = gate.clamp(max=lim)
-            up = up.clamp(-lim, lim)
-        a = 1.0 if alpha is None else float(alpha[local_e])
-        b = 0.0 if beta is None else float(beta[local_e])
-        act = (up + b) * gate * torch.sigmoid(a * gate)
+        if situ is not None:
+            gate_cap, linear_cap = situ
+            act = (linear_cap * torch.tanh(up / linear_cap)) * (
+                gate_cap * torch.tanh(gate / gate_cap) * torch.sigmoid(gate)
+            )
+        else:
+            if limit is not None:
+                lim = float(limit[local_e])
+                gate = gate.clamp(max=lim)
+                up = up.clamp(-lim, lim)
+            a = 1.0 if alpha is None else float(alpha[local_e])
+            b = 0.0 if beta is None else float(beta[local_e])
+            act = (up + b) * gate * torch.sigmoid(a * gate)
         if quantize_intermediate:
             act = _q_intermediate(act)
         y = act @ _dequant(dn_c[local_e], dn_s[local_e]).t() + dn_b[local_e]
@@ -1626,6 +1639,364 @@ def _window(args, ref, offset: int, num_local: int):
     return sub, sub_ref
 
 
+# ── Kimi K3.1 ─────────────────────────────────────────────────────────────
+
+#: Kimi K3.1's routed experts: 896 experts, top-16, read and written at the
+#: latent width (routed_expert_hidden_size); 3072 intermediate columns per
+#: expert before a MoE TP split.
+_K31 = dict(hidden=3584, num_experts=896, top_k=16)
+_K31_INTERMEDIATE = 3072
+#: SiTU's soft caps: activation_situ_beta on the gate half, activation_situ_linear_beta
+#: on the linear half. The target passes them per local expert in gemm1_alpha /
+#: gemm1_beta (SiTuActivation.constants()).
+_K31_GATE_CAP, _K31_LINEAR_CAP = 4.0, 25.0
+_ACT_TYPE_SITU = 3  # ActType_TrtllmGen.SiTu
+_ROUTING_DEEPSEEK_V3 = 2  # RoutingMethodType.DeepSeekV3
+#: Smallest gap the K3.1 router inputs leave between the 16th and 17th selection
+#: score. The kernel's sigmoid differs from torch's in the last fp32 bits; a gap
+#: below that would let the two routings run different experts, which is not
+#: what a cell is about.
+_ROUTING_MARGIN = 1e-4
+
+
+def _k31_router(num_tokens: int, num_experts: int, top_k: int, gen: torch.Generator):
+    """fp32 router logits and fp32 e_score_correction_bias, the dtypes the target passes.
+
+    Each token's logits are a permuted ladder; a token whose top-k boundary
+    (`sigmoid(logit) + bias`) is closer than `_ROUTING_MARGIN` is re-drawn.
+    """
+    bias = torch.randn(num_experts, device=DEV, generator=gen) * 0.05
+    ladder = torch.linspace(-4.0, 4.0, num_experts, device=DEV)
+    logits = torch.empty(num_tokens, num_experts, device=DEV)
+    todo = torch.arange(num_tokens, device=DEV)
+    for _ in range(64):
+        perm = torch.rand(todo.numel(), num_experts, device=DEV, generator=gen).argsort(dim=1)
+        logits[todo] = ladder[perm]
+        top = torch.topk(torch.sigmoid(logits[todo].double()) + bias.double(), top_k + 1).values
+        todo = todo[(top[:, top_k - 1] - top[:, top_k]) <= _ROUTING_MARGIN]
+        if todo.numel() == 0:
+            return logits, bias
+    raise AssertionError("could not draw router logits with a clear top-k boundary")
+
+
+def _deepseek_v3_routing(logits: torch.Tensor, bias: torch.Tensor, top_k: int, scale: float):
+    """DeepSeekV3 routing with one group: select by `sigmoid(logit) + bias`,
+    weight by the unbiased sigmoid renormalized over the kept experts, times
+    `scale`. Ids are global; weights are bf16, the dtype the kernel keeps them in
+    and the one it takes pre-routed."""
+    scores = torch.sigmoid(logits.double())
+    ids = torch.topk(scores + bias.double(), top_k, dim=-1).indices
+    weights = torch.gather(scores, 1, ids)
+    weights = weights / weights.sum(dim=-1, keepdim=True) * scale
+    return ids.to(torch.int32), weights.to(torch.bfloat16)
+
+
+_K31_LAYER: dict = {}
+
+
+def _k31_layer(num_local: int, inter: int, i_pad: int | None):
+    """This rank's expert window at K3.1 geometry, without expert biases.
+
+    Only the window is built: the kernel reads weights for its local experts
+    alone, and the whole 896-expert bank at H=3584, I=3072 is tens of GB of
+    operand plus reference codes. One geometry is kept at a time.
+    """
+    key = (num_local, inter, i_pad)
+    if key not in _K31_LAYER:
+        _K31_LAYER.clear()
+        torch.cuda.empty_cache()
+        args, ref = _build(num_local, _K31["hidden"], inter, seed=311, i_pad=i_pad)
+        # The K3.1 routed experts carry no bias, and the target passes None for both.
+        args = dict(args, gemm1_bias=None, gemm2_bias=None)
+        for role in ("up", "gate", "down"):
+            c, s, b = ref[role]
+            ref[role] = (c, s, torch.zeros_like(b))
+        _K31_LAYER[key] = (args, ref)
+    return _K31_LAYER[key]
+
+
+def _k31_situ_caps(num_local: int):
+    return (
+        torch.full((num_local,), _K31_GATE_CAP, dtype=torch.float32, device=DEV),
+        torch.full((num_local,), _K31_LINEAR_CAP, dtype=torch.float32, device=DEV),
+    )
+
+
+def _k31_cell(**spec):
+    """A K3.1 cell spec; `intermediate` defaults to the unsplit 3072 (EP-only)."""
+    return {
+        **_K31,
+        "activation": "situ",
+        "routing": "deepseek_v3",
+        "intermediate": _K31_INTERMEDIATE,
+        **spec,
+    }
+
+
+#: Deviation of every K3.1 cell driven in this process, in bf16 ulp
+#: (worst element, relative RMS), for the band's derivation.
+_K31_MEASURED: dict[str, tuple[float, float]] = {}
+
+
+def _certify_kimi_k31_cell(cell: Cell) -> None:
+    """One K3.1 cell: the target's call, against `_ref_moe` with SiTU.
+
+    The entry's own `reference` models the clamped SwiGlu only, so it cannot
+    stand in for act_type 3; this file's `_ref_moe(situ=...)` does, over the same
+    exact operands. Routing is checked through its effect: the expected ids and
+    weights are recomputed with `_deepseek_v3_routing`, and an in-kernel route
+    that picked or weighted differently lands far outside the band.
+
+    The gate is `_compare`'s 8 / 4 ulp, unchanged: measured on GB300 over the
+    K3.1 cells, worst 3.1 ulp element-wise (dep16, 2048 tokens) and 0.84 ulp
+    RMS (tep4 decode). SiTU's tanh adds nothing visible over SwiGlu's sigmoid.
+    """
+    spec = cell.spec
+    off, n = spec["local_expert_offset"], spec["local_num_experts"]
+    num_experts, hidden, top_k = spec["num_experts"], spec["hidden"], spec["top_k"]
+    args, ref = _k31_layer(n, spec["intermediate"], spec.get("intermediate_pad"))
+    gen = torch.Generator(device=DEV).manual_seed(zlib.crc32(cell.why.encode()) % 2**31)
+    data, sf, xv = _rand_mxfp8(spec["tokens"], hidden, ref["h1_pad"], gen)
+    logits, bias = _k31_router(spec["tokens"], num_experts, top_k, gen)
+    ids, wts = _deepseek_v3_routing(logits, bias, top_k, 1.0)
+    gate_cap, linear_cap = _k31_situ_caps(n)
+    if spec["routed_by_kernel"]:
+        # Attention TP: the kernel routes from the fp32 logits and the bias.
+        entry = dict(routing_logits=logits, routing_bias=bias)
+    else:
+        # Attention DP: top-k was taken before the dispatch; no logits, no bias.
+        entry = dict(topk_ids=ids, topk_weights=wts)
+    y = _call(
+        data,
+        sf,
+        args,
+        num_experts,
+        top_k,
+        local_expert_offset=off,
+        local_num_experts=n,
+        n_group=1,
+        topk_group=1,
+        routed_scaling_factor=1.0,
+        routing_method_type=_ROUTING_DEEPSEEK_V3,
+        act_type=_ACT_TYPE_SITU,
+        gemm1_alpha=gate_cap,
+        gemm1_beta=linear_cap,
+        **entry,
+    )
+    assert y.shape == (spec["tokens"], hidden), y.shape
+    exp = _ref_moe(
+        xv, ids, wts, ref, offset=off, num_local=n, situ=(_K31_GATE_CAP, _K31_LINEAR_CAP)
+    ).to(torch.bfloat16)
+    _K31_MEASURED[cell.why] = _dev(y, exp)
+    print(f"  {cell.why}: {_K31_MEASURED[cell.why][0]:.2f} / {_K31_MEASURED[cell.why][1]:.2f} ulp")
+    _compare(y, exp)
+    if spec["routed_by_kernel"]:
+        # The bias is load-bearing in this cell: routing without it picks other
+        # experts, and the band refuses the result.
+        unbiased = _deepseek_v3_routing(logits, torch.zeros_like(bias), top_k, 1.0)
+        wrong = _ref_moe(
+            xv, *unbiased, ref, offset=off, num_local=n, situ=(_K31_GATE_CAP, _K31_LINEAR_CAP)
+        ).to(torch.bfloat16)
+        with pytest.raises(AssertionError):
+            _compare(y, wrong)
+
+
+def _situ_per_expert_ref(xv, ids, wts, ref, gate_caps, linear_caps, **kw):
+    """`_ref_moe` with SiTU, one cap pair per local expert."""
+    out = torch.zeros(xv.shape[0], xv.shape[1], dtype=torch.float32, device=DEV)
+    for e in range(gate_caps.numel()):
+        out += _ref_moe(
+            xv,
+            torch.where(ids == e, ids, torch.full_like(ids, -1)),
+            wts,
+            ref,
+            situ=(float(gate_caps[e]), float(linear_caps[e])),
+            **kw,
+        )
+    return out.to(torch.bfloat16)
+
+
+def _situ_layer_without_fc1_bias(seed: int):
+    num_experts, hidden, inter, top_k, num_tokens = 8, 512, 256, 3, 24
+    args, ref = _build(num_experts, hidden, inter, seed=seed)
+    gen = ref["gen"]
+    data, sf, xv = _rand_mxfp8(num_tokens, hidden, ref["h1_pad"], gen)
+    ids, wts = _routing(num_tokens, num_experts, top_k, gen)
+    no_fc1_bias = dict(ref)
+    for role in ("up", "gate"):
+        c, s, b = ref[role]
+        no_fc1_bias[role] = (c, s, torch.zeros_like(b))
+    return args, ref, no_fc1_bias, data, sf, xv, ids, wts, num_experts, top_k
+
+
+def test_kimi_k31_situ_reads_x1_as_gate_and_caps_per_expert():
+    """Pin the SiTU convention the K3.1 cells' reference assumes.
+
+    Every expert gets its own cap pair, so the cells' uniform (4, 25) cannot hide
+    a kernel that reads only the first entry or swaps the two slots. Measured on
+    GB300: the convention below at 1.9 / 0.7 ulp; reading FC1's halves the other
+    way round 351 / 245, the two caps swapped 108 / 67, expert 0's caps for
+    every expert 1050 / 546.
+    """
+    args, _, ref, data, sf, xv, ids, wts, num_experts, top_k = _situ_layer_without_fc1_bias(31)
+    args = dict(args, gemm1_bias=None)
+    gate_caps = torch.linspace(1.5, 6.0, num_experts, device=DEV)
+    linear_caps = torch.linspace(2.0, 30.0, num_experts, device=DEV)
+    out = _call(
+        data,
+        sf,
+        args,
+        num_experts,
+        top_k,
+        topk_ids=ids,
+        topk_weights=wts,
+        routing_method_type=_ROUTING_DEEPSEEK_V3,
+        act_type=_ACT_TYPE_SITU,
+        gemm1_alpha=gate_caps,
+        gemm1_beta=linear_caps,
+    )
+    _compare(out, _situ_per_expert_ref(xv, ids, wts, ref, gate_caps, linear_caps))
+    for wrong in (
+        _situ_per_expert_ref(xv, ids, wts, ref, gate_caps, linear_caps, swap_gate_up=True),
+        _situ_per_expert_ref(xv, ids, wts, ref, linear_caps, gate_caps),
+        _situ_per_expert_ref(
+            xv,
+            ids,
+            wts,
+            ref,
+            gate_caps[:1].expand(num_experts),
+            linear_caps[:1].expand(num_experts),
+        ),
+    ):
+        with pytest.raises(AssertionError):
+            _compare(out, wrong)
+
+
+def test_situ_ignores_the_fc1_bias():
+    """A hazard the entry does not guard: with act_type 3 the kernel accepts a
+    `gemm1_bias` and drops it, while `gemm2_bias` is still added.
+
+    Kimi K3.1 passes no expert bias, so its cells never reach this. Pinned so
+    a cubin that starts honouring the bias turns this red rather than silently
+    changing what a biased SiTU caller gets. Measured on GB300: the kernel sits
+    1.6 / 0.7 ulp from a reference without the FC1 bias and 193 / 132 ulp from
+    one with it.
+    """
+    args, ref, no_fc1_bias, data, sf, xv, ids, wts, num_experts, top_k = (
+        _situ_layer_without_fc1_bias(32)
+    )
+    assert args["gemm1_bias"] is not None and args["gemm1_bias"].abs().max() > 0
+    gate_caps, linear_caps = _k31_situ_caps(num_experts)
+    out = _call(
+        data,
+        sf,
+        args,
+        num_experts,
+        top_k,
+        topk_ids=ids,
+        topk_weights=wts,
+        routing_method_type=_ROUTING_DEEPSEEK_V3,
+        act_type=_ACT_TYPE_SITU,
+        gemm1_alpha=gate_caps,
+        gemm1_beta=linear_caps,
+    )
+    _compare(out, _situ_per_expert_ref(xv, ids, wts, no_fc1_bias, gate_caps, linear_caps))
+    with pytest.raises(AssertionError):
+        _compare(out, _situ_per_expert_ref(xv, ids, wts, ref, gate_caps, linear_caps))
+
+
+# The cells of every Kimi K3.1 target: the general one and the SM 10.3 perf targets copied from it.
+_K31_TARGET_CELLS: tuple[Cell, ...] = (
+    Cell(
+        why="K3.1 tep4 decode T=1: kernel routes 896 ids, rank 1 runs its 224",
+        spec=_k31_cell(
+            tokens=1, routed_by_kernel=True, local_expert_offset=224, local_num_experts=224
+        ),
+    ),
+    Cell(
+        why="K3.1 tep4 prefill chunk T=2048: kernel routes, rank 3's window of 224",
+        spec=_k31_cell(
+            tokens=2048, routed_by_kernel=True, local_expert_offset=672, local_num_experts=224
+        ),
+    ),
+    Cell(
+        why="K3.1 dep4 decode T=1, pre-routed: rank 0's window of 224",
+        spec=_k31_cell(
+            tokens=1, routed_by_kernel=False, local_expert_offset=0, local_num_experts=224
+        ),
+    ),
+    Cell(
+        why="K3.1 tep8 MTP decode T=5: kernel routes, rank 5's window of 112",
+        spec=_k31_cell(
+            tokens=5, routed_by_kernel=True, local_expert_offset=560, local_num_experts=112
+        ),
+    ),
+    Cell(
+        why="K3.1 tep8 verify batch T=40: kernel routes, rank 0's window of 112",
+        spec=_k31_cell(
+            tokens=40, routed_by_kernel=True, local_expert_offset=0, local_num_experts=112
+        ),
+    ),
+    Cell(
+        why="K3.1 dep8 decode batch T=8, pre-routed: rank 7's window of 112",
+        spec=_k31_cell(
+            tokens=8, routed_by_kernel=False, local_expert_offset=784, local_num_experts=112
+        ),
+    ),
+    Cell(
+        why="K3.1 tep16 prefill chunk T=2048: kernel routes, rank 7's window of 56",
+        spec=_k31_cell(
+            tokens=2048, routed_by_kernel=True, local_expert_offset=392, local_num_experts=56
+        ),
+    ),
+    Cell(
+        why="K3.1 dep16 verify batch T=40, pre-routed: rank 15's window of 56",
+        spec=_k31_cell(
+            tokens=40, routed_by_kernel=False, local_expert_offset=840, local_num_experts=56
+        ),
+    ),
+    Cell(
+        why="K3.1 dep16 gathered prefill T=2048, pre-routed: rank 7's window of 56",
+        spec=_k31_cell(
+            tokens=2048, routed_by_kernel=False, local_expert_offset=392, local_num_experts=56
+        ),
+    ),
+    Cell(
+        why="K3.1 moe_tp4 x ep1 decode T=8: all 896 experts, 768 columns each",
+        spec=_k31_cell(
+            tokens=8,
+            routed_by_kernel=True,
+            local_expert_offset=0,
+            local_num_experts=896,
+            intermediate=768,
+            intermediate_pad=768,
+        ),
+    ),
+    Cell(
+        why="K3.1 moe_tp4 x ep1 prefill T=2048: all 896 experts, 768 columns each",
+        spec=_k31_cell(
+            tokens=2048,
+            routed_by_kernel=True,
+            local_expert_offset=0,
+            local_num_experts=896,
+            intermediate=768,
+            intermediate_pad=768,
+        ),
+    ),
+    Cell(
+        why="K3.1 moe_tp2 x ep2 batch T=40: rank's window of 448, 1536 columns each",
+        spec=_k31_cell(
+            tokens=40,
+            routed_by_kernel=True,
+            local_expert_offset=448,
+            local_num_experts=448,
+            intermediate=1536,
+            intermediate_pad=1536,
+        ),
+    ),
+)
+
+
 # The shapes each shipped target calls this entry with, by target directory
 # under `models/`. The entry's own `CELLS` are the op's whoever calls it.
 TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
@@ -1731,6 +2102,16 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
             ),
         ),
     ),
+    # Kimi K3.1's routed experts through TRTLLMGenFusedMoE (W4A8_MXFP4_MXFP8):
+    # SiTU (act_type 3), DeepSeekV3 routing with one group, no expert biases.
+    # Under attention TP the kernel routes from fp32 logits + fp32 bias; under
+    # attention DP top-k is taken before the dispatch and handed in. The default
+    # split is EP-only (an expert window per rank); a user MoE TP x EP split
+    # slices the 3072 intermediate columns instead (attention TP only).
+    # Cells are grouped by expert window so the cached layer is built once.
+    "kimi_k31/kimi_k31_pro_mxfp4__sm_10x__default": _K31_TARGET_CELLS,
+    "kimi_k31/kimi_k31_pro_mxfp4__sm_103__tep": _K31_TARGET_CELLS,
+    "kimi_k31/kimi_k31_pro_mxfp4__sm_103__dep": _K31_TARGET_CELLS,
 }
 
 CELLS = certified_cells(moe, TARGET_CELLS)
@@ -1756,8 +2137,16 @@ def test_certified_cells(cell):
     routing is recomputed here the way Renormalize defines it (top-k, then
     softmax over the kept logits), which is what makes the reference comparable
     at all.
+
+    Kimi K3.1's cells (SiTU, DeepSeekV3 routing) go to `_certify_kimi_k31_cell`:
+    the entry's `reference` models the clamped SwiGlu only, so there is no
+    second reference to cross-check, and this file's `_ref_moe(situ=...)` gates
+    the kernel alone.
     """
     spec = cell.spec
+    if spec.get("activation") == "situ":
+        _certify_kimi_k31_cell(cell)
+        return
     if spec["intermediate"] == 2880 and "intermediate_pad" not in spec:
         args, ref = _gpt_oss()
     else:

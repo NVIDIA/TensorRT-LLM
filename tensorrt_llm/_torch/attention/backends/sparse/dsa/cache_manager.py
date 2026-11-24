@@ -718,5 +718,11 @@ class DSACacheManagerV2(KVCacheManagerV2):
 
 
 def is_dsa_cache_manager(cache_manager: object) -> bool:
-    """Return whether a manager uses native DSA indexer page mapping."""
-    return isinstance(cache_manager, (DSACacheManager, DSACacheManagerV2))
+    """Return whether a manager uses native DSA indexer page mapping.
+
+    Hybrid managers implementing the indexer K-cache accessors opt in with
+    ``provides_dsa_indexer_k_cache``.
+    """
+    return isinstance(cache_manager, (DSACacheManager, DSACacheManagerV2)) or getattr(
+        cache_manager, "provides_dsa_indexer_k_cache", False
+    )

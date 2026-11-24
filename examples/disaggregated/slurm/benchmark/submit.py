@@ -783,6 +783,8 @@ def submit_job(config, log_dir, dry_run):
                 str(profiling_config['nsys_on']).lower(),
                 config_path,
                 cuda_devices,
+                # Optional trailing argument; start_worker.sh defaults it to false.
+                str(slurm_config.get('numa_local', False)).lower(),
                 f"&> {log_dir}/3_output_{server_type}_{server_id}.log &",
             ]
             start_server_cmds.append(" ".join(cmd))

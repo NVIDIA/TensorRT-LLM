@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from tensorrt_llm._torch.attention.backends.fp4_mla import (
+    is_fp4_mla_context_only_cache,
     run_fp4_mla_attention_decode,
     scatter_fp4_mla_kv_cache,
 )
@@ -112,10 +113,14 @@ class Fp4MlaFmha(PhasedFmha):
         state = metadata.fp4_mla_state
         if state is None or state.hp_pool is None:
             raise RuntimeError("FP4 MLA requires prepared high-precision KV state.")
-        if state.v_scale_pool is None:
-            raise RuntimeError("FP4 MLA requires the V-scale pool.")
-
         attention_input_type = forward_args.attention_input_type
+        # A disaggregated context worker's single-copy cache omits the
+        # generation-only V scales; it only ever runs context attention.
+        if state.v_scale_pool is None and not (
+            attention_input_type == AttentionInputType.context_only
+            and is_fp4_mla_context_only_cache(kv_cache_manager)
+        ):
+            raise RuntimeError("FP4 MLA requires the V-scale pool.")
         if attention_input_type == AttentionInputType.context_only:
             if k is None or v is None:
                 raise RuntimeError("FP4 MLA context requires expanded K and V tensors.")

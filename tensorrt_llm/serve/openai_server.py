@@ -233,9 +233,13 @@ def _warn_unresolvable_thinking_once(reasoning_parser: str) -> None:
 
 
 def _validate_required_tool_grammar_request(
-        request: ChatCompletionRequest, sampling_params: SamplingParams, *,
-        guided_decoding_backend: Optional[str], tool_parser: Optional[str],
-        reasoning_parser: Optional[str]) -> None:
+        request: ChatCompletionRequest,
+        sampling_params: SamplingParams,
+        *,
+        guided_decoding_backend: Optional[str],
+        tool_parser: Optional[str],
+        reasoning_parser: Optional[str],
+        has_dynamic_tools: bool = False) -> None:
     """Validate inputs for mandatory tool-call grammar construction."""
     if guided_decoding_backend != "xgrammar":
         raise ValueError("Required tool grammars need the xgrammar backend.")
@@ -247,13 +251,24 @@ def _validate_required_tool_grammar_request(
             "Required tool grammars need a reasoning parser that resolves its "
             "mode from the rendered prompt. Configure the server with "
             "--reasoning_parser nemotron-v3 (or a compatible parser alias).")
-    if not request.tools:
-        raise ValueError("tool_choice='required' requires request-level tools.")
-    if (request.prompt_token_ids is not None or request.prompt_token_ids_b64
-            or not request.add_generation_prompt
-            or request.disaggregated_params is not None):
-        raise ValueError("Required tool grammars need chat messages with "
-                         "add_generation_prompt=True on a native server.")
+    if not request.tools and not has_dynamic_tools:
+        raise ValueError("tool_choice='required' requires tools.")
+    if not request.add_generation_prompt:
+        raise ValueError(
+            "Required tool grammars need add_generation_prompt=True.")
+    disaggregated_params = request.disaggregated_params
+    if (disaggregated_params is not None
+            and disaggregated_params.request_type == "generation_only"):
+        # The grammar depends only on the tools and the reasoning mode. A
+        # generation worker never renders the prompt, so it builds the grammar
+        # from the mode the context worker resolved and relayed.
+        if disaggregated_params.resolved_thinking is None:
+            raise ValueError(
+                "Required tool grammars on a generation worker need the "
+                "reasoning mode relayed by the context worker.")
+    elif request.prompt_token_ids is not None or request.prompt_token_ids_b64:
+        raise ValueError("Required tool grammars need chat messages, not "
+                         "prompt_token_ids, to resolve the reasoning mode.")
     if sampling_params.guided_decoding is not None:
         raise ValueError(
             "tool_choice='required' cannot be combined with response_format "
@@ -326,16 +341,10 @@ def _build_tool_strict_guided_decoding_params(tools, tool_parser_name):
     ``structure_info()`` and the tool's ``parameters`` schema, then returns
     a ``GuidedDecodingParams`` with the structural tag format.
 
-    Returns None if no tool has strict=True or the parser doesn't support
-    structural tags.
+    Custom parsers may supply a server-side strict default. Otherwise returns
+    None if no tool has strict=True or the parser doesn't support structural tags.
     """
     if not tools or not tool_parser_name:
-        return None
-
-    # Check if any tool has strict=True
-    has_strict = any(tool.function.strict for tool in tools
-                     if tool.function.strict)
-    if not has_strict:
         return None
 
     tool_parser_cls = ToolParserFactory.parsers.get(tool_parser_name.lower())
@@ -354,6 +363,10 @@ def _build_tool_strict_guided_decoding_params(tools, tool_parser_name):
                                      format=custom_format)
         return GuidedDecodingParams(structural_tag=resp_format.model_dump_json(
             by_alias=True, exclude_none=True))
+    # Custom formats can apply a server-side default when strict is omitted.
+    # Generic parsers still require an explicit opt-in from the client.
+    if not any(tool.function.strict for tool in tools):
+        return None
     if not parser.supports_structural_tag():
         logger.warning(
             "Tool parser '%s' does not support structural tags, "
@@ -2105,7 +2118,8 @@ class OpenAIServer(_VideoRoutesMixin):
                                               render_resources).tool_dicts
             required_mode = extension.required_tool_choice_mode()
             required_tool_grammar = (request.tool_choice == "required"
-                                     and required_mode == "grammar")
+                                     and required_mode
+                                     in ("grammar", "prefer_grammar"))
             conversation: List[ConversationMessage] = []
             # Pass the model vocabulary size so ``logit_bias`` can be
             # expanded into an embedding bias tensor in the sampler.
@@ -2119,13 +2133,23 @@ class OpenAIServer(_VideoRoutesMixin):
                 reasoning_parser=self.generator.args.reasoning_parser,
                 backend=self.generator.args.backend)
             if required_tool_grammar:
-                _validate_required_tool_grammar_request(
-                    request,
-                    sampling_params,
-                    guided_decoding_backend=self.generator.args.
-                    guided_decoding_backend,
-                    tool_parser=self.tool_parser,
-                    reasoning_parser=self.generator.args.reasoning_parser)
+                try:
+                    _validate_required_tool_grammar_request(
+                        request,
+                        sampling_params,
+                        guided_decoding_backend=self.generator.args.
+                        guided_decoding_backend,
+                        tool_parser=self.tool_parser,
+                        reasoning_parser=self.generator.args.reasoning_parser,
+                        has_dynamic_tools=bool(
+                            extension.dynamic_tools(request.messages)))
+                except ValueError as e:
+                    if required_mode != "prefer_grammar":
+                        raise
+                    # The chat template still asks for the call.
+                    logger.debug(
+                        f"tool_choice='required' without a grammar: {e}")
+                    required_tool_grammar = False
             # Pre-render, so the mode may be unresolved. Safe because the
             # boundary lookup reads the parser class attributes, not the
             # branch `__init__` picked.
@@ -2239,10 +2263,10 @@ class OpenAIServer(_VideoRoutesMixin):
                 has_tools=bool(request.tools) or bool(dynamic_tools))
             all_tools = (request.tools or []) + dynamic_tool_params
             if self.tool_parser and all_tools:
-                # When strict=True on any tool, apply constrained decoding
-                # via structural tags (only if response_format doesn't already
-                # set guided decoding). Dynamic tools must be in the grammar
-                # too, or their calls would be masked out.
+                # Apply tool constraints via structural tags when requested
+                # by the client or parser's server-side default (only if
+                # response_format doesn't already set guided decoding).
+                # Include dynamic tools so their calls are not masked out.
                 if sampling_params.guided_decoding is None and not required_tool_grammar:
                     if (forced_tool_name is not None
                             and _parser_extracts_forced_tool_calls(
@@ -2274,8 +2298,8 @@ class OpenAIServer(_VideoRoutesMixin):
                         sampling_params.guided_decoding = forced_guided
                     else:
                         # Strict-tools path: structural tags with the existing
-                        # ``triggered_tags`` semantics. Engages only when at
-                        # least one tool has ``strict=True``.
+                        # ``triggered_tags`` semantics. The parser may supply
+                        # a server-side default for omitted strict fields.
                         strict_guided = _build_tool_strict_guided_decoding_params(
                             all_tools, self.tool_parser)
                         if strict_guided is not None:
@@ -2426,25 +2450,29 @@ class OpenAIServer(_VideoRoutesMixin):
                         "enable_thinking": thinking,
                     }
             if required_tool_grammar:
-                if thinking is None:
+                required_format = None
+                if thinking is not None:
+                    parser = ToolParserFactory.create_tool_parser(
+                        self.tool_parser)
+                    # Dynamic tools must be in the grammar too, or their
+                    # calls would be masked out.
+                    build_required = functools.partial(
+                        parser.build_required_structural_tag,
+                        all_tools,
+                        thinking=thinking)
+                    required_format = await asyncio.get_running_loop(
+                    ).run_in_executor(self._input_proc_executor, build_required)
+                if required_format is not None:
+                    sampling_params.guided_decoding = GuidedDecodingParams(
+                        structural_tag=required_format.model_dump_json(
+                            by_alias=True))
+                    postproc_args.tool_parser_grammar_constrained = True
+                elif required_mode != "prefer_grammar":
                     raise ValueError(
                         "Cannot resolve required-tool reasoning state from the rendered prompt."
-                    )
-                parser = ToolParserFactory.create_tool_parser(self.tool_parser)
-                build_required = functools.partial(
-                    parser.build_required_structural_tag,
-                    request.tools,
-                    thinking=thinking)
-                required_format = await asyncio.get_running_loop(
-                ).run_in_executor(self._input_proc_executor, build_required)
-                if required_format is None:
-                    raise ValueError(
+                        if thinking is None else
                         "The configured tool parser does not support required tools."
                     )
-                sampling_params.guided_decoding = GuidedDecodingParams(
-                    structural_tag=required_format.model_dump_json(
-                        by_alias=True))
-                postproc_args.tool_parser_grammar_constrained = True
             postproc_args.tool_parser = self.tool_parser
             postproc_args.tool_call_id_type = self.tool_call_id_type
             if conversation and conversation[-1].get(

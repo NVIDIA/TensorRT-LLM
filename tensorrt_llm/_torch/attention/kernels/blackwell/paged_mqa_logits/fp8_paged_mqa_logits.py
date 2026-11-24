@@ -52,6 +52,12 @@ defaults the traced kernel body, the launch and the ABI are unchanged.
                       cannot precede ``griddepcontrol.wait`` (hence not with
                       ``pdl``).
 
+  kv_evict_first      Opt-in (default off): the KV and KV-scale TMA loads
+                      carry the L2 evict-first cache policy.  Every K-cache
+                      byte is read once per call, so the hint leaves L2 to the
+                      logits, which a Top-K kernel reads right after.  Only the
+                      cache policy changes: the logits are bit-identical.
+
 Architecture:
   - 384 threads: 256 math (2 WGs) + 128 specialized (2 TMA + 2 UMMA)
   - 1 TMA per KV block [128, 128], UMMA iterates 4x K=32
@@ -128,6 +134,9 @@ from .mqa_logits_util import atom_token_offset, atom_tokens_after, is_uneven_spl
 # CuTe DSL CUDA 13 validates rounding modes as string literals. The string
 # form is also accepted by older wrappers, so keep it version-independent.
 _RND_RN = "rn"
+
+# 64-bit L2 cache-policy descriptor of an evict-first TMA load (CUTLASS CacheHintSm90::EVICT_FIRST).
+_L2_EVICT_FIRST = 0x12F0000000000000
 
 
 @dsl_user_op
@@ -317,6 +326,7 @@ class FP8MQALogitsKernel:
         fused_weight_scale: bool = False,
         pdl: bool = False,
         early_prologue: bool = False,
+        kv_evict_first: bool = False,
     ):
         if (acc_dtype, epi_dtype) not in (
             (cutlass.Float32, cutlass.Float32),
@@ -471,6 +481,9 @@ class FP8MQALogitsKernel:
         self.umma_warp_base = 10
 
         self.num_q_stages = 3  # 3 stages for Q pipelining across batch sequences
+        # L2 eviction priority of the KV + scale TMA loads: every KV byte is read once per call, so marking it
+        # evict-first keeps the logits (re-read by the Top-K right after) resident instead.
+        self.kv_evict_first = bool(kv_evict_first)
 
         # TMEM columns (arch-aware): each group needs N columns per UMMA stage,
         # so max_umma_stages = TMEM_COLS // (2 * N). Rubin exposes more than
@@ -533,6 +546,10 @@ class FP8MQALogitsKernel:
         self.cta_group = tcgen05.CtaGroup.ONE
         self.cluster_shape_mn = (1, 1)
         self.mma_tiler_mn = (block_kv, self.N)
+
+    def _kv_cache_policy(self):
+        """L2 cache hint of the KV + scale TMA loads (None = the default policy)."""
+        return cutlass.Int64(_L2_EVICT_FIRST) if self.kv_evict_first else None
 
     def _atom_seq(self, qa):
         """Native sequence (block_table / context_lens row) of a q_atom_idx.
@@ -1646,12 +1663,14 @@ class FP8MQALogitsKernel:
                             tAsA_0[(None, i, early_stage_0)],
                             tma_bar_ptr=early_bar_0,
                             mcast_mask=a_mcast_mask,
+                            cache_policy=self._kv_cache_policy(),
                         )
                         cute.copy(
                             tma_atom_s,
                             tSgS_0[(None, 0, early_blks_0[i])],
                             tSsS_0[(None, i, early_stage_0)],
                             tma_bar_ptr=early_bar_0,
+                            cache_policy=self._kv_cache_policy(),
                         )
                     kv_prod_state_0.advance()
             if is_tma_warp_1:
@@ -1670,12 +1689,14 @@ class FP8MQALogitsKernel:
                             tAsA_1[(None, i, early_stage_1)],
                             tma_bar_ptr=early_bar_1,
                             mcast_mask=a_mcast_mask,
+                            cache_policy=self._kv_cache_policy(),
                         )
                         cute.copy(
                             tma_atom_s,
                             tSgS_1[(None, 0, early_blks_1[i])],
                             tSsS_1[(None, i, early_stage_1)],
                             tma_bar_ptr=early_bar_1,
+                            cache_policy=self._kv_cache_policy(),
                         )
                     kv_prod_state_1.advance()
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
@@ -1865,12 +1886,14 @@ class FP8MQALogitsKernel:
                                 tAsA_0[(None, i, stage)],
                                 tma_bar_ptr=bar,
                                 mcast_mask=a_mcast_mask,
+                                cache_policy=self._kv_cache_policy(),
                             )
                             cute.copy(
                                 tma_atom_s,
                                 tSgS_0[(None, 0, phys_blks[i])],
                                 tSsS_0[(None, i, stage)],
                                 tma_bar_ptr=bar,
+                                cache_policy=self._kv_cache_policy(),
                             )
                         kv_prod_state_0.advance()
                 else:
@@ -1884,12 +1907,14 @@ class FP8MQALogitsKernel:
                             tAsA_0[(None, i, stage)],
                             tma_bar_ptr=bar,
                             mcast_mask=a_mcast_mask,
+                            cache_policy=self._kv_cache_policy(),
                         )
                         cute.copy(
                             tma_atom_s,
                             tSgS_0[(None, 0, phys_blks[i])],
                             tSsS_0[(None, i, stage)],
                             tma_bar_ptr=bar,
+                            cache_policy=self._kv_cache_policy(),
                         )
                     kv_prod_state_0.advance()
 
@@ -1995,12 +2020,14 @@ class FP8MQALogitsKernel:
                                 tAsA_1[(None, i, stage)],
                                 tma_bar_ptr=bar,
                                 mcast_mask=a_mcast_mask,
+                                cache_policy=self._kv_cache_policy(),
                             )
                             cute.copy(
                                 tma_atom_s,
                                 tSgS_1[(None, 0, phys_blks[i])],
                                 tSsS_1[(None, i, stage)],
                                 tma_bar_ptr=bar,
+                                cache_policy=self._kv_cache_policy(),
                             )
                         kv_prod_state_1.advance()
                 else:
@@ -2014,12 +2041,14 @@ class FP8MQALogitsKernel:
                             tAsA_1[(None, i, stage)],
                             tma_bar_ptr=bar,
                             mcast_mask=a_mcast_mask,
+                            cache_policy=self._kv_cache_policy(),
                         )
                         cute.copy(
                             tma_atom_s,
                             tSgS_1[(None, 0, phys_blks[i])],
                             tSsS_1[(None, i, stage)],
                             tma_bar_ptr=bar,
+                            cache_policy=self._kv_cache_policy(),
                         )
                     kv_prod_state_1.advance()
 

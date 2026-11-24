@@ -662,3 +662,166 @@ def test_sm107_weight_read_linear_cuda_graph(m, n, k):
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(out, eager)
+
+
+# --- 1x32 weight scales (ModelOpt MXFP8 checkpoints, e.g. the Kimi-K3.1 KDA / shared experts) ---
+
+# (N, K): Kimi-K3.1 TP8 decode projections, a partial last N tile, and a small shape.
+VEC32_SHAPES = [(6288, 7168), (7168, 1536), (1536, 7168), (7168, 768), (400, 1280)]
+VEC32_MS = [1, 8, 32, 64, 65, 128, 200, 256]
+
+
+def _make_weight_vec32(n, k, seed):
+    """N(0, 0.02) weight quantized per 1x32 group of a row with power-of-two scales.
+
+    Returns the E4M3 ``[N, K]`` weight, its FP32 dequantization and the flat R128c4 scale bytes.
+    """
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    w = (torch.randn((n, k), device="cuda", generator=gen) * 0.02).view(n, k // 32, 32)
+    # Spread the groups over several binades so a dropped or misplaced scale shows.
+    w = w * torch.exp2(torch.randint(-3, 4, (n, k // 32, 1), device="cuda", generator=gen))
+    exp = torch.ceil(torch.log2(w.abs().amax(-1, keepdim=True).clamp(min=1e-6) / 448.0))
+    w_fp8 = (w / torch.exp2(exp)).to(torch.float8_e4m3fn)
+    deq = (w_fp8.float() * torch.exp2(exp)).view(n, k)
+    rows = (exp.squeeze(-1) + 127).to(torch.uint8)
+    n_pad = -(-n // 128) * 128
+    padded = torch.zeros((n_pad, k // 32), dtype=torch.uint8, device="cuda")
+    padded[:n] = rows
+    r128c4 = padded.view(n_pad // 128, 4, 32, k // 128, 4).permute(0, 3, 2, 1, 4).reshape(-1)
+    return w_fp8.view(n, k).contiguous(), deq, r128c4.contiguous()
+
+
+def _mxfp8_activation(x):
+    m, k = x.shape
+    groups = x.float().view(m, k // 32, 32)
+    amax = groups.abs().amax(-1, keepdim=True).clamp(min=1.0014e-4)
+    exp = torch.ceil(torch.log2(amax / 448.0))
+    xq = (groups / torch.exp2(exp)).to(torch.float8_e4m3fn)
+    return xq.view(m, k), exp.squeeze(-1)
+
+
+def _vec32_reference(x, deq):
+    xq, exp = _mxfp8_activation(x)
+    m, k = x.shape
+    xd = (xq.float().view(m, k // 32, 32) * torch.exp2(exp).unsqueeze(-1)).view(m, k)
+    return xd @ deq.t()
+
+
+@pytest.mark.parametrize("n, k", VEC32_SHAPES)
+@pytest.mark.parametrize("m", VEC32_MS)
+def test_vec32_weight_scales(m, n, k):
+    """Default dispatch (low-M below the cut-over, mid-M above) on 1x32 weight scales."""
+    w_fp8, deq, ws = _make_weight_vec32(n, k, seed=31)
+    x = _make_activation(m, k, seed=3)
+    _kernel_module().check_inputs(x, w_fp8, ws)
+    out = torch.ops.trtllm.fp8_block_scale_low_m_gemm(x, w_fp8, ws)
+    torch.cuda.synchronize()
+    assert _rel_err(out, _vec32_reference(x, deq)) < 5e-3
+
+
+@pytest.mark.parametrize("split_k", [1, 2, 3, 5])
+@pytest.mark.parametrize("m", [5, 16, 40, 64])
+def test_vec32_low_m_split_k(m, split_k):
+    mod = _kernel_module()
+    n, k = 400, 1280
+    w_fp8, deq, ws = _make_weight_vec32(n, k, seed=37)
+    x = _make_activation(m, k, seed=11)
+    base = mod.LowMTactic(
+        mma_n=mod.mma_n_for(m), split_k=split_k, a_stages=1, x_stages=4, b_stages=4
+    )
+    tactic = dataclasses.replace(base, a_stages=mod.max_a_stages(n, k, base, True))
+    out = _run(x, w_fp8, ws, tactic)
+    torch.cuda.synchronize()
+    assert _rel_err(out, _vec32_reference(x, deq)) < 5e-3
+
+
+@pytest.mark.parametrize("split_k", [1, 2, 3, 5])
+@pytest.mark.parametrize("m, mma_n", [(40, 64), (65, 96), (128, 128), (200, 224), (250, 256)])
+def test_vec32_mid_m_split_k(m, mma_n, split_k):
+    mod = _kernel_module()
+    n, k = 400, 1280
+    w_fp8, deq, ws = _make_weight_vec32(n, k, seed=41)
+    x = _make_activation(m, k, seed=13)
+    base = mod.MidMTactic(mma_n=mma_n, split_k=split_k, a_stages=1, b_stages=2)
+    tactic = dataclasses.replace(base, a_stages=mod.max_mid_a_stages(n, k, base))
+    out = _run(x, w_fp8, ws, tactic)
+    torch.cuda.synchronize()
+    assert _rel_err(out, _vec32_reference(x, deq)) < 5e-3
+
+
+@pytest.mark.parametrize("m", [1, 8, 32, 33, 65, 128, 200, 256])
+def test_vec32_prequantized(m):
+    """A producer's MXFP8 activation (mid-M scale layout) through ``run_prequantized``: the
+    low-M kernel without its quantization warps up to the cut-over, the mid-M kernel above."""
+    mod = _kernel_module()
+    n, k = 6288, 7168
+    w_fp8, deq, ws = _make_weight_vec32(n, k, seed=43)
+    x = _make_activation(m, k, seed=17)
+    xq, exp = _mxfp8_activation(x)
+    sf_blocks = -(-mod.mid_mma_n_for(m) // 128)
+    rows = torch.full((sf_blocks * 128, k // 32), 127, dtype=torch.uint8, device="cuda")
+    rows[:m] = (exp + 127).to(torch.uint8)
+    # [K / 128][sf_blocks][512 B], atom byte (r % 32) * 16 + (r // 32 % 4) * 4 + k32 % 4
+    xs = rows.view(sf_blocks, 4, 32, k // 128, 4).permute(3, 0, 2, 1, 4).reshape(-1).contiguous()
+    assert xs.numel() == mod.mid_activation_scale_bytes(m, k)
+    out = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+    mod.run_prequantized(xq.contiguous(), xs, w_fp8, ws, out)
+    torch.cuda.synchronize()
+    assert _rel_err(out, _vec32_reference(x, deq)) < 5e-3
+
+
+@pytest.mark.parametrize("m", [1, 8, 100])
+def test_prequantized_packed_block_scales(m):
+    """Packed 128x128 block weight scales (non-unit) on a prequantized activation: the weight
+    scales reach the product, and a low-M tactic, whose kernel would drop them, is refused."""
+    mod = _kernel_module()
+    n, k = 2048, 7168
+    w_fp8, scale = _make_weight(n, k, seed=29)
+    packed = _pack(scale, n, k)
+    x = _make_activation(m, k, seed=31)
+    xq, exp = _mxfp8_activation(x)
+    sf_blocks = -(-mod.mid_mma_n_for(m) // 128)
+    rows = torch.full((sf_blocks * 128, k // 32), 127, dtype=torch.uint8, device="cuda")
+    rows[:m] = (exp + 127).to(torch.uint8)
+    xs = rows.view(sf_blocks, 4, 32, k // 128, 4).permute(3, 0, 2, 1, 4).reshape(-1).contiguous()
+    out = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+    mod.run_prequantized(xq.contiguous(), xs, w_fp8, packed, out)
+    torch.cuda.synchronize()
+    assert _rel_err(out, _mxfp8_emulated_reference(x, w_fp8, scale)) < 5e-3
+    with pytest.raises(ValueError, match="MidMTactic"):
+        mod.run_prequantized(
+            xq.contiguous(),
+            xs,
+            w_fp8,
+            packed,
+            out,
+            tactic=mod.default_tactic(min(m, mod.LOW_M_MAX), n, k),
+        )
+
+
+@pytest.mark.parametrize("n, k", [(6288, 7168), (7168, 1536), (400, 1280)])
+@pytest.mark.parametrize("m", [8, 100, 129, 144, 160, 200, 256])
+def test_vec32_prequantized_r128c4_scales(m, n, k):
+    """``act_r128c4``: the dense GEMM's R128c4 scale order ([M / 128][K / 128][512 B]) gives the
+    bits of the mid-M order at the same tactic, and those of the BF16 path."""
+    mod = _kernel_module()
+    w_fp8, _, ws = _make_weight_vec32(n, k, seed=47)
+    x = _make_activation(m, k, seed=19)
+    xq, exp = _mxfp8_activation(x)
+    sf_blocks = -(-mod.mid_mma_n_for(m) // 128)
+    rows = torch.full((sf_blocks * 128, k // 32), 127, dtype=torch.uint8, device="cuda")
+    rows[:m] = (exp + 127).to(torch.uint8)
+    tiles = rows.view(sf_blocks, 4, 32, k // 128, 4)
+    mid = tiles.permute(3, 0, 2, 1, 4).reshape(-1).contiguous()
+    r128c4 = tiles.permute(0, 3, 2, 1, 4).reshape(-1).contiguous()
+    tactic = None if m <= mod.low_m_max_for(n, k) else mod.default_mid_tactic(m, n, k)
+    outs = []
+    for xs, flag in ((mid, False), (r128c4, True)):
+        out = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+        mod.run_prequantized(xq.contiguous(), xs, w_fp8, ws, out, tactic=tactic, act_r128c4=flag)
+        outs.append(out)
+    ref = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+    mod.run_low_m_gemm(x, w_fp8, ws, ref, tactic=tactic)
+    torch.cuda.synchronize()
+    assert torch.equal(outs[1], outs[0])
+    assert torch.equal(outs[0], ref)

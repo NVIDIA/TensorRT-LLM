@@ -322,3 +322,42 @@ def test_disagg_config_rejects_non_bool_request_chat_template_opt_in(value):
             generation_servers={"num_instances": 0},
             allow_request_chat_template=value,
         )
+
+
+@pytest.mark.parametrize(
+    ("fields", "rejected"),
+    [
+        ({}, False),
+        ({"n": 1}, False),
+        ({"n": 2}, True),
+        ({"n": 1, "best_of": 3}, True),
+        ({"n": 2, "use_beam_search": True}, False),
+    ],
+)
+def test_ensure_single_sequence(fields, rejected):
+    request = CompletionRequest(model="m", prompt="hi", **fields)
+    if rejected:
+        with pytest.raises(ValueError, match="one sequence per request"):
+            openai_disagg_server._ensure_single_sequence(request)
+    else:
+        openai_disagg_server._ensure_single_sequence(request)
+
+
+@pytest.mark.asyncio
+async def test_multi_sequence_request_is_rejected_before_dispatch():
+    """An n > 1 request gets an HTTP 400 and never reaches a context server."""
+    from fastapi import HTTPException
+
+    server = object.__new__(OpenAIDisaggServer)
+    server._perf_metrics_collector = Mock()
+    server._allow_request_chat_template = False
+    server._config = SimpleNamespace(conversation_affinity_header_for_subagents=None)
+    server._collect_perf_metrics = False
+    entry_point = AsyncMock()
+    wrapper = server._wrap_entry_point(entry_point, CompletionRequest)
+
+    with pytest.raises(HTTPException) as excinfo:
+        await wrapper(CompletionRequest(model="m", prompt="hi", n=2), _raw_request({}))
+
+    assert excinfo.value.status_code == 400
+    entry_point.assert_not_awaited()

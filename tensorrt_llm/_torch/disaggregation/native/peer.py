@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Union
@@ -25,12 +26,19 @@ from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxTransferLayou
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import AttentionPolicy
 from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
+from tensorrt_llm._torch.disaggregation.resource.dkv import dkv_helix_shares_pages
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
-from tensorrt_llm._torch.disaggregation.resource.page import CacheKind, MapperKind, PoolView
+from tensorrt_llm._torch.disaggregation.resource.page import (
+    AttentionLayerGroup,
+    CacheKind,
+    MapperKind,
+    PoolView,
+)
 from tensorrt_llm._torch.disaggregation.resource.utils import (
     get_layer_byte_ranges,
     get_layer_to_layer_group,
     get_pool_view_global_layer_ids,
+    is_standalone_draft_group,
 )
 
 # Type alias for (lg_idx, pool_idx) pair
@@ -179,7 +187,12 @@ class PeerRegistrar:
             self_page_table,
             peer_ri.page_table,
         )
-        AttentionPolicy.validate_peer_compatible(self_page_table, peer_ri.page_table)
+        AttentionPolicy.validate_peer_compatible(
+            self_page_table,
+            peer_ri.page_table,
+            self._ri.attention.tokens_per_block if self._ri.attention is not None else None,
+            peer_ri.attention.tokens_per_block if peer_ri.attention is not None else None,
+        )
 
         self_layers = sum(self._ri.layer_num_per_pp)
         peer_layers = sum(peer_ri.layer_num_per_pp)
@@ -423,8 +436,13 @@ class PeerRegistrar:
                 peer_overlap_positions[0] if peer_overlap_positions else 0
             )
 
+        mapper_peer_ri = peer_ri
+        if is_standalone_draft_group(self_lg):
+            # A standalone draft group maps heads on its own rank grid.
+            policy = AttentionPolicy(AttentionPolicy.draft_group_rank_info(self._ri, self_lg))
+            mapper_peer_ri = AttentionPolicy.draft_group_rank_info(peer_ri, peer_lg)
         mapper = policy.build_mapper(
-            peer_ri=peer_ri,
+            peer_ri=mapper_peer_ri,
             mapper_kind=self_pv.mapper_kind,
             self_layer_offsets=self_layer_offsets,
             peer_layer_offsets=peer_layer_offsets,
@@ -524,6 +542,10 @@ class PeerRegistrar:
             self._ri.cp_size, peer_ri.cp_size, self._ri.cp_rank
         )
 
+        if self.dkv_fan_out(peer_ri):
+            # A DKV group spreads each request's pages over its ranks: every context rank
+            # writes its own pages to every generation rank (all of them hold the whole latent).
+            peer_start_tp, peer_end_tp = 0, peer_ri.tp_size
         ranks: List[int] = []
         for pp in range(peer_start_pp, peer_end_pp):
             for tp in range(peer_start_tp, peer_end_tp):
@@ -547,6 +569,52 @@ class PeerRegistrar:
         )
         self._overlap_cache[key] = targets
         return targets
+
+    def dkv_fan_out(self, peer_rank_info: RankInfo) -> bool:
+        """Whether this pair moves DKV group's pages by fan-out.
+
+        One side is DKV group (``RankInfo.dkv_size``) and the other a plain TP
+        instance, both MLA (the latent replicated on every TP rank) without attention DP or CP:
+        each context rank writes the pages it owns to every generation rank, so every generation
+        rank hears from every context rank. The rest of a request (recurrent state, draft pages,
+        aux) keeps its TP pairing.
+        """
+        a, b = self._ri, peer_rank_info
+        if (a.dkv_size > 1) == (b.dkv_size > 1):
+            return False
+        for ri in (a, b):
+            if ri.attention is None or not ri.attention.is_mla or ri.attention.enable_attention_dp:
+                return False
+            if ri.cp_size != 1:
+                return False
+        return True
+
+    def dkv_helix(self, peer_rank_info: RankInfo) -> bool:
+        """Whether this pair is DKV group of ``N`` ranks and a Helix CP instance of ``M``
+        ranks (TP 1), ``M`` a multiple or a divisor of ``N``, with the same page size, both MLA
+        without attention DP.
+
+        Helix stores global page ``g`` on CP rank ``g % M``, DKV on its rank ``g % N``
+        (flat TP rank, ``KVCacheManagerV2._make_dkv``), with the same partial last page
+        (``helix_local_len``): DKV rank ``r`` writes Helix rank ``h`` the pages it owns there,
+        ``g % N == r`` and ``g % M == h`` (resource/dkv.py). A Helix rank hears from DKV rank
+        ``h % N`` alone when ``M >= N``, and from the ``N / M`` ranks ``h, h + M, ...`` when
+        ``M < N``. The pair keeps the replicated sender's overlap (every context rank a writer of
+        every Helix rank, aux from the elected rank); a pair that shares no page writes no paged KV.
+        """
+        a, b = self._ri, peer_rank_info
+        dkv, helix = (a, b) if a.dkv_size > 1 else (b, a)
+        n, m = dkv.dkv_size, helix.cp_size
+        if n <= 1 or helix.dkv_size > 1:
+            return False
+        if dkv.tp_size != n or dkv.cp_size != 1 or dkv.pp_size != 1:
+            return False
+        if m <= 1 or max(n, m) % min(n, m) or helix.tp_size != 1 or helix.pp_size != 1:
+            return False
+        for ri in (a, b):
+            if ri.attention is None or not ri.attention.is_mla or ri.attention.enable_attention_dp:
+                return False
+        return dkv.attention.tokens_per_block == helix.attention.tokens_per_block
 
     def _owns_tp_fan_in(self, peer_rank_info: RankInfo) -> bool:
         """Elect one owner when replicated bytes fan in across TP ranks.
@@ -587,13 +655,76 @@ class PeerRegistrar:
         """
         layer_group = self._self_ext_cache.page_table.layer_groups[layer_group_id]
         pool_view = layer_group.pool_views[pool_idx]
+        if is_standalone_draft_group(layer_group):
+            return self._should_send_draft_pool(peer_rank_info, layer_group_id, pool_idx)
+        if layer_group.kind != CacheKind.STATE and self.dkv_helix(peer_rank_info):
+            # The target's paged KV goes from every DKV rank that owns some of the Helix rank's
+            # pages, whatever the replicated sender's head routing would elect.
+            return dkv_helix_shares_pages(
+                self._ri.dkv_size, self._ri.tp_rank, peer_rank_info.cp_size, peer_rank_info.cp_rank
+            )
+        if layer_group.kind != CacheKind.STATE and self.dkv_fan_out(peer_rank_info):
+            # Fan-out: every DKV rank writes the pages it owns, so none may be elected away.
+            return True
         # Delegate to the policy's should_send. None means fan-in election.
         policy = self._get_policy(layer_group.kind)
         result = policy.should_send(peer_overlap, peer_rank_info, mapper_kind=pool_view.mapper_kind)
         return self._owns_tp_fan_in(peer_rank_info) if result is None else result
 
+    def _should_send_draft_pool(
+        self, peer_rank_info: RankInfo, layer_group_id: int, pool_idx: int
+    ) -> bool:
+        """Ownership of one standalone draft view on the drafter's own rank grid.
+
+        Draft KV is laid out over the flattened TP x CP grid (``cp_as_tp``), so
+        the target's helix overlap does not decide the pairing: a sender
+        writes only to receivers whose grid shard covers its own, and among
+        head replicas one sender per receiver is elected. A DKV group that
+        splits the pages like its latent (every head on every rank, global
+        page ``g`` on rank ``g % N`` alone) has no replicas to elect: each
+        rank writes its pages to every receiver that keeps some of them.
+        """
+        peer_lg_id, _ = self.get_pool_mapping(peer_rank_info)[(layer_group_id, pool_idx)]
+        layer_group = self._self_ext_cache.page_table.layer_groups[layer_group_id]
+        peer_lg = peer_rank_info.page_table.layer_groups[peer_lg_id]
+        if self._ri.dkv_size > 1 and int(layer_group.cp_as_tp_shards) > 1:
+            return self._dkv_draft_pages_overlap(layer_group, peer_rank_info, peer_lg)
+        local = AttentionPolicy.draft_group_rank_info(self._ri, layer_group)
+        peer = AttentionPolicy.draft_group_rank_info(peer_rank_info, peer_lg)
+        if local.tp_size <= peer.tp_size:
+            if peer.tp_rank // (peer.tp_size // local.tp_size) != local.tp_rank:
+                return False
+        elif local.tp_rank // (local.tp_size // peer.tp_size) != peer.tp_rank:
+            return False
+        duplicate, _ = AttentionPolicy(local).duplicate_head_factors(peer)
+        return duplicate <= 1 or peer.dp_rank % duplicate == local.tp_rank % duplicate
+
+    def _dkv_draft_pages_overlap(
+        self,
+        layer_group: AttentionLayerGroup,
+        peer_rank_info: RankInfo,
+        peer_lg: AttentionLayerGroup,
+    ) -> bool:
+        """Whether this DKV rank holds draft pages the receiver keeps.
+
+        The rank holds the global pages ``g`` with ``g % N`` its grid rank (``N`` its
+        ``cp_as_tp_shards``); the receiver keeps every page, or with draft shards ``S`` of its own
+        (Helix) the pages ``g % S`` of its grid rank: some ``g`` is both when the two ranks agree
+        modulo ``gcd(N, S)``.
+        """
+        peer_shards = int(peer_lg.cp_as_tp_shards)
+        if peer_shards <= 1:
+            return True
+        _, rank = AttentionPolicy.draft_rank_grid(peer_rank_info)
+        _, own = AttentionPolicy.draft_rank_grid(self._ri)
+        common = math.gcd(int(layer_group.cp_as_tp_shards), peer_shards)
+        return own % common == rank % common
+
     def should_send_aux(self, peer_rank_info: RankInfo) -> bool:
         # to ensure the transfer aux is not duplicated
+        if self.dkv_fan_out(peer_rank_info):
+            # Every DKV rank writes to every peer; the TP-paired one sends the aux.
+            return self._ri.tp_rank == peer_rank_info.tp_rank and self._ri.pp_rank == 0
 
         # TP: only the first rank in each peer-TP-sized group sends aux
         ratio = max(1, self._ri.tp_size_per_dp_group // peer_rank_info.tp_size_per_dp_group)

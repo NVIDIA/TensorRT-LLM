@@ -32,7 +32,21 @@ slurm:
   extra_args: ""  # Additional SLURM arguments (e.g., "--gres=gpu:4 --exclude=node1")
   set_segment: true # Optional: whether to set the segment for the job
   numa_bind: true  # Enable NUMA binding for GB200/GB300 NVL72
+  # numa_local: false  # Optional: bind each rank to its GPU's NUMA node; see note below
 ```
+
+`numa_bind: true` runs every worker under `numactl -m 0,1` (host memory from
+the two CPU NUMA nodes only). `numa_local: true` (default `false`) instead
+starts each rank, before any Python runs, under
+`numactl --cpunodebind=<n> --membind=<n>`, where `<n>` is the NUMA node of
+the rank's GPU (read from sysfs). Imports, the CUDA context and the heap are
+then first-touched on the GPU's socket. `start_worker.sh` logs one
+`NUMA_LOCAL rank=... gpu=... numa=... cpus=... mems=... membind=...` line per
+rank, and defaults `TLLM_NUMA_AWARE_WORKER_AFFINITY` to `1` so TensorRT-LLM
+keeps the CPU mask. With both keys on, `numa_local` replaces `numa_bind`'s
+`-m 0,1` (its `--membind=<n>` is a subset). If the node cannot be resolved,
+the rank logs `NUMA_LOCAL_SKIP` and starts without it (`numa_bind` still
+applies).
 
 ### 2. Benchmark Configuration
 ```yaml

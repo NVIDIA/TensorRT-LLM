@@ -1,5 +1,21 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+import json
 import os
 from abc import ABC, abstractmethod
+from typing import Any, List, Optional
 
 import llguidance
 import llguidance.torch
@@ -9,6 +25,30 @@ import xgrammar
 from tensorrt_llm.llmapi.llm_args import GuidedDecodingConfig
 
 from ...bindings.executor import GuidedDecodingParams
+
+
+def _drop_negative_lower_bounds(node: Any) -> Any:
+    """Copy of a JSON (schema) document without negative lower bounds.
+
+    xgrammar's range regex for a negative ``minimum`` / ``exclusiveMinimum``
+    admits a bare "-" and rejects in-range negatives; without the bound the
+    grammar still enforces the type.
+    """
+    if isinstance(node, dict):
+        return {
+            key: _drop_negative_lower_bounds(value)
+            for key, value in node.items()
+            if not (key in ("minimum", "exclusiveMinimum") and isinstance(
+                value, (int,
+                        float)) and not isinstance(value, bool) and value < 0)
+        }
+    if isinstance(node, list):
+        return [_drop_negative_lower_bounds(value) for value in node]
+    return node
+
+
+def _without_negative_lower_bounds(document: str) -> str:
+    return json.dumps(_drop_negative_lower_bounds(json.loads(document)))
 
 
 class GrammarMatcher(ABC):
@@ -35,8 +75,14 @@ class GrammarMatcherFactory(ABC):
 
     @abstractmethod
     def create(self,
-               guided_decoding_params: GuidedDecodingParams) -> GrammarMatcher:
-        pass
+               guided_decoding_params: GuidedDecodingParams,
+               stop_token_ids: Optional[List[int]] = None) -> GrammarMatcher:
+        """Build a matcher for one request.
+
+        ``stop_token_ids`` are the request's own terminators; a backend that
+        supports it admits them once the grammar is complete instead of only
+        the tokenizer's EOS.
+        """
 
 
 class XGrammarMatcher(GrammarMatcher):
@@ -73,6 +119,9 @@ class XGrammarMatcherFactory(GrammarMatcherFactory):
                 guided_decoding_config.tokenizer_str)
             vocab_type = metadata["vocab_type"]
             add_prefix_space = metadata["add_prefix_space"]
+        elif guided_decoding_config.vocab_type is not None:
+            vocab_type = xgrammar.VocabType[
+                guided_decoding_config.vocab_type.upper()]
 
         tokenizer_info = xgrammar.TokenizerInfo(
             guided_decoding_config.encoded_vocab,
@@ -92,7 +141,8 @@ class XGrammarMatcherFactory(GrammarMatcherFactory):
         self.max_num_draft_tokens = max_num_draft_tokens
 
     def create(self,
-               guided_decoding_params: GuidedDecodingParams) -> XGrammarMatcher:
+               guided_decoding_params: GuidedDecodingParams,
+               stop_token_ids: Optional[List[int]] = None) -> XGrammarMatcher:
         guide_type = guided_decoding_params.guide_type
         guide = guided_decoding_params.guide
         match guide_type:
@@ -101,20 +151,23 @@ class XGrammarMatcherFactory(GrammarMatcherFactory):
                 )
             case GuidedDecodingParams.GuideType.JSON_SCHEMA:
                 compiled_grammar = self._xgrammar_compiler.compile_json_schema(
-                    guide)
+                    _without_negative_lower_bounds(guide))
             case GuidedDecodingParams.GuideType.REGEX:
                 compiled_grammar = self._xgrammar_compiler.compile_regex(guide)
             case GuidedDecodingParams.GuideType.EBNF_GRAMMAR:
                 compiled_grammar = self._xgrammar_compiler.compile_grammar(
                     guide)
             case GuidedDecodingParams.GuideType.STRUCTURAL_TAG:
+                # The tag's embedded json_schema formats need the same care.
                 compiled_grammar = self._xgrammar_compiler.compile_structural_tag(
-                    guide)
+                    _without_negative_lower_bounds(guide))
             case _:
                 raise ValueError(f"Unsupported guide type: {guide_type}.")
 
         matcher = xgrammar.GrammarMatcher(
-            compiled_grammar, max_rollback_tokens=self.max_num_draft_tokens)
+            compiled_grammar,
+            override_stop_tokens=stop_token_ids or None,
+            max_rollback_tokens=self.max_num_draft_tokens)
         return XGrammarMatcher(matcher)
 
 
@@ -184,9 +237,11 @@ class LLGuidanceMatcherFactory(GrammarMatcherFactory):
                                                  n_vocab=vocab_size_padded,
                                                  eos_token=eos_token)
 
-    def create(
-            self,
-            guided_decoding_params: GuidedDecodingParams) -> LLGuidanceMatcher:
+    def create(self,
+               guided_decoding_params: GuidedDecodingParams,
+               stop_token_ids: Optional[List[int]] = None) -> LLGuidanceMatcher:
+        # LLGuidance terminates on the single EOS token of its config.
+        del stop_token_ids
         guide_type = guided_decoding_params.guide_type
         guide = guided_decoding_params.guide
 

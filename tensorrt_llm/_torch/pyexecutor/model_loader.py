@@ -3,6 +3,7 @@
 
 import copy
 import inspect
+import itertools
 import os
 import sys
 import traceback
@@ -52,9 +53,10 @@ from ..models.checkpoints.checkpoint_catalog import CheckpointCatalog
 from ..models.checkpoints.weight_load_plan import WeightLoadPlan
 from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
                                      get_registered_model_class, timing_metric)
+from ..modules.dwdp.dense.manager import get_global_dense_dwdp_manager
 from ..modules.embedding import Embedding, LMHead
 from ..modules.low_m_gemm import LOW_M_GEMM_ACTIVE, prepare_low_m_gemm
-from ..moe.fused_moe.moe_load_balancer import (MoeLoadBalancer,
+from ..moe.fused_moe.moe_load_balancer import (BaseMoeLoadBalancer,
                                                maybe_create_moe_load_balancer)
 from ..virtual_memory import RestoreMode
 from ..virtual_memory import scope as virtual_memory_scope
@@ -186,10 +188,15 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
     sparse_config = model_config.sparse_attention_config
     uses_minimax_m3_msa = (is_minimax_m3(sparse_config)
                            and sparse_config.implementation == "msa")
+    # A modeling_v2 target whose own attention serves an NVFP4 KV cache says so
+    # (handles_nvfp4_kv_cache) and keeps it.
+    target_handles_nvfp4 = getattr(
+        getattr(model_config, "modeling_v2_target", None),
+        "handles_nvfp4_kv_cache", False)
     if (effective_kv_cache_quant in (QuantAlgo.NVFP4, QuantAlgo.NVFP4.value)
             and not supports_fp4_mla_attention(model_config)
-            and not uses_minimax_m3_msa and torch.cuda.is_available()
-            and get_sm_version() == 107):
+            and not uses_minimax_m3_msa and not target_handles_nvfp4
+            and torch.cuda.is_available() and get_sm_version() == 107):
         logger.warning(
             "NVFP4 KV cache is not supported by trtllm-gen on SM107; "
             "using FP8 KV cache instead.")
@@ -252,16 +259,15 @@ def validate_fp4_mla_config(model_config: ModelConfig,
             and model_config.quant_config.quant_mode.has_fp4_kv_cache()):
         return
     if not supports_fp4_mla_attention(model_config):
-        raise ValueError("Dense FP4 MLA requires the TRTLLM attention backend; "
-                         "hybrid linear attention is not supported.")
-    if model_config.mapping.cp_size != 1:
-        raise ValueError("FP4 MLA does not support context parallelism.")
+        raise ValueError(
+            "Dense FP4 MLA requires the TRTLLM attention backend; among hybrid "
+            "linear-attention models only Kimi K3 is supported.")
+    if model_config.mapping.cp_size != 1 and not model_config.mapping.has_cp_helix(
+    ):
+        raise ValueError("FP4 MLA supports context parallelism only with Helix "
+                         "(cp_config cp_type=HELIX).")
     if llm_args.kv_cache_config.use_kv_cache_manager_v2 is False:
         raise ValueError("FP4 MLA requires use_kv_cache_manager_v2=True.")
-    if llm_args.enable_chunked_prefill:
-        raise ValueError(
-            "FP4 MLA does not support chunked prefill or cached context; "
-            "set enable_chunked_prefill=False.")
 
     spec_config = model_config.spec_config
     if spec_config is not None and spec_config.spec_dec_mode.use_one_engine():
@@ -438,6 +444,40 @@ def initialize_dummy_weights(
             initialize_dummy_state(low=low, high=high, seed=seed)
 
 
+#: Attribute a model sets (``True``) on a parameter or buffer that is still on
+#: the meta device to keep it there through the load: the loader neither
+#: materializes nor moves it, and ``create_py_executor`` calls the model's
+#: ``load_deferred_weights()`` once the standalone dense DWDP setup is done,
+#: which allocates and loads it. A model defers its routed experts this way
+#: under dense DWDP, so that a rank never holds the replicated dense weights and
+#: its experts at once.
+DEFER_MATERIALIZATION_ATTR = "_tllm_defer_materialization"
+
+
+def is_deferred_tensor(t: torch.Tensor) -> bool:
+    """Whether ``t`` is a meta tensor whose model asked the loader to leave it
+    unmaterialized."""
+    return t.device.type == "meta" and getattr(t, DEFER_MATERIALIZATION_ATTR,
+                                               False)
+
+
+def has_deferred_tensors(model: torch.nn.Module) -> bool:
+    """Whether ``model`` holds a tensor the loader leaves on the meta device
+    (``DEFER_MATERIALIZATION_ATTR``)."""
+    return any(
+        is_deferred_tensor(t)
+        for t in itertools.chain(model.parameters(), model.buffers()))
+
+
+def _model_to_cuda(model: torch.nn.Module) -> None:
+    """``model.to("cuda")``, except that the deferred meta tensors stay where
+    they are."""
+    if not has_deferred_tensors(model):
+        model.to("cuda")
+        return
+    model._apply(lambda t: t if is_deferred_tensor(t) else t.to("cuda"))
+
+
 def get_rank_model_storage(model):
     total_bytes = 0
     for _, param in model.named_parameters():
@@ -590,10 +630,41 @@ def _legacy_weight_session(checkpoint_loader: Any, checkpoint_dir: str,
     yield checkpoint_loader.load_weights(checkpoint_dir, **kwargs)
 
 
+def _model_weight_session(
+        checkpoint_loader: Any, checkpoint_dir: str,
+        **kwargs: Any) -> Optional[AbstractContextManager[dict[str, Any]]]:
+    """The model's own checkpoint session, when the model reads its checkpoint.
+
+    A model class that defines ``open_checkpoint_weights(checkpoint_dir,
+    mapping)`` (a modeling_v2 target) reads its own checkpoint in place of the
+    built-in HF weight loader, for example as lazy slices so a large checkpoint
+    is never held in host RAM. Any other checkpoint loader or weight loader
+    still reads the weights.
+    """
+    model = kwargs.get("model")
+    if getattr(type(model), "open_checkpoint_weights", None) is None:
+        return None
+    from tensorrt_llm._torch.models.checkpoints.hf.checkpoint_loader import \
+        HfCheckpointLoader
+    from tensorrt_llm._torch.models.checkpoints.hf.weight_loader import \
+        HfWeightLoader
+    if (type(checkpoint_loader) is not HfCheckpointLoader
+            or type(checkpoint_loader.weight_loader) is not HfWeightLoader):
+        return None
+    logger.info(f"Reading the checkpoint through "
+                f"{type(model).__name__}.open_checkpoint_weights")
+    return model.open_checkpoint_weights(checkpoint_dir,
+                                         mapping=kwargs.get("mapping"))
+
+
 def _open_checkpoint_weight_session(
         checkpoint_loader: Any, checkpoint_dir: str,
         **kwargs: Any) -> AbstractContextManager[dict[str, Any]]:
     """Preserve duck-typed loaders that predate the session interface."""
+    model_session = _model_weight_session(checkpoint_loader, checkpoint_dir,
+                                          **kwargs)
+    if model_session is not None:
+        return model_session
     if getattr(type(checkpoint_loader), "open_weight_session", None) is None:
         return _legacy_weight_session(checkpoint_loader, checkpoint_dir,
                                       **kwargs)
@@ -722,6 +793,32 @@ def _assert_no_compile_wrapper_in_paths(model: torch.nn.Module) -> None:
 def _check_compile_wrapper_before_reload(model: torch.nn.Module) -> None:
     if not _load_weights_strips_compile_wrapper(model):
         _assert_no_compile_wrapper_in_paths(model)
+
+
+def _reject_dense_dwdp_update(model: torch.nn.Module, action: str) -> None:
+    """Refuse to rewrite the weights of a model that dense DWDP sharded.
+
+    Dense DWDP repoints the dense weights of the MoE decoder layers into staging
+    slots that several layers share and that the next gather overwrites, so
+    weights written through the modules would be lost. Its setup marks the
+    model and its decoder with ``_dense_dwdp_active``; the mark stays after the
+    dense DWDP teardown, which leaves zero-size tensors behind.
+
+    Args:
+        model: The model about to be updated.
+        action: What the caller was about to do, for the error message.
+
+    Raises:
+        RuntimeError: The model or its decoder (``model.model``) is marked.
+    """
+    decoder = getattr(model, "model", None)
+    if getattr(model, "_dense_dwdp_active", False) or getattr(
+            decoder, "_dense_dwdp_active", False):
+        raise RuntimeError(
+            f"Cannot {action}: dense DWDP (dwdp_config.enable_dense) moved "
+            "this model's dense weights into staging slots shared across "
+            "layers, so they cannot be rewritten in place. Launch without "
+            "dwdp_config.enable_dense to update weights.")
 
 
 class ModelLoaderMetricNames(Enum):
@@ -934,6 +1031,10 @@ class ModelLoader:
         if architectures:
             preference_cls = get_registered_model_class(
                 architectures[0]) or model_cls
+        if preference_cls is None:
+            # An architecture served only by modeling_v2 targets: the target
+            # supplies the model defaults and engine preferences.
+            preference_cls = model_cls = modeling_v2_resolve(config, llm_args)
 
         # model_cls is None when the architecture is unknown/unsupported.
         model_defaults = {}
@@ -1045,7 +1146,7 @@ class ModelLoader:
         self,
         checkpoint_dir: str,
         checkpoint_loader: BaseCheckpointLoader,
-    ) -> tuple[DecoderModelForCausalLM, MoeLoadBalancer | None]:
+    ) -> tuple[DecoderModelForCausalLM, BaseMoeLoadBalancer | None]:
         """
         Loads the model, its weights, and applies necessary configurations.
 
@@ -1114,9 +1215,12 @@ class ModelLoader:
                     "Hugging Face AUTO loader; DUMMY, VISION_ONLY, GMS, and MX "
                     "loaders cannot materialize them")
 
+            # Models that load their drafter inside ``load_weights`` opt out
+            # of the generic draft materialization.
             loads_draft_weights = (
                 self.spec_config is not None
-                and self.spec_config.needs_separate_draft_weights)
+                and self.spec_config.needs_separate_draft_weights
+                and not getattr(model, "loads_draft_weights_internally", False))
             speculative_mode = self._speculative_mode_name(self.spec_config)
             post_transform_qualification = self._qualify_post_transform_profile(
                 model,
@@ -1169,6 +1273,8 @@ class ModelLoader:
                                                                LoadFormat.DUMMY)
 
                 def allocate_weights_on_cuda(t: torch.Tensor):
+                    if is_deferred_tensor(t):
+                        return t
                     if t not in memo:
                         cuda_t = torch.empty_like(t, device='cuda')
                         if t.device != torch.device('meta') and (
@@ -1199,7 +1305,8 @@ class ModelLoader:
             elif is_meta_init and load_format != LoadFormat.GMS:
 
                 def init_meta_tensor(t: torch.Tensor):
-                    if t.device != torch.device('meta'):
+                    if t.device != torch.device('meta') or is_deferred_tensor(
+                            t):
                         return t
 
                     if t not in memo:
@@ -1211,7 +1318,7 @@ class ModelLoader:
             # Ensure everything is at least on CUDA
             # No-op if worked as expected
             if load_format != LoadFormat.GMS:
-                model.to("cuda")
+                _model_to_cuda(model)
             memo.clear()
 
             rank_model_storage = get_rank_model_storage(model)
@@ -1520,6 +1627,10 @@ class ModelLoader:
             elif load_format == LoadFormat.DUMMY:
                 self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
                     model, config)
+                # No checkpoint to defer: dummy weights fill the deferred tensors now.
+                device = torch.device("cuda", torch.cuda.current_device())
+                model._apply(lambda t: torch.empty_like(t, device=device)
+                             if is_deferred_tensor(t) else t)
                 initialize_dummy_weights(model)
                 if loads_draft_weights:
                     model.draft_model.load_weights_from_target_model(model)
@@ -1569,7 +1680,7 @@ class ModelLoader:
                 # `tensorrt_llm/llmapi/llm_args.py`. When implementing the
                 # follow-up, drop the validator gate AFTER moving these calls
                 # into the pool scope.
-                if isinstance(moe_load_balancer, MoeLoadBalancer):
+                if isinstance(moe_load_balancer, BaseMoeLoadBalancer):
                     moe_load_balancer.register_weight_slots_after_to_cuda()
                     logger.info("moe_load_balancer finalizing model...")
                     moe_load_balancer.finalize_model()
@@ -1960,7 +2071,12 @@ class ModelLoader:
 
         Returns:
             None.
+
+        Raises:
+            RuntimeError: Dense DWDP sharded the model's dense weights, or the
+                weight mapper was not initialized.
         """
+        _reject_dense_dwdp_update(model, "reload weights")
         if self.weight_mapper is None:
             raise RuntimeError(
                 "Cannot reload weights: weight_mapper was not initialized. "
@@ -1977,10 +2093,18 @@ class ModelLoader:
             torch.cuda.current_stream().synchronize()
 
     def begin_update_weights(self) -> None:
-        """Start an incremental update session on the persistent mapper."""
+        """Start an incremental update session on the persistent mapper.
+
+        Raises:
+            RuntimeError: The weight mapper was not initialized, or dense DWDP
+                sharded the dense weights of the model it is bound to.
+        """
         if self.weight_mapper is None:
             raise RuntimeError(
                 "Cannot update weights: weight_mapper was not initialized")
+        bound_model = getattr(self.weight_mapper, "_model", None)
+        if bound_model is not None:
+            _reject_dense_dwdp_update(bound_model, "update weights")
         self.weight_mapper.begin_update_weights()
 
     def finalize_update_weights(self) -> None:
@@ -2050,6 +2174,7 @@ class ModelLoader:
             sparse_attention_config=self.sparse_attention_config,
             kv_cache_compression_config=(
                 self.llm_args.kv_cache_compression_config),
+            dkv_config=self.llm_args.dkv_config,
             max_num_tokens=self.max_num_tokens,
             max_seq_len=self.max_seq_len,
             moe_max_num_tokens=self.llm_args.moe_config.max_num_tokens,
@@ -2095,9 +2220,13 @@ class ModelLoader:
         # built-in class and applied its model defaults to `llm_args`: a
         # modeling_v2 target reads the arguments as the engine will run with
         # them and never overrides those defaults.
-        config = replace(config,
-                         modeling_v2_target=modeling_v2_resolve(
-                             config, self.llm_args))
+        modeling_v2_target = modeling_v2_resolve(config, self.llm_args)
+        # extra_attrs is not an init field, so replace() starts it empty:
+        # carry what was set before, including what the route recorded for
+        # the target there (its server role, for example).
+        extra_attrs = config.extra_attrs
+        config = replace(config, modeling_v2_target=modeling_v2_target)
+        config.extra_attrs.update(extra_attrs)
 
         if uses_mtp_head_checkpoint(self.spec_config):
             # `load_config_and_apply_defaults` already ran this, but against a
@@ -2114,6 +2243,14 @@ class ModelLoader:
             'kv_cache_dtype'] = self.llm_args.kv_cache_config.dtype
         config.extra_attrs["bounded_replay_on_generation"] = (
             self.llm_args.bounded_replay_on_generation)
+        # The engine limits a target may size its workspaces by (they are not routing inputs).
+        config.extra_attrs["max_batch_size"] = self.llm_args.max_batch_size
+        config.extra_attrs["max_num_tokens"] = self.llm_args.max_num_tokens
+        # The dense DWDP manager the executor registered before the model is
+        # built (None without dwdp_config.enable_dense): a model whose layers
+        # are no modules captures it from here.
+        config.extra_attrs[
+            "dense_dwdp_manager"] = get_global_dense_dwdp_manager()
         # Store allreduce pre-allocation config for AllReduce module access.
         # Use get_text_config() so VLM wrapper configs (e.g. KimiK2VLConfig,
         # KimiK25Config) that store the text config under .text_config are

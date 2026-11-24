@@ -56,7 +56,11 @@ from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
     CacheReuseAdapter,
     create_cache_reuse_adapter,
 )
-from tensorrt_llm._torch.disaggregation.resource.utils import get_pool_view_slot_bytes
+from tensorrt_llm._torch.disaggregation.resource.dkv import manager_dkv, own_page_slots
+from tensorrt_llm._torch.disaggregation.resource.utils import (
+    get_pool_view_slot_bytes,
+    is_standalone_draft_group,
+)
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm._torch.pyexecutor import hang_detector
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
@@ -268,6 +272,9 @@ def _chunk_bytes_by_kind(page_table, chunk: Chunk) -> Tuple[int, int]:
 
 
 class KvCacheTransceiverV2(KvCacheTransceiver):
+    # Whether the context-side consensus spans TP x CP (Ulysses CP); set by _init_sync_policy.
+    _ctx_sync_over_cp: bool = False
+
     @property
     def consumes_transfer_buffer(self) -> bool:
         return False
@@ -440,9 +447,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         Every TP rank receives the same number of bytes, split or replicated, so the TP
         total is tp_size times this rank's bytes; under attention DP one DP rank holds the
         request. Helix CP ranks receive different paged bytes, so CP is scaled per request
-        (see _request_kv_bytes).
+        (see _request_kv_bytes); Ulysses CP ranks receive TP shares, so they count here.
         """
-        return 1 if mapping.enable_attention_dp else max(1, mapping.tp_size)
+        if mapping.enable_attention_dp:
+            return 1
+        cp_ranks = mapping.cp_size if mapping.cp_size > 1 and mapping.has_cp_ulysses() else 1
+        return max(1, mapping.tp_size * cp_ranks)
 
     def _request_kv_bytes(self, req: LlmRequest, paged_bytes: int, state_bytes: int) -> int:
         """KV bytes the request's transfer moves into the TP and CP ranks of this PP stage.
@@ -450,13 +460,15 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         A metric only. The C++ transceiver can sum what every rank received, PP stages
         included. This computes that sum for this PP stage alone from this rank's paged
         and STATE bytes (_chunk_bytes_by_kind), with no collective. Both scale by the
-        TP factor. Each CP rank also holds a STATE (recurrent) slot of the same size, so
-        STATE bytes scale by the CP size too. Paged bytes follow the prompt blocks each
-        CP rank holds instead (_request_paged_bytes).
+        TP factor. Each helix CP rank also holds a STATE (recurrent) slot of the same size,
+        so STATE bytes scale by the CP size too. Paged bytes follow the prompt blocks each
+        CP rank holds instead (_request_paged_bytes). Ulysses CP ranks count as TP ranks.
         """
         tp_paged = paged_bytes * self._kv_size_rank_factor
         tp_state = state_bytes * self._kv_size_rank_factor
-        return self._request_paged_bytes(req, tp_paged) + tp_state * self._mapping.cp_size
+        m = self._mapping
+        cp_state = 1 if m.cp_size == 1 or m.has_cp_ulysses() else m.cp_size
+        return self._request_paged_bytes(req, tp_paged) + tp_state * cp_state
 
     def _request_paged_bytes(self, req: LlmRequest, paged_bytes: int) -> int:
         """Request-total paged bytes, given this CP rank's paged bytes times the TP factor.
@@ -467,7 +479,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         per-block bytes by the global block count gives the request total. A CP rank that
         owns no block has no paged bytes; responses come from CP rank 0, which owns block 0.
         """
-        if paged_bytes == 0 or self._mapping.cp_size == 1:
+        if paged_bytes == 0 or self._mapping.cp_size == 1 or self._mapping.has_cp_ulysses():
             return paged_bytes
         tpb = self._reuse_adapter.tokens_per_block
         local_blocks = (req.prompt_len + tpb - 1) // tpb
@@ -478,10 +490,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     def _init_sync_policy(self):
         m = self._mapping
-        # The ctx side never syncs over CP: helix pairs a cp=1 context instance
-        # with a cp=N generation instance (see attention/peer.py check_peer_compatible),
-        # so on the context side the CP group is always a single rank.
-        self._ctx_need_tp_sync = m.tp_size > 1 and not m.enable_attention_dp
+        # The ctx side never syncs over helix CP: helix pairs a cp=1 context instance
+        # with a cp=N generation instance (see attention/peer.py check_peer_compatible).
+        # Ulysses CP ranks hold TP shares of every request, so they sync with the TP ranks.
+        self._ctx_sync_over_cp = m.cp_size > 1 and m.has_cp_ulysses()
+        ctx_sync_size = m.tp_size * (m.cp_size if self._ctx_sync_over_cp else 1)
+        self._ctx_need_tp_sync = ctx_sync_size > 1 and not m.enable_attention_dp
         self._ctx_need_pp_sync = m.pp_size > 1
         if m.enable_attention_dp:
             # DP groups schedule independently, but the PP or helix CP ranks of
@@ -511,6 +525,21 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         else:
             self._gen_need_sync = m.world_size > 1
             self._gen_allgather = self._dist.allgather
+        # TRTLLM_DISAGG_GEN_FAST_SYNC=1: an idle non-blocking status poll is decided by
+        # one fixed-size int64 allgather of the per-rank receive-session counts instead
+        # of the two pickled allgathers of the full consensus. It spans the same ranks
+        # (the world, i.e. TP x CP when PP is 1), so every rank takes the same branch.
+        self._gen_idle_probe = (
+            os.environ.get("TRTLLM_DISAGG_GEN_FAST_SYNC", "0") == "1"
+            and self._gen_need_sync
+            and not m.enable_attention_dp
+            and m.pp_size == 1
+            and m.world_size == m.tp_size * m.cp_size
+        )
+
+    def _any_rank_has_recv_sessions(self) -> bool:
+        counts = self._dist.tp_cp_allgather_int64([len(self._recv_sessions)])
+        return bool(counts.any())
 
     def _dp_group_allgather(self, obj):
         """Allgather over the CP ranks, then the PP ranks, of this DP group.
@@ -673,10 +702,22 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         empty = np.array([], dtype=np.int64)
         groups = []
         kinds = [lg.kind for lg in layer_groups]
+        dkv = manager_dkv(self._kv_cache_manager)
+        dkv_life_cycles = (
+            frozenset(self._kv_cache_manager.dkv_life_cycles) if dkv is not None else ()
+        )
         for idx, lg in enumerate(layer_groups):
+            if idx in dkv_life_cycles:
+                # Per global page: this rank's slot of its DKV block (resource/dkv.py), as the
+                # manager holds it now, not as of the request's last exchange.
+                own = self._kv_cache_manager.dkv_own_slots(req.py_request_id, idx)
+                groups.append(own_page_slots(own, dkv.size, prompt_blocks))
+                continue
             if lg.kind == CacheKind.STATE:
                 slot = self._get_mamba_slot_for_request(req)
                 group = np.array([slot], dtype=np.int64) if slot is not None else empty
+            elif is_standalone_draft_group(lg):
+                group = self._describe_draft_group(req, idx, lg, cached_per_lg[idx] // tpb)
             else:
                 # Block lists carry beam 0 only (beam-search attention reads
                 # prompt positions through beam 0's block table), so the
@@ -692,6 +733,44 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             is_last=True,
             excluded_pool_views=excluded_pool_views,
         )
+
+    def _describe_draft_group(
+        self, req: LlmRequest, idx: int, lg, cached_blocks: int
+    ) -> np.ndarray:
+        """Positional block table of a unified standalone draft group.
+
+        Draft pages follow the drafter's own rank grid, not the target's helix
+        split: a rank keeps the global prompt pages ``g`` with
+        ``g % cp_as_tp_shards == draft_cp_rank`` (every page with one shard),
+        indexed by their local ordinal. Once the whole prompt is in place
+        (always on the receiver), a full-history drafter must hold every
+        prompt page; a missing one would silently drop drafter context.
+        """
+        tpb = self._reuse_adapter.tokens_per_block
+        manager = self._kv_cache_manager
+        prompt_blocks = (self._global_prompt_len(req) + tpb - 1) // tpb
+        shards = int(lg.cp_as_tp_shards)
+        draft_rank = int(manager.draft_cp_rank) % shards if shards > 1 else 0
+        local_blocks = len(range(draft_rank, prompt_blocks, shards))
+        ordinals = self._reuse_adapter.get_block_ordinals(req, idx, lg)
+        prompt_complete = req.is_generation_only_request or req.context_remaining_length == 0
+        # A DKV group splits the pages like its latent (draft_page_split): its table is
+        # positional over the global pages, -1 at the ones the other ranks hold.
+        split = getattr(manager, "draft_page_split", None) is not None
+        local_cached = len(range(draft_rank, cached_blocks, shards)) if split else cached_blocks
+        if manager.draft_window_size is None and prompt_complete:
+            held = ordinals[min(local_cached, local_blocks) : local_blocks]
+            if held.size != local_blocks - min(local_cached, local_blocks) or np.any(held < 0):
+                raise ValueError(
+                    f"Request {req.py_request_id}: unified draft KV transfer is missing "
+                    "allocated prompt pages"
+                )
+        if not split:
+            return self._positional_window(ordinals, local_blocks, cached_blocks)
+        window = np.full(prompt_blocks, -1, dtype=np.int64)
+        window[draft_rank::shards] = self._positional_window(ordinals, local_blocks, 0)
+        window[: min(cached_blocks, prompt_blocks)] = -1
+        return window
 
     @staticmethod
     def _positional_window(
@@ -709,10 +788,89 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         window[: min(cached_blocks, prompt_blocks)] = -1
         return window
 
-    @staticmethod
-    def _need_aux_transfer(req: LlmRequest) -> bool:
+    def _need_aux_transfer(self, req: LlmRequest) -> bool:
+        """Whether this request's transfer carries the aux buffer.
+
+        Generation-first requests carry their first tokens there; a unified
+        standalone draft cache carries its history there under every schedule.
+        """
+        if self._has_standalone_draft_cache():
+            return True
         params = req.py_disaggregated_params
         return params is not None and params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
+
+    def _has_standalone_draft_cache(self) -> bool:
+        """Whether the KV cache manager owns unified standalone draft layers (DSpark)."""
+        manager = getattr(self, "_kv_cache_manager", None)
+        return getattr(manager, "has_standalone_draft_cache", False) is True
+
+    def _global_prompt_len(self, req: LlmRequest) -> int:
+        """Prompt length in global tokens; helix requests carry their rank-local slice."""
+        if getattr(self._kv_cache_manager, "_has_cp_helix", False) is True:
+            return req.total_input_len_cp
+        return req.prompt_len
+
+    def _validate_draft_history_range(self, req: LlmRequest, history: dict) -> None:
+        """Require draft history covering the complete prompt, without scratch.
+
+        Full-attention drafters may skip the context store of a prompt longer
+        than their position limit; windowed drafters retain their complete
+        live suffix.
+        """
+        window_size = history["layout"]["window_size"]
+        max_positions = getattr(self._kv_cache_manager, "draft_max_position_embeddings", None)
+        prompt_len = self._global_prompt_len(req)
+        expected_length = prompt_len
+        if window_size is not None:
+            if type(window_size) is not int or window_size <= 0:
+                raise ValueError("Invalid draft history window size")
+            expected_length = min(expected_length, window_size)
+        elif max_positions is not None and prompt_len > max_positions:
+            expected_length = min(history["valid_length"], max_positions)
+        if history["valid_length"] != expected_length or history["position"] != prompt_len:
+            raise ValueError(
+                "DSpark transfer requires valid draft history and sequence position "
+                f"covering the complete prompt ({prompt_len} tokens, {expected_length} "
+                f"retained); got valid_length={history['valid_length']}, "
+                f"position={history['position']}."
+            )
+
+    def _pack_draft_history(self, req: LlmRequest) -> None:
+        """Export the prompt's validated draft history for the aux transfer."""
+        if not self._has_standalone_draft_cache():
+            return
+        history = self._kv_cache_manager.export_draft_history(req.py_request_id)
+        if history is None:
+            raise ValueError(
+                f"Standalone draft request {req.py_request_id} has no draft history to transfer"
+            )
+        self._validate_draft_history_range(req, history)
+        req.py_draft_transfer_history = history
+
+    def _restore_draft_history(self, req: LlmRequest) -> None:
+        """Publish received draft history; its K/V already sits in receiver-local pages.
+
+        Only a unified standalone draft cache receives history: its aux layout
+        is the only one with a draft-history buffer.
+        """
+        if not self._has_standalone_draft_cache():
+            return
+        history = getattr(req, "py_draft_transfer_history", None)
+        if history is None:
+            raise ValueError(
+                "Standalone DSpark generation requires draft history from a context "
+                "server with a matching speculative configuration; the draft history "
+                "metadata is missing."
+            )
+        self._validate_draft_history_range(req, history)
+        self._kv_cache_manager.restore_draft_history(req.py_request_id, history)
+
+    def _prepare_received_history(self, session, req: LlmRequest) -> None:
+        """Apply the aux payload and validate the received history before completion."""
+        if self._need_aux_transfer(req):
+            self._apply_aux(session, req)
+        self._assert_disagg_history_declared(req)
+        self._restore_draft_history(req)
 
     def _validate_bridge_req(self, req: LlmRequest, synchronous: bool = False) -> bool:
         if not getattr(self, "_fp4_mla_bridge_enabled", False):
@@ -734,11 +892,16 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             return False
         return True
 
+    def _ctx_sync_allgather(self, obj) -> list:
+        """Allgather over the context-side sync group: TP, or TP x CP under Ulysses."""
+        if self._ctx_sync_over_cp:
+            return self._dist.tp_cp_allgather(obj)
+        return self._dist.tp_allgather(obj)
+
     def _ctx_consensus(self, local_ids: list) -> list:
         # TP consensus: ensure all TP ranks have peer info
-        sync_size = self._dist.tp_size if self._ctx_need_tp_sync else 1
-        all_ranks = self._dist.tp_allgather(local_ids) if self._ctx_need_tp_sync else [local_ids]
-        ready_ids = _find_consensus_request_ids(all_ranks, sync_size)
+        all_ranks = self._ctx_sync_allgather(local_ids) if self._ctx_need_tp_sync else [local_ids]
+        ready_ids = _find_consensus_request_ids(all_ranks, len(all_ranks))
 
         # PP consensus: ensure all PP ranks have peer info before promoting.
         # In PP, the first PP rank schedules and propagates to others. If a
@@ -868,7 +1031,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             cancelled,
             failed,
             completed,
-            self._dist.tp_allgather,
+            self._ctx_sync_allgather,
             self._ctx_need_tp_sync,
             locally_quiesced,
         )
@@ -1015,6 +1178,16 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     def _apply_aux(self, session, req: LlmRequest):
         """Unpack aux tokens from session into request's context_phase_params."""
+        params = req.py_disaggregated_params
+        if (
+            self._has_standalone_draft_cache()
+            and params is not None
+            and params.schedule_style != DisaggScheduleStyle.GENERATION_FIRST
+        ):
+            # Context-first tokens and usage already arrived in the context
+            # response; the aux transfer carries only the draft history.
+            session.unpack_draft_history(req)
+            return
         session.unpack_aux(req)
         first_gen_tokens = req.py_first_gen_tokens  # type: ignore[attr-defined]
         draft_tokens = req.py_draft_tokens
@@ -1052,6 +1225,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         rid = get_unique_rid(req)
         assert rid is not None
         if self._need_aux_transfer(req):
+            self._pack_draft_history(req)
             session.pack_aux(req)
             session.send_aux()
         req.context_phase_params = ContextPhaseParams(
@@ -1215,9 +1389,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 req.py_kv_transfer_verified = session.kv_write_verified()
                 # KV-transfer timing setters deferred to #15871 (clock-source consistency); size only.
                 req.set_kv_cache_size(self._request_kv_bytes(req, paged_bytes, state_bytes))
-                if self._need_aux_transfer(req):
-                    self._apply_aux(session, req)
-                self._assert_disagg_history_declared(req)
+                self._prepare_received_history(session, req)
                 req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
             else:
                 req.state = LlmRequestState.DISAGG_TRANS_ERROR
@@ -1395,6 +1567,16 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def check_gen_transfer_status(self, at_least_request_num: Optional[int]) -> GenTransferStatus:
         if not self._ever_had_recv_session and not self._gen_need_sync:
             return GenTransferStatus([], [], [])
+        # With no receive session on any rank, the consensus below gathers empty
+        # lists and returns three empty lists without side effects. Only the
+        # non-blocking poll is short-circuited; blocking and at-least-N calls keep
+        # their pacing.
+        if (
+            getattr(self, "_gen_idle_probe", False)
+            and at_least_request_num == 0
+            and not self._any_rank_has_recv_sessions()
+        ):
+            return GenTransferStatus([], [], [])
         block_all = at_least_request_num is None
         wait_num = at_least_request_num if not block_all else 0
         need_progress = wait_num > 0
@@ -1481,9 +1663,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             req.py_kv_transfer_verified = rid in verified
             # transfer_end already stamped at completion detection above.
             req.set_kv_cache_size(getattr(req, "py_kv_cache_xfer_bytes", 0))
-            if self._need_aux_transfer(req):
-                self._apply_aux(session, req)
-            self._assert_disagg_history_declared(req)
+            self._prepare_received_history(session, req)
             self._close_session_or_raise(session, rid, "completed")
             req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
             del self._recv_reqs[rid]
@@ -1660,11 +1840,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     def _check_compatible(self):
         m = self._mapping
-        if m.cp_size != 1 and not m.has_cp_helix():
+        if m.cp_size != 1 and not (m.has_cp_helix() or m.has_cp_ulysses()):
             raise ValueError(
                 f"KvCacheTransceiverV2: _check_compatible: unsupported context parallelism "
                 f"(cp_size={m.cp_size}, cp_type={m.cp_config.get('cp_type')}); "
-                f"only cp_size == 1 or helix CP is supported"
+                f"only cp_size == 1, helix or Ulysses CP is supported"
             )
         # Under attention-DP the gen-side completion consensus spans the helix CP
         # ranks of a DP group, so they must admit the same gen-init requests in

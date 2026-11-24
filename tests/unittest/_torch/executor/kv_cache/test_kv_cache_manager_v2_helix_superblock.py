@@ -336,9 +336,23 @@ def test_estimation_prepare_promotes_skip_est_for_v2() -> None:
     c = creator(is_v2=False)
     assert KvCacheCreator.try_prepare_estimation(c) is False
     assert c._skip_est is False
-    c = creator(is_v2=True, cp_type=CpType.ULYSSES)
+    c = creator(is_v2=True, cp_type=CpType.RING)
     assert KvCacheCreator.try_prepare_estimation(c) is False
     assert c._skip_est is False
+
+
+def test_ulysses_cp_sizes_the_kv_cache_as_tp() -> None:
+    """Ulysses CP keeps the TP KV layout: estimation and sizing treat it as TP."""
+    from tensorrt_llm._torch.pyexecutor._util import _cp_splits_kv
+    from tensorrt_llm.mapping import CpType
+
+    def mapping(cp_type):
+        return SimpleNamespace(cp_config={} if cp_type is None else {"cp_type": cp_type})
+
+    assert not _cp_splits_kv(mapping(None))
+    assert not _cp_splits_kv(mapping(CpType.ULYSSES))
+    assert _cp_splits_kv(mapping(CpType.HELIX))
+    assert _cp_splits_kv(mapping(CpType.RING))
 
 
 def test_scheduler_allocation_failure_raises_under_helix() -> None:
@@ -354,6 +368,7 @@ def test_scheduler_allocation_failure_raises_under_helix() -> None:
         kv_cache_manager=SimpleNamespace(try_allocate_generation=lambda req: False),
         draft_kv_cache_manager=None,
         enable_joint_kv_cache_reuse=False,
+        _skip_blocked_generation=False,
     )
     sched._try_allocate_generation = types.MethodType(
         KVCacheV2Scheduler._try_allocate_generation, sched

@@ -43,7 +43,14 @@ def _transceiver(mapping, dist) -> KvCacheTransceiverV2:
 
 
 def _mapping(**overrides) -> SimpleNamespace:
-    base = dict(tp_size=1, pp_size=1, cp_size=1, world_size=1, enable_attention_dp=False)
+    base = dict(
+        tp_size=1,
+        pp_size=1,
+        cp_size=1,
+        world_size=1,
+        enable_attention_dp=False,
+        has_cp_ulysses=lambda: False,
+    )
     base.update(overrides)
     return SimpleNamespace(**base)
 
@@ -294,3 +301,51 @@ def test_chunk_bytes_by_kind_counts_paged_per_block_and_state_once(monkeypatch) 
     paged, state = transceiver_module._chunk_bytes_by_kind(page_table, chunk)
 
     assert (paged, state) == (2 * 10, 100)
+
+
+@pytest.mark.parametrize("tp_size,cp_size", [(1, 8), (1, 16), (2, 4)])
+def test_ulysses_context_consensus_spans_tp_x_cp(tp_size, cp_size) -> None:
+    """Ulysses CP ranks hold TP shares of every request.
+
+    The context consensus gathers over TP x CP and promotes only the requests every rank of it is
+    ready for.
+    """
+    world = tp_size * cp_size
+    dist = SimpleNamespace(
+        tp_allgather=Mock(side_effect=AssertionError("the TP-only gather misses the CP ranks")),
+        allgather=lambda payload: [payload] * world,
+        tp_cp_allgather=lambda payload: [payload] + [[3]] * (world - 1),
+    )
+    tc = _transceiver(
+        _mapping(
+            tp_size=tp_size,
+            cp_size=cp_size,
+            world_size=world,
+            has_cp_ulysses=lambda: True,
+        ),
+        dist,
+    )
+
+    assert tc._ctx_need_tp_sync is True
+    assert tc._ctx_consensus([3, 4]) == [3]
+    assert KvCacheTransceiverV2._kv_size_rank_factor_for(tc._mapping) == world
+
+
+def test_ulysses_request_kv_bytes_count_every_rank_as_tp() -> None:
+    """Under Ulysses every rank holds the whole prompt's blocks (its TP share) and a STATE slot."""
+    tc, req = _metric_transceiver(
+        _mapping(tp_size=1, cp_size=8, has_cp_ulysses=lambda: True), 80, 80
+    )
+    local_paged = 3 * _BLOCK_BYTES
+
+    assert tc._request_kv_bytes(req, local_paged, _STATE_BYTES) == 8 * (
+        3 * _BLOCK_BYTES + _STATE_BYTES
+    )
+
+
+def test_ulysses_cp_is_compatible() -> None:
+    tc = object.__new__(KvCacheTransceiverV2)
+    tc._mapping = _mapping(
+        cp_size=8, world_size=8, has_cp_helix=lambda: False, has_cp_ulysses=lambda: True
+    )
+    tc._check_compatible()

@@ -11,6 +11,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -388,6 +389,82 @@ def test_failed_sender_write_retains_roots_until_fatal_deadline() -> None:
     assert operation.status is status
     assert not task.resources_drained
     assert not owner.close()
+
+
+def test_agent_gate_metadata_drains_transfers_and_goes_first() -> None:
+    """A metadata load waits for active transfers and is not starved by new ones."""
+    gate = transfer_mod._AgentOperationGate()
+    order: list[str] = []
+    release_first = threading.Event()
+    first_in = threading.Event()
+
+    def first_transfer() -> None:
+        with gate.transfer():
+            first_in.set()
+            release_first.wait(5)
+            order.append("transfer1-done")
+
+    def load() -> None:
+        with gate.metadata():
+            order.append("load")
+
+    def second_transfer() -> None:
+        with gate.transfer():
+            order.append("transfer2")
+
+    t1 = threading.Thread(target=first_transfer)
+    t1.start()
+    assert first_in.wait(5)
+    t_load = threading.Thread(target=load)
+    t_load.start()
+    deadline = time.monotonic() + 5
+    while gate._metadata_waiters == 0 and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert gate._metadata_waiters == 1
+    t2 = threading.Thread(target=second_transfer)
+    t2.start()
+    time.sleep(0.05)
+    assert order == []  # the load waits for transfer1; transfer2 waits behind the load
+    release_first.set()
+    for t in (t1, t_load, t2):
+        t.join(5)
+        assert not t.is_alive()
+    assert order == ["transfer1-done", "load", "transfer2"]
+    assert gate._active_transfers == 0 and not gate._metadata_active
+
+
+def test_submit_transfer_releases_status_inside_agent_gate() -> None:
+    """The status destructor (NIXL request release) runs before the transfer leaves the gate."""
+    gate = transfer_mod._AgentOperationGate()
+    seen: list[tuple[int, bool]] = []
+
+    class _Status:
+        def __init__(self, completed: bool) -> None:
+            self._completed = completed
+
+        def wait(self) -> bool:
+            return self._completed
+
+        def last_status_str(self) -> str:
+            return "ERROR"
+
+        def __del__(self) -> None:
+            seen.append((gate._active_transfers, gate._metadata_active))
+
+    sender = object.__new__(transfer_mod.Sender)
+    sender._shutdown = True  # No worker threads or transport were created by this fixture.
+    sender._sessions_lock = threading.Lock()
+    sender._enforce_physical_ownership = False
+    sender._agent_operation_gate = gate
+    outcomes = [True, False]
+    # Build each status on demand: a list of prebuilt ones would keep them alive past the call.
+    sender._agent = Mock(submit_transfer_requests=Mock(side_effect=lambda _req: _Status(outcomes.pop(0))))
+    task = transfer_mod.SendTaskBase(DisaggregatedParams(disagg_request_id=21))
+
+    assert sender._submit_transfer(task, 3, object()) == (True, None)
+    assert sender._submit_transfer(task, 3, object()) == (False, "ERROR")
+    assert seen == [(1, False), (1, False)]
+    assert gate._active_transfers == 0
 
 
 @pytest.mark.parametrize("kill_raises", [False, True])

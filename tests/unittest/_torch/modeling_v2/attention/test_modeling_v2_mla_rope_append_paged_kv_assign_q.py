@@ -359,9 +359,12 @@ def _run_and_check(
     num_contexts: int,
     cached_lens: List[int],
     layer_idx: int = 0,
+    real_heads: Optional[int] = None,
 ) -> _Run:
     """Pre-fill every sequence's cached prefix, run the op over the context
-    sequences' new tokens, and verify every kernel effect."""
+    sequences' new tokens, and verify every kernel effect. With `real_heads`
+    the query heads from `real_heads` on are zero, as a caller that pads its
+    heads passes them."""
     kv_lens = [c + s for c, s in zip(cached_lens, seq_lens)]
     metadata = env.prepare_metadata(request_ids, seq_lens, num_contexts, cached_lens)
     # Known cached-prefix rows (all sequences) to check the op leaves them be.
@@ -376,6 +379,8 @@ def _run_and_check(
     positions = [cached_lens[s] + i for s in range(num_contexts) for i in range(ctx_new[s])]
 
     q = torch.randn(num_tokens, num_heads * QK_HEAD_DIM, dtype=env.torch_dtype, device="cuda")
+    if real_heads is not None:
+        q.view(num_tokens, num_heads, QK_HEAD_DIM)[:, real_heads:] = 0
     # The op rejects other ranks (thop checks latent_cache.dim() == 2).
     latent_cache = torch.randn(num_tokens, LATENT_SIZE, dtype=env.torch_dtype, device="cuda")
     q_orig = q.clone()
@@ -444,8 +449,10 @@ def _run_and_check(
         # the context FMHA (which quantizes q/k/v itself) is not a double
         # quantization. Compared against the untouched nope slice of the same
         # tensor, which is the in-run baseline for un-quantized bf16 data.
+        # Over the real heads only: zero padding heads survive any round trip.
+        real = num_heads if real_heads is None else real_heads
         for name, values in (
-            ("roped q", q_heads[..., QK_NOPE_HEAD_DIM:]),
+            ("roped q", q_heads[:, :real, QK_NOPE_HEAD_DIM:]),
             ("roped k_pe", latent_cache[:, KV_LORA_RANK:]),
         ):
             frac = _e4m3_roundtrip_fraction(values)
@@ -453,7 +460,7 @@ def _run_and_check(
                 f"{name} looks e4m3-quantized: {frac:.4f} of elements survive "
                 "an e4m3 round trip unchanged"
             )
-        baseline = _e4m3_roundtrip_fraction(q_orig_heads[..., :QK_NOPE_HEAD_DIM])
+        baseline = _e4m3_roundtrip_fraction(q_orig_heads[:, :real, :QK_NOPE_HEAD_DIM])
         assert baseline < MAX_E4M3_ROUNDTRIP_FRACTION, (
             f"un-quantized baseline is already {baseline:.4f} — the "
             "round-trip check cannot discriminate at this input distribution"
@@ -550,6 +557,83 @@ def _fp8_env(max_batch_size: int = 8, orig_quant: Optional[float] = None) -> _Ml
     )
 
 
+def _k31(
+    head_num: int,
+    pool: str,
+    tokens_per_block: int,
+    cached: Sequence[int],
+    new: Sequence[int],
+    real_heads: Optional[int] = None,
+) -> dict:
+    """A Kimi K3.1 context call: the DeepSeek MLA geometry, the per-rank query heads (96 padded to 128 under
+    attention TP 1 and attention DP, 48 .. 3 under attention TP 2 .. 32), an FP8 or BF16 latent pool and the
+    identity RoPE table (K3.1 is NoPE)."""
+    return dict(
+        cached=list(cached),
+        new=list(new),
+        tokens_per_block=tokens_per_block,
+        **dict(
+            MlaRopeAppendPagedKvAssignQ.R1,
+            head_num=head_num,
+            quant_mode=QUANT_MODE_FP8_KV_CACHE if pool == "fp8" else 0,
+        ),
+        pool=pool,
+        rope="identity",
+        real_heads=head_num if real_heads is None else real_heads,
+    )
+
+
+_K31_CELLS = (
+    Cell(
+        why="k31 96->128 padded heads, fp8 pool, page 64, cached prefixes",
+        spec=_k31(128, "fp8", 64, (0, 100, 300), (37, 64, 200), real_heads=96),
+    ),
+    Cell(
+        why="k31 96->128 padded heads, bf16 pool, page 64, cached prefixes",
+        spec=_k31(128, "bf16", 64, (0, 100, 300), (37, 64, 200), real_heads=96),
+    ),
+    Cell(
+        why="k31 96->128 padded heads, fp8 pool, page 128, a page-edge prefix",
+        spec=_k31(128, "fp8", 128, (127, 0), (130, 1), real_heads=96),
+    ),
+    Cell(
+        why="k31 attention TP2: 48 heads, fp8 pool, page 128",
+        spec=_k31(48, "fp8", 128, (0, 129), (300, 1)),
+    ),
+    Cell(
+        why="k31 attention TP2: 48 heads, bf16 pool, page 32",
+        spec=_k31(48, "bf16", 32, (31, 0), (70, 33)),
+    ),
+    Cell(
+        why="k31 attention TP4: 24 heads, bf16 pool, page 128",
+        spec=_k31(24, "bf16", 128, (127,), (260,)),
+    ),
+    Cell(
+        why="k31 attention TP8: 12 heads, fp8 pool, page 32",
+        spec=_k31(12, "fp8", 32, (0, 64), (96, 17)),
+    ),
+    Cell(
+        why="k31 attention TP8: 12 heads, bf16 pool, page 64",
+        spec=_k31(12, "bf16", 64, (63, 200), (65, 3)),
+    ),
+    Cell(
+        why="k31 attention TP16: 6 heads, fp8 pool, page 64",
+        spec=_k31(6, "fp8", 64, (500,), (12,)),
+    ),
+    Cell(
+        why="k31 attention TP16: 6 heads, bf16 pool, page 64",
+        spec=_k31(6, "bf16", 64, (0, 1), (64, 63)),
+    ),
+    Cell(
+        why="k31 attention TP32: 3 heads, fp8 pool, page 128",
+        spec=_k31(3, "fp8", 128, (0, 256, 1), (128, 5, 300)),
+    ),
+    Cell(
+        why="k31 attention TP32: 3 heads, bf16 pool, page 32",
+        spec=_k31(3, "bf16", 32, (63,), (65,)),
+    ),
+)
+
 # The shapes each shipped target calls this entry with, by target directory
 # under `models/`. The entry's own `CELLS` are the op's whoever calls it.
 TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
@@ -567,6 +651,10 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
 }
 
 CELLS = certified_cells(op, TARGET_CELLS)
+# Kimi K3.1 calls this entry from the family's DSA attention op (models/kimi_k31/ops/attention/dsa_attention.py), which
+# all three K3.1 targets run, not from a target's own modules, so its cells carry no target key (as the K3.1 cells of
+# thop_attention).
+CELLS = (*CELLS, *_K31_CELLS)
 
 
 @pytest.mark.parametrize("cell", CELLS, ids=[c.why[:44] for c in CELLS])
@@ -584,8 +672,13 @@ def test_certified_cells(cell) -> None:
         max_batch_size=8,
         tokens_per_block=spec["tokens_per_block"],
         num_heads=spec["head_num"],
-        fp8_pool=True,
+        fp8_pool=spec["quant_mode"] == QUANT_MODE_FP8_KV_CACHE,
     )
+    if spec.get("rope") == "identity":
+        # cos = 1, sin = 0: the rotation is a copy, as for a NoPE model's table.
+        flat = env.rotary_cos_sin.reshape(-1)
+        flat[0::2] = 1.0
+        flat[1::2] = 0.0
     try:
         rids = list(range(len(spec["new"])))
         env.kv_cache_manager.add_dummy_requests(
@@ -598,6 +691,7 @@ def test_certified_cells(cell) -> None:
                 seq_lens=spec["new"],
                 num_contexts=len(rids),
                 cached_lens=spec["cached"],
+                real_heads=spec.get("real_heads"),
             )
     finally:
         env.shutdown()

@@ -714,12 +714,17 @@ class DecoderCudaGraphs:
         graphs_to_capture = self._get_graphs_to_capture(cuda_graph_batch_sizes)
         graphs_to_capture = sorted(graphs_to_capture, reverse=True)
         # Create CUDA graphs for short and long sequences separately for sparse attention.
-        # self.max_seq_len is the global max sequence length. For Helix CP each
-        # rank only holds max_seq_len / cp_size tokens, so scale accordingly to
-        # avoid creating warmup requests whose position_ids exceed the RoPE
-        # table (max_position_embeddings).
+        # V2 reserves Helix dummy requests in global tokens. The legacy manager
+        # takes a rank-local length and constructs a synthetic global length.
         effective_max_seq_len = self._config.max_seq_len
-        if self.mapping is not None and self.mapping.has_cp_helix():
+        kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
+        if (
+            self.mapping is not None
+            and self.mapping.has_cp_helix()
+            and not isinstance(kv_cache_manager, KVCacheManagerV2)
+        ):
             effective_max_seq_len = self._config.max_seq_len // self.mapping.cp_size
 
         sparse_config = self.sparse_attention_config

@@ -1654,6 +1654,7 @@ def test_late_request_data_to_terminal_sender_settles_aux(
         lock=threading.Lock(),
         _closed=False,
         kv_tasks=[],
+        aux_task=None,
         has_failed=Mock(return_value=True),
         _claim_unsubmitted_aux_failures_locked=Mock(return_value=[info]),
     )

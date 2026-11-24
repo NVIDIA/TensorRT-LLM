@@ -29,6 +29,7 @@ class TestDWDPPrefetchPipeline:
         self.weight_buffer.device_id = 0
         self.weight_buffer.local_start = 0
         self.weight_buffer.local_end = 2
+        self.weight_buffer.num_slots = 2
         self.weight_buffer.buffer_index_for_layer.side_effect = {
             3: 0,
             5: 1,

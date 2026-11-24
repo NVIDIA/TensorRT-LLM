@@ -52,6 +52,9 @@ l0_cpu:
   # GLM routing and draft workspace setup use CPU metadata and mocked allocations.
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16/spec/test_modeling_v2_draft_exchange.py
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/test_routing.py
+  # Kimi K3.1 family: pytest_ignore_collect keeps only the files marked cpu_only (routing, config, the DFlash
+  # context budget, the DSA metadata and the general target's multimodal and MLP construction tests).
+  - unittest/_torch/modeling_v2/models/kimi_k31
   - unittest/_torch/executor
   - unittest/_torch/test_connector.py::test_a_partial_grouped_scheduler_is_rejected_at_bring_up
   - unittest/_torch/test_connector.py::test_a_grouped_scheduler_and_a_single_group_cache_are_accepted
@@ -80,6 +83,13 @@ l0_cpu:
   - unittest/_torch/modeling_v2/test_modeling_v2_qwen4_exp_kv_quant.py
   - unittest/_torch/modeling_v2/test_modeling_v2_qwen4_exp_thop_attention_calls.py
   - unittest/_torch/modeling_v2/test_modeling_v2_qwen4_exp_weight_table.py
+  # The Kimi K3 Rubin target's cpu_only cases: CuTe DSL hint tables and the context
+  # MLA FP8 and split-K dispatch gates. Its GPU tests are in l0_gr100.
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/test_k3_features.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/mla/test_k3_mla_ctx_fp8.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/mla/test_k3_mla_ctx_split_k.py
+  # The decode switchboard the K3.1 ULL generation target configures (shared runtime settings).
+  - unittest/_torch/test_decode_switches.py
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_fp8_indexer_rejects_different_qk_norm_epsilons
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_moe_reduces_only_local_terms
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_decoder_layer_sets_post_fusion_from_moe_scheduler
@@ -121,6 +131,23 @@ l0_cpu:
   - unittest/_torch/speculative/hw_agnostic
   # l0_h100 selects with -m "not cpu_only", so this entry is what runs it.
   - unittest/_torch/speculative/test_spec_slot_pool_sizing.py
+  # The vocab-parallel pair exchange stays off the one-shot all-reduce workspace.
+  - unittest/_torch/speculative/test_vocab_parallel_exchange.py
+  # DFlash with the overlap scheduler and CUDA graphs: the cpu_only tests of the forced-
+  # acceptance pool and rows and of the DFlash draft-cache runtime; l0_h100 runs the GPU half
+  # of test_force_accept_pool_init.py.
+  - unittest/_torch/speculative/test_force_accept_pool_init.py
+  - unittest/_torch/speculative/test_force_accept_real_drafts.py
+  - unittest/_torch/speculative/test_dflash_context_kv_config.py
+  - unittest/_torch/speculative/test_dflash_capture_projection_bind.py
+  - unittest/_torch/speculative/test_dflash_draft_metadata_refresh.py
+  - unittest/_torch/speculative/test_dflash_managed_history_overlap.py
+  # TP ranks that serve the same requests take TP rank 0's draft tokens.
+  - unittest/_torch/speculative/test_tp_draft_token_agreement.py
+  # The autotuner's lockstep across forked ranks and its sliced fill of large random dummy inputs,
+  # which no directory entry here reaches.
+  - unittest/_torch/test_autotuner_lockstep.py
+  - unittest/_torch/test_autotuner_dummy_inputs.py
   - unittest/_torch/test_custom_config_registration.py
   - unittest/_torch/test_hf_quant_config.py
   - unittest/_torch/test_mmap_utils.py
@@ -196,6 +223,7 @@ l0_cpu:
   - unittest/executor/test_stop_word_side_output_trim.py
   - unittest/executor/test_ray_stub.py
   - unittest/executor/test_generation_request_array_prompt.py
+  - unittest/executor/test_result_end_token_text.py
   - unittest/grpc/openengine/test_coordinator.py
   - unittest/_torch/test_shared_tensor_cpu.py
   - unittest/grpc/openengine/test_frontend_lifecycle.py
@@ -216,6 +244,10 @@ l0_cpu:
   - unittest/llmapi/test_deepseek_v32_encoding.py
   - unittest/llmapi/test_deepseek_v32_tokenizer.py
   - unittest/llmapi/test_deepseek_v41_tokenizer.py
+  - unittest/llmapi/test_disagg_worker_role.py
+  - unittest/llmapi/test_disagg_single_sequence.py
+  - unittest/llmapi/test_disagg_coordinator_gc.py
+  - unittest/llmapi/test_kimi_tokenizer_fastpath.py
   - unittest/llmapi/apps/test_anthropic_adapter.py
   - unittest/llmapi/apps/test_anthropic_batches.py
   - unittest/llmapi/apps/test_anthropic_gateway.py

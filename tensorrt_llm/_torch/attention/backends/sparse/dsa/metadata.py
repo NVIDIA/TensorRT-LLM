@@ -13,8 +13,14 @@ import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings
+from tensorrt_llm._torch import decode_switches
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+from tensorrt_llm._torch.pyexecutor.input_commit import (
+    InputCommit,
+    active_input_commit,
+    flush_active_input_commit,
+)
 from tensorrt_llm._torch.utils import maybe_compile
 from tensorrt_llm._utils import get_sm_version, prefer_pinned
 from tensorrt_llm.deep_gemm import get_paged_mqa_logits_metadata
@@ -33,7 +39,11 @@ from .indexer import (
     _select_indexer_compress_ratio,
     use_cute_dsl_paged_mqa_logits,
 )
-from .kernels import fused_dsa_decode_metadata
+from .kernels import (
+    fused_dsa_decode_metadata,
+    fused_dsa_helix_decode_metadata,
+    helix_zero_or_empty_rows,
+)
 from .params import DSAMetadataParams
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
@@ -61,6 +71,31 @@ def _fused_dsa_meta_enabled() -> bool:
     voiding the "pre-compiled at warmup" capture-safety guarantee.
     """
     return os.environ.get("TRTLLM_DISABLE_FUSED_DSA_METADATA", "0") == "0"
+
+
+def _fused_dsa_helix_meta_enabled() -> bool:
+    """Build a Helix CP generation step's DSA decode metadata with one Triton launch
+    (``fused_dsa_helix_decode_metadata``) instead of the eager chain and the Helix ownership
+    rewrite: switchboard field ``dsa_helix_fused_meta`` (set by a target's generation profile). Set before
+    the model is built, so the first launch happens at warm-up, before graph capture."""
+    return decode_switches.active().dsa_helix_fused_meta
+
+
+@functools.lru_cache(maxsize=1)
+def _dg_sm100_schedule_in_kernel() -> bool:
+    """Whether the fused Helix decode metadata also writes the DeepGEMM paged-MQA-logits schedules
+    (``kernels._dg_sm100_schedule``): SM 10.x, where ``get_paged_mqa_logits_metadata`` runs
+    DeepGEMM's SM100 schedule."""
+    return get_sm_version() // 10 == 10
+
+
+def _indexer_k_dtype(kv_cache_manager) -> str:
+    """The indexer K dtype of a DSA-compatible cache manager: its ``indexer_k_dtype`` when it has
+    one, else ``"fp4"`` or ``"fp8"`` from its ``use_fp4`` flag."""
+    indexer_k_dtype = getattr(kv_cache_manager, "indexer_k_dtype", None)
+    if indexer_k_dtype is not None:
+        return indexer_k_dtype
+    return "fp4" if getattr(kv_cache_manager, "use_fp4", False) else "fp8"
 
 
 def build_req_idx_per_token(seq_lens: torch.Tensor, num_tokens: int) -> torch.Tensor:
@@ -157,6 +192,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     # Number of compressed KV tokens for context requests
     num_ctx_kv_tokens: int = 0
     gen_indexer_kv_lens_cuda_runtime: Optional[torch.Tensor] = None
+    # This layer's Helix combine mask when the key-sharded merge wrote it with the kept counts, else None.
+    _helix_combine_mask: Optional[torch.Tensor] = field(default=None, init=False)
     # Rebound by on_update_kv_lens(); the decode graph recomputes it.
     graph_temporary_attrs: ClassVar[FrozenSet[str]] = frozenset(
         {"gen_indexer_kv_lens_cuda_runtime"}
@@ -275,6 +312,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # annotations) to stay invisible to dataclass/torch.compile introspection.
         self._pool_cache_valid = False
         self._cached_kv_mgr_id = 0
+        self._cached_pool_key = None
         self._cached_pool_view = None
         self._cached_num_pool_tokens = 0
         self._cached_tokens_per_block = 0
@@ -376,10 +414,307 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.create_buffers_for_mla_rope_append(capture_graph=capture_graph)
         self.create_buffers_for_indexer(capture_graph=capture_graph)
         self._create_nvfp4_mla_generation_buffers(capture_graph=capture_graph)
+        self._create_helix_sparse_row_buffers(capture_graph=capture_graph)
+
+    def _helix_local_kv_lens(self, cached_token_lens: torch.Tensor) -> torch.Tensor:
+        """Rank-local KV lengths under Helix CP, as TrtllmAttentionMetadata computes them.
+
+        Context rows append all their tokens. A generation row appends only the
+        new tokens this rank owns: one token on the active rank without
+        speculation, and a per-sequence count when a verify group can straddle a
+        page boundary. The Helix per-sequence buffers are generation-relative.
+        Under the overlap scheduler these host values are provisional;
+        on_update_kv_lens() rederives the device state.
+        """
+        kv_lens = cached_token_lens + self.seq_lens_kv
+        gen = slice(self.num_contexts, self.num_seqs)
+        num_gen = self.num_generations
+        if self._helix_spec_tokens_valid:
+            kv_lens[gen] = cached_token_lens[gen] + self.helix_owned_new_tokens_cpu[:num_gen]
+        else:
+            inactive = self.helix_is_inactive_rank_cpu[:num_gen]
+            kv_lens[gen] = torch.where(inactive, cached_token_lens[gen], kv_lens[gen])
+        return kv_lens
+
+    def _create_helix_sparse_row_buffers(self, capture_graph=False):
+        """Allocate the token-major rows token-sparse MLA reads under Helix.
+
+        After the Helix Top-K merge a rank keeps only its share of each row's
+        global Top-K: the kept entries come first and the rest of the row is
+        -1. The sparse-MLA kernel attends to the first min(top_k, kv_len)
+        entries of a row and does not mask -1 inside that range, so every
+        generation token is presented as its own row whose length is its kept
+        count (``set_helix_sparse_row_lens``).
+        """
+        names = (
+            "helix_row_kv_lens_cuda",
+            "helix_row_kv_lens_host",
+            "helix_row_req_idx_cuda",
+            "helix_row_req_idx_host",
+            "helix_row_prompt_lens_cuda",
+            "helix_row_prompt_lens_cpu",
+            "helix_row_request_types_host",
+            "helix_row_block_offsets",
+        )
+        for name in names:
+            setattr(self, name, None)
+        self._helix_num_rows = 0
+        self._helix_rows_set = False
+        if not self.enable_helix or self.kv_cache_manager is None:
+            return
+        rows_cap = self.max_num_sequences * (2 + self._draft_sizing_cap)
+        for name, dtype in (
+            ("helix_row_kv_lens_cuda", torch.int32),
+            ("helix_row_req_idx_cuda", torch.long),
+            ("helix_row_prompt_lens_cuda", torch.int32),
+        ):
+            setattr(
+                self,
+                name,
+                self.get_empty(
+                    self.cuda_graph_buffers,
+                    (rows_cap,),
+                    cache_name=name,
+                    dtype=dtype,
+                    capture_graph=capture_graph,
+                ),
+            )
+        pinned = prefer_pinned()
+        self.helix_row_kv_lens_host = torch.zeros((rows_cap,), dtype=torch.int32, pin_memory=pinned)
+        self.helix_row_req_idx_host = torch.zeros((rows_cap,), dtype=torch.long, pin_memory=pinned)
+        self.helix_row_prompt_lens_cpu = torch.zeros(
+            (rows_cap,), dtype=torch.int32, pin_memory=pinned
+        )
+        self.helix_row_request_types_host = torch.ones(
+            (rows_cap,), dtype=torch.int32, pin_memory=pinned
+        )
+        num_attention_op_pools = getattr(
+            self.kv_cache_manager, "num_attention_op_pools", self.kv_cache_manager.num_pools
+        )
+        self.helix_row_block_offsets = self.get_empty(
+            self.cuda_graph_buffers,
+            (num_attention_op_pools, rows_cap, 2, self.kv_cache_manager.max_blocks_per_seq),
+            cache_name="helix_row_block_offsets",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+
+    def _prepare_helix_sparse_rows(self, kv_lens: torch.Tensor) -> None:
+        """Lay out one attention row per context request and generation token.
+
+        Host lengths are upper bounds for the op's host-side planning; the
+        device lengths start there and the indexer narrows each generation
+        row to its kept count layer by layer.
+        """
+        self._helix_num_rows = 0
+        if self.helix_row_kv_lens_cuda is None or self.num_generations <= 0:
+            return
+        num_contexts = self.num_contexts
+        gen_seq_lens = self.seq_lens[num_contexts : self.num_seqs].to(torch.long)
+        num_rows = num_contexts + int(gen_seq_lens.sum())
+        assert num_rows <= self.helix_row_kv_lens_cuda.shape[0], (
+            f"Helix sparse rows need {num_rows} rows, capacity "
+            f"{self.helix_row_kv_lens_cuda.shape[0]}"
+        )
+        req_idx = torch.cat(
+            [
+                torch.arange(num_contexts, dtype=torch.long),
+                torch.repeat_interleave(
+                    torch.arange(num_contexts, self.num_seqs, dtype=torch.long), gen_seq_lens
+                ),
+            ]
+        )
+        self.helix_row_req_idx_host[:num_rows].copy_(req_idx)
+        # A generation row reads at most top_k entries and never more than its
+        # sequence holds locally after this step's appends (an upper bound
+        # under the overlap scheduler's provisional lengths).
+        upper = (kv_lens[: self.num_seqs].to(torch.long) + self.seq_lens_kv.to(torch.long)).clamp(
+            max=self.num_sparse_topk
+        )
+        upper[:num_contexts] = kv_lens[:num_contexts]
+        self.helix_row_kv_lens_host[:num_rows].copy_(upper[req_idx].to(torch.int32))
+        self.helix_row_prompt_lens_cpu[:num_contexts].copy_(
+            self.prompt_lens_cpu[:num_contexts].to(torch.int32)
+        )
+        self.helix_row_prompt_lens_cpu[num_contexts:num_rows].fill_(1)
+        self.helix_row_request_types_host[:num_contexts].zero_()
+        self.helix_row_request_types_host[num_contexts:num_rows].fill_(1)
+        for dst, src in (
+            (self.helix_row_kv_lens_cuda, self.helix_row_kv_lens_host),
+            (self.helix_row_req_idx_cuda, self.helix_row_req_idx_host),
+            (self.helix_row_prompt_lens_cuda, self.helix_row_prompt_lens_cpu),
+        ):
+            self._stage_or_copy(dst[:num_rows], src[:num_rows])
+        source = self.kv_cache_block_offsets
+        num_pools = min(source.shape[0], self.helix_row_block_offsets.shape[0])
+        width = min(source.shape[-1], self.helix_row_block_offsets.shape[-1])
+
+        def gather_rows():
+            torch.index_select(
+                source[:num_pools, :, :, :width],
+                1,
+                self.helix_row_req_idx_cuda[:num_rows],
+                out=self.helix_row_block_offsets[:num_pools, :num_rows, :, :width],
+            )
+
+        if self._staging_commit is not None:
+            # The gather reads the staged row index and block offsets: right after the commit.
+            self._staging_commit.after_commit(gather_rows)
+        else:
+            gather_rows()
+        self._helix_num_rows = num_rows
+        self._helix_rows_set = False
+        self._helix_combine_mask = None
+
+    def set_helix_sparse_row_lens(self, gen_rows: torch.Tensor) -> None:
+        """Present each generation row with exactly its kept Top-K entries.
+
+        Called by every indexer layer after its Helix merge; a layer that
+        shares the previous layer's Top-K reads the same lengths.
+        """
+        if self._helix_num_rows <= 0:
+            return
+        num_contexts = self.num_contexts
+        torch.sum(
+            gen_rows >= 0,
+            dim=1,
+            dtype=torch.int32,
+            out=self.helix_row_kv_lens_cuda[num_contexts : num_contexts + gen_rows.shape[0]],
+        )
+        self._helix_rows_set = True
+        self._helix_combine_mask = None
+
+    def helix_sparse_row_lens_out(self, num_gen_rows: int) -> Optional[torch.Tensor]:
+        """The generation rows' slice of the token-sparse MLA row lengths, for a producer that writes the kept
+        counts itself (then ``mark_helix_sparse_row_lens_set``); None without Helix sparse rows."""
+        if self._helix_num_rows <= 0:
+            return None
+        num_contexts = self.num_contexts
+        return self.helix_row_kv_lens_cuda[num_contexts : num_contexts + num_gen_rows]
+
+    def mark_helix_sparse_row_lens_set(self, combine_mask: Optional[torch.Tensor] = None) -> None:
+        """The generation rows' lengths were written through ``helix_sparse_row_lens_out``; ``combine_mask``, if
+        the producer wrote it too, is their ``helix_zero_or_empty_rows``."""
+        if self._helix_num_rows > 0:
+            self._helix_rows_set = True
+            self._helix_combine_mask = combine_mask
+
+    def helix_sparse_empty_rows(self, num_gen_tokens: int) -> Optional[torch.Tensor]:
+        """Generation rows whose current Top-K kept nothing on this rank, or None.
+
+        Such a row attends to no local KV, so its partial output must not
+        enter the Helix combine.
+        """
+        if self._helix_num_rows <= 0 or not self._helix_rows_set:
+            return None
+        num_contexts = self.num_contexts
+        return self.helix_row_kv_lens_cuda[num_contexts : num_contexts + num_gen_tokens] == 0
+
+    def helix_zero_or_empty_rows(self, num_gen_tokens: int) -> Optional[torch.Tensor]:
+        """The Helix combine mask of the generation rows in one launch (``mla.py``,
+        ``helix_folded_zero_kv_mask``).
+
+        ``(helix_kv_bounds == 0) | (kept count == 0)``: the rows this rank owns no KV for (their
+        per-token bound, as ``helix_gen_zero_kv_mask`` takes it on a speculative step) or whose
+        current Top-K kept nothing here (``helix_sparse_empty_rows``). None where either half is not
+        the per-token form, so the caller keeps the generic path.
+        """
+        bounds = getattr(self, "helix_kv_bounds", None)
+        if bounds is None or not getattr(self, "_helix_spec_tokens_valid", False):
+            return None
+        if self._helix_num_rows <= 0 or not self._helix_rows_set:
+            return None
+        mask = getattr(self, "_helix_combine_mask", None)
+        if mask is not None and mask.shape[0] == num_gen_tokens:
+            return mask
+        num_contexts = self.num_contexts
+        return helix_zero_or_empty_rows(
+            bounds[:num_gen_tokens],
+            self.helix_row_kv_lens_cuda[num_contexts : num_contexts + num_gen_tokens],
+        )
+
+    def helix_spec_row_kv_lens(self, num_gen_tokens: int) -> Optional[torch.Tensor]:
+        """Per-token rank-local KV bounds of Helix verify groups, or None."""
+        if not (self.enable_helix and self._helix_spec_tokens_valid):
+            return None
+        return self.helix_kv_bounds[:num_gen_tokens]
+
+    # The input commit the running prepare() stages its uploads into, or None (_stage_or_copy).
+    _staging_commit: Optional[InputCommit] = None
 
     def prepare(self):
         self._validate_ragged_verification()
         super().prepare()
+        commit = active_input_commit()
+        staging = commit is not None and commit.is_open
+        flushed = staging and not self._staged_prepare_needs_no_flush()
+        if flushed:
+            # The DSA preparation below reads the KV lengths and offsets on the device.
+            flush_active_input_commit()
+        self._staging_commit = commit if staging else None
+        self._num_staged_uploads = 0
+        try:
+            self._prepare_dsa()
+        finally:
+            self._staging_commit = None
+        if staging and self._num_staged_uploads:
+            logger.info_once(
+                f"DSA prepare stages its uploads into the step's input commit "
+                f"({self._num_staged_uploads} entries at num_seqs={self.num_seqs}, "
+                f"num_tokens={self.num_tokens}; flushed first: {flushed})",
+                key=f"dsa_prepare_staged_{flushed}",
+            )
+
+    def _staged_prepare_needs_no_flush(self) -> bool:
+        """Whether :meth:`_prepare_dsa` of a staged step runs without the inputs staged so far
+        written: a Helix speculative generation step, where every device read of a staged
+        input is deferred past the commit (the sparse-row gather, ``after_commit``) and the
+        DeepGEMM schedules are left to ``on_update_kv_lens``. Context rows, ragged
+        verification and the CuTe DSL row expansion read the device lengths, so they flush."""
+        return (
+            self.num_contexts == 0
+            and self.enable_helix
+            and self._helix_spec_tokens_valid
+            and not self.is_ragged_verify
+        )
+
+    _num_staged_uploads: int = 0
+
+    def helix_host_gen_slot_rows(self, indexer_params) -> Optional[slice]:
+        """Rows of the host slot mappings this metadata rewrote for Helix generation tokens (the
+        indexer uploads them with its own), or None: the engine keeps the generic mapping."""
+        return None
+
+    def _stage_or_copy(self, dst: torch.Tensor, src: torch.Tensor) -> None:
+        """``dst.copy_(src, non_blocking=True)`` of a host ``src``; staged into the step's input
+        commit instead while :meth:`prepare` runs inside one (a CUDA-graph generation step of the
+        decode-step shell, ``input_commit.py``). The commit kernel writes the same bytes before the
+        replay, and nothing in :meth:`prepare` reads a staged destination on the device before
+        it: the clamps are applied on the host, the sparse-row gather runs after the commit and
+        the DeepGEMM schedules are left to the step's ``on_update_kv_lens`` (see the callers)."""
+        commit = self._staging_commit
+        if commit is None:
+            dst.copy_(src, non_blocking=True)
+        elif dst.is_contiguous():
+            commit.stage(dst, src)
+            self._num_staged_uploads += 1
+        else:
+            # Rows of a 2-D slice of a wider buffer: one contiguous entry per row.
+            for row in range(dst.shape[0]):
+                commit.stage(dst[row], src[row])
+            self._num_staged_uploads += dst.shape[0]
+
+    def _clamp_staged_buffer_once(self, buf: torch.Tensor) -> None:
+        """Before the first staged upload of a block-offset buffer, apply the full-buffer
+        ``clamp_(min=0)`` of the copy path once. Staged uploads are clamped on the host, so the
+        rows a step leaves alone stay non-negative afterwards, as the copy path keeps them."""
+        done = self.__dict__.setdefault("_staged_clamped_buffers", set())
+        key = buf.data_ptr()
+        if key not in done:
+            buf.clamp_(min=0)
+            done.add(key)
+
+    def _prepare_dsa(self):
         self._invalidate_pool_view_cache()
 
         # Get kv lengths
@@ -390,12 +725,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             device="cpu",
         )
         if self.enable_helix:
-            # For Helix CP, inactive ranks only attend to previously cached
-            # tokens (no new token appended), while active ranks add new tokens.
-            # This mirrors the kv_lens logic in TrtllmAttentionMetadata.prepare().
-            active_rank = ~self.helix_is_inactive_rank_cpu[: self.num_seqs]
-            kv_lens = cached_token_lens.clone()
-            kv_lens[active_rank] += self.seq_lens_kv[active_rank]
+            kv_lens = self._helix_local_kv_lens(cached_token_lens)
         else:
             kv_lens = cached_token_lens + self.seq_lens_kv
 
@@ -418,6 +748,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
         # Prepare metadata for indexer
         Indexer.prepare(metadata=self)
+
+        if self.enable_helix:
+            self._prepare_helix_sparse_rows(kv_lens)
 
     def _prepare_device_window_kv_lens(self, kv_lens: torch.Tensor) -> torch.Tensor:
         """Bound host-side KV extents until device-selected windows are installed."""
@@ -564,7 +897,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         """
         # same two-level dispatch and hardware gates as the indexer __init__:
         # never compile these kernels on unsupported stacks during warmup
-        if not IS_CUTLASS_DSL_AVAILABLE or get_sm_version() not in (100, 103):
+        if not IS_CUTLASS_DSL_AVAILABLE or get_sm_version() not in (100, 103, 107):
             return
         if not self.enable_gvr_topk or self.kv_cache_manager is None:
             return
@@ -638,6 +971,57 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 "will JIT-compile lazily on first touch instead."
             )
 
+    def _apply_helix_gen_ownership(self) -> None:
+        """Give generation rows this CP rank's indexer-K slot, or -1 (skipped) for tokens
+        another rank owns; verify groups score one row per token against ``helix_kv_bounds``.
+        Device-only with no host sync, so it can be captured."""
+        num_ctx_tokens = self.num_ctx_tokens
+        num_gen_tokens = self.num_tokens - num_ctx_tokens
+        if num_gen_tokens <= 0:
+            return
+        if self._helix_spec_tokens_valid:
+            local = self.helix_local_slots[:num_gen_tokens].to(torch.int64)
+            owned = local >= 0
+            req_indices = self.req_idx_per_token[num_ctx_tokens : self.num_tokens].to(torch.int64)
+        else:
+            # One token per generation row; the active rank appends it locally.
+            gen_kv_lens = self.kv_lens_cuda[self.num_contexts : self.num_seqs].to(torch.int64)
+            local = gen_kv_lens - 1
+            owned = ~self.helix_is_inactive_rank[: self.num_generations]
+            req_indices = torch.arange(
+                self.num_contexts, self.num_seqs, dtype=torch.int64, device=local.device
+            )
+        index_head_dim = self.kv_cache_manager.index_head_dim
+        use_fp4 = getattr(self.kv_cache_manager, "use_fp4", False)
+        data_bytes_per_token = index_head_dim // 2 if use_fp4 else index_head_dim
+        fp8_indices, scale_indices = _compute_slot_mappings(
+            local.clamp(min=0),
+            self.indexer_k_cache_block_offsets,
+            req_indices,
+            index_head_dim,
+            self._tokens_per_block,
+            self.indexer_quant_block_size,
+            data_bytes_per_token=data_bytes_per_token,
+        )
+        gen_rows = slice(num_ctx_tokens, self.num_tokens)
+        self.slot_mapping_fp8[gen_rows] = torch.where(owned, fp8_indices, -1)
+        self.slot_mapping_scale[gen_rows] = torch.where(owned, scale_indices, -1)
+
+        if self._helix_spec_tokens_valid and self.use_expanded_buffers_for_mtp:
+            # A rank may see no KV for a token (bound 0); scoring keeps at least
+            # one row slot so the schedule never sees an all-empty batch, and
+            # the indexer drops those rows' candidates (helix_spec_row_kv_lens).
+            bounds = self.helix_kv_bounds[:num_gen_tokens]
+            self.kv_lens_expanded_cuda[:num_gen_tokens].copy_(bounds.clamp(min=1))
+            scheduler_metadata_buffer_expanded = get_paged_mqa_logits_metadata(
+                self.kv_lens_expanded_cuda[:num_gen_tokens].view(-1, 1),
+                _DG_SCHEDULE_BLOCK_KV,
+                self.num_sms,
+            )
+            self.scheduler_metadata_buffer_expanded.copy_(
+                scheduler_metadata_buffer_expanded, non_blocking=True
+            )
+
     def on_update_kv_lens(self) -> None:
         # After changing the kv_lens/kv_lens_cuda, we may need to update other metadatas.
         # Especially for the changes in DecoderInputPreparer.preprocess_inputs().
@@ -655,6 +1039,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # pool_view cache here so it is recomputed on the next
         # transform_local_topk_and_prepare_pool_view() call.
         self._invalidate_pool_view_cache()
+
+        if self._helix_fused_meta_applies():
+            self._update_kv_lens_helix_fused()
+            return
 
         # Default fused path: collapse the eager DSA decode-metadata chain
         # (req_idx_per_token + slot mappings + the two gen indptr cumsums) into
@@ -674,6 +1062,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             and self.num_generations > 0
             and self.num_contexts == 0
             and not self.use_fp8_ds_mla
+            # Helix rewrites the generation slots per rank below.
+            and not self.enable_helix
         )
 
         # The draft loop can rewrite seq_lens after prepare() built this map.
@@ -804,8 +1194,116 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 self._fused_dsa_meta_armed = True
             self._run_fused_dsa_decode_metadata()
 
+        if self.enable_helix and self.kv_cache_manager is not None and self.num_generations > 0:
+            self._apply_helix_gen_ownership()
+
         self._compute_kv_lens_row_reorder()
         self.prepare_dense_topk_indices(self.kv_lens_cuda, device=True)
+
+    def _helix_fused_meta_applies(self) -> bool:
+        """Whether ``on_update_kv_lens`` takes the fused Helix path
+        (:func:`_fused_dsa_helix_meta_enabled`).
+
+        The step must be a Helix CP generation step with uniform verify groups and the per-token
+        Helix buffers armed: no context request, the expanded per-token schedule, no ragged
+        verification, no DSL split rows, no fp8_ds_mla token positions and an uncompressed
+        indexer. Any other step keeps the eager chain.
+        """
+        return (
+            _fused_dsa_helix_meta_enabled()
+            and self.enable_helix
+            and self.kv_cache_manager is not None
+            and getattr(self, "_helix_spec_tokens_valid", False)
+            and self.num_contexts == 0
+            and self.num_ctx_tokens == 0
+            and self.num_generations > 0
+            and self.num_tokens == self.num_generations * self.gen_token_stride
+            and getattr(self, "use_expanded_buffers_for_mtp", False)
+            and not getattr(self, "expand_for_dsl", True)
+            and not self.enable_ragged_verification
+            and not self.is_ragged_verify
+            and not self.use_fp8_ds_mla
+            and self._indexer_compress_ratio <= 1
+        )
+
+    def _update_kv_lens_helix_fused(self) -> None:
+        """``on_update_kv_lens`` of a Helix CP generation step with the fused metadata kernel.
+
+        Leaves the state of the eager chain (``req_idx_per_token``, the slot mappings after the
+        Helix ownership rewrite, the generation indptrs, the 2D and per-token indexer lengths and
+        both DeepGEMM schedules) with one Triton launch plus the two schedule kernels; the
+        generic slots and the generic per-token schedule the eager chain builds and then
+        overwrites are not computed.
+        """
+        num_seqs = self.num_seqs
+        num_tokens = self.num_tokens
+        index_head_dim = self.kv_cache_manager.index_head_dim
+        # Indexer K payload bytes of one token, without its scale (FP4 packs two per byte).
+        data_bytes_per_token = (
+            index_head_dim // 2
+            if _indexer_k_dtype(self.kv_cache_manager) == "fp4"
+            else index_head_dim
+        )
+        gen_kv_lens = self.kv_lens_cuda[:num_seqs]
+        # On SM 10.x the launch also writes both DeepGEMM schedules (DeepGEMM's SM100 metadata).
+        in_kernel_schedule = _dg_sm100_schedule_in_kernel()
+        self._launch_fused_dsa_helix_decode_metadata(
+            self.seq_lens_cuda[:num_seqs],
+            gen_kv_lens,
+            self.indexer_k_cache_block_offsets,
+            self.helix_local_slots,
+            self.helix_kv_bounds,
+            self.req_idx_per_token,
+            self.slot_mapping_fp8,
+            self.slot_mapping_scale,
+            self.gen_kv_indptr,
+            self.gen_cached_token_indptr,
+            self.kv_lens_cuda_2d,
+            self.kv_lens_expanded_cuda,
+            num_tokens=num_tokens,
+            width=min(self.gen_token_stride, self.kv_lens_cuda_2d.shape[1]),
+            tokens_per_block=self._tokens_per_block,
+            index_head_dim=index_head_dim,
+            quant_block_size=self.indexer_quant_block_size,
+            data_bytes_per_token=data_bytes_per_token,
+            schedule=self.scheduler_metadata_buffer if in_kernel_schedule else None,
+            schedule_expanded=(
+                self.scheduler_metadata_buffer_expanded if in_kernel_schedule else None
+            ),
+        )
+        if not getattr(self, "_fused_dsa_helix_meta_armed", False):
+            logger.info(
+                "Fused Helix DSA decode-metadata kernel armed "
+                f"(num_seqs={num_seqs}, num_tokens={num_tokens}, "
+                f"DeepGEMM schedules in the kernel: {in_kernel_schedule})."
+            )
+            self._fused_dsa_helix_meta_armed = True
+        # The indexer compress ratio is 1 on this path (_helix_fused_meta_applies).
+        gen_indexer_kv_lens = self.get_indexer_kv_lens(gen_kv_lens)
+        self.gen_indexer_kv_lens_cuda_runtime = gen_indexer_kv_lens
+        if not in_kernel_schedule:
+            self.scheduler_metadata_buffer.copy_(
+                get_paged_mqa_logits_metadata(
+                    gen_indexer_kv_lens.view(-1, 1), _DG_SCHEDULE_BLOCK_KV, self.num_sms
+                ),
+                non_blocking=True,
+            )
+            self.scheduler_metadata_buffer_expanded.copy_(
+                get_paged_mqa_logits_metadata(
+                    self.kv_lens_expanded_cuda[:num_tokens].view(-1, 1),
+                    _DG_SCHEDULE_BLOCK_KV,
+                    self.num_sms,
+                ),
+                non_blocking=True,
+            )
+        self._compute_kv_lens_row_reorder()
+        self.prepare_dense_topk_indices(self.kv_lens_cuda, device=True)
+
+    def _launch_fused_dsa_helix_decode_metadata(self, *args, **kwargs) -> None:
+        """The launch of ``_update_kv_lens_helix_fused``: ``fused_dsa_helix_decode_metadata(*args,
+        **kwargs)``. A subclass may make it part of another launch that writes the same outputs
+        from the same inputs."""
+        fused_dsa_helix_decode_metadata(*args, **kwargs)
 
     def _run_fused_dsa_decode_metadata(self):
         """Fill req_idx_per_token + slot mappings + gen indptrs via one Triton
@@ -854,8 +1352,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         else:
             self.kv_lens_row_reorder = None
 
-    def update_for_spec_dec(self):
-        super().update_for_spec_dec()
+    def update_for_spec_dec(self, refresh_device_metadata: bool = True):
+        super().update_for_spec_dec(refresh_device_metadata)
         # host
         self.max_ctx_kv_len = 0
         self.num_ctx_cached_tokens = 0
@@ -973,9 +1471,16 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         sparse_metadata_params = self.sparse_metadata_params
         if not isinstance(sparse_metadata_params, DSAMetadataParams):
             raise ValueError("DSA sparse attention metadata params are not set")
+        # A cache whose index-key pages outnumber its blocks (DKV's whole index keys)
+        # states the table's width.
+        indexer_columns = getattr(
+            self.kv_cache_manager,
+            "indexer_max_blocks_per_seq",
+            self.kv_cache_manager.max_blocks_per_seq,
+        )
         self.indexer_k_cache_block_offsets = self.get_empty(
             self.cuda_graph_buffers,
-            [self.max_num_sequences, self.kv_cache_manager.max_blocks_per_seq],
+            [self.max_num_sequences, indexer_columns],
             cache_name="indexer_k_cache_block_offsets",
             dtype=torch.int32,
             capture_graph=capture_graph,
@@ -1098,10 +1603,18 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.host_req_idx_per_token = torch.empty_like(
             self.req_idx_per_token, device="cpu", pin_memory=prefer_pinned()
         )
-        # Block table for topk_indices conversion (shared for context and generation)
+        # Block table for topk_indices conversion (shared for context and generation); it holds
+        # the index-key pages, as wide as their table.
         self.block_table = self.get_empty(
             self.cuda_graph_buffers,
-            [self.max_num_sequences, self.kv_cache_manager.max_blocks_per_seq],
+            [
+                self.max_num_sequences,
+                getattr(
+                    self.kv_cache_manager,
+                    "indexer_max_blocks_per_seq",
+                    self.kv_cache_manager.max_blocks_per_seq,
+                ),
+            ],
             cache_name="block_table",
             dtype=torch.int32,
             capture_graph=capture_graph,
@@ -1469,6 +1982,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self._expanded_alloc_draft_cap = allocation_cap
             self._create_kv_lens_2d_buffer(capture_graph=capture_graph)
             self.create_expanded_buffers(capture_graph=capture_graph)
+            # One Helix sparse row per verify token.
+            self._create_helix_sparse_row_buffers(capture_graph=capture_graph)
         if resize_radix_workspace:
             self._create_radix_aux_buffers(capture_graph)
 
@@ -1486,6 +2001,13 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         page_indices = pool_indices * cache_manager.indexer_k_cache_page_scale
         num_blocks = page_indices.shape[1]
         self.host_indexer_k_cache_block_offsets[: self.num_seqs, :num_blocks].copy_(page_indices)
+        if self._staging_commit is not None:
+            self._clamp_staged_buffer_once(self.indexer_k_cache_block_offsets)
+            self._stage_or_copy(
+                self.indexer_k_cache_block_offsets[: self.num_seqs],
+                self.host_indexer_k_cache_block_offsets[: self.num_seqs].clamp(min=0),
+            )
+            return pool_indices
         self.indexer_k_cache_block_offsets[: self.num_seqs].copy_(
             self.host_indexer_k_cache_block_offsets[: self.num_seqs], non_blocking=True
         )
@@ -1518,7 +2040,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self._group_remap_batched.clear()
         self.nvfp4_mla_context_fp8_scratch = None
 
-    def _ensure_pool_view_cached(self):
+    def _ensure_pool_view_cached(self, local_layer_idx: int | None = None):
         """Compute and cache values used by
         transform_local_topk_and_prepare_pool_view().
 
@@ -1531,16 +2053,28 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         start of every step (prepare() and on_update_kv_lens()), so the boolean
         flag is always cleared before the first per-layer call within a step.
         """
-        if self._pool_cache_valid and self._cached_kv_mgr_id == id(self.kv_cache_manager):
-            return
-
-        pool = self.kv_cache_manager.get_unique_primary_pool()
         kv_cache_manager = self.kv_cache_manager
+        if local_layer_idx is None:
+            # The manager's one primary pool, of the manager's KV dtype.
+            pool_key = (id(kv_cache_manager), None)
+            if self._pool_cache_valid and self._cached_pool_key == pool_key:
+                return
+            pool = kv_cache_manager.get_unique_primary_pool()
+            packed_fp4 = kv_cache_manager.dtype == tensorrt_llm.bindings.DataType.NVFP4
+        else:
+            # A manager with a pool per storage dtype: the layer's pool, which carries its own
+            # dtype (FP4 is packed int8).
+            pool = kv_cache_manager.get_primary_pool(local_layer_idx)
+            pool_key = (id(kv_cache_manager), pool.data_ptr())
+            if self._pool_cache_valid and self._cached_pool_key == pool_key:
+                return
+            packed_fp4 = pool.dtype == torch.int8
+
         num_blocks, num_layers = pool.shape[:2]
         self._cached_tokens_per_block = kv_cache_manager.tokens_per_block
         head_dim = kv_cache_manager.head_dim
         self._cached_num_pool_tokens = num_blocks * num_layers * self._cached_tokens_per_block
-        if kv_cache_manager.dtype == tensorrt_llm.bindings.DataType.NVFP4:
+        if packed_fp4:
             # FP4 packs two values per byte and therefore cannot use the
             # ordinary [token, head_dim] view. Its gather op reads the raw
             # data/scale pools through their stable host pointers instead.
@@ -1554,6 +2088,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.req_idx_per_token[self.num_ctx_tokens : self.num_tokens] - self.num_contexts
         )
         self._cached_kv_mgr_id = id(kv_cache_manager)
+        self._cached_pool_key = pool_key
         self._pool_cache_valid = True
 
     def _ensure_group_remap_struct(self):
@@ -1574,6 +2109,17 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         """
         kvm = self.kv_cache_manager
         if self._group_remap_struct is not None and self._group_remap_struct_kv_id == id(kvm):
+            return self._group_remap_struct
+
+        # Without shared-indexer layers every group is a singleton. Skipping
+        # the scan also keeps hybrid managers, whose local layers include
+        # recurrent layers that own no indexer, from forming groups.
+        sparse_metadata_params = getattr(self, "sparse_metadata_params", None)
+        if sparse_metadata_params is not None and not getattr(
+            sparse_metadata_params, "has_shared_indexer_layers", True
+        ):
+            self._group_remap_struct = {}
+            self._group_remap_struct_kv_id = id(kvm)
             return self._group_remap_struct
 
         # Building the small per-group layer-offset device tensors must happen
@@ -1728,8 +2274,16 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 "ragged verification requires dense spec-decoding metadata to be disabled"
             )
 
+        helix_spec = self.enable_helix and self._helix_spec_tokens_valid
+        if helix_spec:
+            # Each Helix verify token has its own rank-local KV bound
+            # (helix_kv_bounds), which the in-kernel next_n stagger cannot
+            # express, so score one row per token with explicit lengths.
+            use_dsl = False
         self.use_expanded_buffers_for_mtp = not use_dsl and (
-            self.is_ragged_verify or (self.max_draft_tokens > 1 and get_sm_version() == 90)
+            helix_spec
+            or self.is_ragged_verify
+            or (self.max_draft_tokens > 1 and get_sm_version() == 90)
         )
         if self.use_expanded_buffers_for_mtp:
             if self.is_ragged_verify:
@@ -1744,8 +2298,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             gen_kv_lens = self.get_indexer_kv_lens(kv_lens[self.num_contexts : self.num_seqs])
             gen_kv_lens_expanded, num_tokens = self.expand_per_gen_token(gen_kv_lens)
             self.kv_lens_expanded_host[:num_tokens].copy_(gen_kv_lens_expanded)
-            self.kv_lens_expanded_cuda[:num_tokens].copy_(
-                self.kv_lens_expanded_host[:num_tokens], non_blocking=True
+            self._stage_or_copy(
+                self.kv_lens_expanded_cuda[:num_tokens], self.kv_lens_expanded_host[:num_tokens]
             )
 
             if self.kv_cache_manager is not None and self.num_generations > 0:
@@ -1755,10 +2309,17 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 ]
                 expanded_blocks, _ = self.expand_per_gen_token(gen_blocks, dim=0)
                 self.host_block_table_expanded[:num_tokens, :max_len].copy_(expanded_blocks)
-                self.block_table_expanded[:num_tokens].copy_(
-                    self.host_block_table_expanded[:num_tokens], non_blocking=True
-                )
-                self.block_table_expanded.clamp_(min=0)
+                if self._staging_commit is not None:
+                    self._clamp_staged_buffer_once(self.block_table_expanded)
+                    self._stage_or_copy(
+                        self.block_table_expanded[:num_tokens],
+                        self.host_block_table_expanded[:num_tokens].clamp(min=0),
+                    )
+                else:
+                    self.block_table_expanded[:num_tokens].copy_(
+                        self.host_block_table_expanded[:num_tokens], non_blocking=True
+                    )
+                    self.block_table_expanded.clamp_(min=0)
 
             if self.is_ragged_verify:
                 self._prepare_ragged_row_kv_lens(kv_lens)
@@ -1949,8 +2510,25 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             out=self.attn_row_block_offsets[:num_pools, :num_rows, :, :width],
         )
 
-    def token_major_gen_view(self) -> Optional[TokenMajorGenView]:
-        """Return the ragged generation view expected by ``trtllm.py``."""
+    def token_major_gen_view(self, token_sparse: bool = False) -> Optional[TokenMajorGenView]:
+        """Return the ragged generation view expected by ``trtllm.py``.
+
+        Under Helix, token-sparse MLA is presented one row per generation token
+        instead, each row as long as its kept Top-K entries; see
+        ``_create_helix_sparse_row_buffers``.
+        """
+        if token_sparse and not self.is_ragged_verify and self._helix_num_rows > 0:
+            num_rows = self._helix_num_rows
+            return TokenMajorGenView(
+                num_rows=num_rows,
+                sequence_length=self.helix_row_kv_lens_cuda[:num_rows],
+                host_past_key_value_lengths=self.helix_row_kv_lens_host[:num_rows],
+                host_context_lengths=self.helix_row_prompt_lens_cpu[:num_rows],
+                prompt_lens_cuda=self.helix_row_prompt_lens_cuda[:num_rows],
+                host_request_types=self.helix_row_request_types_host[:num_rows],
+                kv_cache_block_offsets=self.helix_row_block_offsets[:, :num_rows],
+                max_num_rows=self.helix_row_kv_lens_cuda.shape[0],
+            )
         num_rows = self._attn_num_rows
         if not self.is_ragged_verify or num_rows <= 0:
             return None
@@ -2054,12 +2632,16 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             device="cpu",
         )
         if self.enable_helix:
-            active_rank = ~self.helix_is_inactive_rank_cpu[: self.num_seqs]
-            kv_lens = cached_token_lens.clone()
-            kv_lens[active_rank] += self.seq_lens_kv[active_rank]
+            kv_lens = self._helix_local_kv_lens(cached_token_lens)
         else:
             kv_lens = cached_token_lens + self.seq_lens_kv
-        tokens_per_block = self.kv_cache_manager.tokens_per_block
+        # A cache whose index-key table column spans several pages (DKV's sharded index keys:
+        # one column per DKV block) states the tokens of a column.
+        tokens_per_block = getattr(
+            self.kv_cache_manager,
+            "indexer_tokens_per_block",
+            self.kv_cache_manager.tokens_per_block,
+        )
         num_blocks_per_seq = (kv_lens[: self.num_seqs] + tokens_per_block - 1) // tokens_per_block
         max_blocks_used = num_blocks_per_seq.max().item() if self.num_seqs > 0 else 1
         # pool_indices already has correct values; set padding to -1.
@@ -2092,7 +2674,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         else:
             self.skip_indexer_for_ctx_reqs = False
 
-        if self.num_generations > 0 and self.enable_indexer_skip:
+        # Under Helix kv_lens are this rank's share of each sequence, which does
+        # not bound the global Top-K; the indexer runs and merge_helix_topk
+        # reduces the per-rank selections instead.
+        if self.num_generations > 0 and self.enable_indexer_skip and not self.enable_helix:
             # Minus the number of extra KV tokens because when using one-model MTP, the
             # draft layers needs more KV tokens for the next draft forwards.
             self.skip_indexer_for_gen_reqs = (
@@ -2144,8 +2729,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 dtype=torch.int64,
                 out=self.host_gen_cached_token_indptr[1 : self.num_generations + 1],
             )
-            self.gen_cached_token_indptr[: self.num_generations + 1].copy_(
-                self.host_gen_cached_token_indptr[: self.num_generations + 1], non_blocking=True
+            self._stage_or_copy(
+                self.gen_cached_token_indptr[: self.num_generations + 1],
+                self.host_gen_cached_token_indptr[: self.num_generations + 1],
             )
             # generation kv indptr
             torch.cumsum(
@@ -2154,8 +2740,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 dtype=torch.int64,
                 out=self.host_gen_kv_indptr[1 : self.num_generations + 1],
             )
-            self.gen_kv_indptr[: self.num_generations + 1].copy_(
-                self.host_gen_kv_indptr[: self.num_generations + 1], non_blocking=True
+            self._stage_or_copy(
+                self.gen_kv_indptr[: self.num_generations + 1],
+                self.host_gen_kv_indptr[: self.num_generations + 1],
             )
         else:
             self.max_gen_seq_len = 0
@@ -2168,7 +2755,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.seq_lens,
             dim=0,
         )
-        self.req_idx_per_token[: self.num_tokens].copy_(
+        self._stage_or_copy(
+            self.req_idx_per_token[: self.num_tokens],
             self.host_req_idx_per_token[: self.num_tokens],
-            non_blocking=True,
         )

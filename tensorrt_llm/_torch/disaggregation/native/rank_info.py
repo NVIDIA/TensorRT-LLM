@@ -20,6 +20,7 @@ import msgpack
 
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBufferMeta
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.spec import AttentionInfo
+from tensorrt_llm._torch.disaggregation.resource.dkv import manager_dkv
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
 from tensorrt_llm._torch.disaggregation.resource.page import KVCachePageTable
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
@@ -49,6 +50,9 @@ class RankInfo:
     aux_meta: Optional[AuxBufferMeta] = None
     page_table: Optional[KVCachePageTable] = None
     bounded_replay_on_generation: bool = False
+    # Ranks of this rank's DKV group (KVCacheManagerV2(dkv=True)): its paged KV of a
+    # DKV life cycle is spread over them, and it sends every page itself (resource/dkv.py).
+    dkv_size: int = 1
 
     @property
     def tp_size_per_dp_group(self) -> int:
@@ -74,6 +78,12 @@ class RankInfo:
         m = kv_cache_manager.mapping
         kvm = kv_cache_manager
         enable_attention_dp = m.enable_attention_dp
+        # Ulysses CP keeps the TP KV layout over its TP x CP ranks (attn_tp_size): peers see
+        # TP tp_size * cp_size with the TP-major, CP-minor flat rank, and no CP.
+        tp_size, tp_rank, cp_size, cp_rank = m.tp_size, m.tp_rank, m.cp_size, m.cp_rank
+        if m.cp_size > 1 and m.has_cp_ulysses():
+            tp_size, tp_rank = m.tp_size * m.cp_size, m.tp_rank * m.cp_size + m.cp_rank
+            cp_size, cp_rank = 1, 0
         # Keep AttentionInfo on attention-free PP stages so it can still carry
         # the attention-DP topology used by Mamba transfers.  A zero head count
         # means that this rank has no local attention cache; AttentionPolicy
@@ -90,14 +100,14 @@ class RankInfo:
         return cls(
             instance_name=instance_name,
             instance_rank=m.rank,
-            tp_size=m.tp_size,
-            tp_rank=m.tp_rank,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
             pp_size=m.pp_size,
             pp_rank=m.pp_rank,
             dp_size=m.tp_size if enable_attention_dp else m.dp_size,
             dp_rank=m.tp_rank if enable_attention_dp else 0,
-            cp_size=m.cp_size,
-            cp_rank=m.cp_rank,
+            cp_size=cp_size,
+            cp_rank=cp_rank,
             device_id=device_id,
             layer_num_per_pp=[len(kvm.pp_layers)],
             sender_endpoints=[],
@@ -114,6 +124,7 @@ class RankInfo:
             aux_meta=aux_buffer_meta,
             page_table=build_page_table_from_manager(kvm),
             bounded_replay_on_generation=getattr(kvm, "bounded_replay_on_generation", False),
+            dkv_size=dkv.size if (dkv := manager_dkv(kvm)) is not None else 1,
         )
 
     @classmethod

@@ -58,6 +58,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..distributed import AllReduce, AllReduceStrategy, allgather
+from ..distributed.ops import MNNVLAllReduce
 from ..modules.embedding import LMHead
 from ..modules.linear import TensorParallelMode
 from ..pyexecutor.sampler.ops.vanilla import GREEDY_TEMPERATURE_THRESHOLD
@@ -617,15 +618,26 @@ class VocabParallelHead:
         # The pairs carry token indices as float32 and must sum exactly, so the
         # exchange picks its own exact strategy rather than the model's
         # allreduce_strategy, which may be lossy (LOWPRECISION) or need user
-        # buffers (UB).
-        self._exchange = _PairExchange(
-            AllReduce(mapping, strategy=AllReduceStrategy.AUTO, dtype=torch.float32),
-            mapping.tp_size,
-            mapping.tp_rank,
-        )
+        # buffers (UB). That is AUTO only where AUTO runs the MNNVL all-reduce
+        # (it records bytes to clear); elsewhere NCCL: AUTO's one-shot Lamport
+        # kernel shares its workspace with the model's bf16 all-reduces and
+        # clears it in elements of the caller's dtype, leaving a stale half
+        # after this float32 call, which a later one-shot call can read as a
+        # peer's data.
+        self._exchange = None
+        if MNNVLAllReduce.is_mnnvl(mapping, torch.float32):
+            candidate = tp_pair_exchange(mapping, AllReduceStrategy.AUTO)
+            # AUTO without its MNNVL all-reduce (it failed to build) would fall
+            # back to the tunable all-reduce and its one-shot kernel.
+            if candidate.all_reduce.mnnvl_allreduce is not None:
+                self._exchange = candidate
+        if self._exchange is None:
+            self._exchange = tp_pair_exchange(mapping, AllReduceStrategy.NCCL)
+        all_reduce = self._exchange.all_reduce
+        exchange = "MNNVL" if all_reduce.mnnvl_allreduce is not None else all_reduce.strategy.name
         logger.info(
             f"Vocab-parallel LM-head token selection: tp={mapping.tp_size}, "
-            f"shard={self.shard_width}, vocab={self.vocab_size}"
+            f"shard={self.shard_width}, vocab={self.vocab_size}, exchange={exchange}"
         )
 
     @staticmethod

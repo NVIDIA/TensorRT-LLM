@@ -130,6 +130,10 @@ methods:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.AttentionDpConfig]
         default: null
         status: beta
+      dkv_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.DkvConfig]
+        default: null
+        status: prototype
       dwdp_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.DwdpConfig]
         default: null

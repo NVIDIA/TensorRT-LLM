@@ -683,6 +683,7 @@ class ConfigurableMoE(MoE):
         use_dp_padding: Optional[bool] = None,
         lora_params: Optional[Dict] = None,
         input_ready_event: Optional[torch.cuda.Event] = None,
+        moe_output: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Forward entry point.
@@ -699,6 +700,9 @@ class ConfigurableMoE(MoE):
 
         ``input_ready_event``: ``x`` is written on another stream; the join is
         deferred to the first kernel that reads ``x``, so routing overlaps it.
+
+        ``moe_output``: optional output buffer (see ``MoEScheduler.forward``); the
+        result is written into it only where the scheduler and backend support that.
         """
         input_ids = kwargs.get("input_ids")
         routing_aux = kwargs.get("routing_aux")
@@ -730,6 +734,7 @@ class ConfigurableMoE(MoE):
             lora_params=lora_params,
             routing_aux=routing_aux,
             input_ready_event=input_ready_event,
+            moe_output=moe_output,
         )
 
         # DWDP: record compute and trigger next prefetch (per-layer, not per-chunk).

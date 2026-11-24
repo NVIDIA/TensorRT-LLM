@@ -844,6 +844,14 @@ class BaseLLM:
         # so set to 1 to avoid allocating unnecessary KV cache blocks for single request
         is_ctx_only = disaggregated_params is not None and disaggregated_params.request_type == "context_only"
         is_gen_only = disaggregated_params is not None and disaggregated_params.request_type == "generation_only"
+        if ((is_ctx_only or is_gen_only) and not sampling_params.use_beam_search
+                and (sampling_params.best_of or sampling_params.n) > 1):
+            # The KV cache transfer is keyed by the request's disagg_request_id,
+            # which the child sequences of a sampling request share.
+            raise ValueError(
+                "Disaggregated context-only and generation-only requests return "
+                f"one sequence; n={sampling_params.n} and "
+                f"best_of={sampling_params.best_of} are not supported.")
 
         if is_ctx_only:
             sampling_params.max_tokens = 1
@@ -1037,6 +1045,12 @@ class BaseLLM:
                                     (("multi_modal_data" in inputs
                                       or "multi_modal_embeddings" in inputs))):
             if 'multi_modal_data' in inputs:
+                # Reject per request: a server built without the vision
+                # encoder would otherwise fail the whole batch in forward().
+                if getattr(self.args, "disable_mm_encoder", False):
+                    raise ValueError(
+                        "Multimodal input is not supported: the vision encoder "
+                        "is disabled on this server (disable_mm_encoder).")
                 # TODO: The current design uses a wrapper for existing input processor (input_processor_with_hash)
                 # to handle/add multimodal hashes, positions, and lengths. Now we only support image modality.
                 # In the future, we should refactor this to:

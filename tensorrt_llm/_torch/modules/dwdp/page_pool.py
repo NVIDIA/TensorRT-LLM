@@ -16,7 +16,8 @@
 """Page pool for DWDP remote double buffer.
 
 The page pool manages per-page fabric handles for the remote regions of the
-composite buffer. Two pools (slot 0, slot 1) support double buffering.
+composite buffer. Two pools (slot 0, slot 1) support double buffering; the
+cross-step prefetch schedule may use more (``TRTLLM_DWDP_PREFETCH_SLOTS``).
 
 Each pool is a list of page-sized fabric handles that can be mapped at different
 VA positions for different layers. Pages are reused across layers in the same slot:
@@ -369,6 +370,7 @@ class PagePool:
 def compute_slot_sizes(
     layouts: dict[int, dict[str, "PageAlignedLayout"]],  # noqa: F821
     buffer_slot_assignments: dict[int, int],
+    num_slots: int = 2,
 ) -> List[int]:
     """Compute the required slot sizes for a set of layouts.
 
@@ -377,16 +379,17 @@ def compute_slot_sizes(
 
     Args:
         layouts: Mapping from layer_idx to {weight_name: PageAlignedLayout}.
-        buffer_slot_assignments: Mapping from layer_idx to slot (0 or 1).
+        buffer_slot_assignments: Mapping from layer_idx to slot in [0, num_slots).
+        num_slots: Number of prefetch buffer slots.
 
     Returns:
-        [slot0_size, slot1_size] in bytes.
+        Per-slot sizes in bytes, ``num_slots`` entries.
     """
 
-    slot_sizes = [0, 0]
+    slot_sizes = [0] * num_slots
 
     for layer_idx, weight_layouts in layouts.items():
-        slot = buffer_slot_assignments.get(layer_idx, layer_idx % 2)
+        slot = buffer_slot_assignments.get(layer_idx, layer_idx % num_slots)
 
         # Sum remote sizes across all weight names within a layer.
         # Each weight name needs its own pool pages (they hold different data

@@ -18,6 +18,7 @@ l0_gb300:
       stage: pre_merge
       backend: pytorch
   tests:
+  - unittest/_torch/modeling_v2/models/kimi_k31/kimi_k31_pro_nvfp4__sm_10x__default
   # ------------- PyTorch tests ---------------
   # ------------- DeepSeek-V4.1 model, Engram and DSpark ---------------
   - unittest/_torch/modeling/test_modeling_deepseekv41.py
@@ -56,6 +57,24 @@ l0_gb300:
   - unittest/_torch/modules/kimi_kda/test_kda_mtp_decode_cute_parity.py
   - unittest/_torch/modules/kimi_kda/test_kimi_kda_fused_verify_parity.py
   - unittest/_torch/visual_gen/kernels/parallel
+  # Kimi K3.1 modeling_v2 general target unit tests, with the vision tower against the engine tower and the KDA layer
+  # against the engine KDA mixer. The stage runs -m "not cpu_only"; the cpu_only ones run on l0_cpu.
+  - unittest/_torch/modeling_v2/models/kimi_k31/kimi_k31_pro_mxfp4__sm_10x__default
+  # Kimi K3.1 sm_103 perf target unit tests, with the kernels and ops only that target runs. The multi-rank tests
+  # skip on fewer GPUs than their ranks (four, or two for the KDA pair projection).
+  - unittest/_torch/modeling_v2/models/kimi_k31/kimi_k31_pro_mxfp4__sm_103__tep
+  - unittest/_torch/modeling_v2/models/kimi_k31/kimi_k31_pro_mxfp4__sm_103__dep
+  # The DFlash drafter context budget against the worker's real allocation (its other tests run on l0_cpu).
+  - unittest/_torch/modeling_v2/models/kimi_k31/test_dflash_ctx_budget.py
+  # The Kimi K3.1 ULL generation target (kimi_k31_pro_nvfp4__sm_107__helix16_moetp16ep1); GB300 runs its kernels as Rubin does.
+  - unittest/_torch/modeling_v2/models/kimi_k31/kimi_k31_pro_nvfp4__sm_107__helix16_moetp16ep1
+  # The helix targets' DFlash2 rejection sampling on their workers (the law, capture/replay, greedy bitwise).
+  - unittest/_torch/modeling_v2/models/kimi_k31/test_rubin_dflash2_rejection_sampling.py
+  # The tep8 context server's first block of drafts and the generation server taking it as real.
+  - unittest/_torch/modeling_v2/models/kimi_k31/test_rubin_ctx_first_drafts.py
+  # Kimi K3.1 family operations and borrowed kernels.
+  - unittest/_torch/modeling_v2/models/kimi_k31/ops
+  - unittest/_torch/modeling_v2/models/kimi_k31/kernels
 - condition:
     ranges:
       system_gpu_count:

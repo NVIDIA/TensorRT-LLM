@@ -27,7 +27,7 @@ import sys
 from abc import ABC, abstractmethod
 from collections.abc import Hashable, Iterable
 from dataclasses import dataclass, field
-from typing import Any, Dict, Generic, List, Optional, TypeAlias, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Dict, Generic, List, Optional, TypeAlias, TypeVar, cast
 
 import torch
 
@@ -89,6 +89,9 @@ if sys.version_info[:2] >= (3, 12):
 else:
     from typing_extensions import override
 
+if TYPE_CHECKING:
+    from ..kv_cache.standalone_draft_cache import DraftHistoryUpdate
+
 T = TypeVar("T")
 
 # Seed of every unseeded request, the same on every rank.
@@ -114,6 +117,9 @@ class SampleState(Generic[GenericSampleStateTensorsHost, GenericSampleStateTenso
     host: Optional[GenericSampleStateTensorsHost] = None
     sampler_event: Optional[SamplerEvent] = None
     runtime_draft_len: Optional[int] = None
+    # The forward's draft history in a unified draft cache, published once
+    # this state's sampling has completed.
+    draft_history_update: Optional["DraftHistoryUpdate"] = None
 
 
 # Generic bounds not supported, https://github.com/python/typing/issues/548

@@ -111,8 +111,15 @@ checkpoint of the same shape is ungated.
 
 ```
 _router_index.py    architectures[0] -> routing module. Small, stable, test-guarded.
+_architecture_index.py
+                    model_type -> architecture module, for families with no
+                    built-in implementation
 models/<family>/
   routing.py        one forward-reading decision tree per architecture family
+  architecture.py   (no built-in implementation only) what the engine reads
+                    before routing (config class, input processor, serving
+                    extension, parsers)
+  config.py         (no built-in implementation only) the config classes
   <checkpoint>__<gpu arch>__<parallel>/
                       modeling.py  weights.py
                       ops/<category>/   entries only this target calls

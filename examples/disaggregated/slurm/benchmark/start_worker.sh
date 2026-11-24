@@ -1,4 +1,6 @@
 #! /bin/bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 set -u
 set -e
 set -x
@@ -12,6 +14,8 @@ log_dir=${6}
 enable_nsys=${7}
 config_file=${8}
 cuda_devices=${9}
+# Optional, defaults to false so that older command lines keep working.
+numa_local=${10:-false}
 # CUDA_VISIBLE_DEVICES selection:
 #   - Default packing (no gpu_map file): each node is dedicated to one
 #     worker, so every rank on the node is given the node's full GPU list
@@ -74,6 +78,85 @@ else
     echo "Not binding memory. If on GB200/GB300 NVL72, use \"numactl -m 0,1\" to only allocate memory from nodes."
 fi
 
+# Per-rank NUMA locality (slurm.numa_local): start the worker on the CPUs and
+# the memory of its GPU's NUMA node, before any Python runs, so that imports,
+# the CUDA context and the malloc heap are first-touched on the GPU's socket.
+# TensorRT-LLM binds CPUs only after it selects the device and sets no memory
+# policy, so pages touched before that stay wherever the process started.
+#   - GPU: the device TensorRT-LLM selects, global rank % visible GPUs, mapped
+#     through CUDA_VISIBLE_DEVICES.
+#   - Node: the numa_node of the GPU's PCI device in sysfs.
+#   - Wrap: numactl --cpunodebind=<node> --membind=<node>, outermost, so the
+#     launcher's helper processes (on rank 0 also the MPI leader and the
+#     trtllm-serve frontend) inherit it.
+#   - TLLM_NUMA_AWARE_WORKER_AFFINITY defaults to 1 here; when unset,
+#     TensorRT-LLM clears a CPU mask it did not set.
+#   - With numa_bind also on, --membind=<node> subsumes "numactl -m 0,1", so
+#     only the numa_local wrap is applied.
+#   - Fail-open: if the node cannot be resolved, log NUMA_LOCAL_SKIP and start
+#     unbound (numa_bind still applies).
+# One line per rank:
+#   NUMA_LOCAL rank= gpu= bus= numa= cpus= mems= membind=
+# cpus / mems are Cpus_allowed_list / Mems_allowed_list of a probe started
+# under the same wrap; membind is its memory policy (numactl --show).
+numa_local_skip() {
+    echo "NUMA_LOCAL_SKIP rank=${SLURM_PROCID:-?} reason=$1"
+}
+numa_local_resolve() {
+    local visible_gpus gpu bus pci node probe cpus mems membind
+    if ! command -v numactl >/dev/null 2>&1; then
+        numa_local_skip "no numactl"
+        return 1
+    fi
+    if [ -z "${SLURM_PROCID:-}" ]; then
+        numa_local_skip "no SLURM_PROCID"
+        return 1
+    fi
+    if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+        IFS=',' read -ra visible_gpus <<< "${CUDA_VISIBLE_DEVICES}"
+    else
+        mapfile -t visible_gpus < <(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | tr -d ' ')
+    fi
+    if [ "${#visible_gpus[@]}" -eq 0 ]; then
+        numa_local_skip "no visible GPUs"
+        return 1
+    fi
+    gpu=${visible_gpus[$((SLURM_PROCID % ${#visible_gpus[@]}))]}
+    bus=$(nvidia-smi --query-gpu=pci.bus_id --format=csv,noheader -i "${gpu}" 2>/dev/null | tr -d ' ')
+    if [[ ! ${bus} =~ ^([0-9A-Fa-f]+):([0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-9A-Fa-f])$ ]]; then
+        numa_local_skip "bad PCI bus id '${bus}' for GPU ${gpu}"
+        return 1
+    fi
+    pci=$(printf '%04x' "0x${BASH_REMATCH[1]}"):${BASH_REMATCH[2],,}
+    node=$(cat "/sys/bus/pci/devices/${pci}/numa_node" 2>/dev/null)
+    if [[ ! ${node} =~ ^[0-9]+$ ]]; then
+        numa_local_skip "no numa_node for ${pci} ('${node}')"
+        return 1
+    fi
+    if ! probe=$(numactl --cpunodebind="${node}" --membind="${node}" \
+            sh -c 'grep -E "^(Cpus|Mems)_allowed_list:" /proc/self/status; numactl --show' 2>&1); then
+        numa_local_skip "numactl failed on node ${node}: $(echo "${probe}" | tr '\n' ' ')"
+        return 1
+    fi
+    cpus=$(awk '/^Cpus_allowed_list:/ {print $2}' <<< "${probe}")
+    mems=$(awk '/^Mems_allowed_list:/ {print $2}' <<< "${probe}")
+    membind=$(awk '/^membind:/ {$1 = ""; sub(/^ /, ""); print}' <<< "${probe}")
+    echo "NUMA_LOCAL rank=${SLURM_PROCID} gpu=${gpu} bus=${bus} numa=${node} cpus=${cpus} mems=${mems} membind=${membind}"
+    numa_local_cmd="numactl --cpunodebind=${node} --membind=${node}"
+}
+
+numa_local_cmd=""
+if [ "${numa_local}" = "true" ]; then
+    if numa_local_resolve; then
+        export TLLM_NUMA_AWARE_WORKER_AFFINITY="${TLLM_NUMA_AWARE_WORKER_AFFINITY:-1}"
+        echo "TLLM_NUMA_AWARE_WORKER_AFFINITY: ${TLLM_NUMA_AWARE_WORKER_AFFINITY}"
+        if [ -n "${numa_bind_cmd}" ]; then
+            echo "numa_local: ${numa_local_cmd} replaces ${numa_bind_cmd}"
+            numa_bind_cmd=""
+        fi
+    fi
+fi
+
 echo "config_file: ${config_file}"
 
 nsys_prefix=""
@@ -92,7 +175,7 @@ if ! command -v trtllm-serve >/dev/null 2>&1; then
     trtllm_serve_cmd="python3 -m tensorrt_llm.commands.serve"
 fi
 
-${nsys_prefix} trtllm-llmapi-launch ${numa_bind_cmd} \
+${numa_local_cmd} ${nsys_prefix} trtllm-llmapi-launch ${numa_bind_cmd} \
     ${trtllm_serve_cmd} ${model_path} \
         --host $(hostname) --port ${port} \
         --config ${config_file}

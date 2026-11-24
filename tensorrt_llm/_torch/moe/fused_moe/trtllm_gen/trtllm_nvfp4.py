@@ -18,7 +18,11 @@ from ..impl_contract import MoEDeployment, MoEEligibility, MoEProblem
 from ..impl_identity import register_moe_impl
 from .eligibility import check_trtllm_gen_leaf
 from .fp4_block_scale import TRTLLMGenNvfp4Base
-from .identity import PROVIDER_TRTLLM, trtllm_gen_descriptor
+from .identity import (
+    PROVIDER_TRTLLM,
+    TRTLLM_GEN_PER_LAYER_DYNAMIC_EPLB_CAPABILITIES,
+    trtllm_gen_descriptor,
+)
 
 
 @register_moe_impl
@@ -26,7 +30,10 @@ class TrtllmTrtllmGenNvfp4Impl(TRTLLMGenNvfp4Base):
     """``trtllm.trtllm_gen.fused_moe.nvfp4``."""
 
     descriptor = trtllm_gen_descriptor(
-        PROVIDER_TRTLLM, "nvfp4", "TRTLLM-Gen batched-GEMM cubins over NVFP4, SM100 family."
+        PROVIDER_TRTLLM,
+        "nvfp4",
+        "TRTLLM-Gen batched-GEMM cubins over NVFP4, SM100 family.",
+        capabilities=TRTLLM_GEN_PER_LAYER_DYNAMIC_EPLB_CAPABILITIES,
     )
 
     #: The group-16 fused SiTu cubins exist for this format, but only the

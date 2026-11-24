@@ -32,7 +32,7 @@ from importlib.util import find_spec
 from pathlib import Path
 from types import FrameType
 from typing import (TYPE_CHECKING, Any, Dict, Iterator, NoReturn, Optional,
-                    Sequence, Set)
+                    Sequence, Set, Tuple)
 
 import click
 import torch
@@ -541,8 +541,16 @@ def launch_server(
     # Publish an explicit serving role before constructing/spawning the model.
     # Remote-tail context workers use it to omit generation-only weights.
     if server_role is not None:
-        os.environ[
-            DisaggLauncherEnvs.TLLM_DISAGG_ROLE] = server_role.name.lower()
+        role = server_role.name.lower()
+        os.environ[DisaggLauncherEnvs.TLLM_DISAGG_ROLE] = role
+        # MPI workers can predate this process (trtllm-llmapi-launch) and then
+        # never see the variable above; forward it through worker_main's
+        # explicit environment overrides as well.
+        llm_args["env_overrides"] = {
+            **(llm_args.get("env_overrides") or {}),
+            DisaggLauncherEnvs.TLLM_DISAGG_ROLE.value:
+            role,
+        }
 
     backend = llm_args["backend"]
     model = served_model_name or llm_args["model"]
@@ -888,6 +896,41 @@ def launch_visual_gen_server(
             )
 
 
+def _default_parsers(
+        model: str, tool_parser: Optional[str],
+        reasoning_parser: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    """Resolve the parsers a ``serve`` command uses when it names none.
+
+    A model family served only by modeling_v2 may state the parsers its
+    output markup needs (tool calls, thinking); its checkpoints get them when
+    an option is absent. ``none`` keeps a parser off (e.g. for clients that
+    read only ``content``); every other value is returned unchanged.
+    """
+    if tool_parser is None or reasoning_parser is None:
+        config_path = Path(model) / "config.json"
+        model_type = None
+        if config_path.exists():
+            with open(config_path) as f:
+                model_type = json.load(f).get("model_type")
+        from tensorrt_llm._torch._experimental.modeling_v2._architecture_index import \
+            serve_parser
+        if tool_parser is None:
+            tool_parser = serve_parser(model_type, "tool")
+            if tool_parser is not None:
+                logger.info(f"{model_type} checkpoint: using tool parser "
+                            f"{tool_parser}")
+        if reasoning_parser is None:
+            reasoning_parser = serve_parser(model_type, "reasoning")
+            if reasoning_parser is not None:
+                logger.info(f"{model_type} checkpoint: using reasoning parser "
+                            f"{reasoning_parser}")
+    if tool_parser == "none":
+        tool_parser = None
+    if reasoning_parser == "none":
+        reasoning_parser = None
+    return tool_parser, reasoning_parser
+
+
 @click.command("serve")
 @click.argument("model", type=str)
 @stability_option(
@@ -1094,18 +1137,20 @@ def launch_visual_gen_server(
     "startup, telemetry, environment, server-only, or VisualGen settings.",
     status="prototype")
 @stability_option("--reasoning_parser",
-                  type=click.Choice(["auto"] +
+                  type=click.Choice(["auto", "none"] +
                                     list(ReasoningParserFactory.keys())),
                   default=None,
                   help="Specify the parser for reasoning models. "
-                  "Use 'auto' to automatically select based on the model.",
+                  "Use 'auto' to automatically select based on the model, "
+                  "'none' to return the reasoning as part of the content.",
                   status="prototype")
 @stability_option("--tool_parser",
-                  type=click.Choice(["auto"] +
+                  type=click.Choice(["auto", "none"] +
                                     list(ToolParserFactory.parsers.keys())),
                   default=None,
                   help="Specify the parser for tool models. "
-                  "Use 'auto' to automatically select based on the model.",
+                  "Use 'auto' to automatically select based on the model, "
+                  "'none' to return tool calls as part of the content.",
                   status="prototype")
 @stability_option("--metadata_server_config_file",
                   type=str,
@@ -1347,6 +1392,9 @@ def serve(
             "--moe_cluster_parallel_size / --cluster_size is deprecated and "
             "no longer supported. This option will be removed in a future release."
         )
+
+    tool_parser, reasoning_parser = _default_parsers(model, tool_parser,
+                                                     reasoning_parser)
 
     if tool_parser == "auto":
         resolved = resolve_auto_tool_parser(model)
@@ -2339,6 +2387,13 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
         request_timeout_secs=request_timeout)
     logger.info(f"Coordinator serving on {public_host}:{coord_port} "
                 f"(uds={coord_uds}) (fleet on public port {public_port})")
+
+    # Disable GC as the single server (topology (c)) and the fleet workers do.
+    # Every fleet worker waits on this process for /select and /finish, so a
+    # full collection over its heap stalls the whole fleet at once.
+    if os.getenv("TRTLLM_DISAGG_SERVER_DISABLE_GC", "1") == "1":
+        gc.disable()
+
     set_lifecycle_phase("serving")
 
     async def _serve_and_monitor():

@@ -699,9 +699,16 @@ class AttentionMetadata:
             block_ids_per_seq=block_ids_per_seq,
         )
 
-    def update_for_spec_dec(self) -> None:
+    def update_for_spec_dec(self, refresh_device_metadata: bool = True) -> None:
         """
         Hook to be called during forward when using spec-dec one-model mode.
+
+        ``refresh_device_metadata=False`` says the caller reads none of this
+        metadata's device-side state until the next ``prepare()`` or
+        ``on_update_kv_lens()``: the draft forward of a speculative worker whose
+        drafter reads no target attention metadata. A class may then skip that
+        refresh; one that refreshes anyway is still correct. Every override
+        takes the keyword.
         """
 
     @staticmethod

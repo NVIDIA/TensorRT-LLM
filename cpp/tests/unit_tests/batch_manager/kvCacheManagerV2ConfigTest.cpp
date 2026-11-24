@@ -162,4 +162,65 @@ TEST(KvCacheManagerV2ConfigTest, SparseBuffersCoalesceByExpandedSize)
     EXPECT_EQ(second.expansion, 1);
 }
 
+TEST(KvCacheManagerV2ConfigTest, AttentionLifecycleFactoryPreservesCacheDomain)
+{
+    auto const target = AttnLifeCycle::make(128, 5, 4);
+    auto const draft
+        = AttnLifeCycle::make(128, 5, 4, false, AttentionReusePolicy::REQUIRED, CacheDomain::kStandaloneDraft);
+    EXPECT_EQ(target.numSinkBlocks, 2);
+    EXPECT_EQ(target.cacheDomain, CacheDomain::kTarget);
+    EXPECT_EQ(draft.cacheDomain, CacheDomain::kStandaloneDraft);
+    EXPECT_FALSE(target == draft);
+    EXPECT_TRUE(target < draft || draft < target);
+    EXPECT_TRUE(
+        draft == AttnLifeCycle::make(128, 8, 4, false, AttentionReusePolicy::REQUIRED, CacheDomain::kStandaloneDraft));
+}
+
+TEST(KvCacheManagerV2ConfigTest, StandaloneDraftHistoryHasNoScratchRange)
+{
+    auto const target = AttnLifeCycle::make(8, std::nullopt, 4);
+    auto const draft
+        = AttnLifeCycle::make(8, std::nullopt, 4, false, AttentionReusePolicy::REQUIRED, CacheDomain::kStandaloneDraft);
+    auto const targetScratch = computeScratchRange(target, 0, 64, 4, 0);
+    auto const draftScratch = computeScratchRange(draft, 0, 64, 4, 0);
+    EXPECT_LT(targetScratch.beg, targetScratch.end);
+    EXPECT_EQ(draftScratch.beg, draftScratch.end);
+}
+
+TEST(KvCacheManagerV2ConfigTest, MatchingSlotShapesSharePoolsOnlyWithinEachCacheDomain)
+{
+    auto config = makeTieredConfig();
+    config.layers.clear();
+    for (LayerId layerId = 0; layerId < 4; ++layerId)
+    {
+        auto layer = makeAttentionLayer(layerId, false);
+        layer.slidingWindowSize = layerId % 2 == 0 ? 128 : 256;
+        layer.cacheDomain = layerId < 2 ? CacheDomain::kTarget : CacheDomain::kStandaloneDraft;
+        config.layers.push_back(layer);
+    }
+    ASSERT_NO_THROW(config.validate());
+
+    LifeCycleRegistry const registry(config);
+    auto const storage = createStorageConfig(config);
+    auto const attributes = storage.bufferAttributes();
+    auto const grouping = storage.lifeCycleGrouping();
+    auto lifeCycle = [&](LayerId layerId) { return attributes.at(BufferId{layerId, "key"}).lifeCycleId; };
+    auto poolGroup = [&](LayerId layerId) { return grouping[lifeCycle(layerId)]; };
+    EXPECT_EQ(registry.size(), LifeCycleId{4});
+    EXPECT_EQ(storage.slotDescList.size(), PoolGroupIndex{2});
+    // The standalone draft domain sorts first in the storage layout.
+    EXPECT_EQ(poolGroup(2), PoolGroupIndex{0});
+    for (LayerId first = 0; first < 4; ++first)
+    {
+        auto const& attention = std::get<AttnLifeCycle>(registry[lifeCycle(first)]);
+        EXPECT_EQ(attention.cacheDomain, first < 2 ? CacheDomain::kTarget : CacheDomain::kStandaloneDraft);
+        for (LayerId second = first + 1; second < 4; ++second)
+        {
+            EXPECT_NE(lifeCycle(first), lifeCycle(second));
+            EXPECT_FALSE(registry[lifeCycle(first)] == registry[lifeCycle(second)]);
+            EXPECT_EQ(poolGroup(first) == poolGroup(second), first / 2 == second / 2);
+        }
+    }
+}
+
 } // namespace
