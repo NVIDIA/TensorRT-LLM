@@ -43,9 +43,18 @@ def _mapper() -> NemotronHHfWeightMapper:
 
 # `embeddings` is the name in NVIDIA's released checkpoints; transformers 5.x
 # save_pretrained reverses its own load-time rename and writes `embedding`.
-@pytest.mark.parametrize("source_key", ["backbone.embeddings.weight", "backbone.embedding.weight"])
-def test_input_embedding_maps_to_embed_tokens(source_key: str) -> None:
+# Keys that merely contain the word, or are already mapped, must not change.
+@pytest.mark.parametrize(
+    ("source_key", "expected_key"),
+    [
+        ("backbone.embeddings.weight", "model.embed_tokens.weight"),
+        ("backbone.embedding.weight", "model.embed_tokens.weight"),
+        ("backbone.position_embeddings.weight", "model.position_embeddings.weight"),
+        ("model.embed_tokens.weight", "model.embed_tokens.weight"),
+    ],
+)
+def test_embedding_key_mapping(source_key: str, expected_key: str) -> None:
     table = torch.randn(16, 4)
     remapped = _mapper().preprocess_weights({source_key: table})
-    assert list(remapped) == ["model.embed_tokens.weight"]
-    assert remapped["model.embed_tokens.weight"] is table
+    assert list(remapped) == [expected_key]
+    assert remapped[expected_key] is table
