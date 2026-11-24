@@ -415,13 +415,11 @@ class RequestScheduler(ABC):
         """
 
     def take_lost_kv_requests(self) -> list[tuple[LlmRequest, str]]:
-        """Requests the scheduler could not schedule, which the executor must
-        fail one by one, with their error messages: requests whose KV pages a
-        failed remote cache level took, and requests whose completion no longer
-        fits the KV cache.
+        """Requests whose KV pages a failed remote cache level took, which the
+        executor must fail, with their error messages.
 
-        Only the KV cache manager V2 scheduler reports these; the default has
-        none.
+        Only the KV cache manager V2 scheduler loses pages this way; the
+        default has none.
         """
         return []
 

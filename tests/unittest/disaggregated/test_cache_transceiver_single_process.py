@@ -200,9 +200,6 @@ class KvCacheConfigV2:
     # Mirrors KvCacheConfig.remote_cache_config; read by KVCacheManagerV2.__init__.
     remote_cache_config: Optional[RemoteCacheConfig] = None
     enable_kv_pool_rebalance: bool = False
-    # Stand-in for KvCacheConfig.enable_disagg_completion_reservation, which
-    # KVCacheManagerV2.__init__() reads.
-    enable_disagg_completion_reservation: bool = False
 
 
 # ---------------------------------------------------------------------------

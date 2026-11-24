@@ -212,16 +212,6 @@ class KvCacheConnectorWorker(ABC):
     #: instance in `__init__`, since the manager is built after the connector.
     #: Must be the same on every rank.
     requires_block_aligned_reuse: bool = False
-    #: The connector prefers whole local matches to backed-off ones. The target
-    #: `KVCacheManagerV2` then drops the one-model draft lookahead backoff; the
-    #: draft KV at the tail of a reused block may belong to a different next
-    #: token. This can lower acceptance; strict acceptance preserves greedy
-    #: output, but relaxed acceptance and seeded sampling can change text.
-    #: If both reuse declarations are true, this one takes precedence: whole
-    #: local blocks need no further alignment. Partial reuse remains disabled.
-    #: Only an explicit True counts. May be set per instance. Must be the same
-    #: on every rank.
-    drops_reuse_match_backoff: bool = False
     #: Opt in when a prefix load can come up short (a page offered at lookup
     #: is gone at load time) and the worker reports the affected requests
     #: through `take_failed_load_requests` / `take_failed_async_load_requests`
@@ -232,17 +222,6 @@ class KvCacheConnectorWorker(ABC):
     #: KVCacheManagerV2, and the final-batch query path (prefix reservations
     #: off). Only an explicit True counts.
     reports_failed_loads: bool = False
-    #: Opt in to completion headroom on a disaggregated server whose
-    #: `KVCacheManagerV2` has no tier below GPU. The manager then admits a
-    #: request only while the pages every admitted request still needs to
-    #: finish fit (a decode its output, a connector prefill the rest of its
-    #: prompt), so a restore chosen after the final batch is not starved by
-    #: other requests' chunks. Only an explicit True counts, and a
-    #: `capacity_only` worker's is ignored. Read from the worker, which every
-    #: rank holds, so every rank sees it; may be set per instance in
-    #: `__init__`, since the manager is built after the connector. Must be the
-    #: same on every rank.
-    requires_completion_reservation: bool = False
 
     def __init__(self, llm_args: TorchLlmArgs):
         self._llm_args = llm_args
@@ -494,17 +473,14 @@ class KvCacheConnectorScheduler(ABC):
     #: Opt in to run next to one-model speculative decoding (MTP or EAGLE3) on
     #: a disaggregated context server; see
     #: `KvCacheConnectorManager.speculative_prefill_only`. A one-model draft
-    #: writes KV at each prompt position from the next
-    #: `draft_prompt_lookahead(llm_args.speculative_config)` prompt tokens, so
-    #: declare it only when the adapter's content identity (its store keys)
-    #: covers those tokens past each block's end; a served block's draft-layer
-    #: KV then belongs to this prompt. The adapter must never offer or save a
-    #: block whose lookahead tokens fall outside the prompt, and must never
-    #: save a block this pass has not computed: one-model speculation
-    #: allocates `max_draft_len - 1` extra KV slots past every context chunk,
-    #: so a page can exist before its block is computed. The worker must
-    #: declare it too. Only an explicit True counts, and it is read from the
-    #: class before either half is constructed.
+    #: writes KV using following prompt tokens. The runtime backs off external
+    #: matches just as it backs off local matches. Each offered page must come
+    #: from the matched prompt, including its draft lookahead; independent
+    #: block-key hits do not by themselves prove that compatibility. No backend
+    #: key format is prescribed. Only save blocks this pass has
+    #: computed: allocated draft slots can extend past the computed range.
+    #: The worker must declare support too. Only an explicit True counts,
+    #: read from the class before either half is constructed.
     supports_speculative_prefill: bool = False
 
     def __init__(self, llm_args: TorchLlmArgs):
@@ -908,8 +884,6 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
     reports_failed_loads: bool = False
     speculative_prefill_only: bool = False
     requires_block_aligned_reuse: bool = False
-    drops_reuse_match_backoff: bool = False
-    requires_completion_reservation: bool = False
 
     def __init__(
         self,
@@ -961,12 +935,6 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self.reports_failed_loads = worker.reports_failed_loads is True and not self.capacity_only
         self.requires_block_aligned_reuse = (
             worker.requires_block_aligned_reuse is True and not self.capacity_only
-        )
-        self.drops_reuse_match_backoff = (
-            worker.drops_reuse_match_backoff is True and not self.capacity_only
-        )
-        self.requires_completion_reservation = (
-            worker.requires_completion_reservation is True and not self.capacity_only
         )
         if self.reports_failed_loads:
             self._validate_failed_load_reporting(worker)
@@ -1119,8 +1087,6 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
                 and worker_method is not KvCacheConnectorWorker.get_finished_prefix_loads,
                 self.capacity_only,
                 self.requires_block_aligned_reuse,
-                self.drops_reuse_match_backoff,
-                self.requires_completion_reservation,
                 self.reports_failed_loads,
             )
             probe = [local_probe] if self.enable_attention_dp else mpi_allgather(local_probe)
@@ -1128,8 +1094,6 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             declarations = (
                 "capacity_only",
                 "requires_block_aligned_reuse",
-                "drops_reuse_match_backoff",
-                "requires_completion_reservation",
                 "reports_failed_loads",
             )
             for index, declaration in enumerate(declarations, start=1):

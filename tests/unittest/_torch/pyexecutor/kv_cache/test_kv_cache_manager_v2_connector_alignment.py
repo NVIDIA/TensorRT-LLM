@@ -17,8 +17,8 @@
 A one-model draft's lookahead backoff trims a local match of whole blocks to a
 few tokens short of a boundary, and a connector that serves only from a block
 boundary could then offer nothing. The manager asks the core to align the
-match only when that combination is actually present, or drops the backoff
-when the connector asks for whole local matches instead.
+match only when that combination is present. The native lookahead backoff
+remains in effect before alignment.
 """
 
 from types import SimpleNamespace
@@ -52,19 +52,12 @@ def _connector(whole_blocks: bool | str, *, capacity_only: bool = False) -> Simp
     )
 
 
-def _dropping_connector(drops: bool | str, *, capacity_only: bool = False) -> SimpleNamespace:
-    return SimpleNamespace(
-        capacity_only=capacity_only,
-        drops_reuse_match_backoff=drops is True and not capacity_only,
-    )
-
-
 @pytest.mark.parametrize(
     "backoff, partial_reuse, connector, is_draft, expected",
     [
         (1, False, _connector(True), False, TOKENS_PER_BLOCK),
-        # No backoff: attention coverage can still end a match mid-block.
-        (0, False, _connector(True), False, TOKENS_PER_BLOCK),
+        # No backoff: matches of whole blocks already end on a boundary.
+        (0, False, _connector(True), False, 1),
         # Whole-block declarations override the default partial reuse setting.
         (1, True, _connector(True), False, TOKENS_PER_BLOCK),
         # A connector that serves from any position needs nothing.
@@ -112,36 +105,46 @@ def test_a_manager_without_a_connector_keeps_token_granularity() -> None:
     assert manager._connector_reuse_match_alignment() == 1
 
 
-@pytest.mark.parametrize(
-    "is_draft, connector, expected",
-    [
-        (False, _dropping_connector(True), True),
-        (False, _dropping_connector(False), False),
-        # A mock answers truthily; only a declared True counts.
-        (False, _dropping_connector("yes"), False),
-        (False, None, False),
-        (False, _dropping_connector(True, capacity_only=True), False),
-        (True, _dropping_connector(True), False),
-    ],
-    ids=[
-        "asked",
-        "not_asked",
-        "truthy_but_not_true",
-        "no_connector",
-        "capacity_only_connector",
-        "draft",
-    ],
-)
-def test_connector_drops_reuse_match_backoff(
-    is_draft: bool, connector: SimpleNamespace | None, expected: bool
-) -> None:
-    manager = object.__new__(KVCacheManagerV2)
-    manager.is_draft = is_draft
-    manager.kv_connector_manager = connector
-    assert manager._connector_drops_reuse_match_backoff() is expected
-
-
-def test_the_worker_base_class_declares_neither() -> None:
+def test_the_worker_base_class_keeps_token_granularity() -> None:
     """Third-party connectors keep upstream reuse unless they opt in."""
     assert KvCacheConnectorWorker.requires_block_aligned_reuse is False
-    assert KvCacheConnectorWorker.drops_reuse_match_backoff is False
+
+
+@pytest.mark.parametrize(
+    "backoff, matched, expected", [(0, 128, 128), (1, 128, 0), (1, 256, 128), (129, 256, 0)]
+)
+def test_external_prefix_keeps_native_lookahead(backoff: int, matched: int, expected: int) -> None:
+    manager = _manager(backoff=backoff, partial_reuse=False, connector=None)
+    manager.tokens_per_block = TOKENS_PER_BLOCK
+    request = SimpleNamespace(prompt_len=512)
+    assert manager._connector_safe_prefix_end(request, matched) == expected
+
+
+@pytest.mark.parametrize("growth_succeeds", [False, True])
+def test_retained_generation_retry_reserves_current_draft_width(growth_succeeds: bool) -> None:
+    from unittest.mock import Mock
+
+    manager = object.__new__(KVCacheManagerV2)
+    cache = SimpleNamespace(is_active=True, capacity=130, resize=Mock(return_value=growth_succeeds))
+    manager.kv_cache_map = {7: cache}
+    manager._ensure_generation_beam_width = lambda request, kv_cache: True
+    manager._generation_draft_slots = lambda request: 4
+    manager._retained_generation_allocations = {7: 1}
+    manager._allocated_draft_lens = {}
+    manager._inflight_draft_lens = {7: [0]}
+    manager._fill_fresh_kv_pages = Mock()
+    manager._log_window_crossing = Mock()
+    request = SimpleNamespace(py_request_id=7)
+
+    assert manager.try_allocate_generation(request) is growth_succeeds
+    cache.resize.assert_called_once_with(133)
+    if growth_succeeds:
+        assert manager._retained_generation_allocations == {}
+        assert manager._allocated_draft_lens == {7: 4}
+        assert manager._inflight_draft_lens == {7: [0, 4]}
+        manager._fill_fresh_kv_pages.assert_called_once_with(7)
+    else:
+        assert manager._retained_generation_allocations == {7: 1}
+        assert manager._allocated_draft_lens == {}
+        assert manager._inflight_draft_lens == {7: [0]}
+        manager._fill_fresh_kv_pages.assert_not_called()

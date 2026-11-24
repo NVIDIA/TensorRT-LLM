@@ -796,30 +796,6 @@ def test_deferred_lora_generation_resumes_from_harvested_host_token(executor: Py
     assert deferred.py_seq_slot == 1
 
 
-def test_a_request_the_scheduler_rejects_fails_alone_beside_a_healthy_one(
-    executor: PyExecutor,
-) -> None:
-    """A rejected admission is a request error, not a loop failure: the healthy request is still scheduled."""
-    rejected = _request(1)
-    healthy = _request(2)
-    _prepare_generation_harvest(executor, [rejected, healthy])
-    executor.inflight_req_ids = set()
-    executor.enable_batch_waiting = False
-    executor._get_ctx_mla_kv_len_cap = lambda: None
-    executor.scheduler = Mock()
-    executor.scheduler.schedule_request.return_value = SchedulerOutput([], [], [healthy], [], [], 1)
-    message = "Request 1 requires 9 completion blocks, but only 4 fit"
-    executor.scheduler.take_lost_kv_requests.return_value = [(rejected, message)]
-    executor._handle_errors = Mock()
-
-    current_batch, _, _ = executor._schedule()
-
-    assert current_batch.generation_requests == [healthy]
-    executor._handle_errors.assert_called_once_with(
-        message, requests=[rejected], charge_budget=False
-    )
-
-
 @pytest.mark.parametrize("local_batch_ready", [False, True], ids=["empty", "adp-deferred"])
 def test_overlap_marker_changes_only_after_previous_sample_is_harvested(
     executor: PyExecutor, monkeypatch: pytest.MonkeyPatch, local_batch_ready: bool
