@@ -307,9 +307,11 @@ def lookup_paths_into_block_filters(
     covering entry's raw text as identifier so it passes its own `-k` guard.
 
     Returns (block_filters, unmatched_paths). A path is "unmatched" when
-    no YAML entry shares pytest-tree lineage with it. Over-includes
-    sibling `-k` variants on purpose: a path change should run every
-    parameterization of the affected file/scope.
+    no YAML entry shares pytest-tree lineage with it. Intentionally retains
+    every entry under `prefix` that does not explicitly exclude `resolved_anchor`
+    (including sibling `-k` variants and sibling `test_*.py` files): `test_*.py`
+    modules can import or subclass sibling test modules directly, and static
+    importer discovery in `TestsDefRule` deliberately skips `test_*.py` targets.
     """
     block_filters: dict[tuple[str, int], dict[str, set[str]]] = {}
     unmatched: list[str] = []
@@ -324,13 +326,10 @@ def lookup_paths_into_block_filters(
             ids = block_filters.setdefault(key, {}).setdefault(prefix, set())
             for raw in block.tests:
                 target = _entry_target(raw)
-                if (
-                    _target_in_filter_subtree(target, prefix)
-                    and not _entry_excludes_waive(raw, resolved_anchor)
-                    and (
-                        _target_in_filter_subtree(resolved_anchor, target)
-                        or _target_in_filter_subtree(target, resolved_anchor)
-                    )
+                # Keep all non-excluded entries under `prefix` so cross-test
+                # subclasses/importers under a directory prefix are not dropped.
+                if _target_in_filter_subtree(target, prefix) and not _entry_excludes_waive(
+                    raw, resolved_anchor
                 ):
                     ids.add(raw)
     return block_filters, unmatched

@@ -480,7 +480,9 @@ def test_lookup_paths_preserves_walked_up_config_matches_alongside_direct_test(
         "other_suite/test_unrelated.py::test_keep_when_touched",
     ]
 
-    # Editing one file under a `--ignore` directory batch must not re-include the ignored sibling file.
+    # Intentional safe over-inclusion: when a covering directory entry lifts `prefix`
+    # to the directory, sibling `test_*.py` entries under that directory that do not
+    # `--ignore` the edited file must stay so cross-test subclasses/importers still run.
     dir_batch = (
         "unittest/_torch/modules/kimi_kda "
         "--ignore=unittest/_torch/modules/kimi_kda/test_kda_prefill_op.py"
@@ -503,7 +505,34 @@ def test_lookup_paths_preserves_walked_up_config_matches_alongside_direct_test(
     filtered_kda = tmp_path / "filtered_kda"
     write_filtered_test_db(test_db, filtered_kda, bf_kda)
     assert yaml.safe_load((filtered_kda / "l0_b200.yml").read_text())["l0_b200"][0]["tests"] == [
-        dir_batch
+        prefill,
+        dir_batch,
+    ]
+
+    # Regression for directory `-k` + sibling subclass module (`unittest/m -k "x"` + `unittest/m/test_b.py`).
+    (test_db / "l0_h100.yml").write_text(
+        yaml.safe_dump(
+            {
+                "version": "0.0.1",
+                "l0_h100": [
+                    {
+                        "condition": _CONDITION,
+                        "tests": ['unittest/m -k "x"', "unittest/m/test_b.py", "unittest/other.py"],
+                    }
+                ],
+            },
+            sort_keys=False,
+        )
+    )
+    bf_sub, unm_sub = lookup_paths_into_block_filters(
+        YAMLIndex.load(test_db), ["unittest/m/test_a.py"]
+    )
+    assert unm_sub == []
+    filtered_sub = tmp_path / "filtered_sub"
+    write_filtered_test_db(test_db, filtered_sub, bf_sub)
+    assert yaml.safe_load((filtered_sub / "l0_h100.yml").read_text())["l0_h100"][0]["tests"] == [
+        'unittest/m -k "x"',
+        "unittest/m/test_b.py",
     ]
 
     # SpecDecRule selects double-quoted, single-quoted, and bare `-k` entries while ignoring `--ignore`/`--deselect`.
