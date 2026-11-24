@@ -1047,6 +1047,45 @@ TEST(MoeLoadBalancerCpuCopyTest, UpdateCopiesMovedExpertsIntoSlots)
     }
 }
 
+TEST(MoeLoadBalancerAbandonTest, SlotsWritableOnlyAfterAbandonIterationsEndedTheUpdates)
+{
+    ScopedEnv const allowManagedFallback("TLLM_HOST_ACCESSIBLE_ALLOW_MANAGED_FALLBACK", "1");
+    TLLM_CUDA_CHECK(cudaSetDevice(0));
+    using Placement = std::vector<std::vector<int>>;
+    // Expert 1 carries the load, so the update of iteration 0 gives it a second slot.
+    std::vector<int> const initialAssignments{0, 1, 0};
+    std::vector<float> const loads{1, 20};
+    SimulatedEpRank rank(
+        /*epRank=*/0, /*epSize=*/1, /*expertCount=*/2, /*slotCountPerRank=*/3, /*layerCount=*/1, initialAssignments);
+    rank.balancer().startIter(0, /*enableStatistic=*/true, /*enableUpdateWeights=*/true);
+    runLayerOnGpu(rank.layer(0), 0, loads, /*handBack=*/true);
+    rank.balancer().endIter(0);
+
+    // The worker is soon done with iteration 0, while the weight update it started may still run.
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    bool writable = false;
+    while (!writable && std::chrono::steady_clock::now() < deadline)
+    {
+        try
+        {
+            rank.balancer().checkSlotsWritable();
+            writable = true;
+        }
+        catch (tensorrt_llm::common::TllmException const&)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    EXPECT_FALSE(writable) << "slots writable before abandonIterations ended the weight update";
+    EXPECT_THROW(
+        rank.balancer().restorePlacement({}, {Placement{initialAssignments}}), tensorrt_llm::common::TllmException);
+
+    rank.balancer().abandonIterations();
+    EXPECT_NO_THROW(rank.balancer().checkSlotsWritable());
+    EXPECT_NE(rank.layer(0).getOldRankExpertIds(), Placement{initialAssignments});
+    rank.expectSlotsHoldPlacement(0);
+}
+
 TEST(MoeLoadBalancerAbandonTest, AbandonIterationsWaitsForTheLaunchedWork)
 {
     ScopedEnv const allowManagedFallback("TLLM_HOST_ACCESSIBLE_ALLOW_MANAGED_FALLBACK", "1");

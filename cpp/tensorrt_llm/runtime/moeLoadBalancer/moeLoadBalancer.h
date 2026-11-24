@@ -332,8 +332,8 @@ public:
     void abandonIterations();
 
     // should bind to python
-    // Check that no iteration runs or is queued and the online EPLB worker is done with the last one, so that the
-    // caller may write local slots.
+    // Check that no iteration runs or is queued and that abandonIterations ended the weight updates of the last one, so
+    // that the caller may read the placement and write local slots.
     void checkSlotsWritable();
 
     // Test interface to use GPU to do memcpy test functionality
@@ -350,8 +350,8 @@ private:
 
     void checkRecoveryCall(char const* action) const;
 
-    // Like checkRecoveryCall, and also check that no iteration is queued and the online EPLB worker is done with the
-    // last one. Call with mWorkerThreadMutex held.
+    // Like checkRecoveryCall, and also check that no iteration is queued and that abandonIterations ended the weight
+    // updates of the last one. Call with mWorkerThreadMutex held.
     void checkUpdatesEnded(char const* action) const;
 
     // worker thread is used to wait for gpu update done signal
@@ -363,6 +363,8 @@ private:
     // routing kernel, and the recovery calls (restorePlacement, abandonIterations, checkSlotsWritable) are allowed.
     bool mFaultTolerance = false;
     int64_t mWorkerDoneIterId = -1;
+    // The last iteration whose weight updates abandonIterations waited for; slots are writable while it is mIterId.
+    int64_t mUpdatesEndedIterId = -1;
     std::condition_variable mWorkerDoneCondition;
     std::atomic<bool> mAbandoning{false};
     bool mWorkerThreadStopped = true;
