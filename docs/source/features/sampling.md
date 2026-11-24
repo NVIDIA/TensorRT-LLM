@@ -187,7 +187,7 @@ modes.
     an occurrence workspace that is allocated up front. While the flag is off, a
     request that sets any of the three is rejected at admission rather than decoded
     without them. Tree speculation (a dynamic tree), relaxed acceptance for thinking and
-    SA are not supported and such requests are rejected even when the flag is on. Only the
+    suffix automaton are not supported and such requests are rejected even when the flag is on. Only the
     target distribution is penalized; the draft model proposes from its unpenalized
     distribution, which leaves the sampled result unchanged but can lower the
     acceptance rate as the penalty grows.
