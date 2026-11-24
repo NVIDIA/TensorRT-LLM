@@ -21,10 +21,11 @@ from collections.abc import Iterator
 from queue import Empty
 from threading import Thread
 from typing import Literal
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 import zmq
+from utils.spawn_process import SpawnProcessContext, spawn_process
 
 from tensorrt_llm.executor.ipc import ZeroMqQueue
 
@@ -56,6 +57,20 @@ def async_queue_pair(request: pytest.FixtureRequest) -> Iterator[tuple[ZeroMqQue
         for queue in (sender, receiver):
             queue.socket.setsockopt(zmq.LINGER, 0)
             queue.close()
+
+
+def _run_interruptible_send_timeout(context: SpawnProcessContext) -> None:
+    """Exercise a real no-peer send in a process the parent can kill."""
+    sender = ZeroMqQueue(socket_type=zmq.PUSH, is_server=True)
+    try:
+        with patch.object(sender, "_send_data", wraps=sender._send_data) as attempt:
+            context.send("ready")
+            with pytest.raises(RuntimeError, match="send cancelled during shutdown"):
+                sender.put_interruptible({"message": "no peer"}, lambda: attempt.called)
+            attempt.assert_called_once()
+    finally:
+        sender.close()
+    context.send("completed")
 
 
 class TestIpcBasics:
@@ -389,17 +404,12 @@ class TestIpcBasics:
         finally:
             sender.close()
 
-    def test_put_interruptible_rechecks_after_send_timeout(self, monkeypatch) -> None:
+    def test_put_interruptible_rechecks_after_send_timeout(self) -> None:
         """A real send timeout observes cancellation before retrying without a peer."""
-        sender = ZeroMqQueue(socket_type=zmq.PUSH, is_server=True)
-        attempt = Mock(wraps=sender._send_data)
-        monkeypatch.setattr(sender, "_send_data", attempt)
-        try:
-            with pytest.raises(RuntimeError, match="send cancelled during shutdown"):
-                sender.put_interruptible({"message": "no peer"}, lambda: attempt.called)
-            attempt.assert_called_once()
-        finally:
-            sender.close()
+        with spawn_process(_run_interruptible_send_timeout) as child:
+            child.receive("ready", timeout=60)
+            child.receive("completed", timeout=10)
+            assert child.wait(timeout=10) == 0
 
     @pytest.mark.parametrize(
         ("recv_timeout", "timeout_ms"), [(None, -1), (0, 0), (0.0001, 1), (0.0011, 2)]
