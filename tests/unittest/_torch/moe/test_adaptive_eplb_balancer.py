@@ -34,12 +34,6 @@ def cpu_ops(monkeypatch):
     monkeypatch.setattr(torch.ops.trtllm, "adaptive_eplb_record", reference.record, False)
 
 
-@pytest.fixture(autouse=True)
-def versions(monkeypatch):
-    """The cache key's driver and CUDA versions without NVML: no driver on a CPU node."""
-    monkeypatch.setattr(calibrate, "platform_versions", lambda: dict(driver="580", numpy="2"))
-
-
 def _balancer(ep_rank: int = 1, **fields) -> AdaptiveMoeLoadBalancer:
     config = MoeAdaptiveLoadBalancerConfig(num_slots=NUM_SLOTS, **fields)
     config.setup(ep_rank=ep_rank, ep_size=EP_SIZE)
@@ -211,6 +205,7 @@ def _prepare(monkeypatch, path=None, tokens=(8, 16), domain=(None, 1), others=()
     ``fake["config"]``; see the other ``fake`` keys below; the other ranks vote ``others`` unless
     ``fake["allgather"]`` does -> the balancer, its layer, what the start-up saw and the warnings."""
     monkeypatch.delenv("TRTLLM_CACHE_DIR", raising=False)
+    monkeypatch.setattr(calibrate, "platform_versions", lambda: dict(driver="580"))  # no NVML here
     mode = "file" if path else fake.get("mode", "auto")
     config = dict(time_model_file=path, time_model=mode, **fake.get("config", {}))
     balancer = _balancer(ep_rank=fake.get("rank", 0), **config)
@@ -646,6 +641,24 @@ def test_a_new_calibration_evicts_the_oldest_beyond_the_cache_entries(monkeypatc
     (second,) = tmp_path.glob("*[0-9a-f].json")
     left = [second, second.with_suffix(".times.json")]  # the first went with its times
     assert second != first and sorted(tmp_path.iterdir()) == left
+
+
+def test_an_unreadable_driver_version_calibrates_without_the_cache(monkeypatch, tmp_path):
+    timer = _timer()
+    monkeypatch.setattr(calibrate, "LiveTimer", timer)
+    config = dict(SMALL, calibration_cache_dir=str(tmp_path))
+    _prepare(monkeypatch, config=config)[0].before_capture()
+    cached = sorted(tmp_path.iterdir())
+
+    def no_nvml():
+        raise RuntimeError("NVML Shared Library Not Found")
+
+    balancer, _, seen, warnings = _prepare(monkeypatch, config=config)
+    monkeypatch.setattr(calibrate, "platform_versions", no_nvml)
+    balancer.before_capture()  # the cached calibration is not read: it may be another driver's
+    assert "start" in seen and balancer.off_reason is None and len(timer.made) == 2
+    assert sorted(tmp_path.iterdir()) == cached and len(warnings) == 1
+    assert "in memory only: the GPU driver version is unreadable" in warnings[0]
 
 
 def test_buckets_of_different_tiles_calibrate_and_price_each_at_its_own(monkeypatch, tmp_path):

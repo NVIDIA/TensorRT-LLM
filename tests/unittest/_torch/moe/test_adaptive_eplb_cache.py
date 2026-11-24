@@ -18,7 +18,6 @@ from tensorrt_llm.llmapi.llm_args import MoeAdaptiveLoadBalancerConfig
 pytestmark = pytest.mark.cpu_only
 
 IDENTITY = dict(device="GPU", ep_size=4, tactics={"8": "a"})
-PLATFORM_VERSIONS = calibrate.platform_versions  # the real one, whatever another module stubs
 
 
 @pytest.fixture
@@ -28,7 +27,6 @@ def key(monkeypatch, tmp_path):
     package = tmp_path / "tensorrt_llm"
     (package / "libs").mkdir(parents=True)
     monkeypatch.setattr(tensorrt_llm, "__file__", str(package / "__init__.py"))
-    monkeypatch.setattr(calibrate, "platform_versions", PLATFORM_VERSIONS)
     monkeypatch.setattr(pynvml, "nvmlInit", lambda: None)
     monkeypatch.setattr(pynvml, "nvmlShutdown", lambda: None)
     monkeypatch.setattr(pynvml, "nvmlSystemGetDriverVersion", lambda: b"580.178.04")
@@ -95,6 +93,19 @@ def test_eviction_keeps_the_newest_and_never_touches_another_file(tmp_path):
     gone = {p for e in old[:-2] for p in (e, e.with_suffix(".times.json"))}
     assert set(tmp_path.iterdir()) == everything - gone
     assert all(p.with_suffix(".times.json").exists() for p in kept + foreign[:1])
+
+
+def test_eviction_counts_times_without_their_calibration_by_their_own_write_time(tmp_path):
+    cal = {n: _entry(tmp_path, n) for n in range(1, 5)}
+    written = _entry(tmp_path, 0)
+    for n in (2, 4):  # no bucket held: the times stay alone
+        cal[n].unlink()
+    foreign = [tmp_path / f"{calibrate.digest(n)}.times.json" for n in ("list", "layout")]
+    foreign[0].write_text("[]")
+    foreign[1].write_text(json.dumps({"8": 1.0}))
+    assert calibrate.evict(written, 3) == []
+    left = [written, cal[3], *(p.with_suffix(".times.json") for p in (written, cal[3], cal[4]))]
+    assert sorted(tmp_path.iterdir()) == sorted(left + foreign)
 
 
 def test_eviction_tolerates_a_concurrent_delete_and_reports_a_failed_one(tmp_path, monkeypatch):

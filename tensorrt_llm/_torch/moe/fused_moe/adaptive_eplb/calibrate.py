@@ -65,19 +65,24 @@ def digest(value: object) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
 
-def cache_path(config: object, identity: dict) -> Path | None:
+def cache_path(config: object, identity: dict) -> Path | str:
     """The cache file of a run of ``identity``: ``calibration_cache_dir``, else ``adaptive_eplb``
-    under ``TRTLLM_CACHE_DIR``; None without either."""
+    under ``TRTLLM_CACHE_DIR``; or why the run has none: neither is set, or NVML cannot tell the
+    driver, without which the key could name another driver's calibration."""
     root = config.calibration_cache_dir or os.environ.get("TRTLLM_CACHE_DIR")
     if not root:
-        return None
+        return "no cache directory (calibration_cache_dir or TRTLLM_CACHE_DIR)"
+    try:
+        versions = platform_versions()
+    except Exception as error:  # noqa: BLE001 - uncached, the run still calibrates
+        return f"the GPU driver version is unreadable ({type(error).__name__}: {error})"
     key = dict(identity, settings=asdict(Settings.of(config)), schema=CALIBRATION)
     wheels = importlib.metadata.distributions(name="tensorrt_llm")  # the build: its source commit
     build = [u for w in wheels for u in w.metadata.get_all("Project-URL") or [] if "/commit/" in u]
     lib = Path(tensorrt_llm.__file__).parent / "libs" / "libth_common.so"  # and its kernels' bytes,
     build.append(file_sha256(lib) if lib.is_file() else None)  # also when replaced under one wheel
     fit = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()  # this measurement and its fit
-    key.update(trtllm_version=tensorrt_llm.__version__, build=build, fit=fit, **platform_versions())
+    key.update(trtllm_version=tensorrt_llm.__version__, build=build, fit=fit, **versions)
     folder = Path(os.path.expanduser(root))
     folder = folder if config.calibration_cache_dir else folder / "adaptive_eplb"
     return folder / f"{digest(key)}.json"
@@ -105,17 +110,17 @@ def platform_versions() -> dict:
     return dict(driver=driver, cuda=cuda, cuda_runtime=torch.version.cuda, numpy=np.__version__)
 
 
-def read_cache(path: Path | None) -> str | None:
+def read_cache(path: Path | str) -> str | None:
     try:
-        return None if path is None else path.read_text()
+        return path.read_text() if isinstance(path, Path) else None
     except OSError:
         return None
 
 
-def write_cache(path: Path | None, text: str) -> str | None:
+def write_cache(path: Path | str, text: str) -> str | None:
     """Write ``text`` at ``path``; why it stays in memory only, if it does."""
-    if path is None:
-        return "no cache directory (calibration_cache_dir or TRTLLM_CACHE_DIR)"
+    if isinstance(path, str):  # why the run has no cache file
+        return path
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         part = path.with_name(f"{path.name}.{os.getpid()}.tmp")
@@ -128,26 +133,34 @@ def write_cache(path: Path | None, text: str) -> str | None:
 
 def evict(written: Path, keep: int) -> list[str]:
     """Delete all but the ``keep`` newest calibrations beside ``written`` (by write time; never
-    ``written``), each with its ``.times.json`` first; 0 keeps all. Only ``<sha256>.json`` files of
-    this schema count, so a shared directory keeps everything else; a file another process deleted
-    first is no failure. Why a file stayed, never an exception: a failure here loses only space."""
+    ``written``), each with its ``.times.json`` first; 0 keeps all. A ``.times.json`` without its
+    calibration (no bucket held) is an entry of its own. Only ``<sha256>.json`` files of this schema
+    and times of its layout count, so a shared directory keeps everything else; a file another
+    process deleted first is no failure. Why a file stayed, never an exception: it loses only space."""
     if keep <= 0:
         return []
     entries, failed = [], []
     try:
         for path in written.parent.glob("*.json"):
-            if path == written or not re.fullmatch(r"[0-9a-f]{64}\.json", path.name):
+            name = re.fullmatch(r"([0-9a-f]{64})(\.times)?\.json", path.name)
+            times = bool(name and name[2])  # alone: one beside its calibration goes with it
+            if not name or path == written or times and path.with_name(f"{name[1]}.json").exists():
                 continue
             try:
                 doc = json.loads(path.read_text())
-                if isinstance(doc, dict) and doc.get("schema") == CALIBRATION[0]:
-                    entries.append((path.stat().st_mtime_ns, path.name, path))
-            except (OSError, ValueError):  # gone, or not a calibration
+                rows = doc.values() if times and isinstance(doc, dict) else [doc]
+                if all(
+                    isinstance(r, dict)
+                    and ("us" in r if times else r.get("schema") == CALIBRATION[0])
+                    for r in rows
+                ):
+                    entries.append((path.stat().st_mtime_ns, path.name, path, not times))
+            except (OSError, ValueError):  # gone, or not ours
                 continue
     except OSError as error:
         return [f"{written.parent} ({type(error).__name__}: {error})"]
-    for *_, path in sorted(entries, reverse=True)[keep - 1 :]:
-        for part in (path.with_suffix(".times.json"), path):
+    for *_, path, whole in sorted(entries, reverse=True)[keep - 1 :]:
+        for part in (path.with_suffix(".times.json"), path) if whole else (path,):
             try:
                 part.unlink()
             except FileNotFoundError:

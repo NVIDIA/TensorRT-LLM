@@ -658,7 +658,7 @@ class AdaptiveMoeLoadBalancer(BaseMoeLoadBalancer):
                 gather=self.transport.allgather,
                 settings=calibrate.Settings.of(self.config),
             )
-            if times and path is not None and self.ep_rank == 0:  # the designs' times, to replay
+            if times and isinstance(path, Path) and self.ep_rank == 0:  # the times, to replay
                 calibrate.write_cache(path.with_suffix(".times.json"), json.dumps(times))
             for b in json.loads(text)["buckets"] if text and self.ep_rank == 0 else ():
                 keys = ("scale", "se", "holdout_z", "rmse_us", "median_us", "designs", "held")
