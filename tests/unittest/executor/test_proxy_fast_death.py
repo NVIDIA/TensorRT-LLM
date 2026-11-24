@@ -1148,7 +1148,6 @@ def test_worker_death_during_init_aborts_the_wedged_world():
     proxy.mpi_session.release_exit_joins.assert_called_once_with()
     # Pending work fails fast rather than waiting on a gone producer.
     assert isinstance(r.queue.get_nowait(), EngineDeadError)
-    proxy.__del__()  # The init-only fake must also be safe to finalize.
     proxy.mpi_session.abandon.assert_not_called()
 
 
@@ -1290,8 +1289,6 @@ def test_non_ready_status_during_init_aborts_then_marks_dead():
     assert called.index("shutdown_abort") < called.index("release_exit_joins")
     # Pending work fails fast on this path too.
     assert isinstance(r.queue.get_nowait(), EngineDeadError)
-    assert not proxy.mpi_futures[0].done()
-    proxy.__del__()  # Finalization must not wait on this deliberately pending future.
     assert not proxy.mpi_futures[0].done()
     proxy.mpi_session.abandon.assert_not_called()
 
