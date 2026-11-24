@@ -35,7 +35,7 @@ TensorRT-LLM has all the essential capabilities to serve as the rollout engine i
 
 In MLPerf Training v6.1, MLCommons added a new benchmark: Qwen3.5-397B, a large-scale LLM post-training workload and the first of its kind in MLPerf Training. Post-training underpins much of the recent progress in agentic AI. In this benchmark, [Qwen3.5-397B-A17B](https://huggingface.co/Qwen/Qwen3.5-397B-A17B), an MoE model with 17B active parameters per token that combines Gated DeltaNet linear-attention layers with full-attention layers, is trained with Group Relative Policy Optimization (GRPO) to solve software engineering tasks. The score of this benchmark is the time to train to a target accuracy, excluding validation time.
 
-In large-scale RL training, rollout is often the bottleneck: the throughput of the rollout engine sets the pace for the end-to-end time to train. At the same scale of `56` accelerators, **NVIDIA Vera Rubin with NeMo RL and TensorRT-LLM ranks first at `28.466` minutes** ([our submission](https://results.mlcommons.org/training#view=submission&benchmark=qwen35_397b_grpo&rid=6.1-0119%3Aqwen35_397b_grpo), Figure 1). On the same Vera Rubin hardware, TensorRT-LLM generated the rollouts for the fastest results: **`24.82` minutes at `64` GPUs** (a [Nebius submission](https://results.mlcommons.org/training#view=submission&benchmark=qwen35_397b_grpo&rid=6.1-0135%3Aqwen35_397b_grpo), also using NeMo RL and TensorRT-LLM), about `30%` faster than the next-best result with a different rollout engine, and **`10.44` minutes at `1,024` GPUs**, about `5%` faster (Figure 2). See all submission results in the [MLPerf Training v6.1 results](https://results.mlcommons.org/training#benchmark=qwen35_397b_grpo&round=v6.1).
+In large-scale RL training, rollout is often the bottleneck: the throughput of the rollout engine sets the pace for the end-to-end time to train. At the same scale of `56` accelerators, **NVIDIA Vera Rubin with NeMo RL and TensorRT-LLM ranks first at `28.466` minutes** ([our submission](https://results.mlcommons.org/training#view=submission&benchmark=qwen35_397b_grpo&rid=6.1-0119%3Aqwen35_397b_grpo), Figure 1), compared to submissions on NVIDIA GB300 and GB200 GPUs. On NVIDIA Vera Rubin, **submissions that use TensorRT-LLM as the rollout engine rank first at `56`, `64` and `1,024` GPUs**. For example, a Nebius submission ([6.1-0135](https://results.mlcommons.org/training#view=submission&benchmark=qwen35_397b_grpo&rid=6.1-0135%3Aqwen35_397b_grpo)) using NeMo RL and TensorRT-LLM reached `24.82` minutes at `64` GPUs (Figure 2).
 
 <div align="center">
 <figure>
@@ -46,11 +46,11 @@ In large-scale RL training, rollout is often the bottleneck: the throughput of t
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog34_mlperf_rollout_engines.png" alt="Bar chart of Qwen3.5 397B GRPO time to train on NVIDIA Vera Rubin in MLPerf Training v6.1, showing the fastest result per rollout engine at 56, 64 and 1,024 GPUs. TensorRT-LLM results are green and vLLM results are gray. The fastest is 10.44 minutes at 1,024 GPUs." width="1000">
+  <img src="../media/tech_blog34_mlperf_rollout_engines.png" alt="Bar chart of Qwen3.5 397B GRPO time to train on NVIDIA Vera Rubin in MLPerf Training v6.1, showing the fastest result per rollout engine at 56, 64 and 1,024 GPUs. TensorRT-LLM results are green and results with another rollout engine are gray. The fastest is 10.44 minutes at 1,024 GPUs." width="1000">
 </figure>
 </div>
 
-<p align="center"><sub><em>Figure 2: Time to train on the same NVIDIA Vera Rubin hardware with different rollout engines in the Qwen3.5 397B GRPO benchmark, grouped by accelerator count, showing the fastest result for each rollout engine. See all submission results for the GRPO track in the <a href="https://results.mlcommons.org/training#benchmark=qwen35_397b_grpo&amp;round=v6.1">MLPerf Training v6.1 results</a>.</em></sub></p>
+<p align="center"><sub><em>Figure 2: Time to train on NVIDIA Vera Rubin GPUs with different rollout engines in the Qwen3.5 397B GRPO benchmark, grouped by accelerator count (56, 64 and 1,024 GPUs), showing the fastest result for each rollout engine. Gray bars are other NVIDIA submissions that also use NeMo RL with a different rollout engine. See all submission results for the GRPO track in the <a href="https://results.mlcommons.org/training#benchmark=qwen35_397b_grpo&amp;round=v6.1">MLPerf Training v6.1 results</a>.</em></sub></p>
 
 ## Inference in RL: A Different Optimization Problem
 
