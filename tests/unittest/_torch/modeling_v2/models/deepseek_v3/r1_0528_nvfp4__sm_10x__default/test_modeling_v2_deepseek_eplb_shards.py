@@ -39,7 +39,33 @@ from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig
 
 pytestmark = pytest.mark.cpu_only
 
+
+@pytest.fixture(autouse=True)
+def _one_torch_thread():
+    """These checks run many small tensor ops: one torch thread a process keeps them from
+    contending with the other test processes of a shared CPU node."""
+    saved = torch.get_num_threads()
+    torch.set_num_threads(1)
+    yield
+    torch.set_num_threads(saved)
+
+
 _EPLB_LAYOUTS = sorted(routing._EPLB_LAYOUTS)
+
+
+def _load_cases() -> list:
+    """The (layout, mtp) cases of the load checks. Up to dep8 every layout with and without
+    the MTP layer; at wide EP, dep16 (the first alltoall layout) and dep36 (the EPLB-only
+    one) with the MTP layer, which loads the trunk's layers as well. Dep32 splits its slots
+    the way dep36 does, and every layout's slot windows are checked above."""
+    cases = []
+    for layout in _EPLB_LAYOUTS:
+        ws = layout[0]
+        if ws <= 8:
+            cases += [pytest.param(layout, False, id=f"{_layout_id(layout)}-no_mtp")]
+        if ws <= 8 or ws in (16, 36):
+            cases += [pytest.param(layout, True, id=f"{_layout_id(layout)}-mtp")]
+    return cases
 
 
 def _placement(layer: int, num_experts: int, ep_size: int, spare: int) -> list[int]:
@@ -108,8 +134,7 @@ def test_eplb_slots_hold_the_placed_experts(layout):
     assert all(experts == set(range(cfg.n_routed_experts)) for experts in held.values())
 
 
-@pytest.mark.parametrize("mtp", [False, True], ids=["no_mtp", "mtp"])
-@pytest.mark.parametrize("layout", _EPLB_LAYOUTS, ids=_layout_id)
+@pytest.mark.parametrize("layout, mtp", _load_cases())
 def test_eplb_load_fills_every_slot_with_its_expert(layout, mtp, monkeypatch):
     """`load` under static EPLB: coverage holds both ways, a rank reads each expert's
     tensors once per slot that holds it and no expert it does not hold, and every slot
@@ -182,8 +207,7 @@ class _Hosting:
                 assert self.copies[(name, e)].shape == slot_weight.shape[1:], (name, e)
 
 
-@pytest.mark.parametrize("mtp", [False, True], ids=["no_mtp", "mtp"])
-@pytest.mark.parametrize("layout", _EPLB_LAYOUTS, ids=_layout_id)
+@pytest.mark.parametrize("layout, mtp", _load_cases())
 def test_online_eplb_load_hands_over_this_ranks_experts(layout, mtp, monkeypatch):
     """`load` under online EPLB, with the ranks on one node: each rank hands each routed
     layer's balancer handle every slot weight of its share of the experts -- each one what

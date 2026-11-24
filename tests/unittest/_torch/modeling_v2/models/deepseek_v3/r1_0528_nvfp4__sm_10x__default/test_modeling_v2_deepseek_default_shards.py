@@ -51,6 +51,16 @@ from tensorrt_llm.mapping import Mapping
 pytestmark = pytest.mark.cpu_only
 
 
+@pytest.fixture(autouse=True)
+def _one_torch_thread():
+    """These checks run many small tensor ops: one torch thread a process keeps them from
+    contending with the other test processes of a shared CPU node."""
+    saved = torch.get_num_threads()
+    torch.set_num_threads(1)
+    yield
+    torch.set_num_threads(saved)
+
+
 _LAYOUTS = sorted(routing._DEFAULT_LAYOUTS)
 # The MTP layouts that run without EPLB; dep36 runs only as EPLB slots.
 _MTP_LAYOUTS = sorted(routing._MTP_LAYOUTS & routing._DEFAULT_LAYOUTS)
