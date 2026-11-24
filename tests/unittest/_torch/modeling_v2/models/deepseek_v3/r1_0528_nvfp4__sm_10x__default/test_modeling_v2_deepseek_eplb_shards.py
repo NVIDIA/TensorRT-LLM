@@ -25,6 +25,7 @@ from test_modeling_v2_deepseek_default_shards import (
     _default_core,
     _layout_id,
     _mapping,
+    _ranks,
     _tiny,
     _tiny_keys,
 )
@@ -120,7 +121,7 @@ def test_eplb_load_fills_every_slot_with_its_expert(layout, mtp, monkeypatch):
     keys = _tiny_keys(cfg)
     oracle = _default_core(_WS1, 0, cfg, mtp)
     oracle.manifest = D.MODEL_WEIGHTS.manifest(oracle)
-    for rank in range(layout[0]):
+    for rank in _ranks(layout[0]):
         core, assignments = _eplb_core(layout, rank, cfg, mtp)
         d = core.dims
         core.w = D.MODEL_WEIGHTS.declare(d)
@@ -195,7 +196,7 @@ def test_online_eplb_load_hands_over_this_ranks_experts(layout, mtp, monkeypatch
     oracle = _default_core(_WS1, 0, cfg, mtp)
     oracle.manifest = D.MODEL_WEIGHTS.manifest(oracle)
     experts, ranks = cfg.n_routed_experts, layout[0]
-    for rank in range(ranks):
+    for rank in _ranks(ranks):
         core, assignments = _eplb_core(layout, rank, cfg, mtp, updates=2)
         d = core.dims
         assert d.eplb == "online"

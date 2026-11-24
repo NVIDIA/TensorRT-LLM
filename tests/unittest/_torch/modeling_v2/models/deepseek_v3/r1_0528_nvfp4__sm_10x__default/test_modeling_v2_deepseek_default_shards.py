@@ -74,6 +74,13 @@ _ATTN_LAYOUTS = _first_per(lambda lay: 1 if lay[1] else lay[0])
 _EXPERT_LAYOUTS = _first_per(lambda lay: (lay[2], lay[3]))
 
 
+def _ranks(ws: int) -> list[int]:
+    """The ranks a per-rank check visits: all of them up to eight, else the first two, the
+    middle and the last. Every rank's window is the same size, so these cover the first and
+    last window and a neighbour's offset."""
+    return list(range(ws)) if ws <= 8 else sorted({0, 1, ws // 2, ws - 1})
+
+
 def _layout_id(layout) -> str:
     ws, dp, mt, me = layout
     return f"ws{ws}-{'dp' if dp else 'tp'}-moetp{mt}-moeep{me}"
@@ -370,7 +377,7 @@ def test_attention_operands_are_the_ws1_operands_of_the_rank_share(layout, mtp):
     layer = cfg.num_hidden_layers if mtp else 0
     prefix = f"model.layers.{layer}.self_attn"
     qs, os_ = [], []
-    for rank in range(layout[0]):
+    for rank in _ranks(layout[0]):
         core = _default_core(layout, rank, cfg, mtp)
         d = core.dims
         if rank >= d.attn_tp:
@@ -418,7 +425,7 @@ def test_mlp_operands_are_the_ws1_operands_of_the_rank_share(layout, family):
     and the cut is all that is read."""
     cfg = _cfg(hidden_size=256)
     layer = 0 if family == "dense" else cfg.first_k_dense_replace
-    for rank in range(layout[0]):
+    for rank in _ranks(layout[0]):
         core = _default_core(layout, rank, cfg)
         d = core.dims
         ckpt = _Checkpoint(cfg)
@@ -452,7 +459,7 @@ def test_expert_operands_are_the_ws1_operands_of_the_rank_share(layout):
     the cut is all that is read."""
     cfg = _cfg(hidden_size=256)
     layer = cfg.first_k_dense_replace
-    for rank in range(layout[0]):
+    for rank in _ranks(layout[0]):
         core = _default_core(layout, rank, cfg)
         d = core.dims
         share = _cfg(hidden_size=256, moe_intermediate_size=d.moe_inter)
@@ -482,7 +489,7 @@ def test_mtp_shared_expert_is_the_ws1_one_of_the_rank_share(layout):
     the trunk's NVFP4 one: gate and up rows, down columns, one value an element."""
     cfg = _cfg(hidden_size=256)
     layer = cfg.num_hidden_layers
-    for rank in range(layout[0]):
+    for rank in _ranks(layout[0]):
         core = _default_core(layout, rank, cfg, mtp=True)
         d = core.dims
         ckpt = _Checkpoint(cfg)
@@ -506,7 +513,7 @@ def test_mtp_expert_operands_are_the_ws1_operands_of_the_rank_share(layout):
     as the trunk's: `[up ; gate]` rows of the slice for FC1, its columns for FC2."""
     cfg = _cfg(hidden_size=256)
     layer = cfg.num_hidden_layers
-    for rank in range(layout[0]):
+    for rank in _ranks(layout[0]):
         core = _default_core(layout, rank, cfg, mtp=True)
         d = core.dims
         share = _cfg(hidden_size=256, moe_intermediate_size=d.moe_inter)
@@ -538,7 +545,7 @@ def test_mtp_own_weights_are_replicated(layout):
     cfg = _cfg(hidden_size=256)
     layer = cfg.num_hidden_layers
     q = f"model.layers.{layer}"
-    for rank in range(layout[0]):
+    for rank in _ranks(layout[0]):
         core = _default_core(layout, rank, cfg, mtp=True)
         ckpt = _Checkpoint(cfg)
         for name, key in (
@@ -703,7 +710,7 @@ def test_load_reads_only_the_rank_share(layout, mtp, monkeypatch):
     cfg = _tiny(layout)
     keys = _tiny_keys(cfg)
     mtp_prefix = f"model.layers.{cfg.num_hidden_layers}."
-    for rank in range(layout[0]):
+    for rank in _ranks(layout[0]):
         core = _default_core(layout, rank, cfg, mtp)
         d = core.dims
         core.w = D.MODEL_WEIGHTS.declare(d)
