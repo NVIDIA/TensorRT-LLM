@@ -31,7 +31,7 @@ from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
 from tensorrt_llm._torch.moe.workspace import CutlassWorkspaceReclaimer
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
-from tensorrt_llm._torch.pyexecutor import h2d_cache, step_inputs
+from tensorrt_llm._torch.pyexecutor import device_copy, h2d_cache, step_inputs
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import BreakableCUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.context_logits_plan import ContextLogitsPlan
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
@@ -40,6 +40,7 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     DSparkCUDAGraphRunner,
     KeyType,
 )
+from tensorrt_llm._torch.pyexecutor.device_copy import CopyPlan, DeviceCopier, copy_plan_of
 from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
 from tensorrt_llm._torch.pyexecutor.h2d_cache import H2DSkipCache
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
@@ -157,6 +158,19 @@ class PrefillCompiledModel(torch.nn.Module):
             return getattr(super().__getattr__("eager_model"), name)
 
 
+def check_one_copy_path(model: object, plan: CopyPlan, hooks: RuntimeHooks) -> None:
+    """Refuse a model that declares a copy plan and also turns on the step-input pack or the skip cache.
+
+    The two paths coexist across models, not within one: a model moves its step's copies to the copy plan as a whole.
+    """
+    if plan and (hooks.pack_step_inputs or hooks.skip_unchanged_h2d):
+        raise ValueError(
+            f"{type(model).__name__} declares a copy plan and also turns on the step-input pack or the skip cache "
+            "(RuntimeHooks.pack_step_inputs / skip_unchanged_h2d); a model moves its step's copies to the copy plan "
+            "as a whole"
+        )
+
+
 class DecoderRunner(ScheduledModelRunner):
     """Run scheduled decoder generation with its own buffers, graphs and metadata."""
 
@@ -165,6 +179,10 @@ class DecoderRunner(ScheduledModelRunner):
     # This engine's skip cache and step-input pack (None: the hook is off), active only during its own forward.
     _h2d_cache: H2DSkipCache | None = None
     _step_pack: StepInputPack | None = None
+    # The copy plan the model declares (device_copy); empty by default, and then the engine has no copier.
+    copy_plan: CopyPlan = CopyPlan()
+    # This engine's copier (None: an empty plan), active only during its own forward.
+    _copier: DeviceCopier | None = None
     # Whether a batch may keep the greedy tokens a forward sampled in place of the logits. False when the executor
     # runs a guided decoder, which reads the logits of every batch.
     keep_greedy_only_outputs = True
@@ -250,6 +268,26 @@ class DecoderRunner(ScheduledModelRunner):
             )
         if self._h2d_cache is not None and self._h2d_cache.changed_span:
             logger.info("[M3 host] changed metadata uploads stage only each row's changed span")
+        self.copy_plan = copy_plan_of(model)
+        check_one_copy_path(model, self.copy_plan, self.runtime_hooks)
+        self._copier = (
+            DeviceCopier(self.copy_plan, torch.device("cuda", torch.cuda.current_device()))
+            if self.copy_plan
+            else None
+        )
+        if self._copier is not None:
+            final = self.copy_plan.final_flush
+            logger.info(
+                f"[device copy] {len(self.copy_plan.merge)} merged sites, "
+                f"{len(self.copy_plan.flush_after)} barriers, "
+                f"parallel scatter {self.copy_plan.parallel_scatter}, final flush "
+                + (
+                    "eager"
+                    if final is None
+                    else f"in graph (early copy {final.early_copy}, "
+                    f"one-launch prologue {final.prologue_op is not None}, step epoch {final.step_epoch})"
+                )
+            )
         # Heads that can project context logits eagerly; the model is fixed.
         self._context_logits_heads = context_logits_heads(
             model, mapping, is_spec_decode=config.is_spec_decode
@@ -332,7 +370,10 @@ class DecoderRunner(ScheduledModelRunner):
         self, mm_item_scheduler: MultimodalItemScheduler | None
     ) -> DecoderInputPreparer:
         """Build the input preparer over this runner's buffers."""
-        return DecoderInputPreparer(**self._input_preparer_kwargs(mm_item_scheduler))
+        return DecoderInputPreparer(
+            **self._input_preparer_kwargs(mm_item_scheduler),
+            attention_runtime_features=self._attention_runtime_features,
+        )
 
     def _make_cuda_graphs(self) -> DecoderCudaGraphs:
         """Build the CUDA graph component; call after the input preparer."""
@@ -427,7 +468,11 @@ class DecoderRunner(ScheduledModelRunner):
         resource_manager: ResourceManager,
         is_dummy: bool = False,
     ) -> Any:
-        with h2d_cache.active(self._h2d_cache), step_inputs.active(self._step_pack):
+        with (
+            h2d_cache.active(self._h2d_cache),
+            step_inputs.active(self._step_pack),
+            device_copy.active(self._copier),
+        ):
             try:
                 return self._forward_decoder(inputs, resource_manager, is_dummy=is_dummy)
             except BaseException:
@@ -435,6 +480,9 @@ class DecoderRunner(ScheduledModelRunner):
                 step_inputs.discard()
                 if self._h2d_cache is not None:
                     self._h2d_cache.clear()
+                # The copy plan's pack likewise: discarding it runs the staged copies' on_drop callbacks, so the
+                # buffer owners forget the records they made for them.
+                device_copy.discard()
                 raise
 
     def _initialize_moe_workspace_reclaimer(self) -> None:
@@ -455,6 +503,8 @@ class DecoderRunner(ScheduledModelRunner):
         self._eager_workspace_reclaimer = self._warmup.run(resource_manager)
 
     def release_graphs(self, *, release_nccl_window_owners: bool = True) -> None:
+        if self._host_uploader is not None:
+            self._host_uploader.synchronize()
         self._graphs.release(release_nccl_window_owners=release_nccl_window_owners)
 
     def wait_for_input_copy(self) -> None:
@@ -516,6 +566,7 @@ class DecoderRunner(ScheduledModelRunner):
         return cuda_graph_runner
 
     def _cuda_graph_runner_config(self) -> CUDAGraphRunnerConfig:
+        sampling_variants = getattr(self._config.cuda_graph_config, "sampling_variants", None)
         return CUDAGraphRunnerConfig(
             use_cuda_graph=self._config.cuda_graph_config is not None,
             cuda_graph_padding_enabled=self._config.cuda_graph_padding_enabled,
@@ -537,7 +588,9 @@ class DecoderRunner(ScheduledModelRunner):
             private_metadata_buffers=self.runtime_hooks.skips_unchanged_metadata_uploads,
             prioritize_decode_graphs=self.runtime_hooks.prioritize_decode_graphs,
             stage_decode_inputs=self.runtime_hooks.stage_decode_inputs,
+            skip_adp_count_gather=self.runtime_hooks.skip_adp_count_gather,
             enable_in_graph_sampling=self._config.enable_in_graph_sampling,
+            sampling_variants=None if sampling_variants is None else frozenset(sampling_variants),
             # Speculative steps rewrite every input token and position, so
             # captured graphs can read the persistent buffers directly.
             static_input_ids=(
@@ -697,7 +750,7 @@ class DecoderRunner(ScheduledModelRunner):
         # through the padding exchange (sync_group_all_greedy_sample).
         sampling_mode = None
         if samples_from_adp_head_shards(spec_metadata, self._mapping):
-            sampling_mode = one_model_sampling_mode(graph_requests.all_requests())
+            sampling_mode = one_model_sampling_mode(graph_requests.all_requests(), spec_metadata)
         with self._graphs.pad_batch(
             graph_requests, resource_manager, runtime_draft_len, sampling_mode=sampling_mode
         ) as padded_graph_requests:
@@ -754,6 +807,13 @@ class DecoderRunner(ScheduledModelRunner):
                 and context_plan is None
                 and not (ced_enabled and scheduled_requests.num_context_requests > 0)
             )
+            if (
+                key is None
+                and not is_dummy
+                and spec_metadata is not None
+                and scheduled_requests.num_context_requests == 0
+            ):
+                self._graphs.warn_uncaptured_sampling_variant(spec_metadata)
             if can_run_graph:
                 attn_metadata = selection.attn_metadata
                 spec_metadata = selection.spec_metadata
@@ -804,6 +864,15 @@ class DecoderRunner(ScheduledModelRunner):
                 and not self.cuda_graph_runner.needs_capture(key)
             ):
                 step_inputs.begin()
+            # The copy plan's pack, under the same condition, for a model that declares a plan.
+            if (
+                self._copier is not None
+                and self._copier.merges
+                and can_run_graph
+                and not self.cuda_graph_runner.is_warmup_only
+                and not self.cuda_graph_runner.needs_capture(key)
+            ):
+                device_copy.begin()
             with self._cuda_graph_metadata_prepare_scope(
                 attn_metadata,
                 key,
@@ -895,6 +964,7 @@ class DecoderRunner(ScheduledModelRunner):
                 )
             # No-op unless a pack was opened above and the replay did not issue it.
             step_inputs.flush()
+            device_copy.flush()
             if context_plan is not None and context_plan.handled:
                 outputs = dict(outputs) if isinstance(outputs, dict) else {"logits": outputs}
                 outputs["context_logits_handled"] = True
@@ -954,8 +1024,14 @@ class DecoderRunner(ScheduledModelRunner):
         is_dummy: bool,
         gather_context_logits: bool = False,
     ) -> dict[str, Any]:
+        # Lets a model start work that reads only graph inputs beside the input corrections.
         inputs = self._inputs.preprocess_inputs(
-            inputs, enable_spec_decode=enable_spec_decode, runtime_draft_len=runtime_draft_len
+            inputs,
+            enable_spec_decode=enable_spec_decode,
+            runtime_draft_len=runtime_draft_len,
+            mark_prologue_start=getattr(
+                getattr(self._model, "model", None), "mark_prologue_start", None
+            ),
         )
         spec_metadata = inputs.get("spec_metadata")
         gather_ids = spec_metadata.gather_ids if spec_metadata is not None else None
@@ -1116,23 +1192,24 @@ class DecoderRunner(ScheduledModelRunner):
             # logits instead whenever a request needed them.
             return
 
-        if outputs.get("logits_vocab_shard", False):
+        vocab_shard = outputs.get("logits_vocab_shard", False)
+        if vocab_shard and self._mapping.enable_attention_dp:
+            raise RuntimeError(
+                "vocabulary-sharded spec-worker logits need every TP rank "
+                "to schedule the same requests, which attention DP does "
+                "not"
+            )
+        if not any(
+            getattr(request, "py_logits_post_processors", None)
+            for request in scheduled_requests.all_requests()
+        ):
+            return
+
+        if vocab_shard:
             # The spec worker kept the logits vocabulary-sharded (this TP
             # rank's columns). A post-processor sees the whole vocabulary, so
             # gather them first, only when a request has one. Every TP rank
-            # schedules the same requests, so all of them take the gather;
-            # under attention DP they would not.
-            if self._mapping.enable_attention_dp:
-                raise RuntimeError(
-                    "vocabulary-sharded spec-worker logits need every TP rank "
-                    "to schedule the same requests, which attention DP does "
-                    "not"
-                )
-            if not any(
-                getattr(request, "py_logits_post_processors", None)
-                for request in scheduled_requests.all_requests()
-            ):
-                return
+            # schedules the same requests, so all of them take the gather.
             from tensorrt_llm._torch.distributed import allgather
 
             logits_tensor = allgather(logits_tensor, self._mapping, dim=-1).float()

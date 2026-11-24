@@ -26,7 +26,7 @@ import cuda.bindings.driver as cuda_drv
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.qsa_paged_kv_store import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_paged_kv_store import (  # noqa: E501
     qsa_paged_kv_store as op,
 )
 

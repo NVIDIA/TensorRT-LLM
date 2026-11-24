@@ -19,6 +19,7 @@ from typing import Optional
 
 from cutlass.experimental import primitives as prims
 
+from ....task_compat import RESOURCE_INIT_TAKES_CAPTURED_SCHEDULE
 from ...helpers.constants import LN_2, LOG2_E
 
 import cutlass
@@ -245,7 +246,10 @@ class TmemCorrResource(MlaResource):
         captured_schedule: cutlass.Constexpr[bool] = False,
     ) -> None:
         """Initialize correction/store SMEM views outside captured task bodies."""
-        super().initialize_runtime_state_internal(context, captured_schedule)
+        if cutlass.const_expr(RESOURCE_INIT_TAKES_CAPTURED_SCHEDULE):
+            super().initialize_runtime_state_internal(context, captured_schedule)
+        else:
+            super().initialize_runtime_state_internal(context)
         # cluster state is initialized explicitly by the kernel entry before the
         # cluster rendezvous.  This guarantees that every remote transaction
         # barrier is live before any peer can publish a partial.  Non-cluster
@@ -1300,6 +1304,7 @@ class TmemCorrResource(MlaResource):
             cta_idx_q_for_stage(self.cta_idx_q, stage_info),
             self.cu_seqlens_q,
             batch,
+            cp_rank=self.cp_rank,
         )
         tile = global_kv_tile_idx(
             cfg, local_tile, length, cta_idx_kv_for_stage(self.cta_idx_kv, stage_info)

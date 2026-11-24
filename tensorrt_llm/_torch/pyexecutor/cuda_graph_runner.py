@@ -6,11 +6,11 @@ import contextlib
 import os
 from dataclasses import dataclass, field
 from typing import (Any, Callable, Dict, Iterator, List, NamedTuple, Optional,
-                    Tuple, TypeAlias)
+                    Sequence, Tuple, TypeAlias)
 
 import torch
 
-from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm._utils import prefer_pinned, wait_event
 from tensorrt_llm.llmapi.llm_args import (BaseSparseAttentionConfig,
                                           DecodingBaseConfig,
                                           EncodeExtraInputSpec,
@@ -18,6 +18,7 @@ from tensorrt_llm.llmapi.llm_args import (BaseSparseAttentionConfig,
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
+from ..attention.backends.interface import GraphVariant
 from ..attention.backends.trtllm import TrtllmAttentionMetadata
 from ..distributed import Distributed
 from ..hostfunc import HOSTFUNC_USER_DATA_HANDLES, record_hostfunc_graph_replay
@@ -31,7 +32,8 @@ from ..speculative.interface import SpecMetadata
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.utils import get_draft_kv_cache_manager
 from ..utils import decode_stream_priority, make_weak_ref, piecewise_cuda_graph
-from . import step_inputs
+from . import device_copy, step_inputs
+from .device_copy import CopySite
 from .llm_request import LlmRequest, get_draft_token_length
 from .replay_inputs import stage_replay_inputs
 from .resource_manager import (BaseResourceManager, NoFreeSlotsError,
@@ -153,38 +155,20 @@ class KeyType(NamedTuple):
     # Total submitted verifier tokens for a ragged generation graph. ``None``
     # retains the existing uniform graph family.
     ragged_verify_bucket: Optional[int] = None
-    # Ceiling (tokens) of the KV regime the graph was captured for, when the
-    # runner keys its decode graphs by the step's longest live KV so the FP4
-    # MLA decode dispatcher decides on it. ``None`` keeps one KV family.
-    kv_regime: Optional[int] = None
-    # Split decision of the FP4 MLA packed decode the graph was captured for,
-    # when the runner keys its decode graphs by it: True launches the KV split
-    # budget, False one task per request. ``None`` keeps one family.
-    packed_split: Optional[bool] = None
+    # Values of the graph variants the decode graphs are keyed by, one per
+    # registered GraphVariant in registration order; empty keeps one family.
+    variants: Tuple[int, ...] = ()
 
 
-def _largest_kv_regime(regimes) -> Optional[int]:
-    """The largest KV regime among the ranks' (None entries ignored); None when no rank keys by regime."""
-    known = [regime for regime in regimes if regime is not None]
-    return max(known) if known else None
-
-
-def _agreed_packed_split(decisions) -> Optional[bool]:
-    """True when any rank's step splits, so every rank replays the split graph; None when no rank keys by it."""
-    known = [decision for decision in decisions if decision is not None]
-    return any(known) if known else None
-
-
-class PackedSplitResolver(NamedTuple):
-    """Split decisions of the FP4 MLA packed decode that decode graphs are keyed by.
-
-    ``variants(batch_size, draft_len)`` lists the decisions the graphs of a
-    shape are captured for (``packed_plan.packed_split_variants``);
-    ``decide(batch_size, draft_len, kv_lens)`` is a step's decision from its
-    per-request KV lengths (``packed_plan.packed_split_needed``).
-    """
-    variants: Callable[[int, int], Tuple[bool, ...]]
-    decide: Callable[[int, int, List[int]], bool]
+def sampling_variant(spec_metadata: Optional[SpecMetadata]) -> str:
+    """The one-engine sampling variant of a batch, as cuda_graph_config.sampling_variants names it."""
+    if getattr(spec_metadata, "is_all_greedy_sample", True):
+        return "greedy"
+    # The one-engine fast paths' flag, or the vocabulary-shard sampler's.
+    if (getattr(spec_metadata, "temperature_only", False)
+            or spec_metadata.is_all_temperature_only):
+        return "temperature_only"
+    return "advanced"
 
 
 def _save_spec_decode_capture_state(
@@ -270,8 +254,13 @@ class CUDAGraphRunnerConfig:
     # Write a replay's input ids and positions in one launch
     # (RuntimeHooks.stage_decode_inputs).
     stage_decode_inputs: bool = False
+    # Agree on a captured graph to replay in the attention-DP shape exchange
+    # (RuntimeHooks.skip_adp_count_gather).
+    skip_adp_count_gather: bool = False
     enable_encoder_decoder_mixed_cuda_graph: bool = False
     enable_in_graph_sampling: bool = False
+    # One-engine sampling variants that have graphs (cuda_graph_config.sampling_variants); None for all.
+    sampling_variants: Optional[frozenset[str]] = None
     static_input_ids: Optional[torch.Tensor] = None
     """The decoder runner's own int32 input-id buffer. When given (with
     ``static_position_ids``), the graphs' static inputs are views of the
@@ -292,20 +281,16 @@ class CUDAGraphRunner:
     WARMUP_STEPS = 1
     # CUDAGraphRunnerConfig.short_long_seq_len_threshold, when the config set one.
     _configured_seq_len_threshold: Optional[int] = None
-    # Resolves a graph shape (batch size, draft length) to the ceilings of the
-    # KV regimes its decode graphs are keyed by (ascending, the page-table
-    # capacity last); set by the decoder's graph component once the KV cache
-    # exists, None keeps every graph in one KV family. The regime is pinned
-    # while a capture pass runs, like the sampling tier.
-    kv_regime_resolver: Optional[Callable[[int, int], Tuple[int, ...]]] = None
-    _capture_kv_regime: Optional[int] = None
-    # Resolves a graph shape to the FP4 MLA packed split decisions its decode
-    # graphs are keyed by, and a step to its decision; set like the KV regime
-    # resolver, None keeps one family. Pinned while a capture pass runs.
-    packed_split_resolver: Optional[PackedSplitResolver] = None
-    _capture_packed_split: Optional[bool] = None
+    # The variants the decode graphs are keyed by besides their shape; set by
+    # the decoder's graph component once the KV cache exists, empty keeps one
+    # family. A variant's value is pinned while a capture pass runs, like the
+    # sampling tier: one entry per variant, None when not pinned.
+    graph_variants: Tuple[GraphVariant, ...] = ()
+    _capture_variants: Tuple[Optional[int], ...] = ()
     # Default for runners built without __init__ (test stubs).
     _adp_graph_batch_hint: Optional[List[Tuple[bool, int, int]]] = None
+    # Whether _agree_graph_shape can agree on a replay key (config.skip_adp_count_gather).
+    _agreement_carries_replay_key = True
 
     def __init__(self, config: CUDAGraphRunnerConfig):
         self.config = config
@@ -325,10 +310,8 @@ class CUDAGraphRunner:
         self.enable_in_graph_sampling = config.enable_in_graph_sampling
         # Set by DecoderCudaGraphs while capturing an in-graph sampling tier pass.
         self._capture_sample_type: Optional[SampleType] = None
-        self.kv_regime_resolver = None
-        self._capture_kv_regime = None
-        self.packed_split_resolver = None
-        self._capture_packed_split = None
+        self.graph_variants = ()
+        self._capture_variants = ()
         self._capture_stream: Optional[torch.cuda.Stream] = None
         # Resolves a runtime batch to its tier; registered through the decoder runner so the
         # graph runner does not need to know about the sampler.
@@ -345,6 +328,9 @@ class CUDAGraphRunner:
         self.graphs: Dict[KeyType, torch.cuda.CUDAGraph] = {}
         # Graphs captured with a step-input pack's prologue, and that pack (step_inputs.capture_prologue).
         self._step_input_prologue_keys: Dict[KeyType, Any] = {}
+        # Graphs captured with a copier's in-graph final flush prologue, and that copier
+        # (device_copy.capture_prologue).
+        self._prologue_copiers: Dict[KeyType, Any] = {}
         self.graph_outputs: Dict[KeyType,
                                  Callable[[], Optional[torch.Tensor]]] = {}
         self.graph_metadata: Dict[KeyType, Dict[str, Any]] = {}
@@ -355,9 +341,12 @@ class CUDAGraphRunner:
         # (batch, every rank's sampling mode) when the padding exchange carried one.
         self._sampling_modes: Optional[Tuple[ScheduledRequests,
                                              List[int]]] = None
+        # The graph every attention-DP rank agreed to replay this step, or None.
+        self._adp_replay_key: Optional[KeyType] = None
         self.dynamic_draft_len_mapping = config.dynamic_draft_len_mapping
 
         self.shared_static_tensors: Dict[str, torch.Tensor] = {}
+        self.forward_scratch_buffers = Buffers()
         if self.enabled:
             self._create_shared_static_tensors()
         self.cuda_graph_meta_buffers = (Buffers()
@@ -474,58 +463,59 @@ class CUDAGraphRunner:
                 or (self.enable_encoder_decoder_mixed_cuda_graph
                     and self._is_mixed_encoder_decoder_batch(batch)))
 
-    def _gather_adp_graph_batch_info(self,
-                                     batch: ScheduledRequests,
-                                     can_run_cuda_graph: bool,
-                                     sample_type: SampleType,
-                                     sampling_mode: Optional[int] = None,
-                                     kv_regime: Optional[int] = None,
-                                     packed_split: Optional[bool] = None):
-        """Return ``[(can_run_cuda_graph, batch_size, sample_type, kv_regime,
-        packed_split)]`` per TP rank.
+    def _gather_adp_graph_batch_info(
+            self,
+            batch: ScheduledRequests,
+            can_run_cuda_graph: bool,
+            sample_type: SampleType,
+            sampling_mode: Optional[int] = None,
+            variants: Optional[Sequence[Optional[int]]] = None,
+            replay_tokens: Optional[int] = None):
+        """Return ``[(can_run_cuda_graph, batch_size, sample_type, variants)]``
+        per TP rank.
 
         One fixed-size exchange, entered by every rank unconditionally. The
         sampling tier rides along because it is part of the graph key: ranks
         that resolved different tiers would otherwise replay different graphs.
-        So do the KV regime and the packed split decision once the decode
-        graphs are keyed by them (-1 from a caller that does not agree them);
-        otherwise every rank's regime and decision read None.
+        So does the value of every graph variant the decode graphs are keyed
+        by (-1 from a caller that does not agree them); ``variants`` of a rank
+        holds one entry per variant, None for a value the rank did not send.
         A ``sampling_mode`` (every rank passes one or none) rides along too, for
-        ``take_sampling_modes``.
+        ``take_sampling_modes``. So does ``replay_tokens`` (every rank passes
+        one or none), appended to each rank's tuple.
         """
         payload = [
             bool(can_run_cuda_graph), batch.batch_size, sample_type.value
         ]
-        keyed_by_kv_regime = self.kv_regime_resolver is not None
-        keyed_by_packed_split = self.packed_split_resolver is not None
-        if keyed_by_kv_regime:
-            payload.append(-1 if kv_regime is None else int(kv_regime))
-        if keyed_by_packed_split:
-            payload.append(-1 if packed_split is None else int(packed_split))
+        num_variants = len(self.graph_variants)
+        for index in range(num_variants):
+            value = None if variants is None else variants[index]
+            payload.append(-1 if value is None else int(value))
         if sampling_mode is not None:
             payload.append(sampling_mode)
+        if replay_tokens is not None:
+            payload.append(replay_tokens)
         gathered = self.config.dist.tp_allgather_int64(payload)
         flags = gathered[:, 0].astype(bool).tolist()
         sizes = gathered[:, 1].tolist()
         tiers = gathered[:, 2].tolist()
         column = 3
-        regimes = [None] * len(flags)
-        if keyed_by_kv_regime:
-            regimes = [
-                None if regime < 0 else int(regime)
-                for regime in gathered[:, column].tolist()
+        # Most models key their decode graphs by no variant.
+        rank_variants = [()] * len(flags)
+        if num_variants:
+            rank_variants = [
+                tuple(None if value < 0 else int(value) for value in row)
+                for row in gathered[:, column:column + num_variants].tolist()
             ]
-            column += 1
-        decisions = [None] * len(flags)
-        if keyed_by_packed_split:
-            decisions = [
-                None if decision < 0 else bool(decision)
-                for decision in gathered[:, column].tolist()
-            ]
-            column += 1
+            column += num_variants
         if sampling_mode is not None:
             self._sampling_modes = (batch, gathered[:, column].tolist())
-        return list(zip(flags, sizes, tiers, regimes, decisions))
+        info = list(zip(flags, sizes, tiers, rank_variants))
+        if replay_tokens is not None:
+            return [(*rank_info, tokens)
+                    for rank_info, tokens in zip(info, gathered[:,
+                                                                -1].tolist())]
+        return info
 
     def _max_total_seq_len(
         self,
@@ -639,8 +629,9 @@ class CUDAGraphRunner:
         peft_cache_data_type: Optional[torch.dtype] = None,
         use_lora_graph: bool = False,
         forced_sample_type: Optional[SampleType] = None,
-        forced_kv_regime: Optional[int] = None,
-        forced_packed_split: Optional[bool] = None,
+        forced_variants: Optional[Sequence[Optional[int]]] = None,
+        resolved_graph_shape: Optional[Tuple[SampleType, Tuple[Optional[int],
+                                                               ...]]] = None,
     ) -> Optional[KeyType]:
         batch_size = batch.batch_size
 
@@ -654,42 +645,33 @@ class CUDAGraphRunner:
         # both variants and dispatch at replay based on actual batch state.
         # Default to True (greedy fast-path) when the metadata doesn't carry
         # this field (non-one-engine paths or non-spec batches).
-        is_all_greedy_sample = bool(
-            getattr(spec_metadata, "is_all_greedy_sample", True))
-        # The temperature-only variant of the advanced-sampling graphs: the
-        # one-engine fast paths' flag, or the vocabulary-shard sampler's.
-        temperature_only = not is_all_greedy_sample and (
-            bool(getattr(spec_metadata, "temperature_only", False))
-            or spec_metadata.is_all_temperature_only)
+        # maybe_get_cuda_graph checks the same variant against the captured ones.
+        variant = sampling_variant(spec_metadata)
+        is_all_greedy_sample = variant == "greedy"
+        # The temperature-only variant of the advanced-sampling graphs.
+        temperature_only = variant == "temperature_only"
 
-        # Sampling tier this graph must contain. Only meaningful when the fast
-        # sampler is enabled; otherwise it stays FULL so every batch shares one
-        # graph and sampling runs eagerly after the forward, as before.
-        # Under attention DP the caller has already agreed a tier across ranks.
-        sample_type = (forced_sample_type if forced_sample_type is not None
-                       else self._resolve_sample_type(
-                           batch, promoted_context_request_ids))
-
-        # KV regime of the step when the decode graphs are keyed by it (FP4 MLA
-        # decode dispatcher); under attention DP the caller has agreed it.
-        kv_regime = (forced_kv_regime if forced_kv_regime is not None else
-                     self._kv_regime_for_batch(batch, new_tensors_device,
-                                               promoted_context_request_ids))
-        # Split decision of the FP4 MLA packed decode when the decode graphs
-        # are keyed by it; under attention DP the caller has agreed it.
-        packed_split = (forced_packed_split if forced_packed_split is not None
-                        else self._packed_split_for_batch(
-                            batch, new_tensors_device,
-                            promoted_context_request_ids))
+        # Sampling tier and the value of every graph variant the decode graphs
+        # are keyed by may already be resolved locally or agreed across ADP
+        # ranks.
+        if resolved_graph_shape is None:
+            resolved_graph_shape = (
+                forced_sample_type if forced_sample_type is not None else
+                self._resolve_sample_type(batch, promoted_context_request_ids),
+                self._graph_variants_for_batch(batch, new_tensors_device,
+                                               promoted_context_request_ids,
+                                               forced_variants),
+            )
+        sample_type, variants = resolved_graph_shape
 
         # With dynamic spec decode, the draft length may be zero even when enable_spec_decode is True,
         # so we need to get the draft length from the batch instead of using enable_spec_decode.
-        draft_len_list = []
-        for request in batch.generation_requests:
-            draft_len_list.append(len(request.py_draft_tokens))
-        draft_len = max(draft_len_list)
-        assert len(
-            set(draft_len_list)) == 1, "All draft lengths must be the same"
+        draft_lens = {
+            len(request.py_draft_tokens)
+            for request in batch.generation_requests
+        }
+        draft_len = max(draft_lens)
+        assert len(draft_lens) == 1, "All draft lengths must be the same"
         context_requests = batch.context_requests
         num_contexts = len(context_requests)
         context_query_len = 0
@@ -714,37 +696,24 @@ class CUDAGraphRunner:
                        use_lora_graph=use_lora_graph,
                        temperature_only=temperature_only,
                        ragged_verify_bucket=self._ragged_verify_bucket(batch),
-                       kv_regime=kv_regime,
-                       packed_split=packed_split)
+                       variants=variants)
 
     def set_capture_sample_type(self,
                                 sample_type: Optional[SampleType]) -> None:
         """Pin the tier captured by the current pass; None restores runtime resolution."""
         self._capture_sample_type = sample_type
 
-    def set_kv_regime_resolver(
-            self, resolver: Optional[Callable[[int, int], Tuple[int,
-                                                                ...]]]) -> None:
-        """Key the decode graphs by KV regime; None restores one KV family.
+    def set_graph_variants(self, variants: Sequence[GraphVariant]) -> None:
+        """Key the decode graphs by ``variants`` besides their shape; none restores one family."""
+        self.graph_variants = tuple(variants)
+        self._capture_variants = (None, ) * len(self.graph_variants)
 
-        ``resolver(batch_size, draft_len)`` lists the ceilings in tokens of
-        the regimes that graph shape is keyed by, ascending, the page-table
-        capacity last (``fp4_mla_dispatch.kv_regimes_for_batch``).
-        """
-        self.kv_regime_resolver = resolver
-
-    def set_capture_kv_regime(self, kv_regime: Optional[int]) -> None:
-        """Pin the KV regime captured by the current pass; None restores runtime resolution."""
-        self._capture_kv_regime = kv_regime
-
-    def set_packed_split_resolver(
-            self, resolver: Optional[PackedSplitResolver]) -> None:
-        """Key the decode graphs by the FP4 MLA packed split decision; None restores one family."""
-        self.packed_split_resolver = resolver
-
-    def set_capture_packed_split(self, packed_split: Optional[bool]) -> None:
-        """Pin the split decision captured by the current pass; None restores runtime resolution."""
-        self._capture_packed_split = packed_split
+    def set_capture_variant(self, name: str, value: Optional[int]) -> None:
+        """Pin the value of variant ``name`` captured by the current pass; None restores runtime resolution."""
+        index = [variant.name for variant in self.graph_variants].index(name)
+        pinned = list(self._capture_variants)
+        pinned[index] = value
+        self._capture_variants = tuple(pinned)
 
     def register_sample_type_resolver(
         self,
@@ -816,123 +785,86 @@ class CUDAGraphRunner:
         return min(compatible_keys,
                    key=lambda captured_key: captured_key.num_encoder_tokens)
 
-    def _kv_regime_for_batch(
+    def _graph_variants_for_batch(
         self,
         batch: ScheduledRequests,
         new_tensors_device: Optional[SampleStateTensors] = None,
-        promoted_context_request_ids: frozenset[int] = frozenset()
-    ) -> Optional[int]:
-        """Ceiling of the KV regime ``batch`` replays; None without regimes.
+        promoted_context_request_ids: frozenset[int] = frozenset(),
+        forced: Optional[Sequence[Optional[int]]] = None,
+    ) -> Tuple[int, ...]:
+        """Value of every graph variant for ``batch``; empty without variants.
 
-        Pinned during a capture pass, so the graph records the dispatcher's
-        decision for that regime; otherwise, among the regimes of the batch's
-        graph shape, the one covering the step's longest live KV, an upper
-        bound the captured decision was taken on.
+        A value is the agreed one when the caller passes it in ``forced``,
+        else the one pinned by a capture pass, so the graph records the
+        behavior of that value. Otherwise a shape with one value takes it
+        without measuring the step, and a shape with several asks the variant
+        on the KV length each row reads (its sequence length plus the extra KV
+        of one-engine speculation).
         """
-        resolver = self.kv_regime_resolver
-        if resolver is None:
-            return None
-        if self._capture_kv_regime is not None:
-            return self._capture_kv_regime
-        draft_len = max((len(request.py_draft_tokens)
-                         for request in batch.generation_requests),
-                        default=0)
-        ceilings = resolver(batch.batch_size, draft_len)
-        if len(ceilings) == 1:
-            # Most shapes have one regime; the step's KV cannot change it.
-            return int(ceilings[0])
-        # One-engine speculation reads max_draft_len - 1 KV tokens beyond the
-        # row's sequence length (the sparse short/long split counts them too).
-        # Imported here: only an FP4 MLA decode registers a resolver.
-        from ..attention.backends.fp4_mla import fp4_mla_dispatch
-        from ..speculative import get_num_extra_kv_tokens
-        max_kv_len = self._max_total_seq_len(
-            batch, new_tensors_device,
-            promoted_context_request_ids) + get_num_extra_kv_tokens(
-                self.spec_config)
-        return fp4_mla_dispatch.kv_regime_for_step(max_kv_len, ceilings)
+        if not self.graph_variants:
+            return ()
+        # Read from the requests only for a variant that is neither agreed
+        # nor pinned.
+        draft_len = None
+        kv_lens = None
+        values = []
+        for index, variant in enumerate(self.graph_variants):
+            if forced is not None and forced[index] is not None:
+                values.append(int(forced[index]))
+                continue
+            pinned = self._capture_variants[index]
+            if pinned is not None:
+                values.append(int(pinned))
+                continue
+            if draft_len is None:
+                draft_len = max((len(request.py_draft_tokens)
+                                 for request in batch.generation_requests),
+                                default=0)
+            shape_values = variant.values(batch.batch_size, draft_len)
+            if len(shape_values) == 1:
+                # Most shapes have one value; the step's KV cannot change it.
+                values.append(int(shape_values[0]))
+                continue
+            if kv_lens is None:
+                # One-engine speculation reads max_draft_len - 1 KV tokens
+                # beyond the row's sequence length (the sparse short/long
+                # split counts them too).
+                from ..speculative import get_num_extra_kv_tokens
+                extra_kv = get_num_extra_kv_tokens(self.spec_config)
+                kv_lens = [
+                    length + extra_kv for length in self._total_seq_lens(
+                        batch, new_tensors_device, promoted_context_request_ids)
+                ]
+            values.append(
+                int(variant.of_step(batch.batch_size, draft_len, kv_lens)))
+        return tuple(values)
 
-    def _packed_split_for_batch(
-        self,
-        batch: ScheduledRequests,
-        new_tensors_device: Optional[SampleStateTensors] = None,
-        promoted_context_request_ids: frozenset[int] = frozenset()
-    ) -> Optional[bool]:
-        """FP4 MLA packed split decision ``batch`` replays; None without one.
+    def _get_compatible_variant_key(self, key: KeyType) -> KeyType:
+        """Replay a captured graph of another variant value when the step's own was not captured.
 
-        Pinned during a capture pass, so the graph records that decision;
-        otherwise a shape with one variant keys it without measuring the
-        step, and a shape with both decides on the per-request KV lengths
-        the KV regime is taken on (row lengths plus the one-engine extra KV).
+        The variants are settled from the last to the first. Each one picks
+        its value with its ``replayable`` rule among the values captured for
+        the step's shape and the variants already settled, whatever the
+        earlier ones are.
         """
-        resolver = self.packed_split_resolver
-        if resolver is None:
-            return None
-        if self._capture_packed_split is not None:
-            return self._capture_packed_split
-        draft_len = max((len(request.py_draft_tokens)
-                         for request in batch.generation_requests),
-                        default=0)
-        variants = resolver.variants(batch.batch_size, draft_len)
-        if len(variants) == 1:
-            return bool(variants[0])
-        from ..speculative import get_num_extra_kv_tokens
-        extra_kv = get_num_extra_kv_tokens(self.spec_config)
-        kv_lens = [
-            length + extra_kv for length in self._total_seq_lens(
-                batch, new_tensors_device, promoted_context_request_ids)
-        ]
-        return bool(resolver.decide(batch.batch_size, draft_len, kv_lens))
-
-    def _get_compatible_packed_split_key(self, key: KeyType) -> KeyType:
-        """Replay the split graph when the step's unsplit graph was not captured.
-
-        A split graph is valid for any step: its plan keeps every request
-        whole when the step needs no split, at the cost of the empty slots.
-        Shapes with a single (split) variant and skipped captures fall back
-        to it; the KV regime is rounded up afterwards.
-        """
-        if (key.packed_split is not False or self._capture_allowed
-                or key in self.graph_metadata):
-            return key
-        shape = key._replace(kv_regime=None, packed_split=None)
-        if any(
-                isinstance(captured_key, KeyType)
-                and captured_key.packed_split is False and captured_key.
-                _replace(kv_regime=None, packed_split=None) == shape
-                for captured_key in self.graph_metadata):
-            return key
-        return key._replace(packed_split=True)
-
-    def _get_compatible_kv_regime_key(self, key: KeyType) -> KeyType:
-        """Round the KV regime up to a captured graph key.
-
-        A graph of a larger regime is valid for the step: the kernels are
-        planned for the page-table capacity and only the dispatcher's decision
-        is baked in. A regime whose capture was skipped replays the next one
-        up, or the largest captured when none covers it.
-        """
-        if (key.kv_regime is None or self._capture_allowed
-                or key in self.graph_metadata):
-            return key
-        key_without_regime = key._replace(kv_regime=None)
-        compatible_keys = [
-            captured_key for captured_key in self.graph_metadata
-            if isinstance(captured_key, KeyType)
-            and captured_key.kv_regime is not None and captured_key._replace(
-                kv_regime=None) == key_without_regime
-        ]
-        if not compatible_keys:
-            return key
-        covering_keys = [
-            captured_key for captured_key in compatible_keys
-            if captured_key.kv_regime >= key.kv_regime
-        ]
-        if covering_keys:
-            return min(covering_keys,
-                       key=lambda captured_key: captured_key.kv_regime)
-        return max(compatible_keys,
-                   key=lambda captured_key: captured_key.kv_regime)
+        shape = key._replace(variants=())
+        for index in reversed(range(len(key.variants))):
+            if self._capture_allowed or key in self.graph_metadata:
+                return key
+            settled = key.variants[index + 1:]
+            captured = sorted({
+                captured_key.variants[index]
+                for captured_key in self.graph_metadata
+                if isinstance(captured_key, KeyType)
+                and len(captured_key.variants) == len(key.variants)
+                and captured_key.variants[index + 1:] == settled
+                and captured_key._replace(variants=()) == shape
+            })
+            value = int(self.graph_variants[index].replayable(
+                key.variants[index], captured))
+            key = key._replace(variants=key.variants[:index] + (value, ) +
+                               settled)
+        return key
 
     def _ragged_verify_bucket(self, batch: ScheduledRequests) -> Optional[int]:
         """Optional token bucket supplied by a specialized graph runner."""
@@ -944,43 +876,100 @@ class CUDAGraphRunner:
         can_run_cuda_graph: bool,
         promoted_context_request_ids: frozenset[int],
         new_tensors_device: Optional[SampleStateTensors] = None,
-    ) -> Tuple[bool, Optional[SampleType], Optional[int], Optional[bool]]:
-        """Agree on graph eligibility, rows, sampling tier, KV regime and
-        packed split decision across ADP ranks.
+        replay_key: Optional[KeyType] = None,
+        local_graph_shape: Optional[Tuple[SampleType, Tuple[Optional[int],
+                                                            ...]]] = None,
+    ) -> Tuple[bool, Optional[SampleType], Optional[Tuple[Optional[int], ...]]]:
+        """Agree on graph eligibility, rows, sampling tier and graph variants
+        across ADP ranks.
 
-        The agreed KV regime is the largest one, so every rank replays the
-        same graph family and its own rows are covered; None when the graphs
-        are not keyed by regime. Likewise the split graph is replayed when any
-        rank's step splits; None when the graphs are not keyed by it.
+        The agreed value of a variant is the largest one among the ranks', so
+        every rank replays the same graph family and its own rows are covered
+        (``GraphVariant``); the variants are None without the agreement.
         """
         if not (self.enabled and self.config.enable_attention_dp
                 and self.config.mapping.tp_size > 1):
-            return True, None, None, None
-        local_sample_type = self._resolve_sample_type(
-            batch, promoted_context_request_ids)
-        local_kv_regime = self._kv_regime_for_batch(
-            batch, new_tensors_device, promoted_context_request_ids)
-        local_packed_split = self._packed_split_for_batch(
-            batch, new_tensors_device, promoted_context_request_ids)
+            return True, None, None
+        if local_graph_shape is None:
+            local_graph_shape = (
+                self._resolve_sample_type(batch, promoted_context_request_ids),
+                self._graph_variants_for_batch(batch, new_tensors_device,
+                                               promoted_context_request_ids),
+            )
+        local_sample_type, local_variants = local_graph_shape
+        # The flag is the same on every rank, so either every payload carries a
+        # replay size (0 without a key) or none does.
+        replay_tokens = None
+        if self.config.skip_adp_count_gather:
+            replay_tokens = (0 if replay_key is None else
+                             self._get_num_tokens_for_key(replay_key))
         graph_batch_info = self._gather_adp_graph_batch_info(
             batch,
             can_run_cuda_graph,
             local_sample_type,
-            kv_regime=local_kv_regime,
-            packed_split=local_packed_split)
+            variants=local_variants,
+            replay_tokens=replay_tokens)
         all_can_graph = all(rank_info[0] for rank_info in graph_batch_info)
         all_batch_sizes_equal = all(rank_info[1] == graph_batch_info[0][1]
                                     for rank_info in graph_batch_info)
         if not all_can_graph or not all_batch_sizes_equal:
-            return False, None, None, None
-        forced_sample_type = (local_sample_type if all(
-            rank_info[2] == graph_batch_info[0][2]
-            for rank_info in graph_batch_info) else SampleType.FULL)
-        forced_kv_regime = _largest_kv_regime(rank_info[3]
-                                              for rank_info in graph_batch_info)
-        forced_packed_split = _agreed_packed_split(
-            rank_info[4] for rank_info in graph_batch_info)
-        return True, forced_sample_type, forced_kv_regime, forced_packed_split
+            return False, None, None
+        same_tier = all(rank_info[2] == graph_batch_info[0][2]
+                        for rank_info in graph_batch_info)
+        forced_sample_type = local_sample_type if same_tier else SampleType.FULL
+        forced_variants = self._largest_variants(
+            [rank_info[3] for rank_info in graph_batch_info])
+        if same_tier and replay_tokens and all(
+                rank_info[3] == tuple(local_variants)
+                and rank_info[4] == replay_tokens
+                for rank_info in graph_batch_info):
+            self._adp_replay_key = replay_key
+        return True, forced_sample_type, forced_variants
+
+    @staticmethod
+    def _largest_variants(
+        rank_variants: Sequence[Sequence[Optional[int]]]
+    ) -> Tuple[Optional[int], ...]:
+        """Per variant, the largest value among the ranks' (None entries ignored); None when no rank sent one."""
+        agreed = []
+        for values in zip(*rank_variants):
+            known = [value for value in values if value is not None]
+            agreed.append(max(known) if known else None)
+        return tuple(agreed)
+
+    def _captured_replay_key(
+        self,
+        batch: ScheduledRequests,
+        can_run_cuda_graph: bool,
+        is_mixed_encoder_decoder: bool,
+        new_tensors_device: Optional[SampleStateTensors],
+        spec_resource_manager: Optional[BaseResourceManager],
+        spec_metadata: Optional[SpecMetadata],
+        promoted_context_request_ids: frozenset[int],
+        peft_cache_data_type: Optional[torch.dtype],
+        use_lora_graph: bool,
+        local_graph_shape: Tuple[SampleType, Tuple[Optional[int], ...]],
+    ) -> Optional[KeyType]:
+        """This rank's captured uniform generation graph of ``batch`` at its own
+        tier, or None where a rank holding it could still run eagerly."""
+        if (not can_run_cuda_graph or is_mixed_encoder_decoder
+                or promoted_context_request_ids or self.config.use_mrope
+                or self._capture_allowed
+                or batch.batch_size not in self.supported_batch_sizes):
+            return None
+        key = self.get_graph_key(batch,
+                                 new_tensors_device,
+                                 spec_resource_manager,
+                                 spec_metadata,
+                                 promoted_context_request_ids,
+                                 peft_cache_data_type,
+                                 use_lora_graph,
+                                 resolved_graph_shape=local_graph_shape)
+        if (key is None or key.num_contexts
+                or key.ragged_verify_bucket is not None
+                or key not in self.graph_metadata):
+            return None
+        return key
 
     @staticmethod
     def _get_mrope_position_delta(request: Any) -> Optional[Any]:
@@ -1038,19 +1027,55 @@ class CUDAGraphRunner:
         not change request state or type and is used only to build a graph key
         consistent with the final-context token that will be executed.
         """
+        self._adp_replay_key = None
         # disable when doing statistic
         if ExpertStatistic.should_record():
             return None, None, None
 
         is_mixed_encoder_decoder = self._is_mixed_encoder_decoder_batch(batch)
-        can_run_cuda_graph = self._can_run_cuda_graph_batch(batch)
+        # A batch of an uncaptured sampling variant runs eagerly; under attention
+        # DP the agreement below then takes every rank's step eager with it.
+        can_run_cuda_graph = (
+            self._can_run_cuda_graph_batch(batch) and
+            (spec_metadata is None or self.config.sampling_variants is None or
+             sampling_variant(spec_metadata) in self.config.sampling_variants))
+        if can_run_cuda_graph and getattr(
+                attn_metadata, "beam_shared_prefix_enabled", False) is True:
+            # A beam longer than the library's captured tail runs this step eagerly.
+            from ..attention.backends.fmha.beam_shared_prefix import \
+                tail_exceeds_cuda_graph
+            can_run_cuda_graph = not tail_exceeds_cuda_graph(
+                batch.generation_requests)
         batch_size = batch.batch_size
-        (shapes_agree, forced_sample_type, forced_kv_regime,
-         forced_packed_split) = self._agree_graph_shape(
-             batch, can_run_cuda_graph, promoted_context_request_ids,
-             new_tensors_device)
+        local_graph_shape = None
+        if self.enabled and (can_run_cuda_graph or
+                             (self.config.enable_attention_dp
+                              and self.config.mapping.tp_size > 1)):
+            local_graph_shape = (
+                self._resolve_sample_type(batch, promoted_context_request_ids),
+                self._graph_variants_for_batch(batch, new_tensors_device,
+                                               promoted_context_request_ids),
+            )
+        replay_key = None
+        if (self._agreement_carries_replay_key and self.enabled
+                and self.config.enable_attention_dp
+                and self.config.mapping.tp_size > 1
+                and self.config.skip_adp_count_gather):
+            assert local_graph_shape is not None
+            replay_key = self._captured_replay_key(
+                batch, can_run_cuda_graph, is_mixed_encoder_decoder,
+                new_tensors_device, spec_resource_manager, spec_metadata,
+                promoted_context_request_ids, peft_cache_data_type,
+                use_lora_graph, local_graph_shape)
+        shapes_agree, forced_sample_type, forced_variants = self._agree_graph_shape(
+            batch, can_run_cuda_graph, promoted_context_request_ids,
+            new_tensors_device, replay_key, local_graph_shape)
         if not shapes_agree:
             return None, None, None
+        if self._adp_replay_key is not None:
+            graph_metadata = self.graph_metadata[self._adp_replay_key]
+            return (graph_metadata["attn_metadata"],
+                    graph_metadata["spec_metadata"], self._adp_replay_key)
 
         if not self.enabled or not can_run_cuda_graph:
             return None, None, None
@@ -1064,20 +1089,30 @@ class CUDAGraphRunner:
             return None, None, None
         # Propagate the execution-view identity through graph lookup. Existing
         # callers pass the empty default and retain generation-only behavior.
-        key = self.get_graph_key(batch, new_tensors_device,
-                                 spec_resource_manager, spec_metadata,
+        assert local_graph_shape is not None
+        local_sample_type, local_variants = local_graph_shape
+        agreed_graph_shape = (
+            forced_sample_type
+            if forced_sample_type is not None else local_sample_type,
+            # an agreed value of a variant replaces the local one
+            local_variants if forced_variants is None else tuple(
+                local if forced is None else forced
+                for forced, local in zip(forced_variants, local_variants)),
+        )
+        key = self.get_graph_key(batch,
+                                 new_tensors_device,
+                                 spec_resource_manager,
+                                 spec_metadata,
                                  promoted_context_request_ids,
-                                 peft_cache_data_type, use_lora_graph,
-                                 forced_sample_type, forced_kv_regime,
-                                 forced_packed_split)
+                                 peft_cache_data_type,
+                                 use_lora_graph,
+                                 resolved_graph_shape=agreed_graph_shape)
         if key is None:
             return None, None, None
         if is_mixed_encoder_decoder:
             key = self._get_compatible_mixed_encoder_decoder_key(key)
-        if key.packed_split is not None:
-            key = self._get_compatible_packed_split_key(key)
-        if key.kv_regime is not None:
-            key = self._get_compatible_kv_regime_key(key)
+        if key.variants:
+            key = self._get_compatible_variant_key(key)
 
         if key in self.graph_metadata:
             return self.graph_metadata[key][
@@ -1095,17 +1130,15 @@ class CUDAGraphRunner:
 
         num_sequences_in_batch = batch_size * self.max_beam_width
         graph_attn_metadata = attn_metadata.create_cuda_graph_metadata(
-            num_sequences_in_batch, False, key.draft_len,
-            self.cuda_graph_meta_buffers)
-        if key.kv_regime is not None:
-            # The decode captured in this graph chooses its kernels on the
-            # regime ceiling, an upper bound of the live KV, instead of the
-            # page-table capacity.
-            graph_attn_metadata.set_decode_kv_regime(key.kv_regime)
-        if key.packed_split is not None:
-            # The packed decode captured in this graph launches its split
-            # budget only for a split key.
-            graph_attn_metadata.set_decode_packed_split(key.packed_split)
+            num_sequences_in_batch,
+            False,
+            key.draft_len,
+            self.cuda_graph_meta_buffers,
+            forward_scratch_buffers=self.forward_scratch_buffers)
+        for variant, value in zip(self.graph_variants, key.variants):
+            # The decode captured in this graph behaves as the key's value of
+            # the variant says, instead of deciding on each call.
+            graph_attn_metadata.set_decode_graph_variant(variant.name, value)
         if is_mixed_encoder_decoder:
             generation_query_len = key.draft_len + 1
             graph_attn_metadata.seq_lens = torch.tensor(
@@ -1124,6 +1157,21 @@ class CUDAGraphRunner:
         else:
             graph_spec_metadata = None
         return graph_attn_metadata, graph_spec_metadata, key
+
+    def take_agreed_replay_key(self, attn_metadata: Any) -> Optional[KeyType]:
+        """The uniform graph all attention-DP ranks agreed to replay this step,
+        or None; returned once, and it fixes every rank's input counts."""
+        key, self._adp_replay_key = self._adp_replay_key, None
+        if key is not None and not getattr(attn_metadata, "is_cuda_graph",
+                                           False):
+            raise RuntimeError(
+                f"Attention-DP ranks agreed to replay {key}, but this rank "
+                "prepares an eager step")
+        return key
+
+    def graph_num_tokens(self, key: KeyType) -> int:
+        """Token rows the graph of ``key`` runs."""
+        return self._get_num_tokens_for_key(key)
 
     def needs_capture(self, key: KeyType):
         return self._capture_allowed and key not in self.graph_outputs
@@ -1170,13 +1218,24 @@ class CUDAGraphRunner:
                 (key.batch_size * self.max_beam_width - key.num_contexts) *
                 token_per_generation)
 
-    def capture(self,
-                key: KeyType,
-                forward_fn: Callable,
-                initial_inputs: Dict[str, Any],
-                enable_spec_decode: bool = False,
-                postprocess_fn: Optional[Callable] = None) -> Any:
-        """Warm up and/or capture the forward pass for a graph key."""
+    def capture(
+        self,
+        key: KeyType,
+        forward_fn: Callable,
+        initial_inputs: Dict[str, Any],
+        enable_spec_decode: bool = False,
+        postprocess_fn: Optional[Callable] = None,
+        capture_scope: Callable[
+            [], contextlib.AbstractContextManager] = contextlib.nullcontext,
+        record_tensor_ptrs: bool = False,
+    ) -> Any:
+        """Warm up and/or capture the forward pass for a graph key.
+
+        ``capture_scope`` encloses the graph capture but not the warmup
+        forwards before it. It is entered before the stream capture begins, so
+        it may switch the MoE communication timeouts. ``record_tensor_ptrs``
+        records the graph's metadata tensor addresses for moved_graph_tensors().
+        """
         batch_size = key.batch_size
         # [CUDA graph spec decode padding]
         # We pad input IDs/position IDs to the maximum draft length (token per request).
@@ -1264,18 +1323,22 @@ class CUDAGraphRunner:
             output = None
             graph_pool = self.memory_pool or torch.cuda.graph_pool_handle()
             num_hostfuncs = len(HOSTFUNC_USER_DATA_HANDLES)
-            with nccl_window_graph_capture(
+            with capture_scope(), nccl_window_graph_capture(
                     graph, graph_pool, stream=self._priority_capture_stream()):
                 # A pre-replay hook reads the static inputs before the replay, so their copies must land before it.
                 prologue_pack = (None if self._pre_replay_hooks else
                                  step_inputs.capture_prologue())
                 if prologue_pack is not None:
                     self._step_input_prologue_keys[key] = prologue_pack
+                prologue_copier = (None if self._pre_replay_hooks else
+                                   device_copy.capture_prologue())
+                if prologue_copier is not None:
+                    self._prologue_copiers[key] = prologue_copier
                 output = forward_fn(capture_inputs)
             if len(HOSTFUNC_USER_DATA_HANDLES) > num_hostfuncs:
                 self._hostfunc_graph_keys.add(key)
-            # The addresses the graph baked in, for the strict buffer check.
-            self._record_strict_buffer_snapshot(key)
+            if record_tensor_ptrs or _STRICT_BUFFER_CHECK:
+                self._record_graph_tensor_ptrs(key)
             _restore_spec_decode_capture_state(attn_metadata,
                                                saved_kv_lens_cuda)
 
@@ -1284,6 +1347,16 @@ class CUDAGraphRunner:
         self.graph_outputs[key] = graph_output
         self.memory_pool = graph.pool()
         return graph_output
+
+    @staticmethod
+    def _copy_static_input(site: CopySite, dst: torch.Tensor,
+                           src: torch.Tensor) -> None:
+        """Copy a step input into a graph's static input: through ``site`` when the model
+        declares a copy plan (an active copier), else through the step-input pack."""
+        if device_copy.current() is not None:
+            device_copy.copy(site, dst, src)
+        else:
+            step_inputs.copy_(dst, src)
 
     def replay(
         self,
@@ -1307,8 +1380,7 @@ class CUDAGraphRunner:
             assert current_inputs.get(
                 "spec_metadata") is stored_meta["spec_metadata"]
         self._check_strict_buffer_stability(stored_meta)
-        self._check_kv_regime_metadata(key, stored_meta)
-        self._check_packed_split_metadata(key, stored_meta)
+        self._check_graph_variant_metadata(key, stored_meta)
 
         static_tensors = self.shared_static_tensors
 
@@ -1340,9 +1412,11 @@ class CUDAGraphRunner:
                     static_tensors["position_ids"])
             hook_positions = self._pre_replay_position_ids[..., :seqlen]
         # One launch copies the ids and positions and writes the hooks' positions,
-        # unless an open step-input pack still defers copies into its sources.
+        # unless an open step-input pack or copy-plan pack still defers copies into
+        # their sources.
         staged = (self.config.stage_decode_inputs and copy_input_ids
                   and not self.config.use_mrope and not step_inputs.is_open()
+                  and not device_copy.is_open()
                   and tuple(position_ids.shape) == (1, seqlen)
                   and stage_replay_inputs(
                       static_input_ids, input_ids,
@@ -1350,7 +1424,8 @@ class CUDAGraphRunner:
                       hook_positions, None if hook_positions is None else
                       position_id_offsets[:seqlen]))
         if copy_input_ids and not staged:
-            step_inputs.copy_(static_input_ids, input_ids)
+            self._copy_static_input(CopySite.GRAPH_INPUT_IDS, static_input_ids,
+                                    input_ids)
 
         if self.config.use_mrope:
             expected_position_ids_shape = (3, 1, seqlen)
@@ -1401,7 +1476,8 @@ class CUDAGraphRunner:
             static_position_ids = static_tensors["position_ids"][:, :seqlen]
             if (not prestaged and not staged and position_ids.data_ptr()
                     != static_position_ids.data_ptr()):
-                step_inputs.copy_(static_position_ids, position_ids)
+                self._copy_static_input(CopySite.GRAPH_POSITION_IDS,
+                                        static_position_ids, position_ids)
 
         num_encoder_tokens = key.num_encoder_tokens
         if num_encoder_tokens:
@@ -1435,6 +1511,13 @@ class CUDAGraphRunner:
         if prologue_pack is not None and not captured_pack_active:
             # Replayed outside the pack's context: nothing filled its window.
             prologue_pack.quiesce_graph_window()
+        # The same for the copy plan's merged copies (a model that declares a plan).
+        prologue_copier = self._prologue_copiers.get(key)
+        captured_copier_active = (prologue_copier is not None
+                                  and device_copy.is_active(prologue_copier))
+        device_copy.flush(in_graph=captured_copier_active)
+        if prologue_copier is not None and not captured_copier_active:
+            prologue_copier.quiesce_graph_window()
         if self._pre_replay_hooks:
             hook_tensors = static_tensors
             if hook_positions is not None:
@@ -1451,6 +1534,8 @@ class CUDAGraphRunner:
         finally:
             if prologue_pack is not None:
                 prologue_pack.on_graph_replay()
+            if prologue_copier is not None:
+                prologue_copier.on_graph_replay()
         if key in self._hostfunc_graph_keys:
             record_hostfunc_graph_replay()
         output_ref = self.graph_outputs[key]
@@ -1473,20 +1558,23 @@ class CUDAGraphRunner:
 
         These are the addresses the captured graph's kernels may have baked
         in; any of them changing before a later replay means the graph would
-        read stale (or freed) memory. obj.graph_temporary_attrs are skipped.
+        read stale (or freed) memory. obj.graph_temporary_attrs are skipped,
+        and an object without a __dict__ records nothing.
         """
         graph_temporary_attrs = getattr(obj, "graph_temporary_attrs", ())
         return {
             name: value.data_ptr()
-            for name, value in vars(obj).items()
+            for name, value in getattr(obj, "__dict__", {}).items()
             if isinstance(value, torch.Tensor) and value.is_cuda
             and name not in graph_temporary_attrs
         }
 
     @staticmethod
-    def _assert_graph_tensor_ptrs_stable(obj: Any,
-                                         expected_ptrs: Dict[str, int]) -> None:
-        """Raise if any tensor captured by _snapshot_graph_tensor_ptrs has moved.
+    def _moved_graph_tensors(
+            obj: Any,
+            expected_ptrs: Dict[str, int]) -> Iterator[Tuple[str, Any, int]]:
+        """Yield (name, live value, captured data_ptr) for each tensor captured by
+        _snapshot_graph_tensor_ptrs that is no longer at its captured address.
 
         Attributes in obj.draft_replay_swapped_attrs are deliberately rebound
         to draft KV cache buffers for the duration of a draft replay, so their
@@ -1497,25 +1585,47 @@ class CUDAGraphRunner:
         for name, expected_ptr in expected_ptrs.items():
             value = (swapped_attrs[name] if name in swapped_attrs else getattr(
                 obj, name, None))
+            if (not isinstance(value, torch.Tensor)
+                    or value.data_ptr() != expected_ptr):
+                yield name, value, expected_ptr
+
+    @staticmethod
+    def _assert_graph_tensor_ptrs_stable(obj: Any,
+                                         expected_ptrs: Dict[str, int]) -> None:
+        """Raise if any tensor captured by _snapshot_graph_tensor_ptrs has moved."""
+        for name, value, expected_ptr in CUDAGraphRunner._moved_graph_tensors(
+                obj, expected_ptrs):
             if not isinstance(value, torch.Tensor):
                 raise RuntimeError(
                     f"CUDA graph metadata attribute `{type(obj).__name__}."
                     f"{name}` was a tensor at capture time but is now "
                     f"{type(value).__name__}. Graph-visible buffers must be "
                     "updated in place, not rebound.")
-            if value.data_ptr() != expected_ptr:
-                raise RuntimeError(
-                    f"CUDA graph metadata tensor `{type(obj).__name__}."
-                    f"{name}` was reallocated between capture and replay "
-                    f"(data_ptr 0x{expected_ptr:x} -> 0x{value.data_ptr():x}). "
-                    "Graph-visible buffers must be updated in place; "
-                    "rebinding invalidates addresses baked into the captured "
-                    "CUDA graph.")
+            raise RuntimeError(
+                f"CUDA graph metadata tensor `{type(obj).__name__}."
+                f"{name}` was reallocated between capture and replay "
+                f"(data_ptr 0x{expected_ptr:x} -> 0x{value.data_ptr():x}). "
+                "Graph-visible buffers must be updated in place; "
+                "rebinding invalidates addresses baked into the captured "
+                "CUDA graph.")
 
-    def _record_strict_buffer_snapshot(self, key: KeyType) -> None:
-        """Snapshot graph-visible tensor addresses for key, if strict checking is enabled."""
-        if not _STRICT_BUFFER_CHECK:
-            return
+    def moved_graph_tensors(self) -> List[str]:
+        """Name each graph-visible metadata tensor that moved since its graph was captured."""
+        moved = []
+        for key, stored_meta in self.graph_metadata.items():
+            for owner in ("attn_metadata", "spec_metadata"):
+                expected_ptrs = stored_meta.get(f"{owner}_ptrs")
+                if expected_ptrs is None:
+                    continue
+                obj = stored_meta[owner]
+                moved.extend(f"{type(obj).__name__}.{name} (graph batch size "
+                             f"{key.batch_size}, draft length {key.draft_len})"
+                             for name, _, _ in self._moved_graph_tensors(
+                                 obj, expected_ptrs))
+        return moved
+
+    def _record_graph_tensor_ptrs(self, key: KeyType) -> None:
+        """Snapshot the graph-visible tensor addresses the graph for key baked in."""
         stored_meta = self.graph_metadata[key]
         stored_meta["attn_metadata_ptrs"] = self._snapshot_graph_tensor_ptrs(
             stored_meta["attn_metadata"])
@@ -1536,29 +1646,18 @@ class CUDAGraphRunner:
             self._assert_graph_tensor_ptrs_stable(
                 stored_meta["spec_metadata"], stored_meta["spec_metadata_ptrs"])
 
-    @staticmethod
-    def _check_kv_regime_metadata(key: KeyType, stored_meta: Dict[str,
-                                                                  Any]) -> None:
-        """Assert the stored attention metadata carries the key's KV regime, if strict checking is enabled."""
-        if not _STRICT_BUFFER_CHECK or key.kv_regime is None:
+    def _check_graph_variant_metadata(self, key: KeyType,
+                                      stored_meta: Dict[str, Any]) -> None:
+        """Assert the stored attention metadata carries the key's graph variants, if strict checking is enabled."""
+        if not _STRICT_BUFFER_CHECK:
             return
-        # None: the backend's decode does not depend on the KV length.
-        stored_kv_regime = stored_meta["attn_metadata"].decode_kv_regime
-        assert stored_kv_regime in (None, key.kv_regime), (
-            f"CUDA graph {key} replays attention metadata of KV "
-            f"regime {stored_kv_regime}")
-
-    @staticmethod
-    def _check_packed_split_metadata(key: KeyType,
-                                     stored_meta: Dict[str, Any]) -> None:
-        """Assert the stored attention metadata carries the key's packed split decision, if strict checking is enabled."""
-        if not _STRICT_BUFFER_CHECK or key.packed_split is None:
-            return
-        # None: the backend has no packed split decode.
-        stored_packed_split = stored_meta["attn_metadata"].decode_packed_split
-        assert stored_packed_split in (None, key.packed_split), (
-            f"CUDA graph {key} replays attention metadata of packed split "
-            f"decision {stored_packed_split}")
+        for variant, value in zip(self.graph_variants, key.variants):
+            # None: the backend's decode does not depend on the variant.
+            stored = stored_meta["attn_metadata"].decode_graph_variant(
+                variant.name)
+            assert stored in (None, value), (
+                f"CUDA graph {key} replays attention metadata of "
+                f"{variant.name} {stored}")
 
     def will_pad_to(self, padded_bs: int, num_requests: int) -> bool:
         """Whether a batch of ``num_requests`` can actually reach ``padded_bs``.
@@ -2032,9 +2131,11 @@ class CUDAGraphRunner:
         self.graphs.clear()
         self.graph_outputs.clear()
         self.graph_metadata.clear()
+        self.forward_scratch_buffers.buffers.clear()
         self._hostfunc_graph_keys.clear()
         self._pre_replay_position_ids = None
         self._step_input_prologue_keys.clear()
+        self._prologue_copiers.clear()
         self.reset_padding_dummies()
         del self.memory_pool
         self.memory_pool = None
@@ -2045,6 +2146,8 @@ class CUDAGraphRunner:
 
 class DSparkCUDAGraphRunner(CUDAGraphRunner):
     """Ragged verification graph policy for confidence-enabled DSpark."""
+
+    _agreement_carries_replay_key = False
 
     def __init__(self, config: CUDAGraphRunnerConfig) -> None:
         super().__init__(config)
@@ -2068,11 +2171,13 @@ class DSparkCUDAGraphRunner(CUDAGraphRunner):
     def pad_batch(self,
                   scheduled_requests: ScheduledRequests,
                   resource_manager: ResourceManager,
-                  runtime_draft_len: int = 0):
+                  runtime_draft_len: int = 0,
+                  sampling_mode: Optional[int] = None):
         """Consume the shape vote once, including an exceptional forward exit."""
         try:
             with super().pad_batch(scheduled_requests, resource_manager,
-                                   runtime_draft_len) as padded_requests:
+                                   runtime_draft_len,
+                                   sampling_mode) as padded_requests:
                 yield padded_requests
         finally:
             self.adp_shape_agreement = None
@@ -2100,13 +2205,15 @@ class DSparkCUDAGraphRunner(CUDAGraphRunner):
         can_run_cuda_graph: bool,
         promoted_context_request_ids: frozenset[int],
         new_tensors_device: Optional[SampleStateTensors] = None,
-    ) -> Tuple[bool, Optional[SampleType], Optional[int], Optional[bool]]:
-        """Agree shape, tier, KV regime and packed split decision like the
-        base runner, reusing the policy's shape agreement when it holds.
+        replay_key: Optional[KeyType] = None,
+        local_graph_shape: Optional[Tuple[SampleType, Tuple[Optional[int],
+                                                            ...]]] = None,
+    ) -> Tuple[bool, Optional[SampleType], Optional[Tuple[Optional[int], ...]]]:
+        """Agree shape, tier and graph variants like the base runner, reusing
+        the policy's shape agreement when it holds.
 
-        A reused agreement leaves the KV regime and the split decision
-        rank-local: both only pick the attention kernels of the rank's own
-        rows.
+        A reused agreement leaves the graph variants rank-local: they only
+        pick the attention kernels of the rank's own rows.
         """
         agreement = self.adp_shape_agreement
         # The policy agreement covers shape, not the in-graph sampling tier.
@@ -2125,11 +2232,11 @@ class DSparkCUDAGraphRunner(CUDAGraphRunner):
                     "matches the local replay key")
         adp_graph_agreement = (self.enabled and self.config.enable_attention_dp
                                and self.config.mapping.tp_size > 1)
-        local_sample_type = self._resolve_sample_type(
-            batch,
-            promoted_context_request_ids) if adp_graph_agreement else None
         if not adp_graph_agreement or reuse_agreement:
-            return True, None, None, None
+            return True, None, None
+        local_sample_type = (local_graph_shape[0] if local_graph_shape
+                             is not None else self._resolve_sample_type(
+                                 batch, promoted_context_request_ids))
 
         # Replay freezes all_rank_num_tokens. Compare every rank-local shape
         # component before launch; -1 denotes a non-applicable field.
@@ -2142,41 +2249,26 @@ class DSparkCUDAGraphRunner(CUDAGraphRunner):
             self._local_draft_len(batch) if can_run_cuda_graph else -1,
             local_sample_type.value,
         ]
-        # The KV regime rides along once the decode graphs are keyed by it.
-        keyed_by_kv_regime = self.kv_regime_resolver is not None
-        if keyed_by_kv_regime:
-            local_kv_regime = self._kv_regime_for_batch(
-                batch, new_tensors_device, promoted_context_request_ids)
-            local_shape.append(-1 if local_kv_regime is
-                               None else int(local_kv_regime))
-        # So does the packed split decision once the graphs are keyed by it.
-        keyed_by_packed_split = self.packed_split_resolver is not None
-        if keyed_by_packed_split:
-            local_packed_split = self._packed_split_for_batch(
-                batch, new_tensors_device, promoted_context_request_ids)
-            local_shape.append(-1 if local_packed_split is
-                               None else int(local_packed_split))
+        # The graph variants ride along once the decode graphs are keyed by them.
+        num_variants = len(self.graph_variants)
+        if num_variants:
+            local_shape.extend(
+                local_graph_shape[1] if local_graph_shape is not None else self.
+                _graph_variants_for_batch(batch, new_tensors_device,
+                                          promoted_context_request_ids))
         peer_shapes = self.config.dist.tp_allgather_int64(local_shape).tolist()
         if (not all(peer[0] for peer in peer_shapes)
                 or not all(peer[1:4] == peer_shapes[0][1:4]
                            for peer in peer_shapes)):
-            return False, None, None, None
+            return False, None, None
         forced_sample_type = (local_sample_type if all(
             peer[4] == peer_shapes[0][4]
             for peer in peer_shapes) else SampleType.FULL)
-        column = 5
-        forced_kv_regime = None
-        if keyed_by_kv_regime:
-            forced_kv_regime = _largest_kv_regime(
-                None if peer[column] < 0 else int(peer[column])
-                for peer in peer_shapes)
-            column += 1
-        forced_packed_split = None
-        if keyed_by_packed_split:
-            forced_packed_split = _agreed_packed_split(
-                None if peer[column] < 0 else bool(peer[column])
-                for peer in peer_shapes)
-        return True, forced_sample_type, forced_kv_regime, forced_packed_split
+        forced_variants = self._largest_variants([
+            tuple(None if value < 0 else int(value)
+                  for value in peer[5:5 + num_variants]) for peer in peer_shapes
+        ])
+        return True, forced_sample_type, forced_variants
 
     def _get_num_tokens_for_key(self, key: KeyType) -> int:
         if key.ragged_verify_bucket is not None:
@@ -3430,7 +3522,7 @@ class EncoderCUDAGraphRunner:
     def retire_staging(self) -> None:
         """Wait until a prior replay no longer reads shared staging buffers."""
         if self._staging_retirement_event is not None:
-            self._staging_retirement_event.synchronize()
+            wait_event(self._staging_retirement_event)
             self._staging_retirement_event = None
 
     def _replay_features(

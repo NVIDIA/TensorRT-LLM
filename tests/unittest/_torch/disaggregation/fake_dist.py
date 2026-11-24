@@ -120,18 +120,21 @@ class FakeDistRank:
     """
 
     pp_size = 1
-    cp_size = 1
 
     def __init__(self, group: "FakeDistGroup", rank: int) -> None:
         self._group = group
         self.rank = rank
         self.world_size = group.world_size
         self.tp_size = group.tp_size
+        self.cp_size = group.cp_size
         self.tp_rank = rank % group.tp_size
         self.calls: List[Tuple[str, Any]] = []
 
     def tp_allgather(self, obj, *, small_payload: bool = False) -> list:
         return self._gather(self._group.tp_rendezvous(self.rank), "tp_allgather", obj)
+
+    def tp_cp_allgather(self, obj, *, small_payload: bool = False) -> list:
+        return self._gather(self._group._tp_cp, "tp_cp_allgather", obj)
 
     def tp_allgather_int64(self, values) -> np.ndarray:
         gathered = self._gather(self._group.tp_rendezvous(self.rank), "tp_allgather_int64", values)
@@ -181,9 +184,16 @@ class FakeDistRank:
 class FakeDistGroup:
     """``world_size`` fake ranks in TP groups of ``tp_size`` consecutive ranks."""
 
-    def __init__(self, world_size: int, tp_size: int, timeout_s: float = 5.0) -> None:
+    def __init__(
+        self, world_size: int, tp_size: int, cp_size: int = 1, timeout_s: float = 5.0
+    ) -> None:
         if world_size % tp_size:
             raise ValueError(f"tp_size {tp_size} must divide world_size {world_size}")
+        if world_size % (tp_size * cp_size):
+            raise ValueError(
+                f"tp_size*cp_size {tp_size * cp_size} must divide world_size {world_size}"
+            )
+        self.cp_size = cp_size
         self.world_size = world_size
         self.tp_size = tp_size
         self._ranks = [FakeDistRank(self, rank) for rank in range(world_size)]
@@ -197,6 +207,8 @@ class FakeDistGroup:
             )
             for index in range(world_size // tp_size)
         ]
+        # One replicated TP+CP batch shares the cancellation vote across CP groups.
+        self._tp_cp = _Rendezvous("TP+CP group", range(world_size), timeout_s, self._last_call)
 
     def rank(self, rank: int) -> FakeDistRank:
         return self._ranks[rank]

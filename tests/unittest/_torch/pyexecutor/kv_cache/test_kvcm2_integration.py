@@ -193,6 +193,55 @@ def test_create_kv_cache_swa_endpoint_priority(
         assert kwargs["custom_priority_callback"](255, AttnLifeCycle(4096, 0)) == 70
 
 
+@pytest.mark.parametrize("rewind", [0, 1024])
+def test_create_kv_cache_forwards_custom_priority_callback(rewind: int) -> None:
+    """A caller's priority callback (a subclass's _context_priority_callback) reaches the backend.
+
+    With SWA endpoint priorities on, attention pages keep them and every other
+    page takes the caller's priority.
+    """
+    manager = object.__new__(KVCacheManagerV2)
+    manager._swa_endpoint_rewind = rewind
+    manager.block_reuse_policy = BlockReusePolicy.ALL_REUSABLE
+    manager.enable_block_reuse = True
+    manager.is_draft = False
+    manager.tokens_per_block = 32
+    manager.kv_cache_map = {}
+    manager.index_mapper = Mock()
+    manager.index_mapper.num_free_slots.return_value = 1
+    manager.max_beam_width = 1
+    manager.num_pools = 0
+    manager.impl = Mock()
+    manager.impl.create_kv_cache.return_value.beam_width = 1
+    manager.impl.create_kv_cache.return_value.batch_row = None
+
+    def callback(_ordinal, _life_cycle):
+        return 3
+
+    manager._create_kv_cache(
+        0,
+        None,
+        None,
+        is_dummy=False,
+        expected_prompt_length=8192,
+        custom_priority_callback=callback,
+    )
+
+    kwargs = manager.impl.create_kv_cache.call_args.kwargs
+    if rewind == 0:
+        assert kwargs["custom_priority_callback"] is callback
+    else:
+        priority = kwargs["custom_priority_callback"]
+        assert priority(255, AttnLifeCycle(4096, 0)) == 70
+        assert priority(255, object()) == 3
+
+
+def test_context_priority_callback_defaults_to_none() -> None:
+    """The base manager keeps the backend's default page priorities."""
+    manager = object.__new__(KVCacheManagerV2)
+    assert manager._context_priority_callback(Mock()) is None
+
+
 def _commit_released_prompt(core: KVCacheManager, prompt: list[int], priority_callback) -> None:
     """Run a prompt through a real cache and release it, leaving its pages reusable."""
     cache = core.create_kv_cache(None, prompt, custom_priority_callback=priority_callback)
@@ -337,8 +386,8 @@ class _FakeKVCache:
         self.num_committed_tokens += len(tokens)
         self.history_length = max(self.history_length, self.num_committed_tokens)
 
-    def resize(self, capacity, history_length: int) -> bool:
-        del capacity
+    def resize(self, capacity, history_length: int, *, complete_optional_recovery=False) -> bool:
+        del capacity, complete_optional_recovery
         self.history_length = history_length
         return True
 
@@ -1630,6 +1679,7 @@ def test_prepare_context_cache_records_lookup_without_mutating_cursor(
         context_current_position=6,
         is_first_context_chunk=True,
         is_disagg_generation_init_state=False,
+        is_context_only_request=False,
     )
     kv_cache = Mock(num_committed_tokens=2)
     manager = object.__new__(KVCacheManagerV2)
@@ -3276,7 +3326,7 @@ def test_disagg_generation_drafter_writes_stay_on_its_own_draft_pages(
         )
         worker._lazy_init_ctx_buffers(
             draft_model,
-            SimpleNamespace(max_num_requests=2),
+            SimpleNamespace(max_num_requests=2, num_seq_slots=2),
             attn_metadata,
             draft_kv_cache_manager=draft,
         )
@@ -3424,7 +3474,7 @@ def test_slot_from_zero_worker_refuses_a_disagg_windowed_draft_pool(
             """Bind the drafter's ctx cache to the draft pool."""
             worker._lazy_init_ctx_buffers(
                 draft_model,
-                SimpleNamespace(max_num_requests=2),
+                SimpleNamespace(max_num_requests=2, num_seq_slots=2),
                 attn_metadata,
                 draft_kv_cache_manager=draft,
             )
@@ -3498,7 +3548,7 @@ def test_trailing_drafter_slot_reads_only_pages_its_request_holds(
         )
         worker._lazy_init_ctx_buffers(
             draft_model,
-            SimpleNamespace(max_num_requests=2),
+            SimpleNamespace(max_num_requests=2, num_seq_slots=2),
             attn_metadata,
             draft_kv_cache_manager=draft,
         )
@@ -4329,7 +4379,13 @@ def max_num_turns() -> int:
 
 
 @pytest.fixture
-def manager(max_num_turns: int) -> KVCacheManagerV2:
+def drop_extended_turns() -> bool:
+    """BlockReuseConfig.drop_extended_turns for the ``manager`` fixture."""
+    return False
+
+
+@pytest.fixture
+def manager(max_num_turns: int, drop_extended_turns: bool) -> KVCacheManagerV2:
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     torch.cuda.init()
@@ -4343,6 +4399,7 @@ def manager(max_num_turns: int) -> KVCacheManagerV2:
             block_reuse_config=BlockReuseConfig(
                 policy="per_conversation",
                 max_num_turns=max_num_turns,
+                drop_extended_turns=drop_extended_turns,
             ),
         ),
         CacheType.SELF,
@@ -4673,6 +4730,162 @@ def test_per_conversation_policy_retains_configured_number_of_turns(
         _free_if_active(manager, request_a_probe)
         _free_if_active(manager, request_b)
         _free_if_active(manager, request_a)
+
+
+@pytest.mark.parametrize("max_num_turns", [2])
+@pytest.mark.parametrize(
+    ("drop_extended_turns", "main_reuse", "subagent_reuse"),
+    [
+        # Oldest first: the subagent's two turns push out the main turn.
+        (False, 0, 7),
+        # Drop on extension: the subagent's second turn drops its first,
+        # and the main turn, which nothing extended, stays.
+        (True, 7, 0),
+    ],
+)
+def test_per_conversation_policy_drop_extended_turns_keeps_unextended_branch(
+    manager: KVCacheManagerV2,
+    drop_extended_turns: bool,
+    main_reuse: int,
+    subagent_reuse: int,
+) -> None:
+    """A subagent that shares its parent's conversation id must not evict the parent."""
+    main = _ContextRequest(1, list(range(8)), 8, "conv-1")
+    subagent_turn_1 = _ContextRequest(2, list(range(100, 108)), 8, "conv-1")
+    subagent_turn_2 = _ContextRequest(3, list(range(100, 112)), 12, "conv-1")
+    main_probe = _ContextRequest(4, list(range(8)), 8, "conv-2")
+    subagent_probe = _ContextRequest(5, list(range(100, 108)), 8, "conv-3")
+
+    try:
+        for request in (main, subagent_turn_1, subagent_turn_2):
+            _run_context(manager, request)
+            _free_if_active(manager, request)
+
+        assert manager.prepare_context(main_probe)
+        assert main_probe.prepopulated_prompt_len == main_reuse
+        _free_if_active(manager, main_probe)
+
+        assert manager.prepare_context(subagent_probe)
+        assert subagent_probe.prepopulated_prompt_len == subagent_reuse
+    finally:
+        _free_if_active(manager, subagent_probe)
+        _free_if_active(manager, main_probe)
+        _free_if_active(manager, subagent_turn_2)
+        _free_if_active(manager, subagent_turn_1)
+        _free_if_active(manager, main)
+
+
+@pytest.mark.parametrize("max_num_turns", [2])
+@pytest.mark.parametrize("drop_extended_turns", [True])
+@pytest.mark.parametrize(
+    ("second_salt", "first_reuse"),
+    [
+        # Same reuse scope: the second turn extends the first, which is dropped.
+        ("a", 0),
+        # Different reuse scope: matching tokens alone do not make it an extension.
+        ("b", 7),
+    ],
+)
+def test_per_conversation_policy_drop_extended_turns_respects_reuse_scope(
+    manager: KVCacheManagerV2,
+    second_salt: str,
+    first_reuse: int,
+) -> None:
+    """Only a later turn in the same reuse scope can drop an earlier turn."""
+    first = _ContextRequest(1, list(range(8)), 8, "conv-1", cache_salt="a")
+    second = _ContextRequest(2, list(range(12)), 12, "conv-1", cache_salt=second_salt)
+    first_probe = _ContextRequest(3, list(range(8)), 8, "conv-2", cache_salt="a")
+
+    try:
+        for request in (first, second):
+            _run_context(manager, request)
+            _free_if_active(manager, request)
+
+        assert manager.prepare_context(first_probe)
+        assert first_probe.prepopulated_prompt_len == first_reuse
+    finally:
+        _free_if_active(manager, first_probe)
+        _free_if_active(manager, second)
+        _free_if_active(manager, first)
+
+
+@pytest.mark.parametrize("max_num_turns", [3])
+@pytest.mark.parametrize("drop_extended_turns", [True])
+def test_per_conversation_policy_drop_extended_turns_drops_every_extended_turn(
+    manager: KVCacheManagerV2,
+) -> None:
+    """A turn that extends several retained turns drops all of them at once."""
+    main = _ContextRequest(1, list(range(500, 508)), 8, "conv-1")
+    longer = _ContextRequest(2, list(range(12)), 12, "conv-1")
+    shorter = _ContextRequest(3, list(range(8)), 8, "conv-1")
+    extending = _ContextRequest(4, list(range(16)), 16, "conv-1")
+    main_probe = _ContextRequest(5, list(range(500, 508)), 8, "conv-2")
+    shorter_probe = _ContextRequest(6, list(range(8)), 8, "conv-3")
+
+    try:
+        for request in (main, longer, shorter, extending):
+            _run_context(manager, request)
+            _free_if_active(manager, request)
+
+        # The main turn and the extending turn remain; both prefixes are gone.
+        state = manager.conversation_manager._conversation_states[("conv-1", None, None)]
+        assert [turn.num_committed_tokens for turn in state.retained_turns] == [8, 16]
+
+        assert manager.prepare_context(main_probe)
+        assert main_probe.prepopulated_prompt_len == 7
+        _free_if_active(manager, main_probe)
+
+        assert manager.prepare_context(shorter_probe)
+        assert shorter_probe.prepopulated_prompt_len == 0
+    finally:
+        _free_if_active(manager, shorter_probe)
+        _free_if_active(manager, main_probe)
+        _free_if_active(manager, extending)
+        _free_if_active(manager, shorter)
+        _free_if_active(manager, longer)
+        _free_if_active(manager, main)
+
+
+@pytest.mark.parametrize("drop_extended_turns", [False, True])
+def test_per_conversation_policy_extension_keeps_shared_window_page(
+    manager: KVCacheManagerV2,
+) -> None:
+    """Dropping the extended turn keeps the window page it shares with the new turn.
+
+    The one-token extension keeps the new turn's SWA window on the page the old
+    turn ended in. The new turn is planned before the old one is dropped, so
+    that page stays reusable at the new endpoint.
+    """
+    turn = _ContextRequest(1, list(range(8)), 8, "conv-1")
+    extension = _ContextRequest(2, list(range(9)), 9, "conv-1")
+    extension_probe = _ContextRequest(3, list(range(9)), 9, "conv-2")
+
+    try:
+        for request in (turn, extension):
+            _run_context(manager, request)
+            _free_if_active(manager, request)
+
+        assert manager.prepare_context(extension_probe)
+        assert extension_probe.prepopulated_prompt_len == extension_probe.prompt_len - 1
+    finally:
+        _free_if_active(manager, extension_probe)
+        _free_if_active(manager, extension)
+        _free_if_active(manager, turn)
+
+
+def test_prefix_digests_match_across_token_types() -> None:
+    """Integer prefixes digest the same whether or not later tokens are multimodal."""
+    text = [5, 6, 7, 8]
+    mixed = [*text, b"image-key", 9]
+    text_digests = kv_cache_v2_module._prefix_digests(kv_cache_v2_module._token_words(text), [2, 4])
+    mixed_digests = kv_cache_v2_module._prefix_digests(
+        kv_cache_v2_module._token_words(mixed), [2, 4, 6]
+    )
+    assert text_digests[2] == mixed_digests[2]
+    assert text_digests[4] == mixed_digests[4]
+    assert mixed_digests[4] != mixed_digests[6]
+    other = kv_cache_v2_module._prefix_digests(kv_cache_v2_module._token_words([5, 6, 7, 0]), [4])
+    assert other[4] != text_digests[4]
 
 
 def test_per_conversation_policy_ignores_overlapping_request(

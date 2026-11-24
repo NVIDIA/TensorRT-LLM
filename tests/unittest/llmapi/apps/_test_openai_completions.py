@@ -38,6 +38,10 @@ def server(model_name: str, backend: str, num_postprocess_workers: int):
     args = ["--backend", f"{backend}"]
     args.extend(["--kv_cache_free_gpu_memory_fraction",
                  "0.2"])  # for co-existence with other servers
+    # Smaller batch size reduces chance of OOM, because test parametrization results
+    # in several concurrently live engines.
+    args.extend(["--max_batch_size", "128"])
+    args.extend(["--max_num_tokens", "1024"])
     args.extend(["--num_postprocess_workers", f"{num_postprocess_workers}"])
     with RemoteOpenAIServer(model_path, args) as remote_server:
         yield remote_server
@@ -54,6 +58,10 @@ def server_with_beam_search(model_name: str, backend: str,
     # --max_beam_width's per-beam KV cache reservation exceeds the capacity
     # available on smaller GPUs (A10), crashing the server during startup.
     args.extend(["--max_seq_len", "2048"])
+    # Smaller batch size reduces chance of OOM, because test parametrization results
+    # in several concurrently live engines.
+    args.extend(["--max_batch_size", "128"])
+    args.extend(["--max_num_tokens", "1024"])
     args.extend(["--max_beam_width", "2"])
     args.extend(["--num_postprocess_workers", f"{num_postprocess_workers}"])
     with RemoteOpenAIServer(model_path, args) as remote_server:

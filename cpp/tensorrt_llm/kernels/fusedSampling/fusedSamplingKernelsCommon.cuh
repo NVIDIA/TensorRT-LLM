@@ -59,6 +59,8 @@ constexpr float kTempEpsilon = 1e-6f;
 //! build, so exhausting the budget still answers with a token inside the support -- it
 //! perturbs the distribution rather than leaving it.
 constexpr int kMaxRejectRounds = 32;
+//! Walkers the parallel walk serves; more (a rounding pathology) take the per-thread walk.
+constexpr int kMaxWalkers = 4;
 
 __device__ inline float toFloat(float v)
 {
@@ -104,6 +106,41 @@ __device__ inline void forEachLogit(T const* row, int vocabSize, Fn fn)
     for (int v = threadIdx.x; v < vecCount; v += blockDim.x)
     {
         int4 const packed = reinterpret_cast<int4 const*>(row)[v];
+        T const* elems = reinterpret_cast<T const*>(&packed);
+#pragma unroll
+        for (int j = 0; j < kWidth; ++j)
+        {
+            fn(v * kWidth + j, toFloat(elems[j]));
+        }
+    }
+    for (int i = vecCount * kWidth + threadIdx.x; i < vocabSize; i += blockDim.x)
+    {
+        fn(i, toFloat(row[i]));
+    }
+}
+
+//! forEachLogit with the next vector's load issued before the current one is processed: the same
+//! elements in the same per-thread order.
+template <typename T, typename Fn>
+__device__ inline void forEachLogitPipelined(T const* row, int vocabSize, Fn fn)
+{
+    constexpr int kWidth = kVecBytes / sizeof(T);
+    if ((reinterpret_cast<uintptr_t>(row) % kVecBytes) != 0)
+    {
+        forEachLogit(row, vocabSize, fn);
+        return;
+    }
+    int const vecCount = vocabSize / kWidth;
+    int4 const* vec = reinterpret_cast<int4 const*>(row);
+    int v = threadIdx.x;
+    int4 next = v < vecCount ? vec[v] : int4{};
+    for (; v < vecCount; v += blockDim.x)
+    {
+        int4 const packed = next;
+        if (v + static_cast<int>(blockDim.x) < vecCount)
+        {
+            next = vec[v + blockDim.x];
+        }
         T const* elems = reinterpret_cast<T const*>(&packed);
 #pragma unroll
         for (int j = 0; j < kWidth; ++j)
@@ -565,7 +602,161 @@ struct FusedSamplingShared
     float massTarget;
     int candIdx;
     curandStatePhilox4_32_10_t rejectRng;
+    int walkers;
+    int walkerTid[kMaxWalkers];
+    float walkerBase[kMaxWalkers];
 };
+
+//! Inverse-CDF walk of the rejection path: the thread whose scan interval holds ``target`` re-adds
+//! its strided weights in order until the running mass passes it. Warp 0 stages them in shared
+//! memory in parallel and one lane sums them in that order, bit-identical to the per-thread walk.
+template <typename T, int BLOCK>
+__device__ void walkSupport(T const* rowLogits, int vocabSize, float tempInv, float maxScaled, float supportFloor,
+    float pivot, float target, float base, bool walks, FusedSamplingShared<BLOCK>& shared)
+{
+    constexpr int kWidth = kVecBytes / sizeof(T);
+    constexpr int kChunk = 32;
+    static_assert(kChunk * kWidth <= kCandCap);
+    int const tid = threadIdx.x;
+    if (tid == 0)
+    {
+        shared.walkers = 0;
+    }
+    __syncthreads();
+    if (walks)
+    {
+        int const k = atomicAdd(&shared.walkers, 1);
+        if (k < kMaxWalkers)
+        {
+            shared.walkerTid[k] = tid;
+            shared.walkerBase[k] = base;
+        }
+    }
+    __syncthreads();
+    int const walkers = shared.walkers;
+    if (tid == 0 && walkers > 1 && walkers <= kMaxWalkers)
+    {
+        // Ascending thread order: a later walker that also crosses (a rounding-only overlap) wins.
+        for (int k = 1; k < walkers; ++k)
+        {
+            for (int q = k; q > 0 && shared.walkerTid[q - 1] > shared.walkerTid[q]; --q)
+            {
+                int const t = shared.walkerTid[q];
+                float const b = shared.walkerBase[q];
+                shared.walkerTid[q] = shared.walkerTid[q - 1];
+                shared.walkerBase[q] = shared.walkerBase[q - 1];
+                shared.walkerTid[q - 1] = t;
+                shared.walkerBase[q - 1] = b;
+            }
+        }
+    }
+    __syncthreads();
+    bool const aligned = (reinterpret_cast<uintptr_t>(rowLogits) % kVecBytes) == 0;
+    if (walkers > kMaxWalkers || !aligned)
+    {
+        if (walks)
+        {
+            float running = base;
+            bool found = false;
+            forEachLogit(rowLogits, vocabSize,
+                [&](int i, float logit)
+                {
+                    if (found)
+                    {
+                        return;
+                    }
+                    float const w = __expf(__fmul_rn(logit, tempInv) - maxScaled);
+                    if (!(w >= supportFloor && w > pivot))
+                    {
+                        return;
+                    }
+                    running += w;
+                    if (running > target)
+                    {
+                        shared.candIdx = i;
+                        shared.candWeight = w;
+                        found = true;
+                    }
+                });
+        }
+        return;
+    }
+    if (tid >= 32)
+    {
+        return;
+    }
+    int const lane = tid;
+    int const vecCount = vocabSize / kWidth;
+    float* const weights = shared.cand;
+    for (int w = 0; w < walkers; ++w)
+    {
+        int const walker = shared.walkerTid[w];
+        float running = shared.walkerBase[w];
+        int const count = walker < vecCount ? (vecCount - 1 - walker) / BLOCK + 1 : 0;
+        int found = -1;
+        float foundWeight = 0.0f;
+        for (int c0 = 0; c0 < count && found < 0; c0 += kChunk)
+        {
+            int const m = c0 + lane;
+            if (m < count)
+            {
+                int4 const packed = reinterpret_cast<int4 const*>(rowLogits)[walker + m * BLOCK];
+                T const* elems = reinterpret_cast<T const*>(&packed);
+#pragma unroll
+                for (int j = 0; j < kWidth; ++j)
+                {
+                    weights[lane * kWidth + j] = __expf(__fmul_rn(toFloat(elems[j]), tempInv) - maxScaled);
+                }
+            }
+            __syncwarp();
+            if (lane == 0)
+            {
+                int const n = min(kChunk, count - c0);
+                for (int mm = 0; mm < n && found < 0; ++mm)
+                {
+#pragma unroll
+                    for (int j = 0; j < kWidth; ++j)
+                    {
+                        float const wj = weights[mm * kWidth + j];
+                        if (wj >= supportFloor && wj > pivot)
+                        {
+                            running += wj;
+                            if (found < 0 && running > target)
+                            {
+                                found = (walker + (c0 + mm) * BLOCK) * kWidth + j;
+                                foundWeight = wj;
+                            }
+                        }
+                    }
+                }
+            }
+            found = __shfl_sync(0xffffffffu, found, 0);
+            __syncwarp();
+        }
+        if (lane == 0)
+        {
+            for (int i = vecCount * kWidth + walker; found < 0 && i < vocabSize; i += BLOCK)
+            {
+                float const wi = __expf(__fmul_rn(toFloat(rowLogits[i]), tempInv) - maxScaled);
+                if (wi >= supportFloor && wi > pivot)
+                {
+                    running += wi;
+                    if (running > target)
+                    {
+                        found = i;
+                        foundWeight = wi;
+                    }
+                }
+            }
+            if (found >= 0)
+            {
+                shared.candIdx = found;
+                shared.candWeight = foundWeight;
+            }
+        }
+        __syncwarp();
+    }
+}
 
 //! \brief The kernel body, shared by both entry points below.
 //!
@@ -649,7 +840,7 @@ __device__ void fusedSamplingBody(FusedSamplingParams const& params, FusedSampli
         {
             if (reuseThreadMass)
             {
-                forEachLogit(rowLogits, vocabSize,
+                forEachLogitPipelined(rowLogits, vocabSize,
                     [&](int i, float logit) {
                         cachedThreadStats = combineOnlineSoftmax(
                             cachedThreadStats, OnlineSoftmax{__fmul_rn(logit, rp.tempInv), 1.0f, i});
@@ -837,33 +1028,8 @@ __device__ void fusedSamplingBody(FusedSamplingParams const& params, FusedSampli
                 __syncthreads();
 
                 float const target = sTarget;
-                if (target >= base && target < base + localMass)
-                {
-                    // Same traversal as the accumulation above, so the two float sums
-                    // agree term for term and the crossing lands on the same element.
-                    float running = base;
-                    bool found = false;
-                    forEachLogit(rowLogits, vocabSize,
-                        [&](int i, float logit)
-                        {
-                            if (found)
-                            {
-                                return;
-                            }
-                            float const w = __expf(__fmul_rn(logit, rp.tempInv) - maxScaled);
-                            if (!(w >= supportFloor && w > pivot))
-                            {
-                                return;
-                            }
-                            running += w;
-                            if (running > target)
-                            {
-                                sCandIdx = i;
-                                sCandWeight = w;
-                                found = true;
-                            }
-                        });
-                }
+                walkSupport<T, BLOCK>(rowLogits, vocabSize, rp.tempInv, maxScaled, supportFloor, pivot, target, base,
+                    target >= base && target < base + localMass, shared);
                 __syncthreads();
 
                 if (sCandIdx < 0)

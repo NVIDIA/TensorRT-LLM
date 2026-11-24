@@ -14,6 +14,7 @@
 # limitations under the License.
 """MoE backend unit tests."""
 
+import ast
 import collections
 import dataclasses
 import importlib
@@ -47,11 +48,14 @@ from _torch.moe.moe_test_utils import (
 )
 from _torch.moe.quantize_utils import get_test_quant_params
 from transformers.configuration_utils import PretrainedConfig
-from utils.util import check_accuracy, skip_pre_blackwell
+from utils.util import check_accuracy, getSMVersion, skip_pre_blackwell
 
 from tensorrt_llm._torch.autotuner import AutoTuner, OptimizationProfile, autotune
 from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import _select_explicit_fallback_tactic
-from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
+from tensorrt_llm._torch.cute_dsl_utils import (
+    IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE,
+    IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+)
 from tensorrt_llm._torch.locality_domain.policy import LocalityDomainPolicy
 from tensorrt_llm._torch.locality_domain_utils import is_locality_domain_enabled
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -78,11 +82,14 @@ from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
 from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe_backend
 from tensorrt_llm._torch.moe.fused_moe.cutedsl import (
     TrtllmCutedslDenseGemmNvfp4Impl,
+    TrtllmCutedslFusedFc12Mxfp8Impl,
     TrtllmCutedslGroupedGemmBf16Impl,
     TrtllmCutedslGroupedGemmNvfp4Impl,
     TrtllmCutedslGroupedGemmNvfp4PlusImpl,
 )
-from tensorrt_llm._torch.moe.fused_moe.cutedsl.fused_fc12 import CuteDslFc12FusedMoENvfp4Runner
+from tensorrt_llm._torch.moe.fused_moe.cutedsl.fused_fc12.nvfp4 import (
+    CuteDslFc12FusedMoENvfp4Runner,
+)
 from tensorrt_llm._torch.moe.fused_moe.cutedsl.runners import CuteDslFusedMoENvfp4Runner
 from tensorrt_llm._torch.moe.fused_moe.cutlass import (
     CUTLASS_LEAVES,
@@ -91,6 +98,7 @@ from tensorrt_llm._torch.moe.fused_moe.cutlass import (
     TrtllmCutlassUnquantizedImpl,
     TrtllmCutlassW4a16Mxfp4Impl,
     TrtllmCutlassW4a16Nvfp4Impl,
+    TrtllmTritonFp8ActGroupedGemmFp8BlockScalesImpl,
     TrtllmTritonFp8BlockScalesImpl,
 )
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import (
@@ -152,6 +160,7 @@ from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb.planner import (
 )
 from tensorrt_llm._torch.moe.fused_moe.quantization import (
     FusedMoEMethodBase,
+    FusedMoEQuantScalesDeepSeekFP8BlockScales,
     MXFP4WeightTRTLLMGenFusedMoEMethod,
     NVFP4FusedMoEMethod,
     NVFP4MarlinFusedMoEMethod,
@@ -443,6 +452,243 @@ def test_fused_comm_scheduler_rejects_partial_ep_token_metadata():
         scheduler._strip_adp_padding(x, router_logits, None, [6, 5])
 
 
+def _dummy_allreduce_moe(
+    rank: int, enabled: bool, events: List[str], **backend_overrides
+) -> SimpleNamespace:
+    """A fused-comm MoE that records its debug collectives, quantization and kernel launches."""
+
+    def run_moe(ctx: MoERunContext) -> torch.Tensor:
+        events.append("run_moe")
+        return ctx.x + 1
+
+    backend = dict(
+        input_requirement=MoEInputRequirement(),
+        fused_route_quant_enabled=False,
+        quantize_input=lambda x: events.append("quantize") or (x, None),
+        run_moe=run_moe,
+    )
+    backend.update(backend_overrides)
+    return SimpleNamespace(
+        mapping=SimpleNamespace(moe_ep_rank=rank, moe_ep_size=2),
+        parallel_size=2,
+        use_dp=True,
+        moe_max_num_tokens=2,
+        split_chunk=_split_chunk,
+        repeat_idx=0,
+        repeat_count=1,
+        apply_router_weight_on_input=False,
+        enable_dummy_allreduce=enabled,
+        dummy_allreduce=lambda: events.append("allreduce"),
+        layer_load_balancer=None,
+        num_slots=4,
+        _enable_perfect_router_expert_ids=False,
+        routing_method=SimpleNamespace(
+            experts_per_token=1,
+            apply=lambda logits, ids: (
+                torch.zeros((logits.shape[0], 1), dtype=torch.int32),
+                torch.ones((logits.shape[0], 1), dtype=torch.float32),
+            ),
+        ),
+        _using_dynamic_load_balancer=lambda: False,
+        _load_balancer_uses_replica_plan=lambda: False,
+        _warmup_placement_route_counters=lambda offset: None,
+        _maybe_get_perfect_router_expert_ids=lambda routes: routes,
+        _load_balancer_start_wait_gpu_stage=Mock(),
+        _load_balancer_start_set_cpu_stage=Mock(),
+        _load_balancer_done_set_cpu_stage=Mock(),
+        backend=SimpleNamespace(**backend),
+    )
+
+
+def _run_dummy_allreduce_scheduler(
+    scheduler: FusedCommMoEScheduler, token_counts: Tuple[int, int]
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    # Attention-DP padding must not turn an idle rank into a nonempty chunk.
+    x = torch.arange(max(token_counts) * 8, dtype=torch.float32).reshape(-1, 8)
+    output = scheduler.forward(
+        x,
+        torch.zeros((x.shape[0], 4)),
+        do_finalize=True,
+        output_dtype=x.dtype,
+        all_rank_num_tokens=list(token_counts),
+        use_dp_padding=True,
+        input_ids=None,
+    )
+    return x, output
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("token_counts", [(2, 1), (5, 1), (5, 0), (0, 0)])
+def test_fused_comm_dummy_allreduce_brackets_every_chunk(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool, token_counts: tuple[int, int]
+) -> None:
+    """Ranks with empty/tail chunks must issue the same debug collectives as their peers."""
+    scheduler_module = importlib.import_module(FusedCommMoEScheduler.__module__)
+    monkeypatch.setattr(scheduler_module, "_record_routes", lambda moe, routes, slots: routes)
+    monkeypatch.setattr(scheduler_module, "get_active_route_capture", lambda: None)
+    num_chunks = max(1, (max(token_counts) + 1) // 2)
+
+    for rank, num_tokens in enumerate(token_counts):
+        events = []
+        chunk_sizes = []
+        moe = _dummy_allreduce_moe(rank, enabled, events)
+        run_moe = moe.backend.run_moe
+
+        def record_chunk(ctx: MoERunContext, run_moe=run_moe) -> torch.Tensor:
+            chunk_sizes.append(ctx.x.shape[0])
+            return run_moe(ctx)
+
+        moe.backend.run_moe = record_chunk
+        x, output = _run_dummy_allreduce_scheduler(FusedCommMoEScheduler(moe), token_counts)
+
+        chunk_events = ["quantize", "run_moe"]
+        if enabled:
+            chunk_events = ["allreduce", *chunk_events, "allreduce"]
+        assert events == chunk_events * num_chunks
+        assert chunk_sizes == _split_chunk(num_tokens, num_chunks)
+        torch.testing.assert_close(output, x[:num_tokens] + 1, atol=0, rtol=0)
+
+
+@pytest.fixture
+def rubin_fused_comm_scheduler_type() -> type:
+    # Importing the GLM Rubin target loads its SM107 native library. Execute just its scheduler
+    # class on top of the real shared scheduler, so this CPU test needs neither.
+    source = (
+        Path(__file__).resolve().parents[4]
+        / "tensorrt_llm/_torch/modeling_v2/models/glm_moe_dsa"
+        / "glm_5_2_nvfp4__sm_107__high_throughput/ops/moe/megamoe.py"
+    )
+    tree = ast.parse(source.read_text())
+    scheduler = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "RubinFusedCommScheduler"
+    )
+    namespace = {
+        "FusedCommMoEScheduler": FusedCommMoEScheduler,
+        "MoERunContext": MoERunContext,
+        "get_active_route_capture": lambda: None,
+        "ExpertStatistic": SimpleNamespace(should_record=lambda: False),
+        "get_calibrator": lambda: SimpleNamespace(mode=None),
+        "Mode": SimpleNamespace(NONE=None),
+    }
+    exec(compile(ast.Module(body=[scheduler], type_ignores=[]), str(source), "exec"), namespace)
+    return namespace["RubinFusedCommScheduler"]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("enabled", [False, True])
+def test_fused_comm_dummy_allreduce_covers_forward_chunk_override(
+    monkeypatch: pytest.MonkeyPatch, rubin_fused_comm_scheduler_type: type, enabled: bool
+) -> None:
+    """A rank on the GLM Rubin direct stage and an idle rank issue the same debug collectives."""
+    scheduler_module = importlib.import_module(FusedCommMoEScheduler.__module__)
+    monkeypatch.setattr(scheduler_module, "_record_routes", lambda moe, routes, slots: routes)
+    monkeypatch.setattr(scheduler_module, "get_active_route_capture", lambda: None)
+    token_counts = (5, 0)
+    num_chunks = 3
+
+    rank_events = []
+    for rank, num_tokens in enumerate(token_counts):
+        events = []
+        stage = SimpleNamespace(
+            topk_idx=torch.zeros((2, 1), dtype=torch.int32),
+            topk_weights=torch.ones((2, 1)),
+        )
+        prepare_direct_stage = Mock(return_value=stage)
+        moe = _dummy_allreduce_moe(
+            rank,
+            enabled,
+            events,
+            prepare_direct_stage=prepare_direct_stage,
+            route_and_quantize_into=lambda *args: stage,
+            quantize_input_into=lambda x, stage: events.append("quantize_into") or (x, None),
+            set_adaptive_launch_tokens=Mock(),
+        )
+        x, output = _run_dummy_allreduce_scheduler(
+            rubin_fused_comm_scheduler_type(moe), token_counts
+        )
+
+        assert prepare_direct_stage.call_count == (num_chunks if num_tokens else 0)
+        torch.testing.assert_close(output, x[:num_tokens] + 1, atol=0, rtol=0)
+        rank_events.append(events)
+
+    def expected(quantize: str) -> List[str]:
+        chunk_events = [quantize, "run_moe"]
+        if enabled:
+            chunk_events = ["allreduce", *chunk_events, "allreduce"]
+        return chunk_events * num_chunks
+
+    # Rank 0 runs the direct stage; the idle rank 1 falls back to the base path.
+    assert rank_events == [expected("quantize_into"), expected("quantize")]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("attention_dp", [False, True])
+def test_dummy_allreduce_uses_nccl_whatever_the_model_strategy(
+    monkeypatch: pytest.MonkeyPatch, attention_dp: bool
+) -> None:
+    """TWOSHOT at TP 2/4 rejects the 4-element dummy tensor, so the dummy sync has its own NCCL
+    reducer; under attention TP the layer's output reduction keeps the model's strategy."""
+    import tensorrt_llm._torch.distributed as distributed
+    from tensorrt_llm.functional import AllReduceStrategy
+
+    class RecordingAllReduce:
+        def __init__(self, *, mapping, strategy, dtype):
+            self.strategy = strategy
+            self.inputs = []
+
+        def __call__(self, x):
+            self.inputs.append(x)
+            return x
+
+    class ReducerTestMoE(MoE):
+        def create_weights(self):
+            raise NotImplementedError
+
+        def load_weights(self, weights, allow_partial_loading=False):
+            raise NotImplementedError
+
+        def quantize_input(self, x, **kwargs):
+            return x, None
+
+        def run_moe(self, ctx, *, workspace=None):
+            raise NotImplementedError
+
+    monkeypatch.setattr(distributed, "AllReduce", RecordingAllReduce)
+    monkeypatch.setenv("TRTLLM_ENABLE_DUMMY_ALLREDUCE", "1")
+    moe = ReducerTestMoE(
+        routing_method=DefaultMoeRoutingMethod(top_k=1),
+        num_experts=4,
+        hidden_size=8,
+        intermediate_size=16,
+        dtype=torch.bfloat16,
+        reduce_results=True,
+        model_config=ModelConfig(
+            mapping=Mapping(world_size=2, tp_size=2, rank=0, enable_attention_dp=attention_dp),
+            allreduce_strategy=AllReduceStrategy.TWOSHOT,
+        ),
+        init_load_balancer=False,
+    )
+
+    assert moe.dummy_all_reduce.strategy == AllReduceStrategy.NCCL
+    if attention_dp:
+        # No output reduction under attention DP: the layer keeps the NCCL reducer, as before.
+        assert moe.all_reduce is moe.dummy_all_reduce
+    else:
+        assert moe.all_reduce.strategy == AllReduceStrategy.TWOSHOT
+
+    zeros = torch.zeros
+    monkeypatch.setattr(torch, "zeros", lambda *args, device=None, **kwargs: zeros(*args, **kwargs))
+    moe.dummy_allreduce()
+
+    (dummy,) = moe.dummy_all_reduce.inputs
+    assert dummy.shape == (4,) and dummy.dtype == torch.float32
+    if not attention_dp:
+        assert moe.all_reduce.inputs == []
+
+
 @pytest.mark.cpu_only
 def test_import_deep_gemm_rejects_pre_situ_mega_moe_api(monkeypatch):
     import tensorrt_llm
@@ -618,10 +864,13 @@ def test_cutedsl_direct_metadata_tuning_buckets_capacity_and_legacy_uses_tokens(
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("decode_tuning", [False, True])
-def test_fp4_block_scale_moe_decode_tuning(decode_tuning: bool) -> None:
+def test_fp4_block_scale_moe_decode_tuning(
+    monkeypatch: pytest.MonkeyPatch, decode_tuning: bool
+) -> None:
     """Only a model that declares decode tuning gets the decode-step buckets and rank 0's tactic on every
     rank; otherwise every rank tunes on its own over the power-of-2 ladder."""
     from tensorrt_llm._torch.autotuner import DistributedTuningStrategy
+    from tensorrt_llm._torch.custom_ops import trtllm_gen_custom_ops
     from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import FP4BlockScaleMoERunner
 
     config = FP4BlockScaleMoERunner.get_tuning_config(4, decode_tuning=decode_tuning)
@@ -640,13 +889,16 @@ def test_fp4_block_scale_moe_decode_tuning(decode_tuning: bool) -> None:
         assert [spec.map_to_tuning_buckets(m) for m in (7, 14, 28, 130)] == [4, 8, 16, 128]
 
     # Only the declaring model's tuning cache key carries the flag, and with it do_finalize (finalized and
-    # un-finalized calls run different kernels).
+    # un-finalized calls run different kernels); the routing the tactics are timed on follows.
+    monkeypatch.setattr(trtllm_gen_custom_ops, "_dummy_distribution", lambda: "random")
     for do_finalize in (False, True):
         runner = FP4BlockScaleMoERunner(
             512, 10, None, None, 512, 0, 64, None, 1, do_finalize, 0, decode_tuning=decode_tuning
         )
-        assert runner.unique_id() == (10, 512, 64, 0) + (
-            (True, do_finalize) if decode_tuning else ()
+        assert runner.unique_id() == (
+            (10, 512, 64, 0)
+            + ((True, do_finalize) if decode_tuning else ())
+            + (512, False, 1, None, None, "random")
         )
 
 
@@ -1797,12 +2049,12 @@ def test_moe_weight_owner_declares_transform_guard_before_load() -> None:
     """A staged receiver can mark a never-loaded expert-weight owner transformed.
 
     Post-transform receivers install already transformed expert bytes without
-    calling `load_weights()`. `ModelLoader._mark_weights_transformed` only marks
+    calling `load_weights()`. `model_hooks.mark_weights_transformed` only marks
     modules that carry the guard, so it must exist from construction on the
     backend that sits behind the `_weights_removed` `ConfigurableMoE` wrapper.
     """
+    from tensorrt_llm._torch.models.checkpoints import model_hooks
     from tensorrt_llm._torch.moe.fused_moe.impl_blocks import MoEWeightOwnerMixin
-    from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 
     assert MoEWeightOwnerMixin._weights_transformed is False
     # `__new__` rather than the constructor: the guard is a class-level
@@ -1819,15 +2071,13 @@ def test_moe_weight_owner_declares_transform_guard_before_load() -> None:
     model = torch.nn.Module()
     model.experts = wrapper
 
-    ModelLoader._mark_weights_transformed(model)
+    model_hooks.mark_weights_transformed(model)
 
     assert backend._weights_transformed is True
     assert wrapper._weights_transformed is False
-    # The walk itself must skip the marked backend; the backend's own guard
-    # would also stop the quantization transform, so spy on the hook it calls.
-    backend.transform_weights = MagicMock(wraps=backend.transform_weights)
-    ModelLoader._walk_transform(model)
-    backend.transform_weights.assert_not_called()
+    # The guard makes a later transform of the marked backend skip the
+    # quantization transform, so spy on the hook it would call.
+    backend.transform_weights()
     backend.quant_method.transform_weights.assert_not_called()
 
 
@@ -3535,7 +3785,7 @@ def test_megamoe_cache_derived_state_survives_the_read_only_reader_walk():
     surfaces as the assert in ``run_moe`` -- so the walk itself is asserted,
     not just the override in isolation.
     """
-    from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
+    from tensorrt_llm._torch.models.checkpoints import model_hooks
 
     # ``__new__`` rather than the constructor: the real ``__init__`` would want
     # MPI, a process group, and a DG SymmBuffer, none of which this walk needs.
@@ -3552,7 +3802,7 @@ def test_megamoe_cache_derived_state_survives_the_read_only_reader_walk():
     model = torch.nn.Module()
     model.moe = wrapper
 
-    ModelLoader._walk_cache_state(model)
+    model_hooks.walk_cache_state(model)
 
     backend._alloc_symm_buffer.assert_called_once_with()
     backend.quant_method.cache_derived_state.assert_called_once_with(backend)
@@ -3568,7 +3818,7 @@ def test_megamoe_cutedsl_cache_derived_state_survives_the_read_only_reader_walk(
     ``post_load_weights``, so losing the override here leaves the derived
     MegaMoE-format state silently never recomputed.
     """
-    from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
+    from tensorrt_llm._torch.models.checkpoints import model_hooks
 
     # ``__new__`` rather than the constructor: the real ``__init__`` would want
     # a process group and the cuMem symmetric-memory rendezvous.
@@ -3588,7 +3838,7 @@ def test_megamoe_cutedsl_cache_derived_state_survives_the_read_only_reader_walk(
     model = torch.nn.Module()
     model.moe = wrapper
 
-    ModelLoader._walk_cache_state(model)
+    model_hooks.walk_cache_state(model)
 
     backend.create_weights.assert_called_once_with()
     quant_method.cache_derived_state.assert_called_once_with(backend)
@@ -4634,17 +4884,19 @@ def test_enumerate_megamoe_candidate_tactics_curated_space(
     decode = megamoe_op.enumerate_megamoe_candidate_tactics(1024, sm_version=sm_version)
     prefill = megamoe_op.enumerate_megamoe_candidate_tactics(16384, sm_version=sm_version)
     assert (len(decode), len(prefill)) == (decode_count, prefill_count)
-    assert all(len(t) == 11 for t in decode + prefill)
-    assert {t[-2] for t in decode} == {(1, 1)}
-    assert {t[-2] for t in prefill} == {(2, 4)}
-    assert {t[-1] for t in decode + prefill} == {"expert"}
+    assert all(len(t) == 12 for t in decode + prefill)
+    assert {t[-3] for t in decode} == {(1, 1)}
+    assert {t[-3] for t in prefill} == {(2, 4)}
+    assert {t[-2] for t in decode + prefill} == {"expert"}
+    assert {t[-1] for t in decode + prefill} == {False}
     for tactic in decode + prefill:
         megamoe_op.validate_megamoe_tactic(tactic, sm_version=sm_version)
     default_tactics = [
         megamoe_op.default_megamoe_tactic(num_tokens) for num_tokens in (64, 4096, 16384)
     ]
-    assert all(len(tactic) == 11 for tactic in default_tactics)
-    assert {tactic[-1] for tactic in default_tactics} == {"expert"}
+    assert all(len(tactic) == 12 for tactic in default_tactics)
+    assert {tactic[-2] for tactic in default_tactics} == {"expert"}
+    assert {tactic[-1] for tactic in default_tactics} == {False}
     for tactic in default_tactics:
         megamoe_op.validate_megamoe_tactic(tactic, sm_version=sm_version)
     if sm_version == 107:
@@ -4658,7 +4910,7 @@ def test_enumerate_megamoe_candidate_tactics_curated_space(
                 in_kernel_fc2_reduce=False,
                 combine_format="bf16",
             )
-            assert len(selected) == 11
+            assert len(selected) == 12
             assert selected == megamoe_op._unpack_tactic(tactic)
     invalid_tactic = list(megamoe_op.default_megamoe_tactic(64))
     invalid_tactic[3] = ("grouped", 0)
@@ -4667,9 +4919,10 @@ def test_enumerate_megamoe_candidate_tactics_curated_space(
     legacy = ([256, 128, 256], [2, 1, 1], 512, "static", "epi_warps", True, 1, (1, 1))
     megamoe_op.validate_megamoe_tactic(legacy, sm_version=sm_version)
     assert megamoe_op._unpack_tactic(legacy) == megamoe_op.default_megamoe_tactic(64)
-    v4 = megamoe_op.default_megamoe_tactic(64)[:-1]
-    megamoe_op.validate_megamoe_tactic(v4, sm_version=sm_version)
-    assert megamoe_op._unpack_tactic(v4) == megamoe_op.default_megamoe_tactic(64)
+    for legacy_len in (11, 10):  # v5 (no combine_dedup) and v4 (no READY granularity)
+        legacy = megamoe_op.default_megamoe_tactic(64)[:legacy_len]
+        megamoe_op.validate_megamoe_tactic(legacy, sm_version=sm_version)
+        assert megamoe_op._unpack_tactic(legacy) == megamoe_op.default_megamoe_tactic(64)
 
 
 @pytest.mark.cpu_only
@@ -5058,6 +5311,7 @@ def _run_megamoe_prologue_helper() -> Callable[[int, bool, int], torch.Tensor]:
         BlockPhase,
         map_phase_interleaved_fc12_work_id,
         resolve_phase_interleaved_fc1_claim_target,
+        resolve_phase_interleaved_stream_extent,
     )
     from tensorrt_llm._torch.moe.kernels.cutedsl_megamoe.kernel_src.schedulers.fc12_scheduler import (
         PhaseInterleavedFc12Scheduler,
@@ -5131,6 +5385,8 @@ def _run_megamoe_prologue_helper() -> Callable[[int, bool, int], torch.Tensor]:
             pipeline_init_wait(cluster_shape_mn=(1, 1))
             worker = self.scheduler._work_id_worker
             state = self.scheduler._task_mapping_state
+            # Mirror PhaseInterleavedFc12Scheduler.gen_next_work initialization.
+            state = resolve_phase_interleaved_stream_extent(state)
             _, fc1_valid, state = map_phase_interleaved_fc12_work_id(
                 Int32(0), Int32(BlockPhase.Linear1), (Int32(0), Int32(0), Int32(0)), state
             )
@@ -5381,6 +5637,7 @@ def should_skip_locality_domain_param(
     activation_type: ActivationType,
     swiglu_gptoss_style: bool,
     dtype: torch.dtype,
+    model_config: Optional[MoeModelConfig] = None,
 ) -> Optional[str]:
     """Return a static skip reason for locality domain MoE backend params."""
     if backend_type != MoeBackendType.CUTEDSL:
@@ -5394,6 +5651,12 @@ def should_skip_locality_domain_param(
         return "locality domain MoE backend test only supports SwiGLU"
     if swiglu_gptoss_style:
         return "locality domain MoE backend test does not cover GPT-OSS SwiGLU style"
+    # CuteDslLocalityDomainMixin._adjust_locality_domain_plan runs such shapes
+    # on the full-GPU kernels, so the locality-domain ops would not be tuned.
+    if model_config is not None and (
+        (2 * model_config.intermediate_size) % 256 != 0 or model_config.hidden_size % 256 != 0
+    ):
+        return "locality domain shards must be 128-row multiples"
     return None
 
 
@@ -5506,6 +5769,7 @@ def generate_test_params() -> List:
                 ActivationType.Swiglu,
                 swiglu_gptoss_style,
                 dtype,
+                model_config,
             )
             locality_domain_param_values = (
                 dtype,
@@ -5953,8 +6217,19 @@ def test_moe_backend(
                 assert autotuner.stats.tuned_op_profiled_configs.get(op_name, 0) > 0
                 assert not autotuner.stats.failed_profiling_count.get(op_name, set())
 
+        # The SM90 Triton FP8-activation leaf runs decode-sized BF16 batches
+        # without any autotuned op, so those runs leave nothing to capture.
+        # Every other call (FP16 input, a non-uniform clamp, more rows) runs
+        # the parent's tuned fused op and keeps the tactic replay below.
+        runs_untuned_triton = (
+            isinstance(backend, TrtllmTritonFp8ActGroupedGemmFp8BlockScalesImpl)
+            and seq_len <= backend.TRITON_FP8_ACT_MAX_TOKENS
+            and dtype_activation == torch.bfloat16
+            and backend._triton_swiglu is not None
+        )
+
         # Check if this backend+quant_algo combination supports autotuner capture/replay
-        if supports_autotuner_capture(backend_type, quant_algo):
+        if supports_autotuner_capture(backend_type, quant_algo) and not runs_untuned_triton:
             # Capture phase: record which tactics are used (requires actual execution)
             with AutoTuner.get().capture() as all_tactics, torch.inference_mode():
                 _ = run_moe()
@@ -7134,6 +7409,7 @@ def _cutlass_leaf_on_cpu(leaf_cls):
     leaf.act_beta = None
     leaf.act_clamp = None
     leaf.act_clamp_after_silu = False
+    leaf.activation = DEFAULT_MOE_ACTIVATION
     leaf.tp_size, leaf.tp_rank, leaf.ep_size, leaf.ep_rank = 1, 0, 1, 0
     leaf.cluster_size, leaf.cluster_rank = 1, 0
     leaf.use_fused_finalize = True
@@ -7446,6 +7722,49 @@ def _forward_in_two_chunks(backend) -> Tuple[torch.Tensor, torch.Tensor]:
 
 
 @pytest.mark.cpu_only
+def test_mxfp8_fused_fc12_forward_routes_before_run_moe_without_comm():
+    """The MXFP8 fused FC12 op takes precomputed routing, so a single-rank
+    layer with no communication strategy and no attention DP must still route
+    before ``run_moe``; a routing method that would otherwise route inside the
+    kernel cannot change that."""
+    leaf = TrtllmCutedslFusedFc12Mxfp8Impl.__new__(TrtllmCutedslFusedFc12Mxfp8Impl)
+    torch.nn.Module.__init__(leaf)
+    leaf.apply_router_weight_on_input = False
+    calls = []
+
+    def quantize_input(x, post_quant_comm=True):
+        return x, torch.empty((x.shape[0], x.shape[1] // 32), dtype=torch.uint8)
+
+    def run_moe_mxfp8(
+        x, token_selected_experts, token_final_scales, x_sf, moe_output=None, enable_alltoall=False
+    ):
+        calls.append((token_selected_experts, token_final_scales))
+        return x * 2
+
+    leaf.quantize_input = quantize_input
+    leaf.run_moe_mxfp8 = run_moe_mxfp8
+    moe = _chunking_moe(leaf, num_chunks=1)
+    moe.routing_method.requires_separated_routing = False
+    moe._enable_perfect_router_expert_ids = False
+
+    x = torch.arange(8 * 64, dtype=torch.bfloat16).reshape(8, 64)
+    out = ExternalCommMoEScheduler(moe).forward(
+        x,
+        torch.zeros((8, 4)),
+        do_finalize=True,
+        output_dtype=torch.bfloat16,
+        all_rank_num_tokens=None,
+        use_dp_padding=None,
+    )
+
+    torch.testing.assert_close(out, x * 2, rtol=0, atol=0)
+    assert len(calls) == 1
+    token_selected_experts, token_final_scales = calls[0]
+    assert token_selected_experts is not None and token_selected_experts.shape == (8, 1)
+    assert token_final_scales is not None and token_final_scales.dtype == torch.float32
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "leaf_cls",
     [FlashinferCutedslNvfp4Impl, FlashinferCutedslW4a16Nvfp4Impl],
@@ -7479,6 +7798,24 @@ def test_multi_chunk_forward_overlaps_chunks_of_a_backend_that_allocates_its_out
 
     torch.testing.assert_close(out, x * 2, rtol=0, atol=0)
     assert backend.streams == [_AUX_STREAM, _MAIN_STREAM]
+
+
+@pytest.mark.cpu_only
+def test_mxfp8_fused_fc12_multi_chunk_forward_runs_chunks_on_one_stream(monkeypatch):
+    """The MXFP8 fused FC12 kernel is a persistent grid whose FC2 tiles wait
+    on FC1 tiles of the same launch, so two chunks in flight on the main and
+    aux streams could each hold part of the GPU and wait forever. The leaf
+    declares this, and the scheduler then runs both chunks on the main stream."""
+    requirement = TrtllmCutedslFusedFc12Mxfp8Impl.descriptor.input_requirement
+    assert requirement.run_moe_requires_coresident_grid
+    assert not requirement.run_moe_reuses_buffers
+    backend = _FreshOutputBackend(_record_streams(monkeypatch))
+    backend.input_requirement = requirement
+
+    x, out = _forward_in_two_chunks(backend)
+
+    torch.testing.assert_close(out, x * 2, rtol=0, atol=0)
+    assert backend.streams == [_MAIN_STREAM, _MAIN_STREAM]
 
 
 @pytest.mark.cpu_only
@@ -7522,6 +7859,169 @@ def test_triton_fp8_block_scales_leaf_localizes_global_slot_ids(enable_alltoall,
     # The kernel returns its own tensor, so the scheduler must not hand it the
     # alltoall workspace to fill.
     assert not leaf.supports_moe_output_in_alltoall_workspace()
+
+
+def _sm90_triton_fp8_act_leaf_on_cpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[TrtllmTritonFp8ActGroupedGemmFp8BlockScalesImpl, dict, list]:
+    """The SM90 Triton FP8-activation leaf, opted into its Triton path, with
+    both callees replaced by recorders: what the Triton runner saw, and the
+    fused-op calls."""
+    from tensorrt_llm._torch.moe.fused_moe.cutlass import fp8_block_scales_hopper_triton
+
+    seen = {}
+
+    def run_triton(x, ids, scales, *args, **kwargs):
+        seen.update(ids=ids, scales=scales, args=args, **kwargs)
+        return torch.zeros_like(x)
+
+    monkeypatch.setattr(
+        fp8_block_scales_hopper_triton, "run_triton_fp8_block_scale_moe_fp8_act", run_triton
+    )
+    calls = _record_fused_moe(monkeypatch)
+    leaf = _cutlass_leaf_on_cpu(TrtllmTritonFp8ActGroupedGemmFp8BlockScalesImpl)
+    leaf.quant_scales = FusedMoEQuantScalesDeepSeekFP8BlockScales(
+        fc_weight_scales="fc31-scale", proj_weight_scales="fc2-scale"
+    )
+    leaf._triton_swiglu = (7.0, True)
+    return leaf, seen, calls
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "change, takes_triton",
+    [
+        pytest.param({}, True, id="at-threshold"),
+        pytest.param({"num_tokens": 33}, False, id="above-threshold"),
+        pytest.param({"x_sf": torch.ones(1)}, False, id="scale-factors"),
+        pytest.param({"x_dtype": torch.float16}, False, id="fp16-input"),
+        pytest.param({"moe_output": torch.zeros(32, 8)}, False, id="moe-output"),
+        pytest.param({"triton_swiglu": None}, False, id="non-uniform-clamp"),
+    ],
+)
+def test_sm90_triton_fp8_act_leaf_dispatch(change, takes_triton, monkeypatch):
+    """Up to ``TRITON_FP8_ACT_MAX_TOKENS`` rows of plain BF16 input without an
+    output buffer run Triton; everything else runs the inherited fused op."""
+    leaf, seen, calls = _sm90_triton_fp8_act_leaf_on_cpu(monkeypatch)
+    assert leaf.TRITON_FP8_ACT_MAX_TOKENS == 32
+    if "triton_swiglu" in change:
+        leaf._triton_swiglu = change["triton_swiglu"]
+    num_tokens = change.get("num_tokens", 32)
+    ctx = _cpu_run_context(num_tokens=num_tokens)
+    ctx = dataclasses.replace(
+        ctx,
+        x=ctx.x.to(change.get("x_dtype", torch.bfloat16)),
+        x_sf=change.get("x_sf"),
+        comm_plan=dataclasses.replace(ctx.comm_plan, moe_output=change.get("moe_output")),
+    )
+
+    leaf.run_moe(ctx)
+
+    assert bool(seen) is takes_triton
+    assert len(calls) == (0 if takes_triton else 1)
+    if takes_triton:
+        assert seen["args"] == (leaf.w3_w1_weight, "fc31-scale", leaf.w2_weight, "fc2-scale")
+        assert seen["swiglu_limit"] == 7.0
+        assert seen["swiglu_clamp_after_silu"] is True
+        assert seen["output_dtype"] is torch.bfloat16
+
+
+@pytest.mark.cpu_only
+def test_sm90_triton_fp8_act_leaf_localizes_slots_and_defaults_the_scales(monkeypatch):
+    """Under EP the Triton kernel indexes this rank's experts, so every slot
+    outside them weighs 0; folded router weights arrive as None and weigh 1."""
+    leaf, seen, _ = _sm90_triton_fp8_act_leaf_on_cpu(monkeypatch)
+    leaf.ep_size = 2
+    leaf.expert_size_per_partition = 4
+    leaf.slot_start = 4  # this rank owns slots 4..7
+    ctx = dataclasses.replace(
+        _cpu_run_context(num_tokens=2),
+        # 1 is below this rank's slots, -1 padding, 8 (num_slots) above them.
+        token_selected_experts=torch.tensor([[5, 1], [-1, 8]], dtype=torch.int32),
+        token_final_scales=None,
+    )
+
+    leaf.run_moe(ctx)
+
+    assert seen["ids"].tolist() == [[1, 0], [0, 3]]
+    assert seen["scales"].tolist() == [[1.0, 0.0], [0.0, 0.0]]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "slots, expected",
+    [
+        pytest.param({}, (None, False), id="no-clamp"),
+        pytest.param({"act_clamp": 5.0, "act_clamp_after_silu": True}, (5.0, True), id="scalar"),
+        pytest.param({"act_clamp": torch.full((4,), 5.0)}, (5.0, False), id="uniform-tensor"),
+        pytest.param({"act_clamp": torch.tensor([5.0, 5.0, 6.0, 5.0])}, None, id="per-expert"),
+        pytest.param({"w2_bias": torch.zeros(1)}, None, id="expert-bias"),
+        pytest.param({"act_alpha": 1.702}, None, id="alpha"),
+    ],
+)
+def test_sm90_triton_fp8_act_leaf_reads_the_clamp_off_its_slots(slots, expected):
+    """The Triton SwiGLU takes the clamp by value, so it serves only a layer
+    whose installed clamp is one value for every expert."""
+    leaf = _cutlass_leaf_on_cpu(TrtllmTritonFp8ActGroupedGemmFp8BlockScalesImpl)
+    for name, value in slots.items():
+        setattr(leaf, name, value)
+
+    assert leaf._uniform_swiglu_clamp() == expected
+
+
+@pytest.mark.cpu_only
+def test_sm90_triton_fp8_act_leaf_prewarms_once_per_layer_shape(monkeypatch):
+    """``cache_derived_state`` compiles the Triton path up to the row threshold
+    once per process for layers that share weight shapes, top-k and clamp, and
+    not at all for a layer whose clamp keeps it on the fused op."""
+    from tensorrt_llm._torch.moe.fused_moe.cutlass import (
+        fp8_block_scales_hopper,
+        fp8_block_scales_hopper_triton,
+    )
+
+    calls = []
+    monkeypatch.setattr(
+        fp8_block_scales_hopper_triton,
+        "prewarm_triton_fp8_block_scale_moe_fp8_act",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    monkeypatch.setattr(TrtllmTritonFp8ActGroupedGemmFp8BlockScalesImpl, "_prewarmed", set())
+    monkeypatch.setattr(
+        fp8_block_scales_hopper.DeepgemmCudaHopperFp8BlockScalesImpl,
+        "cache_derived_state",
+        lambda self: None,
+    )
+
+    def layer(clamp):
+        leaf = _cutlass_leaf_on_cpu(TrtllmTritonFp8ActGroupedGemmFp8BlockScalesImpl)
+        leaf.w3_w1_weight = torch.zeros((4, 32, 8), dtype=torch.bfloat16)
+        leaf.w2_weight = torch.zeros((4, 8, 16), dtype=torch.bfloat16)
+        leaf.quant_scales = FusedMoEQuantScalesDeepSeekFP8BlockScales(
+            fc_weight_scales=torch.ones((4, 1, 1)), proj_weight_scales=torch.ones((4, 1, 1))
+        )
+        leaf.routing_method = SimpleNamespace(top_k=2)
+        leaf.act_clamp = clamp
+        leaf.cache_derived_state()
+        return leaf
+
+    first = layer(7.0)
+    layer(7.0)
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    expected = (
+        first.w3_w1_weight,
+        first.quant_scales.fc_weight_scales,
+        first.w2_weight,
+        first.quant_scales.proj_weight_scales,
+    )
+    assert all(arg is want for arg, want in zip(args, expected, strict=True))
+    assert kwargs == dict(top_k=2, max_tokens=32, swiglu_limit=7.0, swiglu_clamp_after_silu=False)
+
+    layer(6.0)
+    assert len(calls) == 2
+    per_expert = layer(torch.tensor([5.0, 6.0, 5.0, 5.0]))
+    assert per_expert._triton_swiglu is None
+    assert len(calls) == 2
 
 
 @pytest.mark.cpu_only
@@ -7673,3 +8173,313 @@ def test_mxfp4_fp8_trtllm_gen_accumulator_params(
         if bias:
             torch.testing.assert_close(restored.w3_w1_bias, module.w3_w1_bias)
             torch.testing.assert_close(restored.w2_bias, module.w2_bias)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "lean_intermediate,padded_intermediate,expected_valid_intermediate",
+    [
+        (352, 384, 352),
+        (192, 256, 192),
+        (128, 128, 128),
+        (None, 384, None),
+    ],
+    ids=["tp4_i1408_lean352", "tp16_i3072_lean192", "aligned_lean128", "unset_lean"],
+)
+def test_mxfp4_fp8_trtllm_gen_forwards_lean_intermediate_size(
+    monkeypatch: pytest.MonkeyPatch,
+    lean_intermediate: int | None,
+    padded_intermediate: int,
+    expected_valid_intermediate: int | None,
+) -> None:
+    """Keep physical padding separate from logical dimensions at the runner boundary."""
+    captured: dict[str, object] = {}
+
+    def fake_runner(*args: object, **kwargs: object) -> torch.Tensor:
+        # Op positions 19..21: physical intermediate, valid hidden, valid intermediate.
+        (
+            captured["intermediate_size"],
+            captured["valid_hidden_size"],
+            captured["valid_intermediate_size"],
+        ) = args[19:22]
+        return torch.zeros((2, 2048), dtype=torch.bfloat16)
+
+    monkeypatch.setattr(torch.ops.trtllm, "e4m3_mxe2m1_block_scale_moe_runner", fake_runner)
+
+    leaf = TrtllmTrtllmGenW4a8Mxfp4Fp8Impl.__new__(TrtllmTrtllmGenW4a8Mxfp4Fp8Impl)
+    torch.nn.Module.__init__(leaf)
+    leaf.w3_w1_weight = torch.zeros((4, padded_intermediate * 2, 1024), dtype=torch.uint8)
+    leaf.w3_w1_weight_scale = torch.zeros((4, padded_intermediate * 2, 64), dtype=torch.uint8)
+    leaf.w3_w1_bias = torch.zeros((4, padded_intermediate * 2), dtype=torch.float32)
+    leaf.act_alpha = None
+    leaf.act_beta = None
+    leaf.act_clamp = None
+    leaf.w2_weight = torch.zeros((4, 2048, padded_intermediate // 2), dtype=torch.uint8)
+    leaf.w2_weight_scale = torch.zeros((4, 2048, padded_intermediate // 32), dtype=torch.uint8)
+    leaf.w2_bias = torch.zeros((4, 2048), dtype=torch.float32)
+    leaf.fc31_input_dequant = torch.ones((4,), dtype=torch.float32)
+    leaf.fc31_input_gate_dequant = torch.ones((4,), dtype=torch.float32)
+    leaf.fc2_input_dequant = torch.ones((4,), dtype=torch.float32)
+    leaf.num_slots = 4
+    leaf.hidden_size = 2048
+    leaf.quant_method = SimpleNamespace(intermediate_size_per_partition_lean=lean_intermediate)
+    leaf.slot_start = 0
+    leaf.expert_size_per_partition = 4
+    leaf.routing_method = RenormalizeMoeRoutingMethod(top_k=2)
+    leaf.max_num_tokens = 256
+    leaf.use_dp = False
+    leaf.parallel_size = 4
+
+    ctx = MoERunContext(
+        x=torch.zeros((2, 2048), dtype=torch.float8_e4m3fn),
+        x_sf=None,
+        router_logits=torch.zeros((2, 4), dtype=torch.bfloat16),
+        token_selected_experts=None,
+        token_final_scales=None,
+        comm_plan=MoECommPlan(
+            input_sf_swizzled=False,
+            enable_alltoall=False,
+            moe_output=None,
+            payload_in_workspace=False,
+        ),
+        do_finalize=True,
+    )
+    out = leaf.run_moe(ctx)
+
+    assert out.shape == (2, 2048)
+    assert captured["intermediate_size"] == padded_intermediate
+    assert captured["valid_hidden_size"] == 2048
+    assert captured["valid_intermediate_size"] == expected_valid_intermediate
+
+
+@pytest.mark.skipif(
+    not (100 <= getSMVersion() < 110),
+    reason="The kernel requires Blackwell.",
+)
+@pytest.mark.parametrize(
+    "valid_hidden_size,valid_intermediate_size",
+    [(512, 352), (352, 512), (2880, 2880)],
+    ids=["h512_i352", "h352_i512", "h2880_i2880"],
+)
+def test_moe_mxe2m1_weights_valid_dimensions(
+    valid_hidden_size: int, valid_intermediate_size: int
+) -> None:
+    """Exercise C++ TMA alignment with lean sizes and zero-padded weights."""
+    from _torch.moe.kernels.serial.test_moe import _run_moe_mxe2m1_weights as run_direct_case
+
+    from tensorrt_llm.quantization.utils.fp4_utils import pad_up
+
+    # Reuse the numerical reference without enabling the deprecated test matrix.
+    run_direct_case(
+        num_tokens=16,
+        hidden_size=pad_up(valid_hidden_size, 512),
+        intermediate_size=pad_up(valid_intermediate_size, 128),
+        routing_info={
+            "num_experts": 16,
+            "top_k": 8,
+            "n_groups": None,
+            "top_k_groups": None,
+            "routed_scaling": None,
+            "has_routing_bias": False,
+            "routing_method_type": RenormalizeMoeRoutingMethod(top_k=8).routing_method_type,
+        },
+        dtype_activation="fp8",
+        act_type_str="SwiGlu",
+        use_autotune=True,
+        use_topk_as_input=False,
+        valid_hidden_size=valid_hidden_size,
+        valid_intermediate_size=valid_intermediate_size,
+        skip_dynamic_tuning_buckets=True,
+        check_all_tactics=True,
+    )
+
+
+# ============================================================================
+# CuTeDSL MXFP8 fused FC12: accuracy A/B against the MXFP8 reference module
+# ============================================================================
+
+
+def _error_stats(a: torch.Tensor, b: torch.Tensor) -> dict:
+    """Scale-invariant error statistics of ``a`` against ``b``."""
+    a = a.float().flatten()
+    b = b.float().flatten()
+    diff = (a - b).abs()
+    return {
+        "rms_rel": (diff.norm() / (b.norm() + 1e-12)).item(),
+        "cos": torch.nn.functional.cosine_similarity(a, b, dim=0).item(),
+        "max_abs": diff.max().item(),
+        "mean_abs": diff.mean().item(),
+    }
+
+
+def _mxfp8_fp32_oracle(
+    x_q: torch.Tensor,
+    x_sf: torch.Tensor,
+    weights: dict,
+    token_selected_experts: torch.Tensor,
+    token_final_scales: torch.Tensor,
+    num_experts: int,
+    hidden_size: int,
+) -> torch.Tensor:
+    """fp32 MoE on the dequantized MXFP8 activations/weights with an fp32 intermediate.
+
+    This is the exact-math target both MXFP8 implementations approximate: the only error
+    either one adds on top is its own requantization of the FC1 intermediate before FC2.
+    """
+    from tensorrt_llm._torch.modules.mxfp8_utils import dequant_mxfp8_weight
+
+    a = dequant_mxfp8_weight(x_q, x_sf.view(x_q.shape[0], hidden_size // 32))
+    out = torch.zeros(x_q.shape[0], hidden_size, dtype=torch.float32, device=a.device)
+    tse = token_selected_experts.long()
+    tfs = token_final_scales.float()
+    for expert in range(num_experts):
+        mask = tse == expert
+        if not mask.any():
+            continue
+        tokens, slots = mask.nonzero(as_tuple=True)
+        w1 = dequant_mxfp8_weight(
+            weights[f"{expert}.w1.weight"], weights[f"{expert}.w1.weight_scale"]
+        )
+        w3 = dequant_mxfp8_weight(
+            weights[f"{expert}.w3.weight"], weights[f"{expert}.w3.weight_scale"]
+        )
+        w2 = dequant_mxfp8_weight(
+            weights[f"{expert}.w2.weight"], weights[f"{expert}.w2.weight_scale"]
+        )
+        xa = a[tokens]
+        h = torch.nn.functional.silu(xa @ w1.t()) * (xa @ w3.t())
+        out.index_add_(0, tokens, (h @ w2.t()) * tfs[tokens, slots][:, None])
+    return out
+
+
+@pytest.mark.parametrize(
+    "num_experts,top_k,hidden_size,intermediate_size,seq_len",
+    [
+        (60, 4, 2048, 1408, 128),  # Qwen1.5-MoE-A2.7B
+        (128, 10, 4096, 1024, 128),  # Qwen3.5-397B experts as seen by one EP4 rank
+    ],
+    ids=["e60_k4_h2048_i1408", "e128_k10_h4096_i1024"],
+)
+def test_cutedsl_mxfp8_fused_fc12_accuracy_ab(
+    num_experts: int, top_k: int, hidden_size: int, intermediate_size: int, seq_len: int
+):
+    """A/B the fused MXFP8 FC12 CuTeDSL MoE against independent references on identical inputs.
+
+    Three legs consume the SAME MXFP8 activations and e4m3/UE8M0 weights:
+      fused  -- TrtllmCutedslFusedFc12Mxfp8Impl (one fused FC1+SwiGLU+MXFP8-requant+FC2+finalize kernel)
+      ref    -- the repo's MXFP8 reference module (per-expert MXFP8 Linear layers, BF16 intermediate)
+      oracle -- fp32 math on the dequantized tensors with an fp32 intermediate (no requant)
+
+    Both MXFP8 implementations sit ~2.7% RMS from the oracle (the inherent cost of requantizing
+    the FC1 intermediate); the fused kernel must not add error beyond that noise floor. Measured
+    on Rubin: fused-vs-oracle 2.66-2.70% vs ref-vs-oracle 2.69-2.71%, fused-vs-ref ~1.8%,
+    cosine >= 0.9996. The statistics are logged so drifts are visible in the test report.
+    """
+    backend_type = MoeBackendType.CUTEDSL
+    # Same gate as TrtllmCutedslFusedFc12Mxfp8Impl.can_implement: the fused
+    # FC1+FC2 kernel needs Rubin and a CuTe DSL build with the fused FC12
+    # submodules.
+    if get_sm_version() != 107:
+        pytest.skip(f"CuteDSL MXFP8 fused FC12 requires SM107 (Rubin), got SM{get_sm_version()}")
+    if not IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE:
+        pytest.skip("MXFP8 on SM107 requires a CuTe DSL build with the fused FC12 kernel")
+    dtype = torch.bfloat16
+    skip_if_insufficient_gpu_memory(num_experts, hidden_size, intermediate_size, dtype)
+
+    mapping = Mapping()
+    mapping.rank = mpi_rank()
+    with torch.device(f"cuda:{mapping.rank}"):
+        torch.manual_seed(0)
+        torch.cuda.manual_seed(0)
+        AutoTuner.get().setup_distributed_state(mapping)
+        routing_method = RenormalizeMoeRoutingMethod(top_k=top_k)
+        x = torch.randn((seq_len, hidden_size), dtype=dtype, device="cuda")
+        router_logits = torch.randn((seq_len, num_experts), dtype=dtype, device="cuda")
+
+        quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+            QuantAlgo.MXFP8, x, backend_type
+        )
+        quantize_util = quantize_util_cls(
+            num_experts=num_experts,
+            dtype=dtype,
+            intermediate_size=intermediate_size,
+            hidden_size=hidden_size,
+            quant_config=quant_config,
+        )
+        backend = create_test_backend(
+            backend_type=backend_type,
+            routing_method=routing_method,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            quant_config=quant_config,
+            mapping=mapping,
+            weight_loading_mode=MoEWeightLoadingMode.VANILLA,
+        )
+        assert type(backend).__name__ == "TrtllmCutedslFusedFc12Mxfp8Impl"
+        assert type(backend.quant_method).__name__ == "MXFP8CuteDslFusedMoEMethod"
+        weights = quantize_util.create_weights(**quant_kwargs)
+        backend.load_weights([weights])
+        backend.post_load_weights()
+        backend.cuda()
+        ref_fused_moe = quantize_util.create_ref_module(routing_method)
+        ref_fused_moe.load_weights([weights])
+        ref_fused_moe.cuda()
+
+        token_selected_experts, token_final_scales = routing_method.apply(router_logits)
+        x_quantized, x_sf = backend.quantize_input(x, post_quant_comm=False)
+
+        def run_fused():
+            return run_backend_moe(
+                backend,
+                backend_type,
+                x_quantized,
+                x_sf,
+                token_selected_experts,
+                token_final_scales,
+                dtype,
+                router_logits,
+            )
+
+        AutoTuner.get().clear_cache()
+        with torch.inference_mode(), autotune():
+            run_fused()
+        with torch.inference_mode():
+            fused = run_fused().float()
+            ref = ref_fused_moe.forward(x, router_logits).float()
+            oracle = _mxfp8_fp32_oracle(
+                x_quantized,
+                x_sf,
+                weights,
+                token_selected_experts,
+                token_final_scales,
+                num_experts,
+                hidden_size,
+            )
+        torch.cuda.synchronize()
+
+    fused_vs_ref = _error_stats(fused, ref)
+    fused_vs_oracle = _error_stats(fused, oracle)
+    ref_vs_oracle = _error_stats(ref, oracle)
+    for label, s in (
+        ("fused vs ref", fused_vs_ref),
+        ("fused vs oracle", fused_vs_oracle),
+        ("ref vs oracle", ref_vs_oracle),
+    ):
+        logger.info(
+            "[mxfp8 fused fc12 A/B] %s: rms_rel=%.4f%% cos=%.6f max_abs=%.3f mean_abs=%.4f",
+            label,
+            100 * s["rms_rel"],
+            s["cos"],
+            s["max_abs"],
+            s["mean_abs"],
+        )
+
+    # The fused kernel must be at least as close to exact math as the established reference
+    # (10% slack on the reference's own RMS error) and must agree tightly with it.
+    assert fused_vs_oracle["rms_rel"] <= 1.1 * ref_vs_oracle["rms_rel"] + 1e-3, (
+        f"fused kernel adds error beyond the MXFP8 reference: {fused_vs_oracle} vs {ref_vs_oracle}"
+    )
+    assert fused_vs_oracle["cos"] >= 0.999, fused_vs_oracle
+    assert fused_vs_ref["cos"] >= 0.999 and fused_vs_ref["rms_rel"] <= 0.05, fused_vs_ref

@@ -31,7 +31,7 @@ __extra_import_path__ = ["../../.."]  # noqa: F841 -- repo's file-scoped import 
 
 import pytest
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.gpt_oss.gpt_oss_120b__sm_10x__default import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.gpt_oss.gpt_oss_120b__sm_10x__default import (  # noqa: E501
     weights as W,
 )
 from tensorrt_llm.mapping import Mapping

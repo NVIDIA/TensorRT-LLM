@@ -33,6 +33,8 @@ from .config import (
     _fp4_mla_q1_kv_blocks_per_program,
     _fp4_mla_q1_prefix_blocks_per_program,
     _HPUpdatePhase,
+    fp4_mla_cache_layout,
+    fp4_mla_generation_backend_supported,
 )
 from .fp4_mla_kernels import (
     _fp4_mla_context_cache_update_kernel,
@@ -51,7 +53,6 @@ from .layout import (
 )
 from .metadata import (
     _fp4_mla_generation_hp_page_ids,
-    _fp4_mla_generation_num_blocks_device,
     _fp4_mla_generation_page_ids,
     _fp4_mla_uniform_generation_lengths,
     _materialize_fp4_mla_device_page_table_for_forward,
@@ -60,9 +61,7 @@ from .packed_plan import _fp4_mla_helix_plan_bounds, _fp4_mla_packed_plan_geomet
 from .v_cache import (
     _get_cutedsl_persistent_v_packed_cache,
     _get_fp4_mla_v_packed_pool_base,
-    _maybe_update_triton_v_packed_cache,
     _repack_cutedsl_v_packed_cache,
-    _triton_prepack_v_enabled,
 )
 
 
@@ -103,9 +102,10 @@ def can_fuse_fp4_mla_q_quant(
 ) -> bool:
     """Return whether generation can quantize Q in the fused cache update."""
     num_gen = metadata.num_seqs - metadata.num_contexts
+    backend = _fp4_mla_attention_backend()
+    sm_version = get_sm_version()
     return bool(
-        _fp4_mla_attention_backend() in _FP4_MLA_K_RESIDUAL_BACKENDS
-        and get_sm_version() == 107
+        fp4_mla_generation_backend_supported(sm_version, backend)
         and num_gen > 0
         and getattr(metadata, "kv_cache_manager", None) is not None
         and q.shape[0] > 0
@@ -142,20 +142,14 @@ def _prepare_fp4_mla_q_buffers(
     """
     if num_queries <= 0:
         raise ValueError(f"FP4 MLA Q buffer preparation needs queries, got {num_queries}.")
-    owner = getattr(metadata, "kv_cache_manager", None)
-    if owner is None:
-        raise RuntimeError("Fused FP4 MLA Q quantization requires a KV cache manager.")
+    cache_layout = fp4_mla_cache_layout(getattr(metadata, "kv_cache_manager", None))
+    if cache_layout is None:
+        raise RuntimeError(
+            "Fused FP4 MLA Q quantization requires a KV cache manager with the FP4 MLA cache layout."
+        )
     if num_heads <= 0 or num_heads > 128:
         raise ValueError(f"FP4 MLA Q buffers require 1-128 local heads, got {num_heads}.")
-    buffers = getattr(owner, "_fp4_mla_q_buffers", None)
-    if buffers is None:
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "Cannot create FP4 MLA Q buffers while capturing a CUDA graph. "
-                "Run a warmup forward first."
-            )
-        buffers = {}
-        setattr(owner, "_fp4_mla_q_buffers", buffers)
+    buffers = cache_layout.get_or_create_fp4_mla_q_buffers()
 
     max_num_tokens = int(getattr(metadata, "max_num_tokens", num_queries) or num_queries)
     max_num_sequences = int(
@@ -291,7 +285,6 @@ class _Fp4MlaContextScatterPlan:
     cutedsl_v_packed: bool
     v_packed_base: Optional[torch.Tensor]
     cutedsl_repack: Optional[tuple]
-    triton_v_pack: bool
     rope_table: Optional[torch.Tensor] = None
     rope_dim: int = 0
 
@@ -361,7 +354,7 @@ def _build_fp4_mla_context_scatter_plan(
         head_dim=head_dim,
         backend=backend,
     )
-    if has_decode_views and getattr(state, "v_scale_pool", None) is None:
+    if has_decode_views and state.v_scale_pool is None:
         raise RuntimeError("FP4 MLA scatter requires the auxiliary V scale pool.")
     if metadata.page_size % FP4_BLOCK_SIZE != 0:
         raise ValueError(
@@ -392,7 +385,7 @@ def _build_fp4_mla_context_scatter_plan(
             )
         _validate_fp4_mla_context_start_alignment(metadata, num_contexts, alignment=FP4_BLOCK_SIZE)
 
-    hp_pool = getattr(state, "hp_pool", None)
+    hp_pool = state.hp_pool
     if not isinstance(hp_pool, torch.Tensor):
         raise TypeError("FP4 MLA high-precision KV pool must be a tensor.")
     if hp_pool.device != latent_cache.device:
@@ -479,7 +472,6 @@ def _build_fp4_mla_context_scatter_plan(
         cutedsl_v_packed=cutedsl_v_packed,
         v_packed_base=v_packed_base,
         cutedsl_repack=cutedsl_repack,
-        triton_v_pack=has_decode_views and _triton_prepack_v_enabled(),
     )
 
 
@@ -663,7 +655,7 @@ def _scatter_fp4_mla_context(
     kv_cache_manager = getattr(metadata, "kv_cache_manager", None)
     has_decode_views = _fp4_mla_cache_has_decode_views(kv_cache_manager)
     kv_cache, sf_cache = _get_fp4_mla_kv_cache_tensors(metadata, layer_idx)
-    plan = getattr(state, "context_scatter_plan", None)
+    plan = state.context_scatter_plan
     if plan is None or not plan.matches(
         metadata,
         kv_cache,
@@ -700,11 +692,8 @@ def _scatter_fp4_mla_context(
         )
         v_packed_base = plan.v_packed_base
         if v_packed_base is not None:
-            get_v_page_offset = getattr(kv_cache_manager, "get_mla_v_packed_page_offset", None)
-            v_page_offset = (
-                int(get_v_page_offset(local_layer))
-                if callable(get_v_page_offset)
-                else local_layer * kv_cache.shape[0]
+            v_page_offset = int(
+                fp4_mla_cache_layout(kv_cache_manager).get_mla_v_packed_page_offset(local_layer)
             )
             row_width = metadata.page_size // 2
             required_base_rows = (v_page_offset + kv_cache.shape[0]) * v_head_dim
@@ -752,19 +741,6 @@ def _scatter_fp4_mla_context(
             kv_lens=kv_lens,
             generation_lens=generation_lens,
             max_touched_pages=max_touched_pages,
-        )
-    if plan.triton_v_pack:
-        _maybe_update_triton_v_packed_cache(
-            metadata,
-            layer_idx,
-            kv_cache,
-            plan.paged_kv_indices,
-            num_queries=num_tokens,
-            v_head_dim=v_head_dim,
-            page_size=metadata.page_size,
-            local_layer=local_layer,
-            v_sf=v_sf[local_layer],
-            num_valid_pages=None,
         )
     return hp_pool_updated
 
@@ -836,7 +812,7 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
     )
     _materialize_fp4_mla_device_page_table_for_forward(metadata, kv_lens_gen)
 
-    pool = getattr(metadata.fp4_mla_state, "hp_pool", None)
+    pool = metadata.fp4_mla_state.hp_pool
     if pool is None:
         raise RuntimeError("FP4 MLA 2D generation scatter requires the HP KV pool.")
     try:
@@ -1232,7 +1208,7 @@ def scatter_fp4_mla_kv_cache(
     kv_cache_manager = getattr(metadata, "kv_cache_manager", None)
     if not _fp4_mla_cache_has_decode_views(kv_cache_manager):
         raise RuntimeError("FP4 MLA context-only cache cannot execute generation.")
-    if getattr(metadata.fp4_mla_state, "v_scale_pool", None) is None:
+    if metadata.fp4_mla_state.v_scale_pool is None:
         raise RuntimeError("FP4 MLA scatter requires the auxiliary V scale pool.")
     if metadata.page_size % FP4_BLOCK_SIZE != 0:
         raise ValueError(
@@ -1318,11 +1294,8 @@ def scatter_fp4_mla_kv_cache(
         )
         if direct_v_packed_write:
             v_packed_base = _get_fp4_mla_v_packed_pool_base(metadata)
-            get_v_page_offset = getattr(kv_cache_manager, "get_mla_v_packed_page_offset", None)
-            v_page_offset = (
-                int(get_v_page_offset(local_layer))
-                if callable(get_v_page_offset)
-                else local_layer * kv_cache.shape[0]
+            v_page_offset = int(
+                fp4_mla_cache_layout(kv_cache_manager).get_mla_v_packed_page_offset(local_layer)
             )
             expected_row_width = metadata.page_size // 2
             required_base_rows = (v_page_offset + kv_cache.shape[0]) * v_head_dim
@@ -1375,14 +1348,6 @@ def scatter_fp4_mla_kv_cache(
         helix_position_offsets=helix_position_offsets,
         helix_is_inactive_rank=helix_is_inactive_rank,
     )
-    v_pack_page_ids = _fp4_mla_generation_page_ids(
-        metadata, metadata.num_seqs - metadata.num_contexts
-    )
-    v_pack_num_valid = None
-    if getattr(metadata, "is_cuda_graph", False):
-        # Frozen launch grids cannot follow the per-replay page count;
-        # the repack kernels stride over this device-side count instead.
-        v_pack_num_valid = _fp4_mla_generation_num_blocks_device(metadata)
     cutedsl_repack_page_indptr = None
     cutedsl_repack_kv_lens = None
     cutedsl_repack_generation_lens = None
@@ -1400,7 +1365,9 @@ def scatter_fp4_mla_kv_cache(
                 metadata.page_size,
             )
         else:
-            cutedsl_v_pack_page_ids = v_pack_page_ids
+            cutedsl_v_pack_page_ids = _fp4_mla_generation_page_ids(
+                metadata, metadata.num_seqs - metadata.num_contexts
+            )
         _repack_cutedsl_v_packed_cache(
             persistent_v_packed,
             kv_cache,
@@ -1413,17 +1380,5 @@ def scatter_fp4_mla_kv_cache(
             generation_lens=cutedsl_repack_generation_lens,
             max_touched_pages=cutedsl_repack_max_touched_pages,
         )
-    _maybe_update_triton_v_packed_cache(
-        metadata,
-        layer_idx,
-        kv_cache,
-        v_pack_page_ids,
-        num_queries=num_tokens,
-        v_head_dim=v_head_dim,
-        page_size=metadata.page_size,
-        local_layer=local_layer,
-        v_sf=v_sf[local_layer],
-        num_valid_pages=v_pack_num_valid,
-    )
     metadata.fp4_mla_state.generation_cache_scattered = True
     return True

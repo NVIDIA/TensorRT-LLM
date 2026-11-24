@@ -17,7 +17,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.vision.patch_embed_conv3d import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.vision.patch_embed_conv3d import (  # noqa: E501
     patch_embed_conv3d as op,
 )
 

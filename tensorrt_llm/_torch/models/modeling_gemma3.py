@@ -14,7 +14,7 @@
 # limitations under the License.
 
 import math
-from typing import Any, Dict, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Tuple
 
 import torch
 import triton
@@ -34,6 +34,7 @@ from ..attention.backends import (AttentionMetadata,
 from ..attention.backends.interface import (AttentionMask, CustomAttentionMask,
                                             PositionalEmbeddingParams,
                                             PredefinedAttentionMask, RopeParams)
+from ..attention.backends.trtllm import trtllm_supports_swa_scratch_reuse
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
@@ -44,6 +45,9 @@ from ..modules.rms_norm import RMSNorm
 from ..utils import inference_mode_unless_compiling
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              register_auto_model)
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 
 @triton.jit
@@ -376,6 +380,21 @@ class Gemma3TextModel(DecoderModel):
 @register_auto_model("Gemma3ForCausalLM")
 class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
                                                 Gemma3TextConfig]):
+
+    @classmethod
+    def get_model_defaults(cls, llm_args: 'TorchLlmArgs') -> dict:
+        """Default to prefill scratch reuse where TRTLLM attention supports it
+        and block reuse is disabled."""
+        enable_scratch = (getattr(llm_args, "attn_backend", "TRTLLM").upper()
+                          == "TRTLLM" and trtllm_supports_swa_scratch_reuse())
+        kv_cache_config = llm_args.kv_cache_config
+        if enable_scratch and kv_cache_config.enable_block_reuse:
+            enable_scratch = False
+        return {
+            "kv_cache_config": {
+                "enable_swa_scratch_reuse": enable_scratch,
+            },
+        }
 
     @classmethod
     def get_preferred_transceiver_runtime(

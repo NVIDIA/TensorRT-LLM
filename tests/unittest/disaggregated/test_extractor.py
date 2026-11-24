@@ -263,7 +263,15 @@ def test_layer_group_meta_serialization():
     assert KVCachePageTable.from_dict(d).layer_groups[0].pool_views[0].num_kv_heads is None
 
 
-def _make_fake_v2_manager(attrs, role_mapper_kinds, *, num_pools=1, slot_bytes_list=(640,)):
+def _make_fake_v2_manager(
+    attrs,
+    role_mapper_kinds,
+    *,
+    num_pools=1,
+    slot_bytes_list=(640,),
+    num_locality_domains=1,
+    mapped_ranges=None,
+):
     """Build a minimal duck-typed KVCacheManagerV2 for _build_page_table_v2.
 
     ``attrs`` keeps the storage-layer shape ``{(layer_id, role):
@@ -302,7 +310,11 @@ def _make_fake_v2_manager(attrs, role_mapper_kinds, *, num_pools=1, slot_bytes_l
         num_slots=4,
         pools=[
             SimpleNamespace(
-                pool_index=pi, base_address=base, slot_bytes=sb, storage_medium=CacheTier.GPU_MEM
+                pool_index=pi,
+                base_address=base,
+                slot_bytes=sb,
+                storage_medium=CacheTier.GPU_MEM,
+                mapped_ranges=mapped_ranges,
             )
             for pi, sb in enumerate(slot_bytes_list)
         ],
@@ -330,9 +342,39 @@ def _make_fake_v2_manager(attrs, role_mapper_kinds, *, num_pools=1, slot_bytes_l
         layer_offsets={0: 0, 1: 1},
         num_kv_heads_per_layer=[1, 1],
         mixed_precision_high_layers={},
+        num_locality_domains=num_locality_domains,
         get_disagg_role_mapper_kinds=lambda: role_mapper_kinds,
         get_disagg_role_layouts=lambda: {},
     )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("num_locality_domains", [1, 2])
+def test_v2_builder_emits_mapped_ranges_only_for_localized_pools(num_locality_domains):
+    """A non-localized pool is fully backed: no ranges, and the wire format is unchanged."""
+    from types import SimpleNamespace
+
+    attrs = {
+        (0, Role.KEY): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=0, size=128),
+        (0, Role.VALUE): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=128, size=128),
+        (1, Role.KEY): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=256, size=128),
+        (1, Role.VALUE): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=384, size=128),
+    }
+    ranges = ((0, 1024), (2048, 3072))
+    manager = _make_fake_v2_manager(
+        attrs,
+        {Role.ALL: MapperKind.NHD},
+        slot_bytes_list=(512,),
+        num_locality_domains=num_locality_domains,
+        mapped_ranges=ranges,
+    )
+
+    pool = build_page_table_from_manager(manager).pool_groups[0].pools[0]
+    if num_locality_domains == 1:
+        assert pool.mapped_ranges is None
+        assert "mapped_ranges" not in pool.to_dict()
+    else:
+        assert pool.mapped_ranges == ranges
 
 
 @pytest.mark.cpu_only

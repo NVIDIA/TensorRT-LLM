@@ -35,7 +35,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, FrozenSet, Iterator, List, Optional, Set, Tuple
+from typing import Any, Dict, FrozenSet, Iterator, List, Optional, Set, Tuple, cast
 
 from .ladder import Ladder
 from .marks import CollectedTest, ResourceMarker, ResourceMarkers, default_markers
@@ -117,7 +117,7 @@ class MachineProfile:
         """One catalogue entry: the profile's fields, and an optional ladder that fits the node."""
         where = f"{source}: profile {name!r}"
         try:
-            return cls(name=name, **values).checked_ladder()
+            return cls(name=name, **cast(Mapping[str, Any], values)).checked_ladder()
         except TypeError as error:
             raise ProfileConfigError(f"{where}: {error}") from error
         except ValueError as error:

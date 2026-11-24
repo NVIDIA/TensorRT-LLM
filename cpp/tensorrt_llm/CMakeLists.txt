@@ -317,17 +317,23 @@ target_link_libraries(${SHARED_TARGET} PUBLIC ${TRTLLM_LINK_LIBS})
 set(TLLM_FACADE_COMPONENT_TARGETS
     ipc_nvls_memory_src
     tllm_batch_request_info
+    tllm_batch_rnn_cache_routing
     tllm_batch_scheduler
     tllm_common_cublas
     tllm_common_cuda
     tllm_common_environment
     tllm_common_error
+    tllm_common_ip
     tllm_common_logging
+    tllm_common_native_memory
     tllm_common_profiler
     tllm_context_transfer_consensus
+    tllm_executor_agent_connection
     tllm_executor_agent_name
+    tllm_executor_cache_routing
     tllm_executor_memory_desc
     tllm_executor_serialization
+    tllm_executor_socket_serialization
     tllm_executor_transfer_agent
     tllm_executor_types
     tllm_executor_values
@@ -344,6 +350,7 @@ set(TLLM_FACADE_COMPONENT_TARGETS
     tllm_runtime_lora
     tllm_runtime_lora_cache
     tllm_runtime_memory
+    tllm_runtime_moe_load_balance
     tllm_runtime_numpy
     tllm_runtime_topology
     tllm_runtime_utils
@@ -379,19 +386,15 @@ target_link_libraries(${BATCH_MANAGER_TARGET} INTERFACE ${SHARED_TARGET})
 # Cyclic dependency of executor on TRT-LLM
 target_link_libraries(${EXECUTOR_TARGET} INTERFACE ${SHARED_TARGET})
 
-# Cyclic dependency of UCX data transceiver on TRT-LLM
 if(TARGET ${UCX_WRAPPER_TARGET})
-  target_link_libraries(${UCX_WRAPPER_TARGET} INTERFACE ${SHARED_TARGET})
   add_dependencies(${SHARED_TARGET} ${UCX_WRAPPER_TARGET})
 endif()
 
 if(TARGET ${NIXL_WRAPPER_TARGET})
-  target_link_libraries(${NIXL_WRAPPER_TARGET} INTERFACE ${SHARED_TARGET})
   add_dependencies(${SHARED_TARGET} ${NIXL_WRAPPER_TARGET})
 endif()
 
 if(TARGET ${MOONCAKE_WRAPPER_TARGET})
-  target_link_libraries(${MOONCAKE_WRAPPER_TARGET} INTERFACE ${SHARED_TARGET})
   add_dependencies(${SHARED_TARGET} ${MOONCAKE_WRAPPER_TARGET})
 endif()
 

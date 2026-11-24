@@ -40,11 +40,26 @@ def make_manager():
 class TestSuffixAutomatonManager:
     """Tests for SuffixAutomatonManager class."""
 
-    def test_manager_creation(self, make_manager):
-        """Test manager creation."""
+    def test_manager_shutdown_and_reuse(self, make_manager):
         config = SAConfig(max_seq_len=1024, max_slots=16)
         manager = make_manager(config, max_num_requests=16)
-        assert manager is not None
+        accepted = torch.tensor([[6, 0, 0, 0, 0]], dtype=torch.int32, device="cuda")
+        counts = torch.ones(1, dtype=torch.int32, device="cuda")
+
+        for request_id in (0, 1):
+            manager.add_request(request_id, [1, 2, 3])
+            manager.prepare([request_id], max_draft_len=4)
+            assert manager._gpu_nondummy_mask is not None
+            assert manager._cpu_batch_indices is not None
+            assert manager._cpu_nondummy_mask is not None
+            match_len, draft = manager.extend([request_id], accepted, counts, 4)
+            assert match_len[0].item() == 0
+            assert draft[0, :4].tolist() == [0, 0, 0, 0]
+
+            manager.shutdown()
+            assert manager._gpu_nondummy_mask is None
+            assert manager._cpu_batch_indices is None
+            assert manager._cpu_nondummy_mask is None
 
     def test_manager_add_remove(self, make_manager):
         """Test adding and removing requests."""

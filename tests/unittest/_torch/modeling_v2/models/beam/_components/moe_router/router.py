@@ -11,7 +11,8 @@ eight experts each token is routed to and their mixing weights. It runs no exper
 dispatches no token and combines no expert output; the routed scaling factor belongs to
 that combine and is not applied here. It does not call the built-in Beam modeling.
 
-The routing, every step fp32 (``ops/moe/beam_grouped_topk_router.py``)::
+The routing uses FP32 at every step, through the Beam family operator
+``tensorrt_llm._torch.modeling_v2.models.beam.ops.moe.beam_grouped_topk_router``::
 
     logits  = hidden.float() @ weight^T                        [T, 256]
     scores  = sigmoid(logits)                                  unbiased: the weights use these
@@ -26,11 +27,9 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam._constants import (
-    ROUTER_EPS as NORM_EPS,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam._constants import SM as _SM
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.moe.beam_grouped_topk_router import (
+from tensorrt_llm._torch.modeling_v2.models.beam._constants import ROUTER_EPS as NORM_EPS
+from tensorrt_llm._torch.modeling_v2.models.beam._constants import SM as _SM
+from tensorrt_llm._torch.modeling_v2.models.beam.ops.moe.beam_grouped_topk_router import (
     beam_grouped_topk_router,
 )
 

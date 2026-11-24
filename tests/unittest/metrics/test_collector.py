@@ -14,6 +14,7 @@
 # limitations under the License.
 """Unit tests for MetricsCollector and process_req_perf_metrics."""
 
+from collections.abc import Iterator
 from typing import Dict
 
 import pytest
@@ -28,18 +29,17 @@ pytestmark = pytest.mark.cpu_only
 
 
 @pytest.fixture(autouse=True)
-def clean_registry():
+def clean_registry() -> Iterator[None]:
     """Unregister all custom collectors between tests to avoid duplicate metric errors."""
-    collectors_to_remove = []
-    for collector in REGISTRY._names_to_collectors.values():
-        if hasattr(collector, "_name") and collector._name.startswith("trtllm_"):
-            collectors_to_remove.append(collector)
-    for collector in set(collectors_to_remove):
-        try:
-            REGISTRY.unregister(collector)
-        except Exception:
-            pass
+
+    def clear() -> None:
+        for metric in tuple(REGISTRY._collector_to_names):
+            if getattr(metric, "_name", "").startswith("trtllm_"):
+                REGISTRY.unregister(metric)
+
+    clear()
     yield
+    clear()
 
 
 @pytest.fixture
@@ -905,6 +905,81 @@ class TestProcessReqPerfMetrics:
 
     def test_empty_stats_returns_empty(self):
         assert process_req_perf_metrics(None, output_length=10) == {}
+
+
+class TestCollectedRequestRecords:
+    @pytest.mark.parametrize("exposure", ["http", "openengine"])
+    def test_completed_request_record_is_collected_once_and_exposed_directly(
+        self, collector, exposure
+    ):
+        import asyncio
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+
+        from tensorrt_llm.executor.result import GenerationResultBase
+        from tensorrt_llm.metrics.perf import PerfMetricsCollector, PerfMetricsRecord
+        from tensorrt_llm.sampling_params import SamplingParams
+
+        result = GenerationResultBase(id=1, sampling_params=SamplingParams())
+        result.finished = True
+        result.prompt_token_ids = [1, 2]
+        result.per_pos_drafted = [4, 2]
+        result.per_pos_accepted = [3, 1]
+        output = SimpleNamespace(
+            finish_reason="end_id",
+            token_ids=[3, 4],
+            request_perf_metrics=None,
+            prompt_logprobs=None,
+            length=2,
+            cumulative_logprob=None,
+            logprobs=None,
+        )
+        stats = {
+            RequestEventTiming.ARRIVAL_TIME: 10.0,
+            RequestEventTiming.FIRST_TOKEN_TIME: 11.0,
+            RequestEventTiming.LAST_TOKEN_TIME: 12.0,
+        }
+        with (
+            patch.object(
+                PerfMetricsCollector, "collect_request", wraps=PerfMetricsCollector.collect_request
+            ) as collect,
+            patch.object(
+                PerfMetricsRecord, "request_metrics", side_effect=AssertionError("unexpected thaw")
+            ),
+        ):
+            result.record_stats(output, stats)
+            result.per_pos_accepted[0] = 99
+            result.per_pos_drafted[0] = 99
+            assert result.candidate_metrics[0][MetricNames.SPEC_DEC_ACCEPTED_PER_POS] == [3, 1]
+            assert result.candidate_metrics[0][MetricNames.SPEC_DEC_DRAFTED_PER_POS] == [4, 2]
+            # Compatibility dictionaries stay mutable without changing the collected observation.
+            result.candidate_metrics[0][MetricNames.E2E] = 999
+            result.candidate_metrics[0][MetricNames.SPEC_DEC_ACCEPTED_PER_POS][0] = 999
+            if exposure == "http":
+                from tensorrt_llm.serve.openai_server import OpenAIServer
+
+                server = SimpleNamespace(
+                    metrics_collector=collector,
+                    _collect_perf_metrics=False,
+                    _iteration_stats_collector_task=None,
+                )
+                asyncio.run(OpenAIServer._extract_metrics(server, result, None))
+            else:
+                from tensorrt_llm.grpc.openengine.metrics import OpenEngineMetrics
+
+                metrics = SimpleNamespace(
+                    collector=collector, _collect_requests=True, _record_error=Mock()
+                )
+                OpenEngineMetrics.record_result(metrics, result)
+                metrics._record_error.assert_not_called()
+            assert collect.call_count == 1
+        assert _get_counter_value(collector, "counter_generation_tokens") == 2
+        assert _get_counter_value(collector, "counter_prompt_tokens") == 2
+        assert _get_histogram_count(collector, "histogram_e2e_time_request") == 1
+        assert _get_histogram_sum(collector, "histogram_e2e_time_request") == 2.0
+        assert result.candidate_metric_records[0].per_req[
+            MetricNames.SPEC_DEC_ACCEPTED_PER_POS
+        ] == (3, 1)
 
 
 class TestCustomHistogramBuckets:

@@ -14,10 +14,8 @@
 # the License.
 include(FetchContent)
 
-set(SRCS
-    bufferManagerNvls.cpp utils/debugUtils.cu ipcUtils.cpp
-    mcastDeviceMemory.cpp moeLoadBalancer/moeLoadBalancer.cpp
-    ncclCommunicator.cpp)
+set(SRCS bufferManagerNvls.cpp utils/debugUtils.cu ipcUtils.cpp
+         mcastDeviceMemory.cpp ncclCommunicator.cpp)
 
 include_directories(${API_INCLUDE_DIR}/tensorrt_llm/runtime)
 
@@ -77,8 +75,8 @@ add_library(ipc_nvls_memory_src STATIC ipcNvlsMemory.cu ipcSocket.cpp
                                        mcastGroupComm.cpp)
 add_library(tllm::runtime_ipc_nvls ALIAS ipc_nvls_memory_src)
 target_link_libraries(
-  ipc_nvls_memory_src PUBLIC tllm::common_cuda tllm::runtime_distributed
-                             CUDA::cuda_driver)
+  ipc_nvls_memory_src PUBLIC tllm::common_cuda tllm::common_native_memory
+                             tllm::runtime_distributed CUDA::cuda_driver)
 target_compile_features(ipc_nvls_memory_src PUBLIC cxx_std_20)
 set_target_properties(
   ipc_nvls_memory_src
@@ -121,13 +119,25 @@ add_library(tllm::runtime_host_accessible_memory ALIAS
             tllm_runtime_host_accessible_memory)
 target_link_libraries(
   tllm_runtime_host_accessible_memory
-  PUBLIC tllm::runtime_gdr tllm::runtime_topology Threads::Threads
+  PUBLIC tllm::runtime_gdr tllm::runtime_topology tllm::common_native_memory
+         Threads::Threads
   PRIVATE tllm::common_environment)
 if(NOT WIN32)
   target_link_libraries(tllm_runtime_host_accessible_memory PUBLIC NUMA::NUMA)
 endif()
 target_compile_features(tllm_runtime_host_accessible_memory PUBLIC cxx_std_20)
 set_target_properties(tllm_runtime_host_accessible_memory
+                      PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+add_library(tllm_runtime_moe_load_balance STATIC
+            moeLoadBalancer/moeLoadBalancer.cpp)
+add_library(tllm::runtime_moe_load_balance ALIAS tllm_runtime_moe_load_balance)
+target_link_libraries(
+  tllm_runtime_moe_load_balance
+  PUBLIC tllm::common_cuda Threads::Threads
+  PRIVATE tllm::runtime_host_accessible_memory tllm::kernel_moe_load_balance)
+target_compile_features(tllm_runtime_moe_load_balance PUBLIC cxx_std_20)
+set_target_properties(tllm_runtime_moe_load_balance
                       PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 add_library(tllm_runtime_locality STATIC
@@ -177,9 +187,7 @@ add_library(runtime_src OBJECT ${SRCS})
 set_property(TARGET runtime_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET runtime_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 add_cuda_architectures(runtime_src 89)
-target_link_libraries(
-  runtime_src PUBLIC ipc_nvls_memory_src tllm::runtime_topology
-                     tllm::runtime_host_accessible_memory)
+target_link_libraries(runtime_src PUBLIC ipc_nvls_memory_src)
 
 target_include_directories(runtime_src PRIVATE ${MPI_C_INCLUDE_DIRS})
 

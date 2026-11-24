@@ -7,7 +7,7 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.gemm.m3_fp32_linear import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.gemm.m3_fp32_linear import (  # noqa: E501
     m3_fp32_linear as op,
 )
 

@@ -126,11 +126,11 @@ class SchedulerOutput(
 
 def is_decoder_context_request_waiting_for_encoder_output(req: LlmRequest) -> bool:
     """Return whether decoder-context scheduling is blocked on encoder output."""
-    if not req.is_context_init_state:
-        return False
-
+    # The attribute is unset outside encoder-decoder models; read it before the state binding.
     ready_event = getattr(req, "py_encoder_output_ready_event", None)
-    return ready_event is not None and not ready_event.query()
+    if ready_event is None or not req.is_context_init_state:
+        return False
+    return not ready_event.query()
 
 
 def drop_decoder_context_requests_waiting_for_encoder_output(
@@ -174,13 +174,49 @@ def _get_lora_task_id(req: LlmRequest):
     return (1, lora_id)
 
 
-def _get_forced_context_chunk_size(req: LlmRequest) -> int:
-    next_point = min(
-        (point for point in req.expect_snapshot_points if point > req.context_current_position),
-        default=None,
+def _is_midchunk_snapshot_point(req: LlmRequest, point: int) -> bool:
+    """Whether the cache manager takes the snapshot at ``point`` inside a context step.
+
+    The cache manager sets ``py_midchunk_snapshot_alignment`` when it can store
+    a recurrent-state snapshot at a point inside the step, for the last
+    snapshot point and only at that alignment relative to the step start.
+    """
+    alignment = getattr(req, "py_midchunk_snapshot_alignment", None)
+    return (
+        isinstance(alignment, int)
+        and point < req.prompt_len
+        and point == max(req.expect_snapshot_points)
+        and (point - req.context_current_position) % alignment == 0
     )
-    if next_point is None:
+
+
+def _is_midchunk_pass_point(req: LlmRequest, point: int) -> bool:
+    """Whether a context step may pass the snapshot point ``point``.
+
+    The cache manager sets ``py_midchunk_pass_point`` to a point (not the last
+    one) whose snapshot it can take inside a context step. A step holds at
+    most one such snapshot.
+    """
+    alignment = getattr(req, "py_midchunk_snapshot_alignment", None)
+    return (
+        isinstance(alignment, int)
+        and point == getattr(req, "py_midchunk_pass_point", None)
+        and point < req.prompt_len
+        and (point - req.context_current_position) % alignment == 0
+    )
+
+
+def _get_forced_context_chunk_size(req: LlmRequest) -> int:
+    later_points = sorted(
+        point for point in req.expect_snapshot_points if point > req.context_current_position
+    )
+    if not later_points or _is_midchunk_snapshot_point(req, later_points[0]):
         return req.context_remaining_length
+    next_point = later_points[0]
+    if len(later_points) > 1 and _is_midchunk_pass_point(req, next_point):
+        # The snapshot at the next point is taken inside the step, which ends
+        # at the following point at the latest.
+        next_point = later_points[1]
     next_position = min(next_point, req.prompt_len)
     return max(0, next_position - req.context_current_position)
 
@@ -405,6 +441,19 @@ class RequestScheduler(ABC):
         Args:
             probe: Whether cancelled receives still retain local resources.
         """
+
+    def set_async_transfer_manager(self, mgr) -> None:
+        """Register the executor's AsyncTransferManager, which owns the KV
+        pages of finished disaggregated sends until they land.
+
+        Only schedulers with transfer-aware deadlock detection use it; the
+        default is a no-op.
+        """
+
+    @property
+    def ctx_demote_uncached_tokens(self) -> int:
+        """Long-prefill demotion threshold in uncached tokens; 0 (the default) when off."""
+        return 0
 
     def take_decision_counters(self) -> tuple[int, int, int, int]:
         """Return and reset the holds since the last call: gen-init cap, gen-init transfer budget,
@@ -775,6 +824,13 @@ class MultimodalScheduler(RequestScheduler):
             probe: Whether cancelled receives still retain local resources.
         """
         self.scheduler.set_retiring_gen_receives_probe(probe)
+
+    def set_async_transfer_manager(self, mgr) -> None:
+        self.scheduler.set_async_transfer_manager(mgr)
+
+    @property
+    def ctx_demote_uncached_tokens(self) -> int:
+        return self.scheduler.ctx_demote_uncached_tokens
 
     def take_decision_counters(self) -> tuple[int, int, int, int]:
         return self.scheduler.take_decision_counters()

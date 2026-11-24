@@ -1,16 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Routed NVFP4 MoE FC2 for decode-sized batches, bit-identical to the trtllm-gen FC2 cubin
-``bmm_Bfloat16_E2m1E2m1_Fp32_Ab16_Bb16_t128x8x256_*_dynB`` (Gemm2 of ``moe/trtllmGen/runner.cu``), with a shared-memory
-and register footprint that fits ``CTAS_PER_SM`` CTAs per SM.
+"""Routed NVFP4 MoE FC2 for decode-sized batches, bit-identical to the trtllm-gen tile-8 FC2 cubins
+``bmm_Bfloat16_E2m1E2m1_Fp32_Ab16_Bb16_t128x8x*`` (Gemm2 of ``moe/trtllmGen/runner.cu``), with a shared-memory and
+register footprint that fits ``CTAS_PER_SM`` CTAs per SM.
 
 ``out[p, h] = bf16_satfinite(scale[e] * sum_k act[p, k] * w2[e, h, k])`` for every permuted row ``p`` of a token tile
 (8 rows) of local expert ``e``. Operands and routing tables are the trtllm-gen MoE runner's buffers (``moe_lowm_fc2``):
 ``w2`` rows shuffled in 32-row blocks with 128x4 E4M3 scales, the FC1 output with 8x4 scales.
 
 Bit-exactness: the cubin's MMA (``tcgen05.mma.kind::mxf4nvf4.block_scale.scale_vec::4X``, M 128, N 8, K 64) in its K
-order with K tiles of 256 (the zero-filled K tail issues the same MMAs), one FP32 ``mul.rn`` by ``scale[e]`` and
-``cvt.rn.satfinite.bf16x2.f32``.
+order, the +0 of the cubin's zero-filled K tail where the kernel has none of its own, one FP32 ``mul.rn`` by
+``scale[e]`` and ``cvt.rn.satfinite.bf16x2.f32``.
 
 Work: a persistent grid walks the (m tile, token tile) pairs. Warp 0 streams weights by TMA before the PDL wait, warp 1
 activations after it, warp 2 issues the MMAs into two TMEM accumulators, warp 3 L2-prefetches later tiles' weights and
@@ -19,7 +19,7 @@ warps 4-7 scale, convert and store.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -49,7 +49,7 @@ from .ptx_helpers import _ld_nc_f32, _ld_s32, _scale_pack_bf16x2, _st_global_b32
 
 TILE_M = 128
 TILE_N = 8
-TILE_K = 256  # the cubin's K tile (K order and zero-filled tail MMAs are defined by it)
+TILE_K = 256
 SF_VEC = 16
 EPI_WARP0 = 4
 NUM_ACC = 2
@@ -88,13 +88,24 @@ def _prefetch_bulk_l2(addr: Int64, nbytes: Int32) -> None:
     )
 
 
+def _scale_pack_bf16x2_tail(lo, hi, s) -> Int32:
+    """Adds the +0 of the cubins' zero-filled K-tail MMAs first (a -0 accumulator becomes +0)."""
+    return cute.arch.inline_ptx(
+        "{ .reg .f32 a, b; add.rn.f32 a, {$r0}, 0f00000000; add.rn.f32 b, {$r1}, 0f00000000;"
+        " mul.rn.f32 a, a, {$r2}; mul.rn.f32 b, b, {$r2}; cvt.rn.satfinite.bf16x2.f32 {$w0}, b, a; }",
+        write_only_types=[Int32],
+        read_only_args=[lo, hi, s],
+    )
+
+
 class MoeLowMFc2Nvfp4:
     """Routed NVFP4 FC2, tile 128 (hidden) x 8 (rows) x 256 (K), ``NUM_STAGES`` K stages per CTA."""
 
-    def __init__(self, k_tiles: int, k_groups: int, use_pdl: bool = True):
+    def __init__(self, k_tiles: int, k_groups: int, zero_tail: bool, use_pdl: bool = True):
         self.use_pdl = use_pdl
         self.k_tiles = k_tiles
         self.k_groups = k_groups  # 4-scale groups per activation row (I / 64)
+        self.zero_tail = zero_tail
         self.tile_k = TILE_K
         self.gps = TILE_K // (4 * SF_VEC)  # 4-scale groups per K tile
         self.num_stages = NUM_STAGES
@@ -793,10 +804,11 @@ class MoeLowMFc2Nvfp4:
                 r = y * TILE_N + j
                 if lead:
                     if r < limit:
-                        _st_global_b32(
-                            c_addr + (Int64(r) * Int64(h_total) + col) * 2,
-                            _scale_pack_bf16x2(rAcc[j], partner, s),
-                        )
+                        if cutlass.const_expr(self.zero_tail):
+                            packed = _scale_pack_bf16x2_tail(rAcc[j], partner, s)
+                        else:
+                            packed = _scale_pack_bf16x2(rAcc[j], partner, s)
+                        _st_global_b32(c_addr + (Int64(r) * Int64(h_total) + col) * 2, packed)
 
 
 _COMPILED = {}
@@ -811,6 +823,14 @@ def num_sms(device: Optional[torch.device] = None) -> int:
     return torch.cuda.get_device_properties(device).multi_processor_count - sm_reserve()
 
 
+def supports(w2_shape: Tuple[int, ...], cubin_k_tile: int) -> bool:
+    """Whether :func:`moe_lowm_fc2` reproduces the FC2 cubin of tile K ``cubin_k_tile`` on uint8 FC2 weights
+    [E, H, I / 2]."""
+    _, h, half_k = w2_shape
+    k = 2 * half_k
+    return h % TILE_M == 0 and k % (4 * SF_VEC) == 0 and cubin_k_tile % TILE_K == 0
+
+
 def moe_lowm_fc2(
     act: torch.Tensor,
     act_sf: torch.Tensor,
@@ -821,18 +841,23 @@ def moe_lowm_fc2(
     cta_limit: torch.Tensor,
     num_non_exiting: torch.Tensor,
     out: torch.Tensor,
+    cubin_k_tile: Optional[int] = None,
 ) -> torch.Tensor:
-    """FC2 of the trtllm-gen MoE path. ``act`` [rows, I/2] uint8 (E2M1 x2), ``act_sf`` 8x4 E4M3 (uint8),
-    ``w2`` [E, H, I/2] uint8, ``w2_sf`` [E, H, I/16] (128x4), ``scale`` [E] fp32, tables int32 (``cta_batch`` /
-    ``cta_limit`` per token tile, ``num_non_exiting`` [1]), ``out`` [padded rows, H] bf16 with at least the total padded
-    rows (rows of a tile past its limit are not written)."""
+    """FC2 of the trtllm-gen MoE path, bit for bit the FC2 cubin of tile K ``cubin_k_tile`` (None: the kernel's).
+    ``act`` [rows, I/2] uint8 (E2M1 x2), ``act_sf`` 8x4 E4M3 (uint8), ``w2`` [E, H, I/2] uint8, ``w2_sf``
+    [E, H, I/16] (128x4), ``scale`` [E] fp32, tables int32 (``cta_batch`` / ``cta_limit`` per token tile,
+    ``num_non_exiting`` [1]), ``out`` [padded rows, H] bf16 with at least the total padded rows (rows of a tile past
+    its limit are not written)."""
     import torch
 
+    cubin_k_tile = TILE_K if cubin_k_tile is None else cubin_k_tile
     rows, half_k = act.shape
     e, h, half_k2 = w2.shape
     k = 2 * half_k
-    if half_k2 != half_k or h % TILE_M or k % (4 * SF_VEC):
-        raise ValueError(f"unsupported FC2 shape rows {rows} H {h} I {k} E {e}")
+    if half_k2 != half_k or not supports(w2.shape, cubin_k_tile):
+        raise ValueError(
+            f"unsupported FC2 shape rows {rows} H {h} I {k} E {e}, cubin K tile {cubin_k_tile}"
+        )
     if (
         out.dim() != 2
         or out.shape[1] != h
@@ -840,6 +865,8 @@ def moe_lowm_fc2(
         or not out.is_contiguous()
     ):
         raise ValueError("out must be a contiguous bf16 [padded rows, H] tensor")
+    # A cubin's zero-filled K tail adds an exact +0, which the kernel re-applies when it has no tail of its own.
+    zero_tail = k % cubin_k_tile != 0 and k % TILE_K == 0
     grid_ctas = num_sms(act.device) * CTAS_PER_SM
     ptrs = (
         gmem_ptr(w2, cutlass.Float4E2M1FN, 32),
@@ -858,12 +885,13 @@ def moe_lowm_fc2(
     problem = (Int32(h), Int32(k), Int32(e), Int32(rows))
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     use_pdl = get_env_enable_pdl()
-    fn = _COMPILED.get((k, use_pdl))
+    key = (k, zero_tail, use_pdl)
+    fn = _COMPILED.get(key)
     if fn is None:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("compile the low-M MoE FC2 before CUDA graph capture")
-        kern = MoeLowMFc2Nvfp4(-(-k // TILE_K), k // (4 * SF_VEC), use_pdl)
+        kern = MoeLowMFc2Nvfp4(-(-k // TILE_K), k // (4 * SF_VEC), zero_tail, use_pdl)
         fn = cute.compile(kern, *ptrs, *addrs, problem, Int32(grid_ctas), stream)
-        _COMPILED[(k, use_pdl)] = fn
+        _COMPILED[key] = fn
     fn(*ptrs, *addrs, problem, Int32(grid_ctas), stream)
     return out

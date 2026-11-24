@@ -7,8 +7,9 @@ import weakref
 from collections import namedtuple
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
-from typing import (TYPE_CHECKING, Any, Dict, Generic, List, Literal, Optional,
-                    Protocol, Tuple, Type, TypeVar, Union)
+from typing import (TYPE_CHECKING, Any, Callable, Dict, Generic, List, Literal,
+                    NamedTuple, Optional, Protocol, Sequence, Tuple, Type,
+                    TypeVar, Union)
 
 import torch
 from typing_extensions import Self
@@ -69,6 +70,44 @@ class AttentionInputType(IntEnum):
     mixed = 0  # contains both context and generation
     context_only = 1
     generation_only = 2
+
+
+class GraphVariant(NamedTuple):
+    """One more dimension the decode graphs are keyed by, declared by the attention backend.
+
+    The backend lists its variants in ``AttentionBackend.decode_graph_variants``.
+    A decode step has one integer value of the variant, and graphs captured
+    for different values are different graphs. The runner does not know what
+    a value means: it captures the values a graph shape can take, keys every
+    step by its value, and tells the attention metadata of a graph which
+    value the graph serves (``AttentionMetadata.set_decode_graph_variant``).
+
+    Ranks that must replay the same graph take the largest value among their
+    own, so a graph of a larger value has to be valid for a step of a smaller
+    one.
+
+    A value may change only what a rank computes for its own rows, such as
+    the attention kernel it launches. It must not change the work the ranks
+    share inside a graph (what they exchange, or the shapes they exchange it
+    in). A runner that reuses a graph shape agreed elsewhere replays without
+    exchanging the values (``DSparkCUDAGraphRunner._agree_graph_shape``), so
+    its ranks may replay graphs of different values in the same step.
+    """
+    name: str
+    # Values the graphs of a shape (batch size, draft length) are captured
+    # for, ascending. A shape with one value is keyed by it without measuring
+    # the step.
+    values: Callable[[int, int], Tuple[int, ...]]
+    # A step's value, from its shape and the KV length each of its rows reads.
+    of_step: Callable[[int, int, List[int]], int]
+    # The value a step replays when no graph of its own value was captured,
+    # from that value and the ones captured for the step's shape.
+    replayable: Callable[[int, Sequence[int]], int]
+    # (warm-up length, value) of the capture passes of a shape, from the
+    # warm-up lengths of the capture and the shape's values. None captures
+    # every value at every length. Only the first variant may set it.
+    capture_passes: Optional[Callable[[Sequence[int], Tuple[int, ...]],
+                                      List[Tuple[int, int]]]] = None
 
 
 @dataclass(kw_only=True)
@@ -198,6 +237,12 @@ class AttentionMetadata:
     # This buffer is currently only used for TrtllmAttentionMetadata.
     cache_indirection: Optional[torch.Tensor] = None
     cuda_graph_buffers: dict[str, list[torch.Tensor]] = None
+    forward_scratch_buffers: Optional[Buffers] = None
+    """Runner-local storage shared across graphs within one forward, not persistent state.
+
+    Warmup registers capacity; capture must not grow it. CUDAGraphRunner.clear()
+    releases the pool, unlike the potentially process-wide cuda_graph_buffers.
+    """
 
     _saved_tensors: Dict[str, torch.Tensor] = field(init=False,
                                                     default_factory=dict)
@@ -498,7 +543,8 @@ class AttentionMetadata:
 
         if self.mamba_metadata is None:
             if isinstance(self.kv_cache_manager, BaseMambaCacheManager):
-                metadata_cls = self.mamba_metadata_cls
+                metadata_cls = self.mamba_metadata_cls or getattr(
+                    self.kv_cache_manager, "mamba_metadata_cls", None)
                 if metadata_cls is None:
                     from ...modules.mamba.mamba2_metadata import Mamba2Metadata
                     metadata_cls = Mamba2Metadata
@@ -512,17 +558,25 @@ class AttentionMetadata:
 
         self.mamba_metadata.prepare(self)
 
-    def create_cuda_graph_metadata(self,
-                                   max_batch_size: int,
-                                   sub_cross_metadata: bool = False,
-                                   max_draft_tokens: int = 0,
-                                   buffers=None,
-                                   encode_only: bool = False) -> Self:
+    def create_cuda_graph_metadata(
+            self,
+            max_batch_size: int,
+            sub_cross_metadata: bool = False,
+            max_draft_tokens: int = 0,
+            buffers=None,
+            encode_only: bool = False,
+            *,
+            forward_scratch_buffers: Optional[Buffers] = None) -> Self:
         """
         Creates metadata for CUDA graph execution.
         CUDA graphs require to use pre-allocated buffers for all tensors in fields.
         Please do not re-allocate any tensors stored inside AttentionMetadata
         after the initial warmup run when you're using CUDA graphs.
+
+        forward_scratch_buffers belongs to the caller's runner and is shared by
+        its graphs within one forward. Warmup must register capacity before
+        capture; persistent state must not use this pool. The runner releases
+        it in clear(), independently of cuda_graph_buffers.
 
         When encode_only is True, initialize seq_lens as ones(max_batch_size)
         and leave num_contexts at the caller's discretion.
@@ -533,9 +587,15 @@ class AttentionMetadata:
         cuda_graph_metadata = copy.copy(self)
         cuda_graph_metadata.is_cuda_graph = True
         cuda_graph_metadata.cuda_graph_buffers = buffers
+        cuda_graph_metadata.forward_scratch_buffers = forward_scratch_buffers
         if self.has_cross_sub_metadata:
             cuda_graph_metadata.cross = cuda_graph_metadata.cross.create_cuda_graph_metadata(
-                max_batch_size, True, max_draft_tokens, buffers, encode_only)
+                max_batch_size,
+                True,
+                max_draft_tokens,
+                buffers,
+                encode_only,
+                forward_scratch_buffers=forward_scratch_buffers)
         if not sub_cross_metadata:
             # Set to None to force the cuda graph metadata to allocate a tensor
             # with the correct batch size. See seq_lens setter for how this works.
@@ -571,39 +631,28 @@ class AttentionMetadata:
         cuda_graph_metadata.__post_init__()
         return cuda_graph_metadata
 
-    def set_decode_kv_regime(self, kv_regime: Optional[int]) -> None:
-        """Bound the KV length the decode kernels choose their path on.
+    def set_decode_graph_variant(self, name: str, value: Optional[int]) -> None:
+        """Fix a decode graph variant for the CUDA graph this metadata serves.
 
-        A CUDA graph runner that keys its decode graphs by KV regime passes
-        the regime ceiling of the graph this metadata serves, an upper bound
-        of the longest KV a replay reads.
-
-        Args:
-            kv_regime: The regime ceiling in tokens; None restores the
-                page-table capacity. Backends whose decode path does not
-                depend on the KV length ignore it.
-        """
-
-    @property
-    def decode_kv_regime(self) -> Optional[int]:
-        """The KV regime set by ``set_decode_kv_regime``; None when unset or ignored."""
-        return None
-
-    def set_decode_packed_split(self, packed_split: Optional[bool]) -> None:
-        """Fix whether the decode launches its KV split budget.
-
-        A CUDA graph runner that keys its decode graphs by the split
-        decision passes the decision of the graph this metadata serves.
+        A CUDA graph runner that keys its decode graphs by a variant the
+        backend declared (``AttentionBackend.decode_graph_variants``) passes
+        the value of the graph this metadata serves, so the decode captured in
+        the graph behaves as that value says instead of deciding on each call.
 
         Args:
-            packed_split: True launches the split budget, False one task
-                per request; None restores the per-call decision. Backends
-                without a split decode ignore it.
-        """
+            name: The variant's name.
+            value: Its value for this graph; None restores the per-call
+                decision.
 
-    @property
-    def decode_packed_split(self) -> Optional[bool]:
-        """The decision set by ``set_decode_packed_split``; None when unset or ignored."""
+        Raises:
+            ValueError: This metadata serves no variant of that name. The base
+                metadata serves none, as its backend declares none.
+        """
+        raise ValueError(
+            f"{type(self).__name__} serves no decode graph variant {name!r}.")
+
+    def decode_graph_variant(self, name: str) -> Optional[int]:
+        """The value set by ``set_decode_graph_variant``; None when unset."""
         return None
 
     def prepare_for_spec_dec(self, *fields) -> None:
@@ -1106,11 +1155,16 @@ class AttentionForwardArgs:
     mrope_rotary_cos_sin: Optional[torch.Tensor] = None
     mrope_position_deltas: Optional[torch.Tensor] = cpp_field(dtype=torch.int32)
     softmax_stats_tensor: Optional[torch.Tensor] = None
+    # Output tag: a provider may write compact base-2 LSE into the first half
+    # of the caller's pair-capacity buffer. Other providers retain max/sum.
+    softmax_stats_is_lse: bool = False
     attention_sinks: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
     cu_q_seqlens: Optional[torch.Tensor] = cpp_field(dtype=torch.int32)
     cu_kv_seqlens: Optional[torch.Tensor] = cpp_field(dtype=torch.int32)
     fmha_scheduler_counter: Optional[torch.Tensor] = cpp_field(
         dtype=torch.uint32)
+    # Locality domain this call runs against; -1 means the whole batch.
+    locality_domain_id: int = -1
     mla_bmm1_scale: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
     mla_bmm2_scale: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
     quant_q_buffer: Optional[torch.Tensor] = None
@@ -1188,6 +1242,14 @@ class AttentionForwardArgs:
     sparse_backend_args: Optional[SparseBackendForwardArgs] = None
     sparse_runtime_params: SparseRuntimeParams = field(
         default_factory=SparseRuntimeParams)
+
+    @property
+    def softmax_stats(self) -> Optional[torch.Tensor]:
+        """Return the written normalizer view, with final width one for base-2 LSE."""
+        stats = self.softmax_stats_tensor
+        if stats is None or not self.softmax_stats_is_lse:
+            return stats
+        return stats.view(-1)[:stats.numel() // 2].view(*stats.shape[:-1], 1)
 
     @property
     def mask_type(self) -> int:
@@ -1268,6 +1330,11 @@ class AttentionBackend(Generic[TMetadata]):
         """
         self.quant_config = new_quant_config
 
+    def runs_without_host_plan(self, metadata: TMetadata) -> bool:
+        """Whether a forward over ``metadata`` reads all its inputs on the device, so a CUDA graph
+        can capture it without host-side preparation at replay."""
+        return False
+
     def forward(self,
                 q: torch.Tensor,
                 k: Optional[torch.Tensor],
@@ -1310,6 +1377,27 @@ class AttentionBackend(Generic[TMetadata]):
         return False
 
     @classmethod
+    def decode_graph_variants(
+            cls, *, kv_cache_manager: Any, model: torch.nn.Module,
+            mapping: Mapping, sm_count_fn: Callable[[],
+                                                    int]) -> List[GraphVariant]:
+        """Graph variants the decode CUDA graphs of this backend are keyed by, besides their shape.
+
+        The decoder graph runner asks once, at capture, when the KV cache
+        exists, and keys the graphs by what it gets. The backend's metadata
+        has to serve every variant returned here
+        (``AttentionMetadata.set_decode_graph_variant``). Default: none.
+
+        Args:
+            kv_cache_manager: The KV cache manager of the decode.
+            model: The model whose decode the graphs capture.
+            mapping: The parallel layout of this rank.
+            sm_count_fn: Streaming multiprocessors of the device the graphs
+                replay on, read only when a variant depends on it.
+        """
+        return []
+
+    @classmethod
     def support_multi_item_scoring(cls) -> bool:
         return False
 
@@ -1339,6 +1427,36 @@ class AttentionBackend(Generic[TMetadata]):
         that prefix.
         """
         return True
+
+    @classmethod
+    def runtime_workspace_min_tokens(
+        cls,
+        model_config: "ModelConfig",
+        mapping: Mapping,
+        *,
+        max_num_tokens: int,
+        runtime_features: AttentionRuntimeFeatures,
+    ) -> int:
+        """Minimum tokens priced at ``runtime_workspace_bytes_per_token``.
+
+        The estimator calls this only for a nonzero per-token workspace rate
+        with an admission cap. It subtracts staging actually covered by the
+        profiling peak before reserving additional memory. Backends whose
+        workspace is not chunk-bounded return zero, as does the default.
+        """
+        return 0
+
+    @classmethod
+    def runtime_workspace_profiled_tokens(
+        cls,
+        model_config: "ModelConfig",
+        *,
+        profiled_prompt_len: int,
+        max_num_tokens: int,
+        max_batch_size: int,
+    ) -> int:
+        """Workspace tokens actually staged by the fresh-prefill profiling path."""
+        return 0
 
     @classmethod
     def runtime_workspace_fixed_bytes(

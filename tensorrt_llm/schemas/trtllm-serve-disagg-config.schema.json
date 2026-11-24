@@ -410,6 +410,17 @@
           "status": "prototype",
           "title": "Moe Tactic"
         },
+        "rejection_sample_method": {
+          "default": "standard",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only: not supported with the dynamic tree, relaxed thinking acceptance or DSpark confidence scheduling.",
+          "enum": [
+            "standard",
+            "block"
+          ],
+          "status": "prototype",
+          "title": "Rejection Sample Method",
+          "type": "string"
+        },
         "spec_dec_variant": {
           "default": 1,
           "description": "Version of the algorithm within its decoding_type family (e.g. DFlash 1 vs. 2), for versions that share one decoding config. Resolved from the draft checkpoint where a family has versions. Do not set manually.",
@@ -479,8 +490,39 @@
     },
     "BlockReuseConfig": {
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "drop_extended_turns": {
+                "const": true
+              }
+            },
+            "required": [
+              "drop_extended_turns"
+            ]
+          },
+          "then": {
+            "properties": {
+              "policy": {
+                "const": "per_conversation"
+              }
+            },
+            "required": [
+              "policy"
+            ]
+          }
+        }
+      ],
       "description": "Configuration for KV cache block reuse policies.",
       "properties": {
+        "drop_extended_turns": {
+          "default": false,
+          "description": "With policy 'per_conversation', drop a retained turn as soon as a later turn of the same conversation extends it (its committed tokens are a prefix of the later turn's), instead of waiting for it to age out of `max_num_turns`. Turns that are not extended keep their state until the `max_num_turns` cap drops the oldest. This helps when one conversation id carries several branches, such as subagents that share their parent's id: a subagent's turns no longer push out the parent's state. Set `max_num_turns` to at least the number of branches to keep.",
+          "status": "prototype",
+          "title": "Drop Extended Turns",
+          "type": "boolean"
+        },
         "enable_branch_snapshot": {
           "default": false,
           "description": "Keep reusable state where a request's prompt diverges from the prefix cache, so later requests sharing that prefix can reuse up to the fork. For sliding-window attention (SWA), the SWA window at the fork is committed. This helps when only the SWA window at a chunk end is kept: policy 'per_request' or 'per_conversation', or SWA scratch reuse. The fork is aligned down to a block boundary and becomes a forced context chunk boundary. SWA layers skip this with joint target/draft KV cache reuse. For hybrid Mamba models, the recurrent state is snapshotted at the fork. If no periodic or additional snapshot point applies to the prompt, the prompt end is snapshotted as a fallback. Requires KV cache manager v2 and block reuse.",
@@ -1156,6 +1198,17 @@
           "status": "prototype",
           "title": "Moe Tactic"
         },
+        "rejection_sample_method": {
+          "default": "standard",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only: not supported with the dynamic tree, relaxed thinking acceptance or DSpark confidence scheduling.",
+          "enum": [
+            "standard",
+            "block"
+          ],
+          "status": "prototype",
+          "title": "Rejection Sample Method",
+          "type": "string"
+        },
         "skip_ctx_buffer_budget_check": {
           "default": false,
           "description": "Skip the config-time check that the pooled-context K/V buffers fit in the memory left free after the KV-cache pool commits. The estimate is deliberately conservative; set this to proceed when you know the device has the headroom. The token-budget check is not affected.",
@@ -1363,6 +1416,21 @@
           "title": "Confidence Min Predicted Gain",
           "type": "number"
         },
+        "context_recompute_tail": {
+          "anyOf": [
+            {
+              "minimum": -1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": 0,
+          "description": "Prompt-tail tokens to recompute through the target forward when a request takes a KV-cache prefix hit, so a standalone DSpark drafter gets context K/V for reused tokens. Acceptance drops on hits with or without a draft KV pool paired with the target's block reuse, so the tail trades TTFT for acceptance in either layout. 0 (default) disables it; -1 forces a full re-prefill on a hit; None resolves from the draft model config to the drafter's attention window when every layer's context attention is windowed, else -1 (0 for the embedded drafter). A disaggregated context server recomputes only when the draft layers share the target's KV cache manager, the one layout whose draft pages reach the generation server. A smaller tail trades acceptance length for TTFT. The V2 KV cache manager requires the all_reusable block-reuse policy; the V1 manager requires chunked prefill and no sliding-window target layers; otherwise the managers disable it with a warning. On recurrent-state targets a positive tail becomes -1 (full re-prefill).",
+          "status": "prototype",
+          "title": "Context Recompute Tail"
+        },
         "decoding_type": {
           "const": "DSpark",
           "default": "DSpark",
@@ -1545,6 +1613,17 @@
           "status": "prototype",
           "title": "Moe Tactic"
         },
+        "rejection_sample_method": {
+          "default": "standard",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only: not supported with the dynamic tree, relaxed thinking acceptance or DSpark confidence scheduling.",
+          "enum": [
+            "standard",
+            "block"
+          ],
+          "status": "prototype",
+          "title": "Rejection Sample Method",
+          "type": "string"
+        },
         "spec_dec_variant": {
           "default": 1,
           "description": "Version of the algorithm within its decoding_type family (e.g. DFlash 1 vs. 2), for versions that share one decoding config. Resolved from the draft checkpoint where a family has versions. Do not set manually.",
@@ -1602,6 +1681,13 @@
           "description": "Target model layer indices whose hidden states are captured for cross-attention in the draft model. If None, read from the draft model config (dspark_target_layer_ids).",
           "title": "Target Layer Ids"
         },
+        "use_ancestral_draft_sampling": {
+          "default": false,
+          "description": "Sampled drafts of a standalone drafter with a Markov head are drawn ancestrally when the deployment drops the sampling filters (advanced_sampling_mode='no_topk_no_topp'): each position is sampled given the token drawn before it by a fused Triton chain, so the stored proposals are the drafter's joint distribution, which raises acceptance. If true, all other sampled drafts are drawn ancestrally too, at one sampler call per draft position. False (default) chains the Markov bias of the other sampled drafts through the greedy argmax and samples every position at once. Requires use_rejection_sampling=True; standalone drafters only, not supported with confidence scheduling.",
+          "status": "prototype",
+          "title": "Use Ancestral Draft Sampling",
+          "type": "boolean"
+        },
         "use_rejection_sampling": {
           "default": false,
           "description": "If true, enables rejection sampling for one-model speculative decoding paths when the batch contains any non-greedy request. All-greedy batches always take the argmax fast path regardless of this flag. Set to false (default) to use exact-match verification on non-greedy batches. The non-dynamic-tree one-model path requires FlashInfer.",
@@ -1652,6 +1738,29 @@
           "description": "CUDA graph configuration mode.",
           "title": "Mode",
           "type": "string"
+        },
+        "sampling_variants": {
+          "anyOf": [
+            {
+              "items": {
+                "enum": [
+                  "greedy",
+                  "advanced",
+                  "temperature_only"
+                ],
+                "type": "string"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Sampling variants captured as CUDA graphs with one-engine speculative decoding. 'greedy' serves decode batches whose requests all decode greedily; 'advanced' serves batches with a sampled request, one whose temperature, top-k, top-p or min-p does not resolve to greedy decoding (a seed or a penalty alone does not); 'temperature_only' serves sampled batches whose sampled requests set only a temperature, where the target tokens are sampled from vocabulary-sharded logits: MTP-Eagle one-model decode on models with the spec-decode fast paths (today Qwen3.5 checkpoints on SM 10.0/10.3 GPUs) with tensor parallelism, without attention DP, relaxed acceptance or watermark_config; or a DSpark draft embedded in the target checkpoint (the DeepSeek-V4 family) with tensor parallelism, or with attention DP and enable_lm_head_tp_in_adp. Both need no rejection sampling or penalties; elsewhere the first capture rejects it. By default every variant the engine supports is captured. Without 'temperature_only', temperature-only batches use 'advanced'. Without 'greedy', greedy batches use the sampled graphs ('temperature_only' if listed, else 'advanced') and still decode greedily, but add sampling-parameter and RNG-state uploads, take the sampled path in eager steps too, can break exact ties differently on 'advanced', and lose the argmax fast paths: with rejection sampling, argmax drafting and its LM-head-TP path, and the vocabulary-sharded target argmax where the model has one (models with the spec-decode fast paths and embedded DSpark drafts keep it by listing 'temperature_only', unless they use rejection sampling; DFlash with tensor parallelism keeps its shard selection without rejection sampling and with advanced_sampling_mode 'no_topk_no_topp'). Without 'advanced', a sampled batch that 'temperature_only' does not serve runs eagerly; under attention DP the whole step then runs eagerly on every rank.",
+          "status": "prototype",
+          "title": "Sampling Variants"
         }
       },
       "title": "DecodeCudaGraphConfig",
@@ -3133,6 +3242,19 @@
           "title": "Max Stats Len",
           "type": "integer"
         },
+        "memory_monitor_config": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MemoryMonitorConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Configuration for the GPU memory monitor, which explains out-of-memory errors. Unset uses the defaults: a report when GPU memory runs out, and nothing else.",
+          "status": "prototype"
+        },
         "mla_skip_correction_threshold": {
           "default": 8.0,
           "description": "Threshold for threshold-based skip-correction. This is used only when enable_mla_skip_correction is True. The default is 8. The maximum supported value depends on the selected kernel's BMM2 dtype: 8 for E4M3, 15 for FP16, and 32 for BF16.",
@@ -4271,6 +4393,17 @@
           "status": "prototype",
           "title": "Moe Tactic"
         },
+        "rejection_sample_method": {
+          "default": "standard",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only: not supported with the dynamic tree, relaxed thinking acceptance or DSpark confidence scheduling.",
+          "enum": [
+            "standard",
+            "block"
+          ],
+          "status": "prototype",
+          "title": "Rejection Sample Method",
+          "type": "string"
+        },
         "spec_dec_variant": {
           "default": 1,
           "description": "Version of the algorithm within its decoding_type family (e.g. DFlash 1 vs. 2), for versions that share one decoding config. Resolved from the draft checkpoint where a family has versions. Do not set manually.",
@@ -4802,6 +4935,17 @@
           "status": "prototype",
           "title": "Moe Tactic"
         },
+        "rejection_sample_method": {
+          "default": "standard",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only: not supported with the dynamic tree, relaxed thinking acceptance or DSpark confidence scheduling.",
+          "enum": [
+            "standard",
+            "block"
+          ],
+          "status": "prototype",
+          "title": "Rejection Sample Method",
+          "type": "string"
+        },
         "sa_config": {
           "anyOf": [
             {
@@ -5119,6 +5263,17 @@
           "description": "MoE implementation to run for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. The recommended interface for choosing it. Takes the values of moe_config.tactic: an id 'provider.technique.kernel_name.quant' or any dotted subset of its segments. The ids, the shortest tactic naming each, and the segment values are listed in the MoE implementation catalog of the MoE performance guide (https://nvidia.github.io/TensorRT-LLM/developer-guide/moe-perf-guide.html, docs/source/developer-guide/moe-perf-guide.md in the source tree). Requires moe_backend unset or AUTO. Unset, the draft selects as moe_backend describes.",
           "status": "prototype",
           "title": "Moe Tactic"
+        },
+        "rejection_sample_method": {
+          "default": "standard",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only: not supported with the dynamic tree, relaxed thinking acceptance or DSpark confidence scheduling.",
+          "enum": [
+            "standard",
+            "block"
+          ],
+          "status": "prototype",
+          "title": "Rejection Sample Method",
+          "type": "string"
         },
         "spec_dec_variant": {
           "default": 3,
@@ -5780,7 +5935,7 @@
             }
           ],
           "default": null,
-          "description": "Override, in tokens, for the max summed attended-KV length (total_kv_len) per forward step that the fp8 context-MLA attention workspace is reserved and scheduled for. Only affects fp8 context-MLA models (e.g. DeepSeek / Kimi with an fp8 KV cache). None (default) reserves for the never-stall worst case min(max_batch_size, max_num_tokens) * max_seq_len. A smaller value reserves less workspace (freeing KV cache) and defers context requests whose summed attended KV would exceed it; it is floored at max_seq_len and capped at the worst case. Safe at any value -- the scheduler enforces it -- trading prefill batching under heavy reuse for KV cache capacity.",
+          "description": "Override, in tokens, for the max summed attended-KV length (total_kv_len) per forward step that the context-MLA attention workspace is reserved and scheduled for. Applies to backends that declare attended-KV workspace, including dense FP8-KV and NVFP4-KV MLA and sparse MLA gathers. None (default) requests the never-stall worst case min(max_batch_size, max_num_tokens) * max_seq_len; the memory budget may reduce the admitted capacity. The override is floored at max_seq_len and capped at that worst case. Smaller values may leave more memory for KV cache, but the reserve cannot drop below the backend's staging floor after crediting staging actually measured during profiling. An override below that floor still limits admission without necessarily freeing more memory. Takes effect only when the estimator reserves this workspace: block reuse without chunked prefill, or chunked prefill whose staging profiling could not measure. It is ignored otherwise, including on decode-only workers. The scheduler defers context requests whose summed attended KV exceeds the admitted cap.",
           "status": "prototype",
           "title": "Fp8 Context Mla Kv Len Cap"
         },
@@ -5965,6 +6120,18 @@
           "status": "prototype",
           "title": "Mixed Precision Last N",
           "type": "integer"
+        },
+        "mixed_precision_reuse": {
+          "default": "default",
+          "description": "Block reuse of a cached prefix whose high-precision copy of its last N tokens was evicted (mixed-precision KV and the cold-page first/last-N window). 'default' reuses the prefix down to its last block boundary and reads those tokens from the history (the low-precision pool, or with the cold-page window the layer's own pages) until they leave the window, so they keep the history's precision. 'recompute' reuses the prefix only up to before them and recomputes them in high precision, reading the N tokens before them from the history. 'strict' reuses the prefix only where its high-precision copy is complete and recomputes the rest; without first-N sink tokens, reuse is always strict.",
+          "enum": [
+            "default",
+            "strict",
+            "recompute"
+          ],
+          "status": "prototype",
+          "title": "Mixed Precision Reuse",
+          "type": "string"
         },
         "pool_ratio": {
           "anyOf": [
@@ -6625,6 +6792,17 @@
           "description": "Number of MTP layers in the model checkpoint. Auto-populated from the target pretrained config, or from speculative_model's config.json when MTP heads are loaded separately. Do not set manually.",
           "title": "Num Nextn Predict Layers"
         },
+        "rejection_sample_method": {
+          "default": "standard",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only: not supported with the dynamic tree, relaxed thinking acceptance or DSpark confidence scheduling.",
+          "enum": [
+            "standard",
+            "block"
+          ],
+          "status": "prototype",
+          "title": "Rejection Sample Method",
+          "type": "string"
+        },
         "relaxed_delta": {
           "default": 0.0,
           "description": "Probability threshold for relaxed acceptance. Only candidates with prob >= (top-1 prob - delta) are kept.",
@@ -6752,6 +6930,24 @@
           "title": "Additional Snapshot Offsets From Start",
           "type": "array"
         },
+        "cold_tier_states_per_request": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Recurrent states that one typical request (kv_cache_config.avg_seq_len tokens) keeps in the host and disk tiers of KV cache manager V2, which split their quota between recurrent-state and attention pages by it. None keeps the GPU tier's split, whose typical request counts the live state and every retained snapshot. A cold tier holds released conversations, which mostly come back through their latest endpoint, so a small value (1 or 2) gives more of the tier to attention pages. Takes effect only with block reuse and a host or disk tier.",
+          "status": "prototype",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Cold Tier States Per Request"
+        },
         "enable_branch_snapshot": {
           "default": false,
           "description": "Deprecated alias for kv_cache_config.block_reuse_config.enable_branch_snapshot. It takes effect only when block reuse is enabled.",
@@ -6773,6 +6969,102 @@
         }
       },
       "title": "MambaStateConfig",
+      "type": "object"
+    },
+    "MemoryMonitorConfig": {
+      "additionalProperties": false,
+      "description": "Configuration for the GPU memory monitor.\n\nEach field corresponds to a ``TLLM_MEM_MONITOR*`` environment variable;\na variable set to a non-blank value overrides the field, and\n``TorchLlmArgs`` applies it when the arguments are validated. See\n``docs/source/features/memory-monitor.md``.",
+      "properties": {
+        "mode": {
+          "anyOf": [
+            {
+              "enum": [
+                "off",
+                "oom",
+                "full",
+                "0",
+                "1"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "boolean"
+            },
+            {
+              "enum": [
+                0,
+                1
+              ],
+              "type": "integer"
+            }
+          ],
+          "default": "oom",
+          "description": "'oom' reports out-of-memory errors that the executor's own error handling sees and records nothing else; 'full' also records startup, reports when it completes, compares later reports with that point and reports out-of-memory errors seen anywhere in the process; 'off' produces no reports on its own. YAML's unquoted off and on (booleans) and 0 and 1 are read as 'off' and 'full'. Overridden by TLLM_MEM_MONITOR.",
+          "title": "Mode"
+        },
+        "oom_report_interval_s": {
+          "default": 60.0,
+          "description": "Minimum seconds between two out-of-memory reports, at most a week. Overridden by TLLM_MEM_MONITOR_OOM_INTERVAL.",
+          "maximum": 604800.0,
+          "minimum": 0.0,
+          "title": "Oom Report Interval S",
+          "type": "number"
+        },
+        "periodic_report_interval_s": {
+          "anyOf": [
+            {
+              "maximum": 604800.0,
+              "minimum": 1.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "In 'full' mode, report every this many seconds while serving, at most once a week. Overridden by TLLM_MEM_MONITOR_INTERVAL, where 0 turns the periodic report off.",
+          "title": "Periodic Report Interval S"
+        },
+        "ranks": {
+          "anyOf": [
+            {
+              "items": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Ranks that report; all ranks when unset. Each must be below the job's world size. Overridden by TLLM_MEM_MONITOR_RANKS.",
+          "title": "Ranks"
+        },
+        "record_stacks": {
+          "default": false,
+          "description": "In 'full' mode, record the Python stack of every live PyTorch allocation so that unattributed PyTorch memory is broken down by the code that allocated it. Slows every PyTorch allocation; meant for reproducing a problem. Overridden by TLLM_MEM_MONITOR_STACKS.",
+          "title": "Record Stacks",
+          "type": "boolean"
+        },
+        "report_dir": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Directory to which every report except on-demand ones is also written, one file per report. It is created readable by its owner only, and only the newest 100 periodic reports of each rank and process are kept. Overridden by TLLM_MEM_MONITOR_DIR.",
+          "title": "Report Dir"
+        }
+      },
+      "title": "MemoryMonitorConfig",
       "type": "object"
     },
     "MiniMaxM3SparseAttentionConfig": {
@@ -7191,7 +7483,7 @@
       "not": {
         "pattern": "^[\\u0009\\u000a\\u000b\\u000c\\u000d\\u001c\\u001d\\u001e\\u001f\\u0020\\u0085\\u00a0\\u1680\\u2000\\u2001\\u2002\\u2003\\u2004\\u2005\\u2006\\u2007\\u2008\\u2009\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]*\\*(\\.\\*){0,3}[\\u0009\\u000a\\u000b\\u000c\\u000d\\u001c\\u001d\\u001e\\u001f\\u0020\\u0085\\u00a0\\u1680\\u2000\\u2001\\u2002\\u2003\\u2004\\u2005\\u2006\\u2007\\u2008\\u2009\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]*$"
       },
-      "pattern": "^[\\u0009\\u000a\\u000b\\u000c\\u000d\\u001c\\u001d\\u001e\\u001f\\u0020\\u0085\\u00a0\\u1680\\u2000\\u2001\\u2002\\u2003\\u2004\\u2005\\u2006\\u2007\\u2008\\u2009\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]*(\\*|[bB]12[xX]|[cC][uU][dD][aA]|[cC][uU][tT][eE][dD][sS][lL]|[cC][uU][tT][lL][aA][sS][sS]|[dD][eE][eE][pP][gG][eE][mM][mM]|[dD][eE][nN][sS][eE]_[gG][eE][mM][mM]|[fF][lL][aA][sS][hH][iI][nN][fF][eE][rR]|[fF][pP]8|[fF][pP]8_[bB][lL][oO][cC][kK]_[sS][cC][aA][lL][eE][sS]|[fF][uU][sS][eE][dD]_[fF][cC]12|[fF][uU][sS][eE][dD]_[mM][oO][eE]|[gG][rR][oO][uU][pP][eE][dD]_[gG][eE][mM][mM]|[hH][oO][pP][pP][eE][rR]_[gG][rR][oO][uU][pP][eE][dD]_[gG][eE][mM][mM]|[mM][aA][rR][lL][iI][nN]|[mM][eE][gG][aA]_[mM][oO][eE]|[mM][xX][fF][pP]8|[nN][oO][nN][eE]|[nN][vV][fF][pP]4|[nN][vV][fF][pP]4_[pP][lL][uU][sS]|[tT][rR][iI][tT][oO][nN]|[tT][rR][tT][lL][lL][mM]|[tT][rR][tT][lL][lL][mM]_[gG][eE][nN]|[wW]4[aA]16_[mM][xX][fF][pP]4|[wW]4[aA]16_[nN][vV][fF][pP]4|[wW]4[aA]8_[aA][wW][qQ]|[wW]4[aA]8_[mM][xX][fF][pP]4_[fF][pP]8|[wW]4[aA]8_[mM][xX][fF][pP]4_[mM][xX][fF][pP]8|[wW]4[aA]8_[nN][vV][fF][pP]4_[fF][pP]8|[wW]8[aA]16)(\\.(\\*|[bB]12[xX]|[cC][uU][dD][aA]|[cC][uU][tT][eE][dD][sS][lL]|[cC][uU][tT][lL][aA][sS][sS]|[dD][eE][eE][pP][gG][eE][mM][mM]|[dD][eE][nN][sS][eE]_[gG][eE][mM][mM]|[fF][lL][aA][sS][hH][iI][nN][fF][eE][rR]|[fF][pP]8|[fF][pP]8_[bB][lL][oO][cC][kK]_[sS][cC][aA][lL][eE][sS]|[fF][uU][sS][eE][dD]_[fF][cC]12|[fF][uU][sS][eE][dD]_[mM][oO][eE]|[gG][rR][oO][uU][pP][eE][dD]_[gG][eE][mM][mM]|[hH][oO][pP][pP][eE][rR]_[gG][rR][oO][uU][pP][eE][dD]_[gG][eE][mM][mM]|[mM][aA][rR][lL][iI][nN]|[mM][eE][gG][aA]_[mM][oO][eE]|[mM][xX][fF][pP]8|[nN][oO][nN][eE]|[nN][vV][fF][pP]4|[nN][vV][fF][pP]4_[pP][lL][uU][sS]|[tT][rR][iI][tT][oO][nN]|[tT][rR][tT][lL][lL][mM]|[tT][rR][tT][lL][lL][mM]_[gG][eE][nN]|[wW]4[aA]16_[mM][xX][fF][pP]4|[wW]4[aA]16_[nN][vV][fF][pP]4|[wW]4[aA]8_[aA][wW][qQ]|[wW]4[aA]8_[mM][xX][fF][pP]4_[fF][pP]8|[wW]4[aA]8_[mM][xX][fF][pP]4_[mM][xX][fF][pP]8|[wW]4[aA]8_[nN][vV][fF][pP]4_[fF][pP]8|[wW]8[aA]16)){0,3}[\\u0009\\u000a\\u000b\\u000c\\u000d\\u001c\\u001d\\u001e\\u001f\\u0020\\u0085\\u00a0\\u1680\\u2000\\u2001\\u2002\\u2003\\u2004\\u2005\\u2006\\u2007\\u2008\\u2009\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]*$",
+      "pattern": "^[\\u0009\\u000a\\u000b\\u000c\\u000d\\u001c\\u001d\\u001e\\u001f\\u0020\\u0085\\u00a0\\u1680\\u2000\\u2001\\u2002\\u2003\\u2004\\u2005\\u2006\\u2007\\u2008\\u2009\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]*(\\*|[bB]12[xX]|[cC][uU][dD][aA]|[cC][uU][tT][eE][dD][sS][lL]|[cC][uU][tT][lL][aA][sS][sS]|[dD][eE][eE][pP][gG][eE][mM][mM]|[dD][eE][nN][sS][eE]_[gG][eE][mM][mM]|[fF][lL][aA][sS][hH][iI][nN][fF][eE][rR]|[fF][pP]8|[fF][pP]8_[aA][cC][tT]_[gG][rR][oO][uU][pP][eE][dD]_[gG][eE][mM][mM]|[fF][pP]8_[bB][lL][oO][cC][kK]_[sS][cC][aA][lL][eE][sS]|[fF][uU][sS][eE][dD]_[fF][cC]12|[fF][uU][sS][eE][dD]_[mM][oO][eE]|[gG][rR][oO][uU][pP][eE][dD]_[gG][eE][mM][mM]|[hH][oO][pP][pP][eE][rR]_[gG][rR][oO][uU][pP][eE][dD]_[gG][eE][mM][mM]|[mM][aA][rR][lL][iI][nN]|[mM][eE][gG][aA]_[mM][oO][eE]|[mM][xX][fF][pP]8|[nN][oO][nN][eE]|[nN][vV][fF][pP]4|[nN][vV][fF][pP]4_[pP][lL][uU][sS]|[tT][rR][iI][tT][oO][nN]|[tT][rR][tT][lL][lL][mM]|[tT][rR][tT][lL][lL][mM]_[gG][eE][nN]|[wW]4[aA]16_[mM][xX][fF][pP]4|[wW]4[aA]16_[nN][vV][fF][pP]4|[wW]4[aA]8_[aA][wW][qQ]|[wW]4[aA]8_[mM][xX][fF][pP]4_[fF][pP]8|[wW]4[aA]8_[mM][xX][fF][pP]4_[mM][xX][fF][pP]8|[wW]4[aA]8_[nN][vV][fF][pP]4_[fF][pP]8|[wW]8[aA]16)(\\.(\\*|[bB]12[xX]|[cC][uU][dD][aA]|[cC][uU][tT][eE][dD][sS][lL]|[cC][uU][tT][lL][aA][sS][sS]|[dD][eE][eE][pP][gG][eE][mM][mM]|[dD][eE][nN][sS][eE]_[gG][eE][mM][mM]|[fF][lL][aA][sS][hH][iI][nN][fF][eE][rR]|[fF][pP]8|[fF][pP]8_[aA][cC][tT]_[gG][rR][oO][uU][pP][eE][dD]_[gG][eE][mM][mM]|[fF][pP]8_[bB][lL][oO][cC][kK]_[sS][cC][aA][lL][eE][sS]|[fF][uU][sS][eE][dD]_[fF][cC]12|[fF][uU][sS][eE][dD]_[mM][oO][eE]|[gG][rR][oO][uU][pP][eE][dD]_[gG][eE][mM][mM]|[hH][oO][pP][pP][eE][rR]_[gG][rR][oO][uU][pP][eE][dD]_[gG][eE][mM][mM]|[mM][aA][rR][lL][iI][nN]|[mM][eE][gG][aA]_[mM][oO][eE]|[mM][xX][fF][pP]8|[nN][oO][nN][eE]|[nN][vV][fF][pP]4|[nN][vV][fF][pP]4_[pP][lL][uU][sS]|[tT][rR][iI][tT][oO][nN]|[tT][rR][tT][lL][lL][mM]|[tT][rR][tT][lL][lL][mM]_[gG][eE][nN]|[wW]4[aA]16_[mM][xX][fF][pP]4|[wW]4[aA]16_[nN][vV][fF][pP]4|[wW]4[aA]8_[aA][wW][qQ]|[wW]4[aA]8_[mM][xX][fF][pP]4_[fF][pP]8|[wW]4[aA]8_[mM][xX][fF][pP]4_[mM][xX][fF][pP]8|[wW]4[aA]8_[nN][vV][fF][pP]4_[fF][pP]8|[wW]8[aA]16)){0,3}[\\u0009\\u000a\\u000b\\u000c\\u000d\\u001c\\u001d\\u001e\\u001f\\u0020\\u0085\\u00a0\\u1680\\u2000\\u2001\\u2002\\u2003\\u2004\\u2005\\u2006\\u2007\\u2008\\u2009\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]*$",
       "type": "string"
     },
     "MoeWarmupPlacementConfig": {
@@ -7839,6 +8131,17 @@
           "status": "prototype",
           "title": "Moe Tactic"
         },
+        "rejection_sample_method": {
+          "default": "standard",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only: not supported with the dynamic tree, relaxed thinking acceptance or DSpark confidence scheduling.",
+          "enum": [
+            "standard",
+            "block"
+          ],
+          "status": "prototype",
+          "title": "Rejection Sample Method",
+          "type": "string"
+        },
         "spec_dec_variant": {
           "default": 1,
           "description": "Version of the algorithm within its decoding_type family (e.g. DFlash 1 vs. 2), for versions that share one decoding config. Resolved from the draft checkpoint where a family has versions. Do not set manually.",
@@ -8133,6 +8436,17 @@
           "description": "MoE implementation to run for a neural draft model or embedded MTP layers (PyTorch backend); ignored without a neural draft model. The recommended interface for choosing it. Takes the values of moe_config.tactic: an id 'provider.technique.kernel_name.quant' or any dotted subset of its segments. The ids, the shortest tactic naming each, and the segment values are listed in the MoE implementation catalog of the MoE performance guide (https://nvidia.github.io/TensorRT-LLM/developer-guide/moe-perf-guide.html, docs/source/developer-guide/moe-perf-guide.md in the source tree). Requires moe_backend unset or AUTO. Unset, the draft selects as moe_backend describes.",
           "status": "prototype",
           "title": "Moe Tactic"
+        },
+        "rejection_sample_method": {
+          "default": "standard",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only: not supported with the dynamic tree, relaxed thinking acceptance or DSpark confidence scheduling.",
+          "enum": [
+            "standard",
+            "block"
+          ],
+          "status": "prototype",
+          "title": "Rejection Sample Method",
+          "type": "string"
         },
         "sa_config": {
           "anyOf": [
@@ -9181,6 +9495,17 @@
           "status": "prototype",
           "title": "Moe Tactic"
         },
+        "rejection_sample_method": {
+          "default": "standard",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only: not supported with the dynamic tree, relaxed thinking acceptance or DSpark confidence scheduling.",
+          "enum": [
+            "standard",
+            "block"
+          ],
+          "status": "prototype",
+          "title": "Rejection Sample Method",
+          "type": "string"
+        },
         "spec_dec_variant": {
           "default": 1,
           "description": "Version of the algorithm within its decoding_type family (e.g. DFlash 1 vs. 2), for versions that share one decoding config. Resolved from the draft checkpoint where a family has versions. Do not set manually.",
@@ -9467,6 +9792,17 @@
         "output_directory": {
           "description": "Directory path where hidden states data files will be saved. The directory is created if it does not exist.",
           "title": "Output Directory",
+          "type": "string"
+        },
+        "rejection_sample_method": {
+          "default": "standard",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only: not supported with the dynamic tree, relaxed thinking acceptance or DSpark confidence scheduling.",
+          "enum": [
+            "standard",
+            "block"
+          ],
+          "status": "prototype",
+          "title": "Rejection Sample Method",
           "type": "string"
         },
         "spec_dec_variant": {
@@ -10115,6 +10451,17 @@
           "status": "prototype",
           "title": "Moe Tactic"
         },
+        "rejection_sample_method": {
+          "default": "standard",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only: not supported with the dynamic tree, relaxed thinking acceptance or DSpark confidence scheduling.",
+          "enum": [
+            "standard",
+            "block"
+          ],
+          "status": "prototype",
+          "title": "Rejection Sample Method",
+          "type": "string"
+        },
         "resource_manager": {
           "type": "null"
         },
@@ -10266,7 +10613,7 @@
       "type": "object"
     }
   },
-  "$id": "https://nvidia.github.io/TensorRT-LLM/1.4.0rc4/_static/schemas/trtllm-serve-disagg-config.schema.json",
+  "$id": "https://nvidia.github.io/TensorRT-LLM/1.4.0rc5/_static/schemas/trtllm-serve-disagg-config.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "allOf": [
@@ -11507,6 +11854,19 @@
       "title": "Max Stats Len",
       "type": "integer"
     },
+    "memory_monitor_config": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/MemoryMonitorConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Configuration for the GPU memory monitor, which explains out-of-memory errors. Unset uses the defaults: a report when GPU memory runs out, and nothing else.",
+      "status": "prototype"
+    },
     "mla_skip_correction_threshold": {
       "default": 8.0,
       "description": "Threshold for threshold-based skip-correction. This is used only when enable_mla_skip_correction is True. The default is 8. The maximum supported value depends on the selected kernel's BMM2 dtype: 8 for E4M3, 15 for FP16, and 32 for BF16.",
@@ -12421,6 +12781,6 @@
     }
   },
   "required": [],
-  "title": "TensorRT-LLM 1.4.0rc4 trtllm-serve disaggregated --config",
+  "title": "TensorRT-LLM 1.4.0rc5 trtllm-serve disaggregated --config",
   "type": "object"
 }
