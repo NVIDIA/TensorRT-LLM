@@ -5,8 +5,8 @@ import base64
 import copy
 import math
 import re
-from functools import lru_cache
-from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
+from functools import lru_cache, partial
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -75,7 +75,8 @@ from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_encoder import MultimodalEncoderMixin
 from .modeling_multimodal_encoder import \
     prepare_encoder_attn_metadata as _prepare_qwen_vl_vision_attn_metadata
-from .modeling_multimodal_mixin import MultimodalModelMixin
+from .modeling_multimodal_mixin import (EncoderGroup, MultimodalModelMixin,
+                                        encode_multimodal_by_groups)
 from .modeling_multimodal_utils import (
     _install_processor_output_validation_filter, find_input_mm_embeds,
     fuse_input_embeds, get_attached_multimodal_embeddings,
@@ -1494,6 +1495,41 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         }
 
 
+def _qwen_vision_batch(
+    multimodal_params: List[MultimodalParams],
+    modalities: Tuple[str, ...],
+    prepare_pixels: Optional[Callable] = None,
+) -> Dict[str, torch.Tensor]:
+    pixels = []
+    grids = []
+    for modality in modalities:
+        pixel_key = "pixel_values" if modality == "image" else "pixel_values_videos"
+        for param in multimodal_params:
+            bucket = param.multimodal_data.get(modality)
+            if bucket is None:
+                continue
+            value = bucket[pixel_key]
+            if prepare_pixels is not None:
+                value = prepare_pixels(value, bucket)
+            pixels.append(value)
+            grids.append(bucket[f"{modality}_grid_thw"])
+    return {
+        "pixel_values": pixels[0] if len(pixels) == 1 else torch.cat(pixels),
+        "grid_thw": grids[0] if len(grids) == 1 else torch.cat(grids),
+    }
+
+
+def _qwen_vision_groups(
+        encode: Callable,
+        prepare_pixels: Optional[Callable] = None) -> Tuple[EncoderGroup, ...]:
+    return tuple(
+        EncoderGroup((modality, ), encode,
+                     partial(_qwen_vision_batch,
+                             modalities=(modality, ),
+                             prepare_pixels=prepare_pixels))
+        for modality in ("image", "video"))
+
+
 class Qwen2VisionModelBase(nn.Module):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig],
@@ -1609,81 +1645,75 @@ class Qwen2VisionModelBase(nn.Module):
                            converted_weights,
                            params_map=pattern_mapping)
 
-    def _parse_and_batch_multimodal_data(
-        self, multimodal_params: List[MultimodalParams]
-    ) -> Tuple[Dict[str, Any], Dict[str, List[Any]]]:
-
-        pixel_values_list = []
-        pixel_values_videos_list = []
-        image_grid_thw_list = []
-        video_grid_thw_list = []
-
-        for multimodal_param in multimodal_params:
-            # Process images if present
-            if multimodal_param.multimodal_data.get("image") is not None:
-                pixel_values_list.append(
-                    multimodal_param.multimodal_data["image"]["pixel_values"])
-                image_grid_thw_list.append(
-                    multimodal_param.multimodal_data["image"]["image_grid_thw"])
-
-            # Process videos if present
-            if multimodal_param.multimodal_data.get("video") is not None:
-                pixel_values_videos_list.append(
-                    multimodal_param.multimodal_data["video"]
-                    ["pixel_values_videos"])
-                video_grid_thw_list.append(
-                    multimodal_param.multimodal_data["video"]["video_grid_thw"])
-
-        # Concatenate tensors
-        mm_content_dict = {}
-        if pixel_values_list:
-            mm_content_dict["pixel_values"] = torch.cat(
-                pixel_values_list,
-                dim=0) if len(pixel_values_list) > 1 else pixel_values_list[0]
-        if pixel_values_videos_list:
-            mm_content_dict["pixel_values_videos"] = torch.cat(
-                pixel_values_videos_list,
-                dim=0) if len(pixel_values_videos_list
-                              ) > 1 else pixel_values_videos_list[0]
-
-        # Prepare extra data
-        mm_extra_data = {}
-        if image_grid_thw_list:
-            mm_extra_data["image_grid_thw"] = torch.cat(
-                image_grid_thw_list, dim=0) if len(
-                    image_grid_thw_list) > 1 else image_grid_thw_list[0]
-        if video_grid_thw_list:
-            mm_extra_data["video_grid_thw"] = torch.cat(
-                video_grid_thw_list, dim=0) if len(
-                    video_grid_thw_list) > 1 else video_grid_thw_list[0]
-
-        return mm_content_dict, mm_extra_data
+    def _encode_batched(self, pixel_values: torch.Tensor,
+                        grid_thw: torch.Tensor) -> torch.Tensor:
+        embed = self.visual(pixel_values, grid_thw=grid_thw)
+        if isinstance(embed, BaseModelOutputWithPooling):
+            embed = embed.pooler_output
+        return embed
 
     @nvtx_range("Qwen2VisionModelBase forward()")
     @torch.inference_mode()
-    def forward(self, multimodal_params: List[MultimodalParams]):
-
-        mm_content_data, mm_extra_data = self._parse_and_batch_multimodal_data(
-            multimodal_params)
-        pixel_values = mm_content_data.get("pixel_values", None)
-        pixel_values_videos = mm_content_data.get("pixel_values_videos", None)
-
-        image_grid_thw = mm_extra_data.get("image_grid_thw", None)
-        video_grid_thw = mm_extra_data.get("video_grid_thw", None)
-
-        embeds = []
-        if pixel_values is not None:
-            embed = self.visual(pixel_values, grid_thw=image_grid_thw)
-            if isinstance(embed, BaseModelOutputWithPooling):
-                embed = embed.pooler_output
-            embeds.append(embed)
-
-        if pixel_values_videos is not None:
-            embed = self.visual(pixel_values_videos, grid_thw=video_grid_thw)
-            if isinstance(embed, BaseModelOutputWithPooling):
-                embed = embed.pooler_output
-            embeds.append(embed)
-        return embeds
+    def forward(
+            self,
+            multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
+        params = []
+        for param in multimodal_params:
+            record = param.item_metadata
+            if record is None or record.output_embedding_lengths is None:
+                # Prepared inputs may omit scheduling metadata. With one modality
+                # and no item reorder, the packed output is already in prompt order.
+                grids = {
+                    m: param.multimodal_data[m][f"{m}_grid_thw"]
+                    for m in ("image", "video")
+                    if param.multimodal_data.get(m) is not None
+                }
+                if not grids:
+                    continue
+                if len(multimodal_params) == 1 and len(grids) == 1 and (
+                        record is None or len(record.item_refs) == 1):
+                    return [
+                        self._encode_batched(
+                            **_qwen_vision_batch([param], tuple(grids)))
+                    ]
+                merge = self.config.spatial_merge_size**2
+                if ordered_grids := param.multimodal_data.get(
+                        "multimodal_embedding_metadata"):
+                    # The processor saves these grids in prompt order on the host.
+                    next_index = {"image": 0, "video": 0}
+                    refs = []
+                    lengths = []
+                    for item in ordered_grids:
+                        modality = "image" if "image_grid_thw" in item else "video"
+                        refs.append((modality, next_index[modality]))
+                        next_index[modality] += 1
+                        lengths.append(
+                            math.prod(item[f"{modality}_grid_thw"]) // merge)
+                    if record is not None:
+                        refs = record.item_refs
+                else:
+                    lengths_by_ref = {
+                        (m, i): math.prod(row) // merge
+                        for m, grid in grids.items()
+                        for i, row in enumerate(grid.tolist())
+                    }
+                    refs = record.item_refs if record is not None else list(
+                        lengths_by_ref)
+                    lengths = [lengths_by_ref[ref] for ref in refs]
+                param = MultimodalParams(
+                    multimodal_data={
+                        **param.multimodal_data,
+                        MULTIMODAL_ENCODER_ITEM_METADATA_KEY:
+                        MultimodalItemMetadata(
+                            refs, output_embedding_lengths=lengths),
+                    })
+            params.append(param)
+        if not params:
+            return []
+        return [
+            encode_multimodal_by_groups(
+                _qwen_vision_groups(self._encode_batched), params)
+        ]
 
 
 class Qwen2_5_VLVisionAttention(Attention):

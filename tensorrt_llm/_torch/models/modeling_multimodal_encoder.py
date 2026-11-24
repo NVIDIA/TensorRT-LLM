@@ -45,9 +45,12 @@ if TYPE_CHECKING:
 _ENCODER_FALLBACK_MAX_NUM_REQUESTS = 8192
 
 
-def prepare_encoder_attn_metadata(seq_lens: list[int],
-                                  attn_metadata: AttentionMetadata, *,
-                                  max_seq_len: int) -> AttentionMetadata:
+def prepare_encoder_attn_metadata(
+        seq_lens: list[int],
+        attn_metadata: AttentionMetadata,
+        *,
+        max_seq_len: int,
+        live_seq_lens_cuda: torch.Tensor | None = None) -> AttentionMetadata:
     """Refresh packed no-KV encoder lengths while preserving captured buffers.
 
     Args:
@@ -55,6 +58,7 @@ def prepare_encoder_attn_metadata(seq_lens: list[int],
             including the isolated padding segment when using a padded graph.
         attn_metadata: Initialized encoder metadata. Captured length buffers are updated in place.
         max_seq_len: Positive, stable per-segment capacity, at least the largest live length.
+        live_seq_lens_cuda: Eager device lengths for replay, excluding the padding segment.
 
     Returns:
         The supplied metadata, prepared for context-only attention without a KV cache.
@@ -84,38 +88,44 @@ def prepare_encoder_attn_metadata(seq_lens: list[int],
     seq_lens_torch = torch.tensor(seq_lens,
                                   dtype=torch.int,
                                   pin_memory=prefer_pinned())
-    cu_seqlens = torch.empty(num_segments + 1,
-                             dtype=torch.int32,
-                             pin_memory=prefer_pinned())
-    cu_seqlens[0] = 0
-    torch.cumsum(seq_lens_torch, dim=0, out=cu_seqlens[1:])
-
     attn_metadata.num_contexts = num_segments
     attn_metadata.request_ids = list(range(1, num_segments + 1))
     prepare_graph_replay = getattr(attn_metadata,
                                    "prepare_encoder_cuda_graph_replay", None)
     is_cuda_graph = attn_metadata.is_cuda_graph
-    if is_cuda_graph and callable(prepare_graph_replay):
-        prepare_graph_replay(seq_lens, sum(seq_lens))
-        # The replay helper refreshes only the host lengths, but the captured
-        # attention op also reads the device lengths; update them in place.
-        attn_metadata.seq_lens_cuda[:num_segments].copy_(seq_lens_torch,
-                                                         non_blocking=True)
+    if is_cuda_graph and (callable(prepare_graph_replay)
+                          or live_seq_lens_cuda is not None):
+        if callable(prepare_graph_replay):
+            prepare_graph_replay(seq_lens, sum(seq_lens))
+        else:
+            attn_metadata.seq_lens.copy_(seq_lens_torch)
+            attn_metadata.on_update()
+        lengths = attn_metadata.seq_lens_cuda[:num_segments]
+        if min_seq_len == actual_max_seq_len:
+            lengths.fill_(min_seq_len)
+        elif live_seq_lens_cuda is not None:
+            num_live = live_seq_lens_cuda.numel()
+            lengths[:num_live].copy_(live_seq_lens_cuda)
+            if num_live < num_segments:
+                lengths[num_live:].fill_(seq_lens[-1])
+        else:
+            lengths.copy_(seq_lens_torch, non_blocking=True)
+    elif min_seq_len == actual_max_seq_len and not attn_metadata.has_cross_sub_metadata:
+        attn_metadata._set_uniform_encoder_seq_lens(seq_lens_torch, min_seq_len)
     else:
         attn_metadata.seq_lens = seq_lens_torch
-    cu_seqlens = cu_seqlens.to(device=attn_metadata.seq_lens_cuda.device,
-                               non_blocking=True)
-    if (is_cuda_graph and attn_metadata.cu_q_seqlens is not None
-            and attn_metadata.cu_q_seqlens.shape == cu_seqlens.shape):
-        # CUDA graph capture bakes these addresses into attention kernels.
-        # Refresh their contents without replacing the captured buffers.
-        attn_metadata.cu_q_seqlens.copy_(cu_seqlens, non_blocking=True)
-        if (attn_metadata.cu_kv_seqlens.data_ptr()
-                != attn_metadata.cu_q_seqlens.data_ptr()):
-            attn_metadata.cu_kv_seqlens.copy_(cu_seqlens, non_blocking=True)
-    else:
-        attn_metadata.cu_q_seqlens = cu_seqlens
-        attn_metadata.cu_kv_seqlens = cu_seqlens
+    # Compute the offsets from the segment lengths already on the device,
+    # writing directly into captured graph buffers.
+    lengths = attn_metadata.seq_lens_cuda[:num_segments]
+    offsets = attn_metadata.cu_q_seqlens
+    if not is_cuda_graph or offsets is None or offsets.numel(
+    ) != num_segments + 1:
+        offsets = lengths.new_empty(num_segments + 1)
+        attn_metadata.cu_q_seqlens = attn_metadata.cu_kv_seqlens = offsets
+    offsets[:1].zero_()
+    torch.cumsum(lengths, 0, out=offsets[1:])
+    if attn_metadata.cu_kv_seqlens.data_ptr() != offsets.data_ptr():
+        attn_metadata.cu_kv_seqlens.copy_(offsets)
     # Keep the native attention-op cache key stable across image resolutions.
     # Actual segment lengths remain available through seq_lens / cu_seqlens.
     attn_metadata.max_seq_len = max_seq_len

@@ -1598,9 +1598,8 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         # NB: When kv_cache_manager is None (e.g. ViT), ragged prefill runs only for the context phase.
         #     Restrict seq_lens and index tensors to the first num_contexts entries accordingly.
         #
-        # NB: flashinfer expects seq_len (BatchPrefillWithPagedKVCacheWrapper only), paged_kv_last_page_len, qo_indptr,
-        #     and paged_kv_indptr to be host tensors (if not, it synchronously copies them to the host).
-        #     => not using self.qo_indptr and self.kv_indptr here
+        # Planning uses host offsets. The ragged kernels use the corresponding
+        # device offsets already prepared from the same context lengths.
         num_contexts = self.num_contexts
         q_and_kv_seqlens = self.seq_lens[:num_contexts]
         q_and_kv_seqlens_cuda = self.seq_lens_cuda[:self.num_contexts]
@@ -1649,8 +1648,12 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             # Do not pass v_indptr/o_indptr for self-attention. When they are omitted, FlashInfer
             # aliases them to the CUDA-graph-stable kv/qo buffers; passing them explicitly creates
             # fresh CUDA tensors during plan(), leaving replay with stale captured offset pointers.
+            offsets_host = query_output_indptr
+            query_output_indptr = self.qo_indptr[:num_contexts + 1]
             plan_kwargs = dict(
-                kv_indptr=key_value_indptr,
+                kv_indptr=query_output_indptr,
+                qo_indptr_cpu=offsets_host,
+                kv_indptr_cpu=offsets_host,
                 seq_lens=q_and_kv_seqlens_cuda,
                 seq_lens_q=q_and_kv_seqlens_cuda,
                 max_sequence_kv=

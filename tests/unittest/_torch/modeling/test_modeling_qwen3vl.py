@@ -738,6 +738,66 @@ def test_qwen3_vision_cuda_graph_replay_matches_eager(
     assert captured.metadata.max_num_requests == 2
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.inference_mode()
+def test_qwen3_vision_replays_image_and_video_without_uploading_lengths(monkeypatch):
+    config = Qwen3VLConfig.from_dict(copy.deepcopy(QWEN3_VL_8B_CONFIG))
+    vision_config = config.vision_config
+    vision_config.depth = 1
+    vision_config.deepstack_visual_indexes = []
+    vision_config.hidden_size = vision_config.out_hidden_size = 144
+    vision_config.intermediate_size = 576
+    vision_config.num_heads = 2
+    model_config = ModelConfig(pretrained_config=config, attn_backend="TRTLLM")
+    encoder = Qwen3VisionModelBase(model_config, Qwen3VisionModel).cuda().eval()
+    torch.manual_seed(0)
+    for weight in encoder.parameters():
+        weight.normal_(std=0.02)
+    vision = encoder.visual
+    vision.setup_attn_metadata(2048)
+    requests = []
+    for modality, grid in (
+        ("image", [1, 16, 16]),
+        ("video", [2, 16, 16]),
+        ("image", [1, 16, 24]),
+        ("video", [1, 16, 20]),
+    ):
+        num_patches = int(np.prod(grid))
+        pixels = torch.randn(num_patches, 3 * 2 * 16 * 16, device="cuda")
+        pixel_key = "pixel_values" if modality == "image" else "pixel_values_videos"
+        requests.append(
+            MultimodalParams(
+                multimodal_data={
+                    modality: {pixel_key: pixels, f"{modality}_grid_thw": torch.tensor([grid])},
+                    MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                        [(modality, 0)], output_embedding_lengths=[num_patches // 4]
+                    ),
+                }
+            )
+        )
+    eager = torch.cat([encoder([request])[0] for request in requests])
+    vision.enable_blocks_cuda_graph(
+        MultimodalEncoderCudaGraphConfig(buckets=[(1024, 2), (1024, 3)])
+    )
+    captured = vision._blocks_graph_runner._captured
+    length_buffers = {graph.metadata.seq_lens_cuda.data_ptr() for graph in captured.values()}
+    copy_tensor = torch.Tensor.copy_
+
+    def check_copy(dst, src, *args, **kwargs):
+        if src.device.type == "cpu" and dst.is_cuda and dst.data_ptr() in length_buffers:
+            pytest.fail("Graph replay uploaded lengths already available on the device")
+        return copy_tensor(dst, src, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "copy_", check_copy)
+    monkeypatch.setattr(
+        vision, "_run_encoder_blocks", lambda *a, **kw: pytest.fail("Eager fallback")
+    )
+    (actual,) = encoder(requests)
+    assert captured[(1025, 3)].metadata.seq_lens_cuda.tolist() == [256, 384, 385]
+    assert captured[(1025, 4)].metadata.seq_lens_cuda.tolist() == [256, 256, 320, 193]
+    torch.testing.assert_close(actual, eager, rtol=5e-2, atol=5e-2)
+
+
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("support_fused_qkv", [True, False])
 @pytest.mark.parametrize("rope_impl", ["torch", "flash_attn", "flashinfer"])
@@ -1252,14 +1312,13 @@ def _qwen_vl_item_grid_case(encoder_cls):
     returns it as handle metadata), and the encoder returns rows in the same order.
     """
     # A landscape and a portrait image, so a swapped h and w shows.
-    expected = [{"image_grid_thw": [1, 4, 6]}, {"image_grid_thw": [1, 6, 4]}]
-    prompt = [11, 12, 13, 11, 12, 13]
-    model = "qwen2.5"
-    if encoder_cls is not modeling_qwen2vl.Qwen2VisionModelBase:
-        # Qwen3-VL encodes images and videos in one call. The video comes first in the prompt.
-        expected.insert(0, {"video_grid_thw": [2, 4, 4]})
-        prompt = [11, 14, 13] + prompt
-        model = "qwen3"
+    expected = [
+        {"video_grid_thw": [2, 4, 4]},
+        {"image_grid_thw": [1, 4, 6]},
+        {"image_grid_thw": [1, 6, 4]},
+    ]
+    prompt = [11, 14, 13, 11, 12, 13, 11, 12, 13]
+    model = "qwen2.5" if encoder_cls is modeling_qwen2vl.Qwen2VisionModelBase else "qwen3"
     data = {}
     for modality, pixel_key in (("image", "pixel_values"), ("video", "pixel_values_videos")):
         grid_key = f"{modality}_grid_thw"
@@ -1306,11 +1365,25 @@ def test_qwen_vl_processor_item_grids_match_encoder_row_order(encoder_cls):
     A caller that caches encoder outputs passes this grid back with the
     embedding, as {"mm_embeddings": tensor, "image_grid_thw": [t, h, w]}.
     """
-    data, lengths, expected, encoder, _ = _qwen_vl_item_grid_case(encoder_cls)
+    data, lengths, expected, encoder, calls = _qwen_vl_item_grid_case(encoder_cls)
     assert data["multimodal_embedding_metadata"] == expected
-    _assert_rows_hold_item_grids(
-        torch.cat(encoder.forward([MultimodalParams(multimodal_data=data)])), lengths, expected
-    )
+    requests = [MultimodalParams(multimodal_data=data) for _ in range(2)]
+    _assert_rows_hold_item_grids(torch.cat(encoder.forward(requests)), lengths * 2, expected * 2)
+    assert calls == ["cpu", "cpu"]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("retain_order", [False, True])
+def test_qwen2_prepared_vision_recovers_missing_rows(retain_order):
+    cls = modeling_qwen2vl.Qwen2VisionModelBase
+    data, lengths, expected, encoder, calls = _qwen_vl_item_grid_case(cls)
+    record = data.pop(MULTIMODAL_ENCODER_ITEM_METADATA_KEY)
+    if retain_order:
+        data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(record.item_refs)
+    encoder.config = SimpleNamespace(spatial_merge_size=2)
+    requests = [MultimodalParams(multimodal_data=data) for _ in range(2)]
+    _assert_rows_hold_item_grids(torch.cat(encoder.forward(requests)), lengths * 2, expected * 2)
+    assert len(calls) == 2
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -1333,7 +1406,19 @@ def test_qwen_vl_encoder_runner_does_not_read_grid_from_gpu(encoder_cls):
         get_num_tokens=lambda _: sum(lengths),
     )
 
+    transfers = []
+    tensor_to = torch.Tensor.to
+
+    def track_placement(tensor, *args, **kwargs):
+        placed = tensor_to(tensor, *args, **kwargs)
+        if tensor.device.type == "cpu" and placed.is_cuda:
+            transfers.append(tensor.nbytes)
+        return placed
+
     def forward(multimodal_params):
+        # Both requests' pixels and grids are placed before the tower receives them.
+        sizes = [tensor.nbytes for m in ("image", "video") for tensor in data[m].values()]
+        assert transfers == sizes * 2
         # Any device-to-host copy, like tolist() on a CUDA tensor, raises here.
         previous_mode = torch.cuda.get_sync_debug_mode()
         torch.cuda.set_sync_debug_mode("error")
@@ -1347,15 +1432,19 @@ def test_qwen_vl_encoder_runner_does_not_read_grid_from_gpu(encoder_cls):
         encoder_cache_enabled=False,
         moe_load_balancer=None,
     )
-    result = runner.forward(
-        ScheduledInputs(batch=SimpleNamespace(context_requests=[request])),
-        resource_manager=SimpleNamespace(get_resource_manager=lambda _: None),
+    inputs = ScheduledInputs(
+        batch=SimpleNamespace(context_requests=[request, copy.deepcopy(request)])
     )
+    with patch.object(torch.Tensor, "to", track_placement):
+        result = runner.forward(
+            inputs,
+            resource_manager=SimpleNamespace(get_resource_manager=lambda _: None),
+        )
 
     assert set(grid_devices) == {"cuda"}
-    assert result["mm_embedding_metadata"] == [expected]
-    (embedding,) = result["mm_embeddings"]
-    _assert_rows_hold_item_grids(embedding.cpu(), lengths, expected)
+    assert result["mm_embedding_metadata"] == [expected, expected]
+    for embedding in result["mm_embeddings"]:
+        _assert_rows_hold_item_grids(embedding.cpu(), lengths, expected)
 
 
 # ---------------------------------------------------------------------------

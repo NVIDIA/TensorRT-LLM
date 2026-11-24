@@ -1424,6 +1424,7 @@ def _encoder_with_stub_tower():
     encoder = MuseSparkOpenVisionEncoder.__new__(MuseSparkOpenVisionEncoder)
     torch.nn.Module.__init__(encoder)
     encoder.tower = _OrderRecordingTower()
+    encoder._vision_config = _tiny_vision_config().vision_config
     return encoder
 
 
@@ -1511,8 +1512,18 @@ def test_requests_stay_in_batch_order_and_items_in_prompt_order_within_them():
         {"video": _modality_data("video", [1.0]), "image": _modality_data("image", [2.0])},
         item_refs=[("video", 0), ("image", 0)],
     )
-    second = _params({"image": _modality_data("image", [3.0, 4.0])})
-    assert _encoded_order([first, second]) == [1.0, 2.0, 3.0, 4.0]
+    second = _params(
+        {"image": _modality_data("image", [3.0]), "video": _modality_data("video", [4.0])},
+        item_refs=[("image", 0), ("video", 0)],
+    )
+    second.multimodal_data["image"]["pixel_values"] = second.multimodal_data["image"][
+        "pixel_values"
+    ].bfloat16()
+    encoder = _encoder_with_stub_tower()
+    calls = []
+    encoder.tower.register_forward_hook(lambda _, args, out: calls.append(out[:, 0].tolist()))
+    assert encoder([first, second])[:, 0].tolist() == [1.0, 2.0, 3.0, 4.0]
+    assert calls == [[2.0, 3.0], [1.0, 4.0]]
 
 
 def test_a_single_modality_request_needs_no_item_metadata():

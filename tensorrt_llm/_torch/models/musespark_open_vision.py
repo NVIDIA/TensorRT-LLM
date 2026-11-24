@@ -77,7 +77,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from ..._utils import prefer_pinned
 from ...logger import logger
 from ..attention.attention import Attention
 from ..attention.backends import AttentionMetadata
@@ -92,7 +91,7 @@ from ..model_config import ModelConfig
 from ..modules.layer_norm import LayerNorm
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.mlp import MLP
-from .modeling_multimodal_encoder import MultimodalEncoderMixin
+from .modeling_multimodal_encoder import MultimodalEncoderMixin, prepare_encoder_attn_metadata
 
 __all__ = [
     "CKPT_TO_MODULE",
@@ -232,22 +231,13 @@ def _window_geometry(
     return perm, lengths
 
 
-@lru_cache(maxsize=256)
-def _pixel_shuffle_permutation(grid_h: int, grid_w: int, downsample_factor: int) -> torch.Tensor:
-    """Host permutation that groups each `r x r` patch block contiguously.
-
-    `rearrange("(h r1 w r2) -> (h w r1 r2)")`; the pixel shuffle then folds
-    each group of `r ** 2` rows into one row of `r ** 2 * dim` features.
-    """
-    if grid_h % downsample_factor or grid_w % downsample_factor:
-        raise ValueError(
-            f"grid {grid_h}x{grid_w} is not divisible by downsample_factor {downsample_factor}; "
-            "the input processor must fit every canvas to a multiple of "
-            f"{downsample_factor} patches per side"
-        )
-    r = downsample_factor
-    perm = torch.arange(grid_h * grid_w, dtype=torch.int64)
-    return perm.reshape(grid_h // r, r, grid_w // r, r).permute(0, 2, 1, 3).reshape(-1)
+def _pixel_unshuffle(x: torch.Tensor, t: int, h: int, w: int, factor: int) -> torch.Tensor:
+    """Fold each spatial block into channels in feature-major order for every clip."""
+    if h % factor or w % factor:
+        raise ValueError(f"grid {h}x{w} is not divisible by downsample_factor {factor}")
+    images = x.reshape(t, h, w, -1).permute(0, 3, 1, 2)
+    merged = F.pixel_unshuffle(images, factor)
+    return merged.permute(0, 2, 3, 1).reshape(-1, merged.shape[1])
 
 
 def vision_rows_for_grid(t: int, h: int, w: int, cfg: MuseSparkOpenVisionConfig) -> int:
@@ -740,44 +730,15 @@ class MuseSparkOpenNaViTVisionTower(nn.Module, MultimodalEncoderMixin):
     def prepare_attn_metadata(
         self, seq_lens: Sequence[int], attn_metadata: AttentionMetadata
     ) -> AttentionMetadata:
-        """Present each clip (or window) to the attention op as its own context.
-
-        Everything here is host arithmetic plus one pinned host-to-device copy;
-        nothing reads a device tensor back.
-        """
+        """Present each clip or window to the attention op as its own context."""
         if attn_metadata is None:
             raise RuntimeError(
                 "vision AttentionMetadata is not initialized; setup_attn_metadata must run "
                 "before the tower's first forward"
             )
-        seq_lens = [int(s) for s in seq_lens]
-        if not seq_lens:
-            raise ValueError("vision attention needs at least one segment")
-        max_seq_len = self._max_seq_len_for(attn_metadata)
-        longest = max(seq_lens)
-        if longest > max_seq_len:
-            raise ValueError(
-                f"vision attention segment length {longest} exceeds the configured maximum "
-                f"{max_seq_len}; raise the encoder token budget or lower max_pixels"
-            )
-
-        num_segments = len(seq_lens)
-        seq_lens_host = torch.tensor(seq_lens, dtype=torch.int, pin_memory=prefer_pinned())
-        cu_seqlens = torch.empty(num_segments + 1, dtype=torch.int32, pin_memory=prefer_pinned())
-        cu_seqlens[0] = 0
-        torch.cumsum(seq_lens_host, dim=0, out=cu_seqlens[1:])
-
-        attn_metadata.num_contexts = num_segments
-        attn_metadata.request_ids = list(range(1, num_segments + 1))
-        attn_metadata.seq_lens = seq_lens_host
-        cu_seqlens = cu_seqlens.to(device=attn_metadata.seq_lens_cuda.device, non_blocking=True)
-        attn_metadata.cu_q_seqlens = cu_seqlens
-        attn_metadata.cu_kv_seqlens = cu_seqlens
-        # A stable max keeps the attention op's cache key from churning with
-        # every new image resolution; the real lengths travel in cu_seqlens.
-        attn_metadata.max_seq_len = max_seq_len
-        attn_metadata.prepare_encoder_only()
-        return attn_metadata
+        return prepare_encoder_attn_metadata(
+            list(seq_lens), attn_metadata, max_seq_len=self._max_seq_len_for(attn_metadata)
+        )
 
     # ---- geometry ---------------------------------------------------------
 
@@ -899,9 +860,7 @@ class MuseSparkOpenNaViTVisionTower(nn.Module, MultimodalEncoderMixin):
         clip_lens: List[int] = []
         window_perms: List[torch.Tensor] = []
         window_lens: List[int] = []
-        shuffle_perms: List[torch.Tensor] = []
         offset = 0
-        shuffled_offset = 0
 
         for t, grid_h, grid_w in rows:
             clip_tokens = grid_h * grid_w
@@ -916,12 +875,7 @@ class MuseSparkOpenNaViTVisionTower(nn.Module, MultimodalEncoderMixin):
                 window_perms.append(perm + offset)
                 window_lens.extend(lengths)
 
-                shuffle_perms.append(
-                    _pixel_shuffle_permutation(grid_h, grid_w, self.downsample_factor)
-                    + shuffled_offset
-                )
                 offset += clip_tokens
-                shuffled_offset += clip_tokens
 
         if offset != pixel_values.shape[0]:
             raise ValueError(
@@ -959,18 +913,12 @@ class MuseSparkOpenNaViTVisionTower(nn.Module, MultimodalEncoderMixin):
 
         x = self.ln_post(x)
 
-        # Pixel shuffle: group each 2x2 patch block, then fold the block into the
-        # feature axis channel-major / sub-position-minor -- `(b r) d -> b (d r)`,
-        # so feature f of sub-position s lands at f * r ** 2 + s.
-        shuffle_perm = torch.cat(shuffle_perms).to(device=device, non_blocking=True)
-        block = self.downsample_factor**2
-        x = x[shuffle_perm]
-        x = (
-            x.reshape(x.shape[0] // block, block, x.shape[-1])
-            .transpose(1, 2)
-            .reshape(x.shape[0] // block, x.shape[-1] * block)
-        )
-
+        sizes = [t * h * w for t, h, w in rows]
+        merged = [
+            _pixel_unshuffle(chunk, t, h, w, self.downsample_factor)
+            for chunk, (t, h, w) in zip(x.split(sizes), rows, strict=True)
+        ]
+        x = merged[0] if len(merged) == 1 else torch.cat(merged)
         x = self.adapter(x)
         return self.vision_projection(x)
 

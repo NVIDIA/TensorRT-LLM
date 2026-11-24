@@ -198,6 +198,7 @@ def test_complete_vision_and_aligner_match_reference(
         actual = aligner(model(patches, 4, 5), 4, 5)
         expected = _reference_encoder(model, aligner, vision_config, patches, 4, 5)
     torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-6)
+    torch.testing.assert_close(model(patches.flatten(2), 4, 5), model(patches, 4, 5))
     model.bfloat16()
     assert model.patch_embed.proj.weight.dtype == torch.bfloat16
     for name, parameter in model.named_parameters():
@@ -217,27 +218,43 @@ def test_wrapper_encodes_image_spans_and_tracks_active_positions(
     wrapper.image_end = nn.Parameter(torch.tensor([-3.0, -4.0]))
     wrapper.image_newline = nn.Parameter(torch.tensor([-5.0, -6.0]))
     pixels = torch.randn(20, 3, 2, 2)
-    params = [
-        SimpleNamespace(
-            multimodal_data={
-                "image": {
-                    "pixel_values": [pixels],
-                    "image_grid_hw": [(4, 5)],
-                    "llm_grid_hw": [(2, 2)],
-                    "num_tokens": [8],
+
+    params = []
+    expected = []
+    for image, height, width in [(pixels, 4, 5), (-pixels, 5, 4), (pixels * 2, 4, 5)]:
+        params.append(
+            SimpleNamespace(
+                multimodal_data={
+                    "image": {
+                        "pixel_values": [image],
+                        "image_grid_hw": [(height, width)],
+                        "llm_grid_hw": [(2, 2)],
+                        "num_tokens": [8],
+                    }
                 }
-            }
+            )
         )
-    ]
-    output = wrapper.encode_multimodal_inputs(params)
-    features = wrapper.aligner(wrapper.vision(pixels, 4, 5), 4, 5)
-    torch.testing.assert_close(output[[1, 2, 4, 5]], features)
-    torch.testing.assert_close(
-        output[[0, 3, 6, 7]],
-        torch.stack(
-            (wrapper.image_start, wrapper.image_newline, wrapper.image_newline, wrapper.image_end)
-        ),
+        features = _reference_encoder(
+            wrapper.vision, wrapper.aligner, vision_config, image, height, width
+        )
+        expected.extend(
+            (
+                wrapper.image_start[None],
+                features[:2],
+                wrapper.image_newline[None],
+                features[2:],
+                wrapper.image_newline[None],
+                wrapper.image_end[None],
+            )
+        )
+
+    batches = []
+    wrapper.vision.register_forward_pre_hook(
+        lambda _, args: batches.append((len(args[0]), *args[1:]))
     )
+    output = wrapper.encode_multimodal_inputs(params)
+    assert batches == [(2, 4, 5), (1, 5, 4)]
+    torch.testing.assert_close(output, torch.cat(expected), rtol=2e-5, atol=2e-6)
     ids = torch.tensor([_IMAGE_ID] * 10)
     kwargs = wrapper.get_language_model_extra_forward_kwargs(
         raw_input_ids=ids,

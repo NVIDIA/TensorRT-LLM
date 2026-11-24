@@ -71,13 +71,17 @@ from .modeling_multimodal_mixin import (
     MultimodalModelMixin,
     encode_multimodal_by_groups,
 )
-from .modeling_qwen2vl import Qwen2_5_VLVisionAttention, _prepare_qwen_vl_vision_attn_metadata
+from .modeling_qwen2vl import (
+    Qwen2_5_VLVisionAttention,
+    _prepare_qwen_vl_vision_attn_metadata,
+    _qwen_vision_groups,
+)
 from .modeling_qwen3vl import (
     Qwen3VLInputProcessorBase,
     Qwen3VLModelBase,
     Qwen3VLVisionMLP,
     Qwen3VLVisionPatchMerger,
-    _qwen3vl_build_batched_input,
+    _qwen3vl_prepare_pixels,
 )
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (
@@ -464,13 +468,7 @@ class Cosmos3EdgeVisionEncoder(nn.Module):
 
     @property
     def mm_encoder_groups(self) -> Tuple[EncoderGroup, ...]:
-        return (
-            EncoderGroup(
-                modalities=("image", "video"),
-                encoder_fn=self.encode_batched,
-                build_batched_input=_qwen3vl_build_batched_input,
-            ),
-        )
+        return _qwen_vision_groups(self.encode_batched, _qwen3vl_prepare_pixels)
 
     def forward(self, multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
         return [encode_multimodal_by_groups(self.mm_encoder_groups, multimodal_params)]

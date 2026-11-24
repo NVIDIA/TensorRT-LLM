@@ -26,9 +26,9 @@ version is documented in the deployment guide.
 
 import copy
 import re
+from functools import partial
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-import numpy as np
 import torch
 import torch.nn as nn
 from PIL import Image
@@ -418,9 +418,7 @@ class Glm5NextVisionModel(nn.Module, MultimodalEncoderMixin):
             10000.0 ** (torch.arange(0, freq_dim, 2, dtype=torch.float32, device="cpu") / freq_dim)
         )
         self._rope_inv_freq_by_device: Dict[torch.device, torch.Tensor] = {}
-        # Per-grid (cos, sin) tables on the model device; image grids repeat
-        # heavily in practice and the numpy position build + H2D copy per call
-        # is pure host latency otherwise.
+        # Reuse the device cos/sin tables when a patch grid repeats.
         self._rope_cache: Dict[
             Tuple[Tuple[int, int, int], ...], Tuple[torch.Tensor, torch.Tensor]
         ] = {}
@@ -532,31 +530,29 @@ class Glm5NextVisionModel(nn.Module, MultimodalEncoderMixin):
     # -- rotary -------------------------------------------------------------
     @staticmethod
     def rot_pos_ids(t: int, h: int, w: int, spatial_merge_size: int) -> torch.Tensor:
-        """(h, w) coordinates per patch in spatial-merge-block order, repeated
-        over the temporal axis — source ``get_vision_position_ids``."""
-        hpos = np.broadcast_to(np.arange(h).reshape(h, 1), (h, w))
-        wpos = np.broadcast_to(np.arange(w).reshape(1, w), (h, w))
-        block = (
+        """Patch coordinates in spatial-merge-block order, repeated for each frame."""
+        row = torch.arange(h)
+        col = torch.arange(w)
+        coords = torch.stack(torch.meshgrid(row, col, indexing="ij"), dim=-1)
+        block = coords.reshape(
             h // spatial_merge_size,
             spatial_merge_size,
             w // spatial_merge_size,
             spatial_merge_size,
+            2,
         )
-        hpos = hpos.reshape(block).transpose(0, 2, 1, 3).flatten()
-        wpos = wpos.reshape(block).transpose(0, 2, 1, 3).flatten()
-        pos = torch.from_numpy(np.stack([hpos, wpos], axis=-1).copy())
-        if t > 1:
-            pos = pos.repeat(t, 1)
-        return pos
+        positions = block.transpose(1, 2).reshape(-1, 2)
+        return positions.repeat(t, 1) if t > 1 else positions
 
     def rot_pos_emb(self, grid_rows: List[List[int]]) -> Tuple[torch.Tensor, torch.Tensor]:
         key = tuple(tuple(int(v) for v in row) for row in grid_rows)
         cached = self._rope_cache.get(key)
         if cached is not None and cached[0].device == self.device:
             return cached
-        pos = torch.cat(
-            [self.rot_pos_ids(t, h, w, self.spatial_merge_size) for t, h, w in grid_rows], dim=0
-        ).to(self.device)
+        with torch.device(self.device):
+            pos = torch.cat(
+                [self.rot_pos_ids(t, h, w, self.spatial_merge_size) for t, h, w in grid_rows]
+            )
         inv_freq = self._rope_inv_freq_by_device.get(pos.device)
         if inv_freq is None:
             inv_freq = self._rope_inv_freq_cpu.to(pos.device)
@@ -712,15 +708,33 @@ class Glm5NextVisionModelBase(nn.Module):
         pixel_values = pixel_values.to(device=self.visual.device, dtype=self.model_dtype)
         return self.visual(pixel_values, grid_thw=grid_thw)
 
+    @torch.inference_mode()
+    def _encode_modalities(
+        self,
+        pixel_values: torch.Tensor,
+        grid_thw: torch.Tensor,
+        image_boundary: Optional[Tuple[int, int]] = None,
+    ) -> torch.Tensor:
+        if image_boundary is None:
+            return self.encode_batched(pixel_values, grid_thw)
+        # Direct host callers upload the complete pixel tensor before the two views.
+        pixel_values = pixel_values.to(device=self.visual.device, dtype=self.model_dtype)
+        grid_thw = grid_thw.cpu()
+        patches, grids = image_boundary
+        return torch.cat(
+            (
+                self.encode_batched(pixel_values[:patches], grid_thw[:grids]),
+                self.encode_batched(pixel_values[patches:], grid_thw[grids:]),
+            )
+        )
+
     @property
     def mm_encoder_groups(self) -> Tuple[EncoderGroup, ...]:
-        # Images and videos share the tower; the framework lays the output out
-        # as all image rows then all video rows and reorders into prompt order.
         return (
             EncoderGroup(
-                modalities=("image", "video"),
-                encoder_fn=self.encode_batched,
-                build_batched_input=_glm5_next_build_batched_input,
+                ("image", "video"),
+                self._encode_modalities,
+                partial(_glm5_next_build_batched_input, split_modalities=True),
             ),
         )
 
@@ -737,7 +751,11 @@ def _flatten_video_grid_thw(video_grid_thw: torch.Tensor) -> torch.Tensor:
     return torch.cat([hw.new_ones(hw.shape[0], 1), hw], dim=1)
 
 
-def _glm5_next_build_batched_input(multimodal_params: List[MultimodalParams]) -> Dict[str, Any]:
+def _glm5_next_build_batched_input(
+    multimodal_params: List[MultimodalParams],
+    *,
+    split_modalities: bool = False,
+) -> Dict[str, Any]:
     pixels: List[torch.Tensor] = []
     grids: List[torch.Tensor] = []
     for param in multimodal_params:
@@ -745,16 +763,24 @@ def _glm5_next_build_batched_input(multimodal_params: List[MultimodalParams]) ->
         if bucket is not None:
             pixels.append(bucket["pixel_values"])
             grids.append(bucket["image_grid_thw"])
+    num_image_tensors = len(pixels)
     for param in multimodal_params:
         bucket = param.multimodal_data.get("video")
         if bucket is not None:
             pixels.append(bucket["pixel_values_videos"])
             grids.append(_flatten_video_grid_thw(bucket["video_grid_thw"]))
     device = pixels[0].device
-    return {
-        "pixel_values": torch.cat(pixels, dim=0),
-        "grid_thw": torch.cat([g.to(device) for g in grids], dim=0),
+    grid_tensors = [grid.to(device) for grid in grids]
+    inputs: Dict[str, Any] = {
+        "pixel_values": pixels[0] if len(pixels) == 1 else torch.cat(pixels),
+        "grid_thw": grid_tensors[0] if len(grids) == 1 else torch.cat(grid_tensors),
     }
+    if split_modalities and 0 < num_image_tensors < len(pixels):
+        inputs["image_boundary"] = (
+            sum(len(pixel) for pixel in pixels[:num_image_tensors]),
+            sum(len(grid) for grid in grids[:num_image_tensors]),
+        )
+    return inputs
 
 
 class Glm5NextInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInputsBuilder):

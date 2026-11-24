@@ -318,6 +318,16 @@ class AttentionMetadata:
             self.cross._seq_lens = self._seq_lens
             self.cross._seq_lens_cuda = self._seq_lens_cuda
 
+    def _set_uniform_encoder_seq_lens(self, host: torch.Tensor,
+                                      length: int) -> None:
+        """Publish equal no-KV segment lengths without uploading a vector."""
+        self._seq_lens = host
+        self.on_update()
+        if self.is_cuda_graph and self._seq_lens_cuda is not None:
+            self._seq_lens_cuda.fill_(length)
+        else:
+            self._seq_lens_cuda = torch.full_like(host, length, device="cuda")
+
     @property
     def num_contexts(self) -> int:
         return self._num_contexts

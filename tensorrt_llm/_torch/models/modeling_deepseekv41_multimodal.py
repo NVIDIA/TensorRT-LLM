@@ -11,16 +11,22 @@ from transformers import PreTrainedModel
 
 from tensorrt_llm.inputs import (
     ContentFormat,
+    MultimodalItemMetadata,
+    MultimodalItemPartition,
     MultimodalPlaceholderMetadata,
     register_input_processor,
 )
-from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.multimodal import MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalParams
 
 from ..model_config import ModelConfig
 from .deepseek_v41_processor import IMAGE_PLACEHOLDER, DeepseekV41InputProcessor
 from .deepseek_v41_vision import DeepseekV41Aligner, DeepseekV41VisionModel
 from .modeling_deepseekv41 import DeepseekV41ForCausalLM
-from .modeling_multimodal_mixin import MultimodalModelMixin
+from .modeling_multimodal_mixin import (
+    EncoderGroup,
+    MultimodalModelMixin,
+    encode_multimodal_by_groups,
+)
 from .modeling_utils import register_auto_model
 
 
@@ -193,42 +199,78 @@ class DeepseekV41ForConditionalGeneration(MultimodalModelMixin, PreTrainedModel)
         # Preserve lazy checkpoint metadata and consumable-weight ownership.
         self.llm.load_weights(weights)
 
+    @property
+    def mm_encoder_groups(self) -> tuple[EncoderGroup, ...]:
+        return (EncoderGroup(("image",), self._encode_images),)
+
+    def _encode_images(self, pixel_values, image_grid_hw, llm_grid_hw):
+        height, width = image_grid_hw
+        rows, columns = llm_grid_hw
+        features = self.vision(pixel_values, height, width)
+        features = self.aligner(
+            features.reshape(len(pixel_values), height * width, -1), height, width
+        )
+        batch, count, hidden = features.shape
+        if count != rows * columns:
+            raise ValueError("DeepSeek-V4.1 image grid does not match its placeholder span")
+        grid = features.reshape(batch, rows, columns, hidden)
+        newline = self.image_newline.to(features.dtype).expand(batch, rows, 1, hidden)
+        return torch.cat(
+            (
+                self.image_start.to(features.dtype).expand(batch, 1, hidden),
+                torch.cat((grid, newline), dim=2).flatten(1, 2),
+                self.image_end.to(features.dtype).expand(batch, 1, hidden),
+            ),
+            dim=1,
+        ).flatten(0, 1)
+
     def encode_multimodal_inputs(
         self, multimodal_params: Sequence[MultimodalParams]
     ) -> torch.Tensor:
         if self.vision is None or self.aligner is None:
             raise ValueError("Raw images require a local DeepSeek-V4.1 vision encoder")
-        embeddings = []
+        views = []
         device = self.text_embedding_layer.weight.device
+        partitions = {
+            "image": {
+                "pixel_values": MultimodalItemPartition(),
+                "image_grid_hw": MultimodalItemPartition(None),
+                "llm_grid_hw": MultimodalItemPartition(None),
+            }
+        }
         for param in multimodal_params:
-            images = param.multimodal_data["image"]
-            patches = images["pixel_values"]
-            grids = images["image_grid_hw"]
-            llm_grids = images["llm_grid_hw"]
-            lengths = images["num_tokens"]
-            if not (len(patches) == len(grids) == len(llm_grids) == len(lengths)):
-                raise ValueError("DeepSeek-V4.1 image metadata lengths disagree")
-            for pixels, (height, width), (rows, columns), length in zip(
-                patches, grids, llm_grids, lengths
+            image = param.multimodal_data["image"]
+            # Rotary positions and spatial downsampling depend on both grid dimensions.
+            for pixels, grid, llm_grid, length in zip(
+                image["pixel_values"],
+                image["image_grid_hw"],
+                image["llm_grid_hw"],
+                image["num_tokens"],
+                strict=True,
             ):
-                pixels = pixels.to(device=device, dtype=self.embedding_dtype)
-                features = self.aligner(self.vision(pixels, height, width), height, width)
-                if features.shape[0] != rows * columns or length != rows * (columns + 1) + 2:
+                rows, columns = llm_grid
+                if length != rows * (columns + 1) + 2:
                     raise ValueError("DeepSeek-V4.1 image grid does not match its placeholder span")
-                features = features.reshape(rows, columns, self.embedding_dim)
-                newline = self.image_newline.to(features.dtype).expand(rows, 1, -1)
-                embeddings.append(
-                    torch.cat(
-                        (
-                            self.image_start.to(features.dtype).unsqueeze(0),
-                            torch.cat((features, newline), dim=1).flatten(0, 1),
-                            self.image_end.to(features.dtype).unsqueeze(0),
-                        )
+                pixels = pixels.to(device=device, dtype=self.embedding_dtype)
+                views.append(
+                    MultimodalParams(
+                        multimodal_data={
+                            "image": {
+                                "pixel_values": pixels.flatten(1).unsqueeze(0),
+                                "image_grid_hw": grid,
+                                "llm_grid_hw": llm_grid,
+                            },
+                            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                                [("image", 0)],
+                                output_embedding_lengths=[length],
+                                input_partitions=partitions,
+                            ),
+                        }
                     )
                 )
-        if not embeddings:
+        if not views:
             raise ValueError("No images supplied to DeepSeek-V4.1 encoder")
-        return torch.cat(embeddings)
+        return encode_multimodal_by_groups(self.mm_encoder_groups, views)
 
     def get_language_model_extra_forward_kwargs(
         self, *, raw_input_ids, position_ids, mm_inputs, **forward_kwargs
