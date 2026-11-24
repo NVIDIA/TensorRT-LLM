@@ -1676,13 +1676,15 @@ def test_one_model_prompt_lookahead_configures_reuse_backoff(
     [
         (False, False, False, False, 1, 1, [6]),
         (True, False, False, False, 1, TOKENS_PER_BLOCK, [6]),
-        # A legacy connector attribute cannot disable the runtime backoff.
-        (True, True, False, False, 1, TOKENS_PER_BLOCK, [6]),
+        # A dropped backoff has no rewind, so the SWA window is not widened; the match
+        # still aligns to whole blocks, since trimming it to an SWA layer's pages can end
+        # it mid-block.
+        (True, True, False, False, 0, TOKENS_PER_BLOCK, [5]),
         (True, True, True, False, 1, 1, [6]),
         # A paired draft pool keeps its backoff but aligns with the target.
         (True, True, False, True, 1, TOKENS_PER_BLOCK, [6]),
     ],
-    ids=["no_declaration", "align", "legacy_override_ignored", "capacity_only", "joint_draft"],
+    ids=["no_declaration", "align", "drop", "capacity_only", "joint_draft"],
 )
 @pytest.mark.parametrize(
     "spec_config",
@@ -1718,6 +1720,7 @@ def test_kv_connector_reuse_declarations_shape_the_core_match(
         capacity_only=capacity_only,
         requires_block_aligned_reuse=requires and not capacity_only,
         drops_reuse_match_backoff=drops and not capacity_only,
+        requires_completion_reservation=False,
         reports_failed_loads=False,
     )
     manager, _ = _make_manager_for_cache_tier_test(

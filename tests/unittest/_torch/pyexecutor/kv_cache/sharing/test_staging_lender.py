@@ -390,6 +390,8 @@ def test_staging_refuses_a_manager_with_a_kv_cache_connector(
     connector = SimpleNamespace(
         capacity_only=capacity_only,
         requires_block_aligned_reuse=False,
+        drops_reuse_match_backoff=False,
+        requires_completion_reservation=False,
         reports_failed_loads=False,
     )
     with real_manager(windows=[WINDOW, 256], kv_connector_manager=connector) as mgr:

@@ -21,6 +21,7 @@ import types
 from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from typing import Any, Callable, Generator, cast
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -2023,6 +2024,8 @@ def test_vbws_rejects_decreasing_beam_width_array(beam_width_array: list[int],
     executor = types.SimpleNamespace(
         _is_kv_manager_v2=True,
         max_beam_width=request.py_beam_width,
+        kv_cache_manager=types.SimpleNamespace(
+            validate_completion_capacity=Mock()),
         kv_cache_transceiver=None,
         _configure_csa2_remote_tail=lambda _request: None,
         _validate_token_id_range=lambda _request: None,

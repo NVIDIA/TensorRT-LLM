@@ -16,6 +16,8 @@ class ConnectorAdapterMock(MagicMock):
     capacity_only = False
     reports_failed_loads = False
     requires_block_aligned_reuse = False
+    drops_reuse_match_backoff = False
+    requires_completion_reservation = False
 
 
 def connector_request(

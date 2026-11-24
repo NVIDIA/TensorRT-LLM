@@ -206,7 +206,9 @@ def test_connector_retention_request_validation(
     executor.kv_connector_manager = (
         None if connector_mode is None else _connector(capacity_only=connector_mode == "capacity")
     )
-    executor.kv_cache_manager = SimpleNamespace(num_pools=num_groups)
+    executor.kv_cache_manager = SimpleNamespace(
+        num_pools=num_groups, validate_completion_capacity=Mock()
+    )
     executor.kv_cache_transceiver = None
     executor._configure_csa2_remote_tail = Mock()
     executor._validate_token_id_range = Mock()

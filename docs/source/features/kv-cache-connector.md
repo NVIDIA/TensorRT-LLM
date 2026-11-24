@@ -235,8 +235,8 @@ What the declaration promises:
 
 * An external offer describes a consistent prompt prefix, including the following tokens
   that produced its draft KV. The runtime subtracts the native lookahead from that match,
-  aligns the accepted range to whole blocks, and recomputes the remaining tail. Connectors
-  cannot disable this backoff.
+  aligns the accepted range to whole blocks, and recomputes the remaining tail. Only a worker
+  that declares `drops_reuse_match_backoff` (below) disables this backoff.
 * This interface does not prescribe a backend key format. Independent block-key hits alone
   do not prove draft-KV compatibility: a block stored from another prompt may have the same
   preceding tokens but different following tokens. A backend must establish that compatibility
@@ -267,7 +267,10 @@ At runtime:
   An unknown role produces a warning; request admission still enforces context-only work.
 * A worker that transfers whole blocks declares `requires_block_aligned_reuse=True`.
   The runtime aligns local matches after applying the native lookahead backoff. This
-  preserves the model's reuse and recomputation semantics.
+  preserves the model's reuse and recomputation semantics. A worker can instead drop the
+  backoff (`drops_reuse_match_backoff`, described with the worker interface below). Dropping it
+  can lower draft acceptance. Strict acceptance preserves greedy output, but relaxed acceptance
+  and seeded sampling can produce different text.
 * The mode composes with [attention data parallelism](#attention-data-parallelism) when both
   classes also declare `supports_attention_dp`.
 
@@ -380,6 +383,56 @@ this path.
 
 **Deployment note.** Under a connector, a workload that was token-bound becomes KV-bound: the connector removes forward-pass tokens but its prefix still occupies GPU pages. Lowering `max_num_tokens` to hand memory back to the KV pool is usually the right adjustment, the opposite of the guidance for a connector-free deployment.
 
+##### Completion headroom on disaggregated servers
+
+A disaggregated server with KV cache manager V2 can reserve logical GPU-page headroom for each
+admitted request to finish; it does not allocate those pages early. The reservation is opt-in: a
+server qualifies only when no tier sits below GPU and either its connector's worker declares
+[`requires_completion_reservation`](#2-worker-interface-kvcacheconnectorworker) or its
+`kv_cache_config.enable_disagg_completion_reservation` (prototype, `False` by default) is set. A
+connector that transfers KV leaves no such tier, because the host tier is dropped automatically and
+the others are refused at bring-up (see
+[KV cache tiers](#kv-cache-tiers-are-gpu-only-under-a-connector)), so its declaration is enough. A
+server with neither keeps its existing admission, `host_cache_size=0` included, whether it has no
+connector, a capacity-only one, or one that does not declare it. The reservation covers
+full-attention models only, without beam search or pipeline
+parallelism. Recurrent layers and attention windows smaller than the maximum sequence
+length, including mixed-precision tail windows, disable this policy.
+
+A disaggregated generation server without a connector opts in through the configuration. Without a
+connector the host tier is provisioned automatically, so set `host_cache_size: 0` and configure no
+disk tier. Explicit host/disk tiers and an explicit V1 selection are rejected at configuration
+validation. Model-dependent incompatibilities produce a warning identifying the failed condition.
+Every admitted request on an eligible server is bounded, including local full requests routed
+there by conditional disaggregation.
+
+```yaml
+kv_cache_config:
+  host_cache_size: 0
+  enable_disagg_completion_reservation: true
+```
+
+- **Decode.** Disaggregated generation admission reserves pages through each request's output
+  limit, including speculative padding. Incoming transfers may overlap decoding, but cannot
+  consume the pages reserved for admitted requests to finish.
+- **Context admission.** Context-only requests reserve their remaining prompt; full requests
+  also reserve decode growth, with or without a connector. Before allocating the first chunk,
+  the scheduler reserves the request's completion headroom; chunk
+  allocation stays incremental. A new request waits for headroom instead of preempting an
+  admitted one, so other requests' small chunks cannot consume the pages needed to restore its
+  matching prefix after the final-batch query.
+
+A reservation is released when the request finishes or is cancelled, when an unconsumed first
+chunk returns to the queue, when a generation-init admission is reverted before its transfer, and
+on shutdown. The check counts free and evictable GPU pages, so droppable reusable pages do not
+block admission. Conservative padding and copy-on-write bounds are capped at idle pool capacity
+after subtracting live CUDA-graph padding allocations, including dummies created or resized
+after warmup. Requests whose completion cannot fit that capacity fail admission individually
+without consuming the executor error budget. Once a bounded
+request waits for capacity, later newcomers wait behind it while admitted decoding and chunked
+prefill continue. Cancellation releases this fairness gate.
+This GPU admission budget is separate from any store capacity behind the connector.
+
 #### 2. Worker Interface (`KvCacheConnectorWorker`)
 
 These methods run on all workers (GPU processes) and interact with the actual GPU data.
@@ -450,10 +503,17 @@ These methods run on all workers (GPU processes) and interact with the actual GP
 * **`requires_block_aligned_reuse: bool`** (class attribute)
   * **Description**: Optional, `False` by default; only an explicit `True` counts. Declares a connector that stores and offers KV by whole blocks starting at the local prefix match, so that match must end on a block boundary. `KVCacheManagerV2` then aligns every local match down to a multiple of `tokens_per_block`: a one-model speculative-decoding draft (for example MTP or one-model EAGLE3) backs a match of whole blocks off by its prompt lookahead, and trimming a match to the pages a sliding-window layer holds can end it mid-block. Aligning trades the trimmed block for the connector serving it along with the rest of the prefix. The manager disables `KvCacheConfig.enable_partial_reuse` with a warning when this declaration requires whole-block matches.
 
-The manager reads `requires_block_aligned_reuse` once after constructing the worker.
-It may be set per instance. A `capacity_only` worker's declaration is ignored.
-Startup checks require all ranks to agree on this declaration, `reports_failed_loads`,
-and `capacity_only`.
+* **`drops_reuse_match_backoff: bool`** (class attribute)
+  * **Description**: Optional, `False` by default; only an explicit `True` counts. Declares a connector that prefers whole local matches to backed-off ones: the target `KVCacheManagerV2` drops the one-model draft's reuse backoff, so a local match of whole blocks is used whole and needs no alignment. The draft KV at the tail of a reused block may then belong to a different next token, which can lower draft acceptance. Strict acceptance preserves greedy output, but relaxed acceptance and seeded sampling can produce different text. A draft pool never drops its own backoff.
+
+* **`requires_completion_reservation: bool`** (class attribute)
+  * **Description**: Optional, `False` by default; only an explicit `True` counts. Turns on the completion reservation of a disaggregated server with no tier below GPU (see [Completion headroom on disaggregated servers](#completion-headroom-on-disaggregated-servers)): `KVCacheManagerV2` then admits a decode or a connector first chunk only while the pages every admitted request needs to finish still fit. Declare it when the connector restores a prefix only after the final batch is chosen, so other requests' chunks must not take the pages that restore needs. Read from the worker, which every rank holds, once when the cache manager is built after the connector, so a worker may set it per instance in `__init__`. Must be the same on every rank. A `capacity_only` worker's declaration is ignored.
+
+The manager reads these three declarations once after constructing the worker, so a worker
+may set them per instance. A `capacity_only` worker's declarations are ignored. Startup checks
+require all ranks to agree on them, `reports_failed_loads`, and `capacity_only`. If both reuse
+declarations are true, `drops_reuse_match_backoff` takes precedence: whole local blocks need no
+additional alignment. The block-aligned declaration still disables partial reuse.
 
 ## Attention data parallelism
 

@@ -1261,6 +1261,8 @@ def _make_v2_multimodal_scheduler(
     kv_allocated = {}
     manager = Mock(spec=KVCacheManagerV2)
     manager.kv_connector_manager = None
+    manager.completion_admission_blocked.return_value = False
+    manager.reserve_context_completion.return_value = True
     manager.context_replay_tokens.return_value = None
     manager.can_share_inflight_prefix = False
     manager.tokens_per_block = 10
