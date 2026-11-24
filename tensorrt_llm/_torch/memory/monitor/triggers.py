@@ -89,7 +89,7 @@ import os
 import re
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Iterator
 
 import torch
@@ -551,6 +551,15 @@ def _on_out_of_memory(
         or not (armed.hooks or armed.snapshot_on_oom)
     ):
         return
+    with _arm_lock:
+        if _armed is not armed:
+            return
+        previous = _last_failed_allocation
+        if previous is not None and previous.ambiguous:
+            now = time.monotonic()
+            if now - previous.at <= _FAILED_ALLOCATION_WINDOW_S:
+                _last_failed_allocation = replace(previous, at=now)
+                return
     live = reserved = None
     try:
         live = torch.cuda.memory_allocated(device)

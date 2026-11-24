@@ -223,7 +223,7 @@ def _oom(mod):
 
 
 @pytest.mark.cpu_only
-def test_torch_observer_only_records(armed):
+def test_torch_observer_only_records(armed, monkeypatch):
     mod, clock, emitted, reset = armed
 
     # A caller that catches the OOM and falls back must not cause a report.
@@ -252,6 +252,12 @@ def test_torch_observer_only_records(armed):
     _oom(mod)
     assert mod._failed_allocation_of(_TORCH_OOM) is None
     assert mod._failed_allocation_of(_TORCH_OOM) is None
+    # Repeated failures extend the window without reading the allocator again.
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.cuda, "memory_allocated", lambda _: pytest.fail("redundant OOM read"))
+        for _ in range(2):
+            clock[0] += mod._FAILED_ALLOCATION_WINDOW_S - 1
+            _oom(mod)
     clock[0] += mod._FAILED_ALLOCATION_WINDOW_S + 1
     _oom(mod)
     assert mod._failed_allocation_of(_TORCH_OOM) is not None
