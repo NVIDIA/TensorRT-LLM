@@ -128,32 +128,36 @@ def test_optional_sage_plan_fallback(monkeypatch, prims_available):
         instance(y, y, y, None, skip_softmax=False, skip_threshold_active=False)
 
 
-def test_vc_denoising_schedule(monkeypatch, prims_available):
+@pytest.mark.parametrize(
+    "steps",
+    [(None, None), (0, 1, 4, 4, 5, 0, 4, 8, 7, 1)],
+    ids=["untracked-refiner", "successive-generations"],
+)
+def test_vc_denoising_schedule(monkeypatch, prims_available, steps):
+    from tensorrt_llm._torch.attention.backends.prims_ts.vc_attention import (
+        quantization as provider,
+    )
+
     monkeypatch.setenv("TLLM_FMHA_LIBS", "+prims_ts")
     recipe = QuantAttentionConfig(qk_dtype="bf16", v_dtype="fp8", vc_attention=True)
     state = {}
     impl = prims.H3PrimTS(recipe, state)
-    x = torch.randn(1, 16, 1, 128, dtype=torch.bfloat16)
-    calls = []
-    refreshes = []
-
-    def refresh(grouping, values):
-        refreshes.append(state["denoise_step"][0])
-        if grouping.permutation is None:
-            grouping.permutation = (
-                torch.arange(values.size(1), dtype=torch.int32).flip(0).view(1, 1, -1)
-            )
-
-    def capture(q, k, v, *, plans, quantize_qk, vc_permutation, vc_demean):
-        calls.append((vc_demean, vc_permutation))
-        return q
-
-    monkeypatch.setattr(prims.PrimTSValueGrouping, "refresh", refresh)
-    monkeypatch.setattr(prims, "prims_dense_attention", capture)
-    for step in [7, 0, 1, 4, 4, 5]:
-        state["denoise_step"] = (step, 20)
-        impl(x, x, x, None, skip_softmax=False, skip_threshold_active=False)
-    assert refreshes == [0, 4]
-    assert [smooth for smooth, _ in calls] == [False, True, True, True, True, False]
-    assert torch.equal(calls[0][1], torch.arange(16, dtype=torch.int32).view(1, 1, -1))
-    assert all(perm is calls[1][1] for _, perm in calls[1:])
+    reference = provider.VCAttentionPreprocessor()
+    monkeypatch.setattr(
+        provider, "vc_quantize", lambda k, v, *, perm, demean: (perm.clone(), demean)
+    )
+    monkeypatch.setattr(
+        prims,
+        "prims_dense_attention",
+        lambda q, k, v, *, vc_permutation, vc_demean, **kwargs: (vc_permutation.clone(), vc_demean),
+    )
+    rows = torch.arange(97, dtype=torch.bfloat16)
+    values = torch.stack((rows, rows * 0.5), dim=-1).view(1, 97, 1, 2)
+    for call, idx in enumerate(steps):
+        step = None if idx is None else (idx, 20)
+        state["denoise_step"] = step
+        v = values.roll(11 * call, dims=1)
+        expected_perm, expected_demean = reference.prepare(v, v, denoise_step=step)
+        perm, demean = impl(v, v, v, None, skip_softmax=False, skip_threshold_active=False)
+        assert torch.equal(perm, expected_perm)
+        assert demean == expected_demean

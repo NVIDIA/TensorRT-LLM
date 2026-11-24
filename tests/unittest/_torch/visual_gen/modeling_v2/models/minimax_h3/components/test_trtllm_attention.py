@@ -184,8 +184,7 @@ def test_h3_vc_repair_matches_v1(monkeypatch, qk_dtype):
         expected = v1.forward(q, q, v, batch_size=1, seq_len=length)
         actual = v2.forward(q, q, v, batch_size=1, seq_len=length)
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-        if length == 256:
-            torch.testing.assert_close(actual, v.flatten(2), rtol=0, atol=0)
+        torch.testing.assert_close(actual, v.flatten(2), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("skip_first", [False, True])

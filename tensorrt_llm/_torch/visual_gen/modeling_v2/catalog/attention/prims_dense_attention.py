@@ -13,13 +13,14 @@ from ..quantization.fp8_quantize import native_fp8_per_tensor_quantize
 
 class VcTokenPermutation(OpWrapper):
     """Group BSHD values by three FP32 k-means updates with K=min(64, S).
-    Matching [B*H,K,D] centroids warm-start the groups. Otherwise, each head samples K distinct
-    tokens using the supplied generator or the device RNG. Return stable int64 [B,H,S] indices
+    Matching [B*H,K,D] centroids warm-start the groups. Cold starts use shared token indices
+    from the supplied generator or a fixed seed. Return stable int64 [B,H,S] indices
     ordered by the last assignment and FP32 [B*H,K,D] centroids. Empty clusters retain their center.
     """
 
     ARCHS = frozenset({Arch.SM_100})
     CELLS = (
+        Cell("Fixed cold start across batches and heads", dict(tokens=97, warm=False, fixed=True)),
         Cell("Seeded token rows across batches and heads", dict(tokens=97, warm=False)),
         Cell("Short sequence with warm and empty clusters", dict(tokens=37, warm=True)),
     )
@@ -42,10 +43,13 @@ class VcTokenPermutation(OpWrapper):
         k = min(64, s)
         rows = v.transpose(1, 2).reshape(b * h, s, d).float().double()
         if init_centroids is None or init_centroids.shape != (b * h, k, d):
-            seeds = torch.stack(
-                [torch.randperm(s, device=v.device, generator=generator)[:k] for _ in range(b * h)]
-            )
-            centers = rows.gather(1, seeds.unsqueeze(-1).expand(-1, -1, d))
+            if generator is None:
+                seeds = torch.randperm(
+                    s, device="cpu", generator=torch.Generator(device="cpu").manual_seed(0)
+                )
+            else:
+                seeds = torch.randperm(s, device=v.device, generator=generator)
+            centers = rows[:, seeds[:k].to(v.device)]
         else:
             centers = init_centroids.float().double()
 
@@ -107,7 +111,10 @@ class PrimsDenseAttention(OpWrapper):
         Cell("per-tensor FP8 Q/K/V", dict(quantize_qk=True)),
         Cell("permuted VC values with tile means", dict(quantize_qk=False, grouping=True)),
         Cell("BF16 Q/K with aligned VC repair", dict(quantize_qk=False, repair=True, kv_len=256)),
-        Cell("rotated Q/K with aligned VC repair", dict(quantize_qk=True, repair=True, kv_len=256)),
+        Cell(
+            "rotated Q/K with a partial VC repair tile",
+            dict(quantize_qk=True, repair=True, kv_len=265),
+        ),
     )
 
     def __call__(

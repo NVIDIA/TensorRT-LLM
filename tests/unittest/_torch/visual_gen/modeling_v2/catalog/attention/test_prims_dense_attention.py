@@ -23,19 +23,28 @@ def test_vc_token_permutation(cell):
         active = torch.tensor([0, 1, 3, 10], device=v.device) + offsets.reshape(4, 1)
         initial = torch.full((4, min(tokens, 64), 2), -512.0, device=v.device)
         initial[:, :4] = torch.stack((active, active / 2), dim=-1)
+    fixed = cell.spec.get("fixed", False)
     generator = torch.Generator(device=v.device).manual_seed(125)
     oracle_rng = torch.Generator(device=v.device).set_state(generator.get_state())
     initial_rng = generator.get_state()
+    if fixed:
+        cpu_rng = torch.get_rng_state()
+        cuda_rng = torch.cuda.get_rng_state(v.device)
     initial_copy = initial.clone() if initial is not None else None
-    vc_token_permutation.is_valid(v, init_centroids=initial, generator=generator)
-    permutation, centroids = vc_token_permutation(v, init_centroids=initial, generator=generator)
+    call_rng = None if fixed else generator
+    vc_token_permutation.is_valid(v, init_centroids=initial, generator=call_rng)
+    permutation, centroids = vc_token_permutation(v, init_centroids=initial, generator=call_rng)
     expected_indices, expected_centroids = vc_token_permutation.reference(
-        v, init_centroids=initial, generator=oracle_rng
+        v, init_centroids=initial, generator=None if fixed else oracle_rng
     )
     torch.testing.assert_close(permutation, expected_indices, rtol=0, atol=0)
     torch.testing.assert_close(centroids, expected_centroids, rtol=0, atol=0)
-    assert torch.equal(generator.get_state(), oracle_rng.get_state())
-    assert torch.equal(generator.get_state(), initial_rng) == cell.spec["warm"]
+    if fixed:
+        assert torch.equal(torch.get_rng_state(), cpu_rng)
+        assert torch.equal(torch.cuda.get_rng_state(v.device), cuda_rng)
+    else:
+        assert torch.equal(generator.get_state(), oracle_rng.get_state())
+        assert torch.equal(generator.get_state(), initial_rng) == cell.spec["warm"]
     if initial_copy is not None:
         assert torch.equal(initial, initial_copy)
         assert torch.equal(centroids[:, 4:], initial_copy[:, 4:])

@@ -195,7 +195,6 @@ are not supported. See the
 - MiniMax-H3 currently restricts TRTLLM attention to SM100 or SM103. This is a
   model-specific restriction, not a general VisualGen backend requirement.
 - For H3 TRTLLM attention with sparse routes, choose a block-scaled Sage recipe to quantize Q/K/V. The block-sparse runner uses the input dtype on routed calls with a per-tensor FP8 recipe. See [VisualGen quantized attention](../features/visualgen-quantized-attention.md).
-- Use PrimTS VC repair (`vc_repair_budget > 0`) with H3 KV lengths divisible by 128. If the last tile is partial, padding contributes to the softmax denominator and changes the attention output.
 - The published [MiniMax-H3 checkpoint license](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE)
   restricts use by territory. Obtain legal approval before downloading or running the weights.
 

@@ -33,8 +33,8 @@ class PrimTSValueGrouping:
         self.permutation = None
         self.centroids = None
 
-    def refresh(self, v: torch.Tensor) -> None:
-        perm, centroids = vc_token_permutation(v, init_centroids=self.centroids)
+    def refresh(self, v: torch.Tensor, *, cold: bool) -> None:
+        perm, centroids = vc_token_permutation(v, init_centroids=None if cold else self.centroids)
         if self.permutation is None:
             self.permutation = perm.to(torch.int32)
             self.centroids = centroids
@@ -78,6 +78,8 @@ class H3PrimTS:
         self.vc_shape = None
         self.vc_grouping = None
         self.vc_step = None
+        self.vc_last_step = None
+        self.vc_needs_cold_start = False
 
     def _has_prims(self, name: str) -> bool:
         if name not in self._available:
@@ -163,19 +165,29 @@ class H3PrimTS:
                     self.vc_grouping = PrimTSValueGrouping()
                     self.vc_shape = k.shape
                     self.vc_step = None
+                    self.vc_last_step = None
+                    self.vc_needs_cold_start = False
                 step = self.metadata_state.get("denoise_step")
+                if step is not None:
+                    if self.vc_last_step is not None and step[0] < self.vc_last_step:
+                        self.vc_needs_cold_start = True
+                    self.vc_last_step = step[0]
                 smooth = step is None or step[0] < math.ceil(_VC_SMOOTH_FRACTION * step[1])
-                refresh = self.vc_grouping.permutation is None or (
+                cold = self.vc_grouping.permutation is None or (
+                    step is not None and (step[0] == 0 or self.vc_needs_cold_start)
+                )
+                refresh = cold or (
                     step is not None
-                    and (
-                        step[0] == 0
-                        or (step[0] % _VC_REFRESH_INTERVAL == 0 and step[0] != self.vc_step)
-                    )
+                    and step[0] % _VC_REFRESH_INTERVAL == 0
+                    and step[0] != self.vc_step
                 )
                 if smooth and refresh:
-                    self.vc_grouping.refresh(v)
+                    self.vc_grouping.refresh(v, cold=cold)
                     self.vc_step = None if step is None else step[0]
-                perm = self.vc_grouping.permutation
+                    self.vc_needs_cold_start = False
+                perm = (
+                    self.vc_grouping.permutation if smooth or not self.vc_needs_cold_start else None
+                )
                 if perm is None:
                     perm = torch.arange(k.size(1), dtype=torch.int32, device=k.device)
                     perm = perm.view(1, 1, -1).expand(k.size(0), k.size(2), -1).contiguous()
