@@ -431,6 +431,8 @@ class Router(ABC):
         self._server_registration_ids: dict[str, str] = {}
         self._metadata_registration_keys: dict[str, frozenset[str]] = {}
         self._discovered_context_servers: set[str] = set()
+        self._context_probe_limit = asyncio.Semaphore(
+            _MAX_METADATA_HEALTH_PROBES)
 
     async def close(self):
         """Close the shared HTTP session."""
@@ -690,17 +692,63 @@ class Router(ABC):
             logger.warning(f"Server {server} does not exist")
             return
         async with self._lock:
-            old_servers = self._servers.copy()
-            self._servers = [
-                old_server for old_server in old_servers if old_server != server
-            ]
-            self._on_servers_updated(old_servers, self._servers)
-        self._prepared_ready_servers.discard(server)
-        self._server_info.pop(server, None)
-        self._server_registration_ids.pop(server, None)
-        self._metadata_registration_keys.pop(server, None)
+            self._retire_servers({server})
         logger.debug(
             f"Removed server {server}, current server list: {self._servers}")
+
+    def _retire_servers(self, retired: set[str]) -> None:
+        if not retired:
+            return
+        old_servers = self._servers
+        self._servers = [
+            server for server in old_servers if server not in retired
+        ]
+        self._on_servers_updated(old_servers, self._servers)
+        self._prepared_ready_servers.difference_update(retired)
+        for server in retired:
+            self._server_info.pop(server, None)
+            self._server_registration_ids.pop(server, None)
+            self._metadata_registration_keys.pop(server, None)
+
+    def retire_context_registrations(self, registrations: dict[str,
+                                                               str]) -> None:
+        """Revoke departed grants on the watcher event-loop turn, before any probe can yield."""
+        self._retire_servers({
+            server
+            for server in self._servers if server not in registrations or
+            self._server_registration_ids.get(server) != registrations[server]
+        })
+
+    async def admit_context_registration(
+            self, server: str, registration: str,
+            is_current: Callable[[], bool]) -> bool:
+        """Probe without staging mutable state; publish only into the same watch incarnation."""
+        async with self._context_probe_limit:
+            if not is_current():
+                return True
+            try:
+                info = await self._probe_server_info(server)
+            except ContextCancellationCapabilityError:
+                raise
+            except (RuntimeError, OSError):
+                return False
+        async with self._lock:
+            if is_current():
+                self._publish_context_registration(server, registration, info)
+        return True
+
+    def _publish_context_registration(self, server: str,
+                                      registration: Optional[str],
+                                      info: dict) -> None:
+        self._stage_server(server)
+        try:
+            self._accept_server_info(server, info)
+            self._publish_server(server, registration)
+        finally:
+            if server not in self._servers:
+                self._prepared_ready_servers.discard(server)
+                self._server_info.pop(server, None)
+                self._unstage_server(server)
 
     async def mirror_servers(self, servers: List[str]) -> None:
         """Replace the server list with ``servers`` without preparing them.
@@ -925,12 +973,7 @@ class Router(ABC):
             # Revoke placement grants together; request records retain their
             # original owners for finish and worker-side cancellation.
             async with self._lock:
-                old_servers, self._servers = self._servers, []
-                self._on_servers_updated(old_servers, self._servers)
-                self._server_info.clear()
-                self._prepared_ready_servers.clear()
-                self._server_registration_ids.clear()
-                self._metadata_registration_keys.clear()
+                self.retire_context_registrations({})
             raise ServerPreparationPending(
                 "Cannot verify CTX registrations") from error
 
@@ -979,8 +1022,10 @@ class Router(ABC):
                             info = task.result()
                             if info is None:
                                 continue
-                            self._stage_server(server)
-                            self._accept_server_info(server, info)
+                            self._publish_context_registration(
+                                server,
+                                next(iter(keys)) if len(keys) == 1 else None,
+                                info)
                         except RuntimeError as error:
                             if startup and not isinstance(
                                     error, ServerPreparationPending):
@@ -989,15 +1034,7 @@ class Router(ABC):
                                 f"CTX server {server} remains excluded: {error}"
                             )
                         else:
-                            self._publish_server(
-                                server,
-                                next(iter(keys)) if len(keys) == 1 else None)
                             self._metadata_registration_keys[server] = keys
-                        finally:
-                            if server not in self._servers:
-                                self._prepared_ready_servers.discard(server)
-                                self._server_info.pop(server, None)
-                                self._unstage_server(server)
         finally:
             for task in pending:
                 task.cancel()

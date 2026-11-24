@@ -59,6 +59,7 @@ from tensorrt_llm.llmapi.disagg_utils import (
 from tensorrt_llm.serve import disagg_coordinator as coordinator_module
 from tensorrt_llm.serve import router as router_module
 from tensorrt_llm.serve.cluster_storage import (
+    Etcd3WatchEventQueue,
     StorageItem,
     WatchEvent,
     WatchEventQueue,
@@ -1758,6 +1759,122 @@ async def test_protected_dynamic_registration_is_validated_before_routing(
     await owner._on_worker_event(replacement, WatchEventType.DELETE)
     assert not owner.ctx_router.servers
     await owner.stop()
+
+
+@pytest.mark.asyncio
+async def test_protected_etcd_watch_revokes_context_until_revalidated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An observed watch loss supersedes in-flight probes, not accepted request owners."""
+    config = _context_cancellation_config(
+        monkeypatch, ctx_urls=["static:8000"], router="load_balancing"
+    )
+    config.disagg_cluster_config = DisaggClusterConfig(
+        cluster_uri="etcd://storage", cluster_name="test", minimal_instances=MinimalInstances()
+    )
+    prefix = "/trtllm-disagg/test/workers"
+    watch = Etcd3WatchEventQueue(prefix, Mock(), Mock(), asyncio.get_running_loop())
+    storage = Mock(
+        watch=AsyncMock(return_value=watch),
+        start=AsyncMock(),
+        stop=AsyncMock(),
+        unwatch=AsyncMock(),
+        get_prefix=AsyncMock(),
+    )
+    monkeypatch.setattr(coordinator_module, "create_cluster_storage", Mock(return_value=storage))
+    owner = DisaggCoordinatorService(config, Mock())
+    router = owner.ctx_router
+    stale_started, stale_reply, fresh_reply = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    calls = []
+
+    async def probe(server: str, _timeout: float) -> dict:
+        calls.append(server)
+        if server == "pending:8000" and calls.count(server) == 1:
+            stale_started.set()
+            try:
+                await stale_reply.wait()
+            except asyncio.CancelledError:
+                # Deliver the old successful result even though the watch revoked it.
+                await stale_reply.wait()
+        elif calls.count(server) > 1:
+            await fresh_reply.wait()
+        return {"supports_logical_context_cancellation": True}
+
+    router._fetch_server_info = probe
+    owner.gen_router._fetch_server_info = AsyncMock(return_value={})
+    records = {
+        f"{prefix}/{host}": json.dumps(dict(worker_id=host, host=host, port=port, role=role))
+        for host, port, role in [
+            ("ctx", 8000, ServerRole.CONTEXT),
+            ("pending", 8000, ServerRole.CONTEXT),
+            ("gen", 8001, ServerRole.GENERATION),
+        ]
+    }
+    request = CompletionRequest(model="m", prompt="first")
+    try:
+        await owner.start()
+        storage.get_prefix.assert_not_awaited()
+        assert not router.servers and not calls
+        watch.resync(records)
+        watch.set_available(True)
+        first = owner._context_admission_tasks["ctx:8000"]
+        stale = owner._context_admission_tasks["pending:8000"]
+        await asyncio.wait_for(first, 2)
+        await asyncio.wait_for(stale_started.wait(), 2)
+        assert await owner.is_ready()
+        assert (await router.get_next_server(request))[0] == "ctx:8000"
+        _, info, _ = await owner.select("context", {}, 10, None)
+        original = router._server_state["ctx:8000"]
+        assert original._num_active_requests == 2
+
+        watch.set_available(False)
+        outage = await owner.cluster_info()
+        assert not outage["is_ready"] and outage["context_admissions"] == {}
+        assert outage["server_lists"] == {"context": [], "generation": ["gen:8001"]}
+        with pytest.raises(ValueError, match="No .*servers available"):
+            await router.get_next_server(request)
+        with pytest.raises(ServerPreparationPending):
+            await owner.select("context", {}, 11, None)
+
+        watch.resync(records)
+        watch.set_available(True)
+        fresh = list(owner._context_admission_tasks.values())
+        stale_reply.set()
+        await asyncio.wait_for(stale, 2)
+        assert not router.servers and not await owner.is_ready()
+        fresh_reply.set()
+        await asyncio.wait_for(asyncio.gather(*fresh), 2)
+        recovered = await owner.cluster_info()
+        assert recovered["is_ready"] and set(recovered["context_admissions"]) == {
+            "ctx:8000",
+            "pending:8000",
+        }
+        assert recovered["context_admissions"]["ctx:8000"] != info["context_admission"]
+        assert calls.count("ctx:8000") == calls.count("pending:8000") == 2
+        assert original is not router._server_state["ctx:8000"]
+        # Moving the old value under a different key cannot preserve the worker incarnation.
+        watch._queue_stream_events(
+            watch.stream,
+            [
+                WatchEvent(StorageItem(key=f"{prefix}/ctx"), WatchEventType.DELETE),
+                WatchEvent(
+                    StorageItem(key=f"{prefix}/wrong", value=records[f"{prefix}/ctx"]),
+                    WatchEventType.SET,
+                ),
+            ],
+        )
+        assert router.context_admissions() == {
+            "pending:8000": recovered["context_admissions"]["pending:8000"]
+        }
+        await router.finish_request(request)
+        await owner.finish("context", 10, context_admission=info["context_admission"])
+        assert original._num_active_requests == 0
+    finally:
+        stale_reply.set()
+        fresh_reply.set()
+        await owner.stop()
+    stopped = await owner.cluster_info()
+    assert not stopped["is_ready"] and stopped["context_admissions"] == {}
 
 
 @pytest.mark.asyncio

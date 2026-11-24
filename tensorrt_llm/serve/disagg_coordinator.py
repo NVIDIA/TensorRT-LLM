@@ -241,10 +241,15 @@ class DisaggCoordinatorService(DisaggCoordinator):
         # delegating surfaces).
         self._metadata_server = create_metadata_server(metadata_config)
         ctx_servers, gen_servers = get_ctx_gen_server_addrs(config.server_configs)
+        self._watch_context_registrations = bool(
+            self._context_cancellation_enabled
+            and config.disagg_cluster_config
+            and config.disagg_cluster_config.cluster_uri.startswith("etcd://")
+        )
         self._ctx_router, self._gen_router = build_disagg_routers(
             config.ctx_router_config,
             config.gen_router_config,
-            ctx_servers,
+            [] if self._watch_context_registrations else ctx_servers,
             gen_servers,
             metadata_config,
             self._metadata_server,
@@ -273,6 +278,7 @@ class DisaggCoordinatorService(DisaggCoordinator):
         self._reservation_tasks: dict[tuple[str, int], _Reservation] = {}
         self._context_worker_registrations: dict[str, str] = {}
         self._context_admission_tasks: dict[str, asyncio.Task] = {}
+        self._retired_context_admissions: set[asyncio.Task] = set()
         self._context_admission_closed = False
         self._reservation_locks = [
             asyncio.Lock() for _ in range(COORDINATOR_RESERVATION_LOCK_STRIPES)
@@ -614,7 +620,7 @@ class DisaggCoordinatorService(DisaggCoordinator):
             ) from error
 
     async def start(self) -> None:
-        if self._context_cancellation_enabled:
+        if self._context_cancellation_enabled and not self._watch_context_registrations:
             await self._prepare_context_servers()
         else:
             await self._ctx_router.prepare_servers()
@@ -633,7 +639,12 @@ class DisaggCoordinatorService(DisaggCoordinator):
                 self._config.disagg_cluster_config, self._cluster_storage
             )
             await self._disagg_cluster_manager.start()
-            await self._disagg_cluster_manager.watch_workers(on_event=self._on_worker_event)
+            await self._disagg_cluster_manager.watch_workers(
+                on_event=self._on_worker_event,
+                on_context_registrations=(
+                    self._on_context_registrations if self._watch_context_registrations else None
+                ),
+            )
             logger.info("Disagg cluster manager started")
         else:
             if self._metadata_server and self._metadata_config:
@@ -660,7 +671,9 @@ class DisaggCoordinatorService(DisaggCoordinator):
 
     async def stop(self) -> None:
         self._context_admission_closed = True
-        admissions = list(self._context_admission_tasks.values())
+        if self._watch_context_registrations:
+            self._ctx_router.retire_context_registrations({})
+        admissions = [*self._context_admission_tasks.values(), *self._retired_context_admissions]
         self._context_admission_tasks.clear()
         self._context_worker_registrations.clear()
         for admission in admissions:
@@ -691,6 +704,11 @@ class DisaggCoordinatorService(DisaggCoordinator):
         return True
 
     async def cluster_info(self) -> Dict[str, Any]:
+        cluster = (
+            await self._disagg_cluster_manager.cluster_info()
+            if self._disagg_cluster_manager
+            else {}
+        )
         info = {
             "is_ready": await self.is_ready(),
             "context_cancellation_enabled": self._context_cancellation_enabled,
@@ -717,8 +735,7 @@ class DisaggCoordinatorService(DisaggCoordinator):
             }
             for role, router in (("context", self._ctx_router), ("generation", self._gen_router))
         }
-        if self._disagg_cluster_manager:
-            info.update(await self._disagg_cluster_manager.cluster_info())
+        info.update(cluster)
         return info
 
     async def _wait_for_all_servers_ready(self) -> None:
@@ -765,6 +782,27 @@ class DisaggCoordinatorService(DisaggCoordinator):
         except asyncio.TimeoutError:
             raise TimeoutError("Timeout waiting for context and generation servers to be ready")
 
+    def _on_context_registrations(self, registrations: dict[str, str]) -> None:
+        """Retire stale grants on the watch callback's turn, then probe new registrations."""
+        if self._context_admission_closed:
+            return
+        previous = self._context_worker_registrations
+        if previous == registrations:
+            return
+        self._context_worker_registrations = registrations
+        self._ctx_router.retire_context_registrations(registrations)
+        for address, task in list(self._context_admission_tasks.items()):
+            if previous.get(address) != registrations.get(address):
+                del self._context_admission_tasks[address]
+                self._retired_context_admissions.add(task)
+                task.add_done_callback(self._retired_context_admissions.discard)
+                task.cancel()
+        for address, registration in registrations.items():
+            if previous.get(address) != registration:
+                self._context_admission_tasks[address] = asyncio.create_task(
+                    self._retry_context_admission(address, registration, immediately=True)
+                )
+
     async def _cancel_context_admission(self, address: str) -> None:
         """Drain the old incarnation's probe before replacing or removing it.
 
@@ -787,6 +825,12 @@ class DisaggCoordinatorService(DisaggCoordinator):
             True on admission or permanent rejection; False on transient failure.
         """
         try:
+            if self._watch_context_registrations:
+                return await self._ctx_router.admit_context_registration(
+                    address,
+                    registration,
+                    lambda: self._context_admission_tasks.get(address) is asyncio.current_task(),
+                )
             return await self._ctx_router.add_server(
                 address, registration_id=registration, raise_on_capability_error=True
             )
@@ -798,16 +842,21 @@ class DisaggCoordinatorService(DisaggCoordinator):
             logger.warning(f"CTX registration {registration} at {address} was rejected: {error}")
             return True
 
-    async def _retry_context_admission(self, address: str, registration: str) -> None:
+    async def _retry_context_admission(
+        self, address: str, registration: str, *, immediately: bool = False
+    ) -> None:
         """Retry transient preparation while this registration remains current.
 
         Args:
             address: Worker address whose first admission attempt failed.
             registration: Incarnation that owns this task and its cleanup.
+            immediately: Whether this task owns the initial probe as well as retries.
         """
         try:
             while not self._context_admission_closed:
-                await asyncio.sleep(max(0.01, self._health_check_interval_secs))
+                if not immediately:
+                    await asyncio.sleep(max(0.01, self._health_check_interval_secs))
+                immediately = False
                 if self._context_worker_registrations.get(address) != registration:
                     return
                 if await self._try_context_admission(address, registration):
@@ -830,7 +879,11 @@ class DisaggCoordinatorService(DisaggCoordinator):
             protected_context = (
                 worker_info.role == ServerRole.CONTEXT and self._context_cancellation_enabled
             )
-            if protected_context and self._context_admission_closed:
+            # Protected etcd CTX consumes verified snapshots, never buffered
+            # ordinary events that may predate a lost stream.
+            if protected_context and (
+                self._context_admission_closed or self._watch_context_registrations
+            ):
                 return
             if event_type == WatchEventType.SET:
                 if protected_context:
