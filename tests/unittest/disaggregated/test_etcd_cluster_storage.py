@@ -395,6 +395,46 @@ async def test_watch_delivers_only_valid_records():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("reader_waiting", [False, True])
+async def test_etcd_callback_enqueues_on_owner_loop(reader_waiting):
+    client, storage = _storage()
+    key = f"{PREFIX}/worker"
+    await storage.set(key, "host:8001")
+    handle = await storage.watch(PREFIX)
+    loop = asyncio.get_running_loop()
+    previous_debug = loop.get_debug()
+    loop.set_debug(True)
+    reader = None
+    try:
+        if reader_waiting:
+            reader = asyncio.create_task(handle.drain())
+            await asyncio.sleep(0)
+
+        loop_thread = threading.get_ident()
+        put_threads = []
+        put_nowait = handle.events.put_nowait
+
+        def checked_put(event):
+            put_threads.append(threading.get_ident())
+            put_nowait(event)
+
+        with mock.patch.object(handle.events, "put_nowait", side_effect=checked_put):
+            await asyncio.to_thread(client.send, PREFIX, PutEvent(key, client.data[key]))
+            if reader is None:
+                reader = asyncio.create_task(handle.drain())
+            events = await asyncio.wait_for(reader, 1)
+
+        assert _changes(events) == [("SET", key, "host:8001")]
+        assert put_threads == [loop_thread]
+        assert PREFIX in client.callbacks
+    finally:
+        loop.set_debug(previous_debug)
+        if reader is not None and not reader.done():
+            reader.cancel()
+            await asyncio.gather(reader, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("stream_end", [None, _RpcError(grpc.StatusCode.UNAVAILABLE)])
 async def test_watch_continues_on_a_new_stream_with_the_changes_made_meanwhile(stream_end):
     client, storage = _storage()
