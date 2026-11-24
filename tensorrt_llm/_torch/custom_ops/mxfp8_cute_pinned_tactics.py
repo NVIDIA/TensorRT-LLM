@@ -132,19 +132,19 @@ def run(
         return None
     try:
         from flashinfer.gemm import gemm_base as _gb
+        from flashinfer.utils import _get_stream_cache_buf
 
         key = (out_dtype, act.device)
-        st = _STATE.get(key)
-        if st is None:
+        runner = _STATE.get(key)
+        if runner is None:
             major, minor = _gb.get_compute_capability(act.device)
-            st = _STATE[key] = (
-                _gb._cute_dsl_gemm_mxfp8_runner(major, minor, True, out_dtype),
-                _gb._get_cache_buf("mm_mxfp8_workspace", _gb.DEFAULT_WORKSPACE_SIZE, act.device),
-            )
+            runner = _STATE[key] = _gb._cute_dsl_gemm_mxfp8_runner(major, minor, True, out_dtype)
             logger.info(
                 "[MXFP8 GEMM] pinned CuTe DSL tactics engaged above 32 rows (TRTLLM_MXFP8_CUTE_PIN)"
             )
-        runner, workspace = st
+        workspace = _get_stream_cache_buf(
+            "mm_mxfp8_workspace", _gb.DEFAULT_WORKSPACE_SIZE, act.device
+        )
         out = torch.empty((m, n), dtype=out_dtype, device=act.device)
         runner(
             inputs=[act, weight.t(), act_scale, weight_scale, out_dtype, out, workspace],
