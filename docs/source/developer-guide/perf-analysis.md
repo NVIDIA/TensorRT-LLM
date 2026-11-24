@@ -154,6 +154,8 @@ trtllm-bench --model ${MODEL_PATH} \
     --input-mean=1000 --output-mean=1000 --input-stdev=0 --output-stdev=0
 
 # Benchmark and profile
+# To profile a server, replace the entire trtllm-bench invocation below
+# (including its arguments) with your trtllm-serve command and server arguments.
 TLLM_PROFILE_START_STOP=100-150 nsys profile \
   -o trace -f true \
   -t 'cuda,nvtx,python-gil' -c cudaProfilerApi \
@@ -171,7 +173,8 @@ TLLM_PROFILE_START_STOP=100-150 nsys profile \
 
 The Nsight Systems reports will be saved to `trace.nsys-rep`. Use NVIDIA Nsight Systems application to open it.
 
-The PyTorch profiler results will be saved to `trace.json`. Use `chrome://tracing/` to inspect the saved profile.
+The PyTorch profiler results will be saved per rank as `trace-rank-<rank>.json`
+(for example, `trace-rank-0.json`). Use `chrome://tracing/` to inspect the saved profile.
 
 ## MoE Expert Load Balance Analysis (Perfect Router)
 
