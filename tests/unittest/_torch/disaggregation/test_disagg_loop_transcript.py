@@ -234,7 +234,7 @@ _SCHEDULE_HEAD = [
     ("align_gen_admission_across_cp", []),
     # No step is in flight in an idle iteration, so no receive is deferred.
     ("receive_gen_init", [], "defer=False"),
-    ("poll_progress_when_idle",),
+    ("poll_progress_when_idle", "batch_is_empty=True"),
 ]
 # Non-PP loops flush at loop exit; the PP loop does not.
 _SHUTDOWN_PASS = [("handle_errors_synced",), ("flush_pending_transfer_responses",)]
@@ -571,7 +571,7 @@ def test_executor_loop_pp_transcript_on_first_rank(monkeypatch) -> None:
             ("poll_gen_transfers",),
             ("admit", []),
             ("receive_gen_init", []),
-            ("poll_progress_when_idle",),
+            ("poll_progress_when_idle", "batch_is_empty=True"),
             ("flush_pending_transfer_responses",),
             ("pace_idle",),
         ]
@@ -593,7 +593,7 @@ def test_executor_loop_pp_transcript_on_non_first_rank(monkeypatch) -> None:
             ("poll_gen_transfers",),
             ("revert_deferred_gen_init", [], []),
             ("receive_gen_init", []),
-            ("poll_progress_when_idle",),
+            ("poll_progress_when_idle", "batch_is_empty=True"),
             ("flush_pending_transfer_responses",),
             ("pace_idle",),
         ]

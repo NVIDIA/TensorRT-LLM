@@ -4610,7 +4610,8 @@ class PyExecutor:
 
                 # For requests that are fitting disagg gen init, also prepare resources for KV cache manager
                 self.disagg.receive_gen_init(fitting_disagg_gen_init_requests)
-                self.disagg.poll_progress_when_idle()
+                self.disagg.poll_progress_when_idle(
+                    batch_is_empty=scheduled_batch.batch_size == 0)
 
                 self.num_scheduled_requests = scheduled_batch.batch_size
                 self.num_dummy_requests = sum(
@@ -6313,7 +6314,8 @@ class PyExecutor:
             self.disagg.receive_gen_init(admitted_disagg_gen_init_requests,
                                          defer=defer_gen_receives)
 
-            self.disagg.poll_progress_when_idle()
+            self.disagg.poll_progress_when_idle(
+                batch_is_empty=scheduled_batch.batch_size == 0)
 
             # In gen-only benchmark mode, all requests must fit in KV cache
             # simultaneously. If some requests are stuck in INIT state and the

@@ -2936,10 +2936,12 @@ def test_failed_partial_pipelined_prefill_retires_its_send_session(monkeypatch, 
 
     The failure is parked, so no later chunk runs and the send never gets its
     last slice, and the generation side never cancels. The send is cancelled
-    when the failure is parked. On TP2 the first rank's write has already
-    drained while the last rank's is in flight: the drained rank keeps its
-    session, so both ranks retire it in the same reaper round once the last
-    write drains, and each reports the original error exactly once.
+    when the failure is parked. The request is the only one and is excluded
+    from scheduling, so only the idle poll of an empty batch drives the reaper.
+    On TP2 the first rank's write has already drained while the last rank's is
+    in flight: the drained rank keeps its session, so both ranks retire it in
+    the same idle pass once the last write drains, and each reports the
+    original error exactly once.
     """
     from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
 
@@ -2952,11 +2954,7 @@ def test_failed_partial_pipelined_prefill_retires_its_send_session(monkeypatch, 
 
     def reap_round(rank):
         state = ranks[rank]
-        if tp_size == 1:
-            # A single-rank worker also reaps the open send from its idle poll.
-            state.coordinator.poll_progress_when_idle()
-        else:
-            state.coordinator.reap_context_sends(0)
+        state.coordinator.poll_progress_when_idle(batch_is_empty=True)
         state.executor._sweep_transfer_held_failures()
 
     for state in ranks:
@@ -2999,10 +2997,9 @@ def test_failed_partial_pipelined_prefill_retires_its_send_session(monkeypatch, 
         assert [(req_id, response.error_msg) for req_id, response in state.responses] == [
             (5, "forward failed")
         ]
-    assert all(
-        [name for name, _ in group.rank(rank).calls] == [name for name, _ in group.rank(0).calls]
-        for rank in range(tp_size)
-    )
+    collectives = [[name for name, _ in group.rank(rank).calls] for rank in range(tp_size)]
+    assert all(names == collectives[0] for names in collectives)
+    assert bool(collectives[0]) == (tp_size > 1)
 
 
 class TestComputeScheduledTokens:

@@ -879,27 +879,34 @@ class DisaggTransferCoordinator:
                             timeout_ms=self._transceiver.kv_transfer_timeout_ms,
                         )
 
-    def poll_progress_when_idle(self) -> None:
+    def poll_progress_when_idle(self, batch_is_empty: bool = False) -> None:
         """Reap completed context KV transfers so their blocks can be freed.
 
-        A synchronous GEN receive blocks rank-locally, so a multi-rank worker
-        must not enter the context status collective here. A single-rank
-        worker cannot diverge and polls only while a send is in flight.
+        ``batch_is_empty`` says the scheduled batch has no request to forward,
+        so no post-forward reap runs this iteration.
+
+        With synchronous transfers, a single-rank worker polls only while a
+        send is in flight. A multi-rank worker polls only when its batch is
+        empty: the status collective's peers share that schedule, and the
+        sync receives started before this call are aligned across them and
+        finish before it, so every peer enters the collective in the same
+        iteration. Retained send sessions (a drained cancelled send waiting
+        for the group vote) then retire with no forward step.
         """
         uses_synchronous_gen_transfer = (
             not uses_async_gen_transfer() and not is_gen_only_no_context_benchmark()
         )
-        should_poll_synchronous_context_status = (
-            uses_synchronous_gen_transfer
-            and self._dist.world_size == 1
-            and (
-                self._transfers.has_any_inflight_requests()
-                # A cancelled partial send is retired only by this reap.
-                or getattr(self._transceiver, "has_open_send_sessions", lambda: False)()
-            )
-        )
-        if uses_synchronous_gen_transfer and not should_poll_synchronous_context_status:
-            return
+        if uses_synchronous_gen_transfer:
+            if self._dist.world_size == 1:
+                should_poll = (
+                    self._transfers.has_any_inflight_requests()
+                    # A cancelled partial send is retired only by this reap.
+                    or getattr(self._transceiver, "has_open_send_sessions", lambda: False)()
+                )
+            else:
+                should_poll = batch_is_empty
+            if not should_poll:
+                return
 
         self.reap_context_sends(0)
 
@@ -1644,7 +1651,7 @@ class NoopDisaggCoordinator(DisaggTransferCoordinator):
     def poll_gen_transfers(self) -> None:
         return None
 
-    def poll_progress_when_idle(self) -> None:
+    def poll_progress_when_idle(self, batch_is_empty: bool = False) -> None:
         return None
 
     def check_transfer_timeouts(self, only_with_context_sends: bool = False) -> None:
