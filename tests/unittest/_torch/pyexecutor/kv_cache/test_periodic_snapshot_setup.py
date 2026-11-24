@@ -73,7 +73,7 @@ def test_staging_capacity_respects_max_num_tokens(monkeypatch, max_tokens, expec
 
     assert manager.periodic_snapshot_capacity == expected_rows
     if expected_rows:
-        assert allocate.call_args.args[0] == [1, expected_rows, 2, 128, 128]
+        assert allocate.call_args.args[0] == [expected_rows, 2, 128, 128]
     else:
         allocate.assert_not_called()
 
@@ -124,7 +124,38 @@ def test_tp2_gdn_allocates_bounded_staging_for_consensus(monkeypatch):
     module.MambaHybridCacheManagerV2._setup_periodic_snapshots(manager)
 
     assert manager.periodic_snapshot_capacity == 4
-    assert allocate.call_args.args[0] == [1, 4, 2, 128, 128]
+    assert allocate.call_args.args[0] == [4, 2, 128, 128]
+
+
+def test_gdn_staging_is_shared_across_layers_within_the_budget(monkeypatch):
+    monkeypatch.setenv("TLLM_USE_FLASHINFER_GDN_PREFILL", "1")
+    monkeypatch.setattr(
+        inforward_snapshot, "is_flashinfer_gdn_prefill_supported_arch", lambda: True
+    )
+    manager = _manager(32768)
+    manager.local_num_mamba_layers = 4
+    manager.mamba_pp_layers = [0, 1, 2, 3]
+    manager.layer_offsets = {i: i for i in manager.mamba_pp_layers}
+    manager.mamba_layer_offsets = {i: i for i in manager.mamba_pp_layers}
+    row_bytes = 2 * 128 * 128 * torch.float32.itemsize
+    manager._periodic_snapshot_staging_in_use_bytes = lambda: 4 * row_bytes
+    monkeypatch.setattr(module, "_PERIODIC_SNAPSHOT_STAGING_BYTES", 12 * row_bytes)
+    torch_empty = torch.empty
+    allocate = Mock(side_effect=lambda shape, dtype, device: torch_empty(shape, dtype=dtype))
+    monkeypatch.setattr(module.torch, "empty", allocate)
+
+    module.MambaHybridCacheManagerV2._setup_periodic_snapshots(manager)
+
+    assert manager.periodic_snapshot_capacity == 2
+    assert allocate.call_args.args[0] == [2, 2, 128, 128]
+    assert allocate.call_args.kwargs["device"] == "cuda"
+    first = module.MambaHybridCacheManagerV2.periodic_snapshot_stage_view(manager, 0, 2)
+    later = module.MambaHybridCacheManagerV2.periodic_snapshot_stage_view(manager, 3, 1)
+    assert first.dtype == torch.float32
+    assert later.shape == (1, 2, 128, 128)
+    assert first.data_ptr() == later.data_ptr()
+    with pytest.raises(KeyError):
+        module.MambaHybridCacheManagerV2.periodic_snapshot_stage_view(manager, 4, 4)
 
 
 def test_speculative_decoding_does_not_allocate_periodic_staging(

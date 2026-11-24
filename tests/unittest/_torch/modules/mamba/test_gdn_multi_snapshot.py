@@ -179,3 +179,98 @@ def test_prefill_suffix_from_saved_snapshot_matches_cold_scan(state_dtype, use_c
         torch.testing.assert_close(resumed_output, cold_output[:, point:], **tol)
         torch.testing.assert_close(resumed_final, cold_final, **tol)
         torch.testing.assert_close(conv[slot], mixed_qkv[point - width : point].T, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("use_cp", ["auto", True, False])
+@pytest.mark.skipif(
+    torch.cuda.is_available() and not is_flashinfer_gdn_prefill_supported_arch(),
+    reason="FlashInfer GDN prefill requires SM90, SM100/SM103/SM107 or SM120/SM121",
+)
+def test_shared_staging_preserves_each_layer_across_queued_prefills(state_dtype, use_cp):
+    """A later layer or prefill cannot overwrite an earlier layer's checkpoints."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.modules.fla.flashinfer_chunk import chunk_gated_delta_rule
+    from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2 import (
+        MambaHybridCacheManagerV2,
+    )
+
+    torch.manual_seed(22692)
+    tokens, heads, dim, interval, width = 192, 2, 128, 64, 3
+    points = (64, 128)
+    slots = torch.tensor([5, 2], device="cuda", dtype=torch.int32)
+    rows = torch.tensor([0, 1], device="cuda", dtype=torch.int64)
+    token_indices = torch.tensor(
+        [i for point in points for i in range(point - width, point)],
+        device="cuda",
+        dtype=torch.int64,
+    )
+    cu = torch.tensor([0, tokens], device="cuda", dtype=torch.int32)
+    checkpoint_cu = torch.tensor([0, tokens // interval], device="cuda", dtype=torch.int32)
+    inputs = []
+    for _ in range(4):
+        q = torch.nn.functional.normalize(
+            torch.randn(1, tokens, heads, dim, device="cuda"), dim=-1
+        ).bfloat16()
+        k = torch.nn.functional.normalize(
+            torch.randn(1, tokens, heads, dim, device="cuda"), dim=-1
+        ).bfloat16()
+        v = (torch.randn(1, tokens, heads, dim, device="cuda") * 0.1).bfloat16()
+        g = -0.05 * torch.rand(1, tokens, heads, device="cuda")
+        beta = torch.rand(1, tokens, heads, device="cuda")
+        mixed = torch.randn(tokens, 16, device="cuda", dtype=torch.bfloat16)
+        state = (torch.randn(8, heads, dim, dim, device="cuda") * 0.01).to(state_dtype)
+        conv = torch.randn(8, 16, width, device="cuda", dtype=torch.bfloat16)
+        inputs.append((q, k, v, g, beta, mixed, state, conv))
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+
+    def run(shared: bool):
+        results = []
+        with torch.cuda.stream(stream):
+            manager = SimpleNamespace(
+                _periodic_snapshot_stage=torch.empty(
+                    tokens // interval, heads, dim, dim, device="cuda", dtype=torch.float32
+                ),
+                mamba_layer_offsets={0: 0, 1: 1},
+            )
+            separate = torch.empty(
+                2, tokens // interval, heads, dim, dim, device="cuda", dtype=torch.float32
+            )
+            for index, (q, k, v, g, beta, mixed, state, conv) in enumerate(inputs):
+                layer = index % 2
+                staging = (
+                    MambaHybridCacheManagerV2.periodic_snapshot_stage_view(
+                        manager, layer, tokens // interval
+                    )
+                    if shared
+                    else separate[layer]
+                )
+                pool, conv_pool = state.clone(), conv.clone()
+                output, final = chunk_gated_delta_rule(
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    initial_state=pool[:1],
+                    output_final_state=True,
+                    cu_seqlens=cu,
+                    use_cp=use_cp,
+                    state_checkpoints=staging,
+                    checkpoint_cu_starts=checkpoint_cu,
+                    checkpoint_every_n_tokens=interval,
+                )
+                windows = gather_conv_snapshot_windows(mixed, token_indices, len(points), width)
+                store_gdn_snapshots(pool, conv_pool, staging.index_select(0, rows), windows, slots)
+                results.append((pool, conv_pool, output, final))
+        stream.synchronize()
+        return results
+
+    separate_results = run(shared=False)
+    shared_results = run(shared=True)
+    for expected, actual in zip(separate_results, shared_results):
+        for left, right in zip(expected, actual):
+            torch.testing.assert_close(left, right, rtol=0, atol=0)

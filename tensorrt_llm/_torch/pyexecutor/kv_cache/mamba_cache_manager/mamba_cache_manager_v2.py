@@ -1248,7 +1248,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         if self._periodic_snapshot_requires_staging:
             try:
                 self._periodic_snapshot_stage = torch.empty(
-                    [self.local_num_mamba_layers, rows] + self.ssm_state_shape,
+                    [rows] + self.ssm_state_shape,
                     dtype=torch.float32,
                     device=self.all_ssm_states[0].device,
                 )
@@ -1260,7 +1260,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self.periodic_snapshot_capacity = rows
 
     def periodic_snapshot_stage_view(self, layer_idx: int, count: int) -> torch.Tensor:
-        return self._periodic_snapshot_stage[self.mamba_layer_offsets[layer_idx], :count]
+        """Return scratch reused by layers in execution-stream order."""
+        if layer_idx not in self.mamba_layer_offsets:
+            raise KeyError(layer_idx)
+        return self._periodic_snapshot_stage[:count]
 
     def reserve_periodic_snapshots(
         self,
