@@ -10,6 +10,7 @@ import pytest
 import torch
 import torch.nn as nn
 from mpi4py import MPI
+from mpi4py.futures import MPIPoolExecutor
 from utils.util import skip_pre_blackwell_unittest
 
 import tensorrt_llm
@@ -311,14 +312,15 @@ def run_single_rank_ledger(tensor_parallel_size, ub_size):
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
                     reason='needs 2 GPUs to run this test')
-@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
-def test_user_buffers_are_in_the_native_memory_ledger(mpi_pool_executor):
-    tensor_parallel_size = 2
-    results = mpi_pool_executor.map(
-        run_single_rank_ledger,
-        *zip(*[(tensor_parallel_size, 8 << 20)] * tensor_parallel_size))
-    for r in results:
-        assert r is True
+@pytest.mark.parametrize("tensor_parallel_size", [2])
+def test_user_buffers_are_in_the_native_memory_ledger(tensor_parallel_size):
+    # The registration deltas require a fresh allocator on every rank.
+    with MPIPoolExecutor(tensor_parallel_size) as executor:
+        results = executor.map(run_single_rank_ledger,
+                               [tensor_parallel_size] * tensor_parallel_size,
+                               [8 << 20] * tensor_parallel_size)
+        for result in results:
+            assert result is True
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
