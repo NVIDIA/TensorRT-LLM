@@ -218,7 +218,14 @@ class _MsgspecRoute(APIRoute):
 # serve frontend, connections are load-balanced across frontends at accept time and
 # keep-alive pins each to the frontend that accepted it, so a long timeout freezes
 # that assignment for the connection's life instead of re-randomizing on re-dial.
-TIMEOUT_KEEP_ALIVE = 3600  # seconds.
+#
+# TRTLLM_SERVER_KEEP_ALIVE_TIMEOUT overrides it, as ``server_keep_alive_timeout`` does for
+# the disaggregated server: a non-negative integer; unset or empty keeps 3600.
+_KEEP_ALIVE_ENV = "TRTLLM_SERVER_KEEP_ALIVE_TIMEOUT"
+TIMEOUT_KEEP_ALIVE = int(os.getenv(_KEEP_ALIVE_ENV) or 3600)  # seconds.
+if TIMEOUT_KEEP_ALIVE < 0:
+    raise ValueError(f"{_KEEP_ALIVE_ENV} must be a non-negative integer, "
+                     f"got {TIMEOUT_KEEP_ALIVE}")
 
 _warned_unresolvable_thinking = False
 
@@ -3955,6 +3962,9 @@ class OpenAIServer(_VideoRoutesMixin):
                                 port=port,
                                 log_level="info",
                                 timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
+        if os.getenv(_KEEP_ALIVE_ENV):
+            logger.info(f"HTTP keep-alive timeout: {TIMEOUT_KEEP_ALIVE}s "
+                        f"({_KEEP_ALIVE_ENV})")
         server = create_uvicorn_server(config)
 
         async def _register_after_serving():

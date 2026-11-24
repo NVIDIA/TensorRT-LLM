@@ -50,6 +50,7 @@ from ..pyexecutor.sampler import penalties as penalty_ops
 from ..pyexecutor.sampler.ops import custom as fused_sampling
 from ..pyexecutor.sampler.ops import flashinfer as flashinfer_sampling
 from ..pyexecutor.sampler.ops.vanilla import greedy_search_sampling_batch
+from .block_verification import block_verification_enabled, verify_drafts
 from .compact_draft_probs import (CompactDraftProbs, DeferredDraftProbs,
                                   compact_draft_probs_requested,
                                   compact_store_refusal, private_verify_scratch)
@@ -143,6 +144,13 @@ _FORCE_ACCEPT_RNG_POOL_SIZE = 1 << 16  # 65536 entries (256 KiB float32)
 _FORCE_ACCEPT_RNG_SEED = 0xACCE9D
 _FORCE_ACCEPT_RNG_COUNTER_STRIDE = 6007
 _FORCE_ACCEPT_RNG_SLOT_STRIDE = 1009
+
+# Write the CUDA-graph padding slots' one-hot draft-prob rows with index_fill_
+# and a pinned, non-blocking slot copy. The default assigns Python scalars
+# through a device index, which stages each scalar as a pageable host tensor and
+# blocks the host until the stream drains.
+_DEVICE_ONEHOT_SCALARS = os.environ.get("TRTLLM_DFLASH_DEVICE_ONEHOT_SCALARS",
+                                        "0") == "1"
 
 
 def should_use_separate_draft_kv_cache(spec_config) -> bool:
@@ -1237,6 +1245,21 @@ class SpecMetadata:
                 torch.tensor(padding_slot_ids,
                              dtype=torch.long,
                              device=compact.device), draft_len, onehot_vocab)
+            return
+        if _DEVICE_ONEHOT_SCALARS:
+            logger.info_once(
+                "Speculative decoding: padding-slot one-hot draft-prob rows "
+                "are written with index_fill_, no host sync.",
+                key="device_onehot_padding_draft_probs")
+            slots = torch.tensor(padding_slot_ids,
+                                 dtype=torch.long,
+                                 pin_memory=prefer_pinned()).to(
+                                     self.draft_probs.device, non_blocking=True)
+            # Same elements and values as the indexed writes below; the scalar
+            # is a kernel argument, so no host tensor is staged.
+            self.draft_probs[:, :draft_len, :onehot_vocab].index_fill_(
+                0, slots, 0.0)
+            self.draft_probs[:, :draft_len, 0].index_fill_(0, slots, 1.0)
             return
         if _ONEHOT_INDEXED_PUT:
             slots = torch.tensor(padding_slot_ids,
@@ -2883,14 +2906,30 @@ class SpecWorkerBase(nn.Module, ABC):
                 batch_size,
                 slot=spec_metadata.rng_accept_slot)
 
-            gen_accepted, gen_num_accepted = rejection_sampling_one_model(
-                draft_probs=full_draft_probs,
-                draft_token_ids=full_draft_tokens,
-                target_probs=target_probs,
-                deterministic=True,
-                seed=seed,
-                offset=offset,
-            )
+            if block_verification_enabled() and not is_ragged:
+                # Joint (block) verification: lossless like the token-level
+                # rule below, and it accepts at least as many drafts. Batches
+                # above TRTLLM_SPEC_BLOCK_VERIFICATION_MAX_BATCH, and ragged
+                # (confidence-scheduled) windows, keep the token-level rule.
+                gen_accepted, gen_num_accepted = verify_drafts(
+                    full_draft_tokens,
+                    full_draft_probs,
+                    target_probs,
+                    seed,
+                    offset,
+                    slot_ids=spec_metadata.
+                    batch_slot_ids[num_contexts:batch_size],
+                    dummy_slot=spec_metadata.dummy_slot_row,
+                    token_level=rejection_sampling_one_model)
+            else:
+                gen_accepted, gen_num_accepted = rejection_sampling_one_model(
+                    draft_probs=full_draft_probs,
+                    draft_token_ids=full_draft_tokens,
+                    target_probs=target_probs,
+                    deterministic=True,
+                    seed=seed,
+                    offset=offset,
+                )
 
             if self.force_num_accepted_tokens != 0.0:
                 # Fill gen_accepted positions 1..runtime_draft_len with all draft tokens

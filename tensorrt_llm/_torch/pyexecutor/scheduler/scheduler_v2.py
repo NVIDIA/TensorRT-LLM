@@ -998,6 +998,42 @@ class KVCacheV2Scheduler(RequestScheduler):
                 f"{order.describe() if order is not None else 'arrival order'}, "
                 f"prefill_decode_interval={interval}"
             )
+        # Opt-in (default off): prepare the caches of pending first context
+        # chunks on the last N passes the prefill-decode interval defers; see
+        # _prepare_context_ahead.
+        self._prepare_ahead_passes = 0
+        self._prepare_ahead_max_util = 0.0
+        self._prepared_ahead: dict[int, LlmRequest] = {}
+        self._prepared_ahead_tokens = 0
+        self._ahead_stopped = False
+        self._ahead_pass = 0
+        self._ahead_seen: dict[int, int] = {}
+        self._ahead_seeded: set[int] = set()
+        self._ahead_release: RequestList = []
+        self._ahead_stats: Counter = Counter()
+        ahead = _read_non_negative_int_env("TRTLLM_SCHED_PREPARE_AHEAD_PASSES", 0)
+        if ahead > 0:
+            if self._prepare_ahead_supported():
+                resume_gate = kv_cache_manager.impl.init_config.max_util_for_resume
+                raw = os.environ.get("TRTLLM_SCHED_PREPARE_AHEAD_MAX_UTIL", "").strip()
+                max_util = float(raw) if raw else 0.5 * resume_gate
+                if not 0.0 < max_util <= resume_gate:
+                    raise ValueError(
+                        "TRTLLM_SCHED_PREPARE_AHEAD_MAX_UTIL must be in (0, "
+                        f"max_util_for_resume={resume_gate}], got {raw!r}"
+                    )
+                self._prepare_ahead_passes = ahead
+                self._prepare_ahead_max_util = max_util
+                logger.info(
+                    f"KVCacheV2Scheduler context prepare-ahead: passes={ahead}, "
+                    f"max_util={max_util:.3f}"
+                )
+            else:
+                logger.warning(
+                    "TRTLLM_SCHED_PREPARE_AHEAD_PASSES is set but needs the prefill-decode "
+                    "interval, chunked prefill, ALL_REUSABLE block reuse and no draft, cross "
+                    "or connector KV manager; prepare-ahead stays off"
+                )
 
         # Opt-in (default off): while several
         # context requests can take a chunk, cap each one's chunk at
@@ -1049,6 +1085,14 @@ class KVCacheV2Scheduler(RequestScheduler):
                     f"block_budget={block_budget}, "
                     f"side_stream={self._admission_lookahead.side_stream}"
                 )
+        if self._prepare_ahead_passes and self._admission_lookahead is not None:
+            # Both claim first-chunk caches ahead of the admitting pass and release the
+            # ones it does not use; run together they would hold the same requests twice.
+            logger.warning(
+                "TRTLLM_SCHED_PREPARE_AHEAD_PASSES and TRTLLM_SCHED_LOOKAHEAD_ADMIT_PASSES are "
+                "both set; context admission lookahead is used and prepare-ahead stays off"
+            )
+            self._prepare_ahead_passes = 0
 
     def _resolve_ctx_request_chunk_cap(self, raw: str) -> Optional[int]:
         try:
@@ -1182,6 +1226,11 @@ class KVCacheV2Scheduler(RequestScheduler):
         disagg_candidates: RequestList = []
         scheduled_beam_width = 0
         has_chunking = False
+
+        if self._ahead_release:
+            # Before phase 1, so generation growth sees the pool it would
+            # have seen without prepare-ahead.
+            self._release_unadmitted_ahead()
 
         budget = BudgetTracker(
             self.max_num_tokens,
@@ -1372,6 +1421,10 @@ class KVCacheV2Scheduler(RequestScheduler):
         #
         # The prefill-decode interval may hold context requests back this
         # pass; ShortestPrefillFirstOrder, when on, sets the order they are tried in.
+        if self._prepared_ahead and not self._ahead_pool_has_headroom():
+            # The pool rose past the prepare-ahead ceiling since these claims
+            # were taken: give them back before context admission reads it.
+            self._release_prepared_ahead()
         has_generation = bool(scheduled_gen)
         ctx_candidates, deferred_by_interval = self._admissible_pending_ctx(
             pending_ctx, requests_list, has_generation
@@ -1586,6 +1639,12 @@ class KVCacheV2Scheduler(RequestScheduler):
             self._lookahead_after_pass(scheduled_ctx, has_generation)
         if diag is not None:
             diag.end_pass(len(ctx_candidates), len(scheduled_ctx))
+        if self._prepare_ahead_passes:
+            if deferred_by_interval:
+                self._prepare_context_ahead(pending_ctx, inflight_request_ids, budget)
+            else:
+                self._close_ahead_window(pending_ctx, scheduled_ctx)
+            self._log_ahead_stats()
         if self._prefix_skip_pending or self._prefix_skip_key_cache:
             self._forget_admitted_prefix_skip_state(scheduled_ctx, requests_list)
         if self._prefill_decode_interval is not None:
@@ -1677,6 +1736,224 @@ class KVCacheV2Scheduler(RequestScheduler):
                 "run them"
             )
             stats.clear()
+
+    # ---- Opt-in context prepare-ahead ----
+
+    def _prepare_ahead_supported(self) -> bool:
+        """Whether prepare-ahead can move admission work without changing it.
+
+        It runs on the passes the prefill-decode interval defers, and relies on
+        chunked admission skipping, not stopping at, a refused request. It
+        covers the target pool alone: draft, cross and connector admission have
+        side effects of their own. Under ``ALL_REUSABLE`` reuse, blocks enter
+        the radix tree as contexts run, and no context runs on a deferred pass.
+        """
+        from ..kv_cache.kv_cache_manager_v2 import BlockReusePolicy
+
+        kv_cache_manager = self.kv_cache_manager
+        return (
+            self._prefill_decode_interval is not None
+            and self.chunking_enabled
+            and self.draft_kv_cache_manager is None
+            and self.cross_kv_cache_manager is None
+            and kv_cache_manager.kv_connector_manager is None
+            and kv_cache_manager.enable_block_reuse
+            and kv_cache_manager.block_reuse_policy == BlockReusePolicy.ALL_REUSABLE
+            and not self.has_cp_helix
+        )
+
+    def _ahead_pool_has_headroom(self) -> bool:
+        """Whether every GPU pool group is at or below the prepare-ahead ceiling.
+
+        Held claims must not change which generation growth fits on the
+        deferred passes, so the pool has to stay well below the resume gate
+        (``TRTLLM_SCHED_PREPARE_AHEAD_MAX_UTIL``, default half of it). Pages a
+        claim locks count as used, so this bounds the claims held ahead too.
+        """
+        from ..kv_cache.kv_cache_manager_v2 import GPU_LEVEL, _introspection
+
+        utilization = _introspection.storage_utilization(self.kv_cache_manager.impl, GPU_LEVEL)
+        peak = max(utilization, default=0.0)
+        stats = self._ahead_stats
+        stats["peak_util"] = max(stats["peak_util"], peak)
+        return peak <= self._prepare_ahead_max_util
+
+    def _release_prepared_ahead(self) -> None:
+        """Give back every cache prepared ahead; prepare no more until the window closes."""
+        self._ahead_stats["pressure_released"] += len(self._prepared_ahead)
+        self._ahead_release = list(self._prepared_ahead.values())
+        self._prepared_ahead = {}
+        self._prepared_ahead_tokens = 0
+        self._ahead_stopped = True
+        self._release_unadmitted_ahead()
+
+    def _prepare_context_ahead(
+        self, pending_ctx: RequestList, inflight_request_ids: set[int], budget: BudgetTracker
+    ) -> None:
+        """On a deferred pass, prepare the caches the next admitting pass will try.
+
+        ``_prepare_context_pair`` creates a first chunk's cache, claims its
+        reusable prefix and resumes the matched pages on the GPU, at a cost that
+        grows with the matched pages. On an admitting pass it runs for every
+        admitted request, before the step that carries the context work. On the
+        last ``_prepare_ahead_passes`` passes the interval defers, this runs it
+        for the pending first chunks in the order the admitting pass will try
+        them, a share per pass, until their uncached tokens fill this pass's
+        token budget. The admitting pass then finds those caches active, and its
+        own call claims nothing.
+
+        The pages held ahead are bounded by the pool: no claim is taken while a
+        GPU pool group is above ``_prepare_ahead_max_util``, and a claim that
+        takes one above it is undone at once. Held claims are given back when a
+        generation request does not fit, before anyone is evicted, and before
+        context admission whenever the pool has since risen past the ceiling
+        (``_release_prepared_ahead``).
+
+        Only when the work runs changes. The admitting pass decides what runs
+        exactly as before, and every cache it does not admit is released before
+        the next pass (``_close_ahead_window``). The claim is the one the
+        admitting pass would take: no context runs between the two passes, and
+        a request is prepared only after it has waited two passes, once the
+        cache of the turn it extends has closed. A shortest-prefill-first
+        estimate is computed before the claim, as the admitting pass would.
+        """
+        start = time.perf_counter()
+        passes_left = self._prefill_decode_interval.remaining
+        if passes_left > self._prepare_ahead_passes or self._ahead_stopped:
+            return
+        stats = self._ahead_stats
+        kv_cache_manager = self.kv_cache_manager
+        context_state = self._context_init_state_value
+        self._ahead_pass += 1
+        candidates = [
+            req
+            for req in pending_ctx
+            if req.state_value == context_state
+            and req.is_first_context_chunk
+            and not req.is_dummy
+            and req.request_id not in inflight_request_ids
+            and req.py_request_id not in kv_cache_manager.kv_cache_map
+        ]
+        seen = self._ahead_seen
+        self._ahead_seen = {
+            req.py_request_id: seen.get(req.py_request_id, self._ahead_pass) for req in candidates
+        }
+        candidates = [
+            req for req in candidates if self._ahead_pass - self._ahead_seen[req.py_request_id] >= 2
+        ]
+        token_budget = budget.remaining_tokens
+        slots = budget.max_num_requests - budget.num_requests - len(self._prepared_ahead)
+        if (
+            not candidates
+            or slots <= 0
+            or (token_budget is not None and self._prepared_ahead_tokens >= token_budget)
+        ):
+            stats["ahead_ms"] += (time.perf_counter() - start) * 1e3
+            return
+        if not self._ahead_pool_has_headroom():
+            stats["ceiling_passes"] += 1
+            stats["ahead_ms"] += (time.perf_counter() - start) * 1e3
+            return
+
+        spf = self._shortest_prefill_first
+        if spf is not None:
+            self._ahead_seeded.update(
+                req.py_request_id for req in candidates if req.py_request_id not in spf._uncached
+            )
+            # The order's key depends on the admitted-work clock, which does not
+            # advance between now and the admitting pass.
+            candidates = spf.peek_order(candidates, kv_cache_manager)
+        # Requests the admitting pass is expected to reach. Every one gets its
+        # estimate here, before any claim below.
+        predicted = 0
+        tokens = self._prepared_ahead_tokens
+        for req in candidates:
+            if predicted >= slots or (token_budget is not None and tokens >= token_budget):
+                break
+            predicted += 1
+            if spf is not None:
+                tokens += spf.uncached_tokens(req, kv_cache_manager)
+        quota = -(-predicted // passes_left)
+
+        for req in candidates[:quota]:
+            if token_budget is not None and self._prepared_ahead_tokens >= token_budget:
+                break
+            # The class methods: admission diagnostics time the admitting pass.
+            if not type(self)._prepare_context_pair(self, req):
+                type(self).release_context_admission(self, req)
+                stats["refused"] += 1
+                break
+            if not self._ahead_pool_has_headroom():
+                # This claim took a pool group past the ceiling: undo it and
+                # leave the rest to the admitting pass.
+                type(self).release_context_admission(self, req)
+                stats["rolled_back"] += 1
+                stats["ceiling_passes"] += 1
+                self._ahead_stopped = True
+                break
+            self._prepared_ahead[req.py_request_id] = req
+            self._prepared_ahead_tokens += req.context_remaining_length
+            stats["prepared"] += 1
+        stats["ahead_ms"] += (time.perf_counter() - start) * 1e3
+
+    def _close_ahead_window(self, pending_ctx: RequestList, scheduled_ctx: RequestList) -> None:
+        """After a pass that tried context work, undo what it did not use.
+
+        Caches prepared ahead that the pass did not admit are released at the
+        start of the next pass, before anything reads the pool. Estimates
+        computed ahead are dropped when the pass did not reorder, so they are
+        computed when the first pass that reorders reaches them.
+        """
+        self._ahead_stopped = False
+        if not (self._prepared_ahead or self._ahead_seeded):
+            return
+        scheduled_ids = {req.py_request_id for req in scheduled_ctx}
+        self._ahead_stats["admitted"] += len(scheduled_ids & self._prepared_ahead.keys())
+        self._ahead_release = [
+            req for rid, req in self._prepared_ahead.items() if rid not in scheduled_ids
+        ]
+        spf = self._shortest_prefill_first
+        if spf is not None and self._ahead_seeded:
+            context_state = self._context_init_state_value
+            if sum(1 for req in pending_ctx if req.state_value == context_state) < 2:
+                for request_id in self._ahead_seeded:
+                    spf._uncached.pop(request_id, None)
+                    spf._key.pop(request_id, None)
+        self._prepared_ahead = {}
+        self._prepared_ahead_tokens = 0
+        self._ahead_seeded = set()
+        self._ahead_seen = {}
+
+    def _release_unadmitted_ahead(self) -> None:
+        start = time.perf_counter()
+        context_state = self._context_init_state_value
+        kv_cache_map = self.kv_cache_manager.kv_cache_map
+        for req in self._ahead_release:
+            if (
+                req.state_value == context_state
+                and req.is_first_context_chunk
+                and req.py_request_id in kv_cache_map
+            ):
+                type(self).release_context_admission(self, req)
+                self._ahead_stats["released"] += 1
+        self._ahead_release = []
+        self._ahead_stats["release_ms"] += (time.perf_counter() - start) * 1e3
+
+    def _log_ahead_stats(self) -> None:
+        stats = self._ahead_stats
+        stats["passes"] += 1
+        if stats["passes"] < self._CONTEXT_ADMISSION_LOG_PASSES:
+            return
+        logger.info(
+            f"[V2Scheduler] context prepare-ahead over {stats['passes']} passes: "
+            f"{stats['prepared']} prepared ahead in {stats['ahead_ms']:.0f} ms on deferred "
+            f"passes, {stats['admitted']} admitted, {stats['released']} released unadmitted "
+            f"({stats['release_ms']:.0f} ms; {stats['pressure_released']} under pool "
+            f"pressure), {stats['refused']} refused, {stats['rolled_back']} rolled back at "
+            f"the ceiling; {stats['ceiling_passes']} passes stopped at the ceiling "
+            f"{self._prepare_ahead_max_util:.3f}, peak pool util {stats['peak_util']:.3f}"
+        )
+        stats.clear()
 
     def _started_context_ids(self, requests: RequestList) -> set[int]:
         """Ids of the context requests in *requests* that have started prefilling."""
@@ -3139,6 +3416,11 @@ class KVCacheV2Scheduler(RequestScheduler):
             return ScheduleAction.SKIP, 0, scheduled_beam_width, req_it_end
 
         success = self._try_allocate_generation(req)
+        if not success and self._prepared_ahead:
+            # Caches prepared ahead of admission give their pages back before
+            # any running request is evicted for them.
+            self._release_prepared_ahead()
+            success = self._try_allocate_generation(req)
 
         # First chunks resumed ahead of their context pass give their pages
         # back before any started request is evicted for them.
