@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """QSA block compression of the paged index-key side cache: completed groups to anchors.
 
-Called by the qwen4_exp target (`qwen3_8_flash_next_nvfp4__sm_103__default`) at every
+Called by the qwen4_exp target (`qwen3_8_flash_next_nvfp4__sm_10x__default`) at every
 layout.
 """
 
@@ -15,7 +15,8 @@ import torch
 # Tier-2 sourcing: a vendored Triton callable reached as ordinary Python. QSA's
 # kernel plane has no torch.ops surface.
 from tensorrt_llm._torch.attention.backends.sparse.qsa import kernels as _qsa_kernels
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 #: The mRoPE sections the checkpoint declares. The target passes `None`
 #: (`_QSA_MROPE_SECTION`); these are certified on the NVFP4 trunk-plane cell.
@@ -135,7 +136,7 @@ class QsaPrefillCompress(OpWrapper):
     first), the table and metadata, and the main K/V pool are the caller's.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     CELLS: tuple[Cell, ...] = (
         Cell(
@@ -157,7 +158,7 @@ class QsaPrefillCompress(OpWrapper):
         # page's plane sits past 2^31 elements of the pool's base.
         Cell(
             why="tep4 decode: 128 requests x 1 row, the 258983-page coalesced pool, ordinal 11",
-            spec=_pool(_decode(128, 9215), TEP4_PAGES, CORE_WIDTH, 11),
+            spec=_pool(_decode(128, 9215), TEP4_PAGES, CORE_WIDTH, 11, rounding_flips=1),
         ),
         Cell(
             why="tep4 MTP7 verify: 128 requests x 8 rows = 1024, positions to 16383",
@@ -205,7 +206,7 @@ class QsaPrefillCompress(OpWrapper):
     elements off by up to 1.56e-2, and is not certified. Text rows reduce
     mRoPE to plain RoPE bit for bit (measured, not pinned by a test). Plain
     `@triton.jit`, no autotune, JIT-compiled at first call; the cells drove
-    that JIT path on sm_103 (GB300). Every stride is a
+    that JIT path on sm_103 and sm_107. Every stride is a
     `tl.constexpr`, so each pool layout (contiguous, the NVFP4 shared page,
     the default target's coalesced bf16 pool) is its own compiled specialization, and
     each is driven by a cell. CUDA-graph capturable at a fixed row count
@@ -225,13 +226,13 @@ class QsaPrefillCompress(OpWrapper):
     `[128, 292]` (core) or `[128, 516]` (MTP, max_seq_len 16384), 128 seats at
     128 and at 32 requests. The other 11 layers' planes are checked untouched.
 
-    The kernel's `tl.rsqrt` is the hardware approximation, an fp32 ulp from the
-    reference's: every cell is bitwise the reference but two. In the 32-block
-    MTP7 one, 1 of 8192 anchor elements rounds one bf16 step away. In the 8192-row
-    tep4 prefill, 5 of 262016 do, every one an exact bf16 tie in the reference's
-    fp32 value (low 16 bits 0x8000). The nearest wrong variants (sequential bf16
-    pooling, coordinates from the group's last member, the norm weight without
-    its `+1`) fall far outside that budget.
+    Every cell matches the reference bitwise, except `rounding_flips` elements one
+    bf16 step off: the kernel's fp32 norm (`tl.rsqrt`, a Triton sum) can be an fp32
+    ulp from torch's, and an element that sits exactly on a bf16 tie then rounds the
+    other way (1 element in the 32-block MTP7 verify, 5 in the 8192-row tep4
+    prefill, 1 in the 128-request tep4 decode). The nearest wrong variants
+    (sequential bf16 pooling, coordinates from the group's last member, the norm
+    weight without its `+1`) move far more.
 
     Hard limits (read from the kernel; the page offset also driven): positions,
     requests and page ids are widened to int64 before any address arithmetic,

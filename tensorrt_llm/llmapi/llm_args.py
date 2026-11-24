@@ -280,13 +280,14 @@ class DecodeCudaGraphConfig(BaseCudaGraphConfig):
             "greedily; 'advanced' serves batches with a sampled request, one whose "
             "temperature, top-k, top-p or min-p does not resolve to greedy decoding "
             "(a seed or a penalty alone does not); 'temperature_only' serves sampled "
-            "batches whose sampled requests set only a temperature, where the "
+            "batches whose sampled requests are unseeded and set only a temperature of at least 1e-4, where the "
             "target tokens are sampled from vocabulary-sharded logits: MTP-Eagle "
-            "one-model decode on models with the spec-decode fast paths (today "
-            "Qwen3.5 checkpoints on SM 10.0/10.3 GPUs) with tensor parallelism, "
-            "without attention DP, relaxed acceptance or watermark_config; or a "
-            "DSpark draft embedded in the target checkpoint (the DeepSeek-V4 "
-            "family) with tensor parallelism, or with attention DP and "
+            "one-model decode with spec-decode fast paths, or with "
+            "TLLM_SPEC_VOCAB_PARALLEL_TEMPERATURE=1 and an eligible vocabulary-sharded "
+            "LM head. Both MTP-Eagle paths require tensor parallelism without attention DP, "
+            "relaxed acceptance, guided decoding or watermark_config. Embedded "
+            "DSpark drafts in the target checkpoint (the DeepSeek-V4 "
+            "family) support this with tensor parallelism, or with attention DP and "
             "enable_lm_head_tp_in_adp. Both need no rejection sampling or "
             "penalties; elsewhere the first capture rejects it. By default every "
             "variant the engine supports is captured. "
@@ -1012,9 +1013,11 @@ class GuidedDecodingConfig(StrictBaseModel):
     backend: GuidedDecodingBackend = Field(
         default=GuidedDecodingBackend.XGRAMMAR,
         description="The backend for guided decoding config.")
-    encoded_vocab: Optional[List[str]] = Field(
+    encoded_vocab: Optional[List[Union[str, bytes]]] = Field(
         default=None,
-        description="The encoded vocab for guided decoding config.")
+        description=
+        "The encoded vocab for guided decoding config: each token's text, or "
+        "its raw bytes for tokenizers whose tokens need not be valid UTF-8.")
     tokenizer_str: Optional[str] = Field(
         default=None,
         description="The tokenizer string for guided decoding config.")

@@ -4,6 +4,7 @@
 
 import pytest
 import torch
+from _torch.helpers import triton_num_compiled
 
 from tensorrt_llm._torch.modules.kimi_kda import _kda_kernels
 from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import record_kda_replay_acceptance
@@ -187,6 +188,35 @@ def test_state_update_and_record_acceptance(monkeypatch):
     torch.testing.assert_close(pool, expected, rtol=0, atol=0)
 
     assert len(launches) == 2
+
+
+def test_generation_rows_reuse_the_compiled_variant_across_batches():
+    """No batch compiles a new variant of the kernel once one has run.
+
+    The managers pass the generation rows as views that start ``num_contexts``
+    rows into whole-batch tensors (``update_mamba_states``), so the alignment of
+    the int32 and bool vectors follows the batch's context count. Warmup runs
+    generation-only batches.
+    """
+    kernel = _kda_kernels._record_kda_replay_acceptance_kernel
+    state_indices, num_accepted, is_dummy = _inputs(64, torch.int32, torch.int32, True)
+    pool = _pool()
+    state = _bound_state(pool[:, 0])
+
+    def update(num_contexts, num_generations):
+        rows = slice(num_contexts, num_contexts + num_generations)
+        generation_rows = (state_indices[rows], num_accepted[rows], is_dummy[rows])
+        expected = pool.clone()
+        _reference(expected[:, 0], *generation_rows, 1)
+        state.update(_batch(*generation_rows))
+        torch.testing.assert_close(pool, expected, rtol=0, atol=0)
+
+    update(0, 16)
+    compiled = triton_num_compiled(kernel)
+    # Context counts on and off the 4-row (int32) and 16-row (bool) boundaries.
+    for num_contexts in (1, 2, 3, 4, 8, 12, 16, 17):
+        update(num_contexts, 32)
+    assert triton_num_compiled(kernel) == compiled
 
 
 def test_state_entry_points_raise_on_unsupported_layouts():

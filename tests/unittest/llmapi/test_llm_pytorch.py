@@ -298,6 +298,40 @@ class TestLlmInputValidation:
         # ensure engine remains responsive
         llm.generate(prompts)
 
+    @pytest.mark.threadleak(enabled=False)
+    @pytest.mark.parametrize(
+        "embedding_bias_in, error_regex",
+        [
+            (
+                ((42, -0.5), (999999, -2.5)),
+                ".*Embedding bias index must be in \\[0, 151935\\].*",
+            ),
+        ],
+    )
+    def test_llm_invalid_embedding_bias_with_child_requests(
+        self,
+        embedding_bias_in: torch.Tensor | list[float] | EmbeddingBias,
+        error_regex: str,
+        llm: LLM,
+    ):
+        prompts = [
+            [0],
+        ]
+        with pytest.raises(
+                RuntimeError,
+                match=error_regex,
+        ):
+            llm.generate(
+                prompts,
+                sampling_params=SamplingParams(max_tokens=5,
+                                               embedding_bias=embedding_bias_in,
+                                               n=2,
+                                               temperature=0.9),
+            )
+
+        # ensure engine remains responsive
+        llm.generate(prompts)
+
 
 @skip_ray
 @pytest.mark.part3

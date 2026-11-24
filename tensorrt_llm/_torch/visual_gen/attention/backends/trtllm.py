@@ -57,11 +57,11 @@ def vc_smooth_phase(denoise_step: Optional[tuple[int, int]]) -> Optional[int]:
 
     ``VCAttentionPreprocessor.prepare`` chooses its path from the step alone,
     so a graph captured at one step is only valid for steps on the same path.
-    2 regroups the value tokens and demeans V, 1 keeps the last grouping and
-    demeans V, 0 runs the plain per-channel E4M3 V after the window. ``None``
-    means no denoising step is active; CUDA Graph runners omit their phase key
-    part in that case. The schedule constants are the defaults the layer-owned
-    preprocessor runs with.
+    3 starts the generation cold at step 0, 2 regroups from the current
+    centroids, 1 keeps the grouping and demeans V, 0 runs the plain per-channel
+    E4M3 V after the window. ``None`` means no denoising step is active; CUDA
+    Graph runners omit their phase key part in that case. The schedule
+    constants are the defaults the layer-owned preprocessor runs with.
     """
     if denoise_step is None:
         return None
@@ -73,27 +73,14 @@ def vc_smooth_phase(denoise_step: Optional[tuple[int, int]]) -> Optional[int]:
     step, num_steps = denoise_step
     if step >= math.ceil(VC_SMOOTH_STEP_FRACTION * num_steps):
         return 0
-    return 2 if step == 0 or step % VC_PERM_REFRESH_EVERY == 0 else 1
+    if step == 0:
+        return 3
+    return 2 if step % VC_PERM_REFRESH_EVERY == 0 else 1
 
 
-def vc_denoise_step_for_phase(phase: int) -> tuple[int, int]:
-    """Return a representative denoising step of the schedule in ``phase``.
-
-    Under CUDA graph capture the real step must not change what the graph
-    records, so the host resolved phase selects one step of that phase on a
-    schedule whose window holds exactly one refresh period.
-    """
-    from ....attention.backends.prims_ts.vc_attention.quantization import (
-        VC_PERM_REFRESH_EVERY,
-        VC_SMOOTH_STEP_FRACTION,
-    )
-
-    num_steps = math.ceil(VC_PERM_REFRESH_EVERY / VC_SMOOTH_STEP_FRACTION)
-    if phase == 2:
-        return 0, num_steps
-    if phase == 1:
-        return 1, num_steps
-    return num_steps - 1, num_steps
+# The preprocessor path each phase replays. The captured graph then records
+# no step bookkeeping and the cold start no random draw.
+VC_PHASE_MODES = {3: "cold", 2: "warm", 1: "keep", 0: "plain"}
 
 
 def prepare_vc_operands(
@@ -105,13 +92,20 @@ def prepare_vc_operands(
     repair_budget: float,
     preprocessor: Optional["VCAttentionPreprocessor"],
     denoise_step: Optional[tuple[int, int]],
+    grouped_tokens: Optional[tuple[int, int]] = None,
+    mode: Optional[str] = None,
 ) -> "VCAttentionOperands":
     """Quantize ``[B, S, H, D]`` bf16 Q, K and V for one VC-Attention forward.
 
     With a repair budget the highest-residual tokens are appended as V repair
     rows. Otherwise the layer-owned ``preprocessor`` groups the value tokens
     and splits V into tile means and E4M3 residuals on the V-Smooth schedule
-    given by ``denoise_step``. Under QK8 ``q`` is rotated and quantized too.
+    given by ``denoise_step``. ``grouped_tokens`` is the ``(start, stop)`` token
+    range the grouping covers. In a joint sequence the range holds the video
+    tokens. The other tokens follow in input order. ``None`` groups the whole
+    sequence. ``mode`` names the preprocessor path (``cold``, ``warm``, ``keep``
+    or ``plain``) in place of the step, as the CUDA graph runner's phase does.
+    Under QK8 ``q`` is rotated and quantized too.
     """
     from ....attention.backends.prims_ts.vc_attention.quantization import vc_quantize_repair
 
@@ -120,7 +114,9 @@ def prepare_vc_operands(
         return vc_quantize_repair(k, v, budget=repair_budget, q=vc_q)
     if preprocessor is None:
         raise ValueError("the tile-mean VC-Attention recipe needs a preprocessor")
-    return preprocessor.prepare(k, v, q=vc_q, denoise_step=denoise_step)
+    return preprocessor.prepare(
+        k, v, q=vc_q, denoise_step=denoise_step, grouped_tokens=grouped_tokens, mode=mode
+    )
 
 
 @functools.lru_cache(maxsize=None)
@@ -495,22 +491,28 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         seq_len: int,
         kv_seq_len: int,
         timestep: object,
+        grouped_tokens: Optional[tuple[int, int]] = None,
     ) -> "VCAttentionOperands":
         """Prepare the VC-Attention operands of this call from compact Q, K and V.
 
         The denoising step comes from the pipeline through the shared attention
         metadata state, so the V-Smooth window is a fraction of the schedule's
         steps on any scheduler. Under the CUDA graph runner the host resolved
-        phase stands in for the step, which capture must not record, and
-        selects a representative step of that phase.
+        phase names the preprocessor path. Capture must not record the step.
         """
         del timestep
         quant_cfg = self.quant_attention_config
-        denoise_step = None
+        denoise_step = mode = None
         if self._vc_preprocessor is not None:
             phase = resolved_extra_key("vc_smooth_phase")
             if phase is not None:
-                denoise_step = vc_denoise_step_for_phase(phase)
+                mode = VC_PHASE_MODES[phase]
+                # The runner warms a new graph up with eager calls before the
+                # capture. A warm refresh in those calls would advance the
+                # grouping once per call. The warm-up keeps the grouping. The
+                # first run of the graph then equals a replay.
+                if mode == "warm" and not torch.cuda.is_current_stream_capturing():
+                    mode = "keep"
             else:
                 denoise_step = self.metadata._metadata_state.get("denoise_step")
                 # Eager runs keep the grouping of the current K/V shape only. Under
@@ -532,6 +534,8 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             repair_budget=quant_cfg.vc_repair_budget,
             preprocessor=self._vc_preprocessor,
             denoise_step=denoise_step,
+            grouped_tokens=grouped_tokens,
+            mode=mode,
         )
 
     def should_use_sparse(self, sparse_attn_phase: Optional[int]) -> bool:
@@ -638,6 +642,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         key_padding_mask: Optional[torch.Tensor] = None,
         discard_padded_queries: bool = False,
         valid_seq_len: Optional[int] = None,
+        grouped_tokens: Optional[tuple[int, int]] = None,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -683,6 +688,10 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 for every batch row, in the global sequence after Ulysses exchange.
                 Required when opting into padding. The caller must validate
                 trailing padding; arbitrary masks and unequal lengths are unsupported.
+            grouped_tokens: Under VC-Attention, the ``(start, stop)`` token range the
+                value grouping covers. In a joint sequence the range holds the video
+                tokens. The text or audio tokens follow them in input order. ``None``
+                groups the whole sequence.
             **kwargs: Additional backend-specific arguments.
 
         Returns:
@@ -732,7 +741,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 quantization_kwargs = {
                     "vc_attention": True,
                     "vc_operands": self._vc_operands(
-                        q, k, v, batch_size, seq_len, kv_seq_len, timestep
+                        q, k, v, batch_size, seq_len, kv_seq_len, timestep, grouped_tokens
                     ),
                 }
             elif quant_cfg is not None:

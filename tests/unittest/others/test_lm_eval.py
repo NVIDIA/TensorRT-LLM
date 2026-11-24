@@ -1867,3 +1867,201 @@ def test_stop_strings_cli_rejects_non_list_of_strings(value):
     result = CliRunner().invoke(GSM8K.command, ["--stop_strings", value], standalone_mode=False)
     assert isinstance(result.exception, click.BadParameter)
     assert "JSON list of strings" in result.exception.message
+
+
+# ===========================================================================
+# Mistral-native checkpoints: mistral-common renders the chat with its images
+# ===========================================================================
+
+_P = LM_EVAL_DEFAULT_IMAGE_PLACEHOLDER
+
+
+@pytest.mark.parametrize(
+    "force_single,history,sizes,expected",
+    [
+        (
+            False,
+            [
+                {"role": "user", "content": f"Before {_P} between {_P} after"},
+                {"role": "assistant", "content": "Two pictures."},
+                {"role": "user", "content": f"Compare to {_P} again."},
+            ],
+            [(84, 56), (56, 112), (84, 56)],
+            [
+                {"role": "user", "content": ["Before ", 0, " between ", 1, " after"]},
+                {"role": "assistant", "content": "Two pictures."},
+                {"role": "user", "content": ["Compare to ", 2, " again."]},
+            ],
+        ),
+        # is_force_single_image keeps the first placeholder for the one image it passes.
+        (
+            True,
+            [{"role": "user", "content": f"{_P} and {_P}: which is red?"}],
+            [(84, 56), (56, 112)],
+            [{"role": "user", "content": [0, " and ", ": which is red?"]}],
+        ),
+    ],
+    ids=["in_place", "forced_single"],
+)
+def test_native_mistral_eval_renders_the_chat_with_its_images(
+    force_single, history, sizes, expected
+):
+    """The engine gets the ids mistral-common makes of the chat with its loaded images.
+
+    The images keep the original turn and image order; ``expected`` gives each image's index.
+    """
+    import base64
+    import io
+
+    from mistral_common.protocol.instruct.request import ChatCompletionRequest
+    from PIL import Image
+    from test_common.mistral_tekken import load_tekken
+
+    pytest.importorskip("cv2")  # mistral-common's image encoder resizes with OpenCV
+    tokenizer = load_tekken("v15")  # the bundled Tekken file has no image encoder
+    images = [Image.new("RGB", size) for size in sizes]
+
+    def image_url(image):
+        buffer = io.BytesIO()
+        image.save(buffer, "PNG")
+        return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+
+    def chunk(part):
+        if isinstance(part, str):
+            return {"type": "text", "text": part}
+        return {"type": "image_url", "image_url": {"url": image_url(images[part])}}
+
+    messages = [
+        {**m, "content": [chunk(p) for p in m["content"]]} if isinstance(m["content"], list) else m
+        for m in expected
+    ]
+    expected_ids = tokenizer.mistral.encode_chat_completion(
+        ChatCompletionRequest.from_openai(messages=messages, reasoning_effort="none")
+    ).tokens
+
+    wrapper = _make_multimodal_wrapper(model_type="mistral_common")
+    wrapper.llm.tokenizer = tokenizer
+    wrapper.is_force_single_image = force_single
+    wrapper.chat_template_kwargs = {"reasoning_effort": "none"}
+    future = MagicMock()
+    future.result.return_value.outputs = [MagicMock(text="A")]
+    wrapper.llm.generate_async.return_value = future
+    request = MagicMock()
+    request.args = (wrapper.apply_chat_template(history), {}, {"visual": images})
+    assert wrapper.generate_until([request], disable_tqdm=True) == ["A"]
+
+    submitted = wrapper.llm.generate_async.call_args.args[0]
+    assert submitted["prompt_token_ids"] == expected_ids and "prompt" not in submitted
+    assert len(submitted["multi_modal_data"]["image"]) == (1 if force_single else len(images))
+
+
+def test_native_mistral_eval_continues_a_gen_prefix():
+    """A gen_prefix ends the chat with the assistant turn the model continues."""
+    from mistral_common.protocol.instruct.request import ChatCompletionRequest
+    from test_common.mistral_tekken import load_tekken
+
+    tokenizer = load_tekken("bundled")
+    wrapper = _make_multimodal_wrapper(model_type="mistral_common")
+    wrapper.llm.tokenizer = tokenizer
+    wrapper.chat_template_kwargs = None
+    history = [
+        {"role": "user", "content": "Pick a color."},
+        {"role": "assistant", "content": "The color is"},
+    ]
+    deferred = wrapper.apply_chat_template(history, add_generation_prompt=False)
+    expected = tokenizer.mistral.encode_chat_completion(
+        ChatCompletionRequest.from_openai(messages=history, continue_final_message=True)
+    ).tokens
+    assert wrapper._render_native_mistral_chat(deferred, []) == expected
+
+
+def test_native_mistral_eval_puts_leftover_images_in_the_user_turn():
+    """Images past the last placeholder join the last user message.
+
+    mistral-common takes images in user messages only, so they cannot join an assistant
+    gen_prefix.
+    """
+    import base64
+    import io
+
+    from mistral_common.protocol.instruct.request import ChatCompletionRequest
+    from PIL import Image
+    from test_common.mistral_tekken import load_tekken
+
+    pytest.importorskip("cv2")  # mistral-common's image encoder resizes with OpenCV
+    tokenizer = load_tekken("v15")  # the bundled Tekken file has no image encoder
+    image = Image.new("RGB", (64, 48))
+    buffer = io.BytesIO()
+    image.save(buffer, "PNG")
+    url = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+    wrapper = _make_multimodal_wrapper(model_type="mistral_common")
+    wrapper.llm.tokenizer = tokenizer
+    wrapper.chat_template_kwargs = {"reasoning_effort": "none"}
+    history = [
+        {"role": "user", "content": "What is this?"},
+        {"role": "assistant", "content": "The answer is"},
+    ]
+    deferred = wrapper.apply_chat_template(history, add_generation_prompt=False)
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "What is this?"},
+                {"type": "image_url", "image_url": {"url": url}},
+            ],
+        },
+        history[1],
+    ]
+    expected = tokenizer.mistral.encode_chat_completion(
+        ChatCompletionRequest.from_openai(
+            messages=messages, continue_final_message=True, reasoning_effort="none"
+        )
+    ).tokens
+    assert wrapper._render_native_mistral_chat(deferred, [image]) == expected
+
+
+def test_the_multimodal_wrapper_reads_the_loaded_model_type(tmp_path):
+    """Without a model_type, the wrapper takes the type the input processor was loaded with.
+
+    The trtllm-eval MMMU commands pass none. A Mistral-native checkpoint then needs no
+    config.json, and its Hugging Face config.json does not make it an HF model.
+    """
+    import json
+    from types import SimpleNamespace
+
+    def model_type():
+        return MultimodalLmEvalWrapper(llm, sampling_params=None, streaming=False).model_type
+
+    llm = MagicMock()
+    llm._hf_model_dir = str(tmp_path)
+    llm.input_processor.config = SimpleNamespace(model_type="mistral_common")
+    assert model_type() == "mistral_common"
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "mistral3"}))
+    assert model_type() == "mistral_common"
+    # A processor without a configuration leaves the type to config.json.
+    llm.input_processor.config = None
+    assert model_type() == "mistral3"
+
+
+@pytest.mark.parametrize("prompt", [None, "[INST]Q[/INST]"])
+def test_dump_inference_results_keeps_token_id_prompts(tmp_path, prompt):
+    """A token-id prompt dumps the ids the engine received; a text prompt is re-encoded."""
+    import json
+    from types import SimpleNamespace
+
+    from tensorrt_llm.evaluate.interface import dump_inference_results
+
+    tokenizer = MagicMock()
+    tokenizer.decode.return_value = "[INST][IMG][IMG_END][/INST]"
+    tokenizer.encode.return_value = [7, 8]
+    result = SimpleNamespace(
+        prompt=prompt,
+        prompt_token_ids=[1, 3, 10, 13, 4],
+        outputs=[SimpleNamespace(token_ids=[99, 2], text="red")],
+    )
+    dump_inference_results(str(tmp_path), [result], tokenizer)
+    record = json.loads((tmp_path / "dumped_ids.json").read_text())
+    assert record["output_ids"] == [99, 2]
+    assert record["input_ids"] == ([1, 3, 10, 13, 4] if prompt is None else [7, 8])
+    if prompt is not None:
+        tokenizer.encode.assert_called_once_with(prompt)

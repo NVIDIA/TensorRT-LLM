@@ -1542,6 +1542,12 @@ class KvCacheCreator:
                 # pools. The draft manager never derives (see there).
                 kv_cache_config = kv_cache_config.model_copy(
                     update={"max_attention_window": derived_windows})
+        if (not is_draft and isinstance(manager_cls, type)
+                and issubclass(manager_cls, MambaHybridCacheManagerV2)
+                and self._model_engine is not None
+                and _uses_gdn_mtp_replay(self._model_engine.model)):
+            # Cost the GDN replay region of the state the manager will select.
+            extra_kwargs = dict(extra_kwargs, gdn_mtp_replay=True)
         cost = CacheCost.from_raw(
             manager_cls.get_cache_size_per_token(
                 model_config,
@@ -1751,23 +1757,23 @@ class KvCacheCreator:
         return None
 
     def _cal_max_memory(self, peak_memory, total_gpu_memory, fraction,
-                        allocated_bytes: int) -> int:
+                        allocated_bytes: int) -> tuple[int, int]:
         """
-        Calculate the max KV cache capacity.
+        Return available bytes before the fraction and the resulting KV budget.
 
         NOTE: `allocated_bytes` is the total KV-cache memory that must be pre-allocated during the estimation phase (for both the main and draft models) so the estimation run can complete successfully. When computing `available_kv_mem`, add this amount back in.
         """
         kv_size_per_token = self._get_kv_size_per_token()
 
-        available_kv_mem = (total_gpu_memory - peak_memory +
-                            allocated_bytes) * fraction
+        before_fraction = total_gpu_memory - peak_memory + allocated_bytes
+        available_kv_mem = before_fraction * fraction
         logger.info(
             f"Peak memory during memory usage profiling (torch + non-torch): {peak_memory / (GB):.2f} GiB, "
             f"available KV cache memory when calculating max tokens: {available_kv_mem / (GB):.2f} GiB, "
             f"fraction is set {fraction}, kv size per token is {kv_size_per_token}. device total memory {total_gpu_memory / (GB):.2f} GiB, "
             f"temporary kv cache memory during profiling {allocated_bytes / (GB):.2f} GiB"
         )
-        return int(available_kv_mem)
+        return before_fraction, int(available_kv_mem)
 
     def _get_mla_chunked_profile_length(self, input_seq_len: int) -> int | None:
         """Length needed to profile two full cached-KV chunks with a full query."""
@@ -2391,9 +2397,9 @@ class KvCacheCreator:
                 "the first penalized request.")
 
         # calculate max memory from peak memory and free gpu memory fraction
-        kv_cache_max_memory = self._cal_max_memory(peak_memory,
-                                                   total_gpu_memory, fraction,
-                                                   allocated_bytes)
+        before_fraction, fraction_budget = self._cal_max_memory(
+            peak_memory, total_gpu_memory, fraction, allocated_bytes)
+        kv_cache_max_memory = fraction_budget
         drafter_reserve = self._get_context_kv_only_drafter_reserve(fraction)
         if drafter_reserve > 0:
             budget_before = kv_cache_max_memory
@@ -2411,7 +2417,7 @@ class KvCacheCreator:
 
         # Memory taken out of the KV cache budget for workspaces the
         # profiling run does not allocate.
-        kv_budget_reserves = 0
+        indexer_reserve = 0
         if getattr(self._sparse_attention_config, "algorithm",
                    None) == "deepseek_v4":
             workspace_memory = get_indexer_mqa_logits_workspace_bytes(
@@ -2421,7 +2427,7 @@ class KvCacheCreator:
                 budget_before, workspace_memory)
             if workspace_reserve > 0:
                 kv_cache_max_memory = int(budget_before - workspace_reserve)
-                kv_budget_reserves += workspace_reserve
+                indexer_reserve = workspace_reserve
                 logger.info(
                     f"Reserving {workspace_reserve / (GB):.2f} GiB for the DeepSeek-V4 Indexer MQA "
                     f"logits workspace (workspace cap {workspace_memory / (GB):.2f} GiB): KV cache "
@@ -2535,7 +2541,6 @@ class KvCacheCreator:
         if w_bytes_per_token > 0 and kv_len_cap:
             if workspace_reserve > 0:
                 kv_cache_max_memory = int(budget_before - workspace_reserve)
-                kv_budget_reserves += workspace_reserve
                 floor_description = (
                     f", staging floor {min_workspace_tokens} tokens less "
                     f"{profiled_tokens} tokens already in the measured peak"
@@ -2565,14 +2570,7 @@ class KvCacheCreator:
                     f"{cap_at_floor} tokens and reserve "
                     f"{additional_reserve} additional bytes on this rank.")
 
-        # The memory monitor compares later usage against this plan, which
-        # needs a measured peak. The profiled peak still holds the temporary
-        # sizing KV pool, which the final KV cache replaces, so it is taken
-        # out of the non-KV peak; the workspace reserves are added to it.
-        if py_executor is not None and not self._skip_est:
-            monitor_startup.record_memory_plan(
-                peak_memory - allocated_bytes + kv_budget_reserves,
-                activation_bytes)
+        before_limits = kv_cache_max_memory
 
         # NOTE:
         # For KVCacheManager, KvCacheCreator currently controls capacity using two parameters in KVCacheConfig:
@@ -2627,6 +2625,26 @@ class KvCacheCreator:
         )
         # set max_gpu_total_bytes
         self._kv_cache_config.max_gpu_total_bytes = kv_cache_max_memory
+        if profiled:
+            budget = monitor_startup.KvSizingBudget(
+                device_total=total_gpu_memory,
+                torch_peak=torch_peak_memory,
+                outside_torch=extra_cost,
+                temporary_kv=allocated_bytes,
+                encoder=multimodal_encoder_memory_reserve,
+                attention=fixed_workspace_reserve,
+                penalty=penalty_workspace_reserve,
+                fraction=fraction,
+                before_fraction=before_fraction,
+                fraction_budget=fraction_budget,
+                before_limits=before_limits,
+                drafter=drafter_reserve,
+                indexer=indexer_reserve,
+                context_mla=budget_before - before_limits,
+                final_budget=kv_cache_max_memory,
+            )
+            monitor_startup.record_memory_plan(budget.non_kv_peak,
+                                               activation_bytes, budget)
         if isinstance(self._profiling_stage_data, dict):
             self._profiling_stage_data["activation_bytes"] = activation_bytes
         # ---------------------------handle max_gpu_total_bytes---------------------------------
@@ -4698,6 +4716,23 @@ def _mamba_conv_layout_kwargs(kv_cache_manager_cls: type,
     return {"model_type": model_type}
 
 
+def _uses_gdn_mtp_replay(model: torch.nn.Module) -> bool:
+    """Whether ``model``'s GDN layers can verify drafts with the GDN MTP replay kernels.
+
+    They must be the PyTorch GDN mixer, and none may verify with the fused
+    kernels into an FP8 out_proj input (gdn_verify_tcgen05 / trtllm::gdn_verify),
+    which keep the cached replay history.
+    """
+    from ..modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
+    layers = [
+        module for module in model.modules()
+        if isinstance(module, Qwen3NextGatedDeltaNet)
+    ]
+    return bool(layers) and not any(
+        layer.fused_verify and layer.norm.fp8_scale is not None
+        for layer in layers)
+
+
 def _create_kv_cache_manager(
         model_engine: Optional[ModelEngine],
         kv_cache_manager_cls,
@@ -5163,6 +5198,9 @@ def _create_kv_cache_manager(
             mamba_manager_extra_kwargs["gdn_fused_verify"] = any(
                 module.fused_verify for module in model_engine.model.modules()
                 if isinstance(module, Qwen3NextGatedDeltaNet))
+            if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
+                mamba_manager_extra_kwargs["gdn_mtp_replay"] = (
+                    _uses_gdn_mtp_replay(model_engine.model))
         if is_qwen4_exp(config) and issubclass(kv_cache_manager_cls,
                                                MambaHybridCacheManagerV2):
             mamba_manager_extra_kwargs.update(

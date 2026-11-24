@@ -41,6 +41,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
 from ...memory_buffer_utils import Buffers
 from ...metadata import KVCacheParams
+from ...pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from ...utils import get_global_attrs, get_model_extra_attrs, torch_multi_arange
 from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMetadata,
@@ -88,6 +89,11 @@ def _get_xqa_workspace(device: torch.device) -> torch.Tensor:
 @functools.cache
 def _xqa_block_offsets(width: int, device: int) -> torch.Tensor:
     return torch.arange(width, dtype=torch.int32, device=f"cuda:{device}")
+
+
+def _softmax_scale(head_dim: int, q_scaling: Optional[float]) -> float:
+    return 1.0 / (math.sqrt(head_dim) *
+                  (1.0 if q_scaling is None else q_scaling))
 
 
 def _get_attention_layer_indices(kv_cache_manager: Any) -> list[int]:
@@ -1324,6 +1330,12 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self._update_draft_kv_lengths()
 
     def __post_init__(self) -> None:
+        if (isinstance(self.kv_cache_manager, KVCacheManagerV2)
+                and self.kv_cache_manager.enable_swa_scratch_reuse):
+            raise ValueError(
+                "FlashInfer attention does not support SWA scratch reuse. "
+                "Set kv_cache_config.enable_swa_scratch_reuse=False or use "
+                "the TRTLLM attention backend.")
         super().__post_init__()
         self._post_init_with_buffers(self.cuda_graph_buffers)
 
@@ -2290,7 +2302,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
 
         sm_scale = None
         if q_scaling is not None:
-            sm_scale = 1 / (math.sqrt(head_dim) * q_scaling)
+            sm_scale = _softmax_scale(head_dim, q_scaling)
 
         # FlashInfer decode accepts one q_len_per_req. Current paths keep generation widths
         # uniform (including padded speculative drafts); guard against malformed metadata or
@@ -2643,6 +2655,21 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
             self.qk_nope_head_dim = mla_params.qk_nope_head_dim
             self.v_head_dim = mla_params.v_head_dim
 
+    def supports_variable_window(self, metadata: AttentionMetadata) -> bool:
+        """Triton pads head dimensions to powers of two (dot requires at least 16).
+
+        Grouped-query indexing requires an integral number of query heads per KV head.
+        """
+        return (self.flashinfer_backend in ("fa2", "fa3")
+                and isinstance(metadata, FlashInferAttentionMetadata)
+                and metadata.kv_cache_manager is not None
+                and metadata.num_contexts > 0 and not self.has_fp8_kv_cache and
+                not (metadata.num_generations > 0 and
+                     metadata.uses_xqa_target_decode(self.flashinfer_backend))
+                and not self.is_mla_enable and self.head_dim >= 16
+                and self.num_heads > 0 and self.num_kv_heads > 0
+                and self.num_heads % self.num_kv_heads == 0)
+
     def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
         self.quant_config = new_quant_config
         self.has_fp8_kv_cache = False
@@ -2740,7 +2767,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
 
         sm_scale = None
         if self.q_scaling is not None:
-            sm_scale = 1 / (math.sqrt(qk_head_dim) * self.q_scaling)
+            sm_scale = _softmax_scale(qk_head_dim, self.q_scaling)
 
         ragged_params = RaggedPlanParams(
             num_heads=self.num_heads,
@@ -2808,10 +2835,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
 
         # sm_scale is based on qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
         qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
-        if self.q_scaling is not None:
-            sm_scale = 1.0 / (self.q_scaling * math.sqrt(qk_head_dim))
-        else:
-            sm_scale = 1.0 / math.sqrt(qk_head_dim)
+        sm_scale = _softmax_scale(qk_head_dim, self.q_scaling)
 
         plan_params = MLAPlanParams(
             num_heads=self.num_heads,
@@ -2872,10 +2896,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         q_pe = q_3d[..., self.kv_lora_rank:]
 
         qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
-        if self.q_scaling is not None:
-            sm_scale = 1.0 / (self.q_scaling * math.sqrt(qk_head_dim))
-        else:
-            sm_scale = 1.0 / math.sqrt(qk_head_dim)
+        sm_scale = _softmax_scale(qk_head_dim, self.q_scaling)
 
         plan_params = MLAPlanParams(
             num_heads=self.num_heads,
@@ -2916,7 +2937,23 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         latent_cache: Optional[torch.Tensor] = None,
         attention_input_type: AttentionInputType = AttentionInputType.mixed,
         xqa_out_scale: float = 1.0,
+        variable_window_token_starts: Optional[torch.Tensor] = None,
+        variable_window_token_ends: Optional[torch.Tensor] = None,
     ) -> None:
+        has_variable_window = variable_window_token_starts is not None
+        if has_variable_window != (variable_window_token_ends is not None):
+            raise ValueError(
+                "Variable-window starts and ends must be provided together")
+        if has_variable_window:
+            if not self.supports_variable_window(
+                    metadata) or k is None or v is None:
+                raise ValueError(
+                    "Variable windows require fa2/fa3 paged GQA prefill without FP8 KV"
+                )
+            if attention_mask_data is not None:
+                raise ValueError(
+                    "Variable windows and dense masks are mutually exclusive")
+
         # MLA dispatch
         if self.is_mla_enable:
             if latent_cache is not None and k is not None and v is not None:
@@ -3091,10 +3128,12 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         # (bidirectional) attention masks for head_dim>256 layers.  Use a
         # Triton prefill kernel for those layers during multimodal prefill,
         # while keeping FlashInfer for decode and all other cases.
+        # Per-query variable windows also use Triton to avoid dense mask materialization.
         # KV-shared layers (k is None) keep the causal fallback below.
-        use_triton_prefill = (self.flashinfer_backend == "trtllm-gen"
-                              and attention_mask_data is not None
-                              and num_contexts > 0 and k is not None)
+        use_triton_prefill = (has_variable_window
+                              or (self.flashinfer_backend == "trtllm-gen"
+                                  and attention_mask_data is not None
+                                  and num_contexts > 0 and k is not None))
 
         if use_triton_prefill:
             from .triton_prefill import triton_prefill_with_custom_mask
@@ -3106,6 +3145,11 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
             window_left = (attention_window_size
                            if attention_window_size is not None else -1)
 
+            # Triton indexes cached K/V as HND. Transpose only its view;
+            # FlashInfer append/decode retain the metadata's original layout.
+            triton_kv_cache = (kv_cache.transpose(2, 3)
+                               if metadata.kv_layout == "NHD" else kv_cache)
+
             triton_prefill_with_custom_mask(
                 q=q[:num_ctx_tokens],
                 k=k[:num_ctx_tokens],
@@ -3113,7 +3157,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 output=output[:num_ctx_tokens].view(-1, self.num_heads,
                                                     self.head_dim),
                 qo_indptr=metadata.qo_indptr[:num_contexts + 1],
-                kv_cache=kv_cache,
+                kv_cache=triton_kv_cache,
                 prefix_lens=prefix_lens,
                 page_table_indptr=metadata.
                 paged_kv_indptr_prefill[:num_contexts + 1],
@@ -3121,11 +3165,16 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 _paged_kv_indices[:metadata.num_context_blocks],
                 page_size=metadata.page_size,
                 custom_mask=attention_mask_data,
-                sm_scale=1 / (math.sqrt(self.head_dim) * self.q_scaling),
+                variable_window_token_starts=variable_window_token_starts,
+                variable_window_token_ends=variable_window_token_ends,
+                max_len_extend=int(metadata.seq_lens[:num_contexts].max()),
+                sm_scale=_softmax_scale(self.head_dim, self.q_scaling),
                 window_left=window_left,
             )
 
             if num_generations > 0:
+                # Custom masks and per-query bounds apply only to prefill.
+                # Generation tokens use the layer's causal sliding window.
                 decode_plan_params = metadata.plan(
                     self.num_heads,
                     self.num_kv_heads,
@@ -3133,7 +3182,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                     q_dtype=q.dtype,
                     kv_dtype=kv_cache.dtype,
                     q_scaling=self.q_scaling,
-                    attention_window_size=None,
+                    attention_window_size=attention_window_size,
                     attention_mask_type=int(AttentionMaskType.causal),
                     attention_mask_data=None,
                     flashinfer_backend=self.flashinfer_backend)
@@ -3374,6 +3423,10 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 attention_input_type=forward_args.attention_input_type,
                 xqa_out_scale=(xqa_out_scale
                                if xqa_out_scale is not None else 1.0),
+                variable_window_token_starts=forward_args.
+                variable_window_token_starts,
+                variable_window_token_ends=forward_args.
+                variable_window_token_ends,
             )
         except RuntimeError as exc:
             # Report the TRTLLM-convention (exclusive) window, not the
