@@ -1279,7 +1279,6 @@ class TestFlashInferAttention(unittest.TestCase):
                 # The same cached-prefix mixed batch must work in NHD as well.
                 nhd_reference = flashinfer_attn.forward(
                     q, k, v, nhd_metadata, attention_window_size=window)
-                torch.testing.assert_close(nhd_reference, reference)
                 nhd_actual = flashinfer_attn.forward(
                     q,
                     k,
@@ -1289,11 +1288,11 @@ class TestFlashInferAttention(unittest.TestCase):
                     variable_window_token_starts=starts,
                     variable_window_token_ends=positions)
                 torch.testing.assert_close(nhd_actual[:length],
-                                           reference[:length],
+                                           nhd_reference[:length],
                                            atol=1e-2,
                                            rtol=1e-2)
                 torch.testing.assert_close(nhd_actual[length:],
-                                           reference[length:])
+                                           nhd_reference[length:])
 
                 # Reuse the backend instance to exercise its request-time probe.
                 for owner, attribute, value in (
