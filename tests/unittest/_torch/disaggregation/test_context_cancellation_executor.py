@@ -113,6 +113,7 @@ def _executor(dist: FakeDistRank | None = None) -> PyExecutor:
     engine.kv_cache_transceiver = Mock()
     engine._disagg_coordinator = Mock(
         spec=[
+            "logical_context_cancellation_enabled",
             "supports_logical_context_cancellation",
             "request_logical_context_cancellation",
             "has_retiring_gen_receives",
@@ -123,6 +124,7 @@ def _executor(dist: FakeDistRank | None = None) -> PyExecutor:
             "requires_gen_cancellation_consensus",
         ]
     )
+    engine.disagg.logical_context_cancellation_enabled = True
     engine.disagg.supports_logical_context_cancellation.return_value = True
     engine.disagg.request_logical_context_cancellation.return_value = True
     engine.disagg.has_retiring_gen_receives = False
