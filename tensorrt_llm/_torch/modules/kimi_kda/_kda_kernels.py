@@ -347,7 +347,13 @@ def record_kda_replay_acceptance(
         )
 
 
-@triton.jit(do_not_specialize=["num_requests"])
+# The slot vectors are the generation rows of whole-batch tensors, sliced from
+# row ``num_contexts``, so their alignment follows the batch, as
+# ``num_requests`` does; neither is part of the compile key.
+@triton.jit(
+    do_not_specialize=["num_requests"],
+    do_not_specialize_on_alignment=["state_indices_ptr", "replay_indices_ptr"],
+)
 def _build_kda_mtp_replay_work_items_kernel(
     work_items_ptr,
     state_indices_ptr,
