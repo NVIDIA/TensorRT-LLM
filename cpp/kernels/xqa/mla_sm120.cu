@@ -756,6 +756,15 @@ private:
             uint32_t const idxBuf = regQPartShmBeg + idxPart;
             regQ[idxPart] = loadPart(loadRegQCol, smem.q[idxBuf]);
         }
+        asm volatile(
+#if defined(__CUDACC_VER_MAJOR__)                                                                                      \
+    && (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
+            "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+#else
+            "fence.proxy.async.shared::cta;"
+#endif
+            ::
+                : "memory");
         smem.regQBar.consumed.arrive();
 #endif
 // main loop
@@ -850,6 +859,15 @@ private:
                     if (idxInstKPrefetch == partNbInstK - 1)
                     {
                         assert(prefetch);
+                        asm volatile(
+#if defined(__CUDACC_VER_MAJOR__)                                                                                      \
+    && (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
+                            "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+#else
+                            "fence.proxy.async.shared::cta;"
+#endif
+                            ::
+                                : "memory");
                         kBarWaiter.consumed();
                     }
                 }
@@ -913,6 +931,15 @@ private:
                     if (idxInstKPrefetch == partNbInstK - 1)
                     {
                         assert(prefetch);
+                        asm volatile(
+#if defined(__CUDACC_VER_MAJOR__)                                                                                      \
+    && (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
+                            "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+#else
+                            "fence.proxy.async.shared::cta;"
+#endif
+                            ::
+                                : "memory");
                         kBarWaiter.consumed();
                         if (idxPartPrefetch == nbKParts - 1)
                         {
@@ -1441,6 +1468,15 @@ __device__ inline void Consumer::compute()
         }
         else
         {
+            asm volatile(
+#if defined(__CUDACC_VER_MAJOR__)                                                                                      \
+    && (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
+                "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+#else
+                "fence.proxy.async.shared::cta;"
+#endif
+                ::
+                    : "memory");
             xBar.consumed.arrive();
             vBar.consumed.arrive();
         }
@@ -1729,6 +1765,15 @@ __device__ inline void mergePartialOutputs(uint32_t& semaphore, Vec<OutputHead, 
         RowWise accRowSum;
         RegChunk chunk;
         loadBuf(accRowMaxLog2e, accRowSum, chunk, shmBufs[idxBufInit]);
+        asm volatile(
+#if defined(__CUDACC_VER_MAJOR__)                                                                                      \
+    && (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
+            "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+#else
+            "fence.proxy.async.shared::cta;"
+#endif
+            ::
+                : "memory");
         bars[idxBufInit].consumed.arrive();
 
         using Acc = Array2D<Vec<float, grainOutElems>, rowsPerWarp, regGrainsPerRow>;
@@ -1752,6 +1797,15 @@ __device__ inline void mergePartialOutputs(uint32_t& semaphore, Vec<OutputHead, 
             RowWise chunkRowMaxLog2e;
             RowWise chunkRowSum;
             loadBuf(chunkRowMaxLog2e, chunkRowSum, chunk, shmBufs[idxBuf]);
+            asm volatile(
+#if defined(__CUDACC_VER_MAJOR__)                                                                                      \
+    && (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
+                "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+#else
+                "fence.proxy.async.shared::cta;"
+#endif
+                ::
+                    : "memory");
             bar.consumed.arrive();
 #pragma unroll
             for (uint32_t i = 0; i < rowsPerWarp; i++)
