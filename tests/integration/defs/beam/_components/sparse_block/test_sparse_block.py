@@ -77,9 +77,9 @@ from beam._components.sparse_block import block as block_module  # noqa: E501
 from beam._components.sparse_block.block import BeamSparseBlockBf16Sm103Tp1  # noqa: E501
 
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
-from tensorrt_llm._torch.modeling_v2.catalog.attention.thop_attention import thop_attention
 from tensorrt_llm._torch.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
 from tensorrt_llm._torch.modeling_v2.catalog.norm.flashinfer_rmsnorm import flashinfer_rmsnorm
+from tensorrt_llm._torch.modeling_v2.models.beam import _attention
 from tensorrt_llm._torch.modeling_v2.models.beam.ops.activation.swiglu_fp32 import (
     swiglu_fp32,  # noqa: E501
 )
@@ -186,7 +186,6 @@ EXPECTED_CALLS = (
     "FlashinferRmsnorm",
     "FlashinferRmsnorm",
     "BeamNeoxRope",
-    "ThopAttention",
     "BeamOutputGate",
     "CublasMm",
     "FlashinferRmsnorm",
@@ -205,7 +204,6 @@ OPS = (
     flashinfer_rmsnorm,
     cublas_mm,
     beam_neox_rope,
-    thop_attention,
     beam_output_gate,
     beam_depth_residual,
     beam_grouped_topk_router,
@@ -772,7 +770,7 @@ def test_rejects_unsupported_inputs_before_dispatch(case) -> None:
             blk(x, positions, md)
 
 
-def test_cache_slot_is_the_managers_local_index(record_property, ieee_fp32) -> None:
+def test_cache_slot_is_the_managers_local_index(record_property, ieee_fp32, monkeypatch) -> None:
     """Logical layer 3 lives in slot 0 of a manager whose layer mask selects it alone: the
     attention op is called with local index 0, and the K and V it appended are read back
     through the manager under the logical index 3."""
@@ -788,25 +786,24 @@ def test_cache_slot_is_the_managers_local_index(record_property, ieee_fp32) -> N
             "layer_offsets": dict(mgr.layer_offsets),
             "num_local_layers": mgr.num_local_layers,
         }
-        step = blk.step_args(md)
-        with recording(thop_attention) as calls:
-            out = blk(x, positions, md)
-            torch.cuda.synchronize()
+        calls = support.attention_core_calls(monkeypatch)
+        out = blk(x, positions, md)
+        torch.cuda.synchronize()
         keys, values = cache_rows(md, length)
     record_property(
         f"cache-slot-seed{seed}-T{length}",
         {
             "test": "test_cache_slot_is_the_managers_local_index",
             "layout": layout,
-            "step_local_layer_idx": step["local_layer_idx"],
-            "op_calls": loggable(calls),
+            "attention_core_calls": [
+                {k: v for k, v in call.items() if k != "qkv"} for call in calls
+            ],
             "execution_state": _execution_state(ieee_fp32),
         },
     )
     assert isinstance(mgr, KVCacheManagerV2)
     assert layout["num_layers"] == NUM_LAYERS and layout["pp_layers"] == [LAYER_IDX]
     assert layout["layer_offsets"] == {LAYER_IDX: 0} and layout["num_local_layers"] == 1
-    assert step["local_layer_idx"] == 0
     (call,) = calls
     assert {
         k: call[k]
@@ -816,8 +813,6 @@ def test_cache_slot_is_the_managers_local_index(record_property, ieee_fp32) -> N
             "num_kv_heads",
             "head_size",
             "attention_window_size",
-            "mask_type",
-            "is_fused_qkv",
         )
     } == {
         "local_layer_idx": 0,
@@ -825,8 +820,6 @@ def test_cache_slot_is_the_managers_local_index(record_property, ieee_fp32) -> N
         "num_kv_heads": 8,
         "head_size": 128,
         "attention_window_size": 512,
-        "mask_type": 1,
-        "is_fused_qkv": True,
     }
     assert call["q_shape"] == [length, (48 + 2 * 8) * 128]
     assert out.shape == (1, length, 5120) and bool(torch.isfinite(out).all())
@@ -837,7 +830,7 @@ def test_cache_slot_is_the_managers_local_index(record_property, ieee_fp32) -> N
     assert torch.equal(keys, k_in) and torch.equal(values, v_in)
 
 
-def test_cache_slot_in_a_manager_holding_two_layers(ieee_fp32) -> None:
+def test_cache_slot_in_a_manager_holding_two_layers(ieee_fp32, monkeypatch) -> None:
     """In a manager that holds logical layers 2 and 3, layer 3 is local slot 1: the attention
     op is called with that slot, the K and V are appended there, and the block output is
     bitwise the output on a manager holding layer 3 alone."""
@@ -850,10 +843,10 @@ def test_cache_slot_in_a_manager_holding_two_layers(ieee_fp32) -> None:
         length, num_layers=2, layer_mask=[i in (2, 3) for i in range(NUM_LAYERS)]
     ) as md:
         assert dict(md.kv_cache_manager.layer_offsets) == {2: 0, 3: 1}
-        assert blk.step_args(md)["local_layer_idx"] == 1
-        with recording(thop_attention) as calls:
-            out = blk(x, positions, md)
-            torch.cuda.synchronize()
+        assert _attention.local_layer_index(md, LAYER_IDX) == 1
+        calls = support.attention_core_calls(monkeypatch)
+        out = blk(x, positions, md)
+        torch.cuda.synchronize()
         keys, values = cache_rows(md, length)
     (call,) = calls
     assert call["local_layer_idx"] == 1
@@ -899,14 +892,15 @@ def test_block_matches_reference(record_property, seed, length, ieee_fp32) -> No
 # -------------------------------------------------- tests: the component path
 
 
-def test_forward_runs_the_component_path(record_property, ieee_fp32) -> None:
+def test_forward_runs_the_component_path(record_property, ieee_fp32, monkeypatch) -> None:
     """One case: the component's own composition ran, op by op, with the experts' calls
-    nested inside BeamDispatchCombine, through thop attention on this GPU, with no SDPA, no
+    nested inside BeamDispatchCombine, through the FMHA libraries on this GPU, with no SDPA, no
     built-in Beam module and every op's guard admitting its arguments."""
     seed, length = 17, 17
     blk = loaded_block(seed)
     x, positions = case_inputs(seed, length)
     activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+    core_calls = support.attention_core_calls(monkeypatch)
     with fresh_context(length) as md:
         with builtin_beam_forbidden(), validating(*OPS), recording(*OPS, experts=True) as calls:
             with torch.profiler.profile(activities=activities) as prof:
@@ -957,10 +951,8 @@ def test_forward_runs_the_component_path(record_property, ieee_fp32) -> None:
     assert [c["expert_id"] for c in nested if c["op"] == "expert"] == selected
     assert sum(c["rows"].shape[0] for c in nested if c["op"] == "expert") == 8 * length
     assert inner == len(EXPERT_CALLS) * len(selected)
-    (call,) = [c for c in calls if c["op"] == "ThopAttention"]
-    assert call["local_layer_idx"] == 0 and call["num_contexts"] == 1
-    assert call["num_ctx_tokens"] == length and call["use_paged_context_fmha"] is False
-    assert call["quant_mode"] == 0 and call["position_embedding_type"] == 0
+    (call,) = core_calls
+    assert call["local_layer_idx"] == 0 and call["q_shape"] == [length, (48 + 2 * 8) * 128]
     assert isinstance(manager, KVCacheManagerV2)
     assert record["attention_kernels"], "no attention kernel ran on the GPU"
     assert not record["sdpa_cpu_ops"], record["sdpa_cpu_ops"]

@@ -97,8 +97,9 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from tensorrt_llm._ipc_utils import can_access_peer
-from tensorrt_llm._torch.attention.backends.fmha.phased import get_spec_decoding_position_offsets
-from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
+from tensorrt_llm._torch.attention.backends.attention_layer import AttentionLayer
+from tensorrt_llm._torch.attention.backends.fmha.manager import FmhaManager
+from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArgs, AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.distributed.allreduce_helper import CustomAllReduceHelper
 from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
@@ -113,7 +114,6 @@ from tensorrt_llm._torch.modeling_v2.catalog.attention.fused_qk_norm_rope import
 from tensorrt_llm._torch.modeling_v2.catalog.attention.thop_attention import (
     QM_FP8_KV_CACHE,
     QM_NVFP4_KV_CACHE,
-    thop_attention,
 )
 from tensorrt_llm._torch.modeling_v2.catalog.comm.allgather import allgather
 from tensorrt_llm._torch.modeling_v2.catalog.comm.allreduce import allreduce, allreduce_group_args
@@ -256,6 +256,7 @@ from tensorrt_llm._torch.utils import is_gdn_flashinfer_replay_enabled, is_gdn_r
 from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
 from tensorrt_llm.logger import logger
+from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 if TYPE_CHECKING:
@@ -419,59 +420,6 @@ _MAMBA_FIELDS = (
     "has_initial_states",
     "query_start_loc",
     "query_start_loc_long",
-)
-
-# thop_attention's constant arguments: in-kernel RoPE off (the rope runs before the op),
-# causal mask, no MLA, sparse or cross surface.
-_CALL_CONSTANTS = dict(
-    output_sf=None,
-    k=None,
-    v=None,
-    is_fused_qkv=True,
-    update_kv_cache=True,
-    attention_input_type=0,
-    is_mla_enable=False,
-    mask_type=1,
-    q_scaling=1.0,
-    attention_sinks=None,
-    position_embedding_type=0,
-    rotary_inv_freq=None,
-    rotary_cos_sin=None,
-    rope_dim=0,
-    rope_base=10000.0,
-    rope_scale_type=0,
-    rope_scale=1.0,
-    rope_short_m_scale=1.0,
-    rope_long_m_scale=1.0,
-    rope_max_positions=1024,
-    rope_original_max_positions=1024,
-    out_scale=None,
-    latent_cache=None,
-    q_pe=None,
-    q_lora_rank=None,
-    kv_lora_rank=None,
-    qk_nope_head_dim=None,
-    qk_rope_head_dim=None,
-    v_head_dim=None,
-    rope_append=None,
-    chunked_prefill_buffer_batch_size=1,
-    attention_chunk_size=None,
-    softmax_stats_tensor=None,
-    sparse_kv_indices=None,
-    sparse_kv_offsets=None,
-    sparse_attn_indices=None,
-    sparse_attn_offsets=None,
-    sparse_attn_indices_block_size=0,
-    mrope_rotary_cos_sin=None,
-    mrope_position_deltas=None,
-    helix_position_offsets=None,
-    helix_is_inactive_rank=None,
-    cross_kv=None,
-    relative_attention_bias=None,
-    relative_attention_max_distance=0,
-    kv_norm_weight=None,
-    kv_norm_eps=1e-6,
-    skip_correction_threshold=0.0,
 )
 
 _ROUTING_METHOD_RENORM = 1
@@ -1104,6 +1052,9 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
         # KV scales: fp32 [1] ones (fp8 pool), fp32 [3] ones for q, K, V (NVFP4), None (bf16).
         self.kv_scale_orig_quant: torch.Tensor | None = None
         self.kv_scale_quant_orig: torch.Tensor | None = None
+        # Per global attention layer, the MTP layer included: its attention layer and FMHA
+        # manager for the dense path.
+        self._attn: dict[int, tuple[AttentionLayer, FmhaManager]] = {}
         # Streams are made after load: one created inside a graph capture is not capturable.
         self._side_stream: torch.cuda.Stream | None = None
         self._decode_stream: torch.cuda.Stream | None = None
@@ -1265,6 +1216,14 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
             scales = 3 if self.quant_mode == QM_NVFP4_KV_CACHE else 1
             self.kv_scale_quant_orig = torch.ones(scales, dtype=torch.float32, device=device)
             self.kv_scale_orig_quant = 1.0 / self.kv_scale_quant_orig
+        if device.type == "cuda":
+            self._attn = {
+                layer_idx: self._attention_layer(layer_idx)
+                for layer_idx in (
+                    *self.attn_layers,
+                    *((self.mtp_layer_idx,) if self.mtp_enabled else ()),
+                )
+            }
         # The CPU-only load checks build the targets over host weights; they launch nothing.
         if device.type == "cuda":
             hc_tc_first_precompile(self.stream, self.hc_lowrank, self.hc_count, device)
@@ -1424,6 +1383,52 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
         if min(counts) == max(counts):
             return None
         return _DpPadding(counts)
+
+    def _attention_layer(self, layer_idx: int) -> tuple[AttentionLayer, FmhaManager]:
+        """Global layer `layer_idx`'s dense attention: packed-QKV causal GQA at this rank's heads
+        over the step's pool, rope applied before the call."""
+        layer = AttentionLayer(
+            layer_idx=layer_idx,
+            num_heads=self.heads_q,
+            head_dim=self.head_dim,
+            num_kv_heads=self.heads_kv,
+            quant_config=QuantConfig(kv_cache_quant_algo=self.kv_cache_quant_algo),
+        )
+        return layer, FmhaManager(layer)
+
+    def attention(
+        self,
+        layer_idx: int,
+        local_layer_idx: int,
+        qkv: torch.Tensor,
+        output: torch.Tensor,
+        md: TrtllmAttentionMetadata,
+        predicted_tokens_per_seq: int,
+    ) -> torch.Tensor:
+        """Append the step's packed `[q | k | v]` rows to pool row `local_layer_idx` and attend
+        causally over the full admitted length into `output`, for global layer `layer_idx`."""
+        layer, fmha_manager = self._attn[layer_idx]
+        layer.local_layer_idx = local_layer_idx
+        layer.predicted_tokens_per_seq = predicted_tokens_per_seq
+        if self.quant_mode == QM_NVFP4_KV_CACHE:
+            # An NVFP4 pool's context kernels exist on the paged-context path alone.
+            md.use_paged_context_fmha = True
+        fwd = AttentionForwardArgs(
+            output=output,
+            kv_scale_orig_quant=self.kv_scale_orig_quant,
+            kv_scale_quant_orig=self.kv_scale_quant_orig,
+            cu_q_seqlens=md.cu_q_seqlens,
+            cu_kv_seqlens=md.cu_kv_seqlens,
+            attention_window_size=md.max_seq_len,
+            is_fused_qkv=True,
+        )
+        fmha = fmha_manager.select(layer, qkv, None, None, md, fwd)
+        if fmha is None:
+            raise RuntimeError("No FMHA library supports this qwen4_exp attention call.")
+        if md.is_cuda_graph or not fmha.supports_workspace_reclamation:
+            md.workspace_reclaimable = False
+        fmha.forward(qkv, None, None, md, fwd)
+        return output
 
     def _index_rope_table(self, theta: float, device) -> torch.Tensor:
         """Index rope table at `theta`: `[max_positions, 2 * rotary_pairs]` fp32, cos then sin."""
@@ -4025,52 +4030,15 @@ def _copy_positions(position_ids: torch.Tensor) -> torch.Tensor:
     return pos3
 
 
-def _step_args(md: TrtllmAttentionMetadata, num_contexts, num_ctx_tokens, paged_context) -> dict:
-    """thop_attention's batch state off the prepared metadata.
-
-    Tensors are engine-owned buffers refreshed in place; ints are per-capture constants.
-    `paged_context` forces the paged-context path the engine enables only for chunked prefill
-    or KV cache block reuse: an NVFP4 pool's context kernels exist on it alone."""
+def _step_args(md: TrtllmAttentionMetadata, num_contexts: int, num_ctx_tokens: int) -> dict:
+    """What the step's dense attention calls read beside the layer: the prepared metadata, the
+    step's context requests and tokens, and the rows of each generation sequence, which the
+    step's builder states (1 until it knows the verify width)."""
     return dict(
-        sequence_length=md.kv_lens_cuda_runtime,
-        host_past_key_value_lengths=md.kv_lens_runtime,
-        host_total_kv_lens=md.host_total_kv_lens,
-        context_lengths=md.prompt_lens_cuda_runtime,
-        host_context_lengths=md.prompt_lens_cpu_runtime,
-        host_request_types=md.host_request_types_runtime,
-        kv_cache_block_offsets=md.kv_cache_block_offsets,
-        host_kv_cache_pool_pointers=md.host_kv_cache_pool_pointers,
-        host_kv_cache_pool_mapping=md.host_kv_cache_pool_mapping,
-        workspace=md.effective_workspace,
-        tokens_per_block=md.tokens_per_block,
-        max_num_requests=md.max_num_requests,
-        max_context_length=md.max_context_length,
-        max_seq_len=md.max_seq_len,
-        attention_window_size=md.max_seq_len,
+        md=md,
         num_contexts=num_contexts,
         num_ctx_tokens=num_ctx_tokens,
-        trtllm_gen_jit_warmup=md.trtllm_gen_jit_warmup,
-        use_paged_context_fmha=md.use_paged_context_fmha or paged_context,
-        beam_width=md.effective_beam_width,
-        cache_indirection=md.cache_indirection,
-        block_ids_per_seq=md.block_ids_per_seq,
-        max_context_q_len_override=md.max_context_q_len_override,
-        is_cross=md.is_cross,
-        is_spec_decoding_enabled=md.is_spec_decoding_enabled,
-        use_spec_decoding=md.use_spec_decoding,
-        is_spec_dec_tree=md.is_spec_dec_tree,
-        spec_decoding_generation_lengths=md.spec_decoding_generation_lengths,
-        spec_decoding_position_offsets=get_spec_decoding_position_offsets(md),
-        spec_decoding_packed_mask=md.spec_decoding_packed_mask,
-        spec_decoding_bl_tree_mask_offset=md.spec_decoding_bl_tree_mask_offset,
-        spec_decoding_bl_tree_mask=md.spec_decoding_bl_tree_mask,
-        spec_decoding_target_max_draft_tokens=md.max_total_draft_tokens,
-        spec_bl_tree_first_sparse_mask_offset_kv=md.spec_bl_tree_first_sparse_mask_offset_kv,
-        num_sparse_topk=md.num_sparse_topk,
-        flash_mla_tile_scheduler_metadata=md.flash_mla_tile_scheduler_metadata,
-        flash_mla_num_splits=md.flash_mla_num_splits,
-        max_num_sequences=md.max_num_sequences,
-        force_prepare_spec_dec_tree_mask=md.force_prepare_spec_dec_tree_mask,
+        predicted_tokens_per_seq=1,
     )
 
 
@@ -4158,9 +4126,9 @@ class PrefillTarget:
 
     def __init__(self, core: Qwen4ExpUnifiedModelingV2) -> None:
         self.core = core
-        self._contract_pending = step_contract_enabled()
+        self._validate = step_contract_enabled()
         # Dropped once it has reported.
-        self._kv_probe = _KvRangeProbe.for_target(core, self._contract_pending)
+        self._kv_probe = _KvRangeProbe.for_target(core, self._validate)
         self._layers = _layer_views(core)
         self._stack = _stack_views(core)
         self._step: _PrefillStep | None = None
@@ -4350,21 +4318,9 @@ class PrefillTarget:
         ce = getattr(self, "_ce_exchange", None)
         return pipeline if ce is None else pipeline + (ce,)
 
-    def _check_step_contract(self, md) -> None:
-        """Opt-in first-forward check: surfaces an upstream metadata rename before the forward."""
-        if not self._contract_pending:
-            return
-        try:
-            self.step_args(md)
-        except AttributeError as exc:
-            raise AssertionError(f"attention metadata surface drifted: {exc}") from exc
-        self._contract_pending = False
-
     def step_args(self, md: TrtllmAttentionMetadata) -> dict:
-        """Project the prepared metadata onto thop_attention's batch state."""
-        return _step_args(
-            md, md.num_contexts, md.num_ctx_tokens, self.core.quant_mode == QM_NVFP4_KV_CACHE
-        )
+        """The step's dense attention arguments (`_step_args`)."""
+        return _step_args(md, md.num_contexts, md.num_ctx_tokens)
 
     # --------------------------------------------------------------- blocks ---
 
@@ -4625,18 +4581,13 @@ class PrefillTarget:
                 )
                 attn_out[lo:hi].copy_(torch.reshape(out, [hi - lo, core.q_width]))
         else:
-            thop_attention(
-                q=qkv,
-                output=attn_out[:num_tokens],
-                local_layer_idx=core._bound.pools.pool_idx[i],
-                num_heads=core.heads_q,
-                num_kv_heads=core.heads_kv,
-                head_size=core.head_dim,
-                quant_mode=core.quant_mode,
-                kv_scale_orig_quant=core.kv_scale_orig_quant,
-                kv_scale_quant_orig=core.kv_scale_quant_orig,
-                **step.attn,
-                **_CALL_CONSTANTS,
+            core.attention(
+                i,
+                core._bound.pools.pool_idx[i],
+                qkv,
+                attn_out[:num_tokens],
+                step.attn["md"],
+                step.attn["predicted_tokens_per_seq"],
             )
         attn_out[num_tokens:].zero_()
 
@@ -5122,7 +5073,6 @@ class PrefillTarget:
         breakable prefill graph replay this and the breaks are all of this target that runs."""
         core = self.core
         md = attn_metadata
-        self._check_step_contract(md)
         attn_args = self.step_args(md)
         mm = md.mamba_metadata
 
@@ -5709,18 +5659,13 @@ class PrefillTarget:
                 )
                 attn[lo:hi].copy_(torch.reshape(out, [hi - lo, core.q_width]))
         else:
-            attn = thop_attention(
-                q=qkv,
-                output=torch.empty([rows, core.q_width], dtype=qkv.dtype, device=qkv.device),
-                local_layer_idx=layer_idx,
-                num_heads=core.heads_q,
-                num_kv_heads=core.heads_kv,
-                head_size=core.head_dim,
-                quant_mode=core.quant_mode,
-                kv_scale_orig_quant=core.kv_scale_orig_quant,
-                kv_scale_quant_orig=core.kv_scale_quant_orig,
-                **step,
-                **_CALL_CONSTANTS,
+            attn = core.attention(
+                core.mtp_layer_idx,
+                layer_idx,
+                qkv,
+                torch.empty([rows, core.q_width], dtype=qkv.dtype, device=qkv.device),
+                step["md"],
+                step["predicted_tokens_per_seq"],
             )
         fused_sigmoid_mul_inplace(attn, gate, direct_launch=True)
         out = _mtp_tail(core, M, x, attn, inject, pad_rows)
@@ -5760,31 +5705,17 @@ class DecodeTarget:
 
     def __init__(self, core: Qwen4ExpUnifiedModelingV2) -> None:
         self.core = core
-        self._contract_pending = step_contract_enabled()
+        self._validate = step_contract_enabled()
         # Dropped once it has reported.
-        self._kv_probe = _KvRangeProbe.for_target(core, self._contract_pending)
+        self._kv_probe = _KvRangeProbe.for_target(core, self._validate)
         self._layers = _layer_views(core)
         self._stack = _stack_views(core)
         self._index_split = _index_split_group(core)
 
-    def _check_step_contract(self, md) -> None:
-        if not self._contract_pending:
-            return
-        try:
-            self.step_args(md)
-        except AttributeError as exc:
-            raise AssertionError(f"attention metadata surface drifted: {exc}") from exc
-        self._contract_pending = False
-
     def step_args(self, md: TrtllmAttentionMetadata) -> dict:
         """See PrefillTarget.step_args. Context counts are stated, not read: routing
         guarantees them, and a decode-only CUDA graph would freeze whatever it read."""
-        return _step_args(
-            md,
-            num_contexts=0,
-            num_ctx_tokens=0,
-            paged_context=self.core.quant_mode == QM_NVFP4_KV_CACHE,
-        )
+        return _step_args(md, 0, 0)
 
     def _verify_qsl(self, seq_lens, batch: int, p: int, device) -> torch.Tensor:
         """PLE segmentation `[0, p, ..., batch * p]` of a generation-only verify step, cached
@@ -5894,18 +5825,13 @@ class DecodeTarget:
             )
             out = torch.reshape(attn, [num_tokens, core.q_width])
         else:
-            out = thop_attention(
-                q=qkv,
-                output=attn_out,
-                local_layer_idx=core._bound.pools.pool_idx[i],
-                num_heads=core.heads_q,
-                num_kv_heads=core.heads_kv,
-                head_size=core.head_dim,
-                quant_mode=core.quant_mode,
-                kv_scale_orig_quant=core.kv_scale_orig_quant,
-                kv_scale_quant_orig=core.kv_scale_quant_orig,
-                **step,
-                **_CALL_CONSTANTS,
+            out = core.attention(
+                i,
+                core._bound.pools.pool_idx[i],
+                qkv,
+                attn_out,
+                step["md"],
+                step["predicted_tokens_per_seq"],
             )
             fused_sigmoid_mul_inplace(out, gate, direct_launch=True)
         return _tp_partial(core, mm(out, L.o))
@@ -6092,7 +6018,6 @@ class DecodeTarget:
     ):
         core = self.core
         md = attn_metadata
-        self._check_step_contract(md)
         step = self.step_args(md)
         spec_metadata = kwargs.get("spec_metadata")
         mm = md.mamba_metadata
@@ -6454,18 +6379,13 @@ class DecodeTarget:
                 [n, core.q_width],
             )
         else:
-            attn = thop_attention(
-                q=qkv,
-                output=torch.empty([rows, core.q_width], dtype=qkv.dtype, device=qkv.device),
-                local_layer_idx=layer_idx,
-                num_heads=core.heads_q,
-                num_kv_heads=core.heads_kv,
-                head_size=core.head_dim,
-                quant_mode=core.quant_mode,
-                kv_scale_orig_quant=core.kv_scale_orig_quant,
-                kv_scale_quant_orig=core.kv_scale_quant_orig,
-                **step,
-                **_CALL_CONSTANTS,
+            attn = core.attention(
+                core.mtp_layer_idx,
+                layer_idx,
+                qkv,
+                torch.empty([rows, core.q_width], dtype=qkv.dtype, device=qkv.device),
+                step["md"],
+                step["predicted_tokens_per_seq"],
             )
             fused_sigmoid_mul_inplace(attn, gate, direct_launch=True)
             attn = sel(attn)

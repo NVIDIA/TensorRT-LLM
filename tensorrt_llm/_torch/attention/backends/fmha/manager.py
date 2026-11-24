@@ -21,6 +21,7 @@ import bisect
 import functools
 import inspect
 import os
+from collections.abc import Sequence
 from dataclasses import fields, is_dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, NamedTuple
@@ -38,14 +39,12 @@ from tensorrt_llm.logger import logger
 from .combined import CombinedFmha
 from .interface import Fmha, FmhaPhase, FmhaPrewarmConfig
 from .phased import PhasedFmha
-from .registry import get_enabled_fmha_lib_classes
+from .registry import get_enabled_fmha_lib_classes, resolve_fmha_lib_classes
 from .xqa import XqaFmha
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.attention.backends.trtllm import (
-        TrtllmAttention,
-        TrtllmAttentionMetadata,
-    )
+    from tensorrt_llm._torch.attention.backends.attention_layer import AttentionLayer
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 
 
 # Keep these general-purpose cache buckets aligned with the shape coverage used
@@ -345,16 +344,24 @@ def generation_cell_bound(num_generations: int, q_len: int) -> tuple[int, int]:
 class FmhaManager:
     """Own the FMHA libraries, dispatch policy, and selection cache for one attention layer."""
 
-    def __init__(self, attn: TrtllmAttention) -> None:
+    def __init__(
+        self, attn: AttentionLayer, fmha_libs: Sequence[str | type[Fmha]] | None = None
+    ) -> None:
+        """``fmha_libs`` lists this layer's libraries by name or class instead of TLLM_FMHA_LIBS."""
         self._cache: dict[_FmhaCacheKey, Fmha | object] = {}
         self._cache_inputs: dict[_FmhaCacheKey, _FmhaCacheInputs] = {}
         # Environment configuration is fixed for the manager lifetime so
         # normal forwarding never pays for an environment lookup.
         self._cache_sanity_check_enabled = _is_fmha_cache_sanity_check_enabled()
         self.fmha_libs: list[Fmha] = []
+        enabled_fmha_lib_classes = (
+            get_enabled_fmha_lib_classes()
+            if fmha_libs is None
+            else resolve_fmha_lib_classes(fmha_libs)
+        )
         for fmha_cls in (
             *getattr(attn, "prepended_fmha_lib_classes", ()),
-            *get_enabled_fmha_lib_classes(),
+            *enabled_fmha_lib_classes,
         ):
             if fmha_cls.is_available(attn):
                 self.fmha_libs.append(fmha_cls(attn))
@@ -485,7 +492,7 @@ class FmhaManager:
 
     def select(
         self,
-        attn: TrtllmAttention,
+        attn: AttentionLayer,
         q: torch.Tensor,
         k: torch.Tensor | None,
         v: torch.Tensor | None,
@@ -563,7 +570,7 @@ class FmhaManager:
 
     def _select_uncached(
         self,
-        attn: TrtllmAttention,
+        attn: AttentionLayer,
         q: torch.Tensor,
         k: torch.Tensor | None,
         v: torch.Tensor | None,
@@ -576,7 +583,7 @@ class FmhaManager:
 
     def _select_non_mla(
         self,
-        attn: TrtllmAttention,
+        attn: AttentionLayer,
         q: torch.Tensor,
         k: torch.Tensor | None,
         v: torch.Tensor | None,

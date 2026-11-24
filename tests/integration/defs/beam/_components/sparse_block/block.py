@@ -182,6 +182,9 @@ class BeamSparseBlockBf16Sm103Tp1(nn.Module):
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
         self.head_dim = config.head_dim
+        self.attn_layer, self.fmha_manager = _attention.attention_layer(
+            layer_idx, self.num_heads, self.num_kv_heads, self.head_dim
+        )
         self.is_sliding = ATTENTION_TYPES[layer_idx] == "sliding_attention"
         self.window = config.sliding_window if self.is_sliding else None
         self.rope_theta = SUPPORTED_ROPE["rope_theta"] if self.is_sliding else None
@@ -252,16 +255,16 @@ class BeamSparseBlockBf16Sm103Tp1(nn.Module):
             attention_window=self.window,
         )
 
-    def step_args(self, md: TrtllmAttentionMetadata) -> dict:
-        """Project the prepared metadata onto thop_attention's explicit batch state."""
-        return _attention.step_args(md, self.layer_idx)
-
-    def attention(self, h: torch.Tensor, positions: torch.Tensor, step: dict) -> torch.Tensor:
+    def attention(
+        self, h: torch.Tensor, positions: torch.Tensor, md: TrtllmAttentionMetadata
+    ) -> torch.Tensor:
         """Normalized input [T, hidden] -> attention output [T, hidden], before post_attention_layernorm."""
         return _attention.attention(
             h,
             positions,
-            step,
+            md,
+            layer=self.attn_layer,
+            fmha_manager=self.fmha_manager,
             q_proj=self.self_attn_q_proj,
             k_proj=self.self_attn_k_proj,
             v_proj=self.self_attn_v_proj,
@@ -270,12 +273,9 @@ class BeamSparseBlockBf16Sm103Tp1(nn.Module):
             q_norm=self.self_attn_q_norm,
             k_norm=self.self_attn_k_norm,
             gate_bias=self.self_attn_gate_bias,
-            num_heads=self.num_heads,
-            num_kv_heads=self.num_kv_heads,
-            head_dim=self.head_dim,
             eps=self.eps,
             rope_theta=self.rope_theta,
-            window=self.window if self.is_sliding else step["max_seq_len"],
+            window=self.window if self.is_sliding else md.max_seq_len,
         )
 
     @torch.no_grad()
@@ -286,13 +286,12 @@ class BeamSparseBlockBf16Sm103Tp1(nn.Module):
         attn_metadata: TrtllmAttentionMetadata,
     ) -> torch.Tensor:
         self._check_step(hidden_states, position_ids, attn_metadata)
-        step = self.step_args(attn_metadata)
         num_tokens = hidden_states.shape[1]
         x = hidden_states.view(num_tokens, self.hidden_size)
         positions = position_ids.view(num_tokens)
 
         h = beam_rmsnorm_fp32(x, self.input_layernorm, self.eps)
-        h = self.attention(h, positions, step)
+        h = self.attention(h, positions, attn_metadata)
         h = flashinfer_rmsnorm(h, self.post_attention_layernorm, self.eps)
         x = beam_depth_residual(h, x, *self.attention_scales)
 

@@ -35,6 +35,7 @@ from typing import Optional
 
 import torch
 
+from tensorrt_llm._torch.attention.backends.fmha.manager import FmhaManager
 from tensorrt_llm.quantization.mode import QuantMode
 
 from ._k3_fp4_mla_cache import (
@@ -416,10 +417,11 @@ def _fp8_context_state(state: K3MlaAttnState) -> K3MlaAttnState:
         fp8_state.has_fp8_kv_cache = True
         fp8_state.local_layer_idx = 0
         fp8_state.layer_idx = 0
+        fp8_state.fmha_manager = FmhaManager(fp8_state)
         state._fp8_context_view = fp8_state
+    # The copy shares `rope_params`, so its position count follows the role's.
     fp8_state.rotary_inv_freq = state.rotary_inv_freq
     fp8_state.rotary_cos_sin = state.rotary_cos_sin
-    fp8_state.rope_max_positions = state.rope_max_positions
     return fp8_state
 
 

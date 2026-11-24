@@ -32,10 +32,8 @@ from tensorrt_llm._utils import get_sm_version
 from .interface import Fmha
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.attention.backends.trtllm import (
-        TrtllmAttention,
-        TrtllmAttentionMetadata,
-    )
+    from tensorrt_llm._torch.attention.backends.attention_layer import AttentionLayer
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 
 
 @dataclass(slots=True)
@@ -49,7 +47,7 @@ class FmhaParams:
     whole-batch and native accessors apply ``seq_offset`` / ``token_offset``.
     """
 
-    attn: "TrtllmAttention"
+    attn: "AttentionLayer"
     meta: "TrtllmAttentionMetadata"
     fwd: AttentionForwardArgs
     workspace: torch.Tensor
@@ -156,7 +154,7 @@ class PhasedFmha(Fmha):
     # Required by backends that construct tensor views over the KV pool.
     NEEDS_BLOCK_EXTENT = True
 
-    def __init__(self, attn: "TrtllmAttention"):
+    def __init__(self, attn: "AttentionLayer"):
         super().__init__(attn)
         self.kv_factor = 1 if attn.is_mla_enable else 2
         self.generation_out_head_size = attn.out_head_size(is_gen_only=True)
@@ -549,3 +547,9 @@ class PhasedFmha(Fmha):
         raise NotImplementedError(
             f"{type(self).__name__} does not support MLA generation attention."
         )
+
+    @classmethod
+    def serves(cls, is_mla: bool, is_gen: bool) -> bool:
+        """Whether the library overrides the ``run_*`` method of this attention variant and phase."""
+        name = f"run_{'mla_' if is_mla else ''}{'generation' if is_gen else 'context'}"
+        return getattr(cls, name) is not getattr(PhasedFmha, name)

@@ -1176,3 +1176,22 @@ def test_manager_skips_an_unavailable_prepended_library() -> None:
 
     assert [type(lib) for lib in manager.fmha_libs] == registry
     assert [name for name, _ in checked] == ["Prepended", "First"]
+
+
+def test_manager_takes_an_explicit_library_list() -> None:
+    checked: list = []
+    registry = [_listed_fmha("Registry", True, checked)]
+    first = _listed_fmha("First", True, checked)
+    second = _listed_fmha("Second", True, checked)
+    attn = FakeAttention()
+
+    with (
+        patch.object(fmha_manager, "get_enabled_fmha_lib_classes", return_value=registry),
+        patch.dict(
+            fmha_manager.resolve_fmha_lib_classes.__globals__["FMHA_LIBS"], {"first": first}
+        ),
+    ):
+        manager = FmhaManager(attn, fmha_libs=[second, "first", second])
+
+    assert [type(lib) for lib in manager.fmha_libs] == [second, first]
+    assert [name for name, _ in checked] == ["Second", "First"]

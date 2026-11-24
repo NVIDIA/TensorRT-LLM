@@ -121,6 +121,50 @@ def test_xqa_perf_gain_memo_ignores_declined_calls(declined_first: bool) -> None
         assert thop.xqa_has_perf_gain(params) is None
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("is_mla", [False, True], ids=["mha", "mla"])
+def test_native_libraries_serve_the_phases_they_run(is_mla: bool) -> None:
+    served = {
+        name: (FMHA_LIBS[name].serves(is_mla, False), FMHA_LIBS[name].serves(is_mla, True))
+        for name in ("trtllm_gen", "flash_mla", "xqa", "fmha_v2", "mmha", "unfused")
+    }
+    if is_mla:
+        assert served == {
+            "trtllm_gen": (True, True),
+            "flash_mla": (False, True),
+            "xqa": (False, True),
+            "fmha_v2": (True, True),
+            "mmha": (False, False),
+            "unfused": (False, False),
+        }
+    else:
+        assert served == {
+            "trtllm_gen": (True, True),
+            "flash_mla": (False, False),
+            "xqa": (False, True),
+            "fmha_v2": (True, True),
+            "mmha": (False, True),
+            "unfused": (True, False),
+        }
+    assert FallbackFmha.serves(is_mla, False) and FallbackFmha.serves(is_mla, True)
+
+
+@pytest.mark.cpu_only
+def test_only_primts_block_sparse_adds_back_the_sage_v_mean() -> None:
+    """With ``TLLM_FMHA_LIBS=trtllm_gen`` (or any list without it) a V-smoothing call has no library."""
+    assert [name for name, lib in FMHA_LIBS.items() if lib.supports_sage_smooth_v] == [
+        "prims_ts_block_sparse"
+    ]
+
+
+@_NEEDS_GPU
+@pytest.mark.parametrize("fmha_cls", NATIVE_FMHA_LIBS, ids=lambda cls: cls.__name__)
+def test_native_libraries_decline_sage_v_smoothing(fmha_cls) -> None:
+    with native_batch(torch.bfloat16, num_contexts=1, num_generations=1) as (attn, metadata, qkv):
+        forward_args = native_forward_args(attn, metadata, qkv, sage_attn_smooth_v=True)
+        assert not fmha_cls(attn).is_supported(qkv, None, None, metadata, forward_args)
+
+
 @_NEEDS_GPU
 def test_fallback_rejects_raw_fp8_input() -> None:
     with native_batch(torch.bfloat16, num_contexts=1, num_generations=1) as (attn, metadata, qkv):
@@ -291,6 +335,7 @@ def test_inherited_availability_hook_uses_subclass_capabilities() -> None:
         ),
         ("supports_per_tensor_fp8", {"qk_fp8_per_tensor": True}),
         ("supports_per_tensor_fp8", {"v_fp8_per_tensor": True}),
+        ("supports_sage_smooth_v", {"sage_attn_smooth_v": True}),
         (
             "supports_variable_window",
             {

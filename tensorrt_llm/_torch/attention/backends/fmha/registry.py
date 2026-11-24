@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import os
+from collections.abc import Sequence
 from typing import TypeAlias
 
 from .cute_dsl_mla import CuteDslMlaFmha
@@ -160,6 +161,20 @@ def get_enabled_fmha_lib_classes() -> list[FmhaCls]:
     return [FMHA_LIBS[name] for name in _parse_fmha_libs_env()]
 
 
+def resolve_fmha_lib_classes(fmha_libs: Sequence[str | FmhaCls]) -> list[FmhaCls]:
+    """The classes of an explicit library list, in its order; names follow TLLM_FMHA_LIBS."""
+    classes: list[FmhaCls] = []
+    for lib in fmha_libs:
+        for fmha_cls in (
+            (FMHA_LIBS[name] for name in _expand_fmha_lib_name(lib))
+            if isinstance(lib, str)
+            else (lib,)
+        ):
+            if fmha_cls not in classes:
+                classes.append(fmha_cls)
+    return classes
+
+
 def is_fmha_lib_enabled(name: str) -> bool:
     """Whether ``TLLM_FMHA_LIBS`` enables the library registered as ``name``."""
     return name in _parse_fmha_libs_env()
@@ -173,4 +188,5 @@ __all__ = [
     "get_enabled_fmha_lib_classes",
     "init_fmha_libs",
     "is_fmha_lib_enabled",
+    "resolve_fmha_lib_classes",
 ]

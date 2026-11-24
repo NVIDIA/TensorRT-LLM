@@ -24,77 +24,37 @@ from tensorrt_llm._torch.attention.backends.interface import (
 )
 from tensorrt_llm.bindings.internal import thop
 
-from . import fallback
-from .interface import FmhaPhase
-from .phased import FmhaParams, PhasedFmha
+from .native import NativeFmha
+from .phased import FmhaParams
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.attention.backends.trtllm import (
-        TrtllmAttention,
-        TrtllmAttentionMetadata,
-    )
+    from tensorrt_llm._torch.attention.backends.attention_layer import AttentionLayer
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 
 
-class XqaFmha(PhasedFmha):
+class XqaFmha(NativeFmha):
     """XQA generation kernels."""
 
-    SERVES_CONTEXT = False
-    SERVES_GENERATION = True
-    SERVES_MHA = True
-    SERVES_MLA = True
-    REQUIRES_PAGED_KV = False
-    # The native op consumes pool pointers directly; sparse managers may have
-    # no Role.KEY buffer from which to query a dense block extent.
-    NEEDS_BLOCK_EXTENT = False
-    supports_skip_correction = True
-    supports_workspace_reclamation = True
+    op_is_supported = staticmethod(thop.xqa_is_supported)
 
-    def __init__(self, attn: "TrtllmAttention"):
+    def __init__(self, attn: "AttentionLayer"):
         super().__init__(attn)
         # has_perf_gain() by (generation batch, history in XQA multi-block units, spec decoding,
         # output dtype).
         self._perf_gain: dict[tuple[int, int, bool, torch.dtype], bool] = {}
 
-    @classmethod
-    def _is_available(cls, attn: "TrtllmAttention") -> bool:
-        return fallback.is_native_op_available(
-            attn, serves_mha=cls.SERVES_MHA, serves_mla=cls.SERVES_MLA
-        )
-
-    def _is_supported(
-        self,
-        q: torch.Tensor,
-        k: Optional[torch.Tensor],
-        v: Optional[torch.Tensor],
-        metadata: "TrtllmAttentionMetadata",
-        forward_args: AttentionForwardArgs,
-        *,
-        phase: Optional[FmhaPhase] = None,
-    ) -> bool:
-        def is_supported(params: FmhaParams, is_gen: bool) -> bool:
-            # Judge support at the longest KV history the selection cache key admits, so the
-            # choice holds for every request sharing the key; has_perf_gain() is keyed separately.
-            if is_gen and metadata.max_seq_len is not None:
-                if metadata.beam_width == 1:
-                    params.max_past_kv_length = metadata.max_seq_len
-                elif not self.kv_exceeds_beam_search_window(metadata, forward_args):
-                    params.max_past_kv_length = min(
-                        metadata.max_seq_len, params.cyclic_attention_window_size - 1
-                    )
-            return thop.xqa_is_supported(params, is_gen)
-
-        return fallback.is_native_call_supported(
-            self,
-            q,
-            k,
-            v,
-            metadata,
-            forward_args,
-            phase=phase,
-            serves_context=self.SERVES_CONTEXT,
-            serves_generation=self.SERVES_GENERATION,
-            is_supported=is_supported,
-        )
+    def is_phase_supported(self, params: FmhaParams, is_gen: bool) -> bool:
+        # Judge support at the longest KV history the selection cache key admits, so the choice
+        # holds for every request sharing the key; has_perf_gain() is keyed separately.
+        metadata = params.meta
+        if is_gen and metadata.max_seq_len is not None:
+            if metadata.beam_width == 1:
+                params.max_past_kv_length = metadata.max_seq_len
+            elif not self.kv_exceeds_beam_search_window(metadata, params.fwd):
+                params.max_past_kv_length = min(
+                    metadata.max_seq_len, params.cyclic_attention_window_size - 1
+                )
+        return thop.xqa_is_supported(params, is_gen)
 
     def has_perf_gain(
         self,
@@ -146,17 +106,6 @@ class XqaFmha(PhasedFmha):
             metadata.kv_lens_runtime[num_contexts : num_contexts + metadata.num_generations].max()
         )
         return max_kv_len + 1 > forward_args.attention_window_size
-
-    def prepare_workspace(
-        self,
-        q: torch.Tensor,
-        k: Optional[torch.Tensor],
-        v: Optional[torch.Tensor],
-        metadata: "TrtllmAttentionMetadata",
-        forward_args: AttentionForwardArgs,
-        workspace: torch.Tensor,
-    ) -> None:
-        fallback.warn_unsupported_sage_smoothing(forward_args)
 
     @torch.compiler.disable
     def run_generation(self, params: FmhaParams) -> None:

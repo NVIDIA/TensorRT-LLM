@@ -40,13 +40,19 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
+from tensorrt_llm._torch.attention.backends.attention_layer import AttentionLayer
+from tensorrt_llm._torch.attention.backends.fmha.manager import FmhaManager
+from tensorrt_llm._torch.attention.backends.interface import (
+    AttentionForwardArgs,
+    AttentionInputType,
+    AttentionMetadata,
+    MLAParams,
+    PositionalEmbeddingParams,
+    RopeParams,
+)
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.modeling_v2._router_index import (
-    disable_v2_by_default,
-    step_contract_enabled,
-)
+from tensorrt_llm._torch.modeling_v2._router_index import disable_v2_by_default
 from tensorrt_llm._torch.modeling_v2.catalog.activation.flashinfer_silu_and_mul import (  # noqa: E501
     flashinfer_silu_and_mul,
 )
@@ -59,7 +65,6 @@ from tensorrt_llm._torch.modeling_v2.catalog.attention.mla_rope_append_paged_kv_
 from tensorrt_llm._torch.modeling_v2.catalog.attention.mla_rope_generation import (
     mla_rope_generation,
 )
-from tensorrt_llm._torch.modeling_v2.catalog.attention.thop_attention import thop_attention
 from tensorrt_llm._torch.modeling_v2.catalog.comm.allgather import allgather
 from tensorrt_llm._torch.modeling_v2.catalog.comm.allreduce import (
     RESIDUAL_RMS_NORM,
@@ -86,6 +91,8 @@ from tensorrt_llm._torch.modeling_v2.catalog.quantization.fp4_quantize import fp
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
 from tensorrt_llm._torch.speculative import get_spec_worker, should_use_separate_draft_kv_cache
 from tensorrt_llm._utils import mpi_disabled
+from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from . import weights as _weights
@@ -103,97 +110,7 @@ _CACHED_CTX_FIELDS = (
 )
 
 
-def _build_step_args(md: TrtllmAttentionMetadata) -> dict:
-    """Project the prepared metadata onto the batch state both MLA attention calls of one
-    forward share."""
-    return dict(
-        sequence_length=md.kv_lens_cuda_runtime,
-        host_past_key_value_lengths=md.kv_lens_runtime,
-        host_total_kv_lens=md.host_total_kv_lens,
-        context_lengths=md.prompt_lens_cuda_runtime,
-        host_context_lengths=md.prompt_lens_cpu_runtime,
-        host_request_types=md.host_request_types_runtime,
-        kv_cache_block_offsets=md.kv_cache_block_offsets,
-        host_kv_cache_pool_pointers=md.host_kv_cache_pool_pointers,
-        host_kv_cache_pool_mapping=md.host_kv_cache_pool_mapping,
-        workspace=md.effective_workspace,
-        tokens_per_block=md.tokens_per_block,
-        max_num_requests=md.max_num_requests,
-        max_context_length=md.max_context_length,
-        max_seq_len=md.max_seq_len,
-        attention_window_size=md.max_seq_len,
-        rope_max_positions=md.max_seq_len,
-        rope_original_max_positions=md.max_seq_len,
-        num_contexts=md.num_contexts,
-        num_ctx_tokens=md.num_ctx_tokens,
-        trtllm_gen_jit_warmup=md.trtllm_gen_jit_warmup,
-        max_num_sequences=md.max_num_sequences,
-        force_prepare_spec_dec_tree_mask=md.force_prepare_spec_dec_tree_mask,
-    )
-
-
 _KV_RESIDUAL_DIM = 0
-
-# Both kv scale tensors stay None: None is read as a scale of exactly 1.0, which is what this
-# checkpoint's k_scale/v_scale hold and the only value the context flavors are correct at.
-# The MLA path reads the rope table and nothing else — rope_scale_type, rope_scale, the two
-# m-scales and the two position windows are silently ignored, so the YaRN blend must live in
-# the table.
-_CALL_INERT = dict(
-    output_sf=None,
-    out_scale=None,
-    kv_scale_orig_quant=None,
-    kv_scale_quant_orig=None,
-    attention_sinks=None,
-    update_kv_cache=True,
-    beam_width=1,
-    mask_type=1,
-    use_paged_context_fmha=False,
-    is_mla_enable=True,
-    rope_append=True,
-    position_embedding_type=8,
-    rope_scale_type=0,
-    rope_scale=1.0,
-    rope_short_m_scale=1.0,
-    rope_long_m_scale=1.0,
-    chunked_prefill_buffer_batch_size=1,
-    attention_chunk_size=None,
-    softmax_stats_tensor=None,
-    cache_indirection=None,
-    block_ids_per_seq=None,
-    max_context_q_len_override=None,
-    is_cross=False,
-    cross_kv=None,
-    relative_attention_bias=None,
-    relative_attention_max_distance=0,
-    mrope_rotary_cos_sin=None,
-    mrope_position_deltas=None,
-    helix_position_offsets=None,
-    helix_is_inactive_rank=None,
-    is_spec_decoding_enabled=False,
-    use_spec_decoding=False,
-    is_spec_dec_tree=False,
-    spec_decoding_generation_lengths=None,
-    spec_decoding_position_offsets=None,
-    spec_decoding_packed_mask=None,
-    spec_decoding_bl_tree_mask_offset=None,
-    spec_decoding_bl_tree_mask=None,
-    spec_decoding_target_max_draft_tokens=None,
-    spec_bl_tree_first_sparse_mask_offset_kv=None,
-    sparse_kv_indices=None,
-    sparse_kv_offsets=None,
-    sparse_attn_indices=None,
-    sparse_attn_offsets=None,
-    sparse_attn_indices_block_size=0,
-    num_sparse_topk=None,
-    flash_mla_tile_scheduler_metadata=None,
-    flash_mla_num_splits=None,
-    # kv_norm_weight must stay None: a weight here folds kv_a_layernorm into the KV kernel,
-    # which this target already applies itself — a silent double normalization.
-    kv_norm_weight=None,
-    kv_norm_eps=1e-6,
-    skip_correction_threshold=0.0,
-)
 
 _QUANT_MODE_FP8_KV = 128
 
@@ -305,8 +222,7 @@ class DeepseekV3DefaultModelingV2(DecoderModel):
         kv_algo = model_config.quant_config.kv_cache_quant_algo
         assert kv_algo == QuantAlgo.FP8, f"unsupported KV algo {kv_algo}; fp8 latent pool only"
 
-        # The first-step derivation runs once and always; the contract probe lives on each
-        # target, behind its own flag.
+        # The first-step derivation runs once and always.
         self._derive_pending = True
 
         self.rank = m.rank
@@ -335,13 +251,16 @@ class DeepseekV3DefaultModelingV2(DecoderModel):
         )
         temperature = _yarn_mscale(self.rope_factor, mscale_all_dim)
         self.q_scaling = 1.0 / (temperature * temperature)
-        self._call = dict(_CALL_INERT, quant_mode=self.quant_mode, q_scaling=self.q_scaling)
 
         self.dims = _weights.MODEL_WEIGHTS.dims(self)
         self.w = _weights.MODEL_WEIGHTS.declare(self.dims)
 
         self._rope: dict | None = None
         self._rope_positions = 0
+        # Per global layer, the MTP layer last: the context (MHA) and absorbed generation
+        # (MQA) flavors of its MLA, each with its FMHA manager.
+        self._mha: list[tuple[AttentionLayer, FmhaManager]] = []
+        self._mqa: list[tuple[AttentionLayer, FmhaManager]] = []
         self._side_stream: torch.cuda.Stream | None = None
         self._residual_norm: ResidualNorm | None = None
         self._mtp: _MtpWeights | None = None
@@ -390,9 +309,77 @@ class DeepseekV3DefaultModelingV2(DecoderModel):
             .to(device)
             .contiguous(),
             "rotary_inv_freq": inv.float().to(device).contiguous(),
-            "rope_dim": rope_dim,
-            "rope_base": self.theta,
         }
+
+    def _attention_layers(self, v_head_dim: int, head_dim: int, num_kv_heads: int) -> list:
+        """One MLA flavor's attention layer and FMHA manager for every global layer."""
+        d = self.dims
+        layers = []
+        for i in range(d.num_layers + (1 if d.mtp_enabled else 0)):
+            layer = AttentionLayer(
+                layer_idx=i,
+                num_heads=d.heads,
+                head_dim=head_dim,
+                num_kv_heads=num_kv_heads,
+                quant_config=QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8),
+                q_scaling=self.q_scaling,
+                pos_embd_params=PositionalEmbeddingParams(
+                    type=PositionEmbeddingType.yarn,
+                    rope=RopeParams(dim=d.rope_dim, theta=self.theta),
+                ),
+                mla_params=MLAParams(
+                    q_lora_rank=d.q_lora,
+                    kv_lora_rank=d.kv_lora,
+                    qk_rope_head_dim=d.rope_dim,
+                    qk_nope_head_dim=d.nope,
+                    v_head_dim=v_head_dim,
+                ),
+            )
+            layers.append((layer, FmhaManager(layer)))
+        return layers
+
+    def _bind_rope(self) -> None:
+        """Point every attention layer at the core's rope table: the MLA path reads the table
+        and nothing else, so the YaRN blend lives there."""
+        for layer, _ in (*self._mha, *self._mqa):
+            layer.rotary_inv_freq = self._rope["rotary_inv_freq"]
+            layer.rotary_cos_sin = self._rope["rotary_cos_sin"]
+            layer.rope_params.max_positions = self._rope_positions
+
+    def mla_attention(
+        self,
+        layer_idx: int,
+        local_layer_idx: int,
+        generation: bool,
+        predicted_tokens_per_seq: int,
+        q: torch.Tensor,
+        k: torch.Tensor | None,
+        v: torch.Tensor | None,
+        md: TrtllmAttentionMetadata,
+        fwd: AttentionForwardArgs,
+    ) -> torch.Tensor:
+        """Run global layer `layer_idx`'s MLA at pool row `local_layer_idx` into `fwd.output`.
+
+        `generation` runs the absorbed MQA flavor over the call's generation rows, otherwise
+        the MHA flavor over its context rows. kv scales stay None, read as exactly 1.0 --
+        this checkpoint's k_scale/v_scale and the only value the context flavors are correct at.
+        """
+        layer, fmha_manager = (self._mqa if generation else self._mha)[layer_idx]
+        layer.local_layer_idx = local_layer_idx
+        layer.predicted_tokens_per_seq = predicted_tokens_per_seq
+        # Context MLA reads separate K / V, never the paged-context path.
+        md.use_paged_context_fmha = False
+        fwd.attention_input_type = (
+            AttentionInputType.generation_only if generation else AttentionInputType.context_only
+        )
+        fwd.attention_window_size = md.max_seq_len
+        fmha = fmha_manager.select(layer, q, k, v, md, fwd)
+        if fmha is None:
+            raise RuntimeError("No FMHA library supports this DeepSeek-V3 MLA call.")
+        if md.is_cuda_graph or not fmha.supports_workspace_reclamation:
+            md.workspace_reclaimable = False
+        fmha.forward(q, k, v, md, fwd)
+        return fwd.output
 
     def post_load_weights(self) -> None:
         """Build the two targets, now that the weights are real.
@@ -410,6 +397,10 @@ class DeepseekV3DefaultModelingV2(DecoderModel):
         device = self.w["final_norm"].device
         self._rope_positions = cfg.max_position_embeddings
         self._rope = self._rope_tables(device, self._rope_positions)
+        d = self.dims
+        self._mha = self._attention_layers(d.v_dim, d.qk_dim, d.heads)
+        self._mqa = self._attention_layers(d.kv_lora, d.lat_dim, 1)
+        self._bind_rope()
         self._side_stream = torch.cuda.Stream(device=device)
         self._residual_norm = _residual_norm(self)
         if self.dims.mtp_enabled:
@@ -448,6 +439,7 @@ class DeepseekV3DefaultModelingV2(DecoderModel):
             if md.max_seq_len > self._rope_positions:
                 self._rope_positions = md.max_seq_len
                 self._rope = self._rope_tables(self.w["final_norm"].device, self._rope_positions)
+                self._bind_rope()
             self._cached_ctx = all(hasattr(md, n) for n in _CACHED_CTX_FIELDS) and bool(
                 md.enable_context_mla_with_cached_kv
             )
@@ -866,33 +858,10 @@ class PrefillTarget:
         and the routed-expert block. The forward calls them and never asks which layout it
         runs."""
         self.core = core
-        # Off unless TRTLLM_MODELING_V2_VALIDATE asks for it; read once here rather than per
-        # forward. Each target owns its own flag: the two `step_args` projections differ,
-        # so probing one does not prove the other's fields exist.
-        self._contract_pending = step_contract_enabled()
         self._norm0 = core.w["l0_norm1"]
         self._layers = _layer_views(core)
         self._residual_norm = core._residual_norm
         self._routed = _routed_block(core)
-
-    def _check_step_contract(self, md) -> None:
-        """Opt-in first-forward fail-fast, run when TRTLLM_MODELING_V2_VALIDATE asks for it:
-        the metadata fields this target consumes must exist (they are private trtllm
-        surface). Calling `step_args` is the check -- it reads every field this target
-        consumes, so a rename upstream surfaces here rather than mid-forward. Everything
-        checked is fixed at engine construction, so once per target instance is sound,
-        and it is off in a served engine."""
-        if not self._contract_pending:
-            return
-        try:
-            self.step_args(md)
-        except AttributeError as exc:
-            raise AssertionError(f"attention metadata surface drifted: {exc}") from exc
-        self._contract_pending = False
-
-    def step_args(self, md: TrtllmAttentionMetadata) -> dict:
-        """The batch state both MLA calls of one step share."""
-        return _build_step_args(md)
 
     def forward(
         self,
@@ -904,7 +873,6 @@ class PrefillTarget:
         **kwargs,
     ) -> torch.Tensor:
         core = self.core
-        self._check_step_contract(attn_metadata)
 
         cfg = core.model_config.pretrained_config
         d = core.dims
@@ -922,8 +890,6 @@ class PrefillTarget:
 
         md = attn_metadata
         rope = core._rope
-        call = core._call
-        step = self.step_args(md)
         num_ctx = md.num_contexts
         tc = md.num_ctx_tokens
         # The paged-cache address book, shared by the two MLA preprocessing ops and both
@@ -1042,33 +1008,19 @@ class PrefillTarget:
                 k_pe_dst.copy_(
                     torch.reshape(k_pe_full, [tkv, 1, rope_dim]).expand([tkv, heads, rope_dim])
                 )
-            attn_ctx = thop_attention(
-                q=q_ctx,
-                k=torch.reshape(k, [tkv, heads * qk_dim]),
-                v=v_view,
-                output=attn_ctx,
-                latent_cache=latent_arg,
-                q_pe=None,
-                local_layer_idx=i,
-                is_fused_qkv=False,
-                attention_input_type=1,
-                num_heads=heads,
-                num_kv_heads=heads,
-                head_size=qk_dim,
-                q_lora_rank=q_lora,
-                kv_lora_rank=kv_lora,
-                qk_nope_head_dim=nope,
-                qk_rope_head_dim=rope_dim,
-                v_head_dim=v_dim,
-                cu_q_seqlens=None,
-                cu_kv_seqlens=None,
-                fmha_scheduler_counter=None,
-                # The context call's row count is `num_ctx_tokens` whatever the generation
-                # phase carries, and the entry certifies the MLA context flavors at 1 only.
-                predicted_tokens_per_seq=1,
-                **step,
-                **rope,
-                **call,
+            attn_ctx = core.mla_attention(
+                i,
+                i,
+                False,
+                1,
+                q_ctx,
+                torch.reshape(k, [tkv, heads * qk_dim]),
+                v_view,
+                md,
+                AttentionForwardArgs(
+                    output=attn_ctx,
+                    latent_cache=latent_arg,
+                ),
             )
 
             if gen:
@@ -1120,34 +1072,26 @@ class PrefillTarget:
                     v_head_dim=kv_lora,
                     rope_append=True,
                 )
-                lat_out = thop_attention(
-                    q=torch.reshape(fused_q, [gen, heads * lat_dim]),
-                    k=None,
-                    v=None,
-                    output=lat_out,
-                    latent_cache=latent_gen,
-                    q_pe=q_pe,
-                    local_layer_idx=i,
-                    is_fused_qkv=True,
-                    attention_input_type=2,
-                    num_heads=heads,
-                    num_kv_heads=1,
-                    head_size=lat_dim,
-                    q_lora_rank=q_lora,
-                    kv_lora_rank=kv_lora,
-                    qk_nope_head_dim=nope,
-                    qk_rope_head_dim=rope_dim,
-                    v_head_dim=kv_lora,
-                    cu_q_seqlens=cu_q,
-                    cu_kv_seqlens=cu_kv,
-                    fmha_scheduler_counter=counter,
-                    mla_bmm1_scale=bmm1_scale,
-                    mla_bmm2_scale=bmm2_scale,
-                    quant_q_buffer=quant_q,
-                    predicted_tokens_per_seq=gen_p,
-                    **step,
-                    **rope,
-                    **call,
+                lat_out = core.mla_attention(
+                    i,
+                    i,
+                    True,
+                    gen_p,
+                    torch.reshape(fused_q, [gen, heads * lat_dim]),
+                    None,
+                    None,
+                    md,
+                    AttentionForwardArgs(
+                        output=lat_out,
+                        latent_cache=latent_gen,
+                        q_pe=q_pe,
+                        cu_q_seqlens=cu_q,
+                        cu_kv_seqlens=cu_kv,
+                        fmha_scheduler_counter=counter,
+                        mla_bmm1_scale=bmm1_scale,
+                        mla_bmm2_scale=bmm2_scale,
+                        quant_q_buffer=quant_q,
+                    ),
                 )
                 attn_gen_t = bmm_out(a=lat_out_t, b=L.v_b_t, out=attn_gen_t)
 
@@ -1203,10 +1147,8 @@ class PrefillTarget:
         # Read every call, not once: the worker rewrites `attn_metadata` in place between
         # draft step 0 and step 1+, and `core._rope` may have grown on the engine's first step.
         rope = core._rope
-        call = core._call
         md = attn_metadata
         layer_idx = core._mtp_kv_layer(md)
-        step = self.step_args(md)
         rows = hidden_states.shape[0]
         dt = hidden_states.dtype
         dev = hidden_states.device
@@ -1301,31 +1243,19 @@ class PrefillTarget:
             k_pe_dst.copy_(
                 torch.reshape(k_pe_full, [tkv, 1, rope_dim]).expand([tkv, heads, rope_dim])
             )
-        attn_ctx = thop_attention(
-            q=q_ctx,
-            k=torch.reshape(k, [tkv, heads * qk_dim]),
-            v=v_view,
-            output=attn_ctx,
-            latent_cache=latent_arg,
-            q_pe=None,
-            local_layer_idx=layer_idx,
-            is_fused_qkv=False,
-            attention_input_type=1,
-            num_heads=heads,
-            num_kv_heads=heads,
-            head_size=qk_dim,
-            q_lora_rank=q_lora,
-            kv_lora_rank=kv_lora,
-            qk_nope_head_dim=nope,
-            qk_rope_head_dim=rope_dim,
-            v_head_dim=v_dim,
-            cu_q_seqlens=None,
-            cu_kv_seqlens=None,
-            fmha_scheduler_counter=None,
-            predicted_tokens_per_seq=1,
-            **step,
-            **rope,
-            **call,
+        attn_ctx = core.mla_attention(
+            d.num_layers,
+            layer_idx,
+            False,
+            1,
+            q_ctx,
+            torch.reshape(k, [tkv, heads * qk_dim]),
+            v_view,
+            md,
+            AttentionForwardArgs(
+                output=attn_ctx,
+                latent_cache=latent_arg,
+            ),
         )
 
         if gen:
@@ -1386,34 +1316,26 @@ class PrefillTarget:
                 rope_append=True,
             )
             lat_out = torch.empty([gen, heads * kv_lora], dtype=dt, device=dev)
-            lat_out = thop_attention(
-                q=torch.reshape(fused_q, [gen, heads * lat_dim]),
-                k=None,
-                v=None,
-                output=lat_out,
-                latent_cache=latent_gen,
-                q_pe=q_pe,
-                local_layer_idx=layer_idx,
-                is_fused_qkv=True,
-                attention_input_type=2,
-                num_heads=heads,
-                num_kv_heads=1,
-                head_size=lat_dim,
-                q_lora_rank=q_lora,
-                kv_lora_rank=kv_lora,
-                qk_nope_head_dim=nope,
-                qk_rope_head_dim=rope_dim,
-                v_head_dim=kv_lora,
-                cu_q_seqlens=cu_q,
-                cu_kv_seqlens=cu_kv,
-                fmha_scheduler_counter=counter,
-                mla_bmm1_scale=bmm1_scale,
-                mla_bmm2_scale=bmm2_scale,
-                quant_q_buffer=quant_q,
-                predicted_tokens_per_seq=gen_p,
-                **step,
-                **rope,
-                **call,
+            lat_out = core.mla_attention(
+                d.num_layers,
+                layer_idx,
+                True,
+                gen_p,
+                torch.reshape(fused_q, [gen, heads * lat_dim]),
+                None,
+                None,
+                md,
+                AttentionForwardArgs(
+                    output=lat_out,
+                    latent_cache=latent_gen,
+                    q_pe=q_pe,
+                    cu_q_seqlens=cu_q,
+                    cu_kv_seqlens=cu_kv,
+                    fmha_scheduler_counter=counter,
+                    mla_bmm1_scale=bmm1_scale,
+                    mla_bmm2_scale=bmm2_scale,
+                    quant_q_buffer=quant_q,
+                ),
             )
             lat_out_t = torch.transpose(torch.reshape(lat_out, [gen, heads, kv_lora]), 0, 1)
             attn_gen_t = torch.transpose(torch.reshape(attn_gen, [gen, heads, v_dim]), 0, 1)
@@ -1436,41 +1358,10 @@ class DecodeTarget:
         and the routed-expert block. The forward calls them and never asks which layout it
         runs."""
         self.core = core
-        # Off unless TRTLLM_MODELING_V2_VALIDATE asks for it; read once here rather than per
-        # forward. Each target owns its own flag: the two `step_args` projections differ,
-        # so probing one does not prove the other's fields exist.
-        self._contract_pending = step_contract_enabled()
         self._norm0 = core.w["l0_norm1"]
         self._layers = _layer_views(core)
         self._residual_norm = core._residual_norm
         self._routed = _routed_block(core)
-
-    def _check_step_contract(self, md) -> None:
-        """Opt-in first-forward fail-fast, run when TRTLLM_MODELING_V2_VALIDATE asks for it:
-        the metadata fields this target consumes must exist (they are private trtllm
-        surface). Calling `step_args` is the check -- it reads every field this target
-        consumes, so a rename upstream surfaces here rather than mid-forward. Everything
-        checked is fixed at engine construction, so once per target instance is sound,
-        and it is off in a served engine."""
-        if not self._contract_pending:
-            return
-        try:
-            self.step_args(md)
-        except AttributeError as exc:
-            raise AssertionError(f"attention metadata surface drifted: {exc}") from exc
-        self._contract_pending = False
-
-    def step_args(self, md: TrtllmAttentionMetadata) -> dict:
-        """The batch state both MLA calls of one step share.
-
-        States the two context counts instead of reading them back: this target runs
-        only when `num_contexts` is zero, so reading them would ask the metadata to
-        confirm what the routing already decided.
-        """
-        step = _build_step_args(md)
-        step["num_contexts"] = 0
-        step["num_ctx_tokens"] = 0
-        return step
 
     def forward(
         self,
@@ -1482,7 +1373,6 @@ class DecodeTarget:
         **kwargs,
     ) -> torch.Tensor:
         core = self.core
-        self._check_step_contract(attn_metadata)
 
         cfg = core.model_config.pretrained_config
         d = core.dims
@@ -1500,8 +1390,6 @@ class DecodeTarget:
 
         md = attn_metadata
         rope = core._rope
-        call = core._call
-        step = self.step_args(md)
         tokens_per_block = md.tokens_per_block
         block_offsets = md.kv_cache_block_offsets
         pool_ptrs = md.host_kv_cache_pool_pointers
@@ -1598,34 +1486,26 @@ class DecodeTarget:
                 v_head_dim=kv_lora,
                 rope_append=True,
             )
-            lat_out = thop_attention(
-                q=torch.reshape(fused_q, [gen, heads * lat_dim]),
-                k=None,
-                v=None,
-                output=lat_out,
-                latent_cache=latent,
-                q_pe=q_pe,
-                local_layer_idx=i,
-                is_fused_qkv=True,
-                attention_input_type=2,
-                num_heads=heads,
-                num_kv_heads=1,
-                head_size=lat_dim,
-                q_lora_rank=q_lora,
-                kv_lora_rank=kv_lora,
-                qk_nope_head_dim=nope,
-                qk_rope_head_dim=rope_dim,
-                v_head_dim=kv_lora,
-                cu_q_seqlens=cu_q,
-                cu_kv_seqlens=cu_kv,
-                fmha_scheduler_counter=counter,
-                mla_bmm1_scale=bmm1_scale,
-                mla_bmm2_scale=bmm2_scale,
-                quant_q_buffer=quant_q,
-                predicted_tokens_per_seq=gen_p,
-                **step,
-                **rope,
-                **call,
+            lat_out = core.mla_attention(
+                i,
+                i,
+                True,
+                gen_p,
+                torch.reshape(fused_q, [gen, heads * lat_dim]),
+                None,
+                None,
+                md,
+                AttentionForwardArgs(
+                    output=lat_out,
+                    latent_cache=latent,
+                    q_pe=q_pe,
+                    cu_q_seqlens=cu_q,
+                    cu_kv_seqlens=cu_kv,
+                    fmha_scheduler_counter=counter,
+                    mla_bmm1_scale=bmm1_scale,
+                    mla_bmm2_scale=bmm2_scale,
+                    quant_q_buffer=quant_q,
+                ),
             )
             attn_gen_t = bmm_out(a=lat_out_t, b=L.v_b_t, out=attn_gen_t)
 
@@ -1676,10 +1556,8 @@ class DecodeTarget:
         # Read every call, not once: the worker rewrites `attn_metadata` in place between
         # draft step 0 and step 1+, and `core._rope` may have grown on the engine's first step.
         rope = core._rope
-        call = core._call
         md = attn_metadata
         layer_idx = core._mtp_kv_layer(md)
-        step = self.step_args(md)
         rows = hidden_states.shape[0]
         dt = hidden_states.dtype
         dev = hidden_states.device
@@ -1766,34 +1644,26 @@ class DecodeTarget:
             rope_append=True,
         )
         lat_out = torch.empty([gen, heads * kv_lora], dtype=dt, device=dev)
-        lat_out = thop_attention(
-            q=torch.reshape(fused_q, [gen, heads * lat_dim]),
-            k=None,
-            v=None,
-            output=lat_out,
-            latent_cache=latent,
-            q_pe=q_pe,
-            local_layer_idx=layer_idx,
-            is_fused_qkv=True,
-            attention_input_type=2,
-            num_heads=heads,
-            num_kv_heads=1,
-            head_size=lat_dim,
-            q_lora_rank=q_lora,
-            kv_lora_rank=kv_lora,
-            qk_nope_head_dim=nope,
-            qk_rope_head_dim=rope_dim,
-            v_head_dim=kv_lora,
-            cu_q_seqlens=cu_q,
-            cu_kv_seqlens=cu_kv,
-            fmha_scheduler_counter=counter,
-            mla_bmm1_scale=bmm1_scale,
-            mla_bmm2_scale=bmm2_scale,
-            quant_q_buffer=quant_q,
-            predicted_tokens_per_seq=gen_p,
-            **step,
-            **rope,
-            **call,
+        lat_out = core.mla_attention(
+            d.num_layers,
+            layer_idx,
+            True,
+            gen_p,
+            torch.reshape(fused_q, [gen, heads * lat_dim]),
+            None,
+            None,
+            md,
+            AttentionForwardArgs(
+                output=lat_out,
+                latent_cache=latent,
+                q_pe=q_pe,
+                cu_q_seqlens=cu_q,
+                cu_kv_seqlens=cu_kv,
+                fmha_scheduler_counter=counter,
+                mla_bmm1_scale=bmm1_scale,
+                mla_bmm2_scale=bmm2_scale,
+                quant_q_buffer=quant_q,
+            ),
         )
         lat_out_t = torch.transpose(torch.reshape(lat_out, [gen, heads, kv_lora]), 0, 1)
         attn_gen_t = torch.transpose(torch.reshape(attn_gen, [gen, heads, v_dim]), 0, 1)

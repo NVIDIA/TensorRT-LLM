@@ -254,8 +254,10 @@ the plan key. Paged block-sparse attention rejects Sage. With
 mean, which PrimTS adds back to the output. The attention op cannot, so the
 core also quantizes dense contiguous calls with V smoothing, and
 `PrimsTSBlockSparseFmha` serves dense calls with core-quantized inputs through
-a dense plan; the attention op serves the rest without V smoothing and logs a
-warning once.
+a dense plan. V smoothing is the `supports_sage_smooth_v` capability, which
+only `PrimsTSBlockSparseFmha` declares, so selection never hands such a call to
+a library that would drop the mean; a call it cannot serve fails with an error
+that names the library.
 
 `PrimsTSBlockSparseFmha` keeps its planned wrappers in the attention metadata
 (`TrtllmAttentionMetadata.fmha_plan_caches`), like the FlashInfer wrappers and
@@ -526,12 +528,12 @@ so its prewarm invokes one getter to build the shared library.
 
 The native attention op exposes each of its kernel libraries as its own FMHA
 library: `TrtllmGenFmha`, `FlashMlaFmha`, `XqaFmha`, `FmhaV2Fmha`, `MmhaFmha`
-and `UnfusedFmha` (`fmha/trtllm_gen.py` and siblings), each a `PhasedFmha` of
-its own; the checks they share are functions in `fmha/fallback.py`. Each calls
-only its own entry points:
-`thop.<library>_is_supported(params, is_gen)` and
-`thop.<library>_run_context` / `thop.<library>_run_generation` for the phases
-it serves. `FmhaManager` selects among them like any other library; one
+and `UnfusedFmha` (`fmha/trtllm_gen.py` and siblings), each a `NativeFmha`
+(`fmha/native.py`). A native library serves the attention variants and phases
+whose `run_*` / `run_mla_*` methods it overrides (`PhasedFmha.serves`), and
+calls only its own entry points: `op_is_supported`, its
+`thop.<library>_is_supported(params, is_gen)`, and its
+`thop.<library>_run_context` / `thop.<library>_run_generation`. `FmhaManager` selects among them like any other library; one
 registry order serves MHA and MLA, because FMHA-v2 serves no MHA generation and
 XQA no context phase. `FallbackFmha` wraps them as one library that runs each
 phase on the first native library that serves it, in the op's original

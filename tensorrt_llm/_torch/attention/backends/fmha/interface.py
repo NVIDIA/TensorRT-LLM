@@ -65,6 +65,8 @@ class Fmha(ABC):
     # library (``AttentionForwardArgs.kv_append.fold``): the query input is then the raw QKV projection.
     supports_deferred_prologue: ClassVar[bool] = False
     supports_variable_window: ClassVar[bool] = False
+    # Adds the per-sequence V mean of SageAttention V smoothing (``sage_attn_smooth_v``) back to the output.
+    supports_sage_smooth_v: ClassVar[bool] = False
 
     def __init__(self, attn: "TrtllmAttention"):
         self._attn_ref: weakref.ReferenceType["TrtllmAttention"] = weakref.ref(attn)
@@ -170,6 +172,9 @@ class Fmha(ABC):
         )
         if has_variable_window and not self.supports_variable_window:
             logger.debug(f"{type(self).__name__} does not support variable-window attention.")
+            return False
+        if forward_args.sage_attn_smooth_v and not self.supports_sage_smooth_v:
+            logger.debug(f"{type(self).__name__} does not support SageAttention V smoothing.")
             return False
         return self._is_supported(q, k, v, metadata, forward_args, phase=phase)
 

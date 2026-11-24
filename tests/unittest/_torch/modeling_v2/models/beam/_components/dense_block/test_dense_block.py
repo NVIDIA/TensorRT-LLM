@@ -63,7 +63,6 @@ from _validating import validating  # noqa: E402
 from _components.dense_block import block as block_module  # noqa: E501
 from _components.dense_block.block import BeamDenseBlockBf16Sm103Tp1  # noqa: E501
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
-from tensorrt_llm._torch.modeling_v2.catalog.attention.thop_attention import thop_attention
 from tensorrt_llm._torch.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
 from tensorrt_llm._torch.modeling_v2.catalog.norm.flashinfer_rmsnorm import flashinfer_rmsnorm
 from tensorrt_llm._torch.modeling_v2.models.beam import _attention
@@ -156,7 +155,6 @@ EXPECTED_CALLS = (
     "FlashinferRmsnorm",
     "FlashinferRmsnorm",
     "BeamNeoxRope",
-    "ThopAttention",
     "BeamOutputGate",
     "CublasMm",
     "FlashinferRmsnorm",
@@ -174,7 +172,6 @@ OPS = (
     flashinfer_rmsnorm,
     cublas_mm,
     beam_neox_rope,
-    thop_attention,
     beam_output_gate,
     beam_depth_residual,
     swiglu_fp32,
@@ -323,9 +320,8 @@ def replay(
     eps = BLOCK_CONFIG["rms_norm_eps"]
     w = dict(blk.checkpoint_tensors())
     positions = src["positions"].view(length).cuda()
-    step = blk.step_args(md)
     # Logical block 0 is the manager's local slot 0: the core call indexes the slot.
-    assert step["local_layer_idx"] == md.kv_cache_manager.layer_offsets[LAYER_IDX] == 0
+    assert _attention.local_layer_index(md, LAYER_IDX) == 0
 
     def flat(name: str, width: int) -> torch.Tensor:
         # Dense row-major: the GEMM and norm entries read their input that way.
@@ -380,16 +376,12 @@ def replay(
         (flat("q_rope", heads * d), flat("k_rope", kv_heads * d), flat("v_proj", kv_heads * d)),
         dim=-1,
     )
-    core = torch.empty(length, heads * d, dtype=DTYPE, device="cuda")
-    core = thop_attention(
-        q=qkv,
-        output=core,
-        num_heads=heads,
-        num_kv_heads=kv_heads,
-        head_size=d,
-        attention_window_size=BLOCK_CONFIG["sliding_window"],
-        **step,
-        **_attention.CALL_CONSTANTS,
+    core = _attention.attention_core(
+        qkv,
+        md,
+        layer=blk.attn_layer,
+        fmha_manager=blk.fmha_manager,
+        window=BLOCK_CONFIG["sliding_window"],
     )
     # No rule of its own: the attention core is judged through the attention module below.
     out.append(check("attention_core", None, core, "attention_core"))
@@ -411,7 +403,7 @@ def replay(
         check(
             "attention_output",
             "attention_output",
-            blk.attention(h, positions, step),
+            blk.attention(h, positions, md),
             "attention_output",
         )
     )
@@ -735,13 +727,14 @@ def test_block_matches_source_captures(seed, length, ieee_fp32) -> None:
 
 
 @pytest.mark.parametrize("length", [1, 129])
-def test_forward_runs_the_component_path(length, ieee_fp32) -> None:
-    """One case: the component's own composition ran, op by op, through thop attention on
+def test_forward_runs_the_component_path(length, ieee_fp32, monkeypatch) -> None:
+    """One case: the component's own composition ran, op by op, through the FMHA libraries on
     this GPU, with no SDPA and no built-in Beam module on the way."""
     seed = 17
     blk = loaded_block(seed)
     x, positions = case_inputs(seed, length)
     activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+    attention = support.attention_core_calls(monkeypatch)
     with fresh_context(length) as md:
         with builtin_beam_forbidden(), validating(*OPS), recording(*OPS) as calls:
             with torch.profiler.profile(activities=activities) as prof:
@@ -758,10 +751,7 @@ def test_forward_runs_the_component_path(length, ieee_fp32) -> None:
     kernels = [e.name for e in events if e.device_type == torch.autograd.DeviceType.CUDA]
     cpu_ops = sorted({e.name for e in events if e.device_type == torch.autograd.DeviceType.CPU})
     names = [c["op"] for c in calls]
-    attention = [c for c in calls if c["op"] == "ThopAttention"]
     qkv = attention[0].pop("qkv") if attention else None
-    for c in calls:
-        c.pop("qkv", None)
     assert type(blk).__module__.endswith("dense_block.block")
     assert tuple(names) == EXPECTED_CALLS, names
     (call,) = attention
@@ -774,9 +764,6 @@ def test_forward_runs_the_component_path(length, ieee_fp32) -> None:
         "head_size": 128,
         "attention_window_size": 512,
     }
-    assert call["mask_type"] == 1 and call["is_fused_qkv"] and call["position_embedding_type"] == 0
-    assert call["num_contexts"] == 1 and call["num_ctx_tokens"] == length
-    assert call["use_paged_context_fmha"] is False and call["quant_mode"] == 0
     assert isinstance(md.kv_cache_manager, KVCacheManagerV2)
     # Logical block 0 in a one-layer manager: slot 0, which the core call indexes.
     assert cache_mapping == {"layer_offsets": {0: 0}, "num_local_layers": 1, "num_layers": 1}

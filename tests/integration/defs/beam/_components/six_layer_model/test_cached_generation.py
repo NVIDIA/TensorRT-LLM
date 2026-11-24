@@ -5,7 +5,7 @@
 Configuration under test: the six-block model of ``test_small_model_prefill.py`` (bf16, sm_103,
 eager TP1, generated weights) driven by ``generation.BeamSmallModelGenerator`` -- one
 ``KVCacheManagerV2`` with whole-page block reuse, 32-token pages and a 1024-token capacity,
-TRTLLM attention through the catalog ``thop_attention`` op, and the existing ``TorchSampler``.
+TRTLLM attention through the FMHA libraries, and the existing ``TorchSampler``.
 
 What is checked, without model files or captured data:
 
@@ -76,7 +76,6 @@ from beam._components.six_layer_model.generation import (  # noqa: E501
 from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
-from tensorrt_llm._torch.modeling_v2.catalog.attention.thop_attention import thop_attention
 from tensorrt_llm._torch.modeling_v2.models.beam import _attention
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.sampler import TorchSampler
@@ -129,22 +128,20 @@ def loaded() -> model_module.BeamSixLayerBf16Sm103Tp1:
 
 @contextlib.contextmanager
 def counting_attention_calls():
-    """Count thop attention calls (and their row counts) while letting them run."""
-    cls = type(thop_attention)
-    original = cls.__call__
+    """Count attention core calls (and their row counts) while letting them run."""
+    original = _attention.attention_core
     calls: list = []
 
-    def counted(self, *args, **kwargs):
-        calls.append(
-            (kwargs["local_layer_idx"], kwargs["q"].shape[0], kwargs["q"].detach().clone())
-        )
-        return original(self, *args, **kwargs)
+    def counted(qkv, md, *, layer, fmha_manager, window):
+        local = _attention.local_layer_index(md, layer.layer_idx)
+        calls.append((local, qkv.shape[0], qkv.detach().clone()))
+        return original(qkv, md, layer=layer, fmha_manager=fmha_manager, window=window)
 
-    cls.__call__ = counted
+    _attention.attention_core = counted
     try:
         yield calls
     finally:
-        cls.__call__ = original
+        _attention.attention_core = original
 
 
 def read_slot(mgr, request_id: int, layer: int, position: int):
@@ -734,16 +731,13 @@ def test_sliding_window_excludes_exactly_the_aged_key() -> None:
                     runtime_features=AttentionRuntimeFeatures(cache_reuse=True),
                 )
                 md.prepare()
-                out = torch.empty(count, 48 * 128, dtype=torch.bfloat16, device="cuda")
-                thop_attention(
-                    q=rows.contiguous(),
-                    output=out,
-                    num_heads=48,
-                    num_kv_heads=8,
-                    head_size=128,
-                    attention_window_size=window,
-                    **_attention.step_args(md, layer),
-                    **_attention.CALL_CONSTANTS,
+                attn_layer, fmha_manager = _attention.attention_layer(layer, 48, 8, 128)
+                out = _attention.attention_core(
+                    rows.contiguous(),
+                    md,
+                    layer=attn_layer,
+                    fmha_manager=fmha_manager,
+                    window=window,
                 )
                 outputs.append(out)
             torch.cuda.synchronize()

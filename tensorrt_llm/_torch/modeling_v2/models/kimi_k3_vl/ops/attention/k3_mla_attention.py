@@ -5,8 +5,8 @@
 Every call takes the role's :class:`~.k3_mla_state.K3MlaAttnState` and the step's attention metadata, from
 which it reads the pools, block offsets and lengths (the engine owns the KV cache manager), and launches:
 
-* :func:`mla_context_attention`: the context FMHA of the attention op (catalog ``thop_attention``, MLA
-  context phase) over explicit K / V, writing ``output``. With ``latent_cache`` the op also rotates (identity
+* :func:`mla_context_attention`: the MLA context phase of the role's FMHA libraries over explicit K / V,
+  writing ``output``. With ``latent_cache`` the op also rotates (identity
   RoPE) and appends the chunk's latent rows to the paged cache; with ``full_mask`` it attends a cached-prefix
   partition (padding mask) and writes its softmax statistics to ``softmax_stats``. ``quant_q_buffer`` /
   ``quant_scale_qkv`` hand the op an already-quantized FP8 Q; the FP8 context FMHA reads FP8 K / V as given.
@@ -14,7 +14,7 @@ which it reads the pools, block offsets and lengths (the engine owns the KV cach
   decode serves the batch (:func:`cute_dsl_decode_applies`) it runs ``trtllm::cute_dsl_mla_decode_fp8_blackwell``
   on the quantized query the generation cache update wrote (FP8 cache), or
   ``trtllm::cute_dsl_mla_decode_fp16_blackwell`` on the query as is (a cache of the query's dtype), with the
-  per-request split-KV plan of the step; otherwise the attention op's MLA generation phase.
+  per-request split-KV plan of the step; otherwise the role's FMHA libraries' MLA generation phase.
 
 These are the launches the attention op's FMHA libraries make for these calls on SM107 (the fallback library
 for context and for a decode the CuTe DSL kernel does not take, the CuTe DSL MLA library for the decode),
@@ -30,19 +30,18 @@ import triton.language as tl
 
 # The FP4 MLA KV-cache layout contract shared with the KV cache manager.
 from tensorrt_llm._torch.attention.backends.fp4_mla.config import FP4_MLA_TOKENS_PER_BLOCK
-from tensorrt_llm._torch.modeling_v2.catalog.attention.thop_attention import (
-    MLA_CONTEXT,
-    MLA_GENERATION,
-    thop_attention,
+from tensorrt_llm._torch.attention.backends.interface import (
+    AttentionForwardArgs,
+    AttentionInputType,
+    PredefinedAttentionMask,
 )
 from tensorrt_llm._utils import get_sm_version
-from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 
 from .k3_mla_state import K3MlaAttnState
 
 # ---------------------------------------------------------------------------------------------
-# The attention op (catalog thop_attention).
+# The role's FMHA libraries.
 # ---------------------------------------------------------------------------------------------
 
 
@@ -56,99 +55,22 @@ def _attention_window_size(state: K3MlaAttnState, md) -> int:
     return md.max_seq_len
 
 
-def _op_args(state: K3MlaAttnState, md) -> dict:
-    """Arguments of one attention-op call besides the phase inputs: layer configuration and batch state."""
+def run_mla_phase(state: K3MlaAttnState, q, k, v, md, fwd: AttentionForwardArgs) -> torch.Tensor:
+    """Run one MLA phase through the role's FMHA manager into ``fwd.output``."""
     # MLA context attention takes separate Q / K / V, never the paged-context FMHA.
     md.use_paged_context_fmha = False
     state._ensure_rope_table_size(md.max_seq_len)
-    local_layer_idx = state.get_local_layer_idx(md)
-    return dict(
-        workspace=md.effective_workspace,
-        sequence_length=md.kv_lens_cuda_runtime,
-        host_past_key_value_lengths=md.kv_lens_runtime,
-        host_total_kv_lens=md.host_total_kv_lens,
-        context_lengths=md.prompt_lens_cuda_runtime,
-        host_context_lengths=md.prompt_lens_cpu_runtime,
-        host_request_types=md.host_request_types_runtime,
-        max_context_q_len_override=md.max_context_q_len_override,
-        kv_cache_block_offsets=md.kv_cache_block_offsets,
-        host_kv_cache_pool_pointers=md.host_kv_cache_pool_pointers,
-        host_kv_cache_pool_mapping=md.host_kv_cache_pool_mapping,
-        cache_indirection=md.cache_indirection,
-        kv_scale_orig_quant=state.kv_scale_orig_quant,
-        kv_scale_quant_orig=state.kv_scale_quant_orig,
-        out_scale=None,
-        rotary_inv_freq=state.rotary_inv_freq,
-        rotary_cos_sin=state.rotary_cos_sin,
-        block_ids_per_seq=md.block_ids_per_seq,
-        attention_sinks=None,
-        is_fused_qkv=False,
-        update_kv_cache=True,
-        predicted_tokens_per_seq=state.predicted_tokens_per_seq,
-        local_layer_idx=local_layer_idx,
-        num_heads=state.num_heads,
-        num_kv_heads=state.num_kv_heads,
-        head_size=state.head_dim,
-        tokens_per_block=md.tokens_per_block,
-        max_num_requests=md.max_num_requests,
-        max_context_length=md.max_context_length,
-        max_seq_len=md.max_seq_len,
-        attention_window_size=_attention_window_size(state, md),
-        beam_width=md.beam_width,
-        quant_mode=int(state.quant_mode),
-        q_scaling=state.q_scaling,
-        position_embedding_type=int(state.position_embedding_type),
-        rope_dim=state.rope_dim,
-        rope_base=state.rope_base,
-        rope_scale_type=0,
-        rope_scale=1.0,
-        rope_short_m_scale=1.0,
-        rope_long_m_scale=1.0,
-        rope_max_positions=state.rope_max_positions,
-        rope_original_max_positions=state.rope_original_max_positions,
-        use_paged_context_fmha=False,
-        is_mla_enable=True,
-        q_lora_rank=state.q_lora_rank,
-        kv_lora_rank=state.kv_lora_rank,
-        qk_nope_head_dim=state.qk_nope_head_dim,
-        qk_rope_head_dim=state.qk_rope_head_dim,
-        v_head_dim=state.v_head_dim,
-        rope_append=state.rope_append,
-        mrope_rotary_cos_sin=None,
-        mrope_position_deltas=None,
-        helix_position_offsets=md.helix_position_offsets,
-        helix_is_inactive_rank=md.helix_is_inactive_rank,
-        attention_chunk_size=None,
-        is_spec_decoding_enabled=md.is_spec_decoding_enabled,
-        is_spec_dec_tree=md.is_spec_dec_tree,
-        sparse_kv_indices=None,
-        sparse_kv_offsets=None,
-        sparse_attn_indices=None,
-        sparse_attn_offsets=None,
-        sparse_attn_indices_block_size=0,
-        num_sparse_topk=md.num_sparse_topk,
-        skip_softmax_stat=state.skip_softmax_stat,
-        flash_mla_tile_scheduler_metadata=md.flash_mla_tile_scheduler_metadata,
-        flash_mla_num_splits=md.flash_mla_num_splits,
-        num_contexts=md.num_contexts,
-        num_ctx_tokens=md.num_ctx_tokens,
-        trtllm_gen_jit_warmup=md.trtllm_gen_jit_warmup,
-        spec_decoding_target_max_draft_tokens=md.max_total_draft_tokens,
-        max_num_sequences=md.max_num_sequences,
-        force_prepare_spec_dec_tree_mask=md.force_prepare_spec_dec_tree_mask,
-        skip_correction_threshold=state.skip_correction_threshold,
-    )
-
-
-_NO_SPEC_DECODING = dict(
-    use_spec_decoding=False,
-    spec_decoding_generation_lengths=None,
-    spec_decoding_position_offsets=None,
-    spec_decoding_packed_mask=None,
-    spec_decoding_bl_tree_mask_offset=None,
-    spec_decoding_bl_tree_mask=None,
-    spec_bl_tree_first_sparse_mask_offset_kv=None,
-)
+    state.local_layer_idx = state.get_local_layer_idx(md)
+    fwd.kv_scale_orig_quant = state.kv_scale_orig_quant
+    fwd.kv_scale_quant_orig = state.kv_scale_quant_orig
+    fwd.attention_window_size = _attention_window_size(state, md)
+    fmha = state.fmha_manager.select(state, q, k, v, md, fwd)
+    if fmha is None:
+        raise RuntimeError("No FMHA library supports this Kimi K3 MLA call.")
+    if md.is_cuda_graph or not fmha.supports_workspace_reclamation:
+        md.workspace_reclaimable = False
+    fmha.forward(q, k, v, md, fwd)
+    return fwd.output
 
 
 def mla_context_attention(
@@ -171,56 +93,21 @@ def mla_context_attention(
     docstring. Returns ``output``."""
     if quant_scale_qkv is not None and quant_q_buffer is None:
         raise ValueError("quant_scale_qkv requires quant_q_buffer")
-    if md.is_cuda_graph:
-        md.workspace_reclaimable = False
-    mask_type = AttentionMaskType.padding if full_mask else AttentionMaskType.causal
-    return thop_attention(
-        q=q,
-        k=k,
-        v=v,
+    fwd = AttentionForwardArgs(
         output=output,
-        output_sf=None,
         latent_cache=latent_cache,
-        q_pe=None,
-        mask_type=int(mask_type),
-        attention_input_type=MLA_CONTEXT,
+        attention_mask=(
+            PredefinedAttentionMask.FULL if full_mask else PredefinedAttentionMask.CAUSAL
+        ),
+        attention_input_type=AttentionInputType.context_only,
         chunked_prefill_buffer_batch_size=chunked_prefill_buffer_batch_size,
         softmax_stats_tensor=softmax_stats,
         cu_q_seqlens=md.cu_q_seqlens,
         cu_kv_seqlens=md.cu_kv_seqlens,
         quant_q_buffer=quant_q_buffer,
         quant_scale_qkv=quant_scale_qkv,
-        **_NO_SPEC_DECODING,
-        **_op_args(state, md),
     )
-
-
-def _generation_spec_args(md) -> dict:
-    """The speculative-decoding arguments of a generation phase."""
-    if not (md.is_spec_decoding_enabled and md.use_spec_decoding):
-        return dict(_NO_SPEC_DECODING)
-    offsets = md.spec_decoding_position_offsets
-    if offsets is not None and offsets.dim() == 1:
-        if not md.is_sm_version_trtllm_gen_kernel(sm=get_sm_version()):
-            query_len = md.spec_decoding_query_len
-            if query_len <= 0:
-                raise ValueError(
-                    "1-D speculative position offsets require a positive query length."
-                )
-            offsets = offsets[: md.max_num_requests * query_len].view(
-                md.max_num_requests, query_len
-            )
-        else:
-            offsets = offsets.view(md.max_num_requests, -1)
-    return dict(
-        use_spec_decoding=True,
-        spec_decoding_generation_lengths=md.spec_decoding_generation_lengths,
-        spec_decoding_position_offsets=offsets,
-        spec_decoding_packed_mask=md.spec_decoding_packed_mask,
-        spec_decoding_bl_tree_mask_offset=md.spec_decoding_bl_tree_mask_offset,
-        spec_decoding_bl_tree_mask=md.spec_decoding_bl_tree_mask,
-        spec_bl_tree_first_sparse_mask_offset_kv=md.spec_bl_tree_first_sparse_mask_offset_kv,
-    )
+    return run_mla_phase(state, q, k, v, md, fwd)
 
 
 def mla_generation_attention(
@@ -239,21 +126,13 @@ def mla_generation_attention(
     quant_q_buffer: Optional[torch.Tensor],
     softmax_stats: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """The attention op's MLA generation phase over the absorbed query ``fused_q`` (``[T, H * 576]``)
-    into ``output`` (``[T, H * 512]``), after :func:`~.k3_mla_cache.mla_rope_generation`."""
-    if md.is_cuda_graph:
-        md.workspace_reclaimable = False
-    return thop_attention(
-        q=fused_q,
-        k=None,
-        v=None,
+    """The MLA generation phase over the absorbed query ``fused_q`` (``[T, H * 576]``) into ``output``
+    (``[T, H * 512]``), after :func:`~.k3_mla_cache.mla_rope_generation`."""
+    fwd = AttentionForwardArgs(
         output=output,
-        output_sf=None,
         latent_cache=latent_cache,
         q_pe=q_pe,
-        mask_type=int(AttentionMaskType.causal),
-        attention_input_type=MLA_GENERATION,
-        chunked_prefill_buffer_batch_size=1,
+        attention_input_type=AttentionInputType.generation_only,
         softmax_stats_tensor=softmax_stats,
         cu_q_seqlens=cu_q_seqlens,
         cu_kv_seqlens=cu_kv_seqlens,
@@ -261,9 +140,8 @@ def mla_generation_attention(
         mla_bmm1_scale=mla_bmm1_scale,
         mla_bmm2_scale=mla_bmm2_scale,
         quant_q_buffer=quant_q_buffer,
-        **_generation_spec_args(md),
-        **_op_args(state, md),
     )
+    return run_mla_phase(state, fused_q, None, None, md, fwd)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -289,7 +167,7 @@ _SPLIT_PLAN_PIECE_COST_TILES = 60
 # ``assumed_align`` the decode runner compiles the page table and the KV
 # lengths with; their runtime pointers must keep it.
 _KERNEL_INPUT_ALIGN_BYTES = 16
-# Page size of the fallback thop op's precompiled TRTLLM-Gen MLA generation
+# Page size of the fallback library's precompiled TRTLLM-Gen MLA generation
 # kernels.
 _FALLBACK_MLA_GENERATION_TOKENS_PER_BLOCK = 32
 

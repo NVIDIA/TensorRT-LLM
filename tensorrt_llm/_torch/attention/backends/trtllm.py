@@ -42,12 +42,9 @@ from itertools import accumulate
 from tensorrt_llm._utils import (get_sm_version, is_sm_100f, is_sm_120f,
                                  maybe_pin_memory, prefer_pinned)
 from tensorrt_llm.bindings.internal import thop
-from tensorrt_llm.functional import (AttentionMaskType, PositionEmbeddingType,
-                                     RotaryScalingType)
-from tensorrt_llm.logger import logger
+from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.math_utils import ceil_div
 from tensorrt_llm.models.modeling_utils import QuantConfig
-from tensorrt_llm.quantization.mode import QuantMode
 
 from ...distributed import cp_allgather
 from ...kimi_k3_cache_policy import get_kimi_k3_fp8_kv_layer_ids, is_kimi_k3
@@ -60,6 +57,7 @@ from ...pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
                       get_model_extra_attrs, helix_local_len_tensor)
 from ..kernels.sage_quant import SageQuantized, sage_quantize
+from .attention_layer import AttentionLayer
 from .fmha.fallback import FallbackFmha
 from .fmha.fmha_v2 import FmhaV2Fmha
 from .fmha.fp4_mla import Fp4MlaFmha
@@ -74,14 +72,11 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMask, AttentionMetadata,
                         AttentionRuntimeFeatures, KVCacheParams, MLAParams,
                         PositionalEmbeddingParams, PredefinedAttentionMask,
-                        RopeParams, merge_attention_forward_args)
+                        merge_attention_forward_args)
 from .mixed_precision_rows import store_mixed_precision_low_rows
 from .sparse.hooks import has_sparse_mla_hooks, prepare_sparse_runtime_params
 from .sparse.params import BlockSparseForwardInputs, SparseParams
-from .sparse.skip_softmax import SkipSoftmaxParams
 from .utils import log_attention_failure_context
-
-_SKIP_CORRECTION_SUPPORTED_SMS = frozenset((100, 103))
 
 # Set to 0 to run the locality domains one at a time instead of concurrently.
 # Each domain still uses its own stream, workspace and metadata, so only the
@@ -107,42 +102,6 @@ def trtllm_supports_swa_scratch_reuse(sm_version: Optional[int] = None) -> bool:
     """
     sm = get_sm_version() if sm_version is None else sm_version
     return sm == 90 or is_sm_100f(sm)
-
-
-def _resolve_skip_correction_threshold(threshold: float,
-                                       sm_version: int,
-                                       *,
-                                       is_mla: bool = True) -> float:
-    if not is_mla:
-        return 0.0
-    threshold = float(threshold)
-    if threshold <= 0.0:
-        return 0.0
-    if sm_version in _SKIP_CORRECTION_SUPPORTED_SMS:
-        return threshold
-    logger.warning_once(
-        "Skip-correction is supported only on SM100 and SM103; "
-        f"disabling it on SM{sm_version}.",
-        key="skip_correction_unsupported_sm",
-    )
-    return 0.0
-
-
-def _resolve_uses_spcompress(sparse_params: Optional[SparseParams],
-                             sm_version: int) -> bool:
-    uses_spcompress = bool(
-        isinstance(sparse_params, SkipSoftmaxParams)
-        and sparse_params.uses_spcompress)
-    if not uses_spcompress:
-        return False
-    if sm_version == 107:
-        return True
-    logger.warning_once(
-        "spcompress is supported only on SM107; "
-        f"disabling it on SM{sm_version}.",
-        key="uses_spcompress_unsupported_sm",
-    )
-    return False
 
 
 class _ContextPlan:
@@ -3234,41 +3193,12 @@ def _prepare_locality_domain_mla_gen_state_from_full(
         }
 
 
-class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
+class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata],
+                      AttentionLayer):
 
     Metadata = TrtllmAttentionMetadata
     # Run context-only calls from the forward's shared TrtllmAttentionMetadata.context_plan.
     cache_context_plan: bool = False
-    # FMHA library classes this instance tries before the registry's libraries.
-    prepended_fmha_lib_classes: tuple = ()
-    # Head dimension per K/V stage of FlashInferTrtllmGenFmha's FP8 paged causal context attention, run through
-    # trtllm::fmha_paged_context_fp8; 0 keeps FlashInfer's kernel.
-    context_fmha_head_dim_per_stage_kv: int = 0
-    # In a context-only step, FlashInferTrtllmGenFmha computes only each request's last output row (the others are
-    # zero); every row's K / V is still written.
-    context_last_rows_only: bool = False
-
-    # Layer state the native attention op reads through FmhaParams.attn. The
-    # generator (scripts/generate_fmha_params.py) collects these annotations;
-    # attributes assigned from an annotated __init__ parameter need none.
-    num_kv_heads: int
-    is_mla_enable: bool
-    v_head_dim: int
-    rope_params: RopeParams
-    q_scaling: float
-    predicted_tokens_per_seq: int
-    skip_correction_threshold: float
-    uses_spcompress: bool
-    q_lora_rank: Optional[int]
-    kv_lora_rank: Optional[int]
-    qk_nope_head_dim: Optional[int]
-    qk_rope_head_dim: Optional[int]
-    rope_append: Optional[bool]
-    rotary_inv_freq: Optional[torch.Tensor]
-    rotary_cos_sin: Optional[torch.Tensor]
-    position_embedding_type: PositionEmbeddingType
-    skip_softmax_stat: torch.Tensor
-    quant_mode: QuantMode
 
     @staticmethod
     def is_sm_version_trtllm_gen_kernel(sm):
@@ -3327,85 +3257,36 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         """
         super().__init__(layer_idx, num_heads, head_dim, num_kv_heads,
                          quant_config, **kwargs)
-        self.sparse_params = sparse_params
-        self.kv_cache_dtype = kv_cache_dtype
-        self.use_fp8_ds_mla: bool = kv_cache_dtype == "fp8_ds_mla"
-        self.is_mla_enable = mla_params is not None
+        AttentionLayer.__init__(
+            self,
+            layer_idx,
+            num_heads,
+            head_dim,
+            num_kv_heads,
+            quant_config=quant_config,
+            q_scaling=q_scaling,
+            pos_embd_params=pos_embd_params,
+            mla_params=mla_params,
+            attention_chunk_size=attention_chunk_size,
+            sparse_params=sparse_params,
+            kv_cache_dtype=kv_cache_dtype,
+            skip_correction_threshold=skip_correction_threshold,
+            gqa_decode=gqa_decode,
+            context_fmha_head_dim_per_stage_kv=
+            context_fmha_head_dim_per_stage_kv,
+            context_last_rows_only=context_last_rows_only,
+        )
+        # AttentionBackend keeps the caller's quant config until update_quant_config.
+        self.quant_config = quant_config
         sparse_algorithm = getattr(self.sparse_params, "algorithm", None)
         if (self.is_mla_enable and sparse_algorithm in ("deepseek_v4", "dsa")
                 and is_sm_120f() and self.kv_cache_dtype != "fp8_ds_mla"):
             raise ValueError(
                 "DeepSeek-V4/DSA sparse MLA on SM120/SM121 requires "
                 "kv_cache_config.dtype='fp8_ds_mla'.")
-        self.mla_params = mla_params or MLAParams()
-        self.v_head_dim = self.mla_params.v_head_dim if self.is_mla_enable else head_dim
-
-        rope_params = None
-        if pos_embd_params is not None:
-            rope_params = pos_embd_params.rope
-        self.rope_params = rope_params or RopeParams()
-
-        self.q_scaling = q_scaling or 1.0
-        self.predicted_tokens_per_seq = self.mla_params.predicted_tokens_per_seq
-        self.attention_chunk_size = attention_chunk_size
-        self.skip_correction_threshold = _resolve_skip_correction_threshold(
-            skip_correction_threshold,
-            get_sm_version(),
-            is_mla=self.is_mla_enable)
-        self.uses_spcompress = _resolve_uses_spcompress(sparse_params,
-                                                        get_sm_version())
-
-        if self.is_mla_enable:
-            self.q_lora_rank = self.mla_params.q_lora_rank
-            self.kv_lora_rank = self.mla_params.kv_lora_rank
-            self.qk_nope_head_dim = self.mla_params.qk_nope_head_dim
-            self.qk_rope_head_dim = self.mla_params.qk_rope_head_dim
-            self.rope_append = self.mla_params.rope_append
-        else:
-            self.q_lora_rank = None
-            self.kv_lora_rank = None
-            self.qk_nope_head_dim = None
-            self.qk_rope_head_dim = None
-            self.rope_append = None
-
-        self.rotary_inv_freq, self.rotary_cos_sin = self.rope_params.create_rope_const_params(
-        )
-        self.position_embedding_type = (pos_embd_params.type
-                                        if pos_embd_params is not None else
-                                        PositionEmbeddingType.learned_absolute)
-        self.skip_softmax_stat = torch.zeros(2,
-                                             dtype=torch.uint32,
-                                             device='cuda')
         self.print_skip_softmax_stat = os.environ.get(
             "TRTLLM_PRINT_SKIP_SOFTMAX_STAT", "0") == "1"
-
-        # Layer-level fp8 KV-cache scales. Stay at 1.0 (no-op) for the
-        # PyTorch backend, which never overrides them. They guarantee the
-        # kernel always receives a valid pointer, since several non-MLA
-        # XQA kernels (cpp/kernels/xqa/mha.cu, mha_sm90.cu) deref
-        # `kvCacheScale[0]` whenever `isKVCacheQuantized` is true and
-        # do not check for nullptr. `attention/attention.py` only assigns
-        # `forward_args.kv_scale_*` for fp4 KV cache, so without this
-        # fallback the kernel takes nullptr on fp8-KV models → illegal
-        # memory access.
-        self.kv_cache_scaling_factor = torch.ones(1,
-                                                  dtype=torch.float32,
-                                                  device='cuda')
-        self.kv_scale_quant_orig = self.kv_cache_scaling_factor
-        self.kv_scale_orig_quant = 1.0 / self.kv_cache_scaling_factor
-
-        self.local_layer_idx: Optional[int] = None
         self._fmha_manager: Optional[FmhaManager] = None
-        self.gqa_decode = gqa_decode
-        if context_fmha_head_dim_per_stage_kv < 0 or (
-                context_fmha_head_dim_per_stage_kv > 0
-                and head_dim % context_fmha_head_dim_per_stage_kv != 0):
-            raise ValueError(
-                f"context_fmha_head_dim_per_stage_kv="
-                f"{context_fmha_head_dim_per_stage_kv} must be 0 or divide "
-                f"head_dim={head_dim}.")
-        self.context_fmha_head_dim_per_stage_kv = context_fmha_head_dim_per_stage_kv
-        self.context_last_rows_only = context_last_rows_only
         # A GQA decode library of this layer, which plans the module's KV append and deferred prologue (set with
         # the FMHA manager).
         self.gqa_decode_fmha: Optional["GqaDecodeFmha"] = None
@@ -3423,17 +3304,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.update_quant_config(self.quant_config)
 
     @property
-    def uses_dsa_sparse_mla(self) -> bool:
-        return getattr(self.sparse_params, "algorithm",
-                       None) in ("deepseek_v4", "dsa")
-
-    @property
-    def uses_fp4_mla_attention(self) -> bool:
-        """Whether this layer executes dense FP4 MLA, not sparse NVFP4 storage."""
-        return (self.is_mla_enable and self.has_fp4_kv_cache
-                and self.sparse_params is None)
-
-    @property
     def has_fp8_context_mla(self) -> bool:
         """Whether MLA context attention with an FP8 KV cache runs the op's FP8
         context MLA FMHA, which reads FP8 Q, K and V."""
@@ -3448,23 +3318,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             manager.prewarm(config, attempted)
 
     def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
-        self.quant_config = new_quant_config or QuantConfig()
-        self.quant_mode = self.quant_config.layer_quant_mode
-        self.has_fp8_qdq = self.has_fp8_kv_cache = self.has_nvfp4 = False
-        if self.quant_config is not None:
-            self.has_fp8_kv_cache = self.quant_config.layer_quant_mode.has_fp8_kv_cache(
-            )
-            self.has_fp4_kv_cache = self.quant_config.layer_quant_mode.has_fp4_kv_cache(
-            )
-
-            self.has_fp8_qdq = self.quant_config.layer_quant_mode.has_fp8_qdq()
-            self.has_fp8_block_wise = self.quant_config.layer_quant_mode.has_fp8_block_scales(
-            )
-            self.has_fp8_rowwise = self.quant_config.layer_quant_mode.has_fp8_rowwise(
-            )
-            self.has_nvfp4 = self.quant_config.layer_quant_mode.has_nvfp4()
-            self.has_w4a8_nvfp4_fp8 = self.quant_config.layer_quant_mode.has_w4a8_nvfp4_fp8(
-            )
+        self.set_layer_quant_config(new_quant_config)
         self._fmha_manager = FmhaManager(self)
         # Every layer input of the FMHA selection and of the context workspace size.
         self._context_plan_layer_key = ()
@@ -3674,16 +3528,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                     and sparse_algorithm in ("dsa", "deepseek_v4")
                     and get_sm_version() >= 100)
 
-    def get_local_layer_idx(self, metadata: TrtllmAttentionMetadata) -> int:
-        if self.local_layer_idx is not None:
-            return self.local_layer_idx
-        if metadata.kv_cache_manager is None:
-            # Uncached: recomputed each call until a cache manager appears.
-            return self.layer_idx
-        self.local_layer_idx = metadata.kv_cache_manager.layer_offsets[
-            self.layer_idx]
-        return self.local_layer_idx
-
     def get_fp4_mla_local_layer_idx(self,
                                     metadata: TrtllmAttentionMetadata) -> int:
         """Return the compact index used by FP4 MLA-only side pools."""
@@ -3829,19 +3673,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             v_summary=summary.v.view(inputs.v_summary.shape),
             k_summary_scale=summary.k_scale)
 
-    def _ensure_rope_table_size(self, required_max_positions: int) -> None:
-        floats_per_position = self.rope_params.dim * (
-            2 if self.rope_params.duplicate_data else 1)
-        table_max_positions = (self.rotary_cos_sin.numel() //
-                               floats_per_position
-                               if self.rotary_cos_sin is not None else 0)
-        self.rope_params.max_positions = max(self.rope_params.max_positions,
-                                             table_max_positions,
-                                             required_max_positions)
-        if required_max_positions > table_max_positions:
-            self.rotary_inv_freq, self.rotary_cos_sin = (
-                self.rope_params.create_rope_const_params())
-
     def _has_fmha_lib(self, fmha_cls: type) -> bool:
         """Whether this layer enables ``fmha_cls``, alone or in the native fallback group."""
         return any(
@@ -3877,21 +3708,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self._has_fmha_lib(FmhaV2Fmha),
             self._has_fmha_lib(XqaFmha),
         )
-
-    def out_head_size(self, is_gen_only: bool) -> int:
-        """Per-head width of the attention output for this phase.
-
-        Single source of truth for the output buffer `create_output` allocates and
-        the view a phased FMHA library takes over it; the two must not drift. MLA
-        generation writes the latent (plus the rope part when it is not appended in
-        place), while MLA context writes the already-projected V head.
-        """
-        if not self.is_mla_enable:
-            return self.head_dim
-        if not is_gen_only:
-            return self.v_head_dim
-        return (self.kv_lora_rank if self.rope_append else self.kv_lora_rank +
-                self.qk_rope_head_dim)
 
     def _is_variable_window_kernel_available(
         self,
@@ -3948,38 +3764,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             q.new_empty((num_tokens, self.num_heads * v_head_size),
                         dtype=out_dtype)
         ]
-
-    @property
-    def rope_dim(self) -> int:
-        return self.rope_params.dim
-
-    @property
-    def rope_base(self) -> float:
-        return self.rope_params.theta
-
-    @property
-    def rope_scale_type(self) -> RotaryScalingType:
-        return self.rope_params.scale_type
-
-    @property
-    def rope_scale(self) -> float:
-        return self.rope_params.scale
-
-    @property
-    def rope_short_m_scale(self) -> float:
-        return self.rope_params.short_m_scale
-
-    @property
-    def rope_long_m_scale(self) -> float:
-        return self.rope_params.long_m_scale
-
-    @property
-    def rope_max_positions(self) -> int:
-        return self.rope_params.max_positions
-
-    @property
-    def rope_original_max_positions(self) -> int:
-        return self.rope_params.original_max_positions
 
     def forward(
         self,
@@ -4333,6 +4117,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                         raise RuntimeError(
                             "The per-tensor FP8 attention recipe needs the PrimTS "
                             "FMHA library (TLLM_FMHA_LIBS=+prims_ts), which is not "
+                            "enabled or does not support this request.")
+                    if part_args.sage_attn_smooth_v:
+                        raise RuntimeError(
+                            "SageAttention V smoothing needs the PrimTS FMHA library "
+                            "(TLLM_FMHA_LIBS=+prims_ts_block_sparse), which is not "
                             "enabled or does not support this request.")
                     if (metadata.num_contexts > 0
                             and metadata.use_paged_context_fmha
