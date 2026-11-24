@@ -2273,7 +2273,7 @@ class TestDisaggTerminationGuard:
         final claim is released, the departed request must be terminated even
         when the PP=1 early-termination optimization was requested."""
         req = Mock()
-        req.py_request_terminated = True
+        req.py_request_terminated = False
         coordinator, _, effects = _make_transfer_coordinator(
             active_requests=[],  # early termination deferred until transfer release
         )
