@@ -2671,9 +2671,9 @@ class OpenAIServer(_VideoRoutesMixin):
                     prompt_embeds_rows = await self._decode_prompt_embeds(
                         [part.data for part in prompt_embeds_parts])
                 except Exception:
-                    # The media loads were never started; close them instead
-                    # of leaving them to be reported as never awaited.
-                    mm_coroutines.close()
+                    # Run the tracker's coroutine so it closes the loads it
+                    # parked; with media beside parts it only discards them.
+                    await mm_coroutines
                     raise
 
             # Decode base64 int32 prompt_token_ids relayed by the orchestrator.

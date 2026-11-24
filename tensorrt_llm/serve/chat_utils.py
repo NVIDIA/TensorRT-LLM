@@ -617,8 +617,13 @@ def parse_chat_messages_coroutines(
 
     # ``item_order`` is populated synchronously by ``add_data``, so it can
     # be returned directly (not through the coroutine).
+    # The chat route refuses prompt_embeds parts beside media, so those loads never run.
+    mixes_parts_and_media = any(
+        msg.get(PROMPT_EMBEDS_MESSAGE_KEY)
+        for msg in conversation) and any(msg["media"] for msg in conversation)
     mm_coroutine = (mm_data_tracker.retrieve_all_async()
-                    if resolve_media else mm_data_tracker.discard_all_async())
+                    if resolve_media and not mixes_parts_and_media else
+                    mm_data_tracker.discard_all_async())
     return (conversation, mm_coroutine, mm_placeholder_counts,
             mm_data_tracker.item_order())
 

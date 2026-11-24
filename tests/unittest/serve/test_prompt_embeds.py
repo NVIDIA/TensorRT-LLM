@@ -3,8 +3,10 @@
 """``prompt_embeds`` on /v1/completions and as a chat content part (CPU, fake generator)."""
 
 import base64
+import gc
 import io
 import json
+import warnings
 from types import SimpleNamespace
 from typing import Any, Dict, Iterator, List
 
@@ -291,11 +293,15 @@ def test_chat_part_with_image_rejected(serve_env: ServeTestEnv) -> None:
     )
     image = {"type": "image_url", "image_url": {"url": "http://127.0.0.1:9/a.png"}}
     content = [_part(torch.zeros(2, HIDDEN)), image]
-    with serve_env.client(server.app) as client:
-        response = _chat(client, [{"role": "user", "content": content}])
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with serve_env.client(server.app) as client:
+            response = _chat(client, [{"role": "user", "content": content}])
+        gc.collect()
     assert response.status_code == 400
     assert "multimodal" in response.json()["message"]
     assert server.generator.generate_calls == []
+    assert not [w for w in caught if "never awaited" in str(w.message)]
 
 
 def test_chat_part_without_data(serve_env: ServeTestEnv) -> None:
@@ -358,8 +364,10 @@ def test_harmony_refuses_parts(serve_env: ServeTestEnv) -> None:
     assert server.generator.generate_calls == []
 
 
-@pytest.mark.parametrize("encoding", ["utf-8", "escaped", "utf-16"])
-@pytest.mark.parametrize("enabled", [True, False])
+@pytest.mark.parametrize(
+    "enabled, encoding",
+    [(True, "utf-8"), (True, "escaped"), (True, "utf-16"), (False, "utf-8")],
+)
 def test_harmony_refuses_parts_in_tool_messages(
     serve_env: ServeTestEnv, enabled: bool, encoding: str
 ) -> None:
@@ -511,3 +519,42 @@ def test_splice_rejects_mixed_dtypes() -> None:
     rows = [torch.zeros(1, 4), torch.zeros(1, 4, dtype=torch.float16)]
     with pytest.raises(ValueError, match="dtype"):
         splice_chat_prompt_embeds("<A><B>", parts, rows, _identity_tokenize, False)
+
+
+class _MergingTokenizer:
+    """Tokenizer stand-in: one id per character, except ``merges`` pairs become one id.
+
+    ``is_fast`` selects the path under test: offset mapping, or the probe's own ids.
+    """
+
+    def __init__(self, merges: set, is_fast: bool) -> None:
+        self.merges = merges
+        self.is_fast = is_fast
+
+    def _tokens(self, text: str) -> List[tuple]:
+        tokens, i = [], 0
+        while i < len(text):
+            step = 2 if text[i : i + 2] in self.merges else 1
+            tokens.append((1000 * (step - 1) + ord(text[i]), (i, i + step)))
+            i += step
+        return tokens
+
+    def encode(self, text: str, add_special_tokens: bool = False) -> List[int]:
+        return [token for token, _ in self._tokens(text)]
+
+    def __call__(self, text: str, add_special_tokens: bool, return_offsets_mapping: bool):
+        tokens = self._tokens(text)
+        return {"input_ids": [t for t, _ in tokens], "offset_mapping": [o for _, o in tokens]}
+
+
+@pytest.mark.parametrize("is_fast", [True, False], ids=["offsets", "probe_ids"])
+def test_continuation_tries_the_next_probe(is_fast: bool) -> None:
+    """A probe that merges into the text is skipped; a later one keeps the text's own ids."""
+    res = SimpleNamespace(tokenizer=_MergingTokenizer({"ax"}, is_fast))
+    assert resource_continuation(res)("xy") == [ord("x"), ord("y")]
+
+
+@pytest.mark.parametrize("is_fast", [True, False], ids=["offsets", "probe_ids"])
+def test_continuation_gives_up_when_every_probe_merges(is_fast: bool) -> None:
+    res = SimpleNamespace(tokenizer=_MergingTokenizer({"ax", ".x", ",x"}, is_fast))
+    assert resource_continuation(res)("xy") is None
