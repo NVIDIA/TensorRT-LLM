@@ -886,7 +886,9 @@ def test_dispatch_final_batch_notifies_async_waiter_before_sentinel(tmp_path) ->
     async def run() -> None:
         proxy = _bare_proxy()
         proxy.result_queue = FusedIpcQueue(
-            (f"ipc://{tmp_path / 'final.sock'}", b"private-test-key"), is_server=True
+            (f"ipc://{tmp_path / 'final.sock'}", b"private-test-key"),
+            is_server=True,
+            recv_timeout=5,
         )
         worker_lane = FusedIpcQueue(proxy.result_queue.address, is_server=False)
         pending = _FakeResult()
