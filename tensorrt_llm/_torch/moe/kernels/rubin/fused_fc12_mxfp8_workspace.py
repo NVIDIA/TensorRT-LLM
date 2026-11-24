@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Reset the MXFP8 fused FC12 synchronization workspace in one launch.
+"""Prepare an MXFP8 fused FC12 launch: reset its workspace, clear, quantize.
 
 The fused FC12 kernel gates FC2 A-loads on per-M-tile readiness flags and
 draws work IDs from two L2-atomic counters. All of them must be zero on
@@ -72,7 +72,7 @@ def _store_zero_128(ptr: cute.Pointer, *, loc=None, ip=None) -> None:
 
 
 @cute.kernel
-def _reset_fc12_sync_workspace_kernel(
+def _prepare_fc12_launch_kernel(
     ready: cute.Tensor,
     fc1_counter: cute.Tensor,
     fc2_counter: cute.Tensor,
@@ -123,7 +123,7 @@ def _reset_fc12_sync_workspace_kernel(
 
 
 @cute.jit
-def reset_fc12_sync_workspace(
+def prepare_fc12_launch(
     ready_ptr: cute.Pointer,
     num_ready: cutlass.Int32,
     fc1_counter_ptr: cute.Pointer,
@@ -138,7 +138,8 @@ def reset_fc12_sync_workspace(
     input_scale_ptr: Optional[cute.Pointer] = None,
     input_numel: cutlass.Int32 = 0,
 ) -> None:
-    """Clear the sync workspace and optional BF16 output, and quantize raw input.
+    """Prepare one fused FC12 launch: clear its sync workspace, optionally
+    clear the BF16 output and quantize raw input.
 
     Clear ``num_ready`` Int32 ready flags, two one-element Int32 counters
     and, with ``zero_output``, ``output_numel`` BF16 output elements. With
@@ -182,7 +183,7 @@ def reset_fc12_sync_workspace(
             input_scale_ptr, cute.make_layout((input_numel // MXFP8_SCALE_GROUP_SIZE,))
         )
         grid = cutlass.max(grid, cute.ceil_div(input_numel, block_threads * _QUANT_VALUES_PER_LANE))
-    _reset_fc12_sync_workspace_kernel(
+    _prepare_fc12_launch_kernel(
         ready,
         fc1_counter,
         fc2_counter,
