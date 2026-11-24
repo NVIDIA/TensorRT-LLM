@@ -126,7 +126,7 @@ def test_abort_and_rearm_after_peer_failure() -> None:
         resets.append(1)
         torch.ops.trtllm.moe_a2a_initialize(workspace, meta, 0, _EP_SIZE, barrier=False)
 
-    state.register_workspace(object(), reset_workspace, Mock(), workspace)
+    state.register_workspace(object(), object(), reset_workspace, Mock(), workspace)
 
     _collective_round(state, workspace, meta, experts, payload)
     done = _queued_work_done()
@@ -188,7 +188,7 @@ def test_incomplete_round_word_marks_the_state_aborted() -> None:
         key = object()
         # Layers that share a workspace register it again.
         for _ in range(2):
-            state.register_workspace(key, Mock(), check, workspace)
+            state.register_workspace(object(), key, Mock(), check, workspace)
 
     state.check_incomplete_rounds()
     torch.cuda.synchronize()
@@ -209,6 +209,7 @@ def test_rearm_resets_bound_layers_and_shared_workspaces() -> None:
     shared = object()
     for name in ("shared", "shared again"):
         state.register_workspace(
+            object(),
             shared,
             lambda name=name: resets.append(name),
             Mock(),
@@ -221,6 +222,32 @@ def test_rearm_resets_bound_layers_and_shared_workspaces() -> None:
     state.rearm()
     assert resets == ["shared", "layer workspace"]
     assert comm._dispatch_state == {"phase": "idle"}
+
+
+def test_destroyed_layer_leaves_the_execution_state() -> None:
+    """A destroyed layer's callbacks leave the state, which reaches a shared workspace through a
+    layer that is still bound, and through none once the last layer is destroyed."""
+    state = MoeExecutionState(EPGroupHealth(2), 0, torch.device("cuda"))
+    calls = []
+    comms = [_frontend(), _frontend()]
+    comms[1].mnnvl_mem = comms[0].mnnvl_mem
+    for name, comm in zip(("first", "second"), comms):
+        comm.reset_state = lambda name=name: calls.append(f"{name} layer")
+        comm._reset_local_workspace = lambda name=name: calls.append(f"{name} workspace")
+        comm._check_incomplete_round = lambda name=name: calls.append(f"{name} check")
+        comm.bind_execution_state(state)
+
+    comms[0].destroy()
+    assert comms[0].execution_state is None
+    state.rearm()
+    state.check_incomplete_rounds()
+    assert calls == ["second workspace", "second layer", "second check"]
+
+    calls.clear()
+    comms[1].destroy()
+    state.rearm()
+    state.check_incomplete_rounds()
+    assert calls == []
 
 
 def test_abort_requested_during_rearm_stays(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -316,6 +343,7 @@ def test_shared_workspace_counted_once() -> None:
     }
     for workspace, name in ((shared, "shared"), (shared, "shared again"), (other, "other")):
         state.register_workspace(
+            object(),
             workspace,
             lambda name=name: resets.append(name),
             lambda name=name: checks.append(name),
@@ -428,8 +456,11 @@ def test_bound_layer_passes_the_device_mask(monkeypatch: pytest.MonkeyPatch) -> 
         assert kwargs["enable_rank_mask"] is True and kwargs["use_sentinel"] is False
         assert kwargs["active_rank_mask"] is state.active_rank_mask
         assert kwargs["abort_state"] is state.abort
-    state.register_layer.assert_called_once_with(bound.reset_state, bound._mnnvl_checkpoint_is_idle)
+    state.register_layer.assert_called_once_with(
+        bound, bound.reset_state, bound._mnnvl_checkpoint_is_idle
+    )
     state.register_workspace.assert_called_once_with(
+        bound,
         bound.mnnvl_mem,
         bound._reset_local_workspace,
         bound._check_incomplete_round,

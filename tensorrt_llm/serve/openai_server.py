@@ -51,6 +51,7 @@ from tensorrt_llm.executor.rank_failure_requests import (RANK_FAILURE_CODE,
 from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
 from tensorrt_llm.executor.rpc import RPCError
 from tensorrt_llm.executor.utils import (CONTEXT_LENGTH_EXCEEDED_CODE,
+                                         RequestError,
                                          is_context_length_exceeded_message)
 from tensorrt_llm.inputs import prompt_inputs
 from tensorrt_llm.inputs.data import TokensPrompt
@@ -325,14 +326,20 @@ def _configure_parser_special_token_decoding(
 def _stream_error_events(error: Exception) -> List[str]:
     """Return the SSE events that end a stream whose request failed.
 
-    The client receives an OpenAI error object with the exception's message,
-    then [DONE]. A streaming completion reports a failure the same way once
-    HTTP 200 has been sent. A rank failure carries the rank_failure code.
+    The client receives an OpenAI error object, then [DONE]. A streaming
+    completion reports a failure the same way once HTTP 200 has been sent.
+    The object carries the message of a RequestError, which the executor
+    reports for this request alone. Any other exception is an internal failure
+    whose text can hold internal detail, such as a dead worker's rank and
+    process ID: the client receives a generic message, and the caller logs the
+    exception. A rank failure, a RequestError, carries the rank_failure code.
     """
+    message = (str(error)
+               if isinstance(error, RequestError) else "Internal server error")
     code = RANK_FAILURE_CODE if isinstance(error, RankFailureError) else None
     error_data = json.dumps({
         "error": {
-            "message": str(error),
+            "message": message,
             "type": "server_error",
             "code": code,
             "param": None,

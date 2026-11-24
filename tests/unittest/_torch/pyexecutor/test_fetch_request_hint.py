@@ -70,7 +70,8 @@ def _make_stub_executor(rank=0, queued_items=None):
     stub._fetch_drain_cancellations = MethodType(PyExecutor._fetch_drain_cancellations, stub)
     # No generation-side receive is retiring.
     stub.disagg = SimpleNamespace(
-        has_retiring_gen_receives=False, supports_logical_context_cancellation=lambda req: False
+        has_retiring_gen_receives=False,
+        supports_logical_context_cancellation=lambda req=None: False,
     )
     # FCFS waiting queue: no wait cap, so no rank-0 clock.
     stub._waiting_queue_needs_clock = False

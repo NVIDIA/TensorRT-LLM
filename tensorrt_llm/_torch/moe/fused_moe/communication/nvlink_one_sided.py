@@ -964,8 +964,9 @@ class NVLinkOneSided(Communication):
             raise ValueError(
                 f"An execution state of EP rank {state.ep_rank} cannot run EP rank {self.ep_rank}"
             )
-        state.register_layer(self.reset_state, self._mnnvl_checkpoint_is_idle)
+        state.register_layer(self, self.reset_state, self._mnnvl_checkpoint_is_idle)
         state.register_workspace(
+            self,
             self.mnnvl_mem,
             self._reset_local_workspace,
             self._check_incomplete_round,
@@ -1054,6 +1055,11 @@ class NVLinkOneSided(Communication):
             return
 
         self._destroyed = True
+        # The execution state may outlive this layer, so its rearm must not reach the layer.
+        execution_state = getattr(self, "execution_state", None)
+        if execution_state is not None:
+            execution_state.unregister(self)
+            self.execution_state = None
         lifecycle = getattr(self, "_workspace_lifecycle", None)
         if lifecycle is not None and getattr(self, "_workspace_registered", False):
             lifecycle.unregister(self)
