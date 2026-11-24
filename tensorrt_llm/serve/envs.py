@@ -202,7 +202,7 @@ _DEPLOY: tuple[EnvVar, ...] = (
         default="unset",
         description=(
             "API key the runtime-control (sleep and wake-up) endpoints require; mandatory with "
-            "--enable_sleep_mode."
+            "--enable_sleep_mode. Also the memory-report route's fallback when no server key is set."
         ),
         secret=True,
     ),

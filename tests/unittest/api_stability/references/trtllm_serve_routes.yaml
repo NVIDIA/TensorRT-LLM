@@ -279,6 +279,41 @@ configs:
     - POST /resume_memory _MsgspecRoute
     - GET /memory_status _MsgspecRoute
     - GET /server_info _MsgspecRoute
+  llm_memory_report:
+    kind: openai_server
+    routes:
+    - GET,HEAD /openapi.json Route
+    - GET,HEAD /docs Route
+    - GET,HEAD /docs/oauth2-redirect Route
+    - GET,HEAD /redoc Route
+    - GET /health _MsgspecRoute
+    - GET /health_generate _MsgspecRoute
+    - GET /version _MsgspecRoute
+    - GET /v1/models _MsgspecRoute
+    - GET /v1/data_transceiver_state _MsgspecRoute
+    - GET /metrics _MsgspecRoute
+    - GET /energy_metrics _MsgspecRoute
+    - GET /steady_clock_offset _MsgspecRoute
+    - POST /steady_clock_offset _MsgspecRoute
+    - POST /kv_cache_events _MsgspecRoute
+    - POST /v1/completions _MsgspecRoute
+    - POST /v1/chat/completions _MsgspecRoute
+    - POST /v1/messages _MsgspecRoute
+    - POST /v1/messages/count_tokens _MsgspecRoute
+    - POST /v1/messages/batches _MsgspecRoute
+    - GET /v1/messages/batches _MsgspecRoute
+    - GET /v1/messages/batches/{batch_id} _MsgspecRoute
+    - DELETE /v1/messages/batches/{batch_id} _MsgspecRoute
+    - POST /v1/messages/batches/{batch_id}/cancel _MsgspecRoute
+    - GET /v1/messages/batches/{batch_id}/results _MsgspecRoute
+    - POST /v1/responses _MsgspecRoute
+    - GET /v1/responses/{response_id} _MsgspecRoute
+    - DELETE /v1/responses/{response_id} _MsgspecRoute
+    - POST /_internal/tokenize _MsgspecRoute
+    - POST /start_profile _MsgspecRoute
+    - POST /stop_profile _MsgspecRoute
+    - GET /memory_report _MsgspecRoute
+    - GET /server_info _MsgspecRoute
   llm_rl_and_runtime_control:
     kind: openai_server
     error: 'ValueError: Legacy RL control and runtime control endpoints cannot both be enabled.'

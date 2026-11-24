@@ -1,12 +1,54 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Worker-side helpers for tests that reuse one ``MpiPoolSession``.
+"""Worker-side helpers for tests that reuse MPI workers.
 
 Used by the automatic session-reuse layer (``test_common/session_reuse.py``).
 This is test infrastructure only and must not be used on production inference
 paths. Heavy imports are done lazily so importing this module never triggers a
 circular import during package initialization.
 """
+
+from collections.abc import Iterator
+from contextlib import contextmanager
+
+
+@contextmanager
+def preserve_worker_env(n_workers: int, name: str) -> Iterator[None]:
+    """Restore a variable on launcher-owned ranks after the executor shuts down.
+
+    Callers must use ``private_mpi_session`` for locally spawned workers.
+    """
+    from tensorrt_llm.executor.utils import create_mpi_comm_session, get_spawn_proxy_process_env
+
+    session = create_mpi_comm_session(n_workers) if get_spawn_proxy_process_env() else None
+    previous = dict(session.submit_sync(get_worker_env, name)) if session else {}
+    try:
+        yield
+    finally:
+        if session:
+            session.submit_sync(restore_worker_env, name, previous)
+
+
+def get_worker_env(name: str) -> tuple[int, str | None]:
+    """Read an environment variable with its rank for order-independent restoration."""
+    import os
+
+    from mpi4py import MPI
+
+    return MPI.COMM_WORLD.Get_rank(), os.environ.get(name)
+
+
+def restore_worker_env(name: str, previous: dict[int, str | None]) -> None:
+    """Restore this rank's environment variable, including its original absence."""
+    import os
+
+    from mpi4py import MPI
+
+    value = previous[MPI.COMM_WORLD.Get_rank()]
+    if value is None:
+        os.environ.pop(name, None)
+    else:
+        os.environ[name] = value
 
 
 def _ranked_run(fn):

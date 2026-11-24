@@ -188,6 +188,7 @@ def _run(world: int, group_size: int) -> bool:
                     use_rejection_sampling=False,
                     is_ragged_verify=False,
                     enable_penalty=False,
+                    skip_verify_row_gather=False,
                 )
             spec_metadata.draft_tokens = draft.reshape(-1)
             spec_metadata.gather_ids = torch.arange(rows, device="cuda")

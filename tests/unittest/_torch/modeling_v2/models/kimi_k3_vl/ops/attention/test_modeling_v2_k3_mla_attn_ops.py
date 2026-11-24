@@ -230,10 +230,10 @@ class _Bench:
         """Every cache pool a call of these tests may write."""
         if self.kind != "nvfp4":
             return [self.manager.get_buffers(0)]
-        manager = self.manager
-        kv, sf = manager.get_fp4_mla_cache_buffers(0)
-        pools = [kv, sf, manager.get_fp4_mla_hp_pool()]
-        for extra in (manager.get_mla_v_scale_pool(), manager.get_mla_v_packed_pool_base()):
+        layout = self.manager.fp4_mla_layout
+        kv, sf = layout.get_fp4_mla_cache_buffers(0)
+        pools = [kv, sf, layout.get_fp4_mla_hp_pool()]
+        for extra in (layout.get_mla_v_scale_pool(), layout.get_mla_v_packed_pool_base()):
             if extra is not None:
                 pools.append(extra)
         return pools

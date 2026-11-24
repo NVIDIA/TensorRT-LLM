@@ -295,7 +295,7 @@ CALL_SITES = {
     "TRTLLM_SERVER_DISABLE_GC": "tensorrt_llm/commands/serve.py",
     "TRTLLM_DISAGG_SERVER_DISABLE_GC": "tensorrt_llm/commands/serve.py",
     "TRTLLM_RESPONSES_API_DISABLE_STORE": "tensorrt_llm/commands/serve.py, tensorrt_llm/serve/openai_server.py",
-    "TRTLLM_RUNTIME_CONTROL_API_KEY": "tensorrt_llm/commands/serve.py",
+    "TRTLLM_RUNTIME_CONTROL_API_KEY": "tensorrt_llm/commands/serve.py, tensorrt_llm/serve/openai_server.py",
     "TRTLLM_MEDIA_STORAGE_PATH": "tensorrt_llm/serve/openai_server.py",
     "DISABLE_HARMONY_ADAPTER": (
         "tensorrt_llm/serve/chat_tokenization.py, tensorrt_llm/serve/openai_server.py, "

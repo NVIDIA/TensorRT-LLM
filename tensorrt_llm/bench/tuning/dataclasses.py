@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import json
 import os
 import struct
@@ -55,6 +58,10 @@ SAFETENSORS_DTYPE_BYTES = {
     "F8_E4M3": 1,
 }
 
+# Weight files of a Mistral-native checkpoint, next to its params.json.
+CONSOLIDATED_SAFETENSORS_SINGLE_FILE = "consolidated.safetensors"
+CONSOLIDATED_SAFETENSORS_INDEX_FILE = "consolidated.safetensors.index.json"
+
 
 def parse_safetensors_file_metadata(model_path, filename):
     with open(os.path.join(model_path, filename), "rb") as f:
@@ -98,24 +105,45 @@ def parse_safetensors_file_metadata(model_path, filename):
         ) from e
 
 
-def get_safetensors_metadata(model_name_or_path):
-    """Read the safetensors metadata from HF model."""
+def get_safetensors_metadata(model_name_or_path, consolidated: bool = False):
+    """Read the safetensors metadata from HF model.
+
+    Args:
+        model_name_or_path: Hugging Face model name or local checkpoint directory.
+        consolidated: Read the consolidated*.safetensors files of a local Mistral-native
+            checkpoint instead of the model*.safetensors files.
+    """
+    single_file, index_file = (
+        (CONSOLIDATED_SAFETENSORS_SINGLE_FILE, CONSOLIDATED_SAFETENSORS_INDEX_FILE)
+        if consolidated
+        else (SAFETENSORS_SINGLE_FILE, SAFETENSORS_INDEX_FILE)
+    )
     if os.path.isdir(model_name_or_path):
-        if os.path.exists(os.path.join(model_name_or_path, SAFETENSORS_SINGLE_FILE)):
+        # A consolidated checkpoint may come as shards without an index, which the
+        # runtime finds by name.
+        unindexed_shards = (
+            sorted(
+                name
+                for name in os.listdir(model_name_or_path)
+                if "consolidated" in name and name.endswith(".safetensors")
+            )
+            if consolidated
+            else []
+        )
+        if os.path.exists(os.path.join(model_name_or_path, single_file)):
             file_metadata = parse_safetensors_file_metadata(
-                model_path=model_name_or_path, filename=SAFETENSORS_SINGLE_FILE
+                model_path=model_name_or_path, filename=single_file
             )
             return SafetensorsRepoMetadata(
                 metadata=None,
                 sharded=False,
                 weight_map={
-                    tensor_name: SAFETENSORS_SINGLE_FILE
-                    for tensor_name in file_metadata.tensors.keys()
+                    tensor_name: single_file for tensor_name in file_metadata.tensors.keys()
                 },
-                files_metadata={SAFETENSORS_SINGLE_FILE: file_metadata},
+                files_metadata={single_file: file_metadata},
             )
-        elif os.path.exists(os.path.join(model_name_or_path, SAFETENSORS_INDEX_FILE)):
-            with open(os.path.join(model_name_or_path, SAFETENSORS_INDEX_FILE)) as f:
+        elif os.path.exists(os.path.join(model_name_or_path, index_file)):
+            with open(os.path.join(model_name_or_path, index_file)) as f:
                 index = json.load(f)
 
             weight_map = index.get("weight_map", {})
@@ -141,12 +169,34 @@ def get_safetensors_metadata(model_name_or_path):
                 weight_map=weight_map,
                 files_metadata=files_metadata,
             )
+        elif unindexed_shards:
+            files_metadata = {
+                filename: parse_safetensors_file_metadata(
+                    model_path=model_name_or_path, filename=filename
+                )
+                for filename in unindexed_shards
+            }
+            return SafetensorsRepoMetadata(
+                metadata=None,
+                sharded=True,
+                weight_map={
+                    tensor_name: filename
+                    for filename, file_metadata in files_metadata.items()
+                    for tensor_name in file_metadata.tensors.keys()
+                },
+                files_metadata=files_metadata,
+            )
         else:
             # Not a safetensors repo
             raise RuntimeError(
                 f"'{model_name_or_path}' is not a safetensors repo. Couldn't find "
-                f"'{SAFETENSORS_INDEX_FILE}' or '{SAFETENSORS_SINGLE_FILE}' files."
+                f"'{index_file}' or '{single_file}' files."
             )
+    elif consolidated:
+        raise RuntimeError(
+            f"'{model_name_or_path}' is not a local directory; consolidated safetensors "
+            "files are read from local checkpoints only."
+        )
     else:
         return huggingface_hub.get_safetensors_metadata(model_name_or_path)
 
@@ -266,8 +316,14 @@ class ModelConfig(BaseModel):
         return bool(self.kv_lora_rank and self.qk_rope_head_dim)
 
     @classmethod
-    def get_param_count_and_checkpoint_size(cls, model_hf_name, hf_model_path):
+    def get_param_count_and_checkpoint_size(cls, model_hf_name, hf_model_path, consolidated=False):
         """Read parameter count and checkpoint size from safetensors metadata.
+
+        Args:
+            model_hf_name: Hugging Face model name.
+            hf_model_path: Local checkpoint directory, or None to read model_hf_name.
+            consolidated: Read the consolidated*.safetensors files of a Mistral-native
+                checkpoint.
 
         Returns:
             Tuple[int, float]: (param_count, checkpoint_size_in_gb).
@@ -282,7 +338,7 @@ class ModelConfig(BaseModel):
             checkpoint_size_in_gb = param_count / (1024**3)
         else:
             model_name_or_path = hf_model_path or model_hf_name
-            metadata = get_safetensors_metadata(model_name_or_path)
+            metadata = get_safetensors_metadata(model_name_or_path, consolidated=consolidated)
             param_count = sum(metadata.parameter_count.values())
             # Compute actual checkpoint size using per-dtype byte sizes.
             # This is critical for quantized models (e.g. NVFP4) where
@@ -315,6 +371,34 @@ class ModelConfig(BaseModel):
             param_count=param_count,
             checkpoint_size_in_gb=checkpoint_size_in_gb,
             **hf_config,
+        )
+
+    @classmethod
+    def from_mistral(cls, model_name, model_path, checkpoint_format):
+        """Read a Mistral-native checkpoint the way the runtime loads it.
+
+        The configuration comes from params.json through the Mistral config loader, and the
+        parameter count and checkpoint size from the consolidated safetensors files.
+
+        Args:
+            model_name: Model name.
+            model_path: Local checkpoint directory, or None to read model_name.
+            checkpoint_format: The Mistral-native checkpoint format.
+        """
+        pretrained_config = load_pretrained_config(
+            model_path or model_name, checkpoint_format=checkpoint_format
+        )
+        config = pretrained_config.to_dict()
+        # to_dict() writes the model_type of the config class, not the one the loader sets.
+        config["model_type"] = pretrained_config.model_type
+        param_count, checkpoint_size_in_gb = cls.get_param_count_and_checkpoint_size(
+            model_name, model_path, consolidated=True
+        )
+        return cls(
+            name=model_name,
+            param_count=param_count,
+            checkpoint_size_in_gb=checkpoint_size_in_gb,
+            **config,
         )
 
     def extra_model_cache_in_gb(self, bytes_per_elem, target_seq_len=None):
