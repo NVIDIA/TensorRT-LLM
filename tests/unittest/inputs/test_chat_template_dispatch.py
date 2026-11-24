@@ -3,6 +3,7 @@
 """Tests for content-format-driven chat template dispatch and placeholder handling."""
 
 import threading
+from unittest.mock import Mock
 
 import pytest
 from transformers import PreTrainedTokenizerBase
@@ -15,10 +16,12 @@ from tensorrt_llm.inputs.registry import (
 )
 from tensorrt_llm.inputs.utils import (
     ConversationMessage,
+    MultimodalDataTracker,
     _build_openai_content,
     _resolve_content_format,
     add_multimodal_placeholders,
     apply_chat_template,
+    apply_mm_placeholders,
     async_apply_chat_template,
     interleave_mm_placeholders,
 )
@@ -81,6 +84,63 @@ def _register_test_models():
             MULTIMODAL_PLACEHOLDER_REGISTRY.remove_placeholder_metadata(mt)
         except ValueError:
             pass
+
+
+@pytest.mark.parametrize("model_type", ["qwen3_5", "qwen3_5_moe"])
+class TestQwen35PlaceholderOrder:
+    def test_frame_labels_stay_with_their_images(self, model_type: str) -> None:
+        image = "<|vision_start|><|image_pad|><|vision_end|>"
+        content_parts = []
+        for index in range(4):
+            content_parts.extend([f"Frame {index + 1}: ", {"type": "image", "media_index": index}])
+        message = ConversationMessage(
+            role="user",
+            content="Frame 1: Frame 2: Frame 3: Frame 4: ",
+            media=[],
+            content_parts=content_parts,
+        )
+        tracker = Mock(spec=MultimodalDataTracker)
+        tracker.placeholder_modalities.return_value = {image: "image"}
+        tracker.item_order.return_value = []
+
+        apply_mm_placeholders(model_type, message, {image: 4}, tracker)
+
+        assert message["content"] == (
+            f"Frame 1: {image}Frame 2: {image}Frame 3: {image}Frame 4: {image}"
+        )
+
+    def test_mixed_media_preserve_content_order(self, model_type: str) -> None:
+        image = "<|vision_start|><|image_pad|><|vision_end|>"
+        video = "<|vision_start|><|video_pad|><|vision_end|>"
+        message = ConversationMessage(
+            role="user",
+            content="Video: Image: Compare.",
+            media=[],
+            content_parts=[
+                "Video: ",
+                {"type": "video", "media_index": 0},
+                "Image: ",
+                {"type": "image", "media_index": 1},
+                "Compare.",
+            ],
+        )
+        tracker = Mock(spec=MultimodalDataTracker)
+        tracker.placeholder_modalities.return_value = {image: "image", video: "video"}
+        tracker.item_order.return_value = []
+
+        apply_mm_placeholders(model_type, message, {image: 1, video: 1}, tracker)
+
+        assert message["content"] == f"Video: {video}Image: {image}Compare."
+
+    def test_without_content_parts_keeps_bulk_placement(self, model_type: str) -> None:
+        image = "<|vision_start|><|image_pad|><|vision_end|>"
+        message = ConversationMessage(role="user", content="Compare.", media=[])
+        tracker = Mock(spec=MultimodalDataTracker)
+        tracker.item_order.return_value = []
+
+        apply_mm_placeholders(model_type, message, {image: 2}, tracker)
+
+        assert message["content"] == f"{image}{image}Compare."
 
 
 class TestResolveContentFormat:
