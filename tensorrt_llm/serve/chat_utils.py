@@ -29,6 +29,10 @@ from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
 from tensorrt_llm.inputs.utils import (NATIVE_MISTRAL_MODEL_TYPES,
                                        apply_mm_placeholders)
 from tensorrt_llm.logger import logger
+from tensorrt_llm.serve.prompt_embeds import (PROMPT_EMBEDS_MESSAGE_KEY,
+                                              PROMPT_EMBEDS_PART_TYPE,
+                                              ChatPromptEmbedsPart,
+                                              new_chat_part)
 
 
 class VideoURL(TypedDict):
@@ -235,6 +239,7 @@ def parse_chat_message_content_parts(
     parts: Iterable[ChatCompletionContentPartParam],
     mm_data_tracker: MultimodalDataTracker,
     keep_content_parts: bool = False,
+    accept_prompt_embeds: bool = False,
 ) -> ConversationMessage:
     """Parse multiple parts of a chat message.
 
@@ -246,8 +251,21 @@ def parse_chat_message_content_parts(
     media_parts: list[MultimodalData] = []
     content_parts: list[Union[str, dict]] = []
 
+    prompt_embeds_parts: list[ChatPromptEmbedsPart] = []
     media_index = 0
     for part in parts:
+        if isinstance(part,
+                      dict) and part.get("type") == PROMPT_EMBEDS_PART_TYPE:
+            if not accept_prompt_embeds:
+                raise ValueError(
+                    "prompt_embeds content parts are only accepted "
+                    "by /v1/chat/completions.")
+            # Rendered as a marker; the chat route replaces it with the rows.
+            embeds_part = new_chat_part(part)
+            prompt_embeds_parts.append(embeds_part)
+            text_parts.append(embeds_part.marker)
+            content_parts.append(embeds_part.marker)
+            continue
         parse_res = parse_chat_message_content_part(part, mm_data_tracker)
         if parse_res:
             if isinstance(parse_res, str):
@@ -270,6 +288,8 @@ def parse_chat_message_content_parts(
     # interleaved ordering for multimodal dispatch).
     if media_parts or keep_content_parts:
         result["content_parts"] = content_parts
+    if prompt_embeds_parts:
+        result[PROMPT_EMBEDS_MESSAGE_KEY] = prompt_embeds_parts
     return result
 
 
@@ -279,7 +299,8 @@ def parse_chat_message_content(
         lenient_tool_call_arguments: bool = False,
         keep_message_tools: bool = False,
         keep_text_parts: bool = False,
-        raw_tool_call_arguments: bool = False) -> ConversationMessage:
+        raw_tool_call_arguments: bool = False,
+        accept_prompt_embeds: bool = False) -> ConversationMessage:
     """Parse the content of a chat message.
 
     With `keep_text_parts`, a content list keeps its text parts as separate
@@ -306,6 +327,7 @@ def parse_chat_message_content(
         content,
         mm_data_tracker,
         keep_content_parts=keep_text_parts and is_part_list,
+        accept_prompt_embeds=accept_prompt_embeds,
     )
     if role == "assistant":
         result.update(
@@ -490,6 +512,7 @@ def parse_chat_messages_coroutines(
     request_media_io_kwargs: Optional[Dict[str, Dict[str, Any]]] = None,
     model_type_override: Optional[str] = None,
     resolve_media: bool = True,
+    accept_prompt_embeds: bool = False,
 ) -> Tuple[List[ConversationMessage], Coroutine[Any, Any, tuple[Optional[Dict[
         str, List[Any]]], Optional[Dict[str, List[Any]]]]], list[dict[str,
                                                                       int]]]:
@@ -512,6 +535,9 @@ def parse_chat_messages_coroutines(
         resolve_media: When False the returned coroutine closes the
             pending loads instead of running them and yields
             `(None, None)`.
+        accept_prompt_embeds: Parse `prompt_embeds` parts into markers and
+            per-message `PROMPT_EMBEDS_MESSAGE_KEY` entries for the caller
+            to consume; otherwise such parts are rejected.
 
     Returns:
         `(conversation, mm_coroutine, mm_placeholder_counts)` where
@@ -561,7 +587,8 @@ def parse_chat_messages_coroutines(
             lenient_tool_call_arguments=(model_type == "kimi_k3"),
             keep_message_tools=(model_type == "kimi_k3"),
             keep_text_parts=native_mistral,
-            raw_tool_call_arguments=native_mistral)
+            raw_tool_call_arguments=native_mistral,
+            accept_prompt_embeds=accept_prompt_embeds)
         conversation.append(parsed_msg)
 
         # Track placeholders added for this message only.

@@ -69,10 +69,10 @@ models:
         required: true
       prompt:
         kind: openai
-        type: Union[List[int], List[List[int]], str, List[str]]
+        type: Optional[Union[List[int], List[List[int]], str, List[str]]]
         default: null
         status: stable
-        required: true
+        required: false
       best_of:
         kind: openai
         type: Optional[int]
@@ -316,6 +316,12 @@ models:
       priority:
         kind: extension
         type: Optional[float]
+        default: null
+        status: prototype
+        required: false
+      prompt_embeds:
+        kind: extension
+        type: Optional[Union[str, List[str]]]
         default: null
         status: prototype
         required: false

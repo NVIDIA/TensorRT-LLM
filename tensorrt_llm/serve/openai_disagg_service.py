@@ -224,6 +224,11 @@ class OpenAIDisaggregatedService(OpenAIService):
     ) -> UCompletionResponseOrGenerator:
         if not await self.is_ready():
             raise RuntimeError("Cluster is not ready")
+        if getattr(request, "prompt_embeds", None) is not None:
+            # A client error: the generic handler would report a ValueError as 500.
+            raise HTTPException(
+                status_code=400, detail="Disaggregated server does not support prompt_embeds"
+            )
         if not isinstance(request.prompt, str):
             # Reject empty prompt lists explicitly so the router does not
             # index prompt[0] on an empty list.

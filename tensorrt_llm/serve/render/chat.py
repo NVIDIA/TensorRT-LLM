@@ -46,6 +46,7 @@ from tensorrt_llm.inputs.utils import (
 )
 from tensorrt_llm.sampling_params import SamplingParams
 from tensorrt_llm.serve.chat_utils import parse_chat_messages_coroutines
+from tensorrt_llm.serve.prompt_embeds import has_prompt_embeds_parts
 from tensorrt_llm.serve.serving_extensions import ServingExtension
 
 from .prompt_types import (
@@ -419,6 +420,9 @@ def render_chat(
     ignore the media, and so do messages the request model rejects unless the
     caller passes the raw body's ``raw_messages`` (see :func:`_parse_text_conversation`).
     """
+    if has_prompt_embeds_parts(request.messages) or has_prompt_embeds_parts(raw_messages):
+        # The parts' rows replace their marker text only on the chat route.
+        raise UnsupportedRenderError("prompt_embeds parts are not supported by prompt rendering.")
     if request.prompt_token_ids is not None:
         return RenderedPrompt(token_ids=list(request.prompt_token_ids))
     prepared = prepare_chat_request(request, res)

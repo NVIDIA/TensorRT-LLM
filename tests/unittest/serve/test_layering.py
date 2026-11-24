@@ -42,6 +42,7 @@ CONTRACTS = (
             "tensorrt_llm.serve.render.resources",
             "tensorrt_llm.serve.render.fingerprint",
             "tensorrt_llm.serve.render.prompt_types",
+            "tensorrt_llm.serve.render.prompt_embeds",
         ),
         forbidden=("fastapi", "starlette", "tensorrt_llm.executor"),
         fix=(

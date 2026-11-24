@@ -444,6 +444,14 @@ def test_openai_misc_example(llm_root, llm_venv, backend: str):
     ])
 
 
+def test_openai_prompt_embeds(llm_root, llm_venv):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd([
+        "-m", "pytest", "-s", "-v", "--tb=long", "-ra",
+        str(test_root / "_test_openai_prompt_embeds.py")
+    ])
+
+
 @pytest.mark.skip_less_device(4)
 def test_openai_kv_cache_contamination(llm_root, llm_venv):
     """NVBug 6025177 regression: cross-request KV-cache contamination on cancel-during-chunked-prefill.

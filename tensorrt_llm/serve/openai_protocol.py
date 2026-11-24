@@ -795,7 +795,7 @@ class CompletionRequest(OpenAIBaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/completions/create
     model: str
-    prompt: Union[List[int], List[List[int]], str, List[str]]
+    prompt: Optional[Union[List[int], List[List[int]], str, List[str]]] = None
     best_of: Optional[int] = None
     echo: Optional[bool] = False
     frequency_penalty: Optional[float] = 0.0
@@ -877,6 +877,17 @@ class CompletionRequest(OpenAIBaseModel):
     conversation_params: Optional[ConversationParams] = Field(
         default=None,
         description=("Parameters for multi-turn conversation routing"),
+    )
+    prompt_embeds: Optional[Union[str, List[str]]] = Field(
+        default=None,
+        repr=False,
+        description=(
+            "Prompts given as precomputed input embeddings: each entry is a "
+            "base64 torch.save of a [num_tokens, hidden_size] float16, "
+            "bfloat16 or float32 tensor, one row per prompt position, equal to "
+            "the output of the model's input embedding module. Served before "
+            "any `prompt` entries. Requires the server flag "
+            "--enable_prompt_embeds."),
     )
 
     # doc: end-completion-extra-params
@@ -965,6 +976,22 @@ class CompletionRequest(OpenAIBaseModel):
         if data.get("suffix"):
             raise ValueError("suffix is not supported")
         return data
+
+    @model_validator(mode="after")
+    def check_prompt_embeds(self) -> "CompletionRequest":
+        """Require a prompt and reject options that need prompt text."""
+        if self.prompt is None and self.prompt_embeds is None:
+            raise ValueError("Either 'prompt' or 'prompt_embeds' is required.")
+        if self.prompt_embeds is None:
+            return self
+        if isinstance(self.prompt_embeds, list) and not self.prompt_embeds:
+            raise ValueError("'prompt_embeds' must not be empty.")
+        if self.echo:
+            raise ValueError("echo is not supported with prompt_embeds.")
+        if self.truncate_prompt_tokens is not None:
+            raise ValueError(
+                "truncate_prompt_tokens is not supported with prompt_embeds.")
+        return self
 
 
 class FunctionCall(OpenAIBaseModel):
