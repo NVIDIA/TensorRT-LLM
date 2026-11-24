@@ -143,7 +143,7 @@ def test_compiled_ffn_matches_stock_bits_and_checks_shape_fallback(
     generator = torch.Generator(device="cuda").manual_seed(7423)
     block = _HarnessBlock().cuda().eval()
     block.ff = _FFN(precision, generator)
-    # The loader and full real-shard dtype census are tested by the Rhea harness.
+    # The loader and full checkpoint dtype census are covered by end-to-end integration runs.
     device = block.ff.gate_up_proj.weight.device
     device_index = device.index
     bf16 = precision == "bf16"

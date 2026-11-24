@@ -122,11 +122,15 @@ class Fp8Attention(ScenarioAttention):
         self._fp8_block_id = torch.tensor(layer_idx, device="cpu", dtype=torch.int64)
         self._hybrid_cudnn_backend = None
         self._hybrid_step_state: dict[str, int] | None = None
-        self._hybrid_cudnn_steps: int = 8
+        self._hybrid_cudnn_steps: int = 11
+        self._hybrid_direct_fp8_steps: int = 20
+        self._hybrid_t1_steps: int = 25
+        self._hybrid_direct_fp8_scale = None
 
     def _hybrid_attention_forward(self, qkv, rotary_emb, key_padding_mask, timestep):
         cos, sin = rotary_emb
-        if self._hybrid_step_state["step"] < self._hybrid_cudnn_steps:
+        step = self._hybrid_step_state["step"]
+        if step < self._hybrid_cudnn_steps:
             from ..fused_rope import apply_minimax_h3_qk_norm_rope_bf16
 
             value = qkv.split([self.local_q_dim, self.local_kv_dim, self.local_kv_dim], dim=-1)[2]
@@ -153,6 +157,8 @@ class Fp8Attention(ScenarioAttention):
                 )
             finally:
                 self.attn = orig
+        from tensorrt_llm._torch.visual_gen.attention.backends.cudnn import _a3_fmha_dense_fp8
+
         from ..minimax_h3_fp8__sm_103_107__u4.qkv_exchange import qk_norm_rope_quant_u1_asym
 
         rows = qkv.shape[1]
@@ -166,6 +172,47 @@ class Fp8Attention(ScenarioAttention):
             float(self.norm_q.variance_epsilon),
             valid_rows,
         )
+        use_t1 = step >= self._hybrid_t1_steps
+        out_scale = self._hybrid_direct_fp8_scale if step >= self._hybrid_direct_fp8_steps else None
+        if out_scale is not None or use_t1:
+            q4 = query.view(1, rows, 56, 128)
+            k4 = key.view(1, rows, 56, 128)
+            v4 = value.view(1, rows, 56, 128)
+            out_dtype = torch.float8_e4m3fn if out_scale is not None else torch.bfloat16
+            if out_scale is not None:
+                s_out = (descales[2:3] / out_scale.to(torch.float32)).contiguous()
+                fmha_descales = torch.stack([descales[0], descales[1], s_out[0]])
+            else:
+                fmha_descales = descales
+            sm_scale = 128.0**-0.5
+            if key_padding_mask is not None and valid_rows < rows:
+                raw = torch.zeros((1, rows, 56, 128), dtype=out_dtype, device=qkv.device)
+                if valid_rows > 0:
+                    _a3_fmha_dense_fp8(
+                        q4[:, :valid_rows],
+                        k4[:, :valid_rows],
+                        v4[:, :valid_rows],
+                        fmha_descales,
+                        sm_scale,
+                        out_dtype,
+                        out=raw[:, :valid_rows],
+                        variant="trtllm-gen-fp16sm",
+                        skip_corr_threshold=1.0 if use_t1 else 0.0,
+                        strided=False,
+                    )
+            else:
+                raw = _a3_fmha_dense_fp8(
+                    q4,
+                    k4,
+                    v4,
+                    fmha_descales,
+                    sm_scale,
+                    out_dtype,
+                    variant="trtllm-gen-fp16sm",
+                    skip_corr_threshold=1.0 if use_t1 else 0.0,
+                    strided=False,
+                )
+            return raw.flatten(2)
         return self._attn_impl(
             query,
             key,

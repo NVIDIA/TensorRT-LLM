@@ -11,7 +11,9 @@ from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent
 from ..minimax_h3_nvfp4__sm_107__u1_u4.pipeline import MiniMaxH3Nvfp4Sm107U1U4Pipeline
 from .modeling import Fp8Transformer
 
-_HYBRID_CUDNN_INITIAL_STEPS = 8
+_HYBRID_CUDNN_INITIAL_STEPS = 11
+_HYBRID_DIRECT_FP8_OUT_START_STEP = 20
+_HYBRID_SKIP_CORR_T1_START_STEP = 25
 
 
 class MiniMaxH3Fp8Sm107U1Pipeline(MiniMaxH3Nvfp4Sm107U1U4Pipeline):
@@ -28,6 +30,10 @@ class MiniMaxH3Fp8Sm107U1Pipeline(MiniMaxH3Nvfp4Sm107U1U4Pipeline):
         ).eval()
 
     def _init_hybrid_attention(self) -> None:
+        cfg = getattr(self, "pipeline_config", None)
+        compile_cfg = getattr(cfg, "torch_compile", None) or getattr(cfg, "torch_compile_config", None)
+        if getattr(compile_cfg, "enable_fullgraph", False):
+            return
         blocks = getattr(self.transformer, "transformer_blocks", None)
         if not blocks:
             return
@@ -47,11 +53,26 @@ class MiniMaxH3Fp8Sm107U1Pipeline(MiniMaxH3Nvfp4Sm107U1U4Pipeline):
         )
         import torch
 
+        direct_fp8_ok = False
+        try:
+            direct_fp8_ok = bool(
+                torch.ops.trtllm.fmha_dense_fp8_is_supported(128, 56, torch.float8_e4m3fn, True)
+            )
+        except (RuntimeError, AttributeError):
+            direct_fp8_ok = False
+
         step_state = {"step": 0}
         for block in blocks:
             block.attn._hybrid_cudnn_backend = cudnn_backend
             block.attn._hybrid_step_state = step_state
             block.attn._hybrid_cudnn_steps = _HYBRID_CUDNN_INITIAL_STEPS
+            block.attn._hybrid_direct_fp8_steps = _HYBRID_DIRECT_FP8_OUT_START_STEP
+            block.attn._hybrid_t1_steps = _HYBRID_SKIP_CORR_T1_START_STEP
+            block.attn._hybrid_direct_fp8_scale = (
+                block.attn.to_out[0].input_scale
+                if direct_fp8_ok and getattr(block, "fp8_fused", False)
+                else None
+            )
             block.attn._hybrid_attention_forward = torch.compiler.disable(
                 block.attn._hybrid_attention_forward
             )
@@ -65,6 +86,13 @@ class MiniMaxH3Fp8Sm107U1Pipeline(MiniMaxH3Nvfp4Sm107U1U4Pipeline):
         kernel_cache = Path(get_default_build_root()) / "minimax_h3_fp8"
         self.transformer.initialize_fp8(kernel_cache)
         self._init_hybrid_attention()
+        audio_vae = getattr(self, "audio_vae", None)
+        if audio_vae is not None:
+            from tensorrt_llm._torch.visual_gen.models.minimax_h3.minimax_h3_fp8__sm_103_107__u4.vae_opt import (
+                install_audio_vae_cuda_graph,
+            )
+
+            install_audio_vae_cuda_graph(audio_vae, self.device)
         if self.vae is not None:
             self.vae.enable_tiling(
                 tile_sample_min_height=288,

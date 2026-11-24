@@ -149,6 +149,32 @@ def exchange_fp8_output(
     return unpack_u4_output(recv, block_r=block_r).view(torch.float8_e4m3fn)
 
 
+def exchange_prequantized_fp8_output(
+    attn_out_fp8: torch.Tensor,
+    group,
+    *,
+    block_r: int = 8,
+) -> torch.Tensor:
+    """All-to-all pre-quantized FP8 ``[1, 4 * S_local, 14, 128]`` and assemble ``[1, S_local, 7168]``."""
+    if (
+        attn_out_fp8.ndim != 4
+        or attn_out_fp8.shape[0] != 1
+        or attn_out_fp8.shape[2] != _LOCAL_HEADS
+        or attn_out_fp8.shape[3] != _HEAD_DIM
+        or attn_out_fp8.shape[1] % _ULYSSES_SIZE != 0
+        or attn_out_fp8.dtype != torch.float8_e4m3fn
+    ):
+        raise ValueError(
+            f"expected FP8 [1, 4*S_local, {_LOCAL_HEADS}, {_HEAD_DIM}], "
+            f"got {attn_out_fp8.dtype} {tuple(attn_out_fp8.shape)}"
+        )
+    rows = attn_out_fp8.shape[1] // _ULYSSES_SIZE
+    send = attn_out_fp8.contiguous().view(torch.uint8).view(_ULYSSES_SIZE, rows, _LOCAL_WIDTH)
+    recv = torch.empty_like(send)
+    torch.distributed.all_to_all_single(recv.view(-1), send.view(-1), group=group)
+    return unpack_u4_output(recv, block_r=block_r).view(torch.float8_e4m3fn)
+
+
 def exchange_bf16_output(
     attn_out: torch.Tensor,
     group,
