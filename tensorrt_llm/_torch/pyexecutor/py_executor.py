@@ -4798,12 +4798,19 @@ class PyExecutor:
                     with nvtx_range("sync_previous_sampler_event"):
                         previous_batch.sample_state.sampler_event.synchronize()
                 if self._is_kv_manager_v2 and self._pending_peft_pause_requests:
-                    if (previous_batch is not None
-                            and not (self.dist.is_last_pp_rank or can_queue)
-                            and self._get_peft_cache_manager() is not None):
-                        with nvtx_range("sync_previous_sampler_event"):
-                            previous_batch.sample_state.sampler_event.synchronize()
-                    self._flush_pending_peft_pauses()
+                    pending = self._pending_peft_pause_requests
+                    self._pending_peft_pause_requests = []
+                    eligible = self._eligible_peft_pause_requests(pending)
+                    if eligible:
+                        if previous_batch is not None and not (
+                                self.dist.is_last_pp_rank or can_queue):
+                            with nvtx_range("sync_previous_sampler_event"):
+                                previous_batch.sample_state.sampler_event.synchronize(
+                                )
+                        peft_cache_manager = self._get_peft_cache_manager()
+                        assert peft_cache_manager is not None
+                        for req in eligible:
+                            peft_cache_manager.pause_request(req)
 
                 # Stage 2: Enqueue sample state for executed batch to ring broadcast it in background thread asynchronously.
                 # send/recv chain: (pp_size - 1) -> 0 -> 1 -> ... -> (pp_size - 2)
@@ -13966,17 +13973,20 @@ class PyExecutor:
         return self.resource_manager.get_resource_manager(
             ResourceManagerType.PEFT_CACHE_MANAGER)
 
-    def _pause_peft_for_suspended_requests(
-            self, requests: Iterable[LlmRequest]) -> None:
-        """Pause PEFT device ownership for KV-suspended started LoRA requests.
+    def _eligible_peft_pause_requests(
+            self, requests: Iterable[LlmRequest]) -> list[LlmRequest]:
+        """Return KV-suspended started LoRA requests eligible for PEFT pause.
 
-        Skips requests that finished, left ``active_requests``, were reset for
-        recompute, or resumed KV before this point so we neither register a
-        phantom paused entry nor release an adapter still in use.
+        Skips requests without an adapter, already paused requests, and
+        requests that finished, left ``active_requests``, were reset for
+        recompute, or resumed KV before this point so we neither wait
+        unnecessarily, register a phantom paused entry, nor release an adapter
+        still in use.
         """
         peft_cache_manager = self._get_peft_cache_manager()
         if peft_cache_manager is None:
-            return
+            return []
+        eligible: list[LlmRequest] = []
         for req in requests:
             if (req.lora_task_id is None or req.is_finished
                     or req.state == LlmRequestState.GENERATION_TO_COMPLETE):
@@ -13992,6 +14002,18 @@ class PyExecutor:
                 continue
             if self.kv_cache_manager.is_request_active(req.py_request_id):
                 continue
+            if peft_cache_manager.is_paused(req) is True:
+                continue
+            eligible.append(req)
+        return eligible
+
+    def _pause_peft_for_suspended_requests(
+            self, requests: Iterable[LlmRequest]) -> None:
+        """Pause PEFT device ownership for KV-suspended started LoRA requests."""
+        peft_cache_manager = self._get_peft_cache_manager()
+        if peft_cache_manager is None:
+            return
+        for req in self._eligible_peft_pause_requests(requests):
             peft_cache_manager.pause_request(req)
 
     def _flush_pending_peft_pauses(self) -> None:

@@ -3255,7 +3255,7 @@ class _FakeCppPeftCacheManager:
     def __init__(
         self,
         max_device_pages: int,
-        pages_per_task: int = 1,
+        pages_per_task: int | dict[int, int] = 1,
         initial_active: dict[int, set[int]] | None = None,
     ) -> None:
         self.max_device_pages = max_device_pages
@@ -3270,8 +3270,16 @@ class _FakeCppPeftCacheManager:
         self.add_request_peft = Mock(side_effect=self._add_request_peft)
         self.ensure_batch_map_task_id = Mock(side_effect=self._ensure_batch_map_task_id)
 
-    def determine_num_pages(self, _req: object) -> int:
+    def _task_pages(self, task_id: int) -> int:
+        if isinstance(self._pages_per_task, dict):
+            return self._pages_per_task.get(task_id, 1)
         return self._pages_per_task
+
+    def determine_num_pages(self, req: object) -> int:
+        tid = getattr(req, "lora_task_id", None)
+        if tid is None:
+            return 0
+        return self._task_pages(tid)
 
     def is_task_cached(self, task_id: int) -> bool:
         return task_id in self.host_cached
@@ -3328,11 +3336,16 @@ class _FakeCppPeftCacheManager:
             assert tid in self.host_cached, f"adapter {tid} missing from host cache"
             if tid in self.device_cached:
                 continue
-            if len(self.device_cached) >= self.max_device_pages:
+            needed_pages = self._task_pages(tid)
+            while (
+                sum(self._task_pages(t) for t in self.device_cached) + needed_pages
+                > self.max_device_pages
+            ):
                 evictable = [t for t in self.device_cached if t not in self.active_tasks]
                 if not evictable:
                     raise RuntimeError(
-                        f"Cache is full; cannot load adapter {tid} with active {self.active_tasks}"
+                        f"Cache is full; cannot load adapter {tid} ({needed_pages} pages) "
+                        f"with active {self.active_tasks}"
                     )
                 self.device_cached.remove(evictable[0])
             self.device_cached.add(tid)
@@ -3341,7 +3354,7 @@ class _FakeCppPeftCacheManager:
 
 def _make_peft_wrapper(
     max_device_pages: int = 1,
-    pages_per_task: int = 1,
+    pages_per_task: int | dict[int, int] = 1,
     initial_active: dict[int, set[int]] | None = None,
 ) -> tuple[object, _FakeCppPeftCacheManager]:
     """Create a real Python PeftCacheManager backed by _FakeCppPeftCacheManager."""
@@ -3936,6 +3949,85 @@ class TestPeftSuspendResume:
         assert not peft.is_paused(paused_ctx)
         assert impl.device_cached == {1}
 
+        # One-slot case: with 1 PEFT page, max_batch_size=1, and arrival order
+        # [A (paused started ctx on adapter 1), B (paused decode on adapter 2),
+        #  C (base-model decode)], A's PEFT reservation must also hold a batch
+        # slot so C cannot crowd A out of Phase 2 and starve both A and B.
+        mgr1 = make_kv_cache_manager(can_evict=True)
+        peft1, impl1 = _make_peft_wrapper(max_device_pages=1, initial_active={1: {10}, 2: {11}})
+        sched1 = make_scheduler(mgr1, max_batch_size=1, peft_cache_manager=peft1)
+
+        req_a = _init_lora_req(
+            make_ctx_request(10, 64, is_first_context_chunk=False, lora_task_id=1)
+        )
+        mgr1.kv_cache_map[10].is_active = False
+        peft1.pause_request(req_a)
+
+        req_b = _init_lora_req(make_gen_request(11, lora_task_id=2))
+        mgr1.kv_cache_map[11].is_active = False
+        peft1.pause_request(req_b)
+        impl1.device_cached.clear()
+
+        req_c = make_gen_request(12)
+
+        out_one_slot = sched1.schedule_request([req_a, req_b, req_c], set())
+        assert ids(out_one_slot.context_requests) == [10]
+        assert out_one_slot.generation_requests == []
+        peft1.prepare_resources(out_one_slot)
+        assert not peft1.is_paused(req_a)
+        assert impl1.device_cached == {1}
+
+        # Token-budget guard: if paused started context A cannot fit in the
+        # remaining token budget, it must not reserve the PEFT page and block B.
+        mgr_tok = make_kv_cache_manager(can_evict=True)
+        peft_tok, impl_tok = _make_peft_wrapper(
+            max_device_pages=1, initial_active={1: {20}, 2: {21}}
+        )
+        sched_tok = make_scheduler(
+            mgr_tok, max_batch_size=2, max_num_tokens=32, peft_cache_manager=peft_tok
+        )
+        ctx_too_big = _init_lora_req(
+            make_ctx_request(20, 64, is_first_context_chunk=False, lora_task_id=1)
+        )
+        mgr_tok.kv_cache_map[20].is_active = False
+        peft_tok.pause_request(ctx_too_big)
+        gen_b = _init_lora_req(make_gen_request(21, lora_task_id=2))
+        mgr_tok.kv_cache_map[21].is_active = False
+        peft_tok.pause_request(gen_b)
+        impl_tok.device_cached.clear()
+
+        out_tok = sched_tok.schedule_request([ctx_too_big, gen_b], set())
+        assert ids(out_tok.generation_requests) == [21]
+        assert out_tok.context_requests == []
+        peft_tok.prepare_resources(out_tok)
+        assert not peft_tok.is_paused(gen_b)
+        assert impl_tok.device_cached == {2}
+
+        # Phase-2 KV failure rollback: if A reserves PEFT+slot in Phase 1 but
+        # fails KV admission in Phase 2, its tentative PEFT claim is released so
+        # a later Phase-2 context on another adapter can use that page.
+        mgr_kv = make_kv_cache_manager(
+            can_evict=True,
+            resize_context_fn=lambda req, _toks: req.py_request_id != 30,
+        )
+        peft_kv, impl_kv = _make_peft_wrapper(max_device_pages=1, initial_active={1: {30}})
+        sched_kv = make_scheduler(mgr_kv, max_batch_size=2, peft_cache_manager=peft_kv)
+        ctx_kv_fail = _init_lora_req(
+            make_ctx_request(30, 64, is_first_context_chunk=False, lora_task_id=1)
+        )
+        mgr_kv.kv_cache_map[30].is_active = False
+        peft_kv.pause_request(ctx_kv_fail)
+        impl_kv.device_cached.clear()
+        ctx_other = _init_lora_req(
+            make_ctx_request(31, 32, is_first_context_chunk=True, lora_task_id=2)
+        )
+        impl_kv.host_cached.add(2)
+
+        out_kv = sched_kv.schedule_request([ctx_kv_fail, ctx_other], set())
+        assert ids(out_kv.context_requests) == [31]
+        peft_kv.prepare_resources(out_kv)
+        assert impl_kv.device_cached == {2}
+
     @pytest.mark.parametrize("newer_kind", ["gen", "started_ctx"])
     def test_newer_peft_paused_request_cannot_jump_older_multi_page_peft_waiter(
         self, newer_kind: str
@@ -3944,11 +4036,12 @@ class TestPeftSuspendResume:
         waiter needing 2 pages must block a newer paused decode or started
         context needing 1 page from claiming the free page ahead of it."""
         mgr = make_kv_cache_manager(can_evict=True)
+        page_costs = {1: 2, 2: 1, 3: 1}
         peft, impl = _make_peft_wrapper(
             max_device_pages=2,
+            pages_per_task=page_costs,
             initial_active={1: {0}, 2: {1}, 3: {2}},
         )
-        impl.determine_num_pages = lambda req: 2 if req.lora_task_id == 1 else 1  # type: ignore[method-assign]
         sched = make_scheduler(mgr, peft_cache_manager=peft)
 
         older_paused = _init_lora_req(make_gen_request(0, lora_task_id=1))
@@ -3967,11 +4060,18 @@ class TestPeftSuspendResume:
 
         resident = _init_lora_req(make_gen_request(2, lora_task_id=3))
 
+        # Adapter 1 (2 pages) cannot fit on device while resident adapter 3 holds 1 page.
+        with pytest.raises(RuntimeError, match="Cache is full"):
+            impl.ensure_batch_map_task_id([], [older_paused])
+        assert impl.device_cached == {3}
+
         # Pass 1: resident holds 1 of 2 pages -> older_paused (2 pages) waits
         # and holds newer_paused (1 page), while resident keeps running.
         out1 = sched.schedule_request([older_paused, newer_paused, resident], set())
         assert ids(out1.generation_requests) == [2]
         assert out1.context_requests == []
+        peft.prepare_resources(out1)
+        assert impl.device_cached == {3}
 
         # Pass 2: resident completes -> older_paused claims both pages and resumes
         # ahead of newer_paused.
@@ -3982,6 +4082,7 @@ class TestPeftSuspendResume:
         peft.prepare_resources(out2)
         assert not peft.is_paused(older_paused)
         assert peft.is_paused(newer_paused)
+        assert impl.device_cached == {1}
 
     @pytest.mark.parametrize("prioritize_first_token", [False, True])
     def test_disagg_gen_init_peft_miss_skips_instead_of_stalling_active_decode(

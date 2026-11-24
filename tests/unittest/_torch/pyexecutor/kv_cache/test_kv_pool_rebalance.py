@@ -1494,6 +1494,98 @@ class TestPpLoopDrainWiring:
         assert exe._pending_peft_pause_requests == []
         peft_manager.pause_request.assert_called_once_with(suspended)
 
+    @pytest.mark.parametrize(
+        ("rank", "is_first"),
+        [(0, True), (1, False)],
+        ids=["rank0", "middle_rank"],
+    )
+    def test_pp_non_last_rank_skips_extra_sync_when_only_base_request_paused(
+        self, monkeypatch, rank: int, is_first: bool
+    ) -> None:
+        """On non-last PP ranks with an empty current batch (not can_queue), a
+        suspended base-model request with no adapter must not trigger the extra
+        sampler_event.synchronize() even when PEFT is configured."""
+        from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+
+        exe = _make_pp_loop_executor(monkeypatch, num_micro_batches=2, agreement=(False,))
+        exe.dist.pp_size = 3
+        exe.dist.rank = exe.dist.pp_rank = rank
+        exe.dist.is_first_pp_rank = is_first
+        exe.dist.is_last_pp_rank = False
+        exe.dist.prev_pp_rank = rank - 1
+        exe.dist.next_pp_rank = rank + 1
+        exe.dist.recv_object.return_value = 0
+        exe._can_pause_for_rebalance = MagicMock(return_value=False)
+        exe._can_queue = MagicMock(return_value=(False, False))
+        exe.inflight_req_ids = set()
+        exe._pp_retry_until_can_schedule = MagicMock()
+        exe.scheduler = MagicMock()
+        exe.scheduler.schedule_request.return_value = MagicMock(
+            fitting_disagg_gen_init_requests=[]
+        )
+
+        suspended_base = MagicMock()
+        suspended_base.py_request_id = 7
+        suspended_base.lora_task_id = None
+        suspended_base.is_finished = False
+        suspended_base.state = LlmRequestState.GENERATION_IN_PROGRESS
+        suspended_base.is_context_init_state = False
+        suspended_base.is_first_context_chunk = False
+        suspended_base.is_generation_in_progress_state = True
+        suspended_base.is_generation_only_request = False
+        suspended_base.py_decoding_iter = 2
+        exe.active_requests = [suspended_base]
+
+        exe.kv_cache_manager = MagicMock()
+        exe.kv_cache_manager.is_request_active.return_value = False
+
+        events: list[str] = []
+        peft_manager = MagicMock()
+        peft_manager.is_paused.return_value = False
+        peft_manager.pause_request.side_effect = lambda req: events.append(
+            f"pause:{req.py_request_id}"
+        )
+        exe.resource_manager.get_resource_manager.side_effect = lambda rtype: (
+            peft_manager if rtype == ResourceManagerType.PEFT_CACHE_MANAGER else None
+        )
+
+        empty_batch = MagicMock()
+        empty_batch.batch_size = 0
+        empty_batch.num_encoder_requests = 0
+        empty_batch.num_context_requests = 0
+        empty_batch.num_generation_requests = 0
+        empty_batch.encoder_requests = []
+        empty_batch.context_requests = []
+        empty_batch.generation_requests = []
+        empty_batch.paused_requests = [suspended_base]
+        empty_batch.recompute_paused_requests = []
+        empty_batch.scheduled_mm_encoder_items = []
+        empty_batch.all_requests.return_value = []
+        exe._pp_schedule_and_propagate = MagicMock(return_value=(empty_batch, [], 0, False))
+
+        prev_event = MagicMock()
+        prev_event.synchronize.side_effect = lambda: events.append("sync_prev")
+        exe.previous_batch = MagicMock(sample_state=MagicMock(sampler_event=prev_event))
+
+        fetch_calls = 0
+
+        def _one_iter_fetch():
+            nonlocal fetch_calls
+            fetch_calls += 1
+            if fetch_calls > 1:
+                exe.is_shutdown = True
+                exe.active_requests = []
+            return []
+
+        exe._fetch_and_activate_new_requests = MagicMock(side_effect=_one_iter_fetch)
+
+        PyExecutor._executor_loop_pp(exe)
+
+        assert events == []
+        assert exe._pending_peft_pause_requests == []
+        prev_event.synchronize.assert_not_called()
+        peft_manager.pause_request.assert_not_called()
+
     def test_pp_pause_propagation_keeps_peft_ownership_and_admission_aligned_across_ranks(
         self, monkeypatch
     ) -> None:
@@ -1534,7 +1626,7 @@ class TestPpLoopDrainWiring:
             req.lora_task_id = lora_task_id
             req.lora_config = None
             req.state = state
-            req.state_value = int(state)
+            req.state_value = state.value
             req.is_finished = False
             req.is_attention_dp_dummy = False
             req.is_context_init_state = state == LlmRequestState.CONTEXT_INIT
@@ -1582,12 +1674,26 @@ class TestPpLoopDrainWiring:
             exe.active_requests = [suspended]
             rank_suspended.append(suspended)
 
+            events: list[str] = []
+            kv_active = {7: True}
+            kv_entry = MagicMock(is_active=True)
+
             kv_mgr = MagicMock()
             kv_mgr.__class__ = KVCacheManagerV2
-            kv_mgr.is_request_active.return_value = False
+            kv_mgr.is_request_active.side_effect = lambda rid, _active=kv_active: _active.get(
+                rid, False
+            )
+
+            def _suspend_kv(req, _active=kv_active, _entry=kv_entry, _ev=events):
+                _active[req.py_request_id] = False
+                if req.py_request_id == 7:
+                    _entry.is_active = False
+                _ev.append(f"suspend:{req.py_request_id}")
+
+            kv_mgr.suspend_request.side_effect = _suspend_kv
             kv_mgr.can_evict = True
             kv_mgr.tokens_per_block = 32
-            kv_mgr.kv_cache_map = {7: MagicMock(is_active=False)}
+            kv_mgr.kv_cache_map = {7: kv_entry}
             kv_mgr.try_allocate_generation.return_value = False
             kv_mgr.prepare_context.return_value = True
             kv_mgr.resize_context.return_value = True
@@ -1622,7 +1728,6 @@ class TestPpLoopDrainWiring:
             exe.scheduler = sched
             rank_schedulers.append(sched)
 
-            events: list[str] = []
             orig_pause = peft.pause_request
 
             def _track_pause(req, _orig=orig_pause, _ev=events):
@@ -1638,9 +1743,22 @@ class TestPpLoopDrainWiring:
             # Use real _pp_schedule_and_propagate instead of mocking it away.
             exe._pp_schedule_and_propagate = MethodType(PyExecutor._pp_schedule_and_propagate, exe)
             if is_first:
-                empty_paused_batch = ScheduledRequests()
-                empty_paused_batch.paused_requests = [suspended]
-                exe._schedule = MagicMock(return_value=(empty_paused_batch, [], 0))
+
+                def _leader_schedule(_exe=exe, _sched=sched):
+                    out = _sched.schedule_request(_exe.active_requests, _exe.inflight_req_ids)
+                    batch = ScheduledRequests()
+                    batch.encoder_requests = out.encoder_requests
+                    batch.context_requests_last_chunk = out.context_requests
+                    batch.generation_requests = out.generation_requests
+                    batch.paused_requests = out.paused_requests
+                    batch.recompute_paused_requests = out.recompute_paused_requests
+                    return (
+                        batch,
+                        out.fitting_disagg_gen_init_requests,
+                        out.num_fitting_requests,
+                    )
+
+                exe._schedule = MagicMock(side_effect=_leader_schedule)
                 exe.disagg.admit = MagicMock(return_value=([], False))
 
             def _isend(obj, dest, tag, _wire=wire):
@@ -1667,7 +1785,8 @@ class TestPpLoopDrainWiring:
 
             PyExecutor._executor_loop_pp(exe)
 
-            assert events == ["sync_prev", "pause:7"], f"rank {rank}: {events}"
+            assert not kv_mgr.is_request_active(7), f"rank {rank}: KV stayed active"
+            assert events == ["suspend:7", "sync_prev", "pause:7"], f"rank {rank}: {events}"
             assert exe._pending_peft_pause_requests == []
 
         # Subsequent scheduling pass: all 3 ranks must agree on paused PEFT state
