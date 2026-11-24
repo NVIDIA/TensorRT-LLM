@@ -76,7 +76,7 @@ MAX_TOKENS = 1024
 ADD_NONE, ADD_PREFIX, ADD_MOE = 0, 1, 2
 
 #: Programmatic dependent launch unless TRTLLM_ENABLE_PDL=0 (the stack-wide switch).
-_USE_PDL = True  # TensorRT-LLM local change: 1007804's value (unset); the target reads no environment.
+_USE_PDL = True  # TensorRT-LLM local change: the reference setting (unset); the target reads no environment.
 #: TRTLLM_K3_ATTN_RES_EARLY_TRIGGER=1: release the dependent grid right after ``griddepcontrol.wait``
 #: instead of after the last store, so the next kernel (a decode projection) can become resident and
 #: stream its weights while this one finishes.

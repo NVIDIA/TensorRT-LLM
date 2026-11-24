@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """The FP4 MLA generation cache update of an FP4-KV MLA layer: one Triton launch per layer and step.
 
-The served update (6904cd9672, ``attention/backends/fp4_mla/cache_update.py``
+The served update (``attention/backends/fp4_mla/cache_update.py``
 ``scatter_fp4_mla_kv_cache``, generation phase, and ``TrtllmAttention._fp4_mla_rope_generation`` /
 ``fp4_mla_kv_append_generation``) for the deployment's configuration: the CuTe DSL backend with the
 packed query layout, exclusively owned cache pages (block reuse off: packed V is written directly),
@@ -72,7 +72,7 @@ def _ceil_div(lhs: int, rhs: int) -> int:
 
 
 # The CuTe DSL backend stores the K residual (served ``_FP4_MLA_K_RESIDUAL_BACKENDS``) and runs
-# without the fused V transpose (TRTLLM_FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE, unset in 1007804).
+# without the fused V transpose (TRTLLM_FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE, unset in the reference deployment).
 _STORE_K_RESIDUAL = True
 _FUSED_V_TRANSPOSE = False
 

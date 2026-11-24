@@ -1,9 +1,7 @@
 {
   "area": "mla",
   "scope": "GEN step of one MLA layer (FP4-KV layers and FP8-KV layers 91 / 92): side gate, q-fused path (<= 16 rows) or absorption path, KV-cache update, packed FP4 decode or CuTe DSL FP8 decode, Helix exchange + fused K3HelixTail, gated o_proj hand-off. The FP8 weight-read linears (q_a|kv_a, q_b, o_proj, gate) are equivalent to served without edits (fp8_weight_read.py, ops/gemm/* unchanged). MLAIN (the fold of the gate into the input projection, released at the producer's entry) follows served ull/mlain.py MlaInAttention through the interface modeling._mla_input (served ChainMlaInput) calls.",
-  "source_commit": "6904cd9672",
-  "source_tree": "user/xguan/k3-rubin-ull-chain-mlamoe-gsm (~/dev/tekit_k3r_mlamoe_gsm)",
-  "measured_run": "1007804",
+  "source": "NVIDIA Kimi K3 ULL reference implementation",
   "functions": {
     "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3MLAAttention._side_gate_core / gated_o_proj / _forward_side_gate": [
       "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp4ep4/ull/stages.py:350 MlaAttention._side_gate",
@@ -114,7 +112,7 @@
       "tensorrt_llm/_torch/kimi_k3_cache_policy.py:28 get_kimi_k3_fp8_kv_layer_ids"
     ],
     "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:MLA_MAX_POSITIONS": [
-      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/text_model.py:386 _KIMI_K3_MLA_MAX_POSITIONS_ENV (unset in 1007804 -> max_position_embeddings 1048576)"
+      "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/text_model.py:386 _KIMI_K3_MLA_MAX_POSITIONS_ENV (unset in the reference deployment -> max_position_embeddings 1048576)"
     ],
     "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:K3MLARuntime.takes_q_fused": [
       "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp4ep4/ull/mlain.py:212 MlaInAttention.takes_q_fused",
@@ -149,10 +147,10 @@
     ]
   },
   "constants": {
-    "ops/attention/_fp4_mla_decode_ull.py:_SPLITS = 8": "TRTLLM_FP4_MLA_SPLIT_KV=8 (1007804 trtllm env); served packed_plan.py:76",
-    "ops/attention/_fp4_mla_decode_ull.py:_LPT_PLAN = True": "TRTLLM_FP4_MLA_LPT_PLAN=1 (1007804's GEN srun --export; the case's trtllm_config.yaml lacks it); served config.py:301 _fp4_mla_lpt_plan_enabled",
+    "ops/attention/_fp4_mla_decode_ull.py:_SPLITS = 8": "TRTLLM_FP4_MLA_SPLIT_KV=8 (reference environment); served packed_plan.py:76",
+    "ops/attention/_fp4_mla_decode_ull.py:_LPT_PLAN = True": "TRTLLM_FP4_MLA_LPT_PLAN=1 (set in the reference generation worker's environment); served config.py:301 _fp4_mla_lpt_plan_enabled",
     "ops/attention/_fp4_mla_decode_ull.py:_WAVE_PLAN = True": "TRTLLM_FP4_MLA_PACKED_WAVE_PLAN unset; served config.py:308 default on where the kernel module has SUPPORTS_ORDERED_PLAN (the K3 module has it)",
-    "ops/attention/_fp4_mla_decode_ull.py:_ULL3_MLA_TAIL_TRIGGER_EPILOGUE = True": "TRTLLM_K3_ULL3_MLA_TAIL_TRIGGER=epilogue (1007804's GEN srun --export; the case's trtllm_config.yaml lacks it); served config.py:325 -> the kernel module's LAUNCH_DEPENDENTS_EPILOGUE",
+    "ops/attention/_fp4_mla_decode_ull.py:_ULL3_MLA_TAIL_TRIGGER_EPILOGUE = True": "TRTLLM_K3_ULL3_MLA_TAIL_TRIGGER=epilogue (set in the reference generation worker's environment); served config.py:325 -> the kernel module's LAUNCH_DEPENDENTS_EPILOGUE",
     "ops/attention/_fp4_mla_decode_ull.py:_PACKED_Q = True": "TRTLLM_FP4_MLA_PACKED_Q unset; served config.py:186 default on",
     "ops/attention/_fp4_mla_decode_ull.py:CUTEDSL_BACKEND = \"cutedsl\"": "TRTLLM_FP4_MLA_ATTENTION_BACKEND unset; served config.py:210 picks cutedsl on SM107 when the CuTe DSL backend imports",
     "ops/attention/_fp4_mla_cache_update.py:_FUSED_V_TRANSPOSE = False": "TRTLLM_FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE unset; served config.py:128 default off",
@@ -161,10 +159,10 @@
     "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:MLA_MAX_POSITIONS = 1048576": "KIMI_K3_MLA_MAX_POSITIONS unset; served text_model.py:4787 falls back to max_position_embeddings"
   },
   "features": {
-    "ull2_mla_decode_pdl": "True. TRTLLM_K3_ULL2_MLA_DEC_PDL=1 (1007804's GEN srun --export; the case's trtllm_config.yaml lacks it); served config.py:176.",
+    "ull2_mla_decode_pdl": "True. TRTLLM_K3_ULL2_MLA_DEC_PDL=1 (set in the reference generation worker's environment); served config.py:176.",
     "fp4_mla_page_plan": "True. TRTLLM_FP4_MLA_PAGE_PLAN unset; served config.py:315 default on (\"0\" turns it off).",
-    "fp4_mla_reduce_pdl": "True. TRTLLM_FP4_MLA_REDUCE_PDL=1 (1007804's GEN srun --export; the case's trtllm_config.yaml lacks it); served fp4_mla_packed_reduce.py:85.",
-    "fp4_mla_f16_partials": "True. TRTLLM_FP4_MLA_F16_PARTIALS=1 (1007804's GEN srun --export; the case's trtllm_config.yaml lacks it); served fp4_mla_packed_reduce.py:96."
+    "fp4_mla_reduce_pdl": "True. TRTLLM_FP4_MLA_REDUCE_PDL=1 (set in the reference generation worker's environment); served fp4_mla_packed_reduce.py:85.",
+    "fp4_mla_f16_partials": "True. TRTLLM_FP4_MLA_F16_PARTIALS=1 (set in the reference generation worker's environment); served fp4_mla_packed_reduce.py:96."
   },
   "source_sha256": {
     "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/k3_rubin/mla/kimi_k3_mla_attention.py": "787b30235c9337081924581350ae1831692f6177b5249f709bbea711fccc267d",
@@ -185,7 +183,7 @@
     "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix16_moetp4ep4/ull/mlain.py": "4629dea04064be8210b196b05f6facde1e875f2d71843d5302866939bf6a0964"
   },
   "deliberate_differences": [
-    "Env reads are constants with 1007804's values (see constants and features). The copied kernels/fp4_mla_packed_reduce.py answers TRTLLM_FP4_MLA_REDUCE_SPREAD_STATS / REDUCE_PDL / F16_PARTIALS with 1007804's \"1\" (constants); the glue passes reduce_pdl / f16_partials explicitly, and spread_stats is only read by the standalone reduction, which the deferred fused tail does not launch.",
+    "Env reads are constants with the reference deployment's values (see constants and features). The copied kernels/fp4_mla_packed_reduce.py answers TRTLLM_FP4_MLA_REDUCE_SPREAD_STATS / REDUCE_PDL / F16_PARTIALS with the reference deployment's \"1\" (constants); the glue passes reduce_pdl / f16_partials explicitly, and spread_stats is only read by the standalone reduction, which the deferred fused tail does not launch.",
     "The served backend dispatch (MLA.forward -> TrtllmAttention.forward -> FP4 / FMHA backend objects, autotuner custom op) is unrolled into explicit calls: FP4 layers call ops/attention/k3_fp4_mla_decode, FP8 layers call ops/attention/k3_mla_decode_fp8 with the served runner's default tactic. Paths the deployment does not reach (non-Helix GEN, no-FP8 non-FP4 KV, layer.mqa.forward fallback) raise instead of falling back.",
     "The FP4 RoPE + KV append launches the served _fp4_mla_generation_fused_qk_rope_cache_update_kernel (copied file) through the served glue; the old renamed copy kernels/fp4_mla_kv_append.py and the extra plan launch it made are gone. Plan, lengths and page table come from the step state (_fp4_mla_decode) as in served, one launch per step.",
     "forward_gen_q_fused does not allocate the q_input / q_pe buffers served allocates and never reads (no kernels either way).",

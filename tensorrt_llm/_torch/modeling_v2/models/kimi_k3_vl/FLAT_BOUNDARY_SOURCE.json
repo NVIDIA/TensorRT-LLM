@@ -1,9 +1,7 @@
 {
   "area": "boundary",
   "scope": "GEN step outside the ULL decode chain: step prep, layer 0 (standalone KDA, KDA o_proj push + Lamport finish, Dense0), the chain entry mix, the MLA layers' input hand-off / post-attention mix / prefetch forks, the final join, the decoder loop.",
-  "source_commit": "6904cd9672",
-  "source_tree": "user/xguan/k3-rubin-ull-chain-mlamoe-gsm (~/dev/tekit_k3r_mlamoe_gsm)",
-  "measured_run": "1007804",
+  "source": "NVIDIA Kimi K3 ULL reference implementation",
   "functions": {
     "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:KimiK3Helix16UllModelingV2.forward (embedding)": [
       {
@@ -256,13 +254,13 @@
     "tensorrt_llm/_torch/speculative/interface.py": "646424d5f73264a52f47d160f76d2d98d6abc8063a7b647924bfcfc902ef5872"
   },
   "deliberate_differences": [
-    "Env reads are constants with 1007804's values: KIMI_K3_AUX_ATTN_RES_STREAM unset -> TAP_MIX=True; TRTLLM_ENABLE_PDL unset -> layers.USE_PDL=True; TRTLLM_MNNVL_AR_ONESHOT_MAX_BYTES=2097152 -> layers.MNNVL_ONE_SHOT_MAX_BYTES (push transport, cpp_one_shot reduction order, workspace sizing); TLLM_SPEC_HEAD_FUSION unset -> features.embedding_gather=False (F.embedding, as served nn.Embedding); TLLM_TEST_MNNVL unset -> dropped.",
+    "Env reads are constants with the reference deployment's values: KIMI_K3_AUX_ATTN_RES_STREAM unset -> TAP_MIX=True; TRTLLM_ENABLE_PDL unset -> layers.USE_PDL=True; TRTLLM_MNNVL_AR_ONESHOT_MAX_BYTES=2097152 -> layers.MNNVL_ONE_SHOT_MAX_BYTES (push transport, cpp_one_shot reduction order, workspace sizing); TLLM_SPEC_HEAD_FUSION unset -> features.embedding_gather=False (F.embedding, as served nn.Embedding); TLLM_TEST_MNNVL unset -> dropped.",
     "Served fallbacks the deployment does not reach are not copied and raise instead: the persistent and per-token C++ attn_res(+add)+RMSNorm kernels, the FP32 _apply_attn_res reference, LamportPending.materialize before a mix, Dense0's module path, the UllDecode.plan module fallback (plan_step raises), forward hooks.",
     "The served program machinery (UllDecode programs, Stage, StepState, OprojCall) is unrolled into explicit calls in served order; the per-step _STATS counters and _note_attn_res_fusion debug logs are dropped.",
     "Served taps run inside the next layer's program with capture=(spec, i-1); ours tap after the layer from the consumer's aux rows (chained / MoE layers, as served) and in _entry_mix for layer 0 (as served PreMix).",
     "MLAIN hand-off: served ChainMlaInput sets mixer.next_input_mxfp8 and MlaInAttention.released; ours sets the same on K3MLARuntime (attn.takes_q_fused / attn.stages_weights / attn.released, the MLA area's interface). Whether a layer serves MLAIN (served _serves) is computed once in build_chain.",
     "No vision tower on the generation target (served wrapper built it unless TLLM_MULTIMODAL_DISAGGREGATED); multimodal params raise. No GEN-step kernel depends on it.",
-    "KimiK3Helix16UllForCausalLM.forward is served SpecDecOneEngineForCausalLM.forward (283e3ddbdf: the target head reads spec_worker.target_head_rows, a generation-only batch's rows in place) where #21996's indexes hidden_states[gather_ids] (one index kernel per step). Not copied: #21996's position hoist (spec_decode_fast_paths, absent in served) and the csa2 encoder-boundary branch (not a K3 path). #21996's SpecWorkerBase has no target_head_rows (served added it to the base), so a configuration that keeps main's worker (install_k3_dspark False) takes #21996's forward unchanged.",
-    "Runtime shell (StepShell step_prep/step_fold/pin_executor/gil_switch_us=200) is #21996's RuntimeHooks: pack_step_inputs + pack_spec_rng_uploads only (gap table in notes run_records 1111_k3_ull_v2_boundary)."
+    "KimiK3Helix16UllForCausalLM.forward is served SpecDecOneEngineForCausalLM.forward (the target head reads spec_worker.target_head_rows, a generation-only batch's rows in place) where #21996's indexes hidden_states[gather_ids] (one index kernel per step). Not copied: #21996's position hoist (spec_decode_fast_paths, absent in served) and the csa2 encoder-boundary branch (not a K3 path). #21996's SpecWorkerBase has no target_head_rows (served added it to the base), so a configuration that keeps main's worker (install_k3_dspark False) takes #21996's forward unchanged.",
+    "Runtime shell (StepShell step_prep/step_fold/pin_executor/gil_switch_us=200) is #21996's RuntimeHooks: pack_step_inputs + pack_spec_rng_uploads only."
   ]
 }

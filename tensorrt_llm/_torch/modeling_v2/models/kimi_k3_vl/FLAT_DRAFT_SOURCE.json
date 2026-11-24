@@ -1,9 +1,7 @@
 {
   "area": "draft",
-  "scope": "GEN step after the last MoE tail: target LM head (vocab shard) + vocab-parallel selection and strict acceptance, the DSpark drafter inputs, the 5-layer MLA drafter on the FP8 Helix-sharded context (as 1007804), the draft LM head + Markov chain, next tokens with the KV rewind; the ctx side stream (fc + MNNVL all-reduce with hidden_norm, all-layer latents).",
-  "source_commit": "6904cd9672",
-  "source_tree": "user/xguan/k3-rubin-ull-chain-mlamoe-gsm (~/dev/tekit_k3r_mlamoe_gsm)",
-  "measured_run": "1007804",
+  "scope": "GEN step after the last MoE tail: target LM head (vocab shard) + vocab-parallel selection and strict acceptance, the DSpark drafter inputs, the 5-layer MLA drafter on the FP8 Helix-sharded context (as in the reference deployment), the draft LM head + Markov chain, next tokens with the KV rewind; the ctx side stream (fc + MNNVL all-reduce with hidden_norm, all-layer latents).",
+  "source": "NVIDIA Kimi K3 ULL reference implementation",
   "served_features_profile": "helix16_moetp4ep4",
   "functions": {
     "kimi_k3_nvfp4__sm_107__helix16_moetp16ep1/modeling.py:PrivateMNNVLAllReduce": [
@@ -236,10 +234,10 @@
     "kernels/k3r_spec/dspark_draft_ar.py": "DraftArNorm (sites), DraftEmbedKernel (draft_embed_site)",
     "kernels/k3r_spec/dspark_mla_rope.py": "DSparkMlaCtxNormRoPEKernel (ops/spec/k3_dspark_mla_ctx_norm_rope)",
     "kernels/k3r_mla_decode/cute_dsl_mla.py": "launch_mla_split_kv_plan (piece_cost 60) using the shared _mla_split_kv_plan_kernel in kernels/k3_mla/split_kv_plan.py",
-    "kernels/k3r_mla_decode/mla_decode_fp8.py": "BlackwellMultiHeadLatentAttentionForwardFP8 (FP8 in, BF16 out, softmax stats, kv_bounds, per-request plan) via ops/attention/k3_mla_decode_fp8 (the served CuteDSLNVMlaDecodeBlackwellRunner's only tactic: tilers (128,128)/(128,256), default split of the batch's power-of-two bucket, non-persistent, reduce_unroll 8 (TRTLLM_K3_DRAFT3_REDUCE_UNROLL=8 (1007804's GEN srun --export; the case's trtllm_config.yaml lacks it)))"
+    "kernels/k3r_mla_decode/mla_decode_fp8.py": "BlackwellMultiHeadLatentAttentionForwardFP8 (FP8 in, BF16 out, softmax stats, kv_bounds, per-request plan) via ops/attention/k3_mla_decode_fp8 (the served CuteDSLNVMlaDecodeBlackwellRunner's only tactic: tilers (128,128)/(128,256), default split of the batch's power-of-two bucket, non-persistent, reduce_unroll 8 (TRTLLM_K3_DRAFT3_REDUCE_UNROLL=8 (set in the reference generation worker's environment)))"
   },
   "deliberate_differences": [
-    "Constants for every served switch of the path: features draft3_glue, dspark_draft_gemm, dspark_tail_v2, spec_tail_fusion, ull2_draft_a2a, ull2_draft_store (all True in helix16_moetp4ep4); TRTLLM_ENABLE_PDL -> _PDL = True, TRTLLM_FORCE_MNNVL_AR -> _FORCE_MNNVL_AR = False (1007804: unset); 1007804's FP8 context as the drafter's class constant draft_kv_dtype = torch.float8_e4m3fn, from which the KV cache creator builds its appended draft layers in FP8 (the context servers' family drafter declares the same).",
+    "Constants for every served switch of the path: features draft3_glue, dspark_draft_gemm, dspark_tail_v2, spec_tail_fusion, ull2_draft_a2a, ull2_draft_store (all True in helix16_moetp4ep4); TRTLLM_ENABLE_PDL -> _PDL = True, TRTLLM_FORCE_MNNVL_AR -> _FORCE_MNNVL_AR = False (unset in the reference deployment); the reference deployment's FP8 context as the drafter's class constant draft_kv_dtype = torch.float8_e4m3fn, from which the KV cache creator builds its appended draft layers in FP8 (the context servers' family drafter declares the same).",
     "Unreached served paths are not copied; where served would fall back, the target raises: the BF16 pool ('auto': q_a_layernorm + unfolded q_b, the fused block RoPE into scratch rows + masked scatter, bmm_out, the BF16 decode), the unused block scratch allocation and its index of the FP8 path, eager / trtllm-gen decode, the unfused per-layer RoPE (_mla_rope_into / _rmsnorm_rope_batched), the un-pinned q_kv_a / q_b fallbacks, the NCCL helix exchange (_draft_helix_post_process), the un-pushed all-reduce fallback (_fused_ar_residual_norm), the eager draft logits path (logits_processor + _refine_block_logits / LiLiCorr / DFlash 2), the Triton Markov chain and the per-step Markov loop (markov_tokens_chain / markov_tokens), the eager drafter-input prep and main's _prepare_paged_latent_gen_inputs, vocab_shard_embedding / embed_tokens fallbacks of the draft embedding, the private context arena (dense or paged), the flashinfer paged append, accept-stats recording.",
     "Draft cache: served prepares the unified draft cache with engine hooks (prepare_managed_draft_cache, snapshot_managed_draft_history) and passes position_offset = _ctx_position_offset to dflash_gen_prepare; the target binds #21996's appended draft layers in _lazy_init_ctx_buffers (_managed_ctx_pool, _init_ctx_block_offsets, _check_unified_helix) and decodes the draft page table per step with #21996's speculative.spec_tail_kernels.decode_draft_block_table(block_offset=) (_refresh_ctx_block_tables); dflash_gen_prepare gets position_offset=None (served: a zero offset tensor in steady state, the kernel's other specialization, same values).",
     "target_head_rows falls back to hidden_states[gather_ids] (served: super().target_head_rows); #21996's one-engine forward gathers before target_logits, so the in-place rows need the model's forward to call it.",
@@ -256,10 +254,10 @@
     {
       "served": "FP8 draft pool",
       "21996": "draft layers in the drafter dtype (BF16)",
-      "cost": "closed on 21b86d335d: the engine builds the appended draft layers in FP8 for a drafter that declares draft_kv_dtype FP8 E4M3; this drafter and the context servers' family drafter both do"
+      "cost": "resolved: the engine builds the appended draft layers in FP8 for a drafter that declares draft_kv_dtype FP8 E4M3; this drafter and the context servers' family drafter both do"
     },
     {
-      "served": "managed draft cache upload skip (019d90ccc2): host page table, uploaded when changed",
+      "served": "managed draft cache upload skip: host page table, uploaded when changed",
       "21996": "draft layers' pages in kv_cache_block_offsets",
       "cost": "+1 decode_draft_block_table launch per step (~2-3 us, overlappable only if the model loop forks it)"
     },
@@ -269,7 +267,7 @@
       "cost": "without it the drafter sites (7 x 7168 x 16 x 2 = 1.6 MB at b1), the ctx fc all-reduce and the target Lamport all-reduces between 1 and 2 MiB run two-shot: other kernel, other summation order; set TLLM_MNNVL_ONESHOT_THRESHOLD_BYTES=2097152 in the GEN env"
     },
     {
-      "served": "TLLM_SPEC_HEAD_FUSION=1 in 1007804 (1007804's GEN srun --export; the case's trtllm_config.yaml lacks it): fused spec-head prep + embedding gather",
+      "served": "TLLM_SPEC_HEAD_FUSION=1 in the reference generation settings: fused spec-head prep + embedding gather",
       "21996": "RuntimeHooks.decode_prologue (modeling.py installs spec_decode_head)",
       "cost": "none: features.embedding_gather installs spec_decode_head, the same two kernels (_spec_head_prep_kernel, _embedding_gather_kernel)"
     },
@@ -284,5 +282,5 @@
       "cost": "+1 index kernel per step unless modeling.py calls spec_worker.target_head_rows"
     }
   ],
-  "gpu_check": "notes/experiments/kimi_k3/1110_k3_ull_v2_target/flatten/draft/draft_vs_served_gpu.py (+ draft_vs_served.sbatch, ocijhb 16 x GB300); not yet run"
+  "gpu_check": "Planned: compare the drafter against the reference implementation on 16 GB300 GPUs."
 }

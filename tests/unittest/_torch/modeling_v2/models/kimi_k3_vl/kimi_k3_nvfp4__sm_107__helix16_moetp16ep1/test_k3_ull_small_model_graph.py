@@ -25,7 +25,7 @@ device buffers). Each step: 1, 2 or 4 requests x 8 tokens, DSpark taps of layers
 Checks: the output rows and the taps of a CUDA graph replay equal the eager step's, from the same
 KV cache, KDA checkpoints and input.
 
-Run (ocijhb, 4 GB300 nodes)::
+Run on 4 GB300 nodes::
 
     K3_CKPT=<Kimi K3 NVFP4 checkpoint> srun -N4 --ntasks-per-node=4 --mpi=pmix \\
         python -m pytest -q -p no:cacheprovider \\

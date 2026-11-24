@@ -3,8 +3,7 @@
 """The speculative-decoding position IDs of a step's first ``num_tokens`` tokens.
 
 :func:`_slice_spec_position_ids` is Modeling V1's
-(``tensorrt_llm/_torch/models/modeling_speculative.py`` at
-21b86d335db76818167f583d14d5dd2dc2b6a0d9) token for token; only the imports differ.
+(``tensorrt_llm/_torch/models/modeling_speculative.py``) token for token; only the imports differ.
 ``test_k3_common.py`` checks it against its source.
 """
 

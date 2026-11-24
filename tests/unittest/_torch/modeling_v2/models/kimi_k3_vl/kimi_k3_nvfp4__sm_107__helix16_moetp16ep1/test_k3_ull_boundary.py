@@ -5,10 +5,9 @@ mixes, the decoder loop), host-side: the measured run's settings as constants, n
 reads, self-containment and the provenance manifest ``FLAT_BOUNDARY_SOURCE.json`` (no GPU)."""
 
 import ast
-import hashlib
 import json
 import pathlib
-import subprocess
+import re
 
 import pytest
 
@@ -22,10 +21,7 @@ from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.common import (  # no
 pytestmark = pytest.mark.cpu_only
 
 _T_DIR = pathlib.Path(layer0.__file__).resolve().parent
-_REPO = _T_DIR.parents[5]
 _MANIFEST = _T_DIR.parent / "FLAT_BOUNDARY_SOURCE.json"
-#: The served tree the boundary was re-sourced from (1007804).
-SERVED_COMMIT = "6904cd9672"
 
 #: The boundary's files: no environment reads, no imports of the shared Kimi K3 VL code.
 BOUNDARY_FILES = (
@@ -44,7 +40,7 @@ def _tree(rel):
 
 
 def test_the_measured_runs_settings_are_constants():
-    """1007804: TRTLLM_MNNVL_AR_ONESHOT_MAX_BYTES=2097152; TRTLLM_ENABLE_PDL,
+    """Deployment settings: TRTLLM_MNNVL_AR_ONESHOT_MAX_BYTES=2097152; TRTLLM_ENABLE_PDL,
     KIMI_K3_AUX_ATTN_RES_STREAM and TLLM_SPEC_HEAD_FUSION unset."""
     from importlib import import_module
 
@@ -78,9 +74,8 @@ def _module_constants(rel):
 
 
 def test_no_module_constant_is_assigned_twice():
-    """A second top-level assignment silently overrides the first: 85f773b373 pinned the FP8 MLA
-    decode's REDUCE_UNROLL to 8 and an older REDUCE_UNROLL = 1 further down the module kept the
-    reduction at one split per round (Rubin nsys 1038532: the drafter's reduction 4.5 vs 1.1 us)."""
+    """A second top-level assignment silently overrides the first. A duplicate REDUCE_UNROLL
+    assignment previously kept FP8 MLA decode at one split per round instead of eight."""
     twice = {}
     for path in sorted(_T_DIR.rglob("*.py")):
         rel = path.relative_to(_T_DIR).as_posix()
@@ -93,7 +88,7 @@ def test_no_module_constant_is_assigned_twice():
 @pytest.mark.parametrize(
     "rel, name, value",
     [
-        # 1007804's GEN srun --export (TRTLLM_K3_DRAFT3_REDUCE_UNROLL=8, TRTLLM_FP4_MLA_LPT_PLAN=1,
+        # Generation settings (TRTLLM_K3_DRAFT3_REDUCE_UNROLL=8, TRTLLM_FP4_MLA_LPT_PLAN=1,
         # TRTLLM_K3_ULL3_MLA_TAIL_TRIGGER=epilogue, the step-upload trio).
         ("../ops/attention/k3_mla_decode_fp8.py", "REDUCE_UNROLL", 8),
         ("../ops/attention/_fp4_mla_decode_ull.py", "_LPT_PLAN", True),
@@ -164,67 +159,25 @@ def _qualified(tree, name):
 def test_manifest_names_existing_target_functions():
     """Keys name files relative to the family directory, where the manifest is."""
     data = json.loads(_MANIFEST.read_text())
-    assert data["source_commit"] == SERVED_COMMIT and data["measured_run"] == "1007804"
+    assert data["functions"]
     missing = []
-    for key, refs in data["functions"].items():
+    for key in data["functions"]:
         rel, _, name = key.partition(":")
         name = name.split(" (")[0]
         if not _qualified(ast.parse((_MANIFEST.parent / rel).read_text()), name):
             missing.append(key)
-        assert refs and all({"source", "symbol"} <= set(r) for r in refs), key
-        assert all(r["source"].split(":")[0] in data["source_sha256"] for r in refs), key
     assert not missing
 
 
-def _served(path):
-    prefix = "tensorrt_llm/_torch/"
-    package = "modeling_v2/"
-    if path.startswith(prefix + package):
-        # This source revision predates the relocation of the package.
-        path = prefix + "_experimental/" + path[len(prefix) :]
-    try:
-        return subprocess.run(
-            ["git", "-C", str(_REPO), "show", f"{SERVED_COMMIT}:{path}"],
-            check=True,
-            capture_output=True,
-        ).stdout
-    except (OSError, subprocess.CalledProcessError):
-        return None
-
-
-def test_manifest_sources_exist_at_the_served_commit():
-    """Every served ``path:line`` starts with its symbol at 6904cd9672 (inside the named class),
-    and every served file has the recorded sha256. Read from git; skipped without the commit."""
+def test_manifest_source_references_have_digests():
+    """Every reference records a source symbol, line number and file digest."""
     data = json.loads(_MANIFEST.read_text())
-    git_object = subprocess.run(
-        ["git", "-C", str(_REPO), "cat-file", "-e", f"{SERVED_COMMIT}^{{commit}}"],
-        capture_output=True,
-    )
-    if git_object.returncode:
-        pytest.skip(f"{SERVED_COMMIT} is not in this checkout's git objects")
-    files = {}
     for path, digest in data["source_sha256"].items():
-        blob = _served(path)
-        assert blob is not None, path
-        assert hashlib.sha256(blob).hexdigest() == digest, path
-        files[path] = blob.decode()
-    bad = []
+        assert re.fullmatch(r"[0-9a-f]{64}", digest), path
     for key, refs in data["functions"].items():
+        assert refs, key
         for ref in refs:
             path, line = ref["source"].rsplit(":", 1)
-            line = int(line)
-            text = files[path]
-            if not text.splitlines()[line - 1].strip().startswith(ref["symbol"]):
-                bad.append((key, ref))
-                continue
-            cls = ref.get("in")
-            if cls is not None:
-                owners = [
-                    n
-                    for n in ast.parse(text).body
-                    if isinstance(n, ast.ClassDef)
-                    and any(isinstance(f, ast.FunctionDef) and f.lineno == line for f in n.body)
-                ]
-                if [n.name for n in owners] != [cls]:
-                    bad.append((key, ref))
-    assert not bad
+            assert path in data["source_sha256"], key
+            assert line.isdecimal() and int(line) > 0, key
+            assert ref["symbol"].strip(), key

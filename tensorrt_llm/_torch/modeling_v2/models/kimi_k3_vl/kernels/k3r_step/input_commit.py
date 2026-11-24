@@ -64,8 +64,8 @@ from ...ops.common.k3_ull_runtime import STEP_FOLD
 BATCHED_INPUT_COMMIT_ENV = "TRTLLM_BATCHED_INPUT_COMMIT"
 BATCHED_INPUT_COMMIT_VERIFY_ENV = "TRTLLM_BATCHED_INPUT_COMMIT_VERIFY"
 
-_ENABLED = False  # TensorRT-LLM local change: 1007804's value (unset); the target reads no environment.
-_VERIFY_COMMITS = 0  # TensorRT-LLM local change: 1007804's value (unset); the target reads no environment.
+_ENABLED = False  # TensorRT-LLM local change: the reference setting (unset); the target reads no environment.
+_VERIFY_COMMITS = 0  # TensorRT-LLM local change: the reference setting (unset); the target reads no environment.
 
 # torch dtype -> (numpy dtype, element size) of the staged values.
 _TORCH_TO_NUMPY = {

@@ -631,7 +631,7 @@ class _PairExchange:
 
         assert self.backend == "mnnvl"
         comm = MNNVLAllReduce.allreduce_mnnvl_workspaces[self.mapping]["comm"]
-        force_mn = False  # TensorRT-LLM local change: 1007804's value (unset); the target reads no environment.
+        force_mn = False  # TensorRT-LLM local change: the reference setting (unset); the target reads no environment.
         handle = McastGPUBuffer(
             numel * 4,
             self.tp_size,
@@ -673,7 +673,7 @@ class _PairExchange:
 
         assert self.backend == "mnnvl"
         comm = MNNVLAllReduce.allreduce_mnnvl_workspaces[self.mapping]["comm"]
-        force_mn = False  # TensorRT-LLM local change: 1007804's value (unset); the target reads no environment.
+        force_mn = False  # TensorRT-LLM local change: the reference setting (unset); the target reads no environment.
         handle = McastGPUBuffer(
             words * 4,
             self.tp_size,

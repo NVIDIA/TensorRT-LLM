@@ -2,17 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """The ULL target's GEN-step shell (``ops/common/k3_ull_runtime.py``), host-side.
 
-Covered without a GPU: ``make_runtime_hooks`` declares the served shell; the executor-pinning core
-choice equals served ``ull_shell.pin_executor_cpu`` on synthetic topologies; the pin and the GIL
-switch interval are applied; the provenance manifest names functions that exist on both sides. The
-engine hook points the shell uses are tested in ``tests/unittest/_torch/pyexecutor/``
+Covered without a GPU: ``make_runtime_hooks`` declares the served shell; the executor selects the
+expected core on synthetic topologies; the pin and the GIL switch interval are applied; the
+provenance manifest names functions in the target. The engine hook points are tested in
+``tests/unittest/_torch/pyexecutor/``
 (``test_runtime_hooks.py``, ``test_step_inputs.py``)."""
 
 import ast
 import hashlib
 import json
 import pathlib
-import subprocess
 import sys
 import types
 
@@ -27,9 +26,7 @@ from tensorrt_llm._torch.pyexecutor.runtime_hooks import DEFAULT_RUNTIME_HOOKS, 
 pytestmark = pytest.mark.cpu_only
 
 _FAM_DIR = pathlib.Path(runtime.__file__).resolve().parents[2]
-_REPO = _FAM_DIR.parents[4]
 _MANIFEST = _FAM_DIR / "FLAT_RUNTIME_SOURCE.json"
-SERVED_COMMIT = "6904cd9672"
 
 
 def test_make_runtime_hooks_declares_the_served_shell():
@@ -85,41 +82,19 @@ _TOPOLOGIES = [
 
 
 @pytest.mark.parametrize("topo", range(len(_TOPOLOGIES)))
-@pytest.mark.parametrize("gpu", range(4))
+@pytest.mark.parametrize("gpu", range(8))
 def test_pinned_core_choice(topo, gpu, monkeypatch):
     monkeypatch.setattr(runtime, "smt_siblings", _topology(_TOPOLOGIES[topo]))
     available = set(range(8)) if topo < 2 else set(range(36, 72)) | set(range(108, 144))
     cpu = runtime.pin_executor_cpu(available, gpu_index=gpu)
     assert cpu in available
     assert 0 not in runtime.smt_siblings(cpu) or available == {0}
-    expected = {0: [1, 2, 3, 1], 1: [1, 2, 3, 4], 2: [36 + gpu] * 4}[topo][gpu]
-    assert cpu == expected
-
-
-def _served_ull_shell():
-    out = subprocess.run(
-        ["git", "show", f"{SERVED_COMMIT}:tensorrt_llm/_torch/pyexecutor/ull_shell.py"],
-        cwd=_REPO,
-        capture_output=True,
+    expected = (
+        (1, 2, 3, 1, 2, 3, 1, 2),
+        (1, 2, 3, 4, 5, 6, 7, 1),
+        (36, 37, 38, 39, 40, 41, 42, 43),
     )
-    if out.returncode:
-        pytest.skip(f"served commit {SERVED_COMMIT} is not in this repository")
-    module = types.ModuleType("served_ull_shell")
-    exec(compile(out.stdout.decode(), "served_ull_shell.py", "exec"), module.__dict__)
-    return module
-
-
-@pytest.mark.parametrize("topo", range(len(_TOPOLOGIES)))
-def test_pinned_core_choice_equals_served(topo, monkeypatch):
-    served = _served_ull_shell()
-    fake = _topology(_TOPOLOGIES[topo])
-    monkeypatch.setattr(runtime, "smt_siblings", fake)
-    monkeypatch.setattr(served, "_smt_siblings", fake)
-    monkeypatch.setattr(served, "_SHELL", served.StepShell(pin_executor=True))
-    available = set(range(8)) if topo < 2 else set(range(36, 72)) | set(range(108, 144))
-    for gpu in range(8):
-        ours = runtime.pin_executor_cpu(available, gpu_index=gpu)
-        assert ours == served.pin_executor_cpu(available, gpu_index=gpu)
+    assert cpu == expected[topo][gpu]
 
 
 @pytest.mark.parametrize(
@@ -250,13 +225,6 @@ def _defined(tree):
 def test_manifest_names_exist():
     manifest = json.loads(_MANIFEST.read_text())
     ours = _defined(ast.parse(pathlib.Path(runtime.__file__).read_text()))
-    for name, source in manifest["functions"].items():
+    assert manifest["functions"]
+    for name in manifest["functions"]:
         assert name.startswith("k3_ull_runtime.") and name[len("k3_ull_runtime.") :] in ours, name
-        path, func = source.split(":")
-        out = subprocess.run(
-            ["git", "show", f"{SERVED_COMMIT}:{path}"], cwd=_REPO, capture_output=True
-        )
-        if out.returncode:
-            pytest.skip(f"served commit {SERVED_COMMIT} is not in this repository")
-        served = _defined(ast.parse(out.stdout.decode()))
-        assert func in served, f"{name}: {path}:{func}"

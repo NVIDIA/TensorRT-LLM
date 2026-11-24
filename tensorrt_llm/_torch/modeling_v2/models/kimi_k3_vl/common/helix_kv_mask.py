@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """The per-token mask of the tokens a helix CP rank holds no KV for.
 
-:func:`_helix_zero_kv_mask` is Modeling V1's (``tensorrt_llm/_torch/attention/attention.py`` at
-21b86d335db76818167f583d14d5dd2dc2b6a0d9) token for token; only the imports differ.
+:func:`_helix_zero_kv_mask` is Modeling V1's (``tensorrt_llm/_torch/attention/attention.py``)
+token for token; only the imports differ.
 ``test_k3_common.py`` checks it against its source.
 """
 

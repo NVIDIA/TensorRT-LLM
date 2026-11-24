@@ -21,7 +21,7 @@ class K3Features:
     """One deployment's settings. Each default is the plain code path.
 
     The fields down to ``dspark_tail_v2`` are the served tree's ``k3_rubin/features.K3Features``
-    (6904cd9672) in its order, without the ones only served code this target does not run read
+    in its order, omitting fields read only by paths this target does not run
     (the MoE and KDA module paths the ULL decode chain replaces, the ULL front, the MXFP8 AttnRes of the
     module path) and the ones whose served branch is this target's only code (``attn_res_pdl``,
     ``draft3_glue``, ``dspark_draft_gemm``: on in the served profile, written as the code itself);
@@ -50,7 +50,7 @@ class K3Features:
     dspark_tail_v2: bool = False  # TLLM_DSPARK_TAIL_V2
 
     # This target's own fields. The served tree read these as environment variables or decided
-    # them in its runtime; each value in PROFILE must be what the measured run (1007804) did.
+    # them in its runtime; each value in PROFILE must be what the measured run did.
     # Token embedding and the speculative decode step's head (modeling.py)
     embedding_gather: bool = False  # TLLM_SPEC_HEAD_FUSION
     # Decode step inputs: one upload and one scatter at the graph replay (modeling.py)
@@ -73,7 +73,7 @@ class K3Features:
 
 #: The one deployment of this target: Helix CP16 generation with the KDA + MoE layers on the ULL decode
 #: chain (``modeling.py``). The served fields are the served ``PROFILES["helix16_moetp4ep4"]``
-#: (6904cd9672) unchanged; the target's own fields follow.
+#: unchanged; the target's own fields follow.
 PROFILE = K3Features(
     attn_res_early_trigger=True,
     cute_carveout_fix=True,
@@ -89,9 +89,9 @@ PROFILE = K3Features(
     ull4_mla_plan_early=True,
     ull_oproj_sandwich=True,
     ull_tail_sandwich=True,
-    # The target's own fields, at the values of 1007804's GEN process environment (its srun --export:
+    # The target's own fields, matching the reference generation process environment:
     # TRTLLM_FP4_MLA_F16_PARTIALS=1, TRTLLM_FP4_MLA_REDUCE_PDL=1, TRTLLM_K3_ULL2_MLA_DEC_PDL=1,
-    # TLLM_SPEC_HEAD_FUSION=1; TRTLLM_FP4_MLA_PAGE_PLAN unset). The served backend and runtime read
+    # TLLM_SPEC_HEAD_FUSION=1; TRTLLM_FP4_MLA_PAGE_PLAN unset. The served backend and runtime read
     # these from the environment; #21996's __default helix16_moetp4ep4 profile turns on the same four.
     # pack_step_inputs stands for served StepShell(step_prep=True), its input commit at the replay.
     embedding_gather=True,

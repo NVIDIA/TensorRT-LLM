@@ -3686,11 +3686,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             # reduction for row_max
             row_max_new = tTR_rAcc.load().reduce(cute.ReductionOp.MAX,
                                                  row_max_new, 0)
-        # SM107 (Rubin) shares this reduction path with SM103. The arm was
-        # dropped when this file was taken wholesale from main during the
-        # rebase (c130d75c42); ``rubin-advance`` gates the identical body on
-        # sm_101/sm_103/sm_107/sm_110. Only sm_107 is restored here -- the
-        # others were never in main's copy and are not Rubin.
+        # SM107 (Rubin) shares this reduction path with SM103.
         elif cutlass.const_expr(
             (arch >= Arch.sm_103 and arch <= Arch.sm_103f)
                 or (arch >= Arch.sm_107 and arch <= Arch.sm_107f)):

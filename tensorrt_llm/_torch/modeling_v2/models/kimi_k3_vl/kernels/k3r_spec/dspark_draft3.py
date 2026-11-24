@@ -264,7 +264,7 @@ def draft_qhead(
         assert rows_mask.numel() == num_tokens and rows_mask.is_contiguous()
         if rows_mask.dtype == torch.bool:
             rows_mask = rows_mask.view(torch.uint8)
-    # 256 columns x 8 warps per program (bench_qhead, hecate 851457, 1 GPU, 64 heads: 3.98 / 4.16 /
+    # 256 columns x 8 warps per program (single Rubin GPU, 64 heads: 3.98 / 4.16 /
     # 5.65 us at 8 / 16 / 32 rows vs 5.40 / 6.45 / 7.12 at 128 x 4).
     block_n = 256
     warps = 8

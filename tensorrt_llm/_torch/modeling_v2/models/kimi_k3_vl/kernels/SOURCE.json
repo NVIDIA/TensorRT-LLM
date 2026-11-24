@@ -14,7 +14,7 @@
    "local_edits": [
     "TRTLLM_ENABLE_PDL unset -> True"
    ],
-   "sha256": "14a23d12b9b7e74365264c908dd149eb8ec83f468c285a1949a8a66b33ed8e6b",
+   "sha256": "ae2d968ffb60f070087d5c71478ea60970e6a65aac92969b4d26fd42572e6995",
    "target_path": "kernels/k3_attn_res.py"
   },
   "kernels/k3r_attn_res/ull/__init__.py": {
@@ -167,9 +167,9 @@
     "from .fp4_mla_cute_dsl_utils import ... -> from ...ops.attention._k3_fp4_mla_cute_dsl_utils import ..."
    ],
    "local_edits": [
-    "TRTLLM_FP4_MLA_REDUCE_SPREAD_STATS=1 (1007804's GEN env) -> True",
-    "TRTLLM_FP4_MLA_REDUCE_PDL=1 (1007804's GEN env) -> True",
-    "TRTLLM_FP4_MLA_F16_PARTIALS=1 (1007804's GEN env) -> True",
+    "TRTLLM_FP4_MLA_REDUCE_SPREAD_STATS=1 (reference generation settings) -> True",
+    "TRTLLM_FP4_MLA_REDUCE_PDL=1 (reference generation settings) -> True",
+    "TRTLLM_FP4_MLA_F16_PARTIALS=1 (reference generation settings) -> True",
     "Share plan and reduce kernels with the Helix8 targets. Keep separate deferred contexts and keep runtime PDL and FP16 partial choices in the callers."
    ],
    "sha256": "1d2e69d75c0725f4347189489de297eef744421775eaf61a3b788d6915b77217",
@@ -444,7 +444,7 @@
    "source_sha256": "1696ff32c3c1a240e3086e0c652a2acb48d9de11bb91ed06f3d573406f76a243",
    "import_edits": [],
    "local_edits": [],
-   "sha256": "1696ff32c3c1a240e3086e0c652a2acb48d9de11bb91ed06f3d573406f76a243",
+   "sha256": "92a536e6f885d15bec11d4db02ea6d3e28356761372491125123a4db7047d156",
    "target_path": "kernels/mla/mla_decode_fp8.py"
   },
   "kernels/k3r_mla_decode/mla_helpers.py": {
@@ -711,7 +711,7 @@
     "from ...kimi_k3_nvfp4__sm_107__helix16_moetp16ep1.features import active as _features -> from ...ops.common.k3_ull_features import active as _features"
    ],
    "local_edits": [],
-   "sha256": "fbc87a1376bba2f5235816247152fd9fa221cbba63bddf85e6674917d60034da",
+   "sha256": "8d001e3b418df106aa5ef0f52fad3ffb6a267dde34ccc3db4e50b994db63c452",
    "target_path": "kernels/spec/dspark_draft3.py"
   },
   "kernels/k3r_spec/dspark_draft_ar.py": {
@@ -805,7 +805,7 @@
     "TRTLLM_FORCE_MNNVL_AR unset -> False (float workspace)",
     "TRTLLM_FORCE_MNNVL_AR unset -> False (word workspace)"
    ],
-   "sha256": "1a0ed2b371c4e08105ebdc5db144556b936be713af4fe5d397a4f6dc39ad4402",
+   "sha256": "c8deb93bda4df35c769dee1e80f1d80df0ad6de1a61ab4a1dcf46fb7dcadcf61",
    "target_path": "kernels/spec/vocab_parallel.py"
   },
   "kernels/k3r_step/input_commit.py": {
@@ -822,7 +822,7 @@
     "commit(): overlap fixup reads a device slot tensor when given (runtime.py OverlapFixupFold)",
     "_verify(): the same for the reference gathers"
    ],
-   "sha256": "ed40d6e36f63a761fd30d6dfd95864067df218c4f389aca563b3070d7df8e5d7",
+   "sha256": "d86193bf4f3f7ad1db01a8db25cebbaa52a875720d5e27833de0155dccf0b5d1",
    "target_path": "kernels/step/input_commit.py"
   },
   "kernels/k3r_step/step_upload_kernels.py": {
@@ -830,11 +830,11 @@
    "source_sha256": "757ec4b48712c567f85f64ae475c729cf2294ad884d6b5ce38ace1b38a3b383f",
    "import_edits": [],
    "local_edits": [
-    "TRTLLM_KV_BLOCK_OFFSETS_TRITON=2 (1007804's GEN env) -> True",
-    "TRTLLM_SPEC_SAMPLER_FUSED_SCATTER=1 (1007804's GEN env) -> True",
-    "TRTLLM_STATE_INDEX_COPY_KERNEL=1 (1007804's GEN env) -> True"
+    "TRTLLM_KV_BLOCK_OFFSETS_TRITON=2 (reference generation settings) -> True",
+    "TRTLLM_SPEC_SAMPLER_FUSED_SCATTER=1 (reference generation settings) -> True",
+    "TRTLLM_STATE_INDEX_COPY_KERNEL=1 (reference generation settings) -> True"
    ],
-   "sha256": "be77a039cd4be0afacfdb407f9d63b11c425ecef2f5422f23eb866f3625e54c7",
+   "sha256": "e5afbf383de56e9ca9c91725aea8dcf08e8e601122a53fc7c9a9e3ca77a70821",
    "target_path": "kernels/step/step_upload_kernels.py"
   },
   "ops/attention/_k3_fp4_mla_cute_dsl_utils.py": {

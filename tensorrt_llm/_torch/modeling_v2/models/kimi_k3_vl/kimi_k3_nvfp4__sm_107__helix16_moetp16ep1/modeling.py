@@ -7,10 +7,8 @@ deployment: 16 ranks, every step generation-only, each request verifying ``1 + 7
 1 to 4 requests (8, 16, 24 or 32 token rows). It loads the vision-language checkpoint's text
 model ``KimiK3Helix16UllForCausalLM`` (no vision tower: the context server encodes media).
 
-The step is the served Kimi K3 ULL generation step (``user/xguan/k3-rubin-ull-chain-mlamoe-gsm``
-@ 6904cd9672, ``ull/decode.py`` + ``ull/stages.py`` + the ``chain`` / ``dense0`` / ``mlain``
-ports) written out as plain calls; ``FLAT_BOUNDARY_SOURCE.json`` maps each function here to its
-served source.
+This module expresses the Kimi K3 ULL reference generation step as plain calls.
+``FLAT_BOUNDARY_SOURCE.json`` maps target functions to their source symbols.
 
 The text model has 93 decoder layers: 69 KDA (Kimi Delta Attention) layers, 24 MLA layers
 (3, 7, ..., 87, 91, 92), layer 0 with a dense MLP, layers 1..92 with the latent MoE. Most of the
@@ -3577,11 +3575,11 @@ class K3MLAAttention(nn.Module):
 
 # Identity-RoPE table positions of the MLA backends. K3 is NoPE (the table holds cos=1 / sin=0),
 # but the cache-update kernels index the table by absolute position, so it covers every position
-# of the deployment. Served: KIMI_K3_MLA_MAX_POSITIONS, 1048576 in 1007804.
+# of the deployment. Served: KIMI_K3_MLA_MAX_POSITIONS, 1048576 in the reference deployment.
 MLA_MAX_POSITIONS = 1048576
 
 # The MLA layers whose KV cache is FP8 under the model-wide NVFP4 KV cache: the last two MLA layers.
-# Served: TLLM_KIMI_K3_FP8_KV_LAYERS=91,92 in 1007804. The KV cache manager allocates them from the
+# Served: TLLM_KIMI_K3_FP8_KV_LAYERS=91,92 in the reference deployment. The KV cache manager allocates them from the
 # engine's selection (``kimi_k3_cache_policy.get_kimi_k3_fp8_kv_layer_ids``), which must agree.
 FP8_KV_LAYERS = frozenset({91, 92})
 
@@ -4796,7 +4794,7 @@ __all__ = ["K3UllMambaMetadata", "Step", "native_process_group", "plan_step"]
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import DFlashDecodingConfig
 
-# The 1007804 values of the environment the served path reads (unset there): TRTLLM_ENABLE_PDL
+# Environment variables unset in the reference deployment: TRTLLM_ENABLE_PDL
 # (default on; routing.py declines the target otherwise) and TRTLLM_FORCE_MNNVL_AR (default off).
 _PDL = True
 _FORCE_MNNVL_AR = False
@@ -5319,22 +5317,22 @@ _PINS = {
 }
 
 _PINS_SM107 = {
-    # [q_a | kv_a] (replicated; scripts/draftfuse/bench_gemm.py, job 2706844): 6.46 / 6.48 / 7.17
+    # [q_a | kv_a] (replicated, Rubin): 6.46 / 6.48 / 7.17
     # -> 3.95 / 4.07 / 4.95.
     (2112, 7168): (
         (8, "splitk", (64, 8, 4, 12)),
         (16, "splitk", (64, 16, 4, 10)),
         (32, "splitk", (64, 32, 4, 8)),
     ),
-    # context latents of all layers (replicated; job 2706844): 6.79 / 7.45 / 7.15 -> 4.61 / 4.71 /
+    # context latents of all layers (replicated, Rubin): 6.79 / 7.45 / 7.15 -> 4.61 / 4.71 /
     # 5.38.
     (2880, 7168): (
         (8, "splitk", (64, 8, 2, 12)),
         (16, "splitk", (64, 16, 4, 10)),
         (32, "splitk", (64, 32, 4, 8)),
     ),
-    # The MLP and LM head shards of the TP16 group (scripts/ull_shell/bench_draft_gemm.py
-    # BG_TP=16, hecate job 834542, HBM locked): gate_up 6.02 / 6.11 / 5.72 -> 3.66 / 3.86 / 4.54;
+    # The MLP and LM head shards of the TP16 group (Rubin, fixed HBM clock):
+    # gate_up 6.02 / 6.11 / 5.72 -> 3.66 / 3.86 / 4.54;
     # down 4.22 / 3.31 / 3.37 -> 2.50 / 2.48 / 2.60; LM head 15.65 / 14.56 / 16.09 -> 14.12 /
     # 14.14 / 14.45.
     # gate_up: 2 x 896
@@ -5357,7 +5355,7 @@ _PINS_SM107 = {
     ),
     # q_b of a helix drafter (latent pages sharded over the group, every head on every rank):
     # 64 heads x 192. cuBLAS -> pinned at 8 / 16 / 32 rows: 4.75 / 4.79 / 6.65 -> 4.26 / 4.34 /
-    # 4.49 us (scripts l0ull2drafter/bench_draft_gemm.py BG_TP=1, hecate job 838031, HBM locked).
+    # 4.49 us (Rubin, TP1, fixed HBM clock).
     (12288, 1536): (
         (8, "splitk", (64, 8, 1, 12)),
         (16, "splitk", (64, 16, 1, 11)),

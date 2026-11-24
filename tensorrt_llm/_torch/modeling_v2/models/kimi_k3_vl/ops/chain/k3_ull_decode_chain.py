@@ -23,7 +23,7 @@ _NOTE = """
     and mailboxes `chain` holds; a reference would be the whole decoder layer in torch on the 16
     ranks' shards. Until one is written the entry has no cells: the chain is checked bitwise
     against the reference implementation it was flattened from on 16 GB300 ranks with the
-    checkpoint's weights (notes `1110_k3_ull_v2_chain`), and the model's step against eager in
+    checkpoint's weights, and the model's step against eager in
     `test_k3_ull_small_model_graph.py`.
 """
 

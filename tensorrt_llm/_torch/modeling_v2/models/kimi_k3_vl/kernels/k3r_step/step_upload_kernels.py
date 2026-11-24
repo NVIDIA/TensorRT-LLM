@@ -45,9 +45,9 @@ BLOCK_OFFSETS_TRITON_ENV = "TRTLLM_KV_BLOCK_OFFSETS_TRITON"
 SPEC_SAMPLER_FUSED_SCATTER_ENV = "TRTLLM_SPEC_SAMPLER_FUSED_SCATTER"
 STATE_INDEX_COPY_KERNEL_ENV = "TRTLLM_STATE_INDEX_COPY_KERNEL"
 
-_BLOCK_OFFSETS_TRITON = True  # TensorRT-LLM local change: 1007804's value (=2); the target reads no environment.
-_SPEC_SAMPLER_FUSED_SCATTER = True  # TensorRT-LLM local change: 1007804's value (=1); the target reads no environment.
-_STATE_INDEX_COPY_KERNEL = True  # TensorRT-LLM local change: 1007804's value (=1); the target reads no environment.
+_BLOCK_OFFSETS_TRITON = True  # TensorRT-LLM local change: the reference setting (=2); the target reads no environment.
+_SPEC_SAMPLER_FUSED_SCATTER = True  # TensorRT-LLM local change: the reference setting (=1); the target reads no environment.
+_STATE_INDEX_COPY_KERNEL = True  # TensorRT-LLM local change: the reference setting (=1); the target reads no environment.
 
 # Block-table entries per program of the block-offset copy.
 _BLOCK_OFFSETS_BLOCK = 1024

@@ -2,9 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """K3's packed FP4 MLA generation decode: step metadata, task plan, decode and split reduction.
 
-The host side of the served FP4 MLA generation decode (6904cd9672,
-``attention/backends/fp4_mla/{packed_plan,metadata,decode}.py``) for the one configuration the
-deployment runs: the CuTe DSL backend on SM107 with K3's packed decode kernel module
+This is the host side of the FP4 MLA generation decode for the reference deployment:
+the CuTe DSL backend on SM107 with K3's packed decode kernel module
 (``kernels/fp4_mla_mufu16``, served ``set_fp4_mla_cutedsl_kernel_module``), the packed per-request
 query layout, 8 task slots per request (``TRTLLM_FP4_MLA_SPLIT_KV=8``), the wave plan (no makespan
 plan) and the page plan. The task plan and the split reduction are ``kernels/fp4_mla_packed_reduce``
@@ -74,7 +73,7 @@ def _ceil_div(lhs: int, rhs: int) -> int:
     return (lhs + rhs - 1) // rhs
 
 
-# The served backend read these from the environment; 1007804's values:
+# The served backend read these from the environment; the reference settings:
 # Task slots per request of the packed decode (grid.z = requests * splits): TRTLLM_FP4_MLA_SPLIT_KV=8.
 _SPLITS = 8
 assert 1 < _SPLITS <= _FP4_MLA_PACKED_MAX_SPLITS

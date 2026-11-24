@@ -32,8 +32,8 @@ class K3Fp4MlaDecode(OpWrapper):
     `begin_step` forgets the plan of the previous step and `prelaunch_generation_metadata` may
     launch the plan and page table early on another stream (the result does not change).
     `features` fields select FP16 partials, the reduction's PDL launch, the page plan and the
-    decode's PDL wait after the fused query (all as 1007804: off, off, on, off); the wave plan and
-    8 task slots per request are fixed. Consumes the prequantized query on the state.
+    decode's PDL wait after the fused query (off, off, on, off in the reference deployment). The
+    wave plan and 8 task slots per request are fixed. Consumes the prequantized query on the state.
     """
 
     def __call__(
