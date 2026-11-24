@@ -37,9 +37,10 @@ the committed prefix and the output matches what non-speculative decoding would 
 
 With ``algorithm="gumbel_dual_key"`` and ``alpha > 0`` an ordinary decoding position is drawn under
 the second key with probability ``alpha`` (and under the first key otherwise). The choice is the
-Philox stream of a per-slot routing seed at the position's index in the request's output, also for a
-request that arrives with tokens already generated. It does not depend on the batch, the speculation
-depth or the TP rank, and a request with a seed reproduces it.
+Philox stream of the request's routing seed (see :func:`route_seed`) at the position's index in the
+request's output, also for a request that arrives with tokens already generated or moves to another
+slot. It does not depend on the batch, the speculation depth or the TP rank, and a request with a
+seed reproduces it.
 
 :meth:`WatermarkHandler.plan` and :meth:`WatermarkHandler.commit` use static shapes and no
 host synchronization, so they can be captured in a CUDA graph.
@@ -152,6 +153,21 @@ class WatermarkRows:
     skip: Optional[torch.Tensor] = None  # [B] int64, reference path only (``"all"`` scope)
 
 
+def _route_stream(request: LlmRequest, seed: Optional[int]) -> int:
+    """Identity of the request's routing stream, see :func:`route_seed`.
+
+    Without a seed it is the request id, which is unique to the request and the same on every rank,
+    and does not change when the request moves to another slot after a preemption. With a seed it
+    is the index of the request among the candidates (``n > 1``) of one user request, which the
+    candidates' consecutive ids give, so that candidates sharing a seed still route differently.
+    """
+    if seed is None:
+        return request.py_request_id
+    if getattr(request, "is_child", False):
+        return request.py_request_id - request.parent_request_id
+    return 0
+
+
 class WatermarkHandler:
     def __init__(
         self,
@@ -185,9 +201,6 @@ class WatermarkHandler:
         self._route_state = (
             torch.zeros((num_rows, 2), dtype=torch.int64, device=device) if self._route else None
         )
-        # Streams handed out to requests without a seed. Every rank sees the same requests in the
-        # same order, so the numbering agrees across ranks.
-        self._unseeded_streams = 0
         self._keys = torch.tensor(
             [_signed64(config.key), _signed64(self._secondary_key)],
             dtype=torch.int64,
@@ -301,10 +314,8 @@ class WatermarkHandler:
                 # The committed count starts at `num_contexts`, so this offset makes the routing
                 # index the token's index in the output, also for a resumed request.
                 new_routes.append(
-                    (route_seed(seed, self._unseeded_streams), generated - num_contexts)
+                    (route_seed(seed, _route_stream(request, seed)), generated - num_contexts)
                 )
-                if seed is None:
-                    self._unseeded_streams += 1
         if not new_slots:
             return
         pin = prefer_pinned()

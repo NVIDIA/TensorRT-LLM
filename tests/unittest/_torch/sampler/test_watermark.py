@@ -88,8 +88,12 @@ class TestGammaTail:
         assert _gamma_upper_tail(n, 0.0) == 1.0
 
 
-def _generate(config, probs, *, num_tokens, prompt, watermark=True, seed=0):
-    """Toy autoregressive loop with a fixed next-token distribution."""
+def _generate(config, probs, *, num_tokens, prompt, watermark=True, seed=0, alpha=0.0):
+    """Toy autoregressive loop with a fixed next-token distribution.
+
+    With ``alpha > 0`` and a dual-key config, each token is drawn under the second key with
+    probability ``alpha``, chosen like the sampler's routing stream (seed 5, by output index).
+    """
     rng = np.random.default_rng(seed)
     width = config.context_width
     tokens = list(prompt)
@@ -103,7 +107,13 @@ def _generate(config, probs, *, num_tokens, prompt, watermark=True, seed=0):
         repeated = config.deduplicate_contexts == "single_turn" and key in seen
         seen.add(key)
         if watermark and not repeated:
-            seed_t = context_seeds_torch(config.key, torch.tensor([context]))
+            second = (
+                alpha > 0
+                and philox_uniform(route_seed(5, 0) & (2**64 - 1), np.array([len(out)]))[0] < alpha
+            )
+            seed_t = context_seeds_torch(
+                secondary_key(config.key) if second else config.key, torch.tensor([context])
+            )
             token = int(gumbel_sample_reference(probs_row, seed_t)[0])
         else:
             token = int(rng.choice(len(probs), p=probs))
@@ -182,6 +192,9 @@ class TestDetector:
         # A single-key detector does not know the secondary key.
         single = GumbelWatermarkDetector(WatermarkConfig(key=11, deduplicate_contexts="none"))
         assert not single.detect(secondary, prompt_token_ids=prompt).is_watermarked
+        # Text whose tokens are routed between the keys is detected too.
+        routed = _generate(config, probs, num_tokens=200, prompt=prompt, alpha=0.3)
+        assert detector.detect(routed, prompt_token_ids=prompt).is_watermarked
 
 
 class TestConfig:
@@ -357,8 +370,10 @@ class TestKeyedRecovery:
             assert torch.equal(redrawn[row, last + 1 :], accepted[row, last + 1 :])
 
 
-def _request(request_id, slot, tokens, watermarking=None, greedy=False, seed=None):
+def _request(request_id, slot, tokens, watermarking=None, greedy=False, seed=None, parent=None):
     return SimpleNamespace(
+        is_child=parent is not None,
+        parent_request_id=parent,
         py_request_id=request_id,
         py_seq_slot=slot,
         py_watermarking=watermarking,
@@ -413,7 +428,7 @@ class TestHandler:
     @pytest.mark.parametrize(
         "dedupe, from_probs, routing",
         [(d, p, False) for d in ("none", "single_turn", "all") for p in (False, True)]
-        + [("none", False, True)],
+        + [("none", False, True), ("single_turn", True, True)],
     )
     def test_step_matches_plan_draw_commit(self, dedupe, from_probs, routing):
         config = WatermarkConfig(
@@ -518,6 +533,25 @@ class TestHandler:
             route = state.handler._route_state[:, 0].tolist()
             assert route[0] == route_seed(7, 0)  # a seed reproduces its stream
             assert route[1] != route[2]  # each request without a seed has its own
+
+    def test_routing_streams_follow_the_request(self):
+        config = WatermarkConfig(key=99, context_width=3, **_DUAL)
+        state = WatermarkSpecState(config, max_seq_len=64)
+        state.prepare(
+            num_slots=4, max_num_requests=4, max_draft_len=3, use_rejection_sampling=False
+        )
+        handler = state.handler
+        unseeded = _request(1, 0, [1, 2, 3])
+        parent = _request(10, 1, [1, 2, 3], seed=7)
+        siblings = [_request(11, 2, [1, 2, 3], seed=7, parent=10)]
+        handler.observe([unseeded, parent, *siblings], _can_sample)
+        before = handler._route_state[:, 0].tolist()
+        assert before[1] == route_seed(7, 0)  # a seed reproduces its stream
+        assert before[2] not in (before[1], before[0])  # candidates of one seed route differently
+        # A request resumed in another slot keeps its stream.
+        unseeded.py_seq_slot = 3
+        handler.observe([unseeded], _can_sample)
+        assert handler._route_state[3, 0].item() == before[0]
 
     def test_new_occupant_resets_the_slot(self):
         _, handler = self._handler()

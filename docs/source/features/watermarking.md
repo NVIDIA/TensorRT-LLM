@@ -25,7 +25,7 @@ out = llm.generate(["Write a short note about GPUs."], SamplingParams(temperatur
 | Field | Default | Meaning |
 |-------|---------|---------|
 | `algorithm` | `"gumbel"` | `"gumbel"` or `"gumbel_dual_key"`. Dual-key additionally supports speculative decoding with rejection sampling (see below). |
-| `alpha` | 0.1 | Only used by `"gumbel_dual_key"`; range `[0, 1]`. Probability that a token of ordinary decoding (and of exact-match speculative decoding) is drawn under the second key instead of the first, chosen from a random stream of the request, so requests with the same prompt diverge for `0 < alpha < 1` (most at `0.5`); a request `seed` reproduces the choice. `0` uses the first key only, which is the behavior before routing existed; `1` uses the second key only, so identical prompts repeat each other again. About `alpha` of the tokens carry only the second key, so detection power is somewhat lower than with `"gumbel"`. Rejection-sampling speculative decoding ignores it: the speculative protocol picks the key of each token. |
+| `alpha` | 0.1 | Only used by `"gumbel_dual_key"`; range `[0, 1]`. Probability that a token of ordinary decoding (and of exact-match speculative decoding) is drawn under the second key instead of the first, chosen from a random stream of the request, so requests with the same prompt diverge for `0 < alpha < 1` (most at `0.5`); a request `seed` reproduces the choice. `0` uses the first key only, which is the behavior before routing existed; `1` uses the second key only, so identical prompts repeat each other again. About `alpha` of the tokens carry only the second key, so detection power is lower than with `"gumbel"` and the same text needs to be longer for the same p-value (with `alpha=0.25`, 128-token answers of a large model were flagged at `p < 1e-3` for 12 of 16 prompts). The default `0.1` changes the output of existing `"gumbel_dual_key"` runs, also with a fixed key and seed; set `alpha=0` to keep the earlier output. Rejection-sampling speculative decoding ignores it: the speculative protocol picks the key of each token. |
 | `key` | required | Secret integer in `[0, 2**64)`. Detection needs the same value. Excluded from `repr`. |
 | `context_width` | 4 | Number of preceding tokens that seed each decision, 1 to 64. Larger values are less robust to edits; above 16 a warning is logged. |
 | `deduplicate_contexts` | `"single_turn"` | A repeated context would repeat its token and count as independent evidence, so it falls back to ordinary sampling. `"none"` disables this; `"single_turn"` searches the tokens the request generates; `"all"` also searches the prompt (for example earlier turns of a conversation) and leaves the first `context_width` generated tokens unwatermarked. |
@@ -112,9 +112,15 @@ specific combinations:
   sampling picks for repeated contexts, which is the only source of divergence between candidates.
   With `algorithm="gumbel_dual_key"` and `0 < alpha < 1` (the default), candidates and repeated requests
   diverge once one of them draws a token under the second key, after about `1 / alpha` tokens. A request
-  `seed` selects, and reproduces, that choice. Without a seed, a request takes the next stream of its
-  process, so identical prompts diverge within one process, while replicas or restarts number their
-  streams from the same start. Speculative decoding with rejection sampling ignores `alpha`, so this
+  `seed` selects, and reproduces, that choice, and the candidates of one seeded request (`n > 1`)
+  each get their own stream. Two requests that use the same seed share one stream, so they do not
+  diverge: give them different seeds, or none. Without a seed, a request's stream follows its
+  request id, which is unique within a serving process and the same on every rank, so identical
+  prompts diverge within one process, while replicas or restarts number their requests from the
+  same start. With `alpha=0`, repeated requests agree up to numerical differences between batches,
+  which can flip a near-tied token late in the text. A context that recurs is judged by its
+  first-key draw alone, so a recurrence under the other key also falls back to ordinary sampling.
+  Speculative decoding with rejection sampling ignores `alpha`, so this
   divergence does not apply there.
 - Low-entropy output (code, short answers) and heavily edited text carry little signal.
 - A fixed key applies the same random values wherever a context recurs across requests. For answers

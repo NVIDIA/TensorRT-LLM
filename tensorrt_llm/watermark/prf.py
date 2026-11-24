@@ -80,13 +80,14 @@ def route_seed(request_seed: "int | None", stream: int) -> int:
     """Seed of a request's key-routing stream, as an int64 bit pattern.
 
     Dual-key decoding draws each token under the first or the second key; this stream decides
-    which. A request with its own ``SamplingParams.seed`` gets a stream that depends on that seed
-    alone, so it reproduces. A request without one gets a stream of its own, numbered ``stream``
-    in the order requests reach the sampler, so identical prompts diverge.
+    which. ``stream`` identifies the request. A request with its own ``SamplingParams.seed`` gets
+    a stream that depends on that seed and on ``stream`` (the index of the candidate among those of
+    one request, 0 for a single request), so it reproduces. A request without a seed passes a
+    ``stream`` that is unique to it, so identical prompts diverge.
     """
     with np.errstate(over="ignore"):
         if request_seed is not None:
-            value = (request_seed & _MASK64) ^ _ROUTE_SEEDED_SALT
+            value = ((request_seed & _MASK64) ^ _ROUTE_SEEDED_SALT ^ (stream * _GOLDEN)) & _MASK64
         else:
             value = (((stream + 1) * _GOLDEN) & _MASK64) ^ _ROUTE_UNSEEDED_SALT
         return _signed64(int(_mix64(np.array([value], dtype=np.uint64))[0]))
