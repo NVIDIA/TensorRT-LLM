@@ -25,7 +25,9 @@ from tensorrt_llm._torch.pyexecutor.runtime_hooks import DEFAULT_RUNTIME_HOOKS, 
 
 pytestmark = pytest.mark.cpu_only
 
-_FAM_DIR = pathlib.Path(runtime.__file__).resolve().parents[2]
+_REPO = pathlib.Path(__file__).resolve().parents[7]
+_FAM_DIR = _REPO / "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl"
+_RUNTIME_SOURCE = _FAM_DIR / "ops/common/k3_ull_runtime.py"
 _MANIFEST = _FAM_DIR / "FLAT_RUNTIME_SOURCE.json"
 
 
@@ -184,14 +186,15 @@ def test_before_overlap_loop_sets_the_switch_interval(monkeypatch):
 
 
 def test_the_only_environment_read_is_the_gpu_index():
-    tree = ast.parse(pathlib.Path(runtime.__file__).read_text())
+    source = _RUNTIME_SOURCE.read_text()
+    tree = ast.parse(source)
     reads = [
         ast.unparse(node)
         for node in ast.walk(tree)
         if isinstance(node, ast.Attribute) and node.attr in ("environ", "getenv")
     ]
     assert reads == ["os.environ"]
-    assert '"CUDA_VISIBLE_DEVICES"' in pathlib.Path(runtime.__file__).read_text()
+    assert '"CUDA_VISIBLE_DEVICES"' in source
 
 
 def test_ull_step_kernels_match_the_source_manifest():
@@ -224,7 +227,7 @@ def _defined(tree):
 
 def test_manifest_names_exist():
     manifest = json.loads(_MANIFEST.read_text())
-    ours = _defined(ast.parse(pathlib.Path(runtime.__file__).read_text()))
+    ours = _defined(ast.parse(_RUNTIME_SOURCE.read_text()))
     assert manifest["functions"]
     for name in manifest["functions"]:
         assert name.startswith("k3_ull_runtime.") and name[len("k3_ull_runtime.") :] in ours, name

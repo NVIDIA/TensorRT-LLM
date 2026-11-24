@@ -3,9 +3,10 @@
 """The Kimi K3 SM107 ULL drafter's FP8 context cache on CPU: the drafter's declaration and FP8
 store conversion, both the same as the context servers' (the family drafter of the tp1 target),
 the draft layers' page geometry and transfer IDs in the target's manager, and the gate deployment,
-which shares the draft KV by those declarations alone."""
+which opts both roles into shared draft KV."""
 
 import pathlib
+import shlex
 from types import SimpleNamespace as NS
 
 import pytest
@@ -30,7 +31,7 @@ from tensorrt_llm.bindings import DataType
 
 pytestmark = pytest.mark.cpu_only
 
-_REPO = pathlib.Path(dflash.__file__).resolve().parents[6]
+_REPO = pathlib.Path(__file__).resolve().parents[7]
 _GATE = (
     _REPO / "tests/scripts/perf-sanity/disaggregated/"
     "vr200_kimi-k3-nvfp4-dspark_gsm8k_ctx12_dwdp12_gen1_helix16_moetp16ep1_bs4_dspark7.yaml"
@@ -113,14 +114,16 @@ def test_draft_layer_transfer_ids() -> None:
     assert ids == [186, 188, 190, 192, 194]
 
 
-def test_gate_shares_the_draft_kv_by_declaration() -> None:
+def test_gate_enables_shared_draft_kv_on_both_roles() -> None:
     config = yaml.safe_load(_GATE.read_text())
+    environment = config["environment"]
 
     for role in ("ctx", "gen"):
         spec = config["worker_config"][role]["speculative_config"]
         assert spec["decoding_type"] == "DSpark"
         assert not {"context_kv_dtype", "context_kv_only"} & set(spec)
         assert config["worker_config"][role]["kv_cache_config"]["use_kv_cache_manager_v2"] is True
-    for name in ("worker_env_var", "ctx_worker_env_var", "gen_worker_env_var"):
-        env = config["environment"].get(name) or ""
-        assert not any(v.startswith("TRTLLM_DISAGG_SHARED_DRAFT_KV=") for v in env.split())
+        shared_env = environment.get("worker_env_var") or ""
+        role_env = environment.get(f"{role}_worker_env_var") or ""
+        assignments = dict(v.split("=", 1) for v in shlex.split(f"{shared_env} {role_env}"))
+        assert assignments.get("TRTLLM_DISAGG_SHARED_DRAFT_KV") == "1", role

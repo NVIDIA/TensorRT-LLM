@@ -20,7 +20,10 @@ from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.common import (  # no
 
 pytestmark = pytest.mark.cpu_only
 
-_T_DIR = pathlib.Path(layer0.__file__).resolve().parent
+_REPO = pathlib.Path(__file__).resolve().parents[7]
+_T_DIR = (
+    _REPO / "tensorrt_llm/_torch/modeling_v2/models/kimi_k3_vl" / pathlib.Path(__file__).parent.name
+)
 _MANIFEST = _T_DIR.parent / "FLAT_BOUNDARY_SOURCE.json"
 
 #: The boundary's files: no environment reads, no imports of the shared Kimi K3 VL code.
