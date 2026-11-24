@@ -776,7 +776,7 @@ void invokeSageQuantQkvImpl(SageQuantParams const& params)
     };
 
     // Contiguous blocks are instantiated for the sizes in use. The kernel takes any power of two up to
-    // 256: add its case here and in withPartitionTraits.
+    // 256: add its case here and in getSageScaleHeadStride.
 #define TLLM_SAGE_DISPATCH_HEAD_DIM(HEAD_DIM)                                                                          \
     if (params.headDim == HEAD_DIM)                                                                                    \
     {                                                                                                                  \
@@ -828,44 +828,6 @@ void invokeSageQuant(SageQuantParams const& params)
             numel);
         TLLM_CUDA_CHECK(cudaPeekAtLastError());
     }
-}
-
-namespace
-{
-
-// Evaluate `fn` with the PartitionTraits the (partition, tokenBlockSize) pair selects, or return
-// `fallback` when there is no such instantiation.
-template <typename Fn>
-int withPartitionTraits(SageScalePartition partition, int tokenBlockSize, int fallback, Fn&& fn)
-{
-    switch (partition)
-    {
-    case SageScalePartition::HopperQ: return fn(PartitionTraits<HopperQPartition>{});
-    case SageScalePartition::HopperK: return fn(PartitionTraits<HopperKPartition>{});
-    case SageScalePartition::Contiguous:
-        switch (tokenBlockSize)
-        {
-        case 1: return fn(PartitionTraits<ContiguousPartition<1>>{});
-        case 4: return fn(PartitionTraits<ContiguousPartition<4>>{});
-        case 16: return fn(PartitionTraits<ContiguousPartition<16>>{});
-        case 32: return fn(PartitionTraits<ContiguousPartition<32>>{});
-        default: break;
-        }
-        break;
-    }
-    return fallback;
-}
-
-} // namespace
-
-int getSageScaleHeadStride(SageScalePartition partition, int tokenBlockSize, int sumSeqLens, int batchSize)
-{
-    if (tokenBlockSize <= 0 || sumSeqLens <= 0 || batchSize <= 0)
-    {
-        return 0;
-    }
-    return withPartitionTraits(partition, tokenBlockSize, 0,
-        [&](auto traits) { return decltype(traits)::scaleHeadStride(sumSeqLens, batchSize); });
 }
 
 } // namespace tensorrt_llm::common

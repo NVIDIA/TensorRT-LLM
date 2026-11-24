@@ -212,7 +212,6 @@ public:
     /// Whether a variable-window context kernel exists for this configuration.
     [[nodiscard]] bool supportsVariableWindow();
 
-    [[nodiscard]] size_t getFmhaMultiCtasKvScratchSize(FmhaParams const& p) const noexcept;
     [[nodiscard]] int getMaxNumSeqLenTile(FmhaParams const& p, int batch_beam_size = 1) const;
     /// Context-phase bytes from the prepared params: num_seqs, input_seq_length, num_tokens,
     /// total_kv_len and the cross-KV extent.

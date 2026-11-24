@@ -212,7 +212,8 @@ target_compile_definitions(
     TRTLLM_BUILT_CUDA_ARCHITECTURES=${TRTLLM_BUILT_CUDA_ARCHITECTURES}
     TRTLLM_SUPPORTED_CUDA_ARCHITECTURES=${TRTLLM_SUPPORTED_CUDA_ARCHITECTURES})
 
-add_library(tllm_common_attention_workspace STATIC attentionWorkspace.cpp)
+add_library(tllm_common_attention_workspace STATIC attentionWorkspace.cpp
+                                                   sageScaleGeometry.cpp)
 add_library(tllm::common_attention_workspace ALIAS
             tllm_common_attention_workspace)
 target_link_libraries(tllm_common_attention_workspace

@@ -72,8 +72,8 @@ struct AttentionContextWorkspaceSizes
     size_t fmhaMultiCtasKvScratch{};
 };
 
-//! Geometry and element size for padded unfused context attention buffers.
-struct AttentionUnfusedContextWorkspaceParams
+//! Scalar geometry and resolved backend choices for MHA context workspace sizing.
+struct AttentionContextWorkspaceParams
 {
     size_t elementSize{};
     size_t batchSize{};
@@ -84,6 +84,19 @@ struct AttentionUnfusedContextWorkspaceParams
     int numQueryHeads{};
     int numAttnKvHeads{};
     int headSize{};
+    size_t totalKvTokenCount{}; //!< Packed K/V tokens, including cached context, for Sage staging and scales.
+    int rotaryEmbeddingDim{};
+    bool enableContextFmha{};
+    bool fp8ContextFmha{};
+    bool separateQAndKvInput{};
+    bool sageAttention{};
+    bool hopperSage{};
+    bool sageSmoothK{};
+    int sageQBlockSize{}; //!< Zero disables Q scales; positive values select the quantizer's scale geometry.
+    int sageKBlockSize{};
+    int sageVBlockSize{};
+    bool sparseFmha{};
+    int multiProcessorCount{}; //!< Device SM count used by sparse FMHA scratch sizing.
 };
 
 struct AttentionContextWorkspaceLayout
@@ -237,11 +250,11 @@ struct AttentionXqaWorkspaceLayout
 class AttentionWorkspaceManager
 {
 public:
-    //! Size padded Q/K/V and score buffers, sequence metadata, and packed-token metadata.
-    //! Q/K/V and score buffers use padded counts because padding removal can make the packed token count smaller
-    //! than batch size times the maximum context query length.
-    [[nodiscard]] static AttentionContextWorkspaceSizes buildUnfusedContextSizes(
-        AttentionUnfusedContextWorkspaceParams const& params) noexcept;
+    //! Size all MHA context buffers from geometry and resolved backend choices.
+    //! Unfused Q/K/V and score buffers use padded counts because padding removal can make the packed token count
+    //! smaller than batch size times the maximum context query length.
+    [[nodiscard]] static AttentionContextWorkspaceSizes buildContextSizes(
+        AttentionContextWorkspaceParams const& params) noexcept;
 
     static AttentionContextWorkspaceLayout buildContextLayout(
         AttentionContextWorkspaceSizes const& sizes, uintptr_t alignment = common::kCudaMemAlign)
