@@ -274,20 +274,24 @@ def populate_fp4_mla_generation_lengths(
     )
 
 
+# kv_lens is a view starting at the first generation row, so its alignment
+# follows the number of context requests.
 @triton.jit(
     do_not_specialize=["num_tokens", "tokens_per_seq"],
-    do_not_specialize_on_alignment=["num_tokens", "tokens_per_seq"],
+    do_not_specialize_on_alignment=["num_tokens", "tokens_per_seq", "kv_lens_ptr"],
 )
 def _helix_spec_buffers_kernel(
     positions_ptr,
     local_slots_ptr,
     kv_bounds_ptr,
     kv_lens_ptr,
+    global_kv_lens_ptr,
     num_tokens,
     tokens_per_seq,
     tokens_per_block,
     cp_size,
     cp_rank,
+    WRITE_GLOBAL_KV_LENS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -313,6 +317,8 @@ def _helix_spec_buffers_kernel(
     # The last token of each verify group sets its sequence's rank-local KV length.
     last_of_seq = offsets % tokens_per_seq == tokens_per_seq - 1
     tl.store(kv_lens_ptr + offsets // tokens_per_seq, bound, mask=mask & last_of_seq)
+    if WRITE_GLOBAL_KV_LENS:
+        tl.store(global_kv_lens_ptr + offsets // tokens_per_seq, after, mask=mask & last_of_seq)
 
 
 def populate_helix_spec_buffers(
@@ -326,6 +332,7 @@ def populate_helix_spec_buffers(
     tokens_per_block: int,
     cp_size: int,
     cp_rank: int,
+    global_kv_lens: Optional[torch.Tensor] = None,
 ) -> None:
     """Derive the Helix speculative per-token buffers in one launch.
 
@@ -333,7 +340,9 @@ def populate_helix_spec_buffers(
     ``local_slots[t]`` is its rank-local KV write slot (-1 when another CP rank
     owns the page), ``kv_bounds[t]`` the rank-local KV entries it attends to
     (the local length of ``position + 1``) and ``kv_lens[s]`` the bound of
-    sequence ``s``'s last token. Static shapes, safe under CUDA graph capture.
+    sequence ``s``'s last token. When supplied, ``global_kv_lens[s]`` stores
+    that token's global position plus one. Static shapes, safe under CUDA
+    graph capture.
     """
     if num_tokens <= 0:
         return
@@ -346,6 +355,8 @@ def populate_helix_spec_buffers(
         raise ValueError("Helix spec buffers need a positive page size and a valid CP rank.")
     num_seqs = num_tokens // tokens_per_seq
     tensors = (positions, local_slots, kv_bounds, kv_lens)
+    if global_kv_lens is not None:
+        tensors += (global_kv_lens,)
     if any(tensor.ndim != 1 or tensor.stride(0) != 1 for tensor in tensors):
         raise ValueError("Helix spec buffers must be contiguous and one-dimensional.")
     if any(tensor.dtype != torch.int32 for tensor in tensors):
@@ -354,6 +365,8 @@ def populate_helix_spec_buffers(
         raise ValueError("Helix spec buffers must be CUDA tensors on one device.")
     if any(tensor.numel() < num_tokens for tensor in tensors[:3]) or kv_lens.numel() < num_seqs:
         raise ValueError("Helix spec buffers are too small for the generation tokens.")
+    if global_kv_lens is not None and global_kv_lens.numel() < num_seqs:
+        raise ValueError("Helix global KV lengths are too small for the generation requests.")
 
     block = 256
     _helix_spec_buffers_kernel[(triton.cdiv(num_tokens, block),)](
@@ -361,21 +374,24 @@ def populate_helix_spec_buffers(
         local_slots,
         kv_bounds,
         kv_lens,
+        global_kv_lens,
         num_tokens,
         tokens_per_seq,
         tokens_per_block,
         cp_size,
         cp_rank,
+        WRITE_GLOBAL_KV_LENS=global_kv_lens is not None,
         BLOCK=block,
         num_warps=4,
     )
 
 
 def _fp4_mla_page_table_spec(kv_cache_manager: Any) -> Any:
-    get_spec = getattr(kv_cache_manager, "get_fp4_mla_page_table_spec", None)
-    if not callable(get_spec):
+    from .config import has_fp4_mla_cache_layout
+
+    if not has_fp4_mla_cache_layout(kv_cache_manager):
         raise RuntimeError("FP4 MLA requires V2 cache-layout page metadata.")
-    spec = get_spec()
+    spec = kv_cache_manager.fp4_mla_layout.get_fp4_mla_page_table_spec()
     for field_name in (
         "cache_pool_id",
         "cache_page_index_scale",
@@ -491,6 +507,7 @@ def configure_fp4_mla_device_page_table(
     metadata.fp4_mla_state.device_page_table = False
     metadata.fp4_mla_state.device_page_table_valid = False
     metadata.fp4_mla_state.page_table_stride = 0
+    metadata.fp4_mla_state.generation_max_pages = 0
     metadata.fp4_mla_state.context_repack_max_touched_pages = 1
 
     kv_cache_manager = getattr(metadata, "kv_cache_manager", None)
@@ -501,9 +518,9 @@ def configure_fp4_mla_device_page_table(
     num_context_tokens = int(getattr(metadata, "num_ctx_tokens", 0))
     num_generation_tokens = num_tokens - num_context_tokens
     block_offsets = getattr(metadata, "kv_cache_block_offsets", None)
-    page_ids = getattr(metadata.fp4_mla_state, "_paged_kv_indices", None)
-    paged_kv_indptr = getattr(metadata.fp4_mla_state, "_paged_kv_indptr", None)
-    paged_kv_indptr_decode = getattr(metadata.fp4_mla_state, "paged_kv_indptr_decode", None)
+    page_ids = metadata.fp4_mla_state._paged_kv_indices
+    paged_kv_indptr = metadata.fp4_mla_state._paged_kv_indptr
+    paged_kv_indptr_decode = metadata.fp4_mla_state.paged_kv_indptr_decode
     max_page_capacity = int(getattr(kv_cache_manager, "max_blocks_per_seq", 0) or 0)
     page_spec = _fp4_mla_page_table_spec(kv_cache_manager)
     page_index_scale = int(page_spec.cache_page_index_scale)
@@ -535,7 +552,7 @@ def configure_fp4_mla_device_page_table(
     if not supported:
         return False
 
-    hp_page_ids = getattr(metadata.fp4_mla_state, "hp_page_indices", None)
+    hp_page_ids = metadata.fp4_mla_state.hp_page_indices
     max_pool_id = max(page_spec.cache_pool_id, page_spec.hp_pool_id)
     if (
         not isinstance(hp_page_ids, torch.Tensor)
@@ -550,6 +567,7 @@ def configure_fp4_mla_device_page_table(
     metadata.fp4_mla_state.hp_page_index_scale = int(page_spec.hp_page_index_scale)
 
     max_pages = max_page_capacity
+    generation_max_pages = max_page_capacity if num_generation_sequences > 0 else 0
     host_kv_lens_available = (
         isinstance(kv_lens, torch.Tensor)
         and kv_lens.device.type == "cpu"
@@ -568,11 +586,20 @@ def configure_fp4_mla_device_page_table(
         max_kv_len = int(kv_lens[:num_sequences].max().item()) + max(
             0,
             generation_tokens_per_sequence - 1,
+            int(metadata.kv_cache_params.num_extra_kv_tokens or 0),
         )
         max_pages = min(
             max_page_capacity,
             max(1, _ceil_div(max_kv_len, FP4_MLA_TOKENS_PER_BLOCK)),
         )
+        if num_generation_sequences > 0:
+            max_generation_kv_len = int(kv_lens[num_contexts:num_sequences].max().item()) + max(
+                0, generation_tokens_per_sequence - 1
+            )
+            generation_max_pages = min(
+                max_page_capacity,
+                max(1, _ceil_div(max_generation_kv_len, FP4_MLA_TOKENS_PER_BLOCK)),
+            )
         if num_contexts > 0:
             max_context_len = int(kv_lens[:num_contexts].max().item())
             max_context_pages = _ceil_div(
@@ -610,7 +637,7 @@ def configure_fp4_mla_device_page_table(
     metadata.fp4_mla_state.device_page_table = True
     metadata.fp4_mla_state.num_sequences = num_sequences
     metadata.fp4_mla_state.page_table_stride = max_pages
-    metadata.fp4_mla_state.num_blocks = None
+    metadata.fp4_mla_state.generation_max_pages = generation_max_pages
     metadata.fp4_mla_state.num_context_blocks = num_contexts * max_pages
     metadata.fp4_mla_state.num_generation_blocks = num_generation_sequences * max_pages
     return True
@@ -622,9 +649,9 @@ def materialize_fp4_mla_device_page_table(
     generation_kv_lens: Optional[torch.Tensor] = None,
 ) -> None:
     """Refresh the fixed-stride context and generation page table once per forward."""
-    if not bool(getattr(metadata.fp4_mla_state, "device_page_table", False)):
+    if not bool(metadata.fp4_mla_state.device_page_table):
         raise RuntimeError("FP4 MLA requires fixed-stride device page metadata.")
-    if bool(getattr(metadata.fp4_mla_state, "device_page_table_valid", False)):
+    if bool(metadata.fp4_mla_state.device_page_table_valid):
         return
 
     num_contexts = int(metadata.num_contexts)
@@ -662,7 +689,7 @@ def materialize_fp4_mla_device_page_table(
             f"{num_generation_sequences} entries."
         )
 
-    cache_pool_id = int(getattr(metadata.fp4_mla_state, "cache_pool_id", 0))
+    cache_pool_id = int(metadata.fp4_mla_state.cache_pool_id)
     block_offsets = metadata.kv_cache_block_offsets[
         cache_pool_id,
         :num_sequences,
@@ -693,7 +720,7 @@ def materialize_fp4_mla_device_page_table(
         PAGE_TILE_SIZE=_FP4_MLA_PAGE_TABLE_TILE_SIZE,
         num_warps=4,
     )
-    hp_page_ids = getattr(metadata.fp4_mla_state, "hp_page_indices", None)
+    hp_page_ids = metadata.fp4_mla_state.hp_page_indices
     if not isinstance(hp_page_ids, torch.Tensor):
         raise RuntimeError("FP4 MLA requires an HP page-table output tensor.")
     hp_pool_id = int(metadata.fp4_mla_state.hp_pool_id)
@@ -729,17 +756,6 @@ def _host_int_list_during_forward(value: Any, start: int, end: int) -> Optional[
     return _host_int_list(value, start, end)
 
 
-def _fp4_mla_generation_num_blocks_device(metadata: Any) -> torch.Tensor:
-    """Device-side scalar view holding the generation page-table capacity.
-
-    ``paged_kv_indptr_decode[num_gen]`` is the fixed-stride generation-table
-    endpoint. Device kernels combine it with the live KV lengths, so inactive
-    slots are never consumed.
-    """
-    num_gen = metadata.num_seqs - metadata.num_contexts
-    return metadata.fp4_mla_state.paged_kv_indptr_decode[num_gen : num_gen + 1]
-
-
 def _fp4_mla_uniform_generation_lengths(
     metadata: Any,
     num_gen_tokens: int,
@@ -761,8 +777,8 @@ def _fp4_mla_uniform_generation_lengths(
     num_seqs = metadata.num_seqs
     kv_lens_gen = metadata.kv_lens_cuda_runtime[num_contexts:num_seqs]
     prompt_lens_gen = metadata.prompt_lens_cuda_runtime[num_contexts:num_seqs]
-    corrected_kv_lens = getattr(metadata.fp4_mla_state, "generation_kv_lens", None)
-    generation_lens = getattr(metadata.fp4_mla_state, "generation_append_lens", None)
+    corrected_kv_lens = metadata.fp4_mla_state.generation_kv_lens
+    generation_lens = metadata.fp4_mla_state.generation_append_lens
     tensors = (
         kv_lens_gen,
         prompt_lens_gen,
@@ -780,7 +796,7 @@ def _fp4_mla_uniform_generation_lengths(
     record_for_capture = bool(
         getattr(metadata, "is_cuda_graph", False)
         and torch.cuda.is_current_stream_capturing()
-        and not getattr(metadata.fp4_mla_state, "generation_lengths_capture_recorded", False)
+        and not metadata.fp4_mla_state.generation_lengths_capture_recorded
     )
     precomputed = (
         not record_for_capture
@@ -818,6 +834,7 @@ def _fp4_mla_uniform_generation_lengths(
         metadata.fp4_mla_state.generation_lengths_num_tokens = num_gen_tokens
         metadata.fp4_mla_state.generation_lengths_num_seqs = num_gen
         metadata.fp4_mla_state.generation_lengths_num_contexts = num_contexts
+        metadata.fp4_mla_state.generation_lengths_serial += 1
         if record_for_capture:
             metadata.fp4_mla_state.generation_lengths_capture_recorded = True
     elif plan_pending:
@@ -830,9 +847,9 @@ def _materialize_fp4_mla_device_page_table_for_forward(
     generation_kv_lens: Optional[torch.Tensor] = None,
 ) -> None:
     """Materialize all fixed-stride rows from final per-forward device lengths."""
-    if not bool(getattr(metadata.fp4_mla_state, "device_page_table", False)):
+    if not bool(metadata.fp4_mla_state.device_page_table):
         raise RuntimeError("FP4 MLA cache update requires fixed-stride device page metadata.")
-    if bool(getattr(metadata.fp4_mla_state, "device_page_table_valid", False)):
+    if bool(metadata.fp4_mla_state.device_page_table_valid):
         return
 
     num_contexts = int(metadata.num_contexts)
@@ -855,15 +872,22 @@ def _materialize_fp4_mla_device_page_table_for_forward(
     )
 
 
-def _max_generation_pages(metadata: Any) -> int:
-    num_gen = metadata.num_seqs - metadata.num_contexts
-    if num_gen <= 0:
-        return 0
-    if not getattr(metadata.fp4_mla_state, "device_page_table", False):
+def _device_page_table_stride(metadata: Any) -> int:
+    if not metadata.fp4_mla_state.device_page_table:
         raise RuntimeError("FP4 MLA generation requires fixed-stride device page metadata.")
     max_pages = int(metadata.fp4_mla_state.page_table_stride)
     if max_pages <= 0:
         raise RuntimeError("FP4 MLA device page-table stride must be positive.")
+    return max_pages
+
+
+def _max_generation_pages(metadata: Any) -> int:
+    if metadata.num_seqs <= metadata.num_contexts:
+        return 0
+    _device_page_table_stride(metadata)
+    max_pages = int(metadata.fp4_mla_state.generation_max_pages)
+    if max_pages <= 0:
+        raise RuntimeError("FP4 MLA generation page capacity must be positive.")
     return max_pages
 
 
@@ -875,8 +899,8 @@ def _fp4_mla_generation_page_ids(metadata: Any, num_gen_seqs: int) -> torch.Tens
             "FP4 MLA generation sequence count does not match metadata: "
             f"{num_gen_seqs} != {expected_num_gen}."
         )
-    max_pages = _max_generation_pages(metadata)
-    page_ids = getattr(metadata.fp4_mla_state, "_paged_kv_indices", None)
+    max_pages = _device_page_table_stride(metadata) if num_gen_seqs > 0 else 0
+    page_ids = metadata.fp4_mla_state._paged_kv_indices
     start = metadata.num_contexts * max_pages
     end = start + num_gen_seqs * max_pages
     if (
@@ -898,8 +922,8 @@ def _fp4_mla_generation_hp_page_ids(metadata: Any, num_gen_seqs: int) -> torch.T
             "FP4 MLA generation sequence count does not match metadata: "
             f"{num_gen_seqs} != {expected_num_gen}."
         )
-    max_pages = _max_generation_pages(metadata)
-    page_ids = getattr(metadata.fp4_mla_state, "hp_page_indices", None)
+    max_pages = _device_page_table_stride(metadata) if num_gen_seqs > 0 else 0
+    page_ids = metadata.fp4_mla_state.hp_page_indices
     start = metadata.num_contexts * max_pages
     end = start + num_gen_seqs * max_pages
     if (
@@ -924,57 +948,6 @@ def _host_int_list(value: Any, start: int, end: int) -> Optional[list[int]]:
         return [int(item) for item in value[start:end]]
     except (TypeError, ValueError):
         return None
-
-
-def _infer_assume_full_pages(metadata: Any, max_pages: int, page_size: int) -> bool:
-    if getattr(metadata, "is_cuda_graph", False):
-        return False
-
-    start = metadata.num_contexts
-    end = metadata.num_seqs
-    block_counts = _host_int_list(getattr(metadata.fp4_mla_state, "num_blocks", None), start, end)
-    if block_counts is not None and (
-        not block_counts or min(block_counts) != max_pages or max(block_counts) != max_pages
-    ):
-        return False
-
-    kv_lens_cuda = getattr(metadata, "kv_lens_cuda_runtime", None)
-    if isinstance(kv_lens_cuda, torch.Tensor):
-        cache_key = (
-            start,
-            end,
-            max_pages,
-            page_size,
-            tuple(block_counts) if block_counts is not None else None,
-            kv_lens_cuda.data_ptr(),
-        )
-        cache = getattr(metadata.fp4_mla_state, "full_pages_cache", None)
-        if cache is not None and cache[0] == cache_key:
-            return bool(cache[1])
-        kv_lens = [int(item) for item in kv_lens_cuda[start:end].detach().cpu().tolist()]
-        result = bool(kv_lens) and min(kv_lens) == max(kv_lens) == max_pages * page_size
-        setattr(metadata.fp4_mla_state, "full_pages_cache", (cache_key, result))
-        return result
-
-    kv_cache_params = getattr(metadata, "kv_cache_params", None)
-    cached_token_lens = _host_int_list(
-        getattr(kv_cache_params, "num_cached_tokens_per_seq", None),
-        start,
-        end,
-    )
-    seq_lens_kv = _host_int_list(getattr(metadata, "seq_lens_kv", None), start, end)
-    if cached_token_lens is not None and seq_lens_kv is not None:
-        if len(cached_token_lens) != len(seq_lens_kv):
-            return False
-        kv_lens = [
-            cached_len + seq_len for cached_len, seq_len in zip(cached_token_lens, seq_lens_kv)
-        ]
-    elif kv_cache_params is None:
-        kv_lens = _host_int_list(getattr(metadata, "prompt_lens_cpu_runtime", None), start, end)
-    else:
-        return False
-
-    return bool(kv_lens) and min(kv_lens) == max(kv_lens) == max_pages * page_size
 
 
 def _get_linear_mtp_query_len_per_seq(

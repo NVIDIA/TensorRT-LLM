@@ -67,6 +67,28 @@ class RenderResources:
         """Rendering-configuration fingerprint (see :mod:`.fingerprint`)."""
         return compute_fingerprint(self)
 
+    def prompt_tokens_excluded_from_usage(
+        self,
+        *,
+        add_generation_prompt: bool,
+        pre_tokenized: bool,
+        request_chat_template: Optional[str],
+    ) -> int:
+        """Trailing rendered prompt tokens that a route leaves out of prompt usage.
+
+        The serving extension decides from the facts of how the prompt is rendered
+        (see ``ServingExtension.prompt_tokens_excluded_from_usage``). A server-level
+        chat template may end the prompt differently, so the whole prompt is reported
+        when one is configured.
+        """
+        if self.default_chat_template is not None:
+            return 0
+        return self.extension.prompt_tokens_excluded_from_usage(
+            add_generation_prompt=add_generation_prompt,
+            pre_tokenized=pre_tokenized,
+            request_chat_template=request_chat_template,
+        )
+
     @classmethod
     def from_server(cls, server: Any) -> "RenderResources":
         """Resources of a running ``OpenAIServer``, read at call time.
@@ -180,9 +202,14 @@ class RenderResources:
         from tensorrt_llm.serve.chat_utils import load_chat_template, resolve_top_level_model_type
         from tensorrt_llm.tokenizer import load_custom_tokenizer
 
+        mistral_native = checkpoint_format in ("mistral", "mistral_large_3")
         tokenizer_path = tokenizer or model
         use_fast = tokenizer_mode != "slow"
-        if custom_tokenizer:
+        if mistral_native:
+            # The input processor loads the checkpoint's mistral-common tokenizer file, which
+            # may be a versioned SentencePiece model no Hugging Face loader reads.
+            loaded = None
+        elif custom_tokenizer:
             loaded = load_custom_tokenizer(
                 custom_tokenizer, tokenizer_path, trust_remote_code=trust_remote_code
             )
@@ -190,7 +217,7 @@ class RenderResources:
             loaded = ModelLoader.load_hf_tokenizer(
                 tokenizer_path, trust_remote_code=trust_remote_code, use_fast=use_fast
             )
-        if loaded is None:
+        if loaded is None and not mistral_native:
             raise ValueError(f"Could not load a tokenizer from {tokenizer_path!r}.")
 
         input_processor = create_input_processor(
@@ -204,7 +231,7 @@ class RenderResources:
         loaded = getattr(input_processor, "tokenizer", loaded)
 
         processor = None
-        if checkpoint_format not in ("mistral", "mistral_large_3"):
+        if not mistral_native:
             try:
                 processor = AutoProcessor.from_pretrained(
                     model, trust_remote_code=trust_remote_code

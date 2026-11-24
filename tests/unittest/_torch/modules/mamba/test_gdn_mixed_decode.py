@@ -4,12 +4,14 @@
 
 from collections.abc import Iterator
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
 
 from tensorrt_llm._torch.modules.mamba import gdn_mixer
 from tensorrt_llm._torch.modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
+from tensorrt_llm._utils import is_sm_100f
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
 
@@ -33,27 +35,39 @@ def _make_layer() -> Qwen3NextGatedDeltaNet:
     return layer
 
 
-@pytest.fixture(params=["flashinfer", "triton"])
+@pytest.fixture(params=["flashinfer", "triton", "flashinfer_workspace"])
 def prefill_backend(
     request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
-) -> Iterator[None]:
-    monkeypatch.setenv("FORCE_DETERMINISTIC", "1")
+) -> Iterator[str]:
+    use_flashinfer = request.param != "triton"
+    # Deterministic mode splits decode from prefill; a state workspace does so in any mode.
     monkeypatch.setenv(
-        "TLLM_USE_FLASHINFER_GDN_PREFILL", "1" if request.param == "flashinfer" else "0"
+        "FORCE_DETERMINISTIC", "0" if request.param == "flashinfer_workspace" else "1"
     )
-    if request.param == "flashinfer" and not gdn_mixer._use_flashinfer_gdn_prefill():
+    monkeypatch.setenv("TLLM_USE_FLASHINFER_GDN_PREFILL", "1" if use_flashinfer else "0")
+    if use_flashinfer and not gdn_mixer._use_flashinfer_gdn_prefill():
         pytest.skip("FlashInfer GDN prefill is unavailable on this GPU")
     gdn_mixer._resolve_chunk_gated_delta_rule.cache_clear()
-    yield
+    yield request.param
     gdn_mixer._resolve_chunk_gated_delta_rule.cache_clear()
+
+
+@pytest.fixture(params=["fused_conv", "unfused_conv"])
+def prefill_conv(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        Qwen3NextGatedDeltaNet, "_fused_conv_post_conv", request.param == "fused_conv"
+    )
 
 
 @pytest.mark.parametrize("prefill_lengths", [(1,), (127,), (128,), (129,), (7, 129)])
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("preallocated", [False, True])
-@pytest.mark.usefixtures("prefill_backend")
+@pytest.mark.usefixtures("prefill_conv")
 def test_mixed_decode_matches_decode_only(
-    prefill_lengths: tuple[int, ...], state_dtype: torch.dtype, preallocated: bool
+    prefill_backend: str,
+    prefill_lengths: tuple[int, ...],
+    state_dtype: torch.dtype,
+    preallocated: bool,
 ) -> None:
     torch.manual_seed(42)
     layer = _make_layer()
@@ -92,6 +106,14 @@ def test_mixed_decode_matches_decode_only(
         "num_prefill": num_prefills,
         "num_decodes": num_decodes,
     }
+    if prefill_backend == "flashinfer_workspace":
+        # One-sequence scratch, as on SM90/SM120: two prefills run in groups and
+        # decode never stages its state there.
+        workspace_dtype = state_dtype if is_sm_100f() else torch.float32
+        common["state_workspace"] = tuple(
+            torch.empty(1, 8, 128, 128, device="cuda", dtype=workspace_dtype) for _ in range(2)
+        )
+        common["cu_seqlens_cpu"] = torch.tensor([0, *prefill_lengths]).cumsum(0)
 
     expected_conv, expected_state = conv.clone(), state.clone()
     expected_qkv = projected.clone()[:, :2048]
@@ -128,7 +150,34 @@ def test_mixed_decode_matches_decode_only(
         else None
     )
     actual_conv, actual_state = conv.clone(), state.clone()
-    actual = layer.forward_extend(actual_conv, actual_state, output=output, **common)
+    # The prefill scan has two entry points (the adapter, and the single-launch direct
+    # path taken with a preallocated output on SM100, which returns False elsewhere and
+    # then falls back to the adapter); both run for real, only observed.
+    direct_launches = []
+    real_direct = gdn_mixer.chunk_gated_delta_rule_indexed_direct
+
+    def observe_direct(*args, **kwargs):
+        launched = real_direct(*args, **kwargs)
+        if launched:
+            direct_launches.append(args)
+        return launched
+
+    with (
+        patch.object(
+            gdn_mixer, "chunk_gated_delta_rule", wraps=gdn_mixer.chunk_gated_delta_rule
+        ) as scan_call,
+        patch.object(gdn_mixer, "chunk_gated_delta_rule_indexed_direct", observe_direct),
+    ):
+        actual = layer.forward_extend(actual_conv, actual_state, output=output, **common)
+    # Only the prefill requests go through the prefill kernel, in a single scan.
+    assert scan_call.call_count + len(direct_launches) == 1
+    scan_cu_seqlens = (
+        scan_call.call_args.kwargs["cu_seqlens"]
+        if scan_call.call_count
+        # (q, k, v, g, beta), output, cu_seqlens, ssm_states, state_indices
+        else direct_launches[0][6]
+    )
+    assert scan_cu_seqlens.shape[0] == num_prefills + 1
 
     torch.testing.assert_close(actual[:, prefill_length:], expected_decode, rtol=0, atol=0)
     torch.testing.assert_close(
@@ -158,3 +207,320 @@ def test_mixed_decode_matches_decode_only(
             )
             torch.testing.assert_close(actual_state, expected_state, rtol=0, atol=0)
             torch.testing.assert_close(actual_conv, expected_conv, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("deterministic", [True, False])
+@pytest.mark.parametrize("use_flashinfer", [False, True])
+@pytest.mark.parametrize("prefill_lengths", [(127,), (7, 129)])
+def test_fused_prefill_conv_under_force_deterministic(
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+    deterministic: bool,
+    use_flashinfer: bool,
+    prefill_lengths: tuple[int, ...],
+) -> None:
+    """FORCE_DETERMINISTIC=1 skips the fused prefill conv, so a prompt prefilled alone gets the GDN state it
+    gets next to decodes; without it a context-only batch keeps the fused path."""
+    monkeypatch.setenv("FORCE_DETERMINISTIC", "1" if deterministic else "0")
+    monkeypatch.setenv("TLLM_USE_FLASHINFER_GDN_PREFILL", "1" if use_flashinfer else "0")
+    if use_flashinfer and not gdn_mixer._use_flashinfer_gdn_prefill():
+        pytest.skip("FlashInfer GDN prefill is unavailable on this GPU")
+    gdn_mixer._resolve_chunk_gated_delta_rule.cache_clear()
+    request.addfinalizer(gdn_mixer._resolve_chunk_gated_delta_rule.cache_clear)
+    torch.manual_seed(42)
+    layer = _make_layer()
+    layer.conv_kernel_size, layer.conv_dim_per_tp = 4, 2048
+    assert gdn_mixer.gdn_prefill_conv_supported(128, 128, 4, "silu", 2048, 4)
+    layer.fused_prefill_conv = True
+    num_decodes, num_slots = 3, 7
+    num_prefills, prefill_length = len(prefill_lengths), sum(prefill_lengths)
+    num_tokens = prefill_length + num_decodes
+    projected = torch.randn(num_tokens, 3072, device="cuda", dtype=torch.bfloat16) * 0.1
+    gates = torch.randn(num_tokens, 16, device="cuda", dtype=torch.bfloat16) * 0.1
+    conv = torch.randn(num_slots, 2048, 3, device="cuda", dtype=torch.bfloat16) * 0.1
+    state = torch.randn(num_slots, 8, 128, 128, device="cuda", dtype=torch.float32) * 0.1
+    indices = torch.tensor([5, 4][:num_prefills] + [3, 0, 6], device="cuda", dtype=torch.int32)
+    lengths = [0, *prefill_lengths, *([1] * num_decodes)]
+    positions = torch.tensor(lengths, device="cuda", dtype=torch.int32).cumsum(0, dtype=torch.int32)
+
+    def run(batch_decodes: int):
+        tokens = prefill_length + batch_decodes
+        batch = num_prefills + batch_decodes
+        conv_states, ssm_states = conv.clone(), state.clone()
+        # The decode convolution writes into its input, so each run gets fresh inputs.
+        mixed_qkv = projected.clone()[:tokens, :2048]
+        b, a = gates[:tokens, :8].clone(), gates[:tokens, 8:].clone()
+        with patch.object(
+            gdn_mixer, "gdn_prefill_conv_post", wraps=gdn_mixer.gdn_prefill_conv_post
+        ) as fused_call:
+            out = layer.forward_extend(
+                conv_states,
+                ssm_states,
+                mixed_qkv=mixed_qkv,
+                a=a,
+                b=b,
+                batch_size=batch,
+                has_initial_states=torch.ones(batch, device="cuda", dtype=torch.bool),
+                cache_indices=indices[:batch],
+                query_start_loc=positions[: batch + 1],
+                query_start_loc_long=positions[: batch + 1].long(),
+                num_prefill_tokens=prefill_length,
+                num_decode_tokens=batch_decodes,
+                state_indices_p=indices[:num_prefills],
+                state_indices_d=indices[num_prefills:batch],
+                num_prefill=num_prefills,
+                num_decodes=batch_decodes,
+            )
+        return out[:, :prefill_length], conv_states, ssm_states, fused_call.call_count
+
+    # Warm chunk tuning with disposable state, as in the mixed-batch test above.
+    run(0)
+    alone, alone_conv, alone_state, alone_fused = run(0)
+    if not deterministic:
+        assert alone_fused == 1
+        return
+    assert alone_fused == 0
+    mixed, mixed_conv, mixed_state, mixed_fused = run(num_decodes)
+    assert mixed_fused == 0
+    prefill_slots = indices[:num_prefills]
+    torch.testing.assert_close(mixed, alone, rtol=0, atol=0)
+    torch.testing.assert_close(
+        mixed_state[prefill_slots], alone_state[prefill_slots], rtol=0, atol=0
+    )
+    torch.testing.assert_close(mixed_conv[prefill_slots], alone_conv[prefill_slots], rtol=0, atol=0)
+
+
+def test_forward_core_runs_prefill_groups_from_host_offsets(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A batch with more prefill requests than the state workspace holds runs in groups."""
+    monkeypatch.setenv("FORCE_DETERMINISTIC", "0")
+    monkeypatch.setenv("TLLM_USE_FLASHINFER_GDN_PREFILL", "1")
+    if not gdn_mixer._use_flashinfer_gdn_prefill() or is_sm_100f():
+        pytest.skip("Only FlashInfer GDN prefill on SM90/SM120 uses a state workspace")
+    gdn_mixer._resolve_chunk_gated_delta_rule.cache_clear()
+    request.addfinalizer(gdn_mixer._resolve_chunk_gated_delta_rule.cache_clear)
+    torch.manual_seed(42)
+    layer = _make_layer()
+    layer.layer_idx = 0
+    prefill_lengths, num_decodes, num_slots = (7, 129, 64), 2, 8
+    lengths = [*prefill_lengths, *([1] * num_decodes)]
+    num_prefills, num_tokens = len(prefill_lengths), sum(lengths)
+    projected = torch.randn(num_tokens, 3072, device="cuda", dtype=torch.bfloat16) * 0.1
+    gates = torch.randn(num_tokens, 16, device="cuda", dtype=torch.bfloat16) * 0.1
+    conv = torch.randn(num_slots, 2048, 3, device="cuda", dtype=torch.bfloat16) * 0.1
+    state = torch.randn(num_slots, 8, 128, 128, device="cuda", dtype=torch.bfloat16) * 0.1
+    indices = torch.tensor([6, 1, 4, 3, 0], device="cuda", dtype=torch.int32)
+    positions = torch.tensor([0, *lengths], device="cuda").cumsum(0, dtype=torch.int32)
+    mamba_metadata = SimpleNamespace(
+        has_initial_states=torch.ones(len(lengths), device="cuda", dtype=torch.bool),
+        state_indices=indices,
+        query_start_loc=positions,
+        query_start_loc_long=positions.long(),
+        arange_long=lambda n: torch.arange(n + 1, device="cuda", dtype=torch.int64),
+        replay_work_items=None,
+        replay_n_writes=None,
+    )
+    state_bytes = state[0].numel() * torch.float32.itemsize
+
+    def run(workspace_states: int):
+        monkeypatch.setattr(
+            gdn_mixer, "_PREFILL_STATE_WORKSPACE_BYTES", workspace_states * state_bytes
+        )
+        layer.model_config = SimpleNamespace(extra_attrs={})
+        cache = SimpleNamespace(conv=conv.clone(), temporal=state.clone())
+        attn_metadata = SimpleNamespace(
+            num_contexts=num_prefills,
+            seq_lens=torch.tensor(lengths, dtype=torch.int32),
+            num_ctx_tokens=sum(prefill_lengths),
+            num_tokens=num_tokens,
+            max_num_sequences=len(lengths),
+            max_num_requests=len(lengths),
+            max_num_tokens=num_tokens,
+            kv_cache_manager=SimpleNamespace(mamba_layer_cache=lambda _layer_idx: cache),
+        )
+        # The decode convolution writes into its input, so each run gets fresh inputs.
+        mixed_qkv = projected.clone()[:, :2048]
+        b, a = gates[:, :8].clone(), gates[:, 8:].clone()
+        with patch.object(
+            gdn_mixer, "chunk_gated_delta_rule", wraps=gdn_mixer.chunk_gated_delta_rule
+        ) as prefill_call:
+            out = layer.forward_core(mixed_qkv, a, b, attn_metadata, mamba_metadata)
+        assert prefill_call.call_count == 1
+        return out, cache, prefill_call.call_args.kwargs
+
+    # Warm chunk tuning with disposable state, as in the mixed-batch test above.
+    run(1)
+    grouped, grouped_cache, grouped_call = run(1)
+    single, single_cache, single_call = run(num_prefills)
+    # Only a batch the workspace cannot hold needs the host offsets of its prefill requests.
+    assert grouped_call["state_workspace"][0].shape[0] == 1
+    torch.testing.assert_close(
+        grouped_call["cu_seqlens_cpu"], torch.tensor([0, *prefill_lengths]).cumsum(0)
+    )
+    assert single_call["state_workspace"][0].shape[0] == num_prefills
+    assert single_call["cu_seqlens_cpu"] is None
+    # Decode requests never use the workspace; prefill groups match one call to accumulation error.
+    prefill_length = sum(prefill_lengths)
+    torch.testing.assert_close(
+        grouped[:, prefill_length:], single[:, prefill_length:], rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        grouped[:, :prefill_length], single[:, :prefill_length], atol=1e-4, rtol=1.6e-2
+    )
+    decode_slots, prefill_slots = indices[num_prefills:], indices[:num_prefills]
+    torch.testing.assert_close(
+        grouped_cache.temporal[decode_slots], single_cache.temporal[decode_slots], rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        grouped_cache.temporal[prefill_slots],
+        single_cache.temporal[prefill_slots],
+        atol=2e-3,
+        rtol=1.6e-2,
+    )
+    torch.testing.assert_close(grouped_cache.conv, single_cache.conv, rtol=0, atol=0)
+
+
+def _extend_fused_and_unfused(
+    monkeypatch: pytest.MonkeyPatch,
+    prefill_lengths: tuple[int, ...],
+    num_decodes: int,
+    draft_token_num: int,
+    prefill_conv_supported: bool = False,
+    **verify_kwargs,
+) -> tuple[tuple, tuple]:
+    """forward_extend on one batch with fused_gdn_conv_post_conv enabled and disabled.
+
+    Returns (output, conv states, SSM states, intermediate conv windows, calls of
+    fused_gdn_conv_post_conv, intermediate SSM states) of each run.
+    """
+    torch.manual_seed(42)
+    layer = _make_layer()
+    if prefill_conv_supported:
+        layer.conv_kernel_size, layer.conv_dim_per_tp = 4, 2048
+        assert gdn_mixer.gdn_prefill_conv_supported(128, 128, 4, "silu", 2048, 4)
+    layer.fused_prefill_conv = prefill_conv_supported
+    num_prefills, num_slots = len(prefill_lengths), 8
+    prefill_length = sum(prefill_lengths)
+    num_tokens = prefill_length + num_decodes * draft_token_num
+    projected = torch.randn(num_tokens, 3072, device="cuda", dtype=torch.bfloat16) * 0.1
+    gates = torch.randn(num_tokens, 16, device="cuda", dtype=torch.bfloat16) * 0.1
+    conv = torch.randn(num_slots, 2048, 3, device="cuda", dtype=torch.bfloat16) * 0.1
+    state = torch.randn(num_slots, 8, 128, 128, device="cuda", dtype=torch.float32) * 0.1
+    indices = torch.tensor([6, 1, 4, 3, 0, 7], device="cuda", dtype=torch.int32)
+    indices = indices[: num_prefills + num_decodes]
+    lengths = [0, *prefill_lengths, *([draft_token_num] * num_decodes)]
+    positions = torch.tensor(lengths, device="cuda", dtype=torch.int32).cumsum(0, dtype=torch.int32)
+    has_initial_states = [True, False, True][:num_prefills] + [True] * num_decodes
+    kwargs = {
+        "a": gates[:, 8:],
+        "b": gates[:, :8],
+        "batch_size": num_prefills + num_decodes,
+        "has_initial_states": torch.tensor(has_initial_states, device="cuda"),
+        "cache_indices": indices,
+        "query_start_loc": positions,
+        "query_start_loc_long": positions.long(),
+        "num_prefill_tokens": prefill_length,
+        "num_decode_tokens": num_decodes * draft_token_num,
+        "state_indices_p": indices[:num_prefills],
+        "state_indices_d": indices[num_prefills:],
+        "num_prefill": num_prefills,
+        "num_decodes": num_decodes,
+    }
+
+    def run(fused: bool) -> tuple:
+        monkeypatch.setattr(Qwen3NextGatedDeltaNet, "_fused_conv_post_conv", fused)
+        conv_states, ssm_states = conv.clone(), state.clone()
+        run_kwargs = dict(verify_kwargs)
+        for key in ("intermediate_conv_states", "intermediate_ssm_states"):
+            if key in run_kwargs:
+                run_kwargs[key] = run_kwargs[key].clone()
+        with patch.object(
+            gdn_mixer, "fused_gdn_conv_post_conv", wraps=gdn_mixer.fused_gdn_conv_post_conv
+        ) as fused_call:
+            # The decode conv may run in place on the projection, so give each run its own copy.
+            out = layer.forward_extend(
+                conv_states,
+                ssm_states,
+                mixed_qkv=projected.clone()[:, :2048],
+                **run_kwargs,
+                **kwargs,
+            )
+        intermediate_conv = run_kwargs.get("intermediate_conv_states")
+        intermediate_ssm = run_kwargs.get("intermediate_ssm_states")
+        return (
+            out,
+            conv_states,
+            ssm_states,
+            intermediate_conv,
+            fused_call.call_count,
+            intermediate_ssm,
+        )
+
+    return run(True), run(False)
+
+
+@pytest.mark.parametrize("deterministic", [False, True])
+@pytest.mark.parametrize("prefill_conv_supported", [False, True])
+@pytest.mark.parametrize("num_decodes", [0, 3])
+def test_fused_conv_post_conv_matches_unfused(
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+    num_decodes: int,
+    prefill_conv_supported: bool,
+    deterministic: bool,
+) -> None:
+    """Chunked prefill, alone and next to decode rows, agrees across the two conv paths.
+
+    fused_gdn_conv_post_conv takes the prefill rows except a context-only batch that
+    gdn_prefill_conv_post supports; FORCE_DETERMINISTIC=1 keeps it off.
+    """
+    monkeypatch.setenv("FORCE_DETERMINISTIC", "1" if deterministic else "0")
+    gdn_mixer._resolve_chunk_gated_delta_rule.cache_clear()
+    request.addfinalizer(gdn_mixer._resolve_chunk_gated_delta_rule.cache_clear)
+    fused, unfused = _extend_fused_and_unfused(
+        monkeypatch, (2, 7, 129), num_decodes, 1, prefill_conv_supported
+    )
+    takes_rows = not deterministic and not (prefill_conv_supported and num_decodes == 0)
+    assert (fused[4], unfused[4]) == (int(takes_rows), 0)
+    if not takes_rows:
+        for fused_output, unfused_output in zip(fused[:3], unfused[:3]):
+            assert torch.equal(fused_output, unfused_output)
+        return
+    torch.testing.assert_close(fused[0], unfused[0], rtol=1e-2, atol=1e-5)
+    assert torch.equal(fused[1], unfused[1])
+    torch.testing.assert_close(fused[2], unfused[2], rtol=0, atol=2e-5)
+
+
+def test_fused_conv_post_conv_matches_unfused_target_verify(
+    monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> None:
+    """Prefill rows of a target-verify batch agree across the two conv paths."""
+    monkeypatch.setenv("FORCE_DETERMINISTIC", "0")
+    gdn_mixer._resolve_chunk_gated_delta_rule.cache_clear()
+    request.addfinalizer(gdn_mixer._resolve_chunk_gated_delta_rule.cache_clear)
+    num_decodes, draft_len = 2, 2
+    draft_token_num = draft_len + 1
+    fused, unfused = _extend_fused_and_unfused(
+        monkeypatch,
+        (5, 129),
+        num_decodes,
+        draft_token_num,
+        is_target_verify=True,
+        spec_metadata=SimpleNamespace(runtime_draft_len=draft_len),
+        intermediate_conv_states=torch.zeros(
+            num_decodes, draft_token_num, 2048, 3, device="cuda", dtype=torch.bfloat16
+        ),
+        intermediate_ssm_states=torch.zeros(
+            num_decodes, draft_token_num, 8, 128, 128, device="cuda", dtype=torch.float32
+        ),
+        intermediate_state_indices=torch.arange(num_decodes, device="cuda", dtype=torch.int32),
+    )
+    assert (fused[4], unfused[4]) == (1, 0)
+    torch.testing.assert_close(fused[0], unfused[0], rtol=1e-2, atol=1e-5)
+    assert torch.equal(fused[1], unfused[1])
+    torch.testing.assert_close(fused[2], unfused[2], rtol=0, atol=2e-5)
+    assert torch.equal(fused[3], unfused[3])
+    # The verify steps of the decode rows write their SSM states here.
+    assert fused[5].abs().amax() > 0
+    assert torch.equal(fused[5], unfused[5])

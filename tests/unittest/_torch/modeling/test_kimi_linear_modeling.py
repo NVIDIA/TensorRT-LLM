@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from torch import nn
@@ -86,3 +88,37 @@ def test_kimi_k3_routed_expert_exclusion_outranks_the_checkpoint_entry() -> None
     assert excluded.kv_cache_quant_algo == QuantAlgo.FP8
 
     assert resolve(model_config, 4) is per_layer
+
+
+def test_kimi_k3_moe_front_prewarm_compiles_sort_routing_for_the_moe_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The decode-kernel prewarm compiles the sorting-routing kernels for the routed-expert
+    count of the first MoE layer's runtime; the model holds no ``num_experts`` of its own.
+
+    Nothing compiles: the routing kernel's compile function is a stand-in, the current device
+    counts as one the kernel serves, and the router-logits prewarm is a stand-in.
+    """
+    from tensorrt_llm._torch.moe.kernels.blackwell import kimi_k3_router_logits, kimi_k3_routing
+
+    compiled_for = []
+
+    def compile_routing(num_experts, num_warps, warps_per_token, local_cap, use_pdl):
+        compiled_for.append(num_experts)
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(kimi_k3_routing, "_is_supported_device", lambda device_index: True)
+    monkeypatch.setattr(kimi_k3_routing, "_compiled_kernel", compile_routing)
+    monkeypatch.setattr(kimi_k3_router_logits, "precompile", lambda: 1)
+    runtime = SimpleNamespace(
+        num_experts=384,
+        gate=SimpleNamespace(logits_kernel=True),
+        routed_experts=SimpleNamespace(sort_routing_applies=True),
+    )
+    model = SimpleNamespace(
+        layers=[SimpleNamespace(block_sparse_moe=None), SimpleNamespace(block_sparse_moe=runtime)]
+    )
+
+    compiled = modeling_kimi_linear.KimiLinearModel._prewarm_k3_moe_front_kernels(model)
+    assert compiled == 1 + len(compiled_for)
+    assert compiled_for and set(compiled_for) == {384}

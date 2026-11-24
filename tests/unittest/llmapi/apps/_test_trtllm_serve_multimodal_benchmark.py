@@ -15,13 +15,12 @@
 
 import os
 import re
-import subprocess
 import tempfile
 
 import pytest
 import yaml
 
-from .openai_server import RemoteOpenAIServer
+from .openai_server import RemoteOpenAIServer, run_command_with_output
 
 __extra_import_path__ = ["..", "~/tests/unittest"]
 from test_llm import get_model_path
@@ -130,19 +129,13 @@ def test_trtllm_serve_multimodal_benchmark(server: RemoteOpenAIServer,
     for key, value in dataset_args.items():
         benchmark_cmd.extend([key, str(value)])
 
-    # CalledProcessError will be raised if any errors occur
-    result = subprocess.run(benchmark_cmd,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            text=True,
-                            check=True,
-                            timeout=3600)
+    result = run_command_with_output(benchmark_cmd, timeout=3600)
 
     # Basic validation that the benchmark ran successfully
     assert result.returncode == 0
-    assert "Serving Benchmark Result" in result.stdout
+    assert "Serving Benchmark Result" in result.stdout, result.stdout
     # The exit code alone passes when --num-prompts is ignored.
     completed = re.search(r"^Successful requests:\s+(\d+)\s*$", result.stdout,
                           re.MULTILINE)
     assert completed is not None, result.stdout
-    assert int(completed.group(1)) == 10
+    assert int(completed.group(1)) == 10, result.stdout

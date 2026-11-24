@@ -32,11 +32,11 @@ shared perf regression pipeline. It is responsible for:
 | `MINIMIZE_METRICS` | `d_mean_latency`, `d_median_latency`, `d_p90_latency`, `d_p99_latency`, `d_mean_generation`, `d_median_generation`, `d_p90_generation`, `d_p99_generation` |
 | `REGRESSION_METRICS` | `d_median_generation` |
 
-Latency and generation metrics are read from the VisualGen benchmark JSON in
-seconds. Latency includes media encoding and persistence overhead, while median
-generation tracks the typical engine-side generation time used for regression
-checks. Online benchmarks receive generation timing from the VisualGen serving
-`Server-Timing` response header and store it in the result JSON.
+Latency and generation metrics use client wall-clock seconds, not server inference
+time. `result_metric_paths` in `visual_gen_perf_utils.py` selects `gen_latency` for
+video and `e2e_latency` for synchronous image/image-edit routes, which currently
+have no separate client generation observation. Both populate the existing
+`d_*_generation` fields; server timings under `timings` are diagnostic only.
 
 ## Match Keys
 
@@ -84,10 +84,12 @@ The config folder can be overridden with:
 
 ### Current Naming Pattern
 
-VisualGen family YAMLs currently use underscore-separated names with a hardware
-suffix, for example:
+VisualGen family YAMLs use model-based names. Hardware-specific recipes may
+include a hardware suffix; supported GPUs are listed in
+`metadata.supported_gpus`.
 
-- `wan21_t2v_14b_blackwell.yaml`
+Examples:
+
 - `wan22_i2v_a14b_blackwell.yaml`
 - `flux2_blackwell.yaml`
 - `ltx2_blackwell.yaml`
@@ -98,37 +100,27 @@ Each file can hold one or more named `server_configs`. This mirrors the LLM
 aggregated perf sanity layout and allows one family YAML to contain multiple
 stable server recipes.
 
+A minimal layout is shown below. See the [family YAMLs](../../../scripts/perf-sanity/visual_gen/)
+for complete recipes.
+
 ```yaml
 metadata:
-  model_name: Wan2.1-T2V-14B-Diffusers
+  model_name: FLUX.2-dev
   supported_gpus: [B200]
-
 hardware:
-  gpus_per_node: 8
-
-environment:
-  server_env_var: TLLM_LOG_LEVEL=info
-  client_env_var: ""
-
+  gpus_per_node: 4
 server_configs:
-  - name: wan21_14b_nvfp4_trtllm_cfg2_ulysses4_teacache_on
-    model_path: Wan-AI/Wan2.1-T2V-14B-Diffusers
-    visual_gen_args_path: examples/visual_gen/serve/configs/foo.yml
+  - name: t2i
     server_config:
-      attention_config:
-        backend: TRTLLM
       parallel_config:
-        cfg_size: 2
+        cfg_size: 1
         ulysses_size: 4
     client_configs:
-      - name: 832x480_33f_50s_con1
-        backend: openai-videos
-        generation_mode: t2v
-        size: 832x480
-        num_frames: 33
-        fps: 16
-        num_inference_steps: 50
-        max_concurrency: 1
+      - name: 1024x1024
+        prompt: A cat holding a sign that says hello world
+        backend: openai-images
+        generation_mode: t2i
+        size: 1024x1024
 ```
 
 ### Schema Notes
@@ -161,7 +153,7 @@ VisualGen uses two prefixes:
 - `vg`: run the case without posting new results
 
 `{config_base}` is the YAML filename without the `.yaml` extension (e.g.,
-`flux2_blackwell`, `wan21_t2v_14b_blackwell`).
+`flux2_blackwell`, `wan22_i2v_a14b_blackwell`).
 
 Both prefixes support two selector forms:
 
@@ -180,7 +172,7 @@ perf/test_visual_gen_perf_sanity.py::test_visual_gen_e2e[vg_upload-{config_base}
 Example:
 
 ```text
-perf/test_visual_gen_perf_sanity.py::test_visual_gen_e2e[vg_upload-wan21_t2v_1p3b_blackwell-wan21_1p3b_fp8_fa4_cfg1_ulysses1_teacache_on]
+perf/test_visual_gen_perf_sanity.py::test_visual_gen_e2e[vg_upload-flux2_blackwell-flux2_bf16_cfg1_ulysses4_teacache_cg_on]
 ```
 
 ## CI Integration
@@ -215,7 +207,7 @@ To include the VisualGen perf sanity stage alongside the standard L0 suite:
 
 Model assets are read from `LLM_MODELS_ROOT` (defaults to
 `/home/scratch.trt_llm_data_ci/llm-models/`). The `model_path` in a YAML may
-use the HuggingFace `org/model` format (e.g. `Wan-AI/Wan2.1-T2V-14B-Diffusers`)
+use the HuggingFace `org/model` format (e.g. `Wan-AI/Wan2.2-I2V-A14B-Diffusers`)
 — the resolver tries the full path under `LLM_MODELS_ROOT` first, then falls
 back to stripping the org prefix, so CI layouts without subdirectories work
 automatically.
@@ -224,15 +216,13 @@ Important:
 
 - VisualGen perf sanity uses static pytest cases, like `test_perf_sanity.py`
 - Do **not** add pytest `--perf` for VisualGen perf sanity runs
-- VisualGen `PerfSanity` stages should not be routed through the legacy
-  `perfMode` path used by `test_perf.py`
 
 ## How to Add a Test Case
 
 1. **Locate (or create) the family YAML** under
    `tests/scripts/perf-sanity/visual_gen/`. Use an existing file if the model
    family already has one; otherwise create a new file following the naming
-   pattern `<family>_<hardware>.yaml`.
+   guidance above.
 
 2. **Add a `server_configs` entry.** Each entry needs a unique `name`, a
    `model_path` (or rely on `metadata.model_name`), a `server_config` block,
@@ -263,7 +253,7 @@ Important:
 
    The link pre-filters to `s_runtime: visual_gen`. To find a specific run,
    search for the server config name (e.g. `s_server_name:
-   wan21_14b_nvfp4_trtllm_cfg2_ulysses4_teacache_on`) or narrow the time range
+   flux2_bf16_cfg1_ulysses4_teacache_cg_on`) or narrow the time range
    to match the CI run timestamp.
 
 ## How to Add or Change a Match Key
@@ -295,7 +285,7 @@ extraction in `build_visual_gen_db_entry` and treat it as a baseline reset.
 
 ```bash
 # Run a single named recipe
-pytest perf/test_visual_gen_perf_sanity.py::test_visual_gen_e2e[vg_upload-wan21_t2v_14b_blackwell-wan21_14b_nvfp4_trtllm_cfg2_ulysses4_teacache_on]
+pytest perf/test_visual_gen_perf_sanity.py::test_visual_gen_e2e[vg_upload-flux2_blackwell-flux2_bf16_cfg1_ulysses4_teacache_cg_on]
 
 # Run all server recipes from one family YAML without uploading
 pytest perf/test_visual_gen_perf_sanity.py::test_visual_gen_e2e[vg-ltx2_blackwell]

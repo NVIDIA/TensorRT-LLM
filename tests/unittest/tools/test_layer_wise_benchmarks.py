@@ -301,6 +301,10 @@ def test_qwen3_next_gen_tep(llm_root, world_size):
     check_call(
         [
             "./mpi_launch.sh",
+            # The TRTLLM MoE routes inside its kernel without attention DP, so the
+            # default --balance-method needs the top-k computed outside it.
+            "-x",
+            "TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING=1",
             "./run.sh",
             "config_gen.yaml",
             "--model",

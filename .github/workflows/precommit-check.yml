@@ -24,6 +24,9 @@ on:
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
+permissions:
+  contents: read
+  pull-requests: read
 jobs:
   precommit-check:
     name: Pre-commit Check
@@ -32,6 +35,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ref || github.ref }}
+          persist-credentials: false
 
       - name: Test stale pull request cleanup workflow
         run: node .github/scripts/cleanup_stale_prs.test.js
@@ -46,34 +50,44 @@ jobs:
         if: github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          CHANGED_FILES_PATH: ${{ runner.temp }}/changed_files.txt
         run: |
-          files=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
-            --paginate --jq '.[].filename' | paste -sd ' ' -)
-          count=$(echo "$files" | tr ' ' '\n' | sed '/^$/d' | wc -l)
-          echo "Changed file count from API: ${count}"
-          echo "files=$files" >> $GITHUB_OUTPUT
-          echo "count=$count" >> $GITHUB_OUTPUT
+          set -euo pipefail
+          gh api "repos/${REPO}/pulls/${PR_NUMBER}/files" \
+            --paginate --jq '.[].filename | @json' \
+            | python3 -c '
+          import json, os, sys
+
+          files = [json.loads(line) for line in sys.stdin if line.strip()]
+          print(f"Changed file count from API: {len(files)}")
+          unsafe = any(
+              not isinstance(f, str) or not f or f != f.strip() or "\n" in f or "\r" in f
+              for f in files
+          )
+          # GitHub PR Files API caps out at 3000 entries; also fall back when any
+          # path has line breaks or leading/trailing whitespace that line-based
+          # --files-from cannot preserve.
+          use_files_from = (not unsafe) and 0 < len(files) < 2500
+          if use_files_from:
+              with open(os.environ["CHANGED_FILES_PATH"], "w", encoding="utf-8", newline="\n") as fh:
+                  fh.write("\n".join(files) + "\n")
+          elif unsafe:
+              print("Detected path with line breaks or leading/trailing whitespace; falling back to full check.")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"use_files_from={str(use_files_from).lower()}\n")
+          '
 
       - name: Run pre-commit checks
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          USE_FILES_FROM: ${{ steps.changed-files.outputs.use_files_from }}
+          CHANGED_FILES_PATH: ${{ runner.temp }}/changed_files.txt
         run: |
-          args=""
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            count="${{ steps.changed-files.outputs.count }}"
-            # GitHub's PR Files API caps out at 3000 entries, silently truncating the
-            # list for huge PRs. Fail closed with a 2500 margin below that cap.
-            if [ -n "$count" ] && [ "$count" -gt 0 ] && [ "$count" -lt 2500 ]; then
-              echo "${{ steps.changed-files.outputs.files }}" | tr ' ' '\n' | sed '/^$/d' > changed_files.txt
-              args="--files-from changed_files.txt"
-            fi
+          set -euo pipefail
+          if [ "${EVENT_NAME}" = "pull_request" ] && [ "${USE_FILES_FROM}" = "true" ]; then
+            python3 -u scripts/release_check.py --files-from "${CHANGED_FILES_PATH}"
+          else
+            python3 -u scripts/release_check.py
           fi
-          python3 -u scripts/release_check.py $args
-
-      # Informational only: list test-list entries whose parametrize IDs cannot
-      # be verified statically (runtime-computed argvalues/ids), grouped by
-      # reason, so they can be swept without rerunning the analysis locally. The
-      # pre-commit step above remains the gate for actual validation errors;
-      # this step never fails the job.
-      - name: Report unverifiable test-list param IDs
-        if: always()
-        continue-on-error: true
-        run: python3 -u scripts/check_test_list.py --validate --report-unverifiable

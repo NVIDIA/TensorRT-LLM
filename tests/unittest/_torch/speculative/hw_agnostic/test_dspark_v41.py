@@ -22,6 +22,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from tensorrt_llm._torch import model_config as model_config_module
+from tensorrt_llm._torch.model_config import ModelConfig, MoESelection
 from tensorrt_llm._torch.models import modeling_dspark
 from tensorrt_llm._torch.models.modeling_deepseekv41 import _v41_load_coverage
 from tensorrt_llm._torch.models.modeling_dspark_v41 import (
@@ -33,6 +35,8 @@ from tensorrt_llm._torch.moe.fused_moe.routing import DeepSeekV4MoeRoutingMethod
 from tensorrt_llm._torch.speculative.dspark import DSv4DSparkWorker
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 from tensorrt_llm._torch.speculative.utils import _build_spec_metadata
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 
 @pytest.mark.parametrize("layer_ids", [None, []])
@@ -179,13 +183,17 @@ def _draft_routing(bias, *, hashed=False, table=None, top_k=3):
     )
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
+    reason="This test requires Blackwell or newer",
+)
 @pytest.mark.parametrize("num_tokens", [0, 1, 17])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_v41_draft_top3_routing_matches_reference(num_tokens, dtype, monkeypatch):
     torch.manual_seed(41)
-    logits = torch.randn(num_tokens, 128, dtype=dtype)
+    logits = torch.randn(num_tokens, 128, dtype=dtype, device="cuda")
     # The strong correction deliberately changes selection, not mixture weights.
-    bias = torch.linspace(-10, 10, 128)
+    bias = torch.linspace(-10, 10, 128, device="cuda")
     fused = Mock(side_effect=AssertionError("top-3 must not call target-only gate_forward"))
     monkeypatch.setattr(torch.ops.trtllm, "gate_forward", fused)
     indices, weights = _draft_routing(bias).apply(logits)
@@ -200,10 +208,16 @@ def test_v41_draft_top3_routing_matches_reference(num_tokens, dtype, monkeypatch
     fused.assert_not_called()
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
+    reason="This test requires Blackwell or newer",
+)
 def test_v41_draft_hashed_routing_does_not_read_bias():
-    logits = torch.arange(256, dtype=torch.float32).reshape(2, 128) / 20
-    table = torch.tensor([[100, 50, 3], [4, 16, 127], [32, 41, 9]], dtype=torch.int32)
-    token_ids = torch.tensor([2, 0])
+    logits = torch.arange(256, dtype=torch.float32, device="cuda").reshape(2, 128) / 20
+    table = torch.tensor(
+        [[100, 50, 3], [4, 16, 127], [32, 41, 9]], dtype=torch.int32, device="cuda"
+    )
+    token_ids = torch.tensor([2, 0], device="cuda")
     indices, weights = _draft_routing(None, hashed=True, table=table).apply(logits, token_ids)
     expected = F.softplus(logits).sqrt().gather(1, table[token_ids].long())
     torch.testing.assert_close(indices, table[token_ids])
@@ -230,6 +244,7 @@ def test_v4_target_top6_routing_keeps_fused_kernel(experts, monkeypatch):
 def test_v41_draft_top3_routing_cuda_graph_replay():
     logits = torch.randn(17, 128, dtype=torch.bfloat16, device="cuda")
     routing = _draft_routing(torch.linspace(-1, 1, 128, device="cuda"))
+    routing.apply(logits)  # Compile the routing kernel before capture.
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         indices, weights = routing.apply(logits)
@@ -253,11 +268,95 @@ def test_v41_block32_dequant_uses_each_tile_scale():
             )
 
 
+def test_v41_draft_rejects_fp8_attention_projections(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TRTLLM_DSPARK_LINEAR_BACKEND", "fp8")
+    assert DSv41DSparkDraftModel.supports_fp8_attn_projections is False
+    mapping = SimpleNamespace(tp_size=1, enable_attention_dp=False)
+    with pytest.raises(ValueError, match="not supported by this DSpark drafter"):
+        modeling_dspark._use_dspark_bf16_linear(
+            mapping, fp8_supported=DSv41DSparkDraftModel.supports_fp8_attn_projections
+        )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "tactic, quant_algo, moe_backend",
+    [
+        # No draft selection: the stages run as the loaded config's literal picks.
+        (None, QuantAlgo.W4A8_MXFP4_MXFP8, "TRTLLM"),
+        # One family over the MXFP4 stages, CUTLASS and CuteDSL over the NVFP4 main experts.
+        ("grouped_gemm", QuantAlgo.W4A8_MXFP4_MXFP8, "CUTLASS"),
+        # The stages run as the MXFP4 format the tactic names, not the one the load picked.
+        ("trtllm_gen.w4a8_mxfp4_fp8", QuantAlgo.W4A8_MXFP4_FP8, "TRTLLM"),
+        ("mega_moe", QuantAlgo.W4A8_MXFP4_MXFP8, "MEGAMOE_DEEPGEMM"),
+    ],
+    ids=["no_tactic", "grouped_gemm", "w4a8_fp8", "mega_moe"],
+)
+@pytest.mark.parametrize(
+    "learn_placement", [False, True], ids=["shared_placement", "draft_placement"]
+)
+def test_v41_draft_tactic_resolves_against_the_draft_stages_only(
+    monkeypatch, tactic, quant_algo, moe_backend, learn_placement
+):
+    """The target checkpoint is loaded without the draft tactic, as the embedded draft's loader
+    kwargs do, and the tactic is resolved against the MXFP4 draft stages alone."""
+    # A 2-D I8 expert weight is how the checkpoint marks MXFP4 draft experts.
+    monkeypatch.setattr(
+        ModelConfig,
+        "_get_safetensors_header_for_tensor",
+        staticmethod(lambda checkpoint_dir, name: {"dtype": "I8", "shape": [8, 8]}),
+    )
+    monkeypatch.setattr(model_config_module, "get_sm_version", lambda: 100)
+    monkeypatch.delenv("OVERRIDE_QUANT_ALGO", raising=False)
+    main_experts = QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16)
+    quant_config_dict = {f"model.layers.{i}.mlp.experts": main_experts for i in range(4)}
+    # As ModelConfig.from_pretrained loads it for an AUTO draft selection on SM100.
+    model_config = ModelConfig(
+        pretrained_config=SimpleNamespace(
+            _name_or_path="/unused", architectures=["DeepseekV41ForCausalLM"]
+        ),
+        sparse_attention_config=None,
+        quant_config=QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES),
+        quant_config_dict=dict(quant_config_dict),
+        moe_backend="TRTLLM",
+    )
+    selection = None if tactic is None else MoESelection(tactic=tactic)
+
+    draft_balancer = object() if learn_placement else None
+    monkeypatch.setattr(
+        DSv41DSparkDraftModel,
+        "_draft_load_balancer_config",
+        staticmethod(lambda config: draft_balancer),
+    )
+    draft_config = DSv41DSparkDraftModel._derive_draft_model_config(
+        model_config, 4, 1, selection, block_size=5
+    )
+    assert draft_config.moe_load_balancer is draft_balancer
+    assert draft_config.moe_row_space == ("draft" if learn_placement else "main")
+    assert draft_config.moe_row_space_rows_per_request == (5 if learn_placement else None)
+    assert model_config.moe_load_balancer is None
+    assert model_config.moe_row_space == "main"
+
+    stage_experts = draft_config.quant_config_dict["model.layers.4.mlp.experts"]
+    assert stage_experts.quant_algo is quant_algo
+    assert (draft_config.moe_backend, draft_config.moe_tactic) == (moe_backend, tactic)
+    assert model_config.quant_config_dict == quant_config_dict
+    if tactic in ("grouped_gemm", "mega_moe"):
+        # Over the whole map, NVFP4 main experts included, the tactic spans two families.
+        with pytest.raises(ValueError, match="several backend families"):
+            ModelConfig.pinned_moe_backend(
+                tactic,
+                model_config.quant_config,
+                draft_config.quant_config_dict,
+                architecture="DeepseekV41ForCausalLM",
+            )
+
+
 def test_v41_draft_uses_smaller_expert_bank_without_changing_target(monkeypatch):
     captured = {}
 
     def fake_init(
-        self, model_config, aux_stream_dict, num_stages, block_size, *, draft_moe_backend
+        self, model_config, aux_stream_dict, num_stages, block_size, *, draft_moe_selection
     ):
         nn.Module.__init__(self)
         captured["config"] = model_config.pretrained_config
@@ -296,6 +395,9 @@ def test_v41_three_stages_carry_lagged_pre_into_final_head(batched):
     nn.Module.__init__(model)
     model.hc_mult = 2
     model.block_size = 2
+    model.model_config = SimpleNamespace(
+        mapping=SimpleNamespace(enable_attention_dp=False, tp_size=1)
+    )
     model.lm_head = nn.Identity()
     model.mtp_layers = [SimpleNamespace(_dspark_attn={}) for _ in range(3)]
     model.mtp_layers[-1].hc_ffn = SimpleNamespace(collapse=mHC.collapse)
@@ -313,7 +415,7 @@ def test_v41_three_stages_carry_lagged_pre_into_final_head(batched):
 
     model._forward_stage = MethodType(fake_stage, model)
     model.forward_embed = Mock(return_value=(initial, torch.zeros(1, 3), torch.zeros(1, 2)))
-    model._dspark_freqs_table = Mock(return_value=torch.empty(0))
+    model._dspark_freqs_table = Mock(return_value=torch.empty(8, 1, dtype=torch.complex64))
     call = model.forward_batched if batched else model.forward
     kwargs = {}
     if batched:
@@ -332,7 +434,8 @@ def test_v41_three_stages_carry_lagged_pre_into_final_head(batched):
     torch.testing.assert_close(logits, ((initial + 3) * mixes[-1]).sum(-2))
 
 
-def test_v41_stage_collapses_with_previous_not_current_mix(monkeypatch):
+@pytest.mark.parametrize("batched", [False, True])
+def test_v41_stage_collapses_with_previous_not_current_mix(monkeypatch, batched):
     hidden = torch.randn(1, 2, 2, 3)
     previous_pre, attention_pre, ffn_pre = [torch.randn(1, 2, 2, 1) for _ in range(3)]
     attention_output = torch.randn(1, 2, 3)
@@ -340,17 +443,18 @@ def test_v41_stage_collapses_with_previous_not_current_mix(monkeypatch):
     final_residual = torch.randn_like(hidden)
     attention_mixer = SimpleNamespace(
         pre_mapping_lagged=Mock(return_value=(attention_pre, None, None, hidden[:, :, 0])),
-        post_mapping=Mock(return_value=mid_residual),
     )
     ffn_mixer = SimpleNamespace(
-        pre_mapping_lagged=Mock(return_value=(ffn_pre, None, None, mid_residual[:, :, 0])),
+        fused_hc_lagged=Mock(
+            return_value=(mid_residual, ffn_pre, None, None, mid_residual[:, :, 0])
+        ),
         post_mapping=Mock(return_value=final_residual),
     )
     stage = SimpleNamespace(
         hc_attn=attention_mixer,
         hc_ffn=ffn_mixer,
-        input_layernorm=nn.Identity(),
-        post_attention_layernorm=nn.Identity(),
+        input_layernorm=SimpleNamespace(weight=None, variance_epsilon=0.0),
+        post_attention_layernorm=SimpleNamespace(weight=None, variance_epsilon=0.0),
         mlp=Mock(return_value=torch.zeros(2, 3)),
         _dspark_attn={},
         enable_fused_hc=True,
@@ -359,29 +463,44 @@ def test_v41_stage_collapses_with_previous_not_current_mix(monkeypatch):
         _attn_params={"window_size": 4, "head_dim": 2},
         model_config=SimpleNamespace(mapping=SimpleNamespace(enable_attention_dp=False, tp_size=1)),
     )
+    attention = Mock(return_value=attention_output)
     monkeypatch.setattr(
-        modeling_dspark, "dspark_attention_forward", Mock(return_value=attention_output)
+        modeling_dspark,
+        "dspark_attention_forward_batched" if batched else "dspark_attention_forward",
+        attention,
     )
+    kwargs = {}
+    if batched:
+        rope_metadata = (
+            torch.empty(1, 1, 1, dtype=torch.complex64),
+            torch.empty(1, 2, 1, dtype=torch.complex64),
+        )
+        kwargs = {
+            "stage_window": torch.zeros(1, 4, 2),
+            "slots": torch.zeros(1, dtype=torch.long),
+            "rope_metadata": rope_metadata,
+        }
     result, next_pre = modeling_dspark.DSv4DSparkDraftModel._forward_stage(
         model,
         stage,
         hidden,
         torch.zeros(1, 3),
-        1,
+        torch.ones(1, dtype=torch.long) if batched else 1,
         torch.empty(0),
         torch.zeros(2),
         pre_mix=previous_pre,
+        **kwargs,
     )
+    if batched:
+        assert attention.call_args.kwargs["rope_metadata"] is rope_metadata
     assert attention_mixer.pre_mapping_lagged.call_args.args[1] is previous_pre
-    assert ffn_mixer.pre_mapping_lagged.call_args.args[1] is attention_pre
+    assert ffn_mixer.fused_hc_lagged.call_args.args[4] is attention_pre
     assert result is final_residual
     assert next_pre is ffn_pre
 
 
-@pytest.mark.parametrize("batched", [False, True])
-def test_v41_attention_query_has_no_per_head_rmsnorm(monkeypatch, batched):
+def test_v41_attention_query_has_no_per_head_rmsnorm(monkeypatch):
     torch.manual_seed(24)
-    monkeypatch.setattr(modeling_dspark, "IS_CUTLASS_DSL_AVAILABLE", False)
     hidden, heads, head_dim, q_rank, block = 8, 2, 4, 4, 3
     x = torch.randn(1, block, hidden)
     q_a = torch.randn(q_rank, hidden)
@@ -416,12 +535,7 @@ def test_v41_attention_query_has_no_per_head_rmsnorm(monkeypatch, batched):
         q_b_norm_enabled=False,
     )
     main_x, window = torch.randn(1, 1, hidden), torch.randn(1, 4, head_dim)
-    if batched:
-        modeling_dspark.dspark_attention_forward_batched(
-            x, main_x, torch.tensor([1]), window, torch.tensor([0]), **kwargs
-        )
-    else:
-        modeling_dspark.dspark_attention_forward(x, main_x, 1, window, **kwargs)
+    modeling_dspark.dspark_attention_forward(x, main_x, 1, window, **kwargs)
     q = F.linear(x, q_a)
     q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + 1e-20) * norm_weight
     q = F.linear(q, q_b).unflatten(-1, (heads, head_dim))
@@ -436,7 +550,7 @@ def test_v41_draft_csa2_layout_has_no_target_cache_sources(monkeypatch):
     captured = {}
 
     def fake_init(
-        self, model_config, aux_stream_dict, num_stages, block_size, *, draft_moe_backend
+        self, model_config, aux_stream_dict, num_stages, block_size, *, draft_moe_selection
     ):
         nn.Module.__init__(self)
         captured["params"] = model_config.sparse_attention_config.to_sparse_params(
@@ -502,7 +616,7 @@ def test_v41_draft_real_config_keeps_outer_and_text_geometry_in_sync(
     captured = {}
 
     def fake_init(
-        self, model_config, aux_stream_dict, num_stages, block_size, *, draft_moe_backend
+        self, model_config, aux_stream_dict, num_stages, block_size, *, draft_moe_selection
     ):
         nn.Module.__init__(self)
         captured["config"] = model_config.pretrained_config
@@ -535,3 +649,122 @@ def test_v41_draft_real_config_keeps_outer_and_text_geometry_in_sync(
     assert text.compress_ratios == [0, 0, 1, 1] and text.kv_source_layer_ids == [2]
     if cached_descriptors:
         assert text.layer_descriptors[2].has_long_range
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
+    reason="The compact draft proposal requires Blackwell or newer",
+)
+@pytest.mark.parametrize("num_gens", [16])
+def test_v41_sampled_batch_keeps_the_heads_greedy_proposals(monkeypatch, num_gens):
+    """A temperature-1 batch without rejection sampling keeps the head's greedy proposals, which
+    equal the drafts the worker samples from the corrected logits it no longer builds."""
+    from tensorrt_llm._torch.custom_ops import torch_custom_ops
+    from tensorrt_llm._torch.models.modeling_speculative import VanillaMarkov
+    from tensorrt_llm._torch.modules.embedding import LMHead
+    from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+    from tensorrt_llm._torch.speculative.interface import SpecMetadata
+    from tensorrt_llm.mapping import Mapping
+
+    # The BF16 head: its compact proposals then argmax the logits the sampler reads.
+    monkeypatch.setattr(torch_custom_ops, "IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE", False)
+    vocab, hidden, block, hc_mult = 129280, 1024, 5, 4
+    gen = torch.Generator(device="cuda").manual_seed(19)
+    with torch.inference_mode():
+        lm_head = LMHead(vocab, hidden, dtype=torch.bfloat16).cuda()
+        lm_head.weight.copy_(torch.randn(vocab, hidden, generator=gen, device="cuda") / hidden**0.5)
+        markov = VanillaMarkov(vocab_size=vocab, markov_rank=256).cuda()
+        # Small integer weights give the same exact bias in the FP32 and the BF16 chain.
+        w1, w2 = markov.markov_w1.weight, markov.markov_w2.weight
+        w1.copy_(torch.randint(-1, 2, w1.shape, generator=gen, device="cuda"))
+        w1.mul_(torch.rand(w1.shape, generator=gen, device="cuda") < 0.05)
+        w2.copy_(torch.randint(-1, 2, w2.shape, generator=gen, device="cuda"))
+        norm = RMSNorm(hidden_size=hidden, eps=1e-6, dtype=torch.bfloat16).cuda()
+        norm.weight.copy_(torch.rand(hidden, generator=gen, device="cuda") + 0.5)
+        model = DSv41DSparkDraftModel.__new__(DSv41DSparkDraftModel)
+        nn.Module.__init__(model)
+        model.block_size = block
+        model.lm_head = lm_head
+        model._compact_tp_argmax = modeling_dspark.CompactTPArgmax()
+        model.mtp_layers = [
+            SimpleNamespace(
+                hc_ffn=SimpleNamespace(collapse=mHC.collapse),
+                norm=norm,
+                markov_head=markov,
+                confidence_head=None,
+            )
+        ]
+        wrapper = modeling_dspark.DSv4DSparkForCausalLM.__new__(
+            modeling_dspark.DSv4DSparkForCausalLM
+        )
+        nn.Module.__init__(wrapper)
+        wrapper.dspark_model = model
+
+        metadata = SpecMetadata(
+            max_num_requests=num_gens,
+            max_draft_len=block,
+            max_total_draft_tokens=block,
+            spec_dec_mode=SpeculativeDecodingMode.DSPARK,
+        )
+        # What an OpenAI request without sampling fields resolves to.
+        metadata.update_is_all_greedy_sample(
+            [
+                SimpleNamespace(
+                    sampling_config=SimpleNamespace(
+                        temperature=1.0, top_k=None, top_p=1.0, min_p=None, seed=None
+                    ),
+                    state=LlmRequestState.GENERATION_IN_PROGRESS,
+                    py_seq_slot=slot,
+                    py_request_id=slot,
+                    py_spec_sampling_params=None,
+                    py_logits_post_processors=None,
+                )
+                for slot in range(num_gens)
+            ]
+        )
+        assert not metadata.is_all_greedy_sample
+        worker = DSv4DSparkWorker(
+            SimpleNamespace(max_draft_len=block, spec_dec_mode=SpeculativeDecodingMode.DSPARK),
+            Mapping(),
+        )
+        assert worker._can_reuse_draft_tokens(wrapper, metadata)
+
+        block_hidden = torch.randn(
+            num_gens, block, hc_mult, hidden, generator=gen, device="cuda"
+        ).bfloat16()
+        pre_mix = torch.rand(num_gens, block, hc_mult, 1, generator=gen, device="cuda")
+        bonus = torch.randint(0, vocab, (num_gens,), generator=gen, device="cuda")
+        proposals, _ = model.forward_head(block_hidden, bonus, pre_mix=pre_mix)
+        _, _, corrected = model.forward_head(
+            block_hidden, bonus, pre_mix=pre_mix, return_logits=True
+        )
+        sampled = worker.sample_draft_tokens(corrected, metadata, num_gens, num_contexts=0)
+    assert corrected.shape == (num_gens, block, vocab)
+    assert torch.equal(proposals.to(torch.int32), sampled)
+
+
+@pytest.mark.cpu_only
+def test_v41_explicit_draft_backend_preserves_nvfp4_conversion(monkeypatch):
+    monkeypatch.setattr(
+        ModelConfig,
+        "_get_safetensors_header_for_tensor",
+        staticmethod(lambda checkpoint_dir, name: {"dtype": "I8", "shape": [8, 8]}),
+    )
+    monkeypatch.setattr(model_config_module, "get_sm_version", lambda: 100)
+    model_config = ModelConfig(
+        pretrained_config=SimpleNamespace(
+            _name_or_path="/unused", architectures=["DeepseekV41ForCausalLM"]
+        ),
+        sparse_attention_config=None,
+        quant_config=QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES),
+        moe_backend="TRTLLM",
+    )
+    draft_config = DSv41DSparkDraftModel._derive_draft_model_config(
+        model_config, 4, 1, MoESelection(backend="MEGAMOE_CUTEDSL")
+    )
+    experts = draft_config.quant_config_dict["model.layers.4.mlp.experts"]
+    assert experts.quant_algo is QuantAlgo.NVFP4
+    assert experts.group_size == 16
+    assert (draft_config.moe_backend, draft_config.moe_tactic) == ("MEGAMOE_CUTEDSL", None)
+    assert model_config.quant_config_dict is None

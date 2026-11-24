@@ -16,9 +16,10 @@ Checks the fused SiTU activation op against the eager fp32
 
 import pytest
 import torch
+import triton
 from _torch.moe.kimi_k3_ref_moe.kimi_k3_mlp_test_utils import KimiK3MLP
 
-from tensorrt_llm._torch.modules.situ import SituAndMul
+from tensorrt_llm._torch.modules.situ import SituAndMul, situ_and_mul_kernel
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
 
@@ -118,3 +119,33 @@ def test_situ_and_mul_cuda_graph_capture():
     torch.cuda.synchronize()
     ref = SituAndMul(beta=4.0, linear_beta=25.0)(x2)
     torch.testing.assert_close(out, ref, rtol=1.6e-2, atol=1e-5)
+
+
+@requires_cuda
+@pytest.mark.parametrize("num_tokens,intermediate_size", [(1, 64), (7, 3072)])
+def test_situ_kernel_reads_interleaved_gate_up(num_tokens, intermediate_size):
+    """The MXFP8 shared expert's FC1 interleaves gate and up in 32-row blocks."""
+    interleave = 32
+    beta, linear_beta = 4.0, 25.0
+    torch.manual_seed(0)
+    gate_up = torch.randn((num_tokens, 2 * intermediate_size), dtype=torch.bfloat16, device="cuda")
+    blocks = gate_up.view(num_tokens, 2, -1, interleave)
+    interleaved = blocks.transpose(1, 2).reshape(num_tokens, -1).contiguous()
+    output = gate_up.new_empty((num_tokens, intermediate_size))
+
+    situ_and_mul_kernel[(num_tokens, triton.cdiv(intermediate_size, 1024))](
+        output,
+        output.stride(0),
+        interleaved,
+        interleaved.stride(0),
+        intermediate_size,
+        beta,
+        linear_beta,
+        BLOCK_SIZE=1024,
+        HAS_LINEAR_BETA=True,
+        LAUNCH_WITH_PDL=False,
+        GATE_UP_INTERLEAVE=interleave,
+    )
+
+    reference = SituAndMul(beta=beta, linear_beta=linear_beta)(gate_up)
+    torch.testing.assert_close(output, reference, rtol=1e-2, atol=1e-2)

@@ -60,7 +60,6 @@ from _torch.moe.moe_test_utils import (
     should_skip_to_accelerate_ci,
     should_skip_trtllm,
     skip_if_insufficient_gpu_memory,
-    skip_trtllm_bf16_on_sm103,
     supports_autotuner_capture,
 )
 from _torch.moe.quantize_utils import get_test_quant_params
@@ -75,6 +74,7 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.moe.fused_moe import (
     DEFAULT_MOE_ACTIVATION,
     DeepSeekV3MoeRoutingMethod,
+    DeepSeekV4MoeRoutingMethod,
     DefaultMoeRoutingMethod,
     Llama4RenormalizeMoeRoutingMethod,
     MiniMaxM2MoeRoutingMethod,
@@ -92,6 +92,7 @@ from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancerIterContext,
 )
 from tensorrt_llm._torch.moe.fused_moe.quantization import (
+    BF16TRTLLMGenFusedMoEMethod,
     DeepSeekFP8BlockScalesFusedMoEMethod,
     DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm,
     FP8QDQFusedMoEMethod,
@@ -115,7 +116,7 @@ from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm._utils import get_sm_version, mpi_comm, mpi_rank
 from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models.modeling_utils import QuantAlgo
+from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 G_LOGGER = logging.getLogger(__name__)
 
@@ -334,7 +335,6 @@ def _run_autotune_test(
     backend_type,
     quant_algo,
     run_all_tactics=False,
-    use_flashinfer=False,
 ):
     """Run autotune phase and tactic replay test.
 
@@ -352,9 +352,7 @@ def _run_autotune_test(
         _ = run_forward_fn()
 
     # Check if we should run full tactic replay
-    if not run_all_tactics or not supports_autotuner_capture(
-        backend_type, quant_algo, use_flashinfer
-    ):
+    if not run_all_tactics or not supports_autotuner_capture(backend_type, quant_algo):
         # Simple accuracy check for unsupported backends or when run_all_tactics is False
         with torch.inference_mode():
             output = run_forward_fn()
@@ -747,6 +745,16 @@ def _test_moe_worker_impl(
             ref_fused_moe.load_weights([ref_weights])
             ref_fused_moe.cuda(f"cuda:{mapping.rank}")
 
+            if (
+                mapping.enable_attention_dp
+                and backend_type == MoeBackendType.TRTLLM
+                and quant_algo == QuantAlgo.W4A8_MXFP4_FP8
+            ):
+                # Keep checkpoint weights and scales identical across ranks,
+                # then vary inputs/routes without changing their calibration range.
+                x.copy_(x.roll(mapping.rank, dims=-1))
+                router_logits.copy_(router_logits.roll(mapping.rank, dims=-1))
+
             # Define forward function
             def run_forward():
                 with torch.inference_mode():
@@ -766,9 +774,6 @@ def _test_moe_worker_impl(
             with torch.inference_mode():
                 ref_output = ref_fused_moe.forward(x, router_logits)
 
-            # flashinfer has no capture and replay mechanisms, so we skip test_all_kernels
-            use_flashinfer = getattr(fused_moe, "use_flashinfer", False)
-
             # Run tests
             if enable_autotune:
                 _setup_autotuner_for_test(mapping)
@@ -778,7 +783,6 @@ def _test_moe_worker_impl(
                     ref_output,
                     backend_type,
                     quant_algo,
-                    use_flashinfer=use_flashinfer,
                 )
             else:
                 output = run_forward()
@@ -1301,8 +1305,7 @@ def generate_multi_gpu_test_params(
                 # TP modes shard intermediate_size; EP modes don't
                 moe_tp_size = 4 if parallel_mode in ("DTP", "TTP") else 1
                 # Match the canonical predicate used by the worker impl so
-                # backend skip checks (e.g. the W4A8_MXFP4_FP8 + TRTLLM-Gen
-                # gpt-oss SwiGLU kernel-bug skip) fire on multi-GPU runs too.
+                # backend skip checks also apply to multi-GPU runs.
                 swiglu_gptoss_style = (
                     swiglu_alpha != 1 or swiglu_beta != 0 or swiglu_limit != float("inf")
                 )
@@ -1313,7 +1316,6 @@ def generate_multi_gpu_test_params(
                         quant_algo,
                         model_config,
                         swiglu_gptoss_style=swiglu_gptoss_style,
-                        comm_method=comm_method,
                         moe_tp_size=moe_tp_size,
                         parallel_mode=parallel_mode,
                     ),
@@ -1583,7 +1585,6 @@ def test_configurable_moe_single_gpu(
     """
     swiglu_gptoss_style = swiglu_alpha != 1 or swiglu_beta != 0 or swiglu_limit != float("inf")
     backend_type = MoeBackendType(moe_backend)
-    skip_trtllm_bf16_on_sm103(backend_type, quant_algo, dtype)
     ci_skip = should_skip_to_accelerate_ci(
         backend_type=backend_type,
         quant_algo=quant_algo,
@@ -1625,6 +1626,30 @@ def test_configurable_moe_single_gpu(
         swiglu_beta=swiglu_beta,
         swiglu_limit=swiglu_limit,
     )
+
+
+@pytest.mark.parametrize(
+    "moe_tactic", ["cutlass", "cutlass.none", "trtllm.cutlass.grouped_gemm.none"]
+)
+def test_a_tactic_builds_the_implementation_it_names(moe_tactic: str):
+    """Model code builds MoE layers through create_moe; under a tactic the layer runs the
+    implementation the tactic names on the layer's format, here CUTLASS over BF16 weights."""
+    model_cfg = _create_model_config(
+        num_experts=8,
+        hidden_size=256,
+        intermediate_size=512,
+        dtype=torch.bfloat16,
+        mapping=Mapping(),
+        quant_config=QuantConfig(),
+        moe_backend="CUTLASS",
+    ).copy_with(moe_backend="CUTLASS", moe_tactic=moe_tactic)
+
+    with create_moe(
+        routing_method=RenormalizeMoeRoutingMethod(top_k=2),
+        reduce_results=True,
+        model_config=model_cfg,
+    ) as moe:
+        assert type(moe.backend).descriptor.impl_id == "trtllm.cutlass.grouped_gemm.none"
 
 
 # ============================================================================
@@ -1735,6 +1760,160 @@ def test_trtllm_gen_fp32_routing_bias(routing_method_cls, moe_model_config, quan
     )
 
 
+@pytest.mark.parametrize("moe_backend", [MoeBackendType.TRTLLM, MoeBackendType.MEGAMOE_CUTEDSL])
+@pytest.mark.parametrize("seq_len", [6, 192])
+def test_dsv4_fused_route_quant_matches_separate_launches(moe_backend, seq_len):
+    """The one-launch DeepSeek-V4 routing + NVFP4 quantization leaves the MoE output bitwise."""
+    model = MoeModelConfig(num_experts=256, top_k=6, hidden_size=2048, intermediate_size=512)
+    dtype = torch.bfloat16
+    skip_reason = (
+        should_skip_trtllm(moe_backend, QuantAlgo.NVFP4, model)
+        if moe_backend == MoeBackendType.TRTLLM
+        else should_skip_megamoe_cutedsl(moe_backend, QuantAlgo.NVFP4, dtype, model)
+    )
+    if skip_reason:
+        pytest.skip(skip_reason)
+    torch.manual_seed(0)
+    bias = torch.randn(model.num_experts, dtype=torch.float32, device="cuda") * 0.1
+    routing_method = DeepSeekV4MoeRoutingMethod(
+        top_k=model.top_k,
+        n_group=1,
+        topk_group=1,
+        routed_scaling_factor=2.5,
+        callable_e_score_correction_bias=lambda: bias,
+        callable_tid2eid=lambda: None,
+        is_hashed=False,
+    )
+    x = torch.randn((seq_len, model.hidden_size), dtype=dtype, device="cuda")
+    router_logits = torch.randn((seq_len, model.num_experts), dtype=torch.float32, device="cuda")
+    quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+        QuantAlgo.NVFP4, x, moe_backend
+    )
+    quant_kwargs.pop("ref_cls", None)
+    quantize_util = quantize_util_cls(
+        num_experts=model.num_experts,
+        dtype=dtype,
+        intermediate_size=model.intermediate_size,
+        hidden_size=model.hidden_size,
+        quant_config=quant_config,
+    )
+    mapping = Mapping(world_size=1, rank=0, tp_size=1, moe_tp_size=1, moe_ep_size=1)
+    model_cfg = _create_model_config(
+        num_experts=model.num_experts,
+        hidden_size=model.hidden_size,
+        intermediate_size=model.intermediate_size,
+        dtype=dtype,
+        mapping=mapping,
+        quant_config=quant_config,
+        moe_backend=moe_backend.value,
+        max_num_tokens=256,
+    )
+    # Unfinalized (per-expert rows, weights, permutation), as the model's fused all-reduce takes it.
+    unfinalized = moe_backend == MoeBackendType.TRTLLM
+    with create_moe(
+        routing_method=routing_method, reduce_results=not unfinalized, model_config=model_cfg
+    ) as fused_moe:
+        fused_moe.create_weights()
+        fused_moe.load_weights([quantize_util.create_weights(**quant_kwargs)])
+        fused_moe.post_load_weights()
+        fused_moe.cuda()
+        assert fused_moe.backend._fuses_route_quant
+
+        def forward(do_finalize):
+            return fused_moe.forward(
+                x, router_logits, all_rank_num_tokens=[seq_len], do_finalize=do_finalize
+            )
+
+        with torch.inference_mode():
+            fused = forward(True)
+            fused_rows = forward(False) if unfinalized else None
+            fused_moe.backend._fuses_route_quant = False
+            separate = forward(True)
+            separate_rows = forward(False) if unfinalized else None
+    # Bitwise, also where the TRTLLM leaf hands the runner its routing tables (6 tokens, not 192).
+    torch.testing.assert_close(fused, separate, atol=0, rtol=0)
+    if unfinalized:
+        # An expert's rows may sit elsewhere in its block: compare them by expanded index.
+        rows = [out[0][out[2].flatten().long()] for out in (fused_rows, separate_rows)]
+        torch.testing.assert_close(rows[0], rows[1], atol=0, rtol=0)
+        torch.testing.assert_close(fused_rows[1], separate_rows[1], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("seq_len", [5, 64])
+def test_dspark_draft_fused_route_quant_matches_separate_launches(seq_len, monkeypatch):
+    """The DSpark draft bank (top-3 of 128, bias-selected) on TRTLLM-Gen MXFP4 x MXFP8 routes and
+    quantizes its input in one launch, and the MoE output is bitwise that of the separate
+    routing, scale cast and quantization launches."""
+    moe_backend = MoeBackendType.TRTLLM
+    model = MoeModelConfig(num_experts=128, top_k=3, hidden_size=2048, intermediate_size=512)
+    dtype = torch.bfloat16
+    skip_reason = should_skip_trtllm(moe_backend, QuantAlgo.W4A8_MXFP4_MXFP8, model)
+    if skip_reason:
+        pytest.skip(skip_reason)
+    torch.manual_seed(3)
+    bias = torch.randn(model.num_experts, dtype=torch.float32, device="cuda") * 0.1
+    routing_method = DeepSeekV4MoeRoutingMethod(
+        top_k=model.top_k,
+        n_group=1,
+        topk_group=1,
+        routed_scaling_factor=1.5,
+        callable_e_score_correction_bias=lambda: bias,
+        callable_tid2eid=lambda: None,
+        is_hashed=False,
+    )
+    x = torch.randn((seq_len, model.hidden_size), dtype=dtype, device="cuda")
+    router_logits = torch.randn((seq_len, model.num_experts), dtype=torch.float32, device="cuda")
+    quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+        QuantAlgo.W4A8_MXFP4_MXFP8, x, moe_backend
+    )
+    quant_kwargs.pop("ref_cls", None)
+    quantize_util = quantize_util_cls(
+        num_experts=model.num_experts,
+        dtype=dtype,
+        intermediate_size=model.intermediate_size,
+        hidden_size=model.hidden_size,
+        quant_config=quant_config,
+    )
+    model_cfg = _create_model_config(
+        num_experts=model.num_experts,
+        hidden_size=model.hidden_size,
+        intermediate_size=model.intermediate_size,
+        dtype=dtype,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, moe_tp_size=1, moe_ep_size=1),
+        quant_config=quant_config,
+        moe_backend=moe_backend.value,
+        max_num_tokens=256,
+    )
+    with create_moe(
+        routing_method=routing_method, reduce_results=False, model_config=model_cfg
+    ) as fused_moe:
+        fused_moe.create_weights()
+        fused_moe.load_weights([quantize_util.create_weights(**quant_kwargs)])
+        fused_moe.post_load_weights()
+        fused_moe.cuda()
+        backend = fused_moe.backend
+        fused_launch = backend._try_dsv4_draft_route_quant
+        taken = []
+
+        def spy(*args):
+            result = fused_launch(*args)
+            taken.append(result is not None)
+            return result
+
+        def forward():
+            return fused_moe.forward(
+                x, router_logits, all_rank_num_tokens=[seq_len], output_dtype=dtype
+            )
+
+        with torch.inference_mode():
+            monkeypatch.setattr(backend, "_try_dsv4_draft_route_quant", spy)
+            fused = forward()
+            monkeypatch.setattr(backend, "_try_dsv4_draft_route_quant", lambda *_: None)
+            separate = forward()
+    assert taken == [True]
+    torch.testing.assert_close(fused, separate, atol=0, rtol=0)
+
+
 # ============================================================================
 # MoE Multi-GPU Tests
 # ============================================================================
@@ -1762,6 +1941,17 @@ MULTI_GPU_TEST_PARAMS += _generate_focused_multi_gpu_test_params(
     quant_algo=QuantAlgo.NVFP4,
     parallel_modes=["DEP"] if IS_CI_MODE else ["DEP", "TEP"],
     comm_methods=["ALLGATHER"],
+)
+MULTI_GPU_TEST_PARAMS += generate_multi_gpu_test_params(
+    parallel_modes=["DEP"],
+    comm_methods=["ALLGATHER"],
+    swiglu_combos=[(1, 0, float("inf"))],
+    model_configs=[MoeModelConfig(8, 1, 512, 512)],
+    seq_lens=[8],
+    dtypes=[torch.bfloat16],
+    backend_types=[MoeBackendType.TRTLLM],
+    quant_algos=[QuantAlgo.W4A8_MXFP4_FP8],
+    routing_methods=[RenormalizeMoeRoutingMethod],
 )
 MULTI_GPU_TEST_PARAMS += _generate_focused_multi_gpu_test_params(
     backend_type=MoeBackendType.MEGAMOE_DEEPGEMM,
@@ -1802,7 +1992,6 @@ def test_configurable_moe_multi_gpu(
 ):
     swiglu_gptoss_style = swiglu_alpha != 1 or swiglu_beta != 0 or swiglu_limit != float("inf")
     backend_type = MoeBackendType(moe_backend)
-    skip_trtllm_bf16_on_sm103(backend_type, quant_algo, dtype)
     ci_skip = should_skip_to_accelerate_ci(
         backend_type=backend_type,
         quant_algo=quant_algo,
@@ -2035,10 +2224,13 @@ def _get_fused_moe_method_class(quant_algo, backend_type):
     backend_str = backend_type.value if hasattr(backend_type, "value") else str(backend_type)
 
     if quant_algo is None:
-        # Unquantized - only CUTLASS supports it
-        if backend_str == "CUTLASS":
-            return UnquantizedFusedMoEMethod
-        return None
+        # Unquantized: the CUTLASS method, or the TRTLLM-Gen BF16 method that
+        # keeps the experts in its shuffled BlockMajorK layout.
+        method_map = {
+            "CUTLASS": UnquantizedFusedMoEMethod,
+            "TRTLLM": BF16TRTLLMGenFusedMoEMethod,
+        }
+        return method_map.get(backend_str)
 
     # CUTLASS backend
     # What each CUTLASS leaf's _get_quant_method() returns, for the formats
@@ -2357,8 +2549,6 @@ def test_configurable_moe_multi_gpu_eplb(
     routing_method_cls,
     moe_multi_gpu_executor,
 ):
-    skip_trtllm_bf16_on_sm103(MoeBackendType(moe_backend), quant_algo, dtype)
-
     skip_if_insufficient_gpu_memory(
         model_config.num_experts,
         model_config.hidden_size,
