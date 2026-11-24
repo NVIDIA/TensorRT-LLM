@@ -40,6 +40,7 @@ from tensorrt_llm._torch.models.modeling_qwen3vl import (
 )
 from tensorrt_llm._torch.models.modeling_qwen3vl_moe import Qwen3MoeVLModel
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
+from tensorrt_llm._torch.pyexecutor.engine.multimodal import mm_item_scheduling_enabled
 from tensorrt_llm._torch.pyexecutor.model_loader import _validate_encoder_attention_backend_support
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.inputs.multimodal import (
@@ -375,6 +376,23 @@ class TestQwen3VL(TestModelingMultimodal):
                 hf_model_state_dict=self.hf_model.state_dict(),
                 disable_fuse_rope=True,
             )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("local_encoder", [False, True])
+def test_qwen3vl_cache_and_scheduler_require_local_encoder(local_encoder):
+    model = Qwen3VLModel.__new__(Qwen3VLModel)
+    torch.nn.Module.__init__(model)
+    model.mm_encoder = torch.nn.Identity() if local_encoder else None
+    model.model_config = ModelConfig(multimodal_config=MultimodalConfig())
+    args = SimpleNamespace(
+        disable_mm_encoder=False,
+        multimodal_config=model.model_config.multimodal_config,
+        pipeline_parallel_size=1,
+    )
+
+    assert mm_item_scheduling_enabled(args, model) == local_encoder
+    assert model.encoder_cache_active == local_encoder
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

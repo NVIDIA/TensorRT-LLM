@@ -31,6 +31,7 @@ from tensorrt_llm._torch.pyexecutor import resource_manager
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
 from tensorrt_llm.bindings import executor as executor_lib
 from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.llmapi.llm_args import MultimodalConfig
 from tensorrt_llm.models import modeling_utils
 
 _PATCH_SIZE = 14
@@ -171,7 +172,9 @@ def test_mistral_3_vlm_constructs_under_meta_init(mistral_small_3_1_24b_config):
     config_dict["vision_config"]["num_hidden_layers"] = 1
 
     mistral_3_config = transformers.Mistral3Config.from_dict(config_dict)
-    model_config = model_config_lib.ModelConfig(pretrained_config=mistral_3_config)
+    model_config = model_config_lib.ModelConfig(
+        pretrained_config=mistral_3_config, multimodal_config=MultimodalConfig()
+    )
 
     with MetaInitMode():
         model = modeling_mistral.Mistral3VLM(model_config)
@@ -180,6 +183,7 @@ def test_mistral_3_vlm_constructs_under_meta_init(mistral_small_3_1_24b_config):
     assert "_image_token_ids" not in model.state_dict()
     assert model._vision_tower is not None
     assert model._multi_modal_projector is not None
+    assert model.encoder_cache_active
 
 
 def test_mistral_3_vlm_disable_mm_encoder_skips_vision_modules(mistral_small_3_1_24b_config):
@@ -189,6 +193,7 @@ def test_mistral_3_vlm_disable_mm_encoder_skips_vision_modules(mistral_small_3_1
     model_config = model_config_lib.ModelConfig(
         pretrained_config=transformers.Mistral3Config.from_dict(config_dict),
         disable_mm_encoder=True,
+        multimodal_config=MultimodalConfig(),
     )
 
     with MetaInitMode():
@@ -196,6 +201,7 @@ def test_mistral_3_vlm_disable_mm_encoder_skips_vision_modules(mistral_small_3_1
 
     assert model._vision_tower is None
     assert model._multi_modal_projector is None
+    assert not model.encoder_cache_active
     assert not any(
         name.startswith(("_vision_tower", "_multi_modal_projector"))
         for name, _ in model.named_parameters()

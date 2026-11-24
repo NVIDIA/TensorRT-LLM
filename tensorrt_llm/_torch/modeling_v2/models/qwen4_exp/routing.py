@@ -8,6 +8,7 @@ On the GPUs in `archs.SERVED`, Qwen3.8-Flash-Next-NVFP4 lands on
 at dep8, each with one-model MTP-Eagle or no speculative
 decoding. The target's `check_deployment` then declines the checkpoints and engine choices it
 does not run, so `auto` falls back to the built-in implementation instead of failing in the build.
+The NVFP4 route returns a composite vision-language model.
 """
 
 from __future__ import annotations
@@ -100,7 +101,8 @@ def route(
         return ModelingV2Qwen38FlashNextFp8Sm10xDefault
     from .qwen3_8_flash_next_nvfp4__sm_10x__default.modeling import (
         ModelingV2Qwen38FlashNextNvfp4Sm10xDefault,
+        ModelingV2Qwen38FlashNextNvfp4Sm10xDefaultForConditionalGeneration,
     )
 
     ModelingV2Qwen38FlashNextNvfp4Sm10xDefault.check_deployment(model_config, llm_args, member)
-    return ModelingV2Qwen38FlashNextNvfp4Sm10xDefault
+    return ModelingV2Qwen38FlashNextNvfp4Sm10xDefaultForConditionalGeneration

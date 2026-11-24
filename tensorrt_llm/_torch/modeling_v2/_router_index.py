@@ -346,6 +346,28 @@ def _check_eplb_mode(target: type, config: "ModelConfig") -> None:
         )
 
 
+def _refuse_encoder_side_stream(config: "ModelConfig", target: type) -> None:
+    """Raise ``NoTarget`` when a ``MultimodalModelForCausalLM`` target would build its
+    tower and the engine runs the encoder on a side stream: the base runs its encoder inside
+    the step only. ``auto`` then uses the built-in implementation. An encoder-only deployment
+    (``mm_encoder_only``) builds the architecture's encoder model, not this one."""
+    from .multimodal import MultimodalModelForCausalLM
+
+    if (
+        not issubclass(target, MultimodalModelForCausalLM)
+        or config.disable_mm_encoder
+        or config.mm_encoder_only
+    ):
+        return
+    mm_config = config.multimodal_config
+    if mm_config is not None and mm_config.encoder_side_stream_max_ahead > 0:
+        raise NoTarget(
+            "multimodal_config.encoder_side_stream_max_ahead="
+            f"{mm_config.encoder_side_stream_max_ahead}; {target.__name__} does not run its "
+            "encoder on a side stream"
+        )
+
+
 def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Optional[type]:
     """Decide which modeling_v2 target, if any, this deployment builds.
 
@@ -377,6 +399,7 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
         if target is not None:
             _check_eplb_mode(target, config)
             _refuse_unhonored_moe_tactics(config, target, arch)
+            _refuse_encoder_side_stream(config, target)
     except NoTarget as why:
         if mode is ModelingV2Mode.REQUIRE:
             raise ValueError(f"modeling_v2='require', but no target fits {arch!r}: {why}") from None

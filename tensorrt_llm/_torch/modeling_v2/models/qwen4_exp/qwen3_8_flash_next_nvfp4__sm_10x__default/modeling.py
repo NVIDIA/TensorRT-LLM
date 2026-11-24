@@ -420,6 +420,10 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.ssm.gdn_decode_rows_ga
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.ssm.gdn_prefill_conv_post import (
     gdn_prefill_conv_post,
 )
+from tensorrt_llm._torch.modeling_v2.multimodal import (
+    MultimodalEncoderSpec,
+    MultimodalModelForCausalLM,
+)
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
 from tensorrt_llm._torch.modules.fla.cached_replay import CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
 from tensorrt_llm._torch.modules.fla.flashinfer_cached_replay import (
@@ -1041,8 +1045,8 @@ class _DraftBound(NamedTuple):
 class Qwen4ExpDefaultModelingV2(DecoderModel):
     def __init__(self, model_config: ModelConfig, composite_config: PretrainedConfig):
         """`composite_config` is passed in because the text sub-config adopted as
-        `model_config.pretrained_config` carries neither the vision half nor the media
-        token ids."""
+        `model_config.pretrained_config` carries no media token ids. The vision tower is
+        the vision-language model's, not the core's."""
         super().__init__(model_config)
         cfg = model_config.pretrained_config
         mapping = model_config.mapping
@@ -1237,10 +1241,7 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         # device-address view that owns none of those pages.
         self._ple_table_host = None
 
-        # ---- the vision half (the weight table declares the tower) ---------
-        vcfg = getattr(composite_config, "vision_config", None)
-        assert vcfg is not None, "the composite config carries no vision_config"
-        self.vision_config = vcfg
+        # ---- the media placeholder ids --------------------------------------
         self.image_token_id = int(composite_config.image_token_id)
         self.video_token_id = int(composite_config.video_token_id)
 
@@ -1920,15 +1921,16 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         inputs_embeds: torch.FloatTensor | None = None,
         lora_params: dict | None = None,
         spec_metadata=None,
-        vision: tuple | None = None,
+        mm_embeds: torch.Tensor | None = None,
+        mm_token_indices: torch.Tensor | None = None,
     ) -> None:
         """Check what holds for every step, bind the cache manager, choose the target and
         let the prefill target prepare the step.
 
         The shell calls it before `forward`, on every step: a breakable prefill CUDA graph
         captures `forward` and replays it without calling it, so whatever a step reads from
-        the host is read here. `vision` is `(rows, mm_token_indices)` when the step carries
-        media."""
+        the host is read here. Media steps carry `mm_embeds` and their positions in
+        `mm_token_indices`."""
         assert self._prefill is not None and self._decode is not None, (
             "load_weights must run before forward"
         )
@@ -1952,9 +1954,11 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
             self._bind_cache_manager(attn_metadata, position_ids)
         target = self._select_target(attn_metadata)
         if target is self._prefill:
-            target.prepare(attn_metadata, input_ids, position_ids, vision, spec_metadata)
+            target.prepare(
+                attn_metadata, input_ids, position_ids, mm_embeds, mm_token_indices, spec_metadata
+            )
         else:
-            assert vision is None, "a generation-only step carries vision rows"
+            assert mm_embeds is None, "a generation-only step carries multimodal embeddings"
         self._step_begun = True
 
     def forward(
@@ -3814,7 +3818,8 @@ class _PrefillStep(NamedTuple):
     gdn: tuple
     ple: tuple
     qsa: tuple
-    vision: tuple | None
+    mm_embeds: torch.Tensor | None
+    mm_token_indices: torch.Tensor | None
     # A verify step: the generation rows' side-cache writes are staged for the rollback.
     stage: bool = False
     # Over an NVFP4 pool, `_nvfp4_context_plan`'s row-tile plan or None.
@@ -4278,12 +4283,10 @@ class PrefillTarget:
         normed_out[num_tokens:].zero_()
 
     def _splice(self, h) -> None:
-        """Break: write the step's vision rows over their placeholder rows of the token
-        embedding `h` `[T, hidden]` in place, and zero rows `[n:]`."""
+        """Write multimodal embeddings at their prompt positions and zero the padding."""
         step = self._step
-        if step.vision is not None:
-            rows, mm_token_indices = step.vision
-            h.index_copy_(0, mm_token_indices, rows)
+        if step.mm_embeds is not None:
+            h.index_copy_(0, step.mm_token_indices, step.mm_embeds)
         h[step.num_tokens :].zero_()
 
     # -------------------------------------------------------------- forward ---
@@ -4293,7 +4296,8 @@ class PrefillTarget:
         attn_metadata: AttentionMetadata,
         input_ids: torch.IntTensor,
         position_ids: torch.IntTensor,
-        vision: tuple | None,
+        mm_embeds: torch.Tensor | None,
+        mm_token_indices: torch.Tensor | None,
         spec_metadata=None,
     ) -> None:
         """Everything this step reads from the host, kept for the forward's breaks as one
@@ -4449,7 +4453,8 @@ class PrefillTarget:
             gdn=gdn_state,
             ple=ple_state,
             qsa=qsa,
-            vision=vision,
+            mm_embeds=mm_embeds,
+            mm_token_indices=mm_token_indices,
             stage=is_verify,
             fp8_pages=fp8_pages,
             nvfp4_context=nvfp4_context,
@@ -4483,7 +4488,7 @@ class PrefillTarget:
         pos3 = _copy_positions(position_ids)
         pos = pos3[0]
 
-        # The token embedding (replicated) with this step's vision rows spliced in.
+        # The replicated token embeddings include this step's multimodal embeddings.
         h = nn.functional.embedding(input_ids, core.w["embed"])
         eager_on_graph(h, inner=self._splice)
         dt = h.dtype
@@ -7011,11 +7016,28 @@ class ModelingV2Qwen38FlashNextNvfp4Sm10xDefault(
                 "breakable CUDA graph"
             )
         mm_config = llm_args.multimodal_config
+        if (
+            mm_config is not None
+            and mm_config.encoder_cuda_graph
+            and not model_config.disable_mm_encoder
+            and not model_config.mm_encoder_only
+        ):
+            raise NoTarget(
+                "multimodal_config.encoder_cuda_graph: the vision tower has no encoder CUDA graph"
+            )
         if mm_config is not None and mm_config.encoder_attention_backend:
             raise NoTarget(
                 "multimodal_config.encoder_attention_backend="
                 f"{mm_config.encoder_attention_backend}; the target's vision tower runs its own "
                 "attention and does not apply it"
+            )
+        # The engine's encoder token budget, which startup profiling fills with dummy images.
+        encoder_budget = llm_args.encoder_max_num_tokens or llm_args.max_num_tokens
+        if not model_config.disable_mm_encoder and encoder_budget > _vision.VISION_CALL_MAX_PATCHES:
+            raise NoTarget(
+                f"an encoder token budget of {encoder_budget} (encoder_max_num_tokens, or "
+                "max_num_tokens when it is unset); one call of the target's vision tower takes "
+                f"at most {_vision.VISION_CALL_MAX_PATCHES} patches"
             )
         if spec is None:
             return
@@ -7096,29 +7118,15 @@ class ModelingV2Qwen38FlashNextNvfp4Sm10xDefault(
         # init).
         self._mm_token_ids_value = (self.model.image_token_id, self.model.video_token_id)
         self._mm_token_ids_cache: torch.Tensor | None = None
-        # Replicated on every rank; built once the weights are real (`post_load_weights`).
-        self.vision_tower: _vision.VisionTower | None = None
 
     @property
     def multimodal_token_ids(self) -> torch.Tensor:
-        """Placeholder ids whose rows vision embeddings replace. This checkpoint's
+        """Placeholder IDs for vision embeddings. This checkpoint's
         placeholders are in vocabulary, so the executor's out-of-vocabulary fallback would
         select nothing."""
         if self._mm_token_ids_cache is None:
             self._mm_token_ids_cache = torch.tensor(self._mm_token_ids_value, dtype=torch.int32)
         return self._mm_token_ids_cache
-
-    @property
-    def multimodal_data_device_paths(self) -> list[str]:
-        """Tensors under `multimodal_data` the executor moves to the device. Absent, it moves
-        everything, putting the `(t, h, w)` grids the tower reads on the host there too."""
-        return list(_vision.DEVICE_PATHS)
-
-    def validate_request(self, request) -> None:
-        """Admission check, run by the executor on every new request: a media request the
-        vision tower would assert on fails here as its own error (`vision.validate_request`);
-        a text request returns at once."""
-        _vision.validate_request(self.vision_tower, request)
 
     def forward(
         self,
@@ -7129,10 +7137,13 @@ class ModelingV2Qwen38FlashNextNvfp4Sm10xDefault(
         return_context_logits: bool = False,
         spec_metadata=None,
         lora_params: dict | None = None,
+        mm_embeds: torch.Tensor | None = None,
+        mm_token_indices: torch.Tensor | None = None,
         **kwargs,
     ):
         """One engine step: the core's `begin_step`, then the base forward with every
-        argument it was handed (`resource_manager` stays in `**kwargs`).
+        argument it was handed (`resource_manager` stays in `**kwargs`). Media steps receive
+        the multimodal embeddings and their placeholder positions from the composite.
 
         With a spec worker the shell owns the logits gather (one-model modes gather the rows
         the sampler verifies, `spec_metadata.gather_ids`) and hands the worker the trunk's
@@ -7145,7 +7156,8 @@ class ModelingV2Qwen38FlashNextNvfp4Sm10xDefault(
             inputs_embeds=inputs_embeds,
             lora_params=lora_params,
             spec_metadata=spec_metadata,
-            vision=_vision.multimodal_embeds(self.vision_tower, kwargs),
+            mm_embeds=mm_embeds,
+            mm_token_indices=mm_token_indices,
         )
         if self.spec_worker is None:
             assert spec_metadata is None, (
@@ -7219,8 +7231,6 @@ class ModelingV2Qwen38FlashNextNvfp4Sm10xDefault(
     def post_load_weights(self):
         super().post_load_weights()
         self.model.post_load_weights()
-        self.vision_tower = _vision.VisionTower(self.model.w, self.model.vision_config)
-        self.vision_tower.warm_up()
         if self.one_rank:
             self._build_heads(self.lm_head.weight.data)
 
@@ -7260,3 +7270,27 @@ class ModelingV2Qwen38FlashNextNvfp4Sm10xDefault(
                 f"{_FP8_GEMV_HEAD_ROWS} on nvfp4_gemv over lm_head {tuple(nv.data.shape)}",
                 flush=True,
             )
+
+
+class ModelingV2Qwen38FlashNextNvfp4Sm10xDefaultForConditionalGeneration(
+    MultimodalModelForCausalLM
+):
+    """The PLE layer hashes token IDs, so the language model keeps `input_ids` and
+    places vision embeddings at `mm_token_indices` during prefill."""
+
+    llm_class = ModelingV2Qwen38FlashNextNvfp4Sm10xDefault
+    # Replicated on every rank, at the activation dtype.
+    mm_encoders = {
+        "vision": MultimodalEncoderSpec(_vision.VisionTower, "model.visual.", ("image", "video"))
+    }
+    llm_requires_input_ids = True
+    supports_encoder_cache = True
+
+    # The decoder looks up its packed embedding weight directly and has no embed_tokens layer.
+    @property
+    def embedding_dim(self) -> int:
+        return self.config.hidden_size
+
+    @property
+    def embedding_dtype(self) -> torch.dtype:
+        return self.dtype

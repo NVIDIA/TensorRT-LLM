@@ -25,6 +25,7 @@ from tensorrt_llm.llmapi.llm_args import (
     MoeConfig,
     MTPDecodingConfig,
     MultimodalConfig,
+    MultimodalEncoderCudaGraphConfig,
     NGramDecodingConfig,
     TorchLlmArgs,
 )
@@ -38,7 +39,7 @@ _DUMMY_MODEL = "/tmp/dummy_model"
 _ARCH = "Qwen4ExpForConditionalGeneration"
 _TARGET = (
     "models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_10x__default.modeling."
-    "ModelingV2Qwen38FlashNextNvfp4Sm10xDefault"
+    "ModelingV2Qwen38FlashNextNvfp4Sm10xDefaultForConditionalGeneration"
 )
 
 # The four-rank layouts, as the LLM API's parallel arguments build them. tp4 leaves the
@@ -596,3 +597,11 @@ def test_the_gpus_the_family_serves_and_each_fast_path_runs_on():
     for name, capabilities in archs.FAST_PATHS.items():
         assert capabilities <= archs.SERVED, name
         assert archs.fast_path(name, archs.SM_107) is (name != "cute_dsl_moe"), name
+
+
+def test_encoder_cuda_graph_requires_a_supported_tower():
+    config = _model_config()
+    graph = {"vision": MultimodalEncoderCudaGraphConfig(max_batch_size=1)}
+    mm = MultimodalConfig(encoder_cuda_graph=graph)
+    _declined(config, match="encoder_cuda_graph", multimodal_config=mm)
+    _claimed(replace(config, disable_mm_encoder=True), multimodal_config=mm)

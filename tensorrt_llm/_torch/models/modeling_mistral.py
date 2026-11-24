@@ -982,6 +982,10 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
     supports_encoder_cache = True
     supports_mm_encoder_item_scheduling = True
 
+    @property
+    def _has_local_encoder(self) -> bool:
+        return self._vision_tower is not None
+
     def __init__(
         self,
         model_config: ModelConfig[Mistral3Config],

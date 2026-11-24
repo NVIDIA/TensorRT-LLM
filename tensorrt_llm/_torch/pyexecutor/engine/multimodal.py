@@ -174,6 +174,7 @@ def mm_item_scheduling_enabled(llm_args: TorchLlmArgs, model: nn.Module) -> bool
         not llm_args.disable_mm_encoder
         and isinstance(model, MultimodalModelMixin)
         and model.supports_mm_encoder_item_scheduling
+        and model._has_local_encoder
         and policy != MultimodalEncoderSchedulingPolicy.DISABLED
     )
     if (
@@ -289,10 +290,9 @@ def setup_mm_encoder_attn_metadata(
 def resolve_bytes_per_mm_encoder_embedding(model: MultimodalModelMixin) -> int:
     """Bytes occupied by one multimodal encoder output embedding.
 
-    Prefers the mixin's explicit ``embedding_dim``/``embedding_dtype`` contract, then the
-    text embedding layer's weight, then the pretrained config's hidden size with the
-    loaded weights' dtype -- both mixin properties are optional and most VLMs implement
-    neither.
+    The mixin defaults to the text embedding layer. Models can override the width and
+    dtype for packed encoder outputs. Fall back to the weight or config when a worker
+    cannot expose the embedding metadata.
     """
     embedding_dim = None
     try:
@@ -697,10 +697,18 @@ class MultimodalItemScheduler:
 
     def _embedding_dtype_and_width(self) -> tuple[torch.dtype, int]:
         """Return the dtype and row width of one MM encoder output."""
-        try:
-            expected_dtype = self.model.embedding_dtype
-        except (AttributeError, NotImplementedError):
+        model_cls = type(self.model)
+        if getattr(
+            model_cls, "embedding_dtype", None
+        ) is MultimodalModelMixin.embedding_dtype and not hasattr(model_cls, "mm_encoders"):
+            # Legacy encoders without an explicit output dtype use the outer model dtype.
+            # Their decoder's text embedding weights can have a different dtype.
             expected_dtype = self.model.model_config.torch_dtype
+        else:
+            try:
+                expected_dtype = self.model.embedding_dtype
+            except (AttributeError, NotImplementedError):
+                expected_dtype = self.model.model_config.torch_dtype
         return expected_dtype, self.bytes_per_embedding // expected_dtype.itemsize
 
     def build_multimodal_data_for_llm(
