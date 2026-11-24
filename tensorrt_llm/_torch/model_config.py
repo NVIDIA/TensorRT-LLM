@@ -428,6 +428,8 @@ class ModelConfig(Generic[TConfig]):
     megamoe_fuse_shared_expert: bool = False
     # If true, use low precision combine in MoE operations (only for NVFP4 quantization)
     use_low_precision_moe_combine: bool = False
+    # If true, the MoE all-to-all runs in its Wide-EP fault-tolerant mode
+    enable_wide_ep_fault_tolerance: bool = False
 
     # NVFP4 GEMM backend configuration - list of backends to consider for auto-selection
     nvfp4_gemm_allowed_backends: List[str] = field(

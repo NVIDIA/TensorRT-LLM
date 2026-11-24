@@ -147,7 +147,7 @@ The value must be one of the strategy names in the table above.
 - `fence`: fence only.
 - `sentinel`: same as `auto`, but logs a warning naming the reason when sentinel cannot be used.
 
-A step is carried by sentinel when its busiest rank sends at most `sentinel_max_tokens` tokens, it gathers no EPLB statistics, and its payload matches the layer's format (BF16, MXFP8 or NVFP4 rows). Sentinel is off for FP8 low-precision combine (`use_low_precision_moe_combine`), for communicators with the AlltoAll watchdog or EP-group health, for more than 64 EP ranks, and for the FP8 per-tensor, `W4A8_MXFP4_FP8` and `W4A8_NVFP4_FP8` activation formats.
+A step is carried by sentinel when its busiest rank sends at most `sentinel_max_tokens` tokens, it gathers no EPLB statistics, and its payload matches the layer's format (BF16, MXFP8 or NVFP4 rows). Sentinel is off for FP8 low-precision combine (`use_low_precision_moe_combine`), for layers with Wide-EP fault tolerance (`enable_wide_ep_fault_tolerance`), for more than 64 EP ranks, and for the FP8 per-tensor, `W4A8_MXFP4_FP8` and `W4A8_NVFP4_FP8` activation formats.
 
 The default `sentinel_max_tokens` is between 159 and 512 tokens per rank (capped at `max_num_tokens_per_rank`); `TRTLLM_NVLINK_ONE_SIDED_A2A_SENTINEL_MAX_TOKENS` overrides it. The sentinel landing rows are added to the workspace, `ep_size × sentinel_max_tokens` of them per rank: for hidden 7168, top-8 BF16 rows this is about 52 / 105 / 210 / 419 MiB per rank at EP 8 / 16 / 32 / 64. If a `TRTLLM_NVLINK_ONE_SIDED_A2A_WORKSPACE_MB` override cannot hold them, sentinel is turned off with a warning.
 
