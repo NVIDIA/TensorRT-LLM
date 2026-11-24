@@ -20098,7 +20098,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             scheduler=scheduler,
                             sparse_gather=sparse_gather,
                             stream_weights=stream_weights,
-                            fc2_stream_weights=stream_weights,
                         )
                         sf_vec_cx = self.sf_vec_size
                         tile_size_cx = self.tile_size
