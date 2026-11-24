@@ -58,7 +58,7 @@ from .request import GenerationRequest, LoRARequest
 from .result import (GenerationResult, LogProbsResult, ResponseWrapper,
                      compute_prompt_logprobs, get_metrics_dict,
                      prompt_logprobs_from_reduced, reduce_prompt_logprobs)
-from .sequence_limits import generation_capacity
+from .sequence_limits import generation_capacity, longest_helix_prompt_slice
 from .utils import (ErrorResponse, RequestError, bucket_responses_by_frontend,
                     context_length_exceeded_message, frontend_lane_index,
                     is_llm_response)
@@ -510,8 +510,11 @@ class BaseWorker(GenerationExecutor):
                             max_context_length=max_seq_len * cp_size,
                             num_prompt_tokens=prompt_len))
                 return 1
-            default_max_tokens = generation_capacity(prompt_len, max_seq_len,
-                                                     cp_size)
+            occupancy = prompt_len
+            if cp_size > 1 and self.engine.kv_cache_transceiver is not None:
+                occupancy = longest_helix_prompt_slice(
+                    prompt_len, cp_size, self.mapping.cp_config["tokens_per_block"])
+            default_max_tokens = generation_capacity(occupancy, max_seq_len)
 
             # default_max_tokens is the biggest available value
             if max_tokens is None:

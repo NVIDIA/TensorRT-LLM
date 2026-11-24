@@ -1272,6 +1272,11 @@ def test_merge_helix_children_retain_global_prompt(cp_rank):
     assert [req.request_id for req in requests] == [42, 43, 44]
     assert all(req.total_input_len_cp == len(prompt) for req in requests)
     assert all(req.prompt_len < len(prompt) for req in requests)
+    from tensorrt_llm.executor.sequence_limits import clamp_generation_request
+
+    for req in requests:
+        clamp_generation_request(req, 16, 2)
+        assert req.max_new_tokens == req.py_max_new_tokens == 8
 
 
 def test_merge_helix_requests_empty_ranks():

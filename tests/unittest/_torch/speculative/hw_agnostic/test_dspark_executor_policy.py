@@ -407,6 +407,21 @@ def _assert_policy_native_cleanup(executor, batch):
     assert all(request.py_verify_len is None for request in batch.generation_requests)
 
 
+def test_bounded_step_stages_confidence_once():
+    from unittest.mock import Mock
+
+    executor, batch, worker = _policy_executor()
+    executor._batch_draft_budget = lambda batch: 2
+    buffer = object()
+    worker.staged_confidence_buffer.return_value = buffer
+    worker.verify_planner.stage_confidence = Mock()
+    executor._handle_dynamic_draft_len(batch)
+    executor._handle_dynamic_draft_len(batch)
+    assert executor.runtime_draft_len == 2
+    worker.bump_draft_seq.assert_called_once_with()
+    worker.verify_planner.stage_confidence.assert_called_once_with(buffer)
+
+
 def test_unqueueable_policy_clears_ragged_state_without_rewriting_draft_buffers():
     executor, batch, worker = _policy_executor()
 

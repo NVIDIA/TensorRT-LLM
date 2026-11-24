@@ -6291,16 +6291,7 @@ class PyExecutor:
               and self.model_engine.is_spec_decode and self.max_total_draft_tokens > 0):
             self._reserve_one_model_draft_tokens()
 
-        held_ids = self._pending_speculative_tail_ids()
-        for request_id in held_ids:
-            self.inflight_req_ids.insert(request_id)
-        try:
-            scheduled_batch, scheduler_fitting_disagg_gen_init_requests, _ = self._schedule()
-        finally:
-            for request_id in held_ids:
-                self.inflight_req_ids.erase(request_id)
-        if held_ids:
-            scheduled_batch.paused_in_place_ids |= held_ids
+        scheduled_batch, scheduler_fitting_disagg_gen_init_requests, _ = self._schedule_with_pending_tail_hold()
         if getattr(self, "_check_helix_schedule", False):
             self._check_helix_schedule_consistency(scheduled_batch)
 
@@ -7581,6 +7572,20 @@ class PyExecutor:
                     self.disagg.pace_idle()
 
                 self.iter_counter += 1
+
+    def _schedule_with_pending_tail_hold(self):
+        """Hide pending tails from this scheduler pass and retain their drafter state."""
+        held_ids = self._pending_speculative_tail_ids()
+        for request_id in held_ids:
+            self.inflight_req_ids.insert(request_id)
+        try:
+            result = self._schedule()
+        finally:
+            for request_id in held_ids:
+                self.inflight_req_ids.erase(request_id)
+        if held_ids:
+            result[0].paused_in_place_ids |= held_ids
+        return result
 
     def _pending_speculative_tail_ids(self) -> frozenset[int]:
         """Wait for the pending sample if two overlapping bursts might not fit."""

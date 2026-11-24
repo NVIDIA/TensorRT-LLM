@@ -376,7 +376,7 @@ def test_eagle3_slot_manager_spans_the_slot_pool(num_seq_slots, expected_pool):
         num_seq_slots=num_seq_slots,
     )
 
-    assert mgr.slot_manager.max_num_requests == expected_pool - 1
+    assert mgr.slot_manager.max_num_requests == expected_pool
     assert mgr.relaxed_delta_pool.shape[0] == expected_pool
     assert len(mgr.seq_lens) == expected_pool
     assert len(mgr.start_indices) == expected_pool

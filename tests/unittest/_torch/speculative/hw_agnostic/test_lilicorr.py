@@ -171,6 +171,51 @@ def test_partial_acceptance_selects_normalized_target_row() -> None:
     assert not torch.allclose(actual, raw)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="DFlash prepares CUDA inputs")
+def test_worker_selects_lilicorr_anchor_at_shortened_width():
+    # Two requests each verify one proposal despite the four-row draft block.
+    captured = torch.arange(16, device="cuda", dtype=torch.float32).reshape(4, 4)
+    slots = torch.arange(2, device="cuda")
+    worker = DFlashWorker.__new__(DFlashWorker)
+    worker._resolved_mask_token_id = 1
+    worker._compute_block_size = 4
+    worker._paged_latent_prepare = worker._ctx_paged = False
+    worker._ctx_block_tables = worker._ctx_page_table = worker._ctx_kv_buf = None
+    worker._batch_to_slot_buffer = SimpleNamespace(tensor=slots)
+    worker._max_ctx = 8
+    worker._dummy_slot = 2
+    worker._ctx_len = torch.zeros(3, dtype=torch.long, device="cuda")
+    worker._ctx_k_buf = torch.zeros(3, 1, 8, 1, 4, device="cuda")
+    worker._ctx_v_buf = None
+    model = SimpleNamespace(
+        draft_model_full=SimpleNamespace(
+            model=SimpleNamespace(embed_tokens=nn.Embedding(4, 4).cuda())
+        ),
+        fc=nn.Identity(),
+        hidden_norm=nn.Identity(),
+        lilicorr=object(),
+        project_target_hidden=lambda x: x,
+        precompute_context_kv=lambda x, pos: (x[:, None, None, :].clone(), None),
+    )
+    lengths = torch.zeros_like(slots)
+    attn = SimpleNamespace(
+        num_contexts=0,
+        num_ctx_tokens=0,
+        num_seqs=2,
+        _seq_lens_cuda=lengths,
+        _seq_lens=lengths.cpu(),
+    )
+    spec = SimpleNamespace(
+        runtime_draft_len=1, hidden_size=4, get_hidden_states=lambda n: captured[:n]
+    )
+    tokens = torch.tensor([[1, 2], [2, 3]], device="cuda")
+    result = worker.prepare_1st_drafter_inputs(
+        tokens, slots, captured, tokens, slots + 1, attn, spec, model, total_target_tokens=4
+    )
+    torch.testing.assert_close(result["lilicorr_anchor"], captured[[0, 3]])
+    assert attn._seq_lens.tolist() == [2, 2]
+
+
 def test_worker_rejects_unsupported_layout_before_collectives() -> None:
     worker = DFlashWorker.__new__(DFlashWorker)
     worker.mapping = SimpleNamespace(tp_size=2, tp_rank=0, enable_attention_dp=False)

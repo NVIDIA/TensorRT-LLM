@@ -195,9 +195,34 @@ def test_fixed_verify_layout_fits_at_admission(
             )
 
 
-def test_pard_requires_room_for_mask_rows(request_factory):
-    req = request_factory(prompt_len=24, generated=3, max_tokens=100)
-    assert budget.request_draft_budget(req, 7, 32, 1, is_pard=True) == 2
+@pytest.mark.parametrize("room,k", [(1, 0), (2, 1), (3, 1), (4, 2)])
+def test_pard_requires_room_for_mask_rows(request_factory, room, k):
+    req = request_factory(prompt_len=24, generated=8 - room, max_tokens=16)
+    assert budget.request_draft_budget(req, 7, 32, 1, is_pard=True) == k
+    budget.resize_draft_tokens(req, k, is_pard=True, rejection_on=False)
+    assert len(req.py_draft_tokens) == max(0, 2 * k - 1)
+
+
+def test_partitioned_prompt_capacity_matches_busiest_rank():
+    for cp_size in (2, 3):
+        for prompt_len in range(1, 32):
+            rank_lengths = [0] * cp_size
+            for position in range(prompt_len):
+                rank_lengths[position // 4 % cp_size] += 1
+            assert admission.longest_helix_prompt_slice(prompt_len, cp_size, 4) == max(rank_lengths)
+
+
+@pytest.mark.parametrize("local_prompt,capacity_prompt,expected", [(28, 28, 4), (12, 16, 16)])
+def test_helix_admission_and_verify_share_rank_occupancy(
+    request_factory, local_prompt, capacity_prompt, expected
+):
+    req = request_factory(local_prompt, 2, 64)
+    req.total_input_len_cp = 28
+    req.prompt_len = local_prompt
+    req.py_cp_prompt_skew = capacity_prompt - local_prompt
+    admission.clamp_generation_request(req, 32, 2)
+    assert req.max_new_tokens == expected
+    assert budget.remaining_sequence_tokens(req, 32, 2) == expected - 2
 
 
 @pytest.mark.parametrize("mapped_ids", [[3, 1], [3, 0], [0, 3]])

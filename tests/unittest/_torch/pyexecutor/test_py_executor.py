@@ -4888,7 +4888,8 @@ class TestOneModelMTPDraftTokenScheduling:
         ex._revert_context_chunks.assert_called_once_with([ctx])
         assert ex._revert_unexecuted_alloc.call_args.args[0].generation_requests == [continuing]
 
-    def test_overlap_waits_only_when_pending_burst_can_exhaust_context(self):
+    @pytest.mark.parametrize("disabled,pending", [(True, 3), (False, 0)])
+    def test_overlap_waits_only_when_pending_burst_can_exhaust_context(self, disabled, pending):
         gen = self._make_llm_request(1, LlmRequestState.GENERATION_IN_PROGRESS)
         gen.max_new_tokens = gen.py_max_new_tokens = 1
         ex = self._make_one_model_mtp_executor([gen])
@@ -4901,9 +4902,41 @@ class TestOneModelMTPDraftTokenScheduling:
         assert not ex._pending_speculative_tail_ids()
         ex.max_seq_len -= 1
         assert ex._pending_speculative_tail_ids() == {gen.request_id}
-        ex.speculation_permanently_disabled = True
-        state.runtime_draft_len = 0
+        ex.speculation_permanently_disabled = disabled
+        state.runtime_draft_len = pending
         assert not ex._pending_speculative_tail_ids()
+
+    def test_held_tail_reenters_next_scheduler_pass(self):
+        gen = self._make_llm_request(1, LlmRequestState.GENERATION_IN_PROGRESS)
+        ex = self._make_one_model_mtp_executor([gen])
+        ex.max_draft_len = 3
+        ex.max_seq_len = gen.get_num_tokens(0) + 3
+        ex.dist = types.SimpleNamespace(cp_size=1)
+        ex.previous_batch = types.SimpleNamespace(
+            sample_state=types.SimpleNamespace(requests=[gen], runtime_draft_len=2)
+        )
+
+        class Inflight(set):
+            insert = set.add
+            erase = set.remove
+
+        ex.inflight_req_ids = Inflight()
+
+        def schedule():
+            batch = ScheduledRequests()
+            batch.generation_requests = [
+                r for r in ex.active_requests if r.request_id not in ex.inflight_req_ids
+            ]
+            return batch, [], 0
+
+        ex._schedule = schedule
+        held, _, _ = ex._schedule_with_pending_tail_hold()
+        assert held.generation_requests == []
+        assert held.paused_in_place_ids == {gen.request_id}
+        assert not ex.inflight_req_ids
+        ex.previous_batch = None
+        resumed, _, _ = ex._schedule_with_pending_tail_hold()
+        assert resumed.generation_requests == [gen]
 
     def test_separate_drafter_reserves_reenabled_batch_width(self):
         gen = self._make_llm_request(1, LlmRequestState.GENERATION_IN_PROGRESS)

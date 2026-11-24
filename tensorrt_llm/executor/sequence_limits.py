@@ -37,11 +37,17 @@ def context_length_exceeded_message(max_context_length: int, num_prompt_tokens: 
     )
 
 
-def generation_capacity(prompt_len: int, max_seq_len: int, cp_size: int = 1) -> int:
+def longest_helix_prompt_slice(prompt_len: int, cp_size: int, tokens_per_block: int) -> int:
+    """Return rank zero's occupancy under round-robin block partitioning."""
+    rounds, tail = divmod(prompt_len, cp_size * tokens_per_block)
+    return rounds * tokens_per_block + min(tail, tokens_per_block)
+
+
+def generation_capacity(prompt_len: int, max_seq_len: int) -> int:
     """Return output capacity under the per-CP-rank limit, raising when no output fits."""
-    capacity = max_seq_len - prompt_len // cp_size
+    capacity = max_seq_len - prompt_len
     if capacity <= 0:
-        raise ValueError(context_length_exceeded_message(max_seq_len * cp_size, prompt_len))
+        raise ValueError(context_length_exceeded_message(max_seq_len, prompt_len))
     return capacity
 
 
@@ -50,9 +56,12 @@ def clamp_generation_request(
 ) -> None:
     """Apply the same limit to the native scheduler and the Python sampler."""
     prompt_len = request.total_input_len_cp
-    capacity = generation_capacity(prompt_len, max_seq_len, cp_size) - draft_reserve
+    # Aggregated Helix replicates the prompt. Sliced Helix records the
+    # longest rank slice at partition time, including partial block rounds.
+    occupancy = request.prompt_len + request.py_cp_prompt_skew if cp_size > 1 else prompt_len
+    capacity = generation_capacity(occupancy, max_seq_len) - draft_reserve
     if capacity <= 0:
-        message = context_length_exceeded_message(max_seq_len * cp_size, prompt_len)
+        message = context_length_exceeded_message(max_seq_len, occupancy)
         raise ValueError(
             f"{message} Speculative verification reserves {draft_reserve} "
             "additional positions per context-parallel rank."

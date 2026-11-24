@@ -1143,6 +1143,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_use_chunked_generation_logits = use_chunked_generation_logits
         self.py_logits_chunk_size = logits_chunk_size if not self.streaming else 1
 
+        self.py_cp_prompt_skew = 0
         self._initialize_execution_state(seq_slot=seq_slot,
                                          orig_prompt_len=self.orig_prompt_len)
 

@@ -59,11 +59,10 @@ def fixed_draft_reserve(
 
 
 def remaining_sequence_tokens(request: LlmRequest, max_seq_len: int, cp_size: int = 1) -> int:
-    """Count free sequence positions using the unsliced prompt for Helix CP."""
+    """Count full prompt occupancy, or the longest rank slice for partitioned Helix."""
     current = request.get_num_tokens(0)
     if cp_size > 1:
-        generated = current - request.py_orig_prompt_len
-        current = request.total_input_len_cp // cp_size + generated
+        current += request.py_cp_prompt_skew
     return max_seq_len - current
 
 
