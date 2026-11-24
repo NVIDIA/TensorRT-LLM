@@ -1152,13 +1152,11 @@ def test_mrope_storage_is_retained_for_generation_and_released_at_termination() 
     request.py_mrope_position_delta = delta
     del delta
 
-    executor = object.__new__(PyExecutor)
-    executor._free_request_resources = Mock()
-    executor.gather_all_responses = False
-    executor.dist = SimpleNamespace(rank=0)
-    executor._response_channel = ResponseChannel()
+    executor = make_partial_executor(
+        _free_request_resources=Mock(),
+        previous_batch=SimpleNamespace(requests=[request]),
+    )
     executor._response_channel.register([request.py_request_id], Mock())
-    executor.previous_batch = SimpleNamespace(requests=[request])
 
     executor._release_multimodal_resources(request)
     assert tensor_ref() is request.py_mrope_position_delta
