@@ -34,7 +34,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_man
     MambaHybridCacheManagerV2,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.regions import RegionProvider
-from tensorrt_llm._utils import get_sm_version, is_blackwell_datacenter, prefer_pinned
+from tensorrt_llm._utils import get_sm_version, prefer_pinned
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, DataRole
@@ -650,8 +650,8 @@ def _exact_replay_disabled_reason(
 ) -> str | None:
     """Why the deterministic mode keeps the default Mamba2 kernels, or None."""
     sm = get_sm_version()
-    if not is_blackwell_datacenter(sm):
-        return f"it is implemented for SM100 and SM103 only (this GPU is SM{sm})"
+    if sm != 100:
+        return f"it is validated on SM100 only (this GPU is SM{sm})"
     if spec_config is not None:
         return "speculative decoding is enabled"
     if is_disagg:

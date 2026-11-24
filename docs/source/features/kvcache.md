@@ -336,7 +336,7 @@ the same bits in prefill, chunked prefill and decode.
 It takes effect when all of these hold; otherwise the manager logs the reason
 once and keeps the default kernels:
 
-- an SM100 or SM103 GPU and a bfloat16 Nemotron-H model;
+- an SM100 GPU and a bfloat16 Nemotron-H model;
 - `kv_cache_config.mamba_ssm_cache_dtype: float32`;
 - the Python V2 hybrid cache manager (`NemotronHybridCacheManager`);
 - no speculative decoding and no disaggregated serving.

@@ -857,10 +857,10 @@ def test_the_factory_passes_the_chunk_size_to_the_nemotron_manager_only(monkeypa
     "override, sm, reason",
     [
         ({}, 100, None),
-        ({}, 103, None),
-        ({}, 90, "SM100 and SM103 only (this GPU is SM90)"),
+        ({}, 103, "SM100 only (this GPU is SM103)"),
+        ({}, 90, "SM100 only (this GPU is SM90)"),
         # The hardware is reported first: a float32 state cannot help on SM90.
-        ({"ssm_cache_dtype": torch.bfloat16}, 90, "SM100 and SM103"),
+        ({"ssm_cache_dtype": torch.bfloat16}, 90, "SM100 only"),
         ({"spec_config": object()}, 100, "speculative decoding"),
         ({"is_disagg": True}, 100, "disaggregated serving"),
         ({"model_dtype": torch.float16}, 100, "model dtype"),
