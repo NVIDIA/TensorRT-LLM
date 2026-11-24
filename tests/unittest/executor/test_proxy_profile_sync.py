@@ -614,7 +614,7 @@ def test_profile_close_settles_running_and_queued_calls_with_private_peer(
     monkeypatch.setattr(executor, "submit", record_submit)
 
     def worker():
-        peer = IpcQueue(proxy.request_queue.address, is_server=False)
+        peer = IpcQueue(proxy.request_queue.address, is_server=False, recv_timeout=2.0)
         ack = None
         try:
             incoming = _incoming_requests(peer)
@@ -664,13 +664,15 @@ def test_profile_close_settles_running_and_queued_calls_with_private_peer(
             assert proxy._profile_control_executor is None
     finally:
         allow_ack.set()
-        peer_thread.join(timeout=3.0)
-        assert not peer_thread.is_alive()
-        proxy._close_profile_control()
-        proxy._close_request_sender()
-        if proxy.profile_ack_queue is not None:
-            proxy.profile_ack_queue.close()
-        proxy.request_queue.close()
+        try:
+            peer_thread.join(timeout=3.0)
+            assert not peer_thread.is_alive()
+        finally:
+            proxy._close_profile_control()
+            proxy._close_request_sender()
+            if proxy.profile_ack_queue is not None:
+                proxy.profile_ack_queue.close()
+            proxy.request_queue.close()
     assert not worker_errors
 
 
