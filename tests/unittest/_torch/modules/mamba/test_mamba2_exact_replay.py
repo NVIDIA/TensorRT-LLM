@@ -694,6 +694,25 @@ def _assert_same_state(actual, expected):
         torch.testing.assert_close(actual[name], expected[name], rtol=0, atol=0)
 
 
+def _take_state_slot(manager, slot, others):
+    """Create caches until one of them holds ``slot``, which moves the suspended
+    owner's state page to the host tier; keep that one and close the rest."""
+    holder = None
+    for _ in range(manager._state_layout.slot_capacity + 1):
+        cache = manager.impl.create_kv_cache()
+        assert cache.resume(manager._stream.cuda_stream)
+        others.append(cache)
+        assert cache.resize(1)
+        if cache.get_ssm_block_base_index(manager.ssm_layer_group_id) == slot:
+            holder = cache
+            break
+    assert holder is not None, "no cache took the suspended request's state slot"
+    for cache in others:
+        if cache is not holder:
+            cache.close()
+    others[:] = [holder]
+
+
 def test_manager_keeps_the_replay_buffers_in_the_recurrent_state_slot(monkeypatch):
     manager = _build_manager(monkeypatch)
     try:
@@ -945,6 +964,61 @@ def test_snapshot_reuse_and_suspension_carry_the_replay_state(monkeypatch):
             _slot_state(manager, sibling, total + 1), _slot_state(manager, reference, total + 1)
         )
     finally:
+        manager.shutdown()
+
+
+def test_a_request_that_resumes_in_another_slot_keeps_its_replay_state(monkeypatch):
+    """Without block reuse, as under FORCE_DETERMINISTIC: a request suspended in
+    the middle of a chunk loses its slot to another cache, resumes in a different
+    slot and continues with the bits of a request that never moved."""
+    torch.manual_seed(41)
+    manager = _build_manager(
+        monkeypatch,
+        # max_util_for_resume=1.0 lets new caches resume until the state pool
+        # is full; the suspended request's page then moves to the host tier.
+        kv_cache_config=KvCacheConfig(
+            max_tokens=4096, enable_block_reuse=False, max_util_for_resume=1.0
+        ),
+    )
+    layer = _make_layer()
+    metadata = manager.mamba_metadata_cls(max_batch_size=4, chunk_size=CHUNK)
+    # The request is suspended with a boundary state (128 tokens) and a partial
+    # chunk (32 tokens); the rest of its prompt crosses the next boundary.
+    head, tail = CHUNK + 32, CHUNK
+    inputs = _randn(head + tail, WIDTH)
+    others = []
+    try:
+        # Without a tier below the GPU a suspended page keeps its slot.
+        assert manager.has_cache_tier_below_gpu
+        reference = _request(1, list(range(1, head + tail + 1)))
+        assert manager.prepare_context(reference)
+        expected = _context_chunk(manager, layer, metadata, reference, inputs)
+        expected_state = _slot_state(manager, reference, head + tail)
+        manager.free_resources(reference)
+
+        request = _request(2, list(range(1000, 1000 + head + tail)))
+        assert manager.prepare_context(request)
+        outputs = [_context_chunk(manager, layer, metadata, request, inputs[:head])]
+        before = _slot_state(manager, request, head)
+        slot = manager.get_state_indices([2], [False])[0]
+
+        manager.suspend_request(request)
+        _take_state_slot(manager, slot, others)
+        # What the new owner of the slot writes there.
+        cache = manager.mamba_layer_cache(0)
+        for name in ("conv", "temporal", "replay_x", "replay_dt", "replay_B"):
+            getattr(cache, name)[slot].fill_(float("nan"))
+        assert manager.resume_request(request)
+        manager._setup_state_indices([request], num_contexts=0)
+        assert manager.get_state_indices([2], [False])[0] != slot
+        _assert_same_state(_slot_state(manager, request, head), before)
+
+        outputs.append(_context_chunk(manager, layer, metadata, request, inputs[head:]))
+        torch.testing.assert_close(torch.cat(outputs), expected, rtol=0, atol=0)
+        _assert_same_state(_slot_state(manager, request, head + tail), expected_state)
+    finally:
+        for cache in others:
+            cache.close()
         manager.shutdown()
 
 
