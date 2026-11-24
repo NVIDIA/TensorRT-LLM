@@ -122,6 +122,15 @@ class LinearDraftMetadata(DraftMetadata):
                 buffer_name_prefix="draft_",
             ),
         )
+        # The target and the draft layers never run at the same time, so the
+        # draft set runs its attention kernels in the target's workspace.
+        core = self.get_metadata(TrtllmCoreMetadata)
+        self.draft.workspace = core.workspace
+        self.draft.cuda_graph_workspace = core.cuda_graph_workspace
+
+    def init_cuda_graph_metadata(self, graph_metadata: "LinearDraftMetadata") -> None:
+        graph_metadata.draft.workspace = self.draft.workspace
+        graph_metadata.draft.cuda_graph_workspace = self.draft.cuda_graph_workspace
 
 
 class SharedKVCacheLinearDraftMetadata(DraftMetadata):
@@ -148,6 +157,15 @@ class SharedKVCacheLinearDraftMetadata(DraftMetadata):
             self,
             dataclasses.replace(config, draft_kv_cache_manager=None, buffer_name_prefix="draft_"),
         )
+        # The target and the draft layers never run at the same time, so the
+        # draft set runs its attention kernels in the target's workspace.
+        core = self.get_metadata(TrtllmCoreMetadata)
+        self.draft.workspace = core.workspace
+        self.draft.cuda_graph_workspace = core.cuda_graph_workspace
+
+    def init_cuda_graph_metadata(self, graph_metadata: "SharedKVCacheLinearDraftMetadata") -> None:
+        graph_metadata.draft.workspace = self.draft.workspace
+        graph_metadata.draft.cuda_graph_workspace = self.draft.cuda_graph_workspace
 
 
 class DenseLinearDraftMetadata(DraftMetadata):
@@ -176,6 +194,15 @@ class DenseLinearDraftMetadata(DraftMetadata):
                 buffer_name_prefix="draft_",
             ),
         )
+        # The target and the draft layers never run at the same time, so the
+        # draft set runs its attention kernels in the target's workspace.
+        core = self.get_metadata(TrtllmCoreMetadata)
+        self.draft.workspace = core.workspace
+        self.draft.cuda_graph_workspace = core.cuda_graph_workspace
+
+    def init_cuda_graph_metadata(self, graph_metadata: "DenseLinearDraftMetadata") -> None:
+        graph_metadata.draft.workspace = self.draft.workspace
+        graph_metadata.draft.cuda_graph_workspace = self.draft.cuda_graph_workspace
 
 
 class SharedKVCacheDenseLinearDraftMetadata(DraftMetadata):
@@ -207,6 +234,17 @@ class SharedKVCacheDenseLinearDraftMetadata(DraftMetadata):
                 buffer_name_prefix="draft_",
             ),
         )
+        # The target and the draft layers never run at the same time, so the
+        # draft set runs its attention kernels in the target's workspace.
+        core = self.get_metadata(TrtllmCoreMetadata)
+        self.draft.workspace = core.workspace
+        self.draft.cuda_graph_workspace = core.cuda_graph_workspace
+
+    def init_cuda_graph_metadata(
+        self, graph_metadata: "SharedKVCacheDenseLinearDraftMetadata"
+    ) -> None:
+        graph_metadata.draft.workspace = self.draft.workspace
+        graph_metadata.draft.cuda_graph_workspace = self.draft.cuda_graph_workspace
 
 
 class LinearDraftLengthsMetadata(DraftMetadata):
