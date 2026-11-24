@@ -370,17 +370,37 @@ def test_a_worker_that_cannot_start_leaves_no_descriptor_open(
     assert len(starts) == 1 and pool._workers_started == 0
 
 
+@pytest.mark.parametrize(
+    "value,seconds",
+    [
+        (None, 900.0),
+        ("0", None),
+        ("2.5", 2.5),
+        ("1e30", threading.TIMEOUT_MAX),
+        # Neither 0 nor a positive, finite number of seconds: the default limit stands.
+        ("-1", 900.0),
+        ("nan", 900.0),
+        ("inf", 900.0),
+        ("soon", 900.0),
+    ],
+)
+def test_only_zero_lets_a_worker_take_any_time_to_reply(
+    monkeypatch: pytest.MonkeyPatch, value: str | None, seconds: float | None
+) -> None:
+    if value is None:
+        monkeypatch.delenv("TLLM_KERNEL_BUILDER_BUILD_TIMEOUT_S", raising=False)
+    else:
+        monkeypatch.setenv("TLLM_KERNEL_BUILDER_BUILD_TIMEOUT_S", value)
+    assert build_pool._reply_timeout() == seconds
+
+
 def test_a_worker_that_stops_replying_is_stopped_and_its_build_fails(
     pool: BuildPool, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """A worker that does not reply within TLLM_KERNEL_BUILDER_BUILD_TIMEOUT_S seconds, stuck in
     a build here, is stopped and its build fails, so the pass goes on; another worker takes the
     next build."""
-    monkeypatch.setenv("TLLM_KERNEL_BUILDER_BUILD_TIMEOUT_S", "0")
-    assert build_pool._reply_timeout() is None
-    monkeypatch.setenv("TLLM_KERNEL_BUILDER_BUILD_TIMEOUT_S", "2.5")
-    assert build_pool._reply_timeout() == 2.5
-    monkeypatch.delenv("TLLM_KERNEL_BUILDER_BUILD_TIMEOUT_S")
+    monkeypatch.delenv("TLLM_KERNEL_BUILDER_BUILD_TIMEOUT_S", raising=False)
     with pool.pass_scope():
         # A first build with the default limit, which leaves room for the worker's imports.
         [first] = pool.build([_record(tmp_path / "a", 1)])

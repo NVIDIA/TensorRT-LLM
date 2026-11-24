@@ -37,6 +37,7 @@ import functools
 import hashlib
 import importlib
 import inspect
+import math
 import os
 import pickle  # nosec B403 - messages between this process and its own workers
 import queue
@@ -953,12 +954,28 @@ class _Pool:
 
 
 def _reply_timeout() -> Optional[float]:
-    """``TLLM_KERNEL_BUILDER_BUILD_TIMEOUT_S``, or None to wait without a limit."""
+    """``TLLM_KERNEL_BUILDER_BUILD_TIMEOUT_S`` in seconds, or None for exactly 0, which waits
+    without a limit. Any other value that is not a positive, finite number of seconds keeps the
+    default, with a warning: a stalled worker would otherwise hold up the warmup for good."""
+    value = os.environ.get(_REPLY_TIMEOUT_ENV)
+    if value is None:
+        return _DEFAULT_REPLY_TIMEOUT_S
     try:
-        seconds = float(os.environ.get(_REPLY_TIMEOUT_ENV, _DEFAULT_REPLY_TIMEOUT_S))
+        seconds = float(value)
     except ValueError:
-        seconds = _DEFAULT_REPLY_TIMEOUT_S
-    return seconds if seconds > 0 else None
+        seconds = math.nan
+    if seconds == 0:
+        return None
+    if not (math.isfinite(seconds) and seconds > 0):
+        logger.warning_once(
+            f"[BuildPool] {_REPLY_TIMEOUT_ENV}={value!r} is neither 0 (no limit) nor a positive "
+            f"number of seconds: a worker that does not reply to a build is stopped after "
+            f"{_DEFAULT_REPLY_TIMEOUT_S:g}s",
+            key=("build_pool", "reply_timeout", value),
+        )
+        return _DEFAULT_REPLY_TIMEOUT_S
+    # A timer thread cannot wait longer.
+    return min(seconds, threading.TIMEOUT_MAX)
 
 
 def _abandon_claim(claim: Optional[Claim], process: subprocess.Popen, reason: str) -> None:
