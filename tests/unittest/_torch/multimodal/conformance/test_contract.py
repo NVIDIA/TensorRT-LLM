@@ -42,7 +42,7 @@ _FIELDS = {"base", "fixture"} | {f for f, (tier, _) in FEATURE_TIERS.items() if 
 # entries lowers these; the snapshot never grows.
 _SNAPSHOT_SIZES = {
     "SNAPSHOT_KEYS": 56,
-    "KNOWN_OPT_OUTS": 224,
+    "KNOWN_OPT_OUTS": 223,
     "NOT_ON_BASE": 36,
     "MISSING_FIXTURE": 34,
 }

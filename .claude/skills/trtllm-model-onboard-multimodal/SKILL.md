@@ -277,6 +277,8 @@ Use expected performance gain and implementation effort to choose a feature's ti
 
 Engine settings select which eligible features run. CI checks class declarations, processor hooks and recorded exceptions. The shared V2 base and central admission rule follow #22450. CPU tests track text-only targets that currently admit unsupported payloads. Existing models can support decoder compilation or tower sharding before adopting the protocol marker. Both decoder graph requirements are deferred under #21333. Retire a media replay or piecewise gap when the target and backend pass the corresponding behavior check. Encoder DP follows #17330. Tiny model fixtures are a separate follow-up. Explicit P0 opt-outs still need approval. Check media replay, chunk boundaries and KV reuse with model inputs on GPU.
 
+For V2 targets that delegate media handling, see the [forward pattern recognized by CI and the `supports_multimodal` declaration](../../../docs/source/torch/adding_new_model.md#multimodal-models).
+
 <!-- BEGIN multimodal-feature-tiers -->
 | Feature | Tier | What the model must provide |
 | --- | --- | --- |

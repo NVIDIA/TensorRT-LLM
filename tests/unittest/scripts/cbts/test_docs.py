@@ -1021,6 +1021,29 @@ def test_cpu_test_inputs_select_the_tests_that_read_them(registered: bool) -> No
         }, path
 
 
+def test_removed_b300_fixture_selects_multimodal_conformance(tmp_path: Path) -> None:
+    path = "tests/integration/test_lists/test-db/l0_b300.yml"
+    test_db = (tmp_path / path).parent
+    test_db.mkdir(parents=True)
+    (tmp_path / path).write_text("l0_b300:\n- tests:\n  - unittest/other\n")
+    suite = "unittest/_torch/multimodal/conformance"
+    (test_db / "l0_cpu.yml").write_text(f"l0_cpu:\n- tests: [{suite}, unittest/other]\n")
+    removed = (
+        "unittest/_torch/modeling_v2/models/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_10x__default"
+    )
+    diff = f"@@ -3,2 +3 @@\n   - unittest/other\n-  - {removed} TIMEOUT (30)\n"
+    index = YAMLIndex.load(test_db)
+    cpu = Stage("CPU-Generic-x86-1", "l0_cpu", "x86_64", 1, 1)
+    stages = {cpu.name: cpu}
+    result = Selector(stages).run(
+        PRInputs(changed_files=[path], diffs={path: diff}),
+        cbts_main.build_rules(index, stages, repo_root=tmp_path),
+    )
+    assert result.scope == "testsonly"
+    assert result.affected_stages == {cpu.name}
+    assert result.block_filters == {("l0_cpu", 0): {suite: {suite}}}
+
+
 def test_reviewed_noop_does_not_suppress_mixed_docs_validation(tmp_path: Path) -> None:
     input_path = tmp_path / "input.json"
     input_path.write_text(

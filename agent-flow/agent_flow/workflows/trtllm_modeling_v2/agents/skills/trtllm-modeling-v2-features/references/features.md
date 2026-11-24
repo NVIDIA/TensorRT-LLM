@@ -392,6 +392,8 @@ In #22450 a media-serving V2 target inherits `MultimodalModelForCausalLM`. Set `
 
 The central V2 rule in #22450 requires a local encoder for raw media. Precomputed embeddings require a multimodal V2 target on a split encoder/prefill deployment. Position-only M-RoPE requests pass. V1 models keep their own validators. CPU tests track text-only targets that admit unsupported payloads on the standalone head and check the central rule on #22450. Retire graph gaps when the selected route accepts the backend and the model stages media for breakable replay or compiles only the decoder for piecewise prefill.
 
+If the target delegates media handling, follow the [forward pattern recognized by CI or declare `supports_multimodal`](../../../../../../../../docs/source/torch/adding_new_model.md#multimodal-models).
+
 V2 uses the same tiers, based on performance gain and implementation effort. P0 is required for every new model. Skipping a P0 feature needs an owner-approved entry in `APPROVED_EXCEPTIONS`. P1 is the next follow-up. Record a reason and tracking ID in `multimodal_opt_outs` for each P1 feature the model skips. P2 is optional. See the [multimodal onboarding tiers](../../../../../../../../.claude/skills/trtllm-model-onboard-multimodal/SKILL.md#multimodal-feature-tiers).
 
 <!-- BEGIN multimodal-feature-tiers -->

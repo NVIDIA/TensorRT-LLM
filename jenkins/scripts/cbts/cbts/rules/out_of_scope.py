@@ -132,14 +132,14 @@ OUT_OF_SCOPE_PREFIXES: tuple[str, ...] = (
 _V2_FEATURES = (
     "agent-flow/agent_flow/workflows/trtllm_modeling_v2/agents/skills/trtllm-modeling-v2-features"
 )
-_TIER_TEST = "unittest/_torch/multimodal/conformance/test_skill_tiers.py"
+_CONFORMANCE = "unittest/_torch/multimodal/conformance"
+_TIER_TEST = f"{_CONFORMANCE}/test_skill_tiers.py"
 CPU_TEST_INPUTS: dict[str, str] = {
     ".claude/skills/trtllm-model-onboard-multimodal/SKILL.md": _TIER_TEST,
     f"{_V2_FEATURES}/SKILL.md": _TIER_TEST,
     f"{_V2_FEATURES}/references/features.md": _TIER_TEST,
-    "jenkins/scripts/cbts/cbts/rules/modeling_v2_source.py": (
-        "unittest/_torch/multimodal/conformance"
-    ),
+    "jenkins/scripts/cbts/cbts/rules/modeling_v2_source.py": _CONFORMANCE,
+    "tests/integration/test_lists/test-db/l0_b300.yml": _CONFORMANCE,
 }
 
 # Excluded on purpose:

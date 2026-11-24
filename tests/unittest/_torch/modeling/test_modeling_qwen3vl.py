@@ -144,7 +144,13 @@ class TestQwen3VLScenario(MultimodalScenario):
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "arch", ["Llama4ForConditionalGeneration", "Qwen3VLForConditionalGeneration"]
+    "arch",
+    [
+        "Exaone4_5_ForConditionalGeneration",
+        "Llama4ForConditionalGeneration",
+        "MiniMaxM3SparseForConditionalGeneration",
+        "Qwen3VLForConditionalGeneration",
+    ],
 )
 def test_piecewise_graph_compiles_only_the_decoder(arch: str) -> None:
     cls = get_registered_model_class(arch)

@@ -137,6 +137,14 @@ the mixin: the executor still checks for it until it reads the protocol. The
 `supports_multimodal = True` class marker declares the contract. It does not check
 method signatures and does not turn on any feature.
 
+For a Modeling V2 target that delegates media handling, CPU conformance recognizes
+one pattern without a protocol declaration. The target directly subclasses the
+imported registered model class and defines its own `forward`, which calls
+`super().forward(..., **kwargs)` with its own `**kwargs` as the only keyword
+argument. New targets that inherit the media forward or delegate in another
+form must declare `supports_multimodal = True` and implement `SupportsMultimodal`
+so CI applies the media checks.
+
 - Declare encoder caching and item scheduling separately. Item scheduling also
   needs the processor's item metadata and a runtime configuration that allows it.
 - Record P1 skips with a reason and tracking ID in `multimodal_opt_outs`. Use

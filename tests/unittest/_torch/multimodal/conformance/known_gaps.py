@@ -134,7 +134,7 @@ KNOWN_OPT_OUTS: dict[Key, frozenset[F]] = {
     ("LlavaLlamaModel", None): _UNMARKED,
     ("LlavaNextForConditionalGeneration", None): _UNMARKED,
     ("MiniCPMV4_6ForConditionalGeneration", None): _UNMARKED,
-    (_MINIMAX, None): _UNMARKED,
+    (_MINIMAX, None): _UNMARKED - {F.LLM_PIECEWISE_CUDA_GRAPH},
     (_MINIMAX, _MINIMAX_DEP): _UNMARKED,
     ("Mistral3ForConditionalGeneration", None): _PARALLEL_AND_BREAKABLE
     | {F.LLM_PIECEWISE_CUDA_GRAPH, F.UINT8_MEDIA},
