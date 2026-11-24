@@ -34,14 +34,19 @@ def _encode(value: object, **save_kwargs: object) -> str:
 def _rewrite(
     payload: str, replace: Optional[dict] = None, add: tuple = (), **zip_kwargs: object
 ) -> str:
-    """Rewrite a torch.save archive, replacing records by name suffix and adding empty ones."""
+    """Rewrite a torch.save archive, replacing records by name suffix and adding empty ones.
+
+    A replacement of None drops the record.
+    """
     replace = replace or {}
     src = zipfile.ZipFile(io.BytesIO(base64.b64decode(payload)))
     out = io.BytesIO()
     with zipfile.ZipFile(out, "w", **zip_kwargs) as dst:
         for info in src.infolist():
             suffix = info.filename.split("/", 1)[1]
-            dst.writestr(info.filename, replace.get(suffix, src.read(info)))
+            data = replace.get(suffix, src.read(info))
+            if data is not None:
+                dst.writestr(info.filename, data)
         for name in add:
             dst.writestr(name, b"")
     return base64.b64encode(out.getvalue()).decode("ascii")
@@ -332,6 +337,36 @@ def test_sliced_decoding_matches_whole_text(monkeypatch, tail: str) -> None:
             lambda: _encode(torch.tensor([1 + 2j]).conj().imag), "", id="negative-bit-view"
         ),
         pytest.param(
+            # A plain tuple in place of the rebuild GLOBAL is not a callable.
+            lambda: _replace_pickle(
+                _encode(torch.zeros(8)),
+                _rebuild_pickle(4, (2, 1), 8, wrap=False).replace(
+                    b"ctorch._utils\n_rebuild_tensor_v2\n",
+                    b"X\x1f\x00\x00\x00torch._utils _rebuild_tensor_v2\x85",
+                ),
+            ),
+            "exactly one tensor",
+            id="tuple-as-global",
+        ),
+        pytest.param(
+            lambda: _replace_pickle(
+                _encode(torch.zeros(8)),
+                b"\x80\xff" + _rebuild_pickle(4, (2, 1), 8, wrap=False)[2:],
+            ),
+            "malformed",
+            id="protocol-255",
+        ),
+        pytest.param(
+            lambda: _replace_pickle(
+                _encode(torch.zeros(8)),
+                b"\x80\x04\x95"
+                + (10_000).to_bytes(8, "little")
+                + _rebuild_pickle(4, (2, 1), 8, wrap=False)[2:],
+            ),
+            "malformed",
+            id="frame-past-end",
+        ),
+        pytest.param(
             lambda: _encode(torch.zeros(2, 2, dtype=torch.int32)), "unsupported dtype", id="int32"
         ),
         pytest.param(lambda: _encode(torch.zeros(4, 4).to_sparse()), "", id="sparse"),
@@ -388,8 +423,9 @@ def test_sliced_decoding_matches_whole_text(monkeypatch, tail: str) -> None:
 )
 def test_pickle_rejected(build: Callable[[], str], match: str) -> None:
     """Pickles that are not one bounded dense float tensor are refused before allocating."""
-    with pytest.raises((TypeError, ValueError), match=match):
-        load_base64_tensor(build(), max_bytes=_LIMIT)
+    payload = build()
+    with pytest.raises(ValueError, match=match):
+        load_base64_tensor(payload, max_bytes=_LIMIT)
 
 
 def test_hand_built_pickle_accepted() -> None:
@@ -405,6 +441,17 @@ def _storage_crc_mismatch() -> str:
     name_len, extra_len = struct.unpack_from("<HH", raw, info.header_offset + 26)
     start = info.header_offset + 30 + name_len + extra_len
     raw[start : start + 16] = struct.pack("<4f", 1, 2, 3, 4)
+    return base64.b64encode(bytes(raw)).decode()
+
+
+def _encrypted_flag() -> str:
+    """Set the encryption flag on every record, in both of its headers."""
+    raw = bytearray(base64.b64decode(_encode(torch.zeros(4))))
+    for signature, flag_offset in ((b"PK\x03\x04", 6), (b"PK\x01\x02", 8)):
+        header = raw.find(signature)
+        while header != -1:
+            raw[header + flag_offset] |= 0x1
+            header = raw.find(signature, header + 4)
     return base64.b64encode(bytes(raw)).decode()
 
 
@@ -434,6 +481,13 @@ def _zip64_locator_moved() -> str:
             id="deflated",
         ),
         pytest.param(_storage_crc_mismatch, _LIMIT, "CRC", id="crc-mismatch"),
+        pytest.param(_encrypted_flag, _LIMIT, "unencrypted", id="encrypted"),
+        pytest.param(
+            lambda: _rewrite(_encode(torch.zeros(2)), {"data.pkl": None}),
+            _LIMIT,
+            "only the records",
+            id="missing-pickle",
+        ),
         pytest.param(_zip64_locator_moved, _LIMIT, "directly precede its locator", id="zip64"),
         pytest.param(
             lambda: base64.b64encode(
@@ -484,8 +538,9 @@ def _zip64_locator_moved() -> str:
 )
 def test_archive_rejected(build: Callable[[], str], max_bytes: int, match: str) -> None:
     """Archives other than the stored records torch.save writes for one tensor are refused."""
+    payload = build()
     with pytest.raises(ValueError, match=match):
-        load_base64_tensor(build(), max_bytes=max_bytes)
+        load_base64_tensor(payload, max_bytes=max_bytes)
 
 
 @pytest.mark.parametrize("record", ["data.pkl", "byteorder", "data/0"])

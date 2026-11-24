@@ -10,6 +10,7 @@ import struct
 import sys
 import zipfile
 from collections import defaultdict
+from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from typing import (Any, Collection, Coroutine, Dict, List, NamedTuple,
@@ -111,16 +112,21 @@ _TENSOR_ARCHIVE_RECORDS = frozenset({
 })
 
 
-class _PickleGlobal(NamedTuple):
+# Dataclasses, unlike named tuples, never compare equal to a tuple the
+# pickle builds itself.
+@dataclass(frozen=True)
+class _PickleGlobal:
     name: str
 
 
-class _PickleCall(NamedTuple):
+@dataclass(frozen=True)
+class _PickleCall:
     func: object
     args: tuple
 
 
-class _PicklePersistentId(NamedTuple):
+@dataclass(frozen=True)
+class _PicklePersistentId:
     pid: object
 
 
@@ -130,8 +136,8 @@ class _TensorSpec(NamedTuple):
     dtype: torch.dtype
     storage_numel: int
     offset: int
-    size: Tuple[int, ...]
-    stride: Tuple[int, ...]
+    size: tuple[int, ...]
+    stride: tuple[int, ...]
 
 
 _PICKLE_MARK = object()
@@ -143,15 +149,20 @@ def _replay_tensor_pickle(pickled: bytes) -> object:
         ops = list(pickletools.genops(pickled))
     except ValueError as e:
         raise ValueError(f"Tensor payload pickle is malformed: {e}") from e
-    stack: List[object] = []
+    stack: list[object] = []
     try:
-        for opcode, arg, _ in ops:
+        for opcode, arg, pos in ops:
             name = opcode.name
             if name not in _TENSOR_PICKLE_OPS:
                 raise ValueError(
                     f"Tensor payload uses unsupported pickle opcode {name}.")
             if name == "STOP":
                 break
+            # Python's unpickler accepts protocols up to 5 and frames that
+            # end within the pickle (a FRAME opcode is 9 bytes).
+            if (name == "PROTO" and not 2 <= arg <= 5
+                    or name == "FRAME" and pos + 9 + arg > len(pickled)):
+                raise ValueError("Tensor payload pickle is malformed.")
             if name in ("PROTO", "FRAME", "BINPUT", "LONG_BINPUT", "MEMOIZE"):
                 continue
             if name == "MARK":
@@ -302,7 +313,7 @@ def _check_central_directory_size(content: bytes) -> None:
 
 
 def _read_tensor_archive(content: bytes,
-                         max_bytes: int) -> Tuple[_TensorSpec, torch.Tensor]:
+                         max_bytes: int) -> tuple[_TensorSpec, torch.Tensor]:
     """Check a ``torch.save`` archive of one tensor and read its storage.
 
     Only the zip format with the records ``torch.save`` writes for one tensor,
