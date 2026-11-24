@@ -625,7 +625,10 @@ def test_host_table_node_allocates_dtype_bytes(
             closed.append(True)
 
         def view(self, rows, cols, dtype, device):
-            return torch.zeros(rows, cols, dtype=dtype)
+            table = torch.zeros(rows, cols, dtype=dtype)
+            # Only the address: holding the tensor would prolong the storage lifetime.
+            self.va = table.data_ptr()
+            return table
 
         def attach(self, chunk, fd):
             pass
