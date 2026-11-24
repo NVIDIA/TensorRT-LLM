@@ -33,8 +33,8 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import Future
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -75,6 +75,10 @@ class _SlotHold:
     channel: SessionChannel  # asked at access time whether the session is gone
     slot_id: int
     released: bool = False
+    # The CUDA device the result's device-placed views live on, if it has any.
+    device: Optional[torch.device] = None
+    # The streams copy() queued its clones on.
+    copy_streams: List[torch.cuda.Stream] = field(default_factory=list)
 
 
 @set_api_status("prototype")
@@ -82,10 +86,15 @@ class SessionResult:
     """One result of a session.
 
     ``outputs`` maps each stream the pipeline produced to a tensor that views the
-    worker's delivery slot; it is valid until the next result is requested. A
-    terminal result (``done=True``) carries no outputs and ``error`` is ``None`` for
-    normal completion or a description. ``advance_index`` is ``None`` for an initial
-    result and for the terminal result.
+    worker's delivery slot; it is valid until the next result is requested.
+    Requesting the next result never waits for the device: reads of a device
+    tensor that are queued on the CUDA stream current at that moment run before
+    the slot is written again. Reads queued on any other stream must have
+    finished by then.
+
+    A terminal result (``done=True``) carries no outputs and ``error`` is ``None``
+    for normal completion or a description. ``advance_index`` is ``None`` for an
+    initial result and for the terminal result.
     """
 
     def __init__(
@@ -137,21 +146,18 @@ class SessionResult:
     def copy(self) -> SessionResult:
         """Return this result with its media in memory the caller owns.
 
-        The copies are complete on return, so the slot may be reused as soon as
-        the next result is requested. Does not expire the view it was copied from.
+        Does not wait for the device: a device stream is cloned on the caller's
+        current CUDA stream like any tensor operation, and the slot is not
+        written again until that clone has run. Does not expire the view it was
+        copied from.
         """
         outputs = self.outputs
-        copies: Dict[str, torch.Tensor] = {}
-        try:
-            for name, tensor in outputs.items():
-                copies[name] = tensor.clone()
-        finally:
-            # A device clone reads the slot asynchronously on the caller's current
-            # stream; the worker reuses the slot with no view of that stream, so
-            # every issued read must finish before the slot can be returned, on
-            # success and on a failure partway through the streams alike.
-            for device in {t.device for t in copies.values() if t.is_cuda}:
-                torch.cuda.current_stream(device).synchronize()
+        hold = self._slot_hold
+        if hold is not None and hold.device is not None:
+            stream = torch.cuda.current_stream(hold.device)
+            if stream not in hold.copy_streams:
+                hold.copy_streams.append(stream)
+        copies = {name: tensor.clone() for name, tensor in outputs.items()}
         return SessionResult(
             self.request_id,
             self.sequence,
@@ -212,7 +218,7 @@ class SessionResultsIterator:
     def close(self) -> None:
         if not self._closed:
             self._closed = True
-            self._session._release_held()
+            self._session._release_hold()
 
     def __enter__(self) -> SessionResultsIterator:
         return self
@@ -251,7 +257,7 @@ class VisualGenSession:
         self._channel = channel  # this session's record on the client: replies land here
         # The hold on the slot of the one result the client is reading; requesting
         # the next result, or closing, releases it and returns the slot.
-        self._held: Optional[_SlotHold] = None
+        self._hold: Optional[_SlotHold] = None
 
     # ---- introspection
 
@@ -440,8 +446,9 @@ class VisualGenSession:
         Queued inputs and undelivered results are discarded, in-flight work runs to
         its boundary, state is released. Idempotent.
         """
+        hold = self._expire_hold()
         fut = self._client.session_close(self._channel)
-        self._release_held()
+        self._return_slot(hold)
         try:
             fut.result()
         except RuntimeError:
@@ -449,8 +456,9 @@ class VisualGenSession:
             pass
 
     async def close_async(self) -> None:
+        hold = self._expire_hold()
         fut = self._client.session_close(self._channel)
-        self._release_held()
+        self._return_slot(hold)
         closing = asyncio.wrap_future(fut)
         try:
             await asyncio.shield(closing)
@@ -478,22 +486,40 @@ class VisualGenSession:
 
     def _keep_alive(self) -> None:
         """Reset the worker's idle clock with the held slot's return, or with a bare keep-alive."""
-        if not self._release_held():
+        if self._hold is None:
             self._client.session_keep_alive(self._channel)
+        else:
+            self._release_hold()
 
-    def _release_held(self) -> bool:
-        """Expire the held result and give its slot back to the worker.
+    def _release_hold(self) -> None:
+        """Expire the held result and give its slot back to the worker."""
+        self._return_slot(self._expire_hold())
 
-        Returns whether a slot was returned.
+    def _expire_hold(self) -> Optional[_SlotHold]:
+        """Expire the held result and make its slot safe to return.
+
+        The device reads the caller queued on the slot run before the worker
+        writes it again. Returns the hold whose slot is still to be returned,
+        if any.
         """
-        held, self._held = self._held, None
-        if held is None:
-            return False
-        held.released = True
+        hold, self._hold = self._hold, None
+        if hold is None:
+            return None
+        hold.released = True
         if self._channel.lease_lost is not None:
-            return False
-        self._client.session_return_slot(self._channel, held.slot_id)
-        return True
+            return None
+        event = self._channel.return_event(hold.slot_id)
+        if event is not None and hold.device is not None:
+            stream = torch.cuda.current_stream(hold.device)
+            for other in hold.copy_streams:
+                if other != stream:
+                    stream.wait_stream(other)
+            event.record(stream)
+        return hold
+
+    def _return_slot(self, hold: Optional[_SlotHold]) -> None:
+        if hold is not None:
+            self._client.session_return_slot(self._channel, hold.slot_id)
 
     def _build_result(self, message: SessionResultMessage) -> SessionResult:
         outputs: Dict[str, torch.Tensor] = {}
@@ -503,7 +529,9 @@ class VisualGenSession:
                 outputs[name] = make_view(slot[name], tuple(shape), dtype)
         # The channel takes the result it has built, so the slot is held from here.
         slot_hold = None if message.slot_id is None else _SlotHold(self._channel, message.slot_id)
-        self._held = slot_hold
+        if slot_hold is not None:
+            slot_hold.device = next((t.device for t in outputs.values() if t.is_cuda), None)
+        self._hold = slot_hold
         return SessionResult(
             self.request_id,
             message.sequence,

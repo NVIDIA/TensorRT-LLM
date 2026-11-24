@@ -3046,7 +3046,7 @@ def test_explicit_close_discards_a_queued_terminal(harness):
         assert channel.lockstep_due() == 0
 
 
-def test_channel_members_are_the_nine_and_the_session_the_three(harness):
+def test_channel_members_are_the_ten_and_the_session_the_three(harness):
     """The state model: one authoritative member per fact, nothing duplicated."""
     with harness(CountingPipeline(initial=False)) as h:
         with h.open() as s:
@@ -3057,15 +3057,16 @@ def test_channel_members_are_the_nine_and_the_session_the_three(harness):
                 "_closed",
                 "_lock",
                 "_slots",
+                "_return_events",
                 "_submit",
                 "_reader",
                 "_results",
                 "_lockstep_due",
             }
-            assert set(vars(s)) == {"_client", "_channel", "_held"}
+            assert set(vars(s)) == {"_client", "_channel", "_hold"}
 
 
-# --------------------------------------------------------------------------- transitions on the nine members
+# --------------------------------------------------------------------------- transitions on the channel's members
 
 
 def _media(session_id, sequence, index):

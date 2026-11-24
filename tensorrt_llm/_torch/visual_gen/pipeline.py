@@ -691,8 +691,9 @@ class BasePipeline(nn.Module):
         ``initial_slot`` is the executor's reserved slot when the capabilities
         declare an initial result, else ``None``; the outcome's ``written`` holds
         the views put into it and its ``event`` covers this rank's work, state and
-        slot alike, so a rank given no slot still returns one. If opening fails,
-        release partial allocations and raise.
+        slot alike, so a rank given no slot still returns one. Slot writes follow
+        the rule ``advance`` states. If opening fails, release partial allocations
+        and raise.
         """
         raise NotImplementedError(f"{type(self).__name__} does not support sessions")
 
@@ -711,8 +712,11 @@ class BasePipeline(nn.Module):
         ``slot[name].view(shape, dtype)`` and return those views in ``written``.
         Return a CUDA event recorded behind this rank's state updates and its
         last write (``None`` when all of it has completed on return) and ``done``;
-        a rank given no slot still returns the event for its state work. Advances
-        never overlap; a non-final advance must write at least one stream."""
+        a rank given no slot still returns the event for its state work. Queue the
+        slot writes on the CUDA stream that is current when this is called: that
+        stream is the one made to wait for the client's reads of the slot's
+        previous result. Advances never overlap; a non-final advance must write
+        at least one stream."""
         raise NotImplementedError(f"{type(self).__name__} does not support sessions")
 
     def close_session(self, state: object) -> None:

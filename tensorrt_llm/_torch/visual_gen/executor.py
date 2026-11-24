@@ -66,7 +66,12 @@ from tensorrt_llm._torch.visual_gen.session_protocol import (
     SessionSubmit,
 )
 from tensorrt_llm._torch.visual_gen.session_state import SessionState
-from tensorrt_llm._torch.visual_gen.slot_pool import DeliverySlot, SlotPool, map_slots
+from tensorrt_llm._torch.visual_gen.slot_pool import (
+    DeliverySlot,
+    SlotPool,
+    map_slots,
+    open_return_events,
+)
 from tensorrt_llm.bindings.BuildInfo import check_cuda_architecture_supported
 from tensorrt_llm.bindings.internal import start_coordinator_watchdog
 from tensorrt_llm.executor.ipc import ZeroMqQueue
@@ -1060,6 +1065,7 @@ class DiffusionExecutor:
         ending = _SessionExit.CLOSE
         try:
             ending = self._run_session(session, pool, pipeline_state)
+            pool.wait_for_readers()
         except FatalRankError:
             fatal = True
             raise
@@ -1130,7 +1136,12 @@ class DiffusionExecutor:
             )
             return None
         self.response_queue.put(
-            SessionOpened(session_id, capabilities=caps.public(), slots=pool.export_handles())
+            SessionOpened(
+                session_id,
+                capabilities=caps.public(),
+                slots=pool.export_handles(),
+                return_events=pool.export_return_events(),
+            )
         )
         if initial_slot is not None:
             if outcome.written:
@@ -1574,7 +1585,7 @@ class PendingSubmit(NamedTuple):
 class SessionChannel:
     """Coordinator side of one session: the hand-off point between the main
     thread (the public ``VisualGenSession`` calls) and the client's background
-    thread (which dispatches the worker's replies here). Nine members, one per
+    thread (which dispatches the worker's replies here). Ten members, one per
     fact, each described at its field below.
     """
 
@@ -1588,6 +1599,10 @@ class SessionChannel:
         # The client's mapping of the delivery slots, slots[slot_id][stream], from a
         # successful open until the session ends; dropping it unmaps the storage.
         self._slots: Optional[List[Dict[str, torch.Tensor]]] = None
+        # One CUDA event per slot, for exactly as long as the mapping, when a
+        # stream lives in device memory: recorded on the caller's stream as a
+        # slot is returned, so the worker's next write waits for the caller's reads.
+        self._return_events: Optional[List[torch.cuda.Event]] = None
         # None until a close begins; then the close operation. Completes on the
         # worker's confirmation, or with the sticky failure if the worker group died.
         self._closed: Optional[Future] = None
@@ -1622,6 +1637,13 @@ class SessionChannel:
         if slots is None:
             raise RuntimeError(f"session {self.session_id} is not open")
         return slots
+
+    def return_event(self, slot_id: int) -> Optional[torch.cuda.Event]:
+        """The event to record behind the caller's device reads of slot
+        ``slot_id`` before returning it; ``None`` when the session has no
+        device-placed stream or is over."""
+        events = self._return_events
+        return None if events is None else events[slot_id]
 
     def wait_open(self, timeout: Optional[float] = None) -> Dict[str, Any]:
         """Block until the worker answered the open; the capabilities, or the open
@@ -1686,10 +1708,14 @@ class SessionChannel:
     # ---- opening (background thread)
 
     def open_succeeded(
-        self, capabilities: Dict[str, Any], slots: List[Dict[str, torch.Tensor]]
+        self,
+        capabilities: Dict[str, Any],
+        slots: List[Dict[str, torch.Tensor]],
+        return_events: Optional[List[torch.cuda.Event]] = None,
     ) -> None:
         with self._lock:
             self._slots = slots
+            self._return_events = return_events
             if capabilities.get("lockstep") and capabilities.get("initial_result"):
                 self._lockstep_due = 1
         self._complete(self._opened, capabilities)
@@ -1921,6 +1947,7 @@ class SessionChannel:
             pending, self._submit = self._submit, None
             reader = self._reader
             self._slots = None
+            self._return_events = None
             close = self._closed
         if pending is not None:
             self._complete(pending.admission, error=SessionEnded("session closed"))
@@ -1945,6 +1972,7 @@ class SessionChannel:
             pending, self._submit = self._submit, None
             reader = self._reader
             self._slots = None
+            self._return_events = None
         # The opening completes after the close outcome: a close callback that
         # fires on it finds the failure already recorded and cannot soften it.
         self._complete(self._opened, error=error)
@@ -2464,11 +2492,11 @@ class DiffusionRemoteClient:
         """A session command did not leave the process. The socket serializes a
         command before it sends it, so anything other than a socket or OS error
         is a payload that cannot be serialized (nothing was sent, the transport
-        is intact) and fails just the call that made it: the pending submit gets ``ValueError`` and consumes no
-        index; an open gets ``ValueError``, its reservation and its request
-        references are released. Any other failure means control messages may be
-        lost on a transport we can no longer trust, so the worker group is
-        aborted and every session call raises that failure."""
+        is intact) and fails just the call that made it: the pending submit gets
+        ``ValueError`` and consumes no index; an open gets ``ValueError``, its
+        reservation and its request references are released. Any other failure
+        means control messages may be lost on a transport we can no longer trust,
+        so the worker group is aborted and every session call raises that failure."""
         if not isinstance(req, SessionCommand):
             return
         payload_error = not isinstance(exc, (zmq.ZMQError, OSError))
@@ -2685,10 +2713,11 @@ class DiffusionRemoteClient:
             self._retire_unsent(reply.session_id)
 
     def _session_opened(self, channel: SessionChannel, reply: SessionOpened) -> None:
-        error, slots = reply.exception(), None
+        error, slots, return_events = reply.exception(), None, None
         if error is None:
             try:
                 slots = map_slots(reply.slots or [])
+                return_events = open_return_events(reply.return_events, slots)
             except Exception as e:
                 # The worker holds the session open; without its slots the client
                 # cannot use it, so the open fails and the worker is told to close.
@@ -2699,7 +2728,7 @@ class DiffusionRemoteClient:
             self._forget_session(reply.session_id)
             channel.open_failed(error)
         else:
-            channel.open_succeeded(reply.capabilities or {}, slots)
+            channel.open_succeeded(reply.capabilities or {}, slots, return_events)
 
     def _forget_session(self, session_id: int) -> None:
         with self._sessions_lock:

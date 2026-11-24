@@ -24,16 +24,21 @@ memory shared through CUDA IPC.
 
 from __future__ import annotations
 
+import itertools
 import math
 import weakref
 from collections import deque
-from typing import Deque, Dict, List, Tuple
+from typing import Deque, Dict, List, Optional, Tuple
 
 import torch
 
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._torch.visual_gen.pipeline import SessionCapabilities, SessionStreamSpec
-from tensorrt_llm._torch.visual_gen.session_protocol import SharedTensorHandle, SlotHandles
+from tensorrt_llm._torch.visual_gen.session_protocol import (
+    ReturnEventHandles,
+    SharedTensorHandle,
+    SlotHandles,
+)
 from tensorrt_llm.logger import logger
 
 
@@ -140,6 +145,21 @@ class SlotPool:
             raise
         # Indices of the slots nobody holds, oldest return first.
         self._free: Deque[int] = deque(range(num_slots))
+        # One event per slot when a stream lives in device memory. The client
+        # records a slot's event on its stream as it returns the slot, and the
+        # worker's stream waits on that event before the slot is written again:
+        # CUDA orders work within one stream of one process only. Host-placed
+        # streams need none, the client reads its mapping of them synchronously.
+        self._device = device
+        self._local = local
+        self._return_events: List[torch.cuda.Event] = []
+        on_device = any(spec.placement == "device" for spec in capabilities.streams)
+        if device.type == "cuda" and on_device:
+            with torch.cuda.device(device):
+                for _ in range(num_slots):
+                    event = torch.cuda.Event(enable_timing=False, interprocess=not local)
+                    event.record()  # creates it on this device, already complete
+                    self._return_events.append(event)
 
     def __len__(self) -> int:
         return len(self._slots)
@@ -159,7 +179,16 @@ class SlotPool:
         if not self._free:
             raise RuntimeError("every delivery slot is held")
         slot_id = self._free.popleft()
+        if self._return_events:
+            self._return_events[slot_id].wait(torch.cuda.current_stream(self._device))
         return slot_id, self._slots[slot_id]
+
+    def wait_for_readers(self) -> None:
+        """Queue, on the current stream, a wait for the reads the client queued
+        on every slot it returned. Call before the pool is dropped, so memory
+        the pool frees is not written under those reads."""
+        for event in self._return_events:
+            event.wait(torch.cuda.current_stream(self._device))
 
     def release(self, slot_id: int) -> None:
         if not 0 <= slot_id < len(self._slots):
@@ -179,6 +208,25 @@ class SlotPool:
         """One handle dict per slot per stream, for ``SessionOpened``. Each handle is
         consumed exactly once by the client's mapping."""
         return [{name: buffer.handle for name, buffer in slot.items()} for slot in self._slots]
+
+    def export_return_events(self) -> Optional[ReturnEventHandles]:
+        """What ``SessionOpened`` carries for the client to reach the per-slot
+        events: one handle per slot, or a token for a client in this process.
+        ``None`` when no stream lives in device memory."""
+        if not self._return_events:
+            return None
+        if self._local:
+            token = next(_local_tokens)
+            _local_pools[token] = self
+            return token
+        return [event.ipc_handle() for event in self._return_events]
+
+
+# Pools whose client lives in this process, by token. The handle of a CUDA event
+# cannot be opened by the process that created it, so such a client takes the
+# pool's own event objects.
+_local_pools: "weakref.WeakValueDictionary[int, SlotPool]" = weakref.WeakValueDictionary()
+_local_tokens = itertools.count()
 
 
 def _page_lock(storage: torch.Tensor) -> bool:
@@ -236,10 +284,28 @@ def map_slots(handles: List[SlotHandles]) -> List[Dict[str, torch.Tensor]]:
     return mapped
 
 
+def open_return_events(
+    handles: Optional[ReturnEventHandles], slots: List[Dict[str, torch.Tensor]]
+) -> Optional[List[torch.cuda.Event]]:
+    """The client's side of the pool's per-slot events, from what
+    ``SessionOpened`` carries for them, on the device the mapped slots live on.
+    ``None`` when the worker sent nothing."""
+    if handles is None:
+        return None
+    if isinstance(handles, int):
+        pool = _local_pools.pop(handles, None)
+        if pool is None:
+            raise RuntimeError("the slot pool of this session is gone")
+        return pool._return_events
+    device = next(t.device for slot in slots for t in slot.values() if t.is_cuda)
+    return [torch.cuda.Event.from_ipc_handle(device, handle) for handle in handles]
+
+
 __all__ = [
     "DeliverySlot",
     "SlotPool",
     "StreamBuffer",
     "make_view",
     "map_slots",
+    "open_return_events",
 ]

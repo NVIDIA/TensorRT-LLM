@@ -209,6 +209,7 @@ def test_slot_pool_acquire_release_and_views():
     caps = steered_caps()
     pool = SlotPool(caps, num_slots=2, device=torch.device("cpu"))
     assert pool.free_count == 2
+    assert pool.export_return_events() is None  # no stream lives in device memory
     a_id, a = pool.acquire()
     b_id, b = pool.acquire()
     assert (a_id, b_id) == (0, 1)

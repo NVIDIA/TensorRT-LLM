@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -58,6 +58,9 @@ class SessionLeaseExpired(SessionError):
 # produces (``dump_to_dict``); the client maps it back with ``from_dict``.
 SharedTensorHandle = Dict[str, Any]
 SlotHandles = Dict[str, SharedTensorHandle]  # one buffer per stream name
+# How the client reaches the pool's per-slot CUDA events: one event handle per
+# slot, or a token when the pool lives in the client's own process.
+ReturnEventHandles = Union[int, List[bytes]]
 #
 # Commands travel from the coordinator to rank 0: SessionOpen and SessionSubmit on
 # the request socket (they carry payloads), SessionControl on the control socket.
@@ -126,6 +129,8 @@ class SessionOpened(SessionReply):
 
     capabilities: Optional[Dict[str, Any]] = None
     slots: Optional[List[SlotHandles]] = None  # indexed by slot id
+    # None when no stream lives in device memory.
+    return_events: Optional[ReturnEventHandles] = None
     error: Optional[str] = None
     error_type: Optional[str] = None
 
