@@ -26,8 +26,10 @@ reason, but not all of them: see [Limitations](#limitations) for what it checks 
 - GB200 NVL72 nodes with every GPU of the deployment in one NVLink domain, and an IMEX channel in the container (see
   the [Wide-EP example](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/wide_ep)).
 - DeepSeek-V3 or DeepSeek-R1 (`DeepseekV3ForCausalLM`) as a BF16 or NVFP4 checkpoint with the Cutlass MoE backend, or
-  NVFP4 with `backend: CUTEDSL`. With another MoE backend, backend selection falls back to Cutlass and logs a warning
-  that names fault tolerance and the reason. Other quantizations, FP8 among them, are rejected when the model loads.
+  NVFP4 with `backend: CUTEDSL`, or Qwen3-235B-A22B (`Qwen3MoeForCausalLM`) as an NVFP4 checkpoint with the Cutlass
+  MoE backend, tested on one node of 4 GPUs (rank loss and rejoin). With another MoE backend, backend selection falls
+  back to Cutlass and logs a warning that names fault tolerance and the reason. Other quantizations, FP8 among them,
+  are rejected when the model loads.
 - Attention DP with tensor and expert parallelism over all ranks, `NVLinkOneSided` MoE communication, EPLB, KV cache
   manager V2, the overlap scheduler, MTP with a fixed draft length or no speculative decoding, no `torch_compile_config`
   and no piecewise prefill CUDA graphs (`prefill_cuda_graph_backend: piecewise`), and `enable_chunked_prefill` or a

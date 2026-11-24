@@ -14,6 +14,8 @@
 # limitations under the License.
 """End-to-end tests of Wide-EP fault tolerance, serving DeepSeek-V3-Lite on 4 GPUs while ranks fail.
 
+One target of ``test_rejoin_on_target`` serves Qwen3-235B-A22B instead.
+
 Load and GSM8K clients run throughout. After a ``healthy`` phase, each failure adds the phases
 ``failover`` (the requests in flight at the failure), ``degraded``, ``admission`` (in flight when
 the replacement is admitted) and ``rejoined``.
@@ -301,6 +303,15 @@ TARGETS = {
             }
         },
     ),
+    # Qwen3-235B-A22B has no MTP layers.
+    "qwen3_235b_nvfp4_cutlass": (
+        "Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf",
+        {
+            "kv_cache_config": {"dtype": "fp8"},
+            "speculative_config": None,
+            "moe_config": {"backend": "CUTLASS"},
+        },
+    ),
 }
 DEFAULT_TARGET = "bf16"
 
@@ -319,7 +330,9 @@ def _merged(base: dict, options: dict) -> dict:
 
 
 def _serving_config(model: Path, target_options: dict) -> dict:
-    num_experts = json.loads((model / "config.json").read_text())["n_routed_experts"]
+    hf_config = json.loads((model / "config.json").read_text())
+    # DeepSeek-V3 names its routed expert count n_routed_experts, and Qwen3 MoE num_experts.
+    num_experts = hf_config.get("n_routed_experts", hf_config.get("num_experts"))
     config = {
         "enable_wide_ep_fault_tolerance": True,
         "enable_attention_dp": True,
