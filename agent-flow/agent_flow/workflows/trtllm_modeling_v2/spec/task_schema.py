@@ -23,7 +23,7 @@ from agent_flow.agent_runtime import AGENTS_FIELD, validate_agents
 
 from ..agents.roles import ROLES
 from ..checks import accuracy_policy
-from ..infra.compute.environment import EnvironmentError, check_tmpdir
+from ..infra.compute.environment import EnvironmentError, check_tmpdir, gpus_per_node
 from ..infra.compute.sessions import validate_sessions
 from ..infra.git import COMMIT_POLICY_FIELD, validate_commit_policy_block
 from .schema_keys import reject_unknown_keys
@@ -91,18 +91,27 @@ SPECULATORS: frozenset[str] = frozenset(
 # modules OR DSpark stages and never both.
 MTP_NAMESPACE_FEATURES: tuple[str, ...] = ("mtp", "dspark")
 
-# `accuracy.disagg`: the tree's own disaggregated-serving accuracy test for this target
-# (checks/disagg.py), the one check the `disagg` feature owes. The run writes it beside the
-# tree's tests that serve through `trtllm-serve disaggregated`.
+# `accuracy.disagg`: the one check the `disagg` feature owes (checks/disagg.py). Either the
+# tree's three files of a deployment, which the flow serves:
 #
-#   test     REQUIRED with the disagg feature: its repository-relative pytest node id, e.g.
+#   config      the proxy's (`trtllm-serve disaggregated -c`)
+#   context     every context server's `trtllm-serve --config`; `generation` likewise
+#
+# or the tree's own kind of test, which the run writes beside the tree's tests that serve
+# through `trtllm-serve disaggregated`:
+#
+#   test     its repository-relative pytest node id, e.g.
 #            `tests/integration/defs/accuracy/test_disaggregated_serving.py::TestX::test_y`
 #   tests    optional refinements of test, each run as a separate native job
 #   devices  the devices it starts its engines on (default two engines at the member's width)
+#   nodes    nodes that run one pytest process each
 #   timeout  seconds (default 7200)
-#   env      the environment the test runs under (`LLM_MODELS_ROOT`, ...)
+#   env      the environment the servers or the test run under (`LLM_MODELS_ROOT`, ...)
 DISAGG_FEATURE = "disagg"
-DISAGG_KEYS: tuple[str, ...] = ("test", "tests", "devices", "nodes", "timeout", "env")
+DISAGG_SIDES: tuple[str, ...] = ("context", "generation")
+DISAGG_FILES: tuple[str, ...] = ("config", *DISAGG_SIDES)
+DISAGG_TEST_KEYS: tuple[str, ...] = ("test", "tests", "devices", "nodes")
+DISAGG_KEYS: tuple[str, ...] = (*DISAGG_FILES, *DISAGG_TEST_KEYS, "timeout", "env")
 
 # Workload and field documentation lives in task.example.yaml. These key sets
 # close the accepted blocks; cross-field constraints are validated below.
@@ -283,6 +292,8 @@ ENVIRONMENT_KEYS: tuple[str, ...] = (
     "mounts",
     "time_limit",
     "gpus_per_node",
+    # The site's `srun` words that enter the session's container on a step across nodes.
+    "step_args",
     # Each device's memory, GiB: engines and disaggregation are sized by it.
     "gpu_memory_gib",
     # The compute sessions the run stands on.
@@ -594,6 +605,12 @@ def _validate_environment(block: Any, errors: list[str]) -> None:
     ):
         errors.append(f"'{ENVIRONMENT_FIELD}.mounts' must be a list of strings")
 
+    words = block.get("step_args")
+    if words is not None and not (
+        isinstance(words, list) and all(isinstance(w, str) and w.startswith("-") for w in words)
+    ):
+        errors.append(f"'{ENVIRONMENT_FIELD}.step_args' must be a list of `srun` options")
+
     memory = block.get("gpu_memory_gib")
     if memory is not None and not (_number(memory) and memory > 0):
         errors.append(f"'{ENVIRONMENT_FIELD}.gpu_memory_gib' must be a positive number of GiB")
@@ -652,13 +669,28 @@ def _validate_fields(
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
+def _validate_disagg_files(block: Mapping[str, Any], where: str, errors: list[str]) -> None:
+    """A stated deployment: the tree's three files, and nothing of the test form."""
+    stated = [key for key in DISAGG_FILES if block.get(key) is not None]
+    if not stated:
+        return
+    for key in DISAGG_FILES:
+        path = block.get(key)
+        if not isinstance(path, str) or not Path(path).is_file():
+            errors.append(f"'{where}.{key}' must be an existing YAML file, got {path!r}")
+    used = [key for key in DISAGG_TEST_KEYS if block.get(key) is not None]
+    if used:
+        errors.append(f"'{where}' states a deployment and {', '.join(used)}: state one of the two")
+
+
 def _validate_disagg(block: Any, errors: list[str]) -> None:
-    """Validate ``accuracy.disagg``: the disaggregated-serving test the run writes and names."""
+    """Validate ``accuracy.disagg``: a stated deployment, or the test the run writes and names."""
     where = f"{ACCURACY_FIELD}.disagg"
     if not isinstance(block, dict):
         errors.append(f"'{where}' must be a mapping")
         return
     reject_unknown_keys(block, DISAGG_KEYS, errors, where=where)
+    _validate_disagg_files(block, where, errors)
     test = block.get("test")
     if test is not None and (
         not isinstance(test, str) or "::" not in test or Path(test).is_absolute()
@@ -1327,29 +1359,19 @@ def _require_relative_on_variants(data: Mapping[str, Any], errors: list[str]) ->
             )
 
 
-def gpus_per_node(data: Mapping[str, Any]) -> int | None:
-    """The most devices one node of the run holds: ``environment`` or one of its sessions."""
-    env = data.get(ENVIRONMENT_FIELD) or {}
-    sizes = [env.get("gpus_per_node")] + [
-        s.get("gpus_per_node") for s in env.get("sessions") or () if isinstance(s, Mapping)
-    ]
-    sizes = [s for s in sizes if isinstance(s, int) and not isinstance(s, bool) and s > 0]
-    return max(sizes) if sizes else None
-
-
 def _require_disagg_test(data: Mapping[str, Any], errors: list[str]) -> None:
-    """The ``disagg`` feature names the test that proves it: nothing else crosses the hop."""
+    """The ``disagg`` feature states what proves it: nothing else crosses the hop."""
     features = data.get(FEATURES_FIELD)
     if not isinstance(features, list) or DISAGG_FEATURE not in features:
         return
     accuracy = data.get(ACCURACY_FIELD)
     block = accuracy.get("disagg") if isinstance(accuracy, dict) else None
-    if not isinstance(block, dict) or not block.get("test"):
+    if not isinstance(block, dict) or not (block.get("test") or block.get(DISAGG_FILES[0])):
         errors.append(
-            f"feature {DISAGG_FEATURE!r} needs 'accuracy.disagg.test': the node id of the "
-            f"disaggregated-serving accuracy test the run writes beside the tree's own (they "
-            f"serve through `trtllm-serve disaggregated`); boot and accuracy run one aggregated "
-            f"engine and never cross the hop."
+            f"feature {DISAGG_FEATURE!r} needs 'accuracy.disagg': the deployment the flow "
+            f"serves (`config`, `context`, `generation`), or 'accuracy.disagg.test', the node id "
+            f"of the disaggregated-serving accuracy test the run writes beside the tree's own; "
+            f"boot and accuracy run one aggregated engine and never cross the hop."
         )
 
 
@@ -1381,6 +1403,10 @@ def _resolve_spec_relative_paths(data: dict[str, Any], spec_dir: Path) -> None:
         accuracy["llm_api_options"] = {k: absolute(v) for k, v in options.items()}
     elif options is not None:
         accuracy["llm_api_options"] = absolute(options)
+    disagg = accuracy.get("disagg")
+    for key in DISAGG_FILES if isinstance(disagg, dict) else ():
+        if key in disagg:
+            disagg[key] = absolute(disagg[key])
 
     # A `dataset` may be a cached dataset id ("openai/gsm8k"), which reads like
     # a relative path, so it is resolved only when the spec's directory holds it.

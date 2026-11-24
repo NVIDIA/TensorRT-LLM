@@ -18,7 +18,9 @@ import pytest
 import torch
 from _torch.attention.helix_context_utils import _check_context_heads, _Scenario
 from _torch.attention.multi_gpu.helix_test_utils import run_helix_test
-from utils.util import skip_pre_blackwell
+from utils.util import getSMVersion, skip_pre_blackwell
+
+from tensorrt_llm._torch.attention.backends.fmha.prims_ts import PrimsTSFmha
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="requires four GPUs")
@@ -32,6 +34,33 @@ def test_k3_mla_helix_compact_cache(fp8_cache):
         ),
         "nccl",
         world_size=4,
+        max_mismatch_ratio=0.0,
+    )
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two GPUs")
+@skip_pre_blackwell
+@pytest.mark.skipif(
+    getSMVersion() not in PrimsTSFmha.SUPPORTED_MLA_SMS,
+    reason="PrimTS MLA requires SM100, SM103, or SM107",
+)
+def test_prims_ts_k3_mla_helix_mtp7() -> None:
+    """Check strict FP8 MLA ownership, mixed MTP7 and graph replay across Helix pages."""
+    run_helix_test(
+        _check_context_heads,
+        _Scenario(
+            cp_size=2,
+            num_heads=96,
+            fp8=True,
+            fp8_cache=True,
+            check_kv_ownership=True,
+            chunked_history=True,
+            generation_query_width=8,
+            tokens_per_block=128,
+            strict_prims_ts=True,
+        ),
+        "nccl",
+        world_size=2,
         max_mismatch_ratio=0.0,
     )
 

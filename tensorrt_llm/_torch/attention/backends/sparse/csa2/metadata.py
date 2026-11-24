@@ -18,11 +18,17 @@ import torch
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.modules.multi_stream_utils import private_stream
-from tensorrt_llm._utils import is_blackwell_datacenter, is_sm_100f
+from tensorrt_llm._utils import get_sm_version, is_blackwell_datacenter, is_sm_100f
 from tensorrt_llm.math_utils import ceil_div
 
 from .block_select import PUBLISH_BLOCK, block_select_supported
-from .params import CSA2BackendForwardArgs, CSA2Layer, CSA2MetadataParams, CSA2Mode
+from .params import (
+    CSA2BackendForwardArgs,
+    CSA2Layer,
+    CSA2MetadataParams,
+    CSA2Mode,
+    select_csa2_backend,
+)
 
 if TYPE_CHECKING:
     from .....pyexecutor.llm_request import LlmRequest
@@ -347,6 +353,10 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         # CSA2 never reads the generic MLA chunked-context tables.
         self.enable_context_mla_with_cached_kv = False
         super().__post_init__()
+
+    def _validate_swa_scratch_reuse(self) -> None:
+        """CSA2 resolves scratch pages before its hardware-selected attention helper."""
+        select_csa2_backend(get_sm_version())
 
     @property
     def tokens_per_block(self) -> int:
@@ -1352,7 +1362,11 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         self._csa2_source_batch = (list(seq_lengths), list(start_positions))
 
     def set_swa_bounded_replay(
-        self, cached_prefix_lengths: list[int | None], *, decoder: bool = False
+        self,
+        cached_prefix_lengths: list[int | None],
+        *,
+        decoder: bool = False,
+        query_starts: list[int | None] | None = None,
     ) -> None:
         """Prepare approximate reconstruction after an authoritative GLOBAL hit.
 
@@ -1371,6 +1385,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
                 "Bounded replay source selection cannot be combined with set_source_batch"
             )
         self._csa2_pending_replay = (tuple(cached_prefix_lengths), decoder)
+        self._csa2_pending_replay_query_starts = query_starts
 
     def prepare_context_replay(
         self, requests: list[LlmRequest], *, allow_final_window: bool = True
@@ -1384,6 +1399,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             tuple(request.prompt_len for request in requests) if allow_final_window else ()
         )
         prefixes = [None] * self.num_seqs
+        query_starts = [None] * self.num_seqs
         floors = [0] * self.num_seqs
         starts = self.kv_cache_params.num_cached_tokens_per_seq
         lengths = self.seq_lens.tolist()
@@ -1394,7 +1410,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
                 if cache is None or plan.cache_identity != id(cache) or not cache.is_active:
                     raise ValueError("Encoder recovery has lost its active Global claim")
             if isinstance(plan, EncoderReplay):
-                floors[row] = plan.start
+                floors[row] = plan.swa_read_floor if plan.restores_checkpoint else plan.start
                 if not plan.consumed:
                     if (
                         plan.request_id != request.py_request_id
@@ -1404,8 +1420,9 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
                     ):
                         raise ValueError("Encoder recovery input does not match its Global claim")
                     prefixes[row] = plan.global_end
+                    query_starts[row] = plan.start
         if any(prefix is not None for prefix in prefixes):
-            self.set_swa_bounded_replay(prefixes)
+            self.set_swa_bounded_replay(prefixes, query_starts=query_starts)
         self._csa2_pending_swa_floors = floors
 
     def set_decoder_query_boundary(self, first_layer: int) -> None:
@@ -1956,6 +1973,9 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         replay = getattr(self, "_csa2_pending_replay", None)
         if hasattr(self, "_csa2_pending_replay"):
             del self._csa2_pending_replay
+        query_starts = getattr(self, "_csa2_pending_replay_query_starts", None)
+        if hasattr(self, "_csa2_pending_replay_query_starts"):
+            del self._csa2_pending_replay_query_starts
         self.csa2_replay_mode = None
         self.csa2_replay_cached_lengths = ()
         replay_starts = [0] * len(lengths)
@@ -1973,6 +1993,13 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
                 else manager.get_swa_replay_ranges([prefix], decoder=decoder)[0][0]
                 for prefix in prefixes
             ]
+            if query_starts is not None:
+                if decoder or len(query_starts) != len(prefixes):
+                    raise ValueError("Explicit Encoder query starts must match the context batch")
+                replay_starts = [
+                    default if start is None else start
+                    for default, start in zip(replay_starts, query_starts)
+                ]
             for row, (prefix, start, length) in enumerate(zip(prefixes, starts, lengths)):
                 if prefix is None:
                     continue
@@ -1988,7 +2015,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             self.csa2_replay_cached_lengths = prefixes
         if hasattr(self, "_csa2_pending_swa_floors"):
             replay_starts = [
-                max(start, floor)
+                floor if query_starts is not None else max(start, floor)
                 for start, floor in zip(replay_starts, self._csa2_pending_swa_floors)
             ]
             del self._csa2_pending_swa_floors

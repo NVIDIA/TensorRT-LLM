@@ -46,7 +46,7 @@ from tensorrt_llm.llmapi import CompletionOutput, RequestOutput, SamplingParams
 from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig, LlmArgs
 from tensorrt_llm.llmapi.tokenizer import DeepseekV4Tokenizer
 
-from ..conftest import llm_models_root, skip_pre_blackwell
+from ..conftest import get_device_memory, llm_models_root, skip_pre_blackwell
 from .accuracy_core import GSM8K, LlmapiAccuracyTestHarness
 from .test_disaggregated_serving import DuckLLM, MyThreadPoolExecutor, Result, run_accuracy_test
 
@@ -366,7 +366,10 @@ def _accuracy_llm(
 
 @pytest.mark.timeout(14400)
 @pytest.mark.skip_less_device(4)
-@pytest.mark.skip_less_device_memory(250000)
+@pytest.mark.skipif(
+    get_device_memory() < 250000,
+    reason="This test requires at least 250000 MiB of memory per GPU",
+)
 @skip_pre_blackwell
 class TestDeepSeekV4ProDSparkMultinode(LlmapiAccuracyTestHarness):
     def test_gsm8k_1p1d_dep4(

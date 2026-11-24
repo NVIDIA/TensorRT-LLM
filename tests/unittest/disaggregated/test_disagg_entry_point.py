@@ -17,9 +17,10 @@
 ``OpenAIDisaggServer._wrap_entry_point`` turns a service entry point into the
 FastAPI handler of the OpenAI routes: it counts the request, applies the
 chat-template permission, resolves the conversation identity from the headers,
-builds the per-request hooks, runs the entry point, counts the response,
-serializes it, and sends every failure through ``_handle_exception`` while the
-exception is being handled. These tests pin that behavior - the per-request
+builds the per-request hooks, runs the entry point, starts an OpenAI stream
+before counting the response, serializes it, and sends failures other than a
+pre-header client disconnect through ``_handle_exception`` while the exception
+is being handled. These tests pin that behavior - the per-request
 counters, the status codes, the serialization and the single trace span - so
 the wrapper's internals can be reorganized without changing what a client or
 a metrics scrape observes.
@@ -39,6 +40,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from openai.types.responses import ResponseFormatTextJSONSchemaConfig, ResponseTextConfig
 from opentelemetry.trace import SpanKind
 from starlette.requests import Request
+from starlette.types import Message
 from test_common.serve.app_factory import DisaggConfig, isolated_serve_env
 
 import tensorrt_llm.serve.openai_disagg_server as disagg_server_module
@@ -95,12 +97,17 @@ def _assert_counts(counters: SimpleNamespace, case: str, **expected: int) -> Non
 
 
 def _raw_request(*headers: tuple) -> Request:
+    async def receive() -> Message:
+        await asyncio.Future()  # The connected client sends no more messages.
+        return {"type": "http.disconnect"}
+
     return Request(
         {
             "type": "http",
             "headers": list(headers),
             "state": {"server_arrival_time": 1.0, "perf_metrics_records": []},
-        }
+        },
+        receive=receive,
     )
 
 
@@ -158,22 +165,39 @@ def test_non_streaming_request_is_counted_and_serialized(tmp_path):
         )
 
 
-def test_streaming_request_returns_the_generator_unchanged(tmp_path):
+def test_streaming_request_preserves_chunks_after_starting_the_generator(tmp_path):
     with isolated_serve_env(tmp_path) as env:
         server, counters = _server_with_counters(env)
 
+        started = False
+        closed = False
+
         async def generated():
-            yield b"data: [DONE]\n\n"
+            nonlocal started, closed
+            started = True
+            try:
+                yield b"data: first\n\n"
+                yield b"data: [DONE]\n\n"
+            finally:
+                closed = True
 
         generator = generated()
         entry_point = AsyncMock(return_value=generator)
         wrapper = server._wrap_entry_point(entry_point, ChatCompletionRequest)
 
-        response = asyncio.run(wrapper(_chat_request(stream=True), _raw_request()))
+        async def run():
+            response = await wrapper(_chat_request(stream=True), _raw_request())
+            assert started and not closed
+            assert isinstance(response, StreamingResponse)
+            assert response.media_type == "text/event-stream"
+            assert response.body_iterator is not generator
+            assert [chunk async for chunk in response.body_iterator] == [
+                b"data: first\n\n",
+                b"data: [DONE]\n\n",
+            ]
+            assert closed
 
-        assert isinstance(response, StreamingResponse)
-        assert response.media_type == "text/event-stream"
-        assert response.body_iterator is generator
+        asyncio.run(run())
         _assert_counts(
             counters,
             "a streaming chat request",
@@ -447,13 +471,15 @@ def test_streamed_responses_request_is_guarded(tmp_path):
         wrapper = server._wrap_entry_point(entry_point, ResponsesRequest)
         req = ResponsesRequest(model="m", input="hi", stream=True)
 
-        response = asyncio.run(wrapper(req, _raw_request()))
+        async def run():
+            response = await wrapper(req, _raw_request())
+            assert isinstance(response, StreamingResponse)
+            assert response.media_type == "text/event-stream"
+            # A relayed Responses stream is guarded before its first pull.
+            assert response.body_iterator is not generator
+            assert [chunk async for chunk in response.body_iterator] == [b"data: {}\n\n"]
 
-        assert isinstance(response, StreamingResponse)
-        assert response.media_type == "text/event-stream"
-        # A relayed Responses stream is wrapped so that an early failure ends
-        # with an `error` event; the raw generator must not go out as-is.
-        assert response.body_iterator is not generator
+        asyncio.run(run())
         _assert_counts(
             counters,
             "a streamed Responses request",
