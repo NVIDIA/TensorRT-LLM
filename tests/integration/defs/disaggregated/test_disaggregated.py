@@ -1559,8 +1559,10 @@ def test_disaggregated_overlap(disaggregated_test_root, llm_venv,
 
 
 @skip_pre_hopper
-@pytest.mark.skip_less_device(8)
-@pytest.mark.parametrize("ctx_pp", [1, 4], ids=["ctx_pp1", "ctx_pp4"])
+@pytest.mark.parametrize("ctx_pp", [
+    pytest.param(1, marks=pytest.mark.skip_less_device(2), id="ctx_pp1"),
+    pytest.param(4, marks=pytest.mark.skip_less_device(8), id="ctx_pp4"),
+])
 def test_disaggregated_overlap_gen_first(disaggregated_test_root,
                                          disaggregated_example_root, llm_venv,
                                          ctx_pp):
