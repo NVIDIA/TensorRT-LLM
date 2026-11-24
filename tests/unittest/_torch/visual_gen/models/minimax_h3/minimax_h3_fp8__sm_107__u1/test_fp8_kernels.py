@@ -300,10 +300,11 @@ def test_bf16_block_attention_cast_matches_the_family_route(scenario, monkeypatc
     if padded:
         valid_len = torch.tensor([max(length - 7, 1)], dtype=torch.int32, device="cuda")
     arguments = (qkv, weight_q, weight_k, angle.cos(), angle.sin(), descale, EPS)
-    arguments += (heads, head_dim, 0, valid_len)
+    arguments += (heads, head_dim)
+    block_id = torch.tensor(0, dtype=torch.int64, device="cpu")
 
-    got = modeling.qk_norm_rope(*arguments)
-    ref = torch.ops.h3_lever8.qk_norm_rope_fp8(*arguments)
+    got = modeling.qk_norm_rope(*arguments, block_id, valid_len)
+    ref = torch.ops.h3_lever8.qk_norm_rope_fp8(*arguments, 0, valid_len)
     for name, a, b in zip(("q", "k", "v", "descale"), got, ref):
         assert a.dtype == b.dtype and a.shape == b.shape, name
         assert _same_fraction(a, b) == 1.0, name
@@ -316,6 +317,115 @@ def _misaligned(tensor):
     view.copy_(tensor)
     assert view.is_contiguous() and view.data_ptr() % 256 != 0
     return view
+
+
+@pytest.mark.parametrize("case", ("other_shape", "custom_swiglu", "not_precompiled"))
+def test_bf16_gate_up_preserves_framework_fallback(scenario, monkeypatch, case):
+    ops, _, gate_up_swiglu, _ = scenario
+    if case == "other_shape":
+        activation = torch.ones((3, 16), dtype=BF16, device="cuda")
+        weight = torch.full((32, 16), 0.25, dtype=BF16, device="cuda")
+    else:
+        activation = torch.ones((1, D), dtype=BF16, device="cuda")
+        weight = torch.full((2 * UP, D), 0.002, dtype=BF16, device="cuda")
+    settings = (2.0, 1.5, 0.25) if case == "custom_swiglu" else (None, None, None)
+
+    def unexpected_launch(*_):
+        pytest.fail("A BF16 kernel was launched outside its contract")
+
+    def precompiled(_):
+        return None if case == "not_precompiled" else unexpected_launch
+
+    monkeypatch.setattr(gate_up_swiglu, "precompiled_bf16", precompiled)
+    monkeypatch.setattr(gate_up_swiglu, "_get_compiled", unexpected_launch)
+    unit = torch.ones(1, device="cuda", dtype=torch.float32)
+    out = ops.gate_up_bf16(activation, weight, unit, *settings)
+    ref = ops.swiglu(
+        F.linear(activation, weight),
+        swiglu_limit=settings[0],
+        swiglu_alpha=settings[1],
+        swiglu_beta=settings[2],
+    )
+    assert torch.equal(out, ref)
+
+
+def test_bf16_attention_projection_rejects_a_reshape_that_changes_rows(scenario):
+    ops = scenario[0]
+    tensors = _inputs(2, rows=1)
+    raw = torch.empty((1, 4, QK // 2), device="cuda", dtype=BF16)
+    weight = torch.empty((D, QK), device="cuda", dtype=BF16)
+    unit = torch.ones(1, device="cuda", dtype=torch.float32)
+    with pytest.raises(ValueError, match="Expected matching attention"):
+        ops.bf16_attention_projection(
+            raw,
+            weight,
+            unit,
+            tensors["hidden"],
+            tensors["norm_weight"],
+            tensors["modulation"],
+            tensors["indices"],
+            EPS,
+        )
+
+
+@pytest.mark.parametrize("projection", ("down", "attention"))
+def test_bf16_projection_rejects_fp8_operands(scenario, projection):
+    ops = scenario[0]
+    tensors = _inputs(2, rows=1)
+    unit = torch.ones(1, device="cuda", dtype=torch.float32)
+    fp8 = torch.float8_e4m3fn
+    if projection == "down":
+        activation = torch.empty((2, UP), device="cuda", dtype=fp8)
+        weight = torch.empty((D, UP), device="cuda", dtype=fp8)
+        operation = ops.bf16_down
+        args = (
+            activation,
+            weight,
+            unit,
+            tensors["hidden"],
+            tensors["modulation"],
+            tensors["indices"],
+        )
+    else:
+        activation = torch.empty((1, 2, QK), device="cuda", dtype=fp8)
+        weight = torch.empty((D, QK), device="cuda", dtype=fp8)
+        operation = ops.bf16_attention_projection
+        args = (
+            activation,
+            weight,
+            unit,
+            tensors["hidden"],
+            tensors["norm_weight"],
+            tensors["modulation"],
+            tensors["indices"],
+            EPS,
+        )
+    with pytest.raises(ValueError, match="BF16 projection requires BF16 activation and weight"):
+        operation(*args)
+
+
+def test_fp8_down_does_not_use_a_bf16_compiled_kernel(scenario, monkeypatch):
+    ops, _, _, projection_residual = scenario
+    hidden = _inputs(2, rows=1)
+    activation = torch.empty((2, UP), device="cuda", dtype=BF16)
+    weight = torch.empty((D, UP), device="cuda", dtype=BF16)
+    unit = torch.ones(1, device="cuda", dtype=torch.float32)
+
+    def expected_fallback(*_):
+        raise ValueError("Reached the existing scaled GEMM fallback")
+
+    monkeypatch.setattr(projection_residual, "supports", lambda *_: True)
+    monkeypatch.setattr(ops, "_cublas_scaled_mm", expected_fallback)
+    with pytest.raises(ValueError, match="Reached the existing scaled GEMM fallback"):
+        ops.down(
+            activation,
+            weight,
+            unit,
+            unit,
+            hidden["hidden"],
+            hidden["modulation"],
+            hidden["indices"],
+        )
 
 
 @pytest.mark.parametrize("length", (300, 4097))

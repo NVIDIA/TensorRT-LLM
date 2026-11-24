@@ -67,7 +67,7 @@ CuTe DSL and the SM107 runtime are required. The CUDA toolchain is optional:
 
 | Tool | Used for | Without it |
 |---|---|---|
-| `nvcc`, `ninja` | build the scalar quantize and output-cast kernels at load | the installed operators run |
+| `nvcc`, `ninja` | build one extension for scalar quantize and output cast at load | the installed operators run |
 | `cuobjdump` | check the instructions of the built kernels | the installed operators run |
 
 The built kernels and the installed operators produce the same bytes, so the

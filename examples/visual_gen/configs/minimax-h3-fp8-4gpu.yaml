@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# MiniMax-H3 static FP8 scenario on SM103/SM107, four GPUs on one node.
+# Serve with: trtllm-serve <pre-quantized FP8 checkpoint> --visual_gen_args <this file>
+# The file holds VisualGenArgs fields only; the checkpoint path is a command-line argument.
+# Keep the checkpoint's exported quantization metadata: do not add quant_config.
+# Launch environment: OMP_NUM_THREADS=8 NCCL_PROTO=Simple NCCL_MIN_CTAS=64 NCCL_MAX_CTAS=64.
+attention_config:
+  backend: CUDNN
+  quant_attention_config:
+    qk_dtype: fp8
+    v_dtype: fp8
+torch_compile_config:
+  enable: true
+cuda_graph_config:
+  enable: false
+parallel_config:
+  ulysses_size: 4
+  parallel_vae_size: 4
+compilation_config:
+  resolutions: [[768, 1344]]
+  num_frames: [124]
+  skip_warmup: false
+pipeline_config:
+  visual_gen_scenario: require

@@ -3,9 +3,12 @@
 """Opaque compiler boundaries for the static-FP8 H3 block's fused operations."""
 
 import torch
+import torch.nn.functional as F
 
+from tensorrt_llm._torch.modules.swiglu import swiglu
 from tensorrt_llm.logger import logger
 
+from ..fused_adaln import h3_gate_res_norm_mod, h3_norm_mod
 from .kernels import gate_up_swiglu, projection_residual
 from .kernels.adaln import launch as adaln_launch
 from .kernels.conversion import BLOCKS, THREADS, modules_for_device
@@ -95,6 +98,61 @@ def _gate_up_fake(activation, packed_weight, input_scale, weight_scale, output_s
     )
 
 
+def _valid_bf16_unit(unit, device):
+    return (
+        unit.device == device
+        and unit.dtype == torch.float32
+        and unit.shape == (1,)
+        and unit.is_contiguous()
+        and unit.data_ptr() % 4 == 0
+    )
+
+
+@torch.library.custom_op("h3_fp8::gate_up_swiglu_bf16", mutates_args=(), device_types="cuda")
+def gate_up_bf16(
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+    unit_scale: torch.Tensor,
+    swiglu_limit: float | None,
+    swiglu_alpha: float | None,
+    swiglu_beta: float | None,
+) -> torch.Tensor:
+    """Fuse the original BF16 GateUp projection and plain SwiGLU."""
+    launch = gate_up_swiglu.precompiled_bf16(activation.device.index)
+    if (
+        launch is not None
+        and activation.ndim == 2
+        and activation.shape[0] > 0
+        and activation.shape[1] == gate_up_swiglu.K_DIM
+        and weight.shape == (gate_up_swiglu.N_TOT, gate_up_swiglu.K_DIM)
+        and activation.device == weight.device
+        and activation.dtype == weight.dtype == torch.bfloat16
+        and activation.is_contiguous()
+        and weight.is_contiguous()
+        and activation.data_ptr() % 256 == 0
+        and weight.data_ptr() % 256 == 0
+        and _valid_bf16_unit(unit_scale, activation.device)
+        and swiglu_limit in (None, float("inf"))
+        and swiglu_alpha in (None, 1.0)
+        and swiglu_beta in (None, 0.0)
+    ):
+        output = activation.new_empty((activation.shape[0], gate_up_swiglu.D_HALF))
+        if output.data_ptr() % 256 == 0:
+            launch(activation, weight, unit_scale, unit_scale, unit_scale, output)
+            return output
+    return swiglu(
+        F.linear(activation, weight),
+        swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+    )
+
+
+@gate_up_bf16.register_fake
+def _gate_up_bf16_fake(activation, weight, unit_scale, swiglu_limit, swiglu_alpha, swiglu_beta):
+    return activation.new_empty((*activation.shape[:-1], weight.shape[0] // 2))
+
+
 @torch.library.custom_op("h3_fp8::down_gated_residual", mutates_args=(), device_types="cuda")
 def down(
     activation: torch.Tensor,
@@ -105,7 +163,7 @@ def down(
     modulation: torch.Tensor,
     indices: torch.Tensor,
 ) -> torch.Tensor:
-    if projection_residual.supports(
+    if activation.dtype == torch.float8_e4m3fn and projection_residual.supports(
         activation, weight, hidden, modulation, indices, projection_residual.DOWN_GATE
     ):
         return projection_residual.run(
@@ -132,6 +190,37 @@ def _gated_residual(hidden, projected, modulation, indices, gate_column):
 
 @down.register_fake
 def _down_fake(activation, weight, input_scale, weight_scale, hidden, modulation, indices):
+    return torch.empty_like(hidden)
+
+
+def _require_bf16_projection(activation, weight):
+    if activation.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
+        raise ValueError("BF16 projection requires BF16 activation and weight")
+
+
+@torch.library.custom_op("h3_fp8::bf16_down_gated_residual", mutates_args=(), device_types="cuda")
+def bf16_down(
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+    unit: torch.Tensor,
+    hidden: torch.Tensor,
+    modulation: torch.Tensor,
+    indices: torch.Tensor,
+) -> torch.Tensor:
+    _require_bf16_projection(activation, weight)
+    gate_column = projection_residual.DOWN_GATE
+    if _valid_bf16_unit(unit, activation.device) and projection_residual.supports(
+        activation, weight, hidden, modulation, indices, gate_column
+    ):
+        return projection_residual.run(
+            activation, weight, unit, unit, hidden, modulation, indices, gate_column
+        ).reshape_as(hidden)
+    projected = F.linear(activation, weight).reshape_as(hidden)
+    return _gated_residual(hidden, projected, modulation, indices, gate_column)
+
+
+@bf16_down.register_fake
+def _bf16_down_fake(activation, weight, unit, hidden, modulation, indices):
     return torch.empty_like(hidden)
 
 
@@ -223,6 +312,46 @@ def _attention_projection_fake(
     eps,
 ):
     return torch.empty_like(hidden), torch.empty_like(hidden, dtype=torch.float8_e4m3fn)
+
+
+@torch.library.custom_op("h3_fp8::bf16_attention_projection", mutates_args=(), device_types="cuda")
+def bf16_attention_projection(
+    raw: torch.Tensor,
+    weight: torch.Tensor,
+    unit: torch.Tensor,
+    hidden: torch.Tensor,
+    norm_weight: torch.Tensor,
+    modulation: torch.Tensor,
+    indices: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    _require_bf16_projection(raw, weight)
+    if (
+        raw.shape[-1:] != (7168,)
+        or hidden.shape[-1:] != (5376,)
+        or raw.shape[:-1] != hidden.shape[:-1]
+    ):
+        raise ValueError("Expected matching attention [*,7168] and hidden [*,5376] rows")
+    activation = raw.reshape(-1, 7168)
+    gate_column = projection_residual.ATTENTION_OUTPUT_GATE
+    if _valid_bf16_unit(unit, activation.device) and projection_residual.supports(
+        activation, weight, hidden, modulation, indices, gate_column
+    ):
+        residual = projection_residual.run(
+            activation, weight, unit, unit, hidden, modulation, indices, gate_column
+        ).reshape_as(hidden)
+        return residual, h3_norm_mod(residual, norm_weight, modulation, indices, eps, 4, 3)
+    projected = F.linear(raw, weight)
+    return h3_gate_res_norm_mod(
+        hidden, projected, norm_weight, modulation, indices, eps, gate_column, 4, 3
+    )
+
+
+@bf16_attention_projection.register_fake
+def _bf16_attention_projection_fake(
+    raw, weight, unit, hidden, norm_weight, modulation, indices, eps
+):
+    return torch.empty_like(hidden), torch.empty_like(hidden)
 
 
 @torch.library.custom_op("h3_fp8::shared_output_cast", mutates_args=(), device_types="cuda")

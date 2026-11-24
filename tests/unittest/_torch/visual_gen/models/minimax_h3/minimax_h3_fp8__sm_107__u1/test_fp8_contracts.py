@@ -40,6 +40,7 @@ def _routing_namespace():
         "_transformer_layer_quant",
         "_ulysses_size",
         "route_fp8_sm_107_u1",
+        "route_fp8_u4",
         "route_nvfp4_sm_107_u1_u4",
         "resolve_scenario",
     }
@@ -202,7 +203,9 @@ def _config():
                 quant_config=_quant_config(),
                 quant_config_dict=None,
                 torch_dtype="BF16",
-                pretrained_config=SimpleNamespace(quantization_config=None),
+                pretrained_config=SimpleNamespace(
+                    quantization_config=None, num_attention_heads=56, attention_head_dim=128
+                ),
                 extra_attrs={},
             )
         },
@@ -212,12 +215,13 @@ def _config():
         force_dynamic_quantization=False,
         attention=SimpleNamespace(
             backend="CUDNN",
+            sparse_attention_config=None,
             quant_attention_config=SimpleNamespace(
                 qk_dtype="fp8",
                 v_dtype="fp8",
             ),
         ),
-        visual_gen_mapping=SimpleNamespace(ulysses_size=1),
+        visual_gen_mapping=SimpleNamespace(ulysses_size=1, world_size=1, cp_size=1),
         mapping=SimpleNamespace(tp_size=1),
         parallel=SimpleNamespace(parallel_vae_size=1, async_ulysses=False),
         torch_compile=SimpleNamespace(enable=True),
@@ -245,6 +249,29 @@ class RoutingContracts(unittest.TestCase):
                     os.environ["NVIDIA_TF32_OVERRIDE"] = value
                 with self.assertRaises(namespace["NoScenario"]):
                     namespace["route_fp8_sm_107_u1"](_config())
+
+    def test_fp8_ulysses_scenario_for_both_architectures(self):
+        cfg = _config()
+        cfg.visual_gen_mapping.ulysses_size = cfg.visual_gen_mapping.world_size = 4
+        cfg.parallel.parallel_vae_size = 4
+        module = ModuleType("_h3_fp8_cpu_contracts.minimax_h3_fp8__sm_103_107__u4.pipeline")
+        module.MiniMaxH3Fp8U4Pipeline = type("UlyssesPipeline", (), {})
+        for capability in ((10, 3), (10, 7)):
+            namespace = _routing_namespace()
+            namespace["_device_capability"] = lambda: capability
+            with (
+                self.subTest(capability=capability),
+                patch.dict(sys.modules, {module.__name__: module}),
+            ):
+                self.assertIs(
+                    namespace["resolve_scenario"](object, cfg), module.MiniMaxH3Fp8U4Pipeline
+                )
+                cfg.parallel.async_ulysses = True
+                try:
+                    with self.assertRaisesRegex(namespace["NoScenario"], "synchronous"):
+                        namespace["route_fp8_u4"](cfg)
+                finally:
+                    cfg.parallel.async_ulysses = False
 
     def test_unsupported_combinations_are_rejected_before_import(self):
         changes = [
@@ -679,9 +706,7 @@ class ForwardContract(unittest.TestCase):
             and "minimax_h3_fp8__sm_107__u1/kernels/" in node.value
         ]
         sources = {p.name for pattern in patterns for p in (REPO / "tensorrt_llm").glob(pattern)}
-        self.assertEqual(
-            sources, {"sharedCast.cpp", "sharedCast.cu", "staticQuant.cpp", "staticQuant.cu"}
-        )
+        self.assertEqual(sources, {"conversionBindings.cpp", "sharedCast.cu", "staticQuant.cu"})
 
     def test_heads_share_one_cast_through_the_family_hook(self):
         casts = []
@@ -819,6 +844,10 @@ def _fused_dispatch_namespace():
     )
     torch = SimpleNamespace(
         Tensor=_LayoutTensor,
+        tensor=lambda value, *, device, dtype: SimpleNamespace(
+            device=device, dtype=dtype, item=lambda: value
+        ),
+        int64="I64",
         bfloat16="BF16",
         float8_e4m3fn="FP8",
         ops=SimpleNamespace(
@@ -845,7 +874,12 @@ def _fused_dispatch_namespace():
     namespace = dict(
         torch=torch,
         _DispatchModule=type(
-            "_DispatchModule", (), {"__call__": lambda self, *a, **kw: self.forward(*a, **kw)}
+            "_DispatchModule",
+            (),
+            {
+                "__init__": lambda self, **kwargs: vars(self).update(kwargs),
+                "__call__": lambda self, *a, **kw: self.forward(*a, **kw),
+            },
         ),
         Optional=Optional,
         Linear=SimpleNamespace,
@@ -872,7 +906,7 @@ def _fused_dispatch_namespace():
         ),
         (
             MODEL / "transformer_minimax_h3.py",
-            {"MiniMaxH3TransformerBlock": {"_forward_fused_adaln"}},
+            {"MiniMaxH3TransformerBlock": {"_forward_fused_adaln", "_forward_mlp_residual"}},
         ),
         (
             MODEL / "minimax_h3_nvfp4__sm_107__u1_u4/modeling.py",
@@ -930,7 +964,9 @@ class FusedDispatchContracts(unittest.TestCase):
                 calls.append("family_ffn")
                 return tensor(hidden.shape)
 
-        attention = namespace["Fp8Attention"]()
+        attention = namespace["Fp8Attention"](layer_idx=0)
+        assert attention._fp8_block_id.device == "cpu"
+        assert attention._fp8_block_id.item() == attention.layer_idx
         attention.qkv_proj = Projection((21504, 5376))
         attention.to_out = [Projection((5376, 7168))]
         attention.use_async_ulysses = False
@@ -1036,7 +1072,9 @@ class LifecycleContracts(unittest.TestCase):
                         {"ConditioningCache", "_table_fake", "_table", "_time_forward"},
                         {
                             "torch": SimpleNamespace(
-                                empty=lambda shape, *, device, dtype: _LayoutTensor(shape, dtype)
+                                empty=lambda shape, *, device, dtype: _LayoutTensor(shape, dtype),
+                                tensor=lambda value, **kwargs: value,
+                                int64="INT64",
                             ),
                             "types": SimpleNamespace(MethodType=MethodType),
                             "OrderedDict": OrderedDict,
@@ -1085,7 +1123,12 @@ class LifecycleContracts(unittest.TestCase):
                     temb = _LayoutTensor((timesteps, 2688))
                     actual = cache.tables[0](temb)
                     fake = namespace["_table_fake"](
-                        temb, modulation.linear.weight, modulation.linear.bias, cache.identifier, 0
+                        temb,
+                        modulation.linear.weight,
+                        modulation.linear.bias,
+                        cache.identifier,
+                        0,
+                        modulation.linear.dtype,
                     )
                     self.assertEqual(fake.shape, actual.shape)
                     self.assertEqual(fake.dtype, actual.dtype)
@@ -1175,6 +1218,7 @@ class LifecycleContracts(unittest.TestCase):
                     ),
                     namespace,
                 )
+
                 transformer = SimpleNamespace(
                     proj_out=SimpleNamespace(weight=SimpleNamespace(device=target)),
                     _initialize_fp8=inner,
