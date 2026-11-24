@@ -601,6 +601,7 @@ def test_profile_close_settles_running_and_queued_calls_with_private_peer(
     requests = []
     executor = proxy._profile_control_executor
     original_submit = executor.submit
+    original_shutdown = executor.shutdown
     submit_count = 0
 
     def record_submit(*args, **kwargs):
@@ -611,7 +612,13 @@ def test_profile_close_settles_running_and_queued_calls_with_private_peer(
             submitted.set()
         return future
 
+    def record_shutdown(wait: bool = True, *, cancel_futures: bool = False) -> None:
+        original_shutdown(wait=wait, cancel_futures=cancel_futures)
+        if not wait:
+            allow_ack.set()
+
     monkeypatch.setattr(executor, "submit", record_submit)
+    monkeypatch.setattr(executor, "shutdown", record_shutdown)
 
     def worker():
         peer = IpcQueue(proxy.request_queue.address, is_server=False, recv_timeout=2.0)
@@ -648,7 +655,6 @@ def test_profile_close_settles_running_and_queued_calls_with_private_peer(
             with proxy._admission_lock:
                 proxy.doing_shutdown = True
                 proxy._PROFILE_SHUTDOWN_TIMEOUT_S = 2.0 if acknowledge else 0.05
-            allow_ack.set()
             proxy._close_profile_control()
             # No post-close sleep or join may hide a surviving owned worker.
             assert not owner.is_alive()
