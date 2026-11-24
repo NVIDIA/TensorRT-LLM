@@ -693,6 +693,41 @@ def test_workers_conditional_disaggregation(disaggregated_test_root,
         asyncio.run(tester.test_multi_round_request(prompts))
 
 
+# NOTE: this test does not test what its name claims, so it was removed from the test
+# lists. It never sets conditional_disagg_config, and ConditionalWorkerTester picks the
+# ctx or gen server itself, so the server's conditional disaggregation never runs.
+# Before restoring it, rename it or set conditional_disagg_config in its config.
+# Server-side conditional disagg is tested by
+# test_disaggregated_deepseek_v3_lite_bf16_conditional_v2.
+@pytest.mark.skip_less_device(2)
+@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
+                         indirect=True)
+def test_workers_conditional_disaggregation_deepseek_v3_lite_bf16(
+        disaggregated_test_root, disaggregated_example_root, llm_venv,
+        deepseek_v3_model_root):
+    config_file = os.path.join(
+        disaggregated_test_root,
+        'test_configs/disagg_config_cache_reuse_deepseek_v3.yaml')
+    model_root = f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/bf16"
+    src_dst_dict = {
+        deepseek_v3_model_root: model_root,
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    with background_workers(llm_venv,
+                            config_file) as (ctx_servers, gen_servers, _,
+                                             internal_request_auth_key):
+        tester = ConditionalWorkerTester(
+            ctx_servers,
+            gen_servers,
+            internal_request_auth_key=internal_request_auth_key)
+        prompts = load_default_prompts(disaggregated_example_root)
+        asyncio.run(tester.test_multi_round_request(prompts))
+
+
 def test_workers_kv_cache_events(disaggregated_test_root,
                                  disaggregated_example_root, llm_venv):
     config_file = os.path.join(disaggregated_test_root,
