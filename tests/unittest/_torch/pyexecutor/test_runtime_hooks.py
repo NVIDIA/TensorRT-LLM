@@ -21,6 +21,7 @@ import pytest
 import torch
 
 import tensorrt_llm
+from tensorrt_llm._torch.pyexecutor.request_delivery import ResponseChannel
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import (
     DEFAULT_RUNTIME_HOOKS,
     ExecutorEvents,
@@ -650,6 +651,8 @@ def _forward_step_executor(monkeypatch, log: list):
 
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: current)
     monkeypatch.setattr(torch.cuda, "stream", stream)
+    monkeypatch.setattr(py_executor, "current_cuda_stream", lambda: current)
+    monkeypatch.setattr(py_executor, "CudaStreamScope", stream)
     monkeypatch.setattr(py_executor, "nvtx_range", lambda message: (lambda fn: fn))
 
     executor = PyExecutor.__new__(PyExecutor)
@@ -713,7 +716,7 @@ def _cleanup_executor(events, completed: bool):
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
     executor = PyExecutor.__new__(PyExecutor)
-    executor.response_cv = threading.Condition()
+    executor._response_channel = ResponseChannel()
     executor.shutdown_event = threading.Event()
     executor._intake_window = threading.Event()
     executor.num_micro_batches = 0

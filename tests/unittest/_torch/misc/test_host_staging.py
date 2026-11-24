@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Pinned uploads remain correct while callers recycle pageable source storage."""
 
+from unittest.mock import Mock
+
 import pytest
 import torch
 
@@ -9,6 +11,7 @@ import tensorrt_llm
 from tensorrt_llm._torch import host_staging
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
@@ -68,6 +71,36 @@ def test_host_staging_respects_unpinned_policy(monkeypatch):
     host_staging.copy_host_to_device(store, "test", destination, source)
     torch.testing.assert_close(destination.cpu(), source, rtol=0, atol=0)
     assert not store
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_runner_teardown_finishes_upload_before_pinned_buffer_reuse() -> None:
+    runner = object.__new__(DecoderRunner)
+    runner._host_uploader = host_staging.HostUploader()
+    runner._graphs = Mock()
+    if runner._host_uploader._stream is None:
+        pytest.skip("pinned staging is disabled")
+    reader = torch.cuda.Stream()
+    expected = torch.arange(128, dtype=torch.int32)
+    # Allocate both slots before the delay: allocation itself may synchronize CUDA.
+    for _ in range(2):
+        runner._host_uploader.upload("teardown", expected)
+    torch.cuda.synchronize()
+    with torch.cuda.stream(runner._host_uploader._stream):
+        torch.cuda._sleep(200_000_000)
+    with torch.cuda.stream(reader):
+        observed = runner._host_uploader.upload("teardown", expected).clone()
+    uploaded = runner._host_uploader._rings["teardown"][0].uploaded
+    assert not uploaded.query(), "the upload completed before teardown was exercised"
+
+    runner.release_graphs()
+    assert uploaded.query()
+    del runner
+    replacement = torch.empty(expected.shape, dtype=expected.dtype, pin_memory=True)
+    replacement.fill_(-1)
+    reader.synchronize()
+
+    torch.testing.assert_close(observed.cpu(), expected, rtol=0, atol=0)
 
 
 _TOKENS_PER_BLOCK = 16

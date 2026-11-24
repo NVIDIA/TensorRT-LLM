@@ -4,20 +4,14 @@
 """Public cached_tokens evidence from a controlled, sequential repeat-prompt probe.
 
 No prompt ledger or inference about what an arbitrary evaluation should reuse.
-Requested snapshot settings size the probe; they are not attested engine facts.
+Requested snapshot settings size the probe; they are not what the engine resolved.
 A missing capacity, missing tokenizer, unsuitable budget or unsupported rank
 pinning is UNKNOWN, never a negative cache observation.
 """
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
 from typing import Any, Mapping
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-import engine_facts  # noqa: E402
 
 PROBE_TEXT = (
     "The river ran slowly past the mill, and the miller counted the sacks of grain "
@@ -33,6 +27,24 @@ def cached_tokens(output: Any) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
 
+def kv_capacity(llm: Any) -> dict[str, Any]:
+    """Rank 0's primary KV-cache pool, as its executor reports it; empty when it cannot.
+
+    ``LLM.get_kv_cache_capacity`` (``{"maxNumBlocks", "tokensPerBlock",
+    "maxNumTokens"}``) asks rank 0's executor, in this process or over the
+    proxy's RPC channel, so it answers at every world size.
+    """
+    read = getattr(llm, "get_kv_cache_capacity", None)
+    if not callable(read):
+        return {}
+    try:
+        capacity = read()
+    # Asking a live engine is an observation: it must never stop the gate's own workload.
+    except Exception:  # noqa: BLE001
+        return {}
+    return dict(capacity) if isinstance(capacity, Mapping) else {}
+
+
 def probe_prompt(tokenizer: Any, tokens: int) -> list[int]:
     """Ordinary tokenizer-produced text tokens, never arbitrary vocabulary ids."""
     ids = list(tokenizer.encode(PROBE_TEXT, add_special_tokens=False))
@@ -45,7 +57,7 @@ def probe(llm: Any, params: Any, requested: Mapping[str, Any]) -> dict[str, Any]
     """Repeat one prompt after completion on the same cache, with a unique cache salt."""
     record: dict[str, Any] = {"status": "UNKNOWN"}
     try:
-        capacity = engine_facts.kv_capacity(llm)
+        capacity = kv_capacity(llm)
         block = capacity.get("tokensPerBlock")
         if not isinstance(block, int) or block <= 0:
             return {**record, "skipped": "public KV capacity did not report tokensPerBlock"}

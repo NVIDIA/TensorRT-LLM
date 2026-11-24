@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import torch
 
 from tensorrt_llm._torch.models.checkpoints import model_hooks
+from tensorrt_llm._torch.models.checkpoints.mx.checkpoint_loader import MXCheckpointLoader
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
 from tensorrt_llm._torch.moe.fused_moe.weight_owner import is_moe_weight_owner
 from tensorrt_llm._torch.weight_sharing import (
@@ -33,6 +34,7 @@ from tensorrt_llm._torch.weight_sharing import (
     PHI3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN3_5_DENSE_VL_POST_TRANSFORM_LAYOUT_ABI_V1,
+    QWEN3_5_MOE_VL_CUTLASS_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN3_DENSE_FP8_BLOCK128_FP32SCALE_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN3_DENSE_TIED_POST_TRANSFORM_LAYOUT_ABI_V1,
@@ -143,6 +145,14 @@ _MX_DEEPSEEK_V3_BF16_CUTLASS_RUNTIME_CONSTRAINTS = replace(
     moe_cluster_sizes=frozenset({1}),
     first_k_dense_replaces=frozenset({1}),
     moe_layer_freqs=frozenset({1}),
+)
+# The Qwen3.5 MoE vision-language root realizes the Qwen3.5 vision-language
+# runtime (interleaved M-RoPE through the fused QK-norm/RoPE kernel) over the
+# Qwen3 MoE CUTLASS backend and partition pins.
+_MX_QWEN3_5_MOE_VL_BF16_CUTLASS_RUNTIME_CONSTRAINTS = replace(
+    _MX_QWEN3_MOE_BF16_CUTLASS_RUNTIME_CONSTRAINTS,
+    rope_types=_MX_QWEN3_5_VL_BF16_RUNTIME_CONSTRAINTS.rope_types,
+    rope_fusion=_MX_QWEN3_5_VL_BF16_RUNTIME_CONSTRAINTS.rope_fusion,
 )
 
 
@@ -321,6 +331,19 @@ MX_POST_TRANSFORM_PROFILE_REGISTRY = PostTransformProfileRegistry(
             transfer_scope=PostTransformTransferScope.TARGET_MODEL,
             runtime_constraints=_MX_DEEPSEEK_V3_BF16_CUTLASS_RUNTIME_CONSTRAINTS,
         ),
+        PostTransformProfile(
+            profile_id="qwen3_5-moe-for-conditional-generation-bf16-cutlass-complete-v1",
+            root_model_class=LazyRootModelIdentity(
+                "tensorrt_llm._torch.models.modeling_qwen3_5", "Qwen3_5MoeVLModel"
+            ),
+            architecture="Qwen3_5MoeForConditionalGeneration",
+            model_type="qwen3_5_moe",
+            speculative_mode=None,
+            protocol_version=MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+            transform_abi_id=QWEN3_5_MOE_VL_CUTLASS_POST_TRANSFORM_LAYOUT_ABI_V1,
+            transfer_scope=PostTransformTransferScope.COMPLETE_MODEL,
+            runtime_constraints=_MX_QWEN3_5_MOE_VL_BF16_CUTLASS_RUNTIME_CONSTRAINTS,
+        ),
     )
 )
 
@@ -444,6 +467,14 @@ def get_mx_load_weights_kwargs(
     return mx_kwargs
 
 
+def is_mx_weights_preloaded(checkpoint_loader: "BaseCheckpointLoader") -> bool:
+    """Whether the last read was an MX P2P load that wrote the weights into the model."""
+    return (
+        isinstance(checkpoint_loader, MXCheckpointLoader)
+        and checkpoint_loader.is_weights_preloaded()
+    )
+
+
 def get_mx_draft_load_weights_kwargs(checkpoint_loader: "BaseCheckpointLoader") -> dict[str, Any]:
     """Return the extra `load_weights` kwargs for the separate draft checkpoint."""
     if checkpoint_loader.checkpoint_format != CheckpointFormat.MX:
@@ -473,11 +504,11 @@ def _should_run_mx_staged_receiver_path(
         RuntimeError: the loader got post-transform weights but the load does
             not match a qualified profile.
     """
-    if checkpoint_loader.checkpoint_format != CheckpointFormat.MX or not weights_preloaded:
-        return False
-
-    method = getattr(type(checkpoint_loader), "is_post_transform_weights_preloaded", None)
-    if method is None or not checkpoint_loader.is_post_transform_weights_preloaded():
+    if not (
+        isinstance(checkpoint_loader, MXCheckpointLoader)
+        and weights_preloaded
+        and checkpoint_loader.is_post_transform_weights_preloaded()
+    ):
         return False
 
     profile = qualification.profile
@@ -534,52 +565,45 @@ def run_post_load_walks(
         model_hooks.walk_full_post_load(model)
 
 
-def post_load_publish(
+def publish_mx_weights(
     checkpoint_loader: "BaseCheckpointLoader",
     model: "DecoderModelForCausalLM",
     *,
-    checkpoint_dir: str,
     weights_preloaded: bool,
     qualification: PostTransformQualificationDecision,
     source_identity: Optional[SourceIdentity],
 ) -> None:
-    """Run the checkpoint loader's publish step after post-load processing.
+    """Publish the final weights through MX after post-load processing.
 
-    Any checkpoint loader may publish. For MX, only qualified profiles
-    publish, and the publish carries this rank's source identity.
+    Only an `MXCheckpointLoader` load with a qualified profile publishes, and
+    the publish carries this rank's source identity. Other loads do nothing.
     """
-    kwargs = {
-        "checkpoint_dir": checkpoint_dir,
-        "weights_preloaded": weights_preloaded,
-    }
-    if checkpoint_loader.checkpoint_format == CheckpointFormat.MX:
-        if not _is_mx_publish_allowed(
-            model, weights_preloaded=weights_preloaded, qualification=qualification
-        ):
-            return
-        kwargs["source_identity"] = source_identity
-    checkpoint_loader.post_load_publish(model, **kwargs)
+    if not isinstance(checkpoint_loader, MXCheckpointLoader):
+        return
+    if not _is_mx_publish_allowed(
+        model, weights_preloaded=weights_preloaded, qualification=qualification
+    ):
+        return
+    checkpoint_loader.publish_as_source(model, source_identity=source_identity)
 
 
 def run_post_load_walks_and_publish(
     checkpoint_loader: "BaseCheckpointLoader",
     model: "DecoderModelForCausalLM",
     *,
-    checkpoint_dir: str,
     weights_preloaded: bool,
     qualification: PostTransformQualificationDecision,
     source_identity: Optional[SourceIdentity],
 ) -> None:
-    """Run the per-module post-load hooks, then the checkpoint loader's publish step.
+    """Run the per-module post-load hooks, then publish the weights through MX.
 
-    `run_post_load_walks` followed by `post_load_publish`, for loads with
+    `run_post_load_walks` followed by `publish_mx_weights`, for loads with
     nothing to do in between. The GMS writer calls the two separately,
     because it moves stray parameters into its pool before publishing.
 
     Args:
         checkpoint_loader: checkpoint loader of this load
         model: model whose weights are in place
-        checkpoint_dir: checkpoint directory of the target model
         weights_preloaded: whether the checkpoint loader filled the model directly
         qualification: post-transform profile decision for this load
         source_identity: identity of this rank's model for MX, or None
@@ -590,10 +614,9 @@ def run_post_load_walks_and_publish(
         weights_preloaded=weights_preloaded,
         qualification=qualification,
     )
-    post_load_publish(
+    publish_mx_weights(
         checkpoint_loader,
         model,
-        checkpoint_dir=checkpoint_dir,
         weights_preloaded=weights_preloaded,
         qualification=qualification,
         source_identity=source_identity,

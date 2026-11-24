@@ -69,6 +69,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import PyResult
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor, WaitingState
 from tensorrt_llm._torch.pyexecutor.rank_failure_memory import StartupMemory
 from tensorrt_llm._torch.pyexecutor.rank_failure_recovery import RankFailureRecovery
+from tensorrt_llm._torch.pyexecutor.request_delivery import ResponseChannel
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import RankState
@@ -251,14 +252,12 @@ def _executor(rank=0):
         _wait_for_model_engine_input_copy=MagicMock(),
         resource_manager=SimpleNamespace(resource_managers={}),
         _staged_responses=[],
-        responses={},
-        response_cv=threading.Condition(),
+        _response_channel=ResponseChannel(),
     )
     for step in (
         "_accept_or_discard_previous_batch",
         "_discard_previous_batch",
         "flush_staged_responses",
-        "_publish_responses",
         "resume_at_iteration",
         "known_request_ids",
         "export_waiting_state",
@@ -525,7 +524,7 @@ def test_abort_exclusion_or_shutdown_ends_process(monkeypatch, record, status):
 def _loop_cleanup(recovery, fatal_error=None, completed=True):
     """Run the executor's cleanup after its loop ended and return the executor."""
     executor = SimpleNamespace(
-        response_cv=threading.Condition(),
+        _response_channel=ResponseChannel(),
         shutdown_event=threading.Event(),
         rank_failure_recovery=recovery,
         num_micro_batches=0,
@@ -889,7 +888,9 @@ def test_staged_final_response_does_not_count_as_lost():
     # staged. The outstanding requests below model the worker as ending the request as soon as
     # the response is published.
     executor._staged_responses = [(16, Mock(), None)]
-    r.recovery.set_outstanding_requests(lambda: {} if 16 in executor.responses else {16: 116})
+    r.recovery.set_outstanding_requests(
+        lambda: {} if 16 in executor._response_channel.responses else {16: 116}
+    )
 
     executor.iter_counter = 10
     r.recovery.before_iteration()
