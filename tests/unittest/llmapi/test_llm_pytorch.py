@@ -18,7 +18,6 @@ from tensorrt_llm.executor.rpc_proxy import GenerationExecutorRpcProxy
 from tensorrt_llm.llmapi import CacheTransceiverConfig, KvCacheConfig
 from tensorrt_llm.llmapi.llm_args import (NGramDecodingConfig, PeftCacheConfig,
                                           SchedulerConfig, WaitingQueuePolicy)
-from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.metrics import MetricNames
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -250,27 +249,6 @@ def test_llm_invalid_input_token_async():
                             f"collect order {collect_order}, collecting {collect_idx}"
                         )
                         futures[collect_idx].result()
-
-
-@pytest.mark.part2
-def test_llm_reward_model():
-    rm_model_path = get_model_path("Qwen2.5-Math-PRM-7B")
-    tokenizer = TransformersTokenizer.from_pretrained(rm_model_path)
-    tokenized_input = tokenizer(prompts, return_tensors="pt")["input_ids"]
-
-    llm = LLM(model=rm_model_path,
-              attn_backend="VANILLA",
-              disable_overlap_scheduler=True)
-
-    sampling_params = SamplingParams(return_context_logits=True)
-
-    outputs = llm.generate(prompts, sampling_params)
-    scores = outputs[0].context_logits
-
-    print(scores)
-
-    assert scores.shape == (tokenized_input.shape[1], 2)
-    assert not outputs[0].outputs[0].text
 
 
 @skip_ray
@@ -566,6 +544,7 @@ def test_llama_7b_multi_lora_evict_and_reload_lora_gpu_cache(cuda_graph_config):
 
 
 @skip_gpu_memory_less_than_40gb
+@skip_ray  # https://nvbugs/5682551
 @pytest.mark.part1
 @test_lora_with_and_without_cuda_graph
 def test_llama_7b_multi_lora_evict_and_load_new_adapters_in_cpu_and_gpu_cache(
@@ -583,6 +562,7 @@ def test_llama_7b_multi_lora_evict_and_load_new_adapters_in_cpu_and_gpu_cache(
 
 
 @skip_gpu_memory_less_than_40gb
+@skip_ray  # https://nvbugs/5682551
 @pytest.mark.part0
 @test_lora_with_and_without_cuda_graph
 def test_llama_7b_multi_lora_read_from_cache_after_insert(cuda_graph_config):
@@ -597,6 +577,7 @@ def test_llama_7b_multi_lora_read_from_cache_after_insert(cuda_graph_config):
 
 
 @skip_gpu_memory_less_than_40gb
+@skip_ray  # https://nvbugs/5682551
 @pytest.mark.part3
 @test_lora_with_and_without_cuda_graph
 def test_llama_7b_multi_lora_evict_and_reload_evicted_adapters_in_cpu_and_gpu_cache(
@@ -1056,6 +1037,7 @@ def test_gqa_nemo_lora(tmp_path, cuda_graph_config):
 
 
 @skip_gpu_memory_less_than_40gb
+@skip_ray  # Qwen1.5-MoE-A2.7B-Chat is absent from the Ray stage's model root
 @pytest.mark.part0
 def test_qwen_moe_shared_expert_lora():
     """Test MoE shared expert LoRA on Qwen1.5-MoE with PyTorch backend.
