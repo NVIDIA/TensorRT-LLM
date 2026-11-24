@@ -345,3 +345,113 @@ def test_rejected_rows_never_reset_stall_rounds_without_execution(parallelism):
                 assert executor._scheduler_stall_rounds == round_id + 1
                 assert not executor._scheduler_progress_since_vote
     assert all(ex._handle_errors.call_count == 2 for ex in executors)
+
+
+@pytest.mark.parametrize("rescheduled_at", [None, 10])
+@pytest.mark.parametrize("parallelism", ["tp", "cp", "pp"])
+def test_local_rejection_from_tick_zero_never_starts_a_request_on_one_rank(
+    parallelism, rescheduled_at
+):
+    """A local rejection only proposes a failure; batches change only by vote.
+
+    Rank 1 rejects request 7 on the first pass after a phase reset while rank 0
+    does not. Both ranks see the same schedule (TP/CP schedule the same inputs
+    deterministically; PP ranks run the first stage's broadcast), so the
+    rejection must neither drop 7 from rank 1's batch nor fail it before the
+    vote on pass 64.
+    """
+    num_passes = 64
+    barrier = threading.Barrier(2, timeout=5)
+    votes = [None, None]
+    gather_passes = [[], []]
+
+    def gather(rank, vote, pass_id):
+        gather_passes[rank].append(pass_id[0])
+        votes[rank] = vote
+        barrier.wait()
+        result = list(votes)
+        barrier.wait()
+        return result
+
+    request = SimpleNamespace(py_request_id=7)
+
+    def scheduled(pass_id):
+        # The scheduler fails a request only in a pass without progress.
+        if rescheduled_at is not None and pass_id >= rescheduled_at:
+            return [request]
+        return []
+
+    def run(rank, executor, pass_id):
+        executed = []
+        for pass_id[0] in range(num_passes):
+            batch = ScheduledRequests()
+            batch.generation_requests = scheduled(pass_id[0])
+            batch.failed_requests = [request] if rank == 1 and pass_id[0] == 0 else []
+            executor._fail_scheduler_requests(batch)
+            assert batch.failed_requests == []
+            executed.append([req.py_request_id for req in batch.all_requests()])
+            if pass_id[0] < num_passes - 1:
+                executor._handle_errors.assert_not_called()
+        return executed
+
+    executors, pass_ids = [], []
+    for rank in range(2):
+        executor = object.__new__(PyExecutor)
+        executor._reset_scheduler_failure_state()
+        assert executor._scheduler_failure_sync_tick == 0
+        executor._is_kv_manager_v2, executor.enable_attention_dp = True, False
+        executor.dist = SimpleNamespace(
+            tp_size=2 if parallelism == "tp" else 1,
+            cp_size=2 if parallelism == "cp" else 1,
+            pp_size=2 if parallelism == "pp" else 1,
+        )
+        pass_id = [None]
+        collective = {"tp": "tp_allgather", "cp": "tp_cp_allgather", "pp": "allgather"}[parallelism]
+        setattr(
+            executor.dist,
+            collective,
+            lambda vote, rank=rank, pass_id=pass_id: gather(rank, vote, pass_id),
+        )
+        executor.active_requests = [request]
+        executor._handle_errors = Mock()
+        executors.append(executor)
+        pass_ids.append(pass_id)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [
+            pool.submit(run, rank, executor, pass_id)
+            for rank, (executor, pass_id) in enumerate(zip(executors, pass_ids))
+        ]
+        executed = [future.result(timeout=10) for future in futures]
+
+    assert gather_passes == [[num_passes - 1], [num_passes - 1]]
+    # Every pass runs the same rows on both ranks: nobody starts 7 alone.
+    assert executed[0] == executed[1]
+    assert executed[0] == [
+        [7] if rescheduled_at is not None and p >= rescheduled_at else [] for p in range(num_passes)
+    ]
+    for executor in executors:
+        if rescheduled_at is None:
+            # The stalled request fails on both ranks in the same vote.
+            executor._handle_errors.assert_called_once_with(
+                "KV cache admission made no progress within the scheduler limit",
+                requests=[request],
+                charge_budget=False,
+            )
+        else:
+            # Scheduling it again withdraws rank 1's stale proposal.
+            executor._handle_errors.assert_not_called()
+        assert not executor._pending_scheduler_failures
+
+
+def test_v2_scheduler_reports_failures_only_from_a_pass_without_progress():
+    from tensorrt_llm._torch.pyexecutor.scheduler import KVCacheV2Scheduler
+
+    scheduler = object.__new__(KVCacheV2Scheduler)
+    scheduler._failed_requests = []
+    scheduler._stalled_schedules = KVCacheV2Scheduler._DEADLOCK_STALL_ITERS
+    request = SimpleNamespace(py_request_id=7, request_id=7)
+    # A pass that schedules anything never reports a failure, so a rank's
+    # rejected request is never in that rank's own batch for the pass.
+    scheduler._detect_deadlock([request], set(), [request], set(), made_progress=True)
+    assert scheduler._failed_requests == []
+    assert scheduler._stalled_schedules == 0
