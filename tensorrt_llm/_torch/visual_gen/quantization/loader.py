@@ -160,7 +160,10 @@ class DynamicLinearWeightLoader:
         name: str,
         module: Linear | None = None,
     ) -> None:
-        """Refuse static quant recipes against checkpoints without scales.
+        """Validate the checkpoint scales used by static quantization.
+
+        Static NVFP4 activation quantization requires a calibrated input scale
+        even when weights are quantized at load time.
 
         With ``dynamic_weight_quant=False`` the loader expects the checkpoint
         to provide pre-quantized weights plus their scale tensors. If a module
@@ -175,6 +178,27 @@ class DynamicLinearWeightLoader:
         closed: a high-precision weight under any static recipe is refused
         even when the expected scale names are unknown.
         """
+        if (
+            quant_algo == QuantAlgo.NVFP4
+            and module is not None
+            and getattr(getattr(module, "quant_method", None), "quantizes_nvfp4_activations", False)
+            and not module.force_dynamic_quantization
+        ):
+            input_scale = weight_dict.get("input_scale")
+            if (
+                input_scale is None
+                or input_scale.numel() != 1
+                or not torch.isfinite(input_scale).all()
+                or not (input_scale > 0).all()
+            ):
+                raise ValueError(
+                    f"Static NVFP4 activation quantization for module '{name}' requires a "
+                    "calibrated 'input_scale' tensor containing one finite, positive value "
+                    "in every checkpoint weight entry. Load-time weight quantization does "
+                    "not calibrate activations. Provide the calibrated scale or explicitly set "
+                    "quant_config.config_groups.<group>.input_activations.dynamic: true."
+                )
+
         if quant_algo is None or self.dynamic_weight_quant:
             return
 
@@ -222,38 +246,6 @@ class DynamicLinearWeightLoader:
             "enable load-time quantization by setting 'dynamic': true in "
             "quant_config."
         )
-
-    def _check_static_nvfp4_input_scale(
-        self,
-        module: Linear,
-        weight_dict: Dict[str, torch.Tensor],
-        quant_algo: Optional[QuantAlgo],
-        name: str,
-    ) -> None:
-        """Require calibration data when NVFP4 activations use a static scale."""
-        if (
-            quant_algo != QuantAlgo.NVFP4
-            or not getattr(
-                getattr(module, "quant_method", None), "quantizes_nvfp4_activations", False
-            )
-            or module.force_dynamic_quantization
-        ):
-            return
-
-        input_scale = weight_dict.get("input_scale")
-        if (
-            input_scale is None
-            or input_scale.numel() != 1
-            or not torch.isfinite(input_scale).all()
-            or not (input_scale > 0).all()
-        ):
-            raise ValueError(
-                f"Static NVFP4 activation quantization for module '{name}' requires a calibrated "
-                "'input_scale' tensor containing one finite, positive value in every checkpoint "
-                "weight entry. Load-time weight quantization does not calibrate activations. "
-                "Provide the calibrated scale or explicitly set "
-                "quant_config.config_groups.<group>.input_activations.dynamic: true."
-            )
 
     def _should_dynamic_quantize(
         self, weight_dict: Dict[str, torch.Tensor], quant_algo: Optional[QuantAlgo], name: str
@@ -421,11 +413,8 @@ class DynamicLinearWeightLoader:
         else:
             quant_algo = self._get_quant_algo_for_layer(name)
 
-        # Static (pre-quantized) recipes must not be loaded from checkpoints
-        # that do not carry the expected scale tensors.
         for weight_dict in weight_dicts:
             self._check_static_quant_scales(weight_dict, quant_algo, name, module)
-            self._check_static_nvfp4_input_scale(module, weight_dict, quant_algo, name)
 
         if quant_algo is not None and getattr(self.quant_config, "ignore_steps", []):
             for weight_dict in weight_dicts:
