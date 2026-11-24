@@ -40,6 +40,7 @@ from ....autotuner import (
 )
 from ....cute_dsl_utils import graph_safe_cute_tensor
 from ....flashinfer_utils import get_env_enable_pdl
+from ....modules.deterministic_linear import use_deterministic_linear
 from ....modules.fla.op import gdc_wait_with_memory_clobber
 from ....modules.low_m_gemm import low_m_gemm_dispatcher
 from ....modules.low_m_mma_gemm import candidate_tactics
@@ -1317,6 +1318,10 @@ class DecodeFront:
         # test in route_steps) would make dynamo specialize the dynamic token count, which piecewise CUDA graphs
         # need symbolic.
         if torch.compiler.is_compiling() or gate.out_dtype != torch.bfloat16:
+            return None
+        # The fronts run router GEMMs of their own, which split K. A gate that takes the fixed-K kernel for
+        # x keeps every row count on it, so the stock path serves these calls.
+        if use_deterministic_linear(x, gate.weight):
             return None
         m = x.shape[0] if x.dim() == 2 else 0
         route_front = m in self.route_steps
