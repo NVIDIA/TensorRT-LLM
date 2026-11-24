@@ -154,7 +154,7 @@ def test_eligible_generation_kv_exhaustion_still_raises(phase: RemoteTailPhase |
 
     with pytest.raises(
         RuntimeError,
-        match=r"V2 scheduler deadlock: 1 generation and 0 context and 0 generation-init request\(s\)",
+        match=r"V2 scheduler deadlock: 1 generation and 0 context request\(s\)",
     ):
         scheduler.schedule_request(active, set())
 
@@ -248,14 +248,12 @@ def test_category_changes_and_late_transfer_activation_wait_for_next_vote() -> N
         make_ctx_request(2, context_remaining_length=128),
         make_ctx_request(3, context_remaining_length=128),
     ]
-    phases = (RemoteTailPhase.CONTEXT, RemoteTailPhase.DECODE, RemoteTailPhase.MIXED)
-    for phase in phases:
+    for phase in (RemoteTailPhase.CONTEXT, RemoteTailPhase.DECODE, RemoteTailPhase.MIXED):
         scheduler.set_remote_tail_phase(phase, context_ids, generation_ids)
         result = scheduler.schedule_request(active, set())
         assert not result.context_requests
         assert not result.generation_requests
-    # Each scheduling pass releases the completion gate once and touches no cache.
-    assert manager.mock_calls == [call.begin_completion_admission(active)] * len(phases)
+    assert not manager.mock_calls
 
 
 def test_disabled_phase_preserves_existing_request_selection() -> None:

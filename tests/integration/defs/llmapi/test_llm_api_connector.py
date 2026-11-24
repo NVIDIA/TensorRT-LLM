@@ -3254,3 +3254,89 @@ def test_connector_adp_transfer_timeout(
     assert returncode != 0, output
     assert "Timed out waiting for an ADP KV connector transfer" in output, output
     assert "Process restart is required" in output, output
+
+
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.parametrize("chunked", [False, True])
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_connector_failed_load_recomputes_output(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    recording_connector: KvCacheConnectorConfig,
+    enforce_single_worker: None,
+    chunked: bool,
+    asynchronous: bool,
+) -> None:
+    """A poisoned prefix is recomputed, including across prefill chunks."""
+    _check_failed_load_output(monkeypatch, tmp_path, chunked, asynchronous, 1)
+
+
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.skip_less_device(2)
+@pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
+def test_connector_adp_failed_async_load_recomputes_output(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    recording_connector: KvCacheConnectorConfig,
+    disable_overlap_scheduler: bool,
+) -> None:
+    """One ADP owner recovers while its peer continues normal generation."""
+    monkeypatch.delenv("TLLM_WORKER_USE_SINGLE_PROCESS", raising=False)
+    _check_failed_load_output(monkeypatch, tmp_path, True, True, 2,
+                              disable_overlap_scheduler)
+
+
+def _check_failed_load_output(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    chunked: bool,
+    asynchronous: bool,
+    world_size: int,
+    disable_overlap_scheduler: bool = True,
+) -> None:
+    connector = KvCacheConnectorConfig(
+        connector_module="connector_test_backend",
+        connector_scheduler_class="FailedLoadConnectorScheduler",
+        connector_worker_class="FailedLoadConnectorWorker",
+    )
+    kwargs = dict(
+        model=f"{llm_models_root()}/Qwen3/Qwen3-0.6B",
+        backend="pytorch",
+        tensor_parallel_size=world_size,
+        enable_attention_dp=world_size > 1,
+        kv_connector_config=connector,
+        max_batch_size=1,
+        max_seq_len=1024,
+        max_num_tokens=128 if chunked else 1024,
+        enable_chunked_prefill=chunked,
+        disable_overlap_scheduler=disable_overlap_scheduler,
+        cuda_graph_config=None,
+        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1,
+                                      tokens_per_block=32,
+                                      use_kv_cache_manager_v2=True),
+    )
+    prompts = ["Explain how a computer stores information. " * 32] * world_size
+    params = SamplingParams(max_tokens=8, ignore_eos=True, temperature=0)
+    monkeypatch.setenv("TRTLLM_TEST_CONNECTOR_FAIL", "0")
+    with LLM(**kwargs) as baseline:
+        expected = [
+            out.outputs[0].token_ids
+            for out in baseline.generate(prompts, params)
+        ]
+    records = tmp_path / "failure-records"
+    monkeypatch.setenv("TRTLLM_TEST_CONNECTOR_RECORDS", str(records))
+    monkeypatch.setenv("TRTLLM_TEST_CONNECTOR_FAIL", "1")
+    monkeypatch.setenv("TRTLLM_TEST_CONNECTOR_ASYNC", str(int(asynchronous)))
+    with LLM(**kwargs) as recovering:
+        actual = [
+            out.outputs[0].token_ids
+            for out in recovering.generate(prompts, params)
+        ]
+    assert actual == expected
+    assert _connector_event_count(records, 0, "poisoned_load") == 1
+    assert _connector_event_count(records, 0, "declined_after_failure") == 1
+    assert _connector_event_count(records, 0, "dropped_saves") == 1
+    if asynchronous:
+        assert _connector_event_count(records, 0, "async_failed") == 1
+    if world_size > 1:
+        assert _connector_event_count(records, 1, "poisoned_load") == 0

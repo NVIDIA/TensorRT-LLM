@@ -435,9 +435,7 @@ def test_allocation_fence_is_the_cache_managers(manager):
     "index, declaration",
     [
         (2, "requires_block_aligned_reuse"),
-        (3, "drops_reuse_match_backoff"),
-        (4, "requires_completion_reservation"),
-        (5, "reports_failed_loads"),
+        (3, "reports_failed_loads"),
     ],
 )
 def test_tp_admission_declarations_must_agree(

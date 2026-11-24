@@ -5297,12 +5297,3 @@ def test_early_response_suppresses_repeat_and_leaves_terminal_for_normal_pass() 
     executor._handle_responses(emit_first_iter=False)
     assert len(executor._response_channel.responses[42]) == 2
     assert executor._terminate_request.call_count == 1
-
-
-@pytest.mark.parametrize("route", ["transceiver", "connector"])
-def test_completion_reservation_routes_cannot_rebalance_pools(route: str) -> None:
-    executor = object.__new__(PyExecutor)
-    executor.enable_kv_pool_rebalance = True
-    executor.kv_cache_transceiver = Mock() if route == "transceiver" else None
-    executor.kv_connector_manager = Mock() if route == "connector" else None
-    assert not executor._can_pause_for_rebalance()

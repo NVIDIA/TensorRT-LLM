@@ -13,6 +13,10 @@ l0_a10:
       stage: pre_merge
       backend: pytorch
   tests:
+  - llmapi/test_llm_api_connector.py::test_connector_failed_load_recomputes_output[False-False]
+  - llmapi/test_llm_api_connector.py::test_connector_failed_load_recomputes_output[False-True]
+  - llmapi/test_llm_api_connector.py::test_connector_failed_load_recomputes_output[True-False]
+  - llmapi/test_llm_api_connector.py::test_connector_failed_load_recomputes_output[True-True]
   # ------------- PyTorch tests ---------------
   - unittest/_torch/sampler/test_torch_sampler.py
   - unittest/_torch/sampler/test_finish_reasons_fused.py

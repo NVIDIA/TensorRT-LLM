@@ -9376,8 +9376,6 @@ class PyExecutor:
 
         _validate_connector_admission(
             getattr(self, "kv_connector_manager", None), request)
-        if self._is_kv_manager_v2:
-            self.kv_cache_manager.validate_completion_capacity(request)
         if getattr(self.model_engine, "_dspark_confidence_enabled", False):
             from ..speculative.dspark import validate_confidence_request
 
