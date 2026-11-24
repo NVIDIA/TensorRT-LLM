@@ -560,6 +560,33 @@ def test_death_and_shutdown_handoff_notifies_async_result_once(
     asyncio.run(run())
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("error_type", [None, TimeoutError, RuntimeError])
+def test_exit_pre_shutdown_preserves_explicit_errors(
+    monkeypatch: pytest.MonkeyPatch, error_type: type[Exception] | None
+) -> None:
+    proxy = _bare_proxy()
+    # Only the callback boundary is exercised; no executor resources were created.
+    proxy._shutdown_complete = True
+    error = error_type("teardown incomplete") if error_type is not None else None
+    pre_shutdown = Mock(return_value=None, side_effect=error)
+    warning = Mock()
+    monkeypatch.setattr(proxy, "pre_shutdown", pre_shutdown)
+    monkeypatch.setattr(proxy_module.logger, "warning", warning)
+
+    proxy._pre_shutdown_at_exit()
+    pre_shutdown.assert_called_once_with()
+    if error is None:
+        warning.assert_not_called()
+    else:
+        warning.assert_called_once()
+        assert "interpreter exit is incomplete" in warning.call_args.args[0]
+        assert str(error) in warning.call_args.args[0]
+        with pytest.raises(type(error)) as raised:
+            proxy.pre_shutdown()
+        assert raised.value is error
+
+
 def test_submit_fast_fails_when_engine_already_dead():
     """submit() must reject new work immediately once the engine is dead."""
     proxy = _bare_proxy()

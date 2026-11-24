@@ -480,9 +480,9 @@ class GenerationExecutorProxy(GenerationExecutor):
         # we have to notify workers to exit before MPI starts to wait them.
         try:
             threading._register_atexit(  # type: ignore[attr-defined]
-                self.pre_shutdown)
+                self._pre_shutdown_at_exit)
         except AttributeError:
-            atexit.register(self.pre_shutdown)
+            atexit.register(self._pre_shutdown_at_exit)
 
     def _check_mpi_futures(self) -> bool:
         """Check if any MPI worker future has completed (crashed/exited).
@@ -1496,6 +1496,15 @@ class GenerationExecutorProxy(GenerationExecutor):
         if ipc_dir is not None:
             shutil.rmtree(ipc_dir, ignore_errors=True)
             self._multi_frontend_ipc_dir = None
+
+    def _pre_shutdown_at_exit(self) -> None:
+        """Keep incomplete cleanup from skipping subsequent interpreter joiners."""
+        try:
+            self.pre_shutdown()
+        except Exception as error:  # noqa: BLE001 - preserve the exit callback chain
+            logger.warning(
+                f"Executor proxy pre-shutdown at interpreter exit is incomplete: {error}"
+            )
 
     def pre_shutdown(self) -> None:
         # The monitor may already be notifying workers. A concurrent closer
