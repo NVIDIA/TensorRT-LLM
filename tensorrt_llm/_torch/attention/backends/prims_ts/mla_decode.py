@@ -3188,9 +3188,10 @@ class BatchSparseMLADecodePagedTSWrapper:
     ):
         """Plan D512/D576 attention over one primary and an optional extra pool.
 
-        With ``compile=False``, resolve the plan without compiling or loading a
-        kernel. ``_state["compile_spec"]`` identifies the finalized specialization;
-        call ``plan()`` with compilation enabled before ``run()``.
+        With ``compile=False``, resolve the finalized specialization and
+        ``workspace_size_bytes`` without allocating launch buffers or compiling
+        or loading a kernel. Call ``plan()`` with compilation enabled before
+        ``run()``.
 
         ``kv_cache_format="nvfp4"`` uses the DS v4.1 D512 format: 256 packed
         E2M1 bytes followed by 32 E4M3 scales in linear block16 order. Every
@@ -3315,15 +3316,11 @@ class BatchSparseMLADecodePagedTSWrapper:
         )
         family = profile.family
         splits = profile.split_kv
-        max_rows = batch_size * max_q_len
         workspace = self._workspace_buffer
-        if workspace is None:
-            workspace = torch.empty(byte_end, device=device, dtype=torch.uint8)
-        _validate_workspace_buffer(workspace, device=device, required_bytes=byte_end)
-        buffers = {
-            name: _workspace_section_view(workspace, section)
-            for name, section in sections.items()
-        }
+        if workspace is not None:
+            _validate_workspace_buffer(
+                workspace, device=device, required_bytes=byte_end
+            )
         # Finalize the joint distribution in the main kernel or its existing
         # split-KV reducer. No per-source outputs or finishing launch are needed.
         if not reload_d576:
@@ -3342,7 +3339,19 @@ class BatchSparseMLADecodePagedTSWrapper:
                 kernel=kernel,
                 kernel_signature=_mla_kernel_compile_signature(kernel),
             )
-        compiled = _get_compiled_mla_decode(spec) if compile else None
+        if not compile:
+            self._state = dict(device=device, compile_spec=spec, compiled=None)
+            self.workspace_size_bytes = byte_end
+            return
+
+        max_rows = batch_size * max_q_len
+        if workspace is None:
+            workspace = torch.empty(byte_end, device=device, dtype=torch.uint8)
+        buffers = {
+            name: _workspace_section_view(workspace, section)
+            for name, section in sections.items()
+        }
+        compiled = _get_compiled_mla_decode(spec)
         self._state = dict(
             reload_d576=reload_d576,
             device=device,

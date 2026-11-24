@@ -132,8 +132,7 @@ def _plan_kernel_variants(
     if not candidates:
         return [], []
     sizes = {rows: _workspace_size(device, rows, heads, **plan_kwargs) for rows in candidates}
-    workspace = torch.empty(max(sizes.values()), device=device, dtype=torch.uint8)
-    wrapper = mla_decode.BatchSparseMLADecodePagedTSWrapper(workspace_buffer=workspace)
+    wrapper = mla_decode.BatchSparseMLADecodePagedTSWrapper()
     # A disk lookup is useful only if at least two misses could start a pool.
     can_fan_out = prims_ts_precompile.pool_enabled(local_ranks=local_ranks)
     variants = []
