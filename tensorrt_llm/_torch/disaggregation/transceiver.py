@@ -2508,6 +2508,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             session.cancel()
             if session.has_transferring_tasks():
                 has_transferring = True
+            elif getattr(self, "_ctx_need_tp_sync", False) or getattr(
+                self, "_ctx_need_pp_sync", False
+            ):
+                # A rank that drained first must not drop its retirement vote:
+                # its peers retire the session only when every rank reports it.
+                # The send reaper retires it on all ranks in the same round.
+                has_transferring = True
             elif session.close() is False:
                 has_transferring = True
             else:

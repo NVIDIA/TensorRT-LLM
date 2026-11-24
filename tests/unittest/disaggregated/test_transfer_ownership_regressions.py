@@ -3452,10 +3452,16 @@ def test_failed_receive_stops_waiting_for_a_silent_writer(
 
     clock["t"] += 0.5
     assert not session.failed_receive_awaits_writers()
-    assert not session.has_transferring_tasks()
     if cancelled:
+        # A cancelled receive keeps the silent writer's KV pages until it settles.
+        assert session.has_transferring_tasks()
+        assert transceiver.check_gen_transfer_status(None) == ([], [], [])
+        assert transceiver._recv_sessions == {rid: session}
+        session.process_kv_agent_result(4, 0, True, AgentResult.FAILED, _KV_RESULT_REPORT_TOKEN)
+        assert not session.has_transferring_tasks()
         assert transceiver.check_gen_transfer_status(None) == ([], [], [request])
     else:
+        assert not session.has_transferring_tasks()
         assert transceiver.check_gen_transfer_status(None) == ([], [rid], [])
         assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
     assert rid not in receiver._sessions

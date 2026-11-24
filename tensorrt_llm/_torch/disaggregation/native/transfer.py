@@ -5544,9 +5544,6 @@ class RxSession(RxSessionBase):
         if not self._enforce_physical_ownership:
             if self._bounce_writers_pending():
                 return False
-            if self._writer_wait_expired and not self._uses_legacy_bounce:
-                # failed_receive_awaits_writers presumed the silent writers gone.
-                return True
             if self._terminal_status == SessionStatus.CANCELLED:
                 return (
                     not any(

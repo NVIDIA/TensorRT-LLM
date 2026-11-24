@@ -23,6 +23,7 @@ from unittest.mock import MagicMock, Mock, patch
 import numpy as np
 import pytest
 import torch
+from _torch.disaggregation.fake_dist import FakeDistGroup
 from _torch.pyexecutor.executor_test_utils import make_partial_executor
 from torch.multiprocessing.reductions import StorageWeakRef
 
@@ -2830,14 +2831,8 @@ def test_held_transfer_failure_keeps_other_lora_requests_schedulable(pp_size):
     assert set(executor.inflight_req_ids) == {9}
 
 
-def test_failed_partial_pipelined_prefill_retires_its_send_session(monkeypatch):
-    """A forward failure after an earlier pipelined chunk retires that send locally.
-
-    The failure is parked, so no later chunk runs and the send never gets its
-    last slice, and the generation side never cancels. The send is cancelled
-    when the failure is parked; the reaper retires it only once its submitted
-    write drains, and the original error is then reported exactly once.
-    """
+def _partial_prefill_rank(dist, tp_size, *, write_in_flight):
+    """One CTX rank whose pipelined send has an earlier chunk's write submitted."""
     from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
     from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 
@@ -2846,7 +2841,7 @@ def test_failed_partial_pipelined_prefill_retires_its_send_session(monkeypatch):
 
         def __init__(self):
             self.status = SessionStatus.READY
-            self.write_in_flight = True
+            self.write_in_flight = write_in_flight
             self.cancel_calls = 0
             self.closed = False
 
@@ -2891,22 +2886,16 @@ def test_failed_partial_pipelined_prefill_retires_its_send_session(monkeypatch):
     transceiver._rank_info_start_failures = None
     transceiver._pending_rank_info_admissions = None
     transceiver._ever_had_send_session = True
-    transceiver._ctx_need_tp_sync = False
+    transceiver._dist = dist
+    transceiver._ctx_need_tp_sync = tp_size > 1
     transceiver._ctx_need_pp_sync = False
     transceiver._transfer_worker = Mock()
-    transceiver._ctx_consensus = list
-    transceiver._ctx_consensus_outcome = lambda _rids, cancelled, failed, completed, quiesced: (
-        cancelled,
-        failed,
-        completed,
-        quiesced,
-    )
 
     coordinator = object.__new__(DisaggTransferCoordinator)
     coordinator._transceiver = transceiver
     coordinator._unpublished_gen_receives = {}
-    # The partial send is not in the transfer manager; the idle poll must reap it.
-    coordinator._dist = Mock(world_size=1)
+    # The partial send is not in the transfer manager; only the reaper retires it.
+    coordinator._dist = dist
     coordinator._transfers = Mock()
     coordinator._transfers.has_any_inflight_requests.return_value = False
     coordinator._transfers.requests_in_transfer.return_value = {}
@@ -2919,7 +2908,7 @@ def test_failed_partial_pipelined_prefill_retires_its_send_session(monkeypatch):
     executor._error_budget = Mock()
     executor._fatal_error = None
     executor.enable_attention_dp = False
-    executor.dist = Mock(world_size=1)
+    executor.dist = Mock(world_size=tp_size)
     executor._pending_transfer_responses = []
     executor._pending_response_terminations = []
     executor.kv_cache_transceiver = transceiver
@@ -2931,41 +2920,89 @@ def test_failed_partial_pipelined_prefill_retires_its_send_session(monkeypatch):
     executor._terminate_request = Mock()
     executor._wait_for_model_engine_input_copy = Mock()
     executor.active_requests = [request]
+    return types.SimpleNamespace(
+        request=request,
+        session=session,
+        transceiver=transceiver,
+        coordinator=coordinator,
+        executor=executor,
+        responses=responses,
+    )
 
-    executor._handle_errors("forward failed", requests=[request], charge_budget=False)
-    # A later error while the write is in flight keeps the original outcome.
-    executor._handle_errors("transfer failed", requests=[request], charge_budget=False)
 
-    # Cancelled locally (which notifies the generation side), but the submitted
-    # write still reads the pages: nothing is released or reported yet.
-    assert session.status == SessionStatus.CANCELLED
-    assert session.cancel_calls == 2
-    for _ in range(2):
-        assert transceiver.check_context_transfer_status(0) == ([], [])
-        executor._sweep_transfer_held_failures()
-    assert transceiver._send_sessions == {5: session}
-    assert not session.closed
-    assert executor._held_transfer_failures() == {id(request): (request, "forward failed")}
-    assert executor.active_requests == [request]
-    executor._terminate_request.assert_not_called()
-    assert responses == []
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_failed_partial_pipelined_prefill_retires_its_send_session(monkeypatch, tp_size):
+    """A forward failure after an earlier pipelined chunk retires that send on every rank.
 
-    session.write_in_flight = False
+    The failure is parked, so no later chunk runs and the send never gets its
+    last slice, and the generation side never cancels. The send is cancelled
+    when the failure is parked. On TP2 the first rank's write has already
+    drained while the last rank's is in flight: the drained rank keeps its
+    session, so both ranks retire it in the same reaper round once the last
+    write drains, and each reports the original error exactly once.
+    """
+    from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
+
     monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
-    coordinator.poll_progress_when_idle()
-    assert session.closed
-    assert transceiver._send_sessions == {}
-    assert request.py_kv_send_session_retired
-
-    executor._sweep_transfer_held_failures()
-    executor._sweep_transfer_held_failures()
-
-    assert executor._held_transfer_failures() == {}
-    assert executor.active_requests == []
-    executor._terminate_request.assert_called_once_with(request)
-    assert [(req_id, response.error_msg) for req_id, response in responses] == [
-        (5, "forward failed")
+    group = FakeDistGroup(world_size=tp_size, tp_size=tp_size)
+    ranks = [
+        _partial_prefill_rank(group.rank(rank), tp_size, write_in_flight=rank == tp_size - 1)
+        for rank in range(tp_size)
     ]
+
+    def reap_round(rank):
+        state = ranks[rank]
+        if tp_size == 1:
+            # A single-rank worker also reaps the open send from its idle poll.
+            state.coordinator.poll_progress_when_idle()
+        else:
+            state.coordinator.reap_context_sends(0)
+        state.executor._sweep_transfer_held_failures()
+
+    for state in ranks:
+        state.executor._handle_errors(
+            "forward failed", requests=[state.request], charge_budget=False
+        )
+        # A later error while the write is in flight keeps the original outcome.
+        state.executor._handle_errors(
+            "transfer failed", requests=[state.request], charge_budget=False
+        )
+
+    # Cancelled locally (which notifies the generation side), but a submitted
+    # write still reads the pages on one rank: nothing is released or reported.
+    for _ in range(5):
+        for state in ranks:
+            assert state.session.status == SessionStatus.CANCELLED
+            assert state.session.cancel_calls == 2
+            assert state.transceiver._send_sessions == {5: state.session}
+            assert not state.session.closed
+            assert state.executor._held_transfer_failures() == {
+                id(state.request): (state.request, "forward failed")
+            }
+            assert state.executor.active_requests == [state.request]
+            state.executor._terminate_request.assert_not_called()
+            assert state.responses == []
+        group.run(reap_round)
+
+    ranks[-1].session.write_in_flight = False
+    group.run(reap_round)
+    for state in ranks:
+        assert state.session.closed
+        assert state.transceiver._send_sessions == {}
+        assert state.request.py_kv_send_session_retired
+        assert state.executor._held_transfer_failures() == {}
+        assert state.executor.active_requests == []
+
+    group.run(reap_round)
+    for state in ranks:
+        state.executor._terminate_request.assert_called_once_with(state.request)
+        assert [(req_id, response.error_msg) for req_id, response in state.responses] == [
+            (5, "forward failed")
+        ]
+    assert all(
+        [name for name, _ in group.rank(rank).calls] == [name for name, _ in group.rank(0).calls]
+        for rank in range(tp_size)
+    )
 
 
 class TestComputeScheduledTokens:
