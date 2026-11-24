@@ -27,7 +27,8 @@ def test_copy_of_device_media_is_complete_when_it_returns(monkeypatch):
     with no view of that stream. ``copy()`` returns only once its reads are done,
     so a slot overwritten right after the return cannot leak into the owned copy.
     The event recorded right behind the clone on that stream says whether the
-    clone had finished when ``copy()`` returned."""
+    clone had finished when ``copy()`` returned; the same event, queried when the
+    clone is issued, proves the clone was still waiting behind the pending work."""
     slot = torch.full((16 << 20,), 1, dtype=torch.uint8, device="cuda")
     result = SessionResult(1, 0, 0, {"video": slot}, {"video": (0, 1)}, False, None)
     worker = torch.cuda.Stream()
@@ -35,17 +36,20 @@ def test_copy_of_device_media_is_complete_when_it_returns(monkeypatch):
     torch.cuda._sleep(2_000_000_000)  # the caller's own pending work, ahead of the clone
     clone = torch.Tensor.clone
     cloned = []
+    waiting_when_issued = []
 
     def clone_then_mark(tensor, *args, **kwargs):
         out = clone(tensor, *args, **kwargs)
         cloned.append(torch.cuda.Event())
         cloned[-1].record()
+        waiting_when_issued.append(not cloned[-1].query())
         return out
 
     monkeypatch.setattr(torch.Tensor, "clone", clone_then_mark)
     keep = result.copy()
     monkeypatch.undo()
-    assert len(cloned) == 1 and cloned[0].query(), "copy() returned before its clone finished"
+    assert waiting_when_issued == [True], "the clone did not wait behind the pending work"
+    assert cloned[0].query(), "copy() returned before its clone finished"
     with torch.cuda.stream(worker):
         slot.fill_(2)  # the worker's next advance writing the reused slot
     torch.cuda.synchronize()

@@ -1157,7 +1157,12 @@ class _RankProcess:
             )
         self.exited_at = None
         self._watch = threading.Thread(target=self._wait, daemon=True)
-        self._watch.start()
+        try:
+            self._watch.start()
+        except BaseException:
+            self._proc.kill()
+            self._proc.wait()
+            raise
 
     def _wait(self):
         self._proc.wait()
@@ -1219,6 +1224,28 @@ def start_rank(tmp_path):
         if proc.is_alive():
             proc.kill()
         proc.join(timeout=10)
+
+
+def test_rank_process_that_fails_to_set_up_leaves_no_child_behind(tmp_path, monkeypatch):
+    spawned = []
+    real_popen = subprocess.Popen
+
+    def recording_popen(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        spawned.append(proc)
+        return proc
+
+    def refuse_to_start(thread):
+        raise RuntimeError("can't start new thread")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(subprocess, "Popen", recording_popen)
+        patch.setattr(threading.Thread, "start", refuse_to_start)
+        with pytest.raises(RuntimeError, match="can't start new thread"):
+            _RankProcess(0, _free_port(), -1, "none", tmp_path, COLLECTIVE_TIMEOUT_S)
+
+    (child,) = spawned
+    assert child.returncode is not None, "the rank process outlived its failed setup"
 
 
 def _free_port():

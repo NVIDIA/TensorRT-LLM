@@ -1295,6 +1295,8 @@ def test_worker_failure_shutdown_does_not_wait_for_thread_timeout() -> None:
     client.event_loop_ready = threading.Event()
     client._init_ipc = MagicMock(return_value=True)
     client._cleanup_ipc = MagicMock()
+    client._sessions = {}
+    client._sessions_lock = threading.Lock()
     client.background_thread = threading.Thread(target=client._serve_forever_thread)
     client.background_thread.start()
 
@@ -1340,6 +1342,8 @@ def test_worker_failure_result_remains_available_until_shutdown() -> None:
     client.completed_responses = {}
     client._init_ipc = MagicMock(return_value=True)
     client._cleanup_ipc = MagicMock()
+    client._sessions = {}
+    client._sessions_lock = threading.Lock()
     client.background_thread = threading.Thread(target=client._serve_forever_thread)
     client.background_thread.start()
 
