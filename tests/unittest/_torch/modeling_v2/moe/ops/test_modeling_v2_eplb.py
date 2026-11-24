@@ -194,7 +194,10 @@ def _placement(experts: int, slots: int, ep_size: int, hot_replicas: int, seed: 
     order = torch.randperm(experts, generator=g).tolist()
     per_rank, spare = experts // ep_size, (slots - experts) // ep_size
     hot = order[-1]
-    extra = [hot] * min(hot_replicas - 1, ep_size * spare)
+    # Rank 0's first spare slot is kept for its second copy, so no copy of `hot` lands there.
+    kept = 1 if spare else 0
+    copies = min(hot_replicas - 1, ep_size * spare - kept)
+    extra = [None] * kept + [hot] * copies
     extra += [e for e in order if e != hot][: ep_size * spare - len(extra)]
     out = []
     for rank in range(ep_size):
@@ -203,6 +206,7 @@ def _placement(experts: int, slots: int, ep_size: int, hot_replicas: int, seed: 
         if rank == 0 and spare:
             mine[0] = own[0]
         out += own + mine
+    assert out.count(hot) == 1 + copies, (out.count(hot), hot_replicas)
     return out
 
 

@@ -180,6 +180,13 @@ def route(
         raise NoTarget(
             f"{eplb} EPLB at parallel layout {split}; the default target runs EPLB at dep4 and dep8"
         )
+    # Warmup placement re-places the experts of the layers registered with its controller;
+    # the target registers its layers with the balancer only, so the placement would never move.
+    if eplb is not None and getattr(model_config.moe_load_balancer, "warmup_placement", None):
+        raise NoTarget(
+            f"{eplb} EPLB with moe_config.load_balancer.warmup_placement; the default target "
+            "keeps its configured placement and does not take part in warmup placement"
+        )
 
     # Attention TP across nodes reduces only over multi-node NVLink.
     if not tp_reaches_across_nodes(mapping):
