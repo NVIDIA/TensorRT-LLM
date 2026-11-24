@@ -1150,3 +1150,74 @@ def test_decoder_runner_forward_enters_model_context() -> None:
 
     engine._forward_decoder.assert_called_once_with(inputs, resources, is_dummy=False)
     assert get_model_extra_attrs() is None
+
+
+@pytest.mark.cpu_only
+def test_full_context_rows_reach_their_own_requests() -> None:
+    """Without the context-logits plan, each request keeps its own prompt rows and sampling row."""
+    from tensorrt_llm._torch.pyexecutor.context_logits_plan import (
+        context_logits_rows,
+        sampling_rows_from_full_rows,
+    )
+    from tensorrt_llm._torch.pyexecutor.handle_logits import HandleLogits
+
+    stored: dict[int, torch.Tensor] = {}
+
+    def request(
+        request_id: int, chunk: int, *, returns: bool, guided: object | None = None
+    ) -> SimpleNamespace:
+        def append_context_logits(logits: torch.Tensor, reusable: bool = False) -> None:
+            stored[request_id] = logits.clone()
+
+        return SimpleNamespace(
+            request_id=request_id,
+            context_chunk_size=chunk,
+            prepopulated_prompt_len=0,
+            py_return_context_logits=returns,
+            py_context_logits_explicit=returns,
+            py_prompt_logprobs=None,
+            py_return_generation_logits=False,
+            py_use_chunked_generation_logits=False,
+            py_logits_post_processors=None,
+            py_guided_decoding_params=guided,
+            state=None,
+            py_result=SimpleNamespace(append_context_logits=append_context_logits),
+        )
+
+    # Prompt chunks of 2, 3 and 4 tokens (the middle request returns no
+    # context logits), then one generation row; every row holds its own values.
+    first = request(1, 2, returns=True)
+    middle = request(2, 3, returns=False)
+    last = request(3, 4, returns=True)
+    generation = request(4, 1, returns=False)
+    contexts = [first, middle, last]
+    full = torch.arange(10 * 3, dtype=torch.float32).reshape(10, 3)
+
+    kept = sampling_rows_from_full_rows(contexts, full)
+    torch.testing.assert_close(kept, full[[1, 4, 8, 9]])
+
+    prefix_sum = [0]
+    for context in contexts:
+        prefix_sum.append(
+            prefix_sum[-1] + context_logits_rows(context, context_logits_handled=True)
+        )
+    HandleLogits()(
+        contexts,
+        [generation],
+        kept,
+        1,
+        prefix_sum,
+        context_logits_handled=True,
+        full_context_logits=full,
+    )
+    assert stored.keys() == {1, 3}
+    torch.testing.assert_close(stored[1], full[0:2])
+    torch.testing.assert_close(stored[3], full[5:9])
+
+    # When every prompt request returns its context logits, the every-token
+    # rows stay, unless a guided-decoding mask would read one row per request.
+    plain = request(5, 2, returns=True)
+    guided = request(6, 3, returns=True, guided=object())
+    for requests, expected in (([plain], False), ([plain, guided], True)):
+        batch = SimpleNamespace(context_requests=requests, all_requests=lambda r=requests: r)
+        assert decoder_runner_module._needs_sampling_row_copy(batch) is expected

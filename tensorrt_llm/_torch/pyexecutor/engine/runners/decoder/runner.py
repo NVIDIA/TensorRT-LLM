@@ -34,9 +34,10 @@ from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
 from tensorrt_llm._torch.pyexecutor import device_copy, h2d_cache, step_inputs
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import BreakableCUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.context_logits_plan import (
+    FULL_CONTEXT_LOGITS_KEY,
     ContextLogitsPlan,
     context_logits_rows,
-    store_context_logits_from_full_rows,
+    sampling_rows_from_full_rows,
 )
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     CUDAGraphRunner,
@@ -184,12 +185,12 @@ def _holds_token_rows(logits: object) -> bool:
     return isinstance(logits, torch.Tensor) and not logits.is_nested and logits.dim() == 2
 
 
-def _full_context_rows_need_storing(scheduled_requests: ScheduledRequests) -> bool:
-    """Whether every-token logits must be stored and dropped before post-processing.
+def _needs_sampling_row_copy(scheduled_requests: ScheduledRequests) -> bool:
+    """Whether the sampling rows must be copied out of every-token logits before post-processing.
 
-    They can stay for the sampler only when every row is a requested context
-    row (no other context request, whose single sampling row the sampler
-    expects) and nothing edits a row before the sampler: no logits
+    The every-token rows can stay for the sampler only when every row is a
+    requested context row (no other context request, whose single sampling row
+    the sampler expects) and nothing edits a row before the sampler: no logits
     post-processor, and no guided decoding, whose mask reads one row per
     request.
     """
@@ -1017,17 +1018,20 @@ class DecoderRunner(ScheduledModelRunner):
                 and isinstance(outputs, dict)
                 and _holds_token_rows(outputs.get("logits"))
                 and not outputs.get("context_logits_handled", False)
-                and _full_context_rows_need_storing(semantic_requests)
+                and _needs_sampling_row_copy(semantic_requests)
             ):
                 # Without the plan the LM head projected every context token of
-                # every context request. Store the requested context logits
-                # before any post-processor edits a row, and leave the plan's
-                # layout: one sampling row per context request.
+                # every context request. Post-processors and guided-decoding
+                # masks edit a copy in the plan's layout, one sampling row per
+                # context request; the every-token rows stay unedited and
+                # HandleLogits stores their context logits when the step is
+                # sampled, after the previous batch is harvested.
                 outputs = {
                     **outputs,
-                    "logits": store_context_logits_from_full_rows(
+                    "logits": sampling_rows_from_full_rows(
                         semantic_requests.context_requests, outputs["logits"]
                     ),
+                    FULL_CONTEXT_LOGITS_KEY: outputs["logits"],
                     "context_logits_handled": True,
                 }
             if isinstance(outputs, dict) and outputs.get(GREEDY_TOKENS_KEY) is not None:

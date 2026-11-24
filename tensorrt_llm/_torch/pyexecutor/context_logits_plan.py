@@ -75,8 +75,9 @@ def context_logits_rows(request: LlmRequest, *, context_logits_handled: bool) ->
 
     Args:
         request: A context request of the step.
-        context_logits_handled: Whether the step's context logits were already
-            stored, by the plan or from every-token rows.
+        context_logits_handled: Whether the step's logits hold one row per
+            context request: the plan stored the context logits, or the forward
+            copied the sampling rows out of every-token logits.
 
     Returns:
         The number of rows.
@@ -86,16 +87,22 @@ def context_logits_rows(request: LlmRequest, *, context_logits_handled: bool) ->
     return 1
 
 
-def store_context_logits_from_full_rows(
+# Key of a step's outputs that holds every-token logits whose context logits are
+# stored when the step is sampled, after the sampling rows were taken from them.
+FULL_CONTEXT_LOGITS_KEY = "full_context_logits"
+
+
+def sampling_rows_from_full_rows(
     context_requests: Sequence[LlmRequest], logits: torch.Tensor
 ) -> torch.Tensor:
-    """Store context logits from logits that hold every context token; keep the sampling rows.
+    """Take the sampling rows out of logits that hold every context token.
 
     Without the context-logits plan, a step that gathers context logits projects
-    every scheduled context token, for every context request. Storing the
-    requested chunks here, before any logits post-processor runs, keeps them the
-    model's own scores, as the plan does; what remains is the plan's layout, one
-    row per context request followed by the other rows.
+    every scheduled context token, for every context request. The returned copy
+    has the plan's layout, one row per context request followed by the other
+    rows, so logits post-processors and guided-decoding masks edit the copy and
+    leave the context logits in ``logits`` as the model's own scores.
+    ``HandleLogits`` stores them when the step is sampled.
 
     Args:
         context_requests: The step's context requests, in row order.
@@ -113,16 +120,11 @@ def store_context_logits_from_full_rows(
             f"{num_context_tokens} scheduled context tokens"
         )
     kept: list[torch.Tensor] = []
-    start = 0
+    end = 0
     for request in context_requests:
-        end = start + request.context_chunk_size
-        if request.py_return_context_logits:
-            # Copied into the request's own storage before returning: logits
-            # may be a graph's static output that the next replay overwrites.
-            store_context_logits(request, logits[start:end], reusable=True)
+        end += request.context_chunk_size
         kept.append(logits[end - 1 : end])
-        start = end
-    kept.append(logits[start:])
+    kept.append(logits[end:])
     # Slices rather than an index tensor, whose host-to-device copy would wait
     # for the forward to finish.
     return torch.cat(kept)

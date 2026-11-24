@@ -25,6 +25,7 @@ class HandleLogits:
         beam_width: int,
         num_context_logits_prefix_sum: list[int],
         context_logits_handled: bool = False,
+        full_context_logits: torch.Tensor | None = None,
     ):
         """Handles context and generation logits for a batch of requests.
 
@@ -34,10 +35,24 @@ class HandleLogits:
             logits: Input logits tensor
             beam_width: Beam width for the generation requests
             num_context_logits_prefix_sum: Prefix sum of the logits
+            context_logits_handled: Whether ``logits`` holds one row per context
+                request, with the context logits stored elsewhere
+            full_context_logits: Every-token logits of the step, whose context
+                logits are stored here, when the forward copied the sampling
+                rows out of them
         """
         if not any(r.py_return_context_logits or r.py_return_generation_logits
                    for r in chain(context_requests, generation_requests)):
             return
+
+        if full_context_logits is not None:
+            logits_begin = 0
+            for llm_req in context_requests:
+                logits_end = logits_begin + llm_req.context_chunk_size
+                if llm_req.py_return_context_logits:
+                    store_context_logits(
+                        llm_req, full_context_logits[logits_begin:logits_end])
+                logits_begin = logits_end
 
         # Copy logits into the per-request logits buffers
         for batch_index, llm_req in enumerate(context_requests):
