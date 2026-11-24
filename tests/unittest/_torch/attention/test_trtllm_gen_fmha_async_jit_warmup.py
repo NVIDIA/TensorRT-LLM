@@ -122,9 +122,14 @@ def test_first_requests_after_readiness_do_not_jit_compile(
 
     # The warmup must have gone through the NVRTC path, otherwise the
     # invariant below would hold vacuously.  Skip when the model/config does
-    # not trigger NVRTC compilation on this GPU (e.g. dense models on B200,
-    # where shouldUseNvrtc only fires for sparse-token or head-dim-per-stage
-    # configurations); the test is only meaningful on configs that do.
+    # not trigger NVRTC compilation on this GPU (e.g. dense GQA models on B200,
+    # where shouldUseNvrtc fires only for static-token-sparse configs or
+    # SwapsMmaAbForGeneration kernels this model does not select).  The async
+    # barrier, the background worker and the verify pass are covered by
+    # test_fmha_jit_warmup_barrier.py (CPU) and fmhaJitWarmupTest.cpp (host);
+    # this test's unique value is the no-post-readiness invariant, which only
+    # applies when NVRTC is exercised.  The asserts above (async_enabled,
+    # all_generated) still run regardless of the skip.
     if result["misses_ready"] == result["misses_before"]:
         pytest.skip(
             "this model/config does not exercise the TRTLLM-Gen JIT path "
