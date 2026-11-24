@@ -26,7 +26,7 @@ from __future__ import annotations
 import functools
 import itertools
 import pickle  # nosec B403
-from typing import Callable, Iterator, Optional, Protocol, Sequence
+from typing import Any, Callable, Iterator, Optional, Protocol, Sequence
 
 import numpy as np
 from numpy.typing import ArrayLike
@@ -63,12 +63,16 @@ class HostExchangeGroup(Protocol):
         """Open the TP group's transport collectively, and return it with the active rank mask."""
 
     def start_round(
-        self, epoch: int, words: np.ndarray, length: int, recipients: Optional[int]
+        self, epoch: int, payload: np.ndarray, length: int, recipients: Optional[int]
     ) -> None:
         """Stage this rank's slot of round ``epoch``, its payload for ``recipients`` (None: all).
 
-        ``words`` holds the round's payload bytes, at most one slot. ``length`` goes in the header:
-        the payload bytes this rank has left from this round on, capped at 0xFFFFFFFF.
+        Args:
+            epoch: The round's epoch.
+            payload: The round's payload bytes as a uint32 array of at most ``self.words`` entries.
+            length: The header's length: the payload bytes this rank has left from this round on,
+                capped at 0xFFFFFFFF.
+            recipients: The mask of ranks that read this rank's payload, or None for all ranks.
         """
 
     def wait(
@@ -81,7 +85,18 @@ class HostExchangeGroup(Protocol):
     ) -> Optional[np.ndarray]:
         """Send the staged slot and wait for the ``active`` ranks' headers and ``readers``' slots.
 
-        Return the packets, or None once ``cancel`` ended the wait or ``received`` lacks a slot.
+        Args:
+            epoch: The round's epoch.
+            active: A bool ``[nranks]`` array of the ranks whose headers the round needs.
+            readers: A bool ``[nranks]`` array of the ranks whose whole slots the round needs.
+            idle: Sleep between polls sooner, for waits that may last until the next request.
+            received: A C-contiguous uint64 ``[nranks, 1 + words]`` array of packets that a
+                membership change completed. The wait sends the staged slot and checks them.
+
+        Returns:
+            The packets as a uint64 ``[nranks, 1 + words]`` array, one slot per rank, or None once
+            ``cancel`` ended the wait or ``received`` lacks a slot. The array may be the group's
+            own buffer, which the next wait overwrites.
         """
 
     def cancel(self) -> None:
@@ -122,7 +137,12 @@ class HostExchange:
     # The largest length a header holds in its 32 bits.
     _MAX_HEADER_LENGTH = 0xFFFFFFFF
 
-    def __init__(self, group: HostExchangeGroup):
+    def __init__(self, group: HostExchangeGroup) -> None:
+        """Create the exchange of this rank over ``group``.
+
+        Args:
+            group: The transport that moves the slots, opened among the TP group's ranks.
+        """
         self.group = group
         self.rank = group.rank
         self.nranks = group.nranks
@@ -254,7 +274,9 @@ class HostExchange:
         lengths, rows = next(rounds)
         received = self._chunks(rows, lengths, ranks)
         # A payload longer than a slot takes several rounds. Join each rank's chunks in order.
-        remaining_chunks = [self._chunks(rows, lengths, ranks) for lengths, rows in rounds]
+        remaining_chunks = [
+            self._chunks(round_rows, round_lengths, ranks) for round_lengths, round_rows in rounds
+        ]
         if remaining_chunks:
             received = [b"".join(parts) for parts in zip(received, *remaining_chunks)]
         payloads = [None] * self.nranks
@@ -277,9 +299,10 @@ class HostExchange:
         ranks = self._ranks_of(readers)[1]
         out = np.zeros((self.nranks, data.size), dtype=np.uint8)
         step = 4 * self._words
-        expected = min(data.size, self._MAX_HEADER_LENGTH)
-        for k, (lengths, rows) in enumerate(self._rounds(data.tobytes(), readers)):
-            if k == 0 and (lengths[self._ranks_of(readers & ~self._failed)[0]] != expected).any():
+        for k, (lengths, rows) in enumerate(self._rounds(data, readers)):
+            # Rows of one size give every rank the same header in every round.
+            expected = min(max(data.size - step * k, 0), self._MAX_HEADER_LENGTH)
+            if (lengths[self._ranks_of(readers & ~self._failed)[0]] != expected).any():
                 raise ValueError(
                     f"allgather_array rows differ in size across ranks: {lengths.tolist()}"
                 )
@@ -309,12 +332,18 @@ class HostExchange:
         return unpack_payloads(rows, lengths, ranks)
 
     def _rounds(
-        self, data: bytes, readers: int, recipients: Optional[int] = None, idle: bool = False
+        self,
+        data: bytes | np.ndarray,
+        readers: int,
+        recipients: Optional[int] = None,
+        idle: bool = False,
     ) -> Iterator[tuple[np.ndarray, Optional[np.ndarray]]]:
         """Yield header lengths and packets per round, sending one slot of ``data`` per round.
 
-        Each header carries the bytes its sender has left from that round on, up to the largest
-        32-bit length. Another round follows while some header carries more than a slot.
+        ``data`` is the payload as bytes or as a uint8 array, which the rounds send without
+        copying it whole. Each header carries the bytes its sender has left from that round on, up
+        to the largest 32-bit length. Another round follows while some header carries more than a
+        slot.
         """
         self._round_readers = readers
         self._failed = 0
@@ -328,7 +357,7 @@ class HostExchange:
 
     def _round(
         self,
-        chunk: bytes,
+        chunk: bytes | np.ndarray,
         length: int,
         readers: int,
         recipients: Optional[int] = None,
@@ -341,7 +370,12 @@ class HostExchange:
         return result
 
     def _try_round(
-        self, chunk: bytes, length: int, readers: int, recipients: Optional[int], idle: bool
+        self,
+        chunk: bytes | np.ndarray,
+        length: int,
+        readers: int,
+        recipients: Optional[int],
+        idle: bool,
     ) -> Optional[tuple[np.ndarray, Optional[np.ndarray]]]:
         """Return every rank's header length and the packets received, or None to run it again.
 
@@ -351,8 +385,8 @@ class HostExchange:
             self._stop(next_epoch(self._epoch))
         self._epoch = next_epoch(self._epoch)
         self._missing = 0
-        words = np.frombuffer(chunk + b"\0" * (-len(chunk) % 4), dtype=np.uint32)
-        self.group.start_round(self._epoch, words, length, recipients)
+        payload = np.frombuffer(bytes(chunk) + b"\0" * (-len(chunk) % 4), dtype=np.uint32)
+        self.group.start_round(self._epoch, payload, length, recipients)
         round_mask = self.active_mask
         rows = self._wait(round_mask, readers & round_mask, idle)
         if rows is None:
@@ -451,16 +485,18 @@ class MnnvlDist(Distributed):
     }
 
     # broadcast_or_none is a single host collective, so the request broadcaster skips its
-    # request-count probe.
+    # request-count probe. With sync_clock it calls the inherited broadcast_or_none_with_header,
+    # which takes a second collective when the root has a payload.
     supports_single_round_broadcast = True
 
     # The transport of the host exchange.
     group_type: type[HostExchangeGroup] = MnnvlHostExchangeGroup
 
-    def __init__(self, mapping: Mapping, host_exchange_owner: Optional[MnnvlDist] = None):
+    def __init__(self, mapping: Mapping, host_exchange_owner: Optional[MnnvlDist] = None) -> None:
         """Create the communicator of ``mapping``.
 
         Args:
+            mapping: The parallel mapping of this rank. Its TP group holds every rank.
             host_exchange_owner: The communicator whose host exchange this one uses, by default
                 itself.
         """
@@ -470,7 +506,12 @@ class MnnvlDist(Distributed):
 
     @staticmethod
     def check_requirements(mapping: Mapping) -> None:
-        """Raise ValueError naming every unmet ``MnnvlDist`` requirement."""
+        """Raise ValueError naming every unmet ``MnnvlDist`` requirement.
+
+        The platform requirements of ``group_type`` are checked only once ``mapping`` and the
+        orchestrator meet theirs. With pipeline and context parallelism off, the TP group holds
+        every rank.
+        """
         checks = [
             (
                 not mpi_disabled(),
@@ -490,11 +531,6 @@ class MnnvlDist(Distributed):
                 mapping.cp_size == 1,
                 "context_parallel_size=1, because MnnvlDist has no context-parallel group",
             ),
-            (
-                mapping.tp_size == mapping.world_size,
-                "tensor_parallel_size equal to the world size, because the host collectives run "
-                "over a TP group that holds every rank",
-            ),
         ]
         if all(met for met, _ in checks):
             checks += MnnvlDist.group_type.requirements()
@@ -506,7 +542,7 @@ class MnnvlDist(Distributed):
 
         An original rank counts all ranks on the node. A replacement rank counts only the node's
         ranks outside the membership, because the active ranks already hold their memory.
-        ``local_mpi_size()`` still counts all ranks on the node.
+        ``local_mpi_size()`` counts only the node's ranks of this process's MPI launch.
         """
         mapping = self.mapping
         node_ranks = [
@@ -555,8 +591,14 @@ class MnnvlDist(Distributed):
         return () if exchange is None else exchange.waited_epochs
 
     def _exchange(
-        self, obj, readers=None, recipients=None, idle=False, reduce_op=None, active_only=False
-    ) -> list:
+        self,
+        obj: Any,
+        readers: Optional[Sequence[int]] = None,
+        recipients: Optional[Sequence[int]] = None,
+        idle: bool = False,
+        reduce_op: Optional[Callable[[Any, Any], Any]] = None,
+        active_only: bool = False,
+    ) -> list[Any]:
         """Exchange ``obj`` as ``HostExchange.exchange`` does, and unpickle the payloads.
 
         ``reduce_op`` (``min`` or ``max``) lets a replacement's startup replay check its own value
@@ -579,7 +621,9 @@ class MnnvlDist(Distributed):
             if payload is not None or not active_only
         ]
 
-    def broadcast(self, obj, root=0, chunk_size: int = 4 * 1024 * 1024, prefer_cpu=False):
+    def broadcast(
+        self, obj: Any, root: int = 0, chunk_size: int = 4 * 1024 * 1024, prefer_cpu: bool = False
+    ) -> Any:
         # prefer_cpu marks a wait that may last until the next request arrives, so it runs as an
         # idle wait.
         if self.mapping.tp_rank == root:
@@ -587,50 +631,54 @@ class MnnvlDist(Distributed):
             return obj
         return self._exchange(None, readers=(root,), recipients=(), idle=prefer_cpu)[root]
 
-    def broadcast_or_none(self, obj, root=0):
+    def broadcast_or_none(self, obj: Any, root: int = 0) -> Any:
         return self.broadcast(obj, root)
 
-    def allgather(self, obj):
+    def allgather(self, obj: Any) -> list[Any]:
         return self._exchange(obj)
 
-    def barrier(self):
+    def barrier(self) -> None:
         self._exchange(None, readers=(), recipients=())
 
-    def tp_barrier(self):
+    def tp_barrier(self) -> None:
         self.barrier()
 
     def tp_allgather(
         self,
-        obj,
+        obj: Any,
         chunk_size: int = 4 * 1024 * 1024,
         *,
         small_payload: bool = False,
         active_only: bool = False,
-    ):
+    ) -> list[Any]:
         return self._exchange(obj, active_only=active_only)
 
-    def tp_gather(self, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
+    def tp_gather(
+        self, obj: Any, root: int = 0, chunk_size: int = 4 * 1024 * 1024
+    ) -> Optional[list[Any]]:
         if self.mapping.tp_rank != root:
             self._exchange(obj, readers=(), recipients=(root,))
             return None
         return self._exchange(obj, recipients=(root,))
 
-    def tp_broadcast(self, obj, root=0, chunk_size: int = 4 * 1024 * 1024, **kwargs):
+    def tp_broadcast(
+        self, obj: Any, root: int = 0, chunk_size: int = 4 * 1024 * 1024, **kwargs: Any
+    ) -> Any:
         return self.broadcast(obj, root)
 
-    def cp_broadcast(self, obj, root=0, **kwargs):
+    def cp_broadcast(self, obj: Any, root: int = 0, **kwargs: Any) -> Any:
         raise NotImplementedError("MnnvlDist has no context-parallel group")
 
-    def cp_allgather(self, obj, *, small_payload: bool = False):
+    def cp_allgather(self, obj: Any, *, small_payload: bool = False) -> list[Any]:
         raise NotImplementedError("MnnvlDist has no context-parallel group")
 
-    def allreduce(self, obj, op: ReduceOp = ReduceOp.SUM):
+    def allreduce(self, obj: Any, op: ReduceOp = ReduceOp.SUM) -> Any:
         _check_reduce_op(op)
         reduce_op = self._REDUCE[op] if op in (ReduceOp.MIN, ReduceOp.MAX) else None
         values = self._exchange(obj, reduce_op=reduce_op, active_only=True)
         return functools.reduce(self._REDUCE[op], values)
 
-    def tp_allreduce(self, obj, op: ReduceOp = ReduceOp.SUM):
+    def tp_allreduce(self, obj: Any, op: ReduceOp = ReduceOp.SUM) -> Any:
         return self.allreduce(obj, op)
 
     def tp_allgather_int64(self, values: ArrayLike, *, active_only: bool = False) -> np.ndarray:

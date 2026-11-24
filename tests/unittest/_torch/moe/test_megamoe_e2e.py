@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""DeepSeek-V4.1-Flash MegaMoE end to end on four GPUs (attention DP, EP4) at the mid (150 rows per rank) and hi
-(1,280) decode shapes on the delivered path: the FP8 shared expert fused into the kernel, router logits as K-chunk
-partials, routing and quantization straight into the launch bucket and the default tactics; and the DSpark draft
-bank re-encoded from MXFP4 to NVFP4.
+"""DeepSeek-V4.1-Flash MegaMoE end to end on four GPUs (attention DP, EP4) at the s8 (48 rows per rank), mid
+(150) and hi (1,280) decode shapes on the delivered path: the FP8 shared expert fused into the kernel, router logits
+as K-chunk partials, routing and quantization straight into the launch bucket and the default tactics; and the
+DSpark draft bank re-encoded from MXFP4 to NVFP4.
 
 Against the reference: the routed experts' per-expert NVFP4 math, the fused shared expert within 2% of the separate
 one's error against FP32, the partials' ordered sum against the router GEMM, and the draft layer against FP32 math on
@@ -51,8 +51,12 @@ _INTERMEDIATE_SIZE = 2304
 _CLAMP = 10.0
 _SCALING = 1.5
 _MAX_NUM_TOKENS = 1280
-# Per-rank rows: the full mid and hi shapes, then each with an idle rank and a one-row (or short) rank.
-_SHAPES = {"mid": ([150] * 4, [150, 0, 75, 1]), "hi": ([1280] * 4, [1280, 640, 0, 33])}
+# Per-rank rows: the full s8, mid and hi shapes, then mid and hi with an idle rank and a one-row (or short) rank.
+_SHAPES = {
+    "s8": ([48] * 4,),
+    "mid": ([150] * 4, [150, 0, 75, 1]),
+    "hi": ([1280] * 4, [1280, 640, 0, 33]),
+}
 # Gate-bias variants of the full shapes: two hot experts, no rows for rank 2's experts, and only the first 24 of every
 # rank's 96 experts live, so the phase-interleaved streams end in front of empty experts.
 _VARIANTS = ("base", "hot", "no_rank2", "trailing_empty")
@@ -363,6 +367,8 @@ def _run(one_round: bool) -> list:
         moe_max_num_tokens=_MAX_NUM_TOKENS,
         megamoe_fuse_shared_expert=True,
     )
+    # DeepSeek-V4.1's opt-in: router partials from 12 rows per rank (the s8 shape).
+    model_config.extra_attrs["moe_router_partials_small_m"] = True
 
     with torch.device("cuda", rank), torch.inference_mode():
         torch.manual_seed(1701)
@@ -430,11 +436,12 @@ def _run(one_round: bool) -> list:
         torch.manual_seed(1702 + rank)
         calls = []
         for shape, patterns in _SHAPES.items():
-            if one_round and shape != "mid":
-                continue
             for pattern, counts in enumerate(patterns):
                 for variant in _VARIANTS if pattern == 0 else ("base",):
+                    # Both passes draw every input, so the one-round pass gets the same mid inputs.
                     x = torch.randn((counts[rank], _HIDDEN_SIZE), dtype=torch.bfloat16)
+                    if one_round and shape != "mid":
+                        continue
                     label = f"{shape} {counts} {variant}"
                     calls.append((label, layers[len(calls) % 2], biases[variant], x, counts))
 

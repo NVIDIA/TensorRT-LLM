@@ -24,6 +24,7 @@ import logging
 import logging.handlers
 import os
 import queue
+import resource
 import selectors
 import signal
 import socket
@@ -222,14 +223,10 @@ class AuthorityProcess:
             record = self._publish(record)
             if record.state in (MembershipState.ABORTED, MembershipState.SHUTDOWN):
                 # The store lives in this process, so keep it until every active rank has read the
-                # record and left, for at most a hang timeout after an abort or rank 0's exit.
-                aborted_s = time.monotonic() if record.state == MembershipState.ABORTED else None
+                # record and left, for at most a hang timeout.
+                ended_s = time.monotonic()
                 while self._connected() & record.active_mask:
-                    since_s = self._parent_ended_s if aborted_s is None else aborted_s
-                    if (
-                        since_s is not None
-                        and time.monotonic() - since_s >= self._authority.hang_timeout_s
-                    ):
+                    if time.monotonic() - ended_s >= self._authority.hang_timeout_s:
                         break
                     # Ranks that have not left yet take a silent authority as hung.
                     self._send_heartbeats(time.monotonic())
@@ -458,8 +455,11 @@ class AuthorityProcess:
         connection.member = (rank, self._incarnation[rank])
         self._changed = True
         connection.lines = Lines()
-        record = self._record.model_copy(update={"incarnations": tuple(self._incarnation)})
-        self._send(sock, connection, message_bytes(record))
+        if replacement:
+            # The stored record and the node views name the replacement's process from now on. The
+            # ranks get no resent record, which they would take as the change's next step.
+            self._publish(self._record, ranks=False)
+        self._send(sock, connection, message_bytes(self._record))
         return rest
 
     def _on_node_report(self, connection: _Connection, report: NodeReport) -> None:
@@ -479,8 +479,8 @@ class AuthorityProcess:
         given_up_mask = (self._given_up_mask & ~node_mask) | rank_mask(
             report.given_up, self.world_size
         )
-        # The supervisor reports every report interval, and only a new given-up rank is decided
-        # at once.
+        # The supervisor reports every report interval, and a change in the given-up ranks is
+        # decided at once.
         if given_up_mask != self._given_up_mask:
             self._given_up_mask = given_up_mask
             self._changed = True
@@ -621,6 +621,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--address-fd", type=int, required=True)
     args = parser.parse_args(argv)
     remove_cpu_affinity_constraints()
+    # This process holds a liveness and a store connection per rank and per node supervisor, and
+    # the connections that wait for their hello, which can exceed a soft limit of 1024 open files.
+    _, max_open_files = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (max_open_files, max_open_files))
     log_listener = log_from_own_thread()
 
     from torch.distributed import TCPStore

@@ -38,6 +38,7 @@ from tensorrt_llm.serve.disagg_auth import (
 )
 from tensorrt_llm.serve.openai_client import OpenAIHttpClient, _encode_request_body
 from tensorrt_llm.serve.openai_protocol import (
+    ChatCompletionRequest,
     CompletionRequest,
     CompletionResponse,
     CompletionResponseChoice,
@@ -1950,7 +1951,7 @@ class TestGenerationLegRetry:
 
     _ORIGINAL_ID = 4242
 
-    def _make_client(self, session, server="localhost:8000"):
+    def _make_client(self, session, server="localhost:8000", max_retries=1):
         _reset_prometheus_registry()
         router = AsyncMock(spec=Router)
         router.servers = [server]
@@ -1960,24 +1961,34 @@ class TestGenerationLegRetry:
             router=router,
             role=ServerRole.GENERATION,
             timeout_secs=10,
-            max_retries=1,
+            max_retries=max_retries,
             retry_interval_sec=0,
             session=session,
             disagg_id_generator=AsyncMock(return_value=9000),
         )
         return client, router
 
-    def _make_request(self, stream: bool) -> CompletionRequest:
+    def _make_request(self, stream: bool, kind: str = "completion"):
+        disaggregated_params = DisaggregatedParams(
+            request_type="generation_only",
+            first_gen_tokens=[7],
+            ctx_request_id=self._ORIGINAL_ID,
+            disagg_request_id=self._ORIGINAL_ID,
+        )
+        if kind == "chat":
+            return ChatCompletionRequest(
+                model="m",
+                messages=[{"role": "user", "content": "hi"}],
+                stream=stream,
+                disaggregated_params=disaggregated_params,
+            )
+        if kind == "responses":
+            return ResponsesRequest(
+                model="m", input="hi", stream=stream, disaggregated_params=disaggregated_params
+            )
+        assert kind == "completion"
         return CompletionRequest(
-            model="m",
-            prompt=[1, 2, 3],
-            stream=stream,
-            disaggregated_params=DisaggregatedParams(
-                request_type="generation_only",
-                first_gen_tokens=[7],
-                ctx_request_id=self._ORIGINAL_ID,
-                disagg_request_id=self._ORIGINAL_ID,
-            ),
+            model="m", prompt=[1, 2, 3], stream=stream, disaggregated_params=disaggregated_params
         )
 
     @staticmethod
@@ -2048,10 +2059,20 @@ class TestGenerationLegRetry:
         "error",
         [
             asyncio.TimeoutError(),
+            aiohttp.ServerTimeoutError("Timeout on reading data from socket"),
             aiohttp.ServerDisconnectedError(),
             aiohttp.ClientOSError(errno.ECONNRESET, "Connection reset by peer"),
+            aiohttp.ClientConnectionError("Connection closed"),
+            aiohttp.ClientPayloadError("Response payload is not completed"),
         ],
-        ids=["timeout", "server_disconnected", "connection_reset"],
+        ids=[
+            "timeout",
+            "server_timeout",
+            "server_disconnected",
+            "connection_reset",
+            "connection_error",
+            "payload_error",
+        ],
     )
     async def test_possibly_delivered_request_is_not_retried(self, error):
         session = AsyncMock(spec=aiohttp.ClientSession)
@@ -2097,6 +2118,44 @@ class TestGenerationLegRetry:
         client._disagg_id_generator.assert_not_awaited()
         hooks.on_disagg_request_id.assert_not_called()
         assert router.finish_request.await_args.kwargs["success"] is True
+
+    @pytest.mark.asyncio
+    async def test_undelivered_request_keeps_transient_tcp_budget(self):
+        """A reset while writing is retried under the transient budget, not max_retries."""
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        session.post.side_effect = [
+            ConnectionResetError(),
+            ConnectionResetError(),
+            self._mock_ok_stream(),
+        ]
+        client, _ = self._make_client(session, max_retries=0)
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            generator = await client.send_request(self._make_request(stream=True))
+            chunks = [chunk async for chunk in generator]
+
+        assert chunks == [b'data: "ok"\n\n']
+        bodies = [
+            msgspec.msgpack.decode(call.kwargs["data"]) for call in session.post.call_args_list
+        ]
+        assert [body["disaggregated_params"]["disagg_request_id"] for body in bodies] == [
+            self._ORIGINAL_ID
+        ] * 3
+        client._disagg_id_generator.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_retry_env_wins_for_undelivered_request(self, monkeypatch):
+        # The client reads the flag when it is constructed.
+        monkeypatch.setenv("TRTLLM_DISAGG_NO_RETRY", "1")
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        session.post.side_effect = ConnectionResetError()
+        client, _ = self._make_client(session, max_retries=5)
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            with pytest.raises(ConnectionResetError):
+                await client.send_request(self._make_request(stream=False))
+
+        assert session.post.call_count == 1
 
 
 async def _read_http_request(reader: asyncio.StreamReader) -> bytes:
@@ -2202,4 +2261,48 @@ class TestGenerationLegRetryOverTransport:
 
         assert len(connections) == 1
         assert len(complete_requests) == int(reads_request)
+        assert router.finish_request.await_args.kwargs["success"] is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind", ["completion", "chat", "responses"])
+    async def test_stream_failed_after_headers_is_not_reposted(self, kind):
+        """The generation server failed the KV transfer after its response headers.
+
+        uvicorn sends the 200 headers, then closes the connection when the stream
+        generator raises "Error in kv cache transfer for generation requests". No
+        context server holds KV cache for a re-post, so the request fails.
+        """
+        bodies = []
+
+        async def fail_after_headers(reader, writer):
+            bodies.append(msgspec.msgpack.decode(await _read_http_request(reader)))
+            writer.write(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                b"Transfer-Encoding: chunked\r\n\r\n"
+            )
+            await writer.drain()
+            writer.close()
+
+        server = await asyncio.start_server(fail_after_headers, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        request = self._make_request(stream=True, kind=kind)
+        try:
+            async with aiohttp.ClientSession() as session:
+                client, router = self._make_client(session, server=f"127.0.0.1:{port}")
+                generator = await client.send_request(request)
+
+                async def consume():
+                    return [chunk async for chunk in generator]
+
+                with pytest.raises(aiohttp.ClientPayloadError):
+                    await asyncio.wait_for(consume(), timeout=10)
+        finally:
+            server.close()
+            await server.wait_closed()
+
+        assert [body["disaggregated_params"]["disagg_request_id"] for body in bodies] == [
+            self._ORIGINAL_ID
+        ]
+        assert request.disaggregated_params.disagg_request_id == self._ORIGINAL_ID
+        client._disagg_id_generator.assert_not_awaited()
         assert router.finish_request.await_args.kwargs["success"] is False

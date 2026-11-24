@@ -274,7 +274,12 @@ should prefer **`KVCacheManagerV2`** when starting fresh.
   hierarchical, supports heterogeneous pools per layer with automatic
   coalescing within a lifecycle group. Adding an auxiliary pool only
   requires defining a per-layer `AttentionLayerConfig` and `BufferConfig`.
-- **`KVCacheManager` (legacy path used by RocketKV/DSA today)**: either
+  `RocketKVCacheManagerV2` registers a per-layer KT `BufferConfig` with its
+  own `coalescing_group`: the KT page shares each K/V slot's lifecycle and
+  the KV budget but not the K/V pool, which the attention op addresses at a
+  fixed stride. It also overrides `get_layer_bytes_per_token` and
+  `get_cache_size_per_token` so the budget counts KT.
+- **`KVCacheManager` (V1 path)**: either
   inherit from it at the Python level (RocketKV's `RocketKVCacheManager`),
   or integrate directly into the C++ `KVCacheManager` (DSA's indexer K
   cache). The Python path is faster to iterate on; the C++ path is

@@ -33,6 +33,7 @@ from tensorrt_llm.llmapi import LLM, SamplingParams
 from tensorrt_llm.llmapi.llm_args import (
     AttentionDpConfig,
     AutoDecodingConfig,
+    BlockReuseConfig,
     CacheTransceiverConfig,
     ColdPageQuantizationCompressionConfig,
     DFlashDecodingConfig,
@@ -42,6 +43,7 @@ from tensorrt_llm.llmapi.llm_args import (
     KvCacheConfig,
     KvCacheConnectorConfig,
     KVEventsConfig,
+    MemoryMonitorConfig,
     MTPDecodingConfig,
     NGramDecodingConfig,
     PARDDecodingConfig,
@@ -95,6 +97,16 @@ def _args(**fields) -> TorchLlmArgs:
         # Whoever starts the executor checks the orchestrator, not the arguments.
         {"orchestrator_type": "rpc"},
         {"orchestrator_type": "ray"},
+        # The default memory monitor reports out-of-memory errors on each rank on its own.
+        {"memory_monitor_config": MemoryMonitorConfig(mode="oom")},
+        # A replacement rank starts with an empty reuse state, as after a conversation's drop.
+        {
+            "kv_cache_config": KvCacheConfig(
+                block_reuse_config=BlockReuseConfig(
+                    policy="per_conversation", drop_extended_turns=True
+                )
+            )
+        },
         # Without fault tolerance, nothing is checked.
         {
             "enable_wide_ep_fault_tolerance": False,
@@ -165,6 +177,10 @@ def test_supported_configuration_is_accepted(fields):
             {"kv_cache_config": KvCacheConfig(host_cache_bind_to_gpu_numa_node=True)},
             "no NUMA binding of the host cache tier "
             "(kv_cache_config.host_cache_bind_to_gpu_numa_node=False, not True)",
+        ),
+        (
+            {"kv_cache_config": KvCacheConfig(enable_kv_pool_rebalance=True)},
+            "no KV pool rebalance (kv_cache_config.enable_kv_pool_rebalance=False, not True)",
         ),
         (
             {"cache_transceiver_config": CacheTransceiverConfig(backend="DEFAULT")},
@@ -255,12 +271,38 @@ def test_supported_configuration_is_accepted(fields):
             {"enable_return_routed_experts": True},
             "no routed-expert capture (enable_return_routed_experts=False), because a step",
         ),
+        (
+            {"memory_monitor_config": MemoryMonitorConfig(mode="full")},
+            "no full memory monitor (memory_monitor_config.mode other than 'full'",
+        ),
+        (
+            {"enable_locality_domains": True},
+            "no locality domains (enable_locality_domains=False), because the KV cache",
+        ),
+        (
+            {
+                "speculative_config": MTPDecodingConfig(
+                    max_draft_len=1,
+                    use_mtp_vanilla=True,
+                    use_rejection_sampling=True,
+                    rejection_sample_method="block",
+                )
+            },
+            "token-level rejection sampling (speculative_config.rejection_sample_method='standard'",
+        ),
     ],
 )
 def test_unsupported_configuration_names_field(fields, fix):
     with pytest.raises(ValueError, match=re.escape(fix)) as error:
         _args(**fields)
     assert TURN_FAULT_TOLERANCE_OFF in str(error.value)
+
+
+def test_full_memory_monitor_from_environment_rejected(monkeypatch):
+    """Refuse the full memory monitor that TLLM_MEM_MONITOR selects, as the configuration's."""
+    monkeypatch.setenv("TLLM_MEM_MONITOR", "1")
+    with pytest.raises(ValueError, match=re.escape("no full memory monitor")):
+        _args()
 
 
 def test_check_leaves_args_unchanged():

@@ -15,6 +15,7 @@ import pytest
 from _torch.pyexecutor.llm_request_factory import make_llm_request
 
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+from tensorrt_llm._torch.pyexecutor.response_utils import prepare_response
 from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import KVCacheAwareADPRouter
 from tensorrt_llm.bindings import executor as trtllm
 
@@ -60,6 +61,17 @@ def test_recompute_reports_the_first_prefill_cached_tokens(first_reuse: int) -> 
 
     assert req.reported_cached_tokens == first_reuse
     assert req.cached_tokens == len(PROMPT)
+
+
+@pytest.mark.parametrize("first_reuse", [0, 8], ids=["cold_cache", "prefix_hit"])
+def test_recompute_response_reports_the_first_prefill_cached_tokens(first_reuse: int) -> None:
+    """The response that the executor builds reports the first prefill's hit."""
+    req = _recomputed_request(first_reuse)
+    req.create_response = lambda: SimpleNamespace(result=SimpleNamespace())
+
+    response = prepare_response(req)
+
+    assert response.result.cached_tokens == first_reuse
 
 
 @pytest.mark.parametrize("first_reuse", [0, 8], ids=["cold_cache", "prefix_hit"])

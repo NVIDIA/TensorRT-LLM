@@ -15,7 +15,9 @@
 """``TrtllmCutedslGroupedGemmNvfp4Impl``: ``trtllm.cutedsl.grouped_gemm.nvfp4``."""
 
 import os
+from collections.abc import Callable
 from functools import cached_property, partial
+from typing import Any
 
 import torch
 
@@ -104,11 +106,15 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
             return
         super().create_weights()
         if self.uses_spare_slots:
-            # The GEMMs and their tuner profile only the active slots.
+            # The GEMMs tune for, and pick their L2 policy by, the active slots only.
             layout = self.tuner_layout_kwargs
             self._fused_moe_runner = partial(CuteDslFusedMoENvfp4Runner, **layout)
             self._gather_act_fusion_op = partial(
                 torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell, **layout
+            )
+            self._gather_act_fusion_zero_op = partial(
+                torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_zero_blackwell,
+                **layout,
             )
             self._finalize_inplace_op = partial(
                 torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell, **layout
@@ -120,19 +126,23 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
     # The runner and the Blackwell ops of the forward. A module with spare slots binds the tuner
     # layout of its active slots to them in create_weights; the Rubin kernels take no spare slots.
     @cached_property
-    def _fused_moe_runner(self):
+    def _fused_moe_runner(self) -> Callable[..., CuteDslFusedMoENvfp4Runner]:
         return CuteDslFusedMoENvfp4Runner
 
     @cached_property
-    def _gather_act_fusion_op(self):
+    def _gather_act_fusion_op(self) -> Callable[..., Any]:
         return torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell
 
     @cached_property
-    def _finalize_inplace_op(self):
+    def _gather_act_fusion_zero_op(self) -> Callable[..., Any]:
+        return torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_zero_blackwell
+
+    @cached_property
+    def _finalize_inplace_op(self) -> Callable[..., Any]:
         return torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell
 
     @cached_property
-    def _grouped_gemm_op(self):
+    def _grouped_gemm_op(self) -> Callable[..., Any]:
         return torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_blackwell
 
     # Kinds mirror the act-fusion kernels' own SUPPORTED_ACTIVATION_TYPES.
@@ -636,7 +646,7 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
         # ran on the main stream in parallel with the quantization.
         self._join_pending_x_ready()
         if fc1_zero:
-            x, x_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_zero_blackwell(
+            x, x_sf = self._gather_act_fusion_zero_op(
                 **{
                     name: gather_act_kwargs[name]
                     for name in (

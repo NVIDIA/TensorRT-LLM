@@ -25,6 +25,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheM
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
 from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
@@ -108,6 +109,60 @@ def test_kv_pools_suspended_resumes_after_error(manager):
     (pages,) = manager.get_batch_cache_indices([0], 0)
     assert manager.get_buffers(0)[pages[-1]].eq(1.5).all()
     manager.free_resources(request)
+
+
+def _pool_bytes(pool, slots: range) -> torch.Tensor:
+    """Return the bytes of ``slots`` in ``pool``."""
+    return convert_to_torch_tensor(
+        TensorWrapper(
+            pool.base_address + slots.start * pool.slot_bytes,
+            torch.uint8,
+            [len(slots) * pool.slot_bytes],
+        )
+    )
+
+
+def test_resize_zeroes_added_slots():
+    """Zero the slots that a grow adds, which can hold the bytes they held before a shrink."""
+    # The pool of the layer with one KV head fits in one 2 MiB allocation unit. Such a pool keeps
+    # its memory mapped through a shrink, so the slots that the shrink drops come back from the
+    # grow still holding the bytes written below.
+    manager = KVCacheManagerV2(
+        KvCacheConfig(max_gpu_total_bytes=18 * MIB, host_cache_size=0, enable_block_reuse=False),
+        tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+        num_layers=2,
+        num_kv_heads=[8, 1],
+        head_dim=64,
+        tokens_per_block=32,
+        max_seq_len=256,
+        max_batch_size=2,
+        mapping=Mapping(world_size=1, tp_size=1, rank=0),
+        dtype=tensorrt_llm.bindings.DataType.HALF,
+    )
+    try:
+        num_slots = [pool_group.num_slots for pool_group in manager.impl.pool_group_descs]
+        assert any(
+            count * pool.slot_bytes <= 2 * MIB
+            for pool_group, count in zip(manager.impl.pool_group_descs, num_slots)
+            for pool in pool_group.pools
+        )
+        for pool_group, count in zip(manager.impl.pool_group_descs, num_slots):
+            for pool in pool_group.pools:
+                _pool_bytes(pool, range(count)).fill_(0xFF)
+        quota = manager.gpu_quota
+        manager.resize_gpu_quota(quota // 2)
+        kept = [pool_group.num_slots for pool_group in manager.impl.pool_group_descs]
+        manager.resize_gpu_quota(quota)
+        torch.cuda.synchronize()
+
+        pool_groups = manager.impl.pool_group_descs
+        assert any(count < pool_group.num_slots for pool_group, count in zip(pool_groups, kept))
+        for pool_group, count in zip(pool_groups, kept):
+            for pool in pool_group.pools:
+                assert _pool_bytes(pool, range(count)).eq(0xFF).all()
+                assert not _pool_bytes(pool, range(count, pool_group.num_slots)).any()
+    finally:
+        manager.shutdown()
 
 
 CHUNK = 32  # one KV block

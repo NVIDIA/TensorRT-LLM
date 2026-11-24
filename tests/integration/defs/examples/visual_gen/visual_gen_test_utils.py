@@ -14,6 +14,7 @@
 # limitations under the License.
 """Shared helpers for VisualGen accuracy tests."""
 
+import ast
 import base64
 import contextlib
 import gc
@@ -27,7 +28,7 @@ import threading
 import traceback
 import zipfile
 from dataclasses import dataclass
-from typing import Collection, Iterator, Literal
+from typing import Any, Collection, Iterator, Literal
 
 import pytest
 import torch
@@ -625,6 +626,24 @@ def _lpips_deterministic_algorithms(*, fully_eager=False):
             os.environ["CUBLAS_WORKSPACE_CONFIG"] = previous_cublas_workspace_config
 
 
+# NVFP4 GEMM backends allowed in fixed-golden runs. The backends are not bit-identical and
+# autotuning picks among them by timing, so the pick can change between processes and machines.
+# Backend selection and parity are covered by the NVFP4 operator unit tests.
+_FIXED_NVFP4_GEMM_BACKENDS = ("cutlass",)
+_NVFP4_GEMM_TUNING_OP = "trtllm::nvfp4_gemm::gemm"
+
+
+@contextlib.contextmanager
+def _fixed_nvfp4_gemm_backends() -> Iterator[None]:
+    """Pin NVFP4 GEMMs built in this thread to ``_FIXED_NVFP4_GEMM_BACKENDS``."""
+    from tensorrt_llm._torch.utils import get_model_extra_attrs, model_extra_attrs
+
+    extra_attrs = dict(get_model_extra_attrs() or {})
+    extra_attrs["nvfp4_gemm_allowed_backends"] = list(_FIXED_NVFP4_GEMM_BACKENDS)
+    with model_extra_attrs(extra_attrs):
+        yield
+
+
 @contextlib.contextmanager
 def _fixed_nvfp4_quantization_backend(features):
     """Pin NVFP4 golden runs to deterministic TRT-LLM and CUTLASS paths.
@@ -640,17 +659,72 @@ def _fixed_nvfp4_quantization_backend(features):
         return
 
     from tensorrt_llm._torch.custom_ops import torch_custom_ops
-    from tensorrt_llm._torch.utils import get_model_extra_attrs, model_extra_attrs
 
     previous_flashinfer_available = torch_custom_ops.IS_FLASHINFER_AVAILABLE
-    extra_attrs = dict(get_model_extra_attrs() or {})
-    extra_attrs["nvfp4_gemm_allowed_backends"] = ["cutlass"]
     try:
         torch_custom_ops.IS_FLASHINFER_AVAILABLE = False
-        with model_extra_attrs(extra_attrs):
+        with _fixed_nvfp4_gemm_backends():
             yield
     finally:
         torch_custom_ops.IS_FLASHINFER_AVAILABLE = previous_flashinfer_available
+
+
+def _run_diffusion_worker_with_fixed_nvfp4_gemm(**worker_kwargs: Any) -> None:
+    """Run a spawned VisualGen worker with its NVFP4 GEMMs pinned to the fixed backends.
+
+    ``_fixed_nvfp4_quantization_backend`` sets a thread-local in the calling process, so it
+    cannot reach a worker that VisualGen spawns. Patch ``executor.run_diffusion_worker`` with
+    this function while constructing ``VisualGen``: each spawned worker then builds its
+    pipeline, and every NVFP4 ``Linear`` in it, under the GEMM pin. Unlike that helper, it
+    leaves the FP4 activation quantizer autotuned: its TRT-LLM and FlashInfer tactics are
+    bit-identical (``test_fp4_quantize_flashinfer.py``), so only the GEMM backend needs the pin.
+
+    Args:
+        **worker_kwargs: Keyword arguments for ``executor.run_diffusion_worker``.
+
+    Raises:
+        RuntimeError: If called in the process that patched ``executor.run_diffusion_worker``.
+    """
+    from tensorrt_llm._torch.visual_gen import executor
+
+    run_worker = executor.run_diffusion_worker
+    if run_worker is _run_diffusion_worker_with_fixed_nvfp4_gemm:
+        raise RuntimeError(
+            "The NVFP4 GEMM pin only works as the target of a spawned VisualGen worker."
+        )
+    with _fixed_nvfp4_gemm_backends():
+        run_worker(**worker_kwargs)
+
+
+def _assert_nvfp4_gemm_cache_pinned(cache_path: str | os.PathLike[str]) -> None:
+    """Check that every NVFP4 GEMM decision in an autotuner cache used the fixed backends.
+
+    Args:
+        cache_path: Autotuner cache JSON written through ``TLLM_AUTOTUNER_CACHE_PATH``.
+
+    Raises:
+        AssertionError: If the cache has no NVFP4 GEMM decision, or a decision was tuned
+            without the backend pin or picked a tactic outside it.
+    """
+    with open(cache_path) as cache_file:
+        cache = json.load(cache_file)
+    entries = [
+        (key, value)
+        for section, section_entries in cache.items()
+        if section != "metadata"
+        for key, value in section_entries.items()
+        if key.startswith(f"('{_NVFP4_GEMM_TUNING_OP}'")
+    ]
+    assert entries, f"No {_NVFP4_GEMM_TUNING_OP} tuning decisions recorded in {cache_path}"
+    pinned_backends = repr(_FIXED_NVFP4_GEMM_BACKENDS)
+    unpinned = [key for key, _ in entries if pinned_backends not in key]
+    assert not unpinned, f"NVFP4 GEMMs tuned without the backend pin: {unpinned}"
+    for key, value in entries:
+        tactic = ast.literal_eval(value["tactic"])
+        backend = tactic[0] if isinstance(tactic, tuple) else None
+        assert tactic == -1 or backend in _FIXED_NVFP4_GEMM_BACKENDS, (
+            f"NVFP4 GEMM tactic {value['tactic']} is outside {_FIXED_NVFP4_GEMM_BACKENDS}: {key}"
+        )
 
 
 def _feature_generator_process_entry(connection, generator, args):

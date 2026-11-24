@@ -58,6 +58,7 @@ def _admission_executor(
         rank_failure_recovery=None,
         _should_exclude_last_generation_logits=lambda: False,
         observed_live_counts=[],
+        _num_embeddings=123,
     )
     executor._fetch_and_enqueue_requests = (
         lambda queue, live, **_: executor.observed_live_counts.append(live)

@@ -47,6 +47,7 @@ from .fast_custom_op import fast_custom_op
 from .mxfp8_gemm import MXFP8_DEFAULT_BACKENDS, MXFP8GemmUnifiedRunner
 
 if IS_FLASHINFER_AVAILABLE:
+    from flashinfer import SfLayout
     from flashinfer import autotune as _flashinfer_autotune
     from flashinfer import mm_mxfp8 as _flashinfer_mm_mxfp8
     from flashinfer import mxfp8_quantize as _flashinfer_mxfp8_quantize
@@ -126,7 +127,6 @@ class MoERunner(TunableRunner):
         activation_type: ActivationType,
         unpadded_hidden_size: Optional[int] = None,
         use_mxfp8_weight_scaling: bool = False,
-        tuner_num_local_experts: Optional[int] = None,
     ):
         self.x_dtype = x_dtype
         self.weight_dtype = weight_dtype
@@ -149,7 +149,6 @@ class MoERunner(TunableRunner):
         self.use_fused_finalize = use_fused_finalize
         self.activation_type = activation_type
         self.unpadded_hidden_size = unpadded_hidden_size if unpadded_hidden_size is not None else 0
-        self.tuner_num_local_experts = tuner_num_local_experts
 
         instance_key = (x_dtype, weight_dtype, output_dtype,
                         use_deepseek_fp8_block_scale, use_w4_group_scaling,
@@ -180,7 +179,7 @@ class MoERunner(TunableRunner):
         return tactic
 
     def unique_id(self):
-        identity = (
+        return (
             self.x_dtype,
             self.weight_dtype,
             self.output_dtype,
@@ -199,9 +198,6 @@ class MoERunner(TunableRunner):
             self.unpadded_hidden_size,
             self.use_mxfp8_weight_scaling,
         )
-        if self.tuner_num_local_experts is not None:
-            identity += (self.tuner_num_local_experts, )
-        return identity
 
     def forward(
         self,
@@ -211,11 +207,6 @@ class MoERunner(TunableRunner):
         do_preparation: bool = False,
     ):
         x, fc1_expert_weights, fc1_expert_biases, fc2_expert_weights, fc2_expert_biases = inputs
-        if self.tuner_num_local_experts is not None:
-            # The profiler routes tokens to every expert of the weights it gets.
-            fc1_expert_weights, fc1_expert_biases, fc2_expert_weights, fc2_expert_biases = (
-                None if w is None else w[:self.tuner_num_local_experts]
-                for w in inputs[1:])
         tactic = self._resolve_fallback_tactic(tactic, gemm_idx)
         self.fused_moe_runner.run_gemm_profile(
             x,
@@ -316,6 +307,18 @@ def fused_moe(
         tuner_input = input
         tuner_top_k = token_selected_experts.size(1)
 
+    tuner_weights = [
+        fc1_expert_weights, fc1_expert_biases, fc2_expert_weights,
+        fc2_expert_biases
+    ]
+    if tuner_num_local_experts is not None:
+        # The tuner gets only the active slots, so it profiles and caches the
+        # problem of a layer without spare slots.
+        tuner_weights = [
+            None if w is None else w[:tuner_num_local_experts]
+            for w in tuner_weights
+        ]
+
     # allocate workspace for profiling
     moe_runner = MoERunner(
         x_dtype=input.dtype,
@@ -337,7 +340,6 @@ def fused_moe(
         activation_type=activation_type,
         unpadded_hidden_size=unpadded_hidden_size,
         use_mxfp8_weight_scaling=use_mxfp8_weight_scaling,
-        tuner_num_local_experts=tuner_num_local_experts,
     )
 
     MoERunner.tuning_config.tune_max_num_tokens = tune_max_num_tokens
@@ -346,10 +348,7 @@ def fused_moe(
         "trtllm::fused_moe::gemm1",
         [moe_runner],
         MoERunner.tuning_config,
-        [
-            tuner_input, fc1_expert_weights, fc1_expert_biases,
-            fc2_expert_weights, fc2_expert_biases
-        ],
+        [tuner_input, *tuner_weights],
         gemm_idx=1,
     )
 
@@ -357,10 +356,7 @@ def fused_moe(
         "trtllm::fused_moe::gemm2",
         [moe_runner],
         MoERunner.tuning_config,
-        [
-            tuner_input, fc1_expert_weights, fc1_expert_biases,
-            fc2_expert_weights, fc2_expert_biases
-        ],
+        [tuner_input, *tuner_weights],
         gemm_idx=2,
     )
 
@@ -3774,19 +3770,19 @@ def _fp4_quantize_dispatch(input: torch.Tensor, input_scale: torch.Tensor,
         assert not sf_use_ue8m0, (
             "FlashInfer FP4 tactic does not support sf_use_ue8m0=True; "
             "force the TRTLLM tactic.")
+        sf_layout = (SfLayout.layout_128x4
+                     if is_sf_swizzled_layout else SfLayout.layout_linear)
         act_fp4, act_sf = _flashinfer_nvfp4_quantize(
             input,
             input_scale,
-            do_shuffle=is_sf_swizzled_layout,
+            sfLayout=sf_layout,
+            do_shuffle=False,
             sf_vec_size=scaling_vector_size,
             enable_pdl=get_env_enable_pdl(),
         )
-        # FlashInfer returns 2D act_sf [M_padded, sf_cols] but downstream
-        # (nvfp4_gemm) and the TRTLLM kernel expect 1D flat. Reshape to match.
-        # Use swizzled_layout=True since the C++ kernel always pads M to 128.
         _, expected_sf_shape = fp4_utils.get_fp4_shape(input.shape,
                                                        scaling_vector_size,
-                                                       True)
+                                                       is_sf_swizzled_layout)
         act_sf = act_sf.reshape(expected_sf_shape)
         return act_fp4, act_sf
     else:
@@ -3914,17 +3910,11 @@ def _(
     sf_use_ue8m0: bool = False,
     is_sf_swizzled_layout: bool = True,
 ) -> List[torch.Tensor]:
-    """Fake implementation for torch.compile support.
-
-    Note: The underlying TRTLLM C++ kernel always pads M to 128 for scale
-    factors regardless of the swizzled_layout flag, so we use
-    swizzled_layout=True in get_fp4_shape to match the actual output size.
-    We also reshape FlashInfer's output to match in _fp4_quantize_dispatch.
-    """
-    del sf_use_ue8m0, is_sf_swizzled_layout
+    """Fake implementation for torch.compile support."""
+    del sf_use_ue8m0
     output_shape, scale_shape = fp4_utils.get_fp4_shape(input.shape,
                                                         scaling_vector_size,
-                                                        True)
+                                                        is_sf_swizzled_layout)
 
     return [
         input.new_empty(output_shape, dtype=torch.uint8),

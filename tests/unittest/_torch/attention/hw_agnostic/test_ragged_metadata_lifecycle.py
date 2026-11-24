@@ -28,6 +28,7 @@ def _metadata(seq_lens: list[int], num_contexts: int = 0) -> DSAtrtllmAttentionM
     metadata._num_ctx_tokens = sum(seq_lens[:num_contexts])
     metadata._num_tokens = sum(seq_lens)
     metadata.max_draft_tokens = 5
+    metadata.sparse_metadata_params = SimpleNamespace(use_cute_dsl_paged_mqa_logits=False)
     metadata.runtime_tokens_per_gen_step = 0
     metadata._indexer_compress_ratio = 1
     metadata.kv_cache_manager = None
@@ -36,8 +37,12 @@ def _metadata(seq_lens: list[int], num_contexts: int = 0) -> DSAtrtllmAttentionM
 
 
 @pytest.mark.parametrize("runtime_width", [1, 2, 6])
-def test_schedule_update_keeps_runtime_query_width(monkeypatch, runtime_width: int) -> None:
+@pytest.mark.parametrize("use_cute_dsl", [False, True])
+def test_schedule_update_keeps_runtime_query_width(
+    monkeypatch, runtime_width: int, use_cute_dsl: bool
+) -> None:
     metadata = _metadata([runtime_width, runtime_width])
+    metadata.sparse_metadata_params.use_cute_dsl_paged_mqa_logits = use_cute_dsl
     metadata.runtime_tokens_per_gen_step = runtime_width
     metadata.kv_lens_cuda = torch.tensor([102, 204], dtype=torch.int32)
     metadata.kv_lens_cuda_runtime = metadata.kv_lens_cuda
@@ -70,19 +75,20 @@ def test_schedule_update_keeps_runtime_query_width(monkeypatch, runtime_width: i
         "tensorrt_llm._torch.attention.backends.sparse.dsa.metadata.get_paged_mqa_logits_metadata",
         schedule,
     )
+    # Exercise either backend on CPU without requiring CuTe DSL or SM100 hardware.
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.attention.backends.sparse.dsa.metadata.use_cute_dsl_paged_mqa_logits",
+        lambda requested: requested,
+    )
     Indexer.prepare_scheduler_metadata(metadata)
     metadata.kv_lens_cuda.add_(1)
     metadata.on_update_kv_lens()
 
-    assert [tuple(value.shape) for value in scheduler_inputs] == [
-        (2, 1),
-        (2, runtime_width),
-        (2, 1),
-        (2, runtime_width),
-    ]
+    expected_shapes = [(2, 1)] if use_cute_dsl else [(2, 1), (2, runtime_width)]
+    assert [tuple(value.shape) for value in scheduler_inputs] == expected_shapes * 2
     torch.testing.assert_close(
         scheduler_inputs[-1],
-        metadata.kv_lens_cuda[:, None].expand(-1, runtime_width),
+        metadata.kv_lens_cuda[:, None].expand(-1, 1 if use_cute_dsl else runtime_width),
     )
 
 

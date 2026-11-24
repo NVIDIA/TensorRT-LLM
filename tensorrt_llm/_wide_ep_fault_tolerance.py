@@ -29,7 +29,7 @@ RENDEZVOUS_ENV = "TLLM_FAULT_TOLERANCE_RENDEZVOUS"
 # The hex secret that every deployment process holds. It derives the hello token.
 SHARED_SECRET_ENV = "TLLM_FAULT_TOLERANCE_SHARED_SECRET"  # nosec B105 - environment variable name, not a secret
 # The model architectures that Wide-EP fault tolerance supports, as named in config.json.
-SUPPORTED_ARCHITECTURES = ("DeepseekV3ForCausalLM",)
+SUPPORTED_ARCHITECTURES = ("DeepseekV3ForCausalLM", "Qwen3MoeForCausalLM")
 # The alternative that each error about an unmet fault tolerance requirement offers.
 TURN_FAULT_TOLERANCE_OFF = "turn fault tolerance off (enable_wide_ep_fault_tolerance=False)"
 
@@ -91,6 +91,10 @@ def check_llm_args(llm_args: "TorchLlmArgs") -> None:
     load_balancer = llm_args.moe_config.load_balancer
     balancer_mode = None if load_balancer is None else load_balancer.mode
     warmup_placement = getattr(load_balancer, "warmup_placement", None)
+    # The TLLM_MEM_MONITOR variables are folded into the configuration before this check.
+    memory_monitor = llm_args.memory_monitor_config
+    memory_monitor_mode = None if memory_monitor is None else memory_monitor.mode
+    rejection_method = getattr(spec_config, "rejection_sample_method", "standard")
     adp_routing = [
         name
         for name in (
@@ -180,6 +184,13 @@ def check_llm_args(llm_args: "TorchLlmArgs") -> None:
                 "and fail its startup check that the node holds every tier bound to it",
             ),
             (
+                not llm_args.kv_cache_config.enable_kv_pool_rebalance,
+                "no KV pool rebalance (kv_cache_config.enable_kv_pool_rebalance=False, not True), "
+                "because fault tolerance resizes the KV cache pool with fixed shares between its "
+                "pool groups, and a rebalance changes those shares without zeroing the slots it "
+                "adds",
+            ),
+            (
                 transceiver_backend is None,
                 "no disaggregated serving (no cache_transceiver_config.backend, not "
                 f"{transceiver_backend!r}), because the KV cache transfers between serving "
@@ -244,6 +255,24 @@ def check_llm_args(llm_args: "TorchLlmArgs") -> None:
                 "no routed-expert capture (enable_return_routed_experts=False), because a step "
                 "that a failure discards would leave its routes in the request's routes",
             ),
+            (
+                memory_monitor_mode != "full",
+                "no full memory monitor (memory_monitor_config.mode other than 'full', and no "
+                "TLLM_MEM_MONITOR=1), because full mode duplicates the MPI world's communicator to "
+                "gather every rank's report, while each rank is its own MPI world",
+            ),
+            (
+                not llm_args.enable_locality_domains,
+                "no locality domains (enable_locality_domains=False), because the KV cache then "
+                "keeps a pool per domain, while fault tolerance resizes the KV cache's GPU quota "
+                "as one pool",
+            ),
+            (
+                rejection_method == "standard",
+                "token-level rejection sampling (speculative_config.rejection_sample_method="
+                f"'standard', not {rejection_method!r}), because block verification is not tested "
+                "with fault tolerance",
+            ),
         ]
     )
 
@@ -259,8 +288,8 @@ def check_model_architectures(architectures: Optional[Sequence[str]]) -> None:
             (
                 bool(architectures)
                 and all(name in SUPPORTED_ARCHITECTURES for name in architectures),
-                f"a model architecture in {list(SUPPORTED_ARCHITECTURES)} (DeepSeek-V3 and "
-                f"DeepSeek-R1), not {architectures}",
+                f"a model architecture in {list(SUPPORTED_ARCHITECTURES)} (DeepSeek-V3, "
+                f"DeepSeek-R1 and Qwen3-235B-A22B), not {architectures}",
             )
         ]
     )

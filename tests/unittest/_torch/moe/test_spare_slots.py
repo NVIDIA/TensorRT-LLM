@@ -41,7 +41,10 @@ from tensorrt_llm._torch.distributed.membership import (
     startup,
 )
 from tensorrt_llm._torch.distributed.startup_record import StartupRecord
-from tensorrt_llm._torch.moe.fused_moe.cutedsl import TrtllmCutedslGroupedGemmNvfp4Impl
+from tensorrt_llm._torch.moe.fused_moe.cutedsl import (
+    TrtllmCutedslGroupedGemmBf16Impl,
+    TrtllmCutedslGroupedGemmNvfp4Impl,
+)
 from tensorrt_llm._torch.moe.fused_moe.cutlass import (
     DeepgemmCudaHopperFp8BlockScalesImpl,
     TrtllmCutlassNvfp4Impl,
@@ -969,3 +972,72 @@ def test_host_weights_not_sized_yet_are_missing(monkeypatch, tracked):
     os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600))
     assert not sharer.holds_host_weights(0)
     sharer.pre_shutdown_cleanup()
+
+
+@pytest.mark.parametrize(
+    "leaf, quant, sm, problem_fields, reason",
+    [
+        # Gated FC1 rows (2 * 96) are not a multiple of the 128-row NVFP4 scale tile.
+        (
+            TrtllmCutlassW4a16Nvfp4Impl,
+            "W4A16_NVFP4",
+            100,
+            {"intermediate_size": 96},
+            "SHAPE_UNALIGNED",
+        ),
+        # The BF16 FC1 op fuses only SwiGLU.
+        (
+            TrtllmCutedslGroupedGemmBf16Impl,
+            None,
+            107,
+            {"activation": "Relu2"},
+            "ACTIVATION_UNSUPPORTED",
+        ),
+    ],
+)
+def test_leaf_reason_wins_over_spare_slots(leaf, quant, sm, problem_fields, reason):
+    """A backend without spare slots that its own gate also turns down reports its own reason."""
+    from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
+        MoEDeployment,
+        MoEEnvironment,
+        MoEProblem,
+        MoERejectReason,
+    )
+    from tensorrt_llm._torch.moe.fused_moe.impl_environment import MoEDep
+
+    problem = MoEProblem(quant=quant, dtype_act=torch.bfloat16, **problem_fields)
+    deployment = MoEDeployment(
+        ep_size=4,
+        tp_size=1,
+        parallel_size=4,
+        use_dp=True,
+        num_slots=8,
+        env=MoEEnvironment(sm=sm, available_deps=(MoEDep.CUTEDSL_RUBIN.value,)),
+        eplb_enabled=True,
+        eplb_mode="standard",
+        spare_slots_enabled=True,
+    )
+    assert not leaf.capabilities.supports_spare_slots
+    verdict = leaf.can_implement(problem, deployment)
+    assert verdict.reject_reason is MoERejectReason[reason]
+
+
+def test_host_weights_outlive_a_failed_rank(monkeypatch, tracked):
+    """Leave no host weights, created or attached, for a rank's resource tracker to unlink.
+
+    The resource tracker of a rank that fails unlinks the shared memory the rank registered, the
+    other ranks' host weights included. The node supervisor unlinks them once the deployment ends.
+    """
+    _original(monkeypatch)
+    sharers = [_sharer(rank, float(rank), node_size=2) for rank in range(2)]
+    for sharer in sharers:
+        sharer.finalize_layer_weights()
+    for sharer in sharers:
+        sharer.finalize_host_tensor_sharing()
+    assert sorted(sharers[0].node_host_weights) == [(e, "w") for e in range(4)]
+    assert not tracked
+    for sharer in sharers:
+        sharer.pre_shutdown_cleanup()
+        sharer.post_shutdown_cleanup()
+    assert not tracked
+    assert _shm_names() == sorted(sharer.get_shared_memory_name() for sharer in sharers)

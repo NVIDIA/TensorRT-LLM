@@ -196,6 +196,7 @@ from .sage_scales import validate_context_sage_layout
 from ...sage.layout import _SageScaleLayout
 from ...sage.modes import SageKTransport
 from .fmha_tasks import (
+    ContextTask,
     PackedContextWorkQueue,
     create_correction_task,
     create_epilogue_task,
@@ -255,12 +256,12 @@ def _init_task_with_domain(
     task: Task,
     kwargs: dict[str, Any],
     domain: int | None,
-    task_init: Callable[..., None] = Task.__init__,
+    task_init: Callable[..., None] = ContextTask.__init__,
 ) -> None:
     """Initialize a captured Task with its static validation loop domain."""
     schedule = kwargs.get("schedule")
     if schedule is None:
-        raise ValueError("Causal domain tasks require a captured schedule.")
+        raise ValueError("Domain tasks require a captured schedule.")
     if domain is not None:
         schedule.loop_end = domain
     task_init(task, **kwargs)
@@ -284,7 +285,7 @@ def _init_causal_domain_state(
     window_size_left: int,
     packed_window: bool,
     kwargs: dict[str, Any],
-    task_init: Callable[..., None] = Task.__init__,
+    task_init: Callable[..., None] = ContextTask.__init__,
 ) -> None:
     """Initialize causal-domain fields and the static validation domain."""
     static_domain = None
@@ -339,7 +340,55 @@ def _init_causal_domain_state(
     task._packed_window = packed_window
 
 
-class CausalDomainTask(Task):
+def _writes_empty_dense_lse(cfg: FmhaConfig) -> bool:
+    """Publish neutral O/LSE for empty ordinary contiguous dense requests."""
+    return (
+        cfg.lse_mode != "none"
+        and not cfg.is_causal
+        and not cfg.has_variable_window
+        and cfg.window_size_left == 0
+        and not cfg.use_paged_kv
+        and cfg.vc_attention is None
+        and not cfg.use_sage_attention
+        and not cfg.use_mxfp8_qk
+    )
+
+
+class PackedDenseDomainTask(ContextTask):
+    """Request-local dense KV extent with one masked tile for empty rows."""
+
+    def __init__(
+        self,
+        num_kv_tiles: int | Int32,
+        tile_size_kv: int,
+        batch_idx: int,
+        cum_seqlen_k: cute.Tensor,
+        offset: int = 0,
+        **kwargs: Any,
+    ) -> None:
+        """Retain a static validation bound when available and clip runtime work."""
+        static_domain = (
+            max(num_kv_tiles - offset, 0) if isinstance(num_kv_tiles, int) else None
+        )
+        _init_task_with_domain(self, kwargs, static_domain)
+        self._num_kv_tiles = num_kv_tiles
+        self._tile_size_kv = tile_size_kv
+        self._batch_idx = batch_idx
+        self._cum_seqlen_k = cum_seqlen_k
+        self._offset = offset
+
+    def get_domain(self, tile_coord: cute.Coord) -> int | Int32:
+        """Use the same live KV bound for each task's N or N-1 domain."""
+        batch_coord = Int32(tile_coord[self._batch_idx])
+        k_begin = Int32(self._cum_seqlen_k[batch_coord])
+        seqlen_k = Int32(self._cum_seqlen_k[batch_coord + Int32(1)]) - k_begin
+        runtime_tiles = cute.ceil_div(seqlen_k, self._tile_size_kv)
+        # Keep the paired N/N-1 pipeline domain valid even for an empty request.
+        domain = _domain_min(self._num_kv_tiles, _domain_max(1, runtime_tiles))
+        return domain - self._offset
+
+
+class CausalDomainTask(ContextTask):
     """Task with causal and optional left-window masking domain.
 
     For causal FMHA, each Q tile only attends to K tiles where k <= q.
@@ -563,7 +612,7 @@ class CausalSoftmaxDomainTask(CausalDomainTask):
         )
 
 
-class VariableWindowDomainTask(Task):
+class VariableWindowDomainTask(ContextTask):
     """Task whose K-loop domain comes from packed-Q window endpoints."""
 
     def __init__(
@@ -1202,6 +1251,7 @@ def build_context_task_manager(
                 cum_seqlen_q=cum_seqlen_q,
                 cum_seqlen_k=cum_seqlen_k,
                 seq_lens_kv=g_seq_lens_kv,
+                keep_empty_kv=_writes_empty_dense_lse(cfg),
                 **work_queue_kwargs,
             )
         else:
@@ -1222,6 +1272,7 @@ def build_context_task_manager(
                 cum_seqlen_q=cum_seqlen_q,
                 cum_seqlen_k=cum_seqlen_k,
                 seq_lens_kv=g_seq_lens_kv,
+                keep_empty_kv=_writes_empty_dense_lse(cfg),
                 **work_queue_kwargs,
             )
         else:
@@ -2607,6 +2658,35 @@ def _causal_domain_kwargs(
     return result
 
 
+def _uses_packed_dense_runtime_kv_bounds(cfg: FmhaConfig) -> bool:
+    """Bound ordinary query-paired dense context by each live packed KV extent."""
+    # All task roles share the same paired N/N-1 protocol and int32 offsets.
+    # Uniform packed plans omit live offsets; specialized recipes and other
+    # topologies retain their own domains and tail handling.
+    # These are the public API's paired geometries; symmetric D192/D256 use
+    # one instance, and the public context API does not admit D64.
+    return (
+        not cfg.is_causal
+        and not cfg.has_variable_window
+        and cfg.window_size_left == 0
+        and not cfg.head_paired
+        and not cfg.use_paged_kv
+        and cfg.has_varlen
+        and not cfg.has_uniform_varlen
+        and cfg.packed_dense_k_mask
+        and cfg.num_qkv_instances == 2
+        and not cfg.two_cta_umma
+        and cfg.logical_head_dim_qk in (128, 192)
+        and cfg.pv_mma_tiler[1] == 128
+        and cfg.vc_attention is None
+        and not cfg.use_sage_attention
+        and not cfg.use_mxfp8_qk
+        and cfg.q_dtype == cfg.k_dtype == cfg.v_dtype
+        and cfg.q_dtype in (cutlass.Float16, cutlass.BFloat16, cutlass.Float8E4M3FN)
+        and cfg.o_dtype in (cutlass.Float16, cutlass.BFloat16)
+    )
+
+
 def _select_fmha_domain_policy(
     cfg: FmhaConfig,
     *,
@@ -2788,6 +2868,24 @@ def _select_fmha_domain_policy(
             domain_n_minus_1_kwargs=causal_n_minus_1,
             softmax0_domain_kwargs=softmax0_domain,
             softmax1_domain_kwargs=softmax1_domain,
+        )
+    if _uses_packed_dense_runtime_kv_bounds(cfg):
+        if cum_seqlen_q is None or cum_seqlen_k is None:
+            raise ValueError("Packed dense domains require runtime Q and KV offsets")
+        dense_kwargs: DomainKwargs = {
+            "task_class": PackedDenseDomainTask,
+            "num_kv_tiles": num_kv_tiles,
+            "tile_size_kv": cfg.kv_tile_n,
+            "batch_idx": batch_idx,
+            "cum_seqlen_k": cum_seqlen_k,
+        }
+        domain_n_kwargs = {**dense_kwargs, "offset": 0}
+        domain_n_minus_1_kwargs = {**dense_kwargs, "offset": 1}
+        return FmhaDomainPolicy(
+            domain_n_kwargs=domain_n_kwargs,
+            domain_n_minus_1_kwargs=domain_n_minus_1_kwargs,
+            softmax0_domain_kwargs=domain_n_kwargs,
+            softmax1_domain_kwargs=domain_n_kwargs,
         )
     # Dense query-paired fallback: no head-pairing or causal mask, so both
     # peers traverse the full static K/V domain.
@@ -4021,7 +4119,7 @@ class FmhaTs:
 
         # 7. Execute all tasks via the TS scheduler
         active_request = cutlass.Boolean(True)
-        if cutlass.const_expr(not is_persistent):
+        if cutlass.const_expr(not is_persistent and not _writes_empty_dense_lse(cfg)):
             batch_coord = cute.arch.block_idx()[cfg.work_tile_coord_indices[2]]
             if cutlass.const_expr(seq_lens_kv is not None):
                 active_request = Int32(seq_lens_kv[batch_coord]) > Int32(0)

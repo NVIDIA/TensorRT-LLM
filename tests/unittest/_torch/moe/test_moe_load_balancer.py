@@ -25,7 +25,7 @@ from tensorrt_llm._torch.moe.fused_moe.impl_blocks import (
     MoEEplbWeightLayoutMixin, MoEWeightOwnerMixin)
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer, MoeLoadBalancerIterContext, SingleLayerMoeLoadBalancer,
-    get_moe_load_balancer, maybe_create_moe_load_balancer,
+    _tensor_to_weight, get_moe_load_balancer, maybe_create_moe_load_balancer,
     moe_load_balancer_add_single_layer)
 from tensorrt_llm._torch.pyexecutor.rank_failure_memory import (RecoveryMemory,
                                                                 StartupMemory)
@@ -1269,6 +1269,34 @@ def test_cpu_copied_slot_outside_host_accessible_memory(fault_tolerance,
         # Release the slots while host accessible device memory is set up.
         slot = storage = None
         balancer.shutdown()
+
+
+class TestTensorToWeight(unittest.TestCase):
+    """_tensor_to_weight describes a tensor as a (height, width, pitch) copy."""
+
+    def test_2d_contiguous(self):
+        t = torch.zeros(6, 10, dtype=torch.bfloat16)
+        mw = _tensor_to_weight(t)
+        self.assertEqual((mw.height, mw.width, mw.pitch), (6, 20, 20))
+        self.assertEqual(mw.weight_ptr, t.data_ptr())
+
+    def test_2d_row_strided_keeps_pitch(self):
+        t = torch.zeros(6, 16, dtype=torch.bfloat16)[:, :10]
+        mw = _tensor_to_weight(t)
+        self.assertEqual((mw.height, mw.width, mw.pitch), (6, 20, 32))
+
+    def test_3d_contiguous_collapses_leading_dims(self):
+        # TRTLLM-Gen BlockMajorK expert weight: [K / block_k, Mn, block_k].
+        t = torch.zeros(4, 8, 64, dtype=torch.bfloat16)
+        mw = _tensor_to_weight(t)
+        self.assertEqual((mw.height, mw.width, mw.pitch), (32, 128, 128))
+        self.assertEqual(mw.weight_ptr, t.data_ptr())
+
+    def test_3d_non_contiguous_rejected(self):
+        t = torch.zeros(8, 4, 64, dtype=torch.bfloat16).permute(1, 0, 2)
+        self.assertFalse(t.is_contiguous())
+        with self.assertRaises(AssertionError):
+            _tensor_to_weight(t)
 
 
 if __name__ == '__main__':

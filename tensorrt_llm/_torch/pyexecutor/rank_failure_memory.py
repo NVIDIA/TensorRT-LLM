@@ -273,8 +273,11 @@ class RecoveryMemory:
     ) -> Iterator[str]:
         """Suspend the KV cache pool, shrink it by ``restore_bytes`` and yield the quota change.
 
-        While the pages in use do not fit, the newest ``recomputable`` requests are preempted for
-        recompute, doubling the number preempted with each attempt.
+        While workspace rows are owed, the pool also gives up the owed rows, as far as its quota
+        and the pages in use allow, so that serving keeps the free memory it had before the remap
+        and the release grows the pool back once the excluded process ends. Free memory stays short
+        by the rest until then. While the pages in use do not fit, the newest ``recomputable``
+        requests are preempted for recompute, doubling the number preempted with each attempt.
 
         Raises:
             KvCacheShrinkError: The pages in use do not fit and no request is left to preempt.
@@ -285,14 +288,23 @@ class RecoveryMemory:
             yield "unchanged"
             return
         backed = 0 if balancer is None else balancer.expert_restore.backed_spare_slot_bytes
+        # The pool's quota bounds the owed bytes it can give up.
+        owed_cap = max(0, self._startup_memory.kv_cache_quota - backed - restore_bytes)
         preempted = 0
         while True:
             with self._executor.kv_pools_suspended() as kv_cache_manager:
                 quota_before, free = kv_cache_manager.gpu_quota, _free_device_memory()
-                free_to_keep = self._startup_memory.free_to_keep(kv_cache_manager, backed)
+                free_to_keep = self._owed_free_to_keep()
+                if free_to_keep is None:
+                    owed = 0
+                    free_to_keep = self._startup_memory.free_to_keep(kv_cache_manager, backed)
+                else:
+                    # The owed rows that the excluded process still holds.
+                    owed = self._startup_memory.shortfall(kv_cache_manager, backed, free_to_keep)
+                    owed = min(owed, owed_cap)
                 try:
-                    quota_after = self._startup_memory.fit_kv_cache(
-                        kv_cache_manager, backed, restore_bytes
+                    quota_after, owed = self._fit_kv_cache_for_restore(
+                        kv_cache_manager, backed, restore_bytes, owed
                     )
                 except OutOfPagesError as error:
                     victims = [
@@ -311,15 +323,46 @@ class RecoveryMemory:
                     self._kv_cache_free_to_keep = free_to_keep
                     yield (
                         f"{quota_before} -> {quota_after} bytes ({restore_bytes} bytes needed, "
-                        f"{free} bytes free, {preempted} requests preempted)"
+                        f"{owed} bytes of owed workspace rows, {free} bytes free, {preempted} "
+                        "requests preempted)"
                     )
                     return
             self._executor.recompute_requests(victims)
             preempted += len(victims)
 
+    def _fit_kv_cache_for_restore(
+        self, kv_cache_manager: KVCacheManagerV2, backed: int, restore_bytes: int, owed: int
+    ) -> tuple[int, int]:
+        """Shrink the suspended pool by ``restore_bytes`` and ``owed``, or by the restore alone.
+
+        The owed bytes never preempt a request: the pool gives them up only if the pages in use
+        still fit.
+
+        Returns:
+            The new quota and the owed bytes given up.
+        """
+        if owed:
+            with contextlib.suppress(OutOfPagesError):
+                quota = self._startup_memory.fit_kv_cache(
+                    kv_cache_manager, backed, restore_bytes + owed
+                )
+                return quota, owed
+        return self._startup_memory.fit_kv_cache(kv_cache_manager, backed, restore_bytes), 0
+
     def owe_workspace_rows(self) -> None:
         """Record that a remap replaced this rank's workspace rows."""
         self._workspace_rows_owed = True
+
+    def _owed_free_to_keep(self) -> int | None:
+        """Return the free memory kept since the owed workspace rows were replaced, if any.
+
+        The scheduled release keeps it, or the retry of a release that fell short.
+        """
+        if not self._workspace_rows_owed:
+            return None
+        if self._kv_cache_free_to_keep is not None:
+            return self._kv_cache_free_to_keep
+        return None if self._release_retry is None else self._release_retry.free_to_keep
 
     def schedule_release(self, balancer: MoeLoadBalancer | None) -> None:
         """Release the committed change's memory.
@@ -405,6 +448,9 @@ class RecoveryMemory:
             self._release_scheduled = False
             self.wait_for_release()
             kept, self._kv_cache_free_to_keep = self._kv_cache_free_to_keep, None
+            if kept is None:
+                # A change that restored nothing on this rank keeps the free memory of owed rows.
+                kept = self._owed_free_to_keep()
             free_to_keep = kept or 0
         else:
             free_to_keep = self._release_retry.free_to_keep

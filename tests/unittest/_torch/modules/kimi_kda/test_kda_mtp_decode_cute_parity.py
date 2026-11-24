@@ -1468,6 +1468,69 @@ def test_verify_kernels_with_separate_replay_slots(
         assert not actual[name][other_replay].any(), name
 
 
+@pytest.mark.parametrize("num_spec", [2, 7])
+def test_round2_replay_clamps_oversized_acceptance(num_spec, monkeypatch):
+    """Oversized counts replay only the available drafts, preserving neighboring requests."""
+    monkeypatch.setenv("TRTLLM_KDA_MTP_BF16_MATH", "0")
+    data, _ = _round2_inputs(B=4, H=6, M=num_spec)
+    accepted = torch.tensor([0, num_spec, num_spec + 1, 2**31 - 1], dtype=torch.int32)
+    data["num_accepted_tokens"] = accepted.cuda()
+    clamped = accepted.clamp(max=num_spec)
+    reference_data = dict(data)
+    reference_data["num_accepted_tokens"] = clamped.cuda()
+    expected = {name: value.cuda() for name, value in cpu_reference(reference_data).items()}
+
+    actual = cute_run(data)
+
+    rows = torch.cat(
+        [
+            torch.arange(
+                request_index * data["T"] + accepted_count,
+                request_index * data["T"] + accepted_count + 1 + num_spec,
+            )
+            for request_index, accepted_count in enumerate(clamped.tolist())
+        ]
+    ).cuda()
+    _assert_close(
+        "out(clamped replay vs cpu)", actual["out"][0, rows], expected["out"][0, rows], atol=2e-2
+    )
+    _assert_close(
+        "state(clamped replay vs cpu)",
+        actual["recurrent_state"],
+        expected["recurrent_state"],
+        atol=1e-4,
+    )
+    for name in ("k_cache", "g_cache", "v_cache", "beta_cache", "cs_q", "cs_k", "cs_v"):
+        _assert_close(
+            f"{name}(clamped replay vs cpu)", actual[name], expected[name], atol=2e-2, rtol=4e-3
+        )
+
+
+@pytest.mark.parametrize("kernel", ["v2", "two_cta"])
+@pytest.mark.parametrize("num_spec", [2, 7])
+def test_packed_replay_clamps_oversized_acceptance(num_spec, kernel, monkeypatch):
+    """Packed fused-norm verify kernels clamp accepted counts to the available drafts."""
+    oversized = torch.tensor([0, num_spec, num_spec + 1, 2**31 - 1], dtype=torch.int32)
+    clamped = oversized.clamp(max=num_spec)
+    actual_data = _packed_fused_norm_inputs(B=4, H=6, num_spec=num_spec, state_dtype=torch.float32)
+    expected_data = dict(actual_data)
+    slots = actual_data["ssm_state_indices"].long()
+    actual_accepted = torch.empty_like(actual_data["num_accepted_tokens"])
+    expected_accepted = torch.empty_like(actual_data["num_accepted_tokens"])
+    actual_accepted[slots] = oversized.cuda()
+    expected_accepted[slots] = clamped.cuda()
+    actual_data["num_accepted_tokens"] = actual_accepted
+    expected_data["num_accepted_tokens"] = expected_accepted
+
+    def run(data):
+        return cute_run(data, packed_token_layout=True, fuse_output_norm=True)
+
+    expected = _run_with_verify_kernel(monkeypatch, kernel, lambda: run(expected_data))
+    actual = _run_with_verify_kernel(monkeypatch, kernel, lambda: run(actual_data))
+    for name in _VERIFY_RESULTS:
+        assert torch.equal(actual[name], expected[name]), name
+
+
 if __name__ == "__main__":
     import sys
 

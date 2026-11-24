@@ -108,6 +108,9 @@ public:
     void unmapDeviceMemory(void* devPtr) noexcept;
 
 private:
+    //! \brief Native-memory ledger label for an allocation; `gdr` is true for GDRCopy-backed device memory.
+    char const* nativeMemoryLabel(bool gdr) const;
+
     struct AllocationInfo
     {
         size_t size;

@@ -274,7 +274,8 @@ def slot_parameters(module: torch.nn.Module) -> list[tuple[str, torch.nn.Paramet
     """Return the named weights of ``module`` that have one row per local slot.
 
     Restoring an expert into a spare slot needs host weights for each of them.
-    ``register_weight_slots_after_to_cuda`` checks this.
+    ``register_weight_slots_after_to_cuda`` checks this for the weights whose spare slots map no
+    memory.
     """
     return [
         (name, param)
@@ -360,7 +361,7 @@ class DeploymentHostWeights(HostMoeTensorSharer):
 
     def __init__(
         self, *args, replacement: bool, next_node_ranks: Optional[Sequence[int]] = None, **kwargs
-    ):
+    ) -> None:
         super().__init__(*args, **kwargs)
         self.replacement = replacement
         self.next_node_ranks = next_node_ranks
@@ -395,7 +396,7 @@ class DeploymentHostWeights(HostMoeTensorSharer):
         _keep_after_exit(shm)
         return shm
 
-    def finalize_layer_weights(self):
+    def finalize_layer_weights(self) -> None:
         super().finalize_layer_weights()
         if not self.reattached_own_shm:
             # Written last, so a process that finds the fingerprint also finds the host weights.
@@ -403,7 +404,7 @@ class DeploymentHostWeights(HostMoeTensorSharer):
                 self.local_rank, self.name_info
             )
 
-    def finalize_host_tensor_sharing(self, add_host_weight_fn: Optional[Callable] = None):
+    def finalize_host_tensor_sharing(self, add_host_weight_fn: Optional[Callable] = None) -> None:
         if self.reattached_own_shm:
             self._import_host_weights(self.own_shm, self.local_rank)
 
@@ -427,8 +428,9 @@ class DeploymentHostWeights(HostMoeTensorSharer):
             )
         return shm
 
-    def pre_shutdown_cleanup(self):
-        # Shared memory closes only once no view of it is left.
+    def pre_shutdown_cleanup(self) -> None:
+        # Drop the tensor views of the shared memory before closing it, so that no view points
+        # to unmapped memory.
         self.host_weights.clear()
         self.node_host_weights.clear()
         for shm in self.imported_shms:
@@ -512,7 +514,7 @@ class DeploymentHostWeights(HostMoeTensorSharer):
 class EplbExpertRestore:
     """Size the spare slots of a ``MoeLoadBalancer`` and restore failed ranks' experts into them."""
 
-    def __init__(self, balancer: "MoeLoadBalancer"):
+    def __init__(self, balancer: "MoeLoadBalancer") -> None:
         self.balancer = balancer
         nodes = self._rank_nodes()
         self.largest_failure = max(map(len, self._recoverable_failures(nodes)), default=0)
@@ -529,9 +531,11 @@ class EplbExpertRestore:
             and not runtime.host_accessible_device_memory_uses_gdrcopy()
         ):
             raise ValueError(
-                "Wide-EP fault tolerance with online EPLB requires GDRCopy in CDMM mode, "
-                "because online EPLB's CPU copies reach the spare slots only through GDRCopy. Set "
-                f"layer_updates_per_iter=0 or {TURN_FAULT_TOLERANCE_OFF}."
+                "Wide-EP fault tolerance with online EPLB requires GDRCopy, because online EPLB's "
+                "CPU copies reach the spare slots only through GDRCopy. EPLB uses GDRCopy if it is "
+                "installed and either GPU memory is not a NUMA node (as in CDMM mode) or "
+                "TRTLLM_EPLB_FORCE_GDRCOPY=1 is set. Otherwise set layer_updates_per_iter=0 or "
+                f"{TURN_FAULT_TOLERANCE_OFF}."
             )
         self.active_ranks: tuple[bool, ...] = (True,) * balancer.ep_size
         self.backed_spare_slot_bytes = 0
@@ -1024,7 +1028,7 @@ class FaultTolerantMoeLoadBalancer(MoeLoadBalancer):
         replacement: bool,
         wait_for_host_weights: Callable[[int, Callable[[], list[int]]], None],
         **kwargs,
-    ):
+    ) -> None:
         """Create the load balancer of one rank of a deployment.
 
         Args:
@@ -1054,7 +1058,7 @@ class FaultTolerantMoeLoadBalancer(MoeLoadBalancer):
         # A layer gets spare slots exactly when some failure is recoverable.
         return self.expert_restore.largest_failure > 0
 
-    def finalize_model(self):
+    def finalize_model(self) -> None:
         if self.replacement:
             self._wait_for_host_weights(
                 self.ep_rank, self.expert_restore.node_ranks_without_host_weights
