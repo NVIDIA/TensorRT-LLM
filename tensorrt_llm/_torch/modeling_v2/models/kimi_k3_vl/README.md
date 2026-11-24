@@ -35,8 +35,8 @@ The MXFP4 checkpoint runs on sm_100 on two targets, TP16 with the experts split 
 The NVFP4 checkpoint runs on sm_107 only, on five specialized targets, each one layout of the
 recipe below. Routing admits exactly these layouts; anything else raises `NoTarget` with the facts
 it saw (`modeling_v2="require"` turns that into an error). The Helix16 ULL layout requires a KV cache
-transceiver and declines an explicit non-generation role, a guided decoding backend, or GEN slot
-preemption.
+transceiver, MNNVL all-reduce (`AUTO` or `MNNVL`), and a standalone MLA DSpark drafter with Markov
+head weights. It declines an explicit non-generation role, guided decoding, or GEN slot preemption.
 
 The recipe:
 

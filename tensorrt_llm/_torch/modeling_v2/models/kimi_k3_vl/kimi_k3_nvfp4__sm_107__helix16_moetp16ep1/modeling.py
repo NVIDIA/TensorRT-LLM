@@ -9159,6 +9159,10 @@ class K3MLADSparkForCausalLM(_DSparkHeadMixin, _K3DFlashDrafterMixin, nn.Module)
         """
         del weight_mapper, kwargs
         weights, _ = self._take_dspark_head_weights(weights)
+        if not self.has_markov_head:
+            raise ValueError(
+                "Kimi K3 ULL requires DSpark Markov head weights in the drafter checkpoint"
+            )
         weights = {self._TORCHSPEC_RENAMES.get(k, k): v for k, v in weights.items()}
         weights = {
             k[len("model.") :] if k.startswith("model.") else k: v for k, v in weights.items()
@@ -9922,9 +9926,7 @@ class KimiK3Helix16UllForCausalLM(
     ) -> Any:
         """The one-engine speculative step (served ``SpecDecOneEngineForCausalLM.forward``): the
         text model, the target head on ``spec_worker.target_head_rows`` (a generation-only batch's
-        rows in place, no index copy), then the DSpark worker. A configuration that keeps main's
-        worker (``install_k3_dspark`` returned False) takes the same path with
-        ``SpecWorkerBase.target_head_rows`` (``hidden_states[spec_metadata.gather_ids]``)."""
+        rows in place, no index copy), then the ULL DSpark worker."""
         hidden_states = self.model(
             input_ids=input_ids,
             attn_metadata=attn_metadata,
@@ -9984,12 +9986,10 @@ class KimiK3Helix16UllForCausalLM(
         contract main's ``DFlashSpecMetadata.prepare()`` has with the worker (the attributes it
         reads and the slot methods it calls, listed in ``drafter.py``).
 
-        One-engine DSpark with a standalone MLA drafter gets the package's drafter
-        (``drafter.py``) and worker (``drafter.py`` on ``dflash.py``)
-        through :func:`~.drafter.install_k3_dspark`, which keeps that contract; every other
-        configuration keeps main's.
+        The ULL recipe requires a standalone MLA DSpark drafter and its matching worker.
         """
-        install_k3_dspark(self, model_config)
+        if not install_k3_dspark(self, model_config):
+            raise ValueError("Kimi K3 ULL requires a standalone MLA DSpark drafter")
 
     def _setup_helix_mappings(
         self,

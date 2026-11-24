@@ -127,3 +127,18 @@ def test_gate_enables_shared_draft_kv_on_both_roles() -> None:
         role_env = environment.get(f"{role}_worker_env_var") or ""
         assignments = dict(v.split("=", 1) for v in shlex.split(f"{shared_env} {role_env}"))
         assert assignments.get("TRTLLM_DISAGG_SHARED_DRAFT_KV") == "1", role
+
+
+def test_ull_requires_an_mla_drafter() -> None:
+    mode = NS(use_one_engine=lambda: True, is_dspark=lambda: True)
+    model_config = NS(spec_config=NS(spec_dec_mode=mode))
+    with pytest.raises(ValueError, match="standalone MLA DSpark drafter"):
+        dflash.KimiK3Helix16UllForCausalLM._install_private_spec(
+            NS(draft_config=None), model_config
+        )
+
+
+def test_ull_requires_markov_weights_before_warmup() -> None:
+    draft = NS(has_markov_head=False, _take_dspark_head_weights=lambda weights: (weights, 0))
+    with pytest.raises(ValueError, match="Markov head weights"):
+        drafter.K3MLADSparkForCausalLM.load_weights(draft, {})

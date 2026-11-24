@@ -376,11 +376,15 @@ def _check_sm107_ull(llm_args: TorchLlmArgs) -> None:
         raise NoTarget("the sm107 Kimi K3 ULL target does not support guided_decoding_backend")
     if llm_args.moe_config.backend != "CUTEDSL_FC12":
         raise NoTarget("the sm107 Kimi K3 ULL target requires moe_config.backend CUTEDSL_FC12")
+    if getattr(llm_args, "allreduce_strategy", None) not in (None, "AUTO", "MNNVL"):
+        raise NoTarget("the sm107 Kimi K3 ULL target requires allreduce_strategy AUTO or MNNVL")
     preemption = getattr(getattr(llm_args, "scheduler_config", None), "gen_preemption", None)
     if getattr(preemption, "enabled", False):
         raise NoTarget("the sm107 Kimi K3 ULL target does not support GEN slot preemption")
 
     spec = llm_args.speculative_config
+    if getattr(spec, "draft_is_embedded_in_target", False):
+        raise NoTarget("the sm107 Kimi K3 ULL target requires a standalone MLA DSpark drafter")
     draft_len = getattr(spec, "max_draft_len", None)
     if draft_len != _ULL_DRAFT_LEN:
         raise NoTarget(

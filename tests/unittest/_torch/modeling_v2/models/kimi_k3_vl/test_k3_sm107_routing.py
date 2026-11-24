@@ -379,6 +379,15 @@ def test_ull_generation_server_routes_to_the_ull_target(max_batch_size):
             _ull_args(moe_config=SimpleNamespace(backend="CUTLASS")),
             "moe_config.backend CUTEDSL_FC12",
         ),
+        (_ull_args(allreduce_strategy="NCCL"), "allreduce_strategy AUTO or MNNVL"),
+        (
+            _ull_args(
+                speculative_config=SimpleNamespace(
+                    max_draft_len=7, draft_is_embedded_in_target=True
+                )
+            ),
+            "standalone MLA DSpark drafter",
+        ),
         (
             _ull_args(
                 scheduler_config=SimpleNamespace(gen_preemption=SimpleNamespace(enabled=True))
