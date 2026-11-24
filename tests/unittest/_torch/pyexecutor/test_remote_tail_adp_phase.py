@@ -383,6 +383,43 @@ def test_queue_reports_lost_execution_reservation_collectively(
     )
 
 
+@pytest.mark.parametrize("idle", [True, False])
+def test_queue_reports_a_lost_row_of_any_reserved_draft_length(idle: bool) -> None:
+    """The vote runs before the draft length is chosen, so every reserved row must be held,
+    whether or not this rank runs the execution row this step."""
+    executor = _make_executor()
+    executor._enable_remote_tail_adp = True
+    executor._remote_tail_reserved_draft_lens = (0, 1, 2)
+    # Rows 0 and 1 are held; row 2 was lost.
+    executor.model_engine.cuda_graph_runner.padding_dummy_requests[1] = object()
+    executor.dist = Mock(tp_size=2)
+    executor.dist.tp_allgather_int64.return_value = torch.tensor([[-1, 0], [1, 0]])
+    batch = ScheduledRequests()
+    batch.attention_dp_phase = RemoteTailPhase.DECODE
+    batch.is_attention_dp_phase_idle = idle
+    if not idle:
+        batch.generation_requests = [object()]
+
+    with pytest.raises(RuntimeError, match="at least one rank"):
+        executor._can_queue(batch)
+    executor.dist.tp_allgather_int64.assert_called_once_with([-1, 0] if idle else [-1, 1])
+
+
+def test_phase_idle_marking_requires_every_reserved_row() -> None:
+    executor = _make_executor()
+    executor._enable_remote_tail_adp = True
+    executor._remote_tail_reserved_draft_lens = (0, 1)
+    batch = ScheduledRequests()
+    batch.attention_dp_phase = RemoteTailPhase.DECODE
+
+    executor._pad_empty_attention_dp_batch(batch)
+    assert not batch.is_attention_dp_phase_idle
+
+    executor.model_engine.cuda_graph_runner.padding_dummy_requests[1] = object()
+    executor._pad_empty_attention_dp_batch(batch)
+    assert batch.is_attention_dp_phase_idle
+
+
 @pytest.mark.parametrize("reservation_survives", [False, True])
 def test_rebalance_reserves_execution_row_before_resuming_real_requests(
     reservation_survives: bool,
@@ -395,7 +432,7 @@ def test_rebalance_reserves_execution_row_before_resuming_real_requests(
     executor.active_requests = [real]
     runner = Mock()
     runner.padding_dummy_requests = {0: dummy}
-    runner.secondary_padding_dummy_requests = {}
+    runner.held_padding_dummies.return_value = [(0, 0, dummy)]
     executor.model_engine.cuda_graph_runner = runner
     manager = Mock()
     executor.kv_cache_manager = manager
@@ -429,8 +466,59 @@ def test_rebalance_reserves_execution_row_before_resuming_real_requests(
         assert not active_ids
     manager.impl.adjust.assert_called_once()
     executor.dist.tp_allgather.assert_called_once_with(reservation_survives)
-    runner.release_padding_dummy.assert_not_called()
+    runner.release_padding_dummies.assert_not_called()
     assert runner.padding_dummy_requests[0] is dummy
+
+
+@pytest.mark.parametrize("failed_row", [(1, 0), (1, 1)])
+def test_rebalance_keeps_every_reserved_row_and_releases_only_failed_siblings(
+    failed_row: tuple[int, int],
+) -> None:
+    """Startup reserves a row per draft length. A reserved row that cannot be resumed is
+    reported on every rank; any other row that cannot be resumed is released on its own,
+    even when it shares a draft length with a reserved row."""
+    executor = _make_executor()
+    executor._enable_remote_tail_adp = True
+    executor._remote_tail_reserved_draft_lens = (0, 1)
+    executor.resource_manager = SimpleNamespace(resource_managers={})
+    executor.active_requests = []
+    rows = {
+        (0, 0): SimpleNamespace(py_request_id=10),
+        (1, 0): SimpleNamespace(py_request_id=11),
+        (1, 1): SimpleNamespace(py_request_id=12),
+    }
+    runner = Mock()
+    runner.padding_dummy_requests = {0: rows[(0, 0)], 1: rows[(1, 0)]}
+    runner.held_padding_dummies.return_value = [
+        (draft_len, variant, dummy) for (draft_len, variant), dummy in rows.items()
+    ]
+    executor.model_engine.cuda_graph_runner = runner
+    manager = Mock()
+    executor.kv_cache_manager = manager
+    active_ids = {10, 11, 12}
+    manager.is_request_active.side_effect = lambda request_id: request_id in active_ids
+    manager.suspend_request.side_effect = lambda request: active_ids.remove(request.py_request_id)
+
+    def resume(request: SimpleNamespace) -> bool:
+        if request is rows[failed_row]:
+            return False
+        active_ids.add(request.py_request_id)
+        return True
+
+    manager.resume_request.side_effect = resume
+    reserved_rows_kept = failed_row != (1, 0)
+    executor.dist = Mock()
+    executor.dist.tp_allgather.return_value = [reserved_rows_kept, True]
+    if reserved_rows_kept:
+        executor._rebalance_kv_pools_now()
+        runner.release_padding_dummies.assert_called_once_with(
+            executor.resource_manager, [failed_row]
+        )
+    else:
+        with pytest.raises(RuntimeError, match="execution row on every rank"):
+            executor._rebalance_kv_pools_now()
+        runner.release_padding_dummies.assert_not_called()
+    executor.dist.tp_allgather.assert_called_once_with(reserved_rows_kept)
 
 
 @pytest.mark.parametrize(
@@ -693,6 +781,8 @@ def test_final_startup_reserves_idle_row_without_admitting_a_request(draft_len: 
     assert executor.model_engine.cuda_graph_runner._get_or_create_padding_dummy.call_args_list == [
         call(executor.resource_manager, length) for length in range(draft_len + 1)
     ]
+    # Every row it reserved is what the queue vote and the reset restore treat as reserved.
+    assert executor._remote_tail_reserved_draft_lens == tuple(range(draft_len + 1))
 
 
 def test_estimation_does_not_reserve_idle_execution_resources() -> None:
@@ -731,6 +821,7 @@ def test_startup_reports_missing_idle_reservation() -> None:
     with pytest.raises(RuntimeError, match="padding request for draft length 0 at startup"):
         executor._initialize_remote_tail_adp()
     assert not executor._enable_remote_tail_adp
+    assert executor._remote_tail_reserved_draft_lens == (0,)
 
 
 def test_rank_state_appends_forward_counts_without_changing_legacy_stats() -> None:

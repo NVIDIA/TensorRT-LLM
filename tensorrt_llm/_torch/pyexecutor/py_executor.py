@@ -319,6 +319,16 @@ def _dspark_exact_secondary_padding_ready(
         for payload in payloads)
 
 
+def _lost_padding_dummy_fallback(variant: int) -> str:
+    """What padded batches do without a lost, unreserved padding dummy."""
+    if variant == 0:
+        return "falling back to lazy re-creation on a later padded step"
+    # Only warmup allocates the DSpark high row (_preallocate_extra_padding_dummy),
+    # and the exact policy picks a split that needs it only if every rank has it.
+    return ("it is allocated only at warmup, so it stays missing and DSpark "
+            "zero-real exact cells that need it run native verification")
+
+
 # How long a drain=True control request waits on KV transfers that have left the
 # scheduler queues but are not yet pulled by the generation engine (see
 # _handle_control_request). Generous relative to a transfer, which is one RDMA of
@@ -774,6 +784,10 @@ class PyExecutor:
     # the real values.
     _packed_sync_enabled = False
     _stage_timing = False
+    # Draft lengths whose variant-0 padding dummies conditional attention-DP
+    # keeps as execution rows; _initialize_remote_tail_adp records the real
+    # set. Draft length 0 is reserved in every configuration.
+    _remote_tail_reserved_draft_lens: Tuple[int, ...] = (0, )
     # Set on a rank that reports completions while requests its first-token
     # check finished, which run no batch, wait for an iteration-stats record.
     _has_close_outs_pending_iter_stats = False
@@ -1317,6 +1331,8 @@ class PyExecutor:
                     f"max_batch_size.")
             self.max_num_active_requests = derived_cap
         self._enable_remote_tail_adp = False
+        self._remote_tail_reserved_draft_lens = (
+            PyExecutor._remote_tail_reserved_draft_lens)
         self._remote_tail_phase = RemoteTailPhase.NONE
         self.active_requests: List[LlmRequest] = []
         self.expected_num_active_requests = 0
@@ -5749,7 +5765,11 @@ class PyExecutor:
             and getattr(self, "_pp_rebalance_drain_iters", None) is None)
 
     def _initialize_remote_tail_adp(self) -> None:
-        """Reserve the execution-only idle row after final KV/graph warmup."""
+        """Reserve the execution-only idle rows after final KV/graph warmup.
+
+        One variant-0 padding dummy per draft length a phase-idle rank can
+        run (0..K), recorded in ``_remote_tail_reserved_draft_lens``.
+        """
         model = getattr(self.model_engine.model, "model", None)
         if (not self.enable_attention_dp
                 or not getattr(model, "disagg_remote_tail_replay", False)
@@ -5771,7 +5791,9 @@ class PyExecutor:
                 "scheduling, PP=CP=1, beam width 1, speculation disabled or "
                 "embedded DSpark, and padded decode CUDA graphs")
         # Draft-length changes must not allocate idle-rank KV during a forward.
-        for draft_len in range(get_static_draft_len(spec_config) + 1):
+        reserved_draft_lens = tuple(
+            range(get_static_draft_len(spec_config) + 1))
+        for draft_len in reserved_draft_lens:
             dummy = runner._get_or_create_padding_dummy(self.resource_manager,
                                                         draft_len)
             if dummy is None:
@@ -5779,7 +5801,31 @@ class PyExecutor:
                     "Conditional disaggregation with attention DP could not "
                     f"reserve its CUDA graph padding request for draft length {draft_len} "
                     "at startup")
+        self._remote_tail_reserved_draft_lens = reserved_draft_lens
         self._enable_remote_tail_adp = True
+
+    def _is_reserved_execution_row(self, draft_len: int, variant: int) -> bool:
+        """Whether a padding dummy is a reserved conditional attention-DP
+        execution row.
+
+        A phase-idle rank runs the variant-0 dummy of its runtime draft length
+        (``attention_dp_execution_batch``) and never creates it on demand, so
+        ``_initialize_remote_tail_adp`` reserves one for every draft length the
+        rank can run.
+        """
+        return (getattr(self, "_enable_remote_tail_adp", False) and variant == 0
+                and draft_len in self._remote_tail_reserved_draft_lens)
+
+    def _holds_reserved_execution_rows(self) -> bool:
+        """Whether this rank holds every reserved execution row.
+
+        A rank that lost one must stop together with its peers at the next
+        vote: its next phase-idle forward would raise on that rank alone while
+        the others wait in the forward's collectives.
+        """
+        rows = self.model_engine.cuda_graph_runner.padding_dummy_requests
+        return all(draft_len in rows
+                   for draft_len in self._remote_tail_reserved_draft_lens)
 
     def _snapshot_remote_tail_phase_work(
         self, active_requests: List[LlmRequest]
@@ -5853,7 +5899,7 @@ class PyExecutor:
             # Still veto an all-empty fleet (e.g. cancellations after the vote).
             effective_size = scheduled_batch.batch_size or int(
                 scheduled_batch.is_attention_dp_phase_idle)
-            if 0 not in self.model_engine.cuda_graph_runner.padding_dummy_requests:
+            if not self._holds_reserved_execution_rows():
                 effective_size = -1
             sizes = self.dist.tp_allgather_int64(
                 [effective_size, scheduled_batch.batch_size])
@@ -6433,8 +6479,8 @@ class PyExecutor:
                 except Exception as exc:
                     error = f"{type(exc).__name__}: {exc}"
             phase_idle = scheduled_batch.is_attention_dp_phase_idle
-            if (getattr(self, "_enable_remote_tail_adp", False) and 0 not in
-                    self.model_engine.cuda_graph_runner.padding_dummy_requests
+            if (getattr(self, "_enable_remote_tail_adp", False)
+                    and not self._holds_reserved_execution_rows()
                     and error is None):
                 error = ("Conditional attention-DP execution lost its reserved "
                          "CUDA graph padding request")
@@ -8126,13 +8172,14 @@ class PyExecutor:
 
         remote_tail_adp = getattr(self, "_enable_remote_tail_adp", False)
         if remote_tail_adp:
-            # Preserve the one execution-only row before real requests reclaim
-            # the resized pools. It is required even when a rank is at capacity.
+            # Preserve the execution-only rows before real requests reclaim the
+            # resized pools. They are required even when a rank is at capacity.
             self._resume_padding_dummies_after_rebalance(mgr, paused_dummies)
-            dummy = self.model_engine.cuda_graph_runner.padding_dummy_requests.get(
-                0)
-            reserved = dummy is not None and mgr.is_request_active(
-                dummy.py_request_id)
+            rows = self.model_engine.cuda_graph_runner.padding_dummy_requests
+            reserved = all(
+                draft_len in rows
+                and mgr.is_request_active(rows[draft_len].py_request_id)
+                for draft_len in self._remote_tail_reserved_draft_lens)
             if not all(self.dist.tp_allgather(reserved)):
                 raise RuntimeError(
                     "KV pool rebalance could not preserve the reserved "
@@ -8240,22 +8287,17 @@ class PyExecutor:
         and silently drop padded batches to eager mode for the rest of the
         process lifetime.
 
-        Returns ``(draft_len, variant, dummy)`` triples. Variant zero is the
-        low-row dummy and variant one is the high-row dummy.
+        Returns ``(draft_len, variant, dummy)`` triples, as
+        ``CUDAGraphRunner.held_padding_dummies`` lists them.
         """
         runner = getattr(self.model_engine, "cuda_graph_runner", None)
         if runner is None:
             return []
         suspended: List[Tuple[int, int, LlmRequest]] = []
-        caches = (
-            getattr(runner, "padding_dummy_requests", {}),
-            getattr(runner, "secondary_padding_dummy_requests", {}),
-        )
-        for variant, cache in enumerate(caches):
-            for draft_len, dummy in cache.items():
-                if mgr.is_request_active(dummy.py_request_id):
-                    mgr.suspend_request(dummy)
-                    suspended.append((draft_len, variant, dummy))
+        for draft_len, variant, dummy in runner.held_padding_dummies():
+            if mgr.is_request_active(dummy.py_request_id):
+                mgr.suspend_request(dummy)
+                suspended.append((draft_len, variant, dummy))
         return suspended
 
     def _resume_padding_dummies_after_rebalance(
@@ -8269,34 +8311,35 @@ class PyExecutor:
         checking that its cache is live.  A dummy left suspended would
         therefore be padded into a batch with a torn-down block table, so
         one that cannot be resumed is released and dropped from the runner
-        instead, falling back to lazy re-creation on a later padded step.
+        instead (a later padded step re-creates a variant-0 row on demand;
+        see ``_lost_padding_dummy_fallback``). A reserved execution row
+        (``_is_reserved_execution_row``) is left suspended instead: the
+        caller checks the reserved rows on every rank.
 
-        The release goes through ``CUDAGraphRunner.release_padding_dummy`` so
-        that every manager the dummy was registered with is covered, not just
-        the main KV cache manager.
+        The release goes through ``CUDAGraphRunner.release_padding_dummies``
+        so that every manager the dummy was registered with is covered, not
+        just the main KV cache manager. It releases only the rows that failed:
+        a sibling at the same draft length that resumed stays held.
         """
         runner = getattr(self.model_engine, "cuda_graph_runner", None)
         if runner is None:
             return
-        failed_draft_lens = set()
+        failed_rows: List[Tuple[int, int]] = []
         for draft_len, variant, dummy in suspended:
             if mgr.resume_request(dummy):
                 continue
-            if getattr(self, "_enable_remote_tail_adp",
-                       False) and draft_len == 0:
+            if self._is_reserved_execution_row(draft_len, variant):
                 # The caller agrees reservation failure across ranks before
                 # raising; a local throw here would strand peers in collectives.
                 continue
             logger.warning(
                 "Could not resume the CUDA graph padding dummy request "
                 f"(draft_len={draft_len}, variant={variant}) after a KV pool "
-                "rebalance; "
-                "releasing it and falling back to lazy re-creation.")
-            failed_draft_lens.add(draft_len)
-        # Resume both siblings before releasing a low/high pair. Releasing
-        # inline could free a resumed sibling and later try to resume it.
-        for draft_len in sorted(failed_draft_lens):
-            runner.release_padding_dummy(self.resource_manager, draft_len)
+                "rebalance; releasing it, "
+                f"{_lost_padding_dummy_fallback(variant)}.")
+            failed_rows.append((draft_len, variant))
+        if failed_rows:
+            runner.release_padding_dummies(self.resource_manager, failed_rows)
 
     @contextmanager
     def control_action(self,
@@ -11621,8 +11664,8 @@ class PyExecutor:
             scheduled_batch.is_attention_dp_phase_idle = (
                 scheduled_batch.attention_dp_phase
                 in (RemoteTailPhase.CONTEXT, RemoteTailPhase.DECODE,
-                    RemoteTailPhase.MIXED) and 0
-                in self.model_engine.cuda_graph_runner.padding_dummy_requests)
+                    RemoteTailPhase.MIXED)
+                and self._holds_reserved_execution_rows())
             return
         # With a single attention-DP rank `_can_queue` vetoes only this rank's
         # own empty batch, so there is no peer to unblock.
@@ -14026,8 +14069,8 @@ class PyExecutor:
         KVCacheManagerV2.clear_reusable_blocks() refuses to run while any KV
         cache is open, and a padding dummy keeps one open between steps, so
         every reset after a weight update failed on an engine that had padded
-        a batch. Releasing goes through CUDAGraphRunner.release_padding_dummy,
-        which frees the dummy in every manager holding it.
+        a batch. Releasing goes through CUDAGraphRunner.release_padding_dummies,
+        which frees each dummy in every manager holding it.
 
         Returns the released ``(draft_len, variant)`` pairs, which
         ``_restore_padding_dummies_after_reuse_reset`` re-creates.
@@ -14038,51 +14081,51 @@ class PyExecutor:
                          "cuda_graph_runner", None)
         if runner is None:
             return []
-        released = sorted(
-            (draft_len, variant)
-            for variant, cache in enumerate(runner._padding_dummy_caches())
-            for draft_len in cache)
-        for draft_len in sorted({draft_len for draft_len, _ in released}):
-            runner.release_padding_dummy(self.resource_manager, draft_len)
-        return released
+        return runner.release_padding_dummies(self.resource_manager)
 
     def _restore_padding_dummies_after_reuse_reset(
             self, released: List[Tuple[int, int]]) -> None:
         """Re-create the padding dummies released for a V2 reuse reset.
 
-        Conditional attention-DP execution reserves the draft-length-0 dummy
-        as its idle execution row, and ``_can_queue`` requires it on every
-        rank, so it must be back before the next scheduling step. The other
-        dummies are re-created here too: right after a reset the KV pool is
-        at its emptiest, while a later padded step may find it full, as at
-        warmup (see ``preallocate_padding_dummies``).
+        Conditional attention-DP execution keeps a reserved execution row per
+        draft length (``_is_reserved_execution_row``), and ``_can_queue``
+        requires all of them on every rank, so they are re-created first and
+        must be back before the next scheduling step. The other dummies are
+        re-created here too: right after a reset the KV pool is at its
+        emptiest, while a later padded step may find it full, as at warmup
+        (see ``preallocate_padding_dummies``).
 
-        A dummy that cannot be re-created stays missing, and the next padded
-        step retries it. The reserved execution row is not retried: the next
-        ``_can_queue`` finds it missing and stops every rank together. Nothing
-        raises here, since the reset itself may already be raising.
+        A dummy that cannot be re-created stays missing; a later padded step
+        re-creates a variant-0 row on demand (``_lost_padding_dummy_fallback``).
+        A reserved execution row is never re-created on demand: the next
+        ``_can_queue`` finds it missing and stops every rank together. Re-creation is best effort
+        (``CUDAGraphRunner.restore_padding_dummies`` logs an allocation error
+        instead of raising), so a failed row neither replaces an error the
+        reset is raising nor skips the remaining rows, and a successful reset
+        returns, letting ``finish_weight_update`` go on to restore the
+        compiled model.
         """
         if not released:
             return
         runner = self.model_engine.cuda_graph_runner
-        remote_tail_adp = getattr(self, "_enable_remote_tail_adp", False)
-        # Low-row dummies first, so the reserved execution row comes first.
-        for draft_len, variant in sorted(released,
-                                         key=lambda pair: (pair[1], pair[0])):
-            if runner._get_or_create_padding_dummy(self.resource_manager,
-                                                   draft_len,
-                                                   variant=variant) is not None:
-                continue
-            if remote_tail_adp and draft_len == 0 and variant == 0:
+        # Reserved execution rows first, then low rows before high rows.
+        rows = sorted(
+            released,
+            key=lambda row:
+            (not self._is_reserved_execution_row(*row), row[1], row[0]))
+        for draft_len, variant in runner.restore_padding_dummies(
+                self.resource_manager, rows):
+            if self._is_reserved_execution_row(draft_len, variant):
                 logger.error(
                     "Could not re-create the reserved conditional "
-                    "attention-DP execution row after a prefix-cache reset; "
-                    "every rank stops at the next scheduling step.")
+                    "attention-DP execution row for draft length "
+                    f"{draft_len} after a prefix-cache reset; every rank "
+                    "stops at the next scheduling step.")
                 continue
             logger.warning(
                 "Could not re-create the CUDA graph padding dummy request "
                 f"(draft_len={draft_len}, variant={variant}) after a "
-                "prefix-cache reset; falling back to lazy re-creation.")
+                f"prefix-cache reset; {_lost_padding_dummy_fallback(variant)}.")
 
     def reset_prefix_cache(self):
         released_dummies = self._release_padding_dummies_for_reuse_reset()

@@ -142,12 +142,19 @@ def _make_executor(
     exe.model_engine = MagicMock()
     exe.resource_manager = MagicMock()
     if has_cuda_graph_runner:
-        exe.model_engine.cuda_graph_runner = MagicMock()
-        exe.model_engine.cuda_graph_runner.padding_dummy_requests = padding_dummies
-        # Mirror the real helper: pop the dummy from the runner's map.
-        exe.model_engine.cuda_graph_runner.release_padding_dummy.side_effect = (
-            lambda _rm, draft_len: padding_dummies.pop(draft_len, None) is not None
-        )
+        runner = MagicMock()
+        runner.padding_dummy_requests = padding_dummies
+        # Mirror the real helpers over the runner's variant-0 map: list the
+        # held dummies, and pop the released ones.
+        runner.held_padding_dummies.side_effect = lambda: [
+            (draft_len, 0, dummy) for draft_len, dummy in sorted(padding_dummies.items())
+        ]
+        runner.release_padding_dummies.side_effect = lambda _rm, rows: [
+            (draft_len, variant)
+            for draft_len, variant in rows
+            if padding_dummies.pop(draft_len, None) is not None
+        ]
+        exe.model_engine.cuda_graph_runner = runner
     else:
         exe.model_engine.cuda_graph_runner = None
 
@@ -170,6 +177,9 @@ def _make_executor(
         lambda mgr, suspended: PyExecutor._resume_padding_dummies_after_rebalance(
             exe, mgr, suspended
         )
+    )
+    exe._is_reserved_execution_row = (
+        lambda draft_len, variant: PyExecutor._is_reserved_execution_row(exe, draft_len, variant)
     )
 
     # Previous batch (overlap loop).
@@ -429,7 +439,8 @@ class TestPaddingDummies:
 
         self._fire(exe, monkeypatch)
 
-        runner.release_padding_dummy.assert_called_once_with(exe.resource_manager, 0)
+        runner.release_padding_dummies.assert_called_once_with(exe.resource_manager, [(0, 0)])
+        assert runner.padding_dummy_requests == {}
         exe.kv_cache_manager.free_resources.assert_not_called()
 
     def test_already_suspended_padding_dummy_is_left_alone(self, monkeypatch):

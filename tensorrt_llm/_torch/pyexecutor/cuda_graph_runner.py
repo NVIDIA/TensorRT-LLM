@@ -4,9 +4,10 @@
 import bisect
 import contextlib
 import os
+import traceback
 from dataclasses import dataclass, field
-from typing import (Any, Callable, Dict, Iterator, List, NamedTuple, Optional,
-                    Sequence, Tuple, TypeAlias)
+from typing import (Any, Callable, ClassVar, Dict, Iterable, Iterator, List,
+                    NamedTuple, Optional, Sequence, Tuple, TypeAlias)
 
 import torch
 
@@ -291,6 +292,11 @@ class CUDAGraphRunner:
     _adp_graph_batch_hint: Optional[List[Tuple[bool, int, int]]] = None
     # Whether _agree_graph_shape can agree on a replay key (config.skip_adp_count_gather).
     _agreement_carries_replay_key = True
+    # The padding-dummy variants this runner holds, low rows first. Each one
+    # has its own cache (_padding_dummy_cache) and request ID range
+    # (cuda_graph_dummy_request_id); variant 0 is the row every padded batch
+    # uses.
+    PADDING_DUMMY_VARIANTS: ClassVar[Tuple[int, ...]] = (0, )
 
     def __init__(self, config: CUDAGraphRunnerConfig):
         self.config = config
@@ -1802,8 +1808,15 @@ class CUDAGraphRunner:
                 f"unsupported CUDA padding dummy variant {variant}")
         return self.padding_dummy_requests
 
-    def _padding_dummy_caches(self) -> Tuple[Dict[int, LlmRequest], ...]:
-        return (self.padding_dummy_requests, )
+    def held_padding_dummies(self) -> List[Tuple[int, int, LlmRequest]]:
+        """The padding dummies this runner holds, as ``(draft_len, variant,
+        request)`` triples ordered by variant and then draft length."""
+        held: List[Tuple[int, int, LlmRequest]] = []
+        for variant in self.PADDING_DUMMY_VARIANTS:
+            cache = self._padding_dummy_cache(variant)
+            held.extend((draft_len, variant, cache[draft_len])
+                        for draft_len in sorted(cache))
+        return held
 
     def reset_padding_dummies(self) -> None:
         """Drop cached request objects when their resource manager changes."""
@@ -1936,34 +1949,91 @@ class CUDAGraphRunner:
                 managers.append(manager)
         return managers
 
-    def release_padding_dummy(self, resource_manager: ResourceManager,
-                              runtime_draft_len: int) -> bool:
-        """Releases the padding dummy for ``runtime_draft_len`` from every
-        manager that allocated part of it, and drops it from the runner so a
-        later padded step re-creates it.
+    def release_padding_dummies(
+        self,
+        resource_manager: ResourceManager,
+        rows: Optional[Iterable[Tuple[int, int]]] = None,
+    ) -> List[Tuple[int, int]]:
+        """Releases padding dummies from every manager that allocated part of
+        them, and drops them from the runner. ``restore_padding_dummies``
+        re-creates them; otherwise a later padded step re-creates a variant-0
+        row on demand, while the other variants (the DSpark high row) are
+        allocated only at warmup and stay missing.
 
-        Each dummy request ID is spread across up to four managers --
-        the main KV cache manager, the one-model draft KV cache manager, the
+        ``rows`` names ``(draft_len, variant)`` pairs; by default every held
+        dummy is released. Each row is released on its own, so a sibling
+        variant at the same draft length stays held, and rows that are not
+        held are skipped.
+
+        Each dummy request ID is spread across up to four managers -- the main
+        KV cache manager, the one-model draft KV cache manager, the
         speculative resource manager slot and the encoder-decoder cross-KV
         cache manager. Releasing only the main one leaves the others holding
         the ID; re-creation deterministically reuses the same variant ID.
 
-        Returns True if a dummy was held for that draft length.
+        Returns the released ``(draft_len, variant)`` pairs, ordered by
+        variant and then draft length.
         """
-        dummy_requests = [
-            cache.pop(runtime_draft_len, None)
-            for cache in self._padding_dummy_caches()
-        ]
-        dummy_requests = [
-            request for request in dummy_requests if request is not None
-        ]
+        if rows is None:
+            targets = [(draft_len, variant)
+                       for draft_len, variant, _ in self.held_padding_dummies()]
+        else:
+            targets = sorted(set(rows), key=lambda row: (row[1], row[0]))
+        released: List[Tuple[int, int]] = []
+        dummy_requests: List[LlmRequest] = []
+        for draft_len, variant in targets:
+            dummy_request = self._padding_dummy_cache(variant).pop(
+                draft_len, None)
+            if dummy_request is not None:
+                released.append((draft_len, variant))
+                dummy_requests.append(dummy_request)
         if not dummy_requests:
-            return False
+            return []
         self._on_padding_dummy_release()
         for dummy_request in dummy_requests:
             for manager in self._padding_dummy_managers(resource_manager):
                 manager.free_resources(dummy_request)
-        return True
+        return released
+
+    def release_padding_dummy(self, resource_manager: ResourceManager,
+                              runtime_draft_len: int) -> bool:
+        """Releases every variant of the padding dummy for
+        ``runtime_draft_len`` (see ``release_padding_dummies``).
+
+        Returns True if a dummy was held for that draft length.
+        """
+        return bool(
+            self.release_padding_dummies(
+                resource_manager, [(runtime_draft_len, variant)
+                                   for variant in self.PADDING_DUMMY_VARIANTS]))
+
+    def restore_padding_dummies(
+            self, resource_manager: ResourceManager,
+            rows: Iterable[Tuple[int, int]]) -> List[Tuple[int, int]]:
+        """Re-creates released padding dummies, in the order ``rows`` gives.
+
+        Best effort: a row that is still held is left as it is, and a row
+        that cannot be re-created -- the allocation is refused or raises -- is
+        returned. It stays missing: a later padded step re-creates a variant-0
+        row on demand, but the other variants are allocated only at warmup.
+        An allocation error is logged rather than raised, because a restore
+        is cleanup: raising would skip the remaining rows and replace any
+        error the caller is already handling.
+        """
+        failed: List[Tuple[int, int]] = []
+        for draft_len, variant in rows:
+            try:
+                dummy_request = self._get_or_create_padding_dummy(
+                    resource_manager, draft_len, variant=variant)
+            except Exception:  # noqa: BLE001 - cleanup must not mask the caller's error
+                logger.error(
+                    "Re-creating the CUDA graph padding dummy request "
+                    f"(draft_len={draft_len}, variant={variant}) raised:\n"
+                    f"{traceback.format_exc()}")
+                dummy_request = None
+            if dummy_request is None:
+                failed.append((draft_len, variant))
+        return failed
 
     def _can_pad_any_batch(self, runtime_draft_len: int) -> bool:
         """Returns True when _get_padded_batch can pad at least one feasible
@@ -2148,6 +2218,9 @@ class DSparkCUDAGraphRunner(CUDAGraphRunner):
     """Ragged verification graph policy for confidence-enabled DSpark."""
 
     _agreement_carries_replay_key = False
+    # Variant 1 is the high-row dummy of zero-real exact cells, held in
+    # secondary_padding_dummy_requests.
+    PADDING_DUMMY_VARIANTS: ClassVar[Tuple[int, ...]] = (0, 1)
 
     def __init__(self, config: CUDAGraphRunnerConfig) -> None:
         super().__init__(config)
@@ -2361,10 +2434,6 @@ class DSparkCUDAGraphRunner(CUDAGraphRunner):
         if variant == 1:
             return self.secondary_padding_dummy_requests
         return super()._padding_dummy_cache(variant)
-
-    def _padding_dummy_caches(self) -> Tuple[Dict[int, LlmRequest], ...]:
-        return super()._padding_dummy_caches() + (
-            self.secondary_padding_dummy_requests, )
 
     def reset_padding_dummies(self) -> None:
         super().reset_padding_dummies()
