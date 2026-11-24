@@ -10,7 +10,6 @@ import struct
 import threading
 import tracemalloc
 import zipfile
-import zlib
 from typing import Callable, Optional
 
 import pytest
@@ -86,6 +85,12 @@ def _pickle(
 def _with_pickle(pickled: bytes) -> str:
     """A torch.save archive of ``zeros(8)`` with its data.pkl record swapped."""
     return _rewrite(_encode(torch.zeros(8)), {"data.pkl": pickled})
+
+
+def _add_comment(raw: bytearray, _: zipfile.ZipFile) -> None:
+    """Give the end-of-central-directory record a one-byte comment."""
+    raw[-2:] = struct.pack("<H", 1)
+    raw += b"x"
 
 
 def _patch(payload: str, edit: Callable[[bytearray, zipfile.ZipFile], None]) -> str:
@@ -374,6 +379,8 @@ _ARCHIVE_REJECTED = {
     ),
     "zip64-record-moved": (_patch(_ZEROS, _zip64_edit(8, lambda v: v - 8, False)), "precede"),
     "shorter-than-zip64-locator": (_SHORT, "zip"),
+    # A comment could hide a second central directory that other readers find.
+    "eocd-comment": (_patch(_ZEROS, _add_comment), "no comment"),
     # Declared record sizes summing past the limit are refused before reading.
     "records-over-limit": (_set_sizes(_ZEROS, "data/0", 2 * _LIMIT, 2 * _LIMIT), "expands to"),
     # A small archive declaring a 512 KiB storage is refused before allocating it.
@@ -421,51 +428,3 @@ def test_metadata_record_rejected(monkeypatch, record: str, value: bytes, match:
     with pytest.raises(ValueError, match=match):
         load_base64_tensor(payload, max_bytes=_LIMIT)
     assert any(name.endswith(record) for name in reads) == (value == b"bigend")
-
-
-def test_hidden_central_directory_rejected() -> None:
-    """A second central directory, reachable only through stored offsets, is refused.
-
-    The EOCD overstates the central directory size and pads with a comment, so
-    zipfile reads the benign directory shifted back while miniz would read one
-    hidden in the last entry's comment, pointing at a deflated 16 MiB storage.
-    """
-
-    def member(name: str, data: bytes, offset: int, method: int = 0, size: int = 0) -> tuple:
-        raw = name.encode()
-        sizes = struct.pack(
-            "<III", zlib.crc32(bytes(size) if method else data), len(data), size or len(data)
-        )
-        local = struct.pack("<IHHHHH", 0x04034B50, 20, 0, method, 0, 0) + sizes
-        central = struct.pack("<IHHHHHH", 0x02014B50, 20, 20, 0, method, 0, 0) + sizes
-        local += struct.pack("<HH", len(raw), 0) + raw + data
-        return local, central + struct.pack("<HHHHHII", len(raw), 0, 0, 0, 0, 0, offset) + raw
-
-    src = zipfile.ZipFile(io.BytesIO(base64.b64decode(_encode(torch.zeros(2, 2)))))
-    numel = 4 << 20
-    deflate = zlib.compressobj(9, zlib.DEFLATED, -15)
-    compressed = deflate.compress(bytes(4 * numel)) + deflate.flush()
-    body, visible, hidden = bytearray(), [], b""
-    for info in src.infolist():
-        visible.append((info.filename, src.read(info), len(body)))
-        body += member(info.filename, src.read(info), 0)[0]
-    for name, data, method, size in [
-        ("archive/data.pkl", _pickle((numel // 2, 2), (2, 1), numel), 0, 0),
-        ("archive/version", b"3\n", 0, 0),
-        ("archive/data/0", compressed, 8, 4 * numel),
-    ]:
-        local, entry = member(name, data, len(body), method, size)
-        hidden += entry
-        body += local
-    shift = sum(len(member(name, data, 0)[1]) for name, data, _ in visible)
-    central = b""
-    for i, (name, data, offset) in enumerate(visible):
-        entry = bytearray(member(name, data, offset + shift)[1])
-        if i == len(visible) - 1:
-            entry[32:34] = struct.pack("<H", len(hidden))
-            entry += hidden
-        central += bytes(entry)
-    eocd = struct.pack("<IHHHHIIH", 0x06054B50, 0, 0, 3, 3, len(central), len(body) + shift, shift)
-    payload = base64.b64encode(bytes(body) + central + eocd + bytes(shift)).decode()
-    with pytest.raises(ValueError, match="no comment"):
-        load_base64_tensor(payload, max_bytes=_LIMIT)

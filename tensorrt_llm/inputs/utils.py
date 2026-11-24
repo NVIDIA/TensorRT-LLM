@@ -446,8 +446,9 @@ def load_base64_tensor(data: str, *, max_bytes: int) -> torch.Tensor:
     bits (save ``tensor.resolve_conj().resolve_neg()``). Callers check shape.
 
     Args:
-        data: Standard base64 text of a ``torch.save`` file; ASCII whitespace
-            such as line breaks is ignored.
+        data: Standard base64 text of a ``torch.save`` file. Spaces, tabs and
+            line breaks are ignored, up to two characters per 76 (MIME line
+            wrapping).
         max_bytes: Upper bound on the decoded payload size.
 
     Returns:
