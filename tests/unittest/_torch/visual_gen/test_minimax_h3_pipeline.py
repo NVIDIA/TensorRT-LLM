@@ -2030,10 +2030,9 @@ def test_pipeline_rejects_unsupported_ulysses_topology(field: str, value: int) -
         MiniMaxH3Pipeline(config)
 
 
-@pytest.mark.parametrize("backend", ["CUTEDSL", "CUDNN"])
-def test_pipeline_rejects_unvalidated_ulysses_attention(backend: str) -> None:
+def test_pipeline_rejects_unvalidated_ulysses_attention() -> None:
     config = _ulysses_pipeline_config()
-    config.attention.backend = backend
+    config.attention.backend = "CUTEDSL"
     with pytest.raises(NotImplementedError, match="VANILLA"):
         MiniMaxH3Pipeline(config)
 

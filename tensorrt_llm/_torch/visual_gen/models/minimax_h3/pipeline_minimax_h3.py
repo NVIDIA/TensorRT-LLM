@@ -1330,6 +1330,8 @@ class MiniMaxH3Pipeline(BasePipeline):
             decode_ranks = {0}
         if self.rank not in decode_ranks:
             return None, None
+        if torch.device(self.device).type != "cuda":
+            return decode_video(latents), decode_audio(audio_latents)
         side = getattr(self, "_audio_decode_stream", None)
         if side is None:
             side = torch.cuda.Stream(device=self.device)
