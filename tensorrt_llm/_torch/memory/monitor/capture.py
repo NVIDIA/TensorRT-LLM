@@ -222,6 +222,7 @@ def capture(
     advise: bool = True,
     startup_steps: bool = False,
     force: bool = False,
+    segments: list[dict] | None = None,
 ) -> MonitorCapture | None:
     """Collect a snapshot, or ``None`` when the monitor is disabled.
 
@@ -247,7 +248,8 @@ def capture(
     # tags: a snapshot costs milliseconds, and two would disagree. The sleep
     # release state is pinned for the same reason: sleep or wakeup on another
     # thread must not change it between the readings below.
-    segments = _segments(device_index)
+    if segments is None:
+        segments = _segments(device_index)
     with released_tags_pinned():
         torch_reading = read_torch(device_index, segments)
         # One tag reading feeds the entries, check B and the stack breakdown;

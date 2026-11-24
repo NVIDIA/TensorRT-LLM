@@ -27,13 +27,13 @@ In full mode startup ends with one breakdown -- tagged ``startup_failed`` if
 startup raised. After that, an out-of-memory error reports, which is the
 moment the breakdown answers a question somebody is actually asking.
 
-A report is built only for an out-of-memory error nobody handled. Some
+A captured report is published only for an out-of-memory error nobody handled. Some
 callers allocate optimistically and fall back when that fails -- KV cache
 sizing, warmup and graph capture, optional workspaces in attention and MoE
-kernels -- so the report is built when the error is seen to escape: the
+kernels -- so the report is published when the error is seen to escape: the
 executor's error handling and the sleep/wakeup path pass the error to
-:func:`notify_error`. That is all the default ``oom`` mode does; it installs
-nothing process-wide.
+:func:`notify_error`. In default and full modes the allocator observer captures the
+failure before exception unwinding.
 
 Full mode also watches the rest of the process: TensorRT-LLM's logger passes
 every ERROR message through :func:`notify_error` -- background threads such as
@@ -110,6 +110,7 @@ from .settings import (
     PERIODIC_INTERVAL_VAR,
     STACKS_ENV_VAR,
     check_rank_filter,
+    current_rank,
     full_mode,
     mode,
     oom_reports_enabled,
@@ -119,6 +120,7 @@ from .settings import (
     stacks_requested,
     warn_once,
 )
+from .stacks import site_of
 
 __all__ = [
     "DIR_VAR",
@@ -156,6 +158,7 @@ class _Armed:
     device: int | None
     #: Whether the process-wide hooks are installed for it (full mode).
     hooks: bool
+    snapshot_on_oom: bool = False
 
 
 #: The armed executor, or ``None`` when reporting is not armed.
@@ -192,6 +195,29 @@ def _format_size(nbytes: int) -> str:
     return f"{nbytes} bytes"
 
 
+def _allocator_snapshot_summary(device: int, segments: list[dict]) -> str:
+    """Keep the failed device's largest live allocation sites before unwinding."""
+    by_site: collections.Counter[str] = collections.Counter()
+    live = largest = count = reserved = 0
+    for segment in segments:
+        reserved += segment["total_size"]
+        for block in segment["blocks"]:
+            if block["state"] != "active_allocated":
+                continue
+            size = block["size"]
+            count += 1
+            live += size
+            largest = max(largest, size)
+            by_site[site_of(block.get("frames") or []) or "no recorded stack"] += size
+    lines = [
+        f"PyTorch allocator snapshot at OOM (device {device}): {_format_size(live)} live "
+        f"(blocks: {count}), {_format_size(reserved)} reserved, largest block {_format_size(largest)}."
+    ]
+    for site, size in by_site.most_common(8):
+        lines.append(f"    {_format_size(size)}  {site}")
+    return "\n".join(lines)
+
+
 @dataclass(frozen=True)
 class _FailedAllocation:
     """What torch's observer saw when a PyTorch allocation failed."""
@@ -205,6 +231,7 @@ class _FailedAllocation:
     live_bytes: int | None
     reserved_bytes: int | None
     at: float
+    snapshot_summary: str = ""
 
     def describe(self) -> str:
         held = ""
@@ -311,6 +338,7 @@ def report_now(
     force: bool = False,
     device_index: int | None = None,
     save: bool = True,
+    incident: str = "",
 ) -> str | None:
     """Render the monitor for this process, or ``None`` if it is disabled.
 
@@ -325,6 +353,12 @@ def report_now(
     ``device_index`` is the device to describe, by default the calling
     thread's current one; the report is built with it selected.
     """
+    if tag == "out_of_memory":
+        text = headline + "\n" + (incident or "No matching fault-time memory snapshot available.")
+        if save:
+            _save(text, tag, rank if rank is not None else current_rank())
+        return text
+
     selected = (
         torch.cuda.device(device_index) if device_index is not None else contextlib.nullcontext()
     )
@@ -442,7 +476,7 @@ def _finish_report_slot(produced: bool) -> None:
             _last_report_at = time.monotonic()
 
 
-def _report_oom(headline: str, *, background: bool = False) -> None:
+def _report_oom(headline: str, *, background: bool = False, incident: str = "") -> None:
     """Emit one OOM report, subject to the shared rate limit. Never raises.
 
     With ``background`` the report is built on a short-lived thread, so the
@@ -450,41 +484,42 @@ def _report_oom(headline: str, *, background: bool = False) -> None:
     slot is still taken here, so a burst of errors starts one report.
     """
     global _background_report
-    if _armed is None or _suspended or getattr(_reporting, "active", False):
+    armed = _armed
+    if armed is None or _suspended or getattr(_reporting, "active", False):
         return
     if not _claim_report_slot():
         return
-    device = _device
+    device = armed.device
+    rank = armed.rank
     if not background:
-        _build_oom_report(headline, device)
+        _build_oom_report(headline, device, rank, incident)
         return
-    if device is None:
-        try:
-            device = torch.cuda.current_device()
-        except (RuntimeError, AssertionError):
-            device = None
     try:
         # Not a daemon: a report already started still reaches the log when
         # the process exits normally.
         thread = threading.Thread(
             target=_build_oom_report,
-            args=(headline, device),
+            args=(headline, device, rank, incident),
             name="memory-monitor-oom-report",
         )
         thread.start()
         _background_report = thread
     except RuntimeError:  # no thread can be started, e.g. at interpreter exit
-        _build_oom_report(headline, device)
+        _build_oom_report(headline, device, rank, incident)
 
 
-def _build_oom_report(headline: str, device: int | None) -> None:
+def _build_oom_report(headline: str, device: int | None, rank: int | None, incident: str) -> None:
     """Build and log the OOM report for a slot already claimed. Never raises."""
     produced = False
     _reporting.active = True
     try:
-        # Forced: in the default mode the full monitor is off, and an armed
-        # reporter is all the permission this report needs.
-        report = report_now(tag="out_of_memory", headline=headline, force=True, device_index=device)
+        report = report_now(
+            tag="out_of_memory",
+            rank=rank,
+            headline=headline,
+            device_index=device,
+            incident=incident,
+        )
         produced = report is not None
         logger.error(f"memory monitor:\n{report}" if produced else f"memory monitor: {headline}")
     except Exception as exc:  # never add a second failure to an OOM
@@ -508,7 +543,12 @@ def _on_out_of_memory(
     """
     global _last_failed_allocation
     armed = _armed
-    if armed is None or not armed.hooks or _suspended:
+    if (
+        armed is None
+        or _suspended
+        or getattr(_reporting, "active", False)
+        or not (armed.hooks or armed.snapshot_on_oom)
+    ):
         return
     live = reserved = None
     try:
@@ -516,6 +556,31 @@ def _on_out_of_memory(
         reserved = torch.cuda.memory_reserved(device)
     except RuntimeError:
         pass
+    summary = ""
+    if armed.snapshot_on_oom and device == armed.device:
+        _reporting.active = True
+        try:
+            with torch.cuda.device(device):
+                segments = [
+                    s for s in torch.cuda.memory._snapshot()["segments"] if s["device"] == device
+                ]
+                summary = _allocator_snapshot_summary(device, segments)
+                scene = capture(
+                    tag="out_of_memory",
+                    rank=armed.rank,
+                    device_index=device,
+                    headline=summary,
+                    force=True,
+                    segments=segments,
+                )
+                if scene is not None:
+                    summary = render_capture(scene)
+        except Exception as exc:  # Diagnostics must preserve the original allocator error.
+            summary += f"\nFault-time memory capture incomplete ({type(exc).__name__})."
+        finally:
+            _reporting.active = False
+    if _armed is not armed:
+        return
     _last_failed_allocation = _FailedAllocation(
         device=device,
         requested_bytes=requested_bytes,
@@ -524,6 +589,7 @@ def _on_out_of_memory(
         live_bytes=live,
         reserved_bytes=reserved,
         at=time.monotonic(),
+        snapshot_summary=summary,
     )
 
 
@@ -618,7 +684,9 @@ def notify_error(
             headline = f"OUT OF MEMORY: {failed.describe()}. Error: {first_line}"
         else:
             headline = f"OUT OF MEMORY: {first_line}"
-        _report_oom(headline, background=background)
+        _report_oom(
+            headline, background=background, incident=failed.snapshot_summary if failed else ""
+        )
     except Exception as exc:  # an error path must not gain a second error
         # A monitor bug would otherwise turn OOM reports off without a trace.
         logger.debug(
@@ -763,7 +831,7 @@ def install_oom_reporter(
 
     In full mode this also installs the process-wide hooks: a filter on
     TensorRT-LLM's logger, ``threading.excepthook`` and torch's OOM
-    observer. The default mode installs none of them.
+    observer. The default mode attaches only the observer when snapshots are enabled.
 
     Returns whether reporting is armed. The callback is attached to torch
     at most once per process, because torch keeps every observer it is
@@ -788,7 +856,13 @@ def install_oom_reporter(
                 "executor; not arming it again"
             )
             return False
-        armed = _Armed(owner=owner, rank=rank, device=device, hooks=hooks)
+        armed = _Armed(
+            owner=owner,
+            rank=rank,
+            device=device,
+            hooks=hooks,
+            snapshot_on_oom=os.getenv("TLLM_MEM_MONITOR_OOM_SNAPSHOT", "1") == "1",
+        )
         _armed = armed
         _device = device
         try:
@@ -800,7 +874,7 @@ def install_oom_reporter(
             _disarm()
             logger.warning(f"memory monitor: could not arm out-of-memory reporting ({exc})")
             return False
-        if hooks:
+        if hooks or armed.snapshot_on_oom:
             _attach_observer()
     return True
 

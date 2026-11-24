@@ -67,13 +67,12 @@ class TestDefaultReportsOnlyOutOfMemory:
         monkeypatch.setenv(triggers.PERIODIC_INTERVAL_VAR, "1")
         seen = []
         monkeypatch.setenv("TLLM_MEM_MONITOR_OOM_INTERVAL", "0")
-        monkeypatch.setattr(
-            triggers, "report_now", lambda tag, **kw: seen.append((tag, kw.get("force"))) or "r"
-        )
+        monkeypatch.setattr(triggers, "_save", lambda text, tag, rank: seen.append((tag, text)))
         assert triggers.install_oom_reporter(rank=0) is True
         triggers.notify_error("CUDA out of memory. Tried to allocate 2.00 GiB. GPU 0")
-        # The full monitor is off, so the report has to be forced.
-        assert seen == [("out_of_memory", True)]
+        assert len(seen) == 1 and seen[0][0] == "out_of_memory"
+        assert "No matching fault-time memory snapshot" in seen[0][1]
+        assert "details by allocator" not in seen[0][1]
 
         # No periodic thread even though an interval is set ...
         assert not any(t.name == "memory-monitor-periodic" for t in threading.enumerate())

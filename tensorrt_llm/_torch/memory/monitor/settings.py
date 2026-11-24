@@ -408,8 +408,8 @@ def mode() -> Mode:
       produced on their own.
     * ``oom`` (the default, also when unset) -- a report when the executor's
       own error handling sees an out-of-memory error: a failed request, a
-      crashed executor loop or a failed wakeup. Nothing is recorded during
-      startup or serving and no process-wide hook is installed; the report
+      crashed executor loop or a failed wakeup. The PyTorch observer records allocator failures
+      after startup when snapshots are enabled; the report
       has every row but no startup-step breakdown and no comparison with
       warmup, which need recording during startup.
     * ``1`` (also ``full``, ``on``, ``true``, ``yes``) -- full: also records
