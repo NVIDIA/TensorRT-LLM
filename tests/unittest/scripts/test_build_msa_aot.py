@@ -4,12 +4,14 @@
 """CPU checks for selecting and validating wheel-time MSA artifacts."""
 
 import ast
+import ctypes
 import importlib.util
 import json
 import os
 import shutil
 import subprocess
 import sys
+import types
 import zipfile
 from pathlib import Path
 
@@ -255,6 +257,7 @@ def _aot_variant_names(): return ["0"]
 def _aot_source_digest(): return "sourcehash"
 def _aot_ffi_version(): return "ffi-version"
 def _get_tvm_ffi_include(): return {str(ffi_include)!r}
+def _cutlass_dir(): return _CUTLASS_INCLUDE.parent
 def _get_cuda_home(): return os.environ["CUDA_HOME"]
 class FMHAVariantManager: pass
 def _get_nvcc_flags(cache, fmha=True):
@@ -297,6 +300,97 @@ else:
     builder.build(package, Path(os.environ["MSA_WARMUP_SCRIPT"]), "103", nvcc, jobs=2)
 
     assert (package / "_aot/sourcehash/manifest.json").is_file()
+
+
+@pytest.mark.skipif(not os.environ.get("MSA_WARMUP_SCRIPT"), reason="patched MSA source not staged")
+def test_real_patched_worker_builds_and_loads_complete_stock_artifacts(tmp_path, monkeypatch):
+    """Exercise real dispatch, templates, flags, Ninja, manifest and loaders with native ELF fixtures."""
+    warmup = Path(os.environ["MSA_WARMUP_SCRIPT"])
+    source = warmup.parents[1] / "python/fmha_sm100"
+    root = tmp_path / "build path $with: spaces"
+    package = root / "fmha_sm100"
+    package.mkdir(parents=True)
+    shutil.copy2(source / "jit.py", package / "jit.py")
+    shutil.copytree(source / "csrc", package / "csrc")
+    headers = package / "cutlass/include/cutlass"
+    headers.mkdir(parents=True)
+    (headers / "version.h").write_text(
+        "#define CUTLASS_MAJOR 4\n#define CUTLASS_MINOR 4\n#define CUTLASS_PATCH 2\n"
+    )
+    (package / "cutlass/tools/util/include").mkdir(parents=True)
+    dependencies = tmp_path / "dependencies"
+    ffi = dependencies / "tvm_ffi"
+    (ffi / "include").mkdir(parents=True)
+    (ffi / "__init__.py").write_text("")
+    (dependencies / "torch.py").write_text("raise AssertionError('build imported torch')\n")
+    distribution = dependencies / "apache_tvm_ffi-0.0.0.dist-info"
+    distribution.mkdir()
+    (distribution / "METADATA").write_text("Name: apache-tvm-ffi\nVersion: 0.0.0\n")
+    monkeypatch.setenv("PYTHONPATH", str(dependencies))
+    monkeypatch.syspath_prepend(str(dependencies))
+    monkeypatch.setenv("CUTLASS_ROOT", str(root / "wrong inherited CUTLASS"))
+    monkeypatch.setenv("MINFER_FMHA_CUDA_ARCH", "107a")
+    monkeypatch.setenv("TLLM_FMHA_PROXY_CORRECTION_CHAIN", "0")
+    monkeypatch.setenv("TLLM_FMHA_PROXY_S_DOUBLE_BUFFER", "1")
+    nvcc = root / "cuda toolkit/bin/nvcc"
+    nvcc.parent.mkdir(parents=True)
+    nvcc.write_text("""#!/usr/bin/env python3
+import os,re,subprocess,sys
+from pathlib import Path
+args = sys.argv[1:]
+if '--version' in args:
+    print('CPU nvcc fixture, no CUDA compilation')
+    raise SystemExit
+if any(arg.endswith('/probe.cu') for arg in args):
+    raise SystemExit
+out = args[args.index('-o') + 1]
+if '-c' in args:
+    assert '-DFMHA_ONLYSCORE_PER_TILE_CORRECTION' in args, args
+    assert '-DFMHA_ONLYSCORE_SINGLE_S' in args, args
+    assert '-gencode=arch=compute_103a,code=sm_103a' in args, args
+    assert not any('compute_107' in arg for arg in args), args
+    source = Path(args[args.index('-c') + 1]).name
+    match = re.fullmatch(r'run_([0-9_]+)\\.cu', source)
+    symbols = {'fmha_sm100_plan.cu': 'plan', 'sparse_topk_select.cu': 'sparse_topk_select',
+               'fmha_sm100_reduction.cu': 'reduction'}
+    symbol = 'run_' + match[1] if match else symbols.get(source)
+    code = 'int __tvm_ffi_' + symbol + '(void) {return 7;}' if symbol else ''
+    subprocess.run(['cc','-fPIC','-x','c','-c','-o',out,'-'], input=code, text=True, check=True)
+else:
+    objects = args[1:args.index('-o')]
+    subprocess.run(['cc','-shared',*objects,'-o',out], check=True)
+""")
+    nvcc.chmod(0o755)
+    builder.build(package, warmup, "103", nvcc, jobs=8)
+    manifests = list((package / "_aot").glob("*/manifest.json"))
+    assert len(manifests) == 1
+    manifest = json.loads(manifests[0].read_text())
+    assert len(manifest["variants"]) == 350
+    assert manifest["proxy_modes"] == [True, True]
+    assert manifest["cuda_architectures"] == ["sm_103a"]
+    assert manifest["tvm_ffi_version"] == "0.0.0"
+    monkeypatch.delenv("CUTLASS_ROOT")
+    monkeypatch.setenv("MINFER_FMHA_CACHE_DIR", str(root / "unused runtime cache"))
+    jit = builder._load_module("_real_msa_stock_runtime", package / "jit.py")
+    monkeypatch.setattr(jit, "_device_is_sm107", lambda: False)
+    monkeypatch.setattr(jit, "_aot_gpu_arch", lambda: "sm_103a")
+    monkeypatch.setattr(jit, "_prebuilt_dir", lambda: None)
+
+    class NativeModule:
+        def __init__(self, path):
+            self.library = ctypes.CDLL(path)
+
+        def __getattr__(self, name):
+            return getattr(self.library, "__tvm_ffi_" + name)
+
+    monkeypatch.setitem(sys.modules, "tvm_ffi", types.SimpleNamespace(load_module=NativeModule))
+    manager = jit.FMHAVariantManager()
+    variant = manager.get_variant(jit._FLOAT8_E4M3FN_CODE, 128, False, -1, 128, False, 1)
+    assert variant.run() == 7
+    assert jit.get_plan_fn().plan() == 7
+    assert jit.get_sparse_topk_module().sparse_topk_select() == 7
+    assert jit.get_reduction_module().reduction() == 7
+    assert not (root / "unused runtime cache").exists()
 
 
 def test_wheel_contains_staged_fmha_artifacts(tmp_path):

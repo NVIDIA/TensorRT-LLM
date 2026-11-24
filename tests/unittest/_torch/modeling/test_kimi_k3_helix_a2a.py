@@ -90,14 +90,18 @@ def _make_layer(layer_idx, attn_weight, moe_weight, rank, token_sliced):
     layer.mlp_res_proj = nn.Linear(HIDDEN, 1, bias=False)
     # Head-TP attention: rank 0 holds the whole row-parallel partial sum.
     owns_output = not token_sliced or rank == 0
-    layer.linear_attn = lambda x, _md: x @ attn_weight if owns_output else torch.zeros_like(x)
+    layer.linear_attn = lambda x, _md, prequantized_input=None: (
+        x @ attn_weight if owns_output else torch.zeros_like(x)
+    )
     layer.seen_all_rank_num_tokens = []
 
-    def moe(x, all_rank_num_tokens):
-        layer.seen_all_rank_num_tokens.append(all_rank_num_tokens)
-        return torch.tanh(x @ moe_weight)
+    class _MoE(nn.Module):
+        def forward(self, x, all_rank_num_tokens, return_parts=False):
+            assert return_parts
+            layer.seen_all_rank_num_tokens.append(all_rank_num_tokens)
+            return torch.tanh(x @ moe_weight), torch.zeros_like(x)
 
-    layer.block_sparse_moe = moe
+    layer.block_sparse_moe = _MoE()
     return layer
 
 
@@ -177,3 +181,54 @@ def test_token_sliced_layer_matches_full_rows(num_tokens, world_size, layer_idx,
         if capture:
             # The DSpark tap sees every row on every rank, as in the full-row layer.
             torch.testing.assert_close(rank_capture.captured[7], ref_capture.captured[7])
+
+
+def test_model_marks_the_bank_written_by_the_row_scatter():
+    """The bank scatter ahead of the first token-sliced layer is the last kernel before that
+    layer's pre-attention mix, so only that layer is told its bank is fresh (its mix then reads
+    the snapshots after the PDL wait)."""
+    world_size, num_tokens, first_sliced, num_layers = 2, 6, 2, 5
+    seen = []
+
+    class _Layer(nn.Module):
+        def __init__(self, layer_idx):
+            super().__init__()
+            self.layer_idx = layer_idx
+            self.token_sliced = layer_idx >= first_sliced
+
+        def forward(self, hidden_states, block_residual, num_snapshots, attn_metadata, **kwargs):
+            seen.append((self.layer_idx, kwargs["fresh_block_residual"], block_residual.shape[1]))
+            return hidden_states, num_snapshots
+
+    model = kimi.KimiLinearModel.__new__(kimi.KimiLinearModel)
+    nn.Module.__init__(model)
+    model.layers = nn.ModuleList([_Layer(i) for i in range(num_layers)])
+    model.helix_a2a_first_layer = first_sliced
+    model.helix_a2a = _SimulatedHelixA2A(_World(1), 0)
+    model.helix_a2a.world_size = world_size
+    model.helix_a2a.all_gather = lambda x, n: x.repeat(world_size, 1)[:n]
+    model.num_attn_res_snapshots = 3
+    model.norm = KimiK3RMSNorm(HIDDEN)
+    model.output_attn_res_norm = KimiK3RMSNorm(HIDDEN)
+    model.output_attn_res_proj = nn.Linear(HIDDEN, 1, bias=False)
+    metadata = SimpleNamespace(num_tokens=num_tokens)
+    model.forward(metadata, inputs_embeds=torch.randn(num_tokens, HIDDEN))
+    chunk = num_tokens // world_size
+    assert seen == [
+        (i, i == first_sliced, num_tokens if i < first_sliced else chunk) for i in range(num_layers)
+    ]
+
+
+def test_decoder_layer_calls_the_moe_module():
+    """The MoE block runs through ``nn.Module.__call__``, so module hooks (layer-wise NVTX
+    ranges, debug hooks) see it."""
+    torch.manual_seed(1)
+    layer = _make_layer(3, torch.randn(HIDDEN, HIDDEN), torch.randn(HIDDEN, HIDDEN), 0, False)
+    calls = []
+    layer.block_sparse_moe.register_forward_hook(lambda module, args, out: calls.append(out))
+    num_tokens = 5
+    bank = torch.randn(4, num_tokens, HIDDEN)
+    md = SimpleNamespace(num_tokens=num_tokens, all_rank_num_tokens=None)
+    with patch.object(kimi, "_FUSED_ATTN_RES_ENABLED", False):
+        layer(torch.randn(num_tokens, HIDDEN), bank, 2, md)
+    assert len(calls) == 1 and len(calls[0]) == 2

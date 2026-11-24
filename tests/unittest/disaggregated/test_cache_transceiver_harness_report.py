@@ -44,6 +44,8 @@ from report import (
 )
 from submit import validate
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.fixture
 def sample_cfg():

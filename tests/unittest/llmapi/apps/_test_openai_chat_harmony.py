@@ -231,7 +231,7 @@ async def test_streaming_tool_call(client: openai.AsyncOpenAI, model: str):
         stream=True,
         extra_body={"top_k": 1},
     )
-    tool_name: str
+    tool_name: str | None = None
     reasoning_chunks: list[str] = []
     tool_arg_chunks: list[str] = []
     async for chunk in response:

@@ -127,6 +127,10 @@ def _worker(package, warmup, architectures, jobs):
     sys.modules["fmha_sm100"] = package_module
     jit = _load_module("fmha_sm100.jit", package / "jit.py")
     package_module.jit = jit
+    # Package stock-mode images without querying or initializing a build GPU.
+    # Runtime mode and target resolution remain untouched in the shipped source.
+    jit._device_is_sm107 = lambda: False
+    jit._resolve_jit_target = lambda: None
 
     flags = jit._get_nvcc_flags
 
@@ -136,8 +140,8 @@ def _worker(package, warmup, architectures, jobs):
         if "-I" in original:
             include_dirs = (
                 jit._FMHA_VARLEN_DIR / "include",
-                jit._CUTLASS_INCLUDE,
-                jit._CUTLASS_UTIL_INCLUDE,
+                jit._cutlass_dir() / "include",
+                jit._cutlass_dir() / "tools" / "util" / "include",
                 jit._get_tvm_ffi_include(),
                 args[0],
             )
@@ -171,6 +175,7 @@ def _worker(package, warmup, architectures, jobs):
         shutil.copy2(path, destination / path.name)
     manifest = {
         "format_version": 1,
+        "proxy_modes": [True, True],
         "source_sha256": digest,
         "tvm_ffi_version": jit._aot_ffi_version(),
         "host_arch": platform.machine(),
@@ -199,13 +204,21 @@ def build(package, warmup, requested, nvcc, jobs):
         temporary = cache / "tmp"
         temporary.mkdir(parents=True)
         env = os.environ.copy()
-        for name in ("GPU_TRACE", "SM_TIMING", "FMHA_GMEM_CHECK"):
+        for name in (
+            "GPU_TRACE",
+            "SM_TIMING",
+            "FMHA_GMEM_CHECK",
+            "CUTLASS_ROOT",
+            "MINFER_FMHA_CUDA_ARCH",
+        ):
             env.pop(name, None)
         env.update(
             MINFER_FMHA_CACHE_DIR=str(cache),
             TMPDIR=str(temporary),
             CUDA_HOME=str(nvcc.parent.parent),
             TRTLLM_MSA_BUILD_CUDA_VERSION=version,
+            TLLM_FMHA_PROXY_CORRECTION_CHAIN="1",
+            TLLM_FMHA_PROXY_S_DOUBLE_BUFFER="0",
         )
         stub_dir = nvcc.parent.parent / "lib64/stubs"
         if stub_dir.is_dir():

@@ -13,7 +13,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from tensorrt_llm._torch.visual_gen.batching import BatchInfo
 from tensorrt_llm._torch.visual_gen.models.qwen_image import QwenImagePipeline
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _pipeline_with_captured_forward():
@@ -93,3 +96,11 @@ def test_infer_rejects_mismatched_negative_prompt_count():
     req = _req(["a", "b", "c"], negative_prompt=["n0", "n1"])
     with pytest.raises(ValueError, match="negative_prompt"):
         pipe.infer(req)
+
+
+def test_infer_preserves_request_batch_metadata():
+    pipe, captured = _pipeline_with_captured_forward()
+    req = _req(["a", "b"])
+    req.batch_info = BatchInfo((1, 2), (1, 1), (42, 17))
+    pipe.infer(req)
+    assert captured["_batch_info"] is req.batch_info

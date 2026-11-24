@@ -25,10 +25,14 @@ Note: encode() is single-GPU only (no TP/PP). Every listed model is
 architecturally required to fit on one GPU for these tests.
 """
 
+import json
+from pathlib import Path
+
 import pytest
 import torch
 
-from tensorrt_llm import LLM
+from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import EncoderCUDAGraphRunner
 from tensorrt_llm.llmapi import EncodeCudaGraphConfig, EncodeExtraInputSpec
 
 from ..conftest import llm_models_root
@@ -94,6 +98,25 @@ TEXT_EMBEDDING_MODELS = [
     ),
 ]
 
+RERANKER_MODELS = [
+    pytest.param(
+        "Qwen/Qwen3-Reranker-0.6B",
+        f"{llm_models_root()}/Qwen3/Qwen3-Reranker-0.6B",
+        id="qwen3-reranker-0.6b",
+    ),
+    pytest.param(
+        "Qwen/Qwen3-Reranker-8B",
+        f"{llm_models_root()}/Qwen3/Qwen3-Reranker-8B",
+        marks=pytest.mark.skip_less_device_memory(32000),
+        id="qwen3-reranker-8b",
+    ),
+]
+
+RERANK_PAIRS = [
+    ("What is the capital of China?", "The capital of China is Beijing."),
+    ("What is gravity?", "Bananas grow in tropical climates."),
+]
+
 # Encoder CUDA graph configs for parametrization. PROMPTS tokenize to short
 # (~6-12 token) sequences, so we only need buckets that cover that range plus
 # one small/larger pair to exercise dispatch + padding. Larger grids inflate
@@ -110,6 +133,20 @@ ENCODER_CUDA_GRAPH_CONFIGS = [
         id="cuda_graph",
     ),
 ]
+
+
+@pytest.fixture
+def graph_replays(monkeypatch):
+    """Keys of the encoder CUDA graph replays this process makes during the test."""
+    replays = []
+    replay = EncoderCUDAGraphRunner.replay
+
+    def counted_replay(runner, key, inputs):
+        replays.append(key)
+        return replay(runner, key, inputs)
+
+    monkeypatch.setattr(EncoderCUDAGraphRunner, "replay", counted_replay)
+    return replays
 
 
 class TestEncoderEncode(LlmapiAccuracyTestHarness):
@@ -281,6 +318,38 @@ class TestEncoderEncode(LlmapiAccuracyTestHarness):
 
         torch.testing.assert_close(graph, eager, rtol=1e-3, atol=1e-3)
 
+    @pytest.mark.parametrize("model_name,model_path", CLASSIFICATION_MODELS)
+    def test_encoder_scheduled_cuda_graph_matches_eager(
+        self, model_name, model_path, monkeypatch, graph_replays
+    ):
+        """LLM.generate() on an encoder-only model applies EncodeCudaGraphConfig.
+
+        The scheduler may split the prompts into different batches in the two
+        runs, and mixed-length outputs depend on batch composition, so the bound
+        is looser than the encode() comparison.
+        """
+        # Keep the executor in-process so graph_replays sees the scheduled replays.
+        monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
+        _, llm_dtype = _resolve_checkpoint_dtype(model_path)
+        params = SamplingParams(max_tokens=1, return_context_logits=True)
+
+        with LLM(model_path, dtype=llm_dtype) as llm_eager:
+            eager_outs = llm_eager.generate(PROMPTS, sampling_params=params)
+        cgc = EncodeCudaGraphConfig(
+            batch_sizes=[1, 4],
+            num_tokens=[32, 64],
+            seq_lens=[16, 32],
+            enable_padding=True,
+        )
+        with LLM(model_path, dtype=llm_dtype, cuda_graph_config=cgc) as llm_graph:
+            replays_before = len(graph_replays)
+            graph_outs = llm_graph.generate(PROMPTS, sampling_params=params)
+            assert len(graph_replays) > replays_before, f"[{model_name}] generate() did not replay"
+
+        eager = torch.stack([o.context_logits.cpu().float() for o in eager_outs])
+        graph = torch.stack([o.context_logits.cpu().float() for o in graph_outs])
+        torch.testing.assert_close(graph, eager, rtol=1e-2, atol=1e-2)
+
     @pytest.mark.parametrize("model_name,model_path", TEXT_EMBEDDING_MODELS)
     def test_qwen3_text_embedding_matches_huggingface(self, model_name, model_path):
         """Decoder text-embedding: L2-normalized last-token hidden state vs HF."""
@@ -297,7 +366,7 @@ class TestEncoderEncode(LlmapiAccuracyTestHarness):
             dtype=llm_dtype,
             model_kwargs={"architectures": ["Qwen3ForTextEmbedding"]},
         ) as llm:
-            runtime_config = llm._encoder_executor.model_engine.model.model_config.pretrained_config
+            runtime_config = llm._encoder_executor.pretrained_config
             assert runtime_config.architectures[0] == "Qwen3ForTextEmbedding"
             outs = llm.encode(PROMPTS)
 
@@ -319,6 +388,99 @@ class TestEncoderEncode(LlmapiAccuracyTestHarness):
             torch.testing.assert_close(tllm_emb, hf_emb, rtol=1.5e-2, atol=1.5e-2)
             # Embeddings must be unit-norm.
             assert abs(tllm_emb.norm().item() - 1.0) < 1e-2
+
+    @pytest.mark.parametrize("model_name,model_path", RERANKER_MODELS)
+    def test_qwen3_reranker_matches_huggingface(self, model_name, model_path):
+        """Derived scalar head matches HF's last-token yes-minus-no logit."""
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        from tensorrt_llm.serve.reranker import format_qwen3_rerank_prompt
+
+        torch_dtype, llm_dtype = _resolve_checkpoint_dtype(model_path)
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        score_config_path = Path(model_path) / "1_LogitScore" / "config.json"
+        if score_config_path.is_file():
+            with score_config_path.open(encoding="utf-8") as config_file:
+                logit_score_config = json.load(config_file)
+            yes_token_id = logit_score_config["true_token_id"]
+            no_token_id = logit_score_config["false_token_id"]
+        else:
+            yes_token_id = tokenizer.convert_tokens_to_ids("yes")
+            no_token_id = tokenizer.convert_tokens_to_ids("no")
+        prompts = [format_qwen3_rerank_prompt(query, document) for query, document in RERANK_PAIRS]
+
+        with LLM(
+            model_path,
+            encode_only=True,
+            dtype=llm_dtype,
+            model_kwargs={"architectures": ["Qwen3ForTextReranking"]},
+        ) as llm:
+            outputs = llm.encode(prompts)
+
+        hf_model = (
+            AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch_dtype).cuda().eval()
+        )
+
+        for index, prompt in enumerate(prompts):
+            with torch.inference_mode():
+                inputs = tokenizer(prompt, return_tensors="pt").to(hf_model.device)
+                hf_last = hf_model(**inputs, logits_to_keep=1).logits[0, -1].float().cpu()
+            hf_score = hf_last[yes_token_id] - hf_last[no_token_id]
+            assert outputs[index].logits.numel() == 1
+            trtllm_score = outputs[index].logits.flatten()[0].float().cpu()
+
+            torch.testing.assert_close(
+                trtllm_score,
+                hf_score,
+                rtol=1.5e-2,
+                atol=2.5e-1,
+                msg=lambda message: (
+                    f"[{model_name}] pair#{index} scalar logit mismatch\n{message}"
+                ),
+            )
+
+    @pytest.mark.parametrize("model_name,model_path", TEXT_EMBEDDING_MODELS)
+    def test_qwen3_text_embedding_cuda_graph_matches_eager(
+        self, model_name, model_path, graph_replays
+    ):
+        """Graph replay must pool each prompt's own last token.
+
+        The prompts have different lengths and are packed into one batch; the
+        reversed three-prompt call replays a padded bucket with other lengths.
+        """
+        _, llm_dtype = _resolve_checkpoint_dtype(model_path)
+        batches = [PROMPTS, PROMPTS[:0:-1]]
+        model_kwargs = {"architectures": ["Qwen3ForTextEmbedding"]}
+
+        with LLM(
+            model_path, encode_only=True, dtype=llm_dtype, model_kwargs=model_kwargs
+        ) as llm_eager:
+            eager = [
+                torch.stack([o.logits.cpu() for o in llm_eager.encode(batch)]) for batch in batches
+            ]
+        cgc = EncodeCudaGraphConfig(
+            batch_sizes=[1, 4],
+            num_tokens=[32, 64],
+            seq_lens=[16, 32],
+            enable_padding=True,
+        )
+        with LLM(
+            model_path,
+            encode_only=True,
+            dtype=llm_dtype,
+            model_kwargs=model_kwargs,
+            cuda_graph_config=cgc,
+        ) as llm_graph:
+            graph = []
+            for batch in batches:
+                replays_before = len(graph_replays)
+                graph.append(torch.stack([o.logits.cpu() for o in llm_graph.encode(batch)]))
+                assert len(graph_replays) > replays_before, (
+                    f"[{model_name}] encode() did not replay"
+                )
+
+        for graph_out, eager_out in zip(graph, eager):
+            torch.testing.assert_close(graph_out, eager_out, rtol=1e-3, atol=1e-3)
 
 
 # --------------------------------------------------------------------------- #

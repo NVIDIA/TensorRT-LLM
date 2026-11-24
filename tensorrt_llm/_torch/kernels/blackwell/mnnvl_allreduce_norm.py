@@ -26,9 +26,9 @@ kernels in one graph; only the byte counts in the flags cross launches, its data
 
 Extensions: ``se_fold`` computes ``routed + sigmoid(gate) * shared`` in-kernel with
 ``fused_sigmoid_gate_mul_add``'s arithmetic; ``moe_topk`` finalizes ``routed`` from the un-finalized
-trtllm-gen MoE output with the finalize kernel's arithmetic; ``tpc`` > 1 gives each CTA ``tpc`` consecutive
-tokens, so a call larger than one wave of CTAs still runs as one wave, with every token's output bits those of
-the one-token kernel.
+trtllm-gen MoE output with the finalize kernel's arithmetic; ``tpc`` > 1 batches consecutive tokens per CTA
+with the one-token kernel's arithmetic. The grid targets two CTAs per SM; shared memory and registers
+can limit actual residency below that target.
 
 PDL: only the workspace table and the norm weight are read before ``griddepcontrol.wait``; never the
 input, the residual (the previous all-reduce's output) or the flags.
@@ -47,6 +47,7 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from .utils import griddepcontrol_launch_dependents, griddepcontrol_wait
 
 VEC = 8  # BF16 per thread (one 16-byte vector)
+_LAMPORT_FLAG_COUNT = 8
 _NEG_ZERO = -2147483648  # 0x80000000: Lamport "not written" word (+0.0, -0.0 as BF16 pair)
 
 
@@ -554,6 +555,50 @@ def _cluster_sync(*, loc=None, ip=None) -> None:
     )
 
 
+# ---- L2 prefetch of the next GEMM's weight (``l2pf``) ----
+L2PF_CHUNK = 65536
+L2PF_MAX_CHUNKS = 8  # per CTA: 512 KB
+
+
+@dsl_user_op
+def _min_s64(a: Int64, b: Int64, *, loc=None, ip=None) -> Int64:
+    return Int64(
+        _asm(
+            T.i64(),
+            [_v(Int64(a), loc, ip), _v(Int64(b), loc, ip)],
+            "min.s64 $0, $1, $2;",
+            "=l,l,l",
+            False,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _prefetch_l2_bulk_if(addr: Int64, nbytes: Int64, *, loc=None, ip=None) -> None:
+    """``cp.async.bulk.prefetch.L2.global [addr], nbytes`` when nbytes > 0 (nothing to wait for)."""
+    _asm(
+        None,
+        [_v(Int64(addr), loc, ip), _v(Int64(nbytes), loc, ip)],
+        "{ .reg .pred p; .reg .b32 n; setp.gt.s64 p, $1, 0; cvt.u32.u64 n, $1; "
+        "@p cp.async.bulk.prefetch.L2.global [$0], n; }",
+        "l,l,~{memory}",
+        loc=loc,
+        ip=ip,
+    )
+
+
+def l2_prefetch_slice(pf_ptr: Int64, pf_bytes: Int64, pf_per: Int64, bid) -> None:
+    """CTA ``bid`` starts pulling bytes [bid * pf_per, min((bid + 1) * pf_per, pf_bytes)) of ``pf_ptr`` into L2
+    (``pf_per``: 16-byte multiple from the host). Straight-line: up to L2PF_MAX_CHUNKS predicated bulk prefetches."""
+    beg = Int64(bid) * pf_per
+    end = _min_s64(beg + pf_per, pf_bytes)
+    for c in range(L2PF_MAX_CHUNKS):
+        off = beg + Int64(c * L2PF_CHUNK)
+        _prefetch_l2_bulk_if(pf_ptr + off, _min_s64(end - off, Int64(L2PF_CHUNK)))
+
+
 class MnnvlAllReduceNormKernel:
     """MNNVL all-reduce + residual + RMSNorm for ``m`` tokens.
 
@@ -563,6 +608,15 @@ class MnnvlAllReduceNormKernel:
     [M, H] E4M3 as uint8 (``quant``), table int64 [3 + W] = (local buffer, multicast buffer, flags,
     every rank's unicast buffer).
     """
+
+    @staticmethod
+    def mt_smem_bytes(hidden: int, tpc: int) -> int:
+        """Shared memory for the multi-token kernel's warp sums, flags, and residual stash.
+
+        Supported hidden sizes keep every allocation aligned to 16 bytes.
+        """
+        num_warps = hidden // VEC // 32
+        return tpc * num_warps * 4 + _LAMPORT_FLAG_COUNT * 4 + tpc * hidden * 2
 
     def __init__(
         self,
@@ -578,6 +632,7 @@ class MnnvlAllReduceNormKernel:
         moe_topk: int = 0,
         fc2_row: int = 0,
         tpc: int = 1,
+        l2pf: bool = False,
     ):
         if hidden % (VEC * ctas) or (hidden // VEC // ctas) % 32 or hidden // VEC // ctas > 1024:
             raise ValueError(f"unsupported hidden size {hidden} for {ctas} CTAs per token")
@@ -592,8 +647,7 @@ class MnnvlAllReduceNormKernel:
         self.ctas = ctas
         self.threads = hidden // VEC // ctas
         self.num_warps = self.threads // 32
-        # 512-thread CTAs (one CTA per token) are bounded to two CTAs per SM (at most 64 registers), so one
-        # wave covers 2 x SMs tokens, the wave size tpc assumes.
+        # Bound 512-thread CTAs to at most 64 registers; shared memory can still prevent two-CTA residency.
         self.min_ctas_per_sm = 2 if self.threads == 512 else 0
         self.use_pdl = use_pdl
         self.se_fold = se_fold
@@ -604,6 +658,7 @@ class MnnvlAllReduceNormKernel:
         self.norm_out = norm_out
         self.quant = quant
         self.row_bytes = hidden * 2
+        self.l2pf = l2pf  # prefetch pf_ptr's slice into L2 after this CTA's pushes
 
     @cute.jit
     def __call__(
@@ -623,11 +678,14 @@ class MnnvlAllReduceNormKernel:
         topw_ptr: Int64,
         perm_ptr: Int64,
         rank: Int32,
+        pf_ptr: Int64,
+        pf_bytes: Int64,
+        pf_per: Int64,
         stream,
     ) -> None:
         m = cute.size(gRes, mode=[0])
         if const_expr(self.tpc > 1):
-            # smem: the CTA's residual vectors (tpc x H BF16), per-token warp sums, the flags
+            # Infer shared memory from the residual stash, per-token warp sums, and flags.
             self.kernel_mt(
                 gX,
                 gRouted,
@@ -644,11 +702,13 @@ class MnnvlAllReduceNormKernel:
                 topw_ptr,
                 perm_ptr,
                 rank,
+                pf_ptr,
+                pf_bytes,
+                pf_per,
             ).launch(
                 grid=[(m + self.tpc - 1) // self.tpc, 1, 1],
                 block=[self.threads, 1, 1],
                 cluster=[1, 1, 1],
-                smem=1024 + self.tpc * self.hidden * 2,
                 stream=stream,
                 use_pdl=self.use_pdl,
                 min_blocks_per_mp=self.min_ctas_per_sm,
@@ -670,6 +730,9 @@ class MnnvlAllReduceNormKernel:
                 topw_ptr,
                 perm_ptr,
                 rank,
+                pf_ptr,
+                pf_bytes,
+                pf_per,
             ).launch(
                 grid=[m * self.ctas, 1, 1],
                 block=[self.threads, 1, 1],
@@ -698,6 +761,9 @@ class MnnvlAllReduceNormKernel:
         topw_ptr: Int64,
         perm_ptr: Int64,
         rank: Int32,
+        pf_ptr: Int64,
+        pf_bytes: Int64,
+        pf_per: Int64,
     ) -> None:
         tidx, _, _ = cute.arch.thread_idx()
         bid, _, _ = cute.arch.block_idx()
@@ -717,7 +783,9 @@ class MnnvlAllReduceNormKernel:
         smem = cutlass.utils.SmemAllocator()
         red = smem.allocate_tensor(Float32, cute.make_layout((num_warps,)), byte_alignment=16)
         csum = smem.allocate_tensor(Float32, cute.make_layout((ctas,)), byte_alignment=16)
-        fl = smem.allocate_tensor(Int32, cute.make_layout((8,)), byte_alignment=16)
+        fl = smem.allocate_tensor(
+            Int32, cute.make_layout((_LAMPORT_FLAG_COUNT,)), byte_alignment=16
+        )
         red_addr = _smem_addr(red.iterator)
         csum_addr = _smem_addr(csum.iterator)
         if const_expr(ctas > 1):
@@ -786,11 +854,10 @@ class MnnvlAllReduceNormKernel:
             if const_expr(self.moe_topk > 0):
                 ev = cute.make_rmem_tensor((topk * 4,), Int32)
                 for k in cutlass.range_constexpr(topk):
-                    e0, e1, e2, e3 = _ld_v4(
-                        fc2_ptr
-                        + (Int64(_max0(pk[k])) * Int64(self.fc2_row) + Int64(vi) * Int64(VEC))
-                        * Int64(2)
-                    )
+                    fa = fc2_ptr + (
+                        Int64(_max0(pk[k])) * Int64(self.fc2_row) + Int64(vi) * Int64(VEC)
+                    ) * Int64(2)
+                    e0, e1, e2, e3 = _ld_v4(fa)
                     ev[4 * k + 0] = e0
                     ev[4 * k + 1] = e1
                     ev[4 * k + 2] = e2
@@ -832,6 +899,12 @@ class MnnvlAllReduceNormKernel:
             _sanitize(x2),
             _sanitize(x3),
         )
+
+        if const_expr(self.l2pf):
+            # The next GEMM's weight into L2 after this thread's push, so the burst overlaps the poll / reduce /
+            # norm phase rather than the fold's gathers (one thread, not thread 0).
+            if tidx == self.threads - 1:
+                l2_prefetch_slice(pf_ptr, pf_bytes, pf_per, bid)
 
         # ---- PDL: release dependents only after every allocator-recyclable input is consumed by the whole CTA
         # (a dependent's pre-wait write into a recycled block must not race these reads). After this only the
@@ -1079,6 +1152,9 @@ class MnnvlAllReduceNormKernel:
         topw_ptr: Int64,
         perm_ptr: Int64,
         rank: Int32,
+        pf_ptr: Int64,
+        pf_bytes: Int64,
+        pf_per: Int64,
     ) -> None:
         """BF16 two-shot, ``tpc`` consecutive tokens per CTA (module docstring); per token the ``kernel`` path's
         arithmetic (two-shot, BF16, ctas == 1)."""
@@ -1098,7 +1174,9 @@ class MnnvlAllReduceNormKernel:
 
         smem = cutlass.utils.SmemAllocator()
         red = smem.allocate_tensor(Float32, cute.make_layout((tpc * num_warps,)), byte_alignment=16)
-        fl = smem.allocate_tensor(Int32, cute.make_layout((8,)), byte_alignment=16)
+        fl = smem.allocate_tensor(
+            Int32, cute.make_layout((_LAMPORT_FLAG_COUNT,)), byte_alignment=16
+        )
         stash = smem.allocate_tensor(Int32, cute.make_layout((tpc * vecs * 4,)), byte_alignment=16)
         red_addr = _smem_addr(red.iterator)
         stash_addr = _smem_addr(stash.iterator) + vi * Int32(
@@ -1170,6 +1248,12 @@ class MnnvlAllReduceNormKernel:
                 _sanitize(x2),
                 _sanitize(x3),
             )
+
+        if const_expr(self.l2pf):
+            # The next GEMM's weight into L2 after this thread's push, so the burst overlaps the poll / reduce /
+            # norm phase rather than the fold's gathers (one thread, not thread 0).
+            if tidx == self.threads - 1:
+                l2_prefetch_slice(pf_ptr, pf_bytes, pf_per, bid)
 
         # ---- PDL: every input consumed (the residual words went to smem, x to the scatter) by every thread ----
         if const_expr(self.use_pdl):

@@ -39,12 +39,20 @@ def jit_package(tmp_path, monkeypatch):
     shutil.copytree(source / "csrc", package / "csrc")
     for relative in ("cutlass/include/cutlass", "cutlass/tools/util/include"):
         (package / relative).mkdir(parents=True)
-    (package / "cutlass/include/cutlass/version.h").write_text("test-cutlass\n")
+    (package / "cutlass/include/cutlass/version.h").write_text(
+        "#define CUTLASS_MAJOR 4\n#define CUTLASS_MINOR 4\n#define CUTLASS_PATCH 2\n"
+    )
     (package / "cutlass/tools/util/include/util.h").write_text("test-util\n")
 
     cache = tmp_path / "user-cache"
     monkeypatch.setenv("MINFER_FMHA_CACHE_DIR", str(cache))
-    for name in ("GPU_TRACE", "SM_TIMING", "FMHA_GMEM_CHECK"):
+    for name in (
+        "GPU_TRACE",
+        "SM_TIMING",
+        "FMHA_GMEM_CHECK",
+        "TLLM_FMHA_PROXY_CORRECTION_CHAIN",
+        "TLLM_FMHA_PROXY_S_DOUBLE_BUFFER",
+    ):
         monkeypatch.delenv(name, raising=False)
 
     loaded = []
@@ -61,6 +69,10 @@ def jit_package(tmp_path, monkeypatch):
     module_spec.loader.exec_module(jit)
     monkeypatch.setattr(jit, "_aot_ffi_version", lambda: "0.1.13.post2", raising=False)
     monkeypatch.setattr(jit, "_aot_gpu_arch", lambda: "sm_103a", raising=False)
+    monkeypatch.setattr(jit, "_device_is_sm107", lambda: False, raising=False)
+    monkeypatch.setattr(jit, "_resolve_jit_target", lambda: None, raising=False)
+    monkeypatch.setattr(jit, "_prebuilt_dir", lambda: None, raising=False)
+    monkeypatch.delenv("CUTLASS_ROOT", raising=False)
     return jit, package, cache, loaded
 
 
@@ -95,6 +107,7 @@ def _stage_artifacts(jit, package):
     assert len(names) == 350
     manifest = {
         "format_version": 1,
+        "proxy_modes": [True, True],
         "source_sha256": digest,
         "tvm_ffi_version": "0.1.13.post2",
         "host_arch": platform.machine(),
@@ -208,7 +221,7 @@ def test_packaged_source_verification_is_reused(jit_package, monkeypatch):
 def test_jit_fallback_cache_tracks_cutlass_headers(jit_package):
     jit, package, _, _ = jit_package
     original = jit._compute_cache_base()
-    (package / "cutlass/include/cutlass/version.h").write_text("modified-cutlass\n")
+    (package / "cutlass/tools/util/include/util.h").write_text("modified-cutlass\n")
     assert jit._compute_cache_base() != original
 
 
@@ -231,7 +244,7 @@ def test_source_install_without_artifacts_retains_jit_fallback(jit_package, monk
     jit, _, cache, loaded = jit_package
     manager = jit.FMHAVariantManager()
 
-    def compile_fixture(name, _params):
+    def compile_fixture(name, _params, cache_dir=None):
         path = cache / jit.CACHE_BASE.name / name / f"{name}.so"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"JIT fixture")
@@ -246,15 +259,16 @@ def test_source_install_without_artifacts_retains_jit_fallback(jit_package, monk
 def test_incomplete_legacy_aggregate_still_uses_per_variant_jit(jit_package, monkeypatch):
     jit, _, cache, _ = jit_package
     manager = jit.FMHAVariantManager()
-    jit._ALL_VARIANTS_SO.parent.mkdir(parents=True)
-    jit._ALL_VARIANTS_SO.write_bytes(b"old partial aggregate")
+    aggregate = jit._all_variants_so()
+    aggregate.parent.mkdir(parents=True)
+    aggregate.write_bytes(b"old partial aggregate")
 
     def load_module(path):
-        if Path(path) == jit._ALL_VARIANTS_SO:
+        if Path(path) == aggregate:
             return types.SimpleNamespace()
         return types.SimpleNamespace(**{"run_1_0_1_3_1_0_0": lambda value: ("compiled", value)})
 
-    def compile_fixture(name, _params):
+    def compile_fixture(name, _params, cache_dir=None):
         path = cache / jit.CACHE_BASE.name / name / f"{name}.so"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"JIT fixture")
@@ -288,7 +302,7 @@ def test_variant_manager_does_not_reuse_packaged_kernel_on_incompatible_device(
         kind = "packaged" if Path(path).parent == artifact_dir else "jit"
         return types.SimpleNamespace(**{"run_1_0_1_3_1_0_0": lambda: kind})
 
-    def compile_fixture(name, _params):
+    def compile_fixture(name, _params, cache_dir=None):
         path = jit.CACHE_BASE / name / f"{name}.so"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"JIT fixture")
@@ -321,12 +335,18 @@ def test_helpers_do_not_reuse_packaged_modules_on_incompatible_device(jit_packag
         path.write_bytes(b"JIT fixture")
 
     monkeypatch.setattr(sys.modules["tvm_ffi"], "load_module", load_module)
-    monkeypatch.setattr(jit, "_do_compile_plan", lambda: compile_fixture("plan/fmha_sm100_plan.so"))
     monkeypatch.setattr(
-        jit, "_do_compile_sparse_topk", lambda: compile_fixture("sparse_topk/sparse_topk_select.so")
+        jit, "_do_compile_plan", lambda *_: compile_fixture("plan/fmha_sm100_plan.so")
     )
     monkeypatch.setattr(
-        jit, "_do_compile_reduction", lambda: compile_fixture("reduction/fmha_sm100_reduction.so")
+        jit,
+        "_do_compile_sparse_topk",
+        lambda *_: compile_fixture("sparse_topk/sparse_topk_select.so"),
+    )
+    monkeypatch.setattr(
+        jit,
+        "_do_compile_reduction",
+        lambda *_: compile_fixture("reduction/fmha_sm100_reduction.so"),
     )
     helpers = (jit.get_plan_fn, jit.get_sparse_topk_module, jit.get_reduction_module)
     assert [fn().kind for fn in helpers] == ["packaged"] * 3
@@ -354,7 +374,7 @@ def test_transient_device_query_failure_cannot_cache_a_packaged_kernel_as_jit(
         kind = "packaged" if Path(path).parent == artifact_dir else "jit"
         return types.SimpleNamespace(**{"run_1_0_1_3_1_0_0": lambda: kind})
 
-    def compile_fixture(name, _params):
+    def compile_fixture(name, _params, cache_dir=None):
         path = jit.CACHE_BASE / name / f"{name}.so"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"JIT fixture")
@@ -404,7 +424,7 @@ def test_incomplete_packaged_set_falls_back_to_jit(jit_package, monkeypatch, mis
 
     manager = jit.FMHAVariantManager()
 
-    def compile_fixture(name, _params):
+    def compile_fixture(name, _params, cache_dir=None):
         path = cache / jit.CACHE_BASE.name / name / f"{name}.so"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"JIT fixture")
@@ -422,6 +442,89 @@ def test_debug_modes_do_not_use_production_artifacts(jit_package, monkeypatch, f
     _stage_artifacts(jit, package)
     monkeypatch.setenv(flag, "1")
     assert jit._aot_module_path("variants") is None
+
+
+@pytest.mark.parametrize("modes", [(False, False), (True, False), (False, True)])
+def test_stock_artifacts_are_rejected_for_different_proxy_modes(jit_package, monkeypatch, modes):
+    jit, package, _, _ = jit_package
+    _stage_artifacts(jit, package)
+    monkeypatch.setattr(jit, "_proxy_modes", lambda: modes)
+    assert jit._aot_module_path("variants") is None
+
+
+def test_manifest_must_explicitly_record_stock_proxy_modes(jit_package):
+    jit, package, _, _ = jit_package
+    artifact_dir = _stage_artifacts(jit, package)
+    manifest = artifact_dir / "manifest.json"
+    data = json.loads(manifest.read_text())
+    del data["proxy_modes"]
+    manifest.write_text(json.dumps(data))
+    assert jit._aot_module_path("variants") is None
+
+
+def test_sm107_prebuilt_path_remains_available(jit_package, monkeypatch, tmp_path):
+    jit, package, cache, loaded = jit_package
+    _stage_artifacts(jit, package)
+    root = tmp_path / "upstream-prebuilt"
+    relative = "1_0_1_3_1_0_0/1_0_1_3_1_0_0.so"
+    binary = root / relative
+    binary.parent.mkdir(parents=True)
+    binary.write_bytes(b"upstream opt-in artifact")
+    monkeypatch.setattr(jit, "_prebuilt_dir", lambda: root)
+    monkeypatch.setattr(jit, "_device_is_sm107", lambda: True)
+    manager = jit.FMHAVariantManager()
+    assert manager.get_variant(jit._FLOAT8_E4M3FN_CODE, 128, False, -1, 128, False, 1).run(1) == (
+        "compiled",
+        1,
+    )
+    assert loaded == [binary]
+    assert not cache.exists()
+
+
+def test_jit_fallback_preserves_target_directory(jit_package, monkeypatch):
+    jit, _, cache, loaded = jit_package
+    monkeypatch.setattr(jit, "_resolve_jit_target", lambda: "103a")
+    manager = jit.FMHAVariantManager()
+
+    def compile_fixture(name, _params, cache_dir):
+        assert cache_dir.parent.name == "sm_103a"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        (cache_dir / f"{name}.so").write_bytes(b"target-specific JIT fixture")
+
+    monkeypatch.setattr(manager, "_compile_only", compile_fixture)
+    assert manager.get_variant(jit._FLOAT8_E4M3FN_CODE, 128, False, -1, 128, False, 1).run(1) == (
+        "compiled",
+        1,
+    )
+    assert loaded[0].relative_to(cache).parts[-3:] == (
+        "sm_103a",
+        "1_0_1_3_1_0_0",
+        "1_0_1_3_1_0_0.so",
+    )
+
+
+def test_sm107_prebuilt_helpers_remain_available(jit_package, monkeypatch, tmp_path):
+    jit, package, cache, loaded = jit_package
+    _stage_artifacts(jit, package)
+    root = tmp_path / "upstream-prebuilt"
+    binaries = [
+        root / name
+        for name in (
+            "plan/fmha_sm100_plan.so",
+            "sparse_topk/sparse_topk_select.so",
+            "reduction/fmha_sm100_reduction.so",
+        )
+    ]
+    for binary in binaries:
+        binary.parent.mkdir(parents=True)
+        binary.write_bytes(b"upstream opt-in helper")
+    monkeypatch.setattr(jit, "_prebuilt_dir", lambda: root)
+    monkeypatch.setattr(jit, "_device_is_sm107", lambda: True)
+    jit.get_plan_fn()
+    jit.get_sparse_topk_module()
+    jit.get_reduction_module()
+    assert loaded == binaries
+    assert not cache.exists()
 
 
 @pytest.mark.parametrize("change", ["fmha", "cutlass", "ffi", "host", "gpu"])

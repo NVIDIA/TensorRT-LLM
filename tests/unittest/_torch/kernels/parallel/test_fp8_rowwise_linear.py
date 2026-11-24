@@ -3,19 +3,19 @@ import torch
 from utils.util import skip_blackwell
 
 from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._torch.utils import Fp8PerTokenQuantizedTensor
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 
 @skip_blackwell
+@pytest.mark.parametrize("prequantized", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_fp8_rowwise_linear(dtype):
+def test_fp8_rowwise_linear(dtype, prequantized):
     SEQ_LEN = 10
     HIDDEN_SIZE = 128
     torch.manual_seed(0)
     x = torch.randn((SEQ_LEN, HIDDEN_SIZE), dtype=dtype).cuda()
-    x_fp8, x_scale = torch.ops.tensorrt_llm.quantize_e4m3_activation(x)
-    x_fp8 = x_fp8.view(torch.float8_e4m3fn)
-    x_scale = x_scale.float().squeeze()
+    x_fp8, x_scale = torch.ops.tensorrt_llm.vectorized_per_token_fp8_quant(x)
     w = torch.randn((HIDDEN_SIZE, HIDDEN_SIZE), dtype=dtype).cuda()
     w_fp8, w_scale = torch.ops.tensorrt_llm.quantize_e4m3_activation(w)
     w_fp8 = w_fp8.view(torch.float8_e4m3fn)
@@ -37,7 +37,9 @@ def test_fp8_rowwise_linear(dtype):
     torch.testing.assert_close(l0.weight_scale, w_scale)
 
     with torch.inference_mode():
-        output = l0.forward(x)
+        # A pre-quantized input skips the Linear's own activation quantization.
+        output = l0.forward(
+            Fp8PerTokenQuantizedTensor(x_fp8, x_scale) if prequantized else x)
 
     with torch.inference_mode():
         x_dq = x_fp8.to(x_scale.dtype) * x_scale.view(-1, 1)
@@ -50,4 +52,4 @@ def test_fp8_rowwise_linear(dtype):
 
 
 if __name__ == '__main__':
-    test_fp8_rowwise_linear(torch.float16)
+    test_fp8_rowwise_linear(torch.float16, False)

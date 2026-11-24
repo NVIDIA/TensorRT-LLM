@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -55,6 +55,8 @@ struct HelixAllToAllParams
     // entryCount / zeroKvMask length: 1 when an entry is a token (fifo v2),
     // num_heads when it is a (token, head) pair (fifo v1).
     int zeroKvMaskDivisor;
+    // Field 1 contains compact base-2 LSE; neutral rows contain only -inf.
+    bool lseStats = false;
 };
 
 // ============================================================================

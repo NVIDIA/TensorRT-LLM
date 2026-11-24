@@ -14,6 +14,12 @@ import torch
 from _torch.pyexecutor.engine.runners.decoder.utils import decoder_config, decoder_graphs
 from _torch.pyexecutor.engine_test_utils import _create_request_with_tokens, _make_request_stub
 
+from tensorrt_llm._torch.attention.backends.fp4_mla import graph_resolvers
+from tensorrt_llm._torch.attention.backends.fp4_mla.graph_resolvers import (
+    PackedSplitDecisions,
+    kv_regime_variant,
+    packed_split_variant,
+)
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import (
     DecoderCudaGraphs,
@@ -374,6 +380,322 @@ def test_generation_capture_passes_local_speculation_state(fails: bool) -> None:
 
 
 @pytest.mark.cpu_only
+def test_generation_capture_runs_one_pass_per_kv_regime() -> None:
+    runner = decoder_graphs(
+        decoder_config(max_seq_len=20000),
+        cuda_graph_runner=Mock(
+            enabled=True, is_warmup_only=False, short_long_seq_len_threshold=None
+        ),
+    )
+    resource_manager = Mock()
+    warmup_lengths = []
+
+    def create_request(
+        resources: ResourceManager,
+        batch_size: int,
+        draft_len: int,
+        max_seq_len: int,
+        **kwargs: object,
+    ) -> ScheduledRequests:
+        warmup_lengths.append(max_seq_len)
+        return ScheduledRequests()
+
+    def resolver(batch_size: int, draft_len: int) -> tuple[int, ...]:
+        return (8192, 16384, 20096) if batch_size == 2 else (20096,)
+
+    variants = [kv_regime_variant(resolver)]
+    with (
+        patch.object(runner, "_decode_graph_variants", return_value=variants),
+        patch.object(runner, "_get_graphs_to_capture", return_value=[(2, 0), (1, 0)]),
+        patch.object(
+            runner._dummy_requests, "create_cuda_graph_warmup_request", side_effect=create_request
+        ),
+        patch.object(
+            runner._dummy_requests,
+            "release_batch_context",
+            side_effect=lambda request, resources: contextlib.nullcontext(request),
+        ),
+        patch.object(runner, "_forward_warmup", Mock()),
+        patch.object(torch.cuda, "synchronize"),
+    ):
+        runner._capture_generation_cuda_graphs(resource_manager)
+
+    graph_runner = runner.cuda_graph_runner
+    graph_runner.set_graph_variants.assert_called_once_with(tuple(variants))
+    # one pass per regime of the shape, largest first; the warmup request never exceeds the engine's
+    # max_seq_len; a shape with a single regime runs one pass
+    assert warmup_lengths == [20000, 16384, 8192, 20000]
+    pinned = [c.args for c in graph_runner.set_capture_variant.call_args_list]
+    assert pinned == [("kv_regime", value) for value in (20096, 16384, 8192, 20096, None)]
+
+
+@pytest.mark.cpu_only
+def test_generation_capture_runs_one_pass_per_packed_split_variant() -> None:
+    runner = decoder_graphs(
+        decoder_config(max_seq_len=20000),
+        cuda_graph_runner=Mock(
+            enabled=True, is_warmup_only=False, short_long_seq_len_threshold=None
+        ),
+    )
+    resource_manager = Mock()
+    warmups = []
+
+    def create_request(
+        resources: ResourceManager,
+        batch_size: int,
+        draft_len: int,
+        max_seq_len: int,
+        **kwargs: object,
+    ) -> ScheduledRequests:
+        warmups.append((batch_size, max_seq_len))
+        return ScheduledRequests()
+
+    variants = [
+        packed_split_variant(
+            PackedSplitDecisions(
+                variants=lambda batch_size, draft_len: (False, True)
+                if batch_size == 2
+                else (True,),
+                decide=lambda batch_size, draft_len, kv_lens: True,
+            )
+        )
+    ]
+
+    with (
+        patch.object(runner, "_decode_graph_variants", return_value=variants),
+        patch.object(runner, "_get_graphs_to_capture", return_value=[(2, 0), (1, 0)]),
+        patch.object(
+            runner._dummy_requests, "create_cuda_graph_warmup_request", side_effect=create_request
+        ),
+        patch.object(
+            runner._dummy_requests,
+            "release_batch_context",
+            side_effect=lambda request, resources: contextlib.nullcontext(request),
+        ),
+        patch.object(runner, "_forward_warmup", Mock()),
+        patch.object(torch.cuda, "synchronize"),
+    ):
+        runner._capture_generation_cuda_graphs(resource_manager)
+
+    graph_runner = runner.cuda_graph_runner
+    graph_runner.set_graph_variants.assert_called_once_with(tuple(variants))
+    # one pass per decision of the shape; a shape with the split graph alone runs one pass
+    assert warmups == [(2, 20000), (2, 20000), (1, 20000)]
+    pinned = [c.args for c in graph_runner.set_capture_variant.call_args_list]
+    assert pinned == [("packed_split", value) for value in (0, 1, 1, None)]
+
+
+def _kv_regimes(
+    runner: DecoderCudaGraphs, resource_manager: Mock, four_x_unavailable: str | None = None
+):
+    """The KV regimes of the FP4 MLA decode on a device that can host the 4x kernel unless a reason says not."""
+    return graph_resolvers.resolve_fp4_mla_kv_regimes(
+        kv_cache_manager=resource_manager.get_resource_manager(None),
+        model=runner.model,
+        mapping=runner.mapping,
+        sm_count_fn=runner._decode_sm_count,
+        four_x_unavailable_fn=lambda: four_x_unavailable,
+    )
+
+
+def _packed_split_decisions(runner: DecoderCudaGraphs, resource_manager: Mock):
+    """The packed split decisions of the FP4 MLA decode, resolved with what the graph component passes."""
+    return graph_resolvers.resolve_fp4_mla_packed_split(
+        kv_cache_manager=resource_manager.get_resource_manager(None),
+        model=runner.model,
+        mapping=runner.mapping,
+        sm_count_fn=runner._decode_sm_count,
+    )
+
+
+@pytest.mark.cpu_only
+def test_packed_split_resolver_resolves_only_for_the_fp4_mla_packed_decode(monkeypatch) -> None:
+    from tensorrt_llm._torch.attention.mla import MLA
+
+    monkeypatch.delenv("TRTLLM_FP4_MLA_SPLIT_KV", raising=False)
+    mla_layer = Mock(spec=MLA)
+    mla_layer.num_heads_tp = 128
+    model = Mock()
+    model.modules.return_value = [torch.nn.Identity(), mla_layer, mla_layer]
+    runner = decoder_graphs(decoder_config(), model=model)
+    fp4_kv_cache_manager = Mock(spec=["max_blocks_per_seq", "fp4_mla_layout"])
+    resource_manager = Mock()
+    config_module = "tensorrt_llm._torch.attention.backends.fp4_mla.config"
+
+    # a KV cache without the FP4 MLA page table (every other model) resolves nothing and never
+    # probes the FP4 MLA switches
+    resource_manager.get_resource_manager.return_value = Mock(spec=["max_blocks_per_seq"])
+    with patch(f"{config_module}._fp4_mla_split_on_demand_enabled", return_value=True) as enabled:
+        assert _packed_split_decisions(runner, resource_manager) is None
+    enabled.assert_not_called()
+    resource_manager.get_resource_manager.return_value = fp4_kv_cache_manager
+
+    # TRTLLM_FP4_MLA_SPLIT_ON_DEMAND=0 resolves nothing
+    with patch(f"{config_module}._fp4_mla_split_on_demand_enabled", return_value=False):
+        assert _packed_split_decisions(runner, resource_manager) is None
+
+    with (
+        patch(f"{config_module}._fp4_mla_split_on_demand_enabled", return_value=True),
+        patch(f"{config_module}._fp4_mla_packed_q_enabled", return_value=True),
+        patch.object(runner, "_decode_sm_count", return_value=212),
+    ):
+        resolver = _packed_split_decisions(runner, resource_manager)
+        # q = 4 (4 m-tiles, 26 tasks per wave): an unsplit graph from 18 requests; q = 1 from 71
+        assert resolver.variants(128, 3) == (False, True)
+        assert resolver.variants(16, 3) == (True,)
+        assert resolver.variants(106, 0) == (False, True)
+        assert resolver.variants(70, 0) == (True,)
+        # the step decides on its rows' KV lengths through the plan mirror (tested with the plan)
+        from tensorrt_llm._torch.attention.backends.fp4_mla import packed_plan
+
+        with patch.object(packed_plan, "packed_split_needed", return_value=False) as needed:
+            assert resolver.decide(32, 3, [2048] * 32) is False
+        needed.assert_called_once_with([2048] * 32, query_len=4, m_tiles=4, sm_count=212)
+        # a fixed TRTLLM_FP4_MLA_SPLIT_KV keeps the budget: nothing to key by
+        monkeypatch.setenv("TRTLLM_FP4_MLA_SPLIT_KV", "3")
+        assert _packed_split_decisions(runner, resource_manager) is None
+        monkeypatch.delenv("TRTLLM_FP4_MLA_SPLIT_KV")
+        # Helix keeps its split budget: nothing to key by
+        with patch.object(runner.mapping, "has_cp_helix", return_value=True):
+            assert _packed_split_decisions(runner, resource_manager) is None
+        # a model without MLA layers has no FP4 MLA decode to key by
+        model.modules.return_value = [torch.nn.Identity()]
+        assert _packed_split_decisions(runner, resource_manager) is None
+        model.modules.return_value = [mla_layer]
+    # the decision only exists behind the packed-Q cutedsl decode
+    with (
+        patch(f"{config_module}._fp4_mla_split_on_demand_enabled", return_value=True),
+        patch(f"{config_module}._fp4_mla_packed_q_enabled", return_value=False),
+    ):
+        assert _packed_split_decisions(runner, resource_manager) is None
+
+
+@pytest.mark.cpu_only
+def test_kv_regime_capture_passes_cover_every_family_a_step_can_key() -> None:
+    capture_passes = graph_resolvers.kv_regime_capture_passes
+    # one warm-up length: every regime below it and the one covering it, largest first
+    assert capture_passes([30080], (12287, 16384, 30080)) == [
+        (30080, 30080),
+        (16384, 16384),
+        (12287, 12287),
+    ]
+    # an engine max_seq_len under a ceiling captures that regime at max_seq_len and nothing above it
+    assert capture_passes([20000], (12287, 16384, 32768, 65536)) == [
+        (20000, 32768),
+        (16384, 16384),
+        (12287, 12287),
+    ]
+    # a sparse short/long split adds the short family in the regime covering the short length only
+    assert capture_passes([30080, 2044], (12287, 16384, 30080)) == [
+        (30080, 30080),
+        (16384, 16384),
+        (12287, 12287),
+        (2044, 12287),
+    ]
+
+
+@pytest.mark.cpu_only
+def test_kv_regime_resolver_resolves_only_for_the_fp4_mla_4x_decode() -> None:
+    from tensorrt_llm._torch.attention.mla import MLA
+
+    mla_layer = Mock(spec=MLA)
+    mla_layer.num_heads_tp = 128
+    model = Mock()
+    model.modules.return_value = [torch.nn.Identity(), mla_layer, mla_layer]
+    runner = decoder_graphs(decoder_config(), model=model)
+    fp4_kv_cache_manager = Mock(spec=["max_blocks_per_seq", "fp4_mla_layout"])
+    fp4_kv_cache_manager.max_blocks_per_seq = 235
+    resource_manager = Mock()
+    resource_manager.get_resource_manager.return_value = fp4_kv_cache_manager
+    config_module = "tensorrt_llm._torch.attention.backends.fp4_mla.config"
+
+    # a KV cache without the FP4 MLA page table (every other model) resolves nothing and never
+    # probes the FP4 MLA switches, even when they are set
+    resource_manager.get_resource_manager.return_value = Mock(spec=["max_blocks_per_seq"])
+    with patch(f"{config_module}._fp4_mla_cutedsl_4x_enabled", return_value=True) as enabled:
+        assert _kv_regimes(runner, resource_manager) is None
+        # the graph component asks the attention backend, which declares no variant for such a cache
+        assert runner._decode_graph_variants(resource_manager) == []
+    enabled.assert_not_called()
+    resource_manager.get_resource_manager.return_value = fp4_kv_cache_manager
+
+    # the default (4x off) resolves nothing
+    with patch(f"{config_module}._fp4_mla_cutedsl_4x_enabled", return_value=False):
+        assert _kv_regimes(runner, resource_manager) is None
+
+    with (
+        patch(f"{config_module}._fp4_mla_cutedsl_4x_enabled", return_value=True),
+        patch(f"{config_module}._fp4_mla_packed_q_enabled", return_value=True),
+        patch.object(runner, "_decode_sm_count", return_value=212),
+    ):
+        resolver = _kv_regimes(runner, resource_manager)
+        # capacity = blocks per sequence x 128 tokens; the regimes of a shape follow its 4x KV floor: 128 requests
+        # of q = 4 (5.6 waves) split at 8K, 16 requests (one wave) and q = 1 (no 4x path) keep one regime
+        assert resolver(128, 3) == (8191, 30080)
+        assert resolver(32, 3) == (2047, 30080)
+        assert resolver(16, 3) == (30080,)
+        assert resolver(128, 0) == (30080,)
+        # a KV cache without the FP4 MLA page table carries no fp4_mla_state: no regimes
+        resource_manager.get_resource_manager.return_value = Mock(spec=["max_blocks_per_seq"])
+        assert _kv_regimes(runner, resource_manager) is None
+        resource_manager.get_resource_manager.return_value = fp4_kv_cache_manager
+        # Helix decodes on the 2x kernel: no regimes
+        with patch.object(runner.mapping, "has_cp_helix", return_value=True):
+            assert _kv_regimes(runner, resource_manager) is None
+        # a model without MLA layers (or with unequal head counts) has no FP4 MLA decode to key by
+        model.modules.return_value = [torch.nn.Identity()]
+        assert _kv_regimes(runner, resource_manager) is None
+        other_layer = Mock(spec=MLA)
+        other_layer.num_heads_tp = 64
+        model.modules.return_value = [mla_layer, other_layer]
+        assert _kv_regimes(runner, resource_manager) is None
+        model.modules.return_value = [mla_layer]
+        # a device that cannot host the 4x kernel decodes every step on 2x: no regimes, as with Helix
+        assert _kv_regimes(runner, resource_manager, "too little shared memory") is None
+    # the dispatcher runs only behind the packed-Q cutedsl decode
+    with (
+        patch(f"{config_module}._fp4_mla_cutedsl_4x_enabled", return_value=True),
+        patch(f"{config_module}._fp4_mla_packed_q_enabled", return_value=False),
+    ):
+        assert _kv_regimes(runner, resource_manager) is None
+
+
+@pytest.mark.cpu_only
+def test_kv_regime_resolver_resolves_each_graph_shape_once() -> None:
+    from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_dispatch
+    from tensorrt_llm._torch.attention.mla import MLA
+
+    mla_layer = Mock(spec=MLA)
+    mla_layer.num_heads_tp = 128
+    model = Mock()
+    model.modules.return_value = [mla_layer]
+    runner = decoder_graphs(decoder_config(), model=model)
+    fp4_kv_cache_manager = Mock(spec=["max_blocks_per_seq", "fp4_mla_layout"])
+    fp4_kv_cache_manager.max_blocks_per_seq = 235
+    resource_manager = Mock()
+    resource_manager.get_resource_manager.return_value = fp4_kv_cache_manager
+    config_module = "tensorrt_llm._torch.attention.backends.fp4_mla.config"
+
+    with (
+        patch(f"{config_module}._fp4_mla_cutedsl_4x_enabled", return_value=True),
+        patch(f"{config_module}._fp4_mla_packed_q_enabled", return_value=True),
+        patch.object(runner, "_decode_sm_count", return_value=212),
+        patch.object(
+            fp4_mla_dispatch, "kv_regimes_for_batch", return_value=(12345, 30080)
+        ) as regimes,
+    ):
+        resolver = _kv_regimes(runner, resource_manager)
+        # the graph runner resolves every decode step; each shape is computed once
+        for _ in range(3):
+            assert resolver(64, 3) == (12345, 30080)
+        assert resolver(32, 3) == (12345, 30080)
+        assert regimes.call_count == 2
+    # replay keeps the ceilings its graphs were captured for, whatever the dispatcher says later
+    assert resolver(64, 3) == (12345, 30080)
+    assert regimes.call_count == 2
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("schedule", [{4: 4, 8: 2, 16: 1}, {4: 2}, {16: 4}, {4: 0}])
 def test_dynamic_warmup_graphs_match_replay_schedule(schedule: dict[int, int]) -> None:
     from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import (
@@ -583,3 +905,74 @@ def test_prefill_capture_skips_break_graphs_without_graphable_breaks(
     # Bucket 128 exceeds max_num_tokens // 4, so only bucket 16 is a candidate.
     captured = [c.args[1] for c in capture_break_graphs.call_args_list]
     assert captured == ([16] if graphable_breaks else [])
+
+
+class _SplitMetadata:
+    """resolve_mamba_metadata_cls stand-in: records whether a warmup forward ran under the split knob."""
+
+    splitting = False
+
+    @classmethod
+    @contextlib.contextmanager
+    def inforward_split_for_warmup(cls) -> Iterator[None]:
+        cls.splitting = True
+        try:
+            yield
+        finally:
+            cls.splitting = False
+
+
+def _split_warmup_graphs(plans_splits: bool, max_num_tokens: int = 258):
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+    from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+
+    kv = Mock(spec=KVCacheManagerV2)
+    kv.inforward_snapshot_rows = 2 if plans_splits else 0
+    kv.inforward_snapshot_min_main, kv.inforward_snapshot_max_tail = 3, 64
+    dummy_requests = MagicMock()
+    batch = object()
+    dummy_requests.create_warmup_request.return_value = batch
+    dummy_requests.release_batch_context.return_value.__enter__.return_value = batch
+    forwards = []
+    graphs = decoder_graphs(
+        decoder_config(max_num_tokens=max_num_tokens),
+        cuda_graph_runner=MagicMock(enabled=False, is_warmup_only=False),
+        dummy_requests=dummy_requests,
+        forward_warmup=lambda b, rm, **kw: forwards.append((b, _SplitMetadata.splitting)),
+    )
+    return graphs, ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: kv}), forwards
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("plans_splits", [False, True])
+def test_split_kernels_warm_up_without_prefill_graphs(plans_splits):
+    """With the prefill CUDA graphs off (the default), no break-graph capture runs a snapshot split: the warmup runs
+    one eager context request under the split knob, so the split's kernels compile before serving; once."""
+    graphs, resource_manager, forwards = _split_warmup_graphs(plans_splits)
+    with (
+        patch(
+            "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs.resolve_mamba_metadata_cls",
+            return_value=_SplitMetadata,
+        ),
+        patch("torch.cuda.synchronize"),
+        patch.object(graphs, "run_cuda_graph_warmup"),
+    ):
+        graphs.warmup_and_capture(resource_manager)
+        graphs.warmup_and_capture(resource_manager)
+    assert len(forwards) == (1 if plans_splits else 0)
+    if plans_splits:
+        assert forwards[0][1], "the warmup forward must plan a split"
+        kwargs = graphs._dummy_requests.create_warmup_request.call_args
+        assert kwargs.args[1:] == (3 + 64, 0) and kwargs.kwargs == {"num_context_requests": 1}
+
+
+@pytest.mark.cpu_only
+def test_split_warmup_skipped_after_break_graph_capture_or_without_room():
+    """A break-graph capture that ran the split variant already compiled the kernels; a token budget below the
+    shortest split request cannot plan one."""
+    graphs, resource_manager, forwards = _split_warmup_graphs(True)
+    graphs._inforward_split_warmed = True
+    graphs._warm_inforward_split(resource_manager)
+    graphs, resource_manager, forwards_small = _split_warmup_graphs(True, max_num_tokens=32)
+    graphs._warm_inforward_split(resource_manager)
+    assert forwards == [] and forwards_small == []

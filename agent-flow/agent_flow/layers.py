@@ -130,6 +130,8 @@ class AgentLayer(Module):
         self._persistent_client: BackendClient | None = None
         self._persistent_client_stack: AsyncExitStack | None = None
         self._persistent_system_prompt: str | None = None
+        # The backend's id of the session the last turn ran in, if reported.
+        self.session_id: str | None = None
 
     @property
     def layer_name(self) -> str:
@@ -346,7 +348,7 @@ class AgentLayer(Module):
 
     def _client_options(self, system_prompt: str | None) -> dict[str, Any]:
         """Resolve the same client configuration for either session mode."""
-        return {
+        options = {
             "system_prompt": system_prompt or "",
             "model": self.config.backend.model,
             "tools": self._resolve_tools(),
@@ -355,6 +357,9 @@ class AgentLayer(Module):
             "extra_mcp_servers": self.config.backend.extra_mcp_servers,
             "cwd": self.config.backend.cwd,
         }
+        if self.config.session.fork_from is not None:
+            options["fork_from"] = self.config.session.fork_from
+        return options
 
     @asynccontextmanager
     async def _temporary_client(
@@ -439,6 +444,8 @@ class AgentLayer(Module):
                         )
                     result_text = event.text
                     turn_usage = event.usage
+                    if event.session_id is not None:
+                        self.session_id = event.session_id
                 elif isinstance(event, ToolCallEvent):
                     policy.record(event)
                     observe("tool", event)

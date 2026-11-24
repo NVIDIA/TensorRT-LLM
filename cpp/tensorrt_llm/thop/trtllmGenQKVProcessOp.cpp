@@ -407,8 +407,8 @@ trtllmGenContextPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, tor
         qkvParams.generation_phase = false;
         qkvParams.q_only_input = qOnlyInput;
         qkvParams.multi_processor_count = static_cast<int>(multi_processor_count);
-        qkvParams.rotary_vision_start = 0;
-        qkvParams.rotary_vision_length = 0;
+        qkvParams.rotary_vision_start = -1;
+        qkvParams.rotary_vision_length = -1;
 
         switch (qkvDtype)
         {
@@ -559,8 +559,8 @@ void trtllmGenContextPostprocess(torch::Tensor qkv_input, torch::Tensor workspac
         qkvParams.quantized_fp8_output = fp8_context_fmha;
         qkvParams.generation_phase = false;
         qkvParams.multi_processor_count = static_cast<int>(multi_processor_count);
-        qkvParams.rotary_vision_start = 0;
-        qkvParams.rotary_vision_length = 0;
+        qkvParams.rotary_vision_start = -1;
+        qkvParams.rotary_vision_length = -1;
 
         switch (qkvDtype)
         {
@@ -745,8 +745,8 @@ trtllmGenGenerationPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, 
         qkvParams.generation_phase = true;
         qkvParams.q_only_input = qOnlyInput;
         qkvParams.multi_processor_count = static_cast<int>(multi_processor_count);
-        qkvParams.rotary_vision_start = 0;
-        qkvParams.rotary_vision_length = 0;
+        qkvParams.rotary_vision_start = -1;
+        qkvParams.rotary_vision_length = -1;
 
         switch (qkvDtype)
         {

@@ -22,7 +22,7 @@ model does *not* use mRoPE).
 """
 
 import dataclasses
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -57,6 +57,7 @@ from ..modules.mlp import MLP
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.qwen3_5_weight_mapper import Qwen3_5MoeHfWeightMapper
 from .modeling_auto import AutoModelForCausalLM
+from .modeling_multimodal_encoder import MultimodalEncoderMixin
 from .modeling_multimodal_utils import (
     _is_mm_disagg,
     find_input_mm_embeds,
@@ -64,7 +65,15 @@ from .modeling_multimodal_utils import (
     get_multimodal_embeddings,
 )
 from .modeling_qwen2vl import _prepare_qwen_vl_vision_attn_metadata
-from .modeling_utils import QuantConfig, _load_weights_impl, register_auto_model
+from .modeling_utils import (
+    QuantConfig,
+    _load_weights_impl,
+    register_auto_model,
+    resolve_recurrent_state_spec,
+)
+
+if TYPE_CHECKING:
+    from ..recurrent_state_spec import RecurrentStateSpec
 
 
 def _gelu_tanh(x: torch.Tensor) -> torch.Tensor:
@@ -489,7 +498,7 @@ class MiniCPMV4_6Merger(nn.Module):
         return processed_features
 
 
-class MiniCPMV4_6VisionModel(nn.Module):
+class MiniCPMV4_6VisionModel(nn.Module, MultimodalEncoderMixin):
     """Full vision tower: embeddings -> encoder (+window merger) -> merger.
 
     Consumes a batch of :class:`MultimodalParams`, concatenates every request's
@@ -525,7 +534,9 @@ class MiniCPMV4_6VisionModel(nn.Module):
         # projection would then all-reduce data that was never sharded across
         # ranks and produce wrong output.
         vision_model_config = dataclasses.replace(
-            model_config, quant_config=QuantConfig(), mapping=Mapping()
+            model_config.with_encoder_attention_backend("vision"),
+            quant_config=QuantConfig(),
+            mapping=Mapping(),
         )
         self.model_config = vision_model_config
         self.config = self.vision_config
@@ -540,7 +551,27 @@ class MiniCPMV4_6VisionModel(nn.Module):
         self.vit_merger = MiniCPMV4_6ViTWindowAttentionMerger(vision_model_config)
         self.merger = MiniCPMV4_6Merger(vision_model_config)
 
-        self.metadata_cls = get_attention_backend(model_config.attn_backend).Metadata
+        self.metadata_cls = get_attention_backend(vision_model_config.attn_backend).Metadata
+        # Per-segment capacity required by the shared encoder metadata helper.
+        # Like the Qwen-VL and Cosmos3 vision towers, default to the model's
+        # token budget rather than the live grid length. The engine replaces it
+        # with its encoder token budget through `set_attn_max_seq_len`.
+        self._attn_max_seq_len = model_config.max_num_tokens
+
+    def setup_attn_metadata(
+        self,
+        max_num_tokens: int,
+        attention_metadata_capacity: Optional[Dict[str, int]] = None,
+    ) -> None:
+        # Metadata is sized per forward from the live grids in `_make_attn_metadata`.
+        pass
+
+    def set_attn_max_seq_len(self, max_seq_len: int) -> None:
+        if max_seq_len <= 0:
+            raise ValueError(
+                f"MiniCPM-V 4.6 vision attention max_seq_len must be positive, got {max_seq_len}"
+            )
+        self._attn_max_seq_len = max_seq_len
 
     def _make_attn_metadata(self, seq_lens: List[int]) -> AttentionMetadata:
         num_segments = len(seq_lens)
@@ -549,7 +580,9 @@ class MiniCPMV4_6VisionModel(nn.Module):
             max_num_tokens=sum(seq_lens) + 1,
             kv_cache_manager=None,
         )
-        return _prepare_qwen_vl_vision_attn_metadata(seq_lens, attn_metadata)
+        return _prepare_qwen_vl_vision_attn_metadata(
+            seq_lens, attn_metadata, max_seq_len=self._attn_max_seq_len
+        )
 
     @staticmethod
     def _grid_seq_lens(target_sizes: torch.Tensor) -> List[int]:
@@ -878,6 +911,26 @@ class MiniCPMV4_6InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDumm
     ),
 )
 class MiniCPMV4_6Model(PreTrainedModel):
+    supported_encoder_attention_backends = {
+        "vision": frozenset({"VANILLA", "TRTLLM", "FLASHINFER"})
+    }
+
+    @property
+    def mamba_metadata_cls(self):
+        """The Mamba metadata class of the language model's recurrent layers."""
+        return getattr(self.llm, "mamba_metadata_cls", None)
+
+    @classmethod
+    def get_recurrent_state_spec(
+        cls,
+        pretrained_config: Any,
+        *,
+        quant_config: Optional[QuantConfig] = None,
+    ) -> "RecurrentStateSpec | None":
+        """Return the declaration of the language model that ``text_config`` selects."""
+        text_config = getattr(pretrained_config, "text_config", None) or pretrained_config
+        return resolve_recurrent_state_spec(text_config, quant_config=quant_config)
+
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
         config = model_config.pretrained_config
         super().__init__(config)

@@ -188,8 +188,9 @@ __all__ = ["MagicFinder"]
 
 from typing import Sequence
 
-# The module-level name a file assigns to declare its own import directories.
-_DECLARATION = "__extra_import_path__"
+from test_common.import_paths import DECLARATION as _DECLARATION
+from test_common.import_paths import declared_paths as _declared_paths
+from test_common.import_paths import resolve_entry as _resolve_entry
 
 _SELF_FILE: str = os.path.realpath(__file__)
 _IMPORTLIB_DIR: str = os.path.dirname(os.path.realpath(importlib.__file__))
@@ -217,30 +218,6 @@ def _is_internal_frame(filename: str) -> bool:
             known = resolved == _SELF_FILE or os.path.dirname(resolved) == _IMPORTLIB_DIR
         _INTERNAL_FRAME[filename] = known
     return known
-
-
-def _resolve_entry(entry, base_dir: str, project_root: str) -> str:
-    """Resolves one declared path to an absolute directory.
-
-    ``~/x`` is project-root relative -- deliberately NOT ``expanduser``; test
-    declarations never want the invoking user's home directory.
-    """
-    if entry == "~" or entry.startswith(("~/", "~" + os.sep)):
-        return os.path.normpath(os.path.join(project_root, entry[1:].lstrip("/" + os.sep)))
-    return os.path.normpath(os.path.join(base_dir, entry))
-
-
-def _declared_paths(value, where: str) -> tuple[str, ...]:
-    """Validates a declaration into raw, unresolved path strings."""
-    if value is None:
-        return ()
-    # A bare str is rejected rather than wrapped: iterating it would silently
-    # search one directory per character.
-    if isinstance(value, (str, bytes, os.PathLike)) or not isinstance(value, (list, tuple)):
-        raise TypeError(
-            f"{where}: {_DECLARATION} must be a list of paths, got {type(value).__name__}"
-        )
-    return tuple(os.fspath(entry) for entry in value)
 
 
 def _module_file(module: ModuleType) -> str | None:
