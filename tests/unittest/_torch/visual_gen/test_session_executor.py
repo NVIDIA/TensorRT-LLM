@@ -452,6 +452,26 @@ def test_queue_full_and_invalid_input_errors(harness):
                 s.submit("unknown", 1)
 
 
+class CrashingValidationPipeline(CountingPipeline):
+    """Its input check fails with an error that is neither a ValueError nor a TypeError."""
+
+    def validate_input(self, state, name, value):
+        if value == "x":
+            value.bit_length()  # AttributeError: a str has none
+
+
+def test_input_check_that_crashes_refuses_that_input_only(harness):
+    pipe = CrashingValidationPipeline(initial=False)
+    with harness(pipe) as h:
+        with h.open() as s:
+            with pytest.raises(ValueError, match="AttributeError.*bit_length"):
+                s.submit("controls", "x")
+            s.submit("controls", 1)
+            with s.results() as results:
+                assert not next(results).done
+    assert len(pipe.advances) == 1 and pipe.closed == 1
+
+
 def test_backpressure_pauses_the_worker_until_a_slot_returns(harness):
     pipe = CountingPipeline(initial=False)
     with harness(pipe, SimpleNamespace(delivery_slots=1, idle_timeout=None)) as h:
@@ -669,6 +689,24 @@ def test_view_without_the_stream_axis_ends_the_session_and_frees_its_slot(harnes
             with s.results() as results:
                 terminal = next(results)
             assert terminal.done and "has no axis 1" in terminal.error
+
+
+class StridedViewPipeline(CountingPipeline):
+    """Reports every other frame of the slot: the slot's memory, but not a layout
+    the client can rebuild from a shape and a dtype."""
+
+    def advance(self, state, inputs, slot):
+        view = slot["video"].view((1, FRAMES, H, W, 3), torch.uint8)
+        return AdvanceResult(written={"video": view[:, ::2]})
+
+
+def test_view_the_client_cannot_rebuild_ends_the_session_with_an_error(harness):
+    with harness(StridedViewPipeline(initial=False), SimpleNamespace(delivery_slots=1)) as h:
+        with h.open() as s:
+            s.submit("controls", 1)
+            with s.results() as results:
+                terminal = next(results)
+            assert terminal.done and "not a contiguous view" in terminal.error
 
 
 def test_failed_open_leaves_no_slot_storage_behind(harness):
@@ -2598,11 +2636,21 @@ def _declared(client, session_id):
     return channel
 
 
-def test_unserializable_submit_fails_that_call_only():
+@pytest.mark.parametrize(
+    "error",
+    [
+        TypeError("cannot pickle 'probe' object"),
+        RecursionError("maximum recursion depth exceeded while pickling an object"),
+        RuntimeError("NYI: Named tensors don't support serialization"),
+        MemoryError(),
+    ],
+    ids=lambda error: type(error).__name__,
+)
+def test_unserializable_submit_fails_that_call_only(error):
     client = _sending_client(None)
     channel = _declared(client, 1)
     client._process_requests()  # the open goes out
-    client.requests_ipc.exc = TypeError("cannot pickle 'probe' object")
+    client.requests_ipc.exc = error
     fut = client.session_submit(channel, "x", [1.0])
     client._process_requests()
     with pytest.raises(ValueError, match="cannot be serialized"):

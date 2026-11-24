@@ -5,7 +5,6 @@ import asyncio
 import atexit
 import contextlib
 import os
-import pickle  # nosec B403
 import queue
 import socket
 import sys
@@ -1259,7 +1258,10 @@ class DiffusionExecutor:
             if name not in slot:
                 raise ValueError(f"stream {name!r} was not declared")
             if not slot[name].is_view_of(tensor):
-                raise ValueError(f"stream {name!r}: the reported tensor is not a view of the slot")
+                raise ValueError(
+                    f"stream {name!r}: the reported tensor is not a contiguous view "
+                    "from the start of the slot's buffer"
+                )
             shapes[name] = (tuple(tensor.shape), tensor.dtype)
         return shapes
 
@@ -1339,6 +1341,13 @@ class DiffusionExecutor:
                 reply.error, reply.failure = str(e), AdmissionFailure.ENDED
             except (ValueError, TypeError) as e:
                 reply.error, reply.failure = str(e), AdmissionFailure.INVALID
+            except Exception as e:
+                # Validation is pipeline code that runs on rank 0 before anything
+                # is broadcast: whatever it raises refuses this one input.
+                logger.error(f"session input {message.name!r} failed validation: {e}")
+                logger.error(traceback.format_exc())
+                reply.error = f"{type(e).__name__}: {e}"
+                reply.failure = AdmissionFailure.INVALID
             self.response_queue.put(reply)
             return None
         if isinstance(message, SessionControl):
@@ -2451,19 +2460,18 @@ class DiffusionRemoteClient:
             if self._controls.get(key) is command:
                 del self._controls[key]
 
-    _PAYLOAD_ERRORS = (TypeError, pickle.PicklingError, AttributeError, ValueError)
-
     def _session_send_failed(self, req: Any, exc: Exception) -> None:
-        """A session command did not leave the process. A payload that cannot be
-        serialized (nothing was sent, the transport is intact) fails just the
-        call that made it: the pending submit gets ``ValueError`` and consumes no
+        """A session command did not leave the process. The socket serializes a
+        command before it sends it, so anything other than a socket or OS error
+        is a payload that cannot be serialized (nothing was sent, the transport
+        is intact) and fails just the call that made it: the pending submit gets ``ValueError`` and consumes no
         index; an open gets ``ValueError``, its reservation and its request
         references are released. Any other failure means control messages may be
         lost on a transport we can no longer trust, so the worker group is
         aborted and every session call raises that failure."""
         if not isinstance(req, SessionCommand):
             return
-        payload_error = isinstance(exc, self._PAYLOAD_ERRORS) and not isinstance(exc, OSError)
+        payload_error = not isinstance(exc, (zmq.ZMQError, OSError))
         with self._sessions_lock:
             channel = self._sessions.get(req.session_id)
         if not payload_error or isinstance(req, SessionControl):

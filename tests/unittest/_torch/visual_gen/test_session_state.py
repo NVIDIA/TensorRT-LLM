@@ -359,6 +359,8 @@ def test_buffer_views_fit_or_raise():
     assert view.shape == (3,) and video.is_view_of(view)
     assert video.view((2, 2), torch.float32).shape == (2, 2)  # any shape that fits
     assert not video.is_view_of(torch.zeros(3))  # someone else's memory
+    assert not video.is_view_of(video.view((4,), torch.float32)[1:])  # not from the start
+    assert not video.is_view_of(video.view((2, 2), torch.float32)[:, :1])  # strided
 
 
 def test_partial_pool_construction_undoes_every_registration(monkeypatch):

@@ -75,8 +75,14 @@ class StreamBuffer:
         return make_view(self.storage, shape, dtype)
 
     def is_view_of(self, tensor: torch.Tensor) -> bool:
-        """Whether ``tensor`` views this storage: what a pipeline may report as written."""
-        return tensor.untyped_storage().data_ptr() == self.storage.untyped_storage().data_ptr()
+        """Whether ``tensor`` is what a pipeline may report as written: a contiguous
+        view that starts at the first byte of this storage, which is the only
+        layout the client can rebuild from a shape and a dtype."""
+        return (
+            tensor.untyped_storage().data_ptr() == self.storage.untyped_storage().data_ptr()
+            and tensor.data_ptr() == self.storage.data_ptr()
+            and tensor.is_contiguous()
+        )
 
 
 def make_view(storage: torch.Tensor, shape: Tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
