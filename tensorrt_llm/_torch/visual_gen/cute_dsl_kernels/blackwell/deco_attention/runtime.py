@@ -17,6 +17,7 @@
 import functools
 import math
 import os
+from collections.abc import Callable
 
 import cuda.bindings.driver as cuda
 import cutlass.cute as cute
@@ -25,17 +26,19 @@ from cutlass.cute.runtime import make_ptr
 
 from .constants import ALIGN
 
+Layout = dict[str, tuple[torch.dtype, tuple[int, ...]]]
 
-def _aligned_bytes(dtype, shape):
+
+def _aligned_bytes(dtype: torch.dtype, shape: tuple[int, ...]) -> int:
     return -(-dtype.itemsize * math.prod(shape) // ALIGN) * ALIGN
 
 
-def workspace_bytes(layout):
+def workspace_bytes(layout: Layout) -> int:
     """Return the bytes of a workspace that holds the buffers of a layout, name -> (dtype, shape) in workspace order."""
     return sum(_aligned_bytes(dtype, shape) for dtype, shape in layout.values())
 
 
-def carve(workspace, layout):
+def carve(workspace: torch.Tensor, layout: Layout) -> dict[str, torch.Tensor]:
     """Return the buffers of a layout as views of a workspace: name -> tensor of the buffer's dtype and shape.
 
     * The 1-D uint8 workspace is read through one view per dtype; each buffer is the contiguous block of that view at
@@ -66,29 +69,29 @@ def carve(workspace, layout):
     return views
 
 
-def gmem_ptr(dtype, t, align=ALIGN):
+def gmem_ptr(dtype: type, t: torch.Tensor, align: int = ALIGN) -> cute.Pointer:
     """Return a pointer to tensor t's data, assumed aligned to `align` bytes."""
     return make_ptr(dtype, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=align)
 
 
-def current_stream(device):
+def current_stream(device: torch.device) -> cuda.CUstream:
     """Return the current PyTorch stream of `device` as a driver stream: every launch goes there."""
     return cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
 
 
-def token_pitches(q, k, v):
+def token_pitches(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> tuple[int, ...]:
     """Return the bytes between consecutive tokens of q, k and v: 256 H for a contiguous tensor, the row of the fused
     projection for a view into one."""
     return tuple(t.stride(1) * t.element_size() for t in (q, k, v))
 
 
-def pdl_enabled():
+def pdl_enabled() -> bool:
     """Return whether the launches use programmatic dependent launch: TRTLLM_ENABLE_PDL, on unless set to 0, read
     at every call as the kernels of TensorRT-LLM read it."""
     return os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
 
 
-def num_sms(device):
+def num_sms(device: torch.device | str) -> int:
     """Return the SM count of a device ("cuda": the current device), cached per device index."""
     device = torch.device(device)
     index = device.index if device.index is not None else torch.cuda.current_device()
@@ -96,11 +99,13 @@ def num_sms(device):
 
 
 @functools.cache
-def _num_sms(index):
+def _num_sms(index: int) -> int:
     return torch.cuda.get_device_properties(index).multi_processor_count
 
 
-def compiled(cache, key, make, *args, **kwargs):
+def compiled(
+    cache: dict, key: tuple, make: Callable[[], object], *args: object, **kwargs: object
+) -> Callable:
     """Return cache[key], compiled for args from make() on first use (make builds the kernel object, or returns the jit
     function, only on a miss)."""
     fn = cache.get(key)

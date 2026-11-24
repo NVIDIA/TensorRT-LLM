@@ -321,22 +321,19 @@ def prepare_land64_flag(scores, maxima, m, safe, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def land32_sum(scores, offsets, m, sch, par, kofs=None, *, loc=None, ip=None):
+def land32_sum(scores, offsets, m, sch, par, *, loc=None, ip=None):
     """32 f32 scores (the four groups of eight of one h-block: (s0, row 0), (s0, row 1), (s1, row 0), (s1, row 1)),
-    four f32 offsets, f32 m, i32 sch (the two decoded block scales as f16), i32 par, optionally four f32 kofs -> four
-    i32 words of eight E2M1 codes (nibble i = score i) and the two f32 16-key sums this lane owns.
+    four f32 offsets, f32 m, i32 sch (the two decoded block scales as f16), i32 par -> four i32 words of eight E2M1
+    codes (nibble i = score i) and the two f32 16-key sums this lane owns.
 
     * A score lands as s m + offset on the f32 subnormal grid (fma.rn.f32x2), its bits the f16 pattern of its element;
       cvt.pack.sat.u16.s32 flushes everything below 2^-15, and -inf, to +0; cvt.rn.satfinite.e2m1x2.f16x2 codes them.
     * The f16x2 sums of the landed elements of a row meet those of the XOR-1 lane (shfl.sync.bfly.b32; each lane keeps
       the half of its parity par) and enter f32 times the decoded block scale of sch (fma.rn.f32.f16).
-    * With kofs (the two-step landing) the offset is subtracted first, the FMA adds the constant kofs of the group
-      (17.5 plus the shift of its decoded scale) and a second multiply scales the result onto the grid.
     """
-    two_step = kofs is not None
-    # $0 .. $3: the P words; then the results sumi (the sums); then the operands: the scores (si), m, the offsets, sch,
-    # par and kofs
-    sumi, si, mi, offi, schi, pari, kofsi = 4, 6, 38, 39, 43, 44, 45
+    # $0 .. $3: the P words; then the results sumi (the sums); then the operands: the scores (si), m, the offsets, sch
+    # and par
+    sumi, si, mi, offi, schi, pari = 4, 6, 38, 39, 43, 44
     body = [
         "{",
         ".reg .pred odd;",
@@ -360,30 +357,10 @@ def land32_sum(scores, offsets, m, sch, par, kofs=None, *, loc=None, ip=None):
                 f"mov.b64 x1, {{${first + 2}, ${first + 3}}};",
                 f"mov.b64 x2, {{${first + 4}, ${first + 5}}};",
                 f"mov.b64 x3, {{${first + 6}, ${first + 7}}};",
-            ]
-            if two_step:
-                body += [
-                    "sub.rn.f32x2 x0, x0, o2;",
-                    "sub.rn.f32x2 x1, x1, o2;",
-                    "sub.rn.f32x2 x2, x2, o2;",
-                    "sub.rn.f32x2 x3, x3, o2;",
-                    f"mov.b64 o2, {{${kofsi + g}, ${kofsi + g}}};",
-                ]
-            body += [
                 "fma.rn.f32x2 x0, x0, m2, o2;",
                 "fma.rn.f32x2 x1, x1, m2, o2;",
                 "fma.rn.f32x2 x2, x2, m2, o2;",
                 "fma.rn.f32x2 x3, x3, m2, o2;",
-            ]
-            if two_step:
-                body += [
-                    "mov.b64 m2, {0f00000400, 0f00000400};",
-                    "mul.rn.f32x2 x0, x0, m2;",
-                    "mul.rn.f32x2 x1, x1, m2;",
-                    "mul.rn.f32x2 x2, x2, m2;",
-                    "mul.rn.f32x2 x3, x3, m2;",
-                ]
-            body += [
                 "mov.b64 {y0, y1}, x0;",
                 "mov.b64 {y2, y3}, x1;",
                 "mov.b64 {y4, y5}, x2;",
@@ -413,9 +390,7 @@ def land32_sum(scores, offsets, m, sch, par, kofs=None, *, loc=None, ip=None):
     body.append("}")
     r = asm(
         "\n".join(body),
-        [f32(x) for x in (*scores, m, *offsets)]
-        + [i32(sch), i32(par)]
-        + [f32(x) for x in (kofs or [])],
+        [f32(x) for x in (*scores, m, *offsets)] + [i32(sch), i32(par)],
         [Int32] * 4 + [Float32] * 2,
         side_effects=True,
         loc=loc,
@@ -433,21 +408,6 @@ def ld_global_nc_b32_pred(addr, pred, *, loc=None, ip=None):
         "{\n.reg .pred p;\nsetp.ne.s32 p, $2, 0;\nmov.b32 $0, 0;\n@p ld.global.nc.b32 $0, [$1];\n}",
         [i64(addr), i32(pred)],
         Int32,
-        side_effects=True,
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def ld_global_nc_b32_v4_pred(addr, pred, *, loc=None, ip=None):
-    """i64 global address, i32 pred -> four i32 words by ld.global.nc.v4.b32 (16 bytes) when pred != 0 (the load is
-    predicated), zeros otherwise."""
-    return asm(
-        "{\n.reg .pred p;\nsetp.ne.s32 p, $5, 0;\nmov.b32 $0, 0;\nmov.b32 $1, 0;\nmov.b32 $2, 0;\n"
-        "mov.b32 $3, 0;\n@p ld.global.nc.v4.b32 {$0, $1, $2, $3}, [$4];\n}",
-        [i64(addr), i32(pred)],
-        [Int32] * 4,
         side_effects=True,
         loc=loc,
         ip=ip,

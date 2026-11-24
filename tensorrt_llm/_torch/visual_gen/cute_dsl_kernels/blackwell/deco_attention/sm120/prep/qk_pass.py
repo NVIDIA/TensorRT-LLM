@@ -34,7 +34,7 @@ from cutlass.utils import SmemAllocator
 
 from ...common.expmath import bf16x2, f2u, round_m3, warp_max
 from ...common.mem import gptr, load_invariant, load_vector, sptr, store_vector
-from ...constants import QPRE
+from ...constants import E2M1_MAX, QK_CHANNELS, QK_SCALE_ATOMS, QPRE
 from ..ptx.shared import (
     e2m1x2_to_f32x2,
     f32x4_to_e2m1x4,
@@ -43,9 +43,13 @@ from ..ptx.shared import (
     st_global_b32_v2_hint,
 )
 from ..valid_len import valid_len
-from .basis import tok_addr
+from .basis import row_addr, tok_addr
 
 QK_THREADS = 256
+# block scales of a key tile of Q' or K': one per token and 16 channels, in the atom layout of the QK MMA
+TILE_SCALES = QK_SCALE_ATOMS * 512
+K_CHUNKS = QK_CHANNELS // 32
+K_ARRAY = 128 * 16
 
 # shared memory map (bytes): Hd^T, U^T, the per-warp code and scale stages, the reduction area
 SQ_HDT = 0  # 128 rows x 256 B, 8-byte slots, slot ^ 4 (row & 3)
@@ -65,7 +69,7 @@ def _quant_block(x0: Float32, x1: Float32, x2: Float32, x3: Float32):
     am = cute.arch.fmax(Float32(0.0), am)
     am = cute.arch.fmax(am, cute.arch.shuffle_sync_bfly(am, offset=1))
     am = cute.arch.fmax(am, cute.arch.shuffle_sync_bfly(am, offset=2))
-    sc = round_m3(am * Float32(1.0 / 6.0))
+    sc = round_m3(am * Float32(1.0 / E2M1_MAX))
     inv = Float32(cutlass.select_(sc > Float32(1e-30), cute.arch.rcp_approx(sc), Float32(0.0)))
     cw = f32x4_to_e2m1x4(x0 * inv, x1 * inv, x2 * inv, x3 * inv)
     d0, d1 = e2m1x2_to_f32x2(cw & Uint32(0xFF))
@@ -160,6 +164,36 @@ def _load_rows(afn, base, rstride, rg, nv, live=None):
         afn[4 * a + 3] = wb[1]
 
 
+@cute.jit
+def _store_rows(stg, lane, tok0, dst, bb, hh, S, H):
+    for m in cutlass.range_constexpr(4):
+        idx = lane + 32 * m
+        rl = idx >> 3
+        chn = idx & 7
+        wv = load_vector(sptr(Uint32, stg + rl * 144 + chn * 16, 16), 4)
+        tok = tok0 + rl
+        if tok < S:
+            row_dst = row_addr(dst, bb, tok, hh, S, H, 128) + chn * 16
+            store_vector(gptr(Uint32, row_dst, 16), wv, cop="cs")
+
+
+def ntile_row(r):
+    rp = r & 31
+    return 8 * (8 * (r >> 6) + 4 * ((r >> 5) & 1) + ((rp & 7) >> 1)) + 2 * (rp >> 3) + (rp & 1)
+
+
+def _store_tile(stg, lane, warp, tok0, kimg, S):
+    """Store the warp's staged K' rows in the tile image at kimg: K_CHUNKS arrays of 128 16-byte rows, n-tile order."""
+    rl = lane & 15
+    chn = lane >> 4
+    src = stg + rl * 144 + chn * 16
+    key_dst = kimg + (chn * K_ARRAY + ntile_row(warp * 16 + rl) * 16)
+    for m in range(K_CHUNKS // 2):
+        wv = load_vector(sptr(Uint32, src + 32 * m, 16), 4)
+        kv = [Uint32(cutlass.select_(tok0 + rl < S, w, Uint32(0))) for w in wv]
+        store_vector(gptr(Uint32, key_dst + 2 * K_ARRAY * m, 16), kv, cop="cs")
+
+
 @cute.kernel
 def qk_kernel(
     q_p: Int64,
@@ -179,11 +213,13 @@ def qk_kernel(
     nitems: Int32,
     ncta: Int32,
     lens_p,
+    *,
+    tile_pitch: cutlass.Constexpr = None,
 ):
     """The Q'/K' pass of the CTA's share of the nitems items (side, batch, head, tile). QP, KP: the bytes between
-    consecutive tokens of q and of k. lens_p: None, or the global
-    address of the valid prefix lengths: the tokens from the length of their batch element on are then read as zeros
-    (zero codes and block scales, outside the group maxima), and a tile without a valid token is left as it is."""
+    consecutive tokens of q and of k. lens_p: None, or the global address of the valid prefix lengths: the tokens from
+    the length of their batch element on are then read as zeros (zero codes and block scales, outside the group
+    maxima), and a tile without a valid token is left as it is. tile_pitch: None, or K' goes to tile images."""
     tid, _, _ = cute.arch.thread_idx()
     cta, _, _ = cute.arch.block_idx()
     lane = tid & 31
@@ -295,7 +331,8 @@ def qk_kernel(
                     )
                 cute.arch.sync_threads()
                 cur = bhs
-            dst = Int64(cutlass.select_(side != 0, k4_p, q4_p))
+            if cutlass.const_expr(tile_pitch is None):
+                dst = Int64(cutlass.select_(side != 0, k4_p, q4_p))
             pre = Float32(cutlass.select_(side != 0, Float32(1.0), Float32(QPRE)))
             tok0 = tile * 128 + warp * 16
             pq = cute.make_rmem_tensor((16,), Float32)
@@ -380,22 +417,17 @@ def qk_kernel(
                     gm[3 + j], Float32(cutlass.select_(isk != 0, groups[j], Float32(0.0)))
                 )
             cute.arch.sync_warp()
-            # codes: 16 rows x 128 B
-            for m in cutlass.range_constexpr(4):
-                idx = lane + 32 * m
-                rl = idx >> 3
-                chn = idx & 7
-                wv = load_vector(sptr(Uint32, stg + rl * 144 + chn * 16, 16), 4)
-                tok = tok0 + rl
-                if tok < S:
-                    row_dst = (
-                        dst
-                        + ((Int64(bb) * Int64(S) + Int64(tok)) * Int64(H) + Int64(hh)) * 128
-                        + chn * 16
-                    )
-                    store_vector(gptr(Uint32, row_dst, 16), wv, cop="cs")
+            # codes: 16 rows x 128 B (tile_pitch: K' to the tile images that many bytes apart from k4_p, zero past S)
+            if cutlass.const_expr(tile_pitch is None):
+                _store_rows(stg, lane, tok0, dst, bb, hh, S, H)
+            elif side == 0:
+                _store_rows(stg, lane, tok0, q4_p, bb, hh, S, H)
+            else:
+                _store_tile(stg, lane, warp, tok0, k4_p + Int64(bh * T + tile) * tile_pitch, S)
             # provisional scales: 16 rows x 3 atoms x 8 B
-            pbase = prov_p + ((Int64(side) * Int64(BH) + Int64(bh)) * Int64(T) + Int64(tile)) * 3072
+            pbase = prov_p + ((Int64(side) * Int64(BH) + Int64(bh)) * Int64(T) + Int64(tile)) * (
+                2 * TILE_SCALES
+            )
             for m in cutlass.range_constexpr(2):
                 idx = lane + 32 * m
                 if idx < 48:
@@ -411,11 +443,11 @@ def qk_kernel(
                     )
             cute.arch.sync_warp()
         else:
-            # a tile past the valid length of its batch element writes no codes; the encode kernel reads the
-            # provisional scales of every tile, so those of this one are zero, not the stale or uninitialized
-            # scratch of the workspace
-            pbase = prov_p + ((Int64(side) * Int64(BH) + Int64(bh)) * Int64(T) + Int64(tile)) * 3072
-            if tid < 192:
+            # a tile past the valid length writes no codes, and zero provisional scales: the encode kernel reads them
+            pbase = prov_p + ((Int64(side) * Int64(BH) + Int64(bh)) * Int64(T) + Int64(tile)) * (
+                2 * TILE_SCALES
+            )
+            if tid < TILE_SCALES // 8:
                 store_vector(
                     gptr(Uint32, pbase + Int64(tid) * 16, 16),
                     (Uint32(0), Uint32(0), Uint32(0), Uint32(0)),

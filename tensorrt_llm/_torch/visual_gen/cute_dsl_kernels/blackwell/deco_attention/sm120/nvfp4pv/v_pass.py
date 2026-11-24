@@ -15,7 +15,7 @@
 """V pass of the sm_120 NVFP4-PV kernel: V' = V minus its BF16 means of every 16 keys, in NVFP4 along the keys.
 
 * V' is in V's own 128 channels: E2M1 codes with one UE4M3 scale per channel and 16 keys, under the power-of-two
-  tensor scale v4_scale of max|v - vbar| / 2688; v_mean = vbar / v4_scale.
+  tensor scale v4_scale of max|v - vbar| / 2688; v_mean = vbar / v4_scale. All three go to the tile images (layout.py).
 * The pass shares the basis launch (prep/basis.py): the launch's spare CTAs scan V for max|v - vbar| (the tensor
   scale is needed before any code is formed) and, when the launch has room for it, run the pass on the tiles a
   counter hands out (_vpass); v_kernel is the pass as its own launch otherwise.
@@ -31,30 +31,25 @@ from ...common.dsl import FPRoundingMode, SaturationMode, cvt_f32x2_to_f8x2
 from ...common.expmath import RN, bf16x2, pow2_ceil, u2f
 from ...common.mem import gptr, load_vector, sptr, store_vector
 from ...common.ptx import f32x8_to_e2m1x8
-from ...constants import E4M3_MAX, V_MEAN_HEADROOM
+from ...constants import E2M1_MAX, E4M3_MAX, V_MEAN_HEADROOM
 from ..prep.basis import (
-    DONE_TILES,
     EIG_THREADS,
-    RED_TILE,
-    SM_RED,
     SM_VSTG,
-    VIN_BYTES,
     basis_cta,
     bf16_f32,
     group16,
     key_count,
-    next_scan_tiles,
-    next_tile,
-    publish_scan,
     scan_max,
     scan_max_word,
-    stage_rows,
     store_slot,
     tok_addr,
+    vpass_tiles,
+    vscan_tiles,
 )
 from ..ptx.nvfp4pv import e4m3_to_f32
 from ..ptx.shared import ld_global_nc_b32_hint_pred
 from ..valid_len import valid_len
+from .layout import STAGE, SV_OFF, key_tiles, mean_off, store_means, v_scale_off
 
 V_THREADS = 128
 
@@ -62,7 +57,7 @@ V_THREADS = 128
 def tensor_scale(c):
     """Return the power-of-two v4_scale for max|v - vbar| = c: at or above c / (6 x 448), the E2M1 range times the
     UE4M3 range."""
-    return pow2_ceil(cute.math.div(c, Float32(6.0 * E4M3_MAX), rounding=RN))
+    return pow2_ceil(cute.math.div(c, Float32(E2M1_MAX * E4M3_MAX), rounding=RN))
 
 
 def group_mean(sums, cnt):
@@ -89,7 +84,7 @@ def channel_codes(val, m, cnt, i4):
         am = cute.arch.fmax(
             am, Float32(cutlass.select_(kk < cnt, cute.math.abs(vv - m), Float32(0.0)))
         )
-    sf = cute.math.div(am * i4, Float32(6.0), rounding=RN)
+    sf = cute.math.div(am * i4, Float32(E2M1_MAX), rounding=RN)
     sfw = Uint32(
         Uint16(
             cvt_f32x2_to_f8x2(
@@ -121,16 +116,15 @@ def stage_codes(stg, sfs, wv, mf, cnt, i4, chunk, grp, NC):
         cute.arch.store(sptr(Uint8, sfs + (chunk * NC + c) * 8 + grp), sfw.to(Uint8))
 
 
-def store_codes(stg, v4_p, bh, tile, thread, SP2, NT, NC):
-    """Store the staged codes of a tile of (batch, head) bh as 128 channel rows of 64 B: 512 / NT parts per thread."""
+def store_codes(stg, img, thread, NT, NC):
+    """Store the staged codes of a tile into its image img, 128 channel rows per 16-byte part: 512 / NT per thread."""
     for m in range(512 // NT):
         ci = thread + NT * m
         ch = ci >> 2
         part = ci & 3
         row = (ch % NC) * (128 // NC) + ch // NC
         w4 = load_vector(sptr(Uint32, stg + row * 64 + part * 16, 16), 4)
-        code_dst = v4_p + (Int64(bh) * 128 + Int64(ch)) * Int64(SP2) + Int64(tile * 64 + part * 16)
-        store_vector(gptr(Uint32, code_dst, 16), w4, cop="cs")
+        store_vector(gptr(Uint32, img + (SV_OFF + part * 2048 + ch * 16), 16), w4, cop="cs")
 
 
 def _fold(sums, vmx, vmn, fc, any_, mx):
@@ -146,53 +140,6 @@ def _fold(sums, vmx, vmn, fc, any_, mx):
             mx, d if any_ is None else Float32(cutlass.select_(any_ != 0, d, Float32(0.0)))
         )
     return mx
-
-
-@cute.jit
-def _vscan(
-    v_p: Int64,
-    done_p: Int64,
-    S: Int32,
-    H: Int32,
-    VP: Int32,
-    T: Int32,
-    ntiles: Int32,
-    tid: Int32,
-    sb: Int32,
-    lens_p,
-):
-    """max|v - vbar| (vbar = BF16 16-key means) over the 128-key tiles that the claim counter of the done buffer hands
-    out (flat over (batch, head, tile)), four tiles at a time; thread = (16-key group, 8-channel chunk). lens_p:
-    None, or the global address of the valid prefix lengths: the keys of a batch element then end at its length.
-    The CTA's maximum and its tile count go to the done buffer (publish_scan)."""
-    u = tid & 127
-    grp = u >> 4
-    cc = u & 15
-    sub4 = tid >> 7
-    rstride = Int64(VP)
-    mx = Float32(0.0)
-    scanned = Int32(0)
-    t4 = next_scan_tiles(sb, done_p, tid)
-    while t4 < ntiles:
-        tile = t4 + sub4
-        tv = Int32(tile < ntiles)
-        tile = cutlass.min(tile, ntiles - 1)
-        bh = tile // T
-        tt = tile - bh * T
-        bb = bh // H
-        hh = bh - bb * H
-        k0 = tt * 128 + 16 * grp
-        nk = valid_len(lens_p, bb, S)
-        cnt = key_count(k0, nk) * tv
-        base = tok_addr(v_p, bb, cutlass.min(k0, S - 1), hh, S, VP) + Int64(cc * 16)
-        # with lengths: a tile without a valid key is skipped
-        live = cutlass.const_expr(lens_p is None) or tt * 128 < nk
-        if live:
-            sums, vmx, vmn = group16(base, rstride, cnt)
-            mx = _fold(sums, vmx, vmn, Float32(cutlass.max(cnt, 1)), Int32(cnt > 0), mx)
-        scanned = scanned + cutlass.min(Int32(4), ntiles - t4)
-        t4 = next_scan_tiles(sb, done_p, tid)
-    publish_scan(mx, scanned, tid, sb, done_p)
 
 
 @cute.jit
@@ -234,11 +181,31 @@ def _vscan_gs(
 
 
 @cute.jit
+def _encode_tile(img_p, i4, stg, sfs, half, wv, sv, tile, tt, cnt, nk, tid_h):
+    """Encode one tile of the V pass in the basis launch (vpass_tiles) for the thread (group tid_h % 8, quad tid_h / 8):
+    the means of its 16-key group, then V' codes and scales transposed through smem ([c&3][quad][64 B] / [c][8 B])
+    into the image of the tile. The keys from cnt on, those past the valid keys nk of the batch element, get zero
+    codes."""
+    grp = tid_h & 7
+    cq = tid_h >> 3
+    img = img_p + Int64(tile) * STAGE
+    # the mean of the 16-key group; v_mean = vbar / v4_scale (exact)
+    mf = group_mean([sv[e] for e in range(4)], cnt)
+    mean_words = [bf16x2(mf[2 * e] * i4, mf[2 * e + 1] * i4) for e in range(2)]
+    mean_at = mean_off(grp, cq >> 1) + (cq & 1) * 8
+    store_means(img, tt, key_tiles(nk) - 1, mean_at, mean_words)
+    stage_codes(stg, sfs, wv, mf, cnt, i4, cq, grp, NC=4)
+    cute.arch.barrier(barrier_id=1 + half, number_of_threads=256)
+    store_codes(stg, img, tid_h, NT=256, NC=4)
+    if tid_h < 128:
+        s2 = load_vector(sptr(Uint32, sfs + tid_h * 8, 8), 2)
+        store_vector(gptr(Uint32, img + v_scale_off(tid_h), 8), s2, cop="cs")
+
+
+@cute.jit
 def _vpass(
     v_p: Int64,
-    v4_p: Int64,
-    v4sf_p: Int64,
-    vmean_p: Int64,
+    img_p: Int64,
     v4s_p: Int64,
     done_p: Int64,
     S: Int32,
@@ -251,80 +218,30 @@ def _vpass(
     sb: Int32,
     lens_p,
 ):
-    """The V pass in the basis launch, tiles handed out by a counter in descending order to two 256-thread halves per
-    CTA, thread = (16-key group, 4-channel quad); V' codes / scales transposed through smem ([c&3][quad][64 B] /
-    [c][8 B]). lens_p: None, or the global address of the valid prefix lengths: the keys of a batch element then end
-    at its length (zero codes from there on), and a tile without a valid key is left as it is."""
-    # the tensor scale from the maximum of this launch's scan CTAs
-    red = sb + SM_RED
+    """The V pass in the basis launch: the tensor scale from the maximum of this launch's scan CTAs, then the tiles
+    of vpass_tiles with _encode_tile. A tile without a valid key is left as it is."""
     v4s = tensor_scale(scan_max_word(done_p))
     if pid == 0 and tid == 0:
         cute.arch.store(gptr(Float32, v4s_p), v4s)
     i4 = cute.math.rcp(v4s)
     half = tid >> 8
-    tid_h = tid & 255
-    grp = tid_h & 7
-    cq = tid_h >> 3
-    vin = sb + half * VIN_BYTES  # next-tile input, rows of 256 B, 16-byte part ^ (row >> 4)
     stg = sb + SM_VSTG + half * 9216
     sfs = stg + 8192
-    SP2 = T * 64
-    SP16 = T * 8
-    word = red + RED_TILE + half * 4
-    ctr = done_p + DONE_TILES
-    # tile t: issue its 128 x 256 B rows into vin (zero past S)
-    tix = next_tile(word, ctr, tid_h, half)
-    if tix < ntiles:
-        stage_rows(v_p, vin, tid_h, ntiles - 1 - tix, S, H, VP, T, lens_p)
-    cute.arch.cp_async_commit_group()
-    cute.arch.barrier(barrier_id=1 + half, number_of_threads=256)
-    nix = next_tile(word, ctr, tid_h, half)
-    while tix < ntiles:
-        tile = ntiles - 1 - tix
-        bh = tile // T
-        tt = tile - bh * T
-        k0 = tt * 128 + 16 * grp
-        nk = valid_len(lens_p, bh // H, S)
-        cnt = key_count(k0, nk)
-        cute.arch.cp_async_wait_group(0)
-        cute.arch.barrier(barrier_id=1 + half, number_of_threads=256)
-        wv = cute.make_rmem_tensor((32,), Uint32)
-        sums = [Float32(0.0)] * 4
-        for kk in cutlass.range_constexpr(16):
-            w = load_vector(
-                sptr(
-                    Uint32, vin + (16 * grp + kk) * 256 + (((cq >> 1) ^ grp) * 16) + (cq & 1) * 8, 8
-                ),
-                2,
-            )
-            for e in cutlass.range_constexpr(2):
-                wv[kk * 2 + e] = w[e]
-                sums[2 * e] = sums[2 * e] + u2f(w[e] << Uint32(16))
-                sums[2 * e + 1] = sums[2 * e + 1] + u2f(w[e] & Uint32(0xFFFF0000))
-        cute.arch.barrier(barrier_id=1 + half, number_of_threads=256)
-        # prefetch the next tile while this one is processed
-        if nix < ntiles:
-            stage_rows(v_p, vin, tid_h, ntiles - 1 - nix, S, H, VP, T, lens_p)
-        cute.arch.cp_async_commit_group()
-        live = cutlass.const_expr(lens_p is None) or tt * 128 < nk
-        if live:
-            # the mean of the 16-key group; v_mean = vbar / v4_scale (exact)
-            mf = group_mean(sums, cnt)
-            mean_dst = (
-                vmean_p
-                + ((Int64(bh) * Int64(SP16) + Int64(tt * 8 + grp)) * 128 + Int64(cq * 4)) * 2
-            )
-            mean_words = [bf16x2(mf[2 * e] * i4, mf[2 * e + 1] * i4) for e in range(2)]
-            store_vector(gptr(Uint32, mean_dst, 8), mean_words, cop="cs")
-            stage_codes(stg, sfs, wv, mf, cnt, i4, cq, grp, NC=4)
-            cute.arch.barrier(barrier_id=1 + half, number_of_threads=256)
-            store_codes(stg, v4_p, bh, tt, tid_h, SP2, NT=256, NC=4)
-            if tid_h < 128:
-                s2 = load_vector(sptr(Uint32, sfs + tid_h * 8, 8), 2)
-                scale_dst = v4sf_p + (Int64(bh) * 128 + Int64(tid_h)) * Int64(SP16) + Int64(tt * 8)
-                store_vector(gptr(Uint32, scale_dst, 8), s2, cop="cs")
-        tix = nix
-        nix = next_tile(word, ctr, tid_h, half)
+    vpass_tiles(
+        v_p,
+        done_p,
+        S,
+        H,
+        VP,
+        T,
+        ntiles,
+        tid,
+        sb,
+        lens_p,
+        lambda wv, sv, tile, bh, tt, k0, cnt, nk, tid_h: _encode_tile(
+            img_p, i4, stg, sfs, half, wv, sv, tile, tt, cnt, nk, tid_h
+        ),
+    )
 
 
 @cute.kernel
@@ -337,9 +254,7 @@ def basis_kernel(
     ut_p: Int64,
     vmax_p: Int64,
     done_p: Int64,
-    v4_p: Int64,
-    v4sf_p: Int64,
-    vmean_p: Int64,
+    img_p: Int64,
     v4s_p: Int64,
     B: Int32,
     S: Int32,
@@ -374,23 +289,25 @@ def basis_kernel(
         nspare,
         FUSED,
         lambda cta, tid, sb: _vscan_gs(v_p, vmax_p, B, S, H, VP, cta, nspare, tid, sb, lens_p),
-        lambda ntiles, tid, sb: _vscan(v_p, done_p, S, H, VP, T, ntiles, tid, sb, lens_p),
-        lambda ntiles, pid, tid, sb: _vpass(
+        # thread = (16-key group, 8-channel chunk); the mean of a lane's group is over its own keys
+        lambda ntiles, tid, sb: vscan_tiles(
             v_p,
-            v4_p,
-            v4sf_p,
-            vmean_p,
-            v4s_p,
             done_p,
             S,
             H,
             VP,
             T,
             ntiles,
-            pid,
             tid,
             sb,
             lens_p,
+            lambda u: (u >> 4, u & 15),
+            lambda sums, vmx, vmn, cnt, mx: _fold(
+                sums, vmx, vmn, Float32(cutlass.max(cnt, 1)), Int32(cnt > 0), mx
+            ),
+        ),
+        lambda ntiles, pid, tid, sb: _vpass(
+            v_p, img_p, v4s_p, done_p, S, H, VP, T, ntiles, pid, tid, sb, lens_p
         ),
         lens_p,
         rows_mode,
@@ -401,9 +318,7 @@ def basis_kernel(
 def v_kernel(
     v_p: Int64,
     vmax_p: Int64,
-    v4_p: Int64,
-    v4sf_p: Int64,
-    vmean_p: Int64,
+    img_p: Int64,
     v4s_p: Int64,
     S: Int32,
     H: Int32,
@@ -432,8 +347,6 @@ def v_kernel(
     warp = tid >> 5
     grp = lane & 7
     cc = (lane >> 3) + 4 * warp
-    SP2 = T * 64
-    SP16 = T * 8
     rstride = Int64(VP)
     item_lo = (cta * nitems) // ncta
     item_hi = ((cta + 1) * nitems) // ncta
@@ -446,6 +359,7 @@ def v_kernel(
         nk = valid_len(lens_p, bb, S)
         cnt = key_count(k0, nk)
         base = tok_addr(v_p, bb, cutlass.min(k0, S - 1), hh, S, VP) + Int64(cc * 16)
+        img = img_p + Int64(item) * STAGE
         live = cutlass.const_expr(lens_p is None) or tile * 128 < nk
         if live:
             wv = cute.make_rmem_tensor((64,), Uint32)
@@ -456,22 +370,17 @@ def v_kernel(
                 )
                 for e in cutlass.range_constexpr(4):
                     wv[kk * 4 + e] = w[e]
-                    sums[2 * e] = sums[2 * e] + u2f(w[e] << Uint32(16))
-                    sums[2 * e + 1] = sums[2 * e + 1] + u2f(w[e] & Uint32(0xFFFF0000))
+                    sums[2 * e] = sums[2 * e] + bf16_f32(w[e], 0)
+                    sums[2 * e + 1] = sums[2 * e + 1] + bf16_f32(w[e], 1)
             mf = group_mean(sums, cnt)
             # v_mean = vbar / v4_scale (exact), 8 channels = 16 bytes
-            mean_dst = (
-                vmean_p
-                + ((Int64(bh) * Int64(SP16) + Int64(tile * 8 + grp)) * 128 + Int64(cc * 8)) * 2
-            )
             mean_words = [bf16x2(mf[2 * e] * i4, mf[2 * e + 1] * i4) for e in range(4)]
-            store_vector(gptr(Uint32, mean_dst, 16), mean_words, cop="cs")
+            store_means(img, tile, key_tiles(nk) - 1, mean_off(grp, cc), mean_words)
             # per channel: amax of y = (v - vbar) / v4_scale over the valid keys, UE4M3 block scale, codes
             stage_codes(stg, sfs, wv, mf, cnt, i4, cc, grp, NC=8)
         cute.arch.sync_threads()
         if live:
-            store_codes(stg, v4_p, bh, tile, tid, SP2, NT=V_THREADS, NC=8)
+            store_codes(stg, img, tid, NT=V_THREADS, NC=8)
             s2 = load_vector(sptr(Uint32, sfs + tid * 8, 8), 2)
-            scale_dst = v4sf_p + (Int64(bh) * 128 + Int64(tid)) * Int64(SP16) + Int64(tile * 8)
-            store_vector(gptr(Uint32, scale_dst, 8), s2, cop="cs")
+            store_vector(gptr(Uint32, img + v_scale_off(tid), 8), s2, cop="cs")
         cute.arch.sync_threads()

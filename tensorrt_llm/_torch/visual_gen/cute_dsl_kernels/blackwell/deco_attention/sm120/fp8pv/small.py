@@ -59,9 +59,7 @@ SMALL_SMEM_BYTES = SBAR_OFF + 8
 
 # ------------------------------------------------------------------------------------------------ tile copy, MMA phases
 @cute.jit
-def small_issue_tile(
-    sbase, kb, vb, kvsrc, kvsrc0, ksfb, t, S: cutlass.Constexpr, H: cutlass.Constexpr, vmb
-):
+def small_issue_tile(sbase, kb, vb, kvsrc, kvsrc0, ksfb, t, S, H, vmb):
     """Copy the key tile into shared memory at sbase by cp.async as one commit group; thread t of the second group.
 
     * 16 rows per instruction step: thread t copies chunk t % 8 of rows 16 it + t / 8 (K' rows: their used chunks
@@ -73,7 +71,7 @@ def small_issue_tile(
     for it in cutlass.range_constexpr(KT // 16):
         row = it * 16 + r16
         nb = Int32(16)
-        src = kvsrc + Int64(it * 16) * (H * 128)
+        src = kvsrc + Int64(it * 16 * 128) * Int64(H)
         if row >= S:
             nb = Int32(0)
             src = kvsrc0
@@ -190,18 +188,14 @@ def small_mma_phase(
 
 
 @cute.jit
-def small_softmax(acc, P, sc, q, lim: cutlass.Constexpr):
+def small_softmax(acc, P, sc, q, lim):
     """Run the softmax of the single tile with the tile max as the anchor, keys >= lim masked; return the row sums."""
     for nt in cutlass.range_constexpr(16):
         s = nt % 4
         i = nt // 4
         for e in cutlass.range_constexpr(2):
             kk = 32 * i + 8 * key_grp(s) + ((2 * q + e) ^ key_rot(s))
-            ok = Int32(1)
-            if cutlass.const_expr(not isinstance(lim, int)):
-                ok = Int32(kk < lim)
-            elif kk >= lim:
-                ok = Int32(0)
+            ok = Int32(kk < lim)
             acc[nt][e] = Float32(cutlass.select_(ok != 0, acc[nt][e], Float32(-math.inf)))
             acc[nt][2 + e] = Float32(cutlass.select_(ok != 0, acc[nt][2 + e], Float32(-math.inf)))
     # the anchors of the rows: the tile max in log2 units
@@ -230,8 +224,8 @@ def small_kernel(
     vs_ptr: cute.Pointer,
     vm_ptr: cute.Pointer,
     o_ptr: cute.Pointer,
-    S: cutlass.Constexpr,
-    H: cutlass.Constexpr,
+    S: Int32,
+    H: Int32,
     lens_ptr,
 ):
     """Run the S < 128 queries of one (batch, head) against its S keys; grid (1, H, B), NTHR threads."""

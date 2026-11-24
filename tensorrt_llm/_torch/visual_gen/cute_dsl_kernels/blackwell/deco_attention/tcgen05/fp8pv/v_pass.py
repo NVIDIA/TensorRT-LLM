@@ -29,11 +29,11 @@ from cutlass import Float32, Int32, Int64, Uint32
 
 from ...common.expmath import bf16x2, e4m3x4, f2u, pow2_ceil_448, u2f, warp_max
 from ...common.mem import gptr, load_invariant, load_vector, sptr, store_vector
-from ...constants import V_MEAN_HEADROOM
+from ...constants import KEY_TILE, V_MEAN_HEADROOM
 from ..prep.basis import GMAX_V
 from ..valid_len import valid_len
 
-V_BLOCK = 128  # keys per mean: one 128-key tile of the attention
+V_BLOCK = KEY_TILE  # keys per mean: one KV tile of the attention
 V_THREADS = 256
 # CTAs per SM that the launches request (min_blocks_per_mp) and that size their grid
 V_CTAS_PER_SM = 4
@@ -220,25 +220,11 @@ def v_scan_kernel(
     VP: Int32,
     NB: Int32,
     nunits: Int32,
+    lens: Int64,
+    LENS: cutlass.Constexpr,
 ):
-    """The scan (_v_scan_body) of a call whose batch elements are all full."""
-    _v_scan_body(v, v_mean, gmax, S, H, VP, NB, nunits, None)
-
-
-@cute.kernel
-def v_scan_kernel_lens(
-    v: cute.Tensor,
-    v_mean: cute.Tensor,
-    gmax: cute.Tensor,
-    lens: cute.Tensor,
-    S: Int32,
-    H: Int32,
-    VP: Int32,
-    NB: Int32,
-    nunits: Int32,
-):
-    """The scan (_v_scan_body) of a call with valid prefix lengths lens [B] (int32)."""
-    _v_scan_body(v, v_mean, gmax, S, H, VP, NB, nunits, Int64(lens.iterator.toint()))
+    """The scan (_v_scan_body); with LENS the call has valid prefix lengths, int32 [B] at the address lens."""
+    _v_scan_body(v, v_mean, gmax, S, H, VP, NB, nunits, lens if LENS else None)
 
 
 @cute.kernel
@@ -252,23 +238,8 @@ def v_encode_kernel(
     VP: Int32,
     NB: Int32,
     nunits: Int32,
+    lens: Int64,
+    LENS: cutlass.Constexpr,
 ):
-    """The encode (_v_encode_body) of a call whose batch elements are all full."""
-    _v_encode_body(v, v8, v_mean, gmax, S, H, VP, NB, nunits, None)
-
-
-@cute.kernel
-def v_encode_kernel_lens(
-    v: cute.Tensor,
-    v8: cute.Tensor,
-    v_mean: cute.Tensor,
-    gmax: cute.Tensor,
-    lens: cute.Tensor,
-    S: Int32,
-    H: Int32,
-    VP: Int32,
-    NB: Int32,
-    nunits: Int32,
-):
-    """The encode (_v_encode_body) of a call with valid prefix lengths lens [B] (int32)."""
-    _v_encode_body(v, v8, v_mean, gmax, S, H, VP, NB, nunits, Int64(lens.iterator.toint()))
+    """The encode (_v_encode_body); with LENS the call has valid prefix lengths, int32 [B] at the address lens."""
+    _v_encode_body(v, v8, v_mean, gmax, S, H, VP, NB, nunits, lens if LENS else None)

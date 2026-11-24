@@ -28,7 +28,7 @@ from cutlass import Arch
 from cutlass.cutlass_dsl import BaseDSL
 
 
-def _archs(*names):
+def _archs(*names: str) -> frozenset[Arch]:
     """Return the architectures of these names that the installed CuTe DSL defines."""
     return frozenset(getattr(Arch, n) for n in names if hasattr(Arch, n))
 
@@ -51,7 +51,7 @@ _FAMILY = {**{a: "tcgen05" for a in _NAMES}, **{a: "sm120" for a in _archs("sm_1
 
 
 @functools.cache
-def arch():
+def arch() -> Arch:
     """Return the architecture enum of the current compilation (NotImplementedError for a target without DeCo kernels:
     the one error a caller may answer with another implementation); cached, as the target is fixed per process."""
     a = BaseDSL._get_dsl().get_arch_enum()
@@ -61,32 +61,32 @@ def arch():
 
 
 @functools.cache
-def kernel_family():
+def kernel_family() -> str:
     """Return the kernel family of the current target, deco_attention/<family>: "tcgen05" (B200, GB300, Rubin) or
     "sm120" (warp-level MMAs: RTX PRO 6000); cached, as the target is fixed per process."""
     return _FAMILY[arch()]
 
 
-def arch_name():
+def arch_name() -> str:
     """Return the target's name without the feature suffix ("sm_100", "sm_103", "sm_107"); tcgen05 targets only."""
     return _NAMES[arch()]
 
 
-def has_k96_fp4_mma():
+def has_k96_fp4_mma() -> bool:
     return arch() in _K96_FP4_MMA
 
 
-def has_k128_fp4_mma():
+def has_k128_fp4_mma() -> bool:
     return arch() in _K128_FP4_MMA
 
 
-def has_k64_fp8_mma():
+def has_k64_fp8_mma() -> bool:
     return arch() in _K64_FP8_MMA
 
 
-def has_tmem_ld_red():
+def has_tmem_ld_red() -> bool:
     return arch() in _TMEM_LD_RED
 
 
-def has_redux_f32():
+def has_redux_f32() -> bool:
     return arch() in _REDUX_F32

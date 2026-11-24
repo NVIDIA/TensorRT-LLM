@@ -39,6 +39,7 @@ CUDA graphs:
 
 import functools
 import importlib
+from types import ModuleType
 from typing import NamedTuple
 
 import torch
@@ -61,21 +62,21 @@ class Operands(NamedTuple):
 
 
 @functools.cache
-def _family():
+def _family() -> ModuleType:
     return importlib.import_module(f".{target.kernel_family()}", __spec__.parent)
 
 
-def pv_formats():
+def pv_formats() -> tuple[str, ...]:
     """Return the PV formats of the kernels of the current target, among "fp8" and "nvfp4" (module docstring)."""
     return _family().pv_formats()
 
 
-def ranks():
+def ranks() -> tuple[int, ...]:
     """Return the compensation ranks of the current target: among constants.RANKS, always with the default rank."""
     return _family().ranks()
 
 
-def _kernel(pv, rank):
+def _kernel(pv: str | None, rank: int) -> tuple[ModuleType, str]:
     """Check pv and rank; return the target's family and the PV format of its kernel (pv, or the family's default)."""
     family = _family()
     if pv is None:
@@ -98,7 +99,7 @@ def _kernel(pv, rank):
 TENSOR_ALIGNMENT = 256
 
 
-def token_rows(x):
+def token_rows(x: torch.Tensor) -> bool:
     """Whether the tokens of x [B, S, H, HEAD_DIM] are rows of HEAD_DIM H contiguous elements at one pitch, a multiple
     of the alignment, over the batch: a contiguous tensor, or a view of the fused projection [B, S, Hq + 2 Hkv, D]."""
     return (
@@ -110,7 +111,13 @@ def token_rows(x):
     )
 
 
-def _check(shape, device, *, token_views=False, **tensors):
+def _check(
+    shape: tuple[int, ...] | None,
+    device: torch.device | None,
+    *,
+    token_views: bool = False,
+    **tensors: torch.Tensor,
+) -> tuple[tuple[int, ...], torch.device]:
     """Check that the caller's tensors (name=tensor) are BF16 tensors of one shape [B, S, H, HEAD_DIM] (shape, or that
     of the first tensor for None) without an empty dimension, contiguous (token_views: or a view whose tokens are
     rows at one pitch, token_rows), on one device (device, or that of the first tensor), at 256-byte aligned
@@ -144,14 +151,30 @@ def _check(shape, device, *, token_views=False, **tensors):
     return shape, device
 
 
-def workspace_size(batch, seq_len, heads, device="cuda", pv=None, rank=DEFAULT_RANK):
+def workspace_size(
+    batch: int,
+    seq_len: int,
+    heads: int,
+    device: torch.device | str = "cuda",
+    pv: str | None = None,
+    rank: int = DEFAULT_RANK,
+) -> int:
     """Return the bytes of workspace that one call of this shape needs on `device`, whose SM count sets the launch
     plans: the operands, the scratch of the preparation and the scratch of the attention."""
     family, pv = _kernel(pv, rank)
     return family.workspace_size(batch, seq_len, heads, device, pv, rank)
 
 
-def prepare(q, k, v, workspace, pv=None, rank=DEFAULT_RANK, rows=None, valid_seq_lens=None):
+def prepare(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    workspace: torch.Tensor,
+    pv: str | None = None,
+    rank: int = DEFAULT_RANK,
+    rows: torch.Tensor | None = None,
+    valid_seq_lens: torch.Tensor | None = None,
+) -> Operands:
     """Run the preparation: write the operands of the attention into the workspace and return them (views into it).
 
     Args:
@@ -159,12 +182,12 @@ def prepare(q, k, v, workspace, pv=None, rank=DEFAULT_RANK, rows=None, valid_seq
             at an offset of a multiple of 128 elements is): contiguous, or the slices of a fused projection
             [B, S, Hq + 2 Hkv, 128], whose tokens the kernels read in place at the projection's pitch.
         workspace: uint8 [>= workspace_size(B, S, H, device, pv, rank)] on that device, 256-byte aligned, any content.
-        rows: int32 [m] on that device, not empty: the tokens the compensation basis is estimated on.
+        rows: int32 [m] on that device at a 16-byte aligned address, not empty: the tokens the basis is estimated on.
             * None is the default draw, sample_rows(seq_len, device, rank=rank); a packed multimodal sequence passes
               sample_rows(seq_len, device, token_tags, rank), drawn on the device.
             * A caller's draw should hold at least 2 * rank tokens where the sequence has that many, the floor of the
               default draw; the kernels clamp a row outside [0, S) to the sequence.
-        valid_seq_lens: None (every batch element is full), or int32 [B] on that device.
+        valid_seq_lens: None (every batch element is full), or int32 [B] on that device at a 16-byte aligned address.
             * Batch element b has valid tokens on its first n = clamp(valid_seq_lens[b], 0, S) positions: it attends
               only its valid keys, its output rows from n on are zero, and q, k and v from n on have no influence.
             * The kernels read the tensor in place, also in the attention (it must hold until then); nothing reads it
@@ -219,7 +242,7 @@ def prepare(q, k, v, workspace, pv=None, rank=DEFAULT_RANK, rows=None, valid_seq
     return Operands(pv, rank, shape[:3], buffers, lens)
 
 
-def attention(operands, out):
+def attention(operands: Operands, out: torch.Tensor) -> torch.Tensor:
     """Run the attention on operands of prepare: fill and return out, contiguous BF16 [B, S, H, 128] on their device at
     a 256-byte aligned address."""
     if not isinstance(operands, Operands):

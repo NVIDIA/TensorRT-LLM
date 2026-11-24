@@ -30,13 +30,14 @@ Attention:
 
 import torch
 
-from ...constants import HEAD_DIM, QK_ROW_BYTES, qk_scale_atoms
+from ...constants import HEAD_DIM, QK_ROW_BYTES, key_tiles, qk_scale_atoms
+from ...runtime import Layout
 from . import launch, prep
 
 
-def layout(b, s, h, rank, nsm):
+def layout(b: int, s: int, h: int, rank: int, nsm: int) -> Layout:
     """Return the buffers of one call in workspace order, name -> (dtype, shape): the operands, then the scratch."""
-    tiles = (s + 127) // 128
+    tiles = key_tiles(s)
     atoms = qk_scale_atoms(rank)
     return {
         # operands, which the preparation writes and the attention reads. q4, k4: rows of packed E2M1, the QK channels
@@ -57,7 +58,16 @@ def layout(b, s, h, rank, nsm):
     }
 
 
-def prepare(q, k, v, rows, buffers, rank, lens=None, map_rows=False):
+def prepare(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    rows: torch.Tensor,
+    buffers: dict[str, torch.Tensor],
+    rank: int,
+    lens: torch.Tensor | None = None,
+    map_rows: bool = False,
+) -> None:
     """Run the preparation of this kernel on the buffers of a call (layout); rows, lens and map_rows as in prep.run."""
     # every buffer may hold anything on entry; only the arrival counters of a split launch must be zero when the
     # attention starts: they are zeroed here
@@ -67,6 +77,8 @@ def prepare(q, k, v, rows, buffers, rank, lens=None, map_rows=False):
     prep.run(q, k, v, rows, buffers, rank, lens, map_rows)
 
 
-def attention(buffers, o, rank, lens=None):
+def attention(
+    buffers: dict[str, torch.Tensor], o: torch.Tensor, rank: int, lens: torch.Tensor | None = None
+) -> None:
     """Run the attention of this kernel into BF16 o on the buffers that prepare filled; lens: those prepare took."""
     launch.run(buffers, o, rank, lens)

@@ -12,83 +12,40 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The scan launch of the sm_120 FP8-PV attention: one flag per (batch, head, key tile) for a non-finite V or v_mean."""
+"""The non-finite flags of the sm_120 FP8-PV attention: one int32 per (batch, head, key tile), set for a NaN in V or a
+non-finite v_mean of the tile by the V pass that writes them (the preparation zeroes the flags first) and read by the
+attention."""
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.typing import Int32, Int64
+from cutlass.cute.typing import Int32, Int64, Uint32
 
-from ...common.dsl import barrier_cta_sync
-from ...common.mem import gptr, load_invariant, load_vector, sptr
-from ..valid_len import valid_len
-from .layout import KT, NTHR
-
-SCAN_THREADS = 128
+from ...common.mem import load_invariant
+from ..ptx.fp8pv import st_global_cs_b32_pred
+from .layout import NTHR
 
 
-@cute.kernel
-def v_tile_nan_kernel(
-    v_ptr: cute.Pointer,
-    vm_ptr: cute.Pointer,
-    flags_ptr: cute.Pointer,
-    S: cutlass.Constexpr,
-    H: cutlass.Constexpr,
-    lens_ptr,
-):
-    """Scan every V byte and v_mean element once, four warps per (batch, head, key tile), and write the tile's flag.
+def e4m3_nan(w):
+    """Return a nonzero word when one of the four E4M3 bytes of w is a NaN (E4M3FN: exactly the bytes 0x7f, 0xff)."""
+    # Every masked byte is <= 127, so the add has no byte carries.
+    return ((w & Uint32(0x7F7F7F7F)) + Uint32(0x01010101)) & Uint32(0x80808080)
 
-    * Set for a NaN in V (E4M3FN: exactly the bytes 0x7f and 0xff) or a non-finite v_mean (BF16 exponent all ones).
-    * The flags are rebuilt by every call; with lengths a tile without a valid key is not read and its flag is zero.
-    """
-    tx, _, _ = cute.arch.thread_idx()
-    kt, hh, bb = cute.arch.block_idx()
-    tidx, tile, head, batch = Int32(tx), Int32(kt), Int32(hh), Int32(bb)
-    lane = tidx & 31
-    warp = tidx >> 5
-    nt = (S + KT - 1) // KT
-    bad = Int32(0)
-    vb = v_ptr.toint()
-    live = cutlass.const_expr(lens_ptr is None) or tile * KT < valid_len(lens_ptr.toint(), batch, S)
-    if live:
-        for it in cutlass.range_constexpr(8):
-            segment = tidx + it * SCAN_THREADS
-            row = tile * KT + (segment >> 3)
-            col = (segment & 7) * 16
-            if row < S:
-                vals = load_invariant(
-                    Int32, vb + Int64((batch * S + row) * H + head) * 128 + col, 4
-                )
-                for w in cutlass.range_constexpr(4):
-                    # Every masked byte is <= 127, so the add has no byte carries.
-                    bad = bad | (
-                        ((vals[w] & 0x7F7F7F7F) + 0x01010101) & Int32(0x80808080 - (1 << 32))
-                    )
-        # the tile's 8 v_mean rows (2 KB): one 16-byte chunk per thread; a BF16 half with exponent bits 0x7F80 is
-        # non-finite, and its masked value plus 0x80 sets bit 15 (no carry between the halves)
-        mrow = (batch * H + head) * (8 * nt) + tile * 8 + (tidx >> 4)
-        mvals = load_invariant(Int32, vm_ptr.toint() + Int64(mrow) * 256 + (tidx & 15) * 16, 4)
-        for w in cutlass.range_constexpr(4):
-            bad = bad | (((mvals[w] & 0x7F807F80) + 0x00800080) & Int32(0x80008000 - (1 << 32)))
-    bad = Int32(cute.arch.vote_any_sync(bad != 0))
-    sp = cute.arch.get_dyn_smem(cutlass.Int32, alignment=16)
-    sa = Int32(sp.toint())
-    if lane == 0:
-        cute.arch.store(sptr(Int32, sa + warp * 4), bad)
-    barrier_cta_sync(Int32(0), thread_count=SCAN_THREADS)
-    if tidx == 0:
-        vals = load_vector(sptr(Int32, sa, 16), 4)
-        bad = vals[0] | vals[1] | vals[2] | vals[3]
-        cute.arch.store(
-            gptr(Int32, flags_ptr.toint() + Int64((batch * H + head) * nt + tile) * 4), bad
-        )
+
+def bf16_nonfinite(w):
+    """Return a nonzero word when one of the two BF16 halves of w is non-finite (exponent bits 0x7F80 all set: the
+    masked half plus 0x80 sets its bit 15, without a carry between the halves)."""
+    return ((w & Uint32(0x7F807F80)) + Uint32(0x00800080)) & Uint32(0x80008000)
+
+
+def flag_tile(flags_p, bh, tile, T, bad):
+    """Set the flag of key tile `tile` of (batch, head) bh (T tiles each) when the word bad is nonzero."""
+    st_global_cs_b32_pred(flags_p + Int64(bh * T + tile) * 4, Uint32(1), Int32(bad != Uint32(0)))
 
 
 @cute.jit
-def head_v_nan(vflags, tidx, nT: cutlass.Constexpr):
+def head_v_nan(vflags, tidx, nT):
     """Return the OR of the flags of the head that this thread reads; a head with a flag set takes every MMA."""
     bad = Int32(0)
-    for part in cutlass.range_constexpr((nT + NTHR - 1) // NTHR):
-        tile = tidx + part * NTHR
-        if tile < nT:
-            bad = bad | load_invariant(Int32, vflags + Int64(tile) * 4)
+    for tile in cutlass.range(tidx, nT, NTHR, unroll=1):
+        bad = bad | load_invariant(Int32, vflags + Int64(tile) * 4)
     return bad

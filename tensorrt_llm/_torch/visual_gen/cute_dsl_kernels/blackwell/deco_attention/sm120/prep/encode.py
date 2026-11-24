@@ -23,8 +23,11 @@ from cutlass.utils import SmemAllocator
 
 from ...common.expmath import e4m3x4, f2u, pow2_ceil_448, u2f, warp_max
 from ...common.mem import gptr, load_vector, sptr, store_vector
+from .basis import bf16_f32
+from .qk_pass import TILE_SCALES
 
 ENCODE_THREADS = 256
+TILE_CHUNKS = TILE_SCALES // 8  # 8-scale chunks of a key tile
 
 
 @cute.kernel
@@ -40,6 +43,8 @@ def encode_kernel(
     nqk_cta: Int32,
     msl: Int32,
     ncta: Int32,
+    *,
+    tile_pitch: cutlass.Constexpr = None,
 ):
     tid, _, _ = cute.arch.thread_idx()
     cta, _, _ = cute.arch.block_idx()
@@ -83,18 +88,18 @@ def encode_kernel(
         cute.arch.store(gptr(Float32, score_scale_p), score_scale)
     iq = [cute.math.rcp(x) for x in gq]
     ik = [x * cute.math.rcp(prod) for x in gq]
-    # provisional BF16 scales -> UE4M3 bytes, 8 per thread-iteration
-    per_side = B * H * T * 192  # 8-element chunks per side
+    # provisional BF16 scales -> UE4M3 bytes, 8 per thread-iteration (tile_pitch: the pitch of the K' tiles from ksf_p)
+    per_side = B * H * T * TILE_CHUNKS
     nch = 2 * per_side
     for i in cutlass.range(cta * ENCODE_THREADS + tid, nch, ncta * ENCODE_THREADS, unroll=1):
         side = Int32(i >= per_side)
         li = i - side * per_side
-        atom = (li % 192) >> 6
+        atom = (li % TILE_CHUNKS) >> 6
         w = load_vector(gptr(Uint32, prov_p + Int64(i) * 16, 16), 4)
         f = [Float32(0.0)] * 8
         for e in cutlass.range_constexpr(4):
-            f[2 * e] = u2f(w[e] << Uint32(16))
-            f[2 * e + 1] = u2f(w[e] & Uint32(0xFFFF0000))
+            f[2 * e] = bf16_f32(w[e], 0)
+            f[2 * e + 1] = bf16_f32(w[e], 1)
         d = [Float32(cutlass.select_(side != 0, ik[j], iq[j])) for j in range(3)]
         db = Float32(cutlass.select_(atom == 2, d[1], d[0]))
         dc = Float32(cutlass.select_(atom == 2, d[2], d[0]))
@@ -102,5 +107,8 @@ def encode_kernel(
         hi = e4m3x4(f[4] * db, f[5] * db, f[6] * dc, f[7] * dc)
         if side == 0:
             store_vector(gptr(Uint32, qsf_p + Int64(li) * 8, 8), (lo, hi))
-        else:
+        elif cutlass.const_expr(tile_pitch is None):
             store_vector(gptr(Uint32, ksf_p + Int64(li) * 8, 8), (lo, hi))
+        else:
+            ktile = ksf_p + Int64(li // TILE_CHUNKS) * tile_pitch
+            store_vector(gptr(Uint32, ktile + (li % TILE_CHUNKS) * 8, 8), (lo, hi))

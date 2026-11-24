@@ -41,8 +41,6 @@ Landing forms:
       guarantees (anchors within +-7900 and c <= 1/16, anchor_update).
     * Subtract first (flag clear): the scores minus their block max, then the same FMA with the offset K0 + d 2^-139
       (prepare_land64_flag picks between the two behind a warp-uniform branch).
-    * Two-step (the copy of the tile loop the kernel takes for a score scale below 2^-10 or with c 2^-139 inexact):
-      a normal-domain FMA c (s - bm) + (17.5 + d), then the multiply by 2^-139 onto the grid.
 The PTX blocks (need_vote, anchor_update, rescale64_loop, block_scales2, prepare_land64_flag, land32_sum) are in
 ../ptx/nvfp4pv.py; this module holds the flow of a tile around them.
 """
@@ -70,8 +68,8 @@ MIN_SCORE_LOG2 = -6
 # Straight-line emitters (plain Python, unrolled at trace time) on a thread's scores Sacc (layout: module docstring).
 def emit_block_max(Sacc, floor):
     """Return the 16-key block maxima of the raw scores, bm[s][h] = (row g, row g + 8); the pair (t, t ^ 1) holds one
-    block. floor: None, or the lower bound of the maxima: -1e30 for a tile with keys past the sequence (scores -inf),
-    whose blocks keep a finite max; with lengths a run-time value, -1e30 for the last tile of the keys, else -inf."""
+    block. floor: None, or the lower bound of the maxima, a run-time value: -1e30 for the last tile of the keys
+    (its blocks keep a finite max with keys past the sequence, scores -inf), else -inf."""
     bm = [[None, None], [None, None]]
     for s_ in range(2):
         for h_ in range(2):
@@ -96,14 +94,13 @@ def emit_block_max(Sacc, floor):
     return bm
 
 
-def emit_p(st, Sacc, bm, ma_dst, ma_off, two_step):
+def emit_p(st, Sacc, bm, ma_dst, ma_off):
     """Emit the NVFP4 P of the tile into st.Pst (codes [4 s + 2 h + rr], scale words [8 + s]), the block sums of the
     unquantized P as the BF16 operand of the means MMA into ma_dst[ma_off] and ma_dst[ma_off + 1], and the row-sum
     update."""
     par = st.par
     P = st.Pst
     lsum = st.lsum
-    m = st.c if two_step else st.M
     sch = [None, None]
     e4 = [None, None]
     # dsh[s][h][rr]: the log2 of block (s, h, rr)'s unrounded scale over its decoded one, this lane's for s = par and
@@ -122,39 +119,29 @@ def emit_p(st, Sacc, bm, ma_dst, ma_off, two_step):
         ]
         dsh[0][h_] = [Float32(cutlass.select_(par != 0, peer[rr], own[rr])) for rr in range(2)]
         dsh[1][h_] = [Float32(cutlass.select_(par != 0, own[rr], peer[rr])) for rr in range(2)]
-    prepared = None
-    if not two_step:
-        all_scores = []
-        all_maxima = []
-        for s_ in range(2):
-            for h_ in range(2):
-                for rr in range(2):
-                    all_maxima.append(bm[s_][h_][rr])
-                    for i_ in range(4):
-                        all_scores.append(Sacc[8 * s_ + 4 * h_ + i_][2 * rr])
-                        all_scores.append(Sacc[8 * s_ + 4 * h_ + i_][2 * rr + 1])
-        prepared = prepare_land64_flag(all_scores, all_maxima, st.M, st.safe[0])
+    all_scores = []
+    all_maxima = []
+    for s_ in range(2):
+        for h_ in range(2):
+            for rr in range(2):
+                all_maxima.append(bm[s_][h_][rr])
+                for i_ in range(4):
+                    all_scores.append(Sacc[8 * s_ + 4 * h_ + i_][2 * rr])
+                    all_scores.append(Sacc[8 * s_ + 4 * h_ + i_][2 * rr + 1])
+    prepared = prepare_land64_flag(all_scores, all_maxima, st.M, st.safe[0])
     xs = []
     for h_ in range(2):
         vals = []
         offsets = []
-        kofs = [] if two_step else None
         for s_ in range(2):
             for rr in range(2):
-                if two_step:
-                    for i_ in range(4):
-                        vals.append(Sacc[8 * s_ + 4 * h_ + i_][2 * rr])
-                        vals.append(Sacc[8 * s_ + 4 * h_ + i_][2 * rr + 1])
-                    offsets.append(bm[s_][h_][rr])
-                    kofs.append(dsh[s_][h_][rr] + Float32(17.5))
-                else:
-                    gi = 4 * s_ + 2 * h_ + rr
-                    vals.extend(prepared[8 * gi : 8 * gi + 8])
-                    # the scale's shift, on the grid of the folded offset (K0 - bm M, or K0 after the subtraction)
-                    offsets.append(
-                        cute.math.fma(dsh[s_][h_][rr], u2f(0x400), prepared[64 + gi], rounding=RN)
-                    )
-        words, sums = land32_sum(vals, offsets, m, sch[h_], par, kofs)
+                gi = 4 * s_ + 2 * h_ + rr
+                vals.extend(prepared[8 * gi : 8 * gi + 8])
+                # the scale's shift, on the grid of the folded offset (K0 - bm M, or K0 after the subtraction)
+                offsets.append(
+                    cute.math.fma(dsh[s_][h_][rr], u2f(0x400), prepared[64 + gi], rounding=RN)
+                )
+        words, sums = land32_sum(vals, offsets, st.M, sch[h_], par)
         for s_ in range(2):
             for rr in range(2):
                 P[4 * s_ + 2 * h_ + rr] = words[2 * s_ + rr]
@@ -174,16 +161,14 @@ def emit_p(st, Sacc, bm, ma_dst, ma_off, two_step):
 
 
 @cute.jit
-def softmax_phase(
-    st, Sacc, masked: cutlass.Constexpr, cur_odd: cutlass.Constexpr, two_step: cutlass.Constexpr
-):
+def softmax_phase(st, Sacc, masked: cutlass.Constexpr, cur_odd: cutlass.Constexpr):
     """Run the softmax of the current tile (scores Sacc), without an MMA.
 
     * NVFP4 P into st.Pst, its means operand into st.Mlo (even tile) or st.Pst[10..11] (odd tile), the row sums.
     * An anchor move rescales O (after the burst's PV, behind a warp-uniform branch) and the even tile's pending means.
-    * masked, cur_odd "lens": a tile of a range that ends at a run-time tile; block-max floor st.mask[1], parity st.odd.
+    * masked: the block maxima have the floor st.mask[1]; cur_odd: the parity of the tile, None: the run-time st.odd.
     """
-    floor = st.mask[1] if masked == "lens" else (Float32(-1e30) if masked else None)
+    floor = st.mask[1] if masked else None
     bm = emit_block_max(Sacc, floor)
     bml = [bm[s_][h_][rr] for s_ in range(2) for h_ in range(2) for rr in range(2)]
     anchor, thr, safe, lsum = st.anchor, st.thr, st.safe, st.lsum
@@ -204,13 +189,13 @@ def softmax_phase(
     for i in cutlass.range_constexpr(64):
         O[i] = vals[i]
     Mlo = st.Mlo
-    if cutlass.const_expr(cur_odd == "lens"):
+    if cutlass.const_expr(cur_odd is None):
         if (vneed & st.odd) != 0:
             Mlo[0] = scale_bf16x2(Mlo[0], f0)
             Mlo[1] = scale_bf16x2(Mlo[1], f1)
         # the means operand of the tile, then into the place of its parity
         ma = cute.make_rmem_tensor((2,), Int32)
-        emit_p(st, Sacc, bm, ma, 0, two_step)
+        emit_p(st, Sacc, bm, ma, 0)
         for i in cutlass.range_constexpr(2):
             st.Pst[10 + i] = Int32(cutlass.select_(st.odd != 0, ma[i], st.Pst[10 + i]))
             Mlo[i] = Int32(cutlass.select_(st.odd != 0, Mlo[i], ma[i]))
@@ -220,6 +205,6 @@ def softmax_phase(
                 # the even tile's means operand waits for its partner: bring it to the new anchor
                 Mlo[0] = scale_bf16x2(Mlo[0], f0)
                 Mlo[1] = scale_bf16x2(Mlo[1], f1)
-            emit_p(st, Sacc, bm, st.Pst, 10, two_step)
+            emit_p(st, Sacc, bm, st.Pst, 10)
         else:
-            emit_p(st, Sacc, bm, Mlo, 0, two_step)
+            emit_p(st, Sacc, bm, Mlo, 0)

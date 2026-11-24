@@ -280,18 +280,18 @@ def load_q(
     q,
     bb,
     hh,
-    S: cutlass.Constexpr,
-    H: cutlass.Constexpr,
-    nT: cutlass.Constexpr,
+    S,
+    H,
+    nT,
 ):
     """Return the Q' fragments and scale words of rows g, g + 8 of warp wp in tile qt, clamped to the last query."""
     r0 = wp * 16 + g
     qi0 = qt * QT + r0
     qi1 = qi0 + 8
     if qi0 > S - 1:
-        qi0 = Int32(S - 1)
+        qi0 = S - 1
     if qi1 > S - 1:
-        qi1 = Int32(S - 1)
+        qi1 = S - 1
     qrow0 = qb + Int64((bb * S + qi0) * H + hh) * 128 + q * 4
     qrow1 = qb + Int64((bb * S + qi1) * H + hh) * 128 + q * 4
     qa = []

@@ -26,6 +26,7 @@ from cutlass.cute.typing import Int32
 from cutlass.cutlass_dsl import extract_mlir_values, new_from_mlir_values
 from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
 
+from ...constants import key_tiles
 from ..valid_len import valid_len
 
 # Work tile positions after (m_block, 0, (h, b)): of a split launch, and of the valid length in a main launch
@@ -244,7 +245,7 @@ class SplitTileScheduler(TileScheduler):
             n = valid_len(
                 lens_addr, cutlass.min(blk_coord[2], self._params.problem_shape_mhb[2] - 1), seqlen
             )
-            n_kv_live = (n + 127) // 128
+            n_kv_live = key_tiles(n)
             is_valid = is_valid & (blk_coord[0] * 256 < n) & (kv_begin < n_kv_live)
             kv_end = cutlass.min(kv_end, n_kv_live)
             # the pieces with kv_begin below n_kv_live

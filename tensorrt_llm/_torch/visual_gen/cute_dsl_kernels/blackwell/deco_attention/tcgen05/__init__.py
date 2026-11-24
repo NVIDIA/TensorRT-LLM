@@ -35,6 +35,8 @@ Calls:
     * The callers' arguments are checked by deco_attention.api, not here.
 """
 
+import torch
+
 from ..runtime import carve, num_sms, workspace_bytes
 from . import fp8pv
 from .qk import ranks
@@ -46,17 +48,27 @@ _KERNELS = {"fp8": fp8pv}
 DEFAULT_PV = "fp8"
 
 
-def pv_formats():
+def pv_formats() -> tuple[str, ...]:
     """Return the PV formats of the kernels of this family."""
     return tuple(_KERNELS)
 
 
-def workspace_size(b, s, h, device, pv, rank):
+def workspace_size(b: int, s: int, h: int, device: torch.device | str, pv: str, rank: int) -> int:
     """Return the bytes of the workspace of one call of this shape, PV format and compensation rank on `device`."""
     return workspace_bytes(_KERNELS[pv].layout(b, s, h, rank, num_sms(device)))
 
 
-def prepare(q, k, v, workspace, pv, rank, rows, valid_seq_lens=None, map_rows=False):
+def prepare(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    workspace: torch.Tensor,
+    pv: str,
+    rank: int,
+    rows: torch.Tensor,
+    valid_seq_lens: torch.Tensor | None = None,
+    map_rows: bool = False,
+) -> dict[str, torch.Tensor]:
     """Carve the buffers of a call from the workspace and fill the operands from raw q, k, v, on the current stream.
 
     rows, valid_seq_lens, map_rows: see fp8pv.prep.run (rows, lens, map_rows). Returns the buffers, name -> tensor.
@@ -68,7 +80,13 @@ def prepare(q, k, v, workspace, pv, rank, rows, valid_seq_lens=None, map_rows=Fa
     return buffers
 
 
-def attention(buffers, o, pv, rank, valid_seq_lens=None):
+def attention(
+    buffers: dict[str, torch.Tensor],
+    o: torch.Tensor,
+    pv: str,
+    rank: int,
+    valid_seq_lens: torch.Tensor | None = None,
+) -> None:
     """Run the attention on the buffers of prepare into BF16 o [B, S, H, 128], on the current stream. valid_seq_lens:
     the lengths that prepare took."""
     _KERNELS[pv].attention(buffers, o, rank, valid_seq_lens)

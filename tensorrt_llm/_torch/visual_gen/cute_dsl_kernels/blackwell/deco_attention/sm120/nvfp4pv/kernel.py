@@ -35,9 +35,9 @@ Schedule:
     * An unpaired last tile shares its means slot with the pair that ends three tiles before it: its means copy is
       deferred until the last reader of that pair has left, and completes the same full-barrier phase as its codes.
 Variants:
-    * The last tile is masked past the sequence.
-    * The score scale selects one of two copies of the tile loop at run time: the folded P landing, or the two-step
-      landing for score scales below 2^-10 or not exact on the subnormal grid.
+    * S, H and the split plan are run-time arguments: thread 0 writes the valid keys and the key range of the CTA into
+      words of shared memory, which the tile ring, the mask and the epilogue read where they need them.
+    * The last tile of the keys is masked past them.
     * The last units % nsm units (query tile, head, batch) of the grid (nsm: the SM count) run as two CTAs over half
       of the keys each; the half that finishes second merges them in key order (split_plan, epilogue_partial).
 """
@@ -48,7 +48,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.typing import Float32, Int32, Int64, Uint32
 
-from ...common.expmath import RN, bf16x2, f2u, u2f
+from ...common.expmath import bf16x2, f2u, subnormal_scale, u2f
 from ...common.mem import gptr, load_invariant, load_vector, mbar_wait, sptr, store_vector
 from ...common.state import State
 from ..ptx.nvfp4pv import (
@@ -59,7 +59,7 @@ from ..ptx.nvfp4pv import (
 )
 from ..ptx.shared import ldsm_b16_x4, ldsm_b16_x4_trans, mma_bf16, mma_nvf4
 from ..valid_len import valid_len
-from .layout import IMG_NOVM, SK_OFF, SKSF_OFF, STAGE, SV_OFF, SVM_OFF, SVSF_OFF
+from .layout import IMG_NOVM, SK_OFF, SKSF_OFF, STAGE, SV_OFF, SVM_OFF, SVSF_OFF, key_tiles
 from .softmax import softmax_phase
 
 NWARPS = 8
@@ -73,9 +73,12 @@ MEANS_STAGE = STAGE - SVM_OFF
 BAR_OFF = MEANS_OFF + 2 * MEANS_STAGE
 EBAR_OFF = BAR_OFF + 8 * NST
 CNT_OFF = EBAR_OFF + 8 * NST
-# offsets from the release counters of the arrival count of a split unit's halves and of the valid tokens (lengths)
+# offsets from the release counters of the words of the CTA: the arrival count of a split unit's halves, the valid keys
+# of its batch element, the first and the end tile of its key range
 CNT_ARRIVED = 4 * NST
 CNT_VALID = CNT_ARRIVED + 4
+CNT_FIRST = CNT_VALID + 4
+CNT_END = CNT_FIRST + 4
 SMEM_BYTES = BAR_OFF + 128
 # a thread's record of a split half: its 64 O values, two row sums and two anchors (f32); a unit's two halves
 PART_BYTES = 272
@@ -84,15 +87,10 @@ assert SMEM_BYTES <= 99 * 1024
 
 
 # ------------------------------------------------------------------------------------------------ tile ring
-def valid_keys(st):
-    """With lengths: the valid tokens of the unit's batch element, read where it is used from its word of shared
-    memory (thread 0 writes it before the first CTA barrier)."""
-    return cute.arch.load(sptr(Int32, st.cnt + CNT_VALID), Int32)
-
-
-def valid_tiles(st):
-    """With lengths: the key tiles of the unit's batch element, up to the one that holds its last valid key."""
-    return (valid_keys(st) + 127) >> 7
+def cta_word(st, off):
+    """A word of the CTA (CNT_VALID, CNT_FIRST, CNT_END), read where it is used from shared memory (thread 0 writes
+    the words before the first CTA barrier)."""
+    return cute.arch.load(sptr(Int32, st.cnt + off), Int32)
 
 
 def _arm_and_copy(dst, src, mb, vm, counted, copied):
@@ -110,7 +108,7 @@ def load_tile(st, kt, stage, initial: cutlass.Constexpr):
     """Issue the TMA copies of tile kt into stage `stage` and arm its full barrier: the codes and scales and, for an
     odd tile (the means of its pair) or the unpaired last tile, the means rows into the means slot of the stage pair.
     initial: one of the first loads of the range, into an empty ring. The barrier's byte count includes a deferred
-    means copy. stage is known at trace time, except in the last iterations of a range with lengths."""
+    means copy. stage is known at trace time, except in the last iterations of a range."""
     dst = st.smem + stage * CODE_STAGE
     mb = st.bar + 8 * stage
     src = st.img + Int64(kt) * STAGE
@@ -118,7 +116,7 @@ def load_tile(st, kt, stage, initial: cutlass.Constexpr):
     if cutlass.const_expr(not isinstance(stage, int)):
         # a refill into a stage known at run time: an odd tile with the means of its pair, the unpaired last tile
         # with its means deferred, any other even tile without
-        if ((stage & 1) == 1) | (kt == valid_tiles(st) - 1):
+        if ((stage & 1) == 1) | (kt == cta_word(st, CNT_END) - 1):
             _arm_and_copy(dst, src, mb, vm, True, False)
             if (stage & 1) == 1:
                 bulk_complete(vm, src + IMG_NOVM, MEANS_STAGE, mb)
@@ -127,7 +125,7 @@ def load_tile(st, kt, stage, initial: cutlass.Constexpr):
     elif cutlass.const_expr(stage % 2 == 1):
         _arm_and_copy(dst, src, mb, vm, True, True)
     else:
-        if kt == (valid_tiles(st) if cutlass.const_expr(st.with_lens) else st.nT) - 1:
+        if kt == cta_word(st, CNT_END) - 1:
             # The barrier counts the means bytes too. A short initial range has no older pair in the means slot and
             # copies them here; otherwise the last releaser of odd tile kt - 3, whose means the slot holds, does.
             _arm_and_copy(dst, src, mb, vm, True, initial)
@@ -135,12 +133,12 @@ def load_tile(st, kt, stage, initial: cutlass.Constexpr):
             _arm_and_copy(dst, src, mb, vm, False, False)
 
 
-def _copy_tail_means(st, s, ph, tail, stage):
-    """Copy the means rows of the unpaired last tile `tail` into the slot of those of the released tile tail - 3, all
-    reads of which finish before these bytes complete the tail's full barrier (stage: s, or its trace-time value)."""
+def _copy_tail_means(st, s, ph, tail):
+    """Copy the means rows of the unpaired last tile `tail` into the slot of those of the released tile tail - 3 (in
+    stage s), all reads of which finish before these bytes complete the tail's full barrier."""
     mbar_wait(st.ebar + 8 * s, ph)
     cute.arch.fence_proxy("async.shared", space="cta")
-    tail_stage = (stage + NST - 1) & (NST - 1)
+    tail_stage = (s + NST - 1) & (NST - 1)
     bulk_complete(
         st.smem + MEANS_OFF + (tail_stage >> 1) * MEANS_STAGE,
         st.img + Int64(tail) * STAGE + SVM_OFF,
@@ -150,41 +148,34 @@ def _copy_tail_means(st, s, ph, tail, stage):
 
 
 @cute.jit
-def release_tile(st, kt, kend: cutlass.Constexpr, stage, phase):
+def release_tile(st, kt, stage, phase):
     """This warp is done with tile kt's stage `stage` (empty-barrier phase parity `phase`): every thread fences its
     reads into the async proxy and arrives on the stage's empty mbarrier; the last of the 8 warps (elected by a shared
-    counter) waits for that phase, which has then completed, and refills the stage with tile kt + NST (below kend). No
-    warp waits for the others here. kend None: a range with lengths, which ends at the run-time tile
-    valid_tiles(st); its last iterations pass a run-time stage."""
+    counter) waits for that phase, which has then completed, and refills the stage with tile kt + NST (below the end
+    tile of the range). No warp waits for the others here."""
     s = Int32(stage)
     ph = Int32(phase)
-    by_len = kend is None
     cute.arch.fence_proxy("async.shared", space="cta")
     cute.arch.mbarrier_arrive(sptr(Int64, st.ebar + 8 * s))
     cute.arch.sync_warp()
     old = atom_add_shared_u32_elect(st.cnt + 4 * s)
     nxt = kt + NST
     if (old & 7) == 7:
-        end = valid_tiles(st) if cutlass.const_expr(by_len) else kend
+        end = cta_word(st, CNT_END)
         if nxt < end:
             mbar_wait(st.ebar + 8 * s, ph)
             cute.arch.fence_proxy("async.shared", space="cta")
             load_tile(st, nxt, stage, False)
-        elif cutlass.const_expr(by_len and (not isinstance(stage, int) or stage % 2 == 1)):
+        elif cutlass.const_expr(not isinstance(stage, int) or stage % 2 == 1):
             if (kt == end - 4) & ((end & 1) == 1):
-                _copy_tail_means(st, s, ph, end - 1, s)
-        elif cutlass.const_expr(
-            not by_len and kend == st.nT and st.nT % 2 == 1 and stage == (st.nT - 4) % NST
-        ):
-            if kt == st.nT - 4:
-                _copy_tail_means(st, s, ph, st.nT - 1, stage)
+                _copy_tail_means(st, s, ph, end - 1)
 
 
 # ------------------------------------------------------------------------------------------------ MMA bursts
 @cute.jit
 def qk_phase(st, masked: cutlass.Constexpr, pre):
-    """S = Q' K'^T of the tile at pre["sbq"] (its first B fragments preloaded in pre["bq"]); masked: the last tile, or
-    "lens": the keys from the run-time count st.mask[0] on are masked."""
+    """S = Q' K'^T of the tile at pre["sbq"] (its first B fragments preloaded in pre["bq"]); masked: the keys from the
+    run-time count st.mask[0] on are masked."""
     sb = pre["sbq"]
     # The K' scale words are loaded after the turn barrier.
     ksw = [load_vector(sptr(Int32, sb + st.ksf_lane + 512 * a, 16), 4) for a in range(3)]
@@ -201,25 +192,13 @@ def qk_phase(st, masked: cutlass.Constexpr, pre):
                 Sacc[j] = mma_nvf4(
                     Sacc[j], st.qa[a], [bfr[2 * e], bfr[2 * e + 1]], st.qsf[a], ksw[a][sidx], j & 3
                 )
-    if cutlass.const_expr(masked == "lens"):
+    if cutlass.const_expr(masked):
         for j in cutlass.range_constexpr(16):
             s_, h_, i_ = j >> 3, (j >> 2) & 1, j & 3
             for e in cutlass.range_constexpr(2):
                 bad = Int32(64 * s_ + 32 * h_ + 2 * i_ + e + 8 * st.t >= st.mask[0])
                 Sacc[j][e] = Float32(cutlass.select_(bad != 0, st.ninf, Sacc[j][e]))
                 Sacc[j][2 + e] = Float32(cutlass.select_(bad != 0, st.ninf, Sacc[j][2 + e]))
-    elif cutlass.const_expr(masked):
-        for j in cutlass.range_constexpr(16):
-            s_, h_, i_ = j >> 3, (j >> 2) & 1, j & 3
-            for e in cutlass.range_constexpr(2):
-                kc = 64 * s_ + 32 * h_ + 2 * i_ + e  # key = kc + 8 t
-                if cutlass.const_expr(kc >= st.nvalid_last):
-                    Sacc[j][e] = st.ninf
-                    Sacc[j][2 + e] = st.ninf
-                elif cutlass.const_expr(kc + 24 >= st.nvalid_last):
-                    bad = Int32(kc + 8 * st.t >= st.nvalid_last)
-                    Sacc[j][e] = Float32(cutlass.select_(bad != 0, st.ninf, Sacc[j][e]))
-                    Sacc[j][2 + e] = Float32(cutlass.select_(bad != 0, st.ninf, Sacc[j][2 + e]))
     return Sacc
 
 
@@ -291,13 +270,12 @@ def burst(
     has_qk: cutlass.Constexpr,
     has_pv: cutlass.Constexpr,
     prev_odd: cutlass.Constexpr,
-    prev_unpaired: cutlass.Constexpr,
     pre,
 ):
     """The MMA burst of iteration kt (its operands preloaded in pre): QK(kt), then PV(kt - 1) and the means MMAs of
-    the pair ending at kt - 1 (or of an unpaired last tile with zeros), back to back. With lengths the parity of a
-    tile may be known at run time only (st.odd): prev_odd "lens" is an iteration kt of parity st.odd, "last" the last
-    burst of a range whose last tile has parity st.odd."""
+    the pair ending at kt - 1, back to back. prev_odd: the parity of tile kt - 1; None: an iteration kt of the
+    run-time parity st.odd; "last": the last burst of a range whose last tile has parity st.odd (the means of an
+    unpaired last tile with zeros)."""
     Sacc = None
     if cutlass.const_expr(has_qk):
         Sacc = qk_phase(st, masked, pre)
@@ -309,118 +287,37 @@ def burst(
         vsw = [[vv[u >> 1][2 * (u & 1) + s] for s in range(2)] for u in range(4)]
         emit_pv_kstep(st, sbp, Pold, vsw, 0, pre["bv"])
         emit_pv_kstep(st, sbp, Pold, vsw, 1)
-        if cutlass.const_expr(prev_odd == "lens"):
+        if cutlass.const_expr(prev_odd is None):
             if st.odd == 0:
                 emit_means(st, pre["mbp"], [st.Mlo[0], st.Mlo[1]], [Pold[10], Pold[11]])
         elif cutlass.const_expr(prev_odd == "last"):
             hi = [Int32(cutlass.select_(st.odd != 0, Pold[10 + i], Int32(0))) for i in range(2)]
             emit_means(st, pre["mbp"], [st.Mlo[0], st.Mlo[1]], hi)
-        else:
-            if cutlass.const_expr(prev_odd):
-                emit_means(st, pre["mbp"], [st.Mlo[0], st.Mlo[1]], [Pold[10], Pold[11]])
-            if cutlass.const_expr(prev_unpaired):
-                emit_means(st, pre["mbp"], [st.Mlo[0], st.Mlo[1]], [Int32(0), Int32(0)])
+        elif cutlass.const_expr(prev_odd):
+            emit_means(st, pre["mbp"], [st.Mlo[0], st.Mlo[1]], [Pold[10], Pold[11]])
     return Sacc
 
 
 @cute.jit
-def iter_step(
-    st,
-    kt,
-    masked: cutlass.Constexpr,
-    cur_odd: cutlass.Constexpr,
-    kend: cutlass.Constexpr,
-    two_step: cutlass.Constexpr,
-    stage,
-    phase,
-):
+def iter_step(st, kt, masked: cutlass.Constexpr, cur_odd: cutlass.Constexpr, stage, phase):
     """Iteration kt (its tile in stage `stage`, full-barrier phase parity `phase`): wait for its tile, take the turn of
     the warp pair, the burst [QK(kt), PV(kt - 1)], hand the turn over, release tile kt - 1, then the softmax of tile kt
-    (while the partner warp runs its burst). iter_step_lens passes "lens", "lens", kend None and a run-time stage."""
+    (while the partner warp runs its burst). cur_odd: the parity of kt, None: the run-time parity st.odd."""
     mbar_wait(st.bar + 8 * stage, Int32(phase))
     pre = preload(st, True, True, stage)
     cute.arch.barrier(barrier_id=st.turn_wait, number_of_threads=64)
-    Sacc = burst(st, masked, True, True, "lens" if cur_odd == "lens" else not cur_odd, False, pre)
+    Sacc = burst(st, masked, True, True, None if cur_odd is None else not cur_odd, pre)
     cute.arch.barrier_arrive(barrier_id=st.turn_post, number_of_threads=64)
     wrapped = int(stage == 0) if isinstance(stage, int) else Int32(stage == 0)
-    release_tile(st, kt - 1, kend, (stage + NST - 1) & (NST - 1), phase ^ wrapped)
-    softmax_phase(st, Sacc, masked, cur_odd, two_step)
+    release_tile(st, kt - 1, (stage + NST - 1) & (NST - 1), phase ^ wrapped)
+    softmax_phase(st, Sacc, masked, cur_odd)
 
 
-@cute.jit
-def first_iteration(
-    st, k0: cutlass.Constexpr, n, masked: cutlass.Constexpr, two_step: cutlass.Constexpr
-):
-    """Start a range of n key tiles from k0 (all initial full barriers begin in relative phase zero): thread 0 issues
-    the first loads; iteration k0 is the QK burst only (warp w of a pair takes the first turn) and its softmax."""
-    if st.tidx == 0:
-        for s in cutlass.range_constexpr(NST):
-            if cutlass.const_expr(isinstance(n, int)):
-                if cutlass.const_expr(s < n):
-                    load_tile(st, Int32(k0 + s), s, True)
-            else:
-                if s < n:
-                    load_tile(st, Int32(k0 + s), s, True)
-    if cutlass.const_expr(masked == "lens"):
-        st.odd = Int32(0)
-        tile_mask(st, n == 1)
-    mbar_wait(st.bar, Int32(0))
-    pre0 = preload(st, True, False, 0)
-    barrier_turn(st.turn_wait, st.isB, "sync")
-    Sacc = burst(st, masked, True, False, False, False, pre0)
-    cute.arch.barrier_arrive(barrier_id=st.turn_post, number_of_threads=64)
-    softmax_phase(st, Sacc, masked, False, two_step)
-
-
-@cute.jit
-def cycles(
-    st, k0: cutlass.Constexpr, ncycles, kend: cutlass.Constexpr, two_step: cutlass.Constexpr
-):
-    """Run ncycles cycles of four unmasked iterations from k0 + 1 (an odd tile first), in the stages 1, 2, 3, 0."""
-    phase = Int32(0)
-    for mp in cutlass.range(ncycles, unroll=1):
-        kt = k0 + 1 + 4 * mp
-        next_phase = phase ^ 1
-        for j in cutlass.range_constexpr(4):
-            ph = next_phase if cutlass.const_expr(j == 3) else phase
-            iter_step(st, kt + j, False, j % 2 == 0, kend, two_step, (1 + j) % NST, ph)
-        phase = next_phase
-
-
-@cute.jit
-def last_burst(st, stage, prev_odd: cutlass.Constexpr, prev_unpaired: cutlass.Constexpr):
-    """The last burst of a range (last tile in the stage before `stage`): PV, means; warp w + 4 hands no turn over."""
-    pre1 = preload(st, False, True, stage)
-    cute.arch.barrier(barrier_id=st.turn_wait, number_of_threads=64)
-    burst(st, False, False, True, prev_odd, prev_unpaired, pre1)
-    barrier_turn(st.turn_post, Int32(1) - st.isB, "arrive")
-
-
-@cute.jit
-def run_range(st, k0: cutlass.Constexpr, k1: cutlass.Constexpr, two_step: cutlass.Constexpr):
-    """Run the key tiles k0..k1 - 1 (k0 a multiple of 4). Iteration kt runs the burst [QK(kt), PV(kt - 1) (+ means of
-    the pair kt - 2, kt - 1 for an odd kt - 1)] in its turn (warp w of a pair first), then the softmax of kt. The
-    last tile of the sequence (nT - 1) is masked."""
-    nT = st.nT
-    n = k1 - k0
-    first_iteration(st, k0, n, n == 1 and k1 == nT, two_step)
-    # iterations k0 + 1 .. k1 - 1: unmasked ones in cycles of four and then one by one, the masked last one apart
-    m = n - 1
-    u = m - (1 if (k1 == nT and m > 0) else 0)
-    cycles(st, k0, u // 4, k1, two_step)
-    for j in cutlass.range_constexpr(u % 4):
-        kk = k0 + 1 + 4 * (u // 4) + j
-        iter_step(st, Int32(kk), False, kk % 2 == 1, k1, two_step, kk % NST, ((kk - k0) // NST) & 1)
-    if cutlass.const_expr(m > u):
-        kk = k1 - 1
-        iter_step(st, Int32(kk), True, kk % 2 == 1, k1, two_step, kk % NST, ((kk - k0) // NST) & 1)
-    last_burst(st, k1 % NST, (k1 - 1) % 2 == 1, (k1 - 1) % 2 == 0)
-
-
-def tile_mask(st, last):
-    """The mask of a tile of a range with lengths (st.mask, read by qk_phase and softmax_phase): the valid keys of the
-    tile and the floor of its block maxima, those of the last tile of the keys when last != 0."""
-    nv = valid_keys(st)
+def tile_mask(st, kt):
+    """The mask of tile kt (st.mask, read by qk_phase and softmax_phase): its valid keys and the floor of its block
+    maxima, those of a tile with keys past the sequence for the last tile of the keys."""
+    nv = cta_word(st, CNT_VALID)
+    last = kt == (nv - 1) >> 7
     st.mask = (
         Int32(cutlass.select_(last, nv - ((nv - 1) >> 7) * 128, Int32(128))),
         Float32(cutlass.select_(last, Float32(-1e30), st.ninf)),
@@ -428,28 +325,73 @@ def tile_mask(st, last):
 
 
 @cute.jit
-def iter_step_lens(st, kt, kend, k0: cutlass.Constexpr, two_step: cutlass.Constexpr):
-    """iter_step for one of the last iterations of a range with lengths, whose stage, parity and mask are known at
-    run time: tile kt of the range from k0 to kend."""
-    stage = kt & 3
-    phase = ((kt - k0) >> 2) & 1
-    st.odd = kt & 1
-    tile_mask(st, kt == kend - 1)
-    iter_step(st, kt, "lens", "lens", None, two_step, stage, phase)
+def first_iteration(st, k0, n):
+    """Start a range of n key tiles from k0 (all initial full barriers begin in relative phase zero): thread 0 issues
+    the first loads; iteration k0 is the QK burst only (warp w of a pair takes the first turn) and its softmax."""
+    if st.tidx == 0:
+        for s in cutlass.range_constexpr(NST):
+            if s < n:
+                load_tile(st, k0 + s, s, True)
+    st.odd = Int32(0)
+    tile_mask(st, k0)
+    mbar_wait(st.bar, Int32(0))
+    pre0 = preload(st, True, False, 0)
+    barrier_turn(st.turn_wait, st.isB, "sync")
+    Sacc = burst(st, True, True, False, False, pre0)
+    cute.arch.barrier_arrive(barrier_id=st.turn_post, number_of_threads=64)
+    softmax_phase(st, Sacc, True, False)
 
 
 @cute.jit
-def run_range_lens(st, k0: cutlass.Constexpr, two_step: cutlass.Constexpr):
-    """run_range for the key tiles from k0 to the last valid one of a call with lengths, an end known at run time: the
-    up to four iterations after the cycles take their stage at run time, the last of them masked from its valid keys."""
-    n = valid_tiles(st) - k0
-    first_iteration(st, k0, n, "lens", two_step)
-    cycles(st, k0, cutlass.max(n - 2, 0) >> 2, None, two_step)
-    kend = valid_tiles(st)
+def cycles(st, k0, ncycles):
+    """Run ncycles cycles of four unmasked iterations from k0 + 1 (an odd tile first), in the stages 1, 2, 3, 0."""
+    phase = Int32(0)
+    for mp in cutlass.range(ncycles, unroll=1):
+        kt = k0 + 1 + 4 * mp
+        next_phase = phase ^ 1
+        for j in cutlass.range_constexpr(4):
+            ph = next_phase if cutlass.const_expr(j == 3) else phase
+            iter_step(st, kt + j, False, j % 2 == 0, (1 + j) % NST, ph)
+        phase = next_phase
+
+
+@cute.jit
+def iter_step_tail(st, kt, k0):
+    """iter_step for one of the last iterations of a range from k0, whose stage, parity and mask are known at run
+    time."""
+    stage = kt & 3
+    phase = ((kt - k0) >> 2) & 1
+    st.odd = kt & 1
+    tile_mask(st, kt)
+    iter_step(st, kt, True, None, stage, phase)
+
+
+@cute.jit
+def last_burst(st, stage):
+    """The last burst of a range (last tile, of parity st.odd, in the stage before `stage`): PV, means; warp w + 4
+    hands no turn over."""
+    pre1 = preload(st, False, True, stage)
+    cute.arch.barrier(barrier_id=st.turn_wait, number_of_threads=64)
+    burst(st, False, False, True, "last", pre1)
+    barrier_turn(st.turn_post, Int32(1) - st.isB, "arrive")
+
+
+@cute.jit
+def run_range(st):
+    """Run the key tiles of the CTA, from its first tile (a multiple of 4) to its end tile. Iteration kt runs the burst
+    [QK(kt), PV(kt - 1) (+ means of the pair kt - 2, kt - 1 for an odd kt - 1)] in its turn (warp w of a pair first),
+    then the softmax of kt. The up to four iterations after the cycles take their stage at run time; the last tile of
+    the keys is masked from its valid keys."""
+    k0 = cta_word(st, CNT_FIRST)
+    n = cta_word(st, CNT_END) - k0
+    first_iteration(st, k0, n)
+    cycles(st, k0, cutlass.max(n - 2, 0) >> 2)
+    k0 = cta_word(st, CNT_FIRST)
+    kend = cta_word(st, CNT_END)
     for kk in cutlass.range(k0 + 1 + 4 * (cutlass.max(kend - k0 - 2, 0) >> 2), kend, unroll=1):
-        iter_step_lens(st, kk, kend, k0, two_step)
+        iter_step_tail(st, kk, k0)
     st.odd = (kend - 1) & 1
-    last_burst(st, kend & 3, "last", False)
+    last_burst(st, kend & 3)
 
 
 # ------------------------------------------------------------------------------------------------ attention kernel
@@ -462,11 +404,11 @@ def attn_kernel(
     img_ptr: cute.Pointer,
     o_ptr: cute.Pointer,
     ws_ptr: cute.Pointer,
-    S: cutlass.Constexpr,
-    H: cutlass.Constexpr,
-    NFULL: cutlass.Constexpr,
-    RSPLIT: cutlass.Constexpr,
-    KMID: cutlass.Constexpr,
+    S: Int32,
+    H: Int32,
+    NFULL: Int32,
+    RSPLIT: Int32,
+    KMID: Int32,
     lens_ptr,
 ):
     """One work unit per CTA, NTHREADS threads: thread (warp, g, t) holds the query rows 16 warp + g and + 8 of the
@@ -474,19 +416,17 @@ def attn_kernel(
     the split units' partials and arrival counters. lens_ptr: None, or the valid prefix lengths: the keys of the
     unit's batch element then end at its length (the tiles after the one that holds it are not run), and the query
     rows from there on are zero in o."""
-    nT = (S + 127) // 128
-    nvalid_last = S - (nT - 1) * 128
+    nT = key_tiles(S)
 
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
-    # work unit (query tile, head, batch) of this CTA; the last RSPLIT units run as two key halves (part 1, 2)
+    # work unit (query tile, head, batch) of this CTA; the units from NFULL on run as two key halves (part 1, 2)
     unit = bidx
     part = Int32(0)
-    if cutlass.const_expr(RSPLIT > 0):
-        if bidx >= NFULL:
-            j = bidx - NFULL
-            unit = NFULL + (j >> 1)
-            part = 1 + (j & 1)
+    if bidx >= NFULL:
+        j = bidx - NFULL
+        unit = NFULL + (j >> 1)
+        part = 1 + (j & 1)
     qt = unit % nT
     hh = (unit // nT) % H
     bb = unit // (nT * H)
@@ -508,9 +448,18 @@ def attn_kernel(
             cute.arch.mbarrier_init(sptr(Int64, ebar + 8 * s), NTHREADS)
             cute.arch.store(sptr(Int32, cnt + 4 * s), Int32(0))
         cute.arch.mbarrier_init_fence()
-        if cutlass.const_expr(lens_ptr is not None):
-            # the valid tokens of the unit's batch element, for valid_keys
-            cute.arch.store(sptr(Int32, cnt + CNT_VALID), valid_len(lens_ptr.toint(), bb, S))
+        # the words of the CTA: the keys end at the valid length; a split unit whose keys end in its first half runs
+        # in its first CTA alone
+        nv = valid_len(None if cutlass.const_expr(lens_ptr is None) else lens_ptr.toint(), bb, S)
+        vt = key_tiles(nv)
+        cute.arch.store(sptr(Int32, cnt + CNT_VALID), nv)
+        cute.arch.store(
+            sptr(Int32, cnt + CNT_FIRST), Int32(cutlass.select_(part == 2, KMID, Int32(0)))
+        )
+        cute.arch.store(
+            sptr(Int32, cnt + CNT_END),
+            Int32(cutlass.select_((part == 1) & (vt > KMID), KMID, vt)),
+        )
     cute.arch.sync_threads()
 
     # ---------------------------------------------------------------- per-thread fragment addressing
@@ -560,7 +509,7 @@ def attn_kernel(
     c = load_invariant(Float32, score_scale_ptr.toint())
     vscale = load_invariant(Float32, vs_ptr.toint())
     # c * 2^-139: a subnormal multiplier (exact for a power-of-two c >= 2^-10)
-    M = cute.math.mul(c, u2f(0x400), rounding=RN)
+    M = subnormal_scale(c)
     ninf = Float32(-math.inf)
 
     # ---------------------------------------------------------------- accumulators and softmax state (registers)
@@ -597,8 +546,6 @@ def attn_kernel(
         turn_wait=turn_wait,
         turn_post=turn_post,
         img=img,
-        nT=nT,
-        with_lens=lens_ptr is not None,
         S=S,
         H=H,
         bb=bb,
@@ -608,7 +555,7 @@ def attn_kernel(
         vscale=vscale,
         o_base=o_ptr.toint(),
         ws=ws_ptr.toint(),
-        cnt_g=ws_ptr.toint() + RSPLIT * RECORD_BYTES,
+        cnt_g=ws_ptr.toint() + Int64(RSPLIT) * RECORD_BYTES,
         tidx=tidx,
         t=t,
         par=par,
@@ -620,7 +567,6 @@ def attn_kernel(
         vm_mh=vm_mh,
         qa=qa,
         qsf=qsf,
-        nvalid_last=nvalid_last,
         ninf=ninf,
         c=c,
         M=M,
@@ -633,18 +579,15 @@ def attn_kernel(
         safe=safe,
     )
 
-    # The folded landing needs c * 2^-139 exact: detect rounded-away bits here, without reading device data on the
-    # host, and take the two-step copy of the tile loop for them.
-    restored_c = cute.math.mul(
-        cute.math.mul(M, u2f(0x7F000000), rounding=RN), Float32(4096.0), rounding=RN
-    )
-    # with lengths: a unit with a valid query row runs, any other unit stores zeros
-    if cutlass.const_expr(lens_ptr is None) or qt * 128 < valid_keys(st):
-        if (c < Float32(2.0**-10)) | (restored_c != c):
-            run_dispatch(st, part, unit, NFULL, RSPLIT, KMID, True)
+    # A CTA with keys runs them; with lengths only a unit with a valid query row, any other unit stores zeros.
+    if (qt * 128 < cta_word(st, CNT_VALID)) & (cta_word(st, CNT_FIRST) < cta_word(st, CNT_END)):
+        run_range(st)
+        # all keys of the unit, or one half of a split unit (part 1: the tiles below KMID, part 2: the others)
+        if (part == 0) | (key_tiles(cta_word(st, CNT_VALID)) <= KMID):
+            epilogue_final(st)
         else:
-            run_dispatch(st, part, unit, NFULL, RSPLIT, KMID, False)
-    elif part != 2:
+            epilogue_partial(st, unit - NFULL, part)
+    elif (part != 2) & (qt * 128 >= cta_word(st, CNT_VALID)):
         # a unit without a valid query row: zeros, by its only CTA or by the first of its two
         for rr in cutlass.range_constexpr(2):
             row = row_g + 8 * rr
@@ -652,50 +595,6 @@ def attn_kernel(
                 ob = o_ptr.toint() + Int64((bb * S + row) * H + hh) * 256 + 4 * t
                 for jc in cutlass.range_constexpr(16):
                     cute.arch.store(gptr(Uint32, ob + 16 * jc), Uint32(0))
-
-
-@cute.jit
-def run_dispatch(
-    st,
-    part,
-    unit,
-    NFULL: cutlass.Constexpr,
-    RSPLIT: cutlass.Constexpr,
-    KMID: cutlass.Constexpr,
-    two_step: cutlass.Constexpr,
-):
-    """The key range of this CTA and its epilogue: all tiles of a full unit (part 0), or one half of a split unit
-    (part 1: the tiles below KMID, part 2: the others)."""
-    nT = st.nT
-    if cutlass.const_expr(st.with_lens):
-        # The keys end at tile valid_tiles(st). A split unit whose keys end in its first half runs in its first CTA
-        # alone.
-        whole = Int32(part == 0)
-        if cutlass.const_expr(RSPLIT > 0):
-            whole = whole | (Int32(part == 1) & Int32(valid_tiles(st) <= KMID))
-        if whole != 0:
-            run_range_lens(st, 0, two_step)
-            epilogue_final(st)
-        elif cutlass.const_expr(RSPLIT > 0):
-            if valid_tiles(st) > KMID:
-                if part == 1:
-                    run_range(st, 0, KMID, two_step)
-                else:
-                    run_range_lens(st, KMID, two_step)
-                epilogue_partial(st, unit - NFULL, part)
-    elif cutlass.const_expr(RSPLIT == 0):
-        run_range(st, 0, nT, two_step)
-        epilogue_final(st)
-    else:
-        if part == 0:
-            run_range(st, 0, nT, two_step)
-            epilogue_final(st)
-        else:
-            if part == 1:
-                run_range(st, 0, KMID, two_step)
-            else:
-                run_range(st, KMID, nT, two_step)
-            epilogue_partial(st, unit - NFULL, part)
 
 
 # ------------------------------------------------------------------------------------------------ epilogues
@@ -708,16 +607,14 @@ def row_sum(st, rr):
 
 @cute.jit
 def store_o(st, word):
-    """Store the thread's 16 words word(rr, jc) of each of its two rows of o, zeros for a row from the valid length."""
+    """Store the thread's 16 words word(rr, jc) of each of its two rows of o, zeros for a row from the valid keys on."""
     rows = [st.row_g, st.row_g8]
-    nv = valid_keys(st) if cutlass.const_expr(st.with_lens) else None
+    nv = cta_word(st, CNT_VALID)
     for rr in cutlass.range_constexpr(2):
         if rows[rr] < st.S:
             ob = st.o_base + Int64((st.bb * st.S + rows[rr]) * st.H + st.hh) * 256 + 4 * st.t
             for jc in cutlass.range_constexpr(16):
-                w = word(rr, jc)
-                if cutlass.const_expr(st.with_lens):
-                    w = Uint32(cutlass.select_(rows[rr] < nv, w, Uint32(0)))
+                w = Uint32(cutlass.select_(rows[rr] < nv, word(rr, jc), Uint32(0)))
                 cute.arch.store(gptr(Uint32, ob + 16 * jc), w)
 
 

@@ -22,18 +22,22 @@
 * Each (device, compensation rank, cluster shape, launch kind) compiles once per process.
 """
 
+from collections.abc import Callable
+
+import cuda.bindings.driver as cuda
 import cutlass
 import torch
 from cutlass.cute.typing import Int32, Int64
 
-from ...runtime import compiled, current_stream, gmem_ptr, num_sms, pdl_enabled
+from ...constants import key_tiles
+from ...runtime import Layout, compiled, current_stream, gmem_ptr, num_sms, pdl_enabled
 from .kernel import PingPongAttention
 
 
-def split_plan(s, h, b, sm_count):
+def split_plan(s: int, h: int, b: int, sm_count: int) -> tuple[int, int, int]:
     """Return (work units, units of the main launch, KV pieces per unit of the split launch) at this shape."""
     n_units = ((s + 255) // 256) * h * b
-    n_kv = (s + 127) // 128
+    n_kv = key_tiles(s)
     n_full = (n_units // sm_count) * sm_count
     rem = n_units - n_full
     n_parts = 1
@@ -46,7 +50,7 @@ def split_plan(s, h, b, sm_count):
     return n_units, n_full, n_parts
 
 
-def scratch(b, s, h, sm_count):
+def scratch(b: int, s: int, h: int, sm_count: int) -> Layout:
     """Return the merge scratch of the split launch at this shape, name -> (dtype, shape); empty without one.
 
     A merge slot is a (tail unit, KV piece, O tile) triple. The pieces write its unnormalized O rows and (anchor, row
@@ -67,7 +71,17 @@ def scratch(b, s, h, sm_count):
 _compiled = {}
 
 
-def _get_compiled(args, device, sm_count, rank, cluster_m, *, split, pdl, lens):
+def _get_compiled(
+    args: tuple,
+    device: torch.device,
+    sm_count: int,
+    rank: int,
+    cluster_m: int,
+    *,
+    split: bool,
+    pdl: bool,
+    lens: bool,
+) -> Callable:
     return compiled(
         _compiled,
         (device.index, sm_count, rank, cluster_m, split, pdl, lens),
@@ -79,8 +93,21 @@ def _get_compiled(args, device, sm_count, rank, cluster_m, *, split, pdl, lens):
 
 
 def _make_args(
-    qk_ptrs, v, v_mean, o, s, h, b, score_scale, v_scale, lens, stream, n_full, n_parts=1, ws=None
-):
+    qk_ptrs: tuple,
+    v: torch.Tensor,
+    v_mean: torch.Tensor,
+    o: torch.Tensor,
+    s: int,
+    h: int,
+    b: int,
+    score_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    lens: torch.Tensor | None,
+    stream: cuda.CUstream,
+    n_full: int,
+    n_parts: int = 1,
+    ws: tuple[torch.Tensor, ...] | None = None,
+) -> tuple:
     return (
         qk_ptrs,
         gmem_ptr(cutlass.Float8E4M3FN, v),
@@ -102,7 +129,9 @@ def _make_args(
 
 
 @torch.no_grad()
-def run(buffers, o, rank, lens=None):
+def run(
+    buffers: dict[str, torch.Tensor], o: torch.Tensor, rank: int, lens: torch.Tensor | None = None
+) -> None:
     """Run the NVFP4 Q'K' + FP8 PV attention on the operands of the preparation into BF16 o [B, S, H, 128].
 
     * buffers: the buffers of the call, the layout of this package. score_scale is the multiplier of the raw scores

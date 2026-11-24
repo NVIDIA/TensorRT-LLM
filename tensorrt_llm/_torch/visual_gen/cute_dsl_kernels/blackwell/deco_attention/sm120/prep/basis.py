@@ -980,6 +980,14 @@ def key_count(k0, n):
     return cutlass.max(cutlass.min(n - k0, 16), 0)
 
 
+def tile_live(tl, S, H, T, lens_p):
+    """Whether V tile tl (flat over (batch, head, tile)) holds a valid key: every tile without lens_p."""
+    if lens_p is None:
+        return True
+    bh = tl // T
+    return (tl - bh * T) * 128 < valid_len(lens_p, bh // H, S)
+
+
 def tok_addr(p, bb, row, hh, S, pitch):
     """Global address of the row of token `row` of (batch bb, head hh) of a raw [B, S, H, 128] BF16 tensor at p whose
     tokens are `pitch` bytes apart (256 H for a contiguous tensor, the row of the fused projection for a view)."""
@@ -1006,8 +1014,8 @@ def group16(base, rstride, cnt):
         ok = Int32(kk < cnt)
         w = ld_global_nc_b32_hint_pred(base + rstride * kk, ok, "evict_last", 4)
         for e in range(4):
-            lo_ = u2f(w[e] << Uint32(16))
-            hi_ = u2f(w[e] & Uint32(0xFFFF0000))
+            lo_ = bf16_f32(w[e], 0)
+            hi_ = bf16_f32(w[e], 1)
             sums[2 * e] = sums[2 * e] + lo_
             sums[2 * e + 1] = sums[2 * e + 1] + hi_
             vmx[2 * e] = cute.arch.fmax(
@@ -1028,9 +1036,8 @@ def group16(base, rstride, cnt):
 def stage_rows(v_p, vin, tid_h, tl, S, H, VP, T, lens_p=None):
     """cp.async of the 128 x 256 B rows of V tile tl (flat over (batch, head, tile)) into the shared-memory buffer
     vin by the 256 threads of a V-pass half, thread tid_h eight of the 16-byte parts: row `key` at key * 256, its part p
-    at (p ^ (key >> 4)) % 16 (zeros for the keys past S; lens_p: the global address of the valid prefix lengths, the
-    keys from the length of the batch element on are then zeros too). VP: the bytes between consecutive tokens of
-    V."""
+    at (p ^ (key >> 4)) % 16. The keys past S are zeros, and with lens_p (the global address of the valid prefix
+    lengths) those from the length of the batch element on. VP: the bytes between consecutive tokens of V."""
     bh = tl // T
     tt = tl - bh * T
     bb = bh // H
@@ -1047,6 +1054,104 @@ def stage_rows(v_p, vin, tid_h, tl, S, H, VP, T, lens_p=None):
             src,
             Int32(Uint32(cutlass.select_(kg < nk, Uint32(16), Uint32(0)))),
         )
+
+
+@cute.jit
+def vscan_tiles(v_p, done_p, S, H, VP, T, ntiles, tid, sb, lens_p, lane_map, fold):
+    """Scan the 128-key tiles that the claim counter of the done buffer hands out (flat over (batch, head, tile)) for
+    max|v - vbar|, four tiles at a time. lane_map(u): the (16-key group, 8-channel chunk) of thread u of a tile;
+    fold(sums, vmx, vmn, cnt, mx): mx raised by the group of the lane (group16), by the mean of the PV format. The
+    CTA's maximum and its tile count go to the done buffer (publish_scan)."""
+    grp, cc = lane_map(tid & 127)
+    sub4 = tid >> 7
+    rstride = Int64(VP)
+    mx = Float32(0.0)
+    scanned = Int32(0)
+    t4 = next_scan_tiles(sb, done_p, tid)
+    while t4 < ntiles:
+        tile = t4 + sub4
+        tv = Int32(tile < ntiles)
+        tile = cutlass.min(tile, ntiles - 1)
+        bh = tile // T
+        tt = tile - bh * T
+        bb = bh // H
+        hh = bh - bb * H
+        k0 = tt * 128 + 16 * grp
+        nk = valid_len(lens_p, bb, S)
+        cnt = key_count(k0, nk) * tv
+        base = tok_addr(v_p, bb, cutlass.min(k0, S - 1), hh, S, VP) + Int64(cc * 16)
+        # with lengths: a tile without a valid key is skipped
+        live = cutlass.const_expr(lens_p is None) or tt * 128 < nk
+        if live:
+            sums, vmx, vmn = group16(base, rstride, cnt)
+            mx = fold(sums, vmx, vmn, cnt, mx)
+        scanned = scanned + cutlass.min(Int32(4), ntiles - t4)
+        t4 = next_scan_tiles(sb, done_p, tid)
+    publish_scan(mx, scanned, tid, sb, done_p)
+
+
+@cute.jit
+def vpass_tiles(v_p, done_p, S, H, VP, T, ntiles, tid, sb, lens_p, encode):
+    """Run the tile loop of a V pass in the basis launch: a counter hands out the tiles in descending order to two
+    256-thread halves per CTA; thread = (16-key group, 4-channel quad), the 8 groups of a quad in lanes 8 j .. 8 j + 7.
+    A tile with a valid key goes through the buffer of its half (stage_rows; the next tile is staged while this one
+    is encoded), then encode(wv, sv, tile, bh, tt, k0, cnt, nk, tid_h) of the PV format works on the thread's 16 x 2
+    words wv and their four sums sv; k0, cnt: the first key of its group and its keys below nk, the valid keys of the
+    batch element."""
+    half = tid >> 8
+    tid_h = tid & 255
+    grp = tid_h & 7
+    cq = tid_h >> 3
+    vin = sb + half * VIN_BYTES  # next-tile input, rows of 256 B, 16-byte part ^ (row >> 4)
+    word = sb + SM_RED + RED_TILE + half * 4
+    ctr = done_p + DONE_TILES
+    tix = next_tile(word, ctr, tid_h, half)
+    if tix < ntiles:
+        tl = ntiles - 1 - tix
+        if tile_live(tl, S, H, T, lens_p):
+            stage_rows(v_p, vin, tid_h, tl, S, H, VP, T, lens_p)
+    cute.arch.cp_async_commit_group()
+    cute.arch.barrier(barrier_id=1 + half, number_of_threads=256)
+    nix = next_tile(word, ctr, tid_h, half)
+    while tix < ntiles:
+        tile = ntiles - 1 - tix
+        bh = tile // T
+        tt = tile - bh * T
+        k0 = tt * 128 + 16 * grp
+        nk = valid_len(lens_p, bh // H, S)
+        cnt = key_count(k0, nk)
+        cute.arch.cp_async_wait_group(0)
+        cute.arch.barrier(barrier_id=1 + half, number_of_threads=256)
+        live = cutlass.const_expr(lens_p is None) or tt * 128 < nk
+        wv = cute.make_rmem_tensor((32,), Uint32)
+        sv = cute.make_rmem_tensor((4,), Float32)
+        if live:
+            sums = [Float32(0.0)] * 4
+            for kk in cutlass.range_constexpr(16):
+                w = load_vector(
+                    sptr(
+                        Uint32,
+                        vin + (16 * grp + kk) * 256 + (((cq >> 1) ^ grp) * 16) + (cq & 1) * 8,
+                        8,
+                    ),
+                    2,
+                )
+                for e in cutlass.range_constexpr(2):
+                    wv[kk * 2 + e] = w[e]
+                    sums[2 * e] = sums[2 * e] + bf16_f32(w[e], 0)
+                    sums[2 * e + 1] = sums[2 * e + 1] + bf16_f32(w[e], 1)
+            for e in cutlass.range_constexpr(4):
+                sv[e] = sums[e]
+        cute.arch.barrier(barrier_id=1 + half, number_of_threads=256)
+        if nix < ntiles:
+            tl = ntiles - 1 - nix
+            if tile_live(tl, S, H, T, lens_p):
+                stage_rows(v_p, vin, tid_h, tl, S, H, VP, T, lens_p)
+        cute.arch.cp_async_commit_group()
+        if live:
+            encode(wv, sv, tile, bh, tt, k0, cnt, nk, tid_h)
+        tix = nix
+        nix = next_tile(word, ctr, tid_h, half)
 
 
 # ------------------------------------------------------------------------------------------------ launch body

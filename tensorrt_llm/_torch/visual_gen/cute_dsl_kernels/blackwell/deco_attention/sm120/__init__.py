@@ -35,6 +35,8 @@ Calls:
       capture into a CUDA graph. deco_attention.api checks the arguments of the callers, not this package.
 """
 
+import torch
+
 from ..constants import DEFAULT_RANK
 from ..runtime import carve, num_sms, workspace_bytes
 from . import fp8pv, nvfp4pv
@@ -46,22 +48,32 @@ _KERNELS = {"fp8": fp8pv, "nvfp4": nvfp4pv}
 DEFAULT_PV = "nvfp4"
 
 
-def pv_formats():
+def pv_formats() -> tuple[str, ...]:
     """Return the PV formats of the kernels of this family."""
     return tuple(_KERNELS)
 
 
-def ranks():
+def ranks() -> tuple[int, ...]:
     """Return the compensation ranks of the kernels of this family: the default rank alone."""
     return (DEFAULT_RANK,)
 
 
-def workspace_size(b, s, h, device, pv, rank):
+def workspace_size(b: int, s: int, h: int, device: torch.device | str, pv: str, rank: int) -> int:
     """Return the bytes of the workspace of one call of this shape with the kernel of PV format pv on `device`."""
     return workspace_bytes(_KERNELS[pv].layout(b, s, h, num_sms(device)))
 
 
-def prepare(q, k, v, workspace, pv, rank, rows, valid_seq_lens=None, map_rows=False):
+def prepare(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    workspace: torch.Tensor,
+    pv: str,
+    rank: int,
+    rows: torch.Tensor,
+    valid_seq_lens: torch.Tensor | None = None,
+    map_rows: bool = False,
+) -> dict[str, torch.Tensor]:
     """Return the buffers of the call (name -> tensor, views into the workspace), filled from raw BF16 q, k, v.
 
     Args:
@@ -78,6 +90,12 @@ def prepare(q, k, v, workspace, pv, rank, rows, valid_seq_lens=None, map_rows=Fa
     return buffers
 
 
-def attention(buffers, o, pv, rank, valid_seq_lens=None):
+def attention(
+    buffers: dict[str, torch.Tensor],
+    o: torch.Tensor,
+    pv: str,
+    rank: int,
+    valid_seq_lens: torch.Tensor | None = None,
+) -> None:
     """Write BF16 o [B, S, H, 128] from the buffers of prepare, with the lengths prepare took, on the current stream."""
     _KERNELS[pv].attention(buffers, o, valid_seq_lens)

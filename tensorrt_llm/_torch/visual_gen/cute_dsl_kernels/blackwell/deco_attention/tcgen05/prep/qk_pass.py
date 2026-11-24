@@ -793,9 +793,11 @@ def qk_kernel(
     H: Int32,
     NB: Int32,
     ntiles: Int32,
+    lens: Int64,
     RANK: cutlass.Constexpr,
+    LENS: cutlass.Constexpr,
 ):
-    """Run the Q'/K' pass (_qk_body) of a call whose batch elements are all full."""
+    """Run the Q'/K' pass (_qk_body); with LENS the call has valid prefix lengths, int32 [B] at the address lens."""
     _qk_body(
         tiled_mma,
         tma_q,
@@ -812,45 +814,5 @@ def qk_kernel(
         NB,
         ntiles,
         RANK,
-        None,
-    )
-
-
-@cute.kernel
-def qk_kernel_lens(
-    tiled_mma: cute.TiledMma,
-    tma_q: cpasync.TmaInfo,
-    tma_k: cpasync.TmaInfo,
-    hadamard: cute.Tensor,
-    uT: cute.Tensor,
-    q4: cute.Tensor,
-    k4: cute.Tensor,
-    q_sfv: cute.Tensor,
-    k_sfv: cute.Tensor,
-    gmax: cute.Tensor,
-    lens: cute.Tensor,
-    S: Int32,
-    H: Int32,
-    NB: Int32,
-    ntiles: Int32,
-    RANK: cutlass.Constexpr,
-):
-    """Run the Q'/K' pass (_qk_body) of a call with valid prefix lengths lens, int32 [B]."""
-    _qk_body(
-        tiled_mma,
-        tma_q,
-        tma_k,
-        hadamard,
-        uT,
-        q4,
-        k4,
-        q_sfv,
-        k_sfv,
-        gmax,
-        S,
-        H,
-        NB,
-        ntiles,
-        RANK,
-        Int64(lens.iterator.toint()),
+        lens if LENS else None,
     )

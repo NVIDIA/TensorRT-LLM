@@ -14,144 +14,31 @@
 # limitations under the License.
 """Host entry of the preparation of the sm_120 NVFP4-PV kernel: raw BF16 q, k, v into the operands of kernel.py.
 
-Launches on the current stream, by one host function per device and chain form (shared host side: ../prep/chain.py):
-    * Basis launch (prep/basis.py with the V scan of v_pass.py): per (batch, head) the Gram matrices of the sampled q
-      and k tokens and their top-32 eigenvectors; the other CTAs scan V for max|v - vbar| and, when the launch has
-      room for it, run the V pass. Otherwise the V pass is its own launch (v_pass.v_kernel).
-    * Q'/K' pass (qk_pass.py): rotation, NVFP4 body and compensation channels, provisional block scales, group maxima.
-    * Encode launch (encode.py): group scales, the score-scale floor, score_scale, UE4M3 block scales.
-Every launch takes the shape at run time, so each of the two forms of the chain (the V pass in the basis launch or on
-its own) compiles once.
+The chain of ../prep/chain.py (make_host: its launches) with the V scan and V pass of this kernel (v_pass.py); K', V',
+their scales and the means go to the tile images of the attention (layout.py).
 """
 
-import cuda.bindings.driver as cuda
-import cutlass
-import cutlass.cute as cute
-from cutlass import Int32, Int64
+import torch
 
 from ..prep import chain
-from ..prep.basis import EIG_THREADS
-from ..prep.encode import ENCODE_THREADS, encode_kernel
-from ..prep.qk_pass import QK_THREADS, qk_kernel
+from .layout import SK_OFF, SKSF_OFF, STAGE
 from .softmax import MIN_SCORE_LOG2
 from .v_pass import V_THREADS, basis_kernel, v_kernel
 
-
-@cute.jit
-def _host(
-    q_p: Int64,
-    k_p: Int64,
-    v_p: Int64,
-    rows_p: Int64,
-    had_p: Int64,
-    q4_p: Int64,
-    k4_p: Int64,
-    qsf_p: Int64,
-    ksf_p: Int64,
-    score_scale_p: Int64,
-    v4_p: Int64,
-    v4sf_p: Int64,
-    vmean_p: Int64,
-    v4s_p: Int64,
-    ut_p: Int64,
-    vmax_p: Int64,
-    gmax_p: Int64,
-    prov_p: Int64,
-    done_p: Int64,
-    lens_p: Int64,
-    B: Int32,
-    S: Int32,
-    H: Int32,
-    QP: Int32,
-    KP: Int32,
-    VP: Int32,
-    NQK: Int32,
-    T: Int32,
-    msl: Int32,
-    nspare: Int32,
-    nqk_items: Int32,
-    nqk_cta: Int32,
-    nv_items: Int32,
-    nv_cta: Int32,
-    nenc_cta: Int32,
-    rows_mode: Int32,
-    stream: cuda.CUstream,
-    FUSED: cutlass.Constexpr,
-    LENS: cutlass.Constexpr,
-):
-    # LENS: the call has valid prefix lengths (int32 [B] at lens_p, read by the kernels in place; rows_mode: the
-    # rows mode of the eigensolver, prep/basis.py); otherwise both are unused and the kernels take None
-    lens_p = lens_p if cutlass.const_expr(LENS) else None
-    rows_mode = rows_mode if cutlass.const_expr(LENS) else None
-    BH = B * H
-    basis_kernel(
-        q_p,
-        k_p,
-        v_p,
-        rows_p,
-        had_p,
-        ut_p,
-        vmax_p,
-        done_p,
-        v4_p,
-        v4sf_p,
-        vmean_p,
-        v4s_p,
-        B,
-        S,
-        H,
-        QP,
-        KP,
-        VP,
-        T,
-        NQK,
-        BH,
-        nspare,
-        FUSED,
-        lens_p,
-        rows_mode,
-    ).launch(grid=(BH + nspare, 1, 1), block=(EIG_THREADS, 1, 1), stream=stream)
-    if cutlass.const_expr(not FUSED):
-        v_kernel(
-            v_p, vmax_p, v4_p, v4sf_p, vmean_p, v4s_p, S, H, VP, T, nspare, nv_items, nv_cta, lens_p
-        ).launch(grid=(nv_cta, 1, 1), block=(V_THREADS, 1, 1), stream=stream)
-    qk_kernel(
-        q_p,
-        k_p,
-        had_p,
-        ut_p,
-        q4_p,
-        k4_p,
-        prov_p,
-        gmax_p,
-        B,
-        S,
-        H,
-        QP,
-        KP,
-        T,
-        nqk_items,
-        nqk_cta,
-        lens_p,
-    ).launch(grid=(nqk_cta, 1, 1), block=(QK_THREADS, 1, 1), stream=stream)
-    encode_kernel(
-        prov_p, gmax_p, qsf_p, ksf_p, score_scale_p, B, H, T, nqk_cta, msl, nenc_cta
-    ).launch(grid=(nenc_cta, 1, 1), block=(ENCODE_THREADS, 1, 1), stream=stream)
-
-
+_host = chain.make_host(basis_kernel, v_kernel, V_THREADS, 2, k_image=(SK_OFF, SKSF_OFF, STAGE))
 _compiled = {}
 
 # the buffers of a call whose addresses the host function takes after q, k, v, the rows and the rotation, in its order
 _HOST_BUFFERS = (
     "q4",
-    "k4",
+    "img",
     "q_sf",
-    "k_sf",
+    "img",
     "score_scale",
-    "v4",
-    "v4_sf",
-    "v_mean",
+    "img",
     "v4_scale",
+    None,
+    None,
     "ut",
     "vmax",
     "gmax",
@@ -164,10 +51,18 @@ _HOST_BUFFERS = (
 scratch = chain.scratch
 
 
-def run(q, k, v, rows, buffers, lens=None, map_rows=False):
+def run(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    rows: torch.Tensor,
+    buffers: dict[str, torch.Tensor],
+    lens: torch.Tensor | None = None,
+    map_rows: bool = False,
+) -> None:
     """Fill the operands of the attention kernel from raw BF16 q, k, v [B, S, H, 128], in the buffers of the call.
 
-    * Q'/K' (q4, k4, q_sf, k_sf), score_scale (floored at 2^MIN_SCORE_LOG2), V' (v4, v4_sf, v_mean, v4_scale).
+    * Q' (q4, q_sf), score_scale (floored at 2^MIN_SCORE_LOG2), K', V' and the means (img, v4_scale).
     * rows: the sampled tokens of the Q/K basis (inputs.sample_rows); lens, map_rows: as in chain.run.
     """
     chain.run(

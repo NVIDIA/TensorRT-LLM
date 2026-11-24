@@ -1317,8 +1317,8 @@ def _eig_body(qtens, ktens, rows, hadamard, uT, S, H, QP, KP, NQK, NCQ, RANK, le
     bh, _, _ = cute.arch.block_idx()
     cute.arch.griddepcontrol_launch_dependents()
     st = _eig_state(tidx, RANK)
-    # DMB/YLB hold aligned Gram operand images until TC completion. The normalized matrix is then staged in VH, whose
-    # first reflector is written only after all paired-row math threads have loaded their register tiles.
+    # dm and zb hold the aligned Gram operand images until the MMAs complete. The normalized matrix is then staged in
+    # VH, whose first reflector is written only after all paired-row math threads have loaded their register tiles.
     _gram(st, qtens, ktens, rows, bh, S, H, QP, KP, NQK, NCQ, lens)
 
     # Householder tridiagonalization: the reflectors in VH, tau, and the tridiagonal matrix (d, e)
@@ -1362,7 +1362,7 @@ def _eig_body(qtens, ktens, rows, hadamard, uT, S, H, QP, KP, NQK, NCQ, RANK, le
     cute.arch.sync_threads()
     _cluster_repair(st, span)
 
-    # back-transform: z <- H_0 ... H_125 y, then U = Hd^T Z / sqrt(128)
+    # back-transform: z <- H_0 ... H_125 z, then U = Hd^T Z / sqrt(128)
     _stage_hadamard_f32(st, hadamard)
     _reflector_pair_products(st)
     cute.arch.sync_threads()
@@ -1384,44 +1384,12 @@ def eig_kernel(
     KP: Int32,
     NQK: Int32,
     NCQ: Int32,
+    lens: Int64,
     RANK: cutlass.Constexpr,
+    LENS: cutlass.Constexpr,
 ):
-    """Run the eigensolver CTA (_eig_body) of a call whose batch elements are all full: rows [NQK] are tokens."""
-    _eig_body(qtens, ktens, rows, hadamard, uT, S, H, QP, KP, NQK, NCQ, RANK, None)
-
-
-@cute.kernel
-def eig_kernel_lens(
-    qtens: cute.Tensor,
-    ktens: cute.Tensor,
-    rows: cute.Tensor,
-    hadamard: cute.Tensor,
-    uT: cute.Tensor,
-    lens: cute.Tensor,
-    S: Int32,
-    H: Int32,
-    QP: Int32,
-    KP: Int32,
-    NQK: Int32,
-    NCQ: Int32,
-    RANK: cutlass.Constexpr,
-    ROWS_PER_SAMPLE: cutlass.Constexpr,
-    MAP_ROWS: cutlass.Constexpr,
-):
-    """Run the eigensolver CTA (_eig_body) of a call with valid prefix lengths lens, int32 [B]: rows is [B, NQK] with
-    ROWS_PER_SAMPLE, else [NQK]; with MAP_ROWS _gram maps them from the padded sequence into each valid prefix."""
-    _eig_body(
-        qtens,
-        ktens,
-        rows,
-        hadamard,
-        uT,
-        S,
-        H,
-        QP,
-        KP,
-        NQK,
-        NCQ,
-        RANK,
-        (Int64(lens.iterator.toint()), ROWS_PER_SAMPLE, MAP_ROWS),
-    )
+    """Run the eigensolver CTA (_eig_body). LENS: None for a call whose batch elements are all full (lens is not read);
+    else (rows per sample, mapped rows) for valid prefix lengths, int32 [B] at the address lens: rows is [B, NQK] or
+    [NQK], and with mapped rows _gram maps them from the padded sequence into each valid prefix."""
+    lens_arg = (lens, LENS[0], LENS[1]) if LENS else None
+    _eig_body(qtens, ktens, rows, hadamard, uT, S, H, QP, KP, NQK, NCQ, RANK, lens_arg)

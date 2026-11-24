@@ -66,8 +66,8 @@ def store_rows(
     ob,
     bb,
     hh,
-    S: cutlass.Constexpr,
-    H: cutlass.Constexpr,
+    S,
+    H,
     nv=None,
 ):
     """Store the 16 output rows of the warp, o = O f v8_scale as BF16, staged in shared memory at ep (EP bytes apart).
@@ -101,7 +101,7 @@ def store_rows(
 
 
 @cute.jit
-def store_zero_rows(lane, warp, qt, ob, bb, hh, S: cutlass.Constexpr, H: cutlass.Constexpr):
+def store_zero_rows(lane, warp, qt, ob, bb, hh, S, H):
     """Store zeros as the 16 output rows of the warp of a unit without a valid query row (the stores of store_rows)."""
     for it in cutlass.range_constexpr(8):
         oq = qt * QT + warp * 16 + 2 * it + (lane >> 4)
@@ -122,46 +122,26 @@ def store_partials(part_ptr, bid, tidx, O, anc0, anc1, l0, l1):
 
 
 @cute.jit
-def _merge_rows(
-    part_ptr,
-    vs_ptr,
-    ob,
-    bid,
-    tidx,
-    warp,
-    lane,
-    g,
-    q,
-    qt,
-    bb,
-    hh,
-    split: cutlass.Constexpr,
-    S: cutlass.Constexpr,
-    H: cutlass.Constexpr,
-    nv,
-):
-    """Merge the pieces of one unit (merge_partial_kernel) and store its rows, those from nv on as zeros."""
-    pb = [
-        part_ptr.toint() + Int64((bid * split + p) * PART_N) * (NTHR * 4) + tidx * 4
-        for p in range(split)
-    ]
-    an0 = [load_invariant(Float32, pb[p] + 64 * (NTHR * 4)) for p in range(split)]
-    an1 = [load_invariant(Float32, pb[p] + 65 * (NTHR * 4)) for p in range(split)]
-    m0 = an0[0]
-    m1 = an1[0]
-    for p in cutlass.range_constexpr(1, split):
-        m0 = cute.arch.fmax(m0, an0[p])
-        m1 = cute.arch.fmax(m1, an1[p])
+def _merge_rows(part_ptr, vs_ptr, ob, bid, tidx, warp, lane, g, q, qt, bb, hh, split, S, H, nv):
+    """Merge the `split` pieces of one unit (merge_partial_kernel) and store its rows, those from nv on as zeros."""
+    pb0 = part_ptr.toint() + Int64(bid * split * PART_N) * (NTHR * 4) + tidx * 4
+    m0 = load_invariant(Float32, pb0 + 64 * (NTHR * 4))
+    m1 = load_invariant(Float32, pb0 + 65 * (NTHR * 4))
+    for p in cutlass.range(1, split, unroll=1):
+        pb = pb0 + Int64(p * PART_N) * (NTHR * 4)
+        m0 = cute.arch.fmax(m0, load_invariant(Float32, pb + 64 * (NTHR * 4)))
+        m1 = cute.arch.fmax(m1, load_invariant(Float32, pb + 65 * (NTHR * 4)))
     O = cute.make_rmem_tensor(cute.make_layout(64), Float32)
     O.fill(0.0)
     l0 = Float32(0.0)
     l1 = Float32(0.0)
-    for p in cutlass.range_constexpr(split):
+    for p in cutlass.range(split, unroll=1):
+        pb = pb0 + Int64(p * PART_N) * (NTHR * 4)
         # the anchors are in log2 units already: the score scale is not applied again
-        a0 = cute.arch.exp2(an0[p] - m0)
-        a1 = cute.arch.exp2(an1[p] - m1)
-        l0 = cute.math.fma(load_invariant(Float32, pb[p] + 66 * (NTHR * 4)), a0, l0, rounding=RN)
-        l1 = cute.math.fma(load_invariant(Float32, pb[p] + 67 * (NTHR * 4)), a1, l1, rounding=RN)
+        a0 = cute.arch.exp2(load_invariant(Float32, pb + 64 * (NTHR * 4)) - m0)
+        a1 = cute.arch.exp2(load_invariant(Float32, pb + 65 * (NTHR * 4)) - m1)
+        l0 = cute.math.fma(load_invariant(Float32, pb + 66 * (NTHR * 4)), a0, l0, rounding=RN)
+        l1 = cute.math.fma(load_invariant(Float32, pb + 67 * (NTHR * 4)), a1, l1, rounding=RN)
         # the factors of rows g, g + 8 go to the queries 2q, 2q + 1, 8 + 2q, 9 + 2q of the transposed O
         fa = cute.arch.shuffle_sync(a0, 8 * q)
         fb = cute.arch.shuffle_sync(a0, 8 * q + 4)
@@ -173,7 +153,7 @@ def _merge_rows(
             else:
                 factor = fc if i % 2 == 0 else fd
             O[i] = cute.math.fma(
-                load_invariant(Float32, pb[p] + i * (NTHR * 4)), factor, O[i], rounding=RN
+                load_invariant(Float32, pb + i * (NTHR * 4)), factor, O[i], rounding=RN
             )
     f = inv_row_sums(l0, l1, q)
     vsc = load_invariant(Float32, vs_ptr.toint())
@@ -186,10 +166,10 @@ def merge_partial_kernel(
     part_ptr: cute.Pointer,
     o_ptr: cute.Pointer,
     vs_ptr: cute.Pointer,
-    S: cutlass.Constexpr,
-    H: cutlass.Constexpr,
-    split: cutlass.Constexpr,
-    unit0: cutlass.Constexpr,
+    S: Int32,
+    H: Int32,
+    split: Int32,
+    unit0: Int32,
     lens_ptr,
 ):
     """Merge the split key-range pieces of unit unit0 + CTA index, in the thread mapping of the attention.

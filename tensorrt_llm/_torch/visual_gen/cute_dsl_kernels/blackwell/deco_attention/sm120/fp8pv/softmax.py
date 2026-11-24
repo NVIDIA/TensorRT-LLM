@@ -60,16 +60,14 @@ MIN_SCORE_LOG2 = -10
 
 
 # ------------------------------------------------------------------------------------------------ softmax of one tile
-def mask_tile(acc, q, lim, mask_tail):
-    """Set the scores of the keys >= lim of the tile to -inf, if the runtime mask_tail (None: always) enables it."""
+def mask_tile(acc, q, lim):
+    """Set the scores of the keys >= lim of the tile to -inf."""
     for nt in range(16):
         s = nt % 4
         i = nt // 4
         for e in range(2):
             kk = 32 * i + 8 * key_grp(s) + ((2 * q + e) ^ key_rot(s))
             ok = compare(kk, Int32(lim), "lt", Int32)
-            if mask_tail is not None:
-                ok = ok | (Int32(1) - mask_tail)
             acc[nt][e] = Float32(cutlass.select_(ok != 0, acc[nt][e], Float32(-math.inf)))
             acc[nt][2 + e] = Float32(cutlass.select_(ok != 0, acc[nt][2 + e], Float32(-math.inf)))
 
@@ -120,8 +118,7 @@ def softmax_tile(
     exp_path,
     sc,
     q,
-    lim: cutlass.Constexpr,
-    mask_tail,
+    lim,
     release,
     refill,
 ):
@@ -129,14 +126,13 @@ def softmax_tile(
 
     * P[4 i + e]: the PV fragments, P = E4M3(2^(s - anchor + T)); P[16], P[17]: the 16-key block sums of the quantized
       P, the means-MMA B fragments. The lazy rescale is that of the module docstring.
-    * Keys at or past lim (< 128, or a run-time count with lengths) are masked: always (mask_tail None) or where the
-      runtime mask_tail is 1.
+    * Keys at or past lim (the valid keys of the tile, a run-time count, or KT at trace time) are masked.
     * release() counts the release of its stage by the warp and refill(count) refills the stage when the count says
       so (the stage ring of kernel.py); None: the phase releases nothing.
     """
     acc = [list(r) for r in acc]
     if cutlass.const_expr(not isinstance(lim, int) or lim < KT):
-        mask_tile(acc, q, lim, mask_tail)
+        mask_tile(acc, q, lim)
     na0 = anc0
     na1 = anc1
     # the scores stay in registers until the overflow decision, so the warp's reads of the stage ended with its MMA

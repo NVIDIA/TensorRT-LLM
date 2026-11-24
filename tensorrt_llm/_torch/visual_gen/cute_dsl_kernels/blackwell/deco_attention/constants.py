@@ -23,6 +23,7 @@ ALIGN = 256
 SAMPLE_FRAC = 256
 
 HEAD_DIM = 128  # channels of q, k, v and o per head
+KEY_TILE = 128  # keys of a KV tile of the attention, and of a block of the preparation passes
 INV_SQRT_HEAD_DIM = HEAD_DIM**-0.5
 # The ranks of the compensation basis a kernel may be built for; a family's ranks() names those a target offers. Q'
 # and K' carry 2 x rank compensation channels after the rotated head channels
@@ -32,24 +33,28 @@ DEFAULT_RANK = 32
 QK_ROW_BYTES = 128  # a packed token row of Q' / K': room for 256 E2M1 codes, the first qk_channels(rank) of them used
 
 
-def qk_channels(rank):
+def key_tiles(s: int) -> int:
+    return (s + KEY_TILE - 1) // KEY_TILE
+
+
+def qk_channels(rank: int) -> int:
     """Return the channels of Q' and K' at a rank: the rotated head channels, then the compensation channels."""
     return HEAD_DIM + 2 * rank
 
 
-def qk_scale_atoms(rank):
+def qk_scale_atoms(rank: int) -> int:
     """Return the 512-byte atoms of the Q' / K' scale factors of a tile at a rank, one per 64 channels."""
     return qk_channels(rank) // 64
 
 
-# The channels and the scale atoms at the default rank, for the sm120 family, whose kernels have that rank only (the
-# tcgen05 kernels take both per rank from the functions above)
+# The channels and the scale atoms at the default rank: the kernels of the sm120 family have that rank only
 QK_CHANNELS = qk_channels(DEFAULT_RANK)
 QK_SCALE_ATOMS = qk_scale_atoms(DEFAULT_RANK)
 # T: the anchor of a softmax row (its running maximum) only moves, and O is only rescaled, when the maximum of a key
 # tile exceeds it by more than T binades
 RESCALE_THRESHOLD = 4.0
 E4M3_MAX = 448.0  # the largest finite E4M3 value
+E2M1_MAX = 6.0  # the largest E2M1 value
 # the V scale is a power of two at or above the largest deviation from the block means over the code range; the block
 # means are stored divided by that scale too, so the deviation maximum also takes |mean| times this factor, which
 # keeps the scaled mean of a block of large equal values (deviation zero) below 2^102 in FP32, with room for the block

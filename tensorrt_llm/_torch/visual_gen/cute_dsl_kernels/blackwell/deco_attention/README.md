@@ -18,8 +18,8 @@ quantization error of the scores. The kernels of a GPU family differ in the PV, 
 
 The family is fixed per process: that of CUDA device 0, or of `CUTE_DSL_ARCH` when it is set.
 
-Requirements: `nvidia-cutlass-dsl` 4.8.0 or 4.8.1, the versions the kernels are validated with,
-`apache-tvm-ffi`, PyTorch with CUDA, `cuda-bindings` (all installed by TensorRT-LLM's `requirements.txt`).
+Requirements: `nvidia-cutlass-dsl` (the kernels are validated with 4.8.0 and 4.8.1), `apache-tvm-ffi`, PyTorch with
+CUDA, `cuda-bindings` (all installed by TensorRT-LLM's `requirements.txt`).
 The package imports its own modules relatively and nothing else of TensorRT-LLM.
 
 ## Interface
@@ -57,15 +57,16 @@ attention(operands, out)                   # BF16 [B, S, H, 128] out
   keep nothing between calls and a call writes every byte it reads, so one buffer serves calls of any shape that
   fits, in any order.
 - **Basis rows.** `rows` are the int32 indices of the tokens the compensation basis is estimated on, a
-  one-dimensional tensor on the device of `q`. The default, `sample_rows(seq_len, rank=rank)`, holds 1/256 of the
-  tokens and at least 2 x rank of them. A packed multimodal sequence passes
+  one-dimensional tensor on the device of `q` at a 16-byte aligned address (as every allocation is). The default,
+  `sample_rows(seq_len, rank=rank)`, holds 1/256 of the tokens and at least 2 x rank of them. A packed multimodal
+  sequence passes
   `rows=sample_rows(seq_len, token_tags=tags, rank=rank)`, which takes half of the rows from the text and audio
   tokens; it runs on the device and reads nothing back, and with `tokens` (bool `[B, seq_len]`, true for a token)
   every batch element gets the draw of its own tokens. The last tagged draw is kept for the calls that pass the same
   tensors. A draw may hold fewer rows than 2 x rank; an empty one is rejected.
 - **Rank.** `rank=64` doubles the compensation channels where `ranks()` lists it.
-- **Compilation.** Kernels compile on first use and are cached per device and rank. The `tcgen05` attention takes the
-  shape at run time; the `sm120` attention compiles once per shape.
+- **Compilation.** Kernels compile on first use and are cached per device and rank. Both attention families take the
+  shape at run time; the `sm120` attention compiles once per device, launch kind and with or without lengths.
 - **CUDA graphs.** A call enqueues its launches on the current stream, reads nothing back from the device and
   allocates nothing, so both calls can be captured into one graph after one eager call of the shape. The eager call
   compiles the kernels and builds the sampled rows of the sequence length and the rotation matrix of the device; a
@@ -85,8 +86,8 @@ lens = torch.tensor([3000], dtype=torch.int32, device="cuda")     # one valid pr
 attention(prepare(q, k, v, workspace, valid_seq_lens=lens), out)
 ```
 
-`valid_seq_lens` is an int32 tensor [B] on the device of `q`: batch element b holds tokens on its first
-n = clamp(valid_seq_lens[b], 0, S) positions and padding after them.
+`valid_seq_lens` is an int32 tensor [B] on the device of `q` at a 16-byte aligned address: batch element b holds
+tokens on its first n = clamp(valid_seq_lens[b], 0, S) positions and padding after them.
 
 - **Output.** The rows below n are the attention of the first n queries over the first n keys, and the rows from n
   on are zero, whatever `q`, `k` and `v` hold from n on. `None` (the default) is a call without padding; a call with

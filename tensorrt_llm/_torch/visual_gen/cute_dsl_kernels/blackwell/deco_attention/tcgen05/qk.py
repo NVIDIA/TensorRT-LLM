@@ -38,10 +38,12 @@ from cutlass.cute.nvgpu.common import OperandMajorMode
 
 from .. import target
 from ..common.dsl import CTAGroup, Tcgen05CpShape, make_tmem_ptr, tcgen05_cp
-from ..constants import DEFAULT_RANK, RANKS, qk_channels, qk_scale_atoms
+from ..constants import DEFAULT_RANK, QK_ROW_BYTES, RANKS, qk_channels, qk_scale_atoms
 from .ptx import smem_desc_sw128
 
-ROW_ELEMS = 256  # E2M1 codes of a Q' / K' row: 128 bytes, the first qk_channels(rank) codes used
+ROW_ELEMS = (
+    2 * QK_ROW_BYTES
+)  # E2M1 codes of a Q' / K' row, the first qk_channels(rank) of them used
 
 
 def ranks():
@@ -552,7 +554,7 @@ class QkK64(QkK96):
     """The QK of sm_100a: the same operands, one K = 64 block-scaled MMA per 64 channels of the QK (three at rank 32).
 
     * Q' and K': E2M1 tiles in the standard 128B-swizzled K-major layout over the padded 256-channel rows (the
-      channels past the QK's are zero and unused).
+      channels past the QK's are not written and not read).
     * Scale factors: the standard (32, 4) atoms, the bytes the sm_103a path reinterprets; TMEM slots as on sm_103a.
     """
 
