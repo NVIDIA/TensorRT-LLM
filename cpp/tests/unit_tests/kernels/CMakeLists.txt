@@ -60,6 +60,16 @@ target_include_directories(
   PRIVATE ${PROJECT_SOURCE_DIR}/../tensorrt_llm/_torch/modeling_v2/models)
 target_compile_definitions(minimaxM3Prob1AgreementTest
                            PRIVATE TRTLLM_MV2_SCOPE=minimax_m3::shared)
+add_tllm_gtest(
+  convertKVCacheWordTest
+  OWNER
+  kernel
+  SOURCES
+  convertKVCacheWordTest.cu
+  LINK_LIBRARIES
+  tllm::common_headers
+  LABELS
+  "unit;kernels;xqa;gpu")
 
 macro(remove_compile_definition TARGET_NAME DEFINITION)
   get_target_property(DEFS ${TARGET_NAME} COMPILE_DEFINITIONS)

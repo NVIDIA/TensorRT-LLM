@@ -26,7 +26,7 @@
 //   V: output element (i, j) (= 2 * i + j) = byte (2 * j + i)   (word i = {byte i, byte i + 2})
 // For bf16 + int8 this also checks the I2F-free specialisation against the generic conversion.
 
-#include "../utils.cuh"
+#include "kernels/xqa/utils.cuh"
 
 #include <gtest/gtest.h>
 
@@ -34,6 +34,13 @@
 #include <cstdio>
 #include <cuda_runtime.h>
 #include <vector>
+
+#define CUDA_CHECK(x)                                                                                                  \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        cudaError_t const err_ = (x);                                                                                  \
+        ASSERT_EQ(err_, cudaSuccess) << cudaGetErrorString(err_);                                                      \
+    } while (0)
 
 namespace
 {
@@ -113,13 +120,6 @@ bool same16(uint16_t a, uint16_t b)
 {
     return a == b || (isNan16<InputElem>(a) && isNan16<InputElem>(b)); // e4m3 NaN encodings may differ in payload
 }
-
-#define CUDA_CHECK(x)                                                                                                  \
-    do                                                                                                                 \
-    {                                                                                                                  \
-        cudaError_t const err_ = (x);                                                                                  \
-        ASSERT_EQ(err_, cudaSuccess) << cudaGetErrorString(err_);                                                      \
-    } while (0)
 
 template <typename InputElem, typename CacheElem>
 void runExhaustive(char const* name)
