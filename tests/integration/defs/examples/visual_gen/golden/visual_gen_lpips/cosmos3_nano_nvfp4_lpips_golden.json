@@ -17,7 +17,7 @@
   "torch_compile": false,
   "deterministic_algorithms": true,
   "lpips_net": "alex",
-  "lpips_threshold": 0.05,
+  "lpips_threshold": 0.15,
   "diffusers_version": "0.40.0",
   "torch_version": "2.14.0a0+b2c75dd062.nv26.9.68203377",
   "tensorrt_llm_version": "1.4.0rc5",

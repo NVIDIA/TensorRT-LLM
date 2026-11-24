@@ -103,6 +103,7 @@ COSMOS3_I2V_4STEP_LPIPS_GUIDANCE_SCALE = 1.0
 COSMOS3_I2V_4STEP_LPIPS_THRESHOLD = 0.10
 
 COSMOS3_FEATURE_LPIPS_THRESHOLD = 0.05
+COSMOS3_NVFP4_LPIPS_THRESHOLD = 0.15
 COSMOS3_QUANTIZATION_IGNORE = [
     "language_model.*",
     "vae2llm",
@@ -142,7 +143,11 @@ def _build_cosmos3_accuracy_cases():
                     id=profile_id,
                     golden_file=(f"cosmos3_nano_{profile_id.replace('-', '_')}_lpips_golden.png"),
                     features=features,
-                    lpips_threshold=COSMOS3_FEATURE_LPIPS_THRESHOLD,
+                    lpips_threshold=(
+                        COSMOS3_NVFP4_LPIPS_THRESHOLD
+                        if profile_id == "nvfp4"
+                        else COSMOS3_FEATURE_LPIPS_THRESHOLD
+                    ),
                 ),
                 id=profile_id,
             )

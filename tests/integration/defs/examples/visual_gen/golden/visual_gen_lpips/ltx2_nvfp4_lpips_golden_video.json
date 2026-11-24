@@ -1,7 +1,7 @@
 {
   "video": "ltx2_nvfp4_lpips_golden_video.mp4",
   "model": "LTX-2 BF16 two-stage",
-  "source": "TensorRT-LLM VisualGen (self-golden)",
+  "source": "TensorRT-LLM VisualGen",
   "prompt": "A woman with long brown hair and light skin smiles at the camera while standing in a sunlit park, her hair gently blowing in the breeze as she tilts her head slightly to the side.",
   "negative_prompt": "worst quality, inconsistent motion, blurry, jittery, distorted",
   "height": 512,
