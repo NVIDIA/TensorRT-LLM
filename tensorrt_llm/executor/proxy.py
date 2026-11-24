@@ -1675,6 +1675,11 @@ class GenerationExecutorProxy(GenerationExecutor):
         with nvtx_range_debug("request_queue.put"):
             try:
                 self._send_generation_request(request)
+            except RequestSendCancelled as error:
+                self._results.pop(request.id, None)
+                if self._engine_dead or self._fatal_error is not None:
+                    raise EngineDeadError(self._fatal_error) from error
+                raise
             except (RuntimeError, zmq.ZMQError):
                 self._results.pop(request.id, None)
                 raise

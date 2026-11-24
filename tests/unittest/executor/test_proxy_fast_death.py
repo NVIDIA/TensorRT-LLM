@@ -23,6 +23,7 @@ from unittest.mock import Mock
 from unittest.mock import Mock as _Mock
 
 import pytest
+import zmq
 
 from tensorrt_llm._startup_errors import (
     StartupErrorInfo,
@@ -34,6 +35,7 @@ from tensorrt_llm._startup_errors import (
 from tensorrt_llm.executor import EngineDeadError
 from tensorrt_llm.executor import proxy as proxy_module
 from tensorrt_llm.executor import worker as worker_module
+from tensorrt_llm.executor.ipc import RequestSendCancelled
 from tensorrt_llm.executor.proxy import GenerationExecutorProxy
 from tensorrt_llm.executor.result import GenerationResult
 from tensorrt_llm.executor.worker_process_monitor import WorkerProcessIdentity
@@ -609,6 +611,68 @@ def test_submit_rechecks_engine_death_after_registration(monkeypatch):
 
     # The raced result must not be left dangling in _results.
     assert 42 not in proxy._results
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "send_error_type,state",
+    [
+        pytest.param(RequestSendCancelled, "engine_dead", id="cancel-after-death"),
+        pytest.param(RequestSendCancelled, "fatal_error", id="cancel-after-fatal-error"),
+        pytest.param(RequestSendCancelled, "shutdown", id="orderly-cancel"),
+        pytest.param(RuntimeError, "shutdown", id="runtime-error-during-shutdown"),
+        pytest.param(RuntimeError, "engine_dead", id="runtime-error-with-death"),
+        pytest.param(zmq.ZMQError, "engine_dead", id="zmq-error-with-death"),
+    ],
+)
+def test_submit_send_exception_contract(
+    monkeypatch: pytest.MonkeyPatch, send_error_type: type[Exception], state: str
+) -> None:
+    proxy = _bare_proxy()
+    proxy._fatal_error = None
+    monkeypatch.setattr(proxy, "_start_dispatch_threads", lambda: None)
+    monkeypatch.setattr(proxy, "_get_next_client_id", lambda: 42)
+    monkeypatch.setattr(proxy, "_get_logprob_params", lambda request: None)
+    monkeypatch.setattr(proxy, "_handle_background_error", lambda: None)
+    result = _FakeResult()
+    monkeypatch.setattr(proxy_module, "GenerationResult", lambda *args, **kwargs: result)
+    request = _FakeRequest()
+    fatal_error = RuntimeError("worker died")
+    send_error = send_error_type("send interrupted")
+    original_cause = ValueError("send cause")
+
+    def send(submitted: object) -> None:
+        assert submitted is request
+        assert proxy._results == {42: result}
+        proxy.doing_shutdown = True
+        proxy._request_transport_closed = True
+        if state == "engine_dead":
+            proxy._mark_engine_dead(fatal_error)
+        elif state == "fatal_error":
+            proxy._fatal_error = fatal_error
+        raise send_error from original_cause
+
+    monkeypatch.setattr(proxy, "_send_generation_request", send)
+    translate = send_error_type is RequestSendCancelled and state != "shutdown"
+    expected_type = EngineDeadError if translate else send_error_type
+    with pytest.raises(expected_type) as raised:
+        proxy.submit(request)
+
+    assert type(raised.value) is expected_type
+    assert not proxy._results
+    assert send_error.__cause__ is original_cause
+    if translate:
+        assert isinstance(raised.value, EngineDeadError)
+        assert raised.value.root_cause is proxy._fatal_error
+        assert raised.value.__cause__ is send_error
+    else:
+        assert raised.value is send_error
+        assert raised.value.__cause__ is original_cause
+    if state == "engine_dead":
+        notification = result.queue.get_nowait()
+        assert isinstance(notification, EngineDeadError)
+        assert notification.root_cause is fatal_error
+    assert result.queue.empty()
 
 
 # --- Remote (TLLM_SPAWN_PROXY_PROCESS / trtllm-llmapi-launch) mode coverage ---
