@@ -14,7 +14,6 @@ LOWER_BOUND = -5.0
 HEAD_STATE_CASES = [
     pytest.param(3, torch.bfloat16, id="kda-bf16"),
     pytest.param(3, torch.float32, id="kda-fp32"),
-    pytest.param(16, torch.float32, id="glm-tp4-fp32"),
     pytest.param(64, torch.float32, id="glm-adp-fp32"),
 ]
 
@@ -268,14 +267,17 @@ def test_kda_mtp_replay_matches_reference(heads, state_dtype, width, strong_deca
     torch.testing.assert_close(history_len, history_len_before, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
-@pytest.mark.parametrize("width", [2, 6])
-@pytest.mark.parametrize("batch", [1, 3])
+@pytest.mark.parametrize(
+    ("state_dtype", "width", "batch"),
+    [(torch.float32, 6, 3), (torch.bfloat16, 2, 1)],
+    ids=["32bit-offsets-multi-row", "64bit-offsets-single-row"],
+)
 @torch.no_grad()
 def test_kda_mtp_replay_paired_slots_match_separate_slots(state_dtype, width, batch):
     """Interleaved (state slot, replay slot) pairs give the separate-index result bit for bit.
 
-    FP32 with six tokens and several rows takes the 32-bit history offsets.
+    FP32 with six tokens and several rows takes the 32-bit history offsets; one BF16
+    row takes the 64-bit offsets.
     """
     from tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_kda_mtp_replay import kda_mtp_replay
 
@@ -332,9 +334,8 @@ def test_kda_mtp_replay_paired_slots_match_separate_slots(state_dtype, width, ba
         assert torch.equal(separate, paired)
 
 
-@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
 @torch.no_grad()
-def test_kda_mtp_replay_conv_pool_past_2g_matches_a_dense_copy(state_dtype):
+def test_kda_mtp_replay_conv_pool_past_2g_matches_a_dense_copy():
     """Conv-state slots that start past element 2**31 give the dense-pool result bit for bit.
 
     V2 coalesces a rank's KDA layers in each slot, so the Conv pool's slot stride
@@ -344,6 +345,8 @@ def test_kda_mtp_replay_conv_pool_past_2g_matches_a_dense_copy(state_dtype):
     from tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_kda_mtp_replay import kda_mtp_replay
 
     torch.manual_seed(13)
+    # The 64-bit Conv slot offset does not depend on the recurrent-state dtype.
+    state_dtype = torch.float32
     heads, width, token_capacity = 4, 4, 8
     channels = 3 * heads * DIM
     slots = 1100

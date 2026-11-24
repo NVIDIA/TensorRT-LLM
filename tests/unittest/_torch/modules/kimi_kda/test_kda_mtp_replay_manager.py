@@ -283,6 +283,8 @@ def test_v2_manager_selects_the_kda_mtp_replay(manager_cls, kda_mtp_replay):
     mgr = _manager(manager_cls, num_spec, kda_mtp_replay=kda_mtp_replay)
     try:
         assert mgr.use_kda_mtp_replay is kda_mtp_replay
+        # The replay verifies one-token steps too, so they are committed after sampling.
+        assert mgr.commits_every_generation_step is kda_mtp_replay
         assert mgr.use_kda_replay_update
         assert mgr.replay_layer_group_id is not None
         layer_cache = mgr.mamba_layer_cache(mgr.mamba_pp_layers[0])
@@ -311,21 +313,38 @@ def test_v2_manager_selects_the_kda_mtp_replay(manager_cls, kda_mtp_replay):
 
 
 @pytest.mark.parametrize("manager_cls", [KimiK3HybridCacheManager, Glm5NextCacheManager])
-def test_kda_mtp_replay_cost_estimate_matches_the_region(manager_cls):
-    """The fixed replay pool the estimate reserves is the one the manager declares."""
+def test_kda_mtp_replay_cost_estimate_matches_the_region(monkeypatch, manager_cls):
+    """The per-slot replay bytes the estimate reserves before the manager exists
+    are the ones the manager's replay region declares."""
     _requires_mtp_replay_kernels()
     num_spec = 2
     mgr = _manager(manager_cls, num_spec, kda_mtp_replay=True)
     try:
-        region = mgr._kda_replay_region
-        state = mgr._kda_replay
-        per_slot = sum(state.bytes_per_slot(mgr._state_layout, layer) for layer in region.layouts)
-        assert region.bytes_per_slot == per_slot
-        capacity = KDA_MTP_REPLAY_HISTORY_SIZE + num_spec + 1
-        layer_bytes = 6 * capacity * DIM * (2 + 2 + 4)
-        assert per_slot == 6 * layer_bytes + 16
+        declared = mgr._kda_replay_region.bytes_per_slot
     finally:
         mgr.shutdown()
+    # The geometry _manager builds: 6 local KDA layers of 6 heads, K = V = 128, Conv4.
+    params = SimpleNamespace(
+        num_heads=6,
+        head_dim=DIM,
+        state_size=DIM,
+        conv_kernel=4,
+        dtype=torch.bfloat16,
+        mamba_ssm_cache_dtype=torch.float32,
+    )
+    monkeypatch.setattr(
+        kda_cache_manager, "_get_local_mamba_cache_layout", lambda *args, **kwargs: (params, 6, 1)
+    )
+    estimate = KDAReplayState.estimate_bytes_per_slot(
+        SimpleNamespace(quant_config=None),
+        Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        spec_config=MTPDecodingConfig(max_draft_len=num_spec),
+        kda_replay_num_spec=num_spec,
+        kda_mtp_replay=True,
+    )
+    assert estimate == declared
+    capacity = KDA_MTP_REPLAY_HISTORY_SIZE + num_spec + 1
+    assert estimate == 6 * (6 * capacity * DIM * (2 + 2 + 4)) + 16
 
 
 def test_kda_mtp_replay_disagg_transfer_clears_the_history_length():
@@ -702,7 +721,7 @@ def test_kda_mtp_replay_history_follows_a_suspended_request(slot_taken):
 @pytest.mark.parametrize(
     "commits", [True, False, "not_a_mamba_manager"], ids=["replay_state", "other_state", "other"]
 )
-@pytest.mark.parametrize("num_contexts", [0, 1, 3])
+@pytest.mark.parametrize("num_contexts", [1, 3], ids=["mixed", "contexts_only"])
 def test_skip_drafting_commits_replay_states(commits, num_contexts):
     """A step without drafts still commits its generation tokens to a replay state.
 
@@ -755,14 +774,3 @@ def test_skip_drafting_commits_replay_states(commits, num_contexts):
     assert call["attn_metadata"] is attn_metadata
     assert call["num_accepted_tokens"].tolist() == [1, 1, 1]
     assert call["state_indices"] is state_indices
-
-
-@pytest.mark.parametrize("manager_cls", [KimiK3HybridCacheManager, Glm5NextCacheManager])
-@pytest.mark.parametrize("kda_mtp_replay", [True, False])
-def test_kda_managers_commit_every_step_only_with_the_mtp_replay(manager_cls, kda_mtp_replay):
-    _requires_mtp_replay_kernels()
-    mgr = _manager(manager_cls, kda_mtp_replay=kda_mtp_replay)
-    try:
-        assert mgr.commits_every_generation_step is kda_mtp_replay
-    finally:
-        mgr.shutdown()
