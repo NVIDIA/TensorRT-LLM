@@ -549,3 +549,86 @@ def test_dense_decode_prepare_loads_each_kernel_once_before_forward(
     with pytest.raises(RuntimeError, match="during capture"):
         fresh.prepare(layers, planners.metadata, **limits)
     assert not planned
+
+
+@pytest.mark.parametrize("case", ["shared", "private", "peer_error", "local_error"])
+def test_dense_decode_prepare_splits_misses_between_cache_peers(
+    planners: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    planned = []
+
+    class Wrapper:
+        def plan(self, **kwargs: object) -> None:
+            planned.append(kwargs)
+            kernel = ("small" if kwargs["batch_size"] <= 2 else "large", kwargs["max_q_len"])
+            self._plan_state = SimpleNamespace(compile_spec=kernel)
+
+        def is_kernel_cached(self) -> bool:
+            return False
+
+    planners.decode.BatchMLADecodePagedTSWrapper = Wrapper
+    precompile = ModuleType("tensorrt_llm._torch.attention.backends.fmha.prims_ts_precompile")
+    precompile.can_publish = lambda: True
+    precompile.pool_enabled = Mock(return_value=True)
+    precompile.encode_dense_payload = lambda index, kwargs: {
+        "device_index": index,
+        "rows": (kwargs["batch_size"], kwargs["max_q_len"]),
+    }
+    precompile.payload_key = lambda payload: str(payload["rows"])
+    precompile.precompile_payloads = Mock()
+    precompile.compile_payloads_in_process = Mock()
+    monkeypatch.setitem(sys.modules, precompile.__name__, precompile)
+    monkeypatch.setattr(_warmup, "_share_cache_key", lambda: "host:/cache")
+    planners.metadata.max_total_draft_tokens = 2
+    library = SimpleNamespace(mla_decode_warmup_profile=Mock(return_value=_decode_profile()))
+    if case == "local_error":
+        library.mla_decode_warmup_profile.side_effect = ValueError("bad layer")
+    exchanged = []
+
+    def exchange(report: object) -> list:
+        exchanged.append(report)
+        if len(exchanged) == 2:
+            return [None, report]  # the barrier
+        # A peer that sorts first, on another GPU with the same misses.
+        peer = replace(
+            report,
+            token="peer",
+            cache="host:/other" if case == "private" else report.cache,
+            missing={k: {**p, "device_index": 1} for k, p in report.missing.items()},
+            error="OSError: peer failed" if case == "peer_error" else None,
+        )
+        return [peer, report]
+
+    warmer = _warmup.PrimsTSDenseMlaWarmup()
+    limits = dict(max_batch_size=4, max_num_tokens=8, local_ranks=2)
+    if case in ("peer_error", "local_error"):
+        error = RuntimeError if case == "peer_error" else ValueError
+        with pytest.raises(error, match="on a peer: OSError" if case == "peer_error" else "bad"):
+            warmer.prepare([(object(), library)], planners.metadata, **limits, exchange=exchange)
+        # Every peer raises after the same exchange, before compiling anything.
+        assert len(exchanged) == 1 and exchanged[0].error == (
+            "ValueError: bad layer" if case == "local_error" else None
+        )
+        precompile.precompile_payloads.assert_not_called()
+        precompile.compile_payloads_in_process.assert_not_called()
+        return
+
+    result = warmer.prepare([(object(), library)], planners.metadata, **limits, exchange=exchange)
+    assert exchanged[0].cache == "host:/cache" and exchanged[1] is None
+    assert sorted(exchanged[0].missing) == ["(1, 1)", "(1, 3)", "(3, 1)"]
+    if case == "shared":
+        # The second of two peers compiles the second of the sorted misses, on its own GPU.
+        assert result == (3, 1)
+        precompile.compile_payloads_in_process.assert_called_once_with(
+            [{"device_index": 0, "rows": (1, 3)}]
+        )
+        precompile.precompile_payloads.assert_not_called()
+    else:
+        assert result == (3, 3)
+        (payloads,), kwargs = precompile.precompile_payloads.call_args
+        assert sorted(p["rows"] for p in payloads) == [(1, 1), (1, 3), (3, 1)]
+        assert kwargs == {"local_ranks": 2}
+        precompile.compile_payloads_in_process.assert_not_called()
+    # Loading follows the barrier and covers every kernel this rank uses.
+    loaded = [(p["batch_size"], p["max_q_len"]) for p in planned if "compile" not in p]
+    assert loaded == [(1, 1), (3, 1), (1, 3)]

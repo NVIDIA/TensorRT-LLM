@@ -46,7 +46,8 @@ def _init_worker(search_path: list[str]) -> None:
     sys.meta_path.insert(0, _VendorPackages())
 
 
-def _plan(payload: dict[str, Any]) -> None:
+def compile_payload(payload: dict[str, Any]) -> None:
+    """Compile the kernel one encoded plan selects and publish it to the disk cache."""
     import torch
 
     device = torch.device("cuda", payload["device_index"])
@@ -91,4 +92,4 @@ if __name__ == "__main__":
         initializer=_init_worker,
         initargs=(request["sys_path"],),
     ) as pool:
-        list(pool.map(_plan, request["payloads"]))
+        list(pool.map(compile_payload, request["payloads"]))

@@ -1150,9 +1150,15 @@ def test_prims_ts_prewarm_prepares_metadata_and_barriers(
         if kind == "sparse":
             warm.assert_called_once_with(owner.model, metadata)
         else:
-            warm.assert_called_once_with(
-                layers, metadata, max_batch_size=8, max_num_tokens=64, local_ranks=cp_size * tp_size
+            assert warm.call_count == 1 and warm.call_args.args == (layers, metadata)
+            kwargs = dict(warm.call_args.kwargs)
+            exchange = kwargs.pop("exchange")
+            assert kwargs == dict(
+                max_batch_size=8, max_num_tokens=64, local_ranks=cp_size * tp_size
             )
+            # Peers split their compiles over the same allgather as the error barrier.
+            assert exchange("report") == ["report", None]
+            gather.assert_called_with("report")
         owner._metadata.setup_attention.assert_called_once_with(manager, draft_manager)
 
         if cp_size > 1:

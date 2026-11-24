@@ -11,6 +11,7 @@ import os
 import time
 from collections.abc import Callable
 from enum import Enum, auto
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -1107,6 +1108,8 @@ class DecoderWarmup:
         The kernels are derived from each layer's configuration and this pass's
         KV cache, so missing ones compile together in the PrimTS precompile pool
         rather than one after another in the forwards that first select them.
+        Tensor and context parallel peers that share a host's kernel cache split
+        those compiles between them.
         """
         from tensorrt_llm._torch.attention.backends.fmha.prims_ts_mla_warmup import (
             dense_mla_decode_layers,
@@ -1132,6 +1135,8 @@ class DecoderWarmup:
                     max_batch_size=self._config.max_batch_size,
                     max_num_tokens=self._config.max_num_tokens,
                     local_ranks=local_rank_count(self.mapping),
+                    # The peer-error allgather also lets peers split their compiles.
+                    exchange=partial(_gather_prewarm_errors, self.dist, self.mapping),
                 )
             torch.cuda.synchronize()
         except Exception as exc:

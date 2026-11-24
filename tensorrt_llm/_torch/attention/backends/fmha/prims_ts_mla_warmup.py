@@ -8,6 +8,8 @@ forward; profiles that forwards selected are completed after graph capture.
 
 from __future__ import annotations
 
+import socket
+import uuid
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import asdict, dataclass, replace
 from enum import Enum, auto
@@ -191,6 +193,41 @@ def _plan_decode(profile: _MlaDecodePlan, workspace: torch.Tensor) -> None:
         del wrapper, workspace
 
 
+def _resolve_decode_kernels(
+    profiles: set[_MlaDecodePlan], *, probe: bool
+) -> tuple[dict[object, _MlaDecodePlan], list[dict]]:
+    """One representative profile per distinct kernel, and encoded plans of uncached ones.
+
+    Plans differ in request count and width; kernels differ only where the
+    launch policy changes. Planning without compiling allocates no workspace.
+    The disk cache is checked only with ``probe``.
+    """
+    from tensorrt_llm._torch.attention.backends.prims_ts.mla_decode import (
+        BatchMLADecodePagedTSWrapper,
+    )
+
+    from . import prims_ts_precompile
+
+    kernels: dict[object, _MlaDecodePlan] = {}
+    missing = []
+    if not profiles:
+        return kernels, missing
+    wrapper = BatchMLADecodePagedTSWrapper()
+    for profile in sorted(profiles, key=lambda p: (p.max_q_len, p.batch_size)):
+        wrapper.plan(**asdict(profile), zero_empty_rows=False, compile=False)
+        kernel = wrapper._plan_state.compile_spec
+        if kernel in kernels:
+            continue
+        kernels[kernel] = profile
+        if probe and not wrapper.is_kernel_cached():
+            plan_kwargs = asdict(profile)
+            device = plan_kwargs.pop("device")
+            plan_kwargs["zero_empty_rows"] = False
+            device_index = device.index if device.index is not None else torch.cuda.current_device()
+            missing.append(prims_ts_precompile.encode_dense_payload(device_index, plan_kwargs))
+    return kernels, missing
+
+
 def _decode_workspace_size(profile: _MlaDecodePlan) -> int:
     from tensorrt_llm._torch.attention.backends.prims_ts import (
         get_prims_ts_batch_mla_decode_workspace_size,
@@ -248,6 +285,57 @@ def dense_mla_decode_layers(model: torch.nn.Module) -> list[tuple[MLA, PrimsTSFm
     return layers
 
 
+@dataclass(frozen=True, kw_only=True)
+class _DecodeShareReport:
+    """What a rank tells its peers before they split the dense decode compiles."""
+
+    token: str  # identifies the sender among the gathered reports
+    cache: str | None  # host and CuTe DSL cache; None if compiles stay private
+    missing: dict[str, dict]  # payload key -> encoded plan of each uncached kernel
+    error: str | None = None
+
+
+def _describe(error: BaseException | None) -> str | None:
+    return None if error is None else f"{type(error).__name__}: {error}"
+
+
+def _raise_on_failure(error: Exception | None, peer_errors: Sequence[str | None]) -> None:
+    """Raise on every peer together once any of them failed."""
+    if error is not None:
+        raise error
+    failed = next((peer for peer in peer_errors if peer is not None), None)
+    if failed is not None:
+        raise RuntimeError(f"PrimTS dense MLA warmup failed on a peer: {failed}")
+
+
+def _share_cache_key() -> str:
+    from tensorrt_llm._torch.attention.backends._cute_dsl_compat import cache_dir
+
+    return f"{socket.gethostname()}:{cache_dir()}"
+
+
+def _own_share(reports: Sequence[_DecodeShareReport], token: str) -> tuple[list[dict], int]:
+    """This rank's part of the misses of the peers that share its kernel cache.
+
+    The combined misses are sorted by key and dealt out in turn, so peers with
+    identical misses compile disjoint, balanced shares. Returns the share,
+    retargeted to this rank's GPU, and the number of peers sharing the cache.
+    """
+    mine = next(report for report in reports if report.token == token)
+    if mine.cache is None:
+        return list(mine.missing.values()), 1
+    peers = [report for report in reports if report.cache == mine.cache]
+    combined = {key: payload for report in peers for key, payload in report.missing.items()}
+    position = peers.index(mine)
+    keys = sorted(combined)[position :: len(peers)]
+    if not keys:
+        return [], len(peers)
+    device_index = next((payload["device_index"] for payload in mine.missing.values()), None)
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    return [{**combined[key], "device_index": device_index} for key in keys], len(peers)
+
+
 class PrimsTSDenseMlaWarmup:
     """Deduplicate public startup profiles without retaining runtime workspace.
 
@@ -271,6 +359,7 @@ class PrimsTSDenseMlaWarmup:
         max_batch_size: int,
         max_num_tokens: int,
         local_ranks: int = 1,
+        exchange: Callable[[object], list] | None = None,
     ) -> tuple[int, int]:
         """Load every dense decode kernel the layers' generation can select.
 
@@ -282,63 +371,69 @@ class PrimsTSDenseMlaWarmup:
         process then loads each kernel once, so no warmup forward compiles one.
         With ``FLASHINFER_DISABLE_JIT=1``, a kernel missing from the disk cache
         is skipped; a forward that selects it reports the miss.
-        Returns the numbers of distinct kernels and of worker compile requests.
+
+        ``exchange`` is an allgather over the peers that run this phase
+        together. Every peer calls it twice, whatever its own outcome, so a
+        failure on one raises on all of them. Peers whose CuTe DSL cache is
+        shared on a host (:func:`_cute_dsl_compat.shared_jit_dir`) compile
+        disjoint shares of their combined misses and wait for each other
+        before loading, so each kernel compiles once per host.
+        Returns the numbers of distinct kernels and of kernels this rank
+        compiled before loading.
         """
         from flashinfer.jit.core import MissingJITCacheError
 
-        from tensorrt_llm._torch.attention.backends.prims_ts.mla_decode import (
-            BatchMLADecodePagedTSWrapper,
-        )
-        from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
         from tensorrt_llm.logger import logger
 
         from . import prims_ts_precompile
 
-        if not isinstance(metadata, TrtllmAttentionMetadata):
-            return 0, 0
-        templates = {
-            profile
-            for layer, library in layers
-            if (profile := library.mla_decode_warmup_profile(layer, metadata)) is not None
-            and profile.device.type == "cuda"
-        }
-        profiles = {
-            replace(template, batch_size=batch_size, max_q_len=width)
-            for template in templates
-            for width in decode_query_widths(metadata)
-            for batch_size in _decode_batch_sizes(
-                width, max_batch_size=max_batch_size, max_num_tokens=max_num_tokens
-            )
-        } - self._completed
-        if not profiles:
-            return 0, 0
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("PrimTS dense MLA startup planning cannot run during capture.")
-
-        can_fan_out = prims_ts_precompile.pool_enabled(local_ranks=local_ranks)
-        # One representative plan per distinct kernel. Plans differ in request
-        # count and width; kernels differ only where the launch policy changes.
-        # Planning without compiling allocates no workspace.
+        share_cache = exchange is not None and prims_ts_precompile.can_publish()
+        error: Exception | None = None
+        profiles: set[_MlaDecodePlan] = set()
         kernels: dict[object, _MlaDecodePlan] = {}
-        payloads = []
-        wrapper = BatchMLADecodePagedTSWrapper()
-        for profile in sorted(profiles, key=lambda p: (p.max_q_len, p.batch_size)):
-            wrapper.plan(**asdict(profile), zero_empty_rows=False, compile=False)
-            kernel = wrapper._plan_state.compile_spec
-            if kernel in kernels:
-                continue
-            kernels[kernel] = profile
-            if can_fan_out and not wrapper.is_kernel_cached():
-                plan_kwargs = asdict(profile)
-                device = plan_kwargs.pop("device")
-                plan_kwargs["zero_empty_rows"] = False
-                device_index = (
-                    device.index if device.index is not None else torch.cuda.current_device()
-                )
-                payloads.append(prims_ts_precompile.encode_dense_payload(device_index, plan_kwargs))
-        del wrapper
-        if payloads:
-            prims_ts_precompile.precompile_payloads(payloads, local_ranks=local_ranks)
+        missing: list[dict] = []
+        try:
+            profiles = self._decode_profiles(
+                layers, metadata, max_batch_size=max_batch_size, max_num_tokens=max_num_tokens
+            )
+            # Probe the disk cache only if a pool or a peer can compile the misses.
+            probe = share_cache or prims_ts_precompile.pool_enabled(local_ranks=local_ranks)
+            kernels, missing = _resolve_decode_kernels(profiles, probe=probe)
+        except Exception as exc:
+            if exchange is None:
+                raise
+            error = exc
+        share, sharers = missing, 1
+        if exchange is not None:
+            token = uuid.uuid4().hex
+            report = _DecodeShareReport(
+                token=token,
+                cache=_share_cache_key() if share_cache and error is None else None,
+                missing={prims_ts_precompile.payload_key(p): p for p in missing},
+                error=_describe(error),
+            )
+            reports = exchange(report)
+            _raise_on_failure(error, [peer.error for peer in reports])
+            share, sharers = _own_share(reports, token)
+
+        compiled = 0
+        try:
+            if len(share) >= 2 and prims_ts_precompile.pool_enabled(local_ranks=local_ranks):
+                prims_ts_precompile.precompile_payloads(share, local_ranks=local_ranks)
+                compiled = len(share)
+            elif share and sharers > 1:
+                # Peers wait for this share, so compile it before they load.
+                prims_ts_precompile.compile_payloads_in_process(share)
+                compiled = len(share)
+        except Exception as exc:
+            if exchange is None:
+                raise
+            error = exc
+        if exchange is not None:
+            # Also the barrier: every share is published once this returns.
+            _raise_on_failure(error, exchange(_describe(error)))
+        if not kernels:
+            return 0, compiled
 
         workspace_sizes: dict[torch.device, int] = {}
         for profile in kernels.values():
@@ -362,11 +457,43 @@ class PrimsTSDenseMlaWarmup:
         self._completed.update(profiles)
         logger.info(
             f"PrimTS dense MLA decode prepared {len(kernels) - deferred} kernels for "
-            f"{len(profiles)} profiles before the first forward ({len(payloads)} sent to the "
-            f"precompile pool, {deferred} cache misses deferred); "
+            f"{len(profiles)} profiles before the first forward ({len(missing)} missing from the "
+            f"disk cache, {compiled} compiled here, {sharers} ranks sharing the cache, "
+            f"{deferred} cache misses deferred); "
             f"query widths: {sorted({p.max_q_len for p in profiles})}."
         )
-        return len(kernels), len(payloads)
+        return len(kernels), compiled
+
+    def _decode_profiles(
+        self,
+        layers: Sequence[tuple[MLA, PrimsTSFmha]],
+        metadata: TrtllmAttentionMetadata | None,
+        *,
+        max_batch_size: int,
+        max_num_tokens: int,
+    ) -> set[_MlaDecodePlan]:
+        """The decode profiles the layers can select that are not yet prepared."""
+        from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+
+        if not isinstance(metadata, TrtllmAttentionMetadata):
+            return set()
+        templates = {
+            profile
+            for layer, library in layers
+            if (profile := library.mla_decode_warmup_profile(layer, metadata)) is not None
+            and profile.device.type == "cuda"
+        }
+        profiles = {
+            replace(template, batch_size=batch_size, max_q_len=width)
+            for template in templates
+            for width in decode_query_widths(metadata)
+            for batch_size in _decode_batch_sizes(
+                width, max_batch_size=max_batch_size, max_num_tokens=max_num_tokens
+            )
+        } - self._completed
+        if profiles and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("PrimTS dense MLA startup planning cannot run during capture.")
+        return profiles
 
     def run(
         self,
