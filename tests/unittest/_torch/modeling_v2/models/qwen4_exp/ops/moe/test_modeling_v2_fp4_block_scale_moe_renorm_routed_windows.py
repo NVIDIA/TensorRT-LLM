@@ -9,7 +9,7 @@ the two-entry composition (`renorm_moe_routing_op` -> pre-routed
 entry's band against this entry's own fp32 reference. The NVFP4 operand construction
 (layout, the 512-expert stack, windows, activations, scalars, the band) is the pre-routed
 entry's test's, loaded by path so the two tests cannot drift apart on what a valid operand
-is; the tp4 zero-padded stack is built here from the same helpers.
+is; the tp4 and tp2 zero-padded stacks are built here from the same helpers.
 """
 
 import importlib.util
@@ -52,10 +52,10 @@ def _helpers():
 
 H = _helpers()
 
-# tp4 holds each rank's 160-wide slice of the 640 intermediate, stored zero-padded to 256.
-_TP4_LOGICAL_INTER = 160
-_TP4_PADDED_INTER = 256
-_TP4 = None
+# tp4 / tp2 hold each rank's 160- / 320-wide slice of the 640 intermediate, stored zero-padded
+# to 256 / 384: the padded width -> the slice.
+_PADDED_SLICES = {256: 160, 384: 320}
+_PADDED: dict = {}
 
 
 def _pad_zero(codes: torch.Tensor, sf: torch.Tensor, dim: int, size: int):
@@ -76,13 +76,12 @@ def _pack(codes: torch.Tensor) -> torch.Tensor:
     return (codes[..., 0::2] | (codes[..., 1::2] << 4)).contiguous()
 
 
-def _tp4_padded():
-    """The tp4 layer, built once: kernel-ready operands at I = 256 and reference operands
-    at I = 256 (the padded ones the kernel reads)."""
-    global _TP4
-    if _TP4 is None:
-        e, h, i, ip = 512, 2560, _TP4_LOGICAL_INTER, _TP4_PADDED_INTER
-        gen = torch.Generator(device=DEV).manual_seed(512160)
+def _padded(ip: int):
+    """The tp4 (I 256) or tp2 (I 384) layer, built once per width: kernel-ready operands at
+    I = ip and reference operands at I = ip (the padded ones the kernel reads)."""
+    if ip not in _PADDED:
+        e, h, i = 512, 2560, _PADDED_SLICES[ip]
+        gen = torch.Generator(device=DEV).manual_seed(512000 + i)
         _, up_s, up_c = H._rand_nvfp4(e, i, h, gen)
         _, gt_s, gt_c = H._rand_nvfp4(e, i, h, gen)
         _, dn_s, dn_c = H._rand_nvfp4(e, h, i, gen)
@@ -109,14 +108,14 @@ def _tp4_padded():
             num_experts=e,
             gen=gen,
         )
-        _TP4 = (args, ref)
-    return _TP4
+        _PADDED[ip] = (args, ref)
+    return _PADDED[ip]
 
 
 def _stack(spec, layer):
     """`(args, ref)` of the whole 512-expert stack at the cell's intermediate width."""
-    if spec["intermediate"] == 256:
-        return _tp4_padded()
+    if spec["intermediate"] in _PADDED_SLICES:
+        return _padded(spec["intermediate"])
     assert spec["intermediate"] == 640, spec["intermediate"]
     return layer()
 

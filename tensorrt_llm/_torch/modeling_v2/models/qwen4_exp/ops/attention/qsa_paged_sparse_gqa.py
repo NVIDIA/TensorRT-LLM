@@ -17,7 +17,8 @@ from tensorrt_llm._torch.attention.backends.sparse.qsa.kernels import (
 from tensorrt_llm._torch.attention.backends.sparse.qsa.kernels import (
     triton_qsa_paged_sparse_gqa as _triton_qsa_paged_sparse_gqa,
 )
-from tensorrt_llm._torch.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.archs import SERVED_ARCHS
 
 _CHECKPOINT = dict(
     q_heads=24,
@@ -166,7 +167,7 @@ class QsaPagedSparseGqa(OpWrapper):
     are not.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = SERVED_ARCHS
 
     CELLS: tuple[Cell, ...] = (
         # ---- generation: no prefill pair, split-K ---------------------------
