@@ -1312,8 +1312,9 @@ class W8A16FP8LinearMethod(FP8QDQLinearMethod):
     Args:
         backend: ``"torch"`` dequantizes weights before the GEMM.
             ``"flashinfer"`` selects the fused GEMM on supported CUDA devices
-            with contiguous operands. FlashInfer applies the FP32 weight
-            scale after accumulation, which changes rounding.
+            with contiguous operands and supported dimensions. Other inputs
+            use Torch. FlashInfer applies the FP32 weight scale after
+            accumulation, which changes rounding.
     """
 
     SUPPORTED_ACTIVATION_DTYPES: ClassVar[Tuple[torch.dtype,
@@ -1340,22 +1341,26 @@ class W8A16FP8LinearMethod(FP8QDQLinearMethod):
                 f"W8A16FP8LinearMethod requires a 16-bit activation, got "
                 f"{input.dtype}.")
 
+        weight = module.weight
         if (self.backend == "flashinfer" and IS_FLASHINFER_AVAILABLE
                 and IS_CUTLASS_DSL_AVAILABLE and input.is_cuda
-                and input.is_contiguous() and module.weight.is_contiguous()
+                and input.is_contiguous() and weight.is_contiguous()
+                and weight.ndim == 2 and weight.size(0) > 0
+                and weight.size(0) % 8 == 0 and weight.size(1) > 0
+                and weight.size(1) % 16 == 0
                 and (bias is None or bias.is_contiguous())):
             from flashinfer.gemm import mm_bf16_fp8
 
             major, minor = torch.cuda.get_device_capability(input.device)
             if mm_bf16_fp8.is_compute_capability_supported(major * 10 + minor):
                 return torch.ops.trtllm.flashinfer_w8a16_fp8_gemm(
-                    input, module.weight, module.weight_scale, bias)
+                    input, weight, module.weight_scale, bias)
 
         # In place: .to() always copies here (the checks above guarantee the
         # dtypes differ), so only one 16-bit copy of the weight is alive.
-        weight = module.weight.to(input.dtype).mul_(
+        dequantized = weight.to(input.dtype).mul_(
             module.weight_scale.to(input.dtype))
-        return F.linear(input, weight, bias)
+        return F.linear(input, dequantized, bias)
 
 
 class FP8RowwiseLinearMethod(UnquantizedLinearMethod):

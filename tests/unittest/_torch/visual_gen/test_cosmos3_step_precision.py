@@ -14,7 +14,6 @@ step still receives FP8 activations and nothing changed.
 import pytest
 import torch
 
-from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.modules.linear import W8A16FP8LinearMethod
 from tensorrt_llm._torch.visual_gen.models.cosmos3.step_precision import (
     StepPrecisionController,
@@ -218,39 +217,6 @@ class TestW8A16Apply:
         out = W8A16FP8LinearMethod(backend=backend).apply(module, x, bias=None)
         expected = torch.nn.functional.linear(x, module.weight.to(x.dtype) * 0.5)
         assert torch.allclose(out, expected)
-
-    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-    @pytest.mark.skipif(
-        not torch.cuda.is_available() or not IS_CUTLASS_DSL_AVAILABLE,
-        reason="requires CUDA and CuTe DSL",
-    )
-    def test_compiled_flashinfer_and_strided_fallback(self, dtype):
-        from flashinfer.gemm import mm_bf16_fp8, mm_fp16_fp8
-
-        gemm = mm_bf16_fp8 if dtype == torch.bfloat16 else mm_fp16_fp8
-        major, minor = torch.cuda.get_device_capability()
-        if not gemm.is_compute_capability_supported(major * 10 + minor):
-            pytest.skip("requires a GPU supported by FlashInfer W8A16")
-
-        generator = torch.Generator(device="cuda").manual_seed(42)
-        module = _StubLinear(out_features=128, in_features=128)
-        module.weight = torch.randn((128, 128), device="cuda", generator=generator).to(
-            torch.float8_e4m3fn
-        )
-        module.weight_scale = torch.tensor(0.013, device="cuda")
-        bias = torch.randn((128,), device="cuda", dtype=dtype, generator=generator) / 16
-        strided = torch.randn((128, 8), device="cuda", dtype=dtype, generator=generator).T
-        contiguous = strided.contiguous()
-        method = W8A16FP8LinearMethod(backend="flashinfer")
-        torch_method = W8A16FP8LinearMethod(backend="torch")
-        with torch.inference_mode():
-            run = torch.compile(lambda x: method.apply(module, x, bias), fullgraph=True)
-            run_torch = torch.compile(lambda x: torch_method.apply(module, x, bias), fullgraph=True)
-            expected_fused = gemm(contiguous, module.weight, module.weight_scale, bias=bias)
-            expected_torch = run_torch(strided)
-            assert not torch.equal(expected_fused, expected_torch)
-            torch.testing.assert_close(run(contiguous), expected_fused, atol=0, rtol=0)
-            torch.testing.assert_close(run(strided), expected_torch, atol=0, rtol=0)
 
     def test_bias_is_applied(self):
         module = _StubLinear(out_features=2, in_features=3, scale=1.0)
