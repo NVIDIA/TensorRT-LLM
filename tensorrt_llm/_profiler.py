@@ -305,7 +305,7 @@ class _RecordFunctionWithMetadata:
         @wraps(func)
         def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
             """Bypass scope construction unless workflow profiling is active."""
-            if not custom_region_active("workflow"):
+            if torch.compiler.is_compiling() or not torch.autograd._profiler_enabled():
                 return func(*args, **kwargs)
             return profiled(*args, **kwargs)
 
