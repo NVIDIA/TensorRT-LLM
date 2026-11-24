@@ -433,6 +433,7 @@ class Router(ABC):
         self._discovered_context_servers: set[str] = set()
         self._context_probe_limit = asyncio.Semaphore(
             _MAX_METADATA_HEALTH_PROBES)
+        self._last_grant_probe: Optional[str] = None
 
     async def close(self):
         """Close the shared HTTP session."""
@@ -468,6 +469,17 @@ class Router(ABC):
     @property
     def has_prepared_server(self) -> bool:
         return not self._prepared_ready_servers.isdisjoint(self._servers)
+
+    @property
+    def requires_context_cancellation(self) -> bool:
+        """Whether CTX placement requires a verified cancellation grant."""
+        return self._require_context_cancellation
+
+    @property
+    def has_verified_live_registration(self) -> bool:
+        """Whether a currently listed worker has a verified registration."""
+        return not self._server_registration_ids.keys().isdisjoint(
+            self._servers)
 
     @property
     def prepared_servers(self) -> set[str]:
@@ -785,10 +797,20 @@ class Router(ABC):
         self.retire_context_registrations(admissions)
         verified = self._server_registration_ids.copy()
         self._server_registration_ids = verified
+        pending = [server for server in servers if server not in verified]
+        # A refresh can expire with probes still waiting for the semaphore.
+        # Start the next pass after the last probe that actually got a slot.
+        last = self._last_grant_probe
+        if last is not None and last in pending:
+            pivot = pending.index(last) + 1
+            pending = pending[pivot:] + pending[:pivot]
 
         async def verify(server: str) -> Optional[RuntimeError]:
             try:
                 async with self._context_probe_limit:
+                    if self._server_registration_ids is not verified:
+                        return None
+                    self._last_grant_probe = server
                     info = await self._fetch_server_info(server, timeout_s)
                 async with self._lock:
                     if self._server_registration_ids is verified:
@@ -809,8 +831,7 @@ class Router(ABC):
                     f"CTX probe unavailable for {server}")
             return None
 
-        errors = await asyncio.gather(*(verify(server) for server in servers
-                                        if server not in verified))
+        errors = await asyncio.gather(*(verify(server) for server in pending))
         if self._server_registration_ids is not verified:
             raise ServerPreparationPending(
                 "A newer CTX admission snapshot superseded the probe")
@@ -984,7 +1005,7 @@ class Router(ABC):
         """An unreadable registry invalidates all grants, unlike a failed worker probe."""
         try:
             return await self.fetch_live_servers(matching_role_only=True)
-        except _REGISTRY_IO_ERRORS as error:
+        except (*_REGISTRY_IO_ERRORS, UnicodeDecodeError) as error:
             # Revoke placement grants together; request records retain their
             # original owners for finish and worker-side cancellation.
             async with self._lock:
@@ -3098,10 +3119,9 @@ class CoordinatorDelegatingRouter(Router):
 
     @property
     def has_prepared_server(self) -> bool:
-        if self._role == "context" and self._local._require_context_cancellation:
+        if self._role == "context" and self._local.requires_context_cancellation is True:
             # A superseded URL can remain in the mirror while its new grant is probed.
-            return not self._local._server_registration_ids.keys().isdisjoint(
-                self._local.servers)
+            return self._local.has_verified_live_registration
         return self._local.has_prepared_server
 
     @property
@@ -3271,7 +3291,7 @@ class CoordinatorDelegatingRouter(Router):
         if body["server"] is None:
             raise ValueError(f"coordinator /select placed no {self._role} "
                              f"server: {info}")
-        if self._role == "context" and self._local._require_context_cancellation is True:
+        if self._role == "context" and self._local.requires_context_cancellation is True:
             admission = info.get("context_admission")
             if not isinstance(admission, str) or not admission:
                 # Without the grant's identity an unconditional finish could

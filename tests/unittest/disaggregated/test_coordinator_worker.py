@@ -1395,7 +1395,17 @@ async def test_protected_metadata_rechecks_repaired_registration() -> None:
 
 
 @pytest.mark.asyncio
-async def test_protected_monitor_revalidates_after_registry_outage() -> None:
+@pytest.mark.parametrize(
+    "snapshot_error",
+    [
+        ConnectionError("registry unavailable"),
+        UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid"),
+    ],
+    ids=["disconnected", "unreadable-enumeration"],
+)
+async def test_protected_monitor_revalidates_after_registry_outage(
+    snapshot_error: Exception,
+) -> None:
     """Revoking placement during an outage must not lose the prior request's finish."""
     server = "ctx:8000"
     record = {"url": server, "server_role": "context"}
@@ -1427,9 +1437,7 @@ async def test_protected_monitor_revalidates_after_registry_outage() -> None:
         assert owner._num_active_requests == 1
         router._fetch_server_info.side_effect = verify_again
         # Even an unchanged registration must obtain a fresh grant after an outage.
-        registry.keys.side_effect = chain(
-            [ConnectionError("registry unavailable")], repeat(["trtllm/v1"])
-        )
+        registry.keys.side_effect = chain([snapshot_error], repeat(["trtllm/v1"]))
         await router.start_server_monitoring(poll_interval=0.01)
         await asyncio.wait_for(reprobe.wait(), 5)
         assert not router.has_prepared_server and not router.context_admissions()
@@ -2303,6 +2311,50 @@ async def test_protected_frontend_serves_verified_peer_during_failing_join(
     finally:
         release.set()
         await asyncio.gather(refresh, return_exceptions=True)
+        await client.stop()
+
+
+@pytest.mark.asyncio
+async def test_interrupted_grant_refresh_gives_untried_worker_a_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _context_cancellation_config(monkeypatch, router="round_robin")
+    client = CoordinatorClient("http://coordinator", config)
+    router = client.ctx_router
+    router._context_probe_limit = asyncio.Semaphore(1)
+    started = asyncio.Queue()
+    release = asyncio.Event()
+    grants = {"slow:1": "first", "healthy:2": "second"}
+
+    async def probe(server, _timeout):
+        started.put_nowait(server)
+        if server == "slow:1":
+            await release.wait()
+            raise RuntimeError("worker unavailable")
+        return {"supports_logical_context_cancellation": True}
+
+    router._fetch_server_info = probe
+
+    def refresh():
+        return asyncio.create_task(router.sync_context_grants(list(grants), grants, 5))
+
+    task = refresh()
+    try:
+        assert await asyncio.wait_for(started.get(), 2) == "slow:1"
+        task.cancel()  # A bounded refresh expires before all queued probes can start.
+        await asyncio.gather(task, return_exceptions=True)
+        assert not router.has_prepared_server
+
+        task = refresh()
+        assert await asyncio.wait_for(started.get(), 2) == "healthy:2"
+        release.set()
+        await task
+        assert router.servers == ["healthy:2"]
+        assert router.server_registration_id("healthy:2") == "second"
+    finally:
+        release.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
         await client.stop()
 
 

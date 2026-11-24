@@ -312,6 +312,8 @@ configs:
     - GET /steady_clock_offset _MsgspecRoute
     - POST /steady_clock_offset _MsgspecRoute
     - POST /kv_cache_events _MsgspecRoute
+    - POST /internal/context-cancellation/reserve _MsgspecRoute
+    - POST /internal/context-cancellation/cancel _MsgspecRoute
     - POST /v1/completions _MsgspecRoute
     - POST /v1/chat/completions _MsgspecRoute
     - POST /v1/messages _MsgspecRoute

@@ -73,8 +73,7 @@ from tensorrt_llm.serve.router import (
     ServerPreparationPending,
 )
 
-# Finish reasons for which a GEN handoff is still pending; any other reason means
-# the CTX request already completed and the disagg KV-cache handoff was never set up.
+# Public CTX finish reasons that require GEN even without a remote tail.
 _GEN_PENDING_FINISH_REASONS = ("length", "not_finished")
 
 
@@ -248,6 +247,14 @@ class _ContextCancellation:
             raise
         return self._token
 
+    def discard_if_no_handoff(self, response: UCompletionResponse) -> None:
+        """A verified CTX response without a published transfer needs no cancellation."""
+        if all(
+            slot.disaggregated_params.ctx_request_id is None
+            for slot in _ctx_handoff_slots(response)
+        ):
+            self._token = None
+
     async def _deliver_cancellation(self) -> None:
         """Try idempotent delivery twice within one fixed ten-second control budget.
 
@@ -296,7 +303,7 @@ class _ContextCancellation:
     async def cancel(self) -> None:
         """Share bounded cancellation delivery without resetting its budget.
 
-        The token is cleared only after a routing receipt. Repeated caller
+        Delivery clears the token only after a routing receipt. Repeated caller
         cancellation cannot cancel delivery, reopen admission, or extend the
         worker's transfer or quiescence deadlines.
         """
@@ -594,6 +601,9 @@ class OpenAIDisaggregatedService(OpenAIService):
                 ctx_response_disagg_params = _ctx_handoff_slots(ctx_response)[
                     0
                 ].disaggregated_params
+                if cancellation is not None:
+                    # Detokenization can report stop after the native CTX handoff was published.
+                    cancellation.discard_if_no_handoff(ctx_response)
                 if ctx_response_disagg_params.disagg_request_id is not None:
                     disagg_request_id = ctx_response_disagg_params.disagg_request_id
                     if hooks:
@@ -668,6 +678,9 @@ class OpenAIDisaggregatedService(OpenAIService):
                 self._output_length_priority.track(ctx_response, length_ticket)
             if gen_server:
                 await self._gen_router.finish_request(request, req_id=gen_reservation_id)
+            if cancellation is not None:
+                # No generation worker will fetch a handoff published by CTX.
+                await cancellation.cancel()
             if hooks:
                 hooks.on_resp_done("", request, ctx_response)
             if request.stream:
@@ -888,10 +901,8 @@ class OpenAIDisaggregatedService(OpenAIService):
                         f"Context server choice {idx} did not return disaggregated params."
                         f" finish_reason={choice.finish_reason!r}"
                     )
-                # A CTX request that finished early (e.g. EOS during prefill) never
-                # sets up the KV-cache handoff, so ctx_request_id/disagg_request_id
-                # stay None. Only enforce them when a GEN handoff is still pending --
-                # mirroring _need_gen, which skips the handoff for these responses.
+                # Native EOS can finish without publishing a handoff. Require its
+                # identifiers only when GEN will consume it.
                 remote_tail = choice.disaggregated_params.remote_tail_start is not None
                 if choice.finish_reason in _GEN_PENDING_FINISH_REASONS or remote_tail:
                     if choice.disaggregated_params.ctx_request_id is None:

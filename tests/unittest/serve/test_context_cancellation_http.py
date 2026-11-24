@@ -894,18 +894,39 @@ def test_protected_coordinator_rejects_missing_prerequisites(
 
 
 @pytest.mark.asyncio
-async def test_context_eos_needs_no_generation_and_keeps_success(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("ctx_request_id", [None, 0], ids=["native-eos", "published-handoff"])
+@pytest.mark.parametrize("reply", ["non-streaming", "streaming", "close-before-first-frame"])
+async def test_context_stop_cancels_only_a_published_handoff(
+    monkeypatch: pytest.MonkeyPatch, ctx_request_id: int | None, reply: str
 ) -> None:
+    """A stop string can finish a CTX reply after the first token started its KV transfer."""
     service = _service(monkeypatch)
-    service._ctx_client.send_request.return_value = _response("stop")
-    result = await service._send_disagg_request_ctx_first(
-        CompletionRequest(model="model", prompt="hello")
+    service._coordinator.is_ready = AsyncMock(return_value=True)
+    ctx_response = _response("stop")
+    ctx_response.choices[0].disaggregated_params.ctx_request_id = ctx_request_id
+    service._ctx_client.send_request.return_value = ctx_response
+    result = await service.openai_completion(
+        CompletionRequest(
+            model="model", prompt="hello", stop=["end"], stream=reply != "non-streaming"
+        )
     )
-    assert result.choices[0].finish_reason == "stop"
-    assert result.choices[0].disaggregated_params is None
+    cancel = service._ctx_client.cancel_context_cancellation
+    # An unfetched transfer is cancelled even if the caller never consumes the stream.
+    assert cancel.await_count == int(ctx_request_id is not None)
+    if reply == "non-streaming":
+        assert result is ctx_response
+    elif reply == "streaming":
+        assert [frame async for frame in result] == [b"data: [DONE]\n\n"]
+    else:
+        await result.aclose()
+    assert ctx_response.choices[0].finish_reason == "stop"
+    assert ctx_response.choices[0].disaggregated_params is None
+    service._gen_router.get_next_server.assert_not_awaited()
     service._gen_client.send_request.assert_not_awaited()
-    service._ctx_client.cancel_context_cancellation.assert_not_awaited()
+    if ctx_request_id is None:
+        cancel.assert_not_awaited()
+    else:
+        cancel.assert_awaited_once_with("ctx:8000", "worker-token")
 
 
 @pytest.mark.asyncio
