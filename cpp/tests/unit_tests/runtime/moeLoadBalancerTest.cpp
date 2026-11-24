@@ -31,6 +31,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cuda.h>
+#include <dlfcn.h>
 #include <exception>
 #include <future>
 #include <memory>
@@ -1047,6 +1048,45 @@ TEST(MoeLoadBalancerCpuCopyTest, UpdateCopiesMovedExpertsIntoSlots)
     }
 }
 
+TEST(MoeLoadBalancerAbandonTest, SlotsWritableOnlyAfterAbandonIterationsEndedTheUpdates)
+{
+    ScopedEnv const allowManagedFallback("TLLM_HOST_ACCESSIBLE_ALLOW_MANAGED_FALLBACK", "1");
+    TLLM_CUDA_CHECK(cudaSetDevice(0));
+    using Placement = std::vector<std::vector<int>>;
+    // Expert 1 carries the load, so the update of iteration 0 gives it a second slot.
+    std::vector<int> const initialAssignments{0, 1, 0};
+    std::vector<float> const loads{1, 20};
+    SimulatedEpRank rank(
+        /*epRank=*/0, /*epSize=*/1, /*expertCount=*/2, /*slotCountPerRank=*/3, /*layerCount=*/1, initialAssignments);
+    rank.balancer().startIter(0, /*enableStatistic=*/true, /*enableUpdateWeights=*/true);
+    runLayerOnGpu(rank.layer(0), 0, loads, /*handBack=*/true);
+    rank.balancer().endIter(0);
+
+    // The worker is soon done with iteration 0, while the weight update it started may still run.
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    bool writable = false;
+    while (!writable && std::chrono::steady_clock::now() < deadline)
+    {
+        try
+        {
+            rank.balancer().checkSlotsWritable();
+            writable = true;
+        }
+        catch (tensorrt_llm::common::TllmException const&)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    EXPECT_FALSE(writable) << "slots writable before abandonIterations ended the weight update";
+    EXPECT_THROW(
+        rank.balancer().restorePlacement({}, {Placement{initialAssignments}}), tensorrt_llm::common::TllmException);
+
+    rank.balancer().abandonIterations();
+    EXPECT_NO_THROW(rank.balancer().checkSlotsWritable());
+    EXPECT_NE(rank.layer(0).getOldRankExpertIds(), Placement{initialAssignments});
+    rank.expectSlotsHoldPlacement(0);
+}
+
 TEST(MoeLoadBalancerAbandonTest, AbandonIterationsWaitsForTheLaunchedWork)
 {
     ScopedEnv const allowManagedFallback("TLLM_HOST_ACCESSIBLE_ALLOW_MANAGED_FALLBACK", "1");
@@ -1148,7 +1188,31 @@ int64_t eplbDeviceBytes()
     return 0;
 }
 
+using SetAccess = CUresult (*)(CUdeviceptr, size_t, CUmemAccessDesc const*, size_t);
+
+//! Return the driver's cuMemSetAccess, or nullptr if dlsym does not find it.
+SetAccess driverSetAccess()
+{
+    static auto const setAccess = reinterpret_cast<SetAccess>(dlsym(RTLD_NEXT, "cuMemSetAccess"));
+    return setAccess;
+}
+
+//! The number of upcoming cuMemSetAccess calls to fail.
+int sAccessGrantsToFail = 0;
+
 } // namespace
+
+// Defined in the test binary, which compiles unbackedSlotMemory.cpp, so a test can fail one access grant.
+extern "C" CUresult CUDAAPI cuMemSetAccess(CUdeviceptr ptr, size_t size, CUmemAccessDesc const* desc, size_t count)
+{
+    if (sAccessGrantsToFail > 0)
+    {
+        --sAccessGrantsToFail;
+        return CUDA_ERROR_OUT_OF_MEMORY;
+    }
+    SetAccess const setAccess = driverSetAccess();
+    return setAccess != nullptr ? setAccess(ptr, size, desc, count) : CUDA_ERROR_NOT_FOUND;
+}
 
 TEST(UnbackedSlotMemoryTest, SavesOnlyChunksInsideUnbackedSlots)
 {
@@ -1212,6 +1276,29 @@ TEST(UnbackedSlotMemoryTest, LedgerRecordsBackedSlotMemory)
     EXPECT_EQ(eplbDeviceBytes() - before, 2 * granularity);
     EXPECT_EQ(memory.setBacked(ptr, {1}, false), size_t(granularity));
     EXPECT_EQ(eplbDeviceBytes() - before, granularity);
+    memory.free(ptr);
+    EXPECT_EQ(eplbDeviceBytes(), before);
+}
+
+TEST(UnbackedSlotMemoryTest, FailedAccessGrantKeepsSlotUnbackedAndRetrySucceeds)
+{
+    ASSERT_NE(driverSetAccess(), nullptr) << "dlsym(RTLD_NEXT, \"cuMemSetAccess\") did not find the driver's function";
+    TLLM_CUDA_CHECK(cudaSetDevice(0));
+    auto& memory = UnbackedSlotMemory::getInstance();
+    auto const granularity = static_cast<int64_t>(slotMemoryGranularity());
+    int64_t const before = eplbDeviceBytes();
+    void* ptr = memory.allocate(granularity, 2, {1});
+    auto* slots = static_cast<uint8_t*>(ptr);
+    sAccessGrantsToFail = 1;
+    EXPECT_THROW(memory.setBacked(ptr, {1}, true), tensorrt_llm::common::TllmException);
+    EXPECT_EQ(sAccessGrantsToFail, 0);
+    // The slot maps the scratch again and the failed backing holds no memory.
+    EXPECT_EQ(memory.bytesToBack(ptr, {1}), size_t(granularity));
+    EXPECT_EQ(eplbDeviceBytes() - before, granularity);
+    EXPECT_EQ(memory.setBacked(ptr, {1}, true), size_t(granularity));
+    TLLM_CUDA_CHECK(cudaMemset(slots + granularity, 0xCD, granularity));
+    EXPECT_EQ(readByte(slots, granularity), 0xCD);
+    EXPECT_EQ(eplbDeviceBytes() - before, 2 * granularity);
     memory.free(ptr);
     EXPECT_EQ(eplbDeviceBytes(), before);
 }
