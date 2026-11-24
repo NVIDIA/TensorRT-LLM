@@ -249,8 +249,15 @@ def test_cache_miss_uses_the_vectorized_kernel(monkeypatch):
     x = torch.randn(4177, 3072, device="cuda", dtype=torch.bfloat16)
     tuner = AutoTuner()
     tuner.is_tuning_mode = False
-    with patch.object(AutoTuner, "get", return_value=tuner):
+    with (
+        patch.object(AutoTuner, "get", return_value=tuner),
+        torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as profile,
+    ):
         q, scale = torch.ops.trtllm.tunable_fp8_per_token_quant(x)
+    # The warp kernel's output equals the vectorized kernel's, so check which kernel ran.
+    kernels = [event.name for event in profile.events()]
+    assert any("dynamic_per_token_scaled_fp8_quant" in name for name in kernels), kernels
+    assert not any("warpPerTokenFp8QuantKernel" in name for name in kernels), kernels
     expected_q, expected_scale = torch.ops.tensorrt_llm.vectorized_per_token_fp8_quant(x)
     assert torch.equal(q.view(torch.uint8), expected_q.view(torch.uint8))
     torch.testing.assert_close(
@@ -292,6 +299,8 @@ def test_warp_fp8_quant_reference(dtype, enable_pdl):
     q, scale = torch.ops.tensorrt_llm.warp_per_token_fp8_quant(x, enable_pdl)
     reference_q, reference_scale = torch.ops.tensorrt_llm.vectorized_per_token_fp8_quant(x)
     torch.testing.assert_close(scale, expected_scale, rtol=1e-6, atol=0)
+    # The global metrics below would hide errors in the zero and tiny rows.
+    assert torch.equal(q[:2].view(torch.uint8), expected_q[:2].view(torch.uint8))
     _assert_quantized_parity(q.float() * scale, expected_q.float() * expected_scale)
     _assert_quantized_parity(q.float() * scale, reference_q.float() * reference_scale)
 
