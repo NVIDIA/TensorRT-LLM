@@ -181,8 +181,18 @@ def test_validation_rejects_tactics_dedup_cannot_run(op: types.ModuleType) -> No
     no_bulk[6], no_bulk[7] = False, None
     with pytest.raises(ValueError, match="use_bulk_fc2_store=False"):
         op.validate_megamoe_tactic(tuple(no_bulk), sm_version=107)
-    with pytest.raises(ValueError, match="SM100"):
-        op.validate_megamoe_tactic(_DEDUP, sm_version=100)
+    for sm_version in (100, 103):
+        op.validate_megamoe_tactic(_DEDUP, sm_version=sm_version)
+    # hybrid_warps is a dedup-only token-back mode; dedup's token comm batches token-in flags
+    # with standalone_warps too, which the plain standalone path does not.
+    hybrid = (*_DEDUP[:5], "hybrid_warps", *_DEDUP[6:])
+    op.validate_megamoe_tactic(hybrid, sm_version=100)
+    with pytest.raises(ValueError, match="hybrid_warps"):
+        op.validate_megamoe_tactic((*hybrid[:11], False), sm_version=100)
+    standalone = (*_DEDUP[:5], "standalone_warps", *_DEDUP[6:8], 4, *_DEDUP[9:])
+    op.validate_megamoe_tactic(standalone, sm_version=100)
+    with pytest.raises(ValueError, match="flag_batch == 1"):
+        op.validate_megamoe_tactic((*standalone[:11], False), sm_version=100)
 
 
 def test_query_and_runner_build_the_same_dedup_kernel(
@@ -218,11 +228,8 @@ def test_query_and_runner_build_the_same_dedup_kernel(
     assert runner._tactic_cache_key(_DEDUP) != runner._tactic_cache_key(plain)
 
 
-@pytest.mark.parametrize("sm_version, capacity", [(107, 256), (100, 8192)])
-def test_dedup_never_reaches_a_kernel_without_the_option(
-    op: types.ModuleType, sm_version: int, capacity: int
-) -> None:
-    common = dict(
+def _dedup_common(capacity: int) -> dict:
+    return dict(
         static_expert_shape=(96, 6144, 7168),
         world_size=4,
         num_topk=6,
@@ -253,9 +260,29 @@ def test_dedup_never_reaches_a_kernel_without_the_option(
         weight_evict_first=False,
         combine_dedup=True,
     )
-    # A gen-phase bucket and the Blackwell kernel would drop the undeclared option.
-    with pytest.raises(ValueError, match="SM107 generic MegaMoE kernel only"):
-        op._construct_megamoe_kernel(sm_version=sm_version, common=common, combine_format="bf16")
+
+
+def test_dedup_never_reaches_a_kernel_without_the_option(op: types.ModuleType) -> None:
+    # The SM107 gen-phase kernel would drop the undeclared option.
+    with pytest.raises(ValueError, match="generic MegaMoE kernels only"):
+        op._construct_megamoe_kernel(
+            sm_version=107, common=_dedup_common(256), combine_format="bf16"
+        )
+
+
+@pytest.mark.parametrize("sm_version", [100, 103])
+def test_blackwell_kernel_takes_dedup_and_hybrid_warps(
+    op: types.ModuleType, sm_version: int
+) -> None:
+    for capacity in (256, 8192):
+        for mode in ("reuse_dispatch_warps", "standalone_warps", "hybrid_warps"):
+            common = dict(_dedup_common(capacity), token_back_mode=mode)
+            kernel, rejection = op._construct_megamoe_kernel(
+                sm_version=sm_version, common=common, combine_format="bf16"
+            )
+            assert rejection is None
+            assert kernel.implementation["combine_dedup"] is True
+            assert kernel.implementation["token_back_mode"] == mode
 
 
 def test_shape_defaults_and_autotune_space_never_select_dedup(op: types.ModuleType) -> None:
@@ -270,7 +297,11 @@ def test_shape_defaults_and_autotune_space_never_select_dedup(op: types.ModuleTy
                 combine_format="bf16",
             )
             assert len(tactic) == 12 and tactic[11] is False
-    for table in (op._SM107_DSV4_PRO_DEFAULT_TACTICS.values(), op._SM107_GENPHASE_TACTICS.values()):
+    for table in (
+        op._SM107_DSV4_PRO_DEFAULT_TACTICS.values(),
+        op._SM107_GENPHASE_TACTICS.values(),
+        op._SM100_DSV4_EP4_DEFAULT_TACTICS.values(),
+    ):
         assert all(op._unpack_tactic(tactic)[11] is False for tactic in table)
     # The provider is sized for the default and its non-dedup base only, so the
     # tuning space never proposes any other dedup tactic.
@@ -370,3 +401,106 @@ def test_query_sizes_the_provider_for_dedup_and_its_base(
         inputs = [SimpleNamespace(shape=(tokens, 7168))]
         tactics = runner.get_valid_tactics(inputs, None)
         assert [t for t in tactics if op._unpack_tactic(t)[11]] == [default]
+
+
+def test_sm100_dedup_defaults_have_a_plain_base(op: types.ModuleType) -> None:
+    assert op._SM100_DSV4_EP4_COMBINE_DEDUP_TACTICS
+    for key, dedup in op._SM100_DSV4_EP4_COMBINE_DEDUP_TACTICS.items():
+        tokens = key[7]
+        assert op._megamoe_default_combine_dedup(key)
+        tactic = op._default_megamoe_tactic_for_key(key, num_tokens=tokens)
+        assert tactic == op._unpack_tactic(dedup) and tactic[11] is True
+        op.validate_megamoe_tactic(tactic, sm_version=100)
+        assert tactic[5] in ("standalone_warps", "hybrid_warps")
+        # The non-dedup form (fused shared expert, provider sizing) only changes the token-back mode.
+        base = op._default_megamoe_tactic_for_key(key, num_tokens=tokens, combine_dedup=False)
+        assert base == (*tactic[:5], "epi_warps", *tactic[6:11], False)
+        op.validate_megamoe_tactic(base, sm_version=100)
+    for key, tactic in op._SM100_DSV4_EP4_DEFAULT_TACTICS.items():
+        assert (
+            key[0] == 100
+            and key[1:4] == (4, 6, 96)
+            and key[9:] == (True, 10.0, None, None, False, "bf16", None, None, 0)
+        )
+        op.validate_megamoe_tactic(tactic, sm_version=100)
+        assert op._default_megamoe_tactic_for_key(key, num_tokens=key[7], combine_dedup=False) == (
+            op._unpack_tactic(tactic)
+        )
+        # GB300 keeps its own tables: an SM103 key never takes a GB200 entry.
+        sm103 = (103, *key[1:])
+        assert op._default_megamoe_tactic_for_key(sm103, num_tokens=key[7])[11] is False
+        assert op._shape_tuned_megamoe_tactic(sm103) != tactic
+
+
+@pytest.mark.parametrize(
+    "index, value",
+    [
+        (0, 103),  # SM103 kernel
+        (1, 8),  # world size
+        (9, False),  # top-k at FC2
+        (10, None),  # gate/up clamp
+        (14, "32e4m3xe8m0"),  # quantized combine
+        (17, 2),  # helper experts
+    ],
+)
+def test_sm100_dedup_default_stays_in_its_problem(
+    op: types.ModuleType, index: int, value: object
+) -> None:
+    for key in op._SM100_DSV4_EP4_COMBINE_DEDUP_TACTICS:
+        changed = list(key)
+        changed[index] = value
+        assert not op._megamoe_default_combine_dedup(tuple(changed))
+        tactic = op._default_megamoe_tactic_for_key(tuple(changed), num_tokens=key[7])
+        assert tactic[11] is False
+
+
+def test_sm100_runner_dedups_only_without_the_fused_shared_expert(
+    op: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def sizes(kernel: _KernelMetadata) -> tuple[int, int]:
+        rows = kernel.problem["world_size"] if kernel.implementation.get("combine_dedup") else 6
+        return 384, rows * 128
+
+    monkeypatch.setattr(_KernelMetadata, "get_workspace_sizes", sizes)
+    monkeypatch.setattr(op, "get_sm_version", lambda: 100)
+    monkeypatch.setattr(op, "_max_active_clusters", lambda size, *args: 148 // size)
+    for key in op._SM100_DSV4_EP4_COMBINE_DEDUP_TACTICS:
+        tokens = key[7]
+        query = dict(
+            world_size=4,
+            num_topk=6,
+            num_experts_per_rank=96,
+            hidden_size=key[4],
+            intermediate_size_per_partition=key[5],
+            expand_intermediate_size_per_partition=key[6],
+            max_tokens_per_rank=tokens,
+            gate_up_clamp=10.0,
+        )
+        # Fits the dedup default (4 rows per token) and its plain base (top-k rows).
+        assert op.query_megamoe_kernel_properties(**query) == (6 * 128, False)
+        runner = op.Sm100MegaMoENvfp4Runner(**_problem(**query, output_dtype="torch.bfloat16"))
+        assert runner.unique_id() == key
+        default = runner._default_tactic(tokens)
+        assert default[11] is True
+        assert runner._build_kernel_once(default).implementation["combine_dedup"] is True
+        tactics = runner.get_valid_tactics([SimpleNamespace(shape=(tokens, 7168))], None)
+        assert [t for t in tactics if op._unpack_tactic(t)[11]] == [default]
+        fused = op.Sm100MegaMoENvfp4Runner(
+            **_problem(**query, output_dtype="torch.bfloat16"),
+            shared_intermediate_size=key[5],
+        )
+        assert fused._default_tactic(tokens)[11] is False
+        tactics = fused.get_valid_tactics([SimpleNamespace(shape=(tokens, 7168))], None)
+        assert not any(op._unpack_tactic(t)[11] for t in tactics)
+
+
+def test_sm100_tables_hold_the_measured_buckets(op: types.ModuleType) -> None:
+    # Pinned independently of the tables: GB200 EP4 buckets measured faster than the token-bucket
+    # default in both rounds of balanced and power-law routing; Pro 2048 was not.
+    assert {(key[4], key[7]) for key in op._SM100_DSV4_EP4_DEFAULT_TACTICS} == {
+        (7168, tokens) for tokens in (4096, 8192, 16384, 32768)
+    } | {(5120, tokens) for tokens in (2048, 4096, 8192, 16384, 32768)}
+    dedup = {(key[4], key[7]): t[5] for key, t in op._SM100_DSV4_EP4_COMBINE_DEDUP_TACTICS.items()}
+    # Flash 32K: dedup on the standalone warps beat the plain form on power-law routing and tied it
+    # on balanced routing; every other bucket kept the plain form.
+    assert dedup == {(5120, 32768): "standalone_warps"}
