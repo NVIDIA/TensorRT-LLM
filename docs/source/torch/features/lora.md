@@ -99,7 +99,7 @@ outputs = llm.generate(
 
 ### LoRA with Quantization
 
-Load a pre-quantized FP8 base checkpoint compatible with the adapter. The model's
+Load a pre-quantized FP8 checkpoint of the base model the adapter was trained on. The model's
 quantization is read from the checkpoint; use `KvCacheConfig` to select the KV-cache
 dtype separately. See [Quantization](../../features/quantization.md) for preparing a checkpoint.
 
