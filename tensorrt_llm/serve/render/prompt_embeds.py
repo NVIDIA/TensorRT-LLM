@@ -166,6 +166,8 @@ def splice_chat_prompt_embeds(
         mask = [False] * len(prefix) + mask + [False] * len(suffix)
     return {
         "prompt_token_ids": token_ids,
-        "prompt_embeds": torch.cat([r for _, _, r in placed], dim=0),
+        "prompt_embeds": placed[0][2]
+        if len(placed) == 1
+        else torch.cat([r for _, _, r in placed], dim=0),
         "prompt_embeds_mask": mask,
     }

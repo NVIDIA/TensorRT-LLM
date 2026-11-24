@@ -141,6 +141,7 @@ from tensorrt_llm.serve.postprocess_handlers import (
     completion_stream_post_processor, responses_api_post_processor,
     responses_api_streaming_post_processor)
 from tensorrt_llm.serve.prompt_embeds import (DISABLED_MESSAGE,
+                                              ChatPromptEmbedsPart,
                                               decode_prompt_embeds,
                                               has_prompt_embeds_parts,
                                               model_hidden_size, pop_chat_parts,
@@ -368,7 +369,7 @@ def _prepare_completion_embeds(
     return [_snapshot_embeds_prompt({"prompt_embeds": t}) for t in tensors]
 
 
-def _prepare_chat_embeds(text: str, parts: List[Any],
+def _prepare_chat_embeds(text: str, parts: List[ChatPromptEmbedsPart],
                          payload_rows: List[torch.Tensor], res: RenderResources,
                          add_special_tokens: bool) -> Dict[str, Any]:
     """Place chat prompt_embeds parts and snapshot the prompt; blocking."""
