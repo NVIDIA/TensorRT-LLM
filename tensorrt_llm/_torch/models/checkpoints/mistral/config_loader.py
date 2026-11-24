@@ -15,10 +15,9 @@
 
 import importlib.metadata
 import json
-import os
 from copy import deepcopy
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import torch
 from packaging.version import Version
@@ -33,53 +32,6 @@ from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
-
-if TYPE_CHECKING:
-    from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig
-
-
-def resolve_native_dspark_config(
-    params: dict, spec: "DSparkDecodingConfig", checkpoint: str, target_model: str
-) -> None:
-    """Adapt the native draft's trained geometry and checkpoint ownership."""
-    mtp = params.get("mtp") or {}
-    dspark = mtp.get("dspark")
-    if dspark is None:
-        return
-    if os.path.realpath(checkpoint) != os.path.realpath(target_model):
-        raise ValueError("Native Mistral DSpark must use the target checkpoint")
-    if spec.use_ancestral_draft_sampling:
-        raise ValueError(
-            "use_ancestral_draft_sampling=True is not supported with the native "
-            "Mistral DSpark drafter, whose Markov head is recurrent."
-        )
-    layers = [int(layer) for layer in mtp["target_activation_layers"].split(",")]
-    trained = dict(
-        target_layer_ids=layers,
-        block_size=int(mtp["depth"]),
-        markov_rank=int(dspark["markov_rank"]),
-        markov_head_type=dspark["head_type"],
-        mask_token_id=int(params["vocab_size"]),
-    )
-    for field, value in trained.items():
-        override = getattr(spec, field)
-        if override is not None and override != value:
-            raise ValueError(
-                f"Mistral DSpark {field} must match the checkpoint: {value}, got {override}"
-            )
-    if spec.max_draft_len != trained["block_size"]:
-        raise ValueError(
-            "Mistral DSpark max_draft_len must equal the trained block depth "
-            f"{trained['block_size']}"
-        )
-    for field, value in trained.items():
-        setattr(spec, field, value)
-    spec._draft_model_config = mtp
-    # Native draft weights are part of the target's manifest, while its paged
-    # draft runtime and KV cache remain independent of the target's cache.
-    spec._draft_weights_in_target = True
-    spec.speculative_model = checkpoint
-
 
 ###################
 # vllm code here
