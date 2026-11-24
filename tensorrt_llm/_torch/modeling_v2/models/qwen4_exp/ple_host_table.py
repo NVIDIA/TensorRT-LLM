@@ -27,6 +27,7 @@ mode that does not run is a warning, once per process.
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import math
 import os
@@ -275,6 +276,13 @@ class _VmmChunks:
                 raise
             desc.flags = D.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
             _cu(D.cuMemSetAccess(address, self.chunk_bytes, [desc], 1))
+        if not read_only:
+            # The CPU fills the chunks this process creates (`PleHostTable.fill`).
+            host = D.CUmemAccessDesc()
+            host.location.type = D.CUmemLocationType.CU_MEM_LOCATION_TYPE_HOST_NUMA
+            host.location.id = self.node
+            host.flags = D.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
+            _cu(D.cuMemSetAccess(address, self.chunk_bytes, [host], 1))
 
     def create(self, k: int) -> None:
         handle = _cu(cuda_driver.cuMemCreate(self.chunk_bytes, self._prop(self.node), 0))
@@ -486,14 +494,15 @@ class PleHostTable:
 
     def fill(self, copy: Copy, read: Read) -> None:
         """Fill (and in `node`, share and gather) the rows this rank stores; ends with `table`,
-        `window` and `mode` set. Every rank of the server calls it."""
+        `window` and `mode` set. Every rank of the server calls it. Host memory is written by the
+        CPU through its own mapping of the pages (`_host_table`), not by a device copy."""
         if self.device.type != "cuda":
             copy(self.table, 0, self.rows, 0)
             return
         if self.requested != NODE:
             lo, hi, base = self.window or (0, self.rows, 0)
             if hi > lo:
-                copy(self.table, lo, hi, base)
+                copy(self._host_table(), lo, hi, base)
             return
         ok = self._node_error is None and self._fill_node(copy, read)
         if _all_agree(ok):
@@ -512,7 +521,19 @@ class PleHostTable:
         self._declare_private()
         lo, hi, base = self.window or (0, self.rows, 0)
         if hi > lo:
-            copy(self.table, lo, hi, base)
+            copy(self._host_table(), lo, hi, base)
+
+    def _host_table(self) -> torch.Tensor:
+        """`table` as a CPU tensor over the same host pages: the VMM chunks at their own address,
+        which this process's CPU may write once it creates them, or the registered private
+        allocation at its host address."""
+        if self._node.vmm is not None:
+            address = self._node.vmm.va
+        else:
+            (attributes,) = CUASSERT(cudart.cudaPointerGetAttributes(self.table.data_ptr()))
+            address = int(attributes.hostPointer)
+        pages = (ctypes.c_uint8 * (self.table.numel() * self.itemsize)).from_address(address)
+        return torch.frombuffer(pages, dtype=torch.uint8).view(self.dtype).view(self.table.shape)
 
     def _fill_node(self, copy: Copy, read: Read) -> bool:
         vmm = self._node.vmm
@@ -523,9 +544,10 @@ class PleHostTable:
             weakref.finalize(table.untyped_storage(), vmm.close).atexit = False
             self._node.vmm_owned_by_storage = True
             self.table = table
+        host = self._host_table()
         try:
             for k in list(self._node.segments):
-                self._fill_and_publish(k, copy)
+                self._fill_and_publish(k, copy, host)
             for k in range(CHUNKS):
                 if k in self._node.segments:
                     continue
@@ -533,7 +555,7 @@ class PleHostTable:
                 if got[0] == _broker.OWNER:
                     self._node.segments[k] = got[1]
                     vmm.create(k)
-                    self._fill_and_publish(k, copy)
+                    self._fill_and_publish(k, copy, host)
                     continue
                 _, fd, meta = got
                 try:
@@ -550,11 +572,10 @@ class PleHostTable:
             return False
         return vmm.complete()
 
-    def _fill_and_publish(self, k: int, copy: Copy) -> None:
+    def _fill_and_publish(self, k: int, copy: Copy, host: torch.Tensor) -> None:
         lo, hi = chunk_range(k, self.rows, self.cols, self.align)
         if hi > lo:
-            copy(self.table, lo, hi, 0)
-        torch.cuda.synchronize(self.device)
+            copy(host, lo, hi, 0)
         fd = self._node.vmm.export(k)
         self._node.fds.append(fd)
         self._node.segments[k].publish(fd, {"chunk": k, "chunk_bytes": self._node.vmm.chunk_bytes})
