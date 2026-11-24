@@ -298,7 +298,10 @@ class Fusions:
             and prefix_slots.numel() > 0
         ):
             # Marking a dense bool mask is idempotent, so duplicate tokens are safe.
-            presence_prefix_cuda[prefix_slots, prefix_tokens] = True
+            # The values are a device tensor, so no host scalar is copied to the device.
+            presence_prefix_cuda.index_put_(
+                (prefix_slots, prefix_tokens), torch.ones_like(prefix_tokens, dtype=torch.bool)
+            )
 
     # --- Beam-search occurrence counts --------------------------------------
     # Counterpart of the per-beam workspace handling in the former C++
