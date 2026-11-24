@@ -469,8 +469,13 @@ public:
     //!
     //! Both halves are load-bearing: the resolve reads Batch state the publish wrote, and
     //! writes a row's residency back into state the next step rewrites on the Batch's stream.
+    //!
+    //! `unitMask`, when given, is [maxBatchSize][selectionWidth]: the chunks of each selected
+    //! unit that will be read -- for a head-major page, the KV heads that selected it. A
+    //! resident cell missing any of them is filled for just those; nothing else is copied.
+    //! Null reads every chunk, which is what a layout with one chunk per unit does.
     void fetchSparsePages(std::vector<BufferId> const& buffers, int32_t const* selected, int selectionWidth,
-        int32_t* out, std::optional<CUstream> stream = std::nullopt);
+        int32_t* out, std::optional<CUstream> stream = std::nullopt, int32_t const* unitMask = nullptr);
 
     //! Resolve one selection, admitting what it names and listing what has to be copied.
     //!
@@ -487,7 +492,7 @@ public:
     //! running a group's layers together, as the SWA scratch already assumes of the
     //! currently executing layer.
     void resolveSparseSelection(std::vector<BufferId> const& buffers, int32_t const* selected, int selectionWidth,
-        std::optional<CUstream> stream = std::nullopt);
+        std::optional<CUstream> stream = std::nullopt, int32_t const* unitMask = nullptr);
 
     //! Copy one layer's share of a resolved selection into its cells, and write its indices.
     //!

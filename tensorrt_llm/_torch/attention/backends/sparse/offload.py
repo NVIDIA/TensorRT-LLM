@@ -179,6 +179,10 @@ class SparseOffloadState:
     out_slots: dict[int, tuple[int, ...]] = field(default_factory=dict)
     nvfp4_scratch: torch.Tensor | None = None
     coverage: torch.Tensor | None = None
+    #: int32 [B, K], filled with ``selected_history_units``: the chunks (KV heads) that read each
+    #: selected unit, one bit per chunk. None for a layout with one chunk per unit, which reads
+    #: every unit whole.
+    selected_unit_masks: torch.Tensor | None = None
     batch: Batch | None = None
     history_lengths: torch.Tensor | None = None
     prepared: bool = False
@@ -191,6 +195,7 @@ class SparseOffloadState:
         topk: int,
         buffer_counts: Collection[int],
         nvfp4_head_dim: int | None,
+        unit_masks: bool = False,
     ) -> int:
         """Return the device bytes one instance allocates.
 
@@ -201,12 +206,15 @@ class SparseOffloadState:
             topk: Units one row selects, K.
             buffer_counts: The distinct sparse buffer counts F of the layers.
             nvfp4_head_dim: Head dim of the dequantized rows with NVFP4, else None.
+            unit_masks: Whether the state carries per-unit chunk masks.
         """
         # The active count, the selections, the scatter start positions, the
         # Batch row map and any coverage flag, then the fetch outputs and write
         # destinations of each buffer count.
         index_entries = 1 + max_batch_size * topk + 2 * max_batch_size
         index_entries += int(SPARSE_OFFLOAD_DEBUG_ASSERT)
+        if unit_masks:
+            index_entries += max_batch_size * topk
         index_entries += sum(max_batch_size * count * (topk + 1) for count in buffer_counts)
         nvfp4_bytes = 0
         if nvfp4_head_dim is not None:
@@ -222,6 +230,7 @@ def allocate_sparse_offload_state(
     max_batch_size: int,
     topk: int,
     nvfp4_head_dim: int | None = None,
+    unit_masks: bool = False,
 ) -> SparseOffloadState:
     """Allocate an attention metadata's persistent offload state.
 
@@ -232,6 +241,7 @@ def allocate_sparse_offload_state(
         max_batch_size: Rows B, the native Batch capacity.
         topk: Units one row selects.
         nvfp4_head_dim: Head dim of the NVFP4 gather's dequantized rows, else None.
+        unit_masks: Allocate the per-unit chunk masks a head-major layout fetches by.
     """
 
     def index_tensor(name: str, shape: tuple[int, ...], value: int) -> torch.Tensor:
@@ -268,6 +278,9 @@ def allocate_sparse_offload_state(
         scatter_start_positions=index_tensor("scatter_start_positions", (max_batch_size,), 0),
         nvfp4_scratch=nvfp4_scratch(nvfp4_head_dim) if nvfp4_head_dim is not None else None,
         coverage=index_tensor("coverage", (1,), 1) if SPARSE_OFFLOAD_DEBUG_ASSERT else None,
+        selected_unit_masks=(
+            index_tensor("selected_unit_masks", (max_batch_size, topk), 0) if unit_masks else None
+        ),
     )
 
 
@@ -350,6 +363,10 @@ class SparseOffloadCacheMixin:
 
     _enable_kv_cache_offload: bool = False
     _sparse_offload_topk: int | None = None
+    #: Whether this model fetches by chunk (KV head): its metadata then carries per-unit chunk
+    #: masks and passes them to ``fetch_sparse_indices``. Layouts with one chunk per unit leave
+    #: this off and fetch every unit whole.
+    _sparse_offload_unit_masks: bool = False
     _sparse_batch: Batch | None = None
     _sparse_batch_prepared: bool = False
 
@@ -384,6 +401,7 @@ class SparseOffloadCacheMixin:
             topk=self._sparse_offload_topk,
             buffer_counts=buffer_counts,
             nvfp4_head_dim=self._sparse_offload_nvfp4_head_dim(),
+            unit_masks=self._sparse_offload_unit_masks,
         )
 
     def _has_sparse_offload_layers(self) -> bool:
@@ -1012,6 +1030,8 @@ class SparseOffloadCacheMixin:
             )
             state.active_request_count.fill_(live)
             state.selected_history_units.fill_(BAD_PAGE_INDEX)
+            if state.selected_unit_masks is not None:
+                state.selected_unit_masks.fill_(0)
             for out in state.fetched_indices.values():
                 out.fill_(BAD_PAGE_INDEX)
             for out in state.write_indices.values():
@@ -1065,6 +1085,7 @@ class SparseOffloadCacheMixin:
         topk_indices: torch.Tensor,
         request_indices: torch.Tensor,
         unit_lengths: torch.Tensor,
+        unit_masks: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Fetch one layer's history into compact per-buffer arena indices.
 
@@ -1073,6 +1094,11 @@ class SparseOffloadCacheMixin:
         Live queries name distinct requests, one query per request; the prepared
         ``state.batch_rows`` maps each to its Batch row. Q and R may be smaller
         than Batch.max_batch_size.
+
+        ``unit_masks`` is int32 [Q, K], aligned with ``topk_indices``: the chunks (KV heads) that
+        read each selected unit, one bit per chunk. A layout that holds one chunk per unit passes
+        None. Every reader of a unit must be named, because a resident cell is complete only for
+        the chunks fetched into it; the fetch copies just the named chunks the cell lacks.
 
         Return int32[B, F, K] in Batch row order and descriptor.buffer_ids order.
         Each index is relative to that buffer's sparse arena base. Top-k slots
@@ -1102,6 +1128,8 @@ class SparseOffloadCacheMixin:
                 state.history_lengths,
                 state.selected_history_units,
                 unit_tokens=descriptor.unit_tokens,
+                masks=unit_masks,
+                masks_out=state.selected_unit_masks,
             )
             out = state.fetched_indices[len(descriptor.buffer_ids)]
             if layer_idx not in state.out_slots:
@@ -1112,12 +1140,19 @@ class SparseOffloadCacheMixin:
             # on graph replay. Native Batch supplies page tables and watermarks.
             stream = CudaStream(torch.cuda.current_stream().cuda_stream)
             owner = descriptor.selection_owner
+            # Layouts with one chunk per unit carry no masks and keep the unmasked call.
+            mask_kwargs = (
+                {}
+                if state.selected_unit_masks is None
+                else {"unit_masks": state.selected_unit_masks}
+            )
             if owner is None:
                 state.batch.fetch_sparse_pages(
                     buffers=descriptor.buffer_ids,
                     selected=state.selected_history_units,
                     out=out,
                     stream=stream,
+                    **mask_kwargs,
                 )
             else:
                 # The layers an indexer selects for share one resident set, so the
@@ -1130,6 +1165,7 @@ class SparseOffloadCacheMixin:
                         buffers=descriptor.buffer_ids,
                         selected=state.selected_history_units,
                         stream=stream,
+                        **mask_kwargs,
                     )
                 state.batch.fetch_resolved_pages(
                     buffers=descriptor.buffer_ids,

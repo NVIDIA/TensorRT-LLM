@@ -356,7 +356,7 @@ Batch::LayoutGenerator Batch::_layoutStepScratchForLifecycle(LifeCycleId lcId)
     auto const flushCount = rows * layers;
 
     int32_t* cursor
-        = co_yield outSlot + rows + inFlightSlot + 3 * (fetchEntries + restoreEntries + flushEntries) + flushCount;
+        = co_yield outSlot + rows + inFlightSlot + 4 * (fetchEntries + restoreEntries + flushEntries) + flushCount;
 
     auto const carve = [&cursor](size_t count)
     {
@@ -372,9 +372,13 @@ Batch::LayoutGenerator Batch::_layoutStepScratchForLifecycle(LifeCycleId lcId)
         work.row = carve(entries);
         work.ordinal = carve(entries);
         work.slot = carve(entries);
+        work.mask = carve(entries);
     };
     carveList(scratch.fetchWork, fetchEntries);
     carveList(scratch.restoreWork, restoreEntries);
+    // A restore copies a growing unit's prefix through every chunk, and its fixed list is
+    // never given masks, so the copy must read none.
+    scratch.restoreWork.mask = nullptr;
     carveList(scratch.flushWork, flushEntries);
     scratch.flushCount = carve(flushCount);
     // -1 so that "no write-back has run" stays distinguishable from "one ran and found
@@ -1948,18 +1952,18 @@ std::vector<int> Batch::sparseOutSlots(std::vector<BufferId> const& buffers) con
 }
 
 void Batch::fetchSparsePages(std::vector<BufferId> const& buffers, int32_t const* selected, int selectionWidth,
-    int32_t* out, std::optional<CUstream> streamOpt)
+    int32_t* out, std::optional<CUstream> streamOpt, int32_t const* unitMask)
 {
     auto const span = mManager->_sparseLayerSpan(buffers, "fetchSparsePages");
     TLLM_CHECK_WITH_INFO(mManager->_selectionLayerCount(span.lifeCycle, span.selectionSlot) == 1,
         "fetchSparsePages: this layer shares its selection_id, so its selection is resolved once for every "
         "layer naming it; call resolveSparseSelection() then fetchResolvedPages()");
-    resolveSparseSelection(buffers, selected, selectionWidth, streamOpt);
+    resolveSparseSelection(buffers, selected, selectionWidth, streamOpt, unitMask);
     fetchResolvedPages(buffers, selected, selectionWidth, out, streamOpt);
 }
 
 void Batch::resolveSparseSelection(std::vector<BufferId> const& buffers, int32_t const* selected, int selectionWidth,
-    std::optional<CUstream> streamOpt)
+    std::optional<CUstream> streamOpt, int32_t const* unitMask)
 {
     CUstream const stream = streamOpt.value_or(cudaStream());
     TLLM_CHECK_WITH_INFO(selected != nullptr, "resolveSparseSelection: selected must be a device pointer");
@@ -1982,6 +1986,7 @@ void Batch::resolveSparseSelection(std::vector<BufferId> const& buffers, int32_t
     resolve.selectionSlot = span.selectionSlot;
     resolve.selected = selected;
     resolve.selectionWidth = selectionWidth;
+    resolve.unitMask = unitMask;
     resolve.historyTokens = reinterpret_cast<int32_t const*>(marks.historyLength);
     resolve.capacityTokens = reinterpret_cast<int32_t const*>(marks.capacity);
     resolve.unitTokens = mManager->sparseCacheUnitTokens(lcId);
@@ -2124,8 +2129,16 @@ void Batch::_buildSparseArenas()
             .numBuffers = mManager->sparseCacheBufferCount(lcId),
             .entriesPerSelection = cellsPerBuffer * mManager->sparseCacheUnitsPerPage(lcId),
             .cellsPerBuffer = cellsPerBuffer,
+            .unitChunks = static_cast<int32_t>(plan.front().layout.numChunks),
             .layerSelection = mManager->_sparseLayerSelection(lcId),
         };
+        for (auto const& entry : plan)
+        {
+            // One validity byte per entry serves every buffer of the life cycle, so they must
+            // agree on what a chunk is.
+            TLLM_CHECK_WITH_INFO(static_cast<int32_t>(entry.layout.numChunks) == shape.unitChunks,
+                "Sparse buffers of one life cycle must share a chunk count per unit");
+        }
         (void) checkedSparseResolveSharedBytes(shape.entriesPerSelection, mManager->_sparseCacheSelectionWidth(lcId),
             mManager->_sparseCacheMaxInFlightUnits(lcId));
 

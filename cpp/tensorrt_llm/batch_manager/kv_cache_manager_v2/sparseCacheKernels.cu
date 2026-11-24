@@ -73,6 +73,13 @@ __device__ inline uint32_t* leaseMetadata(SparseArenaView const& arena, SparseLe
     return reinterpret_cast<uint32_t*>(arena.metadataBase + static_cast<uint64_t>(lease.value()) * arena.leaseStride);
 }
 
+//! A lease's validity bytes: one per entry, one bit per chunk of the unit the entry holds.
+__device__ inline uint8_t* leaseValid(SparseArenaView const& arena, SparseLeaseIndex lease)
+{
+    return reinterpret_cast<uint8_t*>(
+        arena.metadataBase + static_cast<uint64_t>(lease.value()) * arena.leaseStride + arena.validOffset);
+}
+
 //! What the resolve knows about an entry while it is choosing victims.
 constexpr uint8_t kFlagEvictable = 0; //!< Not selected this step and holding no in-flight unit.
 constexpr uint8_t kFlagMatched = 1;   //!< Selected this step, so its unit stays and its age resets.
@@ -99,8 +106,13 @@ struct SmemLayout
     size_t table = 0;
     size_t entry = 0;
     size_t flag = 0;
+    size_t valid = 0;
     size_t missIdx = 0;
     size_t missOrd = 0;
+    size_t missMask = 0;
+    size_t partOrd = 0;
+    size_t partSlot = 0;
+    size_t partNeed = 0;
     size_t hist = 0;
     size_t total = 0;
 };
@@ -117,10 +129,22 @@ __host__ __device__ inline SmemLayout smemLayout(int32_t tableSize, int32_t entr
     offset = alignUp16(offset + sizeof(uint32_t) * static_cast<size_t>(entries));
     layout.flag = offset;
     offset = alignUp16(offset + sizeof(uint8_t) * static_cast<size_t>(entries));
+    layout.valid = offset;
+    offset = alignUp16(offset + sizeof(uint8_t) * static_cast<size_t>(entries));
     layout.missIdx = offset;
     offset = alignUp16(offset + sizeof(int32_t) * static_cast<size_t>(required));
     layout.missOrd = offset;
     offset = alignUp16(offset + sizeof(int32_t) * static_cast<size_t>(required));
+    layout.missMask = offset;
+    offset = alignUp16(offset + sizeof(uint8_t) * static_cast<size_t>(required));
+    // Resident units whose entry lacks chunks the selection reads: the ordinal, the entry and
+    // the chunks missing.
+    layout.partOrd = offset;
+    offset = alignUp16(offset + sizeof(int32_t) * static_cast<size_t>(required));
+    layout.partSlot = offset;
+    offset = alignUp16(offset + sizeof(int32_t) * static_cast<size_t>(required));
+    layout.partNeed = offset;
+    offset = alignUp16(offset + sizeof(uint8_t) * static_cast<size_t>(required));
     layout.hist = offset;
     offset = alignUp16(offset + sizeof(int32_t) * static_cast<size_t>(kAgeBuckets));
     layout.total = offset;
@@ -342,6 +366,10 @@ __global__ __launch_bounds__(kThreads) void sparsePrepareWriteKernel(SparseResol
         auto const slot = static_cast<int32_t>(matched != 0 ? matched - 1U : (victim & kVictimSlotMask));
         entry[slot]
             = SparseEntry::pack(SparseEntry::usedByte(stepAge, matched != 0), static_cast<uint32_t>(historyUnits));
+        // The model writes this unit through every chunk, and a restored prefix is copied
+        // through every chunk, so the cell is complete either way.
+        leaseValid(args.arena, lease)[static_cast<ptrdiff_t>(args.selectionSlot) * entries + slot]
+            = static_cast<uint8_t>(args.arena.fullChunkMask());
         args.inFlightSlot[row] = slot;
         // A newly reserved growing unit restores the host prefix its history already reached.
         if (matched == 0
@@ -401,14 +429,26 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
     QueryTable const table(smem + layout.table);
     auto* entryCache = reinterpret_cast<uint32_t*>(smem + layout.entry);
     auto* flag = reinterpret_cast<uint8_t*>(smem + layout.flag);
+    auto* validCache = reinterpret_cast<uint8_t*>(smem + layout.valid);
     auto* missIdx = reinterpret_cast<int32_t*>(smem + layout.missIdx);
     auto* missOrd = reinterpret_cast<int32_t*>(smem + layout.missOrd);
+    auto* missMask = reinterpret_cast<uint8_t*>(smem + layout.missMask);
+    auto* partOrd = reinterpret_cast<int32_t*>(smem + layout.partOrd);
+    auto* partSlot = reinterpret_cast<int32_t*>(smem + layout.partSlot);
+    auto* partNeed = reinterpret_cast<uint8_t*>(smem + layout.partNeed);
     auto* hist = reinterpret_cast<int32_t*>(smem + layout.hist);
+    // Every chunk of a unit, which is what an in-flight unit and an unmasked selection read.
+    auto const chunkFull = static_cast<uint8_t>(args.arena.fullChunkMask());
 
     __shared__ typename Scan::TempStorage temp;
     __shared__ int32_t numMiss;
     __shared__ int32_t numCopy;
     __shared__ int32_t numResolved;
+    //! Resident units that lack chunks the selection reads, and the chunk copies the call asks for.
+    __shared__ int32_t numPartial;
+    __shared__ int32_t numSlices;
+    //! Misses with a copy to make, which precede the partial units in this row's run.
+    __shared__ int32_t claimedMisses;
     __shared__ int32_t copyBase;
     // The staleness at which the misses run out, and how many of the entries holding
     // exactly that staleness are wanted. A threshold past the histogram evicts nothing.
@@ -420,6 +460,7 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
     // The lease's own words belong to this row's allocation, so only the selection indexes
     // them.
     uint32_t* entry = leaseMetadata(args.arena, lease) + static_cast<ptrdiff_t>(selection) * entries;
+    uint8_t* validGlobal = leaseValid(args.arena, lease) + static_cast<ptrdiff_t>(selection) * entries;
     // The batch-wide arrays are indexed by row alone: the call is one selection, and every
     // buffer resolving within it shares the single result.
     auto const selectionBase = static_cast<ptrdiff_t>(row) * width;
@@ -433,6 +474,9 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
         numMiss = 0;
         numCopy = 0;
         numResolved = 0;
+        numPartial = 0;
+        numSlices = 0;
+        claimedMisses = 0;
         thresholdStaleness = kAgeBuckets;
         neededAtThreshold = 0;
         takenAtThreshold = 0;
@@ -487,6 +531,7 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
             entry[s] = word;
         }
         entryCache[s] = word;
+        validCache[s] = validGlobal[s];
         int32_t const ordinal = SparseEntry::ordinal(word);
         bool const matched = ordinal >= 0 && table.publish(ordinal, s, mask);
         bool const held = ordinal >= historyUnits;
@@ -513,10 +558,25 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
             continue;
         }
         resolvedMine += i < inFlight ? 0 : 1;
+        // The chunks this unit is read through. An in-flight unit is written whole.
+        auto const want = static_cast<uint8_t>(i < inFlight || args.unitMask == nullptr
+                ? chunkFull
+                : (args.unitMask[selectionBase + i - inFlight] & chunkFull));
         int32_t const slot = table.lookup(ord, mask);
         if (slot != kNoSparseSlot)
         {
             (i < inFlight ? inFlightSlot[i] : outSlot[i - inFlight]) = slot;
+            // Resident, but the entry may hold only some of the chunks this selection reads.
+            // The check reads the validity the call started with: nothing writes the bytes
+            // until the pass below, after every probe.
+            auto const need = static_cast<uint8_t>(want & ~validCache[slot]);
+            if (need != 0)
+            {
+                int32_t const j = atomicAdd(&numPartial, 1);
+                partOrd[j] = ord;
+                partSlot[j] = slot;
+                partNeed[j] = need;
+            }
         }
         else if (i < inFlight && ord < copyableUnits)
         {
@@ -530,6 +590,7 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
             int32_t const j = atomicAdd(&numMiss, 1);
             missOrd[j] = ord;
             missIdx[j] = i;
+            missMask[j] = want;
         }
     }
     if (resolvedMine > 0)
@@ -553,21 +614,46 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
         Scan(temp).ExclusiveSum(mine, scanned, claimed);
         if (tid == 0)
         {
-            copyBase = claimed > 0 ? atomicAdd(args.work.total, claimed) : 0;
-            // The list is sized for every row missing its whole selection, so a claim can only
-            // run past it if the caller sized it from a different width.
-            KVCM2_SPARSE_REQUIRE(copyBase + claimed <= args.work.capacity);
+            // A resident unit lacking chunks is copied like a miss, so it joins the run after
+            // the misses. A unit is one or the other, so the run never exceeds the selection
+            // plus the growing unit's prefix, which is what the list is sized for.
+            claimedMisses = claimed;
+            int32_t const total = claimed + numPartial;
+            copyBase = total > 0 ? atomicAdd(args.work.total, total) : 0;
+            // The list is sized for every row missing its whole selection and, with partial
+            // units, the growing unit's prefix, so a claim can only run past it if the caller
+            // sized it from a different width.
+            KVCM2_SPARSE_REQUIRE(copyBase + total <= args.work.capacity);
             if (args.hitMiss != nullptr)
             {
                 atomicAdd(&args.hitMiss->resolved, static_cast<unsigned long long>(numResolved));
-                if (claimed > 0)
+                int32_t const selectedMisses = claimed + numPartial;
+                if (selectedMisses > 0)
                 {
-                    atomicAdd(&args.hitMiss->misses, static_cast<unsigned long long>(claimed));
+                    atomicAdd(&args.hitMiss->misses, static_cast<unsigned long long>(selectedMisses));
                 }
             }
         }
     }
     __syncthreads();
+
+    // The resident units that need chunks. Their entries are matched, so the eviction pass
+    // below leaves them alone, and each names its own entry, so the writes do not overlap.
+    // They become valid for the launches after this one, which is when the copy has run.
+    for (int32_t j = tid; j < numPartial; j += kResolveThreads)
+    {
+        int32_t const slot = partSlot[j];
+        validGlobal[slot] = static_cast<uint8_t>(validCache[slot] | partNeed[j]);
+        auto const c = copyBase + claimedMisses + j;
+        args.work.row[c] = row;
+        args.work.ordinal[c] = partOrd[j];
+        args.work.slot[c] = slot;
+        if (args.work.mask != nullptr)
+        {
+            args.work.mask[c] = partNeed[j];
+        }
+        atomicAdd(&numSlices, __popc(static_cast<uint32_t>(partNeed[j])));
+    }
 
     // Where the misses run out, walking the histogram down from its stalest bucket. One
     // thread per bucket, so the scan that totals them is the whole search.
@@ -618,6 +704,10 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
         int32_t const position = missIdx[j];
         entry[s] = SparseEntry::pack(SparseEntry::usedByte(stepAge, false), static_cast<uint32_t>(ordinal));
         (position < inFlight ? inFlightSlot[position] : outSlot[position - inFlight]) = s;
+        // The cell holds nothing of its previous unit. An in-flight unit is whole once
+        // written; a selected one holds the chunks its copy brings.
+        uint8_t const chunks = position < inFlight ? chunkFull : missMask[j];
+        validGlobal[s] = chunks;
         // Fetch complete history only. An in-flight miss is just reserved: the one with a
         // host prefix was left to write preparation above, so no copy queued here can land
         // on a token the model writes before the fetch runs.
@@ -627,6 +717,14 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
             args.work.row[c] = row;
             args.work.ordinal[c] = ordinal;
             args.work.slot[c] = s;
+            if (args.work.mask != nullptr)
+            {
+                args.work.mask[c] = chunks;
+            }
+            if (position >= inFlight)
+            {
+                atomicAdd(&numSlices, __popc(static_cast<uint32_t>(chunks)));
+            }
         }
     }
     __syncthreads();
@@ -636,7 +734,11 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
 
     if (tid == 0)
     {
-        args.missCount[row] = numCopy;
+        args.missCount[row] = numCopy + numPartial;
+        if (args.hitMiss != nullptr && numSlices > 0)
+        {
+            atomicAdd(&args.hitMiss->slices, static_cast<unsigned long long>(numSlices));
+        }
     }
 }
 
@@ -678,6 +780,13 @@ __device__ void copySparseUnitsImpl(
         int32_t const ordinal = args.work.ordinal[index];
         int32_t const slot = args.work.slot[index];
         if (slot == kNoSparseSlot)
+        {
+            continue;
+        }
+        // The chunks of the unit to move. A head-major page holds one chunk per head, and a
+        // head reads only its own, so a fetch moves just the heads that read the unit.
+        uint32_t const chunkMask = args.work.mask != nullptr ? static_cast<uint32_t>(args.work.mask[index]) : ~0U;
+        if (chunkMask == 0U)
         {
             continue;
         }
@@ -737,6 +846,10 @@ __device__ void copySparseUnitsImpl(
         }
         for (uint32_t c = 0; c < desc.layout.numChunks; ++c)
         {
+            if (((chunkMask >> c) & 1U) == 0U)
+            {
+                continue;
+            }
             auto const offset = static_cast<uint64_t>(c) * desc.layout.chunkStride + firstByte;
             copyChunk<Vec, kCopyThreads>(dst + offset, src + offset, bytes, lane);
         }
@@ -877,11 +990,15 @@ __global__ __launch_bounds__(kThreads) void sparseFlushListKernel(SparseFlushLis
     // layer's buffers and each holds its own mirror of a shared entry.
     uint32_t const* entry
         = leaseMetadata(args.arena, lease) + static_cast<ptrdiff_t>(args.arena.layerSelection[layer]) * entries;
+    uint8_t const* validBytes
+        = leaseValid(args.arena, lease) + static_cast<ptrdiff_t>(args.arena.layerSelection[layer]) * entries;
     auto const ordinalAt = [&](int32_t slot) { return SparseEntry::ordinal(entry[slot]); };
+    // An entry holding no chunk has nothing to write back; one holding some is written back
+    // through exactly those, so a stale chunk never overwrites the host page's good copy.
     auto const crossed = [&](int32_t slot)
     {
         int32_t const ord = ordinalAt(slot);
-        return ord >= from && ord < to;
+        return ord >= from && ord < to && validBytes[slot] != 0;
     };
 
     // Two passes over the resident set, because the run cannot be claimed until its length
@@ -928,6 +1045,10 @@ __global__ __launch_bounds__(kThreads) void sparseFlushListKernel(SparseFlushLis
         args.work.row[j] = row;
         args.work.ordinal[j] = ordinalAt(s);
         args.work.slot[j] = s;
+        if (args.work.mask != nullptr)
+        {
+            args.work.mask[j] = validBytes[s];
+        }
     }
 
     // The list is the last thing this kernel writes, so the release only brings the copy's

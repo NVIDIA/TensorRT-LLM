@@ -319,9 +319,11 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             layers,
             max_batch_size=batch,
             topk=width,
+            unit_masks=True,
         )
         self.msa_sparse_write_slots = allocate("write_slots", (batch,), torch.int32)
         self.msa_sparse_selected = allocate("selected", (batch, width), torch.int32)
+        self.msa_sparse_unit_masks = allocate("unit_masks", (batch, width), torch.int32)
         self.msa_sparse_unit_lengths = allocate("unit_lengths", (batch,), torch.int32)
         self.msa_sparse_request_indices = allocate("request_indices", (batch,), torch.int32)
         self.msa_sparse_request_indices.copy_(
@@ -348,19 +350,25 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         queries = kv_block_indexes.shape[0]
         selected = self.msa_sparse_selected[:queries]
         unit_lengths = self.msa_sparse_unit_lengths[:queries]
+        unit_masks = self.msa_sparse_unit_masks[:queries]
         merge_head_selections(
             kv_block_indexes,
             self.msa_seq_lens_cuda,
             selected,
             unit_lengths,
             unit_tokens=state.layers[layer_idx].unit_tokens,
+            masks=unit_masks,
         )
+        # Each KV head reads only its own slice of a unit's cell, so the fetch fills a unit for
+        # just the heads that selected it. Every head that reads a unit this step is named in
+        # its mask, which is what lets the block table below point all of them at one cell.
         self.kv_cache_manager.fetch_sparse_indices(
             state,
             layer_idx,
             selected,
             self.msa_sparse_request_indices[:queries],
             unit_lengths,
+            unit_masks,
         )
         build_sparse_block_table(state, layer_idx, selected, self.msa_sparse_block_table)
         return self.msa_sparse_block_table[:queries]

@@ -65,6 +65,12 @@ struct SparseWorkList
     int32_t* row = nullptr;
     int32_t* ordinal = nullptr;
     int32_t* slot = nullptr;
+    //! [numLists][capacity] the chunks of the unit to move, one bit per chunk. Null means
+    //! every chunk, which is what a layout with one chunk per unit, a restore of a growing
+    //! unit's prefix and any caller that predates per-chunk residency all want. A fetch
+    //! names the chunks the selection needs and the cell does not yet hold; a write-back the
+    //! chunks the cell holds.
+    int32_t* mask = nullptr;
     //! [numLists] entries written so far. Zeroed before the producer runs; the consumer
     //! bounds its loop by it, which is why the count never crosses to the host.
     //! Null for a single fixed list of `capacity` entries: each producer overwrites its
@@ -95,6 +101,9 @@ struct SparseHitMiss
     unsigned long long resolved;
     //! Of those, the ones the cache did not hold.
     unsigned long long misses;
+    //! Chunk copies the misses asked for: per miss, one for each chunk it needed. With one chunk
+    //! per unit this equals `misses`; with several it measures what a head-wise fetch saved.
+    unsigned long long slices;
 
     //! Clamped, because a host copy races a running fetch and the two are separate atomics:
     //! a resolve can land between them and show a miss its selection has not been counted
@@ -136,6 +145,19 @@ struct SparseResolveArgs
     int32_t const* selected;
     //! Selected units per row, uniform across requests so shapes stay static.
     int32_t selectionWidth;
+    //! [numRows][selectionWidth] the chunks each selected unit is read through this call, one
+    //! bit per chunk, or null for every chunk. A unit already resident is a hit only if the
+    //! entry holds every chunk named here; otherwise just the missing chunks are listed for
+    //! the copy. Every chunk a unit's reader reads must be named, because the attention that
+    //! follows reads nothing the entry's validity bits do not cover.
+    //!
+    //! One CTA resolves a row, and it reads every entry's validity before any is written, so
+    //! all of a row's selections are decided against the state the launch began with: a
+    //! unit one selection brings in is not a hit for another selection of the same launch,
+    //! which is what keeps several queries of one request from seeing each other's partial
+    //! admissions. The chunks the launch lists become valid for later launches, in stream
+    //! order, which is after the copy that fills them.
+    int32_t const* unitMask = nullptr;
 
     //! [numRows] history length and capacity, in tokens, as Batch::watermarks() publishes
     //! them; `unitTokens` divides both to units. Taking the source and the divisor rather

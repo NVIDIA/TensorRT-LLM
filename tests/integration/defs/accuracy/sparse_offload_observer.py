@@ -93,6 +93,7 @@ def _observe(module: ModuleType) -> None:
         topk_indices: torch.Tensor,
         request_indices: torch.Tensor,
         unit_lengths: torch.Tensor,
+        unit_masks: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if state.batch is not None and layer_idx == min(state.layers):
             members = self._sparse_batch_members
@@ -117,7 +118,9 @@ def _observe(module: ModuleType) -> None:
                         "hits": int(hits),
                         "misses": int(misses),
                     }
-        return fetch(self, state, layer_idx, topk_indices, request_indices, unit_lengths)
+        return fetch(
+            self, state, layer_idx, topk_indices, request_indices, unit_lengths, unit_masks
+        )
 
     @functools.wraps(release)
     def observed_release(

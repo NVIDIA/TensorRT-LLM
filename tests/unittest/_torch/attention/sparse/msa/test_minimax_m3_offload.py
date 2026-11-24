@@ -531,27 +531,42 @@ def test_m3_offload_reuses_received_prompt(
 
 
 @pytest.mark.parametrize(
-    "dtype,heads,graph,layout",
+    "dtype,heads,graph,layout,pattern",
     [
-        (DataType.BF16, 2, False, "mixed"),
-        (DataType.HALF, 1, False, "mixed"),
-        (DataType.FP8, 1, False, "mixed"),
-        (DataType.FP8, 4, True, "mixed"),
-        (DataType.NVFP4, 1, False, "mixed"),
-        (DataType.NVFP4, 2, True, "mixed"),
-        (DataType.FP8, 2, False, "all_sparse"),
-        (DataType.NVFP4, 2, True, "all_sparse"),
+        (DataType.BF16, 2, False, "mixed", "rotating"),
+        (DataType.HALF, 1, False, "mixed", "rotating"),
+        (DataType.FP8, 1, False, "mixed", "rotating"),
+        (DataType.FP8, 4, True, "mixed", "rotating"),
+        (DataType.NVFP4, 1, False, "mixed", "rotating"),
+        (DataType.NVFP4, 2, True, "mixed", "rotating"),
+        (DataType.FP8, 2, False, "all_sparse", "rotating"),
+        (DataType.NVFP4, 2, True, "all_sparse", "rotating"),
+        # Every head picks the same units, so each miss is read through all heads at once.
+        (DataType.FP8, 2, False, "mixed", "shared"),
+        # A head picks, one step later, the units its neighbour picked: those cells are resident
+        # but hold only the neighbour's slice, so the pick is a miss for the new head alone.
+        (DataType.NVFP4, 4, False, "mixed", "handoff"),
+        (DataType.FP8, 2, True, "mixed", "handoff"),
+        (DataType.BF16, 4, True, "all_sparse", "handoff"),
     ],
 )
 def test_m3_offload_matches_resident_across_partial_blocks_eviction_and_reseating(
-    dtype: DataType, heads: int, graph: bool, layout: str, monkeypatch: pytest.MonkeyPatch
+    dtype: DataType,
+    heads: int,
+    graph: bool,
+    layout: str,
+    pattern: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Bitwise data/scale and attention parity, including replay with changing batch rows.
 
     Two histories exceed two GPU cache capacities; another has one page.
-    Per-head selections rotate, a request leaves and rejoins inside a growing block, and
-    requests cross page boundaries at different steps. Padded graph queries
-    must never write into another request's arena or become native Batch members.
+    Per-head selections follow ``pattern``, a request leaves and rejoins inside a growing
+    block, and requests cross page boundaries at different steps. A fetch fills a unit only
+    for the heads that select it, so a cell is often resident with some heads' slices
+    unfilled; each head is checked against the resident cache through its own slice. Padded
+    graph queries must never write into another request's arena or become native Batch
+    members.
     """
     sparse_layers = LAYOUTS[layout]
     history_blocks = 2 * TOPK * heads + 7
@@ -689,25 +704,32 @@ def test_m3_offload_matches_resident_across_partial_blocks_eviction_and_reseatin
                 if not graph:
                     arena = manager.get_sparse_arena_buffers(layer, "HND").view(torch.uint8)
                     for position, (rid, history) in enumerate(zip(ids, histories)):
-                        units = topk[position].flatten().unique()
-                        units = units[units >= 0].long()
-                        physical = table[position, units].long()
-                        assert (physical >= 0).all(), (
-                            f"step={step}, layer={layer}, request={rid}: "
-                            f"selected {units.tolist()} reached pages {physical.tolist()}"
-                        )
-                        valid = units[:, None] * PAGE + torch.arange(PAGE, device="cuda") <= history
-                        mask = ~valid[:, None, None, :, None]
-                        torch.testing.assert_close(
-                            arena[physical].masked_fill(mask, 0),
-                            reference[rid, layer][0].view(torch.uint8)[units].masked_fill(mask, 0),
-                            rtol=0,
-                            atol=0,
-                            msg=lambda error: (
-                                f"step={step}, layer={layer}, request={rid}, "
-                                f"selected={units.tolist()}, pages={physical.tolist()}: {error}"
-                            ),
-                        )
+                        # A head reads only its own slice of a unit's cell, so that is the
+                        # slice the fetch owes it: the cell's other slices may be unfilled.
+                        for head in range(heads):
+                            units = topk[position, head]
+                            units = units[units >= 0].long()
+                            physical = table[position, units].long()
+                            assert (physical >= 0).all(), (
+                                f"step={step}, layer={layer}, request={rid}, head={head}: "
+                                f"selected {units.tolist()} reached pages {physical.tolist()}"
+                            )
+                            valid = (
+                                units[:, None] * PAGE + torch.arange(PAGE, device="cuda") <= history
+                            )
+                            mask = ~valid[:, None, :, None]
+                            torch.testing.assert_close(
+                                arena[physical][:, :, head].masked_fill(mask, 0),
+                                reference[rid, layer][0]
+                                .view(torch.uint8)[units][:, :, head]
+                                .masked_fill(mask, 0),
+                                rtol=0,
+                                atol=0,
+                                msg=lambda error: (
+                                    f"step={step}, layer={layer}, request={rid}, head={head}, "
+                                    f"selected={units.tolist()}, pages={physical.tolist()}: {error}"
+                                ),
+                            )
                 _attention(
                     q,
                     manager.get_sparse_arena_buffers(layer, "HND"),
@@ -738,6 +760,8 @@ def test_m3_offload_matches_resident_across_partial_blocks_eviction_and_reseatin
                 use_cache=True, num_cached_tokens_per_seq=histories
             )
             metadata.prepare()
+            if step == 0:
+                state.batch.reset_hit_miss_counter()
             # The fixed-width kernels run padded queries beyond metadata.num_seqs. Like
             # CUDA-graph padding, each is a one-token request whose indexer selects block 0.
             metadata.msa_seq_lens_cuda[len(ids) :].fill_(1)
@@ -756,9 +780,17 @@ def test_m3_offload_matches_resident_across_partial_blocks_eviction_and_reseatin
             topk[len(ids) :, :, 0] = 0
             for position, history in enumerate(histories):
                 for head in range(heads):
+                    # "rotating": each head walks its own band, shifting every step.
+                    # "shared": every head picks head 0's band.
+                    # "handoff": a head picks the band its neighbour picked the step before.
+                    pick_step, pick_head = step, head
+                    if pattern == "shared":
+                        pick_head = 0
+                    elif pattern == "handoff":
+                        pick_step, pick_head = step - 1, (head - 1) % heads
                     units = [
                         1
-                        + (step * TOPK * heads + head * (TOPK - 2) + i)
+                        + (pick_step * TOPK * heads + pick_head * (TOPK - 2) + i)
                         % max(history // PAGE - 1, 1)
                         for i in range(TOPK - 2)
                     ]
@@ -873,6 +905,16 @@ def test_m3_offload_matches_resident_across_partial_blocks_eviction_and_reseatin
                             msg=lambda error: where(error, "V scales"),
                         )
         assert permuted
+        # What the fetches copied, in slices of one head's data for one unit. A unit read through
+        # every head costs all of them; units some heads never read cost less.
+        _, misses = state.batch.peek_hit_miss_counter()
+        slices = state.batch.peek_copied_slices()
+        assert misses > 0
+        assert misses <= slices <= misses * heads, (misses, slices, heads)
+        if pattern == "shared":
+            assert slices == misses * heads, (misses, slices, heads)
+        elif heads > 1 and pattern == "rotating":
+            assert slices < misses * heads, (misses, slices, heads)
         for request in requests:
             manager.free_resources(request)
     finally:

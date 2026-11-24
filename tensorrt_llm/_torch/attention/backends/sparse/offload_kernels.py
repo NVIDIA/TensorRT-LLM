@@ -146,11 +146,18 @@ def _select_sparse_history_units_kernel(
     history_lengths_stride,
     out_stride0,
     out_stride1,
+    masks_ptr,
+    masks_out_ptr,
+    masks_stride0,
+    masks_stride1,
+    masks_out_stride0,
+    masks_out_stride1,
     NUM_ROWS: tl.constexpr,
     num_lengths,
     TOPK: tl.constexpr,
     UNIT_TOKENS: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    HAS_MASKS: tl.constexpr,
 ):
     query = tl.program_id(0)
     active_count = tl.load(active_request_count_ptr)
@@ -171,6 +178,16 @@ def _select_sparse_history_units_kernel(
         tl.where(valid, unit, -1),
         mask=active & (k < TOPK),
     )
+    if HAS_MASKS:
+        # The chunks reading a unit travel with it, and a selection dropped here reads nothing.
+        chunk_mask = tl.load(
+            masks_ptr + query * masks_stride0 + k * masks_stride1, k < TOPK, other=0
+        )
+        tl.store(
+            masks_out_ptr + row * masks_out_stride0 + k * masks_out_stride1,
+            tl.where(valid, chunk_mask, 0),
+            mask=active & (k < TOPK),
+        )
 
 
 def select_sparse_history_units(
@@ -183,6 +200,8 @@ def select_sparse_history_units(
     out: torch.Tensor,
     *,
     unit_tokens: int,
+    masks: torch.Tensor | None = None,
+    masks_out: torch.Tensor | None = None,
 ) -> None:
     """Mask non-history selections and scatter them into native Batch rows.
 
@@ -203,6 +222,10 @@ def select_sparse_history_units(
     selections become -1. Batch rows without a live query are overwritten with
     -1 on every call, including when a graph's Q is smaller than B. No tensor
     allocation, host read, or synchronization is performed.
+
+    ``masks`` [Q, K] and ``masks_out`` [B, K], given together, carry each selected unit's
+    chunk mask (the KV heads reading it) through the same scatter: a dropped selection gets
+    mask 0, and rows without a live query are cleared like ``out``.
     """
     device = out.device
     for tensor, name, ndim in (
@@ -217,6 +240,13 @@ def select_sparse_history_units(
         check_sparse_offload_tensor(tensor, name, ndim, device)
     num_rows, width = out.shape
     num_queries, topk = topk_indices.shape
+    if (masks is None) != (masks_out is None):
+        raise ValueError("masks and masks_out must be given together")
+    if masks is not None:
+        check_sparse_offload_tensor(masks, "masks", 2, device)
+        check_sparse_offload_tensor(masks_out, "masks_out", 2, device)
+        if masks.shape != topk_indices.shape or masks_out.shape != out.shape:
+            raise ValueError("masks and masks_out must have the shapes of topk_indices and out")
     if unit_tokens <= 0:
         raise ValueError("unit_tokens must be positive")
     if topk != width:
@@ -232,6 +262,8 @@ def select_sparse_history_units(
         # Clear separately: padded queries can carry stale or invalid request IDs,
         # and a smaller graph may leave native Batch rows without any query.
         out.fill_(-1)
+        if masks_out is not None:
+            masks_out.fill_(0)
         if num_queries == 0 or topk == 0:
             return
         _select_sparse_history_units_kernel[(num_queries,)](
@@ -248,11 +280,16 @@ def select_sparse_history_units(
             unit_lengths.stride(0),
             history_lengths.stride(0),
             *out.stride(),
+            masks if masks is not None else out,
+            masks_out if masks_out is not None else out,
+            *(masks.stride() if masks is not None else (0, 0)),
+            *(masks_out.stride() if masks_out is not None else (0, 0)),
             NUM_ROWS=num_rows,
             num_lengths=unit_lengths.numel(),
             TOPK=topk,
             UNIT_TOKENS=unit_tokens,
             BLOCK_K=triton.next_power_of_2(topk),
+            HAS_MASKS=masks is not None,
         )
 
 
@@ -465,6 +502,7 @@ def _merge_head_selections_kernel(
     lengths,
     selected,
     units,
+    masks,
     stride_q,
     stride_h,
     stride_k,
@@ -472,6 +510,8 @@ def _merge_head_selections_kernel(
     WIDTH: tl.constexpr,
     UNIT_TOKENS: tl.constexpr,
     BLOCK: tl.constexpr,
+    HEADS: tl.constexpr,
+    HAS_MASKS: tl.constexpr,
 ):
     query = tl.program_id(0)
     lane = tl.arange(0, BLOCK)
@@ -490,6 +530,20 @@ def _merge_head_selections_kernel(
         > 0
     )
     tl.store(selected + query * WIDTH + lane, tl.where(duplicate, -1, block), lane < WIDTH)
+    if HAS_MASKS:
+        # The kept occurrence of a unit carries every head that selected it: a head reads a
+        # unit through its own selection, so each of them needs its slice of the unit's cell.
+        same = (block[:, None] == block[None, :]) & (block[None, :] >= 0)
+        head = lane // TOPK
+        chunk_mask = tl.zeros([BLOCK], dtype=tl.int32)
+        for h in tl.static_range(HEADS):
+            picked = tl.sum((same & (head[None, :] == h)).to(tl.int32), axis=1) > 0
+            chunk_mask = chunk_mask | (picked.to(tl.int32) << h)
+        tl.store(
+            masks + query * WIDTH + lane,
+            tl.where(duplicate | (block < 0), 0, chunk_mask),
+            lane < WIDTH,
+        )
     length = tl.load(lengths + query)
     tl.store(units + query, (length + UNIT_TOKENS - 1) // UNIT_TOKENS)
 
@@ -501,6 +555,7 @@ def merge_head_selections(
     units: torch.Tensor,
     *,
     unit_tokens: int,
+    masks: torch.Tensor | None = None,
 ) -> None:
     """Deduplicate per-head selections into one fixed-width selection per query.
 
@@ -510,20 +565,32 @@ def merge_head_selections(
     head-major order, with later duplicates replaced by -1, and ``units`` [>= Q]
     each query's selectable unit count: ``seq_lens`` [>= Q] in tokens, rounded up
     to whole units. The kernel compiles once for every batch size.
+
+    ``masks`` [>= Q, H * K] int32, when given, receives each kept unit's head mask: bit h is
+    set when KV head h selected the unit, and 0 where ``selected`` is -1.
     """
     width = kv_block_indexes.shape[1] * kv_block_indexes.shape[2]
     if width != selected.shape[1] or kv_block_indexes.shape[0] > selected.shape[0]:
         raise ValueError("Per-head selections do not match the sparse cache selection width")
+    if masks is not None and (
+        masks.shape[1] != width
+        or masks.shape[0] < kv_block_indexes.shape[0]
+        or kv_block_indexes.shape[1] > 8
+    ):
+        raise ValueError("masks must match the selection width and cover at most 8 KV heads")
     _merge_head_selections_kernel[(kv_block_indexes.shape[0],)](
         kv_block_indexes,
         seq_lens,
         selected,
         units,
+        masks if masks is not None else selected,
         *kv_block_indexes.stride(),
         kv_block_indexes.shape[2],
         width,
         unit_tokens,
         triton.next_power_of_2(width),
+        kv_block_indexes.shape[1],
+        masks is not None,
     )
 
 

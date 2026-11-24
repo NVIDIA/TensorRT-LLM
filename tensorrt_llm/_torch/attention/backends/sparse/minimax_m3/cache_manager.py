@@ -342,6 +342,8 @@ class MiniMaxM3SparseOffloadMixin(SparseOffloadCacheMixin):
     """
 
     _m3_offloaded_layer_ids: frozenset[int] = frozenset()
+    # A head-major page holds one chunk per KV head, so the fetch moves only the heads that read a unit.
+    _sparse_offload_unit_masks: bool = True
 
     def _init_m3_sparse_offload(self, config: MiniMaxM3SparseAttentionConfig | None) -> None:
         sizing = None if config is None else config.get_kv_cache_offload_config()

@@ -132,6 +132,16 @@ std::vector<int32_t> KvCacheIntrospection::sparseCacheResidentOrdinals(KvCache c
     return kvCache.mBatch->_sparseArena(id).peekResidentOrdinals(kvCache.mBatch->leaseOf(*kvCache.mBatchRow));
 }
 
+std::vector<int32_t> KvCacheIntrospection::sparseCacheValidChunks(KvCache const& kvCache, int lcId)
+{
+    LifeCycleId const id{lcId};
+    if (id >= kvCache.mManager->numLifeCycles() || kvCache.mBatch == nullptr)
+    {
+        return {};
+    }
+    return kvCache.mBatch->_sparseArena(id).peekValidChunks(kvCache.mBatch->leaseOf(*kvCache.mBatchRow));
+}
+
 std::optional<int> KvCacheIntrospection::sparseCacheBaseCell(KvCache const& kvCache, int lcId, int pool)
 {
     LifeCycleId const id{lcId};
@@ -316,7 +326,8 @@ KvCacheIntrospection::SparseResolveProbe KvCacheIntrospection::sparseResolve(
     std::vector<int32_t> const& residentOrdinal, std::vector<int32_t> const& entryAge, int numLayers,
     int entriesPerLayer, std::vector<int32_t> const& selected, int selectionWidth,
     std::vector<int32_t> const& historyUnits, std::vector<int32_t> const& capacityUnits, int maxInFlightUnits,
-    std::vector<int32_t> const& inactiveRows)
+    std::vector<int32_t> const& inactiveRows, int unitChunks, std::vector<int32_t> const& residentValid,
+    std::vector<int32_t> const& unitMask)
 {
     CUstream const stream = nullptr;
     // Far enough into the clock that every age the probe accepts has a timestamp of its own
@@ -332,6 +343,13 @@ KvCacheIntrospection::SparseResolveProbe KvCacheIntrospection::sparseResolve(
             && residentOrdinal.size() == entryCount && (entryAge.empty() || entryAge.size() == entryCount)
             && selected.size() == selectionCount,
         "sparseResolve: input sizes must match the declared shape");
+    TLLM_CHECK_WITH_INFO(unitChunks >= 1 && unitChunks <= kMaxSparseUnitChunks,
+        "sparseResolve: a unit has between 1 and %d chunks", kMaxSparseUnitChunks);
+    TLLM_CHECK_WITH_INFO(residentValid.empty() || residentValid.size() == entryCount,
+        "sparseResolve: residentValid must be empty or one byte per entry");
+    TLLM_CHECK_WITH_INFO(unitMask.empty() || unitMask.size() == selectionCount,
+        "sparseResolve: unitMask must be empty or one mask per selected unit");
+    auto const fullMask = static_cast<int32_t>((1U << static_cast<uint32_t>(unitChunks)) - 1U);
     for (auto const age : entryAge)
     {
         TLLM_CHECK_WITH_INFO(age >= 0 && static_cast<uint32_t>(age) <= SparseEntry::kMaxAge,
@@ -343,6 +361,9 @@ KvCacheIntrospection::SparseResolveProbe KvCacheIntrospection::sparseResolve(
     auto missRow = deviceCopy(std::vector<int32_t>(selectionCount, kNoSparseSlot));
     auto missOrdinal = deviceCopy(std::vector<int32_t>(selectionCount, kNoSparseSlot));
     auto missSlot = deviceCopy(std::vector<int32_t>(selectionCount, kNoSparseSlot));
+    auto missMask = deviceCopy(std::vector<int32_t>(selectionCount, 0));
+    auto unitMaskBuf = deviceCopy(unitMask.empty() ? std::vector<int32_t>(1, 0) : unitMask);
+    auto hitMiss = deviceCopyWords(std::vector<uint32_t>(sizeof(SparseHitMiss) / sizeof(uint32_t), 0U));
     auto missTotal = deviceCopy(std::vector<int32_t>(static_cast<size_t>(numLayers), 0));
     auto const countCount = static_cast<size_t>(numLayers) * static_cast<size_t>(numRows);
     auto missCount = deviceCopy(std::vector<int32_t>(countCount, 0));
@@ -363,7 +384,23 @@ KvCacheIntrospection::SparseResolveProbe KvCacheIntrospection::sparseResolve(
             ? SparseEntry::kFreeWord
             : SparseEntry::pack(SparseEntry::usedByte(stepAge - age, false), static_cast<uint32_t>(ordinal));
     }
-    auto metadata = deviceCopyWords(metadataHost);
+    // The validity bytes follow the words in each lease. An entry the caller does not describe
+    // holds every chunk, which is what a resolve of a one-chunk layout assumes.
+    auto const validBytes = (perRowEntries + 3U) & ~static_cast<size_t>(3U);
+    auto const leaseWords = perRowEntries + validBytes / sizeof(uint32_t);
+    std::vector<uint32_t> blocks(leaseWords * static_cast<size_t>(numRows), 0U);
+    for (int row = 0; row < numRows; ++row)
+    {
+        auto* words = blocks.data() + leaseWords * static_cast<size_t>(row);
+        std::copy_n(metadataHost.begin() + static_cast<ptrdiff_t>(perRowEntries) * row, perRowEntries, words);
+        auto* bytes = reinterpret_cast<uint8_t*>(words + perRowEntries);
+        for (size_t e = 0; e < perRowEntries; ++e)
+        {
+            auto const index = perRowEntries * static_cast<size_t>(row) + e;
+            bytes[e] = static_cast<uint8_t>(residentValid.empty() ? fullMask : residentValid[index]);
+        }
+    }
+    auto metadata = deviceCopyWords(blocks);
 
     // Row r takes lease r, except an inactive row, which holds none for the kernel to skip.
     std::vector<int32_t> leaseHost(static_cast<size_t>(numRows));
@@ -380,7 +417,9 @@ KvCacheIntrospection::SparseResolveProbe KvCacheIntrospection::sparseResolve(
 
     SparseArenaView arena;
     arena.metadataBase = metadata.get();
-    arena.leaseStride = sizeof(uint32_t) * perRowEntries;
+    arena.leaseStride = sizeof(uint32_t) * leaseWords;
+    arena.validOffset = sizeof(uint32_t) * perRowEntries;
+    arena.unitChunks = unitChunks;
     arena.numLayers = numLayers;
     // One metadata row per layer: this probe drives a model where every layer selects for
     // itself, which is what a resolve sees whenever no selection_id is shared.
@@ -406,6 +445,9 @@ KvCacheIntrospection::SparseResolveProbe KvCacheIntrospection::sparseResolve(
         args.selectionSlot = layer;
         args.selected = reinterpret_cast<int32_t const*>(selection.get()) + selectionOffset;
         args.selectionWidth = selectionWidth;
+        args.unitMask
+            = unitMask.empty() ? nullptr : reinterpret_cast<int32_t const*>(unitMaskBuf.get()) + selectionOffset;
+        args.hitMiss = reinterpret_cast<SparseHitMiss*>(hitMiss.get());
         // The hook works in units, so one token is one unit.
         args.historyTokens = reinterpret_cast<int32_t const*>(history.get());
         args.capacityTokens = reinterpret_cast<int32_t const*>(capacity.get());
@@ -419,6 +461,7 @@ KvCacheIntrospection::SparseResolveProbe KvCacheIntrospection::sparseResolve(
         args.work.row = reinterpret_cast<int32_t*>(missRow.get()) + selectionOffset;
         args.work.ordinal = reinterpret_cast<int32_t*>(missOrdinal.get()) + selectionOffset;
         args.work.slot = reinterpret_cast<int32_t*>(missSlot.get()) + selectionOffset;
+        args.work.mask = reinterpret_cast<int32_t*>(missMask.get()) + selectionOffset;
         args.work.total = reinterpret_cast<int32_t*>(missTotal.get()) + layer;
         args.work.capacity = numRows * selectionWidth;
         args.work.numLists = 1;
@@ -430,13 +473,18 @@ KvCacheIntrospection::SparseResolveProbe KvCacheIntrospection::sparseResolve(
     cuCheck(cuStreamSynchronize(stream));
 
     SparseResolveProbe result;
-    auto const metadataOut = readBackWords(metadata, entryCount);
+    auto const metadataOut = readBackWords(metadata, leaseWords * static_cast<size_t>(numRows));
     result.residentOrdinal.resize(entryCount);
     result.entryAge.resize(entryCount);
     result.entryHit.resize(entryCount);
+    result.validChunks.resize(entryCount);
     for (size_t i = 0; i < entryCount; ++i)
     {
-        auto const word = metadataOut[i];
+        auto const row = i / perRowEntries;
+        auto const e = i % perRowEntries;
+        auto const word = metadataOut[leaseWords * row + e];
+        result.validChunks[i]
+            = reinterpret_cast<uint8_t const*>(metadataOut.data() + leaseWords * row + perRowEntries)[e];
         auto const ordinal = SparseEntry::ordinal(word);
         result.residentOrdinal[i] = ordinal;
         result.entryAge[i] = ordinal < 0 ? -1 : static_cast<int32_t>(SparseEntry::age(word, stepAge));
@@ -446,6 +494,13 @@ KvCacheIntrospection::SparseResolveProbe KvCacheIntrospection::sparseResolve(
     result.missRow = readBack(missRow, selectionCount);
     result.missOrdinal = readBack(missOrdinal, selectionCount);
     result.missSlot = readBack(missSlot, selectionCount);
+    result.missMask = readBack(missMask, selectionCount);
+    {
+        auto const counters = readBackWords(hitMiss, sizeof(SparseHitMiss) / sizeof(uint32_t));
+        SparseHitMiss stats;
+        std::memcpy(&stats, counters.data(), sizeof(stats));
+        result.copiedSlices = stats.slices;
+    }
     result.missTotal = readBack(missTotal, static_cast<size_t>(numLayers));
     result.missCount = readBack(missCount, countCount);
     result.inFlightSlot = inFlightCount > 0 ? readBack(inFlight, inFlightCount) : std::vector<int32_t>{};
@@ -457,8 +512,10 @@ std::vector<uint8_t> KvCacheIntrospection::sparseUnitCopy(std::vector<uint8_t> c
     int cellsPerBuffer, uint64_t bufferBytes, uint32_t numChunks, uint32_t chunkBytes, uint32_t chunkStride,
     uint32_t unitStride, int unitsPerPage, std::vector<int32_t> const& missOrdinal,
     std::vector<int32_t> const& missSlot, std::vector<int32_t> const& missCount, int selectionWidth,
-    std::vector<int32_t> const& bufferLayer, bool writeBack, int gridCtas)
+    std::vector<int32_t> const& bufferLayer, bool writeBack, int gridCtas, std::vector<int32_t> const& missMask)
 {
+    TLLM_CHECK_WITH_INFO(missMask.empty() || missMask.size() == missOrdinal.size(),
+        "KvCacheIntrospection::sparseUnitCopy: missMask must be empty or parallel to missOrdinal");
     // The row's lease is what says whether it holds a reservation, so a negative one asks
     // the kernel to skip the very copy this probe exists to run.
     TLLM_CHECK_WITH_INFO(
@@ -481,6 +538,7 @@ std::vector<uint8_t> KvCacheIntrospection::sparseUnitCopy(std::vector<uint8_t> c
     std::vector<int32_t> flatRow;
     std::vector<int32_t> flatOrdinal;
     std::vector<int32_t> flatSlot;
+    std::vector<int32_t> flatMask;
     std::vector<int32_t> totals(static_cast<size_t>(numLists), 0);
     flatRow.reserve(missOrdinal.size());
     flatOrdinal.reserve(missOrdinal.size());
@@ -495,6 +553,7 @@ std::vector<uint8_t> KvCacheIntrospection::sparseUnitCopy(std::vector<uint8_t> c
             flatRow.push_back(0);
             flatOrdinal.push_back(j < count ? missOrdinal.at(index) : kNoSparseSlot);
             flatSlot.push_back(j < count ? missSlot.at(index) : kNoSparseSlot);
+            flatMask.push_back(j < count && !missMask.empty() ? missMask.at(index) : -1);
         }
         totals[static_cast<size_t>(list)] = static_cast<int32_t>(count);
     }
@@ -502,6 +561,7 @@ std::vector<uint8_t> KvCacheIntrospection::sparseUnitCopy(std::vector<uint8_t> c
     auto workRowBuf = deviceCopy(flatRow);
     auto missOrd = deviceCopy(flatOrdinal);
     auto missSlotBuf = deviceCopy(flatSlot);
+    auto missMaskBuf = deviceCopy(flatMask);
     auto totalBuf = deviceCopy(totals);
     auto bufferLayerBuf = deviceCopy(bufferLayer);
 
@@ -562,6 +622,8 @@ std::vector<uint8_t> KvCacheIntrospection::sparseUnitCopy(std::vector<uint8_t> c
     args.work.row = reinterpret_cast<int32_t*>(workRowBuf.get());
     args.work.ordinal = reinterpret_cast<int32_t*>(missOrd.get());
     args.work.slot = reinterpret_cast<int32_t*>(missSlotBuf.get());
+    // Without a mask every chunk moves, which is every bit set.
+    args.work.mask = reinterpret_cast<int32_t*>(missMaskBuf.get());
     args.work.total = reinterpret_cast<int32_t*>(totalBuf.get());
     // One list's length: the kernel finds list k at k * capacity.
     args.work.capacity = static_cast<int32_t>(perList);
@@ -604,7 +666,13 @@ KvCacheIntrospection::SparseFlushList KvCacheIntrospection::sparseFlushList(std:
     std::transform(residentOrdinal.begin(), residentOrdinal.end(), metadataHost.begin(),
         [](int32_t ordinal)
         { return ordinal < 0 ? SparseEntry::kFreeWord : SparseEntry::pack(0, static_cast<uint32_t>(ordinal)); });
-    auto metadata = deviceCopyWords(metadataHost);
+    // Every entry holds every chunk, so a flush of a crossed entry is whole. The validity
+    // bytes follow the words, as the arena lays them.
+    auto const validWords = (entryCount + 3U) / sizeof(uint32_t);
+    std::vector<uint32_t> block(entryCount + validWords, 0U);
+    std::copy(metadataHost.begin(), metadataHost.end(), block.begin());
+    std::memset(block.data() + entryCount, 0xFF, entryCount);
+    auto metadata = deviceCopyWords(block);
     auto leases = deviceCopy(std::vector<int32_t>(1, 0));
 
     // A layer per metadata row, in order: the probe drives unshared selections.
@@ -614,7 +682,8 @@ KvCacheIntrospection::SparseFlushList KvCacheIntrospection::sparseFlushList(std:
 
     SparseArenaView arena;
     arena.metadataBase = metadata.get();
-    arena.leaseStride = sizeof(uint32_t) * entryCount;
+    arena.leaseStride = sizeof(uint32_t) * (entryCount + validWords);
+    arena.validOffset = sizeof(uint32_t) * entryCount;
     arena.numLayers = numLayers;
     arena.numSelections = numLayers;
     arena.entriesPerSelection = entriesPerLayer;

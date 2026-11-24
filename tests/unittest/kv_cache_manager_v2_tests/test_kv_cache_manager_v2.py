@@ -782,7 +782,10 @@ class TestSparseBufferConfig(unittest.TestCase):
                         self.assertEqual(
                             regions[1][0] - first_base, aligned(first_payload + first_tail)
                         )
-                        metadata_bytes = aligned(num_layers * units_per_buffer * 4)
+                        # A lease's metadata is its 4-byte entry words, then one validity byte
+                        # per entry.
+                        entries = num_layers * units_per_buffer
+                        metadata_bytes = aligned(entries * 4) + aligned(entries)
                         self.assertEqual(
                             batch.sparse_arena_bytes,
                             sum(aligned(payload + tail) for _, payload, tail in regions)
@@ -2074,6 +2077,152 @@ class TestSparseResolve(unittest.TestCase):
                     self.assertEqual(result.resident_ordinal[slot], resident[slot])
 
 
+class TestSparseChunkResolve(unittest.TestCase):
+    """Per-chunk residency: a cell is resident with only the chunks (KV heads) fetched into it."""
+
+    CHUNKS = 4
+    FULL = 0b1111
+
+    def setUp(self) -> None:
+        init_cuda_once()
+
+    @staticmethod
+    def _free(count: int) -> list[int]:
+        return [BAD_PAGE_INDEX] * count
+
+    def _resolve(
+        self,
+        resident: list[int],
+        selected: list[int],
+        masks: list[int] | None,
+        *,
+        valid: list[int] | None = None,
+        chunks: int = CHUNKS,
+        ages: list[int] | None = None,
+        history_units: int = 1 << 20,
+        capacity_units: int | None = None,
+        max_in_flight_units: int = 0,
+    ):
+        return _introspection.sparse_resolve_chunks(
+            resident,
+            ages or [],
+            1,
+            len(resident),
+            selected,
+            len(selected),
+            [history_units],
+            [history_units if capacity_units is None else capacity_units],
+            max_in_flight_units,
+            [],
+            unit_chunks=chunks,
+            resident_valid=valid,
+            unit_mask=masks,
+        )
+
+    @staticmethod
+    def _listed(result) -> dict[int, tuple[int, int]]:
+        """The copy list as {ordinal: (entry, chunks)}."""
+        return {
+            result.miss_ordinal[i]: (result.miss_slot[i], result.miss_mask[i])
+            for i in range(result.miss_total[0])
+        }
+
+    def test_a_miss_copies_only_the_chunks_that_read_it(self):
+        result = self._resolve(self._free(8), [5, 3], [0b0001, 0b0110])
+        listed = self._listed(result)
+        self.assertEqual({o: m for o, (_, m) in listed.items()}, {5: 0b0001, 3: 0b0110})
+        self.assertEqual(result.copied_slices, 3)
+        # The entries now hold exactly the chunks their copy brings.
+        for ordinal, (slot, mask) in listed.items():
+            self.assertEqual(result.resident_ordinal[slot], ordinal)
+            self.assertEqual(result.valid_chunks[slot], mask)
+
+    def test_several_chunks_reading_one_miss_make_one_entry(self):
+        result = self._resolve(self._free(8), [5], [0b1011])
+        self.assertEqual(result.miss_total, [1])
+        self.assertEqual(self._listed(result)[5][1], 0b1011)
+        self.assertEqual(result.copied_slices, 3)
+
+    def test_an_unmasked_selection_reads_every_chunk(self):
+        result = self._resolve(self._free(8), [5, 3], None)
+        self.assertEqual(
+            {o: m for o, (_, m) in self._listed(result).items()}, {5: 0b1111, 3: 0b1111}
+        )
+        self.assertEqual(result.copied_slices, 8)
+
+    def test_a_resident_unit_missing_a_chunk_is_listed_for_that_chunk_alone(self):
+        resident = [10, 11] + self._free(6)
+        result = self._resolve(
+            resident, [10, 11], [0b0011, 0b0100], valid=[0b0001, 0b0100] + [0] * 6
+        )
+        # Unit 11 holds everything it is read through: a hit. Unit 10 lacks chunk 1.
+        self.assertEqual(self._listed(result), {10: (0, 0b0010)})
+        self.assertEqual(result.copied_slices, 1)
+        self.assertEqual(result.resident_ordinal[:2], [10, 11], "a partial hit keeps its entry")
+        self.assertEqual(result.out_slot, [0, 1])
+        self.assertEqual(result.valid_chunks[:2], [0b0011, 0b0100])
+
+    def test_a_complete_resident_unit_hits(self):
+        resident = [10] + self._free(7)
+        result = self._resolve(resident, [10], [0b0101], valid=[0b0111] + [0] * 7)
+        self.assertEqual(result.miss_total, [0])
+        self.assertEqual(result.copied_slices, 0)
+        self.assertEqual(result.valid_chunks[0], 0b0111, "a hit adds nothing and loses nothing")
+
+    def test_a_chunk_nobody_reads_stays_unfilled(self):
+        """Chunk 3 of a unit nobody selected through it is never marked valid."""
+        resident = [10] + self._free(7)
+        first = self._resolve(resident, [10], [0b0001], valid=[0b0001] + [0] * 7)
+        self.assertEqual(first.valid_chunks[0] & 0b1000, 0)
+
+    def test_a_reassigned_entry_forgets_the_chunks_of_its_old_unit(self):
+        # One entry, holding a complete unit; another unit takes it for one chunk.
+        result = self._resolve([9], [4], [0b0100], valid=[self.FULL])
+        self.assertEqual(result.resident_ordinal, [4])
+        self.assertEqual(result.valid_chunks, [0b0100])
+        self.assertEqual(self._listed(result), {4: (0, 0b0100)})
+
+    def test_a_victim_is_chosen_without_regard_to_its_chunks(self):
+        # The stale unit is a victim whether it holds one chunk or all of them.
+        for held in (0b0001, self.FULL):
+            with self.subTest(held=held):
+                result = self._resolve(
+                    [20, 21], [30], [0b0010], valid=[held, self.FULL], ages=[5, 0]
+                )
+                self.assertEqual(result.resident_ordinal, [30, 21])
+                self.assertEqual(result.valid_chunks, [0b0010, self.FULL])
+
+    def test_in_flight_units_are_whole(self):
+        # The model writes the in-flight unit through every chunk, so its entry holds them all,
+        # whatever the selection's masks say.
+        result = self._resolve(
+            self._free(4),
+            [5],
+            [0b0001],
+            history_units=10,
+            capacity_units=11,
+            max_in_flight_units=1,
+        )
+        slots = {
+            ordinal: slot for slot, ordinal in enumerate(result.resident_ordinal) if ordinal >= 0
+        }
+        self.assertEqual(result.valid_chunks[slots[10]], self.FULL)
+        self.assertEqual(result.valid_chunks[slots[5]], 0b0001)
+        self.assertEqual(result.copied_slices, 1, "only the history unit's chunk is copied")
+
+    def test_one_chunk_per_unit_is_unchanged(self):
+        result = self._resolve(self._free(8), [5, 3], None, chunks=1)
+        self.assertEqual({o: m for o, (_, m) in self._listed(result).items()}, {5: 1, 3: 1})
+        self.assertEqual(result.copied_slices, 2)
+        resident = [10] + self._free(7)
+        hit = self._resolve(resident, [10], None, chunks=1, valid=[1] + [0] * 7)
+        self.assertEqual(hit.miss_total, [0])
+
+    def test_masks_beyond_the_unit_are_ignored(self):
+        result = self._resolve(self._free(8), [5], [0b1111_0001], chunks=2)
+        self.assertEqual(self._listed(result)[5][1], 0b01)
+
+
 class TestSparseUnitCopy(unittest.TestCase):
     """Moving a unit between its cold page and its cache cell, in both directions."""
 
@@ -2156,6 +2305,46 @@ class TestSparseUnitCopy(unittest.TestCase):
                 for c in range(chunks):
                     base = c * chunk_stride
                     self.assertEqual(result[base : base + chunk], [0] * chunk)
+
+    def test_a_chunk_mask_moves_only_the_named_chunks(self):
+        # Four heads: a unit is four runs. Only heads 1 and 3 are named, so only they move,
+        # in both directions.
+        chunks, units, chunk = 4, 2, 16
+        chunk_stride = chunk * units
+        page_stride = chunk_stride * chunks
+        host = self._pattern(page_stride)
+        for write_back in (False, True):
+            with self.subTest(write_back=write_back):
+                source = [0] * page_stride if write_back else host
+                result = _introspection.sparse_unit_copy(
+                    host_pool=source,
+                    host_page_stride=page_stride,
+                    page_table=[0],
+                    device_arena=host if write_back else [0] * page_stride,
+                    base_cell=0,
+                    num_blocks=1,
+                    cells_per_buffer=1,
+                    buffer_bytes=page_stride,
+                    num_chunks=chunks,
+                    chunk_bytes=chunk,
+                    chunk_stride=chunk_stride,
+                    unit_stride=chunk,
+                    expansion=units,
+                    miss_ordinal=[1],
+                    miss_slot=[1],
+                    miss_count=[1],
+                    selection_width=1,
+                    buffer_layer=list(range(1)),
+                    write_back=write_back,
+                    miss_mask=[0b1010],
+                )
+                for c in range(chunks):
+                    base = c * chunk_stride + chunk
+                    expected = host[base : base + chunk] if c in (1, 3) else [0] * chunk
+                    self.assertEqual(result[base : base + chunk], expected, f"chunk {c}")
+                for c in range(chunks):
+                    base = c * chunk_stride
+                    self.assertEqual(result[base : base + chunk], [0] * chunk, "unit 0 untouched")
 
     def test_layers_land_in_their_own_sub_slot(self):
         # A cold page concatenates two layers' buffers; the cache cell is derived.

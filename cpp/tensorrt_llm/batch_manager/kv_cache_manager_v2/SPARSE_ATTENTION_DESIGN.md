@@ -866,6 +866,68 @@ page has no valid contents yet, so the result is stale data rather than unrelate
 A debug check against the flushed state can catch it; silence would be a wrong answer, not
 corruption.
 
+### Per-chunk residency
+
+A selection unit of a head-major layout (MiniMax-M3: a page of 128 tokens, one slice per local KV
+head) is stored as `numChunks` contiguous chunks, one per head, in every buffer: the K plane, the V
+plane and, for NVFP4, the two scale planes. A head reads only its own chunk of a cell, so a cell
+need not hold all of them.
+
+**What is tracked.** Each entry has one validity byte, one bit per chunk, stored after the entry
+words in the lease's metadata (`SparseArenaView::validOffset`). A bit says the cell holds that
+chunk of the resident unit. The ordinal word is unchanged; the bytes are cleared when a lease is
+initialised, and every admission overwrites its entry's byte.
+
+**What the resolve does.** The caller may pass `unitMask`, parallel to `selected`: the chunks that
+read each unit this step. Eviction and cell allocation still follow the union, so residency (and
+therefore the hit rate in units) is the same as before. Each selected unit then resolves to one of:
+
+| State of the unit | Listed for the copy | Validity afterwards |
+|---|---|---|
+| not resident | `(ordinal, new cell, mask)` | exactly `mask` |
+| resident, holds every chunk in `mask` | nothing (a hit) | unchanged |
+| resident, lacks chunks `need = mask & ~valid` | `(ordinal, its cell, need)` | `valid | need` |
+
+The work list therefore carries a chunk mask per entry (`SparseWorkList::mask`): one entry per
+unit with the chunks to move in it, rather than one entry per (unit, chunk). A mask costs a word
+per entry, keeps the list as short as the selection, and lets the copy resolve the page, the cell
+and the lease once per unit. An entry per chunk would multiply the list by the head count, and the
+copy would repeat the address arithmetic for each.
+
+The resolve reads every entry's validity into shared memory before it writes any, so all of a row's
+selections are decided against the state the launch began with. New validity is visible to the
+launches after it, which on one stream are after the copy that fills it.
+
+**What the copy does.** A chunk is one contiguous run per buffer (`chunkStride` apart), so a
+per-head copy is the same loop over `numChunks` with the chunks outside the mask skipped: no extra
+launches, no extra descriptors and no extra list entries. Each chunk is `128 tokens x head_dim`
+bytes per plane, so the runs are 16 KiB (FP8) and 8 KiB (NVFP4 data, NVFP4 scales are smaller);
+the warp or CTA that takes an entry moves the chunks of the mask in turn. An entry with fewer
+chunks finishes sooner, so a step moves fewer bytes over the same number of launches.
+
+**Other readers and writers of cells.**
+
+- The in-flight unit is written through every head (`write_layer_caches` takes all heads), so its
+  entry is marked complete when it is reserved, whether the cell is restored from the host prefix or
+  empty. Write-back therefore sees complete cells; it also copies only the chunks the entry's byte
+  names, so a stale chunk can never overwrite the host page.
+- Eviction, quota changes and releasing a lease need nothing: bytes are cleared by
+  `initialiseLease` and overwritten at admission. Moving a member between rows keeps its lease and
+  so its bytes with it.
+- Cells hold nothing the transfer path reads. A disaggregated generation server receives its
+  prefix into host pages and the arena restores partial prefixes from them, always whole.
+- A layer that reuses another's selection resolves once and copies per layer with the same mask
+  list, so every layer of the selection stays in step.
+- CUDA graphs: the masks live in a fixed buffer beside the selection, the validity bytes in the
+  lease, and the resolve and the copy keep their static shapes.
+- Layouts with one chunk per unit (DSA, DeepSeek-V4) pass no masks; the mask is the single chunk
+  and every cell is complete when it is admitted, so their behaviour is unchanged.
+
+**Trade-off.** A head that picks a unit later, which today would hit the cell another head filled,
+now takes a one-chunk copy before attention. The bytes it moves are bytes the earlier fill would
+have moved too; they move on the step that reads them rather than before. Chunks nobody reads
+before the unit is evicted are never moved.
+
 ### Measuring the hit rate
 
 A hit is a selected unit the cache already held; a miss is one the fetch copied from its
