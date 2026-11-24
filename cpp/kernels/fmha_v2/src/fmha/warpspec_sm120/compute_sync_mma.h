@@ -219,6 +219,15 @@ struct Compute
                 // Every consumer thread arrives on the consumed barrier (count
                 // == CONSUMER_THREADS), so the producer cannot overwrite the
                 // buffer until all reads are done.
+                asm volatile(
+#if defined(__CUDACC_VER_MAJOR__)                                                                                      \
+    && (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
+                    "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+#else
+                    "fence.proxy.async.shared::cta;"
+#endif
+                    ::
+                        : "memory");
                 cbr_k.complete(/*arrive=*/1, k_slot);
                 cbr_k.advance();
                 cbr_q.complete(/*arrive=*/1, q_slot);
@@ -354,6 +363,18 @@ struct Compute
                                 }
                             }
                         }
+                    }
+                    if constexpr (!ENABLE_SKIP_SOFTMAX)
+                    {
+                        asm volatile(
+#if defined(__CUDACC_VER_MAJOR__)                                                                                      \
+    && (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
+                            "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+#else
+                            "fence.proxy.async.shared::cta;"
+#endif
+                            ::
+                                : "memory");
                     }
                     cbr_v.complete(/*arrive=*/1, v_slot);
                     cbr_v.advance();
