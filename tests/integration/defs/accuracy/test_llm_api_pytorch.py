@@ -121,9 +121,23 @@ def _disable_dense_prims_ts(monkeypatch: pytest.MonkeyPatch) -> None:
 
     Dense PrimTS MLA decode compiles its kernels the first time a
     configuration runs, which adds minutes to every new case. The MPI workers
-    read TLLM_FMHA_LIBS from this process when the LLM starts them.
+    read TLLM_FMHA_LIBS from this process when the LLM starts them. Other GPUs
+    never select PrimTS, so the variable stays unset there: session reuse
+    respawns its cached MPI pool whenever the environment changes.
+
+    TODO(TRTLLM-18200): remove once dense PrimTS MLA decode no longer compiles
+    per configuration at startup.
     """
-    monkeypatch.setenv("TLLM_FMHA_LIBS", "-prims_ts")
+    if is_sm_100f():
+        monkeypatch.setenv("TLLM_FMHA_LIBS", "-prims_ts")
+
+
+# The only TestDeepSeekV3Lite four-GPU case that keeps dense PrimTS MLA decode,
+# with MTP, attention DP, CUDA graphs and the overlap scheduler. It is
+# registered in l0_dgx_b300, l0_gb200_multi_gpus and l0_gb300_multi_gpus.
+_DENSE_PRIMS_TS_BF16_4GPUS_ID = (
+    "ep4-mtp_nextn=2-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False"
+)
 
 
 # MPI session reuse cannot safely reset Userbuffers between Engines. Tests
@@ -656,14 +670,11 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(4, 1, 1), (4, 1, 4),
                                                          (2, 2, 1), (1, 4, 1)],
                              ids=["tp4", "ep4", "tp2pp2", "pp4"])
-    def test_bfloat16_4gpus(self, monkeypatch: pytest.MonkeyPatch, tp_size,
-                            pp_size, ep_size, mtp_nextn, attention_dp,
-                            cuda_graph, overlap_scheduler, torch_compile):
-        # The ep4 MTP case with attention DP, CUDA graphs and the overlap
-        # scheduler keeps the default FMHA libraries, so dense PrimTS MLA decode
-        # stays covered on four GPUs; the other cases run without it.
-        if not (ep_size == 4 and mtp_nextn == 2 and attention_dp and cuda_graph
-                and overlap_scheduler and not torch_compile):
+    def test_bfloat16_4gpus(self, request: pytest.FixtureRequest,
+                            monkeypatch: pytest.MonkeyPatch, tp_size, pp_size,
+                            ep_size, mtp_nextn, attention_dp, cuda_graph,
+                            overlap_scheduler, torch_compile):
+        if request.node.callspec.id != _DENSE_PRIMS_TS_BF16_4GPUS_ID:
             _disable_dense_prims_ts(monkeypatch)
         if pp_size > 1 and mtp_nextn > 0:
             num_hidden_layers = 30
