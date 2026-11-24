@@ -56,7 +56,7 @@ from tensorrt_llm.inputs.media_io import (BaseMediaIO,
                                           log_allowed_local_media_path)
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.prefix_token_cache import tokenization_routing_key
-from tensorrt_llm.inputs.prompt_embeds import build_prompt_embeds
+from tensorrt_llm.inputs.prompt_embeds import prebuild_prompt_embeds
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.inputs.utils import ConversationMessage
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
@@ -351,11 +351,11 @@ def _snapshot_embeds_prompt(prompt: Dict[str, Any]) -> Dict[str, Any]:
     """Validate a prompt_embeds prompt and take the engine's owned snapshot.
 
     Blocking (copy, finiteness check, hash); run it off the event loop.
-    ``generate_async`` takes the snapshot as is.
+    ``generate_async`` takes the snapshot as is, and nothing here keeps it.
     """
-    token_ids, snapshot = build_prompt_embeds(prompt.get("prompt_token_ids"),
-                                              prompt["prompt_embeds"],
-                                              prompt.get("prompt_embeds_mask"))
+    token_ids, snapshot = prebuild_prompt_embeds(
+        prompt.get("prompt_token_ids"), prompt["prompt_embeds"],
+        prompt.get("prompt_embeds_mask"))
     return {"prompt_token_ids": token_ids, "prompt_embeds": snapshot}
 
 
