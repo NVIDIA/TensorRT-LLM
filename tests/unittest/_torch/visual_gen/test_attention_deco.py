@@ -44,6 +44,20 @@ _UNSEEN_LENGTHS = itertools.count(2001)
 MIN_SEQ_LEN = deco_backend.MIN_SEQ_LEN
 
 
+@pytest.fixture
+def kernel_calls(monkeypatch: pytest.MonkeyPatch) -> list:
+    """The shapes of q in the calls of the kernels' ``prepare`` during the test."""
+    calls: list = []
+    prepare = deco_backend.deco_attention.prepare
+
+    def counting(q, *args, **kwargs):
+        calls.append(tuple(q.shape))
+        return prepare(q, *args, **kwargs)
+
+    monkeypatch.setattr(deco_backend.deco_attention, "prepare", counting)
+    return calls
+
+
 @pytest.fixture(autouse=True)
 def _kernels_serve_short_calls(monkeypatch: pytest.MonkeyPatch) -> None:
     """The tests run the kernels on short sequences; ``test_deco_delegates_short_calls`` puts
@@ -215,7 +229,7 @@ def test_deco_cross_attention_layers_run_on_vanilla(require_deco_kernels) -> Non
         assert type(self_attention.attn) is DeCoAttention
 
 
-def test_deco_layer_construction(require_deco_kernels) -> None:
+def test_deco_layer_construction(require_deco_kernels, kernel_calls: list) -> None:
     """A layer needs a recipe with a kernel on this GPU (NVFP4 PV: SM120 only) and the attention
     state of the model component. A layer whose head dimension or K/V head count the kernels
     do not take is built and runs all its calls on VANILLA."""
@@ -248,7 +262,7 @@ def test_deco_layer_construction(require_deco_kernels) -> None:
 
         ref = _sdpa(q, k, v, enable_gqa=num_kv_heads != 4)
         assert out.shape == q.shape and _relative_error(out, ref) < 2e-2
-        assert "deco_workspace" not in state
+        assert not kernel_calls
 
 
 @pytest.mark.parametrize("v_dtype", V_DTYPES)
@@ -258,7 +272,12 @@ def test_deco_layer_construction(require_deco_kernels) -> None:
     ids=["tiles", "partial_tile", "one_token"],
 )
 def test_deco_forward_matches_sdpa(
-    require_deco_kernels, v_dtype: str, batch_size: int, seq_len: int, num_heads: int
+    require_deco_kernels,
+    kernel_calls: list,
+    v_dtype: str,
+    batch_size: int,
+    seq_len: int,
+    num_heads: int,
 ) -> None:
     """The output follows the scores: its error against FP32 SDPA stays below half the error of
     an attention that ignores Q and K (uniform weights) on rows that a few keys dominate."""
@@ -269,8 +288,7 @@ def test_deco_forward_matches_sdpa(
 
     out = attn.forward(q, k, v)
 
-    # The kernels served the call: a delegated call leaves no workspace behind.
-    assert "deco_workspace" in state
+    assert kernel_calls == [tuple(q.shape)]
     assert out.shape == q.shape and out.dtype == torch.bfloat16
     _assert_follows_the_scores(out, q, k, v)
     # A repeated call returns the same bits.
@@ -430,38 +448,32 @@ def test_deco_constant_v_comes_back_as_the_constant(require_deco_kernels, v_dtyp
         torch.testing.assert_close(out, v, rtol=2e-2, atol=0)
 
 
-def test_deco_layers_share_one_workspace(require_deco_kernels) -> None:
-    """The layers of a model component share one workspace, which grows to the largest call and
-    holds nothing a later call depends on; slices of a fused QKV projection give the result of
-    contiguous inputs."""
+def test_deco_call_leaves_no_workspace_behind(require_deco_kernels) -> None:
+    """The workspace of a call comes from the caching allocator and lives for the call: the
+    layers of a component hold no buffer between forwards, and calls of other sizes in between
+    leave nothing a later call depends on."""
     device = require_deco_kernels()
     batch_size, seq_len, num_heads = 1, 512, 4
     q, k, v = _random_qkv(batch_size, seq_len, num_heads, device)
-    fused = torch.cat([x.flatten(2) for x in (q, k, v)], dim=-1)
-    q_s, k_s, v_s = (x.view(q.shape) for x in fused.chunk(3, dim=-1))
-    assert not k_s.is_contiguous()
-
     state: dict = {}
     first, second = _backend(num_heads, state=state), _backend(num_heads, state=state)
     out = first.forward(q, k, v)
-    workspace = state["deco_workspace"]
+    others = [_random_qkv(batch_size, n, num_heads, device, seed=1) for n in (200, 1024)]
+    # The first call of a sequence length draws its basis rows, which the kernel package keeps.
+    for call in others:
+        second.forward(*call)
+    torch.cuda.synchronize(device)
+    allocated = torch.cuda.memory_allocated(device)
 
-    assert torch.equal(second.forward(q_s, k_s, v_s), out)
-    assert state["deco_workspace"] is workspace
-
-    # A smaller call reuses the buffer; its leftovers do not reach the next call of this shape.
-    second.forward(*_random_qkv(batch_size, 200, num_heads, device, seed=1))
-    assert state["deco_workspace"] is workspace
-    workspace.random_(0, 256)
+    for call in others:
+        second.forward(*call)
     assert torch.equal(first.forward(q, k, v), out)
-
-    # A larger call replaces it.
-    first.forward(*_random_qkv(batch_size, 1024, num_heads, device))
-    assert state["deco_workspace"].numel() > workspace.numel()
+    torch.cuda.synchronize(device)
+    assert torch.cuda.memory_allocated(device) == allocated
 
 
 def test_deco_delegates_unsupported_calls(
-    require_deco_kernels, monkeypatch: pytest.MonkeyPatch
+    require_deco_kernels, kernel_calls: list, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Cross-attention, a causal mask and other dtypes run on VANILLA, unquantized; the layer
     notes its first delegated self-attention call with what keeps it from the kernels."""
@@ -498,12 +510,14 @@ def test_deco_delegates_unsupported_calls(
     assert not out[~key_padding_mask].any()
     assert _relative_error(out[key_padding_mask], ref[key_padding_mask]) < 2e-2
 
-    assert "deco_workspace" not in attn._metadata_state
+    assert not kernel_calls
     # The layer notes once, whatever its later calls are delegated for.
     assert len(notes) == 1 and "torch.float32" in notes[0]
 
 
-def test_deco_delegates_short_calls(require_deco_kernels, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_deco_delegates_short_calls(
+    require_deco_kernels, kernel_calls: list, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A self-attention call over fewer than ``MIN_SEQ_LEN`` rows, such as the text sequence
     of a token refiner, runs on VANILLA, with the note; a call of that many rows runs on the
     kernels."""
@@ -525,14 +539,14 @@ def test_deco_delegates_short_calls(require_deco_kernels, monkeypatch: pytest.Mo
         out = attn.forward(q, k, v, key_padding_mask=key_padding_mask)
         assert not out[~key_padding_mask].any()
         assert _relative_error(out[key_padding_mask], ref[key_padding_mask]) < 2e-2
-    assert "deco_workspace" not in attn._metadata_state and attn._noted_unquantized
+    assert not kernel_calls and attn._noted_unquantized
 
     # The boundary is 8192 rows: one row fewer delegates, that many runs the kernels.
     assert MIN_SEQ_LEN == 8192
     attn.forward(*_random_qkv(1, MIN_SEQ_LEN - 1, num_heads, device))
-    assert "deco_workspace" not in attn._metadata_state
+    assert not kernel_calls
     attn.forward(*_random_qkv(1, MIN_SEQ_LEN, num_heads, device))
-    assert "deco_workspace" in attn._metadata_state
+    assert kernel_calls == [(1, MIN_SEQ_LEN, num_heads, 128)]
 
 
 def test_deco_token_tags_draw_the_basis_rows_by_modality(require_deco_kernels) -> None:

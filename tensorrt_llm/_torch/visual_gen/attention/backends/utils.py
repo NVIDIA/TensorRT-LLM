@@ -245,7 +245,7 @@ def create_attention(
         if attention_metadata_state is None:
             raise ValueError(
                 "DeCo-Attention requires `attention_metadata_state` from "
-                "DiffusionModelConfig for shared workspace allocation."
+                "DiffusionModelConfig for the plans its layers share."
             )
         kwargs["attention_metadata_state"] = attention_metadata_state
     return attn_cls(

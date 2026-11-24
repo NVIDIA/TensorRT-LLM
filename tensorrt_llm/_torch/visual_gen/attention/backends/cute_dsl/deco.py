@@ -117,9 +117,10 @@ class _Plan:
 class DeCoAttention(AttentionBackend):
     """DeCo-Attention backend for diffusion self-attention (see the module docstring).
 
-    The DeCo layers of a model component share one workspace and their plans through
-    ``attention_metadata_state``. They run one after another on one stream, and the kernels
-    keep nothing in the workspace between calls.
+    The DeCo layers of a model component share their plans through ``attention_metadata_state``.
+    The workspace of a call comes from the caching allocator and lives for the call, as the
+    other temporaries of a forward do: the kernels keep nothing in it between calls, and no
+    component holds a buffer between forwards.
     """
 
     def __init__(
@@ -158,7 +159,7 @@ class DeCoAttention(AttentionBackend):
         if attention_metadata_state is None:
             raise ValueError(
                 "DeCoAttention requires `attention_metadata_state` from DiffusionModelConfig: "
-                "the layers of a model component share one workspace buffer."
+                "the layers of a model component share their plans through it."
             )
 
         self.layer_idx = layer_idx
@@ -237,22 +238,6 @@ class DeCoAttention(AttentionBackend):
         return (
             x.is_contiguous() or deco_attention.token_rows(x)
         ) and x.data_ptr() % deco_attention.TENSOR_ALIGNMENT == 0
-
-    def _workspace(self, num_bytes: int, device: torch.device) -> torch.Tensor:
-        """Return the workspace of a call: the buffer of the component, grown to its largest call.
-
-        A call under CUDA graph capture allocates from the memory pool of the graph instead,
-        like its other temporaries: the graph keeps the addresses it was captured with.
-        """
-        if torch.cuda.is_current_stream_capturing():
-            return torch.empty(num_bytes, dtype=torch.uint8, device=device)
-        workspace = self._metadata_state.get("deco_workspace")
-        if workspace is None or workspace.numel() < num_bytes or workspace.device != device:
-            # Release the smaller buffer before allocating the larger one.
-            workspace = self._metadata_state["deco_workspace"] = None
-            workspace = torch.empty(num_bytes, dtype=torch.uint8, device=device)
-            self._metadata_state["deco_workspace"] = workspace
-        return workspace
 
     @staticmethod
     def _basis_rows(
@@ -477,7 +462,7 @@ class DeCoAttention(AttentionBackend):
                 q,
                 k,
                 v,
-                self._workspace(num_bytes, q.device),
+                torch.empty(num_bytes, dtype=torch.uint8, device=q.device),
                 pv,
                 rows=rows,
                 valid_seq_lens=token_counts,
