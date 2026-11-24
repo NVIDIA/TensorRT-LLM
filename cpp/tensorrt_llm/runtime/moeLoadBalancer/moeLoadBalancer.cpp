@@ -1310,10 +1310,10 @@ void MoeLoadBalancer::checkUpdatesEnded(char const* action) const
 {
     checkRecoveryCall(action);
     TLLM_CHECK_WITH_INFO(mIterInfoQueue.empty(), "Cannot %s while iterations are queued.", action);
-    // The worker walks the layers of a started iteration without the lock, and may start weight updates.
-    TLLM_CHECK_WITH_INFO(mLayerUpdatesPerIter == 0 || mWorkerDoneIterId == mIterId,
-        "Cannot %s before the online EPLB worker is done with the last iteration: call abandonIterations first.",
-        action);
+    // The worker is done with an iteration once it has started the iteration's weight updates, which the update
+    // thread may still run. Only abandonIterations waits for them.
+    TLLM_CHECK_WITH_INFO(mLayerUpdatesPerIter == 0 || mUpdatesEndedIterId == mIterId,
+        "Cannot %s before the weight updates of the last iteration ended: call abandonIterations first.", action);
 }
 
 void MoeLoadBalancer::checkSlotsWritable()
@@ -1380,6 +1380,7 @@ void MoeLoadBalancer::abandonIterations()
     }
     mUpdateLayerQueue.clear();
     generateUpdatePlan();
+    mUpdatesEndedIterId = mIterId;
     mAbandoning.store(false, std::memory_order_release);
 }
 
