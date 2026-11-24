@@ -57,6 +57,7 @@ from ..utils import (
     compute_swizzled_sf_shape,
     maybe_compiled_copy_,
 )
+from . import mla_ctx_absorb
 from .attention import (
     _helix_cp_allgather_input,
     _helix_cp_output_projection,
@@ -65,7 +66,6 @@ from .attention import (
     extract_extra_attrs,
 )
 from .linear import Linear, TensorParallelMode, is_static_nvfp4_input_eligible
-from . import mla_ctx_absorb
 from .mla_fp8_q_absorb import mla_fp8_q_absorb_nope
 from .multi_stream_utils import maybe_execute_in_parallel
 from .rms_norm import RMSNorm
@@ -2137,9 +2137,8 @@ class MLA(nn.Module):
                 trtllm_attention.is_chunked_prefill_for_mla_context(attn_metadata)
                 and get_sm_version() >= 100
             ):
-                if (
-                    not trtllm_attention.uses_fp4_mla_attention
-                    and mla_ctx_absorb.eligible(self, attn_metadata, q, latent_cache)
+                if not trtllm_attention.uses_fp4_mla_attention and mla_ctx_absorb.eligible(
+                    self, attn_metadata, q, latent_cache
                 ):
                     if mla_ctx_absorb.CHECK > mla_ctx_absorb._state["checked"]:
                         mla_ctx_absorb._state["checked"] += 1
