@@ -115,8 +115,10 @@ iterations to prevent later windows from overwriting earlier ones. For example,
 `TLLM_TORCH_PROFILE_TRACE=chrome.json` writes
 `chrome-rank-0-iterations-1-100.json` and
 `chrome-rank-0-iterations-400-500.json` on rank 0. An early exit uses the current
-iteration as the end of the filename range. Runtime profiling requests keep
-their existing per-request filenames.
+iteration as the end of the filename range. A runtime request uses its own
+filename and activities at its scheduled start, including when an environment
+range starts on the same iteration. Other environment windows use their
+configured trace path and default activities.
 
 For VisualGen, use `TLLM_PROFILE_VISUAL_GEN_START_STOP` instead. Numeric ranges select
 per-request denoise steps, while `predenoise`, `postdenoise`, and `all` select the

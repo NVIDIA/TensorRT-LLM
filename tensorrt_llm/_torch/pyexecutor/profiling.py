@@ -195,18 +195,10 @@ class ProfileController:
 
         # Runtime-configurable profiling state. Populated by start_profile()
         # when triggered via HTTP endpoints (e.g. trtllm-serve /start_profile)
-        # or API calls. When these are None/False the window falls back to
-        # the environment-variable driven configuration.
+        # or API calls. These settings belong to the scheduled runtime start.
         self._runtime_profile_trace_path: Optional[str] = None
         self._runtime_profile_activities: Optional[List[str]] = None
         self._runtime_profile_cuda_only: bool = False
-        # Iteration markers added by the most recent runtime start_profile().
-        # Tracked so stop_profile() can cancel a start that has not fired
-        # yet (e.g. the caller stops before sending any requests) without
-        # leaking a pending profile window that would start later.
-        self._runtime_profile_pending_start_iter: Optional[int] = None
-        self._runtime_profile_pending_stop_iter: Optional[int] = None
-
         # ``_profile_state_lock`` guards every read and write of
         # ``_profile_enabled`` AND of the pending markers /
         # ``_runtime_profile_*`` window fields above. Both the
@@ -217,8 +209,6 @@ class ProfileController:
         self._profile_state_lock = threading.Lock()
         self._profile_enabled: bool = False
 
-        self.profile_start_iters: set[int] = set()
-        self.profile_stop_iters: set[int] = set()
         self.reset_iterations()
 
         # Window state owned by the executor thread inside ``iterations()``.
@@ -241,11 +231,15 @@ class ProfileController:
 
     def reset_iterations(self) -> None:
         """Schedule only the environment's windows, dropping runtime-scheduled iterations."""
-        start_iters, stop_iters = load_iteration_indexes(PROFILE_START_STOP_ENV_VAR_NAME)
-        # Mutable copies so start_profile()/stop_profile() can add
-        # runtime-configured iteration indices.
-        self.profile_start_iters = set(start_iters)
-        self.profile_stop_iters = set(stop_iters)
+        with self._profile_state_lock:
+            self._env_start_iters, self._env_stop_iters = load_iteration_indexes(
+                PROFILE_START_STOP_ENV_VAR_NAME
+            )
+            self.profile_start_iters = set(self._env_start_iters)
+            self.profile_stop_iters = set(self._env_stop_iters)
+            self._runtime_profile_pending_start_iter: int | None = None
+            self._runtime_profile_pending_stop_iter: int | None = None
+            self._last_runtime_request: str | int | None = None
 
     @staticmethod
     def _activities_from_names(
@@ -318,12 +312,12 @@ class ProfileController:
             claimed = not already_active and pending_start is None
             if claimed:
                 # Claim the window before releasing the lock. The
-                # sentinel (0) means "pending but not yet scheduled";
+                # sentinel (-1) cannot match an executor iteration;
                 # the real ``profile_start_iters`` / trace_path state
                 # is only populated once the broadcast reaches
                 # ``_handle_special_queue_items``. Every failure path
                 # below rolls the claim back under the same lock.
-                self._runtime_profile_pending_start_iter = 0
+                self._runtime_profile_pending_start_iter = -1
 
         if not claimed:
             # Use ``RequestError`` (a ``RuntimeError`` subclass) so the
@@ -448,12 +442,6 @@ class ProfileController:
             "num_steps": num_steps,
         }
 
-        # The pending marker was already claimed by ``start_profile``;
-        # publish the requested activities under the same lock so a
-        # concurrent reader never observes a half-written window.
-        with self._profile_state_lock:
-            self._runtime_profile_activities = list(activities)
-
         # Broadcast to every rank via the request queue so non-zero
         # ranks update their own ``profile_start_iters`` in
         # lockstep. This is also what wakes the idle executor loop
@@ -550,21 +538,11 @@ class ProfileController:
     def apply_start_config(self, config: Dict) -> None:
         """Apply a broadcasted profile-start config to this rank.
 
-        Called from two places: directly on the caller thread from
-        ``start_profile()`` (so
-        ``_runtime_profile_pending_start_iter`` becomes visible for
-        re-entrancy checks) AND from ``_handle_special_queue_items``
-        when the broadcasted ``PROFILE_START_REQUEST_ID`` item
-        arrives. The operation is idempotent: the second call on
-        rank 0 sees the same state and is a no-op.
+        Each rank schedules the request against its local iteration counter.
+        Repeated delivery of the same request keeps its original schedule.
         """
-        activities = config.get("activities") or ["CPU", "GPU"]
-        output_dir = config.get("output_dir")
-        if not output_dir:
-            # Maintain compatibility for callers constructing
-            # configs without output_dir.
-            output_dir = tempfile.mkdtemp(prefix="trtllm-profile-")
-        profile_id = config.get("profile_id") or f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
+        activities = list(config.get("activities") or ["CPU", "GPU"])
+        cuda_only = len(activities) == 1 and activities[0].upper() == "CUDA_PROFILER"
         # Prefer the legacy absolute ``start_iter`` form (older unit
         # tests and env-var driven paths set this directly). For the
         # broadcast path the caller sends ``start_step`` instead so
@@ -580,54 +558,41 @@ class ProfileController:
             start_iter = current_iter + 1 + start_step
         num_steps = config.get("num_steps")
         stop_iter = config.get("stop_iter")
-        if stop_iter is None and num_steps is not None:
+        if stop_iter is not None:
+            stop_iter = int(stop_iter)
+        elif num_steps is not None:
             stop_iter = start_iter + int(num_steps)
-
-        # Rank-specific trace path so every rank writes its own file
-        # when running with TP/PP > 1.
-        trace_filename = f"trtllm-trace-{profile_id}-rank-{self.rank}.json"
-        trace_path = os.path.join(output_dir, trace_filename)
 
         # Publish the whole window under ``_profile_state_lock`` so a
         # concurrent ``start_profile()`` / ``stop_profile()`` on a
         # caller thread never observes a half-applied window (this
         # method runs on the executor thread for the broadcast path).
         with self._profile_state_lock:
-            # First apply on this rank? If the start_iter is already in
-            # profile_start_iters it means either rank 0's local apply
-            # ran (before the broadcast echo-back) or a prior broadcast
-            # already applied — in both cases the pending marker
-            # belongs to the original apply, and re-setting it here
-            # would overwrite a subsequent clear by ``profile_step()``
-            # and leak stale state.
-            is_first_apply = start_iter not in self.profile_start_iters
-
-            self._runtime_profile_trace_path = trace_path
-            self._runtime_profile_activities = list(activities)
-            self._runtime_profile_cuda_only = (
-                len(activities) == 1 and activities[0].upper() == "CUDA_PROFILER"
+            # A runtime request can share an environment start. Broadcasts
+            # carry a stable ID; legacy configs only identify the iteration.
+            profile_id = config.get("profile_id")
+            request_key = profile_id or start_iter
+            if request_key == self._last_runtime_request:
+                return
+            output_dir = config.get("output_dir") or tempfile.mkdtemp(prefix="trtllm-profile-")
+            profile_id = profile_id or f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
+            trace_path = os.path.join(
+                output_dir, f"trtllm-trace-{profile_id}-rank-{self.rank}.json"
             )
-
+            self._last_runtime_request = request_key
+            self._runtime_profile_trace_path = trace_path
+            self._runtime_profile_activities = activities
+            self._runtime_profile_cuda_only = cuda_only
             self.profile_start_iters.add(start_iter)
-            if is_first_apply:
-                self._runtime_profile_pending_start_iter = start_iter
-                if stop_iter is not None:
-                    self.profile_stop_iters.add(int(stop_iter))
-                    self._runtime_profile_pending_stop_iter = int(stop_iter)
-                # ``num_steps is None`` branch: leave pending_stop_iter
-                # alone — caller set it to None in start_profile.
-            elif stop_iter is not None:
-                # Broadcast echoes back to rank 0 after its local apply,
-                # or after the start has already fired. Only ensure the
-                # stop iter is in the set on this rank (idempotent);
-                # don't reset pending markers.
-                self.profile_stop_iters.add(int(stop_iter))
+            self._runtime_profile_pending_start_iter = start_iter
+            self._runtime_profile_pending_stop_iter = stop_iter
+            if stop_iter is not None:
+                self.profile_stop_iters.add(stop_iter)
 
         logger.info(
             f"_apply_profile_start_config[rank={self.rank}]: "
             f"start_iter={start_iter}, stop_iter={stop_iter}, "
-            f"activities={activities}, trace_path={trace_path}, "
-            f"is_first_apply={is_first_apply}"
+            f"activities={activities}, trace_path={trace_path}"
         )
 
     def apply_stop_config(self) -> bool:
@@ -664,8 +629,9 @@ class ProfileController:
             cancelled_pending_start = not currently_enabled and pending_start is not None
             if cancelled_pending_start:
                 pending_stop = self._runtime_profile_pending_stop_iter
-                self.profile_start_iters.discard(pending_start)
-                if pending_stop is not None:
+                if pending_start not in self._env_start_iters:
+                    self.profile_start_iters.discard(pending_start)
+                if pending_stop is not None and pending_stop not in self._env_stop_iters:
                     self.profile_stop_iters.discard(pending_stop)
                 self._runtime_profile_pending_start_iter = None
                 self._runtime_profile_pending_stop_iter = None
@@ -710,8 +676,7 @@ class ProfileController:
             trace_base, trace_ext = os.path.splitext(env_torch_trace_path)
             env_torch_trace_path = f"{trace_base}-rank-{self.rank}{trace_ext}"
         profile_start_stop = os.environ.get(PROFILE_START_STOP_ENV_VAR_NAME, None)
-        env_start_iters, _ = load_iteration_indexes(PROFILE_START_STOP_ENV_VAR_NAME)
-        self._env_multiple_ranges = len(env_start_iters) > 1
+        self._env_multiple_ranges = len(self._env_start_iters) > 1
         self._env_torch_trace_path = env_torch_trace_path
         self._env_enable_torch_trace = bool(env_torch_trace_path and profile_start_stop)
         if env_torch_trace_path and profile_start_stop is None:
@@ -792,16 +757,13 @@ class ProfileController:
         iteration = self._current_iteration()
         if iteration in self.profile_start_iters and not self._is_warmup():
             assert not self._window_open, "Inconsistent CUDA profiling state"
-            # Resolve active trace path + torch.profiler
-            # configuration at start time so runtime overrides
-            # from ``start_profile()`` take precedence over the
-            # environment variables.
-            runtime_trace_path = self._runtime_profile_trace_path
             self._active_profile_start_iter = iteration
-            self._active_env_trace = runtime_trace_path is None
-            runtime_cuda_only = self._runtime_profile_cuda_only
-            runtime_activities = self._runtime_profile_activities
-            if runtime_trace_path is not None:
+            with self._profile_state_lock:
+                self._active_env_trace = self._runtime_profile_pending_start_iter != iteration
+                runtime_trace_path = self._runtime_profile_trace_path
+                runtime_cuda_only = self._runtime_profile_cuda_only
+                runtime_activities = self._runtime_profile_activities
+            if not self._active_env_trace:
                 self._active_torch_trace_path = runtime_trace_path
                 # CUDA_PROFILER only: skip torch.profiler so we
                 # do not pay its overhead and so nsys traces

@@ -333,6 +333,41 @@ def test_runtime_api_keeps_unique_paths_and_requested_configuration(
     )
 
 
+@pytest.mark.parametrize("runtime_start", [1, 5])
+def test_runtime_configuration_applies_only_to_its_window(
+    cpu_runtime: Mock, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, runtime_start: int
+) -> None:
+    """Runtime wins a shared start without redirecting separate environment windows."""
+    monkeypatch.setenv("TLLM_PROFILE_START_STOP", "1-3,10-12")
+    monkeypatch.setenv("TLLM_TORCH_PROFILE_TRACE", str(tmp_path / "environment.json"))
+    executor = _Executor(rank=0)
+    config = {}
+    executor.executor_request_queue = SimpleNamespace(enqueue_profile_start_request=config.update)
+    with _profile_step(executor) as step:
+        executor.controller.start_profile(
+            output_dir=str(tmp_path), start_step=runtime_start - 1, num_steps=2, activities=["CPU"]
+        )
+        executor.controller.apply_start_config(config)
+        _advance(executor, step, 0, 12)
+
+    expected = {
+        start: f"environment-rank-0-iterations-{start}-{start + 2}.json" for start in (1, 10)
+    }
+    expected[runtime_start] = f"trtllm-trace-{config['profile_id']}-rank-0.json"
+    assert {path.name for path in tmp_path.glob("*.json")} == set(expected.values())
+    for start, name in expected.items():
+        events = _event_names(tmp_path / name)
+        assert {event for event in events if event.startswith("iteration-")} == {
+            f"iteration-{start}",
+            f"iteration-{start + 1}",
+        }
+    activity = torch.profiler.ProfilerActivity
+    assert [call.kwargs["activities"] for call in cpu_runtime.call_args_list] == [
+        [activity.CPU] if start == runtime_start else [activity.CPU, activity.CUDA, activity.XPU]
+        for start in sorted(expected)
+    ]
+
+
 def test_early_exit_filename_uses_actual_end_iteration(
     cpu_runtime: Mock, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
