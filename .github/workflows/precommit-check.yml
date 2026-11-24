@@ -56,24 +56,37 @@ jobs:
         run: |
           set -euo pipefail
           gh api "repos/${REPO}/pulls/${PR_NUMBER}/files" \
-            --paginate --jq '.[].filename' > "${CHANGED_FILES_PATH}"
-          count=$(awk 'NF' "${CHANGED_FILES_PATH}" | wc -l | tr -d ' ')
-          echo "Changed file count from API: ${count}"
-          echo "count=${count}" >> "$GITHUB_OUTPUT"
+            --paginate --jq '.[].filename | @json' \
+            | python3 -c '
+          import json, os, sys
+
+          files = [json.loads(line) for line in sys.stdin if line.strip()]
+          print(f"Changed file count from API: {len(files)}")
+          unsafe = any(
+              not isinstance(f, str) or not f or f != f.strip() or "\n" in f or "\r" in f
+              for f in files
+          )
+          # GitHub PR Files API caps out at 3000 entries; also fall back when any
+          # path has line breaks or leading/trailing whitespace that line-based
+          # --files-from cannot preserve.
+          use_files_from = (not unsafe) and 0 < len(files) < 2500
+          if use_files_from:
+              with open(os.environ["CHANGED_FILES_PATH"], "w", encoding="utf-8", newline="\n") as fh:
+                  fh.write("\n".join(files) + "\n")
+          elif unsafe:
+              print("Detected path with line breaks or leading/trailing whitespace; falling back to full check.")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"use_files_from={str(use_files_from).lower()}\n")
+          '
 
       - name: Run pre-commit checks
         env:
           EVENT_NAME: ${{ github.event_name }}
-          CHANGED_FILES_COUNT: ${{ steps.changed-files.outputs.count }}
+          USE_FILES_FROM: ${{ steps.changed-files.outputs.use_files_from }}
           CHANGED_FILES_PATH: ${{ runner.temp }}/changed_files.txt
         run: |
           set -euo pipefail
-          if [ "${EVENT_NAME}" = "pull_request" ] &&
-             [ -n "${CHANGED_FILES_COUNT}" ] &&
-             [ "${CHANGED_FILES_COUNT}" -gt 0 ] &&
-             [ "${CHANGED_FILES_COUNT}" -lt 2500 ]; then
-            # GitHub's PR Files API caps out at 3000 entries, silently truncating the
-            # list for huge PRs. Fail closed with a 2500 margin below that cap.
+          if [ "${EVENT_NAME}" = "pull_request" ] && [ "${USE_FILES_FROM}" = "true" ]; then
             python3 -u scripts/release_check.py --files-from "${CHANGED_FILES_PATH}"
           else
             python3 -u scripts/release_check.py
