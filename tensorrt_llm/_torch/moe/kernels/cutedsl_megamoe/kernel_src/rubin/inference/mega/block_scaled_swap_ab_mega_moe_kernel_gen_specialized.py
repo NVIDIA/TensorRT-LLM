@@ -228,6 +228,10 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
         self._validate_desc_inputs(problem_desc, impl_desc)
+        # The gen-phase token comm reads the ids as slot ids; the key is refused, not declared, so a framework that
+        # probes impl_desc_require() for the route does not take this kernel for one that maps expert ids.
+        if impl_desc.get("adaptive_route_experts"):
+            raise NotImplementedError("The adaptive route is implemented in token_comm.py's router only.")
         problem_desc, impl_desc = resolve_dlb_expert_counts(
             problem_desc, impl_desc, world_size=problem_desc["world_size"]
         )

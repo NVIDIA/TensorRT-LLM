@@ -205,6 +205,8 @@ class _DedupMetadataPushRouter(KernelComponent):
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
         self._validate_desc_inputs(problem_desc, impl_desc)
+        if impl_desc.get("adaptive_route_experts"):
+            raise NotImplementedError("The adaptive route is implemented in token_comm.py's router only.")
 
         self.world_size = problem_desc["world_size"]
         self.expert_count = problem_desc["expert_count"]
@@ -2170,6 +2172,9 @@ class TokenCommDedup(KernelComponent):
 
         iket.range_push("token_in.wait_metadata_ready")
         self._router.wait_for_metadata_ready(self._device_workspace)
+        # The peers' rows this flag publishes were written with generic stores; token_in pulls them below
+        # with TMA (async proxy), so the acquire is followed by a proxy fence, as the router's size exchange does.
+        cute.arch.fence_proxy("async.global")
         iket.range_pop()
 
         for size_copy_round in cutlass.range_constexpr(size_copy_rounds):
@@ -2256,7 +2261,10 @@ class TokenCommDedup(KernelComponent):
                         if not retired:
                             if cutlass.const_expr(self.token_in_flag_batch > 1):
                                 # Publish the ready flags this warp still batches before it sleeps: the block it
-                                # waits for may be waiting for one of them.
+                                # waits for may be waiting for one of them. Their rows waited only for .read, so
+                                # their stores complete first.
+                                cute.arch.cp_async_bulk_wait_group(0)
+                                cute.arch.sync_warp()
                                 flag_tracker.fire()
                                 flag_tracker = flag_tracker.drained()
                             iket.range_push("token_in.ring_wait")
@@ -2326,7 +2334,13 @@ class TokenCommDedup(KernelComponent):
                             destination_sf_vectors[None, sf_vector_idx],
                         )
 
-                cute.arch.cp_async_bulk_wait_group(0, read=True)
+                # The FC1 GEMM TMA-loads a row once a flag covering it is visible. .read only means the
+                # bulk store has read the stage, so a row whose accumulate() publishes waits for the
+                # stores to complete, which also completes the batch's earlier rows.
+                if flag_tracker.publishes_on_accumulate(Int32(0), self.token_in_flag_batch):
+                    cute.arch.cp_async_bulk_wait_group(0)
+                else:
+                    cute.arch.cp_async_bulk_wait_group(0, read=True)
                 cute.arch.sync_warp()
                 ready_address = (fc1_ready_counter + ready_slot_idx).toint()
                 flag_tracker = flag_tracker.accumulate(Int32(0), self.token_in_flag_batch, ready_address)
@@ -2344,6 +2358,10 @@ class TokenCommDedup(KernelComponent):
             )
             local_expert = local_expert + Int32(1)
 
+        # The tail flush publishes a batch that never filled.
+        if cutlass.const_expr(self.token_in_flag_batch > 1):
+            cute.arch.cp_async_bulk_wait_group(0)
+            cute.arch.sync_warp()
         flag_tracker.fire()
         cute.arch.sync_warp()
         iket.range_pop()
@@ -2503,6 +2521,9 @@ class TokenCommDedup(KernelComponent):
                             wait_sleep_ns = cutlass.min(wait_sleep_ns * Int32(2), Int32(self.fc2_done_wait_sleep_max_ns))
                     # Order every lane's fc2_done acquire before the TMA that reads the completed copies.
                     cute.arch.sync_warp()
+                    # The FC2 epilogue writes the copies this counter publishes with ordinary stores; TMA reads
+                    # them below.
+                    cute.arch.fence_proxy("async.global")
                     iket.range_pop()
                     block_index = Int64(metadata.src_token) * Int64(self.world_size) + Int64(metadata.src_rank)
                     block_address = order_pointer.toint() + block_index * Int64(self.order_block_bytes)

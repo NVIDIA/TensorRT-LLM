@@ -36,7 +36,8 @@ from ...helpers.smem_workspace import SmemWorkspace
 from ...helpers.utils import ceil_div, round_up, worst_case_padded_rows
 from ...quant_def import CombineFormat, QuantKind
 from ..token_protocol import TokenSrcMetadata
-from .one_round_router import _OneRoundRouter, fence_proxy_async_global
+from .adaptive_route import AdaptiveRouteMixin
+from .one_round_router import _OneRoundRouter
 from .symmetric_buffer import SymmetricBufferDevice
 
 
@@ -112,7 +113,7 @@ def _copy_atom(dtype, num_bits_per_copy: int):
     return cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), dtype, num_bits_per_copy=num_bits_per_copy)
 
 
-class _MetadataPushRouter(KernelComponent):
+class _MetadataPushRouter(AdaptiveRouteMixin, KernelComponent):
     """Sort and push routing metadata into each destination rank's final pool."""
 
     router_smem_limit_bytes: ClassVar[int] = 227 * 1024
@@ -170,11 +171,15 @@ class _MetadataPushRouter(KernelComponent):
             # (one NVLink domain); the internode component sets its ranks_per_node so the size
             # exchange, the metadata push and the ready counters stay inside the node.
             "ranks_per_node": OptionalRequirement(int),
+            # > 0: the staged ids are this many experts' ids, mapped to slots and counted by the adaptive route
+            # (adaptive_route.py). 0 (the default) reads them as slot ids.
+            "adaptive_route_experts": OptionalRequirement(int),
         }
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
         self._validate_desc_inputs(problem_desc, impl_desc)
 
+        self.adaptive_route_experts = int(impl_desc.get("adaptive_route_experts", 0) or 0)
         self.world_size = problem_desc["world_size"]
         self.ranks_per_node = impl_desc.get("ranks_per_node", self.world_size)
         if self.ranks_per_node <= 0 or self.world_size % self.ranks_per_node != 0:
@@ -182,6 +187,11 @@ class _MetadataPushRouter(KernelComponent):
         self.num_nodes = self.world_size // self.ranks_per_node
         self.expert_count = problem_desc["expert_count"]
         self.topk = problem_desc["topk"]
+        if not 0 <= self.adaptive_route_experts <= self.expert_count:
+            raise ValueError("An adaptive route maps at most as many experts as there are slots.")
+        if self.adaptive_route_experts > 0 and self.num_nodes != 1:
+            # The internode router's Stage 1 pack reads the staged ids as slot ids.
+            raise NotImplementedError("The adaptive route is implemented for one NVLink domain only.")
         self.max_tokens_per_rank = problem_desc["max_tokens_per_rank"]
         self.apply_topk_at_fc1 = problem_desc["apply_topk_at_fc1"]
         self.fc1_activation_per_token_scale = bool(problem_desc.get("fc1_activation_per_token_scale", False))
@@ -445,9 +455,17 @@ class _MetadataPushRouter(KernelComponent):
         activation: Optional[cute.Tensor] = None,  # (tokens, hidden) FP4 rows, relay payload source
         activation_sf: Optional[cute.Tensor] = None,  # (tokens, hidden // sf_vector) scale factors
         activation_scales: Optional[cute.Tensor] = None,  # (max_tokens_per_rank,) fp32, local
+        # iff adaptive_route_experts > 0: the device addresses of the layer's packed route table row, its statistics
+        # row (float32 per expert), forward count (int64), recording flag (int32) and live-row word (int32), then the
+        # forward's token rows and whether this is the forward's first call (Int32 each); adaptive_route.py
+        adaptive_route: Optional[tuple] = None,
         tmp_buffer: Optional[cute.Pointer] = None,  # caller-owned tmp buffer; None: the data stays in local_workspace
     ) -> None:
         """Launch counting-sort DATA, size-exchange HELPER, and metadata PUSH roles."""
+        if cutlass.const_expr((adaptive_route is not None) != (self.adaptive_route_experts > 0)):
+            raise ValueError("adaptive_route is passed iff the router is built with adaptive_route_experts")
+        if cutlass.const_expr(adaptive_route is None):
+            adaptive_route = (None,) * 7
         if cutlass.const_expr(self.apply_topk_at_fc1 and topk_scores is None):
             raise ValueError("apply_topk_at_fc1 requires router topk_scores.")
         if cutlass.const_expr(self.fc1_activation_per_token_scale != (activation_scales is not None)):
@@ -467,6 +485,7 @@ class _MetadataPushRouter(KernelComponent):
             gin_shared_window_offset,
             activation,
             activation_sf,
+            *adaptive_route,
             tmp_buffer,
         ).launch(
             grid=[self.router_grid_cta_count, 1, 1],
@@ -491,6 +510,13 @@ class _MetadataPushRouter(KernelComponent):
         gin_shared_window_offset,  # Optional[Int64]: None without GIN resources
         activation: Optional[cute.Tensor],
         activation_sf: Optional[cute.Tensor],
+        adaptive_tables: Optional[Int64],
+        adaptive_stats: Optional[Int64],
+        adaptive_forwards: Optional[Int64],
+        adaptive_stats_enabled: Optional[Int64],
+        adaptive_live_word: Optional[Int64],
+        adaptive_stats_tokens: Optional[Int32],
+        adaptive_stats_first: Optional[Int32],
         tmp_buffer: Optional[cute.Pointer],
     ) -> None:
         # First statement on purpose: a by-value NCCL DevComm argument must be materialized where it
@@ -526,6 +552,17 @@ class _MetadataPushRouter(KernelComponent):
         self._router_warp_idx = warp_idx
         self._router_lane_idx = lane_idx
         self._router_activation_scales = activation_scales
+        if cutlass.const_expr(self.adaptive_route_experts > 0):
+            self._router_adaptive = (
+                adaptive_tables,
+                adaptive_stats,
+                adaptive_forwards,
+                adaptive_stats_enabled,
+                adaptive_live_word,
+                adaptive_stats_tokens,
+                adaptive_stats_first,
+            )
+            self._router_adaptive_counted_rows = self._adaptive_counted_rows(self._router_adaptive, linear_cta_idx, thread_idx)
 
         if cutlass.const_expr(self.router_data_cta_count == 1):
             self._router_single_cta(topk_indices, topk_scores, smem_base)
@@ -553,6 +590,9 @@ class _MetadataPushRouter(KernelComponent):
         self._router_warp_idx = None
         self._router_lane_idx = None
         self._router_activation_scales = None
+        if cutlass.const_expr(self.adaptive_route_experts > 0):
+            self._router_adaptive = None
+            self._router_adaptive_counted_rows = None
 
     @cute.jit
     def _router_single_cta(
@@ -1139,9 +1179,27 @@ class _MetadataPushRouter(KernelComponent):
             if cutlass.const_expr(topk_indices.dtype.width == 64):
                 expert_registers[register_idx] = raw_indices_i32[2 * register_idx]
             token_idx, _ = self._router_value_coordinate(register_idx, topk_indices.dtype)
-            is_invalid = (expert_registers_u32[register_idx] >= cutlass.Uint32(self.expert_count)) | (
-                token_idx >= actual_token_count
-            )
+            if cutlass.const_expr(self.adaptive_route_experts > 0):
+                # Expert ids: count the live rows' picks and route each through the layer's tables; any other
+                # id becomes -1, which the slot test below drops.
+                in_range = (expert_registers_u32[register_idx] < cutlass.Uint32(self.adaptive_route_experts)) & (
+                    token_idx < actual_token_count
+                )
+                if in_range:
+                    expert_registers[register_idx] = self._adaptive_pick(
+                        self._router_adaptive,
+                        self._router_adaptive_counted_rows,
+                        expert_registers[register_idx],
+                        token_idx,
+                        self._router_local_rank,
+                    )
+                else:
+                    expert_registers[register_idx] = Int32(-1)
+                is_invalid = expert_registers_u32[register_idx] >= cutlass.Uint32(self.expert_count)
+            else:
+                is_invalid = (expert_registers_u32[register_idx] >= cutlass.Uint32(self.expert_count)) | (
+                    token_idx >= actual_token_count
+                )
             if is_invalid:
                 expert_registers[register_idx] = Int32(self.expert_count_padded)
         return expert_registers, score_registers
@@ -1824,9 +1882,12 @@ class TokenCommNonDeterministic(KernelComponent):
         activation: Optional[cute.Tensor] = None,
         activation_sf: Optional[cute.Tensor] = None,
         activation_scales: Optional[cute.Tensor] = None,
+        adaptive_route: Optional[tuple] = None,  # iff adaptive_route_experts > 0 (_MetadataPushRouter.launch_router)
         tmp_buffer: Optional[cute.Pointer] = None,  # caller-owned tmp buffer; None: the data stays in local_workspace
     ) -> None:
         if cutlass.const_expr(self.one_round_dispatch):
+            if cutlass.const_expr(adaptive_route is not None):
+                raise ValueError("The one-round dispatch router has no adaptive route.")
             self._router.launch_router(
                 topk_indices,
                 topk_scores,
@@ -1857,6 +1918,8 @@ class TokenCommNonDeterministic(KernelComponent):
                 activation_sf,
                 activation_scales,
                 tmp_buffer=tmp_buffer,
+                # Only an adaptive-route build passes it: every other router keeps its signature.
+                **({} if adaptive_route is None else {"adaptive_route": adaptive_route}),
             )
 
     # Pool-layout hooks. The NVLink-domain component consumes the router's tables directly; the
@@ -2762,9 +2825,9 @@ class TokenCommNonDeterministic(KernelComponent):
 
         iket.range_push("token_in.wait_metadata_ready")
         self._router.wait_for_metadata_ready(self._device_workspace)
-        if cutlass.const_expr(self.one_round_dispatch):
-            # The plane rows were written by peers' generic stores and are read below through TMA.
-            fence_proxy_async_global()
+        # The peers' rows this flag publishes were written with generic stores; token_in pulls them below
+        # with TMA (async proxy), so the acquire is followed by a proxy fence, as the router's size exchange does.
+        cute.arch.fence_proxy("async.global")
         iket.range_pop()
 
         for size_copy_round in cutlass.range_constexpr(size_copy_rounds):
@@ -2873,7 +2936,10 @@ class TokenCommNonDeterministic(KernelComponent):
                         if not retired:
                             if cutlass.const_expr(self.token_in_flag_batch > 1):
                                 # Publish the ready flags this warp still batches before it sleeps: the block it
-                                # waits for may be waiting for one of them.
+                                # waits for may be waiting for one of them. Their rows waited only for .read, so
+                                # their stores complete first.
+                                cute.arch.cp_async_bulk_wait_group(0)
+                                cute.arch.sync_warp()
                                 flag_tracker.fire()
                                 flag_tracker = flag_tracker.drained()
                             iket.range_push("token_in.ring_wait")
@@ -2931,7 +2997,8 @@ class TokenCommNonDeterministic(KernelComponent):
                             cp_async_bulk_s2g(chunk_destination, warp_activation_stage.iterator, Int32(activation_bytes))
                         cute.arch.sync_warp()
                         cute.arch.cp_async_bulk_commit_group()
-                        # Drain before the stage is reused by the next chunk (and before the flag).
+                        # The next chunk reuses the stage once this store has read it; the flag below
+                        # waits for the stores themselves.
                         cute.arch.cp_async_bulk_wait_group(0, read=True)
                         cute.arch.sync_warp()
                 else:
@@ -2982,9 +3049,15 @@ class TokenCommNonDeterministic(KernelComponent):
                                 destination_sf_vectors[None, sf_vector_idx],
                             )
 
-                if cutlass.const_expr(not self.token_in_stage_split):
-                    cute.arch.cp_async_bulk_wait_group(0, read=True)
-                    cute.arch.sync_warp()
+                # The FC1 GEMM TMA-loads a row once a flag covering it is visible. .read only means the
+                # bulk store has read the stage, so a row whose accumulate() publishes waits for the
+                # stores to complete, which also completes the batch's earlier rows.
+                if flag_tracker.publishes_on_accumulate(Int32(0), self.token_in_flag_batch):
+                    cute.arch.cp_async_bulk_wait_group(0)
+                else:
+                    if cutlass.const_expr(not self.token_in_stage_split):
+                        cute.arch.cp_async_bulk_wait_group(0, read=True)
+                cute.arch.sync_warp()
                 ready_address = (fc1_ready_counter + ready_slot_idx).toint()
                 flag_tracker = flag_tracker.accumulate(Int32(0), self.token_in_flag_batch, ready_address)
                 cute.arch.sync_warp()
@@ -3003,6 +3076,10 @@ class TokenCommNonDeterministic(KernelComponent):
             )
             local_expert = local_expert + Int32(1)
 
+        # The tail flush publishes a batch that never filled.
+        if cutlass.const_expr(self.token_in_flag_batch > 1):
+            cute.arch.cp_async_bulk_wait_group(0)
+            cute.arch.sync_warp()
         flag_tracker.fire()
         cute.arch.sync_warp()
         if cutlass.const_expr(self.tail_parity):
@@ -3170,6 +3247,9 @@ class TokenCommNonDeterministic(KernelComponent):
                 iket.range_push("token_back.wait_fc2")
                 while cute.arch.load(fc2_done + local_expert, Int32, sem="acquire", scope="gpu") < completion_target:
                     nanosleep(500)
+                # The FC2 epilogue writes the rows this counter publishes with ordinary stores
+                # (data rows on the non-bulk path, scale rows on every path); TMA reads them below.
+                cute.arch.fence_proxy("async.global")
                 iket.range_pop()
             chunk_total = token_count * Int32(chunk_count)
             pool_expert_base = pool_expert_bases[local_expert]
@@ -3398,6 +3478,9 @@ class TokenCommNonDeterministic(KernelComponent):
                     iket.range_push("token_back.wait_fc2")
                     while cute.arch.load(fc2_done + local_expert, Int32, sem="acquire", scope="gpu") < completion_target:
                         nanosleep(500)
+                    # The FC2 epilogue writes the rows this counter publishes with ordinary stores
+                    # (data rows on the non-bulk path, scale rows on every path); TMA reads them below.
+                    cute.arch.fence_proxy("async.global")
                     iket.range_pop()
 
             while next_dense_token < expert_valid_end:
@@ -3411,6 +3494,9 @@ class TokenCommNonDeterministic(KernelComponent):
                             self.fc2_done_signals_per_token_tile
                         ):
                             nanosleep(500)
+                        # The FC2 epilogue writes the rows this counter publishes with ordinary stores
+                        # (data rows on the non-bulk path, scale rows on every path); TMA reads them below.
+                        cute.arch.fence_proxy("async.global")
                         iket.range_pop()
                         last_ready_slot = ready_slot
                 pool_token_idx = pool_expert_bases[local_expert] + token_in_expert

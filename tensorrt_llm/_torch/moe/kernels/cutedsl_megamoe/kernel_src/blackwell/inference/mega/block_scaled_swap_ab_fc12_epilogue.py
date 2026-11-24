@@ -1023,6 +1023,7 @@ class SwapABGatedActEpilogue(KernelComponent):
             # Publish fc2_done even without token-back (the internode rail peers gather relay rows after it).
             "publish_fc2_done": OptionalRequirement(bool),
             "fc2_output_ring_blocks": OptionalRequirement(int),
+            "token_back_ready_granularity": OptionalRequirement(str),
         }
 
     @staticmethod
@@ -1105,6 +1106,9 @@ class SwapABGatedActEpilogue(KernelComponent):
         # into slot b % fc2_output_ring_blocks (_fc2_output_row_start) and publishes its completion for the
         # block, not for the expert (signal_fc2_done). Nothing waits here.
         self.fc2_output_ring_blocks = impl_desc.get("fc2_output_ring_blocks", 0)
+        self.token_back_ready_granularity = impl_desc.get("token_back_ready_granularity", "expert")
+        if self.token_back_ready_granularity not in ("expert", "token_tile"):
+            raise ValueError(f"Unsupported token_back_ready_granularity {self.token_back_ready_granularity!r}.")
         # Release scope of the fc2_done publication: "gpu" for same-GPU consumers (the NVLink
         # token-back warps acquire at GPU scope), "sys" when another rank acquires the counter
         # (internode combine, design invariant I9).
@@ -2630,11 +2634,12 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
         publish: cutlass.Constexpr = self.publish_fc2_done
         flag_address = Int64(0)
         if cutlass.const_expr(publish):
-            if cutlass.const_expr(self.fc2_output_ring_blocks > 0):
-                # Local FC2 output in the ring: completion per pool token block. Every CTA tile of the block
-                # publishes once, the padded hidden tiles of the last cluster tile included.
-                block = work_tile_info.cumulative_token_block_count + work_tile_info.tile_n_idx
-                flag_address = (self.fc2_done_counter.iterator + block).toint()
+            if cutlass.const_expr(self.fc2_output_ring_blocks > 0 or self.token_back_ready_granularity == "token_tile"):  # nosec B105 -- mode name, not a credential
+                # Completion per pool token block: the local FC2 output in the ring, or token-tile return
+                # readiness. The scheduler maps every fallback CTA into the preferred logical cluster, so every
+                # CTA tile of the block publishes once, the padded hidden tiles of the last cluster tile included.
+                slot = work_tile_info.cumulative_token_block_count + work_tile_info.tile_n_idx
+                flag_address = (self.fc2_done_counter.iterator + slot).toint()
             else:
                 flag_address = (self.fc2_done_counter.iterator + work_tile_info.expert_idx).toint()
         no_fire: cutlass.Constexpr = not publish

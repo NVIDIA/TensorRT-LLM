@@ -205,6 +205,8 @@ class _MetadataPushRouter(KernelComponent):
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
         self._validate_desc_inputs(problem_desc, impl_desc)
+        if impl_desc.get("adaptive_route_experts"):
+            raise NotImplementedError("The adaptive route is implemented in token_comm.py's router only.")
 
         self.expert_count = problem_desc["expert_count"]
         self.topk = problem_desc["topk"]

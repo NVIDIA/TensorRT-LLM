@@ -150,9 +150,13 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             "fallback_cluster_count": OptionalRequirement(Optional[int]),
             "token_in_flag_batch": int,
             "token_back_mode": str,
+            "token_back_ready_granularity": OptionalRequirement(str),
             "reduce_topk_in_kernel": bool,
             "skip_topk_reduce": OptionalRequirement(bool),
             "helper_expert_count": OptionalRequirement(int),
+            # > 0: the router maps this many experts' staged ids to slots and counts them (adaptive load balancer;
+            # communication/nvlink_domain/adaptive_route.py). 0 (the default) builds the kernel without it.
+            "adaptive_route_experts": OptionalRequirement(int),
             "total_helper_slots": OptionalRequirement(int),
             # Master switch of the internode code paths (False: main's NVLink-domain kernel), the
             # component selection it implies ("nvlink" / "internode_gin") and the internode
@@ -180,10 +184,6 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         problem_desc, impl_desc = resolve_dlb_expert_counts(
             problem_desc, impl_desc, world_size=problem_desc["world_size"]
         )
-        # The Blackwell epilogue publishes expert counters; it counts per token tile only with the local FC2
-        # output in the ring workspace, where the kernel asks for that itself.
-        if impl_desc.get("token_back_ready_granularity", "expert") != "expert":
-            raise ValueError("Blackwell requires token_back_ready_granularity='expert'.")
 
         self.expert_count = problem_desc["expert_count"]
         self.intermediate_gateup_size = problem_desc["intermediate_gateup_size"]
@@ -243,6 +243,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         self.launch_cluster_count = impl_desc["launch_cluster_count"]
         self.token_in_flag_batch = impl_desc["token_in_flag_batch"]
         self.token_back_mode = impl_desc["token_back_mode"]
+        self.token_back_ready_granularity = impl_desc.get("token_back_ready_granularity", "expert")
         self.reduce_topk_in_kernel = impl_desc["reduce_topk_in_kernel"]
         # Ring workspace: the ring_token_blocks the caller asked for (None or 0: none). The ring in effect is
         # self.ring_token_blocks, resolved below once the geometry is validated.
@@ -284,6 +285,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             if self.fuse_shared:
                 raise ValueError("The fused shared expert does not support combine_dedup.")
         self.tail_parity = not self.combine_dedup
+        self.adaptive_route_experts = int(impl_desc.get("adaptive_route_experts", 0) or 0)
 
         self.occupancy = 1
         self.architecture = "sm_100"
@@ -317,6 +319,8 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             # is applied after FC2, reuse_dispatch_warps and the in-kernel reduce drop the remote
             # partials, and the tail reset can race late fc2_done mirror increments.
             raise NotImplementedError("internode=True is not supported by this MegaMoE kernel package.")
+        if self.internode and self.adaptive_route_experts:
+            raise NotImplementedError("The adaptive route is implemented in the NVLink-domain router only.")
         if not self.internode:
             stray = [key for key in _INTERNODE_IMPL_KEYS if key in impl_desc]
             if impl_desc.get("ranks_per_node", self.world_size) != self.world_size:
@@ -367,6 +371,13 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         # A requested ring is checked as a ring, in effect or not: what is supported does not depend on the
         # problem size.
         self._validate_ring_workspace()
+        # FC2 completion is counted per expert or per token tile. A local FC2 output in the ring workspace is
+        # read out block by block, so with it the count is per token tile whatever token_back_ready_granularity
+        # says; the caller's key is gated as without a ring (_validate_geometry), and what the count needs is
+        # checked on the built components (_validate_token_tile_ready_contract).
+        self.fc2_ready_granularity = (
+            "token_tile" if self.ring_covers_fc2_output else self.token_back_ready_granularity
+        )
         # The key never makes an invalid configuration valid: the caller's hint is validated against the
         # caller's FC1 flag batch, as without the key, before the ring takes that batch over.
         self._resolve_schedule_hint()
@@ -394,23 +405,23 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             sf_vec_size=self.sf_vec_size,
         )
         tmem_plan = make_tcgen05_tmem_plan(mma_instruction, self.architecture, self.mma_tiler_mnk)
-        tokens_per_fc1_ready_slot = self.tokens_per_token_block
-        hidden_per_fc2_cluster_tile = self.mma_tiler_mnk[0] // mma_cta_count * self.cluster_shape_mn[0]
-        fc2_done_signals_per_token_tile = (
-            ceil_div(self.hidden_size, hidden_per_fc2_cluster_tile)
-            * self.cluster_shape_mn[0]
-            * self.cluster_shape_mn[1]
-        )
-        if self.ring_covers_fc2_output:
-            # A local FC2 output in the ring workspace is read out block by block, so FC2 completion is counted
-            # per token tile: every CTA tile of a block publishes once. The helper checks that a ready slot is
-            # one token tile (hidden-only clusters, complete MMA CTA groups).
+        if self.fc2_ready_granularity == "token_tile":
+            # FC2 completion per token tile: every CTA tile of a block publishes once. The helper checks that a
+            # ready slot is one token tile (hidden-only clusters, complete MMA CTA groups).
             tokens_per_fc1_ready_slot, fc2_done_signals_per_token_tile = derive_fc2_ready_geometry(
                 hidden_size=self.hidden_size,
                 mma_tiler_mnk=self.mma_tiler_mnk,
                 cluster_shape_mn=self.cluster_shape_mn,
                 use_2cta_instrs=self.use_2cta_instrs,
                 fallback_cluster_shape_mn=self.fallback_cluster_shape_mn,
+            )
+        else:
+            tokens_per_fc1_ready_slot = self.tokens_per_token_block
+            hidden_per_fc2_cluster_tile = self.mma_tiler_mnk[0] // mma_cta_count * self.cluster_shape_mn[0]
+            fc2_done_signals_per_token_tile = (
+                ceil_div(self.hidden_size, hidden_per_fc2_cluster_tile)
+                * self.cluster_shape_mn[0]
+                * self.cluster_shape_mn[1]
             )
         token_comm_impl_desc = ImplDesc(
             {
@@ -436,7 +447,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                     if self.combine_dedup
                     else {}
                 ),
-                "token_back_ready_granularity": "token_tile" if self.ring_covers_fc2_output else "expert",
+                "token_back_ready_granularity": self.fc2_ready_granularity,
                 **self._ring_lease_impl_fields(tokens_per_fc1_ready_slot),
             }
         )
@@ -510,6 +521,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                     if self.combine_dedup
                     else {}
                 ),
+                "token_back_ready_granularity": self.fc2_ready_granularity,
             }
         )
         scheduler_type = (
@@ -522,7 +534,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             self.epilogue = SwapABGatedActEpilogue(fc12_problem_desc, resolved_impl_desc)
         if self.fuse_shared:
             self._init_shared_expert()
-        if self.ring_covers_fc2_output:
+        if self.fc2_ready_granularity == "token_tile":
             self._validate_token_tile_ready_contract()
         if self.epilogue.fc1_output_dtype is not self.b_dtype:
             raise ValueError("Epilogue FC1 output dtype must match the Mainloop B dtype.")
@@ -535,6 +547,9 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         if self.dedup_epilogue_tail_combine:
             self._check_epilogue_tail_ring()
         self.masks_invalid_combine_slots = not self.reduce_topk_in_kernel and not self.internode
+        # The reduce and the route reset read the caller's ids: with the adaptive route those are expert ids, of which
+        # the router routes [0, adaptive_route_experts) only, so the rest are dropped on both sides.
+        routed_ids = self.adaptive_route_experts or self.expert_count
         # With relay tokens the reduce adds one returned BF16 node partial per remote node (I11).
         internode_reduce = (
             (self.local_expert_count, self.token_comm.ranks_per_node, self.token_comm.relay_slot_count)
@@ -551,13 +566,13 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 self.hidden_size,
                 self.topk,
                 self.combine_format,
-                num_experts=self.expert_count,
+                num_experts=routed_ids,
                 internode=internode_reduce,
                 persistent=self.topk_reduce_persistent,
             )
         )
         self._route_reset = ClearInvalidRoutes(
-            self.max_tokens_per_rank, self.topk, self.expert_count,
+            self.max_tokens_per_rank, self.topk, routed_ids,
             self.hidden_size * self.combine_format.act_dtype.width // 8,
             self.token_comm.combine_sf_hidden_padded * self.combine_format.scale_dtype.width // 8
             if self.combine_format.is_quantized else 0,
@@ -622,7 +637,56 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         # those wait on gate/up tiles whose CTAs only get their next tile once the router is done.
         self.epilogue.shared_fc1_signal_early = not self.shared_fc2_claims
 
+    def _validate_token_tile_ready_contract(self) -> None:
+        """Check the FC2 completion count per token tile against the built components.
+
+        The token-back or combine warps read a token tile once its counter shows fc2_done_signals_per_token_tile, so
+        the scheduler's logical CTA geometry, the epilogue's tiles and that target have to agree. Both preferred
+        clusters and a complete fallback group cover the same logical CTA coordinates; using active-cluster
+        dimensions here would permit token-back before the other fallback clusters finish their data.
+        """
+        if not self.epilogue.fc2_use_tma:
+            raise ValueError("token_tile return-ready requires FC2 TMA stores.")
+        mapping_tile = self.scheduler.mapping_cta_tile_shape_mnk
+        mapping_cluster = self.scheduler.mapping_cluster_shape_mn
+        if (
+            mapping_cluster != (1, self.cluster_shape_mn[0])
+            or mapping_tile[:2] != (self.epilogue.cta_tile_n, self.epilogue.cta_tile_m)
+        ):
+            raise ValueError(
+                "Per-token-tile FC2 completion needs the scheduler and the epilogue to share the logical CTA geometry."
+            )
+        expected_signals = ceil_div(self.hidden_size, mapping_tile[1] * mapping_cluster[1]) * mapping_cluster[1]
+        if (
+            self.token_comm.tokens_per_fc1_ready_slot != mapping_tile[0]
+            or self.token_comm.fc2_done_signals_per_token_tile != expected_signals
+        ):
+            raise ValueError(
+                "Per-token-tile FC2 completion needs the combine warps and the FC2 epilogue to share ready slots and "
+                "completion counts."
+            )
+
     def _validate_geometry(self) -> None:
+        if self.token_back_ready_granularity not in ("expert", "token_tile"):
+            raise ValueError(f"Unsupported token_back_ready_granularity {self.token_back_ready_granularity!r}.")
+        if self.token_back_ready_granularity == "token_tile":  # nosec B105 -- mode name, not a credential
+            # The same configurations as Rubin; the internode component counts FC2 completion per expert.
+            if not (
+                self.schedule_mode in ("grouped", "phase_interleave")
+                and self.work_id_mode == "atomic_counter"
+                and self.token_back_mode in ("standalone_warps", "reuse_dispatch_warps")
+                and self.use_2cta_instrs
+                and self.fc2_use_bulk
+                and self.quant_kind == QuantKind.nvfp4
+                and not self.reduce_topk_in_kernel
+                and not self.internode
+            ):
+                raise ValueError(
+                    "token_tile return-ready requires grouped or phase_interleave/atomic_counter, "
+                    "standalone_warps or reuse_dispatch_warps, "
+                    "two-CTA MMA with hidden-only preferred/fallback clusters, "
+                    "FC2 TMA stores, NVFP4, separate top-k reduction, and the NVLink-domain component."
+                )
         if self.skip_topk_reduce and self.internode:
             raise ValueError("skip_topk_reduce does not expose internode partials.")
         if self.skip_topk_reduce and self.topk_reduce_persistent:
@@ -676,6 +740,9 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 raise ValueError("combine_dedup stages FC2 subtiles in SMEM for per-token bulk stores; fc2_use_bulk must be on.")
             if self.internode:
                 raise ValueError("combine_dedup is an NVLink-domain path; internode must be off.")
+            if self.token_back_ready_granularity != "expert":  # nosec B105 -- mode name, not a credential
+                # The dedup combine warps poll one fc2_done counter per local expert (expert-prefix wait).
+                raise ValueError("combine_dedup signals FC2 completion per expert; token_back_ready_granularity must be 'expert'.")
             if self.skip_topk_reduce or self.topk_reduce_persistent:
                 raise ValueError("combine_dedup has its own rank-slot reduce; skip_topk_reduce / topk_reduce_persistent must be off.")
             if self.fc1_activation_per_token_scale:
@@ -870,33 +937,6 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 f"ring_token_blocks {ring_token_blocks} cannot hold the FC1 lead of this schedule "
                 f"(hint {self._ring_schedule()['hint']}, "
                 f"{self.mixed_cga_config.launch_cluster_cnt_merge_as_preferred} clusters); the minimum is {minimum}."
-            )
-
-    def _validate_token_tile_ready_contract(self) -> None:
-        """Check the FC2 completion count per token tile against the built components.
-
-        With the local FC2 output in the ring the combine warps read a block once its counter shows
-        fc2_done_signals_per_token_tile, so the scheduler's logical CTA geometry, the epilogue's tiles and that
-        target have to agree.
-        """
-        mapping_tile = self.scheduler.mapping_cta_tile_shape_mnk
-        mapping_cluster = self.scheduler.mapping_cluster_shape_mn
-        if (
-            mapping_cluster != (1, self.cluster_shape_mn[0])
-            or mapping_tile[:2] != (self.epilogue.cta_tile_n, self.epilogue.cta_tile_m)
-        ):
-            raise ValueError(
-                "The ring workspace with standalone_warps needs the scheduler and the epilogue to share the logical "
-                "CTA geometry."
-            )
-        expected_signals = ceil_div(self.hidden_size, mapping_tile[1] * mapping_cluster[1]) * mapping_cluster[1]
-        if (
-            self.token_comm.tokens_per_fc1_ready_slot != mapping_tile[0]
-            or self.token_comm.fc2_done_signals_per_token_tile != expected_signals
-        ):
-            raise ValueError(
-                "The ring workspace with standalone_warps needs the combine warps and the FC2 epilogue to share "
-                "ready slots and completion counts."
             )
 
     @property
@@ -1131,9 +1171,18 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             # Empty for the NVLink-domain component: the internode=False kernel carries no component token.
             + (f"_{self.token_comm.name_token}" if self.token_comm.name_token else "")
             + "_dlb_v1"
+            # The key has no effect, and no tag, with the local FC2 output in the ring workspace.
+            + (
+                "_fc2readytile_v1"
+                if self.token_back_ready_granularity == "token_tile" and not self.ring_covers_fc2_output  # nosec B105 -- mode name, not a credential
+                else ""
+            )
             # Off / SwiGLU keep the historical name so existing compiled-kernel caches stay valid.
             + ("_fc1actscale" if self.fc1_activation_per_token_scale else "")
             + (f"_act{self.gate_activation}" if self.gate_activation != "swiglu" else "")
+            # Off keeps the name: its seven trailing adaptive-route operands are None, as num_valid_tokens is
+            # without the persistent reduce, and the router compiles no route.
+            + (f"_aroute{self.adaptive_route_experts}_v1" if self.adaptive_route_experts else "")
             # Every build takes the tmp_buffer operand (None with the internode component): an ABI change, so it
             # keys the compiled kernel and its AOT symbol.
             + "_tmpbuf_v1"
@@ -1250,6 +1299,12 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                     assumed_align=8,
                 ),
                 hot_expert_weight_ready_generation=cutlass.Uint64(1),
+            )
+        if self.adaptive_route_experts:
+            fake_arguments.update(
+                {f"adaptive_route_{name}": Int64(0) for name in ("tables", "stats", "forwards", "stats_enabled", "live_word")},
+                adaptive_route_stats_tokens=Int32(0),
+                adaptive_route_stats_first=Int32(1),
             )
         if self.topk_reduce_persistent:
             # The persistent reduce reads its token count from device memory, so
@@ -1377,6 +1432,18 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         fc1_activation_per_token_scale: Optional[cute.Tensor] = None,
         # Caller-owned int32[1] live-token count for persistent finalization.
         num_valid_tokens: Optional[cute.Tensor] = None,
+        # Adaptive route (iff adaptive_route_experts > 0; _MetadataPushRouter.launch_router): device addresses of the
+        # layer's packed route table row, statistics row, forward count, statistics-enabled flag and live-row word,
+        # then the forward's token rows to count and whether this is its first call. The route itself always runs
+        # in a kernel built with adaptive_route_experts > 0; the stats_* operands and the live-row word only
+        # control the statistics.
+        adaptive_route_tables: Optional[Int64] = None,
+        adaptive_route_stats: Optional[Int64] = None,
+        adaptive_route_forwards: Optional[Int64] = None,
+        adaptive_route_stats_enabled: Optional[Int64] = None,
+        adaptive_route_live_word: Optional[Int64] = None,
+        adaptive_route_stats_tokens: Optional[Int32] = None,
+        adaptive_route_stats_first: Optional[Int32] = None,
     ) -> None:
         """Launch router, fused MegaMoE compute, and optional TopK reduce."""
         if cutlass.const_expr(self.combine_dedup):
@@ -1391,6 +1458,22 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             raise ValueError(
                 "gin_dev_comm and gin_window must both be present iff the communication component enables NCCL GIN"
             )
+        # The seven adaptive-route operands come exactly with a kernel built with the route, as the READY pair does:
+        # without it the router would drop them unread, with it a missing one would reach the router as None.
+        adaptive_route_mismatch: cutlass.Constexpr = any(
+            (operand is None) == (self.adaptive_route_experts > 0)
+            for operand in (
+                adaptive_route_tables,
+                adaptive_route_stats,
+                adaptive_route_forwards,
+                adaptive_route_stats_enabled,
+                adaptive_route_live_word,
+                adaptive_route_stats_tokens,
+                adaptive_route_stats_first,
+            )
+        )
+        if cutlass.const_expr(adaptive_route_mismatch):
+            raise ValueError("The seven adaptive_route_* operands are passed iff adaptive_route_experts > 0.")
         # ``None`` (AOT builds and single-domain JIT calls never pass it) means offset 0. The router
         # and the fused kernel take the offset as a dynamic ``Int64`` operand, so resolve it here once
         # instead of letting ``None`` reach a kernel argument cast.
@@ -1502,6 +1585,22 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             router_activation_sf,
             fc1_activation_per_token_scale,
             tmp_buffer=tmp_buffer,
+            # Only an adaptive-route kernel passes the argument: every other router keeps its signature.
+            **(
+                dict(
+                    adaptive_route=(
+                        adaptive_route_tables,
+                        adaptive_route_stats,
+                        adaptive_route_forwards,
+                        adaptive_route_stats_enabled,
+                        adaptive_route_live_word,
+                        adaptive_route_stats_tokens,
+                        adaptive_route_stats_first,
+                    )
+                )
+                if self.adaptive_route_experts > 0
+                else {}
+            ),
         )
 
         peer_rank_ptr_mapper = peer_rank_ptr_mapper_host.make_device_object()
