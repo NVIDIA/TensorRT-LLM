@@ -9495,7 +9495,8 @@ class KVCacheManagerV2(BaseResourceManager):
             Requests in ``request_ids`` order, or ``None`` when cache creation,
             resume, resize, or beam expansion reports insufficient capacity.
             These failure returns release resources allocated by this call;
-            unexpected exceptions propagate.
+            an unexpected exception releases them the same way, then
+            propagates.
 
         The caller must release each returned request with ``free_resources``
         on this manager and the supplied draft manager when it is no longer
@@ -9513,177 +9514,198 @@ class KVCacheManagerV2(BaseResourceManager):
         requests = []
 
         def release_resources(
-            current_request: LlmRequest, free_draft_resources: bool = False
+            current_request: Optional[LlmRequest], free_draft_resources: bool = False
         ) -> None:
             for req in requests:
                 self.free_resources(req)
-            self.free_resources(current_request)
+            if current_request is not None:
+                self.free_resources(current_request)
             if draft_kv_cache_manager is not None:
                 for req in requests:
                     draft_kv_cache_manager.free_resources(req)
-                if free_draft_resources:
+                if free_draft_resources and current_request is not None:
                     draft_kv_cache_manager.free_resources(current_request)
 
-        for i, req_id in enumerate(request_ids):
-            # exact choice of n can be ignored for dummy requests
-            sampling_params = SamplingParams(
-                n=beam_width,
-                best_of=beam_width,
-                use_beam_search=beam_width > 1,
-                temperature=capture_sampling_params.temperature
-                if capture_sampling_params is not None
-                else None,
-                top_k=capture_sampling_params.top_k
-                if capture_sampling_params is not None
-                else None,
-                top_p=capture_sampling_params.top_p
-                if capture_sampling_params is not None
-                else None,
-                min_p=capture_sampling_params.min_p
-                if capture_sampling_params is not None
-                else None,
-            )
-            # Here 1+max_num_draft_tokens is used to extend the prompt length to
-            # a non-zero number to skip illegal memory access issue in MLA kernel
-            # during warmup.
-            token_num = token_nums[i] if token_nums is not None else 1 + max_num_draft_tokens
-            if self._has_cp_helix and is_gen:
-                # Keep the frozen dummy fields self-consistent (the active
-                # rank's past_seen = seqlen - 1 must stay >= 1).
-                token_num = max(token_num, 2)
-            # token_num - 1 is the past history length in generation.
-            history_hint = max(0, token_num - 1) if is_gen and not materialize_history else None
-            encoder_output_len = encoder_output_lens[i] if encoder_output_lens is not None else None
-            encoder_input_tokens = (
-                [1] * encoder_output_len if encoder_output_len is not None else None
-            )
-            # Using 1 instead of 0 prevents NaN during warmup in e.g. Deepseek
-            input_tokens = [1 for _ in range(token_num)]
-            request_locality_domain_id = None
-            if locality_domain_ids is not None:
-                request_locality_domain_id = locality_domain_ids[i]
-            if request_locality_domain_id is None and self.num_locality_domains > 1:
-                # Dummies are freed within the iteration, so they take no part in the placement load.
-                request_locality_domain_id = self._next_locality_domain
-                self._next_locality_domain = (
-                    request_locality_domain_id + 1
-                ) % self.num_locality_domains
-            req = LlmRequest(
-                request_id=req_id,
-                max_new_tokens=1,
-                input_tokens=input_tokens,
-                sampling_config=sampling_params._get_sampling_config(),
-                is_streaming=False,
-                encoder_input_tokens=encoder_input_tokens,
-                locality_domain_id=request_locality_domain_id,
-                encoder_output_len=encoder_output_len,
-            )
-            req.is_dummy_request = True
-            req.paged_kv_block_ids = []
-            expected_prompt_length = token_num - 1 if is_gen else token_num
-            # Dummy caches skip the prefix lookup and never commit, so they
-            # neither claim nor publish real prefixes (see _create_kv_cache).
-            kv_cache = self._create_kv_cache(
-                req.py_request_id,
-                req.lora_task_id,
-                input_tokens,
-                is_dummy=req.is_dummy,
-                expected_prompt_length=expected_prompt_length,
-                locality_domain_id=request_locality_domain_id,
-            )
-            # Saturated IndexMapper (e.g. disagg gen trans in progress)
-            # returns None; retry next iter.
-            if kv_cache is None:
-                release_resources(req)
-                return None
-            assert kv_cache.num_committed_tokens == 0
-            success = kv_cache.resume(self._stream.cuda_stream)
-            if not success:
-                release_resources(req)
-                return None
-            dummy_capacity = token_num + self._kv_alloc_extra_tokens
-            if is_gen and not materialize_history:
-                kv_cache.enable_swa_scratch_reuse = False
-            # Need to hint the committed history to activate stale-block
-            # optimization and match the solver's pool budget.
-            success = kv_cache.resize(dummy_capacity, history_length=history_hint)
-            if not success:
-                release_resources(req)
-                return None
-            draft_kv_cache = None
-            if draft_kv_cache_manager is not None:
-                draft_locality_domain_id = draft_kv_cache_manager._request_locality_domain_id(req)
-                draft_kv_cache = draft_kv_cache_manager._create_kv_cache(
+        # The request being built, if any, and whether its draft cache was
+        # started: an unexpected error releases them and the finished requests
+        # like a None return does, then propagates.
+        current_request: Optional[LlmRequest] = None
+        current_draft_started = False
+
+        try:
+            for i, req_id in enumerate(request_ids):
+                # exact choice of n can be ignored for dummy requests
+                sampling_params = SamplingParams(
+                    n=beam_width,
+                    best_of=beam_width,
+                    use_beam_search=beam_width > 1,
+                    temperature=capture_sampling_params.temperature
+                    if capture_sampling_params is not None
+                    else None,
+                    top_k=capture_sampling_params.top_k
+                    if capture_sampling_params is not None
+                    else None,
+                    top_p=capture_sampling_params.top_p
+                    if capture_sampling_params is not None
+                    else None,
+                    min_p=capture_sampling_params.min_p
+                    if capture_sampling_params is not None
+                    else None,
+                )
+                # Here 1+max_num_draft_tokens is used to extend the prompt length to
+                # a non-zero number to skip illegal memory access issue in MLA kernel
+                # during warmup.
+                token_num = token_nums[i] if token_nums is not None else 1 + max_num_draft_tokens
+                if self._has_cp_helix and is_gen:
+                    # Keep the frozen dummy fields self-consistent (the active
+                    # rank's past_seen = seqlen - 1 must stay >= 1).
+                    token_num = max(token_num, 2)
+                # token_num - 1 is the past history length in generation.
+                history_hint = max(0, token_num - 1) if is_gen and not materialize_history else None
+                encoder_output_len = (
+                    encoder_output_lens[i] if encoder_output_lens is not None else None
+                )
+                encoder_input_tokens = (
+                    [1] * encoder_output_len if encoder_output_len is not None else None
+                )
+                # Using 1 instead of 0 prevents NaN during warmup in e.g. Deepseek
+                input_tokens = [1 for _ in range(token_num)]
+                request_locality_domain_id = None
+                if locality_domain_ids is not None:
+                    request_locality_domain_id = locality_domain_ids[i]
+                if request_locality_domain_id is None and self.num_locality_domains > 1:
+                    # Dummies are freed within the iteration, so they take no part in the placement load.
+                    request_locality_domain_id = self._next_locality_domain
+                    self._next_locality_domain = (
+                        request_locality_domain_id + 1
+                    ) % self.num_locality_domains
+                req = LlmRequest(
+                    request_id=req_id,
+                    max_new_tokens=1,
+                    input_tokens=input_tokens,
+                    sampling_config=sampling_params._get_sampling_config(),
+                    is_streaming=False,
+                    encoder_input_tokens=encoder_input_tokens,
+                    locality_domain_id=request_locality_domain_id,
+                    encoder_output_len=encoder_output_len,
+                )
+                req.is_dummy_request = True
+                current_request = req
+                current_draft_started = False
+                req.paged_kv_block_ids = []
+                expected_prompt_length = token_num - 1 if is_gen else token_num
+                # Dummy caches skip the prefix lookup and never commit, so they
+                # neither claim nor publish real prefixes (see _create_kv_cache).
+                kv_cache = self._create_kv_cache(
                     req.py_request_id,
                     req.lora_task_id,
                     input_tokens,
                     is_dummy=req.is_dummy,
                     expected_prompt_length=expected_prompt_length,
-                    locality_domain_id=draft_locality_domain_id,
+                    locality_domain_id=request_locality_domain_id,
                 )
-                if draft_kv_cache is None:
+                # Saturated IndexMapper (e.g. disagg gen trans in progress)
+                # returns None; retry next iter.
+                if kv_cache is None:
                     release_resources(req)
                     return None
-                assert (
-                    getattr(draft_kv_cache, "locality_domain_id", None) == draft_locality_domain_id
-                )
-                success = draft_kv_cache.resume(draft_kv_cache_manager._stream.cuda_stream)
+                assert kv_cache.num_committed_tokens == 0
+                success = kv_cache.resume(self._stream.cuda_stream)
                 if not success:
-                    release_resources(req, free_draft_resources=True)
+                    release_resources(req)
                     return None
-                # Same history hint as the target cache above: a sliding-window
-                # draft pool then backs only the dummy's window, not its whole
-                # length. The hint exceeds the window only for the
-                # longest-length warmup dummies, which run before any request
-                # holds a draft page.
-                success = draft_kv_cache.resize(dummy_capacity, history_length=history_hint)
+                dummy_capacity = token_num + self._kv_alloc_extra_tokens
+                if is_gen and not materialize_history:
+                    kv_cache.enable_swa_scratch_reuse = False
+                # Need to hint the committed history to activate stale-block
+                # optimization and match the solver's pool budget.
+                success = kv_cache.resize(dummy_capacity, history_length=history_hint)
                 if not success:
-                    release_resources(req, free_draft_resources=True)
+                    release_resources(req)
                     return None
-
-            if is_gen:
-                req.state = LlmRequestState.GENERATION_IN_PROGRESS
-                req.prompt_len = token_num - 1
-                req.py_prompt_len = req.prompt_len
-                req.py_draft_tokens = [1] * max_num_draft_tokens
-                if self._has_cp_helix:
-                    # Frozen fields (V1 parity): dummies never pass the
-                    # per-step derivation — last CP rank active, shared
-                    # synthetic global length.
-                    if self._helix_cp_rank == self._helix_cp_size - 1:
-                        req.py_helix_is_inactive_rank = False
-                        req.prompt_len = token_num - 1
-                    else:
-                        req.py_helix_is_inactive_rank = True
-                        req.prompt_len = token_num
-                    req.py_prompt_len = req.prompt_len
-                    req.seqlen_this_rank_cp = req.prompt_len
-                    req.total_input_len_cp = token_num * self._helix_cp_size - 1
-                    req.py_decoding_iter = 1
-                if not self._ensure_generation_beam_width(req, kv_cache):
-                    release_resources(req, free_draft_resources=draft_kv_cache is not None)
-                    return None
-                # token_num already includes the current generation input.
-                new_capacity = kv_cache.capacity + _kv_draft
-                success = kv_cache.resize(new_capacity, history_length=history_hint)
-                if not success:
-                    release_resources(req, free_draft_resources=draft_kv_cache is not None)
-                    return None
-                if draft_kv_cache is not None:
-                    if not draft_kv_cache_manager._ensure_generation_beam_width(
-                        req, draft_kv_cache
-                    ):
+                draft_kv_cache = None
+                if draft_kv_cache_manager is not None:
+                    current_draft_started = True
+                    draft_locality_domain_id = draft_kv_cache_manager._request_locality_domain_id(
+                        req
+                    )
+                    draft_kv_cache = draft_kv_cache_manager._create_kv_cache(
+                        req.py_request_id,
+                        req.lora_task_id,
+                        input_tokens,
+                        is_dummy=req.is_dummy,
+                        expected_prompt_length=expected_prompt_length,
+                        locality_domain_id=draft_locality_domain_id,
+                    )
+                    if draft_kv_cache is None:
+                        release_resources(req)
+                        return None
+                    assert (
+                        getattr(draft_kv_cache, "locality_domain_id", None)
+                        == draft_locality_domain_id
+                    )
+                    success = draft_kv_cache.resume(draft_kv_cache_manager._stream.cuda_stream)
+                    if not success:
                         release_resources(req, free_draft_resources=True)
                         return None
-                    success = draft_kv_cache.resize(new_capacity)
+                    # Same history hint as the target cache above: a sliding-window
+                    # draft pool then backs only the dummy's window, not its whole
+                    # length. The hint exceeds the window only for the
+                    # longest-length warmup dummies, which run before any request
+                    # holds a draft page.
+                    success = draft_kv_cache.resize(dummy_capacity, history_length=history_hint)
                     if not success:
                         release_resources(req, free_draft_resources=True)
                         return None
 
-            if use_mrope:
-                _populate_dummy_mrope_config(req, token_num, is_gen)
-            requests.append(req)
+                if is_gen:
+                    req.state = LlmRequestState.GENERATION_IN_PROGRESS
+                    req.prompt_len = token_num - 1
+                    req.py_prompt_len = req.prompt_len
+                    req.py_draft_tokens = [1] * max_num_draft_tokens
+                    if self._has_cp_helix:
+                        # Frozen fields (V1 parity): dummies never pass the
+                        # per-step derivation — last CP rank active, shared
+                        # synthetic global length.
+                        if self._helix_cp_rank == self._helix_cp_size - 1:
+                            req.py_helix_is_inactive_rank = False
+                            req.prompt_len = token_num - 1
+                        else:
+                            req.py_helix_is_inactive_rank = True
+                            req.prompt_len = token_num
+                        req.py_prompt_len = req.prompt_len
+                        req.seqlen_this_rank_cp = req.prompt_len
+                        req.total_input_len_cp = token_num * self._helix_cp_size - 1
+                        req.py_decoding_iter = 1
+                    if not self._ensure_generation_beam_width(req, kv_cache):
+                        release_resources(req, free_draft_resources=draft_kv_cache is not None)
+                        return None
+                    # token_num already includes the current generation input.
+                    new_capacity = kv_cache.capacity + _kv_draft
+                    success = kv_cache.resize(new_capacity, history_length=history_hint)
+                    if not success:
+                        release_resources(req, free_draft_resources=draft_kv_cache is not None)
+                        return None
+                    if draft_kv_cache is not None:
+                        if not draft_kv_cache_manager._ensure_generation_beam_width(
+                            req, draft_kv_cache
+                        ):
+                            release_resources(req, free_draft_resources=True)
+                            return None
+                        success = draft_kv_cache.resize(new_capacity)
+                        if not success:
+                            release_resources(req, free_draft_resources=True)
+                            return None
 
+                if use_mrope:
+                    _populate_dummy_mrope_config(req, token_num, is_gen)
+                requests.append(req)
+                current_request = None
+
+        except BaseException:
+            # free_resources tolerates a cache that was never fully created.
+            release_resources(current_request, free_draft_resources=current_draft_started)
+            raise
         return requests
 
     def try_commit_blocks(self, request: LlmRequest) -> None:
