@@ -620,6 +620,13 @@ def _make_aux_result_msg(instance_rank: int, unique_rid: int, result: AgentResul
     ]
 
 
+def _note_kv_submission_locked(session: Optional["TxSession"], task: "SendTaskBase", peer: int):
+    """Record that a KV write to ``peer`` passed admission; the caller holds ``session.lock``."""
+    writing = getattr(session, "_kv_writing_peer_ranks", None)
+    if writing is not None and isinstance(task, KVSendTask):
+        writing.add(peer)
+
+
 @dataclass
 class _PendingSettlement:
     write_meta: WriteMeta
@@ -805,6 +812,10 @@ class Sender(SenderBase):
         self._pending_session_quiescence: dict[tuple[int, int], _SessionQuiescence] = {}
         self._routed_cancels: dict[int, float] = {}
         self._expired_bounce_requests: dict[tuple[int, int], tuple[float, int, bytes]] = {}
+        # unique_rid -> fence time, for fences installed only because a bounce
+        # publication expired unclaimed. Its saved request is evicted with the
+        # fence, so no write can reach that destination once this entry expires.
+        self._expired_publication_fences: dict[int, float] = {}
         self._quiescence_closed = False
         # Sessions already cleared (completed, failed, cancelled or
         # timed out), oldest first. A REQUEST_DATA for one of them must be answered FAILED:
@@ -954,9 +965,15 @@ class Sender(SenderBase):
                 if now - cancelled_at <= self._RETIRED_SESSION_TTL_S:
                     break
                 expired_routed.append(rid)
+            candidate_fences = getattr(self, "_expired_publication_fences", {})
+            expired_candidates = []
+            for rid, fenced_at in candidate_fences.items():
+                if now - fenced_at <= self._RETIRED_SESSION_TTL_S:
+                    break
+                expired_candidates.append(rid)
             pending_rids = (
                 {rid for rid, _ in getattr(self, "_pending_session_quiescence", ())}
-                if expired or expired_routed
+                if expired or expired_routed or expired_candidates
                 else set()
             )
             for rid in expired_routed:
@@ -967,6 +984,19 @@ class Sender(SenderBase):
                 ):
                     # The pre-cancel record still fences a late session or publication.
                     routed.pop(rid, None)
+            for rid in expired_candidates:
+                if rid in pending_rids:
+                    continue
+                if rid in self._sessions or rid in self._retired_rids:
+                    # The session's own retirement now bounds this fence.
+                    del candidate_fences[rid]
+                    continue
+                with self._peer_requests_lock:
+                    if rid in self._peer_requests:
+                        continue
+                del candidate_fences[rid]
+                routed.pop(rid, None)
+                self._pre_cancelled_rids.pop(rid, None)
             proofs = getattr(self, "_expired_bounce_requests", {})
             expired_proofs = []
             for key, (expired_at, _, _) in proofs.items():
@@ -1002,6 +1032,10 @@ class Sender(SenderBase):
                             getattr(info, "wants_no_submission_result", False)
                             and rid not in self._retired_rids
                         ):
+                            if rid not in self._pre_cancelled_rids:
+                                self.__dict__.setdefault("_expired_publication_fences", {})[rid] = (
+                                    now
+                                )
                             self._pre_cancelled_rids.setdefault(rid, True)
                             self._routed_cancels.setdefault(rid, now)
                             proofs = self.__dict__.setdefault("_expired_bounce_requests", {})
@@ -1267,6 +1301,7 @@ class Sender(SenderBase):
     def _submit_direct_transfer(
         self,
         task: SendTaskBase,
+        peer_rank: int,
         requests: tuple[TransferRequest, ...],
         on_submitted: Optional[Callable[[], None]],
         agent_generation: Optional[int],
@@ -1314,6 +1349,7 @@ class Sender(SenderBase):
                                 raise _TransferNotSubmittedError(
                                     "NIXL session belongs to a retired agent"
                                 )
+                        _note_kv_submission_locked(session, task, peer_rank)
                         with task.lock:
                             task._native_inflight += 1
                 try:
@@ -1399,7 +1435,7 @@ class Sender(SenderBase):
         owned = self._owns_task(task)
         if not owned and getattr(self, "_recover_agent", None) is not None:
             return self._submit_direct_transfer(
-                task, requests, on_submitted, agent_generation, session
+                task, peer_rank, requests, on_submitted, agent_generation, session
             )
         peer_lease = (
             self._peer_transfers(requests)
@@ -1441,6 +1477,7 @@ class Sender(SenderBase):
                     or getattr(session, "_routed_cancelled", False) is True
                 ):
                     raise _TransferNotSubmittedError("NIXL transfer session is closed or fenced")
+                _note_kv_submission_locked(session, task, peer_rank)
                 # Reserve every group member until the worker can no longer write.
                 with task.lock:
                     task._native_inflight += 1
@@ -1917,6 +1954,26 @@ class Sender(SenderBase):
             )
             return
         self._get_result_dealer(write_meta.peer_endpoint).send(result_msg)
+        # A bounce SUCCESS resolves only after the receiver's scatter ACK, so this
+        # destination holds no access from this peer once the result is out.
+        if isinstance(session, TxSession) and session._finish_kv_write(
+            write_meta.peer_rank,
+            more_expected=(
+                agent_result == AgentResult.SUCCESS
+                and not write_meta.is_last_slice
+                and write_meta.requires_destination_drain
+            ),
+        ):
+            self._get_result_dealer(write_meta.peer_endpoint).send(
+                _make_kv_result_msg(
+                    self._instance_rank,
+                    write_meta.unique_rid,
+                    write_meta.receiver_slice_id,
+                    True,
+                    AgentResult.NOT_SUBMITTED,
+                    kv_result_report_token=write_meta.kv_result_report_token,
+                )
+            )
 
         with task.lock:
             task.transferred_count += 1
@@ -2021,6 +2078,14 @@ class Sender(SenderBase):
                     session.set_exception(f"aux transfer agent request failed: {last_status}")
             except _TransferNotSubmittedError as error:
                 if getattr(session, "_routed_cancelled", False) is True:
+                    # Cancellation skipped this started peer's claim; only this
+                    # worker can tell the receiver that its slot was never written.
+                    if session._claim_aux_terminal_result(write_meta.peer_rank):
+                        self._get_result_dealer(write_meta.peer_endpoint).send(
+                            _make_aux_result_msg(
+                                self._instance_rank, write_meta.unique_rid, AgentResult.FAILED
+                            )
+                        )
                     return
                 logger.error(
                     "Aux transfer rejected before backend submission: "
@@ -2509,6 +2574,8 @@ class Sender(SenderBase):
                 if session is not None
                 else self.ownership_enabled(context_first=False)
             )
+            # An explicit cancellation keeps its fence beyond the expiry bound.
+            getattr(self, "_expired_publication_fences", {}).pop(unique_rid, None)
             if routed and not owned:
                 self._routed_cancels.setdefault(unique_rid, time.monotonic())
             if session is None or owned or routed:
@@ -2531,7 +2598,7 @@ class Sender(SenderBase):
                 if owned:
                     session.cancel_local(by_peer=True)
                 elif routed:
-                    session.cancel_local(by_peer=True, report_unsubmitted_aux=False, routed=True)
+                    session.cancel_local(by_peer=True, routed=True)
                 else:
                     session.cancel(by_peer=True)
         finally:
@@ -2722,9 +2789,14 @@ class Sender(SenderBase):
                     f"failing REQUEST_DATA for peer rid={info.unique_rid} "
                     f"rank={info.instance_rank}"
                 )
-                self._send_failed_result_to_receiver(
-                    info, include_aux=info.aux_slot is not None and info.slice_id == 0
-                )
+                include_aux = info.aux_slot is not None and info.slice_id == 0
+                if info.wants_no_submission_result:
+                    # This publication was never saved, so no write can reach it.
+                    self._send_no_submission(info)
+                    if include_aux:
+                        self._send_aux_result_to_receiver(info, AgentResult.FAILED)
+                else:
+                    self._send_failed_result_to_receiver(info, include_aux=include_aux)
             return
         with session.lock:
             with self._sessions_lock:
@@ -3065,6 +3137,11 @@ class TxSession(TxSessionBase):
         self.aux_task = None
         self._reported_aux_peer_ranks: set[int] = set()
         self._direct_aux_started_peer_ranks: set[int] = set()
+        # Peers with an admitted KV write that has not reported yet. Added under
+        # ``lock`` at the admission check that a routed cancellation fences. One
+        # worker serves each peer in order, so a peer outside this set has no
+        # write in flight and every earlier write already reported its outcome.
+        self._kv_writing_peer_ranks: set[int] = set()
         self._has_last_slice = False
         self.lock = threading.Lock()
         self._logical_outcomes = _LogicalOutcomes(self._retirement)
@@ -3417,13 +3494,36 @@ class TxSession(TxSessionBase):
                 self.aux_task.fail(exc)
             req_infos = list((self._sender._get_req_info(self.disagg_request_id) or {}).values())
             no_kv_submitted = not self._enforce_physical_ownership and not self.kv_tasks
+            unsubmitted_kv: list[RecvReqInfo] = []
             if report_unsubmitted_aux:
                 aux_failures = self._claim_unsubmitted_aux_failures_locked(req_infos)
+                if self._routed_cancelled:
+                    # The fence is set under this lock, so an idle peer receives
+                    # no further KV write. A writing peer reports after its write.
+                    writing = getattr(self, "_kv_writing_peer_ranks", ())
+                    unsubmitted_kv = [
+                        info
+                        for info in req_infos
+                        if getattr(info, "wants_no_submission_result", False)
+                        and info.instance_rank not in writing
+                    ]
         self._report_unsubmitted_aux_failures(aux_failures)
-        if no_kv_submitted and report_unsubmitted_aux:
+        for info in unsubmitted_kv:
+            self._sender._send_no_submission(info)
+        if no_kv_submitted and report_unsubmitted_aux and not self._routed_cancelled:
             for info in req_infos:
                 self._sender._send_failed_result_to_receiver(info, defer_to_worker=True)
         return True
+
+    def _finish_kv_write(self, peer_rank: int, *, more_expected: bool) -> bool:
+        """Retire ``peer_rank``'s admitted KV write.
+
+        Returns whether the receiver still expects writes from this peer that a
+        routed cancellation has fenced, so the worker must report their absence.
+        """
+        with self.lock:
+            self._kv_writing_peer_ranks.discard(peer_rank)
+            return more_expected and self._routed_cancelled
 
     def has_transferring_tasks(self) -> bool:
         """True if any KV or auxiliary task is currently mid-write.

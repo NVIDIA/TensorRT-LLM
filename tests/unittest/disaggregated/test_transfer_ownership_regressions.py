@@ -1839,6 +1839,349 @@ def test_unclaimed_routed_cancel_reclaims_extra_state_but_keeps_the_fence(monkey
     assert session.has_failed()
 
 
+def _make_bounce_ctx_sender() -> transfer_mod.Sender:
+    sender = _make_owned_sender()
+    sender._enforce_physical_ownership = False
+    sender._device_id = 0
+    sender._registrar = SimpleNamespace(
+        get_peer_rank_info=lambda _name, rank: SimpleNamespace(self_endpoint=str(rank), dp_rank=0),
+        get_peer_overlap=lambda _peer, _dp_rank: SimpleNamespace(ranks=[0]),
+    )
+    sender.dispatch_task = Mock()
+    return sender
+
+
+def _bounce_publication(rid: int, *, rank: int = 0, aux: bool = False) -> transfer_mod.RecvReqInfo:
+    return transfer_mod.RecvReqInfo(
+        sender_req_id=rid,
+        instance_name="gen",
+        instance_rank=rank,
+        block_ids_per_layer_groups=[],
+        unique_rid=rid,
+        aux_slot=0 if aux else None,
+        slice_id=0,
+        wants_no_submission_result=True,
+        kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
+    )
+
+
+def _make_one_writer_bounce_rx(rid: int, *, aux: bool) -> tuple[_ReceiverProbe, RxSession]:
+    receiver = _ReceiverProbe()
+    receiver._enforce_physical_ownership = False
+    receiver._agent = SimpleNamespace(bounce_enabled=True)
+    receiver._registrar = Mock()
+    schedule_style = (
+        DisaggScheduleStyle.GENERATION_FIRST if aux else DisaggScheduleStyle.CONTEXT_FIRST
+    )
+    session = RxSession(
+        request_id=rid,
+        params=DisaggregatedParams(disagg_request_id=rid, schedule_style=schedule_style),
+        receiver=receiver,
+    )
+    session.receive(_sole_piece())
+    _publish_report_tokens(session, ranks=(0,))
+    session._kv_tasks[0].expected_transfers = 1
+    session._aux_expected_writers = 1 if aux else 0
+    receiver._get_session = lambda _: session
+    return receiver, session
+
+
+def _deliver_ctx_evidence(sender, receiver) -> list:
+    """Hand every queued CTX report to the GEN handlers, in worker order."""
+    delivered = []
+    while not sender._send_task_queues[0].empty():
+        item = sender._send_task_queues[0].get_nowait()
+        if isinstance(item, transfer_mod._SessionQuiescence):
+            delivered.append(MessageType.SESSION_QUIESCED)
+            receiver._session.process_session_quiesced(item.peer_rank)
+            continue
+        _endpoint, message = item
+        delivered.append(message[0])
+        if message[0] == MessageType.KV_AGENT_RESULT:
+            Receiver._process_kv_agent_result(receiver, b"", message)
+        else:
+            Receiver._process_aux_agent_result(receiver, b"", message)
+    return delivered
+
+
+def _kv_result_code(message: list[bytes]) -> AgentResult:
+    code = transfer_mod._KV_RESULT_FRAME.unpack(message[1])[4]
+    return transfer_mod._AGENT_RESULT_BY_CODE[code]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("piece_queued", [False, True])
+@pytest.mark.parametrize("writing", [False, True])
+def test_routed_bounce_cancel_reports_unsubmitted_destination_after_session_creation(
+    piece_queued, writing
+):
+    rid = 131
+    sender = _make_bounce_ctx_sender()
+    sender._add_req_info(rid, 0, _bounce_publication(rid))
+    ctx = transfer_mod.TxSession(rid, DisaggregatedParams(disagg_request_id=rid), sender)
+    if piece_queued:
+        ctx.send(_sole_piece())
+    if writing:
+        with ctx.lock:
+            ctx._kv_writing_peer_ranks.add(0)
+    receiver, session = _make_one_writer_bounce_rx(rid, aux=False)
+    assert session.cancel()
+
+    sender._handle_cancel_session([MessageType.CANCEL_SESSION, str(rid).encode(), b"gen", b"0"])
+    if piece_queued:
+        sender._get_result_dealer = Mock(side_effect=AssertionError("cancelled piece reported"))
+        write_meta = SimpleNamespace(
+            src_ptrs=np.zeros(0),
+            dst_ptrs=np.zeros(0),
+            sizes=np.zeros(0),
+            task=ctx.kv_tasks[0],
+            unique_rid=rid,
+            slice_id=0,
+            peer_rank=0,
+        )
+        sender._deliver_kv_to_agent(write_meta)
+    delivered = _deliver_ctx_evidence(sender, receiver)
+
+    slot = _OneSlotAllocator(rid)
+    if writing:
+        # The admitted write still owns the destination until it reports.
+        assert delivered == [MessageType.SESSION_QUIESCED]
+        slot.apply_reuse_decision(session.close())
+        assert not slot.is_reusable
+        session.process_kv_agent_result(
+            0, 0, True, AgentResult.FAILED_QUIESCED, _KV_RESULT_REPORT_TOKEN
+        )
+    else:
+        assert delivered == [MessageType.KV_AGENT_RESULT, MessageType.SESSION_QUIESCED]
+    slot.apply_reuse_decision(session.close())
+    assert slot.is_reusable
+
+
+@pytest.mark.cpu_only
+def test_routed_bounce_cancel_racing_admission_reports_exactly_one_kv_outcome():
+    rid = 132
+    sender = _make_bounce_ctx_sender()
+    sender._add_req_info(rid, 0, _bounce_publication(rid))
+    ctx = transfer_mod.TxSession(rid, DisaggregatedParams(disagg_request_id=rid), sender)
+    ctx.send(_sole_piece())
+    sender._agent = SimpleNamespace(check_remote_descs=lambda *_: True, bounce_enabled=True)
+    sender._handle_cancel_session([MessageType.CANCEL_SESSION, str(rid).encode(), b"gen", b"0"])
+    request = SimpleNamespace(op=transfer_mod.TransferOp.WRITE, remote_name="gen", dst_descs=())
+
+    with pytest.raises(transfer_mod._TransferNotSubmittedError):
+        sender._submit_fallback_transfer(
+            ctx.kv_tasks[0], 0, request, (request,), None, ctx, owned=False
+        )
+    assert not ctx._kv_writing_peer_ranks
+    messages = [item for item in list(sender._send_task_queues[0].queue) if isinstance(item, tuple)]
+    assert [_kv_result_code(message) for _, message in messages] == [AgentResult.NOT_SUBMITTED]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("is_last_slice", [False, True])
+def test_routed_bounce_cancel_during_a_write_reports_after_that_write(monkeypatch, is_last_slice):
+    rid = 136
+    sender = _make_bounce_ctx_sender()
+    sender._add_req_info(rid, 0, _bounce_publication(rid))
+    ctx = transfer_mod.TxSession(rid, DisaggregatedParams(disagg_request_id=rid), sender)
+    ctx.send(_sole_piece(is_last=is_last_slice))
+    receiver, session = _make_one_writer_bounce_rx(rid, aux=False)
+    dealer = Mock()
+    sender._get_result_dealer = Mock(return_value=dealer)
+    monkeypatch.setattr(transfer_mod.Sender, "_make_agent_request", lambda *_a, **_k: object())
+
+    def admit_then_cancel(task, peer_rank, *_args, **_kwargs):
+        with ctx.lock:
+            transfer_mod._note_kv_submission_locked(ctx, task, peer_rank)
+        assert session.cancel()
+        sender._handle_cancel_session([MessageType.CANCEL_SESSION, str(rid).encode(), b"gen", b"0"])
+        # The cancellation leaves the admitted peer to the worker that writes it.
+        assert not any(isinstance(item, tuple) for item in list(sender._send_task_queues[0].queue))
+        return True, None
+
+    sender._submit_transfer = admit_then_cancel
+    sender._deliver_kv_to_agent(
+        SimpleNamespace(
+            src_ptrs=np.zeros(1),
+            dst_ptrs=np.zeros(1),
+            sizes=np.ones(1, dtype=np.int64),
+            task=ctx.kv_tasks[0],
+            unique_rid=rid,
+            slice_id=0,
+            receiver_slice_id=0,
+            peer_rank=0,
+            peer_endpoint="0",
+            is_last_slice=is_last_slice,
+            kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
+            requires_destination_drain=True,
+            agent_generation=0,
+            expected_transfers=1,
+        )
+    )
+
+    sent = [call.args[0] for call in dealer.send.call_args_list]
+    expected = [AgentResult.SUCCESS] + ([] if is_last_slice else [AgentResult.NOT_SUBMITTED])
+    assert [_kv_result_code(message) for message in sent] == expected
+    assert not ctx._kv_writing_peer_ranks
+    slot = _OneSlotAllocator(rid)
+    for message in sent:
+        assert not slot.is_reusable
+        Receiver._process_kv_agent_result(receiver, b"", message)
+    _deliver_ctx_evidence(sender, receiver)
+    slot.apply_reuse_decision(session.close())
+    assert slot.is_reusable
+
+
+@pytest.mark.cpu_only
+def test_context_first_bounce_request_after_retirement_reports_no_submission():
+    rid = 133
+    sender = _make_bounce_ctx_sender()
+    ctx = transfer_mod.TxSession(rid, DisaggregatedParams(disagg_request_id=rid), sender)
+    assert ctx.cancel_local()
+    sender.clear_session(rid)
+    receiver, session = _make_one_writer_bounce_rx(rid, aux=False)
+
+    info = _bounce_publication(rid)
+    sender._respond_with_kv(
+        b"", [MessageType.REQUEST_DATA, info.to_bytes(), _KV_RESULT_REPORT_TOKEN]
+    )
+    assert _deliver_ctx_evidence(sender, receiver) == [MessageType.KV_AGENT_RESULT]
+    assert session.has_failed()
+    slot = _OneSlotAllocator(rid)
+    slot.apply_reuse_decision(session.close())
+    assert slot.is_reusable
+
+
+@pytest.mark.cpu_only
+def test_healthy_adp_candidate_fence_expires_on_the_unselected_rank(monkeypatch):
+    sender = _make_bounce_ctx_sender()
+    now = time.monotonic()
+    monkeypatch.setattr(transfer_mod.time, "monotonic", lambda: now)
+    rids = range(200, 210)
+    for rid in rids:
+        info = _bounce_publication(rid)
+        info.context_first = False
+        sender._add_req_info(rid, 0, info)
+
+    now += sender._STALE_REQ_INFO_TTL_S + 1
+    sender.sweep_stale_req_infos()
+    assert set(sender._pre_cancelled_rids) == set(rids)
+    evidence = [sender._send_task_queues[0].get_nowait() for _ in rids]
+    assert {_kv_result_code(message) for _, message in evidence} == {AgentResult.NOT_SUBMITTED}
+    # The fence still refuses a late session while the evidence is fresh.
+    late = transfer_mod.TxSession(200, DisaggregatedParams(disagg_request_id=200), sender)
+    assert late.has_failed()
+    sender.clear_session(200)
+
+    now += sender._RETIRED_SESSION_TTL_S + 1
+    sender.sweep_stale_req_infos()
+    now += sender._RETIRED_SESSION_TTL_S + 1
+    sender.sweep_stale_req_infos()
+    assert not sender._peer_requests
+    assert not sender._routed_cancels
+    assert not sender._expired_bounce_requests
+    assert not sender._expired_publication_fences
+    assert not sender._pre_cancelled_rids
+    assert not sender._retired_rids
+
+
+@pytest.mark.cpu_only
+def test_explicit_routed_cancel_keeps_a_candidate_fence(monkeypatch):
+    rid = 211
+    sender = _make_bounce_ctx_sender()
+    sender._get_or_connect_thread_dealer = Mock(return_value=Mock())
+    now = time.monotonic()
+    monkeypatch.setattr(transfer_mod.time, "monotonic", lambda: now)
+    sender._add_req_info(rid, 0, _bounce_publication(rid))
+    now += sender._STALE_REQ_INFO_TTL_S + 1
+    sender.sweep_stale_req_infos()
+    sender._handle_cancel_session([MessageType.CANCEL_SESSION, str(rid).encode(), b"gen", b"0"])
+
+    now += sender._RETIRED_SESSION_TTL_S + 1
+    sender.sweep_stale_req_infos()
+    assert rid in sender._pre_cancelled_rids
+    assert not sender._expired_publication_fences
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("aux_started", [False, True])
+def test_routed_bounce_cancel_reports_queued_aux_after_kv_success(aux_started):
+    rid = 134
+    sender = _make_bounce_ctx_sender()
+    sender._add_req_info(rid, 0, _bounce_publication(rid, aux=True))
+    params = DisaggregatedParams(
+        disagg_request_id=rid, schedule_style=DisaggScheduleStyle.GENERATION_FIRST
+    )
+    ctx = transfer_mod.TxSession(rid, params, sender)
+    ctx.send_aux()
+    if aux_started:
+        with ctx.lock:
+            ctx._direct_aux_started_peer_ranks.add(0)
+    receiver, session = _make_one_writer_bounce_rx(rid, aux=True)
+    session.process_kv_agent_result(0, 0, True, AgentResult.SUCCESS, _KV_RESULT_REPORT_TOKEN)
+    assert session.cancel()
+
+    sender._handle_cancel_session([MessageType.CANCEL_SESSION, str(rid).encode(), b"gen", b"0"])
+    delivered = _deliver_ctx_evidence(sender, receiver)
+
+    slot = _OneSlotAllocator(rid)
+    if aux_started:
+        # The started AUX write keeps the slot until its own result arrives.
+        assert delivered == [MessageType.KV_AGENT_RESULT, MessageType.SESSION_QUIESCED]
+        slot.apply_reuse_decision(session.close())
+        assert not slot.is_reusable
+        session.process_aux_agent_result(0, AgentResult.SUCCESS)
+    else:
+        assert delivered == [
+            MessageType.AUX_AGENT_RESULT,
+            MessageType.KV_AGENT_RESULT,
+            MessageType.SESSION_QUIESCED,
+        ]
+    slot.apply_reuse_decision(session.close())
+    assert slot.is_reusable
+
+
+@pytest.mark.cpu_only
+def test_aux_worker_reports_failure_when_routed_cancel_wins_admission(monkeypatch):
+    rid = 135
+    sender = _make_bounce_ctx_sender()
+    sender._add_req_info(rid, 0, _bounce_publication(rid, aux=True))
+    params = DisaggregatedParams(
+        disagg_request_id=rid, schedule_style=DisaggScheduleStyle.GENERATION_FIRST
+    )
+    ctx = transfer_mod.TxSession(rid, params, sender)
+    aux_task = ctx.send_aux()
+    dealer = Mock()
+    sender._get_result_dealer = Mock(return_value=dealer)
+    monkeypatch.setattr(transfer_mod.Sender, "_make_agent_request", lambda *_a, **_k: object())
+
+    def cancel_then_refuse(*_args, **_kwargs):
+        # The started claim is already taken; cancellation must leave this peer to the worker.
+        sender._handle_cancel_session([MessageType.CANCEL_SESSION, str(rid).encode(), b"gen", b"0"])
+        raise transfer_mod._TransferNotSubmittedError("NIXL transfer session is closed or fenced")
+
+    sender._submit_transfer = cancel_then_refuse
+    write_meta = SimpleNamespace(
+        task=aux_task,
+        unique_rid=rid,
+        peer_rank=0,
+        peer_endpoint="0",
+        src_ptrs=np.zeros(1),
+        agent_generation=0,
+    )
+    sender._deliver_aux_to_agent(write_meta)
+
+    dealer.send.assert_called_once_with(
+        transfer_mod._make_aux_result_msg(0, rid, AgentResult.FAILED)
+    )
+    queued = [
+        item[1] for item in list(sender._send_task_queues[0].queue) if isinstance(item, tuple)
+    ]
+    # Only the worker reports this AUX peer; the cancellation adds its idle KV evidence.
+    assert [message[0] for message in queued] == [MessageType.KV_AGENT_RESULT]
+    assert _kv_result_code(queued[0]) is AgentResult.NOT_SUBMITTED
+
+
 @pytest.mark.cpu_only
 def test_failed_legacy_bounce_receive_keeps_waiting_after_session_ack() -> None:
     receiver = _ReceiverProbe()
