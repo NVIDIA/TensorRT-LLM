@@ -62,6 +62,8 @@ from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
 from ..locality_domain.policy import LocalityDomainPolicy
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
+from ..modules.deterministic_linear import (deterministic_linear,
+                                            use_deterministic_linear)
 from ..modules.embedding import Embedding
 from ..moe.fused_moe import (DEFAULT_MOE_ACTIVATION, DeepSeekV3MoeRoutingMethod,
                              MoEWeightLoadingMode, SwigluActivation, create_moe,
@@ -999,13 +1001,9 @@ class DeepseekV3Gate(Linear):
             is_fused=fuse_routing_kernel)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if (os.environ.get("FORCE_DETERMINISTIC", "0") == "1"
-                and self._locality_domain_weight_shards is None
-                and hidden_states.dtype == torch.bfloat16
-                and self.weight.dtype == torch.bfloat16
-                and get_sm_version() in (100, 103)):
-            from ..modules.deterministic_linear import deterministic_linear
-
+        # Weight shards of a locality domain keep their own GEMM below.
+        if (self._locality_domain_weight_shards is None
+                and use_deterministic_linear(hidden_states, self.weight)):
             return deterministic_linear(hidden_states,
                                         self.weight,
                                         output_dtype=torch.float32)

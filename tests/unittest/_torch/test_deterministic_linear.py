@@ -7,14 +7,20 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tensorrt_llm._torch.modules import deterministic_linear as deterministic_linear_module
+from tensorrt_llm._torch.modules import linear as linear_module
 from tensorrt_llm._torch.modules.context_logits import ContextLogitsWorkspace
-from tensorrt_llm._torch.modules.deterministic_linear import deterministic_linear
+from tensorrt_llm._torch.modules.deterministic_linear import (
+    deterministic_linear,
+    deterministic_linear_enabled,
+    use_deterministic_linear,
+)
 from tensorrt_llm._torch.modules.embedding import LMHead
 from tensorrt_llm._torch.modules.linear import UnquantizedLinearMethod
 from tensorrt_llm._utils import get_sm_version
 
 pytestmark = pytest.mark.skipif(
-    get_sm_version() not in (100, 103), reason="Deterministic BF16 GEMM is SM100/SM103 only"
+    get_sm_version() != 100, reason="Deterministic BF16 GEMM is SM100 only"
 )
 
 
@@ -134,6 +140,70 @@ def test_context_logits_projection_token_count_invariance(monkeypatch, output_dt
         indices = torch.linspace(0, m - 1, 8, device="cuda").long()
         inputs[indices] = target
         torch.testing.assert_close(project(inputs)[indices], expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "umbrella, component, enabled",
+    [(None, None, False), ("1", None, True), (None, "1", True), ("0", "0", False)],
+)
+def test_either_switch_selects_the_fixed_reduction(monkeypatch, umbrella, component, enabled):
+    for name, value in (
+        ("FORCE_DETERMINISTIC", umbrella),
+        ("FORCE_LINEAR_KERNEL_DETERMINISTIC", component),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    deterministic_linear_enabled.cache_clear()
+    assert deterministic_linear_enabled() is enabled
+    x = torch.randn(3, 257, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(97, 257, device="cuda", dtype=torch.bfloat16)
+    assert use_deterministic_linear(x, weight) is enabled
+    # Only BF16 tensors on CUDA take the kernel.
+    assert not use_deterministic_linear(x.float(), weight)
+    assert not use_deterministic_linear(x, weight.float())
+    assert not use_deterministic_linear(x.cpu(), weight.cpu())
+    layer = SimpleNamespace(
+        weight=weight,
+        tp_size=1,
+        use_custom_cublas_mm=False,
+        use_cute_dsl_bf16_gemm=False,
+        mapping=None,
+    )
+    calls = []
+
+    def recording(*args, **kwargs):
+        calls.append(args)
+        return deterministic_linear(*args, **kwargs)
+
+    monkeypatch.setattr(linear_module, "deterministic_linear", recording)
+    actual = UnquantizedLinearMethod().apply(layer, x, None)
+    assert len(calls) == int(enabled)
+    if enabled:
+        assert torch.equal(
+            actual.view(torch.int16), deterministic_linear(x, weight).view(torch.int16)
+        )
+
+
+def test_switches_are_read_once_per_process(monkeypatch):
+    monkeypatch.delenv("FORCE_DETERMINISTIC", raising=False)
+    monkeypatch.delenv("FORCE_LINEAR_KERNEL_DETERMINISTIC", raising=False)
+    deterministic_linear_enabled.cache_clear()
+    assert not deterministic_linear_enabled()
+    monkeypatch.setenv("FORCE_DETERMINISTIC", "1")
+    assert not deterministic_linear_enabled()
+    deterministic_linear_enabled.cache_clear()
+    assert deterministic_linear_enabled()
+
+
+@pytest.mark.parametrize("sm_version", [90, 103, 107, 120])
+def test_switches_have_no_effect_off_sm100(monkeypatch, sm_version):
+    monkeypatch.setenv("FORCE_DETERMINISTIC", "1")
+    monkeypatch.setenv("FORCE_LINEAR_KERNEL_DETERMINISTIC", "1")
+    monkeypatch.setattr(deterministic_linear_module, "get_sm_version", lambda: sm_version)
+    deterministic_linear_enabled.cache_clear()
+    assert not deterministic_linear_enabled()
 
 
 def test_linear_kernel_checks_its_arguments():

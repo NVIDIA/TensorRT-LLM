@@ -1,10 +1,26 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""BF16 linear with a fixed K reduction, independent of the token count."""
+"""BF16 linear with a fixed K reduction, independent of the token count.
+
+``FORCE_DETERMINISTIC=1``, or ``FORCE_LINEAR_KERNEL_DETERMINISTIC=1`` for this
+kernel alone, routes the BF16 GEMMs of ``Linear``, the LM head, the context
+logits and the MoE routers that call ``use_deterministic_linear`` here.
+
+The K tile and the accumulation order are fixed, but the row tile changes with
+the token count (16, 64 or 128 rows). Equal bits across token counts therefore
+also need Triton to lower ``tl.dot`` for these tiles to Tensor Core
+instructions that round alike. The zero-tolerance tests pin that on SM100
+only, so the switches have no effect on other architectures.
+"""
+
+import functools
+import os
 
 import torch
 import triton
 import triton.language as tl
+
+from tensorrt_llm._utils import get_sm_version
 
 
 @triton.jit
@@ -45,6 +61,35 @@ def _linear_kernel(
     if HAS_BIAS:
         acc += tl.load(BIAS + cols, cols < N, other=0).to(tl.float32)[None, :]
     tl.store(Y + rows[:, None] * N + cols[None, :], acc, (rows[:, None] < M) & (cols[None, :] < N))
+
+
+@functools.lru_cache(maxsize=1)
+def deterministic_linear_enabled() -> bool:
+    """Whether the environment selects the fixed K reduction on this GPU.
+
+    The switches are read at the first call and kept for the process, so the
+    GEMMs do not read the environment. A worker makes that call after it has
+    replayed ``env_overrides``. Call ``cache_clear()`` after changing the
+    switches in a process that has already run a GEMM.
+    """
+    return get_sm_version() == 100 and (
+        os.getenv("FORCE_DETERMINISTIC", "0") == "1"
+        or os.getenv("FORCE_LINEAR_KERNEL_DETERMINISTIC", "0") == "1"
+    )
+
+
+def use_deterministic_linear(x: torch.Tensor, weight: torch.Tensor) -> bool:
+    """Whether ``x @ weight.T`` runs ``deterministic_linear``.
+
+    True when the switch is on and both tensors are BF16 on CUDA. Every
+    caller asks here, so the condition is the same for all of them.
+    """
+    return (
+        deterministic_linear_enabled()
+        and x.is_cuda
+        and x.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+    )
 
 
 def deterministic_linear(

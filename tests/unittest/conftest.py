@@ -448,6 +448,24 @@ def torch_empty_cache() -> None:
         torch.cuda.empty_cache()
 
 
+def _clear_deterministic_linear_switch() -> None:
+    module = sys.modules.get("tensorrt_llm._torch.modules.deterministic_linear")
+    if module is not None:
+        module.deterministic_linear_enabled.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def reread_deterministic_linear_switch() -> Generator[None, None, None]:
+    """Read the switch of the fixed BF16 GEMM reduction anew in every test.
+
+    FORCE_DETERMINISTIC and FORCE_LINEAR_KERNEL_DETERMINISTIC are read once per
+    process, so a test that sets one must not decide it for the tests after it.
+    """
+    _clear_deterministic_linear_switch()
+    yield
+    _clear_deterministic_linear_switch()
+
+
 @pytest.fixture(autouse=True)
 def verify_skipped_device_copies(monkeypatch) -> None:
     monkeypatch.setattr(

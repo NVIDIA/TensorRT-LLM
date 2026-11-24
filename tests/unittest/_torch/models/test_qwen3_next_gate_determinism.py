@@ -5,19 +5,21 @@
 import pytest
 import torch
 
+from tensorrt_llm._torch.models.modeling_qwen3_moe import Qwen3Gate
 from tensorrt_llm._torch.models.modeling_qwen3_next import Qwen3NextGate
 from tensorrt_llm._utils import get_sm_version
 
 pytestmark = pytest.mark.skipif(
-    get_sm_version() not in (100, 103), reason="Deterministic BF16 GEMM is SM100/SM103 only"
+    get_sm_version() != 100, reason="Deterministic BF16 GEMM is SM100 only"
 )
 
 
+@pytest.mark.parametrize("gate_cls", [Qwen3NextGate, Qwen3Gate])
 @pytest.mark.parametrize("seed", [17, 42, 99])
-def test_qwen_gate_deterministic_batch_invariance(monkeypatch, seed):
+def test_qwen_gate_deterministic_batch_invariance(monkeypatch, gate_cls, seed):
     monkeypatch.setenv("FORCE_DETERMINISTIC", "1")
     torch.manual_seed(seed)
-    gate = Qwen3NextGate(2048, 256, 8, dtype=torch.bfloat16).cuda()
+    gate = gate_cls(2048, 256, 8, dtype=torch.bfloat16).cuda()
     gate.weight.copy_(torch.randn_like(gate.weight) * 0.02)
     x = torch.randn(640, 2048, device="cuda", dtype=torch.bfloat16)
     full = gate(x)
@@ -28,9 +30,10 @@ def test_qwen_gate_deterministic_batch_invariance(monkeypatch, seed):
     torch.testing.assert_close(full.float(), expected.float(), atol=5e-5, rtol=0.008)
 
 
-def test_qwen_gate_float_output_preserved(monkeypatch):
+@pytest.mark.parametrize("gate_cls", [Qwen3NextGate, Qwen3Gate])
+def test_qwen_gate_float_output_preserved(monkeypatch, gate_cls):
     monkeypatch.setenv("FORCE_DETERMINISTIC", "1")
-    gate = Qwen3NextGate(2048, 256, 8, dtype=torch.bfloat16).cuda()
+    gate = gate_cls(2048, 256, 8, dtype=torch.bfloat16).cuda()
     gate.weight.zero_()
     gate.out_dtype = torch.float32
     output = gate(torch.ones(3, 2048, device="cuda", dtype=torch.bfloat16))

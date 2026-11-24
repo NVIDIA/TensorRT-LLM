@@ -40,8 +40,7 @@ from tensorrt_llm._torch.moe.fused_shared_expert import \
 from tensorrt_llm._torch.pyexecutor.config_utils import \
     get_qwen3_hybrid_layer_types
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import RuntimeHooks
-from tensorrt_llm._utils import (get_sm_version, is_blackwell_datacenter,
-                                 is_sm_120f)
+from tensorrt_llm._utils import is_blackwell_datacenter, is_sm_120f
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ...logger import logger
@@ -55,6 +54,8 @@ from ..distributed.ops import MNNVLAllReduce
 from ..kernels.nvfp4_quant import can_use_nvfp4_quant, nvfp4_fp8_dual_quant
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
+from ..modules.deterministic_linear import (deterministic_linear,
+                                            use_deterministic_linear)
 from ..modules.embedding import Embedding, LMHead
 from ..modules.expert_l2_prefetch import ExpertL2Prefetch
 from ..modules.fla.gdn_metadata import GDNMambaMetadata, gdn_metadata_for_batch
@@ -564,13 +565,9 @@ class Qwen3NextGate(nn.Module):
         assert not apply_routing, "Qwen3NextGate routing is called inside MoE"
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if (os.environ.get("FORCE_DETERMINISTIC", "0") == "1"
-                and hidden_states.dtype == torch.bfloat16
-                and self.weight.dtype == torch.bfloat16
-                and self.out_dtype == torch.bfloat16
-                and get_sm_version() in (100, 103)):
-            from ..modules.deterministic_linear import deterministic_linear
-
+        # An FP32 out_dtype stays with cublas_mm below.
+        if (self.out_dtype == torch.bfloat16
+                and use_deterministic_linear(hidden_states, self.weight)):
             return deterministic_linear(hidden_states, self.weight)
 
         # The low-M kernels return the input dtype, so cublas_mm below still

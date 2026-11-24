@@ -5,11 +5,13 @@
 import pytest
 import torch
 
+from tensorrt_llm._torch.custom_ops import router_logit_partials
 from tensorrt_llm._torch.models.modeling_deepseekv3 import DeepseekV3Gate
+from tensorrt_llm._torch.models.modeling_deepseekv4 import DeepseekV4Gate
 from tensorrt_llm._utils import get_sm_version
 
 pytestmark = pytest.mark.skipif(
-    get_sm_version() not in (100, 103), reason="Deterministic BF16 GEMM is SM100/SM103 only"
+    get_sm_version() != 100, reason="Deterministic BF16 GEMM is SM100 only"
 )
 
 
@@ -46,3 +48,37 @@ def test_deepseek_gate_deterministic_fp32_projection(monkeypatch, hidden, expert
     graph.replay()
     torch.testing.assert_close(captured, gate(x[:7]), atol=0, rtol=0)
     torch.testing.assert_close(captured[:1], gate(x[:1]), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("partials", [False, True])
+def test_deepseek_v4_gate_deterministic_fp32_projection(monkeypatch, partials):
+    monkeypatch.setenv("FORCE_DETERMINISTIC", "1")
+    torch.manual_seed(99)
+    hidden, experts = 4096, 256
+    gate = DeepseekV4Gate(
+        hidden,
+        experts,
+        top_k=6,
+        n_group=1,
+        topk_group=1,
+        routed_scaling_factor=1.0,
+        is_hashed=False,
+        dtype=torch.bfloat16,
+    ).cuda()
+    gate.weight.copy_(torch.randn_like(gate.weight) * 0.02)
+    x = torch.randn(640, hidden, device="cuda", dtype=torch.bfloat16)
+    # Without the switch these token counts get K-chunk partials when the caller takes them.
+    assert router_logit_partials.applies(x, gate.weight)
+    assert router_logit_partials.applies(x[:512], gate.weight)
+    full = gate(x, partials=partials)
+    assert isinstance(full, torch.Tensor) and full.dtype == torch.float32
+    rows = [0, 127, 511, 639]
+    for row in rows:
+        torch.testing.assert_close(
+            gate(x[row : row + 1], partials=partials), full[row : row + 1], atol=0, rtol=0
+        )
+    torch.testing.assert_close(gate(x[:512], partials=partials), full[:512], atol=0, rtol=0)
+    reference = x[rows].double() @ gate.weight.double().T
+    torch.testing.assert_close(full[rows].double(), reference, atol=5e-5, rtol=1e-5)
+    empty = gate(x[:0], partials=partials)
+    assert empty.shape == (0, experts) and empty.dtype == torch.float32
