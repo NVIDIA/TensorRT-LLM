@@ -520,8 +520,9 @@ def external_drafter_config_kwargs(
         moe_max_num_tokens=model_config.moe_max_num_tokens,
         use_cute_dsl_blockscaling_mm=model_config.use_cute_dsl_blockscaling_mm,
         max_seq_len=model_config.max_seq_len,
-        # Engine settings (``moe_config``), not checkpoint properties.
+        # Engine settings (``moe_config``, ``enable_wide_ep_fault_tolerance``), not checkpoint properties.
         use_low_precision_moe_combine=model_config.use_low_precision_moe_combine,
+        enable_wide_ep_fault_tolerance=model_config.enable_wide_ep_fault_tolerance,
         megamoe_fuse_shared_expert=model_config.megamoe_fuse_shared_expert,
     )
 

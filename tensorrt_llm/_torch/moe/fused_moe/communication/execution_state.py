@@ -71,7 +71,8 @@ class MoeExecutionState:
         self.ep_group_health = ep_group_health
         self.ep_rank = ep_rank
         self._device = device
-        # The kernels read the abort state at its host address, which must be pinned memory.
+        # The kernels read the abort state at its host address, so the all-to-all ops take it only in
+        # pinned memory.
         if confidential_compute_enabled():
             raise RuntimeError(
                 "Wide-EP fault tolerance is not supported with Confidential Computing: the MoE "
@@ -82,13 +83,14 @@ class MoeExecutionState:
             dtype=torch.int32,
             pin_memory=prefer_pinned(),
         )
-        if not self.abort.is_pinned():
-            raise RuntimeError("The MoE All-to-All abort state requires pinned host memory")
         self._abort_words = self.abort.numpy()[_ABORT_WORDS]
         # Orders the updates of ``requested`` by request_abort and rearm.
         self._abort_lock = threading.Lock()
-        self._workspaces: dict[object, tuple[Callable[[], None], Callable[[], None]]] = {}
-        self._layers: list[tuple[Callable[[], None], Callable[[], bool]]] = []
+        # The callbacks of each bound layer, and of each workspace per bound layer that uses it.
+        self._layers: dict[object, tuple[Callable[[], None], Callable[[], bool]]] = {}
+        self._workspaces: dict[
+            object, dict[object, tuple[Callable[[], None], Callable[[], None]]]
+        ] = {}
         snapshot = ep_group_health.snapshot()
         self._generation = snapshot.generation
         # A layer bound after a membership change has a workspace that the change's remaps left out.
@@ -98,9 +100,9 @@ class MoeExecutionState:
         )
 
     def register_layer(
-        self, reset_state: Callable[[], None], between_rounds: Callable[[], bool]
+        self, layer: object, reset_state: Callable[[], None], between_rounds: Callable[[], bool]
     ) -> None:
-        """Register a bound layer's dispatch/combine state machine.
+        """Register the dispatch/combine state machine of a bound ``layer``.
 
         ``reset_state`` returns it to idle, and ``between_rounds`` returns whether it is idle, that
         is, no dispatch of the layer waits for its combine.
@@ -110,20 +112,37 @@ class MoeExecutionState:
         """
         if self.ep_group_health.generation != self._bound_generation:
             raise RuntimeError("Bind MoE layers only before the EP membership changes")
-        self._layers.append((reset_state, between_rounds))
+        self._layers[layer] = (reset_state, between_rounds)
 
     def register_workspace(
         self,
+        layer: object,
         workspace: object,
         reset_workspace: Callable[[], None],
         check_incomplete_round: Callable[[], None],
     ) -> None:
-        """Register a bound layer's workspace, once per workspace that layers share.
+        """Register the workspace of a bound ``layer``. Layers may share a workspace.
 
         ``reset_workspace`` resets this rank's row of it, and ``check_incomplete_round`` enqueues the
-        check of this rank's incomplete-round word in it (:meth:`check_incomplete_rounds`).
+        check of this rank's incomplete-round word in it (:meth:`check_incomplete_rounds`). Each
+        workspace is reset and checked once, through the callbacks of a layer still registered.
         """
-        self._workspaces.setdefault(workspace, (reset_workspace, check_incomplete_round))
+        self._workspaces.setdefault(workspace, {})[layer] = (
+            reset_workspace,
+            check_incomplete_round,
+        )
+
+    def unregister(self, layer: object) -> None:
+        """Drop the callbacks of ``layer``, and its workspace once no registered layer uses it."""
+        self._layers.pop(layer, None)
+        for workspace, layers in list(self._workspaces.items()):
+            layers.pop(layer, None)
+            if not layers:
+                del self._workspaces[workspace]
+
+    def _workspace_callbacks(self) -> list[tuple[Callable[[], None], Callable[[], None]]]:
+        """Return the callbacks of one registered layer per bound workspace."""
+        return [next(iter(layers.values())) for layers in self._workspaces.values()]
 
     def workspace_bytes(self) -> int:
         """Return the device memory :meth:`remap_workspaces` allocates on this rank."""
@@ -173,7 +192,7 @@ class MoeExecutionState:
         forward, on the stream of its last combine, before the event that the host waits on to
         accept the forward.
         """
-        for _, check_incomplete_round in self._workspaces.values():
+        for _, check_incomplete_round in self._workspace_callbacks():
             check_incomplete_round()
 
     def waited_flags(self) -> dict[int, int]:
@@ -204,9 +223,9 @@ class MoeExecutionState:
         with self._abort_lock:
             handled_requests = int(self._abort_words[_ABORT_REQUESTED])
         torch.cuda.synchronize(self._device)
-        for reset_workspace, _ in self._workspaces.values():
+        for reset_workspace, _ in self._workspace_callbacks():
             reset_workspace()
-        for reset_state, _ in self._layers:
+        for reset_state, _ in self._layers.values():
             reset_state()
         torch.cuda.synchronize(self._device)
         # The kernels write the status and waited flags, and none runs now.
@@ -229,7 +248,7 @@ class MoeExecutionState:
         if snapshot.generation == self._generation:
             return
         words = _mask_words(snapshot.mask, self.ep_rank)
-        if not all(between_rounds() for _, between_rounds in self._layers):
+        if not all(between_rounds() for _, between_rounds in self._layers.values()):
             raise RuntimeError(
                 "Install the MoE All-to-All rank mask only between rounds: a bound layer "
                 "dispatched without its combine"

@@ -35,6 +35,7 @@ from test_common.serve.middleware import middleware_snapshot
 from test_common.serve.routes import _records_conflict, compare, effective_routes
 
 import tensorrt_llm._utils
+from tensorrt_llm.executor.utils import RequestError
 from tensorrt_llm.inputs.media_io import BaseMediaIO
 from tensorrt_llm.sampling_params import SamplingParams
 from tensorrt_llm.usage import usage_lib
@@ -363,7 +364,7 @@ def test_raise_after_steps_ends_a_stream_with_the_scripted_error(serve_env):
     server.generator.script(
         ScriptedOutput(
             steps=(ScriptedStep(text="partial", token_ids=(5,)),),
-            raise_after_steps=RuntimeError("stream exploded"),
+            raise_after_steps=RequestError("stream exploded"),
         )
     )
     client = serve_env.client(server.app)
