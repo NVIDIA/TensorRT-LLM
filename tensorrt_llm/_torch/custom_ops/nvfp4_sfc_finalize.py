@@ -115,7 +115,7 @@ def sfc_finalize(
 @fast_custom_op(
     "trtllm::nvfp4_sfc_finalize",
     mutates_args=(),
-    device_types=("CUDA", "CPU"),
+    device_types=None,
     tags=(torch.Tag.needs_fixed_stride_order,),
 )
 def nvfp4_sfc_finalize(raw: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

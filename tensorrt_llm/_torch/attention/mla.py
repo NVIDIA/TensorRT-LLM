@@ -132,7 +132,7 @@ def create_mla_outputs_impl(hidden_states: torch.Tensor, layer_idx: str) -> torc
     return outputs[0]
 
 
-@fast_custom_op("trtllm::create_mla_outputs", mutates_args=())
+@fast_custom_op("trtllm::create_mla_outputs", mutates_args=(), device_types=None)
 def create_mla_outputs(hidden_states: torch.Tensor, layer_idx: str) -> torch.Tensor:
     return create_mla_outputs_impl(hidden_states, layer_idx)
 
@@ -142,14 +142,20 @@ def _create_mla_outputs_fake(hidden_states: torch.Tensor, layer_idx: str) -> tor
     return create_mla_outputs_impl(hidden_states, layer_idx)
 
 
-def _mla_custom_op_inplace(
+@fast_custom_op(
+    "trtllm::mla_custom_op_inplace",
+    mutates_args=("output",),
+    device_types=None,
+    disable_grad=True,
+)
+def mla_custom_op_inplace(
     hidden_states: torch.Tensor,
     position_ids: Optional[torch.Tensor],
     layer_idx: str,
     output: torch.Tensor,
     latent_cache_gen: Optional[torch.Tensor],
-    hidden_states_fp4: Optional[torch.Tensor],
-    hidden_states_sf: Optional[torch.Tensor],
+    hidden_states_fp4: Optional[torch.Tensor] = None,
+    hidden_states_sf: Optional[torch.Tensor] = None,
 ) -> None:
     metadata, mla_layer = _extract_mla_extra_attrs(layer_idx)
     if hidden_states_fp4 is not None or hidden_states_sf is not None:
@@ -168,39 +174,6 @@ def _mla_custom_op_inplace(
         attn_output=[output],
         latent_cache_gen=latent_cache_gen,
     )
-
-
-@fast_custom_op(
-    "trtllm::mla_custom_op_inplace",
-    mutates_args=("output",),
-)
-def mla_custom_op_inplace(
-    hidden_states: torch.Tensor,
-    position_ids: Optional[torch.Tensor],
-    layer_idx: str,
-    output: torch.Tensor,
-    latent_cache_gen: Optional[torch.Tensor],
-    hidden_states_fp4: Optional[torch.Tensor] = None,
-    hidden_states_sf: Optional[torch.Tensor] = None,
-) -> None:
-    # The op has no autograd kernel, so the body runs with grad mode as the caller
-    # set it. Run the nested projections and BMMs below autograd, as they would be
-    # under custom_op (an out= call there fails when an input requires grad); the
-    # branch keeps no_grad off the inference-mode path.
-    args = (
-        hidden_states,
-        position_ids,
-        layer_idx,
-        output,
-        latent_cache_gen,
-        hidden_states_fp4,
-        hidden_states_sf,
-    )
-    if torch.is_grad_enabled():
-        with torch.no_grad():
-            _mla_custom_op_inplace(*args)
-    else:
-        _mla_custom_op_inplace(*args)
 
 
 @mla_custom_op_inplace.register_fake

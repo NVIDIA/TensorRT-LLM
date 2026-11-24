@@ -14,7 +14,9 @@ if IS_FLASHINFER_AVAILABLE:
     from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace
 
     # Warp this into custom op since flashinfer didn't warp it properly and we want to avoid graph break between mlp layer for user buffer optimization
-    @torch.library.custom_op("trtllm::flashinfer_silu_and_mul", mutates_args=())
+    @fast_custom_op("trtllm::flashinfer_silu_and_mul",
+                    mutates_args=(),
+                    device_types=None)
     def flashinfer_silu_and_mul(x: torch.Tensor) -> torch.Tensor:
         return silu_and_mul(x, enable_pdl=get_env_enable_pdl())
 
@@ -32,7 +34,9 @@ if IS_FLASHINFER_AVAILABLE:
         return torch.empty_like(x).chunk(2, dim=-1)[1].contiguous()
 
     # Warp this into custom op since flashinfer provides default value for eps with would produce two different graphs depends on the eps value.
-    @fast_custom_op("trtllm::flashinfer_rmsnorm", mutates_args=())
+    @fast_custom_op("trtllm::flashinfer_rmsnorm",
+                    mutates_args=(),
+                    device_types=None)
     def flashinfer_rmsnorm(input: torch.Tensor, weight: torch.Tensor,
                            eps: float) -> torch.Tensor:
         return rmsnorm(input, weight, eps, enable_pdl=get_env_enable_pdl())
@@ -57,7 +61,8 @@ if IS_FLASHINFER_AVAILABLE:
         return torch.empty_like(input)
 
     @fast_custom_op("trtllm::flashinfer_fused_add_rmsnorm",
-                    mutates_args=("input", "residual"))
+                    mutates_args=("input", "residual"),
+                    device_types=None)
     def flashinfer_fused_add_rmsnorm(input: torch.Tensor,
                                      residual: torch.Tensor,
                                      weight: torch.Tensor, eps: float) -> None:
@@ -94,7 +99,8 @@ if IS_FLASHINFER_AVAILABLE:
         pass
 
     @fast_custom_op("trtllm::flashinfer_gemma_fused_add_rmsnorm",
-                    mutates_args=("input", "residual"))
+                    mutates_args=("input", "residual"),
+                    device_types=None)
     def flashinfer_gemma_fused_add_rmsnorm(input: torch.Tensor,
                                            residual: torch.Tensor,
                                            weight: torch.Tensor,

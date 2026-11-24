@@ -109,7 +109,7 @@ def situ_and_mul_kernel(
         tl.extra.cuda.gdc_launch_dependents()
 
 
-@fast_custom_op("trtllm::situ_and_mul", mutates_args=())
+@fast_custom_op("trtllm::situ_and_mul", mutates_args=(), device_types=None)
 def situ_and_mul(x: torch.Tensor, beta: float, linear_beta: Optional[float] = None) -> torch.Tensor:
     """Run fused SiTU on a packed ``[num_tokens, 2 * d]`` input."""
     b, n = x.shape

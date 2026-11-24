@@ -64,7 +64,7 @@ def _hc_silu_kernel(
     )
 
 
-@fast_custom_op("trtllm::qwen4_exp_hc_silu", mutates_args=())
+@fast_custom_op("trtllm::qwen4_exp_hc_silu", mutates_args=(), device_types=None)
 def hc_silu(input: torch.Tensor, hc_count: int) -> torch.Tensor:
     """Fuse the HC scaling and SiLU applied after the down projection."""
     if input.ndim != 2 or not input.is_cuda or input.stride(1) != 1:
@@ -142,7 +142,7 @@ def _hc_gate_mix_kernel(
     )
 
 
-@fast_custom_op("trtllm::qwen4_exp_hc_gate_mix", mutates_args=())
+@fast_custom_op("trtllm::qwen4_exp_hc_gate_mix", mutates_args=(), device_types=None)
 def hc_gate_mix(
     input: torch.Tensor,
     gate: torch.Tensor,
@@ -361,7 +361,7 @@ def _hc_combine_norm_kernel(
     tl.store(normed_ptr + row * stride_normed + offsets, normed, mask=mask)
 
 
-@fast_custom_op("trtllm::qwen4_exp_hc_combine_norm", mutates_args=())
+@fast_custom_op("trtllm::qwen4_exp_hc_combine_norm", mutates_args=(), device_types=None)
 def hc_combine_norm(
     residual: torch.Tensor,
     block_output: torch.Tensor,

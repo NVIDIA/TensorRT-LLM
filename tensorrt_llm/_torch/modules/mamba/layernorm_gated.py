@@ -441,7 +441,9 @@ def _multirow_gated_rmsnorm_eligible(N, ngroups, bias, z, norm_before_gate,
             and ngroups == 1 and N <= _MULTIROW_MAX_N and (N & (N - 1)) == 0)
 
 
-@fast_custom_op("trtllm::rms_norm_gated_token_major", mutates_args=())
+@fast_custom_op("trtllm::rms_norm_gated_token_major",
+                mutates_args=(),
+                device_types=None)
 def rms_norm_gated_token_major(
     x: torch.Tensor,
     z: torch.Tensor,

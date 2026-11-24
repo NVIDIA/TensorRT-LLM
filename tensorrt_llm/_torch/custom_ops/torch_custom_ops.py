@@ -78,16 +78,13 @@ IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE = (IS_FLASHINFER_AVAILABLE
 
 
 # Used to WAR an issue in torch.bmm that it would break the graph when the out is not contiguous.
-@fast_custom_op("trtllm::bmm_out", mutates_args=("out", ))
+# disable_grad because torch.bmm rejects out= when grad mode is on and an input requires grad.
+@fast_custom_op("trtllm::bmm_out",
+                mutates_args=("out", ),
+                device_types=None,
+                disable_grad=True)
 def bmm_out(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
-    # The op has no autograd kernel, so the body runs with grad mode as the
-    # caller set it, and torch.bmm rejects out= when grad mode is on and an
-    # input requires grad. The branch keeps no_grad off the inference-mode path.
-    if torch.is_grad_enabled():
-        with torch.no_grad():
-            torch.bmm(a, b, out=out)
-    else:
-        torch.bmm(a, b, out=out)
+    torch.bmm(a, b, out=out)
 
 
 @bmm_out.register_fake
@@ -243,7 +240,7 @@ class MoERunner(TunableRunner):
         )
 
 
-@fast_custom_op("trtllm::fused_moe", mutates_args=())
+@fast_custom_op("trtllm::fused_moe", mutates_args=(), device_types=None)
 def fused_moe(
     input: torch.Tensor,
     token_selected_experts: torch.Tensor,
@@ -427,7 +424,7 @@ def fused_moe(
     # Return empty list to avoid aliasing constraint violation in PyTorch 2.9.1+
     # (custom op output cannot be the same tensor as input).
     # Callers should use out_tensor directly when they provide it.
-    if out_tensor is not None and not min_latency_mode:
+    if out_tensor is not None:
         return []
 
     return output if min_latency_mode else [output]
@@ -566,7 +563,7 @@ class FP8RowwiseGemmRunner(TunableRunner):
         )
 
 
-@fast_custom_op("trtllm::fp8_rowwise_gemm", mutates_args=())
+@fast_custom_op("trtllm::fp8_rowwise_gemm", mutates_args=(), device_types=None)
 def fp8_rowwise_gemm(
     act: torch.Tensor,
     weight: torch.Tensor,
@@ -1988,7 +1985,9 @@ def _(
     return (fake_out, fake_dq_sfs_c)
 
 
-@fast_custom_op("trtllm::w4a8_mxfp4_fp8_gemm", mutates_args=())
+@fast_custom_op("trtllm::w4a8_mxfp4_fp8_gemm",
+                mutates_args=(),
+                device_types=None)
 def w4a8_mxfp4_fp8_gemm(
         act_fp8: torch.Tensor,
         weight: torch.Tensor,
@@ -2081,7 +2080,9 @@ class WeightOnlyQuantGemmRunner(TunableRunner):
         )
 
 
-@fast_custom_op("trtllm::weight_only_quant_gemm", mutates_args=())
+@fast_custom_op("trtllm::weight_only_quant_gemm",
+                mutates_args=(),
+                device_types=None)
 def weight_only_quant_gemm(
         activation: torch.Tensor,
         weight: torch.Tensor,
@@ -2180,7 +2181,9 @@ class FinegrainedMixedDtypeGemm(TunableRunner):
             kwargs["bias"], kwargs["zeros"], alpha)
 
 
-@fast_custom_op("trtllm::finegrained_mixed_dtype_gemm", mutates_args=())
+@fast_custom_op("trtllm::finegrained_mixed_dtype_gemm",
+                mutates_args=(),
+                device_types=None)
 def finegrained_mixed_dtype_gemm(
         input: torch.Tensor,
         weight: torch.Tensor,
@@ -2475,7 +2478,11 @@ def _(
                                 dtype=output_dtype)
 
 
-def _fp8_swap_ab_gemm(
+@fast_custom_op("trtllm::fp8_swap_ab_gemm",
+                mutates_args=(),
+                device_types=None,
+                disable_grad=True)
+def fp8_swap_ab_gemm(
     input: torch.Tensor,
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
@@ -2511,26 +2518,6 @@ def _fp8_swap_ab_gemm(
         inputs=[input, weight, weight_scale],
         tactic=best_tactic,
     )
-
-
-@fast_custom_op("trtllm::fp8_swap_ab_gemm", mutates_args=())
-def fp8_swap_ab_gemm(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    output_dtype: torch.dtype = torch.bfloat16,
-    disable_ue8m0_cast: bool = False,
-) -> torch.Tensor:
-    # The op has no autograd kernel, so the body runs with grad mode as the
-    # caller set it. Run the nested quantize and GEMM calls below autograd, as
-    # they would be under custom_op; the branch keeps no_grad off the
-    # inference-mode path.
-    if torch.is_grad_enabled():
-        with torch.no_grad():
-            return _fp8_swap_ab_gemm(input, weight, weight_scale, output_dtype,
-                                     disable_ue8m0_cast)
-    return _fp8_swap_ab_gemm(input, weight, weight_scale, output_dtype,
-                             disable_ue8m0_cast)
 
 
 @fp8_swap_ab_gemm.register_fake
@@ -2915,7 +2902,7 @@ def _(a, b, a_scale, b_scale, tune_max_num_tokens=4096):
     return a.new_empty((m, n), dtype=torch.bfloat16)
 
 
-@fast_custom_op("trtllm::silu_and_mul", mutates_args=())
+@fast_custom_op("trtllm::silu_and_mul", mutates_args=(), device_types=None)
 def silu_and_mul(x: torch.Tensor,
                  scale: Optional[torch.Tensor] = None,
                  dtype: Optional[torch.dtype] = None,

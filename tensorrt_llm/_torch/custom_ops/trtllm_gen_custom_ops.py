@@ -1133,7 +1133,9 @@ def _run_fp4_block_scale_moe(routing_logits: Optional[torch.Tensor],
     return result
 
 
-@fast_custom_op("trtllm::fp4_block_scale_moe_runner", mutates_args=())
+@fast_custom_op("trtllm::fp4_block_scale_moe_runner",
+                mutates_args=(),
+                device_types=None)
 def fp4_block_scale_moe_runner(routing_logits: Optional[torch.Tensor],
                                routing_bias: Optional[torch.Tensor],
                                hidden_states: torch.Tensor,
@@ -1652,7 +1654,9 @@ class FP8BlockScaleMoERunner(_TrtllmGenMoERunner):
         return tuning_config
 
 
-@fast_custom_op("trtllm::fp8_block_scale_moe_runner", mutates_args=())
+@fast_custom_op("trtllm::fp8_block_scale_moe_runner",
+                mutates_args=(),
+                device_types=None)
 def fp8_block_scale_moe_runner(routing_logits: Optional[torch.Tensor],
                                routing_bias: torch.Tensor,
                                hidden_states: torch.Tensor,
@@ -2013,7 +2017,9 @@ class MxE4m3MxE2m1BlockScaleMoERunner(_TrtllmGenMoERunner):
         return tuning_config
 
 
-@fast_custom_op("trtllm::mxe4m3_mxe2m1_block_scale_moe_runner", mutates_args=())
+@fast_custom_op("trtllm::mxe4m3_mxe2m1_block_scale_moe_runner",
+                mutates_args=(),
+                device_types=None)
 def mxe4m3_mxe2m1_block_scale_moe_runner(
         routing_logits: Optional[torch.Tensor],
         routing_bias: Optional[torch.Tensor],
