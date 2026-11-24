@@ -17,6 +17,7 @@ import enum
 import gc
 import json
 import os
+import pickle  # nosec B403
 import time
 import traceback
 import uuid
@@ -24,8 +25,8 @@ import weakref
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Lock
-from typing import (TYPE_CHECKING, Dict, List, Literal, Optional, Set, Tuple,
-                    Union)
+from typing import (TYPE_CHECKING, Any, Dict, Iterable, List, Literal, Optional,
+                    Set, Tuple, Union)
 
 import torch
 
@@ -58,7 +59,8 @@ from .request import GenerationRequest, LoRARequest
 from .result import (GenerationResult, LogProbsResult, ResponseWrapper,
                      compute_prompt_logprobs, get_metrics_dict,
                      prompt_logprobs_from_reduced, reduce_prompt_logprobs)
-from .utils import (ErrorResponse, RequestError, bucket_responses_by_frontend,
+from .utils import (ErrorResponse, PackedResponses, RequestError,
+                    bucket_responses_by_frontend,
                     context_length_exceeded_message, frontend_lane_index,
                     is_llm_response)
 
@@ -627,8 +629,11 @@ class BaseWorker(GenerationExecutor):
         except Exception as e:
             raise RequestError(str(e)) from e
 
-    def submit(self, request: GenerationRequest) -> GenerationResult:
-        """ Low-level API to the executor. Return a "future" GenerationResult which can be waited. """
+    def submit(self, request: GenerationRequest) -> Optional[GenerationResult]:
+        """ Low-level API to the executor. Return a "future" GenerationResult which can be waited.
+
+        Returns None when the reader of the result queue holds the result.
+        """
         self.start()
 
         if self.rank != 0:
@@ -644,12 +649,19 @@ class BaseWorker(GenerationExecutor):
 
         logprob_params = self._get_logprob_params(request)
 
-        result = GenerationResult(
-            request,
-            background_error_handler=self._handle_background_error,
-            executor=self,
-            disaggregated_params=request.disaggregated_params,
-            logprob_params=logprob_params)
+        # With a result queue the proxy holds the caller's GenerationResult.
+        # This worker reads its own only to post-process responses or to
+        # compute prompt logprobs, so it skips building one otherwise.
+        result = None
+        if (self.result_queue is None or self.postproc_queues is not None
+                or self.enable_postprocess_parallel
+                or logprob_params is not None):
+            result = GenerationResult(
+                request,
+                background_error_handler=self._handle_background_error,
+                executor=self,
+                disaggregated_params=request.disaggregated_params,
+                logprob_params=logprob_params)
 
         self._results[client_id] = result
 
@@ -1683,6 +1695,13 @@ class AwaitResponseHelper:
 
         for response in responses:
 
+            if isinstance(response, PackedResponses):
+                # Already in the proxy's form: see pack_final_responses.
+                rsp_batch.append(response)
+                for client_id in response.client_ids:
+                    self.worker._pop_result(client_id)
+                continue
+
             if isinstance(response, ErrorResponse):
                 pass  # send ErrorResponse directly
             elif _drop_refused_response(self.worker, response):
@@ -1716,6 +1735,32 @@ class AwaitResponseHelper:
                         lanes[frontend_id].put(sub_batch)
             else:
                 self.worker.result_queue.put(rsp_batch)
+
+
+def pack_final_responses(
+        responses: Iterable[Tuple[int, Any]]) -> List[Tuple[int, Any]]:
+    """Pickle a rank's final responses in the form the leader sends to the proxy.
+
+    The leader then forwards them without loading them. Responses it has to
+    finish itself stay as they are: those that are not final, carry an error,
+    or hold the context logits that prompt logprobs are computed from.
+    """
+    kept, packed, client_ids = [], [], []
+    for item in responses:
+        response = item[1]
+        result = getattr(response, "result", None)
+        if (result is None or not result.is_final
+                or result.context_logits is not None):
+            kept.append(item)
+            continue
+        metrics = get_metrics_dict(response)
+        packed.append(
+            ResponseWrapper(response, None, metrics) if metrics else response)
+        client_ids.append(response.client_id)
+    if packed:
+        # The key only has to differ from every request id.
+        kept.append((-1, PackedResponses(client_ids, pickle.dumps(packed))))
+    return kept
 
 
 def _get_params_for_first_rsp(

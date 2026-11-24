@@ -38,7 +38,7 @@ from ..llmapi.mpi_session import set_mpi_session_cpp
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import VizTracer, set_global_tracer
 from ..llmapi.utils import ManagedThread, logger_debug, print_traceback_on_error
-from .base_worker import BaseWorker, _init_hf_modules
+from .base_worker import BaseWorker, _init_hf_modules, pack_final_responses
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import (PostprocWorker, PostprocWorkerConfig,
                               postproc_worker_main)
@@ -636,6 +636,11 @@ def worker_main(
         if not worker_init_status_queue.notify_with_retry(error_msg):
             logger.error("Failed to deliver error message to proxy")
         return
+
+    # The leader sends responses straight to the proxy unless it post-processes
+    # them or routes them to frontends, so the other ranks can pack theirs.
+    if not postproc_worker_config.enabled and multi_frontend_addrs is None:
+        worker.engine.peer_response_packer = pack_final_responses
 
     # Optionally disable GC (default: not disabled)
     if os.getenv("TRTLLM_WORKER_DISABLE_GC", "0") == "1":

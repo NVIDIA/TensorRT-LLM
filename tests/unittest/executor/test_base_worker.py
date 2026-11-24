@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import importlib
 import importlib.util
+import pickle
 import sys
 import time
 import warnings
@@ -26,10 +27,12 @@ from utils.llm_data import llm_models_root
 from utils.util import skip_single_gpu
 # isort: on
 
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmResponse, LlmResult
 from tensorrt_llm.executor import base_worker
-from tensorrt_llm.executor.base_worker import BaseWorker
+from tensorrt_llm.executor.base_worker import AwaitResponseHelper, BaseWorker
 from tensorrt_llm.executor.request import GenerationRequest, LoRARequest
-from tensorrt_llm.executor.result import GenerationResult, LogProbsResult
+from tensorrt_llm.executor.result import (GenerationResult, LogProbsResult,
+                                          ResponseWrapper)
 from tensorrt_llm.executor.rpc_proxy_mixin import RpcExecutorMixin
 from tensorrt_llm.executor.utils import RequestError
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
@@ -1040,3 +1043,107 @@ def test_worker_enqueues_serializable_python_input_envelope(
         assert translated.py_return_routed_experts
         torch.testing.assert_close(translated.py_multimodal_data["embedding"],
                                    torch.ones(2, 4))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("keeps_result",
+                         [None, "prompt_logprobs", "postproc", "no_queue"])
+def test_worker_builds_a_result_only_when_it_reads_one(
+        keeps_result: str | None) -> None:
+    sampling = SamplingParams(
+        max_tokens=1,
+        prompt_logprobs=1 if keeps_result == "prompt_logprobs" else None)
+    request = GenerationRequest(prompt_token_ids=[10, 11],
+                                sampling_params=sampling)
+    request.set_id(7)
+    worker = MagicMock(
+        rank=0,
+        result_queue=None if keeps_result == "no_queue" else object(),
+        postproc_queues=[object()] if keeps_result == "postproc" else None,
+        enable_postprocess_parallel=False,
+        _results={},
+        _client_id_to_request_id={})
+    worker._get_logprob_params = MethodType(BaseWorker._get_logprob_params,
+                                            worker)
+    worker._handle_background_error = MethodType(lambda self: None, worker)
+    worker.postproc_config.num_postprocess_workers = 0
+    worker._enqueue_request.return_value = 70
+
+    result = BaseWorker.submit(worker, request)
+
+    assert worker._results == {7: result}
+    assert worker._client_id_to_request_id == {7: 70}
+    if keeps_result is None:
+        assert result is None
+        # The response path treats a missing result as "no logprobs to add".
+        response = SimpleNamespace(client_id=7,
+                                   result=SimpleNamespace(is_final=True))
+        assert base_worker._get_logprobs(worker, response) is None
+    else:
+        assert isinstance(result, GenerationResult)
+
+
+def _llm_response(client_id: int,
+                  *,
+                  final: bool = True,
+                  error: str | None = None,
+                  context_logits: object = None) -> LlmResponse:
+    result = None
+    if error is None:
+        result = LlmResult(b"serialized",
+                           SimpleNamespace(context_logits=context_logits),
+                           is_final=final)
+    return LlmResponse(request_id=100 + client_id,
+                       error_msg=error,
+                       result=result,
+                       client_id=client_id)
+
+
+@pytest.mark.cpu_only
+def test_other_ranks_pack_final_responses_and_the_leader_forwards_them(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    metrics = {"arrival_time": 1.5}
+    monkeypatch.setattr(
+        base_worker, "get_metrics_dict", lambda response: {}
+        if response.client_id == 3 else metrics)
+    # The leader finishes these three itself.
+    kept = [(104, _llm_response(4, final=False)),
+            (105, _llm_response(5, error="boom")),
+            (106, _llm_response(6, context_logits="logits"))]
+
+    pairs = base_worker.pack_final_responses([(101, _llm_response(1)), *kept,
+                                              (103, _llm_response(3))])
+
+    assert pairs[:3] == kept
+    (_, packed), = pairs[3:]
+    assert packed.client_ids == [1, 3]
+    measured, plain = pickle.loads(packed.payload)
+    assert isinstance(measured, ResponseWrapper)
+    assert measured.request_perf_metrics == metrics and measured.logprobs is None
+    assert measured.client_id == 1 and measured.result.is_final
+    assert type(plain) is LlmResponse and plain.client_id == 3
+    assert base_worker.pack_final_responses(kept) == kept
+
+    sent = []
+    worker = SimpleNamespace(
+        enable_postprocess_parallel=False,
+        postproc_config=SimpleNamespace(num_postprocess_workers=0),
+        frontend_result_queues=None,
+        result_queue=SimpleNamespace(put=sent.append),
+        _results={
+            1: None,
+            3: None,
+            9: None
+        },
+        _client_id_to_request_id={
+            1: 101,
+            3: 103,
+            9: 109
+        })
+    worker._pop_result = MethodType(BaseWorker._pop_result, worker)
+
+    AwaitResponseHelper(worker).handle_for_ipc_batched([packed])
+
+    assert sent == [[packed]]
+    assert worker._results == {9: None}
+    assert worker._client_id_to_request_id == {9: 109}

@@ -337,6 +337,15 @@ def multi_frontend_result_addr(ipc_dir: str, frontend_id: int) -> str:
     return f"ipc://{os.path.join(ipc_dir, f'result_{frontend_id}.sock')}"
 
 
+class PackedResponses(NamedTuple):
+    """Final responses of one attention-DP rank, pickled once for the proxy.
+
+    The leader forwards ``payload`` unopened and forgets ``client_ids``.
+    """
+    client_ids: list[int]
+    payload: bytes
+
+
 def is_llm_response(instance):
     # Duck typing, expect one of:
     #  tensorrt_llm.bindings.executor.Response

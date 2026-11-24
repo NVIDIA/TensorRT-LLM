@@ -779,6 +779,9 @@ class PyExecutor:
     # Set on a rank that reports completions while requests its first-token
     # check finished, which run no batch, wait for an iteration-stats record.
     _has_close_outs_pending_iter_stats = False
+    # Turns the responses a rank gathers to the leader into what the leader's
+    # consumer forwards. Set to the same callable on every rank, or on none.
+    peer_response_packer: Optional[Callable[[Iterable], list]] = None
 
     # Minimum number of async micro batches for async PP execution.
     # This is a trade-off between memory usage and performance.
@@ -13521,6 +13524,9 @@ class PyExecutor:
 
         if self.enable_attention_dp and self.dist.world_size != 1:
             if not self.gather_all_responses:
+                if (self.peer_response_packer and self.dist.rank != 0
+                        and responses):
+                    responses = self.peer_response_packer(responses)
                 responses_list = self.dist.tp_gather(responses)
             else:
                 responses_list = self.dist.allgather(responses)
