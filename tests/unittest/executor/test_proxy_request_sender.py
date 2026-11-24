@@ -271,21 +271,27 @@ def test_transport_error_reaches_error_queue(error_type) -> None:
         sender.close(timeout=2.0)
 
 
-def test_batched_quit_failure_is_best_effort(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("stop_during_quit", [False, True])
+def test_batched_quit_failure_is_best_effort(
+    monkeypatch: pytest.MonkeyPatch, stop_during_quit: bool
+) -> None:
     from tensorrt_llm.executor import proxy as proxy_module
 
     warnings = []
+    stopped = threading.Event()
     monkeypatch.setattr(proxy_module.logger, "warning", warnings.append)
 
     class GoneAfterBatch(_RecordingQueue):
-        def put(self, msg):
+        def put(self, msg: object) -> None:
             if msg is None:
+                if stop_during_quit:
+                    stopped.set()
                 raise RuntimeError("peer closed")
             super().put(msg)
 
     request_queue = GoneAfterBatch()
     errors = queue.Queue()
-    sender = _RequestSender(request_queue, errors)
+    sender = _RequestSender(request_queue, errors, stopped.is_set)
     sender.send(pickle.dumps("request"))
     assert not sender.close(timeout=2, send_sentinel=True)
     assert request_queue.messages == [_payloads("request")]

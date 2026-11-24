@@ -121,9 +121,8 @@ def _send_quit(request_queue: IpcQueue, should_stop: Callable[[],
             try:
                 request_queue.put_interruptible(None, should_stop)
                 return
-            except RuntimeError:
-                if not should_stop():
-                    raise
+            except RequestSendCancelled:
+                pass
         request_queue.put_nowait(None)
     except (RuntimeError, zmq.ZMQError) as exc:
         logger.warning(f"Executor proxy quit could not be delivered: {exc}")
