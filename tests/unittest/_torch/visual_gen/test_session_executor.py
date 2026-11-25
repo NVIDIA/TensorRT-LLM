@@ -201,6 +201,7 @@ def _make_executor(pipeline, session_config=None, *, rank=0, world_size=1, in_cl
     ex.requests_ipc = FakeRequestSocket()
     ex.controls_ipc = FakeRequestSocket()
     ex.session_config = session_config
+    ex._status_group = None
     return ex
 
 
@@ -1037,14 +1038,19 @@ def test_liveness_check_sees_a_dead_in_process_worker_thread():
 # and advance each enter an all-reduce; a failing rank raises either before it (a
 # pipeline-call failure, phases ``open`` / ``advance``) or after it, from the
 # completion event in ``_finalize_advance`` (an asynchronous device error, phases
-# ``open_event`` / ``advance_event``). Either way the other rank is inside a
-# collective the failing rank will never join. Required: the failing rank enters no
-# further collective (no status all-reduce after a pipeline failure, no CLOSE
-# broadcast ever) and ends its process at once with status 1. The surviving rank
-# hits the collective timeout, which is the same rank-local exception, and takes
-# the same path.
+# ``open_event`` / ``advance_event``); ``open_all`` / ``advance_all`` fail the call
+# on every rank alike.
+#
+# Required: a failed rank reports at the status all-reduce and waits there for its
+# peers no longer than the agreement timeout. Peers that arrive (they failed too,
+# or their step was complete) agree that the step failed: the open is refused or
+# the session ends, and the same ranks serve the next session. Peers that are
+# inside a collective the failed rank left never arrive: the failed rank ends its
+# process with status 1 and enters nothing else (no CLOSE broadcast ever), and the
+# other rank, once its collective times out, ends the same way.
 
 COLLECTIVE_TIMEOUT_S = 3.0
+AGREEMENT_TIMEOUT_S = 1.0  # in the rank processes; well inside the collective timeout
 
 
 class _FailingEvent:
@@ -1067,6 +1073,7 @@ class CollectivePipeline(CountingPipeline):
         self.fail_phase = fail_phase
         self.events = events
         self.after_advance = None  # called on this rank after each advance
+        self.failed_once = set()
 
     def prepare_request(self, req):
         # The ``prepare`` phase rejects a request by its content, on every rank alike.
@@ -1077,6 +1084,10 @@ class CollectivePipeline(CountingPipeline):
     def _collective(self, phase):
         # ``<phase>_parked``: the failing rank raises as in ``<phase>``; the other
         # stays alive outside any collective, so only the coordinator ends it.
+        if self.fail_phase == f"{phase}_all" and phase not in self.failed_once:
+            self.failed_once.add(phase)  # the first session's call fails on every rank
+            self.events.append(f"raise:{phase}")
+            raise ValueError(f"{phase} refused by every rank")
         parked = self.fail_phase == f"{phase}_parked"
         if self.rank == self.fail_rank and (parked or self.fail_phase == phase):
             self.events.append(f"raise:{phase}")
@@ -1137,9 +1148,9 @@ def _instrument(ex, events, published=None):
 
         ex.response_queue.put = _put
 
-    def _finalize(outcome):
+    def _finalize(*args):
         events.append("status")
-        return finalize(outcome)
+        return finalize(*args)
 
     def _send(tag, payload=None):
         events.append("tag:" + tag.value)
@@ -1194,9 +1205,12 @@ def _run_rank(
     ex = _make_executor(pipe, rank=rank, world_size=2, in_client_process=in_client_process)
     _instrument(ex, events, published)
     holder["executor"] = ex
-    if fail_phase == "prepare":
-        # A request every rank rejects in preparation, then a session that runs
-        # one advance and is closed by its client.
+    if fail_phase in ("prepare", "open_all", "advance_all"):
+        # A session every rank fails alike (rejected in preparation, or its open
+        # or first advance raising), then a session that runs one advance and is
+        # closed by its client.
+        if rank == 0 and fail_phase == "advance_all":
+            ex.requests_ipc.put_nowait(SessionSubmit.pack(1, "controls", 1))
         ex._serve_session(
             DiffusionRequest(request_id=1, prompt=["rejected"], params=SimpleNamespace())
         )
@@ -1224,6 +1238,7 @@ def _child_main(argv):
         pass
     _wait_for(events_path + ".go")
     events = _EventLog(events_path)
+    executor_module.RANK_AGREEMENT_TIMEOUT = AGREEMENT_TIMEOUT_S
     published = _EventLog(events_path + ".published")
     _run_rank(
         int(rank),
@@ -1397,11 +1412,14 @@ def _published(ex):
     return out
 
 
-@pytest.mark.parametrize("fail_phase", ["open", "advance", "open_event", "advance_event"])
+@pytest.mark.parametrize("fail_phase", ["open", "advance"])
 @pytest.mark.parametrize("fail_rank", [0, 1])
-def test_rank_local_exception_is_fatal_not_a_hung_collective(start_rank, fail_rank, fail_phase):
+def test_rank_that_fails_alone_ends_instead_of_hanging_in_a_collective(
+    start_rank, fail_rank, fail_phase
+):
     """Both ranks as processes of their own, as under an external launcher, where
-    nothing but a rank's own exit ends it."""
+    nothing but a rank's own exit ends it. One raises before the pipeline's
+    collective, which the other is then inside."""
     port = _free_port()
     ranks = [start_rank(rank, port, fail_rank, fail_phase, COLLECTIVE_TIMEOUT_S) for rank in (0, 1)]
     for proc in ranks:
@@ -1414,27 +1432,108 @@ def test_rank_local_exception_is_fatal_not_a_hung_collective(start_rank, fail_ra
         assert proc.exitcode == 1, proc.stderr()
     failing, surviving = ranks[fail_rank], ranks[1 - fail_rank]
 
-    # The failing rank entered no further collective after raising ...
-    assert f"raise:{fail_phase}" in _names(failing.events())
-    assert _after(failing.events(), f"raise:{fail_phase}") == []
-    # ... and left well inside the collective timeout, so it waited in none.
+    # The failing rank reported at the status all-reduce and entered nothing else ...
+    assert _after(failing.events(), f"raise:{fail_phase}") == ["status"]
+    # ... and gave up at the agreement timeout, not at the collective's.
     raise_ts = next(ts for ts, n in failing.events() if n == f"raise:{fail_phase}")
-    assert failing.exited_at - raise_ts < COLLECTIVE_TIMEOUT_S * 0.75
+    waited = failing.exited_at - raise_ts
+    assert AGREEMENT_TIMEOUT_S * 0.9 < waited < COLLECTIVE_TIMEOUT_S * 0.75, waited
 
-    # The surviving rank was inside a collective (the pipeline's, or the status
-    # barrier after an event failure), got the timeout there and took the same
-    # fatal path: nothing after it, in particular no CLOSE.
-    base = fail_phase.removesuffix("_event")
-    last = "status" if fail_phase.endswith("_event") else f"enter:{base}"
-    assert _names(surviving.events())[-1] == last, _names(surviving.events())
+    # The other rank was inside the pipeline's collective, got the timeout there,
+    # found nobody at the status all-reduce and ended too: no CLOSE either.
+    assert _after(surviving.events(), f"enter:{fail_phase}") == ["status"]
     assert "tag:close" not in _names(surviving.events())
 
     # Nothing coordinated was published by rank 0: no SessionClosed, no terminal.
     published = ranks[0].published()
     assert "SessionClosed" not in published
     assert f"SessionResultMessage:{ResultType.TERMINAL.value}" not in published
-    if fail_phase.startswith("advance"):
+    if fail_phase == "advance":
         assert "SessionOpened" in published
+
+
+@pytest.mark.parametrize("fail_phase", ["open_event", "advance_event"])
+@pytest.mark.parametrize("fail_rank", [0, 1])
+def test_device_error_on_one_rank_ends_the_session_on_both(start_rank, fail_rank, fail_phase):
+    """One rank's device work fails at the completion event, after the pipeline's
+    collective: both ranks are at the status all-reduce, agree that the step
+    failed, and neither process ends over it."""
+    port = _free_port()
+    ranks = [start_rank(rank, port, fail_rank, fail_phase, COLLECTIVE_TIMEOUT_S) for rank in (0, 1)]
+    for proc in ranks:
+        proc.ready()
+    for proc in ranks:
+        proc.go()
+    for proc in ranks:
+        proc.join(timeout=120)
+        assert not proc.is_alive(), "a rank hung"
+        assert proc.exitcode == 0, proc.stderr()
+        assert _names(proc.events())[-1] == "returned"
+
+    published = ranks[0].published()
+    if fail_phase == "open_event":
+        assert published == ["SessionOpened"]  # the refusal; no session ever existed
+        assert "tag:close" not in _names(ranks[0].events())
+    else:
+        terminal = f"SessionResultMessage:{ResultType.TERMINAL.value}"
+        assert published == ["SessionOpened", "SessionAdmitted", terminal, "SessionClosed"]
+        assert "tag:close" in _names(ranks[0].events())
+
+
+@pytest.mark.parametrize("fail_phase", ["open_all", "advance_all"])
+def test_call_that_fails_on_every_rank_ends_that_session_only(start_rank, fail_phase):
+    """Rank 0 as a thread in this process, rank 1 as a dedicated process. The
+    first session's open (or first advance) raises on both; the open is refused
+    (or the session ends with the error) and the same two ranks then serve a
+    session."""
+    port = _free_port()
+    child = start_rank(1, port, -1, fail_phase, COLLECTIVE_TIMEOUT_S)
+    child.ready()
+    outcome = {}
+
+    def rank0():
+        child.go()
+        try:
+            _run_rank(0, port, -1, fail_phase, _EventLog(), True, outcome, COLLECTIVE_TIMEOUT_S)
+        except BaseException as exc:  # noqa: BLE001
+            outcome["error"] = exc
+
+    t = threading.Thread(target=rank0, daemon=True)
+    t.start()
+    try:
+        t.join(timeout=120)
+        assert not t.is_alive(), "rank 0 hung"
+        child.join(timeout=60)
+        assert not child.is_alive(), "rank 1 hung"
+    finally:
+        if child.is_alive():
+            child.kill()
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+    assert "error" not in outcome, outcome
+    assert child.exitcode == 0, child.stderr()
+    served = _after(child.events(), "refused")
+    assert "leave:open" in served and "leave:advance" in served, served
+    assert _names(child.events())[-1] == "returned"
+
+    published = _published(outcome["executor"])
+    phase = fail_phase.removesuffix("_all")
+    first = next(m for m in published if isinstance(m, SessionOpened) and m.session_id == 1)
+    if phase == "open":
+        assert f"{phase} refused by every rank" in first.error
+    else:
+        assert first.error is None
+        terminal = next(
+            m
+            for m in published
+            if isinstance(m, SessionResultMessage) and m.type is ResultType.TERMINAL
+        )
+        assert terminal.session_id == 1 and f"{phase} refused by every rank" in terminal.error
+        assert any(isinstance(m, SessionClosed) and m.session_id == 1 for m in published)
+    opened = next(m for m in published if isinstance(m, SessionOpened) and m.session_id == 2)
+    assert opened.error is None
+    assert any(isinstance(m, SessionClosed) and m.session_id == 2 for m in published)
 
 
 def test_request_rejected_in_preparation_on_every_rank_leaves_the_group_in_step(start_rank):

@@ -693,7 +693,9 @@ class BasePipeline(nn.Module):
         the views put into it and its ``event`` covers this rank's work, state and
         slot alike, so a rank given no slot still returns one. Slot writes follow
         the rule ``advance`` states. If opening fails, release partial allocations
-        and raise.
+        and raise: the open is refused with that error and the model instance goes
+        on serving. The rule for raising with several ranks is the one ``advance``
+        states.
         """
         raise NotImplementedError(f"{type(self).__name__} does not support sessions")
 
@@ -716,7 +718,12 @@ class BasePipeline(nn.Module):
         slot writes on the CUDA stream that is current when this is called: that
         stream is the one made to wait for the client's reads of the slot's
         previous result. Advances never overlap; a non-final advance must write
-        at least one stream."""
+        at least one stream.
+
+        Raising ends the session with that error and the model instance goes on
+        serving. With several ranks, raise on every rank alike or outside any
+        collective with the other ranks: a rank that raises alone while the others
+        wait for it inside a collective ends the model instance."""
         raise NotImplementedError(f"{type(self).__name__} does not support sessions")
 
     def close_session(self, state: object) -> None:

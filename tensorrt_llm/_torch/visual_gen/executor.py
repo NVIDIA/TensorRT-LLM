@@ -15,7 +15,7 @@ import weakref
 from collections import OrderedDict, deque
 from concurrent.futures import Future, InvalidStateError
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import (
     TYPE_CHECKING,
@@ -89,6 +89,8 @@ AWAIT_TIMEOUT = 0.05
 THREAD_TIMEOUT = 5.0
 WORKER_TIMEOUT = 2.0
 EXT_WORKER_TEARDOWN_TIMEOUT = 30.0
+# Seconds a rank whose session step failed waits for its peers to report theirs.
+RANK_AGREEMENT_TIMEOUT = 10.0
 WORKER_SPAWN_SHUTDOWN_TIMEOUT = 5.0
 
 # Module-local seams keep lifecycle tests from monkeypatching process-wide
@@ -550,6 +552,9 @@ class DiffusionExecutor:
         self.response_queue = queue.Queue()
         self.sender_thread = None
         self.session_config = getattr(visual_gen_args, "session_config", None)
+        # The process group of the session steps' status all-reduce; made at the
+        # first session, so no collective a pipeline runs can pair up with it.
+        self._status_group = None
         self.memory_monitor = WorkerMemoryMonitor(device_id, self.rank, self.world_size)
 
         # Only rank 0 handles IPC
@@ -950,27 +955,24 @@ class DiffusionExecutor:
     ) -> Tuple[Any, AdvanceResult]:
         """The pipeline's part of opening, on every rank: its open call, then the
         completion barrier. Returns the pipeline state and the open's outcome.
-        Raises what the pipeline
-        raised, or ``RuntimeError`` when another rank failed; either way nothing
-        stays open on this rank. With peers a failure here ends this rank
-        instead (``_fail_rank``)."""
+        Raises what the pipeline raised, or ``RuntimeError`` when only another
+        rank failed; either way every rank refuses the open and nothing stays
+        open on this rank."""
         what = f"session {req.request_id} open"
         pipeline_state, outcome, error = None, None, None
         try:
             with torch.inference_mode():
                 pipeline_state, outcome = self.pipeline.open_session(req, slot)
         except Exception as e:
-            self._fail_rank(what, e)
             logger.error(f"Worker {self.device_id}: {what} failed: {e}")
             logger.error(traceback.format_exc())
             error = e
-        if self._finalize_advance(outcome):
+        error = self._finalize_advance(outcome, error, what)
+        if error is None:
             return pipeline_state, outcome
         if pipeline_state is not None:
             self._close_pipeline(pipeline_state, what)
-        if error is not None:
-            raise error
-        raise RuntimeError(f"{what} failed on another rank")
+        raise error
 
     def _advance_pipeline(
         self,
@@ -981,22 +983,20 @@ class DiffusionExecutor:
     ) -> AdvanceResult:
         """The pipeline's part of one step, on every rank: its advance call, then
         the completion barrier. Raises what the pipeline raised, or
-        ``RuntimeError`` when another rank failed. With peers a failure here ends
-        this rank instead (``_fail_rank``)."""
+        ``RuntimeError`` when only another rank failed; either way every rank
+        knows the step failed."""
         outcome, error = None, None
         try:
             with torch.inference_mode():
                 outcome = self.pipeline.advance(pipeline_state, inputs, slot)
         except Exception as e:
-            self._fail_rank(what, e)
             logger.error(f"Worker {self.device_id}: {what} failed: {e}")
             logger.error(traceback.format_exc())
             error = e
-        if self._finalize_advance(outcome):
+        error = self._finalize_advance(outcome, error, what)
+        if error is None:
             return outcome
-        if error is not None:
-            raise error
-        raise RuntimeError(f"{what} failed on another rank")
+        raise error
 
     def _close_pipeline(self, pipeline_state: Any, what: str) -> None:
         """The pipeline's close on this rank; a failure is logged, nothing else."""
@@ -1006,32 +1006,47 @@ class DiffusionExecutor:
         except Exception as e:
             logger.error(f"Worker {self.device_id}: {what}: close failed: {e}")
 
-    def _finalize_advance(self, outcome: Optional[AdvanceResult]) -> bool:
+    def _finalize_advance(
+        self, outcome: Optional[AdvanceResult], error: Optional[Exception], what: str
+    ) -> Optional[Exception]:
         """Wait for this rank's writes, then agree with every rank whether the
-        advance succeeded; ``None`` is this rank's pipeline call having raised.
-        Returns whether every rank succeeded. With several ranks a failed rank
-        never gets here (see ``_fail_rank``), so the all-reduce is the
-        completion barrier every rank passes together."""
-        failed = outcome is None
-        try:
-            if outcome is not None and outcome.event is not None:
+        step succeeded. ``error`` is what this rank's pipeline call raised, if it
+        raised. Returns ``None`` when every rank succeeded; otherwise this rank's
+        own failure, or ``RuntimeError`` when only another rank failed.
+
+        A rank that failed waits for its peers no longer than
+        ``RANK_AGREEMENT_TIMEOUT``: peers that failed the same way are already
+        there, peers blocked in a collective this rank left never come. Without
+        an agreement this rank ends (``_fail_rank``)."""
+        if error is None and outcome is not None and outcome.event is not None:
+            try:
                 outcome.event.synchronize()
-            if self.world_size == 1:
-                return not failed
-            status = torch.tensor([1 if failed else 0], dtype=torch.int32)
-            dist.all_reduce(status)
-            return int(status.item()) == 0
+            except Exception as e:
+                logger.error(f"Worker {self.device_id}: {what}: device work failed: {e}")
+                logger.error(traceback.format_exc())
+                error = e
+        if self.world_size == 1:
+            return error
+        status = torch.tensor([0 if error is None else 1], dtype=torch.int32)
+        try:
+            if error is not None:
+                dist.set_timeout(timedelta(seconds=RANK_AGREEMENT_TIMEOUT), self._status_group)
+            dist.all_reduce(status, group=self._status_group)
+            if error is not None:
+                dist.set_timeout(default_pg_timeout, self._status_group)
         except Exception as e:
-            # An asynchronous device error surfacing at the event, or the barrier
-            # itself failing: peers may be inside it, so this is rank-local.
-            self._fail_rank("completion barrier", e)
+            self._fail_rank(f"{what}: no agreement with the other ranks", e)
             raise
+        if error is None and int(status.item()) != 0:
+            return RuntimeError(f"{what} failed on another rank")
+        return error
 
     def _fail_rank(self, what: str, exc: BaseException) -> None:
-        """A pipeline call raised on this rank while peers may be inside a
-        collective, so no further collective (status, CLOSE) can be trusted to
-        complete. End this rank's process with status 1 without touching the
-        process group. A worker the client spawned is seen dead by the client,
+        """This rank is out of step with its peers: they did not agree on a
+        session step's outcome, a tag broadcast failed, or this rank cannot follow
+        what rank 0 is about to do. No further collective (status, CLOSE) can be
+        trusted to complete, so end this rank's process with status 1 without
+        touching the process group. A worker the client spawned is seen dead by the client,
         which kills the other workers and raises the failure to its callers.
         Under an external launcher every rank ends this way, rank 0 with the
         application it shares a process with: the client has no handle on the
@@ -1049,6 +1064,9 @@ class DiffusionExecutor:
     def _serve_session(self, req: DiffusionRequest) -> _SessionExit:
         """Serve one session to its end on this rank and say why it ended. A
         follower ends with the leader's CLOSE broadcast, whatever the reason."""
+        if self.world_size > 1 and self._status_group is None:
+            # Every rank is here together, straight from the request broadcast.
+            self._status_group = dist.new_group(backend="gloo")
         if self.rank == 0:
             return self._session_leader(req)
         self._session_follower(req)
@@ -1423,7 +1441,7 @@ class DiffusionExecutor:
         try:
             pipeline_state, _ = self._open_pipeline(req, None)
         except Exception:
-            return  # rank 0's open failed; this rank's own would have ended it
+            return  # some rank's open failed: every rank refused it, rank 0 answers
         while True:
             tag, inputs = self._recv_tag()
             if tag is _RankTag.CLOSE:
@@ -1433,7 +1451,7 @@ class DiffusionExecutor:
             try:
                 self._advance_pipeline(pipeline_state, inputs, None, "session advance")
             except Exception:
-                continue  # rank 0 reports it; keep following its tags
+                continue  # some rank's step failed; rank 0 reports it and sends CLOSE
         self._close_pipeline(pipeline_state, "session")
 
 
