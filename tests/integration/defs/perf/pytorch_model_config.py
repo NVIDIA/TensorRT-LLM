@@ -63,14 +63,7 @@ PERF_CONFIG_PRESETS = _CURATED_PRESETS | {'reuse', 'noreuse', 'mtp3'}
 def _load_curated_config(name: str) -> dict:
     path = Path(get_llm_root()) / 'examples/configs/curated' / name
     with path.open() as stream:
-        config = yaml.safe_load(stream)
-    # The test case supplies the topology, capacity and KV memory budget.
-    for field in ('tensor_parallel_size', 'pipeline_parallel_size',
-                  'moe_expert_parallel_size', 'max_batch_size',
-                  'max_num_tokens'):
-        config.pop(field, None)
-    config.get('kv_cache_config', {}).pop('free_gpu_memory_fraction', None)
-    return config
+        return yaml.safe_load(stream)
 
 
 @cache

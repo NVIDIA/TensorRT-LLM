@@ -85,13 +85,11 @@ if self._config.streaming == "streaming":
     benchmark_cmd += [f"--streaming"]
 ```
 
-#### PyTorch Default Configuration
+#### PyTorch Launch Configuration
 ```python
-# Use default YAML configuration
 if self._config.backend == "pytorch":
     import yaml
-    config = get_model_yaml_config(self._config.to_string(),
-                                   lora_dirs=self.lora_dirs)
+    config = self._get_model_yaml_config()
     print_info(f"pytorch model config: {config}")
     with open('config.yml', 'w') as f:
         yaml.dump(config, f, default_flow_style=False)
@@ -128,9 +126,12 @@ Qwen3.8 Flash-Next cases share `qwen3.8-flash-next.yaml`. The TEP4 serve cases s
 `cuda_graph_config.max_batch_size=128` for their larger CUDA graphs. The Spark streaming
 benchmarks inherit MTP from the same recipe and select their MoE backend with
 `moe_config.backend` in the `cfg:` suffix.
-The test case supplies TP, PP, EP, maximum batch size, token budget and KV memory fraction.
-For example, with `minimax-m3-throughput.yaml`, a case using `maxnt:4096` passes
-`--max_num_tokens=4096` to bench. Omitting `maxnt` uses the harness default of 2048.
+Explicit test-name options override the selected YAML. An omitted option inherits its
+YAML value and falls back to the code default when the YAML also omits it. This includes
+`maxbs`, `maxnt`, `tp`, `pp`, `ep` and `kv_frac` for both bench and serve.
+With `minimax-m3-throughput.yaml`, for example, `maxnt:4096` launches with 4096 tokens
+and omitting `maxnt` launches with the recipe's 8192. Database names keep the historical
+case prefix, which can include a default such as `maxnt:2048` even when the recipe supplies 8192.
 Combine presets left to right, for example `-cfg:deepseek-v4-pro-throughput.yaml+mtp3`.
 
 Use `cfg:field=value` for a case-specific setting, for example the two Qwen3 235B
