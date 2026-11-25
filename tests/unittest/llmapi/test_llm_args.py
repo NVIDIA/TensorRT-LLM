@@ -219,9 +219,10 @@ def test_wide_ep_fault_tolerance_rejects_adp_router_option(option: str) -> None:
         TorchLlmArgs(model=llama_model_path,
                      **_FAULT_TOLERANT_ARGS,
                      attention_dp_config={option: True})
-    assert (f"the default attention-DP router "
-            f"(attention_dp_config.{option}=False, not True)"
-            in str(error.value))
+    assert ("the default attention-DP routing and admission (no "
+            "enable_kv_balanced_admission, enable_kv_cache_aware_routing or "
+            "kv_cache_routing_conversation_affinity in attention_dp_config, "
+            f"which sets {option})" in str(error.value))
     # Without fault tolerance the option stays valid.
     TorchLlmArgs(model=llama_model_path,
                  enable_attention_dp=True,
