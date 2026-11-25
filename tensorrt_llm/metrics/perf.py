@@ -175,6 +175,8 @@ class PerfMetricsCollector:
     """
 
     def __init__(self) -> None:
+        # Called with each new rank snapshot, right after the source read it.
+        self.rank_listener: Callable[[Mapping[MetricKey, MetricValue]], None] | None = None
         self.reset()
 
     def reset(self) -> None:
@@ -209,6 +211,8 @@ class PerfMetricsCollector:
         self.latest_rank = _freeze_fields(
             {**stats, "captureIter": capture_iter, "captureTime": time.time()}
         )
+        if self.rank_listener is not None:
+            self.rank_listener(self.latest_rank)
         return PerfMetricsRecord("rank", per_rank=self.latest_rank)
 
     def collect_loop(
