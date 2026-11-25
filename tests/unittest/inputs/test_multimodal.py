@@ -277,17 +277,26 @@ def test_processor_can_decline_item_encoding_for_a_request():
     )
 
 
-def test_processor_rejects_undeclared_field_even_for_one_item():
+@pytest.mark.parametrize(
+    ("partitions", "error"),
+    [
+        ({}, ValueError),
+        ({"sizes": MultimodalItemPartition(item_axis=False)}, TypeError),
+        ({"sizes": MultimodalItemPartition(item_axis=True)}, TypeError),
+        ({"sizes": MultimodalItemPartition(item_axis=1, item_lengths=(True,))}, ValueError),
+    ],
+)
+def test_processor_rejects_invalid_field_partition_even_for_one_item(partitions, error):
     class Processor(_ItemMetadataFakeProcessor):
         def __call__(self, inputs, sampling_params):
             ids, extra = super().__call__(inputs, sampling_params)
-            extra["multimodal_data"]["image"]["sizes"] = [(1, 1)]
+            extra["multimodal_data"]["image"]["sizes"] = torch.ones(1, 1)
             return ids, extra
 
         def get_mm_input_partitions(self, processed):
-            return {"image": {}}
+            return {"image": partitions}
 
-    with pytest.raises(ValueError, match="image.*sizes"):
+    with pytest.raises(error, match="image.*sizes"):
         create_input_processor_with_hash(Processor([2]))({"prompt": "unused"}, None)
 
 

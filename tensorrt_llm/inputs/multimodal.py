@@ -214,7 +214,7 @@ class MultimodalItemMetadata:
             if modality not in indices_by_modality:
                 raise ValueError(
                     "Input partitions must refer to a present modality")
-            for partition in partitions.values():
+            for name, partition in partitions.items():
                 if not isinstance(partition, MultimodalItemPartition):
                     raise TypeError(
                         "Input partitions must be MultimodalItemPartition records"
@@ -223,10 +223,11 @@ class MultimodalItemMetadata:
                     if (partition.item_axis is None
                             or len(partition.item_lengths) != len(
                                 indices_by_modality[modality])
-                            or any(not isinstance(n, int) or n < 0
+                            or any(not isinstance(n, int)
+                                   or isinstance(n, bool) or n < 0
                                    for n in partition.item_lengths)):
                         raise ValueError(
-                            "Packed input lengths must align with modality items"
+                            f"Packed input lengths must align with modality items for {modality}.{name}"
                         )
 
     def select(self, item_indices: Sequence[int]) -> "MultimodalItemMetadata":

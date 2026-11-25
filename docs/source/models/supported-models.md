@@ -262,22 +262,21 @@ mutually exclusive.
   stored per multimodal item. Set `multimodal_config.encoder_cache_max_bytes` to its capacity (for
   example, `"512MiB"`), or `0` to disable cross-request reuse. The capacity applies per rank; ranks
   do not share a cache.
-  - On the inline encoder path, a request whose items all hit the cache skips the encoder, and a
-    partially cached request encodes only its missing items. Mixed-modality requests are cached
+  - On the inline encoder path, a request whose items all hit the cache skips the encoder. A
+    partial hit encodes only the missing items when the model can select them independently.
+    Otherwise, the encoder processes the full request. Mixed-modality requests are cached
     per item. When combined with side-stream prefetch, peak memory is the cache capacity plus any
     in-flight prefetched encoder inputs and outputs.
-  - Models with item-level encoder scheduling use the item path unless
-    `multimodal_config.encoder_scheduling_policy` is `DISABLED`. Cached items are reused before
+  - On the item scheduling path, cached items are reused before
     encoder work is selected, so they use none of the per-iteration encoder item or token budget.
     Only missing items are encoded, mixed-modality requests are cached per item, and newly encoded
     items populate the cache for later requests. With KV cache manager V2, items covered by confirmed
     KV reuse are not encoded. With chunked prefill, each chunk waits only for its required items
     and releases encoder outputs after use. KV cache manager V1 keeps whole-request encoder
     scheduling. The cache is never smaller than the output of one encoder iteration, even when
-    `encoder_cache_max_bytes` is `0`. Item scheduling does not
-    support side-stream prefetch or pipeline parallelism yet. With `pipeline_parallel_size > 1`,
-    the `DEFAULT` policy, explicit or unset, logs a warning and falls back to the inline path, and
-    the `EAGER` policy raises an error.
+    `encoder_cache_max_bytes` is `0`. With side-stream prefetch or `pipeline_parallel_size > 1`,
+    the `DEFAULT` scheduling policy logs a warning and falls back to inline encoding. `EAGER`
+    rejects either combination. `DISABLED` selects inline encoding directly.
 
 # Visual Generation Models
 

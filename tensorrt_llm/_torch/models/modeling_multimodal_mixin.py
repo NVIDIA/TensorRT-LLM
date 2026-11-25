@@ -64,6 +64,10 @@ class MultimodalEncoderContractError(ValueError):
     """A request-local MM encoder input or output contract violation."""
 
 
+class _MissingItemPartition(MultimodalEncoderContractError):
+    """A raw input has no declaration for per-item selection."""
+
+
 def _assemble_multimodal_encoder_embeddings(
     item_tensors: Dict[int, torch.Tensor], total_items: int
 ) -> torch.Tensor:
@@ -914,8 +918,16 @@ class MultimodalModelMixin:
             )
         item_partitions = self.get_multimodal_item_partitions(param, modality)
         if item_partitions is None:
-            raise ValueError(f"Missing input partitions for {modality}")
-        sliced = select_multimodal_fields(modality_data, item_partitions, local_item_indices)
+            raise _MissingItemPartition(f"Missing input partitions for {modality}")
+        try:
+            sliced = select_multimodal_fields(modality_data, item_partitions, local_item_indices)
+        except KeyError as error:
+            missing = modality_data.keys() - item_partitions.keys()
+            if not missing:
+                raise
+            raise _MissingItemPartition(
+                f"Missing input partitions for {modality}: {sorted(missing)}"
+            ) from error
 
         # Metadata slicing must not rewrite the original request's hashes.
         residual_input = (
@@ -1036,7 +1048,7 @@ class MultimodalModelMixin:
         if partial_hits:
             # `encoder_cache` is non-None here because partitions are only produced when the cache
             # exists.
-            self._encode_with_partial_cache(partial_hits, encoder_cache)
+            cache_misses.extend(self._encode_with_partial_cache(partial_hits, encoder_cache))
 
         embeddings = get_multimodal_embeddings(
             encoder_forward_fn=self._run_multimodal_encoder,
@@ -1275,22 +1287,6 @@ class MultimodalModelMixin:
             else:
                 hits[i] = cached
 
-        if (
-            hits
-            and miss_indices
-            and cls.build_multimodal_encoder_input
-            is MultimodalModelMixin.build_multimodal_encoder_input
-            and cls.get_multimodal_item_partitions
-            is MultimodalModelMixin.get_multimodal_item_partitions
-        ):
-            # A cache-only model can reuse a complete hit even when its processor
-            # has no declaration for slicing the missing inputs.
-            metadata = param.item_metadata
-            if metadata is None or any(
-                metadata.item_refs[i][0] not in metadata.input_partitions for i in miss_indices
-            ):
-                return None
-
         logger.debug(
             f"{_MM_ENCODER_CACHE_LOG_NAME}: partition hit_items={len(hits)}, "
             f"miss_items={len(miss_indices)}, looked_up={len(looked_up)}, "
@@ -1331,37 +1327,36 @@ class MultimodalModelMixin:
         self,
         partials: Sequence[tuple[MultimodalParams, EncoderCachePartition]],
         encoder_cache: TensorLRUCache,
-    ) -> None:
-        """Encode only the miss items of each partial-hit param and stitch results.
-
-        Miss residuals from all partial-hit params in the batch are encoded in a
-        single call and the concatenated output is split back per param, mirroring
-        how `get_multimodal_embeddings` batches full-miss params. After this returns,
-        each param's `multimodal_embedding` has the same shape as a full encoder run
-        so downstream `get_multimodal_embeddings` treats it as fully cached.
-        """
-        if not partials:
-            return
-
-        # Cross-iter prefetch may have staged some params' raw MM tensors on the aux
-        # stream. If a prefetch encoder call then raised, the request reaches this
-        # iteration with an `encoder_event` but no `multimodal_embedding`; slicing
-        # those tensors on the main stream before the event would race the aux-stream
-        # H2D copy. Wait per param up front, before any raw-tensor read.
-        for param, _ in partials:
+    ) -> list[MultimodalParams]:
+        """Stitch cached and newly encoded items, returning requests that need a full encode."""
+        encoder_inputs = []
+        selected_partials = []
+        full_misses = []
+        for param, partition in partials:
+            # A failed prefetch can leave raw tensors whose H2D copy is still pending.
             if param.encoder_event is not None:
                 torch.cuda.current_stream().wait_event(param.encoder_event)
+            try:
+                encoder_inputs.extend(
+                    self.prepare_multimodal_encoder_inputs(
+                        [(param, i) for i in partition.miss_indices]
+                    )
+                )
+            except _MissingItemPartition:
+                # Older cacheable requests can lack a declaration for a missing input.
+                full_misses.append(param)
+                continue
+            selected_partials.append((param, partition))
+        if not selected_partials:
+            return full_misses
 
-        encoder_inputs = self.prepare_multimodal_encoder_inputs(
-            [(param, i) for param, partition in partials for i in partition.miss_indices]
-        )
         # Keep one call across requests and modalities so EncoderGroup can
         # batch modalities that share an encoder.
         batched_output = self._run_multimodal_encoder([param for param, _, _ in encoder_inputs])
         output_lengths = [length for _, lengths, _ in encoder_inputs for length in lengths]
         encoded_items = iter(torch.split(batched_output, output_lengths, dim=0))
 
-        for param, partition in partials:
+        for param, partition in selected_partials:
             miss_tensors = [next(encoded_items) for _ in partition.miss_indices]
 
             by_item: Dict[int, torch.Tensor] = dict(partition.hits)
@@ -1386,6 +1381,8 @@ class MultimodalModelMixin:
                 f"cache_writes_inserted={inserted} "
                 f"cache_writes_rejected={rejected}"
             )
+
+        return full_misses
 
     @classmethod
     def _write_encoder_cache_entries(
@@ -1654,7 +1651,9 @@ def _dispatch_cross_iter_prefetch(
             # next iteration, so keep a clone rather than a view of a released window.
             with discard_nccl_window_tensor_outputs(params_to_transfer):
                 if partial_hits and encoder_cache is not None:
-                    model._encode_with_partial_cache(partial_hits, encoder_cache)
+                    cache_misses.extend(
+                        model._encode_with_partial_cache(partial_hits, encoder_cache)
+                    )
                 if cache_misses:
                     encoder_output = model._run_multimodal_encoder(cache_misses).clone()
                     _store_chunked_prefill_embeddings(cache_misses, [encoder_output])

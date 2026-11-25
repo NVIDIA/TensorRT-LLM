@@ -14,6 +14,8 @@ import transformers
 import transformers.models.mistral3
 from _torch.helpers import create_mock_cuda_graph_runner
 from PIL import Image
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
 from utils.util import getSMVersion
 
 import tensorrt_llm
@@ -30,6 +32,7 @@ from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
 from tensorrt_llm._torch.pyexecutor import resource_manager
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
 from tensorrt_llm.bindings import executor as executor_lib
+from tensorrt_llm.inputs import create_input_processor_with_hash
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.models import modeling_utils
 
@@ -738,6 +741,36 @@ def _make_text_only_native_processor() -> MistralNativeInputProcessor:
     instance = MistralNativeInputProcessor.__new__(MistralNativeInputProcessor)
     instance._config = SimpleNamespace()
     return instance
+
+
+@pytest.mark.cpu_only
+def test_hf_pixtral_keeps_prompt_token_types_out_of_encoder_inputs(mistral_small_3_1_24b_config):
+    tokens = ["[UNK]", "[IMG]", "[IMG_BREAK]", "[IMG_END]"]
+    tokenizer = transformers.PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(
+            WordLevel({t: i for i, t in enumerate(tokens)}, unk_token="[UNK]")
+        ),
+        unk_token="[UNK]",
+        additional_special_tokens=tokens[1:],
+        return_mm_token_type_ids=True,
+    )
+    hf = transformers.PixtralProcessor(
+        image_processor=transformers.PixtralImageProcessor(do_resize=False),
+        tokenizer=tokenizer,
+        patch_size=_PATCH_SIZE,
+        spatial_merge_size=2,
+    )
+    images = [Image.new("RGB", (56, 56))]
+    assert "mm_token_type_ids" in hf(text="[IMG]", images=images)
+    config = transformers.Mistral3Config.from_dict(mistral_small_3_1_24b_config)
+    with mock.patch.object(transformers.AutoProcessor, "from_pretrained", return_value=hf):
+        processor = MistralHFInputProcessor("unused", config, tokenizer)
+    _, extra = create_input_processor_with_hash(processor)(
+        {"prompt": "[IMG]", "multi_modal_data": {"image": images}}, None
+    )
+    param = MultimodalParams(multimodal_data=extra["multimodal_data"])
+    assert set(param.multimodal_data["image"]) == {"pixel_values", "image_sizes"}
+    assert param.item_metadata.encoder_token_lengths == (16,)
 
 
 def test_dummy_mm_max_tokens_per_item_is_image_only():

@@ -496,23 +496,10 @@ def test_eager_compatibility_is_checked_only_for_item_scheduled_models() -> None
         validate_mm_encoder_scheduling_compatibility(args, item_scheduling_enabled=True)
 
 
-def test_side_stream_compatibility_is_checked_only_for_item_scheduled_models() -> None:
-    args = SimpleNamespace(
-        multimodal_config=SimpleNamespace(
-            encoder_scheduling_policy=MultimodalEncoderSchedulingPolicy.DEFAULT,
-            encoder_side_stream_max_ahead=1,
-        ),
-        pipeline_parallel_size=1,
-        enable_attention_dp=False,
-        cache_transceiver_config=None,
-    )
-
-    validate_mm_encoder_scheduling_compatibility(args, item_scheduling_enabled=False)
-
-    with pytest.raises(ValueError, match="side-stream prefetch"):
-        validate_mm_encoder_scheduling_compatibility(args, item_scheduling_enabled=True)
-
-
+@pytest.mark.parametrize(
+    ("pp_size", "prefetch_ahead", "reason"),
+    [(2, 0, "pipeline parallelism"), (1, 1, "side-stream prefetch")],
+)
 @pytest.mark.parametrize(
     ("mm_config_kwargs", "falls_back"),
     [
@@ -522,12 +509,14 @@ def test_side_stream_compatibility_is_checked_only_for_item_scheduled_models() -
     ],
     ids=["unset", "explicit-default", "explicit-eager"],
 )
-def test_pipeline_parallel_compatibility_is_checked_only_for_item_scheduled_models(
-    mm_config_kwargs: dict, falls_back: bool
+def test_item_scheduling_fallback_for_incompatible_execution_mode(
+    mm_config_kwargs: dict, falls_back: bool, pp_size: int, prefetch_ahead: int, reason: str
 ) -> None:
     args = SimpleNamespace(
-        multimodal_config=MultimodalConfig(**mm_config_kwargs),
-        pipeline_parallel_size=2,
+        multimodal_config=MultimodalConfig(
+            encoder_side_stream_max_ahead=prefetch_ahead, **mm_config_kwargs
+        ),
+        pipeline_parallel_size=pp_size,
         disable_mm_encoder=False,
         enable_attention_dp=False,
         cache_transceiver_config=None,
@@ -535,7 +524,7 @@ def test_pipeline_parallel_compatibility_is_checked_only_for_item_scheduled_mode
 
     validate_mm_encoder_scheduling_compatibility(args, item_scheduling_enabled=False)
 
-    with pytest.raises(ValueError, match="pipeline parallelism"):
+    with pytest.raises(ValueError, match=reason):
         validate_mm_encoder_scheduling_compatibility(args, item_scheduling_enabled=True)
 
     from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLInputProcessorBase
@@ -557,7 +546,7 @@ def test_pipeline_parallel_compatibility_is_checked_only_for_item_scheduled_mode
             assert MultimodalItemScheduler.maybe_create(**create_kwargs) is None
         warning_once.assert_called_once()
     else:
-        with pytest.raises(ValueError, match="pipeline parallelism"):
+        with pytest.raises(ValueError, match=reason):
             MultimodalItemScheduler.maybe_create(**create_kwargs)
 
 

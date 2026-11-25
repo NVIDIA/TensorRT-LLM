@@ -39,6 +39,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfi
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalItemMetadata,
+    MultimodalItemPartition,
     MultimodalParams,
     MultimodalRuntimeData,
 )
@@ -176,6 +177,11 @@ def _make_two_item_cacheable_request(
             MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
                 [("image", i) for i in range(len([tokens_per_item] * len(item_hashes)))],
                 output_embedding_lengths=[tokens_per_item] * len(item_hashes),
+                input_partitions={
+                    "image": dict.fromkeys(
+                        ("pixel_values", "image_sizes"), MultimodalItemPartition()
+                    )
+                },
             ),
             "mm_processor_kwargs_hash": "kwargs-a",
         },

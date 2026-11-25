@@ -730,27 +730,16 @@ class MistralHFInputProcessor(MistralPixtralEncoderContract,
         processed = self.processor(text=prompt,
                                    images=images,
                                    do_rescale=do_rescale)
-        input_ids = processed.pop("input_ids").tolist()[0]
-        # Remaining in `processed`:
-        # * "attention_mask": [B, num_input_tokens]
-        # * "pixel_values": [B, C, H, W]
-        # * "image_sizes": [B, 2]
+        input_ids = processed["input_ids"].tolist()[0]
         extra_processed_inputs = None
         pixel_values = processed.get("pixel_values")
         if pixel_values is not None:
-            # We have no use for the `attention_mask`.
-            processed.pop("attention_mask")
-            # `image_sizes` is a `[B, 2]` tensor indicating the height and width of each image in the
-            # request. If we keep it as a regular tensor, it would get converted to a CUDA tensor before
-            # reaching the model forward. Since its values are used to infer the amount of padding
-            # + slice the patch embeddings, this would incur a D2H copy. We therefore convert it to a
-            # list here to avoid this.
-            processed["image_sizes"] = processed["image_sizes"].tolist()
-            # NOTE: `processed` is a dict-like object, but not actually a dict.
+            # Keep the image sizes on the host for padding and slicing.
             extra_processed_inputs = {
                 "multimodal_data": {
                     "image": {
-                        **processed
+                        "pixel_values": pixel_values,
+                        "image_sizes": processed["image_sizes"].tolist(),
                     }
                 }
             }

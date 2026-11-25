@@ -132,6 +132,11 @@ def _apply_mm_input_partitions(
                 raise TypeError(
                     f"Expected MultimodalItemPartition for {modality}.{name}")
             axis, lengths = partition
+            if axis is not None and (isinstance(axis, bool)
+                                     or not isinstance(axis, int)):
+                raise TypeError(
+                    f"Item axis for {modality}.{name} must be an integer or None"
+                )
             if axis is None or value is None:
                 continue
             if isinstance(value,

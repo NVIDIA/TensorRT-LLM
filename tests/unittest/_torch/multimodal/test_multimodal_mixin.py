@@ -615,8 +615,8 @@ def test_encoder_cache_mixed_attached_and_uncached_requests():
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("declared", [False, True])
-def test_encoder_cache_partial_hit_encodes_miss_and_interleaves(declared):
+@pytest.mark.parametrize("layout", ["complete", "absent", "incomplete", "declined"])
+def test_encoder_cache_partial_hit_encodes_miss_and_interleaves(layout, monkeypatch):
     model = CountingEncoderMultimodalModel(
         make_embedding(hidden_size=4),
         torch.tensor([7]),
@@ -631,15 +631,34 @@ def test_encoder_cache_partial_hit_encodes_miss_and_interleaves(declared):
         embedding_lengths=[2, 2],
     )
 
-    if not declared:
+    if layout == "absent":
         partial.item_metadata.input_partitions.clear()
+    elif layout == "incomplete":
+        del partial.item_metadata.input_partitions["image"]["image_sizes"]
+    elif layout == "declined":
+        stream = MagicMock()
+        monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
+        partial.encoder_event = MagicMock()
+
+        def decline(param, modality):
+            assert param is partial
+            stream.wait_event.assert_called_once_with(param.encoder_event)
+            return None
+
+        monkeypatch.setattr(model, "get_multimodal_item_partitions", decline)
 
     model._get_or_encode_multimodal_embeddings([first])
     with patch("tensorrt_llm._torch.models.modeling_multimodal_mixin.logger.debug") as debug:
         embeddings = model._get_or_encode_multimodal_embeddings([partial])
 
-    if not declared:
+    if layout != "complete":
         torch.testing.assert_close(embeddings, torch.full((4, 4), 2.0))
+        # A subsequent complete hit can still reuse the recomputed entries.
+        partial.multimodal_data.pop("multimodal_embedding")
+        torch.testing.assert_close(
+            model._get_or_encode_multimodal_embeddings([partial]), embeddings
+        )
+        assert model.encode_calls == 2
         return
 
     # Encoder ran twice: once for the initial miss item, once for the residual containing
@@ -656,7 +675,29 @@ def test_encoder_cache_partial_hit_encodes_miss_and_interleaves(declared):
     )
 
 
-def test_encoder_cache_partial_hit_batches_encoder_across_partial_params():
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("delegate", [False, True])
+def test_encoder_cache_partial_hit_uses_custom_input_builder(delegate):
+    class Model(CountingEncoderMultimodalModel):
+        def build_multimodal_encoder_input(self, param, local_item_indices, modality=None):
+            assert modality == "image" and local_item_indices == [1]
+            if delegate:
+                return super().build_multimodal_encoder_input(param, local_item_indices, modality)
+            pixels = param.multimodal_data["image"]["pixel_values"][local_item_indices]
+            return MultimodalParams(multimodal_data={"image": {"pixel_values": pixels}})
+
+    model = Model(make_embedding(hidden_size=4), torch.tensor([7]), encoder_cache_max_bytes=4096)
+    hit, miss = [1] * 8, [2] * 8
+    model._get_or_encode_multimodal_embeddings([make_keyed_multimodal_param(item_hashes=[hit])])
+    param = make_keyed_multimodal_param(item_hashes=[hit, miss], embedding_lengths=[2, 2])
+    param.item_metadata.input_partitions.clear()
+    embeddings = model._get_or_encode_multimodal_embeddings([param])
+    torch.testing.assert_close(embeddings[:2], torch.full((2, 4), 2.0 if delegate else 1.0))
+    torch.testing.assert_close(embeddings[2:], torch.full((2, 4), 2.0))
+
+
+@pytest.mark.parametrize("legacy_peer", [False, pytest.param(True, marks=pytest.mark.cpu_only)])
+def test_encoder_cache_partial_hit_batches_encoder_across_partial_params(legacy_peer):
     # Two partial-hit params in the same batch must share a single encoder call so
     # launch overhead scales with iterations, not with partial-hit count.
     model = CountingEncoderMultimodalModel(
@@ -671,15 +712,21 @@ def test_encoder_cache_partial_hit_batches_encoder_across_partial_params():
         item_hashes=[[2] * 8, [4] * 8], embedding_lengths=[2, 2]
     )
 
-    model._get_or_encode_multimodal_embeddings([seed])
-    encode_calls_before = model.encode_calls
-    model._get_or_encode_multimodal_embeddings([partial_a, partial_b])
+    batch = [partial_a, partial_b]
+    if legacy_peer:
+        legacy = make_keyed_multimodal_param(
+            item_hashes=[shared, [5] * 8], embedding_lengths=[2, 2]
+        )
+        legacy.item_metadata.input_partitions.clear()
+        batch.insert(1, legacy)
 
-    # Single batched encoder call for both partial residuals.
-    assert model.encode_calls == encode_calls_before + 1
-    # Both new miss items (`[3]*8` and `[4]*8`) written to cache alongside the two
-    # already-cached seed items.
-    assert len(model._multimodal_encoder_cache) == 4
+    model._get_or_encode_multimodal_embeddings([seed])
+    embeddings = model._get_or_encode_multimodal_embeddings(batch)
+    # Both selectable residuals share one call. An unsliceable peer needs a full encode.
+    expected = [1, 1, 2, 2] + ([3] * 4 if legacy_peer else []) + [1, 1, 2, 2]
+    assert embeddings[:, 0].tolist() == expected
+    assert model.encode_calls == (3 if legacy_peer else 2)
+    assert len(model._multimodal_encoder_cache) == (5 if legacy_peer else 4)
 
 
 def test_encoder_cache_logs_rejected_oversized_write():

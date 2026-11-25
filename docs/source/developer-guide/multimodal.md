@@ -162,11 +162,12 @@ If output row counts are unknown too, the model must resolve them before using
 grouped assembly or item caching. A model-specific full-request encoder can
 compute those counts from its result. Metadata alone never enables scheduling.
 
-For a `MultimodalModelMixin` model, implementing the processor partition
-hook enables item scheduling under a compatible policy. The engine uses the
-existing atomic-item and output capacity hooks to size the encoder and its
-cache before requests arrive. `encoder_scheduling_policy=DISABLED` keeps
-whole-request encoding.
+For a `MultimodalModelMixin` model, implementing the partition hook on its
+`BaseMultimodalInputProcessor` enables item scheduling. The engine uses the
+atomic-item and output capacity hooks to size the encoder and its cache before
+requests arrive. With pipeline parallelism or side-stream prefetch, `DEFAULT`
+uses inline encoding and `EAGER` rejects the configuration. `DISABLED` selects
+inline encoding directly. The inline encoder can still reuse cached items.
 
 ### Selecting Unusual Payloads
 
@@ -180,7 +181,7 @@ def get_mm_input_partitions(self, processed):
     audio = processed.get("audio")
     if audio is None:
         return None
-    clips = MultimodalItemPartition(item_lengths=tuple(audio["audio_num_clips"]))
+    clips = MultimodalItemPartition(item_lengths=tuple(audio["audio_num_clips"].tolist()))
     return {"audio": {
         "input_audio_features": clips,
         "feature_attention_mask": clips,
