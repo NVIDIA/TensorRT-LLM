@@ -289,8 +289,13 @@ def test_csa2_ced_transfer_with_generation_prefix_reuse(
     replay_window = 140
     layout = CSA2Layout((0, 2, 2, 1, 1, 1), (1, 3), (1, 3, 4), candidate_source_layer_id=3)
     reuse = policy != "required-no-reuse"
-    ctx_managers = _managers(ctx_tp, 1, False, layout, reuse=reuse, remote_tail=remote_tail)
-    gen_managers = _managers(gen_tp, 1, False, layout, reuse=reuse, remote_tail=remote_tail)
+    draft_stages = 3 if policy == "hit" and not remote_tail and ctx_tp == gen_tp == 1 else 0
+    ctx_managers = _managers(
+        ctx_tp, 1, False, layout, reuse=reuse, remote_tail=remote_tail, draft_stages=draft_stages
+    )
+    gen_managers = _managers(
+        gen_tp, 1, False, layout, reuse=reuse, remote_tail=remote_tail, draft_stages=draft_stages
+    )
     ctx_tcs, gen_tcs = [], []
     cached_tokens = 256
     prompt_len = cached_tokens + 1 + (replay_window if remote_tail else 0)
@@ -319,6 +324,11 @@ def test_csa2_ced_transfer_with_generation_prefix_reuse(
             for logical, page in enumerate(pages[:end]):
                 if page >= 0:
                     data[page].view(torch.uint8).fill_((virtual_layer * 17 + logical + 1) % 251)
+        for stage, layer in enumerate(manager.draft_layer_ids):
+            data = manager.get_buffers(layer, kv_layout="HND")
+            for logical, page in enumerate(manager.get_batch_cache_indices([req_id], layer)[0]):
+                if page >= 0:
+                    data[page].view(torch.uint8).fill_(151 + stage * 17 + logical)
 
     try:
         ctx_req = request(0, LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY)
@@ -372,6 +382,11 @@ def test_csa2_ced_transfer_with_generation_prefix_reuse(
                         or logical >= cached_tokens // TOKENS_PER_BLOCK
                         or (remote_tail and role == CSA2CacheRole.SWA and layer >= 3)
                     ):
+                        data[page].zero_()
+            for layer in manager.draft_layer_ids:
+                data = manager.get_buffers(layer, kv_layout="HND")
+                for page in manager.get_batch_cache_indices([1], layer)[0]:
+                    if page >= 0:
                         data[page].zero_()
 
         config = CacheTransceiverConfig(
@@ -435,6 +450,22 @@ def test_csa2_ced_transfer_with_generation_prefix_reuse(
             [1],
             remote_tail_split=3 if remote_tail else None,
         )
+        if draft_stages:
+            source = ctx_managers[0]
+            first = max(0, prompt_len + 1 - 129) // TOKENS_PER_BLOCK
+            end = (prompt_len + TOKENS_PER_BLOCK - 1) // TOKENS_PER_BLOCK
+            for target in gen_managers:
+                for layer in target.draft_layer_ids:
+                    src_pages = source.get_batch_cache_indices([0], layer)[0]
+                    dst_pages = target.get_batch_cache_indices([1], layer)[0]
+                    src = source.get_buffers(layer, kv_layout="HND")
+                    dst = target.get_buffers(layer, kv_layout="HND")
+                    for logical in range(first, end):
+                        assert src_pages[logical] >= 0 and dst_pages[logical] >= 0
+                        assert torch.count_nonzero(src[src_pages[logical]]) > 0
+                        torch.testing.assert_close(
+                            dst[dst_pages[logical]], src[src_pages[logical]], rtol=0, atol=0
+                        )
     finally:
         for tc in ctx_tcs + gen_tcs:
             tc.shutdown()

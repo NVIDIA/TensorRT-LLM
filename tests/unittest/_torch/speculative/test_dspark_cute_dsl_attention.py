@@ -462,6 +462,7 @@ def test_attention_cache_miss_rejects_cuda_graph_capture(monkeypatch):
 def test_preparation_cache_misses_reject_cuda_graph_capture(monkeypatch):
     preparation_op._compile_dspark_rmsnorm_rope_cache_write.cache_clear()
     preparation_op._compile_dspark_rmsnorm_rope_draft_block.cache_clear()
+    preparation_op._compile_dspark_paged_backfill.cache_clear()
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
 
     def unexpected_compile(*args, **kwargs):
@@ -472,9 +473,35 @@ def test_preparation_cache_misses_reject_cuda_graph_capture(monkeypatch):
         preparation_op._compile_dspark_rmsnorm_rope_cache_write(1e-6)
     with pytest.raises(RuntimeError, match="draft-block must be warmed up"):
         preparation_op._compile_dspark_rmsnorm_rope_draft_block(5, 1e-6)
+    with pytest.raises(RuntimeError, match="paged backfill must be warmed up"):
+        preparation_op._compile_dspark_paged_backfill(3, 128, 1e-6, torch.cuda.current_device())
 
 
-def test_preparation_self_jit_covers_dynamic_batches():
+def test_context_page_writer_supports_more_than_65535_tokens():
+    from tensorrt_llm._torch.attention.kernels.dspark import write_dspark_context
+
+    batch, tokens, dim, page_size = 2, 65536, 4, 128
+    values = torch.randn(batch, tokens, dim, device="cuda", dtype=torch.bfloat16)
+    positions = torch.arange(1, tokens + 1, device="cuda").expand(batch, -1).clone()
+    positions[:, -1] = 0
+    mask = torch.ones_like(positions, dtype=torch.bool)
+    mask[:, 1::17] = False
+    tables = torch.arange(batch * tokens // page_size, device="cuda", dtype=torch.int32).view(
+        batch, -1
+    )
+    tables[0, 5] = -1
+    capacities = torch.tensor([tokens, tokens - 5], device="cuda")
+    pool = torch.full((tables.numel(), page_size, dim), -1.0, device="cuda", dtype=values.dtype)
+    expected = pool.clone()
+    logical = (positions - 1).clamp(min=0)
+    pages = tables.gather(1, logical // page_size).long()
+    valid = mask & (positions > 0) & (logical < capacities[:, None]) & (pages >= 0)
+    expected[pages[valid], (logical % page_size)[valid]] = values[valid]
+    write_dspark_context(values, positions, mask, pool, tables, capacities)
+    torch.testing.assert_close(pool, expected, rtol=0, atol=0)
+
+
+def test_preparation_self_jit_covers_dynamic_batches(monkeypatch):
     preparation_op._compile_dspark_rmsnorm_rope_cache_write.cache_clear()
     preparation_op._compile_dspark_rmsnorm_rope_draft_block.cache_clear()
     weight = torch.ones(512, device="cuda", dtype=torch.bfloat16)
@@ -511,6 +538,52 @@ def test_preparation_self_jit_covers_dynamic_batches():
         assert torch.count_nonzero(draft[:, 6:]) == 0
     assert preparation_op._compile_dspark_rmsnorm_rope_cache_write.cache_info().misses == 1
     assert preparation_op._compile_dspark_rmsnorm_rope_draft_block.cache_info().misses == 1
+    preparation_op._compile_dspark_paged_backfill.cache_clear()
+    compile_kernel = preparation_op.cute.compile
+    compile_devices = []
+
+    def compile_on_device(*args, **kwargs):
+        compile_devices.append(torch.cuda.current_device())
+        return compile_kernel(*args, **kwargs)
+
+    monkeypatch.setattr(preparation_op.cute, "compile", compile_on_device)
+    caller = torch.cuda.current_device()
+    devices = [caller]
+    if torch.cuda.device_count() > 1:
+        devices.append((caller + 1) % torch.cuda.device_count())
+    for device in devices:
+        for batch in (1, 3):
+            with torch.cuda.device(device):
+                inputs = _make_inputs(
+                    batch=batch,
+                    page_size=128,
+                    capacities=[512] * (batch - 1) + [0] if batch > 1 else [512],
+                )
+                kv = torch.randn(batch, 1, 3, 512, device="cuda", dtype=torch.bfloat16)
+                norms = torch.randn(3, 512, device="cuda", dtype=kv.dtype)
+                freqs_table = dspark.precompute_dspark_freqs_cis(_ROPE_DIM, 1024, device="cuda")
+                freqs = freqs_table[inputs["positions"][:, None]]
+                normalized = _norm_rope(kv, norms, freqs)
+                pools = [inputs["kv_pages"].clone() for _ in range(3)]
+                expected = [
+                    _write_reference(pool, normalized[:, :, stage], inputs)
+                    for stage, pool in enumerate(pools)
+                ]
+            preparation_op.cute_dsl_dspark_paged_backfill(
+                kv.flatten(2),
+                norms,
+                torch.view_as_real(freqs_table),
+                inputs["capacities"][:, None] > 0,
+                inputs["positions"][:, None],
+                inputs["block_tables"].contiguous(),
+                inputs["capacities"],
+                pools,
+                1e-6,
+            )
+            assert torch.cuda.current_device() == caller
+            for actual, reference in zip(pools, expected):
+                torch.testing.assert_close(actual, reference, rtol=2e-2, atol=2e-2)
+    assert compile_devices == devices
 
 
 def _norm_rope(x, weight, freqs):

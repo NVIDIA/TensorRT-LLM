@@ -59,6 +59,10 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
     ) -> None:
         if spec_metadata is None:
             return
+        self._context_kv_only = getattr(draft_model.dspark_model, "context_kv_only", False)
+        if self._context_kv_only:
+            # Confidence calibration and verification planning belong to GEN.
+            self.return_confidence = False
         self._lazy_init(draft_model, spec_metadata, attn_metadata)
         manager = self.get_draft_kv_cache_manager(resource_manager)
         if manager is None:
@@ -77,7 +81,6 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
             ):
                 raise ValueError("V4.1 DSpark draft storage does not match the checkpoint")
             self._draft_kv_manager = manager
-            self._context_kv_only = getattr(draft_model.dspark_model, "context_kv_only", False)
             self._draft_layer_ids = layers
             self._draft_reuse_policy = specs[0].reuse_policy
             self._draft_kv_buffers = tuple(
@@ -402,6 +405,47 @@ class DSv41DSparkWorker(DSv4DSparkWorker):
                     self._valid_len[slot] = torch.clamp(self._valid_len[slot] + keep, max=self._win)
             if i not in batched:
                 self._ctx_len[slot] = chunk_positions[-1] + 1
+
+    def _follow_target_step(
+        self,
+        draft_model,
+        spec_metadata: "DSparkSpecMetadata",
+        attn_metadata,
+        accepted_tokens: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
+        position_ids: torch.Tensor,
+        num_contexts: int,
+        batch_size: int,
+        total_target_tokens: int,
+    ) -> None:
+        """Keep managed draft history current when this step proposes no drafts."""
+        if self._context_kv_only:
+            return
+        captured = spec_metadata.get_hidden_states(total_target_tokens)
+        if captured is None:
+            raise RuntimeError(
+                "DSpark generation requires captured target hidden states; "
+                "check target_layer_ids and the target model's capture hooks."
+            )
+        slots = self._batch_to_slot[num_contexts:batch_size]
+        base = attn_metadata.num_ctx_tokens + torch.arange(slots.shape[0], device=slots.device)
+        _bonus, rows, start_pos, *_ = self._advance_ragged_generation_state(
+            slots,
+            accepted_tokens[num_contexts:batch_size],
+            num_accepted_tokens[num_contexts:batch_size],
+            position_ids.reshape(-1),
+            base,
+            captured.shape[0],
+        )
+        draft_model.write_context_pages(
+            None,
+            start_pos.unsqueeze(1),
+            (slots != self._scratch_slot).unsqueeze(1),
+            self._draft_kv_buffers,
+            self._draft_block_tables[num_contexts:batch_size],
+            self._draft_capacities[num_contexts:batch_size],
+            main_x=draft_model.project_captured_rows(captured, rows.unsqueeze(1)),
+        )
 
     def _draft_gen_block_batched(
         self,

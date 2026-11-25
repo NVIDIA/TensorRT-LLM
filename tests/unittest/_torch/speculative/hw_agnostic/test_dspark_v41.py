@@ -354,6 +354,7 @@ def test_v41_draft_tactic_resolves_against_the_draft_stages_only(
 
 @pytest.mark.cpu_only
 def test_v41_context_draft_constructs_without_moe(monkeypatch):
+    from tensorrt_llm._torch.models import modeling_dspark_v41
     from tensorrt_llm._torch.models.modeling_dspark_v41 import (
         DSv41DSparkForCausalLM,
         _DSv41DSparkContextDraftModel,
@@ -375,7 +376,7 @@ def test_v41_context_draft_constructs_without_moe(monkeypatch):
         num_hidden_layers=1,
         num_nextn_predict_layers=3,
         vocab_size=16,
-        hidden_size=8,
+        hidden_size=32,
         hc_mult=2,
         num_attention_heads=1,
         kv_lora_rank=448,
@@ -402,6 +403,56 @@ def test_v41_context_draft_constructs_without_moe(monkeypatch):
     supports_replay = DSv41DSparkForCausalLM.supports_final_window_context_replay.fget
     assert supports_replay(SimpleNamespace(dspark_model=model))
     assert not supports_replay(SimpleNamespace(dspark_model=SimpleNamespace()))
+
+    class ContextLoader:
+        def __init__(self, model):
+            self.model = model
+
+        def load_weights(self, weights):
+            assert set(weights) == {
+                "mtp_layers.0.main_proj.weight",
+                "mtp_layers.0.main_norm.weight",
+            }
+            for name, value in weights.items():
+                module, parameter = name.rsplit(".", 1)
+                setattr(self.model.get_submodule(module), parameter, nn.Parameter(value.clone()))
+
+    monkeypatch.setattr(modeling_dspark_v41, "DeepseekV41WeightLoader", ContextLoader)
+    monkeypatch.setattr(model.mtp_layers[0].main_proj, "transform_weights", Mock())
+    monkeypatch.setattr(model, "_cache_fp8_prep_weights", Mock())
+    wrapper = DSv41DSparkForCausalLM.__new__(DSv41DSparkForCausalLM)
+    nn.Module.__init__(wrapper)
+    wrapper.dspark_model, wrapper.config, wrapper.num_stages = model, config, 3
+    weights = {
+        "mtp.0.main_proj.weight": torch.arange(1024, dtype=torch.bfloat16).view(32, 32),
+        "mtp.0.main_norm.weight": torch.ones(32, dtype=torch.bfloat16),
+        "mtp.2.norm.weight": torch.full((32,), 99.0),
+    }
+    expected = []
+    for stage in range(3):
+        weights[f"mtp.{stage}.attn.wkv.weight"] = torch.full((512, 32), stage + 1.0).to(
+            torch.float8_e4m3fn
+        )
+        weights[f"mtp.{stage}.attn.wkv.scale"] = torch.full((16, 1), stage + 2.0)
+        weights[f"mtp.{stage}.attn.kv_norm.weight"] = torch.full((512,), stage + 3.0)
+        expected.append(torch.full((512, 32), (stage + 1.0) * (stage + 2.0), dtype=torch.bfloat16))
+    wrapper.load_weights(weights)
+    torch.testing.assert_close(
+        model.mtp_layers[0].main_proj.weight, weights["mtp.0.main_proj.weight"]
+    )
+    torch.testing.assert_close(model._backfill_wkv_weight, torch.cat(expected))
+    torch.testing.assert_close(
+        model._backfill_kv_norm_weight,
+        torch.stack([torch.full((512,), stage + 3.0, dtype=torch.bfloat16) for stage in range(3)]),
+    )
+    for stage in range(3):
+        for suffix in ("wkv.weight", "wkv.scale", "kv_norm.weight"):
+            incomplete = dict(weights)
+            incomplete.pop(f"mtp.{stage}.attn.{suffix}")
+            with pytest.raises(
+                ValueError, match="V4.1 DSpark checkpoint is missing context KV weights"
+            ):
+                wrapper.load_weights(incomplete)
 
 
 def test_v41_draft_uses_smaller_expert_bank_without_changing_target(monkeypatch):
@@ -441,8 +492,8 @@ def test_v41_draft_uses_smaller_expert_bank_without_changing_target(monkeypatch)
     assert model._attn_params["q_b_norm_enabled"] is False
 
 
-@pytest.mark.parametrize("batched", [False, True])
-def test_v41_three_stages_carry_lagged_pre_into_final_head(batched):
+@pytest.mark.parametrize("mode", ["scalar", "batched", "paged-scalar"])
+def test_v41_three_stages_carry_lagged_pre_into_final_head(mode):
     model = DSv41DSparkDraftModel.__new__(DSv41DSparkDraftModel)
     nn.Module.__init__(model)
     model.hc_mult = 2
@@ -468,10 +519,17 @@ def test_v41_three_stages_carry_lagged_pre_into_final_head(batched):
     model._forward_stage = MethodType(fake_stage, model)
     model.forward_embed = Mock(return_value=(initial, torch.zeros(1, 3), torch.zeros(1, 2)))
     model._dspark_freqs_table = Mock(return_value=torch.empty(8, 1, dtype=torch.complex64))
+    batched = mode == "batched"
     call = model.forward_batched if batched else model.forward
     kwargs = {}
     if batched:
         kwargs = {"kv_windows": torch.zeros(1, 3, 4, 2), "slots": torch.zeros(1, dtype=torch.long)}
+    elif mode == "paged-scalar":
+        kwargs = {
+            "kv_pages": tuple(torch.zeros(1, 1, 1, 4, 2) for _ in range(3)),
+            "block_tables": torch.zeros(1, 1, dtype=torch.int32),
+            "capacities": torch.tensor([4]),
+        }
     _, _, logits = call(
         torch.zeros(1, 9),
         torch.ones(1, dtype=torch.long),
@@ -484,6 +542,16 @@ def test_v41_three_stages_carry_lagged_pre_into_final_head(batched):
     torch.testing.assert_close(seen[1], mixes[0])
     torch.testing.assert_close(seen[2], mixes[1])
     torch.testing.assert_close(logits, ((initial + 3) * mixes[-1]).sum(-2))
+    if mode == "paged-scalar":
+        seen.clear()
+        _, _, expected = model.forward_batched(
+            torch.zeros(1, 9),
+            torch.ones(1, dtype=torch.long),
+            torch.ones(1, dtype=torch.long),
+            return_logits=True,
+            **kwargs,
+        )
+        torch.testing.assert_close(logits, expected)
 
 
 @pytest.mark.parametrize("batched", [False, True])

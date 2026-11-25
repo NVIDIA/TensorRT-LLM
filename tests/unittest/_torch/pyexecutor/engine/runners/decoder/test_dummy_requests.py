@@ -11,6 +11,7 @@ from _torch.pyexecutor.engine_test_utils import DummyModel, kv_cache_manager
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.dummy_requests import DummyRequestFactory
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
+from tensorrt_llm._torch.speculative.utils import get_draft_kv_cache_manager
 from tensorrt_llm.llmapi.llm_args import (
     DecodingBaseConfig,
     DraftTargetDecodingConfig,
@@ -41,7 +42,13 @@ def test_warmup_builders_resynchronize_stale_draft_buffers(
         max_num_tokens=258,
     ) as manager:
         monkeypatch.setattr(manager, "get_draft_kv_cache_view", lambda: manager)
-        resource_manager = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: manager})
+        resource_manager = ResourceManager(
+            {
+                ResourceManagerType.KV_CACHE_MANAGER: manager,
+                ResourceManagerType.DRAFT_KV_CACHE_MANAGER: manager,
+            }
+        )
+        assert get_draft_kv_cache_manager(spec, resource_manager) is manager
         batch_size = 2
         if draft_len is None:
             expected_draft_len = config.max_draft_len

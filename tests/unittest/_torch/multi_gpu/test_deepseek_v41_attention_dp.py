@@ -1181,7 +1181,15 @@ def test_attention_dp_decoder_bounded_replay(
 
 
 def _decoder_pass_case(
-    model, config, sparse, mapping, case, use_graph, image=False, graph_name="_decoder_pass_graph"
+    model,
+    config,
+    sparse,
+    mapping,
+    case,
+    use_graph,
+    image=False,
+    graph_name="_decoder_pass_graph",
+    spec_metadata=None,
 ):
     """One DEP2 bounded-replay forward of this rank's batch; returns its last-token logits.
 
@@ -1235,6 +1243,7 @@ def _decoder_pass_case(
                     attn_metadata=metadata,
                     input_ids=ids,
                     position_ids=positions,
+                    spec_metadata=spec_metadata,
                     context_requests=reqs[:num_contexts] or None,
                     **(
                         {
@@ -1319,6 +1328,8 @@ def _run_decoder_pass_graph() -> None:
             ):
                 bias.zero_()
                 bias[experts] = 100.0
+        # This target-only fixture declares the capture layer without loading a drafter.
+        model.model._pass_capture_layer_ids = frozenset({5})
         graph = model.model._decoder_pass_graph
         assert graph is not None and model.model.decoder_replay_split == 5
         window = model.model.decoder_replay_window
@@ -1331,12 +1342,36 @@ def _run_decoder_pass_graph() -> None:
             0: [([300, 300], [0, 0], [300, 300], 2), ([window], [0], [window], 1), full],
             1: [full, ([window], [0], [1000], 1), ([1], [7], [7], 0)],
         }
+        from tensorrt_llm._torch.speculative.dspark import DSparkSpecMetadata
+        from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
+
+        def capture_metadata():
+            result = DSparkSpecMetadata(
+                max_num_requests=2,
+                max_draft_len=5,
+                max_total_draft_tokens=5,
+                spec_dec_mode=SpeculativeDecodingMode.DSPARK,
+                layers_to_capture=[5],
+                hidden_size=text.hidden_size,
+                max_num_tokens=600,
+                dtype=torch.bfloat16,
+            )
+            result.captured_hidden_states.fill_(-777)
+            return result
+
+        first_capture = first_values = None
+        row_maps = []
         # The last step routes image tokens with the vision bias on both ranks.
         for step, case in enumerate([*cases[rank], full]):
             image = step == len(cases[rank])
-            eager = _decoder_pass_case(model, config, sparse, mapping, case, False, image)
+            eager_spec, graph_spec = capture_metadata(), capture_metadata()
+            eager = _decoder_pass_case(
+                model, config, sparse, mapping, case, False, image, spec_metadata=eager_spec
+            )
             with patch.object(graph, "run", wraps=graph.run) as run:
-                graphed = _decoder_pass_case(model, config, sparse, mapping, case, True, image)
+                graphed = _decoder_pass_case(
+                    model, config, sparse, mapping, case, True, image, spec_metadata=graph_spec
+                )
             assert run.call_count == 1
             # Padding rows change the GEMM tactics serving the live rows: bf16 rounding only.
             tolerance = 2**-4 if (rank, step) == (1, 2) else 0
@@ -1347,6 +1382,38 @@ def _run_decoder_pass_graph() -> None:
                 error = f"rank {rank}, case {case}: {exc}"
             errors = [e for e in MPI.COMM_WORLD.allgather(error) if e is not None]
             assert not errors, errors
+            lengths, past, prompts, contexts = case
+            rows, offset = [], 0
+            for index, (length, cached, prompt) in enumerate(zip(lengths, past, prompts)):
+                begin = min(length, max(0, prompt - window - cached)) if index < contexts else 0
+                rows.extend(range(offset + begin, offset + length))
+                offset += length
+            row_maps.append(tuple(rows))
+            mapped = torch.tensor(rows, dtype=torch.long, device="cuda")
+            actual = graph_spec.captured_hidden_states
+            capture_error = None
+            try:
+                assert (eager_spec.captured_hidden_states[mapped] != -777).all()
+                torch.testing.assert_close(
+                    actual[mapped],
+                    eager_spec.captured_hidden_states[mapped],
+                    atol=tolerance,
+                    rtol=0,
+                )
+                untouched = torch.ones(600, dtype=torch.bool, device="cuda")
+                untouched[mapped] = False
+                assert (actual[untouched] == -777).all()
+                if first_capture is None:
+                    first_capture, first_values = actual, actual.clone()
+                else:
+                    torch.testing.assert_close(first_capture, first_values, atol=0, rtol=0)
+            except AssertionError as exc:
+                capture_error = f"rank {rank}, case {case}, speculative capture: {exc}"
+            errors = [
+                error for error in MPI.COMM_WORLD.allgather(capture_error) if error is not None
+            ]
+            assert not errors, errors
+        assert len(set(row_maps)) > 1
     finally:
         for name, value in saved_env.items():
             if value is None:

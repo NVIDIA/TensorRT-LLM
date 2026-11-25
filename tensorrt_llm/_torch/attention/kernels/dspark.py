@@ -24,8 +24,8 @@ def _write_context_kernel(
     PAGE_SIZE: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    row = tl.program_id(0)
-    token = tl.program_id(1)
+    row = tl.program_id(0) // M
+    token = tl.program_id(0) % M
     d = tl.arange(0, BLOCK)
     # RoPE uses frame p + 1; the managed cache stores logical token p.
     position = tl.load(positions + row * M + token) - 1
@@ -53,7 +53,7 @@ def write_dspark_context(
     batch, tokens, head_dim = values.shape
     if batch == 0 or tokens == 0:
         return
-    _write_context_kernel[(batch, tokens)](
+    _write_context_kernel[(batch * tokens,)](
         values.contiguous(),
         positions.contiguous(),
         mask.contiguous(),

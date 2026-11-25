@@ -542,6 +542,16 @@ def test_steady_decode_reuses_converted_tables(
             if tables[2] is not None:
                 assert np.array_equal(tables[2], expected_tables[2])
             _assert_identical(observed, expected, step)
+            if "draft_pages" in observed and transient is None:
+                pages = manager.get_batch_cache_indices(
+                    [batch[0].py_request_id], manager.draft_layer_ids[0]
+                )[0]
+                mapped = next(column for column, page in enumerate(pages) if page >= 0)
+                unmapped = next(
+                    (column for column, page in enumerate(pages) if page < 0), len(pages)
+                )
+                assert observed["draft_pages"][0, mapped].item() == pages[mapped]
+                assert observed["draft_pages"][0, unmapped].item() == -1
             ids = [r.py_request_id for r in batch]
             stats["steps"] += 1
             stats["skipped"] += not converted
@@ -564,6 +574,35 @@ def test_steady_decode_reuses_converted_tables(
     finally:
         for request in [*active, *([padding] if padding else [])]:
             manager.free_resources(request)
+        manager.shutdown()
+
+
+@skip_pre_blackwell
+@torch.inference_mode()
+def test_draft_conversion_keeps_holes_with_scratch_enabled():
+    manager = _manager(False, True, True, 2 * BLOCK, draft_stages=3)
+    request = _admit(manager, 1, 300)
+    try:
+        params = manager._device_batch_page_params
+        host = params.cpu()
+        draft = manager._draft_page_table_index
+        scratch_table = next(index for index, row in enumerate(host) if row[4] > 0)
+        base = torch.full((int(host[:, 0].max()) + 1, 1, 3), -1, dtype=torch.int32, device="cuda")
+        base[:, :, 0] = 7
+        rows = torch.zeros(1, dtype=torch.int32, device="cuda")
+        ranges = torch.tensor(
+            [[[1, 2]]] * (int(host[:, 3].max()) + 1), dtype=torch.int32, device="cuda"
+        )
+        slots = torch.full((*ranges.shape[:2], 1), 23, dtype=torch.int32, device="cuda")
+        out = torch.empty((len(host), 1, 3), dtype=torch.int32, device="cuda")
+        kernel.convert_page_tables(base, rows, params, out, -1, ranges, slots)
+        assert host[draft, 4] == 0
+        assert out[draft, 0, 1].item() == -1
+        assert (
+            out[scratch_table, 0, 1].item() == 23 * host[scratch_table, 1] + host[scratch_table, 2]
+        )
+    finally:
+        manager.free_resources(request)
         manager.shutdown()
 
 

@@ -403,7 +403,7 @@ def _compile_dspark_backfill(num_stages: int, eps: float):
 
 
 @functools.cache
-def _compile_dspark_paged_backfill(num_stages: int, page_size: int, eps: float):
+def _compile_dspark_paged_backfill(num_stages: int, page_size: int, eps: float, device: int):
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError("DSpark paged backfill must be warmed up before CUDA graph capture")
     tokens = cute.sym_int()
@@ -997,18 +997,21 @@ def cute_dsl_dspark_paged_backfill(
     eps: float,
 ) -> None:
     """Write valid [request, interim, stage] RMSNorm/RoPE rows through absolute page mappings."""
-    compiled = _compile_dspark_paged_backfill(weight.shape[0], pools[0].shape[1], eps)
-    compiled(
-        kv.view(-1, _DSV4_DSPARK_HEAD_DIM),
-        weight,
-        freqs,
-        mask.view(-1).view(torch.uint8),
-        positions.view(-1),
-        block_tables,
-        capacities,
-        tuple(pools),
-        mask.shape[1],
-    )
+    with torch.cuda.device(kv.device):
+        compiled = _compile_dspark_paged_backfill(
+            weight.shape[0], pools[0].shape[1], eps, kv.device.index
+        )
+        compiled(
+            kv.view(-1, _DSV4_DSPARK_HEAD_DIM),
+            weight,
+            freqs,
+            mask.view(-1).view(torch.uint8),
+            positions.view(-1),
+            block_tables,
+            capacities,
+            tuple(pools),
+            mask.shape[1],
+        )
 
 
 @torch.library.register_fake("trtllm::cute_dsl_dspark_paged_backfill")

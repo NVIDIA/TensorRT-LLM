@@ -48,6 +48,7 @@ def test_context_worker_rebinds_managed_pages_without_draft_decode():
         _table_slots=(0,),
         _prepare_page_tables=Mock(),
         get_draft_kv_cache_manager=lambda _: manager,
+        return_confidence=True,
     )
     metadata = SimpleNamespace(request_ids=[42])
     draft = SimpleNamespace(
@@ -55,6 +56,11 @@ def test_context_worker_rebinds_managed_pages_without_draft_decode():
         _attn_params={"head_dim": 512},
         dspark_model=SimpleNamespace(context_kv_only=True),
     )
+
+    def initialize(*args):
+        assert not worker.return_confidence
+
+    worker._lazy_init.side_effect = initialize
     DSv41DSparkWorker.prepare_draft_context(
         worker,
         draft,
@@ -63,6 +69,7 @@ def test_context_worker_rebinds_managed_pages_without_draft_decode():
         SimpleNamespace(get_resource_manager=lambda _: manager),
     )
     assert worker._draft_kv_manager is manager
+    assert not worker.return_confidence
     assert not worker._draft_page_versions
     assert worker._draft_prepared_batch is None
     assert not worker._draft_page_indices
@@ -197,7 +204,7 @@ def test_private_fallback_pages_preserve_execution_order_and_managed_pages_skip_
         _draft_table_storage=storage,
         _draft_slot_block_tables=storage[:3],
         _draft_block_tables=storage[3:],
-        _draft_managed_block_tables=storage[3:],
+        _draft_managed_block_tables=torch.full((3, 8), BAD_PAGE_INDEX, dtype=torch.int32),
         _draft_fallback_block_tables=storage[3:],
         _draft_page_versions={},
         _draft_prepared_batch=None,
@@ -259,6 +266,10 @@ def test_private_fallback_pages_preserve_execution_order_and_managed_pages_skip_
     # Once target preparation published this execution order, draft generation
     # uses its addressable extent without uploading per-request block growth.
     worker._draft_kv_manager.draft_page_table_prepared = lambda _: True
+    native = torch.full((3, 8), BAD_PAGE_INDEX, dtype=torch.int32)
+    native[0, 1:3] = torch.tensor([21, 22])
+    native[1, 0] = 31
+    worker._draft_managed_block_tables.copy_(native)
     snapshot = [None]
     worker._draft_kv_manager.draft_page_table_state = lambda: snapshot[0]
     calls, gathers = worker._page_indices.call_count, gather.call_count
@@ -269,6 +280,8 @@ def test_private_fallback_pages_preserve_execution_order_and_managed_pages_skip_
         snapshot[0] = object()
         version_reads.clear()
         DSv41DSparkWorker._prepare_page_tables(worker, [43], 0)
+        assert worker._draft_block_tables is worker._draft_managed_block_tables
+        torch.testing.assert_close(worker._draft_block_tables, native)
         assert not version_reads
         assert worker._draft_capacities.tolist() == [8 * 256, 0, 0]
         if native_uploads is None:
@@ -298,6 +311,40 @@ def test_private_fallback_pages_preserve_execution_order_and_managed_pages_skip_
     ids=["single", "chunked", "held-tail"],
 )
 def test_private_context_seed_rebuilds_final_window(chunks, captures):
+    if captures[0] == 0:
+        from tensorrt_llm._torch.pyexecutor.scheduler.ctx_decoder_batch import (
+            ContextPassPlan,
+            CtxDecoderBatcher,
+        )
+        from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
+
+        scheduler = object.__new__(KVCacheV2Scheduler)
+        scheduler.max_num_tokens, scheduler.chunk_unit_size = 32, 1
+        scheduler._ctx_decoder_held = False
+        scheduler._num_ctx_decoder_hold_passes = scheduler._num_ctx_decoder_held_requests = 0
+        scheduler.plan_context_pass = Mock(return_value=ContextPassPlan(140, 140, 180))
+        executor = SimpleNamespace(
+            model_engine=SimpleNamespace(replays_final_windows_only=lambda: True),
+            dist=SimpleNamespace(tp_allgather_int64=lambda values: torch.tensor([values, values])),
+        )
+        batcher = CtxDecoderBatcher(executor, scheduler, 140)
+        request = SimpleNamespace(
+            is_context_only_request=True,
+            is_dummy=False,
+            py_ctx_decoder_held=False,
+            py_csa2_remote_tail_mode=None,
+            context_current_position=0,
+            prompt_len=180,
+        )
+        batcher.before_schedule([request], set())
+        assert scheduler._ctx_decoder_hold_window == 140
+        first_chunk = scheduler._ctx_decoder_hold_chunk(request, 180)
+        assert request.py_ctx_decoder_held and scheduler._ctx_decoder_held
+        chunks = [first_chunk, 180 - first_chunk]
+        assert chunks == [40, 140]
+        batcher.after_schedule()
+        assert scheduler._ctx_decoder_hold_window == 0
+        assert scheduler._num_ctx_decoder_hold_passes == 1
     worker = SimpleNamespace(
         _draft_reuse_policy=ReusePolicy.PRIVATE,
         _draft_kv_manager=SimpleNamespace(enable_block_reuse=True),

@@ -26,6 +26,7 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import (
 )
 from tensorrt_llm._torch.speculative import dspark as dspark_module
 from tensorrt_llm._torch.speculative.dspark import DSv4DSparkWorker
+from tensorrt_llm._torch.speculative.dspark_v41 import DSv41DSparkWorker
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 from tensorrt_llm._torch.speculative.utils import update_draft_len
 from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig, MTPDecodingConfig
@@ -36,8 +37,8 @@ BLOCK = 3
 WINDOW = 4
 
 
-def _worker(num_rows=2):
-    worker = DSv4DSparkWorker.__new__(DSv4DSparkWorker)
+def _worker(num_rows=2, worker_cls=DSv4DSparkWorker):
+    worker = worker_cls.__new__(worker_cls)
     worker.spec_config = SimpleNamespace(max_draft_len=BLOCK)
     worker.return_confidence = False
     worker.guided_decoder = None
@@ -234,6 +235,73 @@ def test_step_without_speculation_follows_the_target_in_the_windows():
     assert windows is worker._kv_windows
     assert worker._ctx_len[:2].tolist() == [11, 21]
     assert worker._valid_len[:2].tolist() == [3, WINDOW]
+
+
+def test_managed_pages_remain_complete_across_five_zero_five_draft_steps():
+    worker = _worker(worker_cls=DSv41DSparkWorker)
+    worker.spec_config.max_draft_len = 5
+    worker._context_kv_only = False
+    worker._ctx_len[:2] = torch.tensor([10, 20])
+    worker._position_initialized[:2] = True
+    worker._kv_windows = None
+    pool = torch.full((2, 32, 2), -1.0)
+    worker._draft_kv_buffers = (pool,)
+    worker._draft_block_tables = torch.tensor([[0], [1]], dtype=torch.int32)
+    worker._draft_capacities = torch.tensor([32, 32])
+    expected = pool.clone()
+    model = _draft_model()
+    model.block_size = 5
+    model.write_context_windows_batched.side_effect = AssertionError("managed KV uses no ring")
+
+    def write_pages(hidden, frames, mask, pools, tables, capacities, *, main_x):
+        for row, token in mask.nonzero().tolist():
+            position = int(frames[row, token]) - 1
+            page = int(tables[row, position // 32])
+            assert 0 <= position < capacities[row] and page >= 0
+            pools[0][page, position % 32] = main_x[row, token]
+
+    model.write_context_pages = Mock(side_effect=write_pages)
+
+    def draft_forward(hidden, bonus, positions, **kwargs):
+        write_pages(
+            None,
+            positions[:, None],
+            torch.ones(2, 1, dtype=torch.bool),
+            kwargs["kv_pages"],
+            kwargs["block_tables"],
+            kwargs["capacities"],
+            main_x=kwargs["main_x"][:, None],
+        )
+        return None, None, torch.zeros(2, 5, 4)
+
+    model.forward_batched.side_effect = draft_forward
+    for step, width in enumerate((5, 0, 5)):
+        stride = width + 1
+        captured = torch.arange(2 * stride * 2, dtype=torch.float).view(2 * stride, 2) + 100 * step
+        metadata = _metadata(captured, runtime_draft_len=width)
+        positions = torch.cat(
+            [torch.arange(start + step, start + step + stride) for start in (10, 20)]
+        )
+        if width:
+            worker._draft_gen_block_batched(
+                model,
+                metadata,
+                SimpleNamespace(num_ctx_tokens=0),
+                torch.ones(2, stride, dtype=torch.int32),
+                torch.ones(2, dtype=torch.int32),
+                0,
+                2,
+                len(captured),
+                positions,
+            )
+        else:
+            output = _forward(worker, model, metadata, 2, positions)
+            assert output["next_draft_tokens"].shape == (2, 0)
+        for row, start in enumerate((10, 20)):
+            expected[row, start + step] = captured[row * stride]
+        torch.testing.assert_close(pool, expected)
+        assert worker._ctx_len[:2].tolist() == [11 + step, 21 + step]
+    assert model.forward_batched.call_count == 2
 
 
 def test_step_without_speculation_reads_generation_rows_past_the_context_tokens():

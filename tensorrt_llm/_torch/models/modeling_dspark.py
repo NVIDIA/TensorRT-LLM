@@ -3216,10 +3216,16 @@ class DSv4DSparkDraftModel(nn.Module):
             ``(draft_tokens [T, block], confidence [T, block] or None)``.
         """
         if kv_pages is not None:
+            positions = torch.full(
+                (bonus_token_ids.shape[0],),
+                start_pos,
+                dtype=torch.long,
+                device=bonus_token_ids.device,
+            )
             return self.forward_batched(
                 main_hidden,
                 bonus_token_ids,
-                start_pos,
+                positions,
                 kv_pages=kv_pages,
                 block_tables=block_tables,
                 capacities=capacities,
