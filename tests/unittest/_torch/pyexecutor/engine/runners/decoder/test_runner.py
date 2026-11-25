@@ -196,8 +196,15 @@ def test_decoder_forward_routes_compile_bypass(
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("bounded_projection", [False, True])
-def test_encoder_replay_with_context_logits(bounded_projection: bool) -> None:
+@pytest.mark.parametrize(
+    ("has_workspace", "has_processor"),
+    [
+        pytest.param(True, True, id="post-processor"),
+        pytest.param(True, False, id="bounded-projection"),
+        pytest.param(False, False, id="no-workspace"),
+    ],
+)
+def test_encoder_replay_with_context_logits(has_workspace: bool, has_processor: bool) -> None:
     from tensorrt_llm._torch.modules.context_logits import (
         ContextLogitsWorkspace,
         project_context_logits,
@@ -227,7 +234,7 @@ def test_encoder_replay_with_context_logits(bounded_projection: bool) -> None:
     head = SimpleNamespace(
         weight=torch.eye(6), output_dtype=None, num_embeddings=6, tp_size=1, mapping=None
     )
-    head.context_logits_workspace = ContextLogitsWorkspace(head)
+    head.context_logits_workspace = ContextLogitsWorkspace(head) if has_workspace else None
     engine._context_logits_heads = (head,)
     processor_rows: list[torch.Tensor] = []
 
@@ -236,7 +243,7 @@ def test_encoder_replay_with_context_logits(bounded_projection: bool) -> None:
         processor_rows.append(logits.clone())
         logits.zero_()
 
-    if not bounded_projection:
+    if has_processor:
         scoring.py_orig_prompt_len = scoring.py_prompt_len
         scoring.get_tokens = lambda beam: [1, 2]
         scoring.py_logits_post_processors = [process_logits]
@@ -248,7 +255,7 @@ def test_encoder_replay_with_context_logits(bounded_projection: bool) -> None:
     def forward(*args, **kwargs) -> dict[str, torch.Tensor]:
         replay.py_ced_replay.consumed = True
         projected = project_context_logits(hidden, head)
-        assert (projected is not None) == bounded_projection
+        assert (projected is not None) == (has_workspace and not has_processor)
         return {"logits": hidden if projected is None else projected}
 
     # Input preparation can reorder the requests after the plan was created.
@@ -264,7 +271,7 @@ def test_encoder_replay_with_context_logits(bounded_projection: bool) -> None:
         )
 
     expected = hidden[[2, 4, 5]]
-    if not bounded_projection:
+    if has_processor:
         assert len(processor_rows) == 1
         torch.testing.assert_close(processor_rows[0], hidden[4].view(1, 1, -1))
         expected[1].zero_()
