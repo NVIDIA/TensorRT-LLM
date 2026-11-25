@@ -3,9 +3,11 @@
 """MegaMoE CuteDSL on four ranks drops the padding rows of a forward end to end.
 
 One layer runs twice over the same inputs: every row live, then each rank's padding requests
-dropped. Live rows must match bit for bit, dropped rows be zero, and the per-expert counts the
-router publishes must equal the histogram of the live rows' routes. Generic routing stages through
-megamoe_stage_inputs; DeepSeek-V4 routing through its fused route+quant.
+dropped. Live rows must match bit for bit, and the per-expert counts the router publishes must
+equal the histogram of the live rows' routes. The drop covers the routed experts: without a fused
+shared expert the dropped rows are zero; a shared expert fused into the kernel still computes every
+row, so there they hold its output. Generic routing stages through megamoe_stage_inputs;
+DeepSeek-V4 routing through its fused route+quant.
 """
 
 import os
@@ -51,6 +53,11 @@ _COMBINE_FORMATS = ("bf16", "32e4m3xe8m0", "16e2m1xbf16")
 # reference routing (gate_forward) takes 256 or 384 experts (and the rest of the CI shape).
 _DSV4_SHAPE = (256, 6, 2048, 1408)
 _ROUTINGS = ("renormalize", "dsv4")
+# DeepSeek-V4 with its FP8 shared expert fused into the kernel (megamoe_fuse_shared_expert), whose
+# intermediate size the fusion needs as a multiple of 256 (gate/up rows in 512-row clusters).
+_FUSED_SHARED = "dsv4_fused_shared"
+_SHARED_INTERMEDIATE = 1024
+_CASES = [(f, r) for f in _COMBINE_FORMATS for r in _ROUTINGS] + [("bf16", _FUSED_SHARED)]
 
 
 @contextmanager
@@ -99,13 +106,15 @@ def _drop_worker(real_requests_by_rank: tuple, combine_format: str, routing: str
 def _megamoe_layer(combine_format: str, routing: str, rows: int = _REQUESTS * _ROWS_PER_REQUEST):
     """One MegaMoE CuteDSL layer on this rank, the same inputs and weights on every rank."""
     from _torch.moe.moe_test_utils import MoeBackendType
-    from _torch.moe.quantize_utils import get_test_quant_params
+    from _torch.moe.quantize_utils import FP8BlockScalesQuantizeUtil, get_test_quant_params
     from _torch.moe.test_moe_module import (
         _create_mapping_for_parallel_mode,
         _create_model_config,
         _ensure_dist_for_megamoe,
     )
 
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
     from tensorrt_llm._torch.moe.fused_moe import (
         DEFAULT_MOE_ACTIVATION,
         RenormalizeMoeRoutingMethod,
@@ -115,7 +124,7 @@ def _megamoe_layer(combine_format: str, routing: str, rows: int = _REQUESTS * _R
     from tensorrt_llm._torch.moe.fused_moe.routing import DeepSeekV4MoeRoutingMethod
     from tensorrt_llm._torch.nccl_window_tensor_scope import nccl_window_tensor_scope
     from tensorrt_llm._torch.utils import ActivationType
-    from tensorrt_llm.models.modeling_utils import QuantAlgo
+    from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
     os.environ.pop("TRTLLM_FORCE_COMM_METHOD", None)
     os.environ["MEGAMOE_COMBINE_FORMAT"] = combine_format
@@ -125,7 +134,8 @@ def _megamoe_layer(combine_format: str, routing: str, rows: int = _REQUESTS * _R
     torch.cuda.set_device(rank)
     backend_name = MoeBackendType.MEGAMOE_CUTEDSL.value
     _ensure_dist_for_megamoe(backend_name, rank, _WORLD)
-    dsv4 = routing == "dsv4"
+    shared = routing == _FUSED_SHARED
+    dsv4 = routing == "dsv4" or shared
     num_experts, top_k, hidden_size, intermediate_size = _DSV4_SHAPE if dsv4 else _SHAPE
     dtype = torch.bfloat16
 
@@ -175,6 +185,11 @@ def _megamoe_layer(combine_format: str, routing: str, rows: int = _REQUESTS * _R
             moe_backend=backend_name,
             max_num_tokens=max(256, rows),
         )
+        if shared:
+            # DeepSeek-V4's single shared expert, fused under attention DP.
+            model_cfg.pretrained_config.architectures = ["DeepseekV41ForCausalLM"]
+            model_cfg.pretrained_config.n_shared_experts = 1
+            model_cfg = model_cfg.copy_with(megamoe_fuse_shared_expert=True)
         with (
             nccl_window_tensor_scope(x),
             create_moe(
@@ -192,6 +207,35 @@ def _megamoe_layer(combine_format: str, routing: str, rows: int = _REQUESTS * _R
             fused_moe.load_weights([quantize_util.create_weights(**quant_kwargs)])
             fused_moe.post_load_weights()
             fused_moe.cuda(f"cuda:{rank}")
+            if shared:
+                shared_quant = QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES, group_size=128)
+                weights = FP8BlockScalesQuantizeUtil(
+                    num_experts=1,
+                    dtype=dtype,
+                    intermediate_size=_SHARED_INTERMEDIATE,
+                    hidden_size=hidden_size,
+                    quant_config=shared_quant,
+                ).create_weights(use_e8m0_scale=True)
+                mlp = GatedMLP(
+                    hidden_size=hidden_size,
+                    intermediate_size=_SHARED_INTERMEDIATE,
+                    bias=False,
+                    dtype=dtype,
+                    config=ModelConfig(mapping=mapping, quant_config=shared_quant),
+                    overridden_tp_size=1,
+                    reduce_output=False,
+                )
+                mlp.gate_up_proj.load_weights(
+                    [
+                        {k: weights[f"0.{w}.{k}"] for k in ("weight", "weight_scale")}
+                        for w in ("w1", "w3")
+                    ]
+                )
+                mlp.down_proj.load_weights(
+                    [{k: weights[f"0.w2.{k}"] for k in ("weight", "weight_scale")}]
+                )
+                # Before the Linear transforms, as DeepseekV4ForCausalLM.post_load_weights does.
+                assert fused_moe.fuse_shared_expert(mlp)
             yield fused_moe, x, router_logits, routing_method, rank
 
 
@@ -200,7 +244,8 @@ def _drop_worker_impl(real_requests_by_rank: tuple, combine_format: str, routing
     from tensorrt_llm._torch.utils import model_extra_attrs
 
     rows = _REQUESTS * _ROWS_PER_REQUEST
-    dsv4 = routing == "dsv4"
+    shared = routing == _FUSED_SHARED
+    dsv4 = routing == "dsv4" or shared
     num_experts = (_DSV4_SHAPE if dsv4 else _SHAPE)[0]
     with _megamoe_layer(combine_format, routing) as (
         fused_moe,
@@ -262,7 +307,8 @@ def _drop_worker_impl(real_requests_by_rank: tuple, combine_format: str, routing
         assert torch.equal(counts_all, histogram_all)
         assert torch.equal(counts_drop, histogram_live)
         assert torch.equal(out_drop[:live], out_all[:live])
-        assert not out_drop[live:].any()
+        if not shared:  # the fused shared expert still writes its output into the dropped rows
+            assert not out_drop[live:].any()
         if dsv4:
             assert fused_words and all(w is not None for w in fused_words), fused_words
         else:
@@ -272,8 +318,7 @@ def _drop_worker_impl(real_requests_by_rank: tuple, combine_format: str, routing
 @requires_blackwell
 @pytest.mark.skipif(torch.cuda.device_count() < _WORLD, reason=f"needs {_WORLD} GPUs")
 @pytest.mark.threadleak(enabled=False)  # the pool's manager thread persists by design
-@pytest.mark.parametrize("routing", _ROUTINGS)
-@pytest.mark.parametrize("combine_format", _COMBINE_FORMATS)
+@pytest.mark.parametrize("combine_format,routing", _CASES)
 def test_megamoe_cutedsl_drops_padding_rows(
     moe_multi_gpu_executor, combine_format: str, routing: str
 ) -> None:

@@ -23,8 +23,10 @@ one 32-bit word in device memory, once a kernel that reads it has allocated it: 
 divide T, else the leading T / P * R. The MegaMoE CuteDSL route staging
 (``trtllm::megamoe_stage_routes``) reads the word on the device and writes the other
 rows' routes as expert -1 with weight 0, for kernels whose top-k reduce masks such
-routes (``masks_invalid_combine_slots``): the kernel neither routes nor computes those
-rows and writes their output zero. EPLB statistics still count the dropped rows.
+routes (``masks_invalid_combine_slots``): the routed experts neither route nor compute
+those rows. Their output is zero unless a shared expert is fused into the kernel
+(``megamoe_fuse_shared_expert``), which still computes every row: there they hold its
+output. EPLB statistics still count the dropped rows.
 
 That rule holds for a launch over all rows of the forward. A MoE layer that splits a
 forward into chunks launches over parts of it, so those launches read a word that keeps
