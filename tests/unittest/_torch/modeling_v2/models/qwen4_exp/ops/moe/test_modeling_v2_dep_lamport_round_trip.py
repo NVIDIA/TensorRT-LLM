@@ -207,3 +207,19 @@ def test_round_trip_matches_nccl_ring(world, step, via_pointers):
     import torch.multiprocessing as mp
 
     mp.spawn(_rank_main, args=(_free_port(), world, step, via_pointers), nprocs=world, join=True)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device pointer")
+def test_buffers_from_pointers_are_bf16_views_of_the_pointed_memory():
+    """`buffers_from_pointers` hands `build_on` bf16 `workspace_shape` tensors over the very
+    bytes it was pointed at, on any one GPU (the 4- and 8-rank cells above need a tray)."""
+    world, rows = 2, 3
+    shape = op.workspace_shape(HIDDEN, rows, world)
+    owned = [torch.randn(shape, device="cuda").to(torch.bfloat16) for _ in range(world)]
+    views = op.buffers_from_pointers(
+        [b.data_ptr() for b in owned], HIDDEN, rows, world, torch.cuda.current_device()
+    )
+    for view, buf in zip(views, owned):
+        assert view.dtype is torch.bfloat16 and tuple(view.shape) == shape
+        assert view.data_ptr() == buf.data_ptr()
+        assert torch.equal(view.view(torch.int16), buf.view(torch.int16))

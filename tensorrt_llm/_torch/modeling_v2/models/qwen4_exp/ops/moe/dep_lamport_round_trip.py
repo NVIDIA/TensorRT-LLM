@@ -668,15 +668,18 @@ def workspace_bytes(hidden: int, max_rows: int, world: int) -> int:
 def buffers_from_pointers(ptrs, hidden: int, max_rows: int, world: int, device_index: int) -> list:
     """Every rank's buffer, given as this process's device pointers to them (rank order), as bf16
     `workspace_shape` tensors on `cuda:<device_index>` (DLPack with the device stated: a mapping of
-    another node's memory is this GPU's to touch). They do not own the memory."""
+    another node's memory is this GPU's to touch). They do not own the memory.
+
+    The memory is packed as int16 and viewed as bf16: `pack_strided_memory` states every float
+    dtype with DLPack's IEEE float code, so a bf16 request would come back as float16."""
     from tensorrt_llm._dlpack_utils import pack_strided_memory
 
     shape = workspace_shape(hidden, max_rows, world)
     nbytes = workspace_bytes(hidden, max_rows, world)
     return [
-        pack_strided_memory(int(ptr), nbytes, nbytes, 1, torch.bfloat16, device_index)[0].view(
-            shape
-        )
+        pack_strided_memory(int(ptr), nbytes, nbytes, 1, torch.int16, device_index)[0]
+        .view(torch.bfloat16)
+        .view(shape)
         for ptr in ptrs
     ]
 
