@@ -491,7 +491,7 @@ class AdaptiveRuntime:
         self.decision = decision
         self.gather = gather
         self.leave = threading.Event()
-        self.gathers_posted = self._gathers_run = 0  # all-gathers posted to / run by the worker
+        self.gathers_posted = self._gathers_run = 0  # all-gathers posted to / completed by worker
         self.worker = _WorkerThread()
         # Closed before the interpreter finalizes even without a shutdown: a daemon worker that
         # returns from a collective while the interpreter finalizes ends inside the C++ call, and
@@ -544,21 +544,28 @@ class AdaptiveRuntime:
             return
         self._closed = True
         atexit.unregister(self.close)
-        self.worker.jobs.put(None)
-        self.worker.join(timeout=CLOSE_WAIT_S)
-        # Zeros for the all-gathers its worker missed: a window's statistics, then an install's ROW.
-        for index in range(self._gathers_run, 0 if self.worker.is_alive() else gathers):
-            row = torch.zeros(len(ROW), dtype=torch.float64)
-            send = row if index % 2 else torch.zeros_like(self._own_stats)
-            self.gather(send, [torch.empty_like(send) for _ in self._gathered], self.leave)
-        if self.worker.is_alive():
-            self.leave.set()
-            self.worker.join(timeout=CLOSE_WAIT_S)
-        if self.worker.is_alive():
-            from tensorrt_llm.logger import logger
+        from tensorrt_llm.logger import logger
 
-            logger.warning("adaptive EPLB: the worker thread did not end at its close")
-        self.decision.close()
+        try:
+            self.worker.jobs.put(None)
+            self.worker.join(timeout=CLOSE_WAIT_S)
+            # Zeros for the all-gathers its worker missed: a window's statistics, then an install's
+            # ROW. One that fails (a peer's all-gather timed out and closed the group's connection)
+            # leaves the rest: nothing waits for them on that group any more.
+            try:
+                for index in range(self._gathers_run, 0 if self.worker.is_alive() else gathers):
+                    row = torch.zeros(len(ROW), dtype=torch.float64)
+                    send = row if index % 2 else torch.zeros_like(self._own_stats)
+                    self.gather(send, [torch.empty_like(send) for _ in self._gathered], self.leave)
+            except Exception as error:  # noqa: BLE001 - shutdown goes on without the peers
+                logger.warning(f"adaptive EPLB: an all-gather of its close failed: {error!r}")
+            if self.worker.is_alive():
+                self.leave.set()
+                self.worker.join(timeout=CLOSE_WAIT_S)
+            if self.worker.is_alive():
+                logger.warning("adaptive EPLB: the worker thread did not end at its close")
+        finally:
+            self.decision.close()
 
     def counters(self) -> dict[str, int]:
         """The windows closed, the installs applied (updates with new route tables) and the layers
@@ -699,8 +706,8 @@ class AdaptiveRuntime:
         own[n * (experts + 1) : n * (experts + 2)] = self.applied_window
         stats_copy_ms = self._stats_copy_begin.elapsed_time(self._stats_copy_end)
         own[n * (experts + 2) :] = (*totals, stats_copy_ms, *self.last_applied)
-        self._gathers_run += 1
         self.gather(self._own_stats, self._gathered, self.leave)
+        self._gathers_run += 1  # completed: a failed all-gather is one its close still owes
         self._event(
             "window",
             window=window,
@@ -736,8 +743,8 @@ class AdaptiveRuntime:
             ms = self._copy_begin.elapsed_time(self._copy_end)
         row = (self.call, len(update.moved), ms, update.digest)
         rows = torch.zeros(len(self._gathered), len(ROW), dtype=torch.float64)
-        self._gathers_run += 1
         self.gather(torch.tensor(row, dtype=torch.float64), list(rows), self.leave)
+        self._gathers_run += 1
         rows = rows.numpy()
         if update.empty and self._agreed(update, rows):
             return self._settle_empty(update, rows)

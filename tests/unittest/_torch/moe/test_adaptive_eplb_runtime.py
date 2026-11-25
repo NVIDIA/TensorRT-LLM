@@ -782,6 +782,94 @@ def test_shutdown_completes_an_all_gather_that_only_some_ranks_posted(host_cuda,
     assert ranks[1].worker.failure is None and ranks[1].worker.inbox[-1][0] == "copied"
 
 
+_GATHER_TIMEOUT_SCRIPT = """
+import os, sys, time
+from datetime import timedelta
+from types import SimpleNamespace
+import numpy as np
+import torch
+import torch.distributed as dist
+from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb import runtime as rt
+from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb.balancer import ep_gather
+from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb.policy import ExpertGeometry, ExpertStatistics, statistics_buffers
+
+rank, store, timeout_s = int(sys.argv[1]), sys.argv[2], float(sys.argv[3])
+torch.cuda.Event = lambda **kwargs: SimpleNamespace(
+    record=lambda stream=None: None, query=lambda: True, synchronize=lambda: None, elapsed_time=lambda end: 0.0)
+dist.init_process_group("gloo", store=dist.FileStore(store, 2), rank=rank, world_size=2)
+group = dist.new_group([0, 1], backend="gloo", timeout=timedelta(seconds=timeout_s))
+experts, layers, table = 8, 2, 2 * (8 + 12)
+home = ExpertGeometry(experts, 12, 2).home_layout().tolist()
+buffers = statistics_buffers(layers, experts, "cpu")
+on = torch.ones(1, dtype=torch.int32)
+handles = [SimpleNamespace(expert_count=experts, num_slots=12, home_layout=lambda: home,
+                           statistics=ExpertStatistics.of(buffers, i, on)) for i in range(layers)]
+
+
+class Decision:  # rank 0's decision of window 0 fails; rank 1's publishes a table and moves nothing
+    stats, closed = torch.zeros(2, rt.window_stats_size(layers, experts)), False
+
+    def ask(self, message):
+        if rank == 0:
+            raise KeyError("no decision")
+        update = rt.LayoutUpdate(message[1], tables={0: np.full(table, 1, np.int32)})
+        update.digest = update.fingerprint()
+        return ("update", update)
+
+    def close(self):
+        self.closed = True
+
+
+decision = Decision()
+runtime = rt.AdaptiveRuntime(handles, None, None, decision, ep_gather(group), "cpu",
+                             torch.zeros(layers, table, dtype=torch.int32), buffers)
+runtime.boundary()  # window 0 opens
+runtime.boundary()  # it closes: both ranks all-gather its statistics
+deadline = time.monotonic() + 30
+while not (runtime.worker.failure if rank == 0 else runtime.worker.inbox):
+    assert time.monotonic() < deadline
+    time.sleep(0.01)
+runtime.boundary()  # rank 1 posts the install's all-gather; rank 0, stopped, never does
+if rank == 1:  # it runs into the group's timeout
+    while runtime.worker.failure is None:
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+votes = [None, None]
+dist.all_gather_object(votes, runtime.gathers_posted)  # balancer.shutdown's vote
+error = None
+try:
+    runtime.close(max(votes))
+except Exception as exc:
+    error = type(exc).__name__
+print("closed", error, decision.closed, flush=True)
+os._exit(0)
+"""
+
+
+def test_shutdown_after_a_peers_all_gather_timed_out_closes_every_rank(tmp_path):
+    """Rank 0 stops before an install's all-gather that rank 1 posted; rank 1's all-gather runs into
+    the gloo group's timeout, which closes the group's connections. At shutdown every rank still
+    closes without an error and stops its decision process."""
+    script = tmp_path / "gather_timeout.py"
+    script.write_text(_GATHER_TIMEOUT_SCRIPT)
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("PMIX", "PMI_", "OMPI_"))}
+    env["TLLM_DISABLE_MPI"] = "1"
+    cmd = [sys.executable, str(script)]
+    ranks = [
+        subprocess.Popen(
+            [*cmd, str(rank), str(tmp_path / "store"), "3"],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for rank in range(2)
+    ]
+    outputs = [rank.communicate(timeout=120) for rank in ranks]
+    for rank, (out, err) in enumerate(outputs):
+        assert "closed None True" in out, f"rank {rank}: {out[-2000:]} {err[-4000:]}"
+
+
 _EXIT_SCRIPT = """
 import atexit, os, sys, time
 from types import SimpleNamespace
