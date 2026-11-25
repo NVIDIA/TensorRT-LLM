@@ -1,8 +1,15 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+import pytest
+
 from tensorrt_llm.scaffolding.math_utils import (
     extract_answer_from_boxed,
     get_digit_majority_vote_result,
     get_majority_result,
 )
+
+pytestmark = pytest.mark.cpu_only
 
 
 def test_extract_answer_from_boxed_basic():

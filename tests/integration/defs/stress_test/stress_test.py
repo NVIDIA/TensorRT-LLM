@@ -46,9 +46,11 @@ import pytest
 import requests
 import yaml
 from defs.common import get_free_port_in_ci, parse_gsm8k_output
-from defs.conftest import get_device_count, get_device_memory, llm_models_root
+from defs.conftest import (get_device_count, get_device_memory, get_sm_version,
+                           is_sm_100f, is_sm_120f, llm_models_root)
 from defs.trt_test_alternative import (Popen, cleanup_process_tree, print_info,
                                        print_warning)
+from test_common.moe_tactics import fp8_block_scales_moe_tactic
 
 # Install aiperf in requirements-dev.txt will affect triton and pytorch version mismatch
 # def aiperf_install():
@@ -666,34 +668,31 @@ def stress_test(config,
 
         extra_llm_options["enable_attention_dp"] = True
 
-        # Set MOE backend based on GPU architecture and checkpoint type
-        # B200/GB200 (Blackwell, SM100+) with FP8 checkpoints: use DEEPGEMM backend
-        # B200/GB200 (Blackwell, SM100+) with NVFP4 checkpoints: use CUTEDSL backend
-        # H100/H200 (Hopper, SM90) with FP8 checkpoints: use CUTLASS backend (default)
-        try:
-            import torch
-            if torch.cuda.is_available():
-                device_capability = torch.cuda.get_device_capability(0)
-                is_blackwell = device_capability[0] >= 10
-                is_nvfp4 = "FP4" in config.model_dir.upper()
+        # Pin the MoE tactic per GPU family and checkpoint type:
+        # SM100 family (B200/GB200/B300/GB300): CuteDSL grouped GEMM for NVFP4,
+        #   DeepGEMM grouped GEMM for FP8 block scales;
+        # SM120 family with NVFP4: CUTLASS (the b12x kernels do not support
+        #   the attention DP and expert parallelism set above);
+        # any other case (Hopper, SM120 family with FP8): the default AUTO
+        #   selection.
+        sm_version = get_sm_version()
+        is_nvfp4 = "FP4" in config.model_dir.upper()
+        moe_tactic = None
+        if is_sm_100f(sm_version):
+            moe_tactic = ("cutedsl.grouped_gemm"
+                          if is_nvfp4 else fp8_block_scales_moe_tactic())
+        elif is_sm_120f(sm_version) and is_nvfp4:
+            moe_tactic = "cutlass"
 
-                if is_blackwell:
-                    if is_nvfp4:
-                        moe_backend = "CUTEDSL"
-                    else:
-                        moe_backend = "DEEPGEMM"
-
-                    extra_llm_options["moe_config"] = {
-                        "backend": moe_backend,
-                    }
-                    checkpoint_type = "NVFP4" if is_nvfp4 else "FP8"
-                    print_info(
-                        f"Detected GPU architecture is SM{device_capability[0]}{device_capability[1]} (Blackwell), "
-                        f"using {moe_backend} MOE backend for DeepSeek-R1/DeepSeek-V3 with {checkpoint_type} checkpoints"
-                    )
-        except Exception as e:
-            print_warning(f"Failed to detect GPU architecture: {e}. "
-                          "Using default MOE backend (CUTLASS).")
+        if moe_tactic is not None:
+            extra_llm_options["moe_config"] = {
+                "tactic": moe_tactic,
+            }
+            checkpoint_type = "NVFP4" if is_nvfp4 else "FP8"
+            print_info(
+                f"Detected GPU architecture is SM{sm_version}, "
+                f"using MoE tactic {moe_tactic} for DeepSeek-R1/DeepSeek-V3 with {checkpoint_type} checkpoints"
+            )
 
         extra_llm_options.update({
             "cuda_graph_config": {
@@ -719,7 +718,7 @@ def stress_test(config,
                 "enable_padding": True,
             },
             "moe_config": {
-                "backend": "TRTLLM",
+                "tactic": "trtllm_gen",
             },
             "kv_cache_config": {
                 # FP8 KV cache is required on SM103 when chunked prefill or

@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Launch geometry and per-step KV split plan of the packed FP4 MLA decode."""
 
-import os
 from typing import Any, NamedTuple, Sequence
 
 import torch
@@ -10,12 +9,12 @@ import torch
 from .config import (
     _FP4_MLA_PACKED_MAX_SPLITS,
     _FP4_MLA_PACKED_MIN_TILES_PER_SPLIT,
-    _FP4_MLA_SPLIT_KV_ENV,
     FP4_MLA_SCALE_ROW_GROUP,
     _ceil_div,
     _fp4_mla_cutedsl_kernel_module,
     _fp4_mla_packed_rows_per_seq,
     _fp4_mla_packed_wave_plan_enabled,
+    _fp4_mla_split_kv_override,
     _fp4_mla_split_on_demand_enabled,
 )
 from .layout import _ensure_workspace_tensor, _max_sequences
@@ -69,7 +68,7 @@ def _select_packed_split_count(
     longest KV and keep at least _FP4_MLA_PACKED_MIN_TILES_PER_SPLIT KV tiles
     per split. ``TRTLLM_FP4_MLA_SPLIT_KV`` overrides the count for testing.
     """
-    override = os.getenv(_FP4_MLA_SPLIT_KV_ENV, "auto")
+    override = _fp4_mla_split_kv_override()
     if override != "auto":
         return max(1, min(int(override), _FP4_MLA_PACKED_MAX_SPLITS))
     splits = _graph_split_budget(num_requests, _packed_wave_tasks(device, m_tiles))
@@ -164,10 +163,10 @@ def _on_demand_split_count(
         splits <= 1
         or helix
         or not _fp4_mla_split_on_demand_enabled()
-        or os.getenv(_FP4_MLA_SPLIT_KV_ENV, "auto") != "auto"
+        or _fp4_mla_split_kv_override() != "auto"
     ):
         return splits
-    decided = getattr(metadata.fp4_mla_state, "packed_split", None)
+    decided = metadata.fp4_mla_state.packed_split
     if decided is not None:
         return splits if decided else 1
     if bool(getattr(metadata, "is_cuda_graph", False)):
@@ -192,7 +191,7 @@ def packed_split_task_bound(max_requests: int, m_tiles: int, device: torch.devic
     """Largest ``splits * requests`` any batch up to ``max_requests`` can ask for: the capacity of the shared
     split-KV scratch (``layout._ensure_workspace_tensor``). The graph rule bounds the eager rule (eager only caps
     the splits further by the KV length) and the eager floor of 32 slots is kept."""
-    override = os.getenv(_FP4_MLA_SPLIT_KV_ENV, "auto")
+    override = _fp4_mla_split_kv_override()
     if override != "auto":
         splits = max(1, min(int(override), _FP4_MLA_PACKED_MAX_SPLITS))
         return max(32, splits * max(1, int(max_requests)))
@@ -269,7 +268,7 @@ def _fp4_mla_packed_plan_geometry(
         return None
     if not metadata.fp4_mla_state.device_page_table:
         return None
-    # The fixed-stride generation page-table capacity (see _max_generation_pages).
+    # The fixed-stride generation page-table capacity.
     max_pages = int(metadata.fp4_mla_state.page_table_stride)
     if max_pages <= 0:
         return None
@@ -324,8 +323,8 @@ def _fp4_mla_packed_plan_geometry(
     from .fp4_mla_packed_reduce import packed_plan_length
 
     tasks = splits * num_requests
-    # Graph buckets hold exactly their tasks; eager metadata grows on demand. The buffers themselves are
-    # process-wide (layout._ensure_workspace_tensor), sized once for the largest batch any bucket can bring.
+    # Graph buckets hold exactly their tasks; eager metadata grows on demand.
+    # Plans retain metadata ownership and reserve the engine capacity.
     task_capacity = tasks if is_cuda_graph else max(tasks, 32)
     max_requests = max(_max_sequences(metadata), num_requests)
     slots_bound, slot_rows_bound = packed_split_scratch_bound(
@@ -339,6 +338,7 @@ def _fp4_mla_packed_plan_geometry(
         (packed_plan_length(num_requests, task_capacity),),
         dtype=torch.int32,
         device=device,
+        shared=False,
         capacity_numel=packed_plan_length(max_requests, task_bound),
     )
     kv_lens = metadata.fp4_mla_state.generation_kv_lens

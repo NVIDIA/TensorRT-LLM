@@ -25,14 +25,14 @@ import torch
 if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
     pytest.skip("the GLM-5.2 target imports sm_103 CuTe DSL kernels", allow_module_level=True)
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4 import (  # noqa: E402, E501
-    spec_worker as op,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.kernels.spec import (  # noqa: E402, E501
-    draft_loop as K,
-)
 from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import (  # noqa: E402
     DSAtrtllmAttentionMetadata,
+)
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4 import (  # noqa: E402, E501
+    spec_worker as op,
+)
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.kernels.spec import (  # noqa: E402, E501
+    draft_loop as K,
 )
 from tensorrt_llm._torch.speculative.interface import SpecWorkerBase  # noqa: E402
 from tensorrt_llm.deep_gemm import get_paged_mqa_logits_metadata  # noqa: E402
@@ -249,6 +249,8 @@ def _metadata(batch, draft_len, expand, seed, seq_len, skip=False, gvr=False):
         _indexer_compress_ratio=1,
         runtime_tokens_per_gen_step=0,
         max_draft_tokens=draft_len,
+        # Enable the full DeepGEMM schedule for parity with the fused producer's writes.
+        sparse_metadata_params=SimpleNamespace(use_cute_dsl_paged_mqa_logits=False),
         kv_lens_cuda_2d=torch.randint(0, 9, (cap, 1 + draft_len), generator=g,
                                       dtype=torch.int32).to(DEV),
         num_sms=num_sms,
@@ -427,7 +429,7 @@ def test_worker_overrides_are_model_local() -> None:
 def test_greedy_draft_pick_through_the_engine_entry(argmax_on) -> None:
     """`SpecWorkerBase.sample_draft_tokens` reaches the override (CuTe DSL argmax, or the
     built-in argmax when it is off) with and without the step's `out` row."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.sampling import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.sampling import (  # noqa: E501
         cute_dsl_argmax as argmax_entry,
     )
 

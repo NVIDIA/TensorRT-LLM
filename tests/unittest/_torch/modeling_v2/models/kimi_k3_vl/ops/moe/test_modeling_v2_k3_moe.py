@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the moe/k3_moe catalog entry: trtllm::k3_moe on its caller-owned state, both builds.
+"""GPU test for the moe/k3_moe op: trtllm::k3_moe on its caller-owned state, both builds.
 
 One GPU (sm_100), one rank of the Kimi K3 TP16 deployment's routed experts: experts TP4 x EP4, so 224 of the 896
 experts are local (global ids [224, 448)) with intermediate 768 per rank. The experts are random checkpoint-format
@@ -33,15 +33,13 @@ import pytest
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 -- registers the stock path's ops
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.moe.k3_moe import (
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.moe.k3_moe import (
     K3MoeState,
     K3MoeWideState,
     is_supported,
     k3_moe,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.moe.k3_route_quant import (
-    k3_route_quant,
-)
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.moe.k3_route_quant import k3_route_quant
 
 __extra_import_path__ = ["../../../.."]
 from _validating import validating
@@ -163,7 +161,7 @@ def _bias() -> torch.Tensor:
     return _experts()[2]
 
 
-def _weights(p):
+def _weights(p) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """A layer's four TRTLLM-Gen buffers, in K3MoeState.layer's argument order."""
     return p["w31"], p["w31s"], p["w2"], p["w2s"]
 
@@ -227,7 +225,7 @@ def _draw(seed: int, rows: int):
     return logits, torch.randn(rows, H, generator=gen, device=DEV).bfloat16()
 
 
-def _routed_zeros(rows: int):
+def _routed_zeros(rows: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """k3_moe's inputs for ``rows`` tokens, all zero: (x_fp8, x_sf, topk_ids, topk_weights)."""
     return (
         torch.zeros(rows, H, dtype=torch.float8_e4m3fn, device=DEV),
@@ -306,9 +304,7 @@ def _snapshot(state, layers):
 def _cold_k3_moe_cache():
     """trtllm::k3_moe's compile cache emptied for the duration (and restored after): the next call of every build is
     a first call."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import (
-        op,
-    )
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import op
 
     saved = dict(op._compiled)
     op._compiled.clear()
@@ -884,3 +880,34 @@ def test_negative_control_weights_rebound_after_layer():
         t.copy_(e2[name])  # in place: the buffers the stale layers read now hold E2
     assert _same(_call(stale, lg8, x8), y_e2)
     assert _same(_call(stale_wide, lg40, x40), yw_e2)
+
+
+@pytest.mark.parametrize("rows", [9, 33, 64])
+def test_k3_moe_wide_shared_experts(rows):
+    """Shared experts span partial groups, both token masks, and all eight groups per expert."""
+    state, layers = _wide()
+    layer = layers[0]
+    proc, raw, bias = _experts()
+    generator = torch.Generator(device=DEV).manual_seed(20261031 + rows)
+    chosen = list(range(OFFSET + E_LOCAL - TOP_K, OFFSET + E_LOCAL))
+    logits = _chosen_logits([chosen] * rows, generator)
+    latent = torch.randn(rows, H, generator=generator, device=DEV).bfloat16()
+    stock, ids, weights, x_fp8, x_sf = _stock(proc, bias, latent, logits)
+    expected_ids = torch.tensor(chosen, dtype=ids.dtype, device=ids.device)
+    assert torch.equal(ids.sort(dim=1).values, expected_ids.expand(rows, -1))
+    assert bool((weights > 0).all())
+    assert _groups_wide(ids) == TOP_K * ((rows + DECODE_MAX - 1) // DECODE_MAX)
+
+    output = k3_moe(x_fp8, x_sf, ids, weights, OFFSET, layer)
+    torch.cuda.synchronize()
+    assert output.shape == (rows, H) and output.dtype == torch.bfloat16
+    assert output.device == latent.device and output.is_contiguous()
+    reference = k3_moe.reference(raw, x_fp8, x_sf, ids, weights, OFFSET)
+    assert _compare(output, reference)["ok"]
+    assert _compare(output, stock)["ok"]
+    assert _armed(state, layers)
+
+    repeated = k3_moe(x_fp8, x_sf, ids, weights, OFFSET, layer)
+    torch.cuda.synchronize()
+    assert _same(repeated, output)
+    assert _armed(state, layers)

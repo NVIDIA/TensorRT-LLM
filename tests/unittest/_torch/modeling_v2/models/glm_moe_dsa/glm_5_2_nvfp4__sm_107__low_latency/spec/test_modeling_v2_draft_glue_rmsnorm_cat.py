@@ -7,10 +7,10 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2._native import NoTarget
+from tensorrt_llm._torch.modeling_v2._native import NoTarget
 
 try:
-    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.spec.draft_glue_rmsnorm_cat import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.spec.draft_glue_rmsnorm_cat import (  # noqa: E501
         glm_draft_glue_rmsnorm_cat as op,
     )
 except NoTarget as exc:
@@ -47,7 +47,9 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
     assert_within_ulp(out, ref, element_ulp=2.0, rms_ulp=0.25)
 
 
-def _build(spec, seed):
+def _build(
+    spec, seed
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float, int, int]:
     g = torch.Generator(device="cuda").manual_seed(seed)
     rows, vocab = spec["rows"], spec["vocab"]
     table = torch.randn(vocab, HIDDEN, generator=g, device="cuda", dtype=torch.bfloat16)
@@ -70,7 +72,10 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by
     certifying(op)
     out = op(*args, True)
     assert out.is_contiguous() and out.shape == (cell.spec["rows"], args[7] - args[6])
-    _compare(out, op.reference(*args, True))
+    _compare(
+        out,
+        op.reference(*args, True),
+    )
 
 
 def test_window_is_flashinfer_rmsnorm_bitwise() -> None:

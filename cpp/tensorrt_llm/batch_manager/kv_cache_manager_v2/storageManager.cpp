@@ -21,6 +21,7 @@
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/copyEngine.h"
 #include "kv_cache_manager_v2/exceptions.h"
+#include "kv_cache_manager_v2/localityDomain.h"
 #include "kv_cache_manager_v2/page.h"
 #include "kv_cache_manager_v2/stagingBuffer.h"
 #include "kv_cache_manager_v2/storage/remoteMem.h"
@@ -225,7 +226,8 @@ void trimRetainedPageIndices(std::vector<PageIndexPair>& pageIndices)
     }
 }
 
-void sortFallenPagesByPriority(TypedVec<LifeCycleId, std::deque<SharedPtr<Page>>>& fallenPages)
+void sortFallenPagesByPriority(
+    TypedVec<LifeCycleId, std::deque<SharedPtr<Page>, PoolAllocator<SharedPtr<Page>>>>& fallenPages)
 {
     for (auto& pages : fallenPages)
     {
@@ -292,7 +294,7 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     std::unique_ptr<IKvCacheColdPageCodec> coldPageCodec, std::optional<SwaScratchReuseConfig> swaScratchReuse,
     std::optional<BatchDesc> const& typicalBatch, std::vector<BatchDesc> const& constraints,
     std::optional<std::vector<float>> const& initialPoolRatio, std::shared_ptr<EventSink> eventSink,
-    float maxUtilForResume, Priority coldTierOffloadMinPriority)
+    float maxUtilForResume, Priority coldTierOffloadMinPriority, std::optional<BatchDesc> const& coldTypicalBatch)
     : mLifeCycles(lifeCycles)
     , mEventSink(std::move(eventSink))
     , mColdTierOffloadMinPriority(coldTierOffloadMinPriority)
@@ -382,9 +384,31 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
         sparsePools.push_back(std::move(sparse));
     }
 
+    auto const& gpuTierConfig = std::get<GpuCacheTierConfig>(config.cacheTiers[kHotLevel]);
     size_t const gpuQuota = cacheTierQuota(config.cacheTiers[kHotLevel]);
-    mGpuPhysMemAllocator
-        = std::make_unique<PooledPhysMemAllocator>(tierAllocationGranularity(CacheTier::GPU_MEM, gpuQuota));
+    size_t const gpuTierGranularity = tierAllocationGranularity(CacheTier::GPU_MEM, gpuQuota);
+    mNumLocalityDomains = resolveNumLocalityDomains(gpuTierConfig.enableLocalityDomains);
+    if (mNumLocalityDomains > 1)
+    {
+        // Each domain can strand up to one partial chunk per pool group. A slot size with a small power-of-two
+        // factor makes that chunk large; past this bound the split wastes more memory than locality is worth.
+        size_t chunkBytes = 0;
+        for (auto const& slotSizeList : slotSizeLists)
+        {
+            chunkBytes += localityDomainChunkSlots(slotSizeList, gpuTierGranularity)
+                * std::accumulate(slotSizeList.begin(), slotSizeList.end(), size_t{0});
+        }
+        size_t const maxChunkBytes = std::max(gpuQuota / mNumLocalityDomains / 16, 64 * gpuTierGranularity);
+        if (chunkBytes > maxChunkBytes)
+        {
+            TLLM_LOG_WARNING(
+                "KVCacheManagerV2: locality domains disabled; the slot sizes need %zu MiB chunks per domain, above "
+                "the %zu MiB limit",
+                chunkBytes >> 20, maxChunkBytes >> 20);
+            mNumLocalityDomains = 1;
+        }
+    }
+    mGpuPhysMemAllocator = std::make_unique<PooledPhysMemAllocator>(gpuTierGranularity, mNumLocalityDomains);
     size_t const gpuGranularity = mGpuPhysMemAllocator->physMemSize();
 
     // Constraints are hot-level feasibility floors. They are scaled by
@@ -471,7 +495,8 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
                                                                   : defaultHostSparsePoolQuota(config.cacheTiers);
     // From the descriptors: the level's storage does not exist yet.
     auto gpuSlotCounts = computeSlotCountForLevel(config.cacheTiers[kHotLevel], slotSizeLists, hotRatio, mHotMinSlots,
-        gpuGranularity, _secondaryBudget(sparsePools, hostMemSizeGranularity(), mHostSparsePoolQuota), mFixedSlots);
+        gpuGranularity, _secondaryBudget(sparsePools, hostMemSizeGranularity(), mHostSparsePoolQuota), mFixedSlots,
+        mNumLocalityDomains);
     mLevels.emplace_back(lifeCycleGrouping(kHotLevel), kHotLevel, config.cacheTiers[kHotLevel], slotDescList(kHotLevel),
         gpuSlotCounts, mGpuPhysMemAllocator.get(), HostMemBackingOptions{}, mHostSparsePoolQuota);
     for (PoolGroupIndex pgIdx{0}; pgIdx < numPoolGroups(); ++pgIdx)
@@ -613,15 +638,26 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     for (CacheLevel level{1}; level < config.cacheTiers.size(); ++level)
     {
         TLLM_CHECK(appendLevelSlotDescList(coldSlotDescList) == level);
+        // An explicit remote pool ratio wins, then the cold typical step, then the hot level's projection.
         auto const& remotePoolRatio = remotePoolRatios[level];
         auto const coldRatio = remotePoolRatio.has_value() ? levelShareRatio(level, *remotePoolRatio)
-                                                           : projectPoolGroupRatio(kHotLevel, level, lifeCycleRatio);
+            : coldTypicalBatch.has_value() ? coldPoolGroupRatioFromBatch(level, *coldTypicalBatch, tokensPerBlock)
+                                           : projectPoolGroupRatio(kHotLevel, level, lifeCycleRatio);
         // No second budget: a cold group is a single pool holding whatever the codec packs
         // into it, dense and sparse buffers alike, so its quota pays for all of it.
         auto slotCounts = computeSlotCountForLevel(
             config.cacheTiers[level], coldSlotSizeLists, coldRatio, coldMinSlots, gpuGranularity);
         auto* gpuPhysMemAllocator
             = cacheTierOf(config.cacheTiers[level]) == CacheTier::GPU_MEM ? mGpuPhysMemAllocator.get() : nullptr;
+        // The shared allocator would place this tier per domain while allocation always targets
+        // domain 0 on non-hot levels, stranding the other domains' share.
+        if (gpuPhysMemAllocator != nullptr && mNumLocalityDomains > 1)
+        {
+            throw std::invalid_argument(
+                "Locality domains are supported only when the GPU tier is the hot tier; "
+                "cache tier "
+                + std::to_string(level.value()) + " is a GPU tier");
+        }
         mLevels.emplace_back(lifeCycleGrouping(level), level, config.cacheTiers[level], slotDescList(level), slotCounts,
             gpuPhysMemAllocator, tierBackingOptions(config.cacheTiers[level], gpuGranularity, config.hostMemBacking),
             std::nullopt, remoteClientFor(config.cacheTiers[level]));
@@ -912,13 +948,77 @@ void StorageManager::runRemoteTransfer(RemoteMemClient& client, bool write, std:
 // newSlots
 // ---------------------------------------------------------------------------
 
+LocalityDomainId StorageManager::resolveLocalityDomain(
+    CacheLevel level, std::optional<LocalityDomainId> localityDomainId) const
+{
+    if (level != kHotLevel || mNumLocalityDomains == 1)
+    {
+        return LocalityDomainId{0};
+    }
+    TLLM_CHECK_WITH_INFO(localityDomainId.has_value(), "locality_domain_id is required on a localized GPU tier");
+    TLLM_CHECK_WITH_INFO(*localityDomainId >= 0 && *localityDomainId < mNumLocalityDomains,
+        "locality_domain_id %d out of range for %d locality domain(s)", localityDomainId->value(), mNumLocalityDomains);
+    return *localityDomainId;
+}
+
+std::optional<LocalityDomainId> StorageManager::localityDomainFilter(
+    CacheLevel level, std::optional<LocalityDomainId> localityDomainId) const
+{
+    if (level != kHotLevel || mNumLocalityDomains == 1)
+    {
+        return std::nullopt;
+    }
+    return resolveLocalityDomain(level, localityDomainId);
+}
+
+bool StorageManager::localityDomainHint(CacheLevel level) const
+{
+    return level == kHotLevel && mNumLocalityDomains > 1;
+}
+
+SlotCount StorageManager::allocatableSlots(CacheLevel level, PoolGroupBase const& pg, LocalityDomainId domain) const
+{
+    if (!localityDomainHint(level))
+    {
+        return pg.numFreeSlots(domain);
+    }
+    SlotCount total = 0;
+    for (LocalityDomainId d{0}; d < pg.numLocalityDomains(); ++d)
+    {
+        total += pg.numFreeSlots(d);
+    }
+    return total;
+}
+
+std::vector<Slot> StorageManager::allocatePreferring(
+    CacheLevel level, PoolGroupBase& pg, SlotCount numSlots, LocalityDomainId domain)
+{
+    if (!localityDomainHint(level))
+    {
+        return pg.allocateMultiple(numSlots, domain);
+    }
+    std::vector<Slot> slots = pg.allocateMultiple(std::min(numSlots, pg.numFreeSlots(domain)), domain);
+    for (LocalityDomainId d{0}; d < pg.numLocalityDomains(); ++d)
+    {
+        SlotCount const missing = numSlots - slotCountValueFromSize(slots.size());
+        if (d == domain || missing == 0)
+        {
+            continue;
+        }
+        auto more = pg.allocateMultiple(std::min(missing, pg.numFreeSlots(d)), d);
+        std::move(more.begin(), more.end(), std::back_inserter(slots));
+    }
+    return slots;
+}
+
 TypedVec<LifeCycleId, std::vector<Slot>> StorageManager::newSlots(CacheLevel level,
     TypedVec<LifeCycleId, SlotCount> const& numSlotsPerLc, MigrationRecorder const& migrationRecorder,
-    DropRecorder const& dropRecorder)
+    DropRecorder const& dropRecorder, std::optional<LocalityDomainId> localityDomainId)
 {
     auto const& grouping = lifeCycleGrouping(level);
     TLLM_CHECK_DEBUG(numSlotsPerLc.size() == numLifeCycles());
     auto& storage = *mLevels.at(level).storage;
+    LocalityDomainId const domain = resolveLocalityDomain(level, localityDomainId);
 
     // Aggregate by pool group.
     TypedVec<PoolGroupIndex, SlotCount> pgNumSlots(numPoolGroups(level), 0);
@@ -936,7 +1036,7 @@ TypedVec<LifeCycleId, std::vector<Slot>> StorageManager::newSlots(CacheLevel lev
     bool needMore = false;
     for (PoolGroupIndex pgIdx{0}; pgIdx < pgNumSlots.size(); ++pgIdx)
     {
-        if (pgNumSlots[pgIdx] > storage.numFreeSlots(pgIdx))
+        if (pgNumSlots[pgIdx] > storage.numFreeSlots(pgIdx, domain))
         {
             needMore = true;
             break;
@@ -945,13 +1045,13 @@ TypedVec<LifeCycleId, std::vector<Slot>> StorageManager::newSlots(CacheLevel lev
 
     if (needMore)
     {
-        prepareFreeSlots(level, pgNumSlots, migrationRecorder, dropRecorder);
+        prepareFreeSlots(level, pgNumSlots, migrationRecorder, dropRecorder, localityDomainId);
     }
 
     // A14: post-condition — free-slot counts satisfy requirements.
     for (PoolGroupIndex pgIdx{0}; pgIdx < pgNumSlots.size(); ++pgIdx)
     {
-        TLLM_CHECK_DEBUG_WITH_INFO(pgNumSlots[pgIdx] <= storage.numFreeSlots(pgIdx),
+        TLLM_CHECK_DEBUG_WITH_INFO(pgNumSlots[pgIdx] <= allocatableSlots(level, poolGroup(level, pgIdx), domain),
             "Free slot count does not satisfy requirement after prepareFreeSlots");
     }
 
@@ -962,7 +1062,7 @@ TypedVec<LifeCycleId, std::vector<Slot>> StorageManager::newSlots(CacheLevel lev
         for (LifeCycleId lcId{0}; lcId < ret.size(); ++lcId)
         {
             PoolGroupIndex pg = grouping[lcId];
-            ret[lcId] = storage.allocateMultiple(pg, numSlotsPerLc[lcId]);
+            ret[lcId] = allocatePreferring(level, poolGroup(level, pg), numSlotsPerLc[lcId], domain);
         }
     }
     catch (...)
@@ -980,27 +1080,29 @@ TypedVec<LifeCycleId, std::vector<Slot>> StorageManager::newSlots(CacheLevel lev
 
 TypedVec<LifeCycleId, std::vector<Slot>> StorageManager::newGpuSlots(
     TypedVec<LifeCycleId, SlotCount> const& numSlotsPerLc, MigrationRecorder const& migrationRecorder,
-    DropRecorder const& dropRecorder)
+    DropRecorder const& dropRecorder, std::optional<LocalityDomainId> localityDomainId)
 {
-    return newSlots(kHotLevel, numSlotsPerLc, migrationRecorder, dropRecorder);
+    return newSlots(kHotLevel, numSlotsPerLc, migrationRecorder, dropRecorder, localityDomainId);
 }
 
 std::vector<Slot> StorageManager::newSlotsForPoolGroup(CacheLevel level, PoolGroupIndex pgIdx, SlotCount numSlots,
-    MigrationRecorder const& migrationRecorder, DropRecorder const& dropRecorder)
+    MigrationRecorder const& migrationRecorder, DropRecorder const& dropRecorder,
+    std::optional<LocalityDomainId> localityDomainId)
 {
     if (numSlots < 0)
     {
         throw LogicError("StorageManager::newSlotsForPoolGroup: numSlots must be non-negative");
     }
     auto& storage = *mLevels.at(level).storage;
-    if (numSlots > storage.numFreeSlots(pgIdx))
+    LocalityDomainId const domain = resolveLocalityDomain(level, localityDomainId);
+    if (numSlots > storage.numFreeSlots(pgIdx, domain))
     {
         TypedVec<PoolGroupIndex, SlotCount> requirements(numPoolGroups(level), 0);
         requirements.at(pgIdx) = numSlots;
-        prepareFreeSlots(level, requirements, migrationRecorder, dropRecorder);
+        prepareFreeSlots(level, requirements, migrationRecorder, dropRecorder, localityDomainId);
     }
-    TLLM_CHECK_DEBUG(numSlots <= storage.numFreeSlots(pgIdx));
-    return storage.allocateMultiple(pgIdx, numSlots);
+    TLLM_CHECK_DEBUG(numSlots <= allocatableSlots(level, poolGroup(level, pgIdx), domain));
+    return allocatePreferring(level, poolGroup(level, pgIdx), numSlots, domain);
 }
 
 Address StorageManager::slotAddress(CacheLevel level, PoolGroupIndex pgIdx, SlotId slotId, PoolIndex poolIdx) const
@@ -1694,6 +1796,11 @@ void StorageManager::writeThroughToDisk(CacheLevel hostLevel, std::vector<Shared
     }
 }
 
+std::optional<LocalityDomainId> StorageManager::localityDomainOf(CacheLevel level, LifeCycleId lc, SlotId slot) const
+{
+    return mLevels.at(level).storage->poolGroup(getPoolGroupIndex(level, lc)).localityDomainOf(slot);
+}
+
 // ---------------------------------------------------------------------------
 // isEvictable
 // ---------------------------------------------------------------------------
@@ -1828,7 +1935,8 @@ void StorageManager::excludeFromEviction(Page& page)
 // ---------------------------------------------------------------------------
 
 void StorageManager::prepareFreeSlots(CacheLevel level, TypedVec<PoolGroupIndex, SlotCount> const& requirements,
-    MigrationRecorder const& migrationRecorder, DropRecorder const& dropRecorder)
+    MigrationRecorder const& migrationRecorder, DropRecorder const& dropRecorder,
+    std::optional<LocalityDomainId> localityDomainId)
 {
     refreshRetention();
     dropPagesOfFailedRemoteLevels();
@@ -1836,7 +1944,35 @@ void StorageManager::prepareFreeSlots(CacheLevel level, TypedVec<PoolGroupIndex,
     {
         try
         {
-            _prepareFreeSlots(level, requirements, migrationRecorder, dropRecorder);
+            std::optional<LocalityDomainId> spillDomainId = localityDomainId;
+            if (localityDomainHint(level) && localityDomainId.has_value())
+            {
+                // Evict the domain's own pages before taking another domain's slots, so pages land remote only once the
+                // domain is full of live pages.
+                LocalityDomainId const domain = resolveLocalityDomain(level, localityDomainId);
+                auto const& storage = *mLevels.at(level).storage;
+                auto const& ctrl = mLevels.at(level).controller;
+                TypedVec<PoolGroupIndex, SlotCount> local(requirements.size(), 0);
+                bool evictLocal = false;
+                bool spill = false;
+                for (PoolGroupIndex pgIdx{0}; pgIdx < requirements.size(); ++pgIdx)
+                {
+                    SlotCount const free = storage.numFreeSlots(pgIdx, domain);
+                    local.at(pgIdx) = std::min(requirements.at(pgIdx), free + ctrl.numEvictablePages(pgIdx, domain));
+                    evictLocal = evictLocal || local.at(pgIdx) > free;
+                    spill = spill || requirements.at(pgIdx) > local.at(pgIdx);
+                }
+                if (evictLocal)
+                {
+                    _prepareFreeSlots(level, local, migrationRecorder, dropRecorder, domain);
+                }
+                if (!spill)
+                {
+                    return;
+                }
+                spillDomainId = std::nullopt;
+            }
+            _prepareFreeSlots(level, requirements, migrationRecorder, dropRecorder, spillDomainId);
             return;
         }
         catch (RemoteMemError const&)
@@ -1874,7 +2010,8 @@ std::vector<CacheLevel> StorageManager::takeNewlyFailedRemoteLevels()
 }
 
 void StorageManager::_prepareFreeSlots(CacheLevel level, TypedVec<PoolGroupIndex, SlotCount> const& requirements,
-    MigrationRecorder const& migrationRecorder, DropRecorder const& dropRecorder)
+    MigrationRecorder const& migrationRecorder, DropRecorder const& dropRecorder,
+    std::optional<LocalityDomainId> localityDomainId)
 {
     TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotCount>> goals(numCacheLevels());
     for (CacheLevel lvl{0}; lvl < goals.size(); ++lvl)
@@ -1888,16 +2025,16 @@ void StorageManager::_prepareFreeSlots(CacheLevel level, TypedVec<PoolGroupIndex
 
     PagesByLifeCycle fallenPages(numLifeCycles());
     std::vector<SharedPtr<Page>> keepAlive;
-    _prepareFreeSlots(goals, level, fallenPages, keepAlive, migrationRecorder, dropRecorder);
+    _prepareFreeSlots(goals, level, fallenPages, keepAlive, migrationRecorder, dropRecorder, localityDomainId);
 }
 
-void StorageManager::forceEvict(
-    CacheLevel level, TypedVec<PoolGroupIndex, SlotCount> const& minNumPages, DropRecorder const& dropRecorder)
+void StorageManager::forceEvict(CacheLevel level, TypedVec<PoolGroupIndex, SlotCount> const& minNumPages,
+    DropRecorder const& dropRecorder, std::optional<LocalityDomainId> localityDomainId)
 {
     // Declared before the rollback guard, so that the pages they hold outlive it on failure.
     PagesByLifeCycle fallen(numLifeCycles());
     std::vector<SharedPtr<Page>> keepAlive;
-    auto evicted = mLevels.at(level).controller.evict(minNumPages);
+    auto evicted = mLevels.at(level).controller.evict(minNumPages, localityDomainFilter(level, localityDomainId));
     auto rescheduleEvictedPagesOnFailure = makeEvictionRollbackGuard(evicted);
 
     if (isLastLiveLevel(level))
@@ -1950,7 +2087,8 @@ void StorageManager::forceEvict(
 
 void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotCount>>& goals,
     CacheLevel lvlId, PagesByLifeCycle& fallenPages, std::vector<SharedPtr<Page>>& keepAlive,
-    MigrationRecorder const& migrationRecorder, DropRecorder const& dropRecorder)
+    MigrationRecorder const& migrationRecorder, DropRecorder const& dropRecorder,
+    std::optional<LocalityDomainId> localityDomainId)
 {
     TypedVec<LifeCycleId, std::vector<SharedPtr<Page>>> belowOffloadThreshold(numLifeCycles());
     auto restoreBelowThreshold = FuncGuard(
@@ -2016,6 +2154,15 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
     // A failed remote level counts as full with nothing to evict: pages fall past it, or drop after the last level.
     bool const isFailed = remoteLevelFailed(lvlId);
     auto const& grouping = poolGroupMapping(lvlId);
+    // No domain on a localized tier: free and evict across every domain.
+    bool const anyDomain = !localityDomainId.has_value() && localityDomainHint(lvlId);
+    LocalityDomainId const domain = anyDomain ? LocalityDomainId{0} : resolveLocalityDomain(lvlId, localityDomainId);
+    std::optional<LocalityDomainId> const domainFilter
+        = anyDomain ? std::nullopt : localityDomainFilter(lvlId, localityDomainId);
+    auto const freeSlots = [&](PoolGroupIndex pgIdx) {
+        return anyDomain ? allocatableSlots(lvlId, poolGroup(lvlId, pgIdx), domain)
+                         : storage.numFreeSlots(pgIdx, domain);
+    };
 
     auto countPages = [&](PoolGroupIndex pgIdx, PagesByLifeCycle const& pagesByLifeCycle)
     {
@@ -2153,8 +2300,8 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
     {
         SlotCount const goal = goals.at(lvlId).at(pgIdx);
         SlotCount const fallen = countPages(pgIdx, fallenPages);
-        SlotCount const oldFree = isFailed ? 0 : storage.numFreeSlots(pgIdx);
-        SlotCount const evictableCount = isFailed ? 0 : ctrl.numEvictablePages(pgIdx);
+        SlotCount const oldFree = isFailed ? 0 : freeSlots(pgIdx);
+        SlotCount const evictableCount = isFailed ? 0 : ctrl.numEvictablePages(pgIdx, domainFilter);
         SlotCount const required = goal + fallen;
         SlotCount const shortage = required > oldFree ? required - oldFree : 0;
         numToEvict.at(pgIdx) = std::min(shortage, evictableCount);
@@ -2191,7 +2338,7 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
         }
     }
 
-    auto evicted = ctrl.evict(numToEvict);
+    auto evicted = ctrl.evict(numToEvict, domainFilter);
     auto rescheduleEvictedPagesOnFailure = makeEvictionRollbackGuard(evicted);
     TypedVec<LifeCycleId, std::vector<SharedPtr<Page>>> acceptedPages(numLifeCycles());
 
@@ -2233,7 +2380,7 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
     for (PoolGroupIndex pgIdx{0}; pgIdx < evicted.size(); ++pgIdx)
     {
         auto& ev = evicted.at(pgIdx);
-        SlotCount const oldFree = isFailed ? 0 : storage.numFreeSlots(pgIdx);
+        SlotCount const oldFree = isFailed ? 0 : freeSlots(pgIdx);
         SlotCount const numEvicted = slotCountValueFromSize(ev.size());
         SlotCount freeAfterEviction{};
 
@@ -2248,7 +2395,7 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
             }
             ev.clear();
 
-            freeAfterEviction = isFailed ? 0 : storage.numFreeSlots(pgIdx);
+            freeAfterEviction = isFailed ? 0 : freeSlots(pgIdx);
             TLLM_CHECK_DEBUG(freeAfterEviction >= numEvicted + oldFree);
             TLLM_CHECK_DEBUG_WITH_INFO(
                 countPages(pgIdx, heldPages) <= freeAfterEviction, "held_pages count exceeds new free slot count");
@@ -2314,7 +2461,7 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
     if (!isLast)
     {
         sortFallenPagesByPriority(fallenPages);
-        _prepareFreeSlots(goals, lvlId + 1, fallenPages, keepAlive, migrationRecorder, dropRecorder);
+        _prepareFreeSlots(goals, lvlId + 1, fallenPages, keepAlive, migrationRecorder, dropRecorder, localityDomainId);
     }
 
     TLLM_CHECK_DEBUG_WITH_INFO(
@@ -2346,7 +2493,8 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
         for (auto& [batchKey, pages] : migrationBatches)
         {
             CacheLevel const srcLevel = batchKey.first;
-            _batchedMigrate(lvlId, srcLevel, pages, /*updateSrc=*/true, migrationRecorder);
+            _batchedMigrate(
+                lvlId, srcLevel, pages, /*updateSrc=*/true, migrationRecorder, /*defrag=*/false, localityDomainId);
             if (mDiskWriteThrough && srcLevel == kHotLevel)
             {
                 writeThroughToDisk(lvlId, pages);
@@ -2394,7 +2542,7 @@ LayerGroupId StorageManager::getMigrationBatchingLayerGroupId(
 
 std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstLevel, CacheLevel srcLevel,
     std::vector<SharedPtr<Page>> const& srcPages, bool updateSrc, MigrationRecorder const& migrationRecorder,
-    bool defrag)
+    bool defrag, std::optional<LocalityDomainId> dstLocalityDomainId)
 {
     TLLM_CHECK_DEBUG(defrag || dstLevel != srcLevel);
     if (srcPages.empty())
@@ -2425,6 +2573,7 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
         }));
     auto& srcPoolGroup = poolGroup(srcLevel, srcPgIdx);
     auto& dstPoolGroup = poolGroup(dstLevel, dstPgIdx);
+    LocalityDomainId const dstDomain = resolveLocalityDomain(dstLevel, dstLocalityDomainId);
 
     // Keep-disk-copy: pages with a retained copy at dstLevel take that slot back and are not copied.
     std::vector<Slot> dstSlots(srcPages.size());
@@ -2445,7 +2594,7 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
                     ++numUsable;
                 }
             }
-            if (dstPoolGroup.numFreeSlots() < numSlots - numUsable)
+            if (allocatableSlots(dstLevel, dstPoolGroup, dstDomain) < numSlots - numUsable)
             {
                 throw OutOfPagesError("Not enough free slots for migration");
             }
@@ -2459,11 +2608,11 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
                 }
             }
         }
-        if (dstPoolGroup.numFreeSlots() < numNewSlots)
+        if (allocatableSlots(dstLevel, dstPoolGroup, dstDomain) < numNewSlots)
         {
             throw OutOfPagesError("Not enough free slots for migration");
         }
-        auto freshSlots = dstPoolGroup.allocateMultiple(numNewSlots);
+        auto freshSlots = allocatePreferring(dstLevel, dstPoolGroup, numNewSlots, dstDomain);
         // A15: allocated slot count must match the request.
         TLLM_CHECK_DEBUG_WITH_INFO(slotCountValueFromSize(freshSlots.size()) == numNewSlots, "dst_slots size mismatch");
         std::size_t nextFresh = 0;
@@ -2615,28 +2764,31 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
 // batchedMigrate
 // ---------------------------------------------------------------------------
 
-void StorageManager::batchedMigrate(
-    CacheLevel dstLevel, std::vector<SharedPtr<Page>> const& pages, MigrationRecorder const& migrationRecorder)
+void StorageManager::batchedMigrate(CacheLevel dstLevel, std::vector<SharedPtr<Page>> const& pages,
+    MigrationRecorder const& migrationRecorder, std::optional<LocalityDomainId> dstLocalityDomainId)
 {
     std::map<MigrationBatchKey, std::vector<SharedPtr<Page>>> groups;
-    std::set<Page*> seen;
+    uint64_t const visit = nextVisitStamp();
     for (auto const& page : pages)
     {
-        if (page->cacheLevel == dstLevel || !seen.insert(page.get()).second)
+        if (page->cacheLevel == dstLevel || page->visitStamp == visit)
         {
             continue;
         }
+        page->visitStamp = visit;
         CacheLevel const srcLevel = page->cacheLevel;
         groups[{srcLevel, getMigrationBatchingLayerGroupId(dstLevel, srcLevel, page->lifeCycle)}].push_back(page);
     }
     for (auto& [key, group] : groups)
     {
-        _batchedMigrate(dstLevel, key.first, group, /*updateSrc=*/true, migrationRecorder);
+        _batchedMigrate(
+            dstLevel, key.first, group, /*updateSrc=*/true, migrationRecorder, /*defrag=*/false, dstLocalityDomainId);
     }
 }
 
-int64_t StorageManager::prefetch(
-    CacheLevel dstLevel, TypedVec<LifeCycleId, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>> const& pages)
+int64_t StorageManager::prefetch(CacheLevel dstLevel,
+    TypedVec<LifeCycleId, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>> const& pages,
+    std::optional<LocalityDomainId> dstLocalityDomainId)
 {
     TypedVec<PoolGroupIndex, SlotCount> numSlotsToMigrate(numPoolGroups(dstLevel), 0);
     int64_t diskBlocksMigrated = 0;
@@ -2681,7 +2833,7 @@ int64_t StorageManager::prefetch(
         }
     }
 
-    prepareFreeSlots(dstLevel, numSlotsToMigrate);
+    prepareFreeSlots(dstLevel, numSlotsToMigrate, {}, {}, dstLocalityDomainId);
     std::map<MigrationBatchKey, std::vector<SharedPtr<Page>>> migrationGroups;
     for (LifeCycleId lifeCycle{0}; lifeCycle < pages.size(); ++lifeCycle)
     {
@@ -2700,7 +2852,8 @@ int64_t StorageManager::prefetch(
     for (auto& [migrationPath, migrationPages] : migrationGroups)
     {
         CacheLevel const srcLevel = migrationPath.first;
-        _batchedMigrate(dstLevel, srcLevel, migrationPages, /*updateSrc=*/true);
+        _batchedMigrate(
+            dstLevel, srcLevel, migrationPages, /*updateSrc=*/true, {}, /*defrag=*/false, dstLocalityDomainId);
         // Per batch, after it landed: the pages are already grouped by source level, so this costs
         // nothing per page and never credits a batch that did not run.
         if (cacheTier(srcLevel) == CacheTier::DISK)
@@ -2781,6 +2934,7 @@ MemAddress StorageManager::getMemPoolBaseAddress(PoolGroupIndex pgIdx, PoolIndex
 TypedVec<PoolGroupIndex, PoolGroupDesc> StorageManager::poolGroupDescs() const
 {
     auto const& descList = slotDescList(kHotLevel);
+    auto const& gpuStorage = static_cast<GpuCacheLevelStorage const&>(*mLevels[kHotLevel].storage);
     TypedVec<PoolGroupIndex, PoolGroupDesc> result;
     result.reserve(descList.size());
     for (PoolGroupIndex pgIdx{0}; pgIdx < descList.size(); ++pgIdx)
@@ -2791,9 +2945,11 @@ TypedVec<PoolGroupIndex, PoolGroupDesc> StorageManager::poolGroupDescs() const
         for (PoolIndex poolIdx{0}; poolIdx < slotSizeList.size(); ++poolIdx)
         {
             pools.push_back(PoolDesc{poolIdx, getMemPoolBaseAddress(pgIdx, poolIdx), slotSizeList.at(poolIdx),
-                poolMedium(kHotLevel, pgIdx, poolIdx)});
+                poolMedium(kHotLevel, pgIdx, poolIdx), gpuStorage.mappedRanges(pgIdx, poolIdx)});
         }
-        result.push_back(PoolGroupDesc{pgIdx, numSlots(pgIdx, kHotLevel), descList.at(pgIdx), std::move(pools)});
+        // Localized groups have unmapped holes between domains, so the slot count is the index bound.
+        result.push_back(
+            PoolGroupDesc{pgIdx, gpuStorage.slotIndexUpperBound(pgIdx), descList.at(pgIdx), std::move(pools)});
     }
     return result;
 }
@@ -2803,12 +2959,32 @@ SlotCount StorageManager::numSlots(PoolGroupIndex pgIdx, CacheLevel level) const
     return mLevels.at(level).storage->numSlots(pgIdx);
 }
 
-StorageStatistics StorageManager::getStatistics(CacheLevel level, PoolGroupIndex pgIdx) const
+SlotCount StorageManager::slotIndexUpperBound(PoolGroupIndex pgIdx, CacheLevel level) const
+{
+    return mLevels.at(level).storage->slotIndexUpperBound(pgIdx);
+}
+
+std::vector<HalfOpenRange<SlotCount>> StorageManager::slotRanges(PoolGroupIndex pgIdx, CacheLevel level) const
+{
+    return mLevels.at(level).storage->slotRanges(pgIdx);
+}
+
+StorageStatistics StorageManager::getStatistics(
+    CacheLevel level, PoolGroupIndex pgIdx, std::optional<LocalityDomainId> localityDomainId) const
 {
     auto const& lvl = mLevels.at(level);
-    SlotCount freeSlots = lvl.storage->numFreeSlots(pgIdx);
-    SlotCount totalSlots = lvl.storage->numSlots(pgIdx);
-    SlotCount evictable = lvl.controller.numEvictablePages(pgIdx);
+    auto const domainFilter
+        = localityDomainId.has_value() ? localityDomainFilter(level, localityDomainId) : std::nullopt;
+    SlotCount freeSlots = 0;
+    SlotCount totalSlots = 0;
+    for (LocalityDomainId domain{0}; domain < lvl.storage->numLocalityDomains(); ++domain)
+    {
+        if (domainFilter.has_value() && domain != *domainFilter)
+            continue;
+        freeSlots += lvl.storage->numFreeSlots(pgIdx, domain);
+        totalSlots += lvl.storage->numSlots(pgIdx, domain);
+    }
+    SlotCount evictable = lvl.controller.numEvictablePages(pgIdx, domainFilter);
     // Retained disk copies are duplicates the level releases when it needs the room. They are reported apart from
     // evictable pages; available() counts both.
     SlotCount retainedCopies = mNumRetainedCopies.at(level).at(pgIdx);
@@ -2816,13 +2992,14 @@ StorageStatistics StorageManager::getStatistics(CacheLevel level, PoolGroupIndex
     return StorageStatistics{sizes, totalSlots, freeSlots, evictable, retainedCopies};
 }
 
-TypedVec<PoolGroupIndex, float> StorageManager::getUtilization(CacheLevel level) const
+TypedVec<PoolGroupIndex, float> StorageManager::getUtilization(
+    CacheLevel level, std::optional<LocalityDomainId> localityDomainId) const
 {
     TypedVec<PoolGroupIndex, float> result;
     result.reserve(numPoolGroups(level));
     for (PoolGroupIndex pgIdx{0}; pgIdx < numPoolGroups(level); ++pgIdx)
     {
-        auto const s = getStatistics(level, pgIdx);
+        auto const s = getStatistics(level, pgIdx, localityDomainId);
         TLLM_CHECK_WITH_INFO(s.total > 0, "getUtilization: pool group %d at level %d has zero capacity",
             static_cast<int>(pgIdx.value()), static_cast<int>(level.value()));
         result.push_back(static_cast<float>(s.unavailable()) / static_cast<float>(s.total));
@@ -2850,26 +3027,42 @@ float StorageManager::getOverallUtilization(CacheLevel level) const
 // expandPoolGroup
 // ---------------------------------------------------------------------------
 
-void StorageManager::expandPoolGroup(CacheLevel level, PoolGroupIndex pgIdx, SlotCount newNumSlots)
+void StorageManager::expandPoolGroup(
+    CacheLevel level, PoolGroupIndex pgIdx, SlotCount newNumSlots, LocalityDomainId localityDomainId)
 {
     auto& pg = poolGroup(level, pgIdx);
-    TLLM_CHECK_DEBUG(newNumSlots > pg.numSlots());
-    pg.resizePools(newNumSlots);
-    pg.slotAllocator().expand(newNumSlots);
+    TLLM_CHECK_WITH_INFO(newNumSlots > pg.numSlots(localityDomainId),
+        "expandPoolGroup: target %d is not above the current %d slots of locality domain %d",
+        static_cast<int>(newNumSlots), static_cast<int>(pg.numSlots(localityDomainId)), localityDomainId.value());
+    pg.resizePools(newNumSlots, localityDomainId);
+    pg.slotAllocator(localityDomainId).expand(newNumSlots);
 }
 
 // ---------------------------------------------------------------------------
 // shrinkPoolGroup — mirrors Python _storage_manager.py::shrink_pool_group
 // ---------------------------------------------------------------------------
 
-void StorageManager::shrinkPoolGroup(
-    CacheLevel level, PoolGroupIndex pgIdx, SlotCount newNumSlots, std::vector<SharedPtr<Page>> const& persistentPages)
+void StorageManager::shrinkPoolGroup(CacheLevel level, PoolGroupIndex pgIdx, SlotCount newNumSlots,
+    std::vector<SharedPtr<Page>> const& persistentPages, LocalityDomainId localityDomainId)
 {
     refreshRetention();
     auto& pg = poolGroup(level, pgIdx);
-    auto& allocator = pg.slotAllocator();
+    auto& allocator = pg.slotAllocator(localityDomainId);
     auto& ctrl = mLevels.at(level).controller;
-    TLLM_CHECK_DEBUG(newNumSlots < pg.numSlots());
+    TLLM_CHECK_WITH_INFO(newNumSlots < pg.numSlots(localityDomainId),
+        "shrinkPoolGroup: target %d is not below the current %d slots of locality domain %d",
+        static_cast<int>(newNumSlots), static_cast<int>(pg.numSlots(localityDomainId)), localityDomainId.value());
+    // Only this domain's pages and local slot indices matter; slot ids are global and interleaved.
+    std::optional<LocalityDomainId> const domainFilter
+        = pg.numLocalityDomains() == 1 ? std::nullopt : std::optional<LocalityDomainId>{localityDomainId};
+    auto const inScope
+        = [&](Page const& page) { return !domainFilter.has_value() || page.localityDomainId() == domainFilter; };
+    auto const overflows = [&](Page const& page)
+    {
+        auto const local = allocator.localIndexOf(page.slotId());
+        TLLM_CHECK_DEBUG(local.has_value());
+        return local.value_or(LocalSlotIndex{0}) >= newNumSlots;
+    };
 
     // A16: persistent_pages preconditions.
     TLLM_CHECK_DEBUG_WITH_INFO(
@@ -2886,18 +3079,20 @@ void StorageManager::shrinkPoolGroup(
     {
         allocator.prepareForShrink(newNumSlots);
         allocator.finishShrink();
-        pg.resizePools(newNumSlots);
+        pg.resizePools(newNumSlots, localityDomainId);
         return;
     }
 
-    // Find overflow pages: scheduled pages with slot_id >= newNumSlots.
+    // Find overflow pages: scheduled pages of this domain whose local index >= newNumSlots.
     auto gen = ctrl.pageGenerator(pgIdx);
     std::deque<std::pair<SlotCount, SharedPtr<Page>>> overflowSlots;
     {
         SlotCount idx = 0;
         while (auto const* page = gen())
         {
-            if ((*page)->slotId() >= newNumSlots)
+            if (!inScope(**page))
+                continue;
+            if (overflows(**page))
                 overflowSlots.emplace_back(idx, *page);
             ++idx;
         }
@@ -2907,7 +3102,7 @@ void StorageManager::shrinkPoolGroup(
     std::vector<SharedPtr<Page>> overflowPersistent;
     for (auto const& p : persistentPages)
     {
-        if (p->slotId() >= newNumSlots)
+        if (inScope(*p) && overflows(*p))
             overflowPersistent.push_back(p);
     }
     SlotCount numOverflowPersistent = slotCountValueFromSize(overflowPersistent.size());
@@ -2938,7 +3133,7 @@ void StorageManager::shrinkPoolGroup(
     // Force-evict the required pages.
     TypedVec<PoolGroupIndex, SlotCount> evictReqs(numPoolGroups(level), 0);
     evictReqs[pgIdx] = minNumEvicted;
-    forceEvict(level, evictReqs);
+    forceEvict(level, evictReqs, {}, domainFilter);
 
     // Remaining overflow pages to defragment.
     std::vector<SharedPtr<Page>> overflowPages;
@@ -2952,15 +3147,16 @@ void StorageManager::shrinkPoolGroup(
     TypedVec<PoolGroupIndex, SlotCount> reqs(numPoolGroups(level), 0);
     reqs[pgIdx] = slotCountValueFromSize(overflowPages.size());
     // The eviction order captured above must remain stable through defragmentation.
-    _prepareFreeSlots(level, reqs, MigrationRecorder{}, DropRecorder{});
+    _prepareFreeSlots(level, reqs, MigrationRecorder{}, DropRecorder{}, domainFilter);
 
     // A17: all overflow pages must be at the expected cache level.
     TLLM_CHECK_DEBUG_WITH_INFO(std::all_of(overflowPages.begin(), overflowPages.end(),
                                    [level](auto const& p) { return p->cacheLevel == level; }),
         "Overflow page cache level mismatch");
 
-    // Defragment: migrate overflow pages to free slots within the same level.
-    _batchedMigrate(level, level, overflowPages, /*updateSrc=*/true, MigrationRecorder{}, /*defrag=*/true);
+    // Defragment: migrate overflow pages to free slots within the same level and domain.
+    _batchedMigrate(
+        level, level, overflowPages, /*updateSrc=*/true, MigrationRecorder{}, /*defrag=*/true, domainFilter);
 
     // A18: post-defrag overflow assertion — overflow slot count matches expectations.
     TLLM_CHECK_DEBUG_WITH_INFO(allocator.numOverflowSlots() == allocator.numActiveSlots() - allocator.targetCapacity(),
@@ -2968,7 +3164,7 @@ void StorageManager::shrinkPoolGroup(
 
     // Finalize shrink and resize pools.
     allocator.finishShrink();
-    pg.resizePools(newNumSlots);
+    pg.resizePools(newNumSlots, localityDomainId);
 }
 
 // ---------------------------------------------------------------------------
@@ -2980,10 +3176,21 @@ void StorageManager::adjustCacheLevel(CacheLevel level, std::optional<size_t> ne
     TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* persistentPages)
 {
     auto& lvlStorage = *mLevels.at(level).storage;
-    auto oldNumSlots = lvlStorage.slotCountList();
-    size_t quota = newQuota.has_value()
-        ? roundUp(newQuota.value(), lvlStorage.poolSizeGranularity(lvlStorage.cacheTier()))
-        : lvlStorage.roundedNumBytes(lvlStorage.cacheTier());
+    size_t const granularity = lvlStorage.poolSizeGranularity(lvlStorage.cacheTier());
+    int const numDomains = lvlStorage.numLocalityDomains();
+    size_t quota;
+    if (numDomains > 1)
+    {
+        // Slot counts and the feasibility floor are per domain. The share is taken from the
+        // requested quota before any rounding, as construction does, so init and resize agree.
+        size_t const requested = newQuota.value_or(lvlStorage.roundedNumBytes(lvlStorage.cacheTier()));
+        quota = roundDown(requested / static_cast<size_t>(numDomains), granularity);
+    }
+    else
+    {
+        quota = newQuota.has_value() ? roundUp(newQuota.value(), granularity)
+                                     : lvlStorage.roundedNumBytes(lvlStorage.cacheTier());
+    }
     // Chargeable, not total: a rebalance that charged host bytes to the device budget would
     // under-size the level and evict live pages to reach it.
     size_t minQuota = minQuotaForLevel(level);
@@ -3004,30 +3211,61 @@ void StorageManager::adjustCacheLevel(CacheLevel level, std::optional<size_t> ne
     auto newNumSlots = slotCountsForLevel(level, quota, ratioList);
     for (PoolGroupIndex pgIdx{0}; level == kHotLevel && pgIdx < newNumSlots.size(); ++pgIdx)
     {
-        TLLM_CHECK_DEBUG(!mFixedSlots[pgIdx] || newNumSlots[pgIdx] == oldNumSlots[pgIdx]);
+        for (LocalityDomainId localityDomainId{0}; localityDomainId < numDomains; ++localityDomainId)
+        {
+            TLLM_CHECK_DEBUG(!mFixedSlots[pgIdx] || newNumSlots[pgIdx] == lvlStorage.numSlots(pgIdx, localityDomainId));
+        }
     }
 
     TLLM_CHECK_DEBUG(isLastLevel(level) || persistentPages == nullptr);
 
+    // Domains are resized one at a time and a failure leaves the already resized ones at the new
+    // capacity, so each (pool group, domain) pair is compared against its own current capacity:
+    // a retry then only touches the pairs that are still off target.
     // Shrink first.
     for (PoolGroupIndex pgIdx{0}; pgIdx < newNumSlots.size(); ++pgIdx)
     {
-        if (newNumSlots[pgIdx] >= oldNumSlots[pgIdx])
-            continue;
+        bool shrinks = false;
+        for (LocalityDomainId localityDomainId{0}; localityDomainId < numDomains; ++localityDomainId)
+        {
+            shrinks = shrinks || newNumSlots[pgIdx] < lvlStorage.numSlots(pgIdx, localityDomainId);
+        }
         // Shrinking moves or frees this group's slots. Retained copies are duplicates, so drop them rather than
         // relocate them; groups that keep or grow their size keep their copies.
-        releaseRetainedCopies(level, pgIdx, numRetainedCopies(level, pgIdx));
+        if (shrinks)
+        {
+            releaseRetainedCopies(level, pgIdx, numRetainedCopies(level, pgIdx));
+        }
         std::vector<SharedPtr<Page>> pages;
         if (persistentPages)
             pages = (*persistentPages)[pgIdx];
-        shrinkPoolGroup(level, pgIdx, newNumSlots[pgIdx], pages);
+        for (LocalityDomainId localityDomainId{0}; localityDomainId < numDomains; ++localityDomainId)
+        {
+            if (newNumSlots[pgIdx] >= lvlStorage.numSlots(pgIdx, localityDomainId))
+                continue;
+            if (numDomains == 1)
+            {
+                shrinkPoolGroup(level, pgIdx, newNumSlots[pgIdx], pages, localityDomainId);
+                continue;
+            }
+            // The persistent list spans every domain, but each shrink only keeps its own.
+            std::vector<SharedPtr<Page>> domainPages;
+            for (auto const& page : pages)
+            {
+                if (page->localityDomainId() == std::optional<LocalityDomainId>{localityDomainId})
+                    domainPages.push_back(page);
+            }
+            shrinkPoolGroup(level, pgIdx, newNumSlots[pgIdx], domainPages, localityDomainId);
+        }
     }
     // Then expand.
     for (PoolGroupIndex pgIdx{0}; pgIdx < newNumSlots.size(); ++pgIdx)
     {
-        if (newNumSlots[pgIdx] <= oldNumSlots[pgIdx])
-            continue;
-        expandPoolGroup(level, pgIdx, newNumSlots[pgIdx]);
+        for (LocalityDomainId localityDomainId{0}; localityDomainId < numDomains; ++localityDomainId)
+        {
+            if (newNumSlots[pgIdx] > lvlStorage.numSlots(pgIdx, localityDomainId))
+                expandPoolGroup(level, pgIdx, newNumSlots[pgIdx], localityDomainId);
+        }
     }
     if (lvlStorage.cacheTier() == CacheTier::GPU_MEM)
     {
@@ -3094,6 +3332,22 @@ TypedVec<PoolGroupIndex, float> StorageManager::toPoolGroupRatio(
     return normalizeToRatio(poolGroupRatio);
 }
 
+TypedVec<PoolGroupIndex, float> StorageManager::coldPoolGroupRatioFromBatch(
+    CacheLevel level, BatchDesc const& batch, int tokensPerBlock) const
+{
+    auto const numSlots = typicalSlotsForBatch(batch, tokensPerBlock, mSwaScratchReuse);
+    TypedVec<PoolGroupIndex, double> weights(numPoolGroups(level), 0.0);
+    for (LifeCycleId lifeCycle{0}; lifeCycle < numLifeCycles(); ++lifeCycle)
+    {
+        PoolGroupIndex const pgIdx = getPoolGroupIndex(level, lifeCycle);
+        auto const sizes = slotSize(level, pgIdx);
+        // At least one slot each, so every group gets the positive share ratioToSlotCountList requires.
+        weights[pgIdx] += static_cast<double>(std::max(numSlots[lifeCycle], SlotCount{1}))
+            * static_cast<double>(std::accumulate(sizes.begin(), sizes.end(), size_t{0}));
+    }
+    return normalizeToRatio(weights);
+}
+
 TypedVec<PoolGroupIndex, float> StorageManager::projectPoolGroupRatio(
     CacheLevel srcLevel, CacheLevel dstLevel, TypedVec<LifeCycleId, float> const& srcLifeCycleRatio) const
 {
@@ -3120,6 +3374,13 @@ TypedVec<LifeCycleId, float> StorageManager::ratioFromBatch(BatchDesc const& bat
     std::optional<SwaScratchReuseConfig> const& swaScratchReuse, size_t deviceGranularity,
     TypedVec<PoolGroupIndex, std::vector<PoolIndex>> const& sparsePools) const
 {
+    return normalizeToRatio(
+        slotsToBytes(typicalSlotsForBatch(batch, tokensPerBlock, swaScratchReuse), deviceGranularity, sparsePools));
+}
+
+TypedVec<LifeCycleId, SlotCount> StorageManager::typicalSlotsForBatch(
+    BatchDesc const& batch, int tokensPerBlock, std::optional<SwaScratchReuseConfig> const& swaScratchReuse) const
+{
     auto numSlots = computeSlotsForBatch(batch, tokensPerBlock, swaScratchReuse);
     // A soft preference, not a feasibility floor: keep one optional endpoint
     // per typical request in addition to its private working pages.
@@ -3130,7 +3391,7 @@ TypedVec<LifeCycleId, float> StorageManager::ratioFromBatch(BatchDesc const& bat
             numSlots[lc] += slotCountValueFromSize(batch.kvCaches.size());
         }
     }
-    return normalizeToRatio(slotsToBytes(numSlots, deviceGranularity, sparsePools));
+    return numSlots;
 }
 
 // ---------------------------------------------------------------------------
@@ -3336,10 +3597,17 @@ TypedVec<LifeCycleId, size_t> StorageManager::slotsToBytes(TypedVec<LifeCycleId,
 TypedVec<PoolGroupIndex, SlotCount> StorageManager::computeSlotCountForLevel(CacheTierConfig const& tierConfig,
     TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
     TypedVec<PoolGroupIndex, float> const& ratio, TypedVec<PoolGroupIndex, SlotCount> const& minSlots,
-    size_t gpuPhysMemSize, std::optional<SecondaryPoolBudget> const& secondBudget, FixedSlotCounts const& fixedSlots)
+    size_t gpuPhysMemSize, std::optional<SecondaryPoolBudget> const& secondBudget, FixedSlotCounts const& fixedSlots,
+    int numLocalityDomains)
 {
     size_t quota = cacheTierQuota(tierConfig);
     size_t const granularity = tierCommitUnit(tierConfig, gpuPhysMemSize);
+    if (cacheTierOf(tierConfig) == CacheTier::GPU_MEM && numLocalityDomains > 1)
+    {
+        // Each domain rounds its own backing up to the granularity, so the slot count is sized
+        // per domain from an equal share of the quota rather than split after sizing.
+        quota = roundDown(quota / static_cast<size_t>(numLocalityDomains), granularity);
+    }
     quota = std::max(minQuotaForLevel(slotSizeLists, granularity, minSlots, secondBudget), roundUp(quota, granularity));
     return CacheLevelStorage::ratioToSlotCountList(
         quota, slotSizeLists, ratio, granularity, minSlots, secondBudget, fixedSlots);

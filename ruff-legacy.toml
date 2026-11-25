@@ -507,13 +507,11 @@ include = [
     "tests/integration/defs/test_e2e.py",
     "tests/integration/defs/test_fmha.py",
     "tests/integration/defs/test_list_parser.py",
-    "tests/integration/defs/test_list_validation.py",
     "tests/integration/defs/test_sanity.py",
     "tests/integration/defs/test_unittests.py",
     "tests/integration/defs/triton_server/__init__.py",
     "tests/integration/defs/triton_server/common.py",
     "tests/integration/defs/triton_server/conftest.py",
-    "tests/integration/defs/triton_server/test_list_parser.py",
     "tests/integration/defs/triton_server/trt_test_alternative.py",
     "tests/integration/defs/trt_test_alternative.py",
     "tests/integration/defs/utils/__init__.py",
@@ -745,6 +743,8 @@ include = [
 #   F401 (unused imports) → autoflake
 #   F841 (unused variables) → autoflake
 select = [
+    "TID251",
+
     # Bug detection (pyflakes) — NOT covered by autoflake
     "F402",   # import shadowed by loop var
     "F403",   # import star used
@@ -793,3 +793,6 @@ max-line-length = 120  # For comments and docstrings
 
 [lint.pydocstyle]
 convention = "google"
+
+[lint.flake8-tidy-imports.banned-api]
+"tests".msg = "Import test helpers through __extra_import_path__ (tests/test_common/magic_import.py)"

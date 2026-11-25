@@ -3,9 +3,10 @@
 """CPU unit tests for admission-time rejection of sampling features the
 one-model speculative path cannot honor.
 
-``SpecSampler.validate_request`` has always rejected min_length, bad_words,
-no_repeat_ngram_size, embedding_bias and top_p_decay, but it runs on the
-executor's admission path. For a streaming OpenAI request that is too late: the
+``SpecSampler.validate_request`` has always rejected min_length,
+no_repeat_ngram_size and top_p_decay, and bad_words and embedding_bias on a
+deploy that cannot serve them, but it runs on the executor's admission path.
+For a streaming OpenAI request that is too late: the
 frontend has already answered 200 and opened the response stream, so the client
 receives a truncated stream (``ClientPayloadError`` / ``TransferEncodingError``)
 that is indistinguishable from a network fault rather than a status code.
@@ -23,27 +24,36 @@ import pytest
 import torch
 
 from tensorrt_llm import SamplingParams
+from tensorrt_llm._torch.speculative import logit_edits
 from tensorrt_llm._torch.speculative.spec_sampler_base import (
-    UNSUPPORTED_BAD_WORDS_MSG,
-    UNSUPPORTED_EMBEDDING_BIAS_MSG,
+    LOGIT_EDITS_DISABLED_MSG,
+    LOGIT_EDITS_MODE_MSG,
+    LOGIT_EDITS_RELAXED_ACCEPTANCE_MSG,
+    LOGIT_EDITS_TREE_MSG,
+    PENALTY_MODE_MSG,
+    PENALTY_RELAXED_ACCEPTANCE_MSG,
+    PENALTY_TREE_MSG,
     UNSUPPORTED_LOGITS_POST_PROCESSOR_MSG,
     UNSUPPORTED_MIN_LENGTH_MSG,
     UNSUPPORTED_MIN_P_MSG,
     UNSUPPORTED_NO_REPEAT_NGRAM_MSG,
     UNSUPPORTED_TOP_P_DECAY_MSG,
     SpecSampler,
+    logit_edits_unsupported_reason,
     one_model_sampling_rejection_reason,
+    penalty_unsupported_reason,
+    verifies_through_edit_pass,
 )
 from tensorrt_llm.executor.utils import RequestError
 from tensorrt_llm.llmapi import LLM
-from tensorrt_llm.llmapi.llm_args import NGramDecodingConfig, SADecodingConfig
+from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig, NGramDecodingConfig, SADecodingConfig
 
 # (id, SamplingParams kwargs, expected message). Every entry is a value the
 # OpenAI frontend can send today.
 UNSUPPORTED_CASES = [
     ("min_tokens", dict(min_tokens=16), UNSUPPORTED_MIN_LENGTH_MSG),
-    ("bad_token_ids", dict(bad_token_ids=[7]), UNSUPPORTED_BAD_WORDS_MSG),
-    ("bad", dict(bad="nope"), UNSUPPORTED_BAD_WORDS_MSG),
+    ("bad_token_ids", dict(bad_token_ids=[7]), LOGIT_EDITS_DISABLED_MSG),
+    ("bad", dict(bad="nope"), LOGIT_EDITS_DISABLED_MSG),
     ("no_repeat_ngram_size", dict(no_repeat_ngram_size=3), UNSUPPORTED_NO_REPEAT_NGRAM_MSG),
     ("top_p_decay", dict(top_p_decay=0.5), UNSUPPORTED_TOP_P_DECAY_MSG),
     (
@@ -110,7 +120,7 @@ def test_embedding_bias_is_rejected():
     # Kept out of the parametrized table: a tensor field cannot be compared by
     # value in an id-generating parametrize list.
     params = SamplingParams(embedding_bias=torch.zeros(16))
-    assert one_model_sampling_rejection_reason(params) == UNSUPPORTED_EMBEDDING_BIAS_MSG
+    assert one_model_sampling_rejection_reason(params) == LOGIT_EDITS_DISABLED_MSG
 
 
 @pytest.mark.cpu_only
@@ -166,7 +176,7 @@ def test_check_arguments_admits_drafter_modes():
 # full validate_request below.
 EXECUTOR_SIDE_CASES = [
     ("min_length", dict(py_min_length=16), UNSUPPORTED_MIN_LENGTH_MSG),
-    ("bad_words", dict(py_bad_words=[[7]]), UNSUPPORTED_BAD_WORDS_MSG),
+    ("bad_words", dict(py_bad_words=[[7]]), LOGIT_EDITS_DISABLED_MSG),
     ("no_repeat_ngram_size", dict(py_no_repeat_ngram_size=3), UNSUPPORTED_NO_REPEAT_NGRAM_MSG),
     (
         "logits_post_processor",
@@ -204,7 +214,7 @@ def test_executor_side_check_rejects_embedding_bias():
     )
     with pytest.raises(ValueError) as excinfo:
         SpecSampler._validate_unsupported_logits_processors(request)
-    assert str(excinfo.value) == UNSUPPORTED_EMBEDDING_BIAS_MSG
+    assert str(excinfo.value) == LOGIT_EDITS_DISABLED_MSG
 
 
 def _executor_request(**sampling_config_overrides) -> types.SimpleNamespace:
@@ -248,16 +258,18 @@ def _executor_request(**sampling_config_overrides) -> types.SimpleNamespace:
     )
 
 
-def _validate_on_executor(request) -> None:
+def _validate_on_executor(request, **sampler_overrides) -> None:
     """Run the real ``validate_request`` against a minimal sampler stand-in."""
     sampler = types.SimpleNamespace(
         _validate_unsupported_logits_processors=(
             SpecSampler._validate_unsupported_logits_processors
         ),
         _enable_penalty=False,
-        _penalty_supported=True,
+        _penalty_unsupported_reason=None,
         _fused_sampling=False,
     )
+    for name, value in sampler_overrides.items():
+        setattr(sampler, name, value)
     SpecSampler.validate_request(sampler, request)
 
 
@@ -301,3 +313,216 @@ def test_executor_side_check_rejects_a_post_processor_on_the_full_path():
     with pytest.raises(ValueError) as excinfo:
         _validate_on_executor(request)
     assert str(excinfo.value) == UNSUPPORTED_LOGITS_POST_PROCESSOR_MSG
+
+
+def _mode(*, eagle3: bool = False, sa: bool = False) -> types.SimpleNamespace:
+    return types.SimpleNamespace(is_eagle3_one_model=lambda: eagle3, is_sa=lambda: sa)
+
+
+def _spec_config(**overrides) -> types.SimpleNamespace:
+    """The fields ``logit_edits_unsupported_reason`` reads, for a linear Eagle3 deploy
+    that enabled the logits edits."""
+    config = dict(
+        enable_penalty=True,
+        use_dynamic_tree=False,
+        dynamic_tree_max_topK=None,
+        use_relaxed_acceptance_for_thinking=False,
+        spec_dec_mode=_mode(eagle3=True),
+    )
+    config.update(overrides)
+    return types.SimpleNamespace(**config)
+
+
+@pytest.mark.cpu_only
+def test_logit_edits_are_supported_on_an_enabled_linear_deploy():
+    assert logit_edits_unsupported_reason(_spec_config()) is None
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "overrides,expected",
+    [
+        (dict(enable_penalty=False), LOGIT_EDITS_DISABLED_MSG),
+        (dict(use_dynamic_tree=True, dynamic_tree_max_topK=4), LOGIT_EDITS_TREE_MSG),
+        # MTP picks its tree worker on the flag alone, whatever the top-K.
+        (
+            dict(use_dynamic_tree=True, dynamic_tree_max_topK=1, spec_dec_mode=_mode()),
+            LOGIT_EDITS_TREE_MSG,
+        ),
+        (dict(use_relaxed_acceptance_for_thinking=True), LOGIT_EDITS_RELAXED_ACCEPTANCE_MSG),
+        (dict(spec_dec_mode=_mode(sa=True)), LOGIT_EDITS_MODE_MSG),
+    ],
+    ids=["disabled", "dynamic_tree", "mtp_top1_tree", "relaxed_acceptance", "sa"],
+)
+def test_logit_edits_unsupported_reason_names_the_deploy_limit(overrides, expected):
+    assert logit_edits_unsupported_reason(_spec_config(**overrides)) == expected
+
+
+@pytest.mark.cpu_only
+def test_eagle3_top1_tree_serves_logit_edits_and_penalties():
+    """Eagle3 hands a tree of top-K 1 to its linear worker, which verifies through the
+    logits-edit pass."""
+    spec_config = _spec_config(use_dynamic_tree=True, dynamic_tree_max_topK=1)
+    assert verifies_through_edit_pass(spec_config)
+    assert logit_edits_unsupported_reason(spec_config) is None
+    assert penalty_unsupported_reason(spec_config) is None
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "overrides,edits_expected,penalty_expected",
+    [
+        (dict(), None, None),
+        (
+            dict(use_dynamic_tree=True, dynamic_tree_max_topK=4),
+            LOGIT_EDITS_TREE_MSG,
+            PENALTY_TREE_MSG,
+        ),
+        (
+            dict(use_relaxed_acceptance_for_thinking=True),
+            LOGIT_EDITS_RELAXED_ACCEPTANCE_MSG,
+            PENALTY_RELAXED_ACCEPTANCE_MSG,
+        ),
+        (dict(spec_dec_mode=_mode(sa=True)), LOGIT_EDITS_MODE_MSG, PENALTY_MODE_MSG),
+    ],
+    ids=["linear", "dynamic_tree", "relaxed_acceptance", "sa"],
+)
+def test_penalties_and_logit_edits_share_the_deploy_limits(
+    overrides, edits_expected, penalty_expected
+):
+    """One predicate decides both: a deploy whose worker verifies outside the logits-edit
+    pass serves neither, and the pass stays off there."""
+    spec_config = _spec_config(**overrides)
+    assert logit_edits_unsupported_reason(spec_config) == edits_expected
+    assert penalty_unsupported_reason(spec_config) == penalty_expected
+    assert verifies_through_edit_pass(spec_config) is (penalty_expected is None)
+
+
+@pytest.mark.cpu_only
+def test_executor_side_check_rejects_penalties_the_deploy_cannot_serve():
+    request = _executor_request(repetition_penalty=1.2)
+    _validate_on_executor(request, _enable_penalty=True)
+    with pytest.raises(ValueError) as excinfo:
+        _validate_on_executor(
+            request,
+            _enable_penalty=True,
+            _penalty_unsupported_reason=PENALTY_RELAXED_ACCEPTANCE_MSG,
+        )
+    assert str(excinfo.value) == PENALTY_RELAXED_ACCEPTANCE_MSG
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "flags,expected",
+    [
+        (dict(), None),
+        (dict(use_relaxed_acceptance_for_thinking=True), LOGIT_EDITS_RELAXED_ACCEPTANCE_MSG),
+    ],
+    ids=["strict", "relaxed_acceptance"],
+)
+def test_multi_layer_mtp_checkpoint_is_decided_alike_on_both_sides(flags, expected):
+    """The LLM API holds the MTP config before the checkpoint fills in its layer count and
+    reads it as MTP-Eagle, while the executor resolves a 3-layer checkpoint to vanilla
+    MTP. Both must decide a request alike, or the executor rejects it after the stream
+    has opened."""
+    frontend_config = MTPDecodingConfig(max_draft_len=3, enable_penalty=True, **flags)
+    executor_config = MTPDecodingConfig(max_draft_len=3, enable_penalty=True, **flags)
+    executor_config.num_nextn_predict_layers = 3
+    assert frontend_config.spec_dec_mode.is_mtp_eagle_one_model()
+    assert executor_config.spec_dec_mode.is_mtp_vanilla()
+
+    assert logit_edits_unsupported_reason(frontend_config) == expected
+    assert logit_edits_unsupported_reason(executor_config) == expected
+
+    bias = torch.zeros(16)
+    bias[3] = -5.0
+    params = SamplingParams(embedding_bias=bias, bad_token_ids=[7])
+    if expected is None:
+        _check_arguments(frontend_config, params)
+    else:
+        with pytest.raises(RequestError) as excinfo:
+            _check_arguments(frontend_config, params)
+        assert str(excinfo.value) == expected
+
+
+@pytest.mark.cpu_only
+def test_sa_config_does_not_serve_logit_edits_even_when_enabled():
+    """The real config object: SA verifies outside the logits-edit pass."""
+    spec_config = SADecodingConfig(max_draft_len=4, max_matching_ngram_size=-1, enable_penalty=True)
+    assert logit_edits_unsupported_reason(spec_config) == LOGIT_EDITS_MODE_MSG
+
+
+@pytest.mark.cpu_only
+def test_enabled_deploy_admits_embedding_bias_and_bad_words():
+    bias = torch.zeros(16)
+    bias[3] = -5.0
+    params = SamplingParams(embedding_bias=bias, bad_token_ids=[7])
+    assert one_model_sampling_rejection_reason(params, logit_edits_unsupported=None) is None
+
+    request = _executor_request()
+    request.py_bad_words = [[7], [1, 2, 3]]
+    request.py_embedding_bias = bias
+    SpecSampler._validate_unsupported_logits_processors(request, logit_edits_unsupported=None)
+
+
+@pytest.mark.cpu_only
+def test_enabled_deploy_still_reports_its_own_limit():
+    """A deploy-level reason wins over the per-request capacity check."""
+    params = SamplingParams(bad_token_ids=[7])
+    assert (
+        one_model_sampling_rejection_reason(params, logit_edits_unsupported=LOGIT_EDITS_TREE_MSG)
+        == LOGIT_EDITS_TREE_MSG
+    )
+
+
+@pytest.mark.cpu_only
+def test_enabled_deploy_rejects_edits_past_the_slot_tables():
+    """Both sides return the capacity reason, so they cannot drift apart."""
+    dense_bias = torch.ones(logit_edits.MAX_BIAS_TOKENS + 1)
+    too_many_words = [[token] for token in range(logit_edits.MAX_BAD_WORDS + 1)]
+    too_long_word = [list(range(logit_edits.MAX_BAD_WORD_LEN + 1))]
+    cases = [
+        (dict(embedding_bias=dense_bias), dict(py_embedding_bias=dense_bias), "biased tokens"),
+        (
+            dict(bad_token_ids=[word[0] for word in too_many_words]),
+            dict(py_bad_words=too_many_words),
+            "bad words",
+        ),
+        (None, dict(py_bad_words=too_long_word), "tokens"),
+    ]
+    for sampling_kwargs, request_fields, fragment in cases:
+        expected = logit_edits.rejection_reason(
+            request_fields.get("py_embedding_bias"), request_fields.get("py_bad_words")
+        )
+        assert expected is not None and fragment in expected
+        if sampling_kwargs is not None:
+            assert (
+                one_model_sampling_rejection_reason(
+                    SamplingParams(**sampling_kwargs), logit_edits_unsupported=None
+                )
+                == expected
+            )
+        request = types.SimpleNamespace(
+            **{
+                **dict(
+                    py_min_length=None,
+                    py_bad_words=None,
+                    py_no_repeat_ngram_size=None,
+                    py_embedding_bias=None,
+                ),
+                **request_fields,
+            }
+        )
+        with pytest.raises(ValueError) as excinfo:
+            SpecSampler._validate_unsupported_logits_processors(
+                request, logit_edits_unsupported=None
+            )
+        assert str(excinfo.value) == expected
+
+
+@pytest.mark.cpu_only
+def test_slot_tables_admit_edits_at_their_capacity():
+    bias = torch.ones(logit_edits.MAX_BIAS_TOKENS)
+    words = [list(range(logit_edits.MAX_BAD_WORD_LEN))] * logit_edits.MAX_BAD_WORDS
+    assert logit_edits.rejection_reason(bias, words) is None
+    assert logit_edits.rejection_reason(None, None) is None

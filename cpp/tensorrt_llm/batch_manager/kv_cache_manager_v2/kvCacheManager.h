@@ -183,13 +183,18 @@ public:
     //                       nullopt inherits the manager config default.
     // enableRequestStats:   collect request-local allocation and reuse statistics even when
     //                       manager-level statistics are disabled.
+    // optionalReuseMaxBacktrack: retain OPTIONAL candidates only within this distance of the REQUIRED prefix.
+    //                       Zero retains only the prefix endpoint; must be nonnegative.
     // inputTokens is a non-owning view; the caller must keep the underlying buffer alive for the
     // duration of the call (matching reads it but never stores it).
+    // inputKnownNoDigest: inputTokens hold no digest token (e.g. the zero-copy int32 path), so the reuse
+    // match may skip hashing; the sequence's text_only flag is unchanged.
     std::shared_ptr<KvCache> createKvCache(ReuseScope reuseScope = {}, TokenSpan inputTokens = {},
         std::optional<RequestIdType> id = std::nullopt, KvCache::PriorityCb priorityCb = {},
         std::optional<int> expectedPromptLength = std::nullopt, std::optional<bool> textOnly = std::nullopt,
-        bool enableRequestStats = false,
-        std::optional<executor::KvCacheRetentionConfig> retentionConfig = std::nullopt);
+        bool enableRequestStats = false, std::optional<executor::KvCacheRetentionConfig> retentionConfig = std::nullopt,
+        bool inputKnownNoDigest = false, std::optional<LocalityDomainId> localityDomainId = std::nullopt,
+        int optionalReuseMaxBacktrack = 0);
 
     //! Restore expired, unreferenced pages to the default retention priority.
     void refreshRetention();
@@ -204,6 +209,9 @@ public:
     // Matches under the shared lock. Once a remote level has failed, the first probe after it takes the exclusive lock
     // to unlink that level's pages, as createKvCache does, so that no probe counts them.
     int probeReuse(ReuseScope reuseScope = {}, TokenSpan inputTokens = {}, bool knownNoDigest = false);
+    // GPU-resident pages of the same match, counted per locality domain.
+    std::vector<int> probeReuseDomains(
+        ReuseScope reuseScope = {}, TokenSpan inputTokens = {}, bool knownNoDigest = false) const;
 
     // Read-only, advisory key of the first full block past the reusable prefix.
     // Uses the same fresh, window-aware match as probeReuse without acquiring pages.
@@ -249,6 +257,10 @@ public:
     // ---- Query / info ------------------------------------------------------
 
     int tokensPerBlock() const noexcept;
+    int numLocalityDomains() const noexcept;
+    // Contiguous mapped extents of a buffer as (address, page count) pairs. A single pair unless
+    // the GPU tier is localized, whose pools are mapped in interleaved per-domain chunks.
+    std::vector<std::pair<MemAddress, size_t>> getMappedBufferViews(LayerId layerId, DataRole role) const;
     bool enablePartialMatch() const noexcept;
 
     // Partial commit is independent of partial matching so beam search can

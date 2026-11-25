@@ -182,8 +182,8 @@ The `py_executor.model_engine_creation_seconds` timing includes the total `model
 | `draft_checkpoint_preparation_seconds` | Checkpoint preparation time for draft weights loaded as part of the model loader. |
 | `draft_weight_population_seconds` | Weight population time for draft weights loaded as part of the model loader. |
 | `draft_checkpoint_finalization_seconds` | Checkpoint finalization time for draft weights loaded as part of the model loader. |
-| `post_load_processing_seconds` | Time spent in format-specific hooks and model finalization, including post-load weight transformation, quantization and memory cleanup. |
-| `total_model_loading_seconds` | Overall model construction and loading interval measured after checkpoint configuration validation. It includes the named phases below. |
+| `post_load_processing_seconds` | Time spent in format-specific hooks and model finalization, including post-load weight transformation, quantization, memory cleanup and other work. |
+| `total_model_loading_seconds` | Overall model loading interval, from loading and validating the checkpoint configuration to the end of post-load processing. It includes the named phases above. |
 
 `trtllm-serve` exposes the same rank-0 payload in the `startup_metrics` field of the
 `GET /server_info` response:
@@ -203,6 +203,32 @@ curl http://localhost:8000/server_info
 }
 ```
 
+### Capturing Generation CUDA Graphs in One Pass (Prototype)
+
+By default the model engine captures its generation CUDA graphs in two passes: the warmup-only pass
+runs every graph shape once, so that shared buffers such as the attention workspace reach their
+largest size before any graph bakes in their addresses, and the capture pass then warms up and
+captures each shape. Setting `TLLM_CUDA_GRAPH_SKIP_WARMUP_PASS=1` on every rank lets the final model
+engine skip the warmup-only pass:
+
+- Each shape still runs one eager warmup forward right before its capture. These forwards keep the
+  warmup MoE communication timeouts, each capture uses the serving ones, and the ranks line up
+  before each graph's first replay.
+- After the last capture, every rank checks that no captured graph's top-level attention or
+  speculative-decoding metadata tensor was reallocated, and the ranks agree on the result. If one
+  was on any rank, every rank discards the graphs and captures them again with both passes, so a
+  fallback costs one extra capture pass and logs a warning.
+- The check does not see other buffers, such as module buffers or tensors nested in the metadata.
+  Such a buffer that a smaller shape regrows after a larger shape's capture goes unnoticed, so
+  compare a model's outputs with and without the switch before relying on it.
+- The switch is ignored, with a warning, for LoRA CUDA graphs, FlashInfer MXFP8 decode GEMMs that
+  need autotuning, `TLLM_CUDA_GRAPH_GEMM_TUNING=1` on a single rank, encoder-decoder models, DWDP
+  and pipeline parallelism, and when not every rank sets it. The KV cache estimation executor
+  always uses both passes, so the KV cache size does not depend on the switch.
+- With the switch, the final model engine's `gen_cuda_graph_capture_seconds` includes each shape's
+  eager warmup forward and, after a fallback, the discarded pass; `gen_cuda_graph_warmup_seconds`
+  then covers only a fallback's warmup-only pass.
+
 ## Unified Cache for Compiled Artifacts
 
 Set `TRTLLM_CACHE_DIR` before importing TensorRT-LLM to place its compiled
@@ -216,7 +242,7 @@ configured environment variable takes precedence.
 | `TORCHINDUCTOR_CACHE_DIR` | `/tmp/torchinductor_$USER` | `inductor` |
 | `TRITON_CACHE_DIR` | `$HOME/.triton/cache` | `triton` |
 | `TORCH_EXTENSIONS_DIR` | `$HOME/.cache/torch_extensions` | `torch_extensions` |
-| `FLASHINFER_WORKSPACE_BASE` | `$HOME/.cache/flashinfer` | `flashinfer` |
+| `FLASHINFER_WORKSPACE_BASE` | `$HOME/.cache/tensorrt_llm/flashinfer/rank-N` in MPI workers (see below), `$HOME/.cache/flashinfer` otherwise | `flashinfer/rank-N` in MPI workers, `flashinfer` otherwise |
 | `CUTE_DSL_CACHE_DIR` | `/tmp/$USER/cutlass_python_cache` | `cute_dsl` |
 | `DG_JIT_CACHE_DIR` | `$HOME/.deep_gemm` | `deep_gemm` |
 | `TLLM_JIT_SHARE_DIR` | Disabled | Not set (one directory per launch, see below) |
@@ -231,6 +257,18 @@ across model instances or long-term persistence, which may lead to errors
 and other unintended behavior. As such, we recommend using distinct 
 `TRTLLM_CACHE_DIR` caches for different models, and invalidating them anytime 
 a component in the software stack changes.
+
+TensorRT-LLM can also keep the results of `cute.compile`, which the CuTe DSL does not cache,
+so that later processes and ranks load the CuTe DSL kernels they need instead of compiling
+them again. Set `TRTLLM_CUTE_DSL_CACHE_DIR` to a directory before importing TensorRT-LLM to
+turn this on. `TRTLLM_CACHE_DIR` does not set it, because the cache hooks CuTe DSL internals
+and its directory only grows: nothing prunes it, and kernels whose generated names carry a
+per-process value add an entry on every launch. An entry is keyed on everything the compile
+reads: the traced kernel, the compile pipeline and options, the CuTe DSL build, the target
+architecture and the call's TVM-FFI signature, so a changed kernel or toolchain compiles anew.
+Entries run as compiled code, so only trusted users may write to the directory. A process
+killed while it writes an entry leaves a `.tmp.<pid>.<hex>` file, which the cache never reads
+and which can be deleted.
 
 The directories are created by their respective consumers when needed.
 TensorRT-LLM does not add cache locking or cleanup; per-rank isolation is
@@ -352,14 +390,23 @@ Python launcher.
 
 ### FlashInfer JIT workspaces for MPI workers
 
-`trtllm-llmapi-launch` ranks and dynamically spawned `MpiPoolSession` workers
-isolate FlashInfer JIT workspaces by default. Each process claims a locked,
+`trtllm-llmapi-launch` ranks and dynamically spawned `MpiPoolSession` workers,
+single-rank and single-GPU ones included, isolate FlashInfer JIT workspaces by
+default. Each process claims a locked,
 persistent cache slot under `~/.cache/tensorrt_llm/flashinfer` that holds its
 generated sources, compiled modules and downloaded FlashInfer artifacts, so
 concurrent MPI processes never write to each other's compiler inputs while JIT
 artifacts stay warm across launches. Set
 `TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=0` before invoking the launcher or
 creating the LLM instance to disable this behavior.
+
+Workspaces outside these slots, such as FlashInfer's default
+`~/.cache/flashinfer`, are not reused. The first launch, and each additional
+slot that concurrent jobs claim, downloads and compiles FlashInfer artifacts
+again. On a host without network access, pre-populate an explicit
+`FLASHINFER_CUBIN_DIR` and set `FLASHINFER_NO_DOWNLOAD=1` as described below,
+or set `TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=0` to keep using the shared
+workspace.
 
 Downloaded TRTLLM-Gen FMHA kernel cubins are the exception: FlashInfer only
 loads them and never compiles them, so ranks with persistent slots share them

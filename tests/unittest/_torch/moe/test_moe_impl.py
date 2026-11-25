@@ -44,6 +44,7 @@ from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
 from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe_backend
 from tensorrt_llm._torch.moe.fused_moe.cutedsl import (
     TrtllmCutedslDenseGemmNvfp4Impl,
+    TrtllmCutedslFusedFc12Mxfp8Impl,
     TrtllmCutedslFusedFc12Nvfp4Impl,
     TrtllmCutedslGroupedGemmBf16Impl,
     TrtllmCutedslGroupedGemmNvfp4Impl,
@@ -64,8 +65,10 @@ from tensorrt_llm._torch.moe.fused_moe.cutlass import (
     TrtllmCutlassW4a16Mxfp4Impl,
     TrtllmCutlassW4a16Nvfp4Impl,
     TrtllmCutlassW8a16Impl,
+    TrtllmTritonFp8ActGroupedGemmFp8BlockScalesImpl,
     TrtllmTritonFp8BlockScalesImpl,
     cutlass_leaf,
+    find_cutlass_leaf,
 )
 from tensorrt_llm._torch.moe.fused_moe.cutlass.base import (
     CutlassFusedMoEBase,
@@ -101,7 +104,11 @@ from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     identity_quant_of,
     normalize_quant,
 )
-from tensorrt_llm._torch.moe.fused_moe.impl_environment import MoEDep, override_moe_environment
+from tensorrt_llm._torch.moe.fused_moe.impl_environment import (
+    MoEDep,
+    MoEEnvFlag,
+    override_moe_environment,
+)
 from tensorrt_llm._torch.moe.fused_moe.impl_identity import (
     MOE_IMPL_REGISTRY,
     MoEImplDescriptor,
@@ -974,6 +981,141 @@ def test_pinned_fc12_identity_fails_hard_where_the_backend_literal_degrades():
 
 
 # =====================================================================
+# TrtllmCutedslFusedFc12Mxfp8Impl implementation identity
+# =====================================================================
+# The MXFP8 fused FC12 leaf is what ``moe_backend: CUTEDSL`` resolves to for an
+# MXFP8 checkpoint. Its gates read SM, two CuTe DSL dependencies, EPLB, the
+# hidden size's alignment to the FC1 scale gather and the per-rank
+# intermediate size's alignment to the 128-row scale atoms.
+
+_FC12_MXFP8_IMPL_ID = "trtllm.cutedsl.fused_fc12.mxfp8"
+_FC12_MXFP8_DEPS = (MoEDep.CUTEDSL_RUBIN.value, MoEDep.CUTEDSL_MXFP8_FUSED_FC12_RUBIN.value)
+
+
+def _fc12_mxfp8_problem(hidden_size: int = 4096, intermediate_size: int = 1024) -> MoEProblem:
+    """The Qwen3.5-397B routed shape."""
+    return MoEProblem(
+        quant=canonical_quant(QuantAlgo.MXFP8),
+        dtype_act=torch.bfloat16,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=512,
+        top_k=10,
+        swiglu_gptoss_style=False,
+    )
+
+
+def _fc12_mxfp8_environment(sm: int = 107, deps=_FC12_MXFP8_DEPS) -> MoEEnvironment:
+    return MoEEnvironment(sm=sm, available_deps=deps)
+
+
+def test_fc12_mxfp8_identity_round_trips_through_registry():
+    impl = TrtllmCutedslFusedFc12Mxfp8Impl
+    identity = impl.descriptor.identity
+    assert identity.canonical() == _FC12_MXFP8_IMPL_ID
+    assert MoEImplId.parse(_FC12_MXFP8_IMPL_ID) == identity
+    assert MOE_IMPL_REGISTRY.lookup(identity) is impl
+    assert "descriptor" in vars(impl)
+    for name in _ABSTRACT_METHODS:
+        assert name in vars(impl)
+    assert not impl.__abstractmethods__
+    assert impl.scheduler_kind is MoESchedulerKind.EXTERNAL_COMM
+    assert impl.capabilities == MoEStaticCapability(supports_apply_router_weight_on_input=True)
+    assert impl.activation_support == MoEActivationSupport(
+        kinds=frozenset({ActivationType.Swiglu}),
+        limit=ActivationParamShape.UNIFORM_SCALAR,
+        limit_when_absent=float("inf"),
+    )
+    # Not a grouped-GEMM leaf: the family name gates grouped-GEMM-only paths.
+    assert not issubclass(impl, CuteDslFusedMoE)
+    assert backend_family_of(impl) == "CUTEDSL"
+
+
+def test_fc12_mxfp8_is_admitted_on_rubin_only():
+    problem = _fc12_mxfp8_problem()
+    admitted = {
+        sm
+        for sm in range(75, 125)
+        if TrtllmCutedslFusedFc12Mxfp8Impl.can_implement(
+            problem, _single_rank_deployment(_fc12_mxfp8_environment(sm))
+        ).eligible
+    }
+    assert admitted == {107}
+
+
+@pytest.mark.parametrize(
+    "problem, deployment, reason",
+    [
+        pytest.param(
+            _fc12_mxfp8_problem(),
+            _single_rank_deployment(_fc12_mxfp8_environment(deps=(MoEDep.CUTEDSL_RUBIN.value,))),
+            MoERejectReason.DEP_MISSING,
+            id="dsl-too-old",
+        ),
+        pytest.param(
+            _fc12_mxfp8_problem(hidden_size=2304),
+            _single_rank_deployment(_fc12_mxfp8_environment()),
+            MoERejectReason.SHAPE_UNALIGNED,
+            id="hidden-not-512-aligned",
+        ),
+        pytest.param(
+            _fc12_mxfp8_problem(intermediate_size=1088),
+            _single_rank_deployment(_fc12_mxfp8_environment()),
+            MoERejectReason.SHAPE_UNALIGNED,
+            id="intermediate-not-128-aligned",
+        ),
+        pytest.param(
+            _fc12_mxfp8_problem(),
+            dataclasses.replace(_single_rank_deployment(_fc12_mxfp8_environment()), tp_size=16),
+            MoERejectReason.SHAPE_UNALIGNED,
+            id="tp-shard-not-128-aligned",
+        ),
+        pytest.param(
+            _fc12_mxfp8_problem(),
+            dataclasses.replace(
+                _single_rank_deployment(_fc12_mxfp8_environment()), eplb_enabled=True
+            ),
+            MoERejectReason.EPLB_UNSUPPORTED,
+            id="eplb",
+        ),
+        pytest.param(
+            _fc12_mxfp8_problem(),
+            dataclasses.replace(
+                _single_rank_deployment(_fc12_mxfp8_environment()),
+                fused_finalize_enabled=False,
+            ),
+            MoERejectReason.FINALIZE_FUSION_REQUIRED,
+            id="no-fused-finalize",
+        ),
+        pytest.param(
+            dataclasses.replace(_fc12_mxfp8_problem(), quant=canonical_quant(QuantAlgo.NVFP4)),
+            _single_rank_deployment(_fc12_mxfp8_environment()),
+            MoERejectReason.QUANT_UNSUPPORTED,
+            id="nvfp4",
+        ),
+    ],
+)
+def test_fc12_mxfp8_gate_rejections(problem, deployment, reason):
+    verdict = TrtllmCutedslFusedFc12Mxfp8Impl.can_implement(problem, deployment)
+    assert not verdict.eligible
+    assert verdict.reject_reason is reason
+
+
+def test_cutedsl_literal_serves_mxfp8_with_the_fused_fc12_leaf():
+    with override_moe_environment(_fc12_mxfp8_environment()):
+        report = resolve_moe_impl(_cutedsl_model_config(QuantAlgo.MXFP8))
+    assert impl_class_for(report) is TrtllmCutedslFusedFc12Mxfp8Impl
+    assert not report.degraded
+
+
+def test_cutedsl_literal_degrades_mxfp8_to_cutlass_on_an_old_dsl():
+    with override_moe_environment(_fc12_mxfp8_environment(deps=(MoEDep.CUTEDSL_RUBIN.value,))):
+        report = resolve_moe_impl(_cutedsl_model_config(QuantAlgo.MXFP8))
+    assert impl_class_for(report) is TrtllmCutlassMxfp8Impl
+    assert report.degraded
+
+
+# =====================================================================
 # Marlin: two formats over one kernel
 # =====================================================================
 # Both leaves run the same ``marlin_nvfp4_moe_gemm`` launch sequence, and are
@@ -1110,6 +1252,15 @@ _HP_FP32 = _HP | {torch.float32}
 _FROM_AMPERE = frozenset(range(80, 125))
 _PROBED_DTYPES = (torch.float16, torch.bfloat16, torch.float32, torch.float8_e4m3fn)
 
+#: The environment flags that admit the SM90 Triton FP8-activation leaf.
+_SM90_TRITON_FP8_DECODE_ON = ((MoEEnvFlag.SM90_TRITON_FP8_DECODE.value, "1"),)
+
+
+def _opt_in_flags(leaf: type) -> tuple[tuple[str, str], ...]:
+    """The env flags a leaf needs set before it admits anything."""
+    return () if leaf.opt_in_flag is None else ((leaf.opt_in_flag.value, "1"),)
+
+
 # Every CUTLASS leaf's declarations, written out by hand rather than read off
 # the leaves, so one that drifts fails here: the SMs it admits (probed over
 # SM75-124), its activation dtypes, whether its loader takes a gpt-oss / 1-D
@@ -1145,6 +1296,16 @@ _CUTLASS_DECLARATIONS = (
         FusedMoeOpFlags(use_deepseek_fp8_block_scale=True),
         False,
         id="fp8_block_scales-sm90",
+    ),
+    pytest.param(
+        TrtllmTritonFp8ActGroupedGemmFp8BlockScalesImpl,
+        {90},
+        {torch.bfloat16},
+        (False, False),
+        (False, False),
+        FusedMoeOpFlags(use_deepseek_fp8_block_scale=True),
+        False,
+        id="fp8_block_scales-sm90-triton-fp8-act",
     ),
     pytest.param(
         TrtllmTritonFp8BlockScalesImpl,
@@ -1268,8 +1429,9 @@ def test_cutlass_leaf_declarations(leaf, sms, dtypes, gptoss, oss_build, flags, 
         **problem_fields: object,
     ) -> bool:
         problem = MoEProblem(quant=quant, dtype_act=dtype, **problem_fields)
+        environment = MoEEnvironment(sm=sm, oss_cutlass_moe=oss, env_flags=_opt_in_flags(leaf))
         deployment = dataclasses.replace(
-            _single_rank_deployment(MoEEnvironment(sm=sm, oss_cutlass_moe=oss)),
+            _single_rank_deployment(environment),
             force_dynamic_quantization=dynamic,
             moe_lora_enabled=lora,
         )
@@ -1335,6 +1497,73 @@ def test_cutlass_literal_picks_the_fp8_block_scales_leaf_by_sm(sm, impl_id):
         )
     assert impl_class_for(report).descriptor.identity.canonical() == impl_id
     assert not report.degraded
+
+
+@pytest.mark.parametrize(
+    "env_flags, winner",
+    [
+        pytest.param((), DeepgemmCudaHopperFp8BlockScalesImpl, id="default"),
+        pytest.param(
+            _SM90_TRITON_FP8_DECODE_ON,
+            TrtllmTritonFp8ActGroupedGemmFp8BlockScalesImpl,
+            id="opted-in",
+        ),
+    ],
+)
+def test_sm90_triton_fp8_act_leaf_is_opt_in(env_flags, winner):
+    """Ranked ahead of the DeepGEMM leaf, the Triton FP8-activation leaf wins
+    only when the deployment opts in; otherwise it declines without blaming the
+    layer, and resolution and the leaf lookup both land on the DeepGEMM leaf."""
+    with override_moe_environment(MoEEnvironment(sm=90, env_flags=env_flags)):
+        report = resolve_moe_impl(
+            _cutlass_model_config(QuantAlgo.FP8_BLOCK_SCALES), dtype=torch.bfloat16
+        )
+        assert find_cutlass_leaf(QuantAlgo.FP8_BLOCK_SCALES) is winner
+    assert impl_class_for(report) is winner
+    assert not report.degraded
+    if not env_flags:
+        (rejection,) = [r for r in report.rejected if "TritonFp8ActGroupedGemm" in r.legacy_backend]
+        assert rejection.reason is MoERejectReason.PATH_NOT_ENABLED
+        assert MoEEnvFlag.SM90_TRITON_FP8_DECODE.value in rejection.detail
+
+
+def test_sm90_triton_fp8_act_pin_needs_the_opt_in():
+    """A pinned identity measures the kernel it names or nothing at all."""
+    impl_id = TrtllmTritonFp8ActGroupedGemmFp8BlockScalesImpl.descriptor.identity.canonical()
+    assert impl_id == "trtllm.triton.fp8_act_grouped_gemm.fp8_block_scales"
+    with override_moe_environment(MoEEnvironment(sm=90)):
+        report = resolve_moe_impl(
+            _cutlass_model_config(QuantAlgo.FP8_BLOCK_SCALES),
+            impl_id=impl_id,
+            dtype=torch.bfloat16,
+        )
+    assert report.winner is None
+    assert report.rejected[-1].reason is MoERejectReason.PATH_NOT_ENABLED
+
+
+@pytest.mark.parametrize(
+    "problem_fields, detail",
+    [
+        pytest.param({"bias": True}, "takes no expert bias", id="expert-bias"),
+        pytest.param({"activation": "Geglu"}, "does not execute Geglu", id="geglu"),
+    ],
+)
+def test_sm90_triton_fp8_act_leaf_declines_what_its_kernel_lacks(problem_fields, detail):
+    """Even opted in, the leaf stands aside for what the Triton path never runs,
+    so the DeepGEMM leaf serves those layers under its own name."""
+    problem = MoEProblem(
+        quant=canonical_quant(QuantAlgo.FP8_BLOCK_SCALES),
+        dtype_act=torch.bfloat16,
+        **problem_fields,
+    )
+    deployment = _single_rank_deployment(
+        MoEEnvironment(sm=90, env_flags=_SM90_TRITON_FP8_DECODE_ON)
+    )
+    verdict = TrtllmTritonFp8ActGroupedGemmFp8BlockScalesImpl.can_implement(problem, deployment)
+
+    assert verdict.reject_reason is MoERejectReason.ACTIVATION_UNSUPPORTED
+    assert detail in verdict.detail
+    assert DeepgemmCudaHopperFp8BlockScalesImpl.can_implement(problem, deployment).eligible
 
 
 def test_cutlass_leaf_names_the_registered_formats_when_none_serves():
@@ -3435,8 +3664,11 @@ def test_cutlass_communication_selection(monkeypatch, is_oss, method, force_sour
         constructors[name] = MagicMock(name=name)
         monkeypatch.setattr(communication_factory, name, constructors[name])
     monkeypatch.setattr(communication_factory, "get_wide_ep_ft_options", lambda _: (None, 60, 1))
+    backend = TrtllmCutlassUnquantizedImpl.__new__(TrtllmCutlassUnquantizedImpl)
+    # __new__ skips __init__, which normally sets quant_config from model_config.
+    backend.quant_config = config.quant_config
     moe = SimpleNamespace(
-        backend=TrtllmCutlassUnquantizedImpl.__new__(TrtllmCutlassUnquantizedImpl),
+        backend=backend,
         enable_dwdp=False,
         model_config=config,
         num_experts=4,

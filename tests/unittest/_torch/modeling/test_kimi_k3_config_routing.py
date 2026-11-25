@@ -50,6 +50,7 @@ def _composite_config():
     }
 
 
+@pytest.mark.cpu_only
 class TestIsKimiK3MultimodalConfig(unittest.TestCase):
     def test_composite_vlm_config_routes_multimodal(self):
         self.assertTrue(is_kimi_k3_multimodal_config(_composite_config()))
@@ -108,6 +109,7 @@ def _vision_model_config(tp_size, enable_attention_dp, cp_size=1):
     )
 
 
+@pytest.mark.cpu_only
 class TestVisionRequiresReplication(unittest.TestCase):
     """Pin the (mapping, num_heads) contract of _vision_requires_replication.
 
@@ -141,6 +143,7 @@ def _load_config_from_dict(cfg: dict[str, Any]) -> PretrainedConfig:
         return load_pretrained_config(model_dir)
 
 
+@pytest.mark.cpu_only
 class TestKimiK3LoaderRouting(unittest.TestCase):
     """End-to-end config.json -> load_pretrained_config routing.
 

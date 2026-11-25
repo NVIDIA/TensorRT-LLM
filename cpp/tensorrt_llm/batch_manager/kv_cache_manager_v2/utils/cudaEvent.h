@@ -382,6 +382,8 @@ private:
 inline void streamWaitEvents(CudaStream stream, std::vector<CUevent> events)
 {
     events.erase(std::remove(events.begin(), events.end(), nullptr), events.end());
+    // Neighbouring pages mostly share one event: collapse runs before sorting.
+    events.erase(std::unique(events.begin(), events.end()), events.end());
     std::sort(events.begin(), events.end());
     events.erase(std::unique(events.begin(), events.end()), events.end());
     for (CUevent h : events)

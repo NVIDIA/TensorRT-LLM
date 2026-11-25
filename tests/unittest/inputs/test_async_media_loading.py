@@ -62,9 +62,7 @@ class TestAsyncLoadImage:
     @pytest.mark.asyncio
     async def test_load_image_from_raw_bytes_pil(self):
         encoded = _make_image_data_url().partition(",")[2]
-        image = await media_io_module.ImageMediaIO(format="pil").async_load_bytes(
-            base64.b64decode(encoded)
-        )
+        image = await media_io_module.ImageMediaIO().async_load_bytes(base64.b64decode(encoded))
         assert isinstance(image, Image.Image)
         assert image.mode == "RGB"
 
@@ -110,6 +108,67 @@ class TestAsyncLoadImage:
         assert worker_thread_ids[0] != event_loop_thread_id, (
             "PIL decoding ran on the event loop thread — event loop is being blocked"
         )
+
+
+# ──────────────────────────────────────────────────────────────
+# load_image / async_load_image: local files
+# ──────────────────────────────────────────────────────────────
+
+
+class TestLoadImageLocalFile:
+    """`load_image` and `async_load_image` resolve local files the same way."""
+
+    @staticmethod
+    def _write_image(directory, name):
+        path = directory / name
+        Image.new("RGB", (6, 4), color=(10, 20, 30)).save(path)
+        return path
+
+    @staticmethod
+    def _reference(path):
+        return np.asarray(Image.open(path).convert("RGB"))
+
+    def test_offline_image_default_and_explicit_tensor(self, tmp_path):
+        path = self._write_image(tmp_path, "offline.png")
+        kwargs = dict(
+            tokenizer=None,
+            model_dir="",
+            model_type="llava_llama",
+            modality="image",
+            prompts=["Describe the image."],
+            media=[str(path)],
+        )
+        default = utils_module.default_multimodal_input_loader(**kwargs)
+        explicit = utils_module.default_multimodal_input_loader(**kwargs, image_data_format="pt")
+        image = default[0]["multi_modal_data"]["image"][0]
+        assert isinstance(image, Image.Image) and image.mode == "RGB"
+        assert isinstance(explicit[0]["multi_modal_data"]["image"][0], torch.Tensor)
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "plain.png",
+            "with space.png",
+            "hash#mark.png",
+            "question?mark.png",
+            "semi;colon.png",
+            "100%.png",
+        ],
+    )
+    @pytest.mark.parametrize("as_uri", [False, True], ids=["bare_path", "file_uri"])
+    @pytest.mark.asyncio
+    async def test_sync_and_async_load_the_same_file(self, tmp_path, name, as_uri):
+        path = self._write_image(tmp_path, name)
+        source = path.as_uri() if as_uri else str(path)
+
+        expected = self._reference(path)
+        sync_image = utils_module.load_image(source)
+        async_image = await async_load_image(source)
+
+        assert isinstance(sync_image, Image.Image) and sync_image.mode == "RGB"
+        assert isinstance(async_image, Image.Image) and async_image.mode == "RGB"
+        assert np.array_equal(np.asarray(sync_image), expected)
+        assert np.array_equal(np.asarray(async_image), expected)
 
 
 # ──────────────────────────────────────────────────────────────

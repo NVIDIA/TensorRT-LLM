@@ -97,8 +97,46 @@ TEST(KvCacheManagerV2SlotAllocatorTest, ShrinkTouchedPool)
     EXPECT_EQ(allocator.numActiveSlots(), 8);
     EXPECT_FALSE(allocator.shrinkInProgress());
 
-    // Leave the allocator quiescent so the debug-build destructor checks pass.
+    // Leave the allocator quiescent so the debug-build destructor checks pass. release() does not
+    // scan readiness, so synchronize() marks the recycled slots ready.
     releaseSlots(allocator, slots, 0, 8);
+    allocator.synchronize();
+}
+
+std::vector<SlotCount> slotIds(std::vector<Slot> const& slots)
+{
+    std::vector<SlotCount> ids;
+    for (auto const& slot : slots)
+    {
+        ids.push_back(slot.slotId().value());
+    }
+    return ids;
+}
+
+// Released slots come back in release order before fresh ids, so allocate() must scan readiness when
+// it could still hand out a fresh id; once every id is issued it takes the front released slot. These
+// slots carry no event, so a scanned slot is ready.
+TEST(KvCacheManagerV2SlotAllocatorTest, ReusesReleasedSlotsInReleaseOrder)
+{
+    SlotAllocator allocator{SlotCount{4}};
+    auto first = allocateSlots(allocator, 2);
+    std::swap(first[0], first[1]);
+    releaseSlots(allocator, first);
+    auto second = allocateSlots(allocator, 4);
+    EXPECT_EQ(slotIds(second), (std::vector<SlotCount>{1, 0, 2, 3}));
+
+    std::vector<Slot> released;
+    released.push_back(std::move(second[2]));
+    released.push_back(std::move(second[0]));
+    releaseSlots(allocator, released);
+    auto third = allocateSlots(allocator, 2);
+    EXPECT_EQ(slotIds(third), (std::vector<SlotCount>{2, 1}));
+
+    releaseSlots(allocator, third);
+    releaseSlots(allocator, second, 1, 2);
+    releaseSlots(allocator, second, 3, 4);
+    EXPECT_EQ(allocator.numOccupiedSlots(), 0);
+    allocator.synchronize();
 }
 
 // SlotId is signed, so an upper-bound-only test admits negative ids, which convert to a huge

@@ -146,6 +146,7 @@ class _ControlExecutor:
     _handle_control_request = PyExecutor._handle_control_request
     _control_drain_ready = PyExecutor._control_drain_ready
     _has_pending_connector_transfers = PyExecutor._has_pending_connector_transfers
+    _has_pending_context_retirement = PyExecutor._has_pending_context_retirement
     _dist_size = staticmethod(PyExecutor._dist_size)
 
     def __init__(self, *, drain, active=(), transfers=0, connector=None):

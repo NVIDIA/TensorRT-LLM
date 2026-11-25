@@ -18,7 +18,6 @@ vocabulary-sharded logits (also through the spec worker), and TPGroupExchange's 
 RoPE kernel's in-kernel q all-gather, eager and replayed from a CUDA graph (the epochs keep advancing across
 launches); TPGroupExchange's all-to-all merge against an eager merge of every member's partials."""
 
-import math
 import pickle
 import sys
 import traceback
@@ -28,6 +27,7 @@ import cloudpickle
 import pytest
 import torch
 from _torch.helpers import (
+    chi_square,
     fast_gumbel_max_reference,
     gumbel_max_reference,
     late_copy,
@@ -186,36 +186,36 @@ def _single_shard_sample(full, temperatures, seed):
     return gumbel_max_reference(full, temperatures, seed, GREEDY_TEMPERATURE_THRESHOLD)
 
 
-def _chi_square(counts, probs, z=5.0):
-    """Pearson statistic of ``counts`` against ``probs`` (bins under 5 expected draws merged) and its
-    critical value at ``z`` standard deviations (Wilson-Hilferty; z = 5 rejects a correct sampler
-    with probability 3e-7)."""
-    expected = probs.double() * counts.sum()
-    big = expected >= 5
-    obs, exp = counts[big].double(), expected[big]
-    rest_obs, rest_exp = counts[~big].sum().double(), expected[~big].sum()
-    if rest_exp >= 5:
-        obs, exp = torch.cat([obs, rest_obs.view(1)]), torch.cat([exp, rest_exp.view(1)])
-    else:
-        obs[-1] += rest_obs
-        exp[-1] += rest_exp
-    stat = float(((obs - exp) ** 2 / exp).sum())
-    dof = obs.numel() - 1
-    crit = dof * (1 - 2 / (9 * dof) + z * math.sqrt(2 / (9 * dof))) ** 3
-    return stat, crit
-
-
 def _gumbel_sample(tp, base_seed=0):
     from tensorrt_llm._torch.speculative.interface import SpecWorkerBase
 
     mapping, rank = _mapping(tp)
     ex = TPKeyExchange.create(mapping, max_rows=64)
     assert ex is not None, "no peer memory for the exchange"
-    vocab, rows, groups = tp * SHARD, 512, 4
-    group_temps = torch.tensor([0.6, 1.0, 1.5, 0.5 * GREEDY_TEMPERATURE_THRESHOLD], device="cuda")
-    temps = group_temps.repeat_interleave(rows // groups)  # the last group stays greedy
+    vocab, rows = tp * SHARD, 480
+    # From just above the greedy threshold to nearly uniform; the last group stays greedy.
+    group_temps = torch.tensor(
+        [
+            2 * GREEDY_TEMPERATURE_THRESHOLD,
+            0.05,
+            0.6,
+            1.0,
+            1.5,
+            50.0,
+            0.5 * GREEDY_TEMPERATURE_THRESHOLD,
+        ],
+        device="cuda",
+    )
+    groups = group_temps.numel()
+    rows = rows // groups * groups
+    temps = group_temps.repeat_interleave(rows // groups)
     g = torch.Generator(device="cuda").manual_seed(base_seed + 1)
     dists = (torch.randn((groups, vocab), generator=g, device="cuda") * 3).to(torch.bfloat16)
+    # Near ties (bf16 steps of 1/32 at 4) spread the draws of the smallest temperature over a few tokens.
+    dists[0] = -20.0
+    dists[0, torch.arange(tp, device="cuda") * SHARD + 1] = 4.0
+    dists[0, torch.arange(tp, device="cuda") * SHARD + 2] = 4.0 - 1.0 / 32
+    dists[1] *= 0.05  # logits / T of the same spread as at T = 1
     full = dists.repeat_interleave(rows // groups, dim=0)
     local = full[:, rank * SHARD : (rank + 1) * SHARD]
     greedy = torch.argmax(full.float(), dim=-1).to(torch.int32)
@@ -223,7 +223,7 @@ def _gumbel_sample(tp, base_seed=0):
         # Each row draws its own noise: the rows of a group are independent samples of its logits.
         counts = torch.zeros((groups - 1, vocab), dtype=torch.int64, device="cuda")
         seed = torch.zeros(1, dtype=torch.int64, device="cuda")
-        for step in range(32):
+        for step in range(64):
             seed.fill_(base_seed * 1000 + step + 1)
             ex.argmax_row_split = step % 4 == 0
             tokens = ex.argmax_logits(
@@ -244,7 +244,7 @@ def _gumbel_sample(tp, base_seed=0):
         assert torch.equal(tokens.view(groups, -1)[-1], greedy.view(groups, -1)[-1])
         for group in range(groups - 1):
             probs = torch.softmax(dists[group].float() / group_temps[group], dim=-1)
-            stat, crit = _chi_square(counts[group].cpu(), probs.cpu())
+            stat, crit = chi_square(counts[group].cpu(), probs.cpu())
             assert stat < crit, (float(group_temps[group]), stat, crit)
 
         # Through the spec worker: every temperature-only batch advances its device seed.
@@ -257,7 +257,7 @@ def _gumbel_sample(tp, base_seed=0):
                 raise NotImplementedError
 
         worker = _Worker(key_exchange=ex)
-        worker.mapping = mapping
+        worker._target_head_mapping = mapping
         worker.cache_derived_state()
         md = SimpleNamespace(
             is_all_greedy_sample=False, sharded_target_logits=True, temperatures=temps
@@ -312,7 +312,7 @@ def _fast_gumbel_sample(tp):
                 assert torch.equal(tokens.view(groups, -1)[-1], greedy.view(groups, -1)[-1])
         for group in range(groups - 1):
             probs = torch.softmax(dists[group].float() / group_temps[group], dim=-1)
-            stat, crit = _chi_square(counts[group].cpu(), probs.cpu())
+            stat, crit = chi_square(counts[group].cpu(), probs.cpu())
             assert stat < crit, (float(group_temps[group]), stat, crit)
         torch.cuda.synchronize()
     finally:
@@ -838,6 +838,39 @@ def _peer_fill_failure(tp):
     assert buffers is None, "a rank kept peer buffers whose fill failed on another rank"
 
 
+def _create_agreement(tp):
+    """``create_tp_key_exchange`` agrees across the TP group: when the setup fails on one rank only,
+    every rank gets None (so callers take the NCCL path on every rank); otherwise every rank gets one."""
+    from tensorrt_llm._torch.distributed import ll_exchange
+
+    mapping, rank = _mapping(tp)
+    # The key of create_tp_key_exchange's default flags (no fast_gumbel, no argmax_row_split).
+    key = (tuple(mapping.tp_group), mapping.tp_rank, torch.cuda.current_device(), False, False)
+    init = TPKeyExchange.__init__
+
+    def failing_init(self, *args, **kwargs):
+        raise RuntimeError("simulated setup failure on rank 1")
+
+    try:
+        ll_exchange._EXCHANGES.pop(key, None)
+        if rank == 1:
+            TPKeyExchange.__init__ = failing_init
+        ex = ll_exchange.create_tp_key_exchange(mapping, 64)
+        TPKeyExchange.__init__ = init
+        outcomes = MPI.COMM_WORLD.allgather(ex is not None)
+        assert outcomes == [False] * tp, outcomes
+
+        ll_exchange._EXCHANGES.pop(key, None)
+        ex = ll_exchange.create_tp_key_exchange(mapping, 64)
+        outcomes = MPI.COMM_WORLD.allgather(ex is not None)
+        assert outcomes == [True] * tp, outcomes
+        ex.close()
+    finally:
+        TPKeyExchange.__init__ = init
+        ll_exchange._EXCHANGES.pop(key, None)
+        MPI.COMM_WORLD.barrier()
+
+
 def _worker(fn, tp):
     try:
         with torch.inference_mode():
@@ -858,11 +891,18 @@ CASES = {
     "rope_gather": _rope_gather,
     "group_merge": _group_merge,
     "peer_fill_failure": _peer_fill_failure,
+    "create_agreement": _create_agreement,
 }
+# Cases that run at TP2 only: the agreement on a failed setup does not depend on
+# the TP size.
+TP2_ONLY_CASES = {"create_agreement"}
 
 
-@pytest.mark.parametrize("case", list(CASES))
-@pytest.mark.parametrize("mpi_pool_executor", [2, 4], indirect=True)
+@pytest.mark.parametrize(
+    "mpi_pool_executor, case",
+    [(tp, case) for tp in (2, 4) for case in CASES if tp == 2 or case not in TP2_ONLY_CASES],
+    indirect=["mpi_pool_executor"],
+)
 def test_ll_exchange(case, mpi_pool_executor):
     tp = mpi_pool_executor.num_workers
     if torch.cuda.device_count() < tp:

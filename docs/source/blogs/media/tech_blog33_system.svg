@@ -15,21 +15,21 @@
 <text x="364" y="128" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">to NVFP4 pages</text>
 <rect x="664" y="56" width="296" height="86" rx="6" fill="#ffffff" stroke="#76B900" stroke-width="1"/>
 <text x="676" y="74" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" letter-spacing="1.4" fill="#76B900" text-anchor="start">KV CACHE</text>
-<text x="676" y="98" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="14" font-weight="600" fill="#2d3142" text-anchor="start">Canonical NVFP4 cache</text>
+<text x="676" y="98" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="14" font-weight="600" fill="#2d3142" text-anchor="start">Paged NVFP4 cache</text>
 <text x="676" y="113" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">128-token pages, 360 B per</text>
 <text x="676" y="128" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">token and layer; reusable</text>
 <path d="M324,94 L350,94" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
 <path d="M636,94 L662,94" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
 <path d="M812,144 L812,212" fill="none" stroke="#76B900" stroke-width="1.5" marker-end="url(#ahg)"/>
-<text x="798" y="184" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="end">NIXL transfer of the canonical state</text>
+<text x="798" y="184" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="end">NIXL transfer of the NVFP4 pages</text>
 <text x="798" y="200" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="end">360 B per token and layer (FP8 MLA: 576 B) + BF16 tail</text>
 <rect x="20" y="214" width="960" height="240" rx="8" fill="none" stroke="#4f5d75" stroke-width="1.2"/>
 <text x="32" y="232" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="600" letter-spacing="1.4" fill="#2d3142" text-anchor="start">GENERATION WORKER · DECODE</text>
 <rect x="664" y="246" width="296" height="86" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
 <text x="676" y="264" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" letter-spacing="1.4" fill="#7a8399" text-anchor="start">IMPORT</text>
-<text x="676" y="288" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="14" font-weight="600" fill="#2d3142" text-anchor="start">Rebuild BMM2 view</text>
-<text x="676" y="303" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">from the imported pages,</text>
-<text x="676" y="318" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">about 0.15 ms per request</text>
+<text x="676" y="288" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="14" font-weight="600" fill="#2d3142" text-anchor="start">NVFP4 pages</text>
+<text x="676" y="303" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">E2M1 values, block scales</text>
+<text x="676" y="318" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">and the BF16 tail</text>
 <rect x="352" y="246" width="282" height="86" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
 <text x="364" y="264" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" letter-spacing="1.4" fill="#7a8399" text-anchor="start">EACH DECODE STEP</text>
 <text x="364" y="288" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="14" font-weight="600" fill="#2d3142" text-anchor="start">Fused pre-attention</text>
