@@ -411,6 +411,13 @@ def mhc_allreduce_post_collapse_norm(
     res_out = torch.empty_like(res_flat)
     quant, quantized, scale_addr = _quantized_outputs(m, hidden, out.device, mxfp8, nvfp4_scale)
     table = allreduce.prepare(allreduce.nranks * m * hidden * res_flat.element_size())
+    # A contiguous offset view can still violate the compiled kernel's 16-byte alignment.
+    res_flat, post, comb, pre, weight, fc2, scales, perm, shared = [
+        t.clone() if t.data_ptr() % 16 else t
+        for t in (res_flat, post, comb, pre, weight, fc2, scales, perm, shared)
+    ]
+    # Unfinalized MoE uses shared as x too; keep the alias to avoid a second copy.
+    x = shared.view(m, hidden) if moe_key is not None else (x.clone() if x.data_ptr() % 16 else x)
     fn = _compiled_allreduce_boundary(
         m,
         hidden,

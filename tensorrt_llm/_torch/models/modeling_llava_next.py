@@ -19,7 +19,8 @@ from tensorrt_llm._torch.models.checkpoints.hf.llava_next_weight_mapper import \
     LlavaNextHfWeightMapper
 from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_mm_disagg
 from tensorrt_llm.inputs.multimodal import (MultimodalItemMetadata,
-                                            MultimodalParams)
+                                            MultimodalParams,
+                                            split_multimodal_embedding_items)
 
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
                        BaseMultimodalInputProcessor, ContentFormat,
@@ -401,6 +402,11 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
                                        return_tensors="pt").input_ids[0]
 
         mm_features = multimodal_embedding["image"]
+        if not isinstance(mm_features, torch.Tensor):
+            # Items may be dicts that also hold metadata such as
+            # image_grid_thw, which LLaVA-NeXT does not use. A bare tensor is
+            # left as is: _postprocess splits it across the images.
+            mm_features, _ = split_multimodal_embedding_items(mm_features)
         fused_input_ids, mm_features = self._postprocess(input_ids, mm_features)
         multimodal_data = {}
         multimodal_data["multimodal_embedding"] = mm_features

@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from tensorrt_llm._torch.attention.backends.fmha.prims_ts_mla_warmup import PrimsTSDenseMlaWarmup
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.distributed import Distributed
@@ -75,6 +76,18 @@ class AutotunerWarmupMode(Enum):
     # Only a max_batch_size generation batch: helix ranks on a disaggregated
     # generation server never prefill.
     GENERATION_ONLY = auto()
+
+
+def _gather_prewarm_errors(
+    dist: Distributed | None, mapping: Mapping, error: str | None = None
+) -> list[str | None]:
+    """Align the tensor and context parallel peers after local kernel preparation."""
+    if dist is not None:
+        if mapping.cp_size > 1:
+            return dist.tp_cp_allgather(error)
+        if mapping.tp_size > 1:
+            return dist.tp_allgather(error)
+    return [error]
 
 
 class WarmupAgreement:
@@ -324,6 +337,7 @@ class DecoderWarmup:
         self._context_logits_heads = context_logits_heads
         # Token shape of the last autotuner warmup that ran a forward pass.
         self._completed_autotuner_warmup_num_tokens: int | None = None
+        self._prims_ts_dense_mla_warmup = PrimsTSDenseMlaWarmup()
 
     @property
     def guided_decoder(self) -> CapturableGuidedDecoder | None:
@@ -516,6 +530,8 @@ class DecoderWarmup:
         # reaches with every variant (e.g. Kimi-K3's attention-residual kernels).
         with self._warmup_timer.phase("model_decode_kernels"):
             self._prewarm_model_decode_kernels(kv_cache_manager)
+        with self._warmup_timer.phase("prims_ts_sparse_mla"):
+            self._prewarm_prims_ts_sparse_mla(resource_manager, kv_cache_manager)
         if self._context_warmups_supported:
             with (
                 self._warmup_timer.phase(
@@ -604,6 +620,14 @@ class DecoderWarmup:
                 allow_single_pass=not getattr(kv_cache_manager, "is_estimating_kv_cache", False),
             )
         log_mem_snapshot("warmup/after_cuda_graph_capture")
+        with self._warmup_timer.phase("prims_ts_dense_mla_prewarm"):
+            self._prims_ts_dense_mla_warmup.run(
+                self.model,
+                self._metadata.attn_metadata,
+                max_batch_size=self._config.max_batch_size,
+                max_num_tokens=self._config.max_num_tokens,
+                max_seq_len=self._config.max_seq_len,
+            )
         # Pre-compile DeepGEMM paged_mqa_logits_metadata for every 32-aligned
         # batch bucket the runtime can produce (max_batch_size scaled by the
         # MTP / DSL expansion factor when applicable). CUDA-graph warmup only
@@ -956,11 +980,7 @@ class DecoderWarmup:
                     logger.warning(f"Throwaway Top-K prewarm skipped. {type(e).__name__}: {e}")
                     break
         torch.cuda.synchronize()
-        if self.dist is not None:
-            if self.mapping.cp_size > 1:
-                self.dist.tp_cp_allgather(1)
-            elif self.mapping.tp_size > 1:
-                self.dist.tp_allgather(1)
+        _gather_prewarm_errors(self.dist, self.mapping)
         if ready:
             logger.info(f"Throwaway Top-K prewarm complete ({time.perf_counter() - start:.1f} s)")
 
@@ -1041,16 +1061,47 @@ class DecoderWarmup:
         torch.cuda.synchronize()
         # Hold the TP (x CP) group, as the indexer-Q prewarm does, so these compiles add no skew
         # between the peers of the first collective.
-        if self.dist is not None:
-            if self.mapping.cp_size > 1:
-                self.dist.tp_cp_allgather(1)
-            elif self.mapping.tp_size > 1:
-                self.dist.tp_allgather(1)
+        _gather_prewarm_errors(self.dist, self.mapping)
         if compiled:
             logger.info(
                 f"Decode kernel prewarm complete ({compiled} kernels, "
                 f"{time.perf_counter() - start:.1f} s)"
             )
+
+    def _prewarm_prims_ts_sparse_mla(
+        self, resource_manager: ResourceManager, kv_cache_manager: KVCacheManager | KVCacheManagerV2
+    ) -> None:
+        """Prepare sparse MLA before forward using the target KV cache manager and
+        any one-engine draft cache provided by the resource manager.
+        """
+        from tensorrt_llm._torch.attention.backends.fmha.prims_ts_sparse_mla import (
+            warmup_prims_ts_sparse_mla,
+        )
+        from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.metadata import (
+            DeepseekV4TrtllmAttentionMetadata,
+        )
+
+        if not issubclass(
+            self._config.attention_backend.Metadata, DeepseekV4TrtllmAttentionMetadata
+        ):
+            return
+        try:
+            with torch.inference_mode():
+                metadata = self._metadata.setup_attention(
+                    kv_cache_manager,
+                    get_draft_kv_cache_manager(self._config.spec_config, resource_manager),
+                )
+                warmup_prims_ts_sparse_mla(self.model, metadata)
+            torch.cuda.synchronize()
+        except Exception as exc:
+            # A CUDA error can also break the communicator. Preserve the original
+            # failure for the executor's distributed warmup guard in that case.
+            with contextlib.suppress(Exception):
+                _gather_prewarm_errors(self.dist, self.mapping, f"{type(exc).__name__}: {exc}")
+            raise
+        for peer_error in _gather_prewarm_errors(self.dist, self.mapping):
+            if peer_error is not None:
+                raise RuntimeError(f"PrimTS sparse MLA warmup failed on a peer: {peer_error}")
 
     def _ensure_dsa_attn_metadata_for_warmup(self, resource_manager: ResourceManager) -> None:
         """Build the DSA attention metadata if no warmup forward created it, so

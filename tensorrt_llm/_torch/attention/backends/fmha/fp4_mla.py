@@ -23,12 +23,12 @@ from tensorrt_llm._torch.attention.backends.fp4_mla import (
     scatter_fp4_mla_kv_cache,
 )
 from tensorrt_llm._torch.attention.backends.fp4_mla.fp4_mla_context import (
-    _FP8_CONTEXT_SCRATCH_ATTR,
     _build_fp8_mla_context_attn,
     _build_fp8_mla_context_metadata,
     _execute_fp8_context_with_cache_update,
     _Fp8MlaContextScratch,
     _get_fp8_mla_context_metadata,
+    get_or_create_fp8_mla_context_scratch,
     require_fp4_mla_fp8_context_support,
 )
 from tensorrt_llm._torch.attention.backends.interface import (
@@ -155,28 +155,13 @@ class Fp4MlaFmha(PhasedFmha):
     ) -> tuple["TrtllmAttention", _Fp8MlaContextScratch]:
         """Reuse one manager-owned scratch and one layer-local FP8 attention view."""
         attn = self.attn
-        kv_cache_manager = metadata.kv_cache_manager
-        if kv_cache_manager is None:
-            raise RuntimeError("FP8 MLA context scratch requires a KV cache manager.")
-        scratch = getattr(kv_cache_manager, _FP8_CONTEXT_SCRATCH_ATTR, None)
         scratch_head_dim = (attn.kv_lora_rank or 0) + (attn.qk_rope_head_dim or 0)
-        if scratch is None:
-            scratch = _Fp8MlaContextScratch.create(
-                metadata,
-                device=q.device,
-                head_dim=scratch_head_dim,
-            )
-            setattr(kv_cache_manager, _FP8_CONTEXT_SCRATCH_ATTR, scratch)
-        else:
-            assert isinstance(scratch, _Fp8MlaContextScratch)
-            # The step's FP8 metadata view is built only after this check, so a
-            # view of this scratch means an earlier layer already passed it.
-            fp8_context_state = metadata.fp4_mla_state.fp8_context_state
-            if fp8_context_state is None or fp8_context_state[0] is not scratch:
-                assert scratch.matches(metadata, device=q.device, head_dim=scratch_head_dim), (
-                    "FP8 MLA context scratch geometry must be shared by all layers of its "
-                    "KV manager."
-                )
+        scratch = get_or_create_fp8_mla_context_scratch(
+            metadata.kv_cache_manager,
+            metadata,
+            device=q.device,
+            head_dim=scratch_head_dim,
+        )
 
         fp8_attention = self._fp8_attention
         if fp8_attention is None:
@@ -254,6 +239,7 @@ class Fp4MlaFmha(PhasedFmha):
             scratch.cache_start_event,
             scratch.cache_done_event,
         )
+        forward_args.softmax_stats_is_lse = fp8_forward_args.softmax_stats_is_lse
 
     def forward_context_partition(
         self,
@@ -342,7 +328,9 @@ class Fp4MlaFmha(PhasedFmha):
             kv_scale_quant_orig=None,
             latent_cache=None,
         )
-        return fp8_attention.forward(q, k, v, fp8_metadata, fp8_forward_args)
+        output = fp8_attention.forward(q, k, v, fp8_metadata, fp8_forward_args)
+        forward_args.softmax_stats_is_lse = fp8_forward_args.softmax_stats_is_lse
+        return output
 
     def run_mla_generation(self, params: FmhaParams) -> None:
         attn = params.attn

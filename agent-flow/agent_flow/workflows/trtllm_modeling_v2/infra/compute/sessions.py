@@ -5,6 +5,7 @@
 
 A session is a process on a GPU node whose main process is the spool scheduler, declared in
 ``environment.sessions``; :func:`render_session_entry` renders its entry script from that block.
+A session of several nodes also has a *lead* (:func:`render_lead_entry`).
 How the process is started (a batch scheduler, a container runtime, a shell on a workstation) is
 the operator's choice and nothing here depends on it. A session with a time limit hands over
 before its end (:mod:`.scheduler`): a second session started on the same spool takes the jobs that
@@ -29,7 +30,7 @@ from typing import Any, Mapping, Sequence
 import yaml
 
 from ...spec.schema_keys import reject_unknown_keys
-from . import SCHEDULER_PATH
+from . import SCHEDULER_PATH, steps
 from .scheduler import latest_watcher, parse_duration, utc_iso
 
 #: What a session is for: ``gates`` takes gate jobs, ``work`` only what a worker submits to it,
@@ -271,10 +272,10 @@ def env_assignments(env: Mapping[str, str]) -> list[str]:
     ]
 
 
-def scheduler_arguments(session: SessionSpec) -> list[str]:
-    """``scheduler.py watch`` options for a session, besides the spool."""
-    args: list[str] = []
-    if session.gpus_per_node is not None:
+def scheduler_arguments(session: SessionSpec, *, lead: bool = False) -> list[str]:
+    """``scheduler.py watch`` options for a session (or its lead), besides the spool."""
+    args: list[str] = ["--lead"] if lead else []
+    if session.gpus_per_node is not None and not lead:
         args += ["--gpus", str(session.gpus_per_node)]
     if session.time_limit_s:
         args += ["--time-limit", str(int(session.time_limit_s))]
@@ -285,20 +286,37 @@ def scheduler_arguments(session: SessionSpec) -> list[str]:
     return args
 
 
+def _entry_env(task_data: Mapping[str, Any], session: SessionSpec) -> dict[str, str]:
+    """What session ``session``'s entry exports: the run's environment, then its own."""
+    block = task_data.get("environment") or {}
+    env = {str(k): str(v) for k, v in (block.get("env") or {}).items()}
+    env.update(session.env)
+    env.setdefault("PYTHONNOUSERSITE", "1")
+    env["MV2FLOW_SESSION"] = session.name
+    env["MV2FLOW_SESSION_SPOOLS"] = ":".join(s.spool for s in sessions_from_task(task_data))
+    if task_data.get("trtllm_repo_path"):
+        env["MV2FLOW_REPO"] = str(task_data["trtllm_repo_path"])
+    return env
+
+
+def render_session_env(task_data: Mapping[str, Any], name: str) -> str:
+    """What session ``name``'s entry exports and sets up, for a step's fresh shell to read."""
+    session = session_by_name(task_data, name)
+    lines = [
+        f"# Environment of compute session {session.name!r} for its steps (`session render`).",
+        *(f"export {assignment}" for assignment in env_assignments(_entry_env(task_data, session))),
+        *session.setup,
+    ]
+    return "\n".join(lines) + "\n"
+
+
 def render_session_entry(
     task_data: Mapping[str, Any], name: str, *, source: str = "task.yaml"
 ) -> str:
     """The entry script of session ``name``: set the run's environment, become its scheduler."""
     session = session_by_name(task_data, name)
     block = task_data.get("environment") or {}
-    env = {str(k): str(v) for k, v in (block.get("env") or {}).items()}
-    env.update(session.env)
-    env.setdefault("PYTHONNOUSERSITE", "1")
-    all_spools = ":".join(s.spool for s in sessions_from_task(task_data))
-    env["MV2FLOW_SESSION"] = session.name
-    env["MV2FLOW_SESSION_SPOOLS"] = all_spools
-    if task_data.get("trtllm_repo_path"):
-        env["MV2FLOW_REPO"] = str(task_data["trtllm_repo_path"])
+    env = _entry_env(task_data, session)
     python = str(block.get("python") or "python3")
     stamp = utc_iso()
     watch = " ".join(shlex.quote(a) for a in scheduler_arguments(session))
@@ -315,7 +333,8 @@ def render_session_entry(
         "# allocation's main process; work arrives as files in the spool.",
         *(
             [
-                f"# With nodes: {session.nodes} it runs once on each node, each a watcher of the spool."
+                f"# With nodes: {session.nodes} it runs once on each node, each a watcher of the spool;"
+                " session_lead.sh runs once beside them, on the batch host."
             ]
             if session.nodes > 1
             else []
@@ -348,17 +367,54 @@ def render_session_entry(
     return "\n".join(lines) + "\n"
 
 
+def render_lead_entry(task_data: Mapping[str, Any], name: str, *, source: str = "task.yaml") -> str:
+    """The lead's entry of session ``name``: the scheduler in lead mode, outside the container."""
+    session = session_by_name(task_data, name)
+    watch = " ".join(shlex.quote(a) for a in scheduler_arguments(session, lead=True))
+    lines = [
+        "#!/bin/bash",
+        "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+        "# SPDX-License-Identifier: Apache-2.0",
+        f"# Lead of compute session {session.name!r}, rendered at {utc_iso()} from {source}.",
+        "# Run it once on the allocation's batch host, OUTSIDE the container. Its Python (3.7+)",
+        "# is MV2FLOW_SCHEDULER_PYTHON where that host's `python3` is older.",
+        "set -u",
+        f"SPOOL={shlex.quote(session.spool)}",
+        f"export MV2FLOW_SESSION={shlex.quote(session.name)}",
+        'export MV2FLOW_SPOOL="$SPOOL"',
+        'mkdir -p "$SPOOL"',
+        f'exec "${{MV2FLOW_SCHEDULER_PYTHON:-python3}}" {shlex.quote(str(SCHEDULER_PATH))} watch "$SPOOL" '
+        f"{watch} --session {shlex.quote(session.name)}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _install(target: Path, text: str) -> Path:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    staging = target.with_name(f".{target.name}.tmp")
+    staging.write_text(text, encoding="utf-8")
+    staging.chmod(0o755)
+    os.replace(staging, target)
+    return target
+
+
 def install_session_entry(
     task_data: Mapping[str, Any], name: str, *, out: Path | None = None, source: str = "task.yaml"
 ) -> Path:
-    """Render session ``name``'s entry and write it (executable) where its successor finds it."""
+    """Render session ``name``'s entry and write it (executable) where its successor finds it.
+
+    A session of several nodes also gets ``session_lead.sh`` beside it and ``session_env.sh`` in
+    its spool, where a step reads it.
+    """
     session = session_by_name(task_data, name)
-    target = Path(out) if out else session.entry_path
-    target.parent.mkdir(parents=True, exist_ok=True)
-    staging = target.with_name(f".{target.name}.tmp")
-    staging.write_text(render_session_entry(task_data, name, source=source), encoding="utf-8")
-    staging.chmod(0o755)
-    os.replace(staging, target)
+    target = _install(
+        Path(out) if out else session.entry_path,
+        render_session_entry(task_data, name, source=source),
+    )
+    if session.nodes > 1:
+        lead = render_lead_entry(task_data, name, source=source)
+        _install(target.with_name("session_lead.sh"), lead)
+        _install(Path(session.spool) / steps.SESSION_ENV, render_session_env(task_data, name))
     return target
 
 
@@ -472,6 +528,10 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 path = install_session_entry(task, args.name, out=args.out, source=str(args.task))
                 print(path)
+                session = session_by_name(task, args.name)
+                if session.nodes > 1:
+                    print(path.with_name("session_lead.sh"))
+                    print(Path(session.spool) / steps.SESSION_ENV)
             return 0
     except (SessionConfigError, KeyError) as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -493,7 +553,9 @@ __all__ = [
     "install_session_entry",
     "load_session_config",
     "main",
+    "render_lead_entry",
     "render_session_entry",
+    "render_session_env",
     "scheduler_arguments",
     "session_by_name",
     "session_status",

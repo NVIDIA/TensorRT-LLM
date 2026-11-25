@@ -10,6 +10,7 @@ import torch
 from torch import nn
 from typing_extensions import Self
 
+from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import _build_request_multimodal_input
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
@@ -17,7 +18,7 @@ from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
 )
 from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from tensorrt_llm._torch.pyexecutor.llm_request import get_multimodal_embedding_lengths
-from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.utils import with_model_extra_attrs
 from tensorrt_llm._utils import nvtx_range, prefer_pinned
@@ -40,8 +41,8 @@ class MultimodalEncoderRunner(ScheduledModelRunner):
     """Run an engine whose only job is multimodal encoding.
 
     This family is distinct from ``MultimodalItemScheduler``, which schedules vision items
-    inside a decoder engine. Its graph phase is a no-op because
-    ``MultimodalEncoderGraphRunner`` belongs to, and is owned by, the vision model layer.
+    inside a decoder engine. The vision towers capture their block CUDA graphs when they are
+    built, so warmup has nothing to do; ``release_graphs`` clears them.
     """
 
     def __init__(
@@ -90,17 +91,15 @@ class MultimodalEncoderRunner(ScheduledModelRunner):
             embedding_lengths.append(list(lengths))
         return _PayloadBatch(request_indices, params, embedding_lengths)
 
-    def _validate_resources(self, resource_manager: ResourceManager) -> None:
-        kv_cache_manager = resource_manager.get_resource_manager(
-            ResourceManagerType.KV_CACHE_MANAGER
-        )
-        assert kv_cache_manager is None, (
-            "a no-KV-cache runner was initialized, but a KV cache manager was allocated"
-        )
+    def warmup(self, resource_manager: ResourceManager | None = None) -> None:
+        del resource_manager
 
-    def warmup(self, resource_manager: ResourceManager) -> None:
-        """Validate the resources used by this runner before execution."""
-        self._validate_resources(resource_manager)
+    def release_graphs(self, *, release_nccl_window_owners: bool = True) -> None:
+        for module in self._model.modules():
+            if isinstance(module, MultimodalEncoderMixin):
+                module.clear_blocks_cuda_graph(
+                    release_nccl_window_owners=release_nccl_window_owners
+                )
 
     @torch.inference_mode()
     @with_model_extra_attrs(lambda self: self._model.extra_attrs)
@@ -111,11 +110,14 @@ class MultimodalEncoderRunner(ScheduledModelRunner):
         resource_manager: ResourceManager,
         is_dummy: bool = False,
     ) -> dict[str, Any]:
-        del is_dummy
-        self._validate_resources(resource_manager)
+        del resource_manager, is_dummy
         batch = self._prepare_inputs(inputs.batch)
         with MoeLoadBalancerIterContext(self._moe_load_balancer):
-            return self._forward_step(batch)
+            outputs = self._forward_step(batch)
+        if inputs.inputs_staged is not None:
+            # The towers' attention metadata stages through reused host buffers during the forward.
+            inputs.inputs_staged.record()
+        return outputs
 
     @nvtx_range("_forward_step_mm_encoder_only")
     def _forward_step(self, batch: _PayloadBatch) -> dict[str, Any]:
@@ -159,7 +161,7 @@ class MultimodalEncoderRunner(ScheduledModelRunner):
                 mrope_position_deltas_list.append(mrope_position_deltas)
 
         # mrope lists must align 1:1 with multimodal_params (or be empty);
-        # the sampler indexes them by per-MM-result position into mm_embeddings.
+        # the completion indexes them by per-MM-result position into mm_embeddings.
         assert len(mrope_position_ids_list) == len(mrope_position_deltas_list) and len(
             mrope_position_ids_list
         ) in (0, len(batch.params)), (
@@ -170,7 +172,6 @@ class MultimodalEncoderRunner(ScheduledModelRunner):
 
         result = {
             "mm_embeddings": mm_embeddings,
-            "logits": None,
             "mm_embedding_request_indices": batch.request_indices,
             "mm_embedding_lengths": batch.embedding_lengths,
         }

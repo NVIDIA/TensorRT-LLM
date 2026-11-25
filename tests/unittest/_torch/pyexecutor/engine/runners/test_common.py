@@ -26,7 +26,6 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.common import (
     token_model_inputs,
 )
 from tensorrt_llm._torch.pyexecutor.engine.runners.interface import ModelRunner
-from tensorrt_llm._torch.pyexecutor.engine.runners.mm_encoder import MultimodalEncoderRunner
 from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
@@ -35,22 +34,19 @@ pytestmark = pytest.mark.cpu_only
 
 
 @pytest.mark.parametrize(
-    ("mm_encoder_only", "is_encoder_decoder", "runner_type"),
+    ("is_encoder_decoder", "runner_type"),
     [
-        (True, False, MultimodalEncoderRunner),
-        (False, True, EncoderDecoderRunner),
-        (False, False, DecoderRunner),
+        (True, EncoderDecoderRunner),
+        (False, DecoderRunner),
     ],
 )
 def test_resolve_runner_dispatches_startup_families(
-    mm_encoder_only: bool,
     is_encoder_decoder: bool,
     runner_type: type[ModelRunner],
 ) -> None:
-    args = SimpleNamespace(mm_encoder_only=mm_encoder_only)
     model = SimpleNamespace(model_config=SimpleNamespace(is_encoder_decoder=is_encoder_decoder))
 
-    assert resolve_runner_type(model, args) is runner_type
+    assert resolve_runner_type(model) is runner_type
 
 
 @pytest.mark.parametrize(

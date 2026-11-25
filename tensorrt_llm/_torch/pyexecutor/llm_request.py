@@ -407,6 +407,8 @@ class PyResult:
             name: []
             for name in additional_outputs
         } if additional_outputs else None
+        self._additional_context_output_lengths: dict[str, int] | None = None
+        self._additional_generation_output_lengths: dict[str, int] | None = None
         self._encoder_output: Optional[torch.Tensor] = None
         self.diff = PyResult.Diff()
 
@@ -415,13 +417,20 @@ class PyResult:
 
         Single-sequence streaming logprobs move to the response, preserving
         cumulative totals in fresh request storage. Beam search publishes full
-        histories, so it copies their lists instead of consuming them.
+        histories, so it copies their lists instead of consuming them. Additional
+        outputs share their lists with response-time lengths for reads and IPC.
+
+        Retaining an in-process response keeps the shared additional-output
+        dictionaries and lists alive, including tensors appended after its
+        captured lengths. An early response can therefore retain outputs for
+        the entire stream even after the request is released. Reads and
+        serialized state still include only the captured prefixes.
         """
         result = copy(self)
         if self.context_prompt_logprob_rows is not None:
             result.context_prompt_logprob_rows = self.context_prompt_logprob_rows.copy(
             )
-        result.diff = PyResult.Diff()
+        del result.diff
         if self._log_probs is not None:
             if self._streaming and beam_width <= 1 and self.log_probs:
                 self._log_probs = LogProbStorage()
@@ -447,17 +456,43 @@ class PyResult:
                 result._generation_logits._device_fragments = self._generation_logits._device_fragments.copy(
                 )
         if self._additional_context_outputs is not None:
-            result._additional_context_outputs = {
-                name: outputs.copy()
+            result._additional_context_output_lengths = {
+                name: len(outputs)
                 for name, outputs in self._additional_context_outputs.items()
             }
         if self._additional_generation_outputs is not None:
-            result._additional_generation_outputs = {
-                name: outputs.copy()
+            result._additional_generation_output_lengths = {
+                name: len(outputs)
                 for name, outputs in
                 self._additional_generation_outputs.items()
             }
         return result
+
+    @staticmethod
+    def _bounded_additional_outputs(
+        outputs: dict[str, list[torch.Tensor]] | None,
+        lengths: dict[str, int] | None,
+    ) -> dict[str, list[torch.Tensor]] | None:
+        if outputs is None or lengths is None:
+            return outputs
+        return {
+            name: outputs[name][:length]
+            for name, length in lengths.items()
+        }
+
+    def __getstate__(self) -> dict:
+        state = self.__dict__.copy()
+        # Queued responses may be serialized after the request appends more outputs.
+        state.update(
+            _additional_context_outputs=self._bounded_additional_outputs(
+                self._additional_context_outputs,
+                self._additional_context_output_lengths),
+            _additional_generation_outputs=self._bounded_additional_outputs(
+                self._additional_generation_outputs,
+                self._additional_generation_output_lengths),
+            _additional_context_output_lengths=None,
+            _additional_generation_output_lengths=None)
+        return state
 
     def reset_diff(self):
         self.diff = PyResult.Diff()
@@ -637,6 +672,21 @@ class PyResult:
         self.diff.mrope_position_ids = self._mrope_position_ids
         self.diff.mrope_position_deltas = self._mrope_position_deltas
 
+    def release_exports(self) -> None:
+        """Consume the handles this result exported; no response will deliver them."""
+        release_exported_handles(self)
+        self._mm_embeddings = None
+        self._mrope_position_ids = None
+        self._mrope_position_deltas = None
+        self.diff.mm_embeddings = None
+        self.diff.mrope_position_ids = None
+        self.diff.mrope_position_deltas = None
+
+    def drop_context_logits(self) -> None:
+        """Drop the stored context logits; no response will deliver them."""
+        self._context_logits = None
+        self.diff.context_logits_list = []
+
     def set_encoder_output(self, encoder_output: torch.Tensor):
         self._encoder_output = encoder_output
         self.diff.encoder_output = encoder_output
@@ -748,31 +798,58 @@ class PyResult:
 
     @property
     def additional_context_outputs(self) -> Dict[str, torch.Tensor] | None:
-        if self._additional_context_outputs is None:
+        outputs = self._bounded_additional_outputs(
+            self._additional_context_outputs,
+            self._additional_context_output_lengths)
+        if outputs is None:
             return None
-        outputs = {}
-        for name, output_list in self._additional_context_outputs.items():
-            if len(output_list) == 0:
-                continue
-            outputs[name] = torch.cat(
-                output_list, dim=0) if len(output_list) > 1 else output_list[0]
-        return outputs
+        return {
+            name: torch.cat(chunks, dim=0) if len(chunks) > 1 else chunks[0]
+            for name, chunks in outputs.items() if chunks
+        }
 
     @property
     def additional_generation_outputs(self) -> Dict[str, torch.Tensor] | None:
-        if self._additional_generation_outputs is None:
+        outputs = self._bounded_additional_outputs(
+            self._additional_generation_outputs,
+            self._additional_generation_output_lengths)
+        if outputs is None:
             return None
-        outputs = {}
-        for name, output_list in self._additional_generation_outputs.items():
-            if len(output_list) == 0:
-                continue
-            outputs[name] = torch.cat(
-                output_list, dim=0) if len(output_list) > 1 else output_list[0]
-        return outputs
+        return {
+            name: torch.cat(chunks, dim=0) if len(chunks) > 1 else chunks[0]
+            for name, chunks in outputs.items() if chunks
+        }
 
     @property
     def encoder_output(self) -> torch.Tensor | None:
         return self._encoder_output
+
+
+def release_exported_handles(result: "PyResult | LlmResult") -> None:
+    """Consume a result's CUDA IPC handles that no consumer will open.
+
+    The producer cannot free an exported allocation until each of its handles is opened
+    and released, or consumed here.
+    """
+    handles = [
+        *(result.mm_embedding_handles or ()),
+        result.mrope_position_ids_handle,
+        result.mrope_position_deltas_handle,
+    ]
+    for handle in handles:
+        if handle is not None:
+            SharedTensorContainer.release_dict(handle)
+
+
+def release_undelivered_response(response: Any) -> None:
+    """Consume the exported handles of a response that no client will receive.
+
+    Takes the executor's responses, also when the worker has wrapped them; error
+    responses and other records carry no ``LlmResult`` and export nothing.
+    """
+    result = getattr(response, "result", None)
+    if isinstance(result, LlmResult):
+        release_exported_handles(result)
 
 
 class LlmResult:
@@ -1445,6 +1522,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             py_multimodal_data=deepcopy(self.py_multimodal_data),
             encoder_input_features=self.py_encoder_input_features,
             locality_domain_id=self.py_locality_domain_id,
+            _validation_error=self._validation_error,
         )
         child.py_bad_words = deepcopy(self.py_bad_words)
         child.py_no_repeat_ngram_size = self.py_no_repeat_ngram_size
