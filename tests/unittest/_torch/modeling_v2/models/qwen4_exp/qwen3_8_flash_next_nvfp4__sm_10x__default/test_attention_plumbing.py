@@ -326,7 +326,7 @@ def test_selection_matches_the_canonical_composition(width, form, monkeypatch):
         expected, positions, lengths, compress_ratio=4, token_topk=2048
     )
     if form != "cluster":
-        monkeypatch.setattr(M, "_topk_expand_cluster_supports", lambda scores: False)
+        monkeypatch.setattr(M, "_topk_expand_cluster_supports", lambda scores, max_rows: False)
     if form == "apart":
         monkeypatch.setattr(M, "_topk_expand_supports", lambda scores: False)
     result = torch.full_like(expected, -7)

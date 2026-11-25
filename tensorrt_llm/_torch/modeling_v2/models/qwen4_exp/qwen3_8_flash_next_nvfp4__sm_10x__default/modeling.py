@@ -284,6 +284,12 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_sparse_g
     qsa_sparse_gqa_splitk_cute,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_topk_expand_cluster__decode import (  # noqa: E501
+    MAX_ROWS as _TOPK_CLUSTER_MAX_ROWS,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_topk_expand_cluster__decode import (  # noqa: E501
+    PAIR_MAX_ROWS as _TOPK_CLUSTER_PAIR_MAX_ROWS,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_topk_expand_cluster__decode import (  # noqa: E501
     qsa_topk_expand_cluster,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_topk_expand_cluster__decode import (  # noqa: E501
@@ -816,6 +822,16 @@ _GROUPED_DECODE_MIN_REQUESTS = 32  # capacity: fixed: a dispatch threshold
 #: front ran caps 3-28 a rank, where this table runs split-K. Read once, when the core is built;
 #: set at a layout without attention DP it warns and does nothing.
 DP_GQA_MIN_REQUESTS_ENV = "TRTLLM_QWEN4_EXP_DP_GQA_MIN_REQUESTS"
+#: Opt-in, attention DP only: `TRTLLM_QWEN4_EXP_DP_TOPK_CLUSTER_ROWS=<n>` (n in
+#: `_TOPK_CLUSTER_MAX_ROWS` + 1..`_TOPK_CLUSTER_PAIR_MAX_ROWS`; unset is the op's own 37) lets a
+#: generation step's selection (`_selection`, not a context part) take the cluster top-k up to
+#: n rows, in clusters of two CTAs past 37 rows, instead of the one-CTA-a-row kernel. The same
+#: selection (exact top-k, the tie rule), so not a numerics question; opt-in because only our own
+#: cluster kernel was measured at these rows (dep4: 2 CTAs a row at 39-76 rows, with the verify
+#: head shard x 277.0 -> 289.0 at cap 12; trunk 153-256 and draft 39-64 rows -0.19..-0.28 ms a
+#: step at graphs 40-52, bitwise), not this one. Read once, when the core is built; set at a
+#: layout without attention DP it warns and does nothing.
+DP_TOPK_CLUSTER_ROWS_ENV = "TRTLLM_QWEN4_EXP_DP_TOPK_CLUSTER_ROWS"
 _QSA_POSITION_AXES = _pool.QSA_POSITION_AXES
 # The compressed index keys rotate at coordinate 0 alone (no mRoPE section), as the index
 # query does.
@@ -1144,6 +1160,31 @@ def _dp_gqa_min_requests(core) -> int:
             f"rank has attention DP {core.dp_size}"
         )
         return _GROUPED_DECODE_MIN_REQUESTS
+    return value
+
+
+def _dp_topk_cluster_rows(core) -> int:
+    """`DP_TOPK_CLUSTER_ROWS_ENV` at this core's layout: the most rows a generation step's
+    selection takes the cluster top-k at (`_TOPK_CLUSTER_MAX_ROWS` unset or at a layout without
+    attention DP). A value outside the op's range raises."""
+    raw = os.environ.get(DP_TOPK_CLUSTER_ROWS_ENV, "").strip()
+    if not raw:
+        return _TOPK_CLUSTER_MAX_ROWS
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if not _TOPK_CLUSTER_MAX_ROWS < value <= _TOPK_CLUSTER_PAIR_MAX_ROWS:
+        raise ValueError(
+            f"{DP_TOPK_CLUSTER_ROWS_ENV}={raw!r}: expected an integer in "
+            f"{_TOPK_CLUSTER_MAX_ROWS + 1}..{_TOPK_CLUSTER_PAIR_MAX_ROWS}"
+        )
+    if core.dp_size == 1:
+        logger.warning(
+            f"{DP_TOPK_CLUSTER_ROWS_ENV} is set but ignored: it serves attention-DP ranks; this "
+            f"rank has attention DP {core.dp_size}"
+        )
+        return _TOPK_CLUSTER_MAX_ROWS
     return value
 
 
@@ -2005,6 +2046,8 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         self._out_proj = None
         # The requests from which the grouped sparse GQA serves a step (`DP_GQA_MIN_REQUESTS_ENV`).
         self.dp_gqa_min_requests = _dp_gqa_min_requests(self)
+        # The most generation rows the cluster top-k serves (`DP_TOPK_CLUSTER_ROWS_ENV`).
+        self.dp_topk_cluster_rows = _dp_topk_cluster_rows(self)
 
         # Every weight but the n-gram table; meta-init intercepts torch.empty.
         self.w = _weights.MODEL_WEIGHTS.declare(d)
@@ -4702,11 +4745,15 @@ def _selection(
 ):
     """The selected token indices of `scores`' rows into `out` `[rows, token_topk +
     compress_ratio - 1]`: the canonical block top-k and its expansion in one launch (a cluster
-    of CTAs a row up to `qsa_topk_expand_cluster`'s rows, else one CTA a row; a context
-    chunk's rows, `context`, on the one-CTA op's context launch), or, for a score table neither
-    serves, the selection and the expansion apart (the rewrite bounded by `live_cols`,
-    `_select`). They all give the same selection."""
-    if _topk_expand_cluster_supports(scores):
+    of CTAs a row up to `qsa_topk_expand_cluster`'s rows, an attention-DP rank's
+    `DP_TOPK_CLUSTER_ROWS_ENV` for generation rows, else one CTA a row; a context chunk's rows,
+    `context`, on the one-CTA op's context launch), or, for a score table neither serves, the
+    selection and the expansion apart (the rewrite bounded by `live_cols`, `_select`). They all
+    give the same selection."""
+    cluster_rows = _TOPK_CLUSTER_MAX_ROWS
+    if not context:
+        cluster_rows = getattr(core, "dp_topk_cluster_rows", _TOPK_CLUSTER_MAX_ROWS)
+    if _topk_expand_cluster_supports(scores, max_rows=cluster_rows):
         qsa_topk_expand_cluster(
             scores,
             visible_blocks,

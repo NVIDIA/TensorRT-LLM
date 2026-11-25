@@ -11,7 +11,8 @@
   (and at a tep4 rank under `TEP_FAST_DECODE_ENV` its e4m3 shard up to 16 rows), None (the
   caller's `_sparse_gqa`) otherwise and over an NVFP4 pool.
 * **Selection** (`_selection`): the cluster launch, then the one-CTA launch, then the two
-  launches apart; a prefill step's context parts ask the one-CTA op for its context launch.
+  launches apart; a prefill step's context parts ask the one-CTA op for its context launch, and
+  an attention-DP rank's generation rows take the cluster up to `DP_TOPK_CLUSTER_ROWS_ENV`.
 
 The ops are replaced by recorders; no kernel runs.
 """
@@ -170,7 +171,7 @@ def test_sparse_gqa_tep4_shard_on_splitk(monkeypatch, tep_fast, rows, dtype, sel
 )
 def test_selection_order(monkeypatch, cluster, cta, expected):
     taken = []
-    monkeypatch.setattr(M, "_topk_expand_cluster_supports", lambda scores: cluster)
+    monkeypatch.setattr(M, "_topk_expand_cluster_supports", lambda scores, max_rows: cluster)
     monkeypatch.setattr(M, "_topk_expand_supports", lambda scores: cta)
     monkeypatch.setattr(M, "qsa_topk_expand_cluster", lambda *a, **k: taken.append("cluster"))
     monkeypatch.setattr(M, "qsa_topk_expand_decode", lambda *a, **k: taken.append("cta"))
@@ -184,7 +185,7 @@ def test_selection_order(monkeypatch, cluster, cta, expected):
 @pytest.mark.parametrize("context", [False, True])
 def test_selection_forwards_context_to_the_one_cta_op(monkeypatch, context):
     seen = []
-    monkeypatch.setattr(M, "_topk_expand_cluster_supports", lambda scores, *a: False)
+    monkeypatch.setattr(M, "_topk_expand_cluster_supports", lambda scores, max_rows: False)
     monkeypatch.setattr(M, "_topk_expand_supports", lambda scores: True)
     monkeypatch.setattr(M, "qsa_topk_expand_decode", lambda *a, **k: seen.append(k["context"]))
     out = torch.zeros(1, 1)
@@ -259,3 +260,50 @@ def test_dp_gqa_min_requests_switch(monkeypatch, env, dp_size, expected):
             M._dp_gqa_min_requests(core)
     else:
         assert M._dp_gqa_min_requests(core) == expected
+
+
+@pytest.mark.parametrize(
+    "rows_env, context, asked",
+    [
+        (None, False, 37),  # the op's own rows
+        (256, False, 256),  # generation rows up to the switch's rows
+        (256, True, 37),  # a context part keeps the op's own rows
+    ],
+)
+def test_selection_cluster_rows(monkeypatch, rows_env, context, asked):
+    seen = []
+    monkeypatch.setattr(
+        M, "_topk_expand_cluster_supports", lambda scores, max_rows: seen.append(max_rows)
+    )
+    monkeypatch.setattr(M, "_topk_expand_supports", lambda scores: True)
+    monkeypatch.setattr(M, "qsa_topk_expand_decode", lambda *a, **k: None)
+    extra = {} if rows_env is None else {"dp_topk_cluster_rows": rows_env}
+    core = SimpleNamespace(**{**vars(CORE), **extra})
+    out = torch.zeros(1, 1)
+    M._selection(core, torch.zeros(1, 8), None, None, None, None, None, out, context=context)
+    assert seen == [asked]
+
+
+@pytest.mark.parametrize(
+    "env, dp_size, expected",
+    [
+        (None, 4, 37),
+        ("76", 8, 76),
+        ("256", 4, 256),
+        ("76", 1, 37),  # no attention DP: warns, keeps the op's rows
+        ("37", 4, ValueError),  # not past the op's own rows
+        ("257", 4, ValueError),
+        ("all", 4, ValueError),
+    ],
+)
+def test_dp_topk_cluster_rows_switch(monkeypatch, env, dp_size, expected):
+    if env is None:
+        monkeypatch.delenv(M.DP_TOPK_CLUSTER_ROWS_ENV, raising=False)
+    else:
+        monkeypatch.setenv(M.DP_TOPK_CLUSTER_ROWS_ENV, env)
+    core = SimpleNamespace(dp_size=dp_size)
+    if expected is ValueError:
+        with pytest.raises(ValueError):
+            M._dp_topk_cluster_rows(core)
+    else:
+        assert M._dp_topk_cluster_rows(core) == expected

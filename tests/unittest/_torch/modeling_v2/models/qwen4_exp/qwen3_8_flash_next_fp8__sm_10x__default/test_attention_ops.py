@@ -1322,7 +1322,9 @@ def _tkc_build(spec, seed):
 
 def _check_topk_expand_cluster(cell, monkeypatch) -> None:
     args = _tkc_build(cell.spec, seed=_seed(cell.why) % 2**31)
-    assert supports(args[0]), "a cell outside the target's routing to this entry"
+    # A cell past `MAX_ROWS` is served for a caller that asks (`max_rows`).
+    floor = {"max_rows": cell.spec["max_rows"]} if "max_rows" in cell.spec else {}
+    assert supports(args[0], **floor), "a cell outside the callers' routing to this entry"
     want_topk, want_sel = _tkc_op.reference(*args)
     sel = _tkc_op(*args)
     assert sel.dtype == torch.int32 and sel.shape == want_sel.shape
