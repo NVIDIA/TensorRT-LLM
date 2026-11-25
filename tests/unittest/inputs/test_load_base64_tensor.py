@@ -351,6 +351,11 @@ def test_whitespace_retry_releases_the_failed_attempt() -> None:
 
 
 _FRAMED = b"\x80\x04\x95" + (10_000).to_bytes(8, "little")
+_BODY = _pickle((4, 2), (2, 1), 8)[2:]
+# An outer frame holding an inner frame that holds the whole body.
+_NESTED = b"\x80\x04" + b"".join(
+    b"\x95" + n.to_bytes(8, "little") for n in (9 + len(_BODY), len(_BODY))
+)
 _TUPLE_GLOBAL = b"X\x1f\x00\x00\x00torch._utils _rebuild_tensor_v2\x85"
 _PICKLE_REJECTED = {
     "allocating-global": (pickle.dumps(_BigBytearray(), protocol=2), "bytearray"),
@@ -362,6 +367,7 @@ _PICKLE_REJECTED = {
     "non-string-stack-global": (b"\x80\x04K\x01K\x02\x93.", "malformed"),
     "protocol": (_pickle((4, 2), (2, 1), 8, head=b"\x80\xff"), "malformed"),
     "frame-past-end": (_pickle((4, 2), (2, 1), 8, head=_FRAMED), "malformed"),
+    "frame-inside-frame": (_NESTED + _BODY, "malformed"),
     "tuple-as-global": (_pickle((4, 2), (2, 1), 8, rebuild=_TUPLE_GLOBAL), "exactly one"),
     # OrderedDict(tensor) would unbind 1e8 zero-stride rows while unpickling.
     "reducer-wrapping-tensor": (_pickle((10**8, 2), (0, 0), 1, wrap=True), "exactly one"),
