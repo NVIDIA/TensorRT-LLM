@@ -290,19 +290,9 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
     def _build_mm_item_metadata(
         self,
         prompt_token_ids: List[int],
-        multimodal_data: Dict[str, Any],
-    ) -> Optional[MultimodalItemMetadata]:
-        """Return prompt-ordered Qwen vision items and pre-merger costs."""
-        grids_by_modality: Dict[str, torch.Tensor] = {}
-        for modality, grid_key in (("image", "image_grid_thw"),
-                                   ("video", "video_grid_thw")):
-            modality_data = multimodal_data.get(modality)
-            if isinstance(modality_data,
-                          dict) and modality_data.get(grid_key) is not None:
-                grids_by_modality[modality] = modality_data[grid_key]
-        if not grids_by_modality:
-            return None
-
+        grids_by_modality: dict[str, list[list[int]]],
+    ) -> MultimodalItemMetadata:
+        """Return prompt-ordered Qwen vision items and their embedding lengths."""
         # Qwen2.5's fixed attention metadata is sized from the live
         # processor's startup geometry. Validate the processed grids against
         # that same contract before the request reaches the scheduler. This
@@ -399,7 +389,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
 
         local_indices = {"image": 0, "video": 0}
         item_refs: List[Tuple[str, int]] = []
-        encoder_token_lengths: List[int] = []
+        output_embedding_lengths: List[int] = []
         for modality in canonical_modalities:
             local_idx = local_indices[modality]
             grids = grids_by_modality.get(modality)
@@ -407,25 +397,31 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                 raise ValueError(
                     f"Prompt contains more {modality} items than encoder grids")
             item_refs.append((modality, local_idx))
-            encoder_token_lengths.append(
-                int(torch.prod(grids[local_idx]).item()))
+            output_embedding_lengths.append(
+                math.prod(grids[local_idx]) // self.spatial_merge_unit)
             local_indices[modality] += 1
 
         expected_items = sum(len(grids) for grids in grids_by_modality.values())
         if len(item_refs) != expected_items:
             raise ValueError("Prompt multimodal item order does not match "
                              "processed Qwen encoder grids")
-        output_embedding_lengths = [
-            token_length // self.spatial_merge_unit
-            for token_length in encoder_token_lengths
-        ]
         if any(length <= 0 for length in output_embedding_lengths):
             raise ValueError(
                 "Processed Qwen items must produce positive embedding lengths")
         return MultimodalItemMetadata(
             item_refs=item_refs,
-            encoder_token_lengths=encoder_token_lengths,
             output_embedding_lengths=output_embedding_lengths)
+
+    def get_mm_input_partitions(
+        self,
+        processed: dict[str,
+                        Any]) -> dict[str, dict[str, MultimodalItemPartition]]:
+        return {
+            modality: _qwen_vision_input_partitions(processed, modality)
+            for modality in ("image", "video")
+            if isinstance(processed.get(modality), dict)
+            and processed[modality].get(f"{modality}_grid_thw") is not None
+        }
 
     def get_mm_item_metadata(
         self,
@@ -433,37 +429,25 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         multimodal_data: Dict[str, Any],
         mm_item_order: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[MultimodalItemMetadata]:
-        metadata = (
-            self._build_mm_item_metadata(prompt_token_ids, multimodal_data)
-            if multimodal_data.get("multimodal_embedding") is None else None)
-        if metadata is None:
+        grids = {}
+        for modality in ("image", "video"):
+            data = multimodal_data.get(modality)
+            key = f"{modality}_grid_thw"
+            if isinstance(data, dict) and data.get(key) is not None:
+                grids[modality] = data[key].tolist()
+        if grids and multimodal_data.get("multimodal_embedding") is None:
+            metadata = self._build_mm_item_metadata(prompt_token_ids, grids)
+        else:
             metadata = super().get_mm_item_metadata(prompt_token_ids,
                                                     multimodal_data,
                                                     mm_item_order)
-        if metadata is not None:
-            item_grids = {}
-            for modality in ("image", "video"):
-                modality_data = multimodal_data.get(modality)
-                grid_key = "image_grid_thw" if modality == "image" else "video_grid_thw"
-                if isinstance(modality_data,
-                              dict) and modality_data.get(grid_key) is not None:
-                    metadata.input_partitions[
-                        modality] = _qwen_vision_input_partitions(
-                            multimodal_data, modality, metadata)
-                    item_grids[modality] = [{
-                        grid_key: grid
-                    } for grid in modality_data[grid_key].tolist()]
-            if item_grids:
-                # Each item's grid, in prompt order. The standalone encoder
-                # returns it with the item's embedding: a prefill worker that
-                # gets the embedding without this encoder's mRoPE positions
-                # (for example from an embedding cache) needs the grid to
-                # build them. It is read here, on the host, because that
-                # encoder moves the grids to the GPU before its forward.
-                multimodal_data["multimodal_embedding_metadata"] = [
-                    item_grids[modality][index]
-                    for modality, index in metadata.item_refs
-                ]
+        if metadata is not None and grids:
+            # A prefill worker receiving only embeddings needs the original
+            # per-item grids in prompt order to reconstruct mRoPE.
+            multimodal_data["multimodal_embedding_metadata"] = [{
+                f"{modality}_grid_thw":
+                grids[modality][index]
+            } for modality, index in metadata.item_refs]
         return metadata
 
     # ------------------------------------------------------------------
@@ -848,7 +832,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         return best_windows, best_area
 
     def _validate_encoder_attention_geometry(
-            self, grids_by_modality: Dict[str, torch.Tensor]) -> None:
+            self, grids_by_modality: dict[str, list[list[int]]]) -> None:
         """Validate runtime grids against startup metadata-sizing bounds."""
         cfg = self.config.vision_config
         merge_size = cfg.spatial_merge_size
@@ -952,19 +936,16 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             item_refs.extend((modality, i) for i in range(num_items))
             encoder_token_lengths.extend([item_tokens] * num_items)
         if item_refs:
-            metadata = MultimodalItemMetadata(
-                item_refs,
-                encoder_token_lengths,
-                [
-                    tokens // self.spatial_merge_unit
-                    for tokens in encoder_token_lengths
-                ],
-            )
-            for modality in mm_data:
-                metadata.input_partitions[
-                    modality] = _qwen_vision_input_partitions(
-                        mm_data, modality, metadata)
-            mm_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = metadata
+            mm_data[
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(
+                    item_refs,
+                    encoder_token_lengths,
+                    [
+                        tokens // self.spatial_merge_unit
+                        for tokens in encoder_token_lengths
+                    ],
+                    input_partitions=self.get_mm_input_partitions(mm_data),
+                )
         return mm_data
 
     def _dummy_mm_data_for_size(
@@ -2312,7 +2293,14 @@ def _qwen_vision_item_partitions(
         return None
     metadata = param.item_metadata
     if metadata is not None and modality in metadata.input_partitions:
-        return metadata.input_partitions[modality]
+        partitions = metadata.input_partitions[modality]
+        if "vision_normalization" in param.multimodal_data[
+                modality] and "vision_normalization" not in partitions:
+            return {
+                **partitions, "vision_normalization":
+                MultimodalItemPartition(item_axis=None)
+            }
+        return partitions
     return _qwen_vision_input_partitions(param.multimodal_data, modality,
                                          metadata)
 
@@ -2320,7 +2308,7 @@ def _qwen_vision_item_partitions(
 def _qwen_vision_input_partitions(
     multimodal_data: dict[str, Any],
     modality: str,
-    metadata: MultimodalItemMetadata | None,
+    metadata: MultimodalItemMetadata | None = None,
 ) -> dict[str, MultimodalItemPartition]:
     """Declare patch packing once on the producer, with a legacy fallback."""
     pixel_key, grid_key = (("pixel_values",
@@ -2341,6 +2329,7 @@ def _qwen_vision_input_partitions(
         pixel_key: MultimodalItemPartition(item_lengths=patch_counts),
         grid_key: _QWEN_VISION_BATCHED_FIELD,
         "second_per_grid_ts": _QWEN_VISION_BATCHED_FIELD,
+        "vision_normalization": MultimodalItemPartition(item_axis=None),
     }
 
 
@@ -2348,8 +2337,6 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
     supported_encoder_attention_backends = {
         "vision": frozenset({"VANILLA", "TRTLLM", "FLASHINFER"})
     }
-
-    supports_mm_encoder_item_scheduling = True
 
     def get_multimodal_item_partitions(
         self,

@@ -89,18 +89,24 @@ and output fusion.
 
 ## Processor Hooks
 
-Processors implement
-`get_mm_item_metadata(prompt_token_ids, multimodal_data, mm_item_order=None)` and
-return `MultimodalItemMetadata`. Generic preparation supplies prompt order and
-known output rows; model processors add encoder costs and input partitions.
-Partial model records retain known prompt rows. Conflicting order or rows fail
-at input preparation. Gemma4 and Nemotron add partitions; Qwen and Mistral also
-provide physical encoder costs.
+Generic preparation supplies the prompt order and output embedding lengths.
+A processor can refine these facts with
+`get_mm_item_metadata(prompt_token_ids, multimodal_data, mm_item_order=None)`.
+Preparation rejects conflicts with the known prompt layout.
 
-Unknown costs or row counts remain `None`. Common metadata does not enable item
-scheduling: models can supply order and output rows with
-`encoder_token_lengths=None` and keep full-request encoding. Model capability
-and configuration decide whether items are scheduled separately.
+A processor for independently encodable items implements
+`get_mm_input_partitions(processed)`. Its argument is the processed
+`multimodal_data` dictionary. Return a mapping from each raw modality to a
+`MultimodalItemPartition` for **every** field in that modality. The base
+implementation returns `None` and keeps whole-request encoding. An override
+can also return `None` for a request that requires inline encoding.
+
+The default encoder cost is the packed length of each item, or one for a
+batched layout. If packed fields use different lengths or the physical work
+uses different units, supply `encoder_token_lengths` in the common item
+metadata. Gemma4 charges padded patch slots for video frames, Pixtral charges
+patches inside each image's true size, and DeepSeek-V4.1 charges the patches
+in each item of its image list.
 
 Custom processors must use this common hook and type. The former
 `get_mm_encoder_item_metadata` hook, `MultimodalEncoderItemMetadata` tuple, and
@@ -156,28 +162,31 @@ If output row counts are unknown too, the model must resolve them before using
 grouped assembly or item caching. A model-specific full-request encoder can
 compute those counts from its result. Metadata alone never enables scheduling.
 
-To opt in, the model sets `supports_mm_encoder_item_scheduling = True` and
-implements `encode_multimodal_inputs` and item selection. The engine also
-checks `disable_mm_encoder`, the scheduling policy, and supported combinations
-in `mm_item_scheduling_enabled()` and
-`validate_mm_encoder_scheduling_compatibility()`. Under item scheduling, missing
-costs or output rows fail admission; they do not silently switch one request to
-full-request encoding. Keep the capability disabled until the model can supply
-the complete scheduling contract.
+For a `MultimodalModelMixin` model, implementing the processor partition
+hook enables item scheduling under a compatible policy. The engine uses the
+existing atomic-item and output capacity hooks to size the encoder and its
+cache before requests arrive. `encoder_scheduling_policy=DISABLED` keeps
+whole-request encoding.
 
 ### Selecting Unusual Payloads
 
-Declare `input_partitions` for ordinary batched, packed, and shared fields.
-For example, two audio items with two and one clips use:
+For example, a processor whose audio features and masks are packed by clip
+can declare two clips for the first item and one for the second. The
+normalization coefficients are shared even if their first dimension happens
+to match the number of items.
 
 ```python
-input_partitions = {
-    "audio": {
-        "input_audio_features": MultimodalItemPartition(item_lengths=(2, 1)),
-        "feature_attention_mask": MultimodalItemPartition(item_lengths=(2, 1)),
+def get_mm_input_partitions(self, processed):
+    audio = processed.get("audio")
+    if audio is None:
+        return None
+    clips = MultimodalItemPartition(item_lengths=tuple(audio["audio_num_clips"]))
+    return {"audio": {
+        "input_audio_features": clips,
+        "feature_attention_mask": clips,
         "audio_num_clips": MultimodalItemPartition(),
-    },
-}
+        "normalization": MultimodalItemPartition(item_axis=None),
+    }}
 ```
 
 If a payload has multiple item axes, nested variable-length structures, or
@@ -188,12 +197,6 @@ references intact. The mixin then slices the common item metadata and hashes
 using prompt-global indices. Payload indices and prompt indices can differ:
 for `[('video', 0), ('image', 0)]`, the image has local index `0` and prompt
 index `1`.
-
-Returning `None` from `get_multimodal_item_partitions` uses the existing
-packed/stacked compatibility selector. New models should declare partitions or
-override selection explicitly; the compatibility selector cannot describe an
-arbitrary model layout. An empty partition dict means every field is shared,
-so it is appropriate only when selecting an item requires no payload changes.
 
 ### Item Boundaries and Model Hooks
 

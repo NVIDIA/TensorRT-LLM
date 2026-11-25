@@ -1621,7 +1621,6 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
         "vision": frozenset({"VANILLA", "TRTLLM", "FLASHINFER"})
     }
 
-    supports_mm_encoder_item_scheduling = True
     supports_vision_gpu_normalize = True
 
     def get_multimodal_item_partitions(

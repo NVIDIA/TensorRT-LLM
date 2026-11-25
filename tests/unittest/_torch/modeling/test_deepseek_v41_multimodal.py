@@ -27,6 +27,7 @@ from tensorrt_llm._torch.models.modeling_deepseekv41_multimodal import (
 )
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import PreparedLlmInputs
 from tensorrt_llm.inputs import create_input_processor_with_hash
+from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.inputs.shared_prompt_store import SharedPromptStore
 
 pytestmark = pytest.mark.cpu_only
@@ -138,7 +139,8 @@ def _wrapper() -> DeepseekV41ForConditionalGeneration:
     return wrapper
 
 
-def test_processor_preserves_interleaved_text_and_image_payload() -> None:
+@pytest.fixture
+def processor() -> DeepseekV41InputProcessor:
     config = PretrainedConfig(
         text_config={"vocab_size": 129280},
         vision_config={
@@ -151,12 +153,13 @@ def test_processor_preserves_interleaved_text_and_image_payload() -> None:
     )
     tokenizer = Mock(unk_token_id=None, all_special_tokens=[], all_special_ids=[])
     tokenizer.convert_tokens_to_ids.return_value = _IMAGE_ID
-    processor = create_input_processor_with_hash(
-        DeepseekV41InputProcessor("unused", config, tokenizer)
-    )
+    return DeepseekV41InputProcessor("unused", config, tokenizer)
+
+
+def test_processor_preserves_interleaved_text_and_image_payload(processor) -> None:
     pixels = np.arange(6 * 6 * 3, dtype=np.uint8).reshape(6, 6, 3)
     token_ids = [7, _IMAGE_ID, 8, _IMAGE_ID, 9]
-    actual, extra = processor(
+    actual, extra = create_input_processor_with_hash(processor)(
         {
             "prompt_token_ids": token_ids,
             "multi_modal_data": {"image": [Image.fromarray(pixels), Image.new("RGB", (14, 8))]},
@@ -178,8 +181,40 @@ def test_processor_preserves_interleaved_text_and_image_payload() -> None:
     expected = expected.reshape(3, 3, 2, 3, 2).permute(1, 3, 0, 2, 4).reshape(9, 3, 2, 2)
     torch.testing.assert_close(image["pixel_values"][0], expected, rtol=0, atol=0)
     assert extra["multimodal_input"] is not None
-    tokenizer.encode.assert_not_called()
-    tokenizer.decode.assert_not_called()
+    processor.tokenizer.encode.assert_not_called()
+    processor.tokenizer.decode.assert_not_called()
+
+
+@torch.inference_mode()
+def test_image_encoder_item_selection(processor, vision_config: DeepseekV41VisionConfig) -> None:
+    _, extra = create_input_processor_with_hash(processor)(
+        {
+            "prompt_token_ids": [_IMAGE_ID, 5, _IMAGE_ID],
+            "multi_modal_data": {
+                "image": [Image.new("RGB", (2, 2)), Image.new("RGB", (14, 8), "red")]
+            },
+        },
+        None,
+    )
+    param = MultimodalParams(multimodal_data=extra["multimodal_data"])
+    metadata = param.item_metadata
+    assert metadata.encoder_token_lengths == (1, 28)
+    assert metadata.output_embedding_lengths == (4, 10)
+    assert processor.get_max_mm_encoder_output_embeddings(2) == 8
+    model = _wrapper()
+    model.vision = DeepseekV41VisionModel(vision_config).eval()
+    model.aligner = DeepseekV41Aligner(vision_config, model.embedding_dim).eval()
+    for name in ("image_start", "image_end", "image_newline"):
+        setattr(model, name, nn.Parameter(torch.randn(model.embedding_dim)))
+    expected = model.encode_multimodal_inputs([param]).split(metadata.output_embedding_lengths)
+    for order in ([0], [1], [1, 0]):
+        selected = model.prepare_multimodal_encoder_inputs([(param, i) for i in order])
+        image = selected[0][0].multimodal_data["image"]
+        for key, values in param.multimodal_data["image"].items():
+            for value, i in zip(image[key], order, strict=True):
+                torch.testing.assert_close(value, values[i], rtol=0, atol=0)
+        for output, i in zip(model.forward_multimodal_encoder_items(selected), order, strict=True):
+            assert torch.equal(output.view(torch.uint8), expected[i].view(torch.uint8))
 
 
 def test_complete_vision_and_aligner_match_reference(

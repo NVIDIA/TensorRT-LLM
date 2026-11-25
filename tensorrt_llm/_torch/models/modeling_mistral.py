@@ -53,6 +53,7 @@ from tensorrt_llm.inputs import (BaseMultimodalDummyInputsBuilder,
                                  register_input_processor)
 from tensorrt_llm.inputs.media_io import convert_image_mode
 from tensorrt_llm.inputs.multimodal import (MultimodalItemMetadata,
+                                            MultimodalItemPartition,
                                             MultimodalParams)
 from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
 from tensorrt_llm.llmapi import SamplingParams
@@ -426,15 +427,17 @@ class MistralCommonImageProcessor:
         return processed
 
 
+_PIXTRAL_IMAGE_PARTITIONS = {
+    "pixel_values": MultimodalItemPartition(),
+    "image_sizes": MultimodalItemPartition(),
+}
+
+
 class MistralPixtralEncoderContract:
     """MM encoder item-scheduling contract for Pixtral-based Mistral VLMs.
 
-    `Mistral3VLM` declares `supports_mm_encoder_item_scheduling` on the *model*
-    class, but the engine requires the contract from the input processor, which
-    `create_input_processor` picks from `checkpoint_format` alone. Both Mistral
-    frontends drive the same `PixtralVisionModel` + `Mistral3MultiModalProjector`,
-    so this geometry belongs to the checkpoint rather than to the preprocessing
-    frontend; sharing it keeps the capability and the requirement together.
+    Both frontends drive the same Pixtral vision encoder and projector, with
+    one pixel tensor and one original size per image.
 
     Mixed into processors supplying `config`/`processor`/`dtype`. The
     mistral-native frontend serves every native checkpoint, including ones with
@@ -558,6 +561,13 @@ class MistralPixtralEncoderContract:
             item_refs=item_refs,
             encoder_token_lengths=encoder_token_lengths,
             output_embedding_lengths=output_embedding_lengths)
+
+    def get_mm_input_partitions(
+        self, processed: dict[str, Any]
+    ) -> dict[str, dict[str, MultimodalItemPartition]] | None:
+        if not self._has_vision_encoder() or "image" not in processed:
+            return None
+        return {"image": _PIXTRAL_IMAGE_PARTITIONS.copy()}
 
     def get_mm_item_metadata(
         self,
@@ -987,7 +997,6 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
     }
 
     supports_encoder_cache = True
-    supports_mm_encoder_item_scheduling = True
 
     def __init__(
         self,
@@ -1214,6 +1223,32 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
                     setattr(pretrained_config, attr, default)
 
         return sub_model_config
+
+    def get_multimodal_item_partitions(
+            self, param: MultimodalParams,
+            modality: str) -> dict[str, MultimodalItemPartition] | None:
+        partitions = super().get_multimodal_item_partitions(param, modality)
+        # Older prepared Pixtral requests only carried the original image sizes.
+        if partitions is None and modality == "image":
+            return _PIXTRAL_IMAGE_PARTITIONS
+        return partitions
+
+    def build_multimodal_encoder_input(
+        self,
+        param: MultimodalParams,
+        local_item_indices: Sequence[int],
+        modality: Optional[str] = None,
+    ) -> MultimodalParams:
+        residual = super().build_multimodal_encoder_input(
+            param, local_item_indices, modality)
+        image = residual.multimodal_data["image"]
+        sizes = image["image_sizes"]
+        if len(sizes):
+            # Drop request-wide padding before the selected images are batched again.
+            height = max(int(h) for h, _ in sizes)
+            width = max(int(w) for _, w in sizes)
+            image["pixel_values"] = image["pixel_values"][..., :height, :width]
+        return residual
 
     # NOTE: this is defined as a separate method with this specific signature in order to be compatible
     # with `get_multimodal_embeddings` callers.

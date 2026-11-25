@@ -105,15 +105,14 @@ def is_multimodal(model: nn.Module, input_processor: InputProcessor) -> bool:
     return isinstance(input_processor, BaseMultimodalInputProcessor)
 
 
-def mm_item_scheduling_enabled(llm_args: TorchLlmArgs, model: nn.Module) -> bool:
+def mm_item_scheduling_enabled(
+    llm_args: TorchLlmArgs, model: nn.Module, input_processor: BaseMultimodalDummyInputsBuilder
+) -> bool:
     """Whether the item-scheduling wiring is engaged this run.
 
-    Item scheduling is declared once, as a model capability (the ``MultimodalModelMixin``
-    ClassVar). This is the actionable flag derived from it: the engine stores it because
-    the executor and the scheduler wrap both read it back off the engine, and the setup
-    below, the scheduler wrap and the executor encoder step must all agree. Both
-    ``disable_mm_encoder`` and a ``DISABLED`` policy keep the capability but run only the
-    base LLM scheduler.
+    A processor declares independent encoder items by implementing its field
+    partition hook. Check the implementation at startup, before any request
+    is available, so the encoder and cache can reserve their budgets.
 
     Item scheduling does not yet support pipeline parallelism. Under PP, ``DEFAULT`` falls
     back to inline encode with a warning; ``EAGER`` stays engaged so that
@@ -129,7 +128,9 @@ def mm_item_scheduling_enabled(llm_args: TorchLlmArgs, model: nn.Module) -> bool
     enabled = (
         not llm_args.disable_mm_encoder
         and isinstance(model, MultimodalModelMixin)
-        and model.supports_mm_encoder_item_scheduling
+        and isinstance(input_processor, BaseMultimodalInputProcessor)
+        and type(input_processor).get_mm_input_partitions
+        is not BaseMultimodalInputProcessor.get_mm_input_partitions
         and policy != MultimodalEncoderSchedulingPolicy.DISABLED
     )
     if (
@@ -368,7 +369,7 @@ class MultimodalItemScheduler:
         ``llm_args.multimodal_config`` before its own early return, so a run with no
         multimodal config raises here exactly as it did inline.
         """
-        enabled = mm_item_scheduling_enabled(llm_args, model)
+        enabled = mm_item_scheduling_enabled(llm_args, model, input_processor)
         validate_mm_encoder_scheduling_compatibility(llm_args, enabled)
         if not enabled:
             return None

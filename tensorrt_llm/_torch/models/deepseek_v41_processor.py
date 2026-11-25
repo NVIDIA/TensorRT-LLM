@@ -29,8 +29,11 @@ from tensorrt_llm.inputs import (
     BaseMultimodalDummyInputsBuilder,
     BaseMultimodalInputProcessor,
     ExtraProcessedInputs,
+    MultimodalItemMetadata,
+    MultimodalItemPartition,
     TextPrompt,
 )
+from tensorrt_llm.inputs.multimodal import MULTIMODAL_ENCODER_ITEM_METADATA_KEY
 from tensorrt_llm.inputs.shared_prompt_store import SharedPromptStore
 from tensorrt_llm.sampling_params import SamplingParams
 from tensorrt_llm.tokenizer import TransformersTokenizer
@@ -316,6 +319,26 @@ class DeepseekV41InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDumm
         height, width = self._dummy_grid(max_num_encoder_tokens)
         return {"image": height * width}
 
+    def get_mm_input_partitions(
+        self, processed: dict[str, Any]
+    ) -> dict[str, dict[str, MultimodalItemPartition]] | None:
+        if "image" not in processed:
+            return None
+        fields = (
+            "pixel_values",
+            "image_grid_hw",
+            "llm_grid_hw",
+            "token_types",
+            "num_tokens",
+            "positions",
+        )
+        return {"image": dict.fromkeys(fields, MultimodalItemPartition())}
+
+    def get_max_mm_encoder_output_embeddings(self, max_num_encoder_tokens: int) -> int:
+        # A one-patch image has one feature, one newline and two delimiters.
+        # Larger grids produce at most that many embeddings per input patch.
+        return max_num_encoder_tokens * _num_image_tokens(1, 1)
+
     def get_dummy_mm_data(
         self,
         *,
@@ -501,6 +524,11 @@ class DeepseekV41InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDumm
                     "token_types": token_types,
                     "num_tokens": num_tokens,
                     "positions": updates["image"]["positions"],
-                }
+                },
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                    item_refs=[("image", i) for i in range(len(images))],
+                    encoder_token_lengths=[patches.shape[0] for patches in pixels],
+                    output_embedding_lengths=num_tokens,
+                ),
             }
         }

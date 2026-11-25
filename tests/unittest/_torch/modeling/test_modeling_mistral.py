@@ -766,6 +766,26 @@ def test_mistral_item_metadata_separates_patch_and_embedding_units():
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("prepared_partitions", [False, True])
+def test_pixtral_selected_images_drop_request_padding(prepared_partitions):
+    from tensorrt_llm.inputs.multimodal import MULTIMODAL_ENCODER_ITEM_METADATA_KEY
+    from tensorrt_llm.inputs.registry import _apply_mm_input_partitions
+
+    proc = _make_dummy_processor()
+    pixels = torch.arange(2 * 3 * 56 * 84).view(2, 3, 56, 84)
+    data = {"image": {"pixel_values": pixels, "image_sizes": [[28, 56], [56, 84]]}}
+    metadata = proc.get_mm_item_metadata([], data)
+    if prepared_partitions:
+        metadata = _apply_mm_input_partitions(metadata, data, proc.get_mm_input_partitions(data))
+    data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = metadata
+    model = object.__new__(modeling_mistral.Mistral3VLM)
+    selected = model.build_multimodal_encoder_input(MultimodalParams(multimodal_data=data), [0])
+    image = selected.multimodal_data["image"]
+    assert image["image_sizes"] == [[28, 56]]
+    assert torch.equal(image["pixel_values"], pixels[:1, :, :28, :56])
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "sizes, encoder_lengths, embedding_lengths",
     [
@@ -911,13 +931,6 @@ def test_dummy_mm_data_satisfies_the_encoder_input_contract():
     assert batched_pixel_values.dtype == torch.float16
 
 
-# ---------------------------------------------------------------------------
-# MM encoder item scheduling is enabled from the *model* class
-# (`Mistral3VLM.supports_mm_encoder_item_scheduling`), but the contract it
-# implies is required of the *input processor*, and `create_input_processor`
-# picks the processor from `checkpoint_format` alone. Both Mistral frontends
-# therefore have to satisfy the contract.
-# ---------------------------------------------------------------------------
 @pytest.mark.parametrize(
     "processor_cls, geometry_from_processor",
     [(MistralHFInputProcessor, False), (MistralNativeInputProcessor, True)],
@@ -956,6 +969,7 @@ def test_both_mistral_processors_satisfy_item_scheduling_contract(
     assert dummy["image"]["pixel_values"].shape == (1, 3, 56, 56)
     assert dummy["image"]["pixel_values"].dtype == proc.dtype
     assert dummy["image"]["image_sizes"] == [[56, 56]]
+    assert set(proc.get_mm_input_partitions(dummy)["image"]) == set(dummy["image"])
     dummy_metadata = proc.get_mm_item_metadata([], dummy)
     assert dummy_metadata is not None
     dummy_metadata.validate()
@@ -973,6 +987,7 @@ def test_both_mistral_processors_satisfy_item_scheduling_contract(
 def test_text_only_native_checkpoint_reports_no_encoder_geometry() -> None:
     proc = _make_text_only_native_processor()
 
+    assert proc.get_mm_input_partitions({"image": {}}) is None
     assert proc.get_mm_max_tokens_per_item() == {}
     assert proc.get_max_mm_encoder_output_embeddings(8192) is None
     assert proc.get_mm_encoder_attention_metadata_capacity(8192) is None

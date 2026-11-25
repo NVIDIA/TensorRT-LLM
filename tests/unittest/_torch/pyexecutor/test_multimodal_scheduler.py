@@ -11,6 +11,7 @@ from _torch.pyexecutor.multimodal_utils import (
     bare_mm_item_scheduler,
     make_llm_request,
     make_mm_request,
+    make_packed_image_data,
     record_output,
 )
 
@@ -113,8 +114,8 @@ def test_generic_metadata_does_not_enable_item_scheduling():
     )
     assert request.py_mm_encoder_state is None
     assert get_multimodal_encoder_token_lengths(request) is None
-    with pytest.raises(ValueError, match="when item-level encoder scheduling is enabled"):
-        initialize_multimodal_encoder_request(request, 32)
+    initialize_multimodal_encoder_request(request, 32)
+    assert request.py_mm_encoder_state is None
     request.py_multimodal_data["multimodal_embedding"] = torch.zeros(1, 2)
     initialize_multimodal_encoder_request(request, 32)
     assert request.py_multimodal_params.encoder_state is None
@@ -345,6 +346,30 @@ def test_item_scheduling_rejects_raw_payload_without_item_metadata():
 
     with pytest.raises(ValueError, match="requires multimodal_encoder_item_metadata"):
         initialize_multimodal_encoder_request(request, max_num_tokens=8)
+
+
+@pytest.mark.parametrize("has_prompt_layout", [False, True])
+def test_inline_layout_runs_alongside_scheduled_items(has_prompt_layout):
+    data = {
+        "image": {"pixels": [1]},
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+            [("image", 0)], output_embedding_lengths=[1]
+        ),
+    }
+    if not has_prompt_layout:
+        data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = None
+    inline = make_llm_request(1, multimodal_data=data)
+    initialize_multimodal_encoder_request(inline, max_num_tokens=8)
+    scheduled = make_mm_request(2, [4])
+    output = _scheduler(max_batch_size=2, max_num_tokens=8).schedule_request(
+        [inline, scheduled], set()
+    )
+    assert output.scheduled_mm_encoder_items == {2: [0]}
+    assert output.context_requests == [inline, scheduled]
+    assert (
+        bare_mm_item_scheduler(MultimodalModelMixin()).build_multimodal_data_for_llm(inline)
+        is inline.py_multimodal_data
+    )
 
 
 def test_multimodal_scheduler_keeps_items_atomic_and_backfills_requests():
@@ -1026,19 +1051,7 @@ def test_item_encoder_slices_and_restores_selected_item_order():
                 [param.multimodal_data["image"]["pixel_values"] for param in multimodal_params]
             )
 
-    multimodal_param = MultimodalParams(
-        multimodal_data={
-            "image": {
-                "pixel_values": torch.arange(5).unsqueeze(1),
-                "image_grid_thw": torch.tensor([[1, 1, 2], [1, 1, 3]]),
-            },
-            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
-                item_refs=[("image", 0), ("image", 1)],
-                encoder_token_lengths=[2, 3],
-                output_embedding_lengths=[2, 3],
-            ),
-        }
-    )
+    multimodal_param = MultimodalParams(multimodal_data=make_packed_image_data())
 
     model = _Model()
     encoder_inputs = model.prepare_multimodal_encoder_inputs(
@@ -1053,19 +1066,7 @@ def test_item_encoder_slices_and_restores_selected_item_order():
 
 
 def test_prepare_multimodal_encoder_inputs_slices_before_device_transfer():
-    multimodal_param = MultimodalParams(
-        multimodal_data={
-            "image": {
-                "pixel_values": torch.arange(5).unsqueeze(1),
-                "image_grid_thw": torch.tensor([[1, 1, 2], [1, 1, 3]]),
-            },
-            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
-                item_refs=[("image", 0), ("image", 1)],
-                encoder_token_lengths=[2, 3],
-                output_embedding_lengths=[2, 3],
-            ),
-        }
-    )
+    multimodal_param = MultimodalParams(multimodal_data=make_packed_image_data())
 
     encoder_inputs = MultimodalModelMixin.prepare_multimodal_encoder_inputs(
         MultimodalModelMixin(), [(multimodal_param, 1)]

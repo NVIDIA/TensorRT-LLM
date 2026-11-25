@@ -15,6 +15,7 @@ from _torch.pyexecutor.multimodal_utils import (
     bare_mm_item_scheduler,
     make_llm_request,
     make_mm_request,
+    make_packed_image_data,
 )
 
 import tensorrt_llm
@@ -537,11 +538,15 @@ def test_pipeline_parallel_compatibility_is_checked_only_for_item_scheduled_mode
     with pytest.raises(ValueError, match="pipeline parallelism"):
         validate_mm_encoder_scheduling_compatibility(args, item_scheduling_enabled=True)
 
-    class _Model(MultimodalModelMixin):
-        supports_mm_encoder_item_scheduling = True
+    from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLInputProcessorBase
+
+    processor = object.__new__(Qwen3VLInputProcessorBase)
 
     create_kwargs = dict(
-        llm_args=args, model=_Model(), input_processor=None, encoder_max_num_tokens=None
+        llm_args=args,
+        model=MultimodalModelMixin(),
+        input_processor=processor,
+        encoder_max_num_tokens=None,
     )
     if falls_back:
         # DEFAULT runs inline encode even when set (model defaults mark every field
@@ -827,15 +832,7 @@ def test_item_outputs_commit_to_prompt_ordered_cache_keys(
     request = make_llm_request(
         1,
         multimodal_data={
-            "image": {
-                "pixel_values": torch.arange(5).unsqueeze(1),
-                "image_grid_thw": torch.tensor([[1, 1, 2], [1, 1, 3]]),
-            },
-            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
-                item_refs=[("image", 0), ("image", 1)],
-                encoder_token_lengths=[2, 3],
-                output_embedding_lengths=[2, 3],
-            ),
+            **make_packed_image_data(),
             "multimodal_embed_mask_cumsum": embed_mask_cumsum,
         },
         input_tokens=list(range(8)),

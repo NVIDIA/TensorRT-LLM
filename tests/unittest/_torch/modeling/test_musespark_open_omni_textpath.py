@@ -1387,19 +1387,17 @@ def test_spec_metadata_and_lora_params_reach_the_decoder():
 
 
 def test_the_mixins_opt_in_features_stay_off():
-    """Encoder cache and item scheduling are separate decisions, not free riders.
-
-    Both are ClassVars defaulting to False, and both bring contracts this model
-    does not implement (`build_multimodal_encoder_input`, an item-metadata
-    provider). Turning either on by accident would engage a code path with no
-    gate behind it.
-    """
     from tensorrt_llm._torch.models.modeling_musespark_open_omni import (  # noqa: PLC0415
         MuseSparkForConditionalGeneration as Omni,
     )
+    from tensorrt_llm._torch.models.modeling_musespark_open_omni import MuseSparkInputProcessor
+    from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 
     assert Omni.supports_encoder_cache is False
-    assert Omni.supports_mm_encoder_item_scheduling is False
+    assert (
+        MuseSparkInputProcessor.get_mm_input_partitions
+        is BaseMultimodalInputProcessor.get_mm_input_partitions
+    )
 
 
 # -- encoder row order ------------------------------------------------------
