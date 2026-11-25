@@ -10,6 +10,7 @@ tests make it load them in the test process.
 
 import os
 import pickle
+import subprocess  # nosec B404 - starts sleep, a fixed argv, no shell
 import time
 from typing import NamedTuple, Tuple
 
@@ -88,6 +89,21 @@ def fail() -> None:
 def stall(seconds: float) -> None:
     """A build that stops replying for ``seconds``, as one stuck in I/O does."""
     time.sleep(seconds)
+
+
+def start_and_stall(path: str, seconds: float) -> None:
+    """A build that starts a process, as one that runs a compiler does, writes its pid to
+    ``path``, and stops replying for ``seconds``."""
+    child = subprocess.Popen(["sleep", str(seconds)])  # nosec B603 B607 - a fixed argv
+    with open(path, "w") as f:
+        f.write(str(child.pid))
+    time.sleep(seconds)
+
+
+def found(path: str) -> bool:
+    """A build that finds what it builds made already: it records ``path`` and returns False."""
+    open(path, "w").close()
+    return False
 
 
 def hold(started: str, release: str, timeout: float = 120.0) -> None:

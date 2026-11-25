@@ -439,6 +439,78 @@ def test_a_stopped_worker_marks_its_claim_failed_and_leaves_others_alone(
     assert not os.path.exists(theirs.failed)
 
 
+def _claim_paths(tmp_path: Path, who: str) -> Claim:
+    return Claim(*(str(tmp_path / f"{who}.{end}") for end in ("claim", "done", "failed")))
+
+
+def _running(pid: int) -> bool:
+    """Whether process ``pid`` runs: neither gone nor a zombie no one has reaped yet."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except FileNotFoundError:
+        return False
+
+
+def test_a_stopped_worker_goes_with_the_processes_its_build_started(
+    pool: BuildPool, tmp_path: Path
+) -> None:
+    """A worker stopped in a build ends with the processes the build started, a compiler's as
+    here, which share its process group: none of them is left to write into a cache that a
+    retry of the build, on this rank or another, uses."""
+    child = tmp_path / "child"
+    with pool.pass_scope():
+        [first] = pool.build([_record(tmp_path / "a", 1)])
+        pool._pool._reply_timeout = 2.0
+        [stuck] = pool.build([Build(f"{targets.__name__}:start_and_stall", (str(child), 600.0))])
+    assert first.status == "built" and stuck.status == "failed"
+    pid = int(child.read_text())
+    deadline = time.monotonic() + 30.0
+    while _running(pid):
+        assert time.monotonic() < deadline, f"the build's process {pid} outlived its worker"
+        time.sleep(0.05)
+
+
+def test_a_worker_whose_serving_thread_does_not_start_is_not_counted(
+    pool: BuildPool, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A worker whose serving thread does not start ends at once and is not counted: the pass
+    starts no other, its builds are left to the caller, and its pipes are closed."""
+    start = threading.Thread.start
+
+    def no_serving_thread(thread: threading.Thread) -> None:
+        if thread.name.startswith("tllm-build-pool-"):
+            raise RuntimeError("can't start new thread")
+        start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", no_serving_thread)
+    before = len(os.listdir("/proc/self/fd"))
+    with pool.pass_scope():
+        results = pool.build([_record(tmp_path / "a", 1)]) + pool.build(
+            [_record(tmp_path / "b", 2)]
+        )
+    assert [result.status for result in results] == ["refused", "refused"]
+    assert pool._workers_started == 0
+    assert len(os.listdir("/proc/self/fd")) == before
+
+
+def test_a_build_that_finds_its_kernel_made_ends_present(pool: BuildPool, tmp_path: Path) -> None:
+    """A build function that returns False found what it builds made already (a compiler's
+    cache hit): the build ends present, not built, so that the counts tell the two apart; one
+    that returns nothing built. Either way its claim is done."""
+    claim = _claim_paths(tmp_path, "found")
+    with pool.pass_scope():
+        results = pool.build(
+            [
+                Build(f"{targets.__name__}:found", (str(tmp_path / "found"),), None, claim),
+                _record(tmp_path / "a", 1),
+            ]
+        )
+    assert [result.status for result in results] == ["present", "built"]
+    assert (tmp_path / "found").exists() and os.path.exists(claim.done)
+    assert pool.counts() == {"present": 1, "built": 1}
+
+
 def test_the_kernels_of_an_edited_compile_function_file_get_other_names(tmp_path: Path) -> None:
     """A process_built function's kernels are also named by its file's contents: a kernel
     compiled from another version of the file, which an editable install does not tell by its

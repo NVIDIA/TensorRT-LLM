@@ -42,6 +42,7 @@ import os
 import pickle  # nosec B403 - messages between this process and its own workers
 import queue
 import shutil
+import signal
 import struct
 import subprocess  # nosec B404 - starts its workers: sys.executable, a fixed argv, no shell
 import sys
@@ -126,9 +127,10 @@ class Claim(NamedTuple):
 
 class Build(NamedTuple):
     """One build for a worker process: ``function`` (``"module:qualname"`` of a module-level
-    function), called with ``args``, which must pickle. ``family`` names the kind of build: the
-    pool admits it by the most GPU memory a build of its kind allocated so far. With a ``claim``,
-    the ranks split the build: the worker that starts it first makes it."""
+    function), called with ``args``, which must pickle; a function that returns ``False`` found
+    what it builds made already, and the build ends ``"present"``. ``family`` names the kind of
+    build: the pool admits it by the most GPU memory a build of its kind allocated so far. With
+    a ``claim``, the ranks split the build: the worker that starts it first makes it."""
 
     function: str
     args: tuple = ()
@@ -722,7 +724,7 @@ class _Pool:
                 ):
                     try:
                         self._start_worker()
-                    except OSError as e:
+                    except (OSError, RuntimeError) as e:
                         # The next builds would fail the same way: they wait for the workers
                         # that run.
                         self._max = len(self._processes)
@@ -750,7 +752,7 @@ class _Pool:
             try:
                 process.wait(timeout=max(0.0, deadline - time.monotonic()))
             except subprocess.TimeoutExpired:
-                process.kill()
+                _kill_group(process)
                 process.wait()
 
     def _start_worker(self) -> None:
@@ -777,6 +779,9 @@ class _Pool:
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=stderr,
+                # The processes a build starts (Ninja, nvcc) join the worker's group, which is
+                # stopped as a whole (_kill_group).
+                start_new_session=True,
             )
         except OSError:
             for fd in fds:
@@ -792,12 +797,21 @@ class _Pool:
             name=f"tllm-build-pool-{index}",
             daemon=True,
         )
+        try:
+            thread.start()
+        except RuntimeError:
+            # No thread serves the worker: it is not counted, and it ends here.
+            for fd in (task_write, result_read):
+                os.close(fd)
+            stderr.close()
+            _kill_group(process)
+            process.wait()
+            raise
         self._processes.append(process)
         self._threads.append(thread)
         self._live += 1
         self._free += 1
         self._owner._worker_started()
-        thread.start()
 
     def _serve(
         self, process: subprocess.Popen, task_write: int, result_read: int, stderr: IO[bytes]
@@ -861,6 +875,7 @@ class _Pool:
                         if timed_out.is_set()
                         else f"the worker process ended ({e!r}): {_tail(stderr)}"
                     )
+                    _kill_group(process)
                     self._owner._settle(task, BuildResult(FAILED, 0.0, error))
                     _abandon_claim(task.claim, process, error)
                     self._release(task)
@@ -888,6 +903,7 @@ class _Pool:
             except Exception as e:  # noqa: BLE001 - a build left unsettled holds up its pass
                 # The worker ends with this thread: leaving closes its pipes.
                 error = f"serving the build raised {type(e).__name__}: {e}"
+                _kill_group(process)
                 self._owner._settle(task, BuildResult(FAILED, 0.0, error))
                 _abandon_claim(task.claim, process, error)
                 self._release(task)
@@ -999,7 +1015,17 @@ def _abandon_claim(claim: Optional[Claim], process: subprocess.Popen, reason: st
 def _stop_worker(process: subprocess.Popen, timed_out: threading.Event) -> None:
     """Kill a worker that did not reply in time; its pipes then fail the exchange."""
     timed_out.set()
-    process.kill()
+    _kill_group(process)
+
+
+def _kill_group(process: subprocess.Popen) -> None:
+    """Kill a worker and the processes its builds started, which share its process group, so
+    that none still writes into a cache a retry of the build uses. Called before the worker is
+    reaped: until then its group cannot be another one's."""
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass  # The group has no process left.
 
 
 def _tail(stream: IO[bytes]) -> str:
@@ -1119,7 +1145,7 @@ def _run(function: str, args: tuple, claim: Optional[Claim]) -> tuple:
             return (PRESENT if os.path.exists(claim.done) else CLAIMED, 0.0, "")
     t0 = time.perf_counter()
     try:
-        _resolve(function)(*args)
+        made = _resolve(function)(*args)
     except Exception as e:  # noqa: BLE001 - reported to the rank, which builds it itself
         if claim is not None:
             _jit_share._mark_failed(claim.failed, f"{type(e).__name__}: {e}")
@@ -1130,7 +1156,8 @@ def _run(function: str, args: tuple, claim: Optional[Claim]) -> tuple:
     peak = _release_gpu_memory()
     if claim is not None and not os.path.exists(claim.done):
         _touch(claim.done)
-    return (BUILT, seconds, "", peak)
+    # False: the function found its kernel built already.
+    return (PRESENT if made is False else BUILT, seconds, "", peak)
 
 
 def _release_gpu_memory() -> int:

@@ -124,9 +124,11 @@ class BuildConfig:
 class _OpStats:
     signatures: int = 0
     list_s: float = 0.0
-    # Builds made by this rank's workers, failed there, made by other ranks, left to the op.
+    # Builds made by this rank's workers, failed there, found made (by another rank, or before),
+    # claimed by other ranks, left to the op.
     built: int = 0
     failed: int = 0
+    present: int = 0
     elsewhere: int = 0
     inline: int = 0
     # Seconds the op's calls spent building, waits for other ranks included.
@@ -307,13 +309,15 @@ class KernelBuilder:
             stats = self._op_stats(op)
             stats.built += counts[BUILT]
             stats.failed += counts[FAILED]
-            stats.elsewhere += counts[PRESENT] + counts[CLAIMED]
+            stats.present += counts[PRESENT]
+            stats.elsewhere += counts[CLAIMED]
             stats.inline += counts[REFUSED]
             stats.build_s += seconds
         logger.info(
             f"[KernelBuilder] {op}: {counts[BUILT]} of {len(jobs)} kernels built in worker "
-            f"processes, {counts[PRESENT] + counts[CLAIMED]} by other ranks ({late} not in time), "
-            f"{counts[FAILED]} failed, {counts[REFUSED]} left to the op, in {seconds:.1f}s"
+            f"processes, {counts[PRESENT]} found built, {counts[CLAIMED]} claimed by other ranks "
+            f"({late} not in time), {counts[FAILED]} failed, {counts[REFUSED]} left to the op, "
+            f"in {seconds:.1f}s"
         )
 
     def build_kernels(self, kernels: Iterable[Tuple[Callable[..., Any], tuple]]) -> int:
@@ -350,7 +354,8 @@ class KernelBuilder:
                     stats = self._op_stats(op)
                     stats.built += count[BUILT]
                     stats.failed += count[FAILED]
-                    stats.elsewhere += count[PRESENT] + count[CLAIMED]
+                    stats.present += count[PRESENT]
+                    stats.elsewhere += count[CLAIMED]
                     stats.inline += count[REFUSED]
                     if count[BUILT] + count[FAILED] + count[CLAIMED]:
                         stats.build_s += seconds
@@ -411,6 +416,8 @@ class KernelBuilder:
                     f"{stats.built} kernels built in worker processes ({stats.failed} failed) "
                     f"in {stats.build_s:.1f}s"
                 )
+            if stats.present:
+                parts.append(f"{stats.present} found built")
             if stats.elsewhere:
                 parts.append(f"{stats.elsewhere} built by other ranks")
             if stats.inline:

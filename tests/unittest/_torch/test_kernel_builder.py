@@ -247,7 +247,8 @@ def test_ranks_split_shared_builds(builder, shared, tmp_path):
         # The other rank finds the build made, and makes nothing.
         other.build("op", [("k", *_record(tmp_path / "k2", 1, _shared_config()))])
     assert (tmp_path / "k").exists() and not (tmp_path / "k2").exists()
-    assert (builder.stats("op").built, other.stats("op").elsewhere) == (1, 1)
+    assert (builder.stats("op").built, other.stats("op").present) == (1, 1)
+    assert other.stats("op").elsewhere == 0
 
 
 def test_ranks_whose_kernels_land_apart_build_their_own(builder, shared, tmp_path):
