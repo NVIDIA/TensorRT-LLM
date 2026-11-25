@@ -74,10 +74,11 @@ projections and heads (`_ONE_RANK_SWITCHES`: `_DENSE_FP8_ENV`, `_GDN_INPROJ_NVFP
 for a captured generation-only step (`tep_fast`, `TEP_FAST_DECODE_ENV`, on by default): the
 decode hyper-connection sites' rows pairs (`hc_decode_pairs`), the CuTe split-K sparse GQA over
 its e4m3 KV head, and the MoE route front over its own rows. With `TEP_FINAR_ENV` (opt-in) such a
-MoE block's finalize and TP all-reduce are one Lamport launch (`ops/moe/tep_finalize_allreduce`).
-With `TEP_DRAFT_LAYER_ENV` (opt-in) a generation-only draft step runs the draft layer on the
-one-rank decode form at the rank's shard (`DecodeTarget._mtp_layer`), a draft-extend step's
-continuing rows included.
+MoE block's finalize and TP all-reduce are one Lamport launch (`ops/moe/tep_finalize_allreduce`);
+with `TEP_MOE_FRONT_ENV` (opt-in) its router GEMM runs in the front's launch
+(`ops/moe/moe_decode_front__decode`). With `TEP_DRAFT_LAYER_ENV` (opt-in) a generation-only
+draft step runs the draft layer on the one-rank decode form at the rank's shard
+(`DecodeTarget._mtp_layer`), a draft-extend step's continuing rows included.
 
 **QSA sparse attention.** The index plane is maintained on every step so a request can
 cross `dense_seq_len_threshold` later without rebuilding its prefix; above it the sparse
@@ -413,6 +414,9 @@ from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_hc_up_gat
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_post_inject import (
     qwen4_exp_post_inject,
+)
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe import (
+    moe_decode_front__decode as _decode_front,
 )
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe import (
     tep_finalize_allreduce as _TEP_FINAR,
@@ -1322,6 +1326,21 @@ def _tep_draft_layer(core) -> bool:
         f"{'on' if core.mtp_enabled else 'off'}"
     )
     return False
+
+
+#: Off by default (opt-in: the router logits come from another GEMM, a same-precision reorder). At a
+#: tep4 rank whose trunk MoE takes the route front (`TEP_FAST_DECODE_ENV`), a captured block of a
+#: row count the route front serves, up to `moe_decode_front.MAX_ROWS`, forms its router logits in
+#: the route front's launch (`ops/moe/moe_decode_front__decode`: the 512-expert router GEMM on the
+#: kernel's low-M warp MMA, then the top-10, the window's tables and the NVFP4 codes) instead of
+#: `_decode_router` (FlashInfer's low-M GEMM) and then the route front: one launch fewer a block.
+#: Given its logits the block is bitwise the route front's; a logit can differ from
+#: `_decode_router`'s in its last bit, so a row whose 10th and 11th logits are that close can pick
+#: the other expert. Every rank must pick alike (each (row, slot) is served by exactly one
+#: window): the logits are the same bits on every rank (same rows, same kernel), and the row
+#: counts are agreed over the group at build (`_tep_decode_front_build`, collective). Read once,
+#: when the target is built; set where it cannot apply it warns and does nothing.
+TEP_MOE_FRONT_ENV = "TRTLLM_QWEN4_EXP_TEP_MOE_FRONT"
 
 
 #: Off by default (a Lamport transport: race-risk, opt-in). At a tep4 rank whose trunk MoE takes
@@ -2364,6 +2383,8 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         # Collective (the group agrees); once a load.
         if self._router_front is None and device.type == "cuda":
             self._router_front = _dp_router_front_build(self, self._decode._layers, device)
+        # Collective where set: every rank of the group agrees on its row counts.
+        _tep_decode_front_build(self, self._route_front, self._decode._layers, device)
         # Collective; once a load (the post-load walk reaches this hook again).
         if self._tep_finar is None and device.type == "cuda":
             self._tep_finar = _tep_finar_build(self, device)
@@ -4176,6 +4197,10 @@ class _RouteFront:
         self.views: dict = {}
         self.flats: dict = {}
         self.layers: dict = {}
+        # `TEP_MOE_FRONT_ENV` (`_tep_decode_front_build`): the row counts whose router GEMM runs in
+        # the front's launch, and each layer's staging buffer.
+        self.decode: frozenset = frozenset()
+        self.stages: list = []
 
 
 def _route_front_tactic(runner, core, rows: int) -> tuple | None:
@@ -4235,13 +4260,32 @@ def _route_front_run(
     router logits: `(out, xq, xsf, ids, wts)`. The runner runs this rank's window numbered from
     0 on `fp4` (the MoE site's NVFP4 codes, the same bits as the front's) or the front's own
     codes; `out` is its finalized output, or with `finalize` False its FC2 rows in the tables'
-    permuted order (the slot -> row table is `st.views[rows][layer][0]`, the weights `wts`)."""
+    permuted order (the slot -> row table is `st.views[rows][layer][0]`, the weights `wts`).
+    `logits` None (`_tep_front_logits`): the decode front forms them in its own launch."""
     rows = x.shape[0]
     tactic = st.tactics[rows]
     tile = int(tactic[0])
-    xq, xsf, ids, wts = moe_route_front(
-        logits, x, L.moe_gscale, st.flats[rows][layer], tile, core.expert_offset, core.local_experts
-    )
+    if logits is None:
+        _, xq, xsf, ids, wts = _decode_front.moe_decode_front(
+            x,
+            L.router.t(),
+            L.moe_gscale,
+            st.flats[rows][layer],
+            st.stages[layer],
+            tile,
+            core.expert_offset,
+            core.local_experts,
+        )
+    else:
+        xq, xsf, ids, wts = moe_route_front(
+            logits,
+            x,
+            L.moe_gscale,
+            st.flats[rows][layer],
+            tile,
+            core.expert_offset,
+            core.local_experts,
+        )
     xq_in, xsf_in = (xq, xsf) if fp4 is None else fp4
     out = st.runner.run_moe_prerouted(
         None,
@@ -4452,7 +4496,7 @@ def _route_front_experts(
     layer = st.layers.get(L.fc1_w.data_ptr())
     if rows not in st.tactics or layer is None or x.stride(1) != 1 or x.stride(0) != core.hidden:
         return None
-    logits = (router_mm or _decode_router)(x, L.router)
+    logits = _tep_front_logits(st, x, L, router_mm)
     return _route_front_run(core, st, x, L, layer, logits, fp4)[0]
 
 
@@ -4550,6 +4594,107 @@ def _dp_router_front_build(core, layers, device) -> "_DpRouterFront | None":
         f"{sorted(rows)}, releasing gather at {sorted(release)}"
     )
     return _DpRouterFront(rows, release, mids)
+
+
+def _tep_front_logits(st: _RouteFront, x, L: _LayerWeights, router_mm=None):
+    """The router logits a route-front block enters with: None at a row count the decode front
+    serves (`TEP_MOE_FRONT_ENV`, tep4: the front's launch forms them), else the step's decode
+    router's (`router_mm`: `_decode_router` by default, or the attention-DP router front)."""
+    return None if x.shape[0] in st.decode else (router_mm or _decode_router)(x, L.router)
+
+
+def _tep_decode_front_check(core, st: _RouteFront, L: _LayerWeights, rows: int, gen) -> tuple:
+    """The decode front at `rows` rows over one layer, eagerly, on scratch tables: `(what
+    differs, logits that differ from _decode_router's)`. The first is "" when its codes, scales,
+    experts, weights and tables are bitwise the route front's over its own logits, the staging
+    buffer is back at zero and the logits are within two bf16 steps of an fp32 GEMM rounded once;
+    the second is reported, not required (the reorder this switch makes)."""
+    device = L.router.device
+    tile = int(st.tactics[rows][0])
+    x = torch.randn([rows, core.hidden], generator=gen, device=device).to(torch.bfloat16)
+    n = sum(table_sizes(rows, core.topk, core.local_experts, tile))
+    flat_a = (torch.arange(n, device=device) % rows).to(torch.int32)
+    flat_b = flat_a.clone()
+    stage = _decode_front.staging_buffer(device)
+    logits, xq, xsf, ids, wts = _decode_front.moe_decode_front(
+        x, L.router.t(), L.moe_gscale, flat_a, stage, tile, core.expert_offset, core.local_experts
+    )
+    xq0, xsf0, ids0, wts0 = moe_route_front(
+        logits, x, L.moe_gscale, flat_b, tile, core.expert_offset, core.local_experts
+    )
+    ref = (x.float() @ L.router.float()).to(torch.bfloat16).float()
+    stock = _decode_router(x, L.router)
+    torch.cuda.synchronize(device)
+    bad = []
+    for name, got, want in (
+        ("NVFP4 codes", xq, xq0),
+        ("NVFP4 block scales", xsf, xsf0),
+        ("selected experts", ids, ids0),
+        ("routing weights", wts, wts0),
+    ):
+        if not torch.equal(got.reshape(-1).view(torch.uint8), want.reshape(-1).view(torch.uint8)):
+            bad.append(name)
+    views = table_views(flat_a, rows, core.topk, core.local_experts, tile)
+    tables = _route_front_check_tables(views, ids, core.expert_offset, core.local_experts, tile)
+    if tables:
+        bad.append(f"tables ({tables})")
+    if bool(stage.any()):
+        bad.append("the staging buffer is not back at zero")
+    step = torch.exp2(torch.floor(torch.log2(ref.abs().clamp_min(2.0**-100))) - 7)
+    if bool(((logits.float() - ref).abs() > 2 * step).any()):
+        bad.append("logits more than two bf16 steps from an fp32 GEMM")
+    return ", ".join(bad), int((logits != stock).sum())
+
+
+def _tep_decode_front_build(core, st: _RouteFront | None, layers, device) -> None:
+    """`TEP_MOE_FRONT_ENV` at build, after the route front: fills `st.decode` / `st.stages`.
+    Where the switch is set at a tep4 rank with its fast forms (host values the group shares,
+    so the ranks decline together) the row counts are agreed over the group, a collective:
+    each rank compiles and checks (`_tep_decode_front_check`) the route front's row counts up to
+    `moe_decode_front.MAX_ROWS`, and only those that pass on EVERY rank are served (one
+    `core.tp_sum` of 0 / 1 flags), since a block that forms its logits one way on one rank and
+    the other way on another could serve a (row, slot) on no window or on two."""
+    if not _switch(TEP_MOE_FRONT_ENV):
+        return
+    if not core.tep_fast or device.type != "cuda":
+        logger.warning(
+            f"{TEP_MOE_FRONT_ENV} is set but ignored: it needs a tep4 rank with "
+            f"{TEP_FAST_DECODE_ENV} on (its route front)"
+        )
+        return
+    cap = _decode_front.MAX_ROWS
+    mine, found = [], {}
+    if st is not None:
+        gen = torch.Generator(device=device).manual_seed(20261125)
+        with torch.cuda.device(device):
+            for j, rows in enumerate(r for r in sorted(st.tactics) if r <= cap):
+                tile = int(st.tactics[rows][0])
+                if not _decode_front.compile_front(
+                    rows, core.hidden, core.hidden, core.local_experts, tile
+                ):
+                    found[rows] = "not compiled"
+                    continue
+                bad, moved = _tep_decode_front_check(core, st, layers[j % len(layers)], rows, gen)
+                found[rows] = bad or f"{moved} logits differ from the stock router's"
+                if not bad:
+                    mine.append(rows)
+    flags = torch.zeros([cap, core.hidden], dtype=torch.bfloat16, device=device)
+    for r in mine:
+        flags[0, r - 1] = 1.0
+    total = core.tp_sum(flags)[0, :cap].float().cpu()
+    agreed = frozenset(r for r in range(1, cap + 1) if int(total[r - 1]) == _TEP_RANKS)
+    if not agreed:
+        logger.warning(
+            f"{TEP_MOE_FRONT_ENV} is set but serves no row count on every rank of the group "
+            f"(this rank: {found}); every block keeps the stock router"
+        )
+        return
+    st.stages = [_decode_front.staging_buffer(device) for _ in layers]
+    st.decode = agreed
+    logger.info(
+        f"MoE decode front ({TEP_MOE_FRONT_ENV}=1): rank {core.mapping.tp_rank}, rows "
+        f"{sorted(agreed)}, build check {found}"
+    )
 
 
 class _TepFinar:
@@ -4713,7 +4858,7 @@ def _tep_finar_routed(core, fin: _TepFinar, x, L: _LayerWeights, fp4, router_mm)
             "launches must take three slots"
         )
     fin.prev = layer
-    logits = _decode_router(x, L.router)
+    logits = _tep_front_logits(st, x, L)
     fc2, _, _, _, wts = _route_front_run(core, st, x, L, layer, logits, fp4, finalize=False)
     perm = st.views[rows][layer][0].view(rows, core.topk)
     return tep_finalize_allreduce(fc2, wts, perm, rows, layer % _TEP_FINAR.SLOTS, fin.op)
