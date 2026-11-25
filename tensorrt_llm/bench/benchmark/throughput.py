@@ -455,6 +455,8 @@ def throughput_command(
 
         llm = get_llm(runtime_config, kwargs)
         startup_metrics = llm.startup_metrics
+        engine_config = (llm._executor.get_engine_config()
+                         if llm._executor else {})
 
         sampler_args = {
             "end_id": options.eos_id,
@@ -519,7 +521,8 @@ def throughput_command(
                                        logger,
                                        kwargs,
                                        options.streaming,
-                                       startup_metrics=startup_metrics)
+                                       startup_metrics=startup_metrics,
+                                       engine_config=engine_config)
         # Generate reports for statistics, output tokens, and request info.
         generate_json_report(options.report_json,
                              report_utility.get_statistics_dict)

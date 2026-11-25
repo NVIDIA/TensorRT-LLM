@@ -274,7 +274,7 @@ def _stats(out, ref_out, pool, ref_pool) -> str:
 #: A tp2/tep2 rank of the FP8 target: 8 k / 24 v heads on its 8240-wide projection, bf16 state;
 #: the register variant up to 12 rows, the bulk copy from 13 (24 v heads x 13 rows > 2 x 152 SMs).
 _FP8_TP2 = dict(k_heads=8, v_heads=24, proj_width=8240, state="bf16")
-_FP8 = "qwen4_exp/qwen3_8_flash_next_fp8__sm_103__unified"
+_FP8 = "qwen4_exp/qwen3_8_flash_next_fp8__sm_10x__default"
 
 #: The shapes each target calls `gdn_decode_rows_gated_norm` with beyond its own cells.
 TARGET_CELLS: dict[str, tuple[Cell, ...]] = {

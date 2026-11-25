@@ -11,6 +11,7 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 
+from tensorrt_llm._torch.attention.backends.interface import GraphVariant
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner, KeyType
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import DecoderInputPreparer
@@ -88,8 +89,6 @@ def _make_runner(dist, max_batch=64, dummy_ok=True, rank=0):
         skip_adp_count_gather=False,
     )
     runner._sample_type_resolver = None
-    runner.kv_regime_resolver = None
-    runner.packed_split_resolver = None
     runner._round_up_batch_size_with_draft_len = lambda bs, draft_len: 4 if bs <= 4 else 8
     dummy = SimpleNamespace(py_request_id=-1) if dummy_ok else None
     runner._get_or_create_padding_dummy = lambda rm, draft_len: dummy
@@ -148,8 +147,10 @@ def test_agreed_replay_counts_skip_one_collective_and_are_consumed(variant: str)
             batch_size=4,
             draft_len=tokens_per_step - 1,
             sample_type=SampleType.FULL if rank == 1 and variant == "tier" else SampleType.FAST,
-            kv_regime=16384 if rank == 1 and variant == "kv_regime" else 8192,
-            packed_split=rank == 1 and variant == "packed_split",
+            variants=(
+                16384 if rank == 1 and variant == "kv_regime" else 8192,
+                int(rank == 1 and variant == "packed_split"),
+            ),
         )
         for request in batch.generation_requests:
             request.py_draft_tokens = [1] * key.draft_len
@@ -159,14 +160,19 @@ def test_agreed_replay_counts_skip_one_collective_and_are_consumed(variant: str)
         runner.config.sampling_variants = None
         runner._capture_allowed = False
         runner._capture_sample_type = None
-        runner._capture_kv_regime = None
-        runner._capture_packed_split = None
+        runner._capture_variants = (None, None)
         runner.supported_batch_sizes = [4]
         runner.max_beam_width = 1
         runner._sample_type_resolver = Mock(return_value=key.sample_type)
-        runner.kv_regime_resolver = Mock(return_value=(key.kv_regime,))
-        runner.packed_split_resolver = SimpleNamespace(
-            variants=Mock(return_value=(key.packed_split,))
+        # Each shape has one value of a variant, which a step takes without measuring its KV.
+        runner.graph_variants = tuple(
+            GraphVariant(
+                name=name,
+                values=Mock(return_value=(value,)),
+                of_step=Mock(),
+                replayable=lambda value, captured: value,
+            )
+            for name, value in zip(("kv_regime", "packed_split"), key.variants)
         )
         runner._can_run_cuda_graph_batch = lambda _: True
         runner._get_seq_len_mode = Mock(return_value=False)
@@ -192,8 +198,8 @@ def test_agreed_replay_counts_skip_one_collective_and_are_consumed(variant: str)
             batch, enable_spec_decode=True, attn_metadata=attention, spec_metadata=spec
         )
         runner._sample_type_resolver.assert_called_once()
-        runner.kv_regime_resolver.assert_called_once()
-        runner.packed_split_resolver.variants.assert_called_once()
+        for graph_variant in runner.graph_variants:
+            graph_variant.values.assert_called_once()
         inputs = SimpleNamespace(
             _config=runner.config,
             mapping=Mapping(world_size=2, tp_size=2, rank=rank, enable_attention_dp=True),
