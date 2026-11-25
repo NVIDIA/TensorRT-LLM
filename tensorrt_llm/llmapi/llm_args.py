@@ -2362,9 +2362,9 @@ class MoePerLayerDynamicLoadBalancerConfig(_MoeLoadBalancerConfigBase):
         "Number of SMs that the routed-input quantization and shared-expert FC12 kernels leave free for the kernel that runs the HALO-Q scheduler and then the in-switch copy of its plan on the copy stream, one CTA per SM. Must be smaller than the device SM count.",
         status="prototype")
     helper_slot_mode: Literal["per_layer_resident", "shared_banks"] = Field(
-        default="per_layer_resident",
+        default="shared_banks",
         description=
-        "Storage of the helper slots. `per_layer_resident` gives every MoE layer its own helper slots and skips copying an expert that a helper slot already holds from that layer's previous forward pass; it costs one helper set per MoE layer, about 6.4 GiB per GPU for DeepSeek-V4-Pro with 3 helper slots per rank. `shared_banks` has all MoE layers alternate between two shared helper banks and copy every helper expert in every forward pass.",
+        "Storage of the helper slots. `shared_banks` has all MoE layers alternate between two shared helper banks and copy every helper expert in every forward pass. `per_layer_resident` gives every MoE layer its own helper slots and skips copying an expert that a helper slot already holds from that layer's previous forward pass; it costs one helper set per MoE layer, about 6.4 GiB per GPU for DeepSeek-V4-Pro with 3 helper slots per rank.",
         status="prototype")
 
     def validate_expert_capacity(self, num_experts: int) -> None:
@@ -10347,12 +10347,11 @@ class TorchLlmArgs(BaseLlmArgs):
         if self.prefill_cuda_graph_backend == PrefillCudaGraphBackend.BREAKABLE:
             bucket = _PER_LAYER_DYNAMIC_EPLB_PREFILL_CAPTURE_TOKENS
             if (self.prefill_capture_num_tokens != [bucket]
-                    or not self.enable_attention_dp
-                    or load_balancer.helper_slot_mode != "per_layer_resident"):
+                    or not self.enable_attention_dp):
                 raise ValueError(
                     "per-layer dynamic EPLB with breakable prefill requires "
-                    f"prefill_capture_num_tokens=[{bucket}], enable_attention_dp=True, and "
-                    "helper_slot_mode='per_layer_resident'")
+                    f"prefill_capture_num_tokens=[{bucket}] and enable_attention_dp=True"
+                )
         if self.cuda_graph_config is not None:
             logger.warning(
                 "per-layer dynamic EPLB does not support decode CUDA "

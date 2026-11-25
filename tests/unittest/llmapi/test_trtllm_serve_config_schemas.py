@@ -1349,7 +1349,7 @@ def test_encoder_attention_backend_schema(
         ({"prefill_capture_num_tokens": None}, "per_layer_resident", False),
         ({"prefill_capture_num_tokens": [4096, 8192]}, "per_layer_resident", False),
         ({"enable_attention_dp": False}, "per_layer_resident", False),
-        ({"enable_attention_dp": True}, "shared_banks", False),
+        ({"enable_attention_dp": True}, "shared_banks", True),
     ],
 )
 def test_per_layer_dynamic_eplb_prefill_schema(

@@ -445,7 +445,7 @@ def test_layer_allocates_arena_from_model_owned_resources(monkeypatch):
 
 @pytest.mark.parametrize(
     ("helper_slot_mode", "per_layer_sets"),
-    [(None, True), ("per_layer_resident", True), ("shared_banks", False)],
+    [(None, False), ("per_layer_resident", True), ("shared_banks", False)],
 )
 def test_helper_slot_mode_selects_helper_residency(helper_slot_mode, per_layer_sets):
     config = _Config()

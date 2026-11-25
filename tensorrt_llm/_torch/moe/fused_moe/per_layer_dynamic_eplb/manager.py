@@ -43,7 +43,7 @@ class PerLayerDynamicMoeLoadBalancer(BaseMoeLoadBalancer):
         self.auxiliary_sms = int(getattr(config, "auxiliary_sms", 4))
         if self.auxiliary_sms <= 0:
             raise ValueError("auxiliary_sms must be positive")
-        helper_slot_mode = getattr(config, "helper_slot_mode", "per_layer_resident")
+        helper_slot_mode = getattr(config, "helper_slot_mode", "shared_banks")
         if helper_slot_mode not in ("per_layer_resident", "shared_banks"):
             raise ValueError(f"unknown helper_slot_mode {helper_slot_mode!r}")
         # Resident helper experts need helper rows that only their layer writes.

@@ -4759,17 +4759,6 @@
             "enable_attention_dp": {
               "const": true
             },
-            "moe_config": {
-              "properties": {
-                "load_balancer": {
-                  "properties": {
-                    "helper_slot_mode": {
-                      "const": "per_layer_resident"
-                    }
-                  }
-                }
-              }
-            },
             "prefill_capture_num_tokens": {
               "const": [
                 8192
@@ -7531,8 +7520,8 @@
           "type": "integer"
         },
         "helper_slot_mode": {
-          "default": "per_layer_resident",
-          "description": "Storage of the helper slots. `per_layer_resident` gives every MoE layer its own helper slots and skips copying an expert that a helper slot already holds from that layer's previous forward pass; it costs one helper set per MoE layer, about 6.4 GiB per GPU for DeepSeek-V4-Pro with 3 helper slots per rank. `shared_banks` has all MoE layers alternate between two shared helper banks and copy every helper expert in every forward pass.",
+          "default": "shared_banks",
+          "description": "Storage of the helper slots. `shared_banks` has all MoE layers alternate between two shared helper banks and copy every helper expert in every forward pass. `per_layer_resident` gives every MoE layer its own helper slots and skips copying an expert that a helper slot already holds from that layer's previous forward pass; it costs one helper set per MoE layer, about 6.4 GiB per GPU for DeepSeek-V4-Pro with 3 helper slots per rank.",
           "enum": [
             "per_layer_resident",
             "shared_banks"

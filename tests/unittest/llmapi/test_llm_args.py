@@ -334,7 +334,7 @@ class TestMoeConfigPerLayerDynamicEplb:
                           MoePerLayerDynamicLoadBalancerConfig)
         assert config.backend == "MEGAMOE_CUTEDSL"
         assert config.load_balancer.auxiliary_sms == 4
-        assert config.load_balancer.helper_slot_mode == "per_layer_resident"
+        assert config.load_balancer.helper_slot_mode == "shared_banks"
 
     @pytest.mark.parametrize(
         "num_experts, message",
@@ -465,7 +465,7 @@ class TestMoeConfigPerLayerDynamicEplb:
             ([4096, 8192], True, None, False),
             ([8192, 8192], True, None, False),
             ([8192], False, None, False),
-            ([8192], True, "shared_banks", False),
+            ([8192], True, "shared_banks", True),
         ])
     def test_per_layer_dynamic_breakable_prefill(self, tokens: list[int] | None,
                                                  attention_dp: bool,

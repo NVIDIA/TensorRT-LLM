@@ -1359,10 +1359,12 @@ set wrong has a test that catches it:
   `SchedulerSpinBound` takes from the MoE communication timeout guard: the
   warmup timeout during warmup and AutoTuner profiling, the native bound
   otherwise.
-- `helper_slot_mode=per_layer_resident` gives each layer its own helper-slot
-  set, and the copy keeps a per-layer table of the expert each helper slot
-  holds so that it skips experts a whole team already holds. Any other writer
-  of those helper rows would invalidate the table.
+- `helper_slot_mode=shared_banks`, the default, has all layers alternate
+  between two shared helper banks and copies every helper expert in every
+  forward pass. `helper_slot_mode=per_layer_resident` gives each layer its own
+  helper-slot set, and the copy keeps a per-layer table of the expert each
+  helper slot holds so that it skips experts a whole team already holds. Any
+  other writer of those helper rows would invalidate the table.
 - HALO-Q and TMA follow the native-operator path under
   `cpp/tensorrt_llm/kernels/moe/loadBalance/dynamicEplb` and
   `cpp/tensorrt_llm/thop/moe/loadBalance`. The scheduler accepts the original
@@ -1406,7 +1408,7 @@ set wrong has a test that catches it:
   `null`. With per-layer dynamic EPLB, FC12 leaves the copy kernel its auxiliary
   SMs.
 - DeepSeek-V4 NVFP4 on SM100/103 supports breakable prefill with an 8192-token
-  bucket, attention DP, and per-layer resident helpers. The parent segment
+  bucket and attention DP, in either helper slot mode. The parent segment
   captures the COPY producer, the route wait, and the MAIN consumers. Replay
   writes the current READY generation on MAIN, and the lease is released
   after submission.

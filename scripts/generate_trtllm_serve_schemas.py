@@ -346,13 +346,6 @@ def _dynamic_eplb_prefill_schema(inline_dynamic: dict, *, inherited_options: boo
     capture_fields = {
         "prefill_capture_num_tokens": {"const": [_PER_LAYER_DYNAMIC_EPLB_PREFILL_CAPTURE_TOKENS]},
         "enable_attention_dp": {"const": True},
-        "moe_config": {
-            "properties": {
-                "load_balancer": {
-                    "properties": {"helper_slot_mode": {"const": "per_layer_resident"}},
-                },
-            },
-        },
     }
     capture: dict = {"properties": capture_fields}
     if not inherited_options:
