@@ -74,7 +74,11 @@ _BUILTIN_PRESETS = {
 _CURATED_PRESETS = {
     'deepseek-v4-pro-latency.yaml',
     'deepseek-v4-pro-throughput.yaml',
+    'gpt-oss-120b-latency.yaml',
+    'gpt-oss-120b-throughput.yaml',
+    'minimax-m3-throughput.yaml',
     'musespark-open-agentic-balanced.yaml',
+    'nemotron-3-super-throughput.yaml',
     'nemotron-3-ultra-throughput.yaml',
     'qwen3.8-flash-next.yaml',
 }
@@ -82,11 +86,14 @@ PERF_CONFIG_PRESETS = _BUILTIN_PRESETS.keys() | _CURATED_PRESETS
 
 
 @cache
-def _get_preset(name: str) -> dict:
-    if name in _BUILTIN_PRESETS:
+def get_perf_config_preset(selection: str) -> dict:
+    """Resolve one cfg selection. Copy the cached options before merging them."""
+    name, *overrides = selection.split(',')
+    if name in _BUILTIN_PRESETS and not overrides:
         return _BUILTIN_PRESETS[name]
     if name not in _CURATED_PRESETS:
-        raise KeyError(name)
+        raise ValueError(f"Unknown cfg selection {selection!r}; known presets: "
+                         f"{sorted(PERF_CONFIG_PRESETS)}")
     path = Path(get_llm_root()) / 'examples/configs/curated' / name
     with path.open() as stream:
         config = yaml.safe_load(stream)
@@ -96,6 +103,20 @@ def _get_preset(name: str) -> dict:
                   'max_num_tokens'):
         config.pop(field, None)
     config.get('kv_cache_config', {}).pop('free_gpu_memory_fraction', None)
+    integer_fields = ('max_seq_len', 'stream_interval',
+                      'num_postprocess_workers')
+    for override in overrides:
+        field, _, value = override.partition('=')
+        if value == 'default' and field in config:
+            # Inherit the value from the model, bench or serve.
+            del config[field]
+        elif field == 'print_iter_log' and value in ('true', 'false'):
+            config[field] = value == 'true'
+        elif (field in integer_fields and value.isascii() and value.isdecimal()
+              and (int(value) > 0 or field == 'num_postprocess_workers')):
+            config[field] = int(value)
+        else:
+            raise ValueError(f"Invalid override {override!r} for {name}")
     return config
 
 
@@ -307,9 +328,8 @@ def _apply_model_overrides(config: dict, label: str) -> None:
                kv_cache_config=_kv_without_reuse())
     if minimax_fp4 or minimax_flash:
         update(sparse_attention_config={'implementation': 'msa'})
-    if minimax_fp4 or minimax_mxfp8:
-        update(enable_attention_dp=True,
-               max_seq_len=4096 if minimax_mxfp8 else 2560)
+    if minimax_mxfp8:
+        update(enable_attention_dp=True, max_seq_len=4096)
     if minimax_fp4:
         update(moe_config={'backend': 'CUTLASS'},
                kv_cache_config={
@@ -327,12 +347,10 @@ def _apply_model_overrides(config: dict, label: str) -> None:
                })
     if 'minimax_m3.1_flash_nvfp4_dspark' in label:
         update(speculative_config=_dspark(7, 'MiniMax-M3.1-Flash/dspark'))
-    if 'minimax_m3_fp4-bench-pytorch' in label:
-        update(stream_interval=10, num_postprocess_workers=4)
 
     # Bound the serve sequence length on TP4/EP4.
     if 'minimax_m3_fp4-serve-pytorch' in label:
-        update(max_seq_len=4096)
+        update(enable_attention_dp=True, max_seq_len=4096)
 
     # The two 8K input recipes need room for 1K output; serve also needs chunking.
     long_input = 'maxnt:2048-input_output_len:8000,1000'
@@ -382,18 +400,6 @@ def _apply_model_overrides(config: dict, label: str) -> None:
             update(speculative_config=_mtp(1))
         else:
             update(kv_cache_config={'enable_block_reuse': True})
-
-    gpt_oss = 'gpt_oss_120b_fp4-bench-pytorch-float4-maxbs:720-maxnt:16384-input_output_len:1024,1024-'
-    high_concurrency = any(gpt_oss + case in label
-                           for case in ('reqs:1280-con:256',
-                                        'reqs:2560-con:512',
-                                        'reqs:20480-con:4096'))
-    low_concurrency = any(gpt_oss + case in label
-                          for case in ('reqs:8-con:1', 'reqs:100-con:32'))
-    if high_concurrency or low_concurrency:
-        update(stream_interval=10, num_postprocess_workers=4)
-    if high_concurrency:
-        update(enable_attention_dp=True)
 
     if 'qwen3_235b_a22b_fp4_eagle3-bench-pytorch' in label:
         update(**_eagle3('Qwen3/qwen3-235B-eagle3'),
@@ -455,19 +461,11 @@ def _apply_model_overrides(config: dict, label: str) -> None:
         update(max_seq_len=1048576)
     if super_streaming:
         update(cuda_graph_config={'max_batch_size': 8})
-    if super_throughput:
-        update(enable_attention_dp=True,
-               cuda_graph_config={'max_batch_size': 256})
     if super_mtp:
         update(speculative_config={
             'decoding_type': 'MTP',
             'num_nextn_predict_layers': 3
         })
-
-    # Limit iteration logs for the long-running Nemotron Super case.
-    if ('nemotron_3_super_120b_nvfp4-serve-pytorch-float4-maxbs:512-maxnt:2048-'
-            'kv_frac:0.8-input_output_len:1024,1024-reqs:160-con:32' in label):
-        update(print_iter_log=False)
 
 
 def get_model_yaml_config(model_label: str,
@@ -495,7 +493,8 @@ def get_model_yaml_config(model_label: str,
 
     if has_cfg:
         for preset in presets.split('+'):
-            recursive_update(config, copy.deepcopy(_get_preset(preset)))
+            recursive_update(config,
+                             copy.deepcopy(get_perf_config_preset(preset)))
 
     if 'pytorch' in model_label and 'loras' in model_label:
         lora_count = 1

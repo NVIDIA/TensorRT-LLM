@@ -128,6 +128,13 @@ MTP cases share `qwen3.8-flash-next.yaml`. The FP4 cases select `moe:CUTEDSL` in
 The test case supplies TP, PP, EP, maximum batch size, token budget and KV memory fraction.
 Combine presets left to right, for example `-cfg:deepseek-v4-pro-throughput.yaml+mtp3`.
 
+A case can set `max_seq_len`, `stream_interval`, `num_postprocess_workers` or
+`print_iter_log` after the filename, for example
+`cfg:minimax-m3-throughput.yaml,max_seq_len=2560` or
+`cfg:nemotron-3-super-throughput.yaml,num_postprocess_workers=0,print_iter_log=false`.
+Use `field=default` to omit a top-level field from this recipe and inherit the model or runtime setting.
+For example, `cuda_graph_config=default` lets bench derive capture sizes from the case's batch size.
+
 ### 4.1 Test Case Configuration
 - Test cases are defined in YAML configuration files
 - Support for different models, precisions, batch sizes, etc.

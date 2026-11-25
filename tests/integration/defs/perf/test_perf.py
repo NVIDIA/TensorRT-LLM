@@ -35,7 +35,7 @@ from tensorrt_llm.llmapi.mpi_session import get_mpi_world_size
 
 from ..conftest import get_device_count, get_gpu_device_list, llm_models_root
 from ._model_paths import HF_MODEL_PATH, LORA_MODEL_PATH, MODEL_PATH_DICT
-from .pytorch_model_config import PERF_CONFIG_PRESETS, get_model_yaml_config
+from .pytorch_model_config import get_model_yaml_config, get_perf_config_preset
 from .sampler_options_config import get_sampler_options_config
 from .utils import (AbstractPerfScriptTestClass, PerfBenchScriptTestCmds,
                     PerfMetricType, PerfServeScriptTestCmds,
@@ -562,7 +562,7 @@ class PerfTestConfig:
         self.moe_backend = moe_backend
         # Shared random prefix length (serve only), added in front of every prompt.
         self.prefix_len = prefix_len
-        # "+"-joined names from PERF_CONFIG_PRESETS in pytorch_model_config.py.
+        # "+"-joined presets with optional per-recipe field overrides.
         self.cfg_presets = cfg_presets
 
     def to_string(self,
@@ -849,13 +849,8 @@ class PerfTestConfig:
                 "prefix applies only to the random text dataset!"
 
         if self.cfg_presets is not None:
-            unknown_presets = [
-                name for name in self.cfg_presets.split("+")
-                if name not in PERF_CONFIG_PRESETS
-            ]
-            assert not unknown_presets, (
-                f"Unknown cfg preset(s) {unknown_presets}; "
-                f"known presets: {sorted(PERF_CONFIG_PRESETS)}")
+            for selection in self.cfg_presets.split("+"):
+                get_perf_config_preset(selection)
 
         # Validate quantization mode.
         if self.model_name in MODEL_PATH_DICT.keys():
