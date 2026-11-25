@@ -65,6 +65,12 @@ def is_gdn_flashinfer_replay_required() -> bool:
     return os.environ.get("TRTLLM_USE_GDN_FLASHINFER_REPLAY", "0") == "force"
 
 
+def is_batch_shape_deterministic() -> bool:
+    """Return whether a row's output must not depend on the batch shape it ran in."""
+    return (os.environ.get("FORCE_DETERMINISTIC", "0") == "1"
+            or os.environ.get("FORCE_BATCH_INVARIANT", "0") == "1")
+
+
 # Engines of at most this many tokens per step and rank capture decode CUDA graphs at the highest of
 # PyTorch's stream priorities; captured kernels keep it, so the model stream goes ahead of the auxiliary
 # streams. Larger steps fill the GPU, and there the high priority starves the auxiliary streams.

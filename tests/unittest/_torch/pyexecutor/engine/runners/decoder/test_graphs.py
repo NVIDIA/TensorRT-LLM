@@ -63,6 +63,27 @@ def test_cuda_graph_factory_preserves_input_preparer(
     assert graphs is graphs_type.return_value
 
 
+BATCH_SHAPE_SWITCHES = ("FORCE_DETERMINISTIC", "FORCE_BATCH_INVARIANT")
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("switch", [None, *BATCH_SHAPE_SWITCHES])
+def test_batch_shape_switch_is_read_at_construction(
+    monkeypatch: pytest.MonkeyPatch, switch: str | None
+) -> None:
+    for name in BATCH_SHAPE_SWITCHES:
+        monkeypatch.delenv(name, raising=False)
+    if switch is not None:
+        monkeypatch.setenv(switch, "1")
+
+    graphs = decoder_graphs(decoder_config())
+    # Flipping the switches afterwards must not change the decision.
+    for name in BATCH_SHAPE_SWITCHES:
+        monkeypatch.setenv(name, "0" if switch else "1")
+
+    assert graphs._batch_shape_deterministic is (switch is not None)
+
+
 @pytest.mark.cpu_only
 class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
     def test_generation_only_is_identity(self) -> None:
