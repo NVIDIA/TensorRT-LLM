@@ -201,7 +201,6 @@ _PERF_PRESETS = {
         **_MINIMAX_M3,
         'max_seq_len': 2560,
         'enable_attention_dp': True,
-        'trust_remote_code': True,
         'cuda_graph_config.enable_padding': True,
         'stream_interval': 10,
         'num_postprocess_workers': 4,
@@ -219,12 +218,9 @@ _PERF_PRESETS = {
     },
     'nemotron_super_throughput': {
         **_MAMBA_FP16,
-        'trust_remote_code': True,
         'enable_attention_dp': True,
-        'cuda_graph_config.enable_padding': True,
         'cuda_graph_config.max_batch_size': 256,
         'kv_cache_config.enable_block_reuse': False,
-        'num_postprocess_workers': 0,
         'enable_chunked_prefill': True,
         'max_seq_len': 1048576,
         'moe_config.backend': 'CUTLASS',
@@ -246,9 +242,7 @@ _PERF_PRESETS = {
     },
     'qwen38_flash_next_tep4': {
         **_MTP3,
-        'trust_remote_code': True,
         'enable_chunked_prefill': True,
-        'cuda_graph_config.enable_padding': True,
         'cuda_graph_config.max_batch_size': 128,
         'moe_config.backend': 'TRTLLM',
         'kv_cache_config.mamba_ssm_cache_dtype': 'bfloat16',
@@ -335,13 +329,8 @@ _FIELD_ALIASES = {
     'kv_cache_config.mamba_state_config.periodic_snapshot_interval',
 }
 
-_SM_OVERRIDES = {
-    'gemma4_nvfp4': {
-        (107, 121): {
-            'attn_backend': 'FLASHINFER'
-        }
-    },
-}
+# Gemma 4 uses 512-wide heads and defaults to TRTLLM on SM107.
+_SM_OVERRIDES = {'gemma4_nvfp4': {107: {'attn_backend': 'FLASHINFER'}}}
 
 
 def _update_field(config: dict, field: str, value) -> None:
@@ -365,10 +354,9 @@ def get_perf_config_preset(selection: str) -> dict:
             except FileNotFoundError as exc:
                 raise ValueError(f"Unknown curated config {name!r}") from exc
         elif name in _PERF_PRESETS:
-            fields = _PERF_PRESETS[name].copy()
-            for versions, extra in _SM_OVERRIDES.get(name, {}).items():
-                if get_sm_version() in versions:
-                    fields.update(extra)
+            fields = _PERF_PRESETS[name]
+            if sm_overrides := _SM_OVERRIDES.get(name):
+                fields = fields | sm_overrides.get(get_sm_version(), {})
             for field, value in fields.items():
                 _update_field(config, field, copy.deepcopy(value))
         else:

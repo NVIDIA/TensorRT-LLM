@@ -1908,15 +1908,10 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             print_info(f"Metric {metric_name} is N/A; skip recording it.")
             return None
 
-        if len(metric_values) == 0:
-            if self._config.runtime == "bench" and self._config.num_gpus > 1 and metric.metric_type == PerfMetricType.BUILD_TIME:
-                print_info("skip building process for multi-gpu test"
-                           )  #https://nvbugspro.nvidia.com/bug/5210111
-                metric_values = [0.0]
-            else:
-                raise RuntimeError(
-                    f"Cannot find perf result for {metric_name} from perf script logs!"
-                )
+        if not metric_values:
+            raise RuntimeError(
+                f"Cannot find perf result for {metric_name} from perf script logs!"
+            )
 
         if metric.metric_type in BUILDER_METRICS and metric.metric_type != PerfMetricType.ENGINE_SIZE:
             # For enc-dec models, there are 2 builder perf metrics, we add them up.
