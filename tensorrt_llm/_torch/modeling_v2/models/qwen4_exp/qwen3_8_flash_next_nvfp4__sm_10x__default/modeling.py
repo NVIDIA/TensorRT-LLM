@@ -1822,6 +1822,43 @@ def _inproj_release_at(core, i: int, rows: int) -> _InProj | None:
     return None if table is None else table.get(i, {}).get(rows)
 
 
+def _decode_forms(core) -> str:
+    """The line a multi-rank core logs once its decode forms are built (`post_load_weights`):
+    what each `TRTLLM_QWEN4_EXP_*` decode form of its layout engaged at on this rank, row counts
+    where they decide. A form set where it cannot take effect also warns on its own; the GDN
+    replay map, settled at each cache-manager bind, logs there."""
+
+    def rows(table) -> list:
+        return sorted(table) if table else []
+
+    route = core._route_front
+    head = f"decode forms: rank {core.mapping.tp_rank} of {core.mapping.tp_size}"
+    if core.dp_size > 1:
+        router, inproj, out = core._router_front, core._inproj_release, core._out_proj
+        forms = {
+            "moe comm": _dp_moe_comm() if core._lamport_trip is not None else "nccl",
+            "route front gathered rows": rows(route.tactics if route else None),
+            "router front gathered rows": rows(router.rows if router else None),
+            "releasing gather rows": rows(router.release_rows if router else None),
+            "hc tiles": core.hc_tiles,
+            "in-proj release rows": rows({r for t in (inproj or {}).values() for r in t}),
+            "out-proj gdn rows": rows(out["gdn_out"] if out else None),
+            "out-proj attn rows": rows(out["attn_o"] if out else None),
+            "grouped gqa from requests": core.dp_gqa_min_requests,
+            "cluster top-k up to rows": core.dp_topk_cluster_rows,
+        }
+    else:
+        forms = {
+            "tep fast": core.tep_fast,
+            "route front rows": rows(route.tactics if route else None),
+            "decode front rows": rows(route.decode if route else None),
+            "finar": core._tep_finar is not None,
+            "draft layer": core.tep_draft_layer,
+            "proj split-k": getattr(core, "tep_proj", False),
+        }
+    return f"{head}: " + ", ".join(f"{k} {v}" for k, v in forms.items())
+
+
 def _moe_prefill_copy(one_rank: bool, trunk_moe_backend: str, max_num_tokens: int) -> bool:
     """Whether the trunk keeps the CuteDSL-layout expert copy: at one rank only (every expert
     is local, the layout the CuteDSL MoE is certified at), only under trtllm-gen, only when a
@@ -2447,6 +2484,8 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         # Collective; once a load (the post-load walk reaches this hook again).
         if self._tep_finar is None and device.type == "cuda":
             self._tep_finar = _tep_finar_build(self, device)
+        if device.type == "cuda" and not one_rank:
+            logger.info(_decode_forms(self))
 
     def _build_draft_one_rank(self, device) -> None:
         """At one rank, and at a tep4 rank under `TEP_DRAFT_LAYER_ENV` (over its heads), the
@@ -2822,6 +2861,10 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
             if self.gdn_replay_map:
                 maps = {n: _gdn_replay_map(n) for n in range(1, md.max_num_requests + 1)}
                 maps = {n: c for n, c in maps.items() if c is not None}
+                logger.info(
+                    f"GDN replay launch map ({DP_GDN_REPLAY_MAP_ENV}): rank {self.dp_rank} of "
+                    f"{self.dp_size}, mapped at {sorted(maps)} requests"
+                )
             gdn_replay_precompile(
                 self.max_verify_rows,
                 self.num_k_heads,

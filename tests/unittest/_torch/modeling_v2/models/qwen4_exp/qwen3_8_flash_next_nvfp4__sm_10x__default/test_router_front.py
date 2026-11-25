@@ -166,3 +166,50 @@ class _Nothing:
 
     def __exit__(self, *exc):
         return False
+
+
+def test_decode_forms_line_names_what_engaged(monkeypatch):
+    """The one line a rank logs after build: at an attention-DP rank the round trip's transport
+    and each form's row counts; at a tep4 rank the tep forms."""
+    monkeypatch.setenv(M.DP_MOE_COMM_ENV, "lamport_step")
+    st = M._RouteFront(None)
+    st.tactics = {192: (16, 32), 64: (8, 53)}
+    front, _ = _front(rows=(64,), release=(64, 192))
+    core = SimpleNamespace(
+        dp_size=4,
+        mapping=SimpleNamespace(tp_rank=2, tp_size=4),
+        _route_front=st,
+        _router_front=front,
+        _lamport_trip=object(),
+        _inproj_release={0: {28: None, 48: None}, 3: {48: None}},
+        _out_proj=None,
+        hc_tiles=True,
+        dp_gqa_min_requests=8,
+        dp_topk_cluster_rows=256,
+    )
+    line = M._decode_forms(core)
+    assert line.startswith("decode forms: rank 2 of 4: moe comm lamport_step, ")
+    for part in (
+        "route front gathered rows [64, 192]",
+        "router front gathered rows [64]",
+        "releasing gather rows [64, 192]",
+        "hc tiles True",
+        "in-proj release rows [28, 48]",
+        "out-proj gdn rows []",
+        "grouped gqa from requests 8",
+        "cluster top-k up to rows 256",
+    ):
+        assert part in line
+    st.decode = frozenset({4, 16})
+    tep = SimpleNamespace(
+        dp_size=1,
+        mapping=SimpleNamespace(tp_rank=0, tp_size=4),
+        _route_front=st,
+        _tep_finar=None,
+        tep_fast=True,
+        tep_draft_layer=True,
+        tep_proj=False,
+    )
+    line = M._decode_forms(tep)
+    assert "decode front rows [4, 16]" in line and "draft layer True" in line
+    assert "finar False" in line and "proj split-k False" in line
