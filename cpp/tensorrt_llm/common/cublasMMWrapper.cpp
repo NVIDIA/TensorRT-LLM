@@ -31,22 +31,15 @@ namespace common
 {
 
 CublasMMWrapper::CublasMMWrapper(
-    cublasHandle_t cublasHandle, cublasLtHandle_t cublasltHandle, cudaStream_t stream, void* workspace)
+    cublasHandle_t cublasHandle, cublasLtHandle_t cublasLtHandle, cudaStream_t stream, void* workspace)
     : mCublasHandle(cublasHandle)
-    , mCublasLtHandle(cublasltHandle)
+    , mCublasLtHandle(cublasLtHandle)
     , mStream(stream)
     , mCublasWorkspace(workspace)
 {
 }
 
 CublasMMWrapper::~CublasMMWrapper() {}
-
-CublasMMWrapper::CublasMMWrapper(CublasMMWrapper const& wrapper)
-    : mCublasHandle(wrapper.mCublasHandle)
-    , mCublasLtHandle(wrapper.mCublasLtHandle)
-    , mStream(wrapper.mStream)
-{
-}
 
 void CublasMMWrapper::createDescriptors(cublasOperation_t transa, cublasOperation_t transb, int const m, int const n,
     int const k, int const lda, int const ldb, int const ldc, int8_t fastAcc)
@@ -267,7 +260,6 @@ void CublasMMWrapper::stridedBatchedGemm(cublasOperation_t transa, cublasOperati
 
 void CublasMMWrapper::prepareCublasHandle()
 {
-    // cublasSetStream also resets the workspace to the handle's default one.
     check_cuda_error(cublasSetStream(mCublasHandle, mStream));
     check_cuda_error(cublasSetMathMode(mCublasHandle, CUBLAS_DEFAULT_MATH));
     check_cuda_error(cublasSetPointerMode(mCublasHandle, CUBLAS_POINTER_MODE_HOST));

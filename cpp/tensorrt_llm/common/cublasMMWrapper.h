@@ -70,7 +70,8 @@ public:
 
     ~CublasMMWrapper();
 
-    CublasMMWrapper(CublasMMWrapper const& wrapper);
+    CublasMMWrapper(CublasMMWrapper const&) = delete;
+    CublasMMWrapper& operator=(CublasMMWrapper const&) = delete;
 
     /********************** GEMMs **********************/
     void Gemm(cublasOperation_t transa, cublasOperation_t transb, int const m, int const n, int const k, void const* A,
