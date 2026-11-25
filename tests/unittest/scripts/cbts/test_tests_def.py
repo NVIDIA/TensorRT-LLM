@@ -24,7 +24,7 @@ from pathlib import Path
 import pytest
 
 __extra_import_path__ = ["~/jenkins/scripts/cbts"]
-from cbts.blocks import Stage, YAMLIndex, parse_stages_from_groovy
+from cbts.blocks import Stage, YAMLIndex, parse_stages
 from cbts.rules._helpers import strip_noop_diff_lines
 from cbts.rules.base import PRInputs, RuleResult
 from cbts.rules.tests_def import (
@@ -1052,7 +1052,9 @@ def modeling_v2_cohort_real_rule() -> CbtsTestsDefRule:
     repo_root = Path(__file__).resolve().parents[4]
     return CbtsTestsDefRule(
         YAMLIndex.load(repo_root / "tests/integration/test_lists/test-db"),
-        parse_stages_from_groovy(repo_root / "jenkins/L0_Test.groovy", include_post_merge=True),
+        parse_stages(
+            repo_root / "jenkins/scripts/test_stage_configs.json", include_post_merge=True
+        ),
         repo_root,
     )
 

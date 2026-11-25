@@ -24,7 +24,7 @@ from pathlib import Path
 import pytest
 
 __extra_import_path__ = ["~/jenkins/scripts/cbts"]
-from cbts.blocks import Block, Stage, YAMLIndex, block_matches_stage, parse_stages_from_groovy
+from cbts.blocks import Block, Stage, YAMLIndex, block_matches_stage, parse_stages
 from cbts.rules.base import PRInputs, RuleResult
 from cbts.rules.modeling_v2 import ModelingV2Rule, _is_mv2_claim, _kept_entries
 
@@ -266,7 +266,7 @@ def test_target_changes_select_target_tests_and_tree_guards(
 def repository_rule() -> tuple[ModelingV2Rule, YAMLIndex, dict[str, Stage]]:
     repo = Path(__file__).resolve().parents[4]
     index = YAMLIndex.load(repo / "tests/integration/test_lists/test-db")
-    stages = parse_stages_from_groovy(repo / "jenkins/L0_Test.groovy", include_post_merge=True)
+    stages = parse_stages(repo / "jenkins/scripts/test_stage_configs.json", include_post_merge=True)
     return ModelingV2Rule(index, stages, repo_root=repo), index, stages
 
 
@@ -548,7 +548,7 @@ def test_k3_ci_runs_once_on_b300_or_gb300_by_topology():
         "ops/comm/test_modeling_v2_k3_allreduce_fallback_op_matrix.py",
     }
     assert sm100_tests | non_mnnvl_tests <= expected, (sm100_tests | non_mnnvl_tests) - expected
-    stages = parse_stages_from_groovy(repo / "jenkins/L0_Test.groovy")
+    stages = parse_stages(repo / "jenkins/scripts/test_stage_configs.json")
     seen = set()
     for block in index.blocks:
         for entry in block.tests:
