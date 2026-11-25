@@ -36,16 +36,16 @@ TensorRT LLM has all the essential capabilities to serve as the rollout engine i
 
 In MLPerf Training v6.1, MLCommons added a new benchmark: Qwen3.5-397B, a large-scale LLM post-training workload, a stage central to recent progress in agentic AI. In this benchmark, [Qwen3.5-397B-A17B](https://huggingface.co/Qwen/Qwen3.5-397B-A17B), an MoE model with 17B active parameters per token that combines Gated DeltaNet linear-attention layers with full-attention layers, is trained with Group Relative Policy Optimization (GRPO) to solve software engineering tasks. The score of this benchmark is the time to train for about 10 steps to reach a target accuracy, excluding validation time.
 
-In large-scale RL training, rollout is often the bottleneck: the throughput of the rollout engine sets the pace for the end-to-end time to train. At the same scale of 56 accelerators, **RL post-training on NVIDIA Vera Rubin with NeMo RL and TensorRT LLM ranks first at 28.47 minutes** ([our submission](https://results.mlcommons.org/training#view=submission&benchmark=qwen35_397b_grpo&rid=6.1-0119%3Aqwen35_397b_grpo), Figure 1), compared to submissions on NVIDIA GB300 and GB200 GPUs.
+In large-scale RL training, rollout is often the bottleneck: the throughput of the rollout engine sets the pace for the end-to-end time to train. At the same scale of 56 accelerators, **RL post-training on NVIDIA Vera Rubin with NeMo RL and TensorRT LLM achieves the fastest time to train at 28.47 minutes** ([our submission](https://results.mlcommons.org/training#view=submission&benchmark=qwen35_397b_grpo&rid=6.1-0119%3Aqwen35_397b_grpo), Figure 1), compared to submissions on NVIDIA GB300 and GB200 GPUs.
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog36_mlperf_56gpu_time_to_train.png" alt="Bar chart of Qwen3.5 397B GRPO time to train at 56 accelerators in MLPerf Training v6.1, with a legend: the NVIDIA Vera Rubin result with NeMo RL and TensorRT LLM, in green, ranks first at 28.47 min, ahead of four slower results from other submissions, in gray, between about 40 and 43 min. Each bar is labeled with its hardware (NVIDIA Rubin, GB300 or GB200) and its MLCommons submission ID" width="1000">
+  <img src="../media/tech_blog36_mlperf_56gpu_time_to_train.png" alt="Bar chart of Qwen3.5 397B GRPO time to train at 56 accelerators in MLPerf Training v6.1, with a legend: the NVIDIA Vera Rubin result with NeMo RL and TensorRT LLM, in green, is the fastest at 28.47 min, ahead of four slower results from other submissions, in gray, between about 40 and 43 min. Each bar is labeled with its hardware (NVIDIA Rubin, GB300 or GB200) and its MLCommons submission ID" width="1000">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 1: Time to train at the same scale of 56 accelerators in the Qwen3.5 397B GRPO benchmark. RL post-training on NVIDIA Vera Rubin with NeMo RL and TensorRT LLM (in green) ranks first at 28.47 minutes. Source: <a href="https://results.mlcommons.org/training#benchmark=qwen35_397b_grpo&amp;round=v6.1">MLCommons MLPerf Training v6.1 results</a> (<a href="https://results.mlcommons.org/training#view=submission&amp;benchmark=qwen35_397b_grpo&amp;rid=6.1-0119%3Aqwen35_397b_grpo">submission details</a>).<sup>1</sup></em></sub></p>
+<p align="center"><em>Figure 1: Time to train at the same scale of 56 accelerators in the Qwen3.5 397B GRPO benchmark. RL post-training on NVIDIA Vera Rubin with NeMo RL and TensorRT LLM (in green) achieves the fastest time to train at 28.47 minutes. Source: <a href="https://results.mlcommons.org/training#benchmark=qwen35_397b_grpo&amp;round=v6.1">MLCommons MLPerf Training v6.1 results</a> (<a href="https://results.mlcommons.org/training#view=submission&amp;benchmark=qwen35_397b_grpo&amp;rid=6.1-0119%3Aqwen35_397b_grpo">submission details</a>).<sup>1</sup></em></p>
 
-On NVIDIA Vera Rubin, **submissions that use TensorRT LLM as the rollout engine rank first at 56, 64 and 1,024 GPUs**. For example, a Nebius submission ([6.1-0135](https://results.mlcommons.org/training#view=submission&benchmark=qwen35_397b_grpo&rid=6.1-0135%3Aqwen35_397b_grpo)) using NeMo RL and TensorRT LLM reached 24.82 minutes at 64 GPUs (Figure 2).
+On NVIDIA Vera Rubin, **submissions that use TensorRT LLM as the rollout engine train the fastest at 56, 64 and 1,024 GPUs**. For example, a Nebius submission ([6.1-0135](https://results.mlcommons.org/training#view=submission&benchmark=qwen35_397b_grpo&rid=6.1-0135%3Aqwen35_397b_grpo)) using NeMo RL and TensorRT LLM reached 24.82 minutes at 64 GPUs (Figure 2).
 
 <div align="center">
 <figure>
@@ -53,7 +53,7 @@ On NVIDIA Vera Rubin, **submissions that use TensorRT LLM as the rollout engine 
 </figure>
 </div>
 
-<p align="center"><sub><em>Figure 2: Time to train on NVIDIA Vera Rubin GPUs with different rollout engines in the Qwen3.5 397B GRPO benchmark, grouped by accelerator count (56, 64 and 1,024 GPUs), showing the fastest result for each rollout engine. Gray bars are other NVIDIA submissions that also use NeMo RL with a different rollout engine. See all submission results for the GRPO track in the <a href="https://results.mlcommons.org/training#benchmark=qwen35_397b_grpo&amp;round=v6.1">MLPerf Training v6.1 results</a>.<sup>1</sup></em></sub></p>
+<p align="center"><em>Figure 2: Time to train on NVIDIA Vera Rubin GPUs with different rollout engines in the Qwen3.5 397B GRPO benchmark, grouped by accelerator count (56, 64 and 1,024 GPUs), showing the fastest result for each rollout engine. Gray bars are other NVIDIA submissions that also use NeMo RL with a different rollout engine. See all submission results for the GRPO track in the <a href="https://results.mlcommons.org/training#benchmark=qwen35_397b_grpo&amp;round=v6.1">MLPerf Training v6.1 results</a>.<sup>1</sup></em></p>
 
 The other performance numbers in this post, such as the percentage gains, timings and rollout breakdowns, are NVIDIA internal measurements. They are not MLPerf results and have not been verified by MLCommons.
 
@@ -68,7 +68,7 @@ In RL, a rollout is one attempt by the model to solve a task in an environment, 
   <img src="../media/tech_blog36_training_step.png" alt="Diagram of one training step. A rollout pool of two prefill servers and one decode server serves model calls from Gym and OpenHands and returns responses. Finished trajectories and rewards go to a replay buffer, which the training pool (logprobs, policy training, refit) collects 512 trajectories from, and new weights flow back to the rollout pool in-flight." width="1000">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 3: One training step in the 56-GPU recipe. Training pulls trajectories from the replay buffer while rollout keeps generating in the background, and a weight refit connects the two at every step.</em></sub></p>
+<p align="center"><em>Figure 3: One training step in the 56-GPU recipe. Training pulls trajectories from the replay buffer while rollout keeps generating in the background, and a weight refit connects the two at every step.</em></p>
 
 ### RL Rollout vs. Online Serving
 
@@ -92,7 +92,7 @@ In our 64-GPU setting, a rollout takes about 140 seconds, and most of that time 
   <img src="../media/tech_blog36_rollout_time_breakdown.png" alt="Timeline of the median rollout, 138.7 seconds, with lanes for model calls, tools and sandbox or evaluation, above a stacked bar of the mean rollout time: decode 76.2 s (54%), before the first token 20.1 s, sandbox up and down 14.7 s, tools 7.2 s, evaluation 8.7 s, agent loop and return 13.5 s." width="1000">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 4: An example of where rollout time goes: the timeline of the median rollout (top) and the mean time breakdown over 7K training rollouts (bottom), from a run on 64 GPUs.</em></sub></p>
+<p align="center"><em>Figure 4: An example of where rollout time goes: the timeline of the median rollout (top) and the mean time breakdown over 7K training rollouts (bottom), from a run on 64 GPUs.</em></p>
 
 ## Deriving the Recipe from a Latency Budget
 
@@ -117,7 +117,7 @@ For each layout, we first plot per-GPU throughput against rollout latency as we 
   <img src="../media/tech_blog36_latency_budget_curves.png" alt="Schematic of two curves of per-GPU throughput against rollout latency, one for aggregated tensor-parallel (TEP) deployments in green with a low latency floor and one for disaggregated expert-parallel (DEP) deployments in blue with a higher floor but much higher throughput. A long training step gives a loose budget where DEP serves it with the fewest GPUs. A short training step gives a tight budget that only TEP can meet, using many more GPUs." width="800">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 5: How the latency budget guides deployment selection (illustrative). Each line is one deployment option. Moving left along a line adds rollout GPUs, and moving right removes them.</em></sub></p>
+<p align="center"><em>Figure 5: How the latency budget guides deployment selection (illustrative). Each line is one deployment option. Moving left along a line adds rollout GPUs, and moving right removes them.</em></p>
 
 ### Step 3: Size the Prefill Servers and Balance
 
@@ -138,7 +138,7 @@ In attention data parallelism (ADP), each GPU serves its own requests but must e
   <img src="../media/tech_blog36_adp_decode_iteration.png" alt="Stacked bar of one 21.55 ms decode iteration before the optimization: compute 12.3 ms, exposed all-to-all 2.85 ms, exposed NCCL 3.5 ms, GPU idle 2.9 ms." width="800">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 6: One decode iteration of a 16-GPU decode server at a concurrency of 512, before the optimization, from a profiling trace.</em></sub></p>
+<p align="center"><em>Figure 6: One decode iteration of a 16-GPU decode server at a concurrency of 512, before the optimization, from a profiling trace.</em></p>
 
 We packed these checks into two synchronizations (Figure 7): the votes and per-GPU state needed at the start of a step go into one all-gather, and those needed after scheduling go into a second. This came on top of moving the underlying collectives from gloo over TCP to NCCL, the largest single win, which cut a busy 16-GPU decode step from about 88 to 15 ms. In the profiling trace, the step now needs about 7 all-gathers and no all-reduces, and GPU idle time fell from 2.9 to 0.7 ms. In a generation-only A/B test, building responses less often with `stream_interval=100` took an iteration from 16.6 to 14.3 ms, and packing the synchronizations brought it to 13.9 ms, about 16% faster in total. The packing lives in TensorRT LLM's `PyExecutor`, the Python executor loop that schedules and runs every iteration.
 
@@ -147,7 +147,7 @@ We packed these checks into two synchronizations (Figure 7): the votes and per-G
   <img src="../media/tech_blog36_adp_sync_packing.png" alt="Before, six separate synchronizations per step: a disaggregation error check, a KV transfer timeout check, per-GPU scheduling state, a request-count check, a can-accept-new-requests vote and CUDA graph padding. After, two combined all-gathers: one at the start of a step carrying the error check, the timeout and the scheduling state, and one after scheduling carrying the vote and the padding. The request-count check is skipped when a hint in the scheduling state answers it." width="800">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 7: Packing the synchronizations of attention data parallelism.</em></sub></p>
+<p align="center"><em>Figure 7: Packing the synchronizations of attention data parallelism.</em></p>
 
 ### Fixing the Host-Bound TEP Path (for 1,024 GPUs)
 
@@ -164,7 +164,7 @@ Gated DeltaNet (GDN) layers make up 45 of Qwen3.5-397B's 60 layers, and each run
   <img src="../media/tech_blog36_gdn_mixed_batch.png" alt="Before, a mixed batch of context and decode tokens goes through one chunked-prefill scan, and the input projection is two projections on separate streams that must join. After, context tokens go to chunked prefill and decode tokens to a recurrent decode kernel, and the input projection is one fused projection in a single launch." width="800">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 8: A mixed batch in a GDN layer before and after the change.</em></sub></p>
+<p align="center"><em>Figure 8: A mixed batch in a GDN layer before and after the change.</em></p>
 
 Together, these host-path changes cut the median host time of a mixed iteration by about 16–19%.
 
