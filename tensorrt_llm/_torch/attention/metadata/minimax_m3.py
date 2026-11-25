@@ -256,6 +256,18 @@ class MiniMaxM3MsaMetadata(Metadata):
         self._fill_tail_in_forward()
         self._update_kv_lens()
 
+    def _generation_block_offsets_need_capacity(self) -> bool:
+        """Whether generation block-offset rows need their configured capacity."""
+        return (
+            self.draft_kv_cache_manager is not None
+            or self.is_spec_decoding_enabled
+            or bool(self.kv_cache_params.num_extra_kv_tokens)
+            or (
+                self.runtime_features is not None
+                and self.runtime_features.has_speculative_draft_tokens
+            )
+        )
+
     def _update_kv_lens(self) -> None:
         """Patch lengths, slots and valid-block counts to kv_lens_cuda.
 

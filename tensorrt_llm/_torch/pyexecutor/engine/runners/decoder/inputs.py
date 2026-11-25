@@ -3621,6 +3621,8 @@ class DecoderInputPreparer:
             self._preprocess_feature_metadata(inputs, attn_meta, has_kv_lens_correction)
             if self.guided_decoder is not None:
                 self.guided_decoder.token_event.record()
+            if mark_prologue_start is not None:
+                mark_prologue_start(attn_meta)
             return inputs
         # Invalidate per-forward-pass caches so they are recomputed (and captured) on every _forward_step.
         # With a correction, the call after it does this: every on_update_kv_lens rebuilds

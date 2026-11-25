@@ -189,6 +189,9 @@ def build_feature_attention_metadata(
     from tensorrt_llm._torch.attention.metadata.sparse import SparseMetadata
     from tensorrt_llm._torch.attention.metadata.spec_decoding import SpecDecodingMetadata
     from tensorrt_llm._torch.metadata import KVCacheParams
+    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.locality_domain import (
+        locality_domain_forkjoin_enabled,
+    )
     from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
         BaseMambaCacheManager,
     )
@@ -219,6 +222,8 @@ def build_feature_attention_metadata(
         raise UnsupportedMetadataConfiguration("Helix context parallelism")
     if model_config.enable_flash_mla:
         raise UnsupportedMetadataConfiguration("FlashMLA")
+    if locality_domain_forkjoin_enabled(kv_cache_manager):
+        raise UnsupportedMetadataConfiguration("fork-join attention over locality domains")
 
     # CSA2 attends over its own staged selections and reads no MLA context tables.
     model_is_mla = is_mla(model_config.pretrained_config) and not is_csa2

@@ -18,8 +18,9 @@ from __future__ import annotations
 
 import functools
 import os
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 
 import tensorrt_llm.bindings
@@ -183,6 +184,9 @@ class DSAMetadata(Metadata):
         self._group_remap_struct = None
         self._group_remap_struct_kv_id = 0
         self._group_remap_batched = {}
+        # Group leaders that did not publish their generation top-k this
+        # forward, each with the layer its group ends before.
+        self._skipped_topk_groups: Dict[int, int] = {}
         self._fused_decode_metadata_logged = False
 
         self._create_buffers(manager)
@@ -292,16 +296,45 @@ class DSAMetadata(Metadata):
         self.radix_aux_indices = self.get_buffer(radix_shape, torch.int32, "radix_aux_indices")
         self.radix_aux_logits = self.get_buffer(radix_shape, torch.float32, "radix_aux_logits")
         # FP8 rows an NVFP4 latent cache is dequantized into for generation.
-        if getattr(manager, "dtype", None) == tensorrt_llm.bindings.DataType.NVFP4:
-            max_gen_tokens = max_sequences * rows_per_sequence
-            self.nvfp4_mla_fp8_scratch = self.get_buffer(
-                (max_gen_tokens, self.num_sparse_topk, manager.head_dim),
-                torch.float8_e4m3fn,
-                "nvfp4_mla_fp8_scratch",
+        # PrimTS reads the records in place, so generation then gathers no
+        # rows; a layer that gathers nevertheless calls
+        # ensure_nvfp4_mla_generation_buffers.
+        from ..backends.fmha.prims_ts_dsa_sparse_mla import prims_ts_reads_nvfp4_mla_records
+
+        if getattr(
+            manager, "dtype", None
+        ) == tensorrt_llm.bindings.DataType.NVFP4 and not prims_ts_reads_nvfp4_mla_records(self):
+            self._allocate_nvfp4_mla_generation_buffers()
+
+    def ensure_nvfp4_mla_generation_buffers(self) -> None:
+        """Allocate the gather outputs for a layer that gathers after creation left them out.
+
+        Creation decides without the attention layers. A layer whose FMHA list
+        lacks the PrimTS record reader gathers although this metadata expected
+        the records to be read in place. The first such step allocates the
+        rows, in eager execution: CUDA graph capture needs their addresses
+        fixed beforehand.
+        """
+        if self.nvfp4_mla_fp8_scratch is not None and self.nvfp4_mla_compact_indices is not None:
+            return
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "NVFP4 MLA gather buffers must be allocated during eager warmup, not under "
+                "CUDA graph capture"
             )
-            self.nvfp4_mla_compact_indices = self.get_buffer(
-                (max_gen_tokens, self.num_sparse_topk), torch.int32, "nvfp4_mla_compact_indices"
-            )
+        self._allocate_nvfp4_mla_generation_buffers()
+
+    def _allocate_nvfp4_mla_generation_buffers(self) -> None:
+        manager = self._core.kv_cache_manager
+        max_gen_tokens = self.config.max_num_sequences * (1 + self.max_draft_tokens)
+        self.nvfp4_mla_fp8_scratch = self.get_buffer(
+            (max_gen_tokens, self.num_sparse_topk, manager.head_dim),
+            torch.float8_e4m3fn,
+            "nvfp4_mla_fp8_scratch",
+        )
+        self.nvfp4_mla_compact_indices = self.get_buffer(
+            (max_gen_tokens, self.num_sparse_topk), torch.int32, "nvfp4_mla_compact_indices"
+        )
 
     @property
     def use_cute_dsl_paged_mqa_logits(self) -> bool:
@@ -346,8 +379,8 @@ class DSAMetadata(Metadata):
     def prepare_req_idx_per_token(self) -> None:
         core = self._core
         num_tokens = core.num_tokens
-        self.host_req_idx_per_token[:num_tokens] = torch.repeat_interleave(
-            torch.arange(core.num_seqs, dtype=torch.int32), core.seq_lens, dim=0
+        self.host_req_idx_per_token.numpy()[:num_tokens] = np.repeat(
+            np.arange(core.num_seqs, dtype=np.int32), core.seq_lens.numpy()
         )
         self.req_idx_per_token[:num_tokens].copy_(
             self.host_req_idx_per_token[:num_tokens], non_blocking=True
@@ -548,7 +581,7 @@ class DSAMetadata(Metadata):
             ),
             non_blocking=True,
         )
-        if self.max_draft_tokens > 0:
+        if self.max_draft_tokens > 0 and not self.use_cute_dsl_paged_mqa_logits:
             self.scheduler_metadata_buffer_full_next_n.copy_(
                 get_paged_mqa_logits_metadata(
                     scheduler_context_lens.contiguous(), _DG_SCHEDULE_BLOCK_KV, self.num_sms
@@ -638,6 +671,7 @@ class DSAMetadata(Metadata):
     def _invalidate_pool_view_cache(self) -> None:
         self._pool_cache_valid = False
         self._group_remap_batched.clear()
+        self._skipped_topk_groups = {}
         self.nvfp4_mla_context_fp8_scratch = None
 
     def _ensure_pool_view_cached(self) -> None:
@@ -663,6 +697,51 @@ class DSAMetadata(Metadata):
         )
         self._cached_kv_mgr_id = id(manager)
         self._pool_cache_valid = True
+
+    def skip_shared_topk_copy(
+        self, local_layer_idx: int, topk_shape: Tuple[int, ...], *, group_remap: bool
+    ) -> bool:
+        """Record whether this leader skips publishing generation top-k for its followers.
+
+        The copy is kept until the group layout of the current cache manager is built.
+        """
+        self._skipped_topk_groups.pop(local_layer_idx, None)
+        if not group_remap:
+            return False
+        struct = self._group_remap_struct
+        shared_topk_indices = self.shared_topk_indices
+        core = self._core
+        if (
+            struct is None
+            or self._group_remap_struct_kv_id != id(core.kv_cache_manager)
+            or shared_topk_indices is None
+        ):
+            return False
+        leader_of = struct.get("leader_of")
+        if (
+            leader_of is None
+            or not 0 <= local_layer_idx < len(leader_of)
+            or leader_of[local_layer_idx] != local_layer_idx
+        ):
+            return False
+        if struct["group_active"].get(local_layer_idx, False) and topk_shape == (
+            core.num_tokens - core.num_ctx_tokens,
+            shared_topk_indices.shape[1],
+        ):
+            self._skipped_topk_groups[local_layer_idx] = (
+                local_layer_idx + struct["group_size"][local_layer_idx]
+            )
+            return True
+        return False
+
+    def check_shared_topk_fallback(self, local_layer_idx: int) -> None:
+        """Fail when a layer needs the local top-k that its group's leader did not publish."""
+        for leader, end in self._skipped_topk_groups.items():
+            if leader < local_layer_idx < end:
+                raise RuntimeError(
+                    f"DSA layer {local_layer_idx} needs local TopK, but leader {leader} "
+                    "skipped the copy"
+                )
 
     def _ensure_group_remap_struct(self) -> dict:
         """Layout of the full + shared indexer layer groups (built once).

@@ -62,10 +62,14 @@ class TrtllmCoreMetadata(Metadata):
     block_ids_per_seq = None
     flash_mla_tile_scheduler_metadata = None
     flash_mla_num_splits = None
-    decode_kv_regime = None
     # The draft loop never modifies this metadata, so there is nothing to restore.
     has_spec_dec_saved_state = False
-    decode_packed_split = None
+    # Attention is never split across locality domains on this metadata.
+    locality_domain_enabled = False
+    locality_domain_gen_req_splits = None
+    locality_domain_gen_token_splits = None
+    locality_domain_spec_decoding_bl_tree_masks = None
+    locality_domain_cute_dsl_mla_split_plans = None
 
     def __init__(self, registry: _Registry, config: "BatchInputs") -> None:
         super().__init__(registry, config)
@@ -405,11 +409,14 @@ class TrtllmCoreMetadata(Metadata):
         max_draft_tokens: int = 0,
         buffers: Any = None,
         encode_only: bool = False,
+        forward_scratch_buffers: Any = None,
     ) -> "TrtllmCoreMetadata":
         """Metadata of one generation-only CUDA graph batch size.
 
         A CUDA graph captures the addresses of the metadata buffers, so each
         captured batch size gets metadata of its own, built from ``buffers``.
+        ``forward_scratch_buffers`` holds per-forward scratch of FP4 MLA,
+        which this metadata does not cover.
         """
         if self.is_cuda_graph:
             return self
@@ -426,15 +433,22 @@ class TrtllmCoreMetadata(Metadata):
         )
         return graph_metadata
 
+    def set_decode_graph_variant(self, name: str, value: Optional[int]) -> None:
+        """Fix a decode graph variant for the CUDA graph this metadata serves.
+
+        Raises:
+            ValueError: Always; the attention backends this metadata covers
+                declare no decode graph variant.
+        """
+        raise ValueError(f"{type(self).__name__} serves no decode graph variant {name!r}.")
+
+    def decode_graph_variant(self, name: str) -> Optional[int]:
+        """The value set by set_decode_graph_variant; None, as none is served."""
+        return None
+
     def init_cuda_graph_metadata(self, graph_metadata: "TrtllmCoreMetadata") -> None:
         graph_metadata.workspace = self.workspace
         graph_metadata.cuda_graph_workspace = self.cuda_graph_workspace
-
-    def set_decode_kv_regime(self, kv_regime: Optional[int]) -> None:
-        """The decode path of this backend does not depend on the KV regime."""
-
-    def set_decode_packed_split(self, packed_split: Optional[bool]) -> None:
-        """This backend has no split decode."""
 
     def support_steady_gen_step(self) -> bool:
         return False
