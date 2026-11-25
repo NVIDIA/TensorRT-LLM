@@ -683,3 +683,116 @@ def test_script_lpips_failure_precedes_generator_initialization(tmp_path, monkey
     )
     with pytest.raises(ImportError, match="missing LPIPS"):
         module._evaluate(args)
+
+
+def test_latent_rmse_modalities_and_precision(tmp_path):
+    import torch
+    from safetensors.torch import save_file
+
+    from tensorrt_llm.evaluate.visual_gen.rmse import score_latent_files
+
+    reference, candidate = tmp_path / "ref.safetensors", tmp_path / "test.safetensors"
+    save_file(
+        {"video_latent": torch.zeros(2, dtype=torch.bfloat16), "audio_latent": torch.ones(3)},
+        str(reference),
+    )
+    save_file(
+        {
+            "video_latent": torch.tensor([3.0, 4.0], dtype=torch.bfloat16),
+            "audio_latent": torch.full((3,), 3.0),
+        },
+        str(candidate),
+    )
+    assert score_latent_files(candidate, reference) == pytest.approx(
+        {"video_latent_rmse": (12.5**0.5), "audio_latent_rmse": 2.0}
+    )
+    assert set(score_latent_files(reference, reference).values()) == {0.0}
+
+
+@pytest.mark.parametrize(
+    "bad, message",
+    [
+        ({"video_latent": [float("nan"), 0.0]}, "NaN"),
+        ({"video_latent": []}, "non-empty"),
+        ({"video_latent": [1.0]}, "shape mismatch"),
+        ({"video": [1.0, 2.0]}, "expected video_latent"),
+        ({"video_latent": [1.0, 2.0], "audio_latent": [1.0]}, "modalities differ"),
+    ],
+)
+def test_latent_rmse_rejects_invalid_pairs(tmp_path, bad, message):
+    import torch
+    from safetensors.torch import save_file
+
+    from tensorrt_llm.evaluate.visual_gen.rmse import score_latent_files
+
+    reference, candidate = tmp_path / "ref.safetensors", tmp_path / "test.safetensors"
+    save_file({"video_latent": torch.zeros(2)}, str(reference))
+    save_file({key: torch.tensor(value) for key, value in bad.items()}, str(candidate))
+    with pytest.raises(ValueError, match=message):
+        score_latent_files(candidate, reference)
+
+
+def test_cli_generates_latents_for_rmse(tmp_path, monkeypatch):
+    import torch
+    from safetensors.torch import save_file
+
+    from tensorrt_llm.visual_gen import VisualGenParams
+
+    baseline = tmp_path / "baseline"
+    baseline.mkdir()
+    save_file(
+        {"video_latent": torch.zeros(2), "audio_latent": torch.ones(2)},
+        str(baseline / "0000.safetensors"),
+    )
+    prompts = tmp_path / "prompts.txt"
+    prompts.write_text("A fox")
+    options = tmp_path / "rmse.yaml"
+    options.write_text("reference_dir: baseline\n")
+    params = VisualGenParams()
+    closed = []
+
+    def generate(**kwargs):
+        assert kwargs["params"].extra_params["output_type"] == "latent"
+        assert kwargs["params"].seed == 42
+        return [SimpleNamespace(error=None, video=torch.ones(2), audio=torch.full((2,), 3.0))]
+
+    generator = SimpleNamespace(generate=generate, close=lambda: closed.append(True))
+    monkeypatch.setattr(cli, "build_visual_generator", lambda *args: (generator, params))
+    result = CliRunner().invoke(
+        cli.VideoGenerationEval.command,
+        [
+            "--evaluator",
+            "rmse",
+            "--prompts",
+            str(prompts),
+            "--evaluator-options",
+            str(options),
+            "--output-dir",
+            str(tmp_path / "output"),
+        ],
+        obj={"model": "MiniMax-H3"},
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads((tmp_path / "output/results.json").read_text())
+    assert payload["aggregate_scores"] == {"video_latent_rmse": 1.0, "audio_latent_rmse": 2.0}
+    assert payload["results"][0]["latent_path"] == "generated_latents/0000.safetensors"
+    assert closed == [True]
+    options.write_text("reference_dir: baseline\ngenerated_dir: output/generated_latents\n")
+    result = CliRunner().invoke(
+        cli.VideoGenerationEval.command,
+        [
+            "--evaluator",
+            "rmse",
+            "--prompts",
+            str(prompts),
+            "--evaluator-options",
+            str(options),
+            "--output-dir",
+            str(tmp_path / "offline"),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert (
+        json.loads((tmp_path / "offline/results.json").read_text())["aggregate_scores"]
+        == payload["aggregate_scores"]
+    )

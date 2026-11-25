@@ -9,6 +9,7 @@
   - [Qwen Image Bench](#qwen-image-bench)
 - [Video generation evaluation](#video-generation-evaluation)
   - [LPIPS](#lpips)
+  - [Latent RMSE](#latent-rmse)
 
 `image_generation_eval` and `video_generation_eval` use two separate configurations:
 
@@ -165,3 +166,89 @@ lower is better. Reference and generated videos must have equal frame rates,
 frame counts, and dimensions. Empty videos and non-finite scores are rejected;
 frames are not resized, trimmed, or temporally aligned. The reported aggregate is
 the mean of the per-video scores; the command does not apply a quality threshold.
+
+### Latent RMSE
+
+`--evaluator rmse` measures numerical drift in **final denoising latents**, before
+VAE decoding. It reports `video_latent_rmse` and, when present, `audio_latent_rmse`
+separately: `sqrt(mean((candidate - reference)**2))`. Arithmetic uses CPU float64;
+the summary is the arithmetic mean of per-prompt RMSE values, not a pooled RMSE.
+Lower is closer to the reference, but this is not a perceptual quality score.
+
+The generator must support `extra_params.output_type: latent` (including MiniMax
+H3). The evaluator selects this option automatically during generation. Latent
+files use prompt order (`0000.safetensors`, `0001.safetensors`, ...), with named
+`video_latent` and optional `audio_latent` tensors. Decoded videos and tensors
+saved from normal decoded outputs are not valid latent baselines. Both sides
+must contain the same modalities and exact shapes; no resizing or truncation is
+performed. Empty tensors and nonfinite values are rejected.
+
+For example, to compare H3 dynamic FP8 against a BF16 baseline:
+
+```yaml
+# rmse.yaml
+reference_dir: /path/to/bf16_latents
+# Optional: score already generated latent files instead of generating them.
+# generated_dir: /path/to/fp8_latents
+```
+
+```yaml
+# fp8.yaml
+quant_config:
+  quant_algo: FP8_BLOCK_SCALES
+  dynamic: true
+generation_params:
+  seed: 42
+  height: 768
+  width: 1344
+  num_frames: 124
+  frame_rate: 24
+  num_inference_steps: 50
+```
+
+To generate and score:
+
+```bash
+trtllm-eval --model /path/to/MiniMax-H3 video_generation_eval \
+  --evaluator rmse --config fp8.yaml --evaluator-options rmse.yaml \
+  --prompts prompts.json --output-dir results/fp8
+```
+
+New tensors are saved in `results/fp8/generated_latents/`, with per-prompt scores
+and generation parameters in the JSON reports. To score existing tensors, set
+`generated_dir` in `rmse.yaml` and omit `--config`; the root command still requires
+`--model`, although it does not load that model in existing-file mode.
+
+Generate the BF16 reference once using the same checkpoint and generation
+settings, without `quant_config`. For example, save the matching settings above
+as `bf16.yaml` and use the evaluation helpers:
+
+```python
+from pathlib import Path
+
+from tensorrt_llm.evaluate.visual_gen.config import load_prompt_records
+from tensorrt_llm.evaluate.visual_gen.generators import build_visual_generator
+from tensorrt_llm.evaluate.visual_gen.rmse import save_latents
+
+_, prompts = load_prompt_records("prompts.json", None)
+reference_dir = Path("bf16_latents")
+reference_dir.mkdir(parents=True, exist_ok=True)
+generator, params = build_visual_generator("/path/to/MiniMax-H3", "bf16.yaml")
+try:
+    params.extra_params = {**(params.extra_params or {}), "output_type": "latent"}
+    for index, prompt in enumerate(prompts):
+        output = generator.generate([prompt], params)[0]
+        if output.error:
+            raise RuntimeError(output.error)
+        save_latents(output, reference_dir / f"{index:04d}.safetensors")
+finally:
+    generator.close()
+```
+
+Use the same prompt order, seed, dimensions, frame count, scheduler settings,
+conditioning, model revision, and runtime settings on both sides, changing only
+the intended quantization setting. File pairing validates shapes and modalities;
+it cannot prove that independently supplied baselines used matching settings.
+H3 latent output excludes fixed conditioning rows and retains the final scheduler
+outputs for video and audio. It does not compare intermediate denoising steps or
+teacher-forced trajectories.

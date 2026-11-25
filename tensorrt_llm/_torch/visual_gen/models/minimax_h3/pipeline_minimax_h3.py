@@ -433,16 +433,24 @@ class MiniMaxH3Pipeline(BasePipeline):
 
     @property
     def extra_param_specs(self) -> dict[str, ExtraParamSchema]:
+        specs = {
+            "output_type": ExtraParamSchema(
+                type="str",
+                default="pt",
+                description="Return decoded media (pt) or final denoising tensors (latent).",
+            ),
+        }
         if self.workflow != "ref2va":
-            return {}
+            return specs
         return {
+            **specs,
             "reference_order": ExtraParamSchema(
                 type="list",
                 default=None,
                 validator=validate_reference_order,
                 description="Ordered image:N/video:N/audio:N references (zero-based); "
                 "defaults to images, videos, then audio, preserving each slot's order.",
-            )
+            ),
         }
 
     def load_transformer_weights(self, checkpoint_dir: str) -> dict:
@@ -798,6 +806,7 @@ class MiniMaxH3Pipeline(BasePipeline):
             num_inference_steps=req.params.num_inference_steps,
             keyframes=keyframes,
             keyframe_anchors=keyframe_anchors,
+            output_type=(req.params.extra_params or {}).get("output_type", "pt"),
         )
 
     def _validate_request(
@@ -1222,6 +1231,7 @@ class MiniMaxH3Pipeline(BasePipeline):
         keyframes: Optional[list[Image.Image]] = None,
         keyframe_anchors: Optional[tuple[str, ...]] = None,
         references: Optional[list] = None,
+        output_type: str = "pt",
     ) -> PipelineOutput:
         manager = getattr(self, "_sleep_manager", None)
         with manager.generation() if manager is not None else nullcontext():
@@ -1236,6 +1246,7 @@ class MiniMaxH3Pipeline(BasePipeline):
                 keyframes=keyframes,
                 keyframe_anchors=keyframe_anchors,
                 references=references,
+                output_type=output_type,
             )
 
     def _forward(
@@ -1251,7 +1262,10 @@ class MiniMaxH3Pipeline(BasePipeline):
         keyframes: Optional[list[Image.Image]] = None,
         keyframe_anchors: Optional[tuple[str, ...]] = None,
         references: Optional[list] = None,
+        output_type: str = "pt",
     ) -> PipelineOutput:
+        if output_type not in ("pt", "latent"):
+            raise ValueError("MiniMax-H3 output_type must be 'pt' or 'latent'.")
         pipeline_start = time.time()
         timer = CudaPhaseTimer()
         timer.mark_pre_start()
@@ -1444,6 +1458,12 @@ class MiniMaxH3Pipeline(BasePipeline):
                 extra_streams={"audio": (audio_latents[None], self.audio_scheduler)},
                 extra_stream_timesteps={"audio": self.audio_scheduler.timesteps},
             )
+        if output_type == "latent":
+            # Keep the batch axis and exclude fixed conditioning rows: these are
+            # the final scheduler outputs, before either VAE decoder.
+            timer.mark_post_start()
+            timer.mark_end()
+            return timer.fill(PipelineOutput(video=generated_latents, audio=extra_latents["audio"]))
         latents = torch.cat((condition_prefix, generated_latents), dim=1)[0]
         audio_latents = extra_latents["audio"][0]
         timer.mark_post_start()

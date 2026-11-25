@@ -23,7 +23,7 @@ class VideoGenerationEval:
     )
     @click.option(
         "--evaluator",
-        type=click.Choice(["lpips"]),
+        type=click.Choice(["lpips", "rmse"]),
         default="lpips",
         show_default=True,
         help="Video scoring metric.",
@@ -32,7 +32,10 @@ class VideoGenerationEval:
         "--evaluator-options",
         required=True,
         type=click.Path(exists=True, dir_okay=False),
-        help="Evaluator YAML: reference_dir and optional generated_dir; files use prompt order (0000.mp4, ...).",
+        help=(
+            "Evaluator YAML: reference_dir and optional generated_dir; files use prompt order "
+            "(0000.mp4 for LPIPS, 0000.safetensors for latent RMSE)."
+        ),
     )
     @click.option(
         "--prompts",
@@ -73,14 +76,15 @@ class VideoGenerationEval:
         base_dir = Path(evaluator_options).resolve().parent
         generated_dir = config.pop("generated_dir", None)
         existing = generated_dir is not None
+        suffix = ".safetensors" if evaluator == "rmse" else ".mp4"
         if existing:
             media = resolve_video_directory(generated_dir, base_dir, "generated_dir")
-            paths = ordered_video_paths(media, len(ids))
+            paths = ordered_video_paths(media, len(ids), suffix)
         else:
             if not root.get("model"):
                 raise click.UsageError("--model is required when generated_dir is omitted.")
-            media = output / "generated_videos"
-            paths = [media / f"{index:04d}.mp4" for index in range(len(ids))]
+            media = output / ("generated_latents" if evaluator == "rmse" else "generated_videos")
+            paths = [media / f"{index:04d}{suffix}" for index in range(len(ids))]
         metric = build_video_evaluator(
             evaluator, config, base_dir, ids, output_paths=None if existing else paths
         )
@@ -90,6 +94,8 @@ class VideoGenerationEval:
         try:
             if not existing:
                 generator, params = build_visual_generator(root["model"], generator_config)
+                if evaluator == "rmse":
+                    params.extra_params = {**(params.extra_params or {}), "output_type": "latent"}
                 if params.seed is None:
                     params.seed = 42
                 generation_params = params.model_dump(mode="json", exclude_none=True)
@@ -108,15 +114,23 @@ class VideoGenerationEval:
                             item = generated[0]
                             if item.error or item.video is None:
                                 raise ValueError(item.error or "Generator returned no video")
-                            item.save(path)
+                            if evaluator == "rmse":
+                                from .rmse import save_latents
+
+                                save_latents(item, path)
+                            else:
+                                item.save(path)
+                        scores = metric.evaluate(prompt_id, prompt, path)
+                        if results and scores.keys() != results[0]["scores"].keys():
+                            raise ValueError("Scored modalities must match across all prompts")
                         results.append(
                             {
                                 "id": prompt_id,
                                 "prompt": prompt,
-                                "video_path": str(path)
+                                ("latent_path" if evaluator == "rmse" else "video_path"): str(path)
                                 if existing
                                 else str(path.relative_to(output)),
-                                "scores": metric.evaluate(prompt_id, prompt, path),
+                                "scores": scores,
                             }
                         )
                     except (ValueError, RuntimeError, OSError) as exc:

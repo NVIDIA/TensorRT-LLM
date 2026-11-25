@@ -96,9 +96,9 @@ def resolve_video_directory(value: str, base_dir: Path, name: str) -> Path:
     return path.resolve()
 
 
-def ordered_video_paths(directory: Path, count: int) -> list[Path]:
-    """Resolve zero-padded MP4 filenames in prompt order, starting at 0000.mp4."""
-    paths = [directory / f"{index:04d}.mp4" for index in range(count)]
+def ordered_video_paths(directory: Path, count: int, suffix: str = ".mp4") -> list[Path]:
+    """Resolve zero-padded artifact filenames in prompt order, starting at 0000."""
+    paths = [directory / f"{index:04d}{suffix}" for index in range(count)]
     missing = [path.name for path in paths if not path.is_file()]
     if missing:
         raise click.BadParameter(f"Missing videos in {directory}: {', '.join(missing)}")
@@ -113,15 +113,20 @@ def build_video_evaluator(
     *,
     output_paths: list[Path] | None = None,
 ) -> VideoEvaluator:
-    if name != "lpips":
-        raise click.BadParameter("Supported video evaluator: lpips", param_hint="--evaluator")
-    unknown = set(config) - {"reference_dir", "net", "device"}
+    if name not in ("lpips", "rmse"):
+        raise click.BadParameter(
+            "Supported video evaluators: lpips, rmse", param_hint="--evaluator"
+        )
+    allowed = {"reference_dir", "net", "device"} if name == "lpips" else {"reference_dir"}
+    unknown = set(config) - allowed
     if unknown:
-        raise click.BadParameter(f"Unknown LPIPS options: {sorted(unknown)}")
+        raise click.BadParameter(f"Unknown {name.upper()} options: {sorted(unknown)}")
     if len(set(prompt_ids)) != len(prompt_ids):
         raise click.BadParameter("Prompt IDs must be unique", param_hint="--prompts")
     directory = resolve_video_directory(config.get("reference_dir"), base_dir, "reference_dir")
-    paths = ordered_video_paths(directory, len(prompt_ids))
+    paths = ordered_video_paths(
+        directory, len(prompt_ids), ".safetensors" if name == "rmse" else ".mp4"
+    )
     if output_paths is not None:
         resolved_references = {path.resolve() for path in paths}
         reference_files = {(path.stat().st_dev, path.stat().st_ino) for path in paths}
@@ -135,6 +140,10 @@ def build_video_evaluator(
                     f"Generated output would overwrite a reference video: {path}",
                     param_hint="--output-dir",
                 )
+    if name == "rmse":
+        from .rmse import LatentRMSEEvaluator
+
+        return LatentRMSEEvaluator(dict(zip(prompt_ids, paths, strict=True)))
     net = config.get("net", "alex")
     device = config.get("device", "cpu")
     if net not in ("alex", "vgg", "squeeze"):
