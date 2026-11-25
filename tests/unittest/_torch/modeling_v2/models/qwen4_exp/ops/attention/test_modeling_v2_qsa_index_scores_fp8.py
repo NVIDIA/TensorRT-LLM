@@ -128,3 +128,39 @@ def test_replay_matches_eager():
     torch.cuda.synchronize()
     eager = qsa_index_scores_fp8(**args)
     _visible_close(captured, eager.double(), args["query_positions"])
+
+
+@pytest.mark.parametrize(
+    "requests, rpr",
+    [
+        (tuple((900 + 7919 * r, 4) for r in range(12)), 4),  # dep verify, 12 runs of 4
+        (tuple((2000 + 4800 * r, 1) for r in range(52)), 1),  # draft rows, 52 runs of 1
+        (tuple((300 + 997 * r, 4) for r in range(64)), 4),  # 256 rows, the most it serves
+    ],
+    ids=["verify12", "draft52", "verify64"],
+)
+def test_flat_is_bitwise_the_group_kernel(requests, rpr):
+    spec = _module._scores_spec(requests=requests, rows_per_request=rpr, table=8196)
+    args, _, _ = build(spec, seed=13)
+    q = args["q"]
+    assert (
+        _module._flat_refusal(
+            q,
+            args["index_cache"],
+            args["block_table"],
+            args["query_positions"],
+            args["request_indices"],
+            TPB,
+            RATIO,
+            rpr,
+        )  # fmt: skip
+        is None
+    )
+    flat = qsa_index_scores_fp8(**args)
+    group = _module._qsa_index_scores_fp8(
+        q, args["index_cache"], args["block_table"], args["query_positions"],
+        args["request_indices"], TPB, RATIO, True, False, rpr,
+    )  # fmt: skip
+    for r in range(flat.shape[0]):
+        v = (int(args["query_positions"][r]) + 1) // RATIO
+        assert torch.equal(flat[r, :v], group[r, :v])

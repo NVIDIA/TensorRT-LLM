@@ -17,9 +17,13 @@ exact against the fp32 reference over the rounded operands up to fp32 summation 
 (dep4, MTP-3, 96 requests a rank): the index-score kernels of a step 2.19 -> 1.82 ms; a 16384-row
 context step's twelve calls 14.9 ms on the bf16 query-tiled kernel, 9.5 ms on the ctx-tile kernel
 here. GSM8K 95.91 / 95.98; the AgentX top-2048 block overlap with bf16 keys p50 0.976.
+Decode-sized generation calls run on a flat grid of a fixed number of programs, bitwise the
+request-group kernel's scores (`_qsa_index_scores_flat_kernel`).
 """
 
 from __future__ import annotations
+
+import functools
 
 import torch
 import triton
@@ -487,6 +491,307 @@ def _qsa_index_scores_fp8_ctx_tile(
     return output
 
 
+#: The flat grid (`_qsa_index_scores_flat_kernel`): bitwise the request-group kernel's scores for a
+#: decode-sized call (the same 128-block tiles, dot shapes and warps), on a fixed grid of
+#: `_FLAT_PROGRAMS_PER_SM` programs an SM that split the concatenated tiles of every run evenly,
+#: instead of one program a (run, column range of the whole table) of which the far ones only
+#: exit; the query is rounded to e4m3 in the kernel. GB300, one layer: 8 / 16 / 32 / 48 requests
+#: 32.6 / 40.2 / 53.5 / 73.2 us on spread contexts with 608 programs (1216: 34.3 / 42.3 / 56.2 /
+#: 76.2). Warps are the group kernel's (another count adds the dot in another order).
+_FLAT_PROGRAMS_PER_SM = 4
+_FLAT_HEADS = 4
+_FLAT_MAX_GROUP_ROWS = 4
+_FLAT_MAX_ROWS = 256
+_FLAT_MAX_RUNS = 64
+_FLAT_WARPS = 4
+
+
+@functools.lru_cache(maxsize=None)
+def _sm_count(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+@triton.jit(
+    do_not_specialize=[
+        "rows",
+        "max_blocks",
+        "q_stride_row",
+        "q_stride_head",
+        "cache_stride_page16",
+        "cache_stride_token16",
+        "block_table_stride_request",
+        "output_stride_row4",
+    ],
+    do_not_specialize_on_alignment=["block_table", "query_positions", "request_indices"],
+)
+def _qsa_index_scores_flat_kernel(
+    q,
+    cache8,
+    block_table,
+    query_positions,
+    request_indices,
+    output,
+    score_scale,
+    rows,
+    max_blocks,
+    q_stride_row,
+    q_stride_head,
+    cache_stride_page16,
+    cache_stride_token16,
+    block_table_stride_request,
+    output_stride_row4,
+    NUM_INDEX_HEADS: tl.constexpr,
+    INDEX_HEAD_DIM: tl.constexpr,
+    TOKENS_PER_BLOCK: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+    GROUP_ROWS: tl.constexpr,
+    BLOCK_G: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    MAX_GROUPS: tl.constexpr,
+    PROGRAMS: tl.constexpr,
+    ROW_BY_ROW: tl.constexpr,
+):
+    """e4m3 keys (the first INDEX_HEAD_DIM bytes of each anchor slot) x the bf16 query rounded
+    to e4m3 here. Program `pid` takes tiles [pid * chunk, (pid + 1) * chunk) of the runs' tiles
+    laid end to end; a run is GROUP_ROWS consecutive rows. Scores are written at each row's
+    visible blocks only."""
+    BLOCK_H: tl.constexpr = BLOCK_G * NUM_INDEX_HEADS
+    pid = tl.program_id(0)
+    # Every run's visible bound (the largest of its rows') and tile count, then this program's
+    # share of the concatenated tiles.
+    g = tl.arange(0, MAX_GROUPS)
+    slots = tl.arange(0, BLOCK_G)
+    all_rows = g[:, None] * GROUP_ROWS + slots[None, :]
+    all_ok = (slots[None, :] < GROUP_ROWS) & (all_rows < rows)
+    all_pos = tl.load(query_positions + all_rows, mask=all_ok, other=-1)
+    all_vis = tl.where(
+        all_ok,
+        tl.maximum(tl.minimum((all_pos + 1) // COMPRESS_RATIO, max_blocks), 0).to(tl.int32),
+        0,
+    )
+    g_tiles = (tl.max(all_vis, axis=1) + (BLOCK_N - 1)) // BLOCK_N
+    cum = tl.cumsum(g_tiles, axis=0)
+    total = tl.sum(g_tiles, axis=0)
+    chunk = tl.maximum((total + (PROGRAMS - 1)) // PROGRAMS, 1)
+    start = pid * chunk
+    if start >= total:
+        return
+    end = tl.minimum(start + chunk, total)
+    # The runs holding tiles `start` and `end - 1`: the first whose prefix sum exceeds each.
+    g_first = tl.sum((cum <= start).to(tl.int32), axis=0)
+    g_last = tl.sum((cum <= end - 1).to(tl.int32), axis=0)
+
+    dim_offsets = tl.arange(0, INDEX_HEAD_DIM)
+    # Dot column c is head c % heads of the run's row c // heads.
+    columns = tl.arange(0, BLOCK_H)
+    column_slot = columns // NUM_INDEX_HEADS
+    block_offsets = tl.arange(0, BLOCK_N)
+    for grp in tl.range(g_first, g_last + 1):
+        mine = g == grp
+        before = tl.sum(tl.where(mine, cum - g_tiles, 0), axis=0)
+        ntiles = tl.sum(tl.where(mine, g_tiles, 0), axis=0)
+        first_tile = tl.maximum(start - before, 0)
+        last_tile = tl.minimum(end - before, ntiles)
+        group_rows = grp * GROUP_ROWS + slots
+        row_ok = (slots < GROUP_ROWS) & (group_rows < rows)
+        lead = tl.load(request_indices + grp * GROUP_ROWS).to(tl.int64)
+        positions = tl.load(query_positions + group_rows, mask=row_ok, other=0)
+        # int32, bounded by the table: every per-block compare below stays 32-bit.
+        visible = tl.where(
+            row_ok,
+            tl.maximum(tl.minimum((positions + 1) // COMPRESS_RATIO, max_blocks), 0).to(tl.int32),
+            0,
+        )
+        max_visible = tl.max(visible, axis=0)
+        column_rows = grp * GROUP_ROWS + column_slot
+        column_ok = (column_slot < GROUP_ROWS) & (column_rows < rows)
+        query_values = tl.load(
+            q
+            + column_rows[None, :] * q_stride_row
+            + dim_offsets[:, None]
+            + (columns % NUM_INDEX_HEADS)[None, :] * q_stride_head,
+            mask=column_ok[None, :],
+            other=0.0,
+        ).to(tl.float8e4nv)
+        if ROW_BY_ROW:
+            # A run whose rows name one request (a verify step's) takes one pass: one key gather
+            # feeds every row's heads. A run whose rows name different requests takes one pass
+            # a row, gathering that row's own request and storing that row only: the fp8 group
+            # kernel's row-by-row branch (the same dot of the same operands for the row's
+            # columns), kept out of the tile loop so that the one-request pass is the only body.
+            requests = tl.load(request_indices + group_rows, mask=row_ok, other=0).to(tl.int64)
+            requests = tl.where(row_ok, requests, lead)
+            shared = tl.max((requests != lead).to(tl.int32), axis=0) == 0
+            passes = tl.where(shared, 1, GROUP_ROWS)
+        else:
+            passes = 1
+        for sub in tl.range(0, passes):
+            if ROW_BY_ROW:
+                request = tl.sum(tl.where(slots == sub, requests, 0), axis=0)
+                store_ok = row_ok & (shared | (slots == sub))
+            else:
+                request = lead
+                store_ok = row_ok
+            for tile in tl.range(first_tile, last_tile):
+                block_columns = tile * BLOCK_N + block_offsets
+                valid_blocks = block_columns < max_visible
+                anchor_positions = block_columns * COMPRESS_RATIO + COMPRESS_RATIO - 1
+                logical_pages = anchor_positions // TOKENS_PER_BLOCK
+                token_in_page = (anchor_positions % TOKENS_PER_BLOCK).to(tl.int64)
+                physical_pages = tl.load(
+                    block_table + request * block_table_stride_request + logical_pages,
+                    mask=valid_blocks,
+                    other=0,
+                ).to(tl.int64)
+                keys = tl.load(
+                    cache8
+                    + (
+                        physical_pages[:, None] * cache_stride_page16
+                        + token_in_page[:, None] * cache_stride_token16
+                    )
+                    * 16
+                    + dim_offsets[None, :],
+                    mask=valid_blocks[:, None],
+                    other=0.0,
+                    eviction_policy="evict_first",
+                )
+                per_head_scores = tl.dot(keys, query_values, out_dtype=tl.float32)
+                # The row-wise kernel's head sum is (h0 + h1) + (h2 + h3): pairs, then the pairs.
+                pairs = tl.sum(
+                    tl.reshape(
+                        tl.maximum(per_head_scores, 0.0),
+                        (BLOCK_N, BLOCK_G, NUM_INDEX_HEADS // 2, 2),
+                    ),
+                    axis=3,
+                )
+                scores = tl.sum(pairs, axis=2)
+                tl.store(
+                    output
+                    + group_rows[None, :] * (output_stride_row4 * 4)
+                    + block_columns[:, None],
+                    scores * score_scale,
+                    mask=(block_columns[:, None] < visible[None, :]) & store_ok[None, :],
+                )
+
+
+def _flat_refusal(
+    q: torch.Tensor,
+    index_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    query_positions: torch.Tensor,
+    request_indices: torch.Tensor,
+    tokens_per_block: int,
+    compress_ratio: int,
+    rows_per_request: int,
+) -> str | None:
+    """None when the flat kernel serves this call, else why it does not (host side: shapes,
+    dtypes, strides and addresses only)."""
+    if q.ndim != 3:
+        return f"query of {q.ndim} dimensions"
+    rows, heads, dim = q.shape
+    if heads != _FLAT_HEADS:
+        return f"{heads} index heads (serves {_FLAT_HEADS})"
+    if dim < 16 or dim & (dim - 1):
+        return f"index head dimension {dim} (serves a power of two from 16)"
+    if not 1 <= rows <= _FLAT_MAX_ROWS:
+        return f"{rows} rows (serves 1..{_FLAT_MAX_ROWS})"
+    if not 1 <= rows_per_request <= _FLAT_MAX_GROUP_ROWS:
+        return f"{rows_per_request} rows a request (serves 1..{_FLAT_MAX_GROUP_ROWS})"
+    runs = triton.cdiv(rows, rows_per_request)
+    if runs > _FLAT_MAX_RUNS:
+        return f"{runs} runs of {rows_per_request} rows (serves up to {_FLAT_MAX_RUNS})"
+    if q.dtype != torch.bfloat16 or q.stride(2) != 1 or q.data_ptr() % 16:
+        return f"query {q.dtype}, strides {tuple(q.stride())}, address % 16 = {q.data_ptr() % 16}"
+    if (
+        index_cache.ndim != 4
+        or index_cache.shape[2] != 1
+        or index_cache.shape[3] != dim
+        or index_cache.dtype != torch.bfloat16
+        or index_cache.stride(3) != 1
+    ):
+        return (
+            f"index plane {tuple(index_cache.shape)} {index_cache.dtype}, strides "
+            f"{tuple(index_cache.stride())} (serves a bf16-sized [pages, tokens, 1, {dim}])"
+        )
+    if (
+        (index_cache.stride(0) * 2) % 16
+        or (index_cache.stride(1) * 2) % 16
+        or index_cache.data_ptr() % 16
+    ):
+        return (
+            f"index plane strides {tuple(index_cache.stride())} elements, address % 16 = "
+            f"{index_cache.data_ptr() % 16} (page and slot strides must be multiples of 16 bytes)"
+        )
+    if block_table.ndim != 2 or block_table.dtype != torch.int32 or block_table.stride(1) != 1:
+        return f"block table {tuple(block_table.shape)} {block_table.dtype}"
+    if (
+        query_positions.shape != (rows,)
+        or request_indices.shape != (rows,)
+        or query_positions.dtype != torch.int64
+        or request_indices.dtype != torch.int32
+        or (rows > 1 and (query_positions.stride(0) != 1 or request_indices.stride(0) != 1))
+    ):
+        return (
+            f"metadata {tuple(query_positions.shape)} {query_positions.dtype} / "
+            f"{tuple(request_indices.shape)} {request_indices.dtype} (serves contiguous int64 "
+            "positions and int32 request indices, one a row)"
+        )
+    if tokens_per_block <= 0 or compress_ratio < 2 or tokens_per_block % compress_ratio:
+        return f"page size {tokens_per_block}, compress ratio {compress_ratio}"
+    max_blocks = block_table.shape[1] * tokens_per_block // compress_ratio
+    if max_blocks <= 0 or max_blocks % 4 or rows * max_blocks >= 2**31:
+        return f"{max_blocks} score columns x {rows} rows"
+    for t in (index_cache, block_table, query_positions, request_indices):
+        if t.device != q.device:
+            return "operands on different devices"
+    if q.device.type != "cuda":
+        return "not a CUDA device"
+    return None
+
+
+def _qsa_index_scores_flat(
+    q, index_cache, block_table, query_positions, request_indices, tokens_per_block,
+    compress_ratio, rows_per_request,
+) -> torch.Tensor:  # fmt: skip
+    """The flat kernel's scores (visible blocks only), one launch; the caller has checked the
+    envelope (`_flat_refusal`)."""
+    rows, heads, dim = q.shape
+    max_blocks = block_table.shape[1] * tokens_per_block // compress_ratio
+    output = torch.empty((rows, max_blocks), dtype=torch.float32, device=q.device)
+    cache8 = _fp8_view(index_cache)
+    runs = triton.cdiv(rows, rows_per_request)
+    programs = _FLAT_PROGRAMS_PER_SM * _sm_count(q.device.index or 0)
+    _qsa_index_scores_flat_kernel[(programs,)](
+        q,
+        cache8,
+        block_table,
+        query_positions,
+        request_indices,
+        output,
+        dim**-0.5,
+        rows,
+        max_blocks,
+        q.stride(0),
+        q.stride(1),
+        cache8.stride(0) // 16,
+        cache8.stride(1) // 16,
+        block_table.stride(0),
+        output.stride(0) // 4,
+        NUM_INDEX_HEADS=heads,
+        INDEX_HEAD_DIM=dim,
+        TOKENS_PER_BLOCK=tokens_per_block,
+        COMPRESS_RATIO=compress_ratio,
+        GROUP_ROWS=rows_per_request,
+        BLOCK_G=max(triton.next_power_of_2(rows_per_request), 16 // heads, 1),
+        BLOCK_N=_GROUP_BLOCK_N,
+        MAX_GROUPS=16 if runs <= 16 else 32 if runs <= 32 else 64,
+        PROGRAMS=programs,
+        ROW_BY_ROW=rows_per_request > 1,
+        num_warps=_FLAT_WARPS,
+    )
+    return output
+
+
 def _takes_ctx_tile(q, only_visible_blocks: bool, context_rows: bool, rows_per_request: int):
     """Whether a call is a prefill-sized context call the ctx-tile kernel serves."""
     return (
@@ -511,8 +816,28 @@ def qsa_index_scores_fp8_launch(
     rows_per_request: int = 1,
 ) -> torch.Tensor:
     """The scores `[rows, max_compressed_blocks]` fp32 of `q` against the e4m3 anchors: a
-    prefill-sized context call on the ctx-tile kernel (bitwise the request-group kernel's
-    scores), every other call on the request-group kernel."""
+    decode-sized generation call on the flat grid and a prefill-sized context call on the
+    ctx-tile kernel (both bitwise the request-group kernel's scores), every other call on the
+    request-group kernel."""
+    if (
+        only_visible_blocks
+        and not context_rows
+        and _flat_refusal(
+            q,
+            index_cache,
+            block_table,
+            query_positions,
+            request_indices,
+            tokens_per_block,
+            compress_ratio,
+            rows_per_request,
+        )  # fmt: skip
+        is None
+    ):
+        return _qsa_index_scores_flat(
+            q, index_cache, block_table, query_positions, request_indices, tokens_per_block,
+            compress_ratio, rows_per_request,
+        )  # fmt: skip
     if _takes_ctx_tile(q, only_visible_blocks, context_rows, rows_per_request):
         return _qsa_index_scores_fp8_ctx_tile(
             q, index_cache, block_table, query_positions, request_indices, tokens_per_block,
@@ -554,8 +879,8 @@ class QsaIndexScoresFp8(OpWrapper):
 
     CELLS: tuple[Cell, ...] = (
         Cell(
-            why="dep MTP-3 verify: 12 requests x 4 rows over the 8196-page table, one key "
-            "gather a request",
+            why="dep MTP-3 verify: 12 requests x 4 rows over the 8196-page table on the flat "
+            "grid, one key gather a request",
             spec=_scores_spec(
                 requests=tuple((20000 + 9973 * r, 4) for r in range(12)),
                 rows_per_request=4,
@@ -563,7 +888,7 @@ class QsaIndexScoresFp8(OpWrapper):
             ),  # fmt: skip
         ),
         Cell(
-            why="dep draft rows: 52 requests x 1 row, ~2k-250k token contexts",
+            why="dep draft rows on the flat grid: 52 requests x 1 row, ~2k-250k token contexts",
             spec=_scores_spec(requests=tuple((2000 + 4800 * r, 1) for r in range(52)), table=8196),
         ),
         Cell(
