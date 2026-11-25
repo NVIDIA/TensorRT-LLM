@@ -1789,14 +1789,18 @@ def precompile(
     partition_from: int,
     work_item_width: int = 4,
     separate_replay_slots: bool = False,
+    configs: Optional[dict] = None,
 ) -> int:
     """Compile every kernel a verify step of 1..`max_requests` requests launches, the way a
     target calls this entry: work items, and with them no in-kernel commit, from
     `partition_from` requests on; the q/k L2 norm and the gating in-kernel; bf16 `a` / `b`.
     A compile costs 5-10 s, so a target runs this at bind, before any step: the captured
     decode graphs do not reach every mapping (padded graphs skip 9 to 15 requests, which an
-    eager mixed step carries). Returns the number of distinct kernels."""
+    eager mixed step carries). `configs` (`{requests: launch mapping}`): the mapping the
+    target passes as `config` at those request counts. Returns the number of distinct
+    kernels."""
     keys = set()
+    configs = configs or {}
     for n in range(1, max_requests + 1):
         partitioned = n >= partition_from
         kw = _kernel_kw(
@@ -1811,6 +1815,7 @@ def precompile(
             g_f32=False,
             b_f32=False,
             work_items=partitioned,
+            config=configs.get(n),
             work_item_width=work_item_width,
             separate_replay_slots=separate_replay_slots,
         )

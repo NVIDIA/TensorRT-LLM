@@ -1221,6 +1221,53 @@ _INPROJ_RELEASE_PLANS: dict = {
 }
 
 
+#: Switch, on by default: at a dep4 / dep8 rank on SM103 (`_dp_decode_rank`) whose verify steps
+#: run the CuTe replay over a bf16 recurrent pool (no FlashInfer ring) with 4 rows a request and
+#: work items from 16 requests (the layout the table was timed at), a verify step of
+#: `_GDN_REPLAY_MAP_REQUESTS` requests launches the replay on the mapping `_gdn_replay_map`
+#: names instead of the kernel's own (`default_config`): its own overflows one wave of resident
+#: CTAs (608 = 152 SMs x 4) at 7-8 requests (96 CTAs a request) and at 13-15 (48 a request).
+#: Every launch mapping of the kernel computes each state tile with the same statements, so the
+#: output, the history and the commits are bitwise. GB300 micro, ms a step saved over the
+#: kernel's own mapping: 0.020-0.028 at 5-6 requests, 0.064-0.071 at 7-10, 0.025-0.035 at
+#: 11-12, 0.065-0.072 at 13-15, 0.003-0.024 at 17-32, 0.017-0.028 at 33-48. `0` keeps the
+#: kernel's own mapping. Read once, at each cache-manager bind.
+DP_GDN_REPLAY_MAP_ENV = "TRTLLM_QWEN4_EXP_DP_GDN_REPLAY_MAP"
+#: Requests a rank the table names a mapping for (the largest timed: 48).
+_GDN_REPLAY_MAP_REQUESTS = (5, 48)  # capacity: fixed: dispatch thresholds
+#: 8 m-tiles a CTA on 8 warps, every state tile by bulk copy as soon as the slot is known.
+_GDN_REPLAY_MAP_A = dict(tpc=8, warps=8, pf=0, minb=4, early_acc=True)
+#: At 13..15 requests (48 CTAs a request): 4 warps, five CTAs resident an SM.
+_GDN_REPLAY_MAP_B = dict(tpc=8, warps=4, pf=1, minb=5)
+_GDN_REPLAY_MAP_B_REQUESTS = (13, 15)  # capacity: fixed: dispatch thresholds
+#: The partition threshold and rows a request the table was timed at; 16 requests (the first
+#: partitioned count) keep the kernel's own mapping, the best there.
+_GDN_REPLAY_MAP_PARTITION, _GDN_REPLAY_MAP_ROWS = 16, 4  # capacity: fixed: the measured layout
+
+
+def _gdn_replay_map(n: int) -> dict | None:
+    """`DP_GDN_REPLAY_MAP_ENV`'s launch mapping of a verify step of `n` requests, or None (the
+    kernel's own)."""
+    lo, hi = _GDN_REPLAY_MAP_REQUESTS
+    if not lo <= n <= hi or n == _GDN_REPLAY_MAP_PARTITION:
+        return None
+    lo_b, hi_b = _GDN_REPLAY_MAP_B_REQUESTS
+    return dict(_GDN_REPLAY_MAP_B if lo_b <= n <= hi_b else _GDN_REPLAY_MAP_A)
+
+
+def _gdn_replay_map_on(core, cm, device, ring: bool) -> bool:
+    """`DP_GDN_REPLAY_MAP_ENV` against a bound manager: an attention-DP rank on SM103, the CuTe
+    replay over a bf16 pool (not FlashInfer's ring), the measured partition threshold and rows
+    a request."""
+    return (
+        _switch(DP_GDN_REPLAY_MAP_ENV, default=True)
+        and _dp_decode_rank(core, device)
+        and not ring
+        and (CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE, core.max_verify_rows)
+        == (_GDN_REPLAY_MAP_PARTITION, _GDN_REPLAY_MAP_ROWS)
+    )
+
+
 #: Attention-DP group sizes the decode forms below (`DP_HC_TILES_ENV`, `DP_INPROJ_RELEASE_ENV`,
 #: `DP_GDN_REPLAY_MAP_ENV`, `DP_OUT_PROJ_BF16_ENV`) were measured at: dep4 and dep8 (GB300).
 #: dep2 was never run with them; it keeps the stock forms.
@@ -1789,6 +1836,8 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         # `DP_HC_TILES_ENV`, `DP_INPROJ_RELEASE_ENV`.
         self.hc_tiles = False
         self._inproj_release = None
+        # `DP_GDN_REPLAY_MAP_ENV`, settled at each cache-manager bind.
+        self.gdn_replay_map = False
 
         # Every weight but the n-gram table; meta-init intercepts torch.empty.
         self.w = _weights.MODEL_WEIGHTS.declare(d)
@@ -2275,10 +2324,20 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
             f"a {state_dtype} recurrent-state cache; this layout serves "
             f"{' or '.join(str(d) for d in served)} (kv_cache_config.mamba_ssm_cache_dtype)"
         )
+        self.gdn_replay_map = self.mtp_enabled and _gdn_replay_map_on(
+            self,
+            cm,
+            rank_pools.ssm[self.gdn_layers[0]].device,
+            bool(getattr(cm, "use_gdn_flashinfer_ring_replay", False)),
+        )
         if self.mtp_enabled and state_dtype == torch.bfloat16:
             # Every CuTe replay kernel a verify step of up to `max_num_requests` requests
             # launches (`_gdn_verify`), compiled now: the captured decode graphs do not reach
             # every launch mapping, and a compile in a serving step stalls it 5-10 s.
+            maps = {}
+            if self.gdn_replay_map:
+                maps = {n: _gdn_replay_map(n) for n in range(1, md.max_num_requests + 1)}
+                maps = {n: c for n, c in maps.items() if c is not None}
             gdn_replay_precompile(
                 self.max_verify_rows,
                 self.num_k_heads,
@@ -2288,6 +2347,7 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
                 partition_from=CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE,
                 work_item_width=mm.replay_work_items.shape[1],
                 separate_replay_slots=_has_replay_slots(cm),
+                configs=maps,
             )
         # No sliding window: the targets pass `max_seq_len` as the window.
         windows = cm.max_attention_window_vec
@@ -3019,8 +3079,12 @@ def _gdn_verify(core, mq, a, b, i, L, si_d, n, p, verify, mq_out=None) -> torch.
         )
         return torch.reshape(out, [1, n * p, core.num_v_heads, core.head_v_dim])
     old_x, old_B, old_dt, old_dA = replay.old[i]
+    extra = {}
     if cute:
         replay_op = gdn_cached_replay_cute
+        if core.gdn_replay_map:
+            # `DP_GDN_REPLAY_MAP_ENV`: the measured launch mapping, None for the kernel's own.
+            extra["config"] = _gdn_replay_map(n)
     else:
         replay_op = fused_recurrent_gated_delta_rule_cached_replay_update
         a, b = a.contiguous(), b.contiguous()
@@ -3056,6 +3120,7 @@ def _gdn_verify(core, mq, a, b, i, L, si_d, n, p, verify, mq_out=None) -> torch.
         use_all_layer_commit=all_layer,
         output=None,
         replay_indices=replay_indices,
+        **extra,
     )
     return torch.reshape(out, [1, n * p, core.num_v_heads, core.head_v_dim])
 

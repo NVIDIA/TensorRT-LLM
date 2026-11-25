@@ -653,3 +653,61 @@ def test_precompile_covers_every_step(heads, separate) -> None:
         op(**kw)
         torch.cuda.synchronize()
         assert len(cr._COMPILED) == compiled, f"a step of {n} requests compiled a kernel"
+
+
+# ── the attention-DP launch-map table (`M.DP_GDN_REPLAY_MAP_ENV`) ──────────
+
+
+@pytest.mark.parametrize("pdl", [False, True])
+@pytest.mark.parametrize("n", [5, 8, 12, 13, 15, 17, 32, 48])
+def test_dp_replay_map_is_bitwise_the_default_mapping(n, pdl) -> None:
+    """At an attention-DP rank's geometry (a whole layer's 16 / 48 heads, 4 rows a request) the
+    mapping `M._gdn_replay_map` names for `n` requests gives the kernel's own mapping's
+    bits: output, checkpoint (in-kernel commits below the partition) and u / k / G history."""
+    cfg = M._gdn_replay_map(n)
+    assert cfg is not None
+    t = 4
+    path = "all_layer" if n >= CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE else "small"
+    spec = _rank_spec((16, 48), path=path, n=n, t=t, steps=1, layers=1, slots=2 * n + 8)
+    bench = trep._Bench(spec, 6100 + n, exact=False)
+    bench.prepare()
+    act = bench.inputs()
+    a, b = _gates(bench, act, True)
+    snap = [x.clone() for x in bench.state(0)]
+    results = []
+    for config in (None, cfg):
+        for x, y in zip(bench.state(0), snap):
+            x.copy_(y)
+        kw = bench.kwargs(0, act)
+        kw.update(g=a, beta=b, config=config, launch_with_pdl=pdl)
+        out = op(**kw)
+        torch.cuda.synchronize()
+        results.append([out.clone()] + [x.clone() for x in bench.state(0)])
+    for name, x, y in zip(("out", "state", "u", "k", "G"), results[1], results[0]):
+        assert torch.equal(x, y), f"{name}: {cfg} vs the kernel's own mapping at {n} requests"
+
+
+def test_precompile_covers_the_dp_replay_map() -> None:
+    """`precompile(configs=...)`, as the target runs it at bind with the launch-map table, leaves
+    nothing to compile for a step at a table mapping."""
+    t, partition_from = 4, CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
+    width = trep.REPLAY_WORK_ITEM_WIDTH
+    configs = {n: M._gdn_replay_map(n) for n in range(1, 49)}
+    configs = {n: c for n, c in configs.items() if c is not None}
+    cr.precompile(
+        t, 16, 48, 48, pdl=True, partition_from=partition_from, work_item_width=width,
+        configs=configs,
+    )  # fmt: skip
+    compiled = len(cr._COMPILED)
+    for n in (5, 13, 17, 48):
+        path = "all_layer" if n >= partition_from else "small"
+        spec = _rank_spec((16, 48), path=path, n=n, t=t, steps=1, layers=1, slots=2 * n + 8)
+        bench = trep._Bench(spec, 6200 + n, exact=False)
+        bench.prepare()
+        act = bench.inputs()
+        kw = bench.kwargs(0, act)
+        kw["g"], kw["beta"] = _gates(bench, act, True)
+        kw.update(launch_with_pdl=True, config=configs[n])
+        op(**kw)
+        torch.cuda.synchronize()
+        assert len(cr._COMPILED) == compiled, f"a step of {n} requests compiled a kernel"
