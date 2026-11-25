@@ -26,6 +26,18 @@ from tensorrt_llm.disaggregated_params import DisaggregatedParams
 pytestmark = pytest.mark.cpu_only
 
 
+@pytest.mark.parametrize("option", ["format", "device"])
+def test_config_digest_rejects_media_representation_overrides(monkeypatch, option):
+    llm, _ = model()
+    monkeypatch.setattr(
+        llm.input_processor,
+        "get_preferred_media_io_kwargs",
+        lambda: {"image": {option: "unsupported"}},
+    )
+    with pytest.raises(ValueError, match=rf"media_io_kwargs\.image\.{option}"):
+        oe._config_digest(llm)
+
+
 @pytest.mark.parametrize("removed_before", ["stat", "unlink"])
 def test_collection_tolerates_a_concurrently_removed_file(tmp_path, monkeypatch, removed_before):
     cache = oe.EncoderCache(str(tmp_path))
