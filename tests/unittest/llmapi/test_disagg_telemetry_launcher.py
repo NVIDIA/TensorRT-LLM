@@ -463,21 +463,23 @@ def test_launch_disaggregated_server_sets_worker_role(
     )
 
 
-def test_rank_info_key_is_carried_by_transceiver_config():
+def test_native_auth_key_is_carried_by_transceiver_config():
     import pickle
 
     args = {"cache_transceiver_config": {"backend": "NIXL"}}
-    serve._set_rank_info_auth_key(args, b"shared-key")
+    serve._set_native_auth_key(args, b"shared-key")
     config = args["cache_transceiver_config"]
-    assert pickle.loads(pickle.dumps(config))._rank_info_auth_key == b"shared-key"
-    assert "_rank_info_auth_key" not in args
-    assert "_rank_info_auth_key" not in config.model_dump()
+    assert pickle.loads(pickle.dumps(config))._native_auth_key == b"shared-key"
+    assert "_native_auth_key" not in args
+    assert "_native_auth_key" not in config.model_dump()
 
 
 @pytest.mark.parametrize("protocol", ["openengine", "smg"])
 @pytest.mark.parametrize("key", [None, "deployment-key"])
 @pytest.mark.parametrize("with_transceiver", [False, True])
-def test_grpc_cli_propagates_rank_info_key(tmp_path, monkeypatch, protocol, key, with_transceiver):
+def test_grpc_cli_propagates_native_auth_key(
+    tmp_path, monkeypatch, protocol, key, with_transceiver
+):
     config = tmp_path / "worker.yaml"
     config.write_text(
         (f"internal_request_auth_key: {key}\n" if key is not None else "")
@@ -504,6 +506,6 @@ def test_grpc_cli_propagates_rank_info_key(tmp_path, monkeypatch, protocol, key,
         assert transceiver == {"backend": "NIXL"}
     else:
         assert transceiver.backend == "NIXL"
-        assert transceiver._rank_info_auth_key == key.encode()
-        assert "_rank_info_auth_key" not in transceiver.model_dump()
+        assert transceiver._native_auth_key == key.encode()
+        assert "_native_auth_key" not in transceiver.model_dump()
     assert "internal_request_auth_key" not in llm_args

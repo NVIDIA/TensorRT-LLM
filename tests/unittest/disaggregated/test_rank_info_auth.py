@@ -23,7 +23,7 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     TransferWorkerConfig,
     WaitResult,
     _rank_info_auth_tag,
-    _validate_rank_info_auth_key,
+    _validate_native_auth_key,
 )
 from tensorrt_llm._torch.disaggregation.orchestration.coordinator import DisaggTransferCoordinator
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
@@ -42,6 +42,7 @@ def _make_receiver() -> Receiver:
     # receiver shut down so its destructor can safely run during any later test.
     receiver._sessions_lock = threading.Lock()
     receiver._shutdown = True
+    receiver._frame_signer = None
     return receiver
 
 
@@ -61,12 +62,12 @@ def test_transfer_worker_config_repr_omits_auth_key(key):
         kv_cache_manager=Mock(),
         device_id=0,
         instance_name="test-instance",
-        rank_info_auth_key=key,
+        native_auth_key=key,
     )
 
-    assert config.rank_info_auth_key == key
+    assert config.native_auth_key == key
     config_repr = repr(config)
-    assert "rank_info_auth_key" not in config_repr
+    assert "native_auth_key" not in config_repr
     if key is not None:
         assert key.decode("ascii") not in config_repr
     assert "test-instance" in config_repr
@@ -163,14 +164,19 @@ def test_receiver_rank_info_exchange(key):
     messenger.stop.assert_called_once_with()
 
 
-@pytest.mark.parametrize("key", [b"", "not-bytes"])
+@pytest.mark.parametrize("key", [b"", b"too-short", b"k" * 15, "not-bytes"])
 def test_transfer_worker_rejects_invalid_configured_key_before_native_setup(key):
     with pytest.raises(ValueError, match="internal_request_auth_key"):
         TransferWorker(
             TransferWorkerConfig(
-                kv_cache_manager=Mock(), device_id=0, instance_name="test", rank_info_auth_key=key
+                kv_cache_manager=Mock(), device_id=0, instance_name="test", native_auth_key=key
             )
         )
+
+
+def test_native_auth_key_of_minimum_length_is_accepted() -> None:
+    key = b"k" * 16
+    assert _validate_native_auth_key(key) == key
 
 
 @pytest.mark.parametrize("ownership", [False, True])
@@ -283,13 +289,15 @@ def test_server_warns_only_when_authentication_is_disabled(key):
         patch(f"{_TRANSFER_MODULE}.ZMQMessenger"),
         patch(f"{_TRANSFER_MODULE}.logger.warning") as warning,
     ):
-        server = RankInfoServer(Mock(), addr="127.0.0.1", port=1234, rank_info_auth_key=key)
+        server = RankInfoServer(
+            Mock(), addr="127.0.0.1", port=1234, rank_info_auth_key=key, frame_signer=None
+        )
         if key is None:
             warning.assert_called_once()
             assert "without authentication" in warning.call_args.args[0]
         else:
             warning.assert_not_called()
-        assert _validate_rank_info_auth_key(key) == key
+        assert _validate_native_auth_key(key) == key
         server.shutdown()
 
 
@@ -587,8 +595,8 @@ def test_rank_info_timeout_uses_one_deadline_and_closes_socket(after_challenge):
 
 
 def test_messenger_receive_timeout_allows_subsequent_reply():
-    with ZMQMessenger("ROUTER", "tcp://127.0.0.1:*") as server:
-        with ZMQMessenger("DEALER", server.endpoint) as client:
+    with ZMQMessenger("ROUTER", "tcp://127.0.0.1:*", signer=None) as server:
+        with ZMQMessenger("DEALER", server.endpoint, signer=None) as client:
             with pytest.raises(TimeoutError):
                 client.receive(timeout_ms=10)
             client.send([b"request"])
