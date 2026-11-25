@@ -831,7 +831,7 @@ def _generation_prompt_source(chat_template: str) -> str:
     comments to the end, so ``<think>`` tags that only re-render reasoning
     in past assistant turns are left out. A template that never reads
     ``add_generation_prompt`` (e.g. Qwen3-Reranker, which always ends with
-    the assistant prefill) is returned whole.
+    the assistant prefill) is returned whole, minus comments.
     """
     template = _JINJA_COMMENT.sub("", chat_template)
     start = template.rfind("add_generation_prompt")

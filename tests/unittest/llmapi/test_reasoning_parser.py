@@ -1149,6 +1149,11 @@ _PLAIN_HISTORY_TEMPLATE = (
                  "{# add_generation_prompt: <think> #}",
                  None,
                  id="comment_after_prompt"),
+    pytest.param("{%- if add_generation_prompt is not defined %}"
+                 "{%- set add_generation_prompt = false %}{%- endif %}" +
+                 _REASONING_HISTORY_TEMPLATE + _FORCED_NON_THINKING_TEMPLATE,
+                 None,
+                 id="default_set_before_history"),
     pytest.param(_REASONING_HISTORY_TEMPLATE + _FORCED_THINKING_TEMPLATE,
                  "deepseek-r1",
                  id="history_and_prompt"),
