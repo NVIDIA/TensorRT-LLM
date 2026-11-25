@@ -6,7 +6,8 @@
   `_INDEX_GROUP_MIN_ROWS - 1` rows, request groups of `p` rows from there, the CuTe group kernel
   from `_INDEX_SCORES_CUTE_MIN_GROUPS` groups where it serves them.
 * **Sparse GQA** (`_sparse_gqa_decode`): at an attention-DP rank under `DP_GQA_BITMAP_ENV` the
-  trunk's bitmap-union kernel from its floor where it takes the call; the request-grouped CuTe
+  trunk's bitmap-union kernel from its floor where it takes the call, and under
+  `DP_DRAFT_GQA_GROUPED1_ENV` a draft pass of one row a request on it; the request-grouped CuTe
   kernel from
   `_GROUPED_DECODE_MIN_REQUESTS` requests (an attention-DP rank's `DP_GQA_MIN_REQUESTS_ENV`),
   the per-row split-K one where it serves the call
@@ -501,8 +502,8 @@ def _bitmap_case(monkeypatch, takes: bool):
     calls = _gqa(monkeypatch, True, True)
     asked = []
 
-    def plan(q, k, bt, sel, tpb, p, min_groups=None):
-        asked.append(min_groups)
+    def plan(q, k, bt, sel, tpb, p, min_groups=None, one_row=False):
+        asked.append(min_groups if not one_row else (min_groups, "one row"))
         return takes
 
     def bitmap(*args, output_gate=None, min_groups=None):
@@ -558,6 +559,7 @@ def test_sparse_gqa_bitmap_dispatch(monkeypatch, rows, floor, trunk, takes, expe
         ("no gate", "nogate"),
         ("a gate of other columns", "gatecols"),
         ("a strided selection", "selstride"),
+        ("q heads of another stride", "qstride"),
     ],
 )
 def test_sparse_gqa_bitmap_declines_layouts_its_entry_refuses(monkeypatch, why, mutate):
@@ -575,6 +577,8 @@ def test_sparse_gqa_bitmap_declines_layouts_its_entry_refuses(monkeypatch, why, 
         gate = torch.zeros(32, 16 * 256, dtype=torch.bfloat16)
     elif mutate == "selstride":
         sel = torch.zeros(32, 4102, dtype=torch.int32)[:, :2051]
+    elif mutate == "qstride":
+        q = torch.zeros(32, 24, 512, dtype=torch.bfloat16)[:, :, :256]
     M._sparse_gqa_decode(core, kv, q, bt, sel, req, 32, gate, p, trunk=True)
     assert all(c[0] != "bitmap" for c in calls), why
     assert asked == []
@@ -606,6 +610,59 @@ def test_dp_gqa_bitmap_switch(monkeypatch, bitmap_env, min_env, dp_size, expecte
         return
     core.dp_gqa_min_requests = M._dp_gqa_min_requests(core)
     assert M._dp_gqa_bitmap(core) == expected
+
+
+@pytest.mark.parametrize(
+    "rows, g1, trunk, p, takes, expected",
+    [
+        (12, True, False, 1, True, ("bitmap", True, 1, 4)),  # a draft pass of 12 requests
+        (4, True, False, 1, True, ("bitmap", True, 1, 4)),  # the range's floor
+        (96, True, False, 1, True, ("bitmap", True, 1, 4)),  # its ceiling
+        (3, True, False, 1, True, ("splitk", True, None)),  # below it: the fixed cost does not pay
+        (97, True, False, 1, True, ("splitk", True, None)),  # past what was measured
+        (12, False, False, 1, True, ("splitk", True, None)),  # the switch off
+        (12, True, True, 1, True, ("splitk", True, None)),  # a trunk call is not a draft pass
+        (48, True, False, 4, True, ("splitk", True, None)),  # a draft-extend pass of 4 rows
+        (12, True, False, 1, False, ("splitk", True, None)),  # the kernel declines (plan, arch)
+    ],
+)
+def test_sparse_gqa_draft_one_row_dispatch(monkeypatch, rows, g1, trunk, p, takes, expected):
+    """`DP_DRAFT_GQA_GROUPED1_ENV`: a draft pass of one row a request takes the bitmap-union
+    kernel at one row a group (asked with `one_row` from the range's floor) at 4..96 rows where
+    the plan takes it; everything else keeps the row table (here: split-K). Independent of the
+    trunk's `DP_GQA_BITMAP_ENV` (off here)."""
+    calls, asked = _bitmap_case(monkeypatch, takes)
+    extra = {"dp_gqa_bitmap": 0, "dp_gqa_min_requests": 32, "dp_draft_gqa_g1": g1}
+    core = SimpleNamespace(**{**vars(CORE), **extra})
+    kv, q, bt, sel, req, gate = _bitmap_operands(rows)
+    out = M._sparse_gqa_decode(core, kv, q, bt, sel, req, 32, gate, p, trunk=trunk)
+    assert out == expected[0] and calls == [expected]
+    consulted = g1 and not trunk and p == 1 and 4 <= rows <= 96
+    assert asked == ([(4, "one row")] if consulted else [])
+
+
+@pytest.mark.parametrize(
+    "env, dp_size, expected",
+    [
+        (None, 8, False),  # off by default
+        ("1", 8, True),
+        ("1", 4, True),
+        ("0", 8, False),
+        ("1", 1, False),  # no attention DP: warns, off
+        ("maybe", 4, ValueError),
+    ],
+)
+def test_dp_draft_gqa_g1_switch(monkeypatch, env, dp_size, expected):
+    if env is None:
+        monkeypatch.delenv(M.DP_DRAFT_GQA_GROUPED1_ENV, raising=False)
+    else:
+        monkeypatch.setenv(M.DP_DRAFT_GQA_GROUPED1_ENV, env)
+    core = SimpleNamespace(dp_size=dp_size)
+    if expected is ValueError:
+        with pytest.raises(ValueError):
+            M._dp_draft_gqa_g1(core)
+        return
+    assert M._dp_draft_gqa_g1(core) is expected
 
 
 @pytest.mark.parametrize(

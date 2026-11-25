@@ -1299,16 +1299,18 @@ def _plan(
     tokens_per_block,
     rows_per_request,
     min_groups: Optional[int] = None,
+    one_row: bool = False,
 ):
     """(splits, layout) of the grouped kernel for this call, or None where the per-row kernel
     takes it: fewer groups than the floor (`min_groups`, `MIN_GROUPS` by default), one row a
-    request, not SM103, a plane its int32 row offsets cannot address, or no shared-memory plan
-    (more than six rows a request; the wide plan takes tables up to 8192 pages of 32 tokens at
-    four rows a request, the rows' bitmaps in the K/V slots).
+    request (unless `one_row`: a caller that groups one-row requests on purpose), not SM103, a
+    plane its int32 row offsets cannot address, or no shared-memory plan (more than six rows a
+    request; the wide plan takes tables up to 8192 pages of 32 tokens at four rows a request, the
+    rows' bitmaps in the K/V slots).
     """
     rows, num_q_heads, head_dim = q.shape
     rpr = int(rows_per_request)
-    if rpr < 2 or -(-rows // rpr) < _floor(min_groups) or head_dim != HEAD_DIM:
+    if rpr < (1 if one_row else 2) or -(-rows // rpr) < _floor(min_groups) or head_dim != HEAD_DIM:
         return None
     if not archs.fast_path("qsa_fp8_verify", torch.cuda.get_device_capability(q.device)):
         return None
@@ -1331,13 +1333,24 @@ def takes_grouped(
     tokens_per_block,
     rows_per_request,
     min_groups: Optional[int] = None,
+    one_row: bool = False,
 ):
     """Whether `fp8_sparse_gqa_verify` runs this call on the grouped kernel (else on the
-    per-row kernel), from `min_groups` groups (`MIN_GROUPS` by default). A host-side decision on
-    shapes only: a per-capture constant.
+    per-row kernel), from `min_groups` groups (`MIN_GROUPS` by default). With `one_row`, whether
+    `fp8_sparse_gqa_verify_grouped` has a plan for a call of one row a request too (each request
+    its own group: one launch with the gate fused instead of the per-row kernel's two and the gate
+    launch); the routed entry never groups one-row requests. A host-side decision on shapes only:
+    a per-capture constant.
     """
     plan = _plan(
-        q, k_cache, block_table, selected_tokens, tokens_per_block, rows_per_request, min_groups
+        q,
+        k_cache,
+        block_table,
+        selected_tokens,
+        tokens_per_block,
+        rows_per_request,
+        min_groups,
+        one_row,
     )
     return plan is not None
 
@@ -1705,7 +1718,9 @@ class QsaPagedSparseGqaFp8Verify(OpWrapper):
     Metadata consumed: none -- every input is an argument.
     Call sites: the NVFP4 target's trunk verify step at an attention-DP rank over an e4m3 pool,
     under `TRTLLM_QWEN4_EXP_DP_GQA_BITMAP` (`_sparse_gqa_decode`), through
-    `fp8_sparse_gqa_verify_grouped` where `takes_grouped(..., min_groups)`.
+    `fp8_sparse_gqa_verify_grouped` where `takes_grouped(..., min_groups)`; its draft passes of
+    one row a request under `TRTLLM_QWEN4_EXP_DP_DRAFT_GQA_GROUPED1`, the same entry at
+    `rows_per_request` 1 where `takes_grouped(..., one_row=True)`.
 
     Routing (`takes_grouped`, host-side, on shapes only): the grouped kernel from the caller's
     floor (`min_groups`, 2..8, default `MIN_GROUPS` 8) of T >= 2 rows a request up, on SM103,

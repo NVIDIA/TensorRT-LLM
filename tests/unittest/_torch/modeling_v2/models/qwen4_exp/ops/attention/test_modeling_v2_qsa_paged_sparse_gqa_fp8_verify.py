@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU test (SM103): `qsa_paged_sparse_gqa_fp8_verify` over an e4m3 pool against the per-row
 op's reference and the per-row kernel, inside the decode op's band (4 ulp of each (row, head)'s
-max, 2 ulp relative RMS), over its cells; plus the routed floor (`min_groups`), the two-wave and
-tail plans, forced splits, an invalid request row, the selections `is_valid` refuses,
-determinism and graph replay against eager."""
+max, 2 ulp relative RMS), over its cells; plus the routed floor (`min_groups`), one row a
+request (the draft's one-row passes), the two-wave and tail plans, forced splits, an invalid
+request row, the selections `is_valid` refuses, determinism and graph replay against eager."""
 
 import math
 import zlib
@@ -221,6 +221,33 @@ def test_other_rows_a_request_and_forced_splits(rows_per_request, splits) -> Non
     )
     el, rms, ok = within_ulp(out, op.reference(**args, rows_per_request=rows_per_request))
     assert ok, f"vs reference: {el:.2f} ulp element, {rms:.2f} ulp RMS"
+
+
+@pytest.mark.parametrize("requests", [4, 12, 52, 96], ids=str)
+def test_one_row_a_request(requests) -> None:
+    """The draft layer's one-row passes (`takes_grouped(..., one_row=True)`, the NVFP4 target's
+    `DP_DRAFT_GQA_GROUPED1`): one request a group over the engine's 8190-page table with the gate
+    fused, from a floor of 4 rows (96 rows: past one wave, the tail split and merged). Within
+    the band of the reference and of the per-row kernel; the routed entry never groups one-row
+    requests."""
+    args = build(_segments(requests, 1, first=3000, step=97), seed=640 + requests, pages=8190)
+    g = torch.Generator(device=DEV).manual_seed(requests)
+    args["output_gate"] = torch.randn(requests, 24 * 256, generator=g, device=DEV).to(
+        torch.bfloat16
+    )
+    one = dict(args, rows_per_request=1, min_groups=4)
+    assert not _takes_grouped(one)
+    plan = (args["q"], args["k_cache"], args["block_table"], args["selected_tokens"], 32, 1)
+    assert _verify_module.takes_grouped(*plan, min_groups=4, one_row=True)
+    # the floor counts requests (groups of one row)
+    assert _verify_module.takes_grouped(*plan, min_groups=8, one_row=True) == (requests >= 8)
+    out = _verify_module.fp8_sparse_gqa_verify_grouped(**one)
+    assert out.dtype == torch.bfloat16 and not out.isnan().any()
+    el, rms, ok = within_ulp(out, op.reference(**one))
+    assert ok, f"vs reference: {el:.2f} ulp element, {rms:.2f} ulp RMS"
+    el, rms, ok = within_ulp(out, _per_row(one))
+    assert ok, f"vs the per-row kernel: {el:.2f} ulp element, {rms:.2f} ulp RMS"
+    assert torch.equal(out, _verify_module.fp8_sparse_gqa_verify_grouped(**one))
 
 
 def test_wide_table_matches_the_narrow_one() -> None:

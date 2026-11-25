@@ -441,7 +441,8 @@ _DEP8 = dict(
 # (`TRTLLM_QWEN4_EXP_DP_GQA_MIN_REQUESTS=2`, another summation order than split-K) and the
 # cluster top-k up to 256 rows (`TRTLLM_QWEN4_EXP_DP_TOPK_CLUSTER_ROWS=256`), and once with
 # those row ranges on the trunk's bitmap-union verify kernel (`TRTLLM_QWEN4_EXP_DP_GQA_BITMAP=1`,
-# class S, SM103 only). FP8 at dep4 once more with the e4m3 QSA index anchors
+# class S, SM103 only), the draft's one-row passes on it too
+# (`TRTLLM_QWEN4_EXP_DP_DRAFT_GQA_GROUPED1=1`). FP8 at dep4 once more with the e4m3 QSA index anchors
 # (`TRTLLM_QWEN4_EXP_INDEX_KEY_FP8=1`, opt-in and lossy against the bf16 keys: every anchor and
 # the index query rounded to e4m3), which only the pass keys reach (gsm8k stays dense). FP8 at
 # dep4 once more with every opt-in attention-DP decode form of the dep follow-ups on (the heads
@@ -1010,6 +1011,7 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
             env["TRTLLM_QWEN4_EXP_DP_TOPK_CLUSTER_ROWS"] = "256"
         if variant.get("dp_bitmap"):
             env["TRTLLM_QWEN4_EXP_DP_GQA_BITMAP"] = "1"
+            env["TRTLLM_QWEN4_EXP_DP_DRAFT_GQA_GROUPED1"] = "1"
         if variant.get("index_key_fp8"):
             env["TRTLLM_QWEN4_EXP_INDEX_KEY_FP8"] = "1"
         if variant.get("tep_opt_in"):
