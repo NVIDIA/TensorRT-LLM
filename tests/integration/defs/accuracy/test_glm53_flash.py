@@ -29,7 +29,7 @@ from tensorrt_llm.llmapi import (
 )
 from tensorrt_llm.quantization import QuantAlgo
 
-from ..conftest import llm_models_root, parametrize_with_ids, skip_pre_blackwell
+from ..conftest import get_sm_version, llm_models_root, parametrize_with_ids, skip_pre_blackwell
 from .accuracy_core import (
     GSM8K,
     MMMU,
@@ -243,7 +243,7 @@ class TestGLM53FlashFP8(LlmapiAccuracyTestHarness):
             json.dumps({"video": {"num_frames": 4, "fps": 2}}),
         ]
         # The request sends the video as a local path.
-        env = dict(os.environ, TRTLLM_MEDIA_ALLOWED_LOCAL_PATH=str(video.parent))
+        env = dict(os.environ, TRTLLM_MEDIA_ALLOWED_INPUT_DIR=str(video.parent))
         with popen(command, env=env) as process:
             _wait_for_server_ready(process, http_port=port, timeout=1200)
             with OpenAI(base_url=f"http://127.0.0.1:{port}/v1", api_key="tensorrt_llm") as client:
@@ -295,7 +295,17 @@ class TestGLM53FlashFP8(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_mpi_world_size(4)
     @pytest.mark.parametrize(
         "attention_dp,draft_len,cache_dtype",
-        [(True, 3, "auto"), (False, 0, "fp8"), (True, 3, "fp8")],
+        [
+            (True, 3, "auto"),
+            (False, 0, "fp8"),
+            pytest.param(
+                True,
+                3,
+                "fp8",
+                # SM107 cold runs of this combined ADP/MTP/FP8-KV case can exceed one hour.
+                marks=[pytest.mark.timeout(7200)] if get_sm_version() == 107 else [],
+            ),
+        ],
         ids=["adp-mtp3", "tp-fp8-kv", "adp-mtp3-fp8-kv"],
     )
     def test_attention_dp_mtp_and_fp8_kv(self, attention_dp, draft_len, cache_dtype):

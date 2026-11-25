@@ -111,6 +111,7 @@ def run_single_rank(dtype, strategy, message_size):
                 for i in range(iter_num):
                     reference_raw_tensor = reference_raw_tensor * self.world_size
 
+                output_tensor = input_tensor
                 for i in range(iter_num):
                     output_tensor = self.allreduce(input_tensor)
                     input_tensor = output_tensor
@@ -134,6 +135,9 @@ def run_single_rank(dtype, strategy, message_size):
                     tmp_lp_result = lowprecision_bf16_result_dict[
                         self.world_size]
 
+                else:
+                    raise ValueError(
+                        f"Unsupported low-precision dtype: {self.dtype}")
                 tmp_raw_result = raw_result_dict[self.world_size]
                 tmp_result_dict = dict(zip(tmp_raw_result, tmp_lp_result))
 
@@ -199,10 +203,7 @@ def run_single_rank(dtype, strategy, message_size):
                 avg_time_per_iter = time_in_seconds / iter_num
 
                 # Determine datatype size in bytes
-                if self.dtype == torch.float32:
-                    datatype_bytes = 4
-                elif self.dtype == torch.float16 or self.dtype == torch.bfloat16:
-                    datatype_bytes = 2
+                datatype_bytes = input_tensor.element_size()
 
                 # Calculate algorithm bandwidth in GB/s
                 total_bytes = self.message_size * datatype_bytes

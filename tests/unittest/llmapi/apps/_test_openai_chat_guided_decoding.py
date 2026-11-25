@@ -11,7 +11,7 @@ import pytest
 import yaml
 from utils.llm_data import llm_datasets_root
 
-from ..test_llm import get_model_path
+from ..model_paths import get_model_path
 from .openai_server import RemoteOpenAIServer
 
 pytestmark = pytest.mark.threadleak(enabled=False)
@@ -61,6 +61,9 @@ def server(model_name: str, temp_extra_llm_api_options_file: str):
         model_path = get_model_path("gpt_oss/gpt-oss-120b")
     elif model_name == "zai-org/GLM-5-FP8":
         model_path = get_model_path("GLM-5-FP8")
+
+    else:
+        raise ValueError(f"Unsupported model: {model_name}")
 
     args = [
         "--max_batch_size=8", "--max_seq_len=4096", "--max_num_tokens=4096",

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """FP4 MLA tensor layout validation, scale views, and workspace allocation."""
 
+from math import prod
 from typing import Any
 
 import torch
@@ -16,6 +17,7 @@ from .config import (
     FP4_MLA_TOKENS_PER_BLOCK,
     HP_BLOCK_SIZE,
     _ceil_div,
+    fp4_mla_cache_layout,
 )
 
 # FP4 MLA scale-layout helpers
@@ -69,7 +71,7 @@ def get_fp4_mla_v_scale_pool_view(
     v_head_dim: int,
 ) -> torch.Tensor:
     """View the auxiliary MLA V-scale pool in Triton's block-scaled layout."""
-    pool = getattr(metadata.fp4_mla_state, "v_scale_pool", None)
+    pool = metadata.fp4_mla_state.v_scale_pool
     if pool is None:
         raise RuntimeError("FP4 MLA V scale pool is not allocated.")
 
@@ -100,7 +102,7 @@ def get_fp4_mla_v_scale_pool_view(
 
 
 def _get_fp4_mla_global_scale(metadata: Any, device: torch.device) -> torch.Tensor:
-    global_scale = getattr(metadata.fp4_mla_state, "kv_global_scale", None)
+    global_scale = metadata.fp4_mla_state.kv_global_scale
     if (
         not isinstance(global_scale, torch.Tensor)
         or global_scale.device != device
@@ -112,7 +114,7 @@ def _get_fp4_mla_global_scale(metadata: Any, device: torch.device) -> torch.Tens
 
 
 def _get_fp4_mla_q_global_scale(metadata: Any, device: torch.device) -> torch.Tensor:
-    global_scale = getattr(metadata.fp4_mla_state, "q_global_scale", None)
+    global_scale = metadata.fp4_mla_state.q_global_scale
     if (
         not isinstance(global_scale, torch.Tensor)
         or global_scale.device != device
@@ -126,7 +128,7 @@ def _get_fp4_mla_q_global_scale(metadata: Any, device: torch.device) -> torch.Te
 def _get_fp4_mla_kv_cache_tensors(
     metadata: Any, layer_idx: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    return metadata.kv_cache_manager.get_fp4_mla_cache_buffers(layer_idx)
+    return metadata.kv_cache_manager.fp4_mla_layout.get_fp4_mla_cache_buffers(layer_idx)
 
 
 def _get_fp4_mla_hp_pool_layout(
@@ -134,10 +136,10 @@ def _get_fp4_mla_hp_pool_layout(
     pool: torch.Tensor,
 ) -> tuple[int, int]:
     """Return the manager-owned HP ring size and per-token head dimension."""
-    manager = getattr(metadata, "kv_cache_manager", None)
-    if manager is None or not hasattr(manager, "fp4_mla_hp_pool_size"):
+    cache_layout = fp4_mla_cache_layout(getattr(metadata, "kv_cache_manager", None))
+    if cache_layout is None:
         raise ValueError("FP4 MLA requires a V2 manager-owned HP ring.")
-    hp_pool_size = manager.fp4_mla_hp_pool_size
+    hp_pool_size = cache_layout.fp4_mla_hp_pool_size
     if (
         hp_pool_size < HP_BLOCK_SIZE
         or pool.ndim != 4
@@ -227,6 +229,24 @@ def _validate_fp4_mla_attention_q_shape(head_dim: int, q_residual_dim: int) -> N
         )
 
 
+def _workspace_capacity_numel(
+    metadata: Any, attr_name: str, dtype: torch.dtype, device: torch.device
+) -> int:
+    """Return scratch capacity available without allocating new storage."""
+    tensor = metadata.fp4_mla_state.workspaces.get(attr_name)
+    held = (
+        tensor.numel()
+        if tensor is not None and tensor.dtype == dtype and tensor.device == device
+        else 0
+    )
+    buffers = getattr(metadata, "forward_scratch_buffers", None)
+    if getattr(metadata, "is_cuda_graph", False) and buffers is not None:
+        blocks = buffers.buffers.get(f"fp4_mla_decode{attr_name}", [])
+        largest = max((block.buffer.numel() for block in blocks), default=0) // dtype.itemsize
+        return max(held, largest)
+    return held
+
+
 def _ensure_workspace_tensor(
     metadata: Any,
     attr_name: str,
@@ -234,24 +254,65 @@ def _ensure_workspace_tensor(
     *,
     dtype: torch.dtype,
     device: torch.device,
+    shared: bool,
+    capacity_numel: int | None = None,
 ) -> torch.Tensor:
+    """Return contiguous scratch with explicit sharing and storage lifetime."""
+    numel = prod(shape)
+    capacity = max(numel, int(capacity_numel or 0))
     workspaces = metadata.fp4_mla_state.workspaces
+    capturing = torch.cuda.is_current_stream_capturing()
+    # Only per-forward scratch may share the runner's pool. Plans and caches
+    # with metadata-specific contents retain metadata ownership.
+    if shared and metadata.is_cuda_graph and metadata.forward_scratch_buffers is not None:
+        available = _workspace_capacity_numel(metadata, attr_name, dtype, device)
+        if capturing:
+            if available < numel:
+                raise ValueError(
+                    f"Cannot allocate {attr_name} while capturing a CUDA graph. "
+                    "Run a warmup prepare/forward first."
+                )
+            capacity = numel
+        allocation_shape = list(shape) if capacity == numel else [capacity]
+        tensor = metadata.get_empty(
+            metadata.forward_scratch_buffers,
+            allocation_shape,
+            dtype,
+            f"fp4_mla_decode{attr_name}",
+            capture_graph=True,
+        )
+        registered = workspaces.get(attr_name)
+        if (
+            registered is None
+            or registered.dtype != dtype
+            or registered.device != tensor.device
+            or registered.numel() < tensor.numel()
+        ):
+            workspaces[attr_name] = tensor
+        return tensor.reshape(-1)[:numel].view(shape)
     tensor = workspaces.get(attr_name)
     needs_alloc = (
         tensor is None
         or tensor.dtype != dtype
         or tensor.device != device
-        or len(tensor.shape) != len(shape)
-        or any(tensor.shape[idx] < dim for idx, dim in enumerate(shape))
+        or not tensor.is_contiguous()
+        or tensor.numel() < (numel if capturing else capacity)
     )
     if needs_alloc:
-        if torch.cuda.is_current_stream_capturing():
+        if capturing:
             raise ValueError(
                 f"Cannot allocate {attr_name} while capturing a CUDA graph. "
                 "Run a warmup prepare/forward first."
             )
-        tensor = torch.empty(shape, dtype=dtype, device=device)
+        allocation_shape = shape if capacity == numel else (capacity,)
+        tensor = torch.empty(allocation_shape, dtype=dtype, device=device)
         workspaces[attr_name] = tensor
+    return tensor.reshape(-1)[:numel].view(shape)
 
-    slices = tuple(slice(0, dim) for dim in shape)
-    return tensor[slices]
+
+def _max_sequences(metadata: Any) -> int:
+    """Return the engine-wide sequence capacity, or zero when unknown."""
+    value = getattr(metadata, "max_num_sequences", None) or getattr(
+        metadata, "max_num_requests", None
+    )
+    return int(value or 0)

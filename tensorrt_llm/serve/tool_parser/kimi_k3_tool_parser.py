@@ -51,6 +51,19 @@ def _parse_attrs(header: str) -> Dict[str, str]:
     return {key: _unescape_attr(value) for key, value in re.findall(r'(\w+)="([^"]*)"', header)}
 
 
+def _names_declared_tool(name: str, tool_indices: Dict[str, int]) -> bool:
+    """Whether ``name`` is a declared tool's name or the bare name of exactly one.
+
+    A namespaced tool is declared qualified (``functions.exec``) and called by
+    its bare name (``exec``) too, which identifies it as long as no other
+    declared tool has that bare name.
+    """
+    if name in tool_indices:
+        return True
+    owners = [declared for declared in tool_indices if declared.rsplit(".", 1)[-1] == name]
+    return len(owners) == 1
+
+
 class KimiK3ToolParser(BaseToolParser):
     """Detector for the Kimi K3 XTML function-call format."""
 
@@ -250,7 +263,7 @@ class KimiK3ToolParser(BaseToolParser):
                     f"kimi_k3 tool parser: call without tool attribute: {match.group('attrs')}"
                 )
                 continue
-            if name not in tool_indices:
+            if not _names_declared_tool(name, tool_indices):
                 logger.warning(f"Model attempted to call undefined function: {name}")
             calls.append(
                 ToolCallItem(

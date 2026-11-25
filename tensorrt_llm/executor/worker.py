@@ -33,7 +33,7 @@ from .._utils import mpi_comm, mpi_rank, print_all_stacks
 from ..llmapi._load_balance_env import (LAUNCH_QUEUES_ENV,
                                         configure_moe_launch_queues,
                                         uses_collective_shutdown)
-from ..llmapi.llm_args import BaseLlmArgs
+from ..llmapi.llm_args import BaseLlmArgs, TorchLlmArgs
 from ..llmapi.mpi_session import set_mpi_session_cpp
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import VizTracer, set_global_tracer
@@ -176,29 +176,30 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
                     self.rpc_server = None
                 except BaseException as error:
                     shutdown_error = error
+            # Reach the engine only through self.engine: a local reference or
+            # bound method would keep it alive through the gc.collect() below.
             if self.engine is not None:
-                engine = self.engine
                 local_safe = bool(
                     getattr(self, "_engine_shutdown_completed", False))
                 if not local_safe:
                     try:
-                        if engine.can_enqueue_requests():
+                        if self.engine.can_enqueue_requests():
                             if self.await_response_thread.is_alive():
                                 self.await_response_thread.stop()
                                 self.await_response_thread.join()
 
-                        engine.shutdown()
+                        self.engine.shutdown()
                         self._engine_shutdown_completed = True
                         local_safe = True
                     except BaseException as error:
                         shutdown_error = error
                 try:
-                    terminal_cleanup = getattr(engine, "terminal_cleanup", None)
-                    if terminal_cleanup is not None:
-                        if getattr(engine, "shutdown_all_ranks", False):
-                            terminal_cleanup(local_safe=local_safe)
+                    if getattr(self.engine, "terminal_cleanup",
+                               None) is not None:
+                        if getattr(self.engine, "shutdown_all_ranks", False):
+                            self.engine.terminal_cleanup(local_safe=local_safe)
                         elif local_safe:
-                            terminal_cleanup()
+                            self.engine.terminal_cleanup()
                 except BaseException as error:
                     if shutdown_error is None:
                         shutdown_error = error
@@ -266,6 +267,12 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
             if torch.distributed.is_initialized():
                 torch.distributed.destroy_process_group()
 
+            # Every step a retry would repeat has succeeded, so drop the engine
+            # now: the gc.collect() below can free it only once nothing
+            # references it.
+            self.engine = None
+            self._engine_shutdown_completed = False
+
             # Return this rank's GPU memory to the driver. Under an external MPI
             # launch (mpirun/srun, e.g. CI), the worker process is long-lived and
             # shared across successive LLM instances: a new GenerationExecutorWorker
@@ -274,8 +281,6 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
             gc.collect()
             torch.cuda.empty_cache()
 
-            self.engine = None
-            self._engine_shutdown_completed = False
             shutdown_succeeded = True
             logger_debug(f"Worker {mpi_rank()} shutdown done.\n", "yellow")
 
@@ -307,9 +312,12 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
                     self.await_response_thread.join()
 
             self.engine.shutdown()
-            local_cleanup = getattr(self.engine, "local_cleanup", None)
-            if local_cleanup is not None:
-                local_cleanup()
+            # Call the hook without binding it to a local: a bound method
+            # would keep the engine reachable through the gc.collect() below,
+            # so its reference cycles, and the GPU memory they hold, would
+            # outlive this shutdown.
+            if getattr(self.engine, "local_cleanup", None) is not None:
+                self.engine.local_cleanup()
             self.engine = None
 
             if (self.llm_args.backend == "pytorch"
@@ -356,7 +364,9 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
     def block_subordinates(self):
         if self.rank != 0:
             from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-            if isinstance(self.engine, PyExecutor):
+            from tensorrt_llm._torch.pyexecutor.scheduled_encoder_executor import \
+                ScheduledEncoderExecutor
+            if isinstance(self.engine, (PyExecutor, ScheduledEncoderExecutor)):
                 self.engine.wait_shutdown()
 
 
@@ -660,6 +670,10 @@ def worker_main(
                     # ranks.
                     worker.engine.set_resource_governor_queue(
                         resource_governor_queue)
+                if (isinstance(llm_args, TorchLlmArgs)
+                        and llm_args.enable_client_io_during_gpu_wait):
+                    # Parse each received request while the executor waits on the GPU.
+                    request_queue.parse_gate = worker.engine.wait_for_intake_window
 
                 for req in _incoming_requests(request_queue):
                     if isinstance(req, CancellingRequest):

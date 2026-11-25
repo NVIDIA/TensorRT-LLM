@@ -34,6 +34,8 @@ add_subdirectory(kdaDecode)
 add_subdirectory(kimiK3AttnRes)
 add_subdirectory(mhcKernels)
 add_subdirectory(compressorKernels)
+add_subdirectory(csa2SparseContext)
+add_subdirectory(csa2SparseDecode)
 add_subdirectory(fusedSampling)
 
 file(GLOB_RECURSE SRC_CPP *.cpp)
@@ -82,6 +84,10 @@ list(FILTER SRC_CPP EXCLUDE REGEX "mhcKernels/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "mhcKernels/.*")
 list(FILTER SRC_CPP EXCLUDE REGEX "compressorKernels/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "compressorKernels/.*")
+list(FILTER SRC_CPP EXCLUDE REGEX "csa2SparseContext/.*")
+list(FILTER SRC_CU EXCLUDE REGEX "csa2SparseContext/.*")
+list(FILTER SRC_CPP EXCLUDE REGEX "csa2SparseDecode/.*")
+list(FILTER SRC_CU EXCLUDE REGEX "csa2SparseDecode/.*")
 list(FILTER SRC_CPP EXCLUDE REGEX "fusedSampling/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "fusedSampling/.*")
 # Marlin is built as its own architecture-scoped OBJECT library below.
@@ -94,10 +100,6 @@ list(FILTER SRC_CU EXCLUDE REGEX
 # The MiniMax-M3 sm_107 decode kernels are built as their own sm_107-only OBJECT
 # library below.
 list(FILTER SRC_CU EXCLUDE REGEX "minimaxM3Sm107(Tp[248])?/.*")
-
-if(NOT ENABLE_MULTI_DEVICE)
-  list(FILTER SRC_CU EXCLUDE REGEX "customAllReduceKernels*.*cu$")
-endif()
 
 # Lower CUDA optimization level when FAST_BUILD is enabled to speed up
 # compilation. CMake by default adds -O3 to CMAKE_CUDA_FLAGS_RELEASE. We

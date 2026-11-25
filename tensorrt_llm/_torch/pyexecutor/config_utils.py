@@ -11,6 +11,7 @@ import transformers
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.llmapi.llm_args import (CacheTransceiverConfig,
+                                          SparseAttentionConfig,
                                           is_speculators_dspark_config,
                                           translate_speculators_dspark_config)
 from tensorrt_llm.logger import logger
@@ -138,6 +139,44 @@ def get_layer_attention_window(
         raise ValueError(
             "Sliding attention requires a positive integer sliding_window.")
     return sliding_window
+
+
+def dspark_layer_window_size(use_swa: bool, swa_window: int,
+                             layer_types: Optional[Sequence[_LayerType]],
+                             layer_idx: int) -> tuple[int, int]:
+    """flash-attn ``window_size`` for one draft layer of the block decode.
+
+    Sliding-window block decode was introduced by the DSpark drafters
+    (deepseek-ai/DeepSpec) -- hence the name -- but it is an attention
+    configuration, not part of the DSpark head set, so it stays in the DFlash
+    base: the block decode below indexes the resolved windows directly and must
+    not depend on a subclass-only attribute.
+
+    Those drafters run the draft block through HF attention with
+    ``sliding_window`` set on 'sliding_attention' layers and is_causal=False.
+    HF's flash path (transformers/modeling_flash_attention_utils.py) translates
+    that to ``window_size = (sliding_window - 1, sliding_window - 1)``, i.e.
+    each query attends keys within ``swa_window - 1`` KV-index distance on both
+    sides. In the DFlash pool layout KV index == token position, so this limits
+    draft queries to the most recent ``swa_window`` context tokens plus the
+    (nearby) draft block. Full-attention layers and drafters that do not enable
+    the window keep flash-attn's default ``(-1, -1)`` (no window).
+
+    A drafter that sets `use_swa` but declares no sliding layer is windowed on
+    every layer: some DFlash 2 drafters are exported with all `full_attention`
+    layer types and the window only in `dflash_config`, and other serving
+    stacks window every layer of such a drafter. The per-layer filter applies
+    only when the layer types tell sliding layers from full ones, and it reads
+    them with `_is_sliding_attention_layer`, as the attention mask does.
+    """
+    if not use_swa:
+        return (-1, -1)
+    any_sliding = layer_types is not None and any(
+        _is_sliding_attention_layer(layer_type) for layer_type in layer_types)
+    if (any_sliding and layer_idx < len(layer_types)
+            and not _is_sliding_attention_layer(layer_types[layer_idx])):
+        return (-1, -1)
+    return (swa_window - 1, swa_window - 1)
 
 
 def is_hybrid_linear(config):
@@ -407,7 +446,7 @@ def supports_fp4_mla_attention(model_config: "ModelConfig") -> bool:
     """Whether the model uses the dedicated dense TRTLLM FP4 MLA path.
 
     Hybrid linear-attention models (Kimi K3) compose the FP4 MLA cache layout
-    with their recurrent-state lifecycle in ``MambaHybridCacheManagerV2``.
+    with their recurrent-state lifecycle in ``KimiK3HybridCacheManager``.
     """
     return (is_mla(model_config.pretrained_config)
             and model_config.attn_backend == "TRTLLM"
@@ -425,6 +464,18 @@ def uses_fp4_mla_attention(model_config: "ModelConfig") -> bool:
 def is_minimax_m3(sparse_attention_config):
     """True when the sparse attention config selects the MiniMax-M3 algorithm."""
     return sparse_attention_config is not None and sparse_attention_config.algorithm == "minimax_m3"
+
+
+def is_decode_only(
+        sparse_attention_config: Optional[SparseAttentionConfig]) -> bool:
+    """True when the sparse attention config restricts the worker to decode.
+
+    Sparse KV cache offload keeps attention history in host memory and admits
+    one query token per request per step, so an offloading worker serves the
+    decode phase of disaggregated serving and never runs a context batch.
+    """
+    return (sparse_attention_config is not None and
+            sparse_attention_config.get_kv_cache_offload_config() is not None)
 
 
 def is_qwen3_next(config):
@@ -859,6 +910,19 @@ def match_nemotron_h_layer_types(model_config, layer_types):
 
 MINIMAX_DSPARK_DRAFT_ARCH = "DSparkMiniMaxDraftModel"
 
+
+def is_mla_dspark_drafter(config: transformers.PretrainedConfig) -> bool:
+    """Whether a standalone DSpark drafter config selects the MLA block decode.
+
+    The MiniMax drafter is dispatched by architecture before the attention
+    shape is inspected, so its config never counts as MLA here.
+    """
+    architectures = getattr(config, "architectures", None) or []
+    if architectures and architectures[0] == MINIMAX_DSPARK_DRAFT_ARCH:
+        return False
+    return is_mla(config)
+
+
 # Keys of the standalone MiniMax DSpark drafter config.json that describe the
 # target checkpoint it was exported next to, not the drafter itself. The
 # drafter's MXFP8 linears are dequantized to the compute dtype at load, so the
@@ -1048,6 +1112,8 @@ def load_pretrained_config(model_name_or_path: str,
         model_name_or_path, **kwargs)
     model_type = config_dict.get("model_type")
     architectures = config_dict.get("architectures") or []
+    model_kwargs = kwargs.get("model_kwargs") or {}
+    requested_architectures = model_kwargs.get("architectures") or architectures
 
     if checkpoint_format in (CheckpointFormat.MISTRAL,
                              CheckpointFormat.MISTRAL_LARGE_3):
@@ -1085,6 +1151,22 @@ def load_pretrained_config(model_name_or_path: str,
         config_dict.pop("layer_types", None)
         model_config = _CONFIG_REGISTRY[model_type].from_dict(
             config_dict, **kwargs)
+    elif (requested_architectures
+          and requested_architectures[0] == "PplxDeciderForDecision"):
+        # pplx-decider packages a text-only decision model in a composite
+        # Qwen3.5 config. Flatten the nested text config before the generic
+        # Qwen3.5 VLM branches preserve the vision config.
+        from tensorrt_llm._torch.models.modeling_pplx_decider import \
+            PPLX_DECIDER_NUM_LABELS
+        from tensorrt_llm._torch.models.modeling_qwen3_5 import \
+            Qwen35ConfigCompat
+        normalized_config = Qwen35ConfigCompat.normalize(
+            config_dict, require_text_config=True)
+        normalized_config["architectures"] = ["PplxDeciderForDecision"]
+        normalized_config["num_labels"] = PPLX_DECIDER_NUM_LABELS
+        model_config = transformers.Qwen3NextConfig.from_dict(normalized_config)
+        model_config.torch_dtype = _resolve_composite_torch_dtype(
+            config_dict, normalized_config)
     elif (model_type == "qwen3_5_moe" and
           (("text_config" in config_dict and "vision_config" in config_dict) or
            (architectures

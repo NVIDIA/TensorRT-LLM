@@ -27,6 +27,7 @@ import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.testclient import TestClient
+from test_common.serve.app_factory import DisaggConfig, isolated_serve_env
 
 from tensorrt_llm.executor.utils import RequestError, context_length_exceeded_message
 from tensorrt_llm.inputs.chat_template_guard import UnusedChatTemplateKwargsError
@@ -321,6 +322,7 @@ def test_batched_message_is_named_after_the_executor_client_id():
 
     server = object.__new__(OpenAIServer)
     server.model = MODEL
+    server._collect_perf_metrics = False
     server.openai_chat = AsyncMock(side_effect=_records_executor_client_id(7))
 
     status, message = asyncio.run(
@@ -469,7 +471,7 @@ class _ModelConfig:
     vocab_size = 1024
 
 
-def _chat_server(monkeypatch, generation):
+def _streaming_chat_server(monkeypatch, generation):
     """A server whose real chat handlers run over ``generation``.
 
     The server is built with ``object.__new__``; prompt rendering and the
@@ -500,6 +502,8 @@ def _chat_server(monkeypatch, generation):
             backend="pytorch",
             guided_decoding_backend=None,
             num_postprocess_workers=1,
+            memory_monitor_config=None,
+            num_serve_frontends=1,
         ),
         generate_async=Mock(return_value=generation),
     )
@@ -510,7 +514,7 @@ def _chat_server(monkeypatch, generation):
 
 async def _chat_stream(monkeypatch, generation):
     """The body of a streamed /v1/chat/completions response, and the server."""
-    server = _chat_server(monkeypatch, generation)
+    server = _streaming_chat_server(monkeypatch, generation)
     request = ChatCompletionRequest(
         model=MODEL, messages=[{"role": "user", "content": "hi"}], stream=True
     )
@@ -535,7 +539,7 @@ def test_streamed_message_takes_the_id_the_real_chat_route_notes(monkeypatch):
     generation.request_id = 42
 
     async def run():
-        server = _chat_server(monkeypatch, generation)
+        server = _streaming_chat_server(monkeypatch, generation)
         raw_request = SimpleNamespace(state=SimpleNamespace(), headers={})
         response = await server.anthropic_messages(
             AnthropicMessagesRequest(**_request(stream=True)), raw_request
@@ -731,7 +735,7 @@ def test_over_length_prompt_is_answered_as_anthropic_answers_it(monkeypatch, whe
     stream that opens and then fails, or OpenAI's wording, reads to it as some
     other error.
     """
-    server = _chat_server(monkeypatch, generation=None)
+    server = _streaming_chat_server(monkeypatch, generation=None)
     server.generator.generate_async = _rejecting_engine(where, stream)
 
     response, body = asyncio.run(_messages(server, stream))
@@ -751,7 +755,7 @@ def test_stream_starts_without_waiting_for_a_slow_first_token(
         gate = asyncio.Event()
         if immediate:
             gate.set()
-        server = _chat_server(monkeypatch, _GatedGeneration(_reply_steps(), gate))
+        server = _streaming_chat_server(monkeypatch, _GatedGeneration(_reply_steps(), gate))
         response = await _messages_response(server, stream=True)
         # The delayed case starts while the first token is still pending.
         assert isinstance(response, StreamingResponse)
@@ -791,7 +795,9 @@ def test_rejection_after_the_wait_ends_the_stream_in_the_same_wording(
     async def run():
         gate = asyncio.Event()
         generation = _GatedGeneration([], gate, then=RequestError(_OVER_LENGTH))
-        response = await _messages_response(_chat_server(monkeypatch, generation), stream=True)
+        response = await _messages_response(
+            _streaming_chat_server(monkeypatch, generation), stream=True
+        )
         assert isinstance(response, StreamingResponse)
         gate.set()
         return await _read(response)
@@ -810,7 +816,7 @@ def test_rejection_after_the_wait_ends_the_stream_in_the_same_wording(
 def test_other_failures_before_the_first_token_stay_in_the_stream(monkeypatch):
     """Only an over-length rejection turns into a 400; other failures are reported as before."""
     generation = _StreamedGeneration([], then=RequestError("engine failed"))
-    server = _chat_server(monkeypatch, generation)
+    server = _streaming_chat_server(monkeypatch, generation)
 
     response, body = asyncio.run(_messages(server, stream=True))
 
@@ -828,7 +834,7 @@ def test_client_gone_before_the_first_token_leaves_nothing_running(
     """A disconnect cancels the read the stream is waiting on, and logs no error."""
 
     async def run():
-        server = _chat_server(monkeypatch, _StreamedGeneration([], hang=True))
+        server = _streaming_chat_server(monkeypatch, _StreamedGeneration([], hang=True))
         response = await _messages_response(server, stream=True)
         consumer = asyncio.ensure_future(response.body_iterator.__anext__())
         await asyncio.sleep(0.05)
@@ -838,6 +844,46 @@ def test_client_gone_before_the_first_token_leaves_nothing_running(
         return [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
 
     assert asyncio.run(run()) == []
+    server_logger.error.assert_not_called()
+
+
+def test_closing_unstarted_resumed_stream_cancels_first_read(
+    monkeypatch, server_logger, short_admission_wait
+):
+    """Failing on http.response.start before body iteration still cancels the first read."""
+    upstream_closed = False
+
+    async def _hanging_chat_stream(*args, **kwargs):
+        async def source():
+            nonlocal upstream_closed
+            try:
+                await asyncio.Event().wait()
+                yield "data: [DONE]\n\n"
+            finally:
+                upstream_closed = True
+
+        return StreamingResponse(source(), media_type="text/event-stream")
+
+    async def run():
+        server = _streaming_chat_server(monkeypatch, generation=None)
+        server.openai_chat = _hanging_chat_stream
+        response = await _messages_response(server, stream=True)
+        assert isinstance(response, StreamingResponse)
+
+        async def receive():
+            await asyncio.Event().wait()
+            return {"type": "http.disconnect"}
+
+        async def failing_send(message):
+            if message["type"] == "http.response.start":
+                raise RuntimeError("client disconnected while sending headers")
+
+        with pytest.raises(RuntimeError, match="client disconnected"):
+            await response({"type": "http"}, receive, failing_send)
+        return [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
+
+    assert asyncio.run(run()) == []
+    assert upstream_closed
     server_logger.error.assert_not_called()
 
 
@@ -867,23 +913,20 @@ def test_prompt_too_long_carries_the_counts(server_kind, message, reply):
     assert response.json()["error"] == {"type": "invalid_request_error", "message": reply}
 
 
-def _relayed_by_disagg_frontend(worker_response):
+def _relayed_by_disagg_frontend(worker_response, tmp_path):
     """What the disaggregated frontend hands its routes for a worker's error response."""
-    frontend = object.__new__(OpenAIDisaggServer)
-    frontend._perf_metrics_collector = SimpleNamespace(
-        http_exceptions=SimpleNamespace(inc=Mock()),
-        internal_errors=SimpleNamespace(inc=Mock()),
-    )
-    upstream = aiohttp.ClientResponseError(
-        request_info=Mock(),
-        history=(),
-        status=worker_response.status_code,
-        message=f"Bad Request: {worker_response.body.decode()}",
-    )
-    try:
-        return frontend._handle_exception(upstream)
-    except HTTPException as e:
-        return e
+    with isolated_serve_env(tmp_path) as env:
+        frontend = env.build_disagg_server(DisaggConfig())
+        upstream = aiohttp.ClientResponseError(
+            request_info=Mock(),
+            history=(),
+            status=worker_response.status_code,
+            message=f"Bad Request: {worker_response.body.decode()}",
+        )
+        try:
+            return frontend._handle_exception(upstream)
+        except HTTPException as e:
+            return e
 
 
 @pytest.mark.parametrize("stream", [False, True])
@@ -905,7 +948,7 @@ def _relayed_by_disagg_frontend(worker_response):
         ),
     ],
 )
-def test_disagg_route_answers_a_worker_rejection(stream, message, status, error):
+def test_disagg_route_answers_a_worker_rejection(stream, message, status, error, tmp_path):
     """A context worker's rejection reaches the client before any stream, streamed or not.
 
     The context phase never streams, so the frontend holds the worker's error
@@ -913,7 +956,7 @@ def test_disagg_route_answers_a_worker_rejection(stream, message, status, error)
     as an HTTPException for anything else.
     """
     worker_response = OpenAIServer.create_error_response(message, status_code=HTTPStatus(status))
-    relayed = _relayed_by_disagg_frontend(worker_response)
+    relayed = _relayed_by_disagg_frontend(worker_response, tmp_path)
     client, backend = _make_route_client("disagg", None)
     if isinstance(relayed, HTTPException):
         backend.side_effect = relayed
@@ -954,7 +997,9 @@ def test_standard_and_disagg_register_messages_route(prometheus_multiproc_dir):
     standard.app = FastAPI()
     standard.generator = SimpleNamespace(
         _executor=SimpleNamespace(resource_governor_queue=None),
-        args=SimpleNamespace(return_perf_metrics=False),
+        args=SimpleNamespace(
+            return_perf_metrics=False, memory_monitor_config=None, num_serve_frontends=1
+        ),
     )
     standard.use_harmony = False
     # register_routes() reads these to decide whether to mount the optional
@@ -1047,7 +1092,9 @@ def test_batch_routes_are_registered_on_the_standard_server():
     standard.app = FastAPI()
     standard.generator = SimpleNamespace(
         _executor=SimpleNamespace(resource_governor_queue=None),
-        args=SimpleNamespace(return_perf_metrics=False),
+        args=SimpleNamespace(
+            return_perf_metrics=False, memory_monitor_config=None, num_serve_frontends=1
+        ),
     )
     standard.use_harmony = False
     # register_routes() reads these to decide whether to mount the optional

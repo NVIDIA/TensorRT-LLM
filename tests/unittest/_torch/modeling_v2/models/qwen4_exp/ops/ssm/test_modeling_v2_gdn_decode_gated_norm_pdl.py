@@ -24,7 +24,7 @@ import cuda.bindings.driver as cuda_drv
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ssm.gdn_decode_gated_norm_pdl import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.ssm.gdn_decode_gated_norm_pdl import (  # noqa: E501
     gdn_decode_gated_norm_pdl as op,
 )
 

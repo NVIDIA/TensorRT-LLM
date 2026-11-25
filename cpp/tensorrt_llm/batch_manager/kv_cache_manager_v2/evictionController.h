@@ -21,6 +21,7 @@
 #include "kv_cache_manager_v2/exceptions.h"
 #include "kv_cache_manager_v2/storage/config.h"
 #include "kv_cache_manager_v2/utils/sharedPtr.h"
+#include "kv_cache_manager_v2/utils/smallObjectPool.h"
 
 #include <cstddef>
 #include <list>
@@ -45,7 +46,7 @@ class Page;
 // IMPORTANT: A NodeRef is always tied to the specific list that issued it.
 // Never mix NodeRefs from different LRUEvictionPolicy instances.
 // ---------------------------------------------------------------------------
-using EvictionList = std::list<SharedPtr<Page>>;
+using EvictionList = std::list<SharedPtr<Page>, PoolAllocator<SharedPtr<Page>>>;
 using NodeRef = EvictionList::iterator;
 
 // ---------------------------------------------------------------------------
@@ -104,6 +105,8 @@ public:
     SharedPtr<Page> remove(NodeRef node);
 
     SlotCount size() const noexcept;
+    // Pages whose slot lives in the given locality domain; the total when nullopt.
+    SlotCount size(std::optional<LocalityDomainId> localityDomainId) const noexcept;
 
     bool empty() const noexcept
     {
@@ -144,9 +147,12 @@ public:
 
 private:
     LRUEvictionPolicy& getOrCreate(Priority p);
+    void count(Page const& page, SlotCount delta) noexcept;
 
     // std::map keeps keys sorted. We evict from the lowest-priority key first.
     std::map<Priority, LRUEvictionPolicy> mPolicies;
+    // Indexed by locality domain id so a domain-filtered count never walks the queues.
+    TypedVec<LocalityDomainId, SlotCount> mDomainCounts;
 };
 
 // ---------------------------------------------------------------------------
@@ -165,16 +171,18 @@ public:
 
     void scheduleForEviction(Page& page, bool evictFirst = false);
 
-    // Evict at least minNumPages[pgIdx] pages per pool group.
+    // Evict at least minNumPages[pgIdx] pages per pool group. With localityDomainId, only pages
+    // whose slot lives in that domain are taken, in eviction order.
     // Returns evicted pages per pool group.
     // On failure, re-queues any already-evicted pages and throws OutOfPagesError.
-    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> evict(
-        TypedVec<PoolGroupIndex, SlotCount> const& minNumPages);
+    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> evict(TypedVec<PoolGroupIndex, SlotCount> const& minNumPages,
+        std::optional<LocalityDomainId> localityDomainId = std::nullopt);
 
     // Remove a page from the queue by its NodeRef.
     void remove(NodeRef node);
 
-    [[nodiscard]] SlotCount numEvictablePages(PoolGroupIndex pgIdx) const;
+    [[nodiscard]] SlotCount numEvictablePages(
+        PoolGroupIndex pgIdx, std::optional<LocalityDomainId> localityDomainId = std::nullopt) const;
 
     [[nodiscard]] PoolGroupIndex numPoolGroups() const noexcept
     {

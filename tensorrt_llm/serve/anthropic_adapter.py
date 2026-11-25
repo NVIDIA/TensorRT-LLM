@@ -137,6 +137,12 @@ def anthropic_chat_error_response(message: str, status_code: int) -> JSONRespons
 STREAM_ADMISSION_WAIT_S = 1.0
 
 
+async def _close_async_iterator(stream: AsyncIterator[Union[str, bytes]]) -> None:
+    aclose = getattr(stream, "aclose", None)
+    if aclose is not None:
+        await aclose()
+
+
 async def wait_for_stream_start(
     openai_sse: AsyncIterator[Union[str, bytes]],
 ) -> Union[JSONResponse, AsyncIterator[Union[str, bytes]]]:
@@ -155,40 +161,87 @@ async def wait_for_stream_start(
     try:
         await asyncio.wait((first,), timeout=STREAM_ADMISSION_WAIT_S)
     except asyncio.CancelledError:
-        first.cancel()
+        if not first.done():
+            first.cancel()
+        try:
+            await first
+        except BaseException:
+            pass
+        await _close_async_iterator(openai_sse)
         raise
     if first.done() and not first.cancelled() and isinstance(first.exception(), RequestError):
         too_long = prompt_too_long_message(str(first.exception()))
         if too_long is not None:
+            await _close_async_iterator(openai_sse)
             return anthropic_error_response(too_long, "invalid_request_error", 400)
-    return _resume_stream(first, openai_sse)
+    return _ResumedStream(first, openai_sse)
 
 
-async def _resume_stream(
-    first: asyncio.Future, rest: AsyncIterator[Union[str, bytes]]
-) -> AsyncIterator[Union[str, bytes]]:
-    """Yield the frame ``first`` reads from ``rest``, then the remaining frames of ``rest``.
+class _ResumedStream:
+    """Async iterator yielding ``first`` from ``rest`` then the remaining frames.
 
-    Cancelling a read that waits on ``first`` cancels ``first`` too, and
-    closing this stream closes ``rest``.
+    Unlike an unstarted async generator, closing this iterator before its first
+    ``__anext__`` still cancels and drains ``first`` and closes ``rest``.
     """
-    try:
-        try:
-            frame = await first
-        except StopAsyncIteration:
-            return
-        except RequestError as e:
-            too_long = prompt_too_long_message(str(e))
-            if too_long is None:
+
+    def __init__(
+        self,
+        first: asyncio.Future,
+        rest: AsyncIterator[Union[str, bytes]],
+    ) -> None:
+        self._first: Optional[asyncio.Future] = first
+        self._rest = rest
+        self._closed = False
+
+    def __aiter__(self) -> "_ResumedStream":
+        return self
+
+    async def __anext__(self) -> Union[str, bytes]:
+        if self._closed:
+            raise StopAsyncIteration
+        if self._first is not None:
+            first = self._first
+            self._first = None
+            try:
+                return await first
+            except StopAsyncIteration:
+                await self.aclose()
                 raise
-            raise AnthropicResponseError(too_long) from e
-        yield frame
-        async for frame in rest:
-            yield frame
-    finally:
-        aclose = getattr(rest, "aclose", None)
-        if aclose is not None:
-            await aclose()
+            except RequestError as e:
+                await self.aclose()
+                too_long = prompt_too_long_message(str(e))
+                if too_long is None:
+                    raise
+                raise AnthropicResponseError(too_long) from e
+            except BaseException:
+                if not first.done():
+                    first.cancel()
+                    try:
+                        await first
+                    except BaseException:
+                        pass
+                await self.aclose()
+                raise
+        try:
+            return await self._rest.__anext__()
+        except BaseException:
+            await self.aclose()
+            raise
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        first = self._first
+        self._first = None
+        if first is not None:
+            if not first.done():
+                first.cancel()
+            try:
+                await first
+            except BaseException:
+                pass
+        await _close_async_iterator(self._rest)
 
 
 # ---------------------------------------------------------------------------
@@ -602,6 +655,9 @@ def convert_anthropic_request(request: AnthropicMessagesRequest) -> ChatCompleti
             chat_request["thinking_token_budget"] = request.thinking.budget_tokens
 
     if request.output_config:
+        # Forwarded as-is here (this adapter is model-agnostic); the model's
+        # serving extension normalizes it later because it is listed in
+        # injected_chat_template_kwargs below (e.g. MuseSpark maps `max`).
         reasoning_effort = request.output_config.get("effort")
         if isinstance(reasoning_effort, str) and reasoning_effort:
             chat_template_kwargs["reasoning_effort"] = reasoning_effort
@@ -1323,7 +1379,37 @@ async def _with_ticks(
         await asyncio.gather(reader, return_exceptions=True)
 
 
-async def reframe_openai_stream(
+class _ClosingAsyncIterator:
+    """Async iterator whose ``aclose`` closes ``upstream`` even before iteration starts."""
+
+    def __init__(
+        self,
+        inner: AsyncIterator[str],
+        upstream: AsyncIterator[Union[str, bytes]],
+    ) -> None:
+        self._inner = inner
+        self._upstream = upstream
+        self._closed = False
+
+    def __aiter__(self) -> "_ClosingAsyncIterator":
+        return self
+
+    async def __anext__(self) -> str:
+        if self._closed:
+            raise StopAsyncIteration
+        return await self._inner.__anext__()
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            await _close_async_iterator(self._inner)
+        finally:
+            await _close_async_iterator(self._upstream)
+
+
+def reframe_openai_stream(
     openai_sse: AsyncIterator[Union[str, bytes]], model: str, request_id: Optional[int] = None
 ) -> AsyncIterator[str]:
     """Translate an OpenAI SSE stream into Anthropic SSE frames.
@@ -1336,6 +1422,15 @@ async def reframe_openai_stream(
     slow first token would otherwise leave the stream silent. Clients skip
     pings wherever they appear.
     """
+    return _ClosingAsyncIterator(
+        _reframe_openai_stream(openai_sse, model=model, request_id=request_id),
+        openai_sse,
+    )
+
+
+async def _reframe_openai_stream(
+    openai_sse: AsyncIterator[Union[str, bytes]], model: str, request_id: Optional[int] = None
+) -> AsyncIterator[str]:
     reframer = AnthropicStreamReframer(model=model, request_id=request_id)
     done = False
     # The frames that close the message, held from [DONE] until the upstream

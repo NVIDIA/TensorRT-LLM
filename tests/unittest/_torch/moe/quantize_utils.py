@@ -2334,7 +2334,16 @@ class MXFP4FP8QuantizeUtil(MXFP4MXFP8QuantizeUtil):
             # w1 and w3 MUST share input_scale — enforced by the MoE methods.
             weights[f"{expert_id}.w1.input_scale"] = input_scale_value.clone()
             weights[f"{expert_id}.w3.input_scale"] = input_scale_value.clone()
-            weights[f"{expert_id}.w2.input_scale"] = input_scale_value.clone()
+            # Distinct GEMM input scales expose use of the wrong bias divisor.
+            weights[f"{expert_id}.w2.input_scale"] = input_scale_value * 2.0
+            if self.bias and self.swiglu_gptoss_style:
+                # O(1) biases make missing accumulator-unit conversion visible.
+                for proj, extent in (
+                    ("w1", quant_kwargs.get("intermediate_size_unpadded", self.intermediate_size)),
+                    ("w3", quant_kwargs.get("intermediate_size_unpadded", self.intermediate_size)),
+                    ("w2", quant_kwargs.get("hidden_size_unpadded", self.hidden_size)),
+                ):
+                    weights[f"{expert_id}.{proj}.bias"][:extent].mul_(10.0)
         return weights
 
     def create_ref_module(

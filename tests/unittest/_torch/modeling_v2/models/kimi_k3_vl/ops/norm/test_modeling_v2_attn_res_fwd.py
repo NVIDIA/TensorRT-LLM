@@ -17,9 +17,7 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.norm.attn_res_fwd import (
-    attn_res_fwd,
-)
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.norm.attn_res_fwd import attn_res_fwd
 
 __extra_import_path__ = ["../../../.."]
 from _validating import validating
@@ -40,7 +38,9 @@ INPUT_NAMES = ("layer_residual", "block_residual", "res_weight", "rms_weight")
 OUTPUT_NAMES = ("output", "rsigma", "probs", "logits")
 
 
-def _make_inputs(num_tokens: int, num_candidates: int, seed: int = 0) -> tuple[torch.Tensor, ...]:
+def _make_inputs(
+    num_tokens: int, num_candidates: int, seed: int = 0
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Inputs at the scales of main's op tests, seeded by the cell."""
     torch.manual_seed(seed)
     layer_residual = (
@@ -118,7 +118,10 @@ def test_guard_refuses_mixed_devices(index) -> None:
     inputs[index] = inputs[index].to(f"cuda:{other_device}")
     with pytest.raises(AssertionError, match="device"):
         with validating(attn_res_fwd):
-            attn_res_fwd(*inputs, RMS_EPS)
+            call_layer_residual, call_block_residual, call_res_weight, call_rms_weight = inputs
+            attn_res_fwd(
+                call_layer_residual, call_block_residual, call_res_weight, call_rms_weight, RMS_EPS
+            )
 
 
 def test_cuda_graph_replay_matches_eager() -> None:

@@ -40,6 +40,7 @@ if TYPE_CHECKING:
 
     from .args import (
         AttentionConfig,
+        BatchingConfig,
         CacheConfig,
         CacheDiTConfig,
         CompilationConfig,
@@ -48,6 +49,7 @@ if TYPE_CHECKING:
         ParallelConfig,
         QuantAttentionConfig,
         RuntimeLoRAConfig,
+        SeaCacheConfig,
         SkipSoftmaxAttentionConfig,
         SolAttentionConfig,
         SparseAttentionConfig,
@@ -68,6 +70,7 @@ _LAZY_ATTRS = {
     "ExtraParamSchema": "tensorrt_llm.visual_gen.visual_gen",
     "VisualGenArgs": "tensorrt_llm.visual_gen.args",
     "AttentionConfig": "tensorrt_llm.visual_gen.args",
+    "BatchingConfig": "tensorrt_llm.visual_gen.args",
     "CacheConfig": "tensorrt_llm.visual_gen.args",
     "CacheDiTConfig": "tensorrt_llm.visual_gen.args",
     "CompilationConfig": "tensorrt_llm.visual_gen.args",
@@ -76,6 +79,7 @@ _LAZY_ATTRS = {
     "ParallelConfig": "tensorrt_llm.visual_gen.args",
     "QuantAttentionConfig": "tensorrt_llm.visual_gen.args",
     "RuntimeLoRAConfig": "tensorrt_llm.visual_gen.args",
+    "SeaCacheConfig": "tensorrt_llm.visual_gen.args",
     "SkipSoftmaxAttentionConfig": "tensorrt_llm.visual_gen.args",
     "SolAttentionConfig": "tensorrt_llm.visual_gen.args",
     "SparseAttentionConfig": "tensorrt_llm.visual_gen.args",
@@ -142,6 +146,7 @@ __all__ = [
     "VisualGenMetrics",
     "ExtraParamSchema",
     # Cross-cutting sub-configs
+    "BatchingConfig",
     "CompilationConfig",
     "CudaGraphConfig",
     "CpuOffloadConfig",
@@ -158,6 +163,7 @@ __all__ = [
     "CacheConfig",
     "TeaCacheConfig",
     "CacheDiTConfig",
+    "SeaCacheConfig",
     # Re-exported for convenience
     "QuantConfig",
 ]

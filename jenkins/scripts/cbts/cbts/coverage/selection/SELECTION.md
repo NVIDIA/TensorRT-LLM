@@ -232,6 +232,16 @@ The resulting stage set unions with every rule contribution, including
 | Footprint < 30 functions | the record is near-empty |
 | On a `-Ray-` stage | the GPU worker is uninstrumented, only driver-side rows exist |
 
+Test paths do not imply that inference ran: neither `disaggregated/` integration tests nor
+`unittest/disaggregated/` unit tests require `py_executor` rows solely because of their name.
+The missing-worker check requires a recorded call matching a generate launch marker; collection
+taints and outcomes apply regardless of the test path.
+
+For each test and stage, a recorded pass is sufficient when every other nonempty outcome is
+`passed` or `skipped`. A retry's skipped observation therefore does not invalidate the original
+pass. Skipped-only captures, failures, errors, and taints still force a run. Selection applies
+this reduction to raw outcomes even for existing schema-5 artifacts whose stored view predates it.
+
 `tainted` is the collection side's own admission that the context channel could not vouch for a
 record (`../collection/README.md`, "Taint"). It comes in two kinds — `attribution`, where rows
 recorded under a test may belong to another one, and `incomplete`, where the rows are right but some
@@ -261,6 +271,10 @@ Entries are keyed by **stage family**: `A10-PyTorch-2` → `A10-PyTorch`. pytest
 entry to exactly one shard and rebalances by duration, so only the family-level union answers "was
 this entry ever captured on this stage".
 
+Trailing `ISOLATION` directives are removed from the lookup identity, like `TIMEOUT` and `SKIP`
+annotations. Kept entries retain their original directives so Jenkins still runs them in isolation.
+Matching the normalized identity does not bypass impact or capture-completeness checks.
+
 A block is left untouched unless every stage family it serves is instrumented — coverage is
 collected on single-GPU post-merge stages only, so blocks belonging to multi-GPU or
 Post-Merge-only stages are never pruned.
@@ -280,10 +294,10 @@ stages finish, it uploads `cbts_pystart_report_x86_64.tar.gz` and
 ```
 run Tier 1                                      → Tier-2 residual paths
 GitHub compare main...<PR head>                 → PR base commit
-GET Artifactory pin at <PR number>/<PR head>:
-   200                                           → reuse its coverage build
-   404                                           → resolve the newest build below
-   other / malformed                             → decline Tier 2
+read helper, pin at <PR number>/<PR head>:
+   read                                          → reuse its coverage build
+   absent from both locations                    → resolve the newest build below
+   refused / failed in transfer / malformed      → decline Tier 2
 when no pin:
    Jenkins REST lastBuild                        → newest build number N
    for b in N .. N-49:                            (_MAX_PROBE)
@@ -306,8 +320,10 @@ The pin lives under
 pin and therefore receives the freshest complete pair available at its first CBTS run. Repeated
 `/bot run` commands for the same head reuse that build even after newer post-merge DBs appear.
 `artifact.py --resolve-pin` owns pin lookup, schema validation, build selection, local pin
-creation, and fail-closed reasons. Groovy only supplies PR identity and uses Jenkins'
-authenticated artifact uploader when Python reports `pin_upload_required`. Lookup, validation,
+creation, and fail-closed reasons. It reads the pin with the read helper
+(`jenkins/scripts/fetch_build_artifact.sh`), as it reads the tarballs. Groovy only supplies PR
+identity and uses Jenkins' authenticated artifact uploader when Python reports
+`pin_upload_required`. Lookup, validation,
 and first-write upload fail closed; CBTS never silently substitutes a newer build when a pin
 cannot be read or written. Preparation also verifies that the pinned build's `build_info.txt`
 still names the commit recorded in the pin, so an overwritten or corrupted build cannot silently

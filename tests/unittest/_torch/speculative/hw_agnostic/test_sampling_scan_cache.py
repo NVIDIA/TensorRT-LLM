@@ -5,10 +5,11 @@ and sets the temperature-only graph key bit only for batches the sharded Gumbel-
 
 import types
 
+import numpy as np
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-from tensorrt_llm._torch.speculative.interface import SpecMetadata
+from tensorrt_llm._torch.speculative.interface import SpecMetadata, one_model_sampling_mode
 
 pytestmark = pytest.mark.cpu_only
 
@@ -18,6 +19,7 @@ class _Req:
         self.py_request_id, self.py_seq_slot, self.temperature = rid, slot, temperature
         self.params = dict(top_k=20, top_p=0.9, min_p=None, seed=None) | params
         self.state = LlmRequestState.GENERATION_IN_PROGRESS
+        self.py_spec_sampling_params = None
         self.reads = 0
 
     @property
@@ -31,9 +33,13 @@ def _metadata(**overrides):
         runtime_draft_len=6,
         is_ragged_verify=False,
         group_all_greedy_sample=None,
+        group_all_temperature_only=None,
+        samples_from_vocab_shards=False,
         dummy_slot_row=8,
         _sampling_scan_cache=None,
         temperature_only_graphs=False,
+        greedy_graphs=True,
+        shard_temperature_only_graphs=True,
         use_rejection_sampling=False,
         enable_penalty=False,
     )
@@ -47,15 +53,18 @@ def _scan(metadata, requests):
 
 
 def _rescanned(metadata, requests):
+    # The scan caches normalized params on the request; clear them so a rescan reads the config again.
+    requests[0].py_spec_sampling_params = None
     before = requests[0].reads
     result = _scan(metadata, requests)
+    rescanned = requests[0].reads > before
     fresh = _metadata(
         runtime_draft_len=metadata.runtime_draft_len,
         is_ragged_verify=metadata.is_ragged_verify,
         group_all_greedy_sample=metadata.group_all_greedy_sample,
     )
     assert result == _scan(fresh, requests)
-    return requests[0].reads > before + 1
+    return rescanned
 
 
 def test_scan_cache_reuses_and_rescans_on_changes():
@@ -126,15 +135,31 @@ def _temperature_only(requests):
         (dict(_TEMPERATURE_ONLY, min_p=0.05), False),
         (dict(_TEMPERATURE_ONLY, seed=7), False),
         (dict(_TEMPERATURE_ONLY, seed=2**64 - 1), False),
+        # Below the greedy threshold the sharded draw is an argmax, while the stock sampler
+        # still splits tied maxima.
+        (
+            dict(
+                _TEMPERATURE_ONLY, temperature=float(np.nextafter(np.float32(1e-4), np.float32(0)))
+            ),
+            False,
+        ),
+        (dict(_TEMPERATURE_ONLY, temperature=float(np.float32(1e-4))), True),
     ],
 )
 def test_temperature_only_takes_unfiltered_unseeded_sampled_rows(params, expected):
+    params = dict(params)
+    temperature = params.pop("temperature", 0.7)
     # Greedy rows stay greedy on the sharded path whatever their filters or seed.
     greedy = [_Req(6, 0, 0.0, seed=3), _Req(7, 1, 0.7, top_k=1, top_p=None, seed=3)]
-    assert _temperature_only([_Req(5, 2, 0.7, **params), *greedy]) is expected
-    # One filtered or seeded sampled row keeps the whole batch on the stock sampler.
+    batch = [_Req(5, 2, temperature, **params), *greedy]
+    assert _temperature_only(batch) is expected
+    dspark = _metadata(samples_from_vocab_shards=True)
+    _scan(dspark, batch)
+    assert dspark.is_all_temperature_only is expected
+    assert bool(one_model_sampling_mode(batch, dspark) & 2) is expected
+    # One filtered, seeded or sub-threshold sampled row keeps the whole batch on the stock sampler.
     other = _Req(8, 3, 1.3, **_TEMPERATURE_ONLY)
-    assert _temperature_only([other, _Req(5, 2, 0.7, **params)]) is expected
+    assert _temperature_only([other, _Req(5, 2, temperature, **params)]) is expected
 
 
 def test_temperature_only_min_p_alone_samples_off_the_sharded_path():
