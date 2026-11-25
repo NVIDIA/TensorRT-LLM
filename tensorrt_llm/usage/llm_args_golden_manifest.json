@@ -1759,6 +1759,11 @@
       "path": "scheduler_config.gen_handoff_seat"
     },
     {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "scheduler_config.gen_init_pause_after_release"
+    },
+    {
       "capture_policy": "float|none",
       "kind": "value",
       "path": "scheduler_config.gen_preemption.target_output_tps"

@@ -5820,6 +5820,16 @@ def create_py_executor_resources(
             "disaggregated server, the KV cache manager V2 scheduler and no "
             "attention DP")
         gen_handoff_seat = False
+    gen_init_pause_after_release = (
+        scheduler_config is not None
+        and scheduler_config.gen_init_pause_after_release)
+    if gen_init_pause_after_release and not (isinstance(
+            kv_cache_manager, KVCacheManagerV2) and is_disagg):
+        logger.warning(
+            "scheduler_config.gen_init_pause_after_release is ignored: it "
+            "needs a disaggregated server and the KV cache manager V2 scheduler"
+        )
+        gen_init_pause_after_release = False
 
     if isinstance(kv_cache_manager, KVCacheManagerV2):
         # V2: interleaved scheduler handles both capacity and budget
@@ -5863,6 +5873,7 @@ def create_py_executor_resources(
             context_demote_probe=(scheduler_config.context_demote_probe
                                   if scheduler_config is not None else False),
             gen_handoff_seat=gen_handoff_seat,
+            gen_init_pause_after_release=gen_init_pause_after_release,
         )
     elif (scheduler_config is not None
           and scheduler_config.use_python_scheduler):

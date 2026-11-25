@@ -5750,6 +5750,19 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
             "place. Changes batch composition only."),
         status="prototype")
 
+    gen_init_pause_after_release: bool = Field(
+        default=False,
+        description=(
+            "On a disaggregated generation server with the KV cache manager V2 "
+            "scheduler: a scheduling pass right after this rank released a "
+            "finished generation request admits no generation-init request "
+            "(each admission allocates the request's KV cache). With "
+            "max_gen_init_admissions_per_pass=1, a step then makes at most one "
+            "KV allocation or release of a whole request, which every "
+            "attention-DP rank waits for. Delays the start of a KV transfer by "
+            "one pass at most; outputs are unchanged."),
+        status="prototype")
+
     @model_validator(mode="after")
     def validate_waiting_queue_max_wait_s(self) -> 'SchedulerConfig':
         if (self.waiting_queue_max_wait_s is not None

@@ -195,6 +195,8 @@ class KVCacheV2Scheduler(RequestScheduler):
     _lockstep_remote_managers: tuple = ()
 
     _ctx_decoder_held = False
+    _gen_init_pause_after_release = False
+    _gen_release_pending = False
     # Holds since take_decision_counters (see RequestScheduler.take_decision_counters).
     _num_gen_init_cap_holds = 0
     _num_gen_init_transfer_budget_holds = 0
@@ -225,6 +227,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         exact_context_demotion: bool = False,
         context_demote_probe: bool = False,
         gen_handoff_seat: bool = False,
+        gen_init_pause_after_release: bool = False,
     ) -> None:
         """``recover_lost_kv_per_rank`` False is for ranks that schedule in lock step (TP without attention DP, CP,
         PP): a failed remote cache level then raises RemoteMemError out of ``schedule_request`` instead of re-matching,
@@ -370,6 +373,12 @@ class KVCacheV2Scheduler(RequestScheduler):
                     f"{self.max_num_requests} requests a forward"
                 )
 
+        # One KV event a step (scheduler_config.gen_init_pause_after_release): a pass right
+        # after this rank released a finished generation request admits no
+        # generation-init request (note_generation_release).
+        self._gen_init_pause_after_release = gen_init_pause_after_release
+        self._gen_release_pending = False
+
         # Long-prefill demotion (opt-in). Context scheduling is FCFS, so a
         # multi-hundred-k-token prefill takes the whole token budget for as many
         # iterations as it needs while the short cached turns behind it wait. A
@@ -485,6 +494,12 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Decoder window whose final-window chunks this pass holds (ctx_decoder_batch.py); 0: none.
         self._ctx_decoder_hold_window = 0
         self._ctx_decoder_held = False
+
+    def note_generation_release(self) -> None:
+        """The executor released a finished generation request: with
+        gen_init_pause_after_release, the next pass admits no generation-init request."""
+        if self._gen_init_pause_after_release:
+            self._gen_release_pending = True
 
     def set_disagg_transfer_admission_controller(self, controller) -> None:
         """Register the executor's KV-transfer window (DisaggTransferAdmissionController).
@@ -872,6 +887,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         # --- Phase 1: generation / disagg only ---
         # Membership costs two binding calls per request; the set is usually empty.
         has_inflight = len(inflight_request_ids) > 0
+        pause_gen_init = self._gen_release_pending
+        self._gen_release_pending = False
         while req_it < req_it_end:
             req = requests_list[req_it]
 
@@ -898,7 +915,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             # no free slots remain, so the request is skipped and retried next
             # iteration. PEFT budget is still checked and committed.
             if req_state_value == self._disagg_gen_init_state_value:
-                if (
+                if pause_gen_init or (
                     self.max_gen_init_admissions_per_pass is not None
                     and len(disagg_candidates) >= self.max_gen_init_admissions_per_pass
                 ):

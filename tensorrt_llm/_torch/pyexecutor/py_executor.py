@@ -763,6 +763,9 @@ class PyExecutor:
     # Whether the overlap loop defers the KV cache close of finished
     # generation-only requests (kv_cache_config.defer_generation_only_release).
     _defer_generation_only_release = False
+    # KVCacheV2Scheduler.note_generation_release when
+    # scheduler_config.gen_init_pause_after_release is on.
+    _note_generation_release = None
     # Whether the model forward runs under torch.compile; read once at construction.
     _uses_torch_compile = False
     # TLLM_BENCHMARK_REQ_QUEUES_SIZE schedule state; see _configure_benchmark_req_queues_size.
@@ -1225,6 +1228,10 @@ class PyExecutor:
         self._defer_generation_only_release = (
             self._is_kv_manager_v2
             and self._execution_config.defer_generation_only_release)
+        self._note_generation_release = (
+            self.scheduler.note_generation_release
+            if isinstance(self.scheduler, KVCacheV2Scheduler)
+            and self.scheduler._gen_init_pause_after_release else None)
         # The KV cache manager takes Mamba snapshots inside the forward and
         # finishes them on the execution stream right after it (_forward_step).
         self._finish_inforward_snapshots = (
@@ -13134,6 +13141,10 @@ class PyExecutor:
 
     def _do_terminate_request(self, request: LlmRequest) -> None:
         self._free_request_resources(request)
+        note_release = self._note_generation_release
+        if (note_release is not None and request.is_generation_only_request
+                and not request.is_dummy_request):
+            note_release()
         # Cancellation and request-scoped failures can terminate before the
         # normal post-prefill release point, including with a partial buffer.
         self._release_multimodal_resources(request)

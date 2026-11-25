@@ -7856,6 +7856,13 @@
           "title": "Gen Handoff Seat",
           "type": "boolean"
         },
+        "gen_init_pause_after_release": {
+          "default": false,
+          "description": "On a disaggregated generation server with the KV cache manager V2 scheduler: a scheduling pass right after this rank released a finished generation request admits no generation-init request (each admission allocates the request's KV cache). With max_gen_init_admissions_per_pass=1, a step then makes at most one KV allocation or release of a whole request, which every attention-DP rank waits for. Delays the start of a KV transfer by one pass at most; outputs are unchanged.",
+          "status": "prototype",
+          "title": "Gen Init Pause After Release",
+          "type": "boolean"
+        },
         "gen_preemption": {
           "$ref": "#/$defs/GenPreemptionConfig",
           "description": "GEN slot preemption on disaggregated generation workers.",

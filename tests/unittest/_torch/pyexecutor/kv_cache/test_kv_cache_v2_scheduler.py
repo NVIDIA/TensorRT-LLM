@@ -6790,3 +6790,47 @@ class TestDisaggAdmitBeforeAlloc:
         base, gated = self._both(64, reqs)
         assert ids(base.out.generation_requests) == ids(gated.out.generation_requests) == [2, 4]
         assert gated.admitted == [0] and gated.allocated == [0, 1]
+
+
+class TestGenInitPauseAfterRelease:
+    """scheduler_config.gen_init_pause_after_release: no generation-init admission in the pass
+    right after the executor released a finished generation request."""
+
+    def test_off_by_default(self):
+        sched = make_scheduler(make_kv_cache_manager())
+        sched.note_generation_release()
+        out = sched.schedule_request([make_disagg_request(0)], set())
+        assert ids(out.fitting_disagg_gen_init_requests) == [0]
+
+    def test_the_pass_after_a_release_admits_none(self):
+        mgr = make_kv_cache_manager()
+        sched = make_scheduler(mgr, gen_init_pause_after_release=True)
+        reqs = [make_gen_request(0), make_disagg_request(1), make_disagg_request(2)]
+
+        sched.note_generation_release()
+        out = sched.schedule_request(reqs, set())
+
+        assert ids(out.generation_requests) == [0]
+        assert out.fitting_disagg_gen_init_requests == []
+        mgr.prepare_disagg_gen_init.assert_not_called()
+        # Counted with the cap's holds; the next pass admits again.
+        assert sched.take_decision_counters()[0] == 2
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.fitting_disagg_gen_init_requests) == [1, 2]
+
+    def test_with_one_admission_a_pass_a_step_makes_one_event(self):
+        sched = make_scheduler(
+            make_kv_cache_manager(),
+            gen_init_pause_after_release=True,
+            max_gen_init_admissions_per_pass=1,
+        )
+        pending = [make_disagg_request(1), make_disagg_request(2)]
+        admitted = []
+        for released in (False, True, False, False):
+            if released:
+                sched.note_generation_release()
+            out = sched.schedule_request(pending, set())
+            got = ids(out.fitting_disagg_gen_init_requests)
+            admitted.append(got)
+            pending = [req for req in pending if req.py_request_id not in got]
+        assert admitted == [[1], [], [2], []]
