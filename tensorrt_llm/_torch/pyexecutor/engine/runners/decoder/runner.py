@@ -645,8 +645,13 @@ class DecoderRunner(ScheduledModelRunner):
         if not isinstance(decoder_model, DecoderModelForCausalLM):
             raise ValueError("breakable prefill CUDA graph requires a decoder model body")
         dynamic_eplb = isinstance(self._moe_load_balancer, PerLayerDynamicMoeLoadBalancer)
+        # A layer joins the parent MoE graph in its ``load_balancer_overlap`` scope,
+        # which only the DeepSeek-V4 MoE block opens around its routed experts.
         if dynamic_eplb and (
-            not getattr(decoder_model.model, "_supports_dynamic_eplb_breakable_prefill", False)
+            not any(
+                getattr(module, "_per_layer_dynamic_eplb_enabled", False)
+                for module in decoder_model.model.modules()
+            )
             or get_sm_version() not in (100, 103)
         ):
             raise ValueError(

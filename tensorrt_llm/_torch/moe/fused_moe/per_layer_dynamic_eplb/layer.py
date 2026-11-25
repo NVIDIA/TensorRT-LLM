@@ -10,6 +10,9 @@ from typing import TYPE_CHECKING, Any, Callable, Iterator, Optional, Sequence
 
 import torch
 
+from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph.context import is_parent_moe_graph_enabled
+from tensorrt_llm.llmapi.llm_args import _PER_LAYER_DYNAMIC_EPLB_PREFILL_CAPTURE_TOKENS
+
 from ..impl_contract import MoEReplicaPlan
 
 if TYPE_CHECKING:
@@ -303,6 +306,16 @@ class PerLayerDynamicMoeLayerLoadBalancer:
         physical routes are lent to the caller, so independent main-stream work
         such as shared experts overlaps planning and the helper-weight copy.
         """
+        if is_parent_moe_graph_enabled() and (
+            self._graph_generation is None
+            or not offset_by_ep_rank
+            or token_selected_experts.shape[0] != _PER_LAYER_DYNAMIC_EPLB_PREFILL_CAPTURE_TOKENS
+        ):
+            raise ValueError(
+                "Breakable prefill CUDA graph with dynamic EPLB requires an attention-DP MoE "
+                f"that routes {_PER_LAYER_DYNAMIC_EPLB_PREFILL_CAPTURE_TOKENS} tokens inside "
+                "its load_balancer_overlap scope"
+            )
         del offset_by_ep_rank  # HALO-Q consumes global logical expert IDs.
         if overlap_fn is not None and not callable(overlap_fn):
             raise TypeError("overlap_fn must be callable")

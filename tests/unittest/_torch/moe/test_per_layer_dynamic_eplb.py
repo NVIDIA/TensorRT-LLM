@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -16,6 +17,7 @@ from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     maybe_create_moe_load_balancer,
 )
 from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb import PerLayerDynamicMoeLoadBalancer
+from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph.context import enable_parent_moe_graph
 
 pytestmark = pytest.mark.cpu_only
 
@@ -238,6 +240,41 @@ def test_load_balancer_overlap_is_consumed_once_and_always_cleared():
         with MoE.load_balancer_overlap(moe, None):
             pass
     assert MoE._load_balancer_uses_replica_plan(moe)
+
+
+def test_load_balancer_overlap_opens_the_parent_moe_graph():
+    events = []
+
+    class _Layer:
+        produces_replica_plan = True
+
+        @contextmanager
+        def use_parent_moe_graph(self):
+            events.append("enter")
+            try:
+                yield
+            finally:
+                events.append("exit")
+
+    moe = SimpleNamespace(layer_load_balancer=_Layer(), _load_balancer_overlap_fn=None)
+
+    with MoE.load_balancer_overlap(moe, lambda: None):
+        events.append("eager")
+    with enable_parent_moe_graph(), MoE.load_balancer_overlap(moe, lambda: None):
+        events.append("graph")
+    assert events == ["eager", "enter", "graph", "exit"]
+
+
+def test_route_rejects_a_parent_graph_forward_outside_the_overlap_scope():
+    manager = _manager()
+    layer = manager.add_layer(expert_count=16, top_k=2, slot_count_per_rank=6)
+    group = _Group()
+    layer.bind_runtime(arena=_Arena(), scheduler_group=group)
+
+    with enable_parent_moe_graph(), pytest.raises(ValueError, match="load_balancer_overlap"):
+        layer.route(torch.tensor([[0, 1]], dtype=torch.int32), True)
+    assert group.events == []
+    assert layer.replica_plan is None
 
 
 def test_layer_disables_standard_host_migration_and_checks_geometry():
