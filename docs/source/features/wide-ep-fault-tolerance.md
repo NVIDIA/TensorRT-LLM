@@ -39,8 +39,8 @@ reason, but not all of them: see [Limitations](#limitations) for what it checks 
   GDRCopy.
 - No pipeline parallelism, beam search, LM head TP in attention DP (`enable_lm_head_tp_in_adp`), KV-cache-aware
   attention-DP routing or admission, KV cache events, KV cache connector or compression, NUMA binding of the host cache
-  tier (`host_cache_bind_to_gpu_numa_node`), disaggregated serving, sleep mode, routed-expert capture
-  (`enable_return_routed_experts`) or `modeling_v2: require`.
+  tier (`host_cache_bind_to_gpu_numa_node`), KV pool rebalance (`enable_kv_pool_rebalance`), disaggregated serving,
+  sleep mode, routed-expert capture (`enable_return_routed_experts`) or `modeling_v2: require`.
 - Each node's GPUs given to one deployment. A restarted node supervisor starts a rank's replacement only once NVML
   lists no compute process on that rank's GPU. A GPU that NVML cannot check counts as a replacement that could not
   start.
