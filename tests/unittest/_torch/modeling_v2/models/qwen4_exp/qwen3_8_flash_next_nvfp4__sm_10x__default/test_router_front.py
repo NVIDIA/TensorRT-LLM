@@ -186,6 +186,9 @@ def test_decode_forms_line_names_what_engaged(monkeypatch):
         hc_tiles=True,
         dp_gqa_min_requests=8,
         dp_topk_cluster_rows=256,
+        dp_gqa_bitmap=2,
+        hc_first_x2=True,
+        index_key_fp8=True,
     )
     line = M._decode_forms(core)
     assert line.startswith("decode forms: rank 2 of 4: moe comm lamport_step, ")
@@ -198,6 +201,12 @@ def test_decode_forms_line_names_what_engaged(monkeypatch):
         "out-proj gdn rows []",
         "grouped gqa from requests 8",
         "cluster top-k up to rows 256",
+        "bitmap gqa from requests 2",
+        "hc first x2 True",
+        "route fast2 rows []",
+        "draft moe tile False",
+        "launch order False",
+        "index key fp8 True",
     ):
         assert part in line
     st.decode = frozenset({4, 16})
