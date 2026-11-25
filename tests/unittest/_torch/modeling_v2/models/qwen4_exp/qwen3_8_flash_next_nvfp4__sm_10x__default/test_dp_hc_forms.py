@@ -295,3 +295,35 @@ def test_hc_site_passes_release_to_the_mixer(monkeypatch):
     target.core.hc_decode_pairs = True
     with pytest.raises(AssertionError, match="inject-norm route"):
         target._hc_site(torch.zeros(4, 8), None, None, None, None, None, True, release=True)
+
+
+_SM103 = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3),
+    reason="the input projection's bitwise claim is measured on SM103 (GB300)",
+)
+
+
+@_SM103
+@pytest.mark.parametrize("geom", sorted(M._INPROJ_RELEASE_PLANS), ids=str)
+def test_inproj_release_gemm_is_bitwise_the_stock_entry(geom):
+    """What the build's self-check requires, on random operands: at every plan of
+    `_INPROJ_RELEASE_PLANS` (rows 17..256, both MMA N rules) the bf16 mid-rows GEMM gives the
+    stock entry's bits (`_decode_projection` for the attention in-projection,
+    `low_m_bf16_mm` for the GDN one, as `_dense_mm` calls them at an attention-DP rank). A
+    failure here means the default-on `DP_INPROJ_RELEASE_ENV` turns itself off at build."""
+    dev = torch.device("cuda")
+    n, k = geom
+    gen = torch.Generator(device=dev).manual_seed(n)
+    w = (torch.randn(n, k, generator=gen, device=dev) * k**-0.5).to(torch.bfloat16)
+    x = torch.randn(256, k, generator=gen, device=dev).to(torch.bfloat16)
+    attn = geom == (14080, 2560)
+    for rows in (20, 28, 48, 64, 65, 72, 80, 96, 97, 120, 128, 144, 224, 256):
+        mpad, plan = M._inproj_plan(n, k, rows)
+        got = M._inproj_mm(x[:rows], M._InProj(0, w, mpad, plan))
+        if attn:
+            ref = M._decode_projection(x[:rows], w.t())
+        else:
+            ref = M.low_m_bf16_mm(x[:rows], w.t(), M._DECODE_PROJ_PDL)
+        torch.cuda.synchronize()
+        bad = int((got.view(torch.int16) != ref.view(torch.int16)).sum())
+        assert bad == 0, f"{geom} at {rows} rows (MMA N {mpad}): {bad} elements differ"

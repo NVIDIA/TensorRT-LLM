@@ -713,3 +713,31 @@ def test_precompile_covers_the_dp_replay_map() -> None:
         op(**kw)
         torch.cuda.synchronize()
         assert len(cr._COMPILED) == compiled, f"a step of {n} requests compiled a kernel"
+
+
+@pytest.mark.parametrize("pdl", [False, True])
+@pytest.mark.parametrize("n", [5, 12, 13, 17, 48])
+def test_dp_replay_map_is_bitwise_at_replay_slots(n, pdl) -> None:
+    """The launch-map table at replay slots of the manager's own (`separate_replay_slots`, the
+    work items' replay-slot field): two benches of one seed, one at the kernel's own mapping and
+    one at `M._gdn_replay_map(n)`, give the same output, checkpoints, history and bookkeeping at
+    the rows' replay slots."""
+    cfg = M._gdn_replay_map(n)
+    assert cfg is not None
+    t, width = 4, trep.REPLAY_WORK_ITEM_WIDTH
+    path = "all_layer" if n >= CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE else "small"
+    spec = _rank_spec((16, 48), path=path, n=n, t=t, steps=1, layers=1, slots=2 * n + 8)
+    sides = [_ReplaySlotBench(spec, 6300 + n, width) for _ in range(2)]
+    for side in sides:
+        side.prepare()
+    act = sides[0].inputs()
+    a, b = _gates(sides[0], act, True)
+    outs = []
+    for side, config in zip(sides, (None, cfg)):
+        kw = side.kwargs(0, act)
+        kw.update(g=a, beta=b, config=config, launch_with_pdl=pdl)
+        outs.append(op(**kw).clone())
+    torch.cuda.synchronize()
+    assert torch.equal(outs[1], outs[0]), f"out: {cfg} vs the kernel's own mapping at {n} requests"
+    for name, x, y in zip(_SLOT_STATE, _slot_state(sides[1]), _slot_state(sides[0])):
+        assert torch.equal(x, y), f"{name}: {cfg} vs the kernel's own mapping at {n} requests"
