@@ -26,6 +26,8 @@ import math
 
 import pytest
 import torch
+import triton
+import triton.language as tl
 
 from tensorrt_llm._torch.attention.backends.sparse.qsa import kernels as _qsa_kernels
 from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention import (
@@ -462,7 +464,9 @@ def test_request_group_prefetch_is_bitwise_and_reads_fresh_keys(requests, mixed)
     row's own position and the anchor of a block ending at one, the index key -- what the
     attention decode prologue writes -- right before the op; the scores must be the plain
     request-group kernel's bits on every visible column. With `mixed` the runs name several
-    requests (gathered after the wait)."""
+    requests (gathered after the wait). The producer here is a plain launch, complete before
+    the op starts: this pins the bits and the capture, not the re-read after the wait
+    (`test_request_group_prefetch_rereads_what_a_late_producer_stores` does)."""
     rows = 4 * requests
     spec = _case(rows, 8, pages=_WIDTH_PAGES, only_visible_blocks=True)
     spec.update(q_layout="scratch_slice", use_pdl=True)
@@ -517,6 +521,111 @@ def test_request_group_prefetch_is_bitwise_and_reads_fresh_keys(requests, mixed)
             f"replay {trial}"
         )
         _compare(graph_out, op.reference(**args))
+
+
+@triton.jit
+def _late_slot_store(
+    src, index_cache, pages, slots, page_stride, slot_stride, delay_ns, ROW: tl.constexpr
+):
+    """Releases its PDL dependents at entry, then (~`delay_ns` later) stores row i of `src` into
+    the index plane's slot (`pages[i]`, `slots[i]`): a dependent that reads that slot before its
+    griddepcontrol.wait sees the old key."""
+    tl.extra.cuda.gdc_launch_dependents()
+    t0 = tl.inline_asm_elementwise(
+        "mov.u64 $0, %globaltimer;", "=l", [], dtype=tl.int64, is_pure=False, pack=1
+    )
+    t = t0
+    while t - t0 < delay_ns:
+        t = tl.inline_asm_elementwise(
+            "mov.u64 $0, %globaltimer;", "=l", [], dtype=tl.int64, is_pure=False, pack=1
+        )
+    i = tl.program_id(0)
+    page = tl.load(pages + i)
+    slot = tl.load(slots + i)
+    offs = tl.arange(0, ROW)
+    tl.store(
+        index_cache + page * page_stride + slot * slot_stride + offs,
+        tl.load(src + i * ROW + offs),
+    )
+
+
+def _late_store(index_cache, pages, slots, keys, delay_ns: int) -> None:
+    """`index_cache[pages, slots] = keys` by a producer that releases a PDL-launched successor
+    at entry and stores ~`delay_ns` later (what the attention decode prologue may still be
+    doing when the scores start)."""
+    row = index_cache.shape[2] * index_cache.shape[3]
+    assert index_cache.stride(3) == 1 and index_cache.stride(2) == index_cache.shape[3]
+    assert keys.dtype == index_cache.dtype and keys.numel() == pages.numel() * row
+    _late_slot_store[(pages.numel(),)](
+        keys.contiguous(),
+        index_cache,
+        pages.to(torch.int64).contiguous(),
+        slots.to(torch.int64).contiguous(),
+        index_cache.stride(0),
+        index_cache.stride(1),
+        delay_ns,
+        ROW=row,
+    )
+
+
+def test_request_group_prefetch_rereads_what_a_late_producer_stores() -> None:
+    """`prefetch` behind a producer that releases it at entry and stores the run's own index
+    slots ~500 us later: the keys at or past the run's smallest position minus one compressed
+    block are read again after the wait, so the scores are the plain request-group kernel's
+    bits over the stored keys. Positive control: a key below that bound, stored the same way,
+    is read stale -- the op does start before the producer stores, so the first check would
+    see a missing or short re-read."""
+    rows, p0 = 4, 4096  # one request's verify run at 4096..4099: row 3 ends a group
+    spec = _case(rows, 8, pages=_WIDTH_PAGES, only_visible_blocks=True)
+    spec.update(q_layout="scratch_slice", use_pdl=True)
+    args = _build(spec, seed=611)
+    cr, tpb = args["compress_ratio"], args["tokens_per_block"]
+    args["request_indices"] = args["request_indices"][:1].repeat(rows).contiguous()
+    pos = p0 + torch.arange(rows, device=DEV)
+    assert int(pos[-1]) < _WIDTH_PAGES * tpb
+    args["query_positions"] = pos.to(args["query_positions"].dtype)
+    group = {**args, "rows_per_request": 4}
+    req = args["request_indices"].long()
+    visible = _visible(args)
+    q, cache = args["q"], args["index_cache"]
+    # Keys whose score is positive (a row's own index head 0): the ReLU cannot hide them.
+    key_of = {r: q[r, 0].reshape(1, -1) for r in range(rows)}
+
+    def run(pages, slots, keys):
+        """`(before, early, plain)`: the plain scores before the store, the prefetching op's
+        behind the late store, the plain scores after it."""
+        old = cache[pages, slots].clone()
+        # Compile both launches outside the timed pair (a compile would let the store finish).
+        _late_store(cache, pages, slots, old, delay_ns=0)
+        op(**{**group, "prefetch": True})
+        before = op(**group)
+        torch.cuda.synchronize()
+        _late_store(cache, pages, slots, keys, delay_ns=500_000)
+        with _watch_launches() as watcher:
+            early = op(**{**group, "prefetch": True})
+        torch.cuda.synchronize()
+        assert watcher.branch == "request_group_prefetch"
+        plain = op(**group)  # over the stored keys, the wait first
+        cache[pages, slots] = old
+        torch.cuda.synchronize()
+        return before, early, plain
+
+    # The run's own slots (the store; slot 4099 is the anchor row 3 reads at column 1024).
+    pages = args["block_table"][req, pos // tpb].long()
+    anchor = (p0 + rows) // cr - 1
+    before, early, plain = run(pages, pos % tpb, torch.cat([key_of[3]] * rows))
+    assert float(plain[3, anchor]) > 0.0 and float(before[3, anchor]) != float(plain[3, anchor])
+    assert torch.equal(early[visible].view(torch.int32), plain[visible].view(torch.int32))
+
+    # Below the re-read bound: block 5's anchor (position 23), visible to every row.
+    stale = torch.tensor([5 * cr + cr - 1], device=DEV)
+    pages = args["block_table"][req[:1], stale // tpb].long()
+    before, early, plain = run(pages, stale % tpb, key_of[0])
+    assert float(plain[0, 5]) > 0.0 and float(before[0, 5]) != float(plain[0, 5])
+    assert torch.equal(early[:, 5], before[:, 5]), (
+        "the op did not read the key before the producer stored it: this GPU or launch path "
+        "did not overlap them, so the re-read check above cannot fail"
+    )
 
 
 @pytest.mark.parametrize(
