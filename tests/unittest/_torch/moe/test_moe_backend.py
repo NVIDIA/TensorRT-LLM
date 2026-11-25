@@ -4616,6 +4616,7 @@ def test_cutedsl_bf16_refuses_a_clamp_at_materialization():
         )
 
 
+@pytest.mark.cpu_only
 def test_post_silu_clamp_mode_requires_limit():
     with pytest.raises(ValueError, match="requires a clamp value"):
         SwigluActivation(clamp_after_silu=True)
@@ -4671,6 +4672,30 @@ def test_create_moe_backend_rejects_apply_router_weight_on_input_by_declaration(
             hidden_size=512,
             intermediate_size=512,
             apply_router_weight_on_input=True,
+        )
+
+
+@pytest.mark.cpu_only
+def test_create_moe_backend_rejects_spare_slots_by_declaration(monkeypatch):
+    """A ``moe_cls`` that does not declare spare-slot support is refused under a load balancer
+    that adds the spare EPLB slots of Wide-EP fault tolerance."""
+    create_moe_module = importlib.import_module("tensorrt_llm._torch.moe.fused_moe.create_moe")
+    monkeypatch.setattr(
+        create_moe_module,
+        "get_moe_load_balancer",
+        lambda: SimpleNamespace(adds_spare_slots=True),
+    )
+
+    class _NoSpareSlots:
+        capabilities = MoEStaticCapability(supports_eplb=True)
+
+    with pytest.raises(ValueError, match="does not support the unbacked spare EPLB slots"):
+        create_moe_backend(
+            moe_cls=_NoSpareSlots,
+            routing_method=MagicMock(),
+            num_experts=8,
+            hidden_size=512,
+            intermediate_size=512,
         )
 
 

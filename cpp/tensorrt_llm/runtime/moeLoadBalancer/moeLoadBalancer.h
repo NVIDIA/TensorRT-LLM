@@ -148,7 +148,8 @@ public:
 
     std::vector<std::vector<int>> getOldRankExpertIds() const
     {
-        // This API is only used in test_moe_module to check expert placement.
+        // test_moe_module reads it to check the expert placement, and the expert restore reads it between iterations.
+        // Not safe to read while an update runs.
         return mCpuPlacementInfo.oldRankExpertIds;
     }
 
@@ -234,8 +235,8 @@ private:
     int64_t mLastUpdateTaskId = -1;
 
     // Per global slot, 1 if a live rank's slot holds no expert (-1 in the initial or an installed placement), so EPLB's
-    // updates must leave it empty. Slots of dead ranks are excluded by the dead rank mask instead. Empty if no slot is
-    // unusable.
+    // updates must leave it empty. Slots of dead ranks are excluded by the dead rank mask instead. Empty means that no
+    // slot is unusable. A non-empty vector may hold only zeros: installPlacement resizes it and never clears it.
     std::vector<uint8_t> mUnusableSlots;
 
     cudaEvent_t mUpdateWeightsDoneEvent = nullptr;
@@ -320,20 +321,20 @@ public:
     void reconfigureMaskOnly(std::vector<int> const& deadRanks);
 
     // should bind to python
-    // Set the failed ranks and install a placement per layer, while no iteration runs. Every rank must finish restoring
-    // before any rank routes with the new placement. The caller loads every local slot whose expert the placement
-    // changes before the call.
+    //! Set the failed ranks and install a placement per layer, while no iteration runs. Every rank must finish
+    //! restoring before any rank routes with the new placement. The caller loads every local slot whose expert the
+    //! placement changes before the call.
     void restorePlacement(
         std::vector<int> const& deadRanks, std::vector<std::vector<std::vector<int>>> const& layerRankExpertIds);
 
     // should bind to python
-    // End the online EPLB work of the iterations started before a rank failure, and restart the statistics and the
-    // update plan so that every survivor updates the same layers. Every launched kernel must be able to finish.
+    //! End the online EPLB work of the iterations started before a rank failure, and restart the statistics and the
+    //! update plan so that every survivor updates the same layers. Every launched kernel must be able to finish.
     void abandonIterations();
 
     // should bind to python
-    // Check that no iteration runs or is queued and that abandonIterations ended the weight updates of the last one, so
-    // that the caller may read the placement and write local slots.
+    //! Check that no iteration runs or is queued and that abandonIterations ended the weight updates of the last one,
+    //! so that the caller may read the placement and write local slots.
     void checkSlotsWritable();
 
     // Test interface to use GPU to do memcpy test functionality
