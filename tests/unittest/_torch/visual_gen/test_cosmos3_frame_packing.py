@@ -17,7 +17,7 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch.visual_gen.models.cosmos3.sim_packing import FramePacking
+from tensorrt_llm._torch.visual_gen.models.cosmos3.frame_packing import FramePacking
 from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import (
     compute_mrope_position_ids_action,
     compute_mrope_position_ids_vision,

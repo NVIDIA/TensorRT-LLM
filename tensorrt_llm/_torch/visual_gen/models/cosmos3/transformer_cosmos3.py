@@ -37,7 +37,7 @@ from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.cosmos3.checkpoint_keys import (
     remap_cosmos3_checkpoint_key,
 )
-from tensorrt_llm._torch.visual_gen.models.cosmos3.sim_packing import FramePacking
+from tensorrt_llm._torch.visual_gen.models.cosmos3.frame_packing import FramePacking
 from tensorrt_llm._torch.visual_gen.models.cosmos3.step_precision import (
     StepPrecisionController,
     install_step_precision,
