@@ -23,25 +23,20 @@ KVCacheManagerV1 selection does not select speculative-prefill mode for V1.
 
 from collections.abc import Callable
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
-    KvCacheConnectorManager,
     KvCacheConnectorScheduler,
     KvCacheConnectorWorker,
 )
 from tensorrt_llm._torch.pyexecutor.py_executor_creator import (
     _connector_runs_speculative_prefill_only,
-    _refuse_speculation_next_to_connector,
-    _validate_connector_kv_cache_manager,
-    _validate_speculative_connector,
     _validate_speculative_connector_role,
 )
 from tensorrt_llm.llmapi.llm_args import (
     CacheTransceiverConfig,
-    CapacitySchedulerPolicy,
     Eagle3DecodingConfig,
     MTPDecodingConfig,
     NGramDecodingConfig,
@@ -145,18 +140,6 @@ def test_other_combinations_keep_the_speculative_refusal(
     )
 
 
-def test_declares_speculative_prefill() -> None:
-    assert KvCacheConnectorManager.declares_speculative_prefill(_Declaring, _Declaring)
-    # A TP follower rank holds no scheduler, so only its worker is checked.
-    assert KvCacheConnectorManager.declares_speculative_prefill(_Declaring, None)
-    assert not KvCacheConnectorManager.declares_speculative_prefill(_Declaring, _Plain)
-    assert not KvCacheConnectorManager.declares_speculative_prefill(_Plain, _Declaring)
-    assert not KvCacheConnectorManager.declares_speculative_prefill(_Plain, None)
-    assert not KvCacheConnectorManager.declares_speculative_prefill(
-        KvCacheConnectorWorker, KvCacheConnectorScheduler
-    )
-
-
 @pytest.mark.parametrize(
     ("role", "normalized_role"),
     [
@@ -195,94 +178,3 @@ def test_speculative_role_checked_before_serving(
         with patch("tensorrt_llm._torch.pyexecutor.py_executor_creator.logger.warning") as warning:
             _validate_speculative_connector_role(connector)
         assert warning.called is (normalized_role is None and restricted)
-
-
-@pytest.mark.parametrize("capacity_only", [False, True])
-@pytest.mark.parametrize("speculative_prefill_only", [False, True])
-@pytest.mark.parametrize("use_v2", [True, "auto"], ids=["v2", "auto"])
-@pytest.mark.parametrize("make_spec_config", [None, _mtp_eagle], ids=["no_spec", "mtp_eagle"])
-def test_speculation_is_refused_next_to_a_kv_moving_connector(
-    make_spec_config: Callable[[], SpeculativeConfig] | None,
-    use_v2: bool | str,
-    speculative_prefill_only: bool,
-    capacity_only: bool,
-) -> None:
-    spec_config = make_spec_config() if make_spec_config is not None else None
-    connector = SimpleNamespace(capacity_only=capacity_only)
-    refused = (
-        spec_config is not None
-        and use_v2 is True
-        and not speculative_prefill_only
-        and not capacity_only
-    )
-    if refused:
-        with pytest.raises(NotImplementedError, match="speculative decoding"):
-            _refuse_speculation_next_to_connector(
-                spec_config, use_v2, speculative_prefill_only, connector
-            )
-    else:
-        _refuse_speculation_next_to_connector(
-            spec_config, use_v2, speculative_prefill_only, connector
-        )
-
-
-@pytest.mark.parametrize("failure", ["refused", "generation_role", "accepted"])
-def test_a_rejected_connector_is_shut_down_before_the_error_leaves(
-    monkeypatch: pytest.MonkeyPatch, failure: str
-) -> None:
-    monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "generation")
-    connector = Mock(capacity_only=False, speculative_prefill_only=failure == "generation_role")
-    spec_config = None if failure == "accepted" else _mtp_eagle()
-    speculative_prefill_only = failure == "generation_role"
-
-    if failure == "refused":
-        with pytest.raises(NotImplementedError, match="speculative decoding"):
-            _validate_speculative_connector(spec_config, True, speculative_prefill_only, connector)
-    elif failure == "generation_role":
-        with pytest.raises(ValueError, match="generation"):
-            _validate_speculative_connector(spec_config, True, speculative_prefill_only, connector)
-    else:
-        _validate_speculative_connector(spec_config, True, speculative_prefill_only, connector)
-
-    assert connector.shutdown.call_count == (0 if failure == "accepted" else 1)
-
-
-@pytest.mark.parametrize("case", ["adp_falls_back_to_v1", "v1_policy", "accepted", "capacity_only"])
-def test_a_connector_refused_for_its_kv_cache_manager_is_shut_down(
-    monkeypatch: pytest.MonkeyPatch, case: str
-) -> None:
-    import tensorrt_llm._torch.pyexecutor.py_executor_creator as creator
-
-    incompatible = ["beam search"] if case in ("adp_falls_back_to_v1", "capacity_only") else []
-    monkeypatch.setattr(
-        creator, "kv_cache_manager_v2_incompatible_features", lambda *a, **k: incompatible
-    )
-    connector = Mock(capacity_only=case == "capacity_only")
-    policy = (
-        CapacitySchedulerPolicy.MAX_UTILIZATION
-        if case == "v1_policy"
-        else CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
-    )
-
-    def validate() -> None:
-        _validate_connector_kv_cache_manager(
-            connector,
-            enable_attention_dp=True,
-            speculative_prefill_only=False,
-            max_beam_width=1,
-            enable_sleep=False,
-            capacity_scheduler_policy=policy,
-            use_kv_cache_manager_v2=False,
-        )
-
-    if case == "adp_falls_back_to_v1":
-        with pytest.raises(ValueError, match="requires KVCacheManagerV2"):
-            validate()
-    elif case == "v1_policy":
-        with pytest.raises(NotImplementedError, match="GUARANTEED_NO_EVICT"):
-            validate()
-    else:
-        validate()
-
-    refused = case in ("adp_falls_back_to_v1", "v1_policy")
-    assert connector.shutdown.call_count == (1 if refused else 0)

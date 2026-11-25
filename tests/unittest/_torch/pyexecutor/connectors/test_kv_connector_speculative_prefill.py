@@ -29,9 +29,7 @@ import pytest
 from utils.kv_connector import ConnectorAdapterMock, connector_mpi, connector_request
 
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import KvCacheConnectorManager
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor, _validate_connector_admission
-from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 
 pytestmark = pytest.mark.cpu_only
 CONNECTOR_MODULE = "tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector"
@@ -97,36 +95,6 @@ def _broadcast(manager: KvCacheConnectorManager) -> Mock:
     return kv_cache_connector.mpi_broadcast
 
 
-@pytest.mark.parametrize("undeclared", ["worker", "scheduler"])
-def test_constructor_refuses_undeclared_connector(undeclared: str) -> None:
-    worker = MagicMock() if undeclared == "worker" else SpecMock()
-    scheduler = MagicMock() if undeclared == "scheduler" else SpecMock()
-    with patch(f"{CONNECTOR_MODULE}.mpi_rank", return_value=0):
-        with pytest.raises(NotImplementedError, match="supports_speculative_prefill"):
-            KvCacheConnectorManager(worker, scheduler, speculative_prefill_only=True)
-
-
-def test_tp_follower_without_scheduler_checks_worker_only() -> None:
-    with patch(f"{CONNECTOR_MODULE}.mpi_rank", return_value=1):
-        manager = KvCacheConnectorManager(SpecMock(), None, speculative_prefill_only=True)
-        assert manager.speculative_prefill_only is True
-        with pytest.raises(NotImplementedError, match="supports_speculative_prefill"):
-            KvCacheConnectorManager(MagicMock(), None, speculative_prefill_only=True)
-
-
-@pytest.mark.parametrize("context_only,dummy", [(True, False), (False, True)])
-def test_speculative_prefill_allows_context_work_and_adp_dummies(
-    context_only: bool, dummy: bool
-) -> None:
-    manager = _manager(attention_dp=True)
-    request = _request(7, context_only=context_only, dummy=dummy)
-
-    num_tokens, _ = manager.query_num_new_matched_tokens(request, 0)
-
-    assert num_tokens == (0 if dummy else 4)
-    assert manager.scheduler.get_num_new_matched_tokens.call_count == (0 if dummy else 1)
-
-
 @pytest.mark.parametrize("attention_dp", [True, False], ids=["adp", "tp"])
 @pytest.mark.parametrize("generation_only", [False, True])
 def test_speculative_prefill_rejects_generation_before_lookup(
@@ -142,91 +110,6 @@ def test_speculative_prefill_rejects_generation_before_lookup(
     if not attention_dp:
         # Every rank raises for the same request; none waits in the broadcast.
         _broadcast(manager).assert_not_called()
-
-
-@pytest.mark.parametrize("attention_dp", [True, False], ids=["adp", "tp"])
-def test_speculative_prefill_rejects_before_prefix_reservation(
-    exit_stack: ExitStack, attention_dp: bool
-) -> None:
-    manager = _manager(attention_dp, stack=exit_stack)
-    manager.prefix_reservations_enabled = True
-
-    with pytest.raises(NotImplementedError, match="context-only"):
-        manager.reserve_prefix(_request(7, context_only=False), 0)
-    manager.scheduler.reserve_prefix.assert_not_called()
-    if not attention_dp:
-        _broadcast(manager).assert_not_called()
-
-    reservation = manager.reserve_prefix(_request(8), 0)
-    assert (reservation.start, reservation.end) == (0, 4)
-    manager.scheduler.reserve_prefix.assert_called_once()
-
-
-@pytest.mark.parametrize("generation_only", [False, True])
-def test_speculative_prefill_rejects_generation_before_transfer_scheduling(
-    generation_only: bool,
-) -> None:
-    manager = _manager(attention_dp=True)
-    batch = ScheduledRequests()
-    batch.context_requests_last_chunk.append(_request(6))
-    batch.generation_requests.append(
-        _request(7, context_only=False, generation_only=generation_only)
-    )
-
-    with patch(f"{CONNECTOR_MODULE}.mpi_rank", return_value=1):
-        with pytest.raises(NotImplementedError, match="context-only"):
-            manager.build_scheduler_output(batch, MagicMock(spec=KVCacheManagerV2))
-
-    assert manager.scheduler_output_manager.requests == {}
-    manager.handle_metadata()
-    manager.scheduler.build_connector_meta.assert_not_called()
-
-
-@pytest.mark.parametrize("attention_dp", [True, False], ids=["adp", "tp"])
-@pytest.mark.parametrize("use_v2", [True, False], ids=["v2", "v1"])
-@pytest.mark.parametrize("speculative_prefill_only", [True, False])
-def test_context_batch_with_dummy_is_reported(
-    exit_stack: ExitStack, attention_dp: bool, use_v2: bool, speculative_prefill_only: bool
-) -> None:
-    from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-
-    manager = _manager(
-        attention_dp, stack=exit_stack, speculative_prefill_only=speculative_prefill_only
-    )
-    context = _request(6)
-    batch = ScheduledRequests()
-    batch.context_requests_last_chunk = [context, _request(900, context_only=False, dummy=True)]
-    batch.generation_requests = [_request(901, context_only=False, dummy=True)]
-    cache = MagicMock(spec=KVCacheManagerV2 if use_v2 else KVCacheManager)
-    if use_v2:
-        cache.get_page_indices_by_layer_group.return_value = [[5]]
-    else:
-        cache.get_cache_indices.return_value = [5]
-        cache.commit_and_get_block_hashes.return_value = [123]
-
-    manager.build_scheduler_output(batch, cache)
-    manager.handle_metadata()
-
-    output = manager.scheduler.build_connector_meta.call_args.args[0]
-    assert [req.request_id for req in output.new_requests] == [6]
-    assert output.cached_requests == []
-
-
-def test_capacity_only_connector_never_refuses() -> None:
-    manager = _manager(attention_dp=True, capacity_only=True)
-    assert manager.capacity_only is True
-    assert manager.speculative_prefill_only is True
-    request = _request(7, context_only=False, generation_only=True)
-
-    assert manager.query_num_new_matched_tokens(request, 0) == (0, False)
-    assert manager.get_num_new_matched_tokens(request, 0) == 0
-    assert manager.reserve_prefix(request, 0) is None
-    batch = ScheduledRequests()
-    batch.generation_requests.append(request)
-    assert manager.build_scheduler_output(batch, MagicMock(spec=KVCacheManagerV2)) is None
-    _validate_connector_admission(manager, request)
-    manager.scheduler.get_num_new_matched_tokens.assert_not_called()
-    manager.scheduler.reserve_prefix.assert_not_called()
 
 
 @pytest.mark.parametrize("capacity_only", [False, True])

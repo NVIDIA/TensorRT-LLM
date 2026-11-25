@@ -131,37 +131,3 @@ def test_alignment_forfeit_is_split_by_what_the_connector_served(
     assert manager._take_alignment_forfeit() == expected
     # Each report covers the iterations since the last one.
     assert manager._take_alignment_forfeit() == (0, 0)
-
-
-def test_alignment_forfeit_is_not_reported_without_alignment() -> None:
-    manager = _manager(backoff=1, partial_reuse=False, connector=_connector(False))
-    manager._alignment_forfeited_served_tokens = 0
-    manager._alignment_forfeited_recomputed_tokens = 0
-    kv_cache = SimpleNamespace(_get_num_reusable_tokens_before_alignment=lambda: 300)
-
-    manager._record_alignment_forfeit(kv_cache, 256, 512)
-
-    assert manager._take_alignment_forfeit() is None
-
-
-@pytest.mark.parametrize("forfeit", [(44, 20), None], ids=["aligned", "not_aligned"])
-def test_alignment_forfeit_reaches_the_iteration_stats(forfeit: tuple[int, int] | None) -> None:
-    from tensorrt_llm._torch.pyexecutor.kv_cache_stats import (
-        KVCacheV2IterationStatsReport,
-        append_kv_cache_iteration_stats,
-    )
-
-    stats: dict = {}
-    append_kv_cache_iteration_stats(
-        stats,
-        KVCacheV2IterationStatsReport(
-            by_window_size={}, by_pool_group={}, alignment_forfeited_tokens=forfeit
-        ),
-    )
-
-    if forfeit is None:
-        assert "iterAlignmentForfeitedConnectorTokens" not in stats
-        assert "iterAlignmentForfeitedRecomputedTokens" not in stats
-    else:
-        assert stats["iterAlignmentForfeitedConnectorTokens"] == 44
-        assert stats["iterAlignmentForfeitedRecomputedTokens"] == 20

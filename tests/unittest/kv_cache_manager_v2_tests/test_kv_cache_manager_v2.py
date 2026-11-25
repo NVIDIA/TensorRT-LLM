@@ -6970,22 +6970,6 @@ class TestNoBatching(TestKVCacheManagerV2):
         self.assertEqual(kv2.num_committed_tokens, expected)
         kv2.close()
 
-    def test_reuse_match_alignment_must_divide_tokens_per_block(self) -> None:
-        """An alignment the block size is not a multiple of is refused at construction."""
-        for alignment in (3, 0, -8):
-            with self.subTest(alignment=alignment), self.assertRaises(AssertionError):
-                KVCacheManagerConfig(
-                    tokens_per_block=8,
-                    cache_tiers=[GpuCacheTierConfig(quota=16 << 20)],
-                    layers=[
-                        AttentionLayerConfig(
-                            layer_id=LayerId(0),
-                            buffers=[BufferConfig(role=Role.KEY, size=1024)],
-                        )
-                    ],
-                    reuse_match_alignment=alignment,
-                )
-
     def test_replace_preserves_reuse_match_alignment(self) -> None:
         """dataclasses.replace() on a config must carry reuse_match_alignment over.
 

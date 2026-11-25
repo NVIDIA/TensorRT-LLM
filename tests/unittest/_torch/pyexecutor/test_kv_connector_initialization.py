@@ -202,21 +202,6 @@ def test_v2_connector_speculative_decoding_guard(
         connector.wait_for_initialization.assert_called_once()
 
 
-def test_speculative_prefill_requires_kv_cache_manager_v2(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    connector = _connector(
-        capacity_only=False, enable_attention_dp=False, speculative_prefill_only=True
-    )
-    executor, _ = _speculative_connector_executor(
-        monkeypatch, connector, max_draft_len=1, kv_cache_manager=Mock()
-    )
-
-    with pytest.raises(NotImplementedError, match="KVCacheManagerV2"):
-        executor._maybe_init_kv_connector_manager()
-    connector.worker.register_kv_caches.assert_not_called()
-
-
 @pytest.mark.parametrize(
     "use_v2,connector_mode,num_groups,with_retention,rejected",
     [

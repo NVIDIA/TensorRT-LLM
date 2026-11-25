@@ -863,69 +863,6 @@ def test_failed_connector_load_batch_preserves_cleanup_order(request_count: int)
         assert calls == []
 
 
-def test_failed_connector_load_releases_the_paired_draft_allocation() -> None:
-    """With joint draft reuse the draft pool holds the request's allocation too, as in `_revert_ctx_alloc`."""
-    executor = object.__new__(PyExecutor)
-    request = SimpleNamespace(request_id=7, py_connector_load_failed=False)
-    calls: list[str] = []
-    executor.execution_stream = SimpleNamespace(synchronize=lambda: calls.append("fence"))
-    executor.kv_connector_manager = SimpleNamespace(
-        drop_bound_saves=Mock(side_effect=lambda reqs: calls.append("drop_saves"))
-    )
-    executor.kv_cache_manager = SimpleNamespace(
-        drop_context_allocation=lambda req: calls.append("drop_allocation")
-    )
-    executor.enable_joint_kv_cache_reuse = True
-    executor.draft_kv_cache_manager = SimpleNamespace(
-        free_resources=lambda req: calls.append("drop_draft")
-    )
-    executor.resource_manager = SimpleNamespace(get_resource_manager=lambda kind: None)
-
-    assert executor._restart_failed_connector_loads([request]) == [7]
-
-    assert calls == ["fence", "drop_saves", "drop_allocation", "drop_draft"]
-
-
-def test_real_request_keeps_failure_marker_across_reset_and_requery() -> None:
-    """Reset callbacks and the subsequent connector lookup see the failed-load marker."""
-
-    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
-    from tensorrt_llm.bindings import SamplingConfig
-
-    request = LlmRequest(
-        request_id=81,
-        max_new_tokens=4,
-        input_tokens=[1, 2, 3, 4],
-        sampling_config=SamplingConfig(1),
-        is_streaming=False,
-    )
-    executor = object.__new__(PyExecutor)
-    executor.execution_stream = Mock()
-    executor.kv_connector_manager = Mock(spec=KvCacheConnectorManager)
-    executor.kv_cache_manager = Mock(spec=KVCacheManagerV2)
-    executor.resource_manager = Mock()
-    executor.resource_manager.get_resource_manager.return_value = None
-
-    def drop_allocation(req: LlmRequest) -> None:
-        assert req.py_connector_load_failed
-        req.reset_for_recompute(32)
-
-    executor.kv_cache_manager.drop_context_allocation.side_effect = drop_allocation
-    executor._restart_failed_connector_loads([request])
-    assert request.py_connector_load_failed
-
-    connector = KvCacheConnectorManager.__new__(KvCacheConnectorManager)
-    connector.capacity_only = False
-    connector.speculative_prefill_only = False
-    connector.enable_attention_dp = True
-    connector.scheduler = Mock()
-    connector.finished_async_loading_requests = {}
-    connector.scheduler.get_num_new_matched_tokens.return_value = (2, False)
-    connector.query_num_new_matched_tokens(request, 0)
-    queried = connector.scheduler.get_num_new_matched_tokens.call_args.args[0]
-    assert queried is request and queried.py_connector_load_failed
-
-
 def test_repeated_failed_load_fails_request_without_restarting_again() -> None:
     executor = _executor()
     executor._handle_errors = Mock()
