@@ -115,12 +115,9 @@ if self._config.backend == "pytorch":
 
 ### 4.1 PyTorch Model Configuration
 
-In [pytorch_model_config.py](pytorch_model_config.py), `_apply_model_overrides` matches substrings of the label from `PerfTestConfig.to_string()`. Each matching rule updates the config in order. Nested fields are merged, so a model variant only needs to specify its differences. The Kimi K3 serve cases set `kv_frac:0.25` in the test list, so the harness supplies `kv_cache_config.free_gpu_memory_fraction` from the case label.
+In [pytorch_model_config.py](pytorch_model_config.py), `_apply_model_overrides` matches the model and runtime in the label from `PerfTestConfig.to_string()`. Put shared settings in the family rule and add only the differences in each variant. Matching rules run in order and merge nested fields.
 
-```python
-if 'qwen3.6_35b_a3b_fp4' in label:
-    update(moe_config={'backend': 'TRTLLM'})
-```
+For example, both Kimi K3 serve variants disable KV block reuse and use 64 tokens per block. The DEP8 variant adds `kv_cache_config.dtype='nvfp4'` and inherits those two settings. The test list supplies the KV memory fraction through `kv_frac`.
 
 ### 4.1 Test Case Configuration
 - Test cases are defined in YAML configuration files

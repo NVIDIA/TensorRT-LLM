@@ -78,6 +78,18 @@ def _mtp(max_draft_len: int) -> dict:
     return {'decoding_type': 'MTP', 'max_draft_len': max_draft_len}
 
 
+def _dspark(max_draft_len: int,
+            draft_model: str | None = None,
+            *,
+            block_size: int | None = None) -> dict:
+    config = {'decoding_type': 'DSpark', 'max_draft_len': max_draft_len}
+    if draft_model is not None:
+        config['speculative_model'] = f'{llm_models_root()}/{draft_model}'
+    if block_size is not None:
+        config['block_size'] = block_size
+    return config
+
+
 def _eagle3(draft_model: str) -> dict:
     return {
         'enable_autotuner': False,
@@ -97,15 +109,39 @@ def _apply_model_overrides(config: dict, label: str) -> None:
 
     model, _, case = label.partition('-')
 
-    if 'muse_spark_open_nvfp4-serve-pytorch' in label:
+    muse = 'muse_spark_open_nvfp4-serve-pytorch' in label
+    muse_agentx = 'muse_spark_open_nvfp4_agentx-serve-pytorch' in label
+    if muse or muse_agentx:
+        update(disable_mm_encoder=True,
+               enable_chunked_prefill=True,
+               allreduce_strategy='NCCL',
+               moe_config={'backend': 'TRTLLM'},
+               kv_cache_config={'dtype': 'fp8'})
+    if muse:
+        update(max_seq_len=49152, cuda_graph_config={'max_batch_size': 256})
+    if muse_agentx:
         update(
-            disable_mm_encoder=True,
-            enable_chunked_prefill=True,
-            allreduce_strategy='NCCL',
-            max_seq_len=49152,
-            cuda_graph_config={'max_batch_size': 256},
-            kv_cache_config={'dtype': 'fp8'},
-            moe_config={'backend': 'TRTLLM'},
+            max_seq_len=1048576,
+            scheduler_config={'capacity_scheduler_policy': 'MAX_UTILIZATION'},
+            cuda_graph_config={'batch_sizes': list(range(1, 25))},
+            prefill_cuda_graph_backend='breakable',
+            prefill_capture_num_tokens=[
+                1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 768, 1024, 1280, 1536,
+                1792, 2048, 2304, 2560, 2816, 3072, 3584, 4096, 4608, 5120,
+                5632, 6144, 6656, 7168, 7680, 8192
+            ],
+            kv_cache_config={
+                'block_reuse_config': {
+                    'swa_endpoint_rewind_tokens': 1024
+                },
+                'pool_ratio': [0.25, 0.75],
+                'host_cache_size': 171798691840
+            },
+            num_postprocess_workers=8,
+            stream_interval=20,
+            enable_tokenization_cache=True,
+            enable_iter_perf_stats=True,
+            iter_perf_stats_interval=40,
         )
 
     if 'deepseek_v41_flash_nvfp4' in label:
@@ -126,88 +162,24 @@ def _apply_model_overrides(config: dict, label: str) -> None:
         )
 
     if 'deepseek_v41_flash_nvfp4_dspark' in label:
-        update(speculative_config={
-            'decoding_type': 'DSpark',
-            'max_draft_len': 5,
-            'block_size': 5
-        })
+        update(speculative_config=_dspark(5, block_size=5))
 
-    qwen_max = 'qwen3.8_max_fp4_mtp-serve-pytorch' in label
-    flash_next = 'qwen3.8_flash_next_' in label
-    if qwen_max or flash_next:
-        # MAX TP8/MTP3 (#18071) and Flash-Next with PLE host offload (#18585).
-        update(
-            cuda_graph_config={'max_batch_size': 16 if flash_next else 32},
-            kv_cache_config={'mamba_ssm_cache_dtype': 'bfloat16'},
-            speculative_config=_mtp(3),
-        )
-    if qwen_max:
-        update(max_seq_len=8192, moe_config={'backend': 'TRTLLM'})
-    if flash_next:
-        update(enable_chunked_prefill=True)
-    if 'qwen3.8_flash_next_fp8_mtp' in label:
-        update(moe_config={'backend': 'TRTLLM'})
-    if 'qwen3.8_flash_next_fp4_mtp' in label:
-        update(moe_config={'backend': 'CUTEDSL'})
-
-    # Spark Flash-Next streaming benchmarks use these MoE backends without MTP.
-    if 'qwen3.8_flash_next_fp4-bench-pytorch-streaming-' in label:
-        update(speculative_config=None, moe_config={'backend': 'CUTEDSL'})
-    if 'qwen3.8_flash_next_fp8-bench-pytorch-streaming-' in label:
-        update(speculative_config=None, moe_config={'backend': 'CUTLASS'})
-
-    if 'kimi_k3-serve-pytorch' in label:
-        update(
-            max_seq_len=9344,
-            enable_chunked_prefill=True,
-            cuda_graph_config={
-                'max_batch_size': 16,
-                'enable_padding': False
-            },
-            kv_cache_config=_kv_without_reuse(tokens_per_block=64),
-            stream_interval=10,
-        )
-
-    # Flash-Base uses the automatic MoE backend. Only Flash pins TRTLLM.
-    if 'deepseek_v4_flash-bench' in label or 'deepseek_v4_flash_base' in label:
-        update(enable_attention_dp=True, max_seq_len=10240)
-    if 'deepseek_v4_flash-bench' in label:
-        update(
-            moe_config={'backend': 'TRTLLM'},
-            enable_chunked_prefill=True,
-        )
-
+    flash = 'deepseek_v4_flash-bench' in label
+    flash_base = 'deepseek_v4_flash_base' in label
     dspark = 'deepseek_v4_pro_dspark' in label
     nvfp4_dspark = 'deepseek_v4_pro_nvfp4_dspark' in label
+    if flash or flash_base or dspark or nvfp4_dspark:
+        update(enable_attention_dp=True, max_seq_len=10240)
+    if flash:
+        update(moe_config={'backend': 'TRTLLM'}, enable_chunked_prefill=True)
     if dspark or nvfp4_dspark:
-        draft_model = 'DeepSeek-V4-Pro-nvfp4-DSpark' if nvfp4_dspark else 'DeepSeek-V4-Pro-DSpark'
-        update(
-            enable_attention_dp=True,
-            max_seq_len=10240,
-            kv_cache_config=_kv_without_reuse(),
-            enable_chunked_prefill=False,
-            disable_overlap_scheduler=True,
-            custom_tokenizer='deepseek_v4',
-            speculative_config={
-                'decoding_type': 'DSpark',
-                'max_draft_len': 3 if nvfp4_dspark else 5,
-                'speculative_model': f'{llm_models_root()}/{draft_model}',
-            },
-        )
+        update(kv_cache_config=_kv_without_reuse(),
+               enable_chunked_prefill=False,
+               disable_overlap_scheduler=True,
+               custom_tokenizer='deepseek_v4')
     if dspark:
-        update(moe_config={'backend': 'MEGAMOE_DEEPGEMM'})
-    if nvfp4_dspark:
-        # Single-node adaptation of the disaggregated NVFP4 recipe for 8K prefill.
-        update(
-            enable_lm_head_tp_in_adp=True,
-            moe_config={
-                'backend': 'CUTEDSL',
-                'use_low_precision_moe_combine': True
-            },
-            kv_cache_config={'dtype': 'fp8'},
-            speculative_config={'block_size': 3},
-        )
-
+        update(moe_config={'backend': 'MEGAMOE_DEEPGEMM'},
+               speculative_config=_dspark(5, 'DeepSeek-V4-Pro-DSpark'))
     # Match the curated DeepSeek V4 Pro throughput and latency recipes.
     fp4_bench = 'deepseek_v4_pro_fp4-bench-pytorch-float4-'
     fp8_serve = 'deepseek_v4_pro_base_fp8-serve-pytorch-streaming-float8-'
@@ -218,68 +190,130 @@ def _apply_model_overrides(config: dict, label: str) -> None:
     latency = any(prefix + 'maxbs:128-maxnt:8448' in label
                   for prefix in (fp4_bench, fp8_serve,
                                  'deepseek_v4_pro_fp4-serve-pytorch-float4-'))
+    if nvfp4_dspark or throughput or latency:
+        update(moe_config={'use_low_precision_moe_combine': True},
+               kv_cache_config={'dtype': 'fp8'})
+    if nvfp4_dspark or throughput:
+        update(enable_lm_head_tp_in_adp=True)
+    if nvfp4_dspark:
+        # Single-node adaptation of the disaggregated NVFP4 recipe for 8K prefill.
+        update(moe_config={'backend': 'CUTEDSL'},
+               speculative_config=_dspark(3,
+                                          'DeepSeek-V4-Pro-nvfp4-DSpark',
+                                          block_size=3))
     if throughput or latency:
-        update(
-            moe_config={
-                'backend': 'TRTLLM',
-                'use_low_precision_moe_combine': True
-            },
-            max_seq_len=9256,
-            kv_cache_config={'dtype': 'fp8'},
-            speculative_config=_mtp(3 if latency else 1),
-            stream_interval=100,
-            num_postprocess_workers=4,
-        )
+        update(moe_config={'backend': 'TRTLLM'},
+               max_seq_len=9256,
+               speculative_config=_mtp(3 if latency else 1),
+               stream_interval=100,
+               num_postprocess_workers=4)
     if throughput:
         update(enable_attention_dp=True,
-               enable_lm_head_tp_in_adp=True,
                attention_dp_config={'enable_balance': True})
-
     if (throughput or latency) and '-serve-' in label:
         update(cuda_graph_config={'max_batch_size': 128 if latency else 32},
                kv_cache_config=_kv_without_reuse())
 
-    # GLM-5.3 B200 TP8/EP8 deployment recipe, without MTP.
-    if 'glm_5.3_fp8-serve-pytorch' in label:
+    qwen_max = 'qwen3.8_max_fp4_mtp-serve-pytorch' in label
+    flash_next = 'qwen3.8_flash_next_' in label
+    if qwen_max or flash_next:
+        # MAX TP8/MTP3 (#18071) and Flash-Next with PLE host offload (#18585).
         update(
-            enable_chunked_prefill=True,
-            max_seq_len=16384,
-            kv_cache_config=_kv_without_reuse(dtype='fp8'),
-            moe_config={'backend': 'DEEPGEMM'},
-            stream_interval=10,
+            cuda_graph_config={'max_batch_size': 16 if flash_next else 32},
+            kv_cache_config={'mamba_ssm_cache_dtype': 'bfloat16'},
+            speculative_config=_mtp(3),
+        )
+    if qwen_max or 'qwen3.8_flash_next_fp8_mtp' in label:
+        update(moe_config={'backend': 'TRTLLM'})
+    if qwen_max:
+        update(max_seq_len=8192)
+    if flash_next:
+        update(enable_chunked_prefill=True)
+    flash_fp4_bench = 'qwen3.8_flash_next_fp4-bench-pytorch-streaming-' in label
+    flash_fp8_bench = 'qwen3.8_flash_next_fp8-bench-pytorch-streaming-' in label
+    if flash_fp4_bench or 'qwen3.8_flash_next_fp4_mtp' in label:
+        update(moe_config={'backend': 'CUTEDSL'})
+    # Spark Flash-Next benchmarks use these MoE backends without MTP.
+    if flash_fp4_bench or flash_fp8_bench:
+        update(speculative_config=None)
+    if flash_fp8_bench:
+        update(moe_config={'backend': 'CUTLASS'})
+    if 'qwen3.8_flash_next_fp8_mtp_tep4-serve-pytorch' in label:
+        update(
+            modeling_v2='require',
+            max_seq_len=9216,
+            prefill_cuda_graph_backend='breakable',
+            prefill_capture_num_tokens=[512, 1024, 2048, 4096, 8192],
+            cuda_graph_config={'max_batch_size': 128},
+            kv_cache_config={
+                'dtype': 'fp8',
+                'enable_block_reuse': True,
+                'mamba_state_config': {
+                    'periodic_snapshot_interval': 256
+                }
+            },
         )
 
+    kimi = 'kimi_k3-serve-pytorch' in label
+    kimi_dep8 = 'kimi_k3_nvfp4_dep8-serve-pytorch' in label
+    if kimi or kimi_dep8:
+        update(enable_chunked_prefill=True,
+               kv_cache_config=_kv_without_reuse(tokens_per_block=64))
+    if kimi:
+        update(max_seq_len=9344,
+               stream_interval=10,
+               cuda_graph_config={
+                   'max_batch_size': 16,
+                   'enable_padding': False
+               })
+    if kimi_dep8:
+        update(enable_attention_dp=True,
+               max_seq_len=8192,
+               cuda_graph_config={'max_batch_size': 8},
+               moe_config={
+                   'backend': 'CUTLASS',
+                   'max_num_tokens': 131072,
+                   'use_low_precision_moe_combine': True
+               },
+               kv_cache_config={'dtype': 'nvfp4'})
+
+    glm_fp8 = model == 'glm_5.3_fp8'
     glm_flash_fp8 = model in ('glm_5.3_flash_fp8', 'glm_5.3_flash_fp8_mtp')
     glm_flash_nvfp4 = model in ('glm_5.3_flash_nvfp4',
                                 'glm_5.3_flash_nvfp4_mtp',
                                 'glm_5.3_flash_nvfp4_mtp_bf16_kv')
-    if (glm_flash_fp8 or glm_flash_nvfp4) and case.startswith('serve-pytorch'):
-        update(disable_mm_encoder=True,
-               enable_chunked_prefill=True,
-               cuda_graph_config={'max_batch_size': 64},
+    if case.startswith('serve-pytorch') and (glm_fp8 or glm_flash_fp8
+                                             or glm_flash_nvfp4):
+        update(enable_chunked_prefill=True,
+               max_seq_len=16384,
                kv_cache_config=_kv_without_reuse())
-        if glm_flash_fp8:
-            update(max_seq_len=16384,
-                   moe_config={'backend': 'TRTLLM'},
-                   kv_cache_config={'free_gpu_memory_fraction': 0.5})
+        if glm_fp8:
+            update(kv_cache_config={'dtype': 'fp8'},
+                   moe_config={'backend': 'DEEPGEMM'},
+                   stream_interval=10)
         else:
+            update(disable_mm_encoder=True,
+                   cuda_graph_config={'max_batch_size': 64})
+        if glm_flash_fp8:
+            update(moe_config={'backend': 'TRTLLM'},
+                   kv_cache_config={'free_gpu_memory_fraction': 0.5})
+        if glm_flash_nvfp4:
             # NVFP4 on SM100 requires the Modeling V2 split/fused targets.
-            update(modeling_v2='require',
-                   max_seq_len=8192,
-                   kv_cache_config={'dtype': 'fp8'})
+            update(modeling_v2='require')
+            if model.endswith('_bf16_kv'):
+                update(cuda_graph_config={'max_batch_size': 32},
+                       kv_cache_config={
+                           'dtype': 'auto',
+                           'tokens_per_block': 128,
+                           'enable_block_reuse': True,
+                           'mamba_state_config': {
+                               'additional_snapshot_offsets_from_end': [0]
+                           }
+                       })
+            else:
+                update(max_seq_len=8192, kv_cache_config={'dtype': 'fp8'})
         if '_mtp' in model:
             update(speculative_config=_mtp(3))
-        if model.endswith('_bf16_kv'):
-            update(max_seq_len=16384,
-                   cuda_graph_config={'max_batch_size': 32},
-                   kv_cache_config={
-                       'dtype': 'auto',
-                       'tokens_per_block': 128,
-                       'enable_block_reuse': True,
-                       'mamba_state_config': {
-                           'additional_snapshot_offsets_from_end': [0]
-                       }
-                   })
 
     # GLM-5.2 NVFP4 uses the MLA + DSA path with CuteDSL routed experts.
     if 'glm_5.2_fp4' in label:
@@ -295,22 +329,32 @@ def _apply_model_overrides(config: dict, label: str) -> None:
     # sequence length to avoid excessive allocations during CUDA graph capture.
     minimax_fp4 = 'minimax_m3_fp4' in label
     minimax_mxfp8 = 'minimax_m3_mxfp8' in label
+    minimax_flash = 'minimax_m3.1_flash_nvfp4' in label
+    if minimax_fp4 or minimax_mxfp8 or minimax_flash:
+        update(sparse_attention_config={'algorithm': 'minimax_m3'},
+               kv_cache_config=_kv_without_reuse())
+    if minimax_fp4 or minimax_flash:
+        update(sparse_attention_config={'implementation': 'msa'})
     if minimax_fp4 or minimax_mxfp8:
-        update(
-            enable_attention_dp=True,
-            max_seq_len=4096 if minimax_mxfp8 else 2560,
-            sparse_attention_config={'algorithm': 'minimax_m3'},
-            kv_cache_config=_kv_without_reuse(),
-        )
+        update(enable_attention_dp=True,
+               max_seq_len=4096 if minimax_mxfp8 else 2560)
     if minimax_fp4:
-        update(
-            moe_config={'backend': 'CUTLASS'},
-            sparse_attention_config={'implementation': 'msa'},
-            kv_cache_config={
-                'dtype': 'fp8',
-                'free_gpu_memory_fraction': 0.6
-            },
-        )
+        update(moe_config={'backend': 'CUTLASS'},
+               kv_cache_config={
+                   'dtype': 'fp8',
+                   'free_gpu_memory_fraction': 0.6
+               })
+    if minimax_flash:
+        update(modeling_v2='require',
+               max_seq_len=16384,
+               cuda_graph_config={'max_batch_size': 64},
+               kv_cache_config={'dtype': 'nvfp4'},
+               sparse_attention_config={
+                   'indexer_kv_dtype': 'fp8',
+                   'fuse_qkv_index_projection': True
+               })
+    if 'minimax_m3.1_flash_nvfp4_dspark' in label:
+        update(speculative_config=_dspark(7, 'MiniMax-M3.1-Flash/dspark'))
     if 'minimax_m3_fp4-bench-pytorch' in label:
         update(stream_interval=10, num_postprocess_workers=4)
 
@@ -318,14 +362,14 @@ def _apply_model_overrides(config: dict, label: str) -> None:
     if 'minimax_m3_fp4-serve-pytorch' in label:
         update(max_seq_len=4096)
 
-    # The 8K input exceeds the 2048-token budget, so serve needs chunking.
-    # Match the normalized PerfTestConfig label, including maxbs/maxnt.
-    if 'minimax_m3_fp4-serve-pytorch-float4-maxbs:128-maxnt:2048-input_output_len:8000,1000' in label:
-        update(max_seq_len=9216, enable_chunked_prefill=True)
-
-    if ('minimax_m3_mxfp8-bench-pytorch-float8-maxbs:1-maxnt:2048-'
-            'input_output_len:8000,1000' in label):
+    # The two 8K input recipes need room for 1K output; serve also needs chunking.
+    long_input = 'maxnt:2048-input_output_len:8000,1000'
+    fp4_long = 'minimax_m3_fp4-serve-pytorch-float4-maxbs:128-' + long_input in label
+    mxfp8_long = 'minimax_m3_mxfp8-bench-pytorch-float8-maxbs:1-' + long_input in label
+    if fp4_long or mxfp8_long:
         update(max_seq_len=9216)
+    if fp4_long:
+        update(enable_chunked_prefill=True)
 
     if 'gemma_4_' in label:
         update(
@@ -351,12 +395,9 @@ def _apply_model_overrides(config: dict, label: str) -> None:
 
     if 'qwen3.6_35b_a3b_fp4' in label:
         update(moe_config={'backend': 'TRTLLM'})
-    qwen_stream = any(prefix + runtime in label
-                      for prefix in ('qwen3.6_35b_a3b_fp4-',
-                                     'qwen3.6_35b_a3b_fp4_mtp-')
-                      for runtime in ('bench-pytorch-streaming',
-                                      'serve-pytorch-streaming'))
-    if qwen_stream:
+    if model in ('qwen3.6_35b_a3b_fp4',
+                 'qwen3.6_35b_a3b_fp4_mtp') and case.startswith(
+                     ('bench-pytorch-streaming', 'serve-pytorch-streaming')):
         update(moe_config={'backend': 'CUTEDSL'},
                nvfp4_gemm_config={
                    'allowed_backends':
@@ -365,7 +406,7 @@ def _apply_model_overrides(config: dict, label: str) -> None:
                enable_chunked_prefill=True,
                num_postprocess_workers=4,
                stream_interval=10)
-        if 'fp4_mtp-' in label:
+        if model.endswith('_mtp'):
             update(speculative_config=_mtp(1))
         else:
             update(kv_cache_config={'enable_block_reuse': True})
@@ -395,23 +436,16 @@ def _apply_model_overrides(config: dict, label: str) -> None:
         update(**_eagle3('gpt_oss/gpt-oss-120b-Eagle3-throughput'),
                disable_overlap_scheduler=True)
 
-    if any(pattern in label
-           for pattern in ('nemotron_3_nano_30b', 'nemotron_3_nano_4b')):
+    nano_30b = 'nemotron_3_nano_30b' in label
+    nano_omni = 'nemotron_3_nano_omni_nvfp4' in label
+    if nano_30b or nano_omni or 'nemotron_3_nano_4b' in label:
         update(kv_cache_config={'mamba_ssm_cache_dtype': 'float32'})
-
-    if 'nemotron_3_nano_30b' in label:
+    if nano_30b or nano_omni:
         update(moe_config={'backend': 'CUTLASS'})
-
-    if 'nemotron_3_nano_omni_nvfp4' in label:
-        update(
-            enable_chunked_prefill=True,
-            moe_config={'backend': 'CUTLASS'},
-            cuda_graph_config={'max_batch_size': 1},
-            kv_cache_config={
-                'free_gpu_memory_fraction': 0.8,
-                'mamba_ssm_cache_dtype': 'float32'
-            },
-        )
+    if nano_omni:
+        update(enable_chunked_prefill=True,
+               cuda_graph_config={'max_batch_size': 1},
+               kv_cache_config={'free_gpu_memory_fraction': 0.8})
 
     lightning = (model in ('nemotron_3.5_lightning_30b_nvfp4_mtp',
                            'nemotron_3.5_lightning_30b_bf16_mtp')
@@ -421,31 +455,31 @@ def _apply_model_overrides(config: dict, label: str) -> None:
     super_throughput = 'nemotron_3_super_120b_nvfp4-serve-pytorch-float' in label
     super_fp8 = 'nemotron_3_super_120b_fp8-bench-pytorch-streaming-' in label
     ultra = 'nemotron_3_ultra_550b_nvfp4-serve-pytorch-' in label
-    if lightning or super_streaming or super_throughput or super_fp8 or ultra:
+    super_case = super_streaming or super_throughput or super_fp8
+    if lightning or super_case or ultra:
         update(
             kv_cache_config={
                 'mamba_ssm_cache_dtype': 'float16',
                 'mamba_ssm_stochastic_rounding': True,
                 'mamba_ssm_philox_rounds': 5
             })
+    if lightning or super_case:
+        update(enable_chunked_prefill=True)
     if lightning or ultra:
         update(stream_interval=10, num_postprocess_workers=4)
-    if ultra:
+    bf16_lightning = lightning and 'bf16_mtp' in model
+    if super_case or bf16_lightning:
+        update(moe_config={'backend': 'CUTLASS'})
+    elif lightning or ultra:
         update(moe_config={'backend': 'CUTEDSL'})
     if lightning:
-        update(enable_chunked_prefill=True,
-               moe_config={
-                   'backend': 'CUTLASS' if 'bf16_mtp' in model else 'CUTEDSL'
-               },
-               speculative_config=_mtp(3),
+        update(speculative_config=_mtp(3),
                kv_cache_config={
                    'free_gpu_memory_fraction': 0.8,
                    'mamba_state_config': {
                        'periodic_snapshot_interval': 8192
                    }
                })
-    if super_streaming or super_throughput or super_fp8:
-        update(enable_chunked_prefill=True, moe_config={'backend': 'CUTLASS'})
     if super_fp8:
         update(disable_overlap_scheduler=True)
     if super_streaming or super_throughput:
@@ -465,93 +499,6 @@ def _apply_model_overrides(config: dict, label: str) -> None:
     if ('nemotron_3_super_120b_nvfp4-serve-pytorch-float4-maxbs:512-maxnt:2048-'
             'kv_frac:0.8-input_output_len:1024,1024-reqs:160-con:32' in label):
         update(print_iter_log=False)
-
-    # Apply the single-node variants after their shared recipes.
-    if 'kimi_k3_nvfp4_dep8-serve-pytorch' in label:
-        update(
-            enable_attention_dp=True,
-            max_seq_len=8192,
-            enable_chunked_prefill=True,
-            cuda_graph_config={'max_batch_size': 8},
-            moe_config={
-                'backend': 'CUTLASS',
-                'max_num_tokens': 131072,
-                'use_low_precision_moe_combine': True
-            },
-            kv_cache_config=_kv_without_reuse(dtype='nvfp4',
-                                              tokens_per_block=64),
-        )
-
-    if 'qwen3.8_flash_next_fp8_mtp_tep4-serve-pytorch' in label:
-        update(
-            modeling_v2='require',
-            max_seq_len=9216,
-            prefill_cuda_graph_backend='breakable',
-            prefill_capture_num_tokens=[512, 1024, 2048, 4096, 8192],
-            cuda_graph_config={'max_batch_size': 128},
-            kv_cache_config={
-                'dtype': 'fp8',
-                'enable_block_reuse': True,
-                'mamba_state_config': {
-                    'periodic_snapshot_interval': 256
-                }
-            },
-        )
-
-    if 'minimax_m3.1_flash_nvfp4' in label:
-        update(
-            modeling_v2='require',
-            max_seq_len=16384,
-            cuda_graph_config={'max_batch_size': 64},
-            kv_cache_config=_kv_without_reuse(dtype='nvfp4'),
-            sparse_attention_config={
-                'algorithm': 'minimax_m3',
-                'implementation': 'msa',
-                'indexer_kv_dtype': 'fp8',
-                'fuse_qkv_index_projection': True
-            },
-        )
-
-    if 'minimax_m3.1_flash_nvfp4_dspark' in label:
-        update(
-            speculative_config={
-                'decoding_type':
-                'DSpark',
-                'max_draft_len':
-                7,
-                'speculative_model':
-                f'{llm_models_root()}/MiniMax-M3.1-Flash/dspark'
-            })
-
-    if 'muse_spark_open_nvfp4_agentx-serve-pytorch' in label:
-        update(
-            max_seq_len=1048576,
-            enable_chunked_prefill=True,
-            allreduce_strategy='NCCL',
-            moe_config={'backend': 'TRTLLM'},
-            scheduler_config={'capacity_scheduler_policy': 'MAX_UTILIZATION'},
-            cuda_graph_config={'batch_sizes': list(range(1, 25))},
-            prefill_cuda_graph_backend='breakable',
-            prefill_capture_num_tokens=[
-                1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 768, 1024, 1280, 1536,
-                1792, 2048, 2304, 2560, 2816, 3072, 3584, 4096, 4608, 5120,
-                5632, 6144, 6656, 7168, 7680, 8192
-            ],
-            kv_cache_config={
-                'dtype': 'fp8',
-                'block_reuse_config': {
-                    'swa_endpoint_rewind_tokens': 1024
-                },
-                'pool_ratio': [0.25, 0.75],
-                'host_cache_size': 171798691840
-            },
-            disable_mm_encoder=True,
-            num_postprocess_workers=8,
-            stream_interval=20,
-            enable_tokenization_cache=True,
-            enable_iter_perf_stats=True,
-            iter_perf_stats_interval=40,
-        )
 
 
 def get_model_yaml_config(model_label: str,
