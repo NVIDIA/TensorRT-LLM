@@ -24,6 +24,7 @@ import pytest
 
 from tensorrt_llm._torch.models.checkpoints import HfWeightLoader
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
+from tensorrt_llm._torch.models.checkpoints.hf import weight_loader as wl
 from tensorrt_llm._torch.models.checkpoints.hf.weight_loader import _LAZY_SAFETENSORS_MODEL_TYPES
 from tensorrt_llm.mapping import Mapping
 
@@ -163,7 +164,6 @@ def test_weight_cache_evicts_before_load_on_miss(tmp_path, monkeypatch):
     # On a cross-model miss with a full cache (max_entries=1), the old entry
     # must be evicted BEFORE the new weights load, so CPU never holds both the
     # old (cached) and new (loading) weights at once (no transient 2x peak).
-    from tensorrt_llm._torch.models.checkpoints.hf import weight_loader as wl
 
     monkeypatch.setenv("TRTLLM_HF_WEIGHT_CACHE", "1")
     monkeypatch.setenv("TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES", "1")
@@ -198,6 +198,53 @@ def test_weight_cache_evicts_before_load_on_miss(tmp_path, monkeypatch):
             loader.load_weights(str(dir_b), mapping=Mapping())
 
     assert len(wl._WEIGHT_CACHE) == 1
+
+
+def test_weight_cache_skips_checkpoint_larger_than_host_memory(tmp_path, monkeypatch):
+    # A checkpoint that host memory cannot keep resident loads like a miss
+    # every time: it is neither fingerprinted nor stored, so no later load
+    # verifies it either, and the old entry is still evicted before it loads.
+
+    monkeypatch.setenv("TRTLLM_HF_WEIGHT_CACHE", "1")
+    monkeypatch.setenv("TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES", "1")
+
+    small_dir = tmp_path / "small"
+    small_dir.mkdir()
+    (small_dir / "model.safetensors").touch()
+    large_dir = tmp_path / "large"
+    large_dir.mkdir()
+    (large_dir / "model.safetensors").write_bytes(b"\0" * 4096)
+    # Below the admission headroom: an empty checkpoint fits, 4 KiB does not.
+    monkeypatch.setattr(wl, "effective_available_host_memory", lambda: 1 << 20)
+
+    loader = HfWeightLoader()
+    with mock.patch.object(loader, "prefetch_files"):
+        with mock.patch.object(
+            loader,
+            "_load_weights_in_parallel",
+            return_value=ConsumableWeightsDict({"foo.weight": object()}),
+        ):
+            loader.load_weights(str(small_dir), mapping=Mapping())
+        assert len(wl._WEIGHT_CACHE) == 1
+
+        def assert_room_freed_before_load(*args, **kwargs):
+            assert len(wl._WEIGHT_CACHE) == 0
+            return ConsumableWeightsDict({"foo.weight": object()})
+
+        with (
+            mock.patch.object(
+                loader,
+                "_load_weights_in_parallel",
+                side_effect=assert_room_freed_before_load,
+            ) as load_weights_in_parallel,
+            mock.patch.object(HfWeightLoader, "_fingerprint") as fingerprint,
+        ):
+            loader.load_weights(str(large_dir), mapping=Mapping())
+            loader.load_weights(str(large_dir), mapping=Mapping())
+
+    assert load_weights_in_parallel.call_count == 2
+    fingerprint.assert_not_called()
+    assert len(wl._WEIGHT_CACHE) == 0
 
 
 def test_weight_cache_disabled_by_default(tmp_path, monkeypatch):
@@ -305,6 +352,56 @@ def test_cache_hit_and_miss_issue_identical_collectives(tmp_path, monkeypatch):
     assert sequences["hit"] == sequences["miss"]  # divergence-safe ordering
 
 
+def test_cache_skip_issues_the_miss_collectives(tmp_path, monkeypatch):
+    # Ranks check host memory on their own, so near the limit one rank can
+    # skip the cache while another misses: the skip must enqueue the same
+    # collectives as a miss (Allreduce, then Barrier).
+
+    monkeypatch.setenv("TRTLLM_HF_WEIGHT_CACHE", "1")
+
+    checkpoint_dir = tmp_path / "foo"
+    checkpoint_dir.mkdir()
+    (checkpoint_dir / "model.safetensors").write_bytes(b"\0" * 4096)
+
+    loader = HfWeightLoader()
+    sequences = {"miss": [], "skip": []}
+    current: list = []
+
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.models.checkpoints.hf.weight_loader.local_mpi_barrier",
+        lambda: current.append("barrier"),
+    )
+
+    def record_allreduce():
+        current.append("allreduce")
+        return 1 << 60  # plenty of host memory
+
+    with (
+        mock.patch.object(
+            loader,
+            "_load_weights_in_parallel",
+            return_value=ConsumableWeightsDict({"foo.weight": object()}),
+        ),
+        mock.patch.object(loader, "prefetch_files"),
+        mock.patch.object(
+            HfWeightLoader,
+            "_get_local_available_host_memory",
+            side_effect=record_allreduce,
+        ),
+    ):
+        current = sequences["miss"]
+        loader.load_weights(str(checkpoint_dir), mapping=Mapping())
+        HfWeightLoader._clear_weight_cache()
+        # Below the admission headroom: the 4 KiB checkpoint does not fit.
+        monkeypatch.setattr(wl, "effective_available_host_memory", lambda: 1 << 20)
+        current = sequences["skip"]
+        loader.load_weights(str(checkpoint_dir), mapping=Mapping())
+
+    assert sequences["miss"] == ["allreduce", "barrier"]
+    assert sequences["skip"] == sequences["miss"]
+    assert len(wl._WEIGHT_CACHE) == 0
+
+
 def test_prefetch_one_file_reports_full_file_in_bounded_windows(tmp_path, monkeypatch):
     # Prefetch must never hold more than one window per thread in memory:
     # whole-file reads pinned up to hundreds of GB across ranks on slow
@@ -312,7 +409,6 @@ def test_prefetch_one_file_reports_full_file_in_bounded_windows(tmp_path, monkey
     # read fallback share the same window size, so this holds on whichever
     # path the host kernel supports; every byte must be reported exactly
     # once, including a trailing partial window.
-    from tensorrt_llm._torch.models.checkpoints.hf import weight_loader as wl
 
     monkeypatch.setattr(wl, "_PREFETCH_CHUNK_SIZE_BYTES", mmap.PAGESIZE)
     file = tmp_path / "model.safetensors"
@@ -329,7 +425,6 @@ def test_prefetch_one_file_reports_full_file_in_bounded_windows(tmp_path, monkey
 def test_prefetch_one_file_chunked_fallback_when_populate_unsupported(tmp_path, monkeypatch):
     # Force the MADV_POPULATE_READ path to report "unsupported" so the chunked
     # readinto fallback is exercised even on kernels that support population.
-    from tensorrt_llm._torch.models.checkpoints.hf import weight_loader as wl
 
     monkeypatch.setattr(wl, "_PREFETCH_CHUNK_SIZE_BYTES", mmap.PAGESIZE)
     monkeypatch.setattr(wl, "populate_file_pages", lambda *args, **kwargs: 0)
@@ -348,7 +443,6 @@ def test_prefetch_one_file_resumes_reads_after_partial_populate(tmp_path, monkey
     # If population stops early (e.g. a transient madvise failure), the
     # chunked reads must resume from that offset: every byte prefetched and
     # reported exactly once, none twice.
-    from tensorrt_llm._torch.models.checkpoints.hf import weight_loader as wl
 
     monkeypatch.setattr(wl, "_PREFETCH_CHUNK_SIZE_BYTES", mmap.PAGESIZE)
 
@@ -377,7 +471,6 @@ def test_prefetch_one_file_logs_partial_populate_once(tmp_path, monkeypatch):
     # A populate that consistently stops partway must be visible in the log
     # (once per process, with the populated byte count) — otherwise every
     # file silently pays for both a partial populate and a chunked read.
-    from tensorrt_llm._torch.models.checkpoints.hf import weight_loader as wl
 
     monkeypatch.setattr(wl, "_PREFETCH_CHUNK_SIZE_BYTES", mmap.PAGESIZE)
     monkeypatch.setattr(wl, "_PREFETCH_FALLBACK_LOGGED", threading.Event())
@@ -404,8 +497,6 @@ def test_prefetch_one_file_fallback_logs_once_across_threads(tmp_path, monkeypat
     # The once-per-process fallback log must stay single-shot when many files
     # fall back concurrently: the check-and-set is atomic under a lock.
     from concurrent.futures import ThreadPoolExecutor
-
-    from tensorrt_llm._torch.models.checkpoints.hf import weight_loader as wl
 
     monkeypatch.setattr(wl, "_PREFETCH_CHUNK_SIZE_BYTES", mmap.PAGESIZE)
     monkeypatch.setattr(wl, "_PREFETCH_FALLBACK_LOGGED", threading.Event())
@@ -437,7 +528,6 @@ def test_read_file_in_chunks_no_buffer_when_nothing_to_read(tmp_path, monkeypatc
     # When population covered the whole file, the fallback must return before
     # allocating its buffer: with this chunk size an allocation attempt would
     # raise MemoryError, so returning 0 proves the allocation was skipped.
-    from tensorrt_llm._torch.models.checkpoints.hf import weight_loader as wl
 
     monkeypatch.setattr(wl, "_PREFETCH_CHUNK_SIZE_BYTES", 1 << 62)
     payload = os.urandom(mmap.PAGESIZE)
@@ -448,8 +538,6 @@ def test_read_file_in_chunks_no_buffer_when_nothing_to_read(tmp_path, monkeypatc
 
 
 def test_prefetch_one_file_no_fallback_log_when_fully_populated(tmp_path, monkeypatch):
-    from tensorrt_llm._torch.models.checkpoints.hf import weight_loader as wl
-
     monkeypatch.setattr(wl, "_PREFETCH_CHUNK_SIZE_BYTES", mmap.PAGESIZE)
     monkeypatch.setattr(wl, "_PREFETCH_FALLBACK_LOGGED", threading.Event())
     payload = os.urandom(2 * mmap.PAGESIZE)
@@ -473,7 +561,6 @@ def test_prefetch_files_emits_progress_heartbeat(tmp_path, monkeypatch):
     # The heartbeat is what keeps a slow prefetch observable (and alive under
     # output-stall watchdogs); with the log interval forced to zero it must
     # fire for every chunk.
-    from tensorrt_llm._torch.models.checkpoints.hf import weight_loader as wl
 
     monkeypatch.setattr(wl, "_PREFETCH_CHUNK_SIZE_BYTES", mmap.PAGESIZE)
     monkeypatch.setattr(wl, "_PREFETCH_LOG_INTERVAL_SEC", 0.0)

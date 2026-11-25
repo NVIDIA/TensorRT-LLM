@@ -163,6 +163,11 @@ routes is never served by a dense kernel. Both the contiguous prefill path,
 used by diffusion models that keep no KV cache, and the paged generation path
 are provided by the vendored PrimTS kernels.
 
+Both `k_summary` and `v_summary` are arithmetic means over the tokens present
+in each KV block. A partial final block excludes padding from its mean. The
+kernel weights each proxy by its represented token count; do not pass V sums
+or pre-weight the summaries.
+
 This is an attention capability, not a standalone public
 `SparseAttentionConfig` algorithm. A user-facing algorithm must also provide
 the selector, metadata, and backend integration.
@@ -240,8 +245,8 @@ During decode, it scores retained pages and attends to the selected Top-K
 pages.
 
 RocketKV currently requires CUDA compute capability 10.0 or newer. KV-cache
-block reuse and chunked prefill must be disabled, and disaggregated serving is
-not supported.
+block reuse and chunked prefill must be disabled. Speculative decoding,
+disaggregated serving, KV-cache compression, and beam search are not supported.
 
 ```python
 from tensorrt_llm import LLM, SamplingParams
@@ -274,6 +279,17 @@ enable_chunked_prefill: false
 
 The TRTLLM and Vanilla attention implementations support RocketKV. The
 Vanilla implementation requires a BF16 KT cache.
+
+RocketKV follows `kv_cache_config.use_kv_cache_manager_v2`. With the V2 KV
+cache manager (the default), each KV cache block also stores the KT rows of its
+request, so the KV cache memory budget covers the KT cache. The V2 manager has
+these additional restrictions:
+
+- Sleep mode (`sleep_config`) is not supported; it requires the V1 manager
+  (`kv_cache_config.use_kv_cache_manager_v2: false`).
+- `kv_cache_config.enable_swa_scratch_reuse` must be disabled.
+- Every attention layer must have the same number of KV heads and the same head
+  size on each rank, and all layers must share one attention window.
 
 #### DeepSeek Sparse Attention
 
@@ -352,23 +368,42 @@ sparse_attention_config:
 
 | Constraint | CSA2 support |
 |---|---|
-| Hardware | SM90: FlashMLA BF16; SM100 family: native trtllm-gen; SM120/121: FlashInfer BF16 FA2 |
+| Hardware | SM100 family: native trtllm-gen. SM90 (FlashMLA BF16) and SM120/121 (FlashInfer BF16 FA2) only for checkpoints without candidate-consumer layers |
 | Attention shape | One KV head, 512-dimensional queries/values, 448 non-RoPE and 64 RoPE channels; checkpoint-defined Q heads |
 | Compression | Ratios `0` (SWA only), `1`, `2`; checkpoint-defined shared KV/index sources |
 | KV-cache block size | `128` or `256` tokens |
 | Persistent cache | Fixed E4M3 SWA, NVFP4 main/index records; `dtype` selects compute staging |
 | Staging | BF16; FP8 on native trtllm-gen without packed attention via `dtype: fp8` or `fp8_ds_mla` |
 | Parallelism | TP/EP and attention DP; PP/CP and disabled-layer masks unsupported |
-| Runtime | Chunked prefill, prefix reuse, overlap and CUDA graphs; embedded DSpark linear verification; tree verification unsupported |
+| Runtime | Chunked prefill, prefix reuse, overlap and CUDA graphs; embedded DSpark linear verification; tree verification and `kv_cache_config.enable_kv_pool_rebalance` unsupported |
+
+Candidate-consumer layers (index-source layers after the checkpoint's
+`candidate_source_layer_id`; the released checkpoint has them) score their
+candidates with DeepGEMM sparse MQA logits. A checkpoint with such layers needs
+an SM100-family GPU, a DeepGEMM build with those kernels, 32 index heads of 128
+dimensions and a `candidate_block_size` that is a multiple of 8; otherwise model
+construction fails with an error that names the missing requirement.
 
 Decoder bounded replay is an **approximation enabled by default** for eligible
 CED layouts. It computes a trailing Decoder window while the Encoder produces
 the complete GLOBAL history. Set `TRTLLM_V41_DECODER_BOUNDED_REPLAY=0` before
-starting workers to use full Decoder prefill. Encoder replay is opt-in via
-`TRTLLM_V41_ENCODER_REPLAY=1` and requires Decoder bounded replay; it permits
-eviction and recovery of OPTIONAL Encoder SWA state. Set these consistently
-for all workers. Replay eligibility and output requirements can retain full
-prefill, as described in the [CSA2 implementation guide](../../../tensorrt_llm/_torch/attention/backends/sparse/csa2/README.md).
+starting workers to use full Decoder prefill. The replay window is 140 tokens,
+or one more than the required SWA window (including an embedded DSpark capture
+window) when that is larger; `TRTLLM_V41_BOUNDED_REPLAY_TOKENS` overrides it and
+must exceed the required window. Encoder replay is also enabled by default when
+Decoder bounded replay runs with CED precompute, as on the released checkpoint:
+prefix reuse can then evict OPTIONAL Encoder SWA state and recover it by
+approximate bounded replay over the same window. Set
+`TRTLLM_V41_ENCODER_REPLAY=0` to keep REQUIRED Encoder state instead. Without
+CED precompute, or when `max_num_tokens` does not exceed the replay window,
+Encoder state stays REQUIRED; an explicit `TRTLLM_V41_ENCODER_REPLAY=1` then
+fails model construction in the first case and is ignored with a warning in the
+second. When Encoder replay and prefix block reuse are enabled, its window must also be at least
+`kv_cache_config.tokens_per_block`; smaller combinations are rejected during
+cache initialization and sizing. With 256-token blocks, set
+`TRTLLM_V41_BOUNDED_REPLAY_TOKENS` to at least 256. Set these consistently for
+all workers. Replay eligibility and output
+requirements can retain full prefill, as described in the [CSA2 implementation guide](../../../tensorrt_llm/_torch/attention/backends/sparse/csa2/README.md).
 
 Validate task accuracy against full prefill on the intended checkpoint before
 deploying bounded replay or optional packed/approximate selector paths. Include
@@ -420,7 +455,9 @@ scales. Dense target layers and the shared Eagle3 draft layer keep FP8 caches.
 Prefill uses MSA kernels; decode uses TensorRT LLM's Triton sparse kernels
 within the MSA backend. This does not select `implementation: triton`.
 The optional `fuse_qkv_index_projection: true` supports FP8 and NVFP4 main
-caches with an FP8 indexer.
+caches with an FP8 indexer. The MiniMax-M3.1-Flash targets of the Modeling V2
+`minimax_m3` family also accept a standalone DSpark drafter; see the
+deployment guide.
 
 The sparse path has no dense fallback and does not support KV-cache reuse.
 Eagle3 supports one shared draft layer and linear drafting; other MTP/tree

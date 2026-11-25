@@ -1,12 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
 
 import copy
 from pathlib import Path
 
 import pytest
+from openai_codex.errors import TransportClosedError
 from openai_codex.generated.v2_all import (
     DynamicToolSpec,
     FunctionDynamicToolSpec,
+    ThreadForkParams,
     ThreadStartParams,
 )
 from pydantic import TypeAdapter
@@ -41,9 +46,15 @@ class FakeTransport:
             if isinstance(self.config_read_response, Exception):
                 raise self.config_read_response
             return self.config_read_response
-        if method == "thread/start":
+        if method in ("thread/start", "thread/fork"):
             self.thread_count += 1
-            return {"thread": {"id": f"thread-{self.thread_count}"}}
+            return {
+                "thread": {"id": f"thread-{self.thread_count}"},
+                "model": "resolved-native-model",
+                "reasoningEffort": "medium",
+                "sandbox": {"type": "workspaceWrite"},
+                "approvalPolicy": "on-request",
+            }
         if method == "skills/list":
             return {
                 "data": [
@@ -116,6 +127,34 @@ async def test_backend_disables_skills_in_codex_config(monkeypatch):
         )
 
 
+async def test_backend_can_run_without_the_users_plugins(monkeypatch):
+    monkeypatch.setattr(codex_module, "CodexTransport", FakeTransport)
+    monkeypatch.setattr(codex_module, "_resolve_codex_bin", lambda: "/configured/codex")
+    from agent_flow.backends import create_backend
+    from agent_flow.config import BackendConfig
+
+    instance = create_backend(BackendConfig(kind="codex", model="m", plugins=False))
+    async with instance:
+        assert instance._transport.config.config_overrides == (
+            "features.plugins=false",
+            "features.apps=false",
+        )
+
+
+async def test_backend_leaves_state_configuration_to_the_native_cli(monkeypatch, tmp_path):
+    monkeypatch.setattr(codex_module, "CodexTransport", FakeTransport)
+    monkeypatch.setattr(codex_module, "_resolve_codex_bin", lambda: "/configured/codex")
+    native = {"CODEX_HOME": str(tmp_path / "home"), "CODEX_SQLITE_HOME": str(tmp_path / "sqlite")}
+    for key, value in native.items():
+        monkeypatch.setenv(key, value)
+    async with CodexBackend() as instance:
+        config = instance._transport.config
+        assert config.env is None
+        assert config.config_overrides == ()
+    assert {key: codex_module.os.environ[key] for key in native} == native
+    assert not (tmp_path / "home").exists() and not (tmp_path / "sqlite").exists()
+
+
 async def test_session_options_use_developer_instructions_and_preserve_native_defaults(
     backend, tmp_path
 ):
@@ -129,12 +168,18 @@ async def test_session_options_use_developer_instructions_and_preserve_native_de
         assert payload["cwd"] == str(tmp_path.resolve())
         assert payload["developerInstructions"] == "Project instructions"
         assert "baseInstructions" not in payload
-        assert payload["approvalPolicy"] == "never"
-        assert payload["sandbox"] == "danger-full-access"
-        assert payload["config"]["model_reasoning_effort"] == backend.reasoning_effort()
+        assert "approvalPolicy" not in payload and "sandbox" not in payload
+        assert client._session_init.sandbox == "workspace-write"
+        assert client._session_init.approval_policy == "on-request"
+        assert "model_reasoning_effort" not in payload["config"]
+        assert "model_context_window" not in payload["config"]
         assert payload["dynamicTools"] == [_dynamic_tool_spec(read_tool)]
         assert transport.registered == {"thread-1": [read_tool]}
         assert await client.list_available_skills() == ["available"]
+        assert client._session_init.backend == "codex"
+        assert client._session_init.model == "resolved-native-model"
+        assert client._session_init.reasoning_effort == "medium"
+        assert client._session_init.session_id == "thread-1"
     assert transport.registered == {}
     assert transport.unregistered == ["thread-1"]
     assert ("thread/unsubscribe", {"threadId": "thread-1"}) in transport.requests
@@ -142,6 +187,61 @@ async def test_session_options_use_developer_instructions_and_preserve_native_de
 
 def test_reasoning_effort_override():
     assert CodexBackend(reasoning_effort="ultra").reasoning_effort() == "ultra"
+
+
+async def test_explicit_effort_is_sent_without_overriding_model_capacity(backend, tmp_path):
+    backend._reasoning_effort = "high"
+    async with backend.create_client("", "", cwd=tmp_path):
+        payload = next(
+            params for method, params in backend._transport.requests if method == "thread/start"
+        )
+        assert payload["config"]["model_reasoning_effort"] == "high"
+        assert "model_context_window" not in payload["config"]
+        assert "model" not in payload
+
+
+async def test_fork_preserves_history_and_applies_child_session_options(backend, tmp_path):
+    backend._reasoning_effort = "high"
+    async with backend.create_client(
+        "Worker instructions",
+        "worker-model",
+        cwd=tmp_path,
+        fork_from="primer-thread",
+        extra_mcp_servers={"files": {"command": "files-server"}},
+        disallowed_tools=["mcp__files__write", "Bash"],
+    ) as client:
+        transport = backend._transport
+        method, payload = next(
+            (method, params) for method, params in transport.requests if method == "thread/fork"
+        )
+        validated = ThreadForkParams.model_validate(payload)
+        assert validated.thread_id == "primer-thread"
+        assert validated.exclude_turns is True
+        assert validated.cwd == str(tmp_path.resolve())
+        assert validated.developer_instructions == "Worker instructions"
+        assert validated.model == "worker-model"
+        assert "approvalPolicy" not in payload and "sandbox" not in payload
+        assert payload["config"]["model_reasoning_effort"] == "high"
+        assert payload["config"]["features"]["shell_tool"] is False
+        assert payload["config"]["mcp_servers"]["files"]["disabled_tools"] == ["write"]
+        assert "dynamicTools" not in payload
+        assert not any(method == "thread/start" for method, _ in transport.requests)
+        assert client._session_init.session_id != "primer-thread"
+        assert transport.registered == {"thread-1": []}
+    assert ("thread/unsubscribe", {"threadId": "thread-1"}) in transport.requests
+    assert not any(
+        method == "thread/unsubscribe" and params.get("threadId") == "primer-thread"
+        for method, params in transport.requests
+    )
+
+
+async def test_fork_does_not_silently_drop_new_dynamic_tools(backend, tmp_path):
+    with pytest.raises(ValueError, match="cannot introduce dynamic tools"):
+        async with backend.create_client(
+            "", "", tools=[read_tool], fork_from="primer", cwd=tmp_path
+        ):
+            pytest.fail("a fork cannot advertise new dynamic tools")
+    assert not any(method == "thread/fork" for method, _ in backend._transport.requests)
 
 
 async def test_empty_prompt_does_not_replace_runtime_instructions(backend, tmp_path):
@@ -416,3 +516,76 @@ async def test_client_requires_entered_backend():
     with pytest.raises(RuntimeError, match="must be entered"):
         async with CodexBackend().create_client("", "gpt-5.4", cwd=Path.cwd()):
             pytest.fail("an unopened backend must not create a client")
+
+
+async def test_explicit_writable_roots_preserve_native_roots_without_selecting_permissions(
+    backend, tmp_path
+):
+    backend._writable_roots = (str(tmp_path / "repo"),)
+    backend._transport.config_read_response = {
+        "config": {"sandbox_workspace_write": {"writable_roots": ["/native/shared"]}},
+        "layers": [
+            {
+                "name": {"type": "project"},
+                "disabledReason": "untrusted",
+                "config": {"sandbox_workspace_write": {"writable_roots": ["/untrusted"]}},
+            }
+        ],
+    }
+    async with backend.create_client("", "", cwd=tmp_path) as client:
+        payload = next(p for m, p in backend._transport.requests if m == "thread/start")
+        assert "sandbox" not in payload and "approvalPolicy" not in payload
+        assert payload["config"]["sandbox_workspace_write"] == {
+            "writable_roots": ["/native/shared", str((tmp_path / "repo").resolve())]
+        }
+        assert client._session_init.sandbox == "workspace-write"
+        assert not any(m == "configRequirements/read" for m, _ in backend._transport.requests)
+
+
+async def test_startup_failure_is_reported_once_without_replacing_the_runtime(monkeypatch):
+    starts = []
+
+    class Unavailable(FakeTransport):
+        async def start(self):
+            starts.append(self)
+            raise TransportClosedError("Codex process closed stdout")
+
+    monkeypatch.setattr(codex_module, "CodexTransport", Unavailable)
+    monkeypatch.setattr(codex_module, "_resolve_codex_bin", lambda: "/unused/codex")
+    instance = CodexBackend()
+    with pytest.raises(TransportClosedError, match="closed stdout"):
+        async with instance:
+            pytest.fail("failed startup cannot enter the backend")
+    assert len(starts) == 1 and instance._transport is None
+
+
+@pytest.mark.asyncio
+async def test_unattended_roles_disable_inherited_mcp_but_keep_explicit_servers(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(codex_module, "CodexTransport", FakeTransport)
+    monkeypatch.setattr(codex_module, "_resolve_codex_bin", lambda: "/unused/codex")
+    async with CodexBackend(plugins=False) as instance:
+        instance._transport.config_read_response = {
+            "config": {"mcp_servers": {"private-mail": {}, "kb": {}}},
+            "layers": [
+                {
+                    "name": {"type": "project"},
+                    "disabledReason": "untrusted",
+                    "config": {"mcp_servers": {"other": {}}},
+                }
+            ],
+        }
+        async with instance.create_client(
+            "",
+            "model",
+            cwd=tmp_path,
+            extra_mcp_servers={"kb": {"type": "http", "url": "https://kb.test/mcp"}},
+        ):
+            payload = next(
+                p for method, p in instance._transport.requests if method == "thread/start"
+            )
+        servers = payload["config"]["mcp_servers"]
+        assert servers["private-mail"] == {"enabled": False}
+        assert servers["other"] == {"enabled": False}
+        assert servers["kb"].get("enabled") is not False

@@ -12,14 +12,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 import pickle
 import sys
 import traceback
+from unittest.mock import patch
 
 import cloudpickle
 import pytest
 import torch
 from mpi4py import MPI
+from mpi4py.futures import MPIPoolExecutor
 from utils.util import check_accuracy, skip_pre_blackwell
 
 import tensorrt_llm
@@ -28,7 +31,14 @@ from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams, AllReduceStrategy,
                                              MiniMaxAllReduceRMS, MoEAllReduce,
                                              MoEAllReduceParams)
+from tensorrt_llm._torch.distributed.allreduce_helper import \
+    CustomAllReduceHelper
+from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
+from tensorrt_llm._torch.distributed.ops import get_allreduce_workspace
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
+from tensorrt_llm._torch.modules.mhc.mhc_lowm import (
+    LamportAllReduce, MnnvlLamportAllReduce, MoeUnfinalized,
+    mhc_allreduce_post_collapse_norm, mhc_post_collapse_norm)
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.nccl_window_tensor_scope import \
     discard_nccl_window_tensor_outputs
@@ -931,5 +941,369 @@ def test_minimax_allreduce_rms_qk(mpi_pool_executor, non_contiguous_input):
                 k_input, rms_weights_q, rms_weights_k, eps,
                 non_contiguous_input)] * tensor_parallel_size),
     )
+    for r in results:
+        assert r is True
+
+
+# About 10 ms of GPU time: long enough for the other ranks' Lamport kernel to
+# read the late rank's part of its buffer before that rank writes it.
+LATE_RANK_SLEEP_CYCLES = 20_000_000
+
+
+@torch.inference_mode()
+def run_lamport_mixed_dtype_single_rank(tensor_parallel_size: int,
+                                        dtype_order: str) -> bool:
+    """Alternate bf16 and fp32 ONESHOT all-reduces on one mapping.
+
+    Both dtypes share the mapping's Lamport workspace, and each call clears
+    the sub-buffer of the call before it. A large call followed by small
+    calls of the other dtype must clear exactly what the large call wrote:
+    clearing more runs into the buffer a later call is using, clearing less
+    leaves stale values that a later large call reads as already arrived.
+    One rank per round starts each call late, so the other ranks read its
+    part of the buffer before it arrives and any stale value is taken.
+    """
+    rank = tensorrt_llm.mpi_rank()
+    torch.cuda.set_device(rank)
+    mapping = Mapping(world_size=tensor_parallel_size,
+                      tp_size=tensor_parallel_size,
+                      rank=rank)
+    hidden_size = 6144
+    max_bytes = CustomAllReduceHelper.max_workspace_size_auto(
+        tensor_parallel_size, support_deterministic=False)
+    allreduce = {
+        dtype: AllReduce(mapping,
+                         strategy=AllReduceStrategy.ONESHOT,
+                         dtype=dtype)
+        for dtype in (torch.bfloat16, torch.float32)
+    }
+    big_dtype, small_dtype = ((torch.bfloat16, torch.float32)
+                              if dtype_order == "bf16_then_fp32" else
+                              (torch.float32, torch.bfloat16))
+    big_rows = int(0.9 * max_bytes) // (hidden_size * big_dtype.itemsize)
+    # The last call is the large shape again in the small dtype: after an
+    # under-clear it lands on the large call's stale sub-buffer.
+    small_dtype_big_rows = int(
+        0.9 * max_bytes) // (hidden_size * small_dtype.itemsize)
+    calls = [(big_rows, big_dtype), (8, small_dtype), (8, small_dtype),
+             (small_dtype_big_rows, small_dtype)]
+
+    try:
+        # Four calls per round on a triple buffer, so each round starts on a
+        # different sub-buffer.
+        for step, (rows, dtype) in enumerate(calls * 3):
+            late_rank = step // len(calls) % tensor_parallel_size
+            # Small integers sum exactly in both dtypes, so the comparison is
+            # exact and any stale or cleared element shows up.
+            parts = [
+                torch.randint(-8,
+                              9, (rows, hidden_size),
+                              generator=torch.Generator(
+                                  device="cuda").manual_seed(100 * step + r),
+                              device="cuda").to(dtype)
+                for r in range(tensor_parallel_size)
+            ]
+            expected = torch.stack(parts).float().sum(dim=0)
+            if rank == late_rank:
+                torch.cuda._sleep(LATE_RANK_SLEEP_CYCLES)
+            output = allreduce[dtype](parts[rank])
+            torch.cuda.synchronize()
+            torch.testing.assert_close(
+                output.float(),
+                expected,
+                rtol=0,
+                atol=0,
+                msg=lambda m: f"step {step}, {rows}x{hidden_size} {dtype}: {m}")
+    except Exception:
+        traceback.print_exc()
+        raise
+    return True
+
+
+# A wrong clear size can hang the ranks inside the kernel; the thread method
+# ends the session with a failure instead of waiting on the MPI pool.
+@pytest.mark.timeout(300, method="thread")
+@pytest.mark.skipif(torch.cuda.device_count() < 2,
+                    reason="Requires at least 2 GPUs for this test")
+@pytest.mark.parametrize("dtype_order", ["bf16_then_fp32", "fp32_then_bf16"])
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_allreduce_lamport_mixed_dtype(mpi_pool_executor: MPIPoolExecutor,
+                                       dtype_order: str) -> None:
+    tensor_parallel_size = mpi_pool_executor.num_workers
+    results = mpi_pool_executor.map(
+        run_lamport_mixed_dtype_single_rank,
+        *zip(*[(tensor_parallel_size, dtype_order)] * tensor_parallel_size),
+    )
+    for r in results:
+        assert r is True
+
+
+@torch.inference_mode()
+def run_minimax_rms_odd_tokens_single_rank(tensor_parallel_size: int) -> bool:
+    """One-token MiniMax reduce-RMS calls on one mapping.
+
+    Each call writes one 4-byte variance per rank, 8 bytes at TP2, and the
+    next call must still clear it: a call three calls later reuses the
+    sub-buffer and would otherwise take the late rank's old variance as
+    already arrived. Each rank holds a constant shard whose value changes
+    with the step, so an old variance changes the normalized output.
+    """
+    rank = tensorrt_llm.mpi_rank()
+    torch.cuda.set_device(rank)
+    mapping = Mapping(world_size=tensor_parallel_size,
+                      tp_size=tensor_parallel_size,
+                      rank=rank)
+    shard = 3072
+    minimax_allreduce_rms = MiniMaxAllReduceRMS(mapping=mapping)
+    weights = torch.ones((shard, ), dtype=torch.bfloat16, device="cuda")
+    try:
+        for step in range(12):
+            late_rank = step // 4 % tensor_parallel_size
+            values = [
+                float(1 + (step + r) % 5) for r in range(tensor_parallel_size)
+            ]
+            rms = (sum(v * v for v in values) / tensor_parallel_size)**0.5
+            local = torch.full((1, shard),
+                               values[rank],
+                               dtype=torch.bfloat16,
+                               device="cuda")
+            if rank == late_rank:
+                torch.cuda._sleep(LATE_RANK_SLEEP_CYCLES)
+            output = minimax_allreduce_rms(input=local,
+                                           rms_weights=weights,
+                                           eps=1e-6)
+            torch.cuda.synchronize()
+            torch.testing.assert_close(output.float(),
+                                       torch.full((1, shard),
+                                                  values[rank] / rms,
+                                                  device="cuda"),
+                                       rtol=2e-2,
+                                       atol=0,
+                                       msg=lambda m: f"step {step}: {m}")
+    except Exception:
+        traceback.print_exc()
+        raise
+    return True
+
+
+# A missed clear can also hang the ranks; see test_allreduce_lamport_mixed_dtype.
+@pytest.mark.timeout(300, method="thread")
+@pytest.mark.skipif(torch.cuda.device_count() < 2,
+                    reason="Requires at least 2 GPUs for this test")
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_minimax_allreduce_rms_odd_tokens(
+        mpi_pool_executor: MPIPoolExecutor) -> None:
+    tensor_parallel_size = mpi_pool_executor.num_workers
+    results = mpi_pool_executor.map(
+        run_minimax_rms_odd_tokens_single_rank,
+        *zip(*[(tensor_parallel_size, )] * tensor_parallel_size),
+    )
+    for r in results:
+        assert r is True
+
+
+@torch.inference_mode()
+def run_nccl_symmetric_unregistered_input(tensor_parallel_size: int,
+                                          num_tokens: int, hidden_size: int,
+                                          num_calls: int) -> bool:
+    rank = tensorrt_llm.mpi_rank()
+    torch.cuda.set_device(rank)
+    mapping = Mapping(world_size=tensor_parallel_size,
+                      tp_size=tensor_parallel_size,
+                      rank=rank)
+    allreduce = AllReduce(mapping=mapping,
+                          strategy=AllReduceStrategy.NCCL_SYMMETRIC).cuda()
+    for call in range(num_calls):
+        gen = torch.Generator(device="cuda").manual_seed(call)
+        shards = torch.randn((tensor_parallel_size, num_tokens, hidden_size),
+                             generator=gen,
+                             device="cuda").to(torch.bfloat16)
+        # A plain allocation: below the registration threshold it stays outside the NCCL window.
+        out = allreduce(shards[rank].clone())
+        ref = shards.float().sum(dim=0)
+        torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=0.125)
+    return True
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 4,
+                    reason="Requires at least 4 GPUs for this test")
+@pytest.mark.parametrize("mpi_pool_executor", [4], indirect=True)
+def test_nccl_symmetric_unregistered_small_input(mpi_pool_executor):
+    """NCCL_SYMMETRIC on a small input outside the NCCL window returns the plain sum on every call."""
+    tensor_parallel_size = mpi_pool_executor.num_workers
+    results = mpi_pool_executor.map(
+        run_nccl_symmetric_unregistered_input,
+        *zip(*[(tensor_parallel_size, 7, 4096, 300)] * tensor_parallel_size),
+    )
+    for r in results:
+        assert r is True
+
+
+# DeepSeek-V4.1 split mHC boundary that all-reduces the sublayer output in its own launch.
+MHC_HIDDEN = 5120
+MHC_NORM_EPS = 1e-20
+
+
+def _mhc_inputs(m: int, seed: int, rank: int):
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    res = torch.randn(m, 4, MHC_HIDDEN, generator=gen, device="cuda").bfloat16()
+    post = 2 * torch.sigmoid(torch.randn(m, 4, generator=gen, device="cuda"))
+    comb = torch.softmax(torch.randn(m, 4, 4, generator=gen, device="cuda"), -1)
+    pre = torch.sigmoid(torch.randn(m, 4, generator=gen, device="cuda")) + 1e-6
+    weight = (
+        1 +
+        0.1 * torch.randn(MHC_HIDDEN, generator=gen, device="cuda")).bfloat16()
+    gen_x = torch.Generator(device="cuda").manual_seed(seed * 100 + rank + 1)
+    x = torch.randn(m, MHC_HIDDEN, generator=gen_x, device="cuda").bfloat16()
+    # Exact zeros of both signs (-0.0 is the Lamport "not yet written" marker).
+    x[:, :16] = 0.0
+    x[:, 16:32] = -0.0
+    # -0.0 next to a nonzero value in one 32-bit word.
+    x[:, 32:40] = torch.tensor([1.0, -0.0, -0.0, 2.0, -0.0, 0.0, 0.0,
+                                -0.0]).bfloat16()
+    return x, res, post, comb, pre, weight
+
+
+def _mhc_moe_inputs(m: int, seed: int, rank: int, top_k: int = 6):
+    """An un-finalized MoE partial (shared expert + gathered expert rows) and the boundary operands.
+
+    Expert rows of multiples of 1/16 and power-of-two routing weights make every product and the
+    FP32 sum of the routed rows exact, so any summation order gives ``finalize()``'s bits.
+    """
+    x, res, post, comb, pre, weight = _mhc_inputs(m, seed, rank)
+    gen = torch.Generator(device="cuda").manual_seed(seed * 100 + rank + 7)
+    rows = m * top_k + 7
+    fc2 = torch.randint(
+        -128, 128,
+        (rows, MHC_HIDDEN), generator=gen, device="cuda").bfloat16() / 16
+    perm = torch.randperm(rows, generator=gen,
+                          device="cuda")[:m * top_k].view(m, top_k)
+    scales = 2.0**torch.randint(-2, 2, (m, top_k), generator=gen,
+                                device="cuda").float()
+    parts = MoeUnfinalized(shared=x,
+                           fc2=fc2,
+                           scales=scales,
+                           perm=perm.to(torch.int32).contiguous())
+    return parts, res, post, comb, pre, weight
+
+
+# Pool workers run later tests: restore the environment.
+@patch.dict(os.environ)
+@torch.inference_mode()
+def run_mhc_allreduce_boundary_single_rank(tp_size: int, mnnvl: bool) -> bool:
+    """Fused boundary vs the library all-reduce + boundary, eager and replayed, interleaved with
+    library all-reduces on the same workspace."""
+    rank = tensorrt_llm.mpi_rank()
+    torch.cuda.set_device(rank)
+    try:
+        mapping = Mapping(world_size=tp_size, tp_size=tp_size, rank=rank)
+        if mnnvl:
+            # The MNNVL protocol on one node (fabric memory replaced by POSIX handles).
+            os.environ["TLLM_TEST_MNNVL"] = "1"
+            allreduce = AllReduce(mapping=mapping,
+                                  strategy=AllReduceStrategy.MNNVL,
+                                  dtype=torch.bfloat16)
+            assert allreduce.mnnvl_allreduce is not None
+            lamport = MnnvlLamportAllReduce(mapping)
+        else:
+            allreduce = AllReduce(mapping=mapping,
+                                  strategy=AllReduceStrategy.ONESHOT,
+                                  dtype=torch.bfloat16)
+            lamport = LamportAllReduce(get_allreduce_workspace(mapping), rank,
+                                       tp_size)
+
+        def reference(x, res, post, comb, pre, weight):
+            return mhc_post_collapse_norm(allreduce(x), res, post, comb, pre,
+                                          weight, MHC_NORM_EPS)
+
+        def fused(x, res, post, comb, pre, weight):
+            return mhc_allreduce_post_collapse_norm(x, res, post, comb, pre,
+                                                    weight, MHC_NORM_EPS,
+                                                    lamport)
+
+        # Interleaved with library all-reduces of other sizes: both advance the same triple buffer.
+        for m in (1, 24):
+            args = _mhc_inputs(m, m, rank)
+            want = reference(*args)
+            for g, w in zip(fused(*args), want):
+                torch.testing.assert_close(g, w, rtol=0, atol=0)
+
+        # CUDA graph replay, fused launches around a library all-reduce.
+        args1, args2 = _mhc_inputs(6, 7, rank), _mhc_inputs(6, 8, rank)
+        want1, want2 = reference(*args1), reference(*args2)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            fused(*args1)
+            allreduce(args2[0])
+            fused(*args2)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out1 = fused(*args1)
+            allreduce(args2[0])
+            out2 = fused(*args2)
+        for _ in range(20):
+            graph.replay()
+        torch.cuda.synchronize()
+        for got, want in ((out1, want1), (out2, want2)):
+            for g, w in zip(got, want):
+                torch.testing.assert_close(g, w, rtol=0, atol=0)
+
+        # The MoE-finalize input.
+        parts, *args = _mhc_moe_inputs(24, 324, rank)
+        want = reference(parts.finalize(), *args)
+        for g, w in zip(fused(parts, *args), want):
+            torch.testing.assert_close(g, w, rtol=0, atol=0)
+
+        # Contiguous MoE views can have storage offsets that violate CuTe's alignment.
+        def offset_copy(value):
+            storage = torch.empty(value.numel() + 1,
+                                  dtype=value.dtype,
+                                  device=value.device)
+            view = storage[1:].view(value.shape)
+            view.copy_(value)
+            assert view.is_contiguous() and view.data_ptr() % 16
+            return view
+
+        parts = MoeUnfinalized(
+            **{
+                name: offset_copy(getattr(parts, name))
+                for name in ('shared', 'fc2', 'scales', 'perm')
+            })
+        want = reference(parts.finalize(), *args)
+        for g, w in zip(fused(parts, *args), want):
+            torch.testing.assert_close(g, w, rtol=0, atol=0)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = fused(parts, *args)
+        parts.shared.mul_(.875)
+        want = reference(parts.finalize(), *args)
+        for _ in range(32):
+            graph.replay()
+        torch.cuda.synchronize()
+        for g, w in zip(captured, want):
+            torch.testing.assert_close(g, w, rtol=0, atol=0)
+    except Exception:
+        traceback.print_exc()
+        raise
+    return True
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.device_count() < 2
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)),
+    reason="needs 2 SM100/SM103/SM107 GPUs",
+)
+# MNNVL: the fabric-memory workspace of a TP group spanning trays.
+@pytest.mark.parametrize("mnnvl", [False, True], ids=["ipc", "mnnvl"])
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_mhc_allreduce_boundary_matches_allreduce_then_boundary(
+        mpi_pool_executor, mnnvl):
+    if mnnvl and not MnnvlMemory.supports_mnnvl():
+        pytest.skip("needs MNNVL memory")
+    tp_size = mpi_pool_executor.num_workers
+    results = mpi_pool_executor.map(run_mhc_allreduce_boundary_single_rank,
+                                    *zip(*[(tp_size, mnnvl)] * tp_size))
     for r in results:
         assert r is True

@@ -173,13 +173,12 @@ def _persistent(
 
 
 def _above_ceiling_tokens() -> int:
-    """One more token than the fused epilogue will take.
+    """One more token than the decode kernel takes; with the persistent kernel off (the default)
+    the model helpers fall back there."""
+    from tensorrt_llm._torch.kernels.blackwell import kimi_k3_attn_res
 
-    Read from the module rather than hardcoded: the ceiling is configurable via
-    KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS, and a literal here would silently stop
-    testing the fallback branch the moment someone raised it.
-    """
-    return modeling_kimi_linear._FUSED_ATTN_RES_MAX_TOKENS + 1
+    assert not modeling_kimi_linear._PERSISTENT_ATTN_RES_ENABLED
+    return kimi_k3_attn_res.MAX_TOKENS + 1
 
 
 def _similarity(
@@ -627,17 +626,6 @@ def test_model_helper_dispatches_fused_attn_res_rmsnorm(
         modeling_kimi_linear,
         "_apply_attn_res",
         unexpected_fallback,
-    )
-    # The shipped default ceiling is 1 (persistent port off means "behaviour
-    # unchanged", i.e. fused at the decode shape only), so the multi-token
-    # arms would legitimately fall back. Raise it for the dispatch assertion
-    # only -- after the reference above was computed under the default -- so
-    # this test keeps covering the multi-token fused kernel without changing
-    # what production does by default.
-    monkeypatch.setattr(
-        modeling_kimi_linear,
-        "_FUSED_ATTN_RES_MAX_TOKENS",
-        max(num_tokens, modeling_kimi_linear._FUSED_ATTN_RES_MAX_TOKENS),
     )
     actual = _apply_attn_res_and_rmsnorm(
         prefix_sum,

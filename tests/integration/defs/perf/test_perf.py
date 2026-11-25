@@ -33,9 +33,9 @@ from defs.trt_test_alternative import (is_linux, is_windows, print_info,
 
 from tensorrt_llm.llmapi.mpi_session import get_mpi_world_size
 
-from ..conftest import get_device_count, llm_models_root, trt_environment
+from ..conftest import get_device_count, get_gpu_device_list, llm_models_root
 from ._model_paths import HF_MODEL_PATH, LORA_MODEL_PATH, MODEL_PATH_DICT
-from .pytorch_model_config import get_model_yaml_config
+from .pytorch_model_config import PERF_CONFIG_PRESETS, get_model_yaml_config
 from .sampler_options_config import get_sampler_options_config
 from .utils import (AbstractPerfScriptTestClass, PerfBenchScriptTestCmds,
                     PerfMetricType, PerfServeScriptTestCmds,
@@ -72,12 +72,30 @@ NEMOTRON_SUPER_MODELS = {
     "nemotron_3.5_lightning_30b_bf16_mtp",
 }
 
+# Cases that run out of memory on H100 at the default KV cache fraction, keyed
+# by (model, input length, output length) and mapped to the fraction they run
+# with there: KV cache sizing does not yet reserve memory for a full batch of
+# logits. Remove an entry once it does. 128/128 is not KV-bound (0.75); the
+# long cases are KV-bound on H100, so they keep more KV (0.82).
+_H100_KV_CACHE_FRACTION_CAPS = {
+    ("qwen3.5_122b_a10b", 128, 128): 0.75,
+    ("qwen3.5_122b_a10b", 500, 2000): 0.82,
+    ("qwen3.5_122b_a10b", 2000, 500): 0.82,
+    ("qwen3.5_122b_a10b", 1000, 2000): 0.82,
+}
+
 KIMI_K3_MODELS = {"kimi_k3"}
 DEEPSEEK_V41_MODELS = {
     "deepseek_v41_flash_nvfp4",
     "deepseek_v41_flash_nvfp4_dspark",
 }
+GLM53_FLASH_NVFP4_MODELS = {
+    "glm_5.3_flash_nvfp4_mtp_bf16_kv",
+    "glm_5.3_flash_nvfp4",
+    "glm_5.3_flash_nvfp4_mtp",
+}
 QWEN38_MTP_MODELS = {
+    "qwen3.8_flash_next_fp8_mtp_tep4",
     "qwen3.8_max_fp4_mtp",
     "qwen3.8_flash_next_fp8_mtp",
     "qwen3.8_flash_next_fp4_mtp",
@@ -87,6 +105,11 @@ KIMI_K3_SERVER_ENV = {
 }
 
 TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=True
+    "kimi_k3_nvfp4_dep8",
+    "minimax_m3.1_flash_nvfp4",
+    "minimax_m3.1_flash_nvfp4_dspark",
+    "muse_spark_open_nvfp4_agentx",
+    *GLM53_FLASH_NVFP4_MODELS,
     *DEEPSEEK_V41_MODELS,
     *QWEN38_MTP_MODELS,
     "kimi_k2.5_fp4",
@@ -94,11 +117,17 @@ TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=
     "minimax_m3_fp4",
     "nemotron_3_super_120b_nvfp4",
     "nemotron_3_super_120b_nvfp4_mtp",
+    "nemotron_3_super_120b_fp8",
     "nemotron_3_ultra_550b_nvfp4",
-    "glm_5_fp8",
+    "glm_5.3_fp8",
+    "glm_5.3_flash_fp8",
     "minimax_m3_mxfp8",
     "qwen3.6_35b_a3b_fp4",
     "qwen3.6_35b_a3b_fp4_mtp",
+    "qwen3.8_27b",
+    "qwen3.8_27b_fp4",
+    "qwen3.8_flash_next_fp4",
+    "qwen3.8_flash_next_fp8",
     "nemotron_3_nano_omni_nvfp4",
     "nemotron_3_nano_omni_nvfp4_image",
     "nemotron_3.5_lightning_30b_nvfp4_mtp",
@@ -125,17 +154,25 @@ OPENAI_CHAT_BACKEND_MODELS = {
 SPEC_DEC_REAL_DATASET_MODELS = {
     **{
         model: "cnn_dailymail"
-        for model in DEEPSEEK_V41_MODELS
+        for model in GLM53_FLASH_NVFP4_MODELS
+    },
+    **{
+        model: "cnn_dailymail"
+        for model in DEEPSEEK_V41_MODELS | QWEN38_MTP_MODELS
     },
     "nemotron_3_super_120b_nvfp4_mtp": "cnn_dailymail",
     "nemotron_3.5_lightning_30b_nvfp4_mtp": "cnn_dailymail",
     "nemotron_3.5_lightning_30b_bf16_mtp": "cnn_dailymail",
+    "gpt_oss_120b_eagle3": "cnn_dailymail",
+    "qwen3.6_35b_a3b_fp4_mtp": "cnn_dailymail",
 }
 
 # All spec-decoding models (MTP, Eagle3, etc.). Used to skip --ignore-eos in
 # benchmark client commands and fixed sequence-length inference: forcing
 # generation past EOS produces unstable acceptance rates for spec-dec.
 SPEC_DEC_MODELS = {
+    "minimax_m3.1_flash_nvfp4_dspark",
+    "glm_5.3_flash_fp8_mtp",
     "deepseek_v4_pro_base_fp8",
     *QWEN38_MTP_MODELS,
     "qwen3_4b_eagle3",
@@ -181,15 +218,12 @@ def cpu_socket_count_gt_1():
 
 # A helper function to import allowed_configs.py.
 def import_allowed_perf_config():
-    if trt_environment:
-        from llm import allowed_configs
+    global ALLOWED_CONFIGS_CACHE
+    if ALLOWED_CONFIGS_CACHE is None:
+        import allowed_configs
+        ALLOWED_CONFIGS_CACHE = allowed_configs
     else:
-        global ALLOWED_CONFIGS_CACHE
-        if ALLOWED_CONFIGS_CACHE is None:
-            import allowed_configs
-            ALLOWED_CONFIGS_CACHE = allowed_configs
-        else:
-            allowed_configs = ALLOWED_CONFIGS_CACHE
+        allowed_configs = ALLOWED_CONFIGS_CACHE
     return allowed_configs
 
 
@@ -266,23 +300,28 @@ AGGR_SERVER_PERF_METRIC_LOG_QUERIES = {
     PerfMetricType.USER_THROUGHPUT:
     re.compile(r"User throughput \(tok\/s\):\s+(-?[\d\.]+)"),
     PerfMetricType.FIRST_TOKEN_TIME:
-    re.compile(r"Mean TTFT \(ms\):\s+(-?[\d\.]+)"),
+    re.compile(
+        r"Mean TTFT \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
     PerfMetricType.MEDIAN_FIRST_TOKEN_TIME:
-    re.compile(r"Median TTFT \(ms\):\s+(-?[\d\.]+)"),
+    re.compile(
+        r"Median TTFT \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
     PerfMetricType.P99_FIRST_TOKEN_TIME:
-    re.compile(r"P99 TTFT \(ms\):\s+(-?[\d\.]+)"),
+    re.compile(r"P99 TTFT \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
     PerfMetricType.INTER_TOKEN_TIME:
-    re.compile(r"Mean ITL \(ms\):\s+(-?[\d\.]+)"),
+    re.compile(r"Mean ITL \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
     PerfMetricType.MEDIAN_INTER_TOKEN_TIME:
-    re.compile(r"Median ITL \(ms\):\s+(-?[\d\.]+)"),
+    re.compile(
+        r"Median ITL \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
     PerfMetricType.P99_INTER_TOKEN_TIME:
-    re.compile(r"P99 ITL \(ms\):\s+(-?[\d\.]+)"),
+    re.compile(r"P99 ITL \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
     PerfMetricType.OUTPUT_TOKEN_TIME:
-    re.compile(r"Mean TPOT \(ms\):\s+(-?[\d\.]+)"),
+    re.compile(
+        r"Mean TPOT \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
     PerfMetricType.MEDIAN_OUTPUT_TOKEN_TIME:
-    re.compile(r"Median TPOT \(ms\):\s+(-?[\d\.]+)"),
+    re.compile(
+        r"Median TPOT \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
     PerfMetricType.P99_OUTPUT_TOKEN_TIME:
-    re.compile(r"P99 TPOT \(ms\):\s+(-?[\d\.]+)"),
+    re.compile(r"P99 TPOT \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
     PerfMetricType.INFERENCE_TIME:
     re.compile(r"Mean E2EL \(ms\):\s+(-?[\d\.]+)"),
     PerfMetricType.MEDIAN_INFERENCE_TIME:
@@ -469,6 +508,8 @@ class PerfTestConfig:
         pp_size: int = 1,
         num_gpus: int = 1,
         moe_backend: str | None = None,
+        prefix_len: int = 0,
+        cfg_presets: str | None = None,
     ):
         # The model name.
         self.model_name = model_name
@@ -519,6 +560,10 @@ class PerfTestConfig:
         # Number of GPUs.
         self.num_gpus = num_gpus
         self.moe_backend = moe_backend
+        # Shared random prefix length (serve only), added in front of every prompt.
+        self.prefix_len = prefix_len
+        # "+"-joined names from PERF_CONFIG_PRESETS in pytorch_model_config.py.
+        self.cfg_presets = cfg_presets
 
     def to_string(self,
                   custom_server_name: str = None,
@@ -632,6 +677,12 @@ class PerfTestConfig:
         if self.moe_backend is not None:
             entries.append(f"moe:{self.moe_backend}")
 
+        if self.prefix_len > 0:
+            entries.append(f"prefix:{self.prefix_len}")
+
+        if self.cfg_presets is not None:
+            entries.append(f"cfg:{self.cfg_presets}")
+
         # Concatenate labels with "-".
         return "-".join(entries)
 
@@ -739,6 +790,14 @@ class PerfTestConfig:
         if labels and labels[0].startswith("moe:"):
             self.moe_backend = labels.pop(0).removeprefix("moe:")
 
+        self.prefix_len = 0
+        if labels and labels[0].startswith("prefix:"):
+            self.prefix_len = int(labels.pop(0).removeprefix("prefix:"))
+
+        self.cfg_presets = None
+        if labels and labels[0].startswith("cfg:"):
+            self.cfg_presets = labels.pop(0).removeprefix("cfg:")
+
         assert len(
             labels
         ) == 0, f"Invalid test name! Some labels cannot be parsed: {labels}"
@@ -778,6 +837,22 @@ class PerfTestConfig:
         assert self.data_type in VALID_DTYPES, f"Invalid data_type {self.data_type}!"
         VALID_KV_CACHE_DTYPES = ["auto", "fp8"]
         assert self.kv_cache_dtype in VALID_KV_CACHE_DTYPES, f"Invalid kv_cache_dtype {self.kv_cache_dtype}!"
+
+        if self.prefix_len > 0:
+            assert self.runtime == "serve", \
+                "prefix (shared random prompt prefix) requires the serve runtime!"
+            assert self.model_name not in SPEC_DEC_REAL_DATASET_MODELS \
+                and self.model_name not in SERVE_IMAGE_MODELS, \
+                "prefix applies only to the random text dataset!"
+
+        if self.cfg_presets is not None:
+            unknown_presets = [
+                name for name in self.cfg_presets.split("+")
+                if name not in PERF_CONFIG_PRESETS
+            ]
+            assert not unknown_presets, (
+                f"Unknown cfg preset(s) {unknown_presets}; "
+                f"known presets: {sorted(PERF_CONFIG_PRESETS)}")
 
         # Validate quantization mode.
         if self.model_name in MODEL_PATH_DICT.keys():
@@ -820,7 +895,7 @@ class PerfTestConfig:
         if self.is_bert_like():
             assert len(self.output_lens
                        ) == 0, f"BERT-like models must not have output_lens!"
-        else:
+        elif self.model_name != "muse_spark_open_nvfp4_agentx":
             assert len(
                 self.output_lens
             ) > 0, f"GPT-like models and enc-dec models must have output_lens!"
@@ -931,7 +1006,7 @@ class PerfTestConfig:
             return None
 
         sequence_lengths = {
-            input_len + output_len
+            self.prefix_len + input_len + output_len
             for input_len, output_len in zip(
                 self.input_lens, self.output_lens, strict=True)
         }
@@ -968,6 +1043,24 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
     def get_test_name(self) -> str:
         return str(self._config)
 
+    def _get_kv_cache_free_gpu_mem_fraction(self) -> float:
+        """Return the KV cache fraction, capped on H100 for known OOM cases.
+
+        The cap leaves the test name, and thus its perf history, unchanged.
+        """
+        fraction = self._config.kv_cache_free_gpu_mem_fraction
+        lens = list(zip(self._config.input_lens, self._config.output_lens))
+        cap = None
+        if len(lens) == 1:
+            cap = _H100_KV_CACHE_FRACTION_CAPS.get(
+                (self._config.model_name, *lens[0]))
+        if cap is not None and cap < fraction and any(
+                "H100" in gpu for gpu in get_gpu_device_list()):
+            print_info(f"Capping kv_cache_free_gpu_mem_fraction {fraction} -> "
+                       f"{cap} for {self.get_test_name()} on H100.")
+            return cap
+        return fraction
+
     def set_runtime_configs(self,
                             llm_root,
                             working_dir,
@@ -989,7 +1082,52 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         self._gpu_clock_lock = gpu_clock_lock
 
     def get_trtllm_bench_model(self):
-        return get_model_dir(self._config.model_name)
+        model_dir = get_model_dir(self._config.model_name)
+        if self._config.model_name == "glm_5.3_flash_nvfp4_mtp_bf16_kv":
+            return self._prepare_bf16_kv_checkpoint(model_dir)
+        return model_dir
+
+    def _prepare_bf16_kv_checkpoint(self, model_dir: str) -> str:
+        """Keep checkpoint weight quantization while disabling KV quantization.
+
+        The shared GLM export declares FP8 KV. The loader's ``auto`` preserves
+        that metadata and it rejects an explicit ``bfloat16`` override. Use a
+        workspace-local view with amended JSON metadata and symlinked weights.
+        """
+
+        def clear_kv_quantization(config: dict) -> None:
+            for key, value in config.items():
+                if key in {"kv_cache_quant_algo", "kv_cache_scheme"}:
+                    config[key] = None
+                elif isinstance(value, dict):
+                    clear_kv_quantization(value)
+                elif isinstance(value, list):
+                    for item in value:
+                        if isinstance(item, dict):
+                            clear_kv_quantization(item)
+
+        checkpoint = os.path.join(self._get_engine_dir(), "bf16-kv-model")
+        os.makedirs(checkpoint, exist_ok=True)
+        for name in os.listdir(model_dir):
+            source = os.path.join(model_dir, name)
+            destination = os.path.join(checkpoint, name)
+            if name in {
+                    "config.json", "hf_quant_config.json", "quant_cfg.json"
+            }:
+                with open(source) as f:
+                    config = json.load(f)
+                if name == "config.json":
+                    dtype = config.get("dtype", config.get("torch_dtype"))
+                    if dtype not in {"bfloat16", "bf16"}:
+                        raise ValueError(
+                            "The GLM BF16-KV recipe requires a BF16 checkpoint; "
+                            f"found dtype={dtype!r}")
+                clear_kv_quantization(config)
+                with open(destination, "w") as f:
+                    json.dump(config, f)
+            elif not os.path.lexists(destination):
+                os.symlink(os.path.abspath(source), destination)
+        return checkpoint
 
     def _get_model_yaml_config(self) -> dict:
         config = get_model_yaml_config(self._config.to_string(),
@@ -1167,7 +1305,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             f"--max_batch_size={self._config.max_batch_size}",
             f"--max_num_tokens={self._config.max_num_tokens}",
             f"--report_json={report_path}",
-            f"--kv_cache_free_gpu_mem_fraction={self._config.kv_cache_free_gpu_mem_fraction}",
+            f"--kv_cache_free_gpu_mem_fraction={self._get_kv_cache_free_gpu_mem_fraction()}",
         ]
         benchmark_cmd += [f"--backend={self._config.backend}"]
         if self._config.num_reqs > 0:
@@ -1235,7 +1373,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         serve_config.setdefault('max_num_tokens', self._config.max_num_tokens)
         kv_cache_cfg = serve_config.setdefault('kv_cache_config', {})
         kv_cache_cfg.setdefault('free_gpu_memory_fraction',
-                                self._config.kv_cache_free_gpu_mem_fraction)
+                                self._get_kv_cache_free_gpu_mem_fraction())
         if self._config.tp_size > 1:
             serve_config.setdefault('tensor_parallel_size',
                                     self._config.tp_size)
@@ -1268,7 +1406,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                                        dataset_source: str,
                                        num_requests: Optional[int] = None,
                                        skip_requests: int = 0):
-        """Write a real-text dataset of fixed-length prompts.
+        """Write a real-text dataset with target-length prompts.
 
         Args:
             num_requests: Samples to write; the case's request count if None.
@@ -1320,8 +1458,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                     if not prompt_ids:
                         continue
                     if len(prompt_ids) < input_len:
-                        # Keep strict fixed-length requests for perf coverage
-                        # by extending short real-dataset prompts.
+                        # Extend short articles to the target token-ID length.
                         repeats = (input_len + len(prompt_ids) -
                                    1) // len(prompt_ids)
                         prompt_ids = (prompt_ids * repeats)[:input_len]
@@ -1342,8 +1479,11 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                         enable_thinking=False,
                         add_generation_prompt=True,
                     )
-                    prompt_ids = tokenizer.encode(prompt_text,
-                                                  add_special_tokens=False)
+
+                # Count the final text after decoding and any template rendering.
+                prompt_ids = tokenizer.encode(prompt_text,
+                                              add_special_tokens=False)
+                if self._config.model_name in DEEPSEEK_V41_MODELS:
                     max_seq_len = model_config['max_seq_len']
                     if len(prompt_ids) + output_len > max_seq_len:
                         raise ValueError(
@@ -1383,6 +1523,28 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                                         output_len,
                                         real_dataset_path: str = ""):
         model_dir = self.get_trtllm_bench_model()
+        if self._config.model_name == "muse_spark_open_nvfp4_agentx":
+            return [
+                "env",
+                "AGENTX_DURATION=3600",
+                # Cover warmup, benchmark grace, and dataset preparation.
+                "AGENTX_TIMEOUT_GRACE=2400",
+                "AGENTX_MAX_CTX=1048576",
+                "AGENTX_WARMUP_PER_LANE=10",
+                "AGENTX_EXTRA_ARGS=--benchmark-grace-period 30 "
+                "--warmup-grace-period 1800 --num-dataset-entries 393",
+                "python",
+                os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "agentx_client.py"),
+                "--model",
+                model_dir,
+                "--concurrency",
+                str(self._config.concurrency),
+                "--dataset",
+                "semianalysis_cc_traces_weka_062126",
+                "--artifact-dir",
+                os.path.join(self._output_dir, "agentx"),
+            ]
         client_cmd = [
             "python",
             "-m",
@@ -1455,6 +1617,11 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 "--random-range-ratio",
                 "0.0",
             ]
+            if self._config.prefix_len > 0:
+                client_cmd += [
+                    "--random-prefix-len",
+                    str(self._config.prefix_len)
+                ]
         if self._config.concurrency != -1:
             client_cmd += ["--max-concurrency", str(self._config.concurrency)]
         if self._config.streaming == "streaming":
@@ -1476,6 +1643,9 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         reuse would then serve their prefixes to the measured requests. If the
         source has no articles to spare, the client gets no pass.
         """
+        if self._config.model_name == "muse_spark_open_nvfp4_agentx":
+            # AgentX owns the scenario warmup and measured duration.
+            return None
         if not warmup_pass_enabled():
             return None
         num_requests = one_wave_requests(self._config.concurrency,
@@ -1528,7 +1698,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             data_cmds = []
             for bs in self._config.batch_sizes:
                 for len_idx, input_len in enumerate(self._config.input_lens):
-                    output_len = self._config.output_lens[len_idx]
+                    output_len = (self._config.output_lens[len_idx]
+                                  if self._config.output_lens else None)
                     real_dataset_path = ""
                     if self._config.model_name in SPEC_DEC_REAL_DATASET_MODELS:
                         dataset_source = SPEC_DEC_REAL_DATASET_MODELS[
@@ -1570,7 +1741,15 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 server_env.pop("TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS",
                                None)
                 server_env["TRTLLM_V41_DECODER_BOUNDED_REPLAY"] = "1"
-            if self._config.model_name in QWEN38_MTP_MODELS:
+            if self._config.model_name in {
+                    "kimi_k3_nvfp4_dep8",
+                    "glm_5.3_flash_nvfp4_mtp_bf16_kv",
+                    "minimax_m3.1_flash_nvfp4",
+                    "minimax_m3.1_flash_nvfp4_dspark",
+                    "muse_spark_open_nvfp4_agentx",
+            }:
+                server_timeout = 5400
+            elif self._config.model_name in QWEN38_MTP_MODELS:
                 server_timeout = 5400
             elif self._config.model_name in NEMOTRON_SUPER_MODELS:
                 server_timeout = 3600
@@ -1584,6 +1763,19 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             elif self._config.model_name == "minimax_m3_fp4":
                 # Cold MSA JIT compilation can exceed the default 10 minutes.
                 server_timeout = 1800
+            elif self._config.model_name == "glm_5.3_fp8":
+                # Allow time for checkpoint loading and cold executor warmup.
+                server_timeout = 1800
+            elif self._config.model_name == "muse_spark_open_nvfp4":
+                # Allow time for NVFP4 checkpoint loading and executor warmup.
+                server_timeout = 3600
+            elif self._config.model_name in {
+                    "glm_5.3_flash_fp8",
+                    "glm_5.3_flash_fp8_mtp",
+                    *GLM53_FLASH_NVFP4_MODELS,
+            }:
+                # Weight loading and executor warmup can exceed 10 minutes.
+                server_timeout = 3600
             else:
                 server_timeout = 600
             server_log_dir = None
@@ -1636,9 +1828,9 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         return PerfBenchScriptTestCmds(data_cmds, build_cmd, benchmark_cmds,
                                        mpi_cmd)
 
-    def get_perf_result(self, outputs: Dict[int, str]) -> float:
+    def get_perf_result(self, outputs: Dict[int, str]) -> float | None:
         """
-        Get perf metric result from test output logs.
+        Get a measured value, or None for an explicitly unavailable metric.
         """
         metric = self._current_metric
         cmd_idx = metric.cmd_idx
@@ -1658,6 +1850,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             for line in outputs[cmd_idx].split("\n")
         ]
         metric_values = []
+        unavailable = False
         for match in regex_matches:
             if match:
                 # Handle multiple capture groups - use the first non-None group
@@ -1666,8 +1859,14 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                     if match.group(i) is not None:
                         value = match.group(i)
                         break
-                if value is not None:
+                if value == "N/A":
+                    unavailable = True
+                elif value is not None:
                     metric_values.append(float(value))
+
+        if not metric_values and unavailable:
+            print_info(f"Metric {metric_name} is N/A; skip recording it.")
+            return None
 
         if len(metric_values) == 0:
             if self._config.runtime == "bench" and self._config.num_gpus > 1 and metric.metric_type == PerfMetricType.BUILD_TIME:
@@ -1910,8 +2109,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         for bs in self._config.batch_sizes:
             for len_idx, input_len in enumerate(self._config.input_lens):
                 cmd_idx += 1
-                output_len = None if self._config.is_bert_like(
-                ) else self._config.output_lens[len_idx]
+                output_len = (self._config.output_lens[len_idx]
+                              if self._config.output_lens else None)
 
                 # Get list of metrics depending on config.
                 if self._config.runtime == "serve":

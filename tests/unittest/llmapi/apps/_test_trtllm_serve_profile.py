@@ -101,7 +101,7 @@ def test_start_profile_backend_error_returns_500(server_with_mock_generator):
     # A RuntimeError whose message contains neither "already in progress"
     # nor "pending" is treated as a generic backend failure (500). The
     # backend-side rejection that produces those messages is covered by
-    # tests/unittest/_torch/executor/test_profile_endpoints.py; the
+    # tests/unittest/_torch/pyexecutor/test_profile_endpoints.py; the
     # HTTP-side 409 mapping is covered below.
     server.generator.start_profile.side_effect = RuntimeError("boom")
     response = asyncio.run(server.start_profile(StartProfileRequest()))
@@ -123,7 +123,7 @@ def test_start_profile_backend_error_returns_500(server_with_mock_generator):
 def test_start_profile_double_start_returns_409(server_with_mock_generator, backend_message):
     """A rejected overlapping profile window maps to 409, not 500.
 
-    ``PyExecutorProfileManager.start_profile`` raises ``RequestError``
+    ``ProfileController.start_profile`` raises ``RequestError``
     (a ``RuntimeError`` subclass) when a window is already active or a
     start is already pending. The handler distinguishes that from a
     generic backend failure so callers can retry instead of treating it

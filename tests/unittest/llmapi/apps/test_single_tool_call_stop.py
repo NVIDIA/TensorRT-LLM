@@ -23,11 +23,13 @@ what a client sees of it, and that it matches the tokens the model writes.
 
 import asyncio
 import json
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 from openai.types.responses.tool import FunctionTool
+from test_common.serve.app_factory import AggConfig, isolated_serve_env
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm.sampling_params import SamplingParams
@@ -43,18 +45,13 @@ from tensorrt_llm.serve.openai_protocol import (
     ResponsesRequest,
     UsageInfo,
 )
-from tensorrt_llm.serve.openai_server import (
-    OpenAIServer,
-    _single_tool_call_stops,
-    _stop_after_first_tool_call,
-)
+from tensorrt_llm.serve.openai_server import _single_tool_call_stops, _stop_after_first_tool_call
 from tensorrt_llm.serve.postprocess_handlers import (
     ChatPostprocArgs,
     chat_response_post_processor,
     chat_stream_post_processor,
 )
 from tensorrt_llm.serve.render import chat as render_chat_module
-from tensorrt_llm.serve.responses_utils import ConversationHistoryStore
 
 pytestmark = pytest.mark.cpu_only
 
@@ -190,12 +187,8 @@ def test_the_stop_matches_the_tokens_the_model_writes(model_name, tool_parser):
 # ---------------------------------------------------------------------------
 
 
-class _ModelConfig:
-    model_type = "llama"
-    vocab_size = 1024
-
-
-def _chat_server(monkeypatch, tool_parser):
+@contextmanager
+def _chat_server(tmp_path, monkeypatch, tool_parser):
     """A server whose real ``openai_chat`` records what reaches the engine."""
 
     async def render(**kwargs):
@@ -222,31 +215,12 @@ def _chat_server(monkeypatch, tool_parser):
             usage=UsageInfo(prompt_tokens=3, completion_tokens=1, total_tokens=4),
         )
 
-    server = object.__new__(OpenAIServer)
-    server.model = MODEL
-    server.allow_request_chat_template = False
-    server.model_config = _ModelConfig()
-    server.processor = None
-    server.tokenizer = SimpleNamespace(tokenizer=SimpleNamespace(vocab_size=1024))
-    server.chat_template = None
-    server.tool_parser = tool_parser
-    server.tool_call_id_type = "random"
-    server.multimodal_server_config = None
-    server._input_proc_executor = None
-    server._is_visual_gen = False
-    server.generator = SimpleNamespace(
-        args=SimpleNamespace(
-            gather_generation_logits=False,
-            reasoning_parser=None,
-            backend="pytorch",
-            guided_decoding_backend=None,
-            num_postprocess_workers=0,
-        ),
-        generate_async=generate_async,
-    )
-    server.await_disconnected = AsyncMock()
-    server._create_chat_response = create_chat_response
-    return server, seen
+    with isolated_serve_env(tmp_path) as env:
+        server = env.build_openai_server(AggConfig(model_name=MODEL, tool_parser=tool_parser))
+        server.generator.generate_async = generate_async
+        server.await_disconnected = AsyncMock()
+        server._create_chat_response = create_chat_response
+        yield server, seen
 
 
 def _raw_request():
@@ -293,9 +267,8 @@ def _warned(log, key):
     ],
 )
 def test_chat_configures_the_stop_only_when_asked_and_possible(
-    monkeypatch, server_logger, fields, tool_parser, stop, enforced
+    tmp_path, monkeypatch, server_logger, fields, tool_parser, stop, enforced
 ):
-    server, seen = _chat_server(monkeypatch, tool_parser)
     request = ChatCompletionRequest(
         **{
             "model": MODEL,
@@ -304,7 +277,8 @@ def test_chat_configures_the_stop_only_when_asked_and_possible(
             **fields,
         }
     )
-    response = asyncio.run(server.openai_chat(request, _raw_request()))
+    with _chat_server(tmp_path, monkeypatch, tool_parser) as (server, seen):
+        response = asyncio.run(server.openai_chat(request, _raw_request()))
 
     assert response.status_code == 200, response.body
     sampling_params = seen["sampling_params"]
@@ -320,9 +294,10 @@ def test_chat_configures_the_stop_only_when_asked_and_possible(
     )
 
 
-def test_a_stop_the_request_lists_itself_keeps_its_stop_reason(monkeypatch, server_logger):
+def test_a_stop_the_request_lists_itself_keeps_its_stop_reason(
+    tmp_path, monkeypatch, server_logger
+):
     """Only the stops the server adds are hidden from the reply's stop reason."""
-    server, seen = _chat_server(monkeypatch, "deepseek_v41")
     request = ChatCompletionRequest(
         model=MODEL,
         messages=[{"role": "user", "content": "weather?"}],
@@ -331,7 +306,8 @@ def test_a_stop_the_request_lists_itself_keeps_its_stop_reason(monkeypatch, serv
         stop=[V41_STOPS[0]],
         include_stop_str_in_output=True,
     )
-    response = asyncio.run(server.openai_chat(request, _raw_request()))
+    with _chat_server(tmp_path, monkeypatch, "deepseek_v41") as (server, seen):
+        response = asyncio.run(server.openai_chat(request, _raw_request()))
 
     assert response.status_code == 200, response.body
     assert seen["sampling_params"].stop == list(V41_STOPS)
@@ -349,9 +325,8 @@ def test_a_stop_the_request_lists_itself_keeps_its_stop_reason(monkeypatch, serv
     ids=["supported", "own_stops_dropped", "format_without_stop", "no_tool_parser"],
 )
 def test_anthropic_disable_parallel_tool_use_configures_the_stop_when_possible(
-    monkeypatch, server_logger, tool_parser, stop_sequences, enforced
+    tmp_path, monkeypatch, server_logger, tool_parser, stop_sequences, enforced
 ):
-    server, seen = _chat_server(monkeypatch, tool_parser)
     request = AnthropicMessagesRequest(
         model=MODEL,
         max_tokens=64,
@@ -360,7 +335,8 @@ def test_anthropic_disable_parallel_tool_use_configures_the_stop_when_possible(
         tool_choice={"type": "auto", "disable_parallel_tool_use": True},
         stop_sequences=stop_sequences,
     )
-    response = asyncio.run(server.anthropic_messages(request, _raw_request()))
+    with _chat_server(tmp_path, monkeypatch, tool_parser) as (server, seen):
+        response = asyncio.run(server.anthropic_messages(request, _raw_request()))
 
     assert response.status_code == 200, response.body
     assert seen["sampling_params"].stop == (list(V41_STOPS) if enforced else stop_sequences)
@@ -554,7 +530,16 @@ def test_streaming_n2_single_call_stop_finishes_only_the_matching_choice():
         assert all(ch.get("stop_reason") is None for ch in by_index[idx])
 
 
-def _make_llm_response(seq_idx, token_ids, finish_reason, is_final=False, cum_log_probs=None):
+def _make_llm_response(
+    seq_idx,
+    token_ids,
+    finish_reason,
+    is_final=False,
+    cum_log_probs=None,
+    per_pos_drafted=None,
+    per_pos_accepted=None,
+    spec_dec_totals=None,
+):
     return SimpleNamespace(
         has_error=lambda: False,
         result=SimpleNamespace(
@@ -571,9 +556,9 @@ def _make_llm_response(seq_idx, token_ids, finish_reason, is_final=False, cum_lo
             sequence_index=seq_idx,
             cum_log_probs=cum_log_probs,
             log_probs=None,
-            per_pos_drafted=None,
-            per_pos_accepted=None,
-            spec_dec_totals=None,
+            per_pos_drafted=per_pos_drafted,
+            per_pos_accepted=per_pos_accepted,
+            spec_dec_totals=spec_dec_totals,
             generation_logits=None,
             additional_context_outputs=None,
             additional_generation_outputs=None,
@@ -764,6 +749,94 @@ def test_best_of_greater_than_n_waits_for_all_underlying_candidates():
     assert [ch["finish_reason"] for ch in step2_choices if ch.get("finish_reason")] == ["stop"]
 
 
+def test_streaming_best_of_preserves_spec_decode_stats_on_late_stopped_response():
+    """A late engine response for a string-stopped winner keeps its stop-time spec-decode stats."""
+    from tensorrt_llm.bindings import executor as tllm
+    from tensorrt_llm.executor.result import DetokenizedGenerationResultBase
+
+    vocab = {
+        1: "Checking.\n\n<｜DSML｜ calls>\n" + WEATHER_INVOKE + "\n",
+        2: " late-ignored-token",
+        3: "Lower-scored candidate.",
+    }
+
+    class _FakeTokenizer:
+        eos_token_id = 0
+        pad_token_id = 0
+
+        def encode(self, text, **_kwargs):
+            return [99]
+
+        def decode(self, token_ids, **_kwargs):
+            return "".join(vocab[t] for t in token_ids)
+
+    sampling_params = SamplingParams(n=1, best_of=2, temperature=0.7)
+    assert _stop_after_first_tool_call(sampling_params, V41_STOPS)
+    sampling_params._setup(_FakeTokenizer(), hf_model_config=None, generation_config=None)
+
+    result = DetokenizedGenerationResultBase(
+        id=12, sampling_params=sampling_params, tokenizer=_FakeTokenizer(), streaming=True
+    )
+    args = _chat_args()
+    args.num_choices = 1
+    args.return_spec_decode_stats = True
+    args.spec_decode_num_spec_tokens = 2
+
+    # Candidate 0 string-stops with higher cum_log_prob and spec-decode counters.
+    result._handle_response(
+        _make_llm_response(
+            0,
+            [1],
+            tllm.FinishReason.NOT_FINISHED,
+            cum_log_probs=[-0.5],
+            per_pos_drafted=[4, 4],
+            per_pos_accepted=[3, 1],
+            spec_dec_totals=(4, 8),
+        )
+    )
+    step0_frames = chat_stream_post_processor(result, args)
+    step0_choices = [json.loads(frame[len("data: ") :])["choices"][0] for frame in step0_frames]
+    assert all(ch.get("finish_reason") is None for ch in step0_choices)
+    assert all("speculative_decoding" not in ch for ch in step0_choices)
+
+    # A late engine response arrives for candidate 0 while candidate 1 is still running.
+    result._handle_response(
+        _make_llm_response(
+            0,
+            [2],
+            tllm.FinishReason.NOT_FINISHED,
+            cum_log_probs=[-0.5],
+        )
+    )
+    assert chat_stream_post_processor(result, args) == []
+
+    # Candidate 1 finishes with lower score so candidate 0 wins; winner keeps its spec stats.
+    result._handle_response(
+        _make_llm_response(
+            1,
+            [3],
+            tllm.FinishReason.END_ID,
+            is_final=True,
+            cum_log_probs=[-3.0],
+            per_pos_drafted=[3, 3],
+            per_pos_accepted=[1],
+            spec_dec_totals=(1, 6),
+        )
+    )
+    final_frames = chat_stream_post_processor(result, args)
+    choices = [json.loads(frame[len("data: ") :])["choices"][0] for frame in final_frames]
+    spec_payloads = [ch["speculative_decoding"] for ch in choices if "speculative_decoding" in ch]
+    assert len(spec_payloads) == 1
+    assert spec_payloads[0] == {
+        "acceptance_rate": 0.5,
+        "total_accepted_draft_tokens": 4,
+        "total_draft_tokens": 8,
+        "num_spec_steps": 4,
+        "acceptance_histogram": [1, 2, 1],
+        "num_spec_tokens": 2,
+    }
+
+
 def test_beam_search_hidden_beam_does_not_terminate_visible_answer():
     """With multi-beam search (n=1, best_of=2), a hidden beam matching a stop string must not end the request."""
     from tensorrt_llm.bindings import executor as tllm
@@ -941,7 +1014,8 @@ class _EngineReached(Exception):
     pass
 
 
-def _responses_server(monkeypatch, tool_parser):
+@contextmanager
+def _responses_server(tmp_path, monkeypatch, tool_parser):
     """A server whose real ``openai_responses`` records what reaches the engine."""
     seen = {}
 
@@ -953,24 +1027,16 @@ def _responses_server(monkeypatch, tool_parser):
         raise _EngineReached()
 
     monkeypatch.setattr(openai_server_module, "responses_api_request_preprocess", preprocess)
-    server = object.__new__(OpenAIServer)
-    server.model = MODEL
-    server.enable_store = False
-    server._is_visual_gen = False
-    server.use_harmony = False
-    server.tokenizer = None
-    server.model_config = None
-    server.processor = None
-    server.multimodal_server_config = None
-    server.chat_template = None
-    server.tool_parser = tool_parser
-    server.metrics_collector = None
-    server.conversation_store = ConversationHistoryStore()
-    server.generator = SimpleNamespace(
-        args=SimpleNamespace(reasoning_parser=None, num_postprocess_workers=0),
-        generate_async=generate_async,
-    )
-    return server, seen
+    with isolated_serve_env(tmp_path) as env:
+        server = env.build_openai_server(
+            AggConfig(
+                model_name=MODEL,
+                tool_parser=tool_parser,
+                env=(("TRTLLM_RESPONSES_API_DISABLE_STORE", "1"),),
+            )
+        )
+        server.generator.generate_async = generate_async
+        yield server, seen
 
 
 @pytest.mark.parametrize(
@@ -995,9 +1061,8 @@ def _responses_server(monkeypatch, tool_parser):
     ],
 )
 def test_responses_configures_the_stop_only_when_asked_and_possible(
-    monkeypatch, server_logger, fields, tool_parser, enforced, warned
+    tmp_path, monkeypatch, server_logger, fields, tool_parser, enforced, warned
 ):
-    server, seen = _responses_server(monkeypatch, tool_parser)
     tool = FunctionTool(
         name="get_weather",
         type="function",
@@ -1011,7 +1076,8 @@ def test_responses_configures_the_stop_only_when_asked_and_possible(
         url=SimpleNamespace(path="/v1/responses"),
         json=AsyncMock(return_value={}),
     )
-    asyncio.run(server.openai_responses(request, raw_request))
+    with _responses_server(tmp_path, monkeypatch, tool_parser) as (server, seen):
+        asyncio.run(server.openai_responses(request, raw_request))
 
     sampling_params = seen["sampling_params"]
     assert sampling_params.stop == (list(V41_STOPS) if enforced else None)

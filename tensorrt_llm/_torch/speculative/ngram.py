@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from typing import Optional
 
 from ordered_set import OrderedSet
@@ -114,11 +129,11 @@ class NGramPoolManager(BaseResourceManager):
                     # 1. the pattern does not exist in the pool
                     # 2. only one match is kept, and the new match is longer (MRU)
                     pool[pattern] = OrderedSet((new_match, ))
-                elif new_match not in pool[pattern]:
+                elif self.is_keep_all and new_match not in pool[pattern]:
                     # Update the matches if the pattern is already existed:
                     # TODO: need a strategy to maintain the short candidates, now we just remove them
                     # Drop all existed matches with small length
-                    for match in pool[pattern]:
+                    for match in list(pool[pattern]):
                         if len(match) < len(new_match):
                             pool[pattern].remove(match)
                     pool[pattern].add(new_match)

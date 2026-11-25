@@ -171,6 +171,8 @@ def test_head_mismatch_mapper():
         dst_layer_offsets=[peer_layer_off],
         self_ri=self_ri,
         peer_ri=peer_ri,
+        self_kv_heads=self_ri.attention.kv_heads_per_rank,
+        peer_kv_heads=peer_ri.attention.kv_heads_per_rank,
         self_bytes_per_layer=self_bytes_per_layer,
         peer_bytes_per_layer=peer_bytes_per_layer,
         self_buffers_per_layer=buffers_per_layer,

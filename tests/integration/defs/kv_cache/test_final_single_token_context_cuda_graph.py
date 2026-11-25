@@ -127,8 +127,14 @@ class _CudaGraphExecutionProbe:
         current_inputs: dict[str, Any],
         *,
         position_id_offsets: torch.Tensor | None = None,
+        static_inputs_staged: int = 0,
     ) -> torch.Tensor | None:
-        output = self._replay(key, current_inputs, position_id_offsets=position_id_offsets)
+        output = self._replay(
+            key,
+            current_inputs,
+            position_id_offsets=position_id_offsets,
+            static_inputs_staged=static_inputs_staged,
+        )
         if self._pending_execution is not None and self._pending_execution.key == key:
             self._pending_execution.replayed = True
             self._pending_execution = None

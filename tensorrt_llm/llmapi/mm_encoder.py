@@ -54,6 +54,8 @@ class MultimodalEncoder(_TorchLLM):
         video_pruning_rate = self.args.multimodal_config.video_pruning_rate
         if video_pruning_rate is not None:
             input_processor_kwargs["video_pruning_rate"] = video_pruning_rate
+        if self.args.multimodal_config.vision_gpu_normalize:
+            input_processor_kwargs["vision_gpu_normalize"] = True
         self.input_processor = create_input_processor(
             self._hf_model_dir,
             self.tokenizer,
@@ -70,7 +72,7 @@ class MultimodalEncoder(_TorchLLM):
             mpi_session=self.mpi_session,
             reuse_mpi_comm=external_mpi_comm_available(
                 self.args.parallel_config.world_size),
-            is_llm_executor=True,  # TODO: check if this is correct or needed
+            is_llm_executor=True,
             hf_model_dir=self._hf_model_dir,
             tokenizer=self.tokenizer,
             llm_args=self.args)

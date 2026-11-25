@@ -1,6 +1,3 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-
 """Raw SM107 dynamic-N block-scaled MMA emission for Rubin MegaMoE."""
 
 from typing import Optional
@@ -11,6 +8,7 @@ from cutlass._mlir.dialects import builtin, llvm
 from cutlass.cutlass_dsl import Boolean, Int32, dsl_user_op
 
 from .....quant_def import QuantKind
+
 
 _bit_k_size_upper = 3
 _bit_b_sf_id = 4
@@ -56,9 +54,7 @@ def build_static_idesc_base(
         raise ValueError(f"SM107 MegaMoE requires instruction M 128 or 256, got {instruction_m}.")
     instruction_n_granularity = 16 if instruction_m == 256 else 8
     if instruction_n <= 0 or instruction_n > 256 or instruction_n % instruction_n_granularity != 0:
-        raise ValueError(
-            f"Invalid SM107 instruction N {instruction_n} for instruction M {instruction_m}."
-        )
+        raise ValueError(f"Invalid SM107 instruction N {instruction_n} for instruction M {instruction_m}.")
 
     expected_instruction_k = quant_kind.instruction_k("2x")
     if instruction_k != expected_instruction_k:
@@ -146,15 +142,7 @@ def _tcgen05_mma_block_scaled(
 
     llvm.inline_asm(
         None,
-        [
-            d_tmem_i32,
-            a_desc_i64,
-            b_desc_i64,
-            idesc_i32,
-            enable_input_d_i32,
-            sfa_tmem_i32,
-            sfb_tmem_i32,
-        ],
+        [d_tmem_i32, a_desc_i64, b_desc_i64, idesc_i32, enable_input_d_i32, sfa_tmem_i32, sfb_tmem_i32],
         "{\n\t"
         ".reg .pred p;\n\t"
         "setp.ne.b32 p, $4, 0;\n\t"

@@ -77,6 +77,8 @@ class DraftTargetOneModelSpecMetadata(SpecMetadata):
 
 
 class DraftTargetOneModelWorker(SpecWorkerBase):
+    verifies_on_target_shard = True
+
     def __init__(
         self,
         spec_config: "DraftTargetDecodingConfig",

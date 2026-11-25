@@ -47,7 +47,13 @@ struct StreamingBlockRemovedData
     std::vector<int64_t> blockHashes;
 };
 
-using StreamingEventData = std::variant<StreamingBlockStoredData, StreamingBlockRemovedData>;
+//! Semantic data for one wire-level AllBlocksCleared event.
+struct StreamingAllBlocksClearedData
+{
+};
+
+using StreamingEventData
+    = std::variant<StreamingBlockStoredData, StreamingBlockRemovedData, StreamingAllBlocksClearedData>;
 
 //! Counters accumulated over the lifetime of a streaming event sink.
 struct StreamingEventStats
@@ -78,6 +84,7 @@ public:
     void addStoredLifeCycle(Block const& block, LifeCycleId lifeCycle) override;
     void addRemovedBlock(Digest const& blockKey) override;
     void addRemovedLifeCycle(Digest const& blockKey, LifeCycleId lifeCycle) override;
+    void addAllBlocksCleared() override;
     void addCacheLevelUpdated(
         Digest const& blockKey, CacheLevel oldLevel, CacheLevel newLevel, LifeCycleId lifeCycle) override;
 

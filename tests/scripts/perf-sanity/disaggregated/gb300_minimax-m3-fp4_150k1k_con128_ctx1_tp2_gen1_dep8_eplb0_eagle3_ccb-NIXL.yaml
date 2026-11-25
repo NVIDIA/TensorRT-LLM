@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# MiniMax-M3 NVFP4 + EAGLE3-GQA decode at a fixed long context, for the
-# gen_only_no_context lane: one DEP8 gen worker (attention DP over 8 GPUs, 2 GB300
+# MiniMax-M3 NVFP4 + EAGLE3-GQA decode at a fixed long context. In the
+# gen_only_no_context lane, one DEP8 gen worker (attention DP over 8 GPUs, 2 GB300
 # nodes, MoE EP8) decodes 128 requests (16 per rank) of exactly 153600 input / 1024
 # output random tokens. This is the DEP8 gen-only sweep of the MiniMax-M3 ctx-only /
 # gen-only optimization study (B = 64-192, the decode of its high-throughput
@@ -16,8 +16,8 @@
 # retired max_tokens_in_buffer is dropped, three env vars main does not read are
 # left out and TLLM_LOG_LEVEL=INFO is added, as in every perf-sanity config. The
 # ctx section (the study's TP2 prefill worker) is not started by
-# gen_only_no_context. modeling_v2 is left at its default: no MiniMax-M3 target
-# covers attention DP.
+# gen_only_no_context; the e2e lane runs it in front of the gen worker. modeling_v2
+# is left at its default: no MiniMax-M3 target covers attention DP.
 #
 # On the ctx worker, block reuse and its 180 GiB host tier (the study's AgentX prefix
 # reuse) are off: the fixed random prompts share no prefix, and with reuse on the
@@ -110,7 +110,6 @@ worker_config:
       transceiver_runtime: PYTHON
       kv_transfer_timeout_ms: 600000
       kv_cache_bounce_size_mb: 4096
-      agent_bounce_buffer_enable: true
     scheduler_config:
       capacity_scheduler_policy: MAX_UTILIZATION
     return_perf_metrics: false
@@ -170,5 +169,4 @@ worker_config:
       transceiver_runtime: PYTHON
       kv_transfer_timeout_ms: 600000
       kv_cache_bounce_size_mb: 4096
-      agent_bounce_buffer_enable: true
     moe_expert_parallel_size: 1

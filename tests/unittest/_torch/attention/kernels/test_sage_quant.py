@@ -21,7 +21,10 @@ read them.
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention.backends.prims_ts.sage import flat_scale_numel, flat_scale_slot
+from tensorrt_llm._torch.attention.backends.prims_ts.sage import (
+    sage_flat_scale_numel,
+    sage_flat_scale_slot,
+)
 from tensorrt_llm._torch.attention.kernels.sage_quant import SageQuantized, sage_quantize
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -97,7 +100,7 @@ def _assert_summaries_match_reference(
     k_ref = k.float() if k_mean is None else k.float() - k_mean[:, None]
     maximum = k_ref.abs().amax(dim=-1).clamp_min(1e-3)
     scales = maximum / torch.full_like(maximum, divisor)
-    slots = flat_scale_slot(
+    slots = sage_flat_scale_slot(
         torch.arange(batch, device=k.device)[:, None],
         torch.arange(blocks, device=k.device)[None, :],
         blocks,
@@ -106,7 +109,7 @@ def _assert_summaries_match_reference(
 
     actual_k, actual_v, actual_scales = actual
     assert actual_k.shape == k.shape and actual_v.shape == v.shape
-    assert actual_scales.shape == (heads, flat_scale_numel(batch, blocks, 1))
+    assert actual_scales.shape == (heads, sage_flat_scale_numel(batch, blocks, 1))
     torch.testing.assert_close(
         actual_scales[:, slots], scales.permute(2, 0, 1).reshape(heads, -1), rtol=1e-6, atol=0
     )
@@ -223,7 +226,7 @@ def _check_block_quantized(
     """Scales equal the reference block maxima; values dequantize within one grid step."""
     divisor = 126.9 if quant_dtype == torch.int8 else 448.0
     batch = len(lengths)
-    expected_numel = flat_scale_numel(1, source.shape[0], block_size) + batch - 1
+    expected_numel = sage_flat_scale_numel(1, source.shape[0], block_size) + batch - 1
     assert scale.shape == (source.shape[1], expected_numel)
     begin = 0
     for b, length in enumerate(lengths):
@@ -235,7 +238,9 @@ def _check_block_quantized(
         maximum = maximum.clamp_min(1e-3)
         expected = maximum / torch.full_like(maximum, divisor)
         # Sequence b's scales start at cu_seqlens[b] // block_size + b.
-        slots = begin // block_size + flat_scale_slot(b, torch.arange(blocks, device="cuda"), 0, 0)
+        slots = begin // block_size + sage_flat_scale_slot(
+            b, torch.arange(blocks, device="cuda"), 0, 0
+        )
         torch.testing.assert_close(scale[:, slots], expected.T, rtol=1e-6, atol=0)
 
         token_scale = expected.repeat_interleave(block_size, dim=0)[:length].unsqueeze(-1)

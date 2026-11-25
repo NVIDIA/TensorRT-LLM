@@ -244,18 +244,56 @@ def _decode_video_to_chunks(
     return chunks, "".join(prompts)
 
 
+def _moon_patch_token_grid(
+    width: int, height: int, patch_size: int, merge_size: int, patch_limit: int, side_limit: int
+) -> tuple[int, int]:
+    """Spatial token grid after Moon-Patch resize and padding."""
+    patches = max(1, width // patch_size) * max(1, height // patch_size)
+    max_side = side_limit * patch_size
+    scale = min(1.0, math.sqrt(patch_limit / patches), max_side / width, max_side / height)
+    new_w = min(max(1, int(width * scale)), max_side)
+    new_h = min(max(1, int(height * scale)), max_side)
+    factor = merge_size * patch_size
+    return (new_h + factor - 1) // factor, (new_w + factor - 1) // factor
+
+
+def _moon_patch_chunk_tokens(chunk: list[np.ndarray] | np.ndarray, cfg: dict[str, Any]) -> int:
+    patch_limit = cfg["in_patch_limit_each_frame"]
+    if patch_limit is None:
+        patch_limit = cfg["in_patch_limit"]
+    if cfg["in_patch_limit_video"] is not None:
+        patch_limit = min(patch_limit, round(cfg["in_patch_limit_video"] / len(chunk)))
+
+    height, width = chunk[0].shape[:2]
+    merge_size = cfg["merge_kernel_size"]
+    side_limit = cfg["patch_limit_on_one_side"]
+    grid = _moon_patch_token_grid(
+        width, height, cfg["patch_size"], merge_size, patch_limit, side_limit
+    )
+    if cfg["fixed_output_tokens"] is not None:
+        return cfg["fixed_output_tokens"]
+    assert max(grid) * merge_size <= side_limit, "Padded video grid exceeds patch_limit_on_one_side"
+    return math.prod(grid)
+
+
+def _to_pil_image(image: Image.Image | torch.Tensor | np.ndarray) -> Image.Image:
+    if isinstance(image, np.ndarray):
+        return Image.fromarray(image)
+    if isinstance(image, torch.Tensor):
+        from torchvision.transforms.functional import to_pil_image
+
+        return to_pil_image(image)
+    return image
+
+
 def _frames_to_chunks(
-    frames: List,
+    frames: List | np.ndarray,
     temporal_merge_kernel_size: int = 4,
     timestamp_mode: str = "hh:mm:ss.fff",
     fps: float = 2.0,
     frame_indices: Optional[List[int]] = None,
 ) -> Tuple[List[Dict[str, Any]], str]:
-    """Split pre-decoded PIL frames into temporal chunks.
-
-    Same output format as ``_decode_video_to_chunks`` but skips the
-    decoding step (frames are already PIL Images).
-    """
+    """Convert decoded frames to PIL and split them into temporal chunks."""
     if fps <= 0:
         raise ValueError(f"Video fps must be positive, got {fps}")
     if frame_indices is not None and len(frame_indices) != len(frames):
@@ -269,7 +307,9 @@ def _frames_to_chunks(
     prompts: List[str] = []
 
     for i in range(0, len(frames), temporal_merge_kernel_size):
-        chunk_frames = frames[i : i + temporal_merge_kernel_size]
+        chunk_frames = [
+            _to_pil_image(frame) for frame in frames[i : i + temporal_merge_kernel_size]
+        ]
         start_frame = frame_indices[i] if frame_indices is not None else i
         start_time = start_frame / fps
         ts_text = _format_video_timestamp(start_time, timestamp_mode)
@@ -798,9 +838,15 @@ class KimiK25VisionModel(nn.Module):
         self.model_config = copy.copy(model_config)
         self.model_config.extra_attrs = copy.copy(model_config.extra_attrs)
         self.model_config._frozen = False
-        self.model_config.quant_config = QuantConfig(
-            kv_cache_quant_algo=model_config.quant_config.kv_cache_quant_algo
+        self.model_config.attn_backend = model_config.get_encoder_attention_backend(
+            "vision", model_config.attn_backend
         )
+        kv_cache_quant_algo = model_config.quant_config.kv_cache_quant_algo
+        if self.model_config.attn_backend != model_config.attn_backend:
+            # The encoder keeps no KV cache, and FlashInfer rejects FP8
+            # KV-cache quantization without one.
+            kv_cache_quant_algo = None
+        self.model_config.quant_config = QuantConfig(kv_cache_quant_algo=kv_cache_quant_algo)
         self.model_config.pretrained_config = copy.copy(model_config.pretrained_config)
 
         # Extract vision config dict (num_heads is resolved here, with this
@@ -1171,44 +1217,49 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
         else:
             merge_k = int(merge_kernel_size)
 
-        w, h = image.size
-        factor = merge_k * patch_size
-        in_patch_limit = 16384
-        patch_limit_on_one_side = 512
-        s1 = math.sqrt(in_patch_limit / (max(1.0, w // patch_size) * max(1.0, h // patch_size)))
-        s2 = patch_limit_on_one_side * patch_size / w
-        s3 = patch_limit_on_one_side * patch_size / h
-        scale = min(1.0, s1, s2, s3)
-        new_w = min(max(1, int(w * scale)), patch_limit_on_one_side * patch_size)
-        new_h = min(max(1, int(h * scale)), patch_limit_on_one_side * patch_size)
-        pad_w = (factor - new_w % factor) % factor
-        pad_h = (factor - new_h % factor) % factor
-        token_w = (new_w + pad_w) // factor
-        token_h = (new_h + pad_h) // factor
-        return token_h * token_w
+        width, height = image.size
+        return math.prod(_moon_patch_token_grid(width, height, patch_size, merge_k, 16384, 512))
 
     def get_num_tokens_per_video(self, *, video: List, **kwargs) -> int:
-        """Calculate total tokens for a video (list of PIL frames).
+        """Calculate total tokens for a decoded video.
 
         Each temporal chunk of ``temporal_merge_kernel_size`` frames produces
         tokens based on the spatial dimensions of the first frame.  The total
         is the sum across all chunks.
 
         Args:
-            video: List of PIL Image frames.
+            video: Decoded video frames.
 
         Returns:
             Total visual tokens for the entire video.
         """
         image_processor = getattr(self._processor, "image_processor", None)
-        temporal_k = 4
-        if image_processor is not None:
-            media_proc_cfg = getattr(image_processor, "media_proc_cfg", {})
-            temporal_k = media_proc_cfg.get("temporal_merge_kernel_size", 4)
+        cfg = getattr(image_processor, "media_proc_cfg", {})
+        temporal_k = cfg.get("temporal_merge_kernel_size", 4)
+        processor_cls = type(image_processor)
+        native_sizing = (
+            processor_cls.__name__ == "KimiK25VisionProcessor"
+            and processor_cls.__module__.rsplit(".", 1)[-1] == "kimi_k25_vision_processing"
+            and cfg.get("config_type")
+            == "media_proc.processors.moonvit.MoonViTMediaProcessorConfig"
+            and "get_resize_config" not in vars(image_processor)
+            and "media_tokens_calculator" not in vars(image_processor)
+        )
 
         total_tokens = 0
         for i in range(0, len(video), temporal_k):
             chunk = video[i : i + temporal_k]
+            if native_sizing and all(
+                isinstance(frame, np.ndarray)
+                and frame.dtype == np.uint8
+                and frame.ndim == 3
+                and 0 not in frame.shape
+                and frame.shape[-1] == 3
+                for frame in chunk
+            ):
+                total_tokens += _moon_patch_chunk_tokens(chunk, cfg)
+                continue
+            chunk = [_to_pil_image(frame) for frame in chunk]
             # Each chunk is treated as a video_chunk; token count depends
             # on the spatial dims of the first frame.
             if image_processor is not None and hasattr(image_processor, "media_tokens_calculator"):
@@ -1266,13 +1317,7 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
         # ``split_video_chunks()`` which requires ``mecord``.
         medias: List[Dict[str, Any]] = []
         for img in images:
-            # The serving layer may pass images as torch.Tensor (default
-            # format="pt"). Convert to PIL for the HF processor.
-            if isinstance(img, torch.Tensor):
-                from torchvision.transforms.functional import to_pil_image
-
-                img = to_pil_image(img)
-            medias.append({"type": "image", "image": img})
+            medias.append({"type": "image", "image": _to_pil_image(img)})
 
         video_prompt_parts: List[str] = []
         if videos:
@@ -1293,18 +1338,13 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
                 fps_for_chunks = sfps
                 frame_indices = None
                 if isinstance(vid, VideoData):
-                    from torchvision.transforms.functional import to_pil_image
-
                     metadata_fps = vid.metadata.get("fps")
                     if metadata_fps is not None:
                         fps_for_chunks = float(metadata_fps)
                     frame_indices = vid.metadata.get("frames_indices")
-                    frames = [
-                        to_pil_image(f) if isinstance(f, torch.Tensor) else f for f in vid.frames
-                    ]
-                    vid = frames
+                    vid = vid.frames
 
-                if isinstance(vid, list):
+                if isinstance(vid, (list, np.ndarray)):
                     # Pre-decoded frames (from framework or VideoData).
                     # Split into temporal chunks directly.
                     chunks, vid_prompt = _frames_to_chunks(
@@ -1575,6 +1615,10 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
         llm: DeepseekV3ForCausalLM (MLA + MoE, 61 layers)
     """
 
+    supported_encoder_attention_backends = {
+        "vision": frozenset({"VANILLA", "TRTLLM", "FLASHINFER"})
+    }
+
     _LANG_PREFIX = "language_model."
     # Vision tower class. Subclasses (Kimi K3) override this so the shared
     # __init__/load_weights MetaInitMode deferral-and-recreation logic
@@ -1729,8 +1773,19 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
         """
         return self._mm_token_ids
 
-    def load_weights(self, weights) -> None:
-        """Load vision + projector + LLM weights from checkpoint."""
+    def load_weights(self, weights: Dict[str, torch.Tensor]) -> None:
+        """Load vision + projector + LLM weights from checkpoint.
+
+        Raises:
+            RuntimeError: Dense DWDP is active on the text model; nothing is loaded.
+        """
+        if getattr(getattr(self, "model", None), "_dense_dwdp_active", False):
+            # The text model's dense weights are views of dense DWDP staging slots that several
+            # layers share; refuse before the vision tower is rebuilt or loaded.
+            raise RuntimeError(
+                f"{type(self).__name__} load_weights is not supported while dense DWDP is "
+                "active: the dense weights live in staging slots shared across layers"
+            )
         # Create vision encoder if it was skipped during meta init.
         # Use the saved VLM config since model_config.pretrained_config
         # has been overwritten with text_config by __init__.

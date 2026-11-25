@@ -57,8 +57,22 @@ def test_format_bind_address_brackets_ipv6() -> None:
 
 @pytest.mark.parametrize("fail_stop", [False, True])
 @pytest.mark.parametrize("fail_metrics", [False, True])
-def test_stop_drains_both_media_pools_even_if_shutdown_fails(fail_stop, fail_metrics) -> None:
+@pytest.mark.parametrize("first_released", [0, 1])
+def test_stop_drains_both_media_pools_even_if_shutdown_fails(
+    fail_stop, fail_metrics, first_released
+) -> None:
     async def exercise_stop():
+        loop = asyncio.get_running_loop()
+
+        class TrackedPool(ThreadPoolExecutor):
+            def __init__(self) -> None:
+                super().__init__(max_workers=1)
+                self.shutdown_started = asyncio.Event()
+
+            def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
+                loop.call_soon_threadsafe(self.shutdown_started.set)
+                super().shutdown(wait=wait, cancel_futures=cancel_futures)
+
         server = OpenEngineServer.__new__(OpenEngineServer)
         server._server = SimpleNamespace(
             stop=AsyncMock(side_effect=RuntimeError("stop failed") if fail_stop else None)
@@ -68,24 +82,57 @@ def test_stop_drains_both_media_pools_even_if_shutdown_fails(fail_stop, fail_met
         server._metrics = SimpleNamespace(
             stop=AsyncMock(side_effect=RuntimeError("metrics failed") if fail_metrics else None)
         )
-        server._input_executor = ThreadPoolExecutor(max_workers=1)
-        server._media_executor = ThreadPoolExecutor(max_workers=1)
-        futures = [
-            pool.submit(lambda: True) for pool in (server._input_executor, server._media_executor)
-        ]
-        media_session = await _get_aiohttp_session()
-        if fail_stop or fail_metrics:
-            message = "metrics failed" if fail_metrics else "stop failed"
-            with pytest.raises(RuntimeError, match=message):
-                await server.stop(grace=0)
-        else:
-            await server.stop(grace=0)
-        assert media_session.closed
+        server._input_executor = TrackedPool()
+        server._media_executor = TrackedPool()
+        pools = (server._input_executor, server._media_executor)
+        started = [threading.Event(), threading.Event()]
+        release = [threading.Event(), threading.Event()]
+
+        def work(index: int) -> None:
+            started[index].set()
+            assert release[index].wait(10)
+
+        futures = [pool.submit(work, index) for index, pool in enumerate(pools)]
+        stop_task = None
+        media_session = None
+        try:
+            media_session = await _get_aiohttp_session()
+            for event in started:
+                assert await asyncio.to_thread(event.wait, 5)
+            stop_task = asyncio.create_task(server.stop(grace=0))
+            await asyncio.wait_for(
+                asyncio.gather(*(pool.shutdown_started.wait() for pool in pools)), 5
+            )
+            done, _ = await asyncio.wait({stop_task}, timeout=0.05)
+            assert not done
+            release[first_released].set()
+            await asyncio.to_thread(futures[first_released].result, 5)
+            done, _ = await asyncio.wait({stop_task}, timeout=0.05)
+            assert not done
+            release[1 - first_released].set()
+            if fail_stop or fail_metrics:
+                message = "metrics failed" if fail_metrics else "stop failed"
+                with pytest.raises(RuntimeError, match=message):
+                    await asyncio.wait_for(stop_task, 5)
+            else:
+                await asyncio.wait_for(stop_task, 5)
+            assert media_session.closed
+            assert all(future.done() for future in futures)
+            for future in futures:
+                future.result()
+        finally:
+            for event in release:
+                event.set()
+            if stop_task is not None:
+                await asyncio.wait_for(asyncio.gather(stop_task, return_exceptions=True), 5)
+            for pool in pools:
+                await asyncio.to_thread(pool.shutdown)
+            if media_session is not None:
+                await media_session.close()
         assert server._stopping
         server._metrics.stop.assert_awaited_once()
         server._health.enter_graceful_shutdown.assert_awaited_once()
-        assert all(future.result() for future in futures)
-        for pool in (server._input_executor, server._media_executor):
+        for pool in pools:
             with pytest.raises(RuntimeError, match="shutdown"):
                 pool.submit(lambda: None)
 

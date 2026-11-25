@@ -20,7 +20,7 @@ Kernel-specific regression coverage lives in dedicated modules such as
 hooks and pass predictions through ``SparseRuntimeParams``.
 """
 
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -36,6 +36,7 @@ from tensorrt_llm._torch.attention.backends.sparse.hooks import (
     MLASparseHooks,
     get_sparse_attention_hooks,
     get_sparse_mla_hooks,
+    has_sparse_mla_hooks,
     prepare_sparse_runtime_params,
     register_attention_sparse_hooks,
     register_mla_sparse_hooks,
@@ -99,6 +100,12 @@ def test_sparse_attn_hook_registration() -> None:
     hook_module = ModuleType("sparse_attn_hook_registration")
     hook_module.sparse_params = _StubSparseParams()
 
+    assert not has_sparse_mla_hooks(None)
+    assert not has_sparse_mla_hooks("skip_softmax")
+    assert not has_sparse_mla_hooks("unregistered_mla_algorithm")
+    assert has_sparse_mla_hooks("dsa")
+    assert has_sparse_mla_hooks("deepseek_v4")
+
     hook_module.sparse_params.algorithm = "dsa"
     dsa_hooks = get_sparse_mla_hooks(hook_module)
     assert isinstance(dsa_hooks, MLASparseHooks)
@@ -118,6 +125,7 @@ def test_sparse_attn_hook_registration() -> None:
     assert get_sparse_mla_hooks(hook_module) is None
 
     register_mla_sparse_hooks("test_mla_hooks", type(dsa_hooks))
+    assert has_sparse_mla_hooks("test_mla_hooks")
     hook_module.sparse_params.algorithm = "test_mla_hooks"
     assert isinstance(get_sparse_mla_hooks(hook_module), type(dsa_hooks))
     assert get_sparse_mla_hooks(hook_module) is not get_sparse_mla_hooks(hook_module)
@@ -399,6 +407,71 @@ def test_sparse_attention_backend_fallback_does_not_redispatch(
 
     assert backend is TrtllmAttention
     trtllm_sparse_resolver.assert_not_called()
+
+
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [True, False])
+def test_skip_softmax_uses_the_dense_kv_cache_manager(use_kv_cache_manager_v2: bool) -> None:
+    from tensorrt_llm._torch.attention.backends.sparse import get_sparse_attn_kv_cache_manager
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+    from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+    from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
+
+    manager_cls = get_sparse_attn_kv_cache_manager(
+        SkipSoftmaxAttentionConfig(threshold_scale_factor=1000.0),
+        use_kv_cache_manager_v2=use_kv_cache_manager_v2,
+    )
+
+    assert manager_cls is (KVCacheManagerV2 if use_kv_cache_manager_v2 else KVCacheManager)
+
+
+def test_only_skip_softmax_keeps_the_dense_kv_cache() -> None:
+    """Manager selection keys off the class flag, which is not a user-facing field."""
+    from typing import get_args
+
+    from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig, SparseAttentionConfig
+
+    config_classes = get_args(get_args(SparseAttentionConfig)[0])
+
+    assert {cls for cls in config_classes if cls.uses_dense_kv_cache} == {
+        SkipSoftmaxAttentionConfig
+    }
+    assert "uses_dense_kv_cache" not in SkipSoftmaxAttentionConfig.model_fields
+
+
+@pytest.mark.parametrize("variable_geometry", [False, True])
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [True, False])
+def test_skip_softmax_model_selects_its_dense_kv_cache_manager(
+    use_kv_cache_manager_v2: bool, variable_geometry: bool
+) -> None:
+    """Variable per-layer KV geometry needs V2 even when V1 is requested."""
+    from tensorrt_llm._torch.model_config import KVCacheLayerSpec
+    from tensorrt_llm._torch.pyexecutor._util import get_kv_cache_manager_cls
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+    from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig, SkipSoftmaxAttentionConfig
+
+    head_dims = (256, 512) if variable_geometry else (256, 256)
+    layer_specs = tuple(
+        KVCacheLayerSpec(head_dim=head_dim, num_kv_heads=2, num_q_heads=8) for head_dim in head_dims
+    )
+    kv_cache_config = KvCacheConfig(use_kv_cache_manager_v2=use_kv_cache_manager_v2)
+
+    def select(sparse_attention_config):
+        model_config = SimpleNamespace(
+            pretrained_config=SimpleNamespace(
+                architectures=["LlamaForCausalLM"], num_hidden_layers=len(head_dims)
+            ),
+            sparse_attention_config=sparse_attention_config,
+            kv_cache_layer_specs=layer_specs,
+        )
+        return get_kv_cache_manager_cls(model_config, kv_cache_config)
+
+    selected = select(SkipSoftmaxAttentionConfig(threshold_scale_factor=1000.0))
+
+    assert selected is select(None)
+    assert selected is (
+        KVCacheManagerV2 if use_kv_cache_manager_v2 or variable_geometry else KVCacheManager
+    )
 
 
 @pytest.mark.parametrize("backend_name", ["FLASHINFER", "unknown"])

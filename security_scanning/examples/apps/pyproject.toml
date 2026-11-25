@@ -5,7 +5,7 @@ description = ""
 authors = [
     {name = "TensorRT LLM [90828364+tensorrt-cicd@users.noreply.github.com]"}
 ]
-requires-python = ">=3.10,<3.13"
+requires-python = ">=3.12,<3.13"
 dependencies = [
     "colorama (>=0.4.6,<0.5.0)",
     "openai (>=1.57.2)"

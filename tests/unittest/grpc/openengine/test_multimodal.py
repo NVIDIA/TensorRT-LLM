@@ -121,10 +121,7 @@ class _ImageInputProcessor(BaseMultimodalInputProcessor):
         raise NotImplementedError
 
     def get_preferred_media_io_kwargs(self):
-        return {
-            "image": {"format": "np"},
-            "video": {"format": "np", "num_frames": 4},
-        }
+        return {"video": {"num_frames": 4}}
 
 
 class _AudioInputProcessor:
@@ -373,7 +370,10 @@ def test_media_capability_accepts_a_registered_non_base_processor(monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("prompt", ["", "<|startoftranscript|><|fr|><|translate|><|notimestamps|>"])
-async def test_audio_text_prompt_survives_preparation_without_placeholders(monkeypatch, prompt):
+@pytest.mark.parametrize("context_only", [False, True])
+async def test_audio_text_prompt_survives_preparation_without_placeholders(
+    monkeypatch, prompt, context_only
+):
     import soundfile
 
     config = _ImageConfig()
@@ -405,6 +405,8 @@ async def test_audio_text_prompt_survives_preparation_without_placeholders(monke
             )
         ],
     )
+    if context_only:
+        request.extra.update({"request_type": "context_only"})
     responses = [response async for response in inference.Generate(request, FakeServicerContext())]
     assert responses[-1].HasField("finished")
     inputs = llm.generate_kwargs["inputs"]
@@ -423,6 +425,43 @@ def test_media_capability_rejects_a_registered_non_callable_processor(monkeypatc
     )
 
     assert request_mapping.media_capabilities_for_model(llm).modalities == set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("compatible", [False, True])
+async def test_prompt_validation_token_ids_are_reused_only_on_compatible_paths(
+    image_llm, monkeypatch, compatible
+):
+    capability_llm, _ = image_llm
+    llm = _ImageLlm(capability_llm.input_processor, capability_llm._hf_model_config)
+    monkeypatch.setattr(llm.input_processor, "supports_token_id_mm_expansion", compatible)
+
+    class ImageIo:
+        @classmethod
+        def create(cls, defaults, runtime):
+            return cls()
+
+        async def async_load_bytes(self, data):
+            return np.zeros((1, 1, 3), dtype=np.uint8)
+
+    monkeypatch.setattr(request_mapping, "ImageMediaIO", ImageIo)
+    request = generation_pb2.GenerateRequest(
+        request_id="reuse-validation",
+        model="image-model",
+        prompt="<image_1> describe",
+        media=[
+            generation_pb2.MediaItem(modality=generation_pb2.MODALITY_IMAGE, raw_bytes=b"image")
+        ],
+    )
+    service = OpenEngineInferenceServicer(llm, "image-model")
+    assert [item async for item in service.Generate(request, FakeServicerContext())]
+    prepared = llm.generate_kwargs["inputs"]
+    if compatible:
+        assert "prompt" not in prepared
+        assert prepared["prompt_token_ids"] == llm.tokenizer.encode(request.prompt)
+    else:
+        assert prepared["prompt"] == request.prompt
+        assert "prompt_token_ids" not in prepared
 
 
 @pytest.mark.asyncio
@@ -1247,8 +1286,24 @@ async def test_token_ids_are_rejected_when_the_processor_does_not_consume_them()
         await request_mapping._input_from_request(request, llm)
 
 
+@pytest.mark.parametrize("source", ["request", "model"])
+def test_media_io_rejects_representation_overrides(image_llm, monkeypatch, source):
+    llm, _ = image_llm
+    options = {"audio": {"device": "cpu"}}
+    request = generation_pb2.GenerateRequest(prompt="hello")
+    with pytest.raises(ValueError, match=r"media_io_kwargs\.audio\.device"):
+        if source == "request":
+            request.extra.update({"media_io_kwargs": options})
+            request_mapping._prepare_input_from_request(request, llm)
+        else:
+            monkeypatch.setattr(
+                llm.input_processor, "get_preferred_media_io_kwargs", lambda: options
+            )
+            request_mapping._media_io_for_model(llm, "image", media_io.ImageMediaIO)
+
+
 @pytest.mark.asyncio
-async def test_image_sources_preserve_order_uuid_and_model_decode_defaults(image_llm, monkeypatch):
+async def test_image_sources_preserve_order_and_uuid(image_llm, monkeypatch):
     llm, _ = image_llm
     created_with = []
 
@@ -1292,7 +1347,7 @@ async def test_image_sources_preserve_order_uuid_and_model_decode_defaults(image
 
     mapped = await request_mapping._input_from_request(request, llm)
 
-    assert created_with == [({"format": "np"}, None)]
+    assert created_with == [(None, None)]
     assert mapped["prompt"] == request.prompt
     assert mapped["multi_modal_data"] == {
         "image": [
@@ -1378,10 +1433,10 @@ async def test_media_sources_preserve_global_order(image_video_audio_llm, monkey
     assert len(created_with) == 3
     video_modality, video_defaults, video_runtime = created_with[0]
     assert video_modality == "video"
-    assert video_defaults == {"format": "np", "num_frames": 4}
+    assert video_defaults == {"num_frames": 4}
     assert set(video_runtime) == {"decoded_memory_reserver"}
     assert callable(video_runtime["decoded_memory_reserver"])
-    assert created_with[1] == ("image", {"format": "np"}, None)
+    assert created_with[1] == ("image", None, None)
     audio_modality, audio_defaults, audio_runtime = created_with[2]
     assert audio_modality == "audio"
     assert audio_defaults is None

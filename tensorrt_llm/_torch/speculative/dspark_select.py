@@ -125,6 +125,7 @@ def select_windows_device(
     stamp: Optional[torch.Tensor] = None,
     expected_stamp: Optional[torch.Tensor] = None,
     pad_len: Optional[int] = None,
+    sync_rows: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
 ) -> DeviceWindowResult:
     """Rank the batch by fresh confidence and pack it into the agreed bucket.
 
@@ -154,6 +155,10 @@ def select_windows_device(
             which its pre-launch copy widths depend on (see
             :func:`fill_bucket_device`). The caller must clamp ``budget`` so
             the real rows can absorb ``graph_num_tokens - n_pad * pad_len``.
+        sync_rows: optional map from this rank's ``[padded_bs, K]`` gathered
+            logits (stale rows already neutral) to the rows every rank must
+            rank, e.g. TP rank 0's without attention DP. Must be a device op
+            that every rank calls.
 
     Returns:
         :class:`DeviceWindowResult`; every tensor is derived without a host
@@ -177,6 +182,8 @@ def select_windows_device(
             selected,
         )
 
+    if sync_rows is not None:
+        selected = sync_rows(selected)
     calibrate = apply_calibration or torch.sigmoid
     survival = compute_survival(calibrate(selected))
     # Pad rows must win no budget: zero survival sits below survival_eps, so

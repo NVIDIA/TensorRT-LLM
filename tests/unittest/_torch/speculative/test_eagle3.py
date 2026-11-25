@@ -25,10 +25,12 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 from test_common.llm_data import with_mocked_hf_download_for_single_gpu
+from test_common.moe_tactics import sm100f_moe_tactic_or_cutlass
 from utils.llm_data import llm_models_root
 from utils.util import skip_num_gpus_less_than, skip_pre_blackwell
 
 from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.attention.backends.sparse.dsa import (
     DSACacheManagerV2, DSAtrtllmAttentionMetadata)
 from tensorrt_llm._torch.attention.backends.trtllm import \
@@ -80,7 +82,9 @@ def test_mtp_eagle_refreshes_dsa_metadata_before_draft_forward() -> None:
     metadata = _Metadata()
 
     @contextmanager
-    def draft_context(attn_metadata, manager):
+    def draft_context(attn_metadata,
+                      manager,
+                      enable_draft_locality_domain_forkjoin=False):
         assert attn_metadata is metadata
         assert manager is draft_manager
         events.append("switch")
@@ -95,8 +99,10 @@ def test_mtp_eagle_refreshes_dsa_metadata_before_draft_forward() -> None:
 
     worker = SimpleNamespace(
         is_mtp_eagle=True,
+        _draft_takes_kept_rows=False,
         draft_kv_cache_context=draft_context,
         _run_draft_forward=run_draft_forward,
+        _step0_draft_layer_picks_rows=lambda draft_model, use_epilogue: False,
     )
 
     from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelWorker
@@ -440,6 +446,43 @@ def test_mtp_eagle_context_input_uses_prompt_lookahead() -> None:
 
 
 @skip_num_gpus_less_than(1)
+@pytest.mark.parametrize("fast_paths", [False, True])
+def test_mtp_eagle_generation_only_draft_input_ids(fast_paths) -> None:
+    """A generation-only step's draft input ids are the accepted tokens: read
+    in place on the speculative fast paths, else a concatenated copy."""
+    spec_config = MTPDecodingConfig(max_draft_len=3)
+    spec_metadata = Eagle3OneModelSpecMetadata(
+        max_num_requests=2,
+        max_draft_len=3,
+        max_total_draft_tokens=3,
+        spec_dec_mode=spec_config.spec_dec_mode,
+        num_layers=1,
+        hidden_size=4,
+        max_num_tokens=8,
+    )
+    spec_metadata.gather_ids = torch.tensor([3, 7],
+                                            dtype=torch.int32,
+                                            device="cuda")
+    spec_metadata.runtime_draft_len = 3
+    accepted = torch.arange(8, dtype=torch.int32, device="cuda").view(2, 4)
+    worker = MTPEagleWorker(spec_config, spec_decode_fast_paths=fast_paths)
+    draft_inputs = worker.prepare_1st_drafter_inputs(
+        input_ids=torch.zeros(8, dtype=torch.int32, device="cuda"),
+        position_ids=torch.arange(8, dtype=torch.int32,
+                                  device="cuda").unsqueeze(0),
+        hidden_states=torch.zeros((8, 4), device="cuda"),
+        accepted_tokens=accepted,
+        attn_metadata=SimpleNamespace(num_contexts=0, num_ctx_tokens=0),
+        spec_metadata=spec_metadata,
+        draft_model=SimpleNamespace(),
+    )
+    input_ids = draft_inputs["input_ids"]
+    assert input_ids.dtype == torch.int32
+    assert torch.equal(input_ids, accepted.flatten())
+    assert (input_ids.data_ptr() == accepted.data_ptr()) == fast_paths
+
+
+@skip_num_gpus_less_than(1)
 def test_mtp_eagle_dynamic_tree_context_input_uses_prompt_lookahead() -> None:
     invalid = INVALID_PROMPT_LOOKAHEAD_TOKEN
     worker = object.__new__(MTPEagleDynamicTreeWorker)
@@ -471,6 +514,71 @@ def test_mtp_eagle_dynamic_tree_context_input_uses_prompt_lookahead() -> None:
         draft_inputs["input_ids"],
         torch.tensor([11, 12, 13, 21, 88], dtype=torch.int32, device="cuda"),
     )
+
+
+@skip_num_gpus_less_than(1)
+def test_eagle3_prepare_skipped_uploads_keep_slot_ids_current() -> None:
+    slots = {5: 2, 6: 0, 7: 3}
+    md = object.__new__(Eagle3OneModelSpecMetadata)
+    md.use_rejection_sampling = False
+    md.use_dynamic_tree = False
+    md.num_tokens = 0
+    md.num_generations = 0
+    md.batch_indices_cuda = torch.full((8, ),
+                                       -1,
+                                       dtype=torch.int,
+                                       device="cuda")
+    md.slot_ids = torch.full((8, ), -1, dtype=torch.long, device="cuda")
+    md._batch_indices_upload = DeviceCopyBuffer(md.batch_indices_cuda)
+    md._slot_ids_upload = DeviceCopyBuffer(md.slot_ids)
+    md.spec_resource_manager = SimpleNamespace(slot_manager=SimpleNamespace(
+        get_slot=lambda rid: slots[rid]))
+    md.spec_dec_mode = SimpleNamespace(is_mtp_eagle_one_model=lambda: True)
+
+    # Repeated and prefix batches may skip the upload; a reassigned slot may not.
+    for request_ids, reassign in [([5, 6], None), ([5, 6], None), ([5], None),
+                                  ([5, 6, 7], None), ([5, 6, 7], (6, 4))]:
+        if reassign is not None:
+            slots[reassign[0]] = reassign[1]
+        md.request_ids = request_ids
+        md.prepare()
+        torch.cuda.synchronize()
+        n = len(request_ids)
+        assert md.batch_indices_cuda[:n].tolist() == list(range(n))
+        assert md.slot_ids[:n].tolist() == [slots[r] for r in request_ids]
+
+
+def test_external_shared_target_kv_step_prepares_next_new_tokens() -> None:
+    accepted = torch.tensor([[11, 12, 13]], dtype=torch.int32)
+    num_accepted = torch.tensor([2], dtype=torch.int32)
+    drafts = torch.tensor([[21, 22]], dtype=torch.int32)
+    worker = SimpleNamespace(
+        _execute_guided_decoder_if_present=lambda logits: None,
+        sample_and_accept_draft_tokens=lambda *args: (accepted, num_accepted),
+        _is_mamba_hybrid_cache=False,
+        sa_enhancer=None,
+        _uses_external_shared_target_kv=True,
+        _forward_external_shared_target_kv_draft_loop=lambda **kwargs: drafts,
+        _prepare_next_new_tokens=lambda *args: "next new tokens",
+        _auxiliary_state_handlers=[],
+    )
+    spec_metadata = SimpleNamespace(runtime_draft_len=2,
+                                    spec_resource_manager=None,
+                                    batch_indices_cuda=torch.tensor([0]),
+                                    sharded_target_logits=False)
+    attn_metadata = SimpleNamespace(num_seqs=1, num_contexts=0)
+
+    out = MTPEagleWorker._forward_impl(worker,
+                                       torch.tensor([1, 2, 3]),
+                                       torch.arange(3),
+                                       torch.zeros(3, 8),
+                                       torch.zeros(3, 16),
+                                       attn_metadata,
+                                       spec_metadata,
+                                       draft_model=None)
+
+    assert out["next_draft_tokens"] is drafts
+    assert out["next_new_tokens"] == "next new tokens"
 
 
 @pytest.fixture(scope="function")
@@ -549,7 +657,8 @@ def _make_mock_kv_cache_manager(num_seqs: int) -> MagicMock:
     mock_kv_cache_manager.copy_batch_block_offsets = MagicMock()
     # MagicMock fabricates every attribute; metadata detects an FP4 MLA cache
     # layout from this hook, so a plain (non-FP4) manager must not expose it.
-    mock_kv_cache_manager.get_fp4_mla_page_table_spec = None
+    mock_kv_cache_manager.fp4_mla_layout = None
+    mock_kv_cache_manager.mixed_precision_high_layers = {}
     return mock_kv_cache_manager
 
 
@@ -1152,22 +1261,25 @@ def test_nemotron_super_mtp_dynamic_tree_dl6_k10_dt31(
     cuda_graph_config = CudaGraphConfig(
         batch_sizes=[1]) if use_cuda_graph else None
 
+    moe_tactic = sm100f_moe_tactic_or_cutlass("trtllm_gen")
     llm_common_config = dict(
         model=model_path,
         tensor_parallel_size=8,
         moe_expert_parallel_size=8,
         pipeline_parallel_size=1,
-        moe_config=MoeConfig(backend="TRTLLM"),
+        moe_config=MoeConfig(tactic=moe_tactic),
         disable_overlap_scheduler=disable_overlap_scheduler,
         cuda_graph_config=cuda_graph_config,
         max_batch_size=max_batch_size,
         kv_cache_config=kv_cache_config,
         max_seq_len=8192,
     )
+    # The target's tactic does not reach the MTP layers, so they pin it too.
     spec_config = MTPDecodingConfig(max_draft_len=max_draft_len,
                                     use_dynamic_tree=True,
                                     dynamic_tree_max_topK=10,
-                                    max_total_draft_tokens=31)
+                                    max_total_draft_tokens=31,
+                                    moe_tactic=moe_tactic)
 
     llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
     prompt = llm_spec.tokenizer.apply_chat_template(

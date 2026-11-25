@@ -1,0 +1,38 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# MiniMax-M3.1-Flash, max throughput on 8 Vera Rubin GPUs (2 nodes of 4): DEP8 (attention data parallel,
+# expert-parallel MoE), DSpark drafter, NVFP4 KV cache.
+tensor_parallel_size: 8
+moe_expert_parallel_size: 8
+enable_attention_dp: true
+attention_dp_config:
+  enable_balance: true
+# The DEP target is built only when modeling_v2 is set, and runs the MegaMoE CuTe DSL MoE backend.
+modeling_v2: require
+trust_remote_code: true
+max_batch_size: 32
+# Chunked prefill stays off: the DSpark drafter's sliding-window draft pool needs whole-prompt prefill when there is no
+# host KV cache, so max_num_tokens covers max_seq_len.
+max_num_tokens: 32768
+max_seq_len: 32768
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 32
+kv_cache_config:
+  dtype: nvfp4
+  free_gpu_memory_fraction: 0.85
+moe_config:
+  backend: MEGAMOE_CUTEDSL
+sparse_attention_config:
+  algorithm: minimax_m3
+  implementation: msa
+  indexer_kv_dtype: fp8
+  fuse_qkv_index_projection: true
+speculative_config:
+  decoding_type: DSpark
+  max_draft_len: 7
+  # The drafter ships in the checkpoint's dspark/ subfolder; with a local checkpoint, point this at its dspark/ folder.
+  speculative_model: MiniMaxAI/MiniMax-M3.1-Flash/dspark
+reasoning_parser: minimax_m3
+stream_interval: 10
+num_postprocess_workers: 4

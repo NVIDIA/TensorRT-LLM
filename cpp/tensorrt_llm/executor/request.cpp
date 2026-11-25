@@ -28,19 +28,18 @@ Request::Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming, 
     OutputConfig const& outputConfig, std::optional<SizeType32> const& endId,
     std::optional<std::vector<SizeType32>> positionIds, std::optional<std::list<VecTokens>> badWords,
     std::optional<std::list<VecTokens>> stopWords, std::optional<Tensor> embeddingBias,
-    std::optional<PromptTuningConfig> pTuningConfig, std::optional<MultimodalInput> multimodalInput,
-    std::optional<MropeConfig> mRopeConfig, std::optional<LoraConfig> loraConfig,
-    std::optional<KvCacheRetentionConfig> kvCacheRetentionConfig, std::optional<VecTokens> encoderInputTokenIds,
-    std::optional<IdType> clientId, bool returnAllGeneratedTokens, float priority, RequestType type,
-    std::optional<ContextPhaseParams> contextPhaseParams, std::optional<Tensor> encoderInputFeatures,
-    std::optional<SizeType32> encoderOutputLength, std::optional<GuidedDecodingParams> guidedDecodingParams,
-    std::optional<MillisecondsType> allottedTimeMs, std::optional<IdType> disaggRequestId,
-    std::optional<std::string> cacheSalt)
+    std::optional<MultimodalInput> multimodalInput, std::optional<MropeConfig> mRopeConfig,
+    std::optional<LoraConfig> loraConfig, std::optional<KvCacheRetentionConfig> kvCacheRetentionConfig,
+    std::optional<VecTokens> encoderInputTokenIds, std::optional<IdType> clientId, bool returnAllGeneratedTokens,
+    float priority, RequestType type, std::optional<ContextPhaseParams> contextPhaseParams,
+    std::optional<Tensor> encoderInputFeatures, std::optional<SizeType32> encoderOutputLength,
+    std::optional<GuidedDecodingParams> guidedDecodingParams, std::optional<MillisecondsType> allottedTimeMs,
+    std::optional<IdType> disaggRequestId, std::optional<std::string> cacheSalt)
     : mImpl(std::make_unique<Impl>(std::move(inputTokenIds), maxTokens, streaming, samplingConfig, outputConfig, endId,
         std::move(positionIds), std::move(badWords), std::move(stopWords), std::move(embeddingBias),
-        std::move(pTuningConfig), std::move(multimodalInput), std::move(mRopeConfig), std::move(loraConfig),
-        std::move(kvCacheRetentionConfig), std::move(encoderInputTokenIds), clientId, returnAllGeneratedTokens,
-        priority, type, std::move(contextPhaseParams), std::move(encoderInputFeatures), encoderOutputLength,
+        std::move(multimodalInput), std::move(mRopeConfig), std::move(loraConfig), std::move(kvCacheRetentionConfig),
+        std::move(encoderInputTokenIds), clientId, returnAllGeneratedTokens, priority, type,
+        std::move(contextPhaseParams), std::move(encoderInputFeatures), encoderOutputLength,
         std::move(guidedDecodingParams), allottedTimeMs, disaggRequestId, std::move(cacheSalt)))
 {
 }
@@ -118,11 +117,6 @@ std::optional<std::list<VecTokens>> Request::getStopWords() const
 std::optional<Tensor> Request::getEmbeddingBias() const
 {
     return mImpl->getEmbeddingBias();
-}
-
-std::optional<PromptTuningConfig> Request::getPromptTuningConfig() const
-{
-    return mImpl->getPromptTuningConfig();
 }
 
 std::optional<MultimodalInput> Request::getMultimodalInput() const
@@ -243,11 +237,6 @@ void Request::setStopWords(std::list<VecTokens> const& stopWords)
 void Request::setEmbeddingBias(Tensor const& embeddingBias)
 {
     mImpl->setEmbeddingBias(embeddingBias);
-}
-
-void Request::setPromptTuningConfig(PromptTuningConfig const& pTuningConfig)
-{
-    mImpl->setPromptTuningConfig(pTuningConfig);
 }
 
 void Request::setMultimodalInput(MultimodalInput const& multimodalInput)

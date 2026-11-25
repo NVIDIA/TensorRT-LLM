@@ -181,6 +181,14 @@ class TestBuiltinExtensions:
     def test_required_tool_choice_loads_builtins(self, clean_registry, model_type, expected):
         assert required_tool_choice_mode(model_type) == expected
 
+    @pytest.mark.parametrize("model_type", ["deepseek_v41", "deepseek_v41_text"])
+    def test_deepseek_v41_resolves_to_its_extension(self, clean_registry, model_type) -> None:
+        extension = serving_extensions.get_serving_extension(model_type)
+
+        from tensorrt_llm.serve.extensions.deepseek_v41 import DeepseekV41ServingExtension
+
+        assert isinstance(extension, DeepseekV41ServingExtension)
+
     def test_gpt_oss_resolves_to_gpt_oss_extension(self, clean_registry) -> None:
         hook = structured_output_format_for("gpt_oss")
 
@@ -351,7 +359,7 @@ class TestOpenAIChatIntegration:
 
         def generate_async(*, inputs, **kwargs):
             rendered["generation"] = kwargs
-            return SimpleNamespace(prompt_token_ids=[1, 2, 3], finished=True)
+            return SimpleNamespace(request_id=1, prompt_token_ids=[1, 2, 3], finished=True)
 
         server = object.__new__(OpenAIServer)
         server.model = "test-model"
@@ -440,6 +448,7 @@ class TestOpenAIChatIntegration:
 
     def test_extension_hooks_drive_tools_and_the_usage_offset(self, chat_client) -> None:
         client, _events, rendered = chat_client
+        asked = []
 
         class HookExtension(ServingExtension):
             def allows_required_tool_choice(self) -> bool:
@@ -448,7 +457,8 @@ class TestOpenAIChatIntegration:
             def serialize_tool(self, tool) -> dict:
                 return {"custom": tool.function.name}
 
-            def prompt_tokens_excluded_from_usage(self, request) -> int:
+            def prompt_tokens_excluded_from_usage(self, **facts) -> int:
+                asked.append(facts)
                 return 5
 
         serving_extensions._BY_MODEL_TYPE[self.MODEL_KEY] = HookExtension()
@@ -469,6 +479,10 @@ class TestOpenAIChatIntegration:
         # _create_chat_response(promise, postproc_params, raw_request, ...)
         postproc_params = rendered["create_chat_response"].call_args.args[1]
         assert postproc_params.postproc_args.num_prompt_tokens_offset == 5
+        # The hook is asked how the prompt is rendered, not handed the request.
+        assert asked == [
+            {"add_generation_prompt": True, "pre_tokenized": False, "request_chat_template": None}
+        ]
 
     @pytest.fixture(params=["nemotron_h_omni", "nemotron_h"])
     def required_chat_client(self, chat_client, monkeypatch, request):
@@ -775,7 +789,12 @@ class TestExtensionHooks:
         assert extension.allows_required_tool_choice() is False
         assert extension.serialize_tool(request.tools[0]) == request.tools[0].model_dump()
         assert extension.dynamic_tools(request.messages) == []
-        assert extension.prompt_tokens_excluded_from_usage(request) == 0
+        assert (
+            extension.prompt_tokens_excluded_from_usage(
+                add_generation_prompt=True, pre_tokenized=False, request_chat_template=None
+            )
+            == 0
+        )
 
     def test_load_builtin_extensions_keeps_its_private_alias(self) -> None:
         assert (
@@ -808,17 +827,86 @@ class TestExtensionHooks:
         [
             pytest.param({}, 3, id="native_template_with_generation_prompt"),
             pytest.param({"add_generation_prompt": False}, 0, id="no_generation_prompt"),
-            pytest.param({"prompt_token_ids": [1, 2, 3]}, 0, id="pre_tokenized"),
-            pytest.param({"prompt_token_ids_b64": "AQAAAA=="}, 0, id="b64_pre_tokenized"),
-            pytest.param({"chat_template": "{{ messages }}"}, 0, id="request_template"),
+            pytest.param({"pre_tokenized": True}, 0, id="pre_tokenized"),
+            pytest.param({"request_chat_template": "{{ messages }}"}, 0, id="request_template"),
         ],
     )
     def test_kimi_k3_excludes_the_generation_channel_opener(
         self, kimi, overrides, expected
     ) -> None:
-        request = _chat_request(**overrides)
-        assert kimi.prompt_tokens_excluded_from_usage(request) == expected
+        facts = {
+            "add_generation_prompt": True,
+            "pre_tokenized": False,
+            "request_chat_template": None,
+            **overrides,
+        }
+        assert kimi.prompt_tokens_excluded_from_usage(**facts) == expected
 
     def test_gpt_oss_declares_harmony_output(self) -> None:
         extension = serving_extensions.get_serving_extension("gpt_oss")
         assert extension.output_mode() is serving_extensions.OutputMode.HARMONY_TOKENS
+
+    @pytest.fixture
+    def deepseek_v41(self):
+        return serving_extensions.get_serving_extension("deepseek_v41")
+
+    @staticmethod
+    def _namespaced_tool(namespace="multi_agent_v1", name="spawn_agent", description=None):
+        from tensorrt_llm.serve.openai_protocol import (
+            FunctionDefinition,
+            NamespacedFunctionToolParam,
+        )
+
+        return NamespacedFunctionToolParam(
+            function=FunctionDefinition(
+                name=f"{namespace}.{name}",
+                description=description or "Sub-agents.",
+                parameters={"type": "object", "properties": {}},
+            ),
+            namespace=namespace,
+            namespace_description="Sub-agents.",
+            declared_name=name,
+            declared_description=description,
+        )
+
+    def test_deepseek_v41_dumps_a_tool_without_a_namespace_unchanged(self, deepseek_v41) -> None:
+        tool = _chat_request(tools=[_WEATHER_TOOL]).tools[0]
+
+        assert deepseek_v41.serialize_tool(tool) == tool.model_dump()
+
+    def test_other_models_get_a_namespaced_tool_as_a_plain_function(self) -> None:
+        from tensorrt_llm.serve.openai_protocol import ChatCompletionToolsParam
+
+        tool = self._namespaced_tool()
+        plain = ChatCompletionToolsParam(function=tool.function)
+
+        assert tool.model_dump() == plain.model_dump()
+        for model_type in (None, "kimi_k3", "nemotron_h", "qwen3"):
+            extension = serving_extensions.get_serving_extension(model_type)
+            assert extension.serialize_tool(tool) == extension.serialize_tool(plain)
+
+    @pytest.mark.parametrize("description", [None, "Spawn one."])
+    def test_deepseek_v41_dumps_a_namespaced_tool_in_the_checkpoint_form(
+        self, deepseek_v41, description
+    ) -> None:
+        """The namespace beside the function, as the checkpoint's encoder reads it."""
+        tool = self._namespaced_tool(description=description)
+
+        assert deepseek_v41.serialize_tool(tool) == {
+            "type": "function",
+            "namespace": {"name": "multi_agent_v1", "description": "Sub-agents."},
+            "function": {
+                "name": "spawn_agent",
+                "description": description,
+                "parameters": {"type": "object", "properties": {}},
+                "strict": None,
+            },
+        }
+
+    @pytest.mark.parametrize("namespace, name", [("a::b", "tool"), ("ns", "a::tool")])
+    def test_deepseek_v41_keeps_a_name_its_encoder_rejects_flattened(
+        self, deepseek_v41, namespace, name
+    ) -> None:
+        tool = self._namespaced_tool(namespace=namespace, name=name)
+
+        assert deepseek_v41.serialize_tool(tool) == tool.model_dump()

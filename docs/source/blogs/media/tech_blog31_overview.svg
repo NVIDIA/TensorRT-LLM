@@ -1,0 +1,191 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 566" width="1000" height="566" role="img" aria-label="Overview of dense DWDP with a DWDP group of four GPUs">
+<defs><marker id="ah" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,1 L8,5 L0,9 Z" fill="#4f5d75"/></marker><marker id="ahg" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,1 L8,5 L0,9 Z" fill="#3f6600"/></marker></defs>
+<rect width="1000" height="566" fill="#f5f5f5"/>
+<rect x="26.0" y="15.0" width="14.0" height="14.0" rx="2" fill="#76b900" stroke="none" stroke-width="1"/>
+<text x="46.0" y="27.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="400" fill="#4f5d75" text-anchor="start">Added by dense DWDP</text>
+<rect x="220.0" y="15.0" width="14.0" height="14.0" rx="2" fill="#e4e7ec" stroke="#bfc0c0" stroke-width="1"/>
+<text x="240.0" y="27.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="400" fill="#4f5d75" text-anchor="start">As in expert DWDP</text>
+<rect x="26.0" y="44.0" width="220.0" height="356.0" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="136.0" y="66.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="15" font-weight="700" fill="#2d3142" text-anchor="middle">GPU 0</text>
+<rect x="38.0" y="78.0" width="196.0" height="42.0" rx="4" fill="#e4e7ec" stroke="none" stroke-width="1"/>
+<text x="48.0" y="96.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="600" fill="#2d3142" text-anchor="start">Replicated weights</text>
+<text x="48.0" y="112.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="11.5" font-weight="400" fill="#4f5d75" text-anchor="start">embeddings · layer 0 · LM head</text>
+<rect x="38.0" y="128.0" width="196.0" height="42.0" rx="4" fill="#e4e7ec" stroke="none" stroke-width="1"/>
+<text x="48.0" y="146.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="600" fill="#2d3142" text-anchor="start">Routed experts: 1/4</text>
+<text x="48.0" y="162.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="11.5" font-weight="400" fill="#4f5d75" text-anchor="start">plus their prefetch slots</text>
+<rect x="38.0" y="178.0" width="196.0" height="92.0" rx="4" fill="#e3f1c4" stroke="#76b900" stroke-width="1"/>
+<text x="48.0" y="196.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="600" fill="#2d3142" text-anchor="start">Dense row store: 1/4</text>
+<text x="48.0" y="212.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="11.5" font-weight="400" fill="#4f5d75" text-anchor="start">row 0 of every layer's A and D</text>
+<rect x="49.0" y="222.0" width="42.0" height="8.0" rx="0" fill="#76b900" stroke="none" stroke-width="1"/>
+<rect x="93.0" y="222.0" width="42.0" height="8.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="2,2"/>
+<rect x="137.0" y="222.0" width="42.0" height="8.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="2,2"/>
+<rect x="181.0" y="222.0" width="42.0" height="8.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="2,2"/>
+<rect x="49.0" y="233.0" width="42.0" height="8.0" rx="0" fill="#76b900" stroke="none" stroke-width="1"/>
+<rect x="93.0" y="233.0" width="42.0" height="8.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="2,2"/>
+<rect x="137.0" y="233.0" width="42.0" height="8.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="2,2"/>
+<rect x="181.0" y="233.0" width="42.0" height="8.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="2,2"/>
+<rect x="49.0" y="244.0" width="42.0" height="8.0" rx="0" fill="#76b900" stroke="none" stroke-width="1"/>
+<rect x="93.0" y="244.0" width="42.0" height="8.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="2,2"/>
+<rect x="137.0" y="244.0" width="42.0" height="8.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="2,2"/>
+<rect x="181.0" y="244.0" width="42.0" height="8.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="2,2"/>
+<rect x="49.0" y="255.0" width="42.0" height="8.0" rx="0" fill="#76b900" stroke="none" stroke-width="1"/>
+<rect x="93.0" y="255.0" width="42.0" height="8.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="2,2"/>
+<rect x="137.0" y="255.0" width="42.0" height="8.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="2,2"/>
+<rect x="181.0" y="255.0" width="42.0" height="8.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="2,2"/>
+<rect x="38.0" y="278.0" width="196.0" height="62.0" rx="4" fill="#ffffff" stroke="#76b900" stroke-width="1"/>
+<text x="48.0" y="296.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="600" fill="#2d3142" text-anchor="start">Staging slots</text>
+<rect x="48.0" y="306.0" width="30.0" height="24.0" rx="3" fill="#76b900" stroke="#3f6600" stroke-width="1"/>
+<text x="63.0" y="323.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="600" fill="#ffffff" text-anchor="middle">A</text>
+<rect x="86.0" y="306.0" width="30.0" height="24.0" rx="3" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="101.0" y="323.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="600" fill="#4f5d75" text-anchor="middle">A</text>
+<rect x="124.0" y="306.0" width="30.0" height="24.0" rx="3" fill="#76b900" stroke="#3f6600" stroke-width="1"/>
+<text x="139.0" y="323.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="600" fill="#ffffff" text-anchor="middle">D</text>
+<rect x="162.0" y="306.0" width="30.0" height="24.0" rx="3" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="177.0" y="323.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="600" fill="#4f5d75" text-anchor="middle">D</text>
+<rect x="200.0" y="306.0" width="30.0" height="24.0" rx="3" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="215.0" y="323.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="600" fill="#4f5d75" text-anchor="middle">D</text>
+<rect x="38.0" y="348.0" width="196.0" height="46.0" rx="4" fill="#e3f1c4" stroke="#76b900" stroke-width="1" stroke-dasharray="5,3"/>
+<text x="136.0" y="368.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="600" fill="#2d3142" text-anchor="middle">Freed memory</text>
+<text x="136.0" y="384.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="11.5" font-weight="400" fill="#4f5d75" text-anchor="middle">→ KV cache, larger chunks</text>
+<rect x="269.0" y="44.0" width="220.0" height="356.0" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="379.0" y="66.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="15" font-weight="700" fill="#2d3142" text-anchor="middle">GPU 1</text>
+<rect x="281.0" y="78.0" width="196.0" height="42.0" rx="4" fill="#e4e7ec" stroke="none" stroke-width="1"/>
+<text x="291.0" y="96.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="600" fill="#2d3142" text-anchor="start">Replicated weights</text>
+<text x="291.0" y="112.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="11.5" font-weight="400" fill="#4f5d75" text-anchor="start">embeddings · layer 0 · LM head</text>
+<rect x="281.0" y="128.0" width="196.0" height="42.0" rx="4" fill="#e4e7ec" stroke="none" stroke-width="1"/>
+<text x="291.0" y="146.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="600" fill="#2d3142" text-anchor="start">Routed experts: 1/4</text>
+<text x="291.0" y="162.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="11.5" font-weight="400" fill="#4f5d75" text-anchor="start">plus their prefetch slots</text>
+<rect x="281.0" y="178.0" width="196.0" height="92.0" rx="4" fill="#e3f1c4" stroke="#76b900" stroke-width="1"/>
+<text x="291.0" y="196.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="600" fill="#2d3142" text-anchor="start">Dense row store: 1/4</text>
+<text x="291.0" y="212.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="11.5" font-weight="400" fill="#4f5d75" text-anchor="start">row 1 of every layer's A and D</text>
+<rect x="292.0" y="222.0" width="42.0" height="8.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="2,2"/>
+<rect x="336.0" y="222.0" width="42.0" height="8.0" rx="0" fill="#76b900" stroke="none" stroke-width="1"/>
+<rect x="380.0" y="222.0" width="42.0" height="8.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="2,2"/>
+<rect x="424.0" y="222.0" width="42.0" height="8.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="2,2"/>
+<rect x="292.0" y="233.0" width="42.0" height="8.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="2,2"/>
+<rect x="336.0" y="233.0" width="42.0" height="8.0" rx="0" fill="#76b900" stroke="none" stroke-width="1"/>
+<rect x="380.0" y="233.0" width="42.0" height="8.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="2,2"/>
+<rect x="424.0" y="233.0" width="42.0" height="8.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="2,2"/>
+<rect x="292.0" y="244.0" width="42.0" height="8.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="2,2"/>
+<rect x="336.0" y="244.0" width="42.0" height="8.0" rx="0" fill="#76b900" stroke="none" stroke-width="1"/>
+<rect x="380.0" y="244.0" width="42.0" height="8.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="2,2"/>
+<rect x="424.0" y="244.0" width="42.0" height="8.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="2,2"/>
+<rect x="292.0" y="255.0" width="42.0" height="8.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="2,2"/>
+<rect x="336.0" y="255.0" width="42.0" height="8.0" rx="0" fill="#76b900" stroke="none" stroke-width="1"/>
+<rect x="380.0" y="255.0" width="42.0" height="8.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="2,2"/>
+<rect x="424.0" y="255.0" width="42.0" height="8.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="2,2"/>
+<rect x="281.0" y="278.0" width="196.0" height="62.0" rx="4" fill="#ffffff" stroke="#76b900" stroke-width="1"/>
+<text x="291.0" y="296.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="600" fill="#2d3142" text-anchor="start">Staging slots</text>
+<rect x="291.0" y="306.0" width="30.0" height="24.0" rx="3" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="306.0" y="323.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="600" fill="#4f5d75" text-anchor="middle">A</text>
+<rect x="329.0" y="306.0" width="30.0" height="24.0" rx="3" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="344.0" y="323.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="600" fill="#4f5d75" text-anchor="middle">A</text>
+<rect x="367.0" y="306.0" width="30.0" height="24.0" rx="3" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="382.0" y="323.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="600" fill="#4f5d75" text-anchor="middle">D</text>
+<rect x="405.0" y="306.0" width="30.0" height="24.0" rx="3" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="420.0" y="323.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="600" fill="#4f5d75" text-anchor="middle">D</text>
+<rect x="443.0" y="306.0" width="30.0" height="24.0" rx="3" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="458.0" y="323.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="600" fill="#4f5d75" text-anchor="middle">D</text>
+<rect x="281.0" y="348.0" width="196.0" height="46.0" rx="4" fill="#e3f1c4" stroke="#76b900" stroke-width="1" stroke-dasharray="5,3"/>
+<text x="379.0" y="368.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="600" fill="#2d3142" text-anchor="middle">Freed memory</text>
+<text x="379.0" y="384.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="11.5" font-weight="400" fill="#4f5d75" text-anchor="middle">→ KV cache, larger chunks</text>
+<rect x="512.0" y="44.0" width="220.0" height="356.0" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="622.0" y="66.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="15" font-weight="700" fill="#2d3142" text-anchor="middle">GPU 2</text>
+<rect x="524.0" y="78.0" width="196.0" height="42.0" rx="4" fill="#e4e7ec" stroke="none" stroke-width="1"/>
+<text x="534.0" y="96.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="600" fill="#2d3142" text-anchor="start">Replicated weights</text>
+<text x="534.0" y="112.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="11.5" font-weight="400" fill="#4f5d75" text-anchor="start">embeddings · layer 0 · LM head</text>
+<rect x="524.0" y="128.0" width="196.0" height="42.0" rx="4" fill="#e4e7ec" stroke="none" stroke-width="1"/>
+<text x="534.0" y="146.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="600" fill="#2d3142" text-anchor="start">Routed experts: 1/4</text>
+<text x="534.0" y="162.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="11.5" font-weight="400" fill="#4f5d75" text-anchor="start">plus their prefetch slots</text>
+<rect x="524.0" y="178.0" width="196.0" height="92.0" rx="4" fill="#e3f1c4" stroke="#76b900" stroke-width="1"/>
+<text x="534.0" y="196.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="600" fill="#2d3142" text-anchor="start">Dense row store: 1/4</text>
+<text x="534.0" y="212.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="11.5" font-weight="400" fill="#4f5d75" text-anchor="start">row 2 of every layer's A and D</text>
+<rect x="535.0" y="222.0" width="42.0" height="8.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="2,2"/>
+<rect x="579.0" y="222.0" width="42.0" height="8.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="2,2"/>
+<rect x="623.0" y="222.0" width="42.0" height="8.0" rx="0" fill="#76b900" stroke="none" stroke-width="1"/>
+<rect x="667.0" y="222.0" width="42.0" height="8.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="2,2"/>
+<rect x="535.0" y="233.0" width="42.0" height="8.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="2,2"/>
+<rect x="579.0" y="233.0" width="42.0" height="8.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="2,2"/>
+<rect x="623.0" y="233.0" width="42.0" height="8.0" rx="0" fill="#76b900" stroke="none" stroke-width="1"/>
+<rect x="667.0" y="233.0" width="42.0" height="8.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="2,2"/>
+<rect x="535.0" y="244.0" width="42.0" height="8.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="2,2"/>
+<rect x="579.0" y="244.0" width="42.0" height="8.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="2,2"/>
+<rect x="623.0" y="244.0" width="42.0" height="8.0" rx="0" fill="#76b900" stroke="none" stroke-width="1"/>
+<rect x="667.0" y="244.0" width="42.0" height="8.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="2,2"/>
+<rect x="535.0" y="255.0" width="42.0" height="8.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="2,2"/>
+<rect x="579.0" y="255.0" width="42.0" height="8.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="2,2"/>
+<rect x="623.0" y="255.0" width="42.0" height="8.0" rx="0" fill="#76b900" stroke="none" stroke-width="1"/>
+<rect x="667.0" y="255.0" width="42.0" height="8.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="2,2"/>
+<rect x="524.0" y="278.0" width="196.0" height="62.0" rx="4" fill="#ffffff" stroke="#76b900" stroke-width="1"/>
+<text x="534.0" y="296.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="600" fill="#2d3142" text-anchor="start">Staging slots</text>
+<rect x="534.0" y="306.0" width="30.0" height="24.0" rx="3" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="549.0" y="323.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="600" fill="#4f5d75" text-anchor="middle">A</text>
+<rect x="572.0" y="306.0" width="30.0" height="24.0" rx="3" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="587.0" y="323.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="600" fill="#4f5d75" text-anchor="middle">A</text>
+<rect x="610.0" y="306.0" width="30.0" height="24.0" rx="3" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="625.0" y="323.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="600" fill="#4f5d75" text-anchor="middle">D</text>
+<rect x="648.0" y="306.0" width="30.0" height="24.0" rx="3" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="663.0" y="323.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="600" fill="#4f5d75" text-anchor="middle">D</text>
+<rect x="686.0" y="306.0" width="30.0" height="24.0" rx="3" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="701.0" y="323.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="600" fill="#4f5d75" text-anchor="middle">D</text>
+<rect x="524.0" y="348.0" width="196.0" height="46.0" rx="4" fill="#e3f1c4" stroke="#76b900" stroke-width="1" stroke-dasharray="5,3"/>
+<text x="622.0" y="368.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="600" fill="#2d3142" text-anchor="middle">Freed memory</text>
+<text x="622.0" y="384.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="11.5" font-weight="400" fill="#4f5d75" text-anchor="middle">→ KV cache, larger chunks</text>
+<rect x="755.0" y="44.0" width="220.0" height="356.0" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="865.0" y="66.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="15" font-weight="700" fill="#2d3142" text-anchor="middle">GPU 3</text>
+<rect x="767.0" y="78.0" width="196.0" height="42.0" rx="4" fill="#e4e7ec" stroke="none" stroke-width="1"/>
+<text x="777.0" y="96.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="600" fill="#2d3142" text-anchor="start">Replicated weights</text>
+<text x="777.0" y="112.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="11.5" font-weight="400" fill="#4f5d75" text-anchor="start">embeddings · layer 0 · LM head</text>
+<rect x="767.0" y="128.0" width="196.0" height="42.0" rx="4" fill="#e4e7ec" stroke="none" stroke-width="1"/>
+<text x="777.0" y="146.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="600" fill="#2d3142" text-anchor="start">Routed experts: 1/4</text>
+<text x="777.0" y="162.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="11.5" font-weight="400" fill="#4f5d75" text-anchor="start">plus their prefetch slots</text>
+<rect x="767.0" y="178.0" width="196.0" height="92.0" rx="4" fill="#e3f1c4" stroke="#76b900" stroke-width="1"/>
+<text x="777.0" y="196.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="600" fill="#2d3142" text-anchor="start">Dense row store: 1/4</text>
+<text x="777.0" y="212.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="11.5" font-weight="400" fill="#4f5d75" text-anchor="start">row 3 of every layer's A and D</text>
+<rect x="778.0" y="222.0" width="42.0" height="8.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="2,2"/>
+<rect x="822.0" y="222.0" width="42.0" height="8.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="2,2"/>
+<rect x="866.0" y="222.0" width="42.0" height="8.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="2,2"/>
+<rect x="910.0" y="222.0" width="42.0" height="8.0" rx="0" fill="#76b900" stroke="none" stroke-width="1"/>
+<rect x="778.0" y="233.0" width="42.0" height="8.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="2,2"/>
+<rect x="822.0" y="233.0" width="42.0" height="8.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="2,2"/>
+<rect x="866.0" y="233.0" width="42.0" height="8.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="2,2"/>
+<rect x="910.0" y="233.0" width="42.0" height="8.0" rx="0" fill="#76b900" stroke="none" stroke-width="1"/>
+<rect x="778.0" y="244.0" width="42.0" height="8.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="2,2"/>
+<rect x="822.0" y="244.0" width="42.0" height="8.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="2,2"/>
+<rect x="866.0" y="244.0" width="42.0" height="8.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="2,2"/>
+<rect x="910.0" y="244.0" width="42.0" height="8.0" rx="0" fill="#76b900" stroke="none" stroke-width="1"/>
+<rect x="778.0" y="255.0" width="42.0" height="8.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="2,2"/>
+<rect x="822.0" y="255.0" width="42.0" height="8.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="2,2"/>
+<rect x="866.0" y="255.0" width="42.0" height="8.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="2,2"/>
+<rect x="910.0" y="255.0" width="42.0" height="8.0" rx="0" fill="#76b900" stroke="none" stroke-width="1"/>
+<rect x="767.0" y="278.0" width="196.0" height="62.0" rx="4" fill="#ffffff" stroke="#76b900" stroke-width="1"/>
+<text x="777.0" y="296.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="600" fill="#2d3142" text-anchor="start">Staging slots</text>
+<rect x="777.0" y="306.0" width="30.0" height="24.0" rx="3" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="792.0" y="323.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="600" fill="#4f5d75" text-anchor="middle">A</text>
+<rect x="815.0" y="306.0" width="30.0" height="24.0" rx="3" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="830.0" y="323.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="600" fill="#4f5d75" text-anchor="middle">A</text>
+<rect x="853.0" y="306.0" width="30.0" height="24.0" rx="3" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="868.0" y="323.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="600" fill="#4f5d75" text-anchor="middle">D</text>
+<rect x="891.0" y="306.0" width="30.0" height="24.0" rx="3" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="906.0" y="323.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="600" fill="#4f5d75" text-anchor="middle">D</text>
+<rect x="929.0" y="306.0" width="30.0" height="24.0" rx="3" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="944.0" y="323.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="600" fill="#4f5d75" text-anchor="middle">D</text>
+<rect x="767.0" y="348.0" width="196.0" height="46.0" rx="4" fill="#e3f1c4" stroke="#76b900" stroke-width="1" stroke-dasharray="5,3"/>
+<text x="865.0" y="368.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="600" fill="#2d3142" text-anchor="middle">Freed memory</text>
+<text x="865.0" y="384.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="11.5" font-weight="400" fill="#4f5d75" text-anchor="middle">→ KV cache, larger chunks</text>
+<path d="M234.0,224.0 L252.0,224.0 L252.0,422.0 L144.6,422.0 L144.6,464.0" fill="none" stroke="#3f6600" stroke-width="1.6" stroke-dasharray="5,3" marker-end="url(#ahg)"/>
+<path d="M477.0,224.0 L495.0,224.0 L495.0,422.0 L381.9,422.0 L381.9,464.0" fill="none" stroke="#3f6600" stroke-width="1.6" marker-end="url(#ahg)"/>
+<path d="M720.0,224.0 L738.0,224.0 L738.0,422.0 L619.1,422.0 L619.1,464.0" fill="none" stroke="#3f6600" stroke-width="1.6" marker-end="url(#ahg)"/>
+<path d="M963.0,224.0 L981.0,224.0 L981.0,422.0 L856.4,422.0 L856.4,464.0" fill="none" stroke="#3f6600" stroke-width="1.6" marker-end="url(#ahg)"/>
+<rect x="26.0" y="468.0" width="949.0" height="40.0" rx="4" fill="#ffffff" stroke="#3f6600" stroke-width="1.4"/>
+<rect x="29.0" y="471.0" width="231.2" height="34.0" rx="3" fill="#76b900" fill-opacity="0.85" stroke="none" stroke-width="1"/>
+<text x="144.6" y="493.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12.5" font-weight="600" fill="#1d2b00" text-anchor="middle">row 0 · local copy</text>
+<rect x="266.2" y="471.0" width="231.2" height="34.0" rx="3" fill="#76b900" fill-opacity="0.85" stroke="none" stroke-width="1"/>
+<text x="381.9" y="493.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12.5" font-weight="600" fill="#1d2b00" text-anchor="middle">row 1 · from GPU 1 over NVLink</text>
+<rect x="503.5" y="471.0" width="231.2" height="34.0" rx="3" fill="#76b900" fill-opacity="0.85" stroke="none" stroke-width="1"/>
+<text x="619.1" y="493.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12.5" font-weight="600" fill="#1d2b00" text-anchor="middle">row 2 · from GPU 2 over NVLink</text>
+<rect x="740.8" y="471.0" width="231.2" height="34.0" rx="3" fill="#76b900" fill-opacity="0.85" stroke="none" stroke-width="1"/>
+<text x="856.4" y="493.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12.5" font-weight="600" fill="#1d2b00" text-anchor="middle">row 3 · from GPU 3 over NVLink</text>
+<text x="26.0" y="530.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="600" fill="#2d3142" text-anchor="start">GPU 0's staging slots for layer l + 2: the full A(l+2) and D(l+2), gathered while layer l runs</text>
+<text x="26.0" y="548.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12.5" font-weight="400" fill="#4f5d75" text-anchor="start">The module tensors point into the slots, so the layer's kernels read the gathered weights in place.</text>
+</svg>

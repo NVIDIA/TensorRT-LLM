@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -69,7 +69,7 @@ Workspace::Workspace(int rank, int tp_size, int max_token_num, int hidden_dim,
     std::vector<int> h_flag_data{0, 0, 0};
     TLLM_CUDA_CHECK(cudaMemcpy(m_flag_d_ptr, h_flag_data.data(), 3 * sizeof(int), cudaMemcpyHostToDevice));
     workspace.push_back(m_flag_d_ptr);
-    // layout_buffer[0], clear size for next lamport kernel
+    // layout_buffer[0], clear size in bytes for next lamport kernel
     // layout_buffer[1], triple buffer offset for lamport kernel
     TLLM_CUDA_CHECK(cudaMalloc(&m_layout_d_ptr, 2 * sizeof(int64_t)));
     std::vector<int64_t> h_layout_data{0, static_cast<int64_t>(lamport_comm_size)};

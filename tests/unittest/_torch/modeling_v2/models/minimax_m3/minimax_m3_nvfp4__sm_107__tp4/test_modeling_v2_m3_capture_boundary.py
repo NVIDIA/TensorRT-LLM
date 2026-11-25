@@ -1,0 +1,192 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""The feed-forward exit on Eagle3 capture layers: the generic layer in both targets' bodies (``PrefillTarget._layer``,
+``DecodeTarget._generic_layer``), and the decode fast path's capture layers (``CAPTURE_LAYERS_FAST``).
+
+Every layer's MoE / MLP output goes unreduced to the fused boundary (all-reduce + residual + the next layer's input
+norm, the final norm after the last layer), and a capture layer captures the reduced residual sum that boundary
+writes, with no residual of its own. Synthetic attention, feed-forward and collectives isolate the residual routing.
+"""
+
+from dataclasses import dataclass
+from types import SimpleNamespace
+
+import pytest
+import torch
+from torch._dynamo.testing import CompileCounter
+
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4 import (  # noqa: E501
+    modeling,
+)
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.modeling_support import (
+    _prepare_prefill_eagle3_capture,
+)
+
+LAYERS = 4
+
+
+class _Spec:
+    def __init__(self, layers):
+        self.layers = set(layers)
+
+    def is_layer_capture(self, i):
+        return i in self.layers
+
+
+@pytest.fixture(params=["prefill", "decode"])
+def layer(request, monkeypatch, make_cuda_m3_config):
+    calls = []
+    core = modeling.MiniMaxM3Tp4ModelingV2(
+        make_cuda_m3_config(4, moe_layers=(0, 0, 1, 1), sparse_layers=(0, 0, 1, 1))
+    )
+    monkeypatch.setattr(modeling, "_can_mc", lambda x, folded=False: False)
+    monkeypatch.setattr(
+        modeling,
+        "_native_allreduce_norm",
+        lambda core, x, r, norm: (("normed", x, norm), ("updated", x, r)),
+    )
+
+    def boundary(self, x, x2, residual, norm_w):
+        calls.append((x, x2, norm_w))
+        return ("next", norm_w), ("sum", x, x2)
+
+    if request.param == "prefill":
+        cls = modeling.PrefillTarget
+        monkeypatch.setattr(cls, "_moe", lambda self, i, h, **k: (("moe", i), ("routed", i)))
+        monkeypatch.setattr(
+            cls, "_swiglu_mlp", lambda self, h, prefix, low_m, dense=False: ("mlp", prefix)
+        )
+    else:
+        cls = modeling.DecodeTarget
+        monkeypatch.setattr(
+            cls, "_moe", lambda self, i, h, **k: (("moe", i), ("routed", i), False, False)
+        )
+        monkeypatch.setattr(
+            cls,
+            "_swiglu_mlp",
+            lambda self, h, prefix, low_m, push=None, dense=False: (("mlp", prefix), False),
+        )
+    monkeypatch.setattr(cls, "_attention", lambda self, i, *a, **k: (("attn", i), False))
+    monkeypatch.setattr(cls, "_generic_boundary", boundary)
+    target = cls(core)
+    run_layer = target._layer if request.param == "prefill" else target._generic_layer
+    return core, run_layer, calls
+
+
+@pytest.mark.parametrize("i", range(LAYERS))
+def test_a_capture_layer_captures_the_boundary_residual_sum(layer, i) -> None:
+    core, run, calls = layer
+    captured = []
+    out = run(
+        i,
+        None,
+        torch.ones(2),
+        torch.zeros(2),
+        None,
+        _Spec([i]),
+        lambda spec, layer, h, r: captured.append((layer, h, r)),
+    )
+    norm = core.w[f"l{i + 1}_in_norm"] if i + 1 < LAYERS else core.w["final_norm"]
+    assert calls[-1][2] is norm, (
+        "the boundary applies the next layer's norm (the final norm after the last)"
+    )
+    assert captured == [(i, out[1], None)]
+    if i in core.moe_layers:
+        assert calls[-1][1] == ("routed", i), "the routed part folds into the boundary"
+
+
+def test_a_layer_without_capture_captures_nothing(layer) -> None:
+    _, run, _ = layer
+    captured = []
+    run(
+        1,
+        None,
+        torch.ones(2),
+        torch.zeros(2),
+        None,
+        _Spec([]),
+        lambda *a: captured.append(a),
+    )
+    assert not captured
+
+
+class _FastCore:
+    num_layers = 3
+    w = {"embed": None}
+
+
+@pytest.mark.parametrize("written", [True, False])
+def test_a_decode_capture_layer_takes_the_fast_layer_with_the_capture_norm(
+    monkeypatch, written
+) -> None:
+    """A decode step's capture layer (past the first) runs the fast decode layer with the worker's capture target, and
+    captures the boundary's updated residual; ``written=True`` when the boundary all-reduce wrote the capture norm
+    (``CAPTURE_NORM_IN_BOUNDARY``)."""
+    assert modeling.CAPTURE_LAYERS_FAST and modeling.CAPTURE_FUSED_BOUNDARY
+    assert modeling.CAPTURE_NORM_IN_BOUNDARY
+    target = modeling.DecodeTarget(_FastCore())
+    seen, captured = [], []
+    monkeypatch.setattr(target, "_check_step_contract", lambda md: None)
+    monkeypatch.setattr(target, "step_args", lambda md: {"num_tokens": 4})
+    monkeypatch.setattr(target, "_embed", lambda ids, n: ("h", "r"))
+    monkeypatch.setattr(modeling, "plan_for", lambda n: SimpleNamespace(name="plan"))
+    monkeypatch.setattr(modeling, "_record", lambda *a: None)
+
+    def fast(i, plan, pos, h, r, step, capture=None):
+        seen.append((i, capture))
+        if capture is not None:
+            target._capture_written = written
+        return ("h", i), ("r", i)
+
+    def generic(*a):
+        raise AssertionError("a capture layer ran the generic layer on a decode step")
+
+    monkeypatch.setattr(target, "_layer", fast)
+    monkeypatch.setattr(target, "_generic_layer", generic)
+    out = target.forward(
+        None,
+        torch.zeros(4, dtype=torch.int32),
+        None,
+        None,
+        _Spec([1]),
+        lambda spec, i, h, r, written=False: captured.append((i, h, r, written)),
+        lambda spec, i, n: ("capture_out", i, n),
+    )
+    assert out == ("h", 2)
+    assert seen == [(0, None), (1, ("capture_out", 1, 4)), (2, None)]
+    assert captured == [(1, ("r", 1), None, written)]
+
+
+@dataclass
+class _CaptureBuffer:
+    hidden_states: torch.Tensor
+    num_capture_tokens: int
+    layers_to_capture: tuple[int, ...] = (0, 1)
+    hidden_size: int = 4
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="uses the CUDA capture buffer copy")
+def test_compiled_prefill_capture_uses_bucket_shape() -> None:
+    hidden = torch.ones((8, 4), device="cuda", dtype=torch.bfloat16)
+    metadata = _CaptureBuffer(hidden.new_zeros((6, 8)), num_capture_tokens=5)
+    capture = _prepare_prefill_eagle3_capture(metadata)
+
+    def forward(states: torch.Tensor) -> torch.Tensor:
+        capture(metadata, 1, states, None)
+        return states + 1
+
+    torch._dynamo.reset()
+    counter = CompileCounter()
+    compiled = torch.compile(forward, fullgraph=True, backend=counter)
+    for live_rows in (5, 6, 4):
+        metadata.num_capture_tokens = live_rows
+        hidden.add_(1)
+        _prepare_prefill_eagle3_capture(metadata)
+        compiled(hidden)
+        torch.testing.assert_close(metadata.hidden_states[:live_rows, 4:], hidden[:live_rows])
+    assert counter.frame_count == 1
+    assert (metadata.hidden_states[:, :4] == 0).all()
+
+    metadata.num_capture_tokens = 7
+    with pytest.raises(RuntimeError, match="buffer capacity 6"):
+        _prepare_prefill_eagle3_capture(metadata)

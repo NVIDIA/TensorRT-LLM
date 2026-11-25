@@ -21,7 +21,8 @@ round, ``tp_gather`` unpickles only on the destination rank, and the size /
 CPU-tensor staging uses persistent pinned buffers guarded by one lock.  These
 tests pin the contract: results identical to a plain pickle round trip, the
 NCCL call sequence identical for non-empty payloads on every rank, the staging
-touched only under the lock.
+touched only under the lock, and ``allgather_ints`` riding exactly the
+CPU-tensor transport.
 
 Multi-process, no Ray: run inside a container with >= 2 GPUs as
 
@@ -182,6 +183,27 @@ def test_tp_gather_only_destination_unpickles(td, world):
         assert loads.call_count == 0
 
 
+def test_allgather_ints_matches_object_reference(td, world):
+    rank, world_size, _ = world
+
+    def vector(r):
+        # RankState-shaped: 13 ints incl. zero, negative and > 2**32 values.
+        return [r, 5 + r, 0, -3 * r, 2**40 + r] + [r * 10 + i for i in range(8)]
+
+    out = td.allgather_ints(vector(rank))
+    assert out == td.tp_allgather(vector(rank))  # object path reference
+    assert out == [vector(r) for r in range(world_size)]
+    assert all(type(x) is int for row in out for x in row)
+    assert all(type(row) is list for row in out)
+
+
+def test_allgather_ints_rides_one_int64_tensor_allgather(td, world):
+    rank, world_size, _ = world
+    values = [rank + i for i in range(13)]
+    _, seq_ints = _record_nccl(lambda: td.allgather_ints(values))
+    assert seq_ints == [("all_gather_into_tensor", (world_size, 13), torch.int64)]
+
+
 # The lock is asserted structurally: a spy on the staging accessor records
 # whether ``_cuda_obj_lock`` is held when the shared buffers are touched.  (A
 # two-thread race is not a usable oracle here -- the GIL and NCCL's own
@@ -274,6 +296,31 @@ def test_broadcast_or_none_is_one_round_for_nothing_two_for_payload(td, world):
         # Without the flag None is an ordinary object (pickle never yields 0 bytes).
         assert td.broadcast(None, root=0) is None
         assert len(shapes) == 2, shapes
+
+
+def test_broadcast_or_none_with_header_rides_in_the_size_word(td, world):
+    """The header (rank 0's clock in the request fetch) costs no extra round: one collective for nothing, two for a
+    payload, as without it; the single-word size exchange is left as it was."""
+    rank, _, _ = world
+    shapes = []
+    orig_bc = dist.broadcast
+
+    def rec_bc(tensor, *args, **kwargs):
+        shapes.append(tuple(tensor.shape))
+        return orig_bc(tensor, *args, **kwargs)
+
+    header = [123_456_789, -1] if rank == 0 else [0, -1]
+    with mock.patch.object(dist, "broadcast", rec_bc):
+        assert td.broadcast_or_none_with_header(None, header, root=0) == ([123_456_789, -1], None)
+        assert shapes == [(3,)], shapes
+        shapes.clear()
+        obj = {"payload": list(range(50))}
+        got = td.broadcast_or_none_with_header(obj if rank == 0 else None, header, root=0)
+        assert got == ([123_456_789, -1], obj)
+        assert len(shapes) == 2 and shapes[0] == (3,), shapes
+        shapes.clear()
+        assert td.broadcast_or_none(None, root=0) is None
+        assert shapes == [(1,)], shapes
 
 
 def test_broadcast_root_stages_asynchronously_through_fenced_pinned_buffers(td, world):

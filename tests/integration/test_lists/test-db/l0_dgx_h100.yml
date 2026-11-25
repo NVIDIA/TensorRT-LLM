@@ -44,7 +44,6 @@ l0_dgx_h100:
   - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_gen_only_sync
   - accuracy/test_disaggregated_serving.py::TestQwen3_5_4B::test_mismatched_block_reuse
   - unittest/llmapi/apps/test_disagg_serving_perf_metrics.py
-  - disaggregated/test_disaggregated.py::test_disaggregated_cancel_large_context_requests[DeepSeek-V3-Lite-bf16]
   # ------------- Model specific tests ---------------
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8[tp2_ep1]
   - unittest/_torch/modeling/test_modeling_nemotron_h.py::test_nemotron_h_breakable_prefill_cuda_graph[tp2] TIMEOUT (90)
@@ -105,6 +104,7 @@ l0_dgx_h100:
   # TP x PP, attention-DP over CP) always skip with "need 4 GPUs, have 2". Name
   # the file here so those compositions actually run.
   - unittest/_torch/multi_gpu/test_kv_pool_rebalance_tp.py
+  - unittest/_torch/multi_gpu/test_allreduce.py::test_nccl_symmetric_unregistered_small_input
   # Exercise VisualGen worker-failure containment with live CUDA allocations
   # spread across four local processes.
   - unittest/_torch/visual_gen/test_executor_lifecycle_multi_gpu.py::test_sigkill_one_worker_contains_real_multi_gpu_group
@@ -112,6 +112,7 @@ l0_dgx_h100:
   - test_e2e.py::test_ptp_quickstart_advanced_bs1
   - test_e2e.py::test_ptp_quickstart_advanced_deepseek_v3_lite_4gpus_adp_balance[DeepSeek-V3-Lite-FP8-DeepSeek-V3-Lite/fp8]
   # ------------- Disaggregated serving tests ---------------
+  - disaggregated/test_disaggregated.py::test_disaggregated_cancel_large_context_requests[DeepSeek-V3-Lite-bf16]
   # Split test_py_cache_transceiver_mp.py by workflow (4 × 12 = 48 combos).
   # A single wrapper case ran ~3581 s on B200 and brushed the outer pytest
   # 3600 s per-test timeout; per-workflow shards give each ~12 combos a
@@ -120,6 +121,8 @@ l0_dgx_h100:
   - unittest/disaggregated/test_py_cache_transceiver_mp.py -k "ctx_first_sync"
   - unittest/disaggregated/test_py_cache_transceiver_mp.py -k "gen_first1"
   - unittest/disaggregated/test_py_cache_transceiver_mp.py -k "gen_first2"
+  - unittest/disaggregated/test_kv_transfer_mp.py::test_context_first_bf16_owned_transfer
+  - unittest/disaggregated/test_transfer_lifecycle_gpu.py::test_context_first_bf16_lifecycle_gpu
   - disaggregated/test_disaggregated.py::test_disaggregated_multi_gpu
   - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp2_genpp2
   - disaggregated/test_disaggregated.py::test_disaggregated_ctxtp2_genpp2
@@ -128,6 +131,7 @@ l0_dgx_h100:
   - disaggregated/test_disaggregated.py::test_disaggregated_genbs1
   - disaggregated/test_disaggregated.py::test_disaggregated_overlap
   - disaggregated/test_disaggregated.py::test_disaggregated_overlap_transceiver_runtime_python
+  - disaggregated/test_disaggregated.py::test_disaggregated_context_first_bf16_ownership
   - disaggregated/test_disaggregated.py::test_disaggregated_overlap_gen_first[ctx_pp1]
   - disaggregated/test_disaggregated.py::test_disaggregated_overlap_gen_first[ctx_pp4]
   - accuracy/test_disaggregated_serving.py::TestQwen3_5_4B::test_ctx_pp_gen_tp_asymmetric
@@ -160,15 +164,11 @@ l0_dgx_h100:
       auto_trigger: others
       orchestrator: mpi
   tests:
-  # ------------- MoE: test_multi_gpu (by backend x quant) ---------------
-  # Only CUTLASS and MARLIN backends run on H100 (SM90). TRTLLM/CUTEDSL/DEEPGEMM require SM100+.
-  # --- CUTLASS ---
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and FP8_BLOCK_SCALES"
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W8A16"
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W4A16_MXFP4"
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W4A8_AWQ"
-  # --- MARLIN (SM90-only; focused DEP + ALLGATHER x NVFP4 matrix) ---
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "MARLIN"
+  # ------------- MoE: multi-GPU module tests ---------------
+  # The SM90 part of the pre-merge subset (_MULTI_GPU_PREMERGE_CASES in test_moe_module.py):
+  # CUTLASS and MARLIN, the backends that run on SM90. The per-backend entries it replaces
+  # run post-merge.
+  - unittest/_torch/moe/test_moe_module.py::test_moe_multi_gpu_premerge
   # ------------- MoE: test_multi_gpu_eplb ---------------
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu_eplb
 - condition:
@@ -238,15 +238,6 @@ l0_dgx_h100:
       auto_trigger: gpt_oss
       orchestrator: mpi
   tests:
-  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v1_kv_cache-tp4-cutlass-auto]
-  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v1_kv_cache-tp4-triton-auto]
-  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v1_kv_cache-ep4-triton-auto]
-  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v1_kv_cache-dp4-triton-auto]
-  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v2_kv_cache-ep4-cutlass-auto]
-  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v2_kv_cache-ep4-triton-auto]
-  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v2_kv_cache-dp4-cutlass-auto]
-  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v2_kv_cache-dp4-triton-auto]
-  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v2_kv_cache_no_reuse-tp4-cutlass-auto]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4a16[dp4-auto]
 - condition:
     ranges:
@@ -336,7 +327,16 @@ l0_dgx_h100:
       auto_trigger: others
       orchestrator: mpi
   tests:
-  # ---- FP8 per-tensor (QDQ) moved to post-merge; block-scale stays in pre ----
+  # ------------- MoE: test_multi_gpu (by backend x quant) ---------------
+  # The entries that test_moe_multi_gpu_premerge replaces before merge, and the CUTLASS FP8
+  # per-tensor (QDQ) slice. Only CUTLASS and MARLIN run on H100 (SM90).
+  # --- CUTLASS ---
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and FP8 and not FP8_BLOCK_SCALES"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and FP8_BLOCK_SCALES"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W8A16"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W4A16_MXFP4"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W4A8_AWQ"
+  # --- MARLIN (SM90-only; focused DEP + ALLGATHER x NVFP4 matrix) ---
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "MARLIN"
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_fp8_4gpus[attention_dp_off]
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_fp8_4gpus[attention_dp_on]

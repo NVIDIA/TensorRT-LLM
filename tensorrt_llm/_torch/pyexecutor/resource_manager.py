@@ -20,14 +20,16 @@ from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict, deque
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import (TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence,
-                    Set, Tuple, Union)
+from typing import (TYPE_CHECKING, Dict, Iterable, List, Literal, Optional,
+                    Sequence, Set, Tuple, Union, overload)
 
 import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
+from tensorrt_llm._torch.memory.monitor import names as monitor_names
+from tensorrt_llm._torch.memory.monitor import startup as monitor_startup
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.manager import LoraManager, LoraModelConfig
 from tensorrt_llm._utils import (get_size_in_bytes, prefer_pinned,
@@ -161,17 +163,18 @@ class ResourceManagerType(enum.Enum):
     KV_CACHE_COMPRESSION_MANAGER = "KV_CACHE_COMPRESSION_MANAGER"
 
 
-def is_context_only_kv_cache(kv_cache_manager: object) -> bool:
+def is_context_only_kv_cache(
+        kv_cache_manager: "KVCacheManager | KVCacheManagerV2 | None") -> bool:
     """Whether a KV cache manager can serve context requests only.
 
     A disaggregated context worker may omit generation-only cache state: the
     KDA draft-verification buffers (``kda_context_only``) or the FP4 MLA V
     scales and packed V (``fp4_mla_context_only_cache``). Such a worker
-    cannot run a generation row, including a warmup or padding dummy.
+    cannot run a generation row, including a warmup or padding dummy. A CSA2
+    cache pruned for a context worker is not reported here; it carries
+    ``context_swa_layer_limit``.
     """
-    return (getattr(kv_cache_manager, "kda_context_only", False) is True
-            or getattr(kv_cache_manager, "fp4_mla_context_only_cache",
-                       False) is True)
+    return kv_cache_manager is not None and kv_cache_manager.is_context_only_cache is True
 
 
 def compute_page_count(token_count: int, tokens_per_page: int) -> int:
@@ -209,6 +212,9 @@ def _merge_kv_cache_pool_pointers(
 
 
 class BaseResourceManager(ABC):
+    # A cache that omits generation-only state overrides this; see
+    # is_context_only_kv_cache.
+    is_context_only_cache: bool = False
 
     @abstractmethod
     def get_max_resource_count(self) -> int:
@@ -244,6 +250,13 @@ class BaseResourceManager(ABC):
 
     def add_dummy_requests(self, request_ids: List[int]):
         pass
+
+    def prepare_expect_snapshot_points(self,
+                                       requests: list[LlmRequest]) -> None:
+        """Prepare optional snapshot boundaries before scheduling."""
+
+    def on_state_transfer_complete(self, request_ids: list[int]) -> None:
+        """Notify optional state owners after a disaggregated transfer."""
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         pass
@@ -410,6 +423,12 @@ class KVCacheManager(BaseResourceManager):
     # state a second time. Only a full re-prefill (rewind target 0) is safe.
     _has_recurrent_state: bool = False
 
+    @property
+    def spec_recompute_tail(self) -> int:
+        """Prompt-tail tokens recomputed on a prefix hit for a hidden-state
+        drafter: 0 off, -1 the whole prompt."""
+        return self._spec_recompute_tail
+
     def __init__(
         self,
         kv_cache_config: KvCacheConfig,
@@ -452,6 +471,15 @@ class KVCacheManager(BaseResourceManager):
         enable_chunked_prefill: bool = False,
         **kwargs,
     ) -> None:
+        logger.warning_once(
+            f"KV cache manager V1 ({type(self).__name__}) is deprecated as of "
+            "TensorRT-LLM 1.4 (2026-11) and will be removed after the 3-month "
+            "migration period; it keeps working until then. Use KV cache "
+            "manager V2 (kv_cache_config.use_kv_cache_manager_v2=True, the "
+            "default) for supported features. Sleep mode still requires V1 "
+            "until V2 support is available. See "
+            "https://github.com/NVIDIA/TensorRT-LLM#deprecation-policy",
+            key="deprecated_kv_cache_manager_v1")
         self.mapping = mapping
         self.dtype = dtype
         self.kv_cache_type = kv_cache_type
@@ -1351,13 +1379,16 @@ class KVCacheManager(BaseResourceManager):
         enforced by the caller: the micro-batch scheduler admits on estimated
         reuse, and ``fit_token_budget`` needs chunking to trim the extra
         compute tokens when a batch of rewound requests exceeds
-        ``max_num_tokens``.
+        ``max_num_tokens``. A context-only (disaggregated) request is not
+        rewound: this manager's draft pages are not transferred, so the
+        generation worker's drafter starts from an empty context whatever the
+        context server recomputes.
         """
         tail = self._spec_recompute_tail
         tokens_per_block = self.tokens_per_block
         for req in batch_llm_requests:
             prepopulated = req.prepopulated_prompt_len
-            if prepopulated <= 0:
+            if prepopulated <= 0 or req.is_context_only_request:
                 continue
             prompt_len = req.prompt_len
             if tail < 0:
@@ -2733,6 +2764,11 @@ class KVCacheManager(BaseResourceManager):
     def pin_blocks(self, request_id: int):
         self.impl.pin_blocks(request_id)
 
+    def batch_block_table_key(self, request_ids: List[int]) -> Optional[tuple]:
+        """Key under which ``copy_batch_block_offsets`` rows of ``request_ids`` are unchanged (see
+        ``KVCacheManagerV2.batch_block_table_key``); None: always copy."""
+        return None
+
     def copy_batch_block_offsets(self,
                                  dst_tensor: torch.Tensor,
                                  request_ids: List[int],
@@ -3021,6 +3057,11 @@ class KVCacheCompressionManager(BaseResourceManager):
     def has_independent_draft_kv_cache(self) -> bool:
         return self.draft_kv_cache_manager is not None
 
+    @property
+    def mixed_precision_high_window(self) -> Optional[tuple[int, int]]:
+        """``(first_n, last_n)`` tokens per sequence left unquantized in cold tiers, else None."""
+        return None
+
     def create_cold_page_codec(
         self,
         cache_config: object,
@@ -3175,6 +3216,17 @@ class ResourceManager:
     def register_resource_manager(self, type: ResourceManagerType,
                                   resource_manager: BaseResourceManager):
         self.resource_managers[type] = resource_manager
+
+    @overload
+    def get_resource_manager(
+        self, type: Literal[ResourceManagerType.KV_CACHE_MANAGER]
+    ) -> "KVCacheManager | KVCacheManagerV2 | None":
+        ...
+
+    @overload
+    def get_resource_manager(
+            self, type: ResourceManagerType) -> Optional[BaseResourceManager]:
+        ...
 
     def get_resource_manager(
             self, type: ResourceManagerType) -> Optional[BaseResourceManager]:
@@ -3331,10 +3383,14 @@ class PeftCacheManager(BaseResourceManager):
         logger.info(
             f"[PeftCacheManager] buffer_manager_stream: {buffer_manager_stream}"
         )
-        self.impl = PeftCacheManagerCpp(config=peft_cache_manager_config,
-                                        model_config=model_config,
-                                        world_config=world_config,
-                                        buffer_manager=buffer_manager)
+        # The device LoRA cache is allocated here, in C++, with no size
+        # exposed to Python; the memory monitor names it by measuring.
+        with monitor_startup.region(monitor_names.REGION_LORA_DEVICE_CACHE,
+                                    per_executor=True):
+            self.impl = PeftCacheManagerCpp(config=peft_cache_manager_config,
+                                            model_config=model_config,
+                                            world_config=world_config,
+                                            buffer_manager=buffer_manager)
         if initial_data_type is not None:
             self.impl.configure_data_type(
                 torch_dtype_to_binding(initial_data_type))

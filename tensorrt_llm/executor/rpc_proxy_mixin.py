@@ -1,9 +1,25 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import asyncio
 import atexit
 import os
 import threading
 from typing import Callable, List, Optional
 
+from .._torch.pyexecutor.llm_request import release_undelivered_response
 from .._utils import nvtx_range_debug
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import _SyncQueue
@@ -13,7 +29,7 @@ from .request import GenerationRequest
 from .result import GenerationResult
 from .rpc import RPCClient
 from .rpc.rpc_common import get_unique_ipc_addr
-from .utils import ErrorResponse, is_llm_response
+from .utils import ErrorResponse, RequestError, is_llm_response
 
 
 class RpcExecutorMixin:
@@ -81,13 +97,17 @@ class RpcExecutorMixin:
         atexit.register(self.shutdown)
 
     def submit(self, request: GenerationRequest) -> GenerationResult:
+        if request.prompt_adapter_request is not None:
+            raise RequestError("Prompt adapters are not supported by the PyTorch executor.")
         request.set_id(self._get_next_client_id())
         logprob_params = self._get_logprob_params(request)
 
-        # submit is a fire-and-forget operation, don't need to wait for response
-        with nvtx_range_debug("RPCExecutor.submit", color="green", category="Proxy"):
-            self.rpc_client.submit(request).remote(need_response=False)
-
+        # Register the result BEFORE the fire-and-forget send. The response
+        # loop runs on another thread and drops responses whose client_id is
+        # not in _results, so a request that completes before this thread
+        # reaches the registration (a short generation, or the submitter
+        # stalled between the two statements) would otherwise lose its final
+        # response and the caller would wait for it forever.
         result = GenerationResult(
             request,
             background_error_handler=self._handle_background_error,
@@ -96,6 +116,16 @@ class RpcExecutorMixin:
             logprob_params=logprob_params,
         )
         self._results[request.id] = result
+
+        # submit is a fire-and-forget operation, don't need to wait for response
+        try:
+            with nvtx_range_debug("RPCExecutor.submit", color="green", category="Proxy"):
+                self.rpc_client.submit(request).remote(need_response=False)
+        except Exception:
+            # The request never reached the worker: drop the registration so
+            # the id does not linger in _results.
+            self._results.pop(request.id, None)
+            raise
 
         return result
 
@@ -111,6 +141,7 @@ class RpcExecutorMixin:
 
                 if client_id not in self._results:
                     logger.warning(f"Received response for unknown client_id: {client_id}")
+                    release_undelivered_response(r)
                     continue
 
                 queue = self._results[client_id].queue

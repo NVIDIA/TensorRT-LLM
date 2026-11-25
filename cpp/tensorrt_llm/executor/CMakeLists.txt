@@ -19,7 +19,6 @@ set(TARGET_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 
 # keep this list sorted alphabetically
 set(SRCS
-    cache_transmission/agent_utils/connection.cpp
     cache_transmission/cacheSplitConcat.cu
     cache_transmission/mpi_utils/connection.cpp
     cache_transmission/rnnCacheSplitConcat.cu
@@ -74,20 +73,36 @@ target_link_libraries(
 set_target_properties(tllm_executor_serialization
                       PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+add_library(tllm_executor_socket_serialization STATIC
+            socketStateSerialization.cpp)
+add_library(tllm::executor_socket_serialization ALIAS
+            tllm_executor_socket_serialization)
+target_link_libraries(tllm_executor_socket_serialization
+                      PUBLIC tllm::common_error)
+
 add_library(
   tllm_executor_values STATIC
   contextPhaseParams.cpp
   loraConfig.cpp
   mropeConfig.cpp
   multimodalInput.cpp
-  promptTuningConfig.cpp
   request.cpp
   response.cpp
   serialization.cpp
   tensor.cpp)
 add_library(tllm::executor_values ALIAS tllm_executor_values)
-target_link_libraries(tllm_executor_values PUBLIC tllm::executor_serialization
-                                                  tllm::runtime_buffers)
+target_link_libraries(
+  tllm_executor_values
+  PUBLIC tllm::executor_serialization tllm::executor_socket_serialization
+         tllm::runtime_buffers)
+
+add_library(tllm_executor_cache_routing STATIC
+            cache_transmission/cacheRouting.cpp)
+add_library(tllm::executor_cache_routing ALIAS tllm_executor_cache_routing)
+target_link_libraries(
+  tllm_executor_cache_routing
+  PUBLIC tllm::common_logging
+  PRIVATE tllm::runtime_distributed)
 
 add_library(tllm_executor_transfer_agent STATIC
             cache_transmission/transferAgent.cpp)
@@ -97,7 +112,41 @@ target_link_libraries(
   PUBLIC tllm::common_logging CUDA::cuda_driver
   PRIVATE ${CMAKE_DL_LIBS})
 
-foreach(component tllm_executor_values tllm_executor_transfer_agent)
+add_library(tllm_executor_memory_desc STATIC memoryDesc.cpp)
+add_library(tllm::executor_memory_desc ALIAS tllm_executor_memory_desc)
+target_link_libraries(
+  tllm_executor_memory_desc
+  PUBLIC tllm::common_error
+  PRIVATE tllm::executor_values tllm::runtime_distributed)
+
+add_library(tllm_executor_agent_name STATIC
+            cache_transmission/agent_utils/agentName.cpp)
+add_library(tllm::executor_agent_name ALIAS tllm_executor_agent_name)
+target_link_libraries(
+  tllm_executor_agent_name
+  PUBLIC tllm::common_headers
+  PRIVATE Threads::Threads)
+
+add_library(tllm_executor_agent_connection STATIC
+            cache_transmission/agent_utils/connection.cpp)
+add_library(tllm::executor_agent_connection ALIAS
+            tllm_executor_agent_connection)
+target_link_libraries(
+  tllm_executor_agent_connection
+  PUBLIC tllm::executor_transfer_agent tllm::executor_memory_desc
+         tllm::batch_request_info tllm::kv_cache_legacy
+  PRIVATE tllm::executor_agent_name tllm::executor_cache_routing
+          tllm::common_environment pg_utils ${Python3_LIBRARIES})
+
+foreach(
+  component
+  tllm_executor_values
+  tllm_executor_transfer_agent
+  tllm_executor_agent_name
+  tllm_executor_memory_desc
+  tllm_executor_cache_routing
+  tllm_executor_socket_serialization
+  tllm_executor_agent_connection)
   target_compile_features(${component} PUBLIC cxx_std_20)
   set_target_properties(${component} PROPERTIES CXX_EXTENSIONS OFF
                                                 POSITION_INDEPENDENT_CODE ON)
@@ -105,8 +154,10 @@ endforeach()
 
 add_library(${EXECUTOR_STATIC_TARGET} STATIC ${SRCS})
 target_link_libraries(
-  ${EXECUTOR_STATIC_TARGET} PUBLIC tllm::executor_values
-                                   tllm::executor_transfer_agent)
+  ${EXECUTOR_STATIC_TARGET}
+  PUBLIC tllm::executor_values tllm::executor_transfer_agent
+         tllm::executor_agent_name tllm::executor_memory_desc
+         tllm::executor_cache_routing tllm::executor_agent_connection)
 set_target_properties(
   ${EXECUTOR_STATIC_TARGET}
   PROPERTIES CXX_STANDARD "20" CXX_STANDARD_REQUIRED "YES" CXX_EXTENSIONS "NO"

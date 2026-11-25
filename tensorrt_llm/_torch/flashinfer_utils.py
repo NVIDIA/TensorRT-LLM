@@ -25,3 +25,8 @@ if platform.system() != "Windows":
         print(
             "flashinfer is not installed properly, please try pip install or building from source codes"
         )
+
+if IS_FLASHINFER_AVAILABLE:
+    from .flashinfer_cubin_pool import install_shared_cubin_pool
+
+    install_shared_cubin_pool()

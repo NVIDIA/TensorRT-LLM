@@ -296,6 +296,10 @@ class Logger(metaclass=Singleton):
             return None
 
     def log(self, severity, *msg):
+        # Without per-module levels the caller's module only matters for an emitted message;
+        # a filtered one returns before the stack walk.
+        if not self._module_levels and not self.is_severity_enabled(severity):
+            return
         module = _get_caller_module()
         if not self.is_severity_enabled(severity, module):
             return
@@ -364,11 +368,18 @@ class Logger(metaclass=Singleton):
         ``TLLM_LOG_LEVEL_BY_MODULE`` override can enable or disable the
         caller's module independently of the global level.
         """
+        if not self._module_levels:
+            return self.is_severity_enabled(self.VERBOSE)
         return self.is_severity_enabled(self.VERBOSE, _get_caller_module())
 
     @property
     def level(self) -> str:
         return self._min_severity
+
+    @property
+    def python_logger(self) -> logging.Logger:
+        """The standard-library logger every record goes through, e.g. to add a filter."""
+        return self._logger
 
     def set_level(self, min_severity):
         if self._set_from_env:

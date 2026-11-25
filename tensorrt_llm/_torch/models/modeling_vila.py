@@ -24,6 +24,7 @@ import warnings
 from enum import Enum, auto
 from typing import List, Optional, Tuple, Union
 
+import numpy as _np
 import torch
 import torch.nn as nn
 from einops import rearrange
@@ -983,6 +984,11 @@ class VilaInputProcessor(BaseMultimodalInputProcessor,
             mm_tensors = []
             block_sizes = []
             for video in videos:
+                if isinstance(video, _np.ndarray):
+                    if video.dtype != _np.uint8:
+                        raise ValueError("Expected uint8 video frames")
+                    video = torch.from_numpy(video.astype(_np.float32)).permute(
+                        0, 3, 1, 2).mul_(1.0 / 255.0)
                 mm_tensor, block_sizes = process_images(
                     video,
                     self.image_processor,
@@ -1164,7 +1170,7 @@ class VilaInputProcessor(BaseMultimodalInputProcessor,
 
         (iii) later in LLM, we can slice-and-assign based on condition fused_embed[input_ids < vocab_size] = text_embed, fused_embed[inputI > vocab_size] = mm_embed.
 
-        (3) passed input_ids and mm_embed via LlmRequest's prompt_token_ids and prompt_embedding_table fields respectively. LlmRequests can be inflight batched, and the mm_embed is passed to LLM model as `multi_modal_data` which is List[torch.Tensor] for batched requests.
+        (3) The token IDs travel in the request tokens, and mm_embed travels in the Python multimodal data. Model input preparation passes the batched multimodal embeddings to the LLM.
         """
 
         text_prompt, mm_data = inputs.get("prompt"), inputs.get(
@@ -1206,6 +1212,10 @@ class VilaInputProcessor(BaseMultimodalInputProcessor,
         content_format=ContentFormat.PASSTHROUGH,
     ))
 class VilaModel(PreTrainedModel):
+
+    # The vision encoder uses Hugging Face CLIP or SigLIP.
+    supported_encoder_attention_backends = {"vision": frozenset()}
+
     config_class = VilaConfig
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args,

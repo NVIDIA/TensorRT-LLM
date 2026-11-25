@@ -35,7 +35,7 @@ from .bindings import (
     openengine_pb2_grpc,
     server_pb2,
 )
-from .capabilities import supported_guides
+from .capabilities import supported_guides, supports_image_routing
 from .coordinator import CoordinationError, FrontendClient, InvalidRequestIdError
 from .errors import AbortFailedError
 from .kv_events import data_parallel_size, events_config
@@ -296,6 +296,8 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
             reasoning_parser=str(self._llm.args.reasoning_parser or ""),
         )
         info.extra.update({"trtllm_supported_modalities": sorted(media_modalities)})
+        if supports_image_routing(self._llm, media_modalities):
+            info.extra.update({"trtllm_image_routing_version": 1})
 
         max_seq_len = _positive_int(self._llm.args.max_seq_len)
         if max_seq_len is not None:

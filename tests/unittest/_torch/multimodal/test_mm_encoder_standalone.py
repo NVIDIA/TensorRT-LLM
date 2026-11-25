@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import copy
+import dataclasses
 import functools
 import json
 import os
@@ -22,17 +23,19 @@ from contextlib import ExitStack, suppress
 from pathlib import Path
 from typing import Generator
 
+import numpy as np
 import pytest
 import torch
+from test_common.moe_tactics import fp8_block_scales_moe_config
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm import MultimodalEncoder
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
-from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.inputs import TextPrompt, default_multimodal_input_loader
 from tensorrt_llm.inputs.multimodal import apply_mm_hashes
+from tensorrt_llm.inputs.multimodal_data import VideoData
 from tensorrt_llm.llmapi import (CacheTransceiverConfig, DisaggregatedParams,
-                                 KvCacheConfig, MoeConfig)
+                                 KvCacheConfig)
 from tensorrt_llm.llmapi.llm import LLM, SamplingParams
 
 test_data_root = Path(
@@ -46,6 +49,7 @@ example_images = [
 _QWEN_3_VL_DIR = llm_models_root() / "Qwen3" / "Qwen3-VL-2B-Instruct"
 _QWEN_3_VL_30B_A3B_FP8_DIR = llm_models_root(
 ) / "Qwen3" / "Qwen3-VL-30B-A3B-Instruct-FP8"
+_QWEN_2_5_VL_3B_DIR = llm_models_root() / "Qwen2.5-VL-3B-Instruct"
 
 _FAKE_QWEN3_VL_30B_A3B_FP8_SENTINEL = "qwen3_vl_30b_a3b_fp8_fake"
 _FAKE_CHECKPOINT_MARKER = ".tllm_fake_checkpoint"
@@ -88,7 +92,7 @@ def _create_llm(
         model=model_dir,
         backend='pytorch',
         kv_cache_config=kv_cache_config,
-        moe_config=_get_moe_config_for_blackwell(),
+        moe_config=fp8_block_scales_moe_config(),
         trust_remote_code=True,
         cache_transceiver_config=cache_transceiver_cfg,
         disable_overlap_scheduler=disable_overlap_scheduler,
@@ -200,12 +204,6 @@ def _is_fake_checkpoint(model_dir: Path) -> bool:
     return (model_dir / _FAKE_CHECKPOINT_MARKER).exists()
 
 
-def _get_moe_config_for_blackwell() -> MoeConfig:
-    if get_sm_version() >= 100:
-        return MoeConfig(backend="DEEPGEMM")
-    return MoeConfig()
-
-
 @pytest.mark.parametrize(
     "prompts,expected_num_duplicates",
     [
@@ -245,7 +243,7 @@ def test_kv_event_mm_keys_with_reuse(prompts, expected_num_duplicates):
         event_buffer_max_size=1024,  # Enable KV cache events
         use_kv_cache_manager_v2=True,
     )
-    moe_config = _get_moe_config_for_blackwell()
+    moe_config = fp8_block_scales_moe_config()
 
     llm = LLM(model=encoder_model_dir,
               backend='pytorch',
@@ -278,6 +276,62 @@ def test_kv_event_mm_keys_with_reuse(prompts, expected_num_duplicates):
     assert num_duplicates == expected_num_duplicates, (
         f"Expected {expected_num_duplicates} duplicate mm_keys offsets, "
         f"got {num_duplicates}. Offsets: {mm_keys_offsets}")
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_attached_embeddings_reuse_only_identical_embeddings() -> None:
+    """Prompts that differ only in their attached image embeddings must not
+    share image KV blocks, while an identical request still reuses them."""
+    with open(_QWEN_3_VL_DIR / "config.json") as f:
+        config = json.load(f)
+    # Random rows stand in for encoder output: the prompt layout depends only
+    # on their shape and grid, and the two images differ only in content.
+    width = config["text_config"]["hidden_size"] * (
+        1 + len(config["vision_config"]["deepstack_visual_indexes"]))
+    side = 16 * config["vision_config"]["spatial_merge_size"]
+    generator = torch.Generator().manual_seed(0)
+    embeddings = [{
+        "mm_embeddings":
+        torch.randn(256, width, generator=generator).to(torch.bfloat16).cuda(),
+        "image_grid_thw": [1, side, side],
+    } for _ in range(2)]
+    kv_cache_config = KvCacheConfig(
+        enable_block_reuse=True,
+        free_gpu_memory_fraction=0.2,
+        use_kv_cache_manager_v2=True,
+    )
+    with LLM(model=_QWEN_3_VL_DIR,
+             kv_cache_config=kv_cache_config,
+             max_batch_size=1) as llm:
+        first, second = _load_inputs(llm, ["Describe the image."] * 2,
+                                     media=None,
+                                     mm_embeddings=embeddings)
+        sampling_params = SamplingParams(max_tokens=16)
+        llm.generate([first], sampling_params=sampling_params)
+        second_after_first = llm.generate([second],
+                                          sampling_params=sampling_params)[0]
+        first_again = llm.generate([first], sampling_params=sampling_params)[0]
+        tokens_per_block = llm.args.kv_cache_config.tokens_per_block
+
+    prompt_token_ids = list(first_again.prompt_token_ids)
+    assert list(second_after_first.prompt_token_ids) == prompt_token_ids
+    first_image_token = prompt_token_ids.index(config["image_token_id"])
+    assert second_after_first.cached_tokens <= first_image_token
+    reusable_tokens = (len(prompt_token_ids) -
+                       1) // tokens_per_block * tokens_per_block
+    assert first_again.cached_tokens >= reusable_tokens
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_attached_embedding_digest_does_not_depend_on_device(
+        dtype: torch.dtype) -> None:
+    """A CUDA embedding hashes through a host copy to the CPU digest."""
+    embedding = torch.arange(24, dtype=torch.float32).reshape(4, 6).to(dtype)
+
+    on_cuda = apply_mm_hashes({"image": [embedding.cuda()]}).hashes
+    on_cpu = apply_mm_hashes({"image": [embedding]}).hashes
+
+    assert on_cuda == on_cpu
 
 
 @pytest.fixture(
@@ -692,7 +746,7 @@ def llm_and_chunked_llm(
             enable_block_reuse=False,
             free_gpu_memory_fraction=0.2,
         ),
-        moe_config=_get_moe_config_for_blackwell(),
+        moe_config=fp8_block_scales_moe_config(),
         trust_remote_code=True,
         max_batch_size=1,
         enable_chunked_prefill=True,
@@ -879,6 +933,78 @@ def test_single_request_chat_multiple_images(
             if hasattr(ref_gen, 'logprobs') and hasattr(test_gen, 'logprobs'):
                 assert ref_gen.logprobs == test_gen.logprobs, \
                     f"Log probabilities don't match for output {i}, generation {j}"
+
+
+@pytest.mark.parametrize("model_dir", [pytest.param(_QWEN_3_VL_DIR)],
+                         indirect=True)
+@pytest.mark.parametrize("pd_disagg", [False], indirect=True)
+@pytest.mark.parametrize("frame_counts", [(8, ), (40, ), (8, 8)])
+@pytest.mark.threadleak(enabled=False)
+def test_video_encoder_handoff_preserves_timestamps(llms_and_encoder,
+                                                    frame_counts):
+    """E/PD must consume the same timestamped prompt as aggregated inference."""
+    (llm, _), encoder = llms_and_encoder
+    videos = []
+    for count in frame_counts:
+        indices = np.linspace(0, 239, count).astype(int).tolist()
+        frames = []
+        for index in indices:
+            frame = np.zeros((224, 224, 3), dtype=np.uint8)
+            frame[:, :, 0 if index < 120 else 2] = 255
+            frames.append(frame)
+        videos.append(
+            VideoData(frames=frames,
+                      metadata={
+                          "fps": 24.0,
+                          "total_num_frames": 240,
+                          "duration": 10.0,
+                          "frames_indices": indices,
+                      }))
+    prompt = llm.tokenizer.apply_chat_template(
+        [{
+            "role":
+            "user",
+            "content": [
+                *({
+                    "type": "video"
+                } for _ in videos),
+                {
+                    "type": "text",
+                    "text": "Describe the events and their times in seconds."
+                },
+            ]
+        }],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    inputs = {
+        "prompt": prompt,
+        "multi_modal_data": {
+            "video": videos
+        },
+        "mm_processor_kwargs": {
+            "do_sample_frames": False
+        }
+    }
+    sampling = SamplingParams(temperature=0, top_k=1, max_tokens=64)
+    reference = llm.generate_async(copy.deepcopy(inputs),
+                                   sampling_params=sampling).result()
+    encoded = encoder.generate_async(copy.deepcopy(inputs)).result()
+    handoff = encoded.disaggregated_params
+    assert handoff.multimodal_input_layout.prompt_token_ids == reference.prompt_token_ids
+    assert handoff.mrope_position_ids_handle["tensor_size"][-1] == len(
+        reference.prompt_token_ids)
+    # Exercise a wire round trip without resending the raw video to prefill.
+    handoff = DisaggregatedParams(
+        **json.loads(json.dumps(dataclasses.asdict(handoff))))
+    handoff.request_type = "context_and_generation"
+    output = llm.generate_async({
+        "prompt": prompt
+    },
+                                sampling_params=sampling,
+                                disaggregated_params=handoff).result()
+    assert output.prompt_token_ids == reference.prompt_token_ids
+    assert output.outputs[0].token_ids == reference.outputs[0].token_ids
 
 
 @pytest.mark.parametrize("model_dir", [pytest.param(_QWEN_3_VL_DIR)],
@@ -1348,3 +1474,46 @@ def test_pd_disagg_multimodal_no_reuse_when_disabled():
             assert len(decode_outputs[0].outputs) > 0
             text = decode_outputs[0].outputs[0].text
             assert len(text) > 0, f"[req {req_num}] empty output"
+
+
+def _encode_images(model_dir: Path, attn_backend: str,
+                   media: list[list[str]]) -> list[torch.Tensor]:
+    encoder = MultimodalEncoder(model=model_dir,
+                                attn_backend=attn_backend,
+                                max_batch_size=len(media))
+    with encoder:
+        inputs = _load_inputs(encoder, ["Describe the image."] * len(media),
+                              media)
+        outputs = encoder.generate(inputs)
+        embeddings = []
+        for output in outputs:
+            handles = output.disaggregated_params.multimodal_embedding_handles
+            assert handles is not None
+            embeddings.append(
+                torch.cat([
+                    SharedTensorContainer.from_dict(
+                        handle).get_local_view().float().cpu()
+                    for handle in handles
+                ]))
+    return embeddings
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_encoder_flashinfer_attention_matches_trtllm():
+    """The encoder-only engine runs with FLASHINFER attention and matches TRTLLM."""
+    # get_attention_backend() falls back to TRTLLM when FlashInfer cannot be
+    # imported, which would turn this test into a TRTLLM self-comparison.
+    pytest.importorskip("flashinfer")
+    if not _QWEN_2_5_VL_3B_DIR.is_dir():
+        pytest.skip(f"Checkpoint not found: {_QWEN_2_5_VL_3B_DIR}")
+    media = [[image] for image in example_images]
+    reference = _encode_images(_QWEN_2_5_VL_3B_DIR, "TRTLLM", media)
+    flashinfer = _encode_images(_QWEN_2_5_VL_3B_DIR, "FLASHINFER", media)
+
+    assert len(flashinfer) == len(reference) == len(media)
+    for ref, test in zip(reference, flashinfer):
+        assert test.shape == ref.shape
+        cos = torch.nn.functional.cosine_similarity(ref.flatten(),
+                                                    test.flatten(),
+                                                    dim=0)
+        assert cos.item() > 0.99, f"cosine similarity {cos.item():.6f}"
