@@ -28,9 +28,6 @@ import uuid
 from contextlib import ExitStack
 from types import SimpleNamespace
 
-# Do not inherit a NIC pin from the host: the selected interface may not exist
-# in the test container and would prevent the NIXL agent from initializing.
-os.environ.pop("UCX_NET_DEVICES", None)
 # Exclude UCX IB transport (avoid NIXL setup hangs without IB) and gdr_copy
 # (avoid SIGSEGV at process exit from UCX rcache cleanup; gdr_copy disabled
 # falls back to cuda_ipc / cuda_copy without affecting correctness).
@@ -39,7 +36,7 @@ os.environ.pop("UCX_NET_DEVICES", None)
 os.environ["UCX_TLS"] = "^ib,gdr_copy"
 os.environ["TRTLLM_NIXL_NUM_THREADS"] = "1"
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, Iterator, List, Optional
 
 import pytest
 import torch
@@ -78,6 +75,21 @@ from tensorrt_llm.llmapi.llm_args import (
 )
 
 AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _pin_ucx_to_loopback() -> Iterator[None]:
+    """Pin UCX to the loopback interface, which every container has, while these tests run.
+
+    Every rank runs in this process on one GPU, so UCX needs no NIC. A NIC pin inherited from
+    the host may name an interface the test container lacks, and letting UCX open every
+    interface of a multi-NIC node slows down creating and connecting each NIXL agent. UCX reads
+    the variable when each agent creates its context, which happens inside the tests.
+    """
+    with pytest.MonkeyPatch.context() as env:
+        env.setenv("UCX_NET_DEVICES", "lo")
+        yield
+
 
 # ---------------------------------------------------------------------------
 # Constants
