@@ -32,7 +32,7 @@ constexpr unsigned long TmaDimMax = 1UL << 31;
 // so overflow can happen.
 constexpr unsigned long LargeN = 1UL << 30;
 // Used in TMA stride. Should be less than 2^40.
-constexpr unsigned long XLargeN = 1UL << 35;
+constexpr unsigned long long XLargeN = 1ULL << 35;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

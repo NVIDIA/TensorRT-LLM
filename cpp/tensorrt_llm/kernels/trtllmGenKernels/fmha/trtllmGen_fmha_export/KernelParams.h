@@ -948,6 +948,11 @@ static KernelParams setKernelParams(FmhaOptions_ const& options,
   params.mOutputScale = options.mOutputScale;
   params.mDsv4ScaleBufM = options.mDsv4ScaleBufM;
   params.mScaleSoftmaxLog2 = softmaxScale;
+  // Unit-scale kernels use a softmax scale of 1 in every stage, the separate reduction kernel
+  // included, whatever the caller passes.
+  if (options.mSkipsSoftmaxScale) {
+    params.mScaleSoftmaxLog2 = 1.f;
+  }
   params.mScaleSfKv = kvSfScale;
   params.mScaleSfO = oSfScale;
   params.mStartTokenIdxSfO = startTokenIdxSfO;

@@ -202,11 +202,13 @@ public:
   // Prevents early exit of producer blocks in Cluster.
   // This should be called once before kernel exits.
   CUTLASS_DEVICE
-  void producer_tail(PipelineState state) {
+  // A stride selects one interleaved partition; state carries that partition's phase.
+  void producer_tail(PipelineState state, uint32_t stage_stride = 1) {
+    CUTLASS_ASSERT(stage_stride > 0 && Stages % stage_stride == 0);
     cutlass::detail::pipeline_check_is_producer(params_.role);
-    for (int count = 0; count < Stages; ++count) {
+    for (int count = 0; count < Stages; count += stage_stride) {
       empty_barrier_ptr_[state.index()].wait(state.phase());
-      ++state;
+      state += stage_stride;
     }
   }
 
@@ -492,10 +494,12 @@ public:
   // Prevents early exit of producer blocks in Cluster.
   // This should be called once before kernel exits.
   CUTLASS_DEVICE
-  void producer_tail(PipelineState state) {
-    for (int count = 0; count < Stages; ++count) {
+  // A stride selects one interleaved partition; state carries that partition's phase.
+  void producer_tail(PipelineState state, uint32_t stage_stride = 1) {
+    CUTLASS_ASSERT(stage_stride > 0 && Stages % stage_stride == 0);
+    for (int count = 0; count < Stages; count += stage_stride) {
       producer_acquire(state);
-      ++state;
+      state += stage_stride;
     }
   }
 

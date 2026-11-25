@@ -696,7 +696,12 @@ __host__ __device__ inline float getSoftmaxPScale(tg::Dtype dtypeBmm2,
   X(bool, mUsesCgaReduction, false, bool)                                                          \
   X(bool, mKnob2, true, bool)                                                      \
   X(bool, mKnob3, true, bool)                                                         \
-  X(bool, mKnob4, true, bool)
+  X(bool, mKnob4, true, bool)                                                            \
+  /* Whether the softmax skips the softmax scale: every stage uses scaleSoftmaxLog2 = 1 and */     \
+  /* ignores ptrScaleSoftmaxLog2 / mScaleSoftmaxLog2, and the per-element multiply is skipped */   \
+  /* (fp16 and fp32 softmax). The caller folds softmax_scale * log2(e) into the Q/K */             \
+  /* quantization scales, so softmax stats match a regular kernel. Not with SageAttention. */      \
+  X(bool, mSkipsSoftmaxScale, false, bool)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -714,10 +719,10 @@ __host__ __device__ inline float getSoftmaxPScale(tg::Dtype dtypeBmm2,
   X(bool, mEnablesFp16Softmax, false, bool)                                                        \
   /* Whether the kernel forces the output to be valid values */                                    \
   /* (not -0.0 for FP and NAN for UE8m0). */                                                       \
-  X(bool, mFineGrainedForceValid, false, bool)                                                         \
-  /* Whether the kernel is a FineGrained producer */                                                   \
+  X(bool, mFineGrainedForceValid, false, bool)                                                     \
+  /* Whether the kernel is a FineGrained producer */                                               \
   /* (invalidates output buffer prior to writing results). */                                      \
-  X(bool, mFineGrainedProducer, false, bool)                                                           \
+  X(bool, mFineGrainedProducer, false, bool)                                                       \
   /* Whether to use tcgen05.ld.spcompress to compress S before softmax (and thus P). */            \
   X(bool, mUsesSpcompress, false, bool)
 #endif // TLLM_RUBIN_FEATURES

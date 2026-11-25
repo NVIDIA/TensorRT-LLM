@@ -501,6 +501,13 @@ initPersistentSchedulerSm90Params(KernelParams const& kernelParams,
   // We map the ragged batch dim to M if BatchM==true else N. Hence always 1 in classic BMM sense.
   int32_t const numBatches = 1;
 
+  // The Sm90 decomposition enumerates whole clusters along the major dimension,
+  // so the linear work space must span the cluster-padded tile counts.
+  // Otherwise, with e.g. 15 M tiles and clusterM 2, the last 1/16 of the N tiles are not scheduled.
+  // Padded tiles take the same early-exit path as in the launch-grid case.
+  numTilesM = ((numTilesM + clusterM - 1) / clusterM) * clusterM;
+  numTilesN = ((numTilesN + clusterN - 1) / clusterN) * clusterN;
+
   schedulerParams.problem_tiles_m_ = numTilesM;
   schedulerParams.problem_tiles_n_ = numTilesN;
   schedulerParams.problem_tiles_l_ = numBatches;

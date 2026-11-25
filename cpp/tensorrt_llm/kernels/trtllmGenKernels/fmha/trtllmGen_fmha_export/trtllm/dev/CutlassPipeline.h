@@ -206,7 +206,11 @@ public:
     // WARN: for CGA>1, the CUTLASS pipeline does not arrive with scope .release.cluster, even
     // though it correctly set the memory space .shared::cluster. Cluster release fence will be
     // needed.
-    pipeline.producer_acquire(pipe_producer_state);
+    if constexpr (ClusterSize == 1) {
+      pipeline.producer_acquire_no_tx(pipe_producer_state);
+    } else {
+      pipeline.producer_acquire(pipe_producer_state);
+    }
     // Convert WorkTileInfo struct to 16B CLCResponse.
     CLCResponse clc_response;
     clc_response.data[0] = work_id.M_idx;
@@ -215,12 +219,12 @@ public:
     clc_response.data[3] = static_cast<uint32_t>(work_id.is_valid_tile);
     // Store work ID in shared memory ring buffer.
     if constexpr (ClusterSize == 1) {
-      // Use direct store + manual barrier completion instead.
-      clc_response_ptr_[pipe_producer_state.index()] = clc_response;
-      // Fence between SM and SYNCS.
-      cutlass::arch::fence_view_async_shared();
-      // Manually complete the transaction bytes that producer_acquire set up.
-      pipeline.producer_commit(pipe_producer_state);
+      // Publish ordinary shared stores with a release arrival after the payload.
+      // A relaxed complete_tx does not order these stores for the consumers.
+      if (cutlass::canonical_lane_idx() == 0) {
+        clc_response_ptr_[pipe_producer_state.index()] = clc_response;
+        pipeline.producer_commit_no_tx(pipe_producer_state);
+      }
     } else {
       // Fence arrive_and_expect_tx and st_async. This ensures full barrier is properly set.
       cuda_ptx::fence(cuda_ptx::sem_release, cuda_ptx::scope_cluster);
@@ -375,7 +379,11 @@ public:
     // WARN: for CGA>1, the CUTLASS pipeline does not arrive with scope .release.cluster, even
     // though it correctly set the memory space .shared::cluster. Cluster release fence will be
     // needed.
-    pipeline.producer_acquire(pipe_producer_state);
+    if constexpr (ClusterSize == 1) {
+      pipeline.producer_acquire_no_tx(pipe_producer_state);
+    } else {
+      pipeline.producer_acquire(pipe_producer_state);
+    }
     // Convert WorkTileInfo struct to 16B CLCResponse.
     CLCResponse clc_response;
     clc_response.data[0] = work_id.M_idx;
@@ -384,12 +392,12 @@ public:
     clc_response.data[3] = static_cast<uint32_t>(work_id.is_valid_tile);
     // Store work ID in shared memory ring buffer.
     if constexpr (ClusterSize == 1) {
-      // Use direct store + manual barrier completion instead.
-      clc_response_ptr_[pipe_producer_state.index()] = clc_response;
-      // Fence between SM and SYNCS.
-      cutlass::arch::fence_view_async_shared();
-      // Manually complete the transaction bytes that producer_acquire set up.
-      pipeline.producer_commit(pipe_producer_state);
+      // Publish ordinary shared stores with a release arrival after the payload.
+      // A relaxed complete_tx does not order these stores for the consumers.
+      if (cutlass::canonical_lane_idx() == 0) {
+        clc_response_ptr_[pipe_producer_state.index()] = clc_response;
+        pipeline.producer_commit_no_tx(pipe_producer_state);
+      }
     } else {
       // Fence arrive_and_expect_tx and st_async. This ensures full barrier is properly set.
       cuda_ptx::fence(cuda_ptx::sem_release, cuda_ptx::scope_cluster);
@@ -842,9 +850,9 @@ public:
     }
   }
 
-  // Producer clean the cluster barrier. It does nothing.
-  inline __device__ void producer_tail(PipelineState const& state) {
-    mPipeline.producer_tail(state);
+  // Producer clean the cluster barrier.
+  inline __device__ void producer_tail(PipelineState const& state, uint32_t stageStride = 1) {
+    mPipeline.producer_tail(state, stageStride);
   }
 
   // Producer get the barrier. It is only used by tma load.
@@ -991,9 +999,9 @@ public:
     mPipeline.producer_commit(state, bytes);
   }
 
-  // Producer clean the cluster barrier. It does nothing.
-  inline __device__ void producer_tail(PipelineState const& state) {
-    mPipeline.producer_tail(state);
+  // Producer clean the cluster barrier.
+  inline __device__ void producer_tail(PipelineState const& state, uint32_t stageStride = 1) {
+    mPipeline.producer_tail(state, stageStride);
   }
 
   // Producer try to acquire the barrier.
@@ -1149,9 +1157,9 @@ public:
     mPipeline.producer_commit(state, bytes);
   }
 
-  // Producer clean the cluster barrier. It does nothing.
-  inline __device__ void producer_tail(PipelineState const& state) {
-    mPipeline.producer_tail(state);
+  // Producer clean the cluster barrier.
+  inline __device__ void producer_tail(PipelineState const& state, uint32_t stageStride = 1) {
+    mPipeline.producer_tail(state, stageStride);
   }
 
   // Producer try to acquire the barrier.
@@ -1294,9 +1302,9 @@ public:
     mPipeline.producer_commit(state, bytes);
   }
 
-  // Producer clean the cluster barrier. It does nothing.
-  inline __device__ void producer_tail(PipelineState const& state) {
-    mPipeline.producer_tail(state);
+  // Producer clean the cluster barrier.
+  inline __device__ void producer_tail(PipelineState const& state, uint32_t stageStride = 1) {
+    mPipeline.producer_tail(state, stageStride);
   }
 
   // Producer try to acquire the barrier.
@@ -1421,9 +1429,15 @@ public:
     mPipeline.producer_commit(state);
   }
 
-  // Producer clean the cluster barrier. It does nothing.
-  inline __device__ void producer_tail(PipelineState const& state) {
-    mPipeline.producer_tail(state);
+  // Producer clean the cluster barrier.
+  inline __device__ void producer_tail(PipelineState const& state, uint32_t stageStride = 1) {
+    if constexpr (IsMma2Sm) {
+      // Consumer releases target only the even CTA, irrespective of task participation.
+      if (cute::block_rank_in_cluster() & 1u) {
+        return;
+      }
+    }
+    mPipeline.producer_tail(state, stageStride);
   }
 
   // Producer try to acquire the barrier.
@@ -1479,7 +1493,8 @@ public:
                                                               InitBarriers = {},
                                                               InitMasks = {},
                                                               int32_t barInitWarpId = 0,
-                                                              int32_t consCnt = 1)
+                                                              int32_t consCnt = 1,
+                                                              bool leadOnlyProducer = false)
     : mPipeline{reinterpret_cast<FullBarrier*>(fullBarrierPtr),
                 reinterpret_cast<EmptyBarrier*>(emptyBarrierPtr),
                 Params{Pipeline::ThreadCategory::Consumer,
@@ -1489,7 +1504,8 @@ public:
                        barInitWarpId},
                 clusterShape,
                 InitMasks{}}
-    , mBlockIdMask{0} {
+    , mBlockIdMask{0}
+    , mEmptyBarrierPtr{reinterpret_cast<EmptyBarrier*>(emptyBarrierPtr)} {
     if constexpr (cute::is_same_v<InitBarriers, cute::true_type>) {
       if (warpId == barInitWarpId) {
         cutlass::arch::detail::
@@ -1502,6 +1518,10 @@ public:
     }
     // Note: fence_barrier_init() will be invoked once after all barriers are initialized.
     init_block_id_mask(clusterShape);
+    // Release only to producer owners; full commits still target both CTAs.
+    mCustomReleaseMask = leadOnlyProducer
+                           ? uint16_t(uint32_t{1} << (cute::block_rank_in_cluster() & ~uint32_t{1}))
+                           : mBlockIdMask;
   }
 
   // Create the umma_peer_mask, which only encodes the current CTA pair in the cluster.
@@ -1521,7 +1541,12 @@ public:
 
   // Consumer release the barrier.
   inline __device__ void consumer_release(PipelineState const& state) {
-    mPipeline.consumer_release(state);
+    if constexpr (IsMma2Sm) {
+      auto smemPtr = reinterpret_cast<uint64_t*>(&mEmptyBarrierPtr[state.index()]);
+      cutlass::arch::umma_arrive_multicast_2x1SM(smemPtr, mCustomReleaseMask);
+    } else {
+      mPipeline.consumer_release(state);
+    }
   }
 
   // Consumer try to wait at the barrier..
@@ -1567,9 +1592,9 @@ public:
     }
   }
 
-  // Producer clean the cluster barrier. It does nothing.
-  inline __device__ void producer_tail(PipelineState const& state) {
-    mPipeline.producer_tail(state);
+  // Producer clean the cluster barrier.
+  inline __device__ void producer_tail(PipelineState const& state, uint32_t stageStride = 1) {
+    mPipeline.producer_tail(state, stageStride);
   }
 
   // Producer try to acquire the barrier.
@@ -1586,6 +1611,10 @@ private:
   Pipeline mPipeline;
   // The blockId mask.
   uint16_t mBlockIdMask;
+  // CTA mask for empty-barrier releases, restricted to elected producer owners.
+  uint16_t mCustomReleaseMask;
+  // Empty barriers targeted by asynchronous UMMA consumer releases.
+  EmptyBarrier* mEmptyBarrierPtr;
   // Does it use 2CTA UTCMMA ?
   static constexpr bool IsMma2Sm = cute::size(AtomThrShapeMNK{}) > 1;
 };
@@ -1757,7 +1786,7 @@ public:
     mPipeline.producer_acquire(state, token);
   }
 
-  // Producer clean the cluster barrier. It does nothing.
+  // Producer clean the cluster barrier.
   inline __device__ void producer_tail(PipelineState const& state) {
     mPipeline.producer_tail(state);
   }

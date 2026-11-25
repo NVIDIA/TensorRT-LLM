@@ -1787,7 +1787,8 @@ private:
     std::map<std::pair<uint64_t, int>, KernelInfo> mStageKvFunctions;
     std::once_flag mStageKvLoaded;
 
-    FmhaInterface mFmhaInterface{false, 1};
+    FmhaInterface mFmhaInterface{std::filesystem::path(getExecPath()).parent_path().string(), /*exportsCubin=*/false,
+        /*numRotations=*/1, /*verbose=*/false, /*enableDiskCache=*/false};
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
