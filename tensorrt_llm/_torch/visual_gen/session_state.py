@@ -25,8 +25,10 @@ from typing import Deque, Dict, Optional, Tuple
 
 import torch
 
+from tensorrt_llm.visual_gen.session_errors import SessionEnded, SessionQueueFull
+
 from .pipeline import SessionCapabilities
-from .session_protocol import ResultType, SessionEnded, SessionQueueFull, SessionResultMessage
+from .session_protocol import ResultType, SessionResultMessage
 
 
 class SessionState:

@@ -62,15 +62,8 @@ if TYPE_CHECKING:
     )
     from .output import VisualGenMetrics, VisualGenOutput
     from .params import MediaRef, VisualGenParams
-    from .session import (
-        SessionEnded,
-        SessionError,
-        SessionLeaseExpired,
-        SessionQueueFull,
-        SessionResult,
-        SessionResultsIterator,
-        VisualGenSession,
-    )
+    from .session import SessionResult, SessionResultsIterator, VisualGenSession
+    from .session_errors import SessionEnded, SessionError, SessionLeaseExpired, SessionQueueFull
     from .visual_gen import ExtraParamSchema, VisualGen, VisualGenResult
 
 # Public name -> providing module.
@@ -101,10 +94,10 @@ _LAZY_ATTRS = {
     "VisualGenSession": "tensorrt_llm.visual_gen.session",
     "SessionResultsIterator": "tensorrt_llm.visual_gen.session",
     "SessionResult": "tensorrt_llm.visual_gen.session",
-    "SessionError": "tensorrt_llm.visual_gen.session",
-    "SessionQueueFull": "tensorrt_llm.visual_gen.session",
-    "SessionEnded": "tensorrt_llm.visual_gen.session",
-    "SessionLeaseExpired": "tensorrt_llm.visual_gen.session",
+    "SessionError": "tensorrt_llm.visual_gen.session_errors",
+    "SessionQueueFull": "tensorrt_llm.visual_gen.session_errors",
+    "SessionEnded": "tensorrt_llm.visual_gen.session_errors",
+    "SessionLeaseExpired": "tensorrt_llm.visual_gen.session_errors",
     "VisualGenMetrics": "tensorrt_llm.visual_gen.output",
     "VisualGenOutput": "tensorrt_llm.visual_gen.output",
     "VisualGenParams": "tensorrt_llm.visual_gen.params",

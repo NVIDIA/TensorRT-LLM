@@ -18,6 +18,7 @@ over fake sockets, a ``DiffusionRemoteClient`` fed by them, the public
 no worker processes, no model."""
 
 import asyncio
+import contextlib
 import json
 import os
 import queue
@@ -37,39 +38,44 @@ import torch.distributed as dist
 
 from tensorrt_llm._torch.shared_tensor.shared_tensor import _LocalTensorStore
 from tensorrt_llm._torch.visual_gen import executor as executor_module
+from tensorrt_llm._torch.visual_gen import pipeline as pipeline_module
+from tensorrt_llm._torch.visual_gen import session_worker as session_worker_module
 from tensorrt_llm._torch.visual_gen import slot_pool as slot_pool_module
 from tensorrt_llm._torch.visual_gen.executor import (
     DiffusionExecutor,
     DiffusionRemoteClient,
     DiffusionRequest,
     DiffusionResponse,
-    SessionChannel,
-    _SessionExit,
 )
 from tensorrt_llm._torch.visual_gen.pipeline import (
     AdvanceResult,
+    BasePipeline,
     SessionCapabilities,
     SessionInputSpec,
     SessionStreamSpec,
 )
+from tensorrt_llm._torch.visual_gen.session_channel import SessionChannel
 from tensorrt_llm._torch.visual_gen.session_protocol import (
     ControlType,
     ResultType,
     SessionAdmitted,
     SessionClosed,
     SessionControl,
-    SessionEnded,
-    SessionError,
-    SessionLeaseExpired,
     SessionOpen,
     SessionOpened,
-    SessionQueueFull,
     SessionReply,
     SessionResultMessage,
     SessionSubmit,
 )
+from tensorrt_llm._torch.visual_gen.session_worker import SessionExit, SessionWorker
 from tensorrt_llm._torch.visual_gen.slot_pool import SlotPool
 from tensorrt_llm.visual_gen.session import VisualGenSession
+from tensorrt_llm.visual_gen.session_errors import (
+    SessionEnded,
+    SessionError,
+    SessionLeaseExpired,
+    SessionQueueFull,
+)
 from tensorrt_llm.visual_gen.visual_gen import VisualGen
 
 pytestmark = pytest.mark.cpu_only
@@ -86,6 +92,11 @@ class CountingPipeline:
     supports_sessions = True
     default_generation_params: Dict[str, Any] = {}
     extra_param_specs: Dict[str, Any] = {}
+    # The worker calls the hooks through the wrapper a real pipeline has.
+    run_session_call = BasePipeline.run_session_call
+    _run_scoped = BasePipeline._run_scoped
+    _is_warmup = False
+    _profiler = SimpleNamespace(request_scope=contextlib.nullcontext)
 
     def __init__(self, *, queued=True, initial=True, length=None, fail_at=None, open_fails=False):
         self.queued = queued
@@ -201,7 +212,7 @@ def _make_executor(pipeline, session_config=None, *, rank=0, world_size=1, in_cl
     ex.requests_ipc = FakeRequestSocket()
     ex.controls_ipc = FakeRequestSocket()
     ex.session_config = session_config
-    ex._status_group = None
+    ex.session_worker = SessionWorker(ex)
     return ex
 
 
@@ -330,7 +341,7 @@ class Harness:
                 if message is None:
                     return
                 if isinstance(message, SessionOpen):
-                    if self.executor._serve_session(message.request) is _SessionExit.SHUTDOWN:
+                    if self.executor.session_worker.serve(message.request) is SessionExit.SHUTDOWN:
                         return
                 else:
                     self.executor._answer_stray_command(message)
@@ -629,6 +640,68 @@ def test_unsupported_pipeline_refuses_a_session_as_a_client_error(harness):
         with pytest.raises(ValueError, match="does not support sessions"):
             h.open()
     assert pipe.opened == 0
+
+
+def test_session_hooks_run_within_the_request_scopes(harness, monkeypatch):
+    """Open, advance and close each run inside the profiler's request window and
+    the NCCL window tensor scope; the advance keeps the session state's tensors."""
+    log = []
+
+    @contextlib.contextmanager
+    def request_scope():
+        log.append("profile:begin")
+        try:
+            yield
+        finally:
+            log.append("profile:end")
+
+    class WindowScope:
+        def __enter__(self):
+            log.append("window:begin")
+            return self
+
+        def escape(self, value):
+            log.append(("keep", value))
+            return value
+
+        def __exit__(self, *exc):
+            log.append("window:end")
+
+    monkeypatch.setattr(pipeline_module, "nccl_window_tensor_scope", lambda anchor: WindowScope())
+
+    class Scoped(CountingPipeline):
+        _profiler = SimpleNamespace(request_scope=request_scope)
+
+        def _nccl_window_tensor_scope_anchor(self):
+            return torch.empty(0)
+
+        def open_session(self, req, initial_slot):
+            log.append("open")
+            return super().open_session(req, initial_slot)
+
+        def advance(self, state, inputs, slot):
+            log.append("advance")
+            return super().advance(state, inputs, slot)
+
+        def close_session(self, state):
+            log.append("close")
+            return super().close_session(state)
+
+    with harness(Scoped(initial=False)) as h:
+        with h.open() as s, s.results() as results:
+            s.submit("controls", 1)
+            next(results)
+
+    calls = [log[i : i + 7] for i in range(0, len(log), 7)]
+    assert [call[2] for call in calls] == ["open", "advance", "close"]
+    for call in calls:
+        assert call[:2] == ["profile:begin", "window:begin"]
+        assert call[5:] == ["window:end", "profile:end"]
+    (_, (state, _)), (_, open_keep) = calls[0][3:5]
+    (_, outcome), (_, advance_keep) = calls[1][3:5]
+    assert open_keep is None  # the open returns the state, so it is kept already
+    assert isinstance(outcome, AdvanceResult) and advance_keep is state
+    assert calls[2][3:5] == [("keep", None), ("keep", None)]
 
 
 def test_execution_error_ends_the_session_with_a_terminal_error(harness):
@@ -1135,7 +1208,8 @@ class _EventLog(list):
 def _instrument(ex, events, published=None):
     """Record every status all-reduce and tag broadcast the rank performs, and
     in ``published`` the kind of every message it queues for the client."""
-    finalize, send, recv = ex._finalize_advance, ex._send_tag, ex._recv_tag
+    worker = ex.session_worker
+    finalize, send, recv = worker._finalize_advance, worker._send_tag, worker._recv_tag
     if published is not None:
         put = ex.response_queue.put
 
@@ -1160,9 +1234,9 @@ def _instrument(ex, events, published=None):
         events.append("tag:recv")
         return recv()
 
-    ex._finalize_advance = _finalize
-    ex._send_tag = _send
-    ex._recv_tag = _recv
+    worker._finalize_advance = _finalize
+    worker._send_tag = _send
+    worker._recv_tag = _recv
 
 
 def _session_request():
@@ -1211,7 +1285,7 @@ def _run_rank(
         # closed by its client.
         if rank == 0 and fail_phase == "advance_all":
             ex.requests_ipc.put_nowait(SessionSubmit.pack(1, "controls", 1))
-        ex._serve_session(
+        ex.session_worker.serve(
             DiffusionRequest(request_id=1, prompt=["rejected"], params=SimpleNamespace())
         )
         events.append("refused")
@@ -1221,12 +1295,12 @@ def _run_rank(
                 SessionControl(2, ControlType.CLOSE)
             )
             ex.requests_ipc.put_nowait(SessionSubmit.pack(2, "controls", 1))
-        ex._serve_session(req)
+        ex.session_worker.serve(req)
         return
     req = _session_request()
     if rank == 0:
         ex.requests_ipc.put_nowait(SessionSubmit.pack(1, "controls", 1))
-    ex._serve_session(req)
+    ex.session_worker.serve(req)
 
 
 def _child_main(argv):
@@ -1238,7 +1312,7 @@ def _child_main(argv):
         pass
     _wait_for(events_path + ".go")
     events = _EventLog(events_path)
-    executor_module.RANK_AGREEMENT_TIMEOUT = AGREEMENT_TIMEOUT_S
+    session_worker_module.RANK_AGREEMENT_TIMEOUT = AGREEMENT_TIMEOUT_S
     published = _EventLog(events_path + ".published")
     _run_rank(
         int(rank),
@@ -2456,8 +2530,8 @@ def _close_with_a_message_behind_it(h, pipe, behind):
     the request socket, and let the worker find both in one drain. Returns why
     the worker says the session ended."""
     endings = []
-    serve = h.executor._serve_session
-    h.executor._serve_session = lambda req: (endings.append(serve(req)), endings[-1])[1]
+    serve = h.executor.session_worker.serve
+    h.executor.session_worker.serve = lambda req: (endings.append(serve(req)), endings[-1])[1]
     s = h.open()
     s.submit("controls", 1)  # the worker is now parked inside advance 0
     h.executor.controls_ipc.put_nowait(SessionControl(s.request_id, ControlType.CLOSE))
@@ -2471,14 +2545,14 @@ def test_shutdown_signal_behind_a_close_still_stops_the_worker(harness):
     pipe = CountingPipeline(initial=False)
     pipe.advance_gate = threading.Event()
     with harness(pipe) as h:
-        assert _close_with_a_message_behind_it(h, pipe, None) is _SessionExit.SHUTDOWN
+        assert _close_with_a_message_behind_it(h, pipe, None) is SessionExit.SHUTDOWN
 
 
 def test_generate_behind_a_close_is_refused_not_dropped(harness):
     pipe = CountingPipeline(initial=False)
     pipe.advance_gate = threading.Event()
     with harness(pipe) as h:
-        assert _close_with_a_message_behind_it(h, pipe, _request(9)) is _SessionExit.CLOSE
+        assert _close_with_a_message_behind_it(h, pipe, _request(9)) is SessionExit.CLOSE
         _wait_until(lambda: any(r.request_id == 9 for r in h.responses), what="the refusal")
         answer = next(r for r in h.responses if r.request_id == 9)
         assert answer.error_type == "capacity" and "is open" in answer.error_msg

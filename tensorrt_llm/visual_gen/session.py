@@ -38,25 +38,15 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
 
-from tensorrt_llm._torch.visual_gen.session_protocol import (
-    ResultType,
-    SessionEnded,
-    SessionError,
-    SessionLeaseExpired,
-    SessionQueueFull,
-    SessionResultMessage,
-)
+from tensorrt_llm._torch.visual_gen.session_protocol import ResultType, SessionResultMessage
 from tensorrt_llm._torch.visual_gen.slot_pool import make_view
 from tensorrt_llm.llmapi.utils import set_api_status
+from tensorrt_llm.visual_gen.session_errors import SessionEnded, SessionError, SessionLeaseExpired
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.visual_gen.executor import DiffusionRemoteClient, SessionChannel
 
 __all__ = [
-    "SessionEnded",
-    "SessionError",
-    "SessionLeaseExpired",
-    "SessionQueueFull",
     "SessionResult",
     "SessionResultsIterator",
     "VisualGenSession",

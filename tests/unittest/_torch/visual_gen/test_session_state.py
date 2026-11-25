@@ -26,13 +26,10 @@ from tensorrt_llm._torch.visual_gen.pipeline import (
     SessionInputSpec,
     SessionStreamSpec,
 )
-from tensorrt_llm._torch.visual_gen.session_protocol import (
-    ResultType,
-    SessionEnded,
-    SessionQueueFull,
-)
+from tensorrt_llm._torch.visual_gen.session_protocol import ResultType
 from tensorrt_llm._torch.visual_gen.session_state import SessionState
 from tensorrt_llm._torch.visual_gen.slot_pool import SlotPool, make_view, map_slots
+from tensorrt_llm.visual_gen.session_errors import SessionEnded, SessionQueueFull
 
 pytestmark = pytest.mark.cpu_only
 

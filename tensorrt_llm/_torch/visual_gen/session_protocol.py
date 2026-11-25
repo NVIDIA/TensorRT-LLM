@@ -16,7 +16,7 @@
 
 A session is one generation whose model state stays alive on the worker while it
 produces results one advance at a time. This module holds what both sides share:
-the commands and replies that cross the sockets and the errors a caller can see.
+the commands and replies that cross the sockets.
 The worker's own bookkeeping is ``session_state.py``; the pipeline declares what
 it accepts and produces through ``SessionCapabilities`` in ``pipeline.py`` and
 never sees any of this.
@@ -31,27 +31,10 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
 
+from tensorrt_llm.visual_gen.session_errors import SessionEnded, SessionQueueFull
+
 if TYPE_CHECKING:
     from tensorrt_llm._torch.visual_gen.executor import DiffusionRequest
-
-# --------------------------------------------------------------------------- errors
-
-
-class SessionError(RuntimeError):
-    """Base class for session failures raised to the client."""
-
-
-class SessionQueueFull(SessionError):
-    """A queued input has no room; retry after the next advance."""
-
-
-class SessionEnded(SessionError):
-    """The session has a terminal result or is closing; no more input is admitted."""
-
-
-class SessionLeaseExpired(SessionError):
-    """A result's storage was returned to the worker; the view is no longer valid."""
-
 
 # --------------------------------------------------------------------------- wire messages
 #

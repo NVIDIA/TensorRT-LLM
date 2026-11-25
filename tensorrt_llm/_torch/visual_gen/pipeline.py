@@ -362,6 +362,16 @@ class BasePipeline(nn.Module):
 
     def run_inference(self, req: Any) -> Any:
         """Run model-specific inference within shared request profiler boundaries."""
+        return self._run_scoped(self.infer, req)
+
+    def run_session_call(self, hook: Callable[..., Any], *args: Any, keep: Any = None) -> Any:
+        """Run a session hook (``open_session``, ``advance``, ``close_session``)
+        within the boundaries ``run_inference`` gives ``infer``. NCCL window
+        tensors the call produced are released when it returns, except those
+        reachable from its return value or from ``keep``."""
+        return self._run_scoped(hook, *args, keep=keep)
+
+    def _run_scoped(self, call: Callable[..., Any], *args: Any, keep: Any = None) -> Any:
         profiler_scope = (
             contextlib.nullcontext() if self._is_warmup else self._profiler.request_scope()
         )
@@ -369,9 +379,11 @@ class BasePipeline(nn.Module):
             anchor_fn = getattr(self, "_nccl_window_tensor_scope_anchor", None)
             anchor = anchor_fn() if anchor_fn is not None else None
             if anchor is None:
-                return self.infer(req)
+                return call(*args)
             with nccl_window_tensor_scope(anchor) as scope:
-                return scope.escape(self.infer(req))
+                result = scope.escape(call(*args))
+                scope.escape(keep)
+                return result
 
     def _profile_denoise_steps(self, timesteps: Iterable[Any]) -> Iterator[Tuple[int, Any]]:
         """Enumerate a denoise loop's steps within its profiling windows.
@@ -669,7 +681,11 @@ class BasePipeline(nn.Module):
     # stream cursors, ordering and the terminal result; the pipeline owns its
     # caches, decoder history, random state and device events and never sees
     # queues, sockets or consumers. ``open_session``, ``advance`` and
-    # ``close_session`` run under ``torch.inference_mode()``, like ``infer``.
+    # ``close_session`` run under ``torch.inference_mode()`` and through
+    # ``run_session_call``, so within the boundaries ``infer`` runs in. A session
+    # state that holds NCCL window tensors from one call to the next is a tuple,
+    # list, dict or dataclass that reaches them; other objects hide them from the
+    # release at the end of each call.
 
     @property
     def supports_sessions(self) -> bool:
